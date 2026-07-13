@@ -7,6 +7,7 @@
 //! - shm mapping, meta pages, reader table, transactions: in progress
 
 pub mod btree;
+pub mod cdc;
 pub mod engine;
 mod os;
 pub mod pagestore;
@@ -14,5 +15,6 @@ pub mod ring;
 pub mod row;
 pub mod shm;
 
+pub use cdc::{CaptureConfig, DirtyEntry, DirtyOp};
 pub use engine::{CheckPrograms, Engine, ReadTxn, RowCursor, TxnSavepoint, WriteTxn};
 pub use ring::{IntentRing, PendingIntent, RingResult, RING_PARAMS_CAP};
