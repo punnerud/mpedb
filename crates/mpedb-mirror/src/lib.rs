@@ -8,10 +8,12 @@
 //! mpedb-core as a generic CDC primitive; this crate owns the mirror semantics
 //! on top of it.
 
+pub mod adapter;
 pub mod import;
 pub mod sqlite;
 pub mod state;
 
+pub use adapter::{Cursor, NetOp, NetOpKind, PullBatch, SourceAdapter};
 pub use import::{import_sqlite, ImportOptions, ImportReport};
 
 pub use state::{
