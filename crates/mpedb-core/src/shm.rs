@@ -37,6 +37,7 @@ const META_LOGICAL_LEN: usize = 96;
 
 // ---- lock area field offsets (page 2) ----
 const LA_INIT_STATE: usize = 0; // AtomicU32: 0 empty, 1 formatting, 2 READY
+#[cfg(target_os = "linux")]
 const LA_MUTEX: usize = 64; // pthread_mutex_t, 128 bytes reserved (Linux)
 // macOS reuses the ex-mutex region (Linux never compiles these): the tri-state
 // recovered signal for the flock-based writer lock (DESIGN-MACOS-LOCK.md).
