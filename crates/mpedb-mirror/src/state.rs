@@ -39,6 +39,18 @@ fn prefixed(prefix: &[u8], table_id: u32) -> Vec<u8> {
     k
 }
 
+/// The raw engine sys subkey for a `mir` record: `mir\0<key>`. Matches the
+/// facade sys-record convention ([`mpedb`] `WriteSession::sys_record_put`), so
+/// records written through the facade are read back with this key against a
+/// config-free [`mpedb_core::Engine`] read txn.
+pub fn sys_subkey(key: &[u8]) -> Vec<u8> {
+    let mut k = Vec::with_capacity(MIR_NS.len() + 1 + key.len());
+    k.extend_from_slice(MIR_NS.as_bytes());
+    k.push(0);
+    k.extend_from_slice(key);
+    k
+}
+
 /// Which external engine a mirror's source is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
