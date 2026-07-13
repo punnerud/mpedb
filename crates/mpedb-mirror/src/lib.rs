@@ -9,11 +9,13 @@
 //! on top of it.
 
 pub mod adapter;
+pub mod export;
 pub mod import;
 pub mod sqlite;
 pub mod state;
 
 pub use adapter::{Cursor, NetOp, NetOpKind, PullBatch, SourceAdapter};
+pub use export::{diff_sqlite_data, export_sqlite, ExportReport};
 pub use import::{import_sqlite, ImportOptions, ImportReport};
 
 pub use state::{
