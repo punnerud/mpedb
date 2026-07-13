@@ -8,6 +8,7 @@
 //! mpedb-core as a generic CDC primitive; this crate owns the mirror semantics
 //! on top of it.
 
+pub mod sqlite;
 pub mod state;
 
 pub use state::{
