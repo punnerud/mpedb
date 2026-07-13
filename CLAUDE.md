@@ -60,8 +60,9 @@ every protocol there survived a 37-finding adversarial review, and the ordering 
   (skip a column that is itself the whole PK). `engine::secondary_index_columns` and
   `mpedb_sql::secondary_indexes` must agree.
 - Schema/geometry are file-authoritative: attach hard-errors on config drift.
-- Linux 64-bit only; single PID namespace; robust mutexes do not survive reboot (boot-id
-  recovery in `post_attach` handles that — don't remove it).
+- Crash-safe on Linux (x86-64 + 32/64-bit ARM) and macOS/Apple Silicon (the FLD-2 flock
+  writer lock, `crate::os`); single PID namespace; robust mutexes / flock locks do not
+  survive reboot (boot-id recovery in `post_attach` handles that — don't remove it).
 
 ## Testing conventions
 
