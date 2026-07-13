@@ -823,6 +823,107 @@ impl WriteSession<'_> {
         self.txn.abort()
     }
 
+    // ------------- replication / CDC plane (DESIGN-MIRROR §3, §5.4) -------------
+    //
+    // The mirror applier and importer operate at the engine typed-API level —
+    // BELOW RLS — inside a single session so row writes, CDC dirty-set changes,
+    // and the mirror cursor all commit atomically in one meta flip. These
+    // methods expose exactly that plane; they do not touch policies. They never
+    // poison the session (the mirror manages its own savepoints); a failing op
+    // leaves whatever partial effect the engine produced, to be unwound by the
+    // caller via [`WriteSession::savepoint`]/[`WriteSession::rollback_to`].
+
+    /// Turn CDC dirty-set capture on/off for this session's transaction. The
+    /// importer and applier set it `false` so their own writes are not
+    /// self-captured (DESIGN-MIRROR §3.8).
+    pub fn set_capture(&mut self, on: bool) {
+        self.txn.set_capture(on);
+    }
+
+    /// Allow this session to draw from the reserved control-page band so a
+    /// control-plane commit succeeds even when the data region is full
+    /// (DESIGN-MIRROR §3.10). Use only for small control writes.
+    pub fn set_reserved_alloc(&mut self, on: bool) {
+        self.txn.set_reserved_alloc(on);
+    }
+
+    /// Blind typed INSERT of a full row into `table_id`.
+    pub fn insert_row(&mut self, table_id: u32, values: &[Value]) -> Result<()> {
+        self.txn.insert_row(table_id, values)
+    }
+
+    /// Replace the full row with the given PK; returns whether it existed.
+    pub fn update_by_pk(&mut self, table_id: u32, values: &[Value]) -> Result<bool> {
+        self.txn.update_by_pk(table_id, values)
+    }
+
+    /// Delete by PK; returns whether the row existed.
+    pub fn delete_by_pk(&mut self, table_id: u32, pk_values: &[Value]) -> Result<bool> {
+        self.txn.delete_by_pk(table_id, pk_values)
+    }
+
+    /// Read a full row by PK within this session's view.
+    pub fn get_by_pk(&mut self, table_id: u32, pk_values: &[Value]) -> Result<Option<Vec<Value>>> {
+        self.txn.get_by_pk(table_id, pk_values)
+    }
+
+    /// Statement-level savepoint for the mirror's per-op apply (§5.4/§6). Pairs
+    /// with [`WriteSession::rollback_to`].
+    pub fn savepoint(&self) -> mpedb_core::TxnSavepoint {
+        self.txn.savepoint()
+    }
+
+    /// Roll back to a savepoint taken in this session.
+    pub fn rollback_to(&mut self, sp: mpedb_core::TxnSavepoint) {
+        self.txn.rollback_to(sp)
+    }
+
+    /// Store a namespaced system record through THIS transaction (atomic with
+    /// the session's row writes — unlike [`Database::sys_record_put`], which
+    /// opens its own txn and would self-lock under an open session).
+    pub fn sys_record_put(&mut self, ns: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        let subkey = sys_record_subkey(ns, key)?;
+        if value.len() > SYS_RECORD_MAX_VALUE {
+            return Err(Error::Unsupported(format!(
+                "system record value too large ({} > {SYS_RECORD_MAX_VALUE} bytes)",
+                value.len()
+            )));
+        }
+        self.txn.sys_put(&subkey, value)
+    }
+
+    /// Read a namespaced system record through this transaction.
+    pub fn sys_record_get(&mut self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        let subkey = sys_record_subkey(ns, key)?;
+        self.txn.sys_get(&subkey)
+    }
+
+    /// Delete a namespaced system record through this transaction.
+    pub fn sys_record_delete(&mut self, ns: &str, key: &[u8]) -> Result<bool> {
+        let subkey = sys_record_subkey(ns, key)?;
+        self.txn.sys_delete(&subkey)
+    }
+
+    /// Scan namespaced system records whose key is in `[lo, hi)`, prefix-bounded
+    /// (the mirror's dirty-set / park scans). Keys returned with the namespace
+    /// prefix stripped.
+    pub fn sys_record_scan_range(
+        &mut self,
+        ns: &str,
+        lo: &[u8],
+        hi: &[u8],
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let klo = sys_record_subkey(ns, lo)?;
+        let khi = sys_record_subkey(ns, hi)?;
+        let strip = ns.len() + 1;
+        Ok(self
+            .txn
+            .sys_scan_range(&klo, &khi)?
+            .into_iter()
+            .map(|(k, v)| (k[strip..].to_vec(), v))
+            .collect())
+    }
+
     fn plan_by_hash(&mut self, hash: &PlanHash) -> Result<Arc<CompiledPlan>> {
         if let Some(p) = self.db.cache.read().expect(POISON).get(hash) {
             return Ok(p.clone());

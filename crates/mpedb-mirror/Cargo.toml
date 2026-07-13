@@ -1,0 +1,16 @@
+[package]
+name = "mpedb-mirror"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Bidirectional sqlite3/PostgreSQL <-> mpedb mirror (DESIGN-MIRROR.md)"
+
+[dependencies]
+mpedb = { workspace = true }
+mpedb-core = { workspace = true }
+mpedb-types = { workspace = true }
+# xxh3 for the CDC dirty-key hash, matching mpedb-core.
+xxhash-rust = { workspace = true }
+# Source adapters (added as each is built): sqlite via rusqlite (bundled 3.45,
+# proven in mpedb-bench), PostgreSQL via the sync postgres client.
+rusqlite = { version = "0.31", features = ["bundled"] }
