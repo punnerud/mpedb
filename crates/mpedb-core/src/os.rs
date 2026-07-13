@@ -252,12 +252,12 @@ mod macos_lock {
     /// The sidecar-`flock` writer lock. Cheap to clone (Arc).
     pub struct WriterLock {
         inner: Arc<Inner>,
-        devino: (u64, u64),
     }
 
     impl WriterLock {
-        /// Open (creating if absent) the sidecar `<db>.wlock`. Returns the lock
-        /// and its (dev, ino) for the on-disk identity record.
+        /// Open (creating if absent) the sidecar `<db>.wlock`. Processes that
+        /// open the same inode share one OFD (and one local mutex) via the
+        /// per-(dev,ino) registry, so `flock` exclusion is cross-process.
         pub fn open(path: &std::path::Path) -> Result<WriterLock> {
             let file = std::fs::OpenOptions::new()
                 .read(true)
@@ -278,18 +278,14 @@ mod macos_lock {
             let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(inner) = reg.get(&devino).and_then(Weak::upgrade) {
                 drop(file); // reuse the registered OFD; close this duplicate fd
-                return Ok(WriterLock { inner, devino });
+                return Ok(WriterLock { inner });
             }
             let inner = Arc::new(Inner {
                 file,
                 local_mtx: make_errorcheck_mutex(),
             });
             reg.insert(devino, Arc::downgrade(&inner));
-            Ok(WriterLock { inner, devino })
-        }
-
-        pub fn devino(&self) -> (u64, u64) {
-            self.devino
+            Ok(WriterLock { inner })
         }
 
         /// Blocking acquire of exclusion: local mutex (re-entrancy → Err), then
