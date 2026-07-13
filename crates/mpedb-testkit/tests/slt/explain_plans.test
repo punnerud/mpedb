@@ -1,0 +1,273 @@
+# EXPLAIN as executable documentation of the planner: access-path selection
+# (PkPoint > PkRange > IndexPoint > FullScan), residual filters, ORDER BY
+# elision on ascending PK prefixes, and the guarantee that EXPLAIN never
+# executes the inner statement.
+#
+# schema:
+# [[table]]
+# name = "users"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "email"
+#   type = "text"
+#   nullable = false
+#   unique = true
+#
+#   [[table.column]]
+#   name = "age"
+#   type = "int64"
+# end schema
+
+# Equality on the whole PK: point access.
+query T nosort
+EXPLAIN SELECT * FROM users WHERE id = 1
+----
+Select users
+  access: PkPoint(id = 1)
+  project: id, email, age
+  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Point
+
+# Bounds on the PK: range access; both bounds consumed, no residual filter.
+query T nosort
+EXPLAIN SELECT * FROM users WHERE id > 1 AND id <= 5
+----
+Select users
+  access: PkRange(id > 1, id <= 5)
+  project: id, email, age
+  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Range
+
+# Equality on a unique column: secondary-index point probe (index 1), which
+# also touches the PK tree to fetch the row (indexes_used = 0x3).
+query T nosort
+EXPLAIN SELECT * FROM users WHERE email = 'a@x'
+----
+Select users
+  access: IndexPoint(email = 'a@x') via index 1
+  project: id, email, age
+  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x3 key=Full
+
+# No usable key: full scan with the predicate as a residual filter.
+query T nosort
+EXPLAIN SELECT * FROM users WHERE age = 3
+----
+Select users
+  access: FullScan
+  filter: age = 3
+  project: id, email, age
+  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Full
+
+# ORDER BY on an ascending PK prefix is elided (scan order already
+# satisfies it): no `order by:` line.
+query T nosort
+EXPLAIN SELECT * FROM users ORDER BY id
+----
+Select users
+  access: FullScan
+  project: id, email, age
+  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Full
+
+# Descending PK order is NOT elided.
+query T nosort
+EXPLAIN SELECT * FROM users ORDER BY id DESC
+----
+Select users
+  access: FullScan
+  project: id, email, age
+  order by: id DESC
+  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Full
+
+query T nosort
+EXPLAIN SELECT id, age + 1 FROM users WHERE id = 2 LIMIT 3 OFFSET 1
+----
+Select users
+  access: PkPoint(id = 2)
+  project: id, age + 1
+  limit: 3
+  offset: 1
+  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Point
+
+# Non-key conjuncts stay behind as the residual filter.
+query T nosort
+EXPLAIN SELECT * FROM users WHERE id = 1 AND age > 2
+----
+Select users
+  access: PkPoint(id = 1)
+  filter: age > 2
+  project: id, email, age
+  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Point
+
+# PK access beats the secondary index; the email conjunct becomes a filter.
+query T nosort
+EXPLAIN SELECT * FROM users WHERE email = 'a@x' AND id = 1
+----
+Select users
+  access: PkPoint(id = 1)
+  filter: email = 'a@x'
+  project: id, email, age
+  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Point
+
+query T nosort
+EXPLAIN SELECT * FROM users WHERE age IS NULL ORDER BY email LIMIT 2
+----
+Select users
+  access: FullScan
+  filter: age IS NULL
+  project: id, email, age
+  order by: email ASC
+  limit: 2
+  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Full
+
+# ---- DML plans -----------------------------------------------------------------
+
+# Single-row insert with a literal PK: exact point write set; omitted
+# column shows as DEFAULT; inserts maintain every unique index (0x3).
+query T nosort
+EXPLAIN INSERT INTO users (id, email) VALUES (1, 'a@x')
+----
+Insert users
+  row 1: id = 1, email = 'a@x', age = DEFAULT
+  footprint: read_only=false tables_read=0x0 tables_written=0x1 indexes_used=0x3 key=Point
+
+# Multi-row insert degrades the write-set claim to Full.
+query T nosort
+EXPLAIN INSERT INTO users (id, email, age) VALUES (2, 'b@x', 30), (3, 'c@x', NULL)
+----
+Insert users
+  row 1: id = 2, email = 'b@x', age = 30
+  row 2: id = 3, email = 'c@x', age = NULL
+  footprint: read_only=false tables_read=0x0 tables_written=0x1 indexes_used=0x3 key=Full
+
+# Updating a non-indexed column touches only the PK tree (0x1).
+query T nosort
+EXPLAIN UPDATE users SET age = age + 1 WHERE id = 1
+----
+Update users
+  access: PkPoint(id = 1)
+  set: age = age + 1
+  footprint: read_only=false tables_read=0x1 tables_written=0x1 indexes_used=0x1 key=Point
+
+# Updating an indexed column adds its index bit (0x3).
+query T nosort
+EXPLAIN UPDATE users SET email = 'x@x' WHERE age > 10
+----
+Update users
+  access: FullScan
+  filter: age > 10
+  set: email = 'x@x'
+  footprint: read_only=false tables_read=0x1 tables_written=0x1 indexes_used=0x3 key=Full
+
+# Deletes unlink from every index regardless of access path.
+query T nosort
+EXPLAIN DELETE FROM users WHERE id > 3
+----
+Delete users
+  access: PkRange(id > 3)
+  footprint: read_only=false tables_read=0x1 tables_written=0x1 indexes_used=0x3 key=Range
+
+query T nosort
+EXPLAIN DELETE FROM users
+----
+Delete users
+  access: FullScan
+  footprint: read_only=false tables_read=0x1 tables_written=0x1 indexes_used=0x3 key=Full
+
+# ---- EXPLAIN never executes -----------------------------------------------------
+
+statement ok
+INSERT INTO users (id, email, age) VALUES (1, 'a@x', 10)
+
+query T nosort
+EXPLAIN INSERT INTO users (id, email) VALUES (2, 'b@x')
+----
+Insert users
+  row 1: id = 2, email = 'b@x', age = DEFAULT
+  footprint: read_only=false tables_read=0x0 tables_written=0x1 indexes_used=0x3 key=Point
+
+# The explained INSERT above did not run.
+query I nosort
+SELECT id FROM users
+----
+1
+
+query T nosort
+EXPLAIN UPDATE users SET age = 99
+----
+Update users
+  access: FullScan
+  set: age = 99
+  footprint: read_only=false tables_read=0x1 tables_written=0x1 indexes_used=0x1 key=Full
+
+query I nosort
+SELECT age FROM users WHERE id = 1
+----
+10
+
+query T nosort
+EXPLAIN DELETE FROM users
+----
+Delete users
+  access: FullScan
+  footprint: read_only=false tables_read=0x1 tables_written=0x1 indexes_used=0x3 key=Full
+
+query I nosort
+SELECT id FROM users WHERE id = 1
+----
+1
+
+# EXPLAIN still type-checks and binds: errors surface without executing.
+statement error unknown table
+EXPLAIN SELECT * FROM missing
+
+statement error cannot compare
+EXPLAIN SELECT * FROM users WHERE id = 'x'
+
+statement error parse error
+EXPLAIN EXPLAIN SELECT * FROM users
+
+# ---- the planned statements behave as planned -------------------------------------
+
+statement ok
+INSERT INTO users (id, email, age) VALUES (2, 'b@x', 30), (3, 'c@x', NULL)
+
+query I nosort
+SELECT id FROM users WHERE id = 2
+----
+2
+
+query I nosort
+SELECT id FROM users WHERE id > 1 AND id <= 5
+----
+2
+3
+
+query I nosort
+SELECT id FROM users WHERE email = 'b@x'
+----
+2
+
+query I nosort
+SELECT id FROM users WHERE age = 30
+----
+2
+
+statement ok
+UPDATE users SET age = age + 1 WHERE id = 1
+
+query I nosort
+SELECT age FROM users WHERE id = 1
+----
+11
+
+statement ok
+DELETE FROM users WHERE id > 2
+
+query I nosort
+SELECT id FROM users
+----
+1
+2

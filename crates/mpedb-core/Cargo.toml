@@ -1,0 +1,15 @@
+[package]
+name = "mpedb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "mpedb storage engine: shared-memory COW B+tree with MVCC snapshots"
+
+[features]
+# expose the in-memory TestStore to downstream crates' tests
+teststore = []
+
+[dependencies]
+mpedb-types = { workspace = true }
+libc = { workspace = true }
+xxhash-rust = { workspace = true }

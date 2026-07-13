@@ -1,0 +1,19 @@
+[package]
+name = "mpedb-py"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Python bindings for mpedb (CPython 3.12+, abi3)"
+
+[lib]
+# The cdylib is named libmpedb_py.so; rename/copy it to `mpedb.so` (or build
+# with maturin) to import it — the #[pymodule] itself is named `mpedb`.
+name = "mpedb_py"
+crate-type = ["cdylib"]
+
+[dependencies]
+mpedb = { workspace = true }
+chrono = "0.4"
+# pyo3 is deliberately NOT a workspace dependency: only this crate binds Python.
+pyo3 = { version = "0.29.0", features = ["extension-module", "abi3-py312", "chrono"] }

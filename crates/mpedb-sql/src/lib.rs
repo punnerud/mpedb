@@ -1,0 +1,219 @@
+//! mpedb SQL front-end: tokenizer, parser, binder, planner, and
+//! content-hashed compiled plans.
+//!
+//! SQL text is compiled **once** by [`prepare`] into a [`CompiledPlan`] — a
+//! self-contained, deterministically serializable plan with a blake3 content
+//! hash. Other processes execute directly from the serialized form
+//! ([`CompiledPlan::decode`]) with no parsing; decode fully re-validates the
+//! bytes against the schema, because plan blobs live in shared memory and may
+//! be corrupt or hostile.
+//!
+//! Determinism: two statements that differ only in whitespace, keyword case,
+//! or `?` vs `$n` parameter spelling (in the same left-to-right order)
+//! compile to identical plans and identical hashes. Identifiers and literals
+//! are case-/value-sensitive.
+//!
+//! No execution happens in this crate; the executor (a later crate) consumes
+//! [`PlanStmt`] and the plan's [`mpedb_types::Footprint`].
+
+mod ast;
+mod binder;
+mod ddl;
+mod parser;
+mod plan;
+mod planner;
+mod policy;
+mod token;
+
+pub use ddl::{CreatePolicySpec, DdlStmt, RlsAction};
+pub use plan::{AccessPath, CompiledPlan, InsertSource, PlanStmt, Projection};
+pub use planner::secondary_indexes;
+pub use policy::{table_policy_hash, PolicyCatalog, TablePolicies};
+
+/// Parse a row-level-security DDL statement, or `None` if `sql` is ordinary
+/// DML/query text (DESIGN-MULTIDB.md §3.1). The facade calls this before
+/// compiling, and applies any DDL against the catalog directly.
+pub fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
+    parser::parse_ddl(sql)
+}
+
+// Re-export the shared types a plan consumer needs.
+pub use mpedb_types::{
+    ColumnDef, ColumnType, DefaultExpr, Error, ExprProgram, Footprint, Instr, KeyAccess,
+    KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema, TableDef, Value,
+    FORMAT_VERSION,
+};
+
+/// Compile SQL against a schema. Deterministic: identical logical statements
+/// (modulo whitespace/keyword case) against the same schema produce identical
+/// plans and hashes.
+///
+/// `EXPLAIN <stmt>` compiles the inner statement; use
+/// [`prepare_maybe_explain`] to learn whether the source asked for EXPLAIN.
+pub fn prepare(sql: &str, schema: &Schema) -> Result<CompiledPlan> {
+    prepare_with_policies(sql, schema, &PolicyCatalog::empty())
+}
+
+/// Like [`prepare`], additionally reporting whether the statement was wrapped
+/// in `EXPLAIN` (the returned plan is always the inner statement's plan; the
+/// caller renders [`CompiledPlan::explain`] instead of executing).
+pub fn prepare_maybe_explain(sql: &str, schema: &Schema) -> Result<(CompiledPlan, bool)> {
+    prepare_maybe_explain_with_policies(sql, schema, &PolicyCatalog::empty())
+}
+
+/// Compile with row-level-security policies injected (DESIGN-MULTIDB.md §3).
+/// The planner AND-folds each target table's applicable `USING`/`WITH CHECK`
+/// predicates from `catalog` into the statement; an empty catalog is identical
+/// to [`prepare`].
+pub fn prepare_with_policies(
+    sql: &str,
+    schema: &Schema,
+    catalog: &PolicyCatalog,
+) -> Result<CompiledPlan> {
+    Ok(prepare_maybe_explain_with_policies(sql, schema, catalog)?.0)
+}
+
+pub fn prepare_maybe_explain_with_policies(
+    sql: &str,
+    schema: &Schema,
+    catalog: &PolicyCatalog,
+) -> Result<(CompiledPlan, bool)> {
+    let (stmt, is_explain, n_params) = parser::parse_statement(sql)?;
+    let plan = planner::plan_statement(&stmt, schema, n_params, catalog)?;
+    Ok((plan, is_explain))
+}
+
+/// Split an optional leading `alias.` database qualifier off a statement's
+/// table reference, for [`Workspace`](mpedb) routing (DESIGN-MULTIDB.md §1.3).
+/// Returns the alias (if present) and the SQL with the qualifier removed, so
+/// the chosen member database compiles an ordinary single-table plan and its
+/// content hash is unaffected by which alias addressed it.
+///
+/// Routing is done on the **token stream**, never by string search: an
+/// `alias.` sequence inside a string literal, a number, or the `WHERE` clause
+/// can never be mistaken for a table qualifier. Only the statement's single
+/// table reference — the identifier after `FROM`/`INTO`, or after `UPDATE` — is
+/// considered. Statements with no table (`BEGIN`/`COMMIT`/`ROLLBACK`) return
+/// `(None, sql)` unchanged.
+pub fn split_db_alias(sql: &str) -> Result<(Option<String>, String)> {
+    use token::{Kw, Tok};
+    let toks = token::tokenize(sql)?;
+    let table_idx = toks
+        .iter()
+        .position(|t| matches!(t.tok, Tok::Kw(Kw::From) | Tok::Kw(Kw::Into) | Tok::Kw(Kw::Update)))
+        .map(|i| i + 1);
+    let ti = match table_idx {
+        Some(ti) => ti,
+        None => return Ok((None, sql.to_string())),
+    };
+    let ident_of = |t: &Tok| match t {
+        Tok::Ident(s) | Tok::QuotedIdent(s) => Some(s.clone()),
+        _ => None,
+    };
+    if let (Some(a), Some(dot), Some(tb)) = (toks.get(ti), toks.get(ti + 1), toks.get(ti + 2)) {
+        if dot.tok == Tok::Dot {
+            if let (Some(alias), Some(_table)) = (ident_of(&a.tok), ident_of(&tb.tok)) {
+                // Drop the bytes [alias.pos, table.pos): the `alias.` qualifier
+                // (and any surrounding spaces), leaving the bare table name.
+                let mut out = String::with_capacity(sql.len());
+                out.push_str(&sql[..a.pos]);
+                out.push_str(&sql[tb.pos..]);
+                return Ok((Some(alias), out));
+            }
+        }
+    }
+    Ok((None, sql.to_string()))
+}
+
+/// Validate an RLS policy predicate source (`USING` / `WITH CHECK`) against a
+/// table at policy-creation time (DESIGN-MULTIDB.md §3): it must parse, type to
+/// bool, reference only the table's columns / literals / `current_setting()`,
+/// and use no `$`/`?` parameters (policies cannot reference query params).
+pub fn validate_policy_expr(src: &str, table: &TableDef) -> Result<()> {
+    let (expr, n_params) = parser::parse_expr_only(src)?;
+    if n_params > 0 {
+        return Err(Error::Bind(
+            "RLS policy predicates may not use `$`/`?` parameters; use current_setting()".into(),
+        ));
+    }
+    // allow_params=true enables `current_setting()`; no `$` params can reach it
+    // (rejected above). bind_predicate requires the result to be boolean.
+    let mut binder = binder::Binder::new(table, 0, true);
+    binder.bind_predicate(&expr)?;
+    Ok(())
+}
+
+/// Compile a CHECK-constraint expression against one table at attach time.
+/// Parses a single expression (no statement), binds it against the table's
+/// columns with **no parameters allowed**, and requires it to type to bool.
+pub fn compile_check(expr_src: &str, table: &TableDef) -> Result<ExprProgram> {
+    let (expr, n_params) = parser::parse_expr_only(expr_src)?;
+    if n_params > 0 {
+        return Err(Error::Bind(
+            "parameters are not allowed in CHECK expressions".into(),
+        ));
+    }
+    let mut binder = binder::Binder::new(table, 0, false);
+    let bound = binder.bind_check(&expr)?;
+    binder::compile_program(&bound)
+}
+
+#[cfg(test)]
+mod route_tests {
+    use super::split_db_alias;
+
+    fn split(sql: &str) -> (Option<String>, String) {
+        split_db_alias(sql).unwrap()
+    }
+
+    #[test]
+    fn strips_qualifier_from_each_statement_shape() {
+        assert_eq!(
+            split("SELECT * FROM billing.orders WHERE id = $1"),
+            (Some("billing".into()), "SELECT * FROM orders WHERE id = $1".into())
+        );
+        assert_eq!(
+            split("INSERT INTO shared.tenants (id) VALUES (1)"),
+            (Some("shared".into()), "INSERT INTO tenants (id) VALUES (1)".into())
+        );
+        assert_eq!(
+            split("UPDATE billing.orders SET total = 5 WHERE id = 1"),
+            (Some("billing".into()), "UPDATE orders SET total = 5 WHERE id = 1".into())
+        );
+        assert_eq!(
+            split("DELETE FROM billing.orders WHERE id = 1"),
+            (Some("billing".into()), "DELETE FROM orders WHERE id = 1".into())
+        );
+    }
+
+    #[test]
+    fn unqualified_and_tableless_pass_through() {
+        assert_eq!(split("SELECT * FROM orders"), (None, "SELECT * FROM orders".into()));
+        assert_eq!(split("BEGIN"), (None, "BEGIN".into()));
+        assert_eq!(split("COMMIT"), (None, "COMMIT".into()));
+    }
+
+    #[test]
+    fn explain_prefix_is_handled() {
+        assert_eq!(
+            split("EXPLAIN SELECT * FROM billing.orders"),
+            (Some("billing".into()), "EXPLAIN SELECT * FROM orders".into())
+        );
+    }
+
+    #[test]
+    fn dotted_text_inside_a_string_literal_is_not_a_qualifier() {
+        // The `x.y` lives in a string literal, not the table reference: the
+        // token-level router must leave it untouched.
+        let sql = "SELECT * FROM orders WHERE note = 'from a.b to c'";
+        assert_eq!(split(sql), (None, sql.to_string()));
+    }
+
+    #[test]
+    fn quoted_alias_and_table() {
+        assert_eq!(
+            split("SELECT * FROM \"billing\".\"orders\""),
+            (Some("billing".into()), "SELECT * FROM \"orders\"".into())
+        );
+    }
+}

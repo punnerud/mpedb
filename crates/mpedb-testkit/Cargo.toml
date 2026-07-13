@@ -1,0 +1,9 @@
+[package]
+name = "mpedb-testkit"
+description = "SQLite-inspired correctness battery for mpedb: sqllogictest runner, curated corpus, differential tester"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+mpedb = { workspace = true }

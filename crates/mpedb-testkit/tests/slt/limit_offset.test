@@ -1,0 +1,209 @@
+# LIMIT / OFFSET edge cases: zero, exact, beyond-end, OFFSET without LIMIT,
+# interaction with WHERE and ORDER BY, and the literal-only grammar rules.
+#
+# schema:
+# [[table]]
+# name = "t"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "v"
+#   type = "text"
+# end schema
+
+statement ok
+INSERT INTO t (id, v) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')
+
+statement ok
+INSERT INTO t (id, v) VALUES (6, 'f'), (7, 'g'), (8, 'h'), (9, 'i'), (10, 'j')
+
+# LIMIT 0 returns nothing.
+query I nosort
+SELECT id FROM t LIMIT 0
+----
+
+query I nosort
+SELECT id FROM t LIMIT 1
+----
+1
+
+query I nosort
+SELECT id FROM t LIMIT 3
+----
+1
+2
+3
+
+# LIMIT of exactly the row count.
+query I nosort
+SELECT id FROM t LIMIT 10
+----
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+# LIMIT beyond the end returns everything.
+query I nosort
+SELECT id FROM t LIMIT 15
+----
+1
+2
+3
+4
+5
+6
+7
+8
+9
+10
+
+query I nosort
+SELECT id FROM t LIMIT 5 OFFSET 0
+----
+1
+2
+3
+4
+5
+
+# OFFSET is allowed without LIMIT.
+query I nosort
+SELECT id FROM t OFFSET 3
+----
+4
+5
+6
+7
+8
+9
+10
+
+query I nosort
+SELECT id FROM t OFFSET 9
+----
+10
+
+# OFFSET of exactly the row count: empty.
+query I nosort
+SELECT id FROM t OFFSET 10
+----
+
+# OFFSET beyond the end: empty.
+query I nosort
+SELECT id FROM t OFFSET 15
+----
+
+query I nosort
+SELECT id FROM t LIMIT 0 OFFSET 0
+----
+
+query I nosort
+SELECT id FROM t LIMIT 0 OFFSET 5
+----
+
+# LIMIT truncates at the end after the OFFSET is applied.
+query I nosort
+SELECT id FROM t LIMIT 3 OFFSET 8
+----
+9
+10
+
+query I nosort
+SELECT id FROM t LIMIT 5 OFFSET 5
+----
+6
+7
+8
+9
+10
+
+query I nosort
+SELECT id FROM t LIMIT 2 OFFSET 0
+----
+1
+2
+
+query I nosort
+SELECT id FROM t LIMIT 1 OFFSET 9
+----
+10
+
+query I nosort
+SELECT id FROM t LIMIT 1 OFFSET 10
+----
+
+query I nosort
+SELECT id FROM t LIMIT 100 OFFSET 8
+----
+9
+10
+
+# OFFSET applies after the sort.
+query I nosort
+SELECT id FROM t ORDER BY id DESC LIMIT 3
+----
+10
+9
+8
+
+query I nosort
+SELECT id FROM t ORDER BY id DESC LIMIT 3 OFFSET 8
+----
+2
+1
+
+query I nosort
+SELECT id FROM t ORDER BY v DESC LIMIT 2
+----
+10
+9
+
+# LIMIT applies after WHERE filtering.
+query I nosort
+SELECT id FROM t WHERE id > 4 LIMIT 2
+----
+5
+6
+
+query I nosort
+SELECT id FROM t WHERE id > 4 LIMIT 2 OFFSET 4
+----
+9
+10
+
+query I nosort
+SELECT id FROM t WHERE id > 100 LIMIT 5
+----
+
+# LIMIT/OFFSET take non-negative integer literals only (no expressions,
+# no parameters, no negatives -- Phase 1 grammar).
+statement error non-negative integer
+SELECT id FROM t LIMIT -1
+
+statement error non-negative integer
+SELECT id FROM t LIMIT 2.5
+
+statement error non-negative integer
+SELECT id FROM t OFFSET -3
+
+statement error non-negative integer
+SELECT id FROM t LIMIT 'x'
+
+# The literal is consumed, then `+ 1` is trailing input.
+statement error parse error
+SELECT id FROM t LIMIT 1 + 1
+
+# OFFSET must follow LIMIT, not precede it.
+statement error parse error
+SELECT id FROM t OFFSET 2 LIMIT 5

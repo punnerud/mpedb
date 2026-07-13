@@ -1,0 +1,252 @@
+# bool and blob columns, plus text edge cases: true/false literals, blob
+# x'..' literals (bytewise comparison and ordering), empty blob vs empty
+# string, quote escaping, and binary text collation (uppercase sorts before
+# lowercase in ASCII).
+#
+# schema:
+# [[table]]
+# name = "t"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "flag"
+#   type = "bool"
+#
+#   [[table.column]]
+#   name = "data"
+#   type = "blob"
+#
+#   [[table.column]]
+#   name = "s"
+#   type = "text"
+# end schema
+
+statement ok
+INSERT INTO t (id, flag, data, s) VALUES (1, true, x'00', 'plain'), (2, false, x'ff01', 'UPPER'), (3, NULL, x'', '')
+
+statement ok
+INSERT INTO t (id, flag, data, s) VALUES (4, true, NULL, 'it''s'), (5, false, x'0f', 'hello world'), (6, NULL, x'deadbeef', NULL)
+
+# ---- bool -----------------------------------------------------------------------
+
+query T nosort
+SELECT flag FROM t
+----
+true
+false
+NULL
+true
+false
+NULL
+
+query I nosort
+SELECT id FROM t WHERE flag
+----
+1
+4
+
+query I nosort
+SELECT id FROM t WHERE NOT flag
+----
+2
+5
+
+query I nosort
+SELECT id FROM t WHERE flag = true
+----
+1
+4
+
+query I nosort
+SELECT id FROM t WHERE flag <> false
+----
+1
+4
+
+query I nosort
+SELECT id FROM t WHERE flag IS NULL
+----
+3
+6
+
+# bool ordering: false < true, NULLS FIRST ascending...
+query I nosort
+SELECT id FROM t ORDER BY flag
+----
+3
+6
+2
+5
+1
+4
+
+# ...and NULLS LAST descending.
+query I nosort
+SELECT id FROM t ORDER BY flag DESC
+----
+1
+4
+2
+5
+3
+6
+
+# A non-NULL value always equals itself.
+query I nosort
+SELECT id FROM t WHERE flag = flag
+----
+1
+2
+4
+5
+
+# ---- blob -----------------------------------------------------------------------
+
+query T nosort
+SELECT data FROM t WHERE id = 6
+----
+x'deadbeef'
+
+query I nosort
+SELECT id FROM t WHERE data = x'00'
+----
+1
+
+# The empty blob is a real value, distinct from NULL.
+query I nosort
+SELECT id FROM t WHERE data = x''
+----
+3
+
+# Bytewise comparison.
+query I nosort
+SELECT id FROM t WHERE data > x'0f'
+----
+2
+6
+
+query I nosort
+SELECT id FROM t WHERE data < x'0f'
+----
+1
+3
+
+# The empty blob sorts BELOW x'00' (bytewise: a proper prefix is smaller),
+# so id 3 is excluded here.
+query I nosort
+SELECT id FROM t WHERE data >= x'00'
+----
+1
+2
+5
+6
+
+# Blob ordering: NULL, then x'' (prefix of everything), then bytewise.
+query I nosort
+SELECT id FROM t ORDER BY data
+----
+4
+3
+1
+5
+6
+2
+
+# ---- text edges ------------------------------------------------------------------
+
+query T nosort
+SELECT s FROM t WHERE id = 3
+----
+(empty)
+
+query T nosort
+SELECT s FROM t WHERE id = 4
+----
+it's
+
+query T nosort
+SELECT s FROM t WHERE id = 5
+----
+hello world
+
+query I nosort
+SELECT id FROM t WHERE s = ''
+----
+3
+
+# Binary collation: 'UPPER' (0x55...) sorts below 'a' (0x61).
+query I nosort
+SELECT id FROM t WHERE s < 'a'
+----
+2
+3
+
+query I nosort
+SELECT id FROM t ORDER BY s
+----
+6
+3
+2
+5
+4
+1
+
+# ---- cross-type rejections ----------------------------------------------------------
+
+statement error cannot compare
+SELECT id FROM t WHERE data = 'x'
+
+statement error cannot compare
+SELECT id FROM t WHERE s = x'00'
+
+statement error arithmetic
+SELECT id FROM t WHERE flag + 1 = 2
+
+statement error cannot negate
+SELECT id FROM t WHERE -flag
+
+statement error cannot compare
+SELECT id FROM t WHERE flag = 1
+
+statement error LIKE requires text
+SELECT id FROM t WHERE data LIKE 'x'
+
+# ---- DML on bool/blob -----------------------------------------------------------------
+
+# NOT flag as a SET expression: toggles, NULL stays NULL.
+statement ok
+UPDATE t SET flag = NOT flag
+
+query T nosort
+SELECT flag FROM t
+----
+false
+true
+NULL
+false
+true
+NULL
+
+statement ok
+UPDATE t SET data = x'aa' WHERE id = 4
+
+query T nosort
+SELECT data FROM t WHERE id = 4
+----
+x'aa'
+
+statement ok
+DELETE FROM t WHERE data = x'ff01'
+
+query I nosort
+SELECT id FROM t
+----
+1
+3
+4
+5
+6

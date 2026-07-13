@@ -1,0 +1,309 @@
+# Composite primary keys: full pinning (point access), prefix equality
+# (point-range over the first column), inclusive/exclusive range bounds on
+# the first column with prefix semantics, second-column predicates as
+# residual filters, and PK immutability.
+#
+# schema:
+# [[table]]
+# name = "orders"
+# primary_key = ["a", "b"]
+#
+#   [[table.column]]
+#   name = "a"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "b"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "note"
+#   type = "text"
+# end schema
+
+statement ok
+INSERT INTO orders (a, b, note) VALUES (1, 1, 'n11'), (1, 2, 'n12'), (1, 3, 'n13')
+
+statement ok
+INSERT INTO orders (a, b, note) VALUES (2, 1, 'n21'), (2, 2, 'n22')
+
+statement ok
+INSERT INTO orders (a, b, note) VALUES (3, 1, 'n31'), (3, 5, 'n35'), (10, 1, 'na1')
+
+# Every PK column pinned by equality: point access.
+query II nosort
+SELECT a, b FROM orders WHERE a = 1 AND b = 2
+----
+1
+2
+
+query T nosort
+SELECT note FROM orders WHERE a = 3 AND b = 5
+----
+n35
+
+query II nosort
+SELECT a, b FROM orders WHERE a = 1 AND b = 9
+----
+
+# Prefix equality alone: an inclusive point-range over all (1, *) keys.
+query II nosort
+SELECT a, b FROM orders WHERE a = 1
+----
+1
+1
+1
+2
+1
+3
+
+# ---- ranges over the first PK column: prefix semantics ---------------------------
+
+# Inclusive lower bound catches every (2,*) row from its first key on.
+query II nosort
+SELECT a, b FROM orders WHERE a >= 2
+----
+2
+1
+2
+2
+3
+1
+3
+5
+10
+1
+
+# Exclusive lower bound skips ALL (2,*) rows, not just (2,1).
+query II nosort
+SELECT a, b FROM orders WHERE a > 2
+----
+3
+1
+3
+5
+10
+1
+
+query II nosort
+SELECT a, b FROM orders WHERE a > 1 AND a < 3
+----
+2
+1
+2
+2
+
+# Inclusive upper bound includes the full (2,*) group.
+query II nosort
+SELECT a, b FROM orders WHERE a <= 2
+----
+1
+1
+1
+2
+1
+3
+2
+1
+2
+2
+
+query II nosort
+SELECT a, b FROM orders WHERE a >= 1 AND a < 2
+----
+1
+1
+1
+2
+1
+3
+
+query II nosort
+SELECT a, b FROM orders WHERE a < 1
+----
+
+query II nosort
+SELECT a, b FROM orders WHERE a > 9
+----
+10
+1
+
+query II nosort
+SELECT a, b FROM orders WHERE a >= 3 AND a <= 3
+----
+3
+1
+3
+5
+
+# ---- second-column predicates ride along as residual filters ----------------------
+
+query II nosort
+SELECT a, b FROM orders WHERE a = 2 AND b > 1
+----
+2
+2
+
+query II nosort
+SELECT a, b FROM orders WHERE a = 1 AND b >= 2
+----
+1
+2
+1
+3
+
+query II nosort
+SELECT a, b FROM orders WHERE a = 1 AND b > 2
+----
+1
+3
+
+query II nosort
+SELECT a, b FROM orders WHERE a = 3 AND b < 5
+----
+3
+1
+
+# The second PK column alone cannot seed a range: full scan + filter.
+query II nosort
+SELECT a, b FROM orders WHERE b = 1
+----
+1
+1
+2
+1
+3
+1
+10
+1
+
+query II nosort
+SELECT a, b FROM orders WHERE b > 2
+----
+1
+3
+3
+5
+
+# Arithmetic hides the column from the planner: full scan + filter, same rows.
+query II nosort
+SELECT a, b FROM orders WHERE a + 0 = 2
+----
+2
+1
+2
+2
+
+# ---- ORDER BY over composite keys ---------------------------------------------------
+
+# ORDER BY on the full PK (ascending) is scan order.
+query II nosort
+SELECT a, b FROM orders ORDER BY a, b
+----
+1
+1
+1
+2
+1
+3
+2
+1
+2
+2
+3
+1
+3
+5
+10
+1
+
+query II nosort
+SELECT a, b FROM orders ORDER BY b, a
+----
+1
+1
+2
+1
+3
+1
+10
+1
+1
+2
+2
+2
+1
+3
+3
+5
+
+query II nosort
+SELECT a, b FROM orders ORDER BY a DESC, b DESC
+----
+10
+1
+3
+5
+3
+1
+2
+2
+2
+1
+1
+3
+1
+2
+1
+1
+
+# ---- DML on composite keys -----------------------------------------------------------
+
+statement ok
+DELETE FROM orders WHERE a = 1 AND b = 2
+
+query II nosort
+SELECT a, b FROM orders WHERE a = 1
+----
+1
+1
+1
+3
+
+statement ok
+UPDATE orders SET note = 'x' WHERE a = 3
+
+query T nosort
+SELECT note FROM orders WHERE a = 3
+----
+x
+x
+
+# No PK column may be updated -- not even part of one.
+statement error primary key
+UPDATE orders SET b = 1 WHERE a = 1
+
+statement error primary key
+UPDATE orders SET a = 5
+
+statement error PRIMARY KEY
+INSERT INTO orders (a, b, note) VALUES (2, 2, 'dup')
+
+statement ok
+INSERT INTO orders (a, b, note) VALUES (2, 3, 'n23')
+
+query II nosort
+SELECT a, b FROM orders WHERE a = 2
+----
+2
+1
+2
+2
+2
+3
+
+query II nosort
+SELECT a, b FROM orders WHERE a = 2 AND b = 3 AND note = 'n23'
+----
+2
+3

@@ -1,0 +1,199 @@
+# Constraint enforcement: PRIMARY KEY, UNIQUE (secondary index), NOT NULL,
+# and CHECK. Failed statements leave the database untouched (autocommit
+# statements are transactions). NULL passes CHECK (SQL standard: only FALSE
+# violates) and NULLs never collide in a UNIQUE index.
+#
+# schema:
+# [[table]]
+# name = "users"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "email"
+#   type = "text"
+#   nullable = false
+#   unique = true
+#
+#   [[table.column]]
+#   name = "age"
+#   type = "int64"
+#   check = "age >= 0 AND age < 200"
+#
+#   [[table.column]]
+#   name = "nick"
+#   type = "text"
+#   unique = true
+# end schema
+
+statement ok
+INSERT INTO users (id, email, age, nick) VALUES (1, 'a@x', 30, 'al')
+
+# CHECK boundaries: 0 and 199 are inside.
+statement ok
+INSERT INTO users (id, email, age, nick) VALUES (2, 'b@x', 0, 'bo')
+
+statement ok
+INSERT INTO users (id, email, age, nick) VALUES (3, 'c@x', 199, NULL)
+
+# ---- PRIMARY KEY -------------------------------------------------------------
+
+statement error PRIMARY KEY
+INSERT INTO users (id, email, age, nick) VALUES (1, 'z@x', 10, NULL)
+
+# The failed insert changed nothing.
+query T nosort
+SELECT email FROM users WHERE id = 1
+----
+a@x
+
+# ---- UNIQUE -------------------------------------------------------------------
+
+statement error UNIQUE
+INSERT INTO users (id, email, age, nick) VALUES (4, 'a@x', 10, NULL)
+
+query I nosort
+SELECT id FROM users WHERE id = 4
+----
+
+statement error UNIQUE
+INSERT INTO users (id, email, age, nick) VALUES (4, 'd@x', 10, 'al')
+
+# NULL never collides in a unique index.
+statement ok
+INSERT INTO users (id, email, age, nick) VALUES (4, 'd@x', 10, NULL)
+
+statement ok
+INSERT INTO users (id, email, age, nick) VALUES (5, 'e@x', NULL, NULL)
+
+query I nosort
+SELECT id FROM users WHERE nick IS NULL
+----
+3
+4
+5
+
+# ---- CHECK ---------------------------------------------------------------------
+
+# NULL age passes the CHECK (UNKNOWN is not a violation).
+query I nosort
+SELECT id FROM users WHERE age IS NULL
+----
+5
+
+statement error CHECK
+INSERT INTO users (id, email, age, nick) VALUES (6, 'f@x', -1, NULL)
+
+statement error CHECK
+INSERT INTO users (id, email, age, nick) VALUES (6, 'f@x', 200, NULL)
+
+statement ok
+INSERT INTO users (id, email, age, nick) VALUES (6, 'f@x', 199, 'fi')
+
+query I nosort
+SELECT id FROM users
+----
+1
+2
+3
+4
+5
+6
+
+# ---- NOT NULL ------------------------------------------------------------------
+
+# Explicit NULL into a NOT NULL column is rejected at prepare time.
+statement error NULL
+INSERT INTO users (id, email, age, nick) VALUES (7, NULL, 10, NULL)
+
+# Omitting a NOT NULL column without a default is rejected too.
+statement error email
+INSERT INTO users (id, age) VALUES (7, 10)
+
+statement error NULL
+UPDATE users SET email = NULL WHERE id = 1
+
+# A NULL that only materializes at runtime (from another column) is caught
+# by the engine.
+statement error NOT NULL
+UPDATE users SET email = nick WHERE id = 5
+
+query T nosort
+SELECT email FROM users WHERE id = 5
+----
+e@x
+
+# ---- constraint violations via UPDATE ------------------------------------------
+
+statement error UNIQUE
+UPDATE users SET email = 'a@x' WHERE id = 2
+
+query T nosort
+SELECT email FROM users WHERE id = 2
+----
+b@x
+
+# Setting a unique column to its current value is not a collision.
+statement ok
+UPDATE users SET email = 'b@x' WHERE id = 2
+
+statement error CHECK
+UPDATE users SET age = -5 WHERE id = 1
+
+query I nosort
+SELECT age FROM users WHERE id = 1
+----
+30
+
+# Multi-row UPDATE hitting a CHECK violation mid-way rolls the whole
+# statement back (id 2 has age 0; 0 - 100 violates).
+statement error CHECK
+UPDATE users SET age = age - 100
+
+query I nosort
+SELECT age FROM users
+----
+30
+0
+199
+10
+NULL
+199
+
+statement ok
+UPDATE users SET age = age + 1 WHERE id = 2
+
+query I nosort
+SELECT age FROM users WHERE id = 2
+----
+1
+
+statement error UNIQUE
+UPDATE users SET nick = 'al' WHERE id = 2
+
+# Releasing the nick makes it available again.
+statement ok
+UPDATE users SET nick = NULL WHERE id = 1
+
+statement ok
+INSERT INTO users (id, email, age, nick) VALUES (7, 'g@x', 10, 'al')
+
+query I nosort
+SELECT id FROM users WHERE nick = 'al'
+----
+7
+
+statement error primary key
+UPDATE users SET id = 99 WHERE id = 7
+
+query T nosort
+SELECT nick FROM users WHERE id = 7
+----
+al
+
+# PK columns are implicitly NOT NULL: a NULL PK can never be inserted.
+statement error NULL
+INSERT INTO users (id, email) VALUES (NULL, 'h@x')

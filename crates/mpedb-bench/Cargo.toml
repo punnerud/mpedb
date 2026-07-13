@@ -1,0 +1,20 @@
+[package]
+name = "mpedb-bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "Head-to-head benchmark: mpedb vs SQLite vs PostgreSQL on this machine"
+
+[dependencies]
+mpedb = { workspace = true }
+# rusqlite 0.31 bundles SQLite 3.45.0 (libsqlite3-sys 0.28). The system has
+# only libsqlite3.so.0 (no dev symlink, no header): linking -lsqlite3 fails,
+# so the bundled build is required on this machine (verified 2026-07-13).
+rusqlite = { version = "0.31", features = ["bundled"] }
+# Synchronous client for the throwaway PostgreSQL 16 instance (unix socket).
+postgres = "0.19"
+
+[[bin]]
+name = "mpedb-bench"
+path = "src/main.rs"
