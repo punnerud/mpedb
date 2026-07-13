@@ -965,6 +965,7 @@ impl<'e> WriteTxn<'e> {
         payload: &[u8],
     ) -> Result<bool> {
         debug_assert!(self.eng.sec_indexes[table_id as usize].is_empty());
+        self.check_write_blocked(table_id)?;
         let (root, count) = self.tree_root(table_id, 0)?;
         let out = btree::insert(self, root, key, payload, InsertMode::InsertOnly)?;
         if out.existed {
@@ -983,6 +984,7 @@ impl<'e> WriteTxn<'e> {
         payload: &[u8],
     ) -> Result<()> {
         debug_assert!(self.eng.sec_indexes[table_id as usize].is_empty());
+        self.check_write_blocked(table_id)?;
         let (root, count) = self.tree_root(table_id, 0)?;
         let out = btree::insert(self, root, key, payload, InsertMode::Upsert)?;
         self.set_tree_root(table_id, 0, out.new_root, count);
@@ -993,6 +995,7 @@ impl<'e> WriteTxn<'e> {
     /// Blind DELETE of a PK. Returns whether the row existed.
     pub fn optimistic_delete(&mut self, table_id: u32, key: &[u8]) -> Result<bool> {
         debug_assert!(self.eng.sec_indexes[table_id as usize].is_empty());
+        self.check_write_blocked(table_id)?;
         let (root, count) = self.tree_root(table_id, 0)?;
         let out = btree::delete(self, root, key)?;
         if out.existed {
@@ -1005,6 +1008,7 @@ impl<'e> WriteTxn<'e> {
     // ---------- typed row API ----------
 
     pub fn insert_row(&mut self, table_id: u32, values: &[Value]) -> Result<()> {
+        self.check_write_blocked(table_id)?;
         self.eng.validate_row(table_id, values)?;
         let table = self.eng.table(table_id)?;
         let tname = table.name.clone();
@@ -1070,6 +1074,7 @@ impl<'e> WriteTxn<'e> {
 
     /// Delete by primary key; returns whether the row existed.
     pub fn delete_by_pk(&mut self, table_id: u32, pk_values: &[Value]) -> Result<bool> {
+        self.check_write_blocked(table_id)?;
         let key = keycode::encode_key(pk_values);
         let (root, count) = self.tree_root(table_id, 0)?;
         // fetch old row first: index maintenance needs its column values
@@ -1103,6 +1108,7 @@ impl<'e> WriteTxn<'e> {
     /// Replace the row with the given PK. PK columns must be unchanged
     /// (enforced; the SQL layer rejects PK updates at bind time too).
     pub fn update_by_pk(&mut self, table_id: u32, new_values: &[Value]) -> Result<bool> {
+        self.check_write_blocked(table_id)?;
         self.eng.validate_row(table_id, new_values)?;
         let table = self.eng.table(table_id)?;
         let tname = table.name.clone();
@@ -1324,6 +1330,20 @@ impl<'e> WriteTxn<'e> {
         };
         self.capture_cfg = Some(c);
         Ok(c)
+    }
+
+    /// Refuse a mutation targeting a write-blocked (frozen) table. Checked from
+    /// the txn's own snapshot under the writer lock, before any side effect, so
+    /// the mirror's authority-switch freeze (DESIGN-MIRROR §3.9) covers every
+    /// write path — typed API, optimistic blind-apply, ring-leader-executed
+    /// intents, and raw-engine users — not just the facade. Independent of
+    /// capture suppression: a frozen table is unwritable even on the
+    /// replication plane.
+    fn check_write_blocked(&mut self, table_id: u32) -> Result<()> {
+        if self.capture_config()?.is_blocked(table_id) {
+            return Err(Error::Frozen { table_id });
+        }
+        Ok(())
     }
 
     /// Record a dirty entry for a captured table after a successful mutation.
@@ -2277,6 +2297,98 @@ primary_key = ["id"]
             .unwrap();
         r.finish().unwrap();
         raw.iter().map(|(_, v)| DirtyEntry::decode(v).unwrap()).collect()
+    }
+
+    fn set_write_block(eng: &Engine, blocked: &[u32]) {
+        let mut cfg = CaptureConfig::default();
+        for &t in blocked {
+            cfg.set_blocked(t, true);
+        }
+        cfg.generation = 1;
+        let mut w = eng.begin_write().unwrap();
+        w.set_capture(false);
+        w.sys_put(cdc::CDC_TABS_KEY, &cfg.encode()).unwrap();
+        w.commit().unwrap();
+    }
+
+    #[test]
+    fn cdc_write_block_refuses_typed_mutators_with_no_side_effects() {
+        let cfg = test_config("cdcblock", 8);
+        let eng = open(&cfg);
+        let mut w = eng.begin_write().unwrap();
+        w.insert_row(0, &user(1, "a@x.no", Some(10))).unwrap();
+        w.commit().unwrap();
+
+        set_write_block(&eng, &[0]);
+
+        let mut w = eng.begin_write().unwrap();
+        assert!(matches!(
+            w.insert_row(0, &user(2, "b@x.no", Some(20))),
+            Err(Error::Frozen { table_id: 0 })
+        ));
+        assert!(matches!(
+            w.update_by_pk(0, &user(1, "a2@x.no", Some(11))),
+            Err(Error::Frozen { table_id: 0 })
+        ));
+        assert!(matches!(
+            w.delete_by_pk(0, &[Value::Int(1)]),
+            Err(Error::Frozen { table_id: 0 })
+        ));
+        drop(w); // abort
+
+        // the seeded row is untouched (the checks fired before any side effect)
+        let mut w = eng.begin_write().unwrap();
+        assert!(w.get_by_pk(0, &[Value::Int(1)]).unwrap().is_some());
+        assert!(w.get_by_pk(0, &[Value::Int(2)]).unwrap().is_none());
+        drop(w);
+
+        // clearing the block re-enables writes
+        set_write_block(&eng, &[]);
+        let mut w = eng.begin_write().unwrap();
+        w.insert_row(0, &user(2, "b@x.no", Some(20))).unwrap();
+        w.commit().unwrap();
+        let mut w = eng.begin_write().unwrap();
+        assert!(w.get_by_pk(0, &[Value::Int(2)]).unwrap().is_some());
+        drop(w);
+        eng.verify_page_accounting().unwrap();
+    }
+
+    #[test]
+    fn cdc_write_block_refuses_optimistic_blind_apply() {
+        let path = std::env::temp_dir()
+            .join("mpedb-engine-tests")
+            .join(format!("cdcblockopt-{}.mpedb", std::process::id()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let toml = format!(
+            "[database]\npath = \"{}\"\nsize_mb = 8\nmax_readers = 64\n\
+             [[table]]\nname = \"kv\"\nprimary_key = [\"id\"]\n\
+             [[table.column]]\nname = \"id\"\ntype = \"int64\"\n\
+             [[table.column]]\nname = \"v\"\ntype = \"int64\"\n",
+            path.display()
+        );
+        let cfg = Config::from_toml_str(&toml).unwrap();
+        let eng = Engine::open(&cfg, vec![vec![]]).unwrap();
+        set_write_block(&eng, &[0]);
+
+        let key = keycode::encode_key(&[Value::Int(7)]);
+        let payload =
+            row::encode_row(&[Value::Int(7), Value::Int(1)], &[ColumnType::Int64; 2]).unwrap();
+        let mut w = eng.begin_write().unwrap();
+        assert!(matches!(
+            w.optimistic_insert(0, &key, &payload),
+            Err(Error::Frozen { table_id: 0 })
+        ));
+        assert!(matches!(
+            w.optimistic_upsert(0, &key, &payload),
+            Err(Error::Frozen { table_id: 0 })
+        ));
+        assert!(matches!(
+            w.optimistic_delete(0, &key),
+            Err(Error::Frozen { table_id: 0 })
+        ));
+        drop(w);
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
