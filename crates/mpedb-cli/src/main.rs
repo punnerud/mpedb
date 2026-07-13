@@ -13,6 +13,7 @@ mod bench;
 mod collide;
 mod crash;
 mod dump;
+mod mirror;
 mod powerloss;
 mod proc_cmd;
 mod render;
@@ -80,6 +81,7 @@ fn dispatch(argv: &[String]) -> CliResult {
         "stress" => stress::run_parent(rest),
         "crash" => crash::run_parent(rest),
         "collide" => collide::run_parent(rest),
+        "mirror" => mirror::run(rest),
         "powerloss" => powerloss::run_parent(rest),
         "stress-child" => stress::run_child(rest),
         "crash-child" => crash::run_child(rest),

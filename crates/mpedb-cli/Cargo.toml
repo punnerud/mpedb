@@ -13,5 +13,8 @@ path = "src/main.rs"
 mpedb = { workspace = true }
 mpedb-core = { workspace = true }
 mpedb-proc = { workspace = true }
+mpedb-mirror = { workspace = true }
 mpedb-types = { workspace = true }
 libc = { workspace = true }
+# sqlite source for `mirror import` (bundled 3.45, as in mpedb-bench).
+rusqlite = { version = "0.31", features = ["bundled"] }
