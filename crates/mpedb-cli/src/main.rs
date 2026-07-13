@@ -10,6 +10,7 @@
 
 mod args;
 mod bench;
+mod collide;
 mod crash;
 mod dump;
 mod powerloss;
@@ -36,6 +37,8 @@ usage: mpedb <command> [args]
   bench   <config.toml>|--auto [--secs N] [--durability M] [--disk DIR]
   stress  --dir <dir> --workers N --secs S --mode bank|unique|mixed|incr
   crash   --dir <dir> --waves W --children C
+  collide --dir <dir> [--writers N] [--total T] [--drop-rate R] [--jitter-us J]
+          [--keyspace K] [--detached-pct P] [--durability M]  (writer-collision fuzz)
   powerloss --dir <dir> [--rounds N] [--workers W] [--durability wal|async]
 
 bench --auto accepts --durability none|commit|async|wal (default none); use
@@ -76,9 +79,11 @@ fn dispatch(argv: &[String]) -> CliResult {
         "bench" => bench::run(rest),
         "stress" => stress::run_parent(rest),
         "crash" => crash::run_parent(rest),
+        "collide" => collide::run_parent(rest),
         "powerloss" => powerloss::run_parent(rest),
         "stress-child" => stress::run_child(rest),
         "crash-child" => crash::run_child(rest),
+        "collide-child" => collide::run_child(rest),
         "powerloss-child" => powerloss::run_child(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
