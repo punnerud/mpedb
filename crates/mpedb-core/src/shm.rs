@@ -817,6 +817,10 @@ impl Shm {
         LOCK_PAGE as usize * PAGE_SIZE + field
     }
 
+    // Linux drives the shared PROCESS_SHARED robust mutex directly; macOS routes
+    // writer exclusion through the FLD-2 sidecar flock (crate::os::WriterLock),
+    // so this shared-memory mutex pointer is unused there.
+    #[cfg(target_os = "linux")]
     fn mutex_ptr(&self) -> *mut libc::pthread_mutex_t {
         self.at(Self::lock_area_off(LA_MUTEX)) as *mut libc::pthread_mutex_t
     }
@@ -1031,8 +1035,15 @@ impl Shm {
     }
 
     pub fn msync_range(&self, offset: usize, len: usize) -> Result<()> {
-        // round down to page boundary as required by msync
-        let start = offset & !(PAGE_SIZE - 1);
+        // msync requires the base address aligned to the OS page size. On Linux
+        // that is PAGE_SIZE (4096); on Apple Silicon it is 16 KiB — larger than a
+        // logical page — so a base at e.g. meta B (page 1) or the lock page
+        // (page 2) would give EINVAL. Round the base down to that granularity and
+        // grow len by the same delta so the *end* stays fixed (never exceeds the
+        // mapping). The extra adjacent pages swept in are harmless: they are
+        // immutable COW data or runtime lock/reader state that is reset on attach.
+        let gran = crate::os::sync_granularity();
+        let start = offset & !(gran - 1);
         let len = len + (offset - start);
         let rc = unsafe {
             libc::msync(
