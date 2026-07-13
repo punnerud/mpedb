@@ -108,38 +108,26 @@ pub fn madvise_hugepage(ptr: *mut libc::c_void, len: usize) {
     }
 }
 
-/// Make a process-shared mutex robust (Linux: survives owner death →
-/// `EOWNERDEAD`). macOS has no robust mutex: **no-op** ⇒ a process that dies
-/// holding the writer lock wedges the database (benchmark-grade only).
+/// Make a process-shared mutex robust so it survives owner death (`EOWNERDEAD`).
+/// Linux-only: macOS lacks robust mutexes and instead gets its owner-death
+/// recovery from the FLD-2 sidecar `flock` writer lock ([`WriterLock`]), so the
+/// shared pthread mutex is never used there.
 ///
 /// # Safety
 /// `attr` must point to an initialized `pthread_mutexattr_t`.
+#[cfg(target_os = "linux")]
 pub unsafe fn mutexattr_set_robust(attr: *mut libc::pthread_mutexattr_t) {
-    #[cfg(target_os = "linux")]
-    {
-        libc::pthread_mutexattr_setrobust(attr, libc::PTHREAD_MUTEX_ROBUST);
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = attr;
-    }
+    libc::pthread_mutexattr_setrobust(attr, libc::PTHREAD_MUTEX_ROBUST);
 }
 
-/// Mark a mutex consistent after `EOWNERDEAD` recovery. macOS: no-op returning
-/// 0 (never reached — the mutex is not robust, so `lock` never yields EOWNERDEAD).
+/// Mark a mutex consistent after `EOWNERDEAD` recovery. Linux-only (see
+/// [`mutexattr_set_robust`]).
 ///
 /// # Safety
 /// `m` must point to a locked mutex recovered from `EOWNERDEAD`.
+#[cfg(target_os = "linux")]
 pub unsafe fn mutex_make_consistent(m: *mut libc::pthread_mutex_t) -> libc::c_int {
-    #[cfg(target_os = "linux")]
-    {
-        libc::pthread_mutex_consistent(m)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        let _ = m;
-        0
-    }
+    libc::pthread_mutex_consistent(m)
 }
 
 /// Cross-process futex wait: return after a wake, a value change, or the
