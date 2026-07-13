@@ -7,6 +7,7 @@ members = [
     "crates/mpedb",
     "crates/mpedb-sdk",
     "crates/mpedb-proc",
+    "crates/mpedb-mirror",
     "crates/mpedb-cli",
     "crates/mpedb-py",
     "crates/mpedb-testkit",
@@ -24,6 +25,7 @@ mpedb-core = { path = "crates/mpedb-core" }
 mpedb-sql = { path = "crates/mpedb-sql" }
 mpedb = { path = "crates/mpedb" }
 mpedb-proc = { path = "crates/mpedb-proc" }
+mpedb-mirror = { path = "crates/mpedb-mirror" }
 libc = "0.2"
 blake3 = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
