@@ -69,6 +69,12 @@ pub enum Error {
     DivisionByZero,
     ArithmeticOverflow,
     Unsupported(String),
+    /// A write targeted a table that is currently write-blocked (frozen) by the
+    /// CDC control record — e.g. the mirror froze it during an authority switch
+    /// (DESIGN-MIRROR §3.9). Not a bug; the caller must not write it now.
+    Frozen {
+        table_id: u32,
+    },
     /// Invariant violation inside the engine itself; always a bug.
     Internal(String),
 }
@@ -116,6 +122,9 @@ impl fmt::Display for Error {
             Error::DivisionByZero => write!(f, "division by zero"),
             Error::ArithmeticOverflow => write!(f, "arithmetic overflow"),
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
+            Error::Frozen { table_id } => {
+                write!(f, "table {table_id} is write-blocked (mirror frozen)")
+            }
             Error::Internal(m) => write!(f, "internal error (bug in mpedb): {m}"),
         }
     }
