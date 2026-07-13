@@ -14,6 +14,7 @@
 //! - key = freeing txn id (u64 BE) → concatenated freed page ids (u64 LE each)
 
 use crate::btree::{self, InsertMode};
+use crate::cdc::{self, CaptureConfig, DirtyEntry, DirtyOp};
 use crate::pagestore::PageStore;
 use crate::row;
 use crate::shm::{MetaSnapshot, Shm};
@@ -93,6 +94,16 @@ fn sys_key(subkey: &[u8]) -> Vec<u8> {
     k.push(SYS_PREFIX);
     k.extend_from_slice(subkey);
     k
+}
+
+/// Best-effort wall-clock micros since the Unix epoch, for CDC dirty entries
+/// (used only by the off-by-default newest-wins conflict policy). A clock before
+/// the epoch yields 0 rather than a negative surprise.
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 fn freelist_key(txn: u64, chunk: u16) -> [u8; 10] {
@@ -440,6 +451,8 @@ impl Engine {
             finished: false,
             written_tables: 0,
             commit_point: None,
+            capture_enabled: true,
+            capture_cfg: None,
         })
     }
 
@@ -786,6 +799,14 @@ pub struct WriteTxn<'e> {
     /// (table, key_hash) point footprint at commit instead of a table-level
     /// one. `None` for every other path.
     commit_point: Option<(u32, u64)>,
+    /// CDC dirty-set capture is on for this txn (default). The replication
+    /// plane (mirror applier/importer) turns it OFF via [`WriteTxn::set_capture`]
+    /// so its own writes are not self-captured (DESIGN-MIRROR §3.8). Transient:
+    /// never persisted, dies with the txn.
+    capture_enabled: bool,
+    /// Lazily-loaded `cdc\0tabs` control record, cached for the txn's lifetime
+    /// (capture enablement is set in a separate txn, so it is stable here).
+    capture_cfg: Option<CaptureConfig>,
 }
 
 impl PageStore for WriteTxn<'_> {
@@ -950,6 +971,7 @@ impl<'e> WriteTxn<'e> {
             return Ok(false);
         }
         self.set_tree_root(table_id, 0, out.new_root, count + 1);
+        self.capture_dirty(table_id, key, DirtyOp::Upsert)?;
         Ok(true)
     }
 
@@ -964,6 +986,7 @@ impl<'e> WriteTxn<'e> {
         let (root, count) = self.tree_root(table_id, 0)?;
         let out = btree::insert(self, root, key, payload, InsertMode::Upsert)?;
         self.set_tree_root(table_id, 0, out.new_root, count);
+        self.capture_dirty(table_id, key, DirtyOp::Upsert)?;
         Ok(())
     }
 
@@ -974,6 +997,7 @@ impl<'e> WriteTxn<'e> {
         let out = btree::delete(self, root, key)?;
         if out.existed {
             self.set_tree_root(table_id, 0, out.new_root, count - 1);
+            self.capture_dirty(table_id, key, DirtyOp::Delete)?;
         }
         Ok(out.existed)
     }
@@ -1028,6 +1052,7 @@ impl<'e> WriteTxn<'e> {
             }
             self.set_tree_root(table_id, ino, out.new_root, icount + 1);
         }
+        self.capture_dirty(table_id, &key, DirtyOp::Upsert)?;
         Ok(())
     }
 
@@ -1071,6 +1096,7 @@ impl<'e> WriteTxn<'e> {
             }
             self.set_tree_root(table_id, ino, out.new_root, icount - 1);
         }
+        self.capture_dirty(table_id, &key, DirtyOp::Delete)?;
         Ok(true)
     }
 
@@ -1136,6 +1162,7 @@ impl<'e> WriteTxn<'e> {
             }
             self.set_tree_root(table_id, ino, iroot, icount);
         }
+        self.capture_dirty(table_id, &key, DirtyOp::Upsert)?;
         Ok(true)
     }
 
@@ -1275,6 +1302,53 @@ impl<'e> WriteTxn<'e> {
         Ok(out)
     }
 
+    // ---------- change-data-capture (DESIGN-MIRROR §3) ----------
+
+    /// Turn CDC dirty-set capture on/off for THIS transaction only. The mirror's
+    /// replication plane (applier + importer) sets it `false` so its own writes
+    /// do not become dirty entries that would echo back on the next push
+    /// (DESIGN-MIRROR §3.8). Transient in-memory state; never persisted.
+    pub fn set_capture(&mut self, on: bool) {
+        self.capture_enabled = on;
+    }
+
+    /// Lazily read and cache the `cdc\0tabs` control record (default empty when
+    /// absent). Enablement is set in a separate txn, so it is stable for ours.
+    fn capture_config(&mut self) -> Result<CaptureConfig> {
+        if let Some(c) = self.capture_cfg {
+            return Ok(c);
+        }
+        let c = match self.sys_get(cdc::CDC_TABS_KEY)? {
+            Some(bytes) => CaptureConfig::decode(&bytes)?,
+            None => CaptureConfig::default(),
+        };
+        self.capture_cfg = Some(c);
+        Ok(c)
+    }
+
+    /// Record a dirty entry for a captured table after a successful mutation.
+    /// No-op when capture is suppressed for this txn or the table is not
+    /// captured (the common case → one cached sys_get, then nothing). The entry
+    /// is an ordinary sys-put into the catalog tree, so a savepoint rollback
+    /// unwinds it for free (DESIGN-MIRROR §3.4).
+    fn capture_dirty(&mut self, table_id: u32, keycode: &[u8], op: DirtyOp) -> Result<()> {
+        if !self.capture_enabled {
+            return Ok(());
+        }
+        let cfg = self.capture_config()?;
+        if !cfg.is_captured(table_id) {
+            return Ok(());
+        }
+        let entry = DirtyEntry {
+            op,
+            last_txn: self.meta.txn_id + 1,
+            wall_us: now_micros(),
+            pk_keycode: keycode.to_vec(),
+        };
+        let key = cdc::dirty_key(table_id, keycode);
+        self.sys_put(&key, &entry.encode())
+    }
+
     // ---------- instrumentation ----------
 
     /// Dirty-page accounting for the current transaction:
@@ -1311,23 +1385,36 @@ impl<'e> WriteTxn<'e> {
             table_roots: self.table_roots.clone(),
             dirty: self.dirty.clone(),
             freed: self.freed.clone(),
+            reusable: self.reusable.clone(),
+            high_water: self.high_water,
         }
     }
 
     /// Roll back to a savepoint taken in this transaction. `high_water` is
-    /// deliberately NOT restored: pages allocated since are returned to
-    /// `reusable` instead, which the commit fixpoint records as freed —
-    /// page accounting stays exact.
+    /// deliberately NOT restored: pages physically allocated from it since the
+    /// savepoint (ids in `[sp.high_water, high_water)`) belong to no committed
+    /// freelist entry, so they are returned to `reusable` and the commit
+    /// fixpoint records them as freed — page accounting stays exact.
+    ///
+    /// `reusable` and `freelist_root` MUST be restored together: if
+    /// `refill_reusable` ran after the savepoint it pulled committed-freelist
+    /// pages into `reusable` AND deleted their freelist entry (advancing
+    /// `freelist_root`). Restoring `freelist_root` un-deletes that entry, so
+    /// those pages are back in the freelist; keeping them in `reusable` too
+    /// would list them twice at commit. Restoring `reusable` to the savepoint
+    /// snapshot drops exactly the refill-pulled pages while re-offering the
+    /// pages that were reusable before the savepoint.
     pub fn rollback_to(&mut self, sp: TxnSavepoint) {
         debug_assert!(!self.in_freelist_op);
-        for &id in self.dirty.difference(&sp.dirty) {
-            self.reusable.push(id);
-        }
         self.catalog_root = sp.catalog_root;
         self.freelist_root = sp.freelist_root;
         self.table_roots = sp.table_roots;
         self.dirty = sp.dirty;
         self.freed = sp.freed;
+        self.reusable = sp.reusable;
+        for id in sp.high_water..self.high_water {
+            self.reusable.push(id);
+        }
     }
 
     // ---------- commit / abort ----------
@@ -1548,6 +1635,8 @@ pub struct TxnSavepoint {
     table_roots: HashMap<(u32, u32), (u64, u64)>,
     dirty: HashSet<u64>,
     freed: BTreeSet<u64>,
+    reusable: Vec<u64>,
+    high_water: u64,
 }
 
 fn table_column_name(eng: &Engine, table_id: u32, col: u16) -> String {
@@ -2167,6 +2256,174 @@ primary_key = ["id"]
             h.join().unwrap();
         }
         std::fs::remove_file(&cfg.options.path).unwrap();
+    }
+
+    fn enable_capture(eng: &Engine, tables: &[u32]) {
+        let mut cfg = CaptureConfig::default();
+        for &t in tables {
+            cfg.set_captured(t, true);
+        }
+        cfg.generation = 1;
+        let mut w = eng.begin_write().unwrap();
+        w.set_capture(false); // the control write must not capture itself
+        w.sys_put(cdc::CDC_TABS_KEY, &cfg.encode()).unwrap();
+        w.commit().unwrap();
+    }
+
+    fn dirty(eng: &Engine) -> Vec<DirtyEntry> {
+        let r = eng.begin_read().unwrap();
+        let raw = r
+            .sys_scan_range(cdc::CDC_DIRTY_PREFIX, cdc::CDC_DIRTY_PREFIX_END)
+            .unwrap();
+        r.finish().unwrap();
+        raw.iter().map(|(_, v)| DirtyEntry::decode(v).unwrap()).collect()
+    }
+
+    #[test]
+    fn cdc_capture_hooks_all_typed_mutators() {
+        let cfg = test_config("cdccap", 8);
+        let eng = open(&cfg);
+
+        // no capture configured → writes leave no dirty entries
+        let mut w = eng.begin_write().unwrap();
+        w.insert_row(0, &user(1, "a@x.no", Some(10))).unwrap();
+        w.commit().unwrap();
+        assert_eq!(dirty(&eng).len(), 0);
+
+        enable_capture(&eng, &[0]);
+        eng.verify_page_accounting().unwrap(); // A
+
+        // insert → one Upsert entry keyed by the PK keycode
+        let mut w = eng.begin_write().unwrap();
+        w.insert_row(0, &user(2, "b@x.no", Some(20))).unwrap();
+        w.commit().unwrap();
+        eng.verify_page_accounting().unwrap(); // B
+        let d = dirty(&eng);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].op, DirtyOp::Upsert);
+        assert_eq!(d[0].pk_keycode, keycode::encode_key(&[Value::Int(2)]));
+
+        // update same PK coalesces (still one, still Upsert)
+        let mut w = eng.begin_write().unwrap();
+        w.update_by_pk(0, &user(2, "b2@x.no", Some(21))).unwrap();
+        w.commit().unwrap();
+        eng.verify_page_accounting().unwrap(); // C
+        let d = dirty(&eng);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].op, DirtyOp::Upsert);
+
+        // delete flips the coalesced entry to a tombstone
+        let mut w = eng.begin_write().unwrap();
+        assert!(w.delete_by_pk(0, &[Value::Int(2)]).unwrap());
+        w.commit().unwrap();
+        eng.verify_page_accounting().unwrap(); // D
+        let d = dirty(&eng);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].op, DirtyOp::Delete);
+
+        // a suppressed replication-plane write captures nothing
+        let mut w = eng.begin_write().unwrap();
+        w.set_capture(false);
+        w.insert_row(0, &user(3, "c@x.no", Some(30))).unwrap();
+        w.commit().unwrap();
+        assert_eq!(dirty(&eng).len(), 1); // still just PK=2's tombstone
+
+        // savepoint rollback unwinds a captured dirty entry (COW §3.4). This
+        // also exercises capture-triggered refill inside a savepoint (the
+        // rollback_to reusable/freelist-root consistency fix).
+        let mut w = eng.begin_write().unwrap();
+        let sp = w.savepoint();
+        w.insert_row(0, &user(4, "d@x.no", Some(40))).unwrap();
+        assert_eq!(
+            w.sys_scan_range(cdc::CDC_DIRTY_PREFIX, cdc::CDC_DIRTY_PREFIX_END).unwrap().len(),
+            2
+        );
+        w.rollback_to(sp);
+        assert_eq!(
+            w.sys_scan_range(cdc::CDC_DIRTY_PREFIX, cdc::CDC_DIRTY_PREFIX_END).unwrap().len(),
+            1
+        );
+        w.commit().unwrap();
+        assert_eq!(dirty(&eng).len(), 1);
+
+        eng.verify_page_accounting().unwrap();
+    }
+
+    #[test]
+    fn savepoint_rollback_after_refill_keeps_accounting_exact() {
+        // Regression (found via the CDC hook): when refill_reusable runs INSIDE
+        // a savepoint it pulls committed-freelist pages into `reusable` and
+        // deletes their freelist entry; rollback_to must restore both `reusable`
+        // and `freelist_root` together or those pages get listed twice.
+        let cfg = test_config("sprefill", 8);
+        let eng = open(&cfg);
+        let mut w = eng.begin_write().unwrap();
+        for i in 0..400 {
+            w.insert_row(0, &user(i, &format!("u{i}@x.no"), Some(i))).unwrap();
+        }
+        w.commit().unwrap();
+        let mut w = eng.begin_write().unwrap();
+        for i in 0..400 {
+            w.delete_by_pk(0, &[Value::Int(i)]).unwrap();
+        }
+        w.commit().unwrap();
+        // tiny commits with no live reader advance the oldest-pinned bound past
+        // the delete, making its freed pages reclaimable by refill
+        for _ in 0..2 {
+            let mut w = eng.begin_write().unwrap();
+            w.sys_put(b"tick", b"x").unwrap();
+            w.commit().unwrap();
+        }
+        eng.verify_page_accounting().unwrap();
+
+        // allocate heavily INSIDE a savepoint (forces refill), then roll back
+        let mut w = eng.begin_write().unwrap();
+        let sp = w.savepoint();
+        for i in 0..400 {
+            w.insert_row(0, &user(1000 + i, &format!("v{i}@x.no"), Some(i))).unwrap();
+        }
+        w.rollback_to(sp);
+        w.commit().unwrap();
+        eng.verify_page_accounting().unwrap();
+    }
+
+    #[test]
+    fn cdc_capture_hooks_optimistic_blind_apply() {
+        // a table with no secondary index, so the optimistic trio is legal
+        let path = std::env::temp_dir()
+            .join("mpedb-engine-tests")
+            .join(format!("cdcopt-{}.mpedb", std::process::id()));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let toml = format!(
+            "[database]\npath = \"{}\"\nsize_mb = 8\nmax_readers = 64\n\
+             [[table]]\nname = \"kv\"\nprimary_key = [\"id\"]\n\
+             [[table.column]]\nname = \"id\"\ntype = \"int64\"\n\
+             [[table.column]]\nname = \"v\"\ntype = \"int64\"\n",
+            path.display()
+        );
+        let cfg = Config::from_toml_str(&toml).unwrap();
+        let eng = Engine::open(&cfg, vec![vec![]]).unwrap();
+        enable_capture(&eng, &[0]);
+
+        let key = keycode::encode_key(&[Value::Int(7)]);
+        let payload =
+            row::encode_row(&[Value::Int(7), Value::Int(100)], &[ColumnType::Int64; 2]).unwrap();
+
+        let mut w = eng.begin_write().unwrap();
+        assert!(w.optimistic_insert(0, &key, &payload).unwrap());
+        w.commit().unwrap();
+        let d = dirty(&eng);
+        assert_eq!(d.len(), 1);
+        assert_eq!(d[0].op, DirtyOp::Upsert);
+
+        let mut w = eng.begin_write().unwrap();
+        assert!(w.optimistic_delete(0, &key).unwrap());
+        w.commit().unwrap();
+        assert_eq!(dirty(&eng)[0].op, DirtyOp::Delete);
+
+        eng.verify_page_accounting().unwrap();
+        std::fs::remove_file(&path).unwrap();
     }
 
     #[test]
