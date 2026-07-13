@@ -62,7 +62,7 @@ pub fn run_parent(argv: &[String]) -> CliResult {
     let p = args::parse(
         argv,
         &["dir", "waves", "children", "durability", "concurrency"],
-        &[],
+        &["size_mb"],
     )?;
     let dir = PathBuf::from(p.require("dir")?);
     let waves = p.require_u64("waves")?;
@@ -84,7 +84,16 @@ pub fn run_parent(argv: &[String]) -> CliResult {
     if !matches!(durability.as_str(), "none" | "commit" | "async" | "wal") {
         return usage("--durability must be none, commit, async or wal");
     }
-    write_config_concurrency(&cfg, &dbf, 64, CRASH_TOML, &durability, &concurrency)?;
+    // Fast machines (e.g. M3) can churn enough COW pages inside one 5-60ms kill
+    // window to exhaust a small DB before SIGKILL lands (DbFull, not a lock bug).
+    // Allow --size_mb to grow the file so recovery is observed, not masked.
+    let size_mb = match p.value("size_mb") {
+        Some(s) => s
+            .parse::<u64>()
+            .map_err(|_| Failure::Usage("--size_mb must be an integer".into()))?,
+        None => 64,
+    };
+    write_config_concurrency(&cfg, &dbf, size_mb, CRASH_TOML, &durability, &concurrency)?;
 
     // Create + seed so children (and readers) always find the full keyspace.
     {
