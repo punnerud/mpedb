@@ -151,3 +151,101 @@ pub fn futex_wake_all(word: &AtomicU32) {
         let _ = word;
     }
 }
+
+// ---- process / boot identity (reader-slot pid-reuse + boot recovery) --------
+
+/// A per-process start time; `(pid, start_time)` survives PID reuse. Linux:
+/// `/proc/<pid>/stat` field 22. macOS: `sysctl(KERN_PROC_PID).kp_proc.p_starttime`.
+pub fn proc_start_time(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // comm may contain spaces/parens: fields resume after the LAST ')'
+        let rest = &stat[stat.rfind(')')? + 2..];
+        rest.split_ascii_whitespace().nth(19)?.parse().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut mib = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_PID,
+            pid as libc::c_int,
+        ];
+        let mut info: libc::kinfo_proc = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<libc::kinfo_proc>();
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                &mut info as *mut _ as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 || size == 0 {
+            return None; // no such process
+        }
+        let tv = info.kp_proc.p_starttime;
+        Some((tv.tv_sec as u64).wrapping_mul(1_000_000).wrapping_add(tv.tv_usec as u64))
+    }
+}
+
+/// PID-namespace identity (Linux: `/proc/self/ns/pid` inode). macOS has no PID
+/// namespaces → a fixed constant (boot recovery relies on [`boot_id`] instead).
+pub fn pid_namespace_id() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let l = std::fs::read_link("/proc/self/ns/pid").ok()?;
+        let s = l.to_string_lossy().into_owned();
+        let inner = s.strip_prefix("pid:[")?.strip_suffix(']')?.to_owned();
+        inner.parse().ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Some(1)
+    }
+}
+
+/// Boot identity: changes across reboots, so a post-reboot attach triggers
+/// robust-mutex/reader-table recovery. Linux: `/proc/sys/kernel/random/boot_id`.
+/// macOS: `sysctl(KERN_BOOTTIME)` (the boot instant).
+pub fn boot_id() -> Option<[u8; 16]> {
+    #[cfg(target_os = "linux")]
+    {
+        let s = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
+        let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        if hex.len() < 32 {
+            return None;
+        }
+        let mut out = [0u8; 16];
+        for (i, chunk) in hex.as_bytes().chunks(2).take(16).enumerate() {
+            out[i] = u8::from_str_radix(std::str::from_utf8(chunk).ok()?, 16).ok()?;
+        }
+        Some(out)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
+        let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
+        let mut size = std::mem::size_of::<libc::timeval>();
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                &mut tv as *mut _ as *mut libc::c_void,
+                &mut size,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 {
+            return None;
+        }
+        let mut out = [0u8; 16];
+        out[0..8].copy_from_slice(&(tv.tv_sec as u64).to_le_bytes());
+        out[8..16].copy_from_slice(&(tv.tv_usec as u64).to_le_bytes());
+        Some(out)
+    }
+}

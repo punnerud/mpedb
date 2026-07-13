@@ -565,13 +565,10 @@ fn read_full_at(file: &File, buf: &mut [u8], offset: u64) -> Result<usize> {
     Ok(done)
 }
 
-/// This process's start time from /proc/self/stat (field 22); the pair
-/// (pid, start time) survives PID reuse.
+/// This process's start time; the pair (pid, start time) survives PID reuse.
+/// Platform-specific (Linux `/proc`; macOS `sysctl`) — see `crate::os`.
 fn proc_start_time(pid: u32) -> Option<u64> {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    // comm may contain spaces/parens: fields resume after the LAST ')'
-    let rest = &stat[stat.rfind(')')? + 2..];
-    rest.split_ascii_whitespace().nth(19)?.parse().ok()
+    crate::os::proc_start_time(pid)
 }
 
 fn pid_alive_identity(pid: u32, recorded_start: u64) -> bool {
@@ -598,34 +595,13 @@ fn pid_alive_identity(pid: u32, recorded_start: u64) -> bool {
 /// spurious boot recovery (mutex re-init + reader-table wipe) on a LIVE
 /// database, and a zeroed ns would defeat the namespace check.
 fn my_pid_ns_ino() -> Result<u64> {
-    // "pid:[4026531836]"
-    std::fs::read_link("/proc/self/ns/pid")
-        .ok()
-        .and_then(|l| {
-            let s = l.to_string_lossy().into_owned();
-            let inner = s.strip_prefix("pid:[")?.strip_suffix(']')?.to_owned();
-            inner.parse().ok()
-        })
-        .ok_or_else(|| {
-            Error::Config("cannot read /proc/self/ns/pid (is /proc mounted?)".into())
-        })
+    crate::os::pid_namespace_id()
+        .ok_or_else(|| Error::Config("cannot read PID-namespace identity".into()))
 }
 
 /// Hard error on failure (see [`my_pid_ns_ino`]).
 fn boot_id() -> Result<[u8; 16]> {
-    let s = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-        .map_err(|e| Error::Config(format!("cannot read boot_id: {e}")))?;
-    let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-    if hex.len() < 32 {
-        return Err(Error::Config("malformed boot_id".into()));
-    }
-    let mut out = [0u8; 16];
-    for (i, chunk) in hex.as_bytes().chunks(2).take(16).enumerate() {
-        let hexs = std::str::from_utf8(chunk).unwrap();
-        out[i] = u8::from_str_radix(hexs, 16)
-            .map_err(|_| Error::Config("malformed boot_id".into()))?;
-    }
-    Ok(out)
+    crate::os::boot_id().ok_or_else(|| Error::Config("cannot read boot identity".into()))
 }
 
 struct FlockGuard<'a>(&'a File);
@@ -1794,7 +1770,7 @@ impl Shm {
             durability,
             data_start: data_start_page(max_readers),
             my_pid_start: proc_start_time(std::process::id()).ok_or_else(|| {
-                Error::Config("cannot read /proc/self/stat for process identity".into())
+                Error::Config("cannot read this process's start time for identity".into())
             })?,
             recovered: false,
             wal: None,
