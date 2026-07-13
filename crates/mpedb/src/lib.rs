@@ -37,10 +37,12 @@ mod policy_store;
 mod registry;
 mod ring_exec;
 mod session;
+mod shard;
 mod stream;
 mod workspace;
 
 pub use session::Session;
+pub use shard::ShardSet;
 pub use stream::RowStream;
 pub use workspace::{Workspace, WsPlan};
 
