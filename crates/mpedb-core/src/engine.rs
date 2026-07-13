@@ -85,6 +85,14 @@ fn cat_tree_key(table_id: u32, index_no: u32) -> Vec<u8> {
 /// (DESIGN.md §4.5) converge.
 const FREELIST_CHUNK_PAGES: usize = 120; // 960-byte values
 
+/// Pages at the top of the file reserved for control-plane writes (mirror
+/// HALTED/frozen/cursor/park markers) so they can still commit when the data
+/// region is full (DESIGN-MIRROR §3.10). Only `WriteTxn::set_reserved_alloc`
+/// txns may allocate from this band; data and CDC capture hit DbFull first.
+/// Sized for a few small sys-record commits (each ~ one record + catalog COW +
+/// freelist fixpoint), not for bulk work.
+const RESERVED_CONTROL_PAGES: u64 = 48;
+
 /// System keys live in the catalog tree under a reserved prefix; the facade
 /// uses them for the shared plan registry.
 const SYS_PREFIX: u8 = 0x02;
@@ -453,6 +461,7 @@ impl Engine {
             commit_point: None,
             capture_enabled: true,
             capture_cfg: None,
+            reserved_alloc: false,
         })
     }
 
@@ -807,6 +816,9 @@ pub struct WriteTxn<'e> {
     /// Lazily-loaded `cdc\0tabs` control record, cached for the txn's lifetime
     /// (capture enablement is set in a separate txn, so it is stable here).
     capture_cfg: Option<CaptureConfig>,
+    /// This txn may allocate from the reserved control-page band (§3.10). Set by
+    /// the mirror for control-only commits; default off.
+    reserved_alloc: bool,
 }
 
 impl PageStore for WriteTxn<'_> {
@@ -835,7 +847,20 @@ impl PageStore for WriteTxn<'_> {
         let id = match self.reusable.pop() {
             Some(id) => id,
             None => {
-                if self.high_water >= self.eng.shm.page_count {
+                // The top RESERVED_CONTROL_PAGES of the file are dispensed only
+                // to `reserved_alloc` txns, so the mirror's control-plane writes
+                // (HALTED/frozen/cursor/park markers) can still commit when the
+                // data region is otherwise full (DESIGN-MIRROR §3.10). Data and
+                // CDC capture use the normal ceiling and hit DbFull first.
+                let ceiling = if self.reserved_alloc {
+                    self.eng.shm.page_count
+                } else {
+                    self.eng
+                        .shm
+                        .page_count
+                        .saturating_sub(RESERVED_CONTROL_PAGES)
+                };
+                if self.high_water >= ceiling {
                     return Err(Error::DbFull);
                 }
                 let id = self.high_water;
@@ -1316,6 +1341,15 @@ impl<'e> WriteTxn<'e> {
     /// (DESIGN-MIRROR §3.8). Transient in-memory state; never persisted.
     pub fn set_capture(&mut self, on: bool) {
         self.capture_enabled = on;
+    }
+
+    /// Allow this txn to allocate from the reserved control-page band (§3.10),
+    /// so a small control-plane commit (HALTED/frozen/cursor/park marker) can
+    /// succeed when the data region is full. Use ONLY for txns that write a few
+    /// sys records — never for data or bulk work, which would consume the
+    /// reserve and defeat its purpose.
+    pub fn set_reserved_alloc(&mut self, on: bool) {
+        self.reserved_alloc = on;
     }
 
     /// Lazily read and cache the `cdc\0tabs` control record (default empty when
@@ -2351,6 +2385,43 @@ primary_key = ["id"]
         assert!(w.get_by_pk(0, &[Value::Int(2)]).unwrap().is_some());
         drop(w);
         eng.verify_page_accounting().unwrap();
+    }
+
+    #[test]
+    fn reserved_pages_extend_the_alloc_ceiling_past_normal_dbfull() {
+        // fill a small db to the NORMAL ceiling in one txn, then prove a
+        // reserved-mode allocation still succeeds (the control-plane headroom).
+        let cfg = test_config("reservedpool", 2);
+        let eng = open(&cfg);
+        let mut w = eng.begin_write().unwrap();
+        let mut i = 0i64;
+        loop {
+            match w.insert_row(0, &user(i, &format!("u{i}@x.no"), Some(i))) {
+                Ok(()) => i += 1,
+                Err(Error::DbFull) => break,
+                Err(e) => panic!("unexpected error while filling: {e}"),
+            }
+        }
+        assert!(i > 0, "db should hold at least some rows");
+        // normal mode is now full
+        assert!(matches!(
+            w.insert_row(0, &user(i, "x@x.no", Some(0))),
+            Err(Error::DbFull)
+        ));
+        // reserved mode reaches into the reserve band and succeeds (the normal
+        // ceiling was RESERVED_CONTROL_PAGES below page_count)
+        w.set_reserved_alloc(true);
+        w.insert_row(0, &user(i, &format!("u{i}@x.no"), Some(i)))
+            .expect("reserved allocation should succeed past the normal ceiling");
+        // the flag persists through commit, so a reserved control write's whole
+        // commit (COW + freelist fixpoint) also draws from the reserve band
+        w.set_reserved_alloc(false);
+        w.set_reserved_alloc(true);
+        w.sys_put(b"mir\0halt", b"db_full").unwrap();
+        w.commit().expect("reserved control write commits past the normal full");
+        let r = eng.begin_read().unwrap();
+        assert_eq!(r.sys_get(b"mir\0halt").unwrap().unwrap(), b"db_full");
+        r.finish().unwrap();
     }
 
     #[test]
