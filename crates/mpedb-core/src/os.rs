@@ -15,8 +15,11 @@ use std::os::unix::io::RawFd;
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
-/// Flush file data to storage. Linux: `fdatasync`. macOS (bench-grade): `fsync`
-/// — NOT platter-durable (that needs `fcntl(F_FULLFSYNC)`, far slower).
+/// Flush file data to storage. Linux: `fdatasync`. macOS: `fcntl(F_FULLFSYNC)`
+/// — the only macOS call that forces the drive to flush its write cache to the
+/// platter (plain `fsync` returns before that, so a power loss can still lose an
+/// acked commit). Slower than `fsync`, but that is the price of real durability.
+/// Falls back to `fsync` only when the filesystem rejects F_FULLFSYNC (ENOTSUP).
 pub fn fdatasync(fd: RawFd) -> libc::c_int {
     #[cfg(target_os = "linux")]
     {
@@ -24,8 +27,33 @@ pub fn fdatasync(fd: RawFd) -> libc::c_int {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        unsafe { libc::fsync(fd) }
+        let rc = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
+        if rc == -1 {
+            let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(0);
+            if e == libc::ENOTSUP || e == libc::EINVAL || e == libc::ENOTTY {
+                return unsafe { libc::fsync(fd) };
+            }
+        }
+        rc
     }
+}
+
+/// Base-address alignment that `msync`/`mmap` require: the OS page size.
+/// Linux: 4096 (== the engine's logical `PAGE_SIZE`). macOS on Apple Silicon:
+/// 16384 — larger than a logical page, so an `msync` whose base is a logical
+/// page that is not also a 16 KiB boundary returns `EINVAL`. Callers round the
+/// base down to this granularity. Cached after the first `sysconf`.
+pub fn sync_granularity() -> usize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static CACHE: AtomicUsize = AtomicUsize::new(0);
+    let cached = CACHE.load(Ordering::Relaxed);
+    if cached != 0 {
+        return cached;
+    }
+    let g = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let g = if g > 0 { g as usize } else { 4096 };
+    CACHE.store(g, Ordering::Relaxed);
+    g
 }
 
 /// Ensure `[offset, offset+len)` is backed by real blocks (Linux: `fallocate`,
