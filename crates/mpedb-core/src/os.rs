@@ -152,6 +152,178 @@ pub fn futex_wake_all(word: &AtomicU32) {
     }
 }
 
+// ---- macOS crash-safe writer lock (DESIGN-MACOS-LOCK.md, FLD-2) -------------
+//
+// Linux uses the robust pthread mutex directly (in shm.rs). macOS has none, so
+// the writer lock is: a sidecar-inode `flock` (the KERNEL releases it when the
+// holder dies → free death oracle + rendezvous) + a process-private ERRORCHECK
+// mutex (intra-process exclusion + re-entrancy → EDEADLK). shm.rs layers the
+// tri-state DIRTY word (the "recovered" signal) on top. This struct provides
+// ONLY the exclusion primitives.
+
+#[cfg(not(target_os = "linux"))]
+pub use macos_lock::WriterLock;
+
+#[cfg(not(target_os = "linux"))]
+mod macos_lock {
+    use mpedb_types::{Error, Result};
+    use std::collections::HashMap;
+    use std::fs::File;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+    use std::sync::{Arc, LazyLock, Mutex, Weak};
+
+    fn reentered() -> Error {
+        Error::Internal("writer lock re-entered by its owner (nested write transaction)".into())
+    }
+    fn ioerr(ctx: &str) -> Error {
+        Error::Io(std::io::Error::new(
+            std::io::Error::last_os_error().kind(),
+            format!("{ctx}: {}", std::io::Error::last_os_error()),
+        ))
+    }
+
+    struct Inner {
+        file: File,                        // OWNS the wl_fd; drop → close → flock auto-release
+        local_mtx: *mut libc::pthread_mutex_t, // process-private ERRORCHECK
+    }
+    // The pthread mutex is thread-safe; the File is Send+Sync. One Inner per
+    // (dev,ino) per process, shared behind Arc.
+    unsafe impl Send for Inner {}
+    unsafe impl Sync for Inner {}
+
+    impl Drop for Inner {
+        fn drop(&mut self) {
+            unsafe {
+                libc::pthread_mutex_destroy(self.local_mtx);
+                drop(Box::from_raw(self.local_mtx));
+            }
+        }
+    }
+
+    // One shared Inner per (dev,ino) per process: a second open() of the SAME
+    // file would otherwise be a distinct OFD whose flock self-BLOCKS the first
+    // (flock treats separate fds independently), deadlocking the process. The
+    // registry hands every in-process handle the SAME OFD + mutex, so a double
+    // open is caught as EDEADLK re-entrancy, not a self-deadlock.
+    static REGISTRY: LazyLock<Mutex<HashMap<(u64, u64), Weak<Inner>>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    fn make_errorcheck_mutex() -> *mut libc::pthread_mutex_t {
+        let m = Box::into_raw(Box::new(unsafe { std::mem::zeroed::<libc::pthread_mutex_t>() }));
+        unsafe {
+            let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
+            libc::pthread_mutexattr_init(&mut attr);
+            libc::pthread_mutexattr_settype(&mut attr, libc::PTHREAD_MUTEX_ERRORCHECK);
+            libc::pthread_mutex_init(m, &attr);
+            libc::pthread_mutexattr_destroy(&mut attr);
+        }
+        m
+    }
+
+    /// The sidecar-`flock` writer lock. Cheap to clone (Arc).
+    pub struct WriterLock {
+        inner: Arc<Inner>,
+        devino: (u64, u64),
+    }
+
+    impl WriterLock {
+        /// Open (creating if absent) the sidecar `<db>.wlock`. Returns the lock
+        /// and its (dev, ino) for the on-disk identity record.
+        pub fn open(path: &std::path::Path) -> Result<WriterLock> {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .mode(0o600)
+                .custom_flags(libc::O_CLOEXEC) // never inherit across exec → no wedge
+                .open(path)?;
+            let fd = file.as_raw_fd();
+            // belt-and-braces (some fork paths clear O_CLOEXEC creation intent).
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(fd, &mut st) } != 0 {
+                return Err(ioerr("fstat(wlock)"));
+            }
+            let devino = (st.st_dev as u64, st.st_ino as u64);
+
+            let mut reg = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(inner) = reg.get(&devino).and_then(Weak::upgrade) {
+                drop(file); // reuse the registered OFD; close this duplicate fd
+                return Ok(WriterLock { inner, devino });
+            }
+            let inner = Arc::new(Inner {
+                file,
+                local_mtx: make_errorcheck_mutex(),
+            });
+            reg.insert(devino, Arc::downgrade(&inner));
+            Ok(WriterLock { inner, devino })
+        }
+
+        pub fn devino(&self) -> (u64, u64) {
+            self.devino
+        }
+
+        /// Blocking acquire of exclusion: local mutex (re-entrancy → Err), then
+        /// the cross-process `flock(LOCK_EX)` (the kernel wait; wakes on release
+        /// or holder death). On Err, both levels are already released.
+        pub fn lock(&self) -> Result<()> {
+            let m = self.inner.local_mtx;
+            match unsafe { libc::pthread_mutex_lock(m) } {
+                0 => {}
+                libc::EDEADLK => return Err(reentered()),
+                rc => return Err(Error::Internal(format!("local writer mutex lock: {rc}"))),
+            }
+            let fd = self.inner.file.as_raw_fd();
+            loop {
+                if unsafe { libc::flock(fd, libc::LOCK_EX) } == 0 {
+                    return Ok(());
+                }
+                if std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                    continue;
+                }
+                unsafe { libc::pthread_mutex_unlock(m) };
+                return Err(ioerr("flock(LOCK_EX)"));
+            }
+        }
+
+        /// Non-blocking acquire: Ok(Some(())) held, Ok(None) if another process
+        /// or thread holds it.
+        pub fn trylock(&self) -> Result<Option<()>> {
+            let m = self.inner.local_mtx;
+            match unsafe { libc::pthread_mutex_trylock(m) } {
+                0 => {}
+                libc::EDEADLK => return Err(reentered()),
+                libc::EBUSY => return Ok(None),
+                rc => return Err(Error::Internal(format!("local writer mutex trylock: {rc}"))),
+            }
+            let fd = self.inner.file.as_raw_fd();
+            if unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                let e = std::io::Error::last_os_error().raw_os_error();
+                unsafe { libc::pthread_mutex_unlock(m) };
+                if e == Some(libc::EWOULDBLOCK) {
+                    return Ok(None);
+                }
+                return Err(ioerr("flock(LOCK_EX|NB)"));
+            }
+            Ok(Some(()))
+        }
+
+        /// Release both levels (infallible; `flock(UN)` retried on EINTR).
+        pub fn release_exclusion(&self) {
+            let fd = self.inner.file.as_raw_fd();
+            loop {
+                if unsafe { libc::flock(fd, libc::LOCK_UN) } == 0
+                    || std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR)
+                {
+                    break;
+                }
+            }
+            unsafe { libc::pthread_mutex_unlock(self.inner.local_mtx) };
+        }
+    }
+}
+
 // ---- process / boot identity (reader-slot pid-reuse + boot recovery) --------
 
 /// A per-process start time; `(pid, start_time)` survives PID reuse. Linux:

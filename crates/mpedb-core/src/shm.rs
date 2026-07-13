@@ -37,7 +37,13 @@ const META_LOGICAL_LEN: usize = 96;
 
 // ---- lock area field offsets (page 2) ----
 const LA_INIT_STATE: usize = 0; // AtomicU32: 0 empty, 1 formatting, 2 READY
-const LA_MUTEX: usize = 64; // pthread_mutex_t, 128 bytes reserved
+const LA_MUTEX: usize = 64; // pthread_mutex_t, 128 bytes reserved (Linux)
+// macOS reuses the ex-mutex region (Linux never compiles these): the tri-state
+// recovered signal for the flock-based writer lock (DESIGN-MACOS-LOCK.md).
+// 0 = CLEAN, 1 = a holder is in its critical section, 2 = POISONED (a prior
+// owner-death recovery failed = ENOTRECOVERABLE, fail-closed).
+#[cfg(not(target_os = "linux"))]
+const LA_WRITER_DIRTY: usize = 64; // AtomicU32
 const LA_DURABLE_TXN: usize = 192; // AtomicU64
 const LA_OLDEST_PINNED: usize = 200; // AtomicU64 (monotone cache)
 const LA_PID_NS_INO: usize = 208; // u64, frozen per boot epoch
@@ -443,6 +449,10 @@ pub struct Shm {
     pub recovered: bool,
     /// The append-only log; Some iff durability = wal.
     wal: Option<WalFile>,
+    /// macOS-only: the crash-safe writer lock (sidecar flock + ERRORCHECK
+    /// mutex). Linux uses the robust pthread mutex in the mapped lock area.
+    #[cfg(not(target_os = "linux"))]
+    wl: crate::os::WriterLock,
 }
 
 // The raw pointer is to a MAP_SHARED region; all concurrent access goes
@@ -844,6 +854,7 @@ impl Shm {
     /// ran (a previous writer died holding the lock). Recovery per §5.2:
     /// msync both meta pages, refresh durable_txn — nothing else, by COW
     /// construction.
+    #[cfg(target_os = "linux")]
     pub fn writer_lock(&self) -> Result<bool> {
         let rc = unsafe { libc::pthread_mutex_lock(self.mutex_ptr()) };
         match rc {
@@ -864,8 +875,55 @@ impl Shm {
         }
     }
 
+    /// macOS: acquire exclusion via the sidecar flock + private ERRORCHECK
+    /// mutex, then read the tri-state DIRTY word (DESIGN-MACOS-LOCK.md §2).
+    #[cfg(not(target_os = "linux"))]
+    pub fn writer_lock(&self) -> Result<bool> {
+        self.wl.lock()?; // on Err both levels are already released
+        self.post_acquire()
+    }
+
+    /// macOS: the tri-state DIRTY signal (the flock-based analogue of
+    /// EOWNERDEAD). Runs holding both exclusion levels, before any engine write.
+    #[cfg(not(target_os = "linux"))]
+    fn writer_dirty(&self) -> &AtomicU32 {
+        self.atomic_u32(Self::lock_area_off(LA_WRITER_DIRTY))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn post_acquire(&self) -> Result<bool> {
+        match self.writer_dirty().load(Ordering::Acquire) {
+            0 => {
+                self.writer_dirty().store(1, Ordering::Release);
+                Ok(false)
+            }
+            1 => match self.recover_after_owner_death() {
+                Ok(()) => {
+                    self.writer_dirty().store(1, Ordering::Release);
+                    Ok(true)
+                }
+                Err(e) => {
+                    // POISON (fail-closed): do NOT clear; release exclusion so a
+                    // later acquirer hard-errors rather than proceed unrecovered.
+                    self.writer_dirty().store(2, Ordering::Release);
+                    self.wl.release_exclusion();
+                    Err(e)
+                }
+            },
+            _ => {
+                self.wl.release_exclusion();
+                Err(Error::Internal(
+                    "writer lock unrecoverable (ENOTRECOVERABLE): a prior owner-death \
+                     recovery failed; database wedged pending operator recovery"
+                        .into(),
+                ))
+            }
+        }
+    }
+
     /// Non-blocking writer-lock attempt: Ok(Some(recovered)) on success,
     /// Ok(None) if another process holds it.
+    #[cfg(target_os = "linux")]
     pub fn try_writer_lock(&self) -> Result<Option<bool>> {
         let rc = unsafe { libc::pthread_mutex_trylock(self.mutex_ptr()) };
         match rc {
@@ -883,6 +941,14 @@ impl Shm {
                 "writer lock re-entered by its owner (nested write transaction)".into(),
             )),
             _ => Err(Error::Internal(format!("pthread_mutex_trylock failed: {rc}"))),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn try_writer_lock(&self) -> Result<Option<bool>> {
+        match self.wl.trylock()? {
+            None => Ok(None),
+            Some(()) => self.post_acquire().map(Some),
         }
     }
 
@@ -915,10 +981,21 @@ impl Shm {
         self.my_pid_start
     }
 
+    #[cfg(target_os = "linux")]
     pub fn writer_unlock(&self) {
         unsafe {
             libc::pthread_mutex_unlock(self.mutex_ptr());
         }
+    }
+
+    /// macOS: clear MY clean-section flag (CAS 1→0, never resurrecting a POISON)
+    /// while still holding flock, then release exclusion.
+    #[cfg(not(target_os = "linux"))]
+    pub fn writer_unlock(&self) {
+        let _ = self
+            .writer_dirty()
+            .compare_exchange(1, 0, Ordering::Release, Ordering::Relaxed);
+        self.wl.release_exclusion();
     }
 
     fn recover_after_owner_death(&self) -> Result<()> {
@@ -1619,7 +1696,7 @@ impl Shm {
         // Fast path: fully-sized file that reports READY attaches lock-free.
         let st_size = file.metadata()?.len();
         if st_size == size {
-            let mut shm = Self::map(&file, size, max_readers, durability)?;
+            let mut shm = Self::map(&file, size, max_readers, durability, path)?;
             if shm.init_state().load(Ordering::Acquire) == INIT_READY {
                 shm.validate_frozen(page_count, max_readers, durability, schema_hash)?;
                 if durability.uses_wal() {
@@ -1641,7 +1718,7 @@ impl Shm {
             // mismatch on a live db is config drift, and extending/shrinking
             // it would brick every correctly-configured process. Probe first.
             if st_size >= (LOCK_PAGE + 1) * PAGE_SIZE as u64 {
-                let probe = Self::map(&file, st_size, max_readers, durability)?;
+                let probe = Self::map(&file, st_size, max_readers, durability, path)?;
                 let ready = probe.init_state().load(Ordering::Acquire) == INIT_READY;
                 drop(probe);
                 if ready {
@@ -1664,7 +1741,7 @@ impl Shm {
                 return Err(io_err("fallocate (preallocating database file)"));
             }
         }
-        let mut shm = Self::map(&file, size, max_readers, durability)?;
+        let mut shm = Self::map(&file, size, max_readers, durability, path)?;
         if durability.uses_wal() {
             shm.attach_wal(path)?; // before format: format truncates debris
         }
@@ -1697,7 +1774,7 @@ impl Shm {
                 "file size is not a valid mpedb database".into(),
             ));
         }
-        let mut shm = Self::map(&file, st_size, 1, Durability::None)?;
+        let mut shm = Self::map(&file, st_size, 1, Durability::None, path)?;
         if shm.init_state().load(Ordering::Acquire) != INIT_READY {
             return Err(Error::Corrupt(
                 "database file is not initialized (READY marker absent)".into(),
@@ -1745,7 +1822,15 @@ impl Shm {
         Ok(shm)
     }
 
-    fn map(file: &File, size: u64, max_readers: u32, durability: Durability) -> Result<Shm> {
+    fn map(
+        file: &File,
+        size: u64,
+        max_readers: u32,
+        durability: Durability,
+        db_path: &Path,
+    ) -> Result<Shm> {
+        #[cfg(target_os = "linux")]
+        let _ = db_path; // Linux uses the mapped robust mutex; no sidecar.
         let ptr = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -1761,6 +1846,13 @@ impl Shm {
         }
         // opportunistic; harmless where unsupported (macOS: no-op)
         crate::os::madvise_hugepage(ptr, size as usize);
+        // macOS crash-safe writer lock: open (creating if absent) `<db>.wlock`.
+        #[cfg(not(target_os = "linux"))]
+        let wl = {
+            let mut p = db_path.as_os_str().to_owned();
+            p.push(".wlock");
+            crate::os::WriterLock::open(Path::new(&p))?
+        };
         Ok(Shm {
             map: ptr as *mut u8,
             len: size as usize,
@@ -1774,6 +1866,8 @@ impl Shm {
             })?,
             recovered: false,
             wal: None,
+            #[cfg(not(target_os = "linux"))]
+            wl,
         })
     }
 
@@ -1797,7 +1891,11 @@ impl Shm {
         // re-set state: the zeroing above cleared it
         self.init_state().store(INIT_FORMATTING, Ordering::Release);
 
-        // robust, error-checking, process-shared writer mutex
+        // robust, error-checking, process-shared writer mutex (Linux only).
+        // macOS uses the flock-based writer lock: the zeroing above already set
+        // the DIRTY word (offset 64) to 0 (CLEAN); a pthread_mutex_init here
+        // would stamp a mutex signature over it and corrupt the signal.
+        #[cfg(target_os = "linux")]
         unsafe {
             let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
             libc::pthread_mutexattr_init(&mut attr);
@@ -1959,6 +2057,9 @@ impl Shm {
                 if self.durability.uses_wal() {
                     self.wal_recover()?;
                 }
+                // Re-init the writer-lock state (Linux: robust mutex; macOS:
+                // reset the DIRTY word — a pre-reboot in-section flag is void).
+                #[cfg(target_os = "linux")]
                 unsafe {
                     let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
                     libc::pthread_mutexattr_init(&mut attr);
@@ -1970,6 +2071,10 @@ impl Shm {
                     libc::pthread_mutexattr_settype(&mut attr, libc::PTHREAD_MUTEX_ERRORCHECK);
                     libc::pthread_mutex_init(self.mutex_ptr(), &attr);
                     libc::pthread_mutexattr_destroy(&mut attr);
+                }
+                #[cfg(not(target_os = "linux"))]
+                self.writer_dirty().store(0, Ordering::Release);
+                unsafe {
                     // clear the reader table: all pre-reboot pins are void
                     std::ptr::write_bytes(
                         self.at(READER_TABLE_PAGE as usize * PAGE_SIZE),
