@@ -85,20 +85,9 @@ fn unpack(word: u64) -> (u32, u64, u64) {
 
 /// Raw cross-process futex wait: returns after a wake, a value change, or the
 /// timeout — callers always re-check state, so spurious returns are fine.
+/// (Platform-specific; macOS polls — see `crate::os`.)
 fn futex_wait(word: &AtomicU32, expected: u32, timeout: Duration) {
-    let ts = libc::timespec {
-        tv_sec: timeout.as_secs() as libc::time_t,
-        tv_nsec: timeout.subsec_nanos() as libc::c_long,
-    };
-    unsafe {
-        libc::syscall(
-            libc::SYS_futex,
-            word.as_ptr(),
-            libc::FUTEX_WAIT, // shared (no PRIVATE flag): cross-process
-            expected,
-            &ts,
-        );
-    }
+    crate::os::futex_wait(word, expected, timeout)
 }
 
 #[doc(hidden)]
@@ -123,9 +112,7 @@ pub fn ring_debug(msg: std::fmt::Arguments<'_>) {
 }
 
 fn futex_wake_all(word: &AtomicU32) {
-    unsafe {
-        libc::syscall(libc::SYS_futex, word.as_ptr(), libc::FUTEX_WAKE, i32::MAX);
-    }
+    crate::os::futex_wake_all(word)
 }
 
 /// A staged or posted intent outcome.

@@ -8,6 +8,7 @@
 
 pub mod btree;
 pub mod engine;
+mod os;
 pub mod pagestore;
 pub mod ring;
 pub mod row;

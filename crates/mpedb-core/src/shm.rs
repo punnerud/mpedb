@@ -873,7 +873,7 @@ impl Shm {
         match rc {
             0 => Ok(false),
             libc::EOWNERDEAD => {
-                unsafe { libc::pthread_mutex_consistent(self.mutex_ptr()) };
+                unsafe { crate::os::mutex_make_consistent(self.mutex_ptr()) };
                 if let Err(e) = self.recover_after_owner_death() {
                     // we DO hold the (now-consistent) mutex; never leak it
                     self.writer_unlock();
@@ -896,7 +896,7 @@ impl Shm {
             0 => Ok(Some(false)),
             libc::EBUSY => Ok(None),
             libc::EOWNERDEAD => {
-                unsafe { libc::pthread_mutex_consistent(self.mutex_ptr()) };
+                unsafe { crate::os::mutex_make_consistent(self.mutex_ptr()) };
                 if let Err(e) = self.recover_after_owner_death() {
                     self.writer_unlock();
                     return Err(e);
@@ -1038,7 +1038,7 @@ impl Shm {
             return Err(io_err("ftruncate(wal)"));
         }
         // real preallocation, never sparse-append (ENOSPC surfaces here)
-        if unsafe { libc::fallocate(fd, 0, 0, WAL_GROW_CHUNK as i64) } != 0 {
+        if crate::os::preallocate(fd, 0, WAL_GROW_CHUNK as i64) != 0 {
             return Err(io_err("fallocate(wal)"));
         }
         prezero(&wal.file, 0, WAL_GROW_CHUNK)?;
@@ -1059,9 +1059,7 @@ impl Shm {
         let cur = wal.file.metadata()?.len();
         let target = need.max(cur).div_ceil(WAL_GROW_CHUNK) * WAL_GROW_CHUNK;
         if target > cur {
-            let rc = unsafe {
-                libc::fallocate(wal.file.as_raw_fd(), 0, cur as i64, (target - cur) as i64)
-            };
+            let rc = crate::os::preallocate(wal.file.as_raw_fd(), cur as i64, (target - cur) as i64);
             if rc != 0 {
                 return Err(io_err("fallocate(wal grow)"));
             }
@@ -1102,7 +1100,7 @@ impl Shm {
         );
         self.wal_ensure_alloc(off + buf.len() as u64)?;
         wal.file.write_all_at(&buf, off)?;
-        if unsafe { libc::fdatasync(wal.file.as_raw_fd()) } != 0 {
+        if crate::os::fdatasync(wal.file.as_raw_fd()) != 0 {
             return Err(io_err("fdatasync(wal)"));
         }
         self.wal_len().store(off + buf.len() as u64, Ordering::Release);
@@ -1157,7 +1155,7 @@ impl Shm {
         if appended <= durable {
             return Ok(0);
         }
-        if unsafe { libc::fdatasync(wal.file.as_raw_fd()) } != 0 {
+        if crate::os::fdatasync(wal.file.as_raw_fd()) != 0 {
             return Err(io_err("fdatasync(wal async flush)"));
         }
         let prev = self.wal_len().fetch_max(appended, Ordering::AcqRel);
@@ -1219,16 +1217,9 @@ impl Shm {
         self.wal_ckpt().store(target, Ordering::Release);
         self.msync_page(LOCK_PAGE)?; // 2. durable ckpt before reclaim
         let wal = self.wal_file()?;
-        unsafe {
-            // 3. best-effort space reclaim; failure (exotic fs) only means
-            // the space is not reclaimed — correctness is unaffected.
-            libc::fallocate(
-                wal.file.as_raw_fd(),
-                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
-                0,
-                target as i64,
-            );
-        }
+        // 3. best-effort space reclaim; failure (exotic fs / macOS) only means
+        // the space is not reclaimed — correctness is unaffected.
+        crate::os::punch_hole(wal.file.as_raw_fd(), 0, target as i64);
         Ok(())
     }
 
@@ -1692,7 +1683,7 @@ impl Shm {
             }
             // real preallocation: ENOSPC surfaces here instead of as SIGBUS
             // on first touch of a hole mid-commit
-            let rc = unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as i64) };
+            let rc = crate::os::preallocate(file.as_raw_fd(), 0, size as i64);
             if rc != 0 {
                 return Err(io_err("fallocate (preallocating database file)"));
             }
@@ -1792,10 +1783,8 @@ impl Shm {
         if ptr == libc::MAP_FAILED {
             return Err(io_err("mmap"));
         }
-        // opportunistic; harmless where unsupported
-        unsafe {
-            libc::madvise(ptr, size as usize, libc::MADV_HUGEPAGE);
-        }
+        // opportunistic; harmless where unsupported (macOS: no-op)
+        crate::os::madvise_hugepage(ptr, size as usize);
         Ok(Shm {
             map: ptr as *mut u8,
             len: size as usize,
@@ -1837,7 +1826,7 @@ impl Shm {
             let mut attr: libc::pthread_mutexattr_t = std::mem::zeroed();
             libc::pthread_mutexattr_init(&mut attr);
             libc::pthread_mutexattr_setpshared(&mut attr, libc::PTHREAD_PROCESS_SHARED);
-            libc::pthread_mutexattr_setrobust(&mut attr, libc::PTHREAD_MUTEX_ROBUST);
+            crate::os::mutexattr_set_robust(&mut attr);
             libc::pthread_mutexattr_settype(&mut attr, libc::PTHREAD_MUTEX_ERRORCHECK);
             let rc = libc::pthread_mutex_init(self.mutex_ptr(), &attr);
             libc::pthread_mutexattr_destroy(&mut attr);
@@ -2001,7 +1990,7 @@ impl Shm {
                         &mut attr,
                         libc::PTHREAD_PROCESS_SHARED,
                     );
-                    libc::pthread_mutexattr_setrobust(&mut attr, libc::PTHREAD_MUTEX_ROBUST);
+                    crate::os::mutexattr_set_robust(&mut attr);
                     libc::pthread_mutexattr_settype(&mut attr, libc::PTHREAD_MUTEX_ERRORCHECK);
                     libc::pthread_mutex_init(self.mutex_ptr(), &attr);
                     libc::pthread_mutexattr_destroy(&mut attr);
