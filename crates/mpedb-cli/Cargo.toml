@@ -1,0 +1,17 @@
+[package]
+name = "mpedb-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "mpedb command-line tool: REPL, bench, multi-process stress tests"
+
+[[bin]]
+name = "mpedb"
+path = "src/main.rs"
+
+[dependencies]
+mpedb = { workspace = true }
+mpedb-core = { workspace = true }
+mpedb-proc = { workspace = true }
+mpedb-types = { workspace = true }
+libc = { workspace = true }

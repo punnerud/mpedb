@@ -1,0 +1,264 @@
+# LIKE: `%` matches any run (including empty), `_` matches exactly one
+# character. Matching is CASE-SENSITIVE (unlike sqlite's ASCII-insensitive
+# LIKE) and there is no ESCAPE clause -- `%`/`_` cannot be matched literally.
+# The pattern must be a string literal (Phase 1). NULL never matches.
+#
+# schema:
+# [[table]]
+# name = "t"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "s"
+#   type = "text"
+# end schema
+
+statement ok
+INSERT INTO t (id, s) VALUES (1, 'hello'), (2, 'help'), (3, 'hell')
+
+statement ok
+INSERT INTO t (id, s) VALUES (4, 'h'), (5, ''), (6, 'HELLO')
+
+statement ok
+INSERT INTO t (id, s) VALUES (7, 'abc'), (8, 'a%c'), (9, 'a_c')
+
+statement ok
+INSERT INTO t (id, s) VALUES (10, NULL), (11, 'aXc'), (12, 'axc')
+
+query I nosort
+SELECT id FROM t WHERE s LIKE 'hel%'
+----
+1
+2
+3
+
+query I nosort
+SELECT id FROM t WHERE s LIKE 'h_ll'
+----
+3
+
+# '%' matches every non-NULL string, including the empty one.
+query I nosort
+SELECT id FROM t WHERE s LIKE '%'
+----
+1
+2
+3
+4
+5
+6
+7
+8
+9
+11
+12
+
+# The empty pattern matches only the empty string.
+query I nosort
+SELECT id FROM t WHERE s LIKE ''
+----
+5
+
+query I nosort
+SELECT id FROM t WHERE s LIKE '_'
+----
+4
+
+query I nosort
+SELECT id FROM t WHERE s LIKE '%o'
+----
+1
+
+# Case-sensitive: 'HELLO' and 'hello' are different worlds.
+query I nosort
+SELECT id FROM t WHERE s LIKE 'HELLO'
+----
+6
+
+query I nosort
+SELECT id FROM t WHERE s LIKE 'hello'
+----
+1
+
+# There is no NOT LIKE keyword; negate the whole predicate. NULL still
+# never appears (NOT UNKNOWN = UNKNOWN).
+query I nosort
+SELECT id FROM t WHERE NOT (s LIKE 'hel%')
+----
+4
+5
+6
+7
+8
+9
+11
+12
+
+# `%` and `_` are always wildcards (no escape syntax): 'a%c' matches every
+# a...c string and 'a_c' every 3-character one.
+query I nosort
+SELECT id FROM t WHERE s LIKE 'a%c'
+----
+7
+8
+9
+11
+12
+
+query I nosort
+SELECT id FROM t WHERE s LIKE 'a_c'
+----
+7
+8
+9
+11
+12
+
+# A backslash is an ordinary character, not an escape.
+query I nosort
+SELECT id FROM t WHERE s LIKE 'a\%c'
+----
+
+query I nosort
+SELECT id FROM t WHERE s LIKE '__'
+----
+
+# Doubled wildcards collapse.
+query I nosort
+SELECT id FROM t WHERE s LIKE '%%'
+----
+1
+2
+3
+4
+5
+6
+7
+8
+9
+11
+12
+
+query I nosort
+SELECT id FROM t WHERE s LIKE '%e%o%'
+----
+1
+
+query I nosort
+SELECT id FROM t WHERE s LIKE 'hello_'
+----
+
+query I nosort
+SELECT id FROM t WHERE s LIKE '_ello'
+----
+1
+
+query I nosort
+SELECT id FROM t WHERE s LIKE '%l%'
+----
+1
+2
+3
+
+query I nosort
+SELECT id FROM t WHERE s LIKE 'x%'
+----
+
+# LIKE is an ordinary boolean expression: usable in projections, NULL for
+# NULL input.
+query IT nosort
+SELECT id, s LIKE 'h%' FROM t
+----
+1
+true
+2
+true
+3
+true
+4
+true
+5
+false
+6
+false
+7
+false
+8
+false
+9
+false
+10
+NULL
+11
+false
+12
+false
+
+query I nosort
+SELECT id FROM t WHERE s LIKE 'h%' AND s LIKE '%p'
+----
+2
+
+# id 8 ('a%c') matches 'a%': a literal '%' in the subject must not consume
+# the pattern's wildcard (regression: tests/engine_bugs.rs).
+query I nosort
+SELECT id FROM t WHERE s LIKE 'h%' OR s LIKE 'a%'
+----
+1
+2
+3
+4
+7
+8
+9
+11
+12
+
+# The empty string renders as (empty) per sqllogictest convention.
+query T nosort
+SELECT s FROM t WHERE id = 5
+----
+(empty)
+
+# A literal '%' in the subject must not consume the pattern's wildcard:
+# 'a%c' (id 8) matches 'a%' (regression fixed 2026-07-13; permanent test in
+# tests/engine_bugs.rs).
+query I nosort
+SELECT id FROM t WHERE s LIKE 'a%'
+----
+7
+8
+9
+11
+12
+
+query I nosort
+SELECT id FROM t WHERE s LIKE '%c'
+----
+7
+8
+9
+11
+12
+
+query I nosort
+SELECT id FROM t WHERE s LIKE 'h%l%'
+----
+1
+2
+3
+
+# ---- LIKE typing rules ----------------------------------------------------------
+
+statement error LIKE requires text
+SELECT id FROM t WHERE id LIKE 'x'
+
+statement error string literal
+SELECT id FROM t WHERE s LIKE 1
+
+statement error literal
+SELECT id FROM t WHERE s LIKE s

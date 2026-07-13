@@ -1,0 +1,10 @@
+[package]
+name = "mpedb-sql"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "mpedb SQL front-end: parser, binder, planner, content-hashed plans"
+
+[dependencies]
+mpedb-types = { workspace = true }
+blake3 = { workspace = true }

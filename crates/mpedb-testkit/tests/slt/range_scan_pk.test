@@ -1,0 +1,231 @@
+# Primary-key range scans on a single-column PK: inclusive and exclusive
+# bounds, combined bounds, empty ranges, point misses, negative keys (the
+# memcmp key encoding must order them numerically), and DML over ranges.
+#
+# schema:
+# [[table]]
+# name = "t"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "v"
+#   type = "text"
+# end schema
+
+statement ok
+INSERT INTO t (id, v) VALUES (1, 'a'), (3, 'b'), (5, 'c')
+
+statement ok
+INSERT INTO t (id, v) VALUES (7, 'd'), (9, 'e'), (11, 'f')
+
+# ---- one-sided bounds ---------------------------------------------------------
+
+query I nosort
+SELECT id FROM t WHERE id > 5
+----
+7
+9
+11
+
+query I nosort
+SELECT id FROM t WHERE id >= 5
+----
+5
+7
+9
+11
+
+query I nosort
+SELECT id FROM t WHERE id < 5
+----
+1
+3
+
+query I nosort
+SELECT id FROM t WHERE id <= 5
+----
+1
+3
+5
+
+# ---- two-sided bounds: all four inclusivity combinations -------------------------
+
+query I nosort
+SELECT id FROM t WHERE id > 4 AND id < 10
+----
+5
+7
+9
+
+query I nosort
+SELECT id FROM t WHERE id >= 3 AND id <= 9
+----
+3
+5
+7
+9
+
+query I nosort
+SELECT id FROM t WHERE id > 3 AND id <= 9
+----
+5
+7
+9
+
+query I nosort
+SELECT id FROM t WHERE id >= 3 AND id < 9
+----
+3
+5
+7
+
+# ---- empty ranges and misses -------------------------------------------------------
+
+query I nosort
+SELECT id FROM t WHERE id > 5 AND id <= 5
+----
+
+query I nosort
+SELECT id FROM t WHERE id > 11
+----
+
+query I nosort
+SELECT id FROM t WHERE id < 1
+----
+
+# Exclusive bounds with nothing between them.
+query I nosort
+SELECT id FROM t WHERE id > 3 AND id < 5
+----
+
+# Point miss between keys.
+query I nosort
+SELECT id FROM t WHERE id = 6
+----
+
+query I nosort
+SELECT id FROM t WHERE id = 7
+----
+7
+
+query I nosort
+SELECT id FROM t WHERE id > 0 AND id < 100
+----
+1
+3
+5
+7
+9
+11
+
+# Redundant bounds on the same column: one is consumed by the range, the
+# rest are evaluated as a residual filter.
+query I nosort
+SELECT id FROM t WHERE id > 1 AND id > 5
+----
+7
+9
+11
+
+query I nosort
+SELECT id FROM t WHERE id < 9 AND id < 5
+----
+1
+3
+
+# ---- negative keys -------------------------------------------------------------------
+
+statement ok
+INSERT INTO t (id, v) VALUES (-3, 'x'), (-1, 'y')
+
+query I nosort
+SELECT id FROM t WHERE id < 0
+----
+-3
+-1
+
+query I nosort
+SELECT id FROM t WHERE id >= -1 AND id <= 1
+----
+-1
+1
+
+query I nosort
+SELECT id FROM t WHERE id > -3 AND id < 3
+----
+-1
+1
+
+# Scan order is numeric, negatives first.
+query I nosort
+SELECT id FROM t
+----
+-3
+-1
+1
+3
+5
+7
+9
+11
+
+query I nosort
+SELECT id FROM t WHERE id <= -3
+----
+-3
+
+query I nosort
+SELECT id FROM t WHERE id > 4 ORDER BY id DESC
+----
+11
+9
+7
+5
+
+# ---- DML over ranges -------------------------------------------------------------------
+
+statement ok
+UPDATE t SET v = 'z' WHERE id > 9
+
+query T nosort
+SELECT v FROM t WHERE id = 11
+----
+z
+
+statement ok
+UPDATE t SET v = 'q' WHERE id >= -3 AND id < 0
+
+query T nosort
+SELECT v FROM t WHERE id < 0
+----
+q
+q
+
+statement ok
+DELETE FROM t WHERE id < 0
+
+query I nosort
+SELECT id FROM t
+----
+1
+3
+5
+7
+9
+11
+
+statement ok
+DELETE FROM t WHERE id > 7 AND id < 11
+
+query I nosort
+SELECT id FROM t
+----
+1
+3
+5
+7
+11

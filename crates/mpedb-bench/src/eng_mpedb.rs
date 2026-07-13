@@ -1,0 +1,186 @@
+//! mpedb adapter: in-process, all threads share ONE `Database` handle
+//! (mpedb's intended multi-thread shape; multi-process attach is the other).
+//!
+//! Hot path is `execute(hash, params)` — plans prepared once per reset.
+//! Durability comes from the file's config: `none` (no msync ever) or
+//! `commit` (msync before ack; the intent-ring group commit engages only
+//! here, DESIGN.md §5.3-5.4).
+
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+
+use mpedb::{params, Config, Database, ExecResult, PlanHash};
+
+use crate::engines::{age_for, email_for, Conn, Engine};
+use crate::util::{err, BResult};
+
+const SIZE_MB: u64 = 1024;
+
+/// KNOWN ENGINE RACE, found by this benchmark (durability=commit only):
+/// `mpedb-core::shm::newest_meta` loads the `durable_txn` gate ONCE and then
+/// validates both meta slots against it. A reader descheduled between the
+/// gate load and the slot reads — while TWO durable commits land (one per
+/// double-buffer slot) — finds both checksum-VALID slots gated
+/// (`txn_id > gate`) and gets a spurious
+/// `Error::Corrupt("no valid meta page (both checksums invalid)")`.
+/// The database is NOT corrupt: a fresh `begin_read` reloads the (monotone)
+/// gate and succeeds. Reproduces in seconds here: 3 readers + 1 durable
+/// writer on 2 cores. The real fix (reload the gate and retry inside
+/// `newest_meta`) belongs in mpedb-core, which parallel work owns — so this
+/// adapter retries the read instead, bounded, with the retry time COUNTED IN
+/// the measured latency, and the total is reported. Genuine corruption would
+/// not clear and still fails after the bound.
+pub static SPURIOUS_CORRUPT_RETRIES: AtomicU64 = AtomicU64::new(0);
+const CORRUPT_RETRY_BOUND: u32 = 100;
+
+pub fn spurious_corrupt_retries() -> u64 {
+    SPURIOUS_CORRUPT_RETRIES.load(Ordering::Relaxed)
+}
+
+pub struct MpedbEngine {
+    /// Directory holding the .mpedb file (tmpfs or disk).
+    dir: PathBuf,
+    durability: &'static str,
+    state: Option<State>,
+}
+
+struct State {
+    db: Arc<Database>,
+    ins: PlanHash,
+    sel: PlanHash,
+    upd: PlanHash,
+}
+
+impl MpedbEngine {
+    /// `durability` is `"none"` or `"commit"` (written into the file config).
+    pub fn new(dir: PathBuf, durability: &'static str) -> BResult<MpedbEngine> {
+        std::fs::create_dir_all(&dir)?;
+        Ok(MpedbEngine {
+            dir,
+            durability,
+            state: None,
+        })
+    }
+
+    fn db_path(&self) -> PathBuf {
+        self.dir.join("bench.mpedb")
+    }
+}
+
+impl Engine for MpedbEngine {
+    fn reset_and_seed(&mut self, rows: i64) -> BResult<()> {
+        // Drop the old handle (unmap) before deleting the file.
+        self.state = None;
+        let path = self.db_path();
+        let _ = std::fs::remove_file(&path);
+
+        let toml = format!(
+            r#"
+[database]
+path = "{}"
+size_mb = {SIZE_MB}
+max_readers = 64
+durability = "{}"
+
+[[table]]
+name = "users"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+
+  [[table.column]]
+  name = "email"
+  type = "text"
+  nullable = false
+  unique = true
+
+  [[table.column]]
+  name = "age"
+  type = "int64"
+"#,
+            path.display(),
+            self.durability
+        );
+        let db = Arc::new(Database::open_with_config(Config::from_toml_str(&toml)?)?);
+
+        // Prepare BEFORE opening the write session (facade locking rule).
+        let ins = db.prepare("INSERT INTO users (id, email, age) VALUES ($1, $2, $3)")?;
+        let sel = db.prepare("SELECT age FROM users WHERE id = $1")?;
+        let upd = db.prepare("UPDATE users SET age = $1 WHERE id = $2")?;
+
+        // Seed in one write transaction (unmeasured setup).
+        let mut session = db.begin()?;
+        for id in 0..rows {
+            session.execute(&ins, &params![id, email_for(id), age_for(id)])?;
+        }
+        session.commit()?;
+
+        self.state = Some(State { db, ins, sel, upd });
+        Ok(())
+    }
+
+    fn conn(&self) -> BResult<Box<dyn Conn>> {
+        let Some(s) = &self.state else {
+            return err("mpedb engine not seeded");
+        };
+        Ok(Box::new(MpedbConn {
+            db: s.db.clone(),
+            ins: s.ins,
+            sel: s.sel,
+            upd: s.upd,
+        }))
+    }
+}
+
+struct MpedbConn {
+    db: Arc<Database>,
+    ins: PlanHash,
+    sel: PlanHash,
+    upd: PlanHash,
+}
+
+impl Conn for MpedbConn {
+    fn insert(&mut self, id: i64, email: &str, age: i64) -> BResult<()> {
+        self.db.execute(&self.ins, &params![id, email, age])?;
+        Ok(())
+    }
+
+    fn select(&mut self, id: i64) -> BResult<bool> {
+        let mut tries = 0u32;
+        loop {
+            match self.db.execute(&self.sel, &params![id]) {
+                Ok(ExecResult::Rows { rows, .. }) => return Ok(!rows.is_empty()),
+                Ok(other) => return err(format!("select returned {other:?}")),
+                // See SPURIOUS_CORRUPT_RETRIES: reader vs two racing durable
+                // commits; retry re-reads the gate. Not real corruption.
+                Err(mpedb::Error::Corrupt(msg))
+                    if msg.contains("no valid meta page") && tries < CORRUPT_RETRY_BOUND =>
+                {
+                    tries += 1;
+                    SPURIOUS_CORRUPT_RETRIES.fetch_add(1, Ordering::Relaxed);
+                    std::hint::spin_loop();
+                }
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+
+    fn update(&mut self, id: i64, age: i64) -> BResult<()> {
+        self.db.execute(&self.upd, &params![age, id])?;
+        Ok(())
+    }
+
+    fn insert_batch(&mut self, base_id: i64, n: i64) -> BResult<()> {
+        // One WriteSession = one commit = one fdatasync (wal) for all n rows.
+        let mut s = self.db.begin()?;
+        for i in 0..n {
+            let id = base_id + i;
+            s.execute(&self.ins, &params![id, email_for(id), age_for(id)])?;
+        }
+        s.commit()?;
+        Ok(())
+    }
+}

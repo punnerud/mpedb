@@ -1,0 +1,11 @@
+[package]
+name = "mpedb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Embedded multi-process shared-memory database with SQL and content-hashed plans"
+
+[dependencies]
+mpedb-types = { workspace = true }
+mpedb-core = { workspace = true }
+mpedb-sql = { workspace = true }

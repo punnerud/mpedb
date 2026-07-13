@@ -1,0 +1,309 @@
+# ORDER BY semantics: NULLS FIRST when ascending, NULLS LAST when
+# descending (the descending sort is the exact reversal of the ascending
+# comparison). The sort is stable, so ties keep primary-key scan order.
+#
+# schema:
+# [[table]]
+# name = "t"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "v"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "s"
+#   type = "text"
+# end schema
+
+statement ok
+INSERT INTO t (id, v, s) VALUES (1, 3, 'c')
+
+statement ok
+INSERT INTO t (id, v, s) VALUES (2, NULL, 'a')
+
+statement ok
+INSERT INTO t (id, v, s) VALUES (3, 1, NULL)
+
+statement ok
+INSERT INTO t (id, v, s) VALUES (4, NULL, 'b')
+
+statement ok
+INSERT INTO t (id, v, s) VALUES (5, 2, 'a')
+
+statement ok
+INSERT INTO t (id, v, s) VALUES (6, 1, 'd')
+
+# Ascending: NULLs first; ties (v=1: ids 3,6 / v NULL: ids 2,4) keep scan order.
+query I nosort
+SELECT id FROM t ORDER BY v
+----
+2
+4
+3
+6
+5
+1
+
+# Explicit ASC is the same.
+query I nosort
+SELECT id FROM t ORDER BY v ASC
+----
+2
+4
+3
+6
+5
+1
+
+# Descending: exact reversal of the comparison, so NULLs last; ties still
+# keep scan order.
+query I nosort
+SELECT id FROM t ORDER BY v DESC
+----
+1
+5
+3
+6
+2
+4
+
+query T nosort
+SELECT s FROM t ORDER BY s
+----
+NULL
+a
+a
+b
+c
+d
+
+query I nosort
+SELECT id FROM t ORDER BY s
+----
+3
+2
+5
+4
+1
+6
+
+query I nosort
+SELECT id FROM t ORDER BY s DESC
+----
+6
+1
+4
+2
+5
+3
+
+# ORDER BY on the primary key.
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+3
+4
+5
+6
+
+query I nosort
+SELECT id FROM t ORDER BY id DESC
+----
+6
+5
+4
+3
+2
+1
+
+query I nosort
+SELECT v FROM t ORDER BY v
+----
+NULL
+NULL
+1
+1
+2
+3
+
+# The ORDER BY column does not need to be projected.
+query T nosort
+SELECT s FROM t ORDER BY v
+----
+a
+b
+NULL
+d
+a
+c
+
+# A seventh row makes multi-column ordering distinguishable from
+# single-column ordering (v=1 group: ids 3, 6, 7).
+statement ok
+INSERT INTO t (id, v, s) VALUES (7, 1, 'b')
+
+query I nosort
+SELECT id FROM t ORDER BY v
+----
+2
+4
+3
+6
+7
+5
+1
+
+# Secondary key breaks the ties: within v=1, s asc puts NULL first.
+query I nosort
+SELECT id FROM t ORDER BY v, s
+----
+2
+4
+3
+7
+6
+5
+1
+
+query I nosort
+SELECT id FROM t ORDER BY v DESC, s
+----
+1
+5
+3
+7
+6
+2
+4
+
+query I nosort
+SELECT id FROM t ORDER BY v DESC, s DESC
+----
+1
+5
+6
+7
+3
+4
+2
+
+query I nosort
+SELECT id FROM t ORDER BY v, s DESC
+----
+4
+2
+6
+7
+3
+5
+1
+
+query I nosort
+SELECT id FROM t ORDER BY s, v
+----
+3
+2
+5
+4
+7
+1
+6
+
+# ORDER BY with LIMIT/OFFSET applies after the sort.
+query II nosort
+SELECT id, v FROM t ORDER BY v LIMIT 3
+----
+2
+NULL
+4
+NULL
+3
+1
+
+query I nosort
+SELECT id FROM t ORDER BY v DESC LIMIT 2 OFFSET 1
+----
+5
+3
+
+query I nosort
+SELECT id FROM t WHERE v IS NOT NULL ORDER BY v
+----
+3
+6
+7
+5
+1
+
+# valuesort: every value sorted independently as strings.
+query I valuesort
+SELECT v FROM t WHERE v IS NOT NULL
+----
+1
+1
+1
+2
+3
+
+# rowsort: whole rows sorted as strings.
+query I rowsort
+SELECT id FROM t WHERE v = 1
+----
+3
+6
+7
+
+statement ok
+UPDATE t SET v = 4 WHERE id = 3
+
+query I nosort
+SELECT id FROM t ORDER BY v
+----
+2
+4
+6
+7
+5
+1
+3
+
+statement ok
+DELETE FROM t WHERE id = 4
+
+query I nosort
+SELECT id FROM t ORDER BY v DESC
+----
+3
+1
+5
+6
+7
+2
+
+# Same query twice must agree (label cross-check).
+query I nosort byv
+SELECT id FROM t ORDER BY v
+----
+2
+6
+7
+5
+1
+3
+
+query I nosort byv
+SELECT id FROM t ORDER BY v ASC
+----
+2
+6
+7
+5
+1
+3

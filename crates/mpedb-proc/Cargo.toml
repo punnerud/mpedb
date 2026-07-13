@@ -1,0 +1,22 @@
+[package]
+name = "mpedb-proc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PySpell-style stored procedures for mpedb: host-side parsing, sandboxed content-hashed IR"
+
+[dependencies]
+mpedb = { workspace = true }
+mpedb-sql = { workspace = true }
+mpedb-types = { workspace = true }
+blake3 = { workspace = true }
+# Frontend parsers: host-side ONLY (define time). The runtime never sees
+# source text, only validated IR. These deps exist in this crate alone.
+rustpython-parser = { version = "0.4", default-features = false, features = ["num-bigint"] }
+syn = { version = "2", features = ["full"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }
+
+[dev-dependencies]
+# Tests forge hostile/stale registry records through a second engine
+# attachment (the facade exposes no raw registry writes, by design).
+mpedb-core = { workspace = true }

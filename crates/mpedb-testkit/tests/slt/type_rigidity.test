@@ -1,0 +1,200 @@
+# Rigid typing: a column only ever stores its declared type. The single
+# implicit coercion is int64 -> float64. Everything else -- including the
+# int/bool and int/timestamp mixes sqlite would accept -- is an error at
+# prepare time.
+#
+# schema:
+# [[table]]
+# name = "t"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "i"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "f"
+#   type = "float64"
+#
+#   [[table.column]]
+#   name = "b"
+#   type = "bool"
+#
+#   [[table.column]]
+#   name = "s"
+#   type = "text"
+#
+#   [[table.column]]
+#   name = "bl"
+#   type = "blob"
+#
+#   [[table.column]]
+#   name = "ts"
+#   type = "timestamp"
+# end schema
+
+statement ok
+INSERT INTO t (id, i, f, b, s, bl) VALUES (1, 10, 2.5, true, 'txt', x'ab')
+
+# ---- INSERT type rejections ------------------------------------------------
+
+statement error cannot be inserted into column
+INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 'x', 2.5, true, 'txt', x'ab')
+
+statement error int64
+INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 1.5, 2.5, true, 'txt', x'ab')
+
+statement error cannot be inserted into column
+INSERT INTO t (id, i, f, b, s, bl) VALUES (2, true, 2.5, true, 'txt', x'ab')
+
+statement error type text
+INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 1, 2.5, true, 5, x'ab')
+
+statement error type bool
+INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 1, 2.5, 1, 'txt', x'ab')
+
+statement error type bool
+INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 1, 2.5, 't', 'txt', x'ab')
+
+statement error type float64
+INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 1, 'x', true, 'txt', x'ab')
+
+statement error type blob
+INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 1, 2.5, true, 'txt', 'x')
+
+statement error type text
+INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 1, 2.5, true, x'00', x'ab')
+
+# There is no timestamp literal; an int is not one.
+statement error type timestamp
+INSERT INTO t (id, ts) VALUES (2, 5)
+
+# ---- comparison type rejections ---------------------------------------------
+
+statement error cannot compare
+SELECT id FROM t WHERE s = 1
+
+statement error cannot compare
+SELECT id FROM t WHERE i = 'x'
+
+statement error cannot compare
+SELECT id FROM t WHERE b = 1
+
+statement error cannot compare
+SELECT id FROM t WHERE i = true
+
+statement error cannot compare
+SELECT id FROM t WHERE ts = 5
+
+statement error cannot compare
+SELECT id FROM t WHERE bl = 'x'
+
+# ---- expression type rejections ---------------------------------------------
+
+statement error text
+SELECT id FROM t WHERE s + 1 = 2
+
+statement error arithmetic requires int64 or float64
+SELECT id FROM t WHERE s + s = 'xx'
+
+statement error cannot negate text
+SELECT id FROM t WHERE -s < 'a'
+
+statement error NOT requires a boolean
+SELECT id FROM t WHERE NOT i
+
+statement error AND/OR requires boolean
+SELECT id FROM t WHERE i AND b
+
+statement error LIKE requires text
+SELECT id FROM t WHERE i LIKE 'x'
+
+# ---- name resolution ----------------------------------------------------------
+
+statement error unknown column
+SELECT nope FROM t
+
+statement error unknown table
+SELECT * FROM missing
+
+statement error unknown column
+SELECT id FROM t ORDER BY nope
+
+# ---- UPDATE type rejections ---------------------------------------------------
+
+statement error cannot assign text
+UPDATE t SET i = 'x'
+
+statement error cannot assign int64
+UPDATE t SET s = 5
+
+# float64 does NOT narrow to int64 (coercion is one-way).
+statement error cannot assign float64
+UPDATE t SET i = f
+
+statement error primary key
+UPDATE t SET id = 5
+
+# ---- the one legal coercion: int64 -> float64 --------------------------------
+
+# An int literal lands in a float column as a float.
+statement ok
+INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 0, 5, false, 'x', x'')
+
+query R nosort
+SELECT f FROM t WHERE id = 2
+----
+5.000
+
+# int column compared against a float literal: the column side is widened.
+query I nosort
+SELECT id FROM t WHERE i < 2.5
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE i = 10.0
+----
+1
+
+# int expression assigned to a float column.
+statement ok
+UPDATE t SET f = i + 1 WHERE id = 1
+
+query R nosort
+SELECT f FROM t WHERE id = 1
+----
+11.000
+
+query I nosort
+SELECT id FROM t WHERE f > 2
+----
+1
+2
+
+# ---- same-type comparisons work ----------------------------------------------
+
+query I nosort
+SELECT id FROM t WHERE b = false
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE bl = x'ab'
+----
+1
+
+query I nosort
+SELECT id FROM t WHERE ts IS NULL
+----
+1
+2
+
+query I nosort
+SELECT id FROM t WHERE s < 'u'
+----
+1

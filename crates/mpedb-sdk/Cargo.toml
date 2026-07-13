@@ -1,0 +1,9 @@
+[package]
+name = "mpedb-sdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Thin caching client session for mpedb: send SQL, the SDK compiles once (client-side) and optimizes against the database"
+
+[dependencies]
+mpedb = { workspace = true }

@@ -1,0 +1,38 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/mpedb-types",
+    "crates/mpedb-core",
+    "crates/mpedb-sql",
+    "crates/mpedb",
+    "crates/mpedb-sdk",
+    "crates/mpedb-proc",
+    "crates/mpedb-cli",
+    "crates/mpedb-py",
+    "crates/mpedb-testkit",
+    "crates/mpedb-bench",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+mpedb-types = { path = "crates/mpedb-types" }
+mpedb-core = { path = "crates/mpedb-core" }
+mpedb-sql = { path = "crates/mpedb-sql" }
+mpedb = { path = "crates/mpedb" }
+mpedb-proc = { path = "crates/mpedb-proc" }
+libc = "0.2"
+blake3 = "1"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
+[profile.bench]
+inherits = "release"

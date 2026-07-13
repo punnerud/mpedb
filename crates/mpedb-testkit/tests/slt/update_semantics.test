@@ -1,0 +1,203 @@
+# UPDATE semantics: every SET expression evaluates against the OLD row (so
+# `SET a = b, b = a` swaps), self-referential updates see pre-statement
+# values, defaults fill omitted INSERT columns, and assignment typing is
+# rigid.
+#
+# schema:
+# [[table]]
+# name = "t"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "a"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "b"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "f"
+#   type = "float64"
+#
+#   [[table.column]]
+#   name = "s"
+#   type = "text"
+#   nullable = false
+#
+#   [[table.column]]
+#   name = "d"
+#   type = "int64"
+#   default = 7
+#
+#   [[table.column]]
+#   name = "ts"
+#   type = "timestamp"
+#   default = "now()"
+# end schema
+
+statement ok
+INSERT INTO t (id, a, b, f, s) VALUES (1, 1, 2, 1.5, 'one')
+
+statement ok
+INSERT INTO t (id, a, b, f, s) VALUES (2, 10, 20, 0.5, 'two')
+
+statement ok
+INSERT INTO t (id, a, b, f, s) VALUES (3, NULL, 5, NULL, 'three')
+
+# Omitted columns take their declared defaults.
+query I nosort
+SELECT d FROM t WHERE id = 1
+----
+7
+
+# now() defaults are per-statement timestamps: not NULL.
+query I nosort
+SELECT id FROM t WHERE ts IS NOT NULL
+----
+1
+2
+3
+
+# ---- self-referential SET evaluates against the OLD row ---------------------------
+
+statement ok
+UPDATE t SET a = a + 1 WHERE id = 1
+
+query I nosort
+SELECT a FROM t WHERE id = 1
+----
+2
+
+# The classic swap: both right-hand sides read the OLD row.
+statement ok
+UPDATE t SET a = b, b = a WHERE id = 2
+
+query II nosort
+SELECT a, b FROM t WHERE id = 2
+----
+20
+10
+
+statement ok
+UPDATE t SET a = a * 2 + b WHERE id = 1
+
+query II nosort
+SELECT a, b FROM t WHERE id = 1
+----
+6
+2
+
+# Unqualified self-referential UPDATE touches every row; NULL propagates.
+statement ok
+UPDATE t SET a = a + 10
+
+query II nosort
+SELECT id, a FROM t
+----
+1
+16
+2
+30
+3
+NULL
+
+# The WHERE snapshot is taken before mutation: no re-matching of updated rows.
+statement ok
+UPDATE t SET a = 0 WHERE a > 0
+
+query I nosort
+SELECT a FROM t
+----
+0
+0
+NULL
+
+# int64 column assigned to a float64 column: widened.
+statement ok
+UPDATE t SET f = a WHERE id = 1
+
+query R nosort
+SELECT f FROM t WHERE id = 1
+----
+0.000
+
+# Cross-assignments both read OLD values.
+statement ok
+UPDATE t SET a = b + 1, b = a - 1 WHERE id = 2
+
+query II nosort
+SELECT a, b FROM t WHERE id = 2
+----
+11
+-1
+
+# ---- rejected SET forms --------------------------------------------------------------
+
+statement error more than once
+UPDATE t SET a = 1, a = 2
+
+statement error unknown column
+UPDATE t SET nope = 1
+
+statement error primary key
+UPDATE t SET id = 4
+
+statement error NULL
+UPDATE t SET s = NULL
+
+# ---- NULL arithmetic in SET -----------------------------------------------------------
+
+# NULL + 1 is NULL: the row is matched and written, value stays NULL.
+statement ok
+UPDATE t SET a = a + 1 WHERE a IS NULL
+
+query I nosort
+SELECT a FROM t WHERE id = 3
+----
+NULL
+
+statement ok
+UPDATE t SET d = d * 2 WHERE id = 1
+
+query I nosort
+SELECT d FROM t WHERE id = 1
+----
+14
+
+# UNKNOWN predicate: nothing updated.
+statement ok
+UPDATE t SET a = 5 WHERE id = NULL
+
+query I nosort
+SELECT a FROM t WHERE id = 1
+----
+0
+
+statement ok
+UPDATE t SET f = f + 0.25 WHERE id = 2
+
+query R nosort
+SELECT f FROM t WHERE id = 2
+----
+0.750
+
+statement ok
+UPDATE t SET s = 'renamed' WHERE id = 3
+
+query T nosort
+SELECT s FROM t WHERE id = 3
+----
+renamed
+
+statement ok
+UPDATE t SET b = b - b WHERE id = 1
+
+query I nosort
+SELECT b FROM t WHERE id = 1
+----
+0

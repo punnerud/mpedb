@@ -1,0 +1,280 @@
+//! mpedb-bench — honest head-to-head: mpedb vs SQLite vs PostgreSQL.
+//!
+//! Run: `cargo run --release -p mpedb-bench`
+//! Flags: `--quick` (short cells, RESULTS.md not written),
+//!        `--only <substr>` (run only engines whose key matches: mpedb,
+//!        sqlite, postgres).
+//!
+//! Progress goes to stderr; the final report goes to stdout and (full runs)
+//! to crates/mpedb-bench/RESULTS.md.
+
+mod dur_compare;
+mod eng_mpedb;
+mod eng_pg;
+mod eng_sqlite;
+mod engines;
+mod report;
+mod util;
+mod workloads;
+
+use std::path::PathBuf;
+use std::time::Instant;
+
+use eng_mpedb::MpedbEngine;
+use eng_pg::{PgEngine, PgServer};
+use eng_sqlite::{SqliteEngine, SqliteMode};
+use engines::Engine;
+use report::{CellRow, Report};
+use util::{cpu_model, fs_type, kernel, mem_total, rustc_version, today_utc, BResult};
+use workloads::{run_workload, RunCfg, ALL_WORKLOADS};
+
+const ENGINE_KEYS: [&str; 3] = ["mpedb", "sqlite", "postgres"];
+
+struct DirGuard(PathBuf);
+impl Drop for DirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Disk-backed scratch next to the build output (the workspace `target/`
+/// directory lives on the real disk here — verified and printed at run time).
+fn disk_scratch(pid: u32) -> PathBuf {
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        .unwrap_or_else(std::env::temp_dir);
+    base.join(format!("mpedb-bench-scratch-{pid}"))
+}
+
+fn pg_version_string() -> String {
+    std::process::Command::new("/usr/lib/postgresql/16/bin/postgres")
+        .arg("--version")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|| "postgres binary not found".into())
+}
+
+fn engine_label(key: &str) -> String {
+    match key {
+        "mpedb" => format!("mpedb {}", env!("CARGO_PKG_VERSION")),
+        "sqlite" => format!("SQLite {}", rusqlite::version()),
+        _ => {
+            // "postgres (PostgreSQL) 16.14 (Ubuntu ...)" → "PostgreSQL 16.14"
+            let v = pg_version_string();
+            v.split_whitespace()
+                .nth(2)
+                .map_or_else(|| "PostgreSQL 16".into(), |n| format!("PostgreSQL {n}"))
+        }
+    }
+}
+
+fn config_label(key: &str, durable: bool) -> String {
+    match (key, durable) {
+        ("mpedb", false) => "tmpfs, durability=none".into(),
+        ("mpedb", true) => "disk, durability=commit".into(),
+        ("sqlite", false) => "tmpfs, sync=OFF+MEMORY".into(),
+        ("sqlite", true) => "disk, sync=FULL+WAL".into(),
+        (_, false) => "tmpfs, fsync=off+sc=off".into(),
+        (_, true) => "disk, fsync=on+sc=on".into(),
+    }
+}
+
+fn build_engine(
+    key: &str,
+    durable: bool,
+    tmpfs_base: &std::path::Path,
+    disk_base: &std::path::Path,
+) -> BResult<Box<dyn Engine>> {
+    let medium = if durable { disk_base } else { tmpfs_base };
+    match key {
+        "mpedb" => Ok(Box::new(MpedbEngine::new(
+            medium.join("mpedb"),
+            if durable { "commit" } else { "none" },
+        )?)),
+        "sqlite" => Ok(Box::new(SqliteEngine::new(
+            medium.join("sqlite"),
+            if durable {
+                SqliteMode::CommitClass
+            } else {
+                SqliteMode::NoneClass
+            },
+        )?)),
+        _ => {
+            // Data dir follows the medium; the unix SOCKET always sits on
+            // tmpfs (short path — 107-byte sun_path limit; carries no data).
+            let datadir = medium.join("pgdata");
+            let sockdir = tmpfs_base.join(if durable { "pgsock-c" } else { "pgsock-n" });
+            let server = PgServer::start(datadir, sockdir, durable)?;
+            Ok(Box::new(PgEngine::new(server)?))
+        }
+    }
+}
+
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let quick = args.iter().any(|a| a == "--quick");
+    let only: Option<String> = args
+        .windows(2)
+        .find(|w| w[0] == "--only")
+        .map(|w| w[1].clone());
+    for (i, a) in args.iter().enumerate() {
+        let known = a == "--quick"
+            || a == "--only"
+            || (i > 0 && args[i - 1] == "--only");
+        if !known {
+            eprintln!("usage: mpedb-bench [--quick] [--only mpedb|sqlite|postgres]");
+            std::process::exit(2);
+        }
+    }
+    let cfg = if quick { RunCfg::quick() } else { RunCfg::full() };
+
+    let pid = std::process::id();
+    let tmpfs_base = PathBuf::from(format!("/dev/shm/mpedb-bench-{pid}"));
+    let disk_base = disk_scratch(pid);
+    for d in [&tmpfs_base, &disk_base] {
+        if let Err(e) = std::fs::create_dir_all(d) {
+            eprintln!("cannot create scratch dir {}: {e}", d.display());
+            std::process::exit(1);
+        }
+    }
+    let _guards = (DirGuard(tmpfs_base.clone()), DirGuard(disk_base.clone()));
+
+    let tmpfs_ty = fs_type(&tmpfs_base);
+    let disk_ty = fs_type(&disk_base);
+    if tmpfs_ty != "tmpfs" {
+        eprintln!("WARNING: {} is {tmpfs_ty}, expected tmpfs", tmpfs_base.display());
+    }
+    if disk_ty == "tmpfs" {
+        eprintln!(
+            "WARNING: disk scratch {} is on tmpfs — 'disk' cells are not disk-backed!",
+            disk_base.display()
+        );
+    }
+
+    let info_lines = vec![
+        format!("Date: {} (UTC)", today_utc()),
+        format!(
+            "CPU: {} — {} cores; RAM: {}; kernel: Linux {}",
+            cpu_model(),
+            std::thread::available_parallelism().map_or(0, |n| n.get()),
+            mem_total(),
+            kernel()
+        ),
+        format!(
+            "Media: tmpfs = {} ({tmpfs_ty}); disk = {} ({disk_ty})",
+            tmpfs_base.display(),
+            disk_base.display()
+        ),
+        format!(
+            "mpedb {} (this workspace, embedded, one shared Database handle across threads)",
+            env!("CARGO_PKG_VERSION")
+        ),
+        format!(
+            "SQLite {} (rusqlite 0.31 `bundled` — system libsqlite3 has no dev \
+             symlink/header, so linking it fails; STRICT table, one connection per thread)",
+            rusqlite::version()
+        ),
+        format!(
+            "{} (throwaway cluster: initdb --auth=trust --locale=C, pg_ctl, unix socket, \
+             `postgres` crate 0.19, one client per thread)",
+            pg_version_string()
+        ),
+        rustc_version() + " (--release, lto=thin)",
+        format!(
+            "Workload sizing: point cells self-calibrate to ~{:.1} s; timed cells {:.1} s; \
+             {} seeded rows per cell",
+            cfg.target_s, cfg.timed_s, cfg.seed_rows
+        ),
+    ];
+
+    let mut cells: Vec<CellRow> = Vec::new();
+    for durable in [false, true] {
+        let class = if durable { "commit-class" } else { "none-class" };
+        for key in ENGINE_KEYS {
+            if let Some(f) = &only {
+                if !key.contains(f.as_str()) {
+                    continue;
+                }
+            }
+            let elabel = engine_label(key);
+            let clabel = config_label(key, durable);
+            eprintln!("=== {elabel} — {clabel} ({class}) ===");
+            match build_engine(key, durable, &tmpfs_base, &disk_base) {
+                Err(e) => {
+                    eprintln!("  engine unavailable: {e}");
+                    for w in ALL_WORKLOADS {
+                        cells.push(CellRow {
+                            engine: elabel.clone(),
+                            config: clabel.clone(),
+                            class,
+                            workload: w,
+                            outcome: Err(format!("engine unavailable: {e}")),
+                        });
+                    }
+                }
+                Ok(mut engine) => {
+                    for w in ALL_WORKLOADS {
+                        eprint!("  {:<18} ", w.name());
+                        let t = Instant::now();
+                        let outcome = run_workload(engine.as_mut(), w, &cfg)
+                            .map_err(|e| e.to_string());
+                        match &outcome {
+                            Ok(_) => eprintln!("done in {:>5.1} s", t.elapsed().as_secs_f64()),
+                            Err(e) => eprintln!("FAILED: {e}"),
+                        }
+                        cells.push(CellRow {
+                            engine: elabel.clone(),
+                            config: clabel.clone(),
+                            class,
+                            workload: w,
+                            outcome,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    // Focused single-client durable point-insert, by durability class (§5.4).
+    // Its own engine instances on real disk; PostgreSQL sockets on tmpfs.
+    eprintln!("=== single-client durable point-insert, by class (§5.4) ===");
+    let labels = dur_compare::Labels {
+        mpedb: engine_label("mpedb"),
+        sqlite: engine_label("sqlite"),
+        pg: engine_label("postgres"),
+    };
+    let dur_rows = dur_compare::run(&disk_base, &tmpfs_base, &cfg, &only, &labels);
+
+    let mut extra_caveats = Vec::new();
+    let retries = eng_mpedb::spurious_corrupt_retries();
+    if retries > 0 {
+        extra_caveats.push(format!(
+            "mpedb spurious-Corrupt reader retries observed THIS run: {retries} \
+             (see the engine-race caveat above; retry time is included in read latency)"
+        ));
+    }
+    let report = Report {
+        info_lines,
+        cells,
+        dur_rows,
+        quick_mode: quick,
+        extra_caveats,
+    };
+    println!("{}", report.to_text());
+
+    if quick {
+        eprintln!("(quick mode: RESULTS.md not written)");
+    } else {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("RESULTS.md");
+        match std::fs::write(&path, report.to_markdown()) {
+            Ok(()) => eprintln!("wrote {}", path.display()),
+            Err(e) => {
+                eprintln!("failed to write {}: {e}", path.display());
+                std::process::exit(1);
+            }
+        }
+    }
+}
