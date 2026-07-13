@@ -1,15 +1,21 @@
 //! Platform abstraction for the OS primitives the shared-memory engine needs
-//! (task #18). **Linux is the reference, crash-safe platform.**
+//! (task #18). **Linux is the reference platform.**
 //!
-//! ## macOS is BENCHMARK-GRADE ONLY
+//! ## macOS is crash-safe (FLD-2)
 //!
-//! macOS lacks robust process-shared mutexes and Linux futexes. This module
-//! degrades those to a plain process-shared mutex (no `EOWNERDEAD` recovery),
-//! a polling "park" instead of a futex, and `fsync` instead of `fdatasync`.
-//! That is enough to run **multi-process throughput benchmarks** on many-core
-//! hardware, but on macOS a process that dies holding the writer lock WEDGES
-//! the database, and durability is not platter-guaranteed. Do not treat the
-//! macOS build as crash-safe or durable.
+//! macOS lacks robust process-shared mutexes and Linux futexes, so the writer
+//! lock is NOT the shared pthread mutex there. Instead `WriterLock` gives
+//! equivalent owner-death recovery via a sidecar `flock` (the kernel releases it
+//! when the holder dies) plus a private ERRORCHECK mutex and a shared-memory
+//! tri-state DIRTY word (DESIGN-MACOS-LOCK.md). Durability uses
+//! `fcntl(F_FULLFSYNC)` (real platter flush) and `msync` bases rounded to the
+//! 16 KiB Apple-Silicon page. Futex waits degrade to a polling "park" (correct,
+//! just busier). Verified: SIGKILL waves recover with `eowner_recovery=true`
+//! across none/commit/wal modes, all invariants held, no wedge.
+//!
+//! Not yet ported: a mid-life sidecar (dev,ino) identity check (DESIGN step 5) —
+//! guards only a live DB file unlink+recreate, which the Linux path also leaves
+//! unguarded, so it is deferred to keep the platforms symmetric.
 
 use std::os::unix::io::RawFd;
 use std::sync::atomic::AtomicU32;

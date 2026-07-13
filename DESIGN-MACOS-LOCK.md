@@ -134,7 +134,7 @@ macOS `writer_lock`/`try_writer_lock` run `recover_after_owner_death()` internal
 
 **Used:** `flock(LOCK_EX/UN/NB)` on a sidecar inode (mutual exclusion + kernel crash-release death oracle + cross-process rendezvous); process-private `PTHREAD_MUTEX_ERRORCHECK` (intra-process serialization + EDEADLK); shared `AtomicU32` in MAP_SHARED (the `DIRTY` word — confirmed truly cross-process on arm64); `O_CLOEXEC`/`FD_CLOEXEC` + `pthread_atfork` (fd-inheritance defense); `fstat` (sidecar identity); `proc_pidinfo(PROC_PIDTBSDINFO).pbi_start_tvsec` (real start time — for the reader sweep, M3); `sysctlbyname("kern.bootsessionuuid")` (reboot-stable boot id, M6); `fcntl(F_FULLFSYNC)` (platter durability — orthogonal to the lock).
 
-**UNusable → fallback:** (a) **robust pthread mutex / `pthread_mutex_consistent`** — absent on macOS; replaced by `flock` crash-release + the `DIRTY` word synthesizing EOWNERDEAD/ENOTRECOVERABLE. (b) **`__ulock_wait/wake` as a cross-process futex** — XNU keys the wait queue on the caller's (task, VA), not the physical page, so a wake never rendezvous cross-process; replaced by **blocking `flock`** as the kernel wait (correctness never depends on a wakeup channel). (c) **`kill(pid,0)`+start-time as the takeover oracle** — necessary-not-sufficient under pid reuse; **not used** by the lock at all (superseded by `flock`'s per-OFD release). (d) **plain `fsync`** (current `os.rs` path) is not platter-durable; `F_FULLFSYNC` is the durability fallback behind the same cfg.
+**UNusable → fallback:** (a) **robust pthread mutex / `pthread_mutex_consistent`** — absent on macOS; replaced by `flock` crash-release + the `DIRTY` word synthesizing EOWNERDEAD/ENOTRECOVERABLE. (b) **`__ulock_wait/wake` as a cross-process futex** — XNU keys the wait queue on the caller's (task, VA), not the physical page, so a wake never rendezvous cross-process; replaced by **blocking `flock`** as the kernel wait (correctness never depends on a wakeup channel). (c) **`kill(pid,0)`+start-time as the takeover oracle** — necessary-not-sufficient under pid reuse; **not used** by the lock at all (superseded by `flock`'s per-OFD release). (d) **plain `fsync`** is not platter-durable; `os::fdatasync` now routes macOS through `fcntl(F_FULLFSYNC)` (falling back to `fsync` only on `ENOTSUP`).
 
 ## 9. Accepted limitations (explicit)
 
@@ -143,3 +143,24 @@ macOS `writer_lock`/`try_writer_lock` run `recover_after_owner_death()` internal
 - **Local filesystem, single host, single PID namespace, single uid** (sidecar is 0600; `proc_pidinfo` is same-uid-or-root) — a documented hard constraint; the real crash-safe target is Linux, macOS is the single-host bench/dev build.
 - **Benign extra idempotent `recover()`** in the t4 window; `recovered` is diagnostic-only so it has no engine effect.
 - **`flock` grants are unordered** — per-writer wait is not FIFO-bounded under saturation (system-wide progress always holds).
+
+## 10. Implementation status (landed & verified on M3, macOS 26.6 arm64)
+
+**Done.** FLD-2 writer lock (`os::WriterLock`: sidecar `flock` + private ERRORCHECK
+mutex + per-(dev,ino) OFD registry) with `post_acquire`/`writer_dirty` tri-state
+recovery in `shm.rs`; `F_FULLFSYNC` durability and 16 KiB-page-aligned `msync`
+(`os::sync_granularity`); real `proc_start_time` via `proc_pidinfo(PROC_PIDTBSDINFO)`
+for the reader-slot PID-reuse guard; `kern.bootsessionuuid`/`KERN_BOOTTIME` boot id.
+All macOS branches are `cfg`-gated so the Linux path is byte-identical (workspace
+tests green, `clippy -D warnings` clean, zero-warning macOS build).
+
+**Verified.** `crash` harness — SIGKILL waves in `none`/`commit`/`wal`, every wave
+`eowner_recovery=true`, all invariants held (checksum, uniqueness, page accounting),
+`verify=ok`. `collide` — durable(`commit`) 12 writers / SIGKILL drops → "ALL
+INVARIANTS HELD … no wedge". The DbFull that previously masked recovery on the fast
+M3 was a test-DB-size artifact, fixed by `crash --size_mb`.
+
+**Deferred (step 5, by choice).** Mid-life sidecar `(dev,ino)` identity check: guards
+only a live DB file unlink+recreate under attached processes — an operational misuse
+the **Linux** path does not guard either. Left out to keep the platforms symmetric;
+crash-safety (owner-death recovery + platter durability) does not depend on it.
