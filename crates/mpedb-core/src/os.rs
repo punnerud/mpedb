@@ -355,7 +355,8 @@ mod macos_lock {
 // ---- process / boot identity (reader-slot pid-reuse + boot recovery) --------
 
 /// A per-process start time; `(pid, start_time)` survives PID reuse. Linux:
-/// `/proc/<pid>/stat` field 22. macOS: `sysctl(KERN_PROC_PID).kp_proc.p_starttime`.
+/// `/proc/<pid>/stat` field 22. macOS: `proc_pidinfo(PROC_PIDTBSDINFO)` start
+/// instant. Returns `None` if the pid is gone (caller treats that as dead).
 pub fn proc_start_time(pid: u32) -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
@@ -366,13 +367,30 @@ pub fn proc_start_time(pid: u32) -> Option<u64> {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        // Benchmark-grade: `kinfo_proc` is not exposed by libc here, so we do
-        // not read a real start time. A constant means the reader-slot check
-        // falls back to pure liveness (`kill(pid, 0)`) — correct while pids are
-        // not reused (benchmarks are short and never SIGKILL a holder). NOT
-        // safe against PID reuse; a real port would use `proc_pidinfo`.
-        let _ = pid;
-        Some(0)
+        // Real per-process start stamp via libproc — `kinfo_proc`/`sysctl` is not
+        // exposed by libc here, but `proc_pidinfo` is. PROC_PIDTBSDINFO fills
+        // `proc_bsdinfo` with the process start `timeval`; fold it into a stable
+        // u64 microsecond stamp so `(pid, start)` distinguishes a reused pid from
+        // the original reader. A dead/absent pid returns 0 bytes → None.
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let sz = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        let rc = unsafe {
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                &mut info as *mut _ as *mut libc::c_void,
+                sz,
+            )
+        };
+        if rc != sz {
+            return None;
+        }
+        Some(
+            (info.pbi_start_tvsec as u64)
+                .wrapping_mul(1_000_000)
+                .wrapping_add(info.pbi_start_tvusec as u64),
+        )
     }
 }
 
