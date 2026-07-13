@@ -662,6 +662,32 @@ impl ReadTxn<'_> {
         Ok(out)
     }
 
+    /// System records whose subkey is in `[lo, hi)` (both given without the
+    /// reserved prefix, which is added internally). Prefix-bounded so a caller
+    /// can walk one family (e.g. a CDC dirty-set `d/<table>…`) in O(matches)
+    /// rather than scanning the whole sys region and filtering.
+    pub fn sys_scan_range(&self, lo: &[u8], hi: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let klo = sys_key(lo);
+        let khi = sys_key(hi);
+        let mut c = btree::cursor(
+            self,
+            self.meta.catalog_root,
+            Some((&klo, true)),
+            Some((&khi, false)),
+        )?;
+        let mut out = Vec::new();
+        while let Some((k, v)) = c.next(self)? {
+            out.push((k[1..].to_vec(), v));
+        }
+        Ok(out)
+    }
+
+    /// This snapshot's commit id (the monotone per-file txn counter). Used as
+    /// the push high-water `H` in the mirror protocol (DESIGN-MIRROR §6).
+    pub fn txn_id(&self) -> u64 {
+        self.meta.txn_id
+    }
+
     /// The canonical schema stored inside the database at init.
     pub fn stored_schema(&self) -> Result<Schema> {
         let bytes = btree::get(self, self.meta.catalog_root, CAT_SCHEMA_KEY)?
@@ -1227,6 +1253,21 @@ impl<'e> WriteTxn<'e> {
         let hi = [SYS_PREFIX + 1];
         let root = self.catalog_root;
         let mut c = btree::cursor(self, root, Some((&lo, true)), Some((&hi, false)))?;
+        let mut out = Vec::new();
+        while let Some((k, v)) = c.next(self)? {
+            out.push((k[1..].to_vec(), v));
+        }
+        Ok(out)
+    }
+
+    /// Prefix-bounded sys scan within the writer's view (see
+    /// [`ReadTxn::sys_scan_range`]). `lo`/`hi` are subkeys; the reserved prefix
+    /// is added internally.
+    pub fn sys_scan_range(&mut self, lo: &[u8], hi: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let klo = sys_key(lo);
+        let khi = sys_key(hi);
+        let root = self.catalog_root;
+        let mut c = btree::cursor(self, root, Some((&klo, true)), Some((&khi, false)))?;
         let mut out = Vec::new();
         while let Some((k, v)) = c.next(self)? {
             out.push((k[1..].to_vec(), v));
@@ -2126,6 +2167,46 @@ primary_key = ["id"]
             h.join().unwrap();
         }
         std::fs::remove_file(&cfg.options.path).unwrap();
+    }
+
+    #[test]
+    fn sys_scan_range_is_prefix_bounded_and_txn_id_tracks_commits() {
+        let cfg = test_config("sysrange", 8);
+        let eng = open(&cfg);
+
+        let mut w = eng.begin_write().unwrap();
+        // several families sharing the sys region
+        w.sys_put(b"cdc\0d/\x00\x00\x00\x00A", b"1").unwrap();
+        w.sys_put(b"cdc\0d/\x00\x00\x00\x00B", b"2").unwrap();
+        w.sys_put(b"cdc\0tabs", b"T").unwrap();
+        w.sys_put(b"plan/xyz", b"P").unwrap();
+        w.sys_put(b"mir\0epoch", b"E").unwrap();
+        w.commit().unwrap();
+
+        // scan just the cdc dirty family [cdc\0d/, cdc\0d0): 0x30 ('0') is the
+        // byte after '/' (0x2f), an exclusive upper bound past every d/ key.
+        let r = eng.begin_read().unwrap();
+        let dirty = r.sys_scan_range(b"cdc\0d/", b"cdc\0d0").unwrap();
+        assert_eq!(dirty.len(), 2, "only the two d/ entries, not tabs/plan/mir");
+        assert_eq!(dirty[0].0, b"cdc\0d/\x00\x00\x00\x00A");
+        assert_eq!(dirty[1].1, b"2");
+        assert_eq!(r.sys_scan().unwrap().len(), 5); // whole region still intact
+        let t_after = r.txn_id();
+        r.finish().unwrap();
+
+        // txn_id advances by exactly one per commit
+        let mut w = eng.begin_write().unwrap();
+        assert_eq!(w.meta.txn_id, t_after);
+        w.sys_put(b"cdc\0d/\x00\x00\x00\x00C", b"3").unwrap();
+        w.commit().unwrap();
+        let r = eng.begin_read().unwrap();
+        assert_eq!(r.txn_id(), t_after + 1);
+        // writer-side prefix scan agrees with the reader
+        let mut w = eng.begin_write().unwrap();
+        assert_eq!(w.sys_scan_range(b"cdc\0d/", b"cdc\0d0").unwrap().len(), 3);
+        drop(w);
+        r.finish().unwrap();
+        eng.verify_page_accounting().unwrap();
     }
 }
 
