@@ -32,6 +32,19 @@
 //!   **only locally** — it never touches the registry write path, precisely
 //!   to avoid that self-lock.
 
+/// Test-only: a database file that deletes itself, even when a test panics.
+///
+/// The tests here put their `.mpedb` on `/dev/shm` and named it by PID, then
+/// removed it on the last line. A panicking test never reaches that line — so
+/// every red run leaked ~8 MB of tmpfs, and re-running (which is exactly what
+/// you do when a test is red) leaked more. `/dev/shm` reached 100% twice in one
+/// day, and the resulting `StorageFull` surfaces as ~50 unrelated test failures,
+/// which reads as "the code is broken" rather than "the disk is full".
+///
+/// Cleanup therefore belongs in a Drop guard, which panics DO run.
+#[cfg(test)]
+mod testdb;
+
 mod exec;
 mod policy_store;
 mod registry;
