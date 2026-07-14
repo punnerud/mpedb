@@ -205,11 +205,10 @@ cell most sensitive to core count — see [BENCHMARKS.md](BENCHMARKS.md).
 
 ### Apple Silicon — M3 Pro, 11 cores, macOS 26.6 (2026-07-14)
 
-mpedb and SQLite only (PostgreSQL is not installed there, so its cells report as
-unavailable rather than being quietly omitted).
+All three engines.
 
 Eleven cores is where the design story stops being theoretical. `read-while-write`
-none-class: **mpedb 3,682,233 reads/s vs SQLite's 180, p99 ~150 seconds** —
+none-class: **mpedb 3,704,543 reads/s vs SQLite's ~180, p99 ~150 seconds** —
 SQLite's none-class journal serializes readers against a writer that now has ten
 spare cores to starve them with. A pathological config rather than a fair fight,
 but it is the exact failure mpedb's MVCC readers exist to avoid, and more cores
@@ -217,12 +216,18 @@ make it worse rather than better. The same cell on the 2-core Linux box reads
 486k vs 3.5k: same phenomenon, two orders of magnitude apart — which is why the
 2-core numbers *understate* this one.
 
-Bulk write flips the other way from Linux: mpedb **2,270 MiB/s (39% of raw)** vs
-SQLite 1,201 (20%) — 1.9×. On the 2-core Linux box SQLite leads that cell; give
+Bulk write flips the other way from Linux: mpedb **2,274 MiB/s (38% of raw)** vs
+SQLite 1,163 (19%) — 1.9×. On the 2-core Linux box SQLite leads that cell; give
 mpedb cores and a fast SSD and it does not.
 
-But the run is worth reading for what it caught rather than its throughput: **it
-found two bugs, one in the benchmark and one in mpedb**, both invisible on Linux.
+**And the durable-write result is that there is no result.** Once every engine is
+made to actually reach the platter, single-client durable inserts land at
+**mpedb 318 ops/s, SQLite 310, PostgreSQL 429** — three engines, three
+independent implementations, agreeing within 40%. That is not engineering, it is
+the ~3 ms an Apple SSD takes to flush, and nobody beats it. Any benchmark showing
+one of them far ahead here is showing you a bug.
+
+Getting there took catching all three of them skipping the flush, one at a time:
 
 macOS's `fsync()` does not flush the drive's write cache — only
 `fcntl(F_FULLFSYNC)` does. mpedb's `durability=commit` barrier is

@@ -10,7 +10,7 @@ durability classes, all latency percentiles) live in its own file.
 | machine | engines | full results |
 |---|---|---|
 | AMD EPYC-Milan, 2 cores, 7.6 GiB, Linux 6.8 | mpedb, SQLite, PostgreSQL 16 | [`RESULTS-linux-amd-epyc-milan-2c.md`](crates/mpedb-bench/RESULTS-linux-amd-epyc-milan-2c.md) |
-| Apple M3 Pro, 11 cores, 36 GiB, macOS 26.6 | mpedb, SQLite — **PostgreSQL not installed there**, so its cells report as unavailable | [`RESULTS-macos-apple-m3-pro-11c.md`](crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md) |
+| Apple M3 Pro, 11 cores, 36 GiB, macOS 26.6 | mpedb, SQLite, PostgreSQL 16 | [`RESULTS-macos-apple-m3-pro-11c.md`](crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md) |
 
 **One file per machine, on purpose.** A generated report says "on this machine"
 in its own first line — it is a single-host document, and a run on a second host
@@ -180,17 +180,17 @@ tmpfs, so **none-class ratios are not directly comparable to the Linux run**
 (mpedb is mmap-based and pays a filesystem layer SQLite's read/write path does
 not).
 
-| none-class, ops/s | mpedb | SQLite | ratio |
+| none-class, ops/s | mpedb | SQLite | PostgreSQL |
 |---|--:|--:|--:|
-| point-select | **1,652,756** | 316,101 | 5.2× |
-| point-insert | **203,914** | 112,985 | 1.8× |
-| point-update | **258,718** | 138,041 | 1.9× |
-| contended-writes (4 threads) | **135,243** | 104,568 | 1.3× |
-| read-while-write (reads) | **3,682,233** | 180 | — |
-| bulk write MiB/s (% of raw) | **2,270.5 (39%)** | 1,200.7 (20%) | 1.9× |
+| point-select | **1,679,538** | 317,810 | 40,399 |
+| point-insert | **203,842** | 111,994 | 34,457 |
+| read-while-write (reads) | **3,704,543** | ~180 | 112,137 |
+| bulk write MiB/s (% of raw) | **2,274.3 (38%)** | 1,163.3 (19%) | 107.2 (2%) |
 
-Two runs of this machine exist and every cell moved ≤4% with the ratios stable
-(point-select 5.2× both times), so treat ±4% here as the noise floor.
+Four runs of this machine exist. Every cell moves ≤4% with ratios stable, so
+±4% is the noise floor here — which is exactly how one apparent 5.7% bulk-write
+regression was dismissed: the sequence was 2270.5 → 2141.1 → 2274.3 on a binary
+that never changed between the last two. A real code signal does not un-regress.
 
 That last row is not a typo. SQLite's none-class journal serializes readers
 against the writer, and on 11 cores the writer starves them completely:
@@ -203,8 +203,8 @@ that is the APFS-over-RAM medium; we did not isolate how much.
 
 ### The durability trap (why this machine was worth running)
 
-The M3 run exposed a bug in the benchmark **and** one in mpedb — both invisible
-on Linux, both in the same direction: *pretending a write was durable.*
+Every engine here was caught pretending a write was durable on Apple. All three.
+Each in a different way, each invisible on Linux, each in the same direction.
 
 On macOS, `fsync()` does not flush the drive's write cache; only
 `fcntl(F_FULLFSYNC)` does. Two consequences we had both gotten wrong:
@@ -217,21 +217,33 @@ On macOS, `fsync()` does not flush the drive's write cache; only
    the commit path's barrier is `msync(MS_SYNC)`, which on macOS hands pages to
    the filesystem and stops there.
 
-Single-client durable INSERT, before and after making both engines honest:
+3. **PostgreSQL** — found last, because until 2026-07-14 it was never *measurable*
+   on a Mac at all: three files hardcoded Debian's `/usr/lib/postgresql/16/bin`,
+   so Homebrew's build was invisible by construction and the cells failed
+   honestly with "initdb not found". The moment it ran, it posted **23,555
+   durable inserts/s at p50 38 µs** — impossible for a device flush.
+   `wal_sync_method` defaults to `open_datasync`; only `fsync_writethrough`
+   issues `F_FULLFSYNC`.
+
+Single-client durable INSERT, before and after making each engine honest:
 
 | | ops/s | p50 | really durable? |
 |---|--:|--:|---|
-| SQLite FULL (harness default) | 26,642 | 25 µs | ❌ |
-| mpedb `commit` (before fix) | 7,583 | 127 µs | ❌ |
-| **SQLite FULL + `fullfsync`** | **286** | 3,815 µs | ✅ |
-| **mpedb `wal`** | **293** | 3,091 µs | ✅ |
-| **mpedb `commit` (after fix)** | **142** | 6,999 µs | ✅ (two flushes — see Known issues) |
+| SQLite FULL (harness default) | 26,642 | 25 µs | ❌ `PRAGMA fullfsync` defaults OFF |
+| PostgreSQL `fsync=on` (default) | 23,555 | 38 µs | ❌ `wal_sync_method=open_datasync` |
+| mpedb `commit` (before fix) | 7,583 | 127 µs | ❌ `msync` stopped at the filesystem |
+| **PostgreSQL + `fsync_writethrough`** | **429** | 2,125 µs | ✅ |
+| **mpedb `wal`** | **318** | 3,015 µs | ✅ |
+| **SQLite FULL + `fullfsync`** | **310** | 3,067 µs | ✅ |
+| mpedb `commit` (after fix) | 142 | 6,997 µs | ✅ but pays two flushes — see Known issues |
 
-**~290 ops/s is simply what an Apple SSD platter flush costs.** Everything above
-it was an engine skipping the flush. Honest verdict on this machine: mpedb `wal`
-and SQLite-with-fullfsync are **tied** (293 vs 286) at genuinely durable
-single-client inserts; the 93× and 26× "wins" either engine appeared to have
-were measurement artifacts. Both fixes are committed.
+**The durable-write result is that there is no result.** Three engines, three
+independent implementations, agreeing within 40% — because what is being measured
+stopped being the engine and became the ~3 ms an Apple SSD takes to flush. Nobody
+beats it. Every apparent "win" here — SQLite's 86×, PostgreSQL's 91×, mpedb's
+24× — was an engine skipping the barrier, and each one made the honest engines
+look slow. A benchmark that lets one engine skip the flush is not measuring the
+other two, it is slandering them. All three fixes are committed.
 
 ## Bulk MB/s — and the number that makes it mean something
 
