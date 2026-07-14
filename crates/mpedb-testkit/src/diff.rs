@@ -121,7 +121,24 @@ const PG_SCHEMA: &str =
 pub struct GenStmt {
     pub sql: String,
     pub is_select: bool,
+    /// The column types this SELECT returns, in order. sqlite3 and psql both
+    /// hand back untyped pipe-separated TEXT, so the shape is what tells the
+    /// parser whether `650` is the integer 650 or the text "650" — mpedb
+    /// returns typed values and would otherwise compare unequal to both.
+    /// Empty for non-SELECTs.
+    pub shape: Vec<Kind>,
 }
+
+/// The type of one output column, for parsing the text engines' rows back.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    Int,
+    Float,
+    Text,
+}
+
+/// The shape of the base probe `SELECT pk, a, b, c FROM t`.
+const BASE_SHAPE: [Kind; 4] = [Kind::Int, Kind::Int, Kind::Float, Kind::Text];
 
 /// Aggregate results of a differential run.
 #[derive(Debug, Default, Clone, Copy)]
@@ -561,7 +578,7 @@ fn run_sqlite(program: &[GenStmt]) -> Result<Vec<Outcome>> {
         } else if stmt.is_select {
             let mut rows = Vec::with_capacity(sections[i].len());
             for line in &sections[i] {
-                rows.push(parse_pipe_row(line)?);
+                rows.push(parse_pipe_row(line, &stmt.shape)?);
             }
             out.push(Outcome::Rows(rows));
         } else {
@@ -685,7 +702,7 @@ fn run_pg(program: &[GenStmt], cluster: &PgCluster) -> Result<Vec<Outcome>> {
         } else if stmt.is_select {
             let mut rows = Vec::with_capacity(sections[i].len());
             for line in &sections[i] {
-                rows.push(parse_pipe_row(line)?);
+                rows.push(parse_pipe_row(line, &stmt.shape)?);
             }
             out.push(Outcome::Rows(rows));
         } else {
@@ -695,46 +712,45 @@ fn run_pg(program: &[GenStmt], cluster: &PgCluster) -> Result<Vec<Outcome>> {
     Ok(out)
 }
 
-/// Parse one pipe-separated output row of the fixed SELECT shape
-/// `pk|a|b|c` (int, int?, real?, text?) — the shared wire format of
-/// sqlite3's `.mode list` and psql's unaligned tuples-only mode. Generated
-/// text never contains `|` or the literal string `NULL`, so the split and
-/// the NULL sentinel are unambiguous (an empty text field is `''`, distinct
-/// from the sentinel — difference #11).
-fn parse_pipe_row(line: &str) -> Result<Vec<Field>> {
+/// Parse one pipe-separated output row against the statement's declared
+/// `shape` — the shared wire format of sqlite3's `.mode list` and psql's
+/// unaligned tuples-only mode. Generated text never contains `|` or the
+/// literal string `NULL`, so the split and the NULL sentinel are unambiguous
+/// (an empty text field is `''`, distinct from the sentinel — difference
+/// #11).
+///
+/// The shape is per-statement rather than fixed because aggregates return
+/// whatever they return: `count(*)` is an integer where the column under it
+/// is text, and `avg(a)` is a float where `a` is an integer.
+fn parse_pipe_row(line: &str, shape: &[Kind]) -> Result<Vec<Field>> {
     let parts: Vec<&str> = line.split('|').collect();
-    if parts.len() != 4 {
+    if parts.len() != shape.len() {
         return Err(Failure(format!(
-            "sqlite row has {} fields, expected 4: {line}",
-            parts.len()
+            "row has {} fields, expected {}: {line}",
+            parts.len(),
+            shape.len()
         )));
     }
-    let int_field = |s: &str| -> Result<Field> {
-        if s == "NULL" {
-            return Ok(Field::Null);
-        }
-        s.parse::<i64>()
-            .map(Field::Int)
-            .map_err(|_| Failure(format!("cannot parse int field `{s}` in row: {line}")))
-    };
-    let float_field = |s: &str| -> Result<Field> {
-        if s == "NULL" {
-            return Ok(Field::Null);
-        }
-        s.parse::<f64>()
-            .map(Field::Float)
-            .map_err(|_| Failure(format!("cannot parse float field `{s}` in row: {line}")))
-    };
-    Ok(vec![
-        int_field(parts[0])?,
-        int_field(parts[1])?,
-        float_field(parts[2])?,
-        if parts[3] == "NULL" {
-            Field::Null
-        } else {
-            Field::Text(parts[3].to_string())
-        },
-    ])
+    let mut out = Vec::with_capacity(shape.len());
+    for (part, kind) in parts.iter().zip(shape) {
+        out.push(match (kind, *part) {
+            (_, "NULL") => Field::Null,
+            (Kind::Int, s) => s
+                .parse::<i64>()
+                .map(Field::Int)
+                .map_err(|_| Failure(format!("cannot parse int field `{s}` in row: {line}")))?,
+            // PG returns `sum(bigint)` and `avg(bigint)` as NUMERIC, printed
+            // with a decimal point and full scale ("162.5000000000000000");
+            // sqlite and mpedb use f64. Parsing both as f64 and comparing with
+            // difference #1's tolerance is what makes those agree.
+            (Kind::Float, s) => s
+                .parse::<f64>()
+                .map(Field::Float)
+                .map_err(|_| Failure(format!("cannot parse float field `{s}` in row: {line}")))?,
+            (Kind::Text, s) => Field::Text(s.to_string()),
+        });
+    }
+    Ok(out)
 }
 
 // ---------------------------------------------------------------- minimizer
@@ -781,13 +797,15 @@ pub fn generate_program(seed: u64, n_stmts: usize) -> Vec<GenStmt> {
             0..=39 => gen_insert(&mut rng),
             40..=59 => gen_update(&mut rng),
             60..=74 => gen_delete(&mut rng),
-            _ => gen_select(&mut rng),
+            75..=87 => gen_select(&mut rng),
+            _ => gen_agg_select(&mut rng),
         };
         out.push(stmt);
     }
     out.push(GenStmt {
         sql: "SELECT pk, a, b, c FROM t ORDER BY pk".into(),
         is_select: true,
+        shape: BASE_SHAPE.to_vec(),
     });
     out
 }
@@ -868,6 +886,7 @@ fn gen_insert(rng: &mut Xorshift) -> GenStmt {
     GenStmt {
         sql: format!("INSERT INTO t ({cols}) VALUES {}", rows.join(", ")),
         is_select: false,
+        shape: Vec::new(),
     }
 }
 
@@ -912,6 +931,7 @@ fn gen_update(rng: &mut Xorshift) -> GenStmt {
     GenStmt {
         sql: format!("UPDATE t SET {}{}", sets.join(", "), where_clause),
         is_select: false,
+        shape: Vec::new(),
     }
 }
 
@@ -924,6 +944,7 @@ fn gen_delete(rng: &mut Xorshift) -> GenStmt {
     GenStmt {
         sql: format!("DELETE FROM t{where_clause}"),
         is_select: false,
+        shape: Vec::new(),
     }
 }
 
@@ -950,6 +971,105 @@ fn gen_select(rng: &mut Xorshift) -> GenStmt {
     GenStmt {
         sql: format!("SELECT pk, a, b, c FROM t{where_clause} ORDER BY pk{dir}{limit}"),
         is_select: true,
+        shape: BASE_SHAPE.to_vec(),
+    }
+}
+
+/// Aggregate probes: `count/sum/avg/min/max`, with and without GROUP BY and
+/// HAVING, compared three-way against sqlite3 and PostgreSQL.
+///
+/// Two constraints shape what may be generated here, and both are the same
+/// rule seen twice: **the output order must be forced, and never by anything
+/// nullable.**
+///
+///   Any GROUP BY needs an ORDER BY, because group order is an engine's
+///   choice — mpedb emits keycode order, sqlite follows its scan, PG may
+///   hash. Without one, three correct engines disagree.
+///
+///   That ORDER BY cannot land on a nullable column, or difference #8 (PG
+///   sorts NULLS LAST ascending, mpedb and sqlite FIRST) fires. So every
+///   grouped probe guards its key with `IS NOT NULL`, which is what
+///   `generator_only_orders_by_non_null` checks for. The NULL group itself
+///   is not lost — `aggregates.test` pins it against sqlite directly.
+///
+/// What is safe here and why: `a` is bounded to ±100 over ≤48 rows, so
+/// `sum(a)` cannot overflow (difference #6). `b` is a multiple of 0.25 with
+/// |b| ≤ 25, so a sum of ≤48 of them is exact in binary REGARDLESS of
+/// summation order (difference #1) — otherwise engines adding in different
+/// row orders would drift apart and nothing would be provable. `min/max` on
+/// text is order-independent, and the test cluster runs `--locale=C`, so it
+/// collates bytewise like mpedb and sqlite (difference #2).
+fn gen_agg_select(rng: &mut Xorshift) -> GenStmt {
+    let where_clause = |rng: &mut Xorshift| {
+        if rng.chance(1, 2) {
+            format!(" WHERE {}", gen_pred(rng))
+        } else {
+            String::new()
+        }
+    };
+    match rng.below(6) {
+        // Bare aggregates: always exactly ONE row, even over an empty table —
+        // and that row is `0|NULL|NULL|NULL` there, which is the split this
+        // probe exists to check three-way.
+        0 => GenStmt {
+            sql: format!(
+                "SELECT count(*), count(a), sum(a), min(a) FROM t{}",
+                where_clause(rng)
+            ),
+            is_select: true,
+            shape: vec![Kind::Int, Kind::Int, Kind::Int, Kind::Int],
+        },
+        1 => GenStmt {
+            sql: format!(
+                "SELECT count(*), sum(b), min(b), max(b) FROM t{}",
+                where_clause(rng)
+            ),
+            is_select: true,
+            shape: vec![Kind::Int, Kind::Float, Kind::Float, Kind::Float],
+        },
+        // avg over an integer column: PG returns NUMERIC, the others f64.
+        2 => GenStmt {
+            sql: format!("SELECT avg(a), avg(b) FROM t{}", where_clause(rng)),
+            is_select: true,
+            shape: vec![Kind::Float, Kind::Float],
+        },
+        3 => GenStmt {
+            sql: format!("SELECT min(c), max(c), count(c) FROM t{}", where_clause(rng)),
+            is_select: true,
+            shape: vec![Kind::Text, Kind::Text, Kind::Int],
+        },
+        // Grouped, on the int key.
+        4 => {
+            let having = if rng.chance(1, 3) {
+                format!(" HAVING count(*) > {}", rng.below(3))
+            } else {
+                String::new()
+            };
+            GenStmt {
+                sql: format!(
+                    "SELECT a, count(*), sum(b) FROM t WHERE a IS NOT NULL GROUP BY a{having} \
+                     ORDER BY a"
+                ),
+                is_select: true,
+                shape: vec![Kind::Int, Kind::Int, Kind::Float],
+            }
+        }
+        // Grouped, on the text key.
+        _ => {
+            let having = if rng.chance(1, 3) {
+                format!(" HAVING sum(a) > {}", rng.range_i64(-20, 20))
+            } else {
+                String::new()
+            };
+            GenStmt {
+                sql: format!(
+                    "SELECT c, count(*), sum(a), min(a) FROM t WHERE c IS NOT NULL GROUP BY \
+                     c{having} ORDER BY c"
+                ),
+                is_select: true,
+                shape: vec![Kind::Text, Kind::Int, Kind::Int, Kind::Int],
+            }
+        }
     }
 }
 
@@ -1042,7 +1162,7 @@ mod tests {
 
     #[test]
     fn pipe_row_parsing() {
-        let r = parse_pipe_row("3|NULL|2.75|abc").unwrap();
+        let r = parse_pipe_row("3|NULL|2.75|abc", &BASE_SHAPE).unwrap();
         assert_eq!(
             r,
             vec![
@@ -1053,24 +1173,64 @@ mod tests {
             ]
         );
         // Empty text field is Text(""), NOT Null (difference #11).
-        let r = parse_pipe_row("3|NULL|2.75|").unwrap();
+        let r = parse_pipe_row("3|NULL|2.75|", &BASE_SHAPE).unwrap();
         assert_eq!(r[3], Field::Text(String::new()));
-        assert!(parse_pipe_row("1|2").is_err());
-        assert!(parse_pipe_row("x|1|1.0|a").is_err());
+        assert!(parse_pipe_row("1|2", &BASE_SHAPE).is_err());
+        assert!(parse_pipe_row("x|1|1.0|a", &BASE_SHAPE).is_err());
+    }
+
+    /// The aggregate probes must actually be generated, and must actually
+    /// exercise GROUP BY and HAVING. Without this the ORDER BY pin above and
+    /// the three-way aggregate coverage could both go hollow — passing
+    /// because nothing was generated, which is the failure mode a coverage
+    /// pin exists to catch.
+    #[test]
+    fn generator_covers_aggregates() {
+        let (mut bare, mut grouped, mut having) = (0, 0, 0);
+        for seed in 0..100 {
+            for s in generate_program(seed, 60) {
+                if !s.sql.contains("count(") && !s.sql.contains("sum(") && !s.sql.contains("avg(")
+                {
+                    continue;
+                }
+                if s.sql.contains("GROUP BY") {
+                    grouped += 1;
+                } else {
+                    bare += 1;
+                }
+                if s.sql.contains("HAVING") {
+                    having += 1;
+                }
+            }
+        }
+        assert!(bare > 50, "too few bare aggregate probes: {bare}");
+        assert!(grouped > 50, "too few GROUP BY probes: {grouped}");
+        assert!(having > 10, "too few HAVING probes: {having}");
     }
 
     /// Difference #8: PostgreSQL's ASC default is NULLS LAST where
-    /// mpedb/sqlite put NULLS FIRST. Safe only while the generator orders
-    /// exclusively by the NOT NULL `pk` — pinned here.
+    /// mpedb/sqlite put NULLS FIRST. Safe only while every generated sort key
+    /// is NULL-free — either the NOT NULL `pk`, or a key the same statement
+    /// has guarded with `IS NOT NULL`. Pinned here.
     #[test]
-    fn generator_only_orders_by_pk() {
+    fn generator_only_orders_by_non_null() {
         for seed in 0..100 {
             for s in generate_program(seed, 60) {
                 let mut rest = s.sql.as_str();
                 while let Some(pos) = rest.find("ORDER BY") {
                     rest = &rest[pos + "ORDER BY".len()..];
+                    // `pk` is NOT NULL by schema. Any other sort key must be
+                    // guarded to non-NULL by the same statement — the rule is
+                    // "never sort by something that can be NULL" (difference
+                    // #8), not "only ever sort by pk"; grouped aggregate
+                    // probes sort by their key, which the WHERE has already
+                    // made NULL-free.
+                    let sorts_by_pk = rest.starts_with(" pk");
+                    let key = rest.trim_start().split([' ', ',']).next().unwrap_or("");
+                    let guarded = !key.is_empty()
+                        && s.sql.contains(&format!("WHERE {key} IS NOT NULL"));
                     assert!(
-                        rest.starts_with(" pk"),
+                        sorts_by_pk || guarded,
                         "ORDER BY on a nullable column would hit the \
                          PG NULLS-placement difference: {}",
                         s.sql
