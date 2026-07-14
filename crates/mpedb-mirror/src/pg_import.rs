@@ -540,4 +540,81 @@ mod tests {
 
         let _ = std::fs::remove_file(&dest);
     }
+
+    /// Pre-flight against a REAL PostgreSQL schema: import, make local writes
+    /// mpedb accepts because it widened the columns, and check that pre-flight
+    /// names them BEFORE any write — then prove PG really would have rejected
+    /// exactly those, so the check is not just self-consistent.
+    #[test]
+    #[ignore = "needs PostgreSQL (run with --ignored)"]
+    fn preflight_predicts_what_postgres_actually_rejects() {
+        use crate::preflight::{preflight, FindingKind};
+
+        let pg = crate::pg_harness::ThrowawayPg::start();
+        let mut c = pg.client();
+        c.batch_execute(
+            "CREATE TABLE w(id bigint PRIMARY KEY, qty int4, code varchar(4), price numeric(5,2));
+             INSERT INTO w VALUES (1, 5, 'ok', '12.34');",
+        )
+        .unwrap();
+
+        let dest = tmp("pg-preflight");
+        let (db, _) = import_pg(&mut c, &dest, &ImportOptions::default()).unwrap();
+
+        // clean import ⇒ silent
+        assert!(preflight(&db).unwrap().findings.is_empty());
+
+        // Local writes mpedb accepts: int4 became Int64, varchar(4) became Text,
+        // numeric(5,2) became Text. All legal here, none legal at the source.
+        db.query(
+            "INSERT INTO w (id, qty, code, price) VALUES ($1, $2, $3, $4)",
+            &[
+                Value::Int(2),
+                Value::Int(2_147_483_648),
+                Value::Text("ok".into()),
+                Value::Text("1.00".into()),
+            ],
+        )
+        .unwrap();
+        db.query(
+            "INSERT INTO w (id, qty, code, price) VALUES ($1, $2, $3, $4)",
+            &[
+                Value::Int(3),
+                Value::Int(1),
+                Value::Text("waytoolong".into()),
+                Value::Text("123456.00".into()),
+            ],
+        )
+        .unwrap();
+
+        let r = preflight(&db).unwrap();
+        assert!(r.would_fail());
+        let flagged: Vec<_> = r
+            .findings
+            .iter()
+            .filter(|f| f.kind == FindingKind::WontFit)
+            .map(|f| f.column.as_str())
+            .collect();
+        assert!(flagged.contains(&"qty"), "int4 overflow: {flagged:?}");
+        assert!(flagged.contains(&"code"), "varchar(4): {flagged:?}");
+        assert!(flagged.contains(&"price"), "numeric(5,2): {flagged:?}");
+
+        // Now the part that makes the prediction worth anything: PostgreSQL must
+        // actually reject each of these. A pre-flight that agrees only with
+        // itself is a spell-checker for its own vocabulary.
+        for (sql, what) in [
+            ("INSERT INTO w VALUES (9, 2147483648, 'ok', '1.00')", "int4 overflow"),
+            ("INSERT INTO w VALUES (9, 1, 'waytoolong', '1.00')", "varchar(4)"),
+            ("INSERT INTO w VALUES (9, 1, 'ok', '123456.00')", "numeric(5,2)"),
+        ] {
+            let e = c.batch_execute(sql);
+            assert!(e.is_err(), "PG must reject {what}: {sql}");
+        }
+        // ...and accept the value pre-flight stayed silent about
+        c.batch_execute("INSERT INTO w VALUES (10, 5, 'ok', '12.34')")
+            .expect("PG must accept what preflight passed");
+
+        drop(db);
+        let _ = std::fs::remove_file(&dest);
+    }
 }
