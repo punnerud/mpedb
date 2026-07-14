@@ -22,6 +22,7 @@ pub mod sqlite;
 pub mod sqlite_adapter;
 pub mod sqlite_track;
 pub mod state;
+pub mod switch;
 
 #[cfg(test)]
 mod pg_harness;
