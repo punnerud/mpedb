@@ -91,10 +91,13 @@ pub(crate) enum Expr {
     /// `<expr> IN (current_setting('key'))` — membership in a session-context
     /// list (DESIGN-MULTIDB.md §2.6). The key binds to ONE reserved param
     /// holding a [`mpedb_types::Value::List`], so the arity of the caller's
-    /// membership set never reaches the plan bytes.
+    /// membership set never reaches the plan bytes. The bool is `negated`.
     ///
     /// Deliberately its own node rather than `Binary(In, e, ContextRef)`: the
     /// right-hand side is not an expression that evaluates to a value on the
     /// stack, it is a param slot the InParam instruction reads directly.
-    InContext(Box<Expr>, String),
+    InContext(Box<Expr>, String, bool),
+    /// `<expr> IN (e1, …, en)` / `NOT IN` — general SQL membership (task #21).
+    /// The bool is `negated`.
+    InList(Box<Expr>, Vec<Expr>, bool),
 }

@@ -50,6 +50,20 @@ pub enum Instr {
     /// compiled plan serves every session (§4.1). Baking the list into the
     /// const pool would mint a plan per distinct membership set.
     InParam(u16),
+    /// `<scalar> IN (<e1>, …, <en>)` — set membership against `n` values taken
+    /// from the STACK (general SQL `IN`, task #21). Pops `n` list elements plus
+    /// the probe beneath them, pushes the 3VL verdict.
+    ///
+    /// The counterpart of [`Instr::InParam`], and the split is deliberate: this
+    /// form's arity IS part of the query text, so encoding it in the plan is
+    /// correct — `x IN (1,2)` and `x IN (1,2,3)` are different queries and
+    /// should hash differently. `InParam` exists precisely because a session's
+    /// membership set must NOT reach the plan bytes (§4.1). Same 3VL either way.
+    ///
+    /// Not desugared into an OR-chain even though the 3VL works out identically:
+    /// that duplicates the probe expression `n` times in the plan, and the probe
+    /// may be arbitrarily large.
+    InList(u16),
 }
 
 const OP_PUSH_COL: u8 = 1;
@@ -75,6 +89,7 @@ const OP_IS_NOT_NULL: u8 = 20;
 const OP_TO_FLOAT: u8 = 21;
 const OP_LIKE: u8 = 22;
 const OP_IN_PARAM: u8 = 23;
+const OP_IN_LIST: u8 = 24;
 
 /// SQL `x IN (…)` under three-valued logic — the semantics that decide whether
 /// a policy admits a row, so they are spelled out rather than approximated:
@@ -105,6 +120,14 @@ fn in_list_3vl(probe: &Value, list: &Value) -> Result<Value> {
             )))
         }
     };
+    in_items_3vl(probe, items)
+}
+
+/// The 3VL core, over items from anywhere. Shared by [`Instr::InParam`] (items
+/// from a param-bound list) and [`Instr::InList`] (items from the stack) so the
+/// two forms cannot drift apart on the NULL rules above — which decide whether
+/// a policy admits a row.
+fn in_items_3vl(probe: &Value, items: &[Value]) -> Result<Value> {
     if probe.is_null() {
         return Ok(Value::Null);
     }
@@ -284,6 +307,13 @@ impl ExprProgram {
                     })?;
                     stack.push(in_list_3vl(&probe, list)?);
                 }
+                Instr::InList(n) => {
+                    // The verifier proved depth >= n+1, so both splits are safe.
+                    let at = stack.len() - n as usize;
+                    let items: Vec<Value> = stack.split_off(at);
+                    let probe = stack.pop().expect("validated");
+                    stack.push(in_items_3vl(&probe, &items)?);
+                }
             }
         }
         Ok(stack.pop().expect("validated: exactly one result"))
@@ -329,6 +359,10 @@ impl ExprProgram {
                 }
                 Instr::Like(x) => {
                     buf.push(OP_LIKE);
+                    buf.extend_from_slice(&x.to_le_bytes());
+                }
+                Instr::InList(x) => {
+                    buf.push(OP_IN_LIST);
                     buf.extend_from_slice(&x.to_le_bytes());
                 }
                 Instr::InParam(x) => {
@@ -393,6 +427,7 @@ impl ExprProgram {
                 OP_PUSH_CONST => Instr::PushConst(read_u16_arg()?),
                 OP_LIKE => Instr::Like(read_u16_arg()?),
                 OP_IN_PARAM => Instr::InParam(read_u16_arg()?),
+                OP_IN_LIST => Instr::InList(read_u16_arg()?),
                 OP_EQ => Instr::Eq,
                 OP_NE => Instr::Ne,
                 OP_LT => Instr::Lt,
@@ -444,6 +479,17 @@ fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
             // Pops the probe scalar, pushes the 3VL result; the list comes from
             // a param slot, not the stack, so the arity is not encoded here.
             Instr::InParam(_) => (1, 1),
+            // n list elements plus the probe beneath them. n == 0 (`x IN ()`)
+            // is rejected by the parser, but a hand-built or corrupt program can
+            // still say it, and (1,1) would then silently be a no-op that leaves
+            // the probe on the stack posing as a bool. Refuse it here, where
+            // every program passes exactly once.
+            Instr::InList(n) => {
+                if n == 0 {
+                    return Err(Error::Corrupt("IN list with zero elements".into()));
+                }
+                (n as usize + 1, 1)
+            }
             Instr::Neg | Instr::Not | Instr::IsNull | Instr::IsNotNull | Instr::ToFloat => (1, 1),
             _ => (2, 1),
         };
@@ -786,5 +832,101 @@ mod tests {
         write_value(&mut nested, &Value::List(vec![Value::List(vec![Value::Int(1)])]));
         let mut pos = 0;
         assert!(matches!(read_value(&nested, &mut pos), Err(Error::Corrupt(_))));
+    }
+}
+
+#[cfg(test)]
+mod in_list_tests {
+    use super::*;
+
+    fn prog(instrs: Vec<Instr>, consts: Vec<Value>) -> ExprProgram {
+        ExprProgram::new(instrs, consts).unwrap()
+    }
+
+    /// `InList` and `InParam` must agree on 3VL exactly — they share
+    /// `in_items_3vl` for that reason, and this pins that they cannot drift.
+    #[test]
+    fn in_list_and_in_param_give_identical_3vl() {
+        let cases: Vec<(Value, Vec<Value>, Option<bool>)> = vec![
+            (Value::Int(2), vec![Value::Int(1), Value::Int(2)], Some(true)),
+            (Value::Int(3), vec![Value::Int(1), Value::Int(2)], Some(false)),
+            // no match but a NULL is present -> unknown, NOT false
+            (Value::Int(3), vec![Value::Int(1), Value::Null], None),
+            // a match wins even alongside a NULL
+            (Value::Int(1), vec![Value::Int(1), Value::Null], Some(true)),
+            // NULL probe is never TRUE
+            (Value::Null, vec![Value::Int(1)], None),
+        ];
+        for (probe, items, want) in cases {
+            let via_list = prog(
+                {
+                    let mut i = vec![Instr::PushConst(0)];
+                    for n in 0..items.len() {
+                        i.push(Instr::PushConst(1 + n as u16));
+                    }
+                    i.push(Instr::InList(items.len() as u16));
+                    i
+                },
+                std::iter::once(probe.clone()).chain(items.clone()).collect(),
+            )
+            .eval(&[], &[])
+            .unwrap();
+
+            let via_param = prog(vec![Instr::PushConst(0), Instr::InParam(0)], vec![probe.clone()])
+                .eval(&[], &[Value::List(items.clone())])
+                .unwrap();
+
+            let got = match &via_list {
+                Value::Null => None,
+                Value::Bool(b) => Some(*b),
+                v => panic!("non-bool {v:?}"),
+            };
+            assert_eq!(got, want, "InList({probe:?}, {items:?})");
+            assert_eq!(via_list, via_param, "the two IN forms disagree on {probe:?} in {items:?}");
+        }
+    }
+
+    /// A zero-arity InList would leave the probe on the stack posing as the
+    /// result — a bool-shaped hole. The verifier must refuse the program.
+    #[test]
+    fn zero_arity_in_list_is_corrupt_not_a_silent_noop() {
+        let r = ExprProgram::new(vec![Instr::PushCol(0), Instr::InList(0)], vec![]);
+        assert!(matches!(r, Err(Error::Corrupt(_))), "got {r:?}");
+    }
+
+    #[test]
+    fn in_list_underflow_is_corrupt() {
+        // claims 3 elements but only 2 values are pushed
+        let r = ExprProgram::new(
+            vec![Instr::PushCol(0), Instr::PushCol(1), Instr::InList(3)],
+            vec![],
+        );
+        assert!(matches!(r, Err(Error::Corrupt(_))), "got {r:?}");
+    }
+
+    #[test]
+    fn in_list_round_trips_through_the_codec() {
+        let p = prog(
+            vec![
+                Instr::PushCol(0),
+                Instr::PushConst(0),
+                Instr::PushConst(1),
+                Instr::InList(2),
+            ],
+            vec![Value::Int(1), Value::Int(2)],
+        );
+        let mut bytes = Vec::new();
+        p.encode_into(&mut bytes);
+        let mut pos = 0;
+        assert_eq!(ExprProgram::decode(&bytes, &mut pos).unwrap(), p);
+        assert_eq!(pos, bytes.len());
+        // truncation at every offset must be Corrupt, never a panic (repo rule)
+        for n in 0..bytes.len() {
+            let mut pos = 0;
+            assert!(
+                ExprProgram::decode(&bytes[..n], &mut pos).is_err(),
+                "truncation at {n} decoded"
+            );
+        }
     }
 }

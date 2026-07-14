@@ -398,15 +398,28 @@ mod tests {
         let _ = std::fs::remove_file(db.path());
     }
 
-    /// Until task #21 lands general IN, the unsupported form must say so.
+    /// The two IN forms share syntax but not machinery, and the split is the
+    /// point: a literal list's arity IS the query and belongs in the plan hash,
+    /// while a session's membership set must NOT reach the plan bytes (§4.1) —
+    /// so it goes through one reserved param instead. This pins that they
+    /// coexist, and that the context form still compiles to a param.
     #[test]
-    fn literal_in_list_is_rejected_with_a_useful_message() {
+    fn both_in_forms_compile_and_hash_by_their_own_rules() {
         let db = db("in-literal");
-        let r = db.prepare("SELECT id FROM orders WHERE tenant IN (1, 2)");
-        assert!(
-            matches!(&r, Err(Error::Parse { msg, .. }) if msg.contains("current_setting")),
-            "got {r:?}"
-        );
+        // A literal list compiles now (task #21).
+        db.prepare("SELECT id FROM orders WHERE tenant IN (1, 2)").unwrap();
+
+        // Arity is part of the query text, so it must change the plan hash.
+        let h2 = db.prepare("SELECT id FROM orders WHERE tenant IN (1, 2)").unwrap();
+        let h3 = db.prepare("SELECT id FROM orders WHERE tenant IN (1, 2, 3)").unwrap();
+        assert_ne!(h2, h3, "IN (1,2) and IN (1,2,3) are different queries");
+
+        // The context form is NOT the literal form: its arity lives in the
+        // session, so one plan serves every membership set.
+        let c = db
+            .prepare("SELECT id FROM orders WHERE tenant IN (current_setting('k'))")
+            .unwrap();
+        assert_ne!(c, h2);
         let _ = std::fs::remove_file(db.path());
     }
 
