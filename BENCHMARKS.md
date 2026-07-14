@@ -10,7 +10,7 @@ durability classes, all latency percentiles) live in its own file.
 | machine | engines | full results |
 |---|---|---|
 | AMD EPYC-Milan, 2 cores, 7.6 GiB, Linux 6.8 | mpedb, SQLite, PostgreSQL 16 | [`RESULTS-linux-amd-epyc-milan-2c.md`](crates/mpedb-bench/RESULTS-linux-amd-epyc-milan-2c.md) |
-| Apple M3 Pro, 11 cores, 36 GiB, macOS 26.6 | mpedb, SQLite (no PostgreSQL installed) | pending — see [Apple Silicon](#apple-silicon-m3-pro-11-cores--and-the-durability-trap-it-exposed) below for the hand-checked findings |
+| Apple M3 Pro, 11 cores, 36 GiB, macOS 26.6 | mpedb, SQLite — **no PostgreSQL installed** | [`RESULTS-macos-apple-m3-pro-11c.md`](crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md) — **transcribed, not generated**: the cells came from separate `--only` runs, so it says so at the top |
 
 **One file per machine, on purpose.** A generated report says "on this machine"
 in its own first line — it is a single-host document, and a run on a second host
@@ -66,12 +66,12 @@ Zero-parse execute-by-hash + no IPC + a COW B+tree in the same address space:
 
 | op (none-class) | mpedb ops/s | SQLite ops/s | PostgreSQL ops/s | mpedb vs SQLite / PG |
 |---|--:|--:|--:|---|
-| point-select (PK) | **469,777** | 80,145 | 21,638 | ~5.9× / ~22× |
-| point-insert | **165,142** | 41,555 | 13,749 | ~4.0× / ~12× |
-| point-update (PK) | **201,638** | 46,214 | 11,058 | ~4.4× / ~18× |
+| point-select (PK) | **493,853** | 80,458 | 22,408 | ~6.1× / ~22× |
+| point-insert | **166,759** | 42,353 | 14,092 | ~3.9× / ~12× |
+| point-update (PK) | **206,608** | 47,592 | 11,610 | ~4.3× / ~18× |
 
-p50 latencies: mpedb select **1 µs**, insert **5 µs**; SQLite 11 µs / 21 µs;
-PostgreSQL 44 µs / 68 µs.
+p50 latencies: mpedb select **1 µs**, insert **5 µs**; SQLite 11 µs / 20 µs;
+PostgreSQL 43 µs / 67 µs.
 
 ### Lock-free reads under a concurrent writer (commit-class)
 
@@ -217,10 +217,10 @@ measures the disk; **`% of raw` is the column that means something.**
 
 | none-class (tmpfs) | write MiB/s | % of raw | scan MiB/s | % of raw |
 |---|--:|--:|--:|--:|
-| raw `std::fs` (baseline) | 2,603 | — | 7,722 | — |
-| SQLite | **1,041** | **40%** | **2,274** | **29%** |
-| mpedb | 598 | 23% | 1,012 | 13% |
-| PostgreSQL | 41 | 2% | 292 | 4% |
+| raw `std::fs` (baseline) | 2,632 | — | 9,282 | — |
+| SQLite | **998** | **38%** | **2,261** | **24%** |
+| mpedb | 602 | 23% | 940 | 10% |
+| PostgreSQL | 41 | 2% | 285 | 3% |
 
 | commit-class (disk) | write MiB/s | % of raw | scan MiB/s | % of raw |
 |---|--:|--:|--:|--:|

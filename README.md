@@ -187,20 +187,20 @@ Single-client, embedded, none-class point ops:
 
 | op (none-class) | mpedb | SQLite | PostgreSQL |
 |---|--:|--:|--:|
-| point-select (PK), ops/s | **469,777** | 80,145 | 21,638 |
-| point-insert, ops/s | **165,142** | 41,555 | 13,749 |
-| point-update (PK), ops/s | **201,638** | 46,214 | 11,058 |
+| point-select (PK), ops/s | **493,853** | 80,458 | 22,408 |
+| point-insert, ops/s | **166,759** | 42,353 | 14,092 |
+| point-update (PK), ops/s | **206,608** | 47,592 | 11,610 |
 
 mpedb leads embedded point ops (~4-22×; zero-parse plans + no IPC + a COW B+tree
 in-process). Under a live writer its MVCC readers never take the writer's lock:
-**466k read ops/s at 2 µs p50 vs SQLite's 4.1k** (none-class — SQLite's journal
+**486k read ops/s at 2 µs p50 vs SQLite's 3.5k** (none-class — SQLite's journal
 serializes readers against the writer, p99 18 ms). Give SQLite its WAL and it
-edges mpedb instead (658k vs 561k) — that cell is single-process, which is
+edges mpedb instead (641k vs 561k) — that cell is single-process, which is
 exactly where mpedb's multi-*process* readers and shared plans do not show.
-Durable writes: `wal` leads single-client (1,900 vs 846 / 1,679) and batched
-100/commit (**129k** vs 62k / 18k). Weakest cell: `durability=commit`
-single-client (~560 ops/s) — every commit msyncs with no batching partner; use
-`wal`. Contended writes (4 threads) mpedb leads 79k vs 30k/34k, but that is the
+Durable writes: `wal` leads single-client (1,883 vs 864 / 1,742) and batched
+100/commit (**132k** vs 62k / 18k). Weakest cell: `durability=commit`
+single-client (~390 ops/s) — every commit msyncs with no batching partner; use
+`wal`. Contended writes (4 threads) mpedb leads 126k vs 28k/34k, but that is the
 cell most sensitive to core count — see [BENCHMARKS.md](BENCHMARKS.md).
 
 ### Apple Silicon — M3 Pro, 11 cores, macOS 26.6 (2026-07-14)
@@ -219,7 +219,7 @@ flush costs**, and anything above it on that machine is a promise no one is
 keeping. Details: [BENCHMARKS.md](BENCHMARKS.md#apple-silicon-m3-pro-11-cores--and-the-durability-trap-it-exposed).
 
 **Bulk bytes are not mpedb's game.** Pushing 256 MiB of 4 KiB blobs, SQLite
-writes 1,041 MiB/s to mpedb's 598 (40% vs 23% of what a raw `std::fs` write does
+writes 998 MiB/s to mpedb's 602 (38% vs 23% of what a raw `std::fs` write does
 on the same medium) — a blob larger than the page takes an overflow chain and
 every touched page is copied before the meta flip. That is crash-safety paid for
 in bandwidth. See [BENCHMARKS.md](BENCHMARKS.md#bulk-mbs--and-the-number-that-makes-it-mean-something).
