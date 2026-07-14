@@ -7,6 +7,8 @@
 
 use mpedb_types::{Result, Value};
 
+// (Value is used in the trait's read_table_rows return type below.)
+
 /// A monotone, opaque source position. The protocol persists it in `mir\0cur`
 /// atomically with the applied rows; only the adapter interprets its bytes.
 pub type Cursor = Vec<u8>;
@@ -65,4 +67,8 @@ pub trait SourceAdapter {
     /// The cursor that means "nothing consumed yet" — the starting point for
     /// the first pull after import.
     fn zero_cursor(&self) -> Cursor;
+
+    /// Read every current row of a mirrored table as mpedb values, in PK order.
+    /// Used by the merge-diff / anti-entropy reconcile (§5.5) and no-touch mode.
+    fn read_table_rows(&mut self, table_id: u32) -> Result<Vec<Vec<Value>>>;
 }
