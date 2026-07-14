@@ -143,6 +143,52 @@ pub fn validate_policy_expr(src: &str, table: &TableDef) -> Result<()> {
     Ok(())
 }
 
+/// The columns a policy predicate pins directly to session context — i.e. every
+/// `col = current_setting('…')` (either operand order). These are the policy's
+/// **discriminators**: the columns that decide which partition of the table a
+/// caller can see.
+///
+/// Only top-level `=` conjuncts count. A discriminator buried under `OR` does not
+/// partition the table (the other branch admits rows regardless), and anything
+/// richer than equality is not a partition key either, so neither is reported —
+/// under-reporting here just means the lint says nothing, which is the safe way
+/// to be wrong for a lint.
+pub fn policy_discriminators(src: &str, table: &TableDef) -> Vec<u16> {
+    let Ok((expr, _)) = parser::parse_expr_only(src) else {
+        return Vec::new(); // unparseable: validate_policy_expr reports it properly
+    };
+    let mut out = Vec::new();
+    collect_discriminators(&expr, table, &mut out);
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn collect_discriminators(e: &ast::Expr, table: &TableDef, out: &mut Vec<u16>) {
+    use ast::{BinOp, Expr};
+    match e {
+        // AND: both sides constrain, so descend into both.
+        Expr::Binary(BinOp::And, a, b) => {
+            collect_discriminators(a, table, out);
+            collect_discriminators(b, table, out);
+        }
+        Expr::Binary(BinOp::Eq, a, b) => {
+            let pair = match (a.as_ref(), b.as_ref()) {
+                (Expr::Col(c), Expr::ContextRef(_)) | (Expr::ContextRef(_), Expr::Col(c)) => {
+                    Some(c)
+                }
+                _ => None,
+            };
+            if let Some(name) = pair {
+                if let Some(i) = table.column_index(name) {
+                    out.push(i);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
 /// Compile a CHECK-constraint expression against one table at attach time.
 /// Parses a single expression (no statement), binds it against the table's
 /// columns with **no parameters allowed**, and requires it to type to bool.

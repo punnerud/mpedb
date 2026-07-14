@@ -288,7 +288,19 @@ impl Database {
                     using_src: spec.using_src,
                     check_src: spec.check_src,
                 };
+                // Lint BEFORE creating, but never block on it (§6.4): a leaky
+                // unique key is a design smell the author may have accepted, not
+                // something the database gets to veto. Findings come back as rows
+                // so they print through the ordinary result path — a lint nobody
+                // sees is worthless, and a library must not print for its caller.
+                let findings = self.lint_policy(&spec.table, &def)?;
                 self.create_policy(&spec.table, &def)?;
+                if !findings.is_empty() {
+                    return Ok(ExecResult::Rows {
+                        columns: vec!["warning".into()],
+                        rows: findings.into_iter().map(|w| vec![Value::Text(w)]).collect(),
+                    });
+                }
             }
             DdlStmt::DropPolicy { table, name } => {
                 self.drop_policy(&table, &name)?;
