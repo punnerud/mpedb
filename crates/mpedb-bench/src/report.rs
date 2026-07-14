@@ -326,6 +326,14 @@ impl Report {
 
 pub const CAVEATS_MD: &str = "\
 - One run, one machine; no confidence intervals. Treat small (<20%) differences as noise.
+- HOST LOAD DOMINATES ABSOLUTE NUMBERS — never read a run-to-run delta as a code \
+change without checking the unchanged engines. Measured on this shared 2-core VM: \
+between two runs on 2026-07-14 (10:40 and 11:56) every cell rose 15-84% — mpedb \
+none-class point-insert 165k->302k ops/s — but SQLite (+19% median) and PostgreSQL \
+(+35% median) rose by the same order with byte-identical binaries, so it was host \
+load, not code. SQLite and PostgreSQL are the control group in every run: if mpedb \
+moves and they do not, that is a code signal; if all three move together, it is the \
+host. Compare RATIOS across runs, absolutes only within one run.
 - The 2-core box runs benchmark threads, the engine, and (for PostgreSQL) server \
 processes simultaneously; contended cells oversubscribe the CPU on purpose.
 - SQLite runs the bundled 3.45.0 build (the system libsqlite3 lacks the dev symlink \

@@ -129,25 +129,30 @@ Single-client, embedded, none-class point ops on a 2-core Linux VM (2026-07-14):
 
 | op (none-class) | mpedb | SQLite | PostgreSQL |
 |---|--:|--:|--:|
-| point-select (PK), ops/s | **229,969** | 38,636 | 20,284 |
-| point-insert, ops/s | **54,499** | 19,197 | 13,074 |
-| point-update (PK), ops/s | **91,416** | 25,363 | 10,983 |
+| point-select (PK), ops/s | **291,116** | 53,698 | 24,519 |
+| point-insert, ops/s | **96,519** | 26,973 | 15,874 |
+| point-update (PK), ops/s | **112,292** | 30,311 | 13,951 |
 
-mpedb leads embedded point ops (~3-11×; zero-parse plans + no IPC + a COW B+tree
-in-process) and lock-free reads under a live writer (~300k read ops/s at 2 µs
-p50). Its one weak spot is **single-client durable INSERT** — one fsync per commit
-with group-commit only under contention — so a lone durable writer trails SQLite
-and PostgreSQL; the answer is to batch in a `WriteSession` or use `wal`, where
-mpedb's batched durable insert (~89k ops/s) is the fastest of the three.
+mpedb leads embedded point ops (~3.6-12×; zero-parse plans + no IPC + a COW
+B+tree in-process). Under a live writer its readers stay lock-free (344k read
+ops/s at 2 µs p50) — though SQLite's WAL readers match that in this
+single-process cell (345k); mpedb's structural edge is multi-*process* readers
+and cross-process shared plans, which this cell does not exercise. Durable
+writes: `wal` leads both single-client (2,598 vs SQLite 1,601 / PG 2,232) and
+batched 100/commit (**105k** vs 76k / 19k). The weak cell is
+`durability=commit` single-client (525 ops/s) — every commit msyncs with no
+batching partner; use `wal`.
 
 ```sh
 cargo run --release -p mpedb-bench      # full head-to-head (writes RESULTS.md)
 mpedb bench --auto --durability wal     # quick mpedb-only
 ```
 
-> Numbers on a shared 2-core VM vary ~20-25% between runs by host load alone;
-> read the ratios, not the digits, and run one engine at a time for the cleanest
-> comparison.
+> Numbers on a shared 2-core VM swing 20-80% between runs on host load alone —
+> measured, in both directions. Read the ratios, not the digits; run one engine
+> at a time for the cleanest absolute. SQLite/PostgreSQL act as the control
+> group: if all three engines move together it is the host, not mpedb's code
+> ([method](BENCHMARKS.md#have-we-gotten-slowerfaster--how-to-read-run-to-run-deltas)).
 
 ## Mirroring & cross-database migration
 
