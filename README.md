@@ -177,34 +177,65 @@ adversarial review).
 
 | | sqlite | PostgreSQL |
 |---|---|---|
-| import, pull, push, switch, reconcile, conflicts | ✅ library **and** `mpedb mirror` CLI | ✅ library only — **the CLI cannot reach PostgreSQL yet** (it takes `--source <file>`, not a DSN) |
-| export to a **fresh** database (`mpedb → X`) | ✅ `mirror export` / `mirror roundtrip` | ❌ not implemented |
+| import, pull, push, switch, reconcile, conflicts | ✅ library **and** `mpedb mirror` CLI | ✅ library **and** CLI (`--source-config`) |
+| export into a **fresh** database (`mpedb → X`) | ✅ `mirror export` / `mirror roundtrip` | ✅ `mirror export --to postgres` |
 
 - **Stage & analyse** — pull a PostgreSQL database into a local `.mpedb`, run
   extra queries, add local tables, compute, then push changes back to
-  PostgreSQL **without losing the data PostgreSQL owns**. Works today, from Rust.
+  PostgreSQL **without losing the data PostgreSQL owns**.
+- **Migrate** — `sqlite3 → mpedb → PostgreSQL` works end to end. A
+  PostgreSQL-sourced mirror round-trips its schema *exactly*: `int4` comes back
+  as `int4`, `varchar(8)` as `varchar(8)`, `numeric(6,2)` as `numeric(6,2)` —
+  the declared types are recorded at import (`mir/map`) and replayed, rather
+  than flattened into mpedb's six types.
 - **See what you lose** — the round-trip diff reports exactly which values cannot
   survive `sqlite → mpedb → sqlite`, so a lossy mapping is explicit, never silent.
+- **Fail before you write, not halfway through** — `mirror preflight` checks
+  every value against the recorded source schema without contacting the source,
+  and `export --to postgres` refuses to start if anything would be rejected. A
+  half-loaded target is worse than no target.
 
-**Not a cross-database migration hub yet.** `sqlite3 → mpedb → PostgreSQL` is a
-natural fit for the design — both adapters already map through mpedb's common
-type model — but it is **not implemented**: the only export target is sqlite, and
-push writes back to the PostgreSQL a mirror was imported *from*, which is
-mirroring rather than migration. Delivering the claim needs an `export_pg` (or a
-"push this mpedb into an empty PostgreSQL" mode) plus a `--dsn` on the CLI.
+**Two honest limits.**
+
+*A sqlite source exports with widened types.* sqlite's declared types are
+[affinities](https://sqlite.org/datatype3.html), not constraints, and its
+vocabulary collides with PostgreSQL's while meaning something different: sqlite's
+`INTEGER` is 64-bit where PostgreSQL's `integer` is int4, and sqlite's `REAL` is
+a double where PostgreSQL's `real` is single precision. Copying those words into
+PostgreSQL would reject every value above 2³¹ and silently round every float to
+~7 digits, so `sqlite → PG` deliberately emits the widest safe type
+(`bigint`/`double precision`/`text`) and the CLI says which tables that affected.
+Exact narrow types survive `PG → mpedb → PG`, not `sqlite → mpedb → PG`, because
+sqlite never had them to begin with.
+
+*Credentials are a file, never a flag.* There is no `--dsn`: `ps` shows every
+process's argv to every user on the host. A PostgreSQL source is named by a 0600
+config file whose mode and owner are re-checked on every read
+(DESIGN-MIRROR §12).
 
 ```sh
-# The CLI is sqlite-only today (--source is a FILE, not a DSN); PostgreSQL
-# mirroring is driven from Rust via import_pg + PgAdapter.
-mpedb mirror import    --source app.db --dest app.mpedb   # snapshot + install change capture
-mpedb mirror pull      --source app.db --db app.mpedb     # apply source changes into mpedb
-mpedb mirror push      --source app.db --db app.mpedb     # write local changes back (echo-safe)
-mpedb mirror sync      --source app.db --db app.mpedb     # pull then push per authority
-mpedb mirror switch    --source app.db --db app.mpedb --to mpedb|source   # epoch-fenced cutover
-mpedb mirror conflicts --db app.mpedb [--clear]           # inspect parked conflicts
-mpedb mirror resolve   --source app.db --db app.mpedb --take source|local # operator override
-mpedb mirror roundtrip --source app.db                    # import -> export -> diff (fidelity)
+# --- sqlite: --source is a path, no secret involved ---
+mpedb mirror import --source app.db --dest app.mpedb   # snapshot + install change capture
+mpedb mirror pull   --source app.db --db app.mpedb     # apply source changes into mpedb
+
+# --- PostgreSQL: the DSN lives in a 0600 file, named by path ---
+install -m600 /dev/null pg.toml            # born 0600, before a secret is in it
+cat >> pg.toml <<'EOT'
+kind = "postgres"
+dsn  = "host=db.internal dbname=app user=app password=s3cr3t"
+EOT
+
+mpedb mirror import --source-config pg.toml --dest app.mpedb
+mpedb mirror sync   --db app.mpedb         # the config path is recorded: --db is enough
+mpedb mirror switch --db app.mpedb --to mpedb
+mpedb exec          app.mpedb "UPDATE items SET qty = qty + 1"
+mpedb mirror push   --db app.mpedb         # local writes land back in PostgreSQL
+
+# --- migrate into an EMPTY PostgreSQL ---
+mpedb mirror preflight --db app.mpedb                                # analyse first
+mpedb mirror export    --db app.mpedb --to postgres --source-config target.toml
 ```
+
 
 Crash-safety of the sync daemon is fuzzed with `mpedb mirror-collide`: source-
 writer processes churn the source while a mirror daemon is SIGKILLed at every
