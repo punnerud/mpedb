@@ -43,7 +43,7 @@ fn now_micros() -> i64 {
 
 /// Push all pending local changes to the source. No-op when the dirty-set is
 /// empty.
-pub fn push_batch<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<PushStats> {
+pub fn push_batch<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> Result<PushStats> {
     let schema = db.schema().clone();
 
     // 1. scan the dirty-set + read upsert images at a brief snapshot, then drop

@@ -61,7 +61,7 @@ fn clear_marks(
 }
 
 /// Resolve every parked conflict with the chosen policy.
-pub fn resolve<A: SourceAdapter>(
+pub fn resolve<A: SourceAdapter + ?Sized>(
     db: &Database,
     adapter: &mut A,
     take: Take,
@@ -77,7 +77,7 @@ pub fn resolve<A: SourceAdapter>(
 }
 
 /// Take::Source — converge mpedb to the current source image for each parked PK.
-fn take_source<A: SourceAdapter>(
+fn take_source<A: SourceAdapter + ?Sized>(
     db: &Database,
     adapter: &mut A,
     parked: &[Parked],
@@ -146,7 +146,7 @@ fn take_source<A: SourceAdapter>(
 }
 
 /// Take::Local — force mpedb's current row onto the source for each parked PK.
-fn take_local<A: SourceAdapter>(
+fn take_local<A: SourceAdapter + ?Sized>(
     db: &Database,
     adapter: &mut A,
     parked: &[Parked],

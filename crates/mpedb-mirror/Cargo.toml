@@ -15,3 +15,6 @@ xxhash-rust = { workspace = true }
 # PostgreSQL via the sync postgres client.
 rusqlite = { version = "0.31", features = ["bundled"] }
 postgres = "0.19"
+# §12 credential channel: 0600 TOML source-config + geteuid ownership check.
+toml = { workspace = true }
+libc = { workspace = true }

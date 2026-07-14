@@ -17,6 +17,25 @@ pub const KEY_EPOCH: &[u8] = b"epoch";
 pub const KEY_CUR: &[u8] = b"cur";
 /// Local echo of the source's applied high-water (status only).
 pub const KEY_HW: &[u8] = b"hw";
+/// Filesystem path of the 0600 source-config that holds the DSN (§12).
+///
+/// The *path*, never the DSN: this record lives inside the .mpedb file, which
+/// has no business holding the source password — a mirror file is copied around
+/// and its perms are the database's, not the secret's. Kept out of
+/// [`MirrorConfig`] on purpose: that codec is exact-length by construction and
+/// its truncation tests depend on that, so a trailing optional field would turn
+/// one strict shape into two.
+pub const KEY_SRC: &[u8] = b"src";
+
+/// Decode the `mir\0src` record: a UTF-8 path. Bounds-checked like every codec
+/// here — corrupt bytes yield [`Error::Corrupt`], never a panic.
+pub fn decode_src_path(bytes: &[u8]) -> Result<String> {
+    if bytes.is_empty() {
+        return Err(Error::Corrupt("mirror src record is empty".into()));
+    }
+    String::from_utf8(bytes.to_vec())
+        .map_err(|_| Error::Corrupt("mirror src record is not valid UTF-8".into()))
+}
 
 // ---- keyed families ----
 const KEY_MAP_PREFIX: &[u8] = b"map/";

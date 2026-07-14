@@ -24,6 +24,7 @@ pub mod reconcile;
 pub mod resolve;
 pub mod sqlite;
 pub mod sqlite_adapter;
+pub mod sourcecfg;
 pub mod sqlite_track;
 pub mod state;
 pub mod switch;
@@ -47,6 +48,7 @@ pub use preflight::{
 pub use push::{push_batch, PushStats};
 pub use resolve::{resolve, ResolveStats, Take};
 
+pub use sourcecfg::SourceSpec;
 pub use state::{
     Authority, CaptureMode, ColumnMap, Epoch, MapPolicy, MirrorConfig, MirrorState, SourceKind,
     TableMap, MIR_NS,

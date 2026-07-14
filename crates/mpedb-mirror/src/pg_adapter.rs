@@ -112,6 +112,19 @@ impl PgAdapter {
         })
     }
 
+    /// Connect to a PostgreSQL source from a DSN and introspect it.
+    ///
+    /// The DSN is a secret (§12): it comes from a 0600
+    /// [`crate::sourcecfg::SourceSpec`], never from `argv`. `postgres::Error`'s
+    /// Display is useless on its own, and a connect failure is the single most
+    /// likely thing a user hits here, so route it through [`pgerr`] — but note
+    /// that libpq-style errors can quote the conninfo, so the DSN itself is
+    /// never added to the message.
+    pub fn connect(dsn: &str, include: Option<&[String]>, exclude: &[String]) -> Result<PgAdapter> {
+        let client = Client::connect(dsn, postgres::NoTls).map_err(pgerr)?;
+        PgAdapter::new(client, include, exclude)
+    }
+
     pub fn client(&mut self) -> &mut Client {
         &mut self.client
     }
