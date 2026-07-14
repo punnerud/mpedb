@@ -124,8 +124,12 @@ fn run_bulk(
     disk_base: &std::path::Path,
     quick: bool,
     only: &Option<String>,
+    value_bytes: Option<usize>,
 ) -> Vec<bulk::BulkRow> {
-    let bcfg = if quick { bulk::BulkCfg::quick() } else { bulk::BulkCfg::full() };
+    let mut bcfg = if quick { bulk::BulkCfg::quick() } else { bulk::BulkCfg::full() };
+    if let Some(v) = value_bytes {
+        bcfg.value_bytes = v;
+    }
     let mut rows: Vec<bulk::BulkRow> = Vec::new();
     eprintln!(
         "=== bulk MB/s ({:.0} MiB logical payload per cell, {} B values) ===",
@@ -245,20 +249,33 @@ fn main() {
         .windows(2)
         .find(|w| w[0] == "--out")
         .map(|w| w[1].clone());
+    // Bytes per blob in the bulk cells. Exposed because the default (4096) sits
+    // ONE BYTE over mpedb's overflow-page capacity (PAGE_SIZE 4096 - 16 B
+    // header = 4080), so every value spills 16 bytes into a whole second page:
+    // 8 KiB written per 4 KiB of payload, 2x amplification, at the single worst
+    // size the engine has. That is a legitimate blob size and the number stands
+    // — but it is a cliff, not a general property, and you cannot see the cliff
+    // without being able to move the size.
+    let value_bytes_arg: Option<usize> = args
+        .windows(2)
+        .find(|w| w[0] == "--value-bytes")
+        .and_then(|w| w[1].parse().ok());
     for (i, a) in args.iter().enumerate() {
         let known = a == "--quick"
             || a == "--io"
             || a == "--only"
             || a == "--tmpfs"
             || a == "--out"
+            || a == "--value-bytes"
             || (i > 0
                 && (args[i - 1] == "--only"
                     || args[i - 1] == "--tmpfs"
-                    || args[i - 1] == "--out"));
+                    || args[i - 1] == "--out"
+                    || args[i - 1] == "--value-bytes"));
         if !known {
             eprintln!(
                 "usage: mpedb-bench [--quick] [--io] [--only mpedb|sqlite|postgres] \
-                 [--tmpfs DIR] [--out FILE]"
+                 [--tmpfs DIR] [--out FILE] [--value-bytes N]"
             );
             std::process::exit(2);
         }
@@ -384,7 +401,7 @@ fn main() {
     }
 
     let bulk_rows = if io {
-        run_bulk(&tmpfs_base, &disk_base, quick, &only)
+        run_bulk(&tmpfs_base, &disk_base, quick, &only, value_bytes_arg)
     } else {
         Vec::new()
     };
