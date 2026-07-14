@@ -42,8 +42,11 @@ usage: mpedb <command> [args]
   collide --dir <dir> [--writers N] [--total T] [--drop-rate R] [--jitter-us J]
           [--keyspace K] [--detached-pct P] [--durability M]  (writer-collision fuzz)
   powerloss --dir <dir> [--rounds N] [--workers W] [--durability wal|async]
-  mirror-collide --dir <dir> [--writers N] [--secs S] [--kill-ms M] [--keyspace K]
-          (SIGKILL fuzz: source writers + a mirror daemon killed at every instant)
+  mirror-collide --dir <dir> [--mode pull|push] [--writers N] [--secs S]
+          [--kill-ms M] [--keyspace K]
+          (SIGKILL fuzz: pull = source writers vs. a killed pull daemon (source
+           is the model); push = mpedb writers vs. a killed push daemon (mpedb
+           is the model) — the final drain must converge the pair exactly)
 
 bench --auto accepts --durability none|commit|async|wal (default none); use
   --disk DIR to place the scratch db on real disk (durable modes need it)
@@ -91,7 +94,9 @@ fn dispatch(argv: &[String]) -> CliResult {
         "crash-child" => crash::run_child(rest),
         "collide-child" => collide::run_child(rest),
         "mirror-collide-writer" => mirror_collide::run_writer(rest),
+        "mirror-collide-mwriter" => mirror_collide::run_mwriter(rest),
         "mirror-collide-daemon" => mirror_collide::run_daemon(rest),
+        "mirror-collide-pdaemon" => mirror_collide::run_push_daemon(rest),
         "powerloss-child" => powerloss::run_child(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
