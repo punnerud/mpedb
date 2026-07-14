@@ -40,6 +40,25 @@ pub struct SqliteEngine {
     mode: SqliteMode,
 }
 
+/// On Apple platforms, `synchronous=FULL` alone is NOT power-loss durable, so a
+/// durable-on-ack cell would be comparing unequal promises.
+///
+/// SQLite's `unixSync` reads `if( fullSync ){ F_FULLFSYNC } else { rc = 1 }` and
+/// then falls back to `fsync(fd)` — and `PRAGMA fullfsync` defaults to OFF. On
+/// macOS plain `fsync()` does not flush the drive's write cache (that is exactly
+/// why `F_FULLFSYNC` exists), so the default leaves an acked commit still in
+/// volatile cache. mpedb's `os::fdatasync` routes macOS through `F_FULLFSYNC`,
+/// so without this pragma the commit-class cells would pit a truly durable mpedb
+/// against a non-durable SQLite and call the resulting gap a benchmark result.
+///
+/// No-op off Apple, where `fsync()` already means what it says.
+fn fullfsync_on_apple(conn: &Connection) -> BResult<()> {
+    if cfg!(target_vendor = "apple") {
+        conn.pragma_update(None, "fullfsync", true)?;
+    }
+    Ok(())
+}
+
 impl SqliteEngine {
     pub fn new(dir: PathBuf, mode: SqliteMode) -> BResult<SqliteEngine> {
         std::fs::create_dir_all(&dir)?;
@@ -61,6 +80,7 @@ impl SqliteEngine {
             SqliteMode::CommitClass => {
                 conn.pragma_update(None, "journal_mode", "WAL")?;
                 conn.pragma_update(None, "synchronous", "FULL")?;
+                fullfsync_on_apple(&conn)?;
             }
             SqliteMode::NormalClass => {
                 conn.pragma_update(None, "journal_mode", "WAL")?;
