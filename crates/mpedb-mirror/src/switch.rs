@@ -70,14 +70,14 @@ fn mirror_id_hex(db: &Database) -> Result<String> {
     Ok(s)
 }
 
-fn read_cur<A: SourceAdapter>(db: &Database, adapter: &A) -> Result<Cursor> {
+fn read_cur<A: SourceAdapter + ?Sized>(db: &Database, adapter: &A) -> Result<Cursor> {
     Ok(db
         .sys_record_get(state::MIR_NS, state::KEY_CUR)?
         .unwrap_or_else(|| adapter.zero_cursor()))
 }
 
 /// Pull + apply until the source is caught up. Returns rows applied.
-pub fn drain_pull<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<u64> {
+pub fn drain_pull<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> Result<u64> {
     let mut applied = 0u64;
     loop {
         let from = read_cur(db, adapter)?;
@@ -96,7 +96,7 @@ pub fn drain_pull<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<u6
 /// `deletes` summed across rounds, and `conflicts` = the stable set left parked
 /// (source-won write-write conflicts whose dirty entries persist for the next
 /// pull to resolve — so they never advance and the loop stops on them).
-pub fn drain_push<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<crate::push::PushStats> {
+pub fn drain_push<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> Result<crate::push::PushStats> {
     let mut total = crate::push::PushStats::default();
     loop {
         let s = push_batch(db, adapter)?;
@@ -120,7 +120,7 @@ fn set_epoch(db: &Database, epoch: state::Epoch) -> Result<()> {
 /// Switch authority source → mpedb (§7 S4→S5). Drains any pending source
 /// changes, then fences the source epoch (losing side first) and flips mpedb to
 /// M_AUTH. After this, local mpedb writes accumulate and pulls should stop.
-pub fn switch_to_mpedb<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<()> {
+pub fn switch_to_mpedb<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> Result<()> {
     let epoch = read_epoch(db)?;
     if epoch.authority != Authority::Source {
         return Err(Error::Unsupported("switch_to_mpedb: not source-authoritative".into()));
@@ -154,7 +154,7 @@ pub fn switch_to_mpedb<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Resu
 /// fence), pushes all local changes, verifies convergence, then flips the epoch
 /// and re-seeds the pull cursor to the head captured at cutover. Leaves the
 /// mirror FROZEN on a failed verify so no writes leak before reconciliation.
-pub fn switch_to_source<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<()> {
+pub fn switch_to_source<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> Result<()> {
     let epoch = read_epoch(db)?;
     if epoch.authority != Authority::Mpedb {
         return Err(Error::Unsupported("switch_to_source: not mpedb-authoritative".into()));
@@ -241,7 +241,7 @@ pub enum Recovered {
 /// frozen (no local write can leak); mid switch-to-mpedb the source is already
 /// fenced at the new epoch (a stale pull/push aborts on the epoch predicate).
 /// So recovery is never racing live divergence — it only finishes the paperwork.
-pub fn recover<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<Recovered> {
+pub fn recover<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> Result<Recovered> {
     let m = read_epoch(db)?;
     let mid = mirror_id_hex(db)?;
     let Some((e_s, auth_s)) = adapter.read_source_state(&mid)? else {

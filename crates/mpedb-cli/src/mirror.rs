@@ -10,8 +10,10 @@ use mpedb_mirror::state::{self, Authority};
 use mpedb_mirror::switch::{
     drain_pull, drain_push, read_epoch, recover, switch_to_mpedb, switch_to_source, Recovered,
 };
+use mpedb_mirror::sourcecfg::{self, SourceSpec};
 use mpedb_mirror::{
-    diff_sqlite_data, export_sqlite, import_sqlite, reconcile, verify, ImportOptions, SqliteAdapter,
+    diff_sqlite_data, export_sqlite, import_pg, import_sqlite, reconcile, verify, ImportOptions,
+    PgAdapter, SourceAdapter, SqliteAdapter,
 };
 use mpedb_types::Durability;
 use rusqlite::Connection;
@@ -46,21 +48,70 @@ pub fn run(argv: &[String]) -> CliResult {
     }
 }
 
-/// Open an existing mirror `.mpedb` (config-free) and a sqlite source adapter
-/// with tracking installed (idempotent).
+/// Work out which source a command should talk to, in precedence order:
+///
+/// 1. `--source-config <path>` — the §12 channel: a 0600 file holding the DSN.
+/// 2. the `mir/src` record — the path recorded at import, so day-to-day
+///    commands need only `--db`.
+/// 3. `--source <sqlite-file>` — a sqlite path is not a secret, so it stays a
+///    plain flag; this is what every existing sqlite invocation uses.
+///
+/// There is deliberately no `--dsn`: `ps` shows every process's argv to every
+/// user on the host, so a DSN flag would publish the source password (§12).
+fn resolve_spec(db: &Database, p: &args::Parsed) -> Result<SourceSpec, Failure> {
+    if let Some(cfg) = p.value("source-config") {
+        return Ok(sourcecfg::load(std::path::Path::new(cfg))?);
+    }
+    if let Some(bytes) = db.sys_record_get(state::MIR_NS, state::KEY_SRC)? {
+        let path = state::decode_src_path(&bytes)?;
+        return sourcecfg::load(std::path::Path::new(&path)).map_err(|e| {
+            Failure::Runtime(format!(
+                "this mirror's source-config is `{path}` (recorded at import) but it \
+                 could not be read: {e}\nPass --source-config <path> if it moved."
+            ))
+        });
+    }
+    if let Some(src) = p.value("source") {
+        return Ok(SourceSpec::Sqlite { path: src.into() });
+    }
+    Err(Failure::Usage(
+        "no source: pass --source <sqlite-file>, or --source-config <0600-file> for \
+         PostgreSQL (a DSN must never be a CLI arg — it would be visible in `ps`)"
+            .into(),
+    ))
+}
+
+/// Open an existing mirror `.mpedb` (config-free) and its source adapter with
+/// tracking installed (idempotent).
 ///
 /// This is every both-sides command's single entry point, so it is also where
 /// **recovery-on-attach** (§7) runs: a switch is two fenced commits — the source
 /// CAS and the mpedb commit — and a SIGKILL between them leaves a half-cutover
 /// that only the pair `(mpedb epoch, source epoch)` can disambiguate. Doing it
-/// here means no command can act on a half-switched mirror.
-fn open_sqlite(db_path: &str, source: &str) -> Result<(Database, SqliteAdapter), Failure> {
+/// here means no command can act on a half-switched mirror — and, since the PG
+/// path now comes through here too, PG gets that same guarantee rather than a
+/// second copy of the rule that can drift out of step.
+fn open_source(
+    db_path: &str,
+    p: &args::Parsed,
+) -> Result<(Database, Box<dyn SourceAdapter>), Failure> {
     let db = Database::open_from_file(std::path::Path::new(db_path))?;
-    let conn = Connection::open(source)
-        .map_err(|e| Failure::Runtime(format!("open sqlite `{source}`: {e}")))?;
-    let mut adapter = SqliteAdapter::new(conn, None, &[])?;
-    adapter.install_triggers()?;
-    match recover(&db, &mut adapter)? {
+    let spec = resolve_spec(&db, p)?;
+    let mut adapter: Box<dyn SourceAdapter> = match &spec {
+        SourceSpec::Sqlite { path } => {
+            let conn = Connection::open(path)
+                .map_err(|e| Failure::Runtime(format!("open sqlite `{path}`: {e}")))?;
+            let a = SqliteAdapter::new(conn, None, &[])?;
+            a.install_triggers()?;
+            Box::new(a)
+        }
+        SourceSpec::Postgres { dsn } => {
+            let mut a = PgAdapter::connect(dsn, None, &[])?;
+            a.install_triggers()?;
+            Box::new(a)
+        }
+    };
+    match recover(&db, adapter.as_mut())? {
         Recovered::Steady => {}
         r => println!("recovery-on-attach: an interrupted switch was completed ({r:?})"),
     }
@@ -70,10 +121,10 @@ fn open_sqlite(db_path: &str, source: &str) -> Result<(Database, SqliteAdapter),
 const HELP: &str = "\
 mpedb mirror <subcommand>
 
-  import  --source <sqlite-file> --dest <new-mpedb-file>
+  import  (--source <sqlite-file> | --source-config <file>) --dest <new-mpedb-file>
           [--include t1,t2] [--exclude t3] [--size_mb N] [--durability none|commit|wal]
           [--adapt exact|lossy]
-      Import a sqlite database into a NEW .mpedb mirror file.
+      Import a sqlite or PostgreSQL database into a NEW .mpedb mirror file.
       sqlite's declared types are affinities, not constraints, so a column may
       hold off-type values. By DEFAULT one of those fails the import (loudly,
       while you are watching). --adapt exact coerces only what parses WHOLLY and
@@ -84,6 +135,28 @@ mpedb mirror <subcommand>
 
   export  --db <mpedb-file> --dest <new-sqlite-file>
       Export a mirror back out to a fresh sqlite database.
+
+
+
+SOURCE SELECTION
+  A sqlite source is a path: --source app.sqlite.
+  A PostgreSQL source needs a DSN, which is a password -- so it is NEVER a flag
+  (`ps` shows every process's argv to every user on the host). Put it in a 0600
+  file and name the file:
+
+      $ install -m600 /dev/null pg.toml     # born 0600, before a secret is in it
+      $ $EDITOR pg.toml
+            kind = \"postgres\"
+            dsn  = \"host=db.internal dbname=app user=app password=s3cr3t\"
+      $ mpedb mirror import --source-config pg.toml --dest app.mpedb
+
+  import records that file's PATH in the mirror (never the DSN), so afterwards
+  --db alone is enough:
+
+      $ mpedb mirror sync --db app.mpedb
+
+  The file's mode and owner are re-checked on every read: if it ever becomes
+  readable by group or other, commands refuse to run rather than use it.
 
   roundtrip --source <sqlite-file> [--size_mb N]
       Differential self-test: source -> mpedb -> sqlite, then diff the data
@@ -99,22 +172,22 @@ mpedb mirror <subcommand>
       in text, loose-source type drift) and every column that already lost
       information at import. Read-only, no round-trips.
 
-  pull    --source <sqlite-file> --db <mpedb-file>
+  pull    --db <mpedb-file> [--source <sqlite-file> | --source-config <file>]
       Pull + apply source changes into mpedb until caught up.
 
-  push    --source <sqlite-file> --db <mpedb-file>
+  push    --db <mpedb-file> [--source <sqlite-file> | --source-config <file>]
       Push local mpedb changes back to the source.
 
-  sync    --source <sqlite-file> --db <mpedb-file>
+  sync    --db <mpedb-file> [--source <sqlite-file> | --source-config <file>]
       Pull then push (respecting which side is authoritative).
 
   verify  --source <sqlite-file> --db <mpedb-file>
       Report whether mpedb and the source are byte-identical.
 
-  reconcile --source <sqlite-file> --db <mpedb-file>
+  reconcile --db <mpedb-file> [--source <sqlite-file> | --source-config <file>]
       Full merge-diff: converge mpedb to the source (source-wins).
 
-  switch  --source <sqlite-file> --db <mpedb-file> --to mpedb|source
+  switch  --db <mpedb-file> --to mpedb|source [--source <f> | --source-config <f>]
       Move authority to the given side (epoch-fenced).
 
   unfreeze --db <mpedb-file>
@@ -124,7 +197,7 @@ mpedb mirror <subcommand>
   conflicts --db <mpedb-file> [--clear]
       List parked conflicts (rows that could not be applied), or --clear them.
 
-  resolve --source <sqlite-file> --db <mpedb-file> --take source|local
+  resolve --db <mpedb-file> --take source|local [--source <f> | --source-config <f>]
       Override every parked conflict: `source` converges mpedb to the current
       source row; `local` forces mpedb's row onto the source.";
 
@@ -149,14 +222,14 @@ fn cmd_conflicts(argv: &[String]) -> CliResult {
 }
 
 fn cmd_resolve(argv: &[String]) -> CliResult {
-    let p = args::parse(argv, &["source", "db", "take"], &[])?;
+    let p = args::parse(argv, &["source", "db", "take", "source-config"], &[])?;
     let take = match p.require("take")? {
         "source" => mpedb_mirror::Take::Source,
         "local" => mpedb_mirror::Take::Local,
         other => return usage(format!("resolve --take must be source|local, not `{other}`")),
     };
-    let (db, mut a) = open_sqlite(p.require("db")?, p.require("source")?)?;
-    let s = mpedb_mirror::resolve(&db, &mut a, take)?;
+    let (db, mut a) = open_source(p.require("db")?, &p)?;
+    let s = mpedb_mirror::resolve(&db, a.as_mut(), take)?;
     println!(
         "resolved: {} took-source, {} took-local, {} still parked",
         s.took_source, s.took_local, s.still_parked
@@ -173,17 +246,17 @@ fn cmd_unfreeze(argv: &[String]) -> CliResult {
 }
 
 fn cmd_pull(argv: &[String]) -> CliResult {
-    let p = args::parse(argv, &["source", "db"], &[])?;
-    let (db, mut a) = open_sqlite(p.require("db")?, p.require("source")?)?;
-    let n = drain_pull(&db, &mut a)?;
+    let p = args::parse(argv, &["source", "db", "source-config"], &[])?;
+    let (db, mut a) = open_source(p.require("db")?, &p)?;
+    let n = drain_pull(&db, a.as_mut())?;
     println!("pulled + applied {n} row change(s)");
     Ok(())
 }
 
 fn cmd_push(argv: &[String]) -> CliResult {
-    let p = args::parse(argv, &["source", "db"], &[])?;
-    let (db, mut a) = open_sqlite(p.require("db")?, p.require("source")?)?;
-    let s = drain_push(&db, &mut a)?;
+    let p = args::parse(argv, &["source", "db", "source-config"], &[])?;
+    let (db, mut a) = open_source(p.require("db")?, &p)?;
+    let s = drain_push(&db, a.as_mut())?;
     println!("pushed {} row change(s) to the source", s.upserts + s.deletes);
     if s.conflicts > 0 {
         println!(
@@ -196,15 +269,15 @@ fn cmd_push(argv: &[String]) -> CliResult {
 }
 
 fn cmd_sync(argv: &[String]) -> CliResult {
-    let p = args::parse(argv, &["source", "db"], &[])?;
-    let (db, mut a) = open_sqlite(p.require("db")?, p.require("source")?)?;
+    let p = args::parse(argv, &["source", "db", "source-config"], &[])?;
+    let (db, mut a) = open_source(p.require("db")?, &p)?;
     let auth = read_epoch(&db)?.authority;
     let pulled = if auth == Authority::Source {
-        drain_pull(&db, &mut a)?
+        drain_pull(&db, a.as_mut())?
     } else {
         0 // mpedb-authoritative: the source is a stale replica, do not pull
     };
-    let s = drain_push(&db, &mut a)?;
+    let s = drain_push(&db, a.as_mut())?;
     println!(
         "sync: pulled {pulled}, pushed {}, parked {} (authority: {auth:?})",
         s.upserts + s.deletes,
@@ -214,9 +287,9 @@ fn cmd_sync(argv: &[String]) -> CliResult {
 }
 
 fn cmd_verify(argv: &[String]) -> CliResult {
-    let p = args::parse(argv, &["source", "db"], &[])?;
-    let (db, mut a) = open_sqlite(p.require("db")?, p.require("source")?)?;
-    if verify(&db, &mut a)? {
+    let p = args::parse(argv, &["source", "db", "source-config"], &[])?;
+    let (db, mut a) = open_source(p.require("db")?, &p)?;
+    if verify(&db, a.as_mut())? {
         println!("OK — mpedb and the source are identical");
         Ok(())
     } else {
@@ -225,9 +298,9 @@ fn cmd_verify(argv: &[String]) -> CliResult {
 }
 
 fn cmd_reconcile(argv: &[String]) -> CliResult {
-    let p = args::parse(argv, &["source", "db"], &[])?;
-    let (db, mut a) = open_sqlite(p.require("db")?, p.require("source")?)?;
-    let s = reconcile(&db, &mut a)?;
+    let p = args::parse(argv, &["source", "db", "source-config"], &[])?;
+    let (db, mut a) = open_source(p.require("db")?, &p)?;
+    let s = reconcile(&db, a.as_mut())?;
     println!(
         "reconciled: {} upserts, {} deletes across {} table(s)",
         s.upserts, s.deletes, s.tables_changed
@@ -236,15 +309,15 @@ fn cmd_reconcile(argv: &[String]) -> CliResult {
 }
 
 fn cmd_switch(argv: &[String]) -> CliResult {
-    let p = args::parse(argv, &["source", "db", "to"], &[])?;
-    let (db, mut a) = open_sqlite(p.require("db")?, p.require("source")?)?;
+    let p = args::parse(argv, &["source", "db", "to", "source-config"], &[])?;
+    let (db, mut a) = open_source(p.require("db")?, &p)?;
     match p.require("to")? {
         "mpedb" => {
-            switch_to_mpedb(&db, &mut a)?;
+            switch_to_mpedb(&db, a.as_mut())?;
             println!("authority switched to mpedb (epoch {})", read_epoch(&db)?.epoch);
         }
         "source" => {
-            switch_to_source(&db, &mut a)?;
+            switch_to_source(&db, a.as_mut())?;
             println!("authority switched to source (epoch {})", read_epoch(&db)?.epoch);
         }
         other => return usage(format!("--to must be mpedb|source, got `{other}`")),
@@ -255,11 +328,24 @@ fn cmd_switch(argv: &[String]) -> CliResult {
 fn cmd_import(argv: &[String]) -> CliResult {
     let p = args::parse(
         argv,
-        &["source", "dest"],
-        &["include", "exclude", "size_mb", "durability"],
+        &[
+            "source", "dest", "include", "exclude", "size_mb", "durability", "adapt",
+            "source-config",
+        ],
+        &[],
     )?;
-    let source = p.require("source")?;
     let dest = PathBuf::from(p.require("dest")?);
+    // Import is the one command with no mirror to read `mir/src` from, so the
+    // spec comes from the flags alone.
+    let spec = match (p.value("source-config"), p.value("source")) {
+        (Some(cfg), _) => sourcecfg::load(std::path::Path::new(cfg))?,
+        (None, Some(src)) => SourceSpec::Sqlite { path: src.into() },
+        (None, None) => {
+            return Err(Failure::Usage(
+                "import needs --source <sqlite-file> or --source-config <0600-file>".into(),
+            ))
+        }
+    };
 
     let include = p
         .value("include")
@@ -281,8 +367,6 @@ fn cmd_import(argv: &[String]) -> CliResult {
         Some(other) => return usage(format!("--durability must be none|commit|wal, got `{other}`")),
     };
 
-    let mut conn = Connection::open(source)
-        .map_err(|e| Failure::Runtime(format!("open sqlite source `{source}`: {e}")))?;
     // Strict-reject stays the default (DESIGN-MIRROR §4.5): an off-type value
     // should fail loudly while a human is watching, not be silently coerced.
     let adapt = match p.value("adapt") {
@@ -301,9 +385,36 @@ fn cmd_import(argv: &[String]) -> CliResult {
         batch_rows: 8192,
         adapt,
     };
-    let (_db, report) = import_sqlite(&mut conn, &dest, &opts)?;
 
-    println!("imported {} into {}", source, dest.display());
+    let (db, report) = match &spec {
+        SourceSpec::Sqlite { path } => {
+            let mut conn = Connection::open(path)
+                .map_err(|e| Failure::Runtime(format!("open sqlite source `{path}`: {e}")))?;
+            import_sqlite(&mut conn, &dest, &opts)?
+        }
+        SourceSpec::Postgres { dsn } => {
+            let mut client = PgAdapter::connect(dsn, opts.include.as_deref(), &opts.exclude)?;
+            import_pg(client.client(), &dest, &opts)?
+        }
+    };
+
+    // Record WHERE the credentials live (never the DSN itself — §12), so every
+    // later command needs only --db. Written after the import commits: a
+    // mir/src pointing into a mirror that does not exist is worse than none.
+    if let Some(cfg) = p.value("source-config") {
+        let abs = std::fs::canonicalize(cfg)
+            .map_err(|e| Failure::Runtime(format!("canonicalize --source-config: {e}")))?;
+        let mut s = db.begin()?;
+        s.set_capture(false);
+        s.sys_record_put(
+            state::MIR_NS,
+            state::KEY_SRC,
+            abs.to_string_lossy().as_bytes(),
+        )?;
+        s.commit()?;
+    }
+
+    println!("imported {} into {}", spec.redacted(), dest.display());
     if !report.adapted.is_empty() {
         // An adapted import must say exactly what it changed: a count alone is a
         // summary of unreviewable edits.
@@ -337,7 +448,7 @@ fn cmd_export(argv: &[String]) -> CliResult {
 }
 
 fn cmd_roundtrip(argv: &[String]) -> CliResult {
-    let p = args::parse(argv, &["source"], &["size_mb"])?;
+    let p = args::parse(argv, &["source", "size_mb"], &[])?;
     let source = p.require("source")?;
     let size_mb = match p.value("size_mb") {
         Some(s) => s

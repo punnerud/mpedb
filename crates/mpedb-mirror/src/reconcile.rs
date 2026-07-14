@@ -56,7 +56,7 @@ fn query_all(db: &Database, table: &str, cols: &[String]) -> Result<Vec<Vec<Valu
 /// diff / anti-entropy pass and no-touch mode for both sqlite and PostgreSQL.
 /// Also the natural handler for a PostgreSQL TRUNCATE (the source table is now
 /// empty → the mpedb rows are deleted).
-pub fn reconcile<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<ReconcileStats> {
+pub fn reconcile<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> Result<ReconcileStats> {
     let schema = db.schema().clone();
     let mut stats = ReconcileStats::default();
 
@@ -115,7 +115,7 @@ pub fn reconcile<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<Rec
 
 /// Read-only verify: is mpedb byte-identical to the source, table by table?
 /// The switch gate (DESIGN-MIRROR §7): a `true` means the cutover is safe.
-pub fn verify<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<bool> {
+pub fn verify<A: SourceAdapter + ?Sized>(db: &Database, adapter: &mut A) -> Result<bool> {
     let schema = db.schema().clone();
     for (tid, tdef) in schema.tables.iter().enumerate() {
         let pk_idx: Vec<usize> = tdef.primary_key.iter().map(|&i| i as usize).collect();

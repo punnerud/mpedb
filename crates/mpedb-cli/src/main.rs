@@ -22,19 +22,21 @@ mod repl;
 mod stress;
 mod util;
 
-use std::path::Path;
 
-use mpedb::{Database, Error, PlanHash};
+use mpedb::{Error, PlanHash};
 use util::{parse_params, usage, CliResult, Failure};
 
 const USAGE: &str = "\
 usage: mpedb <command> [args]
 
-  exec    <config.toml> <SQL> [param ...]   run one statement
-  prepare <config.toml> <SQL>               compile + publish, print plan hash
-  call    <config.toml> <hash> [param ...]  execute a prepared plan by hash
+  exec    <target> <SQL> [param ...]       run one statement
+  prepare <target> <SQL>                   compile + publish, print plan hash
+  call    <target> <hash> [param ...]      execute a prepared plan by hash
   proc    define|call|list ...              stored procedures (see `proc`)
-  repl    <config.toml>                     interactive session (stdin)
+  repl    <target>                          interactive session (stdin)
+
+  <target> is a config.toml, or a .mpedb file directly (e.g. a mirror, which
+  is config-free: its schema lives in the file).
   dump    <file.mpedb> [--data]             config-free schema/row dump
   bench   <config.toml>|--auto [--secs N] [--durability M] [--disk DIR]
   stress  --dir <dir> --workers N --secs S --mode bank|unique|mixed|incr
@@ -108,9 +110,9 @@ fn dispatch(argv: &[String]) -> CliResult {
 
 fn cmd_exec(args: &[String]) -> CliResult {
     let [config, sql, params @ ..] = args else {
-        return usage("exec needs <config.toml> <SQL> [param ...]");
+        return usage("exec needs <config.toml|db.mpedb> <SQL> [param ...]");
     };
-    let db = Database::open(Path::new(config))?;
+    let db = crate::util::open_target(config)?;
     let res = db.query(sql, &parse_params(params))?;
     render::print_result(&res);
     Ok(())
@@ -118,9 +120,9 @@ fn cmd_exec(args: &[String]) -> CliResult {
 
 fn cmd_prepare(args: &[String]) -> CliResult {
     let [config, sql] = args else {
-        return usage("prepare needs <config.toml> <SQL>");
+        return usage("prepare needs <config.toml|db.mpedb> <SQL>");
     };
-    let db = Database::open(Path::new(config))?;
+    let db = crate::util::open_target(config)?;
     let hash = db.prepare(sql)?;
     println!("{hash}");
     Ok(())
@@ -128,12 +130,12 @@ fn cmd_prepare(args: &[String]) -> CliResult {
 
 fn cmd_call(args: &[String]) -> CliResult {
     let [config, hash, params @ ..] = args else {
-        return usage("call needs <config.toml> <hash> [param ...]");
+        return usage("call needs <config.toml|db.mpedb> <hash> [param ...]");
     };
     let hash: PlanHash = hash
         .parse()
         .map_err(|_| Failure::Usage("hash must be 64 hex characters".into()))?;
-    let db = Database::open(Path::new(config))?;
+    let db = crate::util::open_target(config)?;
     match db.execute(&hash, &parse_params(params)) {
         Ok(res) => {
             render::print_result(&res);

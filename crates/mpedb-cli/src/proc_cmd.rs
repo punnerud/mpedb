@@ -6,7 +6,6 @@ use std::path::Path;
 use crate::args;
 use crate::render::value_str;
 use crate::util::{parse_params, usage, CliResult, Failure};
-use mpedb::Database;
 use mpedb_proc::{Budget, Lang, ProcEngine, ProcValue};
 
 const USAGE: &str = "\
@@ -46,7 +45,7 @@ fn cmd_define(args: &[String]) -> CliResult {
     };
     let source = std::fs::read_to_string(path)
         .map_err(|e| Failure::Runtime(format!("cannot read {file}: {e}")))?;
-    let db = Database::open(Path::new(config))?;
+    let db = crate::util::open_target(config)?;
     let engine = ProcEngine::new(&db);
     let hash = engine.define(&source, lang)?;
     let info = engine.info(&hash.to_string())?;
@@ -62,7 +61,7 @@ fn cmd_call(argv: &[String]) -> CliResult {
              [--budget <instrs>[,<dbcalls>[,<rows>]]]",
         );
     };
-    let db = Database::open(Path::new(config))?;
+    let db = crate::util::open_target(config)?;
     let mut engine = ProcEngine::new(&db);
     if let Some(spec) = parsed.value("budget") {
         let (instrs, db_calls, rows) = parse_budget(spec)?;
@@ -105,7 +104,7 @@ fn cmd_list(args: &[String]) -> CliResult {
     let [config] = args else {
         return usage("proc list needs <config.toml>");
     };
-    let db = Database::open(Path::new(config))?;
+    let db = crate::util::open_target(config)?;
     let engine = ProcEngine::new(&db);
     println!("name\targc\tkind\thash");
     for p in engine.list()? {

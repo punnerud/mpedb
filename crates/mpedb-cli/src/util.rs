@@ -192,3 +192,21 @@ pub fn shm_or_temp() -> PathBuf {
         std::env::temp_dir()
     }
 }
+
+/// Open a database given either a `config.toml` or a `.mpedb` file directly.
+///
+/// `Database::open` needs a config, but a mirror `.mpedb` is deliberately
+/// config-free: schema and geometry are file-authoritative, so there is no TOML
+/// to point at and hand-writing one only risks a config-drift hard-error. That
+/// left a real hole — you could `mirror switch --to mpedb` and then have no way
+/// to write to the mirror from the CLI at all, which is most of the point of
+/// taking authority. Dispatching on the extension closes it without changing
+/// any existing invocation.
+pub fn open_target(path: &str) -> Result<mpedb::Database, Failure> {
+    let p = Path::new(path);
+    if p.extension().is_some_and(|e| e == "toml") {
+        Ok(mpedb::Database::open(p)?)
+    } else {
+        Ok(mpedb::Database::open_from_file(p)?)
+    }
+}
