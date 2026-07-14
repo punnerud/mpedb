@@ -113,6 +113,28 @@ pub fn reconcile<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<Rec
     Ok(stats)
 }
 
+/// Read-only verify: is mpedb byte-identical to the source, table by table?
+/// The switch gate (DESIGN-MIRROR §7): a `true` means the cutover is safe.
+pub fn verify<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<bool> {
+    let schema = db.schema().clone();
+    for (tid, tdef) in schema.tables.iter().enumerate() {
+        let pk_idx: Vec<usize> = tdef.primary_key.iter().map(|&i| i as usize).collect();
+        let col_names: Vec<String> = tdef.columns.iter().map(|c| c.name.clone()).collect();
+        let mut mp: BTreeMap<Vec<u8>, Vec<Value>> = BTreeMap::new();
+        for row in query_all(db, &tdef.name, &col_names)? {
+            mp.insert(pk_keycode(&row, &pk_idx), row);
+        }
+        let mut sq: BTreeMap<Vec<u8>, Vec<Value>> = BTreeMap::new();
+        for row in adapter.read_table_rows(tid as u32)? {
+            sq.insert(pk_keycode(&row, &pk_idx), row);
+        }
+        if mp != sq {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Restore guard (DESIGN-MIRROR §5.1 / review CONF#24): a source whose changelog
 /// AUTOINCREMENT counter has regressed below the stored cursor was restored from
 /// an older backup of the same file — pulls would then silently miss writes.
