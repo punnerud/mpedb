@@ -109,14 +109,22 @@ pub trait SourceAdapter {
 
     /// Compare-and-set the source epoch/authority: apply only `WHERE epoch =
     /// expected_epoch`. Returns `true` if it applied, `false` if fenced (a
-    /// concurrent switch moved the epoch). Also returns the source's current
-    /// change-log head captured in the SAME transaction — the re-seed baseline
-    /// for the pull cursor after a switch to source (§7 S8b).
+    /// concurrent switch moved the epoch).
+    ///
+    /// This deliberately does NOT return a change-log head to re-seed the pull
+    /// cursor onto. Re-seeding at cutover would skip every third-party source
+    /// write committed between the drain and the cutover (they sit below the
+    /// new head) — permanent silent divergence. The cursor stays put and echo
+    /// suppression does the job it already does: both adapters filter their own
+    /// `origin` tag out of the changelog on pull, so our drain-push rows are
+    /// no-ops while foreign writes in that window are still pulled. Keeping the
+    /// cursor untouched is also what makes [`crate::switch::recover`] a total
+    /// function — there is no captured head to lose to a SIGKILL.
     fn cas_source_state(
         &mut self,
         mirror_id: &str,
         expected_epoch: u64,
         new_epoch: u64,
         new_authority: &str,
-    ) -> Result<Option<Cursor>>;
+    ) -> Result<bool>;
 }

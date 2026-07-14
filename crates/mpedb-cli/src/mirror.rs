@@ -7,7 +7,9 @@ use std::path::PathBuf;
 use mpedb::Database;
 use mpedb_core::Engine;
 use mpedb_mirror::state::{self, Authority};
-use mpedb_mirror::switch::{drain_pull, drain_push, read_epoch, switch_to_mpedb, switch_to_source};
+use mpedb_mirror::switch::{
+    drain_pull, drain_push, read_epoch, recover, switch_to_mpedb, switch_to_source, Recovered,
+};
 use mpedb_mirror::{
     diff_sqlite_data, export_sqlite, import_sqlite, reconcile, verify, ImportOptions, SqliteAdapter,
 };
@@ -45,12 +47,22 @@ pub fn run(argv: &[String]) -> CliResult {
 
 /// Open an existing mirror `.mpedb` (config-free) and a sqlite source adapter
 /// with tracking installed (idempotent).
+///
+/// This is every both-sides command's single entry point, so it is also where
+/// **recovery-on-attach** (§7) runs: a switch is two fenced commits — the source
+/// CAS and the mpedb commit — and a SIGKILL between them leaves a half-cutover
+/// that only the pair `(mpedb epoch, source epoch)` can disambiguate. Doing it
+/// here means no command can act on a half-switched mirror.
 fn open_sqlite(db_path: &str, source: &str) -> Result<(Database, SqliteAdapter), Failure> {
     let db = Database::open_from_file(std::path::Path::new(db_path))?;
     let conn = Connection::open(source)
         .map_err(|e| Failure::Runtime(format!("open sqlite `{source}`: {e}")))?;
-    let adapter = SqliteAdapter::new(conn, None, &[])?;
+    let mut adapter = SqliteAdapter::new(conn, None, &[])?;
     adapter.install_triggers()?;
+    match recover(&db, &mut adapter)? {
+        Recovered::Steady => {}
+        r => println!("recovery-on-attach: an interrupted switch was completed ({r:?})"),
+    }
     Ok((db, adapter))
 }
 

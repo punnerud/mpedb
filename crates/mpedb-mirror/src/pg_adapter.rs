@@ -337,6 +337,18 @@ impl SourceAdapter for PgAdapter {
     }
 
     fn read_source_state(&mut self, mirror_id: &str) -> Result<Option<(u64, String)>> {
+        // `to_regclass` is NULL when the relation does not exist: the state table
+        // is created by the first switch, so an import-only mirror legitimately
+        // has none. That is "unset", not an error (recovery-on-attach depends on
+        // it) — and checking beats swallowing every undefined_table error.
+        let exists: bool = self
+            .client
+            .query_one("SELECT to_regclass('mpedb_mirror.state') IS NOT NULL", &[])
+            .map_err(pgerr)?
+            .get(0);
+        if !exists {
+            return Ok(None);
+        }
         let rows = self
             .client
             .query(
@@ -355,7 +367,7 @@ impl SourceAdapter for PgAdapter {
         expected_epoch: u64,
         new_epoch: u64,
         new_authority: &str,
-    ) -> Result<Option<Cursor>> {
+    ) -> Result<bool> {
         let mut tx = self.client.transaction().map_err(pgerr)?;
         let n = tx
             .execute(
@@ -366,14 +378,10 @@ impl SourceAdapter for PgAdapter {
             .map_err(pgerr)?;
         if n == 0 {
             let _ = tx.rollback();
-            return Ok(None); // fenced
+            return Ok(false); // fenced
         }
-        let head: String = tx
-            .query_one("SELECT pg_current_snapshot()::text", &[])
-            .map_err(pgerr)?
-            .get(0);
         tx.commit().map_err(pgerr)?;
-        Ok(Some(head.into_bytes()))
+        Ok(true)
     }
 
     fn read_table_rows(&mut self, table_id: u32) -> Result<Vec<Vec<Value>>> {

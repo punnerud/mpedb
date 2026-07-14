@@ -489,6 +489,14 @@ impl SourceAdapter for SqliteAdapter {
         match r {
             Ok(v) => Ok(Some(v)),
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            // The state table is created by the first `ensure_source_state`, i.e.
+            // by the first switch. An import-only mirror has never had one, and
+            // that is "unset", not an error — recovery-on-attach relies on this.
+            Err(rusqlite::Error::SqliteFailure(_, Some(ref m)))
+                if m.contains("no such table") =>
+            {
+                Ok(None)
+            }
             Err(e) => Err(sqlerr(e)),
         }
     }
@@ -499,10 +507,7 @@ impl SourceAdapter for SqliteAdapter {
         expected_epoch: u64,
         new_epoch: u64,
         new_authority: &str,
-    ) -> Result<Option<Cursor>> {
-        // per-table log heads captured in the same txn = the re-seed baseline
-        let table_metas: Vec<(u32, String)> =
-            self.tables.iter().map(|t| (t.table_id, t.src.name.clone())).collect();
+    ) -> Result<bool> {
         let tx = self.conn.transaction().map_err(sqlerr)?;
         let n = tx
             .execute(
@@ -513,18 +518,10 @@ impl SourceAdapter for SqliteAdapter {
             .map_err(sqlerr)?;
         if n == 0 {
             let _ = tx.rollback();
-            return Ok(None); // fenced
-        }
-        let mut head = SqliteCursor::default();
-        for (tid, name) in &table_metas {
-            let log = log_table(name);
-            let mx: i64 = tx
-                .query_row(&format!("SELECT COALESCE(MAX(seq),0) FROM {}", q(&log)), [], |r| r.get(0))
-                .map_err(sqlerr)?;
-            head.set(*tid, mx as u64);
+            return Ok(false); // fenced
         }
         tx.commit().map_err(sqlerr)?;
-        Ok(Some(head.encode()))
+        Ok(true)
     }
 }
 
@@ -685,15 +682,14 @@ mod tests {
         assert_eq!(a.read_source_state(mid).unwrap(), Some((1, "source".into())));
 
         // CAS from the wrong epoch is fenced (returns None, no change)
-        assert!(a.cas_source_state(mid, 5, 6, "mpedb").unwrap().is_none());
+        assert!(!a.cas_source_state(mid, 5, 6, "mpedb").unwrap());
         assert_eq!(a.read_source_state(mid).unwrap(), Some((1, "source".into())));
 
-        // CAS from the right epoch applies and returns the log-head baseline
-        let head = a.cas_source_state(mid, 1, 2, "mpedb").unwrap();
-        assert!(head.is_some());
+        // CAS from the right epoch applies
+        assert!(a.cas_source_state(mid, 1, 2, "mpedb").unwrap());
         assert_eq!(a.read_source_state(mid).unwrap(), Some((2, "mpedb".into())));
         // the same CAS again is now fenced (epoch already moved)
-        assert!(a.cas_source_state(mid, 1, 2, "mpedb").unwrap().is_none());
+        assert!(!a.cas_source_state(mid, 1, 2, "mpedb").unwrap());
     }
 
     #[test]
