@@ -46,6 +46,8 @@ pub struct Report {
     /// Run-specific caveat lines appended after the static caveats
     /// (e.g. the spurious-Corrupt retry count observed this run).
     pub extra_caveats: Vec<String>,
+    /// Bulk MB/s (`--io`), empty unless that section ran.
+    pub bulk_rows: Vec<crate::bulk::BulkRow>,
 }
 
 fn fmt_rate(s: &LatStats) -> String {
@@ -197,6 +199,68 @@ impl Report {
 
     /// The by-class single-client durable point-insert comparison (§5.4).
     /// Two tables — compare WITHIN a class only, never across.
+    /// Bulk MB/s, each engine shown as a percentage of the raw-Rust baseline for
+    /// its own class — the engine number alone is mostly a property of the disk.
+    fn bulk_section(&self, md: bool) -> String {
+        if self.bulk_rows.is_empty() {
+            return String::new();
+        }
+        let mut out = String::new();
+        out.push_str(if md {
+            "## Bulk throughput (MiB/s) — against the raw-Rust baseline\n\n"
+        } else {
+            "# Bulk throughput (MiB/s) — against the raw-Rust baseline\n\n"
+        });
+        out.push_str(
+            "Blob payload pushed through each engine, vs. the SAME bytes written to a plain \
+             file with std::fs on the SAME medium under the SAME durability promise (the \
+             baseline uses the engine's own barrier — F_FULLFSYNC on Apple). MiB is LOGICAL \
+             payload (rows x value bytes), never the physical file, so an engine cannot look \
+             fast by storing less. `% of raw` is the honest column: an engine's MiB/s on its \
+             own mostly measures the disk.\n\n",
+        );
+        for class in ["none-class", "commit-class"] {
+            let rows_in: Vec<&crate::bulk::BulkRow> =
+                self.bulk_rows.iter().filter(|r| r.class == class).collect();
+            if rows_in.is_empty() {
+                continue;
+            }
+            // the baseline for this class is the denominator
+            let base = rows_in.iter().find(|r| r.is_baseline);
+            let (bw, br) = base.map_or((0.0, 0.0), |b| (b.write_mibs, b.scan_mibs));
+            let payload = rows_in.first().map_or(0.0, |r| r.logical_mib);
+            out.push_str(&if md {
+                format!("### {class} — {payload:.0} MiB logical payload per cell\n\n")
+            } else {
+                format!("## {class} — {payload:.0} MiB logical payload per cell\n\n")
+            });
+            let headers = [
+                "engine", "config", "write MiB/s", "% of raw", "scan MiB/s", "% of raw",
+            ];
+            let pct = |v: f64, base: f64| -> String {
+                if base > 0.0 {
+                    format!("{:.0}%", 100.0 * v / base)
+                } else {
+                    "-".into()
+                }
+            };
+            let mut rows: Vec<Vec<String>> = Vec::new();
+            for r in &rows_in {
+                rows.push(vec![
+                    r.engine.clone(),
+                    r.config.clone(),
+                    format!("{:.1}", r.write_mibs),
+                    if r.is_baseline { "—".into() } else { pct(r.write_mibs, bw) },
+                    format!("{:.1}", r.scan_mibs),
+                    if r.is_baseline { "—".into() } else { pct(r.scan_mibs, br) },
+                ]);
+            }
+            out.push_str(&render_table(&headers, &rows, md));
+            out.push('\n');
+        }
+        out
+    }
+
     fn dur_section(&self, md: bool) -> String {
         if self.dur_rows.is_empty() {
             return String::new();
@@ -275,6 +339,7 @@ impl Report {
         for w in ALL_WORKLOADS {
             out.push_str(&self.workload_section(w, false));
         }
+        out.push_str(&self.bulk_section(false));
         out.push_str(&self.dur_section(false));
         out.push_str("Caveats:\n");
         for l in CAVEATS_MD.lines() {
@@ -314,6 +379,7 @@ impl Report {
         for w in ALL_WORKLOADS {
             out.push_str(&self.workload_section(w, true));
         }
+        out.push_str(&self.bulk_section(true));
         out.push_str(&self.dur_section(true));
         out.push_str("## Caveats\n\n");
         out.push_str(CAVEATS_MD);

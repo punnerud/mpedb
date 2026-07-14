@@ -8,6 +8,10 @@ description = "Head-to-head benchmark: mpedb vs SQLite vs PostgreSQL on this mac
 
 [dependencies]
 mpedb = { workspace = true }
+# For os::fdatasync: the raw baseline must use the SAME durability barrier as the
+# engines (F_FULLFSYNC on Apple), or it would flatter itself by ~10x there.
+mpedb-core = { workspace = true }
+libc = { workspace = true }
 # rusqlite 0.31 bundles SQLite 3.45.0 (libsqlite3-sys 0.28). The system has
 # only libsqlite3.so.0 (no dev symlink, no header): linking -lsqlite3 fails,
 # so the bundled build is required on this machine (verified 2026-07-13).

@@ -145,8 +145,15 @@ single-client (~560 ops/s) — every commit msyncs with no batching partner; use
 `wal`. Contended writes (4 threads) mpedb leads 79k vs 30k/34k, but that is the
 cell most sensitive to core count — see [BENCHMARKS.md](BENCHMARKS.md).
 
+**Bulk bytes are not mpedb's game.** Pushing 256 MiB of 4 KiB blobs, SQLite
+writes 1,041 MiB/s to mpedb's 598 (40% vs 23% of what a raw `std::fs` write does
+on the same medium) — a blob larger than the page takes an overflow chain and
+every touched page is copied before the meta flip. That is crash-safety paid for
+in bandwidth. See [BENCHMARKS.md](BENCHMARKS.md#bulk-mbs--and-the-number-that-makes-it-mean-something).
+
 ```sh
 cargo run --release -p mpedb-bench      # full head-to-head (writes RESULTS.md)
+cargo run --release -p mpedb-bench -- --io   # bulk MiB/s vs a raw-Rust baseline
 mpedb bench --auto --durability wal     # quick mpedb-only
 ```
 
