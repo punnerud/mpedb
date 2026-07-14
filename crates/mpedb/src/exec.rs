@@ -5,8 +5,8 @@
 use crate::ExecResult;
 use mpedb_core::{ReadTxn, WriteTxn};
 use mpedb_sql::{
-    AccessPath, AggCall, Aggregation, CompiledPlan, InsertSource, PlanOnConflict, PlanStmt,
-    Projection,
+    AccessPath, AggCall, Aggregation, CompiledPlan, InsertSource, OrderOver, PlanOnConflict,
+    PlanStmt, Projection,
 };
 use mpedb_types::{
     keycode, Accum, DefaultExpr, Error, ExprProgram, KeyBound, KeyPart, Result, Schema, TableDef,
@@ -346,14 +346,19 @@ pub(crate) fn exec_stmt(
             offset,
             aggregate,
             distinct,
+            order_over,
         } => {
             let t = table_def(schema, *table)?;
             // DISTINCT makes LIMIT bound DISTINCT rows, so the scan bound (and
             // the top-K path, which is the same bound wearing a hat) must not
             // apply — the same trap the aggregate path has. Forcing it to None
             // here keeps that in one place rather than at each use.
+            // The scan bound only applies when the sort (and the dedup, if any)
+            // happen on the base row — otherwise LIMIT bounds a tuple further
+            // down the pipeline and cutting the scan short would drop input
+            // that later stages still need.
             let skip_take_bound = || {
-                if *distinct {
+                if *order_over != OrderOver::BaseRow {
                     return None;
                 }
                 limit.map(|l| {
@@ -365,12 +370,12 @@ pub(crate) fn exec_stmt(
             if let Some(agg) = aggregate {
                 return exec_aggregate(
                     ctx, plan, params, t, *table, access, filter.as_ref(), agg, projection,
-                    order_by, *limit, *offset, *distinct,
+                    order_by, *order_over, *limit, *offset, *distinct,
                 );
             }
-            let rows = if *distinct {
-                // The sort indexes the PROJECTION here and must follow the
-                // dedup, so the base rows are left unsorted and unbounded.
+            let rows = if *order_over != OrderOver::BaseRow {
+                // The sort indexes a tuple further down (the projection), so the
+                // base rows are left unsorted and unbounded here.
                 gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?
             } else if order_by.is_empty() {
                 // No surviving sort (the planner elides ORDER BY that matches
@@ -392,10 +397,10 @@ pub(crate) fn exec_stmt(
             // reason to project the ones being skipped. With it, the projection
             // is what gets deduplicated, so it must happen first and skip/take
             // moves to the end.
-            let (row_skip, row_take) = if *distinct {
-                (0, usize::MAX)
-            } else {
+            let (row_skip, row_take) = if *order_over == OrderOver::BaseRow {
                 (skip, take)
+            } else {
+                (0, usize::MAX)
             };
             let mut out = Vec::new();
             let mut seen = std::collections::HashSet::new();
@@ -419,7 +424,7 @@ pub(crate) fn exec_stmt(
                 }
                 out.push(orow);
             }
-            if *distinct {
+            if *order_over != OrderOver::BaseRow {
                 sort_rows(&mut out, order_by);
                 out = out.into_iter().skip(skip).take(take).collect();
             }
@@ -736,6 +741,7 @@ fn exec_aggregate(
     agg: &Aggregation,
     projection: &[Projection],
     order_by: &[(u16, bool)],
+    order_over: OrderOver,
     limit: Option<u64>,
     offset: Option<u64>,
     distinct: bool,
@@ -800,10 +806,9 @@ fn exec_aggregate(
         out = keep;
     }
 
-    // Sort the GROUPED tuple only when the indices refer to it. Under DISTINCT
-    // they refer to the projection, and the sort waits until after the dedup
-    // below.
-    if !distinct && !order_by.is_empty() {
+    // Sort the GROUPED tuple only when the indices refer to it; otherwise the
+    // sort waits for the projection below.
+    if order_over == OrderOver::Grouped && !order_by.is_empty() {
         sort_rows(&mut out, order_by);
     }
 
@@ -830,7 +835,7 @@ fn exec_aggregate(
         }
         projected.push(orow);
     }
-    if distinct {
+    if order_over == OrderOver::Projection {
         sort_rows(&mut projected, order_by);
     }
     let projected: Vec<Vec<Value>> = projected.into_iter().skip(skip).take(take).collect();

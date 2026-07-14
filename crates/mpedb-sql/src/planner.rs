@@ -13,8 +13,8 @@ use std::collections::BTreeSet;
 type PlannedStmt = (PlanStmt, Vec<Option<ColumnType>>, Vec<String>, BTreeSet<String>);
 use crate::binder::{compile_program, BExpr, Binder, Scope};
 use crate::plan::{
-    render_program, AccessPath, AggCall, Aggregation, CompiledPlan, InsertSource, PlanOnConflict,
-    PlanStmt, Projection,
+    render_program, AccessPath, AggCall, Aggregation, CompiledPlan, InsertSource, OrderOver,
+    PlanOnConflict, PlanStmt, Projection,
 };
 use crate::policy::{PolicyCatalog, TablePolicies};
 use mpedb_types::{ExprProgram, ColumnType, Error, Footprint, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
@@ -446,23 +446,38 @@ fn synthetic_grouped_table(
 /// executor honours that by aggregating `gather_rows`' output; this function
 /// simply never gets the chance to reorder them.
 #[allow(clippy::too_many_arguments)]
-/// `ORDER BY` under `SELECT DISTINCT`: resolve each key to its position in the
-/// SELECT list. `check_distinct_order_by` has already established that every
-/// key is there, so this cannot fail for a query that got past it — but it
-/// returns an error rather than asserting, because the two would otherwise have
-/// to agree by inspection.
+/// Resolve each `ORDER BY` key to its position in the SELECT list — the
+/// `OrderOver::Projection` form.
+///
+/// Two things only this form can express, both of which sqlite and PG have:
+///
+///   `ORDER BY 1` — a bare integer literal is an ORDINAL, SQL's oldest wart.
+///     It names the first output column, not the number 1. (`ORDER BY 1 + 1`
+///     is not an ordinal in PG either: only a literal counts, and the AST is
+///     checked before folding so a folded `2` cannot sneak in as one.)
+///   `ORDER BY amt * 2` — a computed key, which no base-column index names.
 fn distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<Vec<(u16, bool)>> {
     let Some(items) = s.items.as_ref() else {
-        // `SELECT DISTINCT *`: the projection is the base row, column for
-        // column, so a base-column index IS the output position.
+        // `SELECT *`: the projection is the base row, column for column, so a
+        // base-column index IS the output position and an ordinal counts over
+        // the same list.
         return s
             .order_by
             .iter()
             .map(|(e, desc)| {
+                if let Some(pos) = ordinal(e, table.columns.len())? {
+                    return Ok((pos, *desc));
+                }
                 let name = match e {
                     ast::Expr::Col(n) => n,
                     ast::Expr::Qualified(q, n) if q.eq_ignore_ascii_case(&table.name) => n,
-                    _ => return Err(bind_err("ORDER BY must name a column".to_string())),
+                    _ => {
+                        return Err(bind_err(
+                            "ORDER BY must name a column, an output position, or an \
+                             expression from the SELECT list"
+                                .to_string(),
+                        ))
+                    }
                 };
                 let idx = table
                     .column_index(name)
@@ -480,15 +495,63 @@ fn distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<Vec<(u16, 
         }
     };
     let mut out = Vec::with_capacity(s.order_by.len());
-    for (key, desc) in &s.order_by {
-        let key = strip(key);
+    for (i, (key, desc)) in s.order_by.iter().enumerate() {
+        if let Some(pos) = ordinal(key, items.len())? {
+            out.push((pos, *desc));
+            continue;
+        }
+        let stripped = strip(key);
         let pos = items
             .iter()
-            .position(|it| strip(it) == key)
-            .ok_or_else(|| bind_err("ORDER BY key is not in the SELECT list".to_string()))?;
+            .position(|it| strip(it) == stripped)
+            .ok_or_else(|| {
+                bind_err(format!(
+                    "ORDER BY {} must be in the SELECT list. Sorting by something outside \
+                     the output is not supported here (sqlite and PostgreSQL do allow it) — \
+                     select it, or order by a plain column of the table.",
+                    describe_key(key, i)
+                ))
+            })?;
         out.push((pos as u16, *desc));
     }
     Ok(out)
+}
+
+/// Name one `ORDER BY` key for an error message. A column has a name worth
+/// quoting; an expression does not — `agg_item_name` renders it `?column?`,
+/// which tells the reader nothing about WHICH key is wrong. Fall back to the
+/// 1-based position, the way sqlite says "1st ORDER BY term".
+fn describe_key(e: &ast::Expr, pos: usize) -> String {
+    match e {
+        ast::Expr::Col(n) => format!("`{n}`"),
+        ast::Expr::Qualified(q, n) => format!("`{q}.{n}`"),
+        _ => format!(
+            "the {}{} ORDER BY key",
+            pos + 1,
+            match pos + 1 {
+                1 => "st",
+                2 => "nd",
+                3 => "rd",
+                _ => "th",
+            }
+        ),
+    }
+}
+
+/// `ORDER BY <integer literal>` — a 1-based ordinal into the SELECT list.
+/// `None` if the key is not a bare integer literal.
+fn ordinal(key: &ast::Expr, n_items: usize) -> Result<Option<u16>> {
+    let ast::Expr::Lit(Value::Int(n)) = key else {
+        return Ok(None);
+    };
+    if *n < 1 || *n as usize > n_items {
+        return Err(bind_err(format!(
+            "ORDER BY {n} is out of range — there {} {n_items} output column{}",
+            if n_items == 1 { "is" } else { "are" },
+            if n_items == 1 { "" } else { "s" }
+        )));
+    }
+    Ok(Some((*n - 1) as u16))
 }
 
 /// With `SELECT DISTINCT`, every `ORDER BY` key must be one of the selected
@@ -519,14 +582,19 @@ fn check_distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<()> 
             other => other.clone(),
         }
     };
-    for (key, _) in &s.order_by {
-        let key = strip(key);
-        if !items.iter().any(|it| strip(it) == key) {
+    for (i, (key, _)) in s.order_by.iter().enumerate() {
+        // An ordinal already names an output position, so it cannot be outside
+        // the SELECT list; `ordinal` range-checks it later.
+        if matches!(key, ast::Expr::Lit(Value::Int(_))) {
+            continue;
+        }
+        let stripped = strip(key);
+        if !items.iter().any(|it| strip(it) == stripped) {
             return Err(bind_err(format!(
-                "ORDER BY `{}` must be in the SELECT list when SELECT DISTINCT is used — \
+                "ORDER BY {} must be in the SELECT list when SELECT DISTINCT is used — \
                  otherwise which duplicate row survives is what decides the order, and the \
                  query does not say",
-                agg_item_name(&key, table)
+                describe_key(key, i)
             )));
         }
     }
@@ -645,6 +713,7 @@ fn plan_aggregate_select(
                 filter,
                 projection,
                 order_by,
+                order_over: OrderOver::Projection,
                 limit: s.limit,
                 offset: s.offset,
                 distinct: true,
@@ -682,6 +751,7 @@ fn plan_aggregate_select(
             filter,
             projection,
             order_by,
+            order_over: OrderOver::Grouped,
             limit: s.limit,
             offset: s.offset,
             distinct: s.distinct,
@@ -778,34 +848,43 @@ fn plan_select(
         }
     };
 
-    // Under DISTINCT the sort follows the dedup and indexes the PROJECTION;
-    // otherwise it indexes the base row and happens before it.
-    let mut order_by = if s.distinct {
-        distinct_order_by(s, table)?
-    } else {
-        let mut v = Vec::with_capacity(s.order_by.len());
-        for (e, desc) in &s.order_by {
-            // Only a bare column: this sort runs on the base row, so there is
-            // nowhere to put a computed sort key. (An aggregate here never
-            // reaches this path — `has_agg` routed it to the aggregate planner
-            // already.)
-            let name = match e {
-                ast::Expr::Col(n) => n,
-                ast::Expr::Qualified(q, n) if q.eq_ignore_ascii_case(&table.name) => n,
-                _ => return Err(bind_err("ORDER BY must name a column".to_string())),
-            };
-            let idx = table
-                .column_index(name)
-                .ok_or_else(|| bind_err(format!("unknown column `{name}` in ORDER BY")))?;
-            v.push((idx, *desc));
+    // Prefer sorting the BASE row: it is the only form that keeps the PK-prefix
+    // elision and the streaming top-K path, both of which are about scan order.
+    // That needs every key to be a plain column of this table AND no dedup in
+    // between — under DISTINCT the sort must follow the dedup, so the base row
+    // is not the tuple being ordered at all.
+    let mut base_keys = Vec::with_capacity(s.order_by.len());
+    for (e, desc) in &s.order_by {
+        if s.distinct {
+            break;
         }
-        v
+        // A NAMED key must name a real column, and saying so beats any later
+        // complaint: `ORDER BY nope` is a typo, and reporting it as "not in the
+        // SELECT list" would send the reader looking in the wrong place.
+        let name = match e {
+            ast::Expr::Col(n) => n,
+            ast::Expr::Qualified(q, n) if q.eq_ignore_ascii_case(&table.name) => n,
+            // Not a name at all (an ordinal, an expression): the base row
+            // cannot be the tuple being sorted.
+            _ => break,
+        };
+        let idx = table
+            .column_index(name)
+            .ok_or_else(|| bind_err(format!("unknown column `{name}` in ORDER BY")))?;
+        base_keys.push((idx, *desc));
+    }
+    let (mut order_by, order_over) = if base_keys.len() == s.order_by.len() && !s.distinct {
+        (base_keys, OrderOver::BaseRow)
+    } else {
+        // A computed key, an ordinal, or DISTINCT: sort the output instead.
+        (distinct_order_by(s, table)?, OrderOver::Projection)
     };
     // A PK-prefix ORDER BY, all ascending, over a PK-ordered access path is
     // already satisfied by scan order: drop the sort. Not under DISTINCT — the
     // indices are output positions there, and the dedup between the scan and
     // the sort means scan order does not survive to the output anyway.
-    let pk_ordered_access = !matches!(access, AccessPath::IndexPoint { .. }) && !s.distinct;
+    let pk_ordered_access =
+        !matches!(access, AccessPath::IndexPoint { .. }) && order_over == OrderOver::BaseRow;
     if pk_ordered_access
         && !order_by.is_empty()
         && order_by.len() <= table.primary_key.len()
@@ -822,6 +901,7 @@ fn plan_select(
         PlanStmt::Select {
             aggregate: None,
             distinct: s.distinct,
+            order_over,
             table: table_id,
             access,
             filter,
