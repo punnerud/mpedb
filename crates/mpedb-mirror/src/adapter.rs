@@ -79,4 +79,27 @@ pub trait SourceAdapter {
     /// (source concurrently changed the same PK) is layered in M7; v1 push is
     /// last-writer-wins from mpedb.
     fn push(&mut self, ops: &[NetOp]) -> Result<()>;
+
+    // ---- authority-switch fence (DESIGN-MIRROR §7) ----
+
+    /// Ensure the source-side mirror-state row exists (idempotent), seeded with
+    /// `epoch`/`authority` on first creation. The epoch on this row is the
+    /// source-side anchor that fences the switch.
+    fn ensure_source_state(&mut self, mirror_id: &str, epoch: u64, authority: &str) -> Result<()>;
+
+    /// Read the source-side `(epoch, authority)`, or None if unset.
+    fn read_source_state(&mut self, mirror_id: &str) -> Result<Option<(u64, String)>>;
+
+    /// Compare-and-set the source epoch/authority: apply only `WHERE epoch =
+    /// expected_epoch`. Returns `true` if it applied, `false` if fenced (a
+    /// concurrent switch moved the epoch). Also returns the source's current
+    /// change-log head captured in the SAME transaction — the re-seed baseline
+    /// for the pull cursor after a switch to source (§7 S8b).
+    fn cas_source_state(
+        &mut self,
+        mirror_id: &str,
+        expected_epoch: u64,
+        new_epoch: u64,
+        new_authority: &str,
+    ) -> Result<Option<Cursor>>;
 }

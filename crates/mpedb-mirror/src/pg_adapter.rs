@@ -266,6 +266,64 @@ impl SourceAdapter for PgAdapter {
         Ok(())
     }
 
+    fn ensure_source_state(&mut self, mirror_id: &str, epoch: u64, authority: &str) -> Result<()> {
+        self.client
+            .batch_execute(
+                "CREATE SCHEMA IF NOT EXISTS mpedb_mirror;
+                 CREATE TABLE IF NOT EXISTS mpedb_mirror.state (\
+                     mirror_id text PRIMARY KEY, epoch bigint NOT NULL, authority text NOT NULL)",
+            )
+            .map_err(pgerr)?;
+        self.client
+            .execute(
+                "INSERT INTO mpedb_mirror.state(mirror_id, epoch, authority) \
+                 VALUES ($1, $2, $3) ON CONFLICT (mirror_id) DO NOTHING",
+                &[&mirror_id, &(epoch as i64), &authority],
+            )
+            .map_err(pgerr)?;
+        Ok(())
+    }
+
+    fn read_source_state(&mut self, mirror_id: &str) -> Result<Option<(u64, String)>> {
+        let rows = self
+            .client
+            .query(
+                "SELECT epoch, authority FROM mpedb_mirror.state WHERE mirror_id=$1",
+                &[&mirror_id],
+            )
+            .map_err(pgerr)?;
+        Ok(rows
+            .first()
+            .map(|r| (r.get::<_, i64>(0) as u64, r.get::<_, String>(1))))
+    }
+
+    fn cas_source_state(
+        &mut self,
+        mirror_id: &str,
+        expected_epoch: u64,
+        new_epoch: u64,
+        new_authority: &str,
+    ) -> Result<Option<Cursor>> {
+        let mut tx = self.client.transaction().map_err(pgerr)?;
+        let n = tx
+            .execute(
+                "UPDATE mpedb_mirror.state SET epoch=$1, authority=$2 \
+                 WHERE mirror_id=$3 AND epoch=$4",
+                &[&(new_epoch as i64), &new_authority, &mirror_id, &(expected_epoch as i64)],
+            )
+            .map_err(pgerr)?;
+        if n == 0 {
+            let _ = tx.rollback();
+            return Ok(None); // fenced
+        }
+        let head: String = tx
+            .query_one("SELECT pg_current_snapshot()::text", &[])
+            .map_err(pgerr)?
+            .get(0);
+        tx.commit().map_err(pgerr)?;
+        Ok(Some(head.into_bytes()))
+    }
+
     fn read_table_rows(&mut self, table_id: u32) -> Result<Vec<Vec<Value>>> {
         let src = self
             .tables
