@@ -32,6 +32,7 @@ pub fn run(argv: &[String]) -> CliResult {
         "verify" => cmd_verify(rest),
         "reconcile" => cmd_reconcile(rest),
         "switch" => cmd_switch(rest),
+        "unfreeze" => cmd_unfreeze(rest),
         "help" | "--help" | "-h" => {
             println!("{HELP}");
             Ok(())
@@ -84,7 +85,19 @@ mpedb mirror <subcommand>
       Full merge-diff: converge mpedb to the source (source-wins).
 
   switch  --source <sqlite-file> --db <mpedb-file> --to mpedb|source
-      Move authority to the given side (epoch-fenced).";
+      Move authority to the given side (epoch-fenced).
+
+  unfreeze --db <mpedb-file>
+      Clear a stuck freeze (e.g. after a switch-to-source verify failure);
+      reconcile first, then retry the switch.";
+
+fn cmd_unfreeze(argv: &[String]) -> CliResult {
+    let p = args::parse(argv, &["db"], &[])?;
+    let db = Database::open_from_file(std::path::Path::new(p.require("db")?))?;
+    mpedb_mirror::switch::set_frozen(&db, false)?;
+    println!("unfrozen — writes to mirrored tables are allowed again");
+    Ok(())
+}
 
 fn cmd_pull(argv: &[String]) -> CliResult {
     let p = args::parse(argv, &["source", "db"], &[])?;
