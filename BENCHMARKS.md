@@ -181,6 +181,71 @@ and SQLite-with-fullfsync are **tied** (293 vs 286) at genuinely durable
 single-client inserts; the 93× and 26× "wins" either engine appeared to have
 were measurement artifacts. Both fixes are committed.
 
+## Bulk MB/s — and the number that makes it mean something
+
+`cargo run --release -p mpedb-bench -- --io` pushes a **blob payload** (256 MiB
+logical, 4 KiB values, batched 256 rows/commit) through each engine and reports
+MiB/s next to a **raw-Rust baseline**: the same bytes written to a plain file
+with `std::fs` on the same medium under the same durability promise (the baseline
+calls `mpedb_core::durability_barrier`, i.e. the engine's own barrier — plain
+`fsync()` would flatter it ~10× on Apple). An engine's MiB/s alone mostly
+measures the disk; **`% of raw` is the column that means something.**
+
+| none-class (tmpfs) | write MiB/s | % of raw | scan MiB/s | % of raw |
+|---|--:|--:|--:|--:|
+| raw `std::fs` (baseline) | 2,603 | — | 7,722 | — |
+| SQLite | **1,041** | **40%** | **2,274** | **29%** |
+| mpedb | 598 | 23% | 1,012 | 13% |
+| PostgreSQL | 41 | 2% | 292 | 4% |
+
+| commit-class (disk) | write MiB/s | % of raw | scan MiB/s | % of raw |
+|---|--:|--:|--:|--:|
+| raw `std::fs` (baseline) | 869 | — | 8,086 | — |
+| SQLite | **167** | **19%** | 2,377 | 29% |
+| mpedb | 121 | 14% | **2,912** | **36%** |
+| PostgreSQL | 33 | 4% | 336 | 4% |
+
+**SQLite wins bulk blob writes — 1.7× mpedb.** That is the mirror image of the
+point-op cells (where mpedb leads 4-6×), and it is the honest shape of the
+design: mpedb is built for small keyed rows through a zero-parse plan, and a
+4 KiB blob is the case it is worst at — the value exceeds the 4 KiB page, so it
+takes an overflow chain, and every touched page is copied (COW) before the meta
+flip. That is crash-safety being paid for in bandwidth. mpedb does take the
+commit-class scan (36% vs 29%). PostgreSQL is 2-4% of raw in every bulk cell:
+a socket round-trip per row is simply the wrong shape for bulk.
+
+**Nobody is close to the medium.** The best engine uses 40% of the raw write
+ceiling and 29% of the read. If you need bytes moved, a file is still the fastest
+database.
+
+### What the >100% cells taught us
+
+The first version of this section reported SQLite writing at **103% of raw** and
+mpedb scanning at **266%** — impossible numbers that were pure methodology bugs,
+and worth recording because both are easy to ship without noticing:
+
+1. **The baseline wrote one 4 KiB syscall per row.** That measures syscall
+   overhead, not the medium — and every engine batches internally, so they "beat
+   the raw file". Fixed: the baseline writes 1 MiB chunks, like any real writer.
+2. **The baseline read was cache-dropped; the engine scans were warm.** The
+   engines scan data they just wrote, out of the page cache, so `posix_fadvise
+   (DONTNEED)` on the baseline rigged a cold-vs-warm race. Fixed: both sides warm.
+   Neither scan column is a disk-read benchmark; both measure the software path.
+
+A number above 100% of the hardware is a gift — it is the measurement telling you
+it is broken. The subtler version of the same bug is the one that lands at 85%
+and gets published.
+
+### Not measured: write amplification
+
+The obvious proxy — physical file bytes per logical byte — is meaningless for
+mpedb, whose file is **preallocated to a fixed `size_mb` and never grows**: the
+ratio would report our own provisioning choice. It printed a suspiciously exact
+`4.00×` (the harness sizes the file at 4× the payload) before we cut it. Doing it
+honestly needs per-process block-layer accounting (`/proc/self/io` `write_bytes`),
+which is Linux-only and cannot see PostgreSQL's server-side writes at all. Left
+out rather than shipped wrong.
+
 ## Reading run-to-run deltas — the control-group method
 
 **A stray process ate half this machine for five days.** An unrelated orphaned

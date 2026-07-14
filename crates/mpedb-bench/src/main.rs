@@ -8,6 +8,7 @@
 //! Progress goes to stderr; the final report goes to stdout and (full runs)
 //! to crates/mpedb-bench/RESULTS.md.
 
+mod bulk;
 mod dur_compare;
 mod eng_mpedb;
 mod eng_pg;
@@ -113,9 +114,114 @@ fn build_engine(
     }
 }
 
+/// The bulk MB/s section (`--io`): the raw-Rust baseline first, then each engine
+/// against it. Both media, both durability classes. Failures are reported, never
+/// silently dropped — a missing cell would read as "not measured", not "broken".
+fn run_bulk(
+    tmpfs_base: &std::path::Path,
+    disk_base: &std::path::Path,
+    quick: bool,
+    only: &Option<String>,
+) -> Vec<bulk::BulkRow> {
+    let bcfg = if quick { bulk::BulkCfg::quick() } else { bulk::BulkCfg::full() };
+    let mut rows: Vec<bulk::BulkRow> = Vec::new();
+    eprintln!(
+        "=== bulk MB/s ({:.0} MiB logical payload per cell, {} B values) ===",
+        bcfg.total_mib, bcfg.value_bytes
+    );
+
+    for (durable, class, medium) in [
+        (false, "none-class", tmpfs_base),
+        (true, "commit-class", disk_base),
+    ] {
+        // the baseline first: everything below is read as a fraction of it
+        eprint!("  {:<28} ", format!("raw std::fs ({class})"));
+        match bulk::raw_baseline(&medium.join("raw"), &bcfg, durable) {
+            Ok((w, r)) => {
+                eprintln!("write {w:>8.1} MiB/s  read {r:>8.1} MiB/s");
+                rows.push(bulk::BulkRow {
+                    engine: "raw std::fs (baseline)".into(),
+                    config: if durable {
+                        "write + fsync barrier".into()
+                    } else {
+                        "write, no fsync".into()
+                    },
+                    class,
+                    logical_mib: bcfg.total_mib as f64,
+                    write_mibs: w,
+                    scan_mibs: r,
+                    is_baseline: true,
+                });
+            }
+            Err(e) => eprintln!("FAILED: {e}"),
+        }
+
+        let want = |k: &str| only.as_ref().is_none_or(|f| k.contains(f.as_str()));
+        if want("mpedb") {
+            let d = if durable { "commit" } else { "none" };
+            eprint!("  {:<28} ", format!("mpedb durability={d}"));
+            match bulk::mpedb_bulk(&medium.join("bulk-mpedb"), d, &bcfg) {
+                Ok(r) => {
+                    eprintln!(
+                        "write {:>8.1} MiB/s  scan {:>8.1} MiB/s",
+                        r.write_mibs, r.scan_mibs
+                    );
+                    rows.push(r);
+                }
+                Err(e) => eprintln!("FAILED: {e}"),
+            }
+        }
+        if want("sqlite") {
+            eprint!("  {:<28} ", "sqlite");
+            match bulk::sqlite_bulk(&medium.join("bulk-sqlite"), durable, &bcfg) {
+                Ok(r) => {
+                    eprintln!(
+                        "write {:>8.1} MiB/s  scan {:>8.1} MiB/s",
+                        r.write_mibs, r.scan_mibs
+                    );
+                    rows.push(r);
+                }
+                Err(e) => eprintln!("FAILED: {e}"),
+            }
+        }
+        if want("postgres") {
+            eprint!("  {:<28} ", "postgres");
+            let datadir = medium.join("bulk-pgdata");
+            let sockdir = tmpfs_base.join(if durable { "bpgsock-c" } else { "bpgsock-n" });
+            match PgServer::start(datadir, sockdir, durable).and_then(|srv| {
+                let mut c = postgres::Client::connect(&srv.conn_str(), postgres::NoTls)?;
+                let label = if durable {
+                    "disk, fsync=on+sc=on"
+                } else {
+                    "tmpfs, fsync=off+sc=off"
+                };
+                let r = bulk::pg_bulk(&mut c, label, class, &bcfg);
+                drop(c);
+                // keep the server alive until the client is done, then stop it
+                drop(srv);
+                r
+            }) {
+                Ok(r) => {
+                    eprintln!(
+                        "write {:>8.1} MiB/s  scan {:>8.1} MiB/s",
+                        r.write_mibs, r.scan_mibs
+                    );
+                    rows.push(r);
+                }
+                Err(e) => eprintln!("FAILED: {e}"),
+            }
+        }
+    }
+    rows
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let quick = args.iter().any(|a| a == "--quick");
+    // Bulk MB/s is off by default: it moves hundreds of MB per cell, which is
+    // minutes of extra runtime and a lot of disk churn for a suite most runs
+    // want for its ops/s cells.
+    let io = args.iter().any(|a| a == "--io");
     let only: Option<String> = args
         .windows(2)
         .find(|w| w[0] == "--only")
@@ -130,12 +236,14 @@ fn main() {
         .map(|w| w[1].clone());
     for (i, a) in args.iter().enumerate() {
         let known = a == "--quick"
+            || a == "--io"
             || a == "--only"
             || a == "--tmpfs"
             || (i > 0 && (args[i - 1] == "--only" || args[i - 1] == "--tmpfs"));
         if !known {
             eprintln!(
-                "usage: mpedb-bench [--quick] [--only mpedb|sqlite|postgres] [--tmpfs DIR]"
+                "usage: mpedb-bench [--quick] [--io] [--only mpedb|sqlite|postgres] \
+                 [--tmpfs DIR]"
             );
             std::process::exit(2);
         }
@@ -260,6 +368,12 @@ fn main() {
         }
     }
 
+    let bulk_rows = if io {
+        run_bulk(&tmpfs_base, &disk_base, quick, &only)
+    } else {
+        Vec::new()
+    };
+
     // Focused single-client durable point-insert, by durability class (§5.4).
     // Its own engine instances on real disk; PostgreSQL sockets on tmpfs.
     eprintln!("=== single-client durable point-insert, by class (§5.4) ===");
@@ -284,6 +398,7 @@ fn main() {
         dur_rows,
         quick_mode: quick,
         extra_caveats,
+        bulk_rows,
     };
     println!("{}", report.to_text());
 

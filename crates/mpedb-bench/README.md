@@ -7,6 +7,8 @@ machine (2 cores, 7.6 GiB RAM, `/dev/shm` tmpfs + ext4 disk).
 cargo run --release -p mpedb-bench            # full run, writes RESULTS.md
 cargo run --release -p mpedb-bench -- --quick # smoke run, no RESULTS.md
 cargo run --release -p mpedb-bench -- --only sqlite
+cargo run --release -p mpedb-bench -- --io    # + bulk MiB/s vs a raw-Rust baseline
+cargo run --release -p mpedb-bench -- --tmpfs /Volumes/ram   # macOS (no /dev/shm)
 ```
 
 The formatted report goes to stdout; a full run also writes
