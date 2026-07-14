@@ -183,6 +183,22 @@ impl Database {
         Database::open_with_config(Config::from_file(config_path)?)
     }
 
+    /// Attach an existing database file config-free, reading its stored schema
+    /// and geometry (the file is schema-authoritative). Used by tooling — the
+    /// mirror daemon/CLI, `dump`, etc. — that must open a file it did not create
+    /// a TOML for. CHECK programs are NOT reconstructed (a file that carries
+    /// CHECK constraints must be opened via a config for enforcement); durability
+    /// = `async` also needs a config (no background flusher). Mirror files use
+    /// neither, so this is exactly what they need.
+    pub fn open_from_file(path: &Path) -> Result<Database> {
+        let engine = Engine::open_from_file(path)?;
+        Ok(Database {
+            engine,
+            cache: RwLock::new(HashMap::new()),
+            path: path.to_path_buf(),
+        })
+    }
+
     /// Open (or create) the database described by an already-parsed config.
     /// Compiles every column CHECK expression against its table and hands the
     /// programs to the engine, so constraint enforcement is identical in

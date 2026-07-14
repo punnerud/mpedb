@@ -4,9 +4,13 @@
 
 use std::path::PathBuf;
 
+use mpedb::Database;
 use mpedb_core::Engine;
-use mpedb_mirror::state;
-use mpedb_mirror::{diff_sqlite_data, export_sqlite, import_sqlite, ImportOptions};
+use mpedb_mirror::state::{self, Authority};
+use mpedb_mirror::switch::{drain_pull, drain_push, read_epoch, switch_to_mpedb, switch_to_source};
+use mpedb_mirror::{
+    diff_sqlite_data, export_sqlite, import_sqlite, reconcile, verify, ImportOptions, SqliteAdapter,
+};
 use mpedb_types::Durability;
 use rusqlite::Connection;
 
@@ -22,12 +26,29 @@ pub fn run(argv: &[String]) -> CliResult {
         "export" => cmd_export(rest),
         "roundtrip" => cmd_roundtrip(rest),
         "status" => cmd_status(rest),
+        "pull" => cmd_pull(rest),
+        "push" => cmd_push(rest),
+        "sync" => cmd_sync(rest),
+        "verify" => cmd_verify(rest),
+        "reconcile" => cmd_reconcile(rest),
+        "switch" => cmd_switch(rest),
         "help" | "--help" | "-h" => {
             println!("{HELP}");
             Ok(())
         }
         other => usage(format!("unknown mirror subcommand `{other}`\n\n{HELP}")),
     }
+}
+
+/// Open an existing mirror `.mpedb` (config-free) and a sqlite source adapter
+/// with tracking installed (idempotent).
+fn open_sqlite(db_path: &str, source: &str) -> Result<(Database, SqliteAdapter), Failure> {
+    let db = Database::open_from_file(std::path::Path::new(db_path))?;
+    let conn = Connection::open(source)
+        .map_err(|e| Failure::Runtime(format!("open sqlite `{source}`: {e}")))?;
+    let adapter = SqliteAdapter::new(conn, None, &[])?;
+    adapter.install_triggers()?;
+    Ok((db, adapter))
 }
 
 const HELP: &str = "\
@@ -45,7 +66,94 @@ mpedb mirror <subcommand>
       against the source. Reports any rows that did not survive the mapping.
 
   status  --db <mpedb-file>
-      Show a mirror's config and authority state.";
+      Show a mirror's config and authority state.
+
+  pull    --source <sqlite-file> --db <mpedb-file>
+      Pull + apply source changes into mpedb until caught up.
+
+  push    --source <sqlite-file> --db <mpedb-file>
+      Push local mpedb changes back to the source.
+
+  sync    --source <sqlite-file> --db <mpedb-file>
+      Pull then push (respecting which side is authoritative).
+
+  verify  --source <sqlite-file> --db <mpedb-file>
+      Report whether mpedb and the source are byte-identical.
+
+  reconcile --source <sqlite-file> --db <mpedb-file>
+      Full merge-diff: converge mpedb to the source (source-wins).
+
+  switch  --source <sqlite-file> --db <mpedb-file> --to mpedb|source
+      Move authority to the given side (epoch-fenced).";
+
+fn cmd_pull(argv: &[String]) -> CliResult {
+    let p = args::parse(argv, &["source", "db"], &[])?;
+    let (db, mut a) = open_sqlite(p.require("db")?, p.require("source")?)?;
+    let n = drain_pull(&db, &mut a)?;
+    println!("pulled + applied {n} row change(s)");
+    Ok(())
+}
+
+fn cmd_push(argv: &[String]) -> CliResult {
+    let p = args::parse(argv, &["source", "db"], &[])?;
+    let (db, mut a) = open_sqlite(p.require("db")?, p.require("source")?)?;
+    let n = drain_push(&db, &mut a)?;
+    println!("pushed {n} row change(s) to the source");
+    Ok(())
+}
+
+fn cmd_sync(argv: &[String]) -> CliResult {
+    let p = args::parse(argv, &["source", "db"], &[])?;
+    let (db, mut a) = open_sqlite(p.require("db")?, p.require("source")?)?;
+    let auth = read_epoch(&db)?.authority;
+    let pulled = if auth == Authority::Source {
+        drain_pull(&db, &mut a)?
+    } else {
+        0 // mpedb-authoritative: the source is a stale replica, do not pull
+    };
+    let pushed = drain_push(&db, &mut a)?;
+    println!("sync: pulled {pulled}, pushed {pushed} (authority: {auth:?})");
+    Ok(())
+}
+
+fn cmd_verify(argv: &[String]) -> CliResult {
+    let p = args::parse(argv, &["source", "db"], &[])?;
+    let (db, mut a) = open_sqlite(p.require("db")?, p.require("source")?)?;
+    if verify(&db, &mut a)? {
+        println!("OK — mpedb and the source are identical");
+        Ok(())
+    } else {
+        Err(Failure::Runtime("mpedb and the source DIVERGE (run reconcile)".into()))
+    }
+}
+
+fn cmd_reconcile(argv: &[String]) -> CliResult {
+    let p = args::parse(argv, &["source", "db"], &[])?;
+    let (db, mut a) = open_sqlite(p.require("db")?, p.require("source")?)?;
+    let s = reconcile(&db, &mut a)?;
+    println!(
+        "reconciled: {} upserts, {} deletes across {} table(s)",
+        s.upserts, s.deletes, s.tables_changed
+    );
+    Ok(())
+}
+
+fn cmd_switch(argv: &[String]) -> CliResult {
+    let p = args::parse(argv, &["source", "db", "to"], &[])?;
+    let (db, mut a) = open_sqlite(p.require("db")?, p.require("source")?)?;
+    match p.require("to")? {
+        "mpedb" => {
+            switch_to_mpedb(&db, &mut a)?;
+            println!("authority switched to mpedb (epoch {})", read_epoch(&db)?.epoch);
+        }
+        "source" => {
+            switch_to_source(&db, &mut a)?;
+            println!("authority switched to source (epoch {})", read_epoch(&db)?.epoch);
+        }
+        other => return usage(format!("--to must be mpedb|source, got `{other}`")),
+    }
+    Ok(())
+}
 
 fn cmd_import(argv: &[String]) -> CliResult {
     let p = args::parse(
