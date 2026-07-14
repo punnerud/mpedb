@@ -14,6 +14,7 @@ pub mod conflicts;
 pub mod export;
 pub mod import;
 pub mod pg;
+pub mod preflight;
 pub mod pg_adapter;
 pub mod pg_import;
 pub mod pg_track;
@@ -38,9 +39,11 @@ pub use export::{diff_sqlite_data, export_sqlite, ExportReport};
 pub use import::{import_sqlite, ImportOptions, ImportReport};
 pub use pg_adapter::PgAdapter;
 pub use pg_import::import_pg;
+pub use preflight::{preflight, Finding, FindingKind, PreflightReport};
 pub use push::{push_batch, PushStats};
 pub use resolve::{resolve, ResolveStats, Take};
 
 pub use state::{
-    Authority, CaptureMode, Epoch, MirrorConfig, MirrorState, SourceKind, MIR_NS,
+    Authority, CaptureMode, ColumnMap, Epoch, MapPolicy, MirrorConfig, MirrorState, SourceKind,
+    TableMap, MIR_NS,
 };
