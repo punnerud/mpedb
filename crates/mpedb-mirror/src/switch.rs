@@ -210,6 +210,7 @@ pub fn switch_to_source<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Res
 mod tests {
     use super::*;
     use crate::import::{import_sqlite, ImportOptions};
+    use mpedb::ExecResult;
     use mpedb_types::{Error as E, Value};
     use rusqlite::Connection;
 
@@ -322,5 +323,182 @@ mod tests {
         for p in [src, mid] {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    // ---- M8.1 switch drill (DESIGN-MIRROR §10.9) ----
+
+    /// Deterministic xorshift64* — no rand dep (testing convention).
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x >> 12;
+            x ^= x << 25;
+            x ^= x >> 27;
+            self.0 = x;
+            x.wrapping_mul(0x2545_f491_4f6c_dd1d)
+        }
+        fn below(&mut self, n: i64) -> i64 {
+            (self.next() % n as u64) as i64
+        }
+    }
+
+    use std::collections::BTreeMap;
+
+    fn mpedb_rows(db: &Database) -> BTreeMap<i64, i64> {
+        let ExecResult::Rows { rows, .. } = db.query("SELECT id, v FROM t", &[]).unwrap() else {
+            panic!("expected rows")
+        };
+        rows.iter()
+            .map(|r| match (&r[0], &r[1]) {
+                (Value::Int(id), Value::Int(v)) => (*id, *v),
+                (Value::Int(id), Value::Null) => (*id, i64::MIN), // sentinel for NULL v
+                other => panic!("bad row {other:?}"),
+            })
+            .collect()
+    }
+
+    fn source_rows(conn: &Connection) -> BTreeMap<i64, i64> {
+        let mut stmt = conn.prepare("SELECT id, v FROM t").unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, Option<i64>>(1)?.unwrap_or(i64::MIN)))
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    /// Apply a random put/delete to the source (sqlite), driven by `model` so we
+    /// emit INSERT vs UPDATE correctly without relying on UPSERT support.
+    fn src_write(conn: &Connection, model: &mut BTreeMap<i64, i64>, id: i64, v: Option<i64>) {
+        match v {
+            Some(v) => {
+                if model.contains_key(&id) {
+                    conn.execute("UPDATE t SET v=?1 WHERE id=?2", rusqlite::params![v, id]).unwrap();
+                } else {
+                    conn.execute("INSERT INTO t(id,v) VALUES(?1,?2)", rusqlite::params![id, v]).unwrap();
+                }
+                model.insert(id, v);
+            }
+            None => {
+                conn.execute("DELETE FROM t WHERE id=?1", rusqlite::params![id]).unwrap();
+                model.remove(&id);
+            }
+        }
+    }
+
+    fn mpedb_write(db: &Database, model: &mut BTreeMap<i64, i64>, id: i64, v: Option<i64>) {
+        match v {
+            Some(v) => {
+                if model.contains_key(&id) {
+                    db.query("UPDATE t SET v=$1 WHERE id=$2", &[Value::Int(v), Value::Int(id)]).unwrap();
+                } else {
+                    db.query("INSERT INTO t (id,v) VALUES ($1,$2)", &[Value::Int(id), Value::Int(v)]).unwrap();
+                }
+                model.insert(id, v);
+            }
+            None => {
+                db.query("DELETE FROM t WHERE id=$1", &[Value::Int(id)]).unwrap();
+                model.remove(&id);
+            }
+        }
+    }
+
+    fn run_switch_drill(rounds: usize, seed: u64, rogue_every: usize) {
+        use crate::reconcile::{reconcile, verify};
+        use crate::SqliteAdapter;
+
+        let src = tmp(&format!("drill-src-{seed}"), "db");
+        let mid = tmp(&format!("drill-mid-{seed}"), "mpedb");
+        {
+            let c = Connection::open(&src).unwrap();
+            c.execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+                 INSERT INTO t VALUES (1,10),(2,20),(3,30);",
+            )
+            .unwrap();
+        }
+        let db = {
+            let mut c = Connection::open(&src).unwrap();
+            import_sqlite(&mut c, &mid, &ImportOptions::default()).unwrap().0
+        };
+        let mut adapter = SqliteAdapter::new(Connection::open(&src).unwrap(), None, &[]).unwrap();
+        adapter.install_triggers().unwrap();
+
+        let mut model: BTreeMap<i64, i64> = source_rows(adapter.conn());
+        let mut rng = Rng(seed | 1);
+        const K: i64 = 8; // id space for churn
+
+        for round in 0..rounds {
+            let start_epoch = read_epoch(&db).unwrap().epoch;
+
+            // --- S2: a burst of source writes, then switch to mpedb (drains pull)
+            for _ in 0..3 {
+                let id = 1 + rng.below(K);
+                let v = if rng.below(4) == 0 { None } else { Some(rng.below(1000)) };
+                src_write(adapter.conn(), &mut model, id, v);
+            }
+            switch_to_mpedb(&db, &mut adapter).unwrap();
+            let ep = read_epoch(&db).unwrap();
+            assert_eq!(ep.authority, Authority::Mpedb, "round {round}: should be M_AUTH");
+            assert_eq!(ep.epoch, start_epoch + 1);
+
+            // --- M_AUTH: a burst of local writes
+            for _ in 0..3 {
+                let id = 1 + rng.below(K);
+                let v = if rng.below(4) == 0 { None } else { Some(rng.below(1000)) };
+                mpedb_write(&db, &mut model, id, v);
+            }
+
+            // --- optionally inject a ROGUE direct source write (id outside the
+            //     churn range so it's a genuine source-only row verify will catch)
+            let rogue = rogue_every != 0 && round % rogue_every == rogue_every - 1;
+            if rogue {
+                let rid = 1000 + round as i64;
+                let rv = rng.below(1000);
+                src_write(adapter.conn(), &mut model, rid, Some(rv));
+            }
+
+            // --- switch back to source. A rogue write makes verify fail (mpedb
+            //     lacks the row) → the mirror stays frozen; escape via
+            //     unfreeze + reconcile (source-wins folds the rogue in), retry.
+            match switch_to_source(&db, &mut adapter) {
+                Ok(()) => assert!(!rogue, "round {round}: rogue write should have failed verify"),
+                Err(_) => {
+                    assert!(rogue, "round {round}: non-rogue switch must not fail");
+                    assert!(read_epoch(&db).unwrap().frozen, "failed switch leaves it frozen");
+                    set_frozen(&db, false).unwrap();
+                    reconcile(&db, &mut adapter).unwrap(); // source-wins → mpedb gets the rogue
+                    switch_to_source(&db, &mut adapter).unwrap();
+                }
+            }
+
+            // --- invariants after a full round
+            let ep = read_epoch(&db).unwrap();
+            assert_eq!(ep.authority, Authority::Source, "round {round}: back to S_AUTH");
+            assert!(!ep.frozen, "round {round}: not frozen after a clean switch");
+            assert_eq!(ep.epoch, start_epoch + 2, "round {round}: epoch advances by 2");
+            assert!(verify(&db, &mut adapter).unwrap(), "round {round}: sides must be identical");
+            assert_eq!(mpedb_rows(&db), model, "round {round}: mpedb matches the model");
+            assert_eq!(source_rows(adapter.conn()), model, "round {round}: source matches the model");
+        }
+
+        for p in [src, mid] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn switch_drill_converges_each_round_with_injected_divergence() {
+        // several seeds so the churn hits inserts, updates, deletes, collisions
+        for seed in [0x1234_5678u64, 0xdead_beef, 0x0f0f_0f0f] {
+            run_switch_drill(12, seed, 4); // rogue write every 4th round
+        }
+    }
+
+    #[test]
+    #[ignore = "slow: 100-round switch drill under load (run with --ignored)"]
+    fn switch_drill_x100() {
+        run_switch_drill(100, 0xa5a5_5a5a, 5);
     }
 }
