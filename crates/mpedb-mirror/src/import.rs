@@ -228,8 +228,8 @@ fn flush_batch(
 }
 
 /// Convert a sqlite value to the mapped mpedb type. Strict-reject on any
-/// violation (the §4.5 import default).
-fn convert_value(vr: ValueRef, ct: ColumnType, table: &str, col: &str) -> Result<Value> {
+/// violation (the §4.5 import default). Shared with the pull adapter.
+pub(crate) fn convert_value(vr: ValueRef, ct: ColumnType, table: &str, col: &str) -> Result<Value> {
     let violation = |what: &str| {
         Err(Error::TypeMismatch(format!(
             "sqlite `{table}.{col}`: {what} (import is strict-reject)"
