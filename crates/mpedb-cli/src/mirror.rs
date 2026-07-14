@@ -34,6 +34,7 @@ pub fn run(argv: &[String]) -> CliResult {
         "switch" => cmd_switch(rest),
         "unfreeze" => cmd_unfreeze(rest),
         "conflicts" => cmd_conflicts(rest),
+        "resolve" => cmd_resolve(rest),
         "help" | "--help" | "-h" => {
             println!("{HELP}");
             Ok(())
@@ -93,7 +94,11 @@ mpedb mirror <subcommand>
       reconcile first, then retry the switch.
 
   conflicts --db <mpedb-file> [--clear]
-      List parked conflicts (rows that could not be applied), or --clear them.";
+      List parked conflicts (rows that could not be applied), or --clear them.
+
+  resolve --source <sqlite-file> --db <mpedb-file> --take source|local
+      Override every parked conflict: `source` converges mpedb to the current
+      source row; `local` forces mpedb's row onto the source.";
 
 fn cmd_conflicts(argv: &[String]) -> CliResult {
     let p = args::parse(argv, &["db"], &["clear"])?;
@@ -112,6 +117,22 @@ fn cmd_conflicts(argv: &[String]) -> CliResult {
     for c in &parked {
         println!("  {:<14?} {}.pk={:?}", c.record.kind, c.table, c.pk);
     }
+    Ok(())
+}
+
+fn cmd_resolve(argv: &[String]) -> CliResult {
+    let p = args::parse(argv, &["source", "db", "take"], &[])?;
+    let take = match p.require("take")? {
+        "source" => mpedb_mirror::Take::Source,
+        "local" => mpedb_mirror::Take::Local,
+        other => return usage(format!("resolve --take must be source|local, not `{other}`")),
+    };
+    let (db, mut a) = open_sqlite(p.require("db")?, p.require("source")?)?;
+    let s = mpedb_mirror::resolve(&db, &mut a, take)?;
+    println!(
+        "resolved: {} took-source, {} took-local, {} still parked",
+        s.took_source, s.took_local, s.still_parked
+    );
     Ok(())
 }
 
