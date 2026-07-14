@@ -77,8 +77,15 @@ pub trait SourceAdapter {
     /// them in ONE source transaction and tags its own writes so they are
     /// filtered out of the next pull (echo suppression). Unconditional
     /// last-writer-wins from mpedb — used when mpedb holds authority (S6/S7,
-    /// local-wins). Conflict-aware write-back is [`push_checked`].
-    fn push(&mut self, ops: &[NetOp]) -> Result<()>;
+    /// local-wins). Conflict-aware write-back is [`SourceAdapter::push_checked`].
+    ///
+    /// Returns one flag per op, positionally: `true` = applied, `false` = the
+    /// source rejected THIS row (a constraint mpedb does not mirror, an
+    /// out-of-range value for a narrower source column, …). Each op is applied
+    /// inside its own SAVEPOINT, so one rejected row parks alone instead of
+    /// poisoning the batch — otherwise the dirty entry survives, every retry hits
+    /// the same error, and write-back wedges forever (review CONF#38).
+    fn push(&mut self, ops: &[NetOp]) -> Result<Vec<bool>>;
 
     /// Conflict-aware write-back (§6, source-authoritative / source-wins). Within
     /// ONE source transaction, applies each op only if the source has NOT changed
