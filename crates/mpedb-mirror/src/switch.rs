@@ -737,4 +737,62 @@ mod tests {
             let _ = std::fs::remove_file(p);
         }
     }
+    /// §7 calls `regenerate` "the ONLY arrow out of HALTED(db_full)", and it
+    /// STARTS with a freeze — a write. So the escape hatch is only real if a
+    /// freeze can commit against a file that just refused an INSERT.
+    ///
+    /// It can, and this pins it. (The margin comes from the failed insert
+    /// releasing its pages back to `reusable`, which the small control write
+    /// then finds; §3.10's reserved pool is the belt to that braces.) If this
+    /// ever goes red, HALTED(db_full) becomes unrecoverable and `regenerate`
+    /// needs `set_reserved_alloc(true)`.
+    #[test]
+    fn freeze_must_work_when_the_file_is_full() {
+        use crate::import::{import_sqlite, ImportOptions};
+        use rusqlite::Connection;
+        let dir = std::env::temp_dir().join("mpedb-regen-probe");
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join(format!("s-{}.db", std::process::id()));
+        let dest = dir.join(format!("d-{}.mpedb", std::process::id()));
+        let _ = std::fs::remove_file(&src);
+        let _ = std::fs::remove_file(&dest);
+        {
+            let c = Connection::open(&src).unwrap();
+            c.execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT NOT NULL);
+                 INSERT INTO t VALUES (1,'a');",
+            ).unwrap();
+        }
+        // smallest legal file, so filling it is quick
+        let opts = ImportOptions { size_bytes: 1 << 20, ..Default::default() };
+        let db = {
+            let mut c = Connection::open(&src).unwrap();
+            import_sqlite(&mut c, &dest, &opts).unwrap().0
+        };
+        // fill the data region until the engine says DbFull
+        let mut i = 2i64;
+        let filled = loop {
+            let r = db.query(
+                "INSERT INTO t (id, v) VALUES ($1, $2)",
+                &[Value::Int(i), Value::Text("x".repeat(400))],
+            );
+            match r {
+                Ok(_) => { i += 1; if i > 100_000 { break false } }
+                Err(mpedb_types::Error::DbFull) => break true,
+                Err(e) => panic!("unexpected: {e:?}"),
+            }
+        };
+        assert!(filled, "could not fill the file");
+        eprintln!("  file full after {} rows", i - 2);
+
+        // THE QUESTION: can the documented recovery even start?
+        let r = crate::switch::set_frozen(&db, true);
+        eprintln!("  set_frozen on a full file -> {r:?}");
+        assert!(
+            r.is_ok(),
+            "freeze is step 1 of the ONLY escape from HALTED(db_full); if it \
+             cannot allocate, the escape is unreachable"
+        );
+        for p in [src, dest] { let _ = std::fs::remove_file(p); }
+    }
 }

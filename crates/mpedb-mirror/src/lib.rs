@@ -21,6 +21,7 @@ pub mod pg_export;
 pub mod pg_import;
 pub mod pg_track;
 pub mod push;
+pub mod regenerate;
 pub mod reconcile;
 pub mod resolve;
 pub mod sqlite;
@@ -48,6 +49,7 @@ pub use preflight::{
     apply_adaptations, preflight, AdaptMode, AdaptStats, Finding, FindingKind, PreflightReport,
 };
 pub use push::{push_batch, PushStats};
+pub use regenerate::{regenerate, RegenReport};
 pub use resolve::{resolve, ResolveStats, Take};
 
 pub use sourcecfg::SourceSpec;
