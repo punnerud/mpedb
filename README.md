@@ -117,6 +117,38 @@ Correctness is checked against the established engines, not just against itself:
   mpedb mirror roundtrip --source app.db
   ```
 
+## Performance
+
+Head-to-head against SQLite and PostgreSQL through one shared Rust measurement
+loop (each engine on its own fast path — mpedb's `execute(hash, …)`, prepared
+statements for the others). Full methodology and every cell are in
+[`BENCHMARKS.md`](BENCHMARKS.md) / the machine-generated
+[`crates/mpedb-bench/RESULTS.md`](crates/mpedb-bench/RESULTS.md).
+
+Single-client, embedded, none-class point ops on a 2-core Linux VM (2026-07-14):
+
+| op (none-class) | mpedb | SQLite | PostgreSQL |
+|---|--:|--:|--:|
+| point-select (PK), ops/s | **229,969** | 38,636 | 20,284 |
+| point-insert, ops/s | **54,499** | 19,197 | 13,074 |
+| point-update (PK), ops/s | **91,416** | 25,363 | 10,983 |
+
+mpedb leads embedded point ops (~3-11×; zero-parse plans + no IPC + a COW B+tree
+in-process) and lock-free reads under a live writer (~300k read ops/s at 2 µs
+p50). Its one weak spot is **single-client durable INSERT** — one fsync per commit
+with group-commit only under contention — so a lone durable writer trails SQLite
+and PostgreSQL; the answer is to batch in a `WriteSession` or use `wal`, where
+mpedb's batched durable insert (~89k ops/s) is the fastest of the three.
+
+```sh
+cargo run --release -p mpedb-bench      # full head-to-head (writes RESULTS.md)
+mpedb bench --auto --durability wal     # quick mpedb-only
+```
+
+> Numbers on a shared 2-core VM vary ~20-25% between runs by host load alone;
+> read the ratios, not the digits, and run one engine at a time for the cleanest
+> comparison.
+
 ## Mirroring & cross-database migration
 
 mpedb doubles as a **neutral staging hub between databases**. Because the sqlite
@@ -134,15 +166,26 @@ and PostgreSQL adapters both map through mpedb's common type model, you can:
 The full protocol — incremental diff-pull under concurrent source write load,
 write-back, and an epoch-fenced authority switch in both directions — is
 specified in [`DESIGN-MIRROR.md`](DESIGN-MIRROR.md) (v1.1, hardened against a
-58-finding adversarial review) and is being implemented in stages. Import plus
-round-trip export/diff work today:
+58-finding adversarial review). The end-to-end pipeline works today for both
+sqlite and PostgreSQL sources: import, incremental pull, write-back push (with
+source-wins write-write conflict detection), epoch-fenced authority switch in
+both directions, anti-entropy reconcile, and operator conflict tooling.
 
 ```sh
-mpedb mirror import    --source app.db --dest app.mpedb
-mpedb mirror export    --db app.mpedb  --dest out.db
-mpedb mirror roundtrip --source app.db      # import -> export -> diff
-mpedb mirror status    --db app.mpedb
+mpedb mirror import    --source app.db --dest app.mpedb   # snapshot + install change capture
+mpedb mirror pull      --source app.db --db app.mpedb     # apply source changes into mpedb
+mpedb mirror push      --source app.db --db app.mpedb     # write local changes back (echo-safe)
+mpedb mirror sync      --source app.db --db app.mpedb     # pull then push per authority
+mpedb mirror switch    --source app.db --db app.mpedb --to mpedb|source   # epoch-fenced cutover
+mpedb mirror conflicts --db app.mpedb [--clear]           # inspect parked conflicts
+mpedb mirror resolve   --source app.db --db app.mpedb --take source|local # operator override
+mpedb mirror roundtrip --source app.db                    # import -> export -> diff (fidelity)
 ```
+
+Crash-safety of the sync daemon is fuzzed with `mpedb mirror-collide`: source-
+writer processes churn the source while a mirror daemon is SIGKILLed at every
+instant; after the writers stop, a final drain must converge mpedb *exactly* to
+the source — no operation lost or duplicated across the kills.
 
 ## Design docs
 
