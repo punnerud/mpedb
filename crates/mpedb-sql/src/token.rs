@@ -40,6 +40,9 @@ pub(crate) enum Tok {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Kw {
+    /// Only `x IN (current_setting('k'))` in v1 — the context-membership form
+    /// (DESIGN-MULTIDB §2.6). General `IN (a, b, c)` is task #21.
+    In,
     Select,
     From,
     Where,
@@ -97,6 +100,7 @@ fn keyword(word: &str) -> Option<Kw> {
         "IS" => Kw::Is,
         "NULL" => Kw::Null,
         "LIKE" => Kw::Like,
+        "IN" => Kw::In,
         "TRUE" => Kw::True,
         "FALSE" => Kw::False,
         _ => return None,

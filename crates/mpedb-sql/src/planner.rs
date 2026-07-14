@@ -4,6 +4,13 @@
 //! precomputed footprint (DESIGN.md §7.3).
 
 use crate::ast::{self, BinOp};
+use std::collections::BTreeSet;
+
+/// What a `plan_*` helper hands back: the statement plan, the inferred parameter
+/// types, the session-context keys it referenced (in reserved-slot order), and
+/// the subset of those keys that are `IN` list slots (§2.6 — those have no
+/// scalar type, so the type-inference guard skips them).
+type PlannedStmt = (PlanStmt, Vec<Option<ColumnType>>, Vec<String>, BTreeSet<String>);
 use crate::binder::{compile_program, BExpr, Binder};
 use crate::plan::{render_program, AccessPath, CompiledPlan, InsertSource, PlanStmt, Projection};
 use crate::policy::{PolicyCatalog, TablePolicies};
@@ -209,10 +216,10 @@ pub(crate) fn plan_statement(
     catalog: &PolicyCatalog,
 ) -> Result<CompiledPlan> {
     let mut consts: Vec<Value> = Vec::new();
-    let (plan_stmt, param_types, context_keys) = match stmt {
-        ast::Stmt::Begin => (PlanStmt::Begin, vec![None; n_params as usize], Vec::new()),
-        ast::Stmt::Commit => (PlanStmt::Commit, vec![None; n_params as usize], Vec::new()),
-        ast::Stmt::Rollback => (PlanStmt::Rollback, vec![None; n_params as usize], Vec::new()),
+    let (plan_stmt, param_types, context_keys, list_keys) = match stmt {
+        ast::Stmt::Begin => (PlanStmt::Begin, vec![None; n_params as usize], Vec::new(), BTreeSet::new()),
+        ast::Stmt::Commit => (PlanStmt::Commit, vec![None; n_params as usize], Vec::new(), BTreeSet::new()),
+        ast::Stmt::Rollback => (PlanStmt::Rollback, vec![None; n_params as usize], Vec::new(), BTreeSet::new()),
         ast::Stmt::Select(s) => plan_select(s, schema, n_params, catalog, &mut consts)?,
         ast::Stmt::Insert(s) => plan_insert(s, schema, n_params, catalog, &mut consts)?,
         ast::Stmt::Update(s) => plan_update(s, schema, n_params, catalog, &mut consts)?,
@@ -224,6 +231,13 @@ pub(crate) fn plan_statement(
     // clear message rather than failing opaquely later (fail closed).
     let n_user = param_types.len() - context_keys.len();
     for (p, key) in context_keys.iter().enumerate() {
+        // A list slot (§2.6) has no scalar type by construction — `IN` checks
+        // membership, it does not unify with a column type — so the
+        // type-inference requirement does not apply to it. Its wrong-type case
+        // is caught instead when `in_list_3vl` refuses a non-list value.
+        if list_keys.contains(key) {
+            continue;
+        }
         if param_types[n_user + p].is_none() {
             return Err(bind_err(format!(
                 "cannot infer the type of current_setting('{key}'); \
@@ -275,7 +289,7 @@ fn plan_select(
     n_params: u16,
     catalog: &PolicyCatalog,
     consts: &mut Vec<Value>,
-) -> Result<(PlanStmt, Vec<Option<ColumnType>>, Vec<String>)> {
+) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
     let mut binder = Binder::new(table, n_params, true);
     let bound_where = s
@@ -336,7 +350,7 @@ fn plan_select(
         order_by.clear();
     }
 
-    let (param_types, context_keys) = binder.into_parts();
+    let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
         PlanStmt::Select {
             table: table_id,
@@ -349,6 +363,7 @@ fn plan_select(
         },
         param_types,
         context_keys,
+        list_keys,
     ))
 }
 
@@ -358,7 +373,7 @@ fn plan_insert(
     n_params: u16,
     catalog: &PolicyCatalog,
     consts: &mut Vec<Value>,
-) -> Result<(PlanStmt, Vec<Option<ColumnType>>, Vec<String>)> {
+) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
     let mut binder = Binder::new(table, n_params, true);
 
@@ -459,7 +474,7 @@ fn plan_insert(
     let with_check = write_check(&mut binder, catalog, table_id, &table.name, PolicyCmd::Insert)?
         .map(|b| compile_program(&b))
         .transpose()?;
-    let (param_types, context_keys) = binder.into_parts();
+    let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
         PlanStmt::Insert {
             table: table_id,
@@ -468,6 +483,7 @@ fn plan_insert(
         },
         param_types,
         context_keys,
+        list_keys,
     ))
 }
 
@@ -477,7 +493,7 @@ fn plan_update(
     n_params: u16,
     catalog: &PolicyCatalog,
     consts: &mut Vec<Value>,
-) -> Result<(PlanStmt, Vec<Option<ColumnType>>, Vec<String>)> {
+) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
     let mut binder = Binder::new(table, n_params, true);
 
@@ -516,7 +532,7 @@ fn plan_update(
     let with_check = write_check(&mut binder, catalog, table_id, &table.name, PolicyCmd::Update)?
         .map(|b| compile_program(&b))
         .transpose()?;
-    let (param_types, context_keys) = binder.into_parts();
+    let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
         PlanStmt::Update {
             table: table_id,
@@ -527,6 +543,7 @@ fn plan_update(
         },
         param_types,
         context_keys,
+        list_keys,
     ))
 }
 
@@ -536,7 +553,7 @@ fn plan_delete(
     n_params: u16,
     catalog: &PolicyCatalog,
     consts: &mut Vec<Value>,
-) -> Result<(PlanStmt, Vec<Option<ColumnType>>, Vec<String>)> {
+) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
     let mut binder = Binder::new(table, n_params, true);
     let bound_where = s
@@ -547,7 +564,7 @@ fn plan_delete(
     let policy = read_policy(&mut binder, catalog, table_id, &table.name, PolicyCmd::Delete)?;
     let (access, residual) = extract_access(merge_and(bound_where, policy), table, consts)?;
     let filter = residual.map(|e| compile_program(&e)).transpose()?;
-    let (param_types, context_keys) = binder.into_parts();
+    let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
         PlanStmt::Delete {
             table: table_id,
@@ -556,6 +573,7 @@ fn plan_delete(
         },
         param_types,
         context_keys,
+        list_keys,
     ))
 }
 

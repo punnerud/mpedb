@@ -23,6 +23,8 @@ pub(crate) enum BExpr {
     Binary(BinOp, Box<BExpr>, Box<BExpr>),
     /// LHS LIKE 'pattern' (pattern is always a literal in Phase 1).
     Like(Box<BExpr>, String),
+    /// `LHS IN (<context list at reserved param n>)` (DESIGN-MULTIDB §2.6).
+    InParam(Box<BExpr>, u16),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -49,6 +51,11 @@ pub(crate) struct Binder<'a> {
     /// Distinct session-context keys, in first-reference order; index `p` maps
     /// to reserved parameter `n_user_params + p`.
     ctx_keys: Vec<String>,
+    /// The subset of `ctx_keys` whose slot holds a [`Value::List`] for an `IN`
+    /// membership test (§2.6). A list slot has no `ColumnType`, so it cannot
+    /// unify with a scalar use of the same key — keeping the set explicit is
+    /// what lets both bind arms reject that mix instead of silently picking one.
+    ctx_list_keys: std::collections::BTreeSet<String>,
     allow_params: bool,
     allow_context: bool,
 }
@@ -64,6 +71,7 @@ impl<'a> Binder<'a> {
             param_types: vec![None; n_params as usize],
             n_user_params: n_params,
             ctx_keys: Vec::new(),
+            ctx_list_keys: std::collections::BTreeSet::new(),
             allow_params,
             // `current_setting()` is allowed wherever caller params are (queries
             // and, later, policy predicates); disallowed in CHECK constraints.
@@ -75,8 +83,12 @@ impl<'a> Binder<'a> {
     /// params followed by the reserved context slots, in `ctx_keys` order) and
     /// the distinct session-context keys. Slot `p` is parameter index
     /// `n_user_params + p`, with type `param_types[n_user_params + p]`.
-    pub fn into_parts(self) -> (Vec<Ty>, Vec<String>) {
-        (self.param_types, self.ctx_keys)
+    /// `(param_types, context_keys, list_context_keys)`. The third is the subset
+    /// of keys whose slot holds a [`Value::List`] for an `IN` test (§2.6): those
+    /// legitimately have NO scalar `Ty`, so the planner's "every context slot
+    /// must be type-inferable" guard has to know to skip them.
+    pub fn into_parts(self) -> (Vec<Ty>, Vec<String>, std::collections::BTreeSet<String>) {
+        (self.param_types, self.ctx_keys, self.ctx_list_keys)
     }
 
     /// Bind a WHERE predicate: must type to bool (or NULL).
@@ -206,6 +218,12 @@ impl<'a> Binder<'a> {
                 // caller params. The value is filled from the session at exec;
                 // the type is inferred exactly like a bare parameter (unified
                 // from whatever it is compared to).
+                if self.ctx_list_keys.contains(key) {
+                    return Err(bind_err(format!(
+                        "session key `{key}` is used both as an IN list and as a scalar; \
+                         a context slot is one or the other"
+                    )));
+                }
                 let pos = match self.ctx_keys.iter().position(|k| k == key) {
                     Some(p) => p,
                     None => {
@@ -220,6 +238,36 @@ impl<'a> Binder<'a> {
                 };
                 let idx = self.n_user_params + pos as u16;
                 Ok((BExpr::Param(idx), self.param_types[idx as usize]))
+            }
+            ast::Expr::InContext(lhs, key) => {
+                if !self.allow_context {
+                    return Err(bind_err("current_setting() is not allowed in this expression"));
+                }
+                let (l, _lt) = self.bind_expr(lhs)?;
+                // The slot holds a LIST, which has no ColumnType — so it can
+                // never unify with a scalar use of the same key. Reject that
+                // outright: one slot cannot be both, and silently picking one
+                // would make `k` mean different things in two conjuncts of the
+                // same policy.
+                if let Some(p) = self.ctx_keys.iter().position(|k| k == key) {
+                    let idx = self.n_user_params as usize + p;
+                    if !self.ctx_list_keys.contains(key) {
+                        return Err(bind_err(format!(
+                            "session key `{key}` is used both as a scalar and as an IN list;                              a context slot is one or the other"
+                        )));
+                    }
+                    return Ok((BExpr::InParam(Box::new(l), idx as u16), Some(ColumnType::Bool)));
+                }
+                let idx = self.n_user_params as usize + self.ctx_keys.len();
+                if idx >= u16::MAX as usize {
+                    return Err(bind_err("too many parameters (including session context)"));
+                }
+                self.ctx_keys.push(key.clone());
+                self.ctx_list_keys.insert(key.clone());
+                // `None` = "no scalar column type": resolve_params keys off
+                // ctx_list_keys to know a List belongs here.
+                self.param_types.push(None);
+                Ok((BExpr::InParam(Box::new(l), idx as u16), Some(ColumnType::Bool)))
             }
             ast::Expr::Binary(op, l, r) => self.bind_binary(*op, l, r),
         }
@@ -323,6 +371,8 @@ pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
             matches!(a.as_ref(), BExpr::Const(_)) && matches!(b.as_ref(), BExpr::Const(_))
         }
         BExpr::Like(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
+        // Never foldable: the list is a session value, not a literal.
+        BExpr::InParam(..) => false,
         _ => false,
     };
     if !foldable {
@@ -383,6 +433,10 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
             emit(a, instrs, consts)?;
             let idx = push_const(consts, Value::Text(pattern.clone()))?;
             instrs.push(Instr::Like(idx));
+        }
+        BExpr::InParam(a, idx) => {
+            emit(a, instrs, consts)?;
+            instrs.push(Instr::InParam(*idx));
         }
     }
     Ok(())

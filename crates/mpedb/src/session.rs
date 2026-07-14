@@ -38,6 +38,32 @@ impl Session {
         self
     }
 
+    /// Bind a **membership set** for `col IN (current_setting(key))`
+    /// (DESIGN-MULTIDB.md §2.6) — e.g. the orgs this principal belongs to.
+    ///
+    /// The arity lives here, in the data: one compiled plan serves a caller in
+    /// one org and a caller in fifty, because the list never enters the plan
+    /// bytes or its hash (§4.1).
+    ///
+    /// An EMPTY set is legal and means "belongs to nothing": `IN ()` is FALSE,
+    /// so every row is denied — cleanly, not as UNKNOWN. Nested lists are
+    /// rejected: a membership set is flat by construction, and nothing
+    /// downstream should have to reason about lists of lists.
+    pub fn set_list(
+        &mut self,
+        key: impl Into<String>,
+        values: impl IntoIterator<Item = Value>,
+    ) -> Result<&mut Session> {
+        let items: Vec<Value> = values.into_iter().collect();
+        if items.iter().any(|v| matches!(v, Value::List(_))) {
+            return Err(Error::TypeMismatch(
+                "a session context list must be flat: nested lists are not supported".into(),
+            ));
+        }
+        self.ctx.insert(key.into(), Value::List(items));
+        Ok(self)
+    }
+
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.ctx.get(key)
     }
@@ -113,7 +139,7 @@ pub(crate) fn resolve_params(
 mod tests {
     use super::Session;
     use crate::{Database, ExecResult};
-    use mpedb_types::{Config, Value};
+    use mpedb_types::{Config, Error, Value};
 
     fn db(tag: &str) -> Database {
         let path = format!("/dev/shm/mpedb-sess-{tag}-{}.mpedb", std::process::id());
@@ -240,5 +266,154 @@ mod tests {
         assert_eq!(affected, ExecResult::Affected(1)); // only tenant 5 (snapshot)
         w.commit().unwrap();
         db.verify().unwrap();
+    }
+
+    // ---- §2.6 `col IN (current_setting('k'))` end to end ----
+
+    fn seed_orgs(db: &Database) {
+        for (id, t) in [(1, 10), (2, 20), (3, 30), (4, 40)] {
+            db.query(
+                "INSERT INTO orders (id, tenant, note) VALUES ($1, $2, NULL)",
+                &[Value::Int(id), Value::Int(t)],
+            )
+            .unwrap();
+        }
+    }
+
+    fn ids(r: ExecResult) -> Vec<i64> {
+        match r {
+            ExecResult::Rows { rows, .. } => rows
+                .iter()
+                .map(|r| match r[0] {
+                    Value::Int(i) => i,
+                    _ => panic!("expected int id"),
+                })
+                .collect(),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn in_context_list_filters_by_membership() {
+        let db = db("in-basic");
+        seed_orgs(&db);
+        let sql = "SELECT id FROM orders WHERE tenant IN (current_setting('app.orgs')) ORDER BY id";
+
+        let mut s = Session::empty();
+        s.set_list("app.orgs", [Value::Int(10), Value::Int(30)]).unwrap();
+        assert_eq!(ids(db.query_ctx(&s, sql, &[]).unwrap()), vec![1, 3]);
+
+        // a different membership set, SAME statement
+        let mut s2 = Session::empty();
+        s2.set_list("app.orgs", [Value::Int(40)]).unwrap();
+        assert_eq!(ids(db.query_ctx(&s2, sql, &[]).unwrap()), vec![4]);
+
+        // empty set = belongs to nothing = denies cleanly
+        let mut s3 = Session::empty();
+        s3.set_list("app.orgs", []).unwrap();
+        assert!(ids(db.query_ctx(&s3, sql, &[]).unwrap()).is_empty());
+
+        let _ = std::fs::remove_file(db.path());
+    }
+
+    /// THE design property (§4.1/§2.6): arity lives in the data, so one
+    /// content-hashed plan serves a caller in one org and a caller in fifty.
+    /// If the list ever leaked into the plan bytes this would mint a plan per
+    /// distinct membership set — the exact explosion §2.6 exists to avoid.
+    #[test]
+    fn one_plan_serves_every_membership_set() {
+        let db = db("in-oneplan");
+        seed_orgs(&db);
+        let sql = "SELECT id FROM orders WHERE tenant IN (current_setting('app.orgs'))";
+        let h1 = db.prepare(sql).unwrap();
+        let h2 = db.prepare(sql).unwrap();
+        assert_eq!(h1, h2);
+
+        let mut small = Session::empty();
+        small.set_list("app.orgs", [Value::Int(10)]).unwrap();
+        let mut big = Session::empty();
+        big.set_list("app.orgs", (0..50).map(Value::Int)).unwrap();
+
+        // both execute the SAME prepared hash
+        assert_eq!(ids(db.execute_ctx(&small, &h1, &[]).unwrap()), vec![1]);
+        assert_eq!(ids(db.execute_ctx(&big, &h1, &[]).unwrap()), vec![1, 2, 3, 4]);
+        let _ = std::fs::remove_file(db.path());
+    }
+
+    /// 3VL reaches the query layer: a NULL in the set means "maybe", and a
+    /// filter needs exactly TRUE, so non-matching rows stay hidden rather than
+    /// being reported as definitely-absent.
+    #[test]
+    fn in_context_null_element_denies_non_matching_rows() {
+        let db = db("in-null");
+        seed_orgs(&db);
+        let sql = "SELECT id FROM orders WHERE tenant IN (current_setting('app.orgs')) ORDER BY id";
+        let mut s = Session::empty();
+        s.set_list("app.orgs", [Value::Int(10), Value::Null]).unwrap();
+        // 10 matches outright; the rest are UNKNOWN (the NULL might have been
+        // them) and UNKNOWN is not visible.
+        assert_eq!(ids(db.query_ctx(&s, sql, &[]).unwrap()), vec![1]);
+        let _ = std::fs::remove_file(db.path());
+    }
+
+    #[test]
+    fn in_context_missing_key_is_a_hard_error() {
+        let db = db("in-missing");
+        seed_orgs(&db);
+        let r = db.query_ctx(
+            &Session::empty(),
+            "SELECT id FROM orders WHERE tenant IN (current_setting('app.orgs'))",
+            &[],
+        );
+        assert!(matches!(r, Err(Error::Bind(_))), "got {r:?}");
+        let _ = std::fs::remove_file(db.path());
+    }
+
+    /// A scalar where a list belongs is a hard error, not a silent deny — a
+    /// silent deny would look exactly like "this principal owns nothing".
+    #[test]
+    fn in_context_with_a_scalar_value_errors() {
+        let db = db("in-scalar");
+        seed_orgs(&db);
+        let mut s = Session::empty();
+        s.set("app.orgs", Value::Int(10));
+        let r = db.query_ctx(
+            &s,
+            "SELECT id FROM orders WHERE tenant IN (current_setting('app.orgs'))",
+            &[],
+        );
+        assert!(matches!(r, Err(Error::TypeMismatch(_))), "got {r:?}");
+        let _ = std::fs::remove_file(db.path());
+    }
+
+    /// One context slot cannot be both a scalar and a list: it would make the
+    /// same key mean two things in one statement.
+    #[test]
+    fn a_key_used_as_both_scalar_and_list_is_rejected_at_prepare() {
+        let db = db("in-mixed");
+        let r = db.prepare(
+            "SELECT id FROM orders WHERE tenant IN (current_setting('k')) AND id = current_setting('k')",
+        );
+        assert!(matches!(&r, Err(Error::Bind(m)) if m.contains("one or the other")), "got {r:?}");
+        let _ = std::fs::remove_file(db.path());
+    }
+
+    /// Until task #21 lands general IN, the unsupported form must say so.
+    #[test]
+    fn literal_in_list_is_rejected_with_a_useful_message() {
+        let db = db("in-literal");
+        let r = db.prepare("SELECT id FROM orders WHERE tenant IN (1, 2)");
+        assert!(
+            matches!(&r, Err(Error::Parse { msg, .. }) if msg.contains("current_setting")),
+            "got {r:?}"
+        );
+        let _ = std::fs::remove_file(db.path());
+    }
+
+    #[test]
+    fn set_list_rejects_nesting() {
+        let mut s = Session::empty();
+        let r = s.set_list("k", [Value::List(vec![Value::Int(1)])]);
+        assert!(matches!(r, Err(Error::TypeMismatch(_))), "got {r:?}");
     }
 }
