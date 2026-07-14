@@ -390,6 +390,27 @@ Six phases, each independently shippable and testable. **Phases 1–2 touch noth
 - Tests: process-B policy edit ⇒ process-A cache-hit re-prepares; old-snapshot reader keeps old policy+old plan; detached stale blob rejected; hostile-blob-with-current-hash *documented* as not closed.
 
 ### Phase 6 — Hardening & completeness (v2; no protocol touch)
+
+**Status 2026-07-14: 6.1–6.3 done** (`require_policy` fail-closed §6.3;
+constraint-error normalization §6.5 via `Error::WriteRejected`; tenant-leading-key
+lint §6.4 via `policy_discriminators` + `Database::lint_policy`, surfaced as rows
+from `CREATE POLICY`). §6.6 (policy-named, non-source-echoing violation) shipped
+back in Phase 4. **Remaining: array-typed context §2.6, `WorkspaceTxn::
+commit_sequential_nonatomic` §1.5, optional stale-`plan/*` GC §4.5.**
+
+Two findings from building it, worth keeping:
+- `require_policy` had to live in `DbOptions`, not `TableDef`: `TableDef` feeds
+  `Schema::canonical_bytes()` → the file-frozen `schema_hash`, so declaring one
+  assertion would otherwise be a flag-day invalidating every existing file. It is
+  therefore honestly a **per-process deployment assertion**, not a file-wide
+  guarantee — consistent with cooperative RLS, and it still catches what it aims
+  at (the developer's own forgotten DDL, in their own build).
+- The §6.4 lint cannot recommend what §6.4 recommends for secondary uniques:
+  mpedb's are **single-column**, so a `unique` column on an RLS table can never
+  be tenant-scoped by key design. The lint says that outright (drop the
+  uniqueness, or move the data to its own table) rather than suggesting a
+  composite unique that cannot be written.
+
 - `crates/mpedb/src/lib.rs`: `WorkspaceTxn::commit_sequential_nonatomic()` with the corrected "arbitrary subset, no prefix/ordering guarantee" docs (§1.5).
 - `crates/mpedb-types/src/expr.rs` + planner: array-typed context `Value` + scalar **set-membership** op for `col ∈ ctx_list` (§2.6) so IN-list policies work without per-session plan explosion.
 - Tenant-leading-key **lint** at `CREATE POLICY` time (warn when a UNIQUE/PK does not lead with the policy discriminator, §6.4); constraint-error normalization + policy-named (non-source-echoing) policy-violation error (§6.5/§6.6).
