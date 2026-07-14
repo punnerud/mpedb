@@ -290,3 +290,64 @@ Select DISTINCT t
   access: FullScan
   project: dept
   footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Full
+
+# ---- ORDER BY by output position, and by an expression ------------------------------
+# `ORDER BY 1` is an ORDINAL — it names the first output column, not the
+# number 1. SQL's oldest wart, and both sqlite and PG have it.
+
+query TI nosort
+SELECT dept, amt FROM t ORDER BY 2, 1
+----
+eng
+NULL
+sales
+NULL
+sales
+NULL
+ops
+50
+eng
+100
+eng
+100
+eng
+200
+
+query TI nosort
+SELECT dept, amt FROM t ORDER BY 2 DESC, 1 LIMIT 2
+----
+eng
+200
+eng
+100
+
+# Out of range is an error, as in sqlite and PG. Silently ignoring it would
+# return an arbitrary order to a query that asked for a specific one.
+statement error out of range
+SELECT dept FROM t ORDER BY 5
+
+statement error out of range
+SELECT dept FROM t ORDER BY 0
+
+# Sorting by an expression that IS selected. This used to work only under
+# DISTINCT, which was an accident of how the sort was wired, not a rule.
+query I nosort
+SELECT amt * 2 FROM t WHERE amt IS NOT NULL ORDER BY amt * 2
+----
+100
+200
+200
+400
+
+# `ORDER BY 1 + 1` is NOT an ordinal — only a bare literal is. sqlite treats
+# it as a constant and leaves the rows unsorted; this refuses instead, as PG
+# does, rather than answer an ORDER BY with an arbitrary order.
+statement error ORDER BY
+SELECT dept, amt FROM t ORDER BY 1 + 1
+
+# Known gap, recorded rather than left to be rediscovered: sqlite and PG both
+# allow sorting by an expression that is NOT in the output. Here the sort runs
+# over the projection, so there is nowhere for such a key to live, and it is
+# refused with a message that says so.
+statement error SELECT list
+SELECT dept FROM t ORDER BY amt + 1

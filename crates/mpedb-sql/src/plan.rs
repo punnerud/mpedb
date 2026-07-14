@@ -25,7 +25,29 @@ use mpedb_types::{AggFn,
 ///    tag and desynchronize from there. It would most likely then fail some
 ///    later bounds check, but "most likely" is exactly what this byte exists to
 ///    replace with "always".
-const PLAN_FORMAT: u8 = 3;
+/// 4: `Select` encodes `order_over` before the `order_by` count.
+const PLAN_FORMAT: u8 = 4;
+
+/// Which tuple a `Select`'s `order_by` indexes.
+///
+/// Each stage of the pipeline produces a different tuple, and the sort runs
+/// against exactly one of them:
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OrderOver {
+    /// The BASE row, sorted before projection. The only variant that keeps the
+    /// PK-prefix elision and the streaming top-K path, both of which are about
+    /// scan order — so the planner prefers it whenever every key is a plain
+    /// column.
+    BaseRow,
+    /// The GROUPED tuple `[keys ‖ aggs]`. Lets a sort key be an aggregate that
+    /// is not selected (`ORDER BY count(*)`).
+    Grouped,
+    /// The PROJECTION, sorted last. Required when the sort must follow a dedup
+    /// (`DISTINCT`), and the only place a computed key like `ORDER BY amt * 2`
+    /// or an ordinal like `ORDER BY 1` can be named — no base-column index
+    /// refers to either.
+    Projection,
+}
 
 /// A compiled, content-addressed statement plan.
 #[derive(Debug, Clone, PartialEq)]
@@ -73,22 +95,15 @@ pub enum PlanStmt {
         filter: Option<ExprProgram>,
         /// Output columns, in order.
         projection: Vec<Projection>,
-        /// (column index, descending). Empty = scan order.
-        ///
-        /// **What the index refers to depends on the shape below it**, because
-        /// each stage sorts the tuple it produces:
-        ///
-        /// - plain: the BASE row — sorted before projection, which is what lets
-        ///   the PK-prefix elision and the top-K path work on scan order.
-        /// - `aggregate`: the GROUPED tuple `[keys ‖ aggs]` — a sort key may be
-        ///   an aggregate that is not selected (`ORDER BY count(*)`).
-        /// - `distinct`: the PROJECTION — the sort must follow the dedup, and
-        ///   `check_distinct_order_by` has already guaranteed every key is in
-        ///   the SELECT list, so an output position always exists (including
-        ///   for `ORDER BY amt * 2`, which no base-column index could name).
-        ///
-        /// `distinct` wins over `aggregate` when both are set.
+        /// (column index, descending). Empty = scan order. The index is into
+        /// the tuple named by `order_over` — never assume the base row.
         order_by: Vec<(u16, bool)>,
+        /// Which tuple `order_by` indexes, and therefore where in the pipeline
+        /// the sort runs. Explicit rather than inferred from `distinct` /
+        /// `aggregate`, because it is a decision the planner makes and the
+        /// decoder must bounds-check against the right width — inferring it
+        /// twice is how the two come to disagree.
+        order_over: OrderOver,
         limit: Option<u64>,
         offset: Option<u64>,
         /// Grouping, applied **after** `filter`. `None` = no aggregation.
@@ -438,11 +453,25 @@ impl CompiledPlan {
                 filter,
                 projection,
                 order_by,
+                order_over,
                 aggregate,
                 ..
             } => {
                 let t = get_table(*table)?;
                 self.check_access(access, t)?;
+                // The sort key is an index into whichever tuple `order_over`
+                // names, and those have different widths. Bounding it against
+                // the wrong one is not a style point: too LOOSE lets a hostile
+                // plan index past the tuple, and too TIGHT is worse than it
+                // sounds — `cmp_rows` skips a key it cannot fetch, so an
+                // out-of-range index silently drops the sort rather than
+                // failing, and the caller gets an unordered answer to an
+                // ORDER BY query.
+                let order_width = |projection_len: usize, grouped: Option<usize>| match order_over {
+                    OrderOver::BaseRow => t.columns.len(),
+                    OrderOver::Grouped => grouped.unwrap_or(0),
+                    OrderOver::Projection => projection_len,
+                };
                 if let Some(f) = filter {
                     self.check_program(f, t)?;
                 }
@@ -483,10 +512,10 @@ impl CompiledPlan {
                             }
                         }
                     }
-                    // ORDER BY also indexes the grouped tuple here.
+                    let w = order_width(projection.len(), Some(out_width));
                     for (c, _) in order_by {
-                        if *c as usize >= out_width {
-                            return Err(corrupt("order-by column out of the grouped tuple"));
+                        if *c as usize >= w {
+                            return Err(corrupt("order-by column out of range"));
                         }
                     }
                     return Ok(());
@@ -501,8 +530,14 @@ impl CompiledPlan {
                         Projection::Expr { program, .. } => self.check_program(program, t)?,
                     }
                 }
+                // A plain Select has no grouped tuple, so `OrderOver::Grouped`
+                // here is itself a malformed plan rather than a width question.
+                if *order_over == OrderOver::Grouped {
+                    return Err(corrupt("order-over grouped without an aggregate"));
+                }
+                let w = order_width(projection.len(), None);
                 for (c, _) in order_by {
-                    if *c as usize >= t.columns.len() {
+                    if *c as usize >= w {
                         return Err(corrupt("order-by column out of range"));
                     }
                 }
@@ -805,6 +840,7 @@ impl CompiledPlan {
                 filter,
                 projection,
                 order_by,
+                order_over,
                 limit,
                 offset,
                 aggregate,
@@ -865,10 +901,22 @@ impl CompiledPlan {
                     .collect();
                 out.push_str(&format!("  project: {}\n", cols.join(", ")));
                 if !order_by.is_empty() {
+                    // The sort key indexes the tuple `order_over` names, which
+                    // is not always the one `name` reads. Naming an output
+                    // position with a base-column name is the same lie EXPLAIN
+                    // told about `count(*)` before the grouped namer above.
+                    let sort_name = |c: u16| match order_over {
+                        OrderOver::Projection => cols
+                            .get(c as usize)
+                            .cloned()
+                            .unwrap_or_else(|| format!("col#{c}")),
+                        OrderOver::BaseRow => base(c),
+                        OrderOver::Grouped => name(c),
+                    };
                     let items: Vec<String> = order_by
                         .iter()
                         .map(|(c, desc)| {
-                            format!("{}{}", name(*c), if *desc { " DESC" } else { " ASC" })
+                            format!("{}{}", sort_name(*c), if *desc { " DESC" } else { " ASC" })
                         })
                         .collect();
                     out.push_str(&format!("  order by: {}\n", items.join(", ")));
@@ -1335,6 +1383,7 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             filter,
             projection,
             order_by,
+            order_over,
             limit,
             offset,
             aggregate,
@@ -1359,6 +1408,11 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
                     }
                 }
             }
+            buf.push(match order_over {
+                OrderOver::BaseRow => 0u8,
+                OrderOver::Grouped => 1,
+                OrderOver::Projection => 2,
+            });
             w_u16(buf, order_by.len() as u16);
             for (c, desc) in order_by {
                 w_u16(buf, *c);
@@ -1491,6 +1545,12 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                     t => return Err(corrupt(format!("bad projection tag {t}"))),
                 });
             }
+            let order_over = match r_u8(buf, pos)? {
+                0 => OrderOver::BaseRow,
+                1 => OrderOver::Grouped,
+                2 => OrderOver::Projection,
+                t => return Err(corrupt(format!("bad order-over tag {t}"))),
+            };
             let n_order = r_u16(buf, pos)? as usize;
             if n_order > crate::parser::MAX_ORDER_BY_ITEMS {
                 return Err(corrupt("too many order-by items in plan"));
@@ -1567,6 +1627,7 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                 filter,
                 projection,
                 order_by,
+                order_over,
                 limit,
                 offset,
                 aggregate,
@@ -1962,6 +2023,56 @@ mod tests {
         let mut evil = p.clone();
         evil.param_types.clear(); // n_params -> 0 on re-encode
         assert!(CompiledPlan::decode(&evil.encode(), &s).is_err());
+    }
+
+    /// A tampered blob whose sort key indexes past the tuple it claims to
+    /// order must be rejected at decode.
+    ///
+    /// This is why `order_over` is a field rather than something inferred from
+    /// `distinct`/`aggregate`: the decoder has to know WHICH tuple to bound
+    /// against, and the failure is quiet if it guesses wrong — `cmp_rows` skips
+    /// a key it cannot fetch, so an out-of-range index does not crash, it drops
+    /// the sort and answers an ORDER BY query in arbitrary order.
+    #[test]
+    fn order_by_index_is_bounded_against_the_tuple_it_orders() {
+        let s = test_schema();
+        // `SELECT DISTINCT email` projects ONE column but the table has more,
+        // so index 1 is in range for the base row and out of range for the
+        // projection. Bounding against the wrong one accepts this.
+        let p = prepare("SELECT DISTINCT email FROM users ORDER BY email", &s).unwrap();
+        match &p.stmt {
+            PlanStmt::Select {
+                order_over,
+                projection,
+                ..
+            } => {
+                assert_eq!(*order_over, OrderOver::Projection);
+                assert_eq!(projection.len(), 1);
+            }
+            _ => unreachable!(),
+        }
+        let mut evil = p.clone();
+        match &mut evil.stmt {
+            PlanStmt::Select { order_by, .. } => order_by[0].0 = 1,
+            _ => unreachable!(),
+        }
+        match CompiledPlan::decode(&evil.encode(), &s) {
+            Err(Error::Corrupt(m)) => assert!(m.contains("order-by column"), "{m}"),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+
+        // And a plain Select cannot claim to order a grouped tuple it has not
+        // got.
+        let p = prepare("SELECT id FROM users ORDER BY id", &s).unwrap();
+        let mut evil = p.clone();
+        match &mut evil.stmt {
+            PlanStmt::Select { order_over, .. } => *order_over = OrderOver::Grouped,
+            _ => unreachable!(),
+        }
+        match CompiledPlan::decode(&evil.encode(), &s) {
+            Err(Error::Corrupt(m)) => assert!(m.contains("grouped"), "{m}"),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
     }
 
     #[test]
