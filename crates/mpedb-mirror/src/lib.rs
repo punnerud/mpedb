@@ -12,11 +12,15 @@ pub mod adapter;
 pub mod apply;
 pub mod export;
 pub mod import;
+pub mod pg;
 pub mod reconcile;
 pub mod sqlite;
 pub mod sqlite_adapter;
 pub mod sqlite_track;
 pub mod state;
+
+#[cfg(test)]
+mod pg_harness;
 
 pub use reconcile::{check_source_not_restored, reconcile, ReconcileStats};
 pub use sqlite_adapter::SqliteAdapter;
