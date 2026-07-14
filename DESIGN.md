@@ -32,10 +32,24 @@ documents rather than solves in Phase 1.
 ## 2. Non-goals and platform assumptions (Phase 1)
 
 - No network protocol, replication, or multi-node.
-- SQL subset only: single-table SELECT/INSERT/UPDATE/DELETE, BEGIN/COMMIT/ROLLBACK,
-  EXPLAIN. No joins, no functions.
-- **Platform: 64-bit Linux only** (robust futex-backed mutexes, `/dev/shm`, 64-bit
-  atomics; u64 fields would tear on 32-bit). macOS/Windows later.
+- SQL subset only: **single-table** SELECT/INSERT/UPDATE/DELETE (+ ON CONFLICT,
+  RETURNING), BEGIN/COMMIT/ROLLBACK, EXPLAIN. Scalar expressions include IN,
+  BETWEEN, CASE and scalar functions (lower/upper/length/trim/abs/round/substr,
+  coalesce/ifnull/nullif) — the "no functions" this line used to say stopped
+  being true in 2026-07.
+- **No joins, no subqueries, no EXISTS, no cross-table references — and this is
+  load-bearing, not a backlog item.** The footprint describes exactly ONE table
+  (`tables_read`/`tables_written` are claimed at plan time and are what the
+  commit path groups conflicts by), and `ExprProgram` is single-row scalar. A
+  second-table read would silently under-claim the footprint and corrupt conflict
+  grouping (§5; DESIGN-MULTIDB §5.2, §6.4). The scaling answer is **more files,
+  not a wider footprint word**. Aggregates are the one planned addition, and they
+  carry their own invariant (DESIGN-MULTIDB §4).
+- **Platform: Linux (x86-64, 32/64-bit ARM) and macOS/Apple Silicon.** The macOS
+  port is the FLD-2 flock writer lock + `F_FULLFSYNC` durability barrier
+  (`crate::os`); it is crash-safe and benchmarked, not a stub. Windows later.
+  Single PID namespace; robust mutexes / flock locks do not survive reboot
+  (boot-id recovery in `post_attach`).
 - **Single PID namespace, single machine, local filesystem.** The lock area records the
   creator's PID-namespace inode (`/proc/self/ns/pid`) and boot id; attach from a
   different namespace or after reboot-with-live-file inconsistencies is refused with a

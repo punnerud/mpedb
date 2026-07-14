@@ -35,11 +35,21 @@ NOT NULL / UNIQUE / CHECK, and a schema that refuses to drift. The failures you
 would have met in production happen on your laptop, at the moment you write the
 bad row, while you are still looking at it.
 
-The mirror is the bridge rather than a rewrite. Point it at the sqlite3 database
-your tests already use, import it, and run the same suite against mpedb: whatever
-breaks was already broken — you just could not see it. That is also why the
-mirror runs in both directions and records what the source declared. Migration
-is a thing you validate, not a thing you hope about.
+The mirror is the bridge: point it at the sqlite3 database your tests already
+use, import it, and mpedb tells you what a strict target will reject — before
+PostgreSQL does, and without contacting PostgreSQL at all. It runs in both
+directions and records what the source declared, so migration is a thing you
+validate rather than hope about.
+
+**What it is not: a drop-in sqlite3.** Be clear-eyed about this before you plan
+around it. mpedb's SQL is deliberately a narrow, **single-table** subset — no
+joins, no subqueries, and (today) no aggregates, so a Django test suite fails on
+its first `COUNT(*)`. That is not a backlog; the footprint that makes the
+precomputed-lock design work describes exactly one table, and a second-table read
+would silently under-claim it and corrupt conflict grouping. The scaling answer
+is more files, not a wider footprint. Aggregates are the one planned addition.
+Today mpedb is a validation and staging tool in that workflow, not the thing your
+ORM talks to. See [SQL support](#sql-support) for the exact surface.
 
 This cuts both ways, and honestly so: hardening mpedb against real sqlite3
 databases is how mpedb gets hardened. Every dialect mismatch found by importing
@@ -166,6 +176,41 @@ Correctness is checked against the established engines, not just against itself:
   ```sh
   mpedb mirror roundtrip --source app.db
   ```
+
+## SQL support
+
+Verified against the binary, not remembered. mpedb compiles SQL once to a
+content-hashed plan; the surface is deliberately narrow, and the narrowness is
+the design rather than a todo list.
+
+| | mpedb | note |
+|---|---|---|
+| `SELECT … WHERE / ORDER BY / LIMIT / OFFSET` | ✅ | |
+| `INSERT` / `UPDATE` / `DELETE` | ✅ | |
+| `ON CONFLICT DO NOTHING / DO UPDATE` + `excluded.` | ✅ | target must be the PK |
+| `RETURNING` | ✅ | on all three verbs |
+| `IN` / `NOT IN`, `BETWEEN`, `CASE`, `LIKE`, `IS [NOT] NULL` | ✅ | full SQL 3VL |
+| `lower upper length trim abs round substr coalesce ifnull nullif` | ✅ | `coalesce` is lazy |
+| `<table>.<column>` qualifiers | ✅ | checked, not ignored |
+| **`COUNT` / `SUM` / `AVG` / `MIN` / `MAX`, `GROUP BY`** | ❌ | **planned** — the one intended addition |
+| **`JOIN`, subqueries, `EXISTS`, cross-table refs** | ❌ | **by design, permanently** — see below |
+| **`DISTINCT`** | ❌ | not yet |
+| **`CREATE TABLE` / `ALTER`** | ❌ | **by design** — schema comes from the config or `mirror import`; see [DESIGN-MIRROR §7](DESIGN-MIRROR.md) |
+
+**Why no joins, and why that will not change.** Every plan carries a *footprint*
+naming exactly which tables and keys it touches, claimed before it runs — that is
+what makes `execute(hash, params)` cheap and what the commit path groups conflicts
+by. A second-table read would silently under-claim the footprint and corrupt that
+grouping. So the answer to "I need two tables" is **more files, not a wider
+footprint word**: separate files are separate writer locks, which is also the only
+OS-enforced isolation boundary here. If you need joins, you need PostgreSQL — and
+mpedb's job is to get you there safely, not to replace it.
+
+**Why no `CREATE TABLE`.** A table's id is its index in the name-sorted table
+vector, and that id keys the catalog's B+tree roots, the CDC capture bitmap, and
+the mirror's per-table state. Adding `accounts` to a database holding `orders` and
+`users` would renumber both and point `accounts` at `orders`' rows. Schema change
+is therefore a *rebuild* (`mirror regenerate`), not an in-place edit.
 
 ## Performance
 
