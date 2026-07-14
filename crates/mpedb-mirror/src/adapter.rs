@@ -75,10 +75,27 @@ pub trait SourceAdapter {
     /// Apply local mpedb changes back to the source (write-back, §6): each
     /// `NetOp` is an upsert (full row image) or delete by PK. The adapter applies
     /// them in ONE source transaction and tags its own writes so they are
-    /// filtered out of the next pull (echo suppression). Conflict resolution
-    /// (source concurrently changed the same PK) is layered in M7; v1 push is
-    /// last-writer-wins from mpedb.
+    /// filtered out of the next pull (echo suppression). Unconditional
+    /// last-writer-wins from mpedb — used when mpedb holds authority (S6/S7,
+    /// local-wins). Conflict-aware write-back is [`push_checked`].
     fn push(&mut self, ops: &[NetOp]) -> Result<()>;
+
+    /// Conflict-aware write-back (§6, source-authoritative / source-wins). Within
+    /// ONE source transaction, applies each op only if the source has NOT changed
+    /// that PK since `from` (excluding this mirror's own echoes); a PK the source
+    /// touched in `(from, now]` is a write-write conflict and is left un-applied
+    /// (source wins). Uses lock-then-check: sqlite's single writer (BEGIN
+    /// IMMEDIATE) makes check-then-write sound; PG takes the row lock, then tests
+    /// the xid-window changelog (CONF#11/27).
+    ///
+    /// Returns a vector index-aligned to `ops`: `true` = applied, `false` =
+    /// rejected because the source concurrently won. The default falls back to
+    /// unconditional [`push`] (all applied) for adapters without a changelog.
+    fn push_checked(&mut self, from: &Cursor, ops: &[NetOp]) -> Result<Vec<bool>> {
+        let _ = from;
+        self.push(ops)?;
+        Ok(vec![true; ops.len()])
+    }
 
     // ---- authority-switch fence (DESIGN-MIRROR §7) ----
 

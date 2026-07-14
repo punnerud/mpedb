@@ -134,8 +134,15 @@ fn cmd_pull(argv: &[String]) -> CliResult {
 fn cmd_push(argv: &[String]) -> CliResult {
     let p = args::parse(argv, &["source", "db"], &[])?;
     let (db, mut a) = open_sqlite(p.require("db")?, p.require("source")?)?;
-    let n = drain_push(&db, &mut a)?;
-    println!("pushed {n} row change(s) to the source");
+    let s = drain_push(&db, &mut a)?;
+    println!("pushed {} row change(s) to the source", s.upserts + s.deletes);
+    if s.conflicts > 0 {
+        println!(
+            "{} change(s) parked (the source concurrently won) — run `pull` to \
+             resolve source-wins, or `conflicts` to inspect",
+            s.conflicts
+        );
+    }
     Ok(())
 }
 
@@ -148,8 +155,12 @@ fn cmd_sync(argv: &[String]) -> CliResult {
     } else {
         0 // mpedb-authoritative: the source is a stale replica, do not pull
     };
-    let pushed = drain_push(&db, &mut a)?;
-    println!("sync: pulled {pulled}, pushed {pushed} (authority: {auth:?})");
+    let s = drain_push(&db, &mut a)?;
+    println!(
+        "sync: pulled {pulled}, pushed {}, parked {} (authority: {auth:?})",
+        s.upserts + s.deletes,
+        s.conflicts
+    );
     Ok(())
 }
 

@@ -92,18 +92,22 @@ pub fn drain_pull<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<u6
     Ok(applied)
 }
 
-/// Push until the local dirty-set is empty. Returns rows pushed.
-pub fn drain_push<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<u64> {
-    let mut pushed = 0u64;
+/// Push until no further progress is made. Returns the aggregate: `upserts` +
+/// `deletes` summed across rounds, and `conflicts` = the stable set left parked
+/// (source-won write-write conflicts whose dirty entries persist for the next
+/// pull to resolve — so they never advance and the loop stops on them).
+pub fn drain_push<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<crate::push::PushStats> {
+    let mut total = crate::push::PushStats::default();
     loop {
         let s = push_batch(db, adapter)?;
-        let n = s.upserts + s.deletes;
-        if n == 0 {
+        total.upserts += s.upserts;
+        total.deletes += s.deletes;
+        total.conflicts = s.conflicts; // persist across rounds → report the final count
+        if s.upserts + s.deletes == 0 {
             break;
         }
-        pushed += n;
     }
-    Ok(pushed)
+    Ok(total)
 }
 
 fn set_epoch(db: &Database, epoch: state::Epoch) -> Result<()> {
