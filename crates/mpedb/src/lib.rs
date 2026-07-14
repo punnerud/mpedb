@@ -44,7 +44,7 @@ mod workspace;
 pub use session::Session;
 pub use shard::ShardSet;
 pub use stream::RowStream;
-pub use workspace::{Workspace, WsPlan};
+pub use workspace::{Workspace, WorkspaceTxn, WsPlan};
 
 pub use mpedb_types::{
     ColumnDef, ColumnType, Config, DbOptions, Durability, Error, PlanHash, PolicyCmd, PolicyDef,
