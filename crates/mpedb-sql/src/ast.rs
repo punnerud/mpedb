@@ -88,4 +88,13 @@ pub(crate) enum Expr {
     /// (DESIGN-MULTIDB.md §2.1). The value never enters the plan bytes, so one
     /// content-hashed plan serves every session.
     ContextRef(String),
+    /// `<expr> IN (current_setting('key'))` — membership in a session-context
+    /// list (DESIGN-MULTIDB.md §2.6). The key binds to ONE reserved param
+    /// holding a [`mpedb_types::Value::List`], so the arity of the caller's
+    /// membership set never reaches the plan bytes.
+    ///
+    /// Deliberately its own node rather than `Binary(In, e, ContextRef)`: the
+    /// right-hand side is not an expression that evaluates to a value on the
+    /// stack, it is a param slot the InParam instruction reads directly.
+    InContext(Box<Expr>, String),
 }

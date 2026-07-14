@@ -617,6 +617,32 @@ impl<'a> Parser<'a> {
                 seen_cmp = true;
                 continue;
             }
+            // `x IN (current_setting('k'))` — the ONLY IN form in v1 (§2.6).
+            // General `IN (a, b, c)` is task #21; until it exists, anything else
+            // after IN is rejected with a message that says so rather than a
+            // bare parse error, because `IN (1, 2)` is the obvious thing to try.
+            if !seen_cmp && self.peek_kw(Kw::In) {
+                self.pos += 1;
+                self.expect(&Tok::LParen, "`(` after IN")?;
+                let inner = self.expr()?;
+                // Check for a comma BEFORE demanding `)`, or `IN (1, 2)` — the
+                // obvious thing to try — reports "expected `)`", which explains
+                // nothing about why it is unsupported.
+                let unsupported = "IN currently supports only `IN (current_setting('key'))` — \
+                     a session-context list (DESIGN-MULTIDB §2.6); literal IN lists are not \
+                     implemented yet";
+                if self.peek() == Some(&Tok::Comma) {
+                    return Err(self.err_here(unsupported));
+                }
+                self.expect(&Tok::RParen, "`)` closing IN")?;
+                let key = match inner {
+                    Expr::ContextRef(k) => k,
+                    _ => return Err(self.err_here(unsupported)),
+                };
+                e = Expr::InContext(Box::new(e), key);
+                seen_cmp = true;
+                continue;
+            }
             let op = match self.peek() {
                 Some(Tok::Eq) => BinOp::Eq,
                 Some(Tok::Ne) => BinOp::Ne,
