@@ -18,6 +18,56 @@ SQL is compiled **once** into a content-hashed plan; the hot path is
 footprints ("pre-computed locks", Calvin-style), so the engine knows which
 tables and keys a statement touches before it runs.
 
+## Why this exists
+
+The common local-development setup is a lie you find out about in production.
+You develop a Django app against sqlite3 because it is a file — instant to
+create, trivial to snapshot (`cp`), trivial to throw away, and it costs nothing
+while idle. Then you deploy to PostgreSQL, and the parts sqlite never enforced
+show up at once: a string that quietly lived in an integer column, a value that
+overflowed `int4`, a constraint that was decoration locally and a hard error in
+prod. The convenience of the local database is bought with the correctness of
+the real one, and the bill arrives late.
+
+mpedb is aimed at that gap: **sqlite's operational model with PostgreSQL's
+strictness**. A file you can copy, no daemon, no idle cost — but typed columns,
+NOT NULL / UNIQUE / CHECK, and a schema that refuses to drift. The failures you
+would have met in production happen on your laptop, at the moment you write the
+bad row, while you are still looking at it.
+
+The mirror is the bridge rather than a rewrite. Point it at the sqlite3 database
+your tests already use, import it, and run the same suite against mpedb: whatever
+breaks was already broken — you just could not see it. That is also why the
+mirror runs in both directions and records what the source declared. Migration
+is a thing you validate, not a thing you hope about.
+
+This cuts both ways, and honestly so: hardening mpedb against real sqlite3
+databases is how mpedb gets hardened. Every dialect mismatch found by importing
+someone's messy production data is a bug found before a migration, not during
+one. (One is documented in the mirror section below: mpedb's own pre-flight
+shipped reading sqlite schemas with PostgreSQL's rules — exactly the class of
+error this project exists to catch, found by pointing it at the other dialect.)
+
+**Snapshot and roll back with `cp`.** A `.mpedb` is one self-describing file —
+the schema lives inside it, so a copy is a complete, independent database:
+
+```sh
+cp app.mpedb app.snap                     # snapshot
+pytest                                    # let the suite do its worst
+cp app.snap app.mpedb                     # roll back, instantly
+```
+
+Two honest caveats. Copy while **no process is attached and writing** — a live
+`mmap`ed file can be caught mid-commit, exactly as with sqlite. And in `wal`
+durability the `-wal` sidecar is part of the database: copy both, or neither.
+
+**Where this is going.** The long-term ambition is to match PostgreSQL's
+guarantees while keeping sqlite's simplicity — and to be good at the work that
+actually happens now: data-science and AI pipelines, where a dataset gets read
+by many processes at once, versioned, branched, and thrown away. Lock-free
+readers, snapshot isolation, and single-file databases are a better fit for that
+than either ancestor. It is not there yet; see Status.
+
 > ⚠️ **Status: personal research project.** Crash-safe on Linux (x86-64 and
 > 32/64-bit ARM) and macOS/Apple Silicon — see [Platforms](#platforms). The
 > design has been through multiple adversarial review rounds (see the
