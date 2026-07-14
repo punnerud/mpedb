@@ -125,34 +125,37 @@ statements for the others). Full methodology and every cell are in
 [`BENCHMARKS.md`](BENCHMARKS.md) / the machine-generated
 [`crates/mpedb-bench/RESULTS.md`](crates/mpedb-bench/RESULTS.md).
 
-Single-client, embedded, none-class point ops on a 2-core Linux VM (2026-07-14):
+Single-client, embedded, none-class point ops on an idle 2-core Linux VM (2026-07-14):
 
 | op (none-class) | mpedb | SQLite | PostgreSQL |
 |---|--:|--:|--:|
-| point-select (PK), ops/s | **291,116** | 53,698 | 24,519 |
-| point-insert, ops/s | **96,519** | 26,973 | 15,874 |
-| point-update (PK), ops/s | **112,292** | 30,311 | 13,951 |
+| point-select (PK), ops/s | **469,777** | 80,145 | 21,638 |
+| point-insert, ops/s | **165,142** | 41,555 | 13,749 |
+| point-update (PK), ops/s | **201,638** | 46,214 | 11,058 |
 
-mpedb leads embedded point ops (~3.6-12×; zero-parse plans + no IPC + a COW
-B+tree in-process). Under a live writer its readers stay lock-free (344k read
-ops/s at 2 µs p50) — though SQLite's WAL readers match that in this
-single-process cell (345k); mpedb's structural edge is multi-*process* readers
-and cross-process shared plans, which this cell does not exercise. Durable
-writes: `wal` leads both single-client (2,598 vs SQLite 1,601 / PG 2,232) and
-batched 100/commit (**105k** vs 76k / 19k). The weak cell is
-`durability=commit` single-client (525 ops/s) — every commit msyncs with no
-batching partner; use `wal`.
+mpedb leads embedded point ops (~4-22×; zero-parse plans + no IPC + a COW B+tree
+in-process). Under a live writer its MVCC readers never take the writer's lock:
+**466k read ops/s at 2 µs p50 vs SQLite's 4.1k** (none-class — SQLite's journal
+serializes readers against the writer, p99 18 ms). Give SQLite its WAL and it
+edges mpedb instead (658k vs 561k) — that cell is single-process, which is
+exactly where mpedb's multi-*process* readers and shared plans do not show.
+Durable writes: `wal` leads single-client (1,900 vs 846 / 1,679) and batched
+100/commit (**129k** vs 62k / 18k). Weakest cell: `durability=commit`
+single-client (~560 ops/s) — every commit msyncs with no batching partner; use
+`wal`. Contended writes (4 threads) mpedb leads 79k vs 30k/34k, but that is the
+cell most sensitive to core count — see [BENCHMARKS.md](BENCHMARKS.md).
 
 ```sh
 cargo run --release -p mpedb-bench      # full head-to-head (writes RESULTS.md)
 mpedb bench --auto --durability wal     # quick mpedb-only
 ```
 
-> Numbers on a shared 2-core VM swing 20-80% between runs on host load alone —
-> measured, in both directions. Read the ratios, not the digits; run one engine
-> at a time for the cleanest absolute. SQLite/PostgreSQL act as the control
-> group: if all three engines move together it is the host, not mpedb's code
-> ([method](BENCHMARKS.md#have-we-gotten-slowerfaster--how-to-read-run-to-run-deltas)).
+> Measured on an idle shared 2-core VM (two back-to-back runs agree within ~4%).
+> Every earlier run was distorted by a stray process pinning one core — which
+> left single-client ratios intact but silently compressed the parallel cells.
+> SQLite/PostgreSQL act as the control group: if all three engines move together
+> it is the host, not mpedb's code
+> ([method](BENCHMARKS.md#reading-run-to-run-deltas--the-control-group-method)).
 
 ## Mirroring & cross-database migration
 
