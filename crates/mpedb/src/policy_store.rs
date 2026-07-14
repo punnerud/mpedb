@@ -48,6 +48,77 @@ impl Database {
             .ok_or_else(|| Error::Bind(format!("unknown table `{name}`")))
     }
 
+    /// **Tenant-leading-key lint (DESIGN-MULTIDB.md §6.4).** Returns human-readable
+    /// findings for a policy about to be created — never an error, and never
+    /// blocking: a leaky key is a design smell the author may have accepted, not a
+    /// bug the database gets to veto.
+    ///
+    /// The leak it looks for: uniqueness is enforced over ALL rows regardless of
+    /// visibility, so a UNIQUE/PK that does not lead with the policy's
+    /// discriminator can collide with an invisible row and tell the caller it
+    /// exists. Leading with the discriminator confines collisions to the caller's
+    /// own partition, which makes them non-leaking (and makes §6.5's error
+    /// normalization harmless rather than merely opaque).
+    ///
+    /// An uncomfortable truth this surfaces, which is exactly why it is worth
+    /// running: **mpedb's secondary unique indexes are single-column**
+    /// (`planner::secondary_indexes`), so a `unique` column on an RLS table can
+    /// NEVER be tenant-scoped by key design. There is no `(tenant, code)` unique
+    /// to write. The only fixes are dropping the uniqueness or moving the
+    /// constraint out of the shared table — so the lint says that plainly instead
+    /// of suggesting an impossible remedy.
+    pub fn lint_policy(&self, table: &str, def: &PolicyDef) -> Result<Vec<String>> {
+        let table_id = self.require_table_id(table)?;
+        let t = self
+            .schema()
+            .table(table_id)
+            .ok_or_else(|| Error::Internal("table id out of range".into()))?;
+        let mut disc: Vec<u16> = Vec::new();
+        for src in [def.using_src.as_deref(), def.check_src.as_deref()].into_iter().flatten() {
+            disc.extend(mpedb_sql::policy_discriminators(src, t));
+        }
+        disc.sort_unstable();
+        disc.dedup();
+
+        let mut out = Vec::new();
+        if disc.is_empty() {
+            // Nothing to lead with: not a finding, just nothing to say.
+            return Ok(out);
+        }
+        let names: Vec<&str> = disc.iter().map(|&i| t.columns[i as usize].name.as_str()).collect();
+
+        let pk_lead = t.primary_key.first().copied();
+        if !pk_lead.is_some_and(|l| disc.contains(&l)) {
+            let pk_names: Vec<&str> = t
+                .primary_key
+                .iter()
+                .map(|&i| t.columns[i as usize].name.as_str())
+                .collect();
+            out.push(format!(
+                "PRIMARY KEY ({}) does not lead with the policy discriminator ({}): a PK \
+                 collision with a row this caller cannot see still fails the write, revealing \
+                 the hidden row exists (§6.4). Consider PRIMARY KEY ({}, …).",
+                pk_names.join(", "),
+                names.join(" or "),
+                names[0],
+            ));
+        }
+        for i in mpedb_sql::secondary_indexes(t) {
+            if !disc.contains(&i) {
+                out.push(format!(
+                    "UNIQUE column `{}` spans every tenant: a value colliding with a hidden \
+                     row reveals it exists (§6.4). mpedb's secondary unique indexes are \
+                     single-column, so this CANNOT be fixed by putting `{}` first — there is \
+                     no composite unique to write. Either drop the uniqueness, or move the \
+                     uniquely-keyed data to its own table.",
+                    t.columns[i as usize].name,
+                    names[0],
+                ));
+            }
+        }
+        Ok(out)
+    }
+
     /// Create (or replace) an RLS policy on `table` (DESIGN-MULTIDB.md §3.1).
     /// The `USING`/`WITH CHECK` sources are validated against the table before
     /// storage. Must not be called while a [`WriteSession`](crate::WriteSession)
@@ -579,6 +650,118 @@ mod tests {
             &[Value::Int(1), Value::Int(1)],
         );
         assert!(matches!(e, Err(E::PrimaryKeyViolation { .. })), "got {e:?}");
+        let _ = std::fs::remove_file(db.path());
+    }
+
+    // ---- §6.4 tenant-leading-key lint ----
+
+    /// `orders(id PK, tenant, code UNIQUE)` — the shape the lint exists for:
+    /// a PK that does not lead with `tenant`, and a tenant-spanning unique.
+    fn db_leaky(tag: &str) -> Database {
+        let path = format!("/dev/shm/mpedb-rls-{tag}-{}.mpedb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+        let cfg = Config::from_toml_str(&format!(
+            "[database]\npath = \"{path}\"\nsize_mb = 8\n\
+             [[table]]\nname = \"orders\"\nprimary_key = [\"id\"]\n  \
+             [[table.column]]\n  name = \"id\"\n  type = \"int64\"\n  \
+             [[table.column]]\n  name = \"tenant\"\n  type = \"int64\"\n  \
+             [[table.column]]\n  name = \"code\"\n  type = \"text\"\n  unique = true"
+        ))
+        .unwrap();
+        Database::open_with_config(cfg).unwrap()
+    }
+
+    #[test]
+    fn lint_flags_a_pk_that_does_not_lead_with_the_discriminator() {
+        let db = db_leaky("lint-pk");
+        let w = db.lint_policy("orders", &tenant_policy()).unwrap();
+        assert!(
+            w.iter().any(|m| m.contains("PRIMARY KEY") && m.contains("does not lead")),
+            "expected a PK finding, got {w:?}"
+        );
+        // and it names the honest remedy for the single-column unique
+        assert!(
+            w.iter().any(|m| m.contains("UNIQUE column `code`") && m.contains("CANNOT be fixed")),
+            "expected the unique finding to state the real constraint, got {w:?}"
+        );
+        let _ = std::fs::remove_file(db.path());
+    }
+
+    /// A tenant-leading PK and no tenant-spanning unique ⇒ nothing to say.
+    #[test]
+    fn lint_is_silent_when_the_key_leads_with_the_discriminator() {
+        let path = format!("/dev/shm/mpedb-rls-lint-ok-{}.mpedb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+        let cfg = Config::from_toml_str(&format!(
+            "[database]\npath = \"{path}\"\nsize_mb = 8\n\
+             [[table]]\nname = \"orders\"\nprimary_key = [\"tenant\", \"id\"]\n  \
+             [[table.column]]\n  name = \"tenant\"\n  type = \"int64\"\n  \
+             [[table.column]]\n  name = \"id\"\n  type = \"int64\""
+        ))
+        .unwrap();
+        let db = Database::open_with_config(cfg).unwrap();
+        assert!(db.lint_policy("orders", &tenant_policy()).unwrap().is_empty());
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A policy with no equality-to-context conjunct has no discriminator, so
+    /// there is nothing to lead with and the lint must stay quiet rather than
+    /// invent a finding.
+    #[test]
+    fn lint_is_silent_without_a_discriminator() {
+        let db = db_leaky("lint-nodisc");
+        let public = PolicyDef {
+            name: "public_rows".into(),
+            command: PolicyCmd::Select,
+            permissive: true,
+            using_src: Some("tenant > 0".into()),
+            check_src: None,
+        };
+        assert!(db.lint_policy("orders", &public).unwrap().is_empty());
+        let _ = std::fs::remove_file(db.path());
+    }
+
+    /// A discriminator under OR does not partition the table (the other branch
+    /// admits rows anyway), so it must not count as one.
+    #[test]
+    fn lint_ignores_a_discriminator_under_or() {
+        let db = db_leaky("lint-or");
+        let loose = PolicyDef {
+            name: "loose".into(),
+            command: PolicyCmd::Select,
+            permissive: true,
+            using_src: Some(
+                "tenant = current_setting('app.tenant') OR tenant = 0".into(),
+            ),
+            check_src: None,
+        };
+        // no top-level equality conjunct ⇒ no discriminator ⇒ silent
+        assert!(db.lint_policy("orders", &loose).unwrap().is_empty());
+        let _ = std::fs::remove_file(db.path());
+    }
+
+    /// The findings must actually reach a user: `CREATE POLICY` returns them as
+    /// rows so they print through the ordinary result path.
+    #[test]
+    fn create_policy_ddl_surfaces_the_lint() {
+        let db = db_leaky("lint-ddl");
+        let r = db
+            .query(
+                "CREATE POLICY tenant_iso ON orders FOR ALL \
+                 USING (tenant = current_setting('app.tenant'))",
+                &[],
+            )
+            .unwrap();
+        match r {
+            ExecResult::Rows { columns, rows } => {
+                assert_eq!(columns, vec!["warning".to_string()]);
+                assert!(!rows.is_empty(), "expected lint rows");
+            }
+            other => panic!("expected lint warnings as rows, got {other:?}"),
+        }
+        // the policy was still created — the lint informs, it does not veto
+        db.enable_rls("orders", false).unwrap();
+        assert_eq!(nrows(db.query_ctx(&sess(1), "SELECT id FROM orders", &[]).unwrap()), 0);
         let _ = std::fs::remove_file(db.path());
     }
 
