@@ -42,14 +42,12 @@ directions and records what the source declared, so migration is a thing you
 validate rather than hope about.
 
 **What it is not: a drop-in sqlite3.** Be clear-eyed about this before you plan
-around it. mpedb's SQL is deliberately a narrow, **single-table** subset — no
-joins, no subqueries, and (today) no aggregates, so a Django test suite fails on
-its first `COUNT(*)`. That is not a backlog; the footprint that makes the
-precomputed-lock design work describes exactly one table, and a second-table read
-would silently under-claim it and corrupt conflict grouping. The scaling answer
-is more files, not a wider footprint. Aggregates are the one planned addition.
-Today mpedb is a validation and staging tool in that workflow, not the thing your
-ORM talks to. See [SQL support](#sql-support) for the exact surface.
+around it. mpedb's SQL is a narrow subset: aggregates, `GROUP BY`/`HAVING` and
+`DISTINCT` are in, but **each statement reads one table** — no joins, no
+subqueries — so a Django test suite will not run against it. Today mpedb is a
+validation and staging tool in that workflow, not the thing your ORM talks to.
+See [SQL support](#sql-support) for the exact surface, measured against the
+binary.
 
 This cuts both ways, and honestly so: hardening mpedb against real sqlite3
 databases is how mpedb gets hardened. Every dialect mismatch found by importing
@@ -192,19 +190,32 @@ the design rather than a todo list.
 | `IN` / `NOT IN`, `BETWEEN`, `CASE`, `LIKE`, `IS [NOT] NULL` | ✅ | full SQL 3VL |
 | `lower upper length trim abs round substr coalesce ifnull nullif` | ✅ | `coalesce` is lazy |
 | `<table>.<column>` qualifiers | ✅ | checked, not ignored |
-| **`COUNT` / `SUM` / `AVG` / `MIN` / `MAX`, `GROUP BY`** | ❌ | **planned** — the one intended addition |
-| **`JOIN`, subqueries, `EXISTS`, cross-table refs** | ❌ | **by design, permanently** — see below |
-| **`DISTINCT`** | ❌ | not yet |
+| `COUNT` / `SUM` / `AVG` / `MIN` / `MAX`, `GROUP BY` / `HAVING` | ✅ | NULL rules verified against sqlite 3.45 |
+| `SELECT DISTINCT`, `COUNT(DISTINCT x)` | ✅ | |
+| `ORDER BY` by name, by ordinal (`ORDER BY 1`), or by a selected expression | ✅ | the key must be in the output; see below |
+| **`JOIN`, subqueries, `EXISTS`, cross-table refs** | ❌ | not yet — see below |
 | **`CREATE TABLE` / `ALTER`** | ❌ | **by design** — schema comes from the config or `mirror import`; see [DESIGN-MIRROR §7](DESIGN-MIRROR.md) |
 
-**Why no joins, and why that will not change.** Every plan carries a *footprint*
-naming exactly which tables and keys it touches, claimed before it runs — that is
-what makes `execute(hash, params)` cheap and what the commit path groups conflicts
-by. A second-table read would silently under-claim the footprint and corrupt that
-grouping. So the answer to "I need two tables" is **more files, not a wider
-footprint word**: separate files are separate writer locks, which is also the only
-OS-enforced isolation boundary here. If you need joins, you need PostgreSQL — and
-mpedb's job is to get you there safely, not to replace it.
+**Why no joins (yet).** Nothing in the storage or commit design forbids them:
+a plan's *footprint* is a **bitmap** (`tables_read: u64`, `tables_written: u64`)
+and `conflicts_with` is a bitmap AND, so a statement touching several tables is
+representable and groups correctly, and one writer lock plus one meta flip already
+make a cross-table transaction atomic (there is a test). What is single-table is
+the **binder**, which resolves names against one table. So this is a real gap, not
+a design boundary — an earlier version of this README claimed the opposite, and it
+was wrong.
+
+The scaling story is still *more files* where it can be: separate files are
+separate writer locks, and that is the only OS-enforced isolation boundary here.
+And if you need the full relational surface, you need PostgreSQL — mpedb's job is
+to get you there safely, not to replace it.
+
+**Where `ORDER BY` is narrower than sqlite/PG.** The sort key must be something
+the query outputs — a column of the table, an output position, or an expression
+from the `SELECT` list. `SELECT c FROM t ORDER BY a + 1` is refused where both
+engines allow it. And under `SELECT DISTINCT` the key must be in the `SELECT`
+list, as in PostgreSQL: once duplicates collapse, a key outside the output means
+*which* duplicate survived is what decides the order, and the query never said.
 
 **Why no `CREATE TABLE`.** A table's id is its index in the name-sorted table
 vector, and that id keys the catalog's B+tree roots, the CDC capture bitmap, and
