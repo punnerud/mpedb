@@ -391,14 +391,18 @@ Six phases, each independently shippable and testable. **Phases 1–2 touch noth
 
 ### Phase 6 — Hardening & completeness (v2; no protocol touch)
 
-**Status 2026-07-14: 6.1–6.3 done** (`require_policy` fail-closed §6.3;
-constraint-error normalization §6.5 via `Error::WriteRejected`; tenant-leading-key
-lint §6.4 via `policy_discriminators` + `Database::lint_policy`, surfaced as rows
-from `CREATE POLICY`). §6.6 (policy-named, non-source-echoing violation) shipped
-back in Phase 4. **Remaining: array-typed context §2.6, `WorkspaceTxn::
-commit_sequential_nonatomic` §1.5, optional stale-`plan/*` GC §4.5.**
+**Status 2026-07-14: PHASE 6 COMPLETE** — §6.3 `require_policy` fail-closed;
+§6.5 constraint-error normalization (`Error::WriteRejected`); §6.4
+tenant-leading-key lint (`policy_discriminators` + `Database::lint_policy`,
+surfaced as rows from `CREATE POLICY`); §1.5 `WorkspaceTxn::
+commit_sequential_nonatomic`; §2.6 array-typed context (`Value::List` +
+`Instr::InParam` + `col IN (current_setting('k'))` + `Session::set_list`).
+§6.6 shipped back in Phase 4. **Not done, and explicitly optional:** the §4.5
+stale-`plan/*` GC sweep — the design already says old plans age out passively via
+the existing 4096-cap eviction, so a targeted sweep buys tidiness, not
+correctness.
 
-Two findings from building it, worth keeping:
+Findings from building it, worth keeping:
 - `require_policy` had to live in `DbOptions`, not `TableDef`: `TableDef` feeds
   `Schema::canonical_bytes()` → the file-frozen `schema_hash`, so declaring one
   assertion would otherwise be a flag-day invalidating every existing file. It is
@@ -410,6 +414,14 @@ Two findings from building it, worth keeping:
   be tenant-scoped by key design. The lint says that outright (drop the
   uniqueness, or move the data to its own table) rather than suggesting a
   composite unique that cannot be written.
+- §2.6's list slot has **no `ColumnType`**, which collided with the planner's
+  "every context slot must be type-inferable" guard. That guard is right for
+  scalars and wrong for lists (`IN` tests membership; it does not unify with a
+  column type), so it now skips list keys — and a key used both as scalar and as
+  list is rejected at prepare, since one slot cannot mean two things.
+- `Value::List` must serialize even though it is never stored: the intent ring
+  encodes params with `write_value`, and context values are params, so without it
+  `IN (current_setting(..))` would work alone and break under writer contention.
 
 - `crates/mpedb/src/lib.rs`: `WorkspaceTxn::commit_sequential_nonatomic()` with the corrected "arbitrary subset, no prefix/ordering guarantee" docs (§1.5).
 - `crates/mpedb-types/src/expr.rs` + planner: array-typed context `Value` + scalar **set-membership** op for `col ∈ ctx_list` (§2.6) so IN-list policies work without per-session plan explosion.
