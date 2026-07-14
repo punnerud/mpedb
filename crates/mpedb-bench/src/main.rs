@@ -1,12 +1,14 @@
 //! mpedb-bench — honest head-to-head: mpedb vs SQLite vs PostgreSQL.
 //!
 //! Run: `cargo run --release -p mpedb-bench`
-//! Flags: `--quick` (short cells, RESULTS.md not written),
+//! Flags: `--out FILE` (report destination; default is derived from the
+//! machine, so a second host cannot silently overwrite the first host's
+//! numbers), `--quick` (short cells, report not written),
 //!        `--only <substr>` (run only engines whose key matches: mpedb,
 //!        sqlite, postgres).
 //!
 //! Progress goes to stderr; the final report goes to stdout and (full runs)
-//! to crates/mpedb-bench/RESULTS.md.
+//! to crates/mpedb-bench/RESULTS-<machine>.md.
 
 mod bulk;
 mod dur_compare;
@@ -26,7 +28,7 @@ use eng_pg::{PgEngine, PgServer};
 use eng_sqlite::{SqliteEngine, SqliteMode};
 use engines::Engine;
 use report::{CellRow, Report};
-use util::{cpu_model, fs_type, kernel, mem_total, rustc_version, today_utc, BResult};
+use util::{cpu_model, fs_type, host_slug, mem_total, os_release, rustc_version, today_utc, BResult};
 use workloads::{run_workload, RunCfg, ALL_WORKLOADS};
 
 const ENGINE_KEYS: [&str; 3] = ["mpedb", "sqlite", "postgres"];
@@ -234,16 +236,29 @@ fn main() {
         .windows(2)
         .find(|w| w[0] == "--tmpfs")
         .map(|w| w[1].clone());
+    // Where to write the report. RESULTS.md is a SINGLE-MACHINE file — it says
+    // so in its own first line — and this used to overwrite it unconditionally.
+    // So running the suite on a second machine did not add a second set of
+    // numbers, it DELETED the first, and the loss was silent. A second host
+    // needs its own file.
+    let out_arg: Option<String> = args
+        .windows(2)
+        .find(|w| w[0] == "--out")
+        .map(|w| w[1].clone());
     for (i, a) in args.iter().enumerate() {
         let known = a == "--quick"
             || a == "--io"
             || a == "--only"
             || a == "--tmpfs"
-            || (i > 0 && (args[i - 1] == "--only" || args[i - 1] == "--tmpfs"));
+            || a == "--out"
+            || (i > 0
+                && (args[i - 1] == "--only"
+                    || args[i - 1] == "--tmpfs"
+                    || args[i - 1] == "--out"));
         if !known {
             eprintln!(
                 "usage: mpedb-bench [--quick] [--io] [--only mpedb|sqlite|postgres] \
-                 [--tmpfs DIR]"
+                 [--tmpfs DIR] [--out FILE]"
             );
             std::process::exit(2);
         }
@@ -287,11 +302,11 @@ fn main() {
     let info_lines = vec![
         format!("Date: {} (UTC)", today_utc()),
         format!(
-            "CPU: {} — {} cores; RAM: {}; kernel: Linux {}",
+            "CPU: {} — {} cores; RAM: {}; OS: {}",
             cpu_model(),
             std::thread::available_parallelism().map_or(0, |n| n.get()),
             mem_total(),
-            kernel()
+            os_release()
         ),
         format!(
             "Media: tmpfs = {} ({tmpfs_ty}); disk = {} ({disk_ty})",
@@ -403,9 +418,13 @@ fn main() {
     println!("{}", report.to_text());
 
     if quick {
-        eprintln!("(quick mode: RESULTS.md not written)");
+        eprintln!("(quick mode: no report written)");
     } else {
-        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("RESULTS.md");
+        let path = match &out_arg {
+            Some(p) => PathBuf::from(p),
+            None => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("RESULTS-{}.md", host_slug())),
+        };
         match std::fs::write(&path, report.to_markdown()) {
             Ok(()) => eprintln!("wrote {}", path.display()),
             Err(e) => {

@@ -1,12 +1,12 @@
 //! Rendering: the same report as an aligned text table (stdout) and as
-//! markdown (RESULTS.md). The honesty notes are part of BOTH outputs by
+//! markdown (RESULTS-<machine>.md). The honesty notes are part of BOTH outputs by
 //! construction.
 
 use crate::dur_compare::{DurRow, DEFERRED, DURABLE_ON_ACK};
 use crate::util::LatStats;
 use crate::workloads::{CellResult, Workload, ALL_WORKLOADS};
 
-/// Honesty requirements — printed in the output header and in RESULTS.md.
+/// Honesty requirements — printed in the output header and in the report.
 pub const HONESTY_NOTES: &[&str] = &[
     "Class comparisons ONLY. \"none-class\" = no fsync guarantees (data may be lost on OS \
      crash / power loss); \"commit-class\" = durable on ack. Never compare a none-class \

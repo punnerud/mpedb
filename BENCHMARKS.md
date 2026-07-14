@@ -1,15 +1,39 @@
 # mpedb benchmarks
 
-Head-to-head throughput and latency for **mpedb vs SQLite vs PostgreSQL** on the
-same machine, same workloads, same measurement loop. The numbers below are a
-curated summary; the full machine-generated tables (every cell, both durability
-classes, all latency percentiles) live in
-[`crates/mpedb-bench/RESULTS.md`](crates/mpedb-bench/RESULTS.md).
+Head-to-head throughput and latency for **mpedb vs SQLite vs PostgreSQL** — same
+machine, same workloads, same measurement loop. This page is the curated
+cross-machine comparison; each machine's full generated tables (every cell, both
+durability classes, all latency percentiles) live in its own file.
+
+## Machines measured
+
+| machine | engines | full results |
+|---|---|---|
+| AMD EPYC-Milan, 2 cores, 7.6 GiB, Linux 6.8 | mpedb, SQLite, PostgreSQL 16 | [`RESULTS-linux-amd-epyc-milan-2c.md`](crates/mpedb-bench/RESULTS-linux-amd-epyc-milan-2c.md) |
+| Apple M3 Pro, 11 cores, 36 GiB, macOS 26.6 | mpedb, SQLite (no PostgreSQL installed) | pending — see [Apple Silicon](#apple-silicon-m3-pro-11-cores--and-the-durability-trap-it-exposed) below for the hand-checked findings |
+
+**One file per machine, on purpose.** A generated report says "on this machine"
+in its own first line — it is a single-host document, and a run on a second host
+used to overwrite the first host's numbers rather than add its own. The filename
+is now derived from the machine (`RESULTS-<os>-<cpu>-<cores>c.md`), so two
+machines cannot collide by accident.
+
+## The two rules that make any of this meaningful
+
+1. **Run on an idle machine.** Not advice — measured. A stray process holding one
+   of this box's two cores did not just add noise, it *compressed* the
+   parallelism results (contended-writes 6.8× → 2.4×) and made mpedb look
+   closer to the others than it is. Every number taken before 2026-07-14 12:10
+   was measured on half a machine. Close everything, then run.
+2. **Compare within a durability class, never across.** "none-class" gives no
+   fsync guarantee; "commit-class" is durable on ack. A none-class number next
+   to a commit-class one is not a comparison, it is a category error.
 
 Reproduce:
 
 ```sh
-cargo run --release -p mpedb-bench          # full run → rewrites RESULTS.md
+cargo run --release -p mpedb-bench          # full run → RESULTS-<machine>.md
+cargo run --release -p mpedb-bench -- --out RESULTS-mybox.md   # explicit name
 cargo run --release -p mpedb-bench -- --only mpedb   # one engine, least noise
 mpedb bench --auto --durability none|commit|wal|async   # mpedb-only, quick
 ```

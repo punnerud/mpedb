@@ -4,15 +4,16 @@ Honest head-to-head benchmark of **mpedb vs SQLite vs PostgreSQL** on this
 machine (2 cores, 7.6 GiB RAM, `/dev/shm` tmpfs + ext4 disk).
 
 ```
-cargo run --release -p mpedb-bench            # full run, writes RESULTS.md
-cargo run --release -p mpedb-bench -- --quick # smoke run, no RESULTS.md
+cargo run --release -p mpedb-bench            # full run -> RESULTS-<machine>.md
+cargo run --release -p mpedb-bench -- --quick # smoke run, writes nothing
+cargo run --release -p mpedb-bench -- --out FILE  # explicit report path
 cargo run --release -p mpedb-bench -- --only sqlite
 cargo run --release -p mpedb-bench -- --io    # + bulk MiB/s vs a raw-Rust baseline
 cargo run --release -p mpedb-bench -- --tmpfs /Volumes/ram   # macOS (no /dev/shm)
 ```
 
 The formatted report goes to stdout; a full run also writes
-[`RESULTS.md`](RESULTS.md) (machine info, versions, date, every cell,
+`RESULTS-<os>-<cpu>-<cores>c.md` (machine info, versions, date, every cell,
 caveats). Progress logs go to stderr.
 
 ## Engines and modes

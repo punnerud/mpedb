@@ -108,7 +108,25 @@ pub fn fs_type(path: &Path) -> String {
     best.map_or_else(|| "?".into(), |(_, ty)| ty)
 }
 
+/// Read a `sysctl -n <name>` value (macOS; there is no /proc there).
+#[cfg(target_os = "macos")]
+fn sysctl(name: &str) -> Option<String> {
+    let out = std::process::Command::new("sysctl")
+        .args(["-n", name])
+        .output()
+        .ok()?;
+    let s = String::from_utf8(out.stdout).ok()?;
+    let s = s.trim().to_string();
+    (!s.is_empty()).then_some(s)
+}
+
 pub fn cpu_model() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        // Apple Silicon reports e.g. "Apple M3 Pro" here.
+        return sysctl("machdep.cpu.brand_string").unwrap_or_else(|| "unknown cpu".into());
+    }
+    #[cfg(not(target_os = "macos"))]
     std::fs::read_to_string("/proc/cpuinfo")
         .ok()
         .and_then(|s| {
@@ -121,6 +139,14 @@ pub fn cpu_model() -> String {
 }
 
 pub fn mem_total() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        return sysctl("hw.memsize")
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(|b| format!("{:.1} GiB", b as f64 / (1024.0 * 1024.0 * 1024.0)))
+            .unwrap_or_else(|| "unknown".into());
+    }
+    #[cfg(not(target_os = "macos"))]
     std::fs::read_to_string("/proc/meminfo")
         .ok()
         .and_then(|s| {
@@ -136,10 +162,62 @@ pub fn mem_total() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
-pub fn kernel() -> String {
-    std::fs::read_to_string("/proc/sys/kernel/osrelease")
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|_| "unknown".into())
+/// OS name + version, e.g. "Linux 6.8.0-134-generic" or "macOS 26.6 (Darwin
+/// 25.6.0)".
+///
+/// Returns the OS NAME too, rather than leaving the caller to hardcode it. The
+/// caller did hardcode it — the machine line read `kernel: Linux {}` — so a Mac
+/// run would have reported "kernel: Linux unknown": not merely missing, but
+/// WRONG, on the one line a reader uses to decide what a number means.
+pub fn os_release() -> String {
+    #[cfg(target_os = "macos")]
+    {
+        let darwin = std::process::Command::new("uname")
+            .arg("-r")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "unknown".into());
+        let product = std::process::Command::new("sw_vers")
+            .arg("-productVersion")
+            .output()
+            .ok()
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|| "?".into());
+        return format!("macOS {product} (Darwin {darwin})");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let r = std::fs::read_to_string("/proc/sys/kernel/osrelease")
+            .map(|s| s.trim().to_string())
+            .unwrap_or_else(|_| "unknown".into());
+        format!("Linux {r}")
+    }
+}
+
+/// A filesystem-safe slug identifying this machine, for the per-host report
+/// filename: `linux-amd-epyc-milan-2c`, `macos-apple-m3-pro-11c`.
+///
+/// The report is a SINGLE-MACHINE document (its own first line says so) and the
+/// writer used to default to one fixed `RESULTS.md`, so a second machine
+/// silently deleted the first machine's numbers instead of adding its own.
+/// Deriving the name from the machine makes that collision impossible by
+/// accident; `--out` still overrides.
+pub fn host_slug() -> String {
+    let os = if cfg!(target_os = "macos") { "macos" } else { "linux" };
+    let cores = std::thread::available_parallelism().map_or(0, |n| n.get());
+    let cpu: String = cpu_model()
+        .to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    // collapse runs of '-' and trim, so "amd epyc-milan processor" reads well
+    let mut cpu: Vec<&str> = cpu.split('-').filter(|p| !p.is_empty()).collect();
+    cpu.retain(|p| !matches!(*p, "processor" | "cpu" | "r" | "with"));
+    cpu.truncate(4);
+    format!("{os}-{}-{cores}c", cpu.join("-"))
 }
 
 pub fn rustc_version() -> String {
