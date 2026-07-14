@@ -175,6 +175,11 @@ pub struct Database {
     /// The database file path this handle attached (for `Workspace` dup-file
     /// detection and diagnostics).
     path: std::path::PathBuf,
+    /// Table ids this process declared `require_policy = true` for
+    /// (DESIGN-MULTIDB §6.3). Resolved from names ONCE at open — so a typo or a
+    /// renamed table fails immediately and loudly, rather than silently
+    /// asserting nothing for the rest of the deployment's life.
+    require_policy: std::collections::HashSet<u32>,
 }
 
 impl Database {
@@ -196,6 +201,11 @@ impl Database {
             engine,
             cache: RwLock::new(HashMap::new()),
             path: path.to_path_buf(),
+            // No config, so no §6.3 assertions — consistent with this
+            // constructor's contract (it also skips CHECK programs): a
+            // config-free attach enforces what the FILE carries, and
+            // `require_policy` is a config-declared deployment assertion.
+            require_policy: std::collections::HashSet::new(),
         })
     }
 
@@ -221,11 +231,28 @@ impl Database {
             checks.push(per_col);
         }
         let path = config.options.path.clone();
+        // Resolve the §6.3 assertions against the schema now: an unknown name is
+        // a config error, not a no-op assertion nobody notices.
+        let mut require_policy = std::collections::HashSet::new();
+        for name in &config.options.require_policy {
+            let id = config
+                .schema
+                .tables
+                .iter()
+                .position(|t| &t.name == name)
+                .ok_or_else(|| {
+                    Error::Config(format!(
+                        "require_policy names table `{name}`, which is not in the schema"
+                    ))
+                })?;
+            require_policy.insert(id as u32);
+        }
         let engine = Engine::open(&config, checks)?;
         Ok(Database {
             engine,
             cache: RwLock::new(HashMap::new()),
             path,
+            require_policy,
         })
     }
 

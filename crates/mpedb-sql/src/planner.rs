@@ -69,6 +69,53 @@ fn using_group(binder: &mut Binder, tp: &TablePolicies, cmd: PolicyCmd) -> Resul
     Ok(eff)
 }
 
+/// **Fail-closed assertion (DESIGN-MULTIDB §6.3).** A table declared
+/// `require_policy = true` must actually be protected for the command being
+/// compiled — otherwise `prepare` errors instead of quietly compiling a plan
+/// that returns every row to every caller.
+///
+/// This exists because the failure it guards is silent and asymmetric: forget
+/// one `ENABLE ROW LEVEL SECURITY` and nothing complains, no context value trips
+/// it, and the table reads exactly like a working one. The assertion converts
+/// that into a loud error at prepare, in the process that declared the intent.
+///
+/// "Protected" means BOTH: RLS enabled, and at least one policy governing `cmd`.
+/// The second half matters even though our empty-permissive-set rule already
+/// default-denies (a literal FALSE, §3.5) — denying every row is safe but is
+/// almost never what someone who wrote `require_policy = true` meant, and
+/// discovering it as "the table is mysteriously empty" is worse than an error.
+/// A deliberate deny-all is still expressible: write it (`FOR DELETE USING
+/// (false)`), do not leave it implied.
+fn assert_policy_required(
+    catalog: &PolicyCatalog,
+    table_id: u32,
+    table_name: &str,
+    cmd: PolicyCmd,
+) -> Result<()> {
+    if !catalog.requires_policy(table_id) {
+        return Ok(());
+    }
+    let tp = catalog.get(table_id);
+    if !tp.is_some_and(|t| t.rls_enabled) {
+        return Err(Error::Config(format!(
+            "table `{table_name}` is declared require_policy = true but row-level security \
+             is not enabled on it — refusing to compile a plan that would expose every row \
+             (run `ALTER TABLE {table_name} ENABLE ROW LEVEL SECURITY`)"
+        )));
+    }
+    let governed = tp
+        .map(|t| t.policies.iter().any(|p| p.command.governs(cmd)))
+        .unwrap_or(false);
+    if !governed {
+        return Err(Error::Config(format!(
+            "table `{table_name}` is declared require_policy = true but no policy governs \
+             {cmd:?} — every {cmd:?} would be denied by default-deny; declare the intent \
+             explicitly with a policy for this command"
+        )));
+    }
+    Ok(())
+}
+
 /// The effective READ predicate injected for `cmd`, or `None` when RLS is not
 /// enabled on the table. For UPDATE/DELETE — which always read the old row —
 /// the SELECT visibility group is AND-ed in too (PG read-via-write, §3.6), so a
@@ -77,8 +124,10 @@ fn read_policy(
     binder: &mut Binder,
     catalog: &PolicyCatalog,
     table_id: u32,
+    table_name: &str,
     cmd: PolicyCmd,
 ) -> Result<Option<BExpr>> {
+    assert_policy_required(catalog, table_id, table_name, cmd)?;
     let tp = match catalog.get(table_id) {
         Some(tp) if tp.rls_enabled => tp,
         _ => return Ok(None),
@@ -99,8 +148,10 @@ fn write_check(
     binder: &mut Binder,
     catalog: &PolicyCatalog,
     table_id: u32,
+    table_name: &str,
     cmd: PolicyCmd,
 ) -> Result<Option<BExpr>> {
+    assert_policy_required(catalog, table_id, table_name, cmd)?;
     let tp = match catalog.get(table_id) {
         Some(tp) if tp.rls_enabled => tp,
         _ => return Ok(None),
@@ -235,7 +286,7 @@ fn plan_select(
     // Inject the SELECT visibility policy AND-ed with the user WHERE, *before*
     // access extraction, so a policy conjunct that pins the PK/unique column
     // still becomes a Point/Range access and footprints only narrow (§3.3).
-    let policy = read_policy(&mut binder, catalog, table_id, PolicyCmd::Select)?;
+    let policy = read_policy(&mut binder, catalog, table_id, &table.name, PolicyCmd::Select)?;
     let (access, residual) = extract_access(merge_and(bound_where, policy), table, consts)?;
     let filter = residual.map(|e| compile_program(&e)).transpose()?;
 
@@ -405,7 +456,7 @@ fn plan_insert(
     }
 
     // RLS gate on the new row (INSERT ignores USING; WITH CHECK is the sole gate).
-    let with_check = write_check(&mut binder, catalog, table_id, PolicyCmd::Insert)?
+    let with_check = write_check(&mut binder, catalog, table_id, &table.name, PolicyCmd::Insert)?
         .map(|b| compile_program(&b))
         .transpose()?;
     let (param_types, context_keys) = binder.into_parts();
@@ -457,12 +508,12 @@ fn plan_update(
         .transpose()?;
     // The UPDATE policy restricts the target set, and (read-via-write) the
     // SELECT policy is folded in too — see `read_policy`.
-    let policy = read_policy(&mut binder, catalog, table_id, PolicyCmd::Update)?;
+    let policy = read_policy(&mut binder, catalog, table_id, &table.name, PolicyCmd::Update)?;
     let (access, residual) = extract_access(merge_and(bound_where, policy), table, consts)?;
     let filter = residual.map(|e| compile_program(&e)).transpose()?;
 
     // WITH CHECK gates the post-image (falls back to USING per PG rule).
-    let with_check = write_check(&mut binder, catalog, table_id, PolicyCmd::Update)?
+    let with_check = write_check(&mut binder, catalog, table_id, &table.name, PolicyCmd::Update)?
         .map(|b| compile_program(&b))
         .transpose()?;
     let (param_types, context_keys) = binder.into_parts();
@@ -493,7 +544,7 @@ fn plan_delete(
         .as_ref()
         .map(|e| binder.bind_predicate(e))
         .transpose()?;
-    let policy = read_policy(&mut binder, catalog, table_id, PolicyCmd::Delete)?;
+    let policy = read_policy(&mut binder, catalog, table_id, &table.name, PolicyCmd::Delete)?;
     let (access, residual) = extract_access(merge_and(bound_where, policy), table, consts)?;
     let filter = residual.map(|e| compile_program(&e)).transpose()?;
     let (param_types, context_keys) = binder.into_parts();
