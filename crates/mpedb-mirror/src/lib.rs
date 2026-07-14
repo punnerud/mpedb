@@ -12,6 +12,7 @@ pub mod adapter;
 pub mod export;
 pub mod import;
 pub mod sqlite;
+pub mod sqlite_track;
 pub mod state;
 
 pub use adapter::{Cursor, NetOp, NetOpKind, PullBatch, SourceAdapter};
