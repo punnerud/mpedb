@@ -28,12 +28,13 @@ mpedb bench --auto --durability none|commit|wal|async   # mpedb-only, quick
   power-loss-durable the instant a commit returns. Never compare a none-class
   number against a durable one — they promise different things.
 - **This is a shared 2-core cloud VM** (AMD EPYC-Milan, 7.6 GiB, ext4 + tmpfs).
-  Absolute numbers swing 20-80% run-to-run on host load alone — in both
-  directions, measured. Read the **ratios**, not the digits, and see
-  ["Have we gotten slower/faster?"](#have-we-gotten-slowerfaster--how-to-read-run-to-run-deltas)
-  for the method that separates a code change from a noisy host.
+  Every run before 2026-07-14 12:10 was measured with **one of the two cores
+  pinned at 99% by an unrelated stray process** — see
+  ["Reading run-to-run deltas"](#reading-run-to-run-deltas--the-control-group-method).
+  The numbers below are the first on a genuinely idle box, and two back-to-back
+  runs agree within ~4%.
 
-## Headline results (2026-07-14 11:56 UTC, Linux, single-client unless noted)
+## Headline results (2026-07-14 12:14 UTC, Linux, 2 idle cores, single-client unless noted)
 
 ### Embedded point operations, none-class — mpedb's home turf
 
@@ -41,30 +42,44 @@ Zero-parse execute-by-hash + no IPC + a COW B+tree in the same address space:
 
 | op (none-class) | mpedb ops/s | SQLite ops/s | PostgreSQL ops/s | mpedb vs SQLite / PG |
 |---|--:|--:|--:|---|
-| point-select (PK) | **291,116** | 53,698 | 24,519 | ~5.4× / ~12× |
-| point-insert | **96,519** | 26,973 | 15,874 | ~3.6× / ~6.1× |
-| point-update (PK) | **112,292** | 30,311 | 13,951 | ~3.7× / ~8× |
+| point-select (PK) | **469,777** | 80,145 | 21,638 | ~5.9× / ~22× |
+| point-insert | **165,142** | 41,555 | 13,749 | ~4.0× / ~12× |
+| point-update (PK) | **201,638** | 46,214 | 11,058 | ~4.4× / ~18× |
 
-p50 latencies: mpedb select **2 µs**, insert **8 µs**; SQLite 15 µs / 29 µs;
-PostgreSQL 35 µs / 51 µs.
+p50 latencies: mpedb select **1 µs**, insert **5 µs**; SQLite 11 µs / 21 µs;
+PostgreSQL 44 µs / 68 µs.
 
 ### Lock-free reads under a concurrent writer (commit-class)
 
 3 readers + 1 writer, durable disk config. mpedb's MVCC readers never block the
 writer:
 
-| engine | read ops/s | read p50 |
-|---|--:|--:|
-| mpedb | 344,064 | 2 µs |
-| SQLite (WAL) | **345,120** | 1 µs |
-| PostgreSQL | 25,792 | 47 µs |
+| engine | read ops/s (none-class) | read p50 | read p99 |
+|---|--:|--:|--:|
+| mpedb | **466,464** | 2 µs | 3 µs |
+| SQLite (journal=MEMORY) | 4,145 | 11 µs | **18,313 µs** |
+| PostgreSQL | 35,226 | 70 µs | 330 µs |
 
-**SQLite ties mpedb here now** (345k vs 344k — inside the noise band), where the
-2026-07-14 10:40 run had mpedb ahead 300k vs 255k. Both engines keep readers off
-the writer's lock; on 2 cores this cell measures the reader loop, and the reader
-loops are equally tight. mpedb's structural advantage is multi-*process* readers
-and shared plans, which this single-process cell does not exercise. PostgreSQL
-pays the socket round-trip per read, which is the whole 13× gap.
+**This is the cell mpedb was built for, and it only became visible once the box
+was idle: 112× SQLite.** SQLite's none-class journal serializes readers against
+the writer, so with two real cores the writer simply runs harder and starves the
+readers — p99 read latency 18 ms. mpedb's MVCC readers never take the writer's
+lock, so they are untouched (p99 3 µs).
+
+Give SQLite its WAL (commit-class), though, and it wins this cell:
+
+| engine | read ops/s (commit-class) | read p50 |
+|---|--:|--:|
+| mpedb | 561,117 | 2 µs |
+| SQLite (WAL) | **657,662** | 1 µs |
+| PostgreSQL | 41,231 | 59 µs |
+
+Honest read: **against SQLite-in-WAL, mpedb has no read-throughput edge in one
+process** (−15%). mpedb's structural advantages here — multi-*process* readers
+and cross-process shared plans — are not exercised by this single-process cell,
+so it under-sells mpedb and over-sells SQLite relative to the multi-process case
+mpedb targets. PostgreSQL pays a socket round-trip per read: that is the 13-16×
+gap.
 
 ### Durable single-client INSERT (durable-on-ack) — mpedb's weak spot, and the fix
 
@@ -74,53 +89,83 @@ the least room to be clever:
 
 | config (durable-on-ack) | ops/s |
 |---|--:|
-| **mpedb `wal`, single client** | **2,598** |
-| SQLite `synchronous=FULL`, single client | 1,601 |
-| PostgreSQL `sc=on`, single client | 2,232 |
-| **mpedb `wal`, batched 100/commit** | **104,877** |
-| SQLite `FULL`, batched 100/commit | 76,156 |
-| PostgreSQL `sc=on`, batched 100/commit | 19,463 |
+| **mpedb `wal`, single client** | **1,900** |
+| SQLite `synchronous=FULL`, single client | 846 |
+| PostgreSQL `sc=on`, single client | 1,679 |
+| **mpedb `wal`, batched 100/commit** | **129,087** |
+| SQLite `FULL`, batched 100/commit | 61,923 |
+| PostgreSQL `sc=on`, batched 100/commit | 17,679 |
 
-`wal` now leads both single-client (2,598 vs 1,601 / 2,232) and batched
-(105k vs 76k / 19k) — the logical-WAL + fsync-coalescing work closed the
-single-client gap that earlier runs showed. The genuinely weak cell is a
-different one: **`durability=commit` single-client (525 ops/s insert, 704
-update)** — the slowest in the suite, because every commit msyncs the whole
-meta double-buffer with no batching partner. Guidance stands: for durable
-writes use `wal`, and batch in a `WriteSession` when you can.
+`wal` leads both single-client (1,900 vs 846 / 1,679) and batched (**129k** vs
+62k / 18k, 2.1×) — the logical-WAL + fsync-coalescing work closed the
+single-client gap earlier runs showed. The genuinely weak cell is a different
+one: **`durability=commit` single-client (~560 ops/s insert)** — the slowest in
+the suite, because every commit msyncs the meta double-buffer with no batching
+partner. Guidance: for durable writes use `wal`, and batch in a `WriteSession`
+when you can.
 
-## "Have we gotten slower/faster?" — how to read run-to-run deltas
+### Contended writes — where mpedb's single writer lock costs it
 
-Three full runs now (07-13, 07-14 10:40, 07-14 11:56) and the absolute numbers
-swung wildly in **both** directions — 07-13→10:40 fell ~24%, 10:40→11:56 rose
-15-84%. Neither was a code change. **On this shared 2-core VM, host load
-dominates the absolutes.**
+4 threads × autocommit inserts, none-class:
 
-The method that settles it every time: **SQLite and PostgreSQL are the control
-group.** Their binaries are byte-identical across our runs, so:
+| engine | ops/s |
+|---|--:|
+| **mpedb** | **79,243** |
+| PostgreSQL | 33,727 |
+| SQLite | 29,747 |
 
-- all three engines move together → **host load**;
-- mpedb moves and they do not → **code signal**.
+mpedb still leads, but this is the cell that **shrank most when the box got a
+second real core: 6.8× → 2.7× vs SQLite**, reproducibly. That is the honest
+shape of the design — mpedb serializes writers behind one lock and amortizes
+with group commit, so extra cores buy it comparatively little, while SQLite's
+and PostgreSQL's contended writes scale with them. mpedb's write-parallelism
+answer is architectural, not per-lock: separate files (Workspaces / ShardSet),
+which this single-file cell does not measure.
 
-Applied to 10:40 → 11:56, after the mirror/CDC work landed in the engine:
+## Reading run-to-run deltas — the control-group method
 
-| | mpedb | SQLite | PostgreSQL |
-|---|--:|--:|--:|
-| median change across point/contended cells | +20% | +19% | +35% |
+**A stray process ate half this machine for five days.** An unrelated orphaned
+python script (PPID 1, a websocket test that spun forever on `recv()` after EOF)
+sat at 99% of one of the two cores from 2026-07-09 until it was killed on 07-14
+at 12:09, having burned ~120 hours of CPU. **Every mpedb benchmark before
+12:10 — including three "full" runs — was therefore measured on ~1 core.**
 
-All three rose together ⇒ host, not code. And the ratios — the only thing
-comparable *across* runs — held or improved: point-select vs SQLite 5.5×→5.9×,
-point-insert 3.4×→3.6×, point-update 4.3×→4.4×, contended-writes 6.4×→6.7×.
+That is a cautionary tale with a method attached, because we caught it the right
+way. **SQLite and PostgreSQL are the control group**: their binaries are
+byte-identical across our runs, so
 
-**This also answers the question the CDC work raised:** M1 put a change-capture
-hook in all six engine mutators. If it cost anything measurable, none-class
-point-insert/update (pure write-path CPU) would have lagged SQLite's
-environmental gain. They tracked it instead (+84%/+18% vs SQLite's +70%/+14%).
-The hook is free when no table is mirrored.
+- all three engines move together → **the host**;
+- mpedb moves and they do not → **a code signal**.
 
-Two standing lessons: **run one engine at a time** (`--only mpedb`) for a clean
-absolute — full-run co-tenancy on 2 cores depressed insert to 54k where an
-isolated run gave 76k — and **never read a delta without checking the controls**.
+That test is what proved the 07-14 10:40→11:56 swing (every cell +15-84%) was
+host load and not the mirror/CDC work — SQLite (+19% median) and PostgreSQL
+(+35%) rose with it. It also answers the question the CDC work raised: **M1's
+change-capture hook in all six engine mutators costs nothing measurable** when
+no table is mirrored — the none-class insert/update cells (pure write-path CPU)
+tracked SQLite's environmental gain instead of lagging it.
+
+**But the correction matters more than the confirmation.** Freeing the core
+showed that ratios are only portable for cells that do not need the missing
+core:
+
+| ratio (none-class, mpedb vs SQLite) | ~1 core | 2 cores (×2 runs) |
+|---|--:|--:|
+| point-select | 5.4× | 6.1× / 5.9× |
+| point-insert | 3.6× | 4.1× / 4.0× |
+| point-update | 3.7× | 4.3× / 4.4× |
+| **contended-writes** | **6.8×** | **2.4× / 2.7×** |
+
+Single-client cells held (all engines were equally starved). The **contended**
+cell did not: with ~1 core nothing can actually contend in parallel, which
+flattered mpedb's single-writer-lock design by 2.5×. Same for read-while-write,
+where the starved box hid a 112× mpedb win in none-class *and* a 15% SQLite win
+in commit-class. **A starved host does not just scale numbers down — it silently
+compresses exactly the cells that measure parallelism.**
+
+Standing rules: **check `ps aux` before believing a number**; **run one engine at
+a time** (`--only mpedb`) for a clean absolute; **never read a delta without the
+controls**; and treat multi-threaded ratios from a loaded host as unusable, not
+merely noisy.
 
 ## Known issues / improvement opportunities
 

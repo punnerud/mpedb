@@ -326,14 +326,19 @@ impl Report {
 
 pub const CAVEATS_MD: &str = "\
 - One run, one machine; no confidence intervals. Treat small (<20%) differences as noise.
-- HOST LOAD DOMINATES ABSOLUTE NUMBERS — never read a run-to-run delta as a code \
-change without checking the unchanged engines. Measured on this shared 2-core VM: \
-between two runs on 2026-07-14 (10:40 and 11:56) every cell rose 15-84% — mpedb \
-none-class point-insert 165k->302k ops/s — but SQLite (+19% median) and PostgreSQL \
-(+35% median) rose by the same order with byte-identical binaries, so it was host \
-load, not code. SQLite and PostgreSQL are the control group in every run: if mpedb \
-moves and they do not, that is a code signal; if all three move together, it is the \
-host. Compare RATIOS across runs, absolutes only within one run.
+- HOST LOAD DOMINATES ABSOLUTE NUMBERS, and a starved host does not merely \
+scale them down — it silently COMPRESSES the cells that measure parallelism. \
+Measured on this box: an unrelated stray process pinned 1 of the 2 cores at 99% \
+for five days; every run before 2026-07-14 12:10 was therefore on ~1 core. \
+Freeing it left single-client ratios intact (mpedb/SQLite point-select 5.4x -> \
+5.9x) but collapsed contended-writes 6.8x -> 2.5x, and flipped read-while-write \
+from a tie into a 112x mpedb win (none-class) and a 15% SQLite win \
+(commit-class). CHECK `ps aux` BEFORE BELIEVING A NUMBER. \
+- SQLite and PostgreSQL are the CONTROL GROUP: their binaries are identical \
+across runs, so if all three engines move together it is the host, and if mpedb \
+moves alone it is a code signal. Compare ratios across runs, absolutes only \
+within one run — and treat multi-threaded ratios from a loaded host as unusable, \
+not merely noisy.
 - The 2-core box runs benchmark threads, the engine, and (for PostgreSQL) server \
 processes simultaneously; contended cells oversubscribe the CPU on purpose.
 - SQLite runs the bundled 3.45.0 build (the system libsqlite3 lacks the dev symlink \
