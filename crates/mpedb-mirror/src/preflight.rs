@@ -63,6 +63,13 @@ pub struct Finding {
     pub pk: Vec<Value>,
     /// Human-readable specifics (the offending value, the limit it broke).
     pub detail: String,
+    /// What it would take to make this value fit (§26.3). `Fine` for column-level
+    /// findings — an already-lossy column has no per-row coercion.
+    pub fix: crate::adapt::Adaptation,
+    /// The mpedb table id and column index, so an `--adapt` pass can write the
+    /// coerced value back without re-deriving them from names.
+    pub table_id: u32,
+    pub col_idx: usize,
 }
 
 #[derive(Debug, Default)]
@@ -72,6 +79,30 @@ pub struct PreflightReport {
 }
 
 impl PreflightReport {
+    /// Findings a coercion would fix with nothing lost.
+    pub fn adaptable_exact(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|f| matches!(f.fix, crate::adapt::Adaptation::Exact(_)))
+            .count()
+    }
+
+    /// Findings a coercion would fix only by discarding something.
+    pub fn adaptable_lossy(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|f| matches!(f.fix, crate::adapt::Adaptation::Lossy(..)))
+            .count()
+    }
+
+    /// Findings no coercion can fix — the ones that end a migration.
+    pub fn unfixable(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|f| matches!(f.fix, crate::adapt::Adaptation::Impossible(_)))
+            .count()
+    }
+
     /// Whether a write to the recorded source schema would be rejected. A
     /// `LossyColumn` finding alone does NOT make it fail: the data is already
     /// what it is, the target will accept it, and the operator needs to decide
@@ -251,6 +282,9 @@ pub fn preflight(db: &Database) -> Result<PreflightReport> {
                 detail: "no source-schema provenance recorded for this table: \
                          nothing could be verified (re-import to record it)"
                     .into(),
+                fix: crate::adapt::Adaptation::Fine,
+                table_id: tid as u32,
+                col_idx: 0,
             });
             continue;
         };
@@ -269,6 +303,9 @@ pub fn preflight(db: &Database) -> Result<PreflightReport> {
                          already the degraded ones, so nothing per-row can be checked or fixed",
                         c.source_type, c.mapped
                     ),
+                    fix: crate::adapt::Adaptation::Fine,
+                    table_id: tid as u32,
+                    col_idx: 0,
                 });
             }
         }
@@ -309,12 +346,93 @@ pub fn preflight(db: &Database) -> Result<PreflightReport> {
                         kind,
                         pk: pk_idx.iter().map(|&i| row[i].clone()).collect(),
                         detail,
+                        fix: crate::adapt::adapt(c, v),
+                        table_id: tid as u32,
+                        col_idx: i,
                     });
                 }
             }
         }
     }
     Ok(report)
+}
+
+/// How much of a pre-flight's advice to actually act on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdaptMode {
+    /// Only coercions that lose nothing (`"42"` → `42`).
+    ExactOnly,
+    /// Also apply coercions that discard something (truncate to `varchar(n)`,
+    /// drop a fractional part). Separate on purpose: this one destroys data, so
+    /// it cannot ride along on the same flag as the safe ones.
+    AllowLossy,
+}
+
+#[derive(Debug, Default)]
+pub struct AdaptStats {
+    pub applied_exact: u64,
+    pub applied_lossy: u64,
+    /// Left alone: no coercion exists, or it was lossy and not permitted.
+    pub left: u64,
+}
+
+/// Rewrite the values a pre-flight says can be coerced, in mpedb, in place.
+///
+/// **Never called implicitly.** `preflight` reports; this acts, and only for the
+/// verdicts `mode` permits. Everything else is left exactly as it was so it
+/// still shows up in the next report rather than quietly disappearing.
+///
+/// Each row is updated by PK through the normal write path, so CHECK
+/// constraints, RLS and change-capture all apply — an adaptation is an ordinary
+/// local write, not a backdoor into the file.
+pub fn apply_adaptations(db: &Database, mode: AdaptMode) -> Result<AdaptStats> {
+    let report = preflight(db)?;
+    let schema = db.schema().clone();
+    let mut stats = AdaptStats::default();
+
+    for f in &report.findings {
+        let new = match (&f.fix, mode) {
+            (crate::adapt::Adaptation::Exact(v), _) => {
+                stats.applied_exact += 1;
+                v.clone()
+            }
+            (crate::adapt::Adaptation::Lossy(v, _), AdaptMode::AllowLossy) => {
+                stats.applied_lossy += 1;
+                v.clone()
+            }
+            _ => {
+                stats.left += 1;
+                continue;
+            }
+        };
+        let tdef = schema
+            .tables
+            .get(f.table_id as usize)
+            .ok_or_else(|| Error::Internal("adapt: unknown table id".into()))?;
+        let set_col = &tdef.columns[f.col_idx].name;
+        let where_sql = tdef
+            .primary_key
+            .iter()
+            .enumerate()
+            .map(|(j, &i)| {
+                format!(
+                    "\"{}\" = ${}",
+                    tdef.columns[i as usize].name.replace('"', "\"\""),
+                    j + 2
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" AND ");
+        let sql = format!(
+            "UPDATE {} SET \"{}\" = $1 WHERE {where_sql}",
+            tdef.name,
+            set_col.replace('"', "\"\"")
+        );
+        let mut params = vec![new];
+        params.extend(f.pk.iter().cloned());
+        db.query(&sql, &params)?;
+    }
+    Ok(stats)
 }
 
 #[cfg(test)]
@@ -441,6 +559,9 @@ mod tests {
             kind: FindingKind::LossyColumn,
             pk: vec![],
             detail: String::new(),
+            fix: crate::adapt::Adaptation::Fine,
+            table_id: 0,
+            col_idx: 0,
         });
         assert!(!r.would_fail(), "a lossy column is a judgement call, not an error");
         r.findings.push(Finding {
@@ -449,6 +570,9 @@ mod tests {
             kind: FindingKind::WontFit,
             pk: vec![],
             detail: String::new(),
+            fix: crate::adapt::Adaptation::Fine,
+            table_id: 0,
+            col_idx: 0,
         });
         assert!(r.would_fail());
     }
@@ -531,6 +655,105 @@ mod tests {
         assert!(qty.detail.contains("2147483648"), "detail: {}", qty.detail);
 
         for p in [src, dest] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// 26.3 end to end — with the premise the first attempt got wrong, twice.
+    ///
+    /// **(1) Drift cannot exist inside a `.mpedb`.** The schema is rigid, so
+    /// INSERTing a Text into an Int64 column is refused outright. sqlite's mess
+    /// must therefore be handled where it arrives: at IMPORT.
+    ///
+    /// **(2) sqlite already fixes the easy half.** Affinity coerces
+    /// numeric-LOOKING text on the way in: `'42'` into an INTEGER column is
+    /// stored as the integer 42, so the textbook "text in a number column" never
+    /// reaches us. What survives affinity is exactly what sqlite could NOT
+    /// convert — `'yes'`, `'2023-11-14T22:13:20Z'`, `'007abc'` — i.e. precisely
+    /// the cases that need judgement. That is the whole job of this layer.
+    #[test]
+    fn import_adapts_what_sqlite_affinity_could_not_and_still_refuses_the_cast_trap() {
+        use crate::import::{import_sqlite, ImportOptions};
+        use rusqlite::Connection;
+
+        let dir = std::env::temp_dir().join("mpedb-mirror-tests");
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid = std::process::id();
+        let mk = |t: &str| dir.join(format!("ad-{t}-{pid}.db"));
+        let dst = |t: &str| dir.join(format!("ad-{t}-{pid}.mpedb"));
+
+        // BOOLEAN/DATETIME have NUMERIC affinity, so these stay TEXT in sqlite
+        // (verified: 'yes' and the ISO string are typeof()='text').
+        let seed = |p: &std::path::Path, b: &str, d: &str| {
+            let _ = std::fs::remove_file(p);
+            let c = Connection::open(p).unwrap();
+            c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, ok BOOLEAN, at DATETIME);")
+                .unwrap();
+            c.execute("INSERT INTO t VALUES (1, ?1, ?2)", [b, d]).unwrap();
+        };
+
+        // --- default: strict-reject. §4.5's default, and it holds.
+        let (s1, d1) = (mk("strict"), dst("strict"));
+        seed(&s1, "yes", "2023-11-14T22:13:20Z");
+        let r = import_sqlite(
+            &mut Connection::open(&s1).unwrap(),
+            &d1,
+            &ImportOptions::default(),
+        )
+        .err();
+        assert!(
+            matches!(&r, Some(mpedb_types::Error::TypeMismatch(m)) if m.contains("strict-reject")),
+            "strict-reject is the default: {r:?}"
+        );
+        let _ = std::fs::remove_file(&d1);
+
+        // --- opted in: both coerce, and the import SAYS what it changed.
+        let (s2, d2) = (mk("adapt"), dst("adapt"));
+        seed(&s2, "yes", "2023-11-14T22:13:20Z");
+        let opts = ImportOptions {
+            adapt: Some(AdaptMode::ExactOnly),
+            ..Default::default()
+        };
+        let (db, rep) = import_sqlite(&mut Connection::open(&s2).unwrap(), &d2, &opts).unwrap();
+        assert_eq!(rep.adapted.len(), 2, "every coercion is reported: {:?}", rep.adapted);
+        match db.query("SELECT ok, at FROM t", &[]).unwrap() {
+            ExecResult::Rows { rows, .. } => {
+                assert_eq!(rows[0][0], Value::Bool(true), "'yes' -> true");
+                assert_eq!(
+                    rows[0][1],
+                    Value::Timestamp(1_700_000_000_000_000),
+                    "ISO-8601 -> micros UTC"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        drop(db);
+        let _ = std::fs::remove_file(&d2);
+
+        // --- the line: '007abc' is NOT 7, in any mode. SQL's CAST says 7.
+        let (s3, d3) = (mk("trap"), dst("trap"));
+        {
+            let _ = std::fs::remove_file(&s3);
+            let c = Connection::open(&s3).unwrap();
+            c.execute_batch("CREATE TABLE t(id INTEGER PRIMARY KEY, qty INTEGER);")
+                .unwrap();
+            // non-numeric text survives INTEGER affinity as TEXT
+            c.execute("INSERT INTO t VALUES (1, ?1)", ["007abc"]).unwrap();
+        }
+        for mode in [AdaptMode::ExactOnly, AdaptMode::AllowLossy] {
+            let _ = std::fs::remove_file(&d3);
+            let o = ImportOptions {
+                adapt: Some(mode),
+                ..Default::default()
+            };
+            let r = import_sqlite(&mut Connection::open(&s3).unwrap(), &d3, &o).err();
+            assert!(
+                matches!(&r, Some(mpedb_types::Error::TypeMismatch(m)) if m.contains("data loss")),
+                "{mode:?} must refuse '007abc', not coerce it to 7: {r:?}"
+            );
+        }
+
+        for p in [s1, s2, s3, d3] {
             let _ = std::fs::remove_file(p);
         }
     }

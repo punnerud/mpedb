@@ -72,7 +72,15 @@ mpedb mirror <subcommand>
 
   import  --source <sqlite-file> --dest <new-mpedb-file>
           [--include t1,t2] [--exclude t3] [--size_mb N] [--durability none|commit|wal]
+          [--adapt exact|lossy]
       Import a sqlite database into a NEW .mpedb mirror file.
+      sqlite's declared types are affinities, not constraints, so a column may
+      hold off-type values. By DEFAULT one of those fails the import (loudly,
+      while you are watching). --adapt exact coerces only what parses WHOLLY and
+      losslessly ('yes' -> true, ISO-8601 -> timestamp); --adapt lossy also
+      allows coercions that discard something (truncation, rounding). Neither
+      ever prefix-parses: '007abc' is refused, never turned into 7. Every
+      coercion applied is printed.
 
   export  --db <mpedb-file> --dest <new-sqlite-file>
       Export a mirror back out to a fresh sqlite database.
@@ -275,16 +283,38 @@ fn cmd_import(argv: &[String]) -> CliResult {
 
     let mut conn = Connection::open(source)
         .map_err(|e| Failure::Runtime(format!("open sqlite source `{source}`: {e}")))?;
+    // Strict-reject stays the default (DESIGN-MIRROR §4.5): an off-type value
+    // should fail loudly while a human is watching, not be silently coerced.
+    let adapt = match p.value("adapt") {
+        None => None,
+        Some("exact") => Some(mpedb_mirror::AdaptMode::ExactOnly),
+        Some("lossy") => Some(mpedb_mirror::AdaptMode::AllowLossy),
+        Some(other) => {
+            return usage(format!("--adapt must be exact|lossy, got `{other}`"))
+        }
+    };
     let opts = ImportOptions {
         size_bytes: size_mb * 1024 * 1024,
         durability,
         include,
         exclude,
         batch_rows: 8192,
+        adapt,
     };
     let (_db, report) = import_sqlite(&mut conn, &dest, &opts)?;
 
     println!("imported {} into {}", source, dest.display());
+    if !report.adapted.is_empty() {
+        // An adapted import must say exactly what it changed: a count alone is a
+        // summary of unreviewable edits.
+        println!("  adapted {} value(s) on the way in:", report.adapted.len());
+        for a in report.adapted.iter().take(20) {
+            println!("    {a}");
+        }
+        if report.adapted.len() > 20 {
+            println!("    … and {} more", report.adapted.len() - 20);
+        }
+    }
     for t in &report.tables {
         println!("  {:<24} {:>10} rows  (table {})", t.name, t.rows, t.table_id);
     }

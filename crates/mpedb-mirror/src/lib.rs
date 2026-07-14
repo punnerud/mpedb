@@ -8,6 +8,7 @@
 //! mpedb-core as a generic CDC primitive; this crate owns the mirror semantics
 //! on top of it.
 
+pub mod adapt;
 pub mod adapter;
 pub mod apply;
 pub mod conflicts;
@@ -39,7 +40,10 @@ pub use export::{diff_sqlite_data, export_sqlite, ExportReport};
 pub use import::{import_sqlite, ImportOptions, ImportReport};
 pub use pg_adapter::PgAdapter;
 pub use pg_import::import_pg;
-pub use preflight::{preflight, Finding, FindingKind, PreflightReport};
+pub use adapt::{adapt, Adaptation};
+pub use preflight::{
+    apply_adaptations, preflight, AdaptMode, AdaptStats, Finding, FindingKind, PreflightReport,
+};
 pub use push::{push_batch, PushStats};
 pub use resolve::{resolve, ResolveStats, Take};
 

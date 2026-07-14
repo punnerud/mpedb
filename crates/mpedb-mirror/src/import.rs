@@ -35,6 +35,21 @@ pub struct ImportOptions {
     pub exclude: Vec<String>,
     /// Rows per apply transaction.
     pub batch_rows: usize,
+    /// **How to handle a loose source's off-type values** (task #26.3).
+    ///
+    /// sqlite's declared types are affinities, not constraints, so an INTEGER
+    /// column may legitimately hold the text `"42"`. mpedb's schema is rigid and
+    /// cannot store it, so import must decide: refuse, or coerce.
+    ///
+    /// `None` (the default) is **strict-reject** — one off-type value fails the
+    /// import, loudly, while a human is watching. That is DESIGN-MIRROR §4.5's
+    /// default and it stays: silently coercing is how `'007abc'` becomes `7`.
+    ///
+    /// `Some(mode)` opts in to [`crate::adapt`]'s whole-value coercions, which
+    /// still refuse anything they cannot parse completely. Every coercion is
+    /// counted in [`ImportReport::adapted`] so an opted-in import still says
+    /// what it did rather than hiding it.
+    pub adapt: Option<crate::preflight::AdaptMode>,
 }
 
 impl Default for ImportOptions {
@@ -42,6 +57,7 @@ impl Default for ImportOptions {
         ImportOptions {
             size_bytes: 256 * 1024 * 1024,
             durability: Durability::None,
+            adapt: None, // strict-reject: §4.5's default, deliberately
             include: None,
             exclude: Vec::new(),
             batch_rows: 4096,
@@ -61,6 +77,10 @@ pub struct TableImportStat {
 #[derive(Clone, Debug, Default)]
 pub struct ImportReport {
     pub tables: Vec<TableImportStat>,
+    /// Values coerced on the way in (`ImportOptions::adapt`), described one by
+    /// one. An adapted import must still be able to say exactly what it changed
+    /// — a count alone would be a summary of unreviewable edits.
+    pub adapted: Vec<String>,
 }
 
 impl ImportReport {
@@ -113,7 +133,15 @@ pub fn import_sqlite(
             .iter()
             .position(|t| t.name == src_t.name)
             .expect("introspected table is in the built schema") as u32;
-        let rows = import_table(&db, &tx, src_t, table_id, opts.batch_rows)?;
+        let rows = import_table(
+            &db,
+            &tx,
+            src_t,
+            table_id,
+            opts.batch_rows,
+            opts.adapt,
+            &mut report.adapted,
+        )?;
         report.tables.push(TableImportStat {
             name: src_t.name.clone(),
             table_id,
@@ -163,12 +191,15 @@ pub(crate) fn create_mirror_db(
 
 /// Stream one table's rows from the snapshot into mpedb in bounded batches,
 /// writing the `imp/<tid>` resume watermark atomically with each batch.
+#[allow(clippy::too_many_arguments)]
 fn import_table(
     db: &Database,
     tx: &rusqlite::Transaction,
     src_t: &sqlite::SourceTable,
     table_id: u32,
     batch_rows: usize,
+    adapt: Option<crate::preflight::AdaptMode>,
+    adapted_log: &mut Vec<String>,
 ) -> Result<u64> {
     let col_types: Vec<ColumnType> = src_t.columns.iter().map(|c| c.mapped).collect();
     let pk_cols = &src_t.pk;
@@ -211,7 +242,27 @@ fn import_table(
                     let vr = row
                         .get_ref(i)
                         .map_err(|e| Error::Config(format!("sqlite column read: {e}")))?;
-                    values.push(convert_value(vr, *ct, &src_t.name, &src_t.columns[i].name)?);
+                    // Build the column's provenance on the fly so an adapting
+                    // import decides against the SAME recorded contract a later
+                    // preflight/export will use — one source of truth, not two.
+                    let cmap = crate::state::ColumnMap {
+                        source_name: src_t.columns[i].name.clone(),
+                        source_type: src_t.columns[i].declared_type.clone(),
+                        not_null: src_t.columns[i].not_null,
+                        generated: src_t.columns[i].generated,
+                        identity: false,
+                        unique: src_t.columns[i].unique,
+                        mapped: *ct,
+                        policy: sqlite::sqlite_map_policy(&src_t.columns[i].declared_type),
+                    };
+                    let a = adapt.map(|m| (m, &cmap, &mut *adapted_log));
+                    values.push(convert_value_opt(
+                        vr,
+                        *ct,
+                        &src_t.name,
+                        &src_t.columns[i].name,
+                        a,
+                    )?);
                 }
                 batch.push(values);
                 if batch.len() >= batch_rows {
@@ -253,6 +304,68 @@ pub(crate) fn flush_batch(
 
 /// Convert a sqlite value to the mapped mpedb type. Strict-reject on any
 /// violation (the §4.5 import default). Shared with the pull adapter.
+/// Convert one sqlite value to the column's mpedb type.
+///
+/// `adapt` is `None` for every path except an opted-in import: the pull adapter
+/// and row re-reads keep strict-reject, because coercing there would silently
+/// change data that is already live in the mirror.
+pub(crate) fn convert_value_opt(
+    vr: ValueRef,
+    ct: ColumnType,
+    table: &str,
+    col: &str,
+    adapt: Option<(crate::preflight::AdaptMode, &crate::state::ColumnMap, &mut Vec<String>)>,
+) -> Result<Value> {
+    match convert_value(vr, ct, table, col) {
+        Ok(v) => Ok(v),
+        Err(strict) => {
+            // Strict-reject said no. If the caller opted in, see whether a
+            // WHOLE-value coercion exists — never a prefix parse.
+            let Some((mode, cmap, log)) = adapt else {
+                return Err(strict);
+            };
+            let raw = raw_value(vr)?;
+            match crate::adapt::adapt(cmap, &raw) {
+                crate::adapt::Adaptation::Exact(v) => {
+                    log.push(format!("{table}.{col}: {raw} -> {v}"));
+                    Ok(v)
+                }
+                crate::adapt::Adaptation::Lossy(v, why) => {
+                    if mode == crate::preflight::AdaptMode::AllowLossy {
+                        log.push(format!("{table}.{col}: {raw} -> {v} (LOSSY: {why})"));
+                        Ok(v)
+                    } else {
+                        Err(Error::TypeMismatch(format!(
+                            "sqlite `{table}.{col}`: {raw} needs a LOSSY coercion ({why}); \
+                             re-run allowing lossy adaptation, or fix the source"
+                        )))
+                    }
+                }
+                crate::adapt::Adaptation::Impossible(why) => Err(Error::TypeMismatch(format!(
+                    "sqlite `{table}.{col}`: {why}"
+                ))),
+                crate::adapt::Adaptation::Fine => Err(strict),
+            }
+        }
+    }
+}
+
+/// A sqlite value as its own mpedb type, ignoring the column — the input to a
+/// coercion decision.
+fn raw_value(vr: ValueRef) -> Result<Value> {
+    Ok(match vr {
+        ValueRef::Null => Value::Null,
+        ValueRef::Integer(i) => Value::Int(i),
+        ValueRef::Real(f) => Value::Float(f),
+        ValueRef::Text(b) => Value::Text(
+            std::str::from_utf8(b)
+                .map_err(|_| Error::TypeMismatch("invalid UTF-8 in TEXT value".into()))?
+                .to_string(),
+        ),
+        ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+    })
+}
+
 pub(crate) fn convert_value(vr: ValueRef, ct: ColumnType, table: &str, col: &str) -> Result<Value> {
     let violation = |what: &str| {
         Err(Error::TypeMismatch(format!(
