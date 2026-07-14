@@ -37,6 +37,7 @@ pub fn run(argv: &[String]) -> CliResult {
         "verify" => cmd_verify(rest),
         "reconcile" => cmd_reconcile(rest),
         "switch" => cmd_switch(rest),
+        "regenerate" => cmd_regenerate(rest),
         "unfreeze" => cmd_unfreeze(rest),
         "conflicts" => cmd_conflicts(rest),
         "resolve" => cmd_resolve(rest),
@@ -196,6 +197,20 @@ SOURCE SELECTION
   switch  --db <mpedb-file> --to mpedb|source [--source <f> | --source-config <f>]
       Move authority to the given side (epoch-fenced).
 
+  regenerate --db <mpedb-file> [--size_mb N] [--source <f> | --source-config <f>]
+             [--no-drain]
+      Rebuild the mirror into a fresh file of --size_mb, carrying its whole
+      identity across: rows, cursor, epoch, type provenance, parked conflicts,
+      and the UN-PUSHED local changes still waiting to reach the source.
+      This is the only way out of a full mirror (the geometry is fixed at
+      create time, so a full file cannot grow), and the only way to follow a
+      source that gained a table or drifted its schema -- mpedb has no ALTER
+      or CREATE TABLE by design (DESIGN-MIRROR §7).
+      Pushes to the source first when one is reachable; --no-drain skips that.
+      Crash-safe: the old file is untouched until an atomic rename, and a
+      half-done rebuild leaves the mirror FROZEN rather than writable -- run
+      `unfreeze` after checking it.
+
   unfreeze --db <mpedb-file>
       Clear a stuck freeze (e.g. after a switch-to-source verify failure);
       reconcile first, then retry the switch.
@@ -239,6 +254,48 @@ fn cmd_resolve(argv: &[String]) -> CliResult {
     println!(
         "resolved: {} took-source, {} took-local, {} still parked",
         s.took_source, s.took_local, s.still_parked
+    );
+    Ok(())
+}
+
+fn cmd_regenerate(argv: &[String]) -> CliResult {
+    let p = args::parse(argv, &["db", "size_mb", "source", "source-config"], &["no-drain"])?;
+    let db_path = PathBuf::from(p.require("db")?);
+    let size_mb = p.value("size_mb").unwrap_or("256");
+    let size_mb: u64 = size_mb
+        .parse()
+        .map_err(|_| Failure::Usage("--size_mb must be an integer".into()))?;
+
+    // §7 step 2: drain-push first WHEN REACHABLE. It is not required — the
+    // un-pushed dirty set travels either way — but pushing first means the
+    // source is already current if the rebuild goes wrong, so it is the
+    // default. A db_full escape must not depend on the source being up, hence
+    // --no-drain and the tolerated failure below.
+    if !p.has("no-drain") && (p.value("source").is_some() || p.value("source-config").is_some()) {
+        match open_source(p.require("db")?, &p) {
+            Ok((db, mut a)) => match drain_push(&db, a.as_mut()) {
+                Ok(s) => println!("drained {} change(s) to the source first", s.upserts + s.deletes),
+                Err(e) => println!("could not drain to the source ({e}); regenerating anyway — \
+                                    the un-pushed changes travel with the rebuild"),
+            },
+            Err(e) => println!("could not reach the source ({e:?}); regenerating anyway"),
+        }
+    }
+
+    let rep = mpedb_mirror::regenerate(&db_path, size_mb * 1024 * 1024)?;
+    println!(
+        "regenerated {} at {} MB",
+        db_path.display(),
+        rep.new_size_bytes / (1024 * 1024)
+    );
+    for (name, n) in &rep.tables {
+        println!("  {name:<24} {n:>10} rows");
+    }
+    println!(
+        "  total: {} rows, {} mirror record(s), {} un-pushed local change(s) carried",
+        rep.total_rows(),
+        rep.mir_records,
+        rep.dirty_entries
     );
     Ok(())
 }

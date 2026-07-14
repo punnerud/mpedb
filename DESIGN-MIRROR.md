@@ -627,6 +627,28 @@ migrated last_txn** (fresh file restarts txn_id at 0 — else push wedges/clears
 migrated entries) and re-seeds cur → atomic rename swap → unfreeze. Crash-wave
 tested (M6).
 
+> **As built (2026-07-14).** Two details of the paragraph above are stale, and
+> the code is the truth:
+> - *`applied_high_water`* does not exist. M5 replaced the global high-water mark
+>   with a **per-entry `last_txn` compare** (clear an entry only if it was not
+>   re-dirtied since the scan), which is what closed CONF#0/15. The txn-restart
+>   hazard is real but lands differently: a migrated entry carries the OLD file's
+>   `last_txn`, and the fresh file's counter starts at 0, so the value would
+>   eventually collide and clear an entry that HAD been re-dirtied — silently
+>   dropping a local write. Regenerate therefore re-stamps migrated entries
+>   rather than adjusting a mark.
+> - *"re-seeds cur"* is not done, deliberately. `mir/cur` is transplanted
+>   VERBATIM. Re-seeding it is exactly the bug CONF#3/#16 closed in
+>   `switch_to_source`: it skips every source write committed between the drain
+>   and the cutover. A rebuilt mirror has consumed precisely what the old one
+>   had; the cursor must not move.
+>
+> Also as built: **drain-push is the CALLER's step, not regenerate's.** A
+> db_full escape cannot depend on the source being reachable, so the library
+> function takes no adapter and the CLI drains first when it can (`--no-drain`
+> to skip). The un-pushed dirty set travels either way, so skipping the drain
+> costs a delay, never data.
+
 ## 8. Conflict policy
 
 Detection: pull-side reads the **pre-batch** `d/` snapshot (§5.4 step 3);
