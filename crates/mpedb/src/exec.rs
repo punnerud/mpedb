@@ -5,7 +5,8 @@
 use crate::ExecResult;
 use mpedb_core::{ReadTxn, WriteTxn};
 use mpedb_sql::{
-    AccessPath, Aggregation, CompiledPlan, InsertSource, PlanOnConflict, PlanStmt, Projection,
+    AccessPath, AggCall, Aggregation, CompiledPlan, InsertSource, PlanOnConflict, PlanStmt,
+    Projection,
 };
 use mpedb_types::{
     keycode, Accum, DefaultExpr, Error, ExprProgram, KeyBound, KeyPart, Result, Schema, TableDef,
@@ -344,9 +345,17 @@ pub(crate) fn exec_stmt(
             limit,
             offset,
             aggregate,
+            distinct,
         } => {
             let t = table_def(schema, *table)?;
+            // DISTINCT makes LIMIT bound DISTINCT rows, so the scan bound (and
+            // the top-K path, which is the same bound wearing a hat) must not
+            // apply — the same trap the aggregate path has. Forcing it to None
+            // here keeps that in one place rather than at each use.
             let skip_take_bound = || {
+                if *distinct {
+                    return None;
+                }
                 limit.map(|l| {
                     let l = l.min(usize::MAX as u64) as usize;
                     let o = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
@@ -356,10 +365,14 @@ pub(crate) fn exec_stmt(
             if let Some(agg) = aggregate {
                 return exec_aggregate(
                     ctx, plan, params, t, *table, access, filter.as_ref(), agg, projection,
-                    order_by, *limit, *offset,
+                    order_by, *limit, *offset, *distinct,
                 );
             }
-            let rows = if order_by.is_empty() {
+            let rows = if *distinct {
+                // The sort indexes the PROJECTION here and must follow the
+                // dedup, so the base rows are left unsorted and unbounded.
+                gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?
+            } else if order_by.is_empty() {
                 // No surviving sort (the planner elides ORDER BY that matches
                 // PK scan order): stream and stop after offset+limit rows.
                 gather_rows(ctx, *table, access, filter.as_ref(), plan, params, skip_take_bound())?
@@ -375,8 +388,18 @@ pub(crate) fn exec_stmt(
             };
             let skip = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
             let take = limit.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
+            // Without DISTINCT, skip/take applies to base rows and there is no
+            // reason to project the ones being skipped. With it, the projection
+            // is what gets deduplicated, so it must happen first and skip/take
+            // moves to the end.
+            let (row_skip, row_take) = if *distinct {
+                (0, usize::MAX)
+            } else {
+                (skip, take)
+            };
             let mut out = Vec::new();
-            for row in rows.into_iter().skip(skip).take(take) {
+            let mut seen = std::collections::HashSet::new();
+            for row in rows.into_iter().skip(row_skip).take(row_take) {
                 let mut orow = Vec::with_capacity(projection.len());
                 for p in projection {
                     orow.push(match p {
@@ -387,7 +410,18 @@ pub(crate) fn exec_stmt(
                         Projection::Expr { program, .. } => program.eval(&row, params)?,
                     });
                 }
+                // Keying on the memcmp encoding rather than on Value: DISTINCT
+                // must treat NULLs as equal to each other (unlike `=`), which
+                // is exactly what the key encoding does, and Value is neither
+                // Hash nor Ord.
+                if *distinct && !seen.insert(keycode::encode_key(&orow)) {
+                    continue;
+                }
                 out.push(orow);
+            }
+            if *distinct {
+                sort_rows(&mut out, order_by);
+                out = out.into_iter().skip(skip).take(take).collect();
             }
             let columns = projection
                 .iter()
@@ -666,6 +700,14 @@ pub(crate) fn exec_stmt(
     }
 }
 
+fn new_accum(a: &AggCall) -> Accum {
+    if a.distinct {
+        Accum::new_distinct(a.func)
+    } else {
+        Accum::new(a.func)
+    }
+}
+
 /// `GROUP BY` / aggregates / `HAVING`.
 ///
 /// **The first line is the invariant.** DESIGN-MULTIDB §4: aggregation must
@@ -696,6 +738,7 @@ fn exec_aggregate(
     order_by: &[(u16, bool)],
     limit: Option<u64>,
     offset: Option<u64>,
+    distinct: bool,
 ) -> Result<ExecResult> {
     // Unbounded on purpose: see the LIMIT note above.
     let rows = gather_rows(ctx, table, access, filter, plan, params, None)?;
@@ -715,7 +758,7 @@ fn exec_aggregate(
         let entry = groups.entry(key).or_insert_with(|| {
             (
                 key_vals,
-                agg.aggs.iter().map(|a| Accum::new(a.func)).collect(),
+                agg.aggs.iter().map(new_accum).collect(),
             )
         });
         for (i, call) in agg.aggs.iter().enumerate() {
@@ -736,7 +779,7 @@ fn exec_aggregate(
     // GROUP BY, an empty input means no groups at all.
     let mut out: Vec<Vec<Value>> = Vec::new();
     if groups.is_empty() && agg.group_by.is_empty() {
-        let accs: Vec<Accum> = agg.aggs.iter().map(|a| Accum::new(a.func)).collect();
+        let accs: Vec<Accum> = agg.aggs.iter().map(new_accum).collect();
         out.push(accs.into_iter().map(|a| a.finish()).collect());
     }
     for (_, (keys, accs)) in groups {
@@ -757,14 +800,18 @@ fn exec_aggregate(
         out = keep;
     }
 
-    if !order_by.is_empty() {
+    // Sort the GROUPED tuple only when the indices refer to it. Under DISTINCT
+    // they refer to the projection, and the sort waits until after the dedup
+    // below.
+    if !distinct && !order_by.is_empty() {
         sort_rows(&mut out, order_by);
     }
 
     let skip = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
     let take = limit.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
     let mut projected = Vec::new();
-    for tuple in out.into_iter().skip(skip).take(take) {
+    let mut seen = std::collections::HashSet::new();
+    for tuple in out {
         let mut orow = Vec::with_capacity(projection.len());
         for p in projection {
             orow.push(match p {
@@ -775,8 +822,18 @@ fn exec_aggregate(
                 Projection::Expr { program, .. } => program.eval(&tuple, params)?,
             });
         }
+        // `SELECT DISTINCT dept, count(*) … GROUP BY dept` — the groups are
+        // already distinct by key, but the PROJECTION need not be (two groups
+        // can share a count), so this still has work to do.
+        if distinct && !seen.insert(keycode::encode_key(&orow)) {
+            continue;
+        }
         projected.push(orow);
     }
+    if distinct {
+        sort_rows(&mut projected, order_by);
+    }
+    let projected: Vec<Vec<Value>> = projected.into_iter().skip(skip).take(take).collect();
     let columns = projection
         .iter()
         .map(|p| match p {

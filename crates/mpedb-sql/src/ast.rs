@@ -18,6 +18,9 @@ pub(crate) enum Stmt {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SelectStmt {
     pub table: String,
+    /// `SELECT DISTINCT` — deduplicate the OUTPUT rows (the projected tuple),
+    /// which is why it cannot be pushed into the scan.
+    pub distinct: bool,
     /// `None` = `SELECT *`.
     pub items: Option<Vec<Expr>>,
     pub where_clause: Option<Expr>,
@@ -26,8 +29,7 @@ pub(crate) struct SelectStmt {
     pub group_by: Vec<String>,
     /// `HAVING` — a predicate over the GROUPED row, not the base row.
     pub having: Option<Expr>,
-    /// (column name, descending)
-    /// `ORDER BY <expr> [ASC|DESC]`. An expression rather than a name because
+    /// `ORDER BY <expr> [ASC|DESC]`, and whether it descends. An expression rather than a name because
     /// `ORDER BY count(*)` is legal in both sqlite and PG, and an aggregate is
     /// not a name. The planner still requires each item to REDUCE to a column
     /// of the output tuple — sorting by a computed expression is rejected, not
@@ -153,5 +155,8 @@ pub(crate) enum Expr {
     /// the rows have been filtered and grouped. Conflating them is how an
     /// aggregate ends up reading the pre-filter tuple stream (DESIGN-MULTIDB §4).
     /// `None` = `count(*)`, which takes the ROW rather than a value.
-    Agg(mpedb_types::AggFn, Option<Box<Expr>>),
+    /// `f([DISTINCT] arg)`, or `count(*)` (a `None` arg — the row itself).
+    /// The bool is DISTINCT: `count(DISTINCT x)` counts distinct non-NULL
+    /// values of x.
+    Agg(mpedb_types::AggFn, Option<Box<Expr>>, bool),
 }

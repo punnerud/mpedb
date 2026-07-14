@@ -22,6 +22,7 @@
 //! overflow" too. Both refuse rather than hand back a plausible wrong total.
 
 use crate::{AggFn, Error, Result, Value};
+use std::collections::BTreeSet;
 
 /// Running state for one aggregate over one group.
 #[derive(Debug, Clone)]
@@ -33,6 +34,12 @@ pub struct Accum {
     acc: Option<Value>,
     /// `AVG` needs a float total regardless of the input's type.
     fsum: f64,
+    /// `f(DISTINCT x)`: the values already accumulated in this group, keyed by
+    /// their memcmp encoding (`Value` is neither `Hash` nor `Ord`). `None` for
+    /// a non-DISTINCT aggregate — the set is what makes DISTINCT cost memory
+    /// proportional to the group's distinct values, so a plain `sum(x)` must
+    /// not pay for it.
+    seen: Option<BTreeSet<Vec<u8>>>,
 }
 
 impl Accum {
@@ -42,6 +49,21 @@ impl Accum {
             n: 0,
             acc: None,
             fsum: 0.0,
+            seen: None,
+        }
+    }
+
+    /// `f(DISTINCT x)` — accumulate each distinct value once.
+    ///
+    /// NULL never reaches the set: `push` skips it before the dedup, which is
+    /// why `count(DISTINCT x)` over an all-NULL group is 0 rather than 1. The
+    /// difference from `SELECT DISTINCT`, where NULLs form one group, is that
+    /// there NULL is a value being grouped and here it is a value being
+    /// ignored.
+    pub fn new_distinct(func: AggFn) -> Accum {
+        Accum {
+            seen: Some(BTreeSet::new()),
+            ..Accum::new(func)
         }
     }
 
@@ -57,6 +79,15 @@ impl Accum {
         // "summed nothing" from "saw no values" below.
         if v.is_null() {
             return Ok(());
+        }
+        // DISTINCT: a repeat of a value already accumulated in this group is
+        // dropped here, AFTER the NULL skip above and BEFORE `n` moves — so it
+        // affects count, sum and avg alike, and min/max not at all (they are
+        // idempotent, which is why `min(DISTINCT x)` is legal but pointless).
+        if let Some(seen) = &mut self.seen {
+            if !seen.insert(crate::keycode::encode_key(std::slice::from_ref(v))) {
+                return Ok(());
+            }
         }
         self.n += 1;
         match self.func {
@@ -219,6 +250,69 @@ mod tests {
         a.push(Some(&Value::Int(i64::MAX))).unwrap();
         let r = a.push(Some(&Value::Int(1)));
         assert!(matches!(r, Err(Error::ArithmeticOverflow)), "got {r:?}");
+    }
+
+    fn run_distinct(f: AggFn, vals: &[Option<Value>]) -> Value {
+        let mut a = Accum::new_distinct(f);
+        for v in vals {
+            a.push(v.as_ref()).unwrap();
+        }
+        a.finish()
+    }
+
+    /// `count(DISTINCT x)` collapses repeats and still skips NULL. Verified
+    /// against sqlite 3.45 on the same data.
+    #[test]
+    fn distinct_collapses_repeats_and_still_skips_null() {
+        let vs = [
+            Some(Value::Int(100)),
+            Some(Value::Int(100)),
+            Some(Value::Int(200)),
+            Some(Value::Null),
+            Some(Value::Int(50)),
+        ];
+        assert_eq!(run_distinct(AggFn::Count, &vs), Value::Int(3));
+        assert_eq!(run_distinct(AggFn::Sum, &vs), Value::Int(350)); // not 450
+        assert_eq!(run_distinct(AggFn::Min, &vs), Value::Int(50));
+    }
+
+    /// An all-NULL group is 0 under `count(DISTINCT x)`, not 1: NULL is
+    /// skipped BEFORE the dedup, so it never becomes "one distinct value".
+    /// This is the one place DISTINCT-in-an-aggregate differs from SELECT
+    /// DISTINCT, where NULLs do form a group.
+    #[test]
+    fn distinct_never_counts_null_as_a_value() {
+        let all_null = [Some(Value::Null), Some(Value::Null)];
+        assert_eq!(run_distinct(AggFn::Count, &all_null), Value::Int(0));
+        assert_eq!(run_distinct(AggFn::Sum, &all_null), Value::Null);
+    }
+
+    /// AVG(DISTINCT x) averages the distinct values — 100 and 200 average to
+    /// 150 however many times each was seen.
+    #[test]
+    fn avg_distinct_averages_the_distinct_values() {
+        let vs = [
+            Some(Value::Int(100)),
+            Some(Value::Int(100)),
+            Some(Value::Int(100)),
+            Some(Value::Int(200)),
+        ];
+        assert_eq!(run_distinct(AggFn::Avg, &vs), Value::Float(150.0));
+        assert_eq!(run(AggFn::Avg, &vs), Value::Float(125.0)); // without DISTINCT
+    }
+
+    /// min/max are idempotent, so DISTINCT cannot change them. Legal, and a
+    /// no-op — pinned so a dedup bug cannot hide here.
+    #[test]
+    fn distinct_is_a_no_op_for_min_and_max() {
+        let vs = [
+            Some(Value::Int(5)),
+            Some(Value::Int(5)),
+            Some(Value::Int(1)),
+            Some(Value::Int(9)),
+        ];
+        assert_eq!(run_distinct(AggFn::Min, &vs), run(AggFn::Min, &vs));
+        assert_eq!(run_distinct(AggFn::Max, &vs), run(AggFn::Max, &vs));
     }
 
     #[test]

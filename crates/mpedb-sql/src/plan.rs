@@ -12,9 +12,20 @@ use mpedb_types::{AggFn,
 };
 
 /// Leading byte of the plan wire format (independent of [`FORMAT_VERSION`],
-/// which is mixed into the hash). Bumped to 2 for the reserved session-context
-/// parameter slots (DESIGN-MULTIDB.md §2); an older blob fails `decode` closed.
-const PLAN_FORMAT: u8 = 2;
+/// which is mixed into the hash). An older blob fails `decode` closed, at byte
+/// 0, with a version error — which is the point: plans are stored persistently
+/// in the catalog's sys-keyspace, so a file written by an older build hands
+/// this decoder bytes in a layout it no longer speaks.
+///
+/// 2: reserved session-context parameter slots (DESIGN-MULTIDB.md §2).
+/// 3: aggregates. Every `Select` now encodes an `aggregate` tag byte after
+///    `offset`, and every `AggCall` a `distinct` byte. Both are layout changes
+///    to EXISTING records, not just new statement kinds — a v2 `Select` blob
+///    read by this decoder would take the byte after `offset` as the aggregate
+///    tag and desynchronize from there. It would most likely then fail some
+///    later bounds check, but "most likely" is exactly what this byte exists to
+///    replace with "always".
+const PLAN_FORMAT: u8 = 3;
 
 /// A compiled, content-addressed statement plan.
 #[derive(Debug, Clone, PartialEq)]
@@ -62,12 +73,34 @@ pub enum PlanStmt {
         filter: Option<ExprProgram>,
         /// Output columns, in order.
         projection: Vec<Projection>,
-        /// (table column index, descending). Empty = scan order.
+        /// (column index, descending). Empty = scan order.
+        ///
+        /// **What the index refers to depends on the shape below it**, because
+        /// each stage sorts the tuple it produces:
+        ///
+        /// - plain: the BASE row — sorted before projection, which is what lets
+        ///   the PK-prefix elision and the top-K path work on scan order.
+        /// - `aggregate`: the GROUPED tuple `[keys ‖ aggs]` — a sort key may be
+        ///   an aggregate that is not selected (`ORDER BY count(*)`).
+        /// - `distinct`: the PROJECTION — the sort must follow the dedup, and
+        ///   `check_distinct_order_by` has already guaranteed every key is in
+        ///   the SELECT list, so an output position always exists (including
+        ///   for `ORDER BY amt * 2`, which no base-column index could name).
+        ///
+        /// `distinct` wins over `aggregate` when both are set.
         order_by: Vec<(u16, bool)>,
         limit: Option<u64>,
         offset: Option<u64>,
         /// Grouping, applied **after** `filter`. `None` = no aggregation.
         aggregate: Option<Aggregation>,
+        /// `SELECT DISTINCT` — deduplicate the PROJECTED tuples.
+        ///
+        /// It cannot be pushed into the scan (the projection is what is being
+        /// deduplicated, and it may be an expression), and it means `limit`
+        /// bounds DISTINCT rows rather than scanned rows — the same trap
+        /// `aggregate` has, so the executor must not pass a scan bound down
+        /// when this is set.
+        distinct: bool,
     },
     Insert {
         table: u32,
@@ -135,6 +168,9 @@ pub struct Aggregation {
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggCall {
     pub func: AggFn,
+    /// `count(DISTINCT x)` — deduplicate this aggregate's INPUT values within
+    /// each group before accumulating. Meaningless but legal for min/max.
+    pub distinct: bool,
     /// `None` = `count(*)`: the argument is the ROW, not a value, so NULL cannot
     /// arise and every row counts. `Some(p)` is evaluated over the base row and
     /// NULLs are skipped. That difference is the whole reason `count(*)` exists.
@@ -772,9 +808,14 @@ impl CompiledPlan {
                 limit,
                 offset,
                 aggregate,
+                distinct,
             } => {
                 let base = col_namer(*table);
-                out.push_str(&format!("Select {}\n", table_name(*table)));
+                out.push_str(&format!(
+                    "Select{} {}\n",
+                    if *distinct { " DISTINCT" } else { "" },
+                    table_name(*table)
+                ));
                 out.push_str(&format!(
                     "  access: {}\n",
                     self.render_access(access, schema, *table)
@@ -1297,6 +1338,7 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             limit,
             offset,
             aggregate,
+            distinct,
         } => {
             buf.push(STMT_SELECT);
             buf.extend_from_slice(&table.to_le_bytes());
@@ -1324,6 +1366,7 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             }
             encode_opt_u64(*limit, buf);
             encode_opt_u64(*offset, buf);
+            buf.push(*distinct as u8);
             match aggregate {
                 None => buf.push(0),
                 Some(a) => {
@@ -1335,6 +1378,7 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
                     w_u16(buf, a.aggs.len() as u16);
                     for c in &a.aggs {
                         buf.push(c.func as u8);
+                        buf.push(c.distinct as u8);
                         match &c.arg {
                             None => buf.push(0),
                             Some(p) => {
@@ -1463,6 +1507,11 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
             }
             let limit = decode_opt_u64(buf, pos)?;
             let offset = decode_opt_u64(buf, pos)?;
+            let distinct = match r_u8(buf, pos)? {
+                0 => false,
+                1 => true,
+                t => return Err(corrupt(format!("bad distinct tag {t}"))),
+            };
             let aggregate = match r_u8(buf, pos)? {
                 0 => None,
                 1 => {
@@ -1482,12 +1531,26 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                     for _ in 0..n {
                         let f = AggFn::from_tag(r_u8(buf, pos)?)
                             .ok_or_else(|| corrupt("unknown aggregate function"))?;
+                        let distinct = match r_u8(buf, pos)? {
+                            0 => false,
+                            1 => true,
+                            t => return Err(corrupt(format!("bad aggregate distinct tag {t}"))),
+                        };
                         let arg = match r_u8(buf, pos)? {
                             0 => None,
                             1 => Some(ExprProgram::decode(buf, pos)?),
                             t => return Err(corrupt(format!("bad aggregate arg tag {t}"))),
                         };
-                        aggs.push(AggCall { func: f, arg });
+                        if distinct && arg.is_none() {
+                            // count(DISTINCT *) has no meaning and the parser
+                            // rejects it; a blob claiming it is corrupt.
+                            return Err(corrupt("aggregate is DISTINCT but has no argument"));
+                        }
+                        aggs.push(AggCall {
+                            func: f,
+                            arg,
+                            distinct,
+                        });
                     }
                     let having = decode_opt_program(buf, pos)?;
                     Some(Aggregation {
@@ -1507,6 +1570,7 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                 limit,
                 offset,
                 aggregate,
+                distinct,
             })
         }
         STMT_INSERT => {

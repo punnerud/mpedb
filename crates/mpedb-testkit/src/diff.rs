@@ -797,8 +797,9 @@ pub fn generate_program(seed: u64, n_stmts: usize) -> Vec<GenStmt> {
             0..=39 => gen_insert(&mut rng),
             40..=59 => gen_update(&mut rng),
             60..=74 => gen_delete(&mut rng),
-            75..=87 => gen_select(&mut rng),
-            _ => gen_agg_select(&mut rng),
+            75..=84 => gen_select(&mut rng),
+            85..=94 => gen_agg_select(&mut rng),
+            _ => gen_distinct_select(&mut rng),
         };
         out.push(stmt);
     }
@@ -1073,6 +1074,81 @@ fn gen_agg_select(rng: &mut Xorshift) -> GenStmt {
     }
 }
 
+/// `SELECT DISTINCT` probes.
+///
+/// Every key is in the SELECT list and every sort key is NULL-free, for the
+/// same two reasons `gen_agg_select` documents: without an ORDER BY the output
+/// order is the engine's choice, and difference #8 puts PG's NULLs at the
+/// opposite end from mpedb's and sqlite's.
+///
+/// Note what is NOT generated: `SELECT DISTINCT c ... ORDER BY pk`. It would
+/// satisfy the NULL rule, but mpedb rejects it (a sort key outside the SELECT
+/// list has no meaning once duplicates collapse) where sqlite invents an
+/// answer. That divergence is deliberate and pinned in `distinct.test`, not
+/// something to rediscover here as a false positive.
+fn gen_distinct_select(rng: &mut Xorshift) -> GenStmt {
+    // The sort keys, guarded to non-NULL, plus an optional random predicate —
+    // built as conjuncts rather than by splicing strings, so the guard is
+    // always present and always spelled `<key> IS NOT NULL` for the pin below
+    // to find.
+    let build = |rng: &mut Xorshift, keys: &[&str]| -> String {
+        let mut conj: Vec<String> = keys.iter().map(|k| format!("{k} IS NOT NULL")).collect();
+        if rng.chance(1, 2) {
+            conj.push(format!("({})", gen_pred(rng)));
+        }
+        format!(" WHERE {}", conj.join(" AND "))
+    };
+    let limit = |rng: &mut Xorshift| {
+        if rng.chance(1, 4) {
+            format!(" LIMIT {}", rng.below(8))
+        } else {
+            String::new()
+        }
+    };
+    match rng.below(4) {
+        0 => {
+            let w = build(rng, &["a"]);
+            GenStmt {
+                sql: format!("SELECT DISTINCT a FROM t{w} ORDER BY a{}", limit(rng)),
+                is_select: true,
+                shape: vec![Kind::Int],
+            }
+        }
+        1 => {
+            let w = build(rng, &["c"]);
+            GenStmt {
+                sql: format!("SELECT DISTINCT c FROM t{w} ORDER BY c{}", limit(rng)),
+                is_select: true,
+                shape: vec![Kind::Text],
+            }
+        }
+        // A distinct TUPLE, ordered by both members so ties cannot make the
+        // order engine-dependent.
+        2 => {
+            let w = build(rng, &["a", "c"]);
+            GenStmt {
+                sql: format!("SELECT DISTINCT a, c FROM t{w} ORDER BY a, c{}", limit(rng)),
+                is_select: true,
+                shape: vec![Kind::Int, Kind::Text],
+            }
+        }
+        // count(DISTINCT x) — one row, so there is no ordering question at
+        // all, which is why this one may keep an unconstrained WHERE.
+        _ => {
+            let w = if rng.chance(1, 2) {
+                format!(" WHERE {}", gen_pred(rng))
+            } else {
+                String::new()
+            };
+            GenStmt {
+                sql: format!("SELECT count(DISTINCT a), count(DISTINCT c), count(*) FROM t{w}"),
+                is_select: true,
+                shape: vec![Kind::Int, Kind::Int, Kind::Int],
+            }
+        }
+    }
+}
+
 /// Boolean predicate over the fixed schema. Type-correct by construction
 /// (mpedb's rigid binder would reject cross-type comparisons that sqlite
 /// would happily coerce). No `/`, `%` (difference #4).
@@ -1204,8 +1280,62 @@ mod tests {
             }
         }
         assert!(bare > 50, "too few bare aggregate probes: {bare}");
+        let distinct = (0..100)
+            .flat_map(|seed| generate_program(seed, 60))
+            .filter(|s| s.sql.contains("DISTINCT"))
+            .count();
+        assert!(distinct > 50, "too few DISTINCT probes: {distinct}");
         assert!(grouped > 50, "too few GROUP BY probes: {grouped}");
         assert!(having > 10, "too few HAVING probes: {having}");
+    }
+
+    /// The top-level `AND` conjuncts of a statement's WHERE clause, ignoring
+    /// anything nested in parentheses (where an OR may legitimately live).
+    fn top_level_conjuncts(sql: &str) -> Vec<String> {
+        let Some(w) = sql.find(" WHERE ") else {
+            return Vec::new();
+        };
+        let rest = &sql[w + " WHERE ".len()..];
+        let end = ["ORDER BY", "GROUP BY", "LIMIT"]
+            .iter()
+            .filter_map(|k| rest.find(k))
+            .min()
+            .unwrap_or(rest.len());
+        let clause = &rest[..end];
+        let (mut out, mut depth, mut cur) = (Vec::new(), 0i32, String::new());
+        let mut it = clause.char_indices().peekable();
+        while let Some((i, ch)) = it.next() {
+            match ch {
+                '(' => depth += 1,
+                ')' => depth -= 1,
+                _ => {}
+            }
+            if depth == 0 && clause[i..].starts_with(" AND ") {
+                out.push(cur.trim().to_string());
+                cur.clear();
+                for _ in 0.." AND ".len() - 1 {
+                    it.next();
+                }
+                continue;
+            }
+            cur.push(ch);
+        }
+        out.push(cur.trim().to_string());
+        out
+    }
+
+    #[test]
+    fn top_level_conjuncts_ignores_nested_ors() {
+        assert_eq!(
+            top_level_conjuncts("SELECT DISTINCT a FROM t WHERE a IS NOT NULL AND (a > 1 OR c = 'x') ORDER BY a"),
+            vec!["a IS NOT NULL".to_string(), "(a > 1 OR c = 'x')".to_string()]
+        );
+        // An OR-ed guard is NOT a conjunct — the case the pin must not accept.
+        assert_eq!(
+            top_level_conjuncts("SELECT DISTINCT a FROM t WHERE a IS NOT NULL OR c = 'x' ORDER BY a"),
+            vec!["a IS NOT NULL OR c = 'x'".to_string()]
+        );
+        assert!(top_level_conjuncts("SELECT a FROM t ORDER BY pk").is_empty());
     }
 
     /// Difference #8: PostgreSQL's ASC default is NULLS LAST where
@@ -1227,8 +1357,14 @@ mod tests {
                     // made NULL-free.
                     let sorts_by_pk = rest.starts_with(" pk");
                     let key = rest.trim_start().split([' ', ',']).next().unwrap_or("");
+                    // The guard must be a TOP-LEVEL conjunct of the WHERE. A
+                    // substring search would also accept `WHERE a IS NOT NULL
+                    // OR …`, which guarantees nothing — the whole point of the
+                    // pin is that it cannot be satisfied by accident.
                     let guarded = !key.is_empty()
-                        && s.sql.contains(&format!("WHERE {key} IS NOT NULL"));
+                        && top_level_conjuncts(&s.sql)
+                            .iter()
+                            .any(|c| *c == format!("{key} IS NOT NULL"));
                     assert!(
                         sorts_by_pk || guarded,
                         "ORDER BY on a nullable column would hit the \

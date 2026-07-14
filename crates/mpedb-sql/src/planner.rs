@@ -315,13 +315,13 @@ fn lift_aggs(
     e: &ast::Expr,
     group_by: &[u16],
     table: &TableDef,
-    aggs: &mut Vec<(mpedb_types::AggFn, Option<ast::Expr>)>,
+    aggs: &mut Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool)>,
 ) -> Result<ast::Expr> {
     use ast::Expr as E;
     let rec = |x: &ast::Expr, aggs: &mut Vec<_>| lift_aggs(x, group_by, table, aggs);
     Ok(match e {
-        E::Agg(f, arg) => {
-            let spec = (*f, arg.as_deref().cloned());
+        E::Agg(f, arg, distinct) => {
+            let spec = (*f, arg.as_deref().cloned(), *distinct);
             // Reuse an identical aggregate rather than adding a slot: `SELECT
             // count(*) ... ORDER BY count(*)` is one aggregate named twice, and
             // lifting it twice would accumulate it twice.
@@ -399,7 +399,7 @@ fn lift_aggs(
 fn synthetic_grouped_table(
     table: &TableDef,
     group_by: &[u16],
-    aggs: &[(mpedb_types::AggFn, Option<ast::Expr>)],
+    aggs: &[(mpedb_types::AggFn, Option<ast::Expr>, bool)],
     agg_types: &[Option<ColumnType>],
 ) -> TableDef {
     let mut columns = Vec::with_capacity(group_by.len() + aggs.len());
@@ -414,7 +414,7 @@ fn synthetic_grouped_table(
             check: None,
         });
     }
-    for (i, (f, _)) in aggs.iter().enumerate() {
+    for (i, (f, _, _)) in aggs.iter().enumerate() {
         let ty = match f {
             mpedb_types::AggFn::Count => ColumnType::Int64,
             mpedb_types::AggFn::Avg => ColumnType::Float64,
@@ -446,6 +446,93 @@ fn synthetic_grouped_table(
 /// executor honours that by aggregating `gather_rows`' output; this function
 /// simply never gets the chance to reorder them.
 #[allow(clippy::too_many_arguments)]
+/// `ORDER BY` under `SELECT DISTINCT`: resolve each key to its position in the
+/// SELECT list. `check_distinct_order_by` has already established that every
+/// key is there, so this cannot fail for a query that got past it — but it
+/// returns an error rather than asserting, because the two would otherwise have
+/// to agree by inspection.
+fn distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<Vec<(u16, bool)>> {
+    let Some(items) = s.items.as_ref() else {
+        // `SELECT DISTINCT *`: the projection is the base row, column for
+        // column, so a base-column index IS the output position.
+        return s
+            .order_by
+            .iter()
+            .map(|(e, desc)| {
+                let name = match e {
+                    ast::Expr::Col(n) => n,
+                    ast::Expr::Qualified(q, n) if q.eq_ignore_ascii_case(&table.name) => n,
+                    _ => return Err(bind_err("ORDER BY must name a column".to_string())),
+                };
+                let idx = table
+                    .column_index(name)
+                    .ok_or_else(|| bind_err(format!("unknown column `{name}` in ORDER BY")))?;
+                Ok((idx, *desc))
+            })
+            .collect();
+    };
+    let strip = |e: &ast::Expr| -> ast::Expr {
+        match e {
+            ast::Expr::Qualified(q, n) if q.eq_ignore_ascii_case(&table.name) => {
+                ast::Expr::Col(n.clone())
+            }
+            other => other.clone(),
+        }
+    };
+    let mut out = Vec::with_capacity(s.order_by.len());
+    for (key, desc) in &s.order_by {
+        let key = strip(key);
+        let pos = items
+            .iter()
+            .position(|it| strip(it) == key)
+            .ok_or_else(|| bind_err("ORDER BY key is not in the SELECT list".to_string()))?;
+        out.push((pos as u16, *desc));
+    }
+    Ok(out)
+}
+
+/// With `SELECT DISTINCT`, every `ORDER BY` key must be one of the selected
+/// items — PostgreSQL's rule, and it is not pedantry.
+///
+/// DISTINCT collapses duplicate OUTPUT rows, so of each duplicate group exactly
+/// one survives. If the sort key is not in the output, then *which* duplicate
+/// survives is what decides where the row sorts — and that choice is the
+/// engine's, not the query's. `SELECT DISTINCT dept FROM t ORDER BY amt` has no
+/// answer: the dept 'eng' has many amts and no reason to prefer any of them.
+/// sqlite picks one and reports a stable-looking answer; the rigid engine says
+/// there is no answer instead.
+fn check_distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<()> {
+    if !s.distinct || s.order_by.is_empty() {
+        return Ok(());
+    }
+    // `SELECT DISTINCT *` outputs every column, so no key can be missing.
+    let Some(items) = s.items.as_ref() else {
+        return Ok(());
+    };
+    // `ORDER BY t.a` and a selected `a` are the same column; compare with the
+    // qualifier stripped so the rule is about meaning, not spelling.
+    let strip = |e: &ast::Expr| -> ast::Expr {
+        match e {
+            ast::Expr::Qualified(q, n) if q.eq_ignore_ascii_case(&table.name) => {
+                ast::Expr::Col(n.clone())
+            }
+            other => other.clone(),
+        }
+    };
+    for (key, _) in &s.order_by {
+        let key = strip(key);
+        if !items.iter().any(|it| strip(it) == key) {
+            return Err(bind_err(format!(
+                "ORDER BY `{}` must be in the SELECT list when SELECT DISTINCT is used — \
+                 otherwise which duplicate row survives is what decides the order, and the \
+                 query does not say",
+                agg_item_name(&key, table)
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn plan_aggregate_select(
     s: &ast::SelectStmt,
     table: &TableDef,
@@ -471,7 +558,7 @@ fn plan_aggregate_select(
     let items = s.items.as_ref().ok_or_else(|| {
         bind_err("SELECT * with GROUP BY has no meaning — list the group keys and aggregates")
     })?;
-    let mut agg_specs: Vec<(mpedb_types::AggFn, Option<ast::Expr>)> = Vec::new();
+    let mut agg_specs: Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool)> = Vec::new();
     let mut rewritten = Vec::with_capacity(items.len());
     for item in items {
         rewritten.push(lift_aggs(item, &group_by, table, &mut agg_specs)?);
@@ -494,10 +581,14 @@ fn plan_aggregate_select(
     // 3. Bind each aggregate ARGUMENT over the BASE row.
     let mut aggs = Vec::with_capacity(agg_specs.len());
     let mut agg_types = Vec::with_capacity(agg_specs.len());
-    for (f, arg) in &agg_specs {
+    for (f, arg, distinct) in &agg_specs {
         match arg {
             None => {
-                aggs.push(AggCall { func: *f, arg: None });
+                aggs.push(AggCall {
+                    func: *f,
+                    arg: None,
+                    distinct: false,
+                });
                 agg_types.push(Some(ColumnType::Int64));
             }
             Some(a) => {
@@ -506,6 +597,7 @@ fn plan_aggregate_select(
                 aggs.push(AggCall {
                     func: *f,
                     arg: Some(compile_program(&b)?),
+                    distinct: *distinct,
                 });
             }
         }
@@ -543,6 +635,30 @@ fn plan_aggregate_select(
     //    aggregate slot. Anything else (`ORDER BY count(*) + 1`) binds to a
     //    computed expression the plan's positional `order_by` cannot express,
     //    so it is refused rather than sorted by the wrong thing.
+    if s.distinct {
+        let order_by = distinct_order_by(s, table)?;
+        let (param_types, context_keys, list_keys) = binder.into_parts();
+        return Ok((
+            PlanStmt::Select {
+                table: table_id,
+                access,
+                filter,
+                projection,
+                order_by,
+                limit: s.limit,
+                offset: s.offset,
+                distinct: true,
+                aggregate: Some(Aggregation {
+                    group_by,
+                    aggs,
+                    having,
+                }),
+            },
+            param_types,
+            context_keys,
+            list_keys,
+        ));
+    }
     let mut order_by = Vec::with_capacity(rewritten_order.len());
     for ((e, desc), (orig, _)) in rewritten_order.iter().zip(&s.order_by) {
         let (b, _) = binder.bind_expr(e)?;
@@ -568,6 +684,7 @@ fn plan_aggregate_select(
             order_by,
             limit: s.limit,
             offset: s.offset,
+            distinct: s.distinct,
             aggregate: Some(Aggregation {
                 group_by,
                 aggs,
@@ -585,8 +702,13 @@ fn agg_item_name(e: &ast::Expr, _t: &TableDef) -> String {
     match e {
         ast::Expr::Col(c) => c.clone(),
         ast::Expr::Qualified(_, c) => c.clone(),
-        ast::Expr::Agg(f, None) => format!("{}(*)", f.name()),
-        ast::Expr::Agg(f, Some(a)) => format!("{}({})", f.name(), agg_item_name(a, _t)),
+        ast::Expr::Agg(f, None, _) => format!("{}(*)", f.name()),
+        ast::Expr::Agg(f, Some(a), distinct) => format!(
+            "{}({}{})",
+            f.name(),
+            if *distinct { "DISTINCT " } else { "" },
+            agg_item_name(a, _t)
+        ),
         _ => "?column?".to_string(),
     }
 }
@@ -611,6 +733,8 @@ fn plan_select(
     let policy = read_policy(&mut binder, catalog, table_id, &table.name, PolicyCmd::Select)?;
     let (access, residual) = extract_access(merge_and(bound_where, policy), table, consts)?;
     let filter = residual.map(|e| compile_program(&e)).transpose()?;
+
+    check_distinct_order_by(s, table)?;
 
     // Is this an aggregate query? Either an aggregate appears, or GROUP BY does.
     let has_agg = s
@@ -654,24 +778,34 @@ fn plan_select(
         }
     };
 
-    let mut order_by = Vec::with_capacity(s.order_by.len());
-    for (e, desc) in &s.order_by {
-        // Only a bare column: the plan sorts by output position, so there is
-        // nowhere to put a computed sort key. (An aggregate here never reaches
-        // this path — `has_agg` routed it to the aggregate planner already.)
-        let name = match e {
-            ast::Expr::Col(n) => n,
-            ast::Expr::Qualified(q, n) if q.eq_ignore_ascii_case(&table.name) => n,
-            _ => return Err(bind_err("ORDER BY must name a column".to_string())),
-        };
-        let idx = table
-            .column_index(name)
-            .ok_or_else(|| bind_err(format!("unknown column `{name}` in ORDER BY")))?;
-        order_by.push((idx, *desc));
-    }
+    // Under DISTINCT the sort follows the dedup and indexes the PROJECTION;
+    // otherwise it indexes the base row and happens before it.
+    let mut order_by = if s.distinct {
+        distinct_order_by(s, table)?
+    } else {
+        let mut v = Vec::with_capacity(s.order_by.len());
+        for (e, desc) in &s.order_by {
+            // Only a bare column: this sort runs on the base row, so there is
+            // nowhere to put a computed sort key. (An aggregate here never
+            // reaches this path — `has_agg` routed it to the aggregate planner
+            // already.)
+            let name = match e {
+                ast::Expr::Col(n) => n,
+                ast::Expr::Qualified(q, n) if q.eq_ignore_ascii_case(&table.name) => n,
+                _ => return Err(bind_err("ORDER BY must name a column".to_string())),
+            };
+            let idx = table
+                .column_index(name)
+                .ok_or_else(|| bind_err(format!("unknown column `{name}` in ORDER BY")))?;
+            v.push((idx, *desc));
+        }
+        v
+    };
     // A PK-prefix ORDER BY, all ascending, over a PK-ordered access path is
-    // already satisfied by scan order: drop the sort.
-    let pk_ordered_access = !matches!(access, AccessPath::IndexPoint { .. });
+    // already satisfied by scan order: drop the sort. Not under DISTINCT — the
+    // indices are output positions there, and the dedup between the scan and
+    // the sort means scan order does not survive to the output anyway.
+    let pk_ordered_access = !matches!(access, AccessPath::IndexPoint { .. }) && !s.distinct;
     if pk_ordered_access
         && !order_by.is_empty()
         && order_by.len() <= table.primary_key.len()
@@ -687,6 +821,7 @@ fn plan_select(
     Ok((
         PlanStmt::Select {
             aggregate: None,
+            distinct: s.distinct,
             table: table_id,
             access,
             filter,
