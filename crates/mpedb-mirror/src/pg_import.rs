@@ -24,8 +24,9 @@ fn q(ident: &str) -> String {
 }
 
 /// The SQL expression that reads a source column in a form the `postgres` client
-/// decodes to the primitive matching the column's mpedb type.
-fn read_expr(c: &PgColumn) -> String {
+/// decodes to the primitive matching the column's mpedb type. Shared with the
+/// pull adapter (row re-read).
+pub(crate) fn read_expr(c: &PgColumn) -> String {
     let col = q(&c.name);
     match c.mapped {
         Some(ColumnType::Int64) => format!("{col}::int8"),
@@ -46,7 +47,7 @@ fn read_expr(c: &PgColumn) -> String {
     }
 }
 
-fn read_value(row: &postgres::Row, i: usize, ty: ColumnType) -> Value {
+pub(crate) fn read_value(row: &postgres::Row, i: usize, ty: ColumnType) -> Value {
     match ty {
         ColumnType::Int64 => row
             .get::<usize, Option<i64>>(i)
