@@ -25,6 +25,13 @@ pub const HONESTY_NOTES: &[&str] = &[
     "Single machine; every engine built/run with --release (debug assertions off). \
      Contended cells intentionally run more threads than cores — see the machine line \
      above for how many there are.",
+    "On Apple, all three engines are forced to actually reach the platter, because none \
+     of them do by default: macOS `fsync()` does not flush the drive's write cache — only \
+     `fcntl(F_FULLFSYNC)` does. SQLite needs `PRAGMA fullfsync` (defaults OFF), PostgreSQL \
+     needs `wal_sync_method=fsync_writethrough` (defaults to `open_datasync`), and mpedb \
+     issues F_FULLFSYNC natively. Each of the three was caught skipping it at some point; \
+     an unfixed engine posts commit-class numbers 20-165x too good and makes the honest \
+     ones look slow. On Linux none of this applies.",
     "No cherry-picking: every cell is reported, including those mpedb loses.",
 ];
 

@@ -50,14 +50,27 @@ fn disk_scratch(pid: u32) -> PathBuf {
     base.join(format!("mpedb-bench-scratch-{pid}"))
 }
 
+/// The PostgreSQL build being measured.
+///
+/// Uses the SAME resolver the harness uses to actually run it — this was a
+/// fourth hardcoded `/usr/lib/postgresql/16/bin/postgres` that survived the fix
+/// to the other three, and it failed loudly in a quiet way: on the Mac the
+/// string became "postgres binary not found", and `engine_label` splits it on
+/// whitespace and takes the third word, so every PostgreSQL row in the report
+/// was labelled **"PostgreSQL not"**. The numbers were real; the report just
+/// refused to say which build produced them.
 fn pg_version_string() -> String {
-    std::process::Command::new("/usr/lib/postgresql/16/bin/postgres")
+    let bin = eng_pg::pg_bin();
+    if bin.is_empty() {
+        return "postgres not found (set MPEDB_PG_BIN)".into();
+    }
+    std::process::Command::new(format!("{bin}/postgres"))
         .arg("--version")
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "postgres binary not found".into())
+        .unwrap_or_else(|| "postgres not found (set MPEDB_PG_BIN)".into())
 }
 
 fn engine_label(key: &str) -> String {
