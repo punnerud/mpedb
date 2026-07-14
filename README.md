@@ -209,7 +209,7 @@ mpedb and SQLite only (PostgreSQL is not installed there, so its cells report as
 unavailable rather than being quietly omitted).
 
 Eleven cores is where the design story stops being theoretical. `read-while-write`
-none-class: **mpedb 3,657,658 reads/s vs SQLite's 175, p99 150 seconds** —
+none-class: **mpedb 3,682,233 reads/s vs SQLite's 180, p99 ~150 seconds** —
 SQLite's none-class journal serializes readers against a writer that now has ten
 spare cores to starve them with. A pathological config rather than a fair fight,
 but it is the exact failure mpedb's MVCC readers exist to avoid, and more cores
@@ -217,8 +217,9 @@ make it worse rather than better. The same cell on the 2-core Linux box reads
 486k vs 3.5k: same phenomenon, two orders of magnitude apart — which is why the
 2-core numbers *understate* this one.
 
-Bulk write flips the other way from Linux: mpedb **1,655 MiB/s (31% of raw)** vs
-SQLite 1,013 (19%).
+Bulk write flips the other way from Linux: mpedb **2,270 MiB/s (39% of raw)** vs
+SQLite 1,201 (20%) — 1.9×. On the 2-core Linux box SQLite leads that cell; give
+mpedb cores and a fast SSD and it does not.
 
 But the run is worth reading for what it caught rather than its throughput: **it
 found two bugs, one in the benchmark and one in mpedb**, both invisible on Linux.

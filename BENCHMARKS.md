@@ -182,16 +182,19 @@ not).
 
 | none-class, ops/s | mpedb | SQLite | ratio |
 |---|--:|--:|--:|
-| point-select | **1,689,578** | 320,727 | 5.3× |
-| point-insert | **196,722** | 112,987 | 1.7× |
-| point-update | **256,132** | 137,962 | 1.9× |
-| contended-writes (4 threads) | **135,007** | 105,792 | 1.3× |
-| read-while-write (reads) | **3,657,658** | 175 | — |
+| point-select | **1,652,756** | 316,101 | 5.2× |
+| point-insert | **203,914** | 112,985 | 1.8× |
+| point-update | **258,718** | 138,041 | 1.9× |
+| contended-writes (4 threads) | **135,243** | 104,568 | 1.3× |
+| read-while-write (reads) | **3,682,233** | 180 | — |
+| bulk write MiB/s (% of raw) | **2,270.5 (39%)** | 1,200.7 (20%) | 1.9× |
+
+Two runs of this machine exist and every cell moved ≤4% with the ratios stable
+(point-select 5.2× both times), so treat ±4% here as the noise floor.
 
 That last row is not a typo. SQLite's none-class journal serializes readers
-against the writer, and on 11 cores the writer (84,454 writes/s) starves them
-completely: **175 reads/s, p99 150 seconds.** mpedb's MVCC readers are
-untouched at 3.7M/s. It is a pathological config rather than a fair fight — but
+against the writer, and on 11 cores the writer starves them completely:
+**180 reads/s, p99 ~150 seconds.** mpedb's MVCC readers are untouched at 3.7M/s. It is a pathological config rather than a fair fight — but
 it is the failure mode mpedb's design exists to avoid, and more cores make it
 worse, not better.
 
