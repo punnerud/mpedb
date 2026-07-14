@@ -187,6 +187,14 @@ impl<'a> Parser<'a> {
         self.eat(&Tok::Kw(kw))
     }
 
+    /// `NOT IN` needs two tokens of lookahead: by the time cmp_expr runs, the
+    /// higher-precedence `not_expr` has already passed on this NOT, so `x NOT IN
+    /// (…)` only parses if we recognise the pair here.
+    fn peek_not_in(&self) -> bool {
+        matches!(self.toks.get(self.pos).map(|t| &t.tok), Some(Tok::Kw(Kw::Not)))
+            && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Kw(Kw::In)))
+    }
+
     fn peek_kw(&self, kw: Kw) -> bool {
         self.peek() == Some(&Tok::Kw(kw))
     }
@@ -617,29 +625,33 @@ impl<'a> Parser<'a> {
                 seen_cmp = true;
                 continue;
             }
-            // `x IN (current_setting('k'))` — the ONLY IN form in v1 (§2.6).
-            // General `IN (a, b, c)` is task #21; until it exists, anything else
-            // after IN is rejected with a message that says so rather than a
-            // bare parse error, because `IN (1, 2)` is the obvious thing to try.
-            if !seen_cmp && self.peek_kw(Kw::In) {
-                self.pos += 1;
+            // `x IN (…)` and `x NOT IN (…)`. Two shapes share the syntax:
+            // a session-context list (§2.6, one reserved param — the arity must
+            // NOT reach the plan bytes) and a general value list (#21, arity IS
+            // the query). Which one is decided by what is inside the parens.
+            if !seen_cmp && (self.peek_kw(Kw::In) || self.peek_not_in()) {
+                let negated = self.eat_kw(Kw::Not);
+                self.expect_kw(Kw::In, "IN")?;
                 self.expect(&Tok::LParen, "`(` after IN")?;
-                let inner = self.expr()?;
-                // Check for a comma BEFORE demanding `)`, or `IN (1, 2)` — the
-                // obvious thing to try — reports "expected `)`", which explains
-                // nothing about why it is unsupported.
-                let unsupported = "IN currently supports only `IN (current_setting('key'))` — \
-                     a session-context list (DESIGN-MULTIDB §2.6); literal IN lists are not \
-                     implemented yet";
-                if self.peek() == Some(&Tok::Comma) {
-                    return Err(self.err_here(unsupported));
+                // `IN ()` is a syntax error in PostgreSQL too. Allowing it would
+                // also mean an InList(0) instruction, which the IR rejects.
+                if self.peek() == Some(&Tok::RParen) {
+                    return Err(self.err_here("IN needs at least one value: `IN ()` is empty"));
+                }
+                let first = self.expr()?;
+                if let (Expr::ContextRef(key), Some(&Tok::RParen)) = (&first, self.peek()) {
+                    let key = key.clone();
+                    self.pos += 1;
+                    e = Expr::InContext(Box::new(e), key, negated);
+                    seen_cmp = true;
+                    continue;
+                }
+                let mut items = vec![first];
+                while self.eat(&Tok::Comma) {
+                    items.push(self.expr()?);
                 }
                 self.expect(&Tok::RParen, "`)` closing IN")?;
-                let key = match inner {
-                    Expr::ContextRef(k) => k,
-                    _ => return Err(self.err_here(unsupported)),
-                };
-                e = Expr::InContext(Box::new(e), key);
+                e = Expr::InList(Box::new(e), items, negated);
                 seen_cmp = true;
                 continue;
             }

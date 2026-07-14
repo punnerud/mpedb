@@ -25,6 +25,8 @@ pub(crate) enum BExpr {
     Like(Box<BExpr>, String),
     /// `LHS IN (<context list at reserved param n>)` (DESIGN-MULTIDB §2.6).
     InParam(Box<BExpr>, u16),
+    /// `LHS IN (e1, …, en)` — a general value list (task #21).
+    InList(Box<BExpr>, Vec<BExpr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -239,7 +241,7 @@ impl<'a> Binder<'a> {
                 let idx = self.n_user_params + pos as u16;
                 Ok((BExpr::Param(idx), self.param_types[idx as usize]))
             }
-            ast::Expr::InContext(lhs, key) => {
+            ast::Expr::InContext(lhs, key, negated) => {
                 if !self.allow_context {
                     return Err(bind_err("current_setting() is not allowed in this expression"));
                 }
@@ -256,7 +258,10 @@ impl<'a> Binder<'a> {
                             "session key `{key}` is used both as a scalar and as an IN list;                              a context slot is one or the other"
                         )));
                     }
-                    return Ok((BExpr::InParam(Box::new(l), idx as u16), Some(ColumnType::Bool)));
+                    return Ok((
+                        maybe_not(BExpr::InParam(Box::new(l), idx as u16), *negated),
+                        Some(ColumnType::Bool),
+                    ));
                 }
                 let idx = self.n_user_params as usize + self.ctx_keys.len();
                 if idx >= u16::MAX as usize {
@@ -267,7 +272,33 @@ impl<'a> Binder<'a> {
                 // `None` = "no scalar column type": resolve_params keys off
                 // ctx_list_keys to know a List belongs here.
                 self.param_types.push(None);
-                Ok((BExpr::InParam(Box::new(l), idx as u16), Some(ColumnType::Bool)))
+                Ok((
+                    maybe_not(BExpr::InParam(Box::new(l), idx as u16), *negated),
+                    Some(ColumnType::Bool),
+                ))
+            }
+            ast::Expr::InList(lhs, items, negated) => {
+                // The IR encodes the arity in a u16, and the stack verifier
+                // proves depth n+1; both need this bound to be real.
+                if items.len() > u16::MAX as usize {
+                    return Err(bind_err("IN list is too long (max 65535 values)"));
+                }
+                let (l, lt) = self.bind_expr(lhs)?;
+                let mut all = vec![(l, lt)];
+                for it in items {
+                    all.push(self.bind_expr(it)?);
+                }
+                // Unify ALL n+1 operands at once, not pairwise against the probe.
+                // Pairwise is subtly wrong: in `x IN (1, 2.5)` with x Int64, the
+                // probe would be coerced to Float64 by element 2 while element 1
+                // stayed Int64, and the rigid comparison would then fail at
+                // runtime on a query the binder had already accepted.
+                let mut all = self.unify_many(all, "compare with IN list")?;
+                let l = all.remove(0);
+                Ok((
+                    maybe_not(BExpr::InList(Box::new(l), all), *negated),
+                    Some(ColumnType::Bool),
+                ))
             }
             ast::Expr::Binary(op, l, r) => self.bind_binary(*op, l, r),
         }
@@ -347,6 +378,42 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Unify n operands to one common type: the same rules as
+    /// [`Self::unify_operands`] (bare params adopt, Int64 -> Float64 is the only
+    /// coercion, anything else cross-type is an error) but applied across the
+    /// whole set, so no operand is left behind at a type the others moved off.
+    fn unify_many(&mut self, operands: Vec<(BExpr, Ty)>, verb: &str) -> Result<Vec<BExpr>> {
+        // Target type = the one every non-param operand agrees on, widened to
+        // Float64 if ints and floats are mixed.
+        let mut target: Ty = None;
+        for (_, t) in &operands {
+            let Some(t) = *t else { continue };
+            target = Some(match target {
+                None => t,
+                Some(prev) if prev == t => prev,
+                Some(ColumnType::Int64) if t == ColumnType::Float64 => ColumnType::Float64,
+                Some(ColumnType::Float64) if t == ColumnType::Int64 => ColumnType::Float64,
+                Some(prev) => return Err(bind_err(format!("cannot {verb}: {prev} and {t}"))),
+            });
+        }
+        let Some(target) = target else {
+            // Nothing pinned the type (all NULLs / bare params). Leave them be;
+            // resolve_params reports an unresolved param.
+            return Ok(operands.into_iter().map(|(e, _)| e).collect());
+        };
+        let mut out = Vec::with_capacity(operands.len());
+        for (e, t) in operands {
+            let (e, t) = self.unify_param(e, t, target);
+            out.push(match t {
+                Some(ColumnType::Int64) if target == ColumnType::Float64 => {
+                    fold(BExpr::Unary(BUnOp::ToFloat, Box::new(e)))?
+                }
+                _ => e,
+            });
+        }
+        Ok(out)
+    }
+
     /// If `e` is a bare parameter with no inferred type yet, pin it to `ty`.
     fn unify_param(&mut self, e: BExpr, t: Ty, ty: ColumnType) -> (BExpr, Ty) {
         if t.is_none() {
@@ -358,6 +425,19 @@ impl<'a> Binder<'a> {
             }
         }
         (e, t)
+    }
+}
+
+/// Wrap in NOT when the source said `NOT IN`. Deliberately a real `Not` over
+/// the 3VL result rather than an inverted membership test: `NOT IN` must yield
+/// NULL (not TRUE) when the list holds a NULL and nothing matched, and NOT of
+/// NULL is NULL — so the plain negation is exactly right, and reimplementing it
+/// would be a second place for the NULL rules to drift.
+fn maybe_not(e: BExpr, negated: bool) -> BExpr {
+    if negated {
+        BExpr::Unary(BUnOp::Not, Box::new(e))
+    } else {
+        e
     }
 }
 
@@ -373,6 +453,11 @@ pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
         BExpr::Like(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         // Never foldable: the list is a session value, not a literal.
         BExpr::InParam(..) => false,
+        // Foldable in principle (`2 IN (1,2)` is TRUE), but deliberately not:
+        // the fold path evaluates via ExprProgram over a const-only program, and
+        // an all-const IN list is not worth a special case. It stays a runtime
+        // InList — correct, just not folded.
+        BExpr::InList(..) => false,
         _ => false,
     };
     if !foldable {
@@ -437,6 +522,15 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
         BExpr::InParam(a, idx) => {
             emit(a, instrs, consts)?;
             instrs.push(Instr::InParam(*idx));
+        }
+        BExpr::InList(a, items) => {
+            // Probe first, then the elements on top of it: InList(n) pops n
+            // elements and finds the probe beneath them.
+            emit(a, instrs, consts)?;
+            for it in items {
+                emit(it, instrs, consts)?;
+            }
+            instrs.push(Instr::InList(items.len() as u16));
         }
     }
     Ok(())
