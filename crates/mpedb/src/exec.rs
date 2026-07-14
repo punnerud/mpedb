@@ -4,7 +4,7 @@
 
 use crate::ExecResult;
 use mpedb_core::{ReadTxn, WriteTxn};
-use mpedb_sql::{AccessPath, CompiledPlan, InsertSource, PlanStmt, Projection};
+use mpedb_sql::{PlanOnConflict, AccessPath, CompiledPlan, InsertSource, PlanStmt, Projection};
 use mpedb_types::{
     keycode, DefaultExpr, Error, ExprProgram, KeyBound, KeyPart, Result, Schema, TableDef, Value,
 };
@@ -397,6 +397,8 @@ pub(crate) fn exec_stmt(
             table,
             rows,
             with_check,
+            on_conflict,
+            returning,
         } => {
             let t = table_def(schema, *table)?;
             // Bind-time `now()`: captured exactly once per execute() call so
@@ -404,6 +406,8 @@ pub(crate) fn exec_stmt(
             // (reviewed determinism requirement).
             let now = now_micros();
             // `applied` = rows fully inserted before the current one.
+            let mut written = 0u64;
+            let mut out: Vec<Vec<Value>> = Vec::new();
             for (applied, row_spec) in rows.iter().enumerate() {
                 let row = match build_insert_row(t, plan, params, row_spec, now) {
                     Ok(row) => row,
@@ -429,16 +433,92 @@ pub(crate) fn exec_stmt(
                         }
                     }
                 }
-                if let Err(e) = ctx.insert_row(*table, &row) {
-                    // A pre-check failure left even this row unapplied, so
-                    // the statement is partial only if earlier rows landed.
-                    // NOTE the order: `partial` is decided from the ORIGINAL
-                    // error, then the variant is hidden (§6.5).
-                    *partial = applied > 0 || !precheck_failure(&e);
-                    return Err(hide_constraint_variant(e, &t.name, with_check.is_some()));
+                match ctx.insert_row(*table, &row) {
+                    Ok(()) => {
+                        written += 1;
+                        if let Some(proj) = returning {
+                            out.push(project_row(proj, &row, params)?);
+                        }
+                    }
+                    Err(e) if is_uniqueness(&e) && !matches!(on_conflict, PlanOnConflict::Error) => {
+                        // ON CONFLICT covers uniqueness ONLY. A CHECK or
+                        // NOT NULL violation is NOT a conflict and must still
+                        // fail — PostgreSQL draws the same line, and swallowing
+                        // them would turn `DO NOTHING` into "ignore my
+                        // constraints", which is the opposite of the point.
+                        match on_conflict {
+                            PlanOnConflict::Error => unreachable!("guarded above"),
+                            PlanOnConflict::DoNothing => { /* skip this row */ }
+                            PlanOnConflict::DoUpdate { target, set, filter } => {
+                                let pk: Vec<Value> =
+                                    target.iter().map(|c| row[*c as usize].clone()).collect();
+                                let Some(existing) = ctx.get_by_pk(*table, &pk)? else {
+                                    // The insert failed on uniqueness but the PK
+                                    // is not there: it was a SECONDARY unique
+                                    // constraint. The target named the PK, so
+                                    // this conflict is not the one the caller
+                                    // asked to handle -- report it rather than
+                                    // silently do nothing.
+                                    *partial = applied > 0 || !precheck_failure(&e);
+                                    return Err(hide_constraint_variant(
+                                        e,
+                                        &t.name,
+                                        with_check.is_some(),
+                                    ));
+                                };
+                                // SET/WHERE see [existing ‖ proposed]: that is
+                                // what `excluded.<c>` = Col(n + i) resolves to.
+                                let mut both = existing.clone();
+                                both.extend_from_slice(&row);
+                                if let Some(f) = filter {
+                                    match f.eval_filter(&mut Vec::new(), &both, params) {
+                                        Ok(true) => {}
+                                        // NULL and FALSE both skip: SQL needs
+                                        // exactly TRUE to act.
+                                        Ok(false) => continue,
+                                        Err(e) => {
+                                            *partial = applied > 0;
+                                            return Err(e);
+                                        }
+                                    }
+                                }
+                                let mut new_row = existing;
+                                for (c, program) in set {
+                                    let v = program.eval(&both, params)?;
+                                    new_row[*c as usize] = v;
+                                }
+                                if let Err(e) = ctx.update_by_pk(*table, &new_row) {
+                                    *partial = applied > 0 || !precheck_failure(&e);
+                                    return Err(hide_constraint_variant(
+                                        e,
+                                        &t.name,
+                                        with_check.is_some(),
+                                    ));
+                                }
+                                written += 1;
+                                if let Some(proj) = returning {
+                                    out.push(project_row(proj, &new_row, params)?);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        // A pre-check failure left even this row unapplied, so
+                        // the statement is partial only if earlier rows landed.
+                        // NOTE the order: `partial` is decided from the ORIGINAL
+                        // error, then the variant is hidden (§6.5).
+                        *partial = applied > 0 || !precheck_failure(&e);
+                        return Err(hide_constraint_variant(e, &t.name, with_check.is_some()));
+                    }
                 }
             }
-            Ok(ExecResult::Affected(rows.len() as u64))
+            match returning {
+                Some(proj) => Ok(ExecResult::Rows {
+                    columns: projection_names(proj, t),
+                    rows: out,
+                }),
+                None => Ok(ExecResult::Affected(written)),
+            }
         }
 
         PlanStmt::Update {
@@ -447,12 +527,14 @@ pub(crate) fn exec_stmt(
             filter,
             set,
             with_check,
+            returning,
         } => {
             let t = table_def(schema, *table)?;
             // Collect-then-mutate: gather the matching CURRENT rows first
             // (read-only; a failure here has no effects).
             let old_rows = gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?;
             let mut affected = 0u64;
+            let mut out: Vec<Vec<Value>> = Vec::new();
             for old in &old_rows {
                 let new_row = (|| -> Result<Vec<Value>> {
                     let mut new_row = old.clone();
@@ -490,7 +572,14 @@ pub(crate) fn exec_stmt(
                     }
                 }
                 match ctx.update_by_pk(*table, &new_row) {
-                    Ok(true) => affected += 1,
+                    Ok(true) => {
+                        affected += 1;
+                        // RETURNING on UPDATE projects the POST-image: SQL
+                        // returns the row as it now is, not as it was.
+                        if let Some(proj) = returning {
+                            out.push(project_row(proj, &new_row, params)?);
+                        }
+                    }
                     Ok(false) => {} // row vanished: nothing changed
                     Err(e) => {
                         // `partial` from the original variant, then hide it (§6.5).
@@ -499,19 +588,27 @@ pub(crate) fn exec_stmt(
                     }
                 }
             }
-            Ok(ExecResult::Affected(affected))
+            match returning {
+                Some(proj) => Ok(ExecResult::Rows {
+                    columns: projection_names(proj, t),
+                    rows: out,
+                }),
+                None => Ok(ExecResult::Affected(affected)),
+            }
         }
 
         PlanStmt::Delete {
             table,
             access,
             filter,
+            returning,
         } => {
             let t = table_def(schema, *table)?;
             // Gather full old rows (the residual filter needs them), then
             // delete by PK values extracted from each row.
             let old_rows = gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?;
             let mut affected = 0u64;
+            let mut out: Vec<Vec<Value>> = Vec::new();
             for old in &old_rows {
                 let mut pk = Vec::with_capacity(t.primary_key.len());
                 for &i in &t.primary_key {
@@ -525,7 +622,14 @@ pub(crate) fn exec_stmt(
                     pk.push(v);
                 }
                 match ctx.delete_by_pk(*table, &pk) {
-                    Ok(true) => affected += 1,
+                    Ok(true) => {
+                        affected += 1;
+                        // RETURNING on DELETE projects the row as it WAS: there
+                        // is no post-image to show.
+                        if let Some(proj) = returning {
+                            out.push(project_row(proj, old, params)?);
+                        }
+                    }
                     Ok(false) => {}
                     Err(e) => {
                         // delete_by_pk has no pre-check failure class: any
@@ -535,7 +639,13 @@ pub(crate) fn exec_stmt(
                     }
                 }
             }
-            Ok(ExecResult::Affected(affected))
+            match returning {
+                Some(proj) => Ok(ExecResult::Rows {
+                    columns: projection_names(proj, t),
+                    rows: out,
+                }),
+                None => Ok(ExecResult::Affected(affected)),
+            }
         }
 
         PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => Err(Error::Unsupported(
@@ -544,6 +654,48 @@ pub(crate) fn exec_stmt(
                 .into(),
         )),
     }
+}
+
+/// Project one written row through a `RETURNING` clause.
+fn project_row(proj: &[Projection], row: &[Value], params: &[Value]) -> Result<Vec<Value>> {
+    let mut out = Vec::with_capacity(proj.len());
+    for p in proj {
+        out.push(match p {
+            Projection::Column(i) => row
+                .get(*i as usize)
+                .cloned()
+                .ok_or_else(|| internal("RETURNING column out of row bounds"))?,
+            Projection::Expr { program, .. } => program.eval(row, params)?,
+        });
+    }
+    Ok(out)
+}
+
+/// Output column names for a `RETURNING` clause.
+fn projection_names(proj: &[Projection], t: &TableDef) -> Vec<String> {
+    proj.iter()
+        .map(|p| match p {
+            Projection::Column(i) => t
+                .columns
+                .get(*i as usize)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| "?".to_string()),
+            Projection::Expr { name, .. } => name.clone(),
+        })
+        .collect()
+}
+
+/// Does this error mean "a uniqueness constraint said no"?
+///
+/// `ON CONFLICT` covers uniqueness ONLY — PostgreSQL is explicit about that,
+/// and it matters: if a CHECK or NOT NULL violation counted as a conflict,
+/// `DO NOTHING` would quietly mean "ignore my constraints" and the rows you
+/// thought you validated would just be missing.
+fn is_uniqueness(e: &Error) -> bool {
+    matches!(
+        e,
+        Error::PrimaryKeyViolation { .. } | Error::UniqueViolation { .. }
+    )
 }
 
 /// Resolve one INSERT row spec (params/consts/defaults) to concrete values.

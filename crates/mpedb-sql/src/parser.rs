@@ -5,18 +5,35 @@
 //! < `+ -` < `* / %` < unary `-` < primary.
 //! Comparisons do not chain (`a < b < c` is a parse error).
 
-use crate::ast::{BinOp, DeleteStmt, Expr, InsertStmt, SelectStmt, Stmt, UnOp, UpdateStmt};
+use crate::ast::{BinOp, DeleteStmt, Expr, InsertStmt, OnConflict, SelectStmt, Stmt, UnOp, UpdateStmt};
 use crate::ddl::{CreatePolicySpec, DdlStmt, RlsAction};
 use crate::token::{tokenize, Kw, SpTok, Tok};
 use mpedb_types::{Error, PolicyCmd, Result, Value};
 
-/// Maximum expression nesting depth. The expression grammar is recursive
-/// descent, so parser stack use is proportional to nesting; without a bound,
-/// hostile SQL (or a hostile CHECK source reaching [`parse_expr_only`] at
-/// attach time) overflows the thread stack and aborts the process instead of
-/// returning an error. 128 is far beyond any legitimate statement while
-/// keeping worst-case stack use trivial.
-const MAX_EXPR_DEPTH: u32 = 128;
+/// Maximum expression nesting depth — a **stack budget**, not a taste.
+///
+/// The grammar is recursive descent, so parser stack use is proportional to
+/// nesting. Without a bound, hostile SQL (or a hostile CHECK source reaching
+/// [`parse_expr_only`] at attach time) overflows the thread stack and aborts the
+/// process — uncatchable — instead of returning an error.
+///
+/// The number is MEASURED, because the previous one was not and quietly stopped
+/// being true. It was 128, chosen when the only deep construct was parenthesised
+/// arithmetic. Adding CASE made a level cost ~16-20 KB rather than a few
+/// hundred bytes (each level is ~10 mutually-recursive frames plus case_expr's
+/// arm vector), and 128 levels then needed MORE THAN 2 MiB — the default size of
+/// a Rust thread stack. The guard still returned its tidy error at 128; the
+/// process just aborted before reaching it.
+///
+/// Measured on this grammar: nested CASE survives 48 levels in a 1 MiB stack and
+/// overflows at 64. 48 is therefore the budget, verified against HALF a default
+/// thread stack so there is real headroom for whatever called us — and
+/// `max_depth_parsing_fits_in_a_small_stack` fails loudly if a future construct
+/// makes a level fatter.
+///
+/// 48 is far beyond any legitimate statement; hand-written SQL does not nest
+/// past single digits.
+const MAX_EXPR_DEPTH: u32 = 48;
 
 /// Parse-time item caps. Plan wire counts are serialized as `u16`
 /// ([`crate::plan`]); these caps keep every count far away from the
@@ -521,11 +538,91 @@ impl<'a> Parser<'a> {
         if rows.len() > u16::MAX as usize {
             return Err(self.err_here("too many rows in one INSERT (max 65535)"));
         }
+        let on_conflict = self.on_conflict_clause()?;
+        let returning = self.returning_clause()?;
         Ok(Stmt::Insert(InsertStmt {
             table,
             columns,
             rows,
+            on_conflict,
+            returning,
         }))
+    }
+
+    /// `ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET … [WHERE …]`.
+    fn on_conflict_clause(&mut self) -> Result<OnConflict> {
+        if !self.eat_word("ON") {
+            return Ok(OnConflict::Error);
+        }
+        self.expect_kw(Kw::Conflict, "CONFLICT after ON")?;
+        let mut target = Vec::new();
+        if self.eat(&Tok::LParen) {
+            target.push(self.ident("conflict-target column")?);
+            while self.eat(&Tok::Comma) {
+                target.push(self.ident("conflict-target column")?);
+            }
+            self.expect(&Tok::RParen, "`)` closing the conflict target")?;
+        }
+        self.expect_kw(Kw::Do, "DO after ON CONFLICT")?;
+        if self.eat_kw(Kw::Nothing) {
+            if !target.is_empty() {
+                // PG allows it, but the target then does nothing but mislead:
+                // DO NOTHING already covers every unique constraint, so naming
+                // one suggests a narrowing that does not happen.
+                return Err(self.err_here(
+                    "ON CONFLICT DO NOTHING takes no conflict target: it already applies to \
+                     every unique constraint on the table",
+                ));
+            }
+            return Ok(OnConflict::DoNothing);
+        }
+        self.expect_kw(Kw::Update, "UPDATE or NOTHING after DO")?;
+        if target.is_empty() {
+            return Err(self.err_here(
+                "ON CONFLICT ... DO UPDATE needs a conflict target, e.g. ON CONFLICT (id) DO \
+                 UPDATE: without it there is no way to know which existing row to update",
+            ));
+        }
+        self.expect_kw(Kw::Set, "SET after DO UPDATE")?;
+        let mut set = Vec::new();
+        loop {
+            let col = self.ident("column name")?;
+            self.expect(&Tok::Eq, "`=`")?;
+            set.push((col, self.expr()?));
+            if set.len() > MAX_SET_ITEMS {
+                return Err(self.err_here(format!(
+                    "too many SET assignments (max {MAX_SET_ITEMS})"
+                )));
+            }
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        let where_clause = if self.eat_kw(Kw::Where) {
+            Some(self.expr()?)
+        } else {
+            None
+        };
+        Ok(OnConflict::DoUpdate {
+            target,
+            set,
+            where_clause,
+        })
+    }
+
+    /// `RETURNING * | expr, …`
+    fn returning_clause(&mut self) -> Result<Option<Option<Vec<Expr>>>> {
+        if !self.eat_kw(Kw::Returning) {
+            return Ok(None);
+        }
+        if self.eat(&Tok::Star) {
+            return Ok(Some(None));
+        }
+        let mut items = vec![self.expr()?];
+        while self.eat(&Tok::Comma) {
+            items.push(self.expr()?);
+        }
+        Ok(Some(Some(items)))
     }
 
     fn update_stmt(&mut self) -> Result<Stmt> {
@@ -552,10 +649,12 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let returning = self.returning_clause()?;
         Ok(Stmt::Update(UpdateStmt {
             table,
             set,
             where_clause,
+            returning,
         }))
     }
 
@@ -568,9 +667,11 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        let returning = self.returning_clause()?;
         Ok(Stmt::Delete(DeleteStmt {
             table,
             where_clause,
+            returning,
         }))
     }
 
@@ -840,6 +941,61 @@ impl<'a> Parser<'a> {
         })
     }
 
+
+    /// Everything a bare identifier can turn into: `current_setting(...)`, a
+    /// function call, `excluded.<col>`, or a plain column.
+    ///
+    /// `#[inline(never)]` and its own frame for the same reason as
+    /// [`Self::between_suffix`]: `primary` is on the mutually-recursive descent
+    /// path, so any local here is paid on EVERY nesting level. This one is not
+    /// hypothetical either — folding it back into `primary` overflowed the
+    /// stack at the permitted depth, and the test that caught it is
+    /// `deep_nesting_through_the_new_constructs_is_also_a_parse_error`.
+    #[inline(never)]
+    fn ident_suffix(&mut self, s: String) -> Result<Expr> {
+
+                // `current_setting('key')` is the only function form in Phase 1.
+                // Recognized only as a bare identifier immediately followed by
+                // `(`; a quoted "current_setting" or one without `(` is a column.
+                if s.eq_ignore_ascii_case("current_setting") && self.eat(&Tok::LParen) {
+                    let key = match self.advance() {
+                        Some(Tok::Str(k)) if !k.is_empty() => k,
+                        _ => {
+                            return Err(self.err_here(
+                                "current_setting() takes a single non-empty string-literal key",
+                            ))
+                        }
+                    };
+                    self.expect(&Tok::RParen, "`)`")?;
+                    return Ok(Expr::ContextRef(key));
+                }
+                if self.peek() == Some(&Tok::LParen) {
+                    return self.call_suffix(s);
+                }
+                // `excluded.<col>` — the proposed row inside ON CONFLICT DO
+                // UPDATE. Only a BARE `excluded` qualifies; a quoted
+                // "excluded" stays a column name, so a table that really has a
+                // column called `excluded` keeps working.
+                if s.eq_ignore_ascii_case("excluded") && self.peek() == Some(&Tok::Dot) {
+                    self.pos += 1;
+                    let col = self.ident("column name after `excluded.`")?;
+                    return Ok(Expr::Excluded(col));
+                }
+                // Any other `x.y` inside an expression. `Dot` is otherwise only
+                // a workspace routing qualifier at statement level, so without
+                // this the error is "unexpected trailing input `Dot`", which
+                // says nothing about the actual mistake.
+                if self.peek() == Some(&Tok::Dot) {
+                    return Err(self.err_here(format!(
+                        "table-qualified column names are not supported in expressions: write \
+                         `<column>` instead of `{s}.<column>`. Inside ON CONFLICT ... DO \
+                         UPDATE, a bare column is the EXISTING row and `excluded.<column>` is \
+                         the proposed one"
+                    )));
+                }
+                Ok(Expr::Col(s))
+    }
+
     fn primary(&mut self) -> Result<Expr> {
         let pos = self.here();
         if self.eat_kw(Kw::Case) {
@@ -874,27 +1030,7 @@ impl<'a> Parser<'a> {
                 self.max_params = self.max_params.max(i + 1);
                 Ok(Expr::Param(i as u16))
             }
-            Some(Tok::Ident(s)) => {
-                // `current_setting('key')` is the only function form in Phase 1.
-                // Recognized only as a bare identifier immediately followed by
-                // `(`; a quoted "current_setting" or one without `(` is a column.
-                if s.eq_ignore_ascii_case("current_setting") && self.eat(&Tok::LParen) {
-                    let key = match self.advance() {
-                        Some(Tok::Str(k)) if !k.is_empty() => k,
-                        _ => {
-                            return Err(self.err_here(
-                                "current_setting() takes a single non-empty string-literal key",
-                            ))
-                        }
-                    };
-                    self.expect(&Tok::RParen, "`)`")?;
-                    return Ok(Expr::ContextRef(key));
-                }
-                if self.peek() == Some(&Tok::LParen) {
-                    return self.call_suffix(s);
-                }
-                Ok(Expr::Col(s))
-            }
+            Some(Tok::Ident(s)) => self.ident_suffix(s),
             Some(Tok::QuotedIdent(s)) => Ok(Expr::Col(s)),
             Some(Tok::LParen) => {
                 let e = self.expr()?;
@@ -1185,11 +1321,15 @@ mod tests {
             Err(Error::Parse { msg, .. }) if msg.contains("nested too deeply")
         ));
 
-        // Depth 100 is comfortably within the limit for every form.
-        let parens = format!("{}a > 0{}", "(".repeat(100), ")".repeat(100));
+        // Well inside the limit for every form. This used to say 100, back
+        // when MAX_EXPR_DEPTH was 128 — a number that turned out not to be
+        // survivable once CASE existed (see the constant's docs). 20 is still
+        // far past any real statement.
+        let d = 20;
+        let parens = format!("{}a > 0{}", "(".repeat(d), ")".repeat(d));
         assert!(parse_expr_only(&parens).is_ok());
-        assert!(parse_expr_only(&format!("{}a", "NOT ".repeat(100))).is_ok());
-        assert!(parse_expr_only(&format!("{}1", "-".repeat(100))).is_ok());
+        assert!(parse_expr_only(&format!("{}a", "NOT ".repeat(d))).is_ok());
+        assert!(parse_expr_only(&format!("{}1", "-".repeat(d))).is_ok());
     }
 
     /// Every construct that recurses is a stack-overflow vector, and each one
@@ -1303,4 +1443,51 @@ mod tests {
         assert!(parse_expr_only("a = ").is_err());
         assert!(parse_expr_only("(a = 1").is_err());
     }
+
+    /// Turns "128 levels probably fit" into a measured fact.
+    ///
+    /// MAX_EXPR_DEPTH is a STACK BUDGET, not a taste preference: the guard only
+    /// prevents a crash if `MAX_EXPR_DEPTH x per-level frame` fits the thread
+    /// stack. Twice now, adding a construct grew the per-level frame and the
+    /// constant silently stopped being survivable — the guard was still there,
+    /// still returning its error at 128, and the process aborted at 128 anyway.
+    ///
+    /// So: parse AT the limit inside a thread with a deliberately small stack.
+    /// If a future change makes a level fatter, this fails loudly here instead
+    /// of aborting the whole test binary somewhere else.
+    #[test]
+    fn max_depth_parsing_fits_in_a_small_stack() {
+        // HALF the 2 MiB Rust gives a spawned thread by default, so passing
+        // here means real headroom for whatever called us — not "it happened
+        // to fit on this machine, in this build".
+        const STACK: usize = 1024 * 1024;
+        // Parens cost exactly one depth unit per level, so this parses AT the
+        // guard's edge: the stack, not the guard, is what must hold it.
+        let d = MAX_EXPR_DEPTH as usize - 2;
+        let inputs = vec![
+            format!("{}a > 0{}", "(".repeat(d), ")".repeat(d)),
+            format!("{}a", "NOT ".repeat(d)),
+            // The expensive constructs spend MORE than one depth unit per
+            // level (CASE descends for both the condition and the result), so
+            // they hit the guard sooner. Use a depth that is legal for them and
+            // still deep: the point is the stack cost, not the arithmetic.
+            format!("{}1{}", "coalesce(".repeat(d / 3), ", 2)".repeat(d / 3)),
+            format!("{}1{}", "abs(".repeat(d / 3), ")".repeat(d / 3)),
+            format!("{}1{}", "CASE WHEN true THEN ".repeat(d / 3), " END".repeat(d / 3)),
+        ];
+        let h = std::thread::Builder::new()
+            .stack_size(STACK)
+            .spawn(move || {
+                for sql in &inputs {
+                    // Must SUCCEED: this is just under the limit, so the guard
+                    // is not what stops it — the stack must actually hold.
+                    parse_expr_only(sql).unwrap_or_else(|e| panic!("{sql:.40}...: {e:?}"));
+                }
+            })
+            .unwrap();
+        h.join().expect("parsing at MAX_EXPR_DEPTH overflowed a 512 KiB stack: \
+                         a construct grew the per-level frame — shrink it (move locals into \
+                         an #[inline(never)] helper) or lower MAX_EXPR_DEPTH");
+    }
+
 }

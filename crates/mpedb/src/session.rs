@@ -422,4 +422,81 @@ mod tests {
         let r = s.set_list("k", [Value::List(vec![Value::Int(1)])]);
         assert!(matches!(r, Err(Error::TypeMismatch(_))), "got {r:?}");
     }
+
+    /// ON CONFLICT / RETURNING, pinned against MEASURED PostgreSQL 16 (every
+    /// line below was run against a live PG first).
+    ///
+    /// The load-bearing one is the last: `ON CONFLICT` covers UNIQUENESS ONLY.
+    /// If a CHECK or NOT NULL violation counted as a conflict, `DO NOTHING`
+    /// would quietly mean "ignore my constraints" and rows you believed were
+    /// validated would simply be absent. PG errors on both; so does mpedb.
+    #[test]
+    fn on_conflict_and_returning_match_postgresql() {
+        let db = db("oc");
+        db.query("INSERT INTO orders (id, tenant) VALUES (1, 1)", &[]).unwrap();
+
+        // A plain duplicate is still an error.
+        assert!(db.query("INSERT INTO orders (id, tenant) VALUES (1, 9)", &[]).is_err());
+
+        // DO NOTHING: skipped, row untouched.
+        assert!(matches!(
+            db.query("INSERT INTO orders (id, tenant) VALUES (1, 9) ON CONFLICT DO NOTHING", &[]),
+            Ok(ExecResult::Affected(0))
+        ));
+        assert!(matches!(
+            db.query("SELECT tenant FROM orders WHERE id = 1", &[]).unwrap(),
+            ExecResult::Rows { rows, .. } if rows[0][0] == Value::Int(1)
+        ));
+
+        // DO UPDATE with excluded: SET sees [existing ‖ proposed].
+        db.query(
+            "INSERT INTO orders (id, tenant) VALUES (1, 9) \
+             ON CONFLICT (id) DO UPDATE SET tenant = excluded.tenant",
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            db.query("SELECT tenant FROM orders WHERE id = 1", &[]).unwrap(),
+            ExecResult::Rows { rows, .. } if rows[0][0] == Value::Int(9)
+        ));
+
+        // DO UPDATE ... WHERE: NULL and FALSE both skip (exactly TRUE acts).
+        // A bare column is the EXISTING row; `excluded.x` is the proposed one --
+        // PostgreSQL's rule, and the reason no qualifier is needed here.
+        db.query(
+            "INSERT INTO orders (id, tenant) VALUES (1, 99) \
+             ON CONFLICT (id) DO UPDATE SET tenant = excluded.tenant WHERE tenant > 100",
+            &[],
+        )
+        .unwrap();
+        assert!(matches!(
+            db.query("SELECT tenant FROM orders WHERE id = 1", &[]).unwrap(),
+            ExecResult::Rows { rows, .. } if rows[0][0] == Value::Int(9),
+        ), "the WHERE was false, so the update must not have happened");
+
+        // RETURNING on all three verbs.
+        assert!(matches!(
+            db.query("INSERT INTO orders (id, tenant) VALUES (2, 5) RETURNING id, tenant", &[]).unwrap(),
+            ExecResult::Rows { rows, columns } if rows == vec![vec![Value::Int(2), Value::Int(5)]]
+                && columns == vec!["id".to_string(), "tenant".to_string()]
+        ));
+        // UPDATE returns the POST-image.
+        assert!(matches!(
+            db.query("UPDATE orders SET tenant = 6 WHERE id = 2 RETURNING tenant", &[]).unwrap(),
+            ExecResult::Rows { rows, .. } if rows == vec![vec![Value::Int(6)]]
+        ));
+        // DELETE returns the PRE-image: there is no post-image to show.
+        assert!(matches!(
+            db.query("DELETE FROM orders WHERE id = 2 RETURNING tenant", &[]).unwrap(),
+            ExecResult::Rows { rows, .. } if rows == vec![vec![Value::Int(6)]]
+        ));
+
+        // `excluded` is out of scope outside DO UPDATE.
+        assert!(db.prepare("SELECT excluded.tenant FROM orders").is_err());
+        // The conflict target must be the PK -- the only key the write path can
+        // probe. Guessing would update the wrong row.
+        assert!(db
+            .prepare("INSERT INTO orders (id, tenant) VALUES (1,1) ON CONFLICT (tenant) DO UPDATE SET tenant = 1")
+            .is_err());
+    }
 }

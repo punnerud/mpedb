@@ -33,6 +33,23 @@ pub(crate) struct InsertStmt {
     /// Explicit column list, if given.
     pub columns: Option<Vec<String>>,
     pub rows: Vec<Vec<Expr>>,
+    pub on_conflict: OnConflict,
+    /// `RETURNING` items; `Some(None)` = `RETURNING *`.
+    pub returning: Option<Option<Vec<Expr>>>,
+}
+
+/// `ON CONFLICT` action.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum OnConflict {
+    /// No clause: a conflict is an error.
+    Error,
+    DoNothing,
+    /// `ON CONFLICT (<target>) DO UPDATE SET … [WHERE …]`.
+    DoUpdate {
+        target: Vec<String>,
+        set: Vec<(String, Expr)>,
+        where_clause: Option<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -40,12 +57,14 @@ pub(crate) struct UpdateStmt {
     pub table: String,
     pub set: Vec<(String, Expr)>,
     pub where_clause: Option<Expr>,
+    pub returning: Option<Option<Vec<Expr>>>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct DeleteStmt {
     pub table: String,
     pub where_clause: Option<Expr>,
+    pub returning: Option<Option<Vec<Expr>>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -110,4 +129,6 @@ pub(crate) enum Expr {
     Func(String, Vec<Expr>),
     /// `coalesce(a, b, …)` — first non-NULL argument, evaluated lazily.
     Coalesce(Vec<Expr>),
+    /// `excluded.<col>` — the proposed row inside `ON CONFLICT DO UPDATE`.
+    Excluded(String),
 }

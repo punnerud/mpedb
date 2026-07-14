@@ -52,6 +52,14 @@ pub(crate) enum BUnOp {
 pub(crate) type Ty = Option<ColumnType>;
 
 pub(crate) struct Binder<'a> {
+    /// Is `excluded.<col>` in scope? Only inside `ON CONFLICT DO UPDATE`.
+    ///
+    /// When set, an `excluded` reference binds to `Col(n_cols + i)`: the
+    /// executor evaluates these programs over the EXISTING row concatenated
+    /// with the PROPOSED row, so the second half is the proposed values. That
+    /// needs no new instruction and no second column namespace in the IR — a
+    /// column index is a column index.
+    allow_excluded: bool,
     /// Are we binding a branch that constant control flow may delete
     /// unevaluated? Then do not fold it, because folding RAISES.
     ///
@@ -95,6 +103,7 @@ fn bind_err(msg: impl Into<String>) -> Error {
 impl<'a> Binder<'a> {
     pub fn new(table: &'a TableDef, n_params: u16, allow_params: bool) -> Binder<'a> {
         Binder {
+            allow_excluded: false,
             suppress_fold: false,
             table,
             param_types: vec![None; n_params as usize],
@@ -106,6 +115,11 @@ impl<'a> Binder<'a> {
             // and, later, policy predicates); disallowed in CHECK constraints.
             allow_context: allow_params,
         }
+    }
+
+    /// Bring `excluded.<col>` in or out of scope (ON CONFLICT DO UPDATE only).
+    pub fn set_allow_excluded(&mut self, on: bool) {
+        self.allow_excluded = on;
     }
 
     /// Consume the binder, yielding the full parameter-type vector (user
@@ -369,6 +383,24 @@ impl<'a> Binder<'a> {
                 let else_b = unified.pop().expect("pushed above");
                 let arms_b: Vec<(BExpr, BExpr)> = bound_conds.into_iter().zip(unified).collect();
                 Ok((self.fold_case(arms_b, else_b)?, ty))
+            }
+            ast::Expr::Excluded(name) => {
+                if !self.allow_excluded {
+                    return Err(bind_err(
+                        "`excluded` is only in scope inside ON CONFLICT ... DO UPDATE",
+                    ));
+                }
+                let i = self
+                    .table
+                    .columns
+                    .iter()
+                    .position(|c| c.name == *name)
+                    .ok_or_else(|| bind_err(format!("unknown column `excluded.{name}`")))?;
+                let n = self.table.columns.len();
+                Ok((
+                    BExpr::Col((n + i) as u16),
+                    Some(self.table.columns[i].ty),
+                ))
             }
             ast::Expr::Coalesce(args) => {
                 if args.is_empty() {
@@ -635,7 +667,13 @@ impl<'a> Binder<'a> {
     fn static_type(&self, e: &BExpr) -> Ty {
         match e {
             BExpr::Const(v) => v.column_type(),
-            BExpr::Col(i) => Some(self.table.columns[*i as usize].ty),
+            // An `excluded.<c>` binds to Col(n + i); fold the index back so a
+            // second-half reference reports the column's real type instead of
+            // indexing off the end.
+            BExpr::Col(i) => {
+                let n = self.table.columns.len();
+                self.table.columns.get(*i as usize % n.max(1)).map(|c| c.ty)
+            }
             BExpr::Param(i) => self.param_types[*i as usize],
             BExpr::Unary(BUnOp::ToFloat, _) => Some(ColumnType::Float64),
             BExpr::Call(ScalarFn::Length, _) => Some(ColumnType::Int64),

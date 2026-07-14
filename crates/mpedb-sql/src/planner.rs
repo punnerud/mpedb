@@ -12,7 +12,9 @@ use std::collections::BTreeSet;
 /// scalar type, so the type-inference guard skips them).
 type PlannedStmt = (PlanStmt, Vec<Option<ColumnType>>, Vec<String>, BTreeSet<String>);
 use crate::binder::{compile_program, BExpr, Binder};
-use crate::plan::{render_program, AccessPath, CompiledPlan, InsertSource, PlanStmt, Projection};
+use crate::plan::{
+    render_program, AccessPath, CompiledPlan, InsertSource, PlanOnConflict, PlanStmt, Projection,
+};
 use crate::policy::{PolicyCatalog, TablePolicies};
 use mpedb_types::{
     ColumnType, Error, Footprint, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
@@ -367,6 +369,139 @@ fn plan_select(
     ))
 }
 
+/// Compile an `ON CONFLICT` action.
+///
+/// The conflict target must be the PRIMARY KEY. That is not a placeholder for
+/// laziness: the executor finds the conflicting row with `get_by_pk`, which is
+/// the only probe it has. A target naming a secondary unique column would need
+/// an index probe the write path does not expose, and guessing — "you said
+/// (email), I will upsert on the PK anyway" — would update the WRONG row. So it
+/// is refused with a message that says which columns would work.
+fn plan_on_conflict(
+    oc: &ast::OnConflict,
+    binder: &mut Binder,
+    table: &mpedb_types::TableDef,
+    _table_id: u32,
+    _consts: &mut Vec<Value>,
+) -> Result<PlanOnConflict> {
+    let (target, set, where_clause) = match oc {
+        ast::OnConflict::Error => return Ok(PlanOnConflict::Error),
+        ast::OnConflict::DoNothing => return Ok(PlanOnConflict::DoNothing),
+        ast::OnConflict::DoUpdate {
+            target,
+            set,
+            where_clause,
+        } => (target, set, where_clause),
+    };
+    let mut tcols = Vec::with_capacity(target.len());
+    for name in target {
+        let i = table
+            .columns
+            .iter()
+            .position(|c| c.name == *name)
+            .ok_or_else(|| bind_err(format!("unknown conflict-target column `{name}`")))?;
+        tcols.push(i as u16);
+    }
+    let pk: Vec<u16> = table.primary_key.clone();
+    if tcols != pk {
+        let pk_names: Vec<&str> = pk
+            .iter()
+            .map(|i| table.columns[*i as usize].name.as_str())
+            .collect();
+        return Err(bind_err(format!(
+            "ON CONFLICT ({}) is not supported: the conflict target must be the primary key \
+             ({}), because that is the only key the write path can probe. Upserting on a \
+             secondary unique column is not implemented — it would have to guess which row \
+             you meant.",
+            target.join(", "),
+            pk_names.join(", ")
+        )));
+    }
+    // `excluded.<c>` is in scope only here, and binds to Col(n + i): the
+    // executor runs these over [existing ‖ proposed].
+    binder.set_allow_excluded(true);
+    let mut bset = Vec::with_capacity(set.len());
+    for (name, e) in set {
+        let i = table
+            .columns
+            .iter()
+            .position(|c| c.name == *name)
+            .ok_or_else(|| bind_err(format!("unknown column `{name}` in DO UPDATE SET")))?;
+        let (b, ty) = binder.bind_expr(e)?;
+        if let Some(t) = ty {
+            if t != table.columns[i].ty {
+                binder.set_allow_excluded(false);
+                return Err(bind_err(format!(
+                    "cannot assign {t} to column `{name}` of type {}",
+                    table.columns[i].ty
+                )));
+            }
+        }
+        bset.push((i as u16, compile_program(&b)?));
+    }
+    let filter = match where_clause {
+        Some(w) => {
+            let (b, ty) = binder.bind_expr(w)?;
+            if !matches!(ty, Some(ColumnType::Bool) | None) {
+                binder.set_allow_excluded(false);
+                return Err(bind_err("ON CONFLICT ... WHERE must be a bool condition"));
+            }
+            Some(compile_program(&b)?)
+        }
+        None => None,
+    };
+    binder.set_allow_excluded(false);
+    Ok(PlanOnConflict::DoUpdate {
+        target: tcols,
+        set: bset,
+        filter,
+    })
+}
+
+/// Compile a `RETURNING` clause into a projection over the written row.
+fn plan_returning(
+    r: Option<&Option<Vec<ast::Expr>>>,
+    binder: &mut Binder,
+    table: &mpedb_types::TableDef,
+) -> Result<Option<Vec<Projection>>> {
+    let Some(items) = r else { return Ok(None) };
+    let Some(items) = items else {
+        // RETURNING *
+        return Ok(Some(
+            (0..table.columns.len() as u16).map(Projection::Column).collect(),
+        ));
+    };
+    let mut proj = Vec::with_capacity(items.len());
+    for e in items {
+        match e {
+            ast::Expr::Col(name) => {
+                let i = table
+                    .columns
+                    .iter()
+                    .position(|c| c.name == *name)
+                    .ok_or_else(|| bind_err(format!("unknown column `{name}` in RETURNING")))?;
+                proj.push(Projection::Column(i as u16));
+            }
+            other => {
+                let (b, _) = binder.bind_expr(other)?;
+                proj.push(Projection::Expr {
+                    program: compile_program(&b)?,
+                    name: render_expr_name(other),
+                });
+            }
+        }
+    }
+    Ok(Some(proj))
+}
+
+/// A display name for a RETURNING expression item.
+fn render_expr_name(e: &ast::Expr) -> String {
+    match e {
+        ast::Expr::Col(c) => c.clone(),
+        _ => "?column?".to_string(),
+    }
+}
+
 fn plan_insert(
     s: &ast::InsertStmt,
     schema: &Schema,
@@ -474,12 +609,32 @@ fn plan_insert(
     let with_check = write_check(&mut binder, catalog, table_id, &table.name, PolicyCmd::Insert)?
         .map(|b| compile_program(&b))
         .transpose()?;
+
+    // §6.5: ON CONFLICT is refused on an RLS table rather than silently
+    // weakening the classification-oracle closure. `with_check.is_some()` is
+    // exact — the planner emits it iff RLS is enabled on the target — and it is
+    // the same signal hide_constraint_variant keys off, so the two cannot drift.
+    if !matches!(s.on_conflict, ast::OnConflict::Error) && with_check.is_some() {
+        return Err(bind_err(format!(
+            "ON CONFLICT is not supported on `{}`, which has row-level security \
+             (DESIGN-MULTIDB §6.5): a silent skip would tell the caller that a row it \
+             cannot see exists, and DO UPDATE would overwrite one. Use a plain INSERT and \
+             handle the rejection.",
+            table.name
+        )));
+    }
+
+    let on_conflict = plan_on_conflict(&s.on_conflict, &mut binder, table, table_id, consts)?;
+    let returning = plan_returning(s.returning.as_ref(), &mut binder, table)?;
+
     let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
         PlanStmt::Insert {
             table: table_id,
             rows,
             with_check,
+            on_conflict,
+            returning,
         },
         param_types,
         context_keys,
@@ -532,9 +687,11 @@ fn plan_update(
     let with_check = write_check(&mut binder, catalog, table_id, &table.name, PolicyCmd::Update)?
         .map(|b| compile_program(&b))
         .transpose()?;
+    let returning = plan_returning(s.returning.as_ref(), &mut binder, table)?;
     let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
         PlanStmt::Update {
+            returning,
             table: table_id,
             access,
             filter,
@@ -564,9 +721,11 @@ fn plan_delete(
     let policy = read_policy(&mut binder, catalog, table_id, &table.name, PolicyCmd::Delete)?;
     let (access, residual) = extract_access(merge_and(bound_where, policy), table, consts)?;
     let filter = residual.map(|e| compile_program(&e)).transpose()?;
+    let returning = plan_returning(s.returning.as_ref(), &mut binder, table)?;
     let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
         PlanStmt::Delete {
+            returning,
             table: table_id,
             access,
             filter,
