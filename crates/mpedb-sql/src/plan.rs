@@ -75,6 +75,9 @@ pub enum PlanStmt {
         /// Evaluated with `eval_filter` semantics — NULL and FALSE both REJECT
         /// (NOT the CHECK-constraint rule). `None` = no RLS write gate.
         with_check: Option<ExprProgram>,
+        on_conflict: PlanOnConflict,
+        /// `RETURNING` projection over the written row. `None` = no clause.
+        returning: Option<Vec<Projection>>,
     },
     Update {
         table: u32,
@@ -84,15 +87,46 @@ pub enum PlanStmt {
         set: Vec<(u16, ExprProgram)>,
         /// RLS `WITH CHECK` gate on the post-image row (see `Insert::with_check`).
         with_check: Option<ExprProgram>,
+        /// `RETURNING` over the POST-image row.
+        returning: Option<Vec<Projection>>,
     },
     Delete {
         table: u32,
         access: AccessPath,
         filter: Option<ExprProgram>,
+        /// `RETURNING` over the row as it was BEFORE deletion — there is no
+        /// post-image to project.
+        returning: Option<Vec<Projection>>,
     },
     Begin,
     Commit,
     Rollback,
+}
+
+/// The compiled `ON CONFLICT` action.
+///
+/// **Not available on an RLS-enabled table, by design.** DESIGN-MULTIDB §6.5
+/// closes a classification oracle by collapsing PrimaryKey/Unique/Check
+/// violations into one opaque `WriteRejected`, so a caller cannot learn WHICH
+/// constraint an invisible row tripped. `ON CONFLICT DO NOTHING` reopens exactly
+/// that channel — a silent skip means "a unique conflict", an error means
+/// "something else" — and `DO UPDATE` is worse: it would overwrite a row the
+/// caller cannot see. PostgreSQL permits both and documents the inference;
+/// mpedb made the §6.5 promise, so the planner refuses instead of quietly
+/// weakening it.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlanOnConflict {
+    Error,
+    DoNothing,
+    DoUpdate {
+        /// Table column indices of the conflict target.
+        target: Vec<u16>,
+        /// column index -> value expression, evaluated over the EXISTING row
+        /// concatenated with the PROPOSED row (`excluded.<c>` = `Col(n + i)`).
+        set: Vec<(u16, ExprProgram)>,
+        /// Optional `WHERE` on the update, over the same doubled row.
+        filter: Option<ExprProgram>,
+    },
 }
 
 /// Where an inserted column value comes from. `Default` means "use the
@@ -357,8 +391,38 @@ impl CompiledPlan {
                 table,
                 rows,
                 with_check,
+                on_conflict,
+                returning,
             } => {
                 let t = get_table(*table)?;
+                // A DO UPDATE's SET/WHERE run over [existing ‖ proposed], so
+                // their column indices legitimately reach 2n-1. check_program
+                // only knows about n, hence the dedicated check.
+                match on_conflict {
+                    PlanOnConflict::Error | PlanOnConflict::DoNothing => {}
+                    PlanOnConflict::DoUpdate { target, set, filter } => {
+                        if target.is_empty() {
+                            return Err(corrupt("ON CONFLICT DO UPDATE with no target"));
+                        }
+                        for c in target {
+                            if *c as usize >= t.columns.len() {
+                                return Err(corrupt("conflict-target column out of range"));
+                            }
+                        }
+                        for (c, p) in set {
+                            if *c as usize >= t.columns.len() {
+                                return Err(corrupt("ON CONFLICT SET column out of range"));
+                            }
+                            self.check_doubled_program(p, t)?;
+                        }
+                        if let Some(f) = filter {
+                            self.check_doubled_program(f, t)?;
+                        }
+                    }
+                }
+                if let Some(r) = returning {
+                    self.check_projection(r, t)?;
+                }
                 if rows.is_empty() {
                     return Err(corrupt("INSERT plan with no rows"));
                 }
@@ -409,8 +473,12 @@ impl CompiledPlan {
                 filter,
                 set,
                 with_check,
+                returning,
             } => {
                 let t = get_table(*table)?;
+                if let Some(r) = returning {
+                    self.check_projection(r, t)?;
+                }
                 self.check_access(access, t)?;
                 if let Some(f) = filter {
                     self.check_program(f, t)?;
@@ -441,9 +509,13 @@ impl CompiledPlan {
                 table,
                 access,
                 filter,
+                returning,
             } => {
                 let t = get_table(*table)?;
                 self.check_access(access, t)?;
+                if let Some(r) = returning {
+                    self.check_projection(r, t)?;
+                }
                 if let Some(f) = filter {
                     self.check_program(f, t)?;
                 }
@@ -464,6 +536,43 @@ impl CompiledPlan {
             match *i {
                 Instr::PushCol(c) if c as usize >= t.columns.len() => {
                     return Err(corrupt("expression column out of range"));
+                }
+                Instr::PushParam(pi) if pi >= self.n_params => {
+                    return Err(corrupt("expression param out of range"));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate a `RETURNING` projection: column indices in range, and any
+    /// expression's own indices too.
+    fn check_projection(&self, proj: &[Projection], t: &TableDef) -> Result<()> {
+        for p in proj {
+            match p {
+                Projection::Column(i) => {
+                    if *i as usize >= t.columns.len() {
+                        return Err(corrupt("RETURNING column out of range"));
+                    }
+                }
+                Projection::Expr { program, .. } => self.check_program(program, t)?,
+            }
+        }
+        Ok(())
+    }
+
+    /// A `DO UPDATE` SET/WHERE program runs over the EXISTING row concatenated
+    /// with the PROPOSED one, so `Col(n + i)` is `excluded.<col i>` and is
+    /// legal. `check_program` would reject those as out of range, so the bound
+    /// here is 2n — but still a bound: a hostile plan must not read past the
+    /// doubled row either.
+    fn check_doubled_program(&self, p: &ExprProgram, t: &TableDef) -> Result<()> {
+        let limit = t.columns.len() * 2;
+        for i in &p.instrs {
+            match *i {
+                Instr::PushCol(c) if c as usize >= limit => {
+                    return Err(corrupt("ON CONFLICT expression column out of range"));
                 }
                 Instr::PushParam(pi) if pi >= self.n_params => {
                     return Err(corrupt("expression param out of range"));
@@ -599,11 +708,34 @@ impl CompiledPlan {
                 table,
                 rows,
                 with_check,
+                on_conflict,
+                returning,
             } => {
                 let name = col_namer(*table);
                 out.push_str(&format!("Insert {}\n", table_name(*table)));
                 if let Some(w) = with_check {
                     out.push_str(&format!("  with check: {}\n", render_program(w, &name)));
+                }
+                match on_conflict {
+                    PlanOnConflict::Error => {}
+                    PlanOnConflict::DoNothing => out.push_str("  on conflict: do nothing\n"),
+                    PlanOnConflict::DoUpdate { target, set, filter } => {
+                        let cols: Vec<String> = target.iter().map(|c| name(*c)).collect();
+                        out.push_str(&format!("  on conflict ({}): do update\n", cols.join(", ")));
+                        for (c, p) in set {
+                            out.push_str(&format!(
+                                "    set {} = {}\n",
+                                name(*c),
+                                render_program(p, &name)
+                            ));
+                        }
+                        if let Some(f) = filter {
+                            out.push_str(&format!("    where {}\n", render_program(f, &name)));
+                        }
+                    }
+                }
+                if returning.is_some() {
+                    out.push_str("  returning: yes\n");
                 }
                 for (r, row) in rows.iter().enumerate() {
                     let items: Vec<String> = row
@@ -627,9 +759,13 @@ impl CompiledPlan {
                 filter,
                 set,
                 with_check,
+                returning,
             } => {
                 let name = col_namer(*table);
                 out.push_str(&format!("Update {}\n", table_name(*table)));
+                if returning.is_some() {
+                    out.push_str("  returning: yes\n");
+                }
                 if let Some(w) = with_check {
                     out.push_str(&format!("  with check: {}\n", render_program(w, &name)));
                 }
@@ -650,9 +786,13 @@ impl CompiledPlan {
                 table,
                 access,
                 filter,
+                returning,
             } => {
                 let name = col_namer(*table);
                 out.push_str(&format!("Delete {}\n", table_name(*table)));
+                if returning.is_some() {
+                    out.push_str("  returning: yes\n");
+                }
                 out.push_str(&format!(
                     "  access: {}\n",
                     self.render_access(access, schema, *table)
@@ -893,6 +1033,124 @@ fn decode_access(buf: &[u8], pos: &mut usize) -> Result<AccessPath> {
     }
 }
 
+const OC_ERROR: u8 = 0;
+const OC_DO_NOTHING: u8 = 1;
+const OC_DO_UPDATE: u8 = 2;
+
+fn encode_projection(proj: &[Projection], buf: &mut Vec<u8>) {
+    w_u16(buf, proj.len() as u16);
+    for p in proj {
+        match p {
+            Projection::Column(i) => {
+                buf.push(PROJ_COLUMN);
+                w_u16(buf, *i);
+            }
+            Projection::Expr { program, name } => {
+                buf.push(PROJ_EXPR);
+                program.encode_into(buf);
+                buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                buf.extend_from_slice(name.as_bytes());
+            }
+        }
+    }
+}
+
+fn decode_projection(buf: &[u8], pos: &mut usize) -> Result<Vec<Projection>> {
+    let n = r_u16(buf, pos)? as usize;
+    // Mirror the parse-time caps: a compliant encoder can never exceed them, so
+    // a larger count is corruption or forgery. This blob can come from a hostile
+    // shared-memory region.
+    if n > crate::parser::MAX_SELECT_ITEMS {
+        return Err(corrupt("too many RETURNING items in plan"));
+    }
+    let mut proj = Vec::with_capacity(n.min(1024));
+    for _ in 0..n {
+        proj.push(match r_u8(buf, pos)? {
+            PROJ_COLUMN => Projection::Column(r_u16(buf, pos)?),
+            PROJ_EXPR => {
+                let program = ExprProgram::decode(buf, pos)?;
+                let len = r_u32(buf, pos)? as usize;
+                if len > 1 << 20 {
+                    return Err(corrupt("projection name too long"));
+                }
+                let name = std::str::from_utf8(take(buf, pos, len)?)
+                    .map_err(|_| corrupt("invalid utf-8 in projection name"))?
+                    .to_string();
+                Projection::Expr { program, name }
+            }
+            other => return Err(corrupt(format!("bad projection tag {other}"))),
+        });
+    }
+    Ok(proj)
+}
+
+fn encode_opt_projection(proj: Option<&[Projection]>, buf: &mut Vec<u8>) {
+    match proj {
+        None => buf.push(0),
+        Some(p) => {
+            buf.push(1);
+            encode_projection(p, buf);
+        }
+    }
+}
+
+fn decode_opt_projection(buf: &[u8], pos: &mut usize) -> Result<Option<Vec<Projection>>> {
+    match r_u8(buf, pos)? {
+        0 => Ok(None),
+        1 => Ok(Some(decode_projection(buf, pos)?)),
+        other => Err(corrupt(format!("bad optional-projection tag {other}"))),
+    }
+}
+
+fn encode_on_conflict(oc: &PlanOnConflict, buf: &mut Vec<u8>) {
+    match oc {
+        PlanOnConflict::Error => buf.push(OC_ERROR),
+        PlanOnConflict::DoNothing => buf.push(OC_DO_NOTHING),
+        PlanOnConflict::DoUpdate { target, set, filter } => {
+            buf.push(OC_DO_UPDATE);
+            w_u16(buf, target.len() as u16);
+            for c in target {
+                w_u16(buf, *c);
+            }
+            w_u16(buf, set.len() as u16);
+            for (c, program) in set {
+                w_u16(buf, *c);
+                program.encode_into(buf);
+            }
+            encode_opt_program(filter.as_ref(), buf);
+        }
+    }
+}
+
+fn decode_on_conflict(buf: &[u8], pos: &mut usize) -> Result<PlanOnConflict> {
+    Ok(match r_u8(buf, pos)? {
+        OC_ERROR => PlanOnConflict::Error,
+        OC_DO_NOTHING => PlanOnConflict::DoNothing,
+        OC_DO_UPDATE => {
+            let n = r_u16(buf, pos)? as usize;
+            if n > crate::parser::MAX_SET_ITEMS {
+                return Err(corrupt("too many conflict-target columns in plan"));
+            }
+            let mut target = Vec::with_capacity(n.min(64));
+            for _ in 0..n {
+                target.push(r_u16(buf, pos)?);
+            }
+            let n = r_u16(buf, pos)? as usize;
+            if n > crate::parser::MAX_SET_ITEMS {
+                return Err(corrupt("too many SET assignments in plan"));
+            }
+            let mut set = Vec::with_capacity(n.min(1024));
+            for _ in 0..n {
+                let c = r_u16(buf, pos)?;
+                set.push((c, ExprProgram::decode(buf, pos)?));
+            }
+            let filter = decode_opt_program(buf, pos)?;
+            PlanOnConflict::DoUpdate { target, set, filter }
+        }
+        other => return Err(corrupt(format!("bad ON CONFLICT tag {other}"))),
+    })
+}
+
 fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
     match stmt {
         PlanStmt::Select {
@@ -935,6 +1193,8 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             table,
             rows,
             with_check,
+            on_conflict,
+            returning,
         } => {
             buf.push(STMT_INSERT);
             buf.extend_from_slice(&table.to_le_bytes());
@@ -957,6 +1217,8 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
                 }
             }
             encode_opt_program(with_check.as_ref(), buf);
+            encode_on_conflict(on_conflict, buf);
+            encode_opt_projection(returning.as_deref(), buf);
         }
         PlanStmt::Update {
             table,
@@ -964,6 +1226,7 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             filter,
             set,
             with_check,
+            returning,
         } => {
             buf.push(STMT_UPDATE);
             buf.extend_from_slice(&table.to_le_bytes());
@@ -975,16 +1238,19 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
                 program.encode_into(buf);
             }
             encode_opt_program(with_check.as_ref(), buf);
+            encode_opt_projection(returning.as_deref(), buf);
         }
         PlanStmt::Delete {
             table,
             access,
             filter,
+            returning,
         } => {
             buf.push(STMT_DELETE);
             buf.extend_from_slice(&table.to_le_bytes());
             encode_access(access, buf);
             encode_opt_program(filter.as_ref(), buf);
+            encode_opt_projection(returning.as_deref(), buf);
         }
         PlanStmt::Begin => buf.push(STMT_BEGIN),
         PlanStmt::Commit => buf.push(STMT_COMMIT),
@@ -1070,10 +1336,14 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                 rows.push(row);
             }
             let with_check = decode_opt_program(buf, pos)?;
+            let on_conflict = decode_on_conflict(buf, pos)?;
+            let returning = decode_opt_projection(buf, pos)?;
             Ok(PlanStmt::Insert {
                 table,
                 rows,
                 with_check,
+                on_conflict,
+                returning,
             })
         }
         STMT_UPDATE => {
@@ -1091,22 +1361,26 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                 set.push((c, program));
             }
             let with_check = decode_opt_program(buf, pos)?;
+            let returning = decode_opt_projection(buf, pos)?;
             Ok(PlanStmt::Update {
                 table,
                 access,
                 filter,
                 set,
                 with_check,
+                returning,
             })
         }
         STMT_DELETE => {
             let table = r_u32(buf, pos)?;
             let access = decode_access(buf, pos)?;
             let filter = decode_opt_program(buf, pos)?;
+            let returning = decode_opt_projection(buf, pos)?;
             Ok(PlanStmt::Delete {
                 table,
                 access,
                 filter,
+                returning,
             })
         }
         STMT_BEGIN => Ok(PlanStmt::Begin),

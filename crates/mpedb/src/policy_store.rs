@@ -980,5 +980,36 @@ mod tests {
         assert!(p.exists(), "the file must exist while the test runs");
         panic!("deliberate panic; {} must not survive it", p.display());
     }
+
+    /// §6.5, extended to ON CONFLICT. The section closes a classification
+    /// oracle by collapsing PrimaryKey/Unique/Check into one opaque
+    /// `WriteRejected`, so a caller cannot learn WHICH constraint an invisible
+    /// row tripped. `ON CONFLICT DO NOTHING` reopens it exactly: a silent skip
+    /// means "unique conflict", an error means "something else". `DO UPDATE` is
+    /// worse -- it would overwrite a row the caller cannot see.
+    ///
+    /// PostgreSQL permits both and documents the inference. mpedb made the §6.5
+    /// promise, so the planner refuses rather than quietly weakening it. This
+    /// test is the guard on that decision.
+    #[test]
+    fn on_conflict_is_refused_on_an_rls_table() {
+        let db = db("oc-rls");
+        db.create_policy("orders", &tenant_policy()).unwrap();
+        db.enable_rls("orders", false).unwrap();
+        for sql in [
+            "INSERT INTO orders (id, tenant) VALUES (1, 1) ON CONFLICT DO NOTHING",
+            "INSERT INTO orders (id, tenant) VALUES (1, 1) ON CONFLICT (id) DO UPDATE SET tenant = 2",
+        ] {
+            let r = db.prepare(sql);
+            assert!(
+                matches!(&r, Err(E::Bind(m))
+                    if m.contains("row-level security") && m.contains("6.5")),
+                "ON CONFLICT must be refused under RLS, got {r:?} for: {sql}"
+            );
+        }
+        // ...and a plain INSERT still works, so the refusal is scoped to the
+        // clause rather than breaking writes on RLS tables.
+        db.query("INSERT INTO orders (id, tenant) VALUES (1, 1)", &[]).unwrap_err();
+    }
 }
 
