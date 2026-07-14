@@ -16,7 +16,48 @@ pub use config::{
     Concurrency, Config, DbOptions, Durability, FilePerms, WorkspaceConfig, WorkspaceMember,
 };
 pub use error::{Error, Result};
+pub mod agg;
+pub use agg::Accum;
 pub use expr::{ExprProgram, Instr, ScalarFn};
+
+/// The aggregate functions.
+///
+/// A closed enum, like [`ScalarFn`]: the tag goes in the plan bytes, so it must
+/// be stable and exhaustively decodable — an unknown tag is `Corrupt`, never a
+/// silently-missing aggregate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum AggFn {
+    /// `COUNT(*)` when the arg is None, `COUNT(expr)` otherwise. COUNT(expr)
+    /// skips NULLs; COUNT(*) counts rows.
+    Count = 1,
+    Sum = 2,
+    Avg = 3,
+    Min = 4,
+    Max = 5,
+}
+
+impl AggFn {
+    pub fn from_tag(t: u8) -> Option<AggFn> {
+        Some(match t {
+            1 => AggFn::Count,
+            2 => AggFn::Sum,
+            3 => AggFn::Avg,
+            4 => AggFn::Min,
+            5 => AggFn::Max,
+            _ => return None,
+        })
+    }
+    pub fn name(self) -> &'static str {
+        match self {
+            AggFn::Count => "count",
+            AggFn::Sum => "sum",
+            AggFn::Avg => "avg",
+            AggFn::Min => "min",
+            AggFn::Max => "max",
+        }
+    }
+}
 pub use footprint::{Footprint, KeyAccess, KeyBound, KeyPart, PlanHash};
 pub use policy::{PolicyCmd, PolicyDef};
 pub use schema::{ColumnDef, DefaultExpr, Schema, TableDef};
