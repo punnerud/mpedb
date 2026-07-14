@@ -74,9 +74,9 @@ impl SqliteAdapter {
 
     /// Read every current row of a mirrored table as mpedb values, in PK order
     /// (`COLLATE BINARY` so text order matches mpedb's memcmp keycode order —
-    /// review CONF#7). Used by the merge-diff / anti-entropy reconcile and the
-    /// no-touch mode. One SELECT is its own consistent snapshot.
-    pub fn read_table_rows(&self, table_id: u32) -> Result<Vec<Vec<Value>>> {
+    /// review CONF#7). One SELECT is its own consistent snapshot. Exposed via
+    /// [`SourceAdapter::read_table_rows`].
+    fn read_all_rows(&self, table_id: u32) -> Result<Vec<Vec<Value>>> {
         let meta = self
             .tables
             .iter()
@@ -330,6 +330,10 @@ impl SourceAdapter for SqliteAdapter {
 
     fn zero_cursor(&self) -> Cursor {
         SqliteCursor::default().encode()
+    }
+
+    fn read_table_rows(&mut self, table_id: u32) -> Result<Vec<Vec<Value>>> {
+        self.read_all_rows(table_id)
     }
 }
 

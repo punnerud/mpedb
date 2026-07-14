@@ -17,6 +17,7 @@ use std::collections::BTreeMap;
 use mpedb::{Database, ExecResult};
 use mpedb_types::{keycode, Error, Result, Value};
 
+use crate::adapter::SourceAdapter;
 use crate::sqlite_adapter::SqliteAdapter;
 use crate::sqlite_track::SqliteCursor;
 
@@ -51,8 +52,11 @@ fn query_all(db: &Database, table: &str, cols: &[String]) -> Result<Vec<Vec<Valu
     }
 }
 
-/// Reconcile mpedb to the sqlite source (source-wins). Returns what changed.
-pub fn reconcile(db: &Database, adapter: &SqliteAdapter) -> Result<ReconcileStats> {
+/// Reconcile mpedb to the source (source-wins), over any adapter — the merge-
+/// diff / anti-entropy pass and no-touch mode for both sqlite and PostgreSQL.
+/// Also the natural handler for a PostgreSQL TRUNCATE (the source table is now
+/// empty → the mpedb rows are deleted).
+pub fn reconcile<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<ReconcileStats> {
     let schema = db.schema().clone();
     let mut stats = ReconcileStats::default();
 
@@ -192,7 +196,7 @@ mod tests {
             s.delete_by_pk(0, &[Value::Int(3)]).unwrap();
             s.commit().unwrap();
         }
-        let adapter = SqliteAdapter::new(Connection::open(&src_path).unwrap(), None, &[]).unwrap();
+        let mut adapter = SqliteAdapter::new(Connection::open(&src_path).unwrap(), None, &[]).unwrap();
         adapter
             .conn()
             .execute_batch(
@@ -202,7 +206,7 @@ mod tests {
             )
             .unwrap();
 
-        let stats = reconcile(&db, &adapter).unwrap();
+        let stats = reconcile(&db, &mut adapter).unwrap();
         assert_eq!(stats.tables_changed, 1);
 
         // mpedb now equals the source: ids {1,3?,4}? source has {1,3,4} (id=3
@@ -216,7 +220,7 @@ mod tests {
         assert_eq!(rows[0][0], Value::Int(11)); // source value won
 
         // reconcile again is a no-op (converged)
-        let again = reconcile(&db, &adapter).unwrap();
+        let again = reconcile(&db, &mut adapter).unwrap();
         assert_eq!(again.tables_changed, 0);
 
         for p in [src_path, mpedb_path] {

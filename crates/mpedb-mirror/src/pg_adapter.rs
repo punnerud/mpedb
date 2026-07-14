@@ -223,6 +223,39 @@ impl SourceAdapter for PgAdapter {
     fn zero_cursor(&self) -> Cursor {
         Vec::new()
     }
+
+    fn read_table_rows(&mut self, table_id: u32) -> Result<Vec<Vec<Value>>> {
+        let src = self
+            .tables
+            .iter()
+            .find(|t| t.table_id == table_id)
+            .ok_or_else(|| Error::Config(format!("table id {table_id} is not mirrored")))?
+            .src
+            .clone();
+        let exprs = src.columns.iter().map(read_expr).collect::<Vec<_>>().join(", ");
+        let order = src
+            .pk
+            .iter()
+            .map(|&i| q(&src.columns[i].name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!(
+            "SELECT {exprs} FROM \"public\".{} ORDER BY {order}",
+            q(&src.name)
+        );
+        let types: Vec<ColumnType> = src.columns.iter().map(|c| c.mapped.unwrap()).collect();
+        let rows = self.client.query(&sql, &[]).map_err(pgerr)?;
+        Ok(rows
+            .iter()
+            .map(|row| {
+                types
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &ct)| read_value(row, i, ct))
+                    .collect()
+            })
+            .collect())
+    }
 }
 
 /// Re-read the current row for a PK at the transaction's snapshot, as mpedb
@@ -337,6 +370,47 @@ mod tests {
 
         // follow from the advanced cursor is empty
         assert!(adapter.pull(&batch.end_cursor, 10000).unwrap().is_none());
+
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    #[ignore = "needs PostgreSQL (run with --ignored)"]
+    fn pg_truncate_surfaces_and_reconcile_converges() {
+        use crate::reconcile::reconcile;
+
+        let pg = crate::pg_harness::ThrowawayPg::start();
+        {
+            let mut c = pg.client();
+            c.batch_execute(
+                "CREATE TABLE t(id bigint PRIMARY KEY, v int);
+                 INSERT INTO t VALUES (1,10),(2,20),(3,30);",
+            )
+            .unwrap();
+        }
+        let dest = tmp("pg-trunc");
+        let db = {
+            let mut c = pg.client();
+            import_pg(&mut c, &dest, &ImportOptions::default()).unwrap().0
+        };
+        assert_eq!(ids(&db), vec![1, 2, 3]);
+
+        let mut adapter = PgAdapter::new(pg.client(), None, &[]).unwrap();
+        adapter.install_triggers().unwrap();
+
+        // out-of-band divergence + a TRUNCATE-then-reload the pull can't follow
+        adapter.client().batch_execute("TRUNCATE t; INSERT INTO t VALUES (9,90);").unwrap();
+
+        // pull hits the TRUNCATE and asks for a reconcile
+        let from = adapter.zero_cursor();
+        assert!(adapter.pull(&from, 10000).is_err());
+
+        // reconcile converges mpedb to the post-truncate source ({9})
+        let stats = reconcile(&db, &mut adapter).unwrap();
+        assert!(stats.tables_changed >= 1);
+        assert_eq!(ids(&db), vec![9]);
+        // reconcile again is a no-op
+        assert_eq!(reconcile(&db, &mut adapter).unwrap().tables_changed, 0);
 
         let _ = std::fs::remove_file(&dest);
     }
