@@ -16,7 +16,7 @@ pub use config::{
     Concurrency, Config, DbOptions, Durability, FilePerms, WorkspaceConfig, WorkspaceMember,
 };
 pub use error::{Error, Result};
-pub use expr::{ExprProgram, Instr};
+pub use expr::{ExprProgram, Instr, ScalarFn};
 pub use footprint::{Footprint, KeyAccess, KeyBound, KeyPart, PlanHash};
 pub use policy::{PolicyCmd, PolicyDef};
 pub use schema::{ColumnDef, DefaultExpr, Schema, TableDef};

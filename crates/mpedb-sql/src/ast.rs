@@ -104,4 +104,10 @@ pub(crate) enum Expr {
     /// form (`CASE x WHEN a …`) is desugared into this by the parser.
     /// `else_` is None for a missing ELSE, which SQL defines as NULL.
     Case(Vec<(Expr, Expr)>, Option<Box<Expr>>),
+    /// A scalar function call. `coalesce`/`ifnull`/`nullif` never appear here:
+    /// they must NOT propagate NULL, so the binder compiles them to control
+    /// flow instead of a call.
+    Func(String, Vec<Expr>),
+    /// `coalesce(a, b, …)` — first non-NULL argument, evaluated lazily.
+    Coalesce(Vec<Expr>),
 }

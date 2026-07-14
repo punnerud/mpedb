@@ -213,10 +213,14 @@ mod tests {
     use super::*;
     use crate::params;
 
-    fn shards(tag: &str, k: usize) -> ShardSet {
+    fn shards(tag: &str, k: usize) -> crate::testdb::Owned<ShardSet> {
         let path = format!("/dev/shm/mpedb-shardset-{tag}-{}.mpedb", std::process::id());
-        for i in 0..k {
-            let _ = std::fs::remove_file(format!("{path}.shard{i}"));
+        // A ShardSet fans out into <path>.shard0..k; every one of them is ours
+        // to remove, panic or not.
+        let files: Vec<std::path::PathBuf> =
+            (0..k).map(|i| format!("{path}.shard{i}").into()).collect();
+        for p in &files {
+            let _ = std::fs::remove_file(p);
         }
         let cfg = Config::from_toml_str(&format!(
             "[database]\npath = \"{path}\"\nsize_mb = 8\n\
@@ -225,7 +229,7 @@ mod tests {
              [[table.column]]\n  name = \"v\"\n  type = \"int64\"\n  nullable = false"
         ))
         .unwrap();
-        ShardSet::open_config(cfg, k).unwrap()
+        crate::testdb::Owned::new(ShardSet::open_config(cfg, k).unwrap(), files)
     }
 
     fn nrows(r: ExecResult) -> usize {

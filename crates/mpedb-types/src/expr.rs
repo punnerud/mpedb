@@ -74,6 +74,75 @@ pub enum Instr {
     JumpIfNotTrue(u16),
     /// Unconditional jump to absolute instruction index `t`.
     Jump(u16),
+    /// PEEK the top of the stack: jump to `t` if it is NOT NULL, leaving it in
+    /// place; otherwise fall through, still leaving it (a following [`Instr::Pop`]
+    /// discards it).
+    ///
+    /// This is what makes `coalesce` lazy. Eager evaluation would not just be a
+    /// nicety here: mpedb raises on division by zero (PostgreSQL's behaviour,
+    /// not sqlite's NULL), so an eager `coalesce(x, 1/0)` would ERROR where both
+    /// sqlite and PostgreSQL return x. Being a strict engine is the point;
+    /// being strict in a way neither ancestor is would just be a third dialect.
+    JumpIfNotNull(u16),
+    /// Discard the top of the stack.
+    Pop,
+    /// Call a scalar function over the top `argc` values (leftmost deepest),
+    /// replacing them with one result.
+    Call(ScalarFn, u8),
+}
+
+/// The built-in scalar functions. Deliberately a closed enum rather than a name
+/// lookup: the id is what goes in the plan bytes, so it must be stable and
+/// exhaustively decodable — an unknown id is [`Error::Corrupt`], never a
+/// silently-missing function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ScalarFn {
+    Lower = 1,
+    Upper = 2,
+    Length = 3,
+    Trim = 4,
+    Abs = 5,
+    Round = 6,
+    Substr = 7,
+}
+
+impl ScalarFn {
+    fn from_tag(t: u8) -> Result<ScalarFn> {
+        Ok(match t {
+            1 => ScalarFn::Lower,
+            2 => ScalarFn::Upper,
+            3 => ScalarFn::Length,
+            4 => ScalarFn::Trim,
+            5 => ScalarFn::Abs,
+            6 => ScalarFn::Round,
+            7 => ScalarFn::Substr,
+            other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
+        })
+    }
+
+    /// Allowed argument counts. Checked at verify time so `eval` can index the
+    /// popped args without re-checking.
+    pub fn arity_ok(self, argc: u8) -> bool {
+        match self {
+            ScalarFn::Lower | ScalarFn::Upper | ScalarFn::Length | ScalarFn::Trim
+            | ScalarFn::Abs => argc == 1,
+            ScalarFn::Round => argc == 1 || argc == 2,
+            ScalarFn::Substr => argc == 2 || argc == 3,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            ScalarFn::Lower => "lower",
+            ScalarFn::Upper => "upper",
+            ScalarFn::Length => "length",
+            ScalarFn::Trim => "trim",
+            ScalarFn::Abs => "abs",
+            ScalarFn::Round => "round",
+            ScalarFn::Substr => "substr",
+        }
+    }
 }
 
 const OP_PUSH_COL: u8 = 1;
@@ -102,6 +171,9 @@ const OP_IN_PARAM: u8 = 23;
 const OP_IN_LIST: u8 = 24;
 const OP_JUMP_IF_NOT_TRUE: u8 = 25;
 const OP_JUMP: u8 = 26;
+const OP_JUMP_IF_NOT_NULL: u8 = 27;
+const OP_POP: u8 = 28;
+const OP_CALL: u8 = 29;
 
 /// SQL `x IN (…)` under three-valued logic — the semantics that decide whether
 /// a policy admits a row, so they are spelled out rather than approximated:
@@ -157,6 +229,101 @@ fn in_items_3vl(probe: &Value, items: &[Value]) -> Result<Value> {
         }
     }
     Ok(if saw_null { Value::Null } else { Value::Bool(false) })
+}
+
+/// Evaluate a scalar function. `validate` already proved the arity, so the
+/// indexing here is total.
+///
+/// Every one of these is NULL-propagating: any NULL argument yields NULL,
+/// without looking at the others. That is the SQL rule, and it is why the
+/// null-tolerant functions (`coalesce`, `nullif`) are NOT here — they are
+/// compiled to control flow instead, precisely because they must NOT propagate.
+fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
+    if args.iter().any(|a| a.is_null()) {
+        return Ok(Value::Null);
+    }
+    let text = |v: &Value| -> Result<String> {
+        match v {
+            Value::Text(s) => Ok(s.clone()),
+            other => Err(Error::TypeMismatch(format!(
+                "{}() expects text, got {}",
+                f.name(),
+                other.type_name()
+            ))),
+        }
+    };
+    let int = |v: &Value| -> Result<i64> {
+        match v {
+            Value::Int(i) => Ok(*i),
+            other => Err(Error::TypeMismatch(format!(
+                "{}() expects an integer, got {}",
+                f.name(),
+                other.type_name()
+            ))),
+        }
+    };
+    Ok(match f {
+        ScalarFn::Lower => Value::Text(text(&args[0])?.to_lowercase()),
+        ScalarFn::Upper => Value::Text(text(&args[0])?.to_uppercase()),
+        // CHARACTERS, not bytes: `length('æ')` is 1. A byte count would be a
+        // silent wrong answer for every non-ASCII string, which is most of the
+        // strings in this author's part of the world.
+        ScalarFn::Length => Value::Int(text(&args[0])?.chars().count() as i64),
+        ScalarFn::Trim => Value::Text(text(&args[0])?.trim().to_string()),
+        ScalarFn::Abs => match &args[0] {
+            // i64::MIN has no positive counterpart: negating it overflows and
+            // would panic in debug and silently wrap in release.
+            Value::Int(i) => Value::Int(i.checked_abs().ok_or_else(|| {
+                Error::TypeMismatch("abs(): integer overflow (i64::MIN has no absolute value)".into())
+            })?),
+            Value::Float(x) => Value::Float(x.abs()),
+            other => {
+                return Err(Error::TypeMismatch(format!(
+                    "abs() expects a number, got {}",
+                    other.type_name()
+                )))
+            }
+        },
+        ScalarFn::Round => {
+            let digits = if args.len() == 2 { int(&args[1])? } else { 0 };
+            match &args[0] {
+                // Rounding an integer is the integer, at any digit count.
+                Value::Int(i) => Value::Int(*i),
+                Value::Float(x) => {
+                    let p = 10f64.powi(digits.clamp(-15, 15) as i32);
+                    Value::Float((x * p).round() / p)
+                }
+                other => {
+                    return Err(Error::TypeMismatch(format!(
+                        "round() expects a number, got {}",
+                        other.type_name()
+                    )))
+                }
+            }
+        }
+        ScalarFn::Substr => {
+            // sqlite/PostgreSQL agree here: 1-based, and a start below 1 counts
+            // toward the string rather than erroring.
+            let s: Vec<char> = text(&args[0])?.chars().collect();
+            let start = int(&args[1])?;
+            let begin = if start < 1 { 0usize } else { (start - 1) as usize };
+            let end = match args.len() {
+                3 => {
+                    let n = int(&args[2])?;
+                    if n <= 0 {
+                        begin
+                    } else {
+                        // saturating: begin+n can exceed usize on a hostile plan
+                        begin.saturating_add(n as usize).min(s.len())
+                    }
+                }
+                _ => s.len(),
+            };
+            let begin = begin.min(s.len());
+            let end = end.max(begin).min(s.len());
+            Value::Text(s[begin..end].iter().collect())
+        }
+    })
 }
 
 /// A compiled expression: instruction sequence + constant pool.
@@ -351,6 +518,23 @@ impl ExprProgram {
                     }
                 }
                 Instr::Jump(t) => pc = t as usize,
+                Instr::JumpIfNotNull(t) => {
+                    // PEEK, do not pop: on the taken path the value IS the
+                    // result, so popping it would throw away what we jumped for.
+                    if !stack.last().expect("validated").is_null() {
+                        pc = t as usize;
+                    }
+                }
+                Instr::Pop => {
+                    stack.pop().expect("validated");
+                }
+                Instr::Call(f, argc) => {
+                    // validate() proved depth >= argc and that argc is legal for
+                    // this function, so the split and the indexing below hold.
+                    let at = stack.len() - argc as usize;
+                    let args: Vec<Value> = stack.split_off(at);
+                    stack.push(call_scalar(f, &args)?);
+                }
             }
         }
         Ok(stack.pop().expect("validated: exactly one result"))
@@ -409,6 +593,16 @@ impl ExprProgram {
                 Instr::Jump(x) => {
                     buf.push(OP_JUMP);
                     buf.extend_from_slice(&x.to_le_bytes());
+                }
+                Instr::JumpIfNotNull(x) => {
+                    buf.push(OP_JUMP_IF_NOT_NULL);
+                    buf.extend_from_slice(&x.to_le_bytes());
+                }
+                Instr::Pop => buf.push(OP_POP),
+                Instr::Call(f, argc) => {
+                    buf.push(OP_CALL);
+                    buf.push(f as u8);
+                    buf.push(argc);
                 }
                 Instr::InParam(x) => {
                     buf.push(OP_IN_PARAM);
@@ -475,6 +669,14 @@ impl ExprProgram {
                 OP_IN_LIST => Instr::InList(read_u16_arg()?),
                 OP_JUMP_IF_NOT_TRUE => Instr::JumpIfNotTrue(read_u16_arg()?),
                 OP_JUMP => Instr::Jump(read_u16_arg()?),
+                OP_JUMP_IF_NOT_NULL => Instr::JumpIfNotNull(read_u16_arg()?),
+                OP_POP => Instr::Pop,
+                OP_CALL => {
+                    let f = *buf.get(*pos).ok_or_else(err)?;
+                    let argc = *buf.get(*pos + 1).ok_or_else(err)?;
+                    *pos += 2;
+                    Instr::Call(ScalarFn::from_tag(f)?, argc)
+                }
                 OP_EQ => Instr::Eq,
                 OP_NE => Instr::Ne,
                 OP_LT => Instr::Lt,
@@ -577,6 +779,15 @@ fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                 merge(&mut depth_at, t, d)?;
                 merge(&mut depth_at, i + 1, d)?;
             }
+            Instr::JumpIfNotNull(t) => {
+                let t = check_target(t)?;
+                if d < 1 {
+                    return Err(Error::Corrupt("expression stack underflow".into()));
+                }
+                // Peeks: the depth is UNCHANGED on both paths.
+                merge(&mut depth_at, t, d)?;
+                merge(&mut depth_at, i + 1, d)?;
+            }
             instr => {
                 let (pops, pushes) = match instr {
                     Instr::PushCol(_) | Instr::PushParam(_) => (0, 1),
@@ -606,7 +817,21 @@ fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                     Instr::Neg | Instr::Not | Instr::IsNull | Instr::IsNotNull | Instr::ToFloat => {
                         (1, 1)
                     }
-                    Instr::Jump(_) | Instr::JumpIfNotTrue(_) => unreachable!("handled above"),
+                    Instr::Pop => (1, 0),
+                    // Arity is checked HERE, once per program, so eval can index
+                    // the args without re-checking per row.
+                    Instr::Call(f, argc) => {
+                        if !f.arity_ok(argc) {
+                            return Err(Error::Corrupt(format!(
+                                "{}() called with {argc} argument(s)",
+                                f.name()
+                            )));
+                        }
+                        (argc as usize, 1)
+                    }
+                    Instr::Jump(_) | Instr::JumpIfNotTrue(_) | Instr::JumpIfNotNull(_) => {
+                        unreachable!("handled above")
+                    }
                     _ => (2, 1),
                 };
                 if d < pops {

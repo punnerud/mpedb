@@ -351,7 +351,7 @@ mod tests {
              [[table.column]]\n  name = \"note\"\n  type = \"text\"\n  nullable = true"
         ))
         .unwrap();
-        crate::testdb::TestDb::new(Database::open_with_config(cfg).unwrap())
+        crate::testdb::TestDb::new_db(Database::open_with_config(cfg).unwrap())
     }
 
     fn sess(tenant: i64) -> Session {
@@ -420,7 +420,7 @@ mod tests {
     // ---- §6.3 require_policy: the fail-closed deployment assertion ----
 
     /// Same schema, but `orders` is declared tenant-scoped.
-    fn db_requiring(tag: &str) -> Database {
+    fn db_requiring(tag: &str) -> crate::testdb::TestDb {
         let path = format!("/dev/shm/mpedb-rls-{tag}-{}.mpedb", std::process::id());
         let _ = std::fs::remove_file(&path);
         let cfg = Config::from_toml_str(&format!(
@@ -431,7 +431,7 @@ mod tests {
              [[table.column]]\n  name = \"note\"\n  type = \"text\"\n  nullable = true"
         ))
         .unwrap();
-        Database::open_with_config(cfg).unwrap()
+        crate::testdb::TestDb::new_db(Database::open_with_config(cfg).unwrap())
     }
 
     /// The whole point of §6.3: forgetting `ENABLE ROW LEVEL SECURITY` is
@@ -653,7 +653,7 @@ mod tests {
 
     /// `orders(id PK, tenant, code UNIQUE)` — the shape the lint exists for:
     /// a PK that does not lead with `tenant`, and a tenant-spanning unique.
-    fn db_leaky(tag: &str) -> Database {
+    fn db_leaky(tag: &str) -> crate::testdb::TestDb {
         let path = format!("/dev/shm/mpedb-rls-{tag}-{}.mpedb", std::process::id());
         let _ = std::fs::remove_file(&path);
         let cfg = Config::from_toml_str(&format!(
@@ -664,7 +664,7 @@ mod tests {
              [[table.column]]\n  name = \"code\"\n  type = \"text\"\n  unique = true"
         ))
         .unwrap();
-        Database::open_with_config(cfg).unwrap()
+        crate::testdb::TestDb::new_db(Database::open_with_config(cfg).unwrap())
     }
 
     #[test]
@@ -687,6 +687,7 @@ mod tests {
     fn lint_is_silent_when_the_key_leads_with_the_discriminator() {
         let path = format!("/dev/shm/mpedb-rls-lint-ok-{}.mpedb", std::process::id());
         let _ = std::fs::remove_file(&path);
+        let _guard = crate::testdb::Owned::new((), vec![path.clone().into()]);
         let cfg = Config::from_toml_str(&format!(
             "[database]\npath = \"{path}\"\nsize_mb = 8\n\
              [[table]]\nname = \"orders\"\nprimary_key = [\"tenant\", \"id\"]\n  \

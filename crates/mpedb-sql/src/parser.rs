@@ -633,68 +633,13 @@ impl<'a> Parser<'a> {
                 seen_cmp = true;
                 continue;
             }
-            // `x BETWEEN a AND b` — desugared right here into
-            // `x >= a AND x <= b` rather than carried as its own node.
-            //
-            // That is not laziness: the planner extracts a PkRange from exactly
-            // that conjunct shape, so the desugaring turns `id BETWEEN 10 AND 20`
-            // into a range SCAN instead of a full scan plus a filter. A dedicated
-            // BETWEEN node would have to teach extract_access a second spelling
-            // of the same fact.
-            //
-            // The cost is that `x` appears twice in the plan. For the usual
-            // `column BETWEEN lo AND hi` that is one extra PushCol.
             if !seen_cmp && (self.peek_kw(Kw::Between) || self.peek_not_between()) {
-                let negated = self.eat_kw(Kw::Not);
-                self.expect_kw(Kw::Between, "BETWEEN")?;
-                // add_expr, NOT expr: the AND below belongs to BETWEEN's own
-                // syntax, so a full expression parse would swallow it and then
-                // fail looking for an AND that is already gone.
-                let lo = self.add_expr()?;
-                self.expect_kw(Kw::And, "AND in BETWEEN")?;
-                let hi = self.add_expr()?;
-                let ge = Expr::Binary(BinOp::Ge, Box::new(e.clone()), Box::new(lo));
-                let le = Expr::Binary(BinOp::Le, Box::new(e), Box::new(hi));
-                let both = Expr::Binary(BinOp::And, Box::new(ge), Box::new(le));
-                // NOT BETWEEN is NOT(a AND b), which under 3VL is NOT the same as
-                // (NOT a OR NOT b) when an operand is NULL -- De Morgan holds in
-                // 3VL, but only if both sides are the SAME 3VL values, and
-                // spelling it out twice invites drift. Negate the whole thing.
-                e = if negated {
-                    Expr::Unary(UnOp::Not, Box::new(both))
-                } else {
-                    both
-                };
+                e = self.between_suffix(e)?;
                 seen_cmp = true;
                 continue;
             }
-            // `x IN (…)` and `x NOT IN (…)`. Two shapes share the syntax:
-            // a session-context list (§2.6, one reserved param — the arity must
-            // NOT reach the plan bytes) and a general value list (#21, arity IS
-            // the query). Which one is decided by what is inside the parens.
             if !seen_cmp && (self.peek_kw(Kw::In) || self.peek_not_in()) {
-                let negated = self.eat_kw(Kw::Not);
-                self.expect_kw(Kw::In, "IN")?;
-                self.expect(&Tok::LParen, "`(` after IN")?;
-                // `IN ()` is a syntax error in PostgreSQL too. Allowing it would
-                // also mean an InList(0) instruction, which the IR rejects.
-                if self.peek() == Some(&Tok::RParen) {
-                    return Err(self.err_here("IN needs at least one value: `IN ()` is empty"));
-                }
-                let first = self.expr()?;
-                if let (Expr::ContextRef(key), Some(&Tok::RParen)) = (&first, self.peek()) {
-                    let key = key.clone();
-                    self.pos += 1;
-                    e = Expr::InContext(Box::new(e), key, negated);
-                    seen_cmp = true;
-                    continue;
-                }
-                let mut items = vec![first];
-                while self.eat(&Tok::Comma) {
-                    items.push(self.expr()?);
-                }
-                self.expect(&Tok::RParen, "`)` closing IN")?;
-                e = Expr::InList(Box::new(e), items, negated);
+                e = self.in_suffix(e)?;
                 seen_cmp = true;
                 continue;
             }
@@ -802,6 +747,99 @@ impl<'a> Parser<'a> {
         Ok(Expr::Case(arms, else_))
     }
 
+
+    /// `x BETWEEN a AND b`, split out of `cmp_expr`.
+    ///
+    /// `#[inline(never)]` and a separate frame on purpose: `cmp_expr` sits on
+    /// the mutually-recursive descent path, so every local here would otherwise
+    /// be paid on EVERY nesting level. Inlining these blocks back into cmp_expr
+    /// grew the per-level frame enough that MAX_EXPR_DEPTH=128 overflowed the
+    /// stack in a debug build — the exact crash the depth guard exists to stop.
+    #[inline(never)]
+    fn between_suffix(&mut self, e: Expr) -> Result<Expr> {
+        let negated = self.eat_kw(Kw::Not);
+        self.expect_kw(Kw::Between, "BETWEEN")?;
+        // add_expr, NOT expr: the AND below belongs to BETWEEN's own syntax, so
+        // a full expression parse would swallow it and then fail looking for an
+        // AND that is already gone.
+        let lo = self.add_expr()?;
+        self.expect_kw(Kw::And, "AND in BETWEEN")?;
+        let hi = self.add_expr()?;
+        // Desugared to `x >= lo AND x <= hi`: that is the shape the planner's
+        // extract_access already turns into a PkRange, so BETWEEN becomes a
+        // range SCAN rather than a full scan plus filter. The cost is `x`
+        // appearing twice in the plan.
+        let ge = Expr::Binary(BinOp::Ge, Box::new(e.clone()), Box::new(lo));
+        let le = Expr::Binary(BinOp::Le, Box::new(e), Box::new(hi));
+        let both = Expr::Binary(BinOp::And, Box::new(ge), Box::new(le));
+        // NOT BETWEEN negates the whole conjunct rather than being spelled out
+        // as (NOT a OR NOT b): De Morgan holds in 3VL, but writing it twice
+        // invites the two spellings to drift.
+        Ok(if negated {
+            Expr::Unary(UnOp::Not, Box::new(both))
+        } else {
+            both
+        })
+    }
+
+    /// `x IN (…)` / `x NOT IN (…)`, split out of `cmp_expr` (see
+    /// [`Self::between_suffix`] for why).
+    ///
+    /// Two shapes share the syntax: a session-context list (§2.6 — one reserved
+    /// param, because the arity must NOT reach the plan bytes) and a general
+    /// value list (#21 — the arity IS the query). What is inside the parens
+    /// decides which.
+    #[inline(never)]
+    fn in_suffix(&mut self, e: Expr) -> Result<Expr> {
+        let negated = self.eat_kw(Kw::Not);
+        self.expect_kw(Kw::In, "IN")?;
+        self.expect(&Tok::LParen, "`(` after IN")?;
+        // `IN ()` is a syntax error in PostgreSQL too, and it would also mean an
+        // InList(0) instruction, which the IR rejects.
+        if self.peek() == Some(&Tok::RParen) {
+            return Err(self.err_here("IN needs at least one value: `IN ()` is empty"));
+        }
+        let first = self.expr()?;
+        if let (Expr::ContextRef(key), Some(&Tok::RParen)) = (&first, self.peek()) {
+            let key = key.clone();
+            self.pos += 1;
+            return Ok(Expr::InContext(Box::new(e), key, negated));
+        }
+        let mut items = vec![first];
+        while self.eat(&Tok::Comma) {
+            items.push(self.expr()?);
+        }
+        self.expect(&Tok::RParen, "`)` closing IN")?;
+        Ok(Expr::InList(Box::new(e), items, negated))
+    }
+
+    /// `name(args…)`, split out of `primary` (see [`Self::between_suffix`]).
+    #[inline(never)]
+    fn call_suffix(&mut self, name: String) -> Result<Expr> {
+        self.expect(&Tok::LParen, "`(`")?;
+        let mut args = Vec::new();
+        if self.peek() != Some(&Tok::RParen) {
+            args.push(self.expr()?);
+            while self.eat(&Tok::Comma) {
+                args.push(self.expr()?);
+            }
+        }
+        self.expect(&Tok::RParen, "`)` closing the argument list")?;
+        let lname = name.to_ascii_lowercase();
+        Ok(match lname.as_str() {
+            "coalesce" => Expr::Coalesce(args),
+            // ifnull IS coalesce/2; a separate node would be a second place for
+            // the laziness to be got wrong.
+            "ifnull" => {
+                if args.len() != 2 {
+                    return Err(self.err_here("ifnull() takes exactly 2 arguments"));
+                }
+                Expr::Coalesce(args)
+            }
+            _ => Expr::Func(lname, args),
+        })
+    }
+
     fn primary(&mut self) -> Result<Expr> {
         let pos = self.here();
         if self.eat_kw(Kw::Case) {
@@ -850,10 +888,12 @@ impl<'a> Parser<'a> {
                         }
                     };
                     self.expect(&Tok::RParen, "`)`")?;
-                    Ok(Expr::ContextRef(key))
-                } else {
-                    Ok(Expr::Col(s))
+                    return Ok(Expr::ContextRef(key));
                 }
+                if self.peek() == Some(&Tok::LParen) {
+                    return self.call_suffix(s);
+                }
+                Ok(Expr::Col(s))
             }
             Some(Tok::QuotedIdent(s)) => Ok(Expr::Col(s)),
             Some(Tok::LParen) => {
@@ -1150,6 +1190,32 @@ mod tests {
         assert!(parse_expr_only(&parens).is_ok());
         assert!(parse_expr_only(&format!("{}a", "NOT ".repeat(100))).is_ok());
         assert!(parse_expr_only(&format!("{}1", "-".repeat(100))).is_ok());
+    }
+
+    /// Every construct that recurses is a stack-overflow vector, and each one
+    /// added is a NEW path the paren test does not cover. CASE, function
+    /// arguments and IN lists all descend through `expr()`, so they must hit the
+    /// same depth guard rather than the thread stack.
+    ///
+    /// This is not hypothetical: extracting these blocks into their own frames
+    /// was forced by an actual overflow — inline, their locals were paid on
+    /// every one of the 128 permitted levels and 128 was no longer survivable.
+    #[test]
+    fn deep_nesting_through_the_new_constructs_is_also_a_parse_error() {
+        let cases = [
+            format!("{}1{}", "coalesce(".repeat(1000), ", 2)".repeat(1000)),
+            format!("{}1{}", "abs(".repeat(1000), ")".repeat(1000)),
+            format!("{}1{}", "CASE WHEN true THEN ".repeat(1000), " END".repeat(1000)),
+            format!("a IN ({}1{})", "abs(".repeat(1000), ")".repeat(1000)),
+            format!("{}a BETWEEN 1 AND 2{}", "(".repeat(1000), ")".repeat(1000)),
+            format!("{}a > 0{}", "NOT (".repeat(1000), ")".repeat(1000)),
+        ];
+        for (i, sql) in cases.iter().enumerate() {
+            match parse_expr_only(sql) {
+                Err(Error::Parse { msg, .. }) if msg.contains("nested too deeply") => {}
+                other => panic!("case {i} must be a depth error, got {other:?}"),
+            }
+        }
     }
 
     #[test]
