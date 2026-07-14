@@ -83,14 +83,37 @@ Seeded xorshift generator (no `rand` dep; every failure reproducible from
 its seed) produces INSERT/UPDATE/DELETE/SELECT programs over a fixed schema
 `t(pk int64 PK, a int64, b float64, c text)`; the same program runs against
 mpedb and `/usr/bin/sqlite3` (one batch process, `.mode list`,
-`.nullvalue NULL`, `CREATE TABLE … STRICT` — sqlite 3.45's STRICT typing
-matches mpedb's rigid types). Compared per statement: success/failure
+`.nullvalue NULL`, `CREATE TABLE … STRICT` — STRICT is the *closest* sqlite
+gets to mpedb's rigid types, not a match; see below). Compared per statement: success/failure
 status, and full row output of every SELECT. Divergences are delta-minimized
 before reporting. The known semantic differences (float formatting, text
 collation/LIKE case, rowid aliasing of `INTEGER PRIMARY KEY`, division
 semantics, error-message wording, integer overflow) are each documented in
 the `diff` module docs with how they are normalized or kept out of the
 generator.
+
+**What STRICT actually enforces**, measured against sqlite 3.45 rather than
+assumed (this table is the reason the generator must be type-correct by
+construction — see `gen_pred` — and an earlier version of this README claimed
+STRICT and mpedb agree, which they do not):
+
+| value → column | sqlite STRICT | mpedb |
+|---|---|---|
+| `'abc'` → INT | reject | reject |
+| `'42'` → INT | **coerces to `42`** | reject |
+| `42` → TEXT | **coerces to `'42'`** | reject |
+| `1.5` → INT | reject | reject |
+| `2.0` → INT | **coerces to `2`** | reject |
+| `7` → REAL | coerces to `7.0` | coerces to `7.0` |
+| `x'01'` → TEXT | reject | reject |
+
+STRICT's rule is "reject what cannot convert **losslessly**"; mpedb's is
+"reject anything that is not the declared type", with `int64 → float64` as the
+one exception. So STRICT is strictly weaker, and the generator never emits a
+cross-type value — otherwise these cells would show up as divergences that are
+not bugs. sqlite STRICT also rejects `VARCHAR(4)`, `NUMERIC(6,2)`, `BOOLEAN`
+and `DATETIME` at DDL (only `INT`/`INTEGER`/`REAL`/`TEXT`/`BLOB`/`ANY` are
+allowed), which is why the fixed schema uses the spellings it does.
 
 **Three-way mode** adds **PostgreSQL 16** as a third engine
 (`run_differential_3way`): a throwaway cluster per run (`src/pg.rs`, the
@@ -99,8 +122,10 @@ as `mpedb-bench`, guard struct always stops and removes it), driven through
 one `psql` batch per program (`-A -t -F'|' -P null=NULL`; per-statement
 status via psql's `:ERROR` variable and `@S/@K/@E` echo markers, so
 expected constraint failures need no stderr parsing). The PG-specific
-normalizations — float output text, `ORDER BY` NULLS placement (generator
-orders only by the NOT NULL `pk`, unit-test-pinned), no STRICT needed
+normalizations — float output text, `ORDER BY` NULLS placement (every
+generated sort key is NULL-free: the NOT NULL `pk`, or a key the same
+statement guards with a top-level `IS NOT NULL` conjunct; unit-test-pinned),
+no STRICT needed
 (PG is rigidly typed already), case-sensitive `LIKE` (matches mpedb), and
 empty-string-vs-NULL distinctness (deliberately exercised by generated `''`
 literals) — are items 7–11 of the `diff` module docs. If the environment
