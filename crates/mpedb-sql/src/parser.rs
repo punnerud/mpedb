@@ -190,6 +190,14 @@ impl<'a> Parser<'a> {
     /// `NOT IN` needs two tokens of lookahead: by the time cmp_expr runs, the
     /// higher-precedence `not_expr` has already passed on this NOT, so `x NOT IN
     /// (…)` only parses if we recognise the pair here.
+    fn peek_not_between(&self) -> bool {
+        matches!(self.toks.get(self.pos).map(|t| &t.tok), Some(Tok::Kw(Kw::Not)))
+            && matches!(
+                self.toks.get(self.pos + 1).map(|t| &t.tok),
+                Some(Tok::Kw(Kw::Between))
+            )
+    }
+
     fn peek_not_in(&self) -> bool {
         matches!(self.toks.get(self.pos).map(|t| &t.tok), Some(Tok::Kw(Kw::Not)))
             && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Kw(Kw::In)))
@@ -625,6 +633,41 @@ impl<'a> Parser<'a> {
                 seen_cmp = true;
                 continue;
             }
+            // `x BETWEEN a AND b` — desugared right here into
+            // `x >= a AND x <= b` rather than carried as its own node.
+            //
+            // That is not laziness: the planner extracts a PkRange from exactly
+            // that conjunct shape, so the desugaring turns `id BETWEEN 10 AND 20`
+            // into a range SCAN instead of a full scan plus a filter. A dedicated
+            // BETWEEN node would have to teach extract_access a second spelling
+            // of the same fact.
+            //
+            // The cost is that `x` appears twice in the plan. For the usual
+            // `column BETWEEN lo AND hi` that is one extra PushCol.
+            if !seen_cmp && (self.peek_kw(Kw::Between) || self.peek_not_between()) {
+                let negated = self.eat_kw(Kw::Not);
+                self.expect_kw(Kw::Between, "BETWEEN")?;
+                // add_expr, NOT expr: the AND below belongs to BETWEEN's own
+                // syntax, so a full expression parse would swallow it and then
+                // fail looking for an AND that is already gone.
+                let lo = self.add_expr()?;
+                self.expect_kw(Kw::And, "AND in BETWEEN")?;
+                let hi = self.add_expr()?;
+                let ge = Expr::Binary(BinOp::Ge, Box::new(e.clone()), Box::new(lo));
+                let le = Expr::Binary(BinOp::Le, Box::new(e), Box::new(hi));
+                let both = Expr::Binary(BinOp::And, Box::new(ge), Box::new(le));
+                // NOT BETWEEN is NOT(a AND b), which under 3VL is NOT the same as
+                // (NOT a OR NOT b) when an operand is NULL -- De Morgan holds in
+                // 3VL, but only if both sides are the SAME 3VL values, and
+                // spelling it out twice invites drift. Negate the whole thing.
+                e = if negated {
+                    Expr::Unary(UnOp::Not, Box::new(both))
+                } else {
+                    both
+                };
+                seen_cmp = true;
+                continue;
+            }
             // `x IN (…)` and `x NOT IN (…)`. Two shapes share the syntax:
             // a session-context list (§2.6, one reserved param — the arity must
             // NOT reach the plan bytes) and a general value list (#21, arity IS
@@ -835,6 +878,50 @@ mod tests {
                 Box::new(Expr::Binary(BinOp::Eq, col("a"), int(1)))
             )
         );
+    }
+
+    /// BETWEEN's own AND must not be eaten by boolean AND: parsing the upper
+    /// bound with a full expression parse would swallow the AND and then fail
+    /// looking for the one it just consumed.
+    #[test]
+    fn between_desugars_to_a_range_conjunct() {
+        let (e, _) = parse_expr_only("a BETWEEN 1 AND 3").unwrap();
+        assert_eq!(
+            e,
+            Expr::Binary(
+                BinOp::And,
+                Box::new(Expr::Binary(BinOp::Ge, col("a"), int(1))),
+                Box::new(Expr::Binary(BinOp::Le, col("a"), int(3))),
+            )
+        );
+    }
+
+    #[test]
+    fn between_composes_with_a_following_boolean_and() {
+        let (e, _) = parse_expr_only("a BETWEEN 1 AND 3 AND b = 2").unwrap();
+        // the trailing `AND b = 2` is a separate conjunct, not BETWEEN's bound
+        assert!(matches!(&e, Expr::Binary(BinOp::And, _, r)
+            if matches!(r.as_ref(), Expr::Binary(BinOp::Eq, ..))), "got {e:?}");
+    }
+
+    #[test]
+    fn not_between_negates_the_whole_conjunct() {
+        let (e, _) = parse_expr_only("a NOT BETWEEN 1 AND 3").unwrap();
+        assert!(matches!(&e, Expr::Unary(UnOp::Not, inner)
+            if matches!(inner.as_ref(), Expr::Binary(BinOp::And, ..))), "got {e:?}");
+    }
+
+    #[test]
+    fn in_list_parses_both_shapes_and_negation() {
+        let (e, _) = parse_expr_only("a IN (1, 2)").unwrap();
+        assert!(matches!(&e, Expr::InList(_, items, false) if items.len() == 2), "got {e:?}");
+        let (e, _) = parse_expr_only("a NOT IN (1)").unwrap();
+        assert!(matches!(&e, Expr::InList(_, _, true)), "got {e:?}");
+        // one-element parens must still be the context form when it IS one
+        let (e, _) = parse_expr_only("a IN (current_setting('k'))").unwrap();
+        assert!(matches!(&e, Expr::InContext(_, k, false) if k == "k"), "got {e:?}");
+        let (e, _) = parse_expr_only("a NOT IN (current_setting('k'))").unwrap();
+        assert!(matches!(&e, Expr::InContext(_, _, true)), "got {e:?}");
     }
 
     #[test]
