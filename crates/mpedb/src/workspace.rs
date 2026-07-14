@@ -146,6 +146,101 @@ impl Workspace {
             .ok_or_else(|| Error::Bind(format!("unknown database alias `{}`", plan.alias)))?;
         db.execute(&plan.hash, params)
     }
+
+    /// Begin a multi-member write (DESIGN-MULTIDB.md §1.5). See
+    /// [`WorkspaceTxn`] — **there is no atomic cross-file commit**, and the type
+    /// exists to make that impossible to use by accident.
+    pub fn begin_multi(&self) -> WorkspaceTxn<'_> {
+        WorkspaceTxn {
+            ws: self,
+            members: Vec::new(),
+        }
+    }
+}
+
+/// A write spanning several workspace members — **NOT a transaction across
+/// files, and deliberately not shaped like one** (DESIGN-MULTIDB.md §1.5).
+///
+/// There is no atomic cross-file commit and none should be added: members have
+/// entirely independent meta pages, intent rings and WALs, and a shared commit
+/// protocol would destroy the independent-writer-lock parallelism that is the
+/// whole point of separate files.
+///
+/// **The failure envelope, stated exactly:** the only commit method is
+/// [`commit_sequential_nonatomic`](WorkspaceTxn::commit_sequential_nonatomic).
+/// It commits members one after another, each atomic *on its own engine*, with
+/// no cross-file barrier at any durability level. **After a crash an ARBITRARY
+/// SUBSET of the member commits may survive — a later member may be durable
+/// while an earlier one is lost. There is no prefix guarantee and no ordering
+/// guarantee.** "It got through member 3, so members 1-2 are safe" is exactly
+/// the reasoning this envelope forbids.
+///
+/// The cliff, plainly: **if you need ACID across two tables they belong in ONE
+/// file; if you need isolation between them they belong in TWO files.** This
+/// type is for the case where the write is genuinely independent per member and
+/// you accept re-running it — an idempotent fan-out, not a transfer.
+/// One queued statement: SQL plus its bound params.
+type QueuedStmt = (String, Vec<Value>);
+
+pub struct WorkspaceTxn<'ws> {
+    ws: &'ws Workspace,
+    /// Per member (in first-touched order): the statements queued for it,
+    /// applied in one `WriteSession` at commit.
+    members: Vec<(String, Vec<QueuedStmt>)>,
+}
+
+impl<'ws> WorkspaceTxn<'ws> {
+    /// Queue a statement against `alias`. Statements for the same member run in
+    /// one `WriteSession` (atomic together); different members never are.
+    ///
+    /// Nothing executes until commit: a partially-built multi-member write must
+    /// not be able to leave one member mutated because the *second* `stmt` call
+    /// had a typo in it.
+    pub fn stmt(&mut self, alias: &str, sql: &str, params: &[Value]) -> Result<()> {
+        if self.ws.db(alias).is_none() {
+            return Err(Error::Bind(format!("unknown database alias `{alias}`")));
+        }
+        let entry: &mut (String, Vec<QueuedStmt>) = match self.members.iter_mut().find(|(a, _)| a == alias) {
+            Some(e) => e,
+            None => {
+                self.members.push((alias.to_string(), Vec::new()));
+                self.members.last_mut().expect("just pushed")
+            }
+        };
+        entry.1.push((sql.to_string(), params.to_vec()));
+        Ok(())
+    }
+
+    /// Commit each member's queued statements, **sequentially and
+    /// non-atomically across members** (§1.5). The name is the documentation.
+    ///
+    /// Per member: one `WriteSession`, so that member's statements are atomic
+    /// together and its failure rolls itself back cleanly. Across members: on
+    /// the first failure this stops and returns the error, leaving **already
+    /// committed members committed** — it cannot undo them, because undoing is
+    /// what "no cross-file transaction" means. `Ok(n)` = members committed.
+    ///
+    /// A crash mid-way is worse than a returned error, and worse than it looks:
+    /// see the type docs — an arbitrary subset survives, not a prefix.
+    pub fn commit_sequential_nonatomic(self) -> Result<usize> {
+        let mut done = 0usize;
+        for (alias, stmts) in &self.members {
+            let db = self
+                .ws
+                .db(alias)
+                .ok_or_else(|| Error::Bind(format!("unknown database alias `{alias}`")))?;
+            let mut s = db.begin()?;
+            for (sql, params) in stmts {
+                // A member's own failure rolls back only that member: the
+                // session drops un-committed, and members already committed
+                // stay committed. That asymmetry IS the envelope.
+                s.query(sql, params)?;
+            }
+            s.commit()?;
+            done += 1;
+        }
+        Ok(done)
+    }
 }
 
 #[cfg(test)]
@@ -270,5 +365,90 @@ size_mb = 8
         assert!(solo.detach("second"));
         assert!(solo.query("SELECT * FROM t", &[]).is_ok());
         drop(ws0);
+    }
+
+    // ---- §1.5 WorkspaceTxn: the non-atomic cross-file write ----
+
+    fn nrows(ws: &Workspace, sql: &str) -> usize {
+        match ws.query(sql, &[]).unwrap() {
+            ExecResult::Rows { rows, .. } => rows.len(),
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn workspace_txn_commits_every_member() {
+        let ws = Workspace::open_config(
+            mpedb_types::WorkspaceConfig::from_toml_str(&ws_toml("mtx-ok")).unwrap(),
+        )
+        .unwrap();
+        let mut tx = ws.begin_multi();
+        tx.stmt("billing", "INSERT INTO orders (id) VALUES ($1)", &[Value::Int(1)]).unwrap();
+        tx.stmt("shared", "INSERT INTO tenants (id) VALUES ($1)", &[Value::Int(7)]).unwrap();
+        assert_eq!(tx.commit_sequential_nonatomic().unwrap(), 2);
+        assert_eq!(nrows(&ws, "SELECT id FROM billing.orders"), 1);
+        assert_eq!(nrows(&ws, "SELECT id FROM shared.tenants"), 1);
+    }
+
+    /// The envelope, demonstrated rather than asserted in prose: a later member
+    /// failing does NOT undo an earlier member's commit. This is the whole
+    /// reason the method's name says non-atomic — a test that only checked the
+    /// happy path would leave the dangerous half unpinned.
+    #[test]
+    fn workspace_txn_leaves_earlier_members_committed_when_a_later_one_fails() {
+        let ws = Workspace::open_config(
+            mpedb_types::WorkspaceConfig::from_toml_str(&ws_toml("mtx-fail")).unwrap(),
+        )
+        .unwrap();
+        // seed the row the second member will collide with
+        ws.query("INSERT INTO shared.tenants (id) VALUES ($1)", &[Value::Int(7)]).unwrap();
+
+        let mut tx = ws.begin_multi();
+        tx.stmt("billing", "INSERT INTO orders (id) VALUES ($1)", &[Value::Int(1)]).unwrap();
+        tx.stmt("shared", "INSERT INTO tenants (id) VALUES ($1)", &[Value::Int(7)]).unwrap();
+        assert!(tx.commit_sequential_nonatomic().is_err(), "PK collision must surface");
+
+        // billing committed and STAYS committed; there is nothing to roll it back.
+        assert_eq!(
+            nrows(&ws, "SELECT id FROM billing.orders"),
+            1,
+            "an earlier member's commit survives a later member's failure — that IS §1.5"
+        );
+        assert_eq!(nrows(&ws, "SELECT id FROM shared.tenants"), 1, "the failed member changed nothing");
+    }
+
+    /// Per member, statements are still atomic on their own engine: a failure
+    /// inside one member rolls that member's whole batch back.
+    #[test]
+    fn workspace_txn_is_atomic_within_one_member() {
+        let ws = Workspace::open_config(
+            mpedb_types::WorkspaceConfig::from_toml_str(&ws_toml("mtx-one")).unwrap(),
+        )
+        .unwrap();
+        ws.query("INSERT INTO billing.orders (id) VALUES ($1)", &[Value::Int(5)]).unwrap();
+        let mut tx = ws.begin_multi();
+        tx.stmt("billing", "INSERT INTO orders (id) VALUES ($1)", &[Value::Int(1)]).unwrap();
+        tx.stmt("billing", "INSERT INTO orders (id) VALUES ($1)", &[Value::Int(5)]).unwrap(); // dup
+        assert!(tx.commit_sequential_nonatomic().is_err());
+        // id=1 must NOT be there: same member, same session, rolled back together.
+        assert_eq!(nrows(&ws, "SELECT id FROM billing.orders"), 1);
+    }
+
+    /// Nothing runs until commit — a typo in the second statement must not leave
+    /// the first member already mutated.
+    #[test]
+    fn workspace_txn_queues_and_validates_before_touching_anything() {
+        let ws = Workspace::open_config(
+            mpedb_types::WorkspaceConfig::from_toml_str(&ws_toml("mtx-queue")).unwrap(),
+        )
+        .unwrap();
+        let mut tx = ws.begin_multi();
+        tx.stmt("billing", "INSERT INTO orders (id) VALUES ($1)", &[Value::Int(1)]).unwrap();
+        assert!(
+            matches!(tx.stmt("ghost", "INSERT INTO x (id) VALUES ($1)", &[Value::Int(1)]), Err(Error::Bind(_))),
+            "an unknown alias must be caught at queue time"
+        );
+        drop(tx); // never committed
+        assert_eq!(nrows(&ws, "SELECT id FROM billing.orders"), 0, "queuing must not write");
     }
 }
