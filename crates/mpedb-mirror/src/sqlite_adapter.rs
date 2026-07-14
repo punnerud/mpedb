@@ -52,9 +52,17 @@ impl SqliteAdapter {
         Ok(SqliteAdapter { conn, tables })
     }
 
-    /// Borrow the underlying connection (e.g. to install triggers).
+    /// Borrow the underlying connection (e.g. to run source writes in a test).
     pub fn conn(&self) -> &Connection {
         &self.conn
+    }
+
+    /// Install tracked-mode changelog + triggers for every mirrored table.
+    pub fn install_triggers(&self) -> Result<()> {
+        for meta in &self.tables {
+            crate::sqlite_track::install_triggers(&self.conn, &meta.src)?;
+        }
+        Ok(())
     }
 
     pub fn table_ids(&self) -> Vec<(u32, String)> {
