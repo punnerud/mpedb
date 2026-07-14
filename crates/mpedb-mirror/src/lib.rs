@@ -10,6 +10,7 @@
 
 pub mod adapter;
 pub mod apply;
+pub mod conflicts;
 pub mod export;
 pub mod import;
 pub mod pg;

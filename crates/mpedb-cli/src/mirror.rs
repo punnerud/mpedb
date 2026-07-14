@@ -33,6 +33,7 @@ pub fn run(argv: &[String]) -> CliResult {
         "reconcile" => cmd_reconcile(rest),
         "switch" => cmd_switch(rest),
         "unfreeze" => cmd_unfreeze(rest),
+        "conflicts" => cmd_conflicts(rest),
         "help" | "--help" | "-h" => {
             println!("{HELP}");
             Ok(())
@@ -89,7 +90,30 @@ mpedb mirror <subcommand>
 
   unfreeze --db <mpedb-file>
       Clear a stuck freeze (e.g. after a switch-to-source verify failure);
-      reconcile first, then retry the switch.";
+      reconcile first, then retry the switch.
+
+  conflicts --db <mpedb-file> [--clear]
+      List parked conflicts (rows that could not be applied), or --clear them.";
+
+fn cmd_conflicts(argv: &[String]) -> CliResult {
+    let p = args::parse(argv, &["db"], &["clear"])?;
+    let db = Database::open_from_file(std::path::Path::new(p.require("db")?))?;
+    if p.has("clear") {
+        let n = mpedb_mirror::conflicts::clear(&db)?;
+        println!("cleared {n} parked conflict(s)");
+        return Ok(());
+    }
+    let parked = mpedb_mirror::conflicts::list(&db)?;
+    if parked.is_empty() {
+        println!("no parked conflicts");
+        return Ok(());
+    }
+    println!("{} parked conflict(s):", parked.len());
+    for c in &parked {
+        println!("  {:<14?} {}.pk={:?}", c.record.kind, c.table, c.pk);
+    }
+    Ok(())
+}
 
 fn cmd_unfreeze(argv: &[String]) -> CliResult {
     let p = args::parse(argv, &["db"], &[])?;
