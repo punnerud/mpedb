@@ -146,6 +146,9 @@ pub(crate) fn create_mirror_db(
             max_readers: 64,
             durability,
             concurrency: Concurrency::Serial,
+            // A mirror file carries no RLS assertions: the mirror applier runs
+            // at the engine level, BELOW policies, by design (DESIGN-MIRROR §0).
+            require_policy: Default::default(),
             perms: FilePerms {
                 mode: None,
                 owner: None,

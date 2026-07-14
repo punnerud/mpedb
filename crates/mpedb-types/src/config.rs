@@ -3,6 +3,7 @@
 //! match the database it attaches to).
 
 use crate::error::{Error, Result};
+use std::collections::BTreeSet;
 use crate::schema::{ColumnDef, DefaultExpr, Schema, TableDef};
 use crate::value::{ColumnType, Value};
 use serde::Deserialize;
@@ -90,6 +91,18 @@ pub struct DbOptions {
     pub durability: Durability,
     pub concurrency: Concurrency,
     pub perms: FilePerms,
+    /// Names of tables declared `require_policy = true` (DESIGN-MULTIDB §6.3).
+    /// A prepare touching one of these fails closed unless RLS is enabled AND a
+    /// policy governs the command being compiled — the answer to "one forgotten
+    /// `ENABLE ROW LEVEL SECURITY` silently exposes every row".
+    ///
+    /// This is a **per-process deployment assertion, not a file-wide guarantee**:
+    /// it lives in config (like `durability`), so a process that does not declare
+    /// it is not bound by it. That is consistent with cooperative RLS — any
+    /// attached process can read raw pages anyway (§6 Honesty Box) — and it
+    /// catches the mistake it is aimed at: the developer's own forgotten DDL, in
+    /// their own build, at prepare time.
+    pub require_policy: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +152,14 @@ fn default_max_readers() -> u32 {
 struct RawTable {
     name: String,
     primary_key: Vec<String>,
+    /// Deployment assertion (DESIGN-MULTIDB §6.3): this table is tenant-scoped
+    /// and MUST be policy-protected — `prepare` fails closed if it is not.
+    /// Deliberately collected into `DbOptions`, NOT into `TableDef`: `TableDef`
+    /// feeds `Schema::canonical_bytes()` and thus the file-frozen `schema_hash`,
+    /// so putting it there would make adding one assertion a flag-day that
+    /// invalidates every existing file.
+    #[serde(default)]
+    require_policy: bool,
     #[serde(rename = "column")]
     columns: Vec<RawColumn>,
 }
@@ -218,6 +239,7 @@ fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>) -> Result<Config> {
         };
 
         let mut tables = Vec::with_capacity(raw_tables.len());
+        let mut require_policy = BTreeSet::new();
         for t in raw_tables {
             let mut columns = Vec::with_capacity(t.columns.len());
             for c in &t.columns {
@@ -259,6 +281,9 @@ fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>) -> Result<Config> {
             for &i in &primary_key {
                 columns[i as usize].nullable = false;
             }
+            if t.require_policy {
+                require_policy.insert(t.name.clone());
+            }
             tables.push(TableDef {
                 name: t.name,
                 columns,
@@ -278,6 +303,7 @@ fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>) -> Result<Config> {
                     owner: db.owner,
                     group: db.group,
                 },
+                require_policy,
             },
             schema: Schema::new(tables)?,
         })

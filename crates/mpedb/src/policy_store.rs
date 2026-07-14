@@ -140,6 +140,13 @@ impl Database {
             tp.policies.sort_by(|a, b| a.name.cmp(&b.name));
             cat.set_table(table_id, tp);
         }
+        // Fold in this process's `require_policy = true` declarations (§6.3).
+        // They come from config, never the file, so they are layered on top of
+        // the file's catalog here rather than read out of the sys-keyspace.
+        // (Name→id resolution and validation already happened at open.)
+        for &table_id in &self.require_policy {
+            cat.set_require_policy(table_id);
+        }
         Ok(cat)
     }
 }
@@ -260,7 +267,7 @@ impl Database {
 #[cfg(test)]
 mod tests {
     use crate::{Database, ExecResult, PolicyCmd, PolicyDef, Session};
-    use mpedb_types::{Config, Value};
+    use mpedb_types::{Config, Error as E, Value};
 
     fn db(tag: &str) -> Database {
         let path = format!("/dev/shm/mpedb-rls-{tag}-{}.mpedb", std::process::id());
@@ -337,6 +344,145 @@ mod tests {
         // Disabling RLS restores full visibility.
         db.disable_rls("orders").unwrap();
         assert_eq!(nrows(db.query("SELECT id FROM orders", &[]).unwrap()), 3);
+    }
+
+    // ---- §6.3 require_policy: the fail-closed deployment assertion ----
+
+    /// Same schema, but `orders` is declared tenant-scoped.
+    fn db_requiring(tag: &str) -> Database {
+        let path = format!("/dev/shm/mpedb-rls-{tag}-{}.mpedb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+        let cfg = Config::from_toml_str(&format!(
+            "[database]\npath = \"{path}\"\nsize_mb = 8\n\
+             [[table]]\nname = \"orders\"\nprimary_key = [\"id\"]\nrequire_policy = true\n  \
+             [[table.column]]\n  name = \"id\"\n  type = \"int64\"\n  \
+             [[table.column]]\n  name = \"tenant\"\n  type = \"int64\"\n  \
+             [[table.column]]\n  name = \"note\"\n  type = \"text\"\n  nullable = true"
+        ))
+        .unwrap();
+        Database::open_with_config(cfg).unwrap()
+    }
+
+    /// The whole point of §6.3: forgetting `ENABLE ROW LEVEL SECURITY` is
+    /// SILENT — the table reads like a working one and hands every row to every
+    /// caller. With the assertion, prepare refuses instead.
+    #[test]
+    fn require_policy_fails_closed_when_rls_was_never_enabled() {
+        let db = db_requiring("req-off");
+        // Without the assertion this SELECT would happily return all 3 rows.
+        let err = db.query("SELECT id FROM orders", &[]);
+        assert!(
+            matches!(&err, Err(E::Config(m)) if m.contains("require_policy")
+                     && m.contains("row-level security is not enabled")),
+            "expected a fail-closed config error, got {err:?}"
+        );
+        // and it is not a read-only quirk — writes are refused too
+        let w = db.query(
+            "INSERT INTO orders (id, tenant, note) VALUES ($1, $2, NULL)",
+            &[Value::Int(9), Value::Int(1)],
+        );
+        assert!(matches!(w, Err(E::Config(_))), "got {w:?}");
+
+        let _ = std::fs::remove_file(db.path());
+    }
+
+    /// RLS on but no policy governs the command: our empty-permissive rule
+    /// already default-denies, so this is SAFE — but "the table is mysteriously
+    /// empty" is a worse diagnostic than an error, and it is never what someone
+    /// who wrote require_policy meant. Assert it too.
+    #[test]
+    fn require_policy_fails_closed_when_no_policy_governs_the_command() {
+        let db = db_requiring("req-nopol");
+        db.enable_rls("orders", false).unwrap();
+        let err = db.query("SELECT id FROM orders", &[]);
+        assert!(
+            matches!(&err, Err(E::Config(m)) if m.contains("no policy governs")),
+            "expected a fail-closed config error, got {err:?}"
+        );
+        let _ = std::fs::remove_file(db.path());
+    }
+
+    /// Properly protected ⇒ the assertion is invisible and filtering is normal.
+    ///
+    /// Note the ORDER this test is forced into: policy and RLS come first, and
+    /// only then can rows be inserted (each under its own tenant context). That
+    /// is the assertion working as intended — a table declared tenant-scoped
+    /// cannot be seeded through an unprotected window, which is precisely the
+    /// window §6.3 is about. The other RLS tests seed first *because* they do not
+    /// declare require_policy.
+    #[test]
+    fn require_policy_is_satisfied_by_a_governing_policy() {
+        let db = db_requiring("req-ok");
+        db.create_policy("orders", &tenant_policy()).unwrap();
+        db.enable_rls("orders", false).unwrap();
+        for (id, t) in [(1, 1), (2, 1), (3, 2)] {
+            db.query_ctx(
+                &sess(t),
+                "INSERT INTO orders (id, tenant, note) VALUES ($1, $2, NULL)",
+                &[Value::Int(id), Value::Int(t)],
+            )
+            .unwrap();
+        }
+        assert_eq!(nrows(db.query_ctx(&sess(1), "SELECT id FROM orders", &[]).unwrap()), 2);
+        assert_eq!(nrows(db.query_ctx(&sess(2), "SELECT id FROM orders", &[]).unwrap()), 1);
+        let _ = std::fs::remove_file(db.path());
+    }
+
+    /// A typo'd/renamed table name must fail at OPEN, not silently assert
+    /// nothing forever.
+    #[test]
+    fn require_policy_naming_an_unknown_table_fails_at_open() {
+        let path = format!("/dev/shm/mpedb-rls-req-typo-{}.mpedb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+        let cfg = Config::from_toml_str(&format!(
+            "[database]\npath = \"{path}\"\nsize_mb = 8\n\
+             [[table]]\nname = \"orders\"\nprimary_key = [\"id\"]\n  \
+             [[table.column]]\n  name = \"id\"\n  type = \"int64\"\n\
+             [[table]]\nname = \"ordrs\"\nprimary_key = [\"id\"]\nrequire_policy = true\n  \
+             [[table.column]]\n  name = \"id\"\n  type = \"int64\""
+        ))
+        .unwrap();
+        // `ordrs` IS in this schema, so it opens; rename it away and it must not
+        let ok = Database::open_with_config(cfg);
+        assert!(ok.is_ok(), "a declared table that exists must open");
+        drop(ok);
+        let _ = std::fs::remove_file(&path);
+
+        let cfg2 = Config::from_toml_str(&format!(
+            "[database]\npath = \"{path}\"\nsize_mb = 8\n\
+             [[table]]\nname = \"orders\"\nprimary_key = [\"id\"]\n  \
+             [[table.column]]\n  name = \"id\"\n  type = \"int64\""
+        ))
+        .unwrap();
+        // hand-inject an assertion for a table that is not in the schema
+        let mut cfg2 = cfg2;
+        cfg2.options.require_policy.insert("ghost".into());
+        let err = Database::open_with_config(cfg2).err();
+        assert!(
+            matches!(&err, Some(E::Config(m)) if m.contains("ghost") && m.contains("not in the schema")),
+            "expected an open-time config error, got {err:?}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The assertion must not change the plan hash: it is per-process config, so
+    /// two processes disagreeing about it must still share the plan registry.
+    #[test]
+    fn require_policy_does_not_affect_the_plan_hash() {
+        let db_plain = db("req-hash-a");
+        let db_req = db_requiring("req-hash-b");
+        db_req.create_policy("orders", &tenant_policy()).unwrap();
+        db_req.enable_rls("orders", false).unwrap();
+        db_plain.create_policy("orders", &tenant_policy()).unwrap();
+        db_plain.enable_rls("orders", false).unwrap();
+
+        let h1 = db_plain.prepare("SELECT id FROM orders WHERE id = $1").unwrap();
+        let h2 = db_req.prepare("SELECT id FROM orders WHERE id = $1").unwrap();
+        assert_eq!(h1, h2, "require_policy is config, not policy content — it must not rehash");
+
+        for d in [&db_plain, &db_req] {
+            let _ = std::fs::remove_file(d.path());
+        }
     }
 
     #[test]

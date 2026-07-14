@@ -3,7 +3,7 @@
 //! the planner reads it to inject `USING`/`WITH CHECK` predicates.
 
 use mpedb_types::PolicyDef;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// A table's RLS state: whether row security is enabled and its policies.
 #[derive(Debug, Clone, Default)]
@@ -48,6 +48,12 @@ pub fn table_policy_hash(tp: Option<&TablePolicies>) -> [u8; 32] {
 #[derive(Debug, Clone, Default)]
 pub struct PolicyCatalog {
     tables: HashMap<u32, TablePolicies>,
+    /// Tables the deployment declares MUST be policy-protected (§6.3), from
+    /// `DbOptions::require_policy`. Kept OUT of `TablePolicies` on purpose: that
+    /// struct mirrors the file's sys-keyspace catalog and is content-hashed into
+    /// plans, whereas this is per-process config. Mixing them would make one
+    /// process's assertion change another's plan hash.
+    require: HashSet<u32>,
 }
 
 impl PolicyCatalog {
@@ -63,7 +69,21 @@ impl PolicyCatalog {
         self.tables.get(&table_id)
     }
 
+    /// Declare `table_id` tenant-scoped: a prepare touching it must find RLS
+    /// enabled and a policy governing the command (§6.3).
+    pub fn set_require_policy(&mut self, table_id: u32) {
+        self.require.insert(table_id);
+    }
+
+    pub fn requires_policy(&self, table_id: u32) -> bool {
+        self.require.contains(&table_id)
+    }
+
+    /// No RLS state AND no assertions ⇒ the planner injects nothing and behaves
+    /// exactly as before. The `require` set must count: a catalog holding only
+    /// assertions still has to be consulted, or a table declared tenant-scoped
+    /// but never policy-protected would be skipped — the exact §6.3 hole.
     pub fn is_empty(&self) -> bool {
-        self.tables.is_empty()
+        self.tables.is_empty() && self.require.is_empty()
     }
 }
