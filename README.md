@@ -205,9 +205,23 @@ cell most sensitive to core count — see [BENCHMARKS.md](BENCHMARKS.md).
 
 ### Apple Silicon — M3 Pro, 11 cores, macOS 26.6 (2026-07-14)
 
-mpedb and SQLite only (no PostgreSQL on that machine). The run is worth reading
-for what it caught rather than its throughput: **it found two bugs, one in the
-benchmark and one in mpedb**, both invisible on Linux.
+mpedb and SQLite only (PostgreSQL is not installed there, so its cells report as
+unavailable rather than being quietly omitted).
+
+Eleven cores is where the design story stops being theoretical. `read-while-write`
+none-class: **mpedb 3,657,658 reads/s vs SQLite's 175, p99 150 seconds** —
+SQLite's none-class journal serializes readers against a writer that now has ten
+spare cores to starve them with. A pathological config rather than a fair fight,
+but it is the exact failure mpedb's MVCC readers exist to avoid, and more cores
+make it worse rather than better. The same cell on the 2-core Linux box reads
+486k vs 3.5k: same phenomenon, two orders of magnitude apart — which is why the
+2-core numbers *understate* this one.
+
+Bulk write flips the other way from Linux: mpedb **1,655 MiB/s (31% of raw)** vs
+SQLite 1,013 (19%).
+
+But the run is worth reading for what it caught rather than its throughput: **it
+found two bugs, one in the benchmark and one in mpedb**, both invisible on Linux.
 
 macOS's `fsync()` does not flush the drive's write cache — only
 `fcntl(F_FULLFSYNC)` does. mpedb's `durability=commit` barrier is
@@ -216,7 +230,16 @@ they are on platter. So mpedb reported ~10× SQLite on durable commits by not
 actually being durable. Once both were honest, `wal` (293 ops/s) landed level
 with SQLite+F_FULLFSYNC (286): **~290 ops/s is simply what an Apple SSD platter
 flush costs**, and anything above it on that machine is a promise no one is
-keeping. Details: [BENCHMARKS.md](BENCHMARKS.md#apple-silicon-m3-pro-11-cores--and-the-durability-trap-it-exposed).
+keeping.
+
+And mpedb's `durability=commit` is still **2× that floor** on Apple (p50 7.0 ms),
+for a reason worth naming: `msync_range` issues one `F_FULLFSYNC` **per call**,
+and a commit makes one call per contiguous dirty-page run plus one for the meta
+flip — so a commit costs *(runs + 1)* whole drive-cache flushes. `F_FULLFSYNC` is
+per-**fd**, not per-range, so one barrier before the ack would do. That is a
+Linux-shaped optimisation (there `msync(MS_SYNC)` really does sync only the
+range) meeting a platform where it multiplies. Logged as known-issue #0; use
+`wal`. Details: [BENCHMARKS.md](BENCHMARKS.md#apple-silicon-m3-pro-11-cores--and-the-durability-trap-it-exposed).
 
 **Bulk bytes are not mpedb's game.** Pushing 256 MiB of 4 KiB blobs, SQLite
 writes 998 MiB/s to mpedb's 602 (38% vs 23% of what a raw `std::fs` write does

@@ -10,13 +10,38 @@ durability classes, all latency percentiles) live in its own file.
 | machine | engines | full results |
 |---|---|---|
 | AMD EPYC-Milan, 2 cores, 7.6 GiB, Linux 6.8 | mpedb, SQLite, PostgreSQL 16 | [`RESULTS-linux-amd-epyc-milan-2c.md`](crates/mpedb-bench/RESULTS-linux-amd-epyc-milan-2c.md) |
-| Apple M3 Pro, 11 cores, 36 GiB, macOS 26.6 | mpedb, SQLite — **no PostgreSQL installed** | [`RESULTS-macos-apple-m3-pro-11c.md`](crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md) — **transcribed, not generated**: the cells came from separate `--only` runs, so it says so at the top |
+| Apple M3 Pro, 11 cores, 36 GiB, macOS 26.6 | mpedb, SQLite — **PostgreSQL not installed there**, so its cells report as unavailable | [`RESULTS-macos-apple-m3-pro-11c.md`](crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md) |
 
 **One file per machine, on purpose.** A generated report says "on this machine"
 in its own first line — it is a single-host document, and a run on a second host
 used to overwrite the first host's numbers rather than add its own. The filename
 is now derived from the machine (`RESULTS-<os>-<cpu>-<cores>c.md`), so two
 machines cannot collide by accident.
+
+## How to prove a change made mpedb faster (the method, and how it fails)
+
+`% of raw` is the column, not MiB/s. The raw `std::fs` baseline is measured in
+the SAME run on the SAME medium, so it absorbs host drift; the engines' absolutes
+do not. A worked example of getting this wrong, from this repo:
+
+A change removed a redundant 4 KiB memset from the blob write path. Two `--only
+mpedb` runs said 614.9 → 687.9 MiB/s and it was written up as "+11%, three runs
+each, ranges do not overlap". **That was not evidence.** `--only mpedb` omits
+SQLite and PostgreSQL — the control group — and the raw baseline itself had moved
++2.5% between those two runs. A later run of the *same* binary came back 639.8:
+a 7.5% spread on identical code, most of the effect being claimed.
+
+Done properly — alternating arms in one session, each run normalised by its own
+raw baseline:
+
+| arm | % of raw (3 runs) | mean |
+|---|---|---|
+| memset present | 22.80 · 21.65 · 22.07 | 22.17% |
+| memset removed | 24.85 · 23.94 · 24.02 | **24.27%** |
+
+Non-overlapping, so the +9.5% is real. The claim survived; the first attempt at
+proving it did not, and a plausible mechanism plus two favourable runs is exactly
+what a wrong result looks like.
 
 ## The two rules that make any of this meaningful
 
@@ -157,15 +182,15 @@ not).
 
 | none-class, ops/s | mpedb | SQLite | ratio |
 |---|--:|--:|--:|
-| point-select | **1,699,066** | 327,907 | 5.2× |
-| point-insert | **196,931** | 117,072 | 1.7× |
-| point-update | **246,983** | 140,530 | 1.8× |
-| contended-writes (4 threads) | **132,992** | 101,975 | 1.3× |
-| read-while-write (reads) | **3,655,502** | 178 | — |
+| point-select | **1,689,578** | 320,727 | 5.3× |
+| point-insert | **196,722** | 112,987 | 1.7× |
+| point-update | **256,132** | 137,962 | 1.9× |
+| contended-writes (4 threads) | **135,007** | 105,792 | 1.3× |
+| read-while-write (reads) | **3,657,658** | 175 | — |
 
 That last row is not a typo. SQLite's none-class journal serializes readers
-against the writer, and on 11 cores the writer (86,580 writes/s) starves them
-completely: **178 reads/s, p99 139 seconds.** mpedb's MVCC readers are
+against the writer, and on 11 cores the writer (84,454 writes/s) starves them
+completely: **175 reads/s, p99 150 seconds.** mpedb's MVCC readers are
 untouched at 3.7M/s. It is a pathological config rather than a fair fight — but
 it is the failure mode mpedb's design exists to avoid, and more cores make it
 worse, not better.
