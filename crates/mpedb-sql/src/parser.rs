@@ -494,6 +494,7 @@ impl<'a> Parser<'a> {
 
     fn select_stmt(&mut self) -> Result<Stmt> {
         self.expect_kw(Kw::Select, "SELECT")?;
+        let distinct = self.eat_kw(Kw::Distinct);
         let items = if self.eat(&Tok::Star) {
             None
         } else {
@@ -572,6 +573,7 @@ impl<'a> Parser<'a> {
         };
         Ok(Stmt::Select(SelectStmt {
             table,
+            distinct,
             items,
             where_clause,
             group_by,
@@ -1018,11 +1020,16 @@ impl<'a> Parser<'a> {
                         f.name()
                     )));
                 }
-                return Ok(Expr::Agg(f, None));
+                return Ok(Expr::Agg(f, None, false));
             }
-            if self.eat_kw(Kw::Distinct) {
+            let distinct = self.eat_kw(Kw::Distinct);
+            if distinct && self.peek() == Some(&Tok::Star) {
+                // sqlite and PG both make this a syntax error, and they are
+                // right: `count(*)` counts ROWS, and "distinct rows" is what
+                // SELECT DISTINCT means — there is nothing for DISTINCT to
+                // apply to inside the parens.
                 return Err(self.err_here(format!(
-                    "{}(DISTINCT …) is not supported yet",
+                    "{}(DISTINCT *) is not valid — use SELECT DISTINCT, or name a column",
                     f.name()
                 )));
             }
@@ -1031,7 +1038,7 @@ impl<'a> Parser<'a> {
                 return Err(self.err_here(format!("{}() takes exactly one argument", f.name())));
             }
             self.expect(&Tok::RParen, "`)` closing the argument list")?;
-            return Ok(Expr::Agg(f, Some(Box::new(arg))));
+            return Ok(Expr::Agg(f, Some(Box::new(arg)), distinct));
         }
         let mut args = Vec::new();
         if self.peek() != Some(&Tok::RParen) {
@@ -1381,7 +1388,7 @@ mod tests {
                 assert_eq!(sel.group_by, vec!["dept".to_string()]);
                 assert_eq!(
                     sel.order_by,
-                    vec![(Expr::Agg(mpedb_types::AggFn::Count, None), true)]
+                    vec![(Expr::Agg(mpedb_types::AggFn::Count, None, false), true)]
                 );
             }
             other => panic!("expected select, got {other:?}"),

@@ -1,0 +1,292 @@
+# DISTINCT, in both of its forms — `SELECT DISTINCT` and `f(DISTINCT x)`.
+#
+# Expected values were produced by running the same program through sqlite3
+# 3.45 (STRICT tables) rather than reasoned out.
+#
+# The rule worth stating up front, because the two forms disagree about it:
+#
+#   SELECT DISTINCT treats NULLs as ONE value — `SELECT DISTINCT amt` over a
+#     column with two NULLs yields NULL once.
+#   count(DISTINCT amt) treats NULL as NO value — an all-NULL group counts 0,
+#     not 1, because the NULL skip happens before the dedup.
+#
+# Both are right, and they are not in tension: in the first NULL is a value
+# being grouped, in the second it is a value being ignored.
+#
+# schema:
+# [[table]]
+# name = "t"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "dept"
+#   type = "text"
+#
+#   [[table.column]]
+#   name = "amt"
+#   type = "int64"
+# end schema
+
+statement ok
+INSERT INTO t (id, dept, amt) VALUES (1, 'eng', 100), (2, 'eng', 100), (3, 'eng', 200)
+
+statement ok
+INSERT INTO t (id, dept, amt) VALUES (4, 'sales', NULL), (5, 'sales', NULL), (6, 'ops', 50)
+
+statement ok
+INSERT INTO t (id, dept, amt) VALUES (7, 'eng', NULL)
+
+# ---- f(DISTINCT x) ------------------------------------------------------------------
+
+# 100, 200, 50 — the repeated 100 collapses, the NULLs are skipped.
+query I nosort
+SELECT count(DISTINCT amt) FROM t
+----
+3
+
+query I nosort
+SELECT count(DISTINCT dept) FROM t
+----
+3
+
+# 100 + 200 + 50, not 100 + 100 + 200 + 50.
+query I nosort
+SELECT sum(DISTINCT amt) FROM t
+----
+350
+
+# (100 + 200 + 50) / 3 — over the DISTINCT values, so 3 not 4.
+query R nosort
+SELECT avg(DISTINCT amt) FROM t
+----
+116.667
+
+# min/max are idempotent: DISTINCT is legal here and changes nothing.
+query I nosort
+SELECT min(DISTINCT amt) FROM t
+----
+50
+
+# The all-NULL group: 0, not 1. NULL is skipped before the dedup, so it never
+# becomes "one distinct value".
+query I nosort
+SELECT count(DISTINCT amt) FROM t WHERE dept = 'sales'
+----
+0
+
+query I nosort
+SELECT count(DISTINCT amt) FROM t WHERE dept = 'zzz'
+----
+0
+
+query I nosort
+SELECT sum(DISTINCT amt) FROM t WHERE dept = 'zzz'
+----
+NULL
+
+# Per group.
+query TI nosort
+SELECT dept, count(DISTINCT amt) FROM t GROUP BY dept ORDER BY dept
+----
+eng
+2
+ops
+1
+sales
+0
+
+# Per group, summed.
+query TI nosort
+SELECT dept, sum(DISTINCT amt) FROM t GROUP BY dept ORDER BY dept
+----
+eng
+300
+ops
+50
+sales
+NULL
+
+# HAVING over a DISTINCT aggregate: 'eng' has 4 rows but only 2 distinct amts,
+# and 'sales' has 2 rows but 0 distinct amts (both NULL).
+query TI nosort
+SELECT dept, count(DISTINCT amt) FROM t GROUP BY dept HAVING count(DISTINCT amt) > 1 ORDER BY dept
+----
+eng
+2
+
+# DISTINCT over the aggregate's ARGUMENT expression, deduplicated after it is
+# computed.
+query I nosort
+SELECT count(DISTINCT amt * 2) FROM t
+----
+3
+
+query TT nosort
+SELECT min(DISTINCT dept), max(DISTINCT dept) FROM t
+----
+eng
+sales
+
+# The three counts side by side — this is the whole point of the family:
+# 3 distinct non-NULL amts, 4 non-NULL amts, 7 rows.
+query III nosort
+SELECT count(DISTINCT amt), count(amt), count(*) FROM t
+----
+3
+4
+7
+
+# `count(DISTINCT *)` is a syntax error in sqlite and PG, and rightly so:
+# count(*) counts ROWS, and "distinct rows" is what SELECT DISTINCT means.
+statement error DISTINCT
+SELECT count(DISTINCT *) FROM t
+
+# ---- SELECT DISTINCT ----------------------------------------------------------------
+
+query T nosort
+SELECT DISTINCT dept FROM t ORDER BY dept
+----
+eng
+ops
+sales
+
+# Here NULL IS a value, and all the NULLs are one of it.
+query I nosort
+SELECT DISTINCT amt FROM t ORDER BY amt
+----
+NULL
+50
+100
+200
+
+# Distinct over a TUPLE — ('eng', 100) appears twice in the table and once here.
+query TI nosort
+SELECT DISTINCT dept, amt FROM t ORDER BY dept, amt
+----
+eng
+NULL
+eng
+100
+eng
+200
+ops
+50
+sales
+NULL
+
+# LIMIT bounds DISTINCT rows, not scanned rows. 'eng' alone covers 4 base
+# rows, so a LIMIT reaching the scan would return fewer than 2 distinct depts.
+query T nosort
+SELECT DISTINCT dept FROM t ORDER BY dept LIMIT 2
+----
+eng
+ops
+
+query T nosort
+SELECT DISTINCT dept FROM t ORDER BY dept LIMIT 2 OFFSET 1
+----
+ops
+sales
+
+query T nosort
+SELECT DISTINCT dept FROM t ORDER BY dept LIMIT 0
+----
+
+# DISTINCT over an expression, not just a column.
+query I nosort
+SELECT DISTINCT amt * 2 FROM t ORDER BY amt * 2
+----
+NULL
+100
+200
+400
+
+# DISTINCT on a unique column changes nothing (every row is already distinct).
+query I nosort
+SELECT DISTINCT id FROM t ORDER BY id LIMIT 3
+----
+1
+2
+3
+
+# `SELECT DISTINCT *` — every column is in the output, so nothing collapses.
+query ITI nosort
+SELECT DISTINCT * FROM t ORDER BY id LIMIT 2
+----
+1
+eng
+100
+2
+eng
+100
+
+# DISTINCT combined with WHERE.
+query T nosort
+SELECT DISTINCT dept FROM t WHERE amt IS NOT NULL ORDER BY dept
+----
+eng
+ops
+
+# ---- ORDER BY must be in the SELECT list under DISTINCT -----------------------------
+# `SELECT DISTINCT dept ... ORDER BY amt` has no answer: 'eng' has several
+# amts and no reason to prefer one. sqlite picks one and reports a
+# stable-looking result; this engine says there is no answer instead.
+
+statement error SELECT list
+SELECT DISTINCT dept FROM t ORDER BY amt
+
+# Without DISTINCT the same ORDER BY is fine — each row has its own amt.
+statement ok
+SELECT dept FROM t ORDER BY amt
+
+# ---- DISTINCT over a grouped result -------------------------------------------------
+# The groups are distinct by key, but the PROJECTION need not be: 'ops' and
+# 'sales' both have one row, and selecting only the count collapses them.
+
+query I nosort
+SELECT DISTINCT count(*) FROM t GROUP BY dept ORDER BY count(*)
+----
+1
+2
+4
+
+# Keep the key and the counts stay distinct — nothing collapses.
+query TI nosort
+SELECT DISTINCT dept, count(*) FROM t GROUP BY dept ORDER BY dept
+----
+eng
+4
+ops
+1
+sales
+2
+
+# DESC.
+query T nosort
+SELECT DISTINCT dept FROM t ORDER BY dept DESC
+----
+sales
+ops
+eng
+
+# Without ORDER BY the output order is the engine's, so compare as a set.
+query T rowsort
+SELECT DISTINCT dept FROM t
+----
+eng
+ops
+sales
+
+# EXPLAIN must say DISTINCT — a plan that silently omits it would read as an
+# ordinary scan.
+query T nosort
+EXPLAIN SELECT DISTINCT dept FROM t
+----
+Select DISTINCT t
+  access: FullScan
+  project: dept
+  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Full

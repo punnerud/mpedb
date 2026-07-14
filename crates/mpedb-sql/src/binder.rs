@@ -558,7 +558,7 @@ impl<'a> Binder<'a> {
             // `WHERE count(*) > 1` is the classic: it reads naturally and is
             // meaningless (the filter runs per row, before any group exists).
             // SQL spells that HAVING, and saying so beats "unknown function".
-            ast::Expr::Agg(f, _) => Err(bind_err(format!(
+            ast::Expr::Agg(f, _, _) => Err(bind_err(format!(
                 "{}() is an aggregate and cannot be used here — aggregates are only \
                  allowed in a SELECT list or HAVING. A per-row filter is WHERE; a \
                  filter on a GROUPED result is HAVING.",
