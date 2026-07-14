@@ -11,7 +11,9 @@
 //! unconstrained and are validated at execute time.
 
 use crate::ast::{self, BinOp, UnOp};
-use mpedb_types::{ColumnDef, ColumnType, Error, ExprProgram, Instr, Result, TableDef, Value};
+use mpedb_types::{
+    ColumnDef, ColumnType, Error, ExprProgram, Instr, Result, ScalarFn, TableDef, Value,
+};
 
 /// Bound (name-resolved, type-checked, constant-folded) expression.
 #[derive(Debug, Clone, PartialEq)]
@@ -30,6 +32,11 @@ pub(crate) enum BExpr {
     /// `CASE WHEN c THEN r … ELSE e END`. `else_` is None for a missing ELSE
     /// (SQL: NULL).
     Case(Vec<(BExpr, BExpr)>, Option<Box<BExpr>>),
+    /// A built-in scalar function over already-typed arguments.
+    Call(ScalarFn, Vec<BExpr>),
+    /// `coalesce(a, b, …)` — compiled to control flow, not a call, so later
+    /// arguments are never evaluated once an earlier one is non-NULL.
+    Coalesce(Vec<BExpr>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +52,22 @@ pub(crate) enum BUnOp {
 pub(crate) type Ty = Option<ColumnType>;
 
 pub(crate) struct Binder<'a> {
+    /// Are we binding a branch that constant control flow may delete
+    /// unevaluated? Then do not fold it, because folding RAISES.
+    ///
+    /// PostgreSQL's rule, measured rather than assumed (live PG 16):
+    ///   EXPLAIN SELECT 1/0                        -> ERROR at PLAN time
+    ///   SELECT coalesce(1, 1/0)                   -> 1
+    ///   SELECT coalesce(NULL, 1/0)                -> ERROR
+    ///   SELECT CASE WHEN true  THEN 1 ELSE 1/0 END -> 1
+    ///   SELECT CASE WHEN false THEN 1 ELSE 1/0 END -> ERROR
+    ///
+    /// So folding is not "never raise" (that would let `SELECT 1/0` prepare
+    /// cleanly and fail at every execute) and not "always raise" (that kills
+    /// `coalesce(1, 1/0)`, which both ancestors answer). It is: fold the
+    /// CONTROL FLOW first, drop the branch that cannot be taken WITHOUT
+    /// evaluating it, then fold whatever survives — and let that raise.
+    suppress_fold: bool,
     pub table: &'a TableDef,
     /// Types of ALL parameters: the `n_user_params` caller params first, then
     /// one appended reserved slot per distinct `current_setting()` key (in
@@ -72,6 +95,7 @@ fn bind_err(msg: impl Into<String>) -> Error {
 impl<'a> Binder<'a> {
     pub fn new(table: &'a TableDef, n_params: u16, allow_params: bool) -> Binder<'a> {
         Binder {
+            suppress_fold: false,
             table,
             param_types: vec![None; n_params as usize],
             n_user_params: n_params,
@@ -129,7 +153,7 @@ impl<'a> Binder<'a> {
         match ty {
             Some(t) if t == col.ty => Ok(b),
             Some(ColumnType::Int64) if col.ty == ColumnType::Float64 => {
-                fold(BExpr::Unary(BUnOp::ToFloat, Box::new(b)))
+                fold_maybe(BExpr::Unary(BUnOp::ToFloat, Box::new(b)), self.suppress_fold)
             }
             Some(t) => Err(bind_err(format!(
                 "cannot assign {t} to column `{}` of type {}",
@@ -175,7 +199,7 @@ impl<'a> Binder<'a> {
                     None | Some(ColumnType::Int64) | Some(ColumnType::Float64) => {}
                     Some(t) => return Err(bind_err(format!("cannot negate {t}"))),
                 }
-                let e = fold(BExpr::Unary(BUnOp::Neg, Box::new(a)))?;
+                let e = fold_maybe(BExpr::Unary(BUnOp::Neg, Box::new(a)), self.suppress_fold)?;
                 Ok((e, at))
             }
             ast::Expr::Unary(UnOp::Not, a) => {
@@ -185,7 +209,7 @@ impl<'a> Binder<'a> {
                     None | Some(ColumnType::Bool) => {}
                     Some(t) => return Err(bind_err(format!("NOT requires a boolean, got {t}"))),
                 }
-                let e = fold(BExpr::Unary(BUnOp::Not, Box::new(a)))?;
+                let e = fold_maybe(BExpr::Unary(BUnOp::Not, Box::new(a)), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
             }
             ast::Expr::IsNull(a, negated) => {
@@ -195,7 +219,7 @@ impl<'a> Binder<'a> {
                 } else {
                     BUnOp::IsNull
                 };
-                let e = fold(BExpr::Unary(op, Box::new(a)))?;
+                let e = fold_maybe(BExpr::Unary(op, Box::new(a)), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
             }
             ast::Expr::Like(lhs, pat) => {
@@ -212,7 +236,7 @@ impl<'a> Binder<'a> {
                     None | Some(ColumnType::Text) => {}
                     Some(t) => return Err(bind_err(format!("LIKE requires text, got {t}"))),
                 }
-                let e = fold(BExpr::Like(Box::new(l), pattern))?;
+                let e = fold_maybe(BExpr::Like(Box::new(l), pattern), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
             }
             ast::Expr::ContextRef(key) => {
@@ -320,10 +344,18 @@ impl<'a> Binder<'a> {
                         }
                     }
                     bound_conds.push(bc);
-                    results.push(self.bind_expr(r)?);
+                    let outer = self.suppress_fold;
+                    self.suppress_fold = true;
+                    let r = self.bind_expr(r);
+                    self.suppress_fold = outer;
+                    results.push(r?);
                 }
                 if let Some(e) = else_ {
-                    results.push(self.bind_expr(e)?);
+                    let outer = self.suppress_fold;
+                    self.suppress_fold = true;
+                    let e = self.bind_expr(e);
+                    self.suppress_fold = outer;
+                    results.push(e?);
                 } else {
                     // A missing ELSE is NULL, and it is a RESULT: it has to take
                     // part in unification, or `CASE WHEN c THEN 1 END` would
@@ -336,8 +368,29 @@ impl<'a> Binder<'a> {
                 let (mut unified, ty) = self.unify_many(results, "mix CASE result types")?;
                 let else_b = unified.pop().expect("pushed above");
                 let arms_b: Vec<(BExpr, BExpr)> = bound_conds.into_iter().zip(unified).collect();
-                Ok((BExpr::Case(arms_b, Some(Box::new(else_b))), ty))
+                Ok((self.fold_case(arms_b, else_b)?, ty))
             }
+            ast::Expr::Coalesce(args) => {
+                if args.is_empty() {
+                    return Err(bind_err("coalesce() needs at least one argument"));
+                }
+                // Bind (so every argument is still TYPE-checked -- PG rejects
+                // `coalesce(1, 'abc')` too) but do not fold yet: an argument
+                // after a non-NULL constant is unreachable, and folding it
+                // would raise for something that will never run.
+                let outer = self.suppress_fold;
+                self.suppress_fold = true;
+                let mut bound = Vec::with_capacity(args.len());
+                for a in args {
+                    bound.push(self.bind_expr(a)?);
+                }
+                self.suppress_fold = outer;
+                // All branches are the one result, so they must unify — same
+                // rule as CASE, and for the same reason.
+                let (bound, ty) = self.unify_many(bound, "mix coalesce() argument types")?;
+                Ok((self.fold_coalesce(bound)?, ty))
+            }
+            ast::Expr::Func(name, args) => self.bind_func(name, args),
             ast::Expr::Binary(op, l, r) => self.bind_binary(*op, l, r),
         }
     }
@@ -356,12 +409,12 @@ impl<'a> Binder<'a> {
                         )));
                     }
                 }
-                let e = fold(BExpr::Binary(op, Box::new(l), Box::new(r)))?;
+                let e = fold_maybe(BExpr::Binary(op, Box::new(l), Box::new(r)), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 let (l, r, _) = self.unify_operands(l, lt, r, rt, "compare")?;
-                let e = fold(BExpr::Binary(op, Box::new(l), Box::new(r)))?;
+                let e = fold_maybe(BExpr::Binary(op, Box::new(l), Box::new(r)), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
             }
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
@@ -373,7 +426,7 @@ impl<'a> Binder<'a> {
                         )));
                     }
                 }
-                let e = fold(BExpr::Binary(op, Box::new(l), Box::new(r)))?;
+                let e = fold_maybe(BExpr::Binary(op, Box::new(l), Box::new(r)), self.suppress_fold)?;
                 Ok((e, ty))
             }
         }
@@ -403,16 +456,192 @@ impl<'a> Binder<'a> {
         match (lt, rt) {
             (Some(a), Some(b)) if a == b => Ok((l, r, Some(a))),
             (Some(ColumnType::Int64), Some(ColumnType::Float64)) => {
-                let l = fold(BExpr::Unary(BUnOp::ToFloat, Box::new(l)))?;
+                let l = fold_maybe(BExpr::Unary(BUnOp::ToFloat, Box::new(l)), self.suppress_fold)?;
                 Ok((l, r, Some(ColumnType::Float64)))
             }
             (Some(ColumnType::Float64), Some(ColumnType::Int64)) => {
-                let r = fold(BExpr::Unary(BUnOp::ToFloat, Box::new(r)))?;
+                let r = fold_maybe(BExpr::Unary(BUnOp::ToFloat, Box::new(r)), self.suppress_fold)?;
                 Ok((l, r, Some(ColumnType::Float64)))
             }
             (Some(a), Some(b)) => Err(bind_err(format!("cannot {verb} {a} and {b}"))),
             (Some(t), None) | (None, Some(t)) => Ok((l, r, Some(t))),
             (None, None) => Ok((l, r, None)),
+        }
+    }
+
+    /// Fold a `coalesce`'s CONTROL FLOW, PostgreSQL-style.
+    ///
+    /// Leading NULL constants can never be the answer, so drop them. If what is
+    /// then first is a non-NULL constant, IT is the answer and every later
+    /// argument is dead — dropped without ever being folded, which is exactly
+    /// why `coalesce(1, 1/0)` returns 1 instead of raising. Whatever survives is
+    /// folded normally, so `coalesce(NULL, 1/0)` still raises: that divide is
+    /// genuinely reachable.
+    fn fold_coalesce(&mut self, args: Vec<BExpr>) -> Result<BExpr> {
+        let mut live = Vec::with_capacity(args.len());
+        for a in args {
+            if matches!(&a, BExpr::Const(Value::Null)) {
+                continue; // a NULL constant is never the result
+            }
+            let dead_after = matches!(&a, BExpr::Const(_));
+            live.push(a);
+            if dead_after {
+                break; // a non-NULL constant answers; the rest is unreachable
+            }
+        }
+        match live.len() {
+            // every argument was a NULL constant
+            0 => Ok(BExpr::Const(Value::Null)),
+            1 => fold(live.pop().expect("len 1")),
+            _ => {
+                let mut out = Vec::with_capacity(live.len());
+                for a in live {
+                    out.push(fold(a)?);
+                }
+                Ok(BExpr::Coalesce(out))
+            }
+        }
+    }
+
+    /// Fold a CASE's control flow: an arm whose condition is constant FALSE or
+    /// NULL is dead and is dropped unfolded; an arm whose condition is constant
+    /// TRUE answers, and everything after it (including ELSE) is dead.
+    fn fold_case(&mut self, arms: Vec<(BExpr, BExpr)>, else_: BExpr) -> Result<BExpr> {
+        let mut live = Vec::with_capacity(arms.len());
+        for (c, r) in arms {
+            match &c {
+                BExpr::Const(Value::Bool(false)) | BExpr::Const(Value::Null) => continue,
+                BExpr::Const(Value::Bool(true)) => {
+                    // This arm always wins.
+                    if live.is_empty() {
+                        return fold(r);
+                    }
+                    live.push((c, r));
+                    let (arms, (_, r)) = {
+                        let last = live.pop().expect("just pushed");
+                        (live, last)
+                    };
+                    return Ok(BExpr::Case(fold_arms(arms)?, Some(Box::new(fold(r)?))));
+                }
+                _ => live.push((c, r)),
+            }
+        }
+        if live.is_empty() {
+            return fold(else_);
+        }
+        Ok(BExpr::Case(fold_arms(live)?, Some(Box::new(fold(else_)?))))
+    }
+
+    /// Bind a built-in scalar function: resolve the name, check the argument
+    /// types against what the function accepts, and give the call a type.
+    ///
+    /// `nullif` is desugared here rather than implemented: it is exactly
+    /// `CASE WHEN a = b THEN NULL ELSE a END`, and re-implementing it would be a
+    /// second place for the NULL and equality rules to drift.
+    fn bind_func(&mut self, name: &str, args: &[ast::Expr]) -> Result<(BExpr, Ty)> {
+        if name == "nullif" {
+            if args.len() != 2 {
+                return Err(bind_err("nullif() takes exactly 2 arguments"));
+            }
+            let eq = ast::Expr::Binary(
+                ast::BinOp::Eq,
+                Box::new(args[0].clone()),
+                Box::new(args[1].clone()),
+            );
+            let case = ast::Expr::Case(
+                vec![(eq, ast::Expr::Lit(Value::Null))],
+                Some(Box::new(args[0].clone())),
+            );
+            return self.bind_expr(&case);
+        }
+        let f = match name {
+            "lower" => ScalarFn::Lower,
+            "upper" => ScalarFn::Upper,
+            "length" => ScalarFn::Length,
+            "trim" => ScalarFn::Trim,
+            "abs" => ScalarFn::Abs,
+            "round" => ScalarFn::Round,
+            "substr" | "substring" => ScalarFn::Substr,
+            other => {
+                return Err(bind_err(format!(
+                    "unknown function `{other}()`; available: lower, upper, length, trim, \
+                     abs, round, substr, coalesce, ifnull, nullif"
+                )))
+            }
+        };
+        let mut bound = Vec::with_capacity(args.len());
+        for a in args {
+            bound.push(self.bind_expr(a)?);
+        }
+        let argc = u8::try_from(bound.len())
+            .map_err(|_| bind_err(format!("{name}() called with too many arguments")))?;
+        if !f.arity_ok(argc) {
+            return Err(bind_err(format!(
+                "{name}() cannot take {argc} argument(s)"
+            )));
+        }
+        // Pin each argument's type where the function demands one, so a bare
+        // `$1` gets a type and a wrong type is a COMPILE error rather than a
+        // per-row surprise.
+        let (want, ret): (&[Option<ColumnType>], Ty) = match f {
+            ScalarFn::Lower | ScalarFn::Upper | ScalarFn::Trim => {
+                (&[Some(ColumnType::Text)], Some(ColumnType::Text))
+            }
+            ScalarFn::Length => (&[Some(ColumnType::Text)], Some(ColumnType::Int64)),
+            // abs/round keep their argument's numeric type, so they are checked
+            // below rather than pinned to one.
+            ScalarFn::Abs | ScalarFn::Round => (&[], None),
+            ScalarFn::Substr => (
+                &[Some(ColumnType::Text), Some(ColumnType::Int64), Some(ColumnType::Int64)],
+                Some(ColumnType::Text),
+            ),
+        };
+        let mut out = Vec::with_capacity(bound.len());
+        for (i, (e, t)) in bound.into_iter().enumerate() {
+            match want.get(i).copied().flatten() {
+                Some(w) => {
+                    let (e, t) = self.unify_param(e, t, w);
+                    if let Some(t) = t {
+                        if t != w {
+                            return Err(bind_err(format!(
+                                "{name}() argument {} must be {w}, got {t}",
+                                i + 1
+                            )));
+                        }
+                    }
+                    out.push(e);
+                }
+                None => out.push(e),
+            }
+        }
+        let ret = match f {
+            ScalarFn::Abs | ScalarFn::Round => {
+                // Numeric in, same numeric out. The type is the argument's.
+                let t = self.static_type(&out[0]);
+                match t {
+                    Some(ColumnType::Int64) | Some(ColumnType::Float64) | None => t,
+                    Some(other) => {
+                        return Err(bind_err(format!("{name}() expects a number, got {other}")))
+                    }
+                }
+            }
+            _ => ret,
+        };
+        Ok((BExpr::Call(f, out), ret))
+    }
+
+    /// The type of an already-bound expression, where it is knowable without
+    /// re-binding. Used for the functions whose return type is their argument's.
+    fn static_type(&self, e: &BExpr) -> Ty {
+        match e {
+            BExpr::Const(v) => v.column_type(),
+            BExpr::Col(i) => Some(self.table.columns[*i as usize].ty),
+            BExpr::Param(i) => self.param_types[*i as usize],
+            BExpr::Unary(BUnOp::ToFloat, _) => Some(ColumnType::Float64),
+            BExpr::Call(ScalarFn::Length, _) => Some(ColumnType::Int64),
+            BExpr::Call(ScalarFn::Abs | ScalarFn::Round, a) => self.static_type(&a[0]),
+            BExpr::Call(_, _) => Some(ColumnType::Text),
+            _ => None,
         }
     }
 
@@ -444,7 +673,7 @@ impl<'a> Binder<'a> {
             let (e, t) = self.unify_param(e, t, target);
             out.push(match t {
                 Some(ColumnType::Int64) if target == ColumnType::Float64 => {
-                    fold(BExpr::Unary(BUnOp::ToFloat, Box::new(e)))?
+                    fold_maybe(BExpr::Unary(BUnOp::ToFloat, Box::new(e)), self.suppress_fold)?
                 }
                 _ => e,
             });
@@ -494,6 +723,10 @@ pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
         // A CASE is branching control flow, not a value-in/value-out node; the
         // fold path evaluates whole programs and has no business here.
         BExpr::Case(..) => false,
+        BExpr::Coalesce(..) => false,
+        // Const-foldable in principle; not worth a special case, and folding
+        // would have to reproduce call_scalar's NULL rules here.
+        BExpr::Call(..) => false,
         // Foldable in principle (`2 IN (1,2)` is TRUE), but deliberately not:
         // the fold path evaluates via ExprProgram over a const-only program, and
         // an all-const IN list is not worth a special case. It stays a runtime
@@ -507,6 +740,25 @@ pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
     let program = compile_program(&e)?;
     let v = program.eval(&[], &[])?;
     Ok(BExpr::Const(v))
+}
+
+/// Fold every surviving arm of a CASE.
+fn fold_arms(arms: Vec<(BExpr, BExpr)>) -> Result<Vec<(BExpr, BExpr)>> {
+    let mut out = Vec::with_capacity(arms.len());
+    for (c, r) in arms {
+        out.push((fold(c)?, fold(r)?));
+    }
+    Ok(out)
+}
+
+/// Fold, unless we are binding a branch that constant control flow may delete
+/// unevaluated. See [`Binder::suppress_fold`].
+fn fold_maybe(e: BExpr, suppressed: bool) -> Result<BExpr> {
+    if suppressed {
+        Ok(e)
+    } else {
+        fold(e)
+    }
 }
 
 /// Compile a bound expression to the shared stack IR.
@@ -591,6 +843,37 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 patch(instrs, j, end)?;
             }
         }
+        BExpr::Call(f, args) => {
+            for a in args {
+                emit(a, instrs, consts)?;
+            }
+            instrs.push(Instr::Call(*f, args.len() as u8));
+        }
+        BExpr::Coalesce(args) => {
+            // Lazily: evaluate an argument, and if it is non-NULL jump to the
+            // end WITH IT STILL ON THE STACK — it is the result. Otherwise pop
+            // the NULL and try the next. The last argument needs no test: if we
+            // reach it, it is the answer whatever it is.
+            //
+            // This is why JumpIfNotNull peeks instead of popping, and why
+            // coalesce is not a Call: an eager coalesce(x, 1/0) would RAISE,
+            // where both sqlite and PostgreSQL return x.
+            let mut ends = Vec::new();
+            let last = args.len() - 1;
+            for (i, a) in args.iter().enumerate() {
+                emit(a, instrs, consts)?;
+                if i == last {
+                    break;
+                }
+                ends.push(instrs.len());
+                instrs.push(Instr::JumpIfNotNull(0)); // patched below
+                instrs.push(Instr::Pop);
+            }
+            let end = instrs.len();
+            for j in ends {
+                patch(instrs, j, end)?;
+            }
+        }
         BExpr::InList(a, items) => {
             // Probe first, then the elements on top of it: InList(n) pops n
             // elements and finds the probe beneath them.
@@ -614,7 +897,7 @@ fn patch(instrs: &mut [Instr], at: usize, target: usize) -> Result<()> {
         Error::Internal("expression is too large to compile (more than 65535 instructions)".into())
     })?;
     match &mut instrs[at] {
-        Instr::JumpIfNotTrue(x) | Instr::Jump(x) => *x = t,
+        Instr::JumpIfNotTrue(x) | Instr::Jump(x) | Instr::JumpIfNotNull(x) => *x = t,
         other => return Err(Error::Internal(format!("patch target is not a jump: {other:?}"))),
     }
     Ok(())
@@ -822,5 +1105,95 @@ mod tests {
                 .unwrap(),
             Value::Bool(true)
         );
+    }
+
+
+    fn bind_ok(sql: &str) -> (BExpr, Ty) {
+        let t = table();
+        let (e, n) = parse_expr_only(sql).unwrap();
+        let mut b = Binder::new(&t, n, true);
+        b.bind_expr(&e).unwrap()
+    }
+    fn bind_err_msg(sql: &str) -> String {
+        let t = table();
+        let (e, n) = parse_expr_only(sql).unwrap();
+        let mut b = Binder::new(&t, n, true);
+        format!("{}", b.bind_expr(&e).unwrap_err())
+    }
+
+    /// The constant-folding / laziness boundary, pinned against MEASURED
+    /// PostgreSQL 16 behaviour rather than a guess. Every line here was run
+    /// against a live PG first; getting this wrong in either direction is easy:
+    ///
+    ///   never raise at fold time -> `SELECT 1/0` prepares clean, fails at
+    ///     every execute. PG raises at PLAN time (EXPLAIN SELECT 1/0 errors).
+    ///   always raise at fold time -> `coalesce(1, 1/0)` dies, though BOTH
+    ///     sqlite and PG answer 1.
+    ///
+    /// The rule is neither: fold the CONTROL FLOW first and drop the
+    /// unreachable branch WITHOUT evaluating it; fold what survives, and let
+    /// that raise.
+    #[test]
+    fn folding_drops_dead_branches_before_it_can_raise_on_them() {
+        // arg0 is a non-NULL constant -> the whole coalesce IS it, and 1/0 is
+        // never folded. PG: 1.
+        assert_eq!(bind_ok("coalesce(1, 1/0)").0, BExpr::Const(Value::Int(1)));
+        // arg0 is a NULL constant -> dropped; 1/0 becomes reachable -> raises.
+        // PG: ERROR division by zero.
+        assert!(matches!(
+            bind_expr_res("coalesce(NULL, 1/0)"),
+            Err(Error::DivisionByZero)
+        ));
+        // Same rule through CASE. PG: 1, then ERROR.
+        assert_eq!(
+            bind_ok("CASE WHEN true THEN 1 ELSE 1/0 END").0,
+            BExpr::Const(Value::Int(1))
+        );
+        assert!(matches!(
+            bind_expr_res("CASE WHEN false THEN 1 ELSE 1/0 END"),
+            Err(Error::DivisionByZero)
+        ));
+        // A live branch still folds normally.
+        assert_eq!(bind_ok("1 + 2").0, BExpr::Const(Value::Int(3)));
+    }
+
+    fn bind_expr_res(sql: &str) -> Result<(BExpr, Ty)> {
+        let t = table();
+        let (e, n) = parse_expr_only(sql).unwrap();
+        let mut b = Binder::new(&t, n, true);
+        b.bind_expr(&e)
+    }
+
+    #[test]
+    fn coalesce_arguments_must_unify() {
+        assert!(bind_err_msg("coalesce(id, 'x')").contains("coalesce"));
+        // int/float widening is the one legal coercion
+        let (_, ty) = bind_ok("coalesce(id, 1.5)");
+        assert_eq!(ty, Some(ColumnType::Float64));
+    }
+
+    #[test]
+    fn function_arity_and_types_are_compile_errors() {
+        assert!(bind_err_msg("lower(id)").contains("must be text"));
+        assert!(bind_err_msg("length('a', 'b')").contains("argument"));
+        assert!(bind_err_msg("abs('x')").contains("number"));
+        assert!(bind_err_msg("frobnicate(1)").contains("unknown function"));
+    }
+
+    /// abs/round keep their argument's numeric type rather than pinning one.
+    #[test]
+    fn abs_and_round_return_their_argument_type() {
+        assert_eq!(bind_ok("abs(id)").1, Some(ColumnType::Int64));
+        assert_eq!(bind_ok("abs(score)").1, Some(ColumnType::Float64));
+        assert_eq!(bind_ok("length(name)").1, Some(ColumnType::Int64));
+        assert_eq!(bind_ok("lower(name)").1, Some(ColumnType::Text));
+    }
+
+    /// nullif is CASE, not a function: reusing the desugaring keeps one set of
+    /// NULL/equality rules rather than two.
+    #[test]
+    fn nullif_desugars_to_case() {
+        let (e, _) = bind_ok("nullif(id, 1)");
+        assert!(matches!(e, BExpr::Case(..)), "got {e:?}");
     }
 }

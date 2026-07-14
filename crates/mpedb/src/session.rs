@@ -152,7 +152,7 @@ mod tests {
              [[table.column]]\n  name = \"note\"\n  type = \"text\"\n  nullable = true"
         ))
         .unwrap();
-        crate::testdb::TestDb::new(Database::open_with_config(cfg).unwrap())
+        crate::testdb::TestDb::new_db(Database::open_with_config(cfg).unwrap())
     }
 
     fn sess(tenant: i64) -> Session {

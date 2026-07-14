@@ -277,12 +277,15 @@ size_mb = 8
         )
     }
 
-    fn open(tag: &str) -> Workspace {
+    fn open(tag: &str) -> crate::testdb::Owned<Workspace> {
         let cfg = WorkspaceConfig::from_toml_str(&ws_toml(tag)).unwrap();
-        for m in &cfg.members {
-            let _ = std::fs::remove_file(&m.config.options.path);
+        // One file per member, all ours.
+        let files: Vec<std::path::PathBuf> =
+            cfg.members.iter().map(|m| m.config.options.path.clone()).collect();
+        for p in &files {
+            let _ = std::fs::remove_file(p);
         }
-        Workspace::open_config(cfg).unwrap()
+        crate::testdb::Owned::new(Workspace::open_config(cfg).unwrap(), files)
     }
 
     #[test]
@@ -340,7 +343,11 @@ size_mb = 8
             std::process::id()
         ))
         .unwrap();
-        let _ = std::fs::remove_file(&single.members[0].config.options.path);
+        let solo_path = single.members[0].config.options.path.clone();
+        let _ = std::fs::remove_file(&solo_path);
+        // Own the files from the start: everything below can panic, and an
+        // assert that fires must not also leave 8 MB of tmpfs behind.
+        let _solo_guard = crate::testdb::Owned::new((), vec![solo_path]);
         let mut solo = Workspace::open_config(single).unwrap();
         // One member ⇒ unqualified statements route to it.
         solo.query("INSERT INTO t (id) VALUES (1)", &[]).unwrap();
@@ -355,7 +362,9 @@ size_mb = 8
             std::process::id()
         ))
         .unwrap();
-        let _ = std::fs::remove_file(&second.options.path);
+        let second_path = second.options.path.clone();
+        let _ = std::fs::remove_file(&second_path);
+        let _second_guard = crate::testdb::Owned::new((), vec![second_path]);
         solo.attach("second", second).unwrap();
         assert!(matches!(solo.query("SELECT * FROM t", &[]), Err(Error::Bind(_))));
         assert!(solo.query("SELECT * FROM main.t", &[]).is_ok()
@@ -378,10 +387,7 @@ size_mb = 8
 
     #[test]
     fn workspace_txn_commits_every_member() {
-        let ws = Workspace::open_config(
-            mpedb_types::WorkspaceConfig::from_toml_str(&ws_toml("mtx-ok")).unwrap(),
-        )
-        .unwrap();
+        let ws = open("mtx-ok");
         let mut tx = ws.begin_multi();
         tx.stmt("billing", "INSERT INTO orders (id) VALUES ($1)", &[Value::Int(1)]).unwrap();
         tx.stmt("shared", "INSERT INTO tenants (id) VALUES ($1)", &[Value::Int(7)]).unwrap();
@@ -396,10 +402,7 @@ size_mb = 8
     /// happy path would leave the dangerous half unpinned.
     #[test]
     fn workspace_txn_leaves_earlier_members_committed_when_a_later_one_fails() {
-        let ws = Workspace::open_config(
-            mpedb_types::WorkspaceConfig::from_toml_str(&ws_toml("mtx-fail")).unwrap(),
-        )
-        .unwrap();
+        let ws = open("mtx-fail");
         // seed the row the second member will collide with
         ws.query("INSERT INTO shared.tenants (id) VALUES ($1)", &[Value::Int(7)]).unwrap();
 
@@ -421,10 +424,7 @@ size_mb = 8
     /// inside one member rolls that member's whole batch back.
     #[test]
     fn workspace_txn_is_atomic_within_one_member() {
-        let ws = Workspace::open_config(
-            mpedb_types::WorkspaceConfig::from_toml_str(&ws_toml("mtx-one")).unwrap(),
-        )
-        .unwrap();
+        let ws = open("mtx-one");
         ws.query("INSERT INTO billing.orders (id) VALUES ($1)", &[Value::Int(5)]).unwrap();
         let mut tx = ws.begin_multi();
         tx.stmt("billing", "INSERT INTO orders (id) VALUES ($1)", &[Value::Int(1)]).unwrap();
@@ -438,10 +438,7 @@ size_mb = 8
     /// the first member already mutated.
     #[test]
     fn workspace_txn_queues_and_validates_before_touching_anything() {
-        let ws = Workspace::open_config(
-            mpedb_types::WorkspaceConfig::from_toml_str(&ws_toml("mtx-queue")).unwrap(),
-        )
-        .unwrap();
+        let ws = open("mtx-queue");
         let mut tx = ws.begin_multi();
         tx.stmt("billing", "INSERT INTO orders (id) VALUES ($1)", &[Value::Int(1)]).unwrap();
         assert!(
