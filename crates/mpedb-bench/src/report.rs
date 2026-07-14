@@ -21,9 +21,10 @@ pub const HONESTY_NOTES: &[&str] = &[
     "mpedb and SQLite are embedded — an operation is a function call in the same process. \
      PostgreSQL is client/server — every operation pays a unix-socket round-trip plus \
      protocol encode/decode. A real architectural difference (not benchmark unfairness), \
-     and it dominates point-op latency on this 2-core machine.",
-    "Single machine, 2 cores, 7.6 GiB RAM; every engine built/run with --release \
-     (debug assertions off). Contended cells intentionally run more threads than cores.",
+     and it dominates point-op latency the fewer cores there are to hide it.",
+    "Single machine; every engine built/run with --release (debug assertions off). \
+     Contended cells intentionally run more threads than cores — see the machine line \
+     above for how many there are.",
     "No cherry-picking: every cell is reported, including those mpedb loses.",
 ];
 
@@ -394,18 +395,18 @@ pub const CAVEATS_MD: &str = "\
 - One run, one machine; no confidence intervals. Treat small (<20%) differences as noise.
 - HOST LOAD DOMINATES ABSOLUTE NUMBERS, and a starved host does not merely \
 scale them down — it silently COMPRESSES the cells that measure parallelism. \
-Measured on this box: an unrelated stray process pinned 1 of the 2 cores at 99% \
-for five days; every run before 2026-07-14 12:10 was therefore on ~1 core. \
-Freeing it left single-client ratios intact (mpedb/SQLite point-select 5.4x -> \
-5.9x) but collapsed contended-writes 6.8x -> 2.5x, and flipped read-while-write \
-from a tie into a 112x mpedb win (none-class) and a 15% SQLite win \
-(commit-class). CHECK `ps aux` BEFORE BELIEVING A NUMBER. \
+Measured (on a 2-core Linux VM, 2026-07-14): an unrelated stray process pinned 1 \
+of the 2 cores at 99% for five days. Freeing it left single-client ratios intact \
+(mpedb/SQLite point-select 5.4x -> 5.9x) but collapsed contended-writes 6.8x -> \
+2.5x, and flipped read-while-write from a tie into a 112x mpedb win (none-class) \
+and a 15% SQLite win (commit-class). The lesson generalises to any host; the \
+numbers are that host's. CHECK WHAT ELSE IS RUNNING BEFORE BELIEVING A NUMBER. \
 - SQLite and PostgreSQL are the CONTROL GROUP: their binaries are identical \
 across runs, so if all three engines move together it is the host, and if mpedb \
 moves alone it is a code signal. Compare ratios across runs, absolutes only \
 within one run — and treat multi-threaded ratios from a loaded host as unusable, \
 not merely noisy.
-- The 2-core box runs benchmark threads, the engine, and (for PostgreSQL) server \
+- The box runs benchmark threads, the engine, and (for PostgreSQL) server \
 processes simultaneously; contended cells oversubscribe the CPU on purpose.
 - SQLite runs the bundled 3.45.0 build (the system libsqlite3 lacks the dev symlink \
 and header needed to link it). Compiled by the same rustc/cc toolchain as everything else.
