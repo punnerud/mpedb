@@ -736,23 +736,33 @@ source|local|value` (source re-reads the CURRENT source row). `park/` bounded �
   correctness — authority-wins is the default):* per-table policy config
   (`local-wins`/`manual`/`newest-wins` selection), newest-wins clock-skew
   display, `conflicts export`.
-- **M8 adversarial battery** (in progress): done — switch drill S2→S6→S2 ×N
-  under load with injected rogue-write → reconcile convergence (§10.9); echo-loop
-  no-op fixpoint (§10.6); sqlite specials — FK-cascade capture + REPLACE-hole
-  anti-entropy (§10.7); in-process concurrent-load fuzz — source writers vs. live
-  pull, model-checked (§10.4); multi-process SIGKILL fuzz — `mpedb mirror-collide`
-  (source-writer processes + a mirror daemon SIGKILLed and respawned at every
-  instant; the final drain must converge mpedb EXACTLY to the source, proving no
-  kill lost or duplicated data — §10.4/§10.5). Crash-safety cores (cursor guard /
-  stale-replay, apply atomicity, never-wedge parking) covered by apply unit
-  tests. *Remaining:* push-side collide (mpedb writers + drain), crash-waves
-  pinned between individual switch sub-txns, broader PG fidelity matrices (§10.8).
+- **M8 adversarial battery** (done): switch drill S2→S6→S2 ×N under load with an
+  injected rogue write → reconcile convergence (§10.9); echo-loop no-op fixpoint
+  (§10.6); sqlite specials — FK-cascade capture + REPLACE-hole anti-entropy
+  (§10.7); in-process concurrent-load fuzz — source writers vs. live pull,
+  model-checked (§10.4); **multi-process SIGKILL fuzz both directions** —
+  `mpedb mirror-collide --mode pull|push`: pull = source-writer processes vs. a
+  daemon killed at every instant (source is the model); push = mpedb writer
+  processes vs. a killed push daemon (**mpedb is the model**), proving §6's
+  at-least-once write-back — a kill between the source commit and the dirty-entry
+  clear re-pushes idempotently. Verified 372/398 kills per run, verify=ok.
+  **Crash waves pinned BETWEEN the switch sub-txns** (§10.5) + `switch::recover`
+  recovery-on-attach, wired into every CLI both-sides command. **PG fidelity
+  matrix** (§10.8): the full PG→mpedb→push→PG loop per mapped type asserting the
+  FIXPOINT (a push must not re-flag its own row). Two confirmed findings closed
+  by the battery: CONF#3/#16 (the cutover re-seeded the pull cursor and swallowed
+  third-party writes racing the switch — re-seed removed, origin filtering
+  already covered echoes) and CONF#38 (one source-rejected row poisoned the whole
+  push txn and wedged write-back forever — per-op SAVEPOINT + park in both
+  adapters). *Remaining:* per-table conflict-policy config (M7 deferrals),
+  partition/TRUNCATE-drift matrices beyond the TRUNCATE case.
 - **M9 (v2)**: pgoutput slot adapter (`pg_walstream`), slot-lost resync,
   `mirror offline`.
 
 Chain: M1→M2→M3→M5→M6→M7→M8; M4 ∥ M3 after M2; M9 after M8.
-Status: **M1–M7 done** (Linux green, clippy clean, live-PG ignored tests pass);
-M8 next.
+Status: **M1–M8 done** (372 workspace tests green, clippy clean; 10 live-PG
+ignored tests pass serially: `cargo test -p mpedb-mirror -- --ignored
+--test-threads=1`). M9 (v2 pgoutput slot) is next and optional.
 
 ## 12. Security / credential model
 - Source DSN/password: stored in a `0600` mirror config file (reuse the repo's
