@@ -396,6 +396,73 @@ impl SourceAdapter for SqliteAdapter {
         Ok(())
     }
 
+    fn push_checked(&mut self, from: &Cursor, ops: &[NetOp]) -> Result<Vec<bool>> {
+        if ops.is_empty() {
+            return Ok(Vec::new());
+        }
+        let cursor = if from.is_empty() {
+            SqliteCursor::default()
+        } else {
+            SqliteCursor::decode(from)?
+        };
+        // metadata for the touched tables (avoids borrowing self across the txn)
+        let mut metas: BTreeMap<u32, SourceTable> = BTreeMap::new();
+        for op in ops {
+            if let std::collections::btree_map::Entry::Vacant(e) = metas.entry(op.table_id) {
+                let src = self
+                    .tables
+                    .iter()
+                    .find(|t| t.table_id == op.table_id)
+                    .ok_or_else(|| Error::Config(format!("push to unmirrored table {}", op.table_id)))?
+                    .src
+                    .clone();
+                e.insert(src);
+            }
+        }
+
+        // IMMEDIATE = grab the single writer lock up front, so each per-PK
+        // check-then-write is atomic against any concurrent source writer (§6).
+        let tx = self
+            .conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(sqlerr)?;
+        let mut premax: BTreeMap<u32, i64> = BTreeMap::new();
+        for (&tid, src) in &metas {
+            let log = log_table(&src.name);
+            let mx: i64 = tx
+                .query_row(&format!("SELECT COALESCE(MAX(seq),0) FROM {}", q(&log)), [], |r| r.get(0))
+                .map_err(sqlerr)?;
+            premax.insert(tid, mx);
+        }
+
+        let mut results = Vec::with_capacity(ops.len());
+        for op in ops {
+            let src = &metas[&op.table_id];
+            let from_seq = cursor.seq(op.table_id);
+            if source_changed(&tx, src, &op.pk, from_seq)? {
+                results.push(false); // source concurrently won — leave un-applied
+                continue;
+            }
+            match &op.kind {
+                NetOpKind::Upsert(row) => apply_upsert(&tx, src, row)?,
+                NetOpKind::Delete => apply_delete(&tx, src, &op.pk)?,
+            }
+            results.push(true);
+        }
+
+        // echo-tag only the changelog rows our applied writes produced
+        for (&tid, src) in &metas {
+            let log = log_table(&src.name);
+            tx.execute(
+                &format!("UPDATE {} SET origin='{SELF_ORIGIN}' WHERE seq > ?1", q(&log)),
+                rusqlite::params![premax[&tid]],
+            )
+            .map_err(sqlerr)?;
+        }
+        tx.commit().map_err(sqlerr)?;
+        Ok(results)
+    }
+
     fn ensure_source_state(&mut self, mirror_id: &str, epoch: u64, authority: &str) -> Result<()> {
         self.conn
             .execute_batch(
@@ -488,6 +555,37 @@ fn apply_upsert(tx: &rusqlite::Transaction, src: &SourceTable, row: &[Value]) ->
     tx.execute(&sql, rusqlite::params_from_iter(params.iter()))
         .map_err(sqlerr)?;
     Ok(())
+}
+
+/// Did the source change this PK in `(from_seq, …]` by something other than our
+/// own echo? A `true` is a write-write conflict (§6 push-conflict detection). The
+/// caller already holds the IMMEDIATE write lock, so this read + the subsequent
+/// write are one atomic check-then-write.
+fn source_changed(
+    tx: &rusqlite::Transaction,
+    src: &SourceTable,
+    pk: &[Value],
+    from_seq: u64,
+) -> Result<bool> {
+    let log = log_table(&src.name);
+    let npk = src.pk.len();
+    let where_pk = (0..npk)
+        .map(|j| format!("pk{j} IS ?{}", j + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    // origin NULL or foreign = a genuine source write; our echoes are tagged.
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM {} WHERE {where_pk} \
+         AND seq > ?{} AND (origin IS NULL OR origin <> '{SELF_ORIGIN}'))",
+        q(&log),
+        npk + 1
+    );
+    let mut params: Vec<SqlVal> = pk.iter().map(crate::export::to_sql).collect();
+    params.push(SqlVal::Integer(from_seq as i64));
+    let exists: i64 = tx
+        .query_row(&sql, rusqlite::params_from_iter(params.iter()), |r| r.get(0))
+        .map_err(sqlerr)?;
+    Ok(exists != 0)
 }
 
 fn apply_delete(tx: &rusqlite::Transaction, src: &SourceTable, pk: &[Value]) -> Result<()> {

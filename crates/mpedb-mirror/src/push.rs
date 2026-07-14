@@ -14,12 +14,31 @@ use mpedb_core::{DirtyEntry, DirtyOp};
 use mpedb_types::{keycode, Error, Result};
 
 use crate::adapter::{NetOp, NetOpKind, SourceAdapter};
+use crate::state::{self, Authority, ConflictKind, Epoch, ParkRecord};
 
 /// What a push did.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PushStats {
     pub upserts: u64,
     pub deletes: u64,
+    /// Ops the source concurrently won (write-write conflict, §6): parked
+    /// `push_rejected`, dirty entry kept for the next pull to resolve source-wins.
+    pub conflicts: u64,
+}
+
+/// A scanned dirty entry carried from the snapshot phase to the clear/park phase.
+struct Pending {
+    subkey: Vec<u8>,
+    last_txn: u64,
+    table_id: u32,
+    pk_keycode: Vec<u8>,
+}
+
+fn now_micros() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0)
 }
 
 /// Push all pending local changes to the source. No-op when the dirty-set is
@@ -30,7 +49,7 @@ pub fn push_batch<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<Pu
     // 1. scan the dirty-set + read upsert images at a brief snapshot, then drop
     //    the writer lock before any (slow) source I/O.
     let mut ops: Vec<NetOp> = Vec::new();
-    let mut pending: Vec<(Vec<u8>, u64)> = Vec::new(); // (cdc subkey, last_txn)
+    let mut pending: Vec<Pending> = Vec::new();
     {
         let mut s = db.begin()?;
         s.set_capture(false);
@@ -53,7 +72,12 @@ pub fn push_batch<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<Pu
                 DirtyOp::Delete => NetOpKind::Delete,
             };
             ops.push(NetOp { table_id, pk, kind });
-            pending.push((subkey, de.last_txn));
+            pending.push(Pending {
+                subkey,
+                last_txn: de.last_txn,
+                table_id,
+                pk_keycode: de.pk_keycode,
+            });
         }
         s.rollback(); // read-only; releases the lock
     }
@@ -61,28 +85,63 @@ pub fn push_batch<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<Pu
         return Ok(PushStats::default());
     }
 
-    let mut stats = PushStats::default();
-    for op in &ops {
-        match op.kind {
-            NetOpKind::Upsert(_) => stats.upserts += 1,
-            NetOpKind::Delete => stats.deletes += 1,
-        }
+    // 2. apply to the source. When the source holds authority (S2/S4, the
+    //    default after import), write-back is source-wins: detect a concurrent
+    //    source write on the same PK and leave that op un-applied (§6, §8). When
+    //    mpedb holds authority (S6/S7 drain), local-wins → unconditional push.
+    let source_authoritative = match db.sys_record_get(state::MIR_NS, state::KEY_EPOCH)? {
+        Some(b) => Epoch::decode(&b)?.authority == Authority::Source,
+        None => true,
+    };
+    let applied: Vec<bool> = if source_authoritative {
+        let from = db
+            .sys_record_get(state::MIR_NS, state::KEY_CUR)?
+            .unwrap_or_else(|| adapter.zero_cursor());
+        adapter.push_checked(&from, &ops)?
+    } else {
+        adapter.push(&ops)?;
+        vec![true; ops.len()]
+    };
+    if applied.len() != ops.len() {
+        return Err(Error::Corrupt("push_checked returned a mis-sized result".into()));
     }
 
-    // 2. apply to the source (one txn, echo-tagged).
-    adapter.push(&ops)?;
-
-    // 3. clear each dirty entry ONLY if it was not re-dirtied since the scan
-    //    (a concurrent local write bumps last_txn and must survive to push next
-    //    round). §6 step 4.
+    // 3. tally, clear the applied dirty entries, and park the rejected ones —
+    //    all in one capture-suppressed txn. An applied entry is cleared ONLY if
+    //    it was not re-dirtied since the scan (a concurrent local write bumps
+    //    last_txn and must survive to push next round — §6 step 4). A rejected
+    //    entry is KEPT: the next pull carries the winning source row and resolves
+    //    it source-wins (which also deletes the dirty entry).
+    let mut stats = PushStats::default();
+    let now = now_micros();
     {
         let mut s = db.begin()?;
         s.set_capture(false);
-        for (subkey, last_txn) in &pending {
-            if let Some(cur) = s.sys_record_get("cdc", subkey)? {
-                if DirtyEntry::decode(&cur)?.last_txn == *last_txn {
-                    s.sys_record_delete("cdc", subkey)?;
+        for (i, op) in ops.iter().enumerate() {
+            let p = &pending[i];
+            if applied[i] {
+                match op.kind {
+                    NetOpKind::Upsert(_) => stats.upserts += 1,
+                    NetOpKind::Delete => stats.deletes += 1,
                 }
+                if let Some(cur) = s.sys_record_get("cdc", &p.subkey)? {
+                    if DirtyEntry::decode(&cur)?.last_txn == p.last_txn {
+                        s.sys_record_delete("cdc", &p.subkey)?;
+                    }
+                }
+            } else {
+                stats.conflicts += 1;
+                let rec = ParkRecord {
+                    kind: ConflictKind::PushRejected,
+                    wall_us: now,
+                    table_id: p.table_id,
+                    pk_keycode: p.pk_keycode.clone(),
+                };
+                s.sys_record_put(
+                    state::MIR_NS,
+                    &state::park_key(p.table_id, &p.pk_keycode),
+                    &rec.encode(),
+                )?;
             }
         }
         s.commit()?;
@@ -170,6 +229,85 @@ mod tests {
         // nothing (no infinite loop back into mpedb)
         let from = adapter.zero_cursor();
         assert!(adapter.pull(&from, 1000).unwrap().is_none());
+
+        for p in [src_path, mpedb_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn sqlite_push_conflict_source_wins_parks_and_next_pull_converges() {
+        let src_path = tmp("pushconf-src", "db");
+        let mpedb_path = tmp("pushconf-mid", "mpedb");
+        {
+            let c = Connection::open(&src_path).unwrap();
+            c.execute_batch(
+                "CREATE TABLE users(id INTEGER PRIMARY KEY, email TEXT NOT NULL, age INTEGER);
+                 INSERT INTO users VALUES (1,'a@x',30),(2,'b@x',40);",
+            )
+            .unwrap();
+        }
+        let db = {
+            let mut c = Connection::open(&src_path).unwrap();
+            import_sqlite(&mut c, &mpedb_path, &ImportOptions::default())
+                .unwrap()
+                .0
+        };
+        let mut adapter =
+            SqliteAdapter::new(Connection::open(&src_path).unwrap(), None, &[]).unwrap();
+        adapter.install_triggers().unwrap();
+
+        // CONCURRENT source write on id=1 (after our cursor) — origin NULL.
+        adapter
+            .conn()
+            .execute_batch("UPDATE users SET age=100 WHERE id=1;")
+            .unwrap();
+
+        // LOCAL mpedb writes: id=1 collides with the source write; id=3 does not.
+        db.query("UPDATE users SET age=$1 WHERE id=$2", &[Value::Int(99), Value::Int(1)])
+            .unwrap();
+        db.query(
+            "INSERT INTO users (id,email,age) VALUES ($1,$2,$3)",
+            &[Value::Int(3), Value::Text("c@x".into()), Value::Int(50)],
+        )
+        .unwrap();
+
+        let stats = push_batch(&db, &mut adapter).unwrap();
+        assert_eq!(stats.upserts, 1, "only the non-conflicting id=3 lands");
+        assert_eq!(stats.conflicts, 1, "id=1 is a write-write conflict");
+
+        // source-wins: id=1 keeps the source's 100, NOT mpedb's 99.
+        let age1: i64 = adapter
+            .conn()
+            .query_row("SELECT age FROM users WHERE id=1", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(age1, 100);
+        // the non-conflicting insert did reach the source.
+        let n3: i64 = adapter
+            .conn()
+            .query_row("SELECT COUNT(*) FROM users WHERE id=3", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n3, 1);
+
+        // id=1 is parked push_rejected; its dirty entry survives for the pull.
+        let parked = crate::conflicts::list(&db).unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].pk, vec![Value::Int(1)]);
+        assert_eq!(parked[0].record.kind, ConflictKind::PushRejected);
+
+        // the follow-up pull carries the source's winning row into mpedb; apply
+        // resolves the divergence source-wins → mpedb id=1 converges to 100.
+        let from = db
+            .sys_record_get(state::MIR_NS, state::KEY_CUR)
+            .unwrap()
+            .unwrap_or_else(|| adapter.zero_cursor());
+        let batch = adapter.pull(&from, 1000).unwrap().unwrap();
+        crate::apply::apply_batch(&db, &from, &batch).unwrap();
+        let got = match db.query("SELECT age FROM users WHERE id=$1", &[Value::Int(1)]).unwrap() {
+            mpedb::ExecResult::Rows { rows, .. } => rows,
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(got[0][0], Value::Int(100), "mpedb converged to the source value");
 
         for p in [src_path, mpedb_path] {
             let _ = std::fs::remove_file(p);

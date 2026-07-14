@@ -266,6 +266,58 @@ impl SourceAdapter for PgAdapter {
         Ok(())
     }
 
+    fn push_checked(&mut self, from: &Cursor, ops: &[NetOp]) -> Result<Vec<bool>> {
+        if ops.is_empty() {
+            return Ok(Vec::new());
+        }
+        // the pull cursor's snapshot = the xid window boundary. Empty cursor →
+        // "everything committed so far" is un-consumed, so any source write is a
+        // conflict (matches sqlite from_seq=0).
+        let snap_prev = if from.is_empty() {
+            "1:1:".to_string()
+        } else {
+            String::from_utf8(from.clone())
+                .map_err(|_| Error::Corrupt("pg cursor is not valid utf-8".into()))?
+        };
+        let mut metas: BTreeMap<u32, PgTable> = BTreeMap::new();
+        for op in ops {
+            if let std::collections::btree_map::Entry::Vacant(e) = metas.entry(op.table_id) {
+                let src = self
+                    .tables
+                    .iter()
+                    .find(|t| t.table_id == op.table_id)
+                    .ok_or_else(|| Error::Config(format!("push to unmirrored table {}", op.table_id)))?
+                    .src
+                    .clone();
+                e.insert(src);
+            }
+        }
+        let origin = self.origin.clone();
+
+        let mut tx = self.client.transaction().map_err(pgerr)?;
+        tx.batch_execute(&format!(
+            "SET LOCAL mpedb.mirror_origin = '{}'",
+            origin.replace('\'', "''")
+        ))
+        .map_err(pgerr)?;
+
+        let mut results = Vec::with_capacity(ops.len());
+        for op in ops {
+            let src = &metas[&op.table_id];
+            if pg_source_changed(&mut tx, src, &op.pk, &snap_prev, &origin)? {
+                results.push(false); // source concurrently won — leave un-applied
+                continue;
+            }
+            match &op.kind {
+                NetOpKind::Upsert(row) => pg_upsert(&mut tx, src, row)?,
+                NetOpKind::Delete => pg_delete(&mut tx, src, &op.pk)?,
+            }
+            results.push(true);
+        }
+        tx.commit().map_err(pgerr)?;
+        Ok(results)
+    }
+
     fn ensure_source_state(&mut self, mirror_id: &str, epoch: u64, authority: &str) -> Result<()> {
         self.client
             .batch_execute(
@@ -490,6 +542,66 @@ fn pg_upsert(tx: &mut postgres::Transaction, src: &PgTable, row: &[Value]) -> Re
     Ok(())
 }
 
+/// Lock-then-check push-conflict detection (§6, CONF#11/27). Locks the target
+/// row (`FOR UPDATE`; a no-op if it doesn't exist yet), then tests the changelog
+/// xid-window consistent with the pull cursor: a non-echo entry for this PK that
+/// is NOT visible in the stored snapshot = a source write we haven't consumed →
+/// a write-write conflict. The lock + the caller's subsequent write are atomic.
+fn pg_source_changed(
+    tx: &mut postgres::Transaction,
+    src: &PgTable,
+    pk: &[Value],
+    snap_prev: &str,
+    origin: &str,
+) -> Result<bool> {
+    let pk_text: Vec<Option<String>> = src
+        .pk
+        .iter()
+        .enumerate()
+        .map(|(j, &i)| to_pg_text(&pk[j], &src.columns[i]))
+        .collect();
+
+    // 1. take the row lock (lock-then-check).
+    let lock_where = src
+        .pk
+        .iter()
+        .enumerate()
+        .map(|(j, &i)| format!("{}::text = ${}", q(&src.columns[i].name), j + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let lock_sql = format!(
+        "SELECT 1 FROM \"public\".{} WHERE {lock_where} FOR UPDATE",
+        q(&src.name)
+    );
+    let lock_params: Vec<&(dyn ToSql + Sync)> =
+        pk_text.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+    tx.query(&lock_sql, &lock_params).map_err(pgerr)?;
+
+    // 2. xid-window changelog check (in a fresh statement, after the lock).
+    let npk = src.pk.len();
+    let pk_match = (0..npk)
+        .map(|j| format!("pk->>{j} = ${}", j + 2))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let snap_idx = npk + 2;
+    let origin_idx = npk + 3;
+    let sql = format!(
+        "SELECT EXISTS(SELECT 1 FROM mpedb_mirror.changelog \
+         WHERE tbl = $1 AND {pk_match} \
+           AND NOT pg_visible_in_snapshot(xid, ${snap_idx}::text::pg_snapshot) \
+           AND (origin IS NULL OR origin <> ${origin_idx}))"
+    );
+    let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(npk + 3);
+    params.push(&src.name as &(dyn ToSql + Sync));
+    for p in &pk_text {
+        params.push(p as &(dyn ToSql + Sync));
+    }
+    params.push(&snap_prev as &(dyn ToSql + Sync));
+    params.push(&origin as &(dyn ToSql + Sync));
+    let exists: bool = tx.query_one(&sql, &params).map_err(pgerr)?.get(0);
+    Ok(exists)
+}
+
 fn pg_delete(tx: &mut postgres::Transaction, src: &PgTable, pk: &[Value]) -> Result<()> {
     let where_sql = src
         .pk
@@ -690,6 +802,62 @@ mod tests {
         // echo suppression: our GUC-tagged writes are filtered from the pull
         let from = adapter.zero_cursor();
         assert!(adapter.pull(&from, 10000).unwrap().is_none());
+
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    #[ignore = "needs PostgreSQL (run with --ignored)"]
+    fn pg_push_conflict_source_wins_and_parks() {
+        use crate::push::push_batch;
+
+        let pg = crate::pg_harness::ThrowawayPg::start();
+        {
+            let mut c = pg.client();
+            c.batch_execute(
+                "CREATE TABLE t(id bigint PRIMARY KEY, v int);
+                 INSERT INTO t VALUES (1,10),(2,20);",
+            )
+            .unwrap();
+        }
+        let dest = tmp("pg-pushconf");
+        let db = {
+            let mut c = pg.client();
+            import_pg(&mut c, &dest, &ImportOptions::default()).unwrap().0
+        };
+        let mut adapter = PgAdapter::new(pg.client(), None, &[]).unwrap();
+        adapter.install_triggers().unwrap();
+
+        // CONCURRENT source write on id=1 (not our echo, after our cursor).
+        adapter.client().batch_execute("UPDATE t SET v=100 WHERE id=1;").unwrap();
+
+        // LOCAL mpedb writes: id=1 collides with the source; id=3 does not.
+        db.query("UPDATE t SET v=$1 WHERE id=$2", &[Value::Int(99), Value::Int(1)]).unwrap();
+        db.query("INSERT INTO t (id,v) VALUES ($1,$2)", &[Value::Int(3), Value::Int(30)]).unwrap();
+
+        let stats = push_batch(&db, &mut adapter).unwrap();
+        assert_eq!(stats.upserts, 1); // only id=3 lands
+        assert_eq!(stats.conflicts, 1); // id=1 is a write-write conflict
+
+        // source-wins: id=1 keeps 100, id=3 arrived.
+        let v1: i32 = adapter
+            .client()
+            .query_one("SELECT v FROM t WHERE id=1", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(v1, 100);
+        let n3: i64 = adapter
+            .client()
+            .query_one("SELECT count(*) FROM t WHERE id=3", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(n3, 1);
+
+        // id=1 is parked push_rejected.
+        let parked = crate::conflicts::list(&db).unwrap();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].pk, vec![Value::Int(1)]);
+        assert_eq!(parked[0].record.kind, crate::state::ConflictKind::PushRejected);
 
         let _ = std::fs::remove_file(&dest);
     }
