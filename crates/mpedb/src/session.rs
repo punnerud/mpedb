@@ -141,7 +141,7 @@ mod tests {
     use crate::{Database, ExecResult};
     use mpedb_types::{Config, Error, Value};
 
-    fn db(tag: &str) -> Database {
+    fn db(tag: &str) -> crate::testdb::TestDb {
         let path = format!("/dev/shm/mpedb-sess-{tag}-{}.mpedb", std::process::id());
         let _ = std::fs::remove_file(&path);
         let cfg = Config::from_toml_str(&format!(
@@ -152,7 +152,7 @@ mod tests {
              [[table.column]]\n  name = \"note\"\n  type = \"text\"\n  nullable = true"
         ))
         .unwrap();
-        Database::open_with_config(cfg).unwrap()
+        crate::testdb::TestDb::new(Database::open_with_config(cfg).unwrap())
     }
 
     fn sess(tenant: i64) -> Session {
@@ -313,7 +313,6 @@ mod tests {
         s3.set_list("app.orgs", []).unwrap();
         assert!(ids(db.query_ctx(&s3, sql, &[]).unwrap()).is_empty());
 
-        let _ = std::fs::remove_file(db.path());
     }
 
     /// THE design property (§4.1/§2.6): arity lives in the data, so one
@@ -337,7 +336,6 @@ mod tests {
         // both execute the SAME prepared hash
         assert_eq!(ids(db.execute_ctx(&small, &h1, &[]).unwrap()), vec![1]);
         assert_eq!(ids(db.execute_ctx(&big, &h1, &[]).unwrap()), vec![1, 2, 3, 4]);
-        let _ = std::fs::remove_file(db.path());
     }
 
     /// 3VL reaches the query layer: a NULL in the set means "maybe", and a
@@ -353,7 +351,6 @@ mod tests {
         // 10 matches outright; the rest are UNKNOWN (the NULL might have been
         // them) and UNKNOWN is not visible.
         assert_eq!(ids(db.query_ctx(&s, sql, &[]).unwrap()), vec![1]);
-        let _ = std::fs::remove_file(db.path());
     }
 
     #[test]
@@ -366,7 +363,6 @@ mod tests {
             &[],
         );
         assert!(matches!(r, Err(Error::Bind(_))), "got {r:?}");
-        let _ = std::fs::remove_file(db.path());
     }
 
     /// A scalar where a list belongs is a hard error, not a silent deny — a
@@ -383,7 +379,6 @@ mod tests {
             &[],
         );
         assert!(matches!(r, Err(Error::TypeMismatch(_))), "got {r:?}");
-        let _ = std::fs::remove_file(db.path());
     }
 
     /// One context slot cannot be both a scalar and a list: it would make the
@@ -395,7 +390,6 @@ mod tests {
             "SELECT id FROM orders WHERE tenant IN (current_setting('k')) AND id = current_setting('k')",
         );
         assert!(matches!(&r, Err(Error::Bind(m)) if m.contains("one or the other")), "got {r:?}");
-        let _ = std::fs::remove_file(db.path());
     }
 
     /// The two IN forms share syntax but not machinery, and the split is the
@@ -420,7 +414,6 @@ mod tests {
             .prepare("SELECT id FROM orders WHERE tenant IN (current_setting('k'))")
             .unwrap();
         assert_ne!(c, h2);
-        let _ = std::fs::remove_file(db.path());
     }
 
     #[test]

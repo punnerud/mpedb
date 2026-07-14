@@ -340,7 +340,7 @@ mod tests {
     use crate::{Database, ExecResult, PolicyCmd, PolicyDef, Session};
     use mpedb_types::{Config, Error as E, Value};
 
-    fn db(tag: &str) -> Database {
+    fn db(tag: &str) -> crate::testdb::TestDb {
         let path = format!("/dev/shm/mpedb-rls-{tag}-{}.mpedb", std::process::id());
         let _ = std::fs::remove_file(&path);
         let cfg = Config::from_toml_str(&format!(
@@ -351,7 +351,7 @@ mod tests {
              [[table.column]]\n  name = \"note\"\n  type = \"text\"\n  nullable = true"
         ))
         .unwrap();
-        Database::open_with_config(cfg).unwrap()
+        crate::testdb::TestDb::new(Database::open_with_config(cfg).unwrap())
     }
 
     fn sess(tenant: i64) -> Session {
@@ -454,7 +454,6 @@ mod tests {
         );
         assert!(matches!(w, Err(E::Config(_))), "got {w:?}");
 
-        let _ = std::fs::remove_file(db.path());
     }
 
     /// RLS on but no policy governs the command: our empty-permissive rule
@@ -470,7 +469,6 @@ mod tests {
             matches!(&err, Err(E::Config(m)) if m.contains("no policy governs")),
             "expected a fail-closed config error, got {err:?}"
         );
-        let _ = std::fs::remove_file(db.path());
     }
 
     /// Properly protected ⇒ the assertion is invisible and filtering is normal.
@@ -496,7 +494,6 @@ mod tests {
         }
         assert_eq!(nrows(db.query_ctx(&sess(1), "SELECT id FROM orders", &[]).unwrap()), 2);
         assert_eq!(nrows(db.query_ctx(&sess(2), "SELECT id FROM orders", &[]).unwrap()), 1);
-        let _ = std::fs::remove_file(db.path());
     }
 
     /// A typo'd/renamed table name must fail at OPEN, not silently assert
@@ -650,7 +647,6 @@ mod tests {
             &[Value::Int(1), Value::Int(1)],
         );
         assert!(matches!(e, Err(E::PrimaryKeyViolation { .. })), "got {e:?}");
-        let _ = std::fs::remove_file(db.path());
     }
 
     // ---- §6.4 tenant-leading-key lint ----
@@ -684,7 +680,6 @@ mod tests {
             w.iter().any(|m| m.contains("UNIQUE column `code`") && m.contains("CANNOT be fixed")),
             "expected the unique finding to state the real constraint, got {w:?}"
         );
-        let _ = std::fs::remove_file(db.path());
     }
 
     /// A tenant-leading PK and no tenant-spanning unique ⇒ nothing to say.
@@ -718,7 +713,6 @@ mod tests {
             check_src: None,
         };
         assert!(db.lint_policy("orders", &public).unwrap().is_empty());
-        let _ = std::fs::remove_file(db.path());
     }
 
     /// A discriminator under OR does not partition the table (the other branch
@@ -737,7 +731,6 @@ mod tests {
         };
         // no top-level equality conjunct ⇒ no discriminator ⇒ silent
         assert!(db.lint_policy("orders", &loose).unwrap().is_empty());
-        let _ = std::fs::remove_file(db.path());
     }
 
     /// The findings must actually reach a user: `CREATE POLICY` returns them as
@@ -762,7 +755,6 @@ mod tests {
         // the policy was still created — the lint informs, it does not veto
         db.enable_rls("orders", false).unwrap();
         assert_eq!(nrows(db.query_ctx(&sess(1), "SELECT id FROM orders", &[]).unwrap()), 0);
-        let _ = std::fs::remove_file(db.path());
     }
 
     #[test]
@@ -972,4 +964,20 @@ mod tests {
         assert_eq!(nrows(db.query_ctx(&sess(3), "SELECT id FROM orders", &[]).unwrap()), 1);
         assert_eq!(nrows(db.query_ctx(&sess(99), "SELECT id FROM orders", &[]).unwrap()), 0);
     }
+
+    /// Deliberately panics. Run explicitly:
+    ///   cargo test -p mpedb --lib panicking_test -- --ignored
+    ///
+    /// Proves the Drop guard cleans up on the FAILURE path -- the only path
+    /// that ever leaked. A cleanup that only runs on success is exactly the bug
+    /// this replaced.
+    #[test]
+    #[ignore]
+    fn panicking_test_still_removes_its_file() {
+        let db = db("leakprobe");
+        let p = db.path().to_path_buf();
+        assert!(p.exists(), "the file must exist while the test runs");
+        panic!("deliberate panic; {} must not survive it", p.display());
+    }
 }
+
