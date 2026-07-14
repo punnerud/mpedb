@@ -38,7 +38,33 @@ use crate::util::{err, BResult};
 ///
 /// Order: `MPEDB_PG_BIN` (an explicit answer always wins), then the usual
 /// install roots, then `$PATH`. Returns the directory, not the binary.
-fn pg_bin() -> String {
+/// On Apple, force PostgreSQL to actually reach the platter.
+///
+/// **The third engine to fall into the same trap, and the last.** macOS's
+/// `fsync()` does not flush the drive's write cache — only
+/// `fcntl(F_FULLFSYNC)` does. We have now paid for that lesson three times:
+/// SQLite (`PRAGMA fullfsync` defaults OFF — `eng_sqlite.rs`), mpedb (the
+/// commit path's `msync` handed pages to the filesystem and stopped), and now
+/// PostgreSQL, whose `wal_sync_method` defaults to `open_datasync` here. Only
+/// `fsync_writethrough` issues `F_FULLFSYNC`.
+///
+/// Left alone, PG posted **23,555 durable inserts/s at p50 38 µs** on an M3 —
+/// physically impossible for a device flush, and next to mpedb's honest 7.0 ms
+/// it would have read as PostgreSQL being 165x faster at durability. It was
+/// writing to the page cache. A benchmark that lets one engine skip the barrier
+/// is not measuring the other two, it is slandering them.
+///
+/// Only applied when `fsync=on`: the none-class deliberately does not promise
+/// durability, and forcing a real barrier there would measure the wrong thing.
+fn apple_wal_sync_method(fsync: &str) -> &'static str {
+    if cfg!(target_vendor = "apple") && fsync == "on" {
+        " -c wal_sync_method=fsync_writethrough"
+    } else {
+        ""
+    }
+}
+
+pub fn pg_bin() -> String {
     // Resolved once; "" means "not found", which the callers surface as an
     // honest engine-unavailable rather than a panic.
     static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
@@ -154,9 +180,10 @@ impl PgServer {
 
         let opts = format!(
             "-c port={PORT} -c unix_socket_directories={} -c listen_addresses= \
-             -c fsync={fsync} -c synchronous_commit={sync_commit} \
+             -c fsync={fsync} -c synchronous_commit={sync_commit}{} \
              -c shared_buffers=256MB -c max_connections=32",
-            sockdir.display()
+            sockdir.display(),
+            apple_wal_sync_method(fsync),
         );
         let mut start = Command::new(format!("{}/pg_ctl", pg_bin()));
         start
@@ -169,6 +196,8 @@ impl PgServer {
         guard.running = true;
         Ok(guard)
     }
+
+    // (see apple_wal_sync_method below)
 
     pub fn conn_str(&self) -> String {
         format!(
