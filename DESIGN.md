@@ -37,14 +37,20 @@ documents rather than solves in Phase 1.
   BETWEEN, CASE and scalar functions (lower/upper/length/trim/abs/round/substr,
   coalesce/ifnull/nullif) — the "no functions" this line used to say stopped
   being true in 2026-07.
-- **No joins, no subqueries, no EXISTS, no cross-table references — and this is
-  load-bearing, not a backlog item.** The footprint describes exactly ONE table
-  (`tables_read`/`tables_written` are claimed at plan time and are what the
-  commit path groups conflicts by), and `ExprProgram` is single-row scalar. A
-  second-table read would silently under-claim the footprint and corrupt conflict
-  grouping (§5; DESIGN-MULTIDB §5.2, §6.4). The scaling answer is **more files,
-  not a wider footprint word**. Aggregates are the one planned addition, and they
-  carry their own invariant (DESIGN-MULTIDB §4).
+- **No joins, subqueries or EXISTS *yet*; no aggregates yet.** A build-order
+  limit, not an architectural one — and the distinction matters, because the
+  first draft of this line asserted the opposite. `Footprint` is ALREADY a bitmap
+  over `MAX_TABLES` (`tables_read` / `tables_written` / `indexes_used`) carrying
+  `KeyAccess::Point|Range|Full`, so it can already describe a multi-table,
+  key-scoped access set; `conflicts_with` is a bitmap AND with key-level
+  refinement for `Point`. What is single-table is the BINDER
+  (`Binder { table: &TableDef }`) and `ExprProgram` (single-row scalar).
+  Cross-**member** JOIN — across separate workspace files — is out of scope
+  (DESIGN-MULTIDB §89, "more files, not a wider footprint word"): separate files
+  mean separate catalogs and separate commit protocols. **Within one file the
+  design says the opposite** (§21: shared data / joins across the wall = yes,
+  cross-table atomic commit = yes). A multi-table binder must claim every table it
+  touches in the footprint — which is what the bitmap is for.
 - **Platform: Linux (x86-64, 32/64-bit ARM) and macOS/Apple Silicon.** The macOS
   port is the FLD-2 flock writer lock + `F_FULLFSYNC` durability barrier
   (`crate::os`); it is crash-safe and benchmarked, not a stub. Windows later.

@@ -51,6 +51,120 @@ pub(crate) enum BUnOp {
 /// Expression type: `None` = NULL literal or not yet constrained.
 pub(crate) type Ty = Option<ColumnType>;
 
+
+/// The tables a statement can name, and how a column reference resolves to a
+/// slot in the row the expression will see.
+///
+/// **Why this exists as a type instead of a `&TableDef` field.** The binder held
+/// exactly one table, so "which table is this column in" was never a question —
+/// and every layer above inherited that assumption without stating it. The
+/// footprint never did: `tables_read`/`tables_written` are bitmaps over
+/// `MAX_TABLES` and `conflicts_with` is a bitmap AND, so a multi-table access set
+/// has always been *representable*. The binder is what made it unreachable.
+///
+/// Today a scope holds one table and this is a pure refactor — same resolution,
+/// same errors, no new SQL. It exists so the next step (a second table) changes
+/// this type rather than 45 call sites, and so the rule that matters is written
+/// down in ONE place: **a column resolves to an offset into the tuple the
+/// expression is evaluated over.** For a single table that is the row itself. For
+/// `ON CONFLICT DO UPDATE` it is already `[existing ‖ proposed]`, which is why
+/// `excluded.<c>` binds to `Col(n + i)`. For a join it will be the concatenation
+/// of the joined rows. Same rule, wider tuple.
+pub(crate) struct Scope<'a> {
+    /// Tables in tuple order. The slot base of table `k` is the sum of the widths
+    /// before it.
+    tables: Vec<&'a TableDef>,
+}
+
+impl<'a> Scope<'a> {
+    pub fn single(t: &'a TableDef) -> Scope<'a> {
+        Scope { tables: vec![t] }
+    }
+
+    /// The only table, for the paths that are still single-table by
+    /// construction (INSERT's target, RLS policy binding, `excluded.`).
+    /// Panics if the scope is wider — a caller that reaches for "the" table of a
+    /// join has a bug that must not be papered over with an arbitrary choice.
+    pub fn only(&self) -> &'a TableDef {
+        assert_eq!(
+            self.tables.len(),
+            1,
+            "Scope::only() on a {}-table scope: this path has not been taught about joins",
+            self.tables.len()
+        );
+        self.tables[0]
+    }
+
+    /// Slot offset of table `k`'s first column in the evaluated tuple.
+    fn base(&self, k: usize) -> usize {
+        self.tables[..k].iter().map(|t| t.columns.len()).sum()
+    }
+
+    /// Total tuple width.
+    pub fn width(&self) -> usize {
+        self.base(self.tables.len())
+    }
+
+    /// Resolve an UNQUALIFIED column name. Ambiguity is an error, never a
+    /// silent pick: with one table it cannot happen, and the day it can, a
+    /// wrong guess is a wrong-table read.
+    pub fn resolve(&self, name: &str) -> Result<(u16, ColumnType)> {
+        let mut found: Option<(u16, ColumnType)> = None;
+        for (k, t) in self.tables.iter().enumerate() {
+            if let Some(i) = t.column_index(name) {
+                let slot = (self.base(k) + i as usize) as u16;
+                if found.is_some() {
+                    return Err(bind_err(format!(
+                        "column `{name}` is ambiguous: qualify it with a table name"
+                    )));
+                }
+                found = Some((slot, t.columns[i as usize].ty));
+            }
+        }
+        found.ok_or_else(|| {
+            bind_err(format!(
+                "unknown column `{name}` in {}",
+                self.describe()
+            ))
+        })
+    }
+
+    /// Resolve a QUALIFIED `<table>.<column>`. The qualifier is checked rather
+    /// than dropped: accepting `nonsense.id` as `id` turns a typo into a
+    /// wrong-table read the moment a scope holds more than one table.
+    pub fn resolve_qualified(&self, qual: &str, name: &str) -> Result<(u16, ColumnType)> {
+        for (k, t) in self.tables.iter().enumerate() {
+            if t.name.eq_ignore_ascii_case(qual) {
+                let i = t.column_index(name).ok_or_else(|| {
+                    bind_err(format!("unknown column `{qual}.{name}`"))
+                })?;
+                return Ok((
+                    (self.base(k) + i as usize) as u16,
+                    t.columns[i as usize].ty,
+                ));
+            }
+        }
+        Err(bind_err(format!(
+            "no table named `{qual}` in this statement ({})",
+            self.describe()
+        )))
+    }
+
+    fn describe(&self) -> String {
+        match self.tables.len() {
+            1 => format!("table `{}`", self.tables[0].name),
+            _ => format!(
+                "tables {}",
+                self.tables
+                    .iter()
+                    .map(|t| format!("`{}`", t.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
+}
+
 pub(crate) struct Binder<'a> {
     /// Is `excluded.<col>` in scope? Only inside `ON CONFLICT DO UPDATE`.
     ///
@@ -76,7 +190,8 @@ pub(crate) struct Binder<'a> {
     /// CONTROL FLOW first, drop the branch that cannot be taken WITHOUT
     /// evaluating it, then fold whatever survives — and let that raise.
     suppress_fold: bool,
-    pub table: &'a TableDef,
+    /// The tables this statement may name. See [`Scope`].
+    pub scope: Scope<'a>,
     /// Types of ALL parameters: the `n_user_params` caller params first, then
     /// one appended reserved slot per distinct `current_setting()` key (in
     /// `ctx_keys` order). `current_setting()` refs bind to `Param(n_user + pos)`
@@ -102,10 +217,14 @@ fn bind_err(msg: impl Into<String>) -> Error {
 
 impl<'a> Binder<'a> {
     pub fn new(table: &'a TableDef, n_params: u16, allow_params: bool) -> Binder<'a> {
+        Binder::with_scope(Scope::single(table), n_params, allow_params)
+    }
+
+    pub fn with_scope(scope: Scope<'a>, n_params: u16, allow_params: bool) -> Binder<'a> {
         Binder {
             allow_excluded: false,
             suppress_fold: false,
-            table,
+            scope,
             param_types: vec![None; n_params as usize],
             n_user_params: n_params,
             ctx_keys: Vec::new(),
@@ -199,13 +318,8 @@ impl<'a> Binder<'a> {
                 Ok((BExpr::Param(*i), self.param_types[*i as usize]))
             }
             ast::Expr::Col(name) => {
-                let idx = self.table.column_index(name).ok_or_else(|| {
-                    bind_err(format!(
-                        "unknown column `{name}` in table `{}`",
-                        self.table.name
-                    ))
-                })?;
-                Ok((BExpr::Col(idx), Some(self.table.columns[idx as usize].ty)))
+                let (idx, ty) = self.scope.resolve(name)?;
+                Ok((BExpr::Col(idx), Some(ty)))
             }
             ast::Expr::Unary(UnOp::Neg, a) => {
                 let (a, at) = self.bind_expr(a)?;
@@ -388,14 +502,8 @@ impl<'a> Binder<'a> {
                 // One table in scope, so the qualifier must be it. Accepting
                 // any qualifier would let `nonsense.id` silently mean `id`, and
                 // when joins arrive that typo becomes a wrong-table read.
-                if !qual.eq_ignore_ascii_case(&self.table.name) {
-                    return Err(bind_err(format!(
-                        "`{qual}.{name}`: no table named `{qual}` in this statement (the table \
-                         is `{}`)",
-                        self.table.name
-                    )));
-                }
-                self.bind_expr(&ast::Expr::Col(name.clone()))
+                let (idx, ty) = self.scope.resolve_qualified(qual, name)?;
+                Ok((BExpr::Col(idx), Some(ty)))
             }
             ast::Expr::Excluded(name) => {
                 if !self.allow_excluded {
@@ -403,17 +511,17 @@ impl<'a> Binder<'a> {
                         "`excluded` is only in scope inside ON CONFLICT ... DO UPDATE",
                     ));
                 }
-                let i = self
-                    .table
+                // ON CONFLICT targets exactly one table, so `only()` is right
+                // here rather than a scope lookup — and if a join ever reaches
+                // this path, only() asserts instead of guessing.
+                let t = self.scope.only();
+                let i = t
                     .columns
                     .iter()
                     .position(|c| c.name == *name)
                     .ok_or_else(|| bind_err(format!("unknown column `excluded.{name}`")))?;
-                let n = self.table.columns.len();
-                Ok((
-                    BExpr::Col((n + i) as u16),
-                    Some(self.table.columns[i].ty),
-                ))
+                let n = t.columns.len();
+                Ok((BExpr::Col((n + i) as u16), Some(t.columns[i].ty)))
             }
             ast::Expr::Coalesce(args) => {
                 if args.is_empty() {
@@ -683,9 +791,15 @@ impl<'a> Binder<'a> {
             // An `excluded.<c>` binds to Col(n + i); fold the index back so a
             // second-half reference reports the column's real type instead of
             // indexing off the end.
+            // `excluded.<c>` binds to Col(n + i) over [existing ‖ proposed], so
+            // fold the index back into the base row's width.
             BExpr::Col(i) => {
-                let n = self.table.columns.len();
-                self.table.columns.get(*i as usize % n.max(1)).map(|c| c.ty)
+                let n = self.scope.width();
+                self.scope
+                    .only()
+                    .columns
+                    .get(*i as usize % n.max(1))
+                    .map(|c| c.ty)
             }
             BExpr::Param(i) => self.param_types[*i as usize],
             BExpr::Unary(BUnOp::ToFloat, _) => Some(ColumnType::Float64),
@@ -1246,5 +1360,73 @@ mod tests {
     fn nullif_desugars_to_case() {
         let (e, _) = bind_ok("nullif(id, 1)");
         assert!(matches!(e, BExpr::Case(..)), "got {e:?}");
+    }
+
+    /// [`Scope`] exists so the NEXT step changes one type instead of 45 call
+    /// sites. That claim is only worth anything if a two-table scope actually
+    /// resolves, so this builds one directly — no SQL surface reaches it yet.
+    ///
+    /// The rule it pins: a column resolves to an OFFSET INTO THE TUPLE the
+    /// expression is evaluated over. One table = the row. `ON CONFLICT DO
+    /// UPDATE` = `[existing ‖ proposed]`, which is why `excluded.<c>` is
+    /// `Col(n + i)`. A join = the concatenated rows. Same rule, wider tuple.
+    #[test]
+    fn a_scope_can_already_hold_two_tables() {
+        let a = table(); // id, score, name, active, data, created
+        let b = TableDef {
+            name: "other".into(),
+            columns: vec![ColumnDef {
+                name: "tag".into(),
+                ty: ColumnType::Text,
+                nullable: true,
+                unique: false,
+                default: None,
+                check: None,
+            }],
+            primary_key: vec![0],
+        };
+        let sc = Scope {
+            tables: vec![&a, &b],
+        };
+        assert_eq!(sc.width(), a.columns.len() + 1);
+
+        // Table b's column sits AFTER a's, at a's width — the concatenation.
+        let (slot, ty) = sc.resolve("tag").unwrap();
+        assert_eq!((slot as usize, ty), (a.columns.len(), ColumnType::Text));
+        // Table a's columns keep their slots, so nothing shifts under them.
+        assert_eq!(sc.resolve("id").unwrap().0, 0);
+        // Qualifiers reach either side.
+        assert_eq!(sc.resolve_qualified("other", "tag").unwrap().0 as usize, a.columns.len());
+        assert_eq!(sc.resolve_qualified("t", "id").unwrap().0, 0);
+        // A qualifier naming no table in scope is an error, not a silent pick.
+        assert!(sc.resolve_qualified("nonsense", "id").is_err());
+    }
+
+    /// Ambiguity must be an ERROR. With one table it cannot arise; the day it
+    /// can, guessing is a wrong-table read — the exact failure the footprint
+    /// discipline exists to prevent.
+    #[test]
+    fn an_ambiguous_column_is_refused_rather_than_guessed() {
+        let a = table();
+        let b = TableDef {
+            name: "other".into(),
+            columns: vec![ColumnDef {
+                name: "id".into(), // collides with a.id
+                ty: ColumnType::Int64,
+                nullable: false,
+                unique: false,
+                default: None,
+                check: None,
+            }],
+            primary_key: vec![0],
+        };
+        let sc = Scope {
+            tables: vec![&a, &b],
+        };
+        let e = sc.resolve("id").unwrap_err();
+        assert!(format!("{e}").contains("ambiguous"), "got {e}");
+        // ...but qualifying resolves it, to the right side each time.
+        assert_eq!(sc.resolve_qualified("t", "id").unwrap().0, 0);
+        assert_eq!(sc.resolve_qualified("other", "id").unwrap().0 as usize, a.columns.len());
     }
 }

@@ -1172,6 +1172,47 @@ primary_key = ["id"]
         (Config::from_toml_str(&toml).unwrap(), path)
     }
 
+    /// Two independent tables in one file — the shape every other write test
+    /// here lacks.
+    fn two_table_config(name: &str) -> (Config, PathBuf) {
+        let dir = if Path::new("/dev/shm").is_dir() {
+            PathBuf::from("/dev/shm")
+        } else {
+            std::env::temp_dir()
+        };
+        let path = dir.join(format!("mpedb-{name}-{}.mpedb", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let toml = format!(
+            r#"
+[database]
+path = "{}"
+size_mb = 8
+
+[[table]]
+name = "a"
+primary_key = ["id"]
+  [[table.column]]
+  name = "id"
+  type = "int64"
+  [[table.column]]
+  name = "v"
+  type = "int64"
+
+[[table]]
+name = "b"
+primary_key = ["id"]
+  [[table.column]]
+  name = "id"
+  type = "int64"
+  [[table.column]]
+  name = "v"
+  type = "int64"
+"#,
+            path.display()
+        );
+        (Config::from_toml_str(&toml).unwrap(), path)
+    }
+
     struct FileGuard(PathBuf);
     impl Drop for FileGuard {
         fn drop(&mut self) {
@@ -1536,5 +1577,56 @@ primary_key = ["id"]
             ExecResult::Rows { rows, .. } if rows.len() == 1
         ));
         db.verify().unwrap();
+    }
+
+    /// **Cross-table atomic commit** — DESIGN-MULTIDB §21 lists it as a headline
+    /// property of the single-file option ("one writer lock, one meta flip"),
+    /// and nothing tested it. Every write test in this repo touched exactly one
+    /// table, so an advertised guarantee rested on the reader believing the
+    /// architecture rather than on evidence.
+    ///
+    /// It follows from the design (a commit is one atomic meta flip regardless
+    /// of how many trees the txn dirtied) — but "it follows" is what people say
+    /// right before a regression. This pins both halves: both tables land
+    /// together on commit, and NEITHER lands on rollback.
+    #[test]
+    fn one_transaction_writing_two_tables_is_atomic() {
+        let (cfg, path) = two_table_config("xtable");
+        let _guard = FileGuard(path);
+        let db = Database::open_with_config(cfg).unwrap();
+
+        let count = |t: &str| -> usize {
+            match db.query(&format!("SELECT id FROM {t}"), &params![]).unwrap() {
+                ExecResult::Rows { rows, .. } => rows.len(),
+                o => panic!("{o:?}"),
+            }
+        };
+
+        // Rollback: neither table may keep its row.
+        let mut s = db.begin().unwrap();
+        s.insert_row(0, &[Value::Int(1), Value::Int(10)]).unwrap();
+        s.insert_row(1, &[Value::Int(1), Value::Int(20)]).unwrap();
+        s.rollback();
+        assert_eq!((count("a"), count("b")), (0, 0), "rollback must undo BOTH tables");
+
+        // Commit: both land, in one meta flip.
+        let mut s = db.begin().unwrap();
+        s.insert_row(0, &[Value::Int(1), Value::Int(10)]).unwrap();
+        s.insert_row(1, &[Value::Int(1), Value::Int(20)]).unwrap();
+        s.commit().unwrap();
+        assert_eq!((count("a"), count("b")), (1, 1), "commit must land BOTH tables");
+
+        // And a failure on the SECOND table must not leave the first behind —
+        // the case that would make "atomic" a lie.
+        let mut s = db.begin().unwrap();
+        s.insert_row(0, &[Value::Int(2), Value::Int(11)]).unwrap();
+        let dup = s.insert_row(1, &[Value::Int(1), Value::Int(99)]); // PK 1 exists
+        assert!(dup.is_err(), "expected a PK violation on table b");
+        s.rollback();
+        assert_eq!(
+            (count("a"), count("b")),
+            (1, 1),
+            "a failure on the second table must not leave the first table's row"
+        );
     }
 }
