@@ -58,7 +58,7 @@ tables and keys a statement touches before it runs.
 | `mpedb-sdk` | Caching client session. |
 | `mpedb-proc` | PySpell-style Python/Rust → budgeted IR stored procedures, streaming cursors. |
 | `mpedb-py` | PyO3 module (`abi3-py312`), GIL released around engine calls. |
-| `mpedb-mirror` | Bidirectional sqlite3/PostgreSQL ⇄ mpedb mirroring & migration: import, incremental diff-pull under load, write-back, epoch-fenced authority switch, and round-trip differential export/diff. |
+| `mpedb-mirror` | Bidirectional sqlite3/PostgreSQL ⇄ mpedb mirroring: import, incremental diff-pull under load, write-back, epoch-fenced authority switch. Round-trip differential export/diff is sqlite-only; the CLI drives sqlite only (PostgreSQL is library-level today). |
 | `mpedb-cli` | The `mpedb` binary: repl / exec / prepare / call / dump / stress / crash / powerloss / bench / proc / mirror. |
 | `mpedb-testkit` | sqllogictest harness + 3-way differential testing vs sqlite3 and PostgreSQL. |
 | `mpedb-bench` | Cross-engine benchmarks. |
@@ -166,27 +166,36 @@ mpedb bench --auto --durability wal     # quick mpedb-only
 
 ## Mirroring & cross-database migration
 
-mpedb doubles as a **neutral staging hub between databases**. Because the sqlite
-and PostgreSQL adapters both map through mpedb's common type model, you can:
+mpedb mirrors a live sqlite or PostgreSQL database into a local `.mpedb`, lets
+you use it while **both sides keep writing**, pulls incremental diffs under
+concurrent source write load, pushes local changes back, and switches which side
+is authoritative — in both directions, repeatably. The protocol is specified in
+[`DESIGN-MIRROR.md`](DESIGN-MIRROR.md) (v1.1, hardened against a 58-finding
+adversarial review).
 
-- **Migrate** `sqlite3 → mpedb → PostgreSQL` (or the reverse) — mpedb is the
-  lingua franca in the middle.
+**What works today, and where:**
+
+| | sqlite | PostgreSQL |
+|---|---|---|
+| import, pull, push, switch, reconcile, conflicts | ✅ library **and** `mpedb mirror` CLI | ✅ library only — **the CLI cannot reach PostgreSQL yet** (it takes `--source <file>`, not a DSN) |
+| export to a **fresh** database (`mpedb → X`) | ✅ `mirror export` / `mirror roundtrip` | ❌ not implemented |
+
 - **Stage & analyse** — pull a PostgreSQL database into a local `.mpedb`, run
   extra queries, add local tables, compute, then push changes back to
-  PostgreSQL **without losing the data PostgreSQL owns**.
+  PostgreSQL **without losing the data PostgreSQL owns**. Works today, from Rust.
 - **See what you lose** — the round-trip diff reports exactly which values cannot
-  round-trip (e.g. a PostgreSQL type that sqlite/mpedb cannot represent
-  losslessly), so a lossy migration is explicit, never silent.
+  survive `sqlite → mpedb → sqlite`, so a lossy mapping is explicit, never silent.
 
-The full protocol — incremental diff-pull under concurrent source write load,
-write-back, and an epoch-fenced authority switch in both directions — is
-specified in [`DESIGN-MIRROR.md`](DESIGN-MIRROR.md) (v1.1, hardened against a
-58-finding adversarial review). The end-to-end pipeline works today for both
-sqlite and PostgreSQL sources: import, incremental pull, write-back push (with
-source-wins write-write conflict detection), epoch-fenced authority switch in
-both directions, anti-entropy reconcile, and operator conflict tooling.
+**Not a cross-database migration hub yet.** `sqlite3 → mpedb → PostgreSQL` is a
+natural fit for the design — both adapters already map through mpedb's common
+type model — but it is **not implemented**: the only export target is sqlite, and
+push writes back to the PostgreSQL a mirror was imported *from*, which is
+mirroring rather than migration. Delivering the claim needs an `export_pg` (or a
+"push this mpedb into an empty PostgreSQL" mode) plus a `--dsn` on the CLI.
 
 ```sh
+# The CLI is sqlite-only today (--source is a FILE, not a DSN); PostgreSQL
+# mirroring is driven from Rust via import_pg + PgAdapter.
 mpedb mirror import    --source app.db --dest app.mpedb   # snapshot + install change capture
 mpedb mirror pull      --source app.db --db app.mpedb     # apply source changes into mpedb
 mpedb mirror push      --source app.db --db app.mpedb     # write local changes back (echo-safe)
