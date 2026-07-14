@@ -1056,6 +1056,25 @@ impl Shm {
         if rc != 0 {
             return Err(io_err("msync"));
         }
+        // macOS: msync(MS_SYNC) hands the pages to the filesystem but does NOT
+        // flush the drive's write cache, so an acked `durability=commit` would
+        // still be sitting in volatile cache — the exact promise the commit class
+        // makes and would be breaking. Follow with the real barrier. (Linux's
+        // msync(MS_SYNC) already goes through vfs_fsync for the range, so it needs
+        // nothing extra; os::fdatasync is a no-op-cheap fdatasync there and this
+        // stays off the Linux hot path via the cfg.)
+        //
+        // Measured on an M3 Pro: without this, single-client durable insert reads
+        // 7,583 ops/s (127 µs) — 26x "faster" than a genuinely durable SQLite,
+        // because it is not durable. With it, mpedb `wal` and SQLite+fullfsync
+        // both land at ~290 ops/s, which is what an Apple SSD platter flush costs.
+        #[cfg(not(target_os = "linux"))]
+        {
+            use std::os::unix::io::AsRawFd;
+            if crate::os::fdatasync(self.file.as_raw_fd()) != 0 {
+                return Err(io_err("F_FULLFSYNC after msync"));
+            }
+        }
         Ok(())
     }
 
