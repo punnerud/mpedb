@@ -203,6 +203,10 @@ fn truthy(v: &PValue) -> bool {
         PValue::Scalar(Value::Text(s)) => !s.is_empty(),
         PValue::Scalar(Value::Blob(b)) => !b.is_empty(),
         PValue::Scalar(Value::Timestamp(_)) => true,
+        // A session-context list (§2.6) is param-only, but a proc can hold one
+        // it was handed. Treat it like every other container here: empty is
+        // falsey.
+        PValue::Scalar(Value::List(v)) => !v.is_empty(),
         PValue::List(v) => !v.is_empty(),
         PValue::Tuple(v) => !v.is_empty(),
         PValue::Cursor { .. } => true,
@@ -221,7 +225,7 @@ fn eq(a: &PValue, b: &PValue) -> bool {
             (Int(i), Float(f)) | (Float(f), Int(i)) => (*i as f64) == *f,
             (x, y) => x == y, // Value::PartialEq is same-variant only
         },
-        (List(x), List(y)) | (Tuple(x), Tuple(y)) => {
+        (PValue::List(x), PValue::List(y)) | (Tuple(x), Tuple(y)) => {
             x.len() == y.len() && x.iter().zip(y.iter()).all(|(a, b)| eq(a, b))
         }
         (Cursor { slot: s1, gen: g1 }, Cursor { slot: s2, gen: g2 }) => {

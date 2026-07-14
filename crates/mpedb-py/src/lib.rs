@@ -139,6 +139,16 @@ fn value_to_py<'py>(py: Python<'py>, v: Value) -> PyResult<Bound<'py, PyAny>> {
                 ))
             })?
             .into_bound_py_any(py),
+        // A context list (§2.6) is param-only, so no query result can contain
+        // one. Render it as a Python list anyway rather than erroring: this is
+        // an output conversion, and the shape maps exactly.
+        Value::List(items) => {
+            let out = pyo3::types::PyList::empty(py);
+            for it in items {
+                out.append(value_to_py(py, it)?)?;
+            }
+            out.into_bound_py_any(py)
+        }
     }
 }
 

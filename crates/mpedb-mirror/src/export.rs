@@ -55,6 +55,10 @@ pub(crate) fn to_sql(v: &Value) -> SqlVal {
         Value::Bool(b) => SqlVal::Integer(*b as i64),
         Value::Text(s) => SqlVal::Text(s.clone()),
         Value::Blob(b) => SqlVal::Blob(b.clone()),
+        // Unreachable: a context list (§2.6) is param-only and cannot be stored,
+        // so nothing read out of a mirrored column can be one. NULL is the least
+        // harmful thing to emit if that ever changes.
+        Value::List(_) => SqlVal::Null,
         // import mapped INTEGER seconds → micros; go back to seconds
         Value::Timestamp(us) => SqlVal::Integer(us.div_euclid(1_000_000)),
     }

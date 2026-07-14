@@ -508,6 +508,10 @@ fn to_pg_text(v: &Value, c: &PgColumn) -> Option<String> {
             "uuid" => uuid_string(b),
             _ => hex(b),
         }),
+        // Unreachable: a context list (§2.6) is param-only and cannot be stored,
+        // so a row read out of mpedb never holds one. Binding NULL is the least
+        // harmful fallback if that ever stops being true.
+        Value::List(_) => None,
     }
 }
 
