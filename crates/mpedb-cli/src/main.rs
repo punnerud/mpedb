@@ -14,6 +14,7 @@ mod collide;
 mod crash;
 mod dump;
 mod mirror;
+mod mirror_collide;
 mod powerloss;
 mod proc_cmd;
 mod render;
@@ -41,6 +42,8 @@ usage: mpedb <command> [args]
   collide --dir <dir> [--writers N] [--total T] [--drop-rate R] [--jitter-us J]
           [--keyspace K] [--detached-pct P] [--durability M]  (writer-collision fuzz)
   powerloss --dir <dir> [--rounds N] [--workers W] [--durability wal|async]
+  mirror-collide --dir <dir> [--writers N] [--secs S] [--kill-ms M] [--keyspace K]
+          (SIGKILL fuzz: source writers + a mirror daemon killed at every instant)
 
 bench --auto accepts --durability none|commit|async|wal (default none); use
   --disk DIR to place the scratch db on real disk (durable modes need it)
@@ -82,10 +85,13 @@ fn dispatch(argv: &[String]) -> CliResult {
         "crash" => crash::run_parent(rest),
         "collide" => collide::run_parent(rest),
         "mirror" => mirror::run(rest),
+        "mirror-collide" => mirror_collide::run_parent(rest),
         "powerloss" => powerloss::run_parent(rest),
         "stress-child" => stress::run_child(rest),
         "crash-child" => crash::run_child(rest),
         "collide-child" => collide::run_child(rest),
+        "mirror-collide-writer" => mirror_collide::run_writer(rest),
+        "mirror-collide-daemon" => mirror_collide::run_daemon(rest),
         "powerloss-child" => powerloss::run_child(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
