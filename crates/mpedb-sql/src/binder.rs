@@ -384,6 +384,19 @@ impl<'a> Binder<'a> {
                 let arms_b: Vec<(BExpr, BExpr)> = bound_conds.into_iter().zip(unified).collect();
                 Ok((self.fold_case(arms_b, else_b)?, ty))
             }
+            ast::Expr::Qualified(qual, name) => {
+                // One table in scope, so the qualifier must be it. Accepting
+                // any qualifier would let `nonsense.id` silently mean `id`, and
+                // when joins arrive that typo becomes a wrong-table read.
+                if !qual.eq_ignore_ascii_case(&self.table.name) {
+                    return Err(bind_err(format!(
+                        "`{qual}.{name}`: no table named `{qual}` in this statement (the table \
+                         is `{}`)",
+                        self.table.name
+                    )));
+                }
+                self.bind_expr(&ast::Expr::Col(name.clone()))
+            }
             ast::Expr::Excluded(name) => {
                 if !self.allow_excluded {
                     return Err(bind_err(

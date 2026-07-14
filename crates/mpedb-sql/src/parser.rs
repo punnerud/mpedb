@@ -10,30 +10,56 @@ use crate::ddl::{CreatePolicySpec, DdlStmt, RlsAction};
 use crate::token::{tokenize, Kw, SpTok, Tok};
 use mpedb_types::{Error, PolicyCmd, Result, Value};
 
-/// Maximum expression nesting depth — a **stack budget**, not a taste.
+/// Parser stack budget, in bytes.
 ///
-/// The grammar is recursive descent, so parser stack use is proportional to
-/// nesting. Without a bound, hostile SQL (or a hostile CHECK source reaching
-/// [`parse_expr_only`] at attach time) overflows the thread stack and aborts the
-/// process — uncatchable — instead of returning an error.
+/// The grammar is recursive descent, so hostile SQL (or a hostile CHECK source
+/// reaching [`parse_expr_only`] at attach time) can overflow the thread stack
+/// and abort the process — uncatchable. Something must stop it.
 ///
-/// The number is MEASURED, because the previous one was not and quietly stopped
-/// being true. It was 128, chosen when the only deep construct was parenthesised
-/// arithmetic. Adding CASE made a level cost ~16-20 KB rather than a few
-/// hundred bytes (each level is ~10 mutually-recursive frames plus case_expr's
-/// arm vector), and 128 levels then needed MORE THAN 2 MiB — the default size of
-/// a Rust thread stack. The guard still returned its tidy error at 128; the
-/// process just aborted before reaching it.
+/// **Measure the stack, do not count the nodes.** This started as a node count
+/// (`MAX_EXPR_DEPTH`), which is a proxy for the thing that actually runs out,
+/// and the proxy broke twice: adding CASE made one level cost ~20 KB instead of
+/// a few hundred bytes, so a count tuned for parenthesised arithmetic silently
+/// stopped fitting the stack, and a count re-tuned for CASE would have punished
+/// cheap constructs for the expensive one's appetite. Measured on this grammar
+/// in a debug build: nested parens cost well under 1 KB per level, nested CASE
+/// about 20 KB.
 ///
-/// Measured on this grammar: nested CASE survives 48 levels in a 1 MiB stack and
-/// overflows at 64. 48 is therefore the budget, verified against HALF a default
-/// thread stack so there is real headroom for whatever called us — and
-/// `max_depth_parsing_fits_in_a_small_stack` fails loudly if a future construct
-/// makes a level fatter.
+/// PostgreSQL solves it this way too (`check_stack_depth()` against
+/// `max_stack_depth`, default 2 MB), and the difference is visible:
 ///
-/// 48 is far beyond any legitimate statement; hand-written SQL does not nest
-/// past single digits.
-const MAX_EXPR_DEPTH: u32 = 48;
+/// | nested parens | nested CASE |
+/// |---|---|
+/// | sqlite3: 93 (errors, does not crash) | sqlite3: **18** |
+/// | PostgreSQL: 500+ | PostgreSQL: bounded by real stack use |
+///
+/// A byte budget gives both: thousands of cheap levels, and a stop long before
+/// an expensive one exhausts the stack — and it re-tunes itself for free when a
+/// release build makes every frame smaller, or when a future construct makes one
+/// fatter.
+///
+/// 1 MiB is half the 2 MiB Rust gives a spawned thread, so there is headroom for
+/// whatever called us. Measured, both builds, because quoting only one would
+/// mislead — a debug build pays for every local, a release build keeps them in
+/// registers and puts CASE's arm vector on the heap:
+///
+/// | nested construct | mpedb (release) | mpedb (debug) | sqlite3 3.45 | PostgreSQL 16 |
+/// |---|---|---|---|---|
+/// | parens | 457 | ~84 | 93 | 500+ |
+/// | CASE | 457 | ~68 | **18** | 500+ |
+///
+/// So: past sqlite on both shapes in the build that ships, still safe in the
+/// build that does not — and, unlike a fixed node count, it re-tunes itself
+/// when frames change instead of quietly becoming a lie.
+const MAX_PARSER_STACK: usize = 1024 * 1024;
+
+/// Hard ceiling on nesting regardless of stack cost.
+///
+/// The byte budget is the real guard; this is a backstop for a pathological
+/// grammar path whose frames are so small that a hostile input could build a
+/// gigantic AST while staying under the budget. Deliberately far above anything
+/// legitimate — and above both ancestors' limits.
+const MAX_EXPR_DEPTH: u32 = 2000;
 
 /// Parse-time item caps. Plan wire counts are serialized as `u16`
 /// ([`crate::plan`]); these caps keep every count far away from the
@@ -122,6 +148,9 @@ struct Parser<'a> {
     max_params: u32,
     /// Current expression nesting depth (see [`MAX_EXPR_DEPTH`]).
     depth: u32,
+    /// Approximate stack address where parsing began; the byte budget is
+    /// measured against it (see [`Self::enter_expr`]).
+    stack_base: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -134,6 +163,10 @@ impl<'a> Parser<'a> {
             next_question: 0,
             max_params: 0,
             depth: 0,
+            stack_base: {
+                let probe = 0u8;
+                &probe as *const u8 as usize
+            },
         }
     }
 
@@ -148,9 +181,21 @@ impl<'a> Parser<'a> {
         })
     }
 
-    /// Enter one level of expression recursion; rejects hostile nesting
-    /// before it can overflow the stack.
+    /// Enter one level of expression recursion, refusing to go deeper than the
+    /// stack can hold.
+    ///
+    /// Reads the approximate stack pointer (the address of a local) and compares
+    /// it to the base captured when parsing began. Stacks grow DOWN on every
+    /// platform mpedb supports (Linux x86-64/ARM, macOS/Apple Silicon), so
+    /// `base - here` is bytes consumed; `saturating_sub` keeps a surprise from
+    /// turning into a panic. This is what PostgreSQL's `check_stack_depth()`
+    /// does, for the same reason.
     fn enter_expr(&mut self) -> Result<()> {
+        let probe = 0u8;
+        let here = &probe as *const u8 as usize;
+        if self.stack_base.saturating_sub(here) > MAX_PARSER_STACK {
+            return Err(self.err_here("expression nested too deeply (parser stack exhausted)"));
+        }
         if self.depth >= MAX_EXPR_DEPTH {
             return Err(self.err_here("expression nested too deeply"));
         }
@@ -981,17 +1026,16 @@ impl<'a> Parser<'a> {
                     let col = self.ident("column name after `excluded.`")?;
                     return Ok(Expr::Excluded(col));
                 }
-                // Any other `x.y` inside an expression. `Dot` is otherwise only
-                // a workspace routing qualifier at statement level, so without
-                // this the error is "unexpected trailing input `Dot`", which
-                // says nothing about the actual mistake.
+                // `<qualifier>.<column>` — both ancestors accept it, so mpedb
+                // does too. There is exactly one table in scope (no joins yet),
+                // so the qualifier is checked against it and then dropped: the
+                // binder resolves a plain column name either way. When joins
+                // arrive the qualifier stops being decoration and this is where
+                // it gets used.
                 if self.peek() == Some(&Tok::Dot) {
-                    return Err(self.err_here(format!(
-                        "table-qualified column names are not supported in expressions: write \
-                         `<column>` instead of `{s}.<column>`. Inside ON CONFLICT ... DO \
-                         UPDATE, a bare column is the EXISTING row and `excluded.<column>` is \
-                         the proposed one"
-                    )));
+                    self.pos += 1;
+                    let col = self.ident("column name after `.`")?;
+                    return Ok(Expr::Qualified(s, col));
                 }
                 Ok(Expr::Col(s))
     }
@@ -1444,50 +1488,87 @@ mod tests {
         assert!(parse_expr_only("(a = 1").is_err());
     }
 
-    /// Turns "128 levels probably fit" into a measured fact.
+    /// The budget must be survivable on the stack it is budgeted against.
     ///
-    /// MAX_EXPR_DEPTH is a STACK BUDGET, not a taste preference: the guard only
-    /// prevents a crash if `MAX_EXPR_DEPTH x per-level frame` fits the thread
-    /// stack. Twice now, adding a construct grew the per-level frame and the
-    /// constant silently stopped being survivable — the guard was still there,
-    /// still returning its error at 128, and the process aborted at 128 anyway.
-    ///
-    /// So: parse AT the limit inside a thread with a deliberately small stack.
-    /// If a future change makes a level fatter, this fails loudly here instead
-    /// of aborting the whole test binary somewhere else.
+    /// MAX_PARSER_STACK is 1 MiB, i.e. half a default 2 MiB thread. Parse right
+    /// up to the guard inside exactly that 2 MiB and require an ERROR rather
+    /// than an abort: if a future construct or a compiler change makes frames
+    /// fatter than the budget assumes, this fails loudly here instead of taking
+    /// out the test binary somewhere unrelated.
     #[test]
-    fn max_depth_parsing_fits_in_a_small_stack() {
-        // HALF the 2 MiB Rust gives a spawned thread by default, so passing
-        // here means real headroom for whatever called us — not "it happened
-        // to fit on this machine, in this build".
-        const STACK: usize = 1024 * 1024;
-        // Parens cost exactly one depth unit per level, so this parses AT the
-        // guard's edge: the stack, not the guard, is what must hold it.
-        let d = MAX_EXPR_DEPTH as usize - 2;
-        let inputs = vec![
-            format!("{}a > 0{}", "(".repeat(d), ")".repeat(d)),
-            format!("{}a", "NOT ".repeat(d)),
-            // The expensive constructs spend MORE than one depth unit per
-            // level (CASE descends for both the condition and the result), so
-            // they hit the guard sooner. Use a depth that is legal for them and
-            // still deep: the point is the stack cost, not the arithmetic.
-            format!("{}1{}", "coalesce(".repeat(d / 3), ", 2)".repeat(d / 3)),
-            format!("{}1{}", "abs(".repeat(d / 3), ")".repeat(d / 3)),
-            format!("{}1{}", "CASE WHEN true THEN ".repeat(d / 3), " END".repeat(d / 3)),
+    fn the_stack_budget_is_survivable_on_a_default_thread() {
+        let inputs: Vec<String> = vec![
+            // Deep enough to blow past the budget on every shape, cheap and
+            // expensive alike.
+            format!("{}a > 0{}", "(".repeat(4000), ")".repeat(4000)),
+            format!("{}a", "NOT ".repeat(4000)),
+            format!("{}1{}", "CASE WHEN true THEN ".repeat(4000), " END".repeat(4000)),
+            format!("{}1{}", "coalesce(".repeat(4000), ", 2)".repeat(4000)),
+            format!("{}1{}", "abs(".repeat(4000), ")".repeat(4000)),
+            format!("a IN ({}1{})", "abs(".repeat(4000), ")".repeat(4000)),
         ];
         let h = std::thread::Builder::new()
-            .stack_size(STACK)
+            .stack_size(2 * 1024 * 1024) // the default a spawned thread gets
             .spawn(move || {
                 for sql in &inputs {
-                    // Must SUCCEED: this is just under the limit, so the guard
-                    // is not what stops it — the stack must actually hold.
-                    parse_expr_only(sql).unwrap_or_else(|e| panic!("{sql:.40}...: {e:?}"));
+                    match parse_expr_only(sql) {
+                        Err(Error::Parse { msg, .. }) if msg.contains("nested too deeply") => {}
+                        other => panic!("expected a depth error, got {other:?}"),
+                    }
                 }
             })
             .unwrap();
-        h.join().expect("parsing at MAX_EXPR_DEPTH overflowed a 512 KiB stack: \
-                         a construct grew the per-level frame — shrink it (move locals into \
-                         an #[inline(never)] helper) or lower MAX_EXPR_DEPTH");
+        h.join().expect(
+            "the parser overflowed a 2 MiB stack before its own 1 MiB budget stopped it: \
+             a frame grew, so MAX_PARSER_STACK no longer leaves room. Shrink the frame \
+             (move locals into an #[inline(never)] helper) or lower the budget.",
+        );
     }
 
+
+    /// What the byte budget actually buys, per construct. Compare against the
+    /// measured ancestors (sqlite3 3.45: 93 nested parens, 18 nested CASE).
+    ///   cargo test -p mpedb-sql --lib limits_probe -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn limits_probe() {
+        type Gen = Box<dyn Fn(usize) -> String>;
+        let mk: Vec<(&str, Gen)> = vec![
+            ("parens", Box::new(|d| format!("{}1{}", "(".repeat(d), ")".repeat(d)))),
+            ("NOT", Box::new(|d| format!("{}a", "NOT ".repeat(d)))),
+            ("CASE", Box::new(|d| format!("{}1{}", "CASE WHEN true THEN ".repeat(d), " END".repeat(d)))),
+            ("coalesce", Box::new(|d| format!("{}1{}", "coalesce(".repeat(d), ", 2)".repeat(d)))),
+        ];
+        for (name, f) in mk {
+            let (mut lo, mut hi) = (1usize, 4000usize);
+            while lo < hi {
+                let m = (lo + hi).div_ceil(2);
+                let sql = f(m);
+                let ok = std::thread::Builder::new()
+                    .stack_size(2 * 1024 * 1024)
+                    .spawn(move || parse_expr_only(&sql).is_ok())
+                    .unwrap()
+                    .join()
+                    .unwrap_or(false);
+                if ok { lo = m } else { hi = m - 1 }
+            }
+            eprintln!("  mpedb max nested {name:>9}: {lo}");
+        }
+    }
+
+    /// Both ancestors accept `<table>.<column>`, so mpedb does. The qualifier
+    /// is CHECKED rather than ignored: with one table in scope it is decoration,
+    /// but silently accepting `nonsense.id` would turn a typo into a
+    /// wrong-table read the day joins exist.
+    #[test]
+    fn table_qualified_columns_parse_and_are_distinct_from_excluded() {
+        let (e, _) = parse_expr_only("orders.tenant").unwrap();
+        assert_eq!(e, Expr::Qualified("orders".into(), "tenant".into()));
+        // `excluded` is its own thing, not a table qualifier.
+        let (e, _) = parse_expr_only("excluded.tenant").unwrap();
+        assert_eq!(e, Expr::Excluded("tenant".into()));
+        // A quoted qualifier is still a qualifier; a quoted `excluded` is a column.
+        let (e, _) = parse_expr_only("\"excluded\"").unwrap();
+        assert_eq!(e, Expr::Col("excluded".into()));
+    }
 }
