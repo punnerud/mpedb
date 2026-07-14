@@ -21,6 +21,96 @@ pub const KEY_HW: &[u8] = b"hw";
 // ---- keyed families ----
 const KEY_MAP_PREFIX: &[u8] = b"map/";
 const KEY_IMP_PREFIX: &[u8] = b"imp/";
+const KEY_PARK_PREFIX: &[u8] = b"park/";
+const KEY_SKIP_PREFIX: &[u8] = b"skip/";
+
+/// `park/<table_id BE4><xxh3_128(pk keycode) BE16>` — a parked conflict, keyed
+/// by PK (idempotent: a PK re-conflicting updates its record). Scan the whole
+/// family over `[park/, park0)`.
+pub fn park_key(table_id: u32, pk_keycode: &[u8]) -> Vec<u8> {
+    keyed(KEY_PARK_PREFIX, table_id, pk_keycode)
+}
+pub const KEY_PARK_END: &[u8] = b"park0"; // '0' = byte after '/'
+
+/// `skip/<table_id BE4><xxh3_128(pk keycode)>` — a manual-policy apply-skip
+/// marker: while present, the pull applier leaves this PK at its local value.
+pub fn skip_key(table_id: u32, pk_keycode: &[u8]) -> Vec<u8> {
+    keyed(KEY_SKIP_PREFIX, table_id, pk_keycode)
+}
+
+fn keyed(prefix: &[u8], table_id: u32, pk_keycode: &[u8]) -> Vec<u8> {
+    let hash = xxhash_rust::xxh3::xxh3_128(pk_keycode);
+    let mut k = Vec::with_capacity(prefix.len() + 4 + 16);
+    k.extend_from_slice(prefix);
+    k.extend_from_slice(&table_id.to_be_bytes());
+    k.extend_from_slice(&hash.to_be_bytes());
+    k
+}
+
+/// Why a row was parked (DESIGN-MIRROR §8 conflict taxonomy).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConflictKind {
+    /// A non-PK unique value is already held by a row outside the batch.
+    UniqueBlocked = 1,
+    /// A stricter mpedb CHECK / NOT NULL / type rule rejected the row.
+    Validation = 2,
+    /// A source value could not be mapped to mpedb (quarantine).
+    TypeViolation = 3,
+    /// The source rejected a pushed row.
+    PushRejected = 4,
+    /// Both sides changed the same PK since the last sync (divergence).
+    Divergence = 5,
+}
+
+impl ConflictKind {
+    fn from_tag(t: u8) -> Result<ConflictKind> {
+        Ok(match t {
+            1 => ConflictKind::UniqueBlocked,
+            2 => ConflictKind::Validation,
+            3 => ConflictKind::TypeViolation,
+            4 => ConflictKind::PushRejected,
+            5 => ConflictKind::Divergence,
+            other => return Err(Error::Corrupt(format!("bad conflict kind {other}"))),
+        })
+    }
+}
+
+/// A parked-conflict record. PK-only for v1 (row images can be re-read); the
+/// operator sees which PK conflicted, why, and when.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParkRecord {
+    pub kind: ConflictKind,
+    pub wall_us: i64,
+    pub table_id: u32,
+    pub pk_keycode: Vec<u8>,
+}
+
+impl ParkRecord {
+    /// Layout: kind u8 ‖ wall_us i64 BE ‖ table_id u32 BE ‖ pk keycode.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(1 + 8 + 4 + self.pk_keycode.len());
+        v.push(self.kind as u8);
+        v.extend_from_slice(&self.wall_us.to_be_bytes());
+        v.extend_from_slice(&self.table_id.to_be_bytes());
+        v.extend_from_slice(&self.pk_keycode);
+        v
+    }
+    pub fn decode(bytes: &[u8]) -> Result<ParkRecord> {
+        if bytes.len() < 13 {
+            return Err(Error::Corrupt(format!(
+                "park record is {} bytes (need >= 13)",
+                bytes.len()
+            )));
+        }
+        Ok(ParkRecord {
+            kind: ConflictKind::from_tag(bytes[0])?,
+            wall_us: i64::from_be_bytes(bytes[1..9].try_into().unwrap()),
+            table_id: u32::from_be_bytes(bytes[9..13].try_into().unwrap()),
+            pk_keycode: bytes[13..].to_vec(),
+        })
+    }
+}
 
 /// `map/<table_id BE4>` — per-table source mapping (added in M2.2).
 pub fn map_key(table_id: u32) -> Vec<u8> {
@@ -280,6 +370,31 @@ mod tests {
         let mut bad = e.encode();
         bad[10] = 2; // frozen must be 0/1
         assert!(Epoch::decode(&bad).is_err());
+    }
+
+    #[test]
+    fn park_record_and_keys() {
+        let p = ParkRecord {
+            kind: ConflictKind::UniqueBlocked,
+            wall_us: -7,
+            table_id: 3,
+            pk_keycode: vec![9, 8, 0, 255],
+        };
+        assert_eq!(ParkRecord::decode(&p.encode()).unwrap(), p);
+        let bytes = p.encode();
+        for n in 0..13 {
+            assert!(ParkRecord::decode(&bytes[..n]).is_err(), "len {n}");
+        }
+        let mut bad = bytes.clone();
+        bad[0] = 9;
+        assert!(ParkRecord::decode(&bad).is_err());
+        // keys are fixed-size, family-scannable, PK-idempotent
+        let k = park_key(3, b"A");
+        assert_eq!(k.len(), KEY_PARK_PREFIX.len() + 4 + 16);
+        assert_eq!(park_key(3, b"A"), park_key(3, b"A"));
+        assert_ne!(park_key(3, b"A"), park_key(3, b"B"));
+        assert_ne!(park_key(3, b"A"), skip_key(3, b"A"));
+        assert!(KEY_PARK_END > &k[..KEY_PARK_END.len()]);
     }
 
     #[test]
