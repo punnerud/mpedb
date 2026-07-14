@@ -29,8 +29,14 @@ impl ThrowawayPg {
     pub fn start() -> ThrowawayPg {
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        // short paths (unix socket has a 107-byte limit)
-        let base = std::env::temp_dir().join(format!("mpgm-{pid}-{n}"));
+        // /dev/shm: roomy tmpfs and a short path (the unix socket has a 107-byte
+        // limit), and it keeps the ~40 MB datadirs off the small root fs.
+        let shm = std::path::Path::new("/dev/shm");
+        let base = if shm.is_dir() {
+            shm.join(format!("mpgm-{pid}-{n}"))
+        } else {
+            std::env::temp_dir().join(format!("mpgm-{pid}-{n}"))
+        };
         let datadir = base.join("d");
         let sockdir = base.join("s");
         // TCP is disabled; the port only names the socket file, so a fixed value
