@@ -131,4 +131,8 @@ pub(crate) enum Expr {
     Coalesce(Vec<Expr>),
     /// `excluded.<col>` — the proposed row inside `ON CONFLICT DO UPDATE`.
     Excluded(String),
+    /// `<table>.<col>` — a table-qualified column reference. Kept distinct from
+    /// [`Expr::Col`] so the binder can check the qualifier actually names the
+    /// table in scope, rather than silently accepting `nonsense.id`.
+    Qualified(String, String),
 }
