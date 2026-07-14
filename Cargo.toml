@@ -38,3 +38,8 @@ codegen-units = 1
 
 [profile.bench]
 inherits = "release"
+
+[profile.dev]
+# Panic/crash backtraces keep full file:line; only debugger *variable* inspection
+# is dropped. For a gdb session that needs locals: CARGO_PROFILE_DEV_DEBUG=full.
+debug = "line-tables-only"
