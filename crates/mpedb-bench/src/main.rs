@@ -120,19 +120,31 @@ fn main() {
         .windows(2)
         .find(|w| w[0] == "--only")
         .map(|w| w[1].clone());
+    // The RAM-backed medium for none-class cells. Linux has /dev/shm; macOS has
+    // no tmpfs, so a run there must point this at a RAM disk (see README) —
+    // otherwise "none-class" would silently measure a page-cached APFS file and
+    // would not be comparable to a Linux run.
+    let tmpfs_arg: Option<String> = args
+        .windows(2)
+        .find(|w| w[0] == "--tmpfs")
+        .map(|w| w[1].clone());
     for (i, a) in args.iter().enumerate() {
         let known = a == "--quick"
             || a == "--only"
-            || (i > 0 && args[i - 1] == "--only");
+            || a == "--tmpfs"
+            || (i > 0 && (args[i - 1] == "--only" || args[i - 1] == "--tmpfs"));
         if !known {
-            eprintln!("usage: mpedb-bench [--quick] [--only mpedb|sqlite|postgres]");
+            eprintln!(
+                "usage: mpedb-bench [--quick] [--only mpedb|sqlite|postgres] [--tmpfs DIR]"
+            );
             std::process::exit(2);
         }
     }
     let cfg = if quick { RunCfg::quick() } else { RunCfg::full() };
 
     let pid = std::process::id();
-    let tmpfs_base = PathBuf::from(format!("/dev/shm/mpedb-bench-{pid}"));
+    let tmpfs_root = tmpfs_arg.unwrap_or_else(|| "/dev/shm".to_string());
+    let tmpfs_base = PathBuf::from(format!("{tmpfs_root}/mpedb-bench-{pid}"));
     let disk_base = disk_scratch(pid);
     for d in [&tmpfs_base, &disk_base] {
         if let Err(e) = std::fs::create_dir_all(d) {
@@ -144,7 +156,17 @@ fn main() {
 
     let tmpfs_ty = fs_type(&tmpfs_base);
     let disk_ty = fs_type(&disk_base);
-    if tmpfs_ty != "tmpfs" {
+    if tmpfs_ty == "?" {
+        // No /proc/mounts (macOS): we cannot verify the medium. Say so rather
+        // than claim "expected tmpfs" — a silently page-cached file would make
+        // none-class numbers incomparable to a Linux run.
+        eprintln!(
+            "NOTE: cannot verify the filesystem of {} on this platform — ensure it is \
+             RAM-backed (macOS: `--tmpfs /Volumes/<ramdisk>`), or none-class numbers are \
+             not comparable to a tmpfs run.",
+            tmpfs_base.display()
+        );
+    } else if tmpfs_ty != "tmpfs" {
         eprintln!("WARNING: {} is {tmpfs_ty}, expected tmpfs", tmpfs_base.display());
     }
     if disk_ty == "tmpfs" {
