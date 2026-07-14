@@ -395,6 +395,70 @@ impl SourceAdapter for SqliteAdapter {
         tx.commit().map_err(sqlerr)?;
         Ok(())
     }
+
+    fn ensure_source_state(&mut self, mirror_id: &str, epoch: u64, authority: &str) -> Result<()> {
+        self.conn
+            .execute_batch(
+                "CREATE TABLE IF NOT EXISTS _mpedb_mirror_state (\
+                     mirror_id TEXT PRIMARY KEY, epoch INTEGER NOT NULL, authority TEXT NOT NULL)",
+            )
+            .map_err(sqlerr)?;
+        self.conn
+            .execute(
+                "INSERT OR IGNORE INTO _mpedb_mirror_state(mirror_id, epoch, authority) \
+                 VALUES (?1, ?2, ?3)",
+                rusqlite::params![mirror_id, epoch as i64, authority],
+            )
+            .map_err(sqlerr)?;
+        Ok(())
+    }
+
+    fn read_source_state(&mut self, mirror_id: &str) -> Result<Option<(u64, String)>> {
+        let r = self.conn.query_row(
+            "SELECT epoch, authority FROM _mpedb_mirror_state WHERE mirror_id=?1",
+            [mirror_id],
+            |r| Ok((r.get::<_, i64>(0)? as u64, r.get::<_, String>(1)?)),
+        );
+        match r {
+            Ok(v) => Ok(Some(v)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(sqlerr(e)),
+        }
+    }
+
+    fn cas_source_state(
+        &mut self,
+        mirror_id: &str,
+        expected_epoch: u64,
+        new_epoch: u64,
+        new_authority: &str,
+    ) -> Result<Option<Cursor>> {
+        // per-table log heads captured in the same txn = the re-seed baseline
+        let table_metas: Vec<(u32, String)> =
+            self.tables.iter().map(|t| (t.table_id, t.src.name.clone())).collect();
+        let tx = self.conn.transaction().map_err(sqlerr)?;
+        let n = tx
+            .execute(
+                "UPDATE _mpedb_mirror_state SET epoch=?1, authority=?2 \
+                 WHERE mirror_id=?3 AND epoch=?4",
+                rusqlite::params![new_epoch as i64, new_authority, mirror_id, expected_epoch as i64],
+            )
+            .map_err(sqlerr)?;
+        if n == 0 {
+            let _ = tx.rollback();
+            return Ok(None); // fenced
+        }
+        let mut head = SqliteCursor::default();
+        for (tid, name) in &table_metas {
+            let log = log_table(name);
+            let mx: i64 = tx
+                .query_row(&format!("SELECT COALESCE(MAX(seq),0) FROM {}", q(&log)), [], |r| r.get(0))
+                .map_err(sqlerr)?;
+            head.set(*tid, mx as u64);
+        }
+        tx.commit().map_err(sqlerr)?;
+        Ok(Some(head.encode()))
+    }
 }
 
 /// `INSERT … ON CONFLICT(pk) DO UPDATE …` — never `INSERT OR REPLACE` (which
@@ -511,6 +575,27 @@ mod tests {
         let b2 = a.pull(&b1.end_cursor, 100).unwrap().unwrap();
         assert_eq!(b2.ops.len(), 1);
         assert_eq!(pk(&b2.ops[0]), 2); // only the new row, not id=1 again
+    }
+
+    #[test]
+    fn source_state_cas_fences_stale_epochs() {
+        let mut a = setup();
+        let mid = "abc123";
+        a.ensure_source_state(mid, 1, "source").unwrap();
+        // idempotent: a second ensure does not overwrite
+        a.ensure_source_state(mid, 9, "mpedb").unwrap();
+        assert_eq!(a.read_source_state(mid).unwrap(), Some((1, "source".into())));
+
+        // CAS from the wrong epoch is fenced (returns None, no change)
+        assert!(a.cas_source_state(mid, 5, 6, "mpedb").unwrap().is_none());
+        assert_eq!(a.read_source_state(mid).unwrap(), Some((1, "source".into())));
+
+        // CAS from the right epoch applies and returns the log-head baseline
+        let head = a.cas_source_state(mid, 1, 2, "mpedb").unwrap();
+        assert!(head.is_some());
+        assert_eq!(a.read_source_state(mid).unwrap(), Some((2, "mpedb".into())));
+        // the same CAS again is now fenced (epoch already moved)
+        assert!(a.cas_source_state(mid, 1, 2, "mpedb").unwrap().is_none());
     }
 
     #[test]
