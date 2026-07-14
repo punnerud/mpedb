@@ -3,6 +3,7 @@
 //! (M4.1) turns a live PostgreSQL `public` schema into an mpedb [`Schema`] plus
 //! per-table source metadata; rows/pull come in later stages.
 
+use crate::state::MapPolicy;
 use mpedb_types::{ColumnDef, ColumnType, Error, Result, Schema, TableDef};
 use postgres::Client;
 
@@ -14,8 +15,13 @@ fn pgerr(context: &str, e: postgres::Error) -> Error {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PgColumn {
     pub name: String,
-    /// The base type name (`int8`, `text`, `timestamptz`, `numeric`, …).
+    /// The BASE type name (`int8`, `text`, `timestamptz`, `numeric`, …) — what
+    /// the mpedb mapping and the [`MapPolicy`] verdict key off.
     pub pg_type: String,
+    /// The DECLARED type with typmod (`numeric(10,2)`, `varchar(64)`) — what an
+    /// export must recreate. Distinct from `pg_type` on purpose: recording only
+    /// the base type silently widens every constrained column on the way home.
+    pub declared_type: String,
     pub not_null: bool,
     /// GENERATED column: mirror its value, never write it back.
     pub generated: bool,
@@ -59,6 +65,38 @@ pub fn map_pg_type(typname: &str) -> Option<ColumnType> {
     })
 }
 
+/// How faithfully `map_pg_type` carried this PG type into mpedb — recorded per
+/// column so a later export/pre-flight can tell "can go home" from "already
+/// lost" (DESIGN-MIRROR §2, [`MapPolicy`]).
+///
+/// This lives beside `map_pg_type` on purpose: the two must not drift. A type
+/// added there without a verdict here would silently record `Exact`.
+pub fn pg_map_policy(typname: &str, mapped: ColumnType) -> MapPolicy {
+    match typname {
+        // same width, same semantics, both directions
+        "int8" | "float8" | "bool" | "text" | "bytea" | "timestamptz" | "timestamp" => {
+            MapPolicy::Exact
+        }
+        // mpedb's type is WIDER than the source column: import was lossless, but
+        // a LOCAL write can now exceed what the source accepts. This is the
+        // class that fails at the target's INSERT — `int4` holding 2147483648
+        // is exactly the error the PG fidelity work hit — so the pre-flight
+        // keys off it.
+        "int2" | "int4" | "float4" | "varchar" | "bpchar" | "citext" | "name" | "date" | "time" => {
+            MapPolicy::Widened
+        }
+        // preserved through a canonical text/byte form
+        "numeric" | "json" | "jsonb" => MapPolicy::ViaText,
+        "uuid" => MapPolicy::ViaText,
+        // Unknown types are rejected by map_pg_type before we get here; if that
+        // ever changes, do not claim fidelity we have not reasoned about.
+        _ => {
+            let _ = mapped;
+            MapPolicy::LossyAtImport
+        }
+    }
+}
+
 /// Introspect the `public` schema, restricted to the given scope.
 pub fn introspect(
     client: &mut Client,
@@ -100,11 +138,19 @@ fn introspect_table(
     name: String,
     replica_identity: char,
 ) -> Result<PgTable> {
-    // columns (attnum order), with base type name and generated/identity flags
+    // Columns in attnum order. TWO type strings, and both are needed:
+    //   typname            — the BASE type ("numeric", "varchar"), which drives
+    //                        the mpedb mapping and the policy verdict;
+    //   format_type(...)   — the DECLARED type WITH typmod ("numeric(10,2)",
+    //                        "varchar(64)"), which is what an export has to
+    //                        recreate. Recording only the base type would
+    //                        silently widen every constrained column on the way
+    //                        home — a schema that looks right and is not.
     let col_rows = client
         .query(
             "SELECT a.attname, t.typname, a.attnotnull, \
-                    a.attidentity::text, a.attgenerated::text \
+                    a.attidentity::text, a.attgenerated::text, \
+                    format_type(a.atttypid, a.atttypmod) \
              FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
              WHERE a.attrelid = $1 AND a.attnum > 0 AND NOT a.attisdropped \
              ORDER BY a.attnum",
@@ -150,12 +196,14 @@ fn introspect_table(
         let not_null: bool = row.get(2);
         let attidentity: String = row.get(3);
         let attgenerated: String = row.get(4);
+        let declared_type: String = row.get(5);
         let is_pk = pk_names.iter().any(|p| p == &cname);
         columns.push(PgColumn {
             mapped: map_pg_type(&typname),
             unique: !is_pk && unique_names.iter().any(|u| u == &cname),
             name: cname,
             pg_type: typname,
+            declared_type,
             not_null,
             generated: !attgenerated.is_empty(),
             identity: !attidentity.is_empty(),

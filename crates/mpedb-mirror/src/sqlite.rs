@@ -5,6 +5,7 @@
 //! the per-table source metadata the importer/adapter needs. It does not read
 //! rows yet (that is import, M2.3).
 
+use crate::state::MapPolicy;
 use mpedb_types::{ColumnDef, ColumnType, Error, Result, Schema, TableDef};
 use rusqlite::Connection;
 
@@ -63,6 +64,46 @@ pub fn map_sqlite_type(declared: &str) -> ColumnType {
         return ColumnType::Float64;
     }
     ColumnType::Float64 // NUMERIC affinity
+}
+
+/// How faithfully `map_sqlite_type` carried this declared type into mpedb
+/// (DESIGN-MIRROR §2, [`MapPolicy`]). Kept beside the mapping so the two cannot
+/// drift.
+///
+/// sqlite makes this weaker than the PG twin on purpose, and the record should
+/// say so rather than flatter us: a declared type in sqlite is an *affinity*,
+/// not a constraint — any row may hold any type — so "Exact" here means "the
+/// declared type maps cleanly", NOT "every value obeys it". Per-row drift is
+/// precisely what the pre-flight has to find; the schema only says what SHOULD
+/// be there.
+pub fn sqlite_map_policy(declared: &str) -> MapPolicy {
+    let up = declared.to_ascii_uppercase();
+    if up.contains("BOOL") {
+        // sqlite has no bool: values are 0/1 by convention and nothing enforces
+        // it. Round-trips as INTEGER, but a stray 'yes' is a per-row problem.
+        return MapPolicy::Exact;
+    }
+    if up.contains("DATE") || up.contains("TIME") {
+        // the storage convention (seconds vs millis vs ISO text) is a CONFIG
+        // guess, not a fact — if it was wrong, every value is already wrong.
+        return MapPolicy::ViaText;
+    }
+    if up.contains("INT") {
+        return MapPolicy::Exact; // sqlite ints are exactly i64
+    }
+    if up.contains("CHAR") || up.contains("CLOB") || up.contains("TEXT") {
+        return MapPolicy::Exact;
+    }
+    if up.is_empty() || up.contains("BLOB") {
+        return MapPolicy::Exact;
+    }
+    if up.contains("REAL") || up.contains("FLOA") || up.contains("DOUB") {
+        return MapPolicy::Exact;
+    }
+    // NUMERIC affinity → Float64: an integer beyond 2^53 has ALREADY lost
+    // precision by the time it reaches mpedb. The column is recoverable; the
+    // digits are not.
+    MapPolicy::LossyAtImport
 }
 
 /// Introspect the `main` schema, restricted to the given scope. `include`
