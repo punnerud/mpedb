@@ -27,7 +27,7 @@ pub mod switch;
 #[cfg(test)]
 mod pg_harness;
 
-pub use reconcile::{check_source_not_restored, reconcile, ReconcileStats};
+pub use reconcile::{check_source_not_restored, reconcile, verify, ReconcileStats};
 pub use sqlite_adapter::SqliteAdapter;
 
 pub use adapter::{Cursor, NetOp, NetOpKind, PullBatch, SourceAdapter};

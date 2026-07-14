@@ -89,6 +89,13 @@ pub fn import_pg(
     let schema = pg::build_schema(&src_tables)?;
     let db = create_mirror_db(dest, schema.clone(), opts.size_bytes, opts.durability)?;
 
+    // install the changelog + triggers BEFORE the snapshot (§4.3 step 0) so a
+    // write concurrent with or after the import is captured
+    crate::pg_track::install_changelog(client)?;
+    for src_t in &src_tables {
+        crate::pg_track::install_triggers(client, src_t)?;
+    }
+
     // one consistent snapshot for the whole import
     let mut tx = client
         .build_transaction()

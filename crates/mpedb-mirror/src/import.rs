@@ -93,7 +93,14 @@ pub fn import_sqlite(
     // 2. create the mpedb file (secure-by-default perms)
     let db = create_mirror_db(dest_path, schema.clone(), opts.size_bytes, opts.durability)?;
 
-    // 3. read rows from ONE sqlite snapshot (deferred txn pins at first read)
+    // 3. install tracked-mode changelog + triggers BEFORE the snapshot read
+    //    (§4.2 step 1) so any source write concurrent with — or after — the
+    //    import is captured (seq > the import watermark).
+    for src_t in &src_tables {
+        crate::sqlite_track::install_triggers(src, src_t)?;
+    }
+
+    // 4. read rows from ONE sqlite snapshot (deferred txn pins at first read)
     let tx = src
         .transaction()
         .map_err(|e| Error::Config(format!("sqlite snapshot: {e}")))?;
