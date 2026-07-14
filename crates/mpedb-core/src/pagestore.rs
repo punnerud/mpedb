@@ -22,6 +22,25 @@ pub trait PageStore {
     fn page_mut(&mut self, id: u64) -> Result<&mut [u8]>;
     /// Allocate a zeroed page, marked dirty. Never returns 0.
     fn alloc(&mut self) -> Result<u64>;
+
+    /// Allocate a page **without zeroing it**, marked dirty. Never returns 0.
+    ///
+    /// For a caller that is about to define every byte it cares about anyway,
+    /// [`alloc`](Self::alloc)'s full-page `fill(0)` is redundant work: a 4 KiB
+    /// memset per page, on the hot path of every blob write. `write_overflow`
+    /// overwrites the header and payload immediately and then zeroes only its
+    /// own tail, producing **byte-identical pages** for strictly less work.
+    ///
+    /// The default forwards to `alloc`, so an implementation that has no cheap
+    /// un-zeroed path stays correct by doing the safe thing.
+    ///
+    /// # Contract
+    /// The caller MUST leave no byte undefined that anything can observe.
+    /// Skipping the memset means the page arrives holding whatever the last
+    /// tenant left there.
+    fn alloc_raw(&mut self) -> Result<u64> {
+        self.alloc()
+    }
     fn free(&mut self, id: u64) -> Result<()>;
     fn is_dirty(&self, id: u64) -> bool;
 }
