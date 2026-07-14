@@ -61,8 +61,8 @@ primary_key = ["id"]
 pub fn run_parent(argv: &[String]) -> CliResult {
     let p = args::parse(
         argv,
-        &["dir", "waves", "children", "durability", "concurrency"],
-        &["size_mb"],
+        &["dir", "waves", "children", "durability", "concurrency", "size_mb"],
+        &[],
     )?;
     let dir = PathBuf::from(p.require("dir")?);
     let waves = p.require_u64("waves")?;
