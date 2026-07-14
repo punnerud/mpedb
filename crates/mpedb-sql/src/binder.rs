@@ -27,6 +27,9 @@ pub(crate) enum BExpr {
     InParam(Box<BExpr>, u16),
     /// `LHS IN (e1, …, en)` — a general value list (task #21).
     InList(Box<BExpr>, Vec<BExpr>),
+    /// `CASE WHEN c THEN r … ELSE e END`. `else_` is None for a missing ELSE
+    /// (SQL: NULL).
+    Case(Vec<(BExpr, BExpr)>, Option<Box<BExpr>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -293,12 +296,47 @@ impl<'a> Binder<'a> {
                 // probe would be coerced to Float64 by element 2 while element 1
                 // stayed Int64, and the rigid comparison would then fail at
                 // runtime on a query the binder had already accepted.
-                let mut all = self.unify_many(all, "compare with IN list")?;
+                let (mut all, _) = self.unify_many(all, "compare with IN list")?;
                 let l = all.remove(0);
                 Ok((
                     maybe_not(BExpr::InList(Box::new(l), all), *negated),
                     Some(ColumnType::Bool),
                 ))
+            }
+            ast::Expr::Case(arms, else_) => {
+                let mut bound_conds = Vec::with_capacity(arms.len());
+                let mut results = Vec::with_capacity(arms.len() + 1);
+                for (c, r) in arms {
+                    let (bc, ct) = self.bind_expr(c)?;
+                    // A WHEN must be a predicate. mpedb is rigidly typed, so
+                    // `CASE WHEN 1 THEN …` is an error here rather than sqlite's
+                    // truthiness coercion — the same trade the whole engine makes.
+                    match ct {
+                        Some(ColumnType::Bool) | None => {}
+                        Some(t) => {
+                            return Err(bind_err(format!(
+                                "CASE WHEN must be a bool condition, got {t}"
+                            )))
+                        }
+                    }
+                    bound_conds.push(bc);
+                    results.push(self.bind_expr(r)?);
+                }
+                if let Some(e) = else_ {
+                    results.push(self.bind_expr(e)?);
+                } else {
+                    // A missing ELSE is NULL, and it is a RESULT: it has to take
+                    // part in unification, or `CASE WHEN c THEN 1 END` would
+                    // claim type Int64 while returning NULL on the else path.
+                    results.push((BExpr::Const(Value::Null), None));
+                }
+                // Every arm must produce one type — a CASE has a single type,
+                // and this is where a mixed `THEN 1 … THEN 'x'` is caught at
+                // COMPILE time instead of returning whichever type the row hit.
+                let (mut unified, ty) = self.unify_many(results, "mix CASE result types")?;
+                let else_b = unified.pop().expect("pushed above");
+                let arms_b: Vec<(BExpr, BExpr)> = bound_conds.into_iter().zip(unified).collect();
+                Ok((BExpr::Case(arms_b, Some(Box::new(else_b))), ty))
             }
             ast::Expr::Binary(op, l, r) => self.bind_binary(*op, l, r),
         }
@@ -382,7 +420,7 @@ impl<'a> Binder<'a> {
     /// [`Self::unify_operands`] (bare params adopt, Int64 -> Float64 is the only
     /// coercion, anything else cross-type is an error) but applied across the
     /// whole set, so no operand is left behind at a type the others moved off.
-    fn unify_many(&mut self, operands: Vec<(BExpr, Ty)>, verb: &str) -> Result<Vec<BExpr>> {
+    fn unify_many(&mut self, operands: Vec<(BExpr, Ty)>, verb: &str) -> Result<(Vec<BExpr>, Ty)> {
         // Target type = the one every non-param operand agrees on, widened to
         // Float64 if ints and floats are mixed.
         let mut target: Ty = None;
@@ -399,7 +437,7 @@ impl<'a> Binder<'a> {
         let Some(target) = target else {
             // Nothing pinned the type (all NULLs / bare params). Leave them be;
             // resolve_params reports an unresolved param.
-            return Ok(operands.into_iter().map(|(e, _)| e).collect());
+            return Ok((operands.into_iter().map(|(e, _)| e).collect(), None));
         };
         let mut out = Vec::with_capacity(operands.len());
         for (e, t) in operands {
@@ -411,7 +449,7 @@ impl<'a> Binder<'a> {
                 _ => e,
             });
         }
-        Ok(out)
+        Ok((out, Some(target)))
     }
 
     /// If `e` is a bare parameter with no inferred type yet, pin it to `ty`.
@@ -453,6 +491,9 @@ pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
         BExpr::Like(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         // Never foldable: the list is a session value, not a literal.
         BExpr::InParam(..) => false,
+        // A CASE is branching control flow, not a value-in/value-out node; the
+        // fold path evaluates whole programs and has no business here.
+        BExpr::Case(..) => false,
         // Foldable in principle (`2 IN (1,2)` is TRUE), but deliberately not:
         // the fold path evaluates via ExprProgram over a const-only program, and
         // an all-const IN list is not worth a special case. It stays a runtime
@@ -523,6 +564,33 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
             emit(a, instrs, consts)?;
             instrs.push(Instr::InParam(*idx));
         }
+        BExpr::Case(arms, else_) => {
+            // WHEN c JumpIfNotTrue next; THEN r; Jump end; … ELSE e; end:
+            // Targets are patched afterwards because they are forward — which
+            // is also exactly what the verifier requires.
+            let mut jumps_to_end = Vec::new();
+            for (c, r) in arms {
+                emit(c, instrs, consts)?;
+                let jnt = instrs.len();
+                instrs.push(Instr::JumpIfNotTrue(0)); // patched below
+                emit(r, instrs, consts)?;
+                jumps_to_end.push(instrs.len());
+                instrs.push(Instr::Jump(0)); // patched below
+                let next_arm = instrs.len();
+                patch(instrs, jnt, next_arm)?;
+            }
+            match else_ {
+                Some(e) => emit(e, instrs, consts)?,
+                None => {
+                    let idx = push_const(consts, Value::Null)?;
+                    instrs.push(Instr::PushConst(idx));
+                }
+            }
+            let end = instrs.len();
+            for j in jumps_to_end {
+                patch(instrs, j, end)?;
+            }
+        }
         BExpr::InList(a, items) => {
             // Probe first, then the elements on top of it: InList(n) pops n
             // elements and finds the probe beneath them.
@@ -532,6 +600,22 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
             }
             instrs.push(Instr::InList(items.len() as u16));
         }
+    }
+    Ok(())
+}
+
+/// Fill in a forward jump target once it is known.
+///
+/// The index is a u16 in the IR, so a program with more than 65535 instructions
+/// cannot express its own jumps. Caught here rather than silently truncating
+/// into a target that points somewhere plausible and wrong.
+fn patch(instrs: &mut [Instr], at: usize, target: usize) -> Result<()> {
+    let t = u16::try_from(target).map_err(|_| {
+        Error::Internal("expression is too large to compile (more than 65535 instructions)".into())
+    })?;
+    match &mut instrs[at] {
+        Instr::JumpIfNotTrue(x) | Instr::Jump(x) => *x = t,
+        other => return Err(Error::Internal(format!("patch target is not a jump: {other:?}"))),
     }
     Ok(())
 }
