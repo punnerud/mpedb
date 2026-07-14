@@ -26,7 +26,70 @@ use postgres::{Client, NoTls, Statement};
 use crate::engines::{age_for, email_for, Conn, Engine};
 use crate::util::{err, BResult};
 
-const BIN: &str = "/usr/lib/postgresql/16/bin";
+/// Locate the PostgreSQL server binaries (`initdb`/`pg_ctl`).
+///
+/// This was a hardcoded `/usr/lib/postgresql/16/bin` — Debian's layout. The
+/// cost of that showed up the moment a second platform existed: PostgreSQL was
+/// installed on the M3 Mac and the harness still reported it "not found",
+/// because Homebrew puts it under /opt/homebrew. The cells failed honestly, so
+/// nothing was ever WRONG — the engine was simply, silently, unmeasurable on
+/// that machine, which is worse than it sounds when the whole point is a
+/// three-engine comparison.
+///
+/// Order: `MPEDB_PG_BIN` (an explicit answer always wins), then the usual
+/// install roots, then `$PATH`. Returns the directory, not the binary.
+fn pg_bin() -> String {
+    // Resolved once; "" means "not found", which the callers surface as an
+    // honest engine-unavailable rather than a panic.
+    static DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        pg_bin_dir()
+            .map(|d| d.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    })
+    .clone()
+}
+
+fn pg_bin_dir() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if let Ok(p) = std::env::var("MPEDB_PG_BIN") {
+        let p = PathBuf::from(p);
+        if p.join("initdb").is_file() {
+            return Some(p);
+        }
+    }
+    let mut cands: Vec<PathBuf> = Vec::new();
+    // Debian/Ubuntu keep versioned trees off $PATH; newest first.
+    for v in ["18", "17", "16", "15", "14"] {
+        cands.push(PathBuf::from(format!("/usr/lib/postgresql/{v}/bin")));
+        // Homebrew: Apple Silicon, then Intel.
+        cands.push(PathBuf::from(format!("/opt/homebrew/opt/postgresql@{v}/bin")));
+        cands.push(PathBuf::from(format!("/usr/local/opt/postgresql@{v}/bin")));
+    }
+    cands.push(PathBuf::from("/usr/bin"));
+    cands.push(PathBuf::from("/usr/local/bin"));
+    cands.push(PathBuf::from("/opt/homebrew/bin"));
+    for c in cands {
+        if c.join("initdb").is_file() {
+            return Some(c);
+        }
+    }
+    // Last resort: whatever $PATH says.
+    std::process::Command::new("initdb")
+        .arg("--version")
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|_| {
+            std::process::Command::new("sh")
+                .args(["-c", "command -v initdb"])
+                .output()
+                .ok()
+        })
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| PathBuf::from(s.trim()))
+        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
 const PORT: u16 = 54329;
 
 pub struct PgServer {
@@ -74,7 +137,7 @@ impl PgServer {
         std::fs::create_dir_all(&sockdir)?;
         std::fs::create_dir_all(datadir.parent().unwrap_or(Path::new("/")))?;
 
-        let mut initdb = Command::new(format!("{BIN}/initdb"));
+        let mut initdb = Command::new(format!("{}/initdb", pg_bin()));
         initdb
             .arg("-D")
             .arg(&datadir)
@@ -95,7 +158,7 @@ impl PgServer {
              -c shared_buffers=256MB -c max_connections=32",
             sockdir.display()
         );
-        let mut start = Command::new(format!("{BIN}/pg_ctl"));
+        let mut start = Command::new(format!("{}/pg_ctl", pg_bin()));
         start
             .arg("-D")
             .arg(&datadir)
@@ -119,7 +182,7 @@ impl Drop for PgServer {
     fn drop(&mut self) {
         if self.running {
             // `-m immediate`: fastest teardown; the data dir is deleted next.
-            let _ = Command::new(format!("{BIN}/pg_ctl"))
+            let _ = Command::new(format!("{}/pg_ctl", pg_bin()))
                 .arg("-D")
                 .arg(&self.datadir)
                 .args(["-m", "immediate", "-w", "-t", "30", "stop"])
