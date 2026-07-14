@@ -198,3 +198,40 @@ query I nosort
 SELECT id FROM t WHERE s < 'u'
 ----
 1
+
+# ---- where sqlite's STRICT stops and mpedb keeps going -----------------------------
+# STRICT is the closest sqlite gets to rigid typing, and it is NOT the same
+# rule. STRICT rejects what cannot convert LOSSLESSLY; mpedb rejects anything
+# that is not the declared type. Measured against sqlite 3.45 — each case
+# below is one sqlite STRICT ACCEPTS and stores coerced:
+#
+#   '42' -> INT   sqlite stores integer 42     mpedb: error
+#   42   -> TEXT  sqlite stores text '42'      mpedb: error
+#   2.0  -> INT   sqlite stores integer 2      mpedb: error
+#
+# The differential generator therefore never emits a cross-type value; these
+# would otherwise read as divergences when they are a deliberate difference.
+# (`crates/mpedb-testkit/README.md` holds the full matrix.)
+
+statement error cannot be inserted
+INSERT INTO t (id, i) VALUES (900, '42')
+
+statement error cannot be inserted
+INSERT INTO t (id, s) VALUES (901, 42)
+
+statement error cannot be inserted
+INSERT INTO t (id, i) VALUES (902, 2.0)
+
+# 'abc' -> INT is rejected by BOTH — the lossy case is where they agree.
+statement error cannot be inserted
+INSERT INTO t (id, i) VALUES (903, 'abc')
+
+# And the one coercion both engines DO perform, so the rule above is not read
+# as "mpedb never coerces".
+statement ok
+INSERT INTO t (id, f) VALUES (904, 7)
+
+query R nosort
+SELECT f FROM t WHERE id = 904
+----
+7.000
