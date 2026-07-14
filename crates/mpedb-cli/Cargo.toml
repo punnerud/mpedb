@@ -17,4 +17,5 @@ mpedb-mirror = { workspace = true }
 mpedb-types = { workspace = true }
 libc = { workspace = true }
 # sqlite source for `mirror import` (bundled 3.45, as in mpedb-bench).
+postgres = "0.19"
 rusqlite = { version = "0.31", features = ["bundled"] }
