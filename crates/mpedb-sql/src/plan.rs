@@ -1396,6 +1396,23 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
 /// cosmetic (EXPLAIN output and computed-column names) but deterministic, so
 /// it is safe to embed in hashed plan bytes.
 pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> String {
+    // Control flow (CASE, lazy coalesce) cannot be rendered by walking the stack:
+    // reconstructing the source shape from a flat program with jumps is
+    // decompilation. Refuse up front rather than produce something plausible.
+    //
+    // The first attempt at this tracked the stack through the jumps and rendered
+    // `coalesce(name, 'd')` as `'d'` — the constant from the last arm, presented
+    // as the whole expression. That is worse than useless: EXPLAIN's whole job is
+    // to tell you what will run, and a confident wrong answer there is a trap. An
+    // honest marker at least sends you to the SQL.
+    if p.instrs.iter().any(|i| {
+        matches!(
+            i,
+            Instr::Jump(_) | Instr::JumpIfNotTrue(_) | Instr::JumpIfNotNull(_)
+        )
+    }) {
+        return "<conditional>".to_string();
+    }
     struct Item {
         s: String,
         atom: bool,
@@ -1475,6 +1492,39 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     s: format!("{} LIKE {}", wrap(&a), cst(i)),
                     atom: false,
                 }
+            }
+            // `x IN ($n)` — a session-context list (§2.6). Pops the probe only.
+            Instr::InParam(i) => {
+                let a = pop(&mut st);
+                Item {
+                    s: format!("{} IN (${})", wrap(&a), i + 1),
+                    atom: false,
+                }
+            }
+            // `x IN (a, b, c)` — pops n elements and the probe beneath them.
+            Instr::InList(n) => {
+                let mut items: Vec<String> = (0..n).map(|_| pop(&mut st).s).collect();
+                items.reverse();
+                let a = pop(&mut st);
+                Item {
+                    s: format!("{} IN ({})", wrap(&a), items.join(", ")),
+                    atom: false,
+                }
+            }
+            // `f(a, b)` — pops argc arguments.
+            Instr::Call(f, argc) => {
+                let mut args: Vec<String> = (0..argc).map(|_| pop(&mut st).s).collect();
+                args.reverse();
+                Item {
+                    s: format!("{}({})", f.name(), args.join(", ")),
+                    atom: true,
+                }
+            }
+            // Unreachable: a program containing jumps returned early above.
+            Instr::Jump(_) | Instr::JumpIfNotTrue(_) | Instr::JumpIfNotNull(_) => continue,
+            Instr::Pop => {
+                let _ = pop(&mut st);
+                continue;
             }
             _ => {
                 let b = pop(&mut st);
@@ -1777,5 +1827,90 @@ mod tests {
             },
             other => panic!("{other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use mpedb_types::{ScalarFn, Value};
+
+    fn r(instrs: Vec<Instr>, consts: Vec<Value>) -> String {
+        let p = ExprProgram::new(instrs, consts).unwrap();
+        render_program(&p, &|c| format!("c{c}"))
+    }
+
+    /// EXPLAIN and SELECT column names both render the COMPILED program, so an
+    /// instruction the renderer does not know does not merely look odd — the old
+    /// catch-all treated every unknown op as a binary operator and popped TWO
+    /// operands, corrupting the stack for everything after it. `lower(name)`
+    /// came out as `? ? name`.
+    #[test]
+    fn every_instruction_renders_without_eating_the_stack() {
+        assert_eq!(
+            r(vec![Instr::PushCol(0), Instr::Call(ScalarFn::Lower, 1)], vec![]),
+            "lower(c0)"
+        );
+        assert_eq!(
+            r(
+                vec![
+                    Instr::PushCol(0),
+                    Instr::PushConst(0),
+                    Instr::PushConst(1),
+                    Instr::Call(ScalarFn::Substr, 3)
+                ],
+                vec![Value::Int(1), Value::Int(2)]
+            ),
+            "substr(c0, 1, 2)"
+        );
+        assert_eq!(
+            r(
+                vec![
+                    Instr::PushCol(0),
+                    Instr::PushConst(0),
+                    Instr::PushConst(1),
+                    Instr::InList(2)
+                ],
+                vec![Value::Int(1), Value::Int(2)]
+            ),
+            "c0 IN (1, 2)"
+        );
+        assert_eq!(
+            r(vec![Instr::PushCol(0), Instr::InParam(0)], vec![]),
+            "c0 IN ($1)"
+        );
+    }
+
+    /// A program with jumps cannot be rendered by walking the stack — that is
+    /// decompilation. The first attempt tried, and rendered
+    /// `coalesce(name, 'd')` as `'d'`: the last arm's constant, presented as the
+    /// whole expression. EXPLAIN exists to tell you what will run, so a
+    /// confident wrong answer there is worse than no answer.
+    #[test]
+    fn control_flow_renders_as_an_honest_marker_not_a_plausible_lie() {
+        // coalesce(c0, 'd') exactly as the binder emits it:
+        //   0 PushCol          depth 1
+        //   1 JumpIfNotNull(4) peeks -> jumps to the END with the value still on
+        //   2 Pop              the NULL is discarded
+        //   3 PushConst('d')   depth 1 again, so both paths agree at 4
+        // Writing JumpIfNotNull(3) instead was rejected outright by the
+        // verifier ("stack depth disagrees at instruction 3") — which is the
+        // depth analysis earning its keep on a hand-written program.
+        let out = r(
+            vec![
+                Instr::PushCol(0),
+                Instr::JumpIfNotNull(4),
+                Instr::Pop,
+                Instr::PushConst(0),
+            ],
+            vec![Value::Text("d".into())],
+        );
+        assert_eq!(out, "<conditional>");
+        // The old renderer produced exactly `'d'` here — the last arm's constant,
+        // presented as the whole expression.
+        assert!(
+            !out.contains("'d'"),
+            "must not present one arm as the whole expression, got {out}"
+        );
     }
 }
