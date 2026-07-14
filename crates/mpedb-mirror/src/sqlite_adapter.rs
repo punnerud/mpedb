@@ -71,6 +71,71 @@ impl SqliteAdapter {
             .map(|t| (t.table_id, t.src.name.clone()))
             .collect()
     }
+
+    /// Read every current row of a mirrored table as mpedb values, in PK order
+    /// (`COLLATE BINARY` so text order matches mpedb's memcmp keycode order —
+    /// review CONF#7). Used by the merge-diff / anti-entropy reconcile and the
+    /// no-touch mode. One SELECT is its own consistent snapshot.
+    pub fn read_table_rows(&self, table_id: u32) -> Result<Vec<Vec<Value>>> {
+        let meta = self
+            .tables
+            .iter()
+            .find(|t| t.table_id == table_id)
+            .ok_or_else(|| Error::Config(format!("table id {table_id} is not mirrored")))?;
+        let src = &meta.src;
+        let cols = src
+            .columns
+            .iter()
+            .map(|c| q(&c.name))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let order = src
+            .pk
+            .iter()
+            .map(|&i| format!("{} COLLATE BINARY", q(&src.columns[i].name)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("SELECT {cols} FROM {} ORDER BY {order}", q(&src.name));
+        let types: Vec<ColumnType> = src.columns.iter().map(|c| c.mapped).collect();
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| Error::Config(format!("read `{}`: {e}", src.name)))?;
+        let mut rows = stmt
+            .query([])
+            .map_err(|e| Error::Config(format!("read `{}`: {e}", src.name)))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(sqlerr)? {
+            let mut vals = Vec::with_capacity(types.len());
+            for (i, &ct) in types.iter().enumerate() {
+                let vr = row.get_ref(i).map_err(sqlerr)?;
+                vals.push(convert_value(vr, ct, &src.name, &src.columns[i].name)?);
+            }
+            out.push(vals);
+        }
+        Ok(out)
+    }
+
+    /// The live AUTOINCREMENT counter of a table's changelog (`sqlite_sequence`),
+    /// 0 if none. Never regresses under normal operation (survives GC) — a value
+    /// below the stored cursor means an older backup of the same file was
+    /// restored (review CONF#24).
+    pub fn log_autoincrement(&self, table_id: u32) -> Result<u64> {
+        let meta = self
+            .tables
+            .iter()
+            .find(|t| t.table_id == table_id)
+            .ok_or_else(|| Error::Config(format!("table id {table_id} is not mirrored")))?;
+        let log = crate::sqlite_track::log_table(&meta.src.name);
+        self.conn
+            .query_row(
+                "SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name=?1), 0)",
+                [&log],
+                |r| r.get::<_, i64>(0),
+            )
+            .map(|v| v as u64)
+            .map_err(sqlerr)
+    }
 }
 
 /// One coalesced changelog entry for a PK, pre-image resolution.

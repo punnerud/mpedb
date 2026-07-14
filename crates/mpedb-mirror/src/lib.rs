@@ -12,11 +12,13 @@ pub mod adapter;
 pub mod apply;
 pub mod export;
 pub mod import;
+pub mod reconcile;
 pub mod sqlite;
 pub mod sqlite_adapter;
 pub mod sqlite_track;
 pub mod state;
 
+pub use reconcile::{check_source_not_restored, reconcile, ReconcileStats};
 pub use sqlite_adapter::SqliteAdapter;
 
 pub use adapter::{Cursor, NetOp, NetOpKind, PullBatch, SourceAdapter};
