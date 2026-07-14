@@ -100,4 +100,8 @@ pub(crate) enum Expr {
     /// `<expr> IN (e1, …, en)` / `NOT IN` — general SQL membership (task #21).
     /// The bool is `negated`.
     InList(Box<Expr>, Vec<Expr>, bool),
+    /// `CASE WHEN c THEN r … [ELSE e] END` — the searched form. The simple
+    /// form (`CASE x WHEN a …`) is desugared into this by the parser.
+    /// `else_` is None for a missing ELSE, which SQL defines as NULL.
+    Case(Vec<(Expr, Expr)>, Option<Box<Expr>>),
 }

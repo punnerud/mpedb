@@ -760,8 +760,53 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `CASE [x] WHEN … THEN … [ELSE …] END`.
+    ///
+    /// The simple form is desugared into the searched form (`CASE x WHEN a` ->
+    /// `CASE WHEN x = a`), so only one shape reaches the binder. That duplicates
+    /// `x` per arm in the plan, and it is the one place this differs from the
+    /// standard's letter: SQL evaluates the operand once. For pure expressions —
+    /// and every expression here is pure, there are no functions with side
+    /// effects — the observable result is identical.
+    ///
+    /// 3VL falls out of the desugaring for free: `CASE x WHEN NULL` becomes
+    /// `x = NULL`, which is NULL, which is not TRUE, so the arm is skipped —
+    /// exactly what the standard requires.
+    fn case_expr(&mut self) -> Result<Expr> {
+        // A simple-form operand is anything up to WHEN.
+        let operand = if self.peek_kw(Kw::When) {
+            None
+        } else {
+            Some(self.expr()?)
+        };
+        let mut arms = Vec::new();
+        while self.eat_kw(Kw::When) {
+            let cond = self.expr()?;
+            self.expect_kw(Kw::Then, "THEN after WHEN")?;
+            let then = self.expr()?;
+            let cond = match &operand {
+                Some(x) => Expr::Binary(BinOp::Eq, Box::new(x.clone()), Box::new(cond)),
+                None => cond,
+            };
+            arms.push((cond, then));
+        }
+        if arms.is_empty() {
+            return Err(self.err_here("CASE needs at least one WHEN"));
+        }
+        let else_ = if self.eat_kw(Kw::Else) {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
+        self.expect_kw(Kw::End, "END closing CASE")?;
+        Ok(Expr::Case(arms, else_))
+    }
+
     fn primary(&mut self) -> Result<Expr> {
         let pos = self.here();
+        if self.eat_kw(Kw::Case) {
+            return self.case_expr();
+        }
         match self.advance() {
             Some(Tok::Int(v)) => Ok(Expr::Lit(Value::Int(v))),
             Some(Tok::Float(v)) => Ok(Expr::Lit(Value::Float(v))),

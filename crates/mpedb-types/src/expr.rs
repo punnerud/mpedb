@@ -64,6 +64,16 @@ pub enum Instr {
     /// that duplicates the probe expression `n` times in the plan, and the probe
     /// may be arbitrarily large.
     InList(u16),
+    /// Jump to absolute instruction index `t` unless the popped value is
+    /// exactly TRUE — i.e. jump on FALSE **and on NULL**.
+    ///
+    /// Named for what it does rather than `JumpIfFalse`, because the NULL case
+    /// is the whole subtlety: `CASE WHEN <null> THEN a ELSE b END` yields `b`,
+    /// so an unknown condition must not be taken. A `JumpIfFalse` that treated
+    /// NULL as "not false" would silently take the branch.
+    JumpIfNotTrue(u16),
+    /// Unconditional jump to absolute instruction index `t`.
+    Jump(u16),
 }
 
 const OP_PUSH_COL: u8 = 1;
@@ -90,6 +100,8 @@ const OP_TO_FLOAT: u8 = 21;
 const OP_LIKE: u8 = 22;
 const OP_IN_PARAM: u8 = 23;
 const OP_IN_LIST: u8 = 24;
+const OP_JUMP_IF_NOT_TRUE: u8 = 25;
+const OP_JUMP: u8 = 26;
 
 /// SQL `x IN (…)` under three-valued logic — the semantics that decide whether
 /// a policy admits a row, so they are spelled out rather than approximated:
@@ -187,7 +199,13 @@ impl ExprProgram {
     ) -> Result<Value> {
         stack.clear();
         stack.reserve(self.max_stack);
-        for &instr in &self.instrs {
+        // A program counter rather than an iterator: jumps (CASE) need to move
+        // it. `validate` proved every target is forward and in range, so this
+        // terminates and never indexes out of bounds.
+        let mut pc = 0usize;
+        while pc < self.instrs.len() {
+            let instr = self.instrs[pc];
+            pc += 1;
             match instr {
                 Instr::PushCol(i) => {
                     let v = cols.get(i as usize).ok_or_else(|| {
@@ -314,6 +332,25 @@ impl ExprProgram {
                     let probe = stack.pop().expect("validated");
                     stack.push(in_items_3vl(&probe, &items)?);
                 }
+                Instr::JumpIfNotTrue(t) => {
+                    // Jump on FALSE *and* on NULL: an unknown WHEN must not be
+                    // taken, or `CASE WHEN <null> THEN a ELSE b END` yields a.
+                    let c = stack.pop().expect("validated");
+                    if !matches!(c, Value::Bool(true)) {
+                        // A non-bool condition is a bind-time error, but a
+                        // hand-built program can still get here; treating it as
+                        // "not true" is the safe reading and matches to_bool3's
+                        // refusal to invent a truth value.
+                        if !matches!(c, Value::Bool(false) | Value::Null) {
+                            return Err(Error::TypeMismatch(format!(
+                                "CASE condition must be bool, got {}",
+                                c.type_name()
+                            )));
+                        }
+                        pc = t as usize;
+                    }
+                }
+                Instr::Jump(t) => pc = t as usize,
             }
         }
         Ok(stack.pop().expect("validated: exactly one result"))
@@ -363,6 +400,14 @@ impl ExprProgram {
                 }
                 Instr::InList(x) => {
                     buf.push(OP_IN_LIST);
+                    buf.extend_from_slice(&x.to_le_bytes());
+                }
+                Instr::JumpIfNotTrue(x) => {
+                    buf.push(OP_JUMP_IF_NOT_TRUE);
+                    buf.extend_from_slice(&x.to_le_bytes());
+                }
+                Instr::Jump(x) => {
+                    buf.push(OP_JUMP);
                     buf.extend_from_slice(&x.to_le_bytes());
                 }
                 Instr::InParam(x) => {
@@ -428,6 +473,8 @@ impl ExprProgram {
                 OP_LIKE => Instr::Like(read_u16_arg()?),
                 OP_IN_PARAM => Instr::InParam(read_u16_arg()?),
                 OP_IN_LIST => Instr::InList(read_u16_arg()?),
+                OP_JUMP_IF_NOT_TRUE => Instr::JumpIfNotTrue(read_u16_arg()?),
+                OP_JUMP => Instr::Jump(read_u16_arg()?),
                 OP_EQ => Instr::Eq,
                 OP_NE => Instr::Ne,
                 OP_LT => Instr::Lt,
@@ -453,58 +500,134 @@ impl ExprProgram {
     }
 }
 
-/// Static verification: const indices in range, stack never underflows, and
-/// the program leaves exactly one value. Returns the maximum stack depth.
+/// Static verification, so `eval` needs no per-instruction safety checks:
+/// const indices in range, no stack underflow, exactly one value left — and,
+/// with jumps in the language, two more properties that used to be free.
+///
+/// **Termination.** Jump targets must be strictly FORWARD. A backward jump
+/// would make an expression able to loop, and `eval` runs per row inside the
+/// engine with no fuel counter: a crafted plan could hang a reader forever.
+/// Forward-only makes the program a DAG, so it always terminates.
+///
+/// **Depth agreement at merge points.** With branches, "the depth here" is no
+/// longer one number per program: an instruction can be reached from several
+/// predecessors, and if they disagree the stack means different things
+/// depending on the row's data. This walks a depth-per-index map and refuses
+/// any disagreement, which is what keeps `max_stack` a real bound and every
+/// `pop().expect("validated")` honest.
+///
+/// Returns the maximum stack depth over all paths.
 fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
     if instrs.is_empty() {
         return Err(Error::Corrupt("empty expression program".into()));
     }
-    let mut depth: usize = 0;
+    let n = instrs.len();
+    // depth on ENTRY to each index; index n is the program's exit.
+    let mut depth_at: Vec<Option<usize>> = vec![None; n + 1];
+    depth_at[0] = Some(0);
     let mut max = 0usize;
-    for &i in instrs {
-        let (pops, pushes) = match i {
-            Instr::PushCol(_) | Instr::PushParam(_) => (0, 1),
-            Instr::PushConst(c) => {
-                if c as usize >= consts.len() {
-                    return Err(Error::Corrupt("const index out of range".into()));
-                }
-                (0, 1)
+
+    // Record the depth on entry to `t`, rejecting a disagreement.
+    fn merge(depth_at: &mut [Option<usize>], t: usize, d: usize) -> Result<()> {
+        match depth_at[t] {
+            None => {
+                depth_at[t] = Some(d);
+                Ok(())
             }
-            Instr::Like(c) => {
-                if c as usize >= consts.len() {
-                    return Err(Error::Corrupt("const index out of range".into()));
-                }
-                (1, 1)
-            }
-            // Pops the probe scalar, pushes the 3VL result; the list comes from
-            // a param slot, not the stack, so the arity is not encoded here.
-            Instr::InParam(_) => (1, 1),
-            // n list elements plus the probe beneath them. n == 0 (`x IN ()`)
-            // is rejected by the parser, but a hand-built or corrupt program can
-            // still say it, and (1,1) would then silently be a no-op that leaves
-            // the probe on the stack posing as a bool. Refuse it here, where
-            // every program passes exactly once.
-            Instr::InList(n) => {
-                if n == 0 {
-                    return Err(Error::Corrupt("IN list with zero elements".into()));
-                }
-                (n as usize + 1, 1)
-            }
-            Instr::Neg | Instr::Not | Instr::IsNull | Instr::IsNotNull | Instr::ToFloat => (1, 1),
-            _ => (2, 1),
-        };
-        if depth < pops {
-            return Err(Error::Corrupt("expression stack underflow".into()));
+            Some(prev) if prev == d => Ok(()),
+            Some(prev) => Err(Error::Corrupt(format!(
+                "stack depth disagrees at instruction {t}: {prev} on one path, {d} on another"
+            ))),
         }
-        depth = depth - pops + pushes;
-        max = max.max(depth);
     }
-    if depth != 1 {
-        return Err(Error::Corrupt(
-            "expression program must leave exactly one value".into(),
-        ));
+
+    for i in 0..n {
+        // Every instruction must be reachable. Dead code after a Jump is not a
+        // harmless curiosity here: it means the encoder or a corrupt plan built
+        // something whose stack shape was never proven.
+        let d = depth_at[i]
+            .ok_or_else(|| Error::Corrupt(format!("instruction {i} is unreachable")))?;
+        max = max.max(d);
+
+        let check_target = |t: u16| -> Result<usize> {
+            let t = t as usize;
+            if t <= i {
+                return Err(Error::Corrupt(format!(
+                    "backward jump {i} -> {t}: expression programs must terminate"
+                )));
+            }
+            if t > n {
+                return Err(Error::Corrupt(format!("jump target {t} past end of program")));
+            }
+            Ok(t)
+        };
+
+        match instrs[i] {
+            Instr::Jump(t) => {
+                let t = check_target(t)?;
+                merge(&mut depth_at, t, d)?;
+                // no fall-through: depth_at[i+1] is set only if something jumps there
+            }
+            Instr::JumpIfNotTrue(t) => {
+                let t = check_target(t)?;
+                if d < 1 {
+                    return Err(Error::Corrupt("expression stack underflow".into()));
+                }
+                let d = d - 1; // pops the condition on BOTH paths
+                merge(&mut depth_at, t, d)?;
+                merge(&mut depth_at, i + 1, d)?;
+            }
+            instr => {
+                let (pops, pushes) = match instr {
+                    Instr::PushCol(_) | Instr::PushParam(_) => (0, 1),
+                    Instr::PushConst(c) => {
+                        if c as usize >= consts.len() {
+                            return Err(Error::Corrupt("const index out of range".into()));
+                        }
+                        (0, 1)
+                    }
+                    Instr::Like(c) => {
+                        if c as usize >= consts.len() {
+                            return Err(Error::Corrupt("const index out of range".into()));
+                        }
+                        (1, 1)
+                    }
+                    // Pops the probe scalar, pushes the 3VL result; the list comes
+                    // from a param slot, not the stack, so the arity is not here.
+                    Instr::InParam(_) => (1, 1),
+                    // n list elements plus the probe beneath them. n == 0 would be
+                    // a no-op leaving the probe posing as a bool — refuse it.
+                    Instr::InList(nl) => {
+                        if nl == 0 {
+                            return Err(Error::Corrupt("IN list with zero elements".into()));
+                        }
+                        (nl as usize + 1, 1)
+                    }
+                    Instr::Neg | Instr::Not | Instr::IsNull | Instr::IsNotNull | Instr::ToFloat => {
+                        (1, 1)
+                    }
+                    Instr::Jump(_) | Instr::JumpIfNotTrue(_) => unreachable!("handled above"),
+                    _ => (2, 1),
+                };
+                if d < pops {
+                    return Err(Error::Corrupt("expression stack underflow".into()));
+                }
+                let nd = d - pops + pushes;
+                max = max.max(nd);
+                merge(&mut depth_at, i + 1, nd)?;
+            }
+        }
     }
-    Ok(max)
+
+    match depth_at[n] {
+        Some(1) => Ok(max),
+        Some(other) => Err(Error::Corrupt(format!(
+            "expression program must leave exactly one value, leaves {other}"
+        ))),
+        None => Err(Error::Corrupt(
+            "expression program never reaches its end".into(),
+        )),
+    }
 }
 
 fn to_bool3(v: Value) -> Result<Option<bool>> {
@@ -927,6 +1050,98 @@ mod in_list_tests {
                 ExprProgram::decode(&bytes[..n], &mut pos).is_err(),
                 "truncation at {n} decoded"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod jump_tests {
+    use super::*;
+
+    /// A backward jump would let a per-row expression loop forever. `eval` runs
+    /// inside the engine with no fuel counter, so a crafted or corrupt plan
+    /// could hang a reader. The verifier must refuse it, not the evaluator.
+    #[test]
+    fn backward_jump_is_refused_so_programs_terminate() {
+        let r = ExprProgram::new(
+            vec![Instr::PushConst(0), Instr::Jump(0)],
+            vec![Value::Bool(true)],
+        );
+        assert!(
+            matches!(&r, Err(Error::Corrupt(m)) if m.contains("terminate")),
+            "got {r:?}"
+        );
+        // self-jump is backward too (t <= i)
+        let r = ExprProgram::new(vec![Instr::PushConst(0), Instr::Jump(1)], vec![Value::Null]);
+        assert!(matches!(r, Err(Error::Corrupt(_))), "got {r:?}");
+    }
+
+    /// If two paths reach an instruction at different depths, the stack means
+    /// different things depending on the row's data — and `max_stack` stops
+    /// being a bound.
+    #[test]
+    fn disagreeing_stack_depth_at_a_merge_is_corrupt() {
+        // path A leaves 2 values at index 4, path B leaves 1
+        let r = ExprProgram::new(
+            vec![
+                Instr::PushConst(0),        // 0: cond
+                Instr::JumpIfNotTrue(4),    // 1: -> 4 with depth 0
+                Instr::PushConst(1),        // 2: depth 1
+                Instr::PushConst(1),        // 3: depth 2  (falls through to 4)
+                Instr::PushConst(1),        // 4: merge point — disagreement
+            ],
+            vec![Value::Bool(true), Value::Int(1)],
+        );
+        assert!(
+            matches!(&r, Err(Error::Corrupt(m)) if m.contains("disagrees")),
+            "got {r:?}"
+        );
+    }
+
+    #[test]
+    fn jump_past_the_end_and_unreachable_code_are_corrupt() {
+        let r = ExprProgram::new(
+            vec![Instr::PushConst(0), Instr::Jump(99)],
+            vec![Value::Int(1)],
+        );
+        assert!(matches!(&r, Err(Error::Corrupt(m)) if m.contains("past end")), "got {r:?}");
+
+        // instruction 2 can never be reached: nothing falls into it or jumps to it
+        let r = ExprProgram::new(
+            vec![Instr::PushConst(0), Instr::Jump(3), Instr::Neg, Instr::PushConst(0)],
+            vec![Value::Int(1)],
+        );
+        assert!(matches!(&r, Err(Error::Corrupt(m)) if m.contains("unreachable")), "got {r:?}");
+    }
+
+    /// The shape the CASE codegen actually emits, evaluated both ways.
+    #[test]
+    fn case_shaped_program_evaluates_both_branches() {
+        // CASE WHEN col0 THEN 10 ELSE 20 END
+        let p = ExprProgram::new(
+            vec![
+                Instr::PushCol(0),       // 0
+                Instr::JumpIfNotTrue(4), // 1 -> else
+                Instr::PushConst(0),     // 2: 10
+                Instr::Jump(5),          // 3 -> end
+                Instr::PushConst(1),     // 4: 20
+            ],
+            vec![Value::Int(10), Value::Int(20)],
+        )
+        .unwrap();
+        assert_eq!(p.eval(&[Value::Bool(true)], &[]).unwrap(), Value::Int(10));
+        assert_eq!(p.eval(&[Value::Bool(false)], &[]).unwrap(), Value::Int(20));
+        // NULL must take the ELSE arm, not the THEN arm
+        assert_eq!(p.eval(&[Value::Null], &[]).unwrap(), Value::Int(20));
+
+        // and it must survive the codec, truncation included
+        let mut bytes = Vec::new();
+        p.encode_into(&mut bytes);
+        let mut pos = 0;
+        assert_eq!(ExprProgram::decode(&bytes, &mut pos).unwrap(), p);
+        for n in 0..bytes.len() {
+            let mut pos = 0;
+            assert!(ExprProgram::decode(&bytes[..n], &mut pos).is_err(), "truncation at {n}");
         }
     }
 }
