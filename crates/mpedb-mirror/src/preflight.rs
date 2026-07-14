@@ -30,7 +30,7 @@
 use mpedb::{Database, ExecResult};
 use mpedb_types::{Error, Result, Value};
 
-use crate::state::{self, ColumnMap, MapPolicy, TableMap};
+use crate::state::{self, ColumnMap, MapPolicy, SourceKind, TableMap};
 
 /// What a value (or a column) will do to a strict target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -138,7 +138,21 @@ fn base_type(declared: &str) -> &str {
 
 /// The inclusive range a narrow integer source column accepts, or None if the
 /// column is not a narrowing integer.
-fn int_range(declared: &str) -> Option<(i64, i64)> {
+/// The integer range a declared type actually enforces **in its own dialect**.
+///
+/// The dialect argument is load-bearing, not decoration. `INTEGER` names a
+/// 32-bit column in PostgreSQL and a *64-bit* one in sqlite, and `REAL` is
+/// single precision in PostgreSQL and double in sqlite — the same word, a
+/// different type. Reading a sqlite `INTEGER` with PG's meaning made preflight
+/// reject 5_000_000_000, a value sqlite stores natively and would take back
+/// without complaint, and that false rejection then blocked the export of
+/// perfectly good data.
+fn int_range(declared: &str, kind: SourceKind) -> Option<(i64, i64)> {
+    // sqlite enforces no width at all: INTEGER holds a full i64, and a declared
+    // type is an affinity rather than a constraint. Nothing to check.
+    if kind == SourceKind::Sqlite {
+        return None;
+    }
     match base_type(declared).to_ascii_lowercase().as_str() {
         "int2" | "smallint" => Some((i16::MIN as i64, i16::MAX as i64)),
         "int4" | "integer" | "int" => Some((i32::MIN as i64, i32::MAX as i64)),
@@ -146,8 +160,8 @@ fn int_range(declared: &str) -> Option<(i64, i64)> {
     }
 }
 
-/// Check one value against one recorded source column.
-fn check_value(c: &ColumnMap, v: &Value) -> Option<(FindingKind, String)> {
+/// Check one value against one recorded source column, in `kind`'s dialect.
+fn check_value(c: &ColumnMap, v: &Value, kind: SourceKind) -> Option<(FindingKind, String)> {
     if v.is_null() {
         return if c.not_null {
             Some((
@@ -162,7 +176,7 @@ fn check_value(c: &ColumnMap, v: &Value) -> Option<(FindingKind, String)> {
     // Narrowing integers: mpedb widened int2/int4 to Int64 at import, so a local
     // write can hold what the source cannot. This is the exact failure the PG
     // fidelity work hit at INSERT time.
-    if let (Some((lo, hi)), Value::Int(i)) = (int_range(&c.source_type), v) {
+    if let (Some((lo, hi)), Value::Int(i)) = (int_range(&c.source_type, kind), v) {
         if *i < lo || *i > hi {
             return Some((
                 FindingKind::WontFit,
@@ -181,6 +195,12 @@ fn check_value(c: &ColumnMap, v: &Value) -> Option<(FindingKind, String)> {
                 ));
             }
             let bt = base_type(&c.source_type).to_ascii_lowercase();
+            // Length and precision are declarations sqlite does not enforce:
+            // `VARCHAR(8)` there happily holds 800 characters, and writing one
+            // back is legal. Only a strict dialect can reject on these.
+            if kind == SourceKind::Sqlite {
+                return None;
+            }
             // varchar(n)/char(n) count CHARACTERS, not bytes — a byte check
             // would false-positive on every non-ASCII value.
             if let Some((n, _)) = typmod(&c.source_type) {
@@ -269,6 +289,20 @@ pub fn preflight(db: &Database) -> Result<PreflightReport> {
     let schema = db.schema().clone();
     let mut report = PreflightReport::default();
 
+    // Which dialect the recorded declared types are written in. Without this
+    // every check silently assumes PostgreSQL, and a sqlite mirror gets judged
+    // by rules sqlite does not have.
+    let src_kind = match db.sys_record_get(state::MIR_NS, state::KEY_CFG)? {
+        Some(raw) => state::MirrorConfig::decode(&raw)?.source_kind,
+        None => {
+            return Err(Error::Config(
+                "not a mirror (no mir/cfg record): preflight has no source schema to \
+                 check against"
+                    .into(),
+            ))
+        }
+    };
+
     for (tid, tdef) in schema.tables.iter().enumerate() {
         let Some(raw) = db.sys_record_get(state::MIR_NS, &state::map_key(tid as u32))? else {
             // No provenance: an .mpedb created before this record existed, or a
@@ -339,7 +373,7 @@ pub fn preflight(db: &Database) -> Result<PreflightReport> {
                 if c.generated {
                     continue; // never written back; the target computes it
                 }
-                if let Some((kind, detail)) = check_value(c, v) {
+                if let Some((kind, detail)) = check_value(c, v, src_kind) {
                     report.findings.push(Finding {
                         table: map.source_name.clone(),
                         column: c.source_name.clone(),
@@ -455,12 +489,12 @@ mod tests {
 
     #[test]
     fn int_ranges_only_for_narrowing_types() {
-        assert_eq!(int_range("int4"), Some((-2147483648, 2147483647)));
-        assert_eq!(int_range("integer"), Some((-2147483648, 2147483647)));
-        assert_eq!(int_range("int2"), Some((-32768, 32767)));
+        assert_eq!(int_range("int4", SourceKind::Postgres), Some((-2147483648, 2147483647)));
+        assert_eq!(int_range("integer", SourceKind::Postgres), Some((-2147483648, 2147483647)));
+        assert_eq!(int_range("int2", SourceKind::Postgres), Some((-32768, 32767)));
         // int8 is NOT narrowing — mpedb's Int64 matches it exactly
-        assert_eq!(int_range("int8"), None);
-        assert_eq!(int_range("bigint"), None);
+        assert_eq!(int_range("int8", SourceKind::Postgres), None);
+        assert_eq!(int_range("bigint", SourceKind::Postgres), None);
     }
 
     fn col(source_type: &str, mapped: mpedb_types::ColumnType, not_null: bool) -> ColumnMap {
@@ -482,43 +516,43 @@ mod tests {
     fn catches_the_int4_overflow_that_postgres_would_have_thrown() {
         use mpedb_types::ColumnType;
         let c = col("int4", ColumnType::Int64, false);
-        let f = check_value(&c, &Value::Int(2147483648));
+        let f = check_value(&c, &Value::Int(2147483648), SourceKind::Postgres);
         assert!(matches!(f, Some((FindingKind::WontFit, _))), "got {f:?}");
         // and the in-range value is silent
-        assert!(check_value(&c, &Value::Int(2147483647)).is_none());
+        assert!(check_value(&c, &Value::Int(2147483647), SourceKind::Postgres).is_none());
         // int8 never overflows: mpedb's Int64 IS int8
         let big = col("int8", ColumnType::Int64, false);
-        assert!(check_value(&big, &Value::Int(i64::MAX)).is_none());
+        assert!(check_value(&big, &Value::Int(i64::MAX), SourceKind::Postgres).is_none());
     }
 
     #[test]
     fn catches_varchar_length_in_characters_not_bytes() {
         use mpedb_types::ColumnType;
         let c = col("character varying(4)", ColumnType::Text, false);
-        assert!(check_value(&c, &Value::Text("abcd".into())).is_none());
+        assert!(check_value(&c, &Value::Text("abcd".into()), SourceKind::Postgres).is_none());
         assert!(matches!(
-            check_value(&c, &Value::Text("abcde".into())),
+            check_value(&c, &Value::Text("abcde".into()), SourceKind::Postgres),
             Some((FindingKind::WontFit, _))
         ));
         // 4 multi-byte chars = 12 bytes but still 4 characters: a byte check
         // would have false-positived here.
-        assert!(check_value(&c, &Value::Text("æøå日".into())).is_none());
+        assert!(check_value(&c, &Value::Text("æøå日".into()), SourceKind::Postgres).is_none());
     }
 
     #[test]
     fn catches_numeric_precision_and_flags_rounding_separately() {
         use mpedb_types::ColumnType;
         let c = col("numeric(5,2)", ColumnType::Text, false);
-        assert!(check_value(&c, &Value::Text("123.45".into())).is_none());
+        assert!(check_value(&c, &Value::Text("123.45".into()), SourceKind::Postgres).is_none());
         // 4 integer digits > (5-2)=3 → the target REJECTS
-        let over = check_value(&c, &Value::Text("1234.5".into()));
+        let over = check_value(&c, &Value::Text("1234.5".into()), SourceKind::Postgres);
         assert!(matches!(&over, Some((FindingKind::WontFit, d)) if d.contains("before the point")));
         // too many fractional digits → the target ROUNDS; say so, do not claim
         // it will be rejected
-        let round = check_value(&c, &Value::Text("1.234".into()));
+        let round = check_value(&c, &Value::Text("1.234".into()), SourceKind::Postgres);
         assert!(matches!(&round, Some((FindingKind::WontFit, d)) if d.contains("ROUND")));
         // leading zeros are not significant digits
-        assert!(check_value(&c, &Value::Text("000.12".into())).is_none());
+        assert!(check_value(&c, &Value::Text("000.12".into()), SourceKind::Postgres).is_none());
     }
 
     #[test]
@@ -526,16 +560,16 @@ mod tests {
         use mpedb_types::ColumnType;
         let nn = col("text", ColumnType::Text, true);
         assert!(matches!(
-            check_value(&nn, &Value::Null),
+            check_value(&nn, &Value::Null, SourceKind::Postgres),
             Some((FindingKind::NullInNotNull, _))
         ));
         let t = col("text", ColumnType::Text, false);
         assert!(matches!(
-            check_value(&t, &Value::Text("a\0b".into())),
+            check_value(&t, &Value::Text("a\0b".into()), SourceKind::Postgres),
             Some((FindingKind::NulInText, _))
         ));
         // a nullable column with NULL is fine and must not be reported
-        assert!(check_value(&t, &Value::Null).is_none());
+        assert!(check_value(&t, &Value::Null, SourceKind::Postgres).is_none());
     }
 
     /// A loose source's whole point: sqlite lets a row hold anything, so the
@@ -544,7 +578,7 @@ mod tests {
     fn catches_loose_source_type_drift() {
         use mpedb_types::ColumnType;
         let c = col("INTEGER", ColumnType::Int64, false);
-        let f = check_value(&c, &Value::Text("oops".into()));
+        let f = check_value(&c, &Value::Text("oops".into()), SourceKind::Postgres);
         assert!(matches!(&f, Some((FindingKind::TypeDrift, d)) if d.contains("mapped as")), "got {f:?}");
     }
 
@@ -577,14 +611,22 @@ mod tests {
         assert!(r.would_fail());
     }
 
-    /// End to end, and the scenario Morten described: a LOOSE sqlite source
-    /// (declared types are affinities) imported into mpedb, then local writes
-    /// that mpedb happily accepts because it widened the columns — `qty` was
-    /// INT4 at the source but is Int64 here, `code` was VARCHAR(4) but is Text.
-    /// PostgreSQL would throw on both, mid-INSERT, after a round-trip each.
-    /// Pre-flight finds them locally, with the source not even open.
+    /// End to end over a LOOSE sqlite source — and the correction of what this
+    /// test used to assert.
+    ///
+    /// It previously imported a sqlite table declaring `qty INT4` and `code
+    /// VARCHAR(4)`, wrote 2_147_483_648 and 'toolong', and demanded preflight
+    /// flag both. That is PostgreSQL's rulebook applied to sqlite. sqlite stores
+    /// both values happily — a declared type there is an affinity, not a
+    /// constraint, and `VARCHAR(4)` enforces no length at all — so writing them
+    /// BACK to the source succeeds. Flagging them was a false rejection, and
+    /// `would_fail()` blocks an export, so it blocked good data.
+    ///
+    /// What is actually true for a sqlite source: NOT NULL is enforced, widths
+    /// are not. The strict checks belong to a strict dialect, and there is a
+    /// unit test below pinning the two apart.
     #[test]
-    fn finds_locally_what_a_strict_target_would_reject_on_write() {
+    fn a_loose_sqlite_source_is_judged_by_sqlites_rules_not_postgresqls() {
         use crate::import::{import_sqlite, ImportOptions};
         use rusqlite::Connection;
 
@@ -609,54 +651,82 @@ mod tests {
             import_sqlite(&mut c, &dest, &ImportOptions::default()).unwrap().0
         };
 
-        // clean import ⇒ nothing to say
         let r = preflight(&db).unwrap();
         assert!(r.findings.is_empty(), "clean data must be silent: {:?}", r.findings);
         assert_eq!(r.rows_checked, 1);
 
-        // local writes mpedb accepts but the SOURCE column cannot take
+        // Values that "overflow" the DECLARED types. sqlite takes them without
+        // complaint, so preflight must not claim the source would reject them.
         db.query(
             "INSERT INTO t (id, qty, code, note) VALUES ($1, $2, $3, $4)",
             &[
                 Value::Int(2),
-                Value::Int(2_147_483_648), // INT4 max is 2147483647
-                Value::Text("ok".into()),
-                Value::Text("x".into()),
-            ],
-        )
-        .unwrap();
-        db.query(
-            "INSERT INTO t (id, qty, code, note) VALUES ($1, $2, $3, $4)",
-            &[
-                Value::Int(3),
-                Value::Int(1),
-                Value::Text("toolong".into()), // VARCHAR(4)
+                Value::Int(2_147_483_648), // > int4, but sqlite INT4 is 64-bit
+                Value::Text("toolong".into()), // > VARCHAR(4), unenforced
                 Value::Text("x".into()),
             ],
         )
         .unwrap();
 
         let r = preflight(&db).unwrap();
-        assert_eq!(r.rows_checked, 3);
-        assert!(r.would_fail(), "both writes must be flagged before anything is written");
+        assert_eq!(r.rows_checked, 2);
+        assert!(
+            !r.would_fail(),
+            "sqlite enforces neither int width nor varchar length; flagging these \
+             blocks an export of data the source would take back verbatim: {:?}",
+            r.findings
+        );
 
-        let kinds: Vec<_> = r.findings.iter().map(|f| (f.column.as_str(), f.kind)).collect();
-        assert!(
-            kinds.contains(&("qty", FindingKind::WontFit)),
-            "int4 overflow must be caught: {kinds:?}"
-        );
-        assert!(
-            kinds.contains(&("code", FindingKind::WontFit)),
-            "varchar(4) overflow must be caught: {kinds:?}"
-        );
-        // and each finding names the row, so it is actionable
-        let qty = r.findings.iter().find(|f| f.column == "qty").unwrap();
-        assert_eq!(qty.pk, vec![Value::Int(2)]);
-        assert!(qty.detail.contains("2147483648"), "detail: {}", qty.detail);
+        // Prove it, rather than trusting the reasoning: sqlite really does
+        // accept both back.
+        {
+            let c = Connection::open(&src).unwrap();
+            c.execute(
+                "INSERT INTO t VALUES (2, 2147483648, 'toolong', 'x')",
+                [],
+            )
+            .expect("sqlite must accept the very values preflight used to reject");
+            let (q, code): (i64, String) = c
+                .query_row("SELECT qty, code FROM t WHERE id=2", [], |r| {
+                    Ok((r.get(0)?, r.get(1)?))
+                })
+                .unwrap();
+            assert_eq!(q, 2_147_483_648);
+            assert_eq!(code, "toolong");
+        }
 
         for p in [src, dest] {
             let _ = std::fs::remove_file(p);
         }
+    }
+
+    /// The dialect split, pinned. Same declared type, same value, opposite
+    /// verdicts — because `INTEGER` is 32-bit in PostgreSQL and 64-bit in
+    /// sqlite. Reading one dialect's schema with the other's rules is what made
+    /// preflight reject 5_000_000_000 out of a sqlite INTEGER column.
+    #[test]
+    fn the_same_declared_type_means_different_things_per_dialect() {
+        let c = col("INTEGER", mpedb_types::ColumnType::Int64, false);
+        let v = Value::Int(5_000_000_000);
+        assert!(
+            check_value(&c, &v, SourceKind::Postgres).is_some(),
+            "PostgreSQL `integer` is int4: 5e9 does not fit"
+        );
+        assert!(
+            check_value(&c, &v, SourceKind::Sqlite).is_none(),
+            "sqlite `INTEGER` is 64-bit: 5e9 fits natively"
+        );
+
+        // Same story for declared widths.
+        let vc = col("VARCHAR(4)", mpedb_types::ColumnType::Text, false);
+        let long = Value::Text("toolong".into());
+        assert!(check_value(&vc, &long, SourceKind::Postgres).is_some());
+        assert!(check_value(&vc, &long, SourceKind::Sqlite).is_none());
+
+        // NOT NULL is enforced by BOTH — the dialect split must not swallow it.
+        let nn = col("TEXT", mpedb_types::ColumnType::Text, true);
+        assert!(check_value(&nn, &Value::Null, SourceKind::Sqlite).is_some());
+        assert!(check_value(&nn, &Value::Null, SourceKind::Postgres).is_some());
     }
 
     /// 26.3 end to end — with the premise the first attempt got wrong, twice.

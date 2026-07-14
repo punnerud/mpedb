@@ -134,7 +134,13 @@ mpedb mirror <subcommand>
       coercion applied is printed.
 
   export  --db <mpedb-file> --dest <new-sqlite-file>
-      Export a mirror back out to a fresh sqlite database.
+          --db <mpedb-file> --to postgres --source-config <file> [--pg-schema S]
+      Export a mirror out to a fresh sqlite database, or into PostgreSQL.
+      The PostgreSQL export recreates the ORIGINAL declared types recorded at
+      import (int4 stays int4, varchar(20) stays varchar(20)) rather than the
+      widened mpedb types, and runs preflight first: if any value would be
+      rejected by the target schema it refuses to start, instead of failing
+      halfway through the load.
 
 
 
@@ -435,8 +441,53 @@ fn cmd_import(argv: &[String]) -> CliResult {
 }
 
 fn cmd_export(argv: &[String]) -> CliResult {
-    let p = args::parse(argv, &["db", "dest"], &[])?;
+    let p = args::parse(
+        argv,
+        &["db", "dest", "to", "source-config", "pg-schema"],
+        &[],
+    )?;
     let db = PathBuf::from(p.require("db")?);
+
+    // --to postgres is the other half of the migration: sqlite -> mpedb -> PG.
+    if p.value("to") == Some("postgres") || p.value("source-config").is_some() {
+        let cfg = p.value("source-config").ok_or_else(|| {
+            Failure::Usage(
+                "exporting to PostgreSQL needs --source-config <0600-file> (a DSN must \
+                 never be a CLI arg -- it would be visible in `ps`)"
+                    .into(),
+            )
+        })?;
+        let spec = sourcecfg::load(std::path::Path::new(cfg))?;
+        let SourceSpec::Postgres { dsn } = &spec else {
+            return usage("--source-config for export --to postgres must be kind = \"postgres\"");
+        };
+        let mut client = postgres::Client::connect(dsn, postgres::NoTls)
+            .map_err(|e| Failure::Runtime(format!("connect to {}: {e}", spec.redacted())))?;
+        let opts = mpedb_mirror::PgExportOptions {
+            schema: p.value("pg-schema").unwrap_or("public").to_string(),
+            skip_preflight: false,
+        };
+        let report = mpedb_mirror::export_pg(&db, &mut client, &opts)?;
+        println!("exported {} to {}", db.display(), spec.redacted());
+        for t in &report.tables {
+            println!("  {:<24} {:>10} rows", t.name, t.rows);
+        }
+        println!("  total: {} rows", report.total_rows());
+        if !report.widened.is_empty() {
+            // Silence here would read as "the schema round-tripped exactly".
+            println!(
+                "  NOTE: {} table(s) got generic (widened) column types rather than the \
+                 source's own: {}\n        (a sqlite source declares affinities, not \
+                 types -- its INTEGER is 64-bit and its REAL is a double, so copying \
+                 those words into PostgreSQL, where they mean int4 and float4, would \
+                 truncate your data rather than preserve it)",
+                report.widened.len(),
+                report.widened.join(", ")
+            );
+        }
+        return Ok(());
+    }
+
     let dest = PathBuf::from(p.require("dest")?);
     let report = export_sqlite(&db, &dest)?;
     println!("exported {} to {}", db.display(), dest.display());

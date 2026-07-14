@@ -17,6 +17,7 @@ pub mod import;
 pub mod pg;
 pub mod preflight;
 pub mod pg_adapter;
+pub mod pg_export;
 pub mod pg_import;
 pub mod pg_track;
 pub mod push;
@@ -40,6 +41,7 @@ pub use apply::{apply_batch, ApplyStats};
 pub use export::{diff_sqlite_data, export_sqlite, ExportReport};
 pub use import::{import_sqlite, ImportOptions, ImportReport};
 pub use pg_adapter::PgAdapter;
+pub use pg_export::{export_pg, PgExportOptions, PgExportReport};
 pub use pg_import::import_pg;
 pub use adapt::{adapt, Adaptation};
 pub use preflight::{
