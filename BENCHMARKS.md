@@ -122,6 +122,65 @@ and PostgreSQL's contended writes scale with them. mpedb's write-parallelism
 answer is architectural, not per-lock: separate files (Workspaces / ShardSet),
 which this single-file cell does not measure.
 
+## Apple Silicon (M3 Pro, 11 cores) — and the durability trap it exposed
+
+Second machine, 2026-07-14: **M3 Pro, 5 perf + 6 eff cores, 36 GB, macOS 26.6**,
+mpedb and SQLite only (no PostgreSQL installed). macOS has no tmpfs, so
+none-class runs on a 2 GB RAM disk (`--tmpfs /Volumes/…`) — APFS over RAM, not
+tmpfs, so **none-class ratios are not directly comparable to the Linux run**
+(mpedb is mmap-based and pays a filesystem layer SQLite's read/write path does
+not).
+
+| none-class, ops/s | mpedb | SQLite | ratio |
+|---|--:|--:|--:|
+| point-select | **1,699,066** | 327,907 | 5.2× |
+| point-insert | **196,931** | 117,072 | 1.7× |
+| point-update | **246,983** | 140,530 | 1.8× |
+| contended-writes (4 threads) | **132,992** | 101,975 | 1.3× |
+| read-while-write (reads) | **3,655,502** | 178 | — |
+
+That last row is not a typo. SQLite's none-class journal serializes readers
+against the writer, and on 11 cores the writer (86,580 writes/s) starves them
+completely: **178 reads/s, p99 139 seconds.** mpedb's MVCC readers are
+untouched at 3.7M/s. It is a pathological config rather than a fair fight — but
+it is the failure mode mpedb's design exists to avoid, and more cores make it
+worse, not better.
+
+Note the write ratios **narrow** vs Linux (1.7× vs 3.97× on insert). Some of
+that is the APFS-over-RAM medium; we did not isolate how much.
+
+### The durability trap (why this machine was worth running)
+
+The M3 run exposed a bug in the benchmark **and** one in mpedb — both invisible
+on Linux, both in the same direction: *pretending a write was durable.*
+
+On macOS, `fsync()` does not flush the drive's write cache; only
+`fcntl(F_FULLFSYNC)` does. Two consequences we had both gotten wrong:
+
+1. **SQLite** `synchronous=FULL` alone is not power-loss durable — its
+   `unixSync` only issues `F_FULLFSYNC` when `PRAGMA fullfsync` is on, and that
+   defaults to **off**. The harness never set it.
+2. **mpedb** `durability=commit` was not power-loss durable either — the earlier
+   macOS port routed `os::fdatasync` (the WAL path) through `F_FULLFSYNC`, but
+   the commit path's barrier is `msync(MS_SYNC)`, which on macOS hands pages to
+   the filesystem and stops there.
+
+Single-client durable INSERT, before and after making both engines honest:
+
+| | ops/s | p50 | really durable? |
+|---|--:|--:|---|
+| SQLite FULL (harness default) | 26,642 | 25 µs | ❌ |
+| mpedb `commit` (before fix) | 7,583 | 127 µs | ❌ |
+| **SQLite FULL + `fullfsync`** | **286** | 3,815 µs | ✅ |
+| **mpedb `wal`** | **293** | 3,091 µs | ✅ |
+| **mpedb `commit` (after fix)** | **142** | 6,999 µs | ✅ (two flushes — see Known issues) |
+
+**~290 ops/s is simply what an Apple SSD platter flush costs.** Everything above
+it was an engine skipping the flush. Honest verdict on this machine: mpedb `wal`
+and SQLite-with-fullfsync are **tied** (293 vs 286) at genuinely durable
+single-client inserts; the 93× and 26× "wins" either engine appeared to have
+were measurement artifacts. Both fixes are committed.
+
 ## Reading run-to-run deltas — the control-group method
 
 **A stray process ate half this machine for five days.** An unrelated orphaned
@@ -168,6 +227,16 @@ controls**; and treat multi-threaded ratios from a loaded host as unusable, not
 merely noisy.
 
 ## Known issues / improvement opportunities
+
+0. **macOS `durability=commit` pays two platter flushes per commit.** The commit
+   path msyncs the data range and then the meta page, and each `msync_range` now
+   follows with `F_FULLFSYNC` (required — `msync(MS_SYNC)` does not flush the
+   drive cache on macOS). But `F_FULLFSYNC` is per-*fd*, not per-range, so one
+   barrier before the ack would cover both: measured 142 ops/s (~7 ms = 2×3.5 ms)
+   where `wal` gets 293 ops/s with a single flush. Fixing it means moving the
+   barrier out of `msync_range` and into the commit path — reviewed protocol code
+   (DESIGN.md §5), so it needs the design-review treatment, not a quick edit.
+   Linux is unaffected (its `msync(MS_SYNC)` already runs `vfs_fsync`).
 
 1. **`newest_meta` stale-gate race (durability=commit).** A reader that loads the
    `durable_txn` gate, then is descheduled while two durable commits land, gets a
