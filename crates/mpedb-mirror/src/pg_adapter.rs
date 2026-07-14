@@ -41,8 +41,53 @@ fn q(ident: &str) -> String {
     format!("\"{}\"", ident.replace('"', "\"\""))
 }
 
+/// `postgres::Error`'s own Display is famously useless ("db error"): the message,
+/// SQLSTATE, and detail live in the source chain. Walk it, or every mirror
+/// failure against a live PG is undiagnosable.
 fn pgerr(e: postgres::Error) -> Error {
-    Error::Config(format!("postgres: {e}"))
+    use std::error::Error as _;
+    let mut msg = format!("postgres: {e}");
+    let mut src = e.source();
+    while let Some(s) = src {
+        msg.push_str(&format!(": {s}"));
+        src = s.source();
+    }
+    Error::Config(msg)
+}
+
+/// Apply one op inside its own SAVEPOINT (DESIGN-MIRROR §6). Without this a
+/// single row the source rejects — CHECK/FK/NOT NULL, int-range or typmod
+/// overflow (mpedb widens int2/int4 to Int64, so a local write can legally hold
+/// a value the source column cannot), NUL-in-text, enum label, source RLS —
+/// poisons the whole batch transaction, and since the dirty entry survives, every
+/// retry hits the same error: write-back wedges permanently (review CONF#38).
+///
+/// `Ok(true)` = applied, `Ok(false)` = the source rejected THIS row → the caller
+/// parks it and the batch continues. A non-`DbError` (connection/protocol) is NOT
+/// a verdict about the row and still propagates — swallowing it would silently
+/// drop data.
+fn apply_op_savepointed(
+    tx: &mut postgres::Transaction,
+    src: &PgTable,
+    op: &NetOp,
+) -> Result<bool> {
+    tx.batch_execute("SAVEPOINT mpedb_op").map_err(pgerr)?;
+    let r = match &op.kind {
+        NetOpKind::Upsert(row) => pg_upsert(tx, src, row),
+        NetOpKind::Delete => pg_delete(tx, src, &op.pk),
+    };
+    match r {
+        Ok(()) => {
+            tx.batch_execute("RELEASE SAVEPOINT mpedb_op").map_err(pgerr)?;
+            Ok(true)
+        }
+        Err(e) if e.as_db_error().is_some() => {
+            tx.batch_execute("ROLLBACK TO SAVEPOINT mpedb_op")
+                .map_err(pgerr)?;
+            Ok(false)
+        }
+        Err(e) => Err(pgerr(e)),
+    }
 }
 
 impl PgAdapter {
@@ -226,9 +271,9 @@ impl SourceAdapter for PgAdapter {
         Vec::new()
     }
 
-    fn push(&mut self, ops: &[NetOp]) -> Result<()> {
+    fn push(&mut self, ops: &[NetOp]) -> Result<Vec<bool>> {
         if ops.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         // clone touched-table metadata (avoids borrowing self across the txn)
         let mut metas: BTreeMap<u32, PgTable> = BTreeMap::new();
@@ -255,15 +300,13 @@ impl SourceAdapter for PgAdapter {
         ))
         .map_err(pgerr)?;
 
+        let mut results = Vec::with_capacity(ops.len());
         for op in ops {
             let src = &metas[&op.table_id];
-            match &op.kind {
-                NetOpKind::Upsert(row) => pg_upsert(&mut tx, src, row)?,
-                NetOpKind::Delete => pg_delete(&mut tx, src, &op.pk)?,
-            }
+            results.push(apply_op_savepointed(&mut tx, src, op)?);
         }
         tx.commit().map_err(pgerr)?;
-        Ok(())
+        Ok(results)
     }
 
     fn push_checked(&mut self, from: &Cursor, ops: &[NetOp]) -> Result<Vec<bool>> {
@@ -308,11 +351,8 @@ impl SourceAdapter for PgAdapter {
                 results.push(false); // source concurrently won — leave un-applied
                 continue;
             }
-            match &op.kind {
-                NetOpKind::Upsert(row) => pg_upsert(&mut tx, src, row)?,
-                NetOpKind::Delete => pg_delete(&mut tx, src, &op.pk)?,
-            }
-            results.push(true);
+            // a row the source rejects parks alone; it must not poison the batch
+            results.push(apply_op_savepointed(&mut tx, src, op)?);
         }
         tx.commit().map_err(pgerr)?;
         Ok(results)
@@ -505,7 +545,11 @@ fn uuid_string(b: &[u8]) -> String {
     }
 }
 
-fn pg_upsert(tx: &mut postgres::Transaction, src: &PgTable, row: &[Value]) -> Result<()> {
+fn pg_upsert(
+    tx: &mut postgres::Transaction,
+    src: &PgTable,
+    row: &[Value],
+) -> std::result::Result<(), postgres::Error> {
     let mut cols = Vec::new();
     let mut exprs = Vec::new();
     let mut params: Vec<Option<String>> = Vec::new();
@@ -546,7 +590,7 @@ fn pg_upsert(tx: &mut postgres::Transaction, src: &PgTable, row: &[Value]) -> Re
     );
     let boxed: Vec<&(dyn ToSql + Sync)> =
         params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-    tx.execute(&sql, &boxed).map_err(pgerr)?;
+    tx.execute(&sql, &boxed)?;
     Ok(())
 }
 
@@ -610,7 +654,11 @@ fn pg_source_changed(
     Ok(exists)
 }
 
-fn pg_delete(tx: &mut postgres::Transaction, src: &PgTable, pk: &[Value]) -> Result<()> {
+fn pg_delete(
+    tx: &mut postgres::Transaction,
+    src: &PgTable,
+    pk: &[Value],
+) -> std::result::Result<(), postgres::Error> {
     let where_sql = src
         .pk
         .iter()
@@ -627,7 +675,7 @@ fn pg_delete(tx: &mut postgres::Transaction, src: &PgTable, pk: &[Value]) -> Res
         .collect();
     let boxed: Vec<&(dyn ToSql + Sync)> =
         params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
-    tx.execute(&sql, &boxed).map_err(pgerr)?;
+    tx.execute(&sql, &boxed)?;
     Ok(())
 }
 

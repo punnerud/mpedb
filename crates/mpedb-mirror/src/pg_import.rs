@@ -251,4 +251,189 @@ mod tests {
 
         let _ = std::fs::remove_file(&dest);
     }
+
+    /// §10.8 PG fidelity matrix — the property that keeps the mirror quiet.
+    ///
+    /// Import fidelity (the test above) is only half of it. For a table marked
+    /// `rw`, every column must survive the FULL loop — PG → mpedb → push → PG —
+    /// byte-stably, or the value we push back reads differently on the next pull,
+    /// the row re-flags as dirty forever, and the mirror generates an unbounded
+    /// self-inflicted write storm (DESIGN-MIRROR §4.5 "fidelity rule", §9
+    /// "phantom-diff storm"). So the assertion that matters is the FIXPOINT: after
+    /// a local write of every mapped type and a push, `verify` holds AND a further
+    /// pull applies nothing.
+    #[test]
+    #[ignore = "needs PostgreSQL (run with --ignored)"]
+    fn pg_fidelity_matrix_roundtrips_and_reaches_a_fixpoint() {
+        use crate::switch::{drain_pull, drain_push, switch_to_mpedb};
+        use crate::{verify, PgAdapter};
+
+        let pg = crate::pg_harness::ThrowawayPg::start();
+        let mut c = pg.client();
+        // one column per mapped type, including the edge values the review flagged
+        c.batch_execute(
+            "CREATE TABLE m(
+                 id bigint PRIMARY KEY,
+                 i2 smallint, i4 int, i8 bigint,
+                 f4 real, f8 double precision,
+                 b boolean,
+                 t text, vc varchar(32),
+                 num numeric,
+                 bin bytea,
+                 uid uuid,
+                 js jsonb,
+                 ts timestamptz,
+                 tsn timestamp,
+                 dt date);
+             INSERT INTO m VALUES
+                 (1, 32767, 2147483647, 9223372036854775807,
+                  0.5, 1.7976931348623157e308,
+                  true,
+                  'unicode: æøå 日本語 ⛄', 'varchar',
+                  '12.34',
+                  '\\xdeadbeef',
+                  '00112233-4455-6677-8899-aabbccddeeff',
+                  '{\"b\":1,\"a\":[2,3]}',
+                  '2023-11-14T22:13:20Z', '2023-11-14T22:13:20', '2023-11-14'),
+                 (2, -32768, -2147483648, -9223372036854775808,
+                  -0.5, -1.7976931348623157e308,
+                  false,
+                  '', '',
+                  '0.01',
+                  '\\x',
+                  NULL,
+                  '{}',
+                  '1970-01-01T00:00:00Z', '1970-01-01T00:00:00', '1970-01-01'),
+                 (3, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                  NULL, NULL, NULL, NULL, NULL);",
+        )
+        .unwrap();
+
+        let dest = tmp("pg-fidelity");
+        let (db, report) = import_pg(&mut c, &dest, &ImportOptions::default()).unwrap();
+        assert_eq!(report.total_rows(), 3);
+
+        let mut a = PgAdapter::new(pg.client(), None, &[]).unwrap();
+        a.install_triggers().unwrap();
+        assert!(verify(&db, &mut a).unwrap(), "import must land byte-identical");
+
+        // mpedb takes authority so pushes are unconditional (local-wins)
+        switch_to_mpedb(&db, &mut a).unwrap();
+
+        // Touch every column locally, re-writing each row with values read back
+        // out of mpedb itself — exactly what an application editing the mirror
+        // does, and the shape that exposes an asymmetric read/write mapping.
+        let before = rows(&db, "SELECT id, i2, i4, i8, f4, f8, b, t, vc, num, bin, uid, js, ts, tsn, dt FROM m", &[]);
+        assert_eq!(before.len(), 3);
+        for r in &before {
+            let id = r[0].clone();
+            // flip one cheap column so the row is genuinely dirty, keep the rest
+            db.query(
+                "UPDATE m SET i4 = $1, t = $2 WHERE id = $3",
+                &[
+                    // stay inside int4: this test is about type fidelity, not
+                    // range overflow (that is push_rejected_row_parks_alone)
+                    match &r[2] {
+                        Value::Int(v) => Value::Int(v / 2),
+                        _ => Value::Int(7),
+                    },
+                    match &r[7] {
+                        Value::Text(s) => Value::Text(format!("{s}!")),
+                        _ => Value::Text("touched".into()),
+                    },
+                    id,
+                ],
+            )
+            .unwrap();
+        }
+
+        let pushed = drain_push(&db, &mut a).unwrap();
+        assert_eq!(pushed.upserts, 3, "every touched row must reach the source");
+        assert_eq!(pushed.conflicts, 0);
+        assert!(
+            verify(&db, &mut a).unwrap(),
+            "after push the source must equal mpedb — a lossy column mapping shows up here"
+        );
+
+        // THE FIXPOINT: our own push must not come back as a change. A pull now
+        // applies nothing (echo-suppressed + state-identical), and the sides stay
+        // identical. If any type's read/write mapping were asymmetric, the row
+        // would re-flag every round forever.
+        let applied = drain_pull(&db, &mut a).unwrap();
+        assert_eq!(applied, 0, "push echoes must not re-apply as changes");
+        assert!(verify(&db, &mut a).unwrap(), "still identical after the echo pull");
+
+        // and the dirty set is fully drained — nothing left to re-push
+        let again = drain_push(&db, &mut a).unwrap();
+        assert_eq!(
+            (again.upserts, again.deletes, again.conflicts),
+            (0, 0, 0),
+            "a second push must find nothing: the fixpoint is reached"
+        );
+
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// Review CONF#38: a row the SOURCE rejects must park alone, not wedge
+    /// write-back. mpedb widens int4 to Int64, so a perfectly legal local write
+    /// can hold a value the source column cannot take — and the source is right
+    /// to refuse it. Before the per-op SAVEPOINT, that one row poisoned the batch
+    /// transaction; since its dirty entry survives, every retry hit the same
+    /// error and write-back was wedged permanently.
+    #[test]
+    #[ignore = "needs PostgreSQL (run with --ignored)"]
+    fn push_rejected_row_parks_alone_and_the_batch_still_lands() {
+        use crate::switch::{drain_push, switch_to_mpedb};
+        use crate::PgAdapter;
+
+        let pg = crate::pg_harness::ThrowawayPg::start();
+        let mut c = pg.client();
+        c.batch_execute(
+            "CREATE TABLE r(id bigint PRIMARY KEY, narrow int, note text);
+             INSERT INTO r VALUES (1,1,'a'), (2,2,'b'), (3,3,'c');",
+        )
+        .unwrap();
+
+        let dest = tmp("pg-reject");
+        let (db, _) = import_pg(&mut c, &dest, &ImportOptions::default()).unwrap();
+        let mut a = PgAdapter::new(pg.client(), None, &[]).unwrap();
+        a.install_triggers().unwrap();
+        switch_to_mpedb(&db, &mut a).unwrap();
+
+        // row 2 gets a value int4 cannot hold; rows 1 and 3 are ordinary edits
+        db.query("UPDATE r SET note=$1 WHERE id=$2", &[Value::Text("a2".into()), Value::Int(1)])
+            .unwrap();
+        db.query(
+            "UPDATE r SET narrow=$1 WHERE id=$2",
+            &[Value::Int(4_000_000_000), Value::Int(2)],
+        )
+        .unwrap();
+        db.query("UPDATE r SET note=$1 WHERE id=$2", &[Value::Text("c2".into()), Value::Int(3)])
+            .unwrap();
+
+        // the push must SUCCEED, land the good rows, and park the bad one
+        let s = drain_push(&db, &mut a).unwrap();
+        assert_eq!(s.upserts, 2, "the two valid rows must reach the source");
+        assert_eq!(s.conflicts, 1, "the rejected row must be parked, not fatal");
+
+        let got: Vec<(i64, String)> = a
+            .client()
+            .query("SELECT id, note FROM r ORDER BY id", &[])
+            .unwrap()
+            .iter()
+            .map(|r| (r.get::<_, i64>(0), r.get::<_, String>(1)))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, "a2".into()), (2, "b".into()), (3, "c2".into())],
+            "good rows landed; the rejected row keeps its old source value"
+        );
+
+        // and it is not a wedge: pushing again still works and still parks just it
+        let s2 = drain_push(&db, &mut a).unwrap();
+        assert_eq!(s2.upserts, 0);
+        assert_eq!(s2.conflicts, 1, "the offender stays parked, write-back keeps working");
+
+        let _ = std::fs::remove_file(&dest);
+    }
 }

@@ -99,8 +99,10 @@ pub fn push_batch<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<Pu
             .unwrap_or_else(|| adapter.zero_cursor());
         adapter.push_checked(&from, &ops)?
     } else {
-        adapter.push(&ops)?;
-        vec![true; ops.len()]
+        // local-wins, but still per-op: a row the source REJECTS (a constraint
+        // mpedb does not mirror, a value outside a narrower source column) parks
+        // alone rather than wedging the whole write-back (CONF#38).
+        adapter.push(&ops)?
     };
     if applied.len() != ops.len() {
         return Err(Error::Corrupt("push_checked returned a mis-sized result".into()));

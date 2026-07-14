@@ -344,9 +344,9 @@ impl SourceAdapter for SqliteAdapter {
         self.read_all_rows(table_id)
     }
 
-    fn push(&mut self, ops: &[NetOp]) -> Result<()> {
+    fn push(&mut self, ops: &[NetOp]) -> Result<Vec<bool>> {
         if ops.is_empty() {
-            return Ok(());
+            return Ok(Vec::new());
         }
         // clone metadata for the touched tables (avoids borrowing self across
         // the transaction that borrows self.conn)
@@ -375,12 +375,11 @@ impl SourceAdapter for SqliteAdapter {
             premax.insert(tid, mx);
         }
 
+        let mut results = Vec::with_capacity(ops.len());
         for op in ops {
             let src = &metas[&op.table_id];
-            match &op.kind {
-                NetOpKind::Upsert(row) => apply_upsert(&tx, src, row)?,
-                NetOpKind::Delete => apply_delete(&tx, src, &op.pk)?,
-            }
+            // a row the source rejects parks alone; it must not poison the batch
+            results.push(apply_op_savepointed(&tx, src, op)?);
         }
 
         // echo tag: mark the changelog rows this push just produced
@@ -393,7 +392,7 @@ impl SourceAdapter for SqliteAdapter {
             .map_err(sqlerr)?;
         }
         tx.commit().map_err(sqlerr)?;
-        Ok(())
+        Ok(results)
     }
 
     fn push_checked(&mut self, from: &Cursor, ops: &[NetOp]) -> Result<Vec<bool>> {
@@ -443,11 +442,7 @@ impl SourceAdapter for SqliteAdapter {
                 results.push(false); // source concurrently won — leave un-applied
                 continue;
             }
-            match &op.kind {
-                NetOpKind::Upsert(row) => apply_upsert(&tx, src, row)?,
-                NetOpKind::Delete => apply_delete(&tx, src, &op.pk)?,
-            }
-            results.push(true);
+            results.push(apply_op_savepointed(&tx, src, op)?);
         }
 
         // echo-tag only the changelog rows our applied writes produced
@@ -527,7 +522,11 @@ impl SourceAdapter for SqliteAdapter {
 
 /// `INSERT … ON CONFLICT(pk) DO UPDATE …` — never `INSERT OR REPLACE` (which
 /// deletes+reinserts and re-fires cascades).
-fn apply_upsert(tx: &rusqlite::Transaction, src: &SourceTable, row: &[Value]) -> Result<()> {
+fn apply_upsert(
+    tx: &rusqlite::Transaction,
+    src: &SourceTable,
+    row: &[Value],
+) -> std::result::Result<(), rusqlite::Error> {
     let cols: Vec<String> = src.columns.iter().map(|c| q(&c.name)).collect();
     let placeholders = vec!["?"; row.len()].join(", ");
     let pk_cols: Vec<String> = src.pk.iter().map(|&i| q(&src.columns[i].name)).collect();
@@ -549,9 +548,55 @@ fn apply_upsert(tx: &rusqlite::Transaction, src: &SourceTable, row: &[Value]) ->
         cols.join(", ")
     );
     let params: Vec<SqlVal> = row.iter().map(crate::export::to_sql).collect();
-    tx.execute(&sql, rusqlite::params_from_iter(params.iter()))
-        .map_err(sqlerr)?;
+    tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
     Ok(())
+}
+
+/// Apply one op inside its own SAVEPOINT — the sqlite twin of the PG helper
+/// (DESIGN-MIRROR §6, review CONF#38). A row the source rejects (CHECK, FK,
+/// NOT NULL, a value outside a narrower source column's range…) parks alone
+/// instead of poisoning the batch and wedging write-back forever.
+///
+/// `Ok(true)` = applied, `Ok(false)` = the source rejected THIS row. Errors that
+/// are not a per-row verdict — I/O, corruption, a locked database — propagate:
+/// swallowing them would silently drop data.
+fn apply_op_savepointed(
+    tx: &rusqlite::Transaction,
+    src: &SourceTable,
+    op: &NetOp,
+) -> Result<bool> {
+    tx.execute_batch("SAVEPOINT mpedb_op").map_err(sqlerr)?;
+    let r = match &op.kind {
+        NetOpKind::Upsert(row) => apply_upsert(tx, src, row),
+        NetOpKind::Delete => apply_delete(tx, src, &op.pk),
+    };
+    match r {
+        Ok(()) => {
+            tx.execute_batch("RELEASE mpedb_op").map_err(sqlerr)?;
+            Ok(true)
+        }
+        Err(e) if is_row_rejection(&e) => {
+            tx.execute_batch("ROLLBACK TO mpedb_op").map_err(sqlerr)?;
+            tx.execute_batch("RELEASE mpedb_op").map_err(sqlerr)?;
+            Ok(false)
+        }
+        Err(e) => Err(sqlerr(e)),
+    }
+}
+
+/// A constraint/type verdict about one row (park it) vs. a real failure of the
+/// database or connection (propagate).
+fn is_row_rejection(e: &rusqlite::Error) -> bool {
+    use rusqlite::ffi::ErrorCode;
+    match e {
+        rusqlite::Error::SqliteFailure(err, _) => matches!(
+            err.code,
+            ErrorCode::ConstraintViolation | ErrorCode::TypeMismatch | ErrorCode::ApiMisuse
+        ),
+        // a value we cannot even bind is likewise this row's problem
+        rusqlite::Error::ToSqlConversionFailure(_) | rusqlite::Error::IntegralValueOutOfRange(..) => true,
+        _ => false,
+    }
 }
 
 /// Did the source change this PK in `(from_seq, …]` by something other than our
@@ -585,7 +630,11 @@ fn source_changed(
     Ok(exists != 0)
 }
 
-fn apply_delete(tx: &rusqlite::Transaction, src: &SourceTable, pk: &[Value]) -> Result<()> {
+fn apply_delete(
+    tx: &rusqlite::Transaction,
+    src: &SourceTable,
+    pk: &[Value],
+) -> std::result::Result<(), rusqlite::Error> {
     let where_sql = src
         .pk
         .iter()
@@ -595,8 +644,7 @@ fn apply_delete(tx: &rusqlite::Transaction, src: &SourceTable, pk: &[Value]) -> 
         .join(" AND ");
     let sql = format!("DELETE FROM {} WHERE {where_sql}", q(&src.name));
     let params: Vec<SqlVal> = pk.iter().map(crate::export::to_sql).collect();
-    tx.execute(&sql, rusqlite::params_from_iter(params.iter()))
-        .map_err(sqlerr)?;
+    tx.execute(&sql, rusqlite::params_from_iter(params.iter()))?;
     Ok(())
 }
 
