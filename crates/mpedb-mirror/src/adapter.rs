@@ -71,4 +71,12 @@ pub trait SourceAdapter {
     /// Read every current row of a mirrored table as mpedb values, in PK order.
     /// Used by the merge-diff / anti-entropy reconcile (§5.5) and no-touch mode.
     fn read_table_rows(&mut self, table_id: u32) -> Result<Vec<Vec<Value>>>;
+
+    /// Apply local mpedb changes back to the source (write-back, §6): each
+    /// `NetOp` is an upsert (full row image) or delete by PK. The adapter applies
+    /// them in ONE source transaction and tags its own writes so they are
+    /// filtered out of the next pull (echo suppression). Conflict resolution
+    /// (source concurrently changed the same PK) is layered in M7; v1 push is
+    /// last-writer-wins from mpedb.
+    fn push(&mut self, ops: &[NetOp]) -> Result<()>;
 }

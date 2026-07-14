@@ -224,6 +224,10 @@ impl SourceAdapter for PgAdapter {
         Vec::new()
     }
 
+    fn push(&mut self, _ops: &[NetOp]) -> Result<()> {
+        Err(Error::Unsupported("PostgreSQL push lands in M5.3".into()))
+    }
+
     fn read_table_rows(&mut self, table_id: u32) -> Result<Vec<Vec<Value>>> {
         let src = self
             .tables

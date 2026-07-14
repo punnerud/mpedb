@@ -46,7 +46,8 @@ fn sqlite_type(ct: ColumnType) -> &'static str {
 }
 
 /// Reverse value mapping (mpedb → sqlite), inverse of import's `convert_value`.
-fn to_sql(v: &Value) -> SqlVal {
+/// Shared with the push adapter.
+pub(crate) fn to_sql(v: &Value) -> SqlVal {
     match v {
         Value::Null => SqlVal::Null,
         Value::Int(i) => SqlVal::Integer(*i),

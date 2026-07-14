@@ -15,6 +15,11 @@ use crate::sqlite::{introspect, SourceColumn, SourceTable};
 use crate::sqlite_track::{log_table, log_head, SqliteCursor, OP_TOMBSTONE, OP_UPSERT};
 
 /// Per-mirrored-table metadata the adapter needs.
+/// Origin tag stamped on this mirror's own pushed changelog rows and filtered
+/// out of pulls (echo suppression, §6). Per-mirror-id scoping is a multi-replica
+/// refinement (review CONF#45).
+const SELF_ORIGIN: &str = "mpedb";
+
 struct TableMeta {
     table_id: u32,
     src: SourceTable,
@@ -160,8 +165,11 @@ impl SqliteAdapter {
         let npk = src.pk.len();
         let log = log_table(&src.name);
         let pk_log_cols: Vec<String> = (0..npk).map(|i| format!("pk{i}")).collect();
+        // filter our own pushed rows (origin tag) for echo suppression (§6)
         let sql = format!(
-            "SELECT seq, op, {} FROM {} WHERE seq > ?1 ORDER BY seq LIMIT ?2",
+            "SELECT seq, op, {} FROM {} \
+             WHERE seq > ?1 AND (origin IS NULL OR origin <> '{SELF_ORIGIN}') \
+             ORDER BY seq LIMIT ?2",
             pk_log_cols.join(", "),
             q(&log)
         );
@@ -335,6 +343,102 @@ impl SourceAdapter for SqliteAdapter {
     fn read_table_rows(&mut self, table_id: u32) -> Result<Vec<Vec<Value>>> {
         self.read_all_rows(table_id)
     }
+
+    fn push(&mut self, ops: &[NetOp]) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        // clone metadata for the touched tables (avoids borrowing self across
+        // the transaction that borrows self.conn)
+        let mut metas: BTreeMap<u32, SourceTable> = BTreeMap::new();
+        for op in ops {
+            if let std::collections::btree_map::Entry::Vacant(e) = metas.entry(op.table_id) {
+                let src = self
+                    .tables
+                    .iter()
+                    .find(|t| t.table_id == op.table_id)
+                    .ok_or_else(|| Error::Config(format!("push to unmirrored table {}", op.table_id)))?
+                    .src
+                    .clone();
+                e.insert(src);
+            }
+        }
+
+        let tx = self.conn.transaction().map_err(sqlerr)?;
+        // remember each touched changelog's head so we can tag OUR rows afterward
+        let mut premax: BTreeMap<u32, i64> = BTreeMap::new();
+        for (&tid, src) in &metas {
+            let log = log_table(&src.name);
+            let mx: i64 = tx
+                .query_row(&format!("SELECT COALESCE(MAX(seq),0) FROM {}", q(&log)), [], |r| r.get(0))
+                .map_err(sqlerr)?;
+            premax.insert(tid, mx);
+        }
+
+        for op in ops {
+            let src = &metas[&op.table_id];
+            match &op.kind {
+                NetOpKind::Upsert(row) => apply_upsert(&tx, src, row)?,
+                NetOpKind::Delete => apply_delete(&tx, src, &op.pk)?,
+            }
+        }
+
+        // echo tag: mark the changelog rows this push just produced
+        for (&tid, src) in &metas {
+            let log = log_table(&src.name);
+            tx.execute(
+                &format!("UPDATE {} SET origin='{SELF_ORIGIN}' WHERE seq > ?1", q(&log)),
+                rusqlite::params![premax[&tid]],
+            )
+            .map_err(sqlerr)?;
+        }
+        tx.commit().map_err(sqlerr)?;
+        Ok(())
+    }
+}
+
+/// `INSERT … ON CONFLICT(pk) DO UPDATE …` — never `INSERT OR REPLACE` (which
+/// deletes+reinserts and re-fires cascades).
+fn apply_upsert(tx: &rusqlite::Transaction, src: &SourceTable, row: &[Value]) -> Result<()> {
+    let cols: Vec<String> = src.columns.iter().map(|c| q(&c.name)).collect();
+    let placeholders = vec!["?"; row.len()].join(", ");
+    let pk_cols: Vec<String> = src.pk.iter().map(|&i| q(&src.columns[i].name)).collect();
+    let non_pk: Vec<String> = (0..src.columns.len())
+        .filter(|i| !src.pk.contains(i))
+        .map(|i| {
+            let c = q(&src.columns[i].name);
+            format!("{c}=excluded.{c}")
+        })
+        .collect();
+    let conflict = if non_pk.is_empty() {
+        format!("ON CONFLICT({}) DO NOTHING", pk_cols.join(", "))
+    } else {
+        format!("ON CONFLICT({}) DO UPDATE SET {}", pk_cols.join(", "), non_pk.join(", "))
+    };
+    let sql = format!(
+        "INSERT INTO {} ({}) VALUES ({placeholders}) {conflict}",
+        q(&src.name),
+        cols.join(", ")
+    );
+    let params: Vec<SqlVal> = row.iter().map(crate::export::to_sql).collect();
+    tx.execute(&sql, rusqlite::params_from_iter(params.iter()))
+        .map_err(sqlerr)?;
+    Ok(())
+}
+
+fn apply_delete(tx: &rusqlite::Transaction, src: &SourceTable, pk: &[Value]) -> Result<()> {
+    let where_sql = src
+        .pk
+        .iter()
+        .enumerate()
+        .map(|(j, &i)| format!("{} IS ?{}", q(&src.columns[i].name), j + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!("DELETE FROM {} WHERE {where_sql}", q(&src.name));
+    let params: Vec<SqlVal> = pk.iter().map(crate::export::to_sql).collect();
+    tx.execute(&sql, rusqlite::params_from_iter(params.iter()))
+        .map_err(sqlerr)?;
+    Ok(())
 }
 
 #[cfg(test)]
