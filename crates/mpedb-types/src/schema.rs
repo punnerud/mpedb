@@ -441,4 +441,41 @@ mod tests {
         }]);
         assert!(bad.is_err());
     }
+    /// **The constraint that blocks `CREATE TABLE`.** Read this before adding
+    /// schema evolution.
+    ///
+    /// A table's id is its index in the NAME-SORTED table vector. So adding a
+    /// table does not append an id — it RENUMBERS every table that sorts after
+    /// the new name. And a table id is not a label; it is a key:
+    ///
+    /// - `cat_tree_key(table_id, index_no)` maps a table to its actual B+tree
+    ///   ROOT. Renumber, and `accounts` (new id 0) reads the tree holding
+    ///   `orders`' rows — silent cross-table corruption, not a stale view.
+    /// - the `cdc\0tabs` capture/write-block bitmaps address tables BY BIT
+    ///   POSITION, so capture would follow the wrong table.
+    /// - the mirror's `map/<tid>`, `imp/<tid>`, `park/<tid>` families all key on
+    ///   it, so type provenance would describe the wrong table.
+    /// - every compiled plan carries `table: u32`.
+    ///
+    /// A Django migration adding `accounts` to a database with `orders` and
+    /// `users` hits exactly this. Making `CREATE TABLE` possible therefore means
+    /// decoupling the id from the sort position (a stable id stored in the
+    /// schema), not bolting DDL onto the parser.
+    #[test]
+    fn a_table_id_is_its_sort_position_so_adding_a_table_renumbers() {
+        let col = |n: &str| ColumnDef { name: n.into(), ty: ColumnType::Int64,
+            nullable: false, unique: false, default: None, check: None };
+        let tbl = |n: &str| TableDef { name: n.into(), columns: vec![col("id")], primary_key: vec![0] };
+
+        let before = Schema::new(vec![tbl("orders"), tbl("users")]).unwrap();
+        eprintln!("  before: orders={:?} users={:?}",
+            before.table_id("orders"), before.table_id("users"));
+
+        // A Django migration adds `accounts` -- a name that sorts FIRST.
+        let after = Schema::new(vec![tbl("orders"), tbl("users"), tbl("accounts")]).unwrap();
+        eprintln!("  after:  accounts={:?} orders={:?} users={:?}",
+            after.table_id("accounts"), after.table_id("orders"), after.table_id("users"));
+        assert_ne!(before.table_id("orders"), after.table_id("orders"),
+            "adding a table must renumber -- that is the finding");
+    }
 }
