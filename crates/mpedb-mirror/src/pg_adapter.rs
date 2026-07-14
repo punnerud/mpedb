@@ -16,8 +16,10 @@ use std::collections::BTreeMap;
 use mpedb_types::{keycode, ColumnType, Error, Result, Value};
 use postgres::{Client, IsolationLevel};
 
+use postgres::types::ToSql;
+
 use crate::adapter::{Cursor, NetOp, NetOpKind, PullBatch, SourceAdapter};
-use crate::pg::{self, PgTable};
+use crate::pg::{self, PgColumn, PgTable};
 use crate::pg_import::{read_expr, read_value};
 use crate::pg_track::{OP_TOMBSTONE, OP_TRUNCATE, OP_UPSERT};
 
@@ -224,8 +226,44 @@ impl SourceAdapter for PgAdapter {
         Vec::new()
     }
 
-    fn push(&mut self, _ops: &[NetOp]) -> Result<()> {
-        Err(Error::Unsupported("PostgreSQL push lands in M5.3".into()))
+    fn push(&mut self, ops: &[NetOp]) -> Result<()> {
+        if ops.is_empty() {
+            return Ok(());
+        }
+        // clone touched-table metadata (avoids borrowing self across the txn)
+        let mut metas: BTreeMap<u32, PgTable> = BTreeMap::new();
+        for op in ops {
+            if let std::collections::btree_map::Entry::Vacant(e) = metas.entry(op.table_id) {
+                let src = self
+                    .tables
+                    .iter()
+                    .find(|t| t.table_id == op.table_id)
+                    .ok_or_else(|| Error::Config(format!("push to unmirrored table {}", op.table_id)))?
+                    .src
+                    .clone();
+                e.insert(src);
+            }
+        }
+        let origin = self.origin.clone();
+
+        let mut tx = self.client.transaction().map_err(pgerr)?;
+        // echo suppression: the capture trigger stamps origin from this GUC, so
+        // our own writes are filtered out of the next pull (§6).
+        tx.batch_execute(&format!(
+            "SET LOCAL mpedb.mirror_origin = '{}'",
+            origin.replace('\'', "''")
+        ))
+        .map_err(pgerr)?;
+
+        for op in ops {
+            let src = &metas[&op.table_id];
+            match &op.kind {
+                NetOpKind::Upsert(row) => pg_upsert(&mut tx, src, row)?,
+                NetOpKind::Delete => pg_delete(&mut tx, src, &op.pk)?,
+            }
+        }
+        tx.commit().map_err(pgerr)?;
+        Ok(())
     }
 
     fn read_table_rows(&mut self, table_id: u32) -> Result<Vec<Vec<Value>>> {
@@ -296,6 +334,123 @@ fn reread_row(
             .map(|(i, &ct)| read_value(row, i, ct))
             .collect(),
     ))
+}
+
+/// An mpedb value as text, in the form `pg_value_expr` casts back to the source
+/// type. `None` binds SQL NULL.
+fn to_pg_text(v: &Value, c: &PgColumn) -> Option<String> {
+    match v {
+        Value::Null => None,
+        Value::Int(i) => Some(i.to_string()),
+        Value::Float(f) => Some(f.to_string()),
+        Value::Bool(b) => Some(if *b { "true".into() } else { "false".into() }),
+        Value::Text(s) => Some(s.clone()),
+        Value::Timestamp(us) => Some(us.to_string()),
+        Value::Blob(b) => Some(match c.pg_type.as_str() {
+            "uuid" => uuid_string(b),
+            _ => hex(b),
+        }),
+    }
+}
+
+/// The `VALUES` expression that casts a text param `$idx` back to the source
+/// column type — the inverse of `pg_import::read_expr`.
+fn pg_value_expr(c: &PgColumn, idx: usize) -> String {
+    let p = format!("${idx}::text");
+    match c.pg_type.as_str() {
+        "int2" | "int4" | "int8" | "float4" | "float8" | "bool" | "text" | "varchar" | "bpchar"
+        | "name" | "citext" | "numeric" | "json" | "jsonb" | "uuid" => format!("{p}::{}", c.pg_type),
+        "bytea" => format!("decode({p}, 'hex')"),
+        "timestamptz" => format!("to_timestamp({p}::float8 / 1000000.0)"),
+        "timestamp" => format!("to_timestamp({p}::float8 / 1000000.0)::timestamp"),
+        "date" => format!("to_timestamp({p}::float8 / 1000000.0)::date"),
+        "time" => format!("(time '00:00:00' + ({p}::bigint) * interval '1 microsecond')"),
+        other => format!("{p}::{other}"),
+    }
+}
+
+fn hex(b: &[u8]) -> String {
+    let mut s = String::with_capacity(b.len() * 2);
+    for byte in b {
+        use std::fmt::Write as _;
+        let _ = write!(s, "{byte:02x}");
+    }
+    s
+}
+
+fn uuid_string(b: &[u8]) -> String {
+    let h = hex(b);
+    if h.len() == 32 {
+        format!("{}-{}-{}-{}-{}", &h[0..8], &h[8..12], &h[12..16], &h[16..20], &h[20..32])
+    } else {
+        h
+    }
+}
+
+fn pg_upsert(tx: &mut postgres::Transaction, src: &PgTable, row: &[Value]) -> Result<()> {
+    let mut cols = Vec::new();
+    let mut exprs = Vec::new();
+    let mut params: Vec<Option<String>> = Vec::new();
+    let mut has_identity = false;
+    for (i, c) in src.columns.iter().enumerate() {
+        if c.generated {
+            continue; // cannot INSERT a generated column
+        }
+        if c.identity {
+            has_identity = true;
+        }
+        params.push(to_pg_text(&row[i], c));
+        cols.push(q(&c.name));
+        exprs.push(pg_value_expr(c, params.len()));
+    }
+    let pk_cols: Vec<String> = src.pk.iter().map(|&i| q(&src.columns[i].name)).collect();
+    let non_pk: Vec<String> = src
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| !c.generated && !src.pk.contains(i))
+        .map(|(_, c)| {
+            let cq = q(&c.name);
+            format!("{cq}=excluded.{cq}")
+        })
+        .collect();
+    let conflict = if non_pk.is_empty() {
+        format!("ON CONFLICT ({}) DO NOTHING", pk_cols.join(", "))
+    } else {
+        format!("ON CONFLICT ({}) DO UPDATE SET {}", pk_cols.join(", "), non_pk.join(", "))
+    };
+    let overriding = if has_identity { " OVERRIDING SYSTEM VALUE" } else { "" };
+    let sql = format!(
+        "INSERT INTO \"public\".{} ({}){overriding} VALUES ({}) {conflict}",
+        q(&src.name),
+        cols.join(", "),
+        exprs.join(", ")
+    );
+    let boxed: Vec<&(dyn ToSql + Sync)> =
+        params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+    tx.execute(&sql, &boxed).map_err(pgerr)?;
+    Ok(())
+}
+
+fn pg_delete(tx: &mut postgres::Transaction, src: &PgTable, pk: &[Value]) -> Result<()> {
+    let where_sql = src
+        .pk
+        .iter()
+        .enumerate()
+        .map(|(j, &i)| format!("{}::text = ${}", q(&src.columns[i].name), j + 1))
+        .collect::<Vec<_>>()
+        .join(" AND ");
+    let sql = format!("DELETE FROM \"public\".{} WHERE {where_sql}", q(&src.name));
+    let params: Vec<Option<String>> = src
+        .pk
+        .iter()
+        .enumerate()
+        .map(|(j, &i)| to_pg_text(&pk[j], &src.columns[i]))
+        .collect();
+    let boxed: Vec<&(dyn ToSql + Sync)> =
+        params.iter().map(|p| p as &(dyn ToSql + Sync)).collect();
+    tx.execute(&sql, &boxed).map_err(pgerr)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -415,6 +570,68 @@ mod tests {
         assert_eq!(ids(&db), vec![9]);
         // reconcile again is a no-op
         assert_eq!(reconcile(&db, &mut adapter).unwrap().tables_changed, 0);
+
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    #[test]
+    #[ignore = "needs PostgreSQL (run with --ignored)"]
+    fn pg_push_writes_local_changes_back_and_suppresses_echo() {
+        use crate::push::push_batch;
+
+        let pg = crate::pg_harness::ThrowawayPg::start();
+        {
+            let mut c = pg.client();
+            c.batch_execute(
+                "CREATE TABLE t(id bigint PRIMARY KEY, v int);
+                 INSERT INTO t VALUES (1,10),(2,20),(3,30);",
+            )
+            .unwrap();
+        }
+        let dest = tmp("pg-push");
+        let db = {
+            let mut c = pg.client();
+            import_pg(&mut c, &dest, &ImportOptions::default()).unwrap().0
+        };
+
+        // LOCAL mpedb changes (captured)
+        db.query("UPDATE t SET v=$1 WHERE id=$2", &[Value::Int(99), Value::Int(1)]).unwrap();
+        db.query("INSERT INTO t (id,v) VALUES ($1,$2)", &[Value::Int(5), Value::Int(50)]).unwrap();
+        db.query("DELETE FROM t WHERE id=$1", &[Value::Int(2)]).unwrap();
+
+        let mut adapter = PgAdapter::new(pg.client(), None, &[]).unwrap();
+        adapter.install_triggers().unwrap();
+
+        let stats = push_batch(&db, &mut adapter).unwrap();
+        assert_eq!(stats.upserts, 2); // id=1 updated, id=5 new
+        assert_eq!(stats.deletes, 1); // id=2
+
+        // the source reflects the local mpedb state
+        let v1: i32 = adapter
+            .client()
+            .query_one("SELECT v FROM t WHERE id=1", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(v1, 99);
+        let n5: i64 = adapter
+            .client()
+            .query_one("SELECT count(*) FROM t WHERE id=5", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(n5, 1);
+        let n2: i64 = adapter
+            .client()
+            .query_one("SELECT count(*) FROM t WHERE id=2", &[])
+            .unwrap()
+            .get(0);
+        assert_eq!(n2, 0);
+
+        // second push is a no-op (dirty-set cleared)
+        assert_eq!(push_batch(&db, &mut adapter).unwrap().upserts, 0);
+
+        // echo suppression: our GUC-tagged writes are filtered from the pull
+        let from = adapter.zero_cursor();
+        assert!(adapter.pull(&from, 10000).unwrap().is_none());
 
         let _ = std::fs::remove_file(&dest);
     }
