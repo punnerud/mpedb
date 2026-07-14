@@ -91,22 +91,7 @@ pub fn import_sqlite(
     let schema = sqlite::build_schema(&src_tables)?;
 
     // 2. create the mpedb file (secure-by-default perms)
-    let config = Config {
-        options: DbOptions {
-            path: dest_path.to_path_buf(),
-            size_bytes: opts.size_bytes,
-            max_readers: 64,
-            durability: opts.durability,
-            concurrency: Concurrency::Serial,
-            perms: FilePerms {
-                mode: None,
-                owner: None,
-                group: None,
-            },
-        },
-        schema: schema.clone(),
-    };
-    let db = Database::open_with_config(config)?;
+    let db = create_mirror_db(dest_path, schema.clone(), opts.size_bytes, opts.durability)?;
 
     // 3. read rows from ONE sqlite snapshot (deferred txn pins at first read)
     let tx = src
@@ -133,9 +118,36 @@ pub fn import_sqlite(
         .map_err(|e| Error::Config(format!("sqlite snapshot release: {e}")))?;
 
     // 4. publish mirror config + epoch, and enable CDC capture (final commit)
-    publish_mirror_state(&db, &schema)?;
+    publish_mirror_state(&db, &schema, state::SourceKind::Sqlite)?;
 
     Ok((db, report))
+}
+
+/// Create a fresh `.mpedb` mirror file with the given schema (secure-by-default
+/// 0600 perms, serial concurrency). Shared by the sqlite and PostgreSQL import
+/// paths.
+pub(crate) fn create_mirror_db(
+    dest_path: &Path,
+    schema: mpedb_types::Schema,
+    size_bytes: u64,
+    durability: Durability,
+) -> Result<Database> {
+    let config = Config {
+        options: DbOptions {
+            path: dest_path.to_path_buf(),
+            size_bytes,
+            max_readers: 64,
+            durability,
+            concurrency: Concurrency::Serial,
+            perms: FilePerms {
+                mode: None,
+                owner: None,
+                group: None,
+            },
+        },
+        schema,
+    };
+    Database::open_with_config(config)
 }
 
 /// Stream one table's rows from the snapshot into mpedb in bounded batches,
@@ -205,7 +217,8 @@ fn import_table(
 }
 
 /// Insert one batch + its resume watermark in a single (capture-off) commit.
-fn flush_batch(
+/// Shared by the sqlite and PostgreSQL import paths.
+pub(crate) fn flush_batch(
     db: &Database,
     table_id: u32,
     pk_cols: &[usize],
@@ -269,12 +282,17 @@ pub(crate) fn convert_value(vr: ValueRef, ct: ColumnType, table: &str, col: &str
 }
 
 /// Publish `mir\0cfg`, `mir\0epoch`, and enable capture on the mirrored tables
-/// (`cdc\0tabs`) in one final commit — the S1 → SRC_AUTH handoff.
-fn publish_mirror_state(db: &Database, schema: &mpedb_types::Schema) -> Result<()> {
+/// (`cdc\0tabs`) in one final commit — the S1 → SRC_AUTH handoff. Shared by the
+/// sqlite and PostgreSQL import paths.
+pub(crate) fn publish_mirror_state(
+    db: &Database,
+    schema: &mpedb_types::Schema,
+    source_kind: state::SourceKind,
+) -> Result<()> {
     let scope: Vec<u32> = (0..schema.tables.len() as u32).collect();
     let cfg = state::MirrorConfig {
         mirror_id: mirror_id_for(db.path()),
-        source_kind: state::SourceKind::Sqlite,
+        source_kind,
         mode: state::CaptureMode::Tracked,
         canonicalization_id: 1,
         scope: scope.clone(),
