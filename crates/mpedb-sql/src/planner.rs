@@ -1105,6 +1105,46 @@ pub(crate) mod tests {
         assert!(filter_of(&p).is_some());
     }
 
+    /// The whole reason BETWEEN is desugared in the parser instead of carried
+    /// as its own node: `x >= lo AND x <= hi` is the shape extract_access
+    /// already recognises, so BETWEEN becomes a range SCAN with no residual
+    /// filter and no second spelling for the planner to learn.
+    #[test]
+    fn between_plans_as_a_range_scan_not_a_full_scan() {
+        let s = test_schema();
+        let p = prepare("SELECT * FROM users WHERE id BETWEEN 1 AND $1", &s).unwrap();
+        assert_eq!(
+            access_of(&p),
+            &AccessPath::PkRange {
+                lo: Some(KeyBound {
+                    parts: vec![KeyPart::Const(0)],
+                    inclusive: true
+                }),
+                hi: Some(KeyBound {
+                    parts: vec![KeyPart::Param(0)],
+                    inclusive: true
+                }),
+            }
+        );
+        assert!(filter_of(&p).is_none(), "BETWEEN must leave no residual filter");
+
+        // NOT BETWEEN cannot be a range (it is the complement of one), so it
+        // must fall back honestly rather than plan a wrong range.
+        let p = prepare("SELECT * FROM users WHERE id NOT BETWEEN 1 AND 5", &s).unwrap();
+        assert_eq!(access_of(&p), &AccessPath::FullScan);
+        assert!(filter_of(&p).is_some());
+    }
+
+    #[test]
+    fn in_list_is_a_full_scan_with_a_residual_for_now() {
+        // A PK IN-list could become n point lookups; it does not yet, and the
+        // honest plan is a scan plus the filter -- correct, just not clever.
+        let s = test_schema();
+        let p = prepare("SELECT * FROM users WHERE id IN (1, 2)", &s).unwrap();
+        assert_eq!(access_of(&p), &AccessPath::FullScan);
+        assert!(filter_of(&p).is_some());
+    }
+
     #[test]
     fn unique_probe_beats_pk_range() {
         // `WHERE id >= $1 AND email = $2` must be a unique probe with the
