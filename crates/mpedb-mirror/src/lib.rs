@@ -13,7 +13,9 @@ pub mod apply;
 pub mod export;
 pub mod import;
 pub mod pg;
+pub mod pg_adapter;
 pub mod pg_import;
+pub mod pg_track;
 pub mod reconcile;
 pub mod sqlite;
 pub mod sqlite_adapter;
@@ -30,6 +32,7 @@ pub use adapter::{Cursor, NetOp, NetOpKind, PullBatch, SourceAdapter};
 pub use apply::{apply_batch, ApplyStats};
 pub use export::{diff_sqlite_data, export_sqlite, ExportReport};
 pub use import::{import_sqlite, ImportOptions, ImportReport};
+pub use pg_adapter::PgAdapter;
 pub use pg_import::import_pg;
 
 pub use state::{
