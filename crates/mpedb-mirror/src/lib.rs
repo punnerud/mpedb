@@ -19,6 +19,7 @@ pub mod pg_import;
 pub mod pg_track;
 pub mod push;
 pub mod reconcile;
+pub mod resolve;
 pub mod sqlite;
 pub mod sqlite_adapter;
 pub mod sqlite_track;
@@ -38,6 +39,7 @@ pub use import::{import_sqlite, ImportOptions, ImportReport};
 pub use pg_adapter::PgAdapter;
 pub use pg_import::import_pg;
 pub use push::{push_batch, PushStats};
+pub use resolve::{resolve, ResolveStats, Take};
 
 pub use state::{
     Authority, CaptureMode, Epoch, MirrorConfig, MirrorState, SourceKind, MIR_NS,
