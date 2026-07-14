@@ -1,0 +1,306 @@
+# Aggregates: count/sum/avg/min/max, GROUP BY, HAVING, and the NULL rules.
+#
+# Every expected value in this file was produced by running the same program
+# through sqlite3 3.45 (STRICT tables) rather than reasoned out — the NULL
+# rules here are the ones that are easy to state confidently and get wrong.
+# The three that matter:
+#
+#   SUM over zero rows is NULL, but COUNT over zero rows is 0.
+#   SUM over an all-NULL group is NULL, not 0 — never seeing a value is not
+#     the same as summing nothing.
+#   AVG divides by the NON-NULL count, so avg(amt) over eng is 200, not 150.
+#
+# The two structural rules that are easy to implement wrong:
+#
+#   No GROUP BY means exactly ONE output row even over an empty table.
+#     WITH a GROUP BY, an empty input means ZERO rows.
+#   LIMIT bounds GROUPS, not input rows.
+#
+# schema:
+# [[table]]
+# name = "t"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "dept"
+#   type = "text"
+#
+#   [[table.column]]
+#   name = "amt"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "score"
+#   type = "float64"
+# end schema
+
+# An aggregate over an EMPTY table, before anything is inserted. COUNT is 0
+# and SUM is NULL, and both are ONE row: "there were no rows" is itself a
+# fact, and a bare aggregate always has exactly one group to report it in.
+query I nosort
+SELECT count(*) FROM t
+----
+0
+
+query I nosort
+SELECT sum(amt) FROM t
+----
+NULL
+
+query I nosort
+SELECT min(amt) FROM t
+----
+NULL
+
+# But WITH a GROUP BY, an empty input has no groups at all — zero rows, not a
+# row of NULLs.
+query TI nosort
+SELECT dept, count(*) FROM t GROUP BY dept
+----
+
+statement ok
+INSERT INTO t (id, dept, amt, score) VALUES (1, 'eng', 100, 1.5), (2, 'eng', 200, 2.5)
+
+statement ok
+INSERT INTO t (id, dept, amt, score) VALUES (3, 'sales', 50, NULL), (4, 'sales', NULL, 4.0)
+
+statement ok
+INSERT INTO t (id, dept, amt, score) VALUES (5, 'ops', NULL, NULL), (6, 'eng', 300, 0.5)
+
+# ---- the COUNT(*) / COUNT(x) split -------------------------------------------------
+
+query I nosort
+SELECT count(*) FROM t
+----
+6
+
+# count(amt) skips the two NULL amts. This difference IS the reason count(*)
+# exists.
+query I nosort
+SELECT count(amt) FROM t
+----
+4
+
+# ---- sum / avg / min / max ---------------------------------------------------------
+
+query I nosort
+SELECT sum(amt) FROM t
+----
+650
+
+# 650/4, not 650/6 — AVG divides by the non-NULL count.
+query R nosort
+SELECT avg(amt) FROM t
+----
+162.500
+
+query II nosort
+SELECT min(amt), max(amt) FROM t
+----
+50
+300
+
+# ---- the all-NULL group ------------------------------------------------------------
+# 'ops' has exactly one row and its amt is NULL. SUM is NULL (not 0) and
+# COUNT is 0 — the same group, two different empty-ish answers.
+
+query I nosort
+SELECT sum(amt) FROM t WHERE dept = 'ops'
+----
+NULL
+
+query I nosort
+SELECT count(amt) FROM t WHERE dept = 'ops'
+----
+0
+
+query I nosort
+SELECT count(*) FROM t WHERE dept = 'ops'
+----
+1
+
+# ---- zero matching rows ------------------------------------------------------------
+
+query I nosort
+SELECT count(*) FROM t WHERE dept = 'zzz'
+----
+0
+
+query I nosort
+SELECT sum(amt) FROM t WHERE dept = 'zzz'
+----
+NULL
+
+# ---- GROUP BY ----------------------------------------------------------------------
+
+query TII nosort
+SELECT dept, count(*), sum(amt) FROM t GROUP BY dept ORDER BY dept
+----
+eng
+3
+600
+ops
+1
+NULL
+sales
+2
+50
+
+# avg per group: eng is 600/3, sales is 50/1 (the NULL row is skipped, so it
+# is not 50/2), ops saw no values at all.
+query TR nosort
+SELECT dept, avg(amt) FROM t GROUP BY dept ORDER BY dept
+----
+eng
+200.000
+ops
+NULL
+sales
+50.000
+
+# GROUP BY a column that contains NULL: SQL groups all NULLs TOGETHER, which
+# is the one place NULL is treated as equal to NULL.
+query II nosort
+SELECT amt, count(*) FROM t GROUP BY amt ORDER BY amt
+----
+NULL
+2
+50
+1
+100
+1
+200
+1
+300
+1
+
+# ---- HAVING ------------------------------------------------------------------------
+
+query TI nosort
+SELECT dept, count(*) FROM t GROUP BY dept HAVING count(*) > 1 ORDER BY dept
+----
+eng
+3
+sales
+2
+
+query TI nosort
+SELECT dept, sum(amt) FROM t GROUP BY dept HAVING sum(amt) > 100 ORDER BY dept
+----
+eng
+600
+
+# HAVING on a group key, not an aggregate.
+query TI nosort
+SELECT dept, count(*) FROM t GROUP BY dept HAVING dept <> 'ops' ORDER BY dept
+----
+eng
+3
+sales
+2
+
+# ---- WHERE vs HAVING ---------------------------------------------------------------
+# WHERE filters INPUT rows, HAVING filters GROUPS. Here WHERE drops the NULL
+# amts before grouping, so sales counts 1 rather than 2 and ops disappears
+# entirely — a group with no surviving rows is not an empty group, it is no
+# group.
+
+query TI nosort
+SELECT dept, count(*) FROM t WHERE amt IS NOT NULL GROUP BY dept ORDER BY dept
+----
+eng
+3
+sales
+1
+
+# An aggregate in WHERE is an error, and the message has to say which clause
+# the user wanted.
+statement error HAVING
+SELECT dept FROM t WHERE count(*) > 1
+
+# ---- LIMIT bounds GROUPS, not rows -------------------------------------------------
+# 'eng' alone has 3 input rows. If LIMIT reached the base scan, LIMIT 2 would
+# cut the input mid-group and report count 2 for eng.
+
+query TI nosort
+SELECT dept, count(*) FROM t GROUP BY dept ORDER BY dept LIMIT 2
+----
+eng
+3
+ops
+1
+
+query TI nosort
+SELECT dept, count(*) FROM t GROUP BY dept ORDER BY dept LIMIT 2 OFFSET 1
+----
+ops
+1
+sales
+2
+
+query TI nosort
+SELECT dept, count(*) FROM t GROUP BY dept ORDER BY dept LIMIT 0
+----
+
+# ---- ORDER BY an aggregate ---------------------------------------------------------
+
+query TI nosort
+SELECT dept, count(*) FROM t GROUP BY dept ORDER BY count(*) DESC, dept
+----
+eng
+3
+sales
+2
+ops
+1
+
+# ---- expressions around and inside aggregates --------------------------------------
+
+query I nosort
+SELECT sum(amt) + 1 FROM t
+----
+651
+
+query I nosort
+SELECT sum(amt * 2) FROM t
+----
+1300
+
+query I nosort
+SELECT count(*) * 10 FROM t
+----
+60
+
+# min/max over TEXT use SQL ordering, not the storage order.
+query TT nosort
+SELECT min(dept), max(dept) FROM t
+----
+eng
+sales
+
+# Aggregate over a float column.
+query R nosort
+SELECT sum(score) FROM t
+----
+8.500
+
+# Several aggregates in one group, including one that sees no values.
+query TIII nosort
+SELECT dept, count(*), count(amt), sum(amt) FROM t GROUP BY dept ORDER BY dept
+----
+eng
+3
+3
+600
+ops
+1
+0
+NULL
+sales
+2
+1
+50

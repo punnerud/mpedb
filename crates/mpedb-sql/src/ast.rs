@@ -21,8 +21,18 @@ pub(crate) struct SelectStmt {
     /// `None` = `SELECT *`.
     pub items: Option<Vec<Expr>>,
     pub where_clause: Option<Expr>,
+    /// `GROUP BY` column names. Empty with aggregates present = one group over
+    /// every surviving row.
+    pub group_by: Vec<String>,
+    /// `HAVING` — a predicate over the GROUPED row, not the base row.
+    pub having: Option<Expr>,
     /// (column name, descending)
-    pub order_by: Vec<(String, bool)>,
+    /// `ORDER BY <expr> [ASC|DESC]`. An expression rather than a name because
+    /// `ORDER BY count(*)` is legal in both sqlite and PG, and an aggregate is
+    /// not a name. The planner still requires each item to REDUCE to a column
+    /// of the output tuple — sorting by a computed expression is rejected, not
+    /// silently mis-sorted.
+    pub order_by: Vec<(Expr, bool)>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }
@@ -135,4 +145,13 @@ pub(crate) enum Expr {
     /// [`Expr::Col`] so the binder can check the qualifier actually names the
     /// table in scope, rather than silently accepting `nonsense.id`.
     Qualified(String, String),
+    /// `count(*)` / `sum(x)` / … — an AGGREGATE call.
+    ///
+    /// Its own node rather than an [`Expr::Func`] because it is not a scalar
+    /// function and must not be compiled into one: a scalar runs per row and
+    /// returns a value; an aggregate consumes a whole GROUP and only exists once
+    /// the rows have been filtered and grouped. Conflating them is how an
+    /// aggregate ends up reading the pre-filter tuple stream (DESIGN-MULTIDB §4).
+    /// `None` = `count(*)`, which takes the ROW rather than a value.
+    Agg(mpedb_types::AggFn, Option<Box<Expr>>),
 }

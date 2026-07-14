@@ -153,6 +153,21 @@ struct Parser<'a> {
     stack_base: usize,
 }
 
+/// The aggregate names, matched case-insensitively. Kept out of the scalar
+/// function table on purpose: a scalar runs per row, an aggregate consumes a
+/// group, and the parser must not let one become the other.
+fn agg_fn(name: &str) -> Option<mpedb_types::AggFn> {
+    use mpedb_types::AggFn::*;
+    Some(match name.to_ascii_lowercase().as_str() {
+        "count" => Count,
+        "sum" => Sum,
+        "avg" => Avg,
+        "min" => Min,
+        "max" => Max,
+        _ => return None,
+    })
+}
+
 impl<'a> Parser<'a> {
     fn new(src: &'a str, toks: Vec<SpTok>) -> Self {
         Parser {
@@ -500,11 +515,34 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        // GROUP BY … HAVING …, between WHERE and ORDER BY. The order is SQL's
+        // and it is also the execution order: filter, then group, then HAVING —
+        // which is exactly why HAVING sees the grouped row and WHERE cannot.
+        let mut group_by: Vec<String> = Vec::new();
+        if self.eat_kw(Kw::Group) {
+            self.expect_kw(Kw::By, "BY after GROUP")?;
+            loop {
+                group_by.push(self.ident("column name in GROUP BY")?);
+                if group_by.len() > MAX_ORDER_BY_ITEMS {
+                    return Err(self.err_here(format!(
+                        "too many GROUP BY items (max {MAX_ORDER_BY_ITEMS})"
+                    )));
+                }
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        let having = if self.eat_kw(Kw::Having) {
+            Some(self.expr()?)
+        } else {
+            None
+        };
         let mut order_by = Vec::new();
         if self.eat_kw(Kw::Order) {
             self.expect_kw(Kw::By, "BY after ORDER")?;
             loop {
-                let col = self.ident("column name in ORDER BY")?;
+                let col = self.expr()?;
                 let desc = if self.eat_kw(Kw::Desc) {
                     true
                 } else {
@@ -536,6 +574,8 @@ impl<'a> Parser<'a> {
             table,
             items,
             where_clause,
+            group_by,
+            having,
             order_by,
             limit,
             offset,
@@ -963,6 +1003,36 @@ impl<'a> Parser<'a> {
     #[inline(never)]
     fn call_suffix(&mut self, name: String) -> Result<Expr> {
         self.expect(&Tok::LParen, "`(`")?;
+        // Aggregates are intercepted BEFORE the scalar argument parse, because
+        // `count(*)` has an argument that is not an expression. `*` there is not
+        // "all columns" — it means "the row itself", which is the whole reason
+        // count(*) and count(x) differ on NULLs.
+        if let Some(f) = agg_fn(&name) {
+            if self.eat(&Tok::Star) {
+                self.expect(&Tok::RParen, "`)` closing count(*)")?;
+                if f != mpedb_types::AggFn::Count {
+                    return Err(self.err_here(format!(
+                        "{}(*) is not valid — only count(*) takes the row itself; \
+                         {}() needs a value",
+                        f.name(),
+                        f.name()
+                    )));
+                }
+                return Ok(Expr::Agg(f, None));
+            }
+            if self.eat_kw(Kw::Distinct) {
+                return Err(self.err_here(format!(
+                    "{}(DISTINCT …) is not supported yet",
+                    f.name()
+                )));
+            }
+            let arg = self.expr()?;
+            if self.peek() == Some(&Tok::Comma) {
+                return Err(self.err_here(format!("{}() takes exactly one argument", f.name())));
+            }
+            self.expect(&Tok::RParen, "`)` closing the argument list")?;
+            return Ok(Expr::Agg(f, Some(Box::new(arg))));
+        }
         let mut args = Vec::new();
         if self.peek() != Some(&Tok::RParen) {
             args.push(self.expr()?);
@@ -1283,9 +1353,36 @@ mod tests {
                 assert_eq!(sel.table, "t");
                 assert_eq!(sel.items.as_ref().unwrap().len(), 2);
                 assert!(sel.where_clause.is_some());
-                assert_eq!(sel.order_by, vec![("a".into(), false), ("b".into(), true)]);
+                assert_eq!(
+                    sel.order_by,
+                    vec![
+                        (Expr::Col("a".into()), false),
+                        (Expr::Col("b".into()), true)
+                    ]
+                );
                 assert_eq!(sel.limit, Some(10));
                 assert_eq!(sel.offset, Some(2));
+            }
+            other => panic!("expected select, got {other:?}"),
+        }
+    }
+
+    /// `ORDER BY count(*)` — legal in sqlite and PG, and the reason ORDER BY
+    /// items are expressions rather than names. An identifier-only ORDER BY
+    /// rejects this at the tokenizer, before anything can rule on whether it
+    /// means something.
+    #[test]
+    fn order_by_takes_an_aggregate_not_just_a_name() {
+        let (s, _, _) =
+            parse_statement("select dept, count(*) from t group by dept order by count(*) desc")
+                .unwrap();
+        match s {
+            Stmt::Select(sel) => {
+                assert_eq!(sel.group_by, vec!["dept".to_string()]);
+                assert_eq!(
+                    sel.order_by,
+                    vec![(Expr::Agg(mpedb_types::AggFn::Count, None), true)]
+                );
             }
             other => panic!("expected select, got {other:?}"),
         }
