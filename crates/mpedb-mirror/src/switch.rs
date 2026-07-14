@@ -131,11 +131,14 @@ pub fn switch_to_mpedb<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Resu
     drain_pull(db, adapter)?; // catch up first
 
     let e = epoch.epoch;
-    if adapter.cas_source_state(&mid, e, e + 1, "mpedb")?.is_none() {
+    if !adapter.cas_source_state(&mid, e, e + 1, "mpedb")? {
         return Err(Error::Unsupported(
             "switch_to_mpedb fenced: the source epoch moved".into(),
         ));
     }
+    // A SIGKILL here leaves (E_m=e, mpedb-pending) vs (E_s=e+1, mpedb):
+    // `recover` completes it. Nothing is at risk in the window — the source is
+    // already fenced and mpedb has not yet started accumulating as authority.
     set_epoch(
         db,
         state::Epoch {
@@ -170,20 +173,30 @@ pub fn switch_to_source<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Res
         ));
     }
 
-    // fence + capture the re-seed baseline (head at cutover)
-    let head = match adapter.cas_source_state(&mid, e, e + 1, "source")? {
-        Some(h) => h,
-        None => {
-            return Err(Error::Unsupported(
-                "switch_to_source fenced: the source epoch moved".into(),
-            ))
-        }
-    };
+    // fence the source (it takes authority at this instant)
+    if !adapter.cas_source_state(&mid, e, e + 1, "source")? {
+        return Err(Error::Unsupported(
+            "switch_to_source fenced: the source epoch moved".into(),
+        ));
+    }
+    // A SIGKILL here leaves (E_m=e, mpedb, frozen) vs (E_s=e+1, source):
+    // `recover` completes it. mpedb stays frozen across the window, so no local
+    // write can leak into a database that is no longer authoritative.
+    finish_switch_to_source(db, e + 1)
+}
 
-    // finalize atomically: re-seed cur, unblock, set epoch = (E+1, source, steady)
+/// The final mpedb-side txn of a switch-to-source: unblock the tables and
+/// publish (E, source, steady) in ONE commit. Split out so `recover` can drive
+/// it after a crash between the source CAS and this commit.
+///
+/// The pull cursor is deliberately NOT re-seeded to the source's log head here.
+/// See [`SourceAdapter::cas_source_state`]: re-seeding would silently skip every
+/// third-party source write that landed between the drain and the cutover. Our
+/// own drain-push rows above the cursor are already filtered by origin, so the
+/// next pull consumes exactly the foreign writes and nothing else.
+fn finish_switch_to_source(db: &Database, new_epoch: u64) -> Result<()> {
     let mut s = db.begin()?;
     s.set_capture(false);
-    s.sys_record_put(state::MIR_NS, state::KEY_CUR, &head)?;
     let mut cap = s
         .sys_record_get("cdc", b"tabs")?
         .map(|b| CaptureConfig::decode(&b))
@@ -196,7 +209,7 @@ pub fn switch_to_source<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Res
         state::MIR_NS,
         state::KEY_EPOCH,
         &state::Epoch {
-            epoch: e + 1,
+            epoch: new_epoch,
             authority: Authority::Source,
             state: MirrorState::SrcAuth,
             frozen: false,
@@ -204,6 +217,71 @@ pub fn switch_to_source<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Res
         .encode(),
     )?;
     s.commit()
+}
+
+/// What [`recover`] found and did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Recovered {
+    /// The pair already agrees — nothing to do.
+    Steady,
+    /// A switch-to-mpedb was interrupted after the source CAS; completed it.
+    CompletedToMpedb,
+    /// A switch-to-source was interrupted after the source CAS; completed it.
+    CompletedToSource,
+}
+
+/// **Recovery-on-attach (§7).** A switch is two fenced commits — one on the
+/// source, one in mpedb — and a SIGKILL can land between them. This maps the
+/// `(mpedb epoch, source epoch)` pair to the single state-machine position it
+/// can be in and drives the missing sub-step forward. It is a total function:
+/// every reachable pair is either steady, a completable half-cutover, or an
+/// explicit error.
+///
+/// Safety of each half-state while it lasts: mid switch-to-source mpedb is
+/// frozen (no local write can leak); mid switch-to-mpedb the source is already
+/// fenced at the new epoch (a stale pull/push aborts on the epoch predicate).
+/// So recovery is never racing live divergence — it only finishes the paperwork.
+pub fn recover<A: SourceAdapter>(db: &Database, adapter: &mut A) -> Result<Recovered> {
+    let m = read_epoch(db)?;
+    let mid = mirror_id_hex(db)?;
+    let Some((e_s, auth_s)) = adapter.read_source_state(&mid)? else {
+        // No source row yet: the mirror has never switched (import-only).
+        return Ok(Recovered::Steady);
+    };
+
+    if e_s == m.epoch {
+        return Ok(Recovered::Steady);
+    }
+    if e_s != m.epoch + 1 {
+        return Err(Error::Unsupported(format!(
+            "mirror epochs diverge by more than one (mpedb={}, source={e_s}) — refusing to \
+             guess; this needs operator resync",
+            m.epoch
+        )));
+    }
+
+    // e_s == m.epoch + 1: the source CAS landed, the mpedb commit did not.
+    match auth_s.as_str() {
+        "mpedb" => {
+            set_epoch(
+                db,
+                state::Epoch {
+                    epoch: e_s,
+                    authority: Authority::Mpedb,
+                    state: MirrorState::MAuth,
+                    frozen: m.frozen,
+                },
+            )?;
+            Ok(Recovered::CompletedToMpedb)
+        }
+        "source" => {
+            finish_switch_to_source(db, e_s)?;
+            Ok(Recovered::CompletedToSource)
+        }
+        other => Err(Error::Unsupported(format!(
+            "source mirror-state has an unknown authority `{other}`"
+        ))),
+    }
 }
 
 #[cfg(test)]
@@ -500,5 +578,163 @@ mod tests {
     #[ignore = "slow: 100-round switch drill under load (run with --ignored)"]
     fn switch_drill_x100() {
         run_switch_drill(100, 0xa5a5_5a5a, 5);
+    }
+
+    // ---- §10.5 crash waves pinned BETWEEN the switch sub-transactions ----
+    //
+    // A switch is two fenced commits — the source CAS and the mpedb commit — and
+    // a SIGKILL can land between them. These tests build that exact half-state by
+    // driving the sub-steps by hand and *stopping*, which is precisely what a kill
+    // in the window leaves behind, then assert `recover` completes it and the pair
+    // converges. Doing it in-process (rather than with a real SIGKILL) is what
+    // lets us pin the kill to the one instant that matters; mirror-collide covers
+    // kills at random instants.
+
+    fn mirror_with_source(
+        tag: &str,
+    ) -> (std::path::PathBuf, std::path::PathBuf, Database, crate::SqliteAdapter) {
+        use crate::SqliteAdapter;
+        let src = tmp(&format!("{tag}-src"), "db");
+        let mid = tmp(&format!("{tag}-mid"), "mpedb");
+        {
+            let c = Connection::open(&src).unwrap();
+            c.execute_batch(
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER NOT NULL);
+                 INSERT INTO t VALUES (1,10);",
+            )
+            .unwrap();
+        }
+        let db = {
+            let mut c = Connection::open(&src).unwrap();
+            import_sqlite(&mut c, &mid, &ImportOptions::default()).unwrap().0
+        };
+        let adapter = SqliteAdapter::new(Connection::open(&src).unwrap(), None, &[]).unwrap();
+        adapter.install_triggers().unwrap();
+        (src, mid, db, adapter)
+    }
+
+    #[test]
+    fn crash_between_switch_to_mpedb_subtxns_recovers() {
+        let (src, mid, db, mut adapter) = mirror_with_source("crash-tom");
+        let mirror_id = super::mirror_id_hex(&db).unwrap();
+        let e = read_epoch(&db).unwrap().epoch;
+        adapter.ensure_source_state(&mirror_id, e, "source").unwrap();
+        drain_pull(&db, &mut adapter).unwrap();
+
+        // CRASH POINT: the source CAS lands, the mpedb commit never does.
+        assert!(adapter.cas_source_state(&mirror_id, e, e + 1, "mpedb").unwrap());
+        assert_eq!(read_epoch(&db).unwrap().authority, Authority::Source, "mpedb still stale");
+        assert_eq!(adapter.read_source_state(&mirror_id).unwrap(), Some((e + 1, "mpedb".into())));
+
+        // recovery drives the half-cutover forward
+        assert_eq!(super::recover(&db, &mut adapter).unwrap(), Recovered::CompletedToMpedb);
+        let ep = read_epoch(&db).unwrap();
+        assert_eq!((ep.authority, ep.epoch), (Authority::Mpedb, e + 1));
+        // idempotent: a second recovery is a no-op
+        assert_eq!(super::recover(&db, &mut adapter).unwrap(), Recovered::Steady);
+
+        // and the mirror is fully usable afterwards: local writes push back
+        db.query("UPDATE t SET v=$1 WHERE id=$2", &[Value::Int(99), Value::Int(1)]).unwrap();
+        drain_push(&db, &mut adapter).unwrap();
+        assert!(verify(&db, &mut adapter).unwrap());
+
+        for p in [src, mid] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn crash_between_switch_to_source_subtxns_recovers_and_unfreezes() {
+        let (src, mid, db, mut adapter) = mirror_with_source("crash-tos");
+        let mirror_id = super::mirror_id_hex(&db).unwrap();
+        switch_to_mpedb(&db, &mut adapter).unwrap();
+        let e = read_epoch(&db).unwrap().epoch;
+
+        // local write, then the switch-back sub-steps by hand
+        db.query("UPDATE t SET v=$1 WHERE id=$2", &[Value::Int(42), Value::Int(1)]).unwrap();
+        set_frozen(&db, true).unwrap();
+        drain_push(&db, &mut adapter).unwrap();
+        assert!(verify(&db, &mut adapter).unwrap());
+
+        // CRASH POINT: the source CAS lands, the finalizing mpedb commit never does.
+        assert!(adapter.cas_source_state(&mirror_id, e, e + 1, "source").unwrap());
+        // the half-state is SAFE while it lasts: mpedb is still frozen, so no
+        // local write can leak into a database that is no longer authoritative.
+        let leaked = db.query("UPDATE t SET v=$1 WHERE id=$2", &[Value::Int(7), Value::Int(1)]);
+        assert!(matches!(leaked, Err(E::Frozen { .. })), "got {leaked:?}");
+
+        assert_eq!(super::recover(&db, &mut adapter).unwrap(), Recovered::CompletedToSource);
+        let ep = read_epoch(&db).unwrap();
+        assert_eq!((ep.authority, ep.epoch), (Authority::Source, e + 1));
+        assert!(!ep.frozen, "recovery must unfreeze — the switch completed");
+        assert_eq!(super::recover(&db, &mut adapter).unwrap(), Recovered::Steady);
+
+        // writes flow again and the source is authoritative: a source change pulls in
+        adapter.conn().execute("UPDATE t SET v=1234 WHERE id=1", []).unwrap();
+        drain_pull(&db, &mut adapter).unwrap();
+        assert!(verify(&db, &mut adapter).unwrap());
+
+        for p in [src, mid] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn recover_refuses_to_guess_when_epochs_diverge_by_more_than_one() {
+        let (src, mid, db, mut adapter) = mirror_with_source("crash-div");
+        let mirror_id = super::mirror_id_hex(&db).unwrap();
+        let e = read_epoch(&db).unwrap().epoch;
+        adapter.ensure_source_state(&mirror_id, e, "source").unwrap();
+        // external tampering: the source epoch jumps two ahead
+        assert!(adapter.cas_source_state(&mirror_id, e, e + 2, "mpedb").unwrap());
+        let err = super::recover(&db, &mut adapter);
+        assert!(matches!(err, Err(E::Unsupported(_))), "got {err:?}");
+
+        for p in [src, mid] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    /// Regression (review CONF#3/#16): the cutover used to re-seed the pull
+    /// cursor to the source's log head, which SKIPPED every third-party source
+    /// write committed between the drain and the cutover — permanent silent
+    /// divergence. The cursor now stays put and origin-filtering suppresses our
+    /// own echoes, so that window is pulled instead of swallowed.
+    #[test]
+    fn switch_to_source_does_not_swallow_a_racing_source_write() {
+        let (src, mid, db, mut adapter) = mirror_with_source("noswallow");
+        switch_to_mpedb(&db, &mut adapter).unwrap();
+
+        // a local change to push during the drain
+        db.query("UPDATE t SET v=$1 WHERE id=$2", &[Value::Int(50), Value::Int(1)]).unwrap();
+
+        // an unfenced third-party source write lands in the switch window — after
+        // our drain/verify would have run, before the cutover. It must survive.
+        set_frozen(&db, true).unwrap();
+        drain_push(&db, &mut adapter).unwrap();
+        adapter
+            .conn()
+            .execute("INSERT INTO t(id,v) VALUES (777, 7)", [])
+            .unwrap();
+
+        // finish the switch by hand (verify would fail on the injected row, which
+        // is the honest cost of cooperative fencing — §7 S7½ reconciles it)
+        let mirror_id = super::mirror_id_hex(&db).unwrap();
+        let e = read_epoch(&db).unwrap().epoch;
+        assert!(adapter.cas_source_state(&mirror_id, e, e + 1, "source").unwrap());
+        super::finish_switch_to_source(&db, e + 1).unwrap();
+
+        // the racing write is NOT below the cursor: the next pull picks it up.
+        drain_pull(&db, &mut adapter).unwrap();
+        assert!(
+            verify(&db, &mut adapter).unwrap(),
+            "the source write that raced the cutover must be pulled, not swallowed"
+        );
+        let rows = mpedb_rows(&db);
+        assert!(rows.contains_key(&777), "racing row 777 missing from mpedb: {rows:?}");
+
+        for p in [src, mid] {
+            let _ = std::fs::remove_file(p);
+        }
     }
 }
