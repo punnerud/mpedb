@@ -28,6 +28,7 @@ pub fn run(argv: &[String]) -> CliResult {
         "export" => cmd_export(rest),
         "roundtrip" => cmd_roundtrip(rest),
         "status" => cmd_status(rest),
+        "preflight" => cmd_preflight(rest),
         "pull" => cmd_pull(rest),
         "push" => cmd_push(rest),
         "sync" => cmd_sync(rest),
@@ -82,6 +83,13 @@ mpedb mirror <subcommand>
 
   status  --db <mpedb-file>
       Show a mirror's config and authority state.
+
+  preflight --db <mpedb-file>
+      Check the data against the source schema recorded at import, WITHOUT
+      contacting the source: reports every value a strict target would reject
+      (int4 overflow, varchar length, numeric precision, NULL in NOT NULL, NUL
+      in text, loose-source type drift) and every column that already lost
+      information at import. Read-only, no round-trips.
 
   pull    --source <sqlite-file> --db <mpedb-file>
       Pull + apply source changes into mpedb until caught up.
@@ -346,6 +354,49 @@ fn cmd_roundtrip(argv: &[String]) -> CliResult {
         }
         Err(Failure::Runtime(format!("{} round-trip difference(s)", diffs.len())))
     }
+}
+
+/// `mirror preflight --db <file>` — check the data against the source schema
+/// recorded at import, WITHOUT touching the source. Reads mpedb only, so it runs
+/// with the source offline and costs no round-trips.
+fn cmd_preflight(argv: &[String]) -> CliResult {
+    let p = args::parse(argv, &["db"], &[])?;
+    let db = Database::open_from_file(std::path::Path::new(p.require("db")?))?;
+    let r = mpedb_mirror::preflight(&db)?;
+
+    if r.findings.is_empty() {
+        println!("preflight: {} row(s) checked — nothing would be rejected", r.rows_checked);
+        return Ok(());
+    }
+    // Column-level verdicts first: they are about the migration, not a row, and
+    // burying them under 10k row findings hides the thing you most need to know.
+    let (col_level, row_level): (Vec<_>, Vec<_>) = r
+        .findings
+        .iter()
+        .partition(|f| f.kind == mpedb_mirror::FindingKind::LossyColumn);
+    for f in &col_level {
+        println!("LOSSY  {}.{}: {}", f.table, f.column, f.detail);
+    }
+    for f in row_level.iter().take(50) {
+        let pk: Vec<String> = f.pk.iter().map(|v| format!("{v}")).collect();
+        println!("REJECT {}.{} [pk {}]: {}", f.table, f.column, pk.join(","), f.detail);
+    }
+    if row_level.len() > 50 {
+        println!("… and {} more", row_level.len() - 50);
+    }
+    println!(
+        "\npreflight: {} row(s) checked, {} would be rejected, {} lossy column(s)",
+        r.rows_checked,
+        row_level.len(),
+        col_level.len()
+    );
+    if r.would_fail() {
+        return Err(Failure::Runtime(
+            "preflight found values the source schema will reject — fix or accept them before \
+             writing".into(),
+        ));
+    }
+    Ok(())
 }
 
 fn cmd_status(argv: &[String]) -> CliResult {
