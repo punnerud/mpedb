@@ -171,11 +171,19 @@ Correctness is checked against the established engines, not just against itself:
 
 Head-to-head against SQLite and PostgreSQL through one shared Rust measurement
 loop (each engine on its own fast path — mpedb's `execute(hash, …)`, prepared
-statements for the others). Full methodology and every cell are in
-[`BENCHMARKS.md`](BENCHMARKS.md) / the machine-generated
-[`crates/mpedb-bench/RESULTS.md`](crates/mpedb-bench/RESULTS.md).
+statements for the others). **[`BENCHMARKS.md`](BENCHMARKS.md) is the detailed
+comparison** — methodology, every machine, and a link to each machine's full
+generated tables. The highlights from all of them are below.
 
-Single-client, embedded, none-class point ops on an idle 2-core Linux VM (2026-07-14):
+Two things to know before reading any of it: numbers are only comparable
+**within a durability class** (none-class has no fsync guarantee, commit-class is
+durable on ack), and the machine must be **idle** — a stray process holding one
+of this box's two cores *compressed* the parallelism results (6.8× → 2.4×)
+rather than merely adding noise.
+
+### Linux — AMD EPYC-Milan, 2 cores (2026-07-14)
+
+Single-client, embedded, none-class point ops:
 
 | op (none-class) | mpedb | SQLite | PostgreSQL |
 |---|--:|--:|--:|
@@ -195,6 +203,21 @@ single-client (~560 ops/s) — every commit msyncs with no batching partner; use
 `wal`. Contended writes (4 threads) mpedb leads 79k vs 30k/34k, but that is the
 cell most sensitive to core count — see [BENCHMARKS.md](BENCHMARKS.md).
 
+### Apple Silicon — M3 Pro, 11 cores, macOS 26.6 (2026-07-14)
+
+mpedb and SQLite only (no PostgreSQL on that machine). The run is worth reading
+for what it caught rather than its throughput: **it found two bugs, one in the
+benchmark and one in mpedb**, both invisible on Linux.
+
+macOS's `fsync()` does not flush the drive's write cache — only
+`fcntl(F_FULLFSYNC)` does. mpedb's `durability=commit` barrier is
+`msync(MS_SYNC)`, which on macOS hands pages to the drive and returns *before*
+they are on platter. So mpedb reported ~10× SQLite on durable commits by not
+actually being durable. Once both were honest, `wal` (293 ops/s) landed level
+with SQLite+F_FULLFSYNC (286): **~290 ops/s is simply what an Apple SSD platter
+flush costs**, and anything above it on that machine is a promise no one is
+keeping. Details: [BENCHMARKS.md](BENCHMARKS.md#apple-silicon-m3-pro-11-cores--and-the-durability-trap-it-exposed).
+
 **Bulk bytes are not mpedb's game.** Pushing 256 MiB of 4 KiB blobs, SQLite
 writes 1,041 MiB/s to mpedb's 598 (40% vs 23% of what a raw `std::fs` write does
 on the same medium) — a blob larger than the page takes an overflow chain and
@@ -202,7 +225,7 @@ every touched page is copied before the meta flip. That is crash-safety paid for
 in bandwidth. See [BENCHMARKS.md](BENCHMARKS.md#bulk-mbs--and-the-number-that-makes-it-mean-something).
 
 ```sh
-cargo run --release -p mpedb-bench      # full head-to-head (writes RESULTS.md)
+cargo run --release -p mpedb-bench      # full head-to-head -> RESULTS-<machine>.md
 cargo run --release -p mpedb-bench -- --io   # bulk MiB/s vs a raw-Rust baseline
 mpedb bench --auto --durability wal     # quick mpedb-only
 ```
