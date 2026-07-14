@@ -38,6 +38,30 @@ pub enum Error {
     PolicyViolation {
         table: String,
     },
+    /// A write to an **RLS-enabled** table was rejected by a constraint, with the
+    /// variant and column deliberately withheld (DESIGN-MULTIDB.md §6.5).
+    ///
+    /// Uniqueness pre-checks run over the whole B+tree with no RLS awareness, so
+    /// a caller inserting a row valid under its own policy still collides with
+    /// rows it cannot see. The distinct variants — `PrimaryKeyViolation` vs
+    /// `UniqueViolation{constraint}` vs `CheckViolation{column, expr}` vs success
+    /// — then let a probe learn not just THAT a hidden row exists but WHICH
+    /// attribute matches a probed value (the error even names the column),
+    /// enabling attribute-by-attribute reconstruction of invisible rows. This
+    /// variant collapses them into one indistinguishable failure.
+    ///
+    /// It does NOT close the existence oracle (rejected-vs-success still leaks
+    /// that *something* collided); that cannot be closed while a single global
+    /// unique domain is preserved, and its mitigation is §6.4 — make the policy
+    /// discriminator a leading part of every UNIQUE/PK so collisions can only
+    /// happen inside the caller's own visible partition.
+    ///
+    /// Only RLS-enabled tables lose the detail; everywhere else the precise
+    /// variants remain, because they are what makes a constraint failure
+    /// debuggable.
+    WriteRejected {
+        table: String,
+    },
     /// SQL tokenizer/parser error with a byte offset into the statement.
     Parse {
         pos: usize,
@@ -98,6 +122,9 @@ impl fmt::Display for Error {
             }
             Error::PrimaryKeyViolation { table } => {
                 write!(f, "PRIMARY KEY violation in {table}")
+            }
+            Error::WriteRejected { table } => {
+                write!(f, "write to {table} rejected by a constraint")
             }
             Error::PolicyViolation { table } => {
                 write!(f, "row violates row-level security policy on {table}")

@@ -274,6 +274,30 @@ fn internal(msg: &str) -> Error {
 /// *before* mutating any tree: a call that failed this way left the
 /// transaction untouched. Anything else (DbFull, Corrupt, Internal, Io, ...)
 /// can fire mid-mutation and must be treated as a possible partial effect.
+/// **§6.5 classification-oracle closure.** On an RLS-enabled table, collapse the
+/// constraint-violation variants into one opaque rejection.
+///
+/// `rls` is `with_check.is_some()`, which is exact rather than a proxy: the
+/// planner emits `with_check` for a write iff RLS is enabled on the target
+/// (`write_check` returns `None` otherwise), so no plan-format flag is needed.
+///
+/// MUST be applied AFTER `precheck_failure` has decided `partial`: that function
+/// matches on the very variants being collapsed, so normalizing first would make
+/// it report a partial effect where the row never landed.
+fn hide_constraint_variant(e: Error, table: &str, rls: bool) -> Error {
+    if !rls {
+        return e;
+    }
+    match e {
+        Error::PrimaryKeyViolation { .. }
+        | Error::UniqueViolation { .. }
+        | Error::CheckViolation { .. } => Error::WriteRejected {
+            table: table.to_string(),
+        },
+        other => other,
+    }
+}
+
 fn precheck_failure(e: &Error) -> bool {
     matches!(
         e,
@@ -408,8 +432,10 @@ pub(crate) fn exec_stmt(
                 if let Err(e) = ctx.insert_row(*table, &row) {
                     // A pre-check failure left even this row unapplied, so
                     // the statement is partial only if earlier rows landed.
+                    // NOTE the order: `partial` is decided from the ORIGINAL
+                    // error, then the variant is hidden (§6.5).
                     *partial = applied > 0 || !precheck_failure(&e);
-                    return Err(e);
+                    return Err(hide_constraint_variant(e, &t.name, with_check.is_some()));
                 }
             }
             Ok(ExecResult::Affected(rows.len() as u64))
@@ -467,8 +493,9 @@ pub(crate) fn exec_stmt(
                     Ok(true) => affected += 1,
                     Ok(false) => {} // row vanished: nothing changed
                     Err(e) => {
+                        // `partial` from the original variant, then hide it (§6.5).
                         *partial = affected > 0 || !precheck_failure(&e);
-                        return Err(e);
+                        return Err(hide_constraint_variant(e, &t.name, with_check.is_some()));
                     }
                 }
             }

@@ -485,6 +485,103 @@ mod tests {
         }
     }
 
+    // ---- §6.5 the classification oracle ----
+
+    /// The attack §6.5 describes, run for real: tenant 2 probes for tenant 1's
+    /// hidden rows. Uniqueness pre-checks span the whole B+tree with no RLS
+    /// awareness, so a colliding INSERT is rejected even though the colliding row
+    /// is invisible. That much cannot be fixed (§6.4 — it needs tenant-leading
+    /// keys). What CAN be fixed is the probe learning *which attribute* matched:
+    /// `PrimaryKeyViolation` vs `UniqueViolation{constraint: "email"}` vs
+    /// `CheckViolation{column, expr}` reconstructs hidden rows attribute by
+    /// attribute. On an RLS table those collapse to one opaque `WriteRejected`.
+    #[test]
+    fn rls_hides_which_constraint_a_hidden_row_collided_with() {
+        let path = format!("/dev/shm/mpedb-rls-oracle-{}.mpedb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+        let cfg = Config::from_toml_str(&format!(
+            "[database]\npath = \"{path}\"\nsize_mb = 8\n\
+             [[table]]\nname = \"orders\"\nprimary_key = [\"id\"]\n  \
+             [[table.column]]\n  name = \"id\"\n  type = \"int64\"\n  \
+             [[table.column]]\n  name = \"tenant\"\n  type = \"int64\"\n  \
+             [[table.column]]\n  name = \"code\"\n  type = \"text\"\n  unique = true"
+        ))
+        .unwrap();
+        let db = Database::open_with_config(cfg).unwrap();
+
+        // tenant 1 owns id=1 with code="secret" — invisible to tenant 2.
+        db.query(
+            "INSERT INTO orders (id, tenant, code) VALUES ($1, $2, $3)",
+            &[Value::Int(1), Value::Int(1), Value::Text("secret".into())],
+        )
+        .unwrap();
+
+        // BEFORE RLS: the taxonomy is fully informative (this is the oracle).
+        let pk = db.query(
+            "INSERT INTO orders (id, tenant, code) VALUES ($1, $2, $3)",
+            &[Value::Int(1), Value::Int(2), Value::Text("mine".into())],
+        );
+        assert!(matches!(pk, Err(E::PrimaryKeyViolation { .. })), "got {pk:?}");
+        let uq = db.query(
+            "INSERT INTO orders (id, tenant, code) VALUES ($1, $2, $3)",
+            &[Value::Int(9), Value::Int(2), Value::Text("secret".into())],
+        );
+        // it even names the colliding column
+        assert!(
+            matches!(&uq, Err(E::UniqueViolation { constraint, .. }) if constraint.contains("code")),
+            "got {uq:?}"
+        );
+
+        db.create_policy("orders", &tenant_policy()).unwrap();
+        db.enable_rls("orders", false).unwrap();
+
+        // AFTER RLS: both probes give the SAME opaque answer. Tenant 2 still
+        // learns something collided (the existence oracle, §6.4) but no longer
+        // learns whether it was the PK or `code`.
+        let pk2 = db.query_ctx(
+            &sess(2),
+            "INSERT INTO orders (id, tenant, code) VALUES ($1, $2, $3)",
+            &[Value::Int(1), Value::Int(2), Value::Text("mine2".into())],
+        );
+        let uq2 = db.query_ctx(
+            &sess(2),
+            "INSERT INTO orders (id, tenant, code) VALUES ($1, $2, $3)",
+            &[Value::Int(9), Value::Int(2), Value::Text("secret".into())],
+        );
+        assert!(matches!(pk2, Err(E::WriteRejected { .. })), "got {pk2:?}");
+        assert!(matches!(uq2, Err(E::WriteRejected { .. })), "got {uq2:?}");
+        assert_eq!(
+            format!("{}", pk2.unwrap_err()),
+            format!("{}", uq2.unwrap_err()),
+            "the two probes must be textually indistinguishable, or the oracle survives"
+        );
+
+        // A row that violates the caller's OWN policy stays distinguishable —
+        // that is the caller's own mistake and leaks nothing about hidden rows.
+        let pol = db.query_ctx(
+            &sess(2),
+            "INSERT INTO orders (id, tenant, code) VALUES ($1, $2, $3)",
+            &[Value::Int(50), Value::Int(1), Value::Text("other".into())],
+        );
+        assert!(matches!(pol, Err(E::PolicyViolation { .. })), "got {pol:?}");
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Without RLS the precise variants must survive — they are what makes a
+    /// constraint failure debuggable, and there is no hidden row to protect.
+    #[test]
+    fn without_rls_the_constraint_taxonomy_is_untouched() {
+        let db = db("no-rls-taxonomy");
+        seed(&db);
+        let e = db.query(
+            "INSERT INTO orders (id, tenant, note) VALUES ($1, $2, NULL)",
+            &[Value::Int(1), Value::Int(1)],
+        );
+        assert!(matches!(e, Err(E::PrimaryKeyViolation { .. })), "got {e:?}");
+        let _ = std::fs::remove_file(db.path());
+    }
+
     #[test]
     fn delete_only_touches_visible_rows() {
         let db = db("delete");
