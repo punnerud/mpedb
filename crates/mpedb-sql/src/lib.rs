@@ -26,7 +26,10 @@ mod policy;
 mod token;
 
 pub use ddl::{CreatePolicySpec, DdlStmt, RlsAction};
-pub use plan::{AccessPath, CompiledPlan, InsertSource, PlanOnConflict, PlanStmt, Projection};
+pub use plan::{
+    AccessPath, AggCall, Aggregation, CompiledPlan, InsertSource, PlanOnConflict, PlanStmt,
+    Projection,
+};
 pub use planner::secondary_indexes;
 pub use policy::{table_policy_hash, PolicyCatalog, TablePolicies};
 

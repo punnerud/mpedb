@@ -4,9 +4,12 @@
 
 use crate::ExecResult;
 use mpedb_core::{ReadTxn, WriteTxn};
-use mpedb_sql::{PlanOnConflict, AccessPath, CompiledPlan, InsertSource, PlanStmt, Projection};
+use mpedb_sql::{
+    AccessPath, Aggregation, CompiledPlan, InsertSource, PlanOnConflict, PlanStmt, Projection,
+};
 use mpedb_types::{
-    keycode, DefaultExpr, Error, ExprProgram, KeyBound, KeyPart, Result, Schema, TableDef, Value,
+    keycode, Accum, DefaultExpr, Error, ExprProgram, KeyBound, KeyPart, Result, Schema, TableDef,
+    Value,
 };
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -340,6 +343,7 @@ pub(crate) fn exec_stmt(
             order_by,
             limit,
             offset,
+            aggregate,
         } => {
             let t = table_def(schema, *table)?;
             let skip_take_bound = || {
@@ -349,6 +353,12 @@ pub(crate) fn exec_stmt(
                     l.saturating_add(o)
                 })
             };
+            if let Some(agg) = aggregate {
+                return exec_aggregate(
+                    ctx, plan, params, t, *table, access, filter.as_ref(), agg, projection,
+                    order_by, *limit, *offset,
+                );
+            }
             let rows = if order_by.is_empty() {
                 // No surviving sort (the planner elides ORDER BY that matches
                 // PK scan order): stream and stop after offset+limit rows.
@@ -654,6 +664,134 @@ pub(crate) fn exec_stmt(
                 .into(),
         )),
     }
+}
+
+/// `GROUP BY` / aggregates / `HAVING`.
+///
+/// **The first line is the invariant.** DESIGN-MULTIDB §4: aggregation must
+/// consume rows only AFTER the merged `(WHERE ∧ effective-policy)` predicate.
+/// `gather_rows` applies exactly that — the access path plus `filter`, which is
+/// where the planner AND-folded the policy — so accumulating over its output
+/// satisfies §4 by construction. Reading the raw scan instead would make
+/// `count(*)` report rows the caller cannot see, and a count leaks existence
+/// whether or not the rows come back. §4 calls it "a natural mistake, since some
+/// policy conjuncts land in the residual"; the only defence is to never hold the
+/// unfiltered stream, which is why there is no cursor here.
+///
+/// The other trap: **LIMIT applies to GROUPS, not rows.** The non-aggregate path
+/// bounds `gather_rows` by offset+limit, which would be silently wrong here —
+/// `LIMIT 1` on a grouped query means one group, not one input row. So this
+/// gathers unbounded and bounds at the end.
+#[allow(clippy::too_many_arguments)]
+fn exec_aggregate(
+    ctx: &mut dyn TxnCtx,
+    plan: &CompiledPlan,
+    params: &[Value],
+    t: &TableDef,
+    table: u32,
+    access: &AccessPath,
+    filter: Option<&ExprProgram>,
+    agg: &Aggregation,
+    projection: &[Projection],
+    order_by: &[(u16, bool)],
+    limit: Option<u64>,
+    offset: Option<u64>,
+) -> Result<ExecResult> {
+    // Unbounded on purpose: see the LIMIT note above.
+    let rows = gather_rows(ctx, table, access, filter, plan, params, None)?;
+
+    // Group. The key is the memcmp-ordered keycode of the group columns, so
+    // groups come out in a deterministic order for free and NULL keys group
+    // together (SQL treats NULLs as one group in GROUP BY, unlike `=`).
+    let mut groups: std::collections::BTreeMap<Vec<u8>, (Vec<Value>, Vec<Accum>)> =
+        Default::default();
+    for row in &rows {
+        let key_vals: Vec<Value> = agg
+            .group_by
+            .iter()
+            .map(|c| row.get(*c as usize).cloned().unwrap_or(Value::Null))
+            .collect();
+        let key = keycode::encode_key(&key_vals);
+        let entry = groups.entry(key).or_insert_with(|| {
+            (
+                key_vals,
+                agg.aggs.iter().map(|a| Accum::new(a.func)).collect(),
+            )
+        });
+        for (i, call) in agg.aggs.iter().enumerate() {
+            match &call.arg {
+                // count(*): the ROW is the input, so nothing is evaluated and
+                // NULL cannot arise.
+                None => entry.1[i].push(None)?,
+                Some(p) => {
+                    let v = p.eval(row, params)?;
+                    entry.1[i].push(Some(&v))?;
+                }
+            }
+        }
+    }
+
+    // `SELECT count(*) FROM t` over an EMPTY table must return one row (0), not
+    // zero rows — there is one group when there is nothing to group by. With a
+    // GROUP BY, an empty input means no groups at all.
+    let mut out: Vec<Vec<Value>> = Vec::new();
+    if groups.is_empty() && agg.group_by.is_empty() {
+        let accs: Vec<Accum> = agg.aggs.iter().map(|a| Accum::new(a.func)).collect();
+        out.push(accs.into_iter().map(|a| a.finish()).collect());
+    }
+    for (_, (keys, accs)) in groups {
+        let mut tuple = keys;
+        tuple.extend(accs.into_iter().map(|a| a.finish()));
+        out.push(tuple);
+    }
+
+    // HAVING — over the GROUPED tuple, which is why it can see aggregates and
+    // WHERE cannot.
+    if let Some(h) = &agg.having {
+        let mut keep = Vec::with_capacity(out.len());
+        for tuple in out {
+            if h.eval_filter(&mut Vec::new(), &tuple, params)? {
+                keep.push(tuple);
+            }
+        }
+        out = keep;
+    }
+
+    if !order_by.is_empty() {
+        sort_rows(&mut out, order_by);
+    }
+
+    let skip = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
+    let take = limit.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
+    let mut projected = Vec::new();
+    for tuple in out.into_iter().skip(skip).take(take) {
+        let mut orow = Vec::with_capacity(projection.len());
+        for p in projection {
+            orow.push(match p {
+                Projection::Column(i) => tuple
+                    .get(*i as usize)
+                    .cloned()
+                    .ok_or_else(|| internal("grouped projection column"))?,
+                Projection::Expr { program, .. } => program.eval(&tuple, params)?,
+            });
+        }
+        projected.push(orow);
+    }
+    let columns = projection
+        .iter()
+        .map(|p| match p {
+            Projection::Column(i) => t
+                .columns
+                .get(*i as usize)
+                .map(|c| c.name.clone())
+                .unwrap_or_else(|| format!("col{i}")),
+            Projection::Expr { name, .. } => name.clone(),
+        })
+        .collect();
+    Ok(ExecResult::Rows {
+        columns,
+        rows: projected,
+    })
 }
 
 /// Project one written row through a `RETURNING` clause.

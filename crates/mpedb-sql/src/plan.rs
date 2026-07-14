@@ -6,7 +6,7 @@
 
 use crate::planner;
 use mpedb_types::value::{read_value, write_value};
-use mpedb_types::{
+use mpedb_types::{AggFn, 
     ColumnType, Error, ExprProgram, Footprint, Instr, KeyBound, KeyPart, PlanHash, Result, Schema,
     TableDef, Value, FORMAT_VERSION, MAX_COLUMNS,
 };
@@ -66,6 +66,8 @@ pub enum PlanStmt {
         order_by: Vec<(u16, bool)>,
         limit: Option<u64>,
         offset: Option<u64>,
+        /// Grouping, applied **after** `filter`. `None` = no aggregation.
+        aggregate: Option<Aggregation>,
     },
     Insert {
         table: u32,
@@ -101,6 +103,42 @@ pub enum PlanStmt {
     Begin,
     Commit,
     Rollback,
+}
+
+/// Compiled `GROUP BY` / aggregates / `HAVING`.
+///
+/// **The ordering here is a security property, not a style choice**
+/// (DESIGN-MULTIDB §4). Aggregation consumes rows only AFTER the merged
+/// `(WHERE ∧ effective-policy)` predicate — which is `filter` plus whatever the
+/// access path already excluded. An aggregate fed the pre-filter tuple stream
+/// would count and sum rows the caller cannot see, and `count(*)` leaking the
+/// existence of hidden rows is a leak whether or not the rows themselves come
+/// back. §4 calls that "a natural mistake, since some policy conjuncts land in
+/// the residual"; the executor avoids it by aggregating the output of
+/// `gather_rows`, which has already applied both.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Aggregation {
+    /// Base-row column indices to group by. **Empty = one group over every
+    /// surviving row** — that is `SELECT count(*) FROM t`, and it must still
+    /// produce exactly one row when the table is empty.
+    pub group_by: Vec<u16>,
+    /// The aggregate calls, in output order. Their arguments are evaluated over
+    /// the BASE row.
+    pub aggs: Vec<AggCall>,
+    /// `HAVING`, evaluated over the GROUPED row `[group keys ‖ agg results]` —
+    /// a different tuple from the one `filter` sees, which is exactly why SQL
+    /// has two clauses rather than one.
+    pub having: Option<ExprProgram>,
+}
+
+/// One aggregate call.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AggCall {
+    pub func: AggFn,
+    /// `None` = `count(*)`: the argument is the ROW, not a value, so NULL cannot
+    /// arise and every row counts. `Some(p)` is evaluated over the base row and
+    /// NULLs are skipped. That difference is the whole reason `count(*)` exists.
+    pub arg: Option<ExprProgram>,
 }
 
 /// The compiled `ON CONFLICT` action.
@@ -364,12 +402,58 @@ impl CompiledPlan {
                 filter,
                 projection,
                 order_by,
+                aggregate,
                 ..
             } => {
                 let t = get_table(*table)?;
                 self.check_access(access, t)?;
                 if let Some(f) = filter {
                     self.check_program(f, t)?;
+                }
+                if let Some(a) = aggregate {
+                    // GROUP BY columns and aggregate ARGUMENTS index the BASE
+                    // row; HAVING and the projection index the GROUPED tuple
+                    // `[keys ‖ aggs]`, which is a different width. Checking
+                    // either against the wrong one would let a hostile plan read
+                    // past its row — so they are bounded separately.
+                    for c in &a.group_by {
+                        if *c as usize >= t.columns.len() {
+                            return Err(corrupt("GROUP BY column out of range"));
+                        }
+                    }
+                    for c in &a.aggs {
+                        if let Some(p) = &c.arg {
+                            self.check_program(p, t)?;
+                        }
+                    }
+                    let out_width = a.group_by.len() + a.aggs.len();
+                    if out_width == 0 {
+                        return Err(corrupt("aggregation with no groups and no aggregates"));
+                    }
+                    if let Some(h) = &a.having {
+                        self.check_program_width(h, out_width)?;
+                    }
+                    for p in projection {
+                        match p {
+                            Projection::Column(i) => {
+                                if *i as usize >= out_width {
+                                    return Err(corrupt(
+                                        "projection column out of the grouped tuple",
+                                    ));
+                                }
+                            }
+                            Projection::Expr { program, .. } => {
+                                self.check_program_width(program, out_width)?
+                            }
+                        }
+                    }
+                    // ORDER BY also indexes the grouped tuple here.
+                    for (c, _) in order_by {
+                        if *c as usize >= out_width {
+                            return Err(corrupt("order-by column out of the grouped tuple"));
+                        }
+                    }
+                    return Ok(());
                 }
                 for p in projection {
                     match p {
@@ -562,6 +646,23 @@ impl CompiledPlan {
         Ok(())
     }
 
+    /// Bound a program's column indices by an arbitrary tuple width — for the
+    /// GROUPED tuple `[keys ‖ aggs]`, which is not a table's row.
+    fn check_program_width(&self, p: &ExprProgram, width: usize) -> Result<()> {
+        for i in &p.instrs {
+            match *i {
+                Instr::PushCol(c) if c as usize >= width => {
+                    return Err(corrupt("expression column out of range"));
+                }
+                Instr::PushParam(pi) if pi >= self.n_params => {
+                    return Err(corrupt("expression param out of range"));
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     /// A `DO UPDATE` SET/WHERE program runs over the EXISTING row concatenated
     /// with the PROPOSED one, so `Col(n + i)` is `excluded.<col i>` and is
     /// legal. `check_program` would reject those as out of range, so the bound
@@ -670,15 +771,49 @@ impl CompiledPlan {
                 order_by,
                 limit,
                 offset,
+                aggregate,
             } => {
-                let name = col_namer(*table);
+                let base = col_namer(*table);
                 out.push_str(&format!("Select {}\n", table_name(*table)));
                 out.push_str(&format!(
                     "  access: {}\n",
                     self.render_access(access, schema, *table)
                 ));
                 if let Some(f) = filter {
-                    out.push_str(&format!("  filter: {}\n", render_program(f, &name)));
+                    out.push_str(&format!("  filter: {}\n", render_program(f, &base)));
+                }
+                // Everything below a grouping step indexes the GROUPED tuple
+                // `[keys ‖ aggs]`, not the base row — so it needs its own namer.
+                // Using the base one here printed the table's first column as the
+                // name of `count(*)`, which is the kind of plausible wrong answer
+                // EXPLAIN exists to rule out.
+                let grouped: Option<Vec<String>> = aggregate.as_ref().map(|a| {
+                    a.group_by
+                        .iter()
+                        .map(|c| base(*c))
+                        .chain(a.aggs.iter().map(|c| match &c.arg {
+                            None => format!("{}(*)", c.func.name()),
+                            Some(p) => format!("{}({})", c.func.name(), render_program(p, &base)),
+                        }))
+                        .collect()
+                });
+                let name = |c: u16| match &grouped {
+                    Some(g) => g
+                        .get(c as usize)
+                        .cloned()
+                        .unwrap_or_else(|| format!("col#{c}")),
+                    None => base(c),
+                };
+                if let Some(a) = aggregate {
+                    if !a.group_by.is_empty() {
+                        let keys: Vec<String> = a.group_by.iter().map(|c| base(*c)).collect();
+                        out.push_str(&format!("  group by: {}\n", keys.join(", ")));
+                    }
+                    let calls: Vec<String> = grouped.as_ref().unwrap()[a.group_by.len()..].to_vec();
+                    out.push_str(&format!("  aggregate: {}\n", calls.join(", ")));
+                    if let Some(h) = &a.having {
+                        out.push_str(&format!("  having: {}\n", render_program(h, &name)));
+                    }
                 }
                 let cols: Vec<String> = projection
                     .iter()
@@ -1161,6 +1296,7 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             order_by,
             limit,
             offset,
+            aggregate,
         } => {
             buf.push(STMT_SELECT);
             buf.extend_from_slice(&table.to_le_bytes());
@@ -1188,6 +1324,28 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             }
             encode_opt_u64(*limit, buf);
             encode_opt_u64(*offset, buf);
+            match aggregate {
+                None => buf.push(0),
+                Some(a) => {
+                    buf.push(1);
+                    w_u16(buf, a.group_by.len() as u16);
+                    for c in &a.group_by {
+                        w_u16(buf, *c);
+                    }
+                    w_u16(buf, a.aggs.len() as u16);
+                    for c in &a.aggs {
+                        buf.push(c.func as u8);
+                        match &c.arg {
+                            None => buf.push(0),
+                            Some(p) => {
+                                buf.push(1);
+                                p.encode_into(buf);
+                            }
+                        }
+                    }
+                    encode_opt_program(a.having.as_ref(), buf);
+                }
+            }
         }
         PlanStmt::Insert {
             table,
@@ -1305,6 +1463,41 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
             }
             let limit = decode_opt_u64(buf, pos)?;
             let offset = decode_opt_u64(buf, pos)?;
+            let aggregate = match r_u8(buf, pos)? {
+                0 => None,
+                1 => {
+                    let n = r_u16(buf, pos)? as usize;
+                    if n > crate::parser::MAX_ORDER_BY_ITEMS {
+                        return Err(corrupt("too many GROUP BY items in plan"));
+                    }
+                    let mut group_by = Vec::with_capacity(n.min(64));
+                    for _ in 0..n {
+                        group_by.push(r_u16(buf, pos)?);
+                    }
+                    let n = r_u16(buf, pos)? as usize;
+                    if n > crate::parser::MAX_SELECT_ITEMS {
+                        return Err(corrupt("too many aggregates in plan"));
+                    }
+                    let mut aggs = Vec::with_capacity(n.min(64));
+                    for _ in 0..n {
+                        let f = AggFn::from_tag(r_u8(buf, pos)?)
+                            .ok_or_else(|| corrupt("unknown aggregate function"))?;
+                        let arg = match r_u8(buf, pos)? {
+                            0 => None,
+                            1 => Some(ExprProgram::decode(buf, pos)?),
+                            t => return Err(corrupt(format!("bad aggregate arg tag {t}"))),
+                        };
+                        aggs.push(AggCall { func: f, arg });
+                    }
+                    let having = decode_opt_program(buf, pos)?;
+                    Some(Aggregation {
+                        group_by,
+                        aggs,
+                        having,
+                    })
+                }
+                t => return Err(corrupt(format!("bad aggregate tag {t}"))),
+            };
             Ok(PlanStmt::Select {
                 table,
                 access,
@@ -1313,6 +1506,7 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                 order_by,
                 limit,
                 offset,
+                aggregate,
             })
         }
         STMT_INSERT => {

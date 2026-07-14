@@ -236,6 +236,31 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Move this binder's PARAMETER and CONTEXT state onto a new scope.
+    ///
+    /// An aggregate query binds in two passes over two different tuples — the
+    /// aggregate arguments over the base row, then the projection and HAVING
+    /// over the grouped tuple `[keys ‖ aggs]`. Both passes must share one
+    /// parameter table: `$1` means the same slot on either side, and a type
+    /// pinned by `sum(qty * $1)` has to be visible to the projection. Starting a
+    /// second binder from scratch would give the two passes separate parameter
+    /// universes and silently accept `$1` meaning two things.
+    pub fn rescope<'b>(self, scope: Scope<'b>) -> Binder<'b> {
+        Binder {
+            scope,
+            param_types: self.param_types,
+            n_user_params: self.n_user_params,
+            ctx_keys: self.ctx_keys,
+            ctx_list_keys: self.ctx_list_keys,
+            allow_params: self.allow_params,
+            allow_context: self.allow_context,
+            // Neither survives a scope change: `excluded.` belongs to ON
+            // CONFLICT, and fold suppression to whichever branch set it.
+            allow_excluded: false,
+            suppress_fold: false,
+        }
+    }
+
     /// Bring `excluded.<col>` in or out of scope (ON CONFLICT DO UPDATE only).
     pub fn set_allow_excluded(&mut self, on: bool) {
         self.allow_excluded = on;
@@ -523,6 +548,22 @@ impl<'a> Binder<'a> {
                 let n = t.columns.len();
                 Ok((BExpr::Col((n + i) as u16), Some(t.columns[i].ty)))
             }
+            // An aggregate is not a scalar and must never compile into one: a
+            // scalar runs per row and yields a value; an aggregate consumes a
+            // whole group and only exists after filtering and grouping. The
+            // planner lifts aggregates OUT of the projection before binding
+            // what is left, so reaching here means one appeared where no
+            // grouping happens — a WHERE clause, a CHECK, a policy, a SET.
+            //
+            // `WHERE count(*) > 1` is the classic: it reads naturally and is
+            // meaningless (the filter runs per row, before any group exists).
+            // SQL spells that HAVING, and saying so beats "unknown function".
+            ast::Expr::Agg(f, _) => Err(bind_err(format!(
+                "{}() is an aggregate and cannot be used here — aggregates are only \
+                 allowed in a SELECT list or HAVING. A per-row filter is WHERE; a \
+                 filter on a GROUPED result is HAVING.",
+                f.name()
+            ))),
             ast::Expr::Coalesce(args) => {
                 if args.is_empty() {
                     return Err(bind_err("coalesce() needs at least one argument"));

@@ -11,15 +11,14 @@ use std::collections::BTreeSet;
 /// the subset of those keys that are `IN` list slots (§2.6 — those have no
 /// scalar type, so the type-inference guard skips them).
 type PlannedStmt = (PlanStmt, Vec<Option<ColumnType>>, Vec<String>, BTreeSet<String>);
-use crate::binder::{compile_program, BExpr, Binder};
+use crate::binder::{compile_program, BExpr, Binder, Scope};
 use crate::plan::{
-    render_program, AccessPath, CompiledPlan, InsertSource, PlanOnConflict, PlanStmt, Projection,
+    render_program, AccessPath, AggCall, Aggregation, CompiledPlan, InsertSource, PlanOnConflict,
+    PlanStmt, Projection,
 };
 use crate::policy::{PolicyCatalog, TablePolicies};
-use mpedb_types::{
-    ColumnType, Error, Footprint, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
-    TableDef, Value,
-};
+use mpedb_types::{ExprProgram, ColumnType, Error, Footprint, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
+    TableDef, Value,};
 
 fn and(a: BExpr, b: BExpr) -> BExpr {
     BExpr::Binary(BinOp::And, Box::new(a), Box::new(b))
@@ -285,6 +284,313 @@ fn resolve_table<'s>(schema: &'s Schema, name: &str) -> Result<(u32, &'s TableDe
     Ok((id, schema.table(id).expect("id from table_id")))
 }
 
+/// Does this expression contain an aggregate anywhere?
+fn contains_agg(e: &ast::Expr) -> bool {
+    use ast::Expr as E;
+    match e {
+        E::Agg(..) => true,
+        E::Unary(_, a) | E::IsNull(a, _) => contains_agg(a),
+        E::Binary(_, a, b) | E::Like(a, b) => contains_agg(a) || contains_agg(b),
+        E::InContext(a, _, _) => contains_agg(a),
+        E::InList(a, xs, _) => contains_agg(a) || xs.iter().any(contains_agg),
+        E::Coalesce(xs) | E::Func(_, xs) => xs.iter().any(contains_agg),
+        E::Case(arms, els) => {
+            arms.iter().any(|(c, r)| contains_agg(c) || contains_agg(r))
+                || els.as_deref().is_some_and(contains_agg)
+        }
+        E::Lit(_) | E::Param(_) | E::Col(_) | E::ContextRef(_) | E::Excluded(_)
+        | E::Qualified(..) => false,
+    }
+}
+
+/// Lift every aggregate out of `e`, replacing it with a reference to its slot in
+/// the GROUPED tuple. Returns the rewritten expression.
+///
+/// The two tuples are the crux. An aggregate's ARGUMENT is evaluated over the
+/// base row (`sum(qty)` needs each row's qty); the aggregate's RESULT lives in
+/// the grouped tuple `[keys ‖ aggs]`, and so does everything the projection and
+/// HAVING say about it. Mixing them up is how `sum(x) + 1` ends up reading
+/// column 1 of the base row.
+fn lift_aggs(
+    e: &ast::Expr,
+    group_by: &[u16],
+    table: &TableDef,
+    aggs: &mut Vec<(mpedb_types::AggFn, Option<ast::Expr>)>,
+) -> Result<ast::Expr> {
+    use ast::Expr as E;
+    let rec = |x: &ast::Expr, aggs: &mut Vec<_>| lift_aggs(x, group_by, table, aggs);
+    Ok(match e {
+        E::Agg(f, arg) => {
+            let spec = (*f, arg.as_deref().cloned());
+            // Reuse an identical aggregate rather than adding a slot: `SELECT
+            // count(*) ... ORDER BY count(*)` is one aggregate named twice, and
+            // lifting it twice would accumulate it twice.
+            let slot = group_by.len()
+                + match aggs.iter().position(|a| *a == spec) {
+                    Some(i) => i,
+                    None => {
+                        aggs.push(spec);
+                        aggs.len() - 1
+                    }
+                };
+            // The grouped tuple has no table, so name the slot positionally;
+            // `synthetic_grouped_table` below gives those names meaning.
+            E::Col(format!("__g{slot}"))
+        }
+        // A bare column in an aggregate query must be a GROUP BY key — SQL's
+        // rule, and not pedantry: `SELECT name, count(*) FROM t` with no GROUP
+        // BY has no answer for which `name` to show. sqlite invents one; the
+        // rigid engine says so instead.
+        E::Col(name) => {
+            let idx = table
+                .column_index(name)
+                .ok_or_else(|| bind_err(format!("unknown column `{name}`")))?;
+            let pos = group_by.iter().position(|g| *g == idx).ok_or_else(|| {
+                bind_err(format!(
+                    "column `{name}` must appear in GROUP BY or be inside an aggregate — \
+                     otherwise there is no single value for it in the group"
+                ))
+            })?;
+            E::Col(format!("__g{pos}"))
+        }
+        E::Qualified(q, name) => {
+            if !q.eq_ignore_ascii_case(&table.name) {
+                return Err(bind_err(format!("no table named `{q}` in this statement")));
+            }
+            rec(&E::Col(name.clone()), aggs)?
+        }
+        E::Unary(op, a) => E::Unary(*op, Box::new(rec(a, aggs)?)),
+        E::IsNull(a, n) => E::IsNull(Box::new(rec(a, aggs)?), *n),
+        E::Binary(op, a, b) => {
+            E::Binary(*op, Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?))
+        }
+        E::Like(a, b) => E::Like(Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?)),
+        E::InList(a, xs, n) => E::InList(
+            Box::new(rec(a, aggs)?),
+            xs.iter().map(|x| rec(x, aggs)).collect::<Result<_>>()?,
+            *n,
+        ),
+        E::InContext(a, k, n) => E::InContext(Box::new(rec(a, aggs)?), k.clone(), *n),
+        E::Coalesce(xs) => E::Coalesce(xs.iter().map(|x| rec(x, aggs)).collect::<Result<_>>()?),
+        E::Func(f, xs) => E::Func(
+            f.clone(),
+            xs.iter().map(|x| rec(x, aggs)).collect::<Result<_>>()?,
+        ),
+        E::Case(arms, els) => E::Case(
+            arms.iter()
+                .map(|(c, r)| Ok((rec(c, aggs)?, rec(r, aggs)?)))
+                .collect::<Result<_>>()?,
+            match els {
+                Some(x) => Some(Box::new(rec(x, aggs)?)),
+                None => None,
+            },
+        ),
+        other @ (E::Lit(_) | E::Param(_) | E::ContextRef(_) | E::Excluded(_)) => other.clone(),
+    })
+}
+
+/// A synthetic `TableDef` describing the GROUPED tuple `[keys ‖ aggs]`, so the
+/// projection and HAVING can be bound by the ordinary binder against it.
+///
+/// The grouped tuple is not a table, but it IS a tuple with typed slots — which
+/// is exactly what the binder needs. Reusing the binder here rather than writing
+/// a second resolution path means the type rules, 3VL and constant folding are
+/// the same ones as everywhere else, instead of a parallel set that drifts.
+fn synthetic_grouped_table(
+    table: &TableDef,
+    group_by: &[u16],
+    aggs: &[(mpedb_types::AggFn, Option<ast::Expr>)],
+    agg_types: &[Option<ColumnType>],
+) -> TableDef {
+    let mut columns = Vec::with_capacity(group_by.len() + aggs.len());
+    for (k, g) in group_by.iter().enumerate() {
+        let src = &table.columns[*g as usize];
+        columns.push(mpedb_types::ColumnDef {
+            name: format!("__g{k}"),
+            ty: src.ty,
+            nullable: true, // a group key can be NULL; NULLs group together
+            unique: false,
+            default: None,
+            check: None,
+        });
+    }
+    for (i, (f, _)) in aggs.iter().enumerate() {
+        let ty = match f {
+            mpedb_types::AggFn::Count => ColumnType::Int64,
+            mpedb_types::AggFn::Avg => ColumnType::Float64,
+            // SUM/MIN/MAX keep the argument's type.
+            _ => agg_types[i].unwrap_or(ColumnType::Int64),
+        };
+        columns.push(mpedb_types::ColumnDef {
+            name: format!("__g{}", group_by.len() + i),
+            ty,
+            // Every aggregate except COUNT is NULL over an empty group.
+            nullable: !matches!(f, mpedb_types::AggFn::Count),
+            unique: false,
+            default: None,
+            check: None,
+        });
+    }
+    TableDef {
+        name: table.name.clone(),
+        columns,
+        primary_key: vec![0],
+    }
+}
+
+/// Plan a `GROUP BY` / aggregate SELECT.
+///
+/// `access` and `filter` are already built and are NOT touched here — that is
+/// the point. They carry the merged `(WHERE ∧ effective-policy)` predicate, and
+/// DESIGN-MULTIDB §4 requires aggregation to consume rows only after it. The
+/// executor honours that by aggregating `gather_rows`' output; this function
+/// simply never gets the chance to reorder them.
+#[allow(clippy::too_many_arguments)]
+fn plan_aggregate_select(
+    s: &ast::SelectStmt,
+    table: &TableDef,
+    table_id: u32,
+    access: AccessPath,
+    filter: Option<ExprProgram>,
+    mut binder: Binder<'_>,
+    _consts: &mut Vec<Value>,
+) -> Result<PlannedStmt> {
+    // 1. GROUP BY columns -> base-row indices.
+    let mut group_by = Vec::with_capacity(s.group_by.len());
+    for name in &s.group_by {
+        let i = table
+            .column_index(name)
+            .ok_or_else(|| bind_err(format!("unknown column `{name}` in GROUP BY")))?;
+        if group_by.contains(&i) {
+            return Err(bind_err(format!("column `{name}` repeated in GROUP BY")));
+        }
+        group_by.push(i);
+    }
+
+    // 2. Lift the aggregates out of the SELECT list and HAVING.
+    let items = s.items.as_ref().ok_or_else(|| {
+        bind_err("SELECT * with GROUP BY has no meaning — list the group keys and aggregates")
+    })?;
+    let mut agg_specs: Vec<(mpedb_types::AggFn, Option<ast::Expr>)> = Vec::new();
+    let mut rewritten = Vec::with_capacity(items.len());
+    for item in items {
+        rewritten.push(lift_aggs(item, &group_by, table, &mut agg_specs)?);
+    }
+    let rewritten_having = match &s.having {
+        Some(h) => Some(lift_aggs(h, &group_by, table, &mut agg_specs)?),
+        None => None,
+    };
+    // ORDER BY is lifted HERE, with the others, because `ORDER BY count(*)` may
+    // name an aggregate that is NOT in the SELECT list — `SELECT dept FROM t
+    // GROUP BY dept ORDER BY count(*)` is legal in sqlite and PG. Lifting it
+    // late, after the grouped tuple was built, would leave that aggregate with
+    // nowhere to live. `lift_aggs` reuses an identical existing slot, so
+    // ordering by an aggregate that IS selected does not compute it twice.
+    let mut rewritten_order = Vec::with_capacity(s.order_by.len());
+    for (e, desc) in &s.order_by {
+        rewritten_order.push((lift_aggs(e, &group_by, table, &mut agg_specs)?, *desc));
+    }
+
+    // 3. Bind each aggregate ARGUMENT over the BASE row.
+    let mut aggs = Vec::with_capacity(agg_specs.len());
+    let mut agg_types = Vec::with_capacity(agg_specs.len());
+    for (f, arg) in &agg_specs {
+        match arg {
+            None => {
+                aggs.push(AggCall { func: *f, arg: None });
+                agg_types.push(Some(ColumnType::Int64));
+            }
+            Some(a) => {
+                let (b, ty) = binder.bind_expr(a)?;
+                agg_types.push(ty);
+                aggs.push(AggCall {
+                    func: *f,
+                    arg: Some(compile_program(&b)?),
+                });
+            }
+        }
+    }
+
+    // 4. Bind the rewritten projection/HAVING over the GROUPED tuple — a
+    //    different tuple from the base row, carrying the same parameter table.
+    let grouped = synthetic_grouped_table(table, &group_by, &agg_specs, &agg_types);
+    let mut binder = binder.rescope(Scope::single(&grouped));
+
+    let mut projection = Vec::with_capacity(rewritten.len());
+    for (item, orig) in rewritten.iter().zip(items) {
+        let (b, _) = binder.bind_expr(item)?;
+        projection.push(match b {
+            BExpr::Col(i) => Projection::Expr {
+                program: compile_program(&BExpr::Col(i))?,
+                name: agg_item_name(orig, table),
+            },
+            other => Projection::Expr {
+                program: compile_program(&other)?,
+                name: agg_item_name(orig, table),
+            },
+        });
+    }
+    let having = match &rewritten_having {
+        Some(h) => {
+            let b = binder.bind_predicate(h)?;
+            Some(compile_program(&b)?)
+        }
+        None => None,
+    };
+
+    // 5. ORDER BY, resolved against the GROUPED tuple. After lifting, every
+    //    legal item is a bare column of that tuple — a group key or an
+    //    aggregate slot. Anything else (`ORDER BY count(*) + 1`) binds to a
+    //    computed expression the plan's positional `order_by` cannot express,
+    //    so it is refused rather than sorted by the wrong thing.
+    let mut order_by = Vec::with_capacity(rewritten_order.len());
+    for ((e, desc), (orig, _)) in rewritten_order.iter().zip(&s.order_by) {
+        let (b, _) = binder.bind_expr(e)?;
+        match b {
+            BExpr::Col(i) => order_by.push((i, *desc)),
+            _ => {
+                return Err(bind_err(format!(
+                    "ORDER BY `{}` must be a GROUP BY key or an aggregate, not an expression \
+                     computed from them",
+                    agg_item_name(orig, table)
+                )))
+            }
+        }
+    }
+
+    let (param_types, context_keys, list_keys) = binder.into_parts();
+    Ok((
+        PlanStmt::Select {
+            table: table_id,
+            access,
+            filter,
+            projection,
+            order_by,
+            limit: s.limit,
+            offset: s.offset,
+            aggregate: Some(Aggregation {
+                group_by,
+                aggs,
+                having,
+            }),
+        },
+        param_types,
+        context_keys,
+        list_keys,
+    ))
+}
+
+/// The output column name for one item of an aggregate SELECT list.
+fn agg_item_name(e: &ast::Expr, _t: &TableDef) -> String {
+    match e {
+        ast::Expr::Col(c) => c.clone(),
+        ast::Expr::Qualified(_, c) => c.clone(),
+        ast::Expr::Agg(f, None) => format!("{}(*)", f.name()),
+        ast::Expr::Agg(f, Some(a)) => format!("{}({})", f.name(), agg_item_name(a, _t)),
+        _ => "?column?".to_string(),
+    }
+}
+
 fn plan_select(
     s: &ast::SelectStmt,
     schema: &Schema,
@@ -305,6 +611,23 @@ fn plan_select(
     let policy = read_policy(&mut binder, catalog, table_id, &table.name, PolicyCmd::Select)?;
     let (access, residual) = extract_access(merge_and(bound_where, policy), table, consts)?;
     let filter = residual.map(|e| compile_program(&e)).transpose()?;
+
+    // Is this an aggregate query? Either an aggregate appears, or GROUP BY does.
+    let has_agg = s
+        .items
+        .as_ref()
+        .is_some_and(|items| items.iter().any(contains_agg))
+        || s.having.as_ref().is_some_and(contains_agg)
+        // ORDER BY too: `SELECT dept FROM t ORDER BY count(*)` is an aggregate
+        // query even though no aggregate appears in the SELECT list, and
+        // routing it to the plain planner would report the wrong problem.
+        || s.order_by.iter().any(|(e, _)| contains_agg(e))
+        || !s.group_by.is_empty();
+    if has_agg {
+        return plan_aggregate_select(
+            s, table, table_id, access, filter, binder, consts,
+        );
+    }
 
     let projection = match &s.items {
         None => (0..table.columns.len() as u16).map(Projection::Column).collect(),
@@ -332,10 +655,18 @@ fn plan_select(
     };
 
     let mut order_by = Vec::with_capacity(s.order_by.len());
-    for (name, desc) in &s.order_by {
-        let idx = table.column_index(name).ok_or_else(|| {
-            bind_err(format!("unknown column `{name}` in ORDER BY"))
-        })?;
+    for (e, desc) in &s.order_by {
+        // Only a bare column: the plan sorts by output position, so there is
+        // nowhere to put a computed sort key. (An aggregate here never reaches
+        // this path — `has_agg` routed it to the aggregate planner already.)
+        let name = match e {
+            ast::Expr::Col(n) => n,
+            ast::Expr::Qualified(q, n) if q.eq_ignore_ascii_case(&table.name) => n,
+            _ => return Err(bind_err("ORDER BY must name a column".to_string())),
+        };
+        let idx = table
+            .column_index(name)
+            .ok_or_else(|| bind_err(format!("unknown column `{name}` in ORDER BY")))?;
         order_by.push((idx, *desc));
     }
     // A PK-prefix ORDER BY, all ascending, over a PK-ordered access path is
@@ -355,6 +686,7 @@ fn plan_select(
     let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
         PlanStmt::Select {
+            aggregate: None,
             table: table_id,
             access,
             filter,
