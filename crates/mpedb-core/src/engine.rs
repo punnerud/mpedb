@@ -838,6 +838,43 @@ impl PageStore for WriteTxn<'_> {
     }
 
     fn alloc(&mut self) -> Result<u64> {
+        let id = self.alloc_id()?;
+        self.dirty.insert(id);
+        self.eng.shm.page_mut_unchecked(id)?.fill(0);
+        Ok(id)
+    }
+
+    fn alloc_raw(&mut self) -> Result<u64> {
+        // Identical to `alloc` minus the full-page fill(0). Split rather than
+        // making `alloc` lazy: every other caller (btree nodes) relies on the
+        // zeroed contract, and quietly weakening it for all of them to speed up
+        // one path is how a subtle corruption gets introduced.
+        let id = self.alloc_id()?;
+        self.dirty.insert(id);
+        Ok(id)
+    }
+
+    fn free(&mut self, id: u64) -> Result<()> {
+        if self.dirty.remove(&id) {
+            // allocated this txn: immediately reusable, invisible to readers
+            self.reusable.push(id);
+            return Ok(());
+        }
+        if !self.freed.insert(id) {
+            return Err(Error::Internal(format!("double free of page {id}")));
+        }
+        Ok(())
+    }
+
+    fn is_dirty(&self, id: u64) -> bool {
+        self.dirty.contains(&id)
+    }
+}
+
+impl WriteTxn<'_> {
+    /// Pick the next page id (freelist-reuse first, then high-water), without
+    /// touching its contents. Shared by `alloc` and `alloc_raw`.
+    fn alloc_id(&mut self) -> Result<u64> {
         // Never re-enter the freelist tree while it is being mutated; fall
         // back to the high-water mark instead (a few pages of slack, never
         // corruption).
@@ -868,27 +905,10 @@ impl PageStore for WriteTxn<'_> {
                 id
             }
         };
-        self.dirty.insert(id);
-        self.eng.shm.page_mut_unchecked(id)?.fill(0);
         Ok(id)
     }
-
-    fn free(&mut self, id: u64) -> Result<()> {
-        if self.dirty.remove(&id) {
-            // allocated this txn: immediately reusable, invisible to readers
-            self.reusable.push(id);
-            return Ok(());
-        }
-        if !self.freed.insert(id) {
-            return Err(Error::Internal(format!("double free of page {id}")));
-        }
-        Ok(())
-    }
-
-    fn is_dirty(&self, id: u64) -> bool {
-        self.dirty.contains(&id)
-    }
 }
+
 
 impl<'e> WriteTxn<'e> {
     /// Pull one reclaimable freelist entry into `reusable`. Reusable iff its

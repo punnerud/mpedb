@@ -367,11 +367,23 @@ fn write_overflow<S: PageStore + ?Sized>(store: &mut S, mut data: &[u8]) -> Resu
     let mut prev = 0u64;
     while !data.is_empty() || first == 0 {
         let take = data.len().min(OVERFLOW_CAP);
-        let id = store.alloc()?;
+        // `alloc_raw`, not `alloc`: this page is about to have every byte it
+        // owns defined right here — header, payload, then the tail below — so
+        // `alloc`'s full-page fill(0) is a 4 KiB memset thrown away on the hot
+        // path of every blob write. The resulting page is byte-for-byte what
+        // `alloc` would have produced; only the redundant pass is gone.
+        let id = store.alloc_raw()?;
         let p = store.page_mut(id)?;
         init_node(p, KIND_OVERFLOW);
         p[6..8].copy_from_slice(&(take as u16).to_le_bytes());
         p[HDR..HDR + take].copy_from_slice(&data[..take]);
+        // The tail. `read_overflow` never looks past HDR+take and there is no
+        // per-data-page checksum (DESIGN.md §5.4.1), so leaving the previous
+        // tenant's bytes here would be *correct* — and would quietly keep
+        // deleted rows readable in a file that gets copied around. Zero it. For
+        // a full page this slice is empty and costs nothing, which is exactly
+        // the common case.
+        p[HDR + take..].fill(0);
         data = &data[take..];
         if first == 0 {
             first = id;
