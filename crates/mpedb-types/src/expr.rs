@@ -41,6 +41,15 @@ pub enum Instr {
     ToFloat,
     /// SQL LIKE with pattern from the const pool (supports % and _).
     Like(u16),
+    /// `<scalar> IN (<list param n>)` — set membership against a
+    /// [`Value::List`] bound to parameter `n` (DESIGN-MULTIDB.md §2.6).
+    ///
+    /// The list is a PARAM, not a const: that is the whole design. Arity lives
+    /// in the data, so the plan bytes — and therefore the plan hash — stay
+    /// independent of how many orgs a given session belongs to, and one
+    /// compiled plan serves every session (§4.1). Baking the list into the
+    /// const pool would mint a plan per distinct membership set.
+    InParam(u16),
 }
 
 const OP_PUSH_COL: u8 = 1;
@@ -65,6 +74,55 @@ const OP_IS_NULL: u8 = 19;
 const OP_IS_NOT_NULL: u8 = 20;
 const OP_TO_FLOAT: u8 = 21;
 const OP_LIKE: u8 = 22;
+const OP_IN_PARAM: u8 = 23;
+
+/// SQL `x IN (…)` under three-valued logic — the semantics that decide whether
+/// a policy admits a row, so they are spelled out rather than approximated:
+///
+/// | case | result | why |
+/// |---|---|---|
+/// | `x` is NULL | **NULL** | never TRUE; a filter needs exactly TRUE, so the row stays invisible |
+/// | `x` equals some element | **TRUE** | a match wins even if other elements are NULL — which is why the NULL scan cannot come first |
+/// | no match, some element NULL | **NULL** | the NULL *might* have been the match; SQL refuses to say FALSE |
+/// | no match, no NULL elements | **FALSE** | |
+/// | empty list | **FALSE** | nothing to match, and NOT NULL: an empty membership set means "belongs to nothing" and must deny cleanly |
+///
+/// The `IS NOT DISTINCT FROM` reading (NULL matching NULL) is deliberately NOT
+/// used: standard `IN` compares with `=`, and a context list containing NULL
+/// must not silently make NULL-keyed rows visible.
+fn in_list_3vl(probe: &Value, list: &Value) -> Result<Value> {
+    let items = match list {
+        Value::List(items) => items,
+        Value::Null => {
+            // The whole set is NULL (e.g. an unset context key bound to NULL):
+            // membership in an unknown set is unknown.
+            return Ok(Value::Null);
+        }
+        other => {
+            return Err(Error::TypeMismatch(format!(
+                "IN expects a context list, got {}",
+                other.type_name()
+            )))
+        }
+    };
+    if probe.is_null() {
+        return Ok(Value::Null);
+    }
+    let mut saw_null = false;
+    for it in items {
+        if it.is_null() {
+            saw_null = true;
+            continue;
+        }
+        // Type mismatches inside the list are the caller's error, not a silent
+        // non-match: `org_id IN (list-of-text)` must not quietly deny every row.
+        match probe.sql_cmp(it)? {
+            Some(std::cmp::Ordering::Equal) => return Ok(Value::Bool(true)),
+            _ => continue,
+        }
+    }
+    Ok(if saw_null { Value::Null } else { Value::Bool(false) })
+}
 
 /// A compiled expression: instruction sequence + constant pool.
 #[derive(Debug, Clone, PartialEq)]
@@ -219,6 +277,13 @@ impl ExprProgram {
                         }
                     });
                 }
+                Instr::InParam(pi) => {
+                    let probe = stack.pop().expect("validated");
+                    let list = params.get(pi as usize).ok_or_else(|| {
+                        Error::Corrupt("IN list parameter index out of range".into())
+                    })?;
+                    stack.push(in_list_3vl(&probe, list)?);
+                }
             }
         }
         Ok(stack.pop().expect("validated: exactly one result"))
@@ -264,6 +329,10 @@ impl ExprProgram {
                 }
                 Instr::Like(x) => {
                     buf.push(OP_LIKE);
+                    buf.extend_from_slice(&x.to_le_bytes());
+                }
+                Instr::InParam(x) => {
+                    buf.push(OP_IN_PARAM);
                     buf.extend_from_slice(&x.to_le_bytes());
                 }
                 Instr::Eq => buf.push(OP_EQ),
@@ -323,6 +392,7 @@ impl ExprProgram {
                 OP_PUSH_PARAM => Instr::PushParam(read_u16_arg()?),
                 OP_PUSH_CONST => Instr::PushConst(read_u16_arg()?),
                 OP_LIKE => Instr::Like(read_u16_arg()?),
+                OP_IN_PARAM => Instr::InParam(read_u16_arg()?),
                 OP_EQ => Instr::Eq,
                 OP_NE => Instr::Ne,
                 OP_LT => Instr::Lt,
@@ -371,6 +441,9 @@ fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                 }
                 (1, 1)
             }
+            // Pops the probe scalar, pushes the 3VL result; the list comes from
+            // a param slot, not the stack, so the arity is not encoded here.
+            Instr::InParam(_) => (1, 1),
             Instr::Neg | Instr::Not | Instr::IsNull | Instr::IsNotNull | Instr::ToFloat => (1, 1),
             _ => (2, 1),
         };
@@ -609,5 +682,109 @@ mod tests {
         for cut in 0..buf.len() {
             let _ = ExprProgram::decode(&buf[..cut], &mut 0); // must not panic
         }
+    }
+
+    // ---- §2.6 `col IN (context list)` under 3VL ----
+
+    fn in_prog() -> ExprProgram {
+        // PushCol(0) ; InParam(0)   ==   `c0 IN ($1)`
+        ExprProgram::new(vec![Instr::PushCol(0), Instr::InParam(0)], vec![]).unwrap()
+    }
+
+    fn eval_in(probe: Value, list: Value) -> Value {
+        in_prog().eval(&[probe], &[list]).unwrap()
+    }
+
+    #[test]
+    fn in_list_three_valued_logic() {
+        let l = |v: Vec<Value>| Value::List(v);
+
+        // plain hit / miss
+        assert_eq!(eval_in(Value::Int(2), l(vec![Value::Int(1), Value::Int(2)])), Value::Bool(true));
+        assert_eq!(eval_in(Value::Int(9), l(vec![Value::Int(1), Value::Int(2)])), Value::Bool(false));
+
+        // a match WINS over a NULL element — this is why the NULL scan cannot
+        // short-circuit before the equality scan.
+        assert_eq!(
+            eval_in(Value::Int(2), l(vec![Value::Null, Value::Int(2)])),
+            Value::Bool(true)
+        );
+
+        // no match + a NULL element ⇒ UNKNOWN, not FALSE: the NULL might have
+        // been the match.
+        assert_eq!(eval_in(Value::Int(9), l(vec![Value::Null, Value::Int(2)])), Value::Null);
+
+        // NULL probe is never TRUE
+        assert_eq!(eval_in(Value::Null, l(vec![Value::Int(1)])), Value::Null);
+
+        // empty set denies CLEANLY (FALSE, not NULL): "belongs to nothing".
+        assert_eq!(eval_in(Value::Int(1), l(vec![])), Value::Bool(false));
+
+        // an entirely-NULL set is an unknown set
+        assert_eq!(eval_in(Value::Int(1), Value::Null), Value::Null);
+    }
+
+    /// A filter passes only on exactly TRUE, so every UNKNOWN above must deny.
+    /// This is the property a policy actually rests on.
+    #[test]
+    fn in_list_unknown_denies_in_a_filter() {
+        let p = in_prog();
+        // no match + NULL element ⇒ UNKNOWN ⇒ row not visible
+        assert!(!p
+            .eval_filter(&mut Vec::new(), &[Value::Int(9)], &[Value::List(vec![Value::Null])])
+            .unwrap());
+        // NULL probe ⇒ UNKNOWN ⇒ row not visible
+        assert!(!p
+            .eval_filter(&mut Vec::new(), &[Value::Null], &[Value::List(vec![Value::Int(1)])])
+            .unwrap());
+        // a real match is visible
+        assert!(p
+            .eval_filter(&mut Vec::new(), &[Value::Int(1)], &[Value::List(vec![Value::Int(1)])])
+            .unwrap());
+    }
+
+    /// A type mismatch inside the list must ERROR, not quietly deny every row —
+    /// a silent deny would look exactly like "this tenant owns nothing".
+    #[test]
+    fn in_list_type_mismatch_is_an_error_not_a_silent_deny() {
+        let r = in_prog().eval(&[Value::Int(1)], &[Value::List(vec![Value::Text("1".into())])]);
+        assert!(matches!(r, Err(Error::TypeMismatch(_))), "got {r:?}");
+        // and a non-list param is likewise a caller error
+        let r2 = in_prog().eval(&[Value::Int(1)], &[Value::Int(1)]);
+        assert!(matches!(r2, Err(Error::TypeMismatch(_))), "got {r2:?}");
+    }
+
+    #[test]
+    fn in_param_roundtrips_and_out_of_range_param_is_corrupt() {
+        let p = in_prog();
+        let mut buf = Vec::new();
+        p.encode_into(&mut buf);
+        let mut pos = 0;
+        assert_eq!(ExprProgram::decode(&buf, &mut pos).unwrap(), p);
+        // a program referencing param 5 with no params supplied must not panic
+        let bad = ExprProgram::new(vec![Instr::PushCol(0), Instr::InParam(5)], vec![]).unwrap();
+        assert!(matches!(bad.eval(&[Value::Int(1)], &[]), Err(Error::Corrupt(_))));
+    }
+
+    /// Lists cross the intent ring as params, so they must survive write/read.
+    #[test]
+    fn list_value_roundtrips_through_the_param_codec() {
+        use crate::value::{read_value, write_value};
+        let v = Value::List(vec![Value::Int(1), Value::Text("a".into()), Value::Null]);
+        let mut buf = Vec::new();
+        write_value(&mut buf, &v);
+        let mut pos = 0;
+        assert_eq!(read_value(&buf, &mut pos).unwrap(), v);
+
+        // truncation at every offset yields Corrupt, never a panic
+        for cut in 0..buf.len() {
+            let mut pos = 0;
+            let _ = read_value(&buf[..cut], &mut pos); // must not panic
+        }
+        // a nested list is rejected on the way in
+        let mut nested = Vec::new();
+        write_value(&mut nested, &Value::List(vec![Value::List(vec![Value::Int(1)])]));
+        let mut pos = 0;
+        assert!(matches!(read_value(&nested, &mut pos), Err(Error::Corrupt(_))));
     }
 }

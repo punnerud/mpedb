@@ -70,6 +70,18 @@ pub enum Value {
     Blob(Vec<u8>),
     /// Microseconds since the Unix epoch, UTC.
     Timestamp(i64),
+    /// **A session-context list — a parameter value only, never a stored one**
+    /// (DESIGN-MULTIDB.md §2.6). It exists so `col IN (current_setting('k'))`
+    /// can bind a variable-length membership set to ONE reserved slot: the
+    /// arity lives in the data, not the plan bytes, so the plan hash stays
+    /// context-independent and one plan still serves every session (§4.1).
+    ///
+    /// There is deliberately no `ColumnType::List`: a list has no column to be
+    /// stored in, no key encoding, and no ordering. Every path that would need
+    /// one rejects it — `column_type()` returns `None`-like behaviour via
+    /// `fits`, `sql_cmp` refuses it, and the row/key codecs error rather than
+    /// inventing a representation. The ONLY thing it supports is membership.
+    List(Vec<Value>),
 }
 
 impl Value {
@@ -87,6 +99,10 @@ impl Value {
             Value::Text(_) => ColumnType::Text,
             Value::Blob(_) => ColumnType::Blob,
             Value::Timestamp(_) => ColumnType::Timestamp,
+            // A list is not storable, so it has no column type. `fits` uses this
+            // to reject it from every column, which is what we want: the only
+            // legal home for a List is a context param slot.
+            Value::List(_) => return None,
         })
     }
 
@@ -123,6 +139,15 @@ impl Value {
             (Text(a), Text(b)) => a.as_bytes().cmp(b.as_bytes()),
             (Blob(a), Blob(b)) => a.cmp(b),
             (Timestamp(a), Timestamp(b)) => a.cmp(b),
+            // Lists have no ordering and comparing one is always a bug in the
+            // caller, not a NULL: say so rather than silently yielding NULL,
+            // which in a policy predicate would read as "row not visible" and
+            // hide the mistake.
+            (List(_), _) | (_, List(_)) => {
+                return Err(Error::TypeMismatch(
+                    "a context list supports only `IN` membership, not comparison".into(),
+                ))
+            }
             (a, b) => {
                 return Err(Error::TypeMismatch(format!(
                     "cannot compare {} with {}",
@@ -159,6 +184,16 @@ impl fmt::Display for Value {
             Value::Int(v) => write!(f, "{v}"),
             Value::Float(v) => write!(f, "{v:?}"),
             Value::Bool(v) => f.write_str(if *v { "true" } else { "false" }),
+            Value::List(items) => {
+                f.write_str("(")?;
+                for (i, v) in items.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    write!(f, "{v}")?;
+                }
+                f.write_str(")")
+            }
             Value::Text(v) => write!(f, "'{}'", v.replace('\'', "''")),
             Value::Blob(v) => {
                 f.write_str("x'")?;
@@ -203,6 +238,19 @@ pub fn write_value(buf: &mut Vec<u8>, v: &Value) {
             buf.push(6);
             buf.extend_from_slice(&x.to_le_bytes());
         }
+        // A context list DOES have to serialize: the intent ring encodes params
+        // with this function (ring_exec::encode_params) and context values are
+        // params, so without this `col IN (current_setting(..))` would work
+        // alone and break the moment a second writer contended. Nested lists are
+        // impossible by construction (Session::set_list takes scalars), but the
+        // encoding is recursive anyway so a decoder can never be surprised.
+        Value::List(items) => {
+            buf.push(7);
+            buf.extend_from_slice(&(items.len() as u32).to_le_bytes());
+            for it in items {
+                write_value(buf, it);
+            }
+        }
     }
 }
 
@@ -245,6 +293,23 @@ pub fn read_value(buf: &[u8], pos: &mut usize) -> Result<Value> {
             Value::Blob(take(buf, pos, len)?.to_vec())
         }
         6 => Value::Timestamp(i64::from_le_bytes(take(buf, pos, 8)?.try_into().unwrap())),
+        7 => {
+            let n = u32::from_le_bytes(take(buf, pos, 4)?.try_into().unwrap()) as usize;
+            // A hostile length must not pre-allocate: each element is decoded
+            // (and bounds-checked) before the next, so a lie about `n` runs out
+            // of buffer instead of out of memory.
+            let mut items = Vec::new();
+            for _ in 0..n {
+                let v = read_value(buf, pos)?;
+                // Reject nesting on the way IN, so nothing downstream ever has
+                // to reason about a list of lists.
+                if matches!(v, Value::List(_)) {
+                    return Err(Error::Corrupt("nested context list".into()));
+                }
+                items.push(v);
+            }
+            Value::List(items)
+        }
         _ => return Err(Error::Corrupt(format!("invalid value tag {tag}"))),
     })
 }

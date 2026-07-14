@@ -58,6 +58,17 @@ pub fn encode_row(values: &[Value], types: &[ColumnType]) -> Result<Vec<u8>> {
                 buf[off + 4..off + 8].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
                 buf.extend_from_slice(bytes);
             }
+            // A context list is param-only (DESIGN-MULTIDB §2.6): it has no
+            // ColumnType, so `fits` rejects it from every column and
+            // validate_row fails the row long before encoding. This arm returns
+            // an error rather than asserting, because unlike key encoding this
+            // signature CAN report it — and a row codec should never be the
+            // thing that panics.
+            Value::List(_) => {
+                return Err(Error::TypeMismatch(
+                    "a context list cannot be stored in a column".into(),
+                ))
+            }
         }
         off += w;
     }

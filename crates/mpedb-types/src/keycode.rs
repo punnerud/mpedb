@@ -43,6 +43,16 @@ pub fn encode_value(buf: &mut Vec<u8>, v: &Value) {
             buf.push(TAG_PRESENT);
             encode_bytes(buf, b);
         }
+        // A context list can never be a key: it has no ordering (`sql_cmp`
+        // refuses it) and no column to live in (`column_type()` is None, so
+        // `fits` rejects it from every column, and validate_row rejects the
+        // row before the engine ever builds a key). Reaching here means an
+        // earlier validation was removed, so say so loudly rather than encode
+        // something that would silently corrupt an index — this signature
+        // cannot return an error, and a wrong key is worse than a crash.
+        Value::List(_) => unreachable!(
+            "a context list reached key encoding — it is param-only (DESIGN-MULTIDB §2.6)"
+        ),
     }
 }
 

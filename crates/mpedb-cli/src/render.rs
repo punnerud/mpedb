@@ -22,6 +22,12 @@ pub fn value_str(v: &Value) -> String {
             out
         }
         Value::Timestamp(t) => t.to_string(),
+        // Param-only (§2.6), so no result cell holds one — but render it rather
+        // than panicking if one ever surfaces (e.g. an EXPLAIN of a bound param).
+        Value::List(items) => {
+            let inner: Vec<String> = items.iter().map(value_str).collect();
+            format!("({})", inner.join(", "))
+        }
     }
 }
 
