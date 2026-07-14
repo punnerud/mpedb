@@ -125,7 +125,8 @@ pub fn import_sqlite(
         .map_err(|e| Error::Config(format!("sqlite snapshot release: {e}")))?;
 
     // 4. publish mirror config + epoch, and enable CDC capture (final commit)
-    publish_mirror_state(&db, &schema, state::SourceKind::Sqlite)?;
+    let maps = sqlite_table_maps(&src_tables, &schema);
+    publish_mirror_state(&db, &schema, state::SourceKind::Sqlite, &maps)?;
 
     Ok((db, report))
 }
@@ -294,10 +295,23 @@ pub(crate) fn convert_value(vr: ValueRef, ct: ColumnType, table: &str, col: &str
 /// Publish `mir\0cfg`, `mir\0epoch`, and enable capture on the mirrored tables
 /// (`cdc\0tabs`) in one final commit — the S1 → SRC_AUTH handoff. Shared by the
 /// sqlite and PostgreSQL import paths.
+/// Publish the mirror's file-resident state: config, epoch, capture flags, and
+/// the per-table **type provenance** (§2 `map/`).
+///
+/// `maps` is `(table_id, TableMap)` built by each importer from its own
+/// introspection — the sqlite and PG source types have nothing in common, so the
+/// mapping happens there and only the persisted form is shared.
+///
+/// The provenance is what lets an `.mpedb` outlive its source: without it the
+/// file knows only `Text`/`Blob`, the adapters re-introspect the LIVE source on
+/// every attach (fine for mirroring, useless once the source is gone), and an
+/// export could only guess a canonical type instead of recreating
+/// `numeric(10,2)`.
 pub(crate) fn publish_mirror_state(
     db: &Database,
     schema: &mpedb_types::Schema,
     source_kind: state::SourceKind,
+    maps: &[(u32, state::TableMap)],
 ) -> Result<()> {
     let scope: Vec<u32> = (0..schema.tables.len() as u32).collect();
     let cfg = state::MirrorConfig {
@@ -325,9 +339,52 @@ pub(crate) fn publish_mirror_state(
     s.set_capture(false);
     s.sys_record_put(state::MIR_NS, state::KEY_CFG, &cfg.encode())?;
     s.sys_record_put(state::MIR_NS, state::KEY_EPOCH, &epoch.encode())?;
+    for (table_id, m) in maps {
+        s.sys_record_put(state::MIR_NS, &state::map_key(*table_id), &m.encode())?;
+    }
     // cdc\0tabs: ns="cdc", key="tabs" → the exact key the engine reads.
     s.sys_record_put("cdc", b"tabs", &capture.encode())?;
     s.commit()
+}
+
+/// Record what sqlite declared for every mirrored column, and how faithfully we
+/// carried it (§2 `map/`). The table_id is the column's position in the built
+/// schema, which is what every other `mir/` family keys on.
+fn sqlite_table_maps(
+    src_tables: &[crate::sqlite::SourceTable],
+    schema: &mpedb_types::Schema,
+) -> Vec<(u32, state::TableMap)> {
+    let mut out = Vec::with_capacity(src_tables.len());
+    for src in src_tables {
+        let Some(table_id) = schema.tables.iter().position(|t| t.name == src.name) else {
+            continue; // not mirrored (scope), nothing to record
+        };
+        let columns = src
+            .columns
+            .iter()
+            .map(|c| state::ColumnMap {
+                source_name: c.name.clone(),
+                // sqlite's declared type IS the typmod-bearing string
+                // ("VARCHAR(64)", "NUMERIC(10,2)") — it is stored verbatim, so
+                // an export recreates exactly what was declared.
+                source_type: c.declared_type.clone(),
+                not_null: c.not_null,
+                generated: c.generated,
+                identity: false, // sqlite has no IDENTITY
+                unique: c.unique,
+                mapped: c.mapped,
+                policy: crate::sqlite::sqlite_map_policy(&c.declared_type),
+            })
+            .collect();
+        out.push((
+            table_id as u32,
+            state::TableMap {
+                source_name: src.name.clone(),
+                columns,
+            },
+        ));
+    }
+    out
 }
 
 /// A stable 128-bit mirror id from the destination path (placeholder for the

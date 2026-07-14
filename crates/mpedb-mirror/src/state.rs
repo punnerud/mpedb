@@ -337,6 +337,186 @@ impl MirrorConfig {
     }
 }
 
+// ---- type provenance: what the SOURCE said, and what we did to it (§2 `map/`)
+
+/// **How a source column was mapped into mpedb** — the field that separates
+/// "this can go home again" from "the information is already gone".
+///
+/// Recording the source *type* alone is a trap: it produces a correct-looking
+/// schema over silently wrong data. If PostgreSQL had `numeric(30,10)` and the
+/// import chose `Float64`, the digits were discarded at import; remembering the
+/// column was numeric does not bring them back. Export would faithfully recreate
+/// `numeric(30,10)` and fill it with rounded values, which is worse than an
+/// error because it looks right.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum MapPolicy {
+    /// Byte-exact in both directions (`int8`→Int64, `text`→Text, `bytea`→Blob,
+    /// `timestamptz`→Timestamp µs). Round-trips unconditionally.
+    Exact = 1,
+    /// Preserved through a canonical text form (`numeric`→Text, `jsonb`→Text,
+    /// `uuid`→Text). Lossless, but the target column must be the same type for
+    /// the text to mean the same thing.
+    ViaText = 2,
+    /// mpedb's type is WIDER than the source's (`int2`/`int4`→Int64,
+    /// `varchar(n)`→Text). Import was lossless; a LOCAL WRITE can now hold a
+    /// value the source column cannot take — which is exactly the case that
+    /// fails at the target's INSERT, and exactly what a pre-flight must catch.
+    Widened = 3,
+    /// **Information was discarded at import** (`numeric`→Float64 by policy).
+    /// The type is recoverable; the values are not.
+    LossyAtImport = 4,
+}
+
+impl MapPolicy {
+    fn from_tag(t: u8) -> Result<MapPolicy> {
+        Ok(match t {
+            1 => MapPolicy::Exact,
+            2 => MapPolicy::ViaText,
+            3 => MapPolicy::Widened,
+            4 => MapPolicy::LossyAtImport,
+            other => return Err(Error::Corrupt(format!("bad map policy {other}"))),
+        })
+    }
+
+    /// Whether a value in this column can be handed back to a column of the
+    /// recorded source type unchanged.
+    pub fn round_trips(self) -> bool {
+        !matches!(self, MapPolicy::LossyAtImport)
+    }
+}
+
+/// One column's provenance.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnMap {
+    /// The column's name AT THE SOURCE (mpedb may have mangled it — identifiers
+    /// are ASCII-restricted, so a quoted/unicode PG name does not survive).
+    pub source_name: String,
+    /// The source's declared type **including typmod** — `numeric(10,2)`,
+    /// `varchar(64)`, `jsonb`, `INTEGER`. This is the string export recreates;
+    /// dropping the typmod would silently widen every constrained column.
+    pub source_type: String,
+    pub not_null: bool,
+    /// Mirror the value, never write it back (PG `GENERATED … STORED`, sqlite
+    /// STORED/VIRTUAL).
+    pub generated: bool,
+    /// PG `GENERATED … AS IDENTITY` — needs `OVERRIDING SYSTEM VALUE` on write.
+    pub identity: bool,
+    pub unique: bool,
+    /// The mpedb column type it became.
+    pub mapped: mpedb_types::ColumnType,
+    pub policy: MapPolicy,
+}
+
+/// One mirrored table's provenance: enough to recreate the source's schema and
+/// to validate mpedb's data against it BEFORE writing (DESIGN-MIRROR §2 `map/`).
+///
+/// Without this the `.mpedb` file has no memory of where its data came from: the
+/// adapters re-introspect the LIVE source on every attach, which is fine while
+/// the source is there (mirroring) and useless once it is not (migration) — the
+/// file would only know `Text` and `Blob`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableMap {
+    pub source_name: String,
+    pub columns: Vec<ColumnMap>,
+}
+
+fn put_str(v: &mut Vec<u8>, s: &str) {
+    v.extend_from_slice(&(s.len() as u16).to_be_bytes());
+    v.extend_from_slice(s.as_bytes());
+}
+
+fn take_str(b: &[u8], pos: &mut usize) -> Result<String> {
+    let n = take_u16(b, pos)? as usize;
+    let end = pos
+        .checked_add(n)
+        .filter(|&e| e <= b.len())
+        .ok_or_else(|| Error::Corrupt("truncated map string".into()))?;
+    let s = std::str::from_utf8(&b[*pos..end])
+        .map_err(|_| Error::Corrupt("map string is not utf-8".into()))?
+        .to_string();
+    *pos = end;
+    Ok(s)
+}
+
+fn take_u16(b: &[u8], pos: &mut usize) -> Result<u16> {
+    let end = pos
+        .checked_add(2)
+        .filter(|&e| e <= b.len())
+        .ok_or_else(|| Error::Corrupt("truncated map u16".into()))?;
+    let v = u16::from_be_bytes(b[*pos..end].try_into().unwrap());
+    *pos = end;
+    Ok(v)
+}
+
+fn take_u8(b: &[u8], pos: &mut usize) -> Result<u8> {
+    let v = *b
+        .get(*pos)
+        .ok_or_else(|| Error::Corrupt("truncated map byte".into()))?;
+    *pos += 1;
+    Ok(v)
+}
+
+impl TableMap {
+    /// Layout: source_name ‖ ncols u16 BE ‖ per column {source_name,
+    /// source_type, flags u8, mapped u8, policy u8}. Strings are u16-len
+    /// prefixed. Every read is bounds-checked (repo invariant).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(64 + self.columns.len() * 32);
+        put_str(&mut v, &self.source_name);
+        v.extend_from_slice(&(self.columns.len() as u16).to_be_bytes());
+        for c in &self.columns {
+            put_str(&mut v, &c.source_name);
+            put_str(&mut v, &c.source_type);
+            let flags = u8::from(c.not_null)
+                | (u8::from(c.generated) << 1)
+                | (u8::from(c.identity) << 2)
+                | (u8::from(c.unique) << 3);
+            v.push(flags);
+            v.push(c.mapped as u8);
+            v.push(c.policy as u8);
+        }
+        v
+    }
+
+    pub fn decode(b: &[u8]) -> Result<TableMap> {
+        let mut pos = 0usize;
+        let source_name = take_str(b, &mut pos)?;
+        let ncols = take_u16(b, &mut pos)? as usize;
+        // Do NOT pre-allocate on a claimed length: a corrupt ncols must run out
+        // of buffer, not out of memory.
+        let mut columns = Vec::new();
+        for _ in 0..ncols {
+            let source_name = take_str(b, &mut pos)?;
+            let source_type = take_str(b, &mut pos)?;
+            let flags = take_u8(b, &mut pos)?;
+            let mapped = mpedb_types::ColumnType::from_tag(take_u8(b, &mut pos)?)
+                .ok_or_else(|| Error::Corrupt("bad mapped column type in map record".into()))?;
+            let policy = MapPolicy::from_tag(take_u8(b, &mut pos)?)?;
+            columns.push(ColumnMap {
+                source_name,
+                source_type,
+                not_null: flags & 1 != 0,
+                generated: flags & 2 != 0,
+                identity: flags & 4 != 0,
+                unique: flags & 8 != 0,
+                mapped,
+                policy,
+            });
+        }
+        if pos != b.len() {
+            return Err(Error::Corrupt(format!(
+                "map record has {} trailing bytes",
+                b.len() - pos
+            )));
+        }
+        Ok(TableMap {
+            source_name,
+            columns,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -427,5 +607,97 @@ mod tests {
         let mut bad = c.encode();
         bad[16] = 9;
         assert!(MirrorConfig::decode(&bad).is_err());
+    }
+
+    // ---- type provenance (§2 `map/`) ----
+
+    fn sample_map() -> TableMap {
+        TableMap {
+            source_name: "orders".into(),
+            columns: vec![
+                ColumnMap {
+                    source_name: "id".into(),
+                    source_type: "int8".into(),
+                    not_null: true,
+                    generated: false,
+                    identity: true,
+                    unique: false,
+                    mapped: mpedb_types::ColumnType::Int64,
+                    policy: MapPolicy::Exact,
+                },
+                ColumnMap {
+                    source_name: "amount".into(),
+                    // the typmod is the whole point: without it export would
+                    // recreate a bare `numeric` and silently widen the column
+                    source_type: "numeric(10,2)".into(),
+                    not_null: false,
+                    generated: false,
+                    identity: false,
+                    unique: false,
+                    mapped: mpedb_types::ColumnType::Text,
+                    policy: MapPolicy::ViaText,
+                },
+                ColumnMap {
+                    source_name: "qty".into(),
+                    source_type: "int4".into(),
+                    not_null: false,
+                    generated: false,
+                    identity: false,
+                    unique: false,
+                    mapped: mpedb_types::ColumnType::Int64,
+                    policy: MapPolicy::Widened,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn table_map_roundtrips() {
+        let m = sample_map();
+        assert_eq!(TableMap::decode(&m.encode()).unwrap(), m);
+    }
+
+    /// Repo invariant: a decoder must yield Corrupt, never panic — at ANY cut.
+    #[test]
+    fn table_map_truncation_at_every_offset_is_corrupt_not_panic() {
+        let buf = sample_map().encode();
+        for cut in 0..buf.len() {
+            match TableMap::decode(&buf[..cut]) {
+                Err(Error::Corrupt(_)) => {}
+                other => panic!("cut {cut}: expected Corrupt, got {other:?}"),
+            }
+        }
+        // trailing garbage is rejected too (a short ncols must not leave slack)
+        let mut extra = buf.clone();
+        extra.push(0);
+        assert!(matches!(TableMap::decode(&extra), Err(Error::Corrupt(_))));
+    }
+
+    /// A lying length must run out of buffer, not out of memory.
+    #[test]
+    fn table_map_absurd_column_count_does_not_allocate() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&2u16.to_be_bytes());
+        b.extend_from_slice(b"t1");
+        b.extend_from_slice(&u16::MAX.to_be_bytes()); // 65535 columns, no data
+        assert!(matches!(TableMap::decode(&b), Err(Error::Corrupt(_))));
+    }
+
+    #[test]
+    fn map_policy_tags_roundtrip_and_reject_garbage() {
+        for p in [MapPolicy::Exact, MapPolicy::ViaText, MapPolicy::Widened, MapPolicy::LossyAtImport] {
+            assert_eq!(MapPolicy::from_tag(p as u8).unwrap(), p);
+        }
+        assert!(MapPolicy::from_tag(0).is_err());
+        assert!(MapPolicy::from_tag(99).is_err());
+    }
+
+    /// The distinction the record exists for: only LossyAtImport cannot go home.
+    #[test]
+    fn only_lossy_at_import_fails_to_round_trip() {
+        assert!(MapPolicy::Exact.round_trips());
+        assert!(MapPolicy::ViaText.round_trips());
+        assert!(MapPolicy::Widened.round_trips());
+        assert!(!MapPolicy::LossyAtImport.round_trips());
     }
 }

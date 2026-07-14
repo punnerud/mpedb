@@ -121,8 +121,53 @@ pub fn import_pg(
     tx.rollback()
         .map_err(|e| Error::Config(format!("pg snapshot release: {e}")))?;
 
-    publish_mirror_state(&db, &schema, state::SourceKind::Postgres)?;
+    let maps = pg_table_maps(&src_tables, &schema);
+    publish_mirror_state(&db, &schema, state::SourceKind::Postgres, &maps)?;
     Ok((db, report))
+}
+
+/// Record what PostgreSQL declared for every mirrored column, and how faithfully
+/// we carried it (§2 `map/`) — the record an export reads to recreate
+/// `numeric(10,2)` instead of guessing a canonical type, and a pre-flight reads
+/// to know what each value must still fit.
+fn pg_table_maps(
+    src_tables: &[PgTable],
+    schema: &mpedb_types::Schema,
+) -> Vec<(u32, state::TableMap)> {
+    let mut out = Vec::with_capacity(src_tables.len());
+    for src in src_tables {
+        let Some(table_id) = schema.tables.iter().position(|t| t.name == src.name) else {
+            continue; // outside the mirrored scope
+        };
+        let columns = src
+            .columns
+            .iter()
+            .filter_map(|c| {
+                // build_schema rejected unmappable columns before we got here;
+                // skip rather than assert, so a future partial-scope import
+                // cannot panic on one.
+                let mapped = c.mapped?;
+                Some(state::ColumnMap {
+                    source_name: c.name.clone(),
+                    source_type: c.declared_type.clone(),
+                    not_null: c.not_null,
+                    generated: c.generated,
+                    identity: c.identity,
+                    unique: c.unique,
+                    mapped,
+                    policy: crate::pg::pg_map_policy(&c.pg_type, mapped),
+                })
+            })
+            .collect();
+        out.push((
+            table_id as u32,
+            state::TableMap {
+                source_name: src.name.clone(),
+                columns,
+            },
+        ));
+    }
+    out
 }
 
 fn import_table(
@@ -433,6 +478,65 @@ mod tests {
         let s2 = drain_push(&db, &mut a).unwrap();
         assert_eq!(s2.upserts, 0);
         assert_eq!(s2.conflicts, 1, "the offender stays parked, write-back keeps working");
+
+        let _ = std::fs::remove_file(&dest);
+    }
+
+    /// The point of the provenance record: the `.mpedb` file must remember what
+    /// PostgreSQL actually had, **with typmod**, and how faithfully we carried
+    /// it — read back from the FILE, with no live source in sight. Without this
+    /// the file knows only Text/Blob and an export can do nothing but guess.
+    #[test]
+    #[ignore = "needs PostgreSQL (run with --ignored)"]
+    fn import_persists_pg_type_provenance_readable_without_the_source() {
+        use crate::state::{MapPolicy, TableMap};
+
+        let pg = crate::pg_harness::ThrowawayPg::start();
+        let mut c = pg.client();
+        c.batch_execute(
+            "CREATE TABLE goods(
+                 id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+                 sku varchar(64) NOT NULL UNIQUE,
+                 price numeric(10,2),
+                 qty int4,
+                 tags jsonb,
+                 uid uuid,
+                 made timestamptz);
+             INSERT INTO goods(sku, price, qty, tags, uid, made) VALUES
+                 ('a', '1.50', 3, '{}', gen_random_uuid(), now());",
+        )
+        .unwrap();
+
+        let dest = tmp("pg-provenance");
+        let (db, _) = import_pg(&mut c, &dest, &ImportOptions::default()).unwrap();
+        drop(db);
+        drop(c);
+        drop(pg); // the source is GONE — everything below reads the file only
+
+        let db = Database::open_from_file(&dest).unwrap();
+        let raw = db
+            .sys_record_get(state::MIR_NS, &state::map_key(0))
+            .unwrap()
+            .expect("import must persist a map/ record");
+        let m = TableMap::decode(&raw).unwrap();
+        assert_eq!(m.source_name, "goods");
+
+        let col = |n: &str| m.columns.iter().find(|c| c.source_name == n).unwrap().clone();
+
+        // typmod survived — THIS is what an export needs; "numeric" alone would
+        // silently widen the column on the way home.
+        assert_eq!(col("price").source_type, "numeric(10,2)");
+        assert_eq!(col("sku").source_type, "character varying(64)");
+
+        // and the honest verdicts
+        assert_eq!(col("price").policy, MapPolicy::ViaText, "numeric->Text keeps the digits");
+        assert_eq!(col("qty").policy, MapPolicy::Widened, "int4->Int64: a local write can overflow it");
+        assert_eq!(col("made").policy, MapPolicy::Exact);
+        assert_eq!(col("tags").policy, MapPolicy::ViaText);
+
+        // structural facts an export must not lose
+        assert!(col("id").identity, "IDENTITY needs OVERRIDING SYSTEM VALUE on write");
+        assert!(col("sku").not_null && col("sku").unique);
 
         let _ = std::fs::remove_file(&dest);
     }
