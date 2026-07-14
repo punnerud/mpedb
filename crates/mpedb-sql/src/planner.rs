@@ -506,8 +506,8 @@ fn distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<Vec<(u16, 
             .position(|it| strip(it) == stripped)
             .ok_or_else(|| {
                 bind_err(format!(
-                    "ORDER BY {} must be in the SELECT list. Sorting by something outside \
-                     the output is not supported here (sqlite and PostgreSQL do allow it) — \
+                    "{} must be in the SELECT list. Sorting by something outside the \
+                     output is not supported here (sqlite and PostgreSQL do allow it) — \
                      select it, or order by a plain column of the table.",
                     describe_key(key, i)
                 ))
@@ -523,8 +523,8 @@ fn distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<Vec<(u16, 
 /// 1-based position, the way sqlite says "1st ORDER BY term".
 fn describe_key(e: &ast::Expr, pos: usize) -> String {
     match e {
-        ast::Expr::Col(n) => format!("`{n}`"),
-        ast::Expr::Qualified(q, n) => format!("`{q}.{n}`"),
+        ast::Expr::Col(n) => format!("ORDER BY `{n}`"),
+        ast::Expr::Qualified(q, n) => format!("ORDER BY `{q}.{n}`"),
         _ => format!(
             "the {}{} ORDER BY key",
             pos + 1,
@@ -591,9 +591,9 @@ fn check_distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<()> 
         let stripped = strip(key);
         if !items.iter().any(|it| strip(it) == stripped) {
             return Err(bind_err(format!(
-                "ORDER BY {} must be in the SELECT list when SELECT DISTINCT is used — \
-                 otherwise which duplicate row survives is what decides the order, and the \
-                 query does not say",
+                "{} must be in the SELECT list when SELECT DISTINCT is used — otherwise \
+                 which duplicate row survives is what decides the order, and the query \
+                 does not say",
                 describe_key(key, i)
             )));
         }
