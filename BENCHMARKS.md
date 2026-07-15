@@ -596,7 +596,7 @@ merely noisy.
    is never gated (`refill_not_yet` fires twice in 199k commits). Nothing is lost
    and nothing is stuck — the pool just grows, and 75% of the high-water bumps
    happen inside the commit fixpoint, where `in_freelist_op` disables refill by
-   design. **Five hypotheses are dead**, including the two most obvious ones: the
+   design. **Six hypotheses are dead**, including the two most obvious ones: the
    oldest-pinned bound is innocent (recomputing it eagerly fixes a real staleness
    defect, lag 933→0, and does not touch the leak), and *reserving* pages ahead of
    the fixpoint makes the leak 2.4× worse by starving the shared freelist. All
