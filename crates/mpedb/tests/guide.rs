@@ -1,0 +1,393 @@
+//! The code from `GUIDE.md`, compiled and run.
+//!
+//! Every Rust snippet in the guide exists here first. Documentation that is
+//! not executed rots quietly — it keeps compiling in a reader's head and
+//! nowhere else — and this project has already shipped a README claiming a
+//! surface the binary did not have.
+//!
+//! When the guide changes, change this; when this fails, the guide is wrong.
+
+use mpedb::{params, Config, Database, ExecResult};
+use mpedb_types::Value;
+
+/// One throwaway database per test, removed on drop.
+struct Tmp {
+    db: Database,
+    path: String,
+}
+
+impl Drop for Tmp {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+        let _ = std::fs::remove_file(format!("{}-wal", self.path));
+    }
+}
+
+impl std::ops::Deref for Tmp {
+    type Target = Database;
+    fn deref(&self) -> &Database {
+        &self.db
+    }
+}
+
+/// The schema from the guide's Quickstart, verbatim.
+const GUIDE_CONFIG: &str = r#"
+[database]
+size_mb = 64
+max_readers = 128
+durability = "wal"
+
+[[table]]
+name = "users"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+
+  [[table.column]]
+  name = "email"
+  type = "text"
+  nullable = false
+  unique = true
+
+  [[table.column]]
+  name = "age"
+  type = "int64"
+  nullable = true
+  check = "age >= 0 AND age < 150"
+"#;
+
+fn open(tag: &str) -> Tmp {
+    let path = format!("/dev/shm/mpedb-guide-{tag}-{}.mpedb", std::process::id());
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(format!("{path}-wal"));
+    let toml = format!("[database]\npath = \"{path}\"\n{}", GUIDE_CONFIG.replacen("\n[database]\n", "\n", 1));
+    let cfg = Config::from_toml_str(&toml).unwrap_or_else(|e| panic!("guide config rejected: {e}"));
+    let db = Database::open_with_config(cfg).unwrap();
+    Tmp { db, path }
+}
+
+fn rows(r: ExecResult) -> Vec<Vec<Value>> {
+    match r {
+        ExecResult::Rows { rows, .. } => rows,
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// GUIDE.md § Quickstart.
+#[test]
+fn quickstart() {
+    let db = open("quickstart");
+
+    // Write.
+    let n = db.query(
+        "INSERT INTO users (id, email, age) VALUES ($1, $2, $3)",
+        &params![1, "ada@example.com", 36],
+    );
+    assert!(matches!(n, Ok(ExecResult::Affected(1))));
+
+    // Read.
+    let r = db
+        .query("SELECT email, age FROM users WHERE id = $1", &params![1])
+        .unwrap();
+    assert_eq!(
+        rows(r),
+        vec![vec![Value::Text("ada@example.com".into()), Value::Int(36)]]
+    );
+
+    // The hot path: compile once, execute by hash forever.
+    let h = db.prepare("SELECT email FROM users WHERE id = $1").unwrap();
+    let r = db.execute(&h, &params![1]).unwrap();
+    assert_eq!(rows(r), vec![vec![Value::Text("ada@example.com".into())]]);
+}
+
+/// GUIDE.md § What the schema buys you — each of these is an ERROR here and
+/// silently accepted (or coerced) by sqlite3 without STRICT.
+#[test]
+fn the_schema_refuses_what_sqlite_would_take() {
+    let db = open("rigid");
+    db.query(
+        "INSERT INTO users (id, email, age) VALUES ($1, $2, $3)",
+        &params![1, "ada@example.com", 36],
+    )
+    .unwrap();
+
+    // A string in an integer column.
+    assert!(db
+        .query(
+            "INSERT INTO users (id, email, age) VALUES ($1, $2, $3)",
+            &params![2, "b@example.com", "not a number"],
+        )
+        .is_err());
+
+    // NOT NULL.
+    assert!(db
+        .query("INSERT INTO users (id, age) VALUES ($1, $2)", &params![3, 20])
+        .is_err());
+
+    // UNIQUE.
+    assert!(db
+        .query(
+            "INSERT INTO users (id, email, age) VALUES ($1, $2, $3)",
+            &params![4, "ada@example.com", 20],
+        )
+        .is_err());
+
+    // CHECK.
+    assert!(db
+        .query(
+            "INSERT INTO users (id, email, age) VALUES ($1, $2, $3)",
+            &params![5, "c@example.com", 200],
+        )
+        .is_err());
+
+    // Every one of those left the table alone.
+    assert_eq!(rows(db.query("SELECT id FROM users", &[]).unwrap()).len(), 1);
+}
+
+/// GUIDE.md § Transactions.
+#[test]
+fn transactions_are_all_or_nothing() {
+    let db = open("txn");
+
+    let mut tx = db.begin().unwrap();
+    tx.query(
+        "INSERT INTO users (id, email) VALUES ($1, $2)",
+        &params![1, "a@example.com"],
+    )
+    .unwrap();
+    tx.query(
+        "INSERT INTO users (id, email) VALUES ($1, $2)",
+        &params![2, "b@example.com"],
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(rows(db.query("SELECT id FROM users", &[]).unwrap()).len(), 2);
+
+    // Rollback: dropping without commit throws the work away.
+    let mut tx = db.begin().unwrap();
+    tx.query(
+        "INSERT INTO users (id, email) VALUES ($1, $2)",
+        &params![3, "c@example.com"],
+    )
+    .unwrap();
+    tx.rollback();
+    assert_eq!(
+        rows(db.query("SELECT id FROM users", &[]).unwrap()).len(),
+        2,
+        "the rolled-back row must be gone"
+    );
+}
+
+/// GUIDE.md § Upsert — the ON CONFLICT forms, including on a UNIQUE column
+/// that is not the primary key.
+#[test]
+fn upsert() {
+    let db = open("upsert");
+    db.query(
+        "INSERT INTO users (id, email, age) VALUES ($1, $2, $3)",
+        &params![1, "ada@example.com", 36],
+    )
+    .unwrap();
+
+    // On the primary key.
+    db.query(
+        "INSERT INTO users (id, email, age) VALUES ($1, $2, $3) \
+         ON CONFLICT (id) DO UPDATE SET age = excluded.age",
+        &params![1, "ada@example.com", 37],
+    )
+    .unwrap();
+    assert_eq!(
+        rows(db.query("SELECT age FROM users WHERE id = 1", &[]).unwrap()),
+        vec![vec![Value::Int(37)]]
+    );
+
+    // On a UNIQUE column. The proposed id 99 never enters — the row that owns
+    // the email is the one updated.
+    let r = db
+        .query(
+            "INSERT INTO users (id, email, age) VALUES ($1, $2, $3) \
+             ON CONFLICT (email) DO UPDATE SET age = users.age + 1 RETURNING id, age",
+            &params![99, "ada@example.com", 0],
+        )
+        .unwrap();
+    assert_eq!(rows(r), vec![vec![Value::Int(1), Value::Int(38)]]);
+
+    // DO NOTHING.
+    db.query(
+        "INSERT INTO users (id, email, age) VALUES ($1, $2, $3) ON CONFLICT DO NOTHING",
+        &params![1, "z@example.com", 1],
+    )
+    .unwrap();
+    assert_eq!(rows(db.query("SELECT id FROM users", &[]).unwrap()).len(), 1);
+}
+
+/// GUIDE.md § Reading the plan.
+#[test]
+fn explain_says_what_it_will_do() {
+    let db = open("explain");
+    match db
+        .query("EXPLAIN SELECT email FROM users WHERE id = $1", &[])
+        .unwrap()
+    {
+        ExecResult::Explain(text) => {
+            // The guide prints this transcript, so compare it EXACTLY. A test
+            // that only checks `contains("PkPoint")` would let the guide show
+            // a rendering the binary never produced — which is what happened:
+            // the first draft printed the Debug form, `PkPoint([Param(0)])`,
+            // in the document whose premise is that it is executed.
+            assert_eq!(
+                text.trim_end(),
+                "Select users\n  \
+                 access: PkPoint(id = $1)\n  \
+                 project: email\n  \
+                 footprint: read_only=true tables_read=0x1 tables_written=0x0 \
+                 indexes_used=0x1 key=Point",
+                "GUIDE.md's EXPLAIN transcript is stale"
+            );
+        }
+        other => panic!("expected an explain, got {other:?}"),
+    }
+    match db.query("EXPLAIN SELECT email FROM users", &[]).unwrap() {
+        ExecResult::Explain(text) => assert!(text.contains("FullScan"), "{text}"),
+        other => panic!("expected an explain, got {other:?}"),
+    }
+}
+
+const SHOP_CONFIG: &str = r#"
+[[table]]
+name = "items"
+primary_key = ["iid"]
+
+  [[table.column]]
+  name = "iid"
+  type = "int64"
+
+  [[table.column]]
+  name = "oid"
+  type = "int64"
+
+  [[table.column]]
+  name = "qty"
+  type = "int64"
+
+[[table]]
+name = "orders"
+primary_key = ["oid"]
+
+  [[table.column]]
+  name = "oid"
+  type = "int64"
+
+  [[table.column]]
+  name = "customer"
+  type = "text"
+"#;
+
+fn open_shop(tag: &str) -> Tmp {
+    let path = format!("/dev/shm/mpedb-guide-{tag}-{}.mpedb", std::process::id());
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        "[database]\npath = \"{path}\"\nsize_mb = 16\nmax_readers = 8\n{SHOP_CONFIG}"
+    );
+    let cfg = Config::from_toml_str(&toml).unwrap();
+    let db = Database::open_with_config(cfg).unwrap();
+    Tmp { db, path }
+}
+
+/// GUIDE.md § Aggregates and joins.
+#[test]
+fn aggregates_and_joins() {
+    let db = open_shop("join");
+    for (oid, c) in [(1, "ada"), (2, "bob"), (3, "nobody")] {
+        db.query(
+            "INSERT INTO orders (oid, customer) VALUES ($1, $2)",
+            &params![oid, c],
+        )
+        .unwrap();
+    }
+    for (iid, oid, qty) in [(10, 1, 2), (11, 1, 3), (12, 2, 5)] {
+        db.query(
+            "INSERT INTO items (iid, oid, qty) VALUES ($1, $2, $3)",
+            &params![iid, oid, qty],
+        )
+        .unwrap();
+    }
+
+    // Aggregates.
+    let r = db
+        .query("SELECT count(*), sum(qty), avg(qty) FROM items", &[])
+        .unwrap();
+    assert_eq!(
+        rows(r),
+        vec![vec![Value::Int(3), Value::Int(10), Value::Float(10.0 / 3.0)]]
+    );
+
+    // GROUP BY / HAVING.
+    let r = db
+        .query(
+            "SELECT oid, count(*) FROM items GROUP BY oid HAVING count(*) > 1 ORDER BY oid",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows(r), vec![vec![Value::Int(1), Value::Int(2)]]);
+
+    // A join. Order 3 has no items, so it is not in the answer at all — an
+    // INNER JOIN emits a row only where both sides match.
+    let r = db
+        .query(
+            "SELECT orders.customer, sum(items.qty) FROM items \
+             JOIN orders ON items.oid = orders.oid \
+             GROUP BY orders.customer ORDER BY orders.customer",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(
+        rows(r),
+        vec![
+            vec![Value::Text("ada".into()), Value::Int(5)],
+            vec![Value::Text("bob".into()), Value::Int(5)],
+        ]
+    );
+
+    // DISTINCT.
+    let r = db
+        .query("SELECT DISTINCT oid FROM items ORDER BY oid", &[])
+        .unwrap();
+    assert_eq!(rows(r), vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+}
+
+/// GUIDE.md § Coming from sqlite3 — the differences that will bite, each one
+/// executed rather than asserted in prose.
+#[test]
+fn the_sqlite_differences_that_bite() {
+    let db = open_shop("diffs");
+    db.query(
+        "INSERT INTO orders (oid, customer) VALUES ($1, $2)",
+        &params![1, "ada"],
+    )
+    .unwrap();
+
+    // 1. No CREATE TABLE. The schema comes from the config or `mirror import`.
+    assert!(db.query("CREATE TABLE t (id INTEGER)", &[]).is_err());
+
+    // 2. Division by zero raises; sqlite yields NULL.
+    assert!(db.query("SELECT 1 / 0", &[]).is_err());
+
+    // 3. No 3+ table joins, no outer joins.
+    assert!(db
+        .query(
+            "SELECT oid FROM items LEFT JOIN orders ON items.oid = orders.oid",
+            &[]
+        )
+        .is_err());
+
+    // 4. ORDER BY must name something the query outputs.
+    assert!(db
+        .query("SELECT customer FROM orders ORDER BY oid + 1", &[])
+        .is_ok(), "a sort-only column is fine");
+    assert!(db
+        .query("SELECT DISTINCT customer FROM orders ORDER BY oid", &[])
+        .is_err(), "under DISTINCT it must be selected");
+}

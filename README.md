@@ -122,6 +122,14 @@ than either ancestor. It is not there yet; see Status.
 | `mpedb-testkit` | sqllogictest harness + 3-way differential testing vs sqlite3 and PostgreSQL. |
 | `mpedb-bench` | Cross-engine benchmarks. |
 
+## Using it
+
+**[GUIDE.md](GUIDE.md)** is the practical guide: quickstart, the schema config,
+queries, transactions, upsert, joins, durability, a side-by-side for people
+coming from sqlite3, and migrating a real sqlite3 database. Every Rust snippet
+in it is compiled and run by `crates/mpedb/tests/guide.rs`, and every shell
+transcript is pasted from a real run.
+
 ## Build & test
 
 ```sh
