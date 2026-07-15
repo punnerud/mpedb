@@ -144,6 +144,37 @@ fn main() {
         report("memcpy", d, "contiguous extent, no syscall trick, ANY fs");
     }
 
+    // ---- 2b. memcpy into a mapping whose pages are ALREADY faulted in.
+    //
+    // This is the one that decides whether the gap mpedb shows on large blobs is
+    // real or a harness artefact. A MAP_SHARED page must be faulted in before it
+    // can be written, even when the write overwrites every byte of it; `write(2)`
+    // owes no such fault. If the cold and warm numbers differ, the cold cost is
+    // one-time-per-page — and a long-lived process that recycles pages through
+    // the freelist pays it once, not per blob. If they match, the fault theory is
+    // dead and the cost is somewhere else.
+    {
+        let f = fresh_dst();
+        let map = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                n,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                f.as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(map, libc::MAP_FAILED, "mmap");
+        // touch every page first — the faults happen HERE, not in the timed part
+        unsafe { std::ptr::write_bytes(map as *mut u8, 1u8, n) };
+        let t0 = std::time::Instant::now();
+        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), map as *mut u8, n) };
+        let d = t0.elapsed();
+        unsafe { libc::munmap(map, n) };
+        report("memcpy2", d, "same, but pages already faulted (2nd write)");
+    }
+
     // ---- 3. copy_file_range: in-kernel, source is an fd
     {
         let src = std::fs::File::open(&src_path).unwrap();
