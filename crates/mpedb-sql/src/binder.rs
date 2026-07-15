@@ -81,6 +81,28 @@ impl<'a> Scope<'a> {
         Scope { tables: vec![t] }
     }
 
+    /// A join's scope. Tuple order IS the order given: the outer table's
+    /// columns come first, so its slots are its own column indices — which is
+    /// what lets an outer-only predicate be handed to the single-table access
+    /// extractor unchanged.
+    pub fn joined(tables: Vec<&'a TableDef>) -> Result<Scope<'a>> {
+        // Self-joins would make `t.c` ambiguous with no way to say which side,
+        // since there are no aliases. Refuse rather than resolve to whichever
+        // came first.
+        for (i, a) in tables.iter().enumerate() {
+            for b in &tables[i + 1..] {
+                if a.name.eq_ignore_ascii_case(&b.name) {
+                    return Err(bind_err(format!(
+                        "table `{}` joined to itself: there is no alias syntax to tell the                          two sides apart",
+                        a.name
+                    )));
+                }
+            }
+        }
+        Ok(Scope { tables })
+    }
+
+
     /// The only table, for the paths that are still single-table by
     /// construction (INSERT's target, RLS policy binding, `excluded.`).
     /// Panics if the scope is wider — a caller that reaches for "the" table of a
@@ -245,6 +267,11 @@ impl<'a> Binder<'a> {
     /// pinned by `sum(qty * $1)` has to be visible to the projection. Starting a
     /// second binder from scratch would give the two passes separate parameter
     /// universes and silently accept `$1` meaning two things.
+    /// Width of the tuple this binder's expressions evaluate over.
+    pub fn scope_width(&self) -> usize {
+        self.scope.width()
+    }
+
     pub fn rescope<'b>(self, scope: Scope<'b>) -> Binder<'b> {
         Binder {
             scope,

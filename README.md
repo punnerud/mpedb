@@ -43,8 +43,9 @@ validate rather than hope about.
 
 **What it is not: a drop-in sqlite3.** Be clear-eyed about this before you plan
 around it. mpedb's SQL is a narrow subset: aggregates, `GROUP BY`/`HAVING` and
-`DISTINCT` are in, but **each statement reads one table** — no joins, no
-subqueries — so a Django test suite will not run against it. Today mpedb is a
+`DISTINCT` and two-table `INNER JOIN` are in, but there are no subqueries, no
+aggregates over a join, and no outer joins — so a Django test suite will not run
+against it. Today mpedb is a
 validation and staging tool in that workflow, not the thing your ORM talks to.
 See [SQL support](#sql-support) for the exact surface, measured against the
 binary.
@@ -193,17 +194,30 @@ the design rather than a todo list.
 | `COUNT` / `SUM` / `AVG` / `MIN` / `MAX`, `GROUP BY` / `HAVING` | ✅ | NULL rules verified against sqlite 3.45 |
 | `SELECT DISTINCT`, `COUNT(DISTINCT x)` | ✅ | |
 | `ORDER BY` by name, by ordinal (`ORDER BY 1`), or by a selected expression | ✅ | the key must be in the output; see below |
-| **`JOIN`, subqueries, `EXISTS`, cross-table refs** | ❌ | not yet — see below |
+| `INNER JOIN` of two tables (`FROM a JOIN b ON …`) | ✅ | nested loop, no pushdown; RLS applies to both sides |
+| **Aggregates over a `JOIN`, 3+ table joins, `LEFT`/`RIGHT`/`FULL`, self-joins** | ❌ | refused with a message, not half-done |
+| **Subqueries, `EXISTS`, cross-FILE refs** | ❌ | not yet |
 | **`CREATE TABLE` / `ALTER`** | ❌ | **by design** — schema comes from the config or `mirror import`; see [DESIGN-MIRROR §7](DESIGN-MIRROR.md) |
 
-**Why no joins (yet).** Nothing in the storage or commit design forbids them:
-a plan's *footprint* is a **bitmap** (`tables_read: u64`, `tables_written: u64`)
-and `conflicts_with` is a bitmap AND, so a statement touching several tables is
-representable and groups correctly, and one writer lock plus one meta flip already
-make a cross-table transaction atomic (there is a test). What is single-table is
-the **binder**, which resolves names against one table. So this is a real gap, not
-a design boundary — an earlier version of this README claimed the opposite, and it
-was wrong.
+**Joins, and what they cost.** A two-table `INNER JOIN` works. The footprint was
+always able to describe it — `tables_read` is a `u64` **bitmap** and
+`conflicts_with` is a bitmap AND — so a joined read claims one bit per table and
+groups correctly; what was single-table was the *binder*. (An earlier version of
+this README called joins a permanent design boundary. That was wrong.)
+
+Two honest caveats. It is a **nested loop with no predicate pushdown**: the inner
+side is read once and held, and every conjunct of your `WHERE` waits for the
+joined row, so both sides are full scans unless an RLS policy pins a key.
+`EXPLAIN` says so. And the statement's `key_access` widens to `Full`, because that
+field names one key space and a Point on the outer stops describing what the
+statement reads once a second table joins in — that costs conflict precision for
+concurrent writers, never correctness.
+
+RLS applies to **both** sides, each policy over its own row and before the `ON`
+condition — mpedb's expressions can raise, and a raise is observable, so an `ON`
+that divides by a hidden row's column would report that row's existence without
+returning it. The plan stamps every table whose policy it baked in, so tightening
+either side's policy invalidates a cached join plan.
 
 The scaling story is still *more files* where it can be: separate files are
 separate writer locks, and that is the only OS-enforced isolation boundary here.

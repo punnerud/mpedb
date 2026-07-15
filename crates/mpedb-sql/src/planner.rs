@@ -14,7 +14,7 @@ type PlannedStmt = (PlanStmt, Vec<Option<ColumnType>>, Vec<String>, BTreeSet<Str
 use crate::binder::{compile_program, BExpr, Binder, Scope};
 use crate::plan::{
     render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource,
-    OrderOver, PlanOnConflict, PlanStmt, Projection,
+    Join, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp, Projection,
 };
 use crate::policy::{PolicyCatalog, TablePolicies};
 use mpedb_types::{ExprProgram, ColumnType, Error, Footprint, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
@@ -285,9 +285,29 @@ pub(crate) fn plan_statement(
         | PlanStmt::Delete { table, .. } => Some(*table),
         PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => None,
     };
-    let tp = target.and_then(|t| catalog.get(t));
-    let policy_epoch = tp.map_or(0, |tp| tp.epoch);
-    let policy_hash = crate::policy::table_policy_hash(tp);
+    // One stamp per table whose policy this plan baked in. For a join that is
+    // BOTH: stamping only the outer would let a cached plan keep serving the
+    // inner table's rows under a policy that has since been tightened, which is
+    // the leak §4 exists to close.
+    let mut stamped: Vec<u32> = target.into_iter().collect();
+    if let PlanStmt::Select {
+        join: Some(j), ..
+    } = &plan_stmt
+    {
+        stamped.push(j.table);
+    }
+
+    let policies: Vec<PolicyStamp> = stamped
+        .into_iter()
+        .map(|t| {
+            let tp = catalog.get(t);
+            PolicyStamp {
+                table: t,
+                epoch: tp.map_or(0, |tp| tp.epoch),
+                hash: crate::policy::table_policy_hash(tp),
+            }
+        })
+        .collect();
 
     // `n_params` now counts user params PLUS the reserved context slots that
     // `current_setting()` appended, so the executor's param array is sized for
@@ -298,8 +318,7 @@ pub(crate) fn plan_statement(
         n_params: param_types.len() as u16,
         param_types,
         context_keys,
-        policy_epoch,
-        policy_hash,
+        policies,
         consts,
         footprint,
     })
@@ -685,6 +704,218 @@ fn check_distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<()> 
     Ok(())
 }
 
+/// `SELECT … FROM a INNER JOIN b ON <cond> [WHERE …]`, as a nested loop.
+///
+/// The evaluation order is the security contract, and it is why the pieces are
+/// separate fields rather than one AND-ed predicate:
+///
+/// ```text
+/// for each outer row matching `access`:
+///     if not `filter`(outer):            continue   <- a's RLS USING
+///     for each inner row matching `join.access`:
+///         if not `join.policy`(inner):   continue   <- b's RLS USING
+///         if not `join.on`(outer ‖ inner):   continue
+///         if not `joined_filter`(outer ‖ inner): continue
+///         emit
+/// ```
+///
+/// Both policies run over ONE row, and before anything that can raise. mpedb's
+/// expressions raise on division by zero and on overflow, and a raise is
+/// observable — so `ON a.x / b.secret > 1` evaluated before b's policy would
+/// report the existence of a row the policy hides, without ever returning it.
+/// AND-ing everything into one predicate would leave that ordering to whatever
+/// the compiler emitted.
+///
+/// What this deliberately does NOT do yet: push the user's WHERE into either
+/// side. Every conjunct waits for the joined row, so the outer is a full scan
+/// unless its POLICY pins a key, and the inner is re-scanned per outer row —
+/// O(n·m). Correct, and slow enough that EXPLAIN says so.
+#[allow(clippy::too_many_arguments)]
+fn plan_join_select(
+    s: &ast::SelectStmt,
+    jc: &ast::JoinClause,
+    schema: &Schema,
+    n_params: u16,
+    catalog: &PolicyCatalog,
+    consts: &mut Vec<Value>,
+) -> Result<PlannedStmt> {
+    let (outer_id, outer) = resolve_table(schema, &s.table)?;
+    let (inner_id, inner) = resolve_table(schema, &jc.table)?;
+
+    // Each table's policy binds over ITS OWN row: a policy is a single-row
+    // scalar predicate (DESIGN-MULTIDB §253), so it must be bound in a
+    // single-table scope or its column slots would be join slots.
+    let mut ob = Binder::new(outer, n_params, true);
+    let outer_policy = read_policy(&mut ob, catalog, outer_id, &outer.name, PolicyCmd::Select)?;
+    let (access, outer_residual) = extract_access(outer_policy, outer, consts)?;
+    let filter = outer_residual.map(|e| compile_program(&e)).transpose()?;
+
+    let mut ib = ob.rescope(Scope::single(inner));
+    let inner_policy = read_policy(&mut ib, catalog, inner_id, &inner.name, PolicyCmd::Select)?;
+    let inner_policy = inner_policy.map(|e| compile_program(&e)).transpose()?;
+
+    // Everything else sees the joined tuple.
+    let mut binder = ib.rescope(Scope::joined(vec![outer, inner])?);
+    let on = compile_program(&binder.bind_predicate(&jc.on)?)?;
+    let joined_filter = s
+        .where_clause
+        .as_ref()
+        .map(|e| binder.bind_predicate(e))
+        .transpose()?
+        .map(|e| compile_program(&e))
+        .transpose()?;
+
+    if s.group_by.is_empty()
+        && s.having.is_none()
+        && !s.items.as_ref().is_some_and(|i| i.iter().any(contains_agg))
+        && !s.order_by.iter().any(|(e, _)| contains_agg(e))
+    {
+        // fall through
+    } else {
+        return Err(bind_err(
+            "aggregates over a JOIN are not supported yet: the grouping step reads the base              row, and teaching it the joined row is a separate change"
+                .to_string(),
+        ));
+    }
+
+    // Projection over the joined tuple. `SELECT *` is every column of both
+    // sides, outer first — the same order the tuple is built in.
+    let mut projection: Vec<Projection> = match &s.items {
+        None => (0..binder.scope_width() as u16).map(Projection::Column).collect(),
+        Some(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let (b, _) = binder.bind_expr(item)?;
+                out.push(match b {
+                    BExpr::Col(i) => Projection::Column(i),
+                    other => {
+                        let program = compile_program(&other)?;
+                        let name = render_program(&program, &joined_namer(outer, inner));
+                        Projection::Expr { program, name }
+                    }
+                });
+            }
+            out
+        }
+    };
+
+    // ORDER BY over the joined row. A bare column is a slot of it; anything
+    // else takes the sort-only-column route, exactly as the single-table path
+    // does.
+    let mut order_by = Vec::with_capacity(s.order_by.len());
+    let mut order_over = OrderOver::BaseRow;
+    let mut order_junk = 0u16;
+    if !s.order_by.is_empty() {
+        // The "base row" of a join IS the joined row, and it is built in full
+        // before the sort — so sorting it is the same operation, just wider.
+        let mut keys = Vec::with_capacity(s.order_by.len());
+        let mut all_cols = true;
+        for (e, desc) in &s.order_by {
+            match binder.bind_expr(e) {
+                Ok((BExpr::Col(i), _)) => keys.push((i, *desc)),
+                _ => {
+                    all_cols = false;
+                    break;
+                }
+            }
+        }
+        if all_cols {
+            order_by = keys;
+        } else {
+            let joined = Scope::joined(vec![outer, inner])?;
+            let (keys, n_junk) = join_order_by(s, &joined, &mut projection, &mut binder, outer, inner)?;
+            order_by = keys;
+            order_over = OrderOver::Projection;
+            order_junk = n_junk;
+        }
+    }
+
+    let (param_types, context_keys, list_keys) = binder.into_parts();
+    Ok((
+        PlanStmt::Select {
+            table: outer_id,
+            access,
+            join: Some(Join {
+                table: inner_id,
+                // The inner side is re-read per outer row; no pushdown yet.
+                access: AccessPath::FullScan,
+                on,
+                policy: inner_policy,
+            }),
+            joined_filter,
+            filter,
+            projection,
+            order_by,
+            order_over,
+            order_junk,
+            limit: s.limit,
+            offset: s.offset,
+            distinct: s.distinct,
+            aggregate: None,
+        },
+        param_types,
+        context_keys,
+        list_keys,
+    ))
+}
+
+/// Name a joined-tuple slot for EXPLAIN and output columns: `<table>.<column>`,
+/// because `id` alone would be a lie about which side it came from.
+fn joined_namer<'a>(
+    outer: &'a TableDef,
+    inner: &'a TableDef,
+) -> impl Fn(u16) -> String + use<'a> {
+    move |c: u16| {
+        let n = outer.columns.len();
+        if (c as usize) < n {
+            format!("{}.{}", outer.name, outer.columns[c as usize].name)
+        } else if (c as usize) < n + inner.columns.len() {
+            format!("{}.{}", inner.name, inner.columns[c as usize - n].name)
+        } else {
+            format!("col#{c}")
+        }
+    }
+}
+
+/// `ORDER BY` for a join that needs sort-only columns.
+fn join_order_by(
+    s: &ast::SelectStmt,
+    _joined: &Scope<'_>,
+    projection: &mut Vec<Projection>,
+    binder: &mut Binder<'_>,
+    outer: &TableDef,
+    inner: &TableDef,
+) -> Result<(Vec<(u16, bool)>, u16)> {
+    let items = s.items.as_ref();
+    let mut keys = Vec::with_capacity(s.order_by.len());
+    let mut n_junk = 0u16;
+    for (i, (e, desc)) in s.order_by.iter().enumerate() {
+        if let Some(items) = items {
+            if let Some(pos) = ordinal(e, items.len())? {
+                keys.push((pos, *desc));
+                continue;
+            }
+            if let Some(pos) = items.iter().position(|it| it == e) {
+                keys.push((pos as u16, *desc));
+                continue;
+            }
+        }
+        let (b, _) = binder.bind_expr(e)?;
+        if matches!(b, BExpr::Const(_)) {
+            return Err(bind_err(format!(
+                "{} is a constant — it names no column, so it orders nothing.",
+                describe_key(e, i)
+            )));
+        }
+        let program = compile_program(&b)?;
+        let name = render_program(&program, &joined_namer(outer, inner));
+        projection.push(Projection::Expr { program, name });
+        keys.push(((projection.len() - 1) as u16, *desc));
+        n_junk += 1;
+    }
+    Ok((keys, n_junk))
+}
+
 fn plan_aggregate_select(
     s: &ast::SelectStmt,
     table: &TableDef,
@@ -795,6 +1026,8 @@ fn plan_aggregate_select(
             PlanStmt::Select {
                 table: table_id,
                 access,
+                join: None,
+                joined_filter: None,
                 filter,
                 projection,
                 order_by,
@@ -853,6 +1086,8 @@ fn plan_aggregate_select(
         PlanStmt::Select {
             table: table_id,
             access,
+            join: None,
+            joined_filter: None,
             filter,
             projection,
             order_by,
@@ -897,6 +1132,9 @@ fn plan_select(
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
+    if let Some(jc) = &s.join {
+        return plan_join_select(s, jc, schema, n_params, catalog, consts);
+    }
     let mut binder = Binder::new(table, n_params, true);
     let bound_where = s
         .where_clause
@@ -909,6 +1147,7 @@ fn plan_select(
     let policy = read_policy(&mut binder, catalog, table_id, &table.name, PolicyCmd::Select)?;
     let (access, residual) = extract_access(merge_and(bound_where, policy), table, consts)?;
     let filter = residual.map(|e| compile_program(&e)).transpose()?;
+    let (join, joined_filter) = (None, None);
 
     check_distinct_order_by(s, table)?;
 
@@ -1017,6 +1256,8 @@ fn plan_select(
     Ok((
         PlanStmt::Select {
             aggregate: None,
+            join,
+            joined_filter,
             distinct: s.distinct,
             order_over,
             order_junk,
@@ -1645,10 +1886,34 @@ pub(crate) fn compute_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Foot
         Ok(bits)
     };
     Ok(match stmt {
-        PlanStmt::Select { table, access, .. } => {
-            let (key_access, indexes_used) = access_key_and_indexes(access);
+        PlanStmt::Select {
+            table,
+            access,
+            join,
+            ..
+        } => {
+            let (key_access, mut indexes_used) = access_key_and_indexes(access);
+            // ONE BIT PER TABLE READ. A join that claimed only the outer would
+            // under-claim `tables_read`, and `conflicts_with` is a bitmap AND —
+            // so a writer to the inner table would not be seen to conflict with
+            // this reader, and the commit path would group them as independent.
+            let mut tables_read = table_bit(*table)?;
+            let mut key_access = key_access;
+            if let Some(j) = join {
+                tables_read |= table_bit(j.table)?;
+                let (jkey, jidx) = access_key_and_indexes(&j.access);
+                indexes_used |= jidx;
+                let _ = jkey;
+                // `key_access` is per-STATEMENT, and it names ONE key space. A
+                // Point on the outer stops describing what this reads the
+                // moment a second table joins in, and a claim narrower than the
+                // truth is a claim that rows this statement does read are rows
+                // it does not. Full is the only honest answer the type can
+                // express — it costs conflict precision, never correctness.
+                key_access = KeyAccess::Full;
+            }
             Footprint {
-                tables_read: table_bit(*table)?,
+                tables_read,
                 tables_written: 0,
                 indexes_used,
                 key_access,

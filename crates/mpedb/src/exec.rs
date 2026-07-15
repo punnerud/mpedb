@@ -5,7 +5,7 @@
 use crate::ExecResult;
 use mpedb_core::{ReadTxn, WriteTxn};
 use mpedb_sql::{
-    AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, OrderOver,
+    AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, Join, OrderOver,
     PlanOnConflict, PlanStmt, Projection,
 };
 use mpedb_types::{
@@ -339,6 +339,8 @@ pub(crate) fn exec_stmt(
         PlanStmt::Select {
             table,
             access,
+            join,
+            joined_filter,
             filter,
             projection,
             order_by,
@@ -359,7 +361,10 @@ pub(crate) fn exec_stmt(
             // down the pipeline and cutting the scan short would drop input
             // that later stages still need.
             let skip_take_bound = || {
-                if *order_over != OrderOver::BaseRow {
+                // A join is gathered whole (the LIMIT bounds joined rows, not
+                // outer rows), and any sort below the base row moves the bound
+                // down the pipeline too.
+                if join.is_some() || *order_over != OrderOver::BaseRow {
                     return None;
                 }
                 limit.map(|l| {
@@ -374,7 +379,28 @@ pub(crate) fn exec_stmt(
                     order_by, *order_over, *order_junk, *limit, *offset, *distinct,
                 );
             }
-            let rows = if *order_over != OrderOver::BaseRow {
+            let rows = if let Some(j) = join {
+                // A join materializes: the sort, the dedup and the LIMIT all
+                // apply to JOINED rows, so none of them can bound the scan.
+                let mut r = gather_joined(
+                    ctx,
+                    plan,
+                    params,
+                    *table,
+                    access,
+                    filter.as_ref(),
+                    j,
+                    joined_filter.as_ref(),
+                )?;
+                // `OrderOver::BaseRow` means "the tuple the scan produced", and
+                // for a join that tuple IS the joined row — so the sort belongs
+                // HERE, before the projection narrows it. Sorting the projected
+                // rows instead would index the wrong tuple.
+                if *order_over == OrderOver::BaseRow && !order_by.is_empty() {
+                    sort_rows(&mut r, order_by);
+                }
+                r
+            } else if *order_over != OrderOver::BaseRow {
                 // The sort indexes a tuple further down (the projection), so the
                 // base rows are left unsorted and unbounded here.
                 gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?
@@ -439,15 +465,37 @@ pub(crate) fn exec_stmt(
                 }
                 out = out.into_iter().skip(skip).take(take).collect();
             }
+            // A joined slot past the outer's width belongs to the inner table,
+            // and it is named `<table>.<column>`: `id` alone would not say
+            // which side it came from, and both sides usually have one.
+            let inner_t = match join {
+                Some(j) => Some(table_def(schema, j.table)?),
+                None => None,
+            };
             let columns = projection
                 .iter()
                 .take(projection.len() - *order_junk as usize)
                 .map(|p| match p {
-                    Projection::Column(i) => t
-                        .columns
-                        .get(*i as usize)
-                        .map(|c| c.name.clone())
-                        .ok_or_else(|| internal("projection column name")),
+                    Projection::Column(i) => {
+                        let i = *i as usize;
+                        match inner_t {
+                            None => t
+                                .columns
+                                .get(i)
+                                .map(|c| c.name.clone())
+                                .ok_or_else(|| internal("projection column name")),
+                            Some(it) => {
+                                if i < t.columns.len() {
+                                    Ok(format!("{}.{}", t.name, t.columns[i].name))
+                                } else {
+                                    it.columns
+                                        .get(i - t.columns.len())
+                                        .map(|c| format!("{}.{}", it.name, c.name))
+                                        .ok_or_else(|| internal("projection column name"))
+                                }
+                            }
+                        }
+                    }
                     Projection::Expr { name, .. } => Ok(name.clone()),
                 })
                 .collect::<Result<Vec<String>>>()?;
@@ -907,6 +955,68 @@ fn exec_aggregate(
         columns,
         rows: projected,
     })
+}
+
+/// `INNER JOIN`, as a nested loop over the outer scan.
+///
+/// The order of the four tests is the security contract, not an implementation
+/// detail — see [`mpedb_sql::Join::policy`]. Each table's RLS `USING` runs over
+/// ITS OWN row, before anything that can see both:
+///
+/// mpedb's expressions raise on division by zero and on overflow, and a raise
+/// is observable. An `ON a.x / b.secret > 1` evaluated before b's policy would
+/// report the existence of a row the policy hides — the row never comes back,
+/// but the error says it was there. Filtering first is what makes the policy a
+/// filter rather than a suggestion.
+///
+/// Cost: the inner side is read ONCE and held, so this is O(n+m) reads and
+/// O(n·m) `on` evaluations, with the inner side resident. No predicate is
+/// pushed into either scan yet — every conjunct of the user's WHERE waits for
+/// the joined row — so both sides are full scans unless a POLICY pins a key.
+/// `EXPLAIN` says so rather than leaving it to be found on a big table.
+#[allow(clippy::too_many_arguments)]
+fn gather_joined(
+    ctx: &mut dyn TxnCtx,
+    plan: &CompiledPlan,
+    params: &[Value],
+    outer_table: u32,
+    outer_access: &AccessPath,
+    outer_policy: Option<&ExprProgram>,
+    join: &Join,
+    joined_filter: Option<&ExprProgram>,
+) -> Result<Vec<Vec<Value>>> {
+    // The outer's policy is a filter over the outer row, so the existing
+    // single-table gather applies it — including through the access path.
+    let outer_rows = gather_rows(ctx, outer_table, outer_access, outer_policy, plan, params, None)?;
+    let inner_rows = gather_rows(
+        ctx,
+        join.table,
+        &join.access,
+        join.policy.as_ref(),
+        plan,
+        params,
+        None,
+    )?;
+
+    let mut out = Vec::new();
+    let mut stack = Vec::new();
+    for o in &outer_rows {
+        for i in &inner_rows {
+            let mut joined = Vec::with_capacity(o.len() + i.len());
+            joined.extend_from_slice(o);
+            joined.extend_from_slice(i);
+            if !join.on.eval_filter(&mut stack, &joined, params)? {
+                continue;
+            }
+            if let Some(f) = joined_filter {
+                if !f.eval_filter(&mut stack, &joined, params)? {
+                    continue;
+                }
+            }
+            out.push(joined);
+        }
+    }
+    Ok(out)
 }
 
 /// Project one written row through a `RETURNING` clause.

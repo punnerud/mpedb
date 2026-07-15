@@ -18,6 +18,10 @@ pub(crate) enum Stmt {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SelectStmt {
     pub table: String,
+    /// `INNER JOIN <table> ON <cond>`. One join, so two tables — the plan and
+    /// the executor are written for a pair, and an N-way join is a follow-up
+    /// rather than something this quietly half-does.
+    pub join: Option<JoinClause>,
     /// `SELECT DISTINCT` — deduplicate the OUTPUT rows (the projected tuple),
     /// which is why it cannot be pushed into the scan.
     pub distinct: bool,
@@ -100,6 +104,13 @@ pub(crate) enum BinOp {
 pub(crate) enum UnOp {
     Neg,
     Not,
+}
+
+/// `[INNER] JOIN <table> ON <cond>`.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct JoinClause {
+    pub table: String,
+    pub on: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
