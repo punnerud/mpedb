@@ -451,6 +451,27 @@ flip. That is crash-safety being paid for in bandwidth. mpedb does take the
 commit-class scan (36% vs 29%). PostgreSQL is 2-4% of raw in every bulk cell:
 a socket round-trip per row is simply the wrong shape for bulk.
 
+⚠ **These cells measure a COLD database, and that is most of what they measure**
+(2026-07-15). Each seeds a fresh file, so every overflow page is touched for the
+first time — and a `MAP_SHARED` page must be faulted in before it can be written,
+even when the write overwrites every byte of it. `write(2)` owes no such fault,
+which is most of why the raw baseline looks so far ahead. Measured with
+`examples/blob_paths` and `examples/blob_warm` on this box:
+
+```text
+  64 MiB memcpy into a cold mapping       819 MiB/s   <- what these cells see
+  64 MiB memcpy, pages already faulted  13,780 MiB/s  <- 17x, same copy
+  in-engine, 16 MiB blob, round 0         244 MiB/s   <- pays the faults
+  in-engine, same blob, rounds 2-5      913-981 MiB/s <- steady state, 4x
+```
+
+A long-lived process recycling pages through the freelist pays the fault once
+per page, not per blob. Two things that does not excuse: steady state is still
+~950 MiB/s against a warm memcpy's ~14,000 — **~3.8 µs of engine cost per
+overflow page**, cause unknown, and NOT the per-page header (measured at 3%); and
+`copy_file_range` beats the cold path by 62% on ext4 precisely by not faulting
+the destination. Both are #40.
+
 **Nobody is close to the medium.** The best engine uses 40% of the raw write
 ceiling and 29% of the read. If you need bytes moved, a file is still the fastest
 database.
