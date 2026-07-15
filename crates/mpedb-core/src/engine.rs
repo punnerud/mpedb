@@ -960,8 +960,16 @@ impl WriteTxn<'_> {
 
 
 impl<'e> WriteTxn<'e> {
-    /// Pull one reclaimable freelist entry into `reusable`. Reusable iff its
-    /// freeing txn is strictly below the oldest-pinned bound.
+    /// Pull one reclaimable freelist entry into `reusable`.
+    ///
+    /// Reusable iff its freeing txn is **at or below** the oldest-pinned bound.
+    /// Not *strictly* below: that off-by-one is the one CLAUDE.md's invariant
+    /// list calls out as causing an unbounded high-water leak, and this comment
+    /// used to describe it — the code has always been right.
+    ///
+    /// ⚠ There is a *different* unbounded-high-water bug reachable from here
+    /// under sustained concurrent churn; see
+    /// `tests/high_water_leak.rs`.
     fn refill_reusable(&mut self) -> Result<()> {
         debug_assert!(!self.in_freelist_op, "refill re-entered a freelist op");
         if self.freelist_root == 0 {
