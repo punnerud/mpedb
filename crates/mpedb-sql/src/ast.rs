@@ -28,9 +28,10 @@ pub(crate) struct SelectStmt {
     /// `None` = `SELECT *`.
     pub items: Option<Vec<Expr>>,
     pub where_clause: Option<Expr>,
-    /// `GROUP BY` column names. Empty with aggregates present = one group over
-    /// every surviving row.
-    pub group_by: Vec<String>,
+    /// `GROUP BY` keys. Expressions rather than names because `GROUP BY t.col`
+    /// is legal in sqlite and PG, and a qualified name is not a name — the
+    /// planner still requires each key to BE a column.
+    pub group_by: Vec<Expr>,
     /// `HAVING` — a predicate over the GROUPED row, not the base row.
     pub having: Option<Expr>,
     /// `ORDER BY <expr> [ASC|DESC]`, and whether it descends. An expression rather than a name because

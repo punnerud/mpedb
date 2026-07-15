@@ -375,8 +375,23 @@ pub(crate) fn exec_stmt(
             };
             if let Some(agg) = aggregate {
                 return exec_aggregate(
-                    ctx, plan, params, t, *table, access, filter.as_ref(), agg, projection,
-                    order_by, *order_over, *order_junk, *limit, *offset, *distinct,
+                    ctx,
+                    plan,
+                    params,
+                    t,
+                    *table,
+                    access,
+                    filter.as_ref(),
+                    join.as_ref(),
+                    joined_filter.as_ref(),
+                    agg,
+                    projection,
+                    order_by,
+                    *order_over,
+                    *order_junk,
+                    *limit,
+                    *offset,
+                    *distinct,
                 );
             }
             let rows = if let Some(j) = join {
@@ -829,6 +844,8 @@ fn exec_aggregate(
     table: u32,
     access: &AccessPath,
     filter: Option<&ExprProgram>,
+    join: Option<&Join>,
+    joined_filter: Option<&ExprProgram>,
     agg: &Aggregation,
     projection: &[Projection],
     order_by: &[(u16, bool)],
@@ -838,8 +855,12 @@ fn exec_aggregate(
     offset: Option<u64>,
     distinct: bool,
 ) -> Result<ExecResult> {
-    // Unbounded on purpose: see the LIMIT note above.
-    let rows = gather_rows(ctx, table, access, filter, plan, params, None)?;
+    // Unbounded on purpose: see the LIMIT note above. Over a join the row being
+    // aggregated is the JOINED row — same rule, wider row.
+    let rows = match join {
+        None => gather_rows(ctx, table, access, filter, plan, params, None)?,
+        Some(j) => gather_joined(ctx, plan, params, table, access, filter, j, joined_filter)?,
+    };
 
     // Group. The key is the memcmp-ordered keycode of the group columns, so
     // groups come out in a deterministic order for free and NULL keys group

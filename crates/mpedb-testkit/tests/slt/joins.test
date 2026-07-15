@@ -289,20 +289,90 @@ SELECT emp.eid FROM emp FULL OUTER JOIN dept ON emp.did = dept.did
 statement error CROSS JOIN is not supported
 SELECT emp.eid FROM emp CROSS JOIN dept
 
-# Aggregates over a join are the known gap, and it includes `count(*)`. The
-# grouping step resolves names against ONE table and builds its grouped tuple
-# from that table's columns; over a join the row is `[outer ‖ inner]` and
-# neither is true. Refused with a message that says so, rather than answering
-# a question nobody asked.
-statement error not supported yet
-SELECT dname, count(*) FROM emp JOIN dept ON emp.did = dept.did GROUP BY dname
-
-statement error not supported yet
-SELECT count(*) FROM emp JOIN dept ON emp.did = dept.did
-
 # A qualifier that names no table in the statement is a typo, not a hint.
 statement error no table named
 SELECT nonsense.eid FROM emp JOIN dept ON emp.did = dept.did
+
+# ---- aggregates, over the joined row ------------------------------------------------
+# Nothing in the grouping step is about tables — it is about the row it is
+# handed. So the same planner runs; the row is just wider.
+
+query I nosort
+SELECT count(*) FROM emp JOIN dept ON emp.did = dept.did
+----
+3
+
+# The 'empty' dept has no employees, so it is not a group with count 0 — it is
+# not a group at all. That is the INNER JOIN, not the aggregate.
+query TI nosort
+SELECT dept.dname, count(*) FROM emp JOIN dept ON emp.did = dept.did GROUP BY dept.dname ORDER BY dept.dname
+----
+eng
+2
+sales
+1
+
+query TIIT nosort
+SELECT dept.dname, count(*), sum(emp.eid), min(emp.ename) FROM emp JOIN dept ON emp.did = dept.did GROUP BY dept.dname ORDER BY dept.dname
+----
+eng
+2
+21
+ann
+sales
+1
+12
+cy
+
+query T nosort
+SELECT dept.dname FROM emp JOIN dept ON emp.did = dept.did GROUP BY dept.dname HAVING count(*) > 1 ORDER BY dept.dname
+----
+eng
+
+query II nosort
+SELECT count(DISTINCT dept.dname), count(DISTINCT emp.did) FROM emp JOIN dept ON emp.did = dept.did
+----
+2
+2
+
+# ORDER BY an aggregate, over a join.
+query TI nosort
+SELECT dname, count(*) FROM emp JOIN dept ON emp.did = dept.did GROUP BY dname ORDER BY count(*) DESC, dname
+----
+eng
+2
+sales
+1
+
+# WHERE runs before the grouping, as always — it just sees the joined row now.
+query TI nosort
+SELECT dept.dname, count(*) FROM emp JOIN dept ON emp.did = dept.did WHERE emp.eid > 10 GROUP BY dept.dname ORDER BY dept.dname
+----
+eng
+1
+sales
+1
+
+# A bare aggregate over an empty join result is still ONE row.
+query I nosort
+SELECT count(*) FROM emp JOIN dept ON emp.did = dept.did WHERE dept.dname = 'zzz'
+----
+0
+
+# `GROUP BY dept.did` — a QUALIFIED group key. It did not parse at all before
+# joins existed (GROUP BY took a bare name), and over a join it is the only
+# way to say which `did` you mean.
+query II nosort
+SELECT dept.did, count(*) FROM emp JOIN dept ON emp.did = dept.did GROUP BY dept.did ORDER BY dept.did
+----
+1
+2
+2
+1
+
+# And the ambiguity is still an error, not a guess.
+statement error ambiguous
+SELECT did, count(*) FROM emp JOIN dept ON emp.did = dept.did GROUP BY did
 
 # ---- EXPLAIN tells the truth about the cost -----------------------------------------
 # The footprint reads 0x3 — one bit per table. A join that claimed only the

@@ -627,23 +627,22 @@ impl CompiledPlan {
                     // The OUTER's policy/residual, over the outer row alone.
                     self.check_program(f, t)?;
                 }
-                if join.is_some() && aggregate.is_some() {
-                    return Err(corrupt("aggregate over a join is not supported"));
-                }
                 if let Some(a) = aggregate {
                     // GROUP BY columns and aggregate ARGUMENTS index the BASE
-                    // row; HAVING and the projection index the GROUPED tuple
-                    // `[keys ‖ aggs]`, which is a different width. Checking
-                    // either against the wrong one would let a hostile plan read
-                    // past its row — so they are bounded separately.
+                    // row — which for a join is the JOINED row, hence
+                    // `base_width` and not the outer table's; HAVING and the
+                    // projection index the GROUPED tuple `[keys ‖ aggs]`, which
+                    // is a different width again. Checking either against the
+                    // wrong one would let a hostile plan read past its row — so
+                    // they are bounded separately.
                     for c in &a.group_by {
-                        if *c as usize >= t.columns.len() {
+                        if *c as usize >= base_width {
                             return Err(corrupt("GROUP BY column out of range"));
                         }
                     }
                     for c in &a.aggs {
                         if let Some(p) = &c.arg {
-                            self.check_program(p, t)?;
+                            self.check_program_width(p, base_width)?;
                         }
                     }
                     let out_width = a.group_by.len() + a.aggs.len();
@@ -2373,6 +2372,54 @@ mod tests {
     /// PRIMARY KEY and update it as if it were the email conflict — the wrong
     /// row, no error, no crash. Decode recomputes the probe from the target and
     /// refuses a mismatch.
+    /// An aggregate over a join groups the JOINED row, so its GROUP BY slots
+    /// and aggregate arguments are bounded by the joined width — not the outer
+    /// table's, which is narrower and would reject a legitimate plan, and not
+    /// nothing, which would let a hostile one read past the tuple.
+    #[test]
+    fn aggregate_over_a_join_is_bounded_by_the_joined_width() {
+        let s = test_schema();
+        let p = prepare(
+            "SELECT count(*) FROM orders JOIN users ON orders.user_id = users.id \
+             GROUP BY users.email",
+            &s,
+        )
+        .unwrap();
+        let (outer_w, joined_w) = match &p.stmt {
+            PlanStmt::Select {
+                table,
+                join: Some(j),
+                aggregate: Some(a),
+                ..
+            } => {
+                let o = s.table(*table).unwrap().columns.len();
+                let i = s.table(j.table).unwrap().columns.len();
+                // `users.email` is column 1 of users, which sits after all of
+                // orders' columns in the joined row — a slot no single-table
+                // bound would accept.
+                assert_eq!(a.group_by, vec![(o + 1) as u16]);
+                (o, o + i)
+            }
+            other => panic!("expected a joined aggregate plan, got {other:?}"),
+        };
+        assert!(joined_w > outer_w, "the join must widen the row");
+        // Round-trips.
+        CompiledPlan::decode(&p.encode(), &s).unwrap();
+
+        // One past the joined row is out of range.
+        let mut evil = p.clone();
+        match &mut evil.stmt {
+            PlanStmt::Select {
+                aggregate: Some(a), ..
+            } => a.group_by[0] = joined_w as u16,
+            _ => unreachable!(),
+        }
+        match CompiledPlan::decode(&evil.encode(), &s) {
+            Err(Error::Corrupt(m)) => assert!(m.contains("GROUP BY column"), "{m}"),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
     #[test]
     fn conflict_probe_must_match_its_target() {
         let s = test_schema();

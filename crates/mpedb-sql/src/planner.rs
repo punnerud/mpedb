@@ -361,11 +361,15 @@ fn contains_agg(e: &ast::Expr) -> bool {
 fn lift_aggs(
     e: &ast::Expr,
     group_by: &[u16],
-    table: &TableDef,
+    // Name -> slot in the row being aggregated. A `Scope`, so this works over a
+    // join's `[outer ‖ inner]` as well as one table — the rule it enforces ("a
+    // bare column must be a GROUP BY key") is about the ROW, and does not care
+    // how many tables built it.
+    scope: &Scope<'_>,
     aggs: &mut Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool)>,
 ) -> Result<ast::Expr> {
     use ast::Expr as E;
-    let rec = |x: &ast::Expr, aggs: &mut Vec<_>| lift_aggs(x, group_by, table, aggs);
+    let rec = |x: &ast::Expr, aggs: &mut Vec<_>| lift_aggs(x, group_by, scope, aggs);
     Ok(match e {
         E::Agg(f, arg, distinct) => {
             let spec = (*f, arg.as_deref().cloned(), *distinct);
@@ -388,23 +392,20 @@ fn lift_aggs(
         // rule, and not pedantry: `SELECT name, count(*) FROM t` with no GROUP
         // BY has no answer for which `name` to show. sqlite invents one; the
         // rigid engine says so instead.
-        E::Col(name) => {
-            let idx = table
-                .column_index(name)
-                .ok_or_else(|| bind_err(format!("unknown column `{name}`")))?;
+        E::Col(_) | E::Qualified(..) => {
+            let (idx, _) = match e {
+                E::Col(n) => scope.resolve(n)?,
+                E::Qualified(q, n) => scope.resolve_qualified(q, n)?,
+                _ => unreachable!("matched above"),
+            };
             let pos = group_by.iter().position(|g| *g == idx).ok_or_else(|| {
                 bind_err(format!(
-                    "column `{name}` must appear in GROUP BY or be inside an aggregate — \
-                     otherwise there is no single value for it in the group"
+                    "column `{}` must appear in GROUP BY or be inside an aggregate — \
+                     otherwise there is no single value for it in the group",
+                    scope.slot_name(idx)
                 ))
             })?;
             E::Col(format!("__g{pos}"))
-        }
-        E::Qualified(q, name) => {
-            if !q.eq_ignore_ascii_case(&table.name) {
-                return Err(bind_err(format!("no table named `{q}` in this statement")));
-            }
-            rec(&E::Col(name.clone()), aggs)?
         }
         E::Unary(op, a) => E::Unary(*op, Box::new(rec(a, aggs)?)),
         E::IsNull(a, n) => E::IsNull(Box::new(rec(a, aggs)?), *n),
@@ -444,15 +445,18 @@ fn lift_aggs(
 /// a second resolution path means the type rules, 3VL and constant folding are
 /// the same ones as everywhere else, instead of a parallel set that drifts.
 fn synthetic_grouped_table(
-    table: &TableDef,
+    // The columns of the row being aggregated. A slice rather than a
+    // `TableDef`, because for a join that row is `[outer ‖ inner]` and no table
+    // describes it.
+    columns: &[mpedb_types::ColumnDef],
     group_by: &[u16],
     aggs: &[(mpedb_types::AggFn, Option<ast::Expr>, bool)],
     agg_types: &[Option<ColumnType>],
 ) -> TableDef {
-    let mut columns = Vec::with_capacity(group_by.len() + aggs.len());
+    let mut out: Vec<mpedb_types::ColumnDef> = Vec::with_capacity(group_by.len() + aggs.len());
     for (k, g) in group_by.iter().enumerate() {
-        let src = &table.columns[*g as usize];
-        columns.push(mpedb_types::ColumnDef {
+        let src = &columns[*g as usize];
+        out.push(mpedb_types::ColumnDef {
             name: format!("__g{k}"),
             ty: src.ty,
             nullable: true, // a group key can be NULL; NULLs group together
@@ -468,7 +472,7 @@ fn synthetic_grouped_table(
             // SUM/MIN/MAX keep the argument's type.
             _ => agg_types[i].unwrap_or(ColumnType::Int64),
         };
-        columns.push(mpedb_types::ColumnDef {
+        out.push(mpedb_types::ColumnDef {
             name: format!("__g{}", group_by.len() + i),
             ty,
             // Every aggregate except COUNT is NULL over an empty group.
@@ -479,8 +483,11 @@ fn synthetic_grouped_table(
         });
     }
     TableDef {
-        name: table.name.clone(),
-        columns,
+        // Not a table anyone named, and nothing resolves a qualifier against
+        // it: `lift_aggs` has already rewritten every column reference to the
+        // positional `__gN`.
+        name: String::new(),
+        columns: out,
         primary_key: vec![0],
     }
 }
@@ -505,7 +512,8 @@ fn synthetic_grouped_table(
 ///   `ORDER BY amt * 2` — a computed key, which no base-column index names.
 fn distinct_order_by(
     s: &ast::SelectStmt,
-    table: &TableDef,
+    // The row being selected FROM: one table, or a join's `[outer ‖ inner]`.
+    scope: &Scope<'_>,
     // When present, a key that is NOT in the SELECT list may be APPENDED to the
     // projection as a sort-only column rather than refused. `None` for the
     // callers that must refuse (DISTINCT, and the grouped path, where the sort
@@ -519,27 +527,18 @@ fn distinct_order_by(
         let mut out = Vec::with_capacity(s.order_by.len());
         let mut n_junk = 0u16;
         for (i, (e, desc)) in s.order_by.iter().enumerate() {
-            if let Some(pos) = ordinal(e, table.columns.len())? {
+            if let Some(pos) = ordinal(e, scope.width())? {
                 out.push((pos, *desc));
                 continue;
             }
-            match e {
-                ast::Expr::Col(n) => {
-                    let idx = table.column_index(n).ok_or_else(|| {
-                        bind_err(format!("unknown column `{n}` in ORDER BY"))
-                    })?;
-                    out.push((idx, *desc));
-                }
-                ast::Expr::Qualified(q, n) if q.eq_ignore_ascii_case(&table.name) => {
-                    let idx = table.column_index(n).ok_or_else(|| {
-                        bind_err(format!("unknown column `{n}` in ORDER BY"))
-                    })?;
-                    out.push((idx, *desc));
-                }
+            // The projection IS the base row here, so a column's slot is its
+            // output position.
+            match col_slot(e, scope) {
+                Some(slot) => out.push((slot, *desc)),
                 // `SELECT * FROM t ORDER BY a + 1`: every column is already in
                 // the output, but a computed key still is not.
-                _ => {
-                    let (pos, added) = push_junk(&mut junk, e, table, i)?;
+                None => {
+                    let (pos, added) = push_junk(&mut junk, e, scope, i)?;
                     out.push((pos, *desc));
                     n_junk += added;
                 }
@@ -547,14 +546,12 @@ fn distinct_order_by(
         }
         return Ok((out, n_junk));
     };
-    let strip = |e: &ast::Expr| -> ast::Expr {
-        match e {
-            ast::Expr::Qualified(q, n) if q.eq_ignore_ascii_case(&table.name) => {
-                ast::Expr::Col(n.clone())
-            }
-            other => other.clone(),
-        }
-    };
+    // Which selected items are plain column references, and to which slot. A
+    // key matches an item when they name the SAME COLUMN, which is a question
+    // about slots and not about spelling: `t.a` and `a` are one column, and —
+    // the case that made the old spelling-based match unfixable — `emp.did`
+    // and `dept.did` are two, but strip the qualifier and they are both `did`.
+    let item_slots: Vec<Option<u16>> = items.iter().map(|it| col_slot(it, scope)).collect();
     let mut out = Vec::with_capacity(s.order_by.len());
     let mut n_junk = 0u16;
     for (i, (key, desc)) in s.order_by.iter().enumerate() {
@@ -562,11 +559,16 @@ fn distinct_order_by(
             out.push((pos, *desc));
             continue;
         }
-        let stripped = strip(key);
-        match items.iter().position(|it| strip(it) == stripped) {
+        let pos = match col_slot(key, scope) {
+            Some(slot) => item_slots.iter().position(|s| *s == Some(slot)),
+            // Not a column: fall back to comparing the expressions, which is
+            // what makes `SELECT amt * 2 … ORDER BY amt * 2` match.
+            None => items.iter().position(|it| it == key),
+        };
+        match pos {
             Some(pos) => out.push((pos as u16, *desc)),
             None => {
-                let (pos, added) = push_junk(&mut junk, key, table, i)?;
+                let (pos, added) = push_junk(&mut junk, key, scope, i)?;
                 out.push((pos, *desc));
                 n_junk += added;
             }
@@ -575,12 +577,25 @@ fn distinct_order_by(
     Ok((out, n_junk))
 }
 
+/// The slot this expression names, if it is a plain column reference.
+///
+/// `None` for anything else, INCLUDING a name that does not resolve or is
+/// ambiguous: those are real errors, but they are reported by the bind that
+/// follows, with a message about the actual problem rather than about the sort.
+fn col_slot(e: &ast::Expr, scope: &Scope<'_>) -> Option<u16> {
+    match e {
+        ast::Expr::Col(n) => scope.resolve(n).ok().map(|(i, _)| i),
+        ast::Expr::Qualified(q, n) => scope.resolve_qualified(q, n).ok().map(|(i, _)| i),
+        _ => None,
+    }
+}
+
 /// Append one sort-only ("junk") column to the projection and return its output
 /// position, or report that the key has nowhere to live.
 fn push_junk(
     junk: &mut Option<(&mut Vec<Projection>, &mut Binder<'_>)>,
     key: &ast::Expr,
-    table: &TableDef,
+    scope: &Scope<'_>,
     i: usize,
 ) -> Result<(u16, u16)> {
     let Some((projection, binder)) = junk else {
@@ -606,13 +621,7 @@ fn push_junk(
         )));
     }
     let program = compile_program(&b)?;
-    let name = render_program(&program, &|c| {
-        table
-            .columns
-            .get(c as usize)
-            .map(|c| c.name.clone())
-            .unwrap_or_else(|| format!("col#{c}"))
-    });
+    let name = render_program(&program, &|c| scope.slot_name(c));
     projection.push(Projection::Expr { program, name });
     if projection.len() > crate::parser::MAX_SELECT_ITEMS {
         return Err(bind_err("too many ORDER BY keys to sort by".to_string()));
@@ -765,17 +774,36 @@ fn plan_join_select(
         .map(|e| compile_program(&e))
         .transpose()?;
 
-    if s.group_by.is_empty()
-        && s.having.is_none()
-        && !s.items.as_ref().is_some_and(|i| i.iter().any(contains_agg))
-        && !s.order_by.iter().any(|(e, _)| contains_agg(e))
-    {
-        // fall through
-    } else {
-        return Err(bind_err(
-            "aggregates over a JOIN are not supported yet: the grouping step reads the base              row, and teaching it the joined row is a separate change"
-                .to_string(),
-        ));
+    // An aggregate over a join groups the JOINED row. Nothing in the grouping
+    // step is about tables — it is about the row it is handed — so the same
+    // planner runs, given the joined row's columns and scope.
+    let has_agg = s
+        .items
+        .as_ref()
+        .is_some_and(|i| i.iter().any(contains_agg))
+        || s.having.as_ref().is_some_and(contains_agg)
+        || s.order_by.iter().any(|(e, _)| contains_agg(e))
+        || !s.group_by.is_empty();
+    if has_agg {
+        let mut joined_columns = outer.columns.clone();
+        joined_columns.extend(inner.columns.iter().cloned());
+        return plan_aggregate_select(
+            s,
+            &joined_columns,
+            &Scope::joined(vec![outer, inner])?,
+            outer_id,
+            access,
+            filter,
+            Some(Join {
+                table: inner_id,
+                access: AccessPath::FullScan,
+                on,
+                policy: inner_policy,
+            }),
+            joined_filter,
+            binder,
+            consts,
+        );
     }
 
     // Projection over the joined tuple. `SELECT *` is every column of both
@@ -916,23 +944,45 @@ fn join_order_by(
     Ok((keys, n_junk))
 }
 
+/// Plan an aggregate SELECT over `base` — one table, or a join's
+/// `[outer ‖ inner]`. Everything here is about the ROW being aggregated, so all
+/// the join changes is how wide that row is and how names resolve into it.
+#[allow(clippy::too_many_arguments)]
 fn plan_aggregate_select(
     s: &ast::SelectStmt,
-    table: &TableDef,
+    // The row being aggregated: its columns (for the grouped tuple's types) and
+    // its scope (for name resolution and messages).
+    base_columns: &[mpedb_types::ColumnDef],
+    base_scope: &Scope<'_>,
     table_id: u32,
     access: AccessPath,
     filter: Option<ExprProgram>,
+    join: Option<Join>,
+    joined_filter: Option<ExprProgram>,
     mut binder: Binder<'_>,
     _consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
-    // 1. GROUP BY columns -> base-row indices.
+    // 1. GROUP BY columns -> base-row slots.
     let mut group_by = Vec::with_capacity(s.group_by.len());
-    for name in &s.group_by {
-        let i = table
-            .column_index(name)
-            .ok_or_else(|| bind_err(format!("unknown column `{name}` in GROUP BY")))?;
+    for g in &s.group_by {
+        let (i, _) = match g {
+            ast::Expr::Col(n) => base_scope.resolve(n)?,
+            ast::Expr::Qualified(q, n) => base_scope.resolve_qualified(q, n)?,
+            // `GROUP BY a + 1` groups by a computed key, which the grouped
+            // tuple's positional keys cannot name. sqlite and PG allow it.
+            _ => {
+                return Err(bind_err(
+                    "GROUP BY must name a column — grouping by an expression is not \
+                     supported (sqlite and PostgreSQL do allow it)"
+                        .to_string(),
+                ))
+            }
+        };
         if group_by.contains(&i) {
-            return Err(bind_err(format!("column `{name}` repeated in GROUP BY")));
+            return Err(bind_err(format!(
+                "column `{}` repeated in GROUP BY",
+                base_scope.slot_name(i)
+            )));
         }
         group_by.push(i);
     }
@@ -944,10 +994,10 @@ fn plan_aggregate_select(
     let mut agg_specs: Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool)> = Vec::new();
     let mut rewritten = Vec::with_capacity(items.len());
     for item in items {
-        rewritten.push(lift_aggs(item, &group_by, table, &mut agg_specs)?);
+        rewritten.push(lift_aggs(item, &group_by, base_scope, &mut agg_specs)?);
     }
     let rewritten_having = match &s.having {
-        Some(h) => Some(lift_aggs(h, &group_by, table, &mut agg_specs)?),
+        Some(h) => Some(lift_aggs(h, &group_by, base_scope, &mut agg_specs)?),
         None => None,
     };
     // ORDER BY is lifted HERE, with the others, because `ORDER BY count(*)` may
@@ -958,7 +1008,7 @@ fn plan_aggregate_select(
     // ordering by an aggregate that IS selected does not compute it twice.
     let mut rewritten_order = Vec::with_capacity(s.order_by.len());
     for (e, desc) in &s.order_by {
-        rewritten_order.push((lift_aggs(e, &group_by, table, &mut agg_specs)?, *desc));
+        rewritten_order.push((lift_aggs(e, &group_by, base_scope, &mut agg_specs)?, *desc));
     }
 
     // 3. Bind each aggregate ARGUMENT over the BASE row.
@@ -988,7 +1038,7 @@ fn plan_aggregate_select(
 
     // 4. Bind the rewritten projection/HAVING over the GROUPED tuple — a
     //    different tuple from the base row, carrying the same parameter table.
-    let grouped = synthetic_grouped_table(table, &group_by, &agg_specs, &agg_types);
+    let grouped = synthetic_grouped_table(base_columns, &group_by, &agg_specs, &agg_types);
     let mut binder = binder.rescope(Scope::single(&grouped));
 
     let mut projection: Vec<Projection> = Vec::with_capacity(rewritten.len());
@@ -997,11 +1047,11 @@ fn plan_aggregate_select(
         projection.push(match b {
             BExpr::Col(i) => Projection::Expr {
                 program: compile_program(&BExpr::Col(i))?,
-                name: agg_item_name(orig, table),
+                name: agg_item_name(orig),
             },
             other => Projection::Expr {
                 program: compile_program(&other)?,
-                name: agg_item_name(orig, table),
+                name: agg_item_name(orig),
             },
         });
     }
@@ -1020,14 +1070,14 @@ fn plan_aggregate_select(
     //    yet, so it gets a sort-only column appended to the projection, exactly
     //    as the plain path does for `ORDER BY amt + 1`.
     if s.distinct {
-        let (order_by, _) = distinct_order_by(s, table, None)?;
+        let (order_by, _) = distinct_order_by(s, base_scope, None)?;
         let (param_types, context_keys, list_keys) = binder.into_parts();
         return Ok((
             PlanStmt::Select {
                 table: table_id,
                 access,
-                join: None,
-                joined_filter: None,
+                join,
+                joined_filter,
                 filter,
                 projection,
                 order_by,
@@ -1072,7 +1122,7 @@ fn plan_aggregate_select(
                 Some(pos) => keys.push((pos as u16, *desc)),
                 None => {
                     let mut junk = Some((&mut projection, &mut binder));
-                    let (pos, added) = push_junk(&mut junk, e, &grouped, i)?;
+                    let (pos, added) = push_junk(&mut junk, e, &Scope::single(&grouped), i)?;
                     keys.push((pos, *desc));
                     n_junk += added;
                 }
@@ -1086,8 +1136,8 @@ fn plan_aggregate_select(
         PlanStmt::Select {
             table: table_id,
             access,
-            join: None,
-            joined_filter: None,
+            join,
+            joined_filter,
             filter,
             projection,
             order_by,
@@ -1109,7 +1159,7 @@ fn plan_aggregate_select(
 }
 
 /// The output column name for one item of an aggregate SELECT list.
-fn agg_item_name(e: &ast::Expr, _t: &TableDef) -> String {
+fn agg_item_name(e: &ast::Expr) -> String {
     match e {
         ast::Expr::Col(c) => c.clone(),
         ast::Expr::Qualified(_, c) => c.clone(),
@@ -1118,7 +1168,7 @@ fn agg_item_name(e: &ast::Expr, _t: &TableDef) -> String {
             "{}({}{})",
             f.name(),
             if *distinct { "DISTINCT " } else { "" },
-            agg_item_name(a, _t)
+            agg_item_name(a)
         ),
         _ => "?column?".to_string(),
     }
@@ -1164,7 +1214,16 @@ fn plan_select(
         || !s.group_by.is_empty();
     if has_agg {
         return plan_aggregate_select(
-            s, table, table_id, access, filter, binder, consts,
+            s,
+            &table.columns,
+            &Scope::single(table),
+            table_id,
+            access,
+            filter,
+            None,
+            None,
+            binder,
+            consts,
         );
     }
 
@@ -1232,7 +1291,7 @@ fn plan_select(
         } else {
             Some((&mut projection, &mut binder))
         };
-        let (keys, n_junk) = distinct_order_by(s, table, junk)?;
+        let (keys, n_junk) = distinct_order_by(s, &Scope::single(table), junk)?;
         (keys, OrderOver::Projection, n_junk)
     };
     // A PK-prefix ORDER BY, all ascending, over a PK-ordered access path is
