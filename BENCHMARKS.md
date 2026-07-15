@@ -589,8 +589,18 @@ merely noisy.
    doubles the survivable time — 64 MB dies at 10 s, 128 MB at 20 s, 256 MB at
    40 s — so it is linear growth, not sizing. One writer survives 20 s where
    four die in 10; the threshold is the box's core count. Reproduce with
-   `mpedb stress --workers 8 --secs 10 --mode mixed`. Full measurements,
-   hypotheses and starting points in
+   `mpedb stress --workers 8 --secs 10 --mode mixed`; instrument with
+   `cargo build --release -p mpedb --features leakstat --example leak_probe`.
+   **Measured, not guessed:** every page ever allocated is sitting in the
+   freelist (16,146 of high_water 16,294), every entry is fresh, and reclamation
+   is never gated (`refill_not_yet` fires twice in 199k commits). Nothing is lost
+   and nothing is stuck — the pool just grows, and 75% of the high-water bumps
+   happen inside the commit fixpoint, where `in_freelist_op` disables refill by
+   design. **Five hypotheses are dead**, including the two most obvious ones: the
+   oldest-pinned bound is innocent (recomputing it eagerly fixes a real staleness
+   defect, lag 933→0, and does not touch the leak), and *reserving* pages ahead of
+   the fixpoint makes the leak 2.4× worse by starving the shared freelist. All
+   five, with numbers, in
    [`crates/mpedb-core/tests/high_water_leak.rs`](crates/mpedb-core/tests/high_water_leak.rs).
    This is reviewed MVCC/freelist code (DESIGN.md §5) and wants the
    design-review treatment.
