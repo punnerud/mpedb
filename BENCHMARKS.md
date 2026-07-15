@@ -269,8 +269,50 @@ median of 3 alternating runs:
 sqlite3 gets its best case here: WAL, and a 60 s `busy_timeout`. The timeout is
 not a courtesy — without it every loser of a write race returns `SQLITE_BUSY` and
 the run dies. **That asymmetry is itself the result**: mpedb's arm has no retry
-path because there is nothing to retry. The 2-process dip is real and
-reproducible; it is not explained yet.
+path because there is nothing to retry.
+
+#### The 2-process dip, explained and mostly fixed
+
+The dip above (160k at two writers, between 299k at one and 274k at eight) was
+real, reproducible and unexplained. It is **two writers ping-ponging on the
+writer lock**: each release wakes the other, which finds the lock taken again and
+sleeps. Measured, per insert:
+
+| writers | rows/s | CPU µs/insert | **voluntary ctx-switches/insert** |
+|--:|--:|--:|--:|
+| 1 | 305,871 | 3.64 | ~0 |
+| **2** | **164,730** | **8.30** | **0.28** |
+| 4 | 260,948 | 4.60 | 0.053 |
+| 8 | 275,562 | 4.11 | 0.018 |
+
+Sleeps per insert *fall* as writers are added, which is the tell: with more
+contenders, a writer that releases and immediately re-acquires wins the race and
+gets a burst of work per wake-up. **Two is the worst case there is** — perfect
+alternation, one sleep/wake per 3.5 inserts, and 2.3× the CPU per row.
+
+Not group commit: the intent ring is gated on `durability = commit|wal`
+(`ring_exec::ring_enabled`) and these cells run `none`, so the writers take the
+lock directly. Not futex volume either — 0.012 futex calls per insert at two
+writers, so the lock takes its uncontended fast path most of the time; it is the
+*few* that sleep that cost, because each one is a full context switch.
+
+The fix is a bounded `trylock` spin before blocking (`Shm::writer_lock`,
+64 attempts). Measured, paired arms:
+
+| | n | result | 95% CI | |
+|---|--:|--:|---|---|
+| dev box, 2 writers | 20 pairs | **+17.4%** | [+13.7, +21.1] | resolved gain |
+| Pi, 1 writer (uncontended) | 15 pairs | +0.5% | [-0.2, +1.2] | **no cost** |
+
+Voluntary context switches at two writers drop from 0.309 to 0.171 per insert.
+
+Two things worth keeping from how this was measured. **The dip does not exist on
+the Pi at all** (7,006 / 6,400 / 6,047 at 1/2/4 writers — a gentle decline), so
+the magnitude is a property of that host's scheduler, not of the design; the
+mechanism is real on both. And the uncontended arm first measured **-1.56%
+[-2.64, -0.47]** at n=5 — a "resolved harm" that n=15 turned into +0.5% and no
+effect. Five reps produce that kind of false positive; see "Measure your
+instrument".
 
 Read this table for its *shape*, not its absolutes: sqlite3 sags gently with more
 writers (90k → 81k) while mpedb stays flat-ish. The dev box's run-to-run CV is
