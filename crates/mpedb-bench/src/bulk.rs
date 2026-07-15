@@ -43,14 +43,35 @@
 //! `HashSet<u64>` of COWed pages — `page_mut` hashes on EVERY call, and a
 //! single row touches several pages.
 //!
-//! Swapping SipHash for fxhash there was measured, and **rejected**: +7% on
-//! armv7, **-1.6% on x86-64**, which is the reference platform. Removing 15%
-//! of a profile does not return 15% — the hash still happens, just cheaper,
-//! and fxhash's collisions take some of it back. The `contains` cannot simply
-//! go: it is the COW guard, and a violation of it is an engine bug this is
-//! meant to catch in production. The idea worth trying is a BITSET instead of a
-//! hash set — page ids are dense and bounded by `high_water`, so a shift and a
-//! mask replace the hash entirely, on every platform.
+//! Swapping SipHash for fxhash was measured properly and **taken**: **+3.5% on
+//! armv7** (95% CI [+2.1, +4.9], n=15 pairs) and **nothing measurable on
+//! x86-64** (-0.1%, CI [-2.2, +1.9], n=25 pairs). Note it is not 15% — removing
+//! 15% of a profile does not hand back 15%, since the hash still happens, just
+//! cheaper.
+//!
+//! The `contains` itself cannot go: it is the COW guard, and catching a
+//! violation of it in production is the point. What could remove the hash
+//! entirely, on every platform, is a BITSET — page ids are dense and bounded by
+//! `high_water`, so a shift and a mask replace it. Untried.
+//!
+//! # How to measure this without fooling yourself
+//!
+//! Both of those numbers are the SECOND answer. The first attempt said
+//! "+2/-2/+0.6%" — pure noise, because the two binaries were **identical**
+//! (`git stash` took the example with it, the build failed, and `cp` copied the
+//! same file twice). **md5 the arms before believing an A/B.**
+//!
+//! The second attempt, 3 alternating reps on the dev box, said "-1.6%, a
+//! regression" and that was wrong too. Run-to-run CV on this dev box is **9.0%**
+//! (mean 332, sd 30, range 255-351 over 10 reps): three reps cannot resolve a
+//! 2% effect, and the "regression" was noise that got as far as a commit
+//! message before anyone checked.
+//!
+//! A Raspberry Pi 3 B+ — 11x slower, and running a live ADS-B decoder the whole
+//! time — has a CV of **1.6%** (mean 30.0, sd 0.47). Steady load beats
+//! fast-but-bursty. **Use the Pi for A/B decisions**, with paired alternating
+//! arms and enough reps to put a confidence interval on the difference; use the
+//! fast machines for absolute numbers.
 //!
 //! (Numbers from a musl build: musl's memcpy is slower than glibc's, so the
 //! 24% would look different against glibc. The hashing would not.)
