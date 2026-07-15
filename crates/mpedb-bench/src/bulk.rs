@@ -37,6 +37,24 @@
 //! a fixed ~1 µs per row that the payload does not touch. Copies would show as
 //! a flat MiB/s; instead it climbs 14×.
 //!
+//! A real CPU profile (Raspberry Pi 3 B+, armv7, `perf record` — the only box
+//! to hand with a working profiler) puts the ~1 µs in: musl's memcpy (~24%),
+//! malloc/free (~14%), and `DefaultHasher` (~15%). That last one is the
+//! `HashSet<u64>` of COWed pages — `page_mut` hashes on EVERY call, and a
+//! single row touches several pages.
+//!
+//! Swapping SipHash for fxhash there was measured, and **rejected**: +7% on
+//! armv7, **-1.6% on x86-64**, which is the reference platform. Removing 15%
+//! of a profile does not return 15% — the hash still happens, just cheaper,
+//! and fxhash's collisions take some of it back. The `contains` cannot simply
+//! go: it is the COW guard, and a violation of it is an engine bug this is
+//! meant to catch in production. The idea worth trying is a BITSET instead of a
+//! hash set — page ids are dense and bounded by `high_water`, so a shift and a
+//! mask replace the hash entirely, on every platform.
+//!
+//! (Numbers from a musl build: musl's memcpy is slower than glibc's, so the
+//! 24% would look different against glibc. The hashing would not.)
+//!
 //! **3. Most of that fixed cost is the ENGINE, not SQL.** `bulk_only … raw`
 //! bypasses the SQL layer (no plan lookup, no param validation, no expression
 //! IR) for the engine's typed row API:
