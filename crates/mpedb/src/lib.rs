@@ -503,6 +503,22 @@ impl Database {
         self.engine.verify_page_accounting()
     }
 
+    /// Diagnostic counters for the high-water leak
+    /// (`crates/mpedb-core/tests/high_water_leak.rs`):
+    /// `(txn_id, high_water, oldest_pinned_bound, freelist_entries)`.
+    ///
+    /// For `examples/leak_probe.rs`. Costs a freelist walk, takes no writer
+    /// lock, and pins nothing — perturbing the reader table is exactly what
+    /// would corrupt the thing being measured.
+    pub fn leak_counters(&self) -> Result<(u64, u64, u64, u64)> {
+        self.engine.leak_counters()
+    }
+
+    /// Diagnostic (#37): see `Engine::freelist_shape`.
+    pub fn freelist_shape(&self) -> Result<mpedb_core::engine::FreelistShape> {
+        self.engine.freelist_shape()
+    }
+
     // ---------------- system records: tooling/extension keyspace ----------
 
     /// Store a raw record in the reserved system keyspace, namespaced by
