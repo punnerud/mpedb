@@ -1733,7 +1733,39 @@ mod tests {
     use super::*;
     use mpedb_types::Config;
 
-    fn test_config(name: &str, size_mb: u64) -> Config {
+    /// A `Config` that takes its database file with it when it dies.
+    ///
+    /// These tests used to leave the file behind. The name carries the pid, so
+    /// every run leaked a fresh one and they accumulated forever — and nobody
+    /// noticed, because a dev box's `/tmp` is enormous. A Raspberry Pi's is a
+    /// 100 MB tmpfs, and ONE run of this suite left 35 MB in it.
+    ///
+    /// Derefs to `Config`, so the fourteen call sites did not change, and it
+    /// cleans up on UNWIND too — a panicking test is exactly when the file is
+    /// least likely to be removed by a line at the end of the function, which
+    /// is how the `/dev/shm` version of this bug survived its first fix.
+    struct TestCfg {
+        cfg: Config,
+        path: std::path::PathBuf,
+    }
+
+    impl std::ops::Deref for TestCfg {
+        type Target = Config;
+        fn deref(&self) -> &Config {
+            &self.cfg
+        }
+    }
+
+    impl Drop for TestCfg {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.path);
+            // The WAL sidecar is part of the database; leaving it behind also
+            // leaves the next run to open a database beside a foreign log.
+            let _ = std::fs::remove_file(format!("{}-wal", self.path.display()));
+        }
+    }
+
+    fn test_config(name: &str, size_mb: u64) -> TestCfg {
         let path = std::env::temp_dir()
             .join("mpedb-engine-tests")
             .join(format!("{}-{}.mpedb", name, std::process::id()));
@@ -1766,7 +1798,10 @@ primary_key = ["id"]
 "#,
             path.display()
         );
-        Config::from_toml_str(&toml).unwrap()
+        TestCfg {
+            cfg: Config::from_toml_str(&toml).unwrap(),
+            path,
+        }
     }
 
     fn open(cfg: &Config) -> Engine {
