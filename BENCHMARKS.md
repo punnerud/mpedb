@@ -572,15 +572,34 @@ merely noisy.
 
 ## Known issues / improvement opportunities
 
-0. **macOS `durability=commit` pays two platter flushes per commit.** The commit
-   path msyncs the data range and then the meta page, and each `msync_range` now
-   follows with `F_FULLFSYNC` (required — `msync(MS_SYNC)` does not flush the
-   drive cache on macOS). But `F_FULLFSYNC` is per-*fd*, not per-range, so one
-   barrier before the ack would cover both: measured 142 ops/s (~7 ms = 2×3.5 ms)
-   where `wal` gets 293 ops/s with a single flush. Fixing it means moving the
-   barrier out of `msync_range` and into the commit path — reviewed protocol code
-   (DESIGN.md §5), so it needs the design-review treatment, not a quick edit.
-   Linux is unaffected (its `msync(MS_SYNC)` already runs `vfs_fsync`).
+0. **macOS `durability=commit` flushes the platter once per contiguous dirty run,
+   plus once for meta.** `msync(MS_SYNC)` does not flush the drive cache on macOS,
+   so `msync_range` follows each call with `F_FULLFSYNC` — and the commit path
+   calls it **once per contiguous run of dirty pages**, not once. Measured 142
+   ops/s (~7 ms ≈ 2×3.5 ms) against `wal`'s 293 ops/s, but that cell is
+   sequential inserts, whose COW pages come off the high-water mark contiguously:
+   N=1, so it sees the best case. A random-update workload scatters the btree path
+   and the freelist path, so N=3-5 → **4-6 platter flushes per commit**. Nobody
+   has measured that cell.
+
+   ⚠ **This entry used to propose an unsafe fix** ("one barrier before the ack
+   would cover both"). It would break DESIGN.md §4.1's publication order: data
+   must be durable BEFORE the meta that references it. With a single barrier
+   covering both, a power loss inside it can leave the drive having written meta
+   and not data — meta_T is then checksum-valid and points at COW pages that were
+   never written. **Two flushes is the FLOOR for the meta-flip protocol on a
+   device with a volatile cache**, and it is exactly why `wal` gets away with one:
+   its record is a single self-describing checksummed object, so a torn tail is
+   discarded and there is no ordering to preserve.
+
+   The safe win, which is bigger than the one this entry used to claim: hoist the
+   barrier out of `msync_range` and issue ONE `F_FULLFSYNC` after all data runs
+   (they are all in the same ordering class), then one after meta. That takes N+1
+   → 2 — a no-op for the benchmark's sequential cell and a 2-3× win for scattered
+   commits. Reviewed protocol code (DESIGN.md §5); the API must make the barrier
+   hard to forget, because forgetting it makes the numbers look *better* while the
+   durability promise is silently gone. **Not done: this box is Linux, and the M3
+   is offline.** Shipping unmeasured durability changes is not on.
 
 1. ~~**UNBOUNDED HIGH-WATER GROWTH under sustained concurrent churn.**~~ **Fixed
    2026-07-15.** A 1000-key table holding ~30 KB of live rows used to fill any
