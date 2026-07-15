@@ -18,6 +18,11 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 
 pub const FORMAT_VERSION: u32 = 2; // v2: intent-ring region between reader table and data
+
+/// How many `trylock` attempts before the writer lock blocks. See
+/// [`Shm::writer_lock`] for why this exists and why it is small.
+#[cfg(target_os = "linux")]
+const WRITER_LOCK_SPINS: u32 = 64;
 const MAGIC: &[u8; 8] = b"MPEDB1\0\0";
 
 // ---- meta page field offsets (pages 0 and 1) ----
@@ -861,23 +866,61 @@ impl Shm {
     /// construction.
     #[cfg(target_os = "linux")]
     pub fn writer_lock(&self) -> Result<bool> {
+        // Spin briefly before blocking.
+        //
+        // At exactly TWO writers the blocking path degenerates into a
+        // ping-pong: each release wakes the other, which finds the lock taken
+        // again and sleeps. Measured, 2 processes inserting into one file:
+        // **0.28 voluntary context switches per insert** and 8.3 µs of CPU per
+        // insert, against 0.018 and 4.1 µs at eight writers — total throughput
+        // 160k/s at two, 274k/s at eight. More contention, more throughput,
+        // because a writer that releases and re-acquires wins the race and gets
+        // a burst of work per wake-up. Two is the worst case there is.
+        //
+        // This changes how we WAIT, not the protocol: the attributes
+        // (PROCESS_SHARED + ROBUST + ERRORCHECK, DESIGN.md §4.2) are untouched
+        // and `trylock` reports `EOWNERDEAD` exactly as `lock` does, so owner-
+        // death recovery is unaffected.
+        //
+        // Bounded, and deliberately small: spinning while the holder is
+        // descheduled is pure waste, and a writer holds this lock for a whole
+        // commit — not a few instructions. This buys the handoff, not the wait.
+        for _ in 0..WRITER_LOCK_SPINS {
+            match unsafe { libc::pthread_mutex_trylock(self.mutex_ptr()) } {
+                0 => return Ok(false),
+                libc::EOWNERDEAD => return self.adopt_after_owner_death(),
+                // EBUSY: someone holds it. EDEADLK never comes from trylock on
+                // an ERRORCHECK mutex — the owner re-entering gets EBUSY here
+                // and falls through to the blocking call below, which reports
+                // it properly (§7.2). The spin costs that path a few hundred
+                // nanoseconds before it errors.
+                libc::EBUSY => std::hint::spin_loop(),
+                _ => break,
+            }
+        }
         let rc = unsafe { libc::pthread_mutex_lock(self.mutex_ptr()) };
         match rc {
             0 => Ok(false),
-            libc::EOWNERDEAD => {
-                unsafe { crate::os::mutex_make_consistent(self.mutex_ptr()) };
-                if let Err(e) = self.recover_after_owner_death() {
-                    // we DO hold the (now-consistent) mutex; never leak it
-                    self.writer_unlock();
-                    return Err(e);
-                }
-                Ok(true)
-            }
+            libc::EOWNERDEAD => self.adopt_after_owner_death(),
             libc::EDEADLK => Err(Error::Internal(
                 "writer lock re-entered by its owner (nested write transaction)".into(),
             )),
             _ => Err(Error::Internal(format!("pthread_mutex_lock failed: {rc}"))),
         }
+    }
+
+    /// The `EOWNERDEAD` path, shared by the spin and the blocking acquire: a
+    /// previous writer died holding the lock, so mark it consistent and run the
+    /// §5.2 recovery. We hold the (now-consistent) mutex either way — an error
+    /// here must not leak it.
+    #[cfg(target_os = "linux")]
+    fn adopt_after_owner_death(&self) -> Result<bool> {
+        unsafe { crate::os::mutex_make_consistent(self.mutex_ptr()) };
+        if let Err(e) = self.recover_after_owner_death() {
+            self.writer_unlock();
+            return Err(e);
+        }
+        Ok(true)
     }
 
     /// macOS: acquire exclusion via the sidecar flock + private ERRORCHECK
