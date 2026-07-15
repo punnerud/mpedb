@@ -57,7 +57,26 @@
 //! inside the commit fixpoint**, where `in_freelist_op` disables refill by
 //! design — the "few pages of slack" its comment promises is the entire leak.
 //!
-//! # Five dead hypotheses — do not re-run these
+//! # The growth rate is CONSTANT — so it is not a feedback loop
+//!
+//! high_water deltas per 1.4 s, 4 writers: 3144, 2982, 2413, 3049, 3559, 3329,
+//! 2900, 3233. Flat. The freelist tree grew 10× over that same window. Any
+//! story where a bigger/deeper freelist causes more bumps predicts an
+//! ACCELERATING rate, and there isn't one.
+//!
+//! So it is a fixed leak per commit: ~2200 pages/s ÷ ~94k commits/s =
+//! **one page per ~43 commits**, and `alloc_hw`/commit measures 0.021 — the
+//! same number. Pool size is irrelevant to the bump rate, which is exactly why
+//! the pool grows forever: refill hands over ONE entry no matter how many
+//! entries exist, so 12,000 free pages help a dry fixpoint not at all.
+//!
+//! Per-commit page accounting closes (4 writers): in 17.45 (refill) + freed
+//! 5.33 = 22.78; out 17.46 (recorded) + used 5.31 = 22.77. **No page goes
+//! missing.** At fixpoint entry a txn holds ~12.1 pages and the fixpoint needs
+//! ~6. It fits 98.5% of the time. The leak is the *tail* of that distribution,
+//! and it is constant because the distribution is stationary.
+//!
+//! # Six dead hypotheses — do not re-run these
 //!
 //! Each was killed by measurement, not by argument:
 //!
@@ -67,13 +86,33 @@
 //!    records `freed ∪ reusable`. It is not dropped. Dead.
 //! 3. **"The once-per-txn recompute cap (`bound_recomputed`) is the limiter."**
 //!    Dead — see 5.
-//! 4. **"The fixpoint runs dry, so stock `reusable` before it starts."** Tried:
-//!    `reserve_reusable(32)` ahead of `in_freelist_op = true`. It did cut
-//!    `alloc_hw_in_fl` (2899→1743) — and made the leak **2.4× WORSE**
-//!    (high_water 27k→65k, throughput halved, DbFull at 10 s). Each writer
-//!    hoards pages in a private `reusable` that no other writer can see, so the
-//!    shared freelist starves: `refill_no_tree` went 15→622, leftover went to 95
-//!    pages/commit. **Reserving feeds the thing it was meant to starve.**
+//! 4. **"The fixpoint runs dry, so stock `reusable` before it starts."** Tried
+//!    TWICE, because the first attempt had a bug worth knowing about. Both runs
+//!    ended identically: high_water 27k→**65k**, throughput halved, DbFull at
+//!    10 s. It does cut `alloc_hw_in_fl` — and triples `alloc_hw` overall.
+//!
+//!    The reason is structural, not a tuning miss: the fixpoint records
+//!    `freed ∪ reusable`, so **every page you hand a writer is a page the
+//!    fixpoint must write back**, in a value that grows its own work and its
+//!    iteration count (`commit_leftover` hit 101 pages/commit;
+//!    `refill_net_negative` hit 51% of refills). **You cannot give the fixpoint
+//!    more pages, because giving it pages makes it need more pages.**
+//!
+//!    The bug in attempt one, worth avoiding: the retry loop used
+//!    `if reusable.len() == before { break }` as its progress check. Evicting an
+//!    entry COSTS pages, so a small entry is net-negative and the pool comes out
+//!    SHORTER — which that check reads as progress, looping until the freelist
+//!    is drained. `refill_reusable` should report reclamation as a bool; never
+//!    infer it from the pool's length.
+//! 6. **"Take only what you need: cap the take, leave the rest in the entry
+//!    under its own key."** The natural answer to 4 — entry size is
+//!    `entry = entry - used + freed`, a fixed point for ANY size (no restoring
+//!    force), and it random-walks to 20 pages under 4 writers vs 4.7 under 1.
+//!    Capping the take is a restoring force, and it keeps leftover pages from
+//!    being re-stamped with a newer txn than they need. Tried with
+//!    `REFILL_TAKE_PAGES = 16`: **worse again** (65k, DbFull at 10 s) and the
+//!    entry COUNT exploded to 4,827 — each commit still adds its own entry while
+//!    refill only shrinks one, so entries pile up faster than they retire.
 //! 5. **"The bound goes stale, locking the freelist out."** This one is a real
 //!    defect: refill only recomputes when `freed_txn > bound`, but refill always
 //!    takes the OLDEST entry, which is almost always reclaimable — so the bound
@@ -86,29 +125,37 @@
 //!
 //! # Where the evidence actually points
 //!
-//! At the commit fixpoint. It is a convergence loop: it records
-//! `freed ∪ reusable`, but its own upserts ALLOCATE from `reusable`, which
-//! changes the set it just recorded, so it iterates (~2.0 iterations/commit
-//! measured). **The work it does grows with `|reusable|`** — which is why
-//! hypothesis 4 backfired. Any fix has to shrink that coupling, not feed it.
+//! Everything above narrows to one sentence: **the commit fixpoint mints a page
+//! whenever it runs dry, and nothing can stop it running dry**, because
+//! `in_freelist_op` forbids the one move that would help (refill re-entering the
+//! tree the fixpoint is mutating — a real hazard, not a missing check).
 //!
-//! Open questions, in the order worth asking:
+//! Hypotheses 4 and 6 are the two obvious ways to feed it, and both fail for the
+//! same structural reason: the fixpoint's own work is coupled to `|reusable|`
+//! through `candidate = freed ∪ reusable`. Pages you give it are pages it must
+//! write back, which is more work, which needs more pages. The coupling is the
+//! bug; any fix has to cut it rather than tune around it.
 //!
-//! - Why does the pool need to be *bigger over time* when the bound never gates
-//!   it and the live set is constant? Something adds a page per ~50 commits and
-//!   never removes one. Find that, and the leak is found.
-//! - Can the fixpoint's own COW draw from a source refill does not have to
-//!   re-enter — a small stash reserved at txn START, not at commit? (Note this
-//!   is *not* hypothesis 4: the failure there was hoarding across the commit,
-//!   which starves peers.)
-//! - Is re-recording leftover `reusable` under `freelist_key(new_txn, ..)` right
-//!   at all? Those pages already passed the bound gate when refill handed them
-//!   over; re-stamping them with a newer txn is strictly more conservative than
-//!   needed, and it churns the tree.
+//! **The untried idea, and the one the evidence supports:** don't let the
+//! fixpoint mint at all — let it UNWIND. When an allocation inside the fixpoint
+//! finds `reusable` empty, fail the iteration (`Error`-style, or a `dry` flag),
+//! leave `in_freelist_op`, refill (legal now — nothing is mid-traversal), and
+//! re-run the iteration from the top. The loop already re-reads
+//! `freed ∪ reusable` every pass and upserts under the same `new_txn` key, so a
+//! half-applied iteration is re-applied, not corrupted. This needs the
+//! convergence and bounded-iteration arguments in DESIGN.md §4.5 re-checked
+//! (the 64-iteration cap becomes reachable in a new way), which is exactly the
+//! design-review treatment this code wants.
 //!
-//! This is reviewed MVCC/freelist protocol code (DESIGN.md §5). It wants the
-//! design-review treatment, not a quick edit. Five hypotheses have now died
-//! here; measure the sixth before you believe it.
+//! Also worth settling, though measured NOT to be the leak: re-recording
+//! leftover `reusable` under `freelist_key(new_txn, ..)` is strictly more
+//! conservative than needed — those pages already passed the bound gate when
+//! refill handed them over.
+//!
+//! This is reviewed MVCC/freelist protocol code (DESIGN.md §5). Six hypotheses
+//! have now died here, two of them by being *implemented and measured doing
+//! nothing or doing harm*. That is the cheapest way to kill one: measure the
+//! seventh before you believe it.
 
 /// Reproduce:
 ///
