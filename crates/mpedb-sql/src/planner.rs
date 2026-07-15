@@ -456,35 +456,49 @@ fn synthetic_grouped_table(
 ///     is not an ordinal in PG either: only a literal counts, and the AST is
 ///     checked before folding so a folded `2` cannot sneak in as one.)
 ///   `ORDER BY amt * 2` — a computed key, which no base-column index names.
-fn distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<Vec<(u16, bool)>> {
+fn distinct_order_by(
+    s: &ast::SelectStmt,
+    table: &TableDef,
+    // When present, a key that is NOT in the SELECT list may be APPENDED to the
+    // projection as a sort-only column rather than refused. `None` for the
+    // callers that must refuse (DISTINCT, and the grouped path, where the sort
+    // key lives in the grouped tuple instead).
+    mut junk: Option<(&mut Vec<Projection>, &mut Binder<'_>)>,
+) -> Result<(Vec<(u16, bool)>, u16)> {
     let Some(items) = s.items.as_ref() else {
         // `SELECT *`: the projection is the base row, column for column, so a
         // base-column index IS the output position and an ordinal counts over
         // the same list.
-        return s
-            .order_by
-            .iter()
-            .map(|(e, desc)| {
-                if let Some(pos) = ordinal(e, table.columns.len())? {
-                    return Ok((pos, *desc));
+        let mut out = Vec::with_capacity(s.order_by.len());
+        let mut n_junk = 0u16;
+        for (i, (e, desc)) in s.order_by.iter().enumerate() {
+            if let Some(pos) = ordinal(e, table.columns.len())? {
+                out.push((pos, *desc));
+                continue;
+            }
+            match e {
+                ast::Expr::Col(n) => {
+                    let idx = table.column_index(n).ok_or_else(|| {
+                        bind_err(format!("unknown column `{n}` in ORDER BY"))
+                    })?;
+                    out.push((idx, *desc));
                 }
-                let name = match e {
-                    ast::Expr::Col(n) => n,
-                    ast::Expr::Qualified(q, n) if q.eq_ignore_ascii_case(&table.name) => n,
-                    _ => {
-                        return Err(bind_err(
-                            "ORDER BY must name a column, an output position, or an \
-                             expression from the SELECT list"
-                                .to_string(),
-                        ))
-                    }
-                };
-                let idx = table
-                    .column_index(name)
-                    .ok_or_else(|| bind_err(format!("unknown column `{name}` in ORDER BY")))?;
-                Ok((idx, *desc))
-            })
-            .collect();
+                ast::Expr::Qualified(q, n) if q.eq_ignore_ascii_case(&table.name) => {
+                    let idx = table.column_index(n).ok_or_else(|| {
+                        bind_err(format!("unknown column `{n}` in ORDER BY"))
+                    })?;
+                    out.push((idx, *desc));
+                }
+                // `SELECT * FROM t ORDER BY a + 1`: every column is already in
+                // the output, but a computed key still is not.
+                _ => {
+                    let (pos, added) = push_junk(&mut junk, e, table, i)?;
+                    out.push((pos, *desc));
+                    n_junk += added;
+                }
+            }
+        }
+        return Ok((out, n_junk));
     };
     let strip = |e: &ast::Expr| -> ast::Expr {
         match e {
@@ -495,26 +509,68 @@ fn distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<Vec<(u16, 
         }
     };
     let mut out = Vec::with_capacity(s.order_by.len());
+    let mut n_junk = 0u16;
     for (i, (key, desc)) in s.order_by.iter().enumerate() {
         if let Some(pos) = ordinal(key, items.len())? {
             out.push((pos, *desc));
             continue;
         }
         let stripped = strip(key);
-        let pos = items
-            .iter()
-            .position(|it| strip(it) == stripped)
-            .ok_or_else(|| {
-                bind_err(format!(
-                    "{} must be in the SELECT list. Sorting by something outside the \
-                     output is not supported here (sqlite and PostgreSQL do allow it) — \
-                     select it, or order by a plain column of the table.",
-                    describe_key(key, i)
-                ))
-            })?;
-        out.push((pos as u16, *desc));
+        match items.iter().position(|it| strip(it) == stripped) {
+            Some(pos) => out.push((pos as u16, *desc)),
+            None => {
+                let (pos, added) = push_junk(&mut junk, key, table, i)?;
+                out.push((pos, *desc));
+                n_junk += added;
+            }
+        }
     }
-    Ok(out)
+    Ok((out, n_junk))
+}
+
+/// Append one sort-only ("junk") column to the projection and return its output
+/// position, or report that the key has nowhere to live.
+fn push_junk(
+    junk: &mut Option<(&mut Vec<Projection>, &mut Binder<'_>)>,
+    key: &ast::Expr,
+    table: &TableDef,
+    i: usize,
+) -> Result<(u16, u16)> {
+    let Some((projection, binder)) = junk else {
+        return Err(bind_err(format!(
+            "{} must be in the SELECT list when SELECT DISTINCT is used — otherwise \
+             which duplicate row survives is what decides the order, and the query \
+             does not say",
+            describe_key(key, i)
+        )));
+    };
+    let (b, _) = binder.bind_expr(key)?;
+    // A CONSTANT sort key names no column, so it cannot order anything: every
+    // row gets the same key and the sort is a no-op. sqlite accepts it and
+    // hands back scan order — an arbitrary answer to a query that asked for an
+    // order. PostgreSQL refuses, and it is right to, because the reason people
+    // write this is that they meant an ordinal: `ORDER BY 2` IS an output
+    // position, and `1 + 1` looks like one until it silently is not.
+    if matches!(b, BExpr::Const(_)) {
+        return Err(bind_err(format!(
+            "{} is a constant — it names no column, so it orders nothing. A bare integer \
+             like `ORDER BY 2` is an output position; an expression is not.",
+            describe_key(key, i)
+        )));
+    }
+    let program = compile_program(&b)?;
+    let name = render_program(&program, &|c| {
+        table
+            .columns
+            .get(c as usize)
+            .map(|c| c.name.clone())
+            .unwrap_or_else(|| format!("col#{c}"))
+    });
+    projection.push(Projection::Expr { program, name });
+    if projection.len() > crate::parser::MAX_SELECT_ITEMS {
+        return Err(bind_err("too many ORDER BY keys to sort by".to_string()));
+    }
+    Ok(((projection.len() - 1) as u16, 1))
 }
 
 /// Name one `ORDER BY` key for an error message. A column has a name worth
@@ -676,7 +732,7 @@ fn plan_aggregate_select(
     let grouped = synthetic_grouped_table(table, &group_by, &agg_specs, &agg_types);
     let mut binder = binder.rescope(Scope::single(&grouped));
 
-    let mut projection = Vec::with_capacity(rewritten.len());
+    let mut projection: Vec<Projection> = Vec::with_capacity(rewritten.len());
     for (item, orig) in rewritten.iter().zip(items) {
         let (b, _) = binder.bind_expr(item)?;
         projection.push(match b {
@@ -698,13 +754,14 @@ fn plan_aggregate_select(
         None => None,
     };
 
-    // 5. ORDER BY, resolved against the GROUPED tuple. After lifting, every
-    //    legal item is a bare column of that tuple — a group key or an
-    //    aggregate slot. Anything else (`ORDER BY count(*) + 1`) binds to a
-    //    computed expression the plan's positional `order_by` cannot express,
-    //    so it is refused rather than sorted by the wrong thing.
+    // 5. ORDER BY. Preferred form: every key is a bare column of the GROUPED
+    //    tuple — a group key or an aggregate slot — so the sort runs there and
+    //    `ORDER BY count(*)` works even unselected. A key computed FROM those
+    //    (`ORDER BY count(*) + 1`) is not a column of any tuple that exists
+    //    yet, so it gets a sort-only column appended to the projection, exactly
+    //    as the plain path does for `ORDER BY amt + 1`.
     if s.distinct {
-        let order_by = distinct_order_by(s, table)?;
+        let (order_by, _) = distinct_order_by(s, table, None)?;
         let (param_types, context_keys, list_keys) = binder.into_parts();
         return Ok((
             PlanStmt::Select {
@@ -714,6 +771,7 @@ fn plan_aggregate_select(
                 projection,
                 order_by,
                 order_over: OrderOver::Projection,
+                order_junk: 0,
                 limit: s.limit,
                 offset: s.offset,
                 distinct: true,
@@ -728,20 +786,39 @@ fn plan_aggregate_select(
             list_keys,
         ));
     }
-    let mut order_by = Vec::with_capacity(rewritten_order.len());
-    for ((e, desc), (orig, _)) in rewritten_order.iter().zip(&s.order_by) {
-        let (b, _) = binder.bind_expr(e)?;
-        match b {
-            BExpr::Col(i) => order_by.push((i, *desc)),
-            _ => {
-                return Err(bind_err(format!(
-                    "ORDER BY `{}` must be a GROUP BY key or an aggregate, not an expression \
-                     computed from them",
-                    agg_item_name(orig, table)
-                )))
-            }
+    let mut grouped_keys = Vec::with_capacity(rewritten_order.len());
+    for (e, desc) in &rewritten_order {
+        match binder.bind_expr(e)? {
+            (BExpr::Col(i), _) => grouped_keys.push((i, *desc)),
+            // Not a bare column of the grouped tuple. Stop: the keys must all
+            // index the SAME tuple, so one computed key moves every key to the
+            // projection.
+            _ => break,
         }
     }
+    let (order_by, order_over, order_junk) = if grouped_keys.len() == rewritten_order.len() {
+        (grouped_keys, OrderOver::Grouped, 0)
+    } else {
+        let mut keys = Vec::with_capacity(rewritten_order.len());
+        let mut n_junk = 0u16;
+        for (i, ((e, desc), (orig, _))) in rewritten_order.iter().zip(&s.order_by).enumerate() {
+            // An ordinal or a repeat of a selected item needs no new column.
+            if let Some(pos) = ordinal(orig, items.len())? {
+                keys.push((pos, *desc));
+                continue;
+            }
+            match rewritten.iter().position(|it| it == e) {
+                Some(pos) => keys.push((pos as u16, *desc)),
+                None => {
+                    let mut junk = Some((&mut projection, &mut binder));
+                    let (pos, added) = push_junk(&mut junk, e, &grouped, i)?;
+                    keys.push((pos, *desc));
+                    n_junk += added;
+                }
+            }
+        }
+        (keys, OrderOver::Projection, n_junk)
+    };
 
     let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
@@ -751,7 +828,8 @@ fn plan_aggregate_select(
             filter,
             projection,
             order_by,
-            order_over: OrderOver::Grouped,
+            order_over,
+            order_junk,
             limit: s.limit,
             offset: s.offset,
             distinct: s.distinct,
@@ -823,7 +901,7 @@ fn plan_select(
         );
     }
 
-    let projection = match &s.items {
+    let mut projection: Vec<Projection> = match &s.items {
         None => (0..table.columns.len() as u16).map(Projection::Column).collect(),
         Some(items) => {
             let mut out = Vec::with_capacity(items.len());
@@ -873,11 +951,22 @@ fn plan_select(
             .ok_or_else(|| bind_err(format!("unknown column `{name}` in ORDER BY")))?;
         base_keys.push((idx, *desc));
     }
-    let (mut order_by, order_over) = if base_keys.len() == s.order_by.len() && !s.distinct {
-        (base_keys, OrderOver::BaseRow)
+    let (mut order_by, order_over, order_junk) = if base_keys.len() == s.order_by.len()
+        && !s.distinct
+    {
+        (base_keys, OrderOver::BaseRow, 0)
     } else {
-        // A computed key, an ordinal, or DISTINCT: sort the output instead.
-        (distinct_order_by(s, table)?, OrderOver::Projection)
+        // A computed key, an ordinal, or DISTINCT: sort the output instead. A
+        // key that is not in the output at all gets a sort-only column appended
+        // — unless DISTINCT, where `None` here makes that an error rather than
+        // a dedup on an invisible value.
+        let junk = if s.distinct {
+            None
+        } else {
+            Some((&mut projection, &mut binder))
+        };
+        let (keys, n_junk) = distinct_order_by(s, table, junk)?;
+        (keys, OrderOver::Projection, n_junk)
     };
     // A PK-prefix ORDER BY, all ascending, over a PK-ordered access path is
     // already satisfied by scan order: drop the sort. Not under DISTINCT — the
@@ -902,6 +991,7 @@ fn plan_select(
             aggregate: None,
             distinct: s.distinct,
             order_over,
+            order_junk,
             table: table_id,
             access,
             filter,

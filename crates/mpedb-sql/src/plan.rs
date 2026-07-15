@@ -108,6 +108,20 @@ pub enum PlanStmt {
         offset: Option<u64>,
         /// Grouping, applied **after** `filter`. `None` = no aggregation.
         aggregate: Option<Aggregation>,
+        /// Trailing `projection` entries that exist ONLY to be sorted by, and
+        /// must be dropped before the rows reach the caller.
+        ///
+        /// `SELECT c FROM t ORDER BY a + 1` sorts by something it does not
+        /// output. PostgreSQL calls these resjunk columns; the key has to be
+        /// computed somewhere, and the projection is the only tuple the sort
+        /// can reach. So the planner appends it, the executor sorts, and then
+        /// trims — which is why `order_over` is `Projection` whenever this is
+        /// nonzero.
+        ///
+        /// Always 0 under `distinct`: DISTINCT requires every key to be in the
+        /// SELECT list already, and a junk column would break the dedup anyway
+        /// by making rows distinct on a value the caller never sees.
+        order_junk: u16,
         /// `SELECT DISTINCT` — deduplicate the PROJECTED tuples.
         ///
         /// It cannot be pushed into the scan (the projection is what is being
@@ -455,9 +469,27 @@ impl CompiledPlan {
                 order_by,
                 order_over,
                 aggregate,
+                distinct,
+                order_junk,
                 ..
             } => {
                 let t = get_table(*table)?;
+                // Junk columns are sort-only and get trimmed, so they must not
+                // be able to (a) eat the whole output, (b) survive a DISTINCT —
+                // where they would dedup on a value the caller never sees — or
+                // (c) exist where nothing sorts the projection.
+                let junk = *order_junk as usize;
+                if junk > 0 {
+                    if *order_over != OrderOver::Projection {
+                        return Err(corrupt("order-junk columns without a projection sort"));
+                    }
+                    if *distinct {
+                        return Err(corrupt("order-junk columns under DISTINCT"));
+                    }
+                    if junk >= projection.len() {
+                        return Err(corrupt("order-junk columns leave no output"));
+                    }
+                }
                 self.check_access(access, t)?;
                 // The sort key is an index into whichever tuple `order_over`
                 // names, and those have different widths. Bounding it against
@@ -845,6 +877,7 @@ impl CompiledPlan {
                 offset,
                 aggregate,
                 distinct,
+                order_junk,
             } => {
                 let base = col_namer(*table);
                 out.push_str(&format!(
@@ -899,7 +932,16 @@ impl CompiledPlan {
                         Projection::Expr { name, .. } => name.clone(),
                     })
                     .collect();
-                out.push_str(&format!("  project: {}\n", cols.join(", ")));
+                // The junk columns are trailing and get trimmed before the
+                // caller sees a row, so listing them under `project:` would
+                // describe an output the query does not have. They are still
+                // worth showing — they are work the plan does — just not as
+                // output.
+                let n_out = cols.len() - *order_junk as usize;
+                out.push_str(&format!("  project: {}\n", cols[..n_out].join(", ")));
+                if *order_junk > 0 {
+                    out.push_str(&format!("  sort-only: {}\n", cols[n_out..].join(", ")));
+                }
                 if !order_by.is_empty() {
                     // The sort key indexes the tuple `order_over` names, which
                     // is not always the one `name` reads. Naming an output
@@ -1388,6 +1430,7 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             offset,
             aggregate,
             distinct,
+            order_junk,
         } => {
             buf.push(STMT_SELECT);
             buf.extend_from_slice(&table.to_le_bytes());
@@ -1421,6 +1464,7 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             encode_opt_u64(*limit, buf);
             encode_opt_u64(*offset, buf);
             buf.push(*distinct as u8);
+            w_u16(buf, *order_junk);
             match aggregate {
                 None => buf.push(0),
                 Some(a) => {
@@ -1572,6 +1616,7 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                 1 => true,
                 t => return Err(corrupt(format!("bad distinct tag {t}"))),
             };
+            let order_junk = r_u16(buf, pos)?;
             let aggregate = match r_u8(buf, pos)? {
                 0 => None,
                 1 => {
@@ -1632,6 +1677,7 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                 offset,
                 aggregate,
                 distinct,
+                order_junk,
             })
         }
         STMT_INSERT => {
@@ -2071,6 +2117,84 @@ mod tests {
         }
         match CompiledPlan::decode(&evil.encode(), &s) {
             Err(Error::Corrupt(m)) => assert!(m.contains("grouped"), "{m}"),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
+    /// Sort-only columns are trimmed by the executor on the strength of a
+    /// COUNT in the plan. A tampered count is therefore a way to make the
+    /// executor trim real output, or to smuggle junk past a DISTINCT where it
+    /// would dedup on a value the caller never sees. Decode must refuse all
+    /// three shapes.
+    #[test]
+    fn order_junk_count_is_validated() {
+        let s = test_schema();
+        let p = prepare("SELECT id FROM users ORDER BY email", &s).unwrap();
+        match &p.stmt {
+            PlanStmt::Select {
+                order_junk,
+                order_over,
+                projection,
+                ..
+            } => {
+                // The key is a plain column, so it sorts the base row and needs
+                // no junk column at all.
+                assert_eq!(*order_junk, 0);
+                assert_eq!(*order_over, OrderOver::BaseRow);
+                assert_eq!(projection.len(), 1);
+            }
+            _ => unreachable!(),
+        }
+
+        // (a) junk without a projection sort: nothing would ever trim it.
+        let mut evil = p.clone();
+        match &mut evil.stmt {
+            PlanStmt::Select { order_junk, .. } => *order_junk = 1,
+            _ => unreachable!(),
+        }
+        match CompiledPlan::decode(&evil.encode(), &s) {
+            Err(Error::Corrupt(m)) => assert!(m.contains("projection sort"), "{m}"),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+
+        // (b) junk that eats the entire output.
+        let p2 = prepare("SELECT id FROM users ORDER BY email + 1", &s);
+        // `email` is text; if that does not bind, use a numeric key instead.
+        let p2 = match p2 {
+            Ok(p) => p,
+            Err(_) => prepare("SELECT email FROM users ORDER BY id + 1", &s).unwrap(),
+        };
+        match &p2.stmt {
+            PlanStmt::Select {
+                order_junk,
+                order_over,
+                projection,
+                ..
+            } => {
+                assert_eq!(*order_junk, 1, "a computed key needs a sort-only column");
+                assert_eq!(*order_over, OrderOver::Projection);
+                assert_eq!(projection.len(), 2, "one output + one sort-only");
+            }
+            _ => unreachable!(),
+        }
+        let mut evil = p2.clone();
+        match &mut evil.stmt {
+            PlanStmt::Select { order_junk, .. } => *order_junk = 2,
+            _ => unreachable!(),
+        }
+        match CompiledPlan::decode(&evil.encode(), &s) {
+            Err(Error::Corrupt(m)) => assert!(m.contains("no output"), "{m}"),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+
+        // (c) junk under DISTINCT.
+        let mut evil = p2.clone();
+        match &mut evil.stmt {
+            PlanStmt::Select { distinct, .. } => *distinct = true,
+            _ => unreachable!(),
+        }
+        match CompiledPlan::decode(&evil.encode(), &s) {
+            Err(Error::Corrupt(m)) => assert!(m.contains("DISTINCT"), "{m}"),
             other => panic!("expected Corrupt, got {other:?}"),
         }
     }
