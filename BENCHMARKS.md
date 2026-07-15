@@ -582,20 +582,31 @@ merely noisy.
    (DESIGN.md §5), so it needs the design-review treatment, not a quick edit.
    Linux is unaffected (its `msync(MS_SYNC)` already runs `vfs_fsync`).
 
-1. **`newest_meta` stale-gate race (durability=commit).** A reader that loads the
+1. **UNBOUNDED HIGH-WATER GROWTH under sustained concurrent churn.** The top
+   genuine bug in the engine, and the one that will bite a real deployment: a
+   1000-key table holding ~30 KB of live rows fills any file, given four or more
+   concurrent writers doing insert/update/delete. Doubling the file exactly
+   doubles the survivable time — 64 MB dies at 10 s, 128 MB at 20 s, 256 MB at
+   40 s — so it is linear growth, not sizing. One writer survives 20 s where
+   four die in 10; the threshold is the box's core count. Reproduce with
+   `mpedb stress --workers 8 --secs 10 --mode mixed`. Full measurements,
+   hypotheses and starting points in
+   [`crates/mpedb-core/tests/high_water_leak.rs`](crates/mpedb-core/tests/high_water_leak.rs).
+   This is reviewed MVCC/freelist code (DESIGN.md §5) and wants the
+   design-review treatment.
+2. **`newest_meta` stale-gate race (durability=commit).** A reader that loads the
    `durable_txn` gate, then is descheduled while two durable commits land, gets a
    spurious `Corrupt("no valid meta page")` — both meta slots are newer than its
    stale gate. The DB is *not* corrupt; a re-read succeeds. The bench adapter
    retries (bounded) and counts it. **Fix:** reload the monotone gate and retry in
-   `mpedb-core::shm::newest_meta`. This is the top genuine bug the benchmark
-   surfaces.
-2. **`durability=commit` single-client floor.** Group-commit engages only under
+   `mpedb-core::shm::newest_meta`.
+3. **`durability=commit` single-client floor.** Group-commit engages only under
    contention, so a lone durable writer pays one serialized msync per commit —
    525 ops/s insert, the slowest cell in the suite (SQLite FULL does 1,632, and
    mpedb's own `wal` does 2,598). `wal` already closed this gap for itself; the
    remaining opportunity is a single-writer fast path for `commit` mode, or
    simply steering users to `wal` (which the docs do).
-3. **~1 µs of fixed per-row cost in the write path.** The bulk write is not
+4. **~1 µs of fixed per-row cost in the write path.** The bulk write is not
    limited by copies — see "Where the bulk write actually spends its time". With
    the SQL layer removed entirely, ~1 µs/row remains: btree descent, COW page
    allocation, freelist, and the dirty-page set. The concrete next step is
@@ -603,7 +614,7 @@ merely noisy.
    bounded by `high_water`, so a shift and a mask replace the hash on every
    platform. The `contains` itself cannot go: it is the COW guard, and catching
    a violation of it in production is the point (DESIGN.md §3).
-4. **CDC capture check on the write path (minor).** With change-capture in the
+5. **CDC capture check on the write path (minor).** With change-capture in the
    engine (mirror foundation), each write txn does one `cdc\0tabs` sys-lookup even
    when no mirror is configured. It is *not* the cause of the run-to-run variance
    above (reads, which skip it, moved identically), but caching the config across
