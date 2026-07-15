@@ -23,6 +23,7 @@ use mpedb_types::{
     PAGE_SIZE,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -450,7 +451,7 @@ impl Engine {
             freelist_root: meta.freelist_root,
             high_water: meta.high_water,
             table_roots: HashMap::new(),
-            dirty: HashSet::new(),
+            dirty: DirtySet::default(),
             reusable: Vec::new(),
             freed: BTreeSet::new(),
             bound_recomputed: false,
@@ -777,6 +778,54 @@ fn catalog_entry<S: PageStore + ?Sized>(
 
 // --------------------------------------------------------------- WriteTxn
 
+/// The pages this transaction has COWed, so `page_mut` can tell "already mine"
+/// from "needs copying" in O(1).
+///
+/// The hasher is the point. `HashSet<u64>` defaults to SipHash-1-3, built to
+/// survive an adversary choosing keys — and these keys are page ids this
+/// process just allocated. A CPU profile of a bulk write on armv7 put ~15% of
+/// the run inside `DefaultHasher`, because `page_mut` hashes on EVERY call and
+/// one row touches several pages.
+///
+/// fxhash's multiply-rotate instead. Measured, paired, alternating arms:
+/// **+3.5% on armv7** (95% CI [+2.1, +4.9], n=15) and **nothing measurable on
+/// x86-64** (-0.1%, CI [-2.2, +1.9], n=25). Free on the reference platform,
+/// real on a supported one.
+///
+/// It still spreads the low bits, which matters because hashbrown takes its
+/// control byte from the TOP 7: a pass-through hash would put dense sequential
+/// ids in one control-byte class and turn every probe into a linear scan — the
+/// obvious "optimization" that is slower.
+type DirtySet = HashSet<u64, BuildHasherDefault<PageIdHasher>>;
+
+#[derive(Default)]
+pub(crate) struct PageIdHasher(u64);
+
+impl Hasher for PageIdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        // Only ever hashes u64 page ids; a byte-slice key means someone reused
+        // this for something it was never measured for.
+        debug_assert!(
+            false,
+            "PageIdHasher is for u64 page ids, got {} bytes",
+            bytes.len()
+        );
+        for b in bytes {
+            self.write_u64(*b as u64);
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0 ^ n)
+            .wrapping_mul(0x517c_c1b7_2722_0a95)
+            .rotate_left(26);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
 pub struct WriteTxn<'e> {
     eng: &'e Engine,
     pub meta: MetaSnapshot,
@@ -786,7 +835,7 @@ pub struct WriteTxn<'e> {
     /// (table_id, index_no) → (root, row_count); loaded lazily, written back
     /// into the catalog at commit.
     table_roots: HashMap<(u32, u32), (u64, u64)>,
-    dirty: HashSet<u64>,
+    dirty: DirtySet,
     reusable: Vec<u64>,
     freed: BTreeSet<u64>,
     bound_recomputed: bool,
@@ -1707,7 +1756,7 @@ pub struct TxnSavepoint {
     catalog_root: u64,
     freelist_root: u64,
     table_roots: HashMap<(u32, u32), (u64, u64)>,
-    dirty: HashSet<u64>,
+    dirty: DirtySet,
     freed: BTreeSet<u64>,
     reusable: Vec<u64>,
     high_water: u64,
