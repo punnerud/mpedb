@@ -40,6 +40,7 @@ usage: mpedb <command> [args]
   dump    <file.mpedb> [--data]             config-free schema/row dump
   bench   <config.toml>|--auto [--secs N] [--durability M] [--disk DIR]
   stress  --dir <dir> --workers N --secs S --mode bank|unique|mixed|incr
+          [--size_mb M]  (default 64; exit 4 = out of space, NOT a correctness failure)
   crash   --dir <dir> --waves W --children C
   collide --dir <dir> [--writers N] [--total T] [--drop-rate R] [--jitter-us J]
           [--keyspace K] [--detached-pct P] [--durability M]  (writer-collision fuzz)
