@@ -197,3 +197,98 @@ al
 # PK columns are implicitly NOT NULL: a NULL PK can never be inserted.
 statement error NULL
 INSERT INTO users (id, email) VALUES (NULL, 'h@x')
+
+# ---- ON CONFLICT on a SECONDARY unique column ---------------------------------------
+# The conflict target may name any key the executor can PROBE: the primary
+# key, or one UNIQUE column. It has to find the row you collided with, and
+# guessing ("you said (email), I will look up the PK anyway") would update a
+# different row and report it as yours.
+#
+# Expected values come from running the same program through sqlite3 3.45.
+
+# `a@x` already belongs to id 1. The proposed id 90 is never inserted — the
+# EXISTING row is updated, which is the whole point of an upsert on a
+# non-PK key.
+statement ok
+INSERT INTO users (id, email, age, nick) VALUES (90, 'a@x', 31, 'zz') ON CONFLICT (email) DO UPDATE SET age = excluded.age
+
+query II nosort
+SELECT id, age FROM users WHERE email = 'a@x'
+----
+1
+31
+
+# The row is still id 1: id 90 did not enter.
+query I nosort
+SELECT count(*) FROM users WHERE id = 90
+----
+0
+
+# A second unique column works the same way, and the SET sees both rows:
+# `users.age` is the existing 1, `excluded.age` the proposed 5.
+statement ok
+INSERT INTO users (id, email, age, nick) VALUES (91, 'q@x', 5, 'bo') ON CONFLICT (nick) DO UPDATE SET age = users.age + excluded.age
+
+query II nosort
+SELECT id, age FROM users WHERE nick = 'bo'
+----
+2
+6
+
+# A WHERE on the update: NULL and FALSE both skip, SQL needs exactly TRUE.
+statement ok
+INSERT INTO users (id, email, age, nick) VALUES (92, 'a@x', 77, 'yy') ON CONFLICT (email) DO UPDATE SET age = excluded.age WHERE users.age > 100
+
+query II nosort
+SELECT id, age FROM users WHERE email = 'a@x'
+----
+1
+31
+
+# No conflict at all: the row just inserts.
+statement ok
+INSERT INTO users (id, email, age, nick) VALUES (10, 'new@x', 20, 'nw') ON CONFLICT (email) DO UPDATE SET age = excluded.age
+
+query ITI nosort
+SELECT id, email, age FROM users WHERE id = 10
+----
+10
+new@x
+20
+
+# RETURNING reports the row that was actually touched — id 2, not the 93 that
+# was proposed and never existed.
+query II nosort
+INSERT INTO users (id, email, age, nick) VALUES (93, 'b@x', 1, 'rr') ON CONFLICT (email) DO UPDATE SET age = 42 RETURNING id, age
+----
+2
+42
+
+# ---- the conflict you named is the only one handled ---------------------------------
+# Target (email), but it is the PK that collides. That is NOT the conflict the
+# statement asked to handle, so it is an error — as in sqlite and PG. Silently
+# upserting the email row would touch a row the caller never mentioned;
+# silently doing nothing would hide a real collision.
+
+statement error PRIMARY KEY
+INSERT INTO users (id, email, age, nick) VALUES (1, 'brand-new@x', 12, NULL) ON CONFLICT (email) DO UPDATE SET age = excluded.age
+
+# Unchanged.
+query I nosort
+SELECT age FROM users WHERE id = 1
+----
+31
+
+# And the mirror case: target (id), but the EMAIL is what collides.
+statement error UNIQUE
+INSERT INTO users (id, email, age, nick) VALUES (77, 'a@x', 12, NULL) ON CONFLICT (id) DO UPDATE SET age = excluded.age
+
+# A target that is neither the PK nor a single UNIQUE column has no key to
+# probe by, and the message says which ones would work.
+statement error must be a key
+INSERT INTO users (id, email, age, nick) VALUES (78, 'p@x', 12, NULL) ON CONFLICT (age) DO UPDATE SET age = excluded.age
+
+# "Unique together" is not something the schema can declare, so a multi-column
+# non-PK target has no index either — even though each column is unique alone.
+statement error must be a key
+INSERT INTO users (id, email, age, nick) VALUES (79, 'r@x', 12, NULL) ON CONFLICT (email, nick) DO UPDATE SET age = excluded.age

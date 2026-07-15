@@ -185,7 +185,7 @@ the design rather than a todo list.
 |---|---|---|
 | `SELECT … WHERE / ORDER BY / LIMIT / OFFSET` | ✅ | |
 | `INSERT` / `UPDATE` / `DELETE` | ✅ | |
-| `ON CONFLICT DO NOTHING / DO UPDATE` + `excluded.` | ✅ | target must be the PK |
+| `ON CONFLICT DO NOTHING / DO UPDATE` + `excluded.` | ✅ | target: the PK, or one UNIQUE column |
 | `RETURNING` | ✅ | on all three verbs |
 | `IN` / `NOT IN`, `BETWEEN`, `CASE`, `LIKE`, `IS [NOT] NULL` | ✅ | full SQL 3VL |
 | `lower upper length trim abs round substr coalesce ifnull nullif` | ✅ | `coalesce` is lazy |

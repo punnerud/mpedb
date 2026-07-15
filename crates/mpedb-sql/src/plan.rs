@@ -224,12 +224,27 @@ pub enum PlanOnConflict {
     DoUpdate {
         /// Table column indices of the conflict target.
         target: Vec<u16>,
+        /// How the executor finds the conflicting row. Carried in the plan
+        /// rather than re-derived at execution: the index numbering lives in
+        /// exactly one place (`secondary_indexes`), and a second derivation is
+        /// how the two come to disagree about which index `email` is.
+        probe: ConflictProbe,
         /// column index -> value expression, evaluated over the EXISTING row
         /// concatenated with the PROPOSED row (`excluded.<c>` = `Col(n + i)`).
         set: Vec<(u16, ExprProgram)>,
         /// Optional `WHERE` on the update, over the same doubled row.
         filter: Option<ExprProgram>,
     },
+}
+
+/// How `ON CONFLICT … DO UPDATE` locates the row it conflicted with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConflictProbe {
+    /// Target is the primary key: `get_by_pk`.
+    Pk,
+    /// Target is one secondary UNIQUE column, probed by its index number
+    /// (1-based over `secondary_indexes`; 0 is the PK tree).
+    Index(u32),
 }
 
 /// Where an inserted column value comes from. `Default` means "use the
@@ -587,7 +602,12 @@ impl CompiledPlan {
                 // only knows about n, hence the dedicated check.
                 match on_conflict {
                     PlanOnConflict::Error | PlanOnConflict::DoNothing => {}
-                    PlanOnConflict::DoUpdate { target, set, filter } => {
+                    PlanOnConflict::DoUpdate {
+                        target,
+                        probe,
+                        set,
+                        filter,
+                    } => {
                         if target.is_empty() {
                             return Err(corrupt("ON CONFLICT DO UPDATE with no target"));
                         }
@@ -595,6 +615,14 @@ impl CompiledPlan {
                             if *c as usize >= t.columns.len() {
                                 return Err(corrupt("conflict-target column out of range"));
                             }
+                        }
+                        // Recompute the probe from the target and demand a
+                        // match. A blob claiming "target (email), probe pk"
+                        // would upsert the WRONG ROW — found by pk, reported as
+                        // if found by email — which is a silent wrong answer,
+                        // not a crash.
+                        if *probe != crate::planner::conflict_probe(t, target) {
+                            return Err(corrupt("conflict probe does not match the target"));
                         }
                         for (c, p) in set {
                             if *c as usize >= t.columns.len() {
@@ -985,9 +1013,21 @@ impl CompiledPlan {
                 match on_conflict {
                     PlanOnConflict::Error => {}
                     PlanOnConflict::DoNothing => out.push_str("  on conflict: do nothing\n"),
-                    PlanOnConflict::DoUpdate { target, set, filter } => {
+                    PlanOnConflict::DoUpdate {
+                        target,
+                        probe,
+                        set,
+                        filter,
+                    } => {
                         let cols: Vec<String> = target.iter().map(|c| name(*c)).collect();
-                        out.push_str(&format!("  on conflict ({}): do update\n", cols.join(", ")));
+                        out.push_str(&format!(
+                            "  on conflict ({}): do update (via {})\n",
+                            cols.join(", "),
+                            match probe {
+                                ConflictProbe::Pk => "pk".to_string(),
+                                ConflictProbe::Index(n) => format!("index {n}"),
+                            }
+                        ));
                         for (c, p) in set {
                             out.push_str(&format!(
                                 "    set {} = {}\n",
@@ -1372,8 +1412,20 @@ fn encode_on_conflict(oc: &PlanOnConflict, buf: &mut Vec<u8>) {
     match oc {
         PlanOnConflict::Error => buf.push(OC_ERROR),
         PlanOnConflict::DoNothing => buf.push(OC_DO_NOTHING),
-        PlanOnConflict::DoUpdate { target, set, filter } => {
+        PlanOnConflict::DoUpdate {
+            target,
+            probe,
+            set,
+            filter,
+        } => {
             buf.push(OC_DO_UPDATE);
+            match probe {
+                ConflictProbe::Pk => buf.push(0),
+                ConflictProbe::Index(n) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&n.to_le_bytes());
+                }
+            }
             w_u16(buf, target.len() as u16);
             for c in target {
                 w_u16(buf, *c);
@@ -1393,6 +1445,11 @@ fn decode_on_conflict(buf: &[u8], pos: &mut usize) -> Result<PlanOnConflict> {
         OC_ERROR => PlanOnConflict::Error,
         OC_DO_NOTHING => PlanOnConflict::DoNothing,
         OC_DO_UPDATE => {
+            let probe = match r_u8(buf, pos)? {
+                0 => ConflictProbe::Pk,
+                1 => ConflictProbe::Index(r_u32(buf, pos)?),
+                t => return Err(corrupt(format!("bad conflict-probe tag {t}"))),
+            };
             let n = r_u16(buf, pos)? as usize;
             if n > crate::parser::MAX_SET_ITEMS {
                 return Err(corrupt("too many conflict-target columns in plan"));
@@ -1411,7 +1468,12 @@ fn decode_on_conflict(buf: &[u8], pos: &mut usize) -> Result<PlanOnConflict> {
                 set.push((c, ExprProgram::decode(buf, pos)?));
             }
             let filter = decode_opt_program(buf, pos)?;
-            PlanOnConflict::DoUpdate { target, set, filter }
+            PlanOnConflict::DoUpdate {
+                target,
+                probe,
+                set,
+                filter,
+            }
         }
         other => return Err(corrupt(format!("bad ON CONFLICT tag {other}"))),
     })
@@ -2126,6 +2188,64 @@ mod tests {
     /// executor trim real output, or to smuggle junk past a DISTINCT where it
     /// would dedup on a value the caller never sees. Decode must refuse all
     /// three shapes.
+    /// A tampered plan claiming "target (email), probe pk" would find a row by
+    /// PRIMARY KEY and update it as if it were the email conflict — the wrong
+    /// row, no error, no crash. Decode recomputes the probe from the target and
+    /// refuses a mismatch.
+    #[test]
+    fn conflict_probe_must_match_its_target() {
+        let s = test_schema();
+        let p = prepare(
+            "INSERT INTO users (id, email) VALUES ($1, $2) \
+             ON CONFLICT (email) DO UPDATE SET email = excluded.email",
+            &s,
+        )
+        .unwrap();
+        match &p.stmt {
+            PlanStmt::Insert {
+                on_conflict: PlanOnConflict::DoUpdate { probe, .. },
+                ..
+            } => assert!(
+                matches!(probe, ConflictProbe::Index(_)),
+                "email is a secondary unique column, got {probe:?}"
+            ),
+            other => panic!("expected an upsert plan, got {other:?}"),
+        }
+
+        let mut evil = p.clone();
+        match &mut evil.stmt {
+            PlanStmt::Insert {
+                on_conflict: PlanOnConflict::DoUpdate { probe, .. },
+                ..
+            } => *probe = ConflictProbe::Pk,
+            _ => unreachable!(),
+        }
+        match CompiledPlan::decode(&evil.encode(), &s) {
+            Err(Error::Corrupt(m)) => assert!(m.contains("probe"), "{m}"),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+
+        // And the reverse: a PK target cannot claim an index probe.
+        let p = prepare(
+            "INSERT INTO users (id, email) VALUES ($1, $2) \
+             ON CONFLICT (id) DO UPDATE SET email = excluded.email",
+            &s,
+        )
+        .unwrap();
+        let mut evil = p.clone();
+        match &mut evil.stmt {
+            PlanStmt::Insert {
+                on_conflict: PlanOnConflict::DoUpdate { probe, .. },
+                ..
+            } => *probe = ConflictProbe::Index(1),
+            _ => unreachable!(),
+        }
+        match CompiledPlan::decode(&evil.encode(), &s) {
+            Err(Error::Corrupt(m)) => assert!(m.contains("probe"), "{m}"),
+            other => panic!("expected Corrupt, got {other:?}"),
+        }
+    }
+
     #[test]
     fn order_junk_count_is_validated() {
         let s = test_schema();

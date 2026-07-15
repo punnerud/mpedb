@@ -5,8 +5,8 @@
 use crate::ExecResult;
 use mpedb_core::{ReadTxn, WriteTxn};
 use mpedb_sql::{
-    AccessPath, AggCall, Aggregation, CompiledPlan, InsertSource, OrderOver, PlanOnConflict,
-    PlanStmt, Projection,
+    AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, OrderOver,
+    PlanOnConflict, PlanStmt, Projection,
 };
 use mpedb_types::{
     keycode, Accum, DefaultExpr, Error, ExprProgram, KeyBound, KeyPart, Result, Schema, TableDef,
@@ -510,16 +510,47 @@ pub(crate) fn exec_stmt(
                         match on_conflict {
                             PlanOnConflict::Error => unreachable!("guarded above"),
                             PlanOnConflict::DoNothing => { /* skip this row */ }
-                            PlanOnConflict::DoUpdate { target, set, filter } => {
-                                let pk: Vec<Value> =
-                                    target.iter().map(|c| row[*c as usize].clone()).collect();
-                                let Some(existing) = ctx.get_by_pk(*table, &pk)? else {
-                                    // The insert failed on uniqueness but the PK
-                                    // is not there: it was a SECONDARY unique
-                                    // constraint. The target named the PK, so
-                                    // this conflict is not the one the caller
-                                    // asked to handle -- report it rather than
-                                    // silently do nothing.
+                            PlanOnConflict::DoUpdate {
+                                target,
+                                probe,
+                                set,
+                                filter,
+                            } => {
+                                // Find the row this collided with, BY THE KEY
+                                // THE CALLER NAMED. Probing by anything else
+                                // would update a row they did not ask about.
+                                let found = match probe {
+                                    ConflictProbe::Pk => {
+                                        let pk: Vec<Value> = target
+                                            .iter()
+                                            .map(|c| row[*c as usize].clone())
+                                            .collect();
+                                        ctx.get_by_pk(*table, &pk)?
+                                    }
+                                    ConflictProbe::Index(ino) => {
+                                        // A single-column target, by
+                                        // construction (see `conflict_probe`).
+                                        let v = &row[target[0] as usize];
+                                        // UNIQUE permits many NULLs, so a NULL
+                                        // here cannot have collided with
+                                        // anything and there is no row to find.
+                                        if v.is_null() {
+                                            None
+                                        } else {
+                                            ctx.get_by_index(*table, *ino, v)?
+                                        }
+                                    }
+                                };
+                                let Some(existing) = found else {
+                                    // The insert failed on SOME uniqueness
+                                    // constraint, but not the one named: a
+                                    // PK-target insert that tripped a secondary
+                                    // UNIQUE, or an email-target insert that
+                                    // tripped the PK. That conflict is not the
+                                    // one the caller asked to handle, so it is
+                                    // an error -- exactly as in PostgreSQL, and
+                                    // the alternative (silently doing nothing)
+                                    // would hide a real collision.
                                     *partial = applied > 0 || !precheck_failure(&e);
                                     return Err(hide_constraint_variant(
                                         e,
