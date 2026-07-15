@@ -274,6 +274,21 @@ SELECT emp.eid FROM emp JOIN emp ON emp.eid = emp.eid
 statement error ON after JOIN
 SELECT emp.eid FROM emp JOIN dept
 
+# An OUTER join keeps rows with no match and NULL-extends them — a different
+# answer, not a slower one. Refused by NAME, because left to the generic path
+# this reads "unexpected trailing input" and tells the reader nothing.
+statement error LEFT JOIN is not supported
+SELECT emp.eid FROM emp LEFT JOIN dept ON emp.did = dept.did
+
+statement error RIGHT JOIN is not supported
+SELECT emp.eid FROM emp RIGHT JOIN dept ON emp.did = dept.did
+
+statement error FULL JOIN is not supported
+SELECT emp.eid FROM emp FULL OUTER JOIN dept ON emp.did = dept.did
+
+statement error CROSS JOIN is not supported
+SELECT emp.eid FROM emp CROSS JOIN dept
+
 # Aggregates over a join are the known gap, and it includes `count(*)`. The
 # grouping step resolves names against ONE table and builds its grouped tuple
 # from that table's columns; over a join the row is `[outer ‖ inner]` and
