@@ -247,15 +247,48 @@ struct ReaderSlot {
 
 ### 4.5 Freelist & page reclamation
 
-- Freelist B+tree keyed by (txn_id that freed the pages) → page-id list. A page freed at
-  `t` is reusable when `t < oldest_pinned` bound (§4.3).
+- Freelist B+tree keyed by (txn_id that freed the pages, chunk#) → page-id list, written
+  strictly ascending. A page freed at `t` is reusable when `t <= oldest_pinned` bound
+  (§4.3). **Not `t <`**: pages freed BY commit `t` are referenced only by snapshots
+  *older* than `t` — commit `t` is what replaced them — so a pin exactly at `t` cannot
+  see them. This document said `<` until 2026-07-15; the code has always said `<=`, and
+  the off-by-one leaks the high-water mark without bound. There is a regression test.
+- **Refill is READ-ONLY.** A writer draws an entry's pages into its private `reusable`
+  pool and **leaves the entry in the tree**, remembering the provenance (`taken`). It
+  never deletes on the way in. Drawing is therefore free: an entry the writer allocates
+  nothing out of is left untouched at commit.
+  Consequences, all load-bearing:
+  - **Drawing is decoupled from writing.** When refill removed the entry, every page
+    drawn became a page the commit fixpoint had to write back (it records what is free,
+    and a drawn page was then listed nowhere else). That coupled the fixpoint's own page
+    appetite to the pool it held — feeding it made it hungrier. Two independent attempts
+    to fix the resulting leak by handing the writer more pages BOTH made it strictly
+    worse; see `mpedb-core/tests/high_water_leak.rs`.
+  - **A writer may hold a deep pool** (`FREELIST_POOL_TARGET`) precisely so the fixpoint,
+    which cannot refill, does not fall through to `high_water`.
+  - An uncommitted writer's draw is invisible: the entry still lists the pages, so a
+    SIGKILL mid-txn loses nothing and needs no undo.
+  - Writers are serialized by the writer lock, so no second writer can draw the same
+    entry concurrently. **This is why refill must stay under the lock.**
 - **Commit-time fixpoint** (the freelist update itself frees and allocates pages —
-  LMDB's classic circularity): the writer iterates
-  { delete consumed entries, upsert this commit's freed-set } against its dirty tree
-  until the freed/allocated sets stabilize. Termination: each iteration can only add
-  pages freed by COWing the ≤ height-bounded freelist path itself, the sets grow
-  monotonically, and allocation switches to `high_water` (which frees nothing) once the
-  reclaimable list is consumed — so the loop is bounded by O(tree height) iterations.
+  LMDB's classic circularity). Each pass computes the desired state and applies only the
+  diff against the previous pass:
+  - each drawn entry, minus the pages consumed out of it (deleted if drawn dry, omitted
+    entirely — not rewritten — if nothing was consumed);
+  - this commit's own free set under its txn id: pages COWed away, plus any page left in
+    `reusable` that no drawn entry lists (allocated from `high_water` or out of an entry
+    since drawn dry, then freed again — nothing else records it).
+  ⚠ Once a pass has written a drawn entry it must stay in the plan even if a later pass
+  frees every page back and it looks untouched again — otherwise the reconcile pass sees
+  a key it wrote that the plan no longer claims and deletes it, with its pages listed
+  nowhere. The page-accounting verifier catches this as `page N leaked`.
+- **Termination**: each pass can only add pages freed by COWing the ≤ height-bounded
+  freelist path itself, the sets grow monotonically, and allocation switches to
+  `high_water` (which frees nothing) once the reclaimable pool is consumed — so the loop
+  is bounded by O(tree height) passes. **The `high_water` fallback IS the termination
+  argument**, which is why refill must stay blocked during the fixpoint (`in_freelist_op`)
+  even though it is now read-only: a refill inside the loop would let the pool grow on
+  the fly, and the "monotone, bounded" argument no longer closes.
 - **Page accounting invariant** (tested by the crash suite): pages reachable from the
   committed meta ⊎ pages listed in the freelist ⊎ [high_water, page_count) partition the
   data region after every commit.

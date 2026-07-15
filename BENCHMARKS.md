@@ -582,28 +582,25 @@ merely noisy.
    (DESIGN.md §5), so it needs the design-review treatment, not a quick edit.
    Linux is unaffected (its `msync(MS_SYNC)` already runs `vfs_fsync`).
 
-1. **UNBOUNDED HIGH-WATER GROWTH under sustained concurrent churn.** The top
-   genuine bug in the engine, and the one that will bite a real deployment: a
-   1000-key table holding ~30 KB of live rows fills any file, given four or more
-   concurrent writers doing insert/update/delete. Doubling the file exactly
-   doubles the survivable time — 64 MB dies at 10 s, 128 MB at 20 s, 256 MB at
-   40 s — so it is linear growth, not sizing. One writer survives 20 s where
-   four die in 10; the threshold is the box's core count. Reproduce with
-   `mpedb stress --workers 8 --secs 10 --mode mixed`; instrument with
-   `cargo build --release -p mpedb --features leakstat --example leak_probe`.
-   **Measured, not guessed:** every page ever allocated is sitting in the
-   freelist (16,146 of high_water 16,294), every entry is fresh, and reclamation
-   is never gated (`refill_not_yet` fires twice in 199k commits). Nothing is lost
-   and nothing is stuck — the pool just grows, and 75% of the high-water bumps
-   happen inside the commit fixpoint, where `in_freelist_op` disables refill by
-   design. **Six hypotheses are dead**, including the two most obvious ones: the
-   oldest-pinned bound is innocent (recomputing it eagerly fixes a real staleness
-   defect, lag 933→0, and does not touch the leak), and *reserving* pages ahead of
-   the fixpoint makes the leak 2.4× worse by starving the shared freelist. All
-   five, with numbers, in
+1. ~~**UNBOUNDED HIGH-WATER GROWTH under sustained concurrent churn.**~~ **Fixed
+   2026-07-15.** A 1000-key table holding ~30 KB of live rows used to fill any
+   file given four or more concurrent writers doing insert/update/delete — 64 MB
+   died at 10 s, 128 MB at 20 s, 256 MB at 40 s, so it was linear growth, not
+   sizing. Now: **8 writers, 64 MB, 60 s, 4.9M ops, `verify: ok`**, where that
+   scaling law would have demanded ~384 MB.
+
+   `refill_reusable` used to delete the freelist entry it drew pages from, which
+   made every drawn page a page the commit fixpoint had to write back — coupling
+   the fixpoint's own page appetite to the pool it held. It cannot refill (it is
+   mutating the tree refill reads), so it minted a high-water page whenever the
+   pool ran dry: ~1 per 43 commits, forever, and pool size could not help because
+   refill handed over one entry no matter how many existed. Refill is now
+   read-only: draw the pages, leave the entry, let the fixpoint strike out only
+   what got consumed. Cost: a measured **-7.05% [-8.71, -5.40], n=20 pairs** on
+   the write path, which is a good trade for an unbounded leak. Six wrong answers
+   — including two "obvious" fixes that made it 2.4× worse — are recorded in
    [`crates/mpedb-core/tests/high_water_leak.rs`](crates/mpedb-core/tests/high_water_leak.rs).
-   This is reviewed MVCC/freelist code (DESIGN.md §5) and wants the
-   design-review treatment.
+
 2. **`newest_meta` stale-gate race (durability=commit).** A reader that loads the
    `durable_txn` gate, then is descheduled while two durable commits land, gets a
    spurious `Corrupt("no valid meta page")` — both meta slots are newer than its

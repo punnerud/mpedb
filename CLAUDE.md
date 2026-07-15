@@ -53,6 +53,15 @@ every protocol there survived a 37-finding adversarial review, and the ordering 
   the commit fixpoint depends on rewrites not changing tree topology.
 - Pages freed by commit T are reusable when T ≤ oldest-pinned bound (NOT strict < — the
   off-by-one causes an unbounded high-water leak; there is a regression test).
+- **`refill_reusable` is READ-ONLY**: it draws an entry's pages into the writer's pool
+  and LEAVES the entry (tracked in `taken`); the commit fixpoint strikes out only what
+  was consumed, and never rewrites an entry nothing was allocated out of. Deleting on
+  the way in is what made every drawn page a page the fixpoint had to write back —
+  coupling its appetite to the pool and leaking high-water forever (DESIGN.md §4.5).
+  Freelist values are strictly ascending and binary-searched; `reusable` is kept sorted.
+- The fixpoint's fallback to `high_water` **is** its termination argument (§4.5) — it
+  frees nothing, so the sets stop growing. That is why `in_freelist_op` must keep
+  blocking refill even though refill no longer mutates.
 - The reader-pin protocol and writer scan pair SeqCst fences; weakening them reintroduces
   a store-buffering race (DESIGN.md §4.3).
 - Intent-ring posting is incarnation-safe ONLY because: posts happen under the writer

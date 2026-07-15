@@ -137,6 +137,13 @@ fn cat_tree_key(table_id: u32, index_no: u32) -> Vec<u8> {
 /// (DESIGN.md §4.5) converge.
 const FREELIST_CHUNK_PAGES: usize = 120; // 960-byte values
 
+/// How deep a page pool a writer draws before allocating, and how many freelist
+/// entries it may draw from to get there (#37). Drawing is read-only and an
+/// undrawn-down entry costs nothing at commit, so the pool exists purely to
+/// keep the commit fixpoint — which cannot refill — off the high-water mark.
+const FREELIST_POOL_TARGET: usize = 32;
+const FREELIST_POOL_DRAWS: u32 = 4;
+
 /// `((txn_id, high_water, bound), [(freed_txn, n_pages)] oldest first)` —
 /// see [`Engine::freelist_shape`].
 pub type FreelistShape = ((u64, u64, u64), Vec<(u64, usize)>);
@@ -557,6 +564,8 @@ impl Engine {
             dirty: DirtySet::default(),
             reusable: Vec::new(),
             freed: BTreeSet::new(),
+            taken: Vec::new(),
+            refill_cursor: None,
             bound_recomputed: false,
             in_freelist_op: false,
             recovered,
@@ -939,7 +948,18 @@ pub struct WriteTxn<'e> {
     /// into the catalog at commit.
     table_roots: HashMap<(u32, u32), (u64, u64)>,
     dirty: DirtySet,
+    /// Pages this txn may allocate. They are **still listed in the freelist**:
+    /// `refill_reusable` reads entries, it does not remove them (DESIGN.md
+    /// §4.5). `taken` remembers where each came from so the commit fixpoint can
+    /// strike out exactly the ones that got consumed.
     reusable: Vec<u64>,
+    /// Freelist entries drawn from, in draw order. Drawing is FREE — an entry
+    /// nobody allocated out of is left untouched at commit. Only consumption
+    /// costs a write. That decoupling is the fix for #37.
+    taken: Vec<TakenEntry>,
+    /// Last key `refill_reusable` drew from; the next draw starts strictly
+    /// after it, so an entry is never drawn twice (it is still in the tree).
+    refill_cursor: Option<Vec<u8>>,
     freed: BTreeSet<u64>,
     bound_recomputed: bool,
     /// True while a mutation of the freelist tree itself is in progress.
@@ -1008,8 +1028,13 @@ impl PageStore for WriteTxn<'_> {
 
     fn free(&mut self, id: u64) -> Result<()> {
         if self.dirty.remove(&id) {
-            // allocated this txn: immediately reusable, invisible to readers
-            self.reusable.push(id);
+            // allocated this txn: immediately reusable, invisible to readers.
+            // Sorted insert — `reusable` is kept ordered so `freelist_plan` can
+            // test membership by binary search instead of building a HashSet
+            // per fixpoint pass (#37: that set was 14% of the write path).
+            if let Err(at) = self.reusable.binary_search(&id) {
+                self.reusable.insert(at, id);
+            }
             return Ok(());
         }
         if !self.freed.insert(id) {
@@ -1027,11 +1052,23 @@ impl WriteTxn<'_> {
     /// Pick the next page id (freelist-reuse first, then high-water), without
     /// touching its contents. Shared by `alloc` and `alloc_raw`.
     fn alloc_id(&mut self) -> Result<u64> {
-        // Never re-enter the freelist tree while it is being mutated; fall
-        // back to the high-water mark instead (a few pages of slack, never
-        // corruption).
+        // Draw a POOL, not one page's worth. Drawing is read-only and costs
+        // nothing at commit unless the pages get consumed (see `taken`), so a
+        // deep pool is free — and it is what keeps the fixpoint below from
+        // running dry and minting high-water pages (#37).
+        //
+        // Still not during a freelist op: refill reads the tree with a cursor,
+        // and mid-`btree::insert` `freelist_root` still points at the old,
+        // intact tree — consistent to read, but the entry it would draw from
+        // may be one the in-progress mutation is about to rewrite.
         if self.reusable.is_empty() && !self.in_freelist_op {
-            self.refill_reusable()?;
+            // Only when DRY: `alloc_id` runs several times per txn, and topping
+            // the pool up on each one would cost a tree descent per allocation.
+            for _ in 0..FREELIST_POOL_DRAWS {
+                if self.reusable.len() >= FREELIST_POOL_TARGET || !self.refill_reusable()? {
+                    break;
+                }
+            }
         }
         let id = match self.reusable.pop() {
             Some(id) => {
@@ -1080,17 +1117,91 @@ impl<'e> WriteTxn<'e> {
     /// ⚠ There is a *different* unbounded-high-water bug reachable from here
     /// under sustained concurrent churn; see
     /// `tests/high_water_leak.rs`.
-    fn refill_reusable(&mut self) -> Result<()> {
+    /// What this commit's freelist writes should be: `(key, ids)` per entry,
+    /// where an EMPTY id list means "delete this key". Keys absent from the
+    /// result are to be left exactly as they are.
+    ///
+    /// Two sources:
+    ///
+    /// 1. Every entry `refill_reusable` drew from, minus the pages that got
+    ///    consumed. An entry nothing was allocated out of is **omitted** — it
+    ///    still holds precisely what it held, so writing it would be pure churn.
+    ///    That omission is what makes drawing a deep pool free, and it is the
+    ///    whole fix for #37.
+    /// 2. This txn's own free set, under `new_txn`: pages COWed away, plus any
+    ///    page left in `reusable` that no drawn entry lists (this txn allocated
+    ///    it from the high-water mark, or out of an entry it then drew dry, and
+    ///    freed it again — nothing else records it, so omitting it would leak
+    ///    it outright).
+    fn freelist_plan(&self, new_txn: u64, written: &[(Vec<u8>, Vec<u64>)]) -> Vec<(Vec<u8>, Vec<u64>)> {
+        // `reusable` is sorted (see `free`/`refill_reusable`), so "is this page
+        // still free?" is a binary search — no per-pass set to build.
+        let mut out: Vec<(Vec<u8>, Vec<u64>)> = Vec::new();
+        for e in &self.taken {
+            let kept: Vec<u64> = e
+                .ids
+                .iter()
+                .copied()
+                .filter(|id| self.reusable.binary_search(id).is_ok())
+                .collect();
+            // Once a pass has rewritten an entry it must stay in the plan
+            // FOREVER, even if a later pass frees every page back and it looks
+            // untouched again. Dropping it here would make the reconcile pass
+            // below see a key in `written` that the plan no longer claims, and
+            // delete it — with its pages listed nowhere. The page-accounting
+            // verifier catches that as "page N leaked: neither reachable nor
+            // freelisted", which is exactly how this was found.
+            if kept.len() != e.ids.len() || written.iter().any(|(k, _)| *k == e.key) {
+                out.push((e.key.clone(), kept)); // shrunk, or emptied = delete
+            }
+        }
+        // A reusable page that some drawn entry still lists is accounted for by
+        // that entry; everything else in the pool is this txn's own.
+        let mut own: Vec<u64> = self.freed.iter().copied().collect();
+        own.extend(self.reusable.iter().copied().filter(|id| {
+            !self
+                .taken
+                .iter()
+                .any(|e| e.ids.binary_search(id).is_ok())
+        }));
+        own.sort_unstable();
+        own.dedup();
+        for (i, chunk) in own.chunks(FREELIST_CHUNK_PAGES).enumerate() {
+            out.push((freelist_key(new_txn, i as u16).to_vec(), chunk.to_vec()));
+        }
+        out
+    }
+
+    /// Draw one freelist entry's pages into `reusable` — **without removing the
+    /// entry**. Returns whether an entry was drawn.
+    ///
+    /// Read-only, and that is the whole point (DESIGN.md §4.5). It used to
+    /// `btree::delete` the entry, which made every page drawn a page the commit
+    /// fixpoint had to write back (it records what is free, and a drawn page is
+    /// listed nowhere else). That coupled the fixpoint's own page appetite to
+    /// the pool it was handed: feeding it made it hungrier, which is why two
+    /// separate attempts to feed it made #37 strictly worse. Leaving the entry
+    /// in place decouples them — an entry nobody allocates out of costs nothing
+    /// at commit.
+    fn refill_reusable(&mut self) -> Result<bool> {
         debug_assert!(!self.in_freelist_op, "refill re-entered a freelist op");
         leakstat::bump(&leakstat::REFILL_CALLS);
         if self.freelist_root == 0 {
             leakstat::bump(&leakstat::REFILL_NO_TREE);
-            return Ok(());
+            return Ok(false);
         }
-        let mut c = btree::cursor(self, self.freelist_root, None, None)?;
+        // Start strictly after the last entry drawn: it is still in the tree,
+        // so an inclusive scan would hand out its pages a second time.
+        let lo = self.refill_cursor.clone();
+        let mut c = btree::cursor(
+            self,
+            self.freelist_root,
+            lo.as_ref().map(|k| (k.as_slice(), false)),
+            None,
+        )?;
         let Some((key, val)) = c.next(self)? else {
             leakstat::bump(&leakstat::REFILL_NO_TREE);
-            return Ok(());
+            return Ok(false);
         };
         if key.len() != 10 || val.len() % 8 != 0 {
             return Err(Error::Corrupt("bad freelist entry".into()));
@@ -1098,7 +1209,11 @@ impl<'e> WriteTxn<'e> {
         let freed_txn = u64::from_be_bytes(key[..8].try_into().unwrap());
         // Pages freed BY commit T are referenced only by snapshots < T (commit
         // T is what replaced them), so they are reusable iff T <= oldest pin.
-        let mut bound = self.eng.shm.oldest_pinned_cache().load(std::sync::atomic::Ordering::Acquire);
+        let mut bound = self
+            .eng
+            .shm
+            .oldest_pinned_cache()
+            .load(std::sync::atomic::Ordering::Acquire);
         if freed_txn > bound && !self.bound_recomputed {
             // the cached bound is stale-conservative; recompute once per txn
             self.bound_recomputed = true;
@@ -1106,15 +1221,15 @@ impl<'e> WriteTxn<'e> {
             bound = self.eng.shm.compute_oldest_pinned(self.meta.txn_id);
         }
         if freed_txn > bound {
+            // Entries are keyed by freeing txn, so this one is the oldest
+            // drawable and nothing behind it can be older. Stop.
             leakstat::bump(&leakstat::REFILL_NOT_YET);
-            return Ok(()); // nothing reclaimable yet
+            return Ok(false);
         }
-        leakstat::bump(&leakstat::REFILL_OK);
-        leakstat::add(&leakstat::REFILL_PAGES, (val.len() / 8) as u64);
-        // Take the pages first so the entry deletion below can allocate
-        // from them without recursing into refill. Validate every id: corrupt
-        // freelist bytes must never let alloc zero-fill meta/lock/reader
-        // pages (page_mut_unchecked only bounds-checks the upper end).
+        // Validate every id: corrupt freelist bytes must never let alloc
+        // zero-fill meta/lock/reader pages (page_mut_unchecked only
+        // bounds-checks the upper end).
+        let mut ids = Vec::with_capacity(val.len() / 8);
         for chunk in val.chunks_exact(8) {
             let id = u64::from_le_bytes(chunk.try_into().unwrap());
             if id < self.eng.shm.data_start || id >= self.eng.shm.page_count {
@@ -1122,13 +1237,25 @@ impl<'e> WriteTxn<'e> {
                     "freelist lists page {id} outside the data region"
                 )));
             }
-            self.reusable.push(id);
+            // Entries are written sorted, and `freelist_plan` binary-searches
+            // them. Enforce it rather than assume it: an unsorted value would
+            // silently mis-answer "is this page still listed here?", which
+            // double-allocates or leaks instead of failing.
+            if ids.last().is_some_and(|&prev| prev >= id) {
+                return Err(Error::Corrupt(
+                    "freelist entry is not strictly ascending".into(),
+                ));
+            }
+            ids.push(id);
         }
-        self.in_freelist_op = true;
-        let res = btree::delete(self, self.freelist_root, &key);
-        self.in_freelist_op = false;
-        self.freelist_root = res?.new_root;
-        Ok(())
+        leakstat::bump(&leakstat::REFILL_OK);
+        leakstat::add(&leakstat::REFILL_PAGES, ids.len() as u64);
+        let key = key.to_vec();
+        self.reusable.extend(ids.iter().copied());
+        self.reusable.sort_unstable();
+        self.taken.push(TakenEntry { key: key.clone(), ids });
+        self.refill_cursor = Some(key);
+        Ok(true)
     }
 
     fn tree_root(&mut self, table_id: u32, index_no: u32) -> Result<(u64, u64)> {
@@ -1634,6 +1761,8 @@ impl<'e> WriteTxn<'e> {
             dirty: self.dirty.clone(),
             freed: self.freed.clone(),
             reusable: self.reusable.clone(),
+            taken: self.taken.clone(),
+            refill_cursor: self.refill_cursor.clone(),
             high_water: self.high_water,
         }
     }
@@ -1660,6 +1789,8 @@ impl<'e> WriteTxn<'e> {
         self.dirty = sp.dirty;
         self.freed = sp.freed;
         self.reusable = sp.reusable;
+        self.taken = sp.taken;
+        self.refill_cursor = sp.refill_cursor;
         for id in sp.high_water..self.high_water {
             self.reusable.push(id);
         }
@@ -1697,16 +1828,30 @@ impl<'e> WriteTxn<'e> {
             self.catalog_root = out.new_root;
         }
 
-        // 2. freelist fixpoint (DESIGN.md §4.5): record freed ∪ leftover
-        // reusable pages under this commit's txn id. The upsert itself may
-        // consume reusable pages (COW/splits) or free old freelist nodes, so
-        // iterate until the recorded set equals the final state. Chunked
-        // inline values keep each iteration from changing tree topology,
-        // which bounds the loop (see FREELIST_CHUNK_PAGES).
-        let mut written_chunks: u16 = 0;
+        // 2. freelist fixpoint (DESIGN.md §4.5). Two things get written:
+        //
+        //   - each drawn entry, minus whatever we consumed out of it (deleted
+        //     if we consumed all of it, left completely alone if we consumed
+        //     none — the common case, and the reason drawing is free);
+        //   - this commit's own free set, under this commit's txn id.
+        //
+        // "Own free set" = pages COWed away, plus any page still sitting in
+        // `reusable` that no drawn entry lists. Those are pages this txn
+        // allocated (from the high-water mark, or from an entry it then fully
+        // consumed) and freed again; nothing else records them, so dropping
+        // them here would leak them outright.
+        //
+        // The circularity is LMDB's: these writes themselves allocate and free
+        // pages, changing what should have been written. So iterate to a
+        // fixpoint. Termination (unchanged by the read-only refill, which frees
+        // nothing): each pass can only add pages freed by COWing the
+        // height-bounded freelist path, the sets grow monotonically, and once
+        // `reusable` is consumed allocation falls back to `high_water`, which
+        // frees nothing — so the loop is bounded by O(tree height).
+        let mut written: Vec<(Vec<u8>, Vec<u64>)> = Vec::new();
         let mut iterations = 0;
         // The whole fixpoint mutates the freelist tree: block refill so no
-        // btree::delete can interleave with the upserts below (see
+        // cursor read can draw from an entry these writes are rewriting (see
         // `in_freelist_op`). Allocations fall back to reusable/high-water.
         self.in_freelist_op = true;
         leakstat::add(&leakstat::COMMIT_FREED, self.freed.len() as u64);
@@ -1717,41 +1862,44 @@ impl<'e> WriteTxn<'e> {
             if iterations > 64 {
                 return Err(Error::Internal("freelist fixpoint did not converge".into()));
             }
-            let mut candidate: Vec<u64> = self.freed.iter().copied().collect();
-            candidate.extend(self.reusable.iter().copied());
-            candidate.sort_unstable();
-            let n_chunks = candidate.len().div_ceil(FREELIST_CHUNK_PAGES) as u16;
-            for (i, chunk) in candidate.chunks(FREELIST_CHUNK_PAGES).enumerate() {
-                let mut val = Vec::with_capacity(chunk.len() * 8);
-                for &id in chunk {
-                    val.extend_from_slice(&id.to_le_bytes());
-                }
-                let fl_root = self.freelist_root;
-                let out = btree::insert(
-                    &mut self,
-                    fl_root,
-                    &freelist_key(new_txn, i as u16),
-                    &val,
-                    InsertMode::Upsert,
-                )?;
-                self.freelist_root = out.new_root;
-            }
-            // drop chunks left over from a larger earlier iteration
-            for c in n_chunks..written_chunks {
-                let fl_root = self.freelist_root;
-                let out = btree::delete(&mut self, fl_root, &freelist_key(new_txn, c))?;
-                self.freelist_root = out.new_root;
-            }
-            written_chunks = n_chunks;
-            leakstat::add(&leakstat::COMMIT_ENTRIES, n_chunks as u64);
-            leakstat::add(&leakstat::COMMIT_PAGES, candidate.len() as u64);
-            let mut now: Vec<u64> = self.freed.iter().copied().collect();
-            now.extend(self.reusable.iter().copied());
-            now.sort_unstable();
-            if now == candidate {
+            let plan = self.freelist_plan(new_txn, &written);
+            if plan == written {
                 break;
             }
+            // Apply the DIFF against the previous pass: a key whose value did
+            // not move must not be rewritten, or its COW would dirty the tree
+            // again every pass and the loop would never settle.
+            for (k, _) in &written {
+                if !plan.iter().any(|(pk, _)| pk == k) {
+                    let fl_root = self.freelist_root;
+                    let out = btree::delete(&mut self, fl_root, k)?;
+                    self.freelist_root = out.new_root;
+                }
+            }
+            for (k, ids) in &plan {
+                if written.iter().any(|(wk, wv)| wk == k && wv == ids) {
+                    continue;
+                }
+                let fl_root = self.freelist_root;
+                self.freelist_root = if ids.is_empty() {
+                    // drawn dry — the entry goes away
+                    btree::delete(&mut self, fl_root, k)?.new_root
+                } else {
+                    let mut val = Vec::with_capacity(ids.len() * 8);
+                    for &id in ids {
+                        val.extend_from_slice(&id.to_le_bytes());
+                    }
+                    btree::insert(&mut self, fl_root, k, &val, InsertMode::Upsert)?.new_root
+                };
+            }
+            leakstat::add(&leakstat::COMMIT_ENTRIES, plan.len() as u64);
+            leakstat::add(
+                &leakstat::COMMIT_PAGES,
+                plan.iter().map(|(_, v)| v.len() as u64).sum::<u64>(),
+            );
+            written = plan;
         }
+        self.taken.clear();
         self.in_freelist_op = false;
 
         // 3. durability: data must be durable before the meta references it
@@ -1889,7 +2037,18 @@ pub struct TxnSavepoint {
     dirty: DirtySet,
     freed: BTreeSet<u64>,
     reusable: Vec<u64>,
+    taken: Vec<TakenEntry>,
+    refill_cursor: Option<Vec<u8>>,
     high_water: u64,
+}
+
+/// One freelist entry `refill_reusable` drew pages from. The entry is still in
+/// the tree with `ids` still listed; the commit fixpoint rewrites it with
+/// whatever is left unconsumed (or deletes it if nothing is).
+#[derive(Clone)]
+struct TakenEntry {
+    key: Vec<u8>,
+    ids: Vec<u64>,
 }
 
 fn table_column_name(eng: &Engine, table_id: u32, col: u16) -> String {
