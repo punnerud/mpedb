@@ -100,10 +100,10 @@ is locked".
 
   | writer processes | mpedb | sqlite3 (WAL, 60 s busy_timeout) | |
   |--:|--:|--:|--:|
-  | 1 | 298,874/s | 90,195/s | 3.3× |
-  | 2 | 160,098/s | 86,171/s | 1.9× |
-  | 4 | 253,733/s | 80,126/s | 3.2× |
-  | 8 | 274,023/s | 81,363/s | 3.4× |
+  | 1 | 302,284/s | 89,702/s | 3.4× |
+  | 2 | 186,479/s | 88,551/s | 2.1× |
+  | 4 | 250,992/s | 83,300/s | 3.0× |
+  | 8 | 270,822/s | 78,877/s | 3.4× |
 
   Honest counterpart: with *durability on* concurrent writing is mpedb's
   **worst** cell — a tie with sqlite3 and **8× behind PostgreSQL**, because group
