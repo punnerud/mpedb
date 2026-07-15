@@ -12,11 +12,53 @@
 //!
 //! Also **scan MB/s** — reading it all back, the shape analytics actually hits.
 //!
+//! # Where the bulk write actually spends its time
+//!
+//! Measured 2026-07-15 with `examples/bulk_only.rs`, which does ONLY the blob
+//! write so a trace attributes to it and not to the point-op suite that shares
+//! the `--io` run. Linux, tmpfs, `durability = "none"`, 128 MiB logical:
+//!
+//! **1. It is not I/O.** `strace -c` over the whole write: 14 `write`, 5
+//! `getpid`, and nothing else of substance — the syscall time is close/munmap
+//! at teardown. Every microsecond is user-space. That rules out the entire
+//! class of "it is the msync/write pattern" explanations at a stroke.
+//!
+//! **2. It is per-ROW, not per-byte.** The same 128 MiB, at different value
+//! sizes:
+//!
+//! ```text
+//!      64 B (2097152 rows):  50 MiB/s   = 1.22 µs/row
+//!     256 B ( 524288 rows): 133 MiB/s   = 1.84 µs/row
+//!    4096 B (  32768 rows): 349 MiB/s   = 11.2 µs/row
+//!   65536 B (   2048 rows): 726 MiB/s   = 86.1 µs/row
+//! ```
+//!
+//! 64 B and 256 B cost nearly the same PER ROW despite 4× the bytes: there is
+//! a fixed ~1 µs per row that the payload does not touch. Copies would show as
+//! a flat MiB/s; instead it climbs 14×.
+//!
+//! **3. Most of that fixed cost is the ENGINE, not SQL.** `bulk_only … raw`
+//! bypasses the SQL layer (no plan lookup, no param validation, no expression
+//! IR) for the engine's typed row API:
+//!
+//! ```text
+//!     64 B: sql  48 vs raw  62 MiB/s   — SQL is 23% of the rate
+//!    256 B: sql 131 vs raw 160 MiB/s   — 18%
+//!   4096 B: sql 341 vs raw 378 MiB/s   — 10%
+//! ```
+//!
+//! So ~1 µs/row remains with SQL removed entirely: btree descent, COW page
+//! allocation, freelist, dirty set. **That is the target.** Fewer rows or
+//! cheaper rows — not fewer copies.
+//!
+//! (Caveat: a shared dev box, not an isolated bench. The syscall COUNTS are
+//! exact regardless, and a 14× spread across the size sweep is far outside
+//! noise. Absolute MiB/s here is not comparable to `RESULTS-*.md`.)
+//!
 //! # Dead ends, measured — do not re-run these
 //!
-//! mpedb's bulk write sits well under sqlite's on Linux (602 vs 998 MiB/s at
-//! the time of writing). Two obvious explanations were proposed and are both
-//! **measurably too small to matter**, at the 4 KiB payload this module uses:
+//! Two explanations were proposed in the task and are both **measurably too
+//! small to matter** at the 4 KiB payload this module uses:
 //!
 //! - **The API-forced clone.** sqlite's `execute` binds `&buf` (a borrow);
 //!   mpedb's `Value::Blob` owns its bytes, so the harness clones per row — and
@@ -27,14 +69,11 @@
 //! - **`dirty.insert(id)` per touched page.** A `HashSet<u64>` insert, ~2–3 per
 //!   4 KiB row: ~1%.
 //!
-//! So the gap is somewhere else, and finding it needs a profiler on an idle
-//! machine rather than another hypothesis. Two earlier guesses also died on
-//! contact with measurement — an "overflow-page cliff" (4080 B = 619.8 MiB/s vs
-//! 4096 B = 614.9: 0.8% apart, so the cost is copies and not amplification) and
-//! an msync-granularity theory on macOS (`F_FULLFSYNC` is per-FD, not
-//! per-range). The next candidate worth testing is the COW discipline itself:
-//! every page touched is copied, which sqlite's in-place-plus-journal does not
-//! do — that may simply be what this design costs.
+//! Two earlier guesses died the same way: an "overflow-page cliff" (4080 B =
+//! 619.8 MiB/s vs 4096 B = 614.9 — 0.8% apart) and an msync-granularity theory
+//! on macOS (`F_FULLFSYNC` is per-FD, not per-range). Four hypotheses, four
+//! measurements, four corpses. The size sweep above is what a measurement
+//! looks like when it actually says something.
 //!
 //! NOT measured here: write amplification. The obvious proxy — physical file
 //! bytes per logical byte — is meaningless for mpedb, whose file is preallocated
