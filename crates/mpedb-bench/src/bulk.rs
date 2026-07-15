@@ -12,6 +12,30 @@
 //!
 //! Also **scan MB/s** — reading it all back, the shape analytics actually hits.
 //!
+//! # Dead ends, measured — do not re-run these
+//!
+//! mpedb's bulk write sits well under sqlite's on Linux (602 vs 998 MiB/s at
+//! the time of writing). Two obvious explanations were proposed and are both
+//! **measurably too small to matter**, at the 4 KiB payload this module uses:
+//!
+//! - **The API-forced clone.** sqlite's `execute` binds `&buf` (a borrow);
+//!   mpedb's `Value::Blob` owns its bytes, so the harness clones per row — and
+//!   so would a real caller. That is a genuine API cost, not a harness artifact.
+//!   It is also **~2%**: a 4 KiB `Vec<u8>` clone measures ~119 ns (≈33 GiB/s)
+//!   against a ~6.5 µs/row budget at 602 MiB/s. (Measure it with `black_box` on
+//!   both sides or the optimizer deletes the loop and reports terabytes/s.)
+//! - **`dirty.insert(id)` per touched page.** A `HashSet<u64>` insert, ~2–3 per
+//!   4 KiB row: ~1%.
+//!
+//! So the gap is somewhere else, and finding it needs a profiler on an idle
+//! machine rather than another hypothesis. Two earlier guesses also died on
+//! contact with measurement — an "overflow-page cliff" (4080 B = 619.8 MiB/s vs
+//! 4096 B = 614.9: 0.8% apart, so the cost is copies and not amplification) and
+//! an msync-granularity theory on macOS (`F_FULLFSYNC` is per-FD, not
+//! per-range). The next candidate worth testing is the COW discipline itself:
+//! every page touched is copied, which sqlite's in-place-plus-journal does not
+//! do — that may simply be what this design costs.
+//!
 //! NOT measured here: write amplification. The obvious proxy — physical file
 //! bytes per logical byte — is meaningless for mpedb, whose file is preallocated
 //! to a fixed `size_mb` and never grows, so the ratio would report our own
