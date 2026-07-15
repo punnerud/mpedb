@@ -634,6 +634,338 @@ impl PySession {
 
 // -------------------------------------------------------------------- module
 
+// ---------------------------------------------------------------- DB-API 2.0
+//
+// PEP 249, so `sqlite3`-shaped code runs unchanged: connect / cursor /
+// execute / fetchall, `?` placeholders, `description`, `rowcount`.
+//
+// What it does NOT pretend: mpedb has no `CREATE TABLE`, so a program that
+// runs DDL fails here, loudly. The schema comes from the config file or from
+// `mirror import`. Saying "sqlite3-compatible" and letting `CREATE TABLE`
+// blow up at run time would be worse than saying so.
+
+/// A DB-API 2.0 connection: a [`PyDatabase`] plus the transaction state PEP
+/// 249 requires (it has no autocommit — a connection is always in one).
+#[pyclass(name = "Connection", module = "mpedb")]
+struct PyConnection {
+    db: Arc<Db>,
+    /// The open transaction, if anything has been written since the last
+    /// commit/rollback. PEP 249 says a connection is always in a transaction;
+    /// mpedb's writer lock is exclusive, so one is only TAKEN once there is
+    /// something to write — otherwise a read-only connection would block every
+    /// writer for as long as it stayed open.
+    txn: Option<Session>,
+    closed: bool,
+}
+
+/// The lazily-opened write session backing a `Connection`.
+struct Session {
+    /// Statements buffered since the last commit. Replayed inside one
+    /// `WriteSession` at commit time.
+    ///
+    /// Buffering rather than holding the writer lock open is the whole design
+    /// decision here: `conn.execute(…)` in a REPL or a web handler can sit for
+    /// minutes before `commit()`, and mpedb has exactly one writer lock. A
+    /// driver that grabbed it on the first INSERT would let one idle Python
+    /// process stop every other writer on the machine.
+    ///
+    /// The cost is that a constraint violation surfaces at `commit()`, not at
+    /// `execute()` — so `execute` runs each statement against a THROWAWAY
+    /// session first, to fail early where the caller is looking. That doubles
+    /// the work for writes; a caller who minds should use `Transaction`.
+    pending: Vec<(String, Vec<Value>)>,
+}
+
+#[pymethods]
+impl PyConnection {
+    /// PEP 249 `Connection.cursor()`.
+    fn cursor(slf: Py<Self>) -> PyCursor {
+        PyCursor {
+            conn: slf,
+            rows: Vec::new(),
+            pos: 0,
+            description: None,
+            rowcount: -1,
+        }
+    }
+
+    /// PEP 249 `Connection.commit()`.
+    fn commit(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.closed {
+            return Err(closed_err());
+        }
+        let Some(session) = self.txn.take() else {
+            return Ok(()); // nothing written; a no-op, as in sqlite3
+        };
+        let db = self.db.clone();
+        py.detach(move || -> Result<(), DbError> {
+            let mut w = db.begin()?;
+            for (sql, params) in &session.pending {
+                w.query(sql, params)?;
+            }
+            w.commit()
+        })
+        .map_err(map_err)
+    }
+
+    /// PEP 249 `Connection.rollback()` — drop what was buffered.
+    fn rollback(&mut self) -> PyResult<()> {
+        if self.closed {
+            return Err(closed_err());
+        }
+        self.txn = None;
+        Ok(())
+    }
+
+    /// PEP 249 `Connection.close()`. Uncommitted work is discarded, which PEP
+    /// 249 requires ("an implicit rollback is performed").
+    fn close(&mut self) -> PyResult<()> {
+        self.txn = None;
+        self.closed = true;
+        Ok(())
+    }
+
+    /// A convenience sqlite3 also has: `conn.execute(...)` makes a cursor.
+    #[pyo3(signature = (sql, params=None))]
+    fn execute(
+        slf: Py<Self>,
+        py: Python<'_>,
+        sql: &str,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<PyCursor> {
+        let mut cur = PyConnection::cursor(slf);
+        cur.execute(py, sql, params)?;
+        Ok(cur)
+    }
+
+    fn __enter__(slf: Py<Self>) -> Py<Self> {
+        slf
+    }
+
+    /// sqlite3's semantics, which PEP 249 leaves open: commit on a clean exit,
+    /// roll back on an exception.
+    fn __exit__(
+        &mut self,
+        py: Python<'_>,
+        exc_type: Option<&Bound<'_, PyAny>>,
+        _v: Option<&Bound<'_, PyAny>>,
+        _tb: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<bool> {
+        if exc_type.is_some() {
+            self.txn = None;
+        } else {
+            self.commit(py)?;
+        }
+        Ok(false) // never swallow the exception
+    }
+}
+
+/// PEP 249 `Cursor`.
+#[pyclass(name = "Cursor", module = "mpedb")]
+struct PyCursor {
+    conn: Py<PyConnection>,
+    rows: Vec<Py<PyAny>>,
+    pos: usize,
+    /// PEP 249 `description`: 7-tuples, of which only `name` is meaningful
+    /// here — the rest are None, which PEP 249 explicitly allows.
+    description: Option<Py<PyAny>>,
+    rowcount: i64,
+}
+
+impl PyCursor {
+    fn is_write(sql: &str) -> bool {
+        let t = sql.trim_start();
+        ["insert", "update", "delete"]
+            .iter()
+            .any(|k| t.len() >= k.len() && t[..k.len()].eq_ignore_ascii_case(k))
+    }
+}
+
+#[pymethods]
+impl PyCursor {
+    /// PEP 249 `Cursor.execute()`.
+    ///
+    /// `?` needs no translation: mpedb's parser takes both `?` and `$n`
+    /// natively (and refuses to mix them in one statement). Which is why there
+    /// is no rewriter here — I wrote one, and it turned out to be a
+    /// reimplementation of something the tokenizer already did.
+    #[pyo3(signature = (sql, params=None))]
+    fn execute(
+        &mut self,
+        py: Python<'_>,
+        sql: &str,
+        params: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<()> {
+        let sql = sql.to_string();
+        let vals = convert_params(params)?;
+        let mut conn = self.conn.borrow_mut(py);
+        if conn.closed {
+            return Err(closed_err());
+        }
+        let db = conn.db.clone();
+
+        if !PyCursor::is_write(&sql) {
+            // A read runs against the committed snapshot. It does NOT see this
+            // connection's buffered writes — which is a real difference from
+            // sqlite3 and is documented rather than papered over.
+            let vals2 = vals.clone();
+            let sql2 = sql.clone();
+            let res = py
+                .detach(move || run_coercing(vals2, |p| db.query(&sql2, p)))
+                .map_err(map_err)?;
+            match res {
+                ExecResult::Rows { columns, rows } => {
+                    let list = rows_to_py(py, rows)?;
+                    self.rowcount = -1; // PEP 249: undefined for SELECT
+                    self.description = Some(describe(py, &columns)?);
+                    self.rows = list.iter().map(|r| r.unbind()).collect();
+                    self.pos = 0;
+                }
+                ExecResult::Affected(n) => {
+                    self.rowcount = n as i64;
+                    self.rows.clear();
+                    self.pos = 0;
+                    self.description = None;
+                }
+                ExecResult::Explain(text) => {
+                    self.description = Some(describe(py, &["plan".to_string()])?);
+                    let row = (text,).into_pyobject(py)?.into_any().unbind();
+                    self.rows = vec![row];
+                    self.pos = 0;
+                    self.rowcount = -1;
+                }
+            }
+            return Ok(());
+        }
+
+        // A write. Validate it NOW against a throwaway session so the error
+        // lands where the caller is looking, then buffer it for commit().
+        let db2 = db.clone();
+        let sql2 = sql.clone();
+        let vals2 = vals.clone();
+        let n = py
+            .detach(move || -> Result<u64, DbError> {
+                let mut w = db2.begin()?;
+                let r = w.query(&sql2, &vals2)?;
+                w.rollback();
+                Ok(match r {
+                    ExecResult::Affected(n) => n,
+                    _ => 0,
+                })
+            })
+            .map_err(map_err)?;
+        conn.txn
+            .get_or_insert_with(|| Session { pending: Vec::new() })
+            .pending
+            .push((sql, vals));
+        self.rowcount = n as i64;
+        self.rows.clear();
+        self.pos = 0;
+        self.description = None;
+        Ok(())
+    }
+
+    /// PEP 249 `Cursor.executemany()`.
+    fn executemany(
+        &mut self,
+        py: Python<'_>,
+        sql: &str,
+        seq: &Bound<'_, PyAny>,
+    ) -> PyResult<()> {
+        let mut total = 0i64;
+        for params in seq.try_iter()? {
+            self.execute(py, sql, Some(&params?))?;
+            if self.rowcount > 0 {
+                total += self.rowcount;
+            }
+        }
+        self.rowcount = total;
+        Ok(())
+    }
+
+    fn fetchone(&mut self, py: Python<'_>) -> Option<Py<PyAny>> {
+        let r = self.rows.get(self.pos).map(|r| r.clone_ref(py));
+        if r.is_some() {
+            self.pos += 1;
+        }
+        r
+    }
+
+    #[pyo3(signature = (size=1))]
+    fn fetchmany(&mut self, py: Python<'_>, size: usize) -> Vec<Py<PyAny>> {
+        let end = (self.pos + size).min(self.rows.len());
+        let out = self.rows[self.pos..end].iter().map(|r| r.clone_ref(py)).collect();
+        self.pos = end;
+        out
+    }
+
+    fn fetchall(&mut self, py: Python<'_>) -> Vec<Py<PyAny>> {
+        let out = self.rows[self.pos..].iter().map(|r| r.clone_ref(py)).collect();
+        self.pos = self.rows.len();
+        out
+    }
+
+    #[getter]
+    fn description(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.description.as_ref().map(|d| d.clone_ref(py))
+    }
+
+    #[getter]
+    fn rowcount(&self) -> i64 {
+        self.rowcount
+    }
+
+    /// PEP 249 requires these to exist; mpedb has no server-side cursors, so
+    /// they are no-ops rather than lies about a fetch size.
+    #[pyo3(signature = (_size=None))]
+    fn setinputsizes(&self, _size: Option<&Bound<'_, PyAny>>) {}
+    #[pyo3(signature = (_size, _column=None))]
+    fn setoutputsize(&self, _size: &Bound<'_, PyAny>, _column: Option<&Bound<'_, PyAny>>) {}
+
+    fn close(&mut self) {
+        self.rows.clear();
+        self.pos = 0;
+    }
+
+    fn __iter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
+        slf
+    }
+
+    fn __next__(&mut self, py: Python<'_>) -> Option<Py<PyAny>> {
+        self.fetchone(py)
+    }
+}
+
+/// PEP 249 `description`: one 7-tuple per column. Only `name` is known here;
+/// the standard says the other six may be None.
+fn describe(py: Python<'_>, columns: &[String]) -> PyResult<Py<PyAny>> {
+    let out = PyList::empty(py);
+    for c in columns {
+        let t = (
+            c.as_str(),
+            py.None(),
+            py.None(),
+            py.None(),
+            py.None(),
+            py.None(),
+            py.None(),
+        );
+        out.append(t.into_pyobject(py)?)?;
+    }
+    Ok(out.into_any().unbind())
+}
+
+/// PEP 249 `connect()`.
+#[pyfunction]
+fn connect(py: Python<'_>, config_path: PathBuf) -> PyResult<PyConnection> {
+    let db = py.detach(move || Db::open(&config_path)).map_err(map_err)?;
+    Ok(PyConnection {
+        db: Arc::new(db),
+        txn: None,
+        closed: false,
+    })
+}
+
 /// Compile-time proof that the pyclasses are fully thread-safe (required
 /// for sharing across Python threads and for `allow_threads` closures).
 #[allow(dead_code)]
@@ -649,6 +981,16 @@ fn mpedb_py(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PyDatabase>()?;
     m.add_class::<PyTransaction>()?;
     m.add_class::<PySession>()?;
+    // DB-API 2.0 (PEP 249).
+    m.add_class::<PyConnection>()?;
+    m.add_class::<PyCursor>()?;
+    m.add_function(wrap_pyfunction!(connect, m)?)?;
+    m.add("apilevel", "2.0")?;
+    // 1 = "threads may share the module, but not connections". A Connection
+    // holds a buffered transaction and is not synchronized; `Database` itself
+    // is Send+Sync and safe to share.
+    m.add("threadsafety", 1)?;
+    m.add("paramstyle", "qmark")?;
     m.add("Error", m.py().get_type::<Error>())?;
     m.add("IntegrityError", m.py().get_type::<IntegrityError>())?;
     m.add("ProgrammingError", m.py().get_type::<ProgrammingError>())?;
