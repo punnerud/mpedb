@@ -224,9 +224,13 @@ pub fn raw_baseline(dir: &Path, cfg: &BulkCfg, durable: bool) -> BResult<(f64, f
     std::fs::create_dir_all(dir)?;
     let path = dir.join("raw-baseline.bin");
     let _ = std::fs::remove_file(&path);
-    // 1 MiB of the row payload, repeated — buffered like any real writer
+    // 1 MiB of the row payload, repeated — buffered like any real writer.
+    // At least ONE row per chunk: a value bigger than the 1 MiB chunk target is
+    // its own chunk, not zero of them (that divided by zero and made the whole
+    // large-value regime — the one where per-row cost stops dominating and the
+    // copy starts to — unmeasurable).
     let row = payload(cfg.value_bytes, 0x5eed);
-    let per_chunk = (1 << 20) / cfg.value_bytes;
+    let per_chunk = ((1 << 20) / cfg.value_bytes).max(1);
     let chunk_buf: Vec<u8> = row.iter().cycle().take(per_chunk * cfg.value_bytes).copied().collect();
     let rows = cfg.rows();
     let chunks = rows as usize / per_chunk;
