@@ -524,6 +524,21 @@ impl<'a> Parser<'a> {
             Some(self.join_tail()?)
         } else if self.eat_kw(Kw::Join) {
             Some(self.join_tail()?)
+        } else if let Some(kind) = self.peek_join_kind() {
+            // Say what is wrong. Left to the generic path this reads
+            // "unexpected trailing input at byte 24", which tells someone who
+            // wrote LEFT JOIN nothing about why.
+            return Err(self.err_here(format!(
+                "{kind} JOIN is not supported — only INNER JOIN. {}",
+                if kind == "CROSS" {
+                    "A cross join is a cartesian product; write INNER JOIN with an ON \
+                     condition, or if you really want every pair, `JOIN … ON true`."
+                } else {
+                    "An outer join keeps rows with no match and NULL-extends them, which is \
+                     a different answer, not a slower one — so it is refused rather than \
+                     quietly treated as INNER."
+                }
+            )));
         } else {
             None
         };
@@ -599,6 +614,18 @@ impl<'a> Parser<'a> {
             limit,
             offset,
         }))
+    }
+
+    /// Name an unsupported join kind, without consuming it. `None` if the next
+    /// token does not start one.
+    fn peek_join_kind(&self) -> Option<&'static str> {
+        let w = match self.peek() {
+            Some(Tok::Ident(w)) => w,
+            _ => return None,
+        };
+        ["LEFT", "RIGHT", "FULL", "CROSS", "NATURAL", "OUTER"]
+            .into_iter()
+            .find(|k| w.eq_ignore_ascii_case(k))
     }
 
     /// The part of a JOIN after the `JOIN` keyword.
