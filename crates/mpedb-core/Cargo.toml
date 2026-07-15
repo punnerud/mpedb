@@ -8,6 +8,9 @@ description = "mpedb storage engine: shared-memory COW B+tree with MVCC snapshot
 [features]
 # expose the in-memory TestStore to downstream crates' tests
 teststore = []
+# count the alloc/refill/commit branches for the #37 high-water leak. Off by
+# default: it puts an atomic increment on the page-allocation path.
+leakstat = []
 
 [dependencies]
 mpedb-types = { workspace = true }

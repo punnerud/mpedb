@@ -13,6 +13,57 @@
 //! Freelist tree layout (root in meta.freelist_root):
 //! - key = freeing txn id (u64 BE) → concatenated freed page ids (u64 LE each)
 
+/// Diagnostic counters for the high-water leak (#37, see
+/// `tests/high_water_leak.rs`). Process-local and Relaxed, dumped by
+/// `mpedb/examples/leak_probe`.
+///
+/// Off unless built with `--features leakstat`: `bump`/`add` compile to nothing,
+/// so the alloc path pays zero. Five hypotheses about this leak have died on
+/// measurement — the instrument stays so the sixth is cheap to test.
+pub mod leakstat {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    macro_rules! counters {
+        ($($n:ident),* $(,)?) => {
+            $(pub static $n: AtomicU64 = AtomicU64::new(0);)*
+            pub fn dump(tag: &str) {
+                let mut s = String::new();
+                $(s.push_str(&format!(" {}={}", stringify!($n).to_lowercase(),
+                    $n.load(Ordering::Relaxed)));)*
+                eprintln!("leakstat[{tag}]:{s}");
+            }
+        };
+    }
+    counters!(
+        ALLOC_REUSABLE,   // alloc served from a reclaimed page
+        ALLOC_HW,         // alloc that bumped the high-water mark — THE LEAK
+        ALLOC_HW_IN_FL,   // ...of those, ones made *during* the commit fixpoint
+        REFILL_CALLS,     // refill_reusable entered
+        REFILL_NO_TREE,   // ...freelist empty
+        REFILL_NOT_YET,   // ...oldest entry newer than the bound
+        REFILL_OK,        // ...reclaimed an entry
+        REFILL_PAGES,     // pages that reclaim yielded
+        RECOMPUTES,       // compute_oldest_pinned calls (the only bound advance)
+        COMMIT_ENTRIES,   // freelist entries written by commit fixpoints
+        COMMIT_PAGES,     // page ids recorded by commit fixpoints
+        COMMITS,          // commit fixpoints entered
+        COMMIT_FREED,     // pages genuinely freed by the txn
+        COMMIT_LEFTOVER,  // reclaimed-but-unused pages handed back at commit
+    );
+    #[inline(always)]
+    pub fn bump(c: &AtomicU64) {
+        add(c, 1);
+    }
+    #[inline(always)]
+    pub fn add(c: &AtomicU64, n: u64) {
+        #[cfg(feature = "leakstat")]
+        c.fetch_add(n, Ordering::Relaxed);
+        #[cfg(not(feature = "leakstat"))]
+        {
+            let _ = (c, n);
+        }
+    }
+}
+
 use crate::btree::{self, InsertMode};
 use crate::cdc::{self, CaptureConfig, DirtyEntry, DirtyOp};
 use crate::pagestore::PageStore;
@@ -85,6 +136,10 @@ fn cat_tree_key(table_id: u32, index_no: u32) -> Vec<u8> {
 /// frees and allocates nothing, which is what makes the commit-time fixpoint
 /// (DESIGN.md §4.5) converge.
 const FREELIST_CHUNK_PAGES: usize = 120; // 960-byte values
+
+/// `((txn_id, high_water, bound), [(freed_txn, n_pages)] oldest first)` —
+/// see [`Engine::freelist_shape`].
+pub type FreelistShape = ((u64, u64, u64), Vec<(u64, usize)>);
 
 /// Pages at the top of the file reserved for control-plane writes (mirror
 /// HALTED/frozen/cursor/park markers) so they can still commit when the data
@@ -336,6 +391,54 @@ impl Engine {
     /// the data region below the high-water mark is either reachable from the
     /// committed roots or listed in the freelist — exactly one of the two.
     /// Takes the writer lock for a stable view; commits nothing.
+    /// Diagnostic counters for the high-water leak
+    /// (`crates/mpedb-core/tests/high_water_leak.rs`):
+    /// `(txn_id, high_water, oldest_pinned_bound, freelist_entries)`.
+    ///
+    /// Reads the committed meta and walks the freelist, so it costs a scan —
+    /// it exists to be called a few times a second by a probe, not on any path
+    /// that matters. It takes no writer lock and pins nothing: perturbing the
+    /// reader table is exactly what would corrupt the measurement.
+    pub fn leak_counters(&self) -> Result<(u64, u64, u64, u64)> {
+        let meta = self.shm.newest_meta()?;
+        let bound = self
+            .shm
+            .oldest_pinned_cache()
+            .load(std::sync::atomic::Ordering::Acquire);
+        let mut ents = 0u64;
+        if meta.freelist_root != 0 {
+            let r = self.begin_read()?;
+            let mut c = btree::cursor(&r, meta.freelist_root, None, None)?;
+            while c.next(&r)?.is_some() {
+                ents += 1;
+            }
+        }
+        Ok((meta.txn_id, meta.high_water, bound, ents))
+    }
+
+    /// TEMPORARY (#37): the freelist's *shape* — `(freed_txn, n_pages)` per
+    /// entry, oldest first, plus `(txn_id, high_water, bound)`. Tells apart
+    /// "entries are stuck (old, reclaimable, never drained)" from "entries are
+    /// churn (all fresh)" — an aggregate counter cannot.
+    pub fn freelist_shape(&self) -> Result<FreelistShape> {
+        let meta = self.shm.newest_meta()?;
+        let bound = self
+            .shm
+            .oldest_pinned_cache()
+            .load(std::sync::atomic::Ordering::Acquire);
+        let mut out = Vec::new();
+        if meta.freelist_root != 0 {
+            let r = self.begin_read()?;
+            let mut c = btree::cursor(&r, meta.freelist_root, None, None)?;
+            while let Some((k, v)) = c.next(&r)? {
+                if k.len() == 10 {
+                    out.push((u64::from_be_bytes(k[..8].try_into().unwrap()), v.len() / 8));
+                }
+            }
+        }
+        Ok(((meta.txn_id, meta.high_water, bound), out))
+    }
+
     pub fn verify_page_accounting(&self) -> Result<()> {
         let txn = self.begin_write()?;
         let res = (|| {
@@ -931,8 +1034,15 @@ impl WriteTxn<'_> {
             self.refill_reusable()?;
         }
         let id = match self.reusable.pop() {
-            Some(id) => id,
+            Some(id) => {
+                leakstat::bump(&leakstat::ALLOC_REUSABLE);
+                id
+            }
             None => {
+                leakstat::bump(&leakstat::ALLOC_HW);
+                if self.in_freelist_op {
+                    leakstat::bump(&leakstat::ALLOC_HW_IN_FL);
+                }
                 // The top RESERVED_CONTROL_PAGES of the file are dispensed only
                 // to `reserved_alloc` txns, so the mirror's control-plane writes
                 // (HALTED/frozen/cursor/park markers) can still commit when the
@@ -972,11 +1082,14 @@ impl<'e> WriteTxn<'e> {
     /// `tests/high_water_leak.rs`.
     fn refill_reusable(&mut self) -> Result<()> {
         debug_assert!(!self.in_freelist_op, "refill re-entered a freelist op");
+        leakstat::bump(&leakstat::REFILL_CALLS);
         if self.freelist_root == 0 {
+            leakstat::bump(&leakstat::REFILL_NO_TREE);
             return Ok(());
         }
         let mut c = btree::cursor(self, self.freelist_root, None, None)?;
         let Some((key, val)) = c.next(self)? else {
+            leakstat::bump(&leakstat::REFILL_NO_TREE);
             return Ok(());
         };
         if key.len() != 10 || val.len() % 8 != 0 {
@@ -989,11 +1102,15 @@ impl<'e> WriteTxn<'e> {
         if freed_txn > bound && !self.bound_recomputed {
             // the cached bound is stale-conservative; recompute once per txn
             self.bound_recomputed = true;
+            leakstat::bump(&leakstat::RECOMPUTES);
             bound = self.eng.shm.compute_oldest_pinned(self.meta.txn_id);
         }
         if freed_txn > bound {
+            leakstat::bump(&leakstat::REFILL_NOT_YET);
             return Ok(()); // nothing reclaimable yet
         }
+        leakstat::bump(&leakstat::REFILL_OK);
+        leakstat::add(&leakstat::REFILL_PAGES, (val.len() / 8) as u64);
         // Take the pages first so the entry deletion below can allocate
         // from them without recursing into refill. Validate every id: corrupt
         // freelist bytes must never let alloc zero-fill meta/lock/reader
@@ -1592,6 +1709,9 @@ impl<'e> WriteTxn<'e> {
         // btree::delete can interleave with the upserts below (see
         // `in_freelist_op`). Allocations fall back to reusable/high-water.
         self.in_freelist_op = true;
+        leakstat::add(&leakstat::COMMIT_FREED, self.freed.len() as u64);
+        leakstat::add(&leakstat::COMMIT_LEFTOVER, self.reusable.len() as u64);
+        leakstat::bump(&leakstat::COMMITS);
         loop {
             iterations += 1;
             if iterations > 64 {
@@ -1623,6 +1743,8 @@ impl<'e> WriteTxn<'e> {
                 self.freelist_root = out.new_root;
             }
             written_chunks = n_chunks;
+            leakstat::add(&leakstat::COMMIT_ENTRIES, n_chunks as u64);
+            leakstat::add(&leakstat::COMMIT_PAGES, candidate.len() as u64);
             let mut now: Vec<u64> = self.freed.iter().copied().collect();
             now.extend(self.reusable.iter().copied());
             now.sort_unstable();
