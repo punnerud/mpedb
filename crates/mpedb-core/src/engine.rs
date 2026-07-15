@@ -959,7 +959,7 @@ pub struct WriteTxn<'e> {
     taken: Vec<TakenEntry>,
     /// Last key `refill_reusable` drew from; the next draw starts strictly
     /// after it, so an entry is never drawn twice (it is still in the tree).
-    refill_cursor: Option<Vec<u8>>,
+    refill_cursor: Option<[u8; 10]>,
     freed: BTreeSet<u64>,
     bound_recomputed: bool,
     /// True while a mutation of the freelist tree itself is in progress.
@@ -1133,10 +1133,10 @@ impl<'e> WriteTxn<'e> {
     ///    it from the high-water mark, or out of an entry it then drew dry, and
     ///    freed it again — nothing else records it, so omitting it would leak
     ///    it outright).
-    fn freelist_plan(&self, new_txn: u64, written: &[(Vec<u8>, Vec<u64>)]) -> Vec<(Vec<u8>, Vec<u64>)> {
+    fn freelist_plan(&self, new_txn: u64, written: &[([u8; 10], Vec<u64>)]) -> Vec<([u8; 10], Vec<u64>)> {
         // `reusable` is sorted (see `free`/`refill_reusable`), so "is this page
         // still free?" is a binary search — no per-pass set to build.
-        let mut out: Vec<(Vec<u8>, Vec<u64>)> = Vec::new();
+        let mut out: Vec<([u8; 10], Vec<u64>)> = Vec::with_capacity(self.taken.len() + 1);
         for e in &self.taken {
             let kept: Vec<u64> = e
                 .ids
@@ -1152,22 +1152,26 @@ impl<'e> WriteTxn<'e> {
             // verifier catches that as "page N leaked: neither reachable nor
             // freelisted", which is exactly how this was found.
             if kept.len() != e.ids.len() || written.iter().any(|(k, _)| *k == e.key) {
-                out.push((e.key.clone(), kept)); // shrunk, or emptied = delete
+                out.push((e.key, kept)); // shrunk, or emptied = delete
             }
         }
         // A reusable page that some drawn entry still lists is accounted for by
         // that entry; everything else in the pool is this txn's own.
+        //
+        // freed and reusable are disjoint by construction — `free` routes a page
+        // to exactly one of them, by whether this txn allocated it.
+        let taken = &self.taken;
         let mut own: Vec<u64> = self.freed.iter().copied().collect();
-        own.extend(self.reusable.iter().copied().filter(|id| {
-            !self
-                .taken
+        own.extend(
+            self.reusable
                 .iter()
-                .any(|e| e.ids.binary_search(id).is_ok())
-        }));
+                .copied()
+                .filter(|id| !taken.iter().any(|e| e.ids.binary_search(id).is_ok())),
+        );
         own.sort_unstable();
-        own.dedup();
+        debug_assert!(own.windows(2).all(|w| w[0] < w[1]), "own must be strictly ascending");
         for (i, chunk) in own.chunks(FREELIST_CHUNK_PAGES).enumerate() {
-            out.push((freelist_key(new_txn, i as u16).to_vec(), chunk.to_vec()));
+            out.push((freelist_key(new_txn, i as u16), chunk.to_vec()));
         }
         out
     }
@@ -1192,7 +1196,7 @@ impl<'e> WriteTxn<'e> {
         }
         // Start strictly after the last entry drawn: it is still in the tree,
         // so an inclusive scan would hand out its pages a second time.
-        let lo = self.refill_cursor.clone();
+        let lo = self.refill_cursor;
         let mut c = btree::cursor(
             self,
             self.freelist_root,
@@ -1250,10 +1254,10 @@ impl<'e> WriteTxn<'e> {
         }
         leakstat::bump(&leakstat::REFILL_OK);
         leakstat::add(&leakstat::REFILL_PAGES, ids.len() as u64);
-        let key = key.to_vec();
+        let key: [u8; 10] = key.try_into().expect("checked len == 10 above");
         self.reusable.extend(ids.iter().copied());
         self.reusable.sort_unstable();
-        self.taken.push(TakenEntry { key: key.clone(), ids });
+        self.taken.push(TakenEntry { key, ids });
         self.refill_cursor = Some(key);
         Ok(true)
     }
@@ -1762,7 +1766,7 @@ impl<'e> WriteTxn<'e> {
             freed: self.freed.clone(),
             reusable: self.reusable.clone(),
             taken: self.taken.clone(),
-            refill_cursor: self.refill_cursor.clone(),
+            refill_cursor: self.refill_cursor,
             high_water: self.high_water,
         }
     }
@@ -1848,7 +1852,7 @@ impl<'e> WriteTxn<'e> {
         // height-bounded freelist path, the sets grow monotonically, and once
         // `reusable` is consumed allocation falls back to `high_water`, which
         // frees nothing — so the loop is bounded by O(tree height).
-        let mut written: Vec<(Vec<u8>, Vec<u64>)> = Vec::new();
+        let mut written: Vec<([u8; 10], Vec<u64>)> = Vec::new();
         let mut iterations = 0;
         // The whole fixpoint mutates the freelist tree: block refill so no
         // cursor read can draw from an entry these writes are rewriting (see
@@ -2038,7 +2042,7 @@ pub struct TxnSavepoint {
     freed: BTreeSet<u64>,
     reusable: Vec<u64>,
     taken: Vec<TakenEntry>,
-    refill_cursor: Option<Vec<u8>>,
+    refill_cursor: Option<[u8; 10]>,
     high_water: u64,
 }
 
@@ -2047,7 +2051,10 @@ pub struct TxnSavepoint {
 /// whatever is left unconsumed (or deletes it if nothing is).
 #[derive(Clone)]
 struct TakenEntry {
-    key: Vec<u8>,
+    /// Freelist keys are always (txn BE, chunk BE) — exactly 10 bytes. Inline,
+    /// not a `Vec`: the commit fixpoint rebuilds its plan on every pass, and a
+    /// heap allocation per key per pass was a measurable slice of the write path.
+    key: [u8; 10],
     ids: Vec<u64>,
 }
 
