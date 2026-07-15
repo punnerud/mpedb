@@ -15,6 +15,14 @@
 //!   probe and recounts rows against the children's success totals.
 //! - `mixed`: random INSERT/UPDATE/DELETE/SELECT over a constrained key
 //!   space; correctness = no unexpected errors + final verify.
+//!
+//! **Capacity is not correctness.** A child that fills the file exits
+//! `EXIT_CAPACITY` (4) and is counted and reported apart from one that hit an
+//! unexpected error (1) or an invariant violation (3). This is not tidiness:
+//! bug #37 was reported here for ten days as "8 child(ren) failed" — which reads
+//! like a torn snapshot — and nobody looked, because the message said the wrong
+//! thing. `--size_mb` exists for the same reason; #37's "doubling the file
+//! doubles the survivable time" table had to be produced by editing the source.
 
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
@@ -111,7 +119,7 @@ struct Totals {
 pub fn run_parent(argv: &[String]) -> CliResult {
     let p = args::parse(
         argv,
-        &["dir", "workers", "secs", "mode", "durability", "concurrency"],
+        &["dir", "workers", "secs", "mode", "durability", "concurrency", "size_mb"],
         &[],
     )?;
     let dir = PathBuf::from(p.require("dir")?);
@@ -132,6 +140,18 @@ pub fn run_parent(argv: &[String]) -> CliResult {
     if workers == 0 || secs == 0 {
         return usage("--workers and --secs must be >= 1");
     }
+    // Was hardcoded to 64. It needs to be a knob: the capacity path cannot be
+    // exercised without one, and #37's "doubling the file exactly doubles the
+    // survivable time" table had to be produced by editing this line.
+    let size_mb = match p.value("size_mb") {
+        Some(v) => v
+            .parse::<u64>()
+            .map_err(|_| Failure::Usage("--size_mb must be a number".into()))?,
+        None => 64,
+    };
+    if size_mb == 0 {
+        return usage("--size_mb must be >= 1");
+    }
 
     std::fs::create_dir_all(&dir)?;
     let dir = dir.canonicalize()?;
@@ -145,7 +165,7 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         "incr" => INCR_TOML,
         _ => MIXED_TOML,
     };
-    crate::util::write_config_concurrency(&cfg, &dbf, 64, tables, &durability, &concurrency)?;
+    crate::util::write_config_concurrency(&cfg, &dbf, size_mb, tables, &durability, &concurrency)?;
 
     let db = Database::open(&cfg)?;
     seed(&db, &mode)?;
@@ -170,6 +190,7 @@ pub fn run_parent(argv: &[String]) -> CliResult {
 
     let mut totals = Totals::default();
     let mut failures = 0u64;
+    let mut out_of_space = 0u64;
     for (k, child) in children.into_iter().enumerate() {
         let out = child.wait_with_output()?;
         let stdout = String::from_utf8_lossy(&out.stdout);
@@ -182,9 +203,15 @@ pub fn run_parent(argv: &[String]) -> CliResult {
                 println!("child {k} ({kind}): ops={ops} ok={ok} expected-conflicts={conflicts}");
             }
         }
-        if !out.status.success() {
-            failures += 1;
-            eprintln!("child {k} FAILED: {}", out.status);
+        match out.status.code() {
+            Some(0) => {}
+            // Capacity, not correctness. Counted and reported apart so this can
+            // never again read like an invariant violation (see EXIT_CAPACITY).
+            Some(c) if c == EXIT_CAPACITY => out_of_space += 1,
+            _ => {
+                failures += 1;
+                eprintln!("child {k} FAILED: {}", out.status);
+            }
         }
     }
     let elapsed = start.elapsed().as_secs_f64();
@@ -202,9 +229,40 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         Ok(()) => println!("verify: ok"),
         Err(Failure::Runtime(m)) | Err(Failure::Usage(m)) => eprintln!("VERIFY FAILED: {m}"),
     }
+    // Report capacity BEFORE correctness: a full file explains a short run, and
+    // saying so plainly is the whole point of separating the two.
+    if out_of_space > 0 {
+        let pages = size_mb * 1024 * 1024 / 4096;
+        let geom = match db.leak_counters() {
+            Ok((txn, hw, _bound, ents)) => format!(
+                "high_water={hw}/{pages} pages ({size_mb} MB), freelist={ents} entries, txn={txn}"
+            ),
+            Err(e) => format!("(could not read geometry: {e})"),
+        };
+        // State the facts and the discriminator; do NOT conclude which case it
+        // is. The harness cannot know, and "pages are not being reclaimed" is
+        // wrong the moment --size_mb is small enough that the writers' own page
+        // pools do not fit — which an earlier draft of this message asserted.
+        eprintln!(
+            "OUT OF SPACE: {out_of_space}/{workers} child(ren) hit DbFull. CAPACITY, not \
+             correctness — `verify` above is the correctness check.\n  {geom}\n  \
+             Which one it is: if this workload's live set is BOUNDED and the file still \
+             fills, pages are not being reclaimed and that is an engine bug (#37's exact \
+             signature — see crates/mpedb-core/tests/high_water_leak.rs, and instrument \
+             with --features leakstat + examples/leak_probe). If the live set grows, or \
+             --size_mb is small enough that {workers} writers' page pools alone do not fit, \
+             it is the workload."
+        );
+    }
     check?;
     if failures > 0 {
         return runtime(format!("{failures} child(ren) failed"));
+    }
+    if out_of_space > 0 {
+        return runtime(format!(
+            "{out_of_space} child(ren) ran out of space (exit {EXIT_CAPACITY}); \
+             raise --size_mb (now {size_mb}), or fix the reclamation bug this is pointing at"
+        ));
     }
     Ok(())
 }
@@ -362,8 +420,30 @@ fn int(v: &Value) -> Result<i64, Failure> {
 
 // -------------------------------------------------------------------- child
 
+/// Exit code for "the file filled up". Its own code because DbFull is a
+/// CAPACITY outcome, not a correctness one, and every other error path here
+/// means the engine did something it should not have.
+///
+/// This distinction is not bookkeeping. Bug #37 — an unbounded high-water leak
+/// on a working set that did not grow — was reported by this harness for ten
+/// days as "8 child(ren) failed", which reads exactly like a torn snapshot or a
+/// double free. Nobody looked, because the message said the wrong thing.
+pub const EXIT_CAPACITY: i32 = 4;
+
+/// A child that ran out of space: say so precisely, and exit `EXIT_CAPACITY` so
+/// the parent can tell this apart from an engine bug.
+fn exit_db_full(kind: &str, e: &mpedb::Error) -> ! {
+    eprintln!(
+        "{kind} child: OUT OF SPACE ({e}) — capacity, not a correctness failure.\n           If the workload's live set is BOUNDED, the file filling is an engine bug \
+         (that is #37's signature: see crates/mpedb-core/tests/high_water_leak.rs). \
+         If it is unbounded, the workload outgrew --size_mb."
+    );
+    std::process::exit(EXIT_CAPACITY);
+}
+
 /// Hidden subcommand. Exit codes: 0 ok, 1 unexpected error (via Failure),
-/// 3 invariant violation observed (MVCC bug — the evidence the parent wants).
+/// 3 invariant violation observed (MVCC bug — the evidence the parent wants),
+/// 4 out of space (capacity — see `EXIT_CAPACITY`).
 pub fn run_child(argv: &[String]) -> CliResult {
     let p = args::parse(argv, &["dir", "mode", "secs", "id"], &[])?;
     let dir = PathBuf::from(p.require("dir")?);
@@ -399,7 +479,8 @@ fn incr_child(db: &Database, deadline: Instant, rng: &mut Rng) -> CliResult {
         match db.execute(&upd, &params![key]) {
             Ok(ExecResult::Affected(1)) => ok += 1,
             Ok(other) => return runtime(format!("incr child: unexpected {other:?}")),
-            Err(e) => return runtime(format!("incr child: unexpected error: {e}")),
+            Err(e) if matches!(e, mpedb::Error::DbFull) => exit_db_full("incr", &e),
+                Err(e) => return runtime(format!("incr child: unexpected error: {e}")),
         }
     }
     println!("STATS kind=incr ops={ops} ok={ok} conflicts=0");
@@ -480,6 +561,7 @@ fn unique_child(db: &Database, deadline: Instant, id: u64) -> CliResult {
                 Err(Error::UniqueViolation { .. }) | Err(Error::PrimaryKeyViolation { .. }) => {
                     conflicts += 1; // lost the race — the expected outcome
                 }
+                Err(e) if matches!(e, mpedb::Error::DbFull) => exit_db_full("unique", &e),
                 Err(e) => return runtime(format!("unique child: unexpected error: {e}")),
             }
         }
@@ -506,7 +588,8 @@ fn mixed_child(db: &Database, deadline: Instant, rng: &mut Rng) -> CliResult {
         match res {
             Ok(_) => ok += 1,
             Err(Error::PrimaryKeyViolation { .. }) => conflicts += 1, // insert on live key
-            Err(e) => return runtime(format!("mixed child: unexpected error: {e}")),
+            Err(e) if matches!(e, mpedb::Error::DbFull) => exit_db_full("mixed", &e),
+                Err(e) => return runtime(format!("mixed child: unexpected error: {e}")),
         }
     }
     println!("STATS kind=mixed ops={ops} ok={ok} conflicts={conflicts}");
