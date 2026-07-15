@@ -11,6 +11,15 @@ durability classes, all latency percentiles) live in its own file.
 |---|---|---|
 | AMD EPYC-Milan, 2 cores, 7.6 GiB, Linux 6.8 | mpedb, SQLite, PostgreSQL 16 | [`RESULTS-linux-amd-epyc-milan-2c.md`](crates/mpedb-bench/RESULTS-linux-amd-epyc-milan-2c.md) |
 | Apple M3 Pro, 11 cores, 36 GiB, macOS 26.6 | mpedb, SQLite, PostgreSQL 16 | [`RESULTS-macos-apple-m3-pro-11c.md`](crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md) |
+| Raspberry Pi 3 B+, armv7l (32-bit), 921 MiB, Linux 6.1 | **mpedb only** | no results file — see below |
+
+The Pi is not a third data point in the engine comparison and never will be:
+`mpedb-bench` links SQLite (bundled C) and PostgreSQL, which needs a C
+cross-compiler to reach ARM, and a PG cluster next to 921 MiB and zero swap
+would OOM the box. It earns its place for two other things — it is the only
+**32-bit / weakly-ordered** platform anything runs on (see
+[Platforms](README.md#platforms)), and it is the **steadiest A/B instrument**
+here despite being the slowest (1.6% CV vs the dev box's 9.0%).
 
 **One file per machine, on purpose.** A generated report says "on this machine"
 in its own first line — it is a single-host document, and a run on a second host
@@ -43,6 +52,47 @@ Non-overlapping, so the +9.5% is real. The claim survived; the first attempt at
 proving it did not, and a plausible mechanism plus two favourable runs is exactly
 what a wrong result looks like.
 
+### Measure your instrument before you measure the change
+
+Two more ways this has gone wrong here, both worth stealing:
+
+**The arms were the same binary.** An A/B of a hasher change came back
+"+2.0 / -2.0 / +0.6%" — sane-looking noise. The two binaries were byte-identical:
+`git stash` had taken the example program with it, the build failed, and `cp`
+copied the same file twice. `md5sum` the arms before you believe an A/B. Noise
+is what a correct null result looks like, which is exactly why it is not evidence
+of one.
+
+**Three reps cannot resolve 2%.** The same change was then measured properly —
+alternating arms, real binaries — and reported as "-1.6%, a regression". Also
+wrong, because nobody had asked what this box's noise floor *is*. Ten runs of an
+identical workload:
+
+| machine | mean | sd | **CV** | range |
+|---|---|---|---|---|
+| dev box (x86-64, 4 cores, in use) | 332 MiB/s | 30 | **9.0%** | 255–351 |
+| Raspberry Pi 3 B+ (armv7, decoding ADS-B throughout) | 30 MiB/s | 0.47 | **1.6%** | 29–31 |
+
+**The slow, busy Pi is a 6× better instrument than the fast dev box.** Steady
+load beats fast-but-bursty: the Pi's three background services run at a constant
+rate, while a dev box alternates between idle and a `cargo build`.
+
+Redone as a paired design — arms back to back, enough reps to put a confidence
+interval on the *difference* — the same change came out:
+
+| platform | paired diff | 95% CI | verdict |
+|---|---|---|---|
+| armv7, n=15 pairs | **+3.5%** | [+2.1, +4.9] | resolved, real |
+| x86-64, n=25 pairs | -0.1% | [-2.2, +1.9] | **no measurable effect** |
+
+So it was taken, not rejected: free on the reference platform, real on a
+supported one. Three reps at CV 9% had produced the opposite conclusion and a
+commit message to go with it.
+
+**The rule:** decide *whether a change helps* on the steadiest machine you have,
+with paired arms and a CI on the difference. Use the fast machines for absolute
+numbers. Those are different jobs and the same box is rarely good at both.
+
 ## The two rules that make any of this meaningful
 
 1. **Run on an idle machine.** Not advice — measured. A stray process holding one
@@ -50,6 +100,10 @@ what a wrong result looks like.
    parallelism results (contended-writes 6.8× → 2.4×) and made mpedb look
    closer to the others than it is. Every number taken before 2026-07-14 12:10
    was measured on half a machine. Close everything, then run.
+   *Refinement (2026-07-15):* for **A/B work** what matters is not idle but
+   **steady** — a Pi running a constant background load has a 1.6% CV where this
+   box has 9.0%. Idle still wins for absolute numbers. See "Measure your
+   instrument" above.
 2. **Compare within a durability class, never across.** "none-class" gives no
    fsync guarantee; "commit-class" is durable on ack. A none-class number next
    to a commit-class one is not a comparison, it is a category error.
@@ -300,6 +354,48 @@ A number above 100% of the hardware is a gift — it is the measurement telling 
 it is broken. The subtler version of the same bug is the one that lands at 85%
 and gets published.
 
+### Where the bulk write actually spends its time (2026-07-15)
+
+mpedb sits at ~26% of raw `std::fs` at 4 KiB values. **The cost is per ROW, and
+it is not the copies** — which is what the improvement list used to say it was.
+Measured with `cargo run --release -p mpedb --example bulk_only`, which does only
+the blob write, so a trace attributes to it:
+
+**It is not I/O.** `strace -c` over the whole write at `durability=none`: 14
+`write`, 5 `getpid`, and nothing else of substance. Every microsecond is
+user-space, which retires the entire "it's the msync/write pattern" family of
+explanations at a stroke.
+
+**It is per-row.** The same 128 MiB at different value sizes:
+
+| value | rows | MiB/s | µs/row |
+|---|---|---|---|
+| 64 B | 2,097,152 | 50 | **1.22** |
+| 256 B | 524,288 | 133 | **1.84** |
+| 4 KiB | 32,768 | 349 | 11.2 |
+| 64 KiB | 2,048 | 726 | 86.1 |
+
+64 B and 256 B cost nearly the same *per row* despite 4× the bytes: there is a
+fixed ~1 µs per row the payload never touches. Copies would have shown a flat
+MiB/s; this climbs 14×. It also explains the shape of the whole suite — 54% of
+raw at 64 KiB, 26% at 4 KiB, because the fixed cost amortises.
+
+**And it is the engine, not SQL.** A `raw` arm bypassing the SQL layer for the
+typed row API leaves that ~1 µs standing (62 vs 48 MiB/s at 64 B). The SQL layer
+costs 23% at 64 B and 10% at 4 KiB — real, and not the story.
+
+**A CPU profile** (Raspberry Pi, `perf record` — the only box here with a working
+profiler) puts the µs in musl's memcpy (~24%), malloc/free (~14%) and
+`DefaultHasher` (~15%). That last one is now fxhash: +3.5% on armv7, nothing
+measurable on x86-64.
+
+Five hypotheses about this gap have died on contact with measurement: an
+overflow-page cliff (~1%), macOS msync granularity (`F_FULLFSYNC` is per-fd),
+the API-forced clone (~2%), `dirty.insert` as a *1%* item (it is ~15% of the
+armv7 profile — but fixing it returns 3.5%, not 15%), and a hasher swap that
+was briefly "rejected" on noise. The module docs in
+`crates/mpedb-bench/src/bulk.rs` keep the corpses so nobody re-runs them.
+
 ### Not measured: write amplification
 
 The obvious proxy — physical file bytes per logical byte — is meaningless for
@@ -380,7 +476,15 @@ merely noisy.
    mpedb's own `wal` does 2,598). `wal` already closed this gap for itself; the
    remaining opportunity is a single-writer fast path for `commit` mode, or
    simply steering users to `wal` (which the docs do).
-3. **CDC capture check on the write path (minor).** With change-capture in the
+3. **~1 µs of fixed per-row cost in the write path.** The bulk write is not
+   limited by copies — see "Where the bulk write actually spends its time". With
+   the SQL layer removed entirely, ~1 µs/row remains: btree descent, COW page
+   allocation, freelist, and the dirty-page set. The concrete next step is
+   replacing that `HashSet<u64>` with a **bitset** — page ids are dense and
+   bounded by `high_water`, so a shift and a mask replace the hash on every
+   platform. The `contains` itself cannot go: it is the COW guard, and catching
+   a violation of it in production is the point (DESIGN.md §3).
+4. **CDC capture check on the write path (minor).** With change-capture in the
    engine (mirror foundation), each write txn does one `cdc\0tabs` sys-lookup even
    when no mirror is configured. It is *not* the cause of the run-to-run variance
    above (reads, which skip it, moved identically), but caching the config across
@@ -393,3 +497,11 @@ These numbers are **Linux (x86-64)**. macOS/Apple Silicon perf has not been
 re-measured in this run; platform *correctness and crash-safety* parity (not
 throughput) is covered separately — see [Platforms](README.md#platforms) and
 [`DESIGN-MACOS-LOCK.md`](DESIGN-MACOS-LOCK.md).
+
+**32-bit ARM** (Raspberry Pi 3 B+, armv7l) is a correctness platform here, not a
+throughput one — it is ~11× slower than the dev box and cannot run the other two
+engines. What it is good for: it is the only weakly-ordered machine anything runs
+on, so the fences in the reader-pin protocol are load-bearing there rather than
+theoretical; and it is the steadiest A/B instrument in the set. 318 tests and a
+multi-process SIGKILL harness pass on it — see
+[Platforms](README.md#platforms).

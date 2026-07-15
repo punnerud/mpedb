@@ -277,6 +277,13 @@ durable on ack), and the machine must be **idle** — a stray process holding on
 of this box's two cores *compressed* the parallelism results (6.8× → 2.4×)
 rather than merely adding noise.
 
+And one finding worth stealing even if you never use mpedb: **for deciding
+whether a change helped, a Raspberry Pi 3 running a live ADS-B decoder is a 6×
+better instrument than this dev box** — 1.6% run-to-run CV against 9.0%. Steady
+load beats fast-but-bursty. Three reps at 9% CV had us reject a real +3.5%
+improvement as a "regression", with a commit message to match. BENCHMARKS.md has
+the method and the two other ways the same A/B went wrong first.
+
 ### Linux — AMD EPYC-Milan, 2 cores (2026-07-14)
 
 Single-client, embedded, none-class point ops:
