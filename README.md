@@ -85,15 +85,56 @@ than either ancestor. It is not there yet; see Status.
 
 ## Highlights
 
-- **Copy-on-write B+tree + MVCC** — double-buffered meta pages, `/proc`-start-time
-  reader identity, robust `PROCESS_SHARED` mutexes with `EOWNERDEAD` recovery.
-- **50,000+ concurrent lock-free readers** (config-sized reader table); writers
-  serialize through one writer lock with intent-ring group commit.
+**Many processes writing one file, and none of them has to cope with that.**
+This is the point. Concurrent *readers* are not — sqlite3 in WAL mode has those,
+and in a like-for-like durable comparison it out-reads mpedb (649k vs 567k
+reads/s; [BENCHMARKS.md](BENCHMARKS.md)). What sqlite3 does not give you is
+several processes *writing* without `SQLITE_BUSY`, a retry loop and a
+`busy_timeout` — the benchmark's sqlite3 adapter needs a **60-second**
+busy_timeout to survive the contended-write cell at all. mpedb's writers queue
+in an intent ring and a leader commits them as a group; nothing returns "database
+is locked".
+
+- **Concurrent writes, measured with real processes** — N processes `fork`ed
+  onto one file, both engines native Rust, none-class, median of 3:
+
+  | writer processes | mpedb | sqlite3 (WAL, 60 s busy_timeout) | |
+  |--:|--:|--:|--:|
+  | 1 | 298,874/s | 90,195/s | 3.3× |
+  | 2 | 160,098/s | 86,171/s | 1.9× |
+  | 4 | 253,733/s | 80,126/s | 3.2× |
+  | 8 | 274,023/s | 81,363/s | 3.4× |
+
+  Honest counterpart: with *durability on* concurrent writing is mpedb's
+  **worst** cell — a tie with sqlite3 and **8× behind PostgreSQL**, because group
+  commit only amortizes what one writer lock lets through. See
+  [BENCHMARKS.md](BENCHMARKS.md#known-issues--improvement-opportunities).
+- **~300 KB of heap per writer process** — peak `RssAnon` across 4 concurrent
+  writers: **1.2 MB for mpedb vs 4.4 MB for sqlite3**. (Peak *VmHWM* goes the
+  other way, 196 MB vs 16 MB, and that is an accounting artifact worth knowing:
+  mpedb mmaps the database, so the pages it touches are resident and charged to
+  it, while sqlite3's same data sits in the OS page cache charged to nobody.
+  `RssAnon` — what the engine actually allocated — is the comparable column.)
+- **Any writer may be `SIGKILL`ed mid-commit** — no corruption, no wedged lock,
+  no recovery step you have to run. Robust `PROCESS_SHARED` mutexes with
+  `EOWNERDEAD` recovery, `/proc`-start-time reader identity, and a
+  double-buffered meta page. Fuzzed on x86-64, Apple Silicon and 32-bit ARM.
+- **Writers never block readers** — MVCC snapshots over a copy-on-write B+tree,
+  50,000+ concurrent lock-free readers (config-sized reader table). sqlite3-WAL
+  gives you this too; the difference is that here it holds while *many processes*
+  write.
+- **It runs where a server does not fit** — a Raspberry Pi 3 (armv7, 921 MB,
+  already decoding ADS-B) does **6-7k writes/s across 1-4 processes on 72 KB of
+  heap**. Slow, and that is the point: no daemon, no postmaster, no per-connection
+  backend. PostgreSQL *does* run on a Pi — the difference is not that it cannot,
+  it is that mpedb costs 72 KB and nothing while idle.
+- **Write parallelism scales with FILES, not locks** — multi-database workspaces
+  address several independent database files as `alias.table`. Separate files =
+  separate writer locks = linear write parallelism, and the only OS-enforced
+  isolation boundary. That is the architectural answer to the single-writer cell
+  above, and it is deliberate rather than a workaround.
 - **Durability modes** — `none`, `commit` (msync), `wal` (sequential log +
   fdatasync, durable-on-ack), `async` (deferred coalesced fsync).
-- **Multi-database workspaces** — address several independent database files as
-  `alias.table`; separate files = separate writer locks = linear write
-  parallelism, and the only OS-enforced isolation boundary.
 - **Cooperative row-level security** — PostgreSQL-style `USING` / `WITH CHECK`
   policies keyed on a caller-set session context, injected transparently at plan
   time, with cache leak-proofing (a stale cached plan is re-validated against the

@@ -93,6 +93,32 @@ commit message to go with it.
 with paired arms and a CI on the difference. Use the fast machines for absolute
 numbers. Those are different jobs and the same box is rarely good at both.
 
+### "Can I just run it 50-100 times and average the noise out?"
+
+Largely yes — and the caveat is the interesting part. The same change, same box,
+same binaries:
+
+| | n | result | 95% CI | |
+|---|--:|--:|---|---|
+| dev box | 25 pairs | -0.12% | [-2.17, +1.94] | unresolved |
+| dev box | **50 pairs** | **+2.14%** | [+0.65, +3.62] | resolved |
+| Pi | 15 pairs | +3.51% | [+2.13, +4.89] | resolved |
+
+50 alternating pairs resolved it on the 9%-CV box — while that run was competing
+with *another* benchmark on the same machine, which is about as adversarial as
+a VPS gets. So: yes, reps work, because the standard error falls as 1/√n and the
+pairing cancels drift *within* a pair.
+
+But look at the two dev-box rows. **-0.12% and +2.14%, same box, same binaries,
+CIs that barely overlap.** The confidence interval assumes independent draws from
+one stable distribution; a host whose state changes between sessions violates
+that, and the CI will not tell you. The Pi got a tighter answer from 15 pairs
+than the dev box got from 50.
+
+Practical version: **~50 alternating pairs on a noisy VPS ≈ ~15 on a steady box**,
+and the VPS still risks a between-session shift the CI cannot see. If a result
+matters, reproduce it in a second session before believing it.
+
 ## The two rules that make any of this meaningful
 
 1. **Run on an idle machine.** Not advice — measured. A stray process holding one
@@ -224,6 +250,54 @@ with group commit, so extra cores buy it comparatively little, while SQLite's
 and PostgreSQL's contended writes scale with them. mpedb's write-parallelism
 answer is architectural, not per-lock: separate files (Workspaces / ShardSet),
 which this single-file cell does not measure.
+
+### Concurrent writes from real PROCESSES (2026-07-15)
+
+The `contended-writes` cell above is `std::thread::scope` — four *threads* in one
+process. It measures lock contention, and it is not the claim mpedb makes.
+"Many processes writing one file, no server" needs many processes, so
+`examples/mp_writes.rs` forks them. Both arms native Rust, one file, none-class,
+median of 3 alternating runs:
+
+| writer processes | mpedb | sqlite3 | ratio |
+|--:|--:|--:|--:|
+| 1 | 298,874/s | 90,195/s | 3.3× |
+| 2 | 160,098/s | 86,171/s | 1.9× |
+| 4 | 253,733/s | 80,126/s | 3.2× |
+| 8 | 274,023/s | 81,363/s | 3.4× |
+
+sqlite3 gets its best case here: WAL, and a 60 s `busy_timeout`. The timeout is
+not a courtesy — without it every loser of a write race returns `SQLITE_BUSY` and
+the run dies. **That asymmetry is itself the result**: mpedb's arm has no retry
+path because there is nothing to retry. The 2-process dip is real and
+reproducible; it is not explained yet.
+
+Read this table for its *shape*, not its absolutes: sqlite3 sags gently with more
+writers (90k → 81k) while mpedb stays flat-ish. The dev box's run-to-run CV is
+9% — see "Measure your instrument".
+
+**Peak memory, 4 concurrent writers, summed across the processes:**
+
+| | RssAnon (heap) | VmHWM (all resident pages) |
+|---|--:|--:|
+| mpedb | **1.2 MB** | 196 MB |
+| sqlite3 | 4.4 MB | 16 MB |
+
+Two columns because one would lie. **RssAnon is the comparable one** — what the
+engine actually allocated — and mpedb uses **3.7× less**, ~300 KB per writer
+process. **VmHWM goes the other way and it is an accounting artifact**: mpedb
+mmaps the database, so every page it touches is resident and charged to it, while
+sqlite3's identical data sits in the OS page cache charged to nobody. Quoting the
+VmHWM difference as "mpedb uses 12× the memory" would be a benchmark lying with
+true numbers.
+
+**And on hardware that has no room for a server:** a Raspberry Pi 3 B+ (armv7,
+921 MB, decoding ADS-B throughout) does 7,006 / 6,400 / 6,047 writes/s at 1 / 2 /
+4 processes, on **72 KB of heap**. Two orders of magnitude slower than the dev
+box, which is the point of including it — the interesting number is not the
+throughput, it is that the whole engine is 72 KB of anonymous memory and no
+daemon. PostgreSQL runs on a Pi 3 too; what it cannot do is cost nothing while
+idle.
 
 ## Apple Silicon (M3 Pro, 11 cores) — and the durability trap it exposed
 
