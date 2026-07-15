@@ -261,10 +261,14 @@ median of 3 alternating runs:
 
 | writer processes | mpedb | sqlite3 | ratio |
 |--:|--:|--:|--:|
-| 1 | 298,874/s | 90,195/s | 3.3× |
-| 2 | 160,098/s | 86,171/s | 1.9× |
-| 4 | 253,733/s | 80,126/s | 3.2× |
-| 8 | 274,023/s | 81,363/s | 3.4× |
+| 1 | 302,284/s | 89,702/s | 3.4× |
+| 2 | 186,479/s | 88,551/s | 2.1× |
+| 4 | 250,992/s | 83,300/s | 3.0× |
+| 8 | 270,822/s | 78,877/s | 3.4× |
+
+(Medians of 5, both arms measured in the same session. The 2-writer cell was
+160k before the writer-lock spin below; sqlite3 sags gently with more writers,
+90k → 79k, while mpedb stays flat-ish.)
 
 sqlite3 gets its best case here: WAL, and a 60 s `busy_timeout`. The timeout is
 not a courtesy — without it every loser of a write race returns `SQLITE_BUSY` and
@@ -314,9 +318,8 @@ mechanism is real on both. And the uncontended arm first measured **-1.56%
 effect. Five reps produce that kind of false positive; see "Measure your
 instrument".
 
-Read this table for its *shape*, not its absolutes: sqlite3 sags gently with more
-writers (90k → 81k) while mpedb stays flat-ish. The dev box's run-to-run CV is
-9% — see "Measure your instrument".
+Read this table for its *shape*, not its absolutes. The dev box's run-to-run CV
+is 9% — see "Measure your instrument".
 
 **Peak memory, 4 concurrent writers, summed across the processes:**
 
