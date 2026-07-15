@@ -13,8 +13,8 @@ use std::collections::BTreeSet;
 type PlannedStmt = (PlanStmt, Vec<Option<ColumnType>>, Vec<String>, BTreeSet<String>);
 use crate::binder::{compile_program, BExpr, Binder, Scope};
 use crate::plan::{
-    render_program, AccessPath, AggCall, Aggregation, CompiledPlan, InsertSource, OrderOver,
-    PlanOnConflict, PlanStmt, Projection,
+    render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource,
+    OrderOver, PlanOnConflict, PlanStmt, Projection,
 };
 use crate::policy::{PolicyCatalog, TablePolicies};
 use mpedb_types::{ExprProgram, ColumnType, Error, Footprint, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
@@ -203,6 +203,34 @@ pub fn secondary_indexes(table: &TableDef) -> Vec<u16> {
         })
         .map(|(i, _)| i as u16)
         .collect()
+}
+
+/// How `ON CONFLICT (<target>) DO UPDATE` must find the conflicting row.
+///
+/// The single source of truth for both the planner (which records it) and
+/// `CompiledPlan::validate` (which recomputes it and demands a match). A blob
+/// claiming "target (email), probe pk" would find a row by PK and report it as
+/// the email conflict — the wrong row, silently.
+///
+/// `None` = the target is neither the PK nor a single secondary UNIQUE column,
+/// so there is no key to probe by.
+pub(crate) fn conflict_probe_opt(table: &TableDef, target: &[u16]) -> Option<ConflictProbe> {
+    if target == table.primary_key {
+        return Some(ConflictProbe::Pk);
+    }
+    // The engine's secondary index probe takes ONE value (`get_by_index`), so a
+    // multi-column target has no index to use even if each column is unique
+    // alone — and "unique together" is not something the schema can declare.
+    let [col] = target else { return None };
+    let ino = secondary_indexes(table).iter().position(|c| c == col)?;
+    Some(ConflictProbe::Index(ino as u32 + 1))
+}
+
+/// The validate-side view: a target that resolves to nothing is corrupt, and
+/// `Pk` is the safe thing to compare an unresolvable one against (it will not
+/// match a real `Index` plan).
+pub(crate) fn conflict_probe(table: &TableDef, target: &[u16]) -> ConflictProbe {
+    conflict_probe_opt(table, target).unwrap_or(ConflictProbe::Pk)
 }
 
 fn bind_err(msg: impl Into<String>) -> Error {
@@ -1008,12 +1036,15 @@ fn plan_select(
 
 /// Compile an `ON CONFLICT` action.
 ///
-/// The conflict target must be the PRIMARY KEY. That is not a placeholder for
-/// laziness: the executor finds the conflicting row with `get_by_pk`, which is
-/// the only probe it has. A target naming a secondary unique column would need
-/// an index probe the write path does not expose, and guessing — "you said
-/// (email), I will upsert on the PK anyway" — would update the WRONG row. So it
-/// is refused with a message that says which columns would work.
+/// The target must be a key the executor can PROBE: the primary key, or one
+/// secondary UNIQUE column. That is the real constraint, and it is not
+/// stylistic — the executor has to find the row you conflicted with, and
+/// guessing ("you said (email), I will upsert on the PK anyway") updates the
+/// wrong row silently.
+///
+/// A multi-column non-PK target has no probe even when each column is unique
+/// on its own: `get_by_index` takes one value, and "unique together" is not
+/// something the schema can declare.
 fn plan_on_conflict(
     oc: &ast::OnConflict,
     binder: &mut Binder,
@@ -1039,21 +1070,24 @@ fn plan_on_conflict(
             .ok_or_else(|| bind_err(format!("unknown conflict-target column `{name}`")))?;
         tcols.push(i as u16);
     }
-    let pk: Vec<u16> = table.primary_key.clone();
-    if tcols != pk {
-        let pk_names: Vec<&str> = pk
+    let Some(probe) = conflict_probe_opt(table, &tcols) else {
+        let pk_names: Vec<&str> = table
+            .primary_key
             .iter()
             .map(|i| table.columns[*i as usize].name.as_str())
             .collect();
+        let mut usable = vec![format!("({})", pk_names.join(", "))];
+        for c in secondary_indexes(table) {
+            usable.push(format!("({})", table.columns[c as usize].name));
+        }
         return Err(bind_err(format!(
-            "ON CONFLICT ({}) is not supported: the conflict target must be the primary key \
-             ({}), because that is the only key the write path can probe. Upserting on a \
-             secondary unique column is not implemented — it would have to guess which row \
-             you meant.",
+            "ON CONFLICT ({}) is not supported: the target must be a key this can probe to \
+             find the row you conflicted with — the primary key, or one UNIQUE column. \
+             Usable here: {}.",
             target.join(", "),
-            pk_names.join(", ")
+            usable.join(", ")
         )));
-    }
+    };
     // `excluded.<c>` is in scope only here, and binds to Col(n + i): the
     // executor runs these over [existing ‖ proposed].
     binder.set_allow_excluded(true);
@@ -1090,6 +1124,7 @@ fn plan_on_conflict(
     binder.set_allow_excluded(false);
     Ok(PlanOnConflict::DoUpdate {
         target: tcols,
+        probe,
         set: bset,
         filter,
     })
