@@ -969,8 +969,26 @@ fn gen_select(rng: &mut Xorshift) -> GenStmt {
     } else {
         String::new()
     };
+    // Sometimes sort by something the query does NOT output, which makes the
+    // planner append a sort-only column and the executor trim it. The trim is
+    // the part worth exercising three-way: a leaked column is not a crash, it
+    // is an extra field in the answer, and `parse_pipe_row` would see it as a
+    // shape mismatch rather than a wrong value.
+    //
+    // `pk + 0` and `-pk` order identically to `pk` and `pk DESC` — pk is NOT
+    // NULL and the arithmetic is exact, so this stays inside difference #8's
+    // rule without needing a guard.
+    let (key, dir) = if rng.chance(1, 4) {
+        if dir.is_empty() {
+            ("pk + 0", "")
+        } else {
+            ("pk + 0", " DESC")
+        }
+    } else {
+        ("pk", dir)
+    };
     GenStmt {
-        sql: format!("SELECT pk, a, b, c FROM t{where_clause} ORDER BY pk{dir}{limit}"),
+        sql: format!("SELECT pk, a, b, c FROM t{where_clause} ORDER BY {key}{dir}{limit}"),
         is_select: true,
         shape: BASE_SHAPE.to_vec(),
     }
@@ -1285,6 +1303,14 @@ mod tests {
             .filter(|s| s.sql.contains("DISTINCT"))
             .count();
         assert!(distinct > 50, "too few DISTINCT probes: {distinct}");
+        // Sorting by something not in the output makes the planner append a
+        // sort-only column and the executor trim it. A leaked column shows up
+        // here as a shape mismatch, so the probe must actually be emitted.
+        let junk = (0..100)
+            .flat_map(|seed| generate_program(seed, 60))
+            .filter(|s| s.sql.contains("ORDER BY pk + 0"))
+            .count();
+        assert!(junk > 20, "too few sort-only-column probes: {junk}");
         assert!(grouped > 50, "too few GROUP BY probes: {grouped}");
         assert!(having > 10, "too few HAVING probes: {having}");
     }
@@ -1355,6 +1381,7 @@ mod tests {
                     // #8), not "only ever sort by pk"; grouped aggregate
                     // probes sort by their key, which the WHERE has already
                     // made NULL-free.
+                    // `pk` and any arithmetic on it are NOT NULL by schema.
                     let sorts_by_pk = rest.starts_with(" pk");
                     let key = rest.trim_start().split([' ', ',']).next().unwrap_or("");
                     // The guard must be a TOP-LEVEL conjunct of the WHERE. A

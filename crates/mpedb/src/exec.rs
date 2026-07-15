@@ -347,6 +347,7 @@ pub(crate) fn exec_stmt(
             aggregate,
             distinct,
             order_over,
+            order_junk,
         } => {
             let t = table_def(schema, *table)?;
             // DISTINCT makes LIMIT bound DISTINCT rows, so the scan bound (and
@@ -370,7 +371,7 @@ pub(crate) fn exec_stmt(
             if let Some(agg) = aggregate {
                 return exec_aggregate(
                     ctx, plan, params, t, *table, access, filter.as_ref(), agg, projection,
-                    order_by, *order_over, *limit, *offset, *distinct,
+                    order_by, *order_over, *order_junk, *limit, *offset, *distinct,
                 );
             }
             let rows = if *order_over != OrderOver::BaseRow {
@@ -426,10 +427,21 @@ pub(crate) fn exec_stmt(
             }
             if *order_over != OrderOver::BaseRow {
                 sort_rows(&mut out, order_by);
+                // Sort-only columns come off AFTER the sort and before the
+                // caller sees anything. They are always trailing, so the trim
+                // is a truncate — and it must reach `columns` below too, or the
+                // header would name a column the rows no longer carry.
+                if *order_junk > 0 {
+                    let keep = projection.len() - *order_junk as usize;
+                    for row in &mut out {
+                        row.truncate(keep);
+                    }
+                }
                 out = out.into_iter().skip(skip).take(take).collect();
             }
             let columns = projection
                 .iter()
+                .take(projection.len() - *order_junk as usize)
                 .map(|p| match p {
                     Projection::Column(i) => t
                         .columns
@@ -742,6 +754,7 @@ fn exec_aggregate(
     projection: &[Projection],
     order_by: &[(u16, bool)],
     order_over: OrderOver,
+    order_junk: u16,
     limit: Option<u64>,
     offset: Option<u64>,
     distinct: bool,
@@ -838,9 +851,18 @@ fn exec_aggregate(
     if order_over == OrderOver::Projection {
         sort_rows(&mut projected, order_by);
     }
+    // Sort-only columns come off after the sort, exactly as in the plain path —
+    // `ORDER BY count(*) + 1` computes a column nobody asked to see.
+    if order_junk > 0 {
+        let keep = projection.len() - order_junk as usize;
+        for row in &mut projected {
+            row.truncate(keep);
+        }
+    }
     let projected: Vec<Vec<Value>> = projected.into_iter().skip(skip).take(take).collect();
     let columns = projection
         .iter()
+        .take(projection.len() - order_junk as usize)
         .map(|p| match p {
             Projection::Column(i) => t
                 .columns

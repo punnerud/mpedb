@@ -339,15 +339,95 @@ SELECT amt * 2 FROM t WHERE amt IS NOT NULL ORDER BY amt * 2
 200
 400
 
-# `ORDER BY 1 + 1` is NOT an ordinal — only a bare literal is. sqlite treats
-# it as a constant and leaves the rows unsorted; this refuses instead, as PG
-# does, rather than answer an ORDER BY with an arbitrary order.
-statement error ORDER BY
+# `ORDER BY 1 + 1` is NOT an ordinal — only a bare literal is. It is a
+# CONSTANT, which names no column and therefore orders nothing: every row gets
+# the same key. sqlite accepts it and hands back scan order — an arbitrary
+# answer to a query that asked for an order. This refuses, as PG does, because
+# the reason people write it is that they meant `ORDER BY 2`.
+statement error constant
 SELECT dept, amt FROM t ORDER BY 1 + 1
 
-# Known gap, recorded rather than left to be rediscovered: sqlite and PG both
-# allow sorting by an expression that is NOT in the output. Here the sort runs
-# over the projection, so there is nowhere for such a key to live, and it is
-# refused with a message that says so.
+# The same rule, without the ordinal confusion.
+statement error constant
+SELECT dept FROM t ORDER BY 'x'
+
+statement error constant
+SELECT dept FROM t ORDER BY 1 + 1 DESC
+
+# ---- sorting by something the query does not output ---------------------------------
+# The sort runs over the projection, so a key that is not in the output has
+# nowhere to live — unless one is made for it. The planner appends a sort-only
+# ("junk") column, the executor sorts, then trims it before the caller sees
+# anything. PostgreSQL calls these resjunk columns.
+#
+# The trim is the part worth testing: a leaked junk column is not a crash, it
+# is an extra column in the answer.
+
+query T nosort
+SELECT dept FROM t ORDER BY amt + 1, id
+----
+sales
+sales
+eng
+ops
+eng
+eng
+eng
+
+query I nosort
+SELECT id FROM t ORDER BY amt DESC, id LIMIT 3
+----
+3
+1
+2
+
+query T nosort
+SELECT dept FROM t WHERE amt IS NOT NULL ORDER BY amt * -1, id
+----
+eng
+eng
+eng
+ops
+
+# A scalar function as the sort key.
+query IT nosort
+SELECT id, dept FROM t ORDER BY length(dept), id LIMIT 3
+----
+1
+eng
+2
+eng
+3
+eng
+
+# LIMIT/OFFSET count OUTPUT rows, not rows the junk column made.
+query I nosort
+SELECT id FROM t ORDER BY amt + 1, id LIMIT 2 OFFSET 2
+----
+7
+6
+
+# Grouped: `ORDER BY count(*) * 10` is not a column of the grouped tuple
+# either, so it gets the same treatment.
+query TI nosort
+SELECT dept, count(*) FROM t GROUP BY dept ORDER BY count(*) * 10, dept
+----
+ops
+1
+sales
+2
+eng
+4
+
+query T nosort
+SELECT dept FROM t GROUP BY dept ORDER BY sum(amt) + 0, dept
+----
+sales
+ops
+eng
+
+# But under DISTINCT there is still nowhere to put it, and that is the rule
+# rather than a limitation: a junk column would dedup on a value the caller
+# never sees.
 statement error SELECT list
-SELECT dept FROM t ORDER BY amt + 1
+SELECT DISTINCT dept FROM t ORDER BY amt + 1
