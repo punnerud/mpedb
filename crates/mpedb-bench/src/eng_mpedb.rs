@@ -17,20 +17,30 @@ use crate::util::{err, BResult};
 
 const SIZE_MB: u64 = 1024;
 
-/// KNOWN ENGINE RACE, found by this benchmark (durability=commit only):
-/// `mpedb-core::shm::newest_meta` loads the `durable_txn` gate ONCE and then
-/// validates both meta slots against it. A reader descheduled between the
-/// gate load and the slot reads — while TWO durable commits land (one per
-/// double-buffer slot) — finds both checksum-VALID slots gated
-/// (`txn_id > gate`) and gets a spurious
-/// `Error::Corrupt("no valid meta page (both checksums invalid)")`.
-/// The database is NOT corrupt: a fresh `begin_read` reloads the (monotone)
-/// gate and succeeds. Reproduces in seconds here: 3 readers + 1 durable
-/// writer on 2 cores. The real fix (reload the gate and retry inside
-/// `newest_meta`) belongs in mpedb-core, which parallel work owns — so this
-/// adapter retries the read instead, bounded, with the retry time COUNTED IN
-/// the measured latency, and the total is reported. Genuine corruption would
-/// not clear and still fails after the bound.
+/// TRIPWIRE for a race this benchmark found and the engine has since fixed —
+/// **this counter should always read 0**.
+///
+/// The race (durability=commit only): a reader that loads the `durable_txn`
+/// gate and is then descheduled while TWO durable commits land (one per
+/// double-buffer slot) finds both checksum-VALID slots gated (`txn_id > gate`)
+/// and gets a spurious `Error::Corrupt("no valid meta page ...")`. The database
+/// is not corrupt; re-reading succeeds.
+///
+/// `mpedb-core::shm::newest_meta` now reloads the monotone gate and retries,
+/// which closes it. **Verified by experiment, not by reading the code** (2026-07-15,
+/// this box, 3 readers + 1 durable writer on 2 cores, same `--only mpedb` flags
+/// both arms):
+///
+/// ```text
+///   newest_meta's retry loop disabled → 3 spurious retries observed
+///   newest_meta as shipped            → 0
+/// ```
+///
+/// So the retry below is no longer a workaround; it is what keeps a regression
+/// in `newest_meta` from being reported as engine corruption. **If this counter
+/// is ever non-zero, that retry has regressed — do not "fix" it here.** Retry
+/// time is counted in the measured latency, and genuine corruption still fails
+/// after the bound.
 pub static SPURIOUS_CORRUPT_RETRIES: AtomicU64 = AtomicU64::new(0);
 const CORRUPT_RETRY_BOUND: u32 = 100;
 

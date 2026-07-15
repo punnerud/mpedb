@@ -620,12 +620,23 @@ merely noisy.
    — including two "obvious" fixes that made it 2.4× worse — are recorded in
    [`crates/mpedb-core/tests/high_water_leak.rs`](crates/mpedb-core/tests/high_water_leak.rs).
 
-2. **`newest_meta` stale-gate race (durability=commit).** A reader that loads the
-   `durable_txn` gate, then is descheduled while two durable commits land, gets a
-   spurious `Corrupt("no valid meta page")` — both meta slots are newer than its
-   stale gate. The DB is *not* corrupt; a re-read succeeds. The bench adapter
-   retries (bounded) and counts it. **Fix:** reload the monotone gate and retry in
-   `mpedb-core::shm::newest_meta`.
+2. ~~**`newest_meta` stale-gate race (durability=commit).**~~ **Already fixed —
+   this entry described code that does not exist.** The race is real: a reader
+   that loads the `durable_txn` gate and is then descheduled while two durable
+   commits land finds both checksum-valid slots newer than its stale gate and
+   gets a spurious `Corrupt("no valid meta page")`. The window is wide on
+   purpose — the commit path writes the meta slot, then `msync`s it
+   (milliseconds on real disk), and only then advances the gate.
+
+   But `shm::newest_meta` already reloads the monotone gate and retries, which
+   is exactly the fix this entry asked for. Verified by experiment rather than by
+   reading it (2026-07-15, same `--only mpedb` flags both arms): with that retry
+   loop disabled the benchmark reports **3** spurious reader retries within
+   seconds; as shipped, **0**. The `mpedb-bench` adapter's own bounded retry
+   stays, re-purposed as the **tripwire** — if its counter is ever non-zero,
+   `newest_meta`'s retry has regressed and the fix belongs there, not in the
+   adapter.
+
 3. **`durability=commit` single-client floor.** Group-commit engages only under
    contention, so a lone durable writer pays one serialized msync per commit —
    525 ops/s insert, the slowest cell in the suite (SQLite FULL does 1,632, and

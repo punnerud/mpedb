@@ -751,6 +751,16 @@ impl Shm {
         // newer than it — a spurious "no valid meta". Reload the gate and
         // retry: a fresh gate only ever admits more, and the newest slot is
         // always <= the gate its committer advanced.
+        //
+        // ⚠ This loop is LOAD-BEARING, and it is cheap to prove: replace it with
+        // a single `newest_meta_gated(self.durable_txn().load(Acquire))` and
+        // `cargo run -p mpedb-bench -- --only mpedb` reports spurious reader
+        // retries within seconds (measured 2026-07-15: 3 with it disabled, 0 as
+        // shipped, same flags both arms). The commit path publishes the meta slot
+        // BEFORE it advances the gate — `write_meta_slot`, then `msync_page`
+        // (milliseconds on real disk), then `durable_txn.fetch_max` — so the
+        // window is wide and a reader falls in it under load. mpedb-bench's
+        // SPURIOUS_CORRUPT_RETRIES counter is the tripwire for that regression.
         let mut last_gate = 0;
         for _ in 0..64 {
             let gate = self.durable_txn().load(Ordering::Acquire);
