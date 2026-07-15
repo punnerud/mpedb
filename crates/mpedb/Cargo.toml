@@ -5,6 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Embedded multi-process shared-memory database with SQL and content-hashed plans"
 
+[dev-dependencies]
+# `examples/multiproc_check.rs` forks. Nothing in the library needs libc.
+libc = { workspace = true }
+
 [dependencies]
 mpedb-types = { workspace = true }
 mpedb-core = { workspace = true }

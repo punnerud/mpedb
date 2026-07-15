@@ -152,9 +152,10 @@ rather than unit tests.
 
 ## Platforms
 
-- **Linux — x86-64 and 32/64-bit ARM** — the reference platform: full
-  crash-safety (robust `PROCESS_SHARED` mutex with `EOWNERDEAD` recovery) and
-  durability. 32-bit ARM works because it has lock-free `AtomicU64`.
+- **Linux — x86-64 and 32-bit ARM** — the reference platform: full crash-safety
+  (robust `PROCESS_SHARED` mutex with `EOWNERDEAD` recovery) and durability.
+  32-bit ARM works because it has lock-free `AtomicU64`, and that is measured
+  rather than argued — see the table below.
 - **macOS — Apple Silicon** — crash-safe via the **FLD-2 writer lock**: a
   sidecar `flock` (which the kernel releases on holder death) plus a private
   `ERRORCHECK` mutex and a shared tri-state word give owner-death recovery
@@ -162,11 +163,28 @@ rather than unit tests.
   16 KiB-aligned `msync`. All platform code is `#[cfg]`-gated behind
   `crate::os`, so the Linux path stays byte-identical.
 
-Platform claims are verified on real hardware: the multi-process `crash` harness
-observes owner-death recovery (`eowner_recovery=true`) under SIGKILL waves across
-`none`/`commit`/`wal` durability on both Linux and an M3 Mac, and `cargo test
---workspace` + `cargo clippy … -D warnings` run on both. See
-[`DESIGN-MACOS-LOCK.md`](DESIGN-MACOS-LOCK.md).
+Platform claims are verified on real hardware, and the table says which hardware:
+
+| platform | what has actually run there |
+|---|---|
+| Linux x86-64 | everything: `cargo test --workspace`, clippy, the `stress`/`crash`/`powerloss`/`collide` harnesses across `none`/`commit`/`wal`, the 3-way differential |
+| macOS / Apple Silicon (M3) | `cargo test --workspace`, clippy, the `crash` harness under SIGKILL waves across all durability classes (`eowner_recovery=true`), the benchmark suite |
+| **Linux armv7l (32-bit ARM)** | 318 cross-compiled tests, 0 failures — including the whole `mpedb-core` shm/btree/COW suite — plus `examples/multiproc_check.rs`: 4 SIGKILL waves against 3 concurrent writer processes, `verify()` clean after each. A Raspberry Pi 3 B+, kernel 6.1. |
+| Linux aarch64 (64-bit ARM) | **nothing yet.** Covered by inference from the other three, which is exactly the kind of claim this table exists to stop making. |
+
+The 32-bit ARM row is the one worth explaining. This README used to assert that
+"32-bit ARM works because it has lock-free `AtomicU64`" — a sound argument, and
+an argument is not a measurement. It is now measured, and it holds: `armv7`
+gives Rust native 64-bit atomics via `ldrexd`/`strexd`, so the packed
+`{pid, seq}` reader words and the meta double-buffer are genuinely lock-free
+across processes. A lock-based fallback would have been silently wrong — the
+lock would live in one process's memory and guard nothing in another's.
+
+ARM is also where the fences earn their keep. x86-64 is TSO, so a missing
+barrier in the reader-pin protocol (DESIGN.md §4.3) usually hides; ARM is
+weakly ordered and it would not.
+
+See [`DESIGN-MACOS-LOCK.md`](DESIGN-MACOS-LOCK.md) for the macOS lock design.
 
 ## Differential testing vs sqlite3 / PostgreSQL
 
