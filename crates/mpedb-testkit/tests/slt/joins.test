@@ -1,0 +1,306 @@
+# INNER JOIN of two tables in one file.
+#
+# Expected values come from running the same program through sqlite3 3.45.
+#
+# The thing to hold onto: an INNER JOIN emits a row only where BOTH sides
+# match. So `dee` (whose did is NULL) never appears, and the 'empty' dept
+# never appears — a NULL never equals anything, including another NULL, and a
+# dept with no employees has nothing to pair with. Neither is a special case;
+# both fall out of the ON condition being a plain 3VL predicate.
+#
+# Output columns are qualified `<table>.<column>` because `did` alone would
+# not say which side it came from, and both sides have one.
+#
+# schema:
+# [[table]]
+# name = "dept"
+# primary_key = ["did"]
+#
+#   [[table.column]]
+#   name = "did"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "dname"
+#   type = "text"
+#
+# [[table]]
+# name = "emp"
+# primary_key = ["eid"]
+#
+#   [[table.column]]
+#   name = "eid"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "ename"
+#   type = "text"
+#
+#   [[table.column]]
+#   name = "did"
+#   type = "int64"
+#   nullable = true
+# end schema
+
+statement ok
+INSERT INTO dept (did, dname) VALUES (1, 'eng'), (2, 'sales'), (3, 'empty')
+
+statement ok
+INSERT INTO emp (eid, ename, did) VALUES (10, 'ann', 1), (11, 'bob', 1), (12, 'cy', 2)
+
+# `dee` has no department.
+statement ok
+INSERT INTO emp (eid, ename, did) VALUES (13, 'dee', NULL)
+
+# ---- the basic shape ----------------------------------------------------------------
+
+query TT nosort
+SELECT emp.ename, dept.dname FROM emp JOIN dept ON emp.did = dept.did ORDER BY emp.eid
+----
+ann
+eng
+bob
+eng
+cy
+sales
+
+# Unqualified names resolve when they are unambiguous. `did` would NOT be —
+# both tables have it — and that is an error rather than a silent pick.
+query TT nosort
+SELECT ename, dname FROM emp JOIN dept ON emp.did = dept.did ORDER BY eid
+----
+ann
+eng
+bob
+eng
+cy
+sales
+
+statement error ambiguous
+SELECT did FROM emp JOIN dept ON emp.did = dept.did
+
+# INNER is the default; spelling it changes nothing.
+query TT nosort
+SELECT emp.ename, dept.dname FROM emp INNER JOIN dept ON emp.did = dept.did ORDER BY emp.eid
+----
+ann
+eng
+bob
+eng
+cy
+sales
+
+# ---- what an INNER JOIN drops -------------------------------------------------------
+# 4 employees and 3 departments, but only 3 rows: `dee` has a NULL did (NULL
+# equals nothing, not even NULL), and 'empty' has nobody to pair with.
+
+query T nosort
+SELECT dept.dname FROM emp JOIN dept ON emp.did = dept.did ORDER BY dept.dname
+----
+eng
+eng
+sales
+
+# ---- WHERE, over the joined row -----------------------------------------------------
+
+query T nosort
+SELECT emp.ename FROM emp JOIN dept ON emp.did = dept.did WHERE dept.dname = 'eng' ORDER BY emp.eid
+----
+ann
+bob
+
+# `IS NOT NULL` on the join column is redundant — the ON already dropped the
+# NULL row, because NULL = anything is NULL and not TRUE. Pinned so that the
+# day someone "optimizes" NULL handling in the ON, this says what changed.
+query T nosort
+SELECT emp.ename FROM emp JOIN dept ON emp.did = dept.did WHERE emp.did IS NOT NULL ORDER BY emp.eid
+----
+ann
+bob
+cy
+
+# ---- ON is a predicate, not just an equality ----------------------------------------
+
+query II nosort
+SELECT emp.eid, dept.did FROM emp JOIN dept ON emp.did > dept.did ORDER BY emp.eid, dept.did
+----
+12
+1
+
+# An ON that ignores the outer row entirely: every surviving outer row pairs
+# with the one matching dept. This is legal, and it is why ON is required —
+# leaving it out would silently mean this.
+query TT nosort
+SELECT emp.ename, dept.dname FROM emp JOIN dept ON dept.did = 1 ORDER BY emp.eid, dept.dname
+----
+ann
+eng
+bob
+eng
+cy
+eng
+dee
+eng
+
+# ---- the rest of the surface still applies ------------------------------------------
+
+query T nosort
+SELECT DISTINCT dept.dname FROM emp JOIN dept ON emp.did = dept.did ORDER BY dept.dname
+----
+eng
+sales
+
+# LIMIT bounds JOINED rows, not outer rows.
+query T nosort
+SELECT emp.ename FROM emp JOIN dept ON emp.did = dept.did ORDER BY emp.eid LIMIT 2 OFFSET 1
+----
+bob
+cy
+
+# `SELECT *` is every column of both sides, outer first — the order the tuple
+# is built in.
+query ITIIT nosort
+SELECT * FROM emp JOIN dept ON emp.did = dept.did ORDER BY emp.eid
+----
+10
+ann
+1
+1
+eng
+11
+bob
+1
+1
+eng
+12
+cy
+2
+2
+sales
+
+query TI nosort
+SELECT emp.ename, dept.did * 10 FROM emp JOIN dept ON emp.did = dept.did ORDER BY emp.eid
+----
+ann
+10
+bob
+10
+cy
+20
+
+# Sorting by a column of the INNER table, which the query does not output —
+# the sort-only column machinery reaches across the join too.
+query T nosort
+SELECT emp.ename FROM emp JOIN dept ON emp.did = dept.did ORDER BY dept.dname, emp.ename
+----
+ann
+bob
+cy
+
+# The whole expression surface works over the joined row — it is one tuple,
+# just wider.
+
+query TT nosort
+SELECT emp.ename, CASE WHEN dept.did = 1 THEN 'core' ELSE 'other' END FROM emp JOIN dept ON emp.did = dept.did ORDER BY emp.eid
+----
+ann
+core
+bob
+core
+cy
+other
+
+query T nosort
+SELECT emp.ename FROM emp JOIN dept ON emp.did = dept.did WHERE dept.dname IN ('eng', 'zzz') ORDER BY emp.eid
+----
+ann
+bob
+
+query T nosort
+SELECT emp.ename FROM emp JOIN dept ON emp.did = dept.did WHERE dept.dname LIKE 'e%' ORDER BY emp.eid
+----
+ann
+bob
+
+# The same column name from both sides, side by side — this is what the
+# qualifier is for.
+query II nosort
+SELECT emp.did, dept.did FROM emp JOIN dept ON emp.did = dept.did ORDER BY emp.eid
+----
+1
+1
+1
+1
+2
+2
+
+# An ON with more than one conjunct.
+query T nosort
+SELECT emp.ename FROM emp JOIN dept ON emp.did = dept.did AND dept.dname = 'eng' ORDER BY emp.eid
+----
+ann
+bob
+
+# ORDER BY an ordinal, over a join.
+query TT nosort
+SELECT emp.ename, dept.dname FROM emp JOIN dept ON emp.did = dept.did ORDER BY 2, 1
+----
+ann
+eng
+bob
+eng
+cy
+sales
+
+# ORDER BY a computed key over the INNER table, output by neither — a
+# sort-only column reaching across the join.
+query T nosort
+SELECT emp.ename FROM emp JOIN dept ON emp.did = dept.did ORDER BY dept.did * -1, emp.eid
+----
+cy
+ann
+bob
+
+# ---- what is refused, and why -------------------------------------------------------
+
+# A self-join has no alias syntax to tell the two sides apart, so `emp.eid`
+# would be ambiguous with no way to disambiguate it. Refused rather than
+# resolved to whichever side came first.
+statement error joined to itself
+SELECT emp.eid FROM emp JOIN emp ON emp.eid = emp.eid
+
+# ON is required. A comma-join is a cartesian product, and the times someone
+# means one are far outnumbered by the times they forgot the condition.
+statement error ON after JOIN
+SELECT emp.eid FROM emp JOIN dept
+
+# Aggregates over a join are the known gap, and it includes `count(*)`. The
+# grouping step resolves names against ONE table and builds its grouped tuple
+# from that table's columns; over a join the row is `[outer ‖ inner]` and
+# neither is true. Refused with a message that says so, rather than answering
+# a question nobody asked.
+statement error not supported yet
+SELECT dname, count(*) FROM emp JOIN dept ON emp.did = dept.did GROUP BY dname
+
+statement error not supported yet
+SELECT count(*) FROM emp JOIN dept ON emp.did = dept.did
+
+# A qualifier that names no table in the statement is a typo, not a hint.
+statement error no table named
+SELECT nonsense.eid FROM emp JOIN dept ON emp.did = dept.did
+
+# ---- EXPLAIN tells the truth about the cost -----------------------------------------
+# The footprint reads 0x3 — one bit per table. A join that claimed only the
+# outer would under-claim `tables_read`, and `conflicts_with` is a bitmap AND,
+# so a writer to `dept` would not be seen to conflict with this reader.
+
+query T nosort
+EXPLAIN SELECT emp.ename FROM emp JOIN dept ON emp.did = dept.did
+----
+Select emp
+  access: FullScan
+  inner join dept (nested loop, O(n*m) — no predicate pushdown)
+    access: FullScan
+    on: emp.did = dept.did
+  project: emp.ename
+  footprint: read_only=true tables_read=0x3 tables_written=0x0 indexes_used=0x1 key=Full

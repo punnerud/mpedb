@@ -5,7 +5,10 @@
 //! < `+ -` < `* / %` < unary `-` < primary.
 //! Comparisons do not chain (`a < b < c` is a parse error).
 
-use crate::ast::{BinOp, DeleteStmt, Expr, InsertStmt, OnConflict, SelectStmt, Stmt, UnOp, UpdateStmt};
+use crate::ast::{
+    BinOp, DeleteStmt, Expr, InsertStmt, JoinClause, OnConflict, SelectStmt, Stmt, UnOp,
+    UpdateStmt,
+};
 use crate::ddl::{CreatePolicySpec, DdlStmt, RlsAction};
 use crate::token::{tokenize, Kw, SpTok, Tok};
 use mpedb_types::{Error, PolicyCmd, Result, Value};
@@ -388,7 +391,7 @@ impl<'a> Parser<'a> {
     fn parse_create_policy(&mut self) -> Result<DdlStmt> {
         self.expect_word("POLICY")?;
         let name = self.ident("policy name")?;
-        self.expect_word("ON")?;
+        self.expect_kw(Kw::On, "ON")?;
         let table = self.ident("table name")?;
         let mut permissive = true;
         if self.eat_word("AS") {
@@ -432,7 +435,7 @@ impl<'a> Parser<'a> {
     fn parse_drop_policy(&mut self) -> Result<DdlStmt> {
         self.expect_word("POLICY")?;
         let name = self.ident("policy name")?;
-        self.expect_word("ON")?;
+        self.expect_kw(Kw::On, "ON")?;
         let table = self.ident("table name")?;
         Ok(DdlStmt::DropPolicy { table, name })
     }
@@ -511,6 +514,19 @@ impl<'a> Parser<'a> {
         };
         self.expect_kw(Kw::From, "FROM")?;
         let table = self.ident("table name")?;
+        // `[INNER] JOIN b ON <cond>`. INNER is the default and the only kind:
+        // LEFT/RIGHT/FULL change what a missing match MEANS (a NULL-extended
+        // row rather than no row), which the executor would have to be taught
+        // separately — so they are refused rather than silently treated as
+        // INNER, which would drop rows the query asked to keep.
+        let join = if self.eat_kw(Kw::Inner) {
+            self.expect_kw(Kw::Join, "JOIN after INNER")?;
+            Some(self.join_tail()?)
+        } else if self.eat_kw(Kw::Join) {
+            Some(self.join_tail()?)
+        } else {
+            None
+        };
         let where_clause = if self.eat_kw(Kw::Where) {
             Some(self.expr()?)
         } else {
@@ -573,6 +589,7 @@ impl<'a> Parser<'a> {
         };
         Ok(Stmt::Select(SelectStmt {
             table,
+            join,
             distinct,
             items,
             where_clause,
@@ -582,6 +599,17 @@ impl<'a> Parser<'a> {
             limit,
             offset,
         }))
+    }
+
+    /// The part of a JOIN after the `JOIN` keyword.
+    fn join_tail(&mut self) -> Result<JoinClause> {
+        let table = self.ident("table name after JOIN")?;
+        // ON is required. A comma-join / cross join is a cartesian product, and
+        // the times someone means one are far outnumbered by the times they
+        // forgot the condition.
+        self.expect_kw(Kw::On, "ON after JOIN — the join condition is required")?;
+        let on = self.expr()?;
+        Ok(JoinClause { table, on })
     }
 
     fn nonneg_int(&mut self, what: &str) -> Result<u64> {
@@ -638,7 +666,7 @@ impl<'a> Parser<'a> {
 
     /// `ON CONFLICT [(cols)] DO NOTHING | DO UPDATE SET … [WHERE …]`.
     fn on_conflict_clause(&mut self) -> Result<OnConflict> {
-        if !self.eat_word("ON") {
+        if !self.eat_kw(Kw::On) {
             return Ok(OnConflict::Error);
         }
         self.expect_kw(Kw::Conflict, "CONFLICT after ON")?;

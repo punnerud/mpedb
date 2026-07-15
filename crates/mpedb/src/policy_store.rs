@@ -265,16 +265,20 @@ fn one_table_from_scan(scan: &[(Vec<u8>, Vec<u8>)], table_id: u32) -> Result<Tab
     Ok(tp)
 }
 
-/// Decide whether a plan is stale relative to `live_epoch` (already read from
-/// the executing pin). Fast path: epochs equal ⇒ current. Slow path: the epoch
-/// moved, so recompute the table's live policy content hash from `scan` and
-/// compare — a no-op edit still matches, a real edit is stale.
-fn is_stale(plan: &CompiledPlan, table_id: u32, live_epoch: u64, scan: &[(Vec<u8>, Vec<u8>)]) -> Result<bool> {
-    if live_epoch == plan.policy_epoch {
+/// Decide whether one stamped table is stale relative to `live_epoch` (already
+/// read from the executing pin). Fast path: epochs equal ⇒ current. Slow path:
+/// the epoch moved, so recompute that table's live policy content hash from
+/// `scan` and compare — a no-op edit still matches, a real edit is stale.
+fn is_stale(
+    stamp: &mpedb_sql::PolicyStamp,
+    live_epoch: u64,
+    scan: &[(Vec<u8>, Vec<u8>)],
+) -> Result<bool> {
+    if live_epoch == stamp.epoch {
         return Ok(false);
     }
-    let tp = one_table_from_scan(scan, table_id)?;
-    Ok(mpedb_sql::table_policy_hash(Some(&tp)) != plan.policy_hash)
+    let tp = one_table_from_scan(scan, stamp.table)?;
+    Ok(mpedb_sql::table_policy_hash(Some(&tp)) != stamp.hash)
 }
 
 impl Database {
@@ -296,17 +300,21 @@ impl Database {
         plan: &CompiledPlan,
         r: &mpedb_core::ReadTxn<'_>,
     ) -> Result<()> {
-        let table = match plan.target_table() {
-            Some(t) => t,
-            None => return Ok(()),
-        };
-        let live_epoch = r.sys_get(&with_table_id(POLEP_PREFIX, table))?.map_or(0, |b| epoch_of(&b));
-        if live_epoch == plan.policy_epoch {
-            return Ok(());
-        }
-        if is_stale(plan, table, live_epoch, &r.sys_scan()?)? {
-            self.evict(hash);
-            return Err(Error::PlanInvalidated);
+        // EVERY table whose policy the plan baked in, not just the first. A
+        // join bakes two, and checking only the outer would let a cached plan
+        // keep serving the inner table's rows under a policy that has since
+        // been tightened — §4's leak, reopened by the table it forgot.
+        for stamp in &plan.policies {
+            let live_epoch = r
+                .sys_get(&with_table_id(POLEP_PREFIX, stamp.table))?
+                .map_or(0, |b| epoch_of(&b));
+            if live_epoch == stamp.epoch {
+                continue;
+            }
+            if is_stale(stamp, live_epoch, &r.sys_scan()?)? {
+                self.evict(hash);
+                return Err(Error::PlanInvalidated);
+            }
         }
         Ok(())
     }
@@ -319,17 +327,17 @@ impl Database {
         plan: &CompiledPlan,
         w: &mut mpedb_core::WriteTxn<'_>,
     ) -> Result<()> {
-        let table = match plan.target_table() {
-            Some(t) => t,
-            None => return Ok(()),
-        };
-        let live_epoch = w.sys_get(&with_table_id(POLEP_PREFIX, table))?.map_or(0, |b| epoch_of(&b));
-        if live_epoch == plan.policy_epoch {
-            return Ok(());
-        }
-        if is_stale(plan, table, live_epoch, &w.sys_scan()?)? {
-            self.evict(hash);
-            return Err(Error::PlanInvalidated);
+        for stamp in &plan.policies {
+            let live_epoch = w
+                .sys_get(&with_table_id(POLEP_PREFIX, stamp.table))?
+                .map_or(0, |b| epoch_of(&b));
+            if live_epoch == stamp.epoch {
+                continue;
+            }
+            if is_stale(stamp, live_epoch, &w.sys_scan()?)? {
+                self.evict(hash);
+                return Err(Error::PlanInvalidated);
+            }
         }
         Ok(())
     }
@@ -885,6 +893,151 @@ mod tests {
             db.execute(&h, &[Value::Int(2), Value::Int(2)]),
             Err(mpedb_types::Error::PlanInvalidated)
         ));
+        db.verify().unwrap();
+    }
+
+    /// A two-table database for the join tests: `orders` and `lines`, each
+    /// tenant-scoped.
+    fn joindb(tag: &str) -> crate::testdb::TestDb {
+        let path = format!("/dev/shm/mpedb-rlsj-{tag}-{}.mpedb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+        let cfg = Config::from_toml_str(&format!(
+            "[database]\npath = \"{path}\"\nsize_mb = 8\n\
+             [[table]]\nname = \"lines\"\nprimary_key = [\"lid\"]\n  \
+             [[table.column]]\n  name = \"lid\"\n  type = \"int64\"\n  \
+             [[table.column]]\n  name = \"oid\"\n  type = \"int64\"\n  \
+             [[table.column]]\n  name = \"tenant\"\n  type = \"int64\"\n\
+             [[table]]\nname = \"orders\"\nprimary_key = [\"id\"]\n  \
+             [[table.column]]\n  name = \"id\"\n  type = \"int64\"\n  \
+             [[table.column]]\n  name = \"tenant\"\n  type = \"int64\"\n  \
+             [[table.column]]\n  name = \"note\"\n  type = \"text\"\n  nullable = true"
+        ))
+        .unwrap();
+        crate::testdb::TestDb::new_db(Database::open_with_config(cfg).unwrap())
+    }
+
+    /// RLS applies to BOTH sides of a join. The inner table's policy is not
+    /// something the outer's visibility implies: tenant 1 can see order 1, and
+    /// that must not carry tenant 2's line rows along with it.
+    #[test]
+    fn rls_filters_both_sides_of_a_join() {
+        let db = joindb("both");
+        for (id, t) in [(1, 1), (2, 2)] {
+            db.query(
+                "INSERT INTO orders (id, tenant, note) VALUES ($1, $2, NULL)",
+                &[Value::Int(id), Value::Int(t)],
+            )
+            .unwrap();
+        }
+        // Line 20 belongs to ORDER 1 (tenant 1) but is itself tenant 2 — the
+        // shape that catches a join which only filters the outer side.
+        for (lid, oid, t) in [(10, 1, 1), (20, 1, 2), (30, 2, 2)] {
+            db.query(
+                "INSERT INTO lines (lid, oid, tenant) VALUES ($1, $2, $3)",
+                &[Value::Int(lid), Value::Int(oid), Value::Int(t)],
+            )
+            .unwrap();
+        }
+        for t in ["orders", "lines"] {
+            db.query(
+                &format!(
+                    "CREATE POLICY tenant_iso ON {t} FOR ALL \
+                     USING (tenant = current_setting('app.tenant'))"
+                ),
+                &[],
+            )
+            .unwrap();
+            db.query(&format!("ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"), &[])
+                .unwrap();
+        }
+
+        let sql = "SELECT lines.lid FROM lines JOIN orders ON lines.oid = orders.id \
+                   ORDER BY lines.lid";
+        // Tenant 1 sees line 10 only. Line 20 joins to a VISIBLE order (order 1
+        // is tenant 1) — so it is dropped by `lines`' own policy, which is the
+        // whole point.
+        match db.query_ctx(&sess(1), sql, &[]).unwrap() {
+            ExecResult::Rows { rows, .. } => {
+                assert_eq!(rows, vec![vec![Value::Int(10)]], "tenant 1");
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        // Tenant 2 sees line 30 (order 2). Line 20 is tenant 2's, but its order
+        // is tenant 1's and therefore invisible — so the inner join has nothing
+        // to pair it with.
+        match db.query_ctx(&sess(2), sql, &[]).unwrap() {
+            ExecResult::Rows { rows, .. } => {
+                assert_eq!(rows, vec![vec![Value::Int(30)]], "tenant 2");
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        db.verify().unwrap();
+    }
+
+    /// The leak-proofing must cover EVERY table the plan baked a policy for.
+    ///
+    /// A join stamps two. If only the outer were stamped, a cached plan would
+    /// keep serving the inner table's rows under the policy frozen at compile
+    /// time — so tightening `lines`' policy would change nothing until the
+    /// plan happened to be evicted. That is §4's leak, reopened by the table
+    /// the check forgot.
+    #[test]
+    fn tightening_the_inner_tables_policy_invalidates_a_cached_join_plan() {
+        let db = joindb("stale");
+        db.query(
+            "INSERT INTO orders (id, tenant, note) VALUES (1, 1, NULL)",
+            &[],
+        )
+        .unwrap();
+        for (lid, t) in [(10, 1), (20, 1)] {
+            db.query(
+                "INSERT INTO lines (lid, oid, tenant) VALUES ($1, 1, $2)",
+                &[Value::Int(lid), Value::Int(t)],
+            )
+            .unwrap();
+        }
+        // `lines` is the OUTER table (it is the one in FROM) and is policed
+        // from the start. `orders` — the INNER side — is wide open. Getting
+        // this the wrong way round makes the test pass on the outer stamp
+        // alone and prove nothing.
+        db.query(
+            "CREATE POLICY line_iso ON lines FOR ALL \
+             USING (tenant = current_setting('app.tenant'))",
+            &[],
+        )
+        .unwrap();
+        db.query("ALTER TABLE lines ENABLE ROW LEVEL SECURITY", &[])
+            .unwrap();
+
+        let sql = "SELECT lines.lid FROM lines JOIN orders ON lines.oid = orders.id \
+                   ORDER BY lines.lid";
+        let hash = db.prepare(sql).unwrap();
+        assert_eq!(
+            nrows(db.execute_ctx(&sess(1), &hash, &[]).unwrap()),
+            2,
+            "both lines visible while `orders` is unpoliced"
+        );
+
+        // Now police the INNER table so its only row disappears. The cached
+        // plan still carries the OLD `orders` policy (none), and the OUTER
+        // table's epoch has not moved — so only the inner stamp can catch this.
+        db.query("CREATE POLICY order_iso ON orders FOR ALL USING (id > 99)", &[])
+            .unwrap();
+        db.query("ALTER TABLE orders ENABLE ROW LEVEL SECURITY", &[])
+            .unwrap();
+
+        // The cached plan must be REFUSED, not silently reused.
+        assert!(
+            matches!(
+                db.execute_ctx(&sess(1), &hash, &[]),
+                Err(mpedb_types::Error::PlanInvalidated)
+            ),
+            "a policy edit on the INNER table must invalidate the cached join plan"
+        );
+        // Re-preparing picks the new policy up: order 1 is now invisible, so
+        // the inner join has nothing to pair the lines with.
+        let hash = db.prepare(sql).unwrap();
+        assert_eq!(nrows(db.execute_ctx(&sess(1), &hash, &[]).unwrap()), 0);
         db.verify().unwrap();
     }
 

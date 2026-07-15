@@ -26,7 +26,41 @@ use mpedb_types::{AggFn,
 ///    later bounds check, but "most likely" is exactly what this byte exists to
 ///    replace with "always".
 /// 4: `Select` encodes `order_over` before the `order_by` count.
-const PLAN_FORMAT: u8 = 4;
+/// 5: joins. `Select` encodes a `join` tag and `order_junk`, and the plan
+///    header carries a LIST of policy stamps where it carried one epoch+hash.
+const PLAN_FORMAT: u8 = 5;
+
+/// One table's RLS state, frozen at compile time. See
+/// [`CompiledPlan::policies`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyStamp {
+    pub table: u32,
+    pub epoch: u64,
+    pub hash: [u8; 32],
+}
+
+/// The inner side of an `INNER JOIN`, driven by a nested loop over the outer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    pub table: u32,
+    /// How the inner side is read FOR EACH outer row.
+    pub access: AccessPath,
+    /// The `ON` condition, over the JOINED row `[outer ‖ inner]`. Kept separate
+    /// from `filter` even though an INNER JOIN's ON and WHERE are
+    /// interchangeable, because they are not interchangeable for the reader:
+    /// `EXPLAIN` has to be able to say which one the query wrote.
+    pub on: ExprProgram,
+    /// The inner table's RLS `USING`, over the INNER row alone — applied as the
+    /// inner side is read, before `on` ever sees it.
+    ///
+    /// It cannot be folded into `on` or `filter`: those run over the joined
+    /// tuple, and mpedb's expressions can RAISE (division by zero, overflow).
+    /// A raise is observable, so an `on` that divides by an inner column would
+    /// report the existence of a row the policy hides — without ever returning
+    /// it. Filtering first is what makes the policy a filter rather than a
+    /// suggestion.
+    pub policy: Option<ExprProgram>,
+}
 
 /// Which tuple a `Select`'s `order_by` indexes.
 ///
@@ -67,15 +101,21 @@ pub struct CompiledPlan {
     /// values are NEVER stored here — they are filled from the caller's
     /// `Session` at execute time, so one content-hashed plan serves all sessions.
     pub context_keys: Vec<String>,
-    /// The target table's RLS `pol_epoch` at compile time (Phase-5 leak-proofing,
-    /// DESIGN-MULTIDB.md §4). Fast-path staleness check: if the live epoch still
-    /// equals this, the baked policy is current.
-    pub policy_epoch: u64,
-    /// Content hash of the target table's applicable policy set at compile time
-    /// ([`table_policy_hash`](crate::table_policy_hash)). When the epoch moved,
-    /// a matching recomputed hash still proves the plan is current (a no-op edit);
-    /// a mismatch is stale ⇒ `PlanInvalidated`.
-    pub policy_hash: [u8; 32],
+    /// RLS leak-proofing (DESIGN-MULTIDB.md §4), one entry per table whose
+    /// policy this plan BAKED IN — which for a join is both of them.
+    ///
+    /// This is a list rather than a single pair because the check has to cover
+    /// every policy the plan froze. Validating only the outer table of a join
+    /// would let a cached plan keep serving the inner table's rows under a
+    /// policy that has since been tightened: the exact leak §4 exists to close,
+    /// reopened by the table it forgot.
+    ///
+    /// Each entry: the table's `pol_epoch` at compile time (fast path: equal
+    /// epoch ⇒ current), and the content hash of its applicable policy set
+    /// ([`table_policy_hash`](crate::table_policy_hash)) — so a moved epoch with
+    /// a matching hash (a no-op edit) is still current, and a mismatch is stale
+    /// ⇒ `PlanInvalidated`.
+    pub policies: Vec<PolicyStamp>,
     /// Plan-level constant pool, referenced by [`KeyPart::Const`] and
     /// [`InsertSource::Const`].
     pub consts: Vec<Value>,
@@ -91,8 +131,24 @@ pub enum PlanStmt {
     Select {
         table: u32,
         access: AccessPath,
-        /// Residual predicate after access-path extraction.
+        /// `INNER JOIN`. `None` = a single-table read, and then every tuple
+        /// below is the base row.
+        join: Option<Join>,
+        /// Residual predicate after access-path extraction, over the BASE row
+        /// (the outer row, when joined). Always the base row — see
+        /// `joined_filter` for the other one.
         filter: Option<ExprProgram>,
+        /// Predicate over the JOINED row `[outer ‖ inner]`; `None` without a
+        /// join.
+        ///
+        /// The split from `filter` is the security-relevant part, not a
+        /// refactor: RLS policies live in `filter` and `join.policy`, which run
+        /// over one row each and BEFORE this. mpedb's expressions can raise
+        /// (division by zero, overflow), and a raise is observable — so a
+        /// predicate over the joined row that divides by a hidden row's column
+        /// would report that row's existence without returning it. Everything
+        /// that can raise waits until both policies have had their say.
+        joined_filter: Option<ExprProgram>,
         /// Output columns, in order.
         projection: Vec<Projection>,
         /// (column index, descending). Empty = scan order. The index is into
@@ -376,8 +432,12 @@ impl CompiledPlan {
             buf.extend_from_slice(&(k.len() as u16).to_le_bytes());
             buf.extend_from_slice(k.as_bytes());
         }
-        buf.extend_from_slice(&self.policy_epoch.to_le_bytes());
-        buf.extend_from_slice(&self.policy_hash);
+        buf.extend_from_slice(&(self.policies.len() as u16).to_le_bytes());
+        for p in &self.policies {
+            buf.extend_from_slice(&p.table.to_le_bytes());
+            buf.extend_from_slice(&p.epoch.to_le_bytes());
+            buf.extend_from_slice(&p.hash);
+        }
         buf.extend_from_slice(&(self.consts.len() as u16).to_le_bytes());
         for c in &self.consts {
             write_value(&mut buf, c);
@@ -434,9 +494,20 @@ impl CompiledPlan {
             }
             context_keys.push(key);
         }
-        let policy_epoch = r_u64(bytes, &mut pos)?;
-        let mut policy_hash = [0u8; 32];
-        policy_hash.copy_from_slice(take(bytes, &mut pos, 32)?);
+        let n_pol = r_u16(bytes, &mut pos)? as usize;
+        // One per table the statement touches; a join touches two. The cap is a
+        // sanity bound on a length read from an untrusted blob.
+        if n_pol > MAX_COLUMNS {
+            return Err(corrupt("too many policy stamps in plan"));
+        }
+        let mut policies = Vec::with_capacity(n_pol.min(8));
+        for _ in 0..n_pol {
+            let table = r_u32(bytes, &mut pos)?;
+            let epoch = r_u64(bytes, &mut pos)?;
+            let mut hash = [0u8; 32];
+            hash.copy_from_slice(take(bytes, &mut pos, 32)?);
+            policies.push(PolicyStamp { table, epoch, hash });
+        }
         let n_consts = r_u16(bytes, &mut pos)?;
         let mut consts = Vec::with_capacity((n_consts as usize).min(1024));
         for _ in 0..n_consts {
@@ -453,8 +524,7 @@ impl CompiledPlan {
             n_params,
             param_types,
             context_keys,
-            policy_epoch,
-            policy_hash,
+            policies,
             consts,
             footprint,
         };
@@ -479,6 +549,8 @@ impl CompiledPlan {
             PlanStmt::Select {
                 table,
                 access,
+                join,
+                joined_filter,
                 filter,
                 projection,
                 order_by,
@@ -506,6 +578,38 @@ impl CompiledPlan {
                     }
                 }
                 self.check_access(access, t)?;
+                // With a join the "base row" IS the joined row, so every width
+                // below moves. Getting this wrong is not cosmetic: a program
+                // bounded against the outer's width alone could not name the
+                // inner's columns at all, and one bounded against nothing could
+                // read past the tuple.
+                let join_t = match join {
+                    Some(j) => Some(get_table(j.table)?),
+                    None => None,
+                };
+                let base_width = t.columns.len() + join_t.map_or(0, |j| j.columns.len());
+                if let Some(j) = join {
+                    let jt = join_t.expect("set together");
+                    if j.table == *table {
+                        // The binder refuses self-joins (no alias syntax to tell
+                        // the sides apart), so a blob claiming one is forged.
+                        return Err(corrupt("join of a table to itself"));
+                    }
+                    self.check_access(&j.access, jt)?;
+                    // The inner's POLICY runs over the inner row alone — that
+                    // is the whole point of it being separate — so it is bounded
+                    // by the inner's width, not the joined one.
+                    if let Some(p) = &j.policy {
+                        self.check_program(p, jt)?;
+                    }
+                    self.check_program_width(&j.on, base_width)?;
+                }
+                if let Some(jf) = joined_filter {
+                    if join.is_none() {
+                        return Err(corrupt("joined filter without a join"));
+                    }
+                    self.check_program_width(jf, base_width)?;
+                }
                 // The sort key is an index into whichever tuple `order_over`
                 // names, and those have different widths. Bounding it against
                 // the wrong one is not a style point: too LOOSE lets a hostile
@@ -515,12 +619,16 @@ impl CompiledPlan {
                 // failing, and the caller gets an unordered answer to an
                 // ORDER BY query.
                 let order_width = |projection_len: usize, grouped: Option<usize>| match order_over {
-                    OrderOver::BaseRow => t.columns.len(),
+                    OrderOver::BaseRow => base_width,
                     OrderOver::Grouped => grouped.unwrap_or(0),
                     OrderOver::Projection => projection_len,
                 };
                 if let Some(f) = filter {
+                    // The OUTER's policy/residual, over the outer row alone.
                     self.check_program(f, t)?;
+                }
+                if join.is_some() && aggregate.is_some() {
+                    return Err(corrupt("aggregate over a join is not supported"));
                 }
                 if let Some(a) = aggregate {
                     // GROUP BY columns and aggregate ARGUMENTS index the BASE
@@ -570,11 +678,13 @@ impl CompiledPlan {
                 for p in projection {
                     match p {
                         Projection::Column(i) => {
-                            if *i as usize >= t.columns.len() {
+                            if *i as usize >= base_width {
                                 return Err(corrupt("projection column out of range"));
                             }
                         }
-                        Projection::Expr { program, .. } => self.check_program(program, t)?,
+                        Projection::Expr { program, .. } => {
+                            self.check_program_width(program, base_width)?
+                        }
                     }
                 }
                 // A plain Select has no grouped tuple, so `OrderOver::Grouped`
@@ -897,6 +1007,8 @@ impl CompiledPlan {
             PlanStmt::Select {
                 table,
                 access,
+                join,
+                joined_filter,
                 filter,
                 projection,
                 order_by,
@@ -907,7 +1019,25 @@ impl CompiledPlan {
                 distinct,
                 order_junk,
             } => {
-                let base = col_namer(*table);
+                // With a join every tuple below is `[outer ‖ inner]`, so the
+                // namer has to span both — and it qualifies, because `did` alone
+                // would not say which side, and both sides usually have one.
+                let outer_t = schema.table(*table).cloned();
+                let inner_t = join.as_ref().and_then(|j| schema.table(j.table).cloned());
+                let single = col_namer(*table);
+                let base = |c: u16| match (&outer_t, &inner_t) {
+                    (Some(o), Some(i)) => {
+                        let n = o.columns.len();
+                        if (c as usize) < n {
+                            format!("{}.{}", o.name, o.columns[c as usize].name)
+                        } else if (c as usize) < n + i.columns.len() {
+                            format!("{}.{}", i.name, i.columns[c as usize - n].name)
+                        } else {
+                            format!("col#{c}")
+                        }
+                    }
+                    _ => single(c),
+                };
                 out.push_str(&format!(
                     "Select{} {}\n",
                     if *distinct { " DISTINCT" } else { "" },
@@ -918,7 +1048,26 @@ impl CompiledPlan {
                     self.render_access(access, schema, *table)
                 ));
                 if let Some(f) = filter {
-                    out.push_str(&format!("  filter: {}\n", render_program(f, &base)));
+                    // Over the OUTER row alone, so it uses the outer's namer.
+                    out.push_str(&format!("  filter: {}\n", render_program(f, &single)));
+                }
+                if let Some(j) = join {
+                    out.push_str(&format!(
+                        "  inner join {} (nested loop, O(n*m) — no predicate pushdown)\n",
+                        table_name(j.table)
+                    ));
+                    out.push_str(&format!(
+                        "    access: {}\n",
+                        self.render_access(&j.access, schema, j.table)
+                    ));
+                    if let Some(p) = &j.policy {
+                        let iname = col_namer(j.table);
+                        out.push_str(&format!("    policy: {}\n", render_program(p, &iname)));
+                    }
+                    out.push_str(&format!("    on: {}\n", render_program(&j.on, &base)));
+                }
+                if let Some(jf) = joined_filter {
+                    out.push_str(&format!("  filter (joined): {}\n", render_program(jf, &base)));
                 }
                 // Everything below a grouping step indexes the GROUPED tuple
                 // `[keys ‖ aggs]`, not the base row — so it needs its own namer.
@@ -1484,6 +1633,8 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
         PlanStmt::Select {
             table,
             access,
+            join,
+            joined_filter,
             filter,
             projection,
             order_by,
@@ -1525,6 +1676,17 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             }
             encode_opt_u64(*limit, buf);
             encode_opt_u64(*offset, buf);
+            match join {
+                None => buf.push(0),
+                Some(j) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&j.table.to_le_bytes());
+                    encode_access(&j.access, buf);
+                    j.on.encode_into(buf);
+                    encode_opt_program(j.policy.as_ref(), buf);
+                    encode_opt_program(joined_filter.as_ref(), buf);
+                }
+            }
             buf.push(*distinct as u8);
             w_u16(buf, *order_junk);
             match aggregate {
@@ -1673,6 +1835,21 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
             }
             let limit = decode_opt_u64(buf, pos)?;
             let offset = decode_opt_u64(buf, pos)?;
+            let join = match r_u8(buf, pos)? {
+                0 => None,
+                1 => Some(Join {
+                    table: r_u32(buf, pos)?,
+                    access: decode_access(buf, pos)?,
+                    on: ExprProgram::decode(buf, pos)?,
+                    policy: decode_opt_program(buf, pos)?,
+                }),
+                t => return Err(corrupt(format!("bad join tag {t}"))),
+            };
+            let joined_filter = if join.is_some() {
+                decode_opt_program(buf, pos)?
+            } else {
+                None
+            };
             let distinct = match r_u8(buf, pos)? {
                 0 => false,
                 1 => true,
@@ -1731,6 +1908,8 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
             Ok(PlanStmt::Select {
                 table,
                 access,
+                join,
+                joined_filter,
                 filter,
                 projection,
                 order_by,
@@ -2062,10 +2241,12 @@ mod tests {
         let p = prepare("SELECT * FROM users WHERE id = $1", &s).unwrap();
         let bytes = p.encode();
         // Footprint starts right after: format(1) + schema(32) + nparams(2)
-        // + param tags(n) + context_keys count(2, none here) + policy_epoch(8)
-        // + policy_hash(32) + nconsts(2) + consts.
+        // + param tags(n) + context_keys count(2, none here)
+        // + npolicies(2) + npolicies * (table 4 + epoch 8 + hash 32)
+        // + nconsts(2) + consts.
         assert!(p.context_keys.is_empty());
-        let mut off = 1 + 32 + 2 + p.param_types.len() + 2 + 8 + 32 + 2;
+        let mut off =
+            1 + 32 + 2 + p.param_types.len() + 2 + 2 + p.policies.len() * (4 + 8 + 32) + 2;
         for c in &p.consts {
             let mut tmp = Vec::new();
             write_value(&mut tmp, c);
