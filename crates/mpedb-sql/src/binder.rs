@@ -151,6 +151,28 @@ impl<'a> Scope<'a> {
         })
     }
 
+    /// Name a slot for humans: bare with one table, `<table>.<column>` with
+    /// more — because `did` alone would not say which side it came from, and
+    /// both sides usually have one.
+    ///
+    /// The single place that answers "what is slot N called", so EXPLAIN, the
+    /// output header and an error message cannot drift apart.
+    pub fn slot_name(&self, c: u16) -> String {
+        let mut base = 0usize;
+        for t in &self.tables {
+            if (c as usize) < base + t.columns.len() {
+                let col = &t.columns[c as usize - base].name;
+                return if self.tables.len() == 1 {
+                    col.clone()
+                } else {
+                    format!("{}.{}", t.name, col)
+                };
+            }
+            base += t.columns.len();
+        }
+        format!("col#{c}")
+    }
+
     /// Resolve a QUALIFIED `<table>.<column>`. The qualifier is checked rather
     /// than dropped: accepting `nonsense.id` as `id` turns a typo into a
     /// wrong-table read the moment a scope holds more than one table.

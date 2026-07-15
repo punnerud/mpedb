@@ -550,11 +550,11 @@ impl<'a> Parser<'a> {
         // GROUP BY … HAVING …, between WHERE and ORDER BY. The order is SQL's
         // and it is also the execution order: filter, then group, then HAVING —
         // which is exactly why HAVING sees the grouped row and WHERE cannot.
-        let mut group_by: Vec<String> = Vec::new();
+        let mut group_by: Vec<Expr> = Vec::new();
         if self.eat_kw(Kw::Group) {
             self.expect_kw(Kw::By, "BY after GROUP")?;
             loop {
-                group_by.push(self.ident("column name in GROUP BY")?);
+                group_by.push(self.expr()?);
                 if group_by.len() > MAX_ORDER_BY_ITEMS {
                     return Err(self.err_here(format!(
                         "too many GROUP BY items (max {MAX_ORDER_BY_ITEMS})"
@@ -1440,7 +1440,7 @@ mod tests {
                 .unwrap();
         match s {
             Stmt::Select(sel) => {
-                assert_eq!(sel.group_by, vec!["dept".to_string()]);
+                assert_eq!(sel.group_by, vec![Expr::Col("dept".into())]);
                 assert_eq!(
                     sel.order_by,
                     vec![(Expr::Agg(mpedb_types::AggFn::Count, None, false), true)]
