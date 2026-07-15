@@ -503,6 +503,107 @@ def check_persistence(db, prev_runs):
     ok(f"persistence: data from {len(prev_runs)} previous run(s) intact")
 
 
+def test_dbapi(cfg_path, base):
+    """PEP 249, so sqlite3-shaped code runs unchanged."""
+    assert mpedb.apilevel == "2.0", mpedb.apilevel
+    assert mpedb.paramstyle == "qmark", mpedb.paramstyle
+    assert mpedb.threadsafety == 1, mpedb.threadsafety
+    ok("dbapi: module globals")
+
+    conn = mpedb.connect(cfg_path)
+    cur = conn.cursor()
+
+    # `?` placeholders, rowcount, commit.
+    cur.execute("INSERT INTO users (id, email, age) VALUES (?, ?, ?)",
+                [base + 900, f"dbapi{base}@x", 30])
+    assert cur.rowcount == 1, cur.rowcount
+    conn.commit()
+    ok("dbapi: execute/rowcount/commit")
+
+    # description names the output columns; PEP 249 allows the other six
+    # fields to be None, and they are.
+    cur.execute("SELECT id, email FROM users WHERE id = ?", [base + 900])
+    assert [d[0] for d in cur.description] == ["id", "email"], cur.description
+    assert all(len(d) == 7 for d in cur.description)
+    assert cur.fetchall() == [(base + 900, f"dbapi{base}@x")]
+    ok("dbapi: description/fetchall")
+
+    # fetchone / fetchmany / iteration all walk the same cursor.
+    cur.execute("SELECT id FROM users WHERE id >= ? ORDER BY id", [base + 900])
+    assert cur.fetchone() is not None
+    cur.execute("SELECT id FROM users WHERE id >= ? ORDER BY id", [base + 900])
+    assert len(cur.fetchmany(1)) == 1
+    cur.execute("SELECT id FROM users WHERE id >= ? ORDER BY id", [base + 900])
+    assert len(list(cur)) >= 1
+    ok("dbapi: fetchone/fetchmany/__iter__")
+
+    cur.executemany("INSERT INTO users (id, email, age) VALUES (?, ?, ?)",
+                    [[base + 901, f"m1{base}@x", 1], [base + 902, f"m2{base}@x", 2]])
+    conn.commit()
+    cur.execute("SELECT count(*) FROM users WHERE id >= ?", [base + 900])
+    assert cur.fetchone() == (3,), "executemany"
+    ok("dbapi: executemany")
+
+    # rollback drops what was buffered.
+    cur.execute("INSERT INTO users (id, email, age) VALUES (?, ?, ?)",
+                [base + 903, f"gone{base}@x", 9])
+    conn.rollback()
+    cur.execute("SELECT count(*) FROM users WHERE id >= ?", [base + 900])
+    assert cur.fetchone() == (3,), "rollback"
+    ok("dbapi: rollback")
+
+    # THE rewrite test: a `?` inside a string literal is a character, not a
+    # parameter. A regex-based driver gets this wrong and corrupts the value
+    # silently, because the statement still parses.
+    cur.execute("SELECT ?, 'why?' FROM users WHERE id = ?", [42, base + 900])
+    assert cur.fetchone() == (42, "why?"), "qmark inside a literal"
+    ok("dbapi: ? inside a string literal is not a parameter")
+
+    # Context manager: commit on a clean exit, roll back on an exception.
+    with mpedb.connect(cfg_path) as c2:
+        c2.execute("INSERT INTO users (id, email, age) VALUES (?, ?, ?)",
+                   [base + 904, f"ctx{base}@x", 4])
+    assert conn.execute("SELECT count(*) FROM users WHERE id = ?",
+                        [base + 904]).fetchone() == (1,)
+    try:
+        with mpedb.connect(cfg_path) as c3:
+            c3.execute("INSERT INTO users (id, email, age) VALUES (?, ?, ?)",
+                       [base + 905, f"boom{base}@x", 5])
+            raise ValueError("boom")
+    except ValueError:
+        pass
+    assert conn.execute("SELECT count(*) FROM users WHERE id = ?",
+                        [base + 905]).fetchone() == (0,), "__exit__ must roll back"
+    ok("dbapi: context manager commits / rolls back")
+
+    # Errors are DB-API exceptions, and they arrive at execute() rather than
+    # waiting for commit() — the caller is still looking at the statement.
+    try:
+        conn.execute("INSERT INTO users (id, email, age) VALUES (?, ?, ?)",
+                     [base + 900, f"dup{base}@x", 1])
+        raise AssertionError("a duplicate PK must not be accepted")
+    except mpedb.IntegrityError:
+        pass
+    ok("dbapi: IntegrityError at execute()")
+
+    # The honest boundary: mpedb has no DDL, and a sqlite3 program that runs
+    # some fails HERE rather than being told it is "100% compatible".
+    try:
+        conn.execute("CREATE TABLE nope (id INTEGER)")
+        raise AssertionError("DDL must be refused")
+    except mpedb.ProgrammingError:
+        pass
+    ok("dbapi: DDL is refused, loudly")
+
+    conn.close()
+    try:
+        conn.execute("SELECT 1 FROM users")
+        raise AssertionError("a closed connection must refuse")
+    except mpedb.Error:
+        pass
+    ok("dbapi: close()")
+
+
 def main():
     workdir = sys.argv[1] if len(sys.argv) > 1 else tempfile.mkdtemp(prefix="mpedb-py-")
     os.makedirs(workdir, exist_ok=True)
@@ -535,6 +636,7 @@ def main():
     test_threading(db, base + 400)
     test_second_handle(db, cfg_path, h_sel_users, base)
     test_detached_and_session(db, cfg_path, base)
+    test_dbapi(cfg_path, base)
 
     db.verify()
     ok("verify()")

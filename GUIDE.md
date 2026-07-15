@@ -424,17 +424,56 @@ cargo build --release -p mpedb-py
 cp target/release/libmpedb_py.so mpedb.so
 ```
 
+There are two APIs. The **DB-API 2.0** one (PEP 249) is what `sqlite3`-shaped
+code already expects:
+
 ```python
-import mpedb
+import mpedb                       # apilevel '2.0', paramstyle 'qmark'
 
-db = mpedb.Database("app.toml")
-db.query("INSERT INTO users (id, email) VALUES ($1, $2)", [1, "ada@example.com"])
+conn = mpedb.connect("app.toml")
+cur = conn.cursor()
+cur.execute("INSERT INTO users (id, email) VALUES (?, ?)", [1, "ada@example.com"])
+conn.commit()
 
-db.query("SELECT email FROM users WHERE id = $1", [1])
-# -> [('ada@example.com',)]
+cur.execute("SELECT id, email FROM users WHERE id = ?", [1])
+[d[0] for d in cur.description]    # -> ['id', 'email']
+cur.fetchall()                     # -> [(1, 'ada@example.com')]
 ```
 
-Rows come back as a list of tuples, and errors are **DB-API 2.0 exceptions**:
+`connect` / `cursor` / `execute` / `executemany` / `fetchone` / `fetchmany` /
+`fetchall` / `description` / `rowcount` / `commit` / `rollback` / `close`,
+iteration over a cursor, and the connection as a context manager (commit on a
+clean exit, roll back on an exception — sqlite3's semantics).
+
+Both `?` and `$1` work, and mixing them in one statement is refused rather than
+guessed at. That is the engine's parser, not a driver rewrite, so a `?` inside a
+string literal is a question mark:
+
+```python
+conn.execute("SELECT ?, 'why?' FROM users WHERE id = ?", [42, 1]).fetchone()
+# -> (42, 'why?')
+```
+
+**Two things it does not pretend.** There is no `CREATE TABLE`, so a program
+that runs DDL raises `ProgrammingError` here — the schema comes from the config
+or `mirror import`. And a connection's buffered writes are not visible to its own
+reads until `commit()`: mpedb has one exclusive writer lock, so the driver
+buffers rather than holding it open across an idle `input()`.
+
+The direct API is the other one — no cursors, no buffering:
+
+```python
+db = mpedb.Database("app.toml")
+db.query("INSERT INTO users (id, email) VALUES ($1, $2)", [1, "ada@example.com"])
+db.query("SELECT email FROM users WHERE id = $1", [1])
+# -> [('ada@example.com',)]
+
+with db.begin() as tx:             # a real transaction, holds the writer lock
+    tx.query("INSERT INTO users (id, email) VALUES ($1, $2)", [2, "b@example.com"])
+```
+
+Either way, rows come back as a list of tuples and errors are **DB-API 2.0
+exceptions**:
 `IntegrityError` for a constraint (NOT NULL / UNIQUE / CHECK / PK),
 `ProgrammingError` for a bad statement or a type that does not fit the column,
 `OperationalError` for the engine. So `except IntegrityError` does what you
