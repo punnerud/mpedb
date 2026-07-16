@@ -356,6 +356,63 @@ fn aggregates_and_joins() {
         .query("SELECT DISTINCT oid FROM items ORDER BY oid", &[])
         .unwrap();
     assert_eq!(rows(r), vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+
+    // LEFT JOIN keeps the row with no match and NULL-extends the inner side:
+    // order 3 ("nobody") comes back with a NULL quantity instead of vanishing.
+    let r = db
+        .query(
+            "SELECT orders.customer, items.qty FROM orders \
+             LEFT JOIN items ON items.oid = orders.oid \
+             WHERE orders.oid = 3",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows(r), vec![vec![Value::Text("nobody".into()), Value::Null]]);
+
+    // A chain with aliases — the third table is the same physical table again
+    // (a self-join): every other item in the same order.
+    let r = db
+        .query(
+            "SELECT a.iid, b.iid FROM items a \
+             JOIN orders o ON a.oid = o.oid \
+             JOIN items b ON b.oid = o.oid AND b.iid > a.iid",
+            &[],
+        )
+        .unwrap();
+    assert_eq!(rows(r), vec![vec![Value::Int(10), Value::Int(11)]]);
+}
+
+/// GUIDE.md § Large values: stream them.
+#[test]
+fn stream_a_file_in() {
+    let path = format!("/dev/shm/mpedb-guide-blob-{}.mpedb", std::process::id());
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        "[database]\npath = \"{path}\"\nsize_mb = 16\n\
+         [[table]]\nname = \"files\"\nprimary_key = [\"id\"]\n  \
+         [[table.column]]\n  name = \"id\"\n  type = \"int64\"\n  \
+         [[table.column]]\n  name = \"data\"\n  type = \"blob\""
+    );
+    let db = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    let db = Tmp { db, path };
+
+    // A stand-in for "a big file on disk" — the memory ceiling is proven at
+    // 8 MiB in tests/insert_file.rs; the guide only shows the call shape.
+    let src = format!("/dev/shm/mpedb-guide-blob-src-{}", std::process::id());
+    std::fs::write(&src, vec![7u8; 128 * 1024]).unwrap();
+
+    // The guide's snippet: the `&[][..]` placeholder marks the streamed
+    // column; the file's bytes never sit in memory at once.
+    let mut s = db.begin().unwrap();
+    s.insert_file("files", &params![1i64, &[][..]], 1, &src).unwrap();
+    s.commit().unwrap();
+
+    let r = rows(db.query("SELECT data FROM files WHERE id = 1", &[]).unwrap());
+    match &r[0][0] {
+        Value::Blob(b) => assert_eq!(b.len(), 128 * 1024),
+        other => panic!("expected the blob back, got {other:?}"),
+    }
+    let _ = std::fs::remove_file(&src);
 }
 
 /// GUIDE.md § Coming from sqlite3 — the differences that will bite, each one
@@ -375,12 +432,17 @@ fn the_sqlite_differences_that_bite() {
     // 2. Division by zero raises; sqlite yields NULL.
     assert!(db.query("SELECT 1 / 0", &[]).is_err());
 
-    // 3. No 3+ table joins, no outer joins.
-    assert!(db
+    // 3. RIGHT/FULL/CROSS joins are refused BY NAME (LEFT and N-way chains
+    // work). RIGHT's message says the fix: swap the tables, write LEFT.
+    let err = db
         .query(
-            "SELECT oid FROM items LEFT JOIN orders ON items.oid = orders.oid",
-            &[]
+            "SELECT orders.oid FROM items RIGHT JOIN orders ON items.oid = orders.oid",
+            &[],
         )
+        .unwrap_err();
+    assert!(format!("{err}").contains("RIGHT JOIN is not supported"), "{err}");
+    assert!(db
+        .query("SELECT orders.oid FROM items CROSS JOIN orders", &[])
         .is_err());
 
     // 4. ORDER BY must name something the query outputs.

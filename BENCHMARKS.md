@@ -165,6 +165,11 @@ mpedb bench --auto --durability none|commit|wal|async   # mpedb-only, quick
 
 ## Headline results (2026-07-14 12:14 UTC, Linux, 2 idle cores, single-client unless noted)
 
+*Re-run 2026-07-16 after #37/#39/#42: every cell reproduced within the noise
+floor, so the table below stands as measured — deliberately not "freshened",
+because swapping in a statistically identical run would only launder noise
+into the history.*
+
 ### Embedded point operations, none-class — mpedb's home turf
 
 Zero-parse execute-by-hash + no IPC + a COW B+tree in the same address space:
