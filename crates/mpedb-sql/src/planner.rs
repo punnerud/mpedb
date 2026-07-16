@@ -199,7 +199,12 @@ pub fn secondary_indexes(table: &TableDef) -> Vec<u16> {
         .iter()
         .enumerate()
         .filter(|(i, c)| {
-            c.unique && !(table.primary_key.len() == 1 && table.primary_key[0] == *i as u16)
+            // A column with `unique` OR `indexed` is a secondary index. The PK's
+            // own single column is skipped — it already has index 0 (the PK
+            // tree). Both engine and SQL derive this identically, in
+            // column-declaration order, so index numbers agree (CLAUDE.md).
+            (c.unique || c.indexed)
+                && !(table.primary_key.len() == 1 && table.primary_key[0] == *i as u16)
         })
         .map(|(i, _)| i as u16)
         .collect()
@@ -462,6 +467,7 @@ fn synthetic_grouped_table(
             ty: src.ty,
             nullable: true, // a group key can be NULL; NULLs group together
             unique: false,
+            indexed: false,
             default: None,
             check: None,
         });
@@ -479,6 +485,7 @@ fn synthetic_grouped_table(
             // Every aggregate except COUNT is NULL over an empty group.
             nullable: !matches!(f, mpedb_types::AggFn::Count),
             unique: false,
+            indexed: false,
             default: None,
             check: None,
         });
@@ -2090,6 +2097,7 @@ pub(crate) mod tests {
             ty,
             nullable: true,
             unique: false,
+            indexed: false,
             default: None,
             check: None,
         }
@@ -2104,6 +2112,7 @@ pub(crate) mod tests {
                 ColumnDef {
                     nullable: false,
                     unique: true,
+                    indexed: false,
                     ..col("email", ColumnType::Text)
                 },
                 col("age", ColumnType::Int64),
@@ -2174,6 +2183,7 @@ pub(crate) mod tests {
                 ColumnDef {
                     nullable: false,
                     unique: true,
+                    indexed: false,
                     ..col("a", ColumnType::Int64)
                 },
                 ColumnDef { nullable: false, ..col("b", ColumnType::Int64) },

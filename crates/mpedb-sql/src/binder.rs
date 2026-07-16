@@ -1193,6 +1193,7 @@ mod tests {
             ty,
             nullable,
             unique: false,
+            indexed: false,
             default: None,
             check: None,
         };
@@ -1485,6 +1486,7 @@ mod tests {
                 ty: ColumnType::Text,
                 nullable: true,
                 unique: false,
+                indexed: false,
                 default: None,
                 check: None,
             }],
@@ -1521,6 +1523,7 @@ mod tests {
                 ty: ColumnType::Int64,
                 nullable: false,
                 unique: false,
+                indexed: false,
                 default: None,
                 check: None,
             }],

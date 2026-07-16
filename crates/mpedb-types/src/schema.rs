@@ -16,6 +16,11 @@ pub struct ColumnDef {
     pub ty: ColumnType,
     pub nullable: bool,
     pub unique: bool,
+    /// A non-unique secondary index (duplicates allowed). Distinct from
+    /// `unique`, which also builds an index but enforces uniqueness. A column
+    /// with either is a secondary index; `unique` decides how it is stored and
+    /// whether inserts are checked.
+    pub indexed: bool,
     pub default: Option<DefaultExpr>,
     /// CHECK expression source (SQL expression over this table's columns).
     /// Compiled to expression IR at attach time by the SQL layer; the source
@@ -207,7 +212,7 @@ impl Schema {
             for c in &t.columns {
                 write_str(&mut buf, &c.name);
                 buf.push(c.ty as u8);
-                buf.push((c.nullable as u8) | ((c.unique as u8) << 1));
+                buf.push((c.nullable as u8) | ((c.unique as u8) << 1) | ((c.indexed as u8) << 2));
                 match &c.default {
                     None => buf.push(0),
                     Some(DefaultExpr::Const(v)) => {
@@ -292,6 +297,7 @@ impl Schema {
                     ty,
                     nullable: flags & 1 != 0,
                     unique: flags & 2 != 0,
+                    indexed: flags & 4 != 0,
                     default,
                     check,
                 });
@@ -371,6 +377,7 @@ mod tests {
                     ty: ColumnType::Int64,
                     nullable: false,
                     unique: false,
+                    indexed: false,
                     default: None,
                     check: None,
                 },
@@ -379,6 +386,7 @@ mod tests {
                     ty: ColumnType::Text,
                     nullable: false,
                     unique: true,
+                    indexed: false,
                     default: None,
                     check: None,
                 },
@@ -387,6 +395,7 @@ mod tests {
                     ty: ColumnType::Int64,
                     nullable: true,
                     unique: false,
+                    indexed: false,
                     default: Some(DefaultExpr::Const(Value::Int(0))),
                     check: Some("age >= 0 AND age < 200".into()),
                 },
@@ -417,6 +426,7 @@ mod tests {
                             ty: ColumnType::Int64,
                             nullable: false,
                             unique: false,
+                            indexed: false,
                             default: None,
                             check: None,
                         }],
@@ -440,6 +450,7 @@ mod tests {
                 ty: ColumnType::Int64,
                 nullable: true,
                 unique: false,
+                indexed: false,
                 default: None,
                 check: None,
             }],
@@ -454,6 +465,7 @@ mod tests {
                 ty: ColumnType::Int64,
                 nullable: false,
                 unique: false,
+                indexed: false,
                 default: None,
                 check: None,
             }],
@@ -484,7 +496,7 @@ mod tests {
     #[test]
     fn a_table_id_is_its_sort_position_so_adding_a_table_renumbers() {
         let col = |n: &str| ColumnDef { name: n.into(), ty: ColumnType::Int64,
-            nullable: false, unique: false, default: None, check: None };
+            nullable: false, unique: false, indexed: false, default: None, check: None };
         let tbl = |n: &str| TableDef { name: n.into(), columns: vec![col("id")], primary_key: vec![0] };
 
         let before = Schema::new(vec![tbl("orders"), tbl("users")]).unwrap();

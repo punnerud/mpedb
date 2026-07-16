@@ -413,6 +413,7 @@ fn stale_plan_surfaces_plan_invalidated() {
         ty: ColumnType::Int64,
         nullable: false,
         unique: false,
+        indexed: false,
         default: None,
         check: None,
     };

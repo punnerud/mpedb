@@ -174,6 +174,12 @@ struct RawColumn {
     nullable: bool,
     #[serde(default)]
     unique: bool,
+    /// A non-unique secondary index — a lookup index that allows duplicates.
+    /// `unique = true` already builds an index (and enforces uniqueness); this
+    /// builds one WITHOUT the uniqueness constraint, for `WHERE col = ?` and
+    /// join lookups on a column that repeats.
+    #[serde(default)]
+    indexed: bool,
     #[serde(default)]
     default: Option<toml::Value>,
     #[serde(default)]
@@ -257,6 +263,7 @@ fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>) -> Result<Config> {
                     ty,
                     nullable: c.nullable,
                     unique: c.unique,
+                    indexed: c.indexed,
                     default,
                     check: c.check.clone(),
                 });

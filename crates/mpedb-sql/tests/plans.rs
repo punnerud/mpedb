@@ -12,6 +12,7 @@ fn col(name: &str, ty: ColumnType) -> ColumnDef {
         ty,
         nullable: true,
         unique: false,
+        indexed: false,
         default: None,
         check: None,
     }
@@ -29,6 +30,7 @@ fn schema() -> Schema {
             ColumnDef {
                 nullable: false,
                 unique: true,
+                indexed: false,
                 ..col("email", ColumnType::Text)
             },
             col("age", ColumnType::Int64),
@@ -55,6 +57,7 @@ fn schema() -> Schema {
             },
             ColumnDef {
                 unique: true,
+                indexed: false,
                 ..col("sku", ColumnType::Text)
             },
             col("note", ColumnType::Text),
