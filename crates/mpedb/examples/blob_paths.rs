@@ -48,10 +48,20 @@ use std::os::fd::AsRawFd;
 const PAGE: usize = 4096;
 const HDR: usize = 16; // mpedb's overflow page header (btree.rs)
 
+#[cfg(target_os = "linux")]
 fn ms(d: std::time::Duration) -> f64 {
     d.as_secs_f64() * 1e3
 }
 
+// copy_file_range / loff_t / fadvise are Linux-only; the numbers above are
+// Linux numbers. On other platforms this example is a no-op rather than a
+// build break for `cargo test --workspace`.
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("blob_paths measures Linux-specific I/O paths; nothing to do here");
+}
+
+#[cfg(target_os = "linux")]
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let dir = std::path::PathBuf::from(a.get(1).cloned().unwrap_or("/tmp/bp".into()));
