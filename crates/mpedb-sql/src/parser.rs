@@ -394,7 +394,7 @@ impl<'a> Parser<'a> {
         self.expect_kw(Kw::On, "ON")?;
         let table = self.ident("table name")?;
         let mut permissive = true;
-        if self.eat_word("AS") {
+        if self.eat_kw(Kw::As) {
             if self.eat_word("PERMISSIVE") {
                 permissive = true;
             } else if self.eat_word("RESTRICTIVE") {
@@ -514,6 +514,7 @@ impl<'a> Parser<'a> {
         };
         self.expect_kw(Kw::From, "FROM")?;
         let table = self.ident("table name")?;
+        let from_alias = self.opt_table_alias()?;
         // `[INNER] JOIN b ON <cond>`. INNER is the default and the only kind:
         // LEFT/RIGHT/FULL change what a missing match MEANS (a NULL-extended
         // row rather than no row), which the executor would have to be taught
@@ -604,6 +605,7 @@ impl<'a> Parser<'a> {
         };
         Ok(Stmt::Select(SelectStmt {
             table,
+            alias: from_alias,
             join,
             distinct,
             items,
@@ -629,14 +631,36 @@ impl<'a> Parser<'a> {
     }
 
     /// The part of a JOIN after the `JOIN` keyword.
+    /// `[AS] ident` after a table name, or nothing. A bare identifier here is
+    /// unambiguous: every other thing that can follow a table name (JOIN, ON,
+    /// WHERE, GROUP, ORDER, LIMIT, `;`, EOF) is a keyword or not an ident.
+    fn opt_table_alias(&mut self) -> Result<Option<String>> {
+        if self.eat_kw(Kw::As) {
+            return Ok(Some(self.ident("alias after AS")?));
+        }
+        // A bare ident is an alias — UNLESS it is a join-kind word. LEFT / RIGHT
+        // / FULL / CROSS / NATURAL / OUTER are not keywords (they are recognised
+        // positionally), so without this `FROM emp LEFT JOIN dept` would read
+        // `LEFT` as an alias for `emp` and lose the join. A quoted identifier is
+        // always an alias — quoting is how you'd name a table `left`.
+        if matches!(self.peek(), Some(Tok::QuotedIdent(_))) {
+            return Ok(Some(self.ident("table alias")?));
+        }
+        if matches!(self.peek(), Some(Tok::Ident(_))) && self.peek_join_kind().is_none() {
+            return Ok(Some(self.ident("table alias")?));
+        }
+        Ok(None)
+    }
+
     fn join_tail(&mut self) -> Result<JoinClause> {
         let table = self.ident("table name after JOIN")?;
+        let alias = self.opt_table_alias()?;
         // ON is required. A comma-join / cross join is a cartesian product, and
         // the times someone means one are far outnumbered by the times they
         // forgot the condition.
         self.expect_kw(Kw::On, "ON after JOIN — the join condition is required")?;
         let on = self.expr()?;
-        Ok(JoinClause { table, on })
+        Ok(JoinClause { table, alias, on })
     }
 
     fn nonneg_int(&mut self, what: &str) -> Result<u64> {
@@ -1640,7 +1664,9 @@ mod tests {
             Err(Error::Parse { pos, .. }) => assert_eq!(pos, 7),
             other => panic!("expected parse error, got {other:?}"),
         }
-        assert!(parse_statement("SELECT * FROM t garbage").is_err());
+        // `FROM t garbage` is now `FROM t AS garbage` — a valid alias (#44).
+        // Genuinely trailing input is a SECOND bare word after the alias.
+        assert!(parse_statement("SELECT * FROM t alias garbage").is_err());
         assert!(parse_statement("SELECT * FROM t; SELECT * FROM t").is_err());
         assert!(parse_statement("EXPLAIN EXPLAIN SELECT * FROM t").is_err());
         assert!(parse_expr_only("a = ").is_err());

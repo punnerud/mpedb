@@ -263,11 +263,19 @@ bob
 
 # ---- what is refused, and why -------------------------------------------------------
 
-# A self-join has no alias syntax to tell the two sides apart, so `emp.eid`
-# would be ambiguous with no way to disambiguate it. Refused rather than
-# resolved to whichever side came first.
-statement error joined to itself
+# A self-join WITHOUT aliases has no way to tell the two sides apart, so `emp.eid`
+# would be ambiguous. Refused — but with aliases it is allowed (below).
+statement error used for two tables
 SELECT emp.eid FROM emp JOIN emp ON emp.eid = emp.eid
+
+# A self-join WITH distinct aliases (#44): pair employees in the same department.
+# ann and bob are both in dept 1; cy is alone in dept 2; dee has a NULL did and
+# matches nobody. Same answer as sqlite3.
+query TT rowsort
+SELECT a.ename, b.ename FROM emp a JOIN emp b ON a.did = b.did AND a.eid < b.eid
+----
+ann
+bob
 
 # ON is required. A comma-join is a cartesian product, and the times someone
 # means one are far outnumbered by the times they forgot the condition.

@@ -18,6 +18,12 @@ pub(crate) enum Stmt {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SelectStmt {
     pub table: String,
+    /// `FROM t [AS] a` — the name `t`'s columns are addressed by. When present,
+    /// the table's own name is NOT in scope (`FROM orders o` makes `orders.c`
+    /// invalid and `o.c` valid — PG's rule), and it is what lets a table join
+    /// itself. Purely a bind-time name: the compiled plan references columns by
+    /// slot, so an alias never reaches the plan bytes.
+    pub alias: Option<String>,
     /// `INNER JOIN <table> ON <cond>`. One join, so two tables — the plan and
     /// the executor are written for a pair, and an N-way join is a follow-up
     /// rather than something this quietly half-does.
@@ -111,6 +117,7 @@ pub(crate) enum UnOp {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JoinClause {
     pub table: String,
+    pub alias: Option<String>,
     pub on: Expr,
 }
 
