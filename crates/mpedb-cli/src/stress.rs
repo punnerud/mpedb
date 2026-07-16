@@ -431,8 +431,9 @@ fn int(v: &Value) -> Result<i64, Failure> {
 pub const EXIT_CAPACITY: i32 = 4;
 
 /// A child that ran out of space: say so precisely, and exit `EXIT_CAPACITY` so
-/// the parent can tell this apart from an engine bug.
-fn exit_db_full(kind: &str, e: &mpedb::Error) -> ! {
+/// the parent can tell this apart from an engine bug. Shared with the crash and
+/// powerloss children, whose blob modes can plausibly fill a file mid-wave.
+pub fn exit_db_full(kind: &str, e: &mpedb::Error) -> ! {
     eprintln!(
         "{kind} child: OUT OF SPACE ({e}) — capacity, not a correctness failure.\n           If the workload's live set is BOUNDED, the file filling is an engine bug \
          (that is #37's signature: see crates/mpedb-core/tests/high_water_leak.rs). \

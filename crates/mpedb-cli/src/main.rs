@@ -41,7 +41,7 @@ usage: mpedb <command> [args]
   bench   <config.toml>|--auto [--secs N] [--durability M] [--disk DIR]
   stress  --dir <dir> --workers N --secs S --mode bank|unique|mixed|incr
           [--size_mb M]  (default 64; exit 4 = out of space, NOT a correctness failure)
-  crash   --dir <dir> --waves W --children C
+  crash   --dir <dir> --waves W --children C [--blob-kb N] [--size_mb M]
   collide --dir <dir> [--writers N] [--total T] [--drop-rate R] [--jitter-us J]
           [--keyspace K] [--detached-pct P] [--durability M]  (writer-collision fuzz)
   powerloss --dir <dir> [--rounds N] [--workers W] [--durability wal|async]
@@ -56,6 +56,11 @@ bench --auto accepts --durability none|commit|async|wal (default none); use
 stress/crash accept --durability none|commit|async|wal (default none)
 stress/crash accept --concurrency serial|optimistic (default serial; Phase-3,
   experimental — see DESIGN-PHASE3.md; `incr` is the autocommit conservation mode)
+crash --blob-kb N mixes ~20% N-KiB blob writes into every wave (suggest 64;
+  above 256 one blob write can dominate the 5-60ms kill window and starve the
+  small-txn paths); content is deterministic and byte-verified after each wave.
+  NOTE: blob params exceed the intent ring's 824 B cap, so with --durability
+  commit|wal blob ops take the direct writer-lock fallback, NOT the ring.
 parameters parse as: null | true | false | integer | float | 0xHEX (blob) | text";
 
 fn main() {
