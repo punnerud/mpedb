@@ -1,0 +1,227 @@
+# Compound SELECTs (#56, PLAN_FORMAT 9): UNION / UNION ALL / EXCEPT /
+# INTERSECT, left-associative with equal precedence (sqlite's rule).
+# UNION/EXCEPT/INTERSECT are SET ops (dedup, NULLs equal); UNION ALL keeps
+# duplicates. ORDER BY/LIMIT bind to the whole compound. Arms must agree on
+# arity and exact output types — CAST bridges deliberate mismatches.
+#
+# schema:
+# [[table]]
+# name = "t"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "a"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "f"
+#   type = "float64"
+#
+# [[table]]
+# name = "u"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "b"
+#   type = "int64"
+# end schema
+
+statement ok
+INSERT INTO t (id, a, f) VALUES (1, 10, 1.5)
+
+statement ok
+INSERT INTO t (id, a, f) VALUES (2, 20, 2.5)
+
+statement ok
+INSERT INTO t (id, a, f) VALUES (3, 20, 3.5)
+
+statement ok
+INSERT INTO u (id, b) VALUES (1, 20)
+
+statement ok
+INSERT INTO u (id, b) VALUES (2, 30)
+
+# ---- UNION dedups; UNION ALL keeps duplicates -----------------------------------------
+
+query I nosort
+SELECT a FROM t UNION SELECT b FROM u ORDER BY 1
+----
+10
+20
+30
+
+query I nosort
+SELECT a FROM t UNION ALL SELECT b FROM u ORDER BY 1
+----
+10
+20
+20
+20
+30
+
+# ---- EXCEPT / INTERSECT are set ops on the deduped left ------------------------------
+
+query I nosort
+SELECT a FROM t EXCEPT SELECT b FROM u ORDER BY 1
+----
+10
+
+query I nosort
+SELECT a FROM t INTERSECT SELECT b FROM u ORDER BY 1
+----
+20
+
+# ---- left-associative chains (sqlite's precedence) ------------------------------------
+
+# (t.a UNION ALL u.b) UNION u.b — the final UNION dedups everything.
+query I nosort
+SELECT a FROM t UNION ALL SELECT b FROM u UNION SELECT b FROM u ORDER BY 1
+----
+10
+20
+30
+
+# ---- compound-level ORDER BY / LIMIT / OFFSET ------------------------------------------
+
+query I nosort
+SELECT a FROM t UNION SELECT b FROM u ORDER BY 1 DESC LIMIT 2
+----
+30
+20
+
+query I nosort
+SELECT a FROM t UNION SELECT b FROM u ORDER BY 1 LIMIT 2 OFFSET 1
+----
+20
+30
+
+# ORDER BY by first-arm output name.
+query I nosort
+SELECT a AS v FROM t UNION SELECT b FROM u ORDER BY v DESC LIMIT 1
+----
+30
+
+# ---- WHERE per arm; the compound combines the filtered outputs -------------------------
+
+query I nosort
+SELECT a FROM t WHERE id = 1 UNION SELECT b FROM u WHERE id = 2 ORDER BY 1
+----
+10
+30
+
+# ---- rigidity: arity and type agreement -------------------------------------------------
+
+statement error same number of columns
+SELECT a, id FROM t UNION SELECT b FROM u
+
+statement error CAST one side
+SELECT a FROM t UNION SELECT f FROM t
+
+# CAST bridges the mismatch explicitly.
+query R nosort
+SELECT CAST(a AS REAL) FROM t WHERE id = 1 UNION SELECT f FROM t WHERE id = 2 ORDER BY 1
+----
+2.500
+10.000
+
+# ORDER BY mid-chain is refused, not silently re-scoped.
+statement error whole compound
+SELECT a FROM t ORDER BY a UNION SELECT b FROM u
+
+# ---- CROSS JOIN desugars to the cartesian product --------------------------------------
+
+query I nosort
+SELECT count(*) FROM t CROSS JOIN u
+----
+6
+
+# ---- NULLs are EQUAL under the set ops (same rule as DISTINCT) --------------------------
+
+statement ok
+INSERT INTO t (id, a, f) VALUES (4, NULL, NULL)
+
+statement ok
+INSERT INTO u (id, b) VALUES (3, NULL)
+
+# One NULL survives the dedup, and it sorts first (NULLS FIRST ascending).
+query I nosort
+SELECT a FROM t UNION SELECT b FROM u ORDER BY 1
+----
+NULL
+10
+20
+30
+
+# UNION ALL keeps both NULLs.
+query I nosort
+SELECT a FROM t WHERE a IS NULL UNION ALL SELECT b FROM u WHERE b IS NULL
+----
+NULL
+NULL
+
+# EXCEPT: the right side's NULL removes the left side's NULL.
+query I nosort
+SELECT a FROM t EXCEPT SELECT b FROM u ORDER BY 1
+----
+10
+
+query I nosort
+SELECT a FROM t INTERSECT SELECT b FROM u ORDER BY 1
+----
+NULL
+20
+
+# ---- aggregate and DISTINCT arms are ordinary arms --------------------------------------
+
+query I nosort
+SELECT count(*) FROM t UNION ALL SELECT count(*) FROM u ORDER BY 1
+----
+3
+4
+
+query I nosort
+SELECT DISTINCT a FROM t WHERE a IS NOT NULL UNION ALL SELECT b FROM u WHERE id = 1 ORDER BY 1
+----
+10
+20
+20
+
+# ---- empty arms and no-overlap set ops ---------------------------------------------------
+
+query I nosort
+SELECT a FROM t WHERE id = 99 UNION SELECT b FROM u WHERE id = 1
+----
+20
+
+query I nosort
+SELECT a FROM t WHERE a = 10 INTERSECT SELECT b FROM u WHERE b = 30
+----
+
+query I nosort
+SELECT a FROM t WHERE a = 10 EXCEPT SELECT a FROM t
+----
+
+# ---- refusals stay refusals --------------------------------------------------------------
+
+# sqlite has no EXCEPT ALL / INTERSECT ALL either.
+statement error expected SELECT
+SELECT a FROM t EXCEPT ALL SELECT b FROM u
+
+# A compound cannot be streamed or point-read; it is still read-only —
+# writing through one is nonsense and the parser never produces it.
+
+# ordinal out of range is a bind error, not a silent no-op.
+statement error out of range
+SELECT a FROM t UNION SELECT b FROM u ORDER BY 7
+
+# name from the SECOND arm does not resolve — the first arm names the output.
+statement error first SELECT
+SELECT a FROM t UNION SELECT b AS bee FROM u ORDER BY bee

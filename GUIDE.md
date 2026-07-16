@@ -342,10 +342,12 @@ Differences that will bite, each one exercised in `tests/guide.rs`:
 1. **No `CREATE TABLE`.** See above — the table-id numbering makes it a rebuild.
 2. **Division by zero raises.** sqlite yields NULL. So does overflow: mpedb
    errors where sqlite silently promotes to REAL.
-3. **No `RIGHT`/`FULL`/`CROSS` join, no subqueries.** Each is refused *by name*
-   with a message saying why (`RIGHT`'s says the fix: swap the tables and write
-   `LEFT`), not with "syntax error". N-way chains, self-joins, aliases and
-   `LEFT JOIN` all work.
+3. **No `RIGHT`/`FULL` join, no subqueries.** Each is refused *by name* with a
+   message saying why (`RIGHT`'s says the fix: swap the tables and write
+   `LEFT`), not with "syntax error". N-way chains, self-joins, aliases,
+   `LEFT JOIN`, `CROSS JOIN` and compound `UNION [ALL]`/`EXCEPT`/`INTERSECT`
+   chains all work. (`RIGHT`/`FULL` are queued: the plan format already
+   reserves their tags.)
 4. **`ORDER BY` must name something the query outputs** — a column of the table,
    an output position (`ORDER BY 1`), or a selected expression. `SELECT c FROM t
    ORDER BY a + 1` works (a hidden sort column is added); under `SELECT DISTINCT`

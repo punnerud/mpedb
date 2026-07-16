@@ -432,8 +432,9 @@ fn the_sqlite_differences_that_bite() {
     // 2. Division by zero raises; sqlite yields NULL.
     assert!(db.query("SELECT 1 / 0", &[]).is_err());
 
-    // 3. RIGHT/FULL/CROSS joins are refused BY NAME (LEFT and N-way chains
-    // work). RIGHT's message says the fix: swap the tables, write LEFT.
+    // 3. RIGHT/FULL joins are refused BY NAME (LEFT, CROSS, N-way chains and
+    // compound set ops work). RIGHT's message says the fix: swap the tables,
+    // write LEFT.
     let err = db
         .query(
             "SELECT orders.oid FROM items RIGHT JOIN orders ON items.oid = orders.oid",
@@ -443,7 +444,10 @@ fn the_sqlite_differences_that_bite() {
     assert!(format!("{err}").contains("RIGHT JOIN is not supported"), "{err}");
     assert!(db
         .query("SELECT orders.oid FROM items CROSS JOIN orders", &[])
-        .is_err());
+        .is_ok(), "CROSS JOIN is the cartesian product, like the comma-join");
+    assert!(db
+        .query("SELECT oid FROM orders UNION SELECT oid FROM items", &[])
+        .is_ok(), "compound set ops work");
 
     // 4. ORDER BY must name something the query outputs.
     assert!(db

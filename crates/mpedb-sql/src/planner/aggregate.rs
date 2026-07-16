@@ -262,9 +262,11 @@ pub(super) fn plan_aggregate_select(
     let grouped = synthetic_grouped_table(base_columns, &group_by, &agg_specs, &agg_types);
     let mut binder = binder.rescope(Scope::single(&grouped));
 
+    let mut out_types: Vec<Option<ColumnType>> = Vec::with_capacity(rewritten.len());
     let mut projection: Vec<Projection> = Vec::with_capacity(rewritten.len());
     for (item, (orig, alias)) in rewritten.iter().zip(items) {
-        let (b, _) = binder.bind_expr(item)?;
+        let (b, ty) = binder.bind_expr(item)?;
+        out_types.push(ty);
         // The alias, when present, IS the output name — otherwise the
         // canonical rendering of the original item.
         let name = alias.clone().unwrap_or_else(|| agg_item_name(orig));
@@ -319,6 +321,7 @@ pub(super) fn plan_aggregate_select(
             param_types,
             context_keys,
             list_keys,
+            out_types,
         ));
     }
     let mut grouped_keys = Vec::with_capacity(rewritten_order.len());
@@ -379,6 +382,7 @@ pub(super) fn plan_aggregate_select(
         param_types,
         context_keys,
         list_keys,
+        out_types,
     ))
 }
 

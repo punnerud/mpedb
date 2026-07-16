@@ -234,6 +234,56 @@ pub struct SelectPlan {
     pub distinct: bool,
 }
 
+/// A compound-statement set operator. sqlite semantics: `UNION`, `EXCEPT`
+/// and `INTERSECT` are SET operators (the result is deduplicated); only
+/// `UNION ALL` keeps duplicates. Chains apply LEFT-ASSOCIATIVELY with equal
+/// precedence — sqlite's rule, and the one the sqllogictest corpus' expected
+/// results are computed under. (PostgreSQL instead gives INTERSECT higher
+/// precedence; a mixed chain ported from PG may need restructuring.)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOp {
+    Union,
+    UnionAll,
+    Except,
+    Intersect,
+}
+
+impl SetOp {
+    pub(crate) fn from_tag(t: u8) -> Option<SetOp> {
+        Some(match t {
+            0 => SetOp::Union,
+            1 => SetOp::UnionAll,
+            2 => SetOp::Except,
+            3 => SetOp::Intersect,
+            _ => return None,
+        })
+    }
+}
+
+/// A compound SELECT: `arm[0] op[0] arm[1] op[1] arm[2] …`, evaluated
+/// left-associatively, then the compound-level ORDER BY / LIMIT / OFFSET.
+///
+/// Invariants (enforced by `validate`, relied on by the executor):
+/// - `arms.len() >= 2` and `ops.len() == arms.len() - 1`;
+/// - every arm projects the SAME arity (the planner also requires the same
+///   output TYPES — rigid engine, no sqlite-style cross-arm coercion);
+/// - no arm carries its own `order_by` / `order_junk` / `limit` / `offset`:
+///   those clauses belong to the compound, and SQL cannot express them per
+///   arm without parentheses (unsupported).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompoundPlan {
+    pub arms: Vec<SelectPlan>,
+    pub ops: Vec<SetOp>,
+    /// (output column index, descending) over the compound OUTPUT tuple.
+    pub order_by: Vec<(u16, bool)>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+/// Self-imposed ceiling on compound arms, so a corrupt plan cannot make the
+/// decoder allocate unboundedly. The corpus' longest chain is 9 arms.
+const MAX_COMPOUND_ARMS: usize = 64;
+
 /// Statement shape the executor consumes.
 // The Select variant is naturally larger than Begin/Commit/Rollback; the
 // shape is frozen by the public API, so boxing is not an option here.
@@ -241,6 +291,8 @@ pub struct SelectPlan {
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlanStmt {
     Select(SelectPlan),
+    /// `SELECT … UNION/EXCEPT/INTERSECT SELECT …` (#56, format 9).
+    Compound(CompoundPlan),
     Insert {
         table: u32,
         /// `rows[r][col_idx]`: one entry per table column per row.
@@ -412,6 +464,7 @@ const STMT_DELETE: u8 = 4;
 const STMT_BEGIN: u8 = 5;
 const STMT_COMMIT: u8 = 6;
 const STMT_ROLLBACK: u8 = 7;
+const STMT_COMPOUND: u8 = 8;
 
 const ACCESS_FULL: u8 = 0;
 const ACCESS_PK_POINT: u8 = 1;
@@ -442,6 +495,9 @@ impl CompiledPlan {
             | PlanStmt::Insert { table, .. }
             | PlanStmt::Update { table, .. }
             | PlanStmt::Delete { table, .. } => Some(*table),
+            // A compound has no SINGLE target; staleness is covered by the
+            // per-arm entries in `policies`, which stamp every table read.
+            PlanStmt::Compound(_) => None,
             PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => None,
         }
     }

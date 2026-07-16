@@ -184,7 +184,40 @@ fn encode_on_conflict(oc: &PlanOnConflict, buf: &mut Vec<u8>) {
 
 fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
     match stmt {
-        PlanStmt::Select(SelectPlan {
+        PlanStmt::Select(sp) => {
+            buf.push(STMT_SELECT);
+            encode_select(sp, buf);
+        }
+        PlanStmt::Compound(c) => {
+            buf.push(STMT_COMPOUND);
+            buf.push(c.arms.len() as u8);
+            for op in &c.ops {
+                buf.push(match op {
+                    SetOp::Union => 0u8,
+                    SetOp::UnionAll => 1,
+                    SetOp::Except => 2,
+                    SetOp::Intersect => 3,
+                });
+            }
+            for arm in &c.arms {
+                encode_select(arm, buf);
+            }
+            w_u16(buf, c.order_by.len() as u16);
+            for (col, desc) in &c.order_by {
+                w_u16(buf, *col);
+                buf.push(*desc as u8);
+            }
+            encode_opt_u64(c.limit, buf);
+            encode_opt_u64(c.offset, buf);
+        }
+        _other => encode_stmt_rest(stmt, buf),
+    }
+}
+
+/// The body of a `Select` after its statement tag — shared verbatim between a
+/// top-level SELECT and each compound arm, so the two can never drift.
+fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
+    let SelectPlan {
             table,
             access,
             joins,
@@ -198,9 +231,8 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             aggregate,
             distinct,
             order_junk,
-        }) => {
-            buf.push(STMT_SELECT);
-            buf.extend_from_slice(&table.to_le_bytes());
+    } = sp;
+    buf.extend_from_slice(&table.to_le_bytes());
             encode_access(access, buf);
             encode_opt_program(filter.as_ref(), buf);
             w_u16(buf, projection.len() as u16);
@@ -271,6 +303,12 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
                     encode_opt_program(a.having.as_ref(), buf);
                 }
             }
+}
+
+fn encode_stmt_rest(stmt: &PlanStmt, buf: &mut Vec<u8>) {
+    match stmt {
+        PlanStmt::Select(_) | PlanStmt::Compound(_) => {
+            unreachable!("handled by encode_stmt")
         }
         PlanStmt::Insert {
             table,

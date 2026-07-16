@@ -129,12 +129,17 @@ pub(super) fn plan_join_select(
 
     // Projection over the joined tuple. `SELECT *` is every column of every
     // side, in join order — the same order the tuple is built in.
+    let mut out_types: Vec<Option<ColumnType>> = Vec::new();
     let mut projection: Vec<Projection> = match &s.items {
-        None => (0..binder.scope_width() as u16).map(Projection::Column).collect(),
+        None => {
+            out_types = full_scope.slot_types().into_iter().map(Some).collect();
+            (0..binder.scope_width() as u16).map(Projection::Column).collect()
+        }
         Some(items) => {
             let mut out = Vec::with_capacity(items.len());
             for (item, alias) in items {
-                let (b, _) = binder.bind_expr(item)?;
+                let (b, ty) = binder.bind_expr(item)?;
+                out_types.push(ty);
                 out.push(match (b, alias) {
                     (BExpr::Col(i), None) => Projection::Column(i),
                     // An alias survives as the output name — same one-
@@ -227,6 +232,7 @@ pub(super) fn plan_join_select(
         param_types,
         context_keys,
         list_keys,
+        out_types,
     ))
 }
 

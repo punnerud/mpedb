@@ -883,7 +883,26 @@ fn expand_star(sql: &str, shim: &Shim) -> Option<String> {
             // or the shim's synthetic rowid_ column leaks into the output
             // (542 phantom "wrong results" the day comma-joins landed).
             "JOIN" | "," => k += 1,
-            "LEFT" | "RIGHT" | "FULL" | "CROSS" | "NATURAL" => return None,
+            // CROSS JOIN and LEFT [OUTER] JOIN execute as well — same rule,
+            // same phantom otherwise (94 of them the day CROSS landed).
+            "CROSS" => {
+                k += 1;
+                if k >= toks.len() || toks[k].up != "JOIN" {
+                    return None;
+                }
+                k += 1;
+            }
+            "LEFT" => {
+                k += 1;
+                if k < toks.len() && toks[k].up == "OUTER" {
+                    k += 1;
+                }
+                if k >= toks.len() || toks[k].up != "JOIN" {
+                    return None;
+                }
+                k += 1;
+            }
+            "RIGHT" | "FULL" | "NATURAL" => return None,
             _ => break, // WHERE/ORDER/... or end of statement
         }
         let (name_raw, qual, nk) = parse_source(sql, &toks, k)?;
@@ -900,6 +919,8 @@ fn expand_star(sql: &str, shim: &Shim) -> Option<String> {
                     || (t.is_word
                         && (t.up == "JOIN"
                             || t.up == "INNER"
+                            || t.up == "CROSS"
+                            || t.up == "LEFT"
                             || CLAUSE_KEYWORDS.contains(&t.up.as_str()))))
             {
                 break;

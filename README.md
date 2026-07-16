@@ -46,9 +46,10 @@ validate rather than hope about.
 **What it is not: a drop-in sqlite3.** Be clear-eyed about this before you plan
 around it. mpedb's SQL is a real subset that keeps growing — aggregates,
 `GROUP BY`/`HAVING`, `DISTINCT`, N-way `INNER JOIN` chains with aliases and
-self-joins, `LEFT JOIN`, and secondary indexes the planner actually uses are
-in — but there are no subqueries, no `RIGHT`/`FULL`/`CROSS` joins, and no
-`CREATE TABLE` yet (the live-DDL plan is [`DESIGN-DDL.md`](DESIGN-DDL.md)) — so
+self-joins, `LEFT JOIN`, `CROSS JOIN`, `UNION`/`EXCEPT`/`INTERSECT`, and
+secondary indexes the planner actually uses are in — but there are no
+subqueries, no `RIGHT`/`FULL` joins, and no `CREATE TABLE` yet (the live-DDL
+plan is [`DESIGN-DDL.md`](DESIGN-DDL.md)) — so
 a Django test suite will not run against it. Today mpedb is a validation and
 staging tool in that workflow, not the thing your ORM talks to. See
 [SQL support](#sql-support) for the exact surface, measured against the binary.
@@ -260,12 +261,12 @@ content-hashed plan; the surface is deliberately narrow, and the narrowness is
 the design rather than a todo list.
 
 It is also measured against sqlite's own **sqllogictest corpus** (the
-`sqlite_corpus` runner in `crates/mpedb-testkit`): ~97% of the random query
+`sqlite_corpus` runner in `crates/mpedb-testkit`): ~99% of the random query
 corpus now executes, with **zero wrong answers and zero error mismatches**
 across every statement both engines accept — every miss is a refused feature,
-never a different result. What remains there is `RIGHT`/`FULL`/`CROSS` joins
-(refused by design, see below); subqueries alone hold the classic
-`select1–3` files at ~49% and are the next target.
+never a different result. What remains there is `RIGHT`/`FULL` joins (queued:
+the plan format already reserves their tags); subqueries alone hold the
+classic `select1–3` files at ~49% and are the next target.
 
 | | mpedb | note |
 |---|---|---|
@@ -286,9 +287,11 @@ never a different result. What remains there is `RIGHT`/`FULL`/`CROSS` joins
 | N-way `INNER JOIN` chains (`FROM a JOIN b ON … JOIN c ON …`), incl. aggregates over them | ✅ | index nested loop when the `ON` has an equality; RLS applies to every side |
 | Table aliases (`FROM emp e JOIN emp b ON …`) and self-joins | ✅ | alias shadows the table name, as in PostgreSQL |
 | `LEFT [OUTER] JOIN` | ✅ | NULL-extends on no match; `WHERE inner IS NULL` anti-joins work |
+| `CROSS JOIN` | ✅ | the cartesian product — desugars exactly like the comma-join |
+| `UNION [ALL]` / `EXCEPT` / `INTERSECT` chains | ✅ | left-associative, sqlite's precedence; set ops dedup (NULLs equal); arms must agree on arity and exact types — `CAST` bridges deliberate mismatches |
 | Secondary indexes: `unique = true` and non-unique `indexed = true` | ✅ | equality and range (`IndexScan`/`IndexRange`) — `EXPLAIN` shows which |
 | Loose typing per column: `type = "any"` | ✅ | refused in keys and `UNIQUE`; the mirror pre-flight refuses pushing it to PG |
-| **`RIGHT`/`FULL`/`CROSS` joins** | ❌ | refused by name (`RIGHT` comes with the hint: swap the tables, write `LEFT`) |
+| **`RIGHT`/`FULL` joins** | ❌ | refused by name (`RIGHT` comes with the hint: swap the tables, write `LEFT`); queued — the plan format reserves their tags |
 | **Subqueries, `EXISTS`, cross-FILE refs** | ❌ | not yet — planned (uncorrelated subplans first) |
 | **`CREATE TABLE` / `ALTER`** | ❌ | today: schema comes from the config or `mirror import`; live DDL is designed in [`DESIGN-DDL.md`](DESIGN-DDL.md) |
 
