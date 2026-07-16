@@ -69,21 +69,33 @@ fn main() {
     let del = db.prepare("DELETE FROM blobs WHERE id = $1").unwrap();
 
     println!("{mib} MiB blob, {rounds} rounds, delete between (pages come back via the freelist)");
-    println!("{:>5} {:>9} {:>11}", "round", "ms", "MiB/s");
+    println!("{:>5} {:>9} {:>11} {:>9} {:>9}", "round", "ms", "MiB/s", "params", "execute");
     for r in 0..rounds {
+        // Time the API copy apart from the engine. `IntoValue for &[u8]` does
+        // `to_vec()` — a full copy of the payload before the engine sees a byte —
+        // and folding it into the "engine" number would blame the engine for the
+        // caller's malloc.
         let t0 = std::time::Instant::now();
-        db.execute(&ins, &params![r as i64, payload.as_slice()]).unwrap();
+        let p = params![r as i64, payload.as_slice()];
+        let t_params = t0.elapsed();
+        let t1 = std::time::Instant::now();
+        db.execute(&ins, &p).unwrap();
+        let t_exec = t1.elapsed();
         let d = t0.elapsed();
         println!(
-            "{:>5} {:>9.2} {:>11.1}{}",
+            "{:>5} {:>9.2} {:>11.1} {:>9.2} {:>9.2}{}",
             r,
             d.as_secs_f64() * 1e3,
             mib as f64 / d.as_secs_f64(),
+            t_params.as_secs_f64() * 1e3,
+            t_exec.as_secs_f64() * 1e3,
             if r == 0 { "   <- pays the page faults" } else { "" }
         );
         // free the pages so the next round draws them back already faulted
         db.execute(&del, &params![r as i64]).unwrap();
     }
+    // #40: where did the per-page time go? These must add up to the rounds above.
+    mpedb_core::engine::leakstat::dump("blob");
     drop(db);
     let _ = std::fs::remove_file(&path);
 }

@@ -48,6 +48,13 @@ pub mod leakstat {
         COMMITS,          // commit fixpoints entered
         COMMIT_FREED,     // pages genuinely freed by the txn
         COMMIT_LEFTOVER,  // reclaimed-but-unused pages handed back at commit
+        // #40: where the ~3.8 µs per overflow page goes. Nanoseconds — the three
+        // must add up to the wall time `btree::write_overflow` takes, or the
+        // cost is somewhere this does not look.
+        OVF_PAGES,        // overflow pages written
+        OVF_NS_ALLOC,     // ...in alloc_raw (freelist pop, refill, dirty insert)
+        OVF_NS_WRITE,     // ...in page_mut + header + payload memcpy + tail zero
+        OVF_NS_CHAIN,     // ...in the 2nd page_mut, only to set prev's next-ptr
     );
     #[inline(always)]
     pub fn bump(c: &AtomicU64) {
