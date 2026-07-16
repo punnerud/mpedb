@@ -419,6 +419,14 @@ whole chain and hand back the memory win it existed to get.
 `WriteSession::insert_file(table, values, stream_col, path)` opens the file and
 streams it in under the same memory ceiling.
 
+**…and then 5× faster again (2026-07-16, #40 closed).** After the buffer below
+was removed, the blob was STILL deep-cloned twice more on its way in — once in
+parameter resolution, once building the insert row. Both paths now borrow the
+caller's values when nothing needs computing (almost every statement), taking a
+warm 16 MiB insert from 12.1 ms to ~2.2 ms. The remaining gap to a raw file
+write is page faults on cold pages, which is a storage-layout question
+([#50](DESIGN.md)), not a copy.
+
 **Large blobs got 77% faster (2026-07-16).** `row::encode_row` materialised the
 whole row — blob included — into a fresh heap buffer whose only purpose was to be
 copied straight back out into overflow pages; at 16 MiB that malloc faults its own

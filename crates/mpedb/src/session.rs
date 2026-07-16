@@ -92,11 +92,11 @@ impl Session {
 /// `n_user` caller params are accepted; a caller cannot supply a value for the
 /// reserved tail (that is where §2.1's "refuse caller-supplied context" is
 /// enforced), because any excess is reported as a wrong parameter count.
-pub(crate) fn resolve_params_timed(
+pub(crate) fn resolve_params_timed<'a>(
     plan: &mpedb_sql::CompiledPlan,
-    user_params: &[mpedb_types::Value],
+    user_params: &'a [mpedb_types::Value],
     session: &Session,
-) -> mpedb_types::Result<Vec<mpedb_types::Value>> {
+) -> mpedb_types::Result<std::borrow::Cow<'a, [mpedb_types::Value]>> {
     let t = std::time::Instant::now();
     let r = resolve_params(plan, user_params, session);
     mpedb_core::engine::leakstat::add(
@@ -106,11 +106,11 @@ pub(crate) fn resolve_params_timed(
     r
 }
 
-pub(crate) fn resolve_params(
+pub(crate) fn resolve_params<'a>(
     plan: &CompiledPlan,
-    user_params: &[Value],
+    user_params: &'a [Value],
     session: &Session,
-) -> Result<Vec<Value>> {
+) -> Result<std::borrow::Cow<'a, [Value]>> {
     let total = plan.n_params as usize;
     let n_ctx = plan.context_keys.len();
     let n_user = total - n_ctx;
@@ -121,15 +121,13 @@ pub(crate) fn resolve_params(
         });
     }
     if n_ctx == 0 {
-        // ⚠ #40: `to_vec` DEEP-clones every Value, so a `Blob(Vec<u8>)` is copied
-        // in full — 2.49 ms of a 12.1 ms 16 MiB insert, measured 2026-07-16 with
-        // `examples/blob_warm --features leakstat`. #42 removed the same class of
-        // copy from `row::encode_row`; this is the next one, and the blob is
-        // still deep-cloned at every API boundary it crosses. Fixing it means
-        // borrowing rather than owning here (`Cow<[Value]>`, or resolving in
-        // place when the plan has no session refs — the common case, which is
-        // exactly the branch this line IS).
-        return Ok(user_params.to_vec());
+        // #40, fixed 2026-07-16: this used to be `to_vec()`, which DEEP-clones
+        // every Value — a `Blob(Vec<u8>)` copied in full, 2.49 ms of a 12.1 ms
+        // 16 MiB insert (measured with `examples/blob_warm --features
+        // leakstat`). The fast path — a plan with no session refs, which is
+        // almost every plan — now BORROWS the caller's params; only the
+        // session-context branch below still builds an owned vector.
+        return Ok(std::borrow::Cow::Borrowed(user_params));
     }
     let mut full = Vec::with_capacity(total);
     full.extend_from_slice(user_params);
@@ -154,7 +152,7 @@ pub(crate) fn resolve_params(
         }
         full.push(value.clone());
     }
-    Ok(full)
+    Ok(std::borrow::Cow::Owned(full))
 }
 
 #[cfg(test)]
