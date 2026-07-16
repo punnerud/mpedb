@@ -209,7 +209,7 @@ pub(super) fn plan_join_select(
 
     let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
-        PlanStmt::Select {
+        PlanStmt::Select(SelectPlan {
             table: outer_id,
             access,
             joins,
@@ -223,7 +223,7 @@ pub(super) fn plan_join_select(
             offset: s.offset,
             distinct: s.distinct,
             aggregate: None,
-        },
+        }),
         param_types,
         context_keys,
         list_keys,

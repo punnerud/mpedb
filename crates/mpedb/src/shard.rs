@@ -14,7 +14,7 @@
 //! - multi-row INSERT, transactions, and RLS on shards are out of v1 scope.
 
 use crate::{Database, DetachedPlan, ExecResult};
-use mpedb_sql::{AccessPath, CompiledPlan, InsertSource, PlanStmt};
+use mpedb_sql::{AccessPath, CompiledPlan, InsertSource, PlanStmt, SelectPlan};
 use mpedb_types::value::write_value;
 use mpedb_types::{Config, Error, KeyPart, Result, Schema, Value};
 use std::path::PathBuf;
@@ -124,7 +124,7 @@ impl ShardSet {
                 }
                 Ok(Route::One((h % k) as usize))
             }
-            PlanStmt::Select { access, .. }
+            PlanStmt::Select(SelectPlan { access, .. })
             | PlanStmt::Update { access, .. }
             | PlanStmt::Delete { access, .. } => match access {
                 AccessPath::PkPoint(parts) => {
@@ -171,12 +171,12 @@ impl ShardSet {
         params: &[Value],
     ) -> Result<ExecResult> {
         match &plan.stmt {
-            PlanStmt::Select {
+            PlanStmt::Select(SelectPlan {
                 order_by,
                 limit,
                 offset,
                 ..
-            } => {
+            }) => {
                 if !order_by.is_empty() || limit.is_some() || offset.is_some() {
                     return Err(Error::Unsupported(
                         "cross-shard SELECT with ORDER BY/LIMIT/OFFSET is not supported (v1); \

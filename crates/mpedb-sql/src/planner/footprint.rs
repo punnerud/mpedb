@@ -47,12 +47,12 @@ pub(crate) fn compute_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Foot
         Ok(bits)
     };
     Ok(match stmt {
-        PlanStmt::Select {
+        PlanStmt::Select(SelectPlan {
             table,
             access,
             joins,
             ..
-        } => {
+        }) => {
             let (key_access, mut indexes_used) = access_key_and_indexes(access);
             // ONE BIT PER TABLE READ. A join that claimed only the outer would
             // under-claim `tables_read`, and `conflicts_with` is a bitmap AND —

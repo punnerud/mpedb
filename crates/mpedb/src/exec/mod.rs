@@ -6,7 +6,7 @@ use crate::ExecResult;
 use mpedb_core::{ReadTxn, WriteTxn};
 use mpedb_sql::{
     AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, Join, JoinKind,
-    OrderOver, PlanOnConflict, PlanStmt, Projection,
+    OrderOver, PlanOnConflict, PlanStmt, Projection, SelectPlan,
 };
 use mpedb_types::{
     keycode, Accum, DefaultExpr, Error, ExprProgram, KeyBound, KeyPart, Result, Schema, TableDef,
@@ -416,7 +416,7 @@ fn exec_stmt_impl(
 ) -> Result<ExecResult> {
     validate_params(plan, params)?;
     match &plan.stmt {
-        PlanStmt::Select {
+        PlanStmt::Select(SelectPlan {
             table,
             access,
             joins,
@@ -430,7 +430,7 @@ fn exec_stmt_impl(
             distinct,
             order_over,
             order_junk,
-        } => {
+        }) => {
             let t = table_def(schema, *table)?;
             // DISTINCT makes LIMIT bound DISTINCT rows, so the scan bound (and
             // the top-K path, which is the same bound wearing a hat) must not

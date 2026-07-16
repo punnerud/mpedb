@@ -33,7 +33,7 @@
 use crate::exec::{range_bounds, validate_params, RawBound, ReadCtx};
 use crate::{exec, Database, ExecResult};
 use mpedb_core::ReadTxn;
-use mpedb_sql::{AccessPath, CompiledPlan, PlanStmt, Projection};
+use mpedb_sql::{AccessPath, CompiledPlan, PlanStmt, Projection, SelectPlan};
 use mpedb_types::{keycode, Error, PlanHash, Result, Value};
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -85,7 +85,7 @@ pub struct RowStream<'db> {
 
 impl<'db> RowStream<'db> {
     fn open(db: &'db Database, plan: Arc<CompiledPlan>, params: &[Value]) -> Result<RowStream<'db>> {
-        let PlanStmt::Select {
+        let PlanStmt::Select(SelectPlan {
             table,
             access,
             order_by,
@@ -96,7 +96,7 @@ impl<'db> RowStream<'db> {
             distinct,
             aggregate,
             ..
-        } = &plan.stmt
+        }) = &plan.stmt
         else {
             return Err(Error::Unsupported(
                 "stream_query requires a read-only SELECT plan".into(),
@@ -223,9 +223,9 @@ impl<'db> RowStream<'db> {
         let Some(txn) = &self.txn else {
             return Ok(());
         };
-        let PlanStmt::Select {
+        let PlanStmt::Select(SelectPlan {
             filter, projection, ..
-        } = &self.plan.stmt
+        }) = &self.plan.stmt
         else {
             unreachable!("open() checked the statement kind");
         };

@@ -168,72 +168,79 @@ pub struct CompiledPlan {
     pub footprint: Footprint,
 }
 
+/// One SELECT, compiled. Extracted from the `PlanStmt::Select` variant so a
+/// nested select is a VALUE — a compound statement's arms (and later #56's
+/// uncorrelated subplans) hold `SelectPlan`s directly, which is what makes
+/// "an arm that is an INSERT" unrepresentable instead of a validation case.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectPlan {
+    pub table: u32,
+    pub access: AccessPath,
+    /// `INNER JOIN` chain, left-deep. Empty = a single-table read, and then
+    /// every tuple below is the base row. Join `k`'s `on` runs over the row
+    /// accumulated through join `k` — `[table0 ‖ … ‖ table_{k+1}]`.
+    pub joins: Vec<Join>,
+    /// Residual predicate after access-path extraction, over the BASE row
+    /// (the outer row, when joined). Always the base row — see
+    /// `joined_filter` for the other one.
+    pub filter: Option<ExprProgram>,
+    /// Predicate over the JOINED row `[outer ‖ inner]`; `None` without a
+    /// join.
+    ///
+    /// The split from `filter` is the security-relevant part, not a
+    /// refactor: RLS policies live in `filter` and `join.policy`, which run
+    /// over one row each and BEFORE this. mpedb's expressions can raise
+    /// (division by zero, overflow), and a raise is observable — so a
+    /// predicate over the joined row that divides by a hidden row's column
+    /// would report that row's existence without returning it. Everything
+    /// that can raise waits until both policies have had their say.
+    pub joined_filter: Option<ExprProgram>,
+    /// Output columns, in order.
+    pub projection: Vec<Projection>,
+    /// (column index, descending). Empty = scan order. The index is into
+    /// the tuple named by `order_over` — never assume the base row.
+    pub order_by: Vec<(u16, bool)>,
+    /// Which tuple `order_by` indexes, and therefore where in the pipeline
+    /// the sort runs. Explicit rather than inferred from `distinct` /
+    /// `aggregate`, because it is a decision the planner makes and the
+    /// decoder must bounds-check against the right width — inferring it
+    /// twice is how the two come to disagree.
+    pub order_over: OrderOver,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+    /// Grouping, applied **after** `filter`. `None` = no aggregation.
+    pub aggregate: Option<Aggregation>,
+    /// Trailing `projection` entries that exist ONLY to be sorted by, and
+    /// must be dropped before the rows reach the caller.
+    ///
+    /// `SELECT c FROM t ORDER BY a + 1` sorts by something it does not
+    /// output. PostgreSQL calls these resjunk columns; the key has to be
+    /// computed somewhere, and the projection is the only tuple the sort
+    /// can reach. So the planner appends it, the executor sorts, and then
+    /// trims — which is why `order_over` is `Projection` whenever this is
+    /// nonzero.
+    ///
+    /// Always 0 under `distinct`: DISTINCT requires every key to be in the
+    /// SELECT list already, and a junk column would break the dedup anyway
+    /// by making rows distinct on a value the caller never sees.
+    pub order_junk: u16,
+    /// `SELECT DISTINCT` — deduplicate the PROJECTED tuples.
+    ///
+    /// It cannot be pushed into the scan (the projection is what is being
+    /// deduplicated, and it may be an expression), and it means `limit`
+    /// bounds DISTINCT rows rather than scanned rows — the same trap
+    /// `aggregate` has, so the executor must not pass a scan bound down
+    /// when this is set.
+    pub distinct: bool,
+}
+
 /// Statement shape the executor consumes.
 // The Select variant is naturally larger than Begin/Commit/Rollback; the
 // shape is frozen by the public API, so boxing is not an option here.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq)]
 pub enum PlanStmt {
-    Select {
-        table: u32,
-        access: AccessPath,
-        /// `INNER JOIN` chain, left-deep. Empty = a single-table read, and then
-        /// every tuple below is the base row. Join `k`'s `on` runs over the row
-        /// accumulated through join `k` — `[table0 ‖ … ‖ table_{k+1}]`.
-        joins: Vec<Join>,
-        /// Residual predicate after access-path extraction, over the BASE row
-        /// (the outer row, when joined). Always the base row — see
-        /// `joined_filter` for the other one.
-        filter: Option<ExprProgram>,
-        /// Predicate over the JOINED row `[outer ‖ inner]`; `None` without a
-        /// join.
-        ///
-        /// The split from `filter` is the security-relevant part, not a
-        /// refactor: RLS policies live in `filter` and `join.policy`, which run
-        /// over one row each and BEFORE this. mpedb's expressions can raise
-        /// (division by zero, overflow), and a raise is observable — so a
-        /// predicate over the joined row that divides by a hidden row's column
-        /// would report that row's existence without returning it. Everything
-        /// that can raise waits until both policies have had their say.
-        joined_filter: Option<ExprProgram>,
-        /// Output columns, in order.
-        projection: Vec<Projection>,
-        /// (column index, descending). Empty = scan order. The index is into
-        /// the tuple named by `order_over` — never assume the base row.
-        order_by: Vec<(u16, bool)>,
-        /// Which tuple `order_by` indexes, and therefore where in the pipeline
-        /// the sort runs. Explicit rather than inferred from `distinct` /
-        /// `aggregate`, because it is a decision the planner makes and the
-        /// decoder must bounds-check against the right width — inferring it
-        /// twice is how the two come to disagree.
-        order_over: OrderOver,
-        limit: Option<u64>,
-        offset: Option<u64>,
-        /// Grouping, applied **after** `filter`. `None` = no aggregation.
-        aggregate: Option<Aggregation>,
-        /// Trailing `projection` entries that exist ONLY to be sorted by, and
-        /// must be dropped before the rows reach the caller.
-        ///
-        /// `SELECT c FROM t ORDER BY a + 1` sorts by something it does not
-        /// output. PostgreSQL calls these resjunk columns; the key has to be
-        /// computed somewhere, and the projection is the only tuple the sort
-        /// can reach. So the planner appends it, the executor sorts, and then
-        /// trims — which is why `order_over` is `Projection` whenever this is
-        /// nonzero.
-        ///
-        /// Always 0 under `distinct`: DISTINCT requires every key to be in the
-        /// SELECT list already, and a junk column would break the dedup anyway
-        /// by making rows distinct on a value the caller never sees.
-        order_junk: u16,
-        /// `SELECT DISTINCT` — deduplicate the PROJECTED tuples.
-        ///
-        /// It cannot be pushed into the scan (the projection is what is being
-        /// deduplicated, and it may be an expression), and it means `limit`
-        /// bounds DISTINCT rows rather than scanned rows — the same trap
-        /// `aggregate` has, so the executor must not pass a scan bound down
-        /// when this is set.
-        distinct: bool,
-    },
+    Select(SelectPlan),
     Insert {
         table: u32,
         /// `rows[r][col_idx]`: one entry per table column per row.
@@ -431,7 +438,7 @@ impl CompiledPlan {
     /// The table this plan targets (for RLS policy-epoch validation), if any.
     pub fn target_table(&self) -> Option<u32> {
         match &self.stmt {
-            PlanStmt::Select { table, .. }
+            PlanStmt::Select(SelectPlan { table, .. })
             | PlanStmt::Insert { table, .. }
             | PlanStmt::Update { table, .. }
             | PlanStmt::Delete { table, .. } => Some(*table),
