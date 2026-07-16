@@ -1,0 +1,342 @@
+use super::*;
+
+impl CompiledPlan {
+    /// Canonical, deterministic serialization (the plan-registry blob and the
+    /// first component of the hash preimage).
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(128);
+        buf.push(PLAN_FORMAT);
+        buf.extend_from_slice(&self.schema_hash);
+        buf.extend_from_slice(&(self.param_types.len() as u16).to_le_bytes());
+        for pt in &self.param_types {
+            buf.push(pt.map_or(0, |t| t as u8));
+        }
+        buf.extend_from_slice(&(self.context_keys.len() as u16).to_le_bytes());
+        for k in &self.context_keys {
+            buf.extend_from_slice(&(k.len() as u16).to_le_bytes());
+            buf.extend_from_slice(k.as_bytes());
+        }
+        buf.extend_from_slice(&(self.policies.len() as u16).to_le_bytes());
+        for p in &self.policies {
+            buf.extend_from_slice(&p.table.to_le_bytes());
+            buf.extend_from_slice(&p.epoch.to_le_bytes());
+            buf.extend_from_slice(&p.hash);
+        }
+        buf.extend_from_slice(&(self.consts.len() as u16).to_le_bytes());
+        for c in &self.consts {
+            write_value(&mut buf, c);
+        }
+        self.footprint.encode_into(&mut buf);
+        encode_stmt(&self.stmt, &mut buf);
+        buf
+    }
+}
+
+// ---- statement encode/decode ----------------------------------------------
+
+fn w_u16(buf: &mut Vec<u8>, v: u16) {
+    buf.extend_from_slice(&v.to_le_bytes());
+}
+
+fn encode_opt_program(p: Option<&ExprProgram>, buf: &mut Vec<u8>) {
+    match p {
+        None => buf.push(0),
+        Some(p) => {
+            buf.push(1);
+            p.encode_into(buf);
+        }
+    }
+}
+
+fn encode_opt_u64(v: Option<u64>, buf: &mut Vec<u8>) {
+    match v {
+        None => buf.push(0),
+        Some(v) => {
+            buf.push(1);
+            buf.extend_from_slice(&v.to_le_bytes());
+        }
+    }
+}
+
+fn encode_part(p: &KeyPart, buf: &mut Vec<u8>) {
+    match p {
+        KeyPart::Param(i) => {
+            buf.push(PART_PARAM);
+            w_u16(buf, *i);
+        }
+        KeyPart::Const(i) => {
+            buf.push(PART_CONST);
+            w_u16(buf, *i);
+        }
+        KeyPart::OuterCol(i) => {
+            buf.push(PART_OUTER_COL);
+            w_u16(buf, *i);
+        }
+    }
+}
+
+fn encode_parts(parts: &[KeyPart], buf: &mut Vec<u8>) {
+    w_u16(buf, parts.len() as u16);
+    for p in parts {
+        encode_part(p, buf);
+    }
+}
+
+fn encode_access(a: &AccessPath, buf: &mut Vec<u8>) {
+    match a {
+        AccessPath::FullScan => buf.push(ACCESS_FULL),
+        AccessPath::PkPoint(parts) => {
+            buf.push(ACCESS_PK_POINT);
+            encode_parts(parts, buf);
+        }
+        AccessPath::PkRange { lo, hi } => {
+            buf.push(ACCESS_PK_RANGE);
+            for bound in [lo, hi] {
+                match bound {
+                    None => buf.push(0),
+                    Some(b) => {
+                        buf.push(1 | ((b.inclusive as u8) << 1));
+                        encode_parts(&b.parts, buf);
+                    }
+                }
+            }
+        }
+        AccessPath::IndexPoint { index_no, part } => {
+            buf.push(ACCESS_INDEX_POINT);
+            buf.extend_from_slice(&index_no.to_le_bytes());
+            encode_part(part, buf);
+        }
+        AccessPath::IndexRange { index_no, lo, hi } => {
+            buf.push(ACCESS_INDEX_RANGE);
+            buf.extend_from_slice(&index_no.to_le_bytes());
+            for bound in [lo, hi] {
+                match bound {
+                    None => buf.push(0),
+                    Some(b) => {
+                        buf.push(1 | ((b.inclusive as u8) << 1));
+                        encode_parts(&b.parts, buf);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn encode_projection(proj: &[Projection], buf: &mut Vec<u8>) {
+    w_u16(buf, proj.len() as u16);
+    for p in proj {
+        match p {
+            Projection::Column(i) => {
+                buf.push(PROJ_COLUMN);
+                w_u16(buf, *i);
+            }
+            Projection::Expr { program, name } => {
+                buf.push(PROJ_EXPR);
+                program.encode_into(buf);
+                buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                buf.extend_from_slice(name.as_bytes());
+            }
+        }
+    }
+}
+
+fn encode_opt_projection(proj: Option<&[Projection]>, buf: &mut Vec<u8>) {
+    match proj {
+        None => buf.push(0),
+        Some(p) => {
+            buf.push(1);
+            encode_projection(p, buf);
+        }
+    }
+}
+
+fn encode_on_conflict(oc: &PlanOnConflict, buf: &mut Vec<u8>) {
+    match oc {
+        PlanOnConflict::Error => buf.push(OC_ERROR),
+        PlanOnConflict::DoNothing => buf.push(OC_DO_NOTHING),
+        PlanOnConflict::DoUpdate {
+            target,
+            probe,
+            set,
+            filter,
+        } => {
+            buf.push(OC_DO_UPDATE);
+            match probe {
+                ConflictProbe::Pk => buf.push(0),
+                ConflictProbe::Index(n) => {
+                    buf.push(1);
+                    buf.extend_from_slice(&n.to_le_bytes());
+                }
+            }
+            w_u16(buf, target.len() as u16);
+            for c in target {
+                w_u16(buf, *c);
+            }
+            w_u16(buf, set.len() as u16);
+            for (c, program) in set {
+                w_u16(buf, *c);
+                program.encode_into(buf);
+            }
+            encode_opt_program(filter.as_ref(), buf);
+        }
+    }
+}
+
+fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
+    match stmt {
+        PlanStmt::Select {
+            table,
+            access,
+            joins,
+            joined_filter,
+            filter,
+            projection,
+            order_by,
+            order_over,
+            limit,
+            offset,
+            aggregate,
+            distinct,
+            order_junk,
+        } => {
+            buf.push(STMT_SELECT);
+            buf.extend_from_slice(&table.to_le_bytes());
+            encode_access(access, buf);
+            encode_opt_program(filter.as_ref(), buf);
+            w_u16(buf, projection.len() as u16);
+            for p in projection {
+                match p {
+                    Projection::Column(i) => {
+                        buf.push(PROJ_COLUMN);
+                        w_u16(buf, *i);
+                    }
+                    Projection::Expr { program, name } => {
+                        buf.push(PROJ_EXPR);
+                        program.encode_into(buf);
+                        buf.extend_from_slice(&(name.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(name.as_bytes());
+                    }
+                }
+            }
+            buf.push(match order_over {
+                OrderOver::BaseRow => 0u8,
+                OrderOver::Grouped => 1,
+                OrderOver::Projection => 2,
+            });
+            w_u16(buf, order_by.len() as u16);
+            for (c, desc) in order_by {
+                w_u16(buf, *c);
+                buf.push(*desc as u8);
+            }
+            encode_opt_u64(*limit, buf);
+            encode_opt_u64(*offset, buf);
+            // A COUNT of joins where v6 wrote a single optional-join tag
+            // (PLAN_FORMAT 7). `joined_filter` follows the chain, once, over the
+            // full joined row.
+            w_u16(buf, joins.len() as u16);
+            for j in joins {
+                buf.extend_from_slice(&j.table.to_le_bytes());
+                buf.push(match j.kind {
+                    JoinKind::Inner => 0,
+                    JoinKind::Left => 1,
+                    // 2 (RIGHT) and 3 (FULL) are reserved — see decode.
+                });
+                encode_access(&j.access, buf);
+                j.on.encode_into(buf);
+                encode_opt_program(j.policy.as_ref(), buf);
+            }
+            encode_opt_program(joined_filter.as_ref(), buf);
+            buf.push(*distinct as u8);
+            w_u16(buf, *order_junk);
+            match aggregate {
+                None => buf.push(0),
+                Some(a) => {
+                    buf.push(1);
+                    w_u16(buf, a.group_by.len() as u16);
+                    for c in &a.group_by {
+                        w_u16(buf, *c);
+                    }
+                    w_u16(buf, a.aggs.len() as u16);
+                    for c in &a.aggs {
+                        buf.push(c.func as u8);
+                        buf.push(c.distinct as u8);
+                        match &c.arg {
+                            None => buf.push(0),
+                            Some(p) => {
+                                buf.push(1);
+                                p.encode_into(buf);
+                            }
+                        }
+                    }
+                    encode_opt_program(a.having.as_ref(), buf);
+                }
+            }
+        }
+        PlanStmt::Insert {
+            table,
+            rows,
+            with_check,
+            on_conflict,
+            returning,
+        } => {
+            buf.push(STMT_INSERT);
+            buf.extend_from_slice(&table.to_le_bytes());
+            w_u16(buf, rows.len() as u16);
+            let width = rows.first().map_or(0, |r| r.len());
+            w_u16(buf, width as u16);
+            for row in rows {
+                for src in row {
+                    match src {
+                        InsertSource::Param(i) => {
+                            buf.push(SRC_PARAM);
+                            w_u16(buf, *i);
+                        }
+                        InsertSource::Const(i) => {
+                            buf.push(SRC_CONST);
+                            w_u16(buf, *i);
+                        }
+                        InsertSource::Default => buf.push(SRC_DEFAULT),
+                    }
+                }
+            }
+            encode_opt_program(with_check.as_ref(), buf);
+            encode_on_conflict(on_conflict, buf);
+            encode_opt_projection(returning.as_deref(), buf);
+        }
+        PlanStmt::Update {
+            table,
+            access,
+            filter,
+            set,
+            with_check,
+            returning,
+        } => {
+            buf.push(STMT_UPDATE);
+            buf.extend_from_slice(&table.to_le_bytes());
+            encode_access(access, buf);
+            encode_opt_program(filter.as_ref(), buf);
+            w_u16(buf, set.len() as u16);
+            for (c, program) in set {
+                w_u16(buf, *c);
+                program.encode_into(buf);
+            }
+            encode_opt_program(with_check.as_ref(), buf);
+            encode_opt_projection(returning.as_deref(), buf);
+        }
+        PlanStmt::Delete {
+            table,
+            access,
+            filter,
+            returning,
+        } => {
+            buf.push(STMT_DELETE);
+            buf.extend_from_slice(&table.to_le_bytes());
+            encode_access(access, buf);
+            encode_opt_program(filter.as_ref(), buf);
+            encode_opt_projection(returning.as_deref(), buf);
+        }
+        PlanStmt::Begin => buf.push(STMT_BEGIN),
+        PlanStmt::Commit => buf.push(STMT_COMMIT),
+        PlanStmt::Rollback => buf.push(STMT_ROLLBACK),
+    }
+}
