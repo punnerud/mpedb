@@ -24,10 +24,9 @@ pub(crate) struct SelectStmt {
     /// itself. Purely a bind-time name: the compiled plan references columns by
     /// slot, so an alias never reaches the plan bytes.
     pub alias: Option<String>,
-    /// `INNER JOIN <table> ON <cond>`. One join, so two tables — the plan and
-    /// the executor are written for a pair, and an N-way join is a follow-up
-    /// rather than something this quietly half-does.
-    pub join: Option<JoinClause>,
+    /// `INNER JOIN <table> ON <cond>` chain. Empty = single table. Left-deep:
+    /// join `k`'s ON may reference any table at or left of `k`.
+    pub joins: Vec<JoinClause>,
     /// `SELECT DISTINCT` — deduplicate the OUTPUT rows (the projected tuple),
     /// which is why it cannot be pushed into the scan.
     pub distinct: bool,

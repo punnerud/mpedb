@@ -277,6 +277,23 @@ SELECT a.ename, b.ename FROM emp a JOIN emp b ON a.did = b.did AND a.eid < b.eid
 ann
 bob
 
+# A 3-table chain (#45), left-deep, mixing a real table and a self-join:
+# ann is in eng (dept 1); the third join finds everyone ELSE in eng. Same
+# answer as sqlite3, which is the whole point of this file.
+query TTT rowsort
+SELECT e.ename, d.dname, e2.ename
+FROM emp e
+JOIN dept d ON e.did = d.did
+JOIN emp e2 ON e2.did = d.did
+WHERE e.eid = 10
+----
+ann
+eng
+ann
+ann
+eng
+bob
+
 # ON is required. A comma-join is a cartesian product, and the times someone
 # means one are far outnumbered by the times they forgot the condition.
 statement error ON after JOIN

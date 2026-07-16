@@ -339,7 +339,7 @@ pub(crate) fn exec_stmt(
         PlanStmt::Select {
             table,
             access,
-            join,
+            joins,
             joined_filter,
             filter,
             projection,
@@ -364,7 +364,7 @@ pub(crate) fn exec_stmt(
                 // A join is gathered whole (the LIMIT bounds joined rows, not
                 // outer rows), and any sort below the base row moves the bound
                 // down the pipeline too.
-                if join.is_some() || *order_over != OrderOver::BaseRow {
+                if !joins.is_empty() || *order_over != OrderOver::BaseRow {
                     return None;
                 }
                 limit.map(|l| {
@@ -382,7 +382,7 @@ pub(crate) fn exec_stmt(
                     *table,
                     access,
                     filter.as_ref(),
-                    join.as_ref(),
+                    joins,
                     joined_filter.as_ref(),
                     agg,
                     projection,
@@ -394,7 +394,7 @@ pub(crate) fn exec_stmt(
                     *distinct,
                 );
             }
-            let rows = if let Some(j) = join {
+            let rows = if !joins.is_empty() {
                 // A join materializes: the sort, the dedup and the LIMIT all
                 // apply to JOINED rows, so none of them can bound the scan.
                 let mut r = gather_joined(
@@ -404,7 +404,7 @@ pub(crate) fn exec_stmt(
                     *table,
                     access,
                     filter.as_ref(),
-                    j,
+                    joins,
                     joined_filter.as_ref(),
                 )?;
                 // `OrderOver::BaseRow` means "the tuple the scan produced", and
@@ -483,34 +483,39 @@ pub(crate) fn exec_stmt(
             // A joined slot past the outer's width belongs to the inner table,
             // and it is named `<table>.<column>`: `id` alone would not say
             // which side it came from, and both sides usually have one.
-            let inner_t = match join {
-                Some(j) => Some(table_def(schema, j.table)?),
-                None => None,
+            // The joined tuple is `[table0 ‖ … ‖ tableN]`. A projected column
+            // index is named `<table>.<column>` (bare would be ambiguous across
+            // sides); a single-table read keeps its plain column name.
+            let joined_tables: Vec<&TableDef> = if joins.is_empty() {
+                vec![t]
+            } else {
+                let mut v = vec![t];
+                for j in joins {
+                    v.push(table_def(schema, j.table)?);
+                }
+                v
+            };
+            let name_slot = |mut i: usize| -> Result<String> {
+                if joined_tables.len() == 1 {
+                    return t
+                        .columns
+                        .get(i)
+                        .map(|c| c.name.clone())
+                        .ok_or_else(|| internal("projection column name"));
+                }
+                for jt in &joined_tables {
+                    if i < jt.columns.len() {
+                        return Ok(format!("{}.{}", jt.name, jt.columns[i].name));
+                    }
+                    i -= jt.columns.len();
+                }
+                Err(internal("projection column name"))
             };
             let columns = projection
                 .iter()
                 .take(projection.len() - *order_junk as usize)
                 .map(|p| match p {
-                    Projection::Column(i) => {
-                        let i = *i as usize;
-                        match inner_t {
-                            None => t
-                                .columns
-                                .get(i)
-                                .map(|c| c.name.clone())
-                                .ok_or_else(|| internal("projection column name")),
-                            Some(it) => {
-                                if i < t.columns.len() {
-                                    Ok(format!("{}.{}", t.name, t.columns[i].name))
-                                } else {
-                                    it.columns
-                                        .get(i - t.columns.len())
-                                        .map(|c| format!("{}.{}", it.name, c.name))
-                                        .ok_or_else(|| internal("projection column name"))
-                                }
-                            }
-                        }
-                    }
+                    Projection::Column(i) => name_slot(*i as usize),
                     Projection::Expr { name, .. } => Ok(name.clone()),
                 })
                 .collect::<Result<Vec<String>>>()?;
@@ -844,7 +849,7 @@ fn exec_aggregate(
     table: u32,
     access: &AccessPath,
     filter: Option<&ExprProgram>,
-    join: Option<&Join>,
+    joins: &[Join],
     joined_filter: Option<&ExprProgram>,
     agg: &Aggregation,
     projection: &[Projection],
@@ -857,9 +862,9 @@ fn exec_aggregate(
 ) -> Result<ExecResult> {
     // Unbounded on purpose: see the LIMIT note above. Over a join the row being
     // aggregated is the JOINED row — same rule, wider row.
-    let rows = match join {
-        None => gather_rows(ctx, table, access, filter, plan, params, None)?,
-        Some(j) => gather_joined(ctx, plan, params, table, access, filter, j, joined_filter)?,
+    let rows = match joins.is_empty() {
+        true => gather_rows(ctx, table, access, filter, plan, params, None)?,
+        false => gather_joined(ctx, plan, params, table, access, filter, joins, joined_filter)?,
     };
 
     // Group. The key is the memcmp-ordered keycode of the group columns, so
@@ -1003,41 +1008,53 @@ fn gather_joined(
     outer_table: u32,
     outer_access: &AccessPath,
     outer_policy: Option<&ExprProgram>,
-    join: &Join,
+    joins: &[Join],
     joined_filter: Option<&ExprProgram>,
 ) -> Result<Vec<Vec<Value>>> {
-    // The outer's policy is a filter over the outer row, so the existing
-    // single-table gather applies it — including through the access path.
-    let outer_rows = gather_rows(ctx, outer_table, outer_access, outer_policy, plan, params, None)?;
-    let inner_rows = gather_rows(
-        ctx,
-        join.table,
-        &join.access,
-        join.policy.as_ref(),
-        plan,
-        params,
-        None,
-    )?;
-
-    let mut out = Vec::new();
+    // Left-deep nested loop. Start with the outer's rows (its policy applies
+    // through the access path), then fold in each join: gather that table's
+    // rows — its policy runs over its OWN row here, BEFORE any ON can raise on
+    // it — and keep the pairs its ON accepts. Join `k`'s ON sees the row
+    // accumulated so far, `[table0 ‖ … ‖ table_k]`, which is exactly the tuple
+    // the planner bound and width-checked it against.
+    let mut acc =
+        gather_rows(ctx, outer_table, outer_access, outer_policy, plan, params, None)?;
     let mut stack = Vec::new();
-    for o in &outer_rows {
-        for i in &inner_rows {
-            let mut joined = Vec::with_capacity(o.len() + i.len());
-            joined.extend_from_slice(o);
-            joined.extend_from_slice(i);
-            if !join.on.eval_filter(&mut stack, &joined, params)? {
-                continue;
-            }
-            if let Some(f) = joined_filter {
-                if !f.eval_filter(&mut stack, &joined, params)? {
-                    continue;
+    for join in joins {
+        let inner = gather_rows(
+            ctx,
+            join.table,
+            &join.access,
+            join.policy.as_ref(),
+            plan,
+            params,
+            None,
+        )?;
+        let mut next = Vec::new();
+        for a in &acc {
+            for i in &inner {
+                let mut joined = Vec::with_capacity(a.len() + i.len());
+                joined.extend_from_slice(a);
+                joined.extend_from_slice(i);
+                if join.on.eval_filter(&mut stack, &joined, params)? {
+                    next.push(joined);
                 }
             }
-            out.push(joined);
         }
+        acc = next;
     }
-    Ok(out)
+    // WHERE runs once, over the full joined row — after every ON and every
+    // per-table policy, because it can raise and a raise is observable.
+    if let Some(f) = joined_filter {
+        let mut kept = Vec::with_capacity(acc.len());
+        for row in acc {
+            if f.eval_filter(&mut stack, &row, params)? {
+                kept.push(row);
+            }
+        }
+        acc = kept;
+    }
+    Ok(acc)
 }
 
 /// Project one written row through a `RETURNING` clause.

@@ -28,12 +28,19 @@ use mpedb_types::{AggFn,
 /// 4: `Select` encodes `order_over` before the `order_by` count.
 /// 5: joins. `Select` encodes a `join` tag and `order_junk`, and the plan
 ///    header carries a LIST of policy stamps where it carried one epoch+hash.
+/// 6: `ColumnType::Any` (tag 7) — see value.rs.
+/// 7: N-way INNER join. `Select` encodes a COUNT of joins where it encoded a
+///    single optional join, so a v6 reader would misread the byte stream.
 /// 6: `ColumnType::Any` (tag 7). No plan FIELD moved — but a plan carries the
 ///    column types it bound against, and a v5 reader decoding a v6 plan would
 ///    hit tag 7 in `ColumnType::from_tag`, get `None`, and report the plan as
 ///    corrupt rather than as "written by a newer mpedb". The bump makes it say
 ///    the true thing.
-const PLAN_FORMAT: u8 = 6;
+/// Self-imposed ceiling on joins in one SELECT, so a corrupt plan cannot make the
+/// decoder allocate unboundedly. Far above any hand-written query.
+const MAX_JOINS: usize = 16;
+
+const PLAN_FORMAT: u8 = 7;
 
 /// One table's RLS state, frozen at compile time. See
 /// [`CompiledPlan::policies`].
@@ -136,9 +143,10 @@ pub enum PlanStmt {
     Select {
         table: u32,
         access: AccessPath,
-        /// `INNER JOIN`. `None` = a single-table read, and then every tuple
-        /// below is the base row.
-        join: Option<Join>,
+        /// `INNER JOIN` chain, left-deep. Empty = a single-table read, and then
+        /// every tuple below is the base row. Join `k`'s `on` runs over the row
+        /// accumulated through join `k` — `[table0 ‖ … ‖ table_{k+1}]`.
+        joins: Vec<Join>,
         /// Residual predicate after access-path extraction, over the BASE row
         /// (the outer row, when joined). Always the base row — see
         /// `joined_filter` for the other one.
@@ -554,7 +562,7 @@ impl CompiledPlan {
             PlanStmt::Select {
                 table,
                 access,
-                join,
+                joins,
                 joined_filter,
                 filter,
                 projection,
@@ -588,29 +596,28 @@ impl CompiledPlan {
                 // bounded against the outer's width alone could not name the
                 // inner's columns at all, and one bounded against nothing could
                 // read past the tuple.
-                let join_t = match join {
-                    Some(j) => Some(get_table(j.table)?),
-                    None => None,
-                };
-                let base_width = t.columns.len() + join_t.map_or(0, |j| j.columns.len());
-                if let Some(j) = join {
-                    let jt = join_t.expect("set together");
-                    if j.table == *table {
-                        // The binder refuses self-joins (no alias syntax to tell
-                        // the sides apart), so a blob claiming one is forged.
-                        return Err(corrupt("join of a table to itself"));
-                    }
+                if joins.len() > MAX_JOINS {
+                    return Err(corrupt("too many joins in plan"));
+                }
+                // Width accumulates left to right: join `k`'s `on` runs over
+                // `[table0 ‖ … ‖ table_{k+1}]`, so its bound grows as we go. Each
+                // join's POLICY runs over its OWN row alone (the whole point of
+                // it being separate), so it is bounded by that one table's width.
+                // A self-join (same table id twice) is legal since #44 — tables
+                // are addressed by alias, and the plan carries slots, not names.
+                let mut acc_width = t.columns.len();
+                for j in joins {
+                    let jt = get_table(j.table)?;
                     self.check_access(&j.access, jt)?;
-                    // The inner's POLICY runs over the inner row alone — that
-                    // is the whole point of it being separate — so it is bounded
-                    // by the inner's width, not the joined one.
                     if let Some(p) = &j.policy {
                         self.check_program(p, jt)?;
                     }
-                    self.check_program_width(&j.on, base_width)?;
+                    acc_width += jt.columns.len();
+                    self.check_program_width(&j.on, acc_width)?;
                 }
+                let base_width = acc_width; // the full joined row
                 if let Some(jf) = joined_filter {
-                    if join.is_none() {
+                    if joins.is_empty() {
                         return Err(corrupt("joined filter without a join"));
                     }
                     self.check_program_width(jf, base_width)?;
@@ -1011,7 +1018,7 @@ impl CompiledPlan {
             PlanStmt::Select {
                 table,
                 access,
-                join,
+                joins,
                 joined_filter,
                 filter,
                 projection,
@@ -1026,21 +1033,29 @@ impl CompiledPlan {
                 // With a join every tuple below is `[outer ‖ inner]`, so the
                 // namer has to span both — and it qualifies, because `did` alone
                 // would not say which side, and both sides usually have one.
-                let outer_t = schema.table(*table).cloned();
-                let inner_t = join.as_ref().and_then(|j| schema.table(j.table).cloned());
+                // The joined tuple is `[table0 ‖ … ‖ tableN]`; the namer walks
+                // the widths to find which table a column index lands in, and
+                // qualifies with the table name (both sides usually share a
+                // column name, so bare would be ambiguous).
+                let joined_tables: Vec<_> = std::iter::once(*table)
+                    .chain(joins.iter().map(|j| j.table))
+                    .filter_map(|id| schema.table(id).cloned())
+                    .collect();
                 let single = col_namer(*table);
-                let base = |c: u16| match (&outer_t, &inner_t) {
-                    (Some(o), Some(i)) => {
-                        let n = o.columns.len();
-                        if (c as usize) < n {
-                            format!("{}.{}", o.name, o.columns[c as usize].name)
-                        } else if (c as usize) < n + i.columns.len() {
-                            format!("{}.{}", i.name, i.columns[c as usize - n].name)
-                        } else {
-                            format!("col#{c}")
-                        }
+                let base = |c: u16| {
+                    // A single-table read names columns bare; only a join needs
+                    // the `<table>.<column>` qualification to say which side.
+                    if joined_tables.len() < 2 {
+                        return single(c);
                     }
-                    _ => single(c),
+                    let mut off = 0usize;
+                    for t in &joined_tables {
+                        if (c as usize) < off + t.columns.len() {
+                            return format!("{}.{}", t.name, t.columns[c as usize - off].name);
+                        }
+                        off += t.columns.len();
+                    }
+                    format!("col#{c}")
                 };
                 out.push_str(&format!(
                     "Select{} {}\n",
@@ -1055,7 +1070,7 @@ impl CompiledPlan {
                     // Over the OUTER row alone, so it uses the outer's namer.
                     out.push_str(&format!("  filter: {}\n", render_program(f, &single)));
                 }
-                if let Some(j) = join {
+                for j in joins {
                     out.push_str(&format!(
                         "  inner join {} (nested loop, O(n*m) — no predicate pushdown)\n",
                         table_name(j.table)
@@ -1637,7 +1652,7 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
         PlanStmt::Select {
             table,
             access,
-            join,
+            joins,
             joined_filter,
             filter,
             projection,
@@ -1680,17 +1695,17 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             }
             encode_opt_u64(*limit, buf);
             encode_opt_u64(*offset, buf);
-            match join {
-                None => buf.push(0),
-                Some(j) => {
-                    buf.push(1);
-                    buf.extend_from_slice(&j.table.to_le_bytes());
-                    encode_access(&j.access, buf);
-                    j.on.encode_into(buf);
-                    encode_opt_program(j.policy.as_ref(), buf);
-                    encode_opt_program(joined_filter.as_ref(), buf);
-                }
+            // A COUNT of joins where v6 wrote a single optional-join tag
+            // (PLAN_FORMAT 7). `joined_filter` follows the chain, once, over the
+            // full joined row.
+            w_u16(buf, joins.len() as u16);
+            for j in joins {
+                buf.extend_from_slice(&j.table.to_le_bytes());
+                encode_access(&j.access, buf);
+                j.on.encode_into(buf);
+                encode_opt_program(j.policy.as_ref(), buf);
             }
+            encode_opt_program(joined_filter.as_ref(), buf);
             buf.push(*distinct as u8);
             w_u16(buf, *order_junk);
             match aggregate {
@@ -1839,21 +1854,20 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
             }
             let limit = decode_opt_u64(buf, pos)?;
             let offset = decode_opt_u64(buf, pos)?;
-            let join = match r_u8(buf, pos)? {
-                0 => None,
-                1 => Some(Join {
+            let njoins = r_u16(buf, pos)? as usize;
+            if njoins > MAX_JOINS {
+                return Err(corrupt("too many joins in plan"));
+            }
+            let mut joins = Vec::with_capacity(njoins.min(MAX_JOINS));
+            for _ in 0..njoins {
+                joins.push(Join {
                     table: r_u32(buf, pos)?,
                     access: decode_access(buf, pos)?,
                     on: ExprProgram::decode(buf, pos)?,
                     policy: decode_opt_program(buf, pos)?,
-                }),
-                t => return Err(corrupt(format!("bad join tag {t}"))),
-            };
-            let joined_filter = if join.is_some() {
-                decode_opt_program(buf, pos)?
-            } else {
-                None
-            };
+                });
+            }
+            let joined_filter = decode_opt_program(buf, pos)?;
             let distinct = match r_u8(buf, pos)? {
                 0 => false,
                 1 => true,
@@ -1912,7 +1926,7 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
             Ok(PlanStmt::Select {
                 table,
                 access,
-                join,
+                joins,
                 joined_filter,
                 filter,
                 projection,
@@ -2393,10 +2407,11 @@ mod tests {
         let (outer_w, joined_w) = match &p.stmt {
             PlanStmt::Select {
                 table,
-                join: Some(j),
+                joins,
                 aggregate: Some(a),
                 ..
-            } => {
+            } if !joins.is_empty() => {
+                let j = &joins[0];
                 let o = s.table(*table).unwrap().columns.len();
                 let i = s.table(j.table).unwrap().columns.len();
                 // `users.email` is column 1 of users, which sits after all of
