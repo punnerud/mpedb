@@ -1,0 +1,389 @@
+use super::*;
+use super::select::{describe_key, distinct_order_by, ordinal};
+
+/// `SELECT … FROM a INNER JOIN b ON <cond> [WHERE …]`, as a nested loop.
+///
+/// The evaluation order is the security contract, and it is why the pieces are
+/// separate fields rather than one AND-ed predicate:
+///
+/// ```text
+/// for each outer row matching `access`:
+///     if not `filter`(outer):            continue   <- a's RLS USING
+///     for each inner row matching `join.access`:
+///         if not `join.policy`(inner):   continue   <- b's RLS USING
+///         if not `join.on`(outer ‖ inner):   continue
+///         if not `joined_filter`(outer ‖ inner): continue
+///         emit
+/// ```
+///
+/// Both policies run over ONE row, and before anything that can raise. mpedb's
+/// expressions raise on division by zero and on overflow, and a raise is
+/// observable — so `ON a.x / b.secret > 1` evaluated before b's policy would
+/// report the existence of a row the policy hides, without ever returning it.
+/// AND-ing everything into one predicate would leave that ordering to whatever
+/// the compiler emitted.
+///
+/// What this deliberately does NOT do yet: push the user's WHERE into either
+/// side. Every conjunct waits for the joined row, so the outer is a full scan
+/// unless its POLICY pins a key, and the inner is re-scanned per outer row —
+/// O(n·m). Correct, and slow enough that EXPLAIN says so.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_join_select(
+    s: &ast::SelectStmt,
+    schema: &Schema,
+    n_params: u16,
+    catalog: &PolicyCatalog,
+    consts: &mut Vec<Value>,
+) -> Result<PlannedStmt> {
+    let (outer_id, outer) = resolve_table(schema, &s.table)?;
+    let outer_name = s.alias.clone().unwrap_or_else(|| outer.name.clone());
+
+    // The outer's policy binds over its own row and can pin an access path.
+    let mut ob = Binder::new(outer, n_params, true);
+    let outer_policy = read_policy(&mut ob, catalog, outer_id, &outer.name, PolicyCmd::Select)?;
+    let (access, outer_residual) = extract_access(outer_policy, outer, consts)?;
+    let filter = outer_residual.map(|e| compile_program(&e)).transpose()?;
+
+    // Fold left over the join chain. `acc_named` grows one table per join, so
+    // join `k`'s ON binds over `[outer ‖ … ‖ table_k]` — exactly the rows that
+    // exist when it runs. Each table's POLICY binds over its OWN row (a policy
+    // is a single-row scalar; a joined slot would be the wrong column) and runs
+    // BEFORE any ON can raise on that row — the RLS-over-join ordering contract.
+    let mut binder = ob;
+    let mut acc_named: Vec<(String, &TableDef)> = vec![(outer_name.clone(), outer)];
+    let mut joins: Vec<Join> = Vec::new();
+    let mut joined_columns = outer.columns.clone();
+    // The accumulated tuple's column types, for the equi-join pushdown: join
+    // `k`'s access may reference outer slots (`KeyPart::OuterCol`), which are
+    // slots of the tuple built BEFORE its own table joins in.
+    let mut acc_types: Vec<ColumnType> = outer.columns.iter().map(|c| c.ty).collect();
+    for jc in &s.joins {
+        let (jid, jt) = resolve_table(schema, &jc.table)?;
+        let jname = jc.alias.clone().unwrap_or_else(|| jt.name.clone());
+
+        let mut pb = binder.rescope(Scope::single(jt));
+        let policy = read_policy(&mut pb, catalog, jid, &jt.name, PolicyCmd::Select)?;
+        let policy = policy.map(|e| compile_program(&e)).transpose()?;
+
+        acc_named.push((jname, jt));
+        let mut jb = pb.rescope(Scope::joined_named(acc_named.clone())?);
+        let bound_on = jb.bind_predicate(&jc.on)?;
+        binder = jb;
+
+        // #49: consume pure equality conjuncts into an inner access path —
+        // the index nested loop. What remains of the ON runs as the residual
+        // over the joined row, preserving every raise the query could observe.
+        let (jaccess, residual_on) = extract_join_access(bound_on, &acc_types, jt, consts)?;
+        let on = compile_program(&residual_on)?;
+
+        joined_columns.extend(jt.columns.iter().cloned());
+        acc_types.extend(jt.columns.iter().map(|c| c.ty));
+        joins.push(Join {
+            table: jid,
+            kind: match jc.kind {
+                ast::JoinKind::Inner => JoinKind::Inner,
+                ast::JoinKind::Left => JoinKind::Left,
+            },
+            access: jaccess,
+            on,
+            policy,
+        });
+    }
+
+    // WHERE runs over the full joined row (`binder` is now in that scope).
+    let joined_filter = s
+        .where_clause
+        .as_ref()
+        .map(|e| binder.bind_predicate(e))
+        .transpose()?
+        .map(|e| compile_program(&e))
+        .transpose()?;
+
+    let full_scope = Scope::joined_named(acc_named.clone())?;
+    let namer = joined_namer(&acc_named);
+
+    // An aggregate over a join groups the JOINED row. Nothing in the grouping
+    // step is about tables — it is about the row it is handed — so the same
+    // planner runs, given the joined row's columns and scope.
+    let has_agg = s
+        .items
+        .as_ref()
+        .is_some_and(|i| i.iter().any(contains_agg))
+        || s.having.as_ref().is_some_and(contains_agg)
+        || s.order_by.iter().any(|(e, _)| contains_agg(e))
+        || !s.group_by.is_empty();
+    if has_agg {
+        return plan_aggregate_select(
+            s,
+            &joined_columns,
+            &full_scope,
+            outer_id,
+            access,
+            filter,
+            joins,
+            joined_filter,
+            binder,
+            consts,
+        );
+    }
+
+    // Projection over the joined tuple. `SELECT *` is every column of every
+    // side, in join order — the same order the tuple is built in.
+    let mut projection: Vec<Projection> = match &s.items {
+        None => (0..binder.scope_width() as u16).map(Projection::Column).collect(),
+        Some(items) => {
+            let mut out = Vec::with_capacity(items.len());
+            for item in items {
+                let (b, _) = binder.bind_expr(item)?;
+                out.push(match b {
+                    BExpr::Col(i) => Projection::Column(i),
+                    other => {
+                        let program = compile_program(&other)?;
+                        let name = render_program(&program, &namer);
+                        Projection::Expr { program, name }
+                    }
+                });
+            }
+            out
+        }
+    };
+
+    // ORDER BY over the joined row. A bare column is a slot of it; anything
+    // else takes the sort-only-column route, exactly as the single-table path
+    // does.
+    let mut order_by = Vec::with_capacity(s.order_by.len());
+    let mut order_over = OrderOver::BaseRow;
+    let mut order_junk = 0u16;
+    if s.distinct {
+        // Under DISTINCT the sort AND the LIMIT/OFFSET must follow the dedup,
+        // and exec only applies skip/take post-dedup on the Projection route —
+        // so the joined base row is never the tuple being ordered or bounded.
+        // The single-table path has enforced this all along; the join path
+        // silently skipped it, and LIMIT counted pre-dedup joined duplicates
+        // (adversarial review find: `SELECT DISTINCT dept.dname … LIMIT 2`
+        // returned one row where sqlite3/PG return two). junk = None: a sort
+        // key that is not in the SELECT list is refused, because after the
+        // dedup it is *which duplicate survived* that would decide the order.
+        let (keys, n_junk) = distinct_order_by(s, &full_scope, None)?;
+        order_by = keys;
+        order_over = OrderOver::Projection;
+        order_junk = n_junk;
+    } else if !s.order_by.is_empty() {
+        // The "base row" of a join IS the joined row, and it is built in full
+        // before the sort — so sorting it is the same operation, just wider.
+        let mut keys = Vec::with_capacity(s.order_by.len());
+        let mut all_cols = true;
+        for (e, desc) in &s.order_by {
+            match binder.bind_expr(e) {
+                Ok((BExpr::Col(i), _)) => keys.push((i, *desc)),
+                _ => {
+                    all_cols = false;
+                    break;
+                }
+            }
+        }
+        if all_cols {
+            order_by = keys;
+        } else {
+            let (keys, n_junk) =
+                join_order_by(s, &full_scope, &mut projection, &mut binder, &namer)?;
+            order_by = keys;
+            order_over = OrderOver::Projection;
+            order_junk = n_junk;
+        }
+    }
+
+    let (param_types, context_keys, list_keys) = binder.into_parts();
+    Ok((
+        PlanStmt::Select {
+            table: outer_id,
+            access,
+            joins,
+            joined_filter,
+            filter,
+            projection,
+            order_by,
+            order_over,
+            order_junk,
+            limit: s.limit,
+            offset: s.offset,
+            distinct: s.distinct,
+            aggregate: None,
+        },
+        param_types,
+        context_keys,
+        list_keys,
+    ))
+}
+
+/// Name a joined-tuple slot for EXPLAIN and output columns: `<table>.<column>`,
+/// because `id` alone would be a lie about which side it came from.
+fn joined_namer<'a>(
+    names: &'a [(String, &'a TableDef)],
+) -> impl Fn(u16) -> String + use<'a> {
+    move |c: u16| {
+        let mut off = 0usize;
+        for (nm, t) in names {
+            if (c as usize) < off + t.columns.len() {
+                return format!("{}.{}", nm, t.columns[c as usize - off].name);
+            }
+            off += t.columns.len();
+        }
+        format!("col#{c}")
+    }
+}
+
+/// `ORDER BY` for a join that needs sort-only columns.
+fn join_order_by(
+    s: &ast::SelectStmt,
+    _joined: &Scope<'_>,
+    projection: &mut Vec<Projection>,
+    binder: &mut Binder<'_>,
+    namer: &dyn Fn(u16) -> String,
+) -> Result<(Vec<(u16, bool)>, u16)> {
+    let items = s.items.as_ref();
+    let mut keys = Vec::with_capacity(s.order_by.len());
+    let mut n_junk = 0u16;
+    for (i, (e, desc)) in s.order_by.iter().enumerate() {
+        if let Some(items) = items {
+            if let Some(pos) = ordinal(e, items.len())? {
+                keys.push((pos, *desc));
+                continue;
+            }
+            if let Some(pos) = items.iter().position(|it| it == e) {
+                keys.push((pos as u16, *desc));
+                continue;
+            }
+        }
+        let (b, _) = binder.bind_expr(e)?;
+        if matches!(b, BExpr::Const(_)) {
+            return Err(bind_err(format!(
+                "{} is a constant — it names no column, so it orders nothing.",
+                describe_key(e, i)
+            )));
+        }
+        let program = compile_program(&b)?;
+        let name = render_program(&program, &namer);
+        projection.push(Projection::Expr { program, name });
+        keys.push(((projection.len() - 1) as u16, *desc));
+        n_junk += 1;
+    }
+    Ok((keys, n_junk))
+}
+
+/// #49: decompose a join's bound ON into an inner-side access path
+/// (parametrized by the outer row) plus the residual ON — the index
+/// nested-loop pushdown. Only PURE equality conjuncts are consumed:
+/// `inner.col = outer.col` (column types exactly equal, so the key encoding
+/// is the stored one), `inner.col = $p`, `inner.col = <lit>`. Anything that
+/// can raise stays in the residual — consuming it would erase observable
+/// raise behaviour, the same contract that keeps policies ahead of ON.
+///
+/// Preference: full-PK equality (one `get` per outer row, no index tree) >
+/// unique index (at most one row) > non-unique index > FullScan
+/// (read-once-and-hold, exactly the pre-#49 execution).
+fn extract_join_access(
+    on: BExpr,
+    outer_types: &[ColumnType],
+    inner: &TableDef,
+    consts: &mut Vec<Value>,
+) -> Result<(AccessPath, BExpr)> {
+    let ow = outer_types.len() as u16;
+    let iw = inner.columns.len() as u16;
+    let mut conjuncts = Vec::new();
+    split_and(on, &mut conjuncts);
+    let mut consumed = vec![false; conjuncts.len()];
+    // Per inner column: the first conjunct that pins it, and with what part.
+    let mut pins: Vec<Option<(usize, KeyPart)>> = vec![None; inner.columns.len()];
+    for (ci, c) in conjuncts.iter().enumerate() {
+        let BExpr::Binary(BinOp::Eq, l, r) = c else { continue };
+        let (icol, part) = match (&**l, &**r) {
+            (BExpr::Col(i), BExpr::Col(j)) if *i >= ow && *i < ow + iw && *j < ow => {
+                let icol = (*i - ow) as usize;
+                if outer_types[*j as usize] != inner.columns[icol].ty {
+                    continue; // cross-type equality: encodings differ, stay residual
+                }
+                (icol, KeyPart::OuterCol(*j))
+            }
+            (BExpr::Col(j), BExpr::Col(i)) if *i >= ow && *i < ow + iw && *j < ow => {
+                let icol = (*i - ow) as usize;
+                if outer_types[*j as usize] != inner.columns[icol].ty {
+                    continue;
+                }
+                (icol, KeyPart::OuterCol(*j))
+            }
+            (BExpr::Col(i), other) if *i >= ow && *i < ow + iw => {
+                let icol = (*i - ow) as usize;
+                match as_atom(other) {
+                    // A NULL or cross-type constant would fail plan validation
+                    // (and `= NULL` is UNKNOWN anyway) — leave it residual.
+                    Some(Atom::Const(v))
+                        if v.is_null() || !v.fits(inner.columns[icol].ty) =>
+                    {
+                        continue
+                    }
+                    Some(a) => (icol, a.to_key_part(consts)?),
+                    None => continue,
+                }
+            }
+            (other, BExpr::Col(i)) if *i >= ow && *i < ow + iw => {
+                let icol = (*i - ow) as usize;
+                match as_atom(other) {
+                    Some(Atom::Const(v))
+                        if v.is_null() || !v.fits(inner.columns[icol].ty) =>
+                    {
+                        continue
+                    }
+                    Some(a) => (icol, a.to_key_part(consts)?),
+                    None => continue,
+                }
+            }
+            _ => continue,
+        };
+        // Belt and suspenders: an `any` column can never be pinned. The
+        // schema already refuses `any` in every key (PK/UNIQUE/indexed), so
+        // no access path could use the pin — but the probe semantics would be
+        // encoding-equality rather than sql_cmp, and that must never leak in
+        // through a future schema change.
+        if pins[icol].is_none() && inner.columns[icol].ty != ColumnType::Any {
+            pins[icol] = Some((ci, part));
+        }
+    }
+
+    // Full PK pinned → PkPoint. Otherwise a UNIQUE index beats a non-unique
+    // one; within each pass, declaration order picks.
+    let mut chosen: Option<AccessPath> = None;
+    let pk_pins: Option<Vec<(usize, KeyPart)>> = inner
+        .primary_key
+        .iter()
+        .map(|&pc| pins[pc as usize])
+        .collect();
+    if let Some(pp) = pk_pins {
+        for (ci, _) in &pp {
+            consumed[*ci] = true;
+        }
+        chosen = Some(AccessPath::PkPoint(pp.into_iter().map(|(_, p)| p).collect()));
+    } else {
+        let sec = secondary_indexes(inner);
+        'passes: for unique_only in [true, false] {
+            for (pos, &col) in sec.iter().enumerate() {
+                if pos >= 63 || inner.columns[col as usize].unique != unique_only {
+                    continue;
+                }
+                if let Some((ci, part)) = pins[col as usize] {
+                    consumed[ci] = true;
+                    chosen = Some(AccessPath::IndexPoint {
+                        index_no: (pos + 1) as u32,
+                        part,
+                    });
+                    break 'passes;
+                }
+            }
+        }
+    }
+    let access = chosen.unwrap_or(AccessPath::FullScan);
+    // An empty residual is constant TRUE — the equality was the whole ON.
+    let residual =
+        rebuild_residual(conjuncts, &consumed).unwrap_or(BExpr::Const(Value::Bool(true)));
+    Ok((access, residual))
+}
