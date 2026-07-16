@@ -55,6 +55,12 @@ pub mod leakstat {
         OVF_NS_ALLOC,     // ...in alloc_raw (freelist pop, refill, dirty insert)
         OVF_NS_WRITE,     // ...in page_mut + header + payload memcpy + tail zero
         OVF_NS_CHAIN,     // ...in the 2nd page_mut, only to set prev's next-ptr
+        // #40: the phases of insert_row. write_overflow is only 20% of execute;
+        // one of these has to hold the other 80%.
+        INS_NS_VALIDATE,  // validate_row
+        INS_NS_ENCODE,    // row::encode_row — copies the blob a SECOND time
+        INS_NS_BTREE,     // btree::insert (which contains write_overflow)
+        INS_NS_COMMIT,    // commit_with: freelist fixpoint + meta publish
     );
     #[inline(always)]
     pub fn bump(c: &AtomicU64) {
@@ -1366,12 +1372,16 @@ impl<'e> WriteTxn<'e> {
 
     pub fn insert_row(&mut self, table_id: u32, values: &[Value]) -> Result<()> {
         self.check_write_blocked(table_id)?;
+        let __t = std::time::Instant::now();
         self.eng.validate_row(table_id, values)?;
+        leakstat::add(&leakstat::INS_NS_VALIDATE, __t.elapsed().as_nanos() as u64);
         let table = self.eng.table(table_id)?;
         let tname = table.name.clone();
         let sec = self.eng.sec_indexes[table_id as usize].clone();
         let key = self.eng.pk_key(table_id, values)?;
+        let __t = std::time::Instant::now();
         let payload = row::encode_row(values, &self.eng.col_types[table_id as usize])?;
+        leakstat::add(&leakstat::INS_NS_ENCODE, __t.elapsed().as_nanos() as u64);
 
         // UNIQUE pre-check on secondary indexes before mutating anything, so
         // a violation aborts with zero side effects on the dirty state.
@@ -1392,7 +1402,9 @@ impl<'e> WriteTxn<'e> {
         }
 
         let (root, count) = self.tree_root(table_id, 0)?;
+        let __t = std::time::Instant::now();
         let out = btree::insert(self, root, &key, &payload, InsertMode::InsertOnly)?;
+        leakstat::add(&leakstat::INS_NS_BTREE, __t.elapsed().as_nanos() as u64);
         if out.existed {
             return Err(Error::PrimaryKeyViolation { table: tname });
         }
@@ -1818,7 +1830,14 @@ impl<'e> WriteTxn<'e> {
     /// posts batch results there: with posting serialized under the lock, a
     /// slot can never be picked up, released, and re-used while a stale
     /// poster still holds a reference to its previous incarnation.
-    pub fn commit_with<F: FnOnce()>(mut self, after_flip: F) -> Result<()> {
+    pub fn commit_with<F: FnOnce()>(self, after_flip: F) -> Result<()> {
+        let __commit_t = std::time::Instant::now();
+        let __r = self.commit_inner(after_flip);
+        leakstat::add(&leakstat::INS_NS_COMMIT, __commit_t.elapsed().as_nanos() as u64);
+        __r
+    }
+
+    fn commit_inner<F: FnOnce()>(mut self, after_flip: F) -> Result<()> {
         let new_txn = self.meta.txn_id + 1;
 
         // 1. write back catalog entries (may COW catalog pages → more frees)
