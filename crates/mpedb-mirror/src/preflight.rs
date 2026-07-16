@@ -28,7 +28,7 @@
 //! it per-row would imply a per-row fix that does not exist.
 
 use mpedb::{Database, ExecResult};
-use mpedb_types::{Error, Result, Value};
+use mpedb_types::{ColumnType, Error, Result, Value};
 
 use crate::state::{self, ColumnMap, MapPolicy, SourceKind, TableMap};
 
@@ -52,6 +52,15 @@ pub enum FindingKind {
     /// **Column-level**: this column already lost information at import, so no
     /// per-row check is meaningful. Reported once.
     LossyColumn,
+    /// **Column-level**: the column is `any`, and the target has no such type.
+    ///
+    /// sqlite does (a column with no declared type takes whatever it is given),
+    /// so this only ever fires against PostgreSQL. Deliberately NOT resolved by
+    /// sniffing the data: deriving `bigint` because today's rows happen to all be
+    /// integers would make the target's DDL depend on the CONTENT, so the same
+    /// push could produce a different schema tomorrow. Naming the column and the
+    /// types actually in it lets the human decide once, in the schema.
+    AnyColumn,
 }
 
 #[derive(Debug, Clone)]
@@ -323,6 +332,51 @@ pub fn preflight(db: &Database) -> Result<PreflightReport> {
             continue;
         };
         let map = TableMap::decode(&raw)?;
+
+        // `any` columns: only PostgreSQL cares — sqlite has this concept, so a
+        // sqlite target round-trips it. Collect the types actually present, so
+        // the message says what the column really holds rather than just that it
+        // is loose.
+        if src_kind == SourceKind::Postgres {
+            for (ci, cdef) in tdef.columns.iter().enumerate() {
+                if cdef.ty != ColumnType::Any {
+                    continue;
+                }
+                let mut seen: Vec<&'static str> = Vec::new();
+                let sql = format!("SELECT {} FROM {}", cdef.name, tdef.name);
+                if let Ok(mpedb::ExecResult::Rows { rows, .. }) = db.query(&sql, &[]) {
+                    for r in &rows {
+                        let n = r[0].type_name();
+                        if !seen.contains(&n) {
+                            seen.push(n);
+                        }
+                    }
+                }
+                seen.sort_unstable();
+                let holds = if seen.is_empty() {
+                    "no rows yet".to_string()
+                } else {
+                    seen.join(", ")
+                };
+                report.findings.push(Finding {
+                    table: tdef.name.clone(),
+                    column: cdef.name.clone(),
+                    kind: FindingKind::AnyColumn,
+                    pk: Vec::new(),
+                    detail: format!(
+                        "`{}.{}` is declared `any`; PostgreSQL has no such type, so this push \
+                         has no column to create. It currently holds: {holds}. Declare the \
+                         column's real type in the schema and re-import — the type will NOT be \
+                         guessed from the data, because that would make the target's DDL depend \
+                         on today's rows",
+                        tdef.name, cdef.name
+                    ),
+                    fix: crate::adapt::Adaptation::Fine,
+                    table_id: tid as u32,
+                    col_idx: ci,
+                });
+            }
+        }
 
         // Column-level verdicts first: a lossy column has no per-row fix.
         for c in &map.columns {

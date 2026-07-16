@@ -2,8 +2,14 @@ use crate::error::{Error, Result};
 use std::cmp::Ordering;
 use std::fmt;
 
-/// Rigid column types. Unlike sqlite, a column only ever stores its declared
-/// type (or NULL where permitted); writes with the wrong type are rejected.
+/// Column types. Rigid by default and by design: unlike sqlite, a column only
+/// ever stores its declared type (or NULL where permitted), and writes with the
+/// wrong type are rejected — that is the dev/prod parity this project exists for.
+///
+/// [`ColumnType::Any`] opts a SINGLE column out of that, sqlite-affinity style.
+/// It is per column on purpose: "rigid schema" is the product, and making it a
+/// database-wide switch would turn a property you can rely on into one you have
+/// to check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
 pub enum ColumnType {
@@ -14,6 +20,17 @@ pub enum ColumnType {
     Blob = 5,
     /// Microseconds since the Unix epoch, UTC.
     Timestamp = 6,
+    /// Any scalar, decided per VALUE rather than per column (sqlite affinity).
+    ///
+    /// The discriminant lives in the row's FIXED section, not the varlen body —
+    /// `row::fixed_width(Any) == 9`, a tag byte plus the eight the other types
+    /// use. That is not an arbitrary layout choice: prefixing the body with a tag
+    /// would make it `[tag] ++ bytes`, which does not exist as one contiguous
+    /// slice to borrow, and both `btree::Payload::Parts` (#42) and the streaming
+    /// insert (#43) borrow varlen bodies straight out of the caller's `Value`.
+    /// Keeping the tag in the fixed slot leaves those untouched, and a rigid
+    /// column pays nothing for a feature it does not use.
+    Any = 7,
 }
 
 impl ColumnType {
@@ -25,6 +42,7 @@ impl ColumnType {
             4 => ColumnType::Text,
             5 => ColumnType::Blob,
             6 => ColumnType::Timestamp,
+            7 => ColumnType::Any,
             _ => return None,
         })
     }
@@ -37,6 +55,7 @@ impl ColumnType {
             "text" | "string" => ColumnType::Text,
             "blob" | "bytes" => ColumnType::Blob,
             "timestamp" => ColumnType::Timestamp,
+            "any" => ColumnType::Any,
             _ => return None,
         })
     }
@@ -49,6 +68,7 @@ impl ColumnType {
             ColumnType::Text => "text",
             ColumnType::Blob => "blob",
             ColumnType::Timestamp => "timestamp",
+            ColumnType::Any => "any",
         }
     }
 }
@@ -108,7 +128,18 @@ impl Value {
 
     /// Whether this value may be stored in a column of type `ty`
     /// (NULL is accepted here; nullability is checked separately).
+    /// Whether this value may be stored in a `ty` column.
+    ///
+    /// NULL fits anything (nullability is checked separately), and `Any` accepts
+    /// anything — that is what it is for. Everything else must match exactly:
+    /// mpedb does not convert, because a conversion that succeeds locally and
+    /// fails in production is the whole problem this project is aimed at.
     pub fn fits(&self, ty: ColumnType) -> bool {
+        if ty == ColumnType::Any {
+            // ...except a context list, which is param-only (DESIGN-MULTIDB
+            // §2.6) and has no encoding in any column, loose or not.
+            return !matches!(self, Value::List(_));
+        }
         match self.column_type() {
             None => true,
             Some(t) => t == ty,

@@ -87,6 +87,15 @@ pub fn decode_value(buf: &[u8], pos: &mut usize, ty: ColumnType) -> Result<Value
         t => return Err(Error::Corrupt(format!("invalid key tag {t:#x}"))),
     }
     match ty {
+        // Refused at schema validation, so reaching here means a corrupt or
+        // hand-built catalog rather than a user mistake. Ordering ACROSS types
+        // is the reason: a key must be memcmp-ordered, and deciding whether
+        // Int(5) sorts before Text("a") means inventing a cross-type order.
+        // sqlite has one; adopting it would hand back exactly the kind of
+        // surprise this project exists to remove. See `Schema::validate`.
+        ColumnType::Any => Err(Error::Corrupt(
+            "an `any` column cannot be part of a key".into(),
+        )),
         ColumnType::Int64 | ColumnType::Timestamp => {
             let raw = buf.get(*pos..*pos + 8).ok_or_else(err)?;
             *pos += 8;
@@ -186,6 +195,10 @@ mod tests {
             return Value::Null;
         }
         match ty {
+            // Keys are never `any` (Schema::validate refuses it — a key is
+            // memcmp-ordered and `any` has no order across types), so the
+            // round-trip property this generator feeds does not apply to it.
+            ColumnType::Any => unreachable!("`any` cannot be a key column"),
             ColumnType::Int64 => Value::Int(rng.next() as i64 >> (rng.next() % 64)),
             ColumnType::Timestamp => Value::Timestamp(rng.next() as i64 >> (rng.next() % 64)),
             ColumnType::Float64 => {

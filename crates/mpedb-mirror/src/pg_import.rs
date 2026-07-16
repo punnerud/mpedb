@@ -29,6 +29,10 @@ fn q(ident: &str) -> String {
 pub(crate) fn read_expr(c: &PgColumn) -> String {
     let col = q(&c.name);
     match c.mapped {
+        // No PostgreSQL column ever maps TO `any`: import derives the mpedb type
+        // from PG's declared type, and PG always has one. (The reverse — an `any`
+        // column being pushed to PG — is refused by preflight.)
+        Some(ColumnType::Any) => format!("{col}::text"),
         Some(ColumnType::Int64) => format!("{col}::int8"),
         Some(ColumnType::Float64) => format!("{col}::float8"),
         Some(ColumnType::Bool) => format!("{col}::bool"),
@@ -49,6 +53,12 @@ pub(crate) fn read_expr(c: &PgColumn) -> String {
 
 pub(crate) fn read_value(row: &postgres::Row, i: usize, ty: ColumnType) -> Value {
     match ty {
+        // Import never maps a PG column to `any` (PG always has a declared
+        // type), so this pairs with `read_expr`'s ::text and keeps the two in
+        // step rather than panicking.
+        ColumnType::Any => row
+            .get::<usize, Option<String>>(i)
+            .map_or(Value::Null, Value::Text),
         ColumnType::Int64 => row
             .get::<usize, Option<i64>>(i)
             .map_or(Value::Null, Value::Int),

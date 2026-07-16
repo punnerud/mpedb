@@ -375,6 +375,9 @@ pub(crate) fn convert_value(vr: ValueRef, ct: ColumnType, table: &str, col: &str
     Ok(match vr {
         ValueRef::Null => Value::Null,
         ValueRef::Integer(i) => match ct {
+            // `any` stores what it is given — that is the whole point, and it is
+            // the one target where no conversion decision has to be made.
+            ColumnType::Any => Value::Int(i),
             ColumnType::Int64 => Value::Int(i),
             ColumnType::Float64 => Value::Float(i as f64),
             ColumnType::Bool => match i {

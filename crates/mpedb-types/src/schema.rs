@@ -159,6 +159,26 @@ impl Schema {
                         t.name, c.name
                     )));
                 }
+                if c.ty == ColumnType::Any {
+                    return Err(Error::Schema(format!(
+                        "primary key column `{}.{}` cannot be `any`: a key is \
+                         memcmp-ordered, and ordering across types would mean \
+                         inventing whether 5 sorts before \"a\" — declare the \
+                         column's real type",
+                        t.name, c.name
+                    )));
+                }
+            }
+            // Same reasoning for a secondary UNIQUE index: its keys are encoded
+            // with `keycode` too, so it needs an order across the column's values.
+            for c in &t.columns {
+                if c.unique && c.ty == ColumnType::Any {
+                    return Err(Error::Schema(format!(
+                        "column `{}.{}` cannot be both `any` and UNIQUE: the index \
+                         is memcmp-ordered and `any` has no order across types",
+                        t.name, c.name
+                    )));
+                }
             }
         }
         Ok(())

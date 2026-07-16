@@ -28,7 +28,12 @@ use mpedb_types::{AggFn,
 /// 4: `Select` encodes `order_over` before the `order_by` count.
 /// 5: joins. `Select` encodes a `join` tag and `order_junk`, and the plan
 ///    header carries a LIST of policy stamps where it carried one epoch+hash.
-const PLAN_FORMAT: u8 = 5;
+/// 6: `ColumnType::Any` (tag 7). No plan FIELD moved — but a plan carries the
+///    column types it bound against, and a v5 reader decoding a v6 plan would
+///    hit tag 7 in `ColumnType::from_tag`, get `None`, and report the plan as
+///    corrupt rather than as "written by a newer mpedb". The bump makes it say
+///    the true thing.
+const PLAN_FORMAT: u8 = 6;
 
 /// One table's RLS state, frozen at compile time. See
 /// [`CompiledPlan::policies`].

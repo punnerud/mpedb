@@ -142,7 +142,16 @@ impl PgAdapter {
 }
 
 fn parse_pk(s: &str, ct: ColumnType) -> Result<Value> {
+    // `any` cannot be a key: `Schema::validate` refuses it, because a key is
+    // memcmp-ordered and `any` has no order across types. Reaching here means a
+    // hand-built or corrupt catalog.
+    if ct == ColumnType::Any {
+        return Err(Error::Corrupt(
+            "an `any` column cannot be part of a primary key".into(),
+        ));
+    }
     Ok(match ct {
+        ColumnType::Any => unreachable!("rejected above"),
         ColumnType::Int64 => Value::Int(
             s.parse()
                 .map_err(|_| Error::Corrupt(format!("bad int PK `{s}`")))?,
