@@ -1,0 +1,283 @@
+# LEFT JOIN (#46): a missing inner match means ONE row with the inner side
+# NULL-extended — a different answer than INNER, not a slower one.
+#
+# Expected values verified against sqlite3 3.45. The data is joins.test's:
+# `dee` has a NULL did (matches nothing, NULL equals nothing), and the
+# 'empty' dept has no employees (invisible from emp's side either way).
+#
+# Since #49 an ON equality is consumed into the inner fetch (index nested
+# loop); an ON without one keeps the held full scan. Both forms are pinned
+# here, including their EXPLAIN labels.
+#
+# schema:
+# [[table]]
+# name = "dept"
+# primary_key = ["did"]
+#
+#   [[table.column]]
+#   name = "did"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "dname"
+#   type = "text"
+#
+# [[table]]
+# name = "emp"
+# primary_key = ["eid"]
+#
+#   [[table.column]]
+#   name = "eid"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "ename"
+#   type = "text"
+#
+#   [[table.column]]
+#   name = "did"
+#   type = "int64"
+#   nullable = true
+# end schema
+
+statement ok
+INSERT INTO dept (did, dname) VALUES (1, 'eng'), (2, 'sales'), (3, 'empty')
+
+statement ok
+INSERT INTO emp (eid, ename, did) VALUES (10, 'ann', 1), (11, 'bob', 1), (12, 'cy', 2), (13, 'dee', NULL)
+
+# ---- the basic shape ----------------------------------------------------------------
+
+query IT nosort
+SELECT emp.eid, dept.dname FROM emp LEFT JOIN dept ON emp.did = dept.did ORDER BY emp.eid
+----
+10
+eng
+11
+eng
+12
+sales
+13
+NULL
+
+# count(*) counts the NULL-extended row; count(col) skips its NULLs.
+query I nosort
+SELECT count(*) FROM emp LEFT JOIN dept ON emp.did = dept.did
+----
+4
+
+query I nosort
+SELECT count(dept.dname) FROM emp LEFT JOIN dept ON emp.did = dept.did
+----
+3
+
+query I nosort
+SELECT count(dept.did) FROM emp LEFT JOIN dept ON emp.did = dept.did
+----
+3
+
+# ---- WHERE over the joined row ------------------------------------------------------
+
+# WHERE on an inner column makes the LEFT a de-facto INNER: the NULL-extended
+# rows fail the comparison (NULL is not 'eng').
+query T nosort
+SELECT emp.ename FROM emp LEFT JOIN dept ON emp.did = dept.did WHERE dept.dname = 'eng' ORDER BY emp.eid
+----
+ann
+bob
+
+# The anti-join: rows with NO match are exactly the NULL-extended ones.
+query T nosort
+SELECT emp.ename FROM emp LEFT JOIN dept ON emp.did = dept.did WHERE dept.did IS NULL
+----
+dee
+
+query I nosort
+SELECT count(*) FROM emp LEFT JOIN dept ON emp.did = dept.did WHERE dept.dname IS NOT NULL
+----
+3
+
+# The outer column is untouched by the extension.
+query I nosort
+SELECT emp.eid FROM emp LEFT JOIN dept ON emp.did = dept.did WHERE emp.did IS NULL
+----
+13
+
+# ---- NULL placement and rendering ---------------------------------------------------
+
+# NULLS FIRST ascending (mpedb and sqlite3 agree).
+query TT nosort
+SELECT emp.ename, dept.dname FROM emp LEFT JOIN dept ON emp.did = dept.did ORDER BY dept.dname, emp.ename
+----
+dee
+NULL
+ann
+eng
+bob
+eng
+cy
+sales
+
+# `SELECT *`: every inner column of the extended row is NULL.
+query ITIIT nosort
+SELECT * FROM emp LEFT JOIN dept ON emp.did = dept.did WHERE emp.eid = 13
+----
+13
+dee
+NULL
+NULL
+NULL
+
+query TT nosort
+SELECT emp.ename, CASE WHEN dept.dname IS NULL THEN 'none' ELSE dept.dname END FROM emp LEFT JOIN dept ON emp.did = dept.did ORDER BY emp.eid
+----
+ann
+eng
+bob
+eng
+cy
+sales
+dee
+none
+
+# ---- both execution forms -----------------------------------------------------------
+
+# An ON without equality keeps the held full scan: cy (did 2) is the only
+# employee whose did exceeds some dept's — ann/bob/dee NULL-extend.
+query T nosort
+SELECT dept.dname FROM emp LEFT JOIN dept ON emp.did > dept.did WHERE emp.eid = 12
+----
+eng
+
+query T nosort
+SELECT dept.dname FROM emp LEFT JOIN dept ON emp.did > dept.did WHERE emp.eid = 10
+----
+NULL
+
+# Equality + residual: the equality is consumed into the fetch, the LIKE runs
+# as the residual — a fetched row that fails it still means "no match".
+query T nosort
+SELECT dept.dname FROM emp LEFT JOIN dept ON dept.did = emp.did AND dept.dname LIKE 'e%' ORDER BY emp.eid
+----
+eng
+eng
+NULL
+NULL
+
+# A constant-pinned inner side: every outer row finds dept 1.
+query IT nosort
+SELECT emp.eid, dept.dname FROM emp LEFT JOIN dept ON dept.did = 1 ORDER BY emp.eid
+----
+10
+eng
+11
+eng
+12
+eng
+13
+eng
+
+# An inner value nothing matches: everyone NULL-extends.
+query I nosort
+SELECT count(dept.did) FROM emp LEFT JOIN dept ON dept.did = 99
+----
+0
+
+query I nosort
+SELECT count(*) FROM emp LEFT JOIN dept ON dept.did = 99
+----
+4
+
+# ---- self-joins and chains ----------------------------------------------------------
+
+# Self-LEFT: who shares my department with a higher id? ann finds bob; the
+# rest find nobody and survive NULL-extended (dee's NULL did matches nothing).
+query TT rowsort
+SELECT a.ename, b.ename FROM emp a LEFT JOIN emp b ON a.did = b.did AND a.eid < b.eid
+----
+ann
+bob
+bob
+NULL
+cy
+NULL
+dee
+NULL
+
+# LEFT then INNER in one chain: the constant-pinned second join keeps all four.
+query I nosort
+SELECT count(*) FROM emp LEFT JOIN dept ON emp.did = dept.did JOIN dept d2 ON d2.did = 1
+----
+4
+
+# A NULL-extended slot feeding the NEXT join's equality matches nothing — and
+# a LEFT there NULL-extends again instead of dropping the row.
+query I nosort
+SELECT count(*) FROM emp e LEFT JOIN emp b ON b.did = e.did AND b.eid > e.eid LEFT JOIN dept d ON d.did = b.did
+----
+4
+
+# ---- aggregates over the extension --------------------------------------------------
+
+query I nosort
+SELECT sum(dept.did) FROM emp LEFT JOIN dept ON emp.did = dept.did
+----
+4
+
+query I nosort
+SELECT max(dept.did) FROM emp LEFT JOIN dept ON emp.did = dept.did
+----
+2
+
+# The NULL-extended rows are their own group — NULLS FIRST in the ordering.
+query TI nosort
+SELECT dept.dname, count(*) FROM emp LEFT JOIN dept ON emp.did = dept.did GROUP BY dept.dname ORDER BY dept.dname
+----
+NULL
+1
+eng
+2
+sales
+1
+
+query T nosort
+SELECT DISTINCT dept.dname FROM emp LEFT JOIN dept ON emp.did = dept.did ORDER BY dept.dname
+----
+NULL
+eng
+sales
+
+query I nosort
+SELECT emp.eid FROM emp LEFT JOIN dept ON emp.did = dept.did ORDER BY emp.eid LIMIT 2 OFFSET 2
+----
+12
+13
+
+# ---- what EXPLAIN promises ----------------------------------------------------------
+
+query T nosort
+EXPLAIN SELECT emp.ename FROM emp LEFT JOIN dept ON emp.did = dept.did
+----
+Select emp
+  access: FullScan
+  left join dept (index nested loop, NULL-extends on no match — ON equality pushed into the inner fetch)
+    access: PkPoint(did = emp.did)
+    on: true
+  project: emp.ename
+  footprint: read_only=true tables_read=0x3 tables_written=0x0 indexes_used=0x1 key=Full
+
+query T nosort
+EXPLAIN SELECT emp.ename FROM emp LEFT JOIN dept ON emp.did > dept.did
+----
+Select emp
+  access: FullScan
+  left join dept (nested loop, NULL-extends on no match — no predicate pushdown)
+    access: FullScan
+    on: emp.did > dept.did
+  project: emp.ename
+  footprint: read_only=true tables_read=0x3 tables_written=0x0 indexes_used=0x1 key=Full
+
+# ---- still required, still refused --------------------------------------------------
+
+statement error ON after JOIN
+SELECT emp.eid FROM emp LEFT JOIN dept

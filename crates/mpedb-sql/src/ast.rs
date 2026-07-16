@@ -112,11 +112,20 @@ pub(crate) enum UnOp {
     Not,
 }
 
-/// `[INNER] JOIN <table> ON <cond>`.
+/// What a missing inner match means for one join step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinKind {
+    Inner,
+    /// `LEFT [OUTER] JOIN`: no match → one NULL-extended row.
+    Left,
+}
+
+/// `[INNER | LEFT [OUTER]] JOIN <table> ON <cond>`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JoinClause {
     pub table: String,
     pub alias: Option<String>,
+    pub kind: JoinKind,
     pub on: Expr,
 }
 

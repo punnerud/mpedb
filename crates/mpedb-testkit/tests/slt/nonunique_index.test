@@ -218,3 +218,32 @@ query I nosort
 SELECT oid FROM orders WHERE cid = 100 AND oid = 7
 ----
 7
+
+# ---- ranges over the index (IndexRange, #48) ----------------------------------------
+# Rows at this point: (4, 200, 'x'), (6, 100, 'e'), (7, 100, 'g').
+
+query I nosort
+SELECT oid FROM orders WHERE cid > 150 ORDER BY oid
+----
+4
+
+query I nosort
+SELECT oid FROM orders WHERE cid >= 100 AND cid <= 150 ORDER BY oid
+----
+6
+7
+
+query I nosort
+SELECT oid FROM orders WHERE cid > 100 AND cid < 300
+----
+4
+
+# ORDER BY pk over an index range is a REAL sort — the index delivers INDEX
+# order, not PK order. The differential against sqlite3 caught the elided
+# sort the day IndexRange was built; this pins the fix.
+query I nosort
+SELECT oid FROM orders WHERE cid >= 100 ORDER BY oid
+----
+4
+6
+7

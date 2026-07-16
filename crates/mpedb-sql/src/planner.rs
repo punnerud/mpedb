@@ -14,7 +14,7 @@ type PlannedStmt = (PlanStmt, Vec<Option<ColumnType>>, Vec<String>, BTreeSet<Str
 use crate::binder::{compile_program, BExpr, Binder, Scope};
 use crate::plan::{
     render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource,
-    Join, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp, Projection,
+    Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp, Projection,
 };
 use crate::policy::{PolicyCatalog, TablePolicies};
 use mpedb_types::{ExprProgram, ColumnType, Error, Footprint, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
@@ -781,6 +781,10 @@ fn plan_join_select(
     let mut acc_named: Vec<(String, &TableDef)> = vec![(outer_name.clone(), outer)];
     let mut joins: Vec<Join> = Vec::new();
     let mut joined_columns = outer.columns.clone();
+    // The accumulated tuple's column types, for the equi-join pushdown: join
+    // `k`'s access may reference outer slots (`KeyPart::OuterCol`), which are
+    // slots of the tuple built BEFORE its own table joins in.
+    let mut acc_types: Vec<ColumnType> = outer.columns.iter().map(|c| c.ty).collect();
     for jc in &s.joins {
         let (jid, jt) = resolve_table(schema, &jc.table)?;
         let jname = jc.alias.clone().unwrap_or_else(|| jt.name.clone());
@@ -791,14 +795,24 @@ fn plan_join_select(
 
         acc_named.push((jname, jt));
         let mut jb = pb.rescope(Scope::joined_named(acc_named.clone())?);
-        let on = compile_program(&jb.bind_predicate(&jc.on)?)?;
+        let bound_on = jb.bind_predicate(&jc.on)?;
         binder = jb;
 
+        // #49: consume pure equality conjuncts into an inner access path —
+        // the index nested loop. What remains of the ON runs as the residual
+        // over the joined row, preserving every raise the query could observe.
+        let (jaccess, residual_on) = extract_join_access(bound_on, &acc_types, jt, consts)?;
+        let on = compile_program(&residual_on)?;
+
         joined_columns.extend(jt.columns.iter().cloned());
+        acc_types.extend(jt.columns.iter().map(|c| c.ty));
         joins.push(Join {
             table: jid,
-            // The inner side is re-read per outer row; no pushdown yet.
-            access: AccessPath::FullScan,
+            kind: match jc.kind {
+                ast::JoinKind::Inner => JoinKind::Inner,
+                ast::JoinKind::Left => JoinKind::Left,
+            },
+            access: jaccess,
             on,
             policy,
         });
@@ -1328,8 +1342,14 @@ fn plan_select(
     // already satisfied by scan order: drop the sort. Not under DISTINCT — the
     // indices are output positions there, and the dedup between the scan and
     // the sort means scan order does not survive to the output anyway.
-    let pk_ordered_access =
-        !matches!(access, AccessPath::IndexPoint { .. }) && order_over == OrderOver::BaseRow;
+    // INDEX accesses deliver INDEX order (value, then pk WITHIN one value),
+    // not PK order — eliding the sort over them returns rows in the wrong
+    // order, silently. The differential caught exactly this on IndexRange
+    // the day it was built; the guard is load-bearing.
+    let pk_ordered_access = !matches!(
+        access,
+        AccessPath::IndexPoint { .. } | AccessPath::IndexRange { .. }
+    ) && order_over == OrderOver::BaseRow;
     if pk_ordered_access
         && !order_by.is_empty()
         && order_by.len() <= table.primary_key.len()
@@ -1924,9 +1944,159 @@ fn extract_access(
         return Ok((AccessPath::PkRange { lo, hi }, residual));
     }
 
+    // 3.5 Range over a secondary index column (#48: IndexRange) — after
+    // PkRange (the PK tree needs no per-hit row fetch, so it wins when both
+    // have range conjuncts) and before a full scan. First index in
+    // declaration order with a range conjunct wins; both bounds on the SAME
+    // column are consumed together, everything else stays residual.
+    for (pos, &col) in sec.iter().enumerate() {
+        if pos >= 63 {
+            break; // beyond the footprint bitmap — never chosen
+        }
+        let mut lo = None;
+        let mut hi = None;
+        if let Some((i, op, atom)) = find(&consumed, col, &[BinOp::Gt, BinOp::Ge]) {
+            consumed[i] = true;
+            lo = Some(KeyBound {
+                parts: vec![atom.to_key_part(consts)?],
+                inclusive: op == BinOp::Ge,
+            });
+        }
+        if let Some((i, op, atom)) = find(&consumed, col, &[BinOp::Lt, BinOp::Le]) {
+            consumed[i] = true;
+            hi = Some(KeyBound {
+                parts: vec![atom.to_key_part(consts)?],
+                inclusive: op == BinOp::Le,
+            });
+        }
+        if lo.is_some() || hi.is_some() {
+            let residual = rebuild_residual(conjuncts, &consumed);
+            return Ok((
+                AccessPath::IndexRange {
+                    index_no: (pos + 1) as u32,
+                    lo,
+                    hi,
+                },
+                residual,
+            ));
+        }
+    }
+
     // 4. Full scan; the whole predicate stays as the filter.
     let residual = rebuild_residual(conjuncts, &consumed);
     Ok((AccessPath::FullScan, residual))
+}
+
+/// #49: decompose a join's bound ON into an inner-side access path
+/// (parametrized by the outer row) plus the residual ON — the index
+/// nested-loop pushdown. Only PURE equality conjuncts are consumed:
+/// `inner.col = outer.col` (column types exactly equal, so the key encoding
+/// is the stored one), `inner.col = $p`, `inner.col = <lit>`. Anything that
+/// can raise stays in the residual — consuming it would erase observable
+/// raise behaviour, the same contract that keeps policies ahead of ON.
+///
+/// Preference: full-PK equality (one `get` per outer row, no index tree) >
+/// unique index (at most one row) > non-unique index > FullScan
+/// (read-once-and-hold, exactly the pre-#49 execution).
+fn extract_join_access(
+    on: BExpr,
+    outer_types: &[ColumnType],
+    inner: &TableDef,
+    consts: &mut Vec<Value>,
+) -> Result<(AccessPath, BExpr)> {
+    let ow = outer_types.len() as u16;
+    let iw = inner.columns.len() as u16;
+    let mut conjuncts = Vec::new();
+    split_and(on, &mut conjuncts);
+    let mut consumed = vec![false; conjuncts.len()];
+    // Per inner column: the first conjunct that pins it, and with what part.
+    let mut pins: Vec<Option<(usize, KeyPart)>> = vec![None; inner.columns.len()];
+    for (ci, c) in conjuncts.iter().enumerate() {
+        let BExpr::Binary(BinOp::Eq, l, r) = c else { continue };
+        let (icol, part) = match (&**l, &**r) {
+            (BExpr::Col(i), BExpr::Col(j)) if *i >= ow && *i < ow + iw && *j < ow => {
+                let icol = (*i - ow) as usize;
+                if outer_types[*j as usize] != inner.columns[icol].ty {
+                    continue; // cross-type equality: encodings differ, stay residual
+                }
+                (icol, KeyPart::OuterCol(*j))
+            }
+            (BExpr::Col(j), BExpr::Col(i)) if *i >= ow && *i < ow + iw && *j < ow => {
+                let icol = (*i - ow) as usize;
+                if outer_types[*j as usize] != inner.columns[icol].ty {
+                    continue;
+                }
+                (icol, KeyPart::OuterCol(*j))
+            }
+            (BExpr::Col(i), other) if *i >= ow && *i < ow + iw => {
+                let icol = (*i - ow) as usize;
+                match as_atom(other) {
+                    // A NULL or cross-type constant would fail plan validation
+                    // (and `= NULL` is UNKNOWN anyway) — leave it residual.
+                    Some(Atom::Const(v))
+                        if v.is_null() || !v.fits(inner.columns[icol].ty) =>
+                    {
+                        continue
+                    }
+                    Some(a) => (icol, a.to_key_part(consts)?),
+                    None => continue,
+                }
+            }
+            (other, BExpr::Col(i)) if *i >= ow && *i < ow + iw => {
+                let icol = (*i - ow) as usize;
+                match as_atom(other) {
+                    Some(Atom::Const(v))
+                        if v.is_null() || !v.fits(inner.columns[icol].ty) =>
+                    {
+                        continue
+                    }
+                    Some(a) => (icol, a.to_key_part(consts)?),
+                    None => continue,
+                }
+            }
+            _ => continue,
+        };
+        if pins[icol].is_none() {
+            pins[icol] = Some((ci, part));
+        }
+    }
+
+    // Full PK pinned → PkPoint. Otherwise a UNIQUE index beats a non-unique
+    // one; within each pass, declaration order picks.
+    let mut chosen: Option<AccessPath> = None;
+    let pk_pins: Option<Vec<(usize, KeyPart)>> = inner
+        .primary_key
+        .iter()
+        .map(|&pc| pins[pc as usize])
+        .collect();
+    if let Some(pp) = pk_pins {
+        for (ci, _) in &pp {
+            consumed[*ci] = true;
+        }
+        chosen = Some(AccessPath::PkPoint(pp.into_iter().map(|(_, p)| p).collect()));
+    } else {
+        let sec = secondary_indexes(inner);
+        'passes: for unique_only in [true, false] {
+            for (pos, &col) in sec.iter().enumerate() {
+                if pos >= 63 || inner.columns[col as usize].unique != unique_only {
+                    continue;
+                }
+                if let Some((ci, part)) = pins[col as usize] {
+                    consumed[ci] = true;
+                    chosen = Some(AccessPath::IndexPoint {
+                        index_no: (pos + 1) as u32,
+                        part,
+                    });
+                    break 'passes;
+                }
+            }
+        }
+    }
+    let access = chosen.unwrap_or(AccessPath::FullScan);
+    // An empty residual is constant TRUE — the equality was the whole ON.
+    let residual =
+        rebuild_residual(conjuncts, &consumed).unwrap_or(BExpr::Const(Value::Bool(true)));
+    Ok((access, residual))
 }
 
 /// Re-AND the unconsumed conjuncts, preserving statement order.
@@ -1956,6 +2126,9 @@ fn access_key_and_indexes(a: &AccessPath) -> (KeyAccess, u64) {
         // The secondary probe also fetches the row through the PK tree, so
         // both index bits are set. Key access degrades honestly to Full.
         AccessPath::IndexPoint { index_no, .. } => {
+            (KeyAccess::Full, 1 | (1u64 << (*index_no).min(63)))
+        }
+        AccessPath::IndexRange { index_no, .. } => {
             (KeyAccess::Full, 1 | (1u64 << (*index_no).min(63)))
         }
         AccessPath::FullScan => (KeyAccess::Full, 1),

@@ -45,6 +45,11 @@ pub enum KeyPart {
     Param(u16),
     /// Index into the plan's constant pool.
     Const(u16),
+    /// Slot in the ACCUMULATED OUTER tuple of a join — the index nested-loop
+    /// parametrization (`ON inner.col = outer.col` pushed into the inner
+    /// fetch). Only legal inside a `Join`'s access path, where the outer row
+    /// exists; a statement-level access path carrying one is corrupt.
+    OuterCol(u16),
 }
 
 /// A composite bound for a range access over the primary key.
@@ -193,6 +198,14 @@ fn encode_parts(buf: &mut Vec<u8>, parts: &[KeyPart]) {
                 buf.push(1);
                 buf.extend_from_slice(&i.to_le_bytes());
             }
+            // Never present in practice: a join degrades key_access to Full,
+            // and OuterCol exists only inside join access paths. Encoded
+            // anyway so the match is total; decode's recompute-and-compare
+            // guard rejects any footprint that claims otherwise.
+            KeyPart::OuterCol(i) => {
+                buf.push(2);
+                buf.extend_from_slice(&i.to_le_bytes());
+            }
         }
     }
 }
@@ -215,6 +228,7 @@ fn decode_parts(buf: &[u8], pos: &mut usize) -> Result<Vec<KeyPart>> {
         out.push(match tag {
             0 => KeyPart::Param(i),
             1 => KeyPart::Const(i),
+            2 => KeyPart::OuterCol(i),
             _ => return Err(Error::Corrupt("bad key part tag".into())),
         });
     }

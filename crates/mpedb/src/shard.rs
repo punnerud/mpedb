@@ -154,6 +154,13 @@ impl ShardSet {
                 .get(*i as usize)
                 .cloned()
                 .ok_or_else(|| Error::Internal("shard: key const".into()))?,
+            // Routing keys come from statement-level access paths, which can
+            // never carry an outer-column part (validate refuses them there).
+            KeyPart::OuterCol(_) => {
+                return Err(Error::Internal(
+                    "shard: outer-column key part outside a join".into(),
+                ))
+            }
         })
     }
 

@@ -27,8 +27,8 @@ mod token;
 
 pub use ddl::{CreatePolicySpec, DdlStmt, RlsAction};
 pub use plan::{
-    AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, Join, OrderOver,
-    PlanOnConflict, PlanStmt, PolicyStamp, Projection,
+    AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, Join, JoinKind,
+    OrderOver, PlanOnConflict, PlanStmt, PolicyStamp, Projection,
 };
 pub use planner::secondary_indexes;
 pub use policy::{table_policy_hash, PolicyCatalog, TablePolicies};
