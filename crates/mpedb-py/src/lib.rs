@@ -512,6 +512,33 @@ impl PyTransaction {
         exec_result_to_py(py, res)
     }
 
+    /// INSERT one row into `table`, streaming column index `stream_col`
+    /// straight from the file at `path`, a page at a time — the file is never
+    /// resident, so it may be far larger than RAM. `values` is the full row in
+    /// column order; `values[stream_col]` is a placeholder for the type check
+    /// (pass `b""`), the length comes from the file.
+    ///
+    /// Path-based on purpose (no read()-callback variant): the engine PULLS
+    /// pages while holding the single writer lock, and re-entering Python per
+    /// page under that lock is the documented footgun. A path keeps Python out
+    /// of the loop entirely.
+    ///
+    /// Engine constraints: the streamed column must be the table's LAST
+    /// variable-length column, and a table with a secondary UNIQUE index is
+    /// refused (the uniqueness probe needs the value nobody has yet).
+    #[pyo3(signature = (table, values, stream_col, path))]
+    fn insert_file(
+        &self,
+        py: Python<'_>,
+        table: &str,
+        values: &Bound<'_, PyAny>,
+        stream_col: usize,
+        path: PathBuf,
+    ) -> PyResult<()> {
+        let vals = convert_params(Some(values))?;
+        self.with_session(py, move |s| s.insert_file(table, &vals, stream_col, &path))
+    }
+
     /// Commit everything written through this transaction. A poisoned
     /// session refuses (OperationalError) and rolls back instead.
     fn commit(&self, py: Python<'_>) -> PyResult<()> {

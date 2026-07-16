@@ -52,6 +52,7 @@ db = mpedb.Database("app.toml")   # open/create from a TOML config file
 | `db.verify()` | `None` | Page-accounting verification; raises on integrity failure. Takes the writer lock briefly. |
 | `db.begin()` | `Transaction` | Interactive write transaction; holds the single writer lock until commit/rollback. |
 | `tx.execute(hash, params=None)` / `tx.query(sql, params=None)` | as above | Run inside the transaction; SELECTs see the session's own uncommitted writes. `tx.query` plans are cached process-locally, never published. |
+| `tx.insert_file(table, values, stream_col, path)` | `None` | INSERT one row, streaming column `stream_col` from the file at `path` a page at a time (never resident — files larger than RAM are fine). `values` is the full row; `values[stream_col]` is a placeholder (`b""`). Path-based on purpose: the engine pulls pages with the writer lock held, so there is no Python `read()`-callback variant. The streamed column must be the table's **last** varlen column; tables with a secondary UNIQUE index are refused. |
 | `tx.commit()` / `tx.rollback()` | `None` | Explicit finish. A dropped/GC'd transaction rolls back. |
 | `with db.begin() as tx:` | | Commits on clean exit, rolls back if an exception propagates (never suppresses it). |
 
