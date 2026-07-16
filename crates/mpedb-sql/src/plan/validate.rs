@@ -135,6 +135,17 @@ impl CompiledPlan {
                     t.columns.iter().map(|c| c.ty).collect();
                 for j in joins {
                     let jt = get_table(j.table)?;
+                    // FULL needs the inner side enumerated and held: single
+                    // join, FullScan access — the executor's unmatched-inner
+                    // sweep is built on exactly that.
+                    if j.kind == JoinKind::Full {
+                        if joins.len() != 1 {
+                            return Err(corrupt("FULL join in a multi-join chain"));
+                        }
+                        if !matches!(j.access, AccessPath::FullScan) {
+                            return Err(corrupt("FULL join with a keyed inner access"));
+                        }
+                    }
                     self.check_access(&j.access, jt, Some(&acc_types), ptypes)?;
                     if let Some(p) = &j.policy {
                         self.check_program(p, jt, ptypes)?;

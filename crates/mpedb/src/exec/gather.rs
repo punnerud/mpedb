@@ -109,6 +109,10 @@ pub(super) fn gather_joined(
     let mut acc =
         gather_rows(ctx, outer_table, outer_access, outer_policy, plan, params, None)?;
     let mut stack = Vec::new();
+    // The width of the tuple accumulated BEFORE each join — what a FULL
+    // join's unmatched-inner sweep NULL-extends on the left. Tracked from the
+    // schema rather than read off `acc`, which may hold no rows.
+    let mut acc_width = table_def(schema, outer_table)?.columns.len();
     for join in joins {
         let inner_width = table_def(schema, join.table)?.columns.len();
         // An access with no OuterCol parts is resolved once: read the inner
@@ -128,6 +132,14 @@ pub(super) fn gather_joined(
                 None,
             )?)
         };
+        // FULL: which held inner rows matched at least one outer row.
+        // validate pinned FULL to a single, held (FullScan) join, so `held`
+        // is always Some when this is.
+        let mut inner_matched: Option<Vec<bool>> = if join.kind == JoinKind::Full {
+            Some(vec![false; held.as_ref().map_or(0, |h| h.len())])
+        } else {
+            None
+        };
         let mut next = Vec::new();
         for a in &acc {
             let fetched;
@@ -139,27 +151,43 @@ pub(super) fn gather_joined(
                 }
             };
             let mut matched = false;
-            for i in candidates {
+            for (ci, i) in candidates.iter().enumerate() {
                 let mut joined = Vec::with_capacity(a.len() + i.len());
                 joined.extend_from_slice(a);
                 joined.extend_from_slice(i);
                 if join.on.eval_filter(&mut stack, &joined, params)? {
                     matched = true;
+                    if let Some(m) = &mut inner_matched {
+                        m[ci] = true;
+                    }
                     next.push(joined);
                 }
             }
-            // LEFT: no match → ONE row with the inner side NULL-extended. The
-            // ON is never evaluated over this row — it exists BECAUSE nothing
-            // matched — so it cannot raise on it, and a policy-hidden inner
-            // row reads as ABSENT (the outer row survives, NULL-extended,
-            // never carrying the hidden row's values).
-            if !matched && join.kind == JoinKind::Left {
+            // LEFT/FULL: no match → ONE row with the inner side NULL-extended.
+            // The ON is never evaluated over this row — it exists BECAUSE
+            // nothing matched — so it cannot raise on it, and a policy-hidden
+            // inner row reads as ABSENT (the outer row survives,
+            // NULL-extended, never carrying the hidden row's values).
+            if !matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
                 let mut joined = Vec::with_capacity(a.len() + inner_width);
                 joined.extend_from_slice(a);
                 joined.resize(a.len() + inner_width, Value::Null);
                 next.push(joined);
             }
         }
+        // FULL's other half: inner rows NO outer row matched, NULL-extended
+        // on the OUTER side. Same raise contract — their ON never ran true,
+        // and a policy-hidden OUTER row was never in `acc` to begin with.
+        if let (Some(m), Some(h)) = (&inner_matched, &held) {
+            for (ci, i) in h.iter().enumerate() {
+                if !m[ci] {
+                    let mut joined = vec![Value::Null; acc_width];
+                    joined.extend_from_slice(i);
+                    next.push(joined);
+                }
+            }
+        }
+        acc_width += inner_width;
         acc = next;
     }
     // WHERE runs once, over the full joined row — after every ON and every

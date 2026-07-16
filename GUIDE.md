@@ -342,13 +342,15 @@ Differences that will bite, each one exercised in `tests/guide.rs`:
 1. **No `CREATE TABLE`.** See above — the table-id numbering makes it a rebuild.
 2. **Division by zero raises.** sqlite yields NULL. So does overflow: mpedb
    errors where sqlite silently promotes to REAL.
-3. **No `RIGHT`/`FULL` join.** Refused *by name* with a message saying why
-   (`RIGHT`'s says the fix: swap the tables and write `LEFT`), not with
-   "syntax error" — and queued: the plan format already reserves their tags.
-   N-way chains, self-joins, aliases, `LEFT JOIN`, `CROSS JOIN`, compound
-   `UNION [ALL]`/`EXCEPT`/`INTERSECT` chains, and scalar/`EXISTS` subqueries
-   (correlated included) all work. A scalar subquery returning more than one
-   row is an ERROR (PostgreSQL's rule) — sqlite silently takes the first row.
+3. **`RIGHT`/`FULL` only join two tables.** The two-table forms work (a
+   `RIGHT` plans as a `LEFT` with the sides swapped; `FULL` NULL-extends both
+   sides); putting either inside a multi-join CHAIN is refused with a message
+   saying the manual fix — a left-deep plan cannot hold the right side as a
+   subtree. Everything else joins freely: N-way `INNER`/`LEFT` chains,
+   self-joins, aliases, `CROSS JOIN`, compound `UNION [ALL]`/`EXCEPT`/
+   `INTERSECT` chains, and scalar/`EXISTS` subqueries (correlated included).
+   A scalar subquery returning more than one row is an ERROR (PostgreSQL's
+   rule) — sqlite silently takes the first row.
 4. **`ORDER BY` must name something the query outputs** — a column of the table,
    an output position (`ORDER BY 1`), or a selected expression. `SELECT c FROM t
    ORDER BY a + 1` works (a hidden sort column is added); under `SELECT DISTINCT`

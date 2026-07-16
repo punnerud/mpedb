@@ -432,16 +432,29 @@ fn the_sqlite_differences_that_bite() {
     // 2. Division by zero raises; sqlite yields NULL.
     assert!(db.query("SELECT 1 / 0", &[]).is_err());
 
-    // 3. RIGHT/FULL joins are refused BY NAME (LEFT, CROSS, N-way chains and
-    // compound set ops work). RIGHT's message says the fix: swap the tables,
-    // write LEFT.
-    let err = db
+    // 3. Every join kind works two-table (RIGHT plans as a swapped LEFT;
+    // FULL NULL-extends both sides); only a RIGHT/FULL inside a multi-join
+    // CHAIN is refused, with the message saying the manual fix.
+    assert!(db
         .query(
             "SELECT orders.oid FROM items RIGHT JOIN orders ON items.oid = orders.oid",
             &[],
         )
+        .is_ok(), "two-table RIGHT JOIN works");
+    assert!(db
+        .query(
+            "SELECT orders.oid FROM items FULL OUTER JOIN orders ON items.oid = orders.oid",
+            &[],
+        )
+        .is_ok(), "two-table FULL JOIN works");
+    let err = db
+        .query(
+            "SELECT o.oid FROM items i JOIN orders o ON i.oid = o.oid \
+             RIGHT JOIN items x ON x.oid = o.oid",
+            &[],
+        )
         .unwrap_err();
-    assert!(format!("{err}").contains("RIGHT JOIN is not supported"), "{err}");
+    assert!(format!("{err}").contains("multi-join chain"), "{err}");
     assert!(db
         .query("SELECT orders.oid FROM items CROSS JOIN orders", &[])
         .is_ok(), "CROSS JOIN is the cartesian product, like the comma-join");

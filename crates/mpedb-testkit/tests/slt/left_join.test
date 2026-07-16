@@ -289,3 +289,88 @@ Select emp
 
 statement error ON after JOIN
 SELECT emp.eid FROM emp LEFT JOIN dept
+
+# ---- RIGHT JOIN (#64): a LEFT with the sides swapped, output order kept -----------------
+
+# All dept rows survive; 'empty' gets NULL emp columns; dee (did NULL) drops.
+query TT nosort
+SELECT ename, dname FROM emp RIGHT JOIN dept ON emp.did = dept.did ORDER BY dname, ename
+----
+NULL
+empty
+ann
+eng
+bob
+eng
+cy
+sales
+
+# `SELECT *` keeps the ORIGINAL column order — emp's columns first — even
+# though the plan swapped the sides.
+query ITIIT nosort
+SELECT * FROM emp RIGHT JOIN dept ON emp.did = dept.did ORDER BY 4, 1
+----
+10
+ann
+1
+1
+eng
+11
+bob
+1
+1
+eng
+12
+cy
+2
+2
+sales
+NULL
+NULL
+NULL
+3
+empty
+
+# The NULL-extended side is real for WHERE: the anti-join works.
+query T nosort
+SELECT dname FROM emp RIGHT JOIN dept ON emp.did = dept.did WHERE emp.eid IS NULL
+----
+empty
+
+# ---- FULL JOIN (#64): unmatched rows on BOTH sides NULL-extend ---------------------------
+
+query TT nosort
+SELECT ename, dname FROM emp FULL OUTER JOIN dept ON emp.did = dept.did ORDER BY 1
+----
+NULL
+empty
+ann
+eng
+bob
+eng
+cy
+sales
+dee
+NULL
+
+query I nosort
+SELECT count(*) FROM emp FULL JOIN dept ON emp.did = dept.did
+----
+5
+
+# Both anti-join directions in one predicate.
+query TT nosort
+SELECT ename, dname FROM emp FULL JOIN dept ON emp.did = dept.did WHERE emp.eid IS NULL OR dept.did IS NULL ORDER BY 1
+----
+NULL
+empty
+dee
+NULL
+
+# ---- chains stay refused, and say the fix ------------------------------------------------
+
+statement error multi-join chain
+SELECT e.eid FROM emp e JOIN dept d ON e.did = d.did RIGHT JOIN emp x ON x.did = d.did
+
+statement error multi-join chain
+SELECT e.eid FROM emp e JOIN dept d ON e.did = d.did FULL JOIN emp x ON x.did = d.did

@@ -244,6 +244,17 @@ pub(super) fn plan_select(
     catalog: &PolicyCatalog,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
+    // RIGHT rewrites to a swapped LEFT before anything else looks at the
+    // statement — the subquery lift's correlation scope and every stage
+    // below must see the FINAL table order.
+    let rewritten_right;
+    let s = match super::join::rewrite_right_join(s, schema)? {
+        Some(r) => {
+            rewritten_right = r;
+            &rewritten_right
+        }
+        None => s,
+    };
     // Subqueries lift out FIRST: every one becomes a subplan plus a reserved
     // parameter slot, and the rest of planning sees only `Param(slot)` — no
     // stage below knows subqueries exist (see planner/subquery.rs).
@@ -314,7 +325,13 @@ pub(super) fn plan_select(
         }
         return plan_aggregate_select(
             s,
-            &Scope::single(table),
+            // The scope carries the ALIAS when the query gave one — dropping
+            // it here is how `SELECT cor0.c FROM t AS cor0 GROUP BY cor0.c`
+            // spent months failing with "no table named cor0".
+            &match &s.alias {
+                Some(a) => Scope::single_named(a.clone(), table),
+                None => Scope::single(table),
+            },
             table_id,
             access,
             filter,

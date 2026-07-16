@@ -20,6 +20,8 @@ fn sample_sqls() -> Vec<&'static str> {
         "DELETE FROM orders",
         "SELECT id FROM users UNION SELECT user_id FROM orders ORDER BY 1 LIMIT 5",
         "SELECT id FROM users UNION ALL SELECT id FROM users",
+        "SELECT users.id FROM users FULL OUTER JOIN orders ON users.id = orders.user_id",
+        "SELECT users.id FROM users RIGHT JOIN orders ON users.id = orders.user_id",
         "SELECT id FROM users EXCEPT SELECT user_id FROM orders",
         "SELECT id FROM users INTERSECT SELECT user_id FROM orders OFFSET 1",
         "BEGIN",
