@@ -1,0 +1,849 @@
+use super::*;
+use super::freelist::TakenEntry;
+
+// --------------------------------------------------------------- WriteTxn
+
+/// The pages this transaction has COWed, so `page_mut` can tell "already mine"
+/// from "needs copying" in O(1).
+///
+/// The hasher is the point. `HashSet<u64>` defaults to SipHash-1-3, built to
+/// survive an adversary choosing keys — and these keys are page ids this
+/// process just allocated. A CPU profile of a bulk write on armv7 put ~15% of
+/// the run inside `DefaultHasher`, because `page_mut` hashes on EVERY call and
+/// one row touches several pages.
+///
+/// fxhash's multiply-rotate instead. Measured, paired, alternating arms:
+/// **+3.5% on armv7** (95% CI [+2.1, +4.9], n=15) and **nothing measurable on
+/// x86-64** (-0.1%, CI [-2.2, +1.9], n=25). Free on the reference platform,
+/// real on a supported one.
+///
+/// It still spreads the low bits, which matters because hashbrown takes its
+/// control byte from the TOP 7: a pass-through hash would put dense sequential
+/// ids in one control-byte class and turn every probe into a linear scan — the
+/// obvious "optimization" that is slower.
+pub(super) type DirtySet = HashSet<u64, BuildHasherDefault<PageIdHasher>>;
+
+#[derive(Default)]
+pub(crate) struct PageIdHasher(u64);
+
+impl Hasher for PageIdHasher {
+    fn write(&mut self, bytes: &[u8]) {
+        // Only ever hashes u64 page ids; a byte-slice key means someone reused
+        // this for something it was never measured for.
+        debug_assert!(
+            false,
+            "PageIdHasher is for u64 page ids, got {} bytes",
+            bytes.len()
+        );
+        for b in bytes {
+            self.write_u64(*b as u64);
+        }
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0 = (self.0 ^ n)
+            .wrapping_mul(0x517c_c1b7_2722_0a95)
+            .rotate_left(26);
+    }
+
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+pub struct WriteTxn<'e> {
+    pub(super) eng: &'e Engine,
+    pub meta: MetaSnapshot,
+    pub(super) catalog_root: u64,
+    pub(super) freelist_root: u64,
+    pub(super) high_water: u64,
+    /// (table_id, index_no) → (root, row_count); loaded lazily, written back
+    /// into the catalog at commit.
+    pub(super) table_roots: HashMap<(u32, u32), (u64, u64)>,
+    pub(super) dirty: DirtySet,
+    /// Pages this txn may allocate. They are **still listed in the freelist**:
+    /// `refill_reusable` reads entries, it does not remove them (DESIGN.md
+    /// §4.5). `taken` remembers where each came from so the commit fixpoint can
+    /// strike out exactly the ones that got consumed.
+    pub(super) reusable: Vec<u64>,
+    /// Freelist entries drawn from, in draw order. Drawing is FREE — an entry
+    /// nobody allocated out of is left untouched at commit. Only consumption
+    /// costs a write. That decoupling is the fix for #37.
+    pub(super) taken: Vec<TakenEntry>,
+    /// Last key `refill_reusable` drew from; the next draw starts strictly
+    /// after it, so an entry is never drawn twice (it is still in the tree).
+    pub(super) refill_cursor: Option<[u8; 10]>,
+    pub(super) freed: BTreeSet<u64>,
+    pub(super) bound_recomputed: bool,
+    /// True while a mutation of the freelist tree itself is in progress.
+    /// `alloc` must NOT trigger `refill_reusable` then: the refill deletes a
+    /// freelist entry via `btree::delete` on the same tree the in-progress
+    /// mutation is rewriting — two interleaved mutations with different root
+    /// snapshots lose updates and hand out live pages (double allocation,
+    /// "double free"/"listed twice" corruption seen in multi-process stress).
+    pub(super) in_freelist_op: bool,
+    /// Robust-mutex recovery ran when this txn acquired the lock.
+    pub recovered: bool,
+    pub(super) finished: bool,
+    /// Bitmap of user tables whose data this txn mutated (set in
+    /// `set_tree_root`). Recorded into the committed-footprint ring at commit
+    /// in optimistic mode; unused (and free) in serial mode.
+    pub(super) written_tables: u64,
+    /// Set by the optimistic blind-apply path to record a precise
+    /// (table, key_hash) point footprint at commit instead of a table-level
+    /// one. `None` for every other path.
+    pub(super) commit_point: Option<(u32, u64)>,
+    /// CDC dirty-set capture is on for this txn (default). The replication
+    /// plane (mirror applier/importer) turns it OFF via [`WriteTxn::set_capture`]
+    /// so its own writes are not self-captured (DESIGN-MIRROR §3.8). Transient:
+    /// never persisted, dies with the txn.
+    pub(super) capture_enabled: bool,
+    /// Lazily-loaded `cdc\0tabs` control record, cached for the txn's lifetime
+    /// (capture enablement is set in a separate txn, so it is stable here).
+    pub(super) capture_cfg: Option<CaptureConfig>,
+    /// This txn may allocate from the reserved control-page band (§3.10). Set by
+    /// the mirror for control-only commits; default off.
+    pub(super) reserved_alloc: bool,
+}
+
+impl<'e> WriteTxn<'e> {
+    pub(super) fn tree_root(&mut self, table_id: u32, index_no: u32) -> Result<(u64, u64)> {
+        if let Some(&e) = self.table_roots.get(&(table_id, index_no)) {
+            return Ok(e);
+        }
+        let e = catalog_entry(self, self.catalog_root, table_id, index_no)?;
+        self.table_roots.insert((table_id, index_no), e);
+        Ok(e)
+    }
+
+    pub(super) fn set_tree_root(&mut self, table_id: u32, index_no: u32, root: u64, count: u64) {
+        self.written_tables |= 1u64 << (table_id & 63);
+        self.table_roots.insert((table_id, index_no), (root, count));
+    }
+
+    // ---------- optimistic concurrency (DESIGN-PHASE3) ----------
+
+    /// First-committer-wins validation for an optimistic write of
+    /// `(table_id, key_hash)` prepared against snapshot `snap_txn`. Must be
+    /// called while holding the writer lock (i.e. on a live `WriteTxn`), before
+    /// applying. Returns `Error::WriteConflict` if a conflicting commit landed
+    /// on our footprint since the snapshot.
+    pub fn optimistic_validate(
+        &self,
+        snap_txn: u64,
+        table_id: u32,
+        key_hash: u64,
+    ) -> Result<()> {
+        if self
+            .eng
+            .shm
+            .opt_conflict(snap_txn, self.meta.txn_id, table_id, key_hash)
+        {
+            return Err(Error::WriteConflict);
+        }
+        Ok(())
+    }
+
+    /// Record a precise point footprint for this commit (blind-apply path).
+    pub fn set_commit_point(&mut self, table_id: u32, key_hash: u64) {
+        self.commit_point = Some((table_id, key_hash));
+    }
+
+    /// Blind INSERT of a pre-validated, pre-encoded row (optimistic apply).
+    /// Caller guarantees `table_id` has no secondary index and the row was
+    /// validated during prep; footprint validation guarantees the PK's state
+    /// is unchanged since the snapshot. Returns false if the PK already exists.
+    pub fn optimistic_insert(
+        &mut self,
+        table_id: u32,
+        key: &[u8],
+        payload: &[u8],
+    ) -> Result<bool> {
+        debug_assert!(self.eng.sec_indexes[table_id as usize].is_empty());
+        self.check_write_blocked(table_id)?;
+        let (root, count) = self.tree_root(table_id, 0)?;
+        let out = btree::insert(self, root, key, &mut btree::Payload::Flat(payload), InsertMode::InsertOnly)?;
+        if out.existed {
+            return Ok(false);
+        }
+        self.set_tree_root(table_id, 0, out.new_root, count + 1);
+        self.capture_dirty(table_id, key, DirtyOp::Upsert)?;
+        Ok(true)
+    }
+
+    /// Blind UPDATE (replace) of an existing PK with a pre-validated row.
+    pub fn optimistic_upsert(
+        &mut self,
+        table_id: u32,
+        key: &[u8],
+        payload: &[u8],
+    ) -> Result<()> {
+        debug_assert!(self.eng.sec_indexes[table_id as usize].is_empty());
+        self.check_write_blocked(table_id)?;
+        let (root, count) = self.tree_root(table_id, 0)?;
+        let out = btree::insert(self, root, key, &mut btree::Payload::Flat(payload), InsertMode::Upsert)?;
+        self.set_tree_root(table_id, 0, out.new_root, count);
+        self.capture_dirty(table_id, key, DirtyOp::Upsert)?;
+        Ok(())
+    }
+
+    /// Blind DELETE of a PK. Returns whether the row existed.
+    pub fn optimistic_delete(&mut self, table_id: u32, key: &[u8]) -> Result<bool> {
+        debug_assert!(self.eng.sec_indexes[table_id as usize].is_empty());
+        self.check_write_blocked(table_id)?;
+        let (root, count) = self.tree_root(table_id, 0)?;
+        let out = btree::delete(self, root, key)?;
+        if out.existed {
+            self.set_tree_root(table_id, 0, out.new_root, count - 1);
+            self.capture_dirty(table_id, key, DirtyOp::Delete)?;
+        }
+        Ok(out.existed)
+    }
+
+    // ---------- typed row API ----------
+
+    /// Insert a row whose column `stream_col` is pulled from `src` instead of
+    /// being handed over as a `Value` (#43). Nothing large is ever resident: the
+    /// engine asks `src` for a page at a time as it writes.
+    ///
+    /// Pass `Value::Blob(vec![])` (or `Text("")`) in `values` at `stream_col` —
+    /// it is a placeholder for the type check; its length comes from
+    /// `src.len()`. The streamed column must be the row's LAST variable-length
+    /// column (`row::encode_row_head_for_stream` enforces it).
+    ///
+    /// The lock is held for the duration, and `src` is called with it held —
+    /// which is exactly why this pulls rather than handing out a writer: a slow
+    /// source blocks every other writer either way, but here that window is the
+    /// engine's to bound rather than the caller's to forget.
+    pub fn insert_row_streaming(
+        &mut self,
+        table_id: u32,
+        values: &[Value],
+        stream_col: usize,
+        src: &mut dyn btree::BlobSource,
+    ) -> Result<()> {
+        self.check_write_blocked(table_id)?;
+        self.eng.validate_row(table_id, values)?;
+        let table = self.eng.table(table_id)?;
+        let tname = table.name.clone();
+        if !self.eng.sec_indexes[table_id as usize].is_empty() {
+            // A UNIQUE probe needs the value, and the whole point here is that
+            // nobody has it. Refuse rather than half-check.
+            return Err(Error::Unsupported(
+                "streaming insert into a table with a secondary UNIQUE index".into(),
+            ));
+        }
+        let key = self.eng.pk_key(table_id, values)?;
+        let types = &self.eng.col_types[table_id as usize];
+        let (head, _total) =
+            row::encode_row_head_for_stream(values, types, stream_col, src.len())?;
+        let (root, count) = self.tree_root(table_id, 0)?;
+        let mut payload = btree::Payload::Stream { head: &head, src };
+        let out = btree::insert(self, root, &key, &mut payload, InsertMode::InsertOnly)?;
+        if out.existed {
+            return Err(Error::PrimaryKeyViolation { table: tname });
+        }
+        self.set_tree_root(table_id, 0, out.new_root, count + 1);
+        Ok(())
+    }
+
+    pub fn insert_row(&mut self, table_id: u32, values: &[Value]) -> Result<()> {
+        self.check_write_blocked(table_id)?;
+        let __t = std::time::Instant::now();
+        self.eng.validate_row(table_id, values)?;
+        leakstat::add(&leakstat::INS_NS_VALIDATE, __t.elapsed().as_nanos() as u64);
+        let table = self.eng.table(table_id)?;
+        let tname = table.name.clone();
+        let sec = self.eng.sec_indexes[table_id as usize].clone();
+        let key = self.eng.pk_key(table_id, values)?;
+        // #42: for a row that will SPILL, hand btree the parts instead of a
+        // buffer. `encode_row` materialises the whole row — a large blob included
+        // — into a fresh heap Vec whose only purpose is to be copied straight
+        // back out into overflow pages; that measured 10.1 ms of a 23.5 ms 16 MiB
+        // insert (~42%), because a fresh malloc faults its anonymous pages just
+        // like the file mapping does.
+        //
+        // Switch on size, and take the size BEFORE encoding: an inline row's leaf
+        // cell has to be contiguous anyway, so the parts form buys it nothing and
+        // its slice-of-slices would be pure overhead on the hot path. Small rows
+        // therefore take EXACTLY the old code path — no regression by
+        // construction rather than by measurement, which matters here because
+        // this box cannot resolve a few percent without ~50 paired runs.
+        let __t = std::time::Instant::now();
+        let types = &self.eng.col_types[table_id as usize];
+        let spills = row::encoded_len(values, types) > btree::MAX_INLINE_VAL;
+        let flat = if spills { None } else { Some(row::encode_row(values, types)?) };
+        let parts = if spills {
+            Some(row::encode_row_parts(values, types)?)
+        } else {
+            None
+        };
+        let pieces: Vec<&[u8]> = match &parts {
+            Some((head, bodies)) => std::iter::once(head.as_slice())
+                .chain(bodies.iter().copied())
+                .collect(),
+            None => Vec::new(),
+        };
+        let mut payload = match &flat {
+            Some(b) => btree::Payload::Flat(b),
+            None => btree::Payload::Parts(&pieces),
+        };
+        leakstat::add(&leakstat::INS_NS_ENCODE, __t.elapsed().as_nanos() as u64);
+
+        // UNIQUE pre-check on secondary indexes before mutating anything, so
+        // a violation aborts with zero side effects on the dirty state. Only
+        // UNIQUE indexes are checked — a plain `indexed` column allows dups.
+        let sec_unique = self.eng.sec_unique[table_id as usize].clone();
+        for (i, &col) in sec.iter().enumerate() {
+            if !sec_unique[i] {
+                continue;
+            }
+            let v = &values[col as usize];
+            if v.is_null() {
+                continue; // SQL: UNIQUE permits multiple NULLs
+            }
+            let ino = (i + 1) as u32;
+            let (iroot, _) = self.tree_root(table_id, ino)?;
+            let ikey = keycode::encode_key(std::slice::from_ref(v));
+            if btree::get(self, iroot, &ikey)?.is_some() {
+                return Err(Error::UniqueViolation {
+                    table: tname,
+                    constraint: table_column_name(self.eng, table_id, col),
+                });
+            }
+        }
+
+        let (root, count) = self.tree_root(table_id, 0)?;
+        let __t = std::time::Instant::now();
+        let out = btree::insert(self, root, &key, &mut payload, InsertMode::InsertOnly)?;
+        leakstat::add(&leakstat::INS_NS_BTREE, __t.elapsed().as_nanos() as u64);
+        if out.existed {
+            return Err(Error::PrimaryKeyViolation { table: tname });
+        }
+        self.set_tree_root(table_id, 0, out.new_root, count + 1);
+
+        for (i, &col) in sec.iter().enumerate() {
+            let v = &values[col as usize];
+            if v.is_null() {
+                continue;
+            }
+            let ino = (i + 1) as u32;
+            let (iroot, icount) = self.tree_root(table_id, ino)?;
+            // UNIQUE: key is the value alone (value→pk). Non-unique: the value
+            // may repeat, so the key is `(value ‖ pk)` — unique by construction,
+            // duplicates on the value coexist as distinct index entries. Both
+            // store the pk as the payload so a lookup fetches the row.
+            let ikey = index_ikey(sec_unique[i], v, &key);
+            let out = btree::insert(self, iroot, &ikey, &mut btree::Payload::Flat(&key), InsertMode::InsertOnly)?;
+            if out.existed {
+                // pre-check passed (unique) / composite is unique (non-unique),
+                // so a collision is engine inconsistency.
+                return Err(Error::Internal("secondary index collision within txn".into()));
+            }
+            self.set_tree_root(table_id, ino, out.new_root, icount + 1);
+        }
+        self.capture_dirty(table_id, &key, DirtyOp::Upsert)?;
+        Ok(())
+    }
+
+    pub fn get_by_pk(&mut self, table_id: u32, pk_values: &[Value]) -> Result<Option<Vec<Value>>> {
+        let key = keycode::encode_key(pk_values);
+        let (root, _) = self.tree_root(table_id, 0)?;
+        match btree::get(self, root, &key)? {
+            None => Ok(None),
+            Some(bytes) => Ok(Some(row::decode_row(
+                &bytes,
+                &self.eng.col_types[table_id as usize],
+            )?)),
+        }
+    }
+
+    /// Delete by primary key; returns whether the row existed.
+    pub fn delete_by_pk(&mut self, table_id: u32, pk_values: &[Value]) -> Result<bool> {
+        self.check_write_blocked(table_id)?;
+        let key = keycode::encode_key(pk_values);
+        let (root, count) = self.tree_root(table_id, 0)?;
+        // fetch old row first: index maintenance needs its column values
+        let sec_unique = self.eng.sec_unique[table_id as usize].clone();
+        let Some(old_bytes) = btree::get(self, root, &key)? else {
+            return Ok(false);
+        };
+        let old = row::decode_row(&old_bytes, &self.eng.col_types[table_id as usize])?;
+        let out = btree::delete(self, root, &key)?;
+        debug_assert!(out.existed);
+        self.set_tree_root(table_id, 0, out.new_root, count - 1);
+
+        let sec = self.eng.sec_indexes[table_id as usize].clone();
+        for (i, &col) in sec.iter().enumerate() {
+            let v = &old[col as usize];
+            if v.is_null() {
+                continue;
+            }
+            let ino = (i + 1) as u32;
+            let (iroot, icount) = self.tree_root(table_id, ino)?;
+            let ikey = index_ikey(sec_unique[i], v, &key);
+            let out = btree::delete(self, iroot, &ikey)?;
+            if !out.existed {
+                return Err(Error::Corrupt("missing index entry on delete".into()));
+            }
+            self.set_tree_root(table_id, ino, out.new_root, icount - 1);
+        }
+        self.capture_dirty(table_id, &key, DirtyOp::Delete)?;
+        Ok(true)
+    }
+
+    /// Replace the row with the given PK. PK columns must be unchanged
+    /// (enforced; the SQL layer rejects PK updates at bind time too).
+    pub fn update_by_pk(&mut self, table_id: u32, new_values: &[Value]) -> Result<bool> {
+        self.check_write_blocked(table_id)?;
+        self.eng.validate_row(table_id, new_values)?;
+        let table = self.eng.table(table_id)?;
+        let tname = table.name.clone();
+        let key = self.eng.pk_key(table_id, new_values)?;
+        let (root, count) = self.tree_root(table_id, 0)?;
+        let Some(old_bytes) = btree::get(self, root, &key)? else {
+            return Ok(false);
+        };
+        let old = row::decode_row(&old_bytes, &self.eng.col_types[table_id as usize])?;
+
+        let sec = self.eng.sec_indexes[table_id as usize].clone();
+        let sec_unique = self.eng.sec_unique[table_id as usize].clone();
+        // pre-check UNIQUE conflicts for changed unique-indexed columns
+        for (i, &col) in sec.iter().enumerate() {
+            if !sec_unique[i] {
+                continue;
+            }
+            let (ov, nv) = (&old[col as usize], &new_values[col as usize]);
+            if index_value_equal(ov, nv) || nv.is_null() {
+                continue;
+            }
+            let ino = (i + 1) as u32;
+            let (iroot, _) = self.tree_root(table_id, ino)?;
+            let ikey = keycode::encode_key(std::slice::from_ref(nv));
+            if btree::get(self, iroot, &ikey)?.is_some() {
+                return Err(Error::UniqueViolation {
+                    table: tname.clone(),
+                    constraint: table_column_name(self.eng, table_id, col),
+                });
+            }
+        }
+
+        let payload = row::encode_row(new_values, &self.eng.col_types[table_id as usize])?;
+        let out = btree::insert(self, root, &key, &mut btree::Payload::Flat(&payload), InsertMode::Upsert)?;
+        self.set_tree_root(table_id, 0, out.new_root, count);
+
+        for (i, &col) in sec.iter().enumerate() {
+            let (ov, nv) = (&old[col as usize], &new_values[col as usize]);
+            if index_value_equal(ov, nv) {
+                continue;
+            }
+            let ino = (i + 1) as u32;
+            let (mut iroot, mut icount) = self.tree_root(table_id, ino)?;
+            if !ov.is_null() {
+                let okey = index_ikey(sec_unique[i], ov, &key);
+                let out = btree::delete(self, iroot, &okey)?;
+                if !out.existed {
+                    return Err(Error::Corrupt("missing index entry on update".into()));
+                }
+                iroot = out.new_root;
+                icount -= 1;
+            }
+            if !nv.is_null() {
+                let nkey = index_ikey(sec_unique[i], nv, &key);
+                let out = btree::insert(self, iroot, &nkey, &mut btree::Payload::Flat(&key), InsertMode::InsertOnly)?;
+                if out.existed {
+                    return Err(Error::Internal("secondary index collision within txn".into()));
+                }
+                iroot = out.new_root;
+                icount += 1;
+            }
+            self.set_tree_root(table_id, ino, iroot, icount);
+        }
+        self.capture_dirty(table_id, &key, DirtyOp::Upsert)?;
+        Ok(true)
+    }
+
+    /// Collect PKs of rows in a PK range (scan step of UPDATE/DELETE plans;
+    /// collect-then-mutate keeps cursors and mutations from aliasing).
+    pub fn collect_pk_range(
+        &mut self,
+        table_id: u32,
+        lo: Option<(&[Value], bool)>,
+        hi: Option<(&[Value], bool)>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let (root, _) = self.tree_root(table_id, 0)?;
+        let lo_k = lo.map(|(v, inc)| (keycode::encode_key(v), inc));
+        let hi_k = hi.map(|(v, inc)| (keycode::encode_key(v), inc));
+        let mut c = btree::cursor(
+            self,
+            root,
+            lo_k.as_ref().map(|(k, i)| (k.as_slice(), *i)),
+            hi_k.as_ref().map(|(k, i)| (k.as_slice(), *i)),
+        )?;
+        let table = self.eng.table(table_id)?;
+        let pk_types: Vec<ColumnType> = table.pk_types();
+        let mut out = Vec::new();
+        while let Some((k, _)) = c.next(self)? {
+            out.push(keycode::decode_key(&k, &pk_types)?);
+        }
+        Ok(out)
+    }
+
+    /// Scan full rows within the writer's own (uncommitted) view.
+    pub fn scan_rows(
+        &mut self,
+        table_id: u32,
+        lo: Option<(&[Value], bool)>,
+        hi: Option<(&[Value], bool)>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let (root, _) = self.tree_root(table_id, 0)?;
+        let lo_k = lo.map(|(v, inc)| (keycode::encode_key(v), inc));
+        let hi_k = hi.map(|(v, inc)| (keycode::encode_key(v), inc));
+        let mut c = btree::cursor(
+            self,
+            root,
+            lo_k.as_ref().map(|(k, i)| (k.as_slice(), *i)),
+            hi_k.as_ref().map(|(k, i)| (k.as_slice(), *i)),
+        )?;
+        let mut out = Vec::new();
+        while let Some((_k, v)) = c.next(self)? {
+            out.push(row::decode_row(&v, &self.eng.col_types[table_id as usize])?);
+        }
+        Ok(out)
+    }
+
+    pub fn row_count(&mut self, table_id: u32) -> Result<u64> {
+        self.tree_root(table_id, 0).map(|(_, c)| c)
+    }
+
+    /// Scan full rows with raw encoded-key bounds within the writer's view.
+    pub fn scan_rows_raw(
+        &mut self,
+        table_id: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let (root, _) = self.tree_root(table_id, 0)?;
+        let mut c = btree::cursor(self, root, lo, hi)?;
+        let mut out = Vec::new();
+        while let Some((_k, v)) = c.next(self)? {
+            out.push(row::decode_row(&v, &self.eng.col_types[table_id as usize])?);
+        }
+        Ok(out)
+    }
+
+    /// Point probe of a secondary unique index within the writer's view.
+    pub fn get_by_index(
+        &mut self,
+        table_id: u32,
+        index_no: u32,
+        value: &Value,
+    ) -> Result<Option<Vec<Value>>> {
+        let ikey = keycode::encode_key(std::slice::from_ref(value));
+        let (iroot, _) = self.tree_root(table_id, index_no)?;
+        let Some(pk_bytes) = btree::get(self, iroot, &ikey)? else {
+            return Ok(None);
+        };
+        let (root, _) = self.tree_root(table_id, 0)?;
+        match btree::get(self, root, &pk_bytes)? {
+            None => Err(Error::Corrupt("index entry points at a missing row".into())),
+            Some(bytes) => Ok(Some(row::decode_row(
+                &bytes,
+                &self.eng.col_types[table_id as usize],
+            )?)),
+        }
+    }
+
+    /// All rows whose `index_no` column equals `value`, within the writer's
+    /// view — the write-side twin of [`ReadTxn::scan_by_index`], with the same
+    /// unique fast path and `(value ‖ pk)` prefix-scan contract.
+    pub fn scan_by_index(
+        &mut self,
+        table_id: u32,
+        index_no: u32,
+        value: &Value,
+    ) -> Result<Vec<Vec<Value>>> {
+        if value.is_null() {
+            return Ok(Vec::new()); // NULL is never indexed
+        }
+        let unique = index_no >= 1
+            && self
+                .eng
+                .sec_unique
+                .get(table_id as usize)
+                .and_then(|v| v.get(index_no as usize - 1))
+                .copied()
+                .unwrap_or(false);
+        if unique {
+            return Ok(self.get_by_index(table_id, index_no, value)?.into_iter().collect());
+        }
+        let prefix = keycode::encode_key(std::slice::from_ref(value));
+        let (iroot, _) = self.tree_root(table_id, index_no)?;
+        let (root, _) = self.tree_root(table_id, 0)?;
+        let mut out = Vec::new();
+        let mut c = btree::cursor(self, iroot, Some((&prefix[..], true)), None)?;
+        while let Some((k, pk_bytes)) = c.next(self)? {
+            if !k.starts_with(&prefix) {
+                break; // past every (value, *) entry
+            }
+            match btree::get(self, root, &pk_bytes)? {
+                Some(bytes) => out.push(row::decode_row(
+                    &bytes,
+                    &self.eng.col_types[table_id as usize],
+                )?),
+                None => {
+                    return Err(Error::Corrupt("index entry points at a missing row".into()))
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Write-side twin of [`ReadTxn::scan_by_index_range`].
+    pub fn scan_by_index_range(
+        &mut self,
+        table_id: u32,
+        index_no: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let (iroot, _) = self.tree_root(table_id, index_no)?;
+        let (root, _) = self.tree_root(table_id, 0)?;
+        let mut out = Vec::new();
+        let mut c = btree::cursor(self, iroot, lo, hi)?;
+        while let Some((_k, pk_bytes)) = c.next(self)? {
+            match btree::get(self, root, &pk_bytes)? {
+                Some(bytes) => out.push(row::decode_row(
+                    &bytes,
+                    &self.eng.col_types[table_id as usize],
+                )?),
+                None => {
+                    return Err(Error::Corrupt("index entry points at a missing row".into()))
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn sys_get(&mut self, subkey: &[u8]) -> Result<Option<Vec<u8>>> {
+        btree::get(self, self.catalog_root, &sys_key(subkey))
+    }
+
+    pub fn sys_put(&mut self, subkey: &[u8], value: &[u8]) -> Result<()> {
+        let root = self.catalog_root;
+        let out = btree::insert(self, root, &sys_key(subkey), &mut btree::Payload::Flat(value), InsertMode::Upsert)?;
+        self.catalog_root = out.new_root;
+        Ok(())
+    }
+
+    pub fn sys_delete(&mut self, subkey: &[u8]) -> Result<bool> {
+        let root = self.catalog_root;
+        let out = btree::delete(self, root, &sys_key(subkey))?;
+        self.catalog_root = out.new_root;
+        Ok(out.existed)
+    }
+
+    pub fn sys_scan(&mut self) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let lo = [SYS_PREFIX];
+        let hi = [SYS_PREFIX + 1];
+        let root = self.catalog_root;
+        let mut c = btree::cursor(self, root, Some((&lo, true)), Some((&hi, false)))?;
+        let mut out = Vec::new();
+        while let Some((k, v)) = c.next(self)? {
+            out.push((k[1..].to_vec(), v));
+        }
+        Ok(out)
+    }
+
+    /// Prefix-bounded sys scan within the writer's view (see
+    /// [`ReadTxn::sys_scan_range`]). `lo`/`hi` are subkeys; the reserved prefix
+    /// is added internally.
+    pub fn sys_scan_range(&mut self, lo: &[u8], hi: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let klo = sys_key(lo);
+        let khi = sys_key(hi);
+        let root = self.catalog_root;
+        let mut c = btree::cursor(self, root, Some((&klo, true)), Some((&khi, false)))?;
+        let mut out = Vec::new();
+        while let Some((k, v)) = c.next(self)? {
+            out.push((k[1..].to_vec(), v));
+        }
+        Ok(out)
+    }
+
+    // ---------- change-data-capture (DESIGN-MIRROR §3) ----------
+
+    /// Turn CDC dirty-set capture on/off for THIS transaction only. The mirror's
+    /// replication plane (applier + importer) sets it `false` so its own writes
+    /// do not become dirty entries that would echo back on the next push
+    /// (DESIGN-MIRROR §3.8). Transient in-memory state; never persisted.
+    pub fn set_capture(&mut self, on: bool) {
+        self.capture_enabled = on;
+    }
+
+    /// Allow this txn to allocate from the reserved control-page band (§3.10),
+    /// so a small control-plane commit (HALTED/frozen/cursor/park marker) can
+    /// succeed when the data region is full. Use ONLY for txns that write a few
+    /// sys records — never for data or bulk work, which would consume the
+    /// reserve and defeat its purpose.
+    pub fn set_reserved_alloc(&mut self, on: bool) {
+        self.reserved_alloc = on;
+    }
+
+    /// Lazily read and cache the `cdc\0tabs` control record (default empty when
+    /// absent). Enablement is set in a separate txn, so it is stable for ours.
+    fn capture_config(&mut self) -> Result<CaptureConfig> {
+        if let Some(c) = self.capture_cfg {
+            return Ok(c);
+        }
+        let c = match self.sys_get(cdc::CDC_TABS_KEY)? {
+            Some(bytes) => CaptureConfig::decode(&bytes)?,
+            None => CaptureConfig::default(),
+        };
+        self.capture_cfg = Some(c);
+        Ok(c)
+    }
+
+    /// Refuse a mutation targeting a write-blocked (frozen) table. Checked from
+    /// the txn's own snapshot under the writer lock, before any side effect, so
+    /// the mirror's authority-switch freeze (DESIGN-MIRROR §3.9) covers every
+    /// write path — typed API, optimistic blind-apply, ring-leader-executed
+    /// intents, and raw-engine users — not just the facade. Independent of
+    /// capture suppression: a frozen table is unwritable even on the
+    /// replication plane.
+    fn check_write_blocked(&mut self, table_id: u32) -> Result<()> {
+        if self.capture_config()?.is_blocked(table_id) {
+            return Err(Error::Frozen { table_id });
+        }
+        Ok(())
+    }
+
+    /// Record a dirty entry for a captured table after a successful mutation.
+    /// No-op when capture is suppressed for this txn or the table is not
+    /// captured (the common case → one cached sys_get, then nothing). The entry
+    /// is an ordinary sys-put into the catalog tree, so a savepoint rollback
+    /// unwinds it for free (DESIGN-MIRROR §3.4).
+    fn capture_dirty(&mut self, table_id: u32, keycode: &[u8], op: DirtyOp) -> Result<()> {
+        if !self.capture_enabled {
+            return Ok(());
+        }
+        let cfg = self.capture_config()?;
+        if !cfg.is_captured(table_id) {
+            return Ok(());
+        }
+        let entry = DirtyEntry {
+            op,
+            last_txn: self.meta.txn_id + 1,
+            wall_us: now_micros(),
+            pk_keycode: keycode.to_vec(),
+        };
+        let key = cdc::dirty_key(table_id, keycode);
+        self.sys_put(&key, &entry.encode())
+    }
+
+    // ---------- instrumentation ----------
+
+    /// Dirty-page accounting for the current transaction:
+    /// `(dirty page count, contiguous page-id runs)`.
+    ///
+    /// The run count is by construction exactly the number of `msync_range`
+    /// calls step 3 of [`WriteTxn::commit_with`] would issue for the
+    /// *current* dirty set in `durability = commit` (the commit itself
+    /// dirties a few more pages for the catalog write-back and the freelist
+    /// fixpoint, so a pre-commit reading slightly undercounts — consistently
+    /// so). Read-only; used by the intent-ring leader's optional batch
+    /// instrumentation (`MPEDB_RING_STATS`).
+    pub fn dirty_page_stats(&self) -> (usize, usize) {
+        let mut ids: Vec<u64> = self.dirty.iter().copied().collect();
+        ids.sort_unstable();
+        let runs = if ids.is_empty() {
+            0
+        } else {
+            1 + ids.windows(2).filter(|w| w[1] != w[0] + 1).count()
+        };
+        (ids.len(), runs)
+    }
+
+    // ---------- savepoints ----------
+
+    /// Capture a statement-level savepoint. COW makes this cheap: a rollback
+    /// only restores root pointers and returns pages allocated after the
+    /// savepoint to the reusable pool (originals were never touched).
+    /// Used by the batch leader so one failing intent aborts only itself.
+    pub fn savepoint(&self) -> TxnSavepoint {
+        TxnSavepoint {
+            catalog_root: self.catalog_root,
+            freelist_root: self.freelist_root,
+            table_roots: self.table_roots.clone(),
+            dirty: self.dirty.clone(),
+            freed: self.freed.clone(),
+            reusable: self.reusable.clone(),
+            taken: self.taken.clone(),
+            refill_cursor: self.refill_cursor,
+            high_water: self.high_water,
+        }
+    }
+
+    /// Roll back to a savepoint taken in this transaction. `high_water` is
+    /// deliberately NOT restored: pages physically allocated from it since the
+    /// savepoint (ids in `[sp.high_water, high_water)`) belong to no committed
+    /// freelist entry, so they are returned to `reusable` and the commit
+    /// fixpoint records them as freed — page accounting stays exact.
+    ///
+    /// `reusable` and `freelist_root` MUST be restored together: if
+    /// `refill_reusable` ran after the savepoint it pulled committed-freelist
+    /// pages into `reusable` AND deleted their freelist entry (advancing
+    /// `freelist_root`). Restoring `freelist_root` un-deletes that entry, so
+    /// those pages are back in the freelist; keeping them in `reusable` too
+    /// would list them twice at commit. Restoring `reusable` to the savepoint
+    /// snapshot drops exactly the refill-pulled pages while re-offering the
+    /// pages that were reusable before the savepoint.
+    pub fn rollback_to(&mut self, sp: TxnSavepoint) {
+        debug_assert!(!self.in_freelist_op);
+        self.catalog_root = sp.catalog_root;
+        self.freelist_root = sp.freelist_root;
+        self.table_roots = sp.table_roots;
+        self.dirty = sp.dirty;
+        self.freed = sp.freed;
+        self.reusable = sp.reusable;
+        self.taken = sp.taken;
+        self.refill_cursor = sp.refill_cursor;
+        for id in sp.high_water..self.high_water {
+            self.reusable.push(id);
+        }
+    }
+}
+
+/// Equality as the index sees it: encoded-key comparison, so all NaNs are
+/// equal and -0.0 == 0.0 (Value's PartialEq disagrees on NaN, which caused
+/// spurious UniqueViolations when updating rows that keep a NaN in a unique
+/// column).
+fn index_value_equal(a: &Value, b: &Value) -> bool {
+    match (a.is_null(), b.is_null()) {
+        (true, true) => true,
+        (true, false) | (false, true) => false,
+        _ => {
+            keycode::encode_key(std::slice::from_ref(a))
+                == keycode::encode_key(std::slice::from_ref(b))
+        }
+    }
+}
+
+/// Opaque statement-savepoint state (see [`WriteTxn::savepoint`]).
+pub struct TxnSavepoint {
+    catalog_root: u64,
+    freelist_root: u64,
+    table_roots: HashMap<(u32, u32), (u64, u64)>,
+    dirty: DirtySet,
+    freed: BTreeSet<u64>,
+    reusable: Vec<u64>,
+    taken: Vec<TakenEntry>,
+    refill_cursor: Option<[u8; 10]>,
+    high_water: u64,
+}
+
+fn table_column_name(eng: &Engine, table_id: u32, col: u16) -> String {
+    eng.schema
+        .table(table_id)
+        .map(|t| t.columns[col as usize].name.clone())
+        .unwrap_or_else(|| format!("col{col}"))
+}
