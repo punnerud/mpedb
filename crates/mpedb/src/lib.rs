@@ -366,7 +366,7 @@ impl Database {
         params: &[Value],
     ) -> Result<ExecResult> {
         let plan = self.cached_or_load(hash)?;
-        let full = session::resolve_params(&plan, params, session)?;
+        let full = session::resolve_params_timed(&plan, params, session)?;
         self.run_plan(Some(hash), &plan, &full)
     }
 
@@ -397,7 +397,7 @@ impl Database {
         }
         let hash = plan.hash();
         let plan = self.register(hash, plan, sql)?;
-        let full = session::resolve_params(&plan, params, session)?;
+        let full = session::resolve_params_timed(&plan, params, session)?;
         self.run_plan(Some(&hash), &plan, &full)
     }
 

@@ -61,6 +61,7 @@ pub mod leakstat {
         INS_NS_ENCODE,    // row::encode_row — copies the blob a SECOND time
         INS_NS_BTREE,     // btree::insert (which contains write_overflow)
         INS_NS_COMMIT,    // commit_with: freelist fixpoint + meta publish
+        EXEC_NS_RESOLVE,  // session::resolve_params — DEEP-clones every Value
     );
     #[inline(always)]
     pub fn bump(c: &AtomicU64) {
