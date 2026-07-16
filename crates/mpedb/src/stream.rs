@@ -92,6 +92,9 @@ impl<'db> RowStream<'db> {
             projection,
             limit,
             offset,
+            joins,
+            distinct,
+            aggregate,
             ..
         } = &plan.stmt
         else {
@@ -111,24 +114,13 @@ impl<'db> RowStream<'db> {
         let tdef = schema
             .table(table)
             .ok_or_else(|| Error::Internal("validated plan table out of range".into()))?;
-        let columns = projection
-            .iter()
-            .map(|p| match p {
-                Projection::Column(i) => tdef
-                    .columns
-                    .get(*i as usize)
-                    .map(|c| c.name.clone())
-                    .ok_or_else(|| Error::Internal("projection column out of range".into())),
-                Projection::Expr { name, .. } => Ok(name.clone()),
-            })
-            .collect::<Result<Vec<String>>>()?;
         let pk_cols: Vec<usize> = tdef.primary_key.iter().map(|&i| i as usize).collect();
 
         let mut stream = RowStream {
             txn: None,
             plan: plan.clone(),
             params: params.to_vec(),
-            columns,
+            columns: Vec::new(), // filled per branch below
             buf: VecDeque::new(),
             table,
             pk_cols,
@@ -140,7 +132,15 @@ impl<'db> RowStream<'db> {
 
         // Sorting plans and point accesses cannot / need not stream: run the
         // ordinary executor once and drain from the buffer (module docs).
+        // Joins, DISTINCT and aggregates DEFINITELY cannot: the streaming
+        // path is a bare outer-table scan, and running such a plan through it
+        // silently returned the outer rows as if the rest of the plan did not
+        // exist (adversarial review find) — they take the materializing
+        // fallback below, which runs the real executor.
         let can_stream = order_by.is_empty()
+            && joins.is_empty()
+            && !*distinct
+            && aggregate.is_none()
             && matches!(access, AccessPath::PkRange { .. } | AccessPath::FullScan);
         if !can_stream {
             let r = db.engine.begin_read()?;
@@ -150,17 +150,36 @@ impl<'db> RowStream<'db> {
                 exec::exec_stmt(&mut ctx, schema, &plan, params, &mut partial)
             }?;
             r.finish()?; // SnapshotEvicted here invalidates the rows
-            let ExecResult::Rows { rows, .. } = res else {
+            let ExecResult::Rows { rows, columns } = res else {
                 return Err(Error::Internal(
                     "SELECT plan did not produce rows".into(),
                 ));
             };
+            // The executor already named the output — over a joined tuple, a
+            // grouped tuple, whatever the plan built. Resolving the projection
+            // against the OUTER table alone here was wrong for every one of
+            // those (out-of-range for a joined slot).
+            stream.columns = columns;
             stream.buf = rows.into();
             // skip/take were already applied by exec_stmt.
             stream.skip = 0;
             stream.take = usize::MAX;
             return Ok(stream);
         }
+
+        // Streaming path: a single-table scan, so the projection names resolve
+        // against this table's columns.
+        stream.columns = projection
+            .iter()
+            .map(|p| match p {
+                Projection::Column(i) => tdef
+                    .columns
+                    .get(*i as usize)
+                    .map(|c| c.name.clone())
+                    .ok_or_else(|| Error::Internal("projection column out of range".into())),
+                Projection::Expr { name, .. } => Ok(name.clone()),
+            })
+            .collect::<Result<Vec<String>>>()?;
 
         // Streaming path: resolve the (possibly parameterized) key range.
         match access {

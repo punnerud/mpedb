@@ -500,7 +500,16 @@ impl CompiledPlan {
         let mut pos = 0usize;
         let format = r_u8(bytes, &mut pos)?;
         if format != PLAN_FORMAT {
-            return Err(corrupt(format!("unknown plan format {format}")));
+            // A plausible other VERSION (either direction — an old client blob
+            // against a newer binary, or an old binary against a newer shared
+            // registry) is DRIFT, not tampering: the caller should re-prepare
+            // (the documented PlanInvalidated path), not be told its blob is
+            // corrupt. A byte outside the version window is not a plan at all.
+            return Err(if (1..64).contains(&format) {
+                Error::PlanInvalidated
+            } else {
+                corrupt(format!("unknown plan format {format}"))
+            });
         }
         let mut schema_hash = [0u8; 32];
         schema_hash.copy_from_slice(take(bytes, &mut pos, 32)?);

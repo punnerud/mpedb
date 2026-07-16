@@ -247,6 +247,14 @@ NULL
 eng
 sales
 
+# DISTINCT + LIMIT over LEFT: two DISTINCT rows, not one — the NULL-extension
+# multiplies duplicates, which is exactly where counting pre-dedup rows bit.
+query T nosort
+SELECT DISTINCT dept.dname FROM emp LEFT JOIN dept ON emp.did = dept.did ORDER BY dept.dname LIMIT 2
+----
+NULL
+eng
+
 query I nosort
 SELECT emp.eid FROM emp LEFT JOIN dept ON emp.did = dept.did ORDER BY emp.eid LIMIT 2 OFFSET 2
 ----

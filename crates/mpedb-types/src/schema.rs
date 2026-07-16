@@ -174,14 +174,22 @@ impl Schema {
                     )));
                 }
             }
-            // Same reasoning for a secondary UNIQUE index: its keys are encoded
-            // with `keycode` too, so it needs an order across the column's values.
+            // Same reasoning for EVERY secondary index, unique or not: its keys
+            // are encoded with `keycode` too, so it needs an order across the
+            // column's values — and `any` has none. A non-unique index over
+            // `any` slipped through here once, and the adversarial review
+            // showed what that means: the memcmp order across mixed runtime
+            // types is arbitrary, so an IndexRange returned WRONG rows — and
+            // DELETE/UPDATE through it deleted them.
             for c in &t.columns {
-                if c.unique && c.ty == ColumnType::Any {
+                if (c.unique || c.indexed) && c.ty == ColumnType::Any {
                     return Err(Error::Schema(format!(
-                        "column `{}.{}` cannot be both `any` and UNIQUE: the index \
-                         is memcmp-ordered and `any` has no order across types",
-                        t.name, c.name
+                        "column `{}.{}` cannot be `any` and carry an index \
+                         ({}): the index is memcmp-ordered and `any` has no \
+                         order across types",
+                        t.name,
+                        c.name,
+                        if c.unique { "UNIQUE" } else { "indexed" }
                     )));
                 }
             }

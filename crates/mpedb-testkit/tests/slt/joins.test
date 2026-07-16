@@ -150,6 +150,28 @@ SELECT DISTINCT dept.dname FROM emp JOIN dept ON emp.did = dept.did ORDER BY dep
 eng
 sales
 
+# DISTINCT + LIMIT bounds DISTINCT rows, never pre-dedup joined duplicates:
+# eng appears twice in the join, and a LIMIT that counted duplicates returned
+# ONE distinct row here instead of two (adversarial review find; verified
+# against sqlite3, which returns both).
+query T nosort
+SELECT DISTINCT dept.dname FROM emp JOIN dept ON emp.did = dept.did ORDER BY dept.dname LIMIT 2
+----
+eng
+sales
+
+# ... and OFFSET consumes a DISTINCT row, not a duplicate.
+query T nosort
+SELECT DISTINCT dept.dname FROM emp JOIN dept ON emp.did = dept.did ORDER BY dept.dname LIMIT 5 OFFSET 1
+----
+sales
+
+# Under DISTINCT the sort key must be in the SELECT list — over a join too.
+# The single-table path has refused this all along; the join path let it
+# through and deduped on the invisible sort value, returning duplicates.
+statement error must be in the SELECT list
+SELECT DISTINCT dept.dname FROM emp JOIN dept ON emp.did = dept.did ORDER BY emp.eid + 1
+
 # LIMIT bounds JOINED rows, not outer rows.
 query T nosort
 SELECT emp.ename FROM emp JOIN dept ON emp.did = dept.did ORDER BY emp.eid LIMIT 2 OFFSET 1
