@@ -750,6 +750,11 @@ fn plan_join_select(
 ) -> Result<PlannedStmt> {
     let (outer_id, outer) = resolve_table(schema, &s.table)?;
     let (inner_id, inner) = resolve_table(schema, &jc.table)?;
+    // The names the query addresses each side by: its alias if given, else the
+    // table name. This is what makes `FROM t a JOIN t b` (a self-join) legal and
+    // `FROM orders o` put `o` — not `orders` — in scope.
+    let outer_name = s.alias.clone().unwrap_or_else(|| outer.name.clone());
+    let inner_name = jc.alias.clone().unwrap_or_else(|| inner.name.clone());
 
     // Each table's policy binds over ITS OWN row: a policy is a single-row
     // scalar predicate (DESIGN-MULTIDB §253), so it must be bound in a
@@ -764,7 +769,10 @@ fn plan_join_select(
     let inner_policy = inner_policy.map(|e| compile_program(&e)).transpose()?;
 
     // Everything else sees the joined tuple.
-    let mut binder = ib.rescope(Scope::joined(vec![outer, inner])?);
+    let mut binder = ib.rescope(Scope::joined_named(vec![
+        (outer_name.clone(), outer),
+        (inner_name.clone(), inner),
+    ])?);
     let on = compile_program(&binder.bind_predicate(&jc.on)?)?;
     let joined_filter = s
         .where_clause
@@ -790,7 +798,10 @@ fn plan_join_select(
         return plan_aggregate_select(
             s,
             &joined_columns,
-            &Scope::joined(vec![outer, inner])?,
+            &Scope::joined_named(vec![
+                (outer_name.clone(), outer),
+                (inner_name.clone(), inner),
+            ])?,
             outer_id,
             access,
             filter,
@@ -850,7 +861,10 @@ fn plan_join_select(
         if all_cols {
             order_by = keys;
         } else {
-            let joined = Scope::joined(vec![outer, inner])?;
+            let joined = Scope::joined_named(vec![
+                (outer_name.clone(), outer),
+                (inner_name.clone(), inner),
+            ])?;
             let (keys, n_junk) = join_order_by(s, &joined, &mut projection, &mut binder, outer, inner)?;
             order_by = keys;
             order_over = OrderOver::Projection;
@@ -1185,7 +1199,10 @@ fn plan_select(
     if let Some(jc) = &s.join {
         return plan_join_select(s, jc, schema, n_params, catalog, consts);
     }
-    let mut binder = Binder::new(table, n_params, true);
+    let mut binder = match &s.alias {
+        Some(a) => Binder::with_scope(Scope::single_named(a.clone(), table), n_params, true),
+        None => Binder::new(table, n_params, true),
+    };
     let bound_where = s
         .where_clause
         .as_ref()

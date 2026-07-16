@@ -74,32 +74,45 @@ pub(crate) struct Scope<'a> {
     /// Tables in tuple order. The slot base of table `k` is the sum of the widths
     /// before it.
     tables: Vec<&'a TableDef>,
+    /// The name each table is ADDRESSED by — its alias if the query gave one,
+    /// else its own name. Parallel to `tables`. Qualified resolution matches
+    /// against this, which is what implements PG's rule that `FROM orders o`
+    /// puts `o` in scope and NOT `orders`, and what lets a table join itself
+    /// under two different names.
+    names: Vec<String>,
 }
 
 impl<'a> Scope<'a> {
     pub fn single(t: &'a TableDef) -> Scope<'a> {
-        Scope { tables: vec![t] }
+        Scope { names: vec![t.name.clone()], tables: vec![t] }
     }
 
-    /// A join's scope. Tuple order IS the order given: the outer table's
-    /// columns come first, so its slots are its own column indices — which is
-    /// what lets an outer-only predicate be handed to the single-table access
-    /// extractor unchanged.
-    pub fn joined(tables: Vec<&'a TableDef>) -> Result<Scope<'a>> {
-        // Self-joins would make `t.c` ambiguous with no way to say which side,
-        // since there are no aliases. Refuse rather than resolve to whichever
-        // came first.
-        for (i, a) in tables.iter().enumerate() {
-            for b in &tables[i + 1..] {
-                if a.name.eq_ignore_ascii_case(&b.name) {
+    /// Single table addressed by `name` (an alias). `FROM orders o WHERE o.id`.
+    pub fn single_named(name: String, t: &'a TableDef) -> Scope<'a> {
+        Scope { names: vec![name], tables: vec![t] }
+    }
+
+    /// A join's scope, each table addressed by an explicit (possibly aliased)
+    /// name. Tuple order IS the order given: the outer table's columns come
+    /// first, so its slots are its own column indices — which is what lets an
+    /// outer-only predicate be handed to the single-table access extractor
+    /// unchanged.
+    pub fn joined_named(named: Vec<(String, &'a TableDef)>) -> Result<Scope<'a>> {
+        // Two tables addressed by the SAME name make `x.c` ambiguous with no way
+        // to say which side. That is a self-join with no (or duplicate) aliases;
+        // refuse it, but a self-join with two distinct aliases is now fine.
+        for (i, (a, _)) in named.iter().enumerate() {
+            for (b, _) in &named[i + 1..] {
+                if a.eq_ignore_ascii_case(b) {
                     return Err(bind_err(format!(
-                        "table `{}` joined to itself: there is no alias syntax to tell the                          two sides apart",
-                        a.name
+                        "`{a}` is used for two tables in this statement: give each side of a \
+                         self-join a distinct alias (`FROM t a JOIN t b ON …`)"
                     )));
                 }
             }
         }
-        Ok(Scope { tables })
+        let (names, tables) = named.into_iter().unzip();
+        Ok(Scope { names, tables })
     }
 
 
@@ -178,7 +191,7 @@ impl<'a> Scope<'a> {
     /// wrong-table read the moment a scope holds more than one table.
     pub fn resolve_qualified(&self, qual: &str, name: &str) -> Result<(u16, ColumnType)> {
         for (k, t) in self.tables.iter().enumerate() {
-            if t.name.eq_ignore_ascii_case(qual) {
+            if self.names[k].eq_ignore_ascii_case(qual) {
                 let i = t.column_index(name).ok_or_else(|| {
                     bind_err(format!("unknown column `{qual}.{name}`"))
                 })?;
@@ -195,13 +208,15 @@ impl<'a> Scope<'a> {
     }
 
     fn describe(&self) -> String {
-        match self.tables.len() {
-            1 => format!("table `{}`", self.tables[0].name),
+        // Report the names the query addresses tables by (aliases), so an
+        // "unknown table `x`" points at what the user actually wrote.
+        match self.names.len() {
+            1 => format!("table `{}`", self.names[0]),
             _ => format!(
                 "tables {}",
-                self.tables
+                self.names
                     .iter()
-                    .map(|t| format!("`{}`", t.name))
+                    .map(|n| format!("`{n}`"))
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
@@ -1476,6 +1491,7 @@ mod tests {
             primary_key: vec![0],
         };
         let sc = Scope {
+            names: vec![a.name.clone(), b.name.clone()],
             tables: vec![&a, &b],
         };
         assert_eq!(sc.width(), a.columns.len() + 1);
@@ -1511,6 +1527,7 @@ mod tests {
             primary_key: vec![0],
         };
         let sc = Scope {
+            names: vec![a.name.clone(), b.name.clone()],
             tables: vec![&a, &b],
         };
         let e = sc.resolve("id").unwrap_err();
