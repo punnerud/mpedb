@@ -391,6 +391,29 @@ pub(crate) fn exec_stmt(
     params: &[Value],
     partial: &mut bool,
 ) -> Result<ExecResult> {
+    // #40 instrument: statement-total time, so resolve + stmt reconciles
+    // against execute()'s wall clock and nothing hides between the phases.
+    #[cfg(feature = "leakstat")]
+    {
+        let t0 = std::time::Instant::now();
+        let r = exec_stmt_impl(ctx, schema, plan, params, partial);
+        mpedb_core::engine::leakstat::add(
+            &mpedb_core::engine::leakstat::EXEC_NS_STMT,
+            t0.elapsed().as_nanos() as u64,
+        );
+        r
+    }
+    #[cfg(not(feature = "leakstat"))]
+    exec_stmt_impl(ctx, schema, plan, params, partial)
+}
+
+fn exec_stmt_impl(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    partial: &mut bool,
+) -> Result<ExecResult> {
     validate_params(plan, params)?;
     match &plan.stmt {
         PlanStmt::Select {
@@ -919,13 +942,51 @@ fn is_uniqueness(e: &Error) -> bool {
 
 /// Resolve one INSERT row spec (params/consts/defaults) to concrete values.
 /// Pure: touches no transaction state.
-fn build_insert_row(
+fn build_insert_row<'a>(
     t: &TableDef,
     plan: &CompiledPlan,
-    params: &[Value],
+    params: &'a [Value],
     row_spec: &[InsertSource],
     now: i64,
-) -> Result<Vec<Value>> {
+) -> Result<std::borrow::Cow<'a, [Value]>> {
+    // #40 instrument: this is per ROW, so the timing only exists under the
+    // leakstat feature — an unconditional Instant here would tax bulk loads.
+    #[cfg(feature = "leakstat")]
+    {
+        let t0 = std::time::Instant::now();
+        let r = build_insert_row_impl(t, plan, params, row_spec, now);
+        mpedb_core::engine::leakstat::add(
+            &mpedb_core::engine::leakstat::EXEC_NS_BUILDROW,
+            t0.elapsed().as_nanos() as u64,
+        );
+        r
+    }
+    #[cfg(not(feature = "leakstat"))]
+    build_insert_row_impl(t, plan, params, row_spec, now)
+}
+
+fn build_insert_row_impl<'a>(
+    t: &TableDef,
+    plan: &CompiledPlan,
+    params: &'a [Value],
+    row_spec: &[InsertSource],
+    now: i64,
+) -> Result<std::borrow::Cow<'a, [Value]>> {
+    // The identity fast path: the common single-row INSERT where every column
+    // comes straight from the caller's params, in declaration order — borrow
+    // instead of cloning. This was the THIRD full deep-clone of a blob on its
+    // way in (#40: ~2.3 ms of a warm 16 MiB insert, measured 2026-07-16 with
+    // blob_warm --features leakstat). Any Default/Const/now() or reordered
+    // spec takes the owned path below, so default resolution and the
+    // partial-effects semantics of multi-row INSERT are untouched.
+    if row_spec.len() == params.len()
+        && row_spec
+            .iter()
+            .enumerate()
+            .all(|(ci, s)| matches!(s, InsertSource::Param(i) if *i as usize == ci))
+    {
+        return Ok(std::borrow::Cow::Borrowed(params));
+    }
     let mut row = Vec::with_capacity(row_spec.len());
     for (ci, src) in row_spec.iter().enumerate() {
         row.push(match src {
@@ -948,7 +1009,7 @@ fn build_insert_row(
             }
         });
     }
-    Ok(row)
+    Ok(std::borrow::Cow::Owned(row))
 }
 
 pub(crate) fn validate_params(plan: &CompiledPlan, params: &[Value]) -> Result<()> {

@@ -486,9 +486,18 @@ than disappointing: `encode_row`'s buffer is only expensive when it is BIG. At
 (+77%)** and left 4 KiB rows unchanged (+1.47% [-1.20, +4.14], n=8). What limits
 THIS cell is the per-ROW engine cost (#32), not copies.
 
-Still open (#40): steady state is ~950 MiB/s against a warm memcpy's ~14,000, and
-`copy_file_range` beats the cold path by 62% on ext4 by not faulting the
-destination at all — gated behind the blob API of #43.
+**#40 CLOSED (2026-07-16, second pass).** The remaining warm gap was the blob
+being deep-cloned TWICE more on its way in — `resolve_params`' fast path did
+`to_vec()` (2.49 ms of a 12.1 ms 16 MiB insert) and `build_insert_row` cloned
+each param again (~2.3 ms), plus the deallocation of both 16 MiB vectors. Both
+paths now BORROW (`Cow`) when nothing needs computing — which is almost every
+statement — and the leakstat ledger finally closes: warm 16 MiB execute went
+**12.1 → ~2.2 ms** (~7,300 MiB/s on the execute path; ~4,900 MiB/s wall
+including the caller's own `params!` copy, which `Value::Blob(vec)` avoids).
+What remains is structural, not copies: COLD writes pay MAP_SHARED page faults
+(17× cold/warm, this section), and `copy_file_range` beats the cold path by
+62% on ext4 by not faulting the destination at all — that is #50's territory
+(extent blobs + reflink), not a facade fix.
 
 **Nobody is close to the medium.** The best engine uses 40% of the raw write
 ceiling and 29% of the read. If you need bytes moved, a file is still the fastest
