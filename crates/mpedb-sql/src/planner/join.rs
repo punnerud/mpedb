@@ -34,12 +34,21 @@ pub(super) fn plan_join_select(
     n_params: u16,
     catalog: &PolicyCatalog,
     consts: &mut Vec<Value>,
+    subplans: Vec<SubPlan>,
+    slot_types: Vec<Ty>,
 ) -> Result<PlannedStmt> {
+    // Subqueries were lifted by `plan_select` before the join dispatch; the
+    // reserved result slots sit right after the user params.
+    let eff_params = n_params + subplans.len() as u16;
+    let correlated: Vec<bool> = subplans.iter().map(|p| !p.outer_args.is_empty()).collect();
     let (outer_id, outer) = resolve_table(schema, &s.table)?;
     let outer_name = s.alias.clone().unwrap_or_else(|| outer.name.clone());
 
     // The outer's policy binds over its own row and can pin an access path.
-    let mut ob = Binder::new(outer, n_params, true);
+    let mut ob = Binder::new(outer, eff_params, true);
+    for (i, ty) in slot_types.iter().enumerate() {
+        ob.pin_param(n_params + i as u16, *ty);
+    }
     let outer_policy = read_policy(&mut ob, catalog, outer_id, &outer.name, PolicyCmd::Select)?;
     let (access, outer_residual) = extract_access(outer_policy, outer, consts)?;
     let filter = outer_residual.map(|e| compile_program(&e)).transpose()?;
@@ -91,13 +100,17 @@ pub(super) fn plan_join_select(
     }
 
     // WHERE runs over the full joined row (`binder` is now in that scope).
-    let joined_filter = s
+    // Conjuncts reading a CORRELATED slot leave the gather for `post_filter`
+    // — those slots are filled per row, after every policy has had its say.
+    let bound_where = s
         .where_clause
         .as_ref()
         .map(|e| binder.bind_predicate(e))
-        .transpose()?
-        .map(|e| compile_program(&e))
         .transpose()?;
+    let (bound_where, post_where) =
+        subquery::split_correlated(bound_where, n_params, &correlated);
+    let joined_filter = bound_where.map(|e| compile_program(&e)).transpose()?;
+    let post_filter = post_where.map(|e| compile_program(&e)).transpose()?;
 
     let full_scope = Scope::joined_named(acc_named.clone())?;
     let namer = joined_namer(&acc_named);
@@ -113,6 +126,11 @@ pub(super) fn plan_join_select(
         || s.order_by.iter().any(|(e, _)| contains_agg(e))
         || !s.group_by.is_empty();
     if has_agg {
+        if correlated.iter().any(|&c| c) {
+            return Err(bind_err(
+                "a correlated subquery in an aggregate query is not supported yet",
+            ));
+        }
         return plan_aggregate_select(
             s,
             &joined_columns,
@@ -124,6 +142,7 @@ pub(super) fn plan_join_select(
             joined_filter,
             binder,
             consts,
+            subplans,
         );
     }
 
@@ -219,6 +238,7 @@ pub(super) fn plan_join_select(
             access,
             joins,
             joined_filter,
+            post_filter,
             filter,
             projection,
             order_by,
@@ -233,6 +253,7 @@ pub(super) fn plan_join_select(
         context_keys,
         list_keys,
         out_types,
+        subplans,
     ))
 }
 

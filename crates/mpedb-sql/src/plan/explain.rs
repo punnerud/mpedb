@@ -38,6 +38,19 @@ impl CompiledPlan {
             }
             _other => self.render_rest(schema, &mut out),
         }
+        for (i, s) in self.subplans.iter().enumerate() {
+            out.push_str(&format!(
+                "subplan ${}: {}{}\n",
+                self.subplan_base() as usize + i + 1,
+                if s.exists { "EXISTS, " } else { "scalar, " },
+                if s.outer_args.is_empty() {
+                    "uncorrelated (evaluated once)".to_string()
+                } else {
+                    format!("correlated on outer slots {:?} (per row)", s.outer_args)
+                }
+            ));
+            self.render_select(&s.plan, schema, &mut out);
+        }
         out.push_str(&format!(
             "  footprint: read_only={} tables_read={:#x} tables_written={:#x} indexes_used={:#x} key={}\n",
             self.footprint.read_only,
@@ -75,6 +88,7 @@ impl CompiledPlan {
                 access,
                 joins,
                 joined_filter,
+                post_filter,
                 filter,
                 projection,
                 order_by,
@@ -125,6 +139,11 @@ impl CompiledPlan {
                 if let Some(f) = filter {
                     // Over the OUTER row alone, so it uses the outer's namer.
                     out.push_str(&format!("  filter: {}\n", render_program(f, &single)));
+                }
+                if let Some(f) = post_filter {
+                    // Runs after the gather, once the correlated subplan
+                    // slots are filled for the row.
+                    out.push_str(&format!("  post-filter: {}\n", render_program(f, &base)));
                 }
                 for j in joins {
                     // The cost note is the honest one for THIS join: a

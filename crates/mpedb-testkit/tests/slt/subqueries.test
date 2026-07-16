@@ -1,0 +1,205 @@
+# Subqueries (#56): scalar `(SELECT …)` and `[NOT] EXISTS (SELECT …)`,
+# uncorrelated (evaluated once per execute) and correlated (per outer row,
+# the OuterCol idea applied to a whole plan). Scalar rule: exactly one output
+# column; 0 rows → NULL; >1 row → runtime error (PostgreSQL's line — sqlite
+# silently takes the first row).
+#
+# schema:
+# [[table]]
+# name = "t1"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "b"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "c"
+#   type = "int64"
+#
+# [[table]]
+# name = "u"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "v"
+#   type = "int64"
+# end schema
+
+statement ok
+INSERT INTO t1 (id, b, c) VALUES (1, 10, 100)
+
+statement ok
+INSERT INTO t1 (id, b, c) VALUES (2, 20, 200)
+
+statement ok
+INSERT INTO t1 (id, b, c) VALUES (3, 30, 300)
+
+statement ok
+INSERT INTO t1 (id, b, c) VALUES (4, 40, 400)
+
+statement ok
+INSERT INTO u (id, v) VALUES (1, 20)
+
+# ---- uncorrelated scalar: once per execute ----------------------------------------------
+
+# The corpus' favourite shape: an aggregate subquery inside CASE.
+query I nosort
+SELECT CASE WHEN c > (SELECT avg(c) FROM t1) THEN id * 2 ELSE id * 10 END FROM t1 ORDER BY id
+----
+10
+20
+6
+8
+
+query I nosort
+SELECT id FROM t1 WHERE b = (SELECT max(b) FROM t1)
+----
+4
+
+# An uncorrelated scalar can feed a PK point probe.
+query I nosort
+SELECT b FROM t1 WHERE id = (SELECT min(id) FROM t1)
+----
+10
+
+# Inner ORDER BY + LIMIT: "the largest b" without an aggregate.
+query I nosort
+SELECT id FROM t1 WHERE b = (SELECT b FROM t1 ORDER BY b DESC LIMIT 1)
+----
+4
+
+# Empty subquery result is NULL — the comparison is UNKNOWN, no rows.
+query I nosort
+SELECT id FROM t1 WHERE b = (SELECT b FROM t1 WHERE id = 99)
+----
+
+# NULL result selected directly.
+query I nosort
+SELECT (SELECT b FROM t1 WHERE id = 99) FROM t1 WHERE id = 1
+----
+NULL
+
+# Cross-table subquery.
+query I nosort
+SELECT id FROM t1 WHERE b = (SELECT v FROM u WHERE id = 1)
+----
+2
+
+# ---- the strict scalar rule --------------------------------------------------------------
+
+statement error at most one
+SELECT id FROM t1 WHERE b = (SELECT b FROM t1)
+
+statement error exactly one column
+SELECT id FROM t1 WHERE b = (SELECT b, c FROM t1 WHERE id = 1)
+
+# ---- correlated scalar: per outer row ----------------------------------------------------
+
+# "How many rows have smaller b" — the corpus' rank idiom.
+query II nosort
+SELECT id, (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b) FROM t1 ORDER BY id
+----
+1
+0
+2
+1
+3
+2
+4
+3
+
+# Correlated in WHERE (the post-filter path).
+query I nosort
+SELECT id FROM t1 WHERE (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b) >= 2 ORDER BY id
+----
+3
+4
+
+# Correlation through an expression.
+query I nosort
+SELECT id FROM t1 WHERE c = (SELECT max(x.c) FROM t1 AS x WHERE x.b <= t1.b) ORDER BY id
+----
+1
+2
+3
+4
+
+# Mixed: correlated conjunct splits to the post-filter, the plain conjunct
+# stays in the gather.
+query I nosort
+SELECT id FROM t1 WHERE id > 1 AND (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b) < 2 ORDER BY id
+----
+2
+
+# ---- EXISTS / NOT EXISTS ----------------------------------------------------------------
+
+query I nosort
+SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM u WHERE u.v = t1.b) ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM t1 WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.v = t1.b) ORDER BY id
+----
+1
+3
+4
+
+# Uncorrelated EXISTS is a constant gate.
+query I nosort
+SELECT count(*) FROM t1 WHERE EXISTS (SELECT 1 FROM u)
+----
+4
+
+query I nosort
+SELECT count(*) FROM t1 WHERE EXISTS (SELECT 1 FROM u WHERE id = 99)
+----
+0
+
+# ---- interplay with the rest of the SELECT surface ---------------------------------------
+
+# Correlated subquery under DISTINCT: post-filter runs before the dedup.
+query I nosort
+SELECT DISTINCT (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b) / 2 FROM t1 ORDER BY 1
+----
+0
+1
+
+# LIMIT bounds the SURVIVING rows after the post-filter.
+query I nosort
+SELECT id FROM t1 WHERE (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b) >= 1 ORDER BY id LIMIT 2
+----
+2
+3
+
+# An uncorrelated subquery inside an aggregate query is fine (filled up front).
+query I nosort
+SELECT count(*) FROM t1 WHERE b > (SELECT avg(b) FROM t1)
+----
+2
+
+# ---- refusals say what and why -----------------------------------------------------------
+
+statement error aggregate query is not supported yet
+SELECT count(*), (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b) FROM t1
+
+statement error nested subqueries
+SELECT id FROM t1 WHERE b = (SELECT max(b) FROM t1 WHERE c > (SELECT avg(c) FROM t1))
+
+statement error HAVING is not supported yet
+SELECT b, count(*) FROM t1 GROUP BY b HAVING count(*) > (SELECT min(b) FROM t1)
+
+statement error compound SELECT is not supported yet
+SELECT (SELECT max(b) FROM t1) FROM t1 UNION SELECT b FROM t1
+
+statement error ON condition is not supported yet
+SELECT t1.id FROM t1 JOIN u ON t1.b = (SELECT max(v) FROM u)

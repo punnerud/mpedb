@@ -6,7 +6,7 @@ use crate::ExecResult;
 use mpedb_core::{ReadTxn, WriteTxn};
 use mpedb_sql::{
     AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, Join, JoinKind,
-    CompoundPlan, OrderOver, PlanOnConflict, PlanStmt, Projection, SelectPlan, SetOp,
+    CompoundPlan, OrderOver, PlanOnConflict, PlanStmt, Projection, SelectPlan, SetOp, SubPlan,
 };
 use mpedb_types::{
     keycode, Accum, DefaultExpr, Error, ExprProgram, KeyBound, KeyPart, Result, Schema, TableDef,
@@ -415,11 +415,76 @@ fn exec_stmt_impl(
     partial: &mut bool,
 ) -> Result<ExecResult> {
     validate_params(plan, params)?;
+    // Uncorrelated subplans evaluate ONCE per execute, into their reserved
+    // slots — before dispatch, so a PK probe built on `id = (SELECT max…)`
+    // resolves like any other param. Correlated ones wait for their row.
+    let filled;
+    let params: &[Value] = if plan.subplans.iter().any(|s| s.outer_args.is_empty()) {
+        let base = plan.subplan_base() as usize;
+        let n_user = base;
+        let mut buf = params.to_vec();
+        for (i, sub) in plan.subplans.iter().enumerate() {
+            if !sub.outer_args.is_empty() {
+                continue;
+            }
+            let inner = exec_select(ctx, schema, plan, &buf[..n_user], &sub.plan)?;
+            buf[base + i] = subplan_value(inner, sub.exists)?;
+        }
+        filled = buf;
+        &filled
+    } else {
+        params
+    };
     match &plan.stmt {
-        PlanStmt::Select(sp) => exec_select(ctx, schema, plan, params, sp),
+        PlanStmt::Select(sp) => exec_select_top(ctx, schema, plan, params, sp),
         PlanStmt::Compound(c) => exec_compound(ctx, schema, plan, params, c),
         _other => exec_stmt_rest(ctx, schema, plan, params, partial),
     }
+}
+
+/// A subquery's rows, reduced to the VALUE its reserved slot carries.
+fn subplan_value(r: ExecResult, exists: bool) -> Result<Value> {
+    let ExecResult::Rows { rows, .. } = r else {
+        return Err(internal("subplan produced no row set"));
+    };
+    if exists {
+        return Ok(Value::Bool(!rows.is_empty()));
+    }
+    match rows.len() {
+        0 => Ok(Value::Null),
+        1 => rows
+            .into_iter()
+            .next()
+            .and_then(|mut r| if r.len() == 1 { r.pop() } else { None })
+            .ok_or_else(|| internal("scalar subplan output arity")),
+        // sqlite silently takes the first row; saying so is the strict line.
+        n => Err(Error::Unsupported(format!(
+            "a scalar subquery returned {n} rows — it must return at most one"
+        ))),
+    }
+}
+
+/// The top-level SELECT: the only place CORRELATED subplans are evaluated —
+/// per row, into a scratch param buffer, after the gather (and therefore
+/// after every policy) has produced the row. Compound arms and the subplans
+/// themselves recurse through plain [`exec_select`], which never fills slots.
+fn exec_select_top(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    sp: &SelectPlan,
+) -> Result<ExecResult> {
+    let correlated: Vec<(usize, &SubPlan)> = plan
+        .subplans
+        .iter()
+        .enumerate()
+        .filter(|(_, s)| !s.outer_args.is_empty())
+        .collect();
+    if correlated.is_empty() && sp.post_filter.is_none() {
+        return exec_select(ctx, schema, plan, params, sp);
+    }
+    exec_select_with(ctx, schema, plan, params, sp, &correlated)
 }
 
 /// Combine already-projected rows under one set operator, left-associatively.
@@ -506,6 +571,10 @@ fn exec_select(
         access,
         joins,
         joined_filter,
+        // Only the TOP-level statement routes post-filter/correlated work
+        // (to `exec_select_with`); arms and subplans never carry one — the
+        // planner cannot produce it there and validate refuses it.
+        post_filter: _,
         filter,
         projection,
         order_by,
@@ -649,48 +718,163 @@ fn exec_select(
                 }
                 out = out.into_iter().skip(skip).take(take).collect();
             }
-            // A joined slot past the outer's width belongs to the inner table,
-            // and it is named `<table>.<column>`: `id` alone would not say
-            // which side it came from, and both sides usually have one.
-            // The joined tuple is `[table0 ‖ … ‖ tableN]`. A projected column
-            // index is named `<table>.<column>` (bare would be ambiguous across
-            // sides); a single-table read keeps its plain column name.
-            let joined_tables: Vec<&TableDef> = if joins.is_empty() {
-                vec![t]
-            } else {
-                let mut v = vec![t];
-                for j in joins {
-                    v.push(table_def(schema, j.table)?);
-                }
-                v
-            };
-            let name_slot = |mut i: usize| -> Result<String> {
-                if joined_tables.len() == 1 {
-                    return t
-                        .columns
-                        .get(i)
-                        .map(|c| c.name.clone())
-                        .ok_or_else(|| internal("projection column name"));
-                }
-                for jt in &joined_tables {
-                    if i < jt.columns.len() {
-                        return Ok(format!("{}.{}", jt.name, jt.columns[i].name));
-                    }
-                    i -= jt.columns.len();
-                }
-                Err(internal("projection column name"))
-            };
-            let columns = projection
-                .iter()
-                .take(projection.len() - *order_junk as usize)
-                .map(|p| match p {
-                    Projection::Column(i) => name_slot(*i as usize),
-                    Projection::Expr { name, .. } => Ok(name.clone()),
-                })
-                .collect::<Result<Vec<String>>>()?;
+            let columns = select_output_columns(schema, sp)?;
             Ok(ExecResult::Rows { columns, rows: out })
         }
     }
+}
+
+/// Output column names of one SELECT. A joined slot past the outer's width
+/// belongs to an inner table and is named `<table>.<column>` (`id` alone would
+/// not say which side); a single-table read keeps plain column names.
+fn select_output_columns(schema: &Schema, sp: &SelectPlan) -> Result<Vec<String>> {
+    let t = table_def(schema, sp.table)?;
+    let joined_tables: Vec<&TableDef> = if sp.joins.is_empty() {
+        vec![t]
+    } else {
+        let mut v = vec![t];
+        for j in &sp.joins {
+            v.push(table_def(schema, j.table)?);
+        }
+        v
+    };
+    let name_slot = |mut i: usize| -> Result<String> {
+        if joined_tables.len() == 1 {
+            return t
+                .columns
+                .get(i)
+                .map(|c| c.name.clone())
+                .ok_or_else(|| internal("projection column name"));
+        }
+        for jt in &joined_tables {
+            if i < jt.columns.len() {
+                return Ok(format!("{}.{}", jt.name, jt.columns[i].name));
+            }
+            i -= jt.columns.len();
+        }
+        Err(internal("projection column name"))
+    };
+    sp.projection
+        .iter()
+        .take(sp.projection.len() - sp.order_junk as usize)
+        .map(|p| match p {
+            Projection::Column(i) => name_slot(*i as usize),
+            Projection::Expr { name, .. } => Ok(name.clone()),
+        })
+        .collect()
+}
+
+/// The correlated pipeline: gather UNBOUNDED (a per-row filter downstream
+/// means no scan bound and no top-K is sound), then per row — fill each
+/// correlated slot by running its subplan with the row's correlation args,
+/// apply the post-filter, project, dedup — and only THEN sort/trim/bound.
+/// The policies all ran inside the gather, so no subplan ever executes
+/// against a row the caller was not allowed to see (the raise contract).
+#[allow(clippy::too_many_arguments)]
+fn exec_select_with(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    sp: &SelectPlan,
+    correlated: &[(usize, &SubPlan)],
+) -> Result<ExecResult> {
+    let SelectPlan {
+        table,
+        access,
+        joins,
+        joined_filter,
+        post_filter,
+        filter,
+        projection,
+        order_by,
+        limit,
+        offset,
+        aggregate,
+        distinct,
+        order_over,
+        order_junk,
+    } = sp;
+    if aggregate.is_some() {
+        return Err(internal("correlated subplans in an aggregate plan"));
+    }
+    let mut rows = if !joins.is_empty() {
+        gather_joined(
+            ctx,
+            plan,
+            params,
+            schema,
+            *table,
+            access,
+            filter.as_ref(),
+            joins,
+            joined_filter.as_ref(),
+        )?
+    } else {
+        gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?
+    };
+    if *order_over == OrderOver::BaseRow && !order_by.is_empty() {
+        sort_rows(&mut rows, order_by);
+    }
+
+    let base = plan.subplan_base() as usize;
+    let n_user = base;
+    let mut scratch: Vec<Value> = params.to_vec();
+    let mut stack: Vec<Value> = Vec::new();
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for row in rows {
+        for &(i, sub) in correlated {
+            let mut inner_params = Vec::with_capacity(n_user + sub.outer_args.len());
+            inner_params.extend_from_slice(&params[..n_user]);
+            for &a in &sub.outer_args {
+                inner_params.push(
+                    row.get(a as usize)
+                        .cloned()
+                        .ok_or_else(|| internal("correlation arg out of row"))?,
+                );
+            }
+            let r = exec_select(ctx, schema, plan, &inner_params, &sub.plan)?;
+            scratch[base + i] = subplan_value(r, sub.exists)?;
+        }
+        if let Some(pf) = post_filter {
+            if !pf.eval_filter(&mut stack, &row, &scratch)? {
+                continue;
+            }
+        }
+        let mut orow = Vec::with_capacity(projection.len());
+        for p in projection {
+            orow.push(match p {
+                Projection::Column(i) => row
+                    .get(*i as usize)
+                    .cloned()
+                    .ok_or_else(|| internal("projection column"))?,
+                Projection::Expr { program, .. } => program.eval(&row, &scratch)?,
+            });
+        }
+        if *distinct && !seen.insert(keycode::encode_key(&orow)) {
+            continue;
+        }
+        out.push(orow);
+    }
+    if *order_over != OrderOver::BaseRow {
+        sort_rows(&mut out, order_by);
+        if *order_junk > 0 {
+            let keep = projection.len() - *order_junk as usize;
+            for row in &mut out {
+                row.truncate(keep);
+            }
+        }
+    }
+    // The post-filter changed the counts, so LIMIT/OFFSET bound the SURVIVING
+    // rows — always applied here, whatever tuple the sort ran over.
+    let skip = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
+    let take = limit.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
+    if skip > 0 || take != usize::MAX {
+        out = out.into_iter().skip(skip).take(take).collect();
+    }
+    let columns = select_output_columns(schema, sp)?;
+    Ok(ExecResult::Rows { columns, rows: out })
 }
 
 fn exec_stmt_rest(

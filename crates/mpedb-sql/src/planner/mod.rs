@@ -20,12 +20,13 @@ type PlannedStmt = (
     Vec<String>,
     BTreeSet<String>,
     Vec<Option<ColumnType>>,
+    Vec<SubPlan>,
 );
-use crate::binder::{compile_program, BExpr, Binder, Scope};
+use crate::binder::{compile_program, BExpr, Binder, Scope, Ty};
 use crate::plan::{
     render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource,
     CompoundPlan, Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp, Projection,
-    SelectPlan,
+    SelectPlan, SubPlan,
 };
 use crate::policy::{PolicyCatalog, TablePolicies};
 use mpedb_types::{ExprProgram, ColumnType, Error, Footprint, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
@@ -36,6 +37,7 @@ mod aggregate;
 mod footprint;
 mod join;
 mod select;
+mod subquery;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -284,8 +286,10 @@ pub(crate) fn plan_statement(
     catalog: &PolicyCatalog,
 ) -> Result<CompiledPlan> {
     let mut consts: Vec<Value> = Vec::new();
-    let txn = |p: PlanStmt| (p, vec![None; n_params as usize], Vec::new(), BTreeSet::new(), Vec::new());
-    let (plan_stmt, param_types, context_keys, list_keys, _out_types) = match stmt {
+    let txn = |p: PlanStmt| {
+        (p, vec![None; n_params as usize], Vec::new(), BTreeSet::new(), Vec::new(), Vec::new())
+    };
+    let (plan_stmt, param_types, context_keys, list_keys, _out_types, subplans) = match stmt {
         ast::Stmt::Begin => txn(PlanStmt::Begin),
         ast::Stmt::Commit => txn(PlanStmt::Commit),
         ast::Stmt::Rollback => txn(PlanStmt::Rollback),
@@ -295,7 +299,7 @@ pub(crate) fn plan_statement(
         ast::Stmt::Update(s) => plan_update(s, schema, n_params, catalog, &mut consts)?,
         ast::Stmt::Delete(s) => plan_delete(s, schema, n_params, catalog, &mut consts)?,
     };
-    let footprint = compute_footprint(&plan_stmt, schema)?;
+    let footprint = compute_footprint(&plan_stmt, &subplans, schema)?;
     // A context slot whose type could not be inferred cannot be type-checked
     // against the session value at execute time — reject it at prepare with a
     // clear message rather than failing opaquely later (fail closed).
@@ -330,6 +334,9 @@ pub(crate) fn plan_statement(
         }
     };
     let mut stamped: Vec<u32> = Vec::new();
+    for s in &subplans {
+        select_tables(&s.plan, &mut stamped);
+    }
     match &plan_stmt {
         PlanStmt::Select(sp) => select_tables(sp, &mut stamped),
         PlanStmt::Compound(c) => {
@@ -345,6 +352,9 @@ pub(crate) fn plan_statement(
         | PlanStmt::Delete { table, .. } => stamped.push(*table),
         PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => {}
     }
+    // One stamp per table is enough however many places read it.
+    stamped.sort_unstable();
+    stamped.dedup();
 
     let policies: Vec<PolicyStamp> = stamped
         .into_iter()
@@ -368,6 +378,7 @@ pub(crate) fn plan_statement(
         param_types,
         context_keys,
         policies,
+        subplans,
         consts,
         footprint,
     })
@@ -545,11 +556,19 @@ fn plan_compound(
     let mut out_types: Vec<Option<ColumnType>> = Vec::new();
 
     for (k, arm_ast) in c.arms.iter().enumerate() {
-        let (stmt, ptypes, ckeys, lkeys, otypes) =
+        let (stmt, ptypes, ckeys, lkeys, otypes, arm_subs) =
             plan_select(arm_ast, schema, n_params, catalog, consts)?;
         let PlanStmt::Select(sp) = stmt else {
             return Err(Error::Internal("plan_select produced a non-select".into()));
         };
+        // Arm-local subplans would need slot allocation coordinated across
+        // arms (each arm's binder numbers its own slots after the user
+        // params) — refuse until that is built.
+        if !arm_subs.is_empty() {
+            return Err(bind_err(
+                "a subquery inside a compound SELECT is not supported yet",
+            ));
+        }
         // Context slots are appended AFTER the user params, so two arms
         // binding different key sets would give the same slot index two
         // meanings. Identical key lists (the common case: same policy on the
@@ -669,6 +688,7 @@ fn plan_compound(
         context_keys,
         list_keys,
         out_types,
+        Vec::new(),
     ))
 }
 
@@ -810,6 +830,7 @@ fn plan_insert(
         context_keys,
         list_keys,
         Vec::new(),
+        Vec::new(),
     ))
 }
 
@@ -873,6 +894,7 @@ fn plan_update(
         context_keys,
         list_keys,
         Vec::new(),
+        Vec::new(),
     ))
 }
 
@@ -905,6 +927,7 @@ fn plan_delete(
         param_types,
         context_keys,
         list_keys,
+        Vec::new(),
         Vec::new(),
     ))
 }

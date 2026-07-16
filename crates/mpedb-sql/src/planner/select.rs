@@ -244,25 +244,50 @@ pub(super) fn plan_select(
     catalog: &PolicyCatalog,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
+    // Subqueries lift out FIRST: every one becomes a subplan plus a reserved
+    // parameter slot, and the rest of planning sees only `Param(slot)` — no
+    // stage below knows subqueries exist (see planner/subquery.rs).
+    let lifted;
+    let (s, subplans, slot_types): (&ast::SelectStmt, Vec<SubPlan>, Vec<Ty>) =
+        if subquery::has_subquery(s) {
+            lifted = subquery::lift_subqueries(s, schema, n_params, catalog, consts)?;
+            (&lifted.stmt, lifted.subplans, lifted.slot_types)
+        } else {
+            (s, Vec::new(), Vec::new())
+        };
+    // The binder's parameter table covers `[user ‖ subplan results]`; the
+    // planner KNOWS each result slot's type, so pin it instead of inferring.
+    let eff_params = n_params + subplans.len() as u16;
+    let correlated: Vec<bool> = subplans.iter().map(|p| !p.outer_args.is_empty()).collect();
+
     let (table_id, table) = resolve_table(schema, &s.table)?;
     if !s.joins.is_empty() {
-        return plan_join_select(s, schema, n_params, catalog, consts);
+        return plan_join_select(s, schema, n_params, catalog, consts, subplans, slot_types);
     }
     let mut binder = match &s.alias {
-        Some(a) => Binder::with_scope(Scope::single_named(a.clone(), table), n_params, true),
-        None => Binder::new(table, n_params, true),
+        Some(a) => Binder::with_scope(Scope::single_named(a.clone(), table), eff_params, true),
+        None => Binder::new(table, eff_params, true),
     };
+    for (i, ty) in slot_types.iter().enumerate() {
+        binder.pin_param(n_params + i as u16, *ty);
+    }
     let bound_where = s
         .where_clause
         .as_ref()
         .map(|e| binder.bind_predicate(e))
         .transpose()?;
+    // WHERE conjuncts that read a CORRELATED slot cannot run in the gather
+    // (the slot is filled per row, after the policies) — they split off into
+    // `post_filter`. Everything else, policy included, keeps today's path.
+    let (bound_where, post_where) =
+        subquery::split_correlated(bound_where, n_params, &correlated);
     // Inject the SELECT visibility policy AND-ed with the user WHERE, *before*
     // access extraction, so a policy conjunct that pins the PK/unique column
     // still becomes a Point/Range access and footprints only narrow (§3.3).
     let policy = read_policy(&mut binder, catalog, table_id, &table.name, PolicyCmd::Select)?;
     let (access, residual) = extract_access(merge_and(bound_where, policy), table, consts)?;
     let filter = residual.map(|e| compile_program(&e)).transpose()?;
+    let post_filter = post_where.map(|e| compile_program(&e)).transpose()?;
     let joined_filter: Option<ExprProgram> = None;
 
     check_distinct_order_by(s, table)?;
@@ -279,6 +304,14 @@ pub(super) fn plan_select(
         || s.order_by.iter().any(|(e, _)| contains_agg(e))
         || !s.group_by.is_empty();
     if has_agg {
+        // Aggregation consumes rows in the gather phase; the per-row filling
+        // that correlated slots need happens after it. Uncorrelated slots are
+        // filled once up front and pass through untouched.
+        if correlated.iter().any(|&c| c) {
+            return Err(bind_err(
+                "a correlated subquery in an aggregate query is not supported yet",
+            ));
+        }
         return plan_aggregate_select(
             s,
             &table.columns,
@@ -290,6 +323,7 @@ pub(super) fn plan_select(
             None,
             binder,
             consts,
+            subplans,
         );
     }
 
@@ -410,6 +444,7 @@ pub(super) fn plan_select(
             aggregate: None,
             joins: Vec::new(),
             joined_filter,
+            post_filter,
             distinct: s.distinct,
             order_over,
             order_junk,
@@ -425,5 +460,6 @@ pub(super) fn plan_select(
         context_keys,
         list_keys,
         out_types,
+        subplans,
     ))
 }

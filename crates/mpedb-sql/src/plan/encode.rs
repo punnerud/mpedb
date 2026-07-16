@@ -26,6 +26,15 @@ impl CompiledPlan {
         for c in &self.consts {
             write_value(&mut buf, c);
         }
+        buf.push(self.subplans.len() as u8);
+        for s in &self.subplans {
+            buf.push(s.exists as u8);
+            buf.extend_from_slice(&(s.outer_args.len() as u16).to_le_bytes());
+            for a in &s.outer_args {
+                buf.extend_from_slice(&a.to_le_bytes());
+            }
+            encode_select(&s.plan, &mut buf);
+        }
         self.footprint.encode_into(&mut buf);
         encode_stmt(&self.stmt, &mut buf);
         buf
@@ -222,6 +231,7 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
             access,
             joins,
             joined_filter,
+            post_filter,
             filter,
             projection,
             order_by,
@@ -278,6 +288,7 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
                 encode_opt_program(j.policy.as_ref(), buf);
             }
             encode_opt_program(joined_filter.as_ref(), buf);
+            encode_opt_program(post_filter.as_ref(), buf);
             buf.push(*distinct as u8);
             w_u16(buf, *order_junk);
             match aggregate {

@@ -448,6 +448,22 @@ fn the_sqlite_differences_that_bite() {
     assert!(db
         .query("SELECT oid FROM orders UNION SELECT oid FROM items", &[])
         .is_ok(), "compound set ops work");
+    assert!(db
+        .query(
+            "SELECT customer FROM orders WHERE oid = (SELECT max(oid) FROM orders)",
+            &[],
+        )
+        .is_ok(), "scalar subqueries work");
+    // >1 row from a scalar subquery is an ERROR (PG's rule) — sqlite would
+    // silently take the first row. Two rows make it observable.
+    db.query(
+        "INSERT INTO orders (oid, customer) VALUES ($1, $2)",
+        &params![2, "bob"],
+    )
+    .unwrap();
+    assert!(db
+        .query("SELECT customer FROM orders WHERE oid = (SELECT oid FROM orders)", &[])
+        .is_err(), "a multi-row scalar subquery must error");
 
     // 4. ORDER BY must name something the query outputs.
     assert!(db

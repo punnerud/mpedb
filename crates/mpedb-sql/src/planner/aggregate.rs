@@ -15,6 +15,9 @@ pub(super) fn contains_agg(e: &ast::Expr) -> bool {
             arms.iter().any(|(c, r)| contains_agg(c) || contains_agg(r))
                 || els.as_deref().is_some_and(contains_agg)
         }
+        // An aggregate INSIDE a subquery aggregates the inner statement's
+        // rows, not ours — the outer walk stops at the boundary.
+        E::Subquery(_) | E::Exists(..) => false,
         E::Lit(_) | E::Param(_) | E::Col(_) | E::ContextRef(_) | E::Excluded(_)
         | E::Qualified(..) => false,
     }
@@ -104,6 +107,9 @@ fn lift_aggs(
                 None => None,
             },
         ),
+        // Subqueries are lifted before aggregation planning ever runs; one
+        // still here is headed for the binder's clear refusal — pass through.
+        other @ (E::Subquery(_) | E::Exists(..)) => other.clone(),
         other @ (E::Lit(_) | E::Param(_) | E::ContextRef(_) | E::Excluded(_)) => other.clone(),
     })
 }
@@ -182,6 +188,7 @@ pub(super) fn plan_aggregate_select(
     joined_filter: Option<ExprProgram>,
     mut binder: Binder<'_>,
     _consts: &mut Vec<Value>,
+    subplans: Vec<SubPlan>,
 ) -> Result<PlannedStmt> {
     // 1. GROUP BY columns -> base-row slots.
     let mut group_by = Vec::with_capacity(s.group_by.len());
@@ -304,6 +311,7 @@ pub(super) fn plan_aggregate_select(
                 access,
                 joins,
                 joined_filter,
+                post_filter: None,
                 filter,
                 projection,
                 order_by,
@@ -322,6 +330,7 @@ pub(super) fn plan_aggregate_select(
             context_keys,
             list_keys,
             out_types,
+            subplans,
         ));
     }
     let mut grouped_keys = Vec::with_capacity(rewritten_order.len());
@@ -365,6 +374,7 @@ pub(super) fn plan_aggregate_select(
             access,
             joins,
             joined_filter,
+            post_filter: None,
             filter,
             projection,
             order_by,
@@ -383,6 +393,7 @@ pub(super) fn plan_aggregate_select(
         context_keys,
         list_keys,
         out_types,
+        subplans,
     ))
 }
 

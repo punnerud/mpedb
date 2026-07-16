@@ -129,6 +129,26 @@ pub enum OrderOver {
     Projection,
 }
 
+/// One lifted subquery (#56). The inner select's parameter space is
+/// `[user params ‖ correlation args]`: outer-row references inside the
+/// subquery were rewritten to trailing params, and `outer_args[j]` names the
+/// OUTER base-row slot whose value fills inner param `n_user + j` — the same
+/// parametrization idea as the index nested loop's `OuterCol`, applied to a
+/// whole plan. `outer_args` empty = uncorrelated: evaluated ONCE per execute
+/// (before access resolution, so a PK probe may consume its slot), not per row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubPlan {
+    pub plan: SelectPlan,
+    pub outer_args: Vec<u16>,
+    /// `EXISTS (…)`: the result is `Bool(any rows)` instead of the scalar
+    /// rule (exactly one output column; 0 rows → NULL; >1 row → runtime
+    /// error, PostgreSQL's line — sqlite silently takes the first row).
+    pub exists: bool,
+}
+
+/// Ceiling on subplans per statement — decoder DoS bound, far above real SQL.
+const MAX_SUBPLANS: usize = 16;
+
 /// A compiled, content-addressed statement plan.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompiledPlan {
@@ -165,7 +185,21 @@ pub struct CompiledPlan {
     /// Plan-level constant pool, referenced by [`KeyPart::Const`] and
     /// [`InsertSource::Const`].
     pub consts: Vec<Value>,
+    /// Lifted subqueries (#56). Subplan `i`'s RESULT occupies the reserved
+    /// parameter slot `subplan_base() + i`; the caller passes only the user
+    /// params, the facade leaves these slots NULL, and the executor fills
+    /// them (uncorrelated: once up front; correlated: per outer row). The
+    /// parameter layout is `[user ‖ subplan results ‖ context]` — context
+    /// stays LAST, so the session-fill formula is untouched.
+    pub subplans: Vec<SubPlan>,
     pub footprint: Footprint,
+}
+
+impl CompiledPlan {
+    /// First reserved subplan-result parameter slot.
+    pub fn subplan_base(&self) -> u16 {
+        self.n_params - self.context_keys.len() as u16 - self.subplans.len() as u16
+    }
 }
 
 /// One SELECT, compiled. Extracted from the `PlanStmt::Select` variant so a
@@ -195,6 +229,13 @@ pub struct SelectPlan {
     /// would report that row's existence without returning it. Everything
     /// that can raise waits until both policies have had their say.
     pub joined_filter: Option<ExprProgram>,
+    /// Predicate over the base row that may read CORRELATED subplan slots
+    /// (params at `subplan_base()..`), so it cannot run inside the gather —
+    /// those slots are filled per outer row, after `filter` and the policies
+    /// have had their say. `None` for every plan without correlated
+    /// subqueries. Splitting it from `filter` rather than flagging is what
+    /// lets validate FORBID gather-side programs from reading unfilled slots.
+    pub post_filter: Option<ExprProgram>,
     /// Output columns, in order.
     pub projection: Vec<Projection>,
     /// (column index, descending). Empty = scan order. The index is into
