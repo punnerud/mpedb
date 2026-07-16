@@ -95,6 +95,59 @@ primary_key = ["id"]
   type = "int64"
 
 [[table]]
+name = "depts"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+
+  [[table.column]]
+  name = "dname"
+  type = "text"
+
+[[table]]
+name = "emps"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+
+  [[table.column]]
+  name = "dept"
+  type = "int64"
+
+  [[table.column]]
+  name = "ename"
+  type = "text"
+
+[[table]]
+name = "anyv"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+
+  [[table.column]]
+  name = "v"
+  type = "any"
+
+[[table]]
+name = "files"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+
+  [[table.column]]
+  name = "data"
+  type = "blob"
+  nullable = false
+
+[[table]]
 name = "runs"
 primary_key = ["run"]
 
@@ -138,7 +191,8 @@ def max_id(db, table):
 
 
 def test_open_and_tables(db):
-    assert sorted(db.tables()) == ["kv", "runs", "users", "vals"], db.tables()
+    assert sorted(db.tables()) == \
+        ["anyv", "depts", "emps", "files", "kv", "runs", "users", "vals"], db.tables()
     ok("open + tables()")
 
 
@@ -492,6 +546,100 @@ def test_detached_and_session(db, cfg_path, base):
     ok("detached plans + caching Session (compiled once, no registry writes)")
 
 
+def test_joins(db, base):
+    d1, d2, d3 = base + 1, base + 2, base + 3
+    h_dept = db.prepare("INSERT INTO depts (id, dname) VALUES ($1, $2)")
+    h_emp = db.prepare("INSERT INTO emps (id, dept, ename) VALUES ($1, $2, $3)")
+    for i, name in [(d1, f"eng{base}"), (d2, f"ops{base}"), (d3, f"empty{base}")]:
+        assert db.execute(h_dept, [i, name]) == 1
+    for i, dept, name in [(base + 10, d1, f"ada{base}"),
+                          (base + 11, d1, f"bob{base}"),
+                          (base + 12, d2, f"cyd{base}")]:
+        assert db.execute(h_emp, [i, dept, name]) == 1
+
+    # INNER JOIN with table aliases: dept d3 has nobody, so it never appears.
+    rows = db.query(
+        "SELECT e.ename, d.dname FROM emps e JOIN depts d ON e.dept = d.id "
+        "WHERE d.id >= $1 ORDER BY e.ename", [d1])
+    assert rows == [(f"ada{base}", f"eng{base}"),
+                    (f"bob{base}", f"eng{base}"),
+                    (f"cyd{base}", f"ops{base}")], rows
+
+    # LEFT JOIN keeps the empty dept and NULL-extends the inner side.
+    rows = db.query(
+        "SELECT depts.dname, emps.ename FROM depts "
+        "LEFT JOIN emps ON emps.dept = depts.id WHERE depts.id = $1", [d3])
+    assert rows == [(f"empty{base}", None)], rows
+
+    # ... and matched rows come through the same LEFT JOIN unchanged.
+    rows = db.query(
+        "SELECT depts.dname, emps.ename FROM depts "
+        "LEFT JOIN emps ON emps.dept = depts.id "
+        "WHERE depts.id >= $1 ORDER BY depts.id, emps.ename", [d1])
+    assert rows == [(f"eng{base}", f"ada{base}"),
+                    (f"eng{base}", f"bob{base}"),
+                    (f"ops{base}", f"cyd{base}"),
+                    (f"empty{base}", None)], rows
+    ok("JOIN + LEFT JOIN over two tables (with aliases)")
+
+
+def test_any_roundtrip(db, base):
+    """One `any` column takes every scalar type, per VALUE, and each comes
+    back as the Python type that went in (bool stays bool, int stays int)."""
+    h_ins = db.prepare("INSERT INTO anyv (id, v) VALUES ($1, $2)")
+    h_sel = db.prepare("SELECT v FROM anyv WHERE id = $1")
+    cases = [
+        (base + 1, 42),
+        (base + 2, f"tekst{base}"),
+        (base + 3, 3.25),
+        (base + 4, True),
+        (base + 5, b"\x00\xffany"),
+        (base + 6, None),
+    ]
+    for i, v in cases:
+        assert db.execute(h_ins, [i, v]) == 1
+    for i, v in cases:
+        (row,) = db.execute(h_sel, [i])
+        assert row[0] == v and type(row[0]) is type(v), (i, v, row)
+    ok("any column round-trip (int/text/float/bool/bytes/None, types intact)")
+
+
+def test_insert_file(db, base, workdir):
+    """Transaction.insert_file: stream a file into a blob column, read it
+    back byte-identical."""
+    n = (1 << 19) + 137  # 512 KiB + change: multi-page overflow, unaligned tail
+    payload = random.Random(base).randbytes(n)
+    path = os.path.join(workdir, f"blob-{base}.bin")
+    with open(path, "wb") as f:
+        f.write(payload)
+    try:
+        rid = base + 1
+        with db.begin() as tx:
+            tx.insert_file("files", [rid, b""], 1, path)
+        (row,) = db.query("SELECT data FROM files WHERE id = $1", [rid])
+        assert isinstance(row[0], bytes) and len(row[0]) == n
+        assert row[0] == payload, "insert_file round-trip must be byte-identical"
+
+        # A table with a secondary UNIQUE index is refused by the engine
+        # (the uniqueness probe needs the value nobody has yet) — and the
+        # refusal happens before any side effect, so the session stays usable.
+        with db.begin() as tx:
+            expect_raises(mpedb.Error, tx.insert_file,
+                          "users", [base + 2, "", 0], 1, path)
+            tx.rollback()
+        # a missing file is an OperationalError, mapped like other I/O
+        tx = db.begin()
+        try:
+            expect_raises(mpedb.OperationalError, tx.insert_file,
+                          "files", [base + 3, b""], 1,
+                          os.path.join(workdir, "does-not-exist.bin"))
+        finally:
+            tx.rollback()
+    finally:
+        os.remove(path)
+    ok("insert_file (streamed) round-trip", f"{n} bytes")
+
+
 def check_persistence(db, prev_runs):
     """Assert data committed by earlier runs of this script is still there."""
     for run, users_marker, kv_count in prev_runs:
@@ -636,6 +784,9 @@ def main():
     test_threading(db, base + 400)
     test_second_handle(db, cfg_path, h_sel_users, base)
     test_detached_and_session(db, cfg_path, base)
+    test_joins(db, base + 500)
+    test_any_roundtrip(db, base + 600)
+    test_insert_file(db, base + 700, workdir)
     test_dbapi(cfg_path, base)
 
     db.verify()

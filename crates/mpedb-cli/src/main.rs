@@ -10,6 +10,7 @@
 
 mod args;
 mod bench;
+mod blob;
 mod collide;
 mod crash;
 mod dump;
@@ -34,6 +35,9 @@ usage: mpedb <command> [args]
   call    <target> <hash> [param ...]      execute a prepared plan by hash
   proc    define|call|list ...              stored procedures (see `proc`)
   repl    <target>                          interactive session (stdin)
+  blob    put <target> <table> <pk> <file>     [--col C]   stream a file into
+          get <target> <table> <pk> <out-file> [--col C]   / out of a blob column
+          (column: the table's last blob column unless --col names one)
 
   <target> is a config.toml, or a .mpedb file directly (e.g. a mirror, which
   is config-free: its schema lives in the file).
@@ -61,7 +65,9 @@ crash --blob-kb N mixes ~20% N-KiB blob writes into every wave (suggest 64;
   small-txn paths); content is deterministic and byte-verified after each wave.
   NOTE: blob params exceed the intent ring's 824 B cap, so with --durability
   commit|wal blob ops take the direct writer-lock fallback, NOT the ring.
-parameters parse as: null | true | false | integer | float | 0xHEX (blob) | text";
+parameters parse as: null | true | false | integer | float | 0xHEX (blob) |
+  ISO-8601 timestamp (2026-07-16T12:00:00Z; optional .micros and ±HH:MM offset,
+  naive = UTC) | text";
 
 fn main() {
     let argv: Vec<String> = std::env::args().skip(1).collect();
@@ -90,6 +96,7 @@ fn dispatch(argv: &[String]) -> CliResult {
         "call" => cmd_call(rest),
         "proc" => proc_cmd::run(rest),
         "repl" => repl::run(rest),
+        "blob" => blob::run(rest),
         "dump" => dump::run(rest),
         "bench" => bench::run(rest),
         "stress" => stress::run_parent(rest),
