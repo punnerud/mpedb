@@ -259,13 +259,22 @@ Verified against the binary, not remembered. mpedb compiles SQL once to a
 content-hashed plan; the surface is deliberately narrow, and the narrowness is
 the design rather than a todo list.
 
+It is also measured against sqlite's own **sqllogictest corpus** (the
+`sqlite_corpus` runner in `crates/mpedb-testkit`): ~91–93% of the random query
+corpus now executes, with **zero wrong answers and zero error mismatches**
+across every statement both engines accept — every miss is a refused feature,
+never a different result. The main remaining blockers are `CAST` and
+subqueries (subqueries alone hold the classic `select1–3` files at ~49%).
+
 | | mpedb | note |
 |---|---|---|
 | `SELECT … WHERE / ORDER BY / LIMIT / OFFSET` | ✅ | |
 | `INSERT` / `UPDATE` / `DELETE` | ✅ | |
 | `ON CONFLICT DO NOTHING / DO UPDATE` + `excluded.` | ✅ | target: the PK, or one UNIQUE column |
 | `RETURNING` | ✅ | on all three verbs |
-| `IN` / `NOT IN`, `BETWEEN`, `CASE`, `LIKE`, `IS [NOT] NULL` | ✅ | full SQL 3VL |
+| `IN` / `NOT IN`, `BETWEEN`, `CASE`, `LIKE`, `IS [NOT] NULL`, unary `+`/`-` | ✅ | full SQL 3VL |
+| SELECT-item aliases (`expr AS name`, bare `expr name`) | ✅ | names the output; `ORDER BY alias` resolves the output first, as in PostgreSQL |
+| Comma-joins (`FROM a, b WHERE …`) | ✅ | the cartesian product, desugared to `INNER JOIN … ON true` |
 | `lower upper length trim abs round substr coalesce ifnull nullif` | ✅ | `coalesce` is lazy |
 | `<table>.<column>` qualifiers | ✅ | checked, not ignored |
 | `COUNT` / `SUM` / `AVG` / `MIN` / `MAX`, `GROUP BY` / `HAVING` | ✅ | NULL rules verified against sqlite 3.45 |
