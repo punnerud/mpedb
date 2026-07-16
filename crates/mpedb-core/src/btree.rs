@@ -840,12 +840,37 @@ fn insert_rec<S: PageStore + ?Sized>(
                 }
                 remove_cell(store.page_mut(id)?, pos);
             }
-            let overflow_page = if val.len() > MAX_INLINE_VAL {
-                write_overflow(store, val)?
-            } else {
-                0
+            // A Stream small enough to stay INLINE has to be drained into a
+            // buffer: the leaf cell must be contiguous, so there is nothing to
+            // stream into and `pieces()` has nothing to give. At <=
+            // MAX_INLINE_VAL there is also nothing to save — that is the same
+            // reasoning that keeps small rows on the flat path in `insert_row`.
+            // Without this a small streamed value silently wrote an EMPTY cell;
+            // `streamed_payload_is_byte_identical_to_flat` caught it.
+            let drained: Option<Vec<u8>> = match val {
+                Payload::Stream { head, src } if head.len() + src.len() <= MAX_INLINE_VAL => {
+                    let mut buf = head.to_vec();
+                    let at = buf.len();
+                    buf.resize(at + src.len(), 0);
+                    if !src.is_empty() {
+                        src.next_into(&mut buf[at..])?;
+                    }
+                    Some(buf)
+                }
+                _ => None,
             };
-            let cell = make_leaf_cell(key, val, overflow_page);
+            let (overflow_page, cell) = match &drained {
+                Some(b) => (0u64, make_leaf_cell(key, &Payload::Flat(b), 0)),
+                None => {
+                    let op = if val.len() > MAX_INLINE_VAL {
+                        write_overflow(store, val)?
+                    } else {
+                        0
+                    };
+                    (op, make_leaf_cell(key, val, op))
+                }
+            };
+            let _ = overflow_page;
             if fits(store.page(id)?, cell.len())? {
                 insert_cell(store.page_mut(id)?, pos, &cell)?;
                 return Ok(Ins::Done {
@@ -1342,6 +1367,66 @@ mod tests {
     use super::*;
     use crate::pagestore::test_store::TestStore;
     use std::collections::BTreeMap;
+
+    /// A streamed value must be byte-for-byte the same as one handed over whole.
+    ///
+    /// The safety claim of #43. Chunked at every awkward size — a source's chunk
+    /// boundary, the page boundary, and the row head's end are three unrelated
+    /// things, and the head is what makes the first page's split uneven.
+    ///
+    /// Mutation-tested: dropping the head into the fill loop (writing it after
+    /// the source's bytes instead of before) fails this, and so does letting the
+    /// stream reader hand back a short buffer.
+    #[test]
+    fn streamed_payload_is_byte_identical_to_flat() {
+        struct Chunked {
+            data: Vec<u8>,
+            pos: usize,
+        }
+        impl BlobSource for Chunked {
+            fn len(&self) -> usize {
+                self.data.len()
+            }
+            fn next_into(&mut self, buf: &mut [u8]) -> Result<()> {
+                buf.copy_from_slice(&self.data[self.pos..self.pos + buf.len()]);
+                self.pos += buf.len();
+                Ok(())
+            }
+        }
+        let mut rng = Rng(0x5175_2A17);
+        for &(head_len, body_len) in &[
+            (0usize, OVERFLOW_CAP * 2 + 5usize),
+            (1, OVERFLOW_CAP * 2),
+            (17, OVERFLOW_CAP - 17), // head + body lands exactly on a page
+            (OVERFLOW_CAP - 1, OVERFLOW_CAP + 1),
+            (OVERFLOW_CAP, OVERFLOW_CAP * 2),
+            (9, 1),
+        ] {
+            let head: Vec<u8> = (0..head_len).map(|_| rng.next() as u8).collect();
+            let body: Vec<u8> = (0..body_len).map(|_| rng.next() as u8).collect();
+            let whole: Vec<u8> = head.iter().chain(body.iter()).copied().collect();
+
+            let mut store = TestStore::new();
+            let r = insert(&mut store, 0, b"flat", &mut Payload::Flat(&whole), InsertMode::InsertOnly)
+                .unwrap()
+                .new_root;
+            let mut src = Chunked { data: body.clone(), pos: 0 };
+            let r = insert(
+                &mut store,
+                r,
+                b"stream",
+                &mut Payload::Stream { head: &head, src: &mut src },
+                InsertMode::InsertOnly,
+            )
+            .unwrap()
+            .new_root;
+            let a = get(&store, r, b"flat").unwrap().unwrap();
+            let b = get(&store, r, b"stream").unwrap().unwrap();
+            assert_eq!(a, whole, "head={head_len} body={body_len}: flat");
+            assert_eq!(b, whole, "head={head_len} body={body_len}: streamed");
+            assert_eq!(src.pos, body.len(), "head={head_len}: source not drained");
+        }
+    }
 
     /// `Payload::Parts` must be byte-for-byte `Payload::Flat` of the same bytes.
     ///

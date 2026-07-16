@@ -936,6 +936,41 @@ impl WriteSession<'_> {
         self.txn.insert_row(table_id, values)
     }
 
+    /// INSERT a row whose column `stream_col` is PULLED from `src` a page at a
+    /// time, so a large value is never resident (#43).
+    ///
+    /// `values[stream_col]` is a placeholder for the type check — pass an empty
+    /// `Blob`/`Text`; the length comes from `src.len()`. The streamed column must
+    /// be the row's last variable-length column.
+    ///
+    /// **Pull, not push, and it is deliberate.** A `writer.write_all(chunk)` API
+    /// would hold the writer lock across YOUR code, so a blob arriving off a
+    /// socket would block every other writer for as long as the network took.
+    /// Here the engine asks for bytes as fast as it can write them. `src` is
+    /// still called with the lock held — keep it cheap.
+    ///
+    /// Refused on a table with a secondary UNIQUE index: that probe needs the
+    /// value, and the point of this call is that nobody has it.
+    pub fn insert_streaming(
+        &mut self,
+        table: &str,
+        values: &[Value],
+        stream_col: usize,
+        src: &mut dyn mpedb_core::btree::BlobSource,
+    ) -> Result<()> {
+        let table_id = self
+            .db
+            .engine
+            .schema()
+            .tables
+            .iter()
+            .position(|t| t.name == table)
+            .ok_or_else(|| Error::Config(format!("no such table: {table}")))?
+            as u32;
+        self.txn
+            .insert_row_streaming(table_id, values, stream_col, src)
+    }
+
     /// Replace the full row with the given PK; returns whether it existed.
     pub fn update_by_pk(&mut self, table_id: u32, values: &[Value]) -> Result<bool> {
         self.txn.update_by_pk(table_id, values)

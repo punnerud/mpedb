@@ -368,6 +368,21 @@ Bulk write flips the other way from Linux: mpedb **2,274 MiB/s (38% of raw)** vs
 SQLite 1,163 (19%) — 1.9×. On the 2-core Linux box SQLite leads that cell; give
 mpedb cores and a fast SSD and it does not.
 
+**Streaming blob insert (2026-07-16).** `WriteSession::insert_streaming` PULLS a
+large value a page at a time instead of taking a `Value::Blob(Vec<u8>)`, so it is
+never resident. A 256 MiB blob costs **+132 KiB of anonymous RSS** — 2000× less
+than the value itself — and reads back byte-identical. Total RSS still grows (the
+file's pages are mapped) but those are page cache the kernel reclaims, not memory
+the caller has to find; on a box with no swap that is the difference between
+running and being OOM-killed.
+
+It pulls rather than handing out a writer on purpose: a `write_all(chunk)` API
+would hold the writer lock across caller code, so a blob arriving off a socket
+would block every other writer for as long as the network took. This is also why
+sqlite's `sqlite3_blob_open` shape does not port — it assumes in-place mutation
+of an existing blob, and mpedb is COW, so an "in-place" write would copy the
+whole chain and hand back the memory win it existed to get.
+
 **Large blobs got 77% faster (2026-07-16).** `row::encode_row` materialised the
 whole row — blob included — into a fresh heap buffer whose only purpose was to be
 copied straight back out into overflow pages; at 16 MiB that malloc faults its own
