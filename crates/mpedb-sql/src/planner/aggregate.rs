@@ -33,7 +33,7 @@ pub(super) fn contains_agg(e: &ast::Expr) -> bool {
 /// column 1 of the base row.
 fn lift_aggs(
     e: &ast::Expr,
-    group_by: &[u16],
+    keys: &GroupKeys<'_>,
     // Name -> slot in the row being aggregated. A `Scope`, so this works over a
     // join's `[outer ‖ inner]` as well as one table — the rule it enforces ("a
     // bare column must be a GROUP BY key") is about the ROW, and does not care
@@ -42,7 +42,15 @@ fn lift_aggs(
     aggs: &mut Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool)>,
 ) -> Result<ast::Expr> {
     use ast::Expr as E;
-    let rec = |x: &ast::Expr, aggs: &mut Vec<_>| lift_aggs(x, group_by, scope, aggs);
+    let rec = |x: &ast::Expr, aggs: &mut Vec<_>| lift_aggs(x, keys, scope, aggs);
+    let group_by = keys.asts;
+    // A selected/ordered expression that IS a group key — `SELECT a+1 …
+    // GROUP BY a+1` — names that key's slot in the grouped tuple. Checked
+    // before anything else, so the whole key wins over its parts; aggregate
+    // ARGUMENTS never get here (the Agg arm below clones them unrewritten).
+    if let Some(pos) = keys.asts.iter().position(|k| k == e) {
+        return Ok(E::Col(format!("__g{pos}")));
+    }
     Ok(match e {
         E::Agg(f, arg, distinct) => {
             let spec = (*f, arg.as_deref().cloned(), *distinct);
@@ -71,7 +79,9 @@ fn lift_aggs(
                 E::Qualified(q, n) => scope.resolve_qualified(q, n)?,
                 _ => unreachable!("matched above"),
             };
-            let pos = group_by.iter().position(|g| *g == idx).ok_or_else(|| {
+            // Slot-based match: `GROUP BY a` + `SELECT t.a` are the same key
+            // under two spellings, which AST equality above cannot see.
+            let pos = keys.cols.iter().position(|g| *g == Some(idx)).ok_or_else(|| {
                 bind_err(format!(
                     "column `{}` must appear in GROUP BY or be inside an aggregate — \
                      otherwise there is no single value for it in the group",
@@ -121,21 +131,27 @@ fn lift_aggs(
 /// is exactly what the binder needs. Reusing the binder here rather than writing
 /// a second resolution path means the type rules, 3VL and constant folding are
 /// the same ones as everywhere else, instead of a parallel set that drifts.
+/// What `lift_aggs` needs to know about the GROUP BY keys.
+struct GroupKeys<'a> {
+    /// The keys as written — whole-expression matching.
+    asts: &'a [ast::Expr],
+    /// Per key: its base-row slot when it IS a plain column, for the
+    /// spelling-insensitive bare-column rule.
+    cols: &'a [Option<u16>],
+}
+
 fn synthetic_grouped_table(
-    // The columns of the row being aggregated. A slice rather than a
-    // `TableDef`, because for a join that row is `[outer ‖ inner]` and no table
-    // describes it.
-    columns: &[mpedb_types::ColumnDef],
-    group_by: &[u16],
+    // One type per GROUP BY key — a plain column's declared type, or the
+    // bound type of a computed key (`GROUP BY a + 1`).
+    key_types: &[ColumnType],
     aggs: &[(mpedb_types::AggFn, Option<ast::Expr>, bool)],
     agg_types: &[Option<ColumnType>],
 ) -> TableDef {
-    let mut out: Vec<mpedb_types::ColumnDef> = Vec::with_capacity(group_by.len() + aggs.len());
-    for (k, g) in group_by.iter().enumerate() {
-        let src = &columns[*g as usize];
+    let mut out: Vec<mpedb_types::ColumnDef> = Vec::with_capacity(key_types.len() + aggs.len());
+    for (k, &ty) in key_types.iter().enumerate() {
         out.push(mpedb_types::ColumnDef {
             name: format!("__g{k}"),
-            ty: src.ty,
+            ty,
             nullable: true, // a group key can be NULL; NULLs group together
             unique: false,
             indexed: false,
@@ -151,7 +167,7 @@ fn synthetic_grouped_table(
             _ => agg_types[i].unwrap_or(ColumnType::Int64),
         };
         out.push(mpedb_types::ColumnDef {
-            name: format!("__g{}", group_by.len() + i),
+            name: format!("__g{}", key_types.len() + i),
             ty,
             // Every aggregate except COUNT is NULL over an empty group.
             nullable: !matches!(f, mpedb_types::AggFn::Count),
@@ -177,9 +193,8 @@ fn synthetic_grouped_table(
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_aggregate_select(
     s: &ast::SelectStmt,
-    // The row being aggregated: its columns (for the grouped tuple's types) and
-    // its scope (for name resolution and messages).
-    base_columns: &[mpedb_types::ColumnDef],
+    // The row being aggregated, as the scope its names resolve in (which is
+    // also where the grouped tuple's key types come from).
     base_scope: &Scope<'_>,
     table_id: u32,
     access: AccessPath,
@@ -190,42 +205,84 @@ pub(super) fn plan_aggregate_select(
     _consts: &mut Vec<Value>,
     subplans: Vec<SubPlan>,
 ) -> Result<PlannedStmt> {
-    // 1. GROUP BY columns -> base-row slots.
-    let mut group_by = Vec::with_capacity(s.group_by.len());
-    for g in &s.group_by {
-        let (i, _) = match g {
-            ast::Expr::Col(n) => base_scope.resolve(n)?,
-            ast::Expr::Qualified(q, n) => base_scope.resolve_qualified(q, n)?,
-            // `GROUP BY a + 1` groups by a computed key, which the grouped
-            // tuple's positional keys cannot name. sqlite and PG allow it.
-            _ => {
-                return Err(bind_err(
-                    "GROUP BY must name a column — grouping by an expression is not \
-                     supported (sqlite and PostgreSQL do allow it)"
-                        .to_string(),
-                ))
-            }
-        };
-        if group_by.contains(&i) {
-            return Err(bind_err(format!(
-                "column `{}` repeated in GROUP BY",
-                base_scope.slot_name(i)
-            )));
-        }
-        group_by.push(i);
-    }
-
-    // 2. Lift the aggregates out of the SELECT list and HAVING.
     let items = s.items.as_ref().ok_or_else(|| {
         bind_err("SELECT * with GROUP BY has no meaning — list the group keys and aggregates")
     })?;
+
+    // 1. GROUP BY keys — a plain column becomes a base-row slot, anything
+    //    else (`GROUP BY a + 1`) a computed key evaluated over the base row.
+    //    Both live in the grouped tuple `[keys ‖ aggs]` like any other key.
+    let mut group_by: Vec<GroupKey> = Vec::with_capacity(s.group_by.len());
+    // Per key: its base-row slot when it IS a column (for the bare-column
+    // rule below), its declared type (for the grouped tuple), and its AST
+    // (for matching selected/ordered expressions to key positions).
+    let mut key_cols: Vec<Option<u16>> = Vec::with_capacity(s.group_by.len());
+    let mut key_types: Vec<ColumnType> = Vec::with_capacity(s.group_by.len());
+    let mut key_asts: Vec<ast::Expr> = Vec::with_capacity(s.group_by.len());
+    for g in &s.group_by {
+        // `GROUP BY 2` is an OUTPUT ordinal in sqlite and PostgreSQL, so the
+        // key is the second select item's expression. A non-integer constant
+        // is refused as in PG: it would put every row in one group, which is
+        // never what was meant.
+        let ordinal_key;
+        let g = if let Some(pos) = ordinal(g, items.len())? {
+            ordinal_key = items[pos as usize].0.clone();
+            &ordinal_key
+        } else if matches!(g, ast::Expr::Lit(_)) {
+            return Err(bind_err(
+                "a constant in GROUP BY does nothing — write an output ordinal \
+                 (`GROUP BY 1`) or a key expression",
+            ));
+        } else {
+            g
+        };
+        if contains_agg(g) {
+            return Err(bind_err(
+                "GROUP BY cannot contain an aggregate — the key decides the \
+                 groups the aggregate is computed OVER",
+            ));
+        }
+        match g {
+            ast::Expr::Col(_) | ast::Expr::Qualified(..) => {
+                let (i, ty) = match g {
+                    ast::Expr::Col(n) => base_scope.resolve(n)?,
+                    ast::Expr::Qualified(q, n) => base_scope.resolve_qualified(q, n)?,
+                    _ => unreachable!("matched above"),
+                };
+                if key_cols.contains(&Some(i)) {
+                    return Err(bind_err(format!(
+                        "column `{}` repeated in GROUP BY",
+                        base_scope.slot_name(i)
+                    )));
+                }
+                group_by.push(GroupKey::Col(i));
+                key_cols.push(Some(i));
+                key_types.push(ty);
+            }
+            expr => {
+                if key_asts.contains(expr) {
+                    return Err(bind_err("expression repeated in GROUP BY"));
+                }
+                let (b, ty) = binder.bind_expr(expr)?;
+                group_by.push(GroupKey::Expr(compile_program(&b)?));
+                key_cols.push(None);
+                // An unpinnable key type (a bare NULL) grades to Any — the
+                // honest "decided per value" column type.
+                key_types.push(ty.unwrap_or(ColumnType::Any));
+            }
+        }
+        key_asts.push(g.clone());
+    }
+
+    // 2. Lift the aggregates out of the SELECT list and HAVING.
+    let keys = GroupKeys { asts: &key_asts, cols: &key_cols };
     let mut agg_specs: Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool)> = Vec::new();
     let mut rewritten = Vec::with_capacity(items.len());
     for (item, _alias) in items {
-        rewritten.push(lift_aggs(item, &group_by, base_scope, &mut agg_specs)?);
+        rewritten.push(lift_aggs(item, &keys, base_scope, &mut agg_specs)?);
     }
     let rewritten_having = match &s.having {
-        Some(h) => Some(lift_aggs(h, &group_by, base_scope, &mut agg_specs)?),
+        Some(h) => Some(lift_aggs(h, &keys, base_scope, &mut agg_specs)?),
         None => None,
     };
     // ORDER BY is lifted HERE, with the others, because `ORDER BY count(*)` may
@@ -236,7 +293,7 @@ pub(super) fn plan_aggregate_select(
     // ordering by an aggregate that IS selected does not compute it twice.
     let mut rewritten_order = Vec::with_capacity(s.order_by.len());
     for (e, desc) in &s.order_by {
-        rewritten_order.push((lift_aggs(e, &group_by, base_scope, &mut agg_specs)?, *desc));
+        rewritten_order.push((lift_aggs(e, &keys, base_scope, &mut agg_specs)?, *desc));
     }
 
     // 3. Bind each aggregate ARGUMENT over the BASE row.
@@ -266,7 +323,7 @@ pub(super) fn plan_aggregate_select(
 
     // 4. Bind the rewritten projection/HAVING over the GROUPED tuple — a
     //    different tuple from the base row, carrying the same parameter table.
-    let grouped = synthetic_grouped_table(base_columns, &group_by, &agg_specs, &agg_types);
+    let grouped = synthetic_grouped_table(&key_types, &agg_specs, &agg_types);
     let mut binder = binder.rescope(Scope::single(&grouped));
 
     let mut out_types: Vec<Option<ColumnType>> = Vec::with_capacity(rewritten.len());

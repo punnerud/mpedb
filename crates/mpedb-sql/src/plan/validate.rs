@@ -181,9 +181,16 @@ impl CompiledPlan {
                     // is a different width again. Checking either against the
                     // wrong one would let a hostile plan read past its row — so
                     // they are bounded separately.
-                    for c in &a.group_by {
-                        if *c as usize >= base_width {
-                            return Err(corrupt("GROUP BY column out of range"));
+                    for k in &a.group_by {
+                        match k {
+                            GroupKey::Col(c) => {
+                                if *c as usize >= base_width {
+                                    return Err(corrupt("GROUP BY column out of range"));
+                                }
+                            }
+                            GroupKey::Expr(p) => {
+                                self.check_program_width(p, base_width, ptypes)?
+                            }
                         }
                     }
                     for c in &a.aggs {

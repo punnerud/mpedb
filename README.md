@@ -281,7 +281,7 @@ their tags).
 | `\|\|` concatenation | ✅ | NULL propagates; ints/bools render as text; floats refused until their formatting is pinned |
 | `lower upper length trim abs round substr coalesce ifnull nullif` | ✅ | `coalesce` is lazy |
 | `<table>.<column>` qualifiers | ✅ | checked, not ignored |
-| `COUNT` / `SUM` / `AVG` / `MIN` / `MAX`, `GROUP BY` / `HAVING` | ✅ | NULL rules verified against sqlite 3.45 |
+| `COUNT` / `SUM` / `AVG` / `MIN` / `MAX`, `GROUP BY` / `HAVING` | ✅ | NULL rules verified against sqlite 3.45; keys may be expressions (`GROUP BY a/100`) or output ordinals (`GROUP BY 1`) |
 | `SELECT DISTINCT`, `COUNT(DISTINCT x)` | ✅ | |
 | `ORDER BY` by name, by ordinal (`ORDER BY 1`), or by a selected expression | ✅ | the key must be in the output; see below |
 | N-way `INNER JOIN` chains (`FROM a JOIN b ON … JOIN c ON …`), incl. aggregates over them | ✅ | index nested loop when the `ON` has an equality; RLS applies to every side |

@@ -314,7 +314,6 @@ pub(super) fn plan_select(
         }
         return plan_aggregate_select(
             s,
-            &table.columns,
             &Scope::single(table),
             table_id,
             access,

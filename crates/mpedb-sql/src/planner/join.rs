@@ -133,7 +133,6 @@ pub(super) fn plan_join_select(
         }
         return plan_aggregate_select(
             s,
-            &joined_columns,
             &full_scope,
             outer_id,
             access,

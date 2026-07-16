@@ -464,7 +464,11 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                     }
                     let mut group_by = Vec::with_capacity(n.min(64));
                     for _ in 0..n {
-                        group_by.push(r_u16(buf, pos)?);
+                        group_by.push(match r_u8(buf, pos)? {
+                            0 => GroupKey::Col(r_u16(buf, pos)?),
+                            1 => GroupKey::Expr(ExprProgram::decode(buf, pos)?),
+                            t => return Err(corrupt(format!("bad group-key tag {t}"))),
+                        });
                     }
                     let n = r_u16(buf, pos)? as usize;
                     if n > crate::parser::MAX_SELECT_ITEMS {
