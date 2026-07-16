@@ -296,8 +296,17 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
                 Some(a) => {
                     buf.push(1);
                     w_u16(buf, a.group_by.len() as u16);
-                    for c in &a.group_by {
-                        w_u16(buf, *c);
+                    for k in &a.group_by {
+                        match k {
+                            GroupKey::Col(c) => {
+                                buf.push(0);
+                                w_u16(buf, *c);
+                            }
+                            GroupKey::Expr(p) => {
+                                buf.push(1);
+                                p.encode_into(buf);
+                            }
+                        }
                     }
                     w_u16(buf, a.aggs.len() as u16);
                     for c in &a.aggs {

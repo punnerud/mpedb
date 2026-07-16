@@ -63,8 +63,12 @@ pub(super) fn exec_aggregate(
         let key_vals: Vec<Value> = agg
             .group_by
             .iter()
-            .map(|c| row.get(*c as usize).cloned().unwrap_or(Value::Null))
-            .collect();
+            .map(|k| match k {
+                GroupKey::Col(c) => Ok(row.get(*c as usize).cloned().unwrap_or(Value::Null)),
+                // A computed key — `GROUP BY a+1` — evaluated over the base row.
+                GroupKey::Expr(p) => p.eval(row, params),
+            })
+            .collect::<Result<_>>()?;
         let key = keycode::encode_key(&key_vals);
         let entry = groups.entry(key).or_insert_with(|| {
             (

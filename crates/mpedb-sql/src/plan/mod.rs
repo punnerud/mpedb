@@ -383,10 +383,10 @@ pub enum PlanStmt {
 /// `gather_rows`, which has already applied both.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Aggregation {
-    /// Base-row column indices to group by. **Empty = one group over every
-    /// surviving row** — that is `SELECT count(*) FROM t`, and it must still
-    /// produce exactly one row when the table is empty.
-    pub group_by: Vec<u16>,
+    /// Group keys, evaluated over the BASE row. **Empty = one group over
+    /// every surviving row** — that is `SELECT count(*) FROM t`, and it must
+    /// still produce exactly one row when the table is empty.
+    pub group_by: Vec<GroupKey>,
     /// The aggregate calls, in output order. Their arguments are evaluated over
     /// the BASE row.
     pub aggs: Vec<AggCall>,
@@ -394,6 +394,15 @@ pub struct Aggregation {
     /// a different tuple from the one `filter` sees, which is exactly why SQL
     /// has two clauses rather than one.
     pub having: Option<ExprProgram>,
+}
+
+/// One GROUP BY key (#56). `GROUP BY a` is a base-row column; `GROUP BY a+1`
+/// is a computed key — sqlite and PostgreSQL both allow it, and the grouped
+/// tuple `[keys ‖ aggs]` carries the computed value like any other key.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GroupKey {
+    Col(u16),
+    Expr(ExprProgram),
 }
 
 /// One aggregate call.

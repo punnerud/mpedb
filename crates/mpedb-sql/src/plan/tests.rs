@@ -239,7 +239,7 @@ fn aggregate_over_a_join_is_bounded_by_the_joined_width() {
             // `users.email` is column 1 of users, which sits after all of
             // orders' columns in the joined row — a slot no single-table
             // bound would accept.
-            assert_eq!(a.group_by, vec![(o + 1) as u16]);
+            assert_eq!(a.group_by, vec![GroupKey::Col((o + 1) as u16)]);
             (o, o + i)
         }
         other => panic!("expected a joined aggregate plan, got {other:?}"),
@@ -253,7 +253,7 @@ fn aggregate_over_a_join_is_bounded_by_the_joined_width() {
     match &mut evil.stmt {
         PlanStmt::Select(SelectPlan {
             aggregate: Some(a), ..
-        }) => a.group_by[0] = joined_w as u16,
+        }) => a.group_by[0] = GroupKey::Col(joined_w as u16),
         _ => unreachable!(),
     }
     match CompiledPlan::decode(&evil.encode(), &s) {

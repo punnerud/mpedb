@@ -194,10 +194,14 @@ impl CompiledPlan {
                 // Using the base one here printed the table's first column as the
                 // name of `count(*)`, which is the kind of plausible wrong answer
                 // EXPLAIN exists to rule out.
+                let group_key_name = |k: &GroupKey| match k {
+                    GroupKey::Col(c) => base(*c),
+                    GroupKey::Expr(p) => render_program(p, &base),
+                };
                 let grouped: Option<Vec<String>> = aggregate.as_ref().map(|a| {
                     a.group_by
                         .iter()
-                        .map(|c| base(*c))
+                        .map(group_key_name)
                         .chain(a.aggs.iter().map(|c| match &c.arg {
                             None => format!("{}(*)", c.func.name()),
                             Some(p) => format!("{}({})", c.func.name(), render_program(p, &base)),
@@ -213,7 +217,8 @@ impl CompiledPlan {
                 };
                 if let Some(a) = aggregate {
                     if !a.group_by.is_empty() {
-                        let keys: Vec<String> = a.group_by.iter().map(|c| base(*c)).collect();
+                        let keys: Vec<String> =
+                            a.group_by.iter().map(group_key_name).collect();
                         out.push_str(&format!("  group by: {}\n", keys.join(", ")));
                     }
                     let calls: Vec<String> = grouped.as_ref().unwrap()[a.group_by.len()..].to_vec();
