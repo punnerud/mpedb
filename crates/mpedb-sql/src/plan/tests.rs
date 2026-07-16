@@ -124,7 +124,7 @@ fn tampered_semantics_are_rejected() {
     let p = prepare("SELECT * FROM orders WHERE user_id = 1 AND item_no = 2", &s).unwrap();
     let mut evil = p.clone();
     match &mut evil.stmt {
-        PlanStmt::Select { access, .. } => {
+        PlanStmt::Select(SelectPlan { access, .. }) => {
             *access = AccessPath::PkPoint(vec![KeyPart::Const(0)]);
         }
         _ => unreachable!(),
@@ -134,7 +134,7 @@ fn tampered_semantics_are_rejected() {
     // Const index out of range inside a key part.
     let mut evil = p.clone();
     match &mut evil.stmt {
-        PlanStmt::Select { access, .. } => {
+        PlanStmt::Select(SelectPlan { access, .. }) => {
             *access = AccessPath::PkPoint(vec![KeyPart::Const(60000), KeyPart::Const(1)]);
         }
         _ => unreachable!(),
@@ -164,11 +164,11 @@ fn order_by_index_is_bounded_against_the_tuple_it_orders() {
     // projection. Bounding against the wrong one accepts this.
     let p = prepare("SELECT DISTINCT email FROM users ORDER BY email", &s).unwrap();
     match &p.stmt {
-        PlanStmt::Select {
+        PlanStmt::Select(SelectPlan {
             order_over,
             projection,
             ..
-        } => {
+        }) => {
             assert_eq!(*order_over, OrderOver::Projection);
             assert_eq!(projection.len(), 1);
         }
@@ -176,7 +176,7 @@ fn order_by_index_is_bounded_against_the_tuple_it_orders() {
     }
     let mut evil = p.clone();
     match &mut evil.stmt {
-        PlanStmt::Select { order_by, .. } => order_by[0].0 = 1,
+        PlanStmt::Select(SelectPlan { order_by, .. }) => order_by[0].0 = 1,
         _ => unreachable!(),
     }
     match CompiledPlan::decode(&evil.encode(), &s) {
@@ -189,7 +189,7 @@ fn order_by_index_is_bounded_against_the_tuple_it_orders() {
     let p = prepare("SELECT id FROM users ORDER BY id", &s).unwrap();
     let mut evil = p.clone();
     match &mut evil.stmt {
-        PlanStmt::Select { order_over, .. } => *order_over = OrderOver::Grouped,
+        PlanStmt::Select(SelectPlan { order_over, .. }) => *order_over = OrderOver::Grouped,
         _ => unreachable!(),
     }
     match CompiledPlan::decode(&evil.encode(), &s) {
@@ -221,12 +221,12 @@ fn aggregate_over_a_join_is_bounded_by_the_joined_width() {
     )
     .unwrap();
     let (outer_w, joined_w) = match &p.stmt {
-        PlanStmt::Select {
+        PlanStmt::Select(SelectPlan {
             table,
             joins,
             aggregate: Some(a),
             ..
-        } if !joins.is_empty() => {
+        }) if !joins.is_empty() => {
             let j = &joins[0];
             let o = s.table(*table).unwrap().columns.len();
             let i = s.table(j.table).unwrap().columns.len();
@@ -245,9 +245,9 @@ fn aggregate_over_a_join_is_bounded_by_the_joined_width() {
     // One past the joined row is out of range.
     let mut evil = p.clone();
     match &mut evil.stmt {
-        PlanStmt::Select {
+        PlanStmt::Select(SelectPlan {
             aggregate: Some(a), ..
-        } => a.group_by[0] = joined_w as u16,
+        }) => a.group_by[0] = joined_w as u16,
         _ => unreachable!(),
     }
     match CompiledPlan::decode(&evil.encode(), &s) {
@@ -315,12 +315,12 @@ fn order_junk_count_is_validated() {
     let s = test_schema();
     let p = prepare("SELECT id FROM users ORDER BY email", &s).unwrap();
     match &p.stmt {
-        PlanStmt::Select {
+        PlanStmt::Select(SelectPlan {
             order_junk,
             order_over,
             projection,
             ..
-        } => {
+        }) => {
             // The key is a plain column, so it sorts the base row and needs
             // no junk column at all.
             assert_eq!(*order_junk, 0);
@@ -333,7 +333,7 @@ fn order_junk_count_is_validated() {
     // (a) junk without a projection sort: nothing would ever trim it.
     let mut evil = p.clone();
     match &mut evil.stmt {
-        PlanStmt::Select { order_junk, .. } => *order_junk = 1,
+        PlanStmt::Select(SelectPlan { order_junk, .. }) => *order_junk = 1,
         _ => unreachable!(),
     }
     match CompiledPlan::decode(&evil.encode(), &s) {
@@ -349,12 +349,12 @@ fn order_junk_count_is_validated() {
         Err(_) => prepare("SELECT email FROM users ORDER BY id + 1", &s).unwrap(),
     };
     match &p2.stmt {
-        PlanStmt::Select {
+        PlanStmt::Select(SelectPlan {
             order_junk,
             order_over,
             projection,
             ..
-        } => {
+        }) => {
             assert_eq!(*order_junk, 1, "a computed key needs a sort-only column");
             assert_eq!(*order_over, OrderOver::Projection);
             assert_eq!(projection.len(), 2, "one output + one sort-only");
@@ -363,7 +363,7 @@ fn order_junk_count_is_validated() {
     }
     let mut evil = p2.clone();
     match &mut evil.stmt {
-        PlanStmt::Select { order_junk, .. } => *order_junk = 2,
+        PlanStmt::Select(SelectPlan { order_junk, .. }) => *order_junk = 2,
         _ => unreachable!(),
     }
     match CompiledPlan::decode(&evil.encode(), &s) {
@@ -374,7 +374,7 @@ fn order_junk_count_is_validated() {
     // (c) junk under DISTINCT.
     let mut evil = p2.clone();
     match &mut evil.stmt {
-        PlanStmt::Select { distinct, .. } => *distinct = true,
+        PlanStmt::Select(SelectPlan { distinct, .. }) => *distinct = true,
         _ => unreachable!(),
     }
     match CompiledPlan::decode(&evil.encode(), &s) {
@@ -394,7 +394,7 @@ fn oversized_counts_in_plan_bytes_are_rejected() {
     let p = prepare("SELECT id FROM users", &s).unwrap();
     let mut evil = p.clone();
     match &mut evil.stmt {
-        PlanStmt::Select { projection, .. } => {
+        PlanStmt::Select(SelectPlan { projection, .. }) => {
             let item = projection[0].clone();
             while projection.len() <= crate::parser::MAX_SELECT_ITEMS {
                 projection.push(item.clone());
@@ -410,7 +410,7 @@ fn oversized_counts_in_plan_bytes_are_rejected() {
     let p = prepare("SELECT id FROM users ORDER BY email", &s).unwrap();
     let mut evil = p.clone();
     match &mut evil.stmt {
-        PlanStmt::Select { order_by, .. } => {
+        PlanStmt::Select(SelectPlan { order_by, .. }) => {
             assert!(!order_by.is_empty());
             let item = order_by[0];
             while order_by.len() <= crate::parser::MAX_ORDER_BY_ITEMS {
@@ -498,7 +498,7 @@ fn projection_names_are_canonical() {
     let b = prepare("select age\n  +\n1 from users", &s).unwrap();
     assert_eq!(a, b);
     match &a.stmt {
-        PlanStmt::Select { projection, .. } => match &projection[0] {
+        PlanStmt::Select(SelectPlan { projection, .. }) => match &projection[0] {
             Projection::Expr { name, .. } => assert_eq!(name, "age + 1"),
             other => panic!("{other:?}"),
         },

@@ -426,7 +426,7 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                 }
                 t => return Err(corrupt(format!("bad aggregate tag {t}"))),
             };
-            Ok(PlanStmt::Select {
+            Ok(PlanStmt::Select(SelectPlan {
                 table,
                 access,
                 joins,
@@ -440,7 +440,7 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                 aggregate,
                 distinct,
                 order_junk,
-            })
+            }))
         }
         STMT_INSERT => {
             let table = r_u32(buf, pos)?;

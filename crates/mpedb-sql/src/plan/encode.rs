@@ -184,7 +184,7 @@ fn encode_on_conflict(oc: &PlanOnConflict, buf: &mut Vec<u8>) {
 
 fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
     match stmt {
-        PlanStmt::Select {
+        PlanStmt::Select(SelectPlan {
             table,
             access,
             joins,
@@ -198,7 +198,7 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             aggregate,
             distinct,
             order_junk,
-        } => {
+        }) => {
             buf.push(STMT_SELECT);
             buf.extend_from_slice(&table.to_le_bytes());
             encode_access(access, buf);

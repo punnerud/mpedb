@@ -297,7 +297,7 @@ pub(super) fn plan_aggregate_select(
         let (order_by, _) = distinct_order_by(s, base_scope, None)?;
         let (param_types, context_keys, list_keys) = binder.into_parts();
         return Ok((
-            PlanStmt::Select {
+            PlanStmt::Select(SelectPlan {
                 table: table_id,
                 access,
                 joins,
@@ -315,7 +315,7 @@ pub(super) fn plan_aggregate_select(
                     aggs,
                     having,
                 }),
-            },
+            }),
             param_types,
             context_keys,
             list_keys,
@@ -357,7 +357,7 @@ pub(super) fn plan_aggregate_select(
 
     let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
-        PlanStmt::Select {
+        PlanStmt::Select(SelectPlan {
             table: table_id,
             access,
             joins,
@@ -375,7 +375,7 @@ pub(super) fn plan_aggregate_select(
                 aggs,
                 having,
             }),
-        },
+        }),
         param_types,
         context_keys,
         list_keys,

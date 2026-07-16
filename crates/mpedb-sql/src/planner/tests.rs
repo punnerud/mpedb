@@ -63,7 +63,7 @@ pub(crate) fn test_schema() -> Schema {
 
 fn access_of(plan: &CompiledPlan) -> &AccessPath {
     match &plan.stmt {
-        PlanStmt::Select { access, .. }
+        PlanStmt::Select(SelectPlan { access, .. })
         | PlanStmt::Update { access, .. }
         | PlanStmt::Delete { access, .. } => access,
         other => panic!("no access path in {other:?}"),
@@ -72,7 +72,7 @@ fn access_of(plan: &CompiledPlan) -> &AccessPath {
 
 fn filter_of(plan: &CompiledPlan) -> Option<&mpedb_types::ExprProgram> {
     match &plan.stmt {
-        PlanStmt::Select { filter, .. }
+        PlanStmt::Select(SelectPlan { filter, .. })
         | PlanStmt::Update { filter, .. }
         | PlanStmt::Delete { filter, .. } => filter.as_ref(),
         other => panic!("no filter in {other:?}"),
@@ -244,7 +244,7 @@ fn unique_probe_beats_pk_range() {
     let schema = test_schema();
     let p = prepare("SELECT id FROM users WHERE id >= $1 AND email = $2", &schema).unwrap();
     match &p.stmt {
-        PlanStmt::Select { access, filter, .. } => {
+        PlanStmt::Select(SelectPlan { access, filter, .. }) => {
             assert!(
                 matches!(access, AccessPath::IndexPoint { .. }),
                 "expected IndexPoint, got {access:?}"
@@ -287,7 +287,7 @@ fn null_literal_is_never_a_key() {
 fn order_by_pk_prefix_elision() {
     let s = test_schema();
     let order = |sql: &str| match prepare(sql, &s).unwrap().stmt {
-        PlanStmt::Select { order_by, .. } => order_by,
+        PlanStmt::Select(SelectPlan { order_by, .. }) => order_by,
         other => panic!("{other:?}"),
     };
     assert_eq!(order("SELECT * FROM users ORDER BY id"), vec![]);
@@ -316,7 +316,7 @@ fn order_by_pk_prefix_elision() {
 fn select_star_projects_all_columns_in_order() {
     let s = test_schema();
     match prepare("SELECT * FROM users", &s).unwrap().stmt {
-        PlanStmt::Select { projection, .. } => {
+        PlanStmt::Select(SelectPlan { projection, .. }) => {
             assert_eq!(
                 projection,
                 (0..6u16).map(Projection::Column).collect::<Vec<_>>()

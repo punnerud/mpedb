@@ -14,7 +14,7 @@ type PlannedStmt = (PlanStmt, Vec<Option<ColumnType>>, Vec<String>, BTreeSet<Str
 use crate::binder::{compile_program, BExpr, Binder, Scope};
 use crate::plan::{
     render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource,
-    Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp, Projection,
+    Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp, Projection, SelectPlan,
 };
 use crate::policy::{PolicyCatalog, TablePolicies};
 use mpedb_types::{ExprProgram, ColumnType, Error, Footprint, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
@@ -307,7 +307,7 @@ pub(crate) fn plan_statement(
     // Recorded for EVERY plan (even non-RLS), so that later ENABLING RLS on the
     // table invalidates plans compiled before it.
     let target = match &plan_stmt {
-        PlanStmt::Select { table, .. }
+        PlanStmt::Select(SelectPlan { table, .. })
         | PlanStmt::Insert { table, .. }
         | PlanStmt::Update { table, .. }
         | PlanStmt::Delete { table, .. } => Some(*table),
@@ -318,7 +318,7 @@ pub(crate) fn plan_statement(
     // inner table's rows under a policy that has since been tightened, which is
     // the leak §4 exists to close.
     let mut stamped: Vec<u32> = target.into_iter().collect();
-    if let PlanStmt::Select { joins, .. } = &plan_stmt {
+    if let PlanStmt::Select(SelectPlan { joins, .. }) = &plan_stmt {
         // One stamp per joined table — a cached plan must not keep serving any
         // side under a policy that was tightened after it was compiled.
         for j in joins {

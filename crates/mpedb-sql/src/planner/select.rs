@@ -401,7 +401,7 @@ pub(super) fn plan_select(
 
     let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
-        PlanStmt::Select {
+        PlanStmt::Select(SelectPlan {
             aggregate: None,
             joins: Vec::new(),
             joined_filter,
@@ -415,7 +415,7 @@ pub(super) fn plan_select(
             order_by,
             limit: s.limit,
             offset: s.offset,
-        },
+        }),
         param_types,
         context_keys,
         list_keys,

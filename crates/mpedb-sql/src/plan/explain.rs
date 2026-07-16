@@ -18,7 +18,7 @@ impl CompiledPlan {
         };
         let mut out = String::new();
         match &self.stmt {
-            PlanStmt::Select {
+            PlanStmt::Select(SelectPlan {
                 table,
                 access,
                 joins,
@@ -32,7 +32,7 @@ impl CompiledPlan {
                 aggregate,
                 distinct,
                 order_junk,
-            } => {
+            }) => {
                 // With a join every tuple below is `[outer ‖ inner]`, so the
                 // namer has to span both — and it qualifies, because `did` alone
                 // would not say which side, and both sides usually have one.

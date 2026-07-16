@@ -13,7 +13,7 @@ impl CompiledPlan {
                 .ok_or_else(|| corrupt(format!("table id {id} out of range")))
         };
         match &self.stmt {
-            PlanStmt::Select {
+            PlanStmt::Select(SelectPlan {
                 table,
                 access,
                 joins,
@@ -26,7 +26,7 @@ impl CompiledPlan {
                 distinct,
                 order_junk,
                 ..
-            } => {
+            }) => {
                 let t = get_table(*table)?;
                 // Junk columns are sort-only and get trimmed, so they must not
                 // be able to (a) eat the whole output, (b) survive a DISTINCT —
