@@ -7,6 +7,7 @@
 //! with NULL yield NULL; AND/OR/NOT use Kleene logic; a filter passes only if
 //! the result is exactly TRUE.
 
+use crate::value::ColumnType;
 use crate::error::{Error, Result};
 use crate::value::{read_value, write_value, Value};
 use std::cmp::Ordering;
@@ -39,6 +40,16 @@ pub enum Instr {
     IsNotNull,
     /// Coerce Int -> Float (inserted by the binder for mixed numerics).
     ToFloat,
+    /// `CAST(x AS <type>)` — SQL type conversion (#56). NULL casts to NULL of
+    /// any type; numeric conversions follow sqlite (float→int truncates
+    /// toward zero, which is also what the corpus expects); a conversion that
+    /// would have to INVENT data (text→number) raises instead of
+    /// prefix-parsing the way sqlite does — that is the strictness line.
+    Cast(ColumnType),
+    /// `a || b` — SQL concatenation. NULL propagates; ints and bools render
+    /// as text first (sqlite's rule); floats are refused until someone needs
+    /// their formatting pinned down.
+    Concat,
     /// SQL LIKE with pattern from the const pool (supports % and _).
     Like(u16),
     /// `<scalar> IN (<list param n>)` — set membership against a
@@ -174,6 +185,8 @@ const OP_JUMP: u8 = 26;
 const OP_JUMP_IF_NOT_NULL: u8 = 27;
 const OP_POP: u8 = 28;
 const OP_CALL: u8 = 29;
+const OP_CAST: u8 = 30;
+const OP_CONCAT: u8 = 31;
 
 /// SQL `x IN (…)` under three-valued logic — the semantics that decide whether
 /// a policy admits a row, so they are spelled out rather than approximated:
@@ -472,6 +485,15 @@ impl ExprProgram {
                         }
                     });
                 }
+                Instr::Cast(t) => {
+                    let a = stack.pop().expect("validated");
+                    stack.push(cast_value(a, t)?);
+                }
+                Instr::Concat => {
+                    let b = stack.pop().expect("validated");
+                    let a = stack.pop().expect("validated");
+                    stack.push(concat_value(a, b)?);
+                }
                 Instr::Like(pi) => {
                     let a = stack.pop().expect("validated");
                     let pattern = &self.consts[pi as usize];
@@ -626,6 +648,11 @@ impl ExprProgram {
                 Instr::IsNull => buf.push(OP_IS_NULL),
                 Instr::IsNotNull => buf.push(OP_IS_NOT_NULL),
                 Instr::ToFloat => buf.push(OP_TO_FLOAT),
+                Instr::Cast(t) => {
+                    buf.push(OP_CAST);
+                    buf.push(t as u8);
+                }
+                Instr::Concat => buf.push(OP_CONCAT),
             }
         }
     }
@@ -695,6 +722,15 @@ impl ExprProgram {
                 OP_IS_NULL => Instr::IsNull,
                 OP_IS_NOT_NULL => Instr::IsNotNull,
                 OP_TO_FLOAT => Instr::ToFloat,
+                OP_CAST => {
+                    let t = *buf.get(*pos).ok_or_else(err)?;
+                    *pos += 1;
+                    Instr::Cast(
+                        ColumnType::from_tag(t)
+                            .ok_or_else(|| Error::Corrupt("bad CAST type tag".into()))?,
+                    )
+                }
+                OP_CONCAT => Instr::Concat,
                 _ => return Err(Error::Corrupt(format!("invalid opcode {op}"))),
             });
         }
@@ -806,6 +842,8 @@ fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                     // Pops the probe scalar, pushes the 3VL result; the list comes
                     // from a param slot, not the stack, so the arity is not here.
                     Instr::InParam(_) => (1, 1),
+                    Instr::Cast(_) => (1, 1),
+                    Instr::Concat => (2, 1),
                     // n list elements plus the probe beneath them. n == 0 would be
                     // a no-op leaving the probe posing as a bool — refuse it.
                     Instr::InList(nl) => {
@@ -949,6 +987,61 @@ fn like_match(pattern: &str, s: &str) -> bool {
     pi == p.len()
 }
 
+
+/// `CAST` semantics (#56): NULL → NULL of any type; lossy numeric narrowing
+/// follows sqlite (truncate toward zero — Rust's saturating `as`, which also
+/// makes NaN/±inf deterministic); text→number is REFUSED rather than
+/// prefix-parsed. Timestamps and blobs only cast to themselves.
+fn cast_value(v: Value, t: ColumnType) -> Result<Value> {
+    if v.is_null() {
+        return Ok(Value::Null);
+    }
+    Ok(match (v, t) {
+        (v, ColumnType::Any) => v,
+        (Value::Int(i), ColumnType::Int64) => Value::Int(i),
+        (Value::Float(f), ColumnType::Int64) => Value::Int(f as i64),
+        (Value::Bool(b), ColumnType::Int64) => Value::Int(b as i64),
+        (Value::Int(i), ColumnType::Float64) => Value::Float(i as f64),
+        (Value::Float(f), ColumnType::Float64) => Value::Float(f),
+        (Value::Bool(b), ColumnType::Float64) => Value::Float(b as u8 as f64),
+        (Value::Text(s), ColumnType::Text) => Value::Text(s),
+        (Value::Int(i), ColumnType::Text) => Value::Text(i.to_string()),
+        (Value::Bool(b), ColumnType::Text) => Value::Text((b as i64).to_string()),
+        (Value::Bool(b), ColumnType::Bool) => Value::Bool(b),
+        (Value::Int(i), ColumnType::Bool) => Value::Bool(i != 0),
+        (Value::Blob(b), ColumnType::Blob) => Value::Blob(b),
+        (Value::Timestamp(u), ColumnType::Timestamp) => Value::Timestamp(u),
+        (v, t) => {
+            return Err(Error::TypeMismatch(format!(
+                "CAST from {} to {t} would have to invent data",
+                v.type_name()
+            )))
+        }
+    })
+}
+
+/// `||` semantics: NULL propagates; ints and bools render as text (sqlite's
+/// rule); floats are refused until their text formatting is pinned down.
+fn concat_value(a: Value, b: Value) -> Result<Value> {
+    if a.is_null() || b.is_null() {
+        return Ok(Value::Null);
+    }
+    let as_text = |v: Value| -> Result<String> {
+        match v {
+            Value::Text(s) => Ok(s),
+            Value::Int(i) => Ok(i.to_string()),
+            Value::Bool(b) => Ok((b as i64).to_string()),
+            v => Err(Error::TypeMismatch(format!(
+                "|| cannot render {} as text",
+                v.type_name()
+            ))),
+        }
+    };
+    let mut s = as_text(a)?;
+    s.push_str(&as_text(b)?);
+    Ok(Value::Text(s))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1076,6 +1169,72 @@ mod tests {
         for cut in 0..buf.len() {
             let _ = ExprProgram::decode(&buf[..cut], &mut 0); // must not panic
         }
+    }
+
+    #[test]
+    fn cast_and_concat_semantics_and_codec() {
+        let cast = |v: Value, t: ColumnType| {
+            prog(vec![Instr::PushParam(0), Instr::Cast(t)], vec![]).eval(&[], &[v])
+        };
+        // NULL casts to NULL of every type.
+        assert_eq!(cast(Value::Null, ColumnType::Int64).unwrap(), Value::Null);
+        assert_eq!(cast(Value::Null, ColumnType::Blob).unwrap(), Value::Null);
+        // float→int truncates toward zero (sqlite's rule), NaN/inf saturate
+        // deterministically instead of being UB.
+        assert_eq!(cast(Value::Float(-1.9), ColumnType::Int64).unwrap(), Value::Int(-1));
+        assert_eq!(cast(Value::Float(f64::NAN), ColumnType::Int64).unwrap(), Value::Int(0));
+        assert_eq!(
+            cast(Value::Float(f64::INFINITY), ColumnType::Int64).unwrap(),
+            Value::Int(i64::MAX)
+        );
+        assert_eq!(cast(Value::Int(3), ColumnType::Float64).unwrap(), Value::Float(3.0));
+        assert_eq!(cast(Value::Int(-7), ColumnType::Text).unwrap(), Value::Text("-7".into()));
+        assert_eq!(cast(Value::Bool(true), ColumnType::Int64).unwrap(), Value::Int(1));
+        assert_eq!(cast(Value::Int(0), ColumnType::Bool).unwrap(), Value::Bool(false));
+        // The strictness line: text never parses into a number.
+        assert!(cast(Value::Text("12".into()), ColumnType::Int64).is_err());
+        assert!(cast(Value::Blob(vec![1]), ColumnType::Text).is_err());
+
+        let cat = |a: Value, b: Value| {
+            prog(
+                vec![Instr::PushParam(0), Instr::PushParam(1), Instr::Concat],
+                vec![],
+            )
+            .eval(&[], &[a, b])
+        };
+        assert_eq!(
+            cat(Value::Text("ab".into()), Value::Int(3)).unwrap(),
+            Value::Text("ab3".into())
+        );
+        assert_eq!(cat(Value::Text("x".into()), Value::Null).unwrap(), Value::Null);
+        assert!(cat(Value::Text("x".into()), Value::Float(1.5)).is_err());
+
+        // codec: roundtrip, truncation safety, and a bad CAST type tag.
+        let p = prog(
+            vec![
+                Instr::PushCol(0),
+                Instr::Cast(ColumnType::Text),
+                Instr::PushCol(1),
+                Instr::Concat,
+            ],
+            vec![],
+        );
+        let mut buf = Vec::new();
+        p.encode_into(&mut buf);
+        let mut pos = 0;
+        assert_eq!(ExprProgram::decode(&buf, &mut pos).unwrap(), p);
+        for cut in 0..buf.len() {
+            let _ = ExprProgram::decode(&buf[..cut], &mut 0); // must not panic
+        }
+        // Corrupt the Cast's type-tag byte: find OP_CAST and break the byte
+        // after it — decode must say Corrupt, never panic or misread.
+        let i = buf.iter().position(|&b| b == 30).unwrap(); // OP_CAST
+        let mut evil = buf.clone();
+        evil[i + 1] = 0xEE;
+        assert!(matches!(
+            ExprProgram::decode(&evil, &mut 0),
+            Err(Error::Corrupt(_))
+        ));
     }
 
     // ---- §2.6 `col IN (context list)` under 3VL ----

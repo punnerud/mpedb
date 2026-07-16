@@ -547,6 +547,13 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     atom: true,
                 }
             }
+            Instr::Cast(t) => {
+                let a = pop(&mut st);
+                Item {
+                    s: format!("CAST({} AS {t})", a.s),
+                    atom: true,
+                }
+            }
             Instr::Like(i) => {
                 let a = pop(&mut st);
                 Item {
@@ -604,6 +611,7 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     Instr::Mod => "%",
                     Instr::And => "AND",
                     Instr::Or => "OR",
+                    Instr::Concat => "||",
                     _ => "?",
                 };
                 Item {

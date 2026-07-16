@@ -22,6 +22,8 @@ pub(crate) enum Tok {
     Ne,
     Lt,
     Le,
+    /// `||` — SQL concatenation.
+    Concat,
     Gt,
     Ge,
     Plus,
@@ -221,6 +223,18 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
                     return Err(perr(start, "expected `!=`"));
                 }
             }
+            b'|' => match b.get(i + 1) {
+                Some(b'|') => {
+                    i += 2;
+                    Tok::Concat
+                }
+                _ => {
+                    return Err(perr(
+                        start,
+                        "`|` is not an operator — SQL concatenation is `||`",
+                    ))
+                }
+            },
             b'<' => match b.get(i + 1) {
                 Some(b'=') => {
                     i += 2;

@@ -37,6 +37,8 @@ pub(crate) enum BExpr {
     /// `coalesce(a, b, …)` — compiled to control flow, not a call, so later
     /// arguments are never evaluated once an earlier one is non-NULL.
     Coalesce(Vec<BExpr>),
+    /// `CAST(x AS t)` — semantics live in [`Instr::Cast`](mpedb_types::expr).
+    Cast(Box<BExpr>, ColumnType),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -650,6 +652,23 @@ impl<'a> Binder<'a> {
             }
             ast::Expr::Func(name, args) => self.bind_func(name, args),
             ast::Expr::Binary(op, l, r) => self.bind_binary(*op, l, r),
+            ast::Expr::Cast(a, t) => {
+                let (a, at) = self.bind_expr(a)?;
+                // `CAST(? AS t)` pins the parameter — PG's canonical way to
+                // type a param, and it makes the cast the identity.
+                let (a, at) = self.unify_param(a, at, *t);
+                // Refuse at bind time the casts that cannot succeed on ANY
+                // non-NULL value (same accept set as Instr::Cast at runtime).
+                if let Some(src) = at {
+                    if !cast_possible(src, *t) {
+                        return Err(bind_err(format!(
+                            "CAST from {src} to {t} would have to invent data"
+                        )));
+                    }
+                }
+                let e = fold_maybe(BExpr::Cast(Box::new(a), *t), self.suppress_fold)?;
+                Ok((e, Some(*t)))
+            }
         }
     }
 
@@ -674,6 +693,24 @@ impl<'a> Binder<'a> {
                 let (l, r, _) = self.unify_operands(l, lt, r, rt, "compare")?;
                 let e = fold_maybe(BExpr::Binary(op, Box::new(l), Box::new(r)), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
+            }
+            BinOp::Concat => {
+                let (l, lt) = self.unify_param(l, lt, ColumnType::Text);
+                let (r, rt) = self.unify_param(r, rt, ColumnType::Text);
+                // Same render set as the runtime: text/int/bool (Any decided
+                // per value); floats are refused until formatting is pinned.
+                for t in [lt, rt].into_iter().flatten() {
+                    if !matches!(
+                        t,
+                        ColumnType::Text | ColumnType::Int64 | ColumnType::Bool | ColumnType::Any
+                    ) {
+                        return Err(bind_err(format!(
+                            "`||` requires text, int64, or bool operands, got {t}"
+                        )));
+                    }
+                }
+                let e = fold_maybe(BExpr::Binary(op, Box::new(l), Box::new(r)), self.suppress_fold)?;
+                Ok((e, Some(ColumnType::Text)))
             }
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                 let (l, r, ty) = self.unify_operands(l, lt, r, rt, "arithmetic on")?;
@@ -981,6 +1018,22 @@ fn maybe_not(e: BExpr, negated: bool) -> BExpr {
 /// Constant-fold one node whose children are already folded: if every child
 /// is a constant, evaluate now (via the same IR evaluator used at run time,
 /// so semantics — including division-by-zero errors — match exactly).
+/// The type-level projection of `Instr::Cast`'s runtime accept set: true when
+/// SOME non-NULL value of `src` casts to `dst`. Text→number is the deliberate
+/// strictness line (no prefix-parse); blob/timestamp only cast to themselves.
+fn cast_possible(src: ColumnType, dst: ColumnType) -> bool {
+    use ColumnType as T;
+    if src == dst || src == T::Any || dst == T::Any {
+        return true;
+    }
+    matches!(
+        (src, dst),
+        (T::Int64, T::Float64 | T::Text | T::Bool)
+            | (T::Float64, T::Int64)
+            | (T::Bool, T::Int64 | T::Float64 | T::Text)
+    )
+}
+
 pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
     let foldable = match &e {
         BExpr::Unary(_, a) => matches!(a.as_ref(), BExpr::Const(_)),
@@ -988,6 +1041,7 @@ pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
             matches!(a.as_ref(), BExpr::Const(_)) && matches!(b.as_ref(), BExpr::Const(_))
         }
         BExpr::Like(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
+        BExpr::Cast(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         // Never foldable: the list is a session value, not a literal.
         BExpr::InParam(..) => false,
         // A CASE is branching control flow, not a value-in/value-out node; the
@@ -1058,6 +1112,10 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 BUnOp::ToFloat => Instr::ToFloat,
             });
         }
+        BExpr::Cast(a, t) => {
+            emit(a, instrs, consts)?;
+            instrs.push(Instr::Cast(*t));
+        }
         BExpr::Binary(op, a, b) => {
             emit(a, instrs, consts)?;
             emit(b, instrs, consts)?;
@@ -1073,6 +1131,7 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 BinOp::Le => Instr::Le,
                 BinOp::Gt => Instr::Gt,
                 BinOp::Ge => Instr::Ge,
+                BinOp::Concat => Instr::Concat,
                 BinOp::And => Instr::And,
                 BinOp::Or => Instr::Or,
             });
