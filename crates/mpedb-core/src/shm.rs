@@ -1088,7 +1088,27 @@ impl Shm {
         Ok(())
     }
 
+    /// msync a range AND barrier it to the platter. The safe default: one call,
+    /// one durable range. Every caller but the commit path wants this.
     pub fn msync_range(&self, offset: usize, len: usize) -> Result<()> {
+        self.msync_range_nobarrier(offset, len)?;
+        self.sync_barrier()
+    }
+
+    /// msync a range WITHOUT the platter barrier.
+    ///
+    /// ⚠ **You must call [`Shm::sync_barrier`] before acking anything as
+    /// durable.** On macOS `msync(MS_SYNC)` only hands the pages to the
+    /// filesystem; the drive's write cache still holds them, so skipping the
+    /// barrier makes `durability=commit` faster and a lie — the exact failure
+    /// this codebase has caught all three engines committing (BENCHMARKS.md).
+    ///
+    /// It exists because `F_FULLFSYNC` is per-FD, not per-range: a caller with
+    /// several ranges to make durable can msync them all and barrier ONCE. The
+    /// commit path is that caller and the only one — a commit's dirty pages are
+    /// scattered (a btree path, a freelist path), and barriering each contiguous
+    /// run cost one platter flush per run.
+    pub fn msync_range_nobarrier(&self, offset: usize, len: usize) -> Result<()> {
         // msync requires the base address aligned to the OS page size. On Linux
         // that is PAGE_SIZE (4096); on Apple Silicon it is 16 KiB — larger than a
         // logical page — so a base at e.g. meta B (page 1) or the lock page
@@ -1099,28 +1119,31 @@ impl Shm {
         let gran = crate::os::sync_granularity();
         let start = offset & !(gran - 1);
         let len = len + (offset - start);
-        let rc = unsafe {
-            libc::msync(
-                self.at(start) as *mut libc::c_void,
-                len,
-                libc::MS_SYNC,
-            )
-        };
+        let rc = unsafe { libc::msync(self.at(start) as *mut libc::c_void, len, libc::MS_SYNC) };
         if rc != 0 {
             return Err(io_err("msync"));
         }
-        // macOS: msync(MS_SYNC) hands the pages to the filesystem but does NOT
-        // flush the drive's write cache, so an acked `durability=commit` would
-        // still be sitting in volatile cache — the exact promise the commit class
-        // makes and would be breaking. Follow with the real barrier. (Linux's
-        // msync(MS_SYNC) already goes through vfs_fsync for the range, so it needs
-        // nothing extra; os::fdatasync is a no-op-cheap fdatasync there and this
-        // stays off the Linux hot path via the cfg.)
-        //
-        // Measured on an M3 Pro: without this, single-client durable insert reads
-        // 7,583 ops/s (127 µs) — 26x "faster" than a genuinely durable SQLite,
-        // because it is not durable. With it, mpedb `wal` and SQLite+fullfsync
-        // both land at ~290 ops/s, which is what an Apple SSD platter flush costs.
+        Ok(())
+    }
+
+    /// Flush everything already msync'd on this fd to the PLATTER.
+    ///
+    /// macOS: `msync(MS_SYNC)` hands the pages to the filesystem but does NOT
+    /// flush the drive's write cache, so an acked `durability=commit` would still
+    /// be sitting in volatile cache — the exact promise the commit class makes.
+    /// `F_FULLFSYNC` is the real barrier, and it is per-fd, so one covers every
+    /// range msync'd since the last one.
+    ///
+    /// Linux: nothing to do. `msync(MS_SYNC)` already ran `vfs_fsync` for the
+    /// range, and this compiles away.
+    ///
+    /// Measured on an M3 Pro: without the barrier at all, single-client durable
+    /// insert reads 7,583 ops/s (127 µs) — 26x "faster" than a genuinely durable
+    /// SQLite, because it is not durable. With it, mpedb `wal` and SQLite+
+    /// fullfsync both land at ~290 ops/s, which is what an Apple SSD platter
+    /// flush costs.
+    #[allow(clippy::unnecessary_wraps)] // Linux: nothing can fail; macOS: plenty
+    pub fn sync_barrier(&self) -> Result<()> {
         #[cfg(not(target_os = "linux"))]
         {
             use std::os::unix::io::AsRawFd;

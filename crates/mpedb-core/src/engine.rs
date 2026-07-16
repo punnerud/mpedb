@@ -2028,12 +2028,28 @@ impl<'e> WriteTxn<'e> {
                         i += 1;
                         end = ids[i];
                     }
-                    self.eng.shm.msync_range(
+                    // NO barrier per run: `F_FULLFSYNC` is per-fd, and every
+                    // run here is data, i.e. the same ordering class. One
+                    // barrier below covers them all. Barriering each run cost a
+                    // platter flush per CONTIGUOUS RUN — the sequential-insert
+                    // benchmark has one run and never showed it, but a random
+                    // update scatters the btree path and the freelist path, so
+                    // N=3-5 and this was 4-6 flushes per commit (#41).
+                    self.eng.shm.msync_range_nobarrier(
                         start as usize * PAGE_SIZE,
                         (end - start + 1) as usize * PAGE_SIZE,
                     )?;
                     i += 1;
                 }
+                // ⚠ ORDERING: this barrier is what makes the data durable BEFORE
+                // the meta that will reference it (DESIGN.md §4.1). It cannot be
+                // merged with the meta's barrier below — a single barrier over
+                // both would let a power loss land meta on the platter and not
+                // its data, and meta_T would then be checksum-valid pointing at
+                // COW pages that were never written. Two flushes is the FLOOR
+                // here; `wal` gets away with one because its record is a single
+                // self-describing checksummed object with no ordering to keep.
+                self.eng.shm.sync_barrier()?;
             }
             // WAL-class (§5.4): ONE sequential record replaces the scattered
             // COW-page msyncs above and the meta-page msync below. `wal`
