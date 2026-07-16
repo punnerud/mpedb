@@ -382,13 +382,16 @@ macro_rules! ovf_timed {
     }};
 }
 
-fn write_overflow<S: PageStore + ?Sized>(store: &mut S, mut data: &[u8]) -> Result<u64> {
+fn write_overflow<S: PageStore + ?Sized>(store: &mut S, data: &Payload<'_>) -> Result<u64> {
     use crate::engine::leakstat;
+    let total = data.len();
+    let mut cur = PayloadCursor::new(data);
     let mut first = 0u64;
     let mut prev = 0u64;
-    while !data.is_empty() || first == 0 {
+    let mut written = 0usize;
+    loop {
         leakstat::bump(&leakstat::OVF_PAGES);
-        let take = data.len().min(OVERFLOW_CAP);
+        let take = OVERFLOW_CAP.min(total - written);
         // `alloc_raw`, not `alloc`: this page is about to have every byte it
         // owns defined right here — header, payload, then the tail below — so
         // `alloc`'s full-page fill(0) is a 4 KiB memset thrown away on the hot
@@ -399,17 +402,26 @@ fn write_overflow<S: PageStore + ?Sized>(store: &mut S, mut data: &[u8]) -> Resu
             let p = store.page_mut(id)?;
             init_node(p, KIND_OVERFLOW);
             p[6..8].copy_from_slice(&(take as u16).to_le_bytes());
-            p[HDR..HDR + take].copy_from_slice(&data[..take]);
-        // The tail. `read_overflow` never looks past HDR+take and there is no
-        // per-data-page checksum (DESIGN.md §5.4.1), so leaving the previous
-        // tenant's bytes here would be *correct* — and would quietly keep
-        // deleted rows readable in a file that gets copied around. Zero it. For
-        // a full page this slice is empty and costs nothing, which is exactly
-        // the common case.
+            // Fill from the payload's pieces. A piece boundary and a page
+            // boundary have nothing to do with each other, so this loops.
+            let mut filled = 0usize;
+            while filled < take {
+                let chunk = cur
+                    .next_chunk(take - filled)
+                    .ok_or_else(|| corrupt("payload shorter than its own length"))?;
+                p[HDR + filled..HDR + filled + chunk.len()].copy_from_slice(chunk);
+                filled += chunk.len();
+            }
+            // The tail. `read_overflow` never looks past HDR+take and there is no
+            // per-data-page checksum (DESIGN.md §5.4.1), so leaving the previous
+            // tenant's bytes here would be *correct* — and would quietly keep
+            // deleted rows readable in a file that gets copied around. Zero it. For
+            // a full page this slice is empty and costs nothing, which is exactly
+            // the common case.
             p[HDR + take..].fill(0);
             Ok::<(), Error>(())
         })?;
-        data = &data[take..];
+        written += take;
         if first == 0 {
             first = id;
         } else {
@@ -420,7 +432,7 @@ fn write_overflow<S: PageStore + ?Sized>(store: &mut S, mut data: &[u8]) -> Resu
             })?;
         }
         prev = id;
-        if data.is_empty() {
+        if written == total {
             break;
         }
     }
@@ -532,14 +544,94 @@ enum Ins {
     Split { left: u64, sep: Vec<u8>, right: u64, existed: bool },
 }
 
-fn make_leaf_cell(key: &[u8], val: &[u8], overflow_page: u64) -> Vec<u8> {
+/// A row payload that may not be contiguous.
+///
+/// `Parts` is the concatenation of its slices, and it exists so a large value
+/// never has to BE concatenated. `row::encode_row` used to materialise the whole
+/// row — a 16 MiB blob included — into a fresh heap `Vec` whose only purpose was
+/// to be handed here and copied straight back out into overflow pages. That
+/// buffer measured **10.1 ms of a 23.5 ms 16 MiB insert (~42%)**: a fresh malloc
+/// faults its anonymous pages exactly like the file mapping does, and then the
+/// memcpy runs. The blob crossed memory three times and two of them did no work.
+///
+/// The inline path (<= `MAX_INLINE_VAL`, i.e. almost every row) still copies —
+/// the leaf cell must be contiguous — but at <= 1 KiB that is free. The overflow
+/// path consumes the parts straight into the pages.
+///
+/// This is NOT a format change: the pages and cells come out byte-for-byte what
+/// a `Flat` payload of the same bytes produces.
+#[derive(Clone, Copy)]
+pub enum Payload<'a> {
+    Flat(&'a [u8]),
+    /// Logically `parts.concat()`, never actually concatenated.
+    Parts(&'a [&'a [u8]]),
+}
+
+impl<'a> Payload<'a> {
+    pub fn len(&self) -> usize {
+        match self {
+            Payload::Flat(b) => b.len(),
+            Payload::Parts(ps) => ps.iter().map(|p| p.len()).sum(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// The pieces, in order. `Flat` is just a one-piece `Parts`, so every
+    /// consumer below has exactly one code path and the two cannot drift.
+    fn pieces(&self) -> &[&'a [u8]] {
+        match self {
+            Payload::Flat(b) => std::slice::from_ref(b),
+            Payload::Parts(ps) => ps,
+        }
+    }
+}
+
+/// Walks a `Payload`'s bytes, handing out at most `want` at a time without
+/// joining the pieces. `write_overflow` fills fixed-size pages from a stream of
+/// arbitrarily-sized slices, so the two boundaries do not line up.
+struct PayloadCursor<'a> {
+    pieces: &'a [&'a [u8]],
+    ix: usize,
+    off: usize,
+}
+
+impl<'a> PayloadCursor<'a> {
+    fn new(p: &'a Payload<'a>) -> Self {
+        PayloadCursor { pieces: p.pieces(), ix: 0, off: 0 }
+    }
+
+    /// Next run of <= `want` contiguous bytes, or `None` when drained.
+    fn next_chunk(&mut self, want: usize) -> Option<&'a [u8]> {
+        while self.ix < self.pieces.len() {
+            let piece = self.pieces[self.ix];
+            if self.off >= piece.len() {
+                self.ix += 1;
+                self.off = 0;
+                continue;
+            }
+            let take = want.min(piece.len() - self.off);
+            let out = &piece[self.off..self.off + take];
+            self.off += take;
+            return Some(out);
+        }
+        None
+    }
+}
+
+fn make_leaf_cell(key: &[u8], val: &Payload<'_>, overflow_page: u64) -> Vec<u8> {
     let mut c = Vec::with_capacity(3 + key.len() + 2 + val.len().min(MAX_INLINE_VAL));
     c.extend_from_slice(&(key.len() as u16).to_le_bytes());
     if overflow_page == 0 {
         c.push(0);
         c.extend_from_slice(key);
         c.extend_from_slice(&(val.len() as u16).to_le_bytes());
-        c.extend_from_slice(val);
+        // inline only, so <= MAX_INLINE_VAL bytes however many pieces it is
+        for piece in val.pieces() {
+            c.extend_from_slice(piece);
+        }
     } else {
         c.push(1);
         c.extend_from_slice(key);
@@ -651,7 +743,7 @@ fn insert_rec<S: PageStore + ?Sized>(
     store: &mut S,
     page_id: u64,
     key: &[u8],
-    val: &[u8],
+    val: &Payload<'_>,
     mode: InsertMode,
 ) -> Result<Ins> {
     let node_kind = {
@@ -764,11 +856,14 @@ fn insert_rec<S: PageStore + ?Sized>(
     }
 }
 
+/// Insert `key` → `val`. `val` is a [`Payload`] so a large value need never be
+/// concatenated on the way in (#42) — pass `Payload::Flat(bytes)` when it
+/// already is.
 pub fn insert<S: PageStore + ?Sized>(
     store: &mut S,
     root: u64,
     key: &[u8],
-    val: &[u8],
+    val: &Payload<'_>,
     mode: InsertMode,
 ) -> Result<InsertOutcome> {
     if key.len() > MAX_KEY {
@@ -1186,6 +1281,82 @@ mod tests {
     use crate::pagestore::test_store::TestStore;
     use std::collections::BTreeMap;
 
+    /// `Payload::Parts` must be byte-for-byte `Payload::Flat` of the same bytes.
+    ///
+    /// This is the whole safety claim of #42: the parts form exists so a large
+    /// value never has to be concatenated, and it is only sound if the pages it
+    /// writes are indistinguishable. Split at every awkward place — a piece
+    /// boundary and a page boundary have nothing to do with each other, so the
+    /// interesting splits are the ones that land mid-page, mid-header, and on
+    /// exactly `OVERFLOW_CAP`.
+    ///
+    /// Mutation-tested: making `PayloadCursor::next_chunk` return the whole
+    /// remaining piece (ignoring `want`) fails this, and so does dropping the
+    /// `while filled < take` loop in `write_overflow`.
+    #[test]
+    fn parts_payload_is_byte_identical_to_flat() {
+        let mut rng = Rng(0x2A17_BEEF);
+        let big: Vec<u8> = (0..(OVERFLOW_CAP * 3 + 777)).map(|_| rng.next() as u8).collect();
+        // splits that land: mid-first-page, exactly on a page edge, one before,
+        // one after, in the tail, and degenerate (empty pieces at both ends)
+        let splits: &[&[usize]] = &[
+            &[1],
+            &[OVERFLOW_CAP - 1],
+            &[OVERFLOW_CAP],
+            &[OVERFLOW_CAP + 1],
+            &[OVERFLOW_CAP * 3],
+            &[0, big.len()],
+            &[7, OVERFLOW_CAP, OVERFLOW_CAP * 2 + 3, big.len() - 1],
+        ];
+        for (case, cuts) in splits.iter().enumerate() {
+            let mut pieces: Vec<&[u8]> = Vec::new();
+            let mut at = 0usize;
+            for &c in cuts.iter() {
+                pieces.push(&big[at..c]);
+                at = c;
+            }
+            pieces.push(&big[at..]);
+
+            let mut store = TestStore::new();
+            let flat = insert(&mut store, 0, b"flat", &Payload::Flat(&big), InsertMode::InsertOnly)
+                .unwrap()
+                .new_root;
+            let both = insert(
+                &mut store,
+                flat,
+                b"parts",
+                &Payload::Parts(&pieces),
+                InsertMode::InsertOnly,
+            )
+            .unwrap()
+            .new_root;
+            let a = get(&store, both, b"flat").unwrap().unwrap();
+            let b = get(&store, both, b"parts").unwrap().unwrap();
+            assert_eq!(a, big, "case {case}: flat round-trip");
+            assert_eq!(b, big, "case {case}: parts round-trip, cuts {cuts:?}");
+            assert_eq!(a, b, "case {case}: parts != flat");
+        }
+    }
+
+    /// The same, for a value small enough to stay INLINE — a different code path
+    /// in `make_leaf_cell`, and one it would be easy to leave joining only the
+    /// first piece.
+    #[test]
+    fn parts_payload_is_byte_identical_to_flat_when_inline() {
+        let small: Vec<u8> = (0..300u32).map(|i| i as u8).collect();
+        assert!(small.len() <= MAX_INLINE_VAL);
+        let pieces: Vec<&[u8]> = vec![&small[..0], &small[..17], &small[17..298], &small[298..]];
+        let mut store = TestStore::new();
+        let r = insert(&mut store, 0, b"f", &Payload::Flat(&small), InsertMode::InsertOnly)
+            .unwrap()
+            .new_root;
+        let r = insert(&mut store, r, b"p", &Payload::Parts(&pieces), InsertMode::InsertOnly)
+            .unwrap()
+            .new_root;
+        assert_eq!(get(&store, r, b"f").unwrap().unwrap(), small);
+        assert_eq!(get(&store, r, b"p").unwrap().unwrap(), small);
+    }
+
     struct Rng(u64);
     impl Rng {
         fn next(&mut self) -> u64 {
@@ -1224,7 +1395,7 @@ mod tests {
             match rng.next() % 10 {
                 0..=5 => {
                     let v = val_of(&mut rng);
-                    let out = insert(&mut store, root, &k, &v, InsertMode::Upsert).unwrap();
+                    let out = insert(&mut store, root, &k, &Payload::Flat(&v), InsertMode::Upsert).unwrap();
                     root = out.new_root;
                     let prev = model.insert(k.clone(), v);
                     assert_eq!(out.existed, prev.is_some(), "step {step}");
@@ -1259,12 +1430,12 @@ mod tests {
     fn insert_only_reports_duplicates_without_mutation() {
         let mut store = TestStore::new();
         let mut root = 0;
-        root = insert(&mut store, root, b"a", b"1", InsertMode::InsertOnly)
+        root = insert(&mut store, root, b"a", &Payload::Flat(b"1"), InsertMode::InsertOnly)
             .unwrap()
             .new_root;
         store.commit();
         let live_before = store.live_pages();
-        let out = insert(&mut store, root, b"a", b"2", InsertMode::InsertOnly).unwrap();
+        let out = insert(&mut store, root, b"a", &Payload::Flat(b"2"), InsertMode::InsertOnly).unwrap();
         assert!(out.existed);
         assert_eq!(out.new_root, root);
         assert_eq!(store.live_pages(), live_before, "no pages may be touched");
@@ -1280,7 +1451,7 @@ mod tests {
                 &mut store,
                 root,
                 &key_of(i),
-                &i.to_le_bytes(),
+                &Payload::Flat(&i.to_le_bytes()),
                 InsertMode::InsertOnly,
             )
             .unwrap()
@@ -1315,7 +1486,7 @@ mod tests {
         let n = 2000u64;
         for i in 0..n {
             let v = val_of(&mut rng);
-            root = insert(&mut store, root, &key_of(i), &v, InsertMode::Upsert)
+            root = insert(&mut store, root, &key_of(i), &Payload::Flat(&v), InsertMode::Upsert)
                 .unwrap()
                 .new_root;
         }
@@ -1339,13 +1510,13 @@ mod tests {
     fn overflow_values_roundtrip_and_free() {
         let mut store = TestStore::new();
         let big: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
-        let mut root = insert(&mut store, 0, b"big", &big, InsertMode::InsertOnly)
+        let mut root = insert(&mut store, 0, b"big", &Payload::Flat(&big), InsertMode::InsertOnly)
             .unwrap()
             .new_root;
         assert_eq!(get(&store, root, b"big").unwrap().unwrap(), big);
         store.commit();
         // replace with a small value: chain must be freed
-        root = insert(&mut store, root, b"big", b"small", InsertMode::Upsert)
+        root = insert(&mut store, root, b"big", &Payload::Flat(b"small"), InsertMode::Upsert)
             .unwrap()
             .new_root;
         store.commit();
@@ -1361,7 +1532,7 @@ mod tests {
     fn oversized_keys_rejected() {
         let mut store = TestStore::new();
         let k = vec![7u8; MAX_KEY + 1];
-        assert!(insert(&mut store, 0, &k, b"", InsertMode::Upsert).is_err());
+        assert!(insert(&mut store, 0, &k, &Payload::Flat(b""), InsertMode::Upsert).is_err());
     }
 
     #[test]
@@ -1374,7 +1545,7 @@ mod tests {
                 &mut store,
                 root,
                 &key_of(i),
-                b"v",
+                &Payload::Flat(b"v"),
                 InsertMode::InsertOnly,
             )
             .unwrap()
@@ -1384,7 +1555,7 @@ mod tests {
         // TestStore::page_mut errors on non-dirty pages, so any COW violation
         // inside insert/delete would fail these calls
         for i in 0..300u64 {
-            root = insert(&mut store, root, &key_of(i), b"w", InsertMode::Upsert)
+            root = insert(&mut store, root, &key_of(i), &Payload::Flat(b"w"), InsertMode::Upsert)
                 .unwrap()
                 .new_root;
         }

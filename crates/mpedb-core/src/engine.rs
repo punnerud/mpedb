@@ -306,7 +306,7 @@ impl Engine {
             &mut txn,
             0,
             CAT_SCHEMA_KEY,
-            &schema_bytes,
+            &btree::Payload::Flat(&schema_bytes),
             InsertMode::InsertOnly,
         )?;
         txn.catalog_root = out.new_root;
@@ -319,7 +319,7 @@ impl Engine {
                     &mut txn,
                     root,
                     &cat_tree_key(tid as u32, ino),
-                    &[0u8; 16],
+                    &btree::Payload::Flat(&[0u8; 16]),
                     InsertMode::InsertOnly,
                 )?;
                 txn.catalog_root = out.new_root;
@@ -1330,7 +1330,7 @@ impl<'e> WriteTxn<'e> {
         debug_assert!(self.eng.sec_indexes[table_id as usize].is_empty());
         self.check_write_blocked(table_id)?;
         let (root, count) = self.tree_root(table_id, 0)?;
-        let out = btree::insert(self, root, key, payload, InsertMode::InsertOnly)?;
+        let out = btree::insert(self, root, key, &btree::Payload::Flat(payload), InsertMode::InsertOnly)?;
         if out.existed {
             return Ok(false);
         }
@@ -1349,7 +1349,7 @@ impl<'e> WriteTxn<'e> {
         debug_assert!(self.eng.sec_indexes[table_id as usize].is_empty());
         self.check_write_blocked(table_id)?;
         let (root, count) = self.tree_root(table_id, 0)?;
-        let out = btree::insert(self, root, key, payload, InsertMode::Upsert)?;
+        let out = btree::insert(self, root, key, &btree::Payload::Flat(payload), InsertMode::Upsert)?;
         self.set_tree_root(table_id, 0, out.new_root, count);
         self.capture_dirty(table_id, key, DirtyOp::Upsert)?;
         Ok(())
@@ -1379,8 +1379,38 @@ impl<'e> WriteTxn<'e> {
         let tname = table.name.clone();
         let sec = self.eng.sec_indexes[table_id as usize].clone();
         let key = self.eng.pk_key(table_id, values)?;
+        // #42: for a row that will SPILL, hand btree the parts instead of a
+        // buffer. `encode_row` materialises the whole row — a large blob included
+        // — into a fresh heap Vec whose only purpose is to be copied straight
+        // back out into overflow pages; that measured 10.1 ms of a 23.5 ms 16 MiB
+        // insert (~42%), because a fresh malloc faults its anonymous pages just
+        // like the file mapping does.
+        //
+        // Switch on size, and take the size BEFORE encoding: an inline row's leaf
+        // cell has to be contiguous anyway, so the parts form buys it nothing and
+        // its slice-of-slices would be pure overhead on the hot path. Small rows
+        // therefore take EXACTLY the old code path — no regression by
+        // construction rather than by measurement, which matters here because
+        // this box cannot resolve a few percent without ~50 paired runs.
         let __t = std::time::Instant::now();
-        let payload = row::encode_row(values, &self.eng.col_types[table_id as usize])?;
+        let types = &self.eng.col_types[table_id as usize];
+        let spills = row::encoded_len(values, types) > btree::MAX_INLINE_VAL;
+        let flat = if spills { None } else { Some(row::encode_row(values, types)?) };
+        let parts = if spills {
+            Some(row::encode_row_parts(values, types)?)
+        } else {
+            None
+        };
+        let pieces: Vec<&[u8]> = match &parts {
+            Some((head, bodies)) => std::iter::once(head.as_slice())
+                .chain(bodies.iter().copied())
+                .collect(),
+            None => Vec::new(),
+        };
+        let payload = match &flat {
+            Some(b) => btree::Payload::Flat(b),
+            None => btree::Payload::Parts(&pieces),
+        };
         leakstat::add(&leakstat::INS_NS_ENCODE, __t.elapsed().as_nanos() as u64);
 
         // UNIQUE pre-check on secondary indexes before mutating anything, so
@@ -1418,7 +1448,7 @@ impl<'e> WriteTxn<'e> {
             let ino = (i + 1) as u32;
             let (iroot, icount) = self.tree_root(table_id, ino)?;
             let ikey = keycode::encode_key(std::slice::from_ref(v));
-            let out = btree::insert(self, iroot, &ikey, &key, InsertMode::InsertOnly)?;
+            let out = btree::insert(self, iroot, &ikey, &btree::Payload::Flat(&key), InsertMode::InsertOnly)?;
             if out.existed {
                 // pre-check passed, so this is engine inconsistency
                 return Err(Error::Internal("unique index race within txn".into()));
@@ -1507,7 +1537,7 @@ impl<'e> WriteTxn<'e> {
         }
 
         let payload = row::encode_row(new_values, &self.eng.col_types[table_id as usize])?;
-        let out = btree::insert(self, root, &key, &payload, InsertMode::Upsert)?;
+        let out = btree::insert(self, root, &key, &btree::Payload::Flat(&payload), InsertMode::Upsert)?;
         self.set_tree_root(table_id, 0, out.new_root, count);
 
         for (i, &col) in sec.iter().enumerate() {
@@ -1528,7 +1558,7 @@ impl<'e> WriteTxn<'e> {
             }
             if !nv.is_null() {
                 let nkey = keycode::encode_key(std::slice::from_ref(nv));
-                let out = btree::insert(self, iroot, &nkey, &key, InsertMode::InsertOnly)?;
+                let out = btree::insert(self, iroot, &nkey, &btree::Payload::Flat(&key), InsertMode::InsertOnly)?;
                 if out.existed {
                     return Err(Error::Internal("unique index race within txn".into()));
                 }
@@ -1638,7 +1668,7 @@ impl<'e> WriteTxn<'e> {
 
     pub fn sys_put(&mut self, subkey: &[u8], value: &[u8]) -> Result<()> {
         let root = self.catalog_root;
-        let out = btree::insert(self, root, &sys_key(subkey), value, InsertMode::Upsert)?;
+        let out = btree::insert(self, root, &sys_key(subkey), &btree::Payload::Flat(value), InsertMode::Upsert)?;
         self.catalog_root = out.new_root;
         Ok(())
     }
@@ -1852,7 +1882,7 @@ impl<'e> WriteTxn<'e> {
                 &mut self,
                 cat_root,
                 &cat_tree_key(tid, ino),
-                &val,
+                &btree::Payload::Flat(&val),
                 InsertMode::Upsert,
             )?;
             self.catalog_root = out.new_root;
@@ -1919,7 +1949,7 @@ impl<'e> WriteTxn<'e> {
                     for &id in ids {
                         val.extend_from_slice(&id.to_le_bytes());
                     }
-                    btree::insert(&mut self, fl_root, k, &val, InsertMode::Upsert)?.new_root
+                    btree::insert(&mut self, fl_root, k, &btree::Payload::Flat(&val), InsertMode::Upsert)?.new_root
                 };
             }
             leakstat::add(&leakstat::COMMIT_ENTRIES, plan.len() as u64);
@@ -3214,7 +3244,7 @@ mod debug_tests {
             let (root, _) = w.tree_root(0, 0).unwrap();
             let pk = keycode::encode_key(&[Value::Int(key)]);
             let s = Instant::now();
-            let out = btree::insert(&mut w, root, &pk, &payload, InsertMode::Upsert).unwrap();
+            let out = btree::insert(&mut w, root, &pk, &btree::Payload::Flat(&payload), InsertMode::Upsert).unwrap();
             t_write += s.elapsed().as_nanos();
             w.set_tree_root(0, 0, out.new_root, 0);
             w.abort();

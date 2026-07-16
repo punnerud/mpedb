@@ -32,8 +32,13 @@ fn bitmap_len(ncols: usize) -> usize {
 /// The fix is a scatter-gather payload so the overflow path consumes the row's
 /// parts without concatenating them; see task #42. Not a format change — the
 /// pages come out byte-for-byte identical.
-pub fn encode_row(values: &[Value], types: &[ColumnType]) -> Result<Vec<u8>> {
-    debug_assert_eq!(values.len(), types.len());
+/// The byte length `encode_row` would produce, without encoding anything.
+///
+/// Lets a caller pick the payload form by size (#42) before paying for either:
+/// an inline row wants the flat buffer its leaf cell needs anyway, a spilling
+/// one wants the parts. `encode_row` sums the same thing internally, so this is
+/// not extra work being invented — it is that sum, hoisted.
+pub fn encoded_len(values: &[Value], types: &[ColumnType]) -> usize {
     let nbm = bitmap_len(types.len());
     let fixed_total: usize = types.iter().map(|&t| fixed_width(t)).sum();
     let var_total: usize = values
@@ -44,20 +49,31 @@ pub fn encode_row(values: &[Value], types: &[ColumnType]) -> Result<Vec<u8>> {
             _ => 0,
         })
         .sum();
-    let mut buf = vec![0u8; nbm + fixed_total];
-    buf.reserve(var_total);
+    nbm + fixed_total + var_total
+}
+
+pub fn encode_row_parts<'a>(
+    values: &'a [Value],
+    types: &[ColumnType],
+) -> Result<(Vec<u8>, Vec<&'a [u8]>)> {
+    debug_assert_eq!(values.len(), types.len());
+    let nbm = bitmap_len(types.len());
+    let fixed_total: usize = types.iter().map(|&t| fixed_width(t)).sum();
+    let mut head = vec![0u8; nbm + fixed_total];
+    let mut bodies: Vec<&'a [u8]> = Vec::new();
+    let mut var_len = 0usize; // running length of the varlen section
     let mut off = nbm;
     for (i, (v, &ty)) in values.iter().zip(types).enumerate() {
         let w = fixed_width(ty);
         match v {
-            Value::Null => buf[i / 8] |= 1 << (i % 8),
+            Value::Null => head[i / 8] |= 1 << (i % 8),
             Value::Int(x) | Value::Timestamp(x) => {
-                buf[off..off + 8].copy_from_slice(&x.to_le_bytes())
+                head[off..off + 8].copy_from_slice(&x.to_le_bytes())
             }
-            Value::Float(x) => buf[off..off + 8].copy_from_slice(&x.to_bits().to_le_bytes()),
-            Value::Bool(x) => buf[off] = *x as u8,
+            Value::Float(x) => head[off..off + 8].copy_from_slice(&x.to_bits().to_le_bytes()),
+            Value::Bool(x) => head[off] = *x as u8,
             Value::Text(_) | Value::Blob(_) => {
-                let bytes: &[u8] = match v {
+                let bytes: &'a [u8] = match v {
                     Value::Text(s) => s.as_bytes(),
                     Value::Blob(b) => b,
                     _ => unreachable!(),
@@ -65,10 +81,10 @@ pub fn encode_row(values: &[Value], types: &[ColumnType]) -> Result<Vec<u8>> {
                 if bytes.len() > u32::MAX as usize {
                     return Err(Error::Unsupported("value larger than 4 GiB".into()));
                 }
-                let var_off = (buf.len() - (nbm + fixed_total)) as u32;
-                buf[off..off + 4].copy_from_slice(&var_off.to_le_bytes());
-                buf[off + 4..off + 8].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
-                buf.extend_from_slice(bytes);
+                head[off..off + 4].copy_from_slice(&(var_len as u32).to_le_bytes());
+                head[off + 4..off + 8].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+                var_len += bytes.len();
+                bodies.push(bytes);
             }
             // A context list is param-only (DESIGN-MULTIDB §2.6): it has no
             // ColumnType, so `fits` rejects it from every column and
@@ -83,6 +99,23 @@ pub fn encode_row(values: &[Value], types: &[ColumnType]) -> Result<Vec<u8>> {
             }
         }
         off += w;
+    }
+    Ok((head, bodies))
+}
+
+/// Encode a full row into one contiguous buffer.
+///
+/// A thin wrapper over [`encode_row_parts`] ON PURPOSE: the two must produce the
+/// same bytes, and the only way to guarantee that is for one to be the other.
+/// Prefer the parts form for anything that might be large — this one has to
+/// materialise the whole row, and for a big value that malloc + memcpy measured
+/// **10.1 ms of a 23.5 ms 16 MiB insert (~42%)** before #42 (the fresh heap
+/// pages fault exactly like the file mapping does).
+pub fn encode_row(values: &[Value], types: &[ColumnType]) -> Result<Vec<u8>> {
+    let (mut buf, bodies) = encode_row_parts(values, types)?;
+    buf.reserve(bodies.iter().map(|b| b.len()).sum::<usize>());
+    for b in bodies {
+        buf.extend_from_slice(b);
     }
     Ok(buf)
 }
