@@ -81,8 +81,9 @@ fn tampered_footprint_byte_is_rejected() {
     // Footprint starts right after: format(1) + schema(32) + nparams(2)
     // + param tags(n) + context_keys count(2, none here)
     // + npolicies(2) + npolicies * (table 4 + epoch 8 + hash 32)
-    // + nconsts(2) + consts.
+    // + nconsts(2) + consts + subplan count(1, none here).
     assert!(p.context_keys.is_empty());
+    assert!(p.subplans.is_empty());
     let mut off =
         1 + 32 + 2 + p.param_types.len() + 2 + 2 + p.policies.len() * (4 + 8 + 32) + 2;
     for c in &p.consts {
@@ -90,6 +91,7 @@ fn tampered_footprint_byte_is_rejected() {
         write_value(&mut tmp, c);
         off += tmp.len();
     }
+    off += 1; // subplan count byte
     // Flip the low bit of tables_read: decode must catch the forgery.
     let mut evil = bytes.clone();
     evil[off] ^= 1;

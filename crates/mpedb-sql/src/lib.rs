@@ -29,7 +29,7 @@ pub use ddl::{CreatePolicySpec, DdlStmt, RlsAction};
 pub use plan::{
     AccessPath, AggCall, Aggregation, CompiledPlan, CompoundPlan, ConflictProbe, InsertSource,
     Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp, Projection, SelectPlan,
-    SetOp,
+    SetOp, SubPlan,
 };
 pub use planner::secondary_indexes;
 pub use policy::{table_policy_hash, PolicyCatalog, TablePolicies};

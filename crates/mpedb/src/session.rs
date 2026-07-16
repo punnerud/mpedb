@@ -113,14 +113,15 @@ pub(crate) fn resolve_params<'a>(
 ) -> Result<std::borrow::Cow<'a, [Value]>> {
     let total = plan.n_params as usize;
     let n_ctx = plan.context_keys.len();
-    let n_user = total - n_ctx;
+    let n_sub = plan.subplans.len();
+    let n_user = total - n_ctx - n_sub;
     if user_params.len() != n_user {
         return Err(Error::WrongParamCount {
             expected: n_user,
             got: user_params.len(),
         });
     }
-    if n_ctx == 0 {
+    if n_ctx == 0 && n_sub == 0 {
         // #40, fixed 2026-07-16: this used to be `to_vec()`, which DEEP-clones
         // every Value — a `Blob(Vec<u8>)` copied in full, 2.49 ms of a 12.1 ms
         // 16 MiB insert (measured with `examples/blob_warm --features
@@ -131,6 +132,10 @@ pub(crate) fn resolve_params<'a>(
     }
     let mut full = Vec::with_capacity(total);
     full.extend_from_slice(user_params);
+    // The reserved subplan-result slots sit between the user params and the
+    // context slots; the EXECUTOR fills them (uncorrelated: once up front,
+    // correlated: per outer row) — here they are holes.
+    full.resize(n_user + n_sub, Value::Null);
     for (p, key) in plan.context_keys.iter().enumerate() {
         let value = session.get(key).ok_or_else(|| {
             Error::Bind(format!(

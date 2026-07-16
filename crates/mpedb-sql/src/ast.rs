@@ -164,6 +164,14 @@ pub(crate) enum Expr {
     Like(Box<Expr>, Box<Expr>),
     /// `CAST(x AS <type>)`.
     Cast(Box<Expr>, mpedb_types::ColumnType),
+    /// `(SELECT …)` — a scalar subquery: one output column; 0 rows = NULL,
+    /// more than one row is a runtime error (PostgreSQL's rule — sqlite
+    /// silently takes the first row). The planner lifts it out into the
+    /// plan's subplan table and replaces this node with a reserved parameter.
+    Subquery(Box<SelectStmt>),
+    /// `[NOT] EXISTS (SELECT …)` — did the subquery produce any row. The
+    /// bool is `negated`.
+    Exists(Box<SelectStmt>, bool),
     /// `current_setting('key')` — a session-context value, bound to a reserved
     /// parameter filled from the caller's [`Session`](mpedb) at execute time
     /// (DESIGN-MULTIDB.md §2.1). The value never enters the plan bytes, so one

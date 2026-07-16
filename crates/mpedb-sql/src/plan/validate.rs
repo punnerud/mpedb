@@ -7,8 +7,9 @@ impl CompiledPlan {
     /// (recomputed from scratch and compared, so a forged footprint in an
     /// otherwise well-formed blob is rejected).
     pub(crate) fn validate(&self, schema: &Schema) -> Result<()> {
+        let ptypes = &self.param_types;
         match &self.stmt {
-            PlanStmt::Select(sp) => self.validate_select(sp, schema)?,
+            PlanStmt::Select(sp) => self.validate_select(sp, schema, ptypes)?,
             PlanStmt::Compound(c) => {
                 if !(2..=MAX_COMPOUND_ARMS).contains(&c.arms.len()) {
                     return Err(corrupt("compound arm count out of range"));
@@ -29,10 +30,16 @@ impl CompiledPlan {
                     {
                         return Err(corrupt("compound arm carries its own ORDER BY/LIMIT"));
                     }
+                    // Arms run through the plain executor, which never fills
+                    // correlated slots — a post-filter there would be
+                    // silently ignored, so its presence is forgery.
+                    if arm.post_filter.is_some() {
+                        return Err(corrupt("compound arm carries a post-filter"));
+                    }
                     if arm.projection.len() != arity {
                         return Err(corrupt("compound arms disagree on output arity"));
                     }
-                    self.validate_select(arm, schema)?;
+                    self.validate_select(arm, schema, ptypes)?;
                 }
                 for (i, _) in &c.order_by {
                     if *i as usize >= arity {
@@ -42,10 +49,17 @@ impl CompiledPlan {
             }
             _other => self.validate_rest(schema)?,
         }
+        if !self.subplans.is_empty() {
+            self.validate_subplans(schema)?;
+        } else if let PlanStmt::Select(sp) = &self.stmt {
+            if sp.post_filter.is_some() {
+                return Err(corrupt("post-filter without subplans"));
+            }
+        }
         // Footprint consistency for EVERY statement kind: recomputed from
         // scratch and compared, so a forged footprint in an otherwise
         // well-formed blob is rejected.
-        let recomputed = planner::compute_footprint(&self.stmt, schema)?;
+        let recomputed = planner::compute_footprint(&self.stmt, &self.subplans, schema)?;
         if recomputed != self.footprint {
             return Err(corrupt("plan footprint does not match its statement"));
         }
@@ -54,7 +68,12 @@ impl CompiledPlan {
 
     /// Everything `validate` checks about one SELECT — shared verbatim between
     /// a top-level SELECT and each compound arm, so the two can never drift.
-    fn validate_select(&self, sp: &SelectPlan, schema: &Schema) -> Result<()> {
+    fn validate_select(
+        &self,
+        sp: &SelectPlan,
+        schema: &Schema,
+        ptypes: &[Option<ColumnType>],
+    ) -> Result<()> {
         let get_table = |id: u32| {
             schema
                 .table(id)
@@ -93,7 +112,7 @@ impl CompiledPlan {
                         return Err(corrupt("order-junk columns leave no output"));
                     }
                 }
-                self.check_access(access, t, None)?;
+                self.check_access(access, t, None, ptypes)?;
                 // With a join the "base row" IS the joined row, so every width
                 // below moves. Getting this wrong is not cosmetic: a program
                 // bounded against the outer's width alone could not name the
@@ -116,20 +135,26 @@ impl CompiledPlan {
                     t.columns.iter().map(|c| c.ty).collect();
                 for j in joins {
                     let jt = get_table(j.table)?;
-                    self.check_access(&j.access, jt, Some(&acc_types))?;
+                    self.check_access(&j.access, jt, Some(&acc_types), ptypes)?;
                     if let Some(p) = &j.policy {
-                        self.check_program(p, jt)?;
+                        self.check_program(p, jt, ptypes)?;
                     }
                     acc_width += jt.columns.len();
                     acc_types.extend(jt.columns.iter().map(|c| c.ty));
-                    self.check_program_width(&j.on, acc_width)?;
+                    self.check_program_width(&j.on, acc_width, ptypes)?;
                 }
                 let base_width = acc_width; // the full joined row
                 if let Some(jf) = joined_filter {
                     if joins.is_empty() {
                         return Err(corrupt("joined filter without a join"));
                     }
-                    self.check_program_width(jf, base_width)?;
+                    self.check_program_width(jf, base_width, ptypes)?;
+                }
+                if let Some(pf) = &sp.post_filter {
+                    // Over the base (joined) row; it may read correlated
+                    // subplan slots — the per-program discipline for the
+                    // GATHER-side programs is enforced in `validate`.
+                    self.check_program_width(pf, base_width, ptypes)?;
                 }
                 // The sort key is an index into whichever tuple `order_over`
                 // names, and those have different widths. Bounding it against
@@ -146,7 +171,7 @@ impl CompiledPlan {
                 };
                 if let Some(f) = filter {
                     // The OUTER's policy/residual, over the outer row alone.
-                    self.check_program(f, t)?;
+                    self.check_program(f, t, ptypes)?;
                 }
                 if let Some(a) = aggregate {
                     // GROUP BY columns and aggregate ARGUMENTS index the BASE
@@ -163,7 +188,7 @@ impl CompiledPlan {
                     }
                     for c in &a.aggs {
                         if let Some(p) = &c.arg {
-                            self.check_program_width(p, base_width)?;
+                            self.check_program_width(p, base_width, ptypes)?;
                         }
                     }
                     let out_width = a.group_by.len() + a.aggs.len();
@@ -171,7 +196,7 @@ impl CompiledPlan {
                         return Err(corrupt("aggregation with no groups and no aggregates"));
                     }
                     if let Some(h) = &a.having {
-                        self.check_program_width(h, out_width)?;
+                        self.check_program_width(h, out_width, ptypes)?;
                     }
                     for p in projection {
                         match p {
@@ -183,7 +208,7 @@ impl CompiledPlan {
                                 }
                             }
                             Projection::Expr { program, .. } => {
-                                self.check_program_width(program, out_width)?
+                                self.check_program_width(program, out_width, ptypes)?
                             }
                         }
                     }
@@ -203,7 +228,7 @@ impl CompiledPlan {
                             }
                         }
                         Projection::Expr { program, .. } => {
-                            self.check_program_width(program, base_width)?
+                            self.check_program_width(program, base_width, ptypes)?
                         }
                     }
                 }
@@ -226,6 +251,7 @@ impl CompiledPlan {
     /// The DML/txn arms of `validate` — split from the SELECT/compound arms
     /// only so `validate_select` can be shared with compound arms.
     fn validate_rest(&self, schema: &Schema) -> Result<()> {
+        let ptypes = &self.param_types;
         let get_table = |id: u32| {
             schema
                 .table(id)
@@ -274,21 +300,21 @@ impl CompiledPlan {
                             if *c as usize >= t.columns.len() {
                                 return Err(corrupt("ON CONFLICT SET column out of range"));
                             }
-                            self.check_doubled_program(p, t)?;
+                            self.check_doubled_program(p, t, ptypes)?;
                         }
                         if let Some(f) = filter {
-                            self.check_doubled_program(f, t)?;
+                            self.check_doubled_program(f, t, ptypes)?;
                         }
                     }
                 }
                 if let Some(r) = returning {
-                    self.check_projection(r, t)?;
+                    self.check_projection(r, t, ptypes)?;
                 }
                 if rows.is_empty() {
                     return Err(corrupt("INSERT plan with no rows"));
                 }
                 if let Some(w) = with_check {
-                    self.check_program(w, t)?;
+                    self.check_program(w, t, ptypes)?;
                 }
                 for row in rows {
                     if row.len() != t.columns.len() {
@@ -338,14 +364,14 @@ impl CompiledPlan {
             } => {
                 let t = get_table(*table)?;
                 if let Some(r) = returning {
-                    self.check_projection(r, t)?;
+                    self.check_projection(r, t, ptypes)?;
                 }
-                self.check_access(access, t, None)?;
+                self.check_access(access, t, None, ptypes)?;
                 if let Some(f) = filter {
-                    self.check_program(f, t)?;
+                    self.check_program(f, t, ptypes)?;
                 }
                 if let Some(w) = with_check {
-                    self.check_program(w, t)?;
+                    self.check_program(w, t, ptypes)?;
                 }
                 if set.is_empty() {
                     return Err(corrupt("UPDATE plan with empty SET"));
@@ -363,7 +389,7 @@ impl CompiledPlan {
                         return Err(corrupt("duplicate SET column"));
                     }
                     seen[ci] = true;
-                    self.check_program(program, t)?;
+                    self.check_program(program, t, ptypes)?;
                 }
             }
             PlanStmt::Delete {
@@ -373,12 +399,12 @@ impl CompiledPlan {
                 returning,
             } => {
                 let t = get_table(*table)?;
-                self.check_access(access, t, None)?;
+                self.check_access(access, t, None, ptypes)?;
                 if let Some(r) = returning {
-                    self.check_projection(r, t)?;
+                    self.check_projection(r, t, ptypes)?;
                 }
                 if let Some(f) = filter {
-                    self.check_program(f, t)?;
+                    self.check_program(f, t, ptypes)?;
                 }
             }
             PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => {}
@@ -386,7 +412,136 @@ impl CompiledPlan {
         Ok(())
     }
 
-    fn check_program(&self, p: &ExprProgram, t: &TableDef) -> Result<()> {
+    /// The subplan table's own rules (#56). The load-bearing one is the SLOT
+    /// DISCIPLINE: a CORRELATED subplan's result slot is filled per outer row
+    /// by the executor's post-phase, so a gather-side program (access parts,
+    /// filter, join on/policy, joined_filter, aggregate args/HAVING) reading
+    /// it would read an unfilled hole. Uncorrelated slots are filled once
+    /// before access resolution and are legal everywhere.
+    fn validate_subplans(&self, schema: &Schema) -> Result<()> {
+        let PlanStmt::Select(outer) = &self.stmt else {
+            return Err(corrupt("subplans on a non-SELECT statement"));
+        };
+        if self.subplans.len() > MAX_SUBPLANS {
+            return Err(corrupt("too many subplans in plan"));
+        }
+        let n_ctx = self.context_keys.len();
+        if self.subplans.len() + n_ctx > self.n_params as usize {
+            return Err(corrupt("more reserved slots than parameters"));
+        }
+        let sub_base = self.subplan_base() as usize;
+        let get_table = |id: u32| {
+            schema
+                .table(id)
+                .ok_or_else(|| corrupt(format!("table id {id} out of range")))
+        };
+        // The outer base row: `[table0 ‖ … ‖ tableN]` types, for outer_args.
+        let mut outer_types: Vec<ColumnType> = Vec::new();
+        for id in std::iter::once(outer.table).chain(outer.joins.iter().map(|j| j.table)) {
+            outer_types.extend(get_table(id)?.columns.iter().map(|c| c.ty));
+        }
+
+        let correlated: Vec<bool> =
+            self.subplans.iter().map(|s| !s.outer_args.is_empty()).collect();
+        let any_correlated = correlated.iter().any(|&c| c);
+        // Aggregation consumes rows inside the gather phase; per-row slot
+        // filling happens after it. The planner refuses the combination —
+        // a blob claiming it is forged.
+        if any_correlated && outer.aggregate.is_some() {
+            return Err(corrupt("correlated subplans in an aggregate statement"));
+        }
+
+        let gather_ok = |p: &ExprProgram| -> Result<()> {
+            for i in &p.instrs {
+                if let Instr::PushParam(pi) = *i {
+                    let pi = pi as usize;
+                    if (sub_base..sub_base + self.subplans.len()).contains(&pi)
+                        && correlated[pi - sub_base]
+                    {
+                        return Err(corrupt(
+                            "gather-side program reads a correlated subplan slot",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        };
+        let key_parts_ok = |a: &AccessPath| -> Result<()> {
+            let mut check = |p: &KeyPart| -> Result<()> {
+                if let KeyPart::Param(i) = p {
+                    let i = *i as usize;
+                    if (sub_base..sub_base + self.subplans.len()).contains(&i)
+                        && correlated[i - sub_base]
+                    {
+                        return Err(corrupt("access path reads a correlated subplan slot"));
+                    }
+                }
+                Ok(())
+            };
+            match a {
+                AccessPath::FullScan => Ok(()),
+                AccessPath::PkPoint(parts) => parts.iter().try_for_each(&mut check),
+                AccessPath::PkRange { lo, hi } => [lo, hi]
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|b| b.parts.iter())
+                    .try_for_each(&mut check),
+                AccessPath::IndexPoint { part, .. } => check(part),
+                AccessPath::IndexRange { lo, hi, .. } => [lo, hi]
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|b| b.parts.iter())
+                    .try_for_each(&mut check),
+            }
+        };
+        key_parts_ok(&outer.access)?;
+        if let Some(f) = &outer.filter {
+            gather_ok(f)?;
+        }
+        if let Some(f) = &outer.joined_filter {
+            gather_ok(f)?;
+        }
+        for j in &outer.joins {
+            key_parts_ok(&j.access)?;
+            gather_ok(&j.on)?;
+            if let Some(p) = &j.policy {
+                gather_ok(p)?;
+            }
+        }
+
+        for s in &self.subplans {
+            for &a in &s.outer_args {
+                if a as usize >= outer_types.len() {
+                    return Err(corrupt("subplan correlation arg out of the outer row"));
+                }
+            }
+            // A scalar subquery IS one value; EXISTS ignores its projection.
+            if !s.exists && s.plan.projection.len() - s.plan.order_junk as usize != 1 {
+                return Err(corrupt("scalar subplan must output exactly one column"));
+            }
+            // Subplans run through the plain executor too — see the arm rule.
+            if s.plan.post_filter.is_some() {
+                return Err(corrupt("subplan carries a post-filter"));
+            }
+            // The inner parameter space: [user params ‖ correlation args] —
+            // its own bound AND its own types (a correlation slot has the
+            // OUTER column's type, not whatever occupies that index in the
+            // outer layout).
+            let mut inner_types: Vec<Option<ColumnType>> =
+                self.param_types[..sub_base].to_vec();
+            inner_types
+                .extend(s.outer_args.iter().map(|&a| Some(outer_types[a as usize])));
+            self.validate_select(&s.plan, schema, &inner_types)?;
+        }
+        Ok(())
+    }
+
+    fn check_program(
+        &self,
+        p: &ExprProgram,
+        t: &TableDef,
+        ptypes: &[Option<ColumnType>],
+    ) -> Result<()> {
         // Stack discipline and const-pool indices were proven by
         // ExprProgram::new/decode; column and parameter indices are ours.
         for i in &p.instrs {
@@ -394,7 +549,7 @@ impl CompiledPlan {
                 Instr::PushCol(c) if c as usize >= t.columns.len() => {
                     return Err(corrupt("expression column out of range"));
                 }
-                Instr::PushParam(pi) if pi >= self.n_params => {
+                Instr::PushParam(pi) if pi as usize >= ptypes.len() => {
                     return Err(corrupt("expression param out of range"));
                 }
                 _ => {}
@@ -405,7 +560,12 @@ impl CompiledPlan {
 
     /// Validate a `RETURNING` projection: column indices in range, and any
     /// expression's own indices too.
-    fn check_projection(&self, proj: &[Projection], t: &TableDef) -> Result<()> {
+    fn check_projection(
+        &self,
+        proj: &[Projection],
+        t: &TableDef,
+        ptypes: &[Option<ColumnType>],
+    ) -> Result<()> {
         for p in proj {
             match p {
                 Projection::Column(i) => {
@@ -413,7 +573,7 @@ impl CompiledPlan {
                         return Err(corrupt("RETURNING column out of range"));
                     }
                 }
-                Projection::Expr { program, .. } => self.check_program(program, t)?,
+                Projection::Expr { program, .. } => self.check_program(program, t, ptypes)?,
             }
         }
         Ok(())
@@ -421,13 +581,18 @@ impl CompiledPlan {
 
     /// Bound a program's column indices by an arbitrary tuple width — for the
     /// GROUPED tuple `[keys ‖ aggs]`, which is not a table's row.
-    fn check_program_width(&self, p: &ExprProgram, width: usize) -> Result<()> {
+    fn check_program_width(
+        &self,
+        p: &ExprProgram,
+        width: usize,
+        ptypes: &[Option<ColumnType>],
+    ) -> Result<()> {
         for i in &p.instrs {
             match *i {
                 Instr::PushCol(c) if c as usize >= width => {
                     return Err(corrupt("expression column out of range"));
                 }
-                Instr::PushParam(pi) if pi >= self.n_params => {
+                Instr::PushParam(pi) if pi as usize >= ptypes.len() => {
                     return Err(corrupt("expression param out of range"));
                 }
                 _ => {}
@@ -441,14 +606,19 @@ impl CompiledPlan {
     /// legal. `check_program` would reject those as out of range, so the bound
     /// here is 2n — but still a bound: a hostile plan must not read past the
     /// doubled row either.
-    fn check_doubled_program(&self, p: &ExprProgram, t: &TableDef) -> Result<()> {
+    fn check_doubled_program(
+        &self,
+        p: &ExprProgram,
+        t: &TableDef,
+        ptypes: &[Option<ColumnType>],
+    ) -> Result<()> {
         let limit = t.columns.len() * 2;
         for i in &p.instrs {
             match *i {
                 Instr::PushCol(c) if c as usize >= limit => {
                     return Err(corrupt("ON CONFLICT expression column out of range"));
                 }
-                Instr::PushParam(pi) if pi >= self.n_params => {
+                Instr::PushParam(pi) if pi as usize >= ptypes.len() => {
                     return Err(corrupt("expression param out of range"));
                 }
                 _ => {}
@@ -467,13 +637,14 @@ impl CompiledPlan {
         p: &KeyPart,
         ty: ColumnType,
         outer: Option<&[ColumnType]>,
+        ptypes: &[Option<ColumnType>],
     ) -> Result<()> {
         match p {
             KeyPart::Param(i) => {
-                if *i >= self.n_params {
+                let Some(pt) = ptypes.get(*i as usize) else {
                     return Err(corrupt("key param out of range"));
-                }
-                if self.param_types[*i as usize] != Some(ty) {
+                };
+                if *pt != Some(ty) {
                     return Err(corrupt("key param type mismatch"));
                 }
             }
@@ -506,6 +677,7 @@ impl CompiledPlan {
         a: &AccessPath,
         t: &TableDef,
         outer: Option<&[ColumnType]>,
+        ptypes: &[Option<ColumnType>],
     ) -> Result<()> {
         match a {
             AccessPath::FullScan => Ok(()),
@@ -514,7 +686,7 @@ impl CompiledPlan {
                     return Err(corrupt("PkPoint part count != PK column count"));
                 }
                 for (part, &pk_col) in parts.iter().zip(&t.primary_key) {
-                    self.check_key_part(part, t.columns[pk_col as usize].ty, outer)?;
+                    self.check_key_part(part, t.columns[pk_col as usize].ty, outer, ptypes)?;
                 }
                 Ok(())
             }
@@ -527,7 +699,7 @@ impl CompiledPlan {
                     if bound.parts.len() != 1 {
                         return Err(corrupt("Phase 1 PkRange bound must have exactly one part"));
                     }
-                    self.check_key_part(&bound.parts[0], first_ty, outer)?;
+                    self.check_key_part(&bound.parts[0], first_ty, outer, ptypes)?;
                 }
                 Ok(())
             }
@@ -538,7 +710,7 @@ impl CompiledPlan {
                     return Err(corrupt("index_no out of range"));
                 }
                 let col = sec[no - 1];
-                self.check_key_part(part, t.columns[col as usize].ty, outer)
+                self.check_key_part(part, t.columns[col as usize].ty, outer, ptypes)
             }
             AccessPath::IndexRange { index_no, lo, hi } => {
                 let sec = crate::planner::secondary_indexes(t);
@@ -554,7 +726,7 @@ impl CompiledPlan {
                     if bound.parts.len() != 1 {
                         return Err(corrupt("IndexRange bound must have exactly one part"));
                     }
-                    self.check_key_part(&bound.parts[0], ty, outer)?;
+                    self.check_key_part(&bound.parts[0], ty, outer, ptypes)?;
                 }
                 Ok(())
             }

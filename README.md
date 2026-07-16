@@ -46,10 +46,10 @@ validate rather than hope about.
 **What it is not: a drop-in sqlite3.** Be clear-eyed about this before you plan
 around it. mpedb's SQL is a real subset that keeps growing — aggregates,
 `GROUP BY`/`HAVING`, `DISTINCT`, N-way `INNER JOIN` chains with aliases and
-self-joins, `LEFT JOIN`, `CROSS JOIN`, `UNION`/`EXCEPT`/`INTERSECT`, and
-secondary indexes the planner actually uses are in — but there are no
-subqueries, no `RIGHT`/`FULL` joins, and no `CREATE TABLE` yet (the live-DDL
-plan is [`DESIGN-DDL.md`](DESIGN-DDL.md)) — so
+self-joins, `LEFT JOIN`, `CROSS JOIN`, `UNION`/`EXCEPT`/`INTERSECT`, scalar
+and `EXISTS` subqueries (correlated included), and secondary indexes the
+planner actually uses are in — but there are no `RIGHT`/`FULL` joins and no
+`CREATE TABLE` yet (the live-DDL plan is [`DESIGN-DDL.md`](DESIGN-DDL.md)) — so
 a Django test suite will not run against it. Today mpedb is a validation and
 staging tool in that workflow, not the thing your ORM talks to. See
 [SQL support](#sql-support) for the exact surface, measured against the binary.
@@ -261,12 +261,12 @@ content-hashed plan; the surface is deliberately narrow, and the narrowness is
 the design rather than a todo list.
 
 It is also measured against sqlite's own **sqllogictest corpus** (the
-`sqlite_corpus` runner in `crates/mpedb-testkit`): ~99% of the random query
-corpus now executes, with **zero wrong answers and zero error mismatches**
-across every statement both engines accept — every miss is a refused feature,
-never a different result. What remains there is `RIGHT`/`FULL` joins (queued:
-the plan format already reserves their tags); subqueries alone hold the
-classic `select1–3` files at ~49% and are the next target.
+`sqlite_corpus` runner in `crates/mpedb-testkit`): the classic `select1–3`
+files pass at **100%**, the random query corpus at ~99%, with **zero wrong
+answers and zero error mismatches** across every statement both engines
+accept — every miss is a refused feature, never a different result. What
+remains is `RIGHT`/`FULL` joins (queued: the plan format already reserves
+their tags).
 
 | | mpedb | note |
 |---|---|---|
@@ -292,7 +292,8 @@ classic `select1–3` files at ~49% and are the next target.
 | Secondary indexes: `unique = true` and non-unique `indexed = true` | ✅ | equality and range (`IndexScan`/`IndexRange`) — `EXPLAIN` shows which |
 | Loose typing per column: `type = "any"` | ✅ | refused in keys and `UNIQUE`; the mirror pre-flight refuses pushing it to PG |
 | **`RIGHT`/`FULL` joins** | ❌ | refused by name (`RIGHT` comes with the hint: swap the tables, write `LEFT`); queued — the plan format reserves their tags |
-| **Subqueries, `EXISTS`, cross-FILE refs** | ❌ | not yet — planned (uncorrelated subplans first) |
+| Scalar subqueries `(SELECT …)`, `[NOT] EXISTS (…)` — uncorrelated AND correlated | ✅ | one output column; 0 rows → NULL; **>1 row errors** (PG's rule — sqlite silently takes the first); correlated references become inner-plan parameters, the `OuterCol` idea applied to a whole plan |
+| **Cross-FILE refs** | ❌ | planned (workspace read-joins) |
 | **`CREATE TABLE` / `ALTER`** | ❌ | today: schema comes from the config or `mirror import`; live DDL is designed in [`DESIGN-DDL.md`](DESIGN-DDL.md) |
 
 **Joins, and what they cost.** Joins are a left-deep chain of up to 16 tables,

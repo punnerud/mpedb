@@ -306,6 +306,13 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Pin a parameter slot's type before binding — used for the reserved
+    /// subplan-result slots, whose types the planner KNOWS from the inner
+    /// select's output rather than inferring from usage.
+    pub fn pin_param(&mut self, i: u16, ty: Option<ColumnType>) {
+        self.param_types[i as usize] = ty;
+    }
+
     /// Move this binder's PARAMETER and CONTEXT state onto a new scope.
     ///
     /// An aggregate query binds in two passes over two different tuples — the
@@ -661,6 +668,14 @@ impl<'a> Binder<'a> {
             }
             ast::Expr::Func(name, args) => self.bind_func(name, args),
             ast::Expr::Binary(op, l, r) => self.bind_binary(*op, l, r),
+            // The planner LIFTS subqueries out (each becomes a subplan and a
+            // reserved parameter) before binding. One reaching the binder is
+            // therefore a subquery in a position the lift does not cover —
+            // say so instead of "unknown expression".
+            ast::Expr::Subquery(_) | ast::Expr::Exists(..) => Err(bind_err(
+                "a subquery is not supported in this position — subqueries work in \
+                 the SELECT list and WHERE of a plain (non-aggregate) SELECT",
+            )),
             ast::Expr::Cast(a, t) => {
                 let (a, at) = self.bind_expr(a)?;
                 // `CAST(? AS t)` pins the parameter — PG's canonical way to

@@ -1341,6 +1341,20 @@ impl<'a> Parser<'a> {
         if self.eat_kw(Kw::Case) {
             return self.case_expr();
         }
+        // `EXISTS ( SELECT … )` — positional word like CAST; NOT EXISTS
+        // arrives here through unary NOT, which is exactly `Exists` negated
+        // by a Not instruction, so no dedicated node is needed for it.
+        if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("EXISTS"))
+            && matches!(self.peek_at(1), Some(Tok::LParen))
+        {
+            self.pos += 2;
+            if !matches!(self.peek(), Some(Tok::Kw(Kw::Select))) {
+                return Err(self.err_here("EXISTS takes a subquery: EXISTS (SELECT …)"));
+            }
+            let inner = self.select_core()?;
+            self.expect(&Tok::RParen, "`)` after EXISTS subquery")?;
+            return Ok(Expr::Exists(Box::new(inner), false));
+        }
         // `CAST ( expr AS <typename> )` — CAST is a positional word, not a
         // keyword, so a table may still be named `cast`.
         if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("CAST"))
@@ -1388,6 +1402,13 @@ impl<'a> Parser<'a> {
             Some(Tok::Ident(s)) => self.ident_suffix(s),
             Some(Tok::QuotedIdent(s)) => Ok(Expr::Col(s)),
             Some(Tok::LParen) => {
+                // `(SELECT …)` is a scalar subquery, not a parenthesized
+                // expression — the SELECT keyword right after `(` decides.
+                if matches!(self.peek(), Some(Tok::Kw(Kw::Select))) {
+                    let inner = self.select_core()?;
+                    self.expect(&Tok::RParen, "`)` after subquery")?;
+                    return Ok(Expr::Subquery(Box::new(inner)));
+                }
                 let e = self.expr()?;
                 self.expect(&Tok::RParen, "`)`")?;
                 Ok(e)

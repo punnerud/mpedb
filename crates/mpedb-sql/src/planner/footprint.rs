@@ -67,7 +67,27 @@ fn select_footprint(sp: &SelectPlan, schema: &Schema) -> Result<Footprint> {
 
 /// Compute the footprint a statement must carry. Also used by
 /// [`CompiledPlan::decode`] to verify that a stored footprint was not forged.
-pub(crate) fn compute_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint> {
+pub(crate) fn compute_footprint(
+    stmt: &PlanStmt,
+    subplans: &[SubPlan],
+    schema: &Schema,
+) -> Result<Footprint> {
+    let mut fp = compute_stmt_footprint(stmt, schema)?;
+    // A subplan's reads are the statement's reads — leaving them out would
+    // let `conflicts_with` group this statement with a writer to the inner
+    // table as independent. Several key spaces ⇒ Full (the join argument).
+    for s in subplans {
+        let sf = select_footprint(&s.plan, schema)?;
+        fp.tables_read |= sf.tables_read;
+        fp.indexes_used |= sf.indexes_used;
+        if !subplans.is_empty() {
+            fp.key_access = KeyAccess::Full;
+        }
+    }
+    Ok(fp)
+}
+
+fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint> {
     let table_bit = |id: u32| -> Result<u64> {
         if schema.table(id).is_none() || id >= 64 {
             return Err(Error::Corrupt(format!("table id {id} out of range")));

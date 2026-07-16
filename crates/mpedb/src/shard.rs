@@ -93,6 +93,11 @@ impl ShardSet {
 
     fn route(&self, plan: &CompiledPlan, params: &[Value]) -> Result<Route> {
         let k = self.shards.len() as u64;
+        // A subplan-result slot is filled by the EXECUTOR (per shard, at run
+        // time); hashing its hole here would route on NULL. Fan out instead.
+        if !plan.subplans.is_empty() {
+            return Ok(Route::All);
+        }
         match &plan.stmt {
             PlanStmt::Insert { table, rows, .. } => {
                 if rows.len() != 1 {

@@ -71,7 +71,9 @@ impl CompiledPlan {
         if n_context > n_params as usize {
             return Err(corrupt("more session-context slots than parameters"));
         }
-        let n_user = n_params as usize - n_context;
+        // Layout: [user ‖ subplan results ‖ context] — context slots are the
+        // LAST n_context entries whatever sits before them.
+        let ctx_base = n_params as usize - n_context;
         let mut context_keys = Vec::with_capacity(n_context.min(1024));
         for p in 0..n_context {
             let klen = r_u16(bytes, &mut pos)? as usize;
@@ -84,7 +86,7 @@ impl CompiledPlan {
             }
             // A reserved context slot must carry a concrete type, or its
             // session value cannot be type-checked at execute time.
-            if param_types[n_user + p].is_none() {
+            if param_types[ctx_base + p].is_none() {
                 return Err(corrupt("session-context slot has no inferred type"));
             }
             context_keys.push(key);
@@ -108,6 +110,31 @@ impl CompiledPlan {
         for _ in 0..n_consts {
             consts.push(read_value(bytes, &mut pos)?);
         }
+        let n_sub = r_u8(bytes, &mut pos)? as usize;
+        if n_sub > MAX_SUBPLANS {
+            return Err(corrupt("too many subplans in plan"));
+        }
+        if n_sub + n_context > n_params as usize {
+            return Err(corrupt("more reserved slots than parameters"));
+        }
+        let mut subplans = Vec::with_capacity(n_sub);
+        for _ in 0..n_sub {
+            let exists = match r_u8(bytes, &mut pos)? {
+                0 => false,
+                1 => true,
+                t => return Err(corrupt(format!("bad subplan exists tag {t}"))),
+            };
+            let n_args = r_u16(bytes, &mut pos)? as usize;
+            if n_args > MAX_COLUMNS {
+                return Err(corrupt("too many subplan correlation args"));
+            }
+            let mut outer_args = Vec::with_capacity(n_args.min(64));
+            for _ in 0..n_args {
+                outer_args.push(r_u16(bytes, &mut pos)?);
+            }
+            let plan = decode_select(bytes, &mut pos)?;
+            subplans.push(SubPlan { plan, outer_args, exists });
+        }
         let footprint = Footprint::decode(bytes, &mut pos)?;
         let stmt = decode_stmt(bytes, &mut pos)?;
         if pos != bytes.len() {
@@ -118,6 +145,7 @@ impl CompiledPlan {
             schema_hash,
             n_params,
             param_types,
+            subplans,
             context_keys,
             policies,
             consts,
@@ -420,6 +448,7 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                 });
             }
             let joined_filter = decode_opt_program(buf, pos)?;
+            let post_filter = decode_opt_program(buf, pos)?;
             let distinct = match r_u8(buf, pos)? {
                 0 => false,
                 1 => true,
@@ -480,6 +509,7 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                 access,
                 joins,
                 joined_filter,
+                post_filter,
                 filter,
                 projection,
                 order_by,

@@ -137,7 +137,8 @@ impl<'db> RowStream<'db> {
         // silently returned the outer rows as if the rest of the plan did not
         // exist (adversarial review find) — they take the materializing
         // fallback below, which runs the real executor.
-        let can_stream = order_by.is_empty()
+        let can_stream = plan.subplans.is_empty()
+            && order_by.is_empty()
             && joins.is_empty()
             && !*distinct
             && aggregate.is_none()
