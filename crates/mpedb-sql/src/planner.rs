@@ -191,8 +191,10 @@ fn write_check(
 
 /// Canonical secondary-index numbering helper (DESIGN.md §4.4): index 0 is
 /// the PK tree; the returned vector lists the column index of secondary
-/// unique index 1, 2, ... — columns with `unique = true` in declaration
-/// order, skipping a column that is by itself the entire primary key.
+/// index 1, 2, ... — columns with `unique = true` OR `indexed = true`, in
+/// declaration order, skipping a column that is by itself the entire primary
+/// key. UNIQUE index trees are keyed `value → pk`; non-unique ones use the
+/// composite key `(value ‖ pk) → pk` (unique by construction).
 pub fn secondary_indexes(table: &TableDef) -> Vec<u16> {
     table
         .columns
@@ -227,6 +229,12 @@ pub(crate) fn conflict_probe_opt(table: &TableDef, target: &[u16]) -> Option<Con
     // multi-column target has no index to use even if each column is unique
     // alone — and "unique together" is not something the schema can declare.
     let [col] = target else { return None };
+    // An `indexed` (non-unique) column cannot witness a conflict: nothing
+    // stops several rows from sharing the value, so there is no single row
+    // to have conflicted with. PG rejects the same shape at prepare.
+    if !table.columns[*col as usize].unique {
+        return None;
+    }
     let ino = secondary_indexes(table).iter().position(|c| c == col)?;
     Some(ConflictProbe::Index(ino as u32 + 1))
 }
@@ -1400,7 +1408,11 @@ fn plan_on_conflict(
             .collect();
         let mut usable = vec![format!("({})", pk_names.join(", "))];
         for c in secondary_indexes(table) {
-            usable.push(format!("({})", table.columns[c as usize].name));
+            // Only UNIQUE columns can witness a conflict; an `indexed`
+            // (non-unique) column is a secondary index but never usable here.
+            if table.columns[c as usize].unique {
+                usable.push(format!("({})", table.columns[c as usize].name));
+            }
         }
         return Err(bind_err(format!(
             "ON CONFLICT ({}) is not supported: the target must be a key this can probe to \
@@ -1845,21 +1857,27 @@ fn extract_access(
         return Ok((AccessPath::PkPoint(parts), residual));
     }
 
-    // 2. Point probe of a secondary unique index — BEFORE any PK range:
-    // a unique probe returns at most one row, so it strictly dominates a
-    // range scan (`WHERE pk >= $1 AND unique_col = $2` must not scan an
-    // unbounded range; the range conjuncts stay behind as the residual
-    // filter). First matching conjunct in statement order wins; indexes
-    // beyond the 64-bit footprint bitmap are never chosen.
+    // 2. Index-equality probe — BEFORE any PK range: an index probe touches
+    // O(matches) rows, so it dominates an unbounded range scan (`WHERE pk >=
+    // $1 AND email = $2` must not scan the range; the range conjuncts stay
+    // behind as the residual filter). A UNIQUE index (at most one row) is
+    // preferred over a non-unique one when both have an equality conjunct —
+    // the only selectivity fact the schema can state without statistics.
+    // Within each pass the first matching conjunct in statement order wins;
+    // indexes beyond the 64-bit footprint bitmap are never chosen.
     let sec = secondary_indexes(table);
-    let probe = cmps.iter().enumerate().find_map(|(i, c)| match c {
-        Some((col, BinOp::Eq, atom)) => sec
-            .iter()
-            .position(|sc| sc == col)
-            .filter(|pos| *pos < 63)
-            .map(|pos| (i, (pos + 1) as u32, atom.clone())),
-        _ => None,
-    });
+    let probe_pass = |unique_only: bool| {
+        cmps.iter().enumerate().find_map(|(i, c)| match c {
+            Some((col, BinOp::Eq, atom)) => sec
+                .iter()
+                .position(|sc| sc == col)
+                .filter(|pos| *pos < 63)
+                .filter(|_| !unique_only || table.columns[*col as usize].unique)
+                .map(|pos| (i, (pos + 1) as u32, atom.clone())),
+            _ => None,
+        })
+    };
+    let probe = probe_pass(true).or_else(|| probe_pass(false));
     if let Some((i, index_no, atom)) = probe {
         consumed[i] = true;
         let part = atom.to_key_part(consts)?;

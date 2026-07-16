@@ -9,11 +9,16 @@
 //!
 //! # Fixed schema
 //!
-//! mpedb (TOML):  `t(pk int64 PRIMARY KEY, a int64, b float64, c text)`
+//! mpedb (TOML):  `t(pk int64 PRIMARY KEY, a int64 INDEXED, b float64, c text)`
 //! sqlite:        `CREATE TABLE t (pk INTEGER PRIMARY KEY, a INT, b REAL,
-//!                 c TEXT) STRICT;`
+//!                 c TEXT) STRICT; CREATE INDEX t_a ON t(a);`
 //! postgres:      `CREATE TABLE t (pk bigint PRIMARY KEY, a bigint,
-//!                 b double precision, c text);`
+//!                 b double precision, c text); CREATE INDEX t_a ON t(a);`
+//!
+//! `a` carries a NON-UNIQUE index in all three engines (#48): every generated
+//! `a = <n>` conjunct makes mpedb's planner take the IndexPoint path through
+//! `scan_by_index` (multi-row prefix scan) while sqlite3/PG remain the
+//! oracles — an index must never change any answer, only how it is found.
 //!
 //! # Known semantic differences — normalized or avoided in generation
 //!
@@ -100,6 +105,7 @@ primary_key = ["pk"]
   [[table.column]]
   name = "a"
   type = "int64"
+  indexed = true
 
   [[table.column]]
   name = "b"
@@ -110,10 +116,11 @@ primary_key = ["pk"]
   type = "text"
 "#;
 
-const SQLITE_SCHEMA: &str = "CREATE TABLE t (pk INTEGER PRIMARY KEY, a INT, b REAL, c TEXT) STRICT;";
+const SQLITE_SCHEMA: &str =
+    "CREATE TABLE t (pk INTEGER PRIMARY KEY, a INT, b REAL, c TEXT) STRICT; CREATE INDEX t_a ON t(a);";
 
 const PG_SCHEMA: &str =
-    "CREATE TABLE t (pk bigint PRIMARY KEY, a bigint, b double precision, c text);";
+    "CREATE TABLE t (pk bigint PRIMARY KEY, a bigint, b double precision, c text); CREATE INDEX t_a ON t(a);";
 
 /// One generated statement. `is_select` decides whether row output is
 /// compared (SELECTs) or only the success/failure status (DML).
