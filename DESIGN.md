@@ -232,16 +232,20 @@ struct ReaderSlot {
 - **Catalog tree:** table_id/index_no → root page id + row count; also stores the full
   canonical schema bytes under a reserved key (recoverable without any config file).
 - **One COW B+tree per table** (key = encoded PK, value = row payload) and **per
-  secondary unique index** (key = encoded column value ‖ encoded PK, value = encoded PK).
-  NULL values are **not indexed**: UNIQUE permits multiple NULLs (SQL standard).
+  secondary index**. A UNIQUE index is keyed by the encoded column value alone
+  (value = encoded PK); a non-unique (`indexed = true`) index is keyed by
+  `encoded column value ‖ encoded PK` (value = encoded PK) — the PK suffix makes the
+  composite key unique by construction, and equality lookup is a prefix scan,
+  O(matches + 1). NULL values are **not indexed**: UNIQUE permits multiple NULLs
+  (SQL standard), and `col = NULL` is UNKNOWN.
 - Slotted 4 KiB nodes; values > 1 KiB spill to overflow page chains; keys ≤ 976 B.
 - **Key encoding** memcmp-ordered (`mpedb-types::keycode`): NULL tag < any value,
   big-endian sign-flipped ints, IEEE total-order floats (-0.0 = 0.0, NaNs equal, > +inf),
   0x00-escaped text/blob. **Text collation is binary** (documented; no locale collation).
 - **Index numbering convention** (planner and engine derive identically from the
-  schema): index 0 = PK tree; secondary unique indexes numbered 1, 2, … in
-  column-declaration order over `unique = true` columns, skipping a column that is by
-  itself the entire PK.
+  schema): index 0 = PK tree; secondary indexes numbered 1, 2, … in
+  column-declaration order over columns with `unique = true` OR `indexed = true`,
+  skipping a column that is by itself the entire PK.
 - **Row encoding:** null bitmap → fixed-width section → varlen section; single-column
   decode without materializing the row.
 

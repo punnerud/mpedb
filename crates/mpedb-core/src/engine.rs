@@ -792,12 +792,13 @@ impl ReadTxn<'_> {
         }
     }
 
-    /// All rows whose `index_no` column equals `value` — the non-unique index
-    /// equality lookup (`WHERE indexed_col = value`). Works for a UNIQUE index
-    /// too (0 or 1 rows). The index tree is keyed by `(value ‖ pk)` for a
-    /// non-unique index and by `value` alone for a unique one; both start with
-    /// `encode_key([value])`, so scanning from that prefix and stopping when the
-    /// prefix no longer matches yields exactly the matches — O(matches + 1).
+    /// All rows whose `index_no` column equals `value` — the index equality
+    /// lookup (`WHERE col = value`). Works for a UNIQUE index too (0 or 1
+    /// rows; those take the exact-get fast path below). The index tree is
+    /// keyed by `(value ‖ pk)` for a non-unique index and by `value` alone
+    /// for a unique one; both start with `encode_key([value])`, so scanning
+    /// from that prefix and stopping when the prefix no longer matches yields
+    /// exactly the matches — O(matches + 1).
     pub fn scan_by_index(
         &self,
         table_id: u32,
@@ -806,6 +807,17 @@ impl ReadTxn<'_> {
     ) -> Result<Vec<Vec<Value>>> {
         if value.is_null() {
             return Ok(Vec::new()); // NULL is never indexed
+        }
+        let unique = index_no >= 1
+            && self
+                .eng
+                .sec_unique
+                .get(table_id as usize)
+                .and_then(|v| v.get(index_no as usize - 1))
+                .copied()
+                .unwrap_or(false);
+        if unique {
+            return Ok(self.get_by_index(table_id, index_no, value)?.into_iter().collect());
         }
         let prefix = keycode::encode_key(std::slice::from_ref(value));
         let iroot = self.tree_root(table_id, index_no)?;
@@ -1795,6 +1807,51 @@ impl<'e> WriteTxn<'e> {
                 &self.eng.col_types[table_id as usize],
             )?)),
         }
+    }
+
+    /// All rows whose `index_no` column equals `value`, within the writer's
+    /// view — the write-side twin of [`ReadTxn::scan_by_index`], with the same
+    /// unique fast path and `(value ‖ pk)` prefix-scan contract.
+    pub fn scan_by_index(
+        &mut self,
+        table_id: u32,
+        index_no: u32,
+        value: &Value,
+    ) -> Result<Vec<Vec<Value>>> {
+        if value.is_null() {
+            return Ok(Vec::new()); // NULL is never indexed
+        }
+        let unique = index_no >= 1
+            && self
+                .eng
+                .sec_unique
+                .get(table_id as usize)
+                .and_then(|v| v.get(index_no as usize - 1))
+                .copied()
+                .unwrap_or(false);
+        if unique {
+            return Ok(self.get_by_index(table_id, index_no, value)?.into_iter().collect());
+        }
+        let prefix = keycode::encode_key(std::slice::from_ref(value));
+        let (iroot, _) = self.tree_root(table_id, index_no)?;
+        let (root, _) = self.tree_root(table_id, 0)?;
+        let mut out = Vec::new();
+        let mut c = btree::cursor(self, iroot, Some((&prefix[..], true)), None)?;
+        while let Some((k, pk_bytes)) = c.next(self)? {
+            if !k.starts_with(&prefix) {
+                break; // past every (value, *) entry
+            }
+            match btree::get(self, root, &pk_bytes)? {
+                Some(bytes) => out.push(row::decode_row(
+                    &bytes,
+                    &self.eng.col_types[table_id as usize],
+                )?),
+                None => {
+                    return Err(Error::Corrupt("index entry points at a missing row".into()))
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn sys_get(&mut self, subkey: &[u8]) -> Result<Option<Vec<u8>>> {

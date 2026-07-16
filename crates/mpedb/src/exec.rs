@@ -23,6 +23,12 @@ pub(crate) trait TxnCtx {
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>>;
     fn get_by_index(&mut self, table: u32, index_no: u32, value: &Value)
         -> Result<Option<Vec<Value>>>;
+    /// Every row matching an index equality — N rows for a non-unique index,
+    /// 0 or 1 for a unique one (the engine takes an exact-get fast path for
+    /// those, so routing everything through here costs the unique case
+    /// nothing).
+    fn scan_by_index(&mut self, table: u32, index_no: u32, value: &Value)
+        -> Result<Vec<Vec<Value>>>;
     fn scan_rows_raw(
         &mut self,
         table: u32,
@@ -109,6 +115,14 @@ impl TxnCtx for WriteTxn<'_> {
     ) -> Result<Option<Vec<Value>>> {
         WriteTxn::get_by_index(self, table, index_no, value)
     }
+    fn scan_by_index(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        value: &Value,
+    ) -> Result<Vec<Vec<Value>>> {
+        WriteTxn::scan_by_index(self, table, index_no, value)
+    }
     fn scan_rows_raw(
         &mut self,
         table: u32,
@@ -142,6 +156,14 @@ impl TxnCtx for ReadCtx<'_, '_> {
         value: &Value,
     ) -> Result<Option<Vec<Value>>> {
         self.0.get_by_index(table, index_no, value)
+    }
+    fn scan_by_index(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        value: &Value,
+    ) -> Result<Vec<Vec<Value>>> {
+        self.0.scan_by_index(table, index_no, value)
     }
     fn scan_rows_raw(
         &mut self,
@@ -1186,7 +1208,10 @@ fn gather_rows(
     cap: Option<usize>,
 ) -> Result<Vec<Vec<Value>>> {
     // Scan paths push the filter AND the cap down into the (possibly
-    // streaming) scan; point paths return at most one row and filter here.
+    // streaming) scan. Point and index-equality paths gather their matches —
+    // one row for a PK/unique probe, every equal row for a non-unique index —
+    // and filter here (no cap pushdown; the caller's skip/take still bounds
+    // what is returned).
     let mut rows = match access {
         AccessPath::PkPoint(parts) => {
             let mut pk = Vec::with_capacity(parts.len());
@@ -1216,7 +1241,9 @@ fn gather_rows(
             if v.is_null() {
                 Vec::new() // `col = NULL` is UNKNOWN; NULLs are never indexed
             } else {
-                ctx.get_by_index(table, *index_no, &v)?.into_iter().collect()
+                // N rows for a non-unique index, 0/1 for a unique one — the
+                // engine picks the exact-get fast path when it is unique.
+                ctx.scan_by_index(table, *index_no, &v)?
             }
         }
         AccessPath::FullScan => {
@@ -1332,7 +1359,11 @@ fn gather_topk(
         AccessPath::FullScan => {
             ctx.scan_rows_topk(table, None, None, filter.map(|f| (f, params)), order_by, keep)
         }
-        // Point paths yield at most one row: gather it, sort trivially, cap.
+        // Point/index paths gather their matches — at most one for PK/unique,
+        // every equal row for a non-unique index — then sort and cap. The
+        // non-unique case materializes all matches before truncating; a
+        // streaming index cursor is deliberately deferred (#48) until a real
+        // workload shows the cost.
         AccessPath::PkPoint(_) | AccessPath::IndexPoint { .. } => {
             let mut r = gather_rows(ctx, table, access, filter, plan, params, None)?;
             sort_rows(&mut r, order_by);

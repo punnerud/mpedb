@@ -1357,8 +1357,16 @@ impl CompiledPlan {
                             .copied()
                     })
                     .unwrap_or(0);
+                // A unique probe returns at most one row (IndexPoint); a
+                // non-unique index returns every equal row (IndexScan) — the
+                // label is the honest cost statement.
+                let unique = schema
+                    .table(table)
+                    .and_then(|t| t.columns.get(col as usize))
+                    .is_none_or(|c| c.unique);
+                let label = if unique { "IndexPoint" } else { "IndexScan" };
                 format!(
-                    "IndexPoint({} = {}) via index {index_no}",
+                    "{label}({} = {}) via index {index_no}",
                     col_name(col),
                     self.render_part(part)
                 )
