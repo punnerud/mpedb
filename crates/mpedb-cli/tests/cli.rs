@@ -232,100 +232,53 @@ fn stress_unique() {
     assert!(out_str(&o).contains("verify: ok"), "stdout: {}", out_str(&o));
 }
 
-/// Failure signatures of the KNOWN engine bug (see the #[ignore]d
-/// `engine_bug_*` test below). Used to quarantine that one bug in
-/// `crash_injection` without masking anything else.
-fn is_known_engine_bug(output: &str) -> bool {
-    ["double free of page",
-     "listed twice in freelist",
-     "neither reachable nor freelisted",
-     "missing catalog entry",
-     "no schema stored in catalog",
-     "unexpected page kind"]
-        .iter()
-        .any(|sig| output.contains(sig))
-}
-
 /// SIGKILL crash injection: children die mid-write every wave; the database
 /// must recover the writer lock promptly, pass page-accounting verification,
 /// and show no torn rows.
 ///
-/// NOTE on the retry loop: the crash waves run concurrent readers + writers,
-/// which can trip the KNOWN freelist-corruption engine bug (~10% of 2x4
-/// runs; see `engine_bug_freelist_double_free_under_concurrent_readers`).
-/// That bug is independent of the kill/recovery machinery under test here,
-/// so a failure carrying exactly its signature is retried (up to 3 tries);
-/// any other failure — wedged lock, watchdog, torn rows, failed recovery —
-/// fails immediately, and 3 engine-bug hits in a row also fail.
+/// This test used to quarantine the freelist-corruption engine bug's failure
+/// signatures behind a retry loop. That bug no longer reproduces (fixed as a
+/// side effect of #37/#39 — see the regression guard below), so EVERY failure
+/// here fails loudly again: a corruption signature in a crash wave is a
+/// crash/recovery regression, not a known flake.
 #[test]
 fn crash_injection() {
-    let mut bug_hits = Vec::new();
-    for attempt in 0..3 {
-        let td = TestDir::new(&format!("crash-{attempt}"));
-        let o = run(&[
-            "crash", "--dir", td.path().to_str().unwrap(),
-            "--waves", "2", "--children", "4",
-        ]);
-        if o.status.success() {
-            let s = out_str(&o);
-            assert!(s.contains("all invariants held"), "stdout: {s}");
-            return;
-        }
-        let combined = format!("{}\n{}", out_str(&o), err_str(&o));
-        assert!(
-            is_known_engine_bug(&combined),
-            "crash test failed WITHOUT the known engine-bug signature — \
-             this is a crash/recovery regression:\n{combined}"
-        );
-        bug_hits.push(combined);
-    }
-    panic!(
-        "crash test hit the known engine bug on all 3 attempts (expected ~10% rate):\n{}",
-        bug_hits.join("\n=== next attempt ===\n")
-    );
+    let td = TestDir::new("crash");
+    let o = run(&[
+        "crash", "--dir", td.path().to_str().unwrap(),
+        "--waves", "2", "--children", "4",
+    ]);
+    assert_ok(&o);
+    let s = out_str(&o);
+    assert!(s.contains("all invariants held"), "stdout: {s}");
 }
 
-/// KNOWN ENGINE BUG (freelist/page-accounting corruption under concurrent
-/// readers + writers). This test FAILS while the bug exists and passes once
-/// it is fixed — it is #[ignore]d so the suite stays green meanwhile.
+/// REGRESSION GUARD for the historical freelist/page-accounting corruption
+/// under concurrent readers + writers (observed 2026-07-12; NO LONGER
+/// REPRODUCES as of 2026-07-16 — fixed as a side effect of #37's read-only
+/// refill and #39's meta-retry work; no single commit names it). Verified
+/// obsolete by 16 consecutive clean 8-worker×5s runs — at the historical
+/// ~2/3 failure rate that is ≈ 2e-8 if the bug were still alive. Kept
+/// #[ignore]d purely for TIME (~20 s), as the strongest known stressor of
+/// the oldest-pinned/freelist-reclamation machinery (DESIGN.md §4.3/§4.5).
 ///
-/// Repro (observed 2026-07-12, debug build, 2-core host, /dev/shm):
-///   mpedb stress --dir D --workers 8 --secs 5 --mode mixed
-/// fails in roughly 2 out of 3 runs with one of:
+/// The historical failure signatures, should it ever return:
 ///   - child:  "internal error (bug in mpedb): double free of page N"
-///     (WriteTxn::free sees the same committed page freed twice in one txn)
 ///   - parent: "database corrupt: page N listed twice in freelist"
-///   - parent: "database corrupt: page N leaked: neither reachable nor
-///     freelisted"  (both from Engine::verify_page_accounting)
-///   - child + parent: "database corrupt: btree: unexpected page kind in
-///     descent" / "... in collect" — a committed tree references a page that
-///     was reused and rewritten as a different kind
+///   - parent: "page N leaked: neither reachable nor freelisted"
+///   - "btree: unexpected page kind in descent/collect" (premature reuse)
+///   - escalation to catalog corruption: "missing catalog entry" /
+///     "no schema stored in catalog"
 ///
-/// Minimization (each variant run 3×, 8 workers × 5 s unless noted):
-///   - UPDATE-only workload:     0/3 failures
-///   - INSERT+DELETE (no reads): 0/3 failures
-///   - UPDATE+SELECT:            3/3 failures (3/3 at 3 workers, 0/3 at 2)
-///   - INSERT+DELETE+SELECT:     2/3 failures
-///
-/// So the trigger is autocommit point-SELECTs (read-txn reader pins)
-/// concurrent with COW write txns, needing >= 3 processes (i.e. at least two
-/// processes able to hold reader pins while a third writes) — consistent
-/// with a race in the oldest-pinned computation / freelist reclamation
-/// (DESIGN.md §4.3/§4.5), not with any single-process path.
-///
-/// The same bug also fires inside `mpedb crash` waves (readers + writers +
-/// SIGKILL-churned reader slots) in ~10% of 2-wave × 4-children runs, where
-/// it has been observed to escalate to committed CATALOG corruption:
-///   "database corrupt: missing catalog entry for table 0 index 0"
-///   "database corrupt: no schema stored in catalog"  (attach fails)
-/// — i.e. a catalog page was prematurely reused. The `crash_injection` test
-/// quarantines exactly these signatures (with retries) so that genuine
-/// kill/recovery regressions still fail loudly.
+/// Historical minimization (kept because it locates the machinery): the
+/// trigger was autocommit point-SELECTs (reader pins) concurrent with COW
+/// write txns, needing >= 3 processes — UPDATE-only and INSERT+DELETE
+/// without reads never failed; UPDATE+SELECT failed 3/3 at 8 workers.
 #[test]
-#[ignore = "known engine bug: freelist corruption under multi-process read/write churn"]
+#[ignore = "slow regression guard (~20 s: 4 stress runs of 8 workers x 5 s); run with --ignored"]
 fn engine_bug_freelist_double_free_under_concurrent_readers() {
-    // The race is probabilistic per run (~2/3 with these settings); four
-    // clean runs in a row ≈ 1% if the bug is still present.
+    // Historically ~2/3 failure rate per run; four clean runs in a row
+    // ≈ 1% if the bug were present.
     for attempt in 0..4 {
         let td = TestDir::new(&format!("engine-bug-{attempt}"));
         let o = run(&[
@@ -334,11 +287,10 @@ fn engine_bug_freelist_double_free_under_concurrent_readers() {
         ]);
         if !o.status.success() {
             panic!(
-                "engine bug reproduced on attempt {attempt}:\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                "the historical freelist bug REGRESSED on attempt {attempt}:\n--- stdout ---\n{}\n--- stderr ---\n{}",
                 out_str(&o),
                 err_str(&o)
             );
         }
     }
-    // All attempts clean: the engine bug appears to be fixed.
 }

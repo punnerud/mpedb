@@ -2735,6 +2735,12 @@ primary_key = ["id"]
     fn wal_cleanup(cfg: &Config) {
         let _ = std::fs::remove_file(&cfg.options.path);
         let _ = std::fs::remove_file(crate::shm::wal_path(&cfg.options.path));
+        // Drop the shared test dir once the last file is gone — remove_dir
+        // only succeeds on an empty directory, so concurrent tests keep it
+        // alive and only the final teardown actually removes it.
+        if let Some(dir) = cfg.options.path.parent() {
+            let _ = std::fs::remove_dir(dir);
+        }
     }
 
     /// Regress the mapping to a plausible post-power-loss state: stale lock
@@ -2973,7 +2979,7 @@ primary_key = ["id"]
         for h in handles {
             h.join().unwrap();
         }
-        std::fs::remove_file(&cfg.options.path).unwrap();
+        wal_cleanup(&cfg);
     }
 
     fn enable_capture(eng: &Engine, tables: &[u32]) {
@@ -3123,7 +3129,8 @@ primary_key = ["id"]
             Err(Error::Frozen { table_id: 0 })
         ));
         drop(w);
-        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(crate::shm::wal_path(&path));
     }
 
     #[test]
@@ -3270,7 +3277,8 @@ primary_key = ["id"]
         assert_eq!(dirty(&eng)[0].op, DirtyOp::Delete);
 
         eng.verify_page_accounting().unwrap();
-        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(crate::shm::wal_path(&path));
     }
 
     #[test]
@@ -3350,7 +3358,11 @@ mod debug_tests {
             w.abort();
             println!("round {round}: high_water={} freelist_entries={entries} freelist_pages={pages}", meta.high_water);
         }
-        std::fs::remove_file(&cfg.options.path).unwrap();
+        let _ = std::fs::remove_file(&cfg.options.path);
+        let _ = std::fs::remove_file(crate::shm::wal_path(&cfg.options.path));
+        if let Some(dir) = cfg.options.path.parent() {
+            let _ = std::fs::remove_dir(dir); // succeeds only once the dir is empty
+        }
     }
 
     /// Phase-3 ceiling measurement: decompose a serial autocommit PK-point
@@ -3488,7 +3500,8 @@ mod debug_tests {
         let perc = |n: u128| n as f64 / churn as f64;
         println!("INSERT: exec={:.0}ns commit={:.0}ns | DELETE: exec={:.0}ns commit={:.0}ns",
                  perc(ti_exec), perc(ti_commit), perc(td_exec), perc(td_commit));
-        std::fs::remove_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_file(crate::shm::wal_path(&path));
     }
 
     fn debug_cfg() -> Config {
