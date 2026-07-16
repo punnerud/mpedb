@@ -364,8 +364,8 @@ make it worse rather than better. The same cell on the 2-core Linux box reads
 486k vs 3.5k: same phenomenon, two orders of magnitude apart — which is why the
 2-core numbers *understate* this one.
 
-Bulk write flips the other way from Linux: mpedb **2,274 MiB/s (38% of raw)** vs
-SQLite 1,163 (19%) — 1.9×. On the 2-core Linux box SQLite leads that cell; give
+Bulk write flips the other way from Linux: mpedb **2,561 MiB/s (39% of raw)** vs
+SQLite 988 (15%) — 2.6×. On the 2-core Linux box SQLite leads that cell; give
 mpedb cores and a fast SSD and it does not.
 
 **Streaming blob insert (2026-07-16).** `WriteSession::insert_streaming` PULLS a
