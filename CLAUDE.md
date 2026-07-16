@@ -25,15 +25,17 @@ every protocol there survived a 37-finding adversarial review, and the ordering 
   for model tests), `btree` (COW B+tree, overflow chains, model-tested against BTreeMap),
   `row` (null bitmap + fixed + varlen codec), `shm` (mmap, init via flock+fallocate, meta
   double-buffer with atomics/fences, robust ERRORCHECK mutex, reader table with packed
-  {pid,seq} generation words + /proc start-time identity), `engine` (ReadTxn/WriteTxn,
-  catalog, chunked freelist with commit-time fixpoint, typed row API, page-accounting
-  verifier).
+  {pid,seq} generation words + /proc start-time identity), `engine/` (split into
+  mod/read/write/freelist/commit: ReadTxn/WriteTxn, catalog, chunked freelist with
+  commit-time fixpoint, typed row API, page-accounting verifier).
 - `crates/mpedb-sql` — tokenizer → AST → binder (rigid types, param unification, const
-  folding) → planner (PkPoint/PkRange/IndexPoint/FullScan + footprints) → CompiledPlan
-  (canonical bytes, blake3 hash, fully re-validating decode).
+  folding) → `planner/` (select/join/aggregate/access/footprint: PkPoint/PkRange/
+  IndexPoint/FullScan + footprints) → CompiledPlan in `plan/` (encode/decode/validate/
+  explain: canonical bytes, blake3 hash, fully re-validating decode).
 - `crates/mpedb` — facade: Database::open(config), prepare/execute/query, WriteSession,
   shared plan registry in the catalog's sys-keyspace (`plan/<hash>`), CHECK compilation,
-  and `ring_exec` (Phase-2 group-commit leader; active when durability = commit or wal).
+  the plan executor in `exec/` (mod = TxnCtx + exec_stmt, gather, aggregate), and
+  `ring_exec` (Phase-2 group-commit leader; active when durability = commit or wal).
 - `crates/mpedb-cli` — `mpedb` binary: repl/exec/prepare/call/dump/stress/crash/
   powerloss/bench + `mirror` (import/export/pull/push/sync/switch/conflicts/resolve)
   and `mirror-collide` (SIGKILL fuzz: source writers + a mirror daemon killed at every
