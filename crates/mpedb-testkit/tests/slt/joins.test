@@ -263,6 +263,15 @@ SELECT emp.ename FROM emp JOIN dept ON emp.did = dept.did AND dept.dname = 'eng'
 ann
 bob
 
+# SELECT-item aliases (#56) name the output and resolve in ORDER BY.
+query IT nosort
+SELECT emp.eid AS e, dept.dname nm FROM emp JOIN dept ON emp.did = dept.did ORDER BY e LIMIT 2
+----
+10
+eng
+11
+eng
+
 # ORDER BY an ordinal, over a join.
 query TT nosort
 SELECT emp.ename, dept.dname FROM emp JOIN dept ON emp.did = dept.did ORDER BY 2, 1

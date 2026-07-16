@@ -108,7 +108,7 @@ pub(super) fn plan_join_select(
     let has_agg = s
         .items
         .as_ref()
-        .is_some_and(|i| i.iter().any(contains_agg))
+        .is_some_and(|i| i.iter().any(|(e, _)| contains_agg(e)))
         || s.having.as_ref().is_some_and(contains_agg)
         || s.order_by.iter().any(|(e, _)| contains_agg(e))
         || !s.group_by.is_empty();
@@ -133,13 +133,17 @@ pub(super) fn plan_join_select(
         None => (0..binder.scope_width() as u16).map(Projection::Column).collect(),
         Some(items) => {
             let mut out = Vec::with_capacity(items.len());
-            for item in items {
+            for (item, alias) in items {
                 let (b, _) = binder.bind_expr(item)?;
-                out.push(match b {
-                    BExpr::Col(i) => Projection::Column(i),
-                    other => {
+                out.push(match (b, alias) {
+                    (BExpr::Col(i), None) => Projection::Column(i),
+                    // An alias survives as the output name — same one-
+                    // instruction indirection as the single-table path.
+                    (other, alias) => {
                         let program = compile_program(&other)?;
-                        let name = render_program(&program, &namer);
+                        let name = alias
+                            .clone()
+                            .unwrap_or_else(|| render_program(&program, &namer));
                         Projection::Expr { program, name }
                     }
                 });
@@ -174,6 +178,16 @@ pub(super) fn plan_join_select(
         let mut keys = Vec::with_capacity(s.order_by.len());
         let mut all_cols = true;
         for (e, desc) in &s.order_by {
+            // Same PG rule as the single-table path: an output ALIAS wins
+            // over an input column of the same name.
+            if let ast::Expr::Col(n) = e {
+                if s.items.as_ref().is_some_and(|items| {
+                    items.iter().any(|it| it.1.as_deref() == Some(n.as_str()))
+                }) {
+                    all_cols = false;
+                    break;
+                }
+            }
             match binder.bind_expr(e) {
                 Ok((BExpr::Col(i), _)) => keys.push((i, *desc)),
                 _ => {
@@ -250,9 +264,19 @@ fn join_order_by(
                 keys.push((pos, *desc));
                 continue;
             }
-            if let Some(pos) = items.iter().position(|it| it == e) {
+            if let Some(pos) = items.iter().position(|it| &it.0 == e) {
                 keys.push((pos as u16, *desc));
                 continue;
+            }
+            // A bare identifier naming an item's ALIAS is that output
+            // position (PG/sqlite resolve the output name first).
+            if let ast::Expr::Col(n) = e {
+                if let Some(pos) =
+                    items.iter().position(|it| it.1.as_deref() == Some(n.as_str()))
+                {
+                    keys.push((pos as u16, *desc));
+                    continue;
+                }
             }
         }
         let (b, _) = binder.bind_expr(e)?;

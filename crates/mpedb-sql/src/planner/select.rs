@@ -59,7 +59,7 @@ pub(super) fn distinct_order_by(
     // about slots and not about spelling: `t.a` and `a` are one column, and —
     // the case that made the old spelling-based match unfixable — `emp.did`
     // and `dept.did` are two, but strip the qualifier and they are both `did`.
-    let item_slots: Vec<Option<u16>> = items.iter().map(|it| col_slot(it, scope)).collect();
+    let item_slots: Vec<Option<u16>> = items.iter().map(|it| col_slot(&it.0, scope)).collect();
     let mut out = Vec::with_capacity(s.order_by.len());
     let mut n_junk = 0u16;
     for (i, (key, desc)) in s.order_by.iter().enumerate() {
@@ -67,11 +67,21 @@ pub(super) fn distinct_order_by(
             out.push((pos, *desc));
             continue;
         }
+        // A bare identifier that matches a select-item's ALIAS names that
+        // output position — PostgreSQL and sqlite both resolve the output
+        // name before the input column, so `SELECT a AS b … ORDER BY b`
+        // sorts by the output even when the table has its own `b`.
+        if let ast::Expr::Col(n) = key {
+            if let Some(pos) = items.iter().position(|it| it.1.as_deref() == Some(n.as_str())) {
+                out.push((pos as u16, *desc));
+                continue;
+            }
+        }
         let pos = match col_slot(key, scope) {
             Some(slot) => item_slots.iter().position(|s| *s == Some(slot)),
             // Not a column: fall back to comparing the expressions, which is
             // what makes `SELECT amt * 2 … ORDER BY amt * 2` match.
-            None => items.iter().position(|it| it == key),
+            None => items.iter().position(|it| &it.0 == key),
         };
         match pos {
             Some(pos) => out.push((pos as u16, *desc)),
@@ -208,8 +218,14 @@ fn check_distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<()> 
         if matches!(key, ast::Expr::Lit(Value::Int(_))) {
             continue;
         }
+        // A key naming an item's alias IS in the SELECT list.
+        if let ast::Expr::Col(n) = key {
+            if items.iter().any(|it| it.1.as_deref() == Some(n.as_str())) {
+                continue;
+            }
+        }
         let stripped = strip(key);
-        if !items.iter().any(|it| strip(it) == stripped) {
+        if !items.iter().any(|it| strip(&it.0) == stripped) {
             return Err(bind_err(format!(
                 "{} must be in the SELECT list when SELECT DISTINCT is used — otherwise \
                  which duplicate row survives is what decides the order, and the query \
@@ -255,7 +271,7 @@ pub(super) fn plan_select(
     let has_agg = s
         .items
         .as_ref()
-        .is_some_and(|items| items.iter().any(contains_agg))
+        .is_some_and(|items| items.iter().any(|(e, _)| contains_agg(e)))
         || s.having.as_ref().is_some_and(contains_agg)
         // ORDER BY too: `SELECT dept FROM t ORDER BY count(*)` is an aggregate
         // query even though no aggregate appears in the SELECT list, and
@@ -281,18 +297,24 @@ pub(super) fn plan_select(
         None => (0..table.columns.len() as u16).map(Projection::Column).collect(),
         Some(items) => {
             let mut out = Vec::with_capacity(items.len());
-            for item in items {
+            for (item, alias) in items {
                 let (b, _) = binder.bind_expr(item)?;
-                out.push(match b {
-                    BExpr::Col(i) => Projection::Column(i),
-                    other => {
+                out.push(match (b, alias) {
+                    (BExpr::Col(i), None) => Projection::Column(i),
+                    // An alias must survive as the output name; a bare column
+                    // wears it via a one-instruction program (PROJ_EXPR is
+                    // already on the wire — no format change, and only
+                    // aliased items pay the indirection).
+                    (other, alias) => {
                         let program = compile_program(&other)?;
-                        let name = render_program(&program, &|c| {
-                            table
-                                .columns
-                                .get(c as usize)
-                                .map(|c| c.name.clone())
-                                .unwrap_or_else(|| format!("col#{c}"))
+                        let name = alias.clone().unwrap_or_else(|| {
+                            render_program(&program, &|c| {
+                                table
+                                    .columns
+                                    .get(c as usize)
+                                    .map(|c| c.name.clone())
+                                    .unwrap_or_else(|| format!("col#{c}"))
+                            })
                         });
                         Projection::Expr { program, name }
                     }
@@ -311,6 +333,16 @@ pub(super) fn plan_select(
     for (e, desc) in &s.order_by {
         if s.distinct {
             break;
+        }
+        // An unqualified name matching a select-item ALIAS orders the OUTPUT
+        // (the PostgreSQL rule) — never the base row, even when a table
+        // column shares the name. Route it to the projection-sort path.
+        if let ast::Expr::Col(n) = e {
+            if s.items.as_ref().is_some_and(|items| {
+                items.iter().any(|it| it.1.as_deref() == Some(n.as_str()))
+            }) {
+                break;
+            }
         }
         // A NAMED key must name a real column, and saying so beats any later
         // complaint: `ORDER BY nope` is a typo, and reporting it as "not in the

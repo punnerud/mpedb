@@ -213,7 +213,7 @@ pub(super) fn plan_aggregate_select(
     })?;
     let mut agg_specs: Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool)> = Vec::new();
     let mut rewritten = Vec::with_capacity(items.len());
-    for item in items {
+    for (item, _alias) in items {
         rewritten.push(lift_aggs(item, &group_by, base_scope, &mut agg_specs)?);
     }
     let rewritten_having = match &s.having {
@@ -262,16 +262,19 @@ pub(super) fn plan_aggregate_select(
     let mut binder = binder.rescope(Scope::single(&grouped));
 
     let mut projection: Vec<Projection> = Vec::with_capacity(rewritten.len());
-    for (item, orig) in rewritten.iter().zip(items) {
+    for (item, (orig, alias)) in rewritten.iter().zip(items) {
         let (b, _) = binder.bind_expr(item)?;
+        // The alias, when present, IS the output name — otherwise the
+        // canonical rendering of the original item.
+        let name = alias.clone().unwrap_or_else(|| agg_item_name(orig));
         projection.push(match b {
             BExpr::Col(i) => Projection::Expr {
                 program: compile_program(&BExpr::Col(i))?,
-                name: agg_item_name(orig),
+                name,
             },
             other => Projection::Expr {
                 program: compile_program(&other)?,
-                name: agg_item_name(orig),
+                name,
             },
         });
     }
