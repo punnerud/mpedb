@@ -94,9 +94,12 @@ you are not using it. `Database::open` mmaps a file.
 
 ## The config file is the schema
 
-`type` is one of `int64`, `float64`, `text`, `blob`, `bool`, `timestamp`.
-Per column: `nullable` (default true), `unique`, `check` (an SQL expression over
-the row), `default`.
+`type` is one of `int64`, `float64`, `text`, `blob`, `bool`, `timestamp` — or
+`any`, the deliberate per-column opt-out that accepts any scalar (sqlite-style
+flexibility where you asked for it; an `any` column cannot be a key or UNIQUE).
+Per column: `nullable` (default true), `unique` (an enforced UNIQUE index),
+`indexed` (a non-unique lookup index — the planner uses it for `WHERE col = …`
+and ranges), `check` (an SQL expression over the row), `default`.
 
 The schema lives **inside the file**. The config is how you create it the first
 time; after that the file is authoritative, and attaching with a config that
@@ -164,8 +167,9 @@ pub enum ExecResult {
 The supported surface is deliberately narrow, and
 [the README's table](README.md#sql-support) is the exact list, measured against
 the binary. In short: `SELECT`/`INSERT`/`UPDATE`/`DELETE`, `WHERE`, `ORDER BY`,
-`LIMIT`/`OFFSET`, `GROUP BY`/`HAVING`, `DISTINCT`, aggregates, two-table
-`INNER JOIN`, `ON CONFLICT`, `RETURNING`, `IN`/`BETWEEN`/`CASE`/`LIKE`, and a
+`LIMIT`/`OFFSET`, `GROUP BY`/`HAVING`, `DISTINCT`, aggregates, N-way
+`INNER JOIN` chains (aliases and self-joins included), `LEFT JOIN`,
+`ON CONFLICT`, `RETURNING`, `IN`/`BETWEEN`/`CASE`/`LIKE`, and a
 handful of scalar functions.
 
 ## Transactions
@@ -223,12 +227,15 @@ Select users
 ```
 
 `access` is the thing to look at: `PkPoint` is a point lookup, `PkRange` a range
-scan, `IndexPoint` a unique-index probe, `FullScan` everything. The `footprint`
-is what the engine claims before running — which tables, which keys — and it is
-how the commit path decides whether two statements conflict.
+scan, `IndexPoint` a unique-index probe, `IndexScan`/`IndexRange` equality and
+range over a non-unique index, `FullScan` everything. The `footprint` is what
+the engine claims before running — which tables, which keys — and it is how the
+commit path decides whether two statements conflict.
 
-Plans do not lie by omission on purpose: a join says it is a nested loop with no
-pushdown, and sort-only columns print as `sort-only:` rather than as output.
+Plans do not lie by omission on purpose: a join says whether it is an index
+nested loop (the `ON` equality was consumed into the inner fetch) or a held
+full scan with its honest `O(n*m)` label, and sort-only columns print as
+`sort-only:` rather than as output.
 
 ## Aggregates and joins
 
@@ -242,6 +249,16 @@ db.query("SELECT orders.customer, sum(items.qty) FROM items \
           GROUP BY orders.customer ORDER BY orders.customer", &[])?;
 
 db.query("SELECT DISTINCT oid FROM items ORDER BY oid", &[])?;
+
+// LEFT JOIN: the order with no items comes back NULL-extended, not dropped.
+db.query("SELECT orders.customer, items.qty FROM orders \
+          LEFT JOIN items ON items.oid = orders.oid \
+          WHERE orders.oid = 3", &[])?;
+
+// A chain with aliases — the third table is the same table again (self-join).
+db.query("SELECT a.iid, b.iid FROM items a \
+          JOIN orders o ON a.oid = o.oid \
+          JOIN items b ON b.oid = o.oid AND b.iid > a.iid", &[])?;
 ```
 
 The NULL rules match sqlite3, and they are the ones people state confidently and
@@ -258,12 +275,16 @@ get wrong:
 
 An `INNER JOIN` emits a row only where both sides match, so a row whose join key
 is NULL never appears (NULL equals nothing, including NULL), and a row on the
-other side with no partner does not either.
+other side with no partner does not either. A `LEFT JOIN` keeps that partnerless
+row and NULL-extends the inner side — and `WHERE inner.col IS NULL` on top of it
+is the anti-join ("which orders have no items").
 
-**Joins are a nested loop with no predicate pushdown.** The inner side is read
-once and held; every conjunct of your `WHERE` waits for the joined row, so both
-sides are full scans unless an RLS policy pins a key. Fine for a few thousand
-rows, not for a few million. `EXPLAIN` says so.
+**Join cost, honestly.** When a join's `ON` contains a plain equality
+(`ON items.oid = orders.oid`), the planner consumes it into the inner fetch:
+each outer row does one PK get or index probe — the index nested loop. An `ON`
+with no equality falls back to reading the inner side once and holding it, with
+every pair evaluated: fine for a few thousand rows, not a few million. Your
+`WHERE` still waits for the joined row. `EXPLAIN` says which form you got.
 
 ## Durability: pick one on purpose
 
@@ -280,12 +301,35 @@ rows, not for a few million. `EXPLAIN` says so.
 power-loss-durable. You may lose a bounded window of recent commits. You will not
 get a torn database.
 
+## Large values: stream them
+
+A blob column takes a `Value::Blob(Vec<u8>)` like any other value — but for a
+value measured in megabytes, materializing that `Vec` *is* the cost. Stream it
+instead:
+
+```rust
+// "Put this file in the database", one call: the bytes are pulled in a page
+// at a time and are never resident. A 256 MiB file costs ~132 KiB of
+// anonymous RSS, not 256 MiB. The `&[][..]` placeholder marks the streamed
+// column (index 1 here); it is replaced by the file's bytes.
+let mut s = db.begin()?;
+s.insert_file("files", &params![1i64, &[][..]], 1, "/path/to/big.bin")?;
+s.commit()?;
+```
+
+`WriteSession::insert_streaming` is the same thing over any `std::io::Read`
+with a known length. Two honest constraints: the streamed column must be the
+table's **last** variable-length column, and the table cannot carry a secondary
+`UNIQUE` index (uniqueness would need the whole value in hand before it
+streams). It pulls rather than handing you a writer on purpose — a
+`write_all(chunk)` API would hold the writer lock across your code.
+
 ## Coming from sqlite3
 
 | you know | here |
 |---|---|
 | `sqlite3.connect("app.db")` | `Database::open("app.toml")` — file, no server, same idea |
-| `CREATE TABLE` | the config file (or `mirror import`); there is no DDL |
+| `CREATE TABLE` | the config file (or `mirror import`) — live DDL is designed ([DESIGN-DDL.md](DESIGN-DDL.md)), not built |
 | `?` placeholders | `$1`, `$2`, … |
 | `PRAGMA journal_mode=WAL` | `durability = "wal"` |
 | `cp app.db app.snap` | `cp app.mpedb app.snap` (plus `-wal` if you use it) |
@@ -298,9 +342,10 @@ Differences that will bite, each one exercised in `tests/guide.rs`:
 1. **No `CREATE TABLE`.** See above — the table-id numbering makes it a rebuild.
 2. **Division by zero raises.** sqlite yields NULL. So does overflow: mpedb
    errors where sqlite silently promotes to REAL.
-3. **No 3+ table joins, no `LEFT`/`RIGHT`/`FULL`/`CROSS` join, no self-join, no
-   subqueries.** Each is refused *by name* with a message saying why, not with
-   "syntax error".
+3. **No `RIGHT`/`FULL`/`CROSS` join, no subqueries.** Each is refused *by name*
+   with a message saying why (`RIGHT`'s says the fix: swap the tables and write
+   `LEFT`), not with "syntax error". N-way chains, self-joins, aliases and
+   `LEFT JOIN` all work.
 4. **`ORDER BY` must name something the query outputs** — a column of the table,
    an output position (`ORDER BY 1`), or a selected expression. `SELECT c FROM t
    ORDER BY a + 1` works (a hidden sort column is added); under `SELECT DISTINCT`

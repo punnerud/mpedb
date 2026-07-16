@@ -11,7 +11,9 @@ mpedb combines three things that normally don't come together:
   lock-free readers that never block writers, and group-commit for durable writes.
 - **Rigid schema & integrity validation** that sqlite lacks — typed columns,
   NOT NULL / UNIQUE / CHECK, and a file-authoritative schema that hard-errors on
-  config drift.
+  config drift. (With one deliberate, per-column escape hatch: `type = "any"`
+  accepts any scalar in that column — sqlite-style flexibility where you ask
+  for it, rigidity everywhere else. An `any` column cannot be a key.)
 
 SQL is compiled **once** into a content-hashed plan; the hot path is
 `execute(hash, params)` with zero parsing. Plans carry precomputed read/write
@@ -42,13 +44,14 @@ directions and records what the source declared, so migration is a thing you
 validate rather than hope about.
 
 **What it is not: a drop-in sqlite3.** Be clear-eyed about this before you plan
-around it. mpedb's SQL is a narrow subset: aggregates, `GROUP BY`/`HAVING` and
-`DISTINCT` and two-table `INNER JOIN` are in, but there are no subqueries, no
-outer joins and no joins past two tables — so a Django test suite will not run
-against it. Today mpedb is a
-validation and staging tool in that workflow, not the thing your ORM talks to.
-See [SQL support](#sql-support) for the exact surface, measured against the
-binary.
+around it. mpedb's SQL is a real subset that keeps growing — aggregates,
+`GROUP BY`/`HAVING`, `DISTINCT`, N-way `INNER JOIN` chains with aliases and
+self-joins, `LEFT JOIN`, and secondary indexes the planner actually uses are
+in — but there are no subqueries, no `RIGHT`/`FULL`/`CROSS` joins, and no
+`CREATE TABLE` yet (the live-DDL plan is [`DESIGN-DDL.md`](DESIGN-DDL.md)) — so
+a Django test suite will not run against it. Today mpedb is a validation and
+staging tool in that workflow, not the thing your ORM talks to. See
+[SQL support](#sql-support) for the exact surface, measured against the binary.
 
 This cuts both ways, and honestly so: hardening mpedb against real sqlite3
 databases is how mpedb gets hardened. Every dialect mismatch found by importing
@@ -94,7 +97,7 @@ than either ancestor. It is not there yet; see Status.
 
 **Many processes writing one file, and none of them has to cope with that.**
 This is the point. Concurrent *readers* are not — sqlite3 in WAL mode has those,
-and in a like-for-like durable comparison it out-reads mpedb (649k vs 567k
+and in a like-for-like durable comparison it out-reads mpedb (658k vs 561k
 reads/s; [BENCHMARKS.md](BENCHMARKS.md)). What sqlite3 does not give you is
 several processes *writing* without `SQLITE_BUSY`, a retry loop and a
 `busy_timeout` — the benchmark's sqlite3 adapter needs a **60-second**
@@ -268,30 +271,41 @@ the design rather than a todo list.
 | `COUNT` / `SUM` / `AVG` / `MIN` / `MAX`, `GROUP BY` / `HAVING` | ✅ | NULL rules verified against sqlite 3.45 |
 | `SELECT DISTINCT`, `COUNT(DISTINCT x)` | ✅ | |
 | `ORDER BY` by name, by ordinal (`ORDER BY 1`), or by a selected expression | ✅ | the key must be in the output; see below |
-| `INNER JOIN` of two tables (`FROM a JOIN b ON …`), incl. aggregates over it | ✅ | nested loop, no pushdown; RLS applies to both sides |
-| **3+ table joins, `LEFT`/`RIGHT`/`FULL`/`CROSS`, self-joins** | ❌ | refused by name, not half-done |
-| **Subqueries, `EXISTS`, cross-FILE refs** | ❌ | not yet |
-| **`CREATE TABLE` / `ALTER`** | ❌ | **by design** — schema comes from the config or `mirror import`; see [DESIGN-MIRROR §7](DESIGN-MIRROR.md) |
+| N-way `INNER JOIN` chains (`FROM a JOIN b ON … JOIN c ON …`), incl. aggregates over them | ✅ | index nested loop when the `ON` has an equality; RLS applies to every side |
+| Table aliases (`FROM emp e JOIN emp b ON …`) and self-joins | ✅ | alias shadows the table name, as in PostgreSQL |
+| `LEFT [OUTER] JOIN` | ✅ | NULL-extends on no match; `WHERE inner IS NULL` anti-joins work |
+| Secondary indexes: `unique = true` and non-unique `indexed = true` | ✅ | equality and range (`IndexScan`/`IndexRange`) — `EXPLAIN` shows which |
+| Loose typing per column: `type = "any"` | ✅ | refused in keys and `UNIQUE`; the mirror pre-flight refuses pushing it to PG |
+| **`RIGHT`/`FULL`/`CROSS` joins** | ❌ | refused by name (`RIGHT` comes with the hint: swap the tables, write `LEFT`) |
+| **Subqueries, `EXISTS`, cross-FILE refs** | ❌ | not yet — planned (uncorrelated subplans first) |
+| **`CREATE TABLE` / `ALTER`** | ❌ | today: schema comes from the config or `mirror import`; live DDL is designed in [`DESIGN-DDL.md`](DESIGN-DDL.md) |
 
-**Joins, and what they cost.** A two-table `INNER JOIN` works. The footprint was
-always able to describe it — `tables_read` is a `u64` **bitmap** and
-`conflicts_with` is a bitmap AND — so a joined read claims one bit per table and
-groups correctly; what was single-table was the *binder*. (An earlier version of
-this README called joins a permanent design boundary. That was wrong.)
+**Joins, and what they cost.** Joins are a left-deep chain of up to 16 tables,
+with aliases and self-joins. When a join's `ON` contains a plain equality
+(`ON child.parent_id = parent.id`), the planner **consumes it into the inner
+fetch**: each outer row does one PK get / index probe instead of pairing with a
+held full scan — the index nested loop, preferring the PK, then a unique index,
+then a non-unique one. Anything else in the `ON` stays as a residual over the
+joined row. An `ON` with no equality keeps the read-once-and-hold nested loop
+with its honest `O(n*m)` label. `EXPLAIN` says which form you got and where the
+equality went.
 
-Two honest caveats. It is a **nested loop with no predicate pushdown**: the inner
-side is read once and held, and every conjunct of your `WHERE` waits for the
-joined row, so both sides are full scans unless an RLS policy pins a key.
-`EXPLAIN` says so. And the statement's `key_access` widens to `Full`, because that
-field names one key space and a Point on the outer stops describing what the
-statement reads once a second table joins in — that costs conflict precision for
-concurrent writers, never correctness.
+`LEFT JOIN` NULL-extends on no match — the extended row is built *because*
+nothing matched, so the `ON` is never evaluated over it and cannot raise on it.
 
-RLS applies to **both** sides, each policy over its own row and before the `ON`
-condition — mpedb's expressions can raise, and a raise is observable, so an `ON`
-that divides by a hidden row's column would report that row's existence without
-returning it. The plan stamps every table whose policy it baked in, so tightening
-either side's policy invalidates a cached join plan.
+One structural caveat stands: the statement's `key_access` widens to `Full`,
+because that field names one key space and a Point on the outer stops
+describing what the statement reads once a second table joins in — that costs
+conflict precision for concurrent writers, never correctness.
+
+RLS applies to **every** side, each policy over its own row and before the `ON`
+(or its pushed-down residual) — mpedb's expressions can raise, and a raise is
+observable, so an `ON` that divides by a hidden row's column would report that
+row's existence without returning it. Under `LEFT JOIN`, a policy-hidden inner
+row reads as *absent*: the outer row survives NULL-extended and never carries
+the hidden row's values. The plan stamps every table whose policy it baked in,
+so tightening any side's policy invalidates a cached join plan. This ordering
+contract is mutation-tested on the raise path, in both execution forms.
 
 The scaling story is still *more files* where it can be: separate files are
 separate writer locks, and that is the only OS-enforced isolation boundary here.
@@ -305,11 +319,13 @@ engines allow it. And under `SELECT DISTINCT` the key must be in the `SELECT`
 list, as in PostgreSQL: once duplicates collapse, a key outside the output means
 *which* duplicate survived is what decides the order, and the query never said.
 
-**Why no `CREATE TABLE`.** A table's id is its index in the name-sorted table
-vector, and that id keys the catalog's B+tree roots, the CDC capture bitmap, and
-the mirror's per-table state. Adding `accounts` to a database holding `orders` and
-`users` would renumber both and point `accounts` at `orders`' rows. Schema change
-is therefore a *rebuild* (`mirror regenerate`), not an in-place edit.
+**Why no `CREATE TABLE` (yet).** A table's id is its index in the name-sorted
+table vector, and that id keys the catalog's B+tree roots, the CDC capture
+bitmap, and the mirror's per-table state. Adding `accounts` to a database holding
+`orders` and `users` would renumber both and point `accounts` at `orders`' rows.
+Schema change is therefore a *rebuild* (`mirror regenerate`) today. Live DDL on a
+running multi-process database is designed — [`DESIGN-DDL.md`](DESIGN-DDL.md) —
+and stable table ids are its explicit stage 0, precisely because of this trap.
 
 ## Performance
 
@@ -324,6 +340,15 @@ Two things to know before reading any of it: numbers are only comparable
 durable on ack), and the machine must be **idle** — a stray process holding one
 of this box's two cores *compressed* the parallelism results (6.8× → 2.4×)
 rather than merely adding noise.
+
+And three practical rules the numbers keep teaching: for **durable writing use
+`durability = "wal"`**, not commit-mode — a lone commit-mode writer pays a
+serialized flush per commit, while wal wins its class outright; on **macOS,
+commit-mode pays two platter flushes by design** (data before meta is the
+crash-safety ordering — two is the floor, not a bug); and the **cold blob
+numbers measure a fresh file** — a long-lived process sees roughly 4× better,
+because the first write to each mapped page pays a fault the steady state does
+not.
 
 And one finding worth stealing even if you never use mpedb: **for deciding
 whether a change helped, a Raspberry Pi 3 running a live ADS-B decoder is a 6×
@@ -389,6 +414,10 @@ would block every other writer for as long as the network took. This is also why
 sqlite's `sqlite3_blob_open` shape does not port — it assumes in-place mutation
 of an existing blob, and mpedb is COW, so an "in-place" write would copy the
 whole chain and hand back the memory win it existed to get.
+
+"Put this file in the database" is one call on top of it:
+`WriteSession::insert_file(table, values, stream_col, path)` opens the file and
+streams it in under the same memory ceiling.
 
 **Large blobs got 77% faster (2026-07-16).** `row::encode_row` materialised the
 whole row — blob included — into a fresh heap buffer whose only purpose was to be
@@ -530,6 +559,8 @@ concurrency, lock, or commit-path code:**
 - [`DESIGN.md`](DESIGN.md) — the core engine, concurrency, and crash-safety protocols.
 - [`DESIGN-MULTIDB.md`](DESIGN-MULTIDB.md) — parallel databases + cooperative RLS.
 - [`DESIGN-MIRROR.md`](DESIGN-MIRROR.md) — bidirectional sqlite/PostgreSQL mirroring & migration.
+- [`DESIGN-DDL.md`](DESIGN-DDL.md) — live `CREATE`/`DROP`/`ALTER TABLE` on a running
+  multi-process database (design; stable table ids are stage 0).
 - [`DESIGN-MACOS-LOCK.md`](DESIGN-MACOS-LOCK.md) — the FLD-2 macOS crash-safe writer lock.
 - [`DESIGN-MPEE-OPT.md`](DESIGN-MPEE-OPT.md), [`DESIGN-PHASE3.md`](DESIGN-PHASE3.md) —
   measured-and-documented explorations (including directions that were falsified
