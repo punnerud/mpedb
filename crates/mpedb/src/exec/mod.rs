@@ -6,7 +6,7 @@ use crate::ExecResult;
 use mpedb_core::{ReadTxn, WriteTxn};
 use mpedb_sql::{
     AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, Join, JoinKind,
-    OrderOver, PlanOnConflict, PlanStmt, Projection, SelectPlan,
+    CompoundPlan, OrderOver, PlanOnConflict, PlanStmt, Projection, SelectPlan, SetOp,
 };
 use mpedb_types::{
     keycode, Accum, DefaultExpr, Error, ExprProgram, KeyBound, KeyPart, Result, Schema, TableDef,
@@ -416,21 +416,108 @@ fn exec_stmt_impl(
 ) -> Result<ExecResult> {
     validate_params(plan, params)?;
     match &plan.stmt {
-        PlanStmt::Select(SelectPlan {
-            table,
-            access,
-            joins,
-            joined_filter,
-            filter,
-            projection,
-            order_by,
-            limit,
-            offset,
-            aggregate,
-            distinct,
-            order_over,
-            order_junk,
-        }) => {
+        PlanStmt::Select(sp) => exec_select(ctx, schema, plan, params, sp),
+        PlanStmt::Compound(c) => exec_compound(ctx, schema, plan, params, c),
+        _other => exec_stmt_rest(ctx, schema, plan, params, partial),
+    }
+}
+
+/// Combine already-projected rows under one set operator, left-associatively.
+/// `UNION`/`EXCEPT`/`INTERSECT` are SET ops: the result is deduplicated (and
+/// NULLs count as equal — the set-op rule, same as DISTINCT); only
+/// `UNION ALL` keeps duplicates. Keys are the memcmp row encoding, for the
+/// same reason DISTINCT uses it: Value is neither Hash nor Ord, and the
+/// encoding is total even across types.
+fn apply_set_op(acc: Vec<Vec<Value>>, right: Vec<Vec<Value>>, op: SetOp) -> Vec<Vec<Value>> {
+    use std::collections::HashSet;
+    let dedup = |rows: Vec<Vec<Value>>| {
+        let mut seen = HashSet::new();
+        rows.into_iter()
+            .filter(|r| seen.insert(keycode::encode_key(r)))
+            .collect::<Vec<_>>()
+    };
+    match op {
+        SetOp::UnionAll => {
+            let mut acc = acc;
+            acc.extend(right);
+            acc
+        }
+        SetOp::Union => {
+            let mut acc = acc;
+            acc.extend(right);
+            dedup(acc)
+        }
+        SetOp::Except | SetOp::Intersect => {
+            let rset: std::collections::HashSet<Vec<u8>> =
+                right.iter().map(|r| keycode::encode_key(r)).collect();
+            let keep_present = matches!(op, SetOp::Intersect);
+            dedup(acc)
+                .into_iter()
+                .filter(|r| rset.contains(&keycode::encode_key(r)) == keep_present)
+                .collect()
+        }
+    }
+}
+
+fn exec_compound(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    c: &CompoundPlan,
+) -> Result<ExecResult> {
+    // Arms carry no ORDER BY/LIMIT of their own (validate enforces it), so
+    // each arm materializes exactly its projected rows. The FIRST arm names
+    // the output — sqlite's and PG's rule.
+    let mut arms = c.arms.iter();
+    let first = arms.next().ok_or_else(|| internal("compound with no arms"))?;
+    let ExecResult::Rows { columns, rows } = exec_select(ctx, schema, plan, params, first)? else {
+        return Err(internal("compound arm produced no rows"));
+    };
+    let mut acc = rows;
+    for (arm, op) in arms.zip(&c.ops) {
+        let ExecResult::Rows { rows, .. } = exec_select(ctx, schema, plan, params, arm)? else {
+            return Err(internal("compound arm produced no rows"));
+        };
+        acc = apply_set_op(acc, rows, *op);
+    }
+    if !c.order_by.is_empty() {
+        sort_rows(&mut acc, &c.order_by);
+    }
+    let skip = c.offset.unwrap_or(0).min(usize::MAX as u64) as usize;
+    let take = c.limit.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
+    if skip > 0 || take != usize::MAX {
+        acc = acc.into_iter().skip(skip).take(take).collect();
+    }
+    Ok(ExecResult::Rows { columns, rows: acc })
+}
+
+/// One SELECT — shared verbatim between a top-level SELECT and each compound
+/// arm, so the two can never drift.
+fn exec_select(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    sp: &SelectPlan,
+) -> Result<ExecResult> {
+    let SelectPlan {
+        table,
+        access,
+        joins,
+        joined_filter,
+        filter,
+        projection,
+        order_by,
+        limit,
+        offset,
+        aggregate,
+        distinct,
+        order_over,
+        order_junk,
+    } = sp;
+    {
+        {
             let t = table_def(schema, *table)?;
             // DISTINCT makes LIMIT bound DISTINCT rows, so the scan bound (and
             // the top-K path, which is the same bound wearing a hat) must not
@@ -603,7 +690,20 @@ fn exec_stmt_impl(
                 .collect::<Result<Vec<String>>>()?;
             Ok(ExecResult::Rows { columns, rows: out })
         }
+    }
+}
 
+fn exec_stmt_rest(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    partial: &mut bool,
+) -> Result<ExecResult> {
+    match &plan.stmt {
+        PlanStmt::Select(_) | PlanStmt::Compound(_) => {
+            unreachable!("handled by exec_stmt_impl")
+        }
         PlanStmt::Insert {
             table,
             rows,

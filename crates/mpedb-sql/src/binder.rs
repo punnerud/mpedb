@@ -172,6 +172,15 @@ impl<'a> Scope<'a> {
     ///
     /// The single place that answers "what is slot N called", so EXPLAIN, the
     /// output header and an error message cannot drift apart.
+    /// Column types of the whole tuple, in slot order — the concatenation of
+    /// the scoped tables' columns.
+    pub fn slot_types(&self) -> Vec<ColumnType> {
+        self.tables
+            .iter()
+            .flat_map(|t| t.columns.iter().map(|c| c.ty))
+            .collect()
+    }
+
     pub fn slot_name(&self, c: u16) -> String {
         let mut base = 0usize;
         for t in &self.tables {

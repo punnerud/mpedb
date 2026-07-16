@@ -137,6 +137,9 @@ impl ShardSet {
                 }
                 _ => Ok(Route::All),
             },
+            // A compound reads several access paths; per-shard routing has no
+            // single key to hash, so it fans out like any non-point read.
+            PlanStmt::Compound(_) => Ok(Route::All),
             PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => Err(Error::Unsupported(
                 "explicit transactions are not supported on a ShardSet (v1)".into(),
             )),

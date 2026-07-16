@@ -7,26 +7,75 @@ impl CompiledPlan {
     /// (recomputed from scratch and compared, so a forged footprint in an
     /// otherwise well-formed blob is rejected).
     pub(crate) fn validate(&self, schema: &Schema) -> Result<()> {
+        match &self.stmt {
+            PlanStmt::Select(sp) => self.validate_select(sp, schema)?,
+            PlanStmt::Compound(c) => {
+                if !(2..=MAX_COMPOUND_ARMS).contains(&c.arms.len()) {
+                    return Err(corrupt("compound arm count out of range"));
+                }
+                if c.ops.len() != c.arms.len() - 1 {
+                    return Err(corrupt("compound op count does not match arm count"));
+                }
+                let arity = c.arms[0].projection.len();
+                for arm in &c.arms {
+                    // The compound owns ORDER BY/LIMIT — SQL cannot express
+                    // them per arm, so an arm carrying its own is forged. And
+                    // with no junk, `projection.len()` IS the output arity,
+                    // which the set ops and the compound sort both index.
+                    if !arm.order_by.is_empty()
+                        || arm.order_junk != 0
+                        || arm.limit.is_some()
+                        || arm.offset.is_some()
+                    {
+                        return Err(corrupt("compound arm carries its own ORDER BY/LIMIT"));
+                    }
+                    if arm.projection.len() != arity {
+                        return Err(corrupt("compound arms disagree on output arity"));
+                    }
+                    self.validate_select(arm, schema)?;
+                }
+                for (i, _) in &c.order_by {
+                    if *i as usize >= arity {
+                        return Err(corrupt("compound order-by column out of range"));
+                    }
+                }
+            }
+            _other => self.validate_rest(schema)?,
+        }
+        // Footprint consistency for EVERY statement kind: recomputed from
+        // scratch and compared, so a forged footprint in an otherwise
+        // well-formed blob is rejected.
+        let recomputed = planner::compute_footprint(&self.stmt, schema)?;
+        if recomputed != self.footprint {
+            return Err(corrupt("plan footprint does not match its statement"));
+        }
+        Ok(())
+    }
+
+    /// Everything `validate` checks about one SELECT — shared verbatim between
+    /// a top-level SELECT and each compound arm, so the two can never drift.
+    fn validate_select(&self, sp: &SelectPlan, schema: &Schema) -> Result<()> {
         let get_table = |id: u32| {
             schema
                 .table(id)
                 .ok_or_else(|| corrupt(format!("table id {id} out of range")))
         };
-        match &self.stmt {
-            PlanStmt::Select(SelectPlan {
-                table,
-                access,
-                joins,
-                joined_filter,
-                filter,
-                projection,
-                order_by,
-                order_over,
-                aggregate,
-                distinct,
-                order_junk,
-                ..
-            }) => {
+        {
+            {
+                let SelectPlan {
+                    table,
+                    access,
+                    joins,
+                    joined_filter,
+                    filter,
+                    projection,
+                    order_by,
+                    order_over,
+                    aggregate,
+                    distinct,
+                    order_junk,
+                    ..
+                } = sp;
                 let t = get_table(*table)?;
                 // Junk columns are sort-only and get trimmed, so they must not
                 // be able to (a) eat the whole output, (b) survive a DISTINCT —
@@ -169,6 +218,22 @@ impl CompiledPlan {
                         return Err(corrupt("order-by column out of range"));
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    /// The DML/txn arms of `validate` — split from the SELECT/compound arms
+    /// only so `validate_select` can be shared with compound arms.
+    fn validate_rest(&self, schema: &Schema) -> Result<()> {
+        let get_table = |id: u32| {
+            schema
+                .table(id)
+                .ok_or_else(|| corrupt(format!("table id {id} out of range")))
+        };
+        match &self.stmt {
+            PlanStmt::Select(_) | PlanStmt::Compound(_) => {
+                unreachable!("handled by validate")
             }
             PlanStmt::Insert {
                 table,
@@ -317,10 +382,6 @@ impl CompiledPlan {
                 }
             }
             PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => {}
-        }
-        let recomputed = planner::compute_footprint(&self.stmt, schema)?;
-        if recomputed != self.footprint {
-            return Err(corrupt("plan footprint does not match its statement"));
         }
         Ok(())
     }

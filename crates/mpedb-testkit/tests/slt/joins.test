@@ -382,8 +382,11 @@ SELECT emp.eid FROM emp RIGHT JOIN dept ON emp.did = dept.did
 statement error FULL JOIN is not supported
 SELECT emp.eid FROM emp FULL OUTER JOIN dept ON emp.did = dept.did
 
-statement error CROSS JOIN is not supported
-SELECT emp.eid FROM emp CROSS JOIN dept
+# CROSS JOIN is the cartesian product, same desugar as the comma-join (#56).
+query I nosort
+SELECT count(*) FROM emp CROSS JOIN dept
+----
+12
 
 # A qualifier that names no table in the statement is a typo, not a hint.
 statement error no table named

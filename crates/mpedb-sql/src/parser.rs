@@ -6,9 +6,10 @@
 //! Comparisons do not chain (`a < b < c` is a parse error).
 
 use crate::ast::{
-    BinOp, DeleteStmt, Expr, InsertStmt, JoinClause, JoinKind, OnConflict, SelectStmt, Stmt,
-    UnOp, UpdateStmt,
+    BinOp, CompoundStmt, DeleteStmt, Expr, InsertStmt, JoinClause, JoinKind, OnConflict,
+    SelectStmt, Stmt, UnOp, UpdateStmt,
 };
+use crate::plan::SetOp;
 use crate::ddl::{CreatePolicySpec, DdlStmt, RlsAction};
 use crate::token::{tokenize, Kw, SpTok, Tok};
 use mpedb_types::{Error, PolicyCmd, Result, Value};
@@ -70,6 +71,9 @@ const MAX_EXPR_DEPTH: u32 = 2000;
 /// re-validated on the decode side — keep in sync with
 /// `CompiledPlan::decode` (plan.rs).
 pub(crate) const MAX_SELECT_ITEMS: usize = 4096;
+/// Ceiling on compound SELECT arms — must not exceed the plan decoder's
+/// `MAX_COMPOUND_ARMS` (both are 64; the corpus' longest chain is 9).
+const MAX_COMPOUND_ARMS: usize = 64;
 pub(crate) const MAX_ORDER_BY_ITEMS: usize = 64;
 pub(crate) const MAX_SET_ITEMS: usize = 1024;
 
@@ -499,7 +503,68 @@ impl<'a> Parser<'a> {
         }
     }
 
+    /// `SELECT …`, or a compound chain `SELECT … UNION [ALL]/EXCEPT/INTERSECT
+    /// SELECT …`. Ops apply left-associatively with equal precedence (sqlite's
+    /// rule; PostgreSQL binds INTERSECT tighter — documented deviation).
     fn select_stmt(&mut self) -> Result<Stmt> {
+        let first = self.select_core()?;
+        if self.peek_compound_op().is_none() {
+            return Ok(Stmt::Select(first));
+        }
+        let mut arms = vec![first];
+        let mut ops = Vec::new();
+        while let Some(word) = self.peek_compound_op() {
+            self.pos += 1;
+            let op = match word {
+                "UNION" => {
+                    if self.eat_word("ALL") {
+                        SetOp::UnionAll
+                    } else {
+                        SetOp::Union
+                    }
+                }
+                "EXCEPT" => SetOp::Except,
+                _ => SetOp::Intersect,
+            };
+            // ORDER BY / LIMIT bind to the WHOLE compound and can therefore
+            // only follow the LAST arm — sqlite and PG both reject this shape.
+            let prev = arms.last().expect("at least one arm");
+            if !prev.order_by.is_empty() || prev.limit.is_some() || prev.offset.is_some() {
+                return Err(self.err_here(
+                    "ORDER BY / LIMIT / OFFSET apply to the whole compound — move them                      after the last SELECT",
+                ));
+            }
+            if arms.len() >= MAX_COMPOUND_ARMS {
+                return Err(self.err_here(format!(
+                    "too many compound SELECT arms (max {MAX_COMPOUND_ARMS})"
+                )));
+            }
+            ops.push(op);
+            arms.push(self.select_core()?);
+        }
+        // The trailing clauses parsed into the last arm; they belong to the
+        // compound. Ordinals / names in them resolve against the OUTPUT.
+        let last = arms.last_mut().expect("at least two arms");
+        let order_by = std::mem::take(&mut last.order_by);
+        let limit = last.limit.take();
+        let offset = last.offset.take();
+        Ok(Stmt::Compound(CompoundStmt { arms, ops, order_by, limit, offset }))
+    }
+
+    /// The next token starts a compound set operator, without consuming it.
+    /// UNION / EXCEPT / INTERSECT are positional words, not keywords — a
+    /// quoted identifier is how you'd name a table `union`.
+    fn peek_compound_op(&self) -> Option<&'static str> {
+        let w = match self.peek() {
+            Some(Tok::Ident(w)) => w,
+            _ => return None,
+        };
+        ["UNION", "EXCEPT", "INTERSECT"]
+            .into_iter()
+            .find(|k| w.eq_ignore_ascii_case(k))
+    }
+
+    fn select_core(&mut self) -> Result<SelectStmt> {
         self.expect_kw(Kw::Select, "SELECT")?;
         let distinct = self.eat_kw(Kw::Distinct);
         let items = if self.eat(&Tok::Star) {
@@ -552,13 +617,24 @@ impl<'a> Parser<'a> {
                 let _ = self.eat_word("OUTER");
                 self.expect_kw(Kw::Join, "JOIN after LEFT")?;
                 joins.push(self.join_tail(JoinKind::Left)?);
+            } else if matches!(self.peek_join_kind(), Some("CROSS")) {
+                // `CROSS JOIN t` is the cartesian product written in the
+                // syntax whose whole meaning is "every pair" — exactly the
+                // comma-join, so it desugars the same way (no ON clause).
+                self.pos += 1;
+                self.expect_kw(Kw::Join, "JOIN after CROSS")?;
+                let t = self.ident("table name after CROSS JOIN")?;
+                let alias = self.opt_table_alias()?;
+                joins.push(JoinClause {
+                    table: t,
+                    alias,
+                    kind: JoinKind::Inner,
+                    on: Expr::Lit(Value::Bool(true)),
+                });
             } else if let Some(kind) = self.peek_join_kind() {
                 return Err(self.err_here(format!(
-                    "{kind} JOIN is not supported — only INNER and LEFT JOIN. {}",
+                    "{kind} JOIN is not supported — only INNER, LEFT and CROSS JOIN. {}",
                     match kind {
-                        "CROSS" =>
-                            "A cross join is a cartesian product; write INNER JOIN with an ON \
-                             condition, or if you really want every pair, `JOIN … ON true`.",
                         "RIGHT" =>
                             "A RIGHT JOIN is a LEFT JOIN with the tables swapped — swap them \
                              and write LEFT JOIN.",
@@ -631,7 +707,7 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        Ok(Stmt::Select(SelectStmt {
+        Ok(SelectStmt {
             table,
             alias: from_alias,
             joins,
@@ -643,7 +719,7 @@ impl<'a> Parser<'a> {
             order_by,
             limit,
             offset,
-        }))
+        })
     }
 
     /// One SELECT-list item: `expr [[AS] alias]`. A bare identifier right
@@ -690,7 +766,12 @@ impl<'a> Parser<'a> {
         if matches!(self.peek(), Some(Tok::QuotedIdent(_))) {
             return Ok(Some(self.ident("table alias")?));
         }
-        if matches!(self.peek(), Some(Tok::Ident(_))) && self.peek_join_kind().is_none() {
+        if matches!(self.peek(), Some(Tok::Ident(_)))
+            && self.peek_join_kind().is_none()
+            // …nor is a compound operator: `FROM t1 UNION SELECT` must not
+            // read `UNION` as t1's alias and lose the second arm.
+            && self.peek_compound_op().is_none()
+        {
             return Ok(Some(self.ident("table alias")?));
         }
         Ok(None)
@@ -1401,6 +1482,47 @@ mod tests {
         );
         // lone `|` is a clear parse error, not a mystery token
         assert!(parse_expr_only("a | b").is_err());
+    }
+
+    /// A compound chain parses left-associatively, hoists the trailing
+    /// ORDER BY/LIMIT to the compound, and rejects them mid-chain.
+    #[test]
+    fn compound_selects_parse() {
+        let stmt = |src: &str| parse_statement(src).unwrap().0;
+        let Stmt::Compound(c) =
+            stmt("SELECT a FROM t UNION ALL SELECT b FROM u UNION SELECT c FROM v ORDER BY 1 LIMIT 3")
+        else {
+            panic!("expected a compound");
+        };
+        assert_eq!(c.arms.len(), 3);
+        assert_eq!(c.ops, vec![SetOp::UnionAll, SetOp::Union]);
+        // hoisted off the last arm
+        assert_eq!(c.order_by.len(), 1);
+        assert_eq!(c.limit, Some(3));
+        assert!(c.arms.iter().all(|a| a.order_by.is_empty() && a.limit.is_none()));
+
+        let Stmt::Compound(c) = stmt("SELECT a FROM t EXCEPT SELECT a FROM u") else {
+            panic!("expected a compound");
+        };
+        assert_eq!(c.ops, vec![SetOp::Except]);
+        let Stmt::Compound(c) = stmt("SELECT a FROM t INTERSECT SELECT a FROM u") else {
+            panic!("expected a compound");
+        };
+        assert_eq!(c.ops, vec![SetOp::Intersect]);
+
+        // ORDER BY mid-chain is an error, not a silent per-arm sort.
+        assert!(parse_statement("SELECT a FROM t ORDER BY a UNION SELECT b FROM u").is_err());
+        // `union` is not eaten as a table alias.
+        assert!(matches!(
+            stmt("SELECT a FROM t UNION SELECT b FROM u"),
+            Stmt::Compound(_)
+        ));
+        // CROSS JOIN desugars like the comma-join.
+        let Stmt::Select(s) = stmt("SELECT a FROM t CROSS JOIN u") else {
+            panic!("expected a select");
+        };
+        assert_eq!(s.joins.len(), 1);
+        assert_eq!(s.joins[0].on, Expr::Lit(Value::Bool(true)));
     }
 
     fn col(name: &str) -> Box<Expr> {

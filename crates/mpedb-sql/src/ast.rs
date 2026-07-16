@@ -2,11 +2,14 @@
 //! Carries no source text except literal values and identifiers, so plans
 //! built from it are automatically whitespace/keyword-case canonical.
 
+use crate::plan::SetOp;
 use mpedb_types::Value;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Stmt {
     Select(SelectStmt),
+    /// `SELECT … UNION/EXCEPT/INTERSECT SELECT …` — set-operator chain.
+    Compound(CompoundStmt),
     Insert(InsertStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
@@ -45,6 +48,21 @@ pub(crate) struct SelectStmt {
     /// not a name. The planner still requires each item to REDUCE to a column
     /// of the output tuple — sorting by a computed expression is rejected, not
     /// silently mis-sorted.
+    pub order_by: Vec<(Expr, bool)>,
+    pub limit: Option<u64>,
+    pub offset: Option<u64>,
+}
+
+/// A compound SELECT. `arms[0] ops[0] arms[1] …`, left-associative (sqlite's
+/// precedence — the corpus' expected results assume it). The trailing
+/// ORDER BY / LIMIT / OFFSET belong to the WHOLE compound; the parser rejects
+/// them on any arm but the last, and hoists the last arm's out to here.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct CompoundStmt {
+    pub arms: Vec<SelectStmt>,
+    /// `ops.len() == arms.len() - 1`.
+    pub ops: Vec<SetOp>,
+    /// Over the compound OUTPUT: an ordinal or a first-arm output name.
     pub order_by: Vec<(Expr, bool)>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,

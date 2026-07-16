@@ -3,6 +3,59 @@ use super::*;
 impl CompiledPlan {
     /// Human-readable plan rendering for `EXPLAIN`.
     pub fn explain(&self, schema: &Schema) -> String {
+        let mut out = String::new();
+        match &self.stmt {
+            PlanStmt::Select(sp) => self.render_select(sp, schema, &mut out),
+            PlanStmt::Compound(c) => {
+                out.push_str(&format!("Compound ({} arms)\n", c.arms.len()));
+                for (k, arm) in c.arms.iter().enumerate() {
+                    if k > 0 {
+                        out.push_str(match c.ops[k - 1] {
+                            SetOp::Union => "UNION\n",
+                            SetOp::UnionAll => "UNION ALL\n",
+                            SetOp::Except => "EXCEPT\n",
+                            SetOp::Intersect => "INTERSECT\n",
+                        });
+                    }
+                    self.render_select(arm, schema, &mut out);
+                }
+                if !c.order_by.is_empty() {
+                    let items: Vec<String> = c
+                        .order_by
+                        .iter()
+                        .map(|(i, desc)| {
+                            format!("output#{}{}", i + 1, if *desc { " DESC" } else { " ASC" })
+                        })
+                        .collect();
+                    out.push_str(&format!("order by: {}\n", items.join(", ")));
+                }
+                if let Some(n) = c.limit {
+                    out.push_str(&format!("limit: {n}\n"));
+                }
+                if let Some(n) = c.offset {
+                    out.push_str(&format!("offset: {n}\n"));
+                }
+            }
+            _other => self.render_rest(schema, &mut out),
+        }
+        out.push_str(&format!(
+            "  footprint: read_only={} tables_read={:#x} tables_written={:#x} indexes_used={:#x} key={}\n",
+            self.footprint.read_only,
+            self.footprint.tables_read,
+            self.footprint.tables_written,
+            self.footprint.indexes_used,
+            match &self.footprint.key_access {
+                mpedb_types::KeyAccess::Point(_) => "Point",
+                mpedb_types::KeyAccess::Range { .. } => "Range",
+                mpedb_types::KeyAccess::Full => "Full",
+            }
+        ));
+        out
+    }
+
+    /// Render one SELECT — shared between a top-level SELECT and each
+    /// compound arm.
+    fn render_select(&self, sp: &SelectPlan, schema: &Schema, out: &mut String) {
         let table_name = |id: u32| {
             schema
                 .table(id)
@@ -16,9 +69,8 @@ impl CompiledPlan {
                 _ => format!("col#{c}"),
             }
         };
-        let mut out = String::new();
-        match &self.stmt {
-            PlanStmt::Select(SelectPlan {
+        {
+            let SelectPlan {
                 table,
                 access,
                 joins,
@@ -32,7 +84,8 @@ impl CompiledPlan {
                 aggregate,
                 distinct,
                 order_junk,
-            }) => {
+            } = sp;
+            {
                 // With a join every tuple below is `[outer ‖ inner]`, so the
                 // namer has to span both — and it qualifies, because `did` alone
                 // would not say which side, and both sides usually have one.
@@ -195,6 +248,28 @@ impl CompiledPlan {
                     out.push_str(&format!("  offset: {n}\n"));
                 }
             }
+        }
+    }
+
+    /// The DML/txn arms of `explain`.
+    fn render_rest(&self, schema: &Schema, out: &mut String) {
+        let table_name = |id: u32| {
+            schema
+                .table(id)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| format!("table#{id}"))
+        };
+        let col_namer = |id: u32| {
+            let t = schema.table(id).cloned();
+            move |c: u16| match &t {
+                Some(t) if (c as usize) < t.columns.len() => t.columns[c as usize].name.clone(),
+                _ => format!("col#{c}"),
+            }
+        };
+        match &self.stmt {
+            PlanStmt::Select(_) | PlanStmt::Compound(_) => {
+                unreachable!("handled by explain")
+            }
             PlanStmt::Insert {
                 table,
                 rows,
@@ -308,19 +383,6 @@ impl CompiledPlan {
             PlanStmt::Commit => out.push_str("Commit\n"),
             PlanStmt::Rollback => out.push_str("Rollback\n"),
         }
-        out.push_str(&format!(
-            "  footprint: read_only={} tables_read={:#x} tables_written={:#x} indexes_used={:#x} key={}\n",
-            self.footprint.read_only,
-            self.footprint.tables_read,
-            self.footprint.tables_written,
-            self.footprint.indexes_used,
-            match &self.footprint.key_access {
-                mpedb_types::KeyAccess::Point(_) => "Point",
-                mpedb_types::KeyAccess::Range { .. } => "Range",
-                mpedb_types::KeyAccess::Full => "Full",
-            }
-        ));
-        out
     }
 
     fn render_const(&self, i: u16) -> String {

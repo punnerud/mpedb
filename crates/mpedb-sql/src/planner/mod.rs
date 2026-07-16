@@ -10,11 +10,22 @@ use std::collections::BTreeSet;
 /// types, the session-context keys it referenced (in reserved-slot order), and
 /// the subset of those keys that are `IN` list slots (§2.6 — those have no
 /// scalar type, so the type-inference guard skips them).
-type PlannedStmt = (PlanStmt, Vec<Option<ColumnType>>, Vec<String>, BTreeSet<String>);
+// (stmt, param_types, context_keys, list_keys, out_types).
+// `out_types` = the caller-visible output columns' types (order-junk excluded);
+// `None` = unpinned (a bare NULL item). Only compound planning consumes it —
+// DML producers return an empty vec.
+type PlannedStmt = (
+    PlanStmt,
+    Vec<Option<ColumnType>>,
+    Vec<String>,
+    BTreeSet<String>,
+    Vec<Option<ColumnType>>,
+);
 use crate::binder::{compile_program, BExpr, Binder, Scope};
 use crate::plan::{
     render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource,
-    Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp, Projection, SelectPlan,
+    CompoundPlan, Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp, Projection,
+    SelectPlan,
 };
 use crate::policy::{PolicyCatalog, TablePolicies};
 use mpedb_types::{ExprProgram, ColumnType, Error, Footprint, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
@@ -273,11 +284,13 @@ pub(crate) fn plan_statement(
     catalog: &PolicyCatalog,
 ) -> Result<CompiledPlan> {
     let mut consts: Vec<Value> = Vec::new();
-    let (plan_stmt, param_types, context_keys, list_keys) = match stmt {
-        ast::Stmt::Begin => (PlanStmt::Begin, vec![None; n_params as usize], Vec::new(), BTreeSet::new()),
-        ast::Stmt::Commit => (PlanStmt::Commit, vec![None; n_params as usize], Vec::new(), BTreeSet::new()),
-        ast::Stmt::Rollback => (PlanStmt::Rollback, vec![None; n_params as usize], Vec::new(), BTreeSet::new()),
+    let txn = |p: PlanStmt| (p, vec![None; n_params as usize], Vec::new(), BTreeSet::new(), Vec::new());
+    let (plan_stmt, param_types, context_keys, list_keys, _out_types) = match stmt {
+        ast::Stmt::Begin => txn(PlanStmt::Begin),
+        ast::Stmt::Commit => txn(PlanStmt::Commit),
+        ast::Stmt::Rollback => txn(PlanStmt::Rollback),
         ast::Stmt::Select(s) => plan_select(s, schema, n_params, catalog, &mut consts)?,
+        ast::Stmt::Compound(c) => plan_compound(c, schema, n_params, catalog, &mut consts)?,
         ast::Stmt::Insert(s) => plan_insert(s, schema, n_params, catalog, &mut consts)?,
         ast::Stmt::Update(s) => plan_update(s, schema, n_params, catalog, &mut consts)?,
         ast::Stmt::Delete(s) => plan_delete(s, schema, n_params, catalog, &mut consts)?,
@@ -306,24 +319,31 @@ pub(crate) fn plan_statement(
     // be detected as stale after a policy edit (Phase-5 leak-proofing, §4).
     // Recorded for EVERY plan (even non-RLS), so that later ENABLING RLS on the
     // table invalidates plans compiled before it.
-    let target = match &plan_stmt {
-        PlanStmt::Select(SelectPlan { table, .. })
-        | PlanStmt::Insert { table, .. }
-        | PlanStmt::Update { table, .. }
-        | PlanStmt::Delete { table, .. } => Some(*table),
-        PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => None,
-    };
     // One stamp per table whose policy this plan baked in. For a join that is
-    // BOTH: stamping only the outer would let a cached plan keep serving the
-    // inner table's rows under a policy that has since been tightened, which is
-    // the leak §4 exists to close.
-    let mut stamped: Vec<u32> = target.into_iter().collect();
-    if let PlanStmt::Select(SelectPlan { joins, .. }) = &plan_stmt {
-        // One stamp per joined table — a cached plan must not keep serving any
-        // side under a policy that was tightened after it was compiled.
-        for j in joins {
-            stamped.push(j.table);
+    // BOTH sides, and for a compound EVERY arm's tables: stamping less would
+    // let a cached plan keep serving some table's rows under a policy that has
+    // since been tightened, which is the leak §4 exists to close.
+    let select_tables = |sp: &SelectPlan, out: &mut Vec<u32>| {
+        out.push(sp.table);
+        for j in &sp.joins {
+            out.push(j.table);
         }
+    };
+    let mut stamped: Vec<u32> = Vec::new();
+    match &plan_stmt {
+        PlanStmt::Select(sp) => select_tables(sp, &mut stamped),
+        PlanStmt::Compound(c) => {
+            for arm in &c.arms {
+                select_tables(arm, &mut stamped);
+            }
+            // Arms often read the same table; one stamp per table suffices.
+            stamped.sort_unstable();
+            stamped.dedup();
+        }
+        PlanStmt::Insert { table, .. }
+        | PlanStmt::Update { table, .. }
+        | PlanStmt::Delete { table, .. } => stamped.push(*table),
+        PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => {}
     }
 
     let policies: Vec<PolicyStamp> = stamped
@@ -505,6 +525,153 @@ fn render_expr_name(e: &ast::Expr) -> String {
     }
 }
 
+
+/// Bind and plan a compound SELECT: plan each arm as an ordinary select, then
+/// check the arms AGREE — same arity, same output types (rigid engine: no
+/// sqlite-style cross-arm coercion; `CAST` one side instead), one shared
+/// parameter table — and resolve the compound-level ORDER BY against the
+/// first arm's output.
+fn plan_compound(
+    c: &ast::CompoundStmt,
+    schema: &Schema,
+    n_params: u16,
+    catalog: &PolicyCatalog,
+    consts: &mut Vec<Value>,
+) -> Result<PlannedStmt> {
+    let mut arms: Vec<SelectPlan> = Vec::with_capacity(c.arms.len());
+    let mut param_types: Vec<Option<ColumnType>> = Vec::new();
+    let mut context_keys: Vec<String> = Vec::new();
+    let mut list_keys: BTreeSet<String> = BTreeSet::new();
+    let mut out_types: Vec<Option<ColumnType>> = Vec::new();
+
+    for (k, arm_ast) in c.arms.iter().enumerate() {
+        let (stmt, ptypes, ckeys, lkeys, otypes) =
+            plan_select(arm_ast, schema, n_params, catalog, consts)?;
+        let PlanStmt::Select(sp) = stmt else {
+            return Err(Error::Internal("plan_select produced a non-select".into()));
+        };
+        // Context slots are appended AFTER the user params, so two arms
+        // binding different key sets would give the same slot index two
+        // meanings. Identical key lists (the common case: same policy on the
+        // same table) line up by construction; anything else is refused
+        // rather than silently misread.
+        if k == 0 {
+            context_keys = ckeys;
+            param_types = ptypes;
+        } else {
+            if ckeys != context_keys {
+                return Err(bind_err(
+                    "compound arms bind different session-context keys — not supported yet",
+                ));
+            }
+            // One statement, one parameter table: unify element-wise.
+            for (i, (have, arm)) in param_types.iter_mut().zip(&ptypes).enumerate() {
+                match (&have, arm) {
+                    (None, Some(t)) => *have = Some(*t),
+                    (Some(a), Some(b)) if a != b => {
+                        return Err(bind_err(format!(
+                            "parameter ${} is used as {a} in one compound arm and {b} in another",
+                            i + 1
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        list_keys.extend(lkeys);
+
+        // Arms must agree on the output shape. `None` (a bare NULL item) is
+        // compatible with anything — it stays NULL whatever the column is.
+        if k == 0 {
+            out_types = otypes;
+        } else {
+            if otypes.len() != out_types.len() {
+                return Err(bind_err(format!(
+                    "compound arms must select the same number of columns \
+                     (first arm has {}, arm {} has {})",
+                    out_types.len(),
+                    k + 1,
+                    otypes.len()
+                )));
+            }
+            for (j, (have, arm)) in out_types.iter_mut().zip(&otypes).enumerate() {
+                match (&have, arm) {
+                    (None, Some(t)) => *have = Some(*t),
+                    (Some(a), Some(b)) if a != b => {
+                        return Err(bind_err(format!(
+                            "column {} of the compound is {a} in one arm and {b} in \
+                             another — CAST one side to make them agree",
+                            j + 1
+                        )));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        arms.push(sp);
+    }
+
+    // The compound-level ORDER BY names the OUTPUT: an ordinal, a first-arm
+    // output name (a select-item alias or a plain column's name), nothing
+    // else — no tuple upstream of the set op survives to be sorted.
+    let arity = out_types.len();
+    let out_name = |sp: &SelectPlan, j: usize| -> Option<String> {
+        match sp.projection.get(j)? {
+            Projection::Expr { name, .. } => Some(name.clone()),
+            Projection::Column(i) => {
+                let t = schema.table(sp.table)?;
+                // Only a single-table arm has unambiguous bare names; a
+                // joined arm's slot names are qualified and never match a
+                // bare ORDER BY identifier.
+                if sp.joins.is_empty() {
+                    t.columns.get(*i as usize).map(|col| col.name.clone())
+                } else {
+                    None
+                }
+            }
+        }
+    };
+    let mut order_by: Vec<(u16, bool)> = Vec::with_capacity(c.order_by.len());
+    for (e, desc) in &c.order_by {
+        if let Some(pos) = select::ordinal(e, arity)? {
+            order_by.push((pos, *desc));
+            continue;
+        }
+        let ast::Expr::Col(n) = e else {
+            return Err(bind_err(
+                "ORDER BY over a compound must name an output column or ordinal",
+            ));
+        };
+        let pos = (0..arity).find(|&j| {
+            out_name(&arms[0], j).is_some_and(|nm| nm.eq_ignore_ascii_case(n))
+        });
+        match pos {
+            Some(j) => order_by.push((j as u16, *desc)),
+            None => {
+                return Err(bind_err(format!(
+                    "ORDER BY `{n}` does not name an output column of the compound's \
+                     first SELECT"
+                )))
+            }
+        }
+    }
+
+    let ops = c.ops.clone();
+    Ok((
+        PlanStmt::Compound(CompoundPlan {
+            arms,
+            ops,
+            order_by,
+            limit: c.limit,
+            offset: c.offset,
+        }),
+        param_types,
+        context_keys,
+        list_keys,
+        out_types,
+    ))
+}
+
 fn plan_insert(
     s: &ast::InsertStmt,
     schema: &Schema,
@@ -642,6 +809,7 @@ fn plan_insert(
         param_types,
         context_keys,
         list_keys,
+        Vec::new(),
     ))
 }
 
@@ -704,6 +872,7 @@ fn plan_update(
         param_types,
         context_keys,
         list_keys,
+        Vec::new(),
     ))
 }
 
@@ -736,6 +905,7 @@ fn plan_delete(
         param_types,
         context_keys,
         list_keys,
+        Vec::new(),
     ))
 }
 

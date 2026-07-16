@@ -24,6 +24,47 @@ fn access_key_and_indexes(a: &AccessPath) -> (KeyAccess, u64) {
     }
 }
 
+/// The footprint of ONE select — shared between a top-level SELECT and each
+/// compound arm.
+fn select_footprint(sp: &SelectPlan, schema: &Schema) -> Result<Footprint> {
+    let table_bit = |id: u32| -> Result<u64> {
+        if schema.table(id).is_none() || id >= 64 {
+            return Err(Error::Corrupt(format!("table id {id} out of range")));
+        }
+        Ok(1u64 << id)
+    };
+    let SelectPlan { table, access, joins, .. } = sp;
+    Ok({
+        let (key_access, mut indexes_used) = access_key_and_indexes(access);
+        // ONE BIT PER TABLE READ. A join that claimed only the outer would
+        // under-claim `tables_read`, and `conflicts_with` is a bitmap AND —
+        // so a writer to the inner table would not be seen to conflict with
+        // this reader, and the commit path would group them as independent.
+        let mut tables_read = table_bit(*table)?;
+        let mut key_access = key_access;
+        for j in joins {
+            tables_read |= table_bit(j.table)?;
+            let (jkey, jidx) = access_key_and_indexes(&j.access);
+            indexes_used |= jidx;
+            let _ = jkey;
+            // `key_access` is per-STATEMENT, and it names ONE key space. A
+            // Point on the outer stops describing what this reads the
+            // moment a second table joins in, and a claim narrower than the
+            // truth is a claim that rows this statement does read are rows
+            // it does not. Full is the only honest answer the type can
+            // express — it costs conflict precision, never correctness.
+            key_access = KeyAccess::Full;
+        }
+        Footprint {
+            tables_read,
+            tables_written: 0,
+            indexes_used,
+            key_access,
+            read_only: true,
+        }
+    })
+}
+
 /// Compute the footprint a statement must carry. Also used by
 /// [`CompiledPlan::decode`] to verify that a stored footprint was not forged.
 pub(crate) fn compute_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint> {
@@ -47,37 +88,23 @@ pub(crate) fn compute_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Foot
         Ok(bits)
     };
     Ok(match stmt {
-        PlanStmt::Select(SelectPlan {
-            table,
-            access,
-            joins,
-            ..
-        }) => {
-            let (key_access, mut indexes_used) = access_key_and_indexes(access);
-            // ONE BIT PER TABLE READ. A join that claimed only the outer would
-            // under-claim `tables_read`, and `conflicts_with` is a bitmap AND —
-            // so a writer to the inner table would not be seen to conflict with
-            // this reader, and the commit path would group them as independent.
-            let mut tables_read = table_bit(*table)?;
-            let mut key_access = key_access;
-            for j in joins {
-                tables_read |= table_bit(j.table)?;
-                let (jkey, jidx) = access_key_and_indexes(&j.access);
-                indexes_used |= jidx;
-                let _ = jkey;
-                // `key_access` is per-STATEMENT, and it names ONE key space. A
-                // Point on the outer stops describing what this reads the
-                // moment a second table joins in, and a claim narrower than the
-                // truth is a claim that rows this statement does read are rows
-                // it does not. Full is the only honest answer the type can
-                // express — it costs conflict precision, never correctness.
-                key_access = KeyAccess::Full;
+        PlanStmt::Select(sp) => select_footprint(sp, schema)?,
+        // A compound reads the UNION of what its arms read. `key_access` is
+        // per-STATEMENT and names ONE key space — with several arms Full is
+        // the only honest claim (same argument as the join case below).
+        PlanStmt::Compound(c) => {
+            let mut tables_read = 0u64;
+            let mut indexes_used = 0u64;
+            for arm in &c.arms {
+                let f = select_footprint(arm, schema)?;
+                tables_read |= f.tables_read;
+                indexes_used |= f.indexes_used;
             }
             Footprint {
                 tables_read,
                 tables_written: 0,
                 indexes_used,
-                key_access,
+                key_access: KeyAccess::Full,
                 read_only: true,
             }
         }
