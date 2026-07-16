@@ -362,34 +362,62 @@ fn descent_index(p: &[u8], key: &[u8]) -> Result<usize> {
 
 // ---------- overflow chains ----------
 
+/// #40: a nanosecond clock, but only when the `leakstat` feature is on — a
+/// blob write does this per PAGE, and `Instant::now()` is ~25 ns, so it must
+/// vanish entirely in a normal build.
+#[cfg(feature = "leakstat")]
+macro_rules! ovf_timed {
+    ($ctr:expr, $body:expr) => {{
+        let __t = std::time::Instant::now();
+        let __r = $body;
+        crate::engine::leakstat::add(&$ctr, __t.elapsed().as_nanos() as u64);
+        __r
+    }};
+}
+#[cfg(not(feature = "leakstat"))]
+macro_rules! ovf_timed {
+    ($ctr:expr, $body:expr) => {{
+        let _ = &$ctr;
+        $body
+    }};
+}
+
 fn write_overflow<S: PageStore + ?Sized>(store: &mut S, mut data: &[u8]) -> Result<u64> {
+    use crate::engine::leakstat;
     let mut first = 0u64;
     let mut prev = 0u64;
     while !data.is_empty() || first == 0 {
+        leakstat::bump(&leakstat::OVF_PAGES);
         let take = data.len().min(OVERFLOW_CAP);
         // `alloc_raw`, not `alloc`: this page is about to have every byte it
         // owns defined right here — header, payload, then the tail below — so
         // `alloc`'s full-page fill(0) is a 4 KiB memset thrown away on the hot
         // path of every blob write. The resulting page is byte-for-byte what
         // `alloc` would have produced; only the redundant pass is gone.
-        let id = store.alloc_raw()?;
-        let p = store.page_mut(id)?;
-        init_node(p, KIND_OVERFLOW);
-        p[6..8].copy_from_slice(&(take as u16).to_le_bytes());
-        p[HDR..HDR + take].copy_from_slice(&data[..take]);
+        let id = ovf_timed!(leakstat::OVF_NS_ALLOC, store.alloc_raw())?;
+        ovf_timed!(leakstat::OVF_NS_WRITE, {
+            let p = store.page_mut(id)?;
+            init_node(p, KIND_OVERFLOW);
+            p[6..8].copy_from_slice(&(take as u16).to_le_bytes());
+            p[HDR..HDR + take].copy_from_slice(&data[..take]);
         // The tail. `read_overflow` never looks past HDR+take and there is no
         // per-data-page checksum (DESIGN.md §5.4.1), so leaving the previous
         // tenant's bytes here would be *correct* — and would quietly keep
         // deleted rows readable in a file that gets copied around. Zero it. For
         // a full page this slice is empty and costs nothing, which is exactly
         // the common case.
-        p[HDR + take..].fill(0);
+            p[HDR + take..].fill(0);
+            Ok::<(), Error>(())
+        })?;
         data = &data[take..];
         if first == 0 {
             first = id;
         } else {
-            let prev_p = store.page_mut(prev)?;
-            set_extra(prev_p, id);
+            ovf_timed!(leakstat::OVF_NS_CHAIN, {
+                let prev_p = store.page_mut(prev)?;
+                set_extra(prev_p, id);
+                Ok::<(), Error>(())
+            })?;
         }
         prev = id;
         if data.is_empty() {
