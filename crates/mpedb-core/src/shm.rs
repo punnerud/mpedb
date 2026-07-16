@@ -2618,6 +2618,52 @@ mod tests {
     }
 
     #[test]
+    fn wal_lean_record_elides_overflow_tail() {
+        // An OVERFLOW page stores `payload` bytes right after the 16-byte
+        // header and its used span ends there — the SPLIT encoding must keep
+        // header + chain pointer + payload byte-for-byte and zero-fill the
+        // elided tail on replay. The KIND_OVERFLOW arm of btree::used_span
+        // was live in every durable blob write and, until this test (#58),
+        // exercised by nothing: no test had ever pushed an overflow page
+        // through WAL encode/replay.
+        let mut page = vec![0xFFu8; PAGE_SIZE];
+        page[0] = 3; // KIND_OVERFLOW
+        page[1] = 0;
+        page[2..4].copy_from_slice(&0u16.to_le_bytes());
+        page[4..6].copy_from_slice(&0u16.to_le_bytes());
+        let payload = 100usize;
+        page[6..8].copy_from_slice(&(payload as u16).to_le_bytes());
+        // The next-page chain pointer lives in the header and MUST survive —
+        // losing it on replay would sever the chain silently.
+        page[8..16].copy_from_slice(&0x1122_3344_5566_7788u64.to_le_bytes());
+        for i in 0..payload {
+            page[16 + i] = (i as u8).wrapping_mul(31).wrapping_add(7);
+        }
+        // bytes 16+payload.. stay 0xFF: a tail no replay may resurrect
+
+        let pages: Vec<(u64, &[u8])> = vec![(50, &page)];
+        let rec = encode_wal_record(0, 1, &pages, 0, 0, 0);
+        assert!(
+            rec.len() < WAL_RECORD_FIXED + WAL_PAGE_ENTRY / 8,
+            "a 100-byte overflow chunk should encode lean, got {}",
+            rec.len()
+        );
+
+        let d = decode_wal_record(&rec, 0, 1024).expect("valid lean overflow record");
+        let mut got = vec![0u8; PAGE_SIZE];
+        d.pages[0].1.write_into(&mut got);
+        assert_eq!(
+            &got[..16 + payload],
+            &page[..16 + payload],
+            "header + chain pointer + payload must replay byte-for-byte"
+        );
+        assert!(
+            got[16 + payload..].iter().all(|&b| b == 0),
+            "elided overflow tail must be zero-filled on replay"
+        );
+    }
+
+    #[test]
     fn wal_commit_appends_and_recovery_replays() {
         let (shm, p) = wal_open_test("commit");
         assert_eq!(shm.wal_len().load(Ordering::Acquire), 0);

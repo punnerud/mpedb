@@ -491,6 +491,75 @@ fn wal_recovery_rebuilds_engine_state_from_log_alone() {
     wal_cleanup(&cfg);
 }
 
+/// #58: a blob spanning several overflow pages must survive power loss via
+/// the WAL alone. The KIND_OVERFLOW arm of the SPLIT page encoding was live
+/// in every durable blob write and replayed by NO test until now — this is
+/// the end-to-end proof: insert a 5-page blob in wal mode, lose every
+/// volatile page and both meta slots, recover from the log, read it back
+/// byte-identical, and pass page accounting.
+#[test]
+fn wal_recovery_replays_overflow_chains_byte_identical() {
+    let base = std::path::Path::new("/dev/shm");
+    let dir = if base.is_dir() {
+        base.join("mpedb-engine-wal-tests")
+    } else {
+        std::env::temp_dir().join("mpedb-engine-wal-tests")
+    };
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("blob-recover-{}.mpedb", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(crate::shm::wal_path(&path));
+    let toml = format!(
+        r#"
+[database]
+path = "{}"
+size_mb = 8
+max_readers = 64
+durability = "wal"
+
+[[table]]
+name = "files"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+
+  [[table.column]]
+  name = "data"
+  type = "blob"
+"#,
+        path.display()
+    );
+    let cfg = Config::from_toml_str(&toml).unwrap();
+    let eng = open(&cfg);
+
+    // ~20 KiB = 5 overflow pages (OVERFLOW_CAP = 4080), deterministic bytes.
+    let blob: Vec<u8> = (0..20_000u32)
+        .map(|i| (i.wrapping_mul(2_654_435_761) >> 16) as u8)
+        .collect();
+    let mut w = eng.begin_write().unwrap();
+    w.insert_row(0, &[Value::Int(1), Value::Blob(blob.clone())]).unwrap();
+    w.commit().unwrap();
+
+    // Power loss that wrote NOTHING volatile back — the log alone rebuilds.
+    simulate_reboot_and_recover(&eng, 0, 0);
+
+    let r = eng.begin_read().unwrap();
+    let row = r
+        .get_by_pk(0, &[Value::Int(1)])
+        .unwrap()
+        .expect("the blob row must survive the reboot");
+    assert_eq!(
+        row[1],
+        Value::Blob(blob),
+        "the overflow chain must replay byte-identical"
+    );
+    r.finish().unwrap();
+    eng.verify_page_accounting().unwrap();
+    wal_cleanup(&cfg);
+}
+
 #[test]
 fn wal_checkpoint_then_recovery_spans_the_boundary() {
     use std::sync::atomic::Ordering;
