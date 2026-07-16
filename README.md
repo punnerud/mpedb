@@ -325,15 +325,19 @@ load beats fast-but-bursty. Three reps at 9% CV had us reject a real +3.5%
 improvement as a "regression", with a commit message to match. BENCHMARKS.md has
 the method and the two other ways the same A/B went wrong first.
 
-### Linux — AMD EPYC-Milan, 2 cores (2026-07-14)
+### Linux — AMD EPYC-Milan, 2 cores (re-run 2026-07-16)
 
 Single-client, embedded, none-class point ops:
 
 | op (none-class) | mpedb | SQLite | PostgreSQL |
 |---|--:|--:|--:|
-| point-select (PK), ops/s | **493,853** | 80,458 | 22,408 |
-| point-insert, ops/s | **166,759** | 42,353 | 14,092 |
-| point-update (PK), ops/s | **206,608** | 47,592 | 11,610 |
+| point-select (PK), ops/s | **485,215** | 80,467 | 22,329 |
+| point-insert, ops/s | **173,054** | 42,170 | 14,739 |
+| point-update (PK), ops/s | **212,492** | 46,954 | 10,942 |
+
+Re-measured after the #37 leak fix and the #42 row-buffer removal; every cell
+landed within this box's noise floor of the 2026-07-14 run, which is the point —
+neither change was supposed to move small-row ops, and neither did.
 
 mpedb leads embedded point ops (~4-22×; zero-parse plans + no IPC + a COW B+tree
 in-process). Under a live writer its MVCC readers never take the writer's lock:
@@ -363,6 +367,14 @@ make it worse rather than better. The same cell on the 2-core Linux box reads
 Bulk write flips the other way from Linux: mpedb **2,274 MiB/s (38% of raw)** vs
 SQLite 1,163 (19%) — 1.9×. On the 2-core Linux box SQLite leads that cell; give
 mpedb cores and a fast SSD and it does not.
+
+**Large blobs got 77% faster (2026-07-16).** `row::encode_row` materialised the
+whole row — blob included — into a fresh heap buffer whose only purpose was to be
+copied straight back out into overflow pages; at 16 MiB that malloc faults its own
+anonymous pages and cost **42% of the insert**. `btree` now takes the row's parts
+and never joins them: **660 → 1,170 MiB/s**. Note the bulk cells above did NOT
+move, and that is correct — they use 4 KiB values, where the buffer is a trivial
+malloc. The copy was only ever expensive when it was big.
 
 **And the durable-write result is that there is no result.** Once every engine is
 made to actually reach the platter, single-client durable inserts land at

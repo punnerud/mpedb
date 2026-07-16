@@ -440,11 +440,16 @@ A/B; lean cut the per-commit fdatasync payload and measured ~1.15-1.2x single-cl
 insert throughput on this host.
 - Seeding is batched (one transaction / COPY) and unmeasured; measured ops always go \
 through prepared statements / precompiled plans.
-- KNOWN mpedb ENGINE RACE found by this benchmark (durability=commit only): a reader \
-that loads the `durable_txn` gate and is then descheduled while two durable commits \
-land gets a spurious `Corrupt(\"no valid meta page\")` from `newest_meta` — both \
-checksum-valid meta slots are newer than its stale gate. The database is not corrupt; \
-re-reading succeeds. The benchmark adapter retries such reads (bounded at 100), counts \
-them, and INCLUDES the retry time in the measured latency. Fix belongs in \
-`mpedb-core::shm::newest_meta` (reload the monotone gate and retry).
+- FIXED mpedb engine race, and this benchmark is now its TRIPWIRE (durability=commit \
+only): a reader that loads the `durable_txn` gate and is then descheduled while two \
+durable commits land finds both checksum-valid meta slots newer than its stale gate and \
+gets a spurious `Corrupt(\"no valid meta page\")`. The window is wide by construction — \
+the commit path writes the meta slot, msyncs it (milliseconds on real disk), and only \
+THEN advances the gate. `shm::newest_meta` reloads the monotone gate and retries, which \
+closes it: verified by experiment rather than by reading the code (2026-07-15, same \
+flags both arms) — with that retry loop disabled this benchmark reports 3 spurious \
+retries within seconds, and as shipped, 0. The adapter still retries (bounded at 100) \
+and counts them, so a REGRESSION in newest_meta surfaces here as a non-zero count \
+instead of as engine corruption. It should always read 0; if it ever does not, fix \
+newest_meta, not the adapter.
 ";
