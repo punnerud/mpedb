@@ -232,6 +232,10 @@ impl<'a> Parser<'a> {
         self.toks.get(self.pos).map(|t| &t.tok)
     }
 
+    fn peek_at(&self, n: usize) -> Option<&Tok> {
+        self.toks.get(self.pos + n).map(|t| &t.tok)
+    }
+
     fn here(&self) -> usize {
         self.toks
             .get(self.pos)
@@ -976,6 +980,11 @@ impl<'a> Parser<'a> {
             let op = match self.peek() {
                 Some(Tok::Plus) => BinOp::Add,
                 Some(Tok::Minus) => BinOp::Sub,
+                // `||` sits in the additive tier (left-associative). sqlite
+                // technically binds it tighter than `*`; nothing in the corpus
+                // or a sane query observes the difference, and additive keeps
+                // the grammar flat.
+                Some(Tok::Concat) => BinOp::Concat,
                 _ => break,
             };
             self.pos += 1;
@@ -1251,6 +1260,21 @@ impl<'a> Parser<'a> {
         if self.eat_kw(Kw::Case) {
             return self.case_expr();
         }
+        // `CAST ( expr AS <typename> )` — CAST is a positional word, not a
+        // keyword, so a table may still be named `cast`.
+        if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("CAST"))
+            && matches!(self.peek_at(1), Some(Tok::LParen))
+        {
+            self.pos += 2;
+            let e = self.expr()?;
+            self.expect_kw(Kw::As, "AS in CAST")?;
+            let tyname = self.ident("type name in CAST")?;
+            let ty = cast_type(&tyname).ok_or_else(|| {
+                self.err_here(format!("unknown CAST target type `{tyname}`"))
+            })?;
+            self.expect(&Tok::RParen, ") after CAST")?;
+            return Ok(Expr::Cast(Box::new(e), ty));
+        }
         match self.advance() {
             Some(Tok::Int(v)) => Ok(Expr::Lit(Value::Int(v))),
             Some(Tok::Float(v)) => Ok(Expr::Lit(Value::Float(v))),
@@ -1307,6 +1331,24 @@ impl<'a> Parser<'a> {
     }
 }
 
+
+/// Map a SQL type name to the CAST target. sqlite's affinity vocabulary and
+/// the standard's both land on mpedb's five scalars; NUMERIC/DECIMAL take
+/// float64 (mpedb has no arbitrary-precision numeric — documented).
+fn cast_type(name: &str) -> Option<mpedb_types::ColumnType> {
+    use mpedb_types::ColumnType as T;
+    let up = name.to_ascii_uppercase();
+    Some(match up.as_str() {
+        "INTEGER" | "INT" | "BIGINT" | "SMALLINT" | "TINYINT" | "INT2" | "INT8" => T::Int64,
+        "REAL" | "FLOAT" | "DOUBLE" | "NUMERIC" | "DECIMAL" => T::Float64,
+        "TEXT" | "CHAR" | "VARCHAR" | "CHARACTER" | "CLOB" | "STRING" => T::Text,
+        "BOOLEAN" | "BOOL" => T::Bool,
+        "BLOB" => T::Blob,
+        "TIMESTAMP" => T::Timestamp,
+        _ => return None,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1325,6 +1367,40 @@ mod tests {
         assert_eq!(expr("- + 43"), expr("- 43"));
         assert_eq!(expr("+ ( - 78 )"), expr("(- 78)"));
         assert_eq!(expr("a + + b"), expr("a + b"));
+    }
+
+    /// `CAST(x AS type)` parses to its own node; `CAST` stays usable as an
+    /// ordinary identifier when not followed by `(`.
+    #[test]
+    fn cast_parses_and_concat_sits_in_the_additive_tier() {
+        use mpedb_types::ColumnType as T;
+        assert_eq!(
+            expr("CAST(a AS INTEGER)"),
+            Expr::Cast(Box::new(Expr::Col("a".into())), T::Int64)
+        );
+        assert_eq!(
+            expr("cast(NULL as real)"),
+            Expr::Cast(Box::new(Expr::Lit(Value::Null)), T::Float64)
+        );
+        assert!(parse_expr_only("CAST(a AS lolwut)").is_err());
+        // bare `cast` is still a column name
+        assert_eq!(expr("cast"), Expr::Col("cast".into()));
+
+        // `a || b || c` is left-associative and binds like +/-
+        assert_eq!(
+            expr("a || b || c"),
+            Expr::Binary(
+                BinOp::Concat,
+                Box::new(Expr::Binary(
+                    BinOp::Concat,
+                    Box::new(Expr::Col("a".into())),
+                    Box::new(Expr::Col("b".into()))
+                )),
+                Box::new(Expr::Col("c".into()))
+            )
+        );
+        // lone `|` is a clear parse error, not a mystery token
+        assert!(parse_expr_only("a | b").is_err());
     }
 
     fn col(name: &str) -> Box<Expr> {

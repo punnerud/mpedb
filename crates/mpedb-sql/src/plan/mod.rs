@@ -57,7 +57,9 @@ const MAX_JOINS: usize = 16;
 //    AccessPath grew IndexRange — one bump for the whole window, so mixed
 //    binaries against the shared plan registry see a clean "unknown plan
 //    format" instead of a confusing "bad tag" mid-decode.
-const PLAN_FORMAT: u8 = 8;
+// 9: the #56 SQL window — the instruction set grew Cast/Concat (`CAST`, `||`);
+//    UNION/compound statements and uncorrelated subplans ride the same bump.
+const PLAN_FORMAT: u8 = 9;
 
 /// One table's RLS state, frozen at compile time. See
 /// [`CompiledPlan::policies`].

@@ -30,7 +30,6 @@ pub(crate) struct SelectStmt {
     /// `SELECT DISTINCT` — deduplicate the OUTPUT rows (the projected tuple),
     /// which is why it cannot be pushed into the scan.
     pub distinct: bool,
-    /// `None` = `SELECT *`.
     /// `None` = `SELECT *`. Each item is the expression and its optional
     /// alias (`expr [AS] name`) — the alias only names the output column.
     pub items: Option<Vec<(Expr, Option<String>)>>,
@@ -106,6 +105,8 @@ pub(crate) enum BinOp {
     Ge,
     And,
     Or,
+    /// `||` — SQL concatenation.
+    Concat,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +144,8 @@ pub(crate) enum Expr {
     IsNull(Box<Expr>, bool),
     /// `lhs LIKE pattern`.
     Like(Box<Expr>, Box<Expr>),
+    /// `CAST(x AS <type>)`.
+    Cast(Box<Expr>, mpedb_types::ColumnType),
     /// `current_setting('key')` — a session-context value, bound to a reserved
     /// parameter filled from the caller's [`Session`](mpedb) at execute time
     /// (DESIGN-MULTIDB.md §2.1). The value never enters the plan bytes, so one

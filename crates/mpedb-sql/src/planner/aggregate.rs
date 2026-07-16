@@ -6,7 +6,7 @@ pub(super) fn contains_agg(e: &ast::Expr) -> bool {
     use ast::Expr as E;
     match e {
         E::Agg(..) => true,
-        E::Unary(_, a) | E::IsNull(a, _) => contains_agg(a),
+        E::Unary(_, a) | E::IsNull(a, _) | E::Cast(a, _) => contains_agg(a),
         E::Binary(_, a, b) | E::Like(a, b) => contains_agg(a) || contains_agg(b),
         E::InContext(a, _, _) => contains_agg(a),
         E::InList(a, xs, _) => contains_agg(a) || xs.iter().any(contains_agg),
@@ -78,6 +78,7 @@ fn lift_aggs(
             E::Col(format!("__g{pos}"))
         }
         E::Unary(op, a) => E::Unary(*op, Box::new(rec(a, aggs)?)),
+        E::Cast(a, t) => E::Cast(Box::new(rec(a, aggs)?), *t),
         E::IsNull(a, n) => E::IsNull(Box::new(rec(a, aggs)?), *n),
         E::Binary(op, a, b) => {
             E::Binary(*op, Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?))
