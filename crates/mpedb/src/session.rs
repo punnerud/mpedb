@@ -92,6 +92,20 @@ impl Session {
 /// `n_user` caller params are accepted; a caller cannot supply a value for the
 /// reserved tail (that is where §2.1's "refuse caller-supplied context" is
 /// enforced), because any excess is reported as a wrong parameter count.
+pub(crate) fn resolve_params_timed(
+    plan: &mpedb_sql::CompiledPlan,
+    user_params: &[mpedb_types::Value],
+    session: &Session,
+) -> mpedb_types::Result<Vec<mpedb_types::Value>> {
+    let t = std::time::Instant::now();
+    let r = resolve_params(plan, user_params, session);
+    mpedb_core::engine::leakstat::add(
+        &mpedb_core::engine::leakstat::EXEC_NS_RESOLVE,
+        t.elapsed().as_nanos() as u64,
+    );
+    r
+}
+
 pub(crate) fn resolve_params(
     plan: &CompiledPlan,
     user_params: &[Value],
@@ -107,6 +121,14 @@ pub(crate) fn resolve_params(
         });
     }
     if n_ctx == 0 {
+        // ⚠ #40: `to_vec` DEEP-clones every Value, so a `Blob(Vec<u8>)` is copied
+        // in full — 2.49 ms of a 12.1 ms 16 MiB insert, measured 2026-07-16 with
+        // `examples/blob_warm --features leakstat`. #42 removed the same class of
+        // copy from `row::encode_row`; this is the next one, and the blob is
+        // still deep-cloned at every API boundary it crosses. Fixing it means
+        // borrowing rather than owning here (`Cow<[Value]>`, or resolving in
+        // place when the plan has no session refs — the common case, which is
+        // exactly the branch this line IS).
         return Ok(user_params.to_vec());
     }
     let mut full = Vec::with_capacity(total);
