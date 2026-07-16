@@ -6,8 +6,8 @@
 //! Comparisons do not chain (`a < b < c` is a parse error).
 
 use crate::ast::{
-    BinOp, DeleteStmt, Expr, InsertStmt, JoinClause, OnConflict, SelectStmt, Stmt, UnOp,
-    UpdateStmt,
+    BinOp, DeleteStmt, Expr, InsertStmt, JoinClause, JoinKind, OnConflict, SelectStmt, Stmt,
+    UnOp, UpdateStmt,
 };
 use crate::ddl::{CreatePolicySpec, DdlStmt, RlsAction};
 use crate::token::{tokenize, Kw, SpTok, Tok};
@@ -515,32 +515,37 @@ impl<'a> Parser<'a> {
         self.expect_kw(Kw::From, "FROM")?;
         let table = self.ident("table name")?;
         let from_alias = self.opt_table_alias()?;
-        // `[INNER] JOIN b ON <cond>`. INNER is the default and the only kind:
-        // LEFT/RIGHT/FULL change what a missing match MEANS (a NULL-extended
-        // row rather than no row), which the executor would have to be taught
-        // separately — so they are refused rather than silently treated as
-        // INNER, which would drop rows the query asked to keep.
-        // `([INNER] JOIN t ON cond)*` — a chain of INNER joins, left-deep.
+        // `([INNER | LEFT [OUTER]] JOIN t ON cond)*` — a left-deep chain.
+        // INNER is the default; LEFT NULL-extends the inner side on no match.
+        // RIGHT/FULL/CROSS/NATURAL are refused BY NAME: left to the generic
+        // path the error reads "unexpected trailing input at byte 24", which
+        // tells someone who wrote RIGHT JOIN nothing about why.
         let mut joins = Vec::new();
         loop {
             if self.eat_kw(Kw::Inner) {
                 self.expect_kw(Kw::Join, "JOIN after INNER")?;
-                joins.push(self.join_tail()?);
+                joins.push(self.join_tail(JoinKind::Inner)?);
             } else if self.eat_kw(Kw::Join) {
-                joins.push(self.join_tail()?);
+                joins.push(self.join_tail(JoinKind::Inner)?);
+            } else if self.eat_word("LEFT") {
+                // The optional OUTER changes nothing — LEFT JOIN and
+                // LEFT OUTER JOIN are the same join.
+                let _ = self.eat_word("OUTER");
+                self.expect_kw(Kw::Join, "JOIN after LEFT")?;
+                joins.push(self.join_tail(JoinKind::Left)?);
             } else if let Some(kind) = self.peek_join_kind() {
-                // Say what is wrong. Left to the generic path this reads
-                // "unexpected trailing input at byte 24", which tells someone who
-                // wrote LEFT JOIN nothing about why.
                 return Err(self.err_here(format!(
-                    "{kind} JOIN is not supported — only INNER JOIN. {}",
-                    if kind == "CROSS" {
-                        "A cross join is a cartesian product; write INNER JOIN with an ON \
-                         condition, or if you really want every pair, `JOIN … ON true`."
-                    } else {
-                        "An outer join keeps rows with no match and NULL-extends them, which is \
-                         a different answer, not a slower one — so it is refused rather than \
-                         quietly treated as INNER."
+                    "{kind} JOIN is not supported — only INNER and LEFT JOIN. {}",
+                    match kind {
+                        "CROSS" =>
+                            "A cross join is a cartesian product; write INNER JOIN with an ON \
+                             condition, or if you really want every pair, `JOIN … ON true`.",
+                        "RIGHT" =>
+                            "A RIGHT JOIN is a LEFT JOIN with the tables swapped — swap them \
+                             and write LEFT JOIN.",
+                        _ =>
+                            "It keeps rows with no match on BOTH sides, which LEFT alone cannot \
+                             express — so it is refused rather than quietly narrowed.",
                     }
                 )));
             } else {
@@ -656,7 +661,7 @@ impl<'a> Parser<'a> {
         Ok(None)
     }
 
-    fn join_tail(&mut self) -> Result<JoinClause> {
+    fn join_tail(&mut self, kind: JoinKind) -> Result<JoinClause> {
         let table = self.ident("table name after JOIN")?;
         let alias = self.opt_table_alias()?;
         // ON is required. A comma-join / cross join is a cartesian product, and
@@ -664,7 +669,7 @@ impl<'a> Parser<'a> {
         // forgot the condition.
         self.expect_kw(Kw::On, "ON after JOIN — the join condition is required")?;
         let on = self.expr()?;
-        Ok(JoinClause { table, alias, on })
+        Ok(JoinClause { table, alias, kind, on })
     }
 
     fn nonneg_int(&mut self, what: &str) -> Result<u64> {

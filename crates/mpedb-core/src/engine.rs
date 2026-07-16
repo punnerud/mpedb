@@ -839,6 +839,34 @@ impl ReadTxn<'_> {
         Ok(out)
     }
 
+    /// Rows whose indexed value falls in the raw-encoded bound range — the
+    /// `IndexRange` access. Bounds use the composite-PK prefix construction
+    /// (`enc(v)` / `enc(v) ++ 0xFF`), which is exactly right over both the
+    /// unique (`value`) and non-unique (`value ‖ pk`) key layouts: both start
+    /// with the encoded value, and `0xFF` clears every continuation.
+    pub fn scan_by_index_range(
+        &self,
+        table_id: u32,
+        index_no: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let iroot = self.tree_root(table_id, index_no)?;
+        let root = self.tree_root(table_id, 0)?;
+        let types = &self.eng.col_types[table_id as usize];
+        let mut out = Vec::new();
+        let mut c = btree::cursor(self, iroot, lo, hi)?;
+        while let Some((_k, pk_bytes)) = c.next(self)? {
+            match btree::get(self, root, &pk_bytes)? {
+                Some(bytes) => out.push(row::decode_row(&bytes, types)?),
+                None => {
+                    return Err(Error::Corrupt("index entry points at a missing row".into()))
+                }
+            }
+        }
+        Ok(out)
+    }
+
     pub fn scan(
         &self,
         table_id: u32,
@@ -1841,6 +1869,32 @@ impl<'e> WriteTxn<'e> {
             if !k.starts_with(&prefix) {
                 break; // past every (value, *) entry
             }
+            match btree::get(self, root, &pk_bytes)? {
+                Some(bytes) => out.push(row::decode_row(
+                    &bytes,
+                    &self.eng.col_types[table_id as usize],
+                )?),
+                None => {
+                    return Err(Error::Corrupt("index entry points at a missing row".into()))
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// Write-side twin of [`ReadTxn::scan_by_index_range`].
+    pub fn scan_by_index_range(
+        &mut self,
+        table_id: u32,
+        index_no: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<Vec<Vec<Value>>> {
+        let (iroot, _) = self.tree_root(table_id, index_no)?;
+        let (root, _) = self.tree_root(table_id, 0)?;
+        let mut out = Vec::new();
+        let mut c = btree::cursor(self, iroot, lo, hi)?;
+        while let Some((_k, pk_bytes)) = c.next(self)? {
             match btree::get(self, root, &pk_bytes)? {
                 Some(bytes) => out.push(row::decode_row(
                     &bytes,

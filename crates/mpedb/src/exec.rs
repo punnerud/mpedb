@@ -5,8 +5,8 @@
 use crate::ExecResult;
 use mpedb_core::{ReadTxn, WriteTxn};
 use mpedb_sql::{
-    AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, Join, OrderOver,
-    PlanOnConflict, PlanStmt, Projection,
+    AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, Join, JoinKind,
+    OrderOver, PlanOnConflict, PlanStmt, Projection,
 };
 use mpedb_types::{
     keycode, Accum, DefaultExpr, Error, ExprProgram, KeyBound, KeyPart, Result, Schema, TableDef,
@@ -29,6 +29,16 @@ pub(crate) trait TxnCtx {
     /// nothing).
     fn scan_by_index(&mut self, table: u32, index_no: u32, value: &Value)
         -> Result<Vec<Vec<Value>>>;
+    /// Every row whose indexed value falls in the raw-encoded bound range —
+    /// `AccessPath::IndexRange`. Bounds use the same prefix construction as
+    /// composite-PK ranges (see [`range_bounds`]).
+    fn scan_by_index_range(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<Vec<Vec<Value>>>;
     fn scan_rows_raw(
         &mut self,
         table: u32,
@@ -123,6 +133,15 @@ impl TxnCtx for WriteTxn<'_> {
     ) -> Result<Vec<Vec<Value>>> {
         WriteTxn::scan_by_index(self, table, index_no, value)
     }
+    fn scan_by_index_range(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<Vec<Vec<Value>>> {
+        WriteTxn::scan_by_index_range(self, table, index_no, lo, hi)
+    }
     fn scan_rows_raw(
         &mut self,
         table: u32,
@@ -164,6 +183,15 @@ impl TxnCtx for ReadCtx<'_, '_> {
         value: &Value,
     ) -> Result<Vec<Vec<Value>>> {
         self.0.scan_by_index(table, index_no, value)
+    }
+    fn scan_by_index_range(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<Vec<Vec<Value>>> {
+        self.0.scan_by_index_range(table, index_no, lo, hi)
     }
     fn scan_rows_raw(
         &mut self,
@@ -400,6 +428,7 @@ pub(crate) fn exec_stmt(
                     ctx,
                     plan,
                     params,
+                    schema,
                     t,
                     *table,
                     access,
@@ -423,6 +452,7 @@ pub(crate) fn exec_stmt(
                     ctx,
                     plan,
                     params,
+                    schema,
                     *table,
                     access,
                     filter.as_ref(),
@@ -867,6 +897,7 @@ fn exec_aggregate(
     ctx: &mut dyn TxnCtx,
     plan: &CompiledPlan,
     params: &[Value],
+    schema: &Schema,
     t: &TableDef,
     table: u32,
     access: &AccessPath,
@@ -886,7 +917,9 @@ fn exec_aggregate(
     // aggregated is the JOINED row — same rule, wider row.
     let rows = match joins.is_empty() {
         true => gather_rows(ctx, table, access, filter, plan, params, None)?,
-        false => gather_joined(ctx, plan, params, table, access, filter, joins, joined_filter)?,
+        false => {
+            gather_joined(ctx, plan, params, schema, table, access, filter, joins, joined_filter)?
+        }
     };
 
     // Group. The key is the memcmp-ordered keycode of the group columns, so
@@ -1022,11 +1055,83 @@ fn exec_aggregate(
 /// pushed into either scan yet — every conjunct of the user's WHERE waits for
 /// the joined row — so both sides are full scans unless a POLICY pins a key.
 /// `EXPLAIN` says so rather than leaving it to be found on a big table.
+/// Does this access path reference the outer row (`KeyPart::OuterCol`)?
+/// If so it is the index nested-loop form, resolved per outer row.
+fn access_has_outer(a: &AccessPath) -> bool {
+    let outer = |p: &KeyPart| matches!(p, KeyPart::OuterCol(_));
+    let bound_outer = |b: &Option<KeyBound>| {
+        b.as_ref().is_some_and(|b| b.parts.iter().any(outer))
+    };
+    match a {
+        AccessPath::PkPoint(parts) => parts.iter().any(outer),
+        AccessPath::IndexPoint { part, .. } => outer(part),
+        AccessPath::PkRange { lo, hi } | AccessPath::IndexRange { lo, hi, .. } => {
+            bound_outer(lo) || bound_outer(hi)
+        }
+        AccessPath::FullScan => false,
+    }
+}
+
+/// Fetch one join step's candidate rows for ONE outer row — the index nested
+/// loop. The join's POLICY runs here, over each fetched inner row alone,
+/// BEFORE the residual ON can raise on it: the same RLS ordering contract as
+/// the held path, where `gather_rows` applies it as the fetch filter.
+fn fetch_inner(
+    ctx: &mut dyn TxnCtx,
+    join: &Join,
+    plan: &CompiledPlan,
+    params: &[Value],
+    outer: &[Value],
+) -> Result<Vec<Vec<Value>>> {
+    let mut rows = match &join.access {
+        AccessPath::PkPoint(parts) => {
+            let mut pk = Vec::with_capacity(parts.len());
+            let mut any_null = false;
+            for p in parts {
+                let v = resolve_part_outer(p, plan, params, outer)?;
+                if v.is_null() {
+                    // `inner.pk = NULL` is UNKNOWN: no candidates (and for a
+                    // LEFT join, that means NULL-extension — SQL's answer).
+                    any_null = true;
+                    break;
+                }
+                pk.push(v);
+            }
+            if any_null {
+                Vec::new()
+            } else {
+                ctx.get_by_pk(join.table, &pk)?.into_iter().collect()
+            }
+        }
+        AccessPath::IndexPoint { index_no, part } => {
+            let v = resolve_part_outer(part, plan, params, outer)?;
+            if v.is_null() {
+                Vec::new()
+            } else {
+                ctx.scan_by_index(join.table, *index_no, &v)?
+            }
+        }
+        _ => return Err(internal("unparametrized access in index nested loop")),
+    };
+    if let Some(p) = &join.policy {
+        let mut stack = Vec::with_capacity(p.max_stack());
+        let mut kept = Vec::with_capacity(rows.len());
+        for row in rows {
+            if p.eval_filter(&mut stack, &row, params)? {
+                kept.push(row);
+            }
+        }
+        rows = kept;
+    }
+    Ok(rows)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gather_joined(
     ctx: &mut dyn TxnCtx,
     plan: &CompiledPlan,
     params: &[Value],
+    schema: &Schema,
     outer_table: u32,
     outer_access: &AccessPath,
     outer_policy: Option<&ExprProgram>,
@@ -1035,7 +1140,7 @@ fn gather_joined(
 ) -> Result<Vec<Vec<Value>>> {
     // Left-deep nested loop. Start with the outer's rows (its policy applies
     // through the access path), then fold in each join: gather that table's
-    // rows — its policy runs over its OWN row here, BEFORE any ON can raise on
+    // rows — its policy runs over its OWN row, BEFORE any ON can raise on
     // it — and keep the pairs its ON accepts. Join `k`'s ON sees the row
     // accumulated so far, `[table0 ‖ … ‖ table_k]`, which is exactly the tuple
     // the planner bound and width-checked it against.
@@ -1043,24 +1148,54 @@ fn gather_joined(
         gather_rows(ctx, outer_table, outer_access, outer_policy, plan, params, None)?;
     let mut stack = Vec::new();
     for join in joins {
-        let inner = gather_rows(
-            ctx,
-            join.table,
-            &join.access,
-            join.policy.as_ref(),
-            plan,
-            params,
-            None,
-        )?;
+        let inner_width = table_def(schema, join.table)?.columns.len();
+        // An access with no OuterCol parts is resolved once: read the inner
+        // side once and hold it (the pre-#49 execution — keeping it is what
+        // stops an ON without equality from regressing to O(n·m) READS). One
+        // WITH OuterCol parts is the index nested loop, fetched per outer row.
+        let held: Option<Vec<Vec<Value>>> = if access_has_outer(&join.access) {
+            None
+        } else {
+            Some(gather_rows(
+                ctx,
+                join.table,
+                &join.access,
+                join.policy.as_ref(),
+                plan,
+                params,
+                None,
+            )?)
+        };
         let mut next = Vec::new();
         for a in &acc {
-            for i in &inner {
+            let fetched;
+            let candidates: &[Vec<Value>] = match &held {
+                Some(rows) => rows,
+                None => {
+                    fetched = fetch_inner(ctx, join, plan, params, a)?;
+                    &fetched
+                }
+            };
+            let mut matched = false;
+            for i in candidates {
                 let mut joined = Vec::with_capacity(a.len() + i.len());
                 joined.extend_from_slice(a);
                 joined.extend_from_slice(i);
                 if join.on.eval_filter(&mut stack, &joined, params)? {
+                    matched = true;
                     next.push(joined);
                 }
+            }
+            // LEFT: no match → ONE row with the inner side NULL-extended. The
+            // ON is never evaluated over this row — it exists BECAUSE nothing
+            // matched — so it cannot raise on it, and a policy-hidden inner
+            // row reads as ABSENT (the outer row survives, NULL-extended,
+            // never carrying the hidden row's values).
+            if !matched && join.kind == JoinKind::Left {
+                let mut joined = Vec::with_capacity(a.len() + inner_width);
+                joined.extend_from_slice(a);
+                joined.resize(a.len() + inner_width, Value::Null);
+                next.push(joined);
             }
         }
         acc = next;
@@ -1194,7 +1329,27 @@ pub(crate) fn resolve_part(part: &KeyPart, plan: &CompiledPlan, params: &[Value]
             .get(*i as usize)
             .cloned()
             .ok_or_else(|| internal("key const"))?,
+        // Only legal inside a join's access path, where the outer row exists;
+        // validate refuses it anywhere else, so reaching this is an exec bug.
+        KeyPart::OuterCol(_) => return Err(internal("outer-column key part outside a join")),
     })
+}
+
+/// [`resolve_part`] with the accumulated outer row in scope — the index
+/// nested-loop form, where `OuterCol(i)` is slot `i` of that row.
+fn resolve_part_outer(
+    part: &KeyPart,
+    plan: &CompiledPlan,
+    params: &[Value],
+    outer: &[Value],
+) -> Result<Value> {
+    match part {
+        KeyPart::OuterCol(i) => outer
+            .get(*i as usize)
+            .cloned()
+            .ok_or_else(|| internal("outer key column out of row bounds")),
+        other => resolve_part(other, plan, params),
+    }
 }
 
 /// Fetch the candidate rows for an access path and apply the residual filter.
@@ -1244,6 +1399,22 @@ fn gather_rows(
                 // N rows for a non-unique index, 0/1 for a unique one — the
                 // engine picks the exact-get fast path when it is unique.
                 ctx.scan_by_index(table, *index_no, &v)?
+            }
+        }
+        AccessPath::IndexRange { index_no, lo, hi } => {
+            match range_bounds(lo.as_ref(), hi.as_ref(), plan, params)? {
+                // A NULL bound makes the range predicate UNKNOWN: no matches.
+                None => Vec::new(),
+                // The same prefix-bound construction as a composite-PK range
+                // works over the index tree: both the unique (`value`) and the
+                // non-unique (`value ‖ pk`) key layouts start with the encoded
+                // value, and `prefix_hi` clears every continuation.
+                Some((lo_k, hi_k)) => ctx.scan_by_index_range(
+                    table,
+                    *index_no,
+                    lo_k.as_ref().map(|(k, inc)| (k.as_slice(), *inc)),
+                    hi_k.as_ref().map(|(k, inc)| (k.as_slice(), *inc)),
+                )?,
             }
         }
         AccessPath::FullScan => {
@@ -1360,11 +1531,11 @@ fn gather_topk(
             ctx.scan_rows_topk(table, None, None, filter.map(|f| (f, params)), order_by, keep)
         }
         // Point/index paths gather their matches — at most one for PK/unique,
-        // every equal row for a non-unique index — then sort and cap. The
-        // non-unique case materializes all matches before truncating; a
-        // streaming index cursor is deliberately deferred (#48) until a real
-        // workload shows the cost.
-        AccessPath::PkPoint(_) | AccessPath::IndexPoint { .. } => {
+        // every equal/in-range row for a non-unique index — then sort and cap.
+        // These materialize all matches before truncating; a streaming index
+        // cursor is deliberately deferred (#48) until a real workload shows
+        // the cost.
+        AccessPath::PkPoint(_) | AccessPath::IndexPoint { .. } | AccessPath::IndexRange { .. } => {
             let mut r = gather_rows(ctx, table, access, filter, plan, params, None)?;
             sort_rows(&mut r, order_by);
             r.truncate(keep);

@@ -176,6 +176,26 @@ fn on_conflict_on_indexed_column_is_refused() {
     assert!(!usable.contains("(cid)"), "a non-unique column must NOT be offered as usable: {msg}");
 }
 
+/// A range over the indexed column takes IndexRange — and its ORDER BY pk is
+/// a real sort (the index delivers index order; the differential caught the
+/// elided-sort bug the day this path was built).
+#[test]
+fn range_over_index_explains_and_sorts() {
+    let d = db("range", "indexed = true");
+    seed(&d);
+    let text = explain(&d, "EXPLAIN SELECT oid FROM orders WHERE cid > $1");
+    assert!(
+        text.contains("IndexRange(cid > $1) via index 1"),
+        "a range on the indexed column must use the index: {text}"
+    );
+    let got = rows(d.query("SELECT oid FROM orders WHERE cid >= $1 ORDER BY oid", &params![100i64]).unwrap());
+    assert_eq!(
+        got,
+        vec![vec![Value::Int(1)], vec![Value::Int(2)], vec![Value::Int(3)], vec![Value::Int(4)], vec![Value::Int(5)]],
+        "ORDER BY pk over an index range must actually sort"
+    );
+}
+
 /// The unique probe keeps its exact-get rendering — one row, `IndexPoint`.
 #[test]
 fn unique_probe_explains_as_index_point() {

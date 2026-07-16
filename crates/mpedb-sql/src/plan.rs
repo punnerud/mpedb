@@ -40,7 +40,12 @@ use mpedb_types::{AggFn,
 /// decoder allocate unboundedly. Far above any hand-written query.
 const MAX_JOINS: usize = 16;
 
-const PLAN_FORMAT: u8 = 7;
+// 8: Join grew a kind byte (INNER/LEFT, with RIGHT/FULL tags reserved),
+//    KeyPart grew OuterCol (index nested-loop parametrization), and
+//    AccessPath grew IndexRange — one bump for the whole window, so mixed
+//    binaries against the shared plan registry see a clean "unknown plan
+//    format" instead of a confusing "bad tag" mid-decode.
+const PLAN_FORMAT: u8 = 8;
 
 /// One table's RLS state, frozen at compile time. See
 /// [`CompiledPlan::policies`].
@@ -51,11 +56,26 @@ pub struct PolicyStamp {
     pub hash: [u8; 32],
 }
 
-/// The inner side of an `INNER JOIN`, driven by a nested loop over the outer.
+/// What a missing inner match MEANS for one join step. Encoded as one byte
+/// with tags 2 (RIGHT) and 3 (FULL) reserved so adding them later needs no
+/// new format bump — decode refuses them by name until they execute.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    /// No match → no row.
+    Inner,
+    /// No match → one row with the inner side NULL-extended.
+    Left,
+}
+
+/// The inner side of one `JOIN` step, driven by a nested loop over the outer.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Join {
     pub table: u32,
-    /// How the inner side is read FOR EACH outer row.
+    pub kind: JoinKind,
+    /// How the inner side is read. An access path whose parts are all
+    /// `Param`/`Const` is resolved once and the inner side is read once and
+    /// held; one carrying `KeyPart::OuterCol` is the index nested-loop form,
+    /// re-resolved and fetched PER OUTER ROW.
     pub access: AccessPath,
     /// The `ON` condition, over the JOINED row `[outer ‖ inner]`. Kept separate
     /// from `filter` even though an INNER JOIN's ON and WHERE are
@@ -338,9 +358,19 @@ pub enum AccessPath {
         lo: Option<KeyBound>,
         hi: Option<KeyBound>,
     },
-    /// Point probe of secondary unique index `index_no` (1-based; index 0 is
-    /// the PK tree — see [`crate::secondary_indexes`]).
+    /// Equality probe of secondary index `index_no` (1-based; index 0 is the
+    /// PK tree — see [`crate::secondary_indexes`]). At most one row for a
+    /// UNIQUE index; every equal row for a non-unique (`indexed`) one.
     IndexPoint { index_no: u32, part: KeyPart },
+    /// Range over secondary index `index_no`'s column: `WHERE idx_col > $1
+    /// AND idx_col <= $2`. Bounds carry exactly one part each (the indexed
+    /// column's value); prefix semantics over the `(value ‖ pk)` composite
+    /// keys make the same construction serve unique and non-unique indexes.
+    IndexRange {
+        index_no: u32,
+        lo: Option<KeyBound>,
+        hi: Option<KeyBound>,
+    },
     FullScan,
 }
 
@@ -366,9 +396,11 @@ const ACCESS_FULL: u8 = 0;
 const ACCESS_PK_POINT: u8 = 1;
 const ACCESS_PK_RANGE: u8 = 2;
 const ACCESS_INDEX_POINT: u8 = 3;
+const ACCESS_INDEX_RANGE: u8 = 4;
 
 const PART_PARAM: u8 = 0;
 const PART_CONST: u8 = 1;
+const PART_OUTER_COL: u8 = 2;
 
 const PROJ_COLUMN: u8 = 0;
 const PROJ_EXPR: u8 = 1;
@@ -590,7 +622,7 @@ impl CompiledPlan {
                         return Err(corrupt("order-junk columns leave no output"));
                     }
                 }
-                self.check_access(access, t)?;
+                self.check_access(access, t, None)?;
                 // With a join the "base row" IS the joined row, so every width
                 // below moves. Getting this wrong is not cosmetic: a program
                 // bounded against the outer's width alone could not name the
@@ -606,13 +638,19 @@ impl CompiledPlan {
                 // A self-join (same table id twice) is legal since #44 — tables
                 // are addressed by alias, and the plan carries slots, not names.
                 let mut acc_width = t.columns.len();
+                // The accumulated tuple's column TYPES, for OuterCol parts:
+                // join `k`'s access resolves against the tuple built BEFORE
+                // its own table joins in.
+                let mut acc_types: Vec<ColumnType> =
+                    t.columns.iter().map(|c| c.ty).collect();
                 for j in joins {
                     let jt = get_table(j.table)?;
-                    self.check_access(&j.access, jt)?;
+                    self.check_access(&j.access, jt, Some(&acc_types))?;
                     if let Some(p) = &j.policy {
                         self.check_program(p, jt)?;
                     }
                     acc_width += jt.columns.len();
+                    acc_types.extend(jt.columns.iter().map(|c| c.ty));
                     self.check_program_width(&j.on, acc_width)?;
                 }
                 let base_width = acc_width; // the full joined row
@@ -815,7 +853,7 @@ impl CompiledPlan {
                 if let Some(r) = returning {
                     self.check_projection(r, t)?;
                 }
-                self.check_access(access, t)?;
+                self.check_access(access, t, None)?;
                 if let Some(f) = filter {
                     self.check_program(f, t)?;
                 }
@@ -848,7 +886,7 @@ impl CompiledPlan {
                 returning,
             } => {
                 let t = get_table(*table)?;
-                self.check_access(access, t)?;
+                self.check_access(access, t, None)?;
                 if let Some(r) = returning {
                     self.check_projection(r, t)?;
                 }
@@ -937,8 +975,16 @@ impl CompiledPlan {
     }
 
     /// A key part must reference a valid param/const, and a const must be a
-    /// non-NULL value of the key column's exact type.
-    fn check_key_part(&self, p: &KeyPart, ty: ColumnType) -> Result<()> {
+    /// non-NULL value of the key column's exact type. `outer` is the
+    /// accumulated outer tuple's column types when the part sits inside a
+    /// join's access path — the only place `OuterCol` is legal; a
+    /// statement-level path (outer = None) carrying one is corrupt.
+    fn check_key_part(
+        &self,
+        p: &KeyPart,
+        ty: ColumnType,
+        outer: Option<&[ColumnType]>,
+    ) -> Result<()> {
         match p {
             KeyPart::Param(i) => {
                 if *i >= self.n_params {
@@ -957,11 +1003,27 @@ impl CompiledPlan {
                     return Err(corrupt("key const type mismatch"));
                 }
             }
+            KeyPart::OuterCol(i) => {
+                let Some(cols) = outer else {
+                    return Err(corrupt("outer-column key part outside a join"));
+                };
+                let Some(&oty) = cols.get(*i as usize) else {
+                    return Err(corrupt("outer-column key part out of range"));
+                };
+                if oty != ty {
+                    return Err(corrupt("outer-column key part type mismatch"));
+                }
+            }
         }
         Ok(())
     }
 
-    fn check_access(&self, a: &AccessPath, t: &TableDef) -> Result<()> {
+    fn check_access(
+        &self,
+        a: &AccessPath,
+        t: &TableDef,
+        outer: Option<&[ColumnType]>,
+    ) -> Result<()> {
         match a {
             AccessPath::FullScan => Ok(()),
             AccessPath::PkPoint(parts) => {
@@ -969,7 +1031,7 @@ impl CompiledPlan {
                     return Err(corrupt("PkPoint part count != PK column count"));
                 }
                 for (part, &pk_col) in parts.iter().zip(&t.primary_key) {
-                    self.check_key_part(part, t.columns[pk_col as usize].ty)?;
+                    self.check_key_part(part, t.columns[pk_col as usize].ty, outer)?;
                 }
                 Ok(())
             }
@@ -982,7 +1044,7 @@ impl CompiledPlan {
                     if bound.parts.len() != 1 {
                         return Err(corrupt("Phase 1 PkRange bound must have exactly one part"));
                     }
-                    self.check_key_part(&bound.parts[0], first_ty)?;
+                    self.check_key_part(&bound.parts[0], first_ty, outer)?;
                 }
                 Ok(())
             }
@@ -993,7 +1055,25 @@ impl CompiledPlan {
                     return Err(corrupt("index_no out of range"));
                 }
                 let col = sec[no - 1];
-                self.check_key_part(part, t.columns[col as usize].ty)
+                self.check_key_part(part, t.columns[col as usize].ty, outer)
+            }
+            AccessPath::IndexRange { index_no, lo, hi } => {
+                let sec = crate::planner::secondary_indexes(t);
+                let no = *index_no as usize;
+                if no == 0 || no > sec.len() || no > 63 {
+                    return Err(corrupt("index_no out of range"));
+                }
+                if lo.is_none() && hi.is_none() {
+                    return Err(corrupt("IndexRange with no bounds"));
+                }
+                let ty = t.columns[sec[no - 1] as usize].ty;
+                for bound in [lo, hi].into_iter().flatten() {
+                    if bound.parts.len() != 1 {
+                        return Err(corrupt("IndexRange bound must have exactly one part"));
+                    }
+                    self.check_key_part(&bound.parts[0], ty, outer)?;
+                }
+                Ok(())
             }
         }
     }
@@ -1071,13 +1151,39 @@ impl CompiledPlan {
                     out.push_str(&format!("  filter: {}\n", render_program(f, &single)));
                 }
                 for j in joins {
+                    // The cost note is the honest one for THIS join: a
+                    // FullScan inner side is read once and paired with every
+                    // outer row (O(n*m) ON evaluations); a keyed access is
+                    // the index nested loop — the ON equality was consumed
+                    // into the inner fetch and runs per outer row.
+                    let kind = match j.kind {
+                        JoinKind::Inner => "inner",
+                        JoinKind::Left => "left",
+                    };
+                    let cost = match (&j.access, j.kind) {
+                        (AccessPath::FullScan, JoinKind::Inner) => {
+                            "(nested loop, O(n*m) — no predicate pushdown)".to_string()
+                        }
+                        (AccessPath::FullScan, JoinKind::Left) => {
+                            "(nested loop, NULL-extends on no match — no predicate pushdown)"
+                                .to_string()
+                        }
+                        (_, JoinKind::Inner) => {
+                            "(index nested loop — ON equality pushed into the inner fetch)"
+                                .to_string()
+                        }
+                        (_, JoinKind::Left) => {
+                            "(index nested loop, NULL-extends on no match — ON equality pushed into the inner fetch)"
+                                .to_string()
+                        }
+                    };
                     out.push_str(&format!(
-                        "  inner join {} (nested loop, O(n*m) — no predicate pushdown)\n",
+                        "  {kind} join {} {cost}\n",
                         table_name(j.table)
                     ));
                     out.push_str(&format!(
                         "    access: {}\n",
-                        self.render_access(&j.access, schema, j.table)
+                        self.render_access_outer(&j.access, schema, j.table, Some(&base))
                     ));
                     if let Some(p) = &j.policy {
                         let iname = col_namer(j.table);
@@ -1301,14 +1407,30 @@ impl CompiledPlan {
             .unwrap_or_else(|| "?".into())
     }
 
-    fn render_part(&self, p: &KeyPart) -> String {
+    /// `outer` names the slots of the accumulated outer tuple, for
+    /// `OuterCol` parts inside a join's access path.
+    fn render_part_outer(&self, p: &KeyPart, outer: Option<&dyn Fn(u16) -> String>) -> String {
         match p {
             KeyPart::Param(i) => format!("${}", i + 1),
             KeyPart::Const(i) => self.render_const(*i),
+            KeyPart::OuterCol(i) => match outer {
+                Some(name) => name(*i),
+                None => format!("outer#{i}"),
+            },
         }
     }
 
     fn render_access(&self, a: &AccessPath, schema: &Schema, table: u32) -> String {
+        self.render_access_outer(a, schema, table, None)
+    }
+
+    fn render_access_outer(
+        &self,
+        a: &AccessPath,
+        schema: &Schema,
+        table: u32,
+        outer: Option<&dyn Fn(u16) -> String>,
+    ) -> String {
         let col_name = |c: u16| {
             schema
                 .table(table)
@@ -1325,7 +1447,7 @@ impl CompiledPlan {
                     .unwrap_or_default()
                     .iter()
                     .zip(parts)
-                    .map(|(&c, p)| format!("{} = {}", col_name(c), self.render_part(p)))
+                    .map(|(&c, p)| format!("{} = {}", col_name(c), self.render_part_outer(p, outer)))
                     .collect();
                 format!("PkPoint({})", items.join(", "))
             }
@@ -1337,11 +1459,11 @@ impl CompiledPlan {
                 let mut items = Vec::new();
                 if let Some(b) = lo {
                     let op = if b.inclusive { ">=" } else { ">" };
-                    items.push(format!("{} {op} {}", col_name(first), self.render_part(&b.parts[0])));
+                    items.push(format!("{} {op} {}", col_name(first), self.render_part_outer(&b.parts[0], outer)));
                 }
                 if let Some(b) = hi {
                     let op = if b.inclusive { "<=" } else { "<" };
-                    items.push(format!("{} {op} {}", col_name(first), self.render_part(&b.parts[0])));
+                    items.push(format!("{} {op} {}", col_name(first), self.render_part_outer(&b.parts[0], outer)));
                 }
                 format!("PkRange({})", items.join(", "))
             }
@@ -1368,8 +1490,39 @@ impl CompiledPlan {
                 format!(
                     "{label}({} = {}) via index {index_no}",
                     col_name(col),
-                    self.render_part(part)
+                    self.render_part_outer(part, outer)
                 )
+            }
+            AccessPath::IndexRange { index_no, lo, hi } => {
+                let col = (*index_no as usize)
+                    .checked_sub(1)
+                    .and_then(|i| {
+                        schema
+                            .table(table)
+                            .map(crate::planner::secondary_indexes)
+                            .unwrap_or_default()
+                            .get(i)
+                            .copied()
+                    })
+                    .unwrap_or(0);
+                let mut items = Vec::new();
+                if let Some(b) = lo {
+                    let op = if b.inclusive { ">=" } else { ">" };
+                    items.push(format!(
+                        "{} {op} {}",
+                        col_name(col),
+                        self.render_part_outer(&b.parts[0], outer)
+                    ));
+                }
+                if let Some(b) = hi {
+                    let op = if b.inclusive { "<=" } else { "<" };
+                    items.push(format!(
+                        "{} {op} {}",
+                        col_name(col),
+                        self.render_part_outer(&b.parts[0], outer)
+                    ));
+                }
+                format!("IndexRange({}) via index {index_no}", items.join(", "))
             }
         }
     }
@@ -1427,6 +1580,10 @@ fn encode_part(p: &KeyPart, buf: &mut Vec<u8>) {
             buf.push(PART_CONST);
             w_u16(buf, *i);
         }
+        KeyPart::OuterCol(i) => {
+            buf.push(PART_OUTER_COL);
+            w_u16(buf, *i);
+        }
     }
 }
 
@@ -1436,6 +1593,7 @@ fn decode_part(buf: &[u8], pos: &mut usize) -> Result<KeyPart> {
     match tag {
         PART_PARAM => Ok(KeyPart::Param(i)),
         PART_CONST => Ok(KeyPart::Const(i)),
+        PART_OUTER_COL => Ok(KeyPart::OuterCol(i)),
         t => Err(corrupt(format!("bad key part tag {t}"))),
     }
 }
@@ -1483,6 +1641,19 @@ fn encode_access(a: &AccessPath, buf: &mut Vec<u8>) {
             buf.extend_from_slice(&index_no.to_le_bytes());
             encode_part(part, buf);
         }
+        AccessPath::IndexRange { index_no, lo, hi } => {
+            buf.push(ACCESS_INDEX_RANGE);
+            buf.extend_from_slice(&index_no.to_le_bytes());
+            for bound in [lo, hi] {
+                match bound {
+                    None => buf.push(0),
+                    Some(b) => {
+                        buf.push(1 | ((b.inclusive as u8) << 1));
+                        encode_parts(&b.parts, buf);
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1510,6 +1681,23 @@ fn decode_access(buf: &[u8], pos: &mut usize) -> Result<AccessPath> {
             let index_no = r_u32(buf, pos)?;
             let part = decode_part(buf, pos)?;
             Ok(AccessPath::IndexPoint { index_no, part })
+        }
+        ACCESS_INDEX_RANGE => {
+            let index_no = r_u32(buf, pos)?;
+            let mut bounds = [None, None];
+            for b in &mut bounds {
+                let tag = r_u8(buf, pos)?;
+                *b = match tag {
+                    0 => None,
+                    t if t & 1 == 1 && t & !3 == 0 => Some(KeyBound {
+                        inclusive: t & 2 != 0,
+                        parts: decode_parts(buf, pos)?,
+                    }),
+                    t => return Err(corrupt(format!("bad range bound tag {t}"))),
+                };
+            }
+            let [lo, hi] = bounds;
+            Ok(AccessPath::IndexRange { index_no, lo, hi })
         }
         t => Err(corrupt(format!("bad access path tag {t}"))),
     }
@@ -1709,6 +1897,11 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             w_u16(buf, joins.len() as u16);
             for j in joins {
                 buf.extend_from_slice(&j.table.to_le_bytes());
+                buf.push(match j.kind {
+                    JoinKind::Inner => 0,
+                    JoinKind::Left => 1,
+                    // 2 (RIGHT) and 3 (FULL) are reserved — see decode.
+                });
                 encode_access(&j.access, buf);
                 j.on.encode_into(buf);
                 encode_opt_program(j.policy.as_ref(), buf);
@@ -1868,8 +2061,20 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
             }
             let mut joins = Vec::with_capacity(njoins.min(MAX_JOINS));
             for _ in 0..njoins {
+                let table = r_u32(buf, pos)?;
+                let kind = match r_u8(buf, pos)? {
+                    0 => JoinKind::Inner,
+                    1 => JoinKind::Left,
+                    // Reserved so RIGHT/FULL need no format bump later; refused
+                    // by NAME so the reader learns what the plan wanted, not
+                    // just that a byte was odd.
+                    2 => return Err(corrupt("join kind RIGHT is reserved but not yet supported")),
+                    3 => return Err(corrupt("join kind FULL is reserved but not yet supported")),
+                    t => return Err(corrupt(format!("bad join kind tag {t}"))),
+                };
                 joins.push(Join {
-                    table: r_u32(buf, pos)?,
+                    table,
+                    kind,
                     access: decode_access(buf, pos)?,
                     on: ExprProgram::decode(buf, pos)?,
                     policy: decode_opt_program(buf, pos)?,
