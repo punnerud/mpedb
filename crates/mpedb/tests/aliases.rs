@@ -103,3 +103,56 @@ fn unaliased_self_join_is_refused() {
         .unwrap_err();
     assert!(format!("{err}").contains("emp") || format!("{err}").to_lowercase().contains("alias"));
 }
+
+/// #56: SELECT-item aliases name the OUTPUT — `AS x`, and the bare form
+/// `expr name` sqlite/PG also accept. The corpus' second-largest blocker.
+#[test]
+fn select_item_aliases_name_the_output() {
+    let d = db("itemalias");
+    seed(&d);
+    match d
+        .query("SELECT id AS x, id + 1 AS y, name z FROM emp ORDER BY x", &[])
+        .unwrap()
+    {
+        ExecResult::Rows { columns, rows } => {
+            assert_eq!(columns, vec!["x", "y", "z"]);
+            assert_eq!(rows[0][..2], [Value::Int(1), Value::Int(2)]);
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // An aliased aggregate names its output too.
+    match d.query("SELECT count(*) AS n FROM emp", &[]).unwrap() {
+        ExecResult::Rows { columns, rows } => {
+            assert_eq!(columns, vec!["n"]);
+            assert_eq!(rows, vec![vec![Value::Int(3)]]);
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+}
+
+/// ORDER BY resolves an output ALIAS before an input column — the PG rule.
+/// `SELECT manager AS id … ORDER BY id` sorts by the OUTPUT (manager), even
+/// though the table has its own `id`; NULLS FIRST puts Ada on top.
+#[test]
+fn order_by_prefers_output_alias_over_input_column() {
+    let d = db("aliasorder");
+    seed(&d);
+    match d
+        .query("SELECT name, manager AS id FROM emp ORDER BY id, name", &[])
+        .unwrap()
+    {
+        ExecResult::Rows { rows, .. } => {
+            let names: Vec<&Value> = rows.iter().map(|r| &r[0]).collect();
+            assert_eq!(
+                names,
+                [&Value::Text("Ada".into()), &Value::Text("Ben".into()), &Value::Text("Ced".into())],
+                "NULL manager first proves the sort used the alias, not emp.id"
+            );
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // And under DISTINCT the alias counts as selected.
+    assert!(d
+        .query("SELECT DISTINCT manager AS m FROM emp ORDER BY m", &[])
+        .is_ok());
+}

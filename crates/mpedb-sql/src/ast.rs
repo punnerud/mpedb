@@ -31,7 +31,9 @@ pub(crate) struct SelectStmt {
     /// which is why it cannot be pushed into the scan.
     pub distinct: bool,
     /// `None` = `SELECT *`.
-    pub items: Option<Vec<Expr>>,
+    /// `None` = `SELECT *`. Each item is the expression and its optional
+    /// alias (`expr [AS] name`) — the alias only names the output column.
+    pub items: Option<Vec<(Expr, Option<String>)>>,
     pub where_clause: Option<Expr>,
     /// `GROUP BY` keys. Expressions rather than names because `GROUP BY t.col`
     /// is legal in sqlite and PG, and a qualified name is not a name — the

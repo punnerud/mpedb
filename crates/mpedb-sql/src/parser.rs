@@ -501,14 +501,14 @@ impl<'a> Parser<'a> {
         let items = if self.eat(&Tok::Star) {
             None
         } else {
-            let mut items = vec![self.expr()?];
+            let mut items = vec![self.select_item()?];
             while self.eat(&Tok::Comma) {
                 if items.len() >= MAX_SELECT_ITEMS {
                     return Err(self.err_here(format!(
                         "too many SELECT items (max {MAX_SELECT_ITEMS})"
                     )));
                 }
-                items.push(self.expr()?);
+                items.push(self.select_item()?);
             }
             Some(items)
         };
@@ -625,6 +625,22 @@ impl<'a> Parser<'a> {
             limit,
             offset,
         }))
+    }
+
+    /// One SELECT-list item: `expr [[AS] alias]`. A bare identifier right
+    /// after the expression is an alias, as in sqlite/PostgreSQL —
+    /// unambiguous because everything that can otherwise follow an item
+    /// (FROM, WHERE, GROUP, ORDER, LIMIT, `,`, `;`, EOF) is a keyword token
+    /// or not an identifier at all. A quoted identifier is always an alias.
+    fn select_item(&mut self) -> Result<(Expr, Option<String>)> {
+        let e = self.expr()?;
+        if self.eat_kw(Kw::As) {
+            return Ok((e, Some(self.ident("alias after AS")?)));
+        }
+        if matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_))) {
+            return Ok((e, Some(self.ident("select-item alias")?)));
+        }
+        Ok((e, None))
     }
 
     /// Name an unsupported join kind, without consuming it. `None` if the next
