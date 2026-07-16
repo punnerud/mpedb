@@ -108,6 +108,21 @@ impl Rng {
     }
 }
 
+/// `len` bytes drawn from `rng` — deterministic blob content for the crash and
+/// powerloss harnesses. Seed the RNG from values any process can reconstruct
+/// (row id, stored write-generation) and verification becomes
+/// recompute-and-compare: that matters because page accounting can never see
+/// CONTENT corruption — a torn or cross-wired overflow chain whose pages are
+/// all individually valid passes `verify()` and only the byte compare fails.
+pub fn fill_bytes(rng: &mut Rng, len: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(len + 8);
+    while out.len() < len {
+        out.extend_from_slice(&rng.next().to_le_bytes());
+    }
+    out.truncate(len);
+    out
+}
+
 // ----------------------------------------------------------------- watchdog
 
 /// Aborts the whole process (exit 1, loud message) if not disarmed within
