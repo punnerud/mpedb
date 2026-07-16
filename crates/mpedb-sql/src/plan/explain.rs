@@ -154,6 +154,7 @@ impl CompiledPlan {
                     let kind = match j.kind {
                         JoinKind::Inner => "inner",
                         JoinKind::Left => "left",
+                        JoinKind::Full => "full",
                     };
                     let cost = match (&j.access, j.kind) {
                         (AccessPath::FullScan, JoinKind::Inner) => {
@@ -170,6 +171,11 @@ impl CompiledPlan {
                         (_, JoinKind::Left) => {
                             "(index nested loop, NULL-extends on no match — ON equality pushed into the inner fetch)"
                                 .to_string()
+                        }
+                        // FULL always holds the inner side whole: the
+                        // unmatched-inner sweep needs it enumerated.
+                        (_, JoinKind::Full) => {
+                            "(held nested loop, NULL-extends on BOTH sides)".to_string()
                         }
                     };
                     out.push_str(&format!(

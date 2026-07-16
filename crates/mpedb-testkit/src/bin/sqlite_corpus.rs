@@ -835,6 +835,40 @@ fn expand_star(sql: &str, shim: &Shim) -> Option<String> {
         return None;
     }
 
+    // FROM-level paren groups — `FROM ( a JOIN b ON … )` — are associativity
+    // no-ops the engine accepts since #64, but the depth-based walk below
+    // would see the whole group as a subexpression and bail (which is how
+    // the shim's rowid_ column leaked as 123 phantom "wrong results" the day
+    // paren-FROM landed). Flatten them: drop the group's paren tokens and
+    // pull the interior up one level. Repeats for nesting.
+    let mut flat: Vec<Tok> = toks.to_vec();
+    while let Some(from) = flat.iter().position(|t| t.up == "FROM" && t.depth == 0) {
+        let open = from + 1;
+        if open >= flat.len() || flat[open].up != "(" {
+            break;
+        }
+        let mut depth = 0i32;
+        let mut close = None;
+        for (m, t) in flat.iter().enumerate().skip(open) {
+            if t.up == "(" {
+                depth += 1;
+            } else if t.up == ")" {
+                depth -= 1;
+                if depth == 0 {
+                    close = Some(m);
+                    break;
+                }
+            }
+        }
+        let c = close?;
+        for t in &mut flat[open + 1..c] {
+            t.depth -= 1;
+        }
+        flat.remove(c);
+        flat.remove(open);
+    }
+    let toks: &[Tok] = &flat;
+
     // `ident [AS alias | bare-alias]` at position k → (name, qualifier, next k).
     fn parse_source(sql: &str, toks: &[Tok], mut k: usize) -> Option<(String, String, usize)> {
         const STOP: [&str; 8] = ["INNER", "JOIN", "ON", "LEFT", "RIGHT", "FULL", "CROSS", "NATURAL"];
@@ -865,7 +899,7 @@ fn expand_star(sql: &str, shim: &Shim) -> Option<String> {
 
     // Parse FROM sources: ident [AS alias] (INNER? JOIN ident [AS alias] ON ...)*
     let mut sources: Vec<(String, String)> = Vec::new(); // (table lower, qualifier raw)
-    let (name_raw, qual, mut k) = parse_source(sql, &toks, j + 1)?;
+    let (name_raw, qual, mut k) = parse_source(sql, toks, j + 1)?;
     sources.push((name_raw.to_ascii_lowercase(), qual));
     loop {
         if k >= toks.len() || toks[k].depth != 0 {
@@ -905,7 +939,7 @@ fn expand_star(sql: &str, shim: &Shim) -> Option<String> {
             "RIGHT" | "FULL" | "NATURAL" => return None,
             _ => break, // WHERE/ORDER/... or end of statement
         }
-        let (name_raw, qual, nk) = parse_source(sql, &toks, k)?;
+        let (name_raw, qual, nk) = parse_source(sql, toks, k)?;
         sources.push((name_raw.to_ascii_lowercase(), qual));
         k = nk;
         // Skip any ON condition: advance to the next JOIN/INNER/comma or

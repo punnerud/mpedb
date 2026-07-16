@@ -356,3 +356,22 @@ SELECT count(*) FROM t GROUP BY 'x'
 # An out-of-range ordinal is an error, not a constant.
 statement error out of range
 SELECT dept, count(*) FROM t GROUP BY 9
+
+# ---- the alias survives into the aggregate path (#64-batch regression) -------------------
+
+# `Scope::single(table)` in the aggregate dispatch dropped the alias, so a
+# qualified GROUP BY failed with "no table named cor0" — corpus-found.
+query TI nosort
+SELECT cor0.dept, count(*) FROM t AS cor0 GROUP BY cor0.dept ORDER BY 1
+----
+eng
+3
+ops
+1
+sales
+2
+
+query I nosort
+SELECT count(*) FROM t cor0 GROUP BY cor0.dept HAVING count(cor0.amt) >= 2
+----
+3

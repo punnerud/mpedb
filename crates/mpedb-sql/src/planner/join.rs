@@ -28,6 +28,63 @@ use super::select::{describe_key, distinct_order_by, ordinal};
 /// unless its POLICY pins a key, and the inner is re-scanned per outer row —
 /// O(n·m). Correct, and slow enough that EXPLAIN says so.
 #[allow(clippy::too_many_arguments)]
+/// `A RIGHT JOIN B ON c` is `B LEFT JOIN A ON c` — with one catch the swap
+/// alone gets wrong: the OUTPUT still lists A's columns first. So a bare
+/// `SELECT *` is pinned to the original column order as explicit qualified
+/// items BEFORE the sides swap. Only the two-table form rewrites; a chain
+/// would need the right side as a subtree, which left-deep plans cannot
+/// express (the refusal says the manual fix).
+pub(super) fn rewrite_right_join(
+    s: &ast::SelectStmt,
+    schema: &Schema,
+) -> Result<Option<ast::SelectStmt>> {
+    if !s.joins.iter().any(|j| j.kind == ast::JoinKind::Right) {
+        return Ok(None);
+    }
+    if s.joins.len() != 1 {
+        return Err(bind_err(
+            "RIGHT JOIN in a multi-join chain is not supported — swap the tables \
+             and write LEFT JOIN",
+        ));
+    }
+    let j = &s.joins[0];
+    let items = match &s.items {
+        Some(items) => Some(items.clone()),
+        None => {
+            let (_, lt) = resolve_table(schema, &s.table)?;
+            let (_, rt) = resolve_table(schema, &j.table)?;
+            let lname = s.alias.clone().unwrap_or_else(|| s.table.clone());
+            let rname = j.alias.clone().unwrap_or_else(|| j.table.clone());
+            let mut items = Vec::with_capacity(lt.columns.len() + rt.columns.len());
+            for c in &lt.columns {
+                items.push((ast::Expr::Qualified(lname.clone(), c.name.clone()), None));
+            }
+            for c in &rt.columns {
+                items.push((ast::Expr::Qualified(rname.clone(), c.name.clone()), None));
+            }
+            Some(items)
+        }
+    };
+    Ok(Some(ast::SelectStmt {
+        table: j.table.clone(),
+        alias: j.alias.clone(),
+        joins: vec![ast::JoinClause {
+            table: s.table.clone(),
+            alias: s.alias.clone(),
+            kind: ast::JoinKind::Left,
+            on: j.on.clone(),
+        }],
+        distinct: s.distinct,
+        items,
+        where_clause: s.where_clause.clone(),
+        group_by: s.group_by.clone(),
+        having: s.having.clone(),
+        order_by: s.order_by.clone(),
+        limit: s.limit,
+        offset: s.offset,
+    }))
+}
+
 pub(super) fn plan_join_select(
     s: &ast::SelectStmt,
     schema: &Schema,
@@ -79,20 +136,45 @@ pub(super) fn plan_join_select(
         let bound_on = jb.bind_predicate(&jc.on)?;
         binder = jb;
 
+        let kind = match jc.kind {
+            ast::JoinKind::Inner => JoinKind::Inner,
+            ast::JoinKind::Left => JoinKind::Left,
+            // RIGHT was rewritten to a swapped LEFT before planning; one
+            // still here is a RIGHT the rewrite cannot express as left-deep.
+            ast::JoinKind::Right => {
+                return Err(bind_err(
+                    "RIGHT JOIN in a multi-join chain is not supported — swap the \
+                     tables and write LEFT JOIN",
+                ))
+            }
+            ast::JoinKind::Full => {
+                if s.joins.len() > 1 {
+                    return Err(bind_err(
+                        "FULL JOIN in a multi-join chain is not supported — it needs \
+                         both sides whole, which a left-deep chain cannot give it",
+                    ));
+                }
+                JoinKind::Full
+            }
+        };
         // #49: consume pure equality conjuncts into an inner access path —
         // the index nested loop. What remains of the ON runs as the residual
         // over the joined row, preserving every raise the query could observe.
-        let (jaccess, residual_on) = extract_join_access(bound_on, &acc_types, jt, consts)?;
+        // A FULL join never takes the index nested loop: emitting the
+        // UNMATCHED inner rows requires the inner side enumerated and held,
+        // so the whole ON stays residual over the held scan.
+        let (jaccess, residual_on) = if kind == JoinKind::Full {
+            (AccessPath::FullScan, bound_on)
+        } else {
+            extract_join_access(bound_on, &acc_types, jt, consts)?
+        };
         let on = compile_program(&residual_on)?;
 
         joined_columns.extend(jt.columns.iter().cloned());
         acc_types.extend(jt.columns.iter().map(|c| c.ty));
         joins.push(Join {
             table: jid,
-            kind: match jc.kind {
-                ast::JoinKind::Inner => JoinKind::Inner,
-                ast::JoinKind::Left => JoinKind::Left,
-            },
+            kind,
             access: jaccess,
             on,
             policy,

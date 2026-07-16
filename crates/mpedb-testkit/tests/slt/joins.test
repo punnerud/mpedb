@@ -375,12 +375,21 @@ SELECT count(*) FROM emp LEFT OUTER JOIN dept ON emp.did = dept.did
 4
 
 # RIGHT/FULL keep rows the other way (or both ways) and stay refused by NAME —
-# RIGHT with the hint that it is LEFT with the tables swapped.
-statement error RIGHT JOIN is not supported
-SELECT emp.eid FROM emp RIGHT JOIN dept ON emp.did = dept.did
+# RIGHT plans as LEFT with the sides swapped (#64): all dept rows survive,
+# the empty dept NULL-extends emp's columns.
+query I nosort
+SELECT emp.eid FROM emp RIGHT JOIN dept ON emp.did = dept.did ORDER BY 1
+----
+NULL
+10
+11
+12
 
-statement error FULL JOIN is not supported
-SELECT emp.eid FROM emp FULL OUTER JOIN dept ON emp.did = dept.did
+# FULL keeps unmatched rows from BOTH sides (#64).
+query I nosort
+SELECT count(*) FROM emp FULL OUTER JOIN dept ON emp.did = dept.did
+----
+5
 
 # CROSS JOIN is the cartesian product, same desugar as the comma-join (#56).
 query I nosort

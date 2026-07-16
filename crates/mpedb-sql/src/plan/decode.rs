@@ -432,11 +432,11 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                 let kind = match r_u8(buf, pos)? {
                     0 => JoinKind::Inner,
                     1 => JoinKind::Left,
-                    // Reserved so RIGHT/FULL need no format bump later; refused
-                    // by NAME so the reader learns what the plan wanted, not
-                    // just that a byte was odd.
-                    2 => return Err(corrupt("join kind RIGHT is reserved but not yet supported")),
-                    3 => return Err(corrupt("join kind FULL is reserved but not yet supported")),
+                    // RIGHT never reaches plan bytes (the planner rewrites it
+                    // to a swapped LEFT), so its tag stays reserved — refused
+                    // by NAME so the reader learns what the blob wanted.
+                    2 => return Err(corrupt("join kind RIGHT is reserved — plans carry a swapped LEFT")),
+                    3 => JoinKind::Full,
                     t => return Err(corrupt(format!("bad join kind tag {t}"))),
                 };
                 joins.push(Join {

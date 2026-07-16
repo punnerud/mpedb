@@ -139,6 +139,11 @@ pub(crate) enum JoinKind {
     Inner,
     /// `LEFT [OUTER] JOIN`: no match → one NULL-extended row.
     Left,
+    /// `RIGHT [OUTER] JOIN` — planned as a LEFT with the sides swapped (and
+    /// the projection remapped); never reaches the plan bytes.
+    Right,
+    /// `FULL [OUTER] JOIN`: unmatched rows on BOTH sides NULL-extend.
+    Full,
 }
 
 /// `[INNER | LEFT [OUTER]] JOIN <table> ON <cond>`.

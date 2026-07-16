@@ -281,7 +281,9 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
                 buf.push(match j.kind {
                     JoinKind::Inner => 0,
                     JoinKind::Left => 1,
-                    // 2 (RIGHT) and 3 (FULL) are reserved — see decode.
+                    // 2 (RIGHT) stays reserved: the planner rewrites RIGHT to
+                    // a swapped LEFT, so no plan ever carries it.
+                    JoinKind::Full => 3,
                 });
                 encode_access(&j.access, buf);
                 j.on.encode_into(buf);

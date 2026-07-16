@@ -79,6 +79,11 @@ pub enum JoinKind {
     Inner,
     /// No match → one row with the inner side NULL-extended.
     Left,
+    /// Unmatched rows on BOTH sides NULL-extend (#64). Only as a statement's
+    /// single join, and only with a FullScan inner access — the matched-set
+    /// bookkeeping needs the inner side enumerated and held. (RIGHT has no
+    /// plan-level kind at all: the planner rewrites it to a swapped LEFT.)
+    Full,
 }
 
 /// The inner side of one `JOIN` step, driven by a nested loop over the outer.

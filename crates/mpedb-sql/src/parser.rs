@@ -551,6 +551,24 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Compound(CompoundStmt { arms, ops, order_by, limit, offset }))
     }
 
+    /// Eat the no-op `ALL` quantifier (the explicit opposite of DISTINCT):
+    /// `SELECT ALL x`, `count(ALL x)`. Positional word, consumed only when an
+    /// expression can follow — `SELECT all FROM t` still names a column, and
+    /// `count(all)` still counts one.
+    fn eat_all_quantifier(&mut self) {
+        if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("ALL"))
+            && !matches!(
+                self.peek_at(1),
+                None | Some(Tok::Kw(Kw::From))
+                    | Some(Tok::Comma)
+                    | Some(Tok::RParen)
+                    | Some(Tok::Semicolon)
+            )
+        {
+            self.pos += 1;
+        }
+    }
+
     /// The next token starts a compound set operator, without consuming it.
     /// UNION / EXCEPT / INTERSECT are positional words, not keywords — a
     /// quoted identifier is how you'd name a table `union`.
@@ -567,6 +585,9 @@ impl<'a> Parser<'a> {
     fn select_core(&mut self) -> Result<SelectStmt> {
         self.expect_kw(Kw::Select, "SELECT")?;
         let distinct = self.eat_kw(Kw::Distinct);
+        if !distinct {
+            self.eat_all_quantifier();
+        }
         let items = if self.eat(&Tok::Star) {
             None
         } else {
@@ -582,31 +603,38 @@ impl<'a> Parser<'a> {
             Some(items)
         };
         self.expect_kw(Kw::From, "FROM")?;
+        // `FROM ( a JOIN b ON … )` — parens around a join group. For the
+        // left-deep chains this grammar builds they are associativity no-ops,
+        // so opening parens are counted and their closers consumed between
+        // join steps. (A paren group as the INNER side of a join — `a JOIN
+        // (b JOIN c)` — is NOT expressible left-deep and stays a parse error.)
+        let mut from_parens = 0usize;
+        while self.eat(&Tok::LParen) {
+            from_parens += 1;
+        }
         let table = self.ident("table name")?;
         let from_alias = self.opt_table_alias()?;
         let mut joins = Vec::new();
-        // `FROM a, b [, c…]` — the comma-join. It IS the cartesian product,
-        // written in the syntax whose whole meaning is "every pair" (unlike a
-        // bare `JOIN b` with a forgotten ON, which stays refused): desugared
-        // to `INNER JOIN … ON true`, with the WHERE doing the filtering over
-        // the joined row — sqlite/PG semantics exactly.
-        while self.eat(&Tok::Comma) {
-            let t = self.ident("table name after ','")?;
-            let alias = self.opt_table_alias()?;
-            joins.push(JoinClause {
-                table: t,
-                alias,
-                kind: JoinKind::Inner,
-                on: Expr::Lit(Value::Bool(true)),
-            });
-        }
-        // `([INNER | LEFT [OUTER]] JOIN t ON cond)*` — a left-deep chain.
-        // INNER is the default; LEFT NULL-extends the inner side on no match.
-        // RIGHT/FULL/CROSS/NATURAL are refused BY NAME: left to the generic
-        // path the error reads "unexpected trailing input at byte 24", which
-        // tells someone who wrote RIGHT JOIN nothing about why.
+        // ONE left-deep chain where `,` and the JOIN keywords are equal
+        // separators — sqlite's FROM grammar, and the corpus interleaves them
+        // freely (`FROM a CROSS JOIN b, c`). The comma-join and CROSS JOIN
+        // ARE the cartesian product, written in syntax whose whole meaning is
+        // "every pair" (unlike a bare `JOIN b` with a forgotten ON, which
+        // stays refused): desugared to `INNER JOIN … ON true`, with WHERE
+        // filtering over the joined row — sqlite/PG semantics exactly.
         loop {
-            if self.eat_kw(Kw::Inner) {
+            if from_parens > 0 && self.eat(&Tok::RParen) {
+                from_parens -= 1;
+            } else if self.eat(&Tok::Comma) {
+                let t = self.ident("table name after ','")?;
+                let alias = self.opt_table_alias()?;
+                joins.push(JoinClause {
+                    table: t,
+                    alias,
+                    kind: JoinKind::Inner,
+                    on: Expr::Lit(Value::Bool(true)),
+                });
+            } else if self.eat_kw(Kw::Inner) {
                 self.expect_kw(Kw::Join, "JOIN after INNER")?;
                 joins.push(self.join_tail(JoinKind::Inner)?);
             } else if self.eat_kw(Kw::Join) {
@@ -617,6 +645,14 @@ impl<'a> Parser<'a> {
                 let _ = self.eat_word("OUTER");
                 self.expect_kw(Kw::Join, "JOIN after LEFT")?;
                 joins.push(self.join_tail(JoinKind::Left)?);
+            } else if self.eat_word("RIGHT") {
+                let _ = self.eat_word("OUTER");
+                self.expect_kw(Kw::Join, "JOIN after RIGHT")?;
+                joins.push(self.join_tail(JoinKind::Right)?);
+            } else if self.eat_word("FULL") {
+                let _ = self.eat_word("OUTER");
+                self.expect_kw(Kw::Join, "JOIN after FULL")?;
+                joins.push(self.join_tail(JoinKind::Full)?);
             } else if matches!(self.peek_join_kind(), Some("CROSS")) {
                 // `CROSS JOIN t` is the cartesian product written in the
                 // syntax whose whole meaning is "every pair" — exactly the
@@ -632,20 +668,17 @@ impl<'a> Parser<'a> {
                     on: Expr::Lit(Value::Bool(true)),
                 });
             } else if let Some(kind) = self.peek_join_kind() {
+                // Only NATURAL is left unsupported: its join condition is
+                // implicit in column NAMES, which rigid schemas make a trap.
                 return Err(self.err_here(format!(
-                    "{kind} JOIN is not supported — only INNER, LEFT and CROSS JOIN. {}",
-                    match kind {
-                        "RIGHT" =>
-                            "A RIGHT JOIN is a LEFT JOIN with the tables swapped — swap them \
-                             and write LEFT JOIN.",
-                        _ =>
-                            "It keeps rows with no match on BOTH sides, which LEFT alone cannot \
-                             express — so it is refused rather than quietly narrowed.",
-                    }
+                    "{kind} JOIN is not supported — write the ON condition explicitly",
                 )));
             } else {
                 break;
             }
+        }
+        if from_parens > 0 {
+            return Err(self.err_here("unclosed `(` in FROM"));
         }
         let where_clause = if self.eat_kw(Kw::Where) {
             Some(self.expr()?)
@@ -1242,6 +1275,9 @@ impl<'a> Parser<'a> {
                 return Ok(Expr::Agg(f, None, false));
             }
             let distinct = self.eat_kw(Kw::Distinct);
+            if !distinct {
+                self.eat_all_quantifier();
+            }
             if distinct && self.peek() == Some(&Tok::Star) {
                 // sqlite and PG both make this a syntax error, and they are
                 // right: `count(*)` counts ROWS, and "distinct rows" is what
