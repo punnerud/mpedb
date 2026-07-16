@@ -20,6 +20,18 @@ fn bitmap_len(ncols: usize) -> usize {
 
 /// Encode a full row. `values.len()` must equal `types.len()`; type fit and
 /// nullability are validated by the caller (engine) beforehand.
+/// ⚠ **This materialises the WHOLE row, blob included, and for a large value
+/// that buffer is the single most expensive thing in an insert** — 10.1 ms of a
+/// 23.5 ms 16 MiB insert (~42%), measured 2026-07-16 with
+/// `examples/blob_warm --features leakstat`. It exists only to be handed to
+/// `btree::insert`, which copies it straight back out into overflow pages: the
+/// blob crosses memory three times (`params!`'s `to_vec` → here → the pages) and
+/// two of the three do no work. The cost is the fresh 16 MiB malloc — anonymous
+/// pages fault exactly like the file mapping does — plus the memcpy.
+///
+/// The fix is a scatter-gather payload so the overflow path consumes the row's
+/// parts without concatenating them; see task #42. Not a format change — the
+/// pages come out byte-for-byte identical.
 pub fn encode_row(values: &[Value], types: &[ColumnType]) -> Result<Vec<u8>> {
     debug_assert_eq!(values.len(), types.len());
     let nbm = bitmap_len(types.len());
