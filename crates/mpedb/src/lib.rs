@@ -1547,6 +1547,26 @@ primary_key = ["id"]
         assert!(matches!(DetachedPlan::decode(&bad_sql), Err(Error::Corrupt(_))));
     }
 
+    /// A detached plan from an OLDER binary (a different PLAN_FORMAT byte) is
+    /// version drift, not tampering: the client must get `PlanInvalidated` —
+    /// the documented re-prepare-from-`DetachedPlan::sql` path — not a
+    /// `Corrupt` that reads as "your blob was forged". Pinned after the 7→8
+    /// bump surfaced exactly this (adversarial review find).
+    #[test]
+    fn detached_plan_from_old_format_is_invalidated_not_corrupt() {
+        let (cfg, path) = test_config("detached-format", 8);
+        let _guard = FileGuard(path);
+        let db = Database::open_with_config(cfg).unwrap();
+        let mut dp = db.prepare_detached("SELECT * FROM users WHERE id = $1").unwrap();
+        // The format byte is byte 0 of the canonical encoding; regress it.
+        assert_ne!(dp.blob[0], 7, "bump the test constant when the format moves");
+        dp.blob[0] = 7;
+        assert!(
+            matches!(db.execute_detached(&dp, &params![1]), Err(Error::PlanInvalidated)),
+            "an old-format blob must invalidate, not report corruption"
+        );
+    }
+
     #[test]
     fn detached_hash_matches_prepare_and_runs_without_registry() {
         let (cfg, path) = test_config("detached-basic", 8);

@@ -882,7 +882,21 @@ fn plan_join_select(
     let mut order_by = Vec::with_capacity(s.order_by.len());
     let mut order_over = OrderOver::BaseRow;
     let mut order_junk = 0u16;
-    if !s.order_by.is_empty() {
+    if s.distinct {
+        // Under DISTINCT the sort AND the LIMIT/OFFSET must follow the dedup,
+        // and exec only applies skip/take post-dedup on the Projection route —
+        // so the joined base row is never the tuple being ordered or bounded.
+        // The single-table path has enforced this all along; the join path
+        // silently skipped it, and LIMIT counted pre-dedup joined duplicates
+        // (adversarial review find: `SELECT DISTINCT dept.dname … LIMIT 2`
+        // returned one row where sqlite3/PG return two). junk = None: a sort
+        // key that is not in the SELECT list is refused, because after the
+        // dedup it is *which duplicate survived* that would decide the order.
+        let (keys, n_junk) = distinct_order_by(s, &full_scope, None)?;
+        order_by = keys;
+        order_over = OrderOver::Projection;
+        order_junk = n_junk;
+    } else if !s.order_by.is_empty() {
         // The "base row" of a join IS the joined row, and it is built in full
         // before the sort — so sorting it is the same operation, just wider.
         let mut keys = Vec::with_capacity(s.order_by.len());
@@ -1892,6 +1906,10 @@ fn extract_access(
                 .iter()
                 .position(|sc| sc == col)
                 .filter(|pos| *pos < 63)
+                // `any` can never be probed: index order is encoding order,
+                // not sql_cmp order. The schema refuses indexing it, so this
+                // is unreachable — kept as the planner's own guarantee.
+                .filter(|_| table.columns[*col as usize].ty != ColumnType::Any)
                 .filter(|_| !unique_only || table.columns[*col as usize].unique)
                 .map(|pos| (i, (pos + 1) as u32, atom.clone())),
             _ => None,
@@ -1952,6 +1970,9 @@ fn extract_access(
     for (pos, &col) in sec.iter().enumerate() {
         if pos >= 63 {
             break; // beyond the footprint bitmap — never chosen
+        }
+        if table.columns[col as usize].ty == ColumnType::Any {
+            continue; // no order across types — see the probe_pass guard
         }
         let mut lo = None;
         let mut hi = None;
@@ -2056,7 +2077,12 @@ fn extract_join_access(
             }
             _ => continue,
         };
-        if pins[icol].is_none() {
+        // Belt and suspenders: an `any` column can never be pinned. The
+        // schema already refuses `any` in every key (PK/UNIQUE/indexed), so
+        // no access path could use the pin — but the probe semantics would be
+        // encoding-equality rather than sql_cmp, and that must never leak in
+        // through a future schema change.
+        if pins[icol].is_none() && inner.columns[icol].ty != ColumnType::Any {
             pins[icol] = Some((ci, part));
         }
     }

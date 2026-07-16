@@ -123,5 +123,37 @@ primary_key = ["id"]
         Err(e) => e,
         Ok(_) => panic!("an `any` UNIQUE column must be refused"),
     };
-    assert!(format!("{e}").contains("`any` and UNIQUE"), "got: {e}");
+    assert!(
+        format!("{e}").contains("`any` and carry an index (UNIQUE)"),
+        "got: {e}"
+    );
+}
+
+/// A NON-unique index over `any` is refused for the same reason — the index
+/// is memcmp-ordered and `any` has no order across types. This slipped
+/// through once, and the adversarial review showed the consequence: an
+/// IndexRange over mixed runtime types returned WRONG rows, and DELETE
+/// through it deleted them.
+#[test]
+fn any_indexed_is_refused() {
+    let ix = r#"
+[[table]]
+name = "t"
+primary_key = ["id"]
+  [[table.column]]
+  name = "id"
+  type = "int64"
+  [[table.column]]
+  name = "u"
+  type = "any"
+  indexed = true
+"#;
+    let e = match db("ix", ix) {
+        Err(e) => e,
+        Ok(_) => panic!("an `any` indexed column must be refused"),
+    };
+    assert!(
+        format!("{e}").contains("`any` and carry an index (indexed)"),
+        "got: {e}"
+    );
 }
