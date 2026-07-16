@@ -1370,6 +1370,51 @@ impl<'e> WriteTxn<'e> {
 
     // ---------- typed row API ----------
 
+    /// Insert a row whose column `stream_col` is pulled from `src` instead of
+    /// being handed over as a `Value` (#43). Nothing large is ever resident: the
+    /// engine asks `src` for a page at a time as it writes.
+    ///
+    /// Pass `Value::Blob(vec![])` (or `Text("")`) in `values` at `stream_col` —
+    /// it is a placeholder for the type check; its length comes from
+    /// `src.len()`. The streamed column must be the row's LAST variable-length
+    /// column (`row::encode_row_head_for_stream` enforces it).
+    ///
+    /// The lock is held for the duration, and `src` is called with it held —
+    /// which is exactly why this pulls rather than handing out a writer: a slow
+    /// source blocks every other writer either way, but here that window is the
+    /// engine's to bound rather than the caller's to forget.
+    pub fn insert_row_streaming(
+        &mut self,
+        table_id: u32,
+        values: &[Value],
+        stream_col: usize,
+        src: &mut dyn btree::BlobSource,
+    ) -> Result<()> {
+        self.check_write_blocked(table_id)?;
+        self.eng.validate_row(table_id, values)?;
+        let table = self.eng.table(table_id)?;
+        let tname = table.name.clone();
+        if !self.eng.sec_indexes[table_id as usize].is_empty() {
+            // A UNIQUE probe needs the value, and the whole point here is that
+            // nobody has it. Refuse rather than half-check.
+            return Err(Error::Unsupported(
+                "streaming insert into a table with a secondary UNIQUE index".into(),
+            ));
+        }
+        let key = self.eng.pk_key(table_id, values)?;
+        let types = &self.eng.col_types[table_id as usize];
+        let (head, _total) =
+            row::encode_row_head_for_stream(values, types, stream_col, src.len())?;
+        let (root, count) = self.tree_root(table_id, 0)?;
+        let mut payload = btree::Payload::Stream { head: &head, src };
+        let out = btree::insert(self, root, &key, &mut payload, InsertMode::InsertOnly)?;
+        if out.existed {
+            return Err(Error::PrimaryKeyViolation { table: tname });
+        }
+        self.set_tree_root(table_id, 0, out.new_root, count + 1);
+        Ok(())
+    }
+
     pub fn insert_row(&mut self, table_id: u32, values: &[Value]) -> Result<()> {
         self.check_write_blocked(table_id)?;
         let __t = std::time::Instant::now();

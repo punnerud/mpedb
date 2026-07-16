@@ -32,6 +32,49 @@ fn bitmap_len(ncols: usize) -> usize {
 /// The fix is a scatter-gather payload so the overflow path consumes the row's
 /// parts without concatenating them; see task #42. Not a format change — the
 /// pages come out byte-for-byte identical.
+/// Encode a row whose column `stream_col` is not in `values` yet — it will be
+/// streamed in (#43). Returns the head (bitmap + fixed + every OTHER varlen
+/// body, concatenated) and the total row length.
+///
+/// The streamed column must be the LAST varlen column, because the varlen
+/// section is laid out in column order and the stream has to land at its end.
+/// Callers get an error rather than a silently mis-laid row.
+pub fn encode_row_head_for_stream(
+    values: &[Value],
+    types: &[ColumnType],
+    stream_col: usize,
+    stream_len: usize,
+) -> Result<(Vec<u8>, usize)> {
+    let last_varlen = values
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| matches!(v, Value::Text(_) | Value::Blob(_)))
+        .map(|(i, _)| i)
+        .next_back();
+    if last_varlen.is_some_and(|i| i > stream_col) {
+        return Err(Error::Unsupported(
+            "the streamed column must be the last variable-length column in the row".into(),
+        ));
+    }
+    let (mut head, bodies) = encode_row_parts(values, types)?;
+    // `encode_row_parts` recorded stream_col's length as whatever placeholder
+    // the caller passed (empty); patch in the real one, and its offset is the
+    // end of the varlen section since it is last.
+    let nbm = bitmap_len(types.len());
+    let off: usize = nbm + types[..stream_col].iter().map(|&t| fixed_width(t)).sum::<usize>();
+    let var_off: usize = bodies.iter().map(|b| b.len()).sum();
+    if stream_len > u32::MAX as usize {
+        return Err(Error::Unsupported("value larger than 4 GiB".into()));
+    }
+    head[off..off + 4].copy_from_slice(&(var_off as u32).to_le_bytes());
+    head[off + 4..off + 8].copy_from_slice(&(stream_len as u32).to_le_bytes());
+    for b in bodies {
+        head.extend_from_slice(b);
+    }
+    let total = head.len() + stream_len;
+    Ok((head, total))
+}
+
 /// The byte length `encode_row` would produce, without encoding anything.
 ///
 /// Lets a caller pick the payload form by size (#42) before paying for either:
