@@ -42,6 +42,10 @@ fn sqlite_type(ct: ColumnType) -> &'static str {
         ColumnType::Text => "TEXT",
         ColumnType::Blob => "BLOB",
         ColumnType::Timestamp => "DATETIME",
+        // sqlite is the one target that HAS this concept: a column with no
+        // declared type gets BLOB affinity, i.e. it stores whatever it is given.
+        // That is exactly `any`, so the round-trip reconstructs it.
+        ColumnType::Any => "",
     }
 }
 

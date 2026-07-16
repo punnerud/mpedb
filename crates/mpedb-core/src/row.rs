@@ -10,7 +10,34 @@ use mpedb_types::{ColumnType, Error, Result, Value};
 fn fixed_width(ty: ColumnType) -> usize {
     match ty {
         ColumnType::Bool => 1,
+        // An `any` column carries its discriminant HERE, not in the varlen body:
+        // a tag byte plus the eight everything else uses (the scalar itself, or
+        // the (offset, len) pair when the tag says text/blob).
+        //
+        // Prefixing the body instead would make it `[tag] ++ bytes`, which does
+        // not exist as one contiguous slice to borrow — and `btree::Payload::Parts`
+        // (#42) and the streaming insert (#43) both borrow varlen bodies straight
+        // out of the caller's `Value`. This layout leaves them untouched, and a
+        // rigid column pays nothing for a feature it does not use.
+        ColumnType::Any => 9,
         _ => 8,
+    }
+}
+
+/// The tag byte in an `any` column's fixed slot: which type this VALUE is.
+/// Reuses `ColumnType`'s own discriminants so there is one numbering to get
+/// wrong, plus 0 for NULL (the bitmap already covers NULL, so 0 should never be
+/// read — it is here so a zeroed slot decodes as corrupt rather than as Int(0)).
+fn any_tag(v: &Value) -> u8 {
+    match v {
+        Value::Null => 0,
+        Value::Int(_) => ColumnType::Int64 as u8,
+        Value::Float(_) => ColumnType::Float64 as u8,
+        Value::Bool(_) => ColumnType::Bool as u8,
+        Value::Text(_) => ColumnType::Text as u8,
+        Value::Blob(_) => ColumnType::Blob as u8,
+        Value::Timestamp(_) => ColumnType::Timestamp as u8,
+        Value::List(_) => 0, // rejected by `fits` long before here
     }
 }
 
@@ -61,7 +88,14 @@ pub fn encode_row_head_for_stream(
     // the caller passed (empty); patch in the real one, and its offset is the
     // end of the varlen section since it is last.
     let nbm = bitmap_len(types.len());
-    let off: usize = nbm + types[..stream_col].iter().map(|&t| fixed_width(t)).sum::<usize>();
+    let mut off: usize =
+        nbm + types[..stream_col].iter().map(|&t| fixed_width(t)).sum::<usize>();
+    // An `any` column's slot is [tag][off][len]; `encode_row_parts` already wrote
+    // the tag from the placeholder value (which is why the placeholder must be a
+    // Blob/Text of the right KIND even though its length is ignored). Step over it.
+    if types[stream_col] == ColumnType::Any {
+        off += 1;
+    }
     let var_off: usize = bodies.iter().map(|b| b.len()).sum();
     if stream_len > u32::MAX as usize {
         return Err(Error::Unsupported("value larger than 4 GiB".into()));
@@ -105,9 +139,22 @@ pub fn encode_row_parts<'a>(
     let mut head = vec![0u8; nbm + fixed_total];
     let mut bodies: Vec<&'a [u8]> = Vec::new();
     let mut var_len = 0usize; // running length of the varlen section
-    let mut off = nbm;
+    let mut cursor = nbm;
     for (i, (v, &ty)) in values.iter().zip(types).enumerate() {
         let w = fixed_width(ty);
+        // THE TRAP: everything below matches on the VALUE, not the column type.
+        // An `any` column's slot is [tag][8], so without this an Int in an `any`
+        // column would take the Int arm and write its eight bytes where the tag
+        // belongs — a row that decodes as garbage and never fails a type check.
+        // Write the tag and shift; the arms then write exactly where they always
+        // did, one byte along.
+        let slot = if ty == ColumnType::Any && !v.is_null() {
+            head[cursor] = any_tag(v);
+            cursor + 1
+        } else {
+            cursor
+        };
+        let off = slot; // shadow for the arms; the real cursor advances by `w` below
         match v {
             Value::Null => head[i / 8] |= 1 << (i % 8),
             Value::Int(x) | Value::Timestamp(x) => {
@@ -141,7 +188,7 @@ pub fn encode_row_parts<'a>(
                 ))
             }
         }
-        off += w;
+        cursor += w;
     }
     Ok((head, bodies))
 }
@@ -180,7 +227,25 @@ pub fn decode_column(buf: &[u8], types: &[ColumnType], col: usize) -> Result<Val
     }
     let ty = types[col];
     let fixed_end: usize = nbm + types.iter().map(|&t| fixed_width(t)).sum::<usize>();
+    // An `any` column's tag says what THIS value is; decode it as that type
+    // from the eight bytes after the tag. Everything below is the rigid path,
+    // untouched.
+    let (ty, off) = if ty == ColumnType::Any {
+        let tag = *buf.get(off).ok_or_else(err)?;
+        let t = ColumnType::from_tag(tag).filter(|t| *t != ColumnType::Any).ok_or_else(|| {
+            // 0 is NULL's tag, and the null bitmap already returned above — so a
+            // 0 here means a zeroed slot, not a null value. Say so rather than
+            // decoding it as Int(0).
+            Error::Corrupt(format!("invalid `any` value tag {tag:#x} in row"))
+        })?;
+        (t, off + 1)
+    } else {
+        (ty, off)
+    };
     match ty {
+        // Unreachable: rewritten above. Kept explicit so adding a type to
+        // ColumnType makes this fail to compile rather than silently fall through.
+        ColumnType::Any => Err(Error::Internal("`any` tag resolved to `any`".into())),
         ColumnType::Bool => match *buf.get(off).ok_or_else(err)? {
             0 => Ok(Value::Bool(false)),
             1 => Ok(Value::Bool(true)),
@@ -232,6 +297,77 @@ pub fn decode_row(buf: &[u8], types: &[ColumnType]) -> Result<Vec<Value>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `any` column round-trips every scalar kind, and the tag decides —
+    /// not the column.
+    #[test]
+    fn any_column_roundtrips_every_kind() {
+        let types = [ColumnType::Int64, ColumnType::Any, ColumnType::Text];
+        for v in [
+            Value::Int(-42),
+            Value::Float(1.5),
+            Value::Bool(true),
+            Value::Bool(false),
+            Value::Text("hei".into()),
+            Value::Blob(vec![0, 1, 255]),
+            Value::Timestamp(1_700_000_000_000_000),
+            Value::Null,
+        ] {
+            let row = [Value::Int(7), v.clone(), Value::Text("tail".into())];
+            let buf = encode_row(&row, &types).unwrap();
+            // every column, not just the loose one: the `any` slot is 9 bytes
+            // wide, so a wrong width silently shifts its NEIGHBOURS
+            assert_eq!(decode_column(&buf, &types, 0).unwrap(), Value::Int(7), "{v:?}");
+            assert_eq!(decode_column(&buf, &types, 1).unwrap(), v, "any col: {v:?}");
+            assert_eq!(
+                decode_column(&buf, &types, 2).unwrap(),
+                Value::Text("tail".into()),
+                "column AFTER the any slot: {v:?}"
+            );
+        }
+    }
+
+    /// `encode_row` matches on the VALUE, so an Int in an `any` column would
+    /// take the Int arm and write its eight bytes where the tag belongs. That
+    /// row decodes as garbage and never fails a type check — the exact trap this
+    /// feature had to avoid. Pin it.
+    #[test]
+    fn any_column_writes_the_tag_not_the_bare_scalar() {
+        let types = [ColumnType::Any];
+        let buf = encode_row(&[Value::Int(1)], &types).unwrap();
+        // bitmap(1) then the any slot: tag first
+        assert_eq!(buf[1], ColumnType::Int64 as u8, "tag byte missing");
+        assert_eq!(buf.len(), 1 + 9, "any slot must be 9 bytes");
+        assert_eq!(decode_column(&buf, &types, 0).unwrap(), Value::Int(1));
+    }
+
+    /// A zeroed `any` slot must be Corrupt, not Int(0). The null bitmap already
+    /// covers NULL, so tag 0 can only mean a slot nobody wrote.
+    #[test]
+    fn zeroed_any_tag_is_corrupt_not_int_zero() {
+        let types = [ColumnType::Any];
+        let mut buf = encode_row(&[Value::Int(0)], &types).unwrap();
+        buf[1] = 0; // clobber the tag
+        assert!(matches!(
+            decode_column(&buf, &types, 0),
+            Err(Error::Corrupt(_))
+        ));
+    }
+
+    /// Truncation at every offset must be `Corrupt`, never a panic — the house
+    /// rule for every decoder, and the `any` slot adds a new width to get wrong.
+    #[test]
+    fn truncated_any_row_never_panics() {
+        let types = [ColumnType::Any, ColumnType::Any];
+        let row = [Value::Text("abc".into()), Value::Int(9)];
+        let full = encode_row(&row, &types).unwrap();
+        for cut in 0..full.len() {
+            for col in 0..types.len() {
+                // must not panic; wrong-but-typed answers are fine, panics are not
+                let _ = decode_column(&full[..cut], &types, col);
+            }
+        }
+    }
 
     #[test]
     fn roundtrip_mixed_row() {

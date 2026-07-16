@@ -70,6 +70,12 @@ fn generic_pg_type(ct: ColumnType) -> &'static str {
         ColumnType::Text => "text",
         ColumnType::Blob => "bytea",
         ColumnType::Timestamp => "timestamptz",
+        // Unreachable via `mirror push`: preflight refuses an `any` column against
+        // a PostgreSQL target (FindingKind::AnyColumn) before any DDL is
+        // generated. If it ever gets here, the check was bypassed — emit
+        // something PostgreSQL will REJECT rather than silently pick a type and
+        // make the schema depend on today's data.
+        ColumnType::Any => "\"any\" -- mpedb: no PostgreSQL equivalent; see preflight",
     }
 }
 
