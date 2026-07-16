@@ -88,6 +88,34 @@ pub enum ExecResult {
     Explain(String),
 }
 
+/// A blob source over any `std::io::Read` with a known length: the bridge from
+/// a file, socket, or stream to `WriteSession::insert_streaming`. The engine
+/// pulls a page at a time, so the reader's bytes are never all resident.
+///
+/// The length is declared up front (the leaf cell records the value's size) and
+/// must match what the reader yields: `next_into` uses `read_exact`, so a reader
+/// that ends early surfaces as an error rather than a short row.
+pub struct ReaderBlobSource<R> {
+    reader: R,
+    len: usize,
+}
+
+impl<R: std::io::Read> ReaderBlobSource<R> {
+    pub fn new(reader: R, len: usize) -> Self {
+        ReaderBlobSource { reader, len }
+    }
+}
+
+impl<R: std::io::Read> mpedb_core::btree::BlobSource for ReaderBlobSource<R> {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn next_into(&mut self, buf: &mut [u8]) -> Result<()> {
+        self.reader.read_exact(buf)?;
+        Ok(())
+    }
+}
+
 /// A **detached (client-borne) plan**: the compiled plan the SDK/client
 /// carries itself instead of leaving in the shared registry (Morten's idea,
 /// DESIGN.md §7.2 turned inside-out). Shipping `(blob + hash + sql)` between
@@ -106,6 +134,7 @@ pub enum ExecResult {
 ///   dependency is not worth it; this field is exactly where a future
 ///   compressor would slot in (compress on [`DetachedPlan::encode`], inflate
 ///   on [`DetachedPlan::decode`]).
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DetachedPlan {
     pub hash: PlanHash,
@@ -951,6 +980,28 @@ impl WriteSession<'_> {
     ///
     /// Refused on a table with a secondary UNIQUE index: that probe needs the
     /// value, and the point of this call is that nobody has it.
+    /// Copy a whole file into `stream_col` as a blob, streamed a page at a time
+    /// so the file is never resident (#43). "Put this file in the database" as
+    /// one call — the memory ceiling is one overflow page, not the file size, so
+    /// a 4 GiB file inserts on a machine that could not hold it in RAM.
+    ///
+    /// `values[stream_col]` is a placeholder for the type check (pass an empty
+    /// `Blob`/`Text`); the length comes from the file. The streamed column must
+    /// be the row's last variable-length column, and the table must have no
+    /// secondary UNIQUE index — same constraints as [`Self::insert_streaming`].
+    pub fn insert_file(
+        &mut self,
+        table: &str,
+        values: &[Value],
+        stream_col: usize,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        let mut src = ReaderBlobSource::new(file, len);
+        self.insert_streaming(table, values, stream_col, &mut src)
+    }
+
     pub fn insert_streaming(
         &mut self,
         table: &str,
