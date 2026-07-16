@@ -976,6 +976,16 @@ impl<'a> Parser<'a> {
             let e = self.unary_expr();
             self.exit_expr();
             Ok(Expr::Unary(UnOp::Neg, Box::new(e?)))
+        } else if self.eat(&Tok::Plus) {
+            // Unary `+` is the identity, as in sqlite and PostgreSQL — parsed
+            // and DROPPED, so `+ col`, `- + 43` and `+ ( - 78 )` all work.
+            // No AST node: identity would only be something for later stages
+            // to look through. This single arm was the sqllogictest corpus'
+            // single largest blocker (#62: ~55% of all refused statements).
+            self.enter_expr()?;
+            let e = self.unary_expr();
+            self.exit_expr();
+            e
         } else {
             self.primary()
         }
@@ -1272,6 +1282,18 @@ mod tests {
 
     fn expr(src: &str) -> Expr {
         parse_expr_only(src).unwrap().0
+    }
+
+    /// Unary `+` is the identity and parses to NOTHING — `+x` is `x`, and the
+    /// sign chains the sqllogictest corpus is full of (`- + 43`, `+ ( - 78 )`)
+    /// reduce to the plain negation they mean.
+    #[test]
+    fn unary_plus_is_identity() {
+        assert_eq!(expr("+ 43"), expr("43"));
+        assert_eq!(expr("+ a"), expr("a"));
+        assert_eq!(expr("- + 43"), expr("- 43"));
+        assert_eq!(expr("+ ( - 78 )"), expr("(- 78)"));
+        assert_eq!(expr("a + + b"), expr("a + b"));
     }
 
     fn col(name: &str) -> Box<Expr> {
