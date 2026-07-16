@@ -1,29 +1,45 @@
-//! What does it actually cost to get a large blob INTO the file? Four paths,
-//! same bytes, same medium — so the prize for a format change is a number, not
-//! an argument.
+//! What does it actually cost to get a large blob INTO the file? Same bytes,
+//! same medium, varying one thing at a time — so a design question gets a number
+//! instead of an argument.
 //!
-//! 1. **chain** — what mpedb does today: memcpy the payload into 4 KiB pages
-//!    through a 16-byte per-page header, i.e. in `PAGE-HDR`-sized chunks with a
-//!    chain pointer written per page.
-//! 2. **memcpy** — one contiguous memcpy into the same mapping. The floor a
-//!    headerless extent format reaches on ANY filesystem, no syscall trick.
-//! 3. **cfr** — `copy_file_range(2)`: in-kernel copy, source is an fd. Works on
-//!    ext4 (a real copy, no userspace bounce); on btrfs/XFS the kernel may turn
-//!    it into a reflink.
-//! 4. **ficlone** — `FICLONERANGE`: pure extent sharing, ~O(metadata). ext4
-//!    rejects it (EOPNOTSUPP); btrfs/XFS do it near-instantly.
+//! Measured on this box (ext4, 64 MiB, page cache evicted between the layout and
+//! the measurement — see `fresh_dst`):
 //!
-//! Measured here (ext4, 64 MiB): chain 803, memcpy 815, cfr 1346 MiB/s. So the
-//! header chain costs **3%** — a contiguous format buys nothing by itself — and
-//! what copy_file_range actually buys is not skipping headers but not FAULTING
-//! the destination through the mapping.
+//! ```text
+//!   layout      cold    warm      what it is
+//!   sparse       855   16256      ftruncate only, no blocks
+//!   fallocate    933   16344      blocks reserved, extents UNWRITTEN  <- mpedb
+//!   prezeroed    357   13766      fallocate + actually write zeros
+//!   chain        963      —       fallocate + a per-page header (the real format)
+//!   cfr         1638      —       copy_file_range, in-kernel
+//! ```
 //!
-//! Caveat before anyone quotes the table: mpedb itself measures 1037 MiB/s on
-//! 16 MiB blobs — FASTER than this file's `chain` simulation, most likely
-//! because the real file is fallocate'd and its pages are already resident. The
-//! true gap needs an in-engine A/B, not this. And raw `std::fs` write() beats
-//! cfr (2211 vs 1346) because a write() from a hot userspace buffer is ONE
-//! page-cache touch where cfr is two.
+//! Four things worth keeping:
+//!
+//! 1. **The cost is page faults, not the copy.** Warm is 17x cold, same memcpy.
+//!    A MAP_SHARED page must be faulted in before it can be written even when
+//!    the write overwrites every byte of it; `write(2)` owes no such fault, which
+//!    is most of why the raw baseline looks so far ahead. A long-lived process
+//!    recycling pages through the freelist pays this once per page, not per blob
+//!    (see `examples/blob_warm`).
+//! 2. **`fallocate` with UNWRITTEN extents is the right layout, and pre-zeroing
+//!    is a 2.6x regression.** An unwritten extent tells the kernel "this is
+//!    zeros", so a fault can zero-fill for free. Write real zeros over it and the
+//!    extent becomes "written" — now a fault must READ 4 KiB off the platter,
+//!    because the kernel no longer knows the content is trivial. `shm.rs` gets
+//!    this right today.
+//! 3. **The per-page header costs ~3%** (chain 963 vs memcpy 933 — inside noise).
+//!    A contiguous headerless extent format buys nothing on its own.
+//! 4. **`copy_file_range` wins by 75%** by not faulting the destination at all.
+//!    Reflink (`FICLONERANGE`) would be ~O(metadata), but ext4 rejects it and
+//!    macOS has no range-clone into an existing file. Both need a file-backed
+//!    blob API that does not exist: our params are `Value::Blob(Vec<u8>)`, already
+//!    in userspace, with no fd to clone from.
+//!
+//! ⚠ The eviction in `fresh_dst` is load-bearing. Without it the prezeroed arm
+//! measures its own freshly-written page cache and reports **+88% instead of
+//! -62%** — the number flips sign. Every arm gets the same treatment so this
+//! compares LAYOUT, not cache state.
 //!
 //! Usage: `blob_paths <dir> [mib]`
 
@@ -58,10 +74,24 @@ fn main() {
     std::fs::write(&src_path, &payload).unwrap();
     let dst_path = dir.join("dst.bin");
 
-    // A destination file the size of the payload, mmap'd MAP_SHARED — mpedb's
-    // arrangement, which is what rules O_DIRECT out and makes the clone-into-a
-    // -live-mapping question load-bearing.
-    let fresh_dst = || {
+    // How the destination file's blocks are laid out. This is not a detail: it
+    // is most of what the cold numbers below measure, and the first version of
+    // this file got it wrong — it used `set_len` (ftruncate), which leaves a
+    // SPARSE file with no blocks at all, so every first touch had to allocate
+    // one. mpedb does not do that; `shm.rs` calls `fallocate` (unwritten
+    // extents: blocks reserved, no data written) precisely so ENOSPC surfaces at
+    // create instead of as SIGBUS mid-commit.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Layout {
+        /// ftruncate only — no blocks. NOT what mpedb does; here to show the cost.
+        Sparse,
+        /// fallocate — blocks reserved, extents "unwritten". **What mpedb does.**
+        Fallocated,
+        /// fallocate + actually write zeros over it, as `shm::prezero` does for
+        /// the WAL (but not for the data file).
+        Prezeroed,
+    }
+    let fresh_dst = |layout: Layout| {
         let _ = std::fs::remove_file(&dst_path);
         let f = std::fs::OpenOptions::new()
             .read(true)
@@ -71,6 +101,28 @@ fn main() {
             .open(&dst_path)
             .unwrap();
         f.set_len(n as u64).unwrap();
+        if layout != Layout::Sparse {
+            let rc = unsafe { libc::fallocate(f.as_raw_fd(), 0, 0, n as i64) };
+            assert_eq!(rc, 0, "fallocate: {}", std::io::Error::last_os_error());
+        }
+        if layout == Layout::Prezeroed {
+            use std::os::unix::fs::FileExt;
+            let zeros = vec![0u8; 1 << 20];
+            let mut off = 0usize;
+            while off < n {
+                let take = (n - off).min(zeros.len());
+                f.write_all_at(&zeros[..take], off as u64).unwrap();
+                off += take;
+            }
+        }
+        // EVICT. Without this the prezero arm is a lie: it has just written the
+        // whole file, so its pages sit hot and dirty in the page cache and the
+        // "cold" number measures a warm mapping. fsync to make them clean (fadvise
+        // only drops clean pages), then DONTNEED to drop them. Every arm gets the
+        // same treatment so the comparison is of LAYOUT, not of cache state.
+        f.sync_all().unwrap();
+        let rc = unsafe { libc::posix_fadvise(f.as_raw_fd(), 0, n as i64, libc::POSIX_FADV_DONTNEED) };
+        assert_eq!(rc, 0, "posix_fadvise(DONTNEED)");
         f
     };
 
@@ -87,9 +139,12 @@ fn main() {
         );
     };
 
-    // ---- 1. chain: header every (PAGE-HDR) bytes, as the overflow chain does
-    {
-        let f = fresh_dst();
+    // ---- memcpy into each layout, cold and warm.
+    //
+    // Cold = first touch of every page, which is what mpedb-bench's blob cells
+    // see (fresh file per cell). Warm = the pages are already faulted in, which
+    // is what a long-lived process sees once the freelist starts recycling.
+    let mmap_of = |f: &std::fs::File| {
         let map = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -101,6 +156,43 @@ fn main() {
             )
         };
         assert_ne!(map, libc::MAP_FAILED, "mmap");
+        map
+    };
+    for (layout, name) in [
+        (Layout::Sparse, "sparse"),
+        (Layout::Fallocated, "fallocate"),
+        (Layout::Prezeroed, "prezeroed"),
+    ] {
+        let f = fresh_dst(layout);
+        let map = mmap_of(&f);
+        let t0 = std::time::Instant::now();
+        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), map as *mut u8, n) };
+        let cold = t0.elapsed();
+        // second pass over the SAME mapping: every page is now faulted in
+        let t1 = std::time::Instant::now();
+        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), map as *mut u8, n) };
+        let warm = t1.elapsed();
+        unsafe { libc::munmap(map, n) };
+        println!(
+            "{:<9} {:>9.2} {:>11.1}  cold 1st touch{}",
+            name,
+            ms(cold),
+            mib as f64 / cold.as_secs_f64(),
+            if layout == Layout::Fallocated { "   <- what mpedb does" } else { "" }
+        );
+        println!(
+            "{:<9} {:>9.2} {:>11.1}  warm (pages already faulted)",
+            "",
+            ms(warm),
+            mib as f64 / warm.as_secs_f64()
+        );
+    }
+
+    // ---- chain: the same copy, but through a per-page header, on the layout
+    // mpedb actually uses. Isolates the overflow format from everything else.
+    {
+        let f = fresh_dst(Layout::Fallocated);
+        let map = mmap_of(&f);
         let t0 = std::time::Instant::now();
         let cap = PAGE - HDR;
         let mut off = 0usize;
@@ -109,7 +201,6 @@ fn main() {
             let take = cap.min(n - off);
             unsafe {
                 let p = (map as *mut u8).add(page * PAGE);
-                // the header: kind + payload len + next page id
                 std::ptr::write_bytes(p, 3u8, 1);
                 (p.add(6) as *mut u16).write_unaligned(take as u16);
                 (p.add(8) as *mut u64).write_unaligned((page + 1) as u64);
@@ -120,65 +211,13 @@ fn main() {
         }
         let d = t0.elapsed();
         unsafe { libc::munmap(map, n) };
-        report("chain", d, "today: memcpy through a per-page header");
-    }
-
-    // ---- 2. memcpy: one contiguous copy into the mapping
-    {
-        let f = fresh_dst();
-        let map = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                n,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                f.as_raw_fd(),
-                0,
-            )
-        };
-        assert_ne!(map, libc::MAP_FAILED, "mmap");
-        let t0 = std::time::Instant::now();
-        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), map as *mut u8, n) };
-        let d = t0.elapsed();
-        unsafe { libc::munmap(map, n) };
-        report("memcpy", d, "contiguous extent, no syscall trick, ANY fs");
-    }
-
-    // ---- 2b. memcpy into a mapping whose pages are ALREADY faulted in.
-    //
-    // This is the one that decides whether the gap mpedb shows on large blobs is
-    // real or a harness artefact. A MAP_SHARED page must be faulted in before it
-    // can be written, even when the write overwrites every byte of it; `write(2)`
-    // owes no such fault. If the cold and warm numbers differ, the cold cost is
-    // one-time-per-page — and a long-lived process that recycles pages through
-    // the freelist pays it once, not per blob. If they match, the fault theory is
-    // dead and the cost is somewhere else.
-    {
-        let f = fresh_dst();
-        let map = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                n,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                f.as_raw_fd(),
-                0,
-            )
-        };
-        assert_ne!(map, libc::MAP_FAILED, "mmap");
-        // touch every page first — the faults happen HERE, not in the timed part
-        unsafe { std::ptr::write_bytes(map as *mut u8, 1u8, n) };
-        let t0 = std::time::Instant::now();
-        unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(), map as *mut u8, n) };
-        let d = t0.elapsed();
-        unsafe { libc::munmap(map, n) };
-        report("memcpy2", d, "same, but pages already faulted (2nd write)");
+        report("chain", d, "cold, fallocate + per-page header (the real format)");
     }
 
     // ---- 3. copy_file_range: in-kernel, source is an fd
     {
         let src = std::fs::File::open(&src_path).unwrap();
-        let dst = fresh_dst();
+        let dst = fresh_dst(Layout::Fallocated);
         let t0 = std::time::Instant::now();
         let mut off_in: libc::loff_t = 0;
         let mut off_out: libc::loff_t = 0;
@@ -216,7 +255,7 @@ fn main() {
     // ---- 4. FICLONERANGE: extent sharing, metadata only
     {
         let src = std::fs::File::open(&src_path).unwrap();
-        let dst = fresh_dst();
+        let dst = fresh_dst(Layout::Fallocated);
         #[repr(C)]
         struct CloneRange {
             src_fd: i64,
