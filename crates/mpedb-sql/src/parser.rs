@@ -520,29 +520,33 @@ impl<'a> Parser<'a> {
         // row rather than no row), which the executor would have to be taught
         // separately — so they are refused rather than silently treated as
         // INNER, which would drop rows the query asked to keep.
-        let join = if self.eat_kw(Kw::Inner) {
-            self.expect_kw(Kw::Join, "JOIN after INNER")?;
-            Some(self.join_tail()?)
-        } else if self.eat_kw(Kw::Join) {
-            Some(self.join_tail()?)
-        } else if let Some(kind) = self.peek_join_kind() {
-            // Say what is wrong. Left to the generic path this reads
-            // "unexpected trailing input at byte 24", which tells someone who
-            // wrote LEFT JOIN nothing about why.
-            return Err(self.err_here(format!(
-                "{kind} JOIN is not supported — only INNER JOIN. {}",
-                if kind == "CROSS" {
-                    "A cross join is a cartesian product; write INNER JOIN with an ON \
-                     condition, or if you really want every pair, `JOIN … ON true`."
-                } else {
-                    "An outer join keeps rows with no match and NULL-extends them, which is \
-                     a different answer, not a slower one — so it is refused rather than \
-                     quietly treated as INNER."
-                }
-            )));
-        } else {
-            None
-        };
+        // `([INNER] JOIN t ON cond)*` — a chain of INNER joins, left-deep.
+        let mut joins = Vec::new();
+        loop {
+            if self.eat_kw(Kw::Inner) {
+                self.expect_kw(Kw::Join, "JOIN after INNER")?;
+                joins.push(self.join_tail()?);
+            } else if self.eat_kw(Kw::Join) {
+                joins.push(self.join_tail()?);
+            } else if let Some(kind) = self.peek_join_kind() {
+                // Say what is wrong. Left to the generic path this reads
+                // "unexpected trailing input at byte 24", which tells someone who
+                // wrote LEFT JOIN nothing about why.
+                return Err(self.err_here(format!(
+                    "{kind} JOIN is not supported — only INNER JOIN. {}",
+                    if kind == "CROSS" {
+                        "A cross join is a cartesian product; write INNER JOIN with an ON \
+                         condition, or if you really want every pair, `JOIN … ON true`."
+                    } else {
+                        "An outer join keeps rows with no match and NULL-extends them, which is \
+                         a different answer, not a slower one — so it is refused rather than \
+                         quietly treated as INNER."
+                    }
+                )));
+            } else {
+                break;
+            }
+        }
         let where_clause = if self.eat_kw(Kw::Where) {
             Some(self.expr()?)
         } else {
@@ -606,7 +610,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Select(SelectStmt {
             table,
             alias: from_alias,
-            join,
+            joins,
             distinct,
             items,
             where_clause,
