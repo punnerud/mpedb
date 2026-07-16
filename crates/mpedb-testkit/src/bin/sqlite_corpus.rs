@@ -879,20 +879,28 @@ fn expand_star(sql: &str, shim: &Shim) -> Option<String> {
                 }
                 k += 1;
             }
-            "JOIN" => k += 1,
-            "," | "LEFT" | "RIGHT" | "FULL" | "CROSS" | "NATURAL" => return None,
+            // The comma-join executes since #56 — its stars must expand too,
+            // or the shim's synthetic rowid_ column leaks into the output
+            // (542 phantom "wrong results" the day comma-joins landed).
+            "JOIN" | "," => k += 1,
+            "LEFT" | "RIGHT" | "FULL" | "CROSS" | "NATURAL" => return None,
             _ => break, // WHERE/ORDER/... or end of statement
         }
         let (name_raw, qual, nk) = parse_source(sql, &toks, k)?;
         sources.push((name_raw.to_ascii_lowercase(), qual));
         k = nk;
-        // Skip the ON condition: advance to the next JOIN/INNER or clause
-        // keyword at depth 0 (or end of tokens).
+        // Skip any ON condition: advance to the next JOIN/INNER/comma or
+        // clause keyword at depth 0 (or end of tokens). Stopping at the comma
+        // matters — a comma source has no ON, and skipping past it would
+        // swallow the NEXT source.
         while k < toks.len() {
             let t = &toks[k];
             if t.depth == 0
-                && t.is_word
-                && (t.up == "JOIN" || t.up == "INNER" || CLAUSE_KEYWORDS.contains(&t.up.as_str()))
+                && (t.up == ","
+                    || (t.is_word
+                        && (t.up == "JOIN"
+                            || t.up == "INNER"
+                            || CLAUSE_KEYWORDS.contains(&t.up.as_str()))))
             {
                 break;
             }

@@ -263,6 +263,29 @@ SELECT emp.ename FROM emp JOIN dept ON emp.did = dept.did AND dept.dname = 'eng'
 ann
 bob
 
+# The comma-join (#56): `FROM a, b` IS the cartesian product, filtered by
+# WHERE — desugared to INNER JOIN ON true. Same answer as the basic shape.
+query TT nosort
+SELECT emp.ename, dept.dname FROM emp, dept WHERE emp.did = dept.did ORDER BY emp.eid
+----
+ann
+eng
+bob
+eng
+cy
+sales
+
+query I nosort
+SELECT count(*) FROM emp, dept
+----
+12
+
+# Mixing comma and keyword joins is legal; the comma pairs first.
+query I nosort
+SELECT count(*) FROM emp, dept d2 JOIN dept d3 ON d3.did = 1
+----
+12
+
 # SELECT-item aliases (#56) name the output and resolve in ORDER BY.
 query IT nosort
 SELECT emp.eid AS e, dept.dname nm FROM emp JOIN dept ON emp.did = dept.did ORDER BY e LIMIT 2

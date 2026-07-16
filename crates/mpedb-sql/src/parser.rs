@@ -515,12 +515,27 @@ impl<'a> Parser<'a> {
         self.expect_kw(Kw::From, "FROM")?;
         let table = self.ident("table name")?;
         let from_alias = self.opt_table_alias()?;
+        let mut joins = Vec::new();
+        // `FROM a, b [, c…]` — the comma-join. It IS the cartesian product,
+        // written in the syntax whose whole meaning is "every pair" (unlike a
+        // bare `JOIN b` with a forgotten ON, which stays refused): desugared
+        // to `INNER JOIN … ON true`, with the WHERE doing the filtering over
+        // the joined row — sqlite/PG semantics exactly.
+        while self.eat(&Tok::Comma) {
+            let t = self.ident("table name after ','")?;
+            let alias = self.opt_table_alias()?;
+            joins.push(JoinClause {
+                table: t,
+                alias,
+                kind: JoinKind::Inner,
+                on: Expr::Lit(Value::Bool(true)),
+            });
+        }
         // `([INNER | LEFT [OUTER]] JOIN t ON cond)*` — a left-deep chain.
         // INNER is the default; LEFT NULL-extends the inner side on no match.
         // RIGHT/FULL/CROSS/NATURAL are refused BY NAME: left to the generic
         // path the error reads "unexpected trailing input at byte 24", which
         // tells someone who wrote RIGHT JOIN nothing about why.
-        let mut joins = Vec::new();
         loop {
             if self.eat_kw(Kw::Inner) {
                 self.expect_kw(Kw::Join, "JOIN after INNER")?;
