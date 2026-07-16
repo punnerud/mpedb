@@ -286,6 +286,7 @@ pub fn to_table_def(src: &SourceTable) -> Result<TableDef> {
             // (INTEGER PRIMARY KEY is implicitly non-null anyway).
             nullable: !is_pk && !c.not_null,
             unique: c.unique,
+            indexed: false,
             default: None,
             check: None,
         });

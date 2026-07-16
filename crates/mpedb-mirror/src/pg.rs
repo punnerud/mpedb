@@ -258,6 +258,7 @@ pub fn to_table_def(src: &PgTable) -> Result<TableDef> {
             ty,
             nullable: !is_pk && !c.not_null,
             unique: c.unique,
+            indexed: false,
             default: None,
             check: None,
         });

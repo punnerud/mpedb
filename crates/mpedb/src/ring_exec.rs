@@ -886,6 +886,7 @@ mod tests {
             ty: ColumnType::Int64,
             nullable,
             unique: false,
+            indexed: false,
             default: None,
             check: None,
         };

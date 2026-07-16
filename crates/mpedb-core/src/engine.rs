@@ -202,13 +202,31 @@ fn freelist_key(txn: u64, chunk: u16) -> [u8; 10] {
 /// convention (DESIGN.md §4.4): index 0 = PK tree; unique columns in
 /// declaration order get 1, 2, …; a column that is by itself the whole PK is
 /// skipped.
+/// The secondary-index B+tree key for value `v` of a row whose primary key
+/// encodes to `pk_key`. A UNIQUE index keys by the value alone; a non-unique one
+/// appends the pk so duplicate values become distinct, memcmp-ordered
+/// (value, pk) entries — and `encode_key` is a plain concatenation of
+/// `encode_value`, so this equals `encode_key([v, ...pk_values])`.
+fn index_ikey(unique: bool, v: &mpedb_types::Value, pk_key: &[u8]) -> Vec<u8> {
+    let mut k = keycode::encode_key(std::slice::from_ref(v));
+    if !unique {
+        k.extend_from_slice(pk_key);
+    }
+    k
+}
+
 pub fn secondary_index_columns(table: &mpedb_types::TableDef) -> Vec<u16> {
     table
         .columns
         .iter()
         .enumerate()
         .filter(|(i, c)| {
-            c.unique && !(table.primary_key.len() == 1 && table.primary_key[0] == *i as u16)
+            // A column with `unique` OR `indexed` is a secondary index. The PK's
+            // own single column is skipped — it already has index 0 (the PK
+            // tree). Both engine and SQL derive this identically, in
+            // column-declaration order, so index numbers agree (CLAUDE.md).
+            (c.unique || c.indexed)
+                && !(table.primary_key.len() == 1 && table.primary_key[0] == *i as u16)
         })
         .map(|(i, _)| i as u16)
         .collect()
@@ -224,6 +242,11 @@ pub struct Engine {
     schema: Schema,
     checks: CheckPrograms,
     sec_indexes: Vec<Vec<u16>>,
+    /// Parallel to `sec_indexes`: is index `k` UNIQUE (value→pk, enforced) or a
+    /// plain non-unique index (composite `(value‖pk)` key, duplicates allowed)?
+    /// The storage form and whether an insert is uniqueness-checked both follow
+    /// from this. Same order as `sec_indexes`.
+    sec_unique: Vec<Vec<bool>>,
     col_types: Vec<Vec<ColumnType>>,
     concurrency: Concurrency,
     /// Deferred-fsync flusher; `Some` only for `durability = async` (§5.4.2).
@@ -262,7 +285,14 @@ impl Engine {
             &schema.hash(),
             &config.options.perms,
         )?;
-        let sec_indexes = schema.tables.iter().map(secondary_index_columns).collect();
+        let sec_indexes: Vec<Vec<u16>> =
+            schema.tables.iter().map(secondary_index_columns).collect();
+        let sec_unique: Vec<Vec<bool>> = schema
+            .tables
+            .iter()
+            .zip(&sec_indexes)
+            .map(|(t, cols)| cols.iter().map(|&c| t.columns[c as usize].unique).collect())
+            .collect();
         let col_types = schema
             .tables
             .iter()
@@ -279,6 +309,7 @@ impl Engine {
             schema,
             checks,
             sec_indexes,
+            sec_unique,
             col_types,
             concurrency: config.options.concurrency,
             flusher,
@@ -361,7 +392,14 @@ impl Engine {
             let bytes = res?.ok_or_else(|| Error::Corrupt("no schema stored in catalog".into()))?;
             Schema::from_canonical_bytes(&bytes)?
         };
-        let sec_indexes = schema.tables.iter().map(secondary_index_columns).collect();
+        let sec_indexes: Vec<Vec<u16>> =
+            schema.tables.iter().map(secondary_index_columns).collect();
+        let sec_unique: Vec<Vec<bool>> = schema
+            .tables
+            .iter()
+            .zip(&sec_indexes)
+            .map(|(t, cols)| cols.iter().map(|&c| t.columns[c as usize].unique).collect())
+            .collect();
         let col_types = schema
             .tables
             .iter()
@@ -373,6 +411,7 @@ impl Engine {
             schema,
             checks,
             sec_indexes,
+            sec_unique,
             col_types,
             concurrency: Concurrency::Serial,
             flusher: None, // read-only tooling handle; async needs a config
@@ -751,6 +790,41 @@ impl ReadTxn<'_> {
                 &self.eng.col_types[table_id as usize],
             )?)),
         }
+    }
+
+    /// All rows whose `index_no` column equals `value` — the non-unique index
+    /// equality lookup (`WHERE indexed_col = value`). Works for a UNIQUE index
+    /// too (0 or 1 rows). The index tree is keyed by `(value ‖ pk)` for a
+    /// non-unique index and by `value` alone for a unique one; both start with
+    /// `encode_key([value])`, so scanning from that prefix and stopping when the
+    /// prefix no longer matches yields exactly the matches — O(matches + 1).
+    pub fn scan_by_index(
+        &self,
+        table_id: u32,
+        index_no: u32,
+        value: &Value,
+    ) -> Result<Vec<Vec<Value>>> {
+        if value.is_null() {
+            return Ok(Vec::new()); // NULL is never indexed
+        }
+        let prefix = keycode::encode_key(std::slice::from_ref(value));
+        let iroot = self.tree_root(table_id, index_no)?;
+        let root = self.tree_root(table_id, 0)?;
+        let types = &self.eng.col_types[table_id as usize];
+        let mut out = Vec::new();
+        let mut c = btree::cursor(self, iroot, Some((&prefix[..], true)), None)?;
+        while let Some((k, pk_bytes)) = c.next(self)? {
+            if !k.starts_with(&prefix) {
+                break; // past every (value, *) entry
+            }
+            match btree::get(self, root, &pk_bytes)? {
+                Some(bytes) => out.push(row::decode_row(&bytes, types)?),
+                None => {
+                    return Err(Error::Corrupt("index entry points at a missing row".into()))
+                }
+            }
+        }
+        Ok(out)
     }
 
     pub fn scan(
@@ -1460,8 +1534,13 @@ impl<'e> WriteTxn<'e> {
         leakstat::add(&leakstat::INS_NS_ENCODE, __t.elapsed().as_nanos() as u64);
 
         // UNIQUE pre-check on secondary indexes before mutating anything, so
-        // a violation aborts with zero side effects on the dirty state.
+        // a violation aborts with zero side effects on the dirty state. Only
+        // UNIQUE indexes are checked — a plain `indexed` column allows dups.
+        let sec_unique = self.eng.sec_unique[table_id as usize].clone();
         for (i, &col) in sec.iter().enumerate() {
+            if !sec_unique[i] {
+                continue;
+            }
             let v = &values[col as usize];
             if v.is_null() {
                 continue; // SQL: UNIQUE permits multiple NULLs
@@ -1493,11 +1572,16 @@ impl<'e> WriteTxn<'e> {
             }
             let ino = (i + 1) as u32;
             let (iroot, icount) = self.tree_root(table_id, ino)?;
-            let ikey = keycode::encode_key(std::slice::from_ref(v));
+            // UNIQUE: key is the value alone (value→pk). Non-unique: the value
+            // may repeat, so the key is `(value ‖ pk)` — unique by construction,
+            // duplicates on the value coexist as distinct index entries. Both
+            // store the pk as the payload so a lookup fetches the row.
+            let ikey = index_ikey(sec_unique[i], v, &key);
             let out = btree::insert(self, iroot, &ikey, &mut btree::Payload::Flat(&key), InsertMode::InsertOnly)?;
             if out.existed {
-                // pre-check passed, so this is engine inconsistency
-                return Err(Error::Internal("unique index race within txn".into()));
+                // pre-check passed (unique) / composite is unique (non-unique),
+                // so a collision is engine inconsistency.
+                return Err(Error::Internal("secondary index collision within txn".into()));
             }
             self.set_tree_root(table_id, ino, out.new_root, icount + 1);
         }
@@ -1523,6 +1607,7 @@ impl<'e> WriteTxn<'e> {
         let key = keycode::encode_key(pk_values);
         let (root, count) = self.tree_root(table_id, 0)?;
         // fetch old row first: index maintenance needs its column values
+        let sec_unique = self.eng.sec_unique[table_id as usize].clone();
         let Some(old_bytes) = btree::get(self, root, &key)? else {
             return Ok(false);
         };
@@ -1539,7 +1624,7 @@ impl<'e> WriteTxn<'e> {
             }
             let ino = (i + 1) as u32;
             let (iroot, icount) = self.tree_root(table_id, ino)?;
-            let ikey = keycode::encode_key(std::slice::from_ref(v));
+            let ikey = index_ikey(sec_unique[i], v, &key);
             let out = btree::delete(self, iroot, &ikey)?;
             if !out.existed {
                 return Err(Error::Corrupt("missing index entry on delete".into()));
@@ -1565,8 +1650,12 @@ impl<'e> WriteTxn<'e> {
         let old = row::decode_row(&old_bytes, &self.eng.col_types[table_id as usize])?;
 
         let sec = self.eng.sec_indexes[table_id as usize].clone();
-        // pre-check unique conflicts for changed indexed columns
+        let sec_unique = self.eng.sec_unique[table_id as usize].clone();
+        // pre-check UNIQUE conflicts for changed unique-indexed columns
         for (i, &col) in sec.iter().enumerate() {
+            if !sec_unique[i] {
+                continue;
+            }
             let (ov, nv) = (&old[col as usize], &new_values[col as usize]);
             if index_value_equal(ov, nv) || nv.is_null() {
                 continue;
@@ -1594,7 +1683,7 @@ impl<'e> WriteTxn<'e> {
             let ino = (i + 1) as u32;
             let (mut iroot, mut icount) = self.tree_root(table_id, ino)?;
             if !ov.is_null() {
-                let okey = keycode::encode_key(std::slice::from_ref(ov));
+                let okey = index_ikey(sec_unique[i], ov, &key);
                 let out = btree::delete(self, iroot, &okey)?;
                 if !out.existed {
                     return Err(Error::Corrupt("missing index entry on update".into()));
@@ -1603,10 +1692,10 @@ impl<'e> WriteTxn<'e> {
                 icount -= 1;
             }
             if !nv.is_null() {
-                let nkey = keycode::encode_key(std::slice::from_ref(nv));
+                let nkey = index_ikey(sec_unique[i], nv, &key);
                 let out = btree::insert(self, iroot, &nkey, &mut btree::Payload::Flat(&key), InsertMode::InsertOnly)?;
                 if out.existed {
-                    return Err(Error::Internal("unique index race within txn".into()));
+                    return Err(Error::Internal("secondary index collision within txn".into()));
                 }
                 iroot = out.new_root;
                 icount += 1;
