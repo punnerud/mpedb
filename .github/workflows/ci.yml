@@ -1,0 +1,30 @@
+# The structural gate for "green means green": the suite and clippy must pass
+# with their EXIT CODES checked — this repo has committed with clippy red
+# because a local pipeline swallowed the code. Each step here fails the job
+# on a non-zero exit by construction.
+#
+# PostgreSQL-dependent mirror tests, soaks, and benchmarks are #[ignore]d and
+# deliberately not run here; the multi-process stress/crash tests DO run
+# (they need only /dev/shm, which the ubuntu runners provide).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: toolchain
+        run: rustc --version && cargo --version && sqlite3 --version
+      - name: test
+        run: cargo test --workspace
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
