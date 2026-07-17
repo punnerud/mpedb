@@ -11,7 +11,7 @@ path = "src/main.rs"
 
 [dependencies]
 mpedb-sqlitefmt = { path = "../mpedb-sqlitefmt" }
-mpedb = { workspace = true }
+mpedb = { workspace = true, features = ["sqlite-checkpoint"] }
 mpedb-core = { workspace = true }
 mpedb-proc = { workspace = true }
 mpedb-mirror = { workspace = true }

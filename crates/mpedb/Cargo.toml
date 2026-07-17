@@ -8,6 +8,10 @@ description = "Embedded multi-process shared-memory database with SQL and conten
 [features]
 # forward mpedb-core's #37 leak counters; `examples/leak_probe` dumps them
 leakstat = ["mpedb-core/leakstat"]
+# the sqlite-backed overlay's checkpoint push (DESIGN-SQLITE-BACKED §5): the
+# sqlite LIBRARY is the base writer, so this pulls in rusqlite. The CLI
+# enables it; library users opt in.
+sqlite-checkpoint = ["dep:rusqlite"]
 
 [dev-dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
@@ -15,6 +19,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 libc = { workspace = true }
 
 [dependencies]
+rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 mpedb-sqlitefmt = { path = "../mpedb-sqlitefmt" }
 mpedb-types = { workspace = true }
 mpedb-core = { workspace = true }
