@@ -175,6 +175,88 @@ SIGKILLed at any instant — that exact scenario is fuzzed continuously
 busy-waiting; [Turso currently returns Busy to a second writer and does not
 support multi-process mixed use](TURSO.md).
 
+| | sqlite | mpedb | notes |
+|---|---|---|---|
+| many processes, one database | ✅ file locks + busy_timeout | ✅ shared-memory attach, MVCC | measured (2-core Linux, readers beside one writer): commit-class mpedb 569k reads/s vs sqlite-WAL 568k — a tie; none-class mpedb 467k vs sqlite-journal 2,251 (that mode serializes readers against the writer) |
+| readers block the writer | in rollback-journal mode, yes; in WAL, no | never | |
+| a process dies mid-write (SIGKILL) | journal/WAL recovery on next open | robust-mutex takeover + intent-ring recovery, fuzzed at every instant | `mpedb crash` is the harness |
+| second concurrent writer | waits (busy_timeout) | queues on the writer lock; group commit under contention | Turso 0.7: immediate Busy, no arbitration — its contended p99 is 51–225 ms in [the measured field](TURSO.md) |
+
+## Memory and resource discipline
+
+The database is a fixed-size file (`size_mb`), mapped once and **shared by
+every attaching process** — N processes cost one mapping, not N page caches
+(sqlite's default is a per-connection cache). Hitting the size is an honest
+`DbFull`, never silent growth; space reclaim is continuous (COW freelist
+fixpoint — the unbounded high-water leak class has a regression test), and
+reader memory is bounded by construction: scans and large-value reads move in
+bounded chunks with pin revalidation, so a reader never materializes the
+mapping. The WAL is circular and bounded, with lean records (only touched COW
+pages, free space elided).
+
+The contrast that motivated writing this down: sqlite's WAL is bounded by
+autocheckpoint (1000 pages, default ON); **Turso 0.7 has no autocheckpoint at
+all, and its WAL measured 1.9 GB of growth inside one 3-second write cell** —
+enough to fill the host disk — until the benchmark adapter supplied manual
+`wal_checkpoint(TRUNCATE)` calls ([TURSO.md](TURSO.md) has the details).
+
+## Migration
+
+| path | status | comment |
+|---|---|---|
+| sqlite → mpedb | ✅ `mpedb mirror import` | schema + data + type provenance; the measured conversion matrix is in the [testkit README](crates/mpedb-testkit/README.md) |
+| mpedb → sqlite | ✅ `mpedb mirror export` | round-trips are verified (`mirror roundtrip`) |
+| live two-way sync with sqlite | ✅ `mirror sync` / daemon | SIGKILL-fuzzed to convergence (`mirror-collide`: writers + a daemon killed at every instant must still converge exactly) |
+| PostgreSQL ⇄ mpedb | ✅ `mirror` with a PG source/target | same machinery, `--source-config` DSN handling |
+| open an existing `.db` file in place | ❌ | mpedb has its own format; migration is import, not attach — sqlite and Turso share the file format instead ([Turso](TURSO.md) reads sqlite files directly, and promises the way back to sqlite; its migration surface is sqlite-only) |
+
+## Measured speed against sqlite
+
+From the 2026-07-17 head-to-head runs (one run per machine, all engines in the
+same run; full tables with latencies and methodology in
+[BENCHMARKS.md](BENCHMARKS.md) and the per-machine RESULTS files, the four-way
+field including PostgreSQL and Turso in [TURSO.md](TURSO.md)). Compare within
+a durability class only; absolute numbers are those hosts', ratios travel
+better. "r / w" is concurrent readers + one writer.
+
+**Linux, AMD EPYC-Milan 2-core** (ops/s, mpedb vs SQLite 3.45):
+
+| workload | mpedb | SQLite | ratio |
+|---|---|---|---|
+| point-insert, none-class | 177,376 | 42,306 | **4.2×** |
+| point-select, none-class | 469,679 | 81,985 | **5.7×** |
+| contended-writes, none-class | 146,801 | 30,474 | **4.8×** |
+| read-while-write, none-class (r / w) | 467,304 / 30,153 | 2,251 / 24,398 | **208× / 1.2×** |
+| point-select, commit-class | 460,791 | 253,422 | **1.8×** |
+| read-while-write, commit-class (r / w) | 569,527 / 441 | 568,318 / 417 | tie / tie |
+| durable-on-ack single writer (§5.4: mpedb `wal` vs FULL+WAL) | 1,794 | 852 | **2.1×** |
+| durable-on-ack, batched 100 rows/commit | 96,252 | 56,749 | **1.7×** |
+| point-insert, `durability=commit` | 391 | 848 | sqlite 2.2× — one msync per commit, serialized; use `wal` |
+
+**macOS, Apple M3 Pro 11-core** (every engine forced through `F_FULLFSYNC`):
+
+| workload | mpedb | SQLite | ratio |
+|---|---|---|---|
+| point-insert, none-class | 224,158 | 110,658 | **2.0×** |
+| point-select, none-class | 1,834,718 | 314,766 | **5.8×** |
+| read-while-write, none-class (r / w) | 4,042,266 / 205,004 | 181 / 86,696 | **22,000× / 2.4×** |
+| point-select, commit-class | 1,798,415 | 751,668 | **2.4×** |
+| read-while-write, commit-class (r) | 4,136,068 | 1,361,001 | **3.0×** |
+| durable-on-ack single writer (§5.4) | 296 | 333 | sqlite 1.1× — everyone sits at the ~3 ms platter-flush floor |
+| durable-on-ack, batched 100 rows/commit | 23,393 | 29,691 | sqlite 1.3× |
+
+The pattern, honestly stated: mpedb wins every read cell and every none-class
+cell on both machines — the outlier rows are sqlite's none-class rollback
+journal serializing readers against a writer (2,251 reads/s beside a writer on
+Linux, 181 on the M3), which is a real property of that configuration, not
+benchmark theater. sqlite wins durable single-writer inserts on Apple
+(everyone pays the same flush; differences there are ~20% and move run to
+run) and against mpedb's `durability=commit` mode everywhere — `wal` is
+mpedb's durable-on-ack mode of record, and on Linux it beats sqlite FULL by
+2.1×. Bulk blob throughput has its own measured story (extents, WiscKey-style
+separation) in [BENCHMARKS.md](BENCHMARKS.md) and
+[DESIGN-BLOBEXTENT.md](DESIGN-BLOBEXTENT.md).
+
 ## Extensions beyond SQLite
 
 - `current_setting('key')` and `expr IN (current_setting('key'))` — session
