@@ -429,7 +429,7 @@ fn exec_stmt_impl(
                 continue;
             }
             let inner = exec_select(ctx, schema, plan, &buf[..n_user], &sub.plan)?;
-            buf[base + i] = subplan_value(inner, sub.exists)?;
+            buf[base + i] = subplan_value(inner, sub.kind)?;
         }
         filled = buf;
         &filled
@@ -444,12 +444,34 @@ fn exec_stmt_impl(
 }
 
 /// A subquery's rows, reduced to the VALUE its reserved slot carries.
-fn subplan_value(r: ExecResult, exists: bool) -> Result<Value> {
+fn subplan_value(r: ExecResult, kind: mpedb_sql::SubPlanKind) -> Result<Value> {
+    use mpedb_sql::SubPlanKind as K;
     let ExecResult::Rows { rows, .. } = r else {
         return Err(internal("subplan produced no row set"));
     };
-    if exists {
-        return Ok(Value::Bool(!rows.is_empty()));
+    match kind {
+        K::Exists => return Ok(Value::Bool(!rows.is_empty())),
+        K::List => {
+            // `x IN (SELECT …)`: every value of the single output column,
+            // order-irrelevant (membership). Bounded so a runaway subquery
+            // cannot balloon one param slot unobserved.
+            if rows.len() > 1_000_000 {
+                return Err(Error::Unsupported(format!(
+                    "an IN subquery returned {} rows — the membership list is \
+                     capped at 1,000,000",
+                    rows.len()
+                )));
+            }
+            let mut items = Vec::with_capacity(rows.len());
+            for mut r in rows {
+                match (r.pop(), r.is_empty()) {
+                    (Some(v), true) => items.push(v),
+                    _ => return Err(internal("IN subplan output arity")),
+                }
+            }
+            return Ok(Value::List(items));
+        }
+        K::Scalar => {}
     }
     match rows.len() {
         0 => Ok(Value::Null),
@@ -850,7 +872,7 @@ fn exec_select_with(
                 );
             }
             let r = exec_select(ctx, schema, plan, &inner_params, &sub.plan)?;
-            scratch[base + i] = subplan_value(r, sub.exists)?;
+            scratch[base + i] = subplan_value(r, sub.kind)?;
         }
         if let Some(pf) = post_filter {
             if !pf.eval_filter(&mut stack, &row, &scratch)? {

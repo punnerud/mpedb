@@ -1253,6 +1253,14 @@ impl<'a> Parser<'a> {
         if self.peek() == Some(&Tok::RParen) {
             return Err(self.err_here("IN needs at least one value: `IN ()` is empty"));
         }
+        // `IN (SELECT …)` — membership in a subquery's output (#70). The
+        // SELECT keyword right after the paren decides, same rule as the
+        // scalar-subquery primary.
+        if matches!(self.peek(), Some(Tok::Kw(Kw::Select))) {
+            let inner = self.select_core()?;
+            self.expect(&Tok::RParen, "`)` after IN subquery")?;
+            return Ok(Expr::InSubquery(Box::new(e), Box::new(inner), negated));
+        }
         let first = self.expr()?;
         if let (Expr::ContextRef(key), Some(&Tok::RParen)) = (&first, self.peek()) {
             let key = key.clone();

@@ -42,7 +42,11 @@ impl CompiledPlan {
             out.push_str(&format!(
                 "subplan ${}: {}{}\n",
                 self.subplan_base() as usize + i + 1,
-                if s.exists { "EXISTS, " } else { "scalar, " },
+                match s.kind {
+                    SubPlanKind::Exists => "EXISTS, ",
+                    SubPlanKind::Scalar => "scalar, ",
+                    SubPlanKind::List => "IN-list, ",
+                },
                 if s.outer_args.is_empty() {
                     "uncorrelated (evaluated once)".to_string()
                 } else {

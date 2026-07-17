@@ -119,10 +119,9 @@ impl CompiledPlan {
         }
         let mut subplans = Vec::with_capacity(n_sub);
         for _ in 0..n_sub {
-            let exists = match r_u8(bytes, &mut pos)? {
-                0 => false,
-                1 => true,
-                t => return Err(corrupt(format!("bad subplan exists tag {t}"))),
+            let kind = match SubPlanKind::from_tag(r_u8(bytes, &mut pos)?) {
+                Some(k) => k,
+                None => return Err(corrupt("bad subplan kind tag")),
             };
             let n_args = r_u16(bytes, &mut pos)? as usize;
             if n_args > MAX_COLUMNS {
@@ -133,7 +132,7 @@ impl CompiledPlan {
                 outer_args.push(r_u16(bytes, &mut pos)?);
             }
             let plan = decode_select(bytes, &mut pos)?;
-            subplans.push(SubPlan { plan, outer_args, exists });
+            subplans.push(SubPlan { plan, outer_args, kind });
         }
         let footprint = Footprint::decode(bytes, &mut pos)?;
         let stmt = decode_stmt(bytes, &mut pos)?;

@@ -203,3 +203,42 @@ SELECT (SELECT max(b) FROM t1) FROM t1 UNION SELECT b FROM t1
 
 statement error ON condition is not supported yet
 SELECT t1.id FROM t1 JOIN u ON t1.b = (SELECT max(v) FROM u)
+
+# ---- #70: IN (SELECT …) — membership in the subquery's single column ------------------
+# Uncorrelated only; same runtime-typed 3VL membership core as IN lists —
+# sqlite is the referee for every NULL edge.
+
+query I nosort
+SELECT id FROM t1 WHERE b IN (SELECT b FROM t1 WHERE id >= 3) ORDER BY id
+----
+3
+4
+
+query I nosort
+SELECT id FROM t1 WHERE b NOT IN (SELECT b FROM t1 WHERE id >= 3) ORDER BY id
+----
+1
+2
+
+# Empty subquery: IN → no rows, NOT IN → every row (FALSE vs TRUE, never NULL).
+query I nosort
+SELECT count(*) FROM t1 WHERE b IN (SELECT b FROM t1 WHERE id > 999)
+----
+0
+
+query I nosort
+SELECT count(*) FROM t1 WHERE b NOT IN (SELECT b FROM t1 WHERE id > 999)
+----
+4
+
+# The membership list may hold values from ANOTHER table.
+query I nosort
+SELECT count(*) FROM t1 WHERE id IN (SELECT id FROM u)
+----
+1
+
+# FROM-less lhs side works too (the dual row).
+query I nosort
+SELECT CASE WHEN 3 IN (SELECT id FROM t1) THEN 1 ELSE 0 END
+----
+1

@@ -42,7 +42,8 @@ pub(super) fn has_subquery(s: &ast::SelectStmt) -> bool {
 fn expr_has_subquery(e: &ast::Expr) -> bool {
     use ast::Expr as E;
     match e {
-        E::Subquery(_) | E::Exists(..) => true,
+        E::Subquery(_) | E::Exists(..) | E::InSubquery(..) => true,
+        E::InParamSlot(a, _, _) => expr_has_subquery(a),
         E::Unary(_, a) | E::IsNull(a, _) | E::Cast(a, _) => expr_has_subquery(a),
         E::Binary(_, a, b) | E::Like(a, b) => expr_has_subquery(a) || expr_has_subquery(b),
         E::InContext(a, _, _) => expr_has_subquery(a),
@@ -175,9 +176,9 @@ impl Lift<'_> {
     fn rewrite(&mut self, e: &ast::Expr) -> Result<ast::Expr> {
         use ast::Expr as E;
         Ok(match e {
-            E::Subquery(inner) => E::Param(self.plan_one(inner, false)?),
+            E::Subquery(inner) => E::Param(self.plan_one(inner, SubPlanKind::Scalar)?),
             E::Exists(inner, negated) => {
-                let p = E::Param(self.plan_one(inner, true)?);
+                let p = E::Param(self.plan_one(inner, SubPlanKind::Exists)?);
                 if *negated {
                     E::Unary(ast::UnOp::Not, Box::new(p))
                 } else {
@@ -195,6 +196,18 @@ impl Lift<'_> {
             E::Like(a, b) => E::Like(Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?)),
             E::InContext(a, k, n) => {
                 E::InContext(Box::new(self.rewrite(a)?), k.clone(), *n)
+            }
+            // `x IN (SELECT …)` (#70): the subquery becomes a LIST-kind
+            // subplan; the node becomes the InParam membership marker over
+            // its slot. Uncorrelated only in this step — a correlated IN
+            // wants the post-filter machinery and is refused by name.
+            E::InSubquery(lhs, inner, negated) => {
+                let lhs = self.rewrite(lhs)?;
+                let slot = self.plan_one(inner, SubPlanKind::List)?;
+                E::InParamSlot(Box::new(lhs), slot, *negated)
+            }
+            E::InParamSlot(a, slot, n) => {
+                E::InParamSlot(Box::new(self.rewrite(a)?), *slot, *n)
             }
             E::InList(a, xs, n) => E::InList(
                 Box::new(self.rewrite(a)?),
@@ -233,7 +246,7 @@ impl Lift<'_> {
     /// Plan one subquery: resolve its correlation against the outer scope,
     /// plan the rewritten inner select, and hand back the reserved slot its
     /// result will occupy.
-    fn plan_one(&mut self, inner: &ast::SelectStmt, exists: bool) -> Result<u16> {
+    fn plan_one(&mut self, inner: &ast::SelectStmt, kind: SubPlanKind) -> Result<u16> {
         if self.subplans.len() >= 16 {
             return Err(bind_err("too many subqueries in one statement (max 16)"));
         }
@@ -339,18 +352,29 @@ impl Lift<'_> {
                 }
             }
         }
-        if !exists && plan.projection.len() - plan.order_junk as usize != 1 {
+        if kind != SubPlanKind::Exists
+            && plan.projection.len() - plan.order_junk as usize != 1
+        {
+            return Err(bind_err(match kind {
+                SubPlanKind::List => "an IN subquery must select exactly one column",
+                _ => "a scalar subquery must select exactly one column",
+            }));
+        }
+        if kind == SubPlanKind::List && !outer_args.is_empty() {
             return Err(bind_err(
-                "a scalar subquery must select exactly one column",
+                "a correlated IN subquery is not supported yet — rewrite as EXISTS",
             ));
         }
-        let ty = if exists {
-            Some(ColumnType::Bool)
-        } else {
-            inner_out.first().copied().flatten()
+        let ty = match kind {
+            SubPlanKind::Exists => Some(ColumnType::Bool),
+            SubPlanKind::Scalar => inner_out.first().copied().flatten(),
+            // The slot holds a LIST at runtime; pinning a scalar type on it
+            // would make resolve reject the fill. Membership is runtime-typed
+            // (the same 3VL core session-context lists use).
+            SubPlanKind::List => None,
         };
         let slot = self.n_params + self.subplans.len() as u16;
-        self.subplans.push(SubPlan { plan, outer_args, exists });
+        self.subplans.push(SubPlan { plan, outer_args, kind });
         self.slot_types.push(ty);
         Ok(slot)
     }
@@ -420,6 +444,11 @@ impl Correlate<'_, '_> {
             E::Like(a, b) => E::Like(Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?)),
             E::InContext(a, k, n) => {
                 E::InContext(Box::new(self.rewrite(a)?), k.clone(), *n)
+            }
+            // Inside a subquery, another subquery is NESTING — refused,
+            // the same line plan_one draws for Subquery/Exists.
+            E::InSubquery(..) | E::InParamSlot(..) => {
+                return Err(bind_err("nested subqueries are not supported yet"))
             }
             E::InList(a, xs, n) => E::InList(
                 Box::new(self.rewrite(a)?),

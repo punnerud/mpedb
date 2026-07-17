@@ -28,7 +28,7 @@ impl CompiledPlan {
         }
         buf.push(self.subplans.len() as u8);
         for s in &self.subplans {
-            buf.push(s.exists as u8);
+            buf.push(s.kind as u8);
             buf.extend_from_slice(&(s.outer_args.len() as u16).to_le_bytes());
             for a in &s.outer_args {
                 buf.extend_from_slice(&a.to_le_bytes());
