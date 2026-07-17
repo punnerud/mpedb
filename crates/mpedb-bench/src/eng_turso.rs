@@ -15,11 +15,17 @@
 //!   measures throughput-under-retry, the closest analog of SQLite's
 //!   busy_timeout arbitration. Without it the cell would just error.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::engines::{age_for, email_for, Conn, Engine};
 use crate::util::{BResult, BoxErr};
+
+/// The `turso` crate has no version API; keep this in step with Cargo.toml.
+/// Durability facts verified against this version's source (turso_core 0.7.0):
+/// default `SyncMode::Full` (lib.rs), `PRAGMA fullfsync` exists but is
+/// Apple-only and defaults OFF like SQLite's (io/mod.rs `FileSyncType`).
+pub const TURSO_VERSION: &str = "0.7.0";
 
 #[derive(Clone, Copy)]
 pub enum TursoMode {
@@ -31,7 +37,6 @@ pub enum TursoMode {
 
 pub struct TursoEngine {
     dir: PathBuf,
-    #[allow(dead_code)]
     mode: TursoMode,
 }
 
@@ -58,7 +63,7 @@ fn rt() -> BResult<tokio::runtime::Runtime> {
         .map_err(|e| BoxErr::from(format!("tokio: {e}")))
 }
 
-fn open_conn(path: &PathBuf) -> BResult<TursoConn> {
+fn open_conn(path: &Path, mode: TursoMode) -> BResult<TursoConn> {
     let rt = rt()?;
     let conn = rt.block_on(async {
         let db = turso::Builder::new_local(path.to_str().unwrap())
@@ -67,7 +72,16 @@ fn open_conn(path: &PathBuf) -> BResult<TursoConn> {
             .map_err(|e| BoxErr::from(format!("turso open: {e}")))?;
         db.connect().map_err(|e| BoxErr::from(format!("turso connect: {e}")))
     })?;
-    Ok(TursoConn { rt, conn })
+    let mut c = TursoConn { rt, conn };
+    // Same honesty rule as the SQLite adapter: on Apple, `fsync()` does not
+    // flush the drive's write cache, and turso's `PRAGMA fullfsync` (Apple-only
+    // pragma) defaults OFF — without this, macOS commit-class numbers would be
+    // 20-165x too good. Turso's default sync mode is already Full (one fsync
+    // per commit), so this only upgrades WHICH fsync is issued.
+    if cfg!(target_os = "macos") && matches!(mode, TursoMode::CommitClass) {
+        c.exec_retry("PRAGMA fullfsync = 1", ())?;
+    }
+    Ok(c)
 }
 
 /// Retry-on-busy with yielding backoff — the busy_timeout analog. Turso has
@@ -147,7 +161,7 @@ impl Engine for TursoEngine {
             p.push(suffix);
             let _ = std::fs::remove_file(PathBuf::from(p));
         }
-        let mut c = open_conn(&path)?;
+        let mut c = open_conn(&path, self.mode)?;
         c.exec_retry(
             "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT UNIQUE NOT NULL, age INTEGER)",
             (),
@@ -161,6 +175,6 @@ impl Engine for TursoEngine {
     }
 
     fn conn(&self) -> BResult<Box<dyn Conn>> {
-        Ok(Box::new(open_conn(&self.db_path())?))
+        Ok(Box::new(open_conn(&self.db_path(), self.mode)?))
     }
 }
