@@ -3,7 +3,7 @@
 //! verify every step against rusqlite's view of the base.
 #![cfg(feature = "sqlite-checkpoint")]
 
-use mpedb::{SqliteOverlay, Value};
+use mpedb::{LockMode, ReconcilePolicy, SqliteOverlay, Value};
 use rusqlite::Connection;
 
 fn setup(tag: &str) -> std::path::PathBuf {
@@ -109,6 +109,32 @@ fn checkpoint_roundtrip_against_the_library() {
     assert!(ovl.schema().tables.iter().all(|t| t.name != "_mpedb_overlay_state"));
 
     drop(ovl);
+    let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn reconcile_ours_then_checkpoint_lands_ours_in_the_base() {
+    let p = setup("reconcile-ours");
+    {
+        let mut ovl = SqliteOverlay::open(&p).unwrap();
+        ovl.query("UPDATE users SET name = 'vaar' WHERE id = 10", &[]).unwrap();
+    }
+    {
+        let c = Connection::open(&p).unwrap();
+        c.execute("UPDATE users SET name = 'deres' WHERE id = 10", []).unwrap();
+    }
+    let mut ovl =
+        SqliteOverlay::open_with_options(&p, LockMode::Locked, Some(ReconcilePolicy::Ours))
+            .unwrap();
+    let r = ovl.checkpoint().unwrap();
+    assert_eq!((r.upserts, r.deletes), (1, 0));
+    drop(ovl);
+    let lib = Connection::open(&p).unwrap();
+    let name: String =
+        lib.query_row("SELECT name FROM users WHERE id = 10", [], |r| r.get(0)).unwrap();
+    assert_eq!(name, "vaar", "ours must overwrite theirs at checkpoint");
+    drop(lib);
     let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));
     let _ = std::fs::remove_file(&p);
 }

@@ -1,27 +1,30 @@
-//! The v2 delta overlay — DESIGN-SQLITE-BACKED §1/§3/§6, building block 5.
+//! The v2 delta overlay — DESIGN-SQLITE-BACKED §1/§2/§3/§5/§6.
 //! The `.db` stays the durable home; `<base>.overlay.mpedb` holds ONLY what
 //! changed since the last checkpoint: upserted row images and TOMBSTONES.
 //! Reads merge per PK — overlay shadows base, tombstones suppress — with the
-//! base read through the native reader under a held SHARED lock (LOCKED
-//! mode: the base provably cannot move, so fall-through needs zero
-//! validation).
-//!
-//! What this block does and does not do, by name:
-//! - LOCKED only: the SHARED is held for the overlay's lifetime. OPTIMISTIC
-//!   wiring (the per-statement bracket) and UNLOCKED-OFFLINE come with the
-//!   mode plumbing (block 7); the primitives already exist in
-//!   `sqlitefmt::lock`.
-//! - No checkpoint yet (block 6): deltas accumulate until then.
-//! - Divergence at reopen (the stored settled stamp no longer matching the
-//!   base) is a NAMED refusal — reconcile rides the checkpoint block.
-//! - A hot journal at open is a named refusal telling the fix (`sqlite3
-//!   base.db 'SELECT 1'` runs sqlite's own recovery); this crate never
-//!   rolls journals back.
+//! base read through the native reader under the mode's lock discipline
+//! (LOCKED / OPTIMISTIC / UNLOCKED-OFFLINE, see [`LockMode`]). The
+//! checkpoint (§5, behind the `sqlite-checkpoint` feature) pushes deltas
+//! into the base via the sqlite library and empties the overlay.
 //!
 //! Layout contract: the overlay's physical tables are the attach-derived
-//! user tables PLUS a trailing hidden `__dead` bool. The executor never
-//! sees `__dead` — plans compile against the USER schema and the merge
-//! context strips/interprets the marker at the TxnCtx boundary.
+//! user tables PLUS two trailing hidden columns — `__dead` (bool tombstone
+//! marker) and `__pre` (the BASE's row image for this PK, captured at the
+//! FIRST delta write, atomically with it). The executor never sees either:
+//! plans compile against the USER schema and the merge context
+//! strips/interprets them at the TxnCtx boundary.
+//!
+//! `__pre` is what makes RECONCILE honest: `Blob([1] ‖ canonical row)` =
+//! the base row as it was, `Blob([0])` = no base row existed, `Null` =
+//! captured offline (unknown). At reconcile, a delta whose `__pre` still
+//! equals the CURRENT base row is provably conflict-free (the foreign
+//! writer touched other PKs); anything else is a per-PK conflict resolved
+//! by the caller's named policy — ours or theirs, counted and reported,
+//! never silently merged.
+//!
+//! A hot journal anywhere is a named refusal telling the fix (`sqlite3
+//! base.db 'SELECT 1'` runs sqlite's own recovery); this crate never rolls
+//! journals back.
 
 use std::path::{Path, PathBuf};
 
@@ -43,6 +46,27 @@ const MARKER_TABLE: &str = "_mpedb_overlay_state";
 /// Truncation batch size [R#14]: deleting delta rows is COW — each batch
 /// commits (and frees) before the next allocates.
 const TRUNCATE_BATCH: usize = 512;
+/// Trailing hidden columns on every overlay row: `__dead`, `__pre`.
+const HIDDEN_COLS: usize = 2;
+
+/// Per-conflict resolution for [`SqliteOverlay::reconcile`]: what wins when
+/// a foreign writer changed a base row we hold an unpushed delta for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcilePolicy {
+    /// Our delta stays and overwrites theirs at the next checkpoint.
+    Ours,
+    /// The base wins: our delta is dropped, their row shows through.
+    Theirs,
+}
+
+/// What one reconcile did, per delta: provably conflict-free (`unchanged`),
+/// kept over theirs (`ours`), or dropped in their favor (`theirs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ReconcileReport {
+    pub unchanged: u64,
+    pub ours: u64,
+    pub theirs: u64,
+}
 
 /// How the base is held between statements — design §2.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,6 +154,10 @@ fn overlay_toml(base: &Path, schema: &Schema, size_mb: u64) -> String {
             t,
             "\n  [[table.column]]\n  name = \"__dead\"\n  type = \"bool\"\n  nullable = false\n"
         );
+        let _ = write!(
+            t,
+            "\n  [[table.column]]\n  name = \"__pre\"\n  type = \"any\"\n"
+        );
     }
     t
 }
@@ -203,6 +231,17 @@ impl SqliteOverlay {
     /// recovery all need the base provably quiescent once — and then keeps
     /// it only in `Locked`.
     pub fn open_with_mode(base: &Path, mode: LockMode) -> Result<SqliteOverlay> {
+        Self::open_with_options(base, mode, None)
+    }
+
+    /// [`Self::open_with_mode`] plus a divergence policy: when the base
+    /// moved under unpushed deltas (the case plain open refuses by name),
+    /// `Some(policy)` runs [`Self::reconcile`] with it before returning.
+    pub fn open_with_options(
+        base: &Path,
+        mode: LockMode,
+        on_divergence: Option<ReconcilePolicy>,
+    ) -> Result<SqliteOverlay> {
         let Some(lock) = SharedLock::acquire(base).map_err(oerr)? else {
             return Err(Error::Unsupported(
                 "the sqlite database is busy (a writer is draining readers) — retry".into(),
@@ -232,6 +271,7 @@ impl SqliteOverlay {
             .map(|t| t.primary_key[0] as usize)
             .collect();
         let ovl = overlay_path(base);
+        let mut needs_reconcile = false;
         let db = if ovl.exists() {
             let db = Database::open_from_file(&ovl)?;
             // The stored settled stamp must still describe the base — else
@@ -241,7 +281,21 @@ impl SqliteOverlay {
                 .ok_or_else(|| Error::Corrupt("overlay has no stored base-stamp".into()))?;
             let stored = decode_stamp(&stored)?;
             if !stored.matches(base).map_err(oerr)? {
-                recover_after_crashed_checkpoint(base, &db, &attach, &pk_idx, &ovl)?;
+                match recover_after_crashed_checkpoint(base, &db, &attach, &pk_idx)? {
+                    Recovery::Healed => {}
+                    Recovery::Diverged { why } => {
+                        if on_divergence.is_none() {
+                            return Err(Error::Unsupported(format!(
+                                "the base {} changed since this overlay's deltas were \
+                                 captured ({why}) — reconcile with a policy \
+                                 (ours/theirs) or discard {}",
+                                base.display(),
+                                ovl.display()
+                            )));
+                        }
+                        needs_reconcile = true;
+                    }
+                }
             }
             db
         } else {
@@ -261,15 +315,24 @@ impl SqliteOverlay {
             &db.sys_record_get(STAMP_NS, STAMP_KEY)?
                 .ok_or_else(|| Error::Corrupt("overlay has no stored base-stamp".into()))?,
         )?;
-        Ok(SqliteOverlay {
+        // Keep the open lock through a possible reconcile — it needs the
+        // quiescence; the mode decides afterwards whether it stays.
+        let mut handle = SqliteOverlay {
             attach,
             db,
             mode,
-            lock: (mode == LockMode::Locked).then_some(lock),
+            lock: Some(lock),
             expected,
             base: base.to_path_buf(),
             pk_idx,
-        })
+        };
+        if needs_reconcile {
+            handle.reconcile(on_divergence.expect("checked above"))?;
+        }
+        if mode != LockMode::Locked {
+            handle.lock = None;
+        }
+        Ok(handle)
     }
 
     pub fn schema(&self) -> &Schema {
@@ -366,8 +429,7 @@ impl SqliteOverlay {
                     if !deltas.iter().all(|t| t.is_empty()) {
                         return Err(Error::Unsupported(format!(
                             "the base {} changed under this overlay's unpushed deltas — \
-                             checkpoint from a fresh handle or discard the overlay \
-                             (reconcile is not built yet)",
+                             run reconcile with a policy (ours/theirs) to resume",
                             self.base.display()
                         )));
                     }
@@ -391,6 +453,111 @@ impl SqliteOverlay {
                 }
             }
         }
+    }
+
+    /// Row-level reconcile of unpushed deltas against a moved base — design
+    /// §2's "pause fall-through, reconcile, resume on the new stamp". Per
+    /// delta PK, `__pre` proves whether the base row actually changed since
+    /// capture: unchanged → the delta is conflict-free and stays; changed
+    /// (or offline-captured unknown) → `policy` decides. `Ours` keeps the
+    /// delta and refreshes its `__pre` to the CURRENT base row, so the next
+    /// foreign write is judged against the state this reconcile accepted;
+    /// `Theirs` drops the delta and their row shows through. Ends by
+    /// settling a fresh stamp under the lock and refreshing the attach
+    /// snapshot — the handle resumes normally, and a detached LOCKED handle
+    /// re-arms.
+    pub fn reconcile(&mut self, policy: ReconcilePolicy) -> Result<ReconcileReport> {
+        if self.mode == LockMode::Offline {
+            return Err(Error::Unsupported(
+                "reconcile reads the base — refuse in unlocked-offline mode; reopen in \
+                 locked/optimistic mode first"
+                    .into(),
+            ));
+        }
+        // Quiescence: the held SHARED, or a transient one for the duration.
+        let transient = if self.lock.is_none() {
+            let l = retake_shared(&self.base)?;
+            if hot_journal(&self.base).map_err(oerr)? {
+                return Err(Error::Unsupported(format!(
+                    "hot journal beside {} — run `sqlite3 {} 'SELECT 1'` once so \
+                     sqlite's own recovery rolls it back",
+                    self.base.display(),
+                    self.base.display()
+                )));
+            }
+            Some(l)
+        } else {
+            None
+        };
+        // Fresh base view FIRST — the reader snapshots at open, and every
+        // comparison below must be against the base as it is NOW.
+        let fresh = SqliteAttach::open(&self.base)?;
+        if fresh.schema() != self.attach.schema() {
+            return Err(Error::Unsupported(
+                "foreign DDL changed the base's schema — reconcile cannot proceed; \
+                 reopen to re-derive the attach"
+                    .into(),
+            ));
+        }
+        self.attach = fresh;
+        enum Act {
+            RefreshPre(u32, Vec<Value>),
+            Drop(u32, Value),
+        }
+        let deltas = snapshot_deltas(&self.db, self.pk_idx.len())?;
+        let mut report = ReconcileReport::default();
+        let mut acts = Vec::new();
+        for (ti, rows) in deltas.iter().enumerate() {
+            let idx = self.pk_idx[ti];
+            for row in rows {
+                let pk = row[idx].clone();
+                let cur = self.attach.base_get_by_pk(ti as u32, std::slice::from_ref(&pk))?;
+                if pre_matches(&row[row.len() - 1], cur.as_deref()) {
+                    report.unchanged += 1;
+                    continue;
+                }
+                match policy {
+                    ReconcilePolicy::Ours => {
+                        let mut full = row.clone();
+                        let n = full.len();
+                        full[n - 1] = pre_of(cur.as_deref());
+                        acts.push(Act::RefreshPre(ti as u32, full));
+                        report.ours += 1;
+                    }
+                    ReconcilePolicy::Theirs => {
+                        acts.push(Act::Drop(ti as u32, pk));
+                        report.theirs += 1;
+                    }
+                }
+            }
+        }
+        for chunk in acts.chunks(TRUNCATE_BATCH) {
+            let mut w = self.db.engine.begin_write()?;
+            let res = chunk.iter().try_for_each(|a| match a {
+                Act::RefreshPre(ti, full) => TxnCtx::update_by_pk(&mut w, *ti, full).map(|_| ()),
+                Act::Drop(ti, pk) => {
+                    TxnCtx::delete_by_pk(&mut w, *ti, std::slice::from_ref(pk)).map(|_| ())
+                }
+            });
+            match res {
+                Ok(()) => w.commit()?,
+                Err(e) => {
+                    w.abort();
+                    return Err(e);
+                }
+            }
+        }
+        // Bless the base as it is now: settle + store + expected.
+        let stamp = settle_and_read(&self.base, &scratch_path(&self.base)).map_err(oerr)?;
+        let _ = std::fs::remove_file(scratch_path(&self.base));
+        self.db.sys_record_put(STAMP_NS, STAMP_KEY, &encode_stamp(&stamp))?;
+        self.expected = stamp;
+        if self.mode == LockMode::Locked {
+            if let Some(l) = transient {
+                self.lock = Some(l); // a detached LOCKED handle re-arms
+            }
+        }
+        Ok(report)
     }
 
     fn exec_plan(
@@ -462,15 +629,95 @@ impl MergeCtx<'_> {
         }
         Ok(())
     }
+
+    /// The `__pre` for a delta write to this PK: the FIRST write captures
+    /// the base's row image (or its absence) atomically with the delta;
+    /// later writes carry the original capture forward. Offline (no base
+    /// access) captures `Null` = unknown — reconcile treats it as a
+    /// conflict, never as proof.
+    fn pre_for(&mut self, table: u32, pk: &Value) -> Result<Value> {
+        if let Some(existing) = self.ovl.get_by_pk(table, std::slice::from_ref(pk))? {
+            return Ok(existing[existing.len() - 1].clone());
+        }
+        if !self.base_ok {
+            return Ok(Value::Null);
+        }
+        let base = self.at.base_get_by_pk(table, std::slice::from_ref(pk))?;
+        Ok(pre_of(base.as_deref()))
+    }
 }
 
 fn is_dead(row: &[Value]) -> bool {
-    matches!(row.last(), Some(Value::Bool(true)))
+    matches!(row.get(row.len().wrapping_sub(HIDDEN_COLS)), Some(Value::Bool(true)))
 }
 
 fn strip(mut row: Vec<Value>) -> Vec<Value> {
-    row.pop();
+    row.truncate(row.len().saturating_sub(HIDDEN_COLS));
     row
+}
+
+/// User-column slice of an overlay row (drops `__dead` + `__pre`).
+fn user_cols(row: &[Value]) -> &[Value] {
+    &row[..row.len() - HIDDEN_COLS]
+}
+
+/// Canonical, private encoding of a base row for `__pre` comparison —
+/// deterministic tag + LE bytes per value (floats by bit pattern).
+fn encode_row(row: &[Value]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(16 * row.len());
+    for v in row {
+        match v {
+            Value::Null => out.push(0),
+            Value::Int(i) => {
+                out.push(1);
+                out.extend_from_slice(&i.to_le_bytes());
+            }
+            Value::Float(f) => {
+                out.push(2);
+                out.extend_from_slice(&f.to_bits().to_le_bytes());
+            }
+            Value::Bool(b) => {
+                out.push(3);
+                out.push(*b as u8);
+            }
+            Value::Text(s) => {
+                out.push(4);
+                out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+                out.extend_from_slice(s.as_bytes());
+            }
+            Value::Blob(b) => {
+                out.push(5);
+                out.extend_from_slice(&(b.len() as u64).to_le_bytes());
+                out.extend_from_slice(b);
+            }
+            Value::Timestamp(t) => {
+                out.push(6);
+                out.extend_from_slice(&t.to_le_bytes());
+            }
+            // Never stored (the row codec refuses lists).
+            Value::List(_) => out.push(7),
+        }
+    }
+    out
+}
+
+/// The `__pre` value for a CURRENT base state: present row, absent, or
+/// (offline) unknown.
+fn pre_of(base_row: Option<&[Value]>) -> Value {
+    match base_row {
+        Some(row) => {
+            let mut b = vec![1u8];
+            b.extend_from_slice(&encode_row(row));
+            Value::Blob(b)
+        }
+        None => Value::Blob(vec![0u8]),
+    }
+}
+
+/// Does a stored `__pre` still describe the CURRENT base row? `Null`
+/// (offline-captured) is never provably unchanged.
+fn pre_matches(pre: &Value, cur_base: Option<&[Value]>) -> bool {
+    matches!((pre, &pre_of(cur_base)), (Value::Blob(a), Value::Blob(b)) if a == b)
 }
 
 fn pk_of(row: &[Value], idx: usize) -> Result<i64> {
@@ -565,7 +812,7 @@ impl TxnCtx for MergeCtx<'_> {
         // collides exactly as a live overlay row does; a tombstoned PK is
         // free again.
         let pk = values[self.pk_idx[table as usize]].clone();
-        if self.get_by_pk(table, &[pk])?.is_some() {
+        if self.get_by_pk(table, std::slice::from_ref(&pk))?.is_some() {
             let name = self
                 .at
                 .schema()
@@ -574,16 +821,21 @@ impl TxnCtx for MergeCtx<'_> {
                 .unwrap_or_default();
             return Err(Error::PrimaryKeyViolation { table: name });
         }
+        let pre = self.pre_for(table, &pk)?;
         let mut full = values.to_vec();
         full.push(Value::Bool(false));
+        full.push(pre);
         self.ovl_upsert(table, &full)
     }
 
     fn update_by_pk(&mut self, table: u32, new_values: &[Value]) -> Result<bool> {
         // The executor only calls this for rows it just read from the merged
         // view, so existence is established; materialize into the overlay.
+        let pk = new_values[self.pk_idx[table as usize]].clone();
+        let pre = self.pre_for(table, &pk)?;
         let mut full = new_values.to_vec();
         full.push(Value::Bool(false));
+        full.push(pre);
         self.ovl_upsert(table, &full)?;
         Ok(true)
     }
@@ -597,12 +849,15 @@ impl TxnCtx for MergeCtx<'_> {
             .table(table)
             .ok_or_else(|| Error::Internal("table id out of range".into()))?;
         let idx = self.pk_idx[table as usize];
-        let mut full = vec![Value::Null; t.columns.len()];
-        full[idx] = pk
+        let pkv = pk
             .first()
             .cloned()
             .ok_or_else(|| Error::Internal("empty PK in delete".into()))?;
+        let pre = self.pre_for(table, &pkv)?;
+        let mut full = vec![Value::Null; t.columns.len()];
+        full[idx] = pkv;
         full.push(Value::Bool(true));
+        full.push(pre);
         self.ovl_upsert(table, &full)?;
         Ok(true)
     }
@@ -682,6 +937,15 @@ fn truncate_deltas(db: &Database, deltas: &[Vec<Vec<Value>>], pk_idx: &[usize]) 
     Ok(())
 }
 
+/// What the divergence recovery at reopen decided.
+enum Recovery {
+    /// Adopted (empty overlay, or our own crashed checkpoint healed).
+    Healed,
+    /// Foreign writer interleaved with unpushed deltas — the caller decides
+    /// (refuse, or reconcile with a policy).
+    Diverged { why: &'static str },
+}
+
 /// The reopen path when the stored stamp no longer matches the base.
 ///
 /// Three outcomes, in order:
@@ -694,32 +958,26 @@ fn truncate_deltas(db: &Database, deltas: &[Vec<Vec<Value>>], pk_idx: &[usize]) 
 ///   delta is exactly reflected in the base (live rows equal, tombstoned
 ///   PKs absent). Truncate the redundant deltas and adopt.
 /// - Anything else means a foreign writer interleaved with unpushed deltas —
-///   refuse, never replay [R#3].
+///   `Diverged`; the caller refuses or reconciles, never blind-replays
+///   [R#3].
 fn recover_after_crashed_checkpoint(
     base: &Path,
     db: &Database,
     attach: &SqliteAttach,
     pk_idx: &[usize],
-    ovl: &Path,
-) -> Result<()> {
-    let refuse = |why: &str| {
-        Err(Error::Unsupported(format!(
-            "the base {} changed since this overlay's deltas were captured ({why}) — \
-             reconcile is not built yet: checkpoint or discard {}",
-            base.display(),
-            ovl.display()
-        )))
-    };
+) -> Result<Recovery> {
     let deltas = snapshot_deltas(db, pk_idx.len())?;
     if deltas.iter().all(|t| t.is_empty()) {
         let stamp = settle_and_read(base, &scratch_path(base)).map_err(oerr)?;
         let _ = std::fs::remove_file(scratch_path(base));
         db.sys_record_put(STAMP_NS, STAMP_KEY, &encode_stamp(&stamp))?;
-        return Ok(());
+        return Ok(Recovery::Healed);
     }
     let epoch = read_epoch(db)?;
     if read_marker(base)? != Some(epoch as i64) {
-        return refuse("a foreign writer committed in an unlocked window");
+        return Ok(Recovery::Diverged {
+            why: "a foreign writer committed in an unlocked window",
+        });
     }
     for (ti, rows) in deltas.iter().enumerate() {
         let idx = pk_idx[ti];
@@ -729,10 +987,12 @@ fn recover_after_crashed_checkpoint(
             let consistent = if is_dead(row) {
                 in_base.is_none()
             } else {
-                in_base.as_deref() == Some(&row[..row.len() - 1])
+                in_base.as_deref() == Some(user_cols(row))
             };
             if !consistent {
-                return refuse("a foreign writer overwrote our crashed checkpoint's push");
+                return Ok(Recovery::Diverged {
+                    why: "a foreign writer overwrote our crashed checkpoint's push",
+                });
             }
         }
     }
@@ -742,7 +1002,7 @@ fn recover_after_crashed_checkpoint(
     let _ = std::fs::remove_file(scratch_path(base));
     db.sys_record_put(STAMP_NS, STAMP_KEY, &encode_stamp(&stamp))?;
     db.sys_record_put(STAMP_NS, EPOCH_KEY, &(epoch + 1).to_le_bytes())?;
-    Ok(())
+    Ok(Recovery::Healed)
 }
 
 // ---- the checkpoint itself (design §5) — needs the sqlite LIBRARY --------
@@ -854,7 +1114,6 @@ impl SqliteOverlay {
     }
 }
 
-#[cfg(feature = "sqlite-checkpoint")]
 fn retake_shared(base: &Path) -> Result<SharedLock> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
@@ -935,9 +1194,7 @@ fn push_deltas(
                     del.execute([to_sq(&row[pk_idx[ti]])])?;
                     deletes += 1;
                 } else {
-                    ins.execute(rusqlite::params_from_iter(
-                        row[..row.len() - 1].iter().map(to_sq),
-                    ))?;
+                    ins.execute(rusqlite::params_from_iter(user_cols(row).iter().map(to_sq)))?;
                     upserts += 1;
                 }
             }

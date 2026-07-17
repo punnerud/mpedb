@@ -124,9 +124,14 @@ The full design — reviewed hard (20 adversarial findings folded) — is
   LOCKED, in the CLI as `mpedb file.db --overlay [--mode …]` with
   `.checkpoint` / `mpedb checkpoint file.db --overlay`. The settled-stamp
   trick makes "did anything touch the base?" one `stat()` after minutes or
-  days unlocked. Remaining for v2 proper: reconcile of diverged deltas
-  (today a named refusal), non-INTEGER-PK WITHOUT ROWID shapes, and the
-  multi-process co-attach story.
+  days unlocked. **Reconcile is built**: every delta write captures the
+  base's row image atomically with it (`__pre`), so when a foreign writer
+  commits under your unpushed deltas, per-PK conflicts are PROVEN rather
+  than assumed — untouched deltas ride through, real conflicts resolve by
+  the named policy you pass (`--reconcile ours|theirs` at open, or
+  `.reconcile ours|theirs` in the repl), counted and reported. Remaining
+  for v2 proper: non-INTEGER-PK WITHOUT ROWID shapes and the multi-process
+  co-attach story.
 - v3 (measured, maybe never): sqlite index probes for cold reads, hot-row
   promotion, WAL-mode bases.
 
@@ -144,8 +149,10 @@ and the experiments that would revive it is
   sqlite tools; that is how incremental pull works without re-reading
   everything).
 - `--direct` trusts you about quiescence; `--overlay` does not (it speaks
-  sqlite's own locks). Divergence with unpushed deltas is still a named
-  refusal, not a merge — reconcile is the next v2 stage.
+  sqlite's own locks). Divergence with unpushed deltas refuses by default
+  and resolves only by an EXPLICIT policy (`--reconcile ours|theirs`) —
+  row-level, proven per PK via the captured base image, never a silent
+  merge. Column-level merging is deliberately not offered.
 - mpedb's SQL is a strict, measured subset — [COMPAT.md](COMPAT.md) row for
   row, 99.8% of sqlite's own 5.3M-record corpus passing with zero wrong
   answers.
