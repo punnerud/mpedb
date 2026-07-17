@@ -10,11 +10,11 @@ Two things make this page different from a typical compatibility list:
 
 1. **Every ✅ is measured, not remembered.** The `sqlite_corpus` runner
    (`crates/mpedb-testkit`) executes sqlite's own sqllogictest corpus
-   differentially against sqlite3: the classic `select1–3` files and the entire
-   random *select* tree — 127 files, 1.46 million records — pass at **100%**,
-   with **zero wrong answers and zero error mismatches** across every statement
-   both engines accept over the full 5.3M-record corpus. The remaining ~31% of
-   the corpus is almost entirely FROM-less `SELECT 3+5` (#67, in progress).
+   differentially against sqlite3: **99.8% of attempted statements pass over
+   the full 5.3M-record corpus, with zero wrong answers and zero error
+   mismatches** — the select tree and aggregates tree at 100.0%, expr at
+   99.6%, groupby at 99.0%, select4 at 99.6%. What remains is deliberate
+   refusals with error messages.
 2. **Every ❌ is an error message, never a silent wrong answer.** SQL that
    mpedb does not support is refused at compile time, usually with the manual
    fix in the message. The narrowness is the design; what compiles, matches.
