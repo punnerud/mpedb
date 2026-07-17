@@ -61,41 +61,42 @@ id` holds under gaps, and the two SchemaBundle constructors emit a dead entry
 per hole. The fix concentrates in **two constructors + one resolver + the mint
 + validate + decoder placement** instead of rewriting 35 index sites to
 search-by-id — and it removes the compaction-off-by-one-to-a-*wrong-live-table*
-risk entirely.
+risk entirely. (The dead slot doubles as the id high-water — see §1, no
+separate counter.)
 
-## 1. The id high-water (the one persistence change → review gate)
+## 1. The id high-water IS `ntables` — dead slots are materialized
 
-`Schema` gains a logical `next_table_id: u32`, **persisted as a catalog
-sys-record** (`sys/next_table_id`), NOT in canonical bytes. Rationale for the
-sys-record over a canonical-bytes v3 field: the schema HASH must stay a pure
-function of table *shapes* (it is the config-drift and plan-invalidation key);
-a monotonic counter that changes on every CREATE would pollute the hash and
-break the seed-vs-file hash equivalence. A sys-record is ordinary append-only
-catalog data — no format-version bump, written in the same COW commit as the
-schema bytes.
+The first draft's separate `sys/next_table_id` counter (and the HIGH review
+finding about deriving vs persisting it) **dissolves** under the right
+tombstone representation: keep the dropped table's slot in `schema.tables` as a
+MATERIALIZED dead entry, encoded in the canonical bytes. Then:
 
-Rules:
-- CREATE: `id = next_table_id; next_table_id += 1`. **Fail closed** at the
-  ceiling: `next_table_id >= MAX_TABLES (64)` ⇒ `Error::Unsupported("table-id
-  space exhausted; rebuild required")`. This turns the footprint/CDC `1u64 <<
-  id` bitmap cap (§4) from silent overflow into an explicit, recoverable limit.
-- **The counter must be MATERIALIZED, never merely derived** (review finding,
-  HIGH). `max(live)+1` is correct only at the instant of first attach, before
-  any gap exists; the moment a DROP removes the highest id, the live set gains
-  a gap and `max(live)+1` re-mints the dropped id — the exact aliasing no-reuse
-  exists to eliminate. Therefore write `sys/next_table_id` explicitly:
-  1. at **bootstrap** of a new file (`= tables.len()`),
-  2. in the **DROP commit** itself — DROP does not change the value, but it
-     **persists the current in-memory counter** so the record can never be
-     absent after a gap has been created,
-  3. as a **write-back at attach when the record is absent** (a pre-stage-4
-     file), BEFORE the first mutation — derive `max(id)+1` once, persist it,
-     and from then on the sys-record is the sole source of truth.
-  With all three, an absent record means only a genuinely untouched pre-stage-4
-  file with no gaps, where `max(id)+1` is provably correct. §2 step 3's "id is
-  not reclaimed" must NOT be read as "the DROP commit skips the counter write."
-- `with_added_table` (today `def.id = tables.len()`) reworks to take the
-  counter and tombstone-aware placement.
+- `schema.tables` never shrinks; ids stay DENSE `0..len-1` (a dead slot fills
+  the dropped id's position). **`position == id` remains exactly true** — no
+  gapped vec, no search-by-id, and the ~35 downstream `[id as usize]` sites are
+  correct-by-inheritance with a dead entry at the dropped id.
+- **`next_table_id` = `tables.len()`** (live + dead). It is persisted (as the
+  `ntables` count in the canonical bytes), monotonic (dead slots are never
+  removed), and **can never regress** — dropping the highest id keeps its dead
+  slot, so `len()` is unchanged and the id is never re-minted. There is no
+  separate counter, no `sys/next_table_id` record, and no `max(id)+1`
+  derivation to get wrong. The HIGH finding's whole premise (an absent /
+  derivable counter) is gone.
+- CREATE: `def.id = tables.len()`; append a live slot. **Fail closed** at the
+  ceiling `tables.len() >= MAX_TABLES (64)` ⇒ `Error::Unsupported("table-id
+  space exhausted; rebuild required")` — turns the footprint/CDC `1u64 << id`
+  cap into an explicit limit. (`with_added_table` is nearly unchanged: it
+  already does `def.id = self.tables.len()`; it only gains the ceiling guard
+  and must count against the ≤ 56 LIVE-count guard, not the total incl. dead.)
+
+Cost: a dead slot costs a few bytes in the canonical schema and one entry in
+each SchemaBundle Vec — negligible over ≤ 64 lifetime creates. The schema HASH
+includes dead slots (they are part of the schema's identity), so a DROP changes
+the hash and invalidates stale plans, which is correct. Config-seed vs file
+hash equivalence is only needed at CREATION (no dead slots yet), where it
+holds; after any DDL the live schema legitimately diverges from the config and
+the config-drift check compares only against the frozen SEED hash (stage 1).
+`regenerate` re-densifies (rebuilds without dead slots), resetting the ceiling.
 
 ## 2. DROP TABLE mechanics (atomic UNLINK commit + bounded reclamation)
 
@@ -124,8 +125,8 @@ safe to reclaim lazily — leaking a page until reclaimed is never corruption).
    bound passes it (#37) — DROP adds nothing to that bound logic.
 3. **Tombstone the schema**: place a dead sentinel at the id's slot (see the
    representation below), re-canonicalize, write to `CAT_SCHEMA_KEY`.
-4. **Persist `sys/next_table_id`** = the current counter (unchanged in value,
-   but written so the record is never absent after a gap — §1 HIGH fix).
+4. (No counter to persist — `ntables` in the tombstoned schema bytes IS the
+   high-water; see §1.)
 5. **Purge the id's catalog-resident soft state**: CDC `set_captured(id,false)`
    / `set_blocked(id,false)` + delete the id's dirty entries (`cdc.rs`), so the
    bitmaps stop marking a dead id. (Mirror park/map records stay orphan-leaked;
@@ -141,17 +142,20 @@ and crash-safe: the `sys/drop-reclaim/<id>` worklist survives a crash, so a
 reopen resumes reclamation; a partially-reclaimed tree just has fewer pages to
 free next round. Space returns eventually, never in one unbounded commit.
 
-**The tombstone sentinel** must be a MATERIALIZED entry in `schema.tables`
-(the review's soundness proof for the `[id]`-aligned SchemaBundle Vecs depends
-on the slot existing), and it must PASS `validate` — so it cannot be a
-zero-column / empty-pk `TableDef` (those violate the 1..=MAX_COLUMNS and
-non-empty-pk rules). Representation: add **`dead: bool` to `TableDef`** (a v2
-field addition — decode/encode a flag byte). A dead table encodes its id + the
-flag and validate SKIPS the shape rules for a dead slot (it holds no data). The
-"a gap in the id sequence IS the tombstone / no field needed" idea from the
-first draft is REJECTED: the decoder loop is `ntables`-driven and the sound
-`[id]`-alignment requires a real slot, so the dead marker is encoded, not
-inferred from a gap. The dropped NAME is freed for re-CREATE (at a new id).
+**The tombstone sentinel** is a MATERIALIZED entry in `schema.tables` — every
+slot `0..ntables` is encoded, so `position == id` is trivially preserved (the
+review's soundness proof for the `[id]`-aligned SchemaBundle Vecs). Add
+**`dead: bool` to `TableDef`**, bumping the canonical bytes to **version 3**
+(an old v2 file then refuses cleanly at the version check with "regenerate",
+rather than misreading a flag byte at the wrong offset). A dead slot encodes
+minimally: `id`, `dead = 1`, empty name, 0 columns, 0 pk, 0 indexes. `validate`
+SKIPS the shape rules (1..=MAX_COLUMNS, non-empty pk, etc.) for a dead slot but
+still enforces `position == id`, `id < MAX_TABLES`, and that a dead slot IS
+empty (0 cols/pk/indexes). Its name is empty, so `table_id(name)` never matches
+it and the dropped name is free to re-CREATE (at a new id, a new live slot).
+The SchemaBundle constructors give a dead slot empty `checks`/`sec_indexes`/
+`sec_unique`/`col_types` entries — never accessed, since no live plan or write
+references a dropped id.
 
 ## 3. The fix, grouped by the audit (ordered by risk)
 
@@ -247,9 +251,10 @@ scope afterward). This shapes exactly what DDL does and does not preserve:
    fixpoint (§4.5) tolerates a large multi-tree free in one commit (a big table
    may write thousands of freelist chunks — bounded but heavy; cross-check the
    1 GiB-delete precedent).
-2. **The persisted counter**: does `next_table_id` survive every crash point,
-   and can dropping-the-highest never silently lower it? Is the absent-record
-   fallback (`max(id)+1`) safe for pre-stage-4 files?
+2. **The high-water = `ntables`**: with dead slots materialized, does
+   `tables.len()` never regress across a drop-the-highest + reopen, and does a
+   pre-stage-4 (v2) file refuse cleanly at the version-3 check rather than
+   misread? (No separate counter to survive — §1.)
 3. **Reader pinned across DROP**: proves its pages are held by the oldest-pinned
    bound with DROP adding nothing, and its own (old) bundle still decodes the
    dropped table's rows correctly from its pinned catalog_root.
