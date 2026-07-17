@@ -8,6 +8,8 @@ edition = "2021"
 # mpedb's own lock protocol with no sqlite library in the path, so nothing
 # here may drag one in. The library is what VERIFIES us, in dev-deps only.
 [dependencies]
+# fcntl byte-range locks (sqlite's own) — no higher-level dep warranted.
+libc = "0.2"
 
 [dev-dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
