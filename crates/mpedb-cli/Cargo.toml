@@ -10,6 +10,7 @@ name = "mpedb"
 path = "src/main.rs"
 
 [dependencies]
+mpedb-sqlitefmt = { path = "../mpedb-sqlitefmt" }
 mpedb = { workspace = true }
 mpedb-core = { workspace = true }
 mpedb-proc = { workspace = true }
