@@ -171,15 +171,20 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
                 .table(*table)
                 .ok_or_else(|| Error::Corrupt("table id out of range".into()))?;
             let (key_access, mut indexes_used) = access_key_and_indexes(access);
-            let sec = secondary_indexes(t);
+            // EVERY index containing a set column gets its bit — including a
+            // composite index one of whose members is set (review finding:
+            // single-column identity understated the write set the
+            // ring/optimistic machinery relies on).
             for (col, _) in set {
-                if let Some(pos) = sec.iter().position(|c| c == col) {
-                    if pos + 1 > 63 {
-                        return Err(Error::Unsupported(
-                            "more than 63 secondary indexes on one table".into(),
-                        ));
+                for (pos, ix) in t.indexes.iter().enumerate() {
+                    if ix.columns.contains(col) {
+                        if pos + 1 > 63 {
+                            return Err(Error::Unsupported(
+                                "more than 63 secondary indexes on one table".into(),
+                            ));
+                        }
+                        indexes_used |= 1u64 << (pos + 1);
                     }
-                    indexes_used |= 1u64 << (pos + 1);
                 }
             }
             let bit = table_bit(*table)?;

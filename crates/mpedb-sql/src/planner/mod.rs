@@ -223,20 +223,20 @@ fn write_check(
 /// declaration order, skipping a column that is by itself the entire primary
 /// key. UNIQUE index trees are keyed `value → pk`; non-unique ones use the
 /// composite key `(value ‖ pk) → pk` (unique by construction).
-pub fn secondary_indexes(table: &TableDef) -> Vec<u16> {
+pub fn secondary_indexes(table: &TableDef) -> Vec<Option<u16>> {
+    // `TableDef.indexes` is the single source of index numbering
+    // (DESIGN-SCHEMA-V2): index_no = position + 1, 0 = the PK tree. Each
+    // entry is `Some(column)` for a single-column index — the only shape the
+    // planner exploits until #55 — or `None` for a composite entry, which
+    // KEEPS its index_no (numbering must stay aligned with the engine's
+    // trees) but is never offered as an access path.
     table
-        .columns
+        .indexes
         .iter()
-        .enumerate()
-        .filter(|(i, c)| {
-            // A column with `unique` OR `indexed` is a secondary index. The PK's
-            // own single column is skipped — it already has index 0 (the PK
-            // tree). Both engine and SQL derive this identically, in
-            // column-declaration order, so index numbers agree (CLAUDE.md).
-            (c.unique || c.indexed)
-                && !(table.primary_key.len() == 1 && table.primary_key[0] == *i as u16)
+        .map(|ix| match ix.columns[..] {
+            [c] => Some(c),
+            _ => None,
         })
-        .map(|(i, _)| i as u16)
         .collect()
 }
 
@@ -263,7 +263,9 @@ pub(crate) fn conflict_probe_opt(table: &TableDef, target: &[u16]) -> Option<Con
     if !table.columns[*col as usize].unique {
         return None;
     }
-    let ino = secondary_indexes(table).iter().position(|c| c == col)?;
+    let ino = secondary_indexes(table)
+        .iter()
+        .position(|c| *c == Some(*col))?;
     Some(ConflictProbe::Index(ino as u32 + 1))
 }
 
@@ -435,7 +437,7 @@ fn plan_on_conflict(
             .map(|i| table.columns[*i as usize].name.as_str())
             .collect();
         let mut usable = vec![format!("({})", pk_names.join(", "))];
-        for c in secondary_indexes(table) {
+        for c in secondary_indexes(table).into_iter().flatten() {
             // Only UNIQUE columns can witness a conflict; an `indexed`
             // (non-unique) column is a secondary index but never usable here.
             if table.columns[c as usize].unique {

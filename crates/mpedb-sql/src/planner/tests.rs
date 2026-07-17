@@ -90,9 +90,9 @@ fn secondary_index_numbering() {
     let s = test_schema();
     // users: id is by itself the whole PK -> skipped even though the PK
     // tree covers it; email (declared unique) is index 1.
-    assert_eq!(secondary_indexes(s.table(2).unwrap()), vec![1]);
+    assert_eq!(secondary_indexes(s.table(2).unwrap()), vec![Some(1)]);
     // orders: sku is index 1.
-    assert_eq!(secondary_indexes(s.table(1).unwrap()), vec![2]);
+    assert_eq!(secondary_indexes(s.table(1).unwrap()), vec![Some(2)]);
     // A unique column that is part of a multi-column PK is NOT skipped.
     let t = TableDef {
         id: 0,
@@ -109,7 +109,9 @@ fn secondary_index_numbering() {
         primary_key: vec![0, 1],
         indexes: vec![],
     };
-    assert_eq!(secondary_indexes(&t), vec![0]);
+    // The derivation lives in Schema::new now (single source: TableDef.indexes).
+    let s = Schema::new(vec![t]).unwrap();
+    assert_eq!(secondary_indexes(s.table(0).unwrap()), vec![Some(0)]);
 }
 
 #[test]

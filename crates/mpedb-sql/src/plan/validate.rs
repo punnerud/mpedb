@@ -752,7 +752,11 @@ impl CompiledPlan {
                 if no == 0 || no > sec.len() || no > 63 {
                     return Err(corrupt("index_no out of range"));
                 }
-                let col = sec[no - 1];
+                // Composite access paths arrive with #55; until then a plan
+                // referencing one cannot have been produced by this planner.
+                let Some(col) = sec[no - 1] else {
+                    return Err(corrupt("composite index access predates #55"));
+                };
                 self.check_key_part(part, t.columns[col as usize].ty, outer, ptypes)
             }
             AccessPath::IndexRange { index_no, lo, hi } => {
@@ -764,7 +768,10 @@ impl CompiledPlan {
                 if lo.is_none() && hi.is_none() {
                     return Err(corrupt("IndexRange with no bounds"));
                 }
-                let ty = t.columns[sec[no - 1] as usize].ty;
+                let Some(col) = sec[no - 1] else {
+                    return Err(corrupt("composite index access predates #55"));
+                };
+                let ty = t.columns[col as usize].ty;
                 for bound in [lo, hi].into_iter().flatten() {
                     if bound.parts.len() != 1 {
                         return Err(corrupt("IndexRange bound must have exactly one part"));

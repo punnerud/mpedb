@@ -502,6 +502,7 @@ impl CompiledPlan {
                             .unwrap_or_default()
                             .get(i)
                             .copied()
+                            .flatten() // composite (#55): falls back below
                     })
                     .unwrap_or(0);
                 // A unique probe returns at most one row (IndexPoint); a
@@ -528,6 +529,7 @@ impl CompiledPlan {
                             .unwrap_or_default()
                             .get(i)
                             .copied()
+                            .flatten() // composite (#55): falls back below
                     })
                     .unwrap_or(0);
                 let mut items = Vec::new();

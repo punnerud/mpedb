@@ -401,8 +401,8 @@ fn secondary_index_helper_is_canonical() {
     let s = schema();
     let users = s.table(s.table_id("users").unwrap()).unwrap();
     let orders = s.table(s.table_id("orders").unwrap()).unwrap();
-    assert_eq!(secondary_indexes(users), vec![1]); // email
-    assert_eq!(secondary_indexes(orders), vec![2]); // sku
+    assert_eq!(secondary_indexes(users), vec![Some(1)]); // email
+    assert_eq!(secondary_indexes(orders), vec![Some(2)]); // sku
 }
 
 #[test]
