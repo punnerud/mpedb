@@ -40,6 +40,14 @@ impl<'e> WriteTxn<'e> {
             self.catalog_root = out.new_root;
         }
 
+        // 1.5 extent-map edits — deferred from the data-tree operations that
+        // recorded them, applied in ONE place so no tree op ever nests inside
+        // another (DESIGN-BLOBEXTENT §4). Runs before the fixpoint so the
+        // pages these COW-edits free/allocate are in its working sets.
+        if !self.pending_map_edits.is_empty() {
+            self.apply_map_edits()?;
+        }
+
         // 2. freelist fixpoint (DESIGN.md §4.5). Two things get written:
         //
         //   - each drawn entry, minus whatever we consumed out of it (deleted
@@ -66,6 +74,18 @@ impl<'e> WriteTxn<'e> {
         // cursor read can draw from an entry these writes are rewriting (see
         // `in_freelist_op`). Allocations fall back to reusable/high-water.
         self.in_freelist_op = true;
+        // The kind-1 (extent run) side writes ONCE: the run pool cannot
+        // change shape inside `in_freelist_op` (refill is blocked; page
+        // allocation never draws from runs), so the page loop below iterates
+        // over a run-plan that is already settled — the §4.5 termination
+        // argument never meets a growing run entry (attribution rule,
+        // DESIGN-BLOBEXTENT §3.3).
+        if !self.taken_runs.is_empty()
+            || !self.freed_runs.is_empty()
+            || self.run_pool.iter().any(|r| r.from.is_none())
+        {
+            self.apply_run_plan(new_txn)?;
+        }
         leakstat::add(&leakstat::COMMIT_FREED, self.freed.len() as u64);
         leakstat::add(&leakstat::COMMIT_LEFTOVER, self.reusable.len() as u64);
         leakstat::bump(&leakstat::COMMITS);
@@ -125,6 +145,18 @@ impl<'e> WriteTxn<'e> {
         };
         match self.eng.shm.durability {
             Durability::Commit => {
+                // Extent payload was pwritten, never mapped-stored, so it is
+                // NOT in `dirty` — its ranges are tracked explicitly and
+                // synced here, in the same ordering class as the COW pages,
+                // covered by the same single barrier below. On Linux the
+                // barrier is a no-op and these range-msyncs ARE the pre-flip
+                // durability (DESIGN-BLOBEXTENT §4, review finding 1).
+                for &(start, npages) in &self.extent_dirty {
+                    self.eng.shm.msync_range_nobarrier(
+                        start as usize * PAGE_SIZE,
+                        npages as usize * PAGE_SIZE,
+                    )?;
+                }
                 let mut ids: Vec<u64> = self.dirty.iter().copied().collect();
                 ids.sort_unstable();
                 let mut i = 0;
@@ -165,6 +197,20 @@ impl<'e> WriteTxn<'e> {
             // (crash-consistent, deferred — §5.4.2). Either way, on error the
             // commit aborts cleanly: nothing was published, Drop unlocks.
             Durability::Wal | Durability::Async => {
+                // Payload BEFORE the record that recovery will replay
+                // (DESIGN-BLOBEXTENT §7): extents opted out of page-image
+                // logging, so the record's validity must imply payload
+                // durability — a range-bounded msync, not a whole-file
+                // fdatasync (which would flush every dirty page in the file
+                // and turn each large-value commit into a mini-checkpoint).
+                // In `async` this is the insert-direction half; the reuse
+                // direction is the refill gate on the durable frontier (§6).
+                for &(start, npages) in &self.extent_dirty {
+                    self.eng.shm.msync_range_nobarrier(
+                        start as usize * PAGE_SIZE,
+                        npages as usize * PAGE_SIZE,
+                    )?;
+                }
                 let mut ids: Vec<u64> = self.dirty.iter().copied().collect();
                 ids.sort_unstable();
                 if self.eng.shm.durability == Durability::Async {

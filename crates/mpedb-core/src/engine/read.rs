@@ -11,6 +11,10 @@ pub struct ReadTxn<'e> {
 }
 
 impl PageStore for ReadTxn<'_> {
+    fn read_extent(&self, start_page: u64, total_len: u64, out: &mut Vec<u8>) -> Result<()> {
+        super::read_extent_from_shm(&self.eng.shm, start_page, total_len, out)
+    }
+
     fn page(&self, id: u64) -> Result<&[u8]> {
         self.eng.shm.page(id)
     }

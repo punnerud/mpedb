@@ -1049,3 +1049,122 @@ fn sys_scan_range_is_prefix_bounded_and_txn_id_tracks_commits() {
     r.finish().unwrap();
     eng.verify_page_accounting().unwrap();
 }
+
+/// Extents end to end (DESIGN-BLOBEXTENT §13.2): a blob-typed table with the
+/// threshold ON, churned through insert/update(shrink+grow)/delete across
+/// commits, with `verify_page_accounting`'s interval ledger as the assertion
+/// after every commit — and a fresh attach reading the values back, so the
+/// map root actually round-trips through the published meta.
+#[test]
+fn extent_rows_roundtrip_reclaim_and_verify() {
+    let path = std::env::temp_dir()
+        .join("mpedb-engine-tests")
+        .join(format!("extents-{}.mpedb", std::process::id()));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        r#"
+[database]
+path = "{}"
+size_mb = 16
+max_readers = 8
+
+[[table]]
+name = "blobs"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+
+  [[table.column]]
+  name = "data"
+  type = "blob"
+"#,
+        path.display()
+    );
+    let cfg = Config::from_toml_str(&toml).unwrap();
+    let mut eng = Engine::open(&cfg, vec![vec![]]).unwrap();
+    eng.set_extent_threshold(Some(4096));
+
+    let blob = |seed: u8, len: usize| -> Vec<u8> {
+        (0..len).map(|i| seed.wrapping_add(i as u8)).collect()
+    };
+    let row = |id: i64, b: &[u8]| vec![Value::Int(id), Value::Blob(b.to_vec())];
+
+    // 1. Insert a mix: extent-sized and inline-sized.
+    {
+        let mut w = eng.begin_write().unwrap();
+        for id in 0..12i64 {
+            let len = if id % 3 == 0 { 64 } else { 5000 + id as usize * 977 };
+            w.insert_row(0, &row(id, &blob(id as u8, len))).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    eng.verify_page_accounting().unwrap();
+
+    // 2. Read back byte-exact.
+    {
+        let r = eng.begin_read().unwrap();
+        for id in 0..12i64 {
+            let len = if id % 3 == 0 { 64 } else { 5000 + id as usize * 977 };
+            let got = r.get_by_pk(0, &[Value::Int(id)]).unwrap().unwrap();
+            assert_eq!(got[1], Value::Blob(blob(id as u8, len)), "id {id}");
+        }
+    }
+
+    // 3. Update churn: extent→extent (grow), extent→inline (shrink — must
+    //    free the run), inline→extent.
+    {
+        let mut w = eng.begin_write().unwrap();
+        w.update_by_pk(0, &row(1, &blob(0xA1, 30_000))).unwrap();
+        w.update_by_pk(0, &row(2, &blob(0xA2, 50))).unwrap();
+        w.update_by_pk(0, &row(3, &blob(0xA3, 9_000))).unwrap();
+        w.commit().unwrap();
+    }
+    eng.verify_page_accounting().unwrap();
+
+    // 4. Delete half; freed runs enter the freelist and must be drawn again
+    //    (reuse) by a later big insert once no pin holds them.
+    {
+        let mut w = eng.begin_write().unwrap();
+        for id in (0..12i64).step_by(2) {
+            assert!(w.delete_by_pk(0, &[Value::Int(id)]).unwrap());
+        }
+        w.commit().unwrap();
+    }
+    eng.verify_page_accounting().unwrap();
+    {
+        let mut w = eng.begin_write().unwrap();
+        for id in 100..106i64 {
+            w.insert_row(0, &row(id, &blob(id as u8, 8_000))).unwrap();
+        }
+        w.commit().unwrap();
+    }
+    eng.verify_page_accounting().unwrap();
+
+    // 5. Same-txn alloc→free→realloc (the attribution rule's regression):
+    //    insert big, delete it, insert big again — all in ONE txn.
+    {
+        let mut w = eng.begin_write().unwrap();
+        w.insert_row(0, &row(200, &blob(0xC8, 20_000))).unwrap();
+        assert!(w.delete_by_pk(0, &[Value::Int(200)]).unwrap());
+        w.insert_row(0, &row(201, &blob(0xC9, 20_000))).unwrap();
+        w.commit().unwrap();
+    }
+    eng.verify_page_accounting().unwrap();
+
+    // 6. Fresh attach: the extent map root survives the meta, values intact.
+    drop(eng);
+    let eng2 = Engine::open(&cfg, vec![vec![]]).unwrap();
+    {
+        let r = eng2.begin_read().unwrap();
+        let got = r.get_by_pk(0, &[Value::Int(1)]).unwrap().unwrap();
+        assert_eq!(got[1], Value::Blob(blob(0xA1, 30_000)));
+        let got = r.get_by_pk(0, &[Value::Int(201)]).unwrap().unwrap();
+        assert_eq!(got[1], Value::Blob(blob(0xC9, 20_000)));
+        assert!(r.get_by_pk(0, &[Value::Int(200)]).unwrap().is_none());
+    }
+    eng2.verify_page_accounting().unwrap();
+    let _ = std::fs::remove_file(&path);
+}

@@ -85,6 +85,28 @@ pub struct WriteTxn<'e> {
     /// snapshots lose updates and hand out live pages (double allocation,
     /// "double free"/"listed twice" corruption seen in multi-process stress).
     pub(super) in_freelist_op: bool,
+    // ---- extents (DESIGN-BLOBEXTENT) ----
+    /// Private run pool, sorted by start, with per-run provenance.
+    pub(super) run_pool: Vec<extent::PoolRun>,
+    /// Drawn kind-1 freelist entries (left in the tree; struck out at commit
+    /// for what was consumed — write-back = pool runs still attributed).
+    pub(super) taken_runs: Vec<extent::TakenRunEntry>,
+    /// Committed extents freed by this txn — the commit's OWN kind-1 set.
+    pub(super) freed_runs: Vec<(u64, u32)>,
+    /// Runs allocated by THIS txn (start -> npages): a free of one of these
+    /// returns to the pool with `from: None` (the attribution rule), never
+    /// to `freed_runs` and never to a drawn entry's write-back.
+    pub(super) allocated_runs: std::collections::HashMap<u64, u32>,
+    /// Extent-map edits in CHRONOLOGICAL order, applied in ONE place at
+    /// commit (never from inside a data-tree operation — no nested tree
+    /// mutation). Order matters: a same-txn alloc→free→realloc touches the
+    /// same start three times, and grouping inserts before deletes would
+    /// leave the final state wrong.
+    pub(super) pending_map_edits: Vec<super::extent::MapEdit>,
+    /// Runs pwritten this txn — commit's range-sync list. On Linux these
+    /// msyncs ARE the pre-flip durability (the barrier is a no-op there).
+    pub(super) extent_dirty: Vec<(u64, u32)>,
+
     /// Robust-mutex recovery ran when this txn acquired the lock.
     pub recovered: bool,
     pub(super) finished: bool,
@@ -274,7 +296,15 @@ impl<'e> WriteTxn<'e> {
         // this box cannot resolve a few percent without ~50 paired runs.
         let __t = std::time::Instant::now();
         let types = &self.eng.col_types[table_id as usize];
-        let spills = row::encoded_len(values, types) > btree::MAX_INLINE_VAL;
+        let encoded_len = row::encoded_len(values, types);
+        let spills = encoded_len > btree::MAX_INLINE_VAL;
+        // DESIGN-BLOBEXTENT §4: a row whose payload exceeds the threshold is
+        // pwritten into a run FIRST — payload before reference — and the tree
+        // gets the 20-byte vkind=2 cell instead of an overflow chain.
+        let as_extent = self
+            .eng
+            .extent_threshold
+            .is_some_and(|t| encoded_len > t);
         let flat = if spills { None } else { Some(row::encode_row(values, types)?) };
         let parts = if spills {
             Some(row::encode_row_parts(values, types)?)
@@ -287,9 +317,36 @@ impl<'e> WriteTxn<'e> {
                 .collect(),
             None => Vec::new(),
         };
-        let mut payload = match &flat {
-            Some(b) => btree::Payload::Flat(b),
-            None => btree::Payload::Parts(&pieces),
+        // The extent path writes the payload NOW (pwrite through the file,
+        // range-synced at commit) and hands the tree only the reference.
+        // A crash before commit publishes nothing: the run allocation lives
+        // in this txn's private pool/high-water and dies with it.
+        let extent_ref = if as_extent {
+            let total_len = encoded_len as u64;
+            let npages = u32::try_from(total_len.div_ceil(PAGE_SIZE as u64))
+                .map_err(|_| Error::Unsupported("value too large for one extent".into()))?;
+            let start_page = self.alloc_run(npages)?;
+            leakstat::add(&leakstat::EXTENT_ALLOC_PAGES, u64::from(npages));
+            match (&flat, &parts) {
+                (Some(b), _) => {
+                    self.write_extent_payload(start_page, npages, &[b.as_slice()], total_len)?
+                }
+                (None, Some(_)) => {
+                    self.write_extent_payload(start_page, npages, &pieces, total_len)?
+                }
+                (None, None) => unreachable!("payload has exactly one form"),
+            }
+            self.pending_map_edits.push(extent::MapEdit::Insert(start_page, npages));
+            Some((start_page, total_len, npages))
+        } else {
+            None
+        };
+        let mut payload = match (extent_ref, &flat) {
+            (Some((start_page, total_len, npages)), _) => {
+                btree::Payload::ExtentRef { start_page, total_len, npages }
+            }
+            (None, Some(b)) => btree::Payload::Flat(b),
+            (None, None) => btree::Payload::Parts(&pieces),
         };
         leakstat::add(&leakstat::INS_NS_ENCODE, __t.elapsed().as_nanos() as u64);
 
@@ -432,7 +489,27 @@ impl<'e> WriteTxn<'e> {
         }
 
         let payload = row::encode_row(new_values, &self.eng.col_types[table_id as usize])?;
-        let out = btree::insert(self, root, &key, &mut btree::Payload::Flat(&payload), InsertMode::Upsert)?;
+        // The threshold applies to updates exactly as to inserts; the upsert
+        // frees the OLD value's chain/run through `free_old_val` either way.
+        let extent_ref = if self.eng.extent_threshold.is_some_and(|t| payload.len() > t) {
+            let total_len = payload.len() as u64;
+            let npages = u32::try_from(total_len.div_ceil(PAGE_SIZE as u64))
+                .map_err(|_| Error::Unsupported("value too large for one extent".into()))?;
+            let start_page = self.alloc_run(npages)?;
+            leakstat::add(&leakstat::EXTENT_ALLOC_PAGES, u64::from(npages));
+            self.write_extent_payload(start_page, npages, &[payload.as_slice()], total_len)?;
+            self.pending_map_edits.push(extent::MapEdit::Insert(start_page, npages));
+            Some((start_page, total_len, npages))
+        } else {
+            None
+        };
+        let mut up = match extent_ref {
+            Some((start_page, total_len, npages)) => {
+                btree::Payload::ExtentRef { start_page, total_len, npages }
+            }
+            None => btree::Payload::Flat(&payload),
+        };
+        let out = btree::insert(self, root, &key, &mut up, InsertMode::Upsert)?;
         self.set_tree_root(table_id, 0, out.new_root, count);
 
         for (i, &col) in sec.iter().enumerate() {

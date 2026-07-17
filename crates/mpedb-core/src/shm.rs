@@ -678,6 +678,19 @@ impl Shm {
     /// Read-only view of a page. Caller contract (MVCC): the page must be
     /// immutable for the borrow's duration — either committed and pinned, or
     /// dirty and owned by the calling writer.
+    /// A bounds-checked byte slice of the mapping spanning pages — the extent
+    /// read path (DESIGN-BLOBEXTENT §5). The caller proved the run's geometry;
+    /// this only guards the mapping's edge.
+    pub fn bytes(&self, offset: usize, len: usize) -> Result<&[u8]> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::Corrupt("byte range overflow".into()))?;
+        if end > self.page_count as usize * PAGE_SIZE {
+            return Err(Error::Corrupt("byte range beyond the mapping".into()));
+        }
+        Ok(unsafe { std::slice::from_raw_parts(self.at(offset), len) })
+    }
+
     pub fn page(&self, id: u64) -> Result<&[u8]> {
         if id >= self.page_count {
             return Err(Error::Corrupt(format!("page id {id} out of bounds")));
@@ -1125,6 +1138,17 @@ impl Shm {
     /// commit path is that caller and the only one — a commit's dirty pages are
     /// scattered (a btree path, a freelist path), and barriering each contiguous
     /// run cost one platter flush per run.
+    /// `pwrite` into the main file — the extent payload path
+    /// (DESIGN-BLOBEXTENT commitment 6): bytes reach the unified page cache
+    /// without faulting mapping pages, and a later `msync` of the same range
+    /// makes them durable exactly like mapping stores.
+    pub fn file_write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file
+            .write_all_at(buf, offset)
+            .map_err(|_| io_err("pwrite(extent)"))
+    }
+
     pub fn msync_range_nobarrier(&self, offset: usize, len: usize) -> Result<()> {
         // msync requires the base address aligned to the OS page size. On Linux
         // that is PAGE_SIZE (4096); on Apple Silicon it is 16 KiB — larger than a
