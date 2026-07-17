@@ -26,7 +26,7 @@
 use std::path::{Path, PathBuf};
 
 use mpedb_sqlitefmt as fmtx;
-use mpedb_sqlitefmt::lock::{hot_journal, SharedLock};
+use mpedb_sqlitefmt::lock::{hot_journal, BracketOutcome, ReadBracket, SharedLock};
 use mpedb_sqlitefmt::stamp::{settle_and_read, BaseStamp};
 use mpedb_types::{ColumnType, Config, Error, Result, Schema, Value};
 
@@ -44,15 +44,40 @@ const MARKER_TABLE: &str = "_mpedb_overlay_state";
 /// commits (and frees) before the next allocates.
 const TRUNCATE_BATCH: usize = 512;
 
+/// How the base is held between statements — design §2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockMode {
+    /// Default: this handle holds sqlite's own SHARED for its lifetime.
+    /// Foreign writers get `SQLITE_BUSY`; the fast path needs zero
+    /// validation; mpedb's full snapshot contract holds.
+    Locked,
+    /// No standing lock: a transient SHARED bracket per STATEMENT (busy →
+    /// bounded backoff, never divergence [R#19]; hot journal → named
+    /// refusal), with the settled stamp compared under the bracket. Foreign
+    /// writers run freely between our statements; a moved base with an
+    /// EMPTY overlay is adopted in place, with unpushed deltas it refuses
+    /// by name. Base-side isolation weakens to per-statement [R#12] — an
+    /// application needing the full snapshot contract uses `Locked`.
+    Optimistic,
+    /// Cooperative window for bulk foreign rewrites: no lock, and every
+    /// base fall-through refused by name — statements resolvable entirely
+    /// in the overlay (point reads/updates of overlay-resident rows) still
+    /// work. Checkpoint refuses; reopen in another mode ends the window.
+    Offline,
+}
+
 pub struct SqliteOverlay {
     attach: SqliteAttach,
     db: Database,
-    /// LOCKED mode: held for the overlay's lifetime, so the base provably
-    /// cannot move under the merge. `None` after a checkpoint failed to
-    /// re-take it (or detected divergence) — the handle then refuses
-    /// queries by name until reopened.
+    mode: LockMode,
+    /// LOCKED: held for the handle's lifetime, so the base provably cannot
+    /// move under the merge (`None` after a checkpoint failed to re-take it
+    /// — the handle then refuses queries by name until reopened). Other
+    /// modes: always `None` between statements.
     lock: Option<SharedLock>,
-    #[cfg_attr(not(feature = "sqlite-checkpoint"), allow(dead_code))]
+    /// The settled stamp the deltas are valid against — mirrors the stored
+    /// record; compared per statement in OPTIMISTIC.
+    expected: BaseStamp,
     base: PathBuf,
     /// Per user-visible table: the PK column index (single int64 in every
     /// attachable shape; same index in user rows and overlay rows, since
@@ -170,6 +195,14 @@ fn oerr(e: fmtx::Error) -> Error {
 impl SqliteOverlay {
     /// Open the base in LOCKED mode with its delta overlay beside it.
     pub fn open(base: &Path) -> Result<SqliteOverlay> {
+        Self::open_with_mode(base, LockMode::Locked)
+    }
+
+    /// Open with an explicit lock mode. Every mode takes ONE transient
+    /// SHARED here — attach snapshot, stamp validation/settling, and
+    /// recovery all need the base provably quiescent once — and then keeps
+    /// it only in `Locked`.
+    pub fn open_with_mode(base: &Path, mode: LockMode) -> Result<SqliteOverlay> {
         let Some(lock) = SharedLock::acquire(base).map_err(oerr)? else {
             return Err(Error::Unsupported(
                 "the sqlite database is busy (a writer is draining readers) — retry".into(),
@@ -224,10 +257,16 @@ impl SqliteOverlay {
             db.sys_record_put(STAMP_NS, EPOCH_KEY, &1u64.to_le_bytes())?;
             db
         };
+        let expected = decode_stamp(
+            &db.sys_record_get(STAMP_NS, STAMP_KEY)?
+                .ok_or_else(|| Error::Corrupt("overlay has no stored base-stamp".into()))?,
+        )?;
         Ok(SqliteOverlay {
             attach,
             db,
-            lock: Some(lock),
+            mode,
+            lock: (mode == LockMode::Locked).then_some(lock),
+            expected,
             base: base.to_path_buf(),
             pk_idx,
         })
@@ -256,11 +295,12 @@ impl SqliteOverlay {
         read_epoch(&self.db)
     }
 
-    /// Compile + run one statement over the MERGED view. Reads run on an
-    /// overlay read transaction (lock-free); writes run in one overlay write
-    /// transaction, committed only on success.
-    pub fn query(&self, sql: &str, params: &[Value]) -> Result<ExecResult> {
-        self.ensure_locked()?;
+    /// Compile + run one statement over the MERGED view, under the mode's
+    /// base discipline. Reads run on an overlay read transaction
+    /// (lock-free); writes run in one overlay write transaction, committed
+    /// only on success. `&mut self` because OPTIMISTIC may adopt a moved
+    /// base in place (fresh attach snapshot + stamp).
+    pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<ExecResult> {
         let (plan, is_explain) = mpedb_sql::prepare_maybe_explain(sql, self.attach.schema())?;
         if is_explain {
             return Ok(ExecResult::Rows {
@@ -272,22 +312,118 @@ impl SqliteOverlay {
                     .collect(),
             });
         }
+        match self.mode {
+            LockMode::Locked => {
+                self.ensure_locked()?;
+                self.exec_plan(&plan, params, true)
+            }
+            LockMode::Offline => self.exec_plan(&plan, params, false),
+            LockMode::Optimistic => {
+                // The §2 bracket: results buffer inside exec and are only
+                // returned after the bracket closes — nothing streams out
+                // of an unvalidated read.
+                let bracket = self.open_bracket()?;
+                let result = self.exec_plan(&plan, params, true);
+                drop(bracket);
+                result
+            }
+        }
+    }
+
+    /// The OPTIMISTIC per-statement bracket: transient SHARED with bounded
+    /// busy-backoff (busy is a WRITER, never divergence [R#19]), hot-journal
+    /// refusal by name, and the stamp compared UNDER the bracket. A moved
+    /// base adopts in place when the overlay is empty; with unpushed deltas
+    /// it refuses (reconcile is post-v2).
+    fn open_bracket(&mut self) -> Result<ReadBracket> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match ReadBracket::open(&self.base).map_err(oerr)? {
+                BracketOutcome::Busy => {
+                    if std::time::Instant::now() > deadline {
+                        return Err(Error::Unsupported(
+                            "base busy: a sqlite writer held the base for the whole 2s \
+                             backoff window — retry the statement"
+                                .into(),
+                        ));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                BracketOutcome::HotJournal => {
+                    return Err(Error::Unsupported(format!(
+                        "hot journal beside {} — a crashed sqlite writer left it; run \
+                         `sqlite3 {} 'SELECT 1'` once so sqlite's own recovery rolls it \
+                         back",
+                        self.base.display(),
+                        self.base.display()
+                    )));
+                }
+                BracketOutcome::Held(b) => {
+                    if b.stamp_matches(&self.expected).map_err(oerr)? {
+                        return Ok(b);
+                    }
+                    let deltas = snapshot_deltas(&self.db, self.pk_idx.len())?;
+                    if !deltas.iter().all(|t| t.is_empty()) {
+                        return Err(Error::Unsupported(format!(
+                            "the base {} changed under this overlay's unpushed deltas — \
+                             checkpoint from a fresh handle or discard the overlay \
+                             (reconcile is not built yet)",
+                            self.base.display()
+                        )));
+                    }
+                    // Empty overlay: nothing was captured against the old
+                    // base — adopt the new one under this bracket's SHARED.
+                    let stamp =
+                        settle_and_read(&self.base, &scratch_path(&self.base)).map_err(oerr)?;
+                    let _ = std::fs::remove_file(scratch_path(&self.base));
+                    let fresh = SqliteAttach::open(&self.base)?;
+                    if fresh.schema() != self.attach.schema() {
+                        return Err(Error::Unsupported(
+                            "foreign DDL changed the base's schema — reopen to re-derive \
+                             the attach (plans and table ids shift)"
+                                .into(),
+                        ));
+                    }
+                    self.db.sys_record_put(STAMP_NS, STAMP_KEY, &encode_stamp(&stamp))?;
+                    self.attach = fresh;
+                    self.expected = stamp;
+                    return Ok(b);
+                }
+            }
+        }
+    }
+
+    fn exec_plan(
+        &self,
+        plan: &mpedb_sql::CompiledPlan,
+        params: &[Value],
+        base_ok: bool,
+    ) -> Result<ExecResult> {
         let mut partial = false;
         if plan.footprint.read_only {
             let r = self.db.engine.begin_read()?;
             let result = {
                 let mut octx = ReadCtx(&r);
-                let mut ctx =
-                    MergeCtx { ovl: &mut octx, at: &self.attach, pk_idx: &self.pk_idx };
-                exec_stmt(&mut ctx, self.attach.schema(), &plan, params, &mut partial)
+                let mut ctx = MergeCtx {
+                    ovl: &mut octx,
+                    at: &self.attach,
+                    pk_idx: &self.pk_idx,
+                    base_ok,
+                };
+                exec_stmt(&mut ctx, self.attach.schema(), plan, params, &mut partial)
             };
             r.finish()?;
             result
         } else {
             let mut w = self.db.engine.begin_write()?;
             let result = {
-                let mut ctx = MergeCtx { ovl: &mut w, at: &self.attach, pk_idx: &self.pk_idx };
-                exec_stmt(&mut ctx, self.attach.schema(), &plan, params, &mut partial)
+                let mut ctx = MergeCtx {
+                    ovl: &mut w,
+                    at: &self.attach,
+                    pk_idx: &self.pk_idx,
+                    base_ok,
+                };
+                exec_stmt(&mut ctx, self.attach.schema(), plan, params, &mut partial)
             };
             match result {
                 Ok(r) => {
@@ -310,6 +446,22 @@ struct MergeCtx<'a> {
     ovl: &'a mut dyn TxnCtx,
     at: &'a SqliteAttach,
     pk_idx: &'a [usize],
+    /// UNLOCKED-OFFLINE (§2): `false` refuses every base fall-through by
+    /// name — overlay-resident answers still serve.
+    base_ok: bool,
+}
+
+impl MergeCtx<'_> {
+    fn base_gate(&self) -> Result<()> {
+        if !self.base_ok {
+            return Err(Error::Unsupported(
+                "base is unlocked-offline: this statement needs the base (a scan or a \
+                 fall-through miss) — reopen in locked/optimistic mode"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 fn is_dead(row: &[Value]) -> bool {
@@ -344,6 +496,7 @@ impl TxnCtx for MergeCtx<'_> {
         if let Some(row) = self.ovl.get_by_pk(table, pk)? {
             return Ok(if is_dead(&row) { None } else { Some(strip(row)) });
         }
+        self.base_gate()?;
         self.at.base_get_by_pk(table, pk)
     }
 
@@ -369,6 +522,7 @@ impl TxnCtx for MergeCtx<'_> {
         lo: Option<(&[u8], bool)>,
         hi: Option<(&[u8], bool)>,
     ) -> Result<Vec<Vec<Value>>> {
+        self.base_gate()?;
         // Both streams arrive PK-ascending (mpedb scans are key-ordered; the
         // attach serves every shape in key order): a two-pointer merge where
         // the overlay wins ties and tombstones emit nothing.
@@ -619,7 +773,17 @@ impl SqliteOverlay {
     /// (co-attaching the same overlay from another process during a
     /// checkpoint is outside v2's contract).
     pub fn checkpoint(&mut self) -> Result<CheckpointReport> {
-        self.ensure_locked()?;
+        match self.mode {
+            LockMode::Locked => self.ensure_locked()?,
+            LockMode::Optimistic => {}
+            LockMode::Offline => {
+                return Err(Error::Unsupported(
+                    "checkpoint writes the base — refuse in unlocked-offline mode; \
+                     reopen in locked/optimistic mode first"
+                        .into(),
+                ))
+            }
+        }
         let epoch = self.epoch()?;
         let deltas = snapshot_deltas(&self.db, self.pk_idx.len())?;
         if deltas.iter().all(|t| t.is_empty()) {
@@ -657,7 +821,10 @@ impl SqliteOverlay {
                 self.attach = fresh;
                 truncate_deltas(&self.db, &deltas, &self.pk_idx)?;
                 self.db.sys_record_put(STAMP_NS, EPOCH_KEY, &(epoch + 1).to_le_bytes())?;
-                self.lock = Some(lock);
+                self.expected = stamp;
+                if self.mode == LockMode::Locked {
+                    self.lock = Some(lock);
+                }
                 Ok(CheckpointReport { upserts, deletes, epoch })
             }
             (Ok(PushOutcome::Done { .. }), Err(e)) => Err(Error::Unsupported(format!(
@@ -677,7 +844,9 @@ impl SqliteOverlay {
                 // IO-class push failure: BEGIN IMMEDIATE rolled back, the
                 // base is untouched, our stamp still matches — re-arm and
                 // keep serving.
-                self.lock = Some(lock);
+                if self.mode == LockMode::Locked {
+                    self.lock = Some(lock);
+                }
                 Err(e)
             }
             (Err(e), Err(_)) => Err(e),

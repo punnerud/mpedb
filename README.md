@@ -50,12 +50,17 @@ In short:
 **`mpedb data.db`** opens it exactly like `sqlite3 data.db` does (repl or
 one-shot statement) — a `.mpedb` sidecar mirrors it, pulls incrementally on
 every open, and **`mpedb checkpoint data.db`** pushes your writes back into
-the sqlite file for every other tool to see. There is also a **native sqlite
-reader** (`mpedb-sqlitefmt`, no sqlite library in the path, differentially
-verified against it): `mpedb dump data.db` inspects a `.db` directly, and
-`mpedb::SqliteAttach` runs read-only mpedb SQL over one with **zero import**.
-The full design — the `.db` as durable home, the `.mpedb` as its delta-WAL
-with lock modes and checkpoints — survived a 20-finding adversarial review in
+the sqlite file for every other tool to see. **`mpedb data.db --overlay`**
+is the true delta-WAL: only your changes live in the overlay file
+(tombstones included), unchanged data reads straight from the `.db` through
+the **native sqlite reader** (`mpedb-sqlitefmt`, no sqlite library in the
+path, differentially verified against it), and `mpedb checkpoint data.db
+--overlay` folds the deltas in and empties the overlay — with three lock
+modes (`locked` speaks sqlite's own byte-range locks, `optimistic` takes a
+µs-bracket per statement so foreign sqlite writers interleave freely,
+`offline` for cooperative windows). `mpedb dump data.db` inspects a `.db`
+directly, and `mpedb::SqliteAttach` runs read-only mpedb SQL over one with
+**zero import**. The full design survived a 20-finding adversarial review in
 [`DESIGN-SQLITE-BACKED.md`](DESIGN-SQLITE-BACKED.md).
 
 **What it is not: a drop-in sqlite3.** Be clear-eyed about this before you plan
