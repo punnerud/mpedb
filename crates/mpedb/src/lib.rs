@@ -118,6 +118,38 @@ impl<R: std::io::Read> mpedb_core::btree::BlobSource for ReaderBlobSource<R> {
     }
 }
 
+/// A FILE as a blob source: `next_into` reads at its own cursor (pread —
+/// never the fd's seek position), and `as_file` hands the engine the file so
+/// the extent import can take the kernel-side `copy_file_range` fast path
+/// (#50). The two views agree by construction: both start at offset 0 over
+/// the same bytes, and the engine uses exactly one of them per insert.
+pub struct FileBlobSource {
+    file: std::fs::File,
+    len: usize,
+    pos: u64,
+}
+
+impl FileBlobSource {
+    pub fn new(file: std::fs::File, len: usize) -> Self {
+        FileBlobSource { file, len, pos: 0 }
+    }
+}
+
+impl mpedb_core::btree::BlobSource for FileBlobSource {
+    fn len(&self) -> usize {
+        self.len
+    }
+    fn next_into(&mut self, buf: &mut [u8]) -> Result<()> {
+        use std::os::unix::fs::FileExt;
+        self.file.read_exact_at(buf, self.pos)?;
+        self.pos += buf.len() as u64;
+        Ok(())
+    }
+    fn as_file(&self) -> Option<&std::fs::File> {
+        Some(&self.file)
+    }
+}
+
 /// A **detached (client-borne) plan**: the compiled plan the SDK/client
 /// carries itself instead of leaving in the shared registry (Morten's idea,
 /// DESIGN.md §7.2 turned inside-out). Shipping `(blob + hash + sql)` between
@@ -1043,7 +1075,9 @@ impl WriteSession<'_> {
     ) -> Result<()> {
         let file = std::fs::File::open(path)?;
         let len = file.metadata()?.len() as usize;
-        let mut src = ReaderBlobSource::new(file, len);
+        // FileBlobSource, not ReaderBlobSource: the file handle is what lets
+        // the extent path bulk-copy kernel-side (copy_file_range, #50).
+        let mut src = FileBlobSource::new(file, len);
         self.insert_streaming(table, values, stream_col, &mut src)
     }
 

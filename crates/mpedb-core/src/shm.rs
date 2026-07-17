@@ -1179,6 +1179,63 @@ impl Shm {
             .map_err(|_| io_err("pwrite(extent)"))
     }
 
+    /// Kernel-side bulk copy from `src` into this database file — the extent
+    /// import fast path (#50: measured +70% over the read/pwrite loop on
+    /// ext4, because the destination's pages are never faulted through
+    /// userspace). Returns `Ok(false)` when the kernel/filesystem cannot
+    /// (non-Linux, EXDEV, EOPNOTSUPP, or any partial-progress error after
+    /// which the CALLER falls back to pwrite FROM `src_off + copied` — the
+    /// returned count makes that resumable). The copied range dirties the
+    /// shared page cache exactly as pwrite does, so the existing
+    /// `extent_dirty` msync discipline covers its durability (the
+    /// powerloss-simulation-proven path); a pure-metadata FICLONERANGE clone
+    /// would NOT be covered, which is one of the two reasons it waits for
+    /// the vkind=3 format window (the other is body alignment).
+    pub fn file_copy_range_from(
+        &self,
+        src: &std::fs::File,
+        src_off: u64,
+        dst_off: u64,
+        len: u64,
+    ) -> Result<u64> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::io::AsRawFd;
+            // The kernel updates these in place; a cast-temporary here would
+            // silently discard the progress and loop on the same offsets.
+            let mut so = src_off as i64;
+            let mut dofs = dst_off as i64;
+            let mut left = len;
+            while left > 0 {
+                let n = unsafe {
+                    libc::copy_file_range(
+                        src.as_raw_fd(),
+                        &mut so,
+                        self.file.as_raw_fd(),
+                        &mut dofs,
+                        left as usize,
+                        0,
+                    )
+                };
+                // ≤ 0 = error (EXDEV/EOPNOTSUPP/…) or source EOF before
+                // `len` (caller declared more bytes than the file holds —
+                // its short-read error path owns the message). Either way:
+                // report progress, the caller resumes with pwrite.
+                if n <= 0 {
+                    return Ok(len - left);
+                }
+                left -= n as u64;
+            }
+            let _ = (src_off, dst_off);
+            Ok(len)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (src, src_off, dst_off, len);
+            Ok(0)
+        }
+    }
+
     pub fn msync_range_nobarrier(&self, offset: usize, len: usize) -> Result<()> {
         // msync requires the base address aligned to the OS page size. On Linux
         // that is PAGE_SIZE (4096); on Apple Silicon it is 16 KiB — larger than a
