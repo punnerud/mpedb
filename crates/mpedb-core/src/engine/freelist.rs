@@ -139,10 +139,10 @@ impl<'e> WriteTxn<'e> {
     ///    it from the high-water mark, or out of an entry it then drew dry, and
     ///    freed it again — nothing else records it, so omitting it would leak
     ///    it outright).
-    pub(super) fn freelist_plan(&self, new_txn: u64, written: &[([u8; 10], Vec<u64>)]) -> Vec<([u8; 10], Vec<u64>)> {
+    pub(super) fn freelist_plan(&self, new_txn: u64, written: &[([u8; 11], Vec<u64>)]) -> Vec<([u8; 11], Vec<u64>)> {
         // `reusable` is sorted (see `free`/`refill_reusable`), so "is this page
         // still free?" is a binary search — no per-pass set to build.
-        let mut out: Vec<([u8; 10], Vec<u64>)> = Vec::with_capacity(self.taken.len() + 1);
+        let mut out: Vec<([u8; 11], Vec<u64>)> = Vec::with_capacity(self.taken.len() + 1);
         for e in &self.taken {
             let kept: Vec<u64> = e
                 .ids
@@ -177,7 +177,7 @@ impl<'e> WriteTxn<'e> {
         own.sort_unstable();
         debug_assert!(own.windows(2).all(|w| w[0] < w[1]), "own must be strictly ascending");
         for (i, chunk) in own.chunks(FREELIST_CHUNK_PAGES).enumerate() {
-            out.push((freelist_key(new_txn, i as u16), chunk.to_vec()));
+            out.push((freelist_key(new_txn, FK_PAGES, i as u16), chunk.to_vec()));
         }
         out
     }
@@ -213,8 +213,19 @@ impl<'e> WriteTxn<'e> {
             leakstat::bump(&leakstat::REFILL_NO_TREE);
             return Ok(false);
         };
-        if key.len() != 10 || val.len() % 8 != 0 {
+        if key.len() != 11 || val.len() % 8 != 0 {
             return Err(Error::Corrupt("bad freelist entry".into()));
+        }
+        // Run entries (FK_RUNS) join the draw path with the extent allocator
+        // (DESIGN-BLOBEXTENT §3.3); until then nothing writes them, so one in
+        // the tree is corruption, not a version skew.
+        if key[8] != FK_RUNS && key[8] != FK_PAGES {
+            return Err(Error::Corrupt("bad freelist entry kind".into()));
+        }
+        if key[8] == FK_RUNS {
+            return Err(Error::Corrupt(
+                "run freelist entry before the extent allocator exists".into(),
+            ));
         }
         let freed_txn = u64::from_be_bytes(key[..8].try_into().unwrap());
         // Pages freed BY commit T are referenced only by snapshots < T (commit
@@ -260,7 +271,7 @@ impl<'e> WriteTxn<'e> {
         }
         leakstat::bump(&leakstat::REFILL_OK);
         leakstat::add(&leakstat::REFILL_PAGES, ids.len() as u64);
-        let key: [u8; 10] = key.try_into().expect("checked len == 10 above");
+        let key: [u8; 11] = key.try_into().expect("checked len == 11 above");
         self.reusable.extend(ids.iter().copied());
         self.reusable.sort_unstable();
         self.taken.push(TakenEntry { key, ids });
@@ -277,6 +288,6 @@ pub(super) struct TakenEntry {
     /// Freelist keys are always (txn BE, chunk BE) — exactly 10 bytes. Inline,
     /// not a `Vec`: the commit fixpoint rebuilds its plan on every pass, and a
     /// heap allocation per key per pass was a measurable slice of the write path.
-    key: [u8; 10],
+    key: [u8; 11],
     ids: Vec<u64>,
 }

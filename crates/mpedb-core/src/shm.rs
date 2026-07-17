@@ -17,7 +17,9 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 
-pub const FORMAT_VERSION: u32 = 2; // v2: intent-ring region between reader table and data
+pub const FORMAT_VERSION: u32 = 3; // v3: extent_map_root in the meta snapshot
+                                   //     (DESIGN-BLOBEXTENT §3.4); WAL3 trailer.
+                                   // v2: intent-ring region between reader table and data
 
 /// How many `trylock` attempts before the writer lock blocks. See
 /// [`Shm::writer_lock`] for why this exists and why it is small.
@@ -37,8 +39,9 @@ const M_TXN_ID: usize = 64; // AtomicU64
 const M_CATALOG_ROOT: usize = 72; // AtomicU64
 const M_FREELIST_ROOT: usize = 80; // AtomicU64
 const M_HIGH_WATER: usize = 88; // AtomicU64
-const M_CHECKSUM: usize = 96; // AtomicU64 (xxh3 of logical bytes 0..96)
-const META_LOGICAL_LEN: usize = 96;
+const M_EXTENT_MAP_ROOT: usize = 96; // AtomicU64 (v3, DESIGN-BLOBEXTENT §3.4)
+const M_CHECKSUM: usize = 104; // AtomicU64 (xxh3 of logical bytes 0..104)
+const META_LOGICAL_LEN: usize = 104;
 
 // ---- lock area field offsets (page 2) ----
 const LA_INIT_STATE: usize = 0; // AtomicU32: 0 empty, 1 formatting, 2 READY
@@ -160,14 +163,15 @@ fn durability_from_tag(t: u32) -> Option<Durability> {
 // (all fields little-endian):
 //
 // ```text
-//   0   magic        u32   WAL_MAGIC ("WAL2")
+//   0   magic        u32   WAL_MAGIC ("WAL3")
 //   4   txn_id       u64
 //  12   n_pages      u32
 //  16   rec_len      u32   total record length in bytes (header..=checksum)
 //  20   n_pages × page_entry (variable length — see below)
-//   +   catalog_root u64 ┐
-//   +   freelist_root u64 │ the commit's MetaSnapshot body
-//   +   high_water   u64 ┘
+//   +   catalog_root    u64 ┐
+//   +   freelist_root   u64 │ the commit's MetaSnapshot body — recovery
+//   +   high_water      u64 │ rebuilds the meta FROM THIS TRAILER, which is
+//   +   extent_map_root u64 ┘ why v3 had to bump the framing (BLOBEXTENT §3.4)
 //   +   checksum     u64   xxh3_64(file_offset LE ‖ record bytes 0..here)
 //
 //   page_entry:
@@ -192,9 +196,9 @@ fn durability_from_tag(t: u32) -> Option<Durability> {
 // page data (or left behind at a different offset). Recovery additionally
 // requires consecutive records to carry consecutive txn ids.
 
-pub const WAL_MAGIC: u32 = 0x324C_4157; // "WAL2" (lean-record framing)
-/// Fixed record overhead: magic + txn + n_pages + rec_len + 3 meta + checksum.
-pub const WAL_RECORD_FIXED: usize = 4 + 8 + 4 + 4 + 3 * 8 + 8;
+pub const WAL_MAGIC: u32 = 0x334C_4157; // "WAL3" (trailer carries extent_map_root)
+/// Fixed record overhead: magic + txn + n_pages + rec_len + 4 meta + checksum.
+pub const WAL_RECORD_FIXED: usize = 4 + 8 + 4 + 4 + 4 * 8 + 8;
 /// Bytes of a FULL page entry: page id + enc byte + page image. A SPLIT entry
 /// is always smaller; this is the per-page upper bound used to size the read
 /// buffer and to bound `rec_len` on decode.
@@ -204,7 +208,7 @@ const WAL_ENC_SPLIT: u8 = 1;
 /// Byte offset of the fixed 20-byte record header prefix (magic..rec_len).
 const WAL_HDR_LEN: usize = 4 + 8 + 4 + 4;
 /// The meta+checksum trailer after the last page entry.
-const WAL_TRAILER_LEN: usize = 3 * 8 + 8;
+const WAL_TRAILER_LEN: usize = 4 * 8 + 8;
 /// Checkpoint when this many un-checkpointed log bytes have accumulated.
 pub const WAL_CKPT_THRESHOLD_DEFAULT: u64 = 16 * 1024 * 1024;
 /// The log is preallocated (never sparse-appended) in chunks of this size.
@@ -289,6 +293,7 @@ pub struct WalRecord<'a> {
     pub catalog_root: u64,
     pub freelist_root: u64,
     pub high_water: u64,
+    pub extent_map_root: u64,
     /// Total encoded length in the log.
     pub len: u64,
 }
@@ -303,6 +308,7 @@ pub fn encode_wal_record(
     catalog_root: u64,
     freelist_root: u64,
     high_water: u64,
+    extent_map_root: u64,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(WAL_RECORD_FIXED + pages.len() * 256);
     buf.extend_from_slice(&WAL_MAGIC.to_le_bytes());
@@ -333,6 +339,7 @@ pub fn encode_wal_record(
     buf.extend_from_slice(&catalog_root.to_le_bytes());
     buf.extend_from_slice(&freelist_root.to_le_bytes());
     buf.extend_from_slice(&high_water.to_le_bytes());
+    buf.extend_from_slice(&extent_map_root.to_le_bytes());
     // rec_len includes the not-yet-appended 8-byte checksum, and is part of
     // the checksum preimage so a torn/altered length cannot validate.
     let rec_len = (buf.len() + 8) as u32;
@@ -420,6 +427,7 @@ pub fn decode_wal_record(buf: &[u8], offset: u64, page_count: u64) -> Option<Wal
         catalog_root: u64_at(pos)?,
         freelist_root: u64_at(pos + 8)?,
         high_water: u64_at(pos + 16)?,
+        extent_map_root: u64_at(pos + 24)?,
         len: rec_len as u64,
     })
 }
@@ -439,6 +447,8 @@ pub struct MetaSnapshot {
     pub catalog_root: u64,
     pub freelist_root: u64,
     pub high_water: u64,
+    /// Root of the extent map (DESIGN-BLOBEXTENT §3.2); 0 = empty tree.
+    pub extent_map_root: u64,
 }
 
 pub struct Shm {
@@ -709,6 +719,8 @@ impl Shm {
         buf[M_FREELIST_ROOT..M_FREELIST_ROOT + 8]
             .copy_from_slice(&s.freelist_root.to_le_bytes());
         buf[M_HIGH_WATER..M_HIGH_WATER + 8].copy_from_slice(&s.high_water.to_le_bytes());
+        buf[M_EXTENT_MAP_ROOT..M_EXTENT_MAP_ROOT + 8]
+            .copy_from_slice(&s.extent_map_root.to_le_bytes());
         buf
     }
 
@@ -726,6 +738,9 @@ impl Shm {
                 .atomic_u64(base + M_FREELIST_ROOT)
                 .load(Ordering::Relaxed),
             high_water: self.atomic_u64(base + M_HIGH_WATER).load(Ordering::Relaxed),
+            extent_map_root: self
+                .atomic_u64(base + M_EXTENT_MAP_ROOT)
+                .load(Ordering::Relaxed),
         };
         let expect = xxhash_rust::xxh3::xxh3_64(&self.meta_checksum_input(slot, &snap));
         // A torn read (fields from two different commits) fails the checksum
@@ -820,6 +835,8 @@ impl Shm {
             .store(s.freelist_root, Ordering::Relaxed);
         self.atomic_u64(base + M_HIGH_WATER)
             .store(s.high_water, Ordering::Relaxed);
+        self.atomic_u64(base + M_EXTENT_MAP_ROOT)
+            .store(s.extent_map_root, Ordering::Relaxed);
         let mut stamped = *s;
         stamped.slot = slot;
         let sum = xxhash_rust::xxh3::xxh3_64(&self.meta_checksum_input(slot, &stamped));
@@ -1257,6 +1274,7 @@ impl Shm {
             snap.catalog_root,
             snap.freelist_root,
             snap.high_water,
+            snap.extent_map_root,
         );
         self.wal_ensure_alloc(off + buf.len() as u64)?;
         wal.file.write_all_at(&buf, off)?;
@@ -1290,6 +1308,7 @@ impl Shm {
             snap.catalog_root,
             snap.freelist_root,
             snap.high_water,
+            snap.extent_map_root,
         );
         self.wal_ensure_alloc(off + buf.len() as u64)?;
         wal.file.write_all_at(&buf, off)?;
@@ -1467,6 +1486,7 @@ impl Shm {
                 catalog_root: rec.catalog_root,
                 freelist_root: rec.freelist_root,
                 high_water: rec.high_water,
+                extent_map_root: rec.extent_map_root,
             });
             off += rec.len;
         }
@@ -2059,6 +2079,7 @@ impl Shm {
             txn_id: 0,
             catalog_root: 0,
             freelist_root: 0,
+            extent_map_root: 0,
             high_water: data_start_page(max_readers),
         };
         self.write_meta_slot(META_PAGE_A, &genesis);
@@ -2313,6 +2334,7 @@ mod tests {
         let m0 = shm.newest_meta().unwrap();
         let mut next = MetaSnapshot {
             slot: 0,
+            extent_map_root: 0,
             txn_id: 1,
             catalog_root: 100,
             freelist_root: 101,
@@ -2336,6 +2358,7 @@ mod tests {
         let (shm, p) = open_test("corrupt-meta");
         let m0 = shm.newest_meta().unwrap();
         let next = MetaSnapshot {
+            extent_map_root: 0,
             txn_id: 1,
             ..m0
         };
@@ -2493,6 +2516,7 @@ mod tests {
         let prev = shm.newest_meta_ungated().unwrap();
         let snap = MetaSnapshot {
             slot: prev.slot,
+            extent_map_root: 0,
             txn_id: txn,
             catalog_root: page_id,
             freelist_root: 0,
@@ -2521,6 +2545,7 @@ mod tests {
         let prev = shm.newest_meta_ungated().unwrap();
         let snap = MetaSnapshot {
             slot: prev.slot,
+            extent_map_root: 0,
             txn_id: txn,
             catalog_root: page_id,
             freelist_root: 0,
@@ -2536,7 +2561,7 @@ mod tests {
     fn wal_record_roundtrip_and_offset_binding() {
         let page = vec![0xABu8; PAGE_SIZE];
         let pages: Vec<(u64, &[u8])> = vec![(17, &page), (99, &page)];
-        let rec = encode_wal_record(4096, 42, &pages, 7, 8, 9);
+        let rec = encode_wal_record(4096, 42, &pages, 7, 8, 9, 0);
         assert_eq!(rec.len(), WAL_RECORD_FIXED + 2 * WAL_PAGE_ENTRY);
 
         let d = decode_wal_record(&rec, 4096, 1024).expect("valid record must decode");
@@ -2595,7 +2620,7 @@ mod tests {
         page[16..18].copy_from_slice(&(cell_start as u16).to_le_bytes()); // slot 0
 
         let pages: Vec<(u64, &[u8])> = vec![(50, &page)];
-        let rec = encode_wal_record(0, 1, &pages, 0, 0, 0);
+        let rec = encode_wal_record(0, 1, &pages, 0, 0, 0, 0);
         // the lean record is a tiny fraction of a full-page record
         assert!(
             rec.len() < WAL_RECORD_FIXED + WAL_PAGE_ENTRY / 8,
@@ -2642,7 +2667,7 @@ mod tests {
         // bytes 16+payload.. stay 0xFF: a tail no replay may resurrect
 
         let pages: Vec<(u64, &[u8])> = vec![(50, &page)];
-        let rec = encode_wal_record(0, 1, &pages, 0, 0, 0);
+        let rec = encode_wal_record(0, 1, &pages, 0, 0, 0, 0);
         assert!(
             rec.len() < WAL_RECORD_FIXED + WAL_PAGE_ENTRY / 8,
             "a 100-byte overflow chunk should encode lean, got {}",
@@ -2681,6 +2706,7 @@ mod tests {
         shm.wal_ckpt().store(0, Ordering::Release);
         let genesis = MetaSnapshot {
             slot: 0,
+            extent_map_root: 0,
             txn_id: 0,
             catalog_root: 0,
             freelist_root: 0,
@@ -2805,7 +2831,7 @@ mod tests {
         let end1 = shm.wal_len().load(Ordering::Acquire);
 
         let img = vec![0x22u8; PAGE_SIZE];
-        let orphan = encode_wal_record(end1, 2, &[(pg, &img)], pg, 0, shm.data_start + 8);
+        let orphan = encode_wal_record(end1, 2, &[(pg, &img)], pg, 0, shm.data_start + 8, 0);
         let wal_f = OpenOptions::new().write(true).open(wal_path(&p)).unwrap();
         wal_f.write_all_at(&orphan, end1).unwrap();
 
@@ -2841,7 +2867,7 @@ mod tests {
         // hand-append a checksum-valid record with a NON-consecutive txn id:
         // the scan must treat it as the end of the valid prefix
         let img = vec![0x99u8; PAGE_SIZE];
-        let stray = encode_wal_record(end1, 5, &[(pg, &img)], pg, 0, shm.data_start + 8);
+        let stray = encode_wal_record(end1, 5, &[(pg, &img)], pg, 0, shm.data_start + 8, 0);
         let wal_f = OpenOptions::new().write(true).open(wal_path(&p)).unwrap();
         wal_f.write_all_at(&stray, end1).unwrap();
         shm.wal_len().store(0, Ordering::Release);
@@ -2963,6 +2989,7 @@ mod tests {
         shm.wal_appended().store(0, Ordering::Release);
         let genesis = MetaSnapshot {
             slot: 0,
+            extent_map_root: 0,
             txn_id: 0,
             catalog_root: 0,
             freelist_root: 0,

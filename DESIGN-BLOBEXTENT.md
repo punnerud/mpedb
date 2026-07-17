@@ -110,9 +110,11 @@ new corruption class the set-insert verifier cannot see **[R]**.
 There is no spare byte in today's `(txn u64 BE ‖ chunk u16 BE)` key **[R]**,
 so run entries get an explicit key form: `(txn u64 BE ‖ kind u8 ‖ chunk u16
 BE)` — 11 bytes, txn still first (the early-stop scan order survives), kind 0
-= page ids (existing 10-byte keys decode as kind 0 for compat within v3
-files), kind 1 = runs with values `(start_page u64 ‖ npages u32)` pairs,
-entries capped ≤ 960 B inline as today. **Every freelist parser learns the
+= page ids, kind 1 = runs with values `(start_page u64 ‖ npages u32)` pairs,
+entries capped ≤ 960 B inline as today. **All v3 keys are uniformly 11
+bytes** — v2 files hard-error at attach, so no v3 file can contain a 10-byte
+key and no dual parsing exists (build simplification over v1.0's compat
+note). **Every freelist parser learns the
 kind** — the review enumerated the sites: `refill_reusable`,
 `verify_page_accounting`, `freelist_shape`, `leak_counters`, and
 `freelist_plan`'s diffing **[R]**.
