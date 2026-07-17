@@ -589,7 +589,8 @@ fn extract_join_access(
     } else {
         let sec = secondary_indexes(inner);
         'passes: for unique_only in [true, false] {
-            for (pos, &col) in sec.iter().enumerate() {
+            for (pos, col) in sec.iter().enumerate() {
+                let Some(col) = *col else { continue }; // composite: #55
                 if pos >= 63 || inner.columns[col as usize].unique != unique_only {
                     continue;
                 }

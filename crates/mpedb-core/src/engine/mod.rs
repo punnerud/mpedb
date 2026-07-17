@@ -260,34 +260,32 @@ fn freelist_key(txn: u64, kind: u8, chunk: u16) -> [u8; 11] {
 /// convention (DESIGN.md §4.4): index 0 = PK tree; unique columns in
 /// declaration order get 1, 2, …; a column that is by itself the whole PK is
 /// skipped.
-/// The secondary-index B+tree key for value `v` of a row whose primary key
-/// encodes to `pk_key`. A UNIQUE index keys by the value alone; a non-unique one
-/// appends the pk so duplicate values become distinct, memcmp-ordered
-/// (value, pk) entries — and `encode_key` is a plain concatenation of
-/// `encode_value`, so this equals `encode_key([v, ...pk_values])`.
-fn index_ikey(unique: bool, v: &mpedb_types::Value, pk_key: &[u8]) -> Vec<u8> {
-    let mut k = keycode::encode_key(std::slice::from_ref(v));
+/// The secondary-index B+tree key for a row's indexed columns, or `None`
+/// when ANY indexed column is NULL — the membership rule (DESIGN-SCHEMA-V2
+/// §1.4): at k = 1 this is exactly the historical skip-if-NULL, and SQL
+/// uniqueness never treats NULLs as conflicting. A UNIQUE index keys by the
+/// values alone; a non-unique one appends the pk so duplicate values become
+/// distinct, memcmp-ordered entries. `encode_key` is a plain concatenation
+/// of `encode_value`, so the k = 1 output is byte-identical to the old
+/// single-value construction — existing index trees need no rebuild.
+fn index_row_key(
+    unique: bool,
+    cols: &[u16],
+    row: &[mpedb_types::Value],
+    pk_key: &[u8],
+) -> Option<Vec<u8>> {
+    let mut k = Vec::with_capacity(16 * cols.len() + pk_key.len());
+    for &c in cols {
+        let v = &row[c as usize];
+        if v.is_null() {
+            return None;
+        }
+        keycode::encode_value(&mut k, v);
+    }
     if !unique {
         k.extend_from_slice(pk_key);
     }
-    k
-}
-
-pub fn secondary_index_columns(table: &mpedb_types::TableDef) -> Vec<u16> {
-    table
-        .columns
-        .iter()
-        .enumerate()
-        .filter(|(i, c)| {
-            // A column with `unique` OR `indexed` is a secondary index. The PK's
-            // own single column is skipped — it already has index 0 (the PK
-            // tree). Both engine and SQL derive this identically, in
-            // column-declaration order, so index numbers agree (CLAUDE.md).
-            (c.unique || c.indexed)
-                && !(table.primary_key.len() == 1 && table.primary_key[0] == *i as u16)
-        })
-        .map(|(i, _)| i as u16)
-        .collect()
+    Some(k)
 }
 
 /// Per-column compiled CHECK programs, one entry per table (indexed like
@@ -299,7 +297,9 @@ pub struct Engine {
     shm: Arc<Shm>,
     schema: Schema,
     checks: CheckPrograms,
-    sec_indexes: Vec<Vec<u16>>,
+    /// Per table, per index (`index_no - 1`): the indexed column ordinals in
+    /// key order. Built from `TableDef.indexes` — the single source.
+    sec_indexes: Vec<Vec<Vec<u16>>>,
     /// Parallel to `sec_indexes`: is index `k` UNIQUE (value→pk, enforced) or a
     /// plain non-unique index (composite `(value‖pk)` key, duplicates allowed)?
     /// The storage form and whether an insert is uniqueness-checked both follow
@@ -347,13 +347,17 @@ impl Engine {
             &schema.hash(),
             &config.options.perms,
         )?;
-        let sec_indexes: Vec<Vec<u16>> =
-            schema.tables.iter().map(secondary_index_columns).collect();
+        // `TableDef.indexes` is the single source of index numbering
+        // (DESIGN-SCHEMA-V2) — no flag re-derivation anywhere.
+        let sec_indexes: Vec<Vec<Vec<u16>>> = schema
+            .tables
+            .iter()
+            .map(|t| t.indexes.iter().map(|ix| ix.columns.clone()).collect())
+            .collect();
         let sec_unique: Vec<Vec<bool>> = schema
             .tables
             .iter()
-            .zip(&sec_indexes)
-            .map(|(t, cols)| cols.iter().map(|&c| t.columns[c as usize].unique).collect())
+            .map(|t| t.indexes.iter().map(|ix| ix.unique).collect())
             .collect();
         let col_types = schema
             .tables
@@ -455,13 +459,15 @@ impl Engine {
             let bytes = res?.ok_or_else(|| Error::Corrupt("no schema stored in catalog".into()))?;
             Schema::from_canonical_bytes(&bytes)?
         };
-        let sec_indexes: Vec<Vec<u16>> =
-            schema.tables.iter().map(secondary_index_columns).collect();
+        let sec_indexes: Vec<Vec<Vec<u16>>> = schema
+            .tables
+            .iter()
+            .map(|t| t.indexes.iter().map(|ix| ix.columns.clone()).collect())
+            .collect();
         let sec_unique: Vec<Vec<bool>> = schema
             .tables
             .iter()
-            .zip(&sec_indexes)
-            .map(|(t, cols)| cols.iter().map(|&c| t.columns[c as usize].unique).collect())
+            .map(|t| t.indexes.iter().map(|ix| ix.unique).collect())
             .collect();
         let col_types = schema
             .tables

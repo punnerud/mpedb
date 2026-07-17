@@ -56,7 +56,7 @@ pub(super) fn extract_access(
         cmps.iter().enumerate().find_map(|(i, c)| match c {
             Some((col, BinOp::Eq, atom)) => sec
                 .iter()
-                .position(|sc| sc == col)
+                .position(|sc| *sc == Some(*col))
                 .filter(|pos| *pos < 63)
                 // `any` can never be probed: index order is encoding order,
                 // not sql_cmp order. The schema refuses indexing it, so this
@@ -119,10 +119,13 @@ pub(super) fn extract_access(
     // have range conjuncts) and before a full scan. First index in
     // declaration order with a range conjunct wins; both bounds on the SAME
     // column are consumed together, everything else stays residual.
-    for (pos, &col) in sec.iter().enumerate() {
+    for (pos, col) in sec.iter().enumerate() {
         if pos >= 63 {
             break; // beyond the footprint bitmap — never chosen
         }
+        let Some(col) = *col else {
+            continue; // composite: range access arrives with #55
+        };
         if table.columns[col as usize].ty == ColumnType::Any {
             continue; // no order across types — see the probe_pass guard
         }

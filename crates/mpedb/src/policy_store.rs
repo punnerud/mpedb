@@ -103,15 +103,26 @@ impl Database {
                 names[0],
             ));
         }
-        for i in mpedb_sql::secondary_indexes(t) {
-            if !disc.contains(&i) {
+        for ix in &t.indexes {
+            // §6.4 generalized over `TableDef.indexes`: an index whose
+            // LEADING column is the discriminator cannot act as a
+            // cross-tenant existence oracle (every probe supplies the tenant
+            // first). A composite unique leading with the discriminator is
+            // exactly the fix the old single-column advice called
+            // impossible.
+            let leading = ix.columns[0];
+            if !disc.contains(&leading) {
+                let cols: Vec<&str> = ix
+                    .columns
+                    .iter()
+                    .map(|&c| t.columns[c as usize].name.as_str())
+                    .collect();
                 out.push(format!(
-                    "UNIQUE column `{}` spans every tenant: a value colliding with a hidden \
-                     row reveals it exists (§6.4). mpedb's secondary unique indexes are \
-                     single-column, so this CANNOT be fixed by putting `{}` first — there is \
-                     no composite unique to write. Either drop the uniqueness, or move the \
-                     uniquely-keyed data to its own table.",
-                    t.columns[i as usize].name,
+                    "index ({}) spans every tenant: a value colliding with a hidden \
+                     row reveals it exists (§6.4). Lead the index with `{}` (a \
+                     composite index whose first column is the discriminator), drop \
+                     it, or move the keyed data to its own table.",
+                    cols.join(", "),
                     names[0],
                 ));
             }
@@ -683,10 +694,12 @@ mod tests {
             w.iter().any(|m| m.contains("PRIMARY KEY") && m.contains("does not lead")),
             "expected a PK finding, got {w:?}"
         );
-        // and it names the honest remedy for the single-column unique
+        // and it names the honest remedy for the tenant-spanning index:
+        // lead a composite with the discriminator (possible since
+        // DESIGN-SCHEMA-V2 made composite indexes representable).
         assert!(
-            w.iter().any(|m| m.contains("UNIQUE column `code`") && m.contains("CANNOT be fixed")),
-            "expected the unique finding to state the real constraint, got {w:?}"
+            w.iter().any(|m| m.contains("index (code)") && m.contains("Lead the index")),
+            "expected the index finding with the composite remedy, got {w:?}"
         );
     }
 

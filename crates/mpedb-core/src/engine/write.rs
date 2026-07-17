@@ -411,21 +411,21 @@ impl<'e> WriteTxn<'e> {
         // a violation aborts with zero side effects on the dirty state. Only
         // UNIQUE indexes are checked — a plain `indexed` column allows dups.
         let sec_unique = self.eng.sec_unique[table_id as usize].clone();
-        for (i, &col) in sec.iter().enumerate() {
+        for (i, cols) in sec.iter().enumerate() {
             if !sec_unique[i] {
                 continue;
             }
-            let v = &values[col as usize];
-            if v.is_null() {
-                continue; // SQL: UNIQUE permits multiple NULLs
-            }
+            // A unique key is the values alone; any-NULL means no entry and
+            // no conflict (SQL: UNIQUE permits multiple NULLs).
+            let Some(ikey) = index_row_key(true, cols, values, &[]) else {
+                continue;
+            };
             let ino = (i + 1) as u32;
             let (iroot, _) = self.tree_root(table_id, ino)?;
-            let ikey = keycode::encode_key(std::slice::from_ref(v));
             if btree::get(self, iroot, &ikey)?.is_some() {
                 return Err(Error::UniqueViolation {
                     table: tname,
-                    constraint: table_column_name(self.eng, table_id, col),
+                    constraint: index_constraint_name(self.eng, table_id, cols),
                 });
             }
         }
@@ -481,18 +481,16 @@ impl<'e> WriteTxn<'e> {
         }
         self.set_tree_root(table_id, 0, out.new_root, count + 1);
 
-        for (i, &col) in sec.iter().enumerate() {
-            let v = &values[col as usize];
-            if v.is_null() {
+        for (i, cols) in sec.iter().enumerate() {
+            // UNIQUE: key is the values alone (values→pk). Non-unique: the
+            // values may repeat, so the key is `(values ‖ pk)` — unique by
+            // construction. Any-NULL ⇒ no entry (membership rule). Both
+            // store the pk as the payload so a lookup fetches the row.
+            let Some(ikey) = index_row_key(sec_unique[i], cols, values, &key) else {
                 continue;
-            }
+            };
             let ino = (i + 1) as u32;
             let (iroot, icount) = self.tree_root(table_id, ino)?;
-            // UNIQUE: key is the value alone (value→pk). Non-unique: the value
-            // may repeat, so the key is `(value ‖ pk)` — unique by construction,
-            // duplicates on the value coexist as distinct index entries. Both
-            // store the pk as the payload so a lookup fetches the row.
-            let ikey = index_ikey(sec_unique[i], v, &key);
             let out = btree::insert(self, iroot, &ikey, &mut btree::Payload::Flat(&key), InsertMode::InsertOnly)?;
             if out.existed {
                 // pre-check passed (unique) / composite is unique (non-unique),
@@ -533,14 +531,12 @@ impl<'e> WriteTxn<'e> {
         self.set_tree_root(table_id, 0, out.new_root, count - 1);
 
         let sec = self.eng.sec_indexes[table_id as usize].clone();
-        for (i, &col) in sec.iter().enumerate() {
-            let v = &old[col as usize];
-            if v.is_null() {
+        for (i, cols) in sec.iter().enumerate() {
+            let Some(ikey) = index_row_key(sec_unique[i], cols, &old, &key) else {
                 continue;
-            }
+            };
             let ino = (i + 1) as u32;
             let (iroot, icount) = self.tree_root(table_id, ino)?;
-            let ikey = index_ikey(sec_unique[i], v, &key);
             let out = btree::delete(self, iroot, &ikey)?;
             if !out.existed {
                 return Err(Error::Corrupt("missing index entry on delete".into()));
@@ -568,21 +564,26 @@ impl<'e> WriteTxn<'e> {
         let sec = self.eng.sec_indexes[table_id as usize].clone();
         let sec_unique = self.eng.sec_unique[table_id as usize].clone();
         // pre-check UNIQUE conflicts for changed unique-indexed columns
-        for (i, &col) in sec.iter().enumerate() {
+        for (i, cols) in sec.iter().enumerate() {
             if !sec_unique[i] {
                 continue;
             }
-            let (ov, nv) = (&old[col as usize], &new_values[col as usize]);
-            if index_value_equal(ov, nv) || nv.is_null() {
+            let changed = cols
+                .iter()
+                .any(|&c| !index_value_equal(&old[c as usize], &new_values[c as usize]));
+            if !changed {
                 continue;
             }
+            // Any-NULL in the NEW values ⇒ no entry ⇒ nothing to conflict.
+            let Some(ikey) = index_row_key(true, cols, new_values, &[]) else {
+                continue;
+            };
             let ino = (i + 1) as u32;
             let (iroot, _) = self.tree_root(table_id, ino)?;
-            let ikey = keycode::encode_key(std::slice::from_ref(nv));
             if btree::get(self, iroot, &ikey)?.is_some() {
                 return Err(Error::UniqueViolation {
                     table: tname.clone(),
-                    constraint: table_column_name(self.eng, table_id, col),
+                    constraint: index_constraint_name(self.eng, table_id, cols),
                 });
             }
         }
@@ -611,15 +612,18 @@ impl<'e> WriteTxn<'e> {
         let out = btree::insert(self, root, &key, &mut up, InsertMode::Upsert)?;
         self.set_tree_root(table_id, 0, out.new_root, count);
 
-        for (i, &col) in sec.iter().enumerate() {
-            let (ov, nv) = (&old[col as usize], &new_values[col as usize]);
-            if index_value_equal(ov, nv) {
+        for (i, cols) in sec.iter().enumerate() {
+            let changed = cols
+                .iter()
+                .any(|&c| !index_value_equal(&old[c as usize], &new_values[c as usize]));
+            if !changed {
                 continue;
             }
+            let okey = index_row_key(sec_unique[i], cols, &old, &key);
+            let nkey = index_row_key(sec_unique[i], cols, new_values, &key);
             let ino = (i + 1) as u32;
             let (mut iroot, mut icount) = self.tree_root(table_id, ino)?;
-            if !ov.is_null() {
-                let okey = index_ikey(sec_unique[i], ov, &key);
+            if let Some(okey) = okey {
                 let out = btree::delete(self, iroot, &okey)?;
                 if !out.existed {
                     return Err(Error::Corrupt("missing index entry on update".into()));
@@ -627,8 +631,7 @@ impl<'e> WriteTxn<'e> {
                 iroot = out.new_root;
                 icount -= 1;
             }
-            if !nv.is_null() {
-                let nkey = index_ikey(sec_unique[i], nv, &key);
+            if let Some(nkey) = nkey {
                 let out = btree::insert(self, iroot, &nkey, &mut btree::Payload::Flat(&key), InsertMode::InsertOnly)?;
                 if out.existed {
                     return Err(Error::Internal("secondary index collision within txn".into()));
@@ -1025,4 +1028,13 @@ fn table_column_name(eng: &Engine, table_id: u32, col: u16) -> String {
         .table(table_id)
         .map(|t| t.columns[col as usize].name.clone())
         .unwrap_or_else(|| format!("col{col}"))
+}
+
+/// Constraint name for a UNIQUE-violation error: the indexed column, or the
+/// comma-joined list for a composite index.
+fn index_constraint_name(eng: &Engine, table_id: u32, cols: &[u16]) -> String {
+    cols.iter()
+        .map(|&c| table_column_name(eng, table_id, c))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
