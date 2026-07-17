@@ -168,7 +168,40 @@ optimistic blind-apply that SKIPS index maintenance — DESIGN §7.3) and
 `planner/mod.rs:396` (`table(id).expect` at compile time, ahead of the
 schema-hash gate).
 
-## 4. What the adversarial review must break (before build)
+## 3.5. Interaction with the bidirectional mirror
+
+The mirror (`mpedb-mirror`, DESIGN-MIRROR) sync-scopes a FROZEN set of table
+ids: `MirrorConfig.scope` and the per-table CDC capture bits are set once, at
+`import` (`import.rs:452` is the ONLY `set_captured` call site; nothing extends
+scope afterward). This shapes exactly what DDL does and does not preserve:
+
+- **Existing mirrored tables stay correct through any DDL.** Stable ids (stage
+  0) + no-reuse (§0) guarantee that a mirrored table keeps its id, scope entry,
+  capture bit, and provenance (`map/<id>`) record unchanged; no CREATE
+  renumbers it and no DROP ever re-binds its id. This is a primary reason
+  stable ids and no-reuse were chosen — the mirror of the *unchanged* tables is
+  never disturbed by a schema change to *other* tables.
+
+- **A live-`CREATE`d table is NOT auto-mirrored.** Its id is not in scope and
+  its capture bit is unset, so its writes are never captured, never pushed to
+  the source, and have no provenance mapping. Extending an active mirror to a
+  new table is out of scope for stage 4; DESIGN-MIRROR's answer to a schema
+  change is `mirror regenerate` (line 695: "schema drift (no ALTER) →
+  regenerate"), and that remains the path. A future `mirror add-table` could
+  extend scope+capture+provenance incrementally, but it is a mirror feature,
+  not a DROP-TABLE concern.
+
+- **`DROP` of a MIRRORED table must not silently diverge.** `push`/`apply`
+  already skip a scope id whose `schema.table(id)` is absent
+  (`resolve.rs:97` `else { continue }`), so a tombstoned mirrored table does
+  not corrupt — but it would **silently stop syncing** while the SOURCE table
+  lives on, an undetected divergence. **Rule for stage 4: DROP refuses a table
+  that is in an active mirror's scope**, with a message routing the operator to
+  `mirror detach`/`regenerate` first (the same "can't drop what something still
+  references" shape SQL uses for FK-referenced tables). Removing-from-scope +
+  propagating the drop to the source is a heavier bidirectional-DDL feature,
+  deferred; refuse-if-mirrored is the safe, honest v1. The check reads the
+  mirror `cfg` sys-record's scope, if present, in the DROP commit's txn.
 
 1. **Crash atomicity of DROP**: page-free + catalog-tree-delete + schema
    rewrite + CDC-bit purge + gen bump — all in one COW commit? SIGKILL at every
