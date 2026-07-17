@@ -463,8 +463,12 @@ fn main() {
         extra_caveats,
         bulk_rows,
     };
-    println!("{}", report.to_text());
-
+    // The markdown file FIRST (it is the durable artifact), stdout second —
+    // and neither through a panicking macro: 17 minutes of measurements once
+    // died to println! panicking on a full disk, with the panic message lost
+    // to the same full disk. Report what can be reported, exit non-zero on
+    // what cannot.
+    let mut failed = false;
     if quick {
         eprintln!("(quick mode: no report written)");
     } else {
@@ -477,8 +481,16 @@ fn main() {
             Ok(()) => eprintln!("wrote {}", path.display()),
             Err(e) => {
                 eprintln!("failed to write {}: {e}", path.display());
-                std::process::exit(1);
+                failed = true;
             }
         }
+    }
+    use std::io::Write as _;
+    if writeln!(std::io::stdout(), "{}", report.to_text()).is_err() {
+        eprintln!("failed to print the report to stdout");
+        failed = true;
+    }
+    if failed {
+        std::process::exit(1);
     }
 }
