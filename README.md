@@ -269,7 +269,9 @@ It is also measured against sqlite's own **sqllogictest corpus** (the
 it: **zero wrong answers and zero error mismatches across the entire corpus**,
 with **99.5% of attempted statements passing** — the classic `select1–3`, the
 whole random *select* tree, and (since FROM-less `SELECT 3+5` landed) the
-*expr* tree at 99.6% and the *aggregates* tree at 100.0%. The remaining half
+*expr* tree at 99.6% and the *aggregates* tree at 100.0%. `select4` — six-way
+comma-join products that were unrunnable before WHERE pushdown (13.5 GB and
+SIGKILLed) — passes at 99.6% inside a 3 GB memory guard. The remaining half
 percent is deliberate refusals with error messages, mostly `CASE`/`COALESCE`
 arms that mix int and float (sqlite types those per row — rigid typing says
 `CAST`) and *groupby*-tree shapes not yet compiled.
@@ -313,6 +315,15 @@ then a non-unique one. Anything else in the `ON` stays as a residual over the
 joined row. An `ON` with no equality keeps the read-once-and-hold nested loop
 with its honest `O(n*m)` label. `EXPLAIN` says which form you got and where the
 equality went.
+
+**WHERE conjuncts push into the chain** the same way: each one runs at the
+earliest join step where every column it reads is bound — so a comma-join
+(`FROM a, b WHERE a.id = b.id`) is indexable exactly as if the equality had
+been written in an `ON`, and single-table conjuncts prune their own step
+instead of surviving to the full product. NULL-extension is the boundary: a
+conjunct on a `LEFT` join's inner side stays after the join (it filters the
+NULL-extended row — inside the `ON` it would decide matching instead), and a
+`FULL` join disables pushdown entirely.
 
 `LEFT JOIN` NULL-extends on no match — the extended row is built *because*
 nothing matched, so the `ON` is never evaluated over it and cannot raise on it.
