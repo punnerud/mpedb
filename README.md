@@ -43,6 +43,18 @@ PostgreSQL does, and without contacting PostgreSQL at all. It runs in both
 directions and records what the source declared, so migration is a thing you
 validate rather than hope about.
 
+And you can start from the file you already have, sqlite3-style:
+**`mpedb data.db`** opens it exactly like `sqlite3 data.db` does (repl or
+one-shot statement) — a `.mpedb` sidecar mirrors it, pulls incrementally on
+every open, and **`mpedb checkpoint data.db`** pushes your writes back into
+the sqlite file for every other tool to see. There is also a **native sqlite
+reader** (`mpedb-sqlitefmt`, no sqlite library in the path, differentially
+verified against it): `mpedb dump data.db` inspects a `.db` directly, and
+`mpedb::SqliteAttach` runs read-only mpedb SQL over one with **zero import**.
+The full design — the `.db` as durable home, the `.mpedb` as its delta-WAL
+with lock modes and checkpoints — survived a 20-finding adversarial review in
+[`DESIGN-SQLITE-BACKED.md`](DESIGN-SQLITE-BACKED.md).
+
 **What it is not: a drop-in sqlite3.** Be clear-eyed about this before you plan
 around it. mpedb's SQL is a real subset that keeps growing — aggregates,
 `GROUP BY`/`HAVING`, `DISTINCT`, N-way `INNER JOIN` chains with aliases and
