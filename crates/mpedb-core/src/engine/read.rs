@@ -111,14 +111,16 @@ impl ReadTxn<'_> {
         }
     }
 
-    /// Point probe of a secondary unique index; returns the full row.
+    /// Point probe of a secondary unique index with its FULL column width;
+    /// returns the full row. (#55: `values` in index-column order — the
+    /// k = 1 case is the historical single-value probe.)
     pub fn get_by_index(
         &self,
         table_id: u32,
         index_no: u32,
-        value: &Value,
+        values: &[Value],
     ) -> Result<Option<Vec<Value>>> {
-        let ikey = keycode::encode_key(std::slice::from_ref(value));
+        let ikey = keycode::encode_key(values);
         let iroot = self.tree_root(table_id, index_no)?;
         let Some(pk_bytes) = btree::get(self, iroot, &ikey)? else {
             return Ok(None);
@@ -146,23 +148,32 @@ impl ReadTxn<'_> {
         &self,
         table_id: u32,
         index_no: u32,
-        value: &Value,
+        values: &[Value],
     ) -> Result<Vec<Vec<Value>>> {
-        if value.is_null() {
-            return Ok(Vec::new()); // NULL is never indexed
+        if values.iter().any(|v| v.is_null()) {
+            return Ok(Vec::new()); // any-NULL rows are never indexed
         }
-        let unique = index_no >= 1
+        // Exact-get fast path only when the probe covers a UNIQUE index's
+        // full width — a PREFIX of a unique index is a scan like any other
+        // (several rows may share the prefix).
+        let full_unique = index_no >= 1
             && self
                 .eng
                 .sec_unique
                 .get(table_id as usize)
                 .and_then(|v| v.get(index_no as usize - 1))
                 .copied()
-                .unwrap_or(false);
-        if unique {
-            return Ok(self.get_by_index(table_id, index_no, value)?.into_iter().collect());
+                .unwrap_or(false)
+            && self
+                .eng
+                .sec_indexes
+                .get(table_id as usize)
+                .and_then(|v| v.get(index_no as usize - 1))
+                .is_some_and(|cols| cols.len() == values.len());
+        if full_unique {
+            return Ok(self.get_by_index(table_id, index_no, values)?.into_iter().collect());
         }
-        let prefix = keycode::encode_key(std::slice::from_ref(value));
+        let prefix = keycode::encode_key(values);
         let iroot = self.tree_root(table_id, index_no)?;
         let root = self.tree_root(table_id, 0)?;
         let types = &self.eng.col_types[table_id as usize];

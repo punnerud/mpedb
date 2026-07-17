@@ -117,7 +117,7 @@ fn crud_cycle_with_constraints() {
     // read it back through a snapshot
     let r = eng.begin_read().unwrap();
     assert_eq!(r.get_by_pk(0, &[Value::Int(1)]).unwrap(), Some(user(1, "a@x.no", Some(30))));
-    assert_eq!(r.get_by_index(0, 1, &Value::Text("b@x.no".into())).unwrap(),
+    assert_eq!(r.get_by_index(0, 1, &[Value::Text("b@x.no".into())]).unwrap(),
                Some(user(2, "b@x.no", None)));
     assert_eq!(r.row_count(0).unwrap(), 2);
     r.finish().unwrap();
@@ -127,8 +127,8 @@ fn crud_cycle_with_constraints() {
     assert!(w.update_by_pk(0, &user(1, "a2@x.no", Some(31))).unwrap());
     w.commit().unwrap();
     let r = eng.begin_read().unwrap();
-    assert_eq!(r.get_by_index(0, 1, &Value::Text("a@x.no".into())).unwrap(), None);
-    assert!(r.get_by_index(0, 1, &Value::Text("a2@x.no".into())).unwrap().is_some());
+    assert_eq!(r.get_by_index(0, 1, &[Value::Text("a@x.no".into())]).unwrap(), None);
+    assert!(r.get_by_index(0, 1, &[Value::Text("a2@x.no".into())]).unwrap().is_some());
     r.finish().unwrap();
 
     // delete
@@ -138,7 +138,7 @@ fn crud_cycle_with_constraints() {
     w.commit().unwrap();
     let r = eng.begin_read().unwrap();
     assert_eq!(r.get_by_pk(0, &[Value::Int(1)]).unwrap(), None);
-    assert_eq!(r.get_by_index(0, 1, &Value::Text("a2@x.no".into())).unwrap(), None);
+    assert_eq!(r.get_by_index(0, 1, &[Value::Text("a2@x.no".into())]).unwrap(), None);
     assert_eq!(r.row_count(0).unwrap(), 1);
     r.finish().unwrap();
 
@@ -477,7 +477,7 @@ fn wal_recovery_rebuilds_engine_state_from_log_alone() {
         Some(user(1, "u1@x.no", Some(1)))
     );
     assert_eq!(
-        r.get_by_index(0, 1, &Value::Text("u1@x.no".into())).unwrap(),
+        r.get_by_index(0, 1, &[Value::Text("u1@x.no".into())]).unwrap(),
         Some(user(1, "u1@x.no", Some(1)))
     );
     r.finish().unwrap();

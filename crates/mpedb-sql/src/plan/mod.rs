@@ -64,7 +64,11 @@ const MAX_JOINS: usize = 16;
 //    for a value that format 9 rejected as out of range, hence the bump.
 // 11: `IN (SELECT …)` (#70) — the subplan tag byte grew List(2); format 10
 //    decoders reject it as a bad exists tag, hence the bump.
-const PLAN_FORMAT: u8 = 11;
+// 12: composite indexes (#55) — `IndexPoint` carries a LIST of parts where
+//    it carried exactly one, so a format-11 reader would take the count
+//    byte as a part tag and desynchronize. Rides the canonical-bytes-v2
+//    window (schemas carry explicit `TableDef.indexes`).
+const PLAN_FORMAT: u8 = 12;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -538,13 +542,18 @@ pub enum AccessPath {
         hi: Option<KeyBound>,
     },
     /// Equality probe of secondary index `index_no` (1-based; index 0 is the
-    /// PK tree — see [`crate::secondary_indexes`]). At most one row for a
-    /// UNIQUE index; every equal row for a non-unique (`indexed`) one.
-    IndexPoint { index_no: u32, part: KeyPart },
-    /// Range over secondary index `index_no`'s column: `WHERE idx_col > $1
-    /// AND idx_col <= $2`. Bounds carry exactly one part each (the indexed
-    /// column's value); prefix semantics over the `(value ‖ pk)` composite
-    /// keys make the same construction serve unique and non-unique indexes.
+    /// PK tree). `parts` cover a PREFIX of the index's columns in key order
+    /// (#55: 1..=width; a single-column index is the k = 1 case). At most
+    /// one row when the index is UNIQUE and the parts cover its full width;
+    /// otherwise every row equal on the covered prefix (the executor picks
+    /// exact-get vs prefix-scan from the index shape).
+    IndexPoint { index_no: u32, parts: Vec<KeyPart> },
+    /// Range over secondary index `index_no`'s FIRST column: `WHERE idx_col
+    /// \> $1 AND idx_col <= $2` — the same Phase-1 rule as `PkRange`, and
+    /// it serves composite indexes unchanged (the first column's encoding
+    /// is a key prefix). Bounds carry exactly one part each; prefix
+    /// semantics over the `(values ‖ pk)` keys make one construction serve
+    /// unique and non-unique indexes.
     IndexRange {
         index_no: u32,
         lo: Option<KeyBound>,

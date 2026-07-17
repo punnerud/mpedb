@@ -63,6 +63,13 @@ primary_key = ["id"]
   type = "int64"
   nullable = true
   check = "age >= 0 AND age < 150"
+
+  # Composite secondary indexes (#55): a column LIST, declaration order =
+  # key order; `unique = true` enforces uniqueness over the SET (NULLs never
+  # conflict). The planner uses full-width equality, any equality prefix,
+  # and ranges on the first column.
+  [[table.index]]
+  columns = ["age", "email"]
 ```
 
 ```rust

@@ -219,8 +219,8 @@ fn decode_access(buf: &[u8], pos: &mut usize) -> Result<AccessPath> {
         }
         ACCESS_INDEX_POINT => {
             let index_no = r_u32(buf, pos)?;
-            let part = decode_part(buf, pos)?;
-            Ok(AccessPath::IndexPoint { index_no, part })
+            let parts = decode_parts(buf, pos)?;
+            Ok(AccessPath::IndexPoint { index_no, parts })
         }
         ACCESS_INDEX_RANGE => {
             let index_no = r_u32(buf, pos)?;

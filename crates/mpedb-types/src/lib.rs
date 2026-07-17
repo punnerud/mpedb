@@ -60,7 +60,7 @@ impl AggFn {
 }
 pub use footprint::{Footprint, KeyAccess, KeyBound, KeyPart, PlanHash};
 pub use policy::{PolicyCmd, PolicyDef};
-pub use schema::{ColumnDef, DefaultExpr, Schema, TableDef};
+pub use schema::{ColumnDef, DefaultExpr, IndexDef, Schema, TableDef, MAX_INDEXES};
 pub use value::{ColumnType, Value};
 
 /// Maximum number of tables (user + system) in one database. Bounded so that

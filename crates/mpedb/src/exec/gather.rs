@@ -26,7 +26,7 @@ fn access_has_outer(a: &AccessPath) -> bool {
     };
     match a {
         AccessPath::PkPoint(parts) => parts.iter().any(outer),
-        AccessPath::IndexPoint { part, .. } => outer(part),
+        AccessPath::IndexPoint { parts, .. } => parts.iter().any(outer),
         AccessPath::PkRange { lo, hi } | AccessPath::IndexRange { lo, hi, .. } => {
             bound_outer(lo) || bound_outer(hi)
         }
@@ -65,12 +65,21 @@ fn fetch_inner(
                 ctx.get_by_pk(join.table, &pk)?.into_iter().collect()
             }
         }
-        AccessPath::IndexPoint { index_no, part } => {
-            let v = resolve_part_outer(part, plan, params, outer)?;
-            if v.is_null() {
+        AccessPath::IndexPoint { index_no, parts } => {
+            let mut vals = Vec::with_capacity(parts.len());
+            let mut any_null = false;
+            for p in parts {
+                let v = resolve_part_outer(p, plan, params, outer)?;
+                if v.is_null() {
+                    any_null = true; // `col = NULL` is UNKNOWN: no candidates
+                    break;
+                }
+                vals.push(v);
+            }
+            if any_null {
                 Vec::new()
             } else {
-                ctx.scan_by_index(join.table, *index_no, &v)?
+                ctx.scan_by_index(join.table, *index_no, &vals)?
             }
         }
         _ => return Err(internal("unparametrized access in index nested loop")),
@@ -296,14 +305,25 @@ pub(super) fn gather_rows(
                 ),
             };
         }
-        AccessPath::IndexPoint { index_no, part } => {
-            let v = resolve_part(part, plan, params)?;
-            if v.is_null() {
-                Vec::new() // `col = NULL` is UNKNOWN; NULLs are never indexed
+        AccessPath::IndexPoint { index_no, parts } => {
+            let mut vals = Vec::with_capacity(parts.len());
+            let mut any_null = false;
+            for p in parts {
+                let v = resolve_part(p, plan, params)?;
+                if v.is_null() {
+                    // `col = NULL` is UNKNOWN; any-NULL rows are not indexed.
+                    any_null = true;
+                    break;
+                }
+                vals.push(v);
+            }
+            if any_null {
+                Vec::new()
             } else {
-                // N rows for a non-unique index, 0/1 for a unique one — the
-                // engine picks the exact-get fast path when it is unique.
-                ctx.scan_by_index(table, *index_no, &v)?
+                // N rows equal on the covered prefix; the engine takes the
+                // exact-get fast path when a UNIQUE index is covered full
+                // width.
+                ctx.scan_by_index(table, *index_no, &vals)?
             }
         }
         AccessPath::IndexRange { index_no, lo, hi } => {
