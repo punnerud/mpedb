@@ -60,6 +60,10 @@ pub struct WriteTxn<'e> {
     /// Root of the extent map (DESIGN-BLOBEXTENT §3.2). Carried through the
     /// commit snapshot; mutated once the extent allocator lands.
     pub(super) extent_map_root: u64,
+    /// #47: set by a DDL mutation in this txn; the commit snapshot then
+    /// writes `meta.schema_gen + 1`, signalling every other process to
+    /// reload its schema from the catalog.
+    pub(super) schema_gen_bump: bool,
     /// (table_id, index_no) → (root, row_count); loaded lazily, written back
     /// into the catalog at commit.
     pub(super) table_roots: HashMap<(u32, u32), (u64, u64)>,

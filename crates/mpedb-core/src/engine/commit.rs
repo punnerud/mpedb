@@ -146,6 +146,9 @@ impl<'e> WriteTxn<'e> {
             freelist_root: self.freelist_root,
             high_water: self.high_water,
             extent_map_root: self.extent_map_root,
+            // Carried forward unchanged by ordinary writes; a DDL commit
+            // (#47 stage 2) bumps it via `self.schema_gen_bump`.
+            schema_gen: self.meta.schema_gen + u64::from(self.schema_gen_bump),
         };
         match self.eng.shm.durability {
             Durability::Commit => {

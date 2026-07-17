@@ -370,7 +370,7 @@ impl Engine {
         // (crash-consistent, power-loss loses a bounded window — §5.4.2).
         let flusher = (config.options.durability == Durability::Async)
             .then(|| spawn_flusher(shm.clone()));
-        let engine = Engine {
+        let mut engine = Engine {
             shm,
             schema,
             checks,
@@ -382,7 +382,47 @@ impl Engine {
             extent_threshold: None,
         };
         engine.bootstrap_catalog()?;
+        // #47 stage 1: the FILE is authoritative for the schema. The config
+        // seeded it (first open) or must hash-match the SEED (the frozen
+        // M_SCHEMA_HASH, which never changes); the LIVE schema — which DDL
+        // may have evolved past the seed — is read from the catalog. For a
+        // never-evolved file the two are byte-identical and this is a no-op.
+        engine.reload_schema_from_catalog()?;
         Ok(engine)
+    }
+
+    /// Replace the cached schema (and every per-table cache derived from it)
+    /// with the catalog's stored one. The schema-gen staleness check (#47
+    /// stage 3) routes writers here after a DDL commit by another process.
+    fn reload_schema_from_catalog(&mut self) -> Result<()> {
+        let r = self.begin_read()?;
+        let stored = r.stored_schema();
+        r.finish()?;
+        let stored = stored?;
+        if stored == self.schema {
+            return Ok(());
+        }
+        self.sec_indexes = stored
+            .tables
+            .iter()
+            .map(|t| t.indexes.iter().map(|ix| ix.columns.clone()).collect())
+            .collect();
+        self.sec_unique = stored
+            .tables
+            .iter()
+            .map(|t| t.indexes.iter().map(|ix| ix.unique).collect())
+            .collect();
+        self.col_types = stored
+            .tables
+            .iter()
+            .map(|t| t.columns.iter().map(|c| c.ty).collect())
+            .collect();
+        // CHECK programs are compiled by the facade from the same check
+        // strings the seed carried; a table added by DDL gets an empty
+        // per-table entry until the facade recompiles (stage 2 wires that).
+        self.checks.resize(stored.tables.len(), Vec::new());
+        self.schema = stored;
+        Ok(())
     }
 
     pub fn schema(&self) -> &Schema {
@@ -786,6 +826,7 @@ impl Engine {
             catalog_root: meta.catalog_root,
             freelist_root: meta.freelist_root,
             extent_map_root: meta.extent_map_root,
+            schema_gen_bump: false,
             run_pool: Vec::new(),
             taken_runs: Vec::new(),
             freed_runs: Vec::new(),
