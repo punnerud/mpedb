@@ -52,6 +52,23 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
              with sqlite3)"
         ));
     }
+    // `--direct`: read-only SQL straight over the sqlite file — the native
+    // reader, no sidecar, no import, no sqlite library. Quiescence is the
+    // caller's responsibility until the v2 lock modes land.
+    let mut rest: Vec<String> = rest.to_vec();
+    let direct = if let Some(i) = rest.iter().position(|a| a == "--direct") {
+        rest.remove(i);
+        true
+    } else {
+        false
+    };
+    let rest = rest.as_slice();
+    if direct {
+        if !is_sqlite(p) {
+            return runtime(format!("--direct needs a sqlite file, {path} is not one"));
+        }
+        return run_direct(p, rest);
+    }
     let target = if is_sqlite(p) {
         let side = sidecar(p);
         if side.exists() {
@@ -124,4 +141,45 @@ pub fn checkpoint(args: &[String]) -> CliResult {
         "--db",
         side.to_str().expect("utf-8 path"),
     ]))
+}
+
+/// `mpedb data.db --direct ['SQL' ...]` — read-only, zero-import attach.
+/// One-shot with a statement; a minimal line repl without one (read-only, so
+/// no BEGIN/COMMIT — just statements and .quit).
+fn run_direct(p: &Path, rest: &[String]) -> CliResult {
+    let at = mpedb::SqliteAttach::open(p)?;
+    for (t, why) in at.skipped() {
+        eprintln!("note: table `{t}` not attached: {why}");
+    }
+    match rest {
+        [sql, params @ ..] => {
+            let vals: Vec<mpedb::Value> = params.iter().map(|s| parse_param(s)).collect();
+            print_result(&at.query(sql, &vals)?);
+            Ok(())
+        }
+        [] => {
+            use std::io::BufRead as _;
+            let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                if interactive {
+                    // The prompt says what this session IS.
+                    eprint!("mpedb(ro)> ");
+                }
+                let line = line?;
+                let stmt = line.trim().trim_end_matches(';').trim();
+                if stmt.is_empty() {
+                    continue;
+                }
+                if stmt == ".quit" || stmt == ".exit" {
+                    break;
+                }
+                match at.query(stmt, &[]) {
+                    Ok(r) => print_result(&r),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+            Ok(())
+        }
+    }
 }
