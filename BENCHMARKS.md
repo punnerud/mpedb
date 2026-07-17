@@ -9,9 +9,13 @@ durability classes, all latency percentiles) live in its own file.
 
 | machine | engines | full results |
 |---|---|---|
-| AMD EPYC-Milan, 2 cores, 7.6 GiB, Linux 6.8 | mpedb, SQLite, PostgreSQL 16 | [`RESULTS-linux-amd-epyc-milan-2c.md`](crates/mpedb-bench/RESULTS-linux-amd-epyc-milan-2c.md) |
-| Apple M3 Pro, 11 cores, 36 GiB, macOS 26.6 | mpedb, SQLite, PostgreSQL 16 | [`RESULTS-macos-apple-m3-pro-11c.md`](crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md) |
+| AMD EPYC-Milan, 2 cores, 7.6 GiB, Linux 6.8 | mpedb, SQLite, PostgreSQL 16, Turso 0.7 | [`RESULTS-linux-amd-epyc-milan-2c.md`](crates/mpedb-bench/RESULTS-linux-amd-epyc-milan-2c.md) |
+| Apple M3 Pro, 11 cores, 36 GiB, macOS 26.6 | mpedb, SQLite, PostgreSQL 16, Turso 0.7 | [`RESULTS-macos-apple-m3-pro-11c.md`](crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md) |
 | Raspberry Pi 3 B+, armv7l (32-bit), 921 MiB, Linux 6.1 | **mpedb only** | no results file — see below |
+
+Turso (the Rust SQLite rewrite) joined the field 2026-07-17; its adapter's
+honesty decisions and a compatibility-parity comparison live in
+[TURSO.md](TURSO.md).
 
 The Pi is not a third data point in the engine comparison and never will be:
 `mpedb-bench` links SQLite (bundled C) and PostgreSQL, which needs a C

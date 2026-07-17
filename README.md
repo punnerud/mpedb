@@ -353,6 +353,9 @@ loop (each engine on its own fast path — mpedb's `execute(hash, …)`, prepare
 statements for the others). **[`BENCHMARKS.md`](BENCHMARKS.md) is the detailed
 comparison** — methodology, every machine, and a link to each machine's full
 generated tables. The highlights from all of them are below.
+[Turso](https://github.com/tursodatabase/turso), the Rust SQLite rewrite, is
+measured as a fourth engine — numbers and a compatibility-parity comparison in
+[TURSO.md](TURSO.md).
 
 Two things to know before reading any of it: numbers are only comparable
 **within a durability class** (none-class has no fsync guarantee, commit-class is
