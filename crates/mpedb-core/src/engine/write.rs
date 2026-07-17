@@ -979,6 +979,49 @@ impl<'e> WriteTxn<'e> {
         Ok(())
     }
 
+    /// ALTER TABLE ... RENAME TO (#47 stage 5). Pure metadata: computes the
+    /// renamed schema from THIS txn's captured bundle (so a concurrent DDL is
+    /// caught by the id-liveness check, not silently overwritten) and publishes
+    /// it. No tree roots move.
+    pub fn alter_rename_table(&mut self, table_id: u32, new_name: &str) -> Result<()> {
+        let bundle = Arc::clone(&self.bundle);
+        let new_schema = bundle.schema.with_renamed_table(table_id, new_name)?;
+        self.publish_schema(&new_schema)
+    }
+
+    /// ALTER TABLE ... RENAME [COLUMN] (#47 stage 5). Pure metadata: the column
+    /// keeps its position and type, so no row is touched.
+    pub fn alter_rename_column(
+        &mut self,
+        table_id: u32,
+        column: &str,
+        new_name: &str,
+    ) -> Result<()> {
+        let bundle = Arc::clone(&self.bundle);
+        let new_schema = bundle.schema.with_renamed_column(table_id, column, new_name)?;
+        self.publish_schema(&new_schema)
+    }
+
+    /// Publish a new schema (already validated by the caller via one of the
+    /// `Schema::with_*` evolvers) into the catalog and arm the schema-gen bump.
+    /// For a PURE-METADATA change (rename): no tree roots move, so this single
+    /// `CAT_SCHEMA_KEY` upsert is the whole commit. The caller swaps the engine
+    /// bundle after commit; other processes reload at their next transaction.
+    pub fn publish_schema(&mut self, new_schema: &mpedb_types::Schema) -> Result<()> {
+        let bytes = new_schema.canonical_bytes();
+        let root = self.catalog_root;
+        let out = btree::insert(
+            self,
+            root,
+            CAT_SCHEMA_KEY,
+            &mut btree::Payload::Flat(&bytes),
+            InsertMode::Upsert,
+        )?;
+        self.catalog_root = out.new_root;
+        self.schema_gen_bump = true;
+        Ok(())
+    }
+
     pub fn sys_get(&mut self, subkey: &[u8]) -> Result<Option<Vec<u8>>> {
         btree::get(self, self.catalog_root, &sys_key(subkey))
     }

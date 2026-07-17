@@ -60,6 +60,12 @@ pub enum DdlStmt {
     /// reused (DESIGN-DROP-TABLE §0). `if_exists` suppresses the missing-table
     /// error, matching sqlite/PG.
     DropTable { name: String, if_exists: bool },
+    /// `ALTER TABLE <t> RENAME TO <new>` (#47 stage 5) — pure schema metadata,
+    /// no data rewrite (same id, same trees). Applied by the facade.
+    AlterRenameTable { table: String, new_name: String },
+    /// `ALTER TABLE <t> RENAME [COLUMN] <old> TO <new>` — pure schema metadata
+    /// (column position/type unchanged, so no row is touched).
+    AlterRenameColumn { table: String, column: String, new_name: String },
     CreatePolicy(CreatePolicySpec),
     DropPolicy { table: String, name: String },
     AlterRls { table: String, action: RlsAction },
@@ -117,6 +123,46 @@ mod tests {
         assert_eq!(
             parse_ddl("DROP POLICY p ON orders").unwrap().unwrap(),
             DdlStmt::DropPolicy { table: "orders".into(), name: "p".into() }
+        );
+    }
+
+    #[test]
+    fn alter_rename_parses() {
+        assert_eq!(
+            parse_ddl("ALTER TABLE orders RENAME TO invoices").unwrap().unwrap(),
+            DdlStmt::AlterRenameTable { table: "orders".into(), new_name: "invoices".into() }
+        );
+        // `RENAME COLUMN a TO b` and the bare `RENAME a TO b` are equivalent.
+        let with_kw =
+            parse_ddl("ALTER TABLE orders RENAME COLUMN qty TO amount").unwrap().unwrap();
+        let bare = parse_ddl("ALTER TABLE orders RENAME qty TO amount").unwrap().unwrap();
+        assert_eq!(with_kw, bare);
+        assert_eq!(
+            with_kw,
+            DdlStmt::AlterRenameColumn {
+                table: "orders".into(),
+                column: "qty".into(),
+                new_name: "amount".into(),
+            }
+        );
+        // The RLS ALTER forms still parse (RENAME branches off first).
+        assert_eq!(
+            parse_ddl("ALTER TABLE orders ENABLE ROW LEVEL SECURITY").unwrap().unwrap(),
+            DdlStmt::AlterRls { table: "orders".into(), action: RlsAction::Enable { force: false } }
+        );
+        // Malformed RENAME COLUMN (no TO) errors.
+        assert!(parse_ddl("ALTER TABLE orders RENAME COLUMN qty amount").is_err());
+    }
+
+    #[test]
+    fn drop_table_parses() {
+        assert_eq!(
+            parse_ddl("DROP TABLE orders").unwrap().unwrap(),
+            DdlStmt::DropTable { name: "orders".into(), if_exists: false }
+        );
+        assert_eq!(
+            parse_ddl("DROP TABLE IF EXISTS orders").unwrap().unwrap(),
+            DdlStmt::DropTable { name: "orders".into(), if_exists: true }
         );
     }
 

@@ -547,6 +547,35 @@ impl Database {
         Ok(ExecResult::Affected(0))
     }
 
+    /// `ALTER TABLE ... RENAME` (#47 stage 5). Pure schema metadata — resolve
+    /// the table id against a fresh view, apply the rename in one commit, then
+    /// (best-effort, like CREATE/DROP) clear the plan cache and reload. `rename`
+    /// runs the txn method that computes+publishes from the txn's own bundle.
+    fn apply_alter_rename(
+        &self,
+        table: &str,
+        rename: impl FnOnce(&mut mpedb_core::engine::WriteTxn, u32) -> Result<()>,
+    ) -> Result<ExecResult> {
+        self.engine.refresh_schema_if_stale()?;
+        let id = self
+            .engine
+            .schema()
+            .schema
+            .table_id(table)
+            .ok_or_else(|| Error::Bind(format!("ALTER TABLE: no such table `{table}`")))?;
+        let mut w = self.engine.begin_write()?;
+        match rename(&mut w, id) {
+            Ok(()) => w.commit()?,
+            Err(e) => {
+                w.abort();
+                return Err(e);
+            }
+        }
+        self.cache.write().expect(POISON).clear();
+        let _ = self.engine.reload_schema_from_catalog();
+        Ok(ExecResult::Affected(0))
+    }
+
     fn apply_ddl(&self, ddl: mpedb_sql::DdlStmt) -> Result<ExecResult> {
         use mpedb_sql::{DdlStmt, RlsAction};
         match ddl {
@@ -555,6 +584,14 @@ impl Database {
             }
             DdlStmt::DropTable { name, if_exists } => {
                 return self.apply_drop_table(&name, if_exists);
+            }
+            DdlStmt::AlterRenameTable { table, new_name } => {
+                return self.apply_alter_rename(&table, |w, id| w.alter_rename_table(id, &new_name));
+            }
+            DdlStmt::AlterRenameColumn { table, column, new_name } => {
+                return self.apply_alter_rename(&table, |w, id| {
+                    w.alter_rename_column(id, &column, &new_name)
+                });
             }
             DdlStmt::CreatePolicy(spec) => {
                 let def = mpedb_types::PolicyDef {

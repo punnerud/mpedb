@@ -125,7 +125,7 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
         }
         Some("alter") => {
             p.advance();
-            p.parse_alter_rls()?
+            p.parse_alter()?
         }
         _ => return Ok(None),
     };
@@ -555,9 +555,25 @@ impl<'a> Parser<'a> {
         Ok(DdlStmt::DropPolicy { table, name })
     }
 
-    fn parse_alter_rls(&mut self) -> Result<DdlStmt> {
+    fn parse_alter(&mut self) -> Result<DdlStmt> {
         self.expect_word("TABLE")?;
         let table = self.ident("table name")?;
+        // RENAME forms (pure schema metadata) branch off before the RLS words.
+        if self.eat_word("RENAME") {
+            if self.eat_word("TO") {
+                let new_name = self.ident("new table name")?;
+                return Ok(DdlStmt::AlterRenameTable { table, new_name });
+            }
+            // `RENAME COLUMN a TO b` or the bare `RENAME a TO b` (sqlite accepts
+            // both; COLUMN is optional).
+            self.eat_word("COLUMN");
+            let column = self.ident("column name")?;
+            if !self.eat_word("TO") {
+                return Err(self.err_here("expected TO in RENAME COLUMN"));
+            }
+            let new_name = self.ident("new column name")?;
+            return Ok(DdlStmt::AlterRenameColumn { table, column, new_name });
+        }
         let action = if self.eat_word("ENABLE") {
             self.expect_row_level_security()?;
             RlsAction::Enable { force: false }

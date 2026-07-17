@@ -219,6 +219,55 @@ impl Schema {
         Ok(schema)
     }
 
+    /// Evolve this schema by RENAMING a table (#47 stage 5). Pure metadata: the
+    /// id, columns, keys, indexes, and all row data are untouched — only the
+    /// name changes. `validate` rejects a collision with another live table.
+    pub fn with_renamed_table(&self, id: u32, new_name: &str) -> Result<Schema> {
+        let mut tables = self.tables.clone();
+        let slot = tables
+            .get_mut(id as usize)
+            .filter(|t| t.id == id && !t.dead)
+            .ok_or_else(|| Error::Schema(format!("no live table with id {id} to rename")))?;
+        slot.name = new_name.to_string();
+        let schema = Schema { tables };
+        schema.validate()?;
+        Ok(schema)
+    }
+
+    /// Evolve this schema by RENAMING one column of a table (#47 stage 5). Pure
+    /// metadata: the column keeps its position and type, so no row image is
+    /// touched. Errors if the column is unknown or the new name collides with a
+    /// sibling column.
+    pub fn with_renamed_column(
+        &self,
+        table_id: u32,
+        column: &str,
+        new_name: &str,
+    ) -> Result<Schema> {
+        let mut tables = self.tables.clone();
+        let slot = tables
+            .get_mut(table_id as usize)
+            .filter(|t| t.id == table_id && !t.dead)
+            .ok_or_else(|| Error::Schema(format!("no live table with id {table_id}")))?;
+        if slot.columns.iter().any(|c| c.name == new_name) {
+            return Err(Error::Schema(format!(
+                "column `{new_name}` already exists in table `{}`",
+                slot.name
+            )));
+        }
+        let col = slot
+            .columns
+            .iter_mut()
+            .find(|c| c.name == column)
+            .ok_or_else(|| {
+                Error::Schema(format!("no column `{column}` in table `{}`", slot.name))
+            })?;
+        col.name = new_name.to_string();
+        let schema = Schema { tables };
+        schema.validate()?;
+        Ok(schema)
+    }
+
     /// Live (non-tombstone) tables — the user-visible set.
     pub fn live_tables(&self) -> impl Iterator<Item = &TableDef> {
         self.tables.iter().filter(|t| !t.dead)
