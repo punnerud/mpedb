@@ -574,6 +574,46 @@ impl<'a> Parser<'a> {
             let new_name = self.ident("new column name")?;
             return Ok(DdlStmt::AlterRenameColumn { table, column, new_name });
         }
+        if self.eat_word("ADD") {
+            self.eat_word("COLUMN"); // optional, as in sqlite/PG
+            let cname = self.ident("column name")?;
+            let tyword = self.ident("column type")?;
+            let Some(ty) = mpedb_types::ColumnType::parse(&tyword.to_ascii_lowercase()) else {
+                return Err(self.err_here(format!(
+                    "unknown column type `{tyword}` (int64/text/real/bool/blob/timestamp/any)"
+                )));
+            };
+            let mut col = crate::ddl::CreateColumnSpec {
+                name: cname,
+                ty,
+                not_null: false,
+                unique: false,
+                pk: false,
+            };
+            loop {
+                if self.eat_kw(Kw::Not) {
+                    self.expect_kw(Kw::Null, "NULL")?;
+                    col.not_null = true;
+                } else if self.eat_kw(Kw::Null) {
+                    col.not_null = false;
+                } else if self.eat_word("UNIQUE") {
+                    col.unique = true;
+                } else if self.eat_word("PRIMARY") {
+                    self.expect_word("KEY")?;
+                    col.pk = true;
+                } else if self.eat_word("DEFAULT")
+                    || self.eat_word("CHECK")
+                    || self.eat_word("REFERENCES")
+                {
+                    return Err(self.err_here(
+                        "DEFAULT/CHECK/REFERENCES are not supported in ADD COLUMN yet",
+                    ));
+                } else {
+                    break;
+                }
+            }
+            return Ok(DdlStmt::AlterAddColumn { table, column: col });
+        }
         let action = if self.eat_word("ENABLE") {
             self.expect_row_level_security()?;
             RlsAction::Enable { force: false }

@@ -42,8 +42,9 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | EXPLAIN | ✅ | plan form (access path, index choice, residuals), not VDBE opcodes |
 | CREATE TABLE | ✅ | live, multi-process, on the shared file — `PRIMARY KEY` (inline or table-level composite), `NOT NULL`, `UNIQUE` (column or composite); other processes see the new table on their next statement. `DEFAULT`/`CHECK`/foreign keys refuse by name (declare them in the config schema for now) |
 | DROP TABLE | ✅ | live, multi-process — `DROP TABLE [IF EXISTS] <name>`; frees the table's pages, tombstones its id in place (never reused — [DESIGN-DROP-TABLE.md](DESIGN-DROP-TABLE.md) §0), other processes see it gone on their next statement. No-reuse caps *lifetime* table creates at 64 (a bounded capacity limit, not a per-query gap; offline `regenerate` re-densifies) |
-| ALTER TABLE RENAME | ✅ | `ALTER TABLE t RENAME TO t2` and `ALTER TABLE t RENAME [COLUMN] a TO b` — pure schema metadata (no data rewrite), live + multi-process, sqlite/PG-equivalent refusals (name collision, unknown target) |
-| ALTER TABLE ADD/DROP COLUMN | ❌ | staged next — mpedb's schema-driven row image is not self-describing, so these need a bounded row rewrite (unlike rename); a column add/drop is a config change today |
+| ALTER TABLE RENAME | ✅ | `RENAME TO` (table) and `RENAME [COLUMN] a TO b` — pure metadata, no data rewrite; sqlite/PG-equivalent refusals (name collision, unknown target) |
+| ALTER TABLE ADD COLUMN | ✅ | nullable column, live + multi-process (existing rows rewritten with NULL). `NOT NULL`/`UNIQUE`/`PRIMARY KEY` on ADD refuse (no default fill / online index build yet), matching sqlite's NOT-NULL-needs-default rule |
+| ALTER TABLE DROP COLUMN | ❌ | staged next (needs a row rewrite; a column drop is a config change today) |
 | CREATE INDEX | **Not needed** | `unique = true` / `indexed = true` on a column, or `[[table.index]]` with a column LIST for composite (unique or not) — equality on the full width or any prefix, range on the first column, visible in EXPLAIN |
 | CREATE VIEW / CREATE TRIGGER | ❌ | triggers' job is planned as the PySpell/ETL layer, not in-SQL |
 | WITH (CTEs) | ❌ | |

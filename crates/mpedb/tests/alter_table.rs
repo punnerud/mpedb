@@ -110,6 +110,83 @@ fn rename_column_both_syntaxes_and_data_intact() {
 }
 
 #[test]
+fn add_column_rewrites_existing_rows_with_null() {
+    let (cfg, path) = config("add-col");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b TEXT)", &[]).unwrap();
+    for id in 1..=5 {
+        db.query(&format!("INSERT INTO t (id, a, b) VALUES ({id}, {}, 'row{id}')", id * 10), &[])
+            .unwrap();
+    }
+
+    // Add a nullable column. Existing rows gain it as NULL; the OTHER columns
+    // must survive the row rewrite byte-for-byte.
+    db.query("ALTER TABLE t ADD COLUMN c REAL", &[]).unwrap();
+    assert_eq!(scalar_i64(&db, "SELECT a FROM t WHERE id = 3"), 30);
+    assert_eq!(
+        rows(db.query("SELECT b FROM t WHERE id = 3", &[]).unwrap()),
+        vec![vec![Value::Text("row3".into())]]
+    );
+    // The new column is NULL for every pre-existing row.
+    assert_eq!(
+        rows(db.query("SELECT c FROM t WHERE id = 3", &[]).unwrap()),
+        vec![vec![Value::Null]]
+    );
+    // count(c) counts non-NULLs → 0 so far; count(*) is unchanged.
+    assert_eq!(scalar_i64(&db, "SELECT count(*) FROM t"), 5);
+    assert_eq!(scalar_i64(&db, "SELECT count(c) FROM t"), 0);
+
+    // New rows can set the new column; old rows still read back intact.
+    db.query("INSERT INTO t (id, a, b, c) VALUES (6, 60, 'row6', 1.5)", &[]).unwrap();
+    assert_eq!(
+        rows(db.query("SELECT c FROM t WHERE id = 6", &[]).unwrap()),
+        vec![vec![Value::Float(1.5)]]
+    );
+    assert_eq!(scalar_i64(&db, "SELECT count(c) FROM t"), 1);
+    assert_eq!(scalar_i64(&db, "SELECT sum(a) FROM t"), 10 + 20 + 30 + 40 + 50 + 60);
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn add_column_refusals_and_persistence() {
+    let (cfg, path) = config("add-col-refuse");
+    {
+        let db = Database::open_with_config(cfg.clone()).unwrap();
+        db.query("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT)", &[]).unwrap();
+        db.query("INSERT INTO t (id, a) VALUES (1, 100)", &[]).unwrap();
+
+        // v1 refusals: NOT NULL (no default), UNIQUE, PRIMARY KEY on ADD.
+        assert!(db.query("ALTER TABLE t ADD COLUMN x INT NOT NULL", &[]).is_err());
+        assert!(db.query("ALTER TABLE t ADD COLUMN x INT UNIQUE", &[]).is_err());
+        assert!(db.query("ALTER TABLE t ADD COLUMN x INT PRIMARY KEY", &[]).is_err());
+        // Duplicate column name.
+        assert!(db.query("ALTER TABLE t ADD COLUMN a INT", &[]).is_err());
+        // Unknown table.
+        assert!(db.query("ALTER TABLE nope ADD COLUMN x INT", &[]).is_err());
+        // After the refusals a valid ADD still works (no half-applied state).
+        db.query("ALTER TABLE t ADD COLUMN note TEXT", &[]).unwrap();
+        db.query("UPDATE t SET note = 'hi' WHERE id = 1", &[]).unwrap();
+        assert_eq!(
+            rows(db.query("SELECT note FROM t WHERE id = 1", &[]).unwrap()),
+            vec![vec![Value::Text("hi".into())]]
+        );
+        db.verify().unwrap();
+    }
+    // The added column and its data are durable across reopen.
+    {
+        let db = Database::open_with_config(cfg).unwrap();
+        assert_eq!(
+            rows(db.query("SELECT note FROM t WHERE id = 1", &[]).unwrap()),
+            vec![vec![Value::Text("hi".into())]]
+        );
+        assert_eq!(scalar_i64(&db, "SELECT a FROM t WHERE id = 1"), 100);
+        db.verify().unwrap();
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn rename_refusals_match_sqlite() {
     let (cfg, path) = config("refuse");
     let db = Database::open_with_config(cfg).unwrap();

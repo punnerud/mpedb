@@ -666,10 +666,11 @@ impl PySession {
 // PEP 249, so `sqlite3`-shaped code runs unchanged: connect / cursor /
 // execute / fetchall, `?` placeholders, `description`, `rowcount`.
 //
-// What it does NOT pretend: mpedb has no `CREATE TABLE`, so a program that
-// runs DDL fails here, loudly. The schema comes from the config file or from
-// `mirror import`. Saying "sqlite3-compatible" and letting `CREATE TABLE`
-// blow up at run time would be worse than saying so.
+// What it does NOT pretend: mpedb's SQL is a real subset, so an unsupported
+// statement fails here, loudly (ProgrammingError), rather than silently doing
+// something else. Live DDL (`CREATE`/`DROP TABLE`, `ALTER … RENAME`/`ADD COLUMN`)
+// does pass through `query`; the rest of a schema change is a config change or a
+// `mirror import`.
 
 /// A DB-API 2.0 connection: a [`PyDatabase`] plus the transaction state PEP
 /// 249 requires (it has no autocommit — a connection is always in one).

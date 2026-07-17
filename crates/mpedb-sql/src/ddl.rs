@@ -66,6 +66,12 @@ pub enum DdlStmt {
     /// `ALTER TABLE <t> RENAME [COLUMN] <old> TO <new>` — pure schema metadata
     /// (column position/type unchanged, so no row is touched).
     AlterRenameColumn { table: String, column: String, new_name: String },
+    /// `ALTER TABLE <t> ADD [COLUMN] <name> <type> [NULL]` (#47 stage 5) —
+    /// appends a column. Existing rows are rewritten with the new column NULL
+    /// (mpedb's row image is schema-driven, so a widen needs a rewrite). v1
+    /// accepts only a nullable column (the facade refuses NOT NULL / UNIQUE /
+    /// PRIMARY KEY on ADD — no DEFAULT fill and no online index build yet).
+    AlterAddColumn { table: String, column: CreateColumnSpec },
     CreatePolicy(CreatePolicySpec),
     DropPolicy { table: String, name: String },
     AlterRls { table: String, action: RlsAction },
@@ -152,6 +158,31 @@ mod tests {
         );
         // Malformed RENAME COLUMN (no TO) errors.
         assert!(parse_ddl("ALTER TABLE orders RENAME COLUMN qty amount").is_err());
+    }
+
+    #[test]
+    fn alter_add_column_parses() {
+        // COLUMN keyword optional; type required; NULL/NOT NULL/UNIQUE captured.
+        let with_kw = parse_ddl("ALTER TABLE t ADD COLUMN note TEXT").unwrap().unwrap();
+        let bare = parse_ddl("ALTER TABLE t ADD note TEXT").unwrap().unwrap();
+        assert_eq!(with_kw, bare);
+        match with_kw {
+            DdlStmt::AlterAddColumn { table, column } => {
+                assert_eq!(table, "t");
+                assert_eq!(column.name, "note");
+                assert_eq!(column.ty, ColumnType::Text);
+                assert!(!column.not_null && !column.unique && !column.pk);
+            }
+            other => panic!("expected AlterAddColumn, got {other:?}"),
+        }
+        // NOT NULL is captured (the facade, not the parser, refuses it on ADD).
+        match parse_ddl("ALTER TABLE t ADD x INT NOT NULL").unwrap().unwrap() {
+            DdlStmt::AlterAddColumn { column, .. } => assert!(column.not_null),
+            other => panic!("{other:?}"),
+        }
+        // Unknown type / missing type error.
+        assert!(parse_ddl("ALTER TABLE t ADD COLUMN c BOGUS").is_err());
+        assert!(parse_ddl("ALTER TABLE t ADD COLUMN c").is_err());
     }
 
     #[test]

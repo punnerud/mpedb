@@ -234,6 +234,29 @@ impl Schema {
         Ok(schema)
     }
 
+    /// Evolve this schema by APPENDING a column to a table (#47 stage 5). The
+    /// new column takes the highest index, so existing column/index positions
+    /// are untouched; the caller rewrites existing rows with the new column
+    /// NULL. Errors on a name collision or an invalid merged schema (e.g. too
+    /// many columns).
+    pub fn with_added_column(&self, table_id: u32, col: ColumnDef) -> Result<Schema> {
+        let mut tables = self.tables.clone();
+        let slot = tables
+            .get_mut(table_id as usize)
+            .filter(|t| t.id == table_id && !t.dead)
+            .ok_or_else(|| Error::Schema(format!("no live table with id {table_id}")))?;
+        if slot.columns.iter().any(|c| c.name == col.name) {
+            return Err(Error::Schema(format!(
+                "column `{}` already exists in table `{}`",
+                col.name, slot.name
+            )));
+        }
+        slot.columns.push(col);
+        let schema = Schema { tables };
+        schema.validate()?;
+        Ok(schema)
+    }
+
     /// Evolve this schema by RENAMING one column of a table (#47 stage 5). Pure
     /// metadata: the column keeps its position and type, so no row image is
     /// touched. Errors if the column is unknown or the new name collides with a
