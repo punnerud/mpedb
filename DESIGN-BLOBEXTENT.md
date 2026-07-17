@@ -360,6 +360,16 @@ on live databases (§5 — FrozenDb only).
 6. **Leak ledger**: EXTENT_*/REFLINK_HITS reconcile across the differential
    run — #40's method, applied to space.
 
+**Measured (Pi-paired closeout, 2026-07-17).** The Pi (armv7, SD card, the
+steadiest A/B instrument) reports **parity at both sizes**: 4 KiB blobs
+0.993, 64 KiB 1.004 (median of 4 ABAB reps, 16 MiB/arm, durability=none) —
+the box is CPU/SD-bound, and neither the extent path's saved page headers
+nor its coalesced pwrites move anything measurable. The wins are where the
+syscall/header shape dominates: Linux x86 tmpfs 1.70–1.84× (4–8 KiB, after
+per-commit pwrite coalescing) and Apple APFS 1.09–1.39× (16 KiB–1 MiB). The
+Linux 4 KiB / macOS 32 KiB defaults stand — on armv7 the default is measured
+HARMLESS, not helpful, and needs no per-arch carve-out.
+
 ## 14. Open questions
 
 - **Q1 (32-bit ARM) [R]**: the engine full-file-mmaps, so the practical
