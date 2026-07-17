@@ -12,6 +12,7 @@ members = [
     "crates/mpedb-py",
     "crates/mpedb-testkit",
     "crates/mpedb-bench",
+    "crates/mpedb-sqlitefmt",
 ]
 
 [workspace.package]
