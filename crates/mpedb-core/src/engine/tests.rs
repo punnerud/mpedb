@@ -1168,3 +1168,55 @@ primary_key = ["id"]
     eng2.verify_page_accounting().unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+/// An EXPECTED failure (duplicate PK / UNIQUE hit) after which the caller
+/// keeps using the txn must leave NO extent bookkeeping behind — a dangling
+/// map edit would commit an extent nothing references (found by design
+/// review of the failure-order, pinned here).
+#[test]
+fn failed_extent_insert_leaves_no_trace() {
+    let path = std::env::temp_dir()
+        .join("mpedb-engine-tests")
+        .join(format!("extents-fail-{}.mpedb", std::process::id()));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        r#"
+[database]
+path = "{}"
+size_mb = 8
+max_readers = 8
+
+[[table]]
+name = "blobs"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+
+  [[table.column]]
+  name = "data"
+  type = "blob"
+"#,
+        path.display()
+    );
+    let cfg = Config::from_toml_str(&toml).unwrap();
+    let mut eng = Engine::open(&cfg, vec![vec![]]).unwrap();
+    eng.set_extent_threshold(Some(4096));
+    let big = vec![7u8; 10_000];
+    {
+        let mut w = eng.begin_write().unwrap();
+        w.insert_row(0, &[Value::Int(1), Value::Blob(big.clone())]).unwrap();
+        // duplicate: must fail BEFORE any payload byte or map edit exists
+        let err = w
+            .insert_row(0, &[Value::Int(1), Value::Blob(big.clone())])
+            .unwrap_err();
+        assert!(matches!(err, Error::PrimaryKeyViolation { .. }), "{err}");
+        // the txn continues and commits cleanly
+        w.insert_row(0, &[Value::Int(2), Value::Blob(big.clone())]).unwrap();
+        w.commit().unwrap();
+    }
+    eng.verify_page_accounting().unwrap();
+    let _ = std::fs::remove_file(&path);
+}

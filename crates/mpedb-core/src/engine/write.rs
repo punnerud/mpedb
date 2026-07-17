@@ -263,7 +263,54 @@ impl<'e> WriteTxn<'e> {
         let (head, _total) =
             row::encode_row_head_for_stream(values, types, stream_col, src.len())?;
         let (root, count) = self.tree_root(table_id, 0)?;
-        let mut payload = btree::Payload::Stream { head: &head, src };
+        // DESIGN-BLOBEXTENT §4 commitment 4: the declared length reserves the
+        // run up front and the source streams into it via pwrite, a page at a
+        // time — nothing large resident, no mapping faults. A source that
+        // yields FEWER bytes than declared errors out of `next_into` and the
+        // txn hard-aborts: a reference over a partially written run is how a
+        // dead writer's residual bytes would become readable.
+        let total_len = (head.len() + src.len()) as u64;
+        let as_extent = self
+            .eng
+            .extent_threshold
+            .is_some_and(|t| total_len as usize > t);
+        let mut payload = if as_extent {
+            // Same expected-failure rule as insert_row: probe the PK before
+            // any payload byte or bookkeeping exists, so a duplicate leaves
+            // the txn clean enough to continue.
+            if btree::get(self, root, &key)?.is_some() {
+                return Err(Error::PrimaryKeyViolation { table: tname });
+            }
+            let npages = u32::try_from(total_len.div_ceil(PAGE_SIZE as u64))
+                .map_err(|_| Error::Unsupported("value too large for one extent".into()))?;
+            let start_page = self.alloc_run(npages)?;
+            leakstat::add(&leakstat::EXTENT_ALLOC_PAGES, u64::from(npages));
+            let mut off = start_page * PAGE_SIZE as u64;
+            self.eng.shm.file_write_at(&head, off)?;
+            off += head.len() as u64;
+            let mut remaining = src.len();
+            let mut buf = vec![0u8; PAGE_SIZE.min(64 * 1024)];
+            while remaining > 0 {
+                let take = remaining.min(buf.len());
+                src.next_into(&mut buf[..take])?;
+                self.eng.shm.file_write_at(&buf[..take], off)?;
+                off += take as u64;
+                remaining -= take;
+            }
+            let cap = u64::from(npages) * PAGE_SIZE as u64;
+            if total_len < cap {
+                let zeros = [0u8; 4096];
+                self.eng
+                    .shm
+                    .file_write_at(&zeros[..(cap - total_len) as usize], off)?;
+            }
+            self.extent_dirty.push((start_page, npages));
+            self.pending_map_edits
+                .push(extent::MapEdit::Insert(start_page, npages));
+            btree::Payload::ExtentRef { start_page, total_len, npages }
+        } else {
+            btree::Payload::Stream { head: &head, src }
+        };
         let out = btree::insert(self, root, &key, &mut payload, InsertMode::InsertOnly)?;
         if out.existed {
             return Err(Error::PrimaryKeyViolation { table: tname });
@@ -317,11 +364,46 @@ impl<'e> WriteTxn<'e> {
                 .collect(),
             None => Vec::new(),
         };
+        leakstat::add(&leakstat::INS_NS_ENCODE, __t.elapsed().as_nanos() as u64);
+
+        // UNIQUE pre-check on secondary indexes before mutating anything, so
+        // a violation aborts with zero side effects on the dirty state. Only
+        // UNIQUE indexes are checked — a plain `indexed` column allows dups.
+        let sec_unique = self.eng.sec_unique[table_id as usize].clone();
+        for (i, &col) in sec.iter().enumerate() {
+            if !sec_unique[i] {
+                continue;
+            }
+            let v = &values[col as usize];
+            if v.is_null() {
+                continue; // SQL: UNIQUE permits multiple NULLs
+            }
+            let ino = (i + 1) as u32;
+            let (iroot, _) = self.tree_root(table_id, ino)?;
+            let ikey = keycode::encode_key(std::slice::from_ref(v));
+            if btree::get(self, iroot, &ikey)?.is_some() {
+                return Err(Error::UniqueViolation {
+                    table: tname,
+                    constraint: table_column_name(self.eng, table_id, col),
+                });
+            }
+        }
+
         // The extent path writes the payload NOW (pwrite through the file,
         // range-synced at commit) and hands the tree only the reference.
         // A crash before commit publishes nothing: the run allocation lives
         // in this txn's private pool/high-water and dies with it.
+        //
+        // EXPECTED failures must come first: a caller may legally continue
+        // the txn after a PK/UNIQUE violation, and an already-recorded map
+        // edit would then commit an extent nothing references. So the PK is
+        // probed here (UNIQUE was pre-checked above), before any payload
+        // byte or bookkeeping exists.
         let extent_ref = if as_extent {
+            let (root_probe, _) = self.tree_root(table_id, 0)?;
+            if btree::get(self, root_probe, &key)?.is_some() {
+                return Err(Error::PrimaryKeyViolation { table: tname });
+            }
             let total_len = encoded_len as u64;
             let npages = u32::try_from(total_len.div_ceil(PAGE_SIZE as u64))
                 .map_err(|_| Error::Unsupported("value too large for one extent".into()))?;
@@ -348,30 +430,6 @@ impl<'e> WriteTxn<'e> {
             (None, Some(b)) => btree::Payload::Flat(b),
             (None, None) => btree::Payload::Parts(&pieces),
         };
-        leakstat::add(&leakstat::INS_NS_ENCODE, __t.elapsed().as_nanos() as u64);
-
-        // UNIQUE pre-check on secondary indexes before mutating anything, so
-        // a violation aborts with zero side effects on the dirty state. Only
-        // UNIQUE indexes are checked — a plain `indexed` column allows dups.
-        let sec_unique = self.eng.sec_unique[table_id as usize].clone();
-        for (i, &col) in sec.iter().enumerate() {
-            if !sec_unique[i] {
-                continue;
-            }
-            let v = &values[col as usize];
-            if v.is_null() {
-                continue; // SQL: UNIQUE permits multiple NULLs
-            }
-            let ino = (i + 1) as u32;
-            let (iroot, _) = self.tree_root(table_id, ino)?;
-            let ikey = keycode::encode_key(std::slice::from_ref(v));
-            if btree::get(self, iroot, &ikey)?.is_some() {
-                return Err(Error::UniqueViolation {
-                    table: tname,
-                    constraint: table_column_name(self.eng, table_id, col),
-                });
-            }
-        }
 
         let (root, count) = self.tree_root(table_id, 0)?;
         let __t = std::time::Instant::now();

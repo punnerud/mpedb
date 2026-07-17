@@ -432,6 +432,36 @@ pub fn decode_wal_record(buf: &[u8], offset: u64, page_count: u64) -> Option<Wal
     })
 }
 
+/// Powerloss-sim instrumentation: append `(start_page, npages)` pairs of
+/// extent ranges whose msync RETURNED — i.e. ranges that survive real power
+/// loss — to the file named by `MPEDB_EXTENT_SYNC_LOG`, fdatasync'd so the
+/// log itself is as durable as what it records. No-op when unset. Test-only
+/// by construction (one env lookup, cached).
+pub fn extent_sync_log(ranges: &[(u64, u32)]) -> Result<()> {
+    use std::io::Write;
+    use std::sync::OnceLock;
+    static LOG: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
+    let Some(path) = LOG.get_or_init(|| std::env::var_os("MPEDB_EXTENT_SYNC_LOG").map(Into::into))
+    else {
+        return Ok(());
+    };
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map_err(|_| io_err("open(extent sync log)"))?;
+    let mut buf = Vec::with_capacity(ranges.len() * 12);
+    for &(start, npages) in ranges {
+        buf.extend_from_slice(&start.to_le_bytes());
+        buf.extend_from_slice(&npages.to_le_bytes());
+    }
+    f.write_all(&buf).map_err(|_| io_err("write(extent sync log)"))?;
+    if crate::os::fdatasync(std::os::fd::AsRawFd::as_raw_fd(&f)) != 0 {
+        return Err(io_err("fdatasync(extent sync log)"));
+    }
+    Ok(())
+}
+
 /// Per-process handle on the WAL file. `alloc` caches the preallocated
 /// (logical) size — stale-low is harmless (we re-fstat before growing).
 struct WalFile {

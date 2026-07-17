@@ -63,7 +63,7 @@ pub fn run(argv: &[String]) -> CliResult {
         std::fs::create_dir_all(&dir)?;
         let guard = TempDirGuard(dir.clone());
         let cfg = dir.join("config.toml");
-        write_config_durable(&cfg, &dir.join("bench.mpedb"), 128, BENCH_TABLE_TOML, &durability)?;
+        write_config_durable(&cfg, &dir.join("bench.mpedb"), 128, BENCH_TABLE_TOML, &durability, None)?;
         (cfg, Some(guard), format!("--auto (scratch db, durability={durability})"))
     } else {
         let [cfg] = p.positional.as_slice() else {

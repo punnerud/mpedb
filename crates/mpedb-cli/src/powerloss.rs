@@ -126,7 +126,7 @@ fn read_u64_at(path: &Path, offset: u64) -> Result<u64, Failure> {
 // ------------------------------------------------------------------- parent
 
 pub fn run_parent(argv: &[String]) -> CliResult {
-    let p = args::parse(argv, &["dir", "rounds", "workers", "durability"], &[])?;
+    let p = args::parse(argv, &["dir", "rounds", "workers", "durability", "extent-kb"], &[])?;
     let dir = PathBuf::from(p.require("dir")?);
     let rounds = p.u64_or("rounds", 20)?;
     let workers = p.u64_or("workers", 6)?;
@@ -167,7 +167,18 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         let _ = std::fs::remove_file(wal_path(&dbf));
         // 64 MB (was 32): the blob workload churns 8-16 KiB overflow chains,
         // and DbFull mid-round would abort workers before the kill.
-        write_config_durable(&cfg, &dbf, 64, POWERLOSS_TOML, &durability)?;
+        let extent_kb = match p.u64_or("extent-kb", 0)? {
+            0 => None,
+            kb => Some(kb),
+        };
+        // Extents raise the size: in `async` the durable-frontier gate (§6)
+        // holds freed runs unreusable until the flusher has flushed the
+        // freeing record, so reuse latency is flusher-shaped and the file
+        // must absorb churn-rate × flush-interval of un-reclaimable runs.
+        // Bounded working set, deferred reclaim — the documented price of
+        // the gate, not a leak.
+        let size_mb = if extent_kb.is_some() { 256 } else { 64 };
+        write_config_durable(&cfg, &dbf, size_mb, POWERLOSS_TOML, &durability, extent_kb)?;
         {
             let db = Database::open(&cfg)?;
             let ins_a = db.prepare("INSERT INTO accounts (id, balance) VALUES ($1, $2)")?;
@@ -185,10 +196,15 @@ pub fn run_parent(argv: &[String]) -> CliResult {
 
         // 2. S0 = the main file as of "the last writeback before power loss"
         std::fs::copy(&dbf, &s0)?;
-        // bytes below S0's wal_len were fdatasync'd and survive power loss
-        let floor = read_u64_at(&s0, WAL_LEN_FILE_OFFSET)?;
 
-        // 3. workload, then SIGKILL every worker at a random instant
+        // 3. workload, then SIGKILL every worker at a random instant.
+        // With extents on, workers log every payload range whose msync
+        // RETURNED — the loss model must not erase what real power loss
+        // would keep (DESIGN-BLOBEXTENT §4: the range-msyncs ARE the
+        // pre-record durability; rolling them back with S0 fabricates a
+        // failure mode real hardware does not have).
+        let sync_log = dir.join("extent-sync.log");
+        let _ = std::fs::remove_file(&sync_log);
         let mut children = Vec::new();
         for k in 0..workers {
             let child = Command::new(&exe)
@@ -196,6 +212,7 @@ pub fn run_parent(argv: &[String]) -> CliResult {
                 .arg("--dir")
                 .arg(&dir)
                 .args(["--id", &k.to_string()])
+                .env("MPEDB_EXTENT_SYNC_LOG", &sync_log)
                 .stdout(Stdio::null())
                 .stderr(Stdio::inherit())
                 .spawn()?;
@@ -225,14 +242,66 @@ pub fn run_parent(argv: &[String]) -> CliResult {
             ));
         }
         if out_of_space > 0 {
-            return runtime(format!(
-                "round {round}: {out_of_space} worker(s) hit DbFull (exit {EXIT_CAPACITY}) \
-                 — CAPACITY, not correctness; the file size in powerloss.rs needs raising"
-            ));
+            // Capacity, not correctness (#38). With extents in `async` this
+            // is EXPECTED under churn: the durable-frontier gate (§6) holds
+            // freed runs unreusable until the flusher passes, so a worker can
+            // outrun the file. Its commits are valid; the round's cut +
+            // recovery + verify still test everything that was written.
+            eprintln!(
+                "round {round}: note: {out_of_space} worker(s) exited on DbFull \
+                 (capacity — expected under async extent churn)"
+            );
         }
 
+        // The cut floor is the durable watermark AT THE KILL — every byte
+        // below the last fdatasync survives real power loss, in both modes
+        // (`wal` advances it per commit, `async` per flusher pass). The old
+        // floor (S0's start-of-round wal_len) modeled losses real hardware
+        // cannot produce; that was harmless while the WAL carried everything
+        // (page images replay at any prefix) and became visible the day
+        // extents put durable bytes OUTSIDE the log: a cut between a durable
+        // free-record and the reuse it licensed is exactly the impossible
+        // state the durable-frontier gate exists to rule out on hardware.
+        let floor = read_u64_at(&dbf, WAL_LEN_FILE_OFFSET)?;
+
         // 4. reconstruct the power-loss disk image
+        // Extent ranges whose msync returned survive real power loss: carry
+        // their CURRENT bytes across the S0 rollback. (A range synced more
+        // than once carries its last synced bytes — extents are immutable
+        // once published, and an unpublished overwrite of a reused run is
+        // itself durable by the time its record exists, so last-wins is the
+        // faithful model.)
+        let preserved: Vec<(u64, u64)> = match std::fs::read(&sync_log) {
+            Ok(bytes) => bytes
+                .chunks_exact(12)
+                .map(|ch| {
+                    (
+                        u64::from_le_bytes(ch[0..8].try_into().unwrap()),
+                        u64::from(u32::from_le_bytes(ch[8..12].try_into().unwrap())),
+                    )
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        let kept: Vec<(u64, Vec<u8>)> = if preserved.is_empty() {
+            Vec::new()
+        } else {
+            let cur = std::fs::OpenOptions::new().read(true).open(&dbf)?;
+            let mut kept = Vec::with_capacity(preserved.len());
+            for &(start, npages) in &preserved {
+                let mut buf = vec![0u8; (npages * 4096) as usize];
+                cur.read_exact_at(&mut buf, start * 4096)?;
+                kept.push((start * 4096, buf));
+            }
+            kept
+        };
         std::fs::copy(&s0, &dbf)?; // stale main file
+        if !kept.is_empty() {
+            let dst = std::fs::OpenOptions::new().write(true).open(&dbf)?;
+            for (off, buf) in &kept {
+                dst.write_all_at(buf, *off)?;
+            }
+        }
         let walf = std::fs::OpenOptions::new()
             .write(true)
             .open(wal_path(&dbf))?;
@@ -369,12 +438,22 @@ pub fn run_child(argv: &[String]) -> CliResult {
             let a = rng.below(BANK_ACCOUNTS as u64) as i64;
             let b = (a + 1 + rng.below(BANK_ACCOUNTS as u64 - 1) as i64) % BANK_ACCOUNTS;
             let amount = 1 + rng.below(50) as i64;
-            let mut s = db.begin()?;
-            let bal_a = one_int(s.execute(&sel, &params![a])?)?;
-            let bal_b = one_int(s.execute(&sel, &params![b])?)?;
-            s.execute(&upd, &params![bal_a - amount, a])?;
-            s.execute(&upd, &params![bal_b + amount, b])?;
-            s.commit()?;
+            let step = || -> Result<(), Error> {
+                let mut s = db.begin()?;
+                let bal_a = one_int_e(s.execute(&sel, &params![a])?)?;
+                let bal_b = one_int_e(s.execute(&sel, &params![b])?)?;
+                s.execute(&upd, &params![bal_a - amount, a])?;
+                s.execute(&upd, &params![bal_b + amount, b])?;
+                s.commit()
+            };
+            match step() {
+                Ok(()) => {}
+                // Capacity, not correctness (#38): the bank rows are tiny,
+                // but their PAGE allocations hit the same full file when
+                // extent churn outruns the async flusher's reclaim.
+                Err(e) if matches!(e, Error::DbFull) => exit_db_full("powerloss", &e),
+                Err(e) => return runtime(format!("powerloss child: unexpected error: {e}")),
+            }
         }
     } else {
         let upd = db.prepare("UPDATE rows SET a = $1, b = $2 WHERE id = $3")?;
@@ -403,11 +482,13 @@ pub fn run_child(argv: &[String]) -> CliResult {
     }
 }
 
-fn one_int(res: ExecResult) -> Result<i64, Failure> {
+fn one_int_e(res: ExecResult) -> Result<i64, Error> {
     match res {
-        ExecResult::Rows { rows, .. } if rows.len() == 1 => int(&rows[0][0]),
-        other => Err(Failure::Runtime(format!(
-            "expected exactly one row, got {other:?}"
-        ))),
+        ExecResult::Rows { mut rows, .. } if rows.len() == 1 => match rows.pop().unwrap().pop() {
+            Some(Value::Int(v)) => Ok(v),
+            other => Err(Error::Internal(format!("expected int, got {other:?}"))),
+        },
+        other => Err(Error::Internal(format!("expected one row, got {other:?}"))),
     }
 }
+

@@ -289,7 +289,10 @@ impl Database {
                 })?;
             require_policy.insert(id as u32);
         }
-        let engine = Engine::open(&config, checks)?;
+        let mut engine = Engine::open(&config, checks)?;
+        // DESIGN-BLOBEXTENT §8: per-process knob, like durability. The format
+        // self-describes, so this only decides what NEW writes do.
+        engine.set_extent_threshold(config.options.extent_threshold);
         Ok(Database {
             engine,
             cache: RwLock::new(HashMap::new()),

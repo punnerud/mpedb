@@ -169,7 +169,7 @@ fn check_blob_cols(id: i64, data: &Value, seq: &Value, kb: u64) -> Result<bool, 
 pub fn run_parent(argv: &[String]) -> CliResult {
     let p = args::parse(
         argv,
-        &["dir", "waves", "children", "durability", "concurrency", "size_mb", "blob-kb"],
+        &["dir", "waves", "children", "durability", "concurrency", "size_mb", "blob-kb", "extent-kb"],
         &[],
     )?;
     let dir = PathBuf::from(p.require("dir")?);
@@ -179,6 +179,13 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         return usage("--waves and --children must be >= 1");
     }
     let blob_kb = p.u64_or("blob-kb", 0)?;
+    // DESIGN-BLOBEXTENT §13.3: with a threshold the blob ops become extent
+    // ops, so the SIGKILL waves exercise the run allocator + map + reclaim.
+    // The children read it from the CONFIG file, not from argv.
+    let extent_kb = match p.u64_or("extent-kb", 0)? {
+        0 => None,
+        kb => Some(kb),
+    };
     if blob_kb > 256 {
         eprintln!(
             "crash: note: --blob-kb {blob_kb} > 256 — a single blob write can dominate \
@@ -213,7 +220,7 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         None => 64,
     };
     let tables = if blob_kb > 0 { CRASH_BLOB_TOML } else { CRASH_TOML };
-    write_config_concurrency(&cfg, &dbf, size_mb, tables, &durability, &concurrency)?;
+    write_config_concurrency(&cfg, &dbf, size_mb, tables, &durability, &concurrency, extent_kb)?;
 
     // Create + seed so children (and readers) always find the full keyspace.
     {

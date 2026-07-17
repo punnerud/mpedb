@@ -211,6 +211,14 @@ impl<'e> WriteTxn<'e> {
                         npages as usize * PAGE_SIZE,
                     )?;
                 }
+                // Test instrumentation (powerloss sim): the sim's loss model
+                // rolls the main file back to a snapshot — which would erase
+                // exactly the ranges the msyncs above made durable. This log
+                // tells it which ranges SURVIVE real power loss. No-op unless
+                // the env var is set.
+                if !self.extent_dirty.is_empty() {
+                    crate::shm::extent_sync_log(&self.extent_dirty)?;
+                }
                 let mut ids: Vec<u64> = self.dirty.iter().copied().collect();
                 ids.sort_unstable();
                 if self.eng.shm.durability == Durability::Async {

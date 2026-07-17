@@ -91,6 +91,11 @@ pub struct DbOptions {
     pub durability: Durability,
     pub concurrency: Concurrency,
     pub perms: FilePerms,
+    /// Extent threshold in BYTES; `None` = the extent path is off
+    /// (DESIGN-BLOBEXTENT §8). Per-process like `durability` — the on-disk
+    /// format self-describes (`vkind=2` cells), so processes with different
+    /// thresholds only differ in what NEW writes do.
+    pub extent_threshold: Option<usize>,
     /// Names of tables declared `require_policy = true` (DESIGN-MULTIDB §6.3).
     /// A prepare touching one of these fails closed unless RLS is enabled AND a
     /// policy governs the command being compiled — the answer to "one forgotten
@@ -138,6 +143,11 @@ struct RawDatabase {
     owner: Option<String>,
     #[serde(default)]
     group: Option<String>,
+    /// Values whose encoded payload exceeds this many KiB take an extent run
+    /// instead of an overflow chain (DESIGN-BLOBEXTENT §8). Absent = the
+    /// extent path is off — today's behavior byte for byte.
+    #[serde(default)]
+    extent_threshold_kb: Option<u64>,
 }
 
 fn default_size_mb() -> u64 {
@@ -310,6 +320,7 @@ fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>) -> Result<Config> {
                     owner: db.owner,
                     group: db.group,
                 },
+                extent_threshold: db.extent_threshold_kb.map(|kb| kb as usize * 1024),
                 require_policy,
             },
             schema: Schema::new(tables)?,
@@ -373,6 +384,7 @@ impl RawMember {
                 mode: self.mode,
                 owner: self.owner,
                 group: self.group,
+                extent_threshold_kb: None,
             },
             self.tables,
         )
