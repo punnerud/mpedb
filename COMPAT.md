@@ -19,10 +19,11 @@ Two things make this page different from a typical compatibility list:
    mpedb does not support is refused at compile time, usually with the manual
    fix in the message. The narrowness is the design; what compiles, matches.
 
-Schema is the other structural difference: mpedb has no in-band DDL — tables
-come from the config file (or `mirror import` from an existing sqlite/PostgreSQL
-database), columns are rigidly typed, and a wrong type is a write-time error.
-sqlite `STRICT` still converts losslessly (`'42'` → `42`); mpedb does not.
+Schema is the other structural difference: mpedb's tables come from the config
+file (or `mirror import` from an existing sqlite/PostgreSQL database) or from
+in-band `CREATE TABLE` (#47 — live, multi-process, on the shared file). Columns
+are rigidly typed, and a wrong type is a write-time error. sqlite `STRICT` still
+converts losslessly (`'42'` → `42`); mpedb does not.
 
 ## Statements
 
@@ -39,8 +40,8 @@ sqlite `STRICT` still converts losslessly (`'42'` → `42`); mpedb does not.
 | BEGIN / COMMIT / ROLLBACK | ✅ | maps to a write session; readers use MVCC snapshots and never block |
 | SAVEPOINT / RELEASE | ❌ | savepoints exist at the engine level (import rollback), not in SQL |
 | EXPLAIN | ✅ | plan form (access path, index choice, residuals), not VDBE opcodes |
-| CREATE TABLE / DROP TABLE | ❌ | schema is the config file or `mirror import`; live DDL is designed ([DESIGN-DDL.md](DESIGN-DDL.md)), not built |
-| ALTER TABLE | ❌ | same — a schema change is a config change today |
+| CREATE TABLE | ✅ | live, multi-process, on the shared file — `PRIMARY KEY` (inline or table-level composite), `NOT NULL`, `UNIQUE` (column or composite); other processes see the new table on their next statement. `DEFAULT`/`CHECK`/foreign keys refuse by name (declare them in the config schema for now) |
+| DROP TABLE / ALTER TABLE | ❌ | designed ([DESIGN-DDL.md](DESIGN-DDL.md)), staged after CREATE — a schema change beyond adding a table is a config change today |
 | CREATE INDEX | **Not needed** | `unique = true` / `indexed = true` on a column, or `[[table.index]]` with a column LIST for composite (unique or not) — equality on the full width or any prefix, range on the first column, visible in EXPLAIN |
 | CREATE VIEW / CREATE TRIGGER | ❌ | triggers' job is planned as the PySpell/ETL layer, not in-SQL |
 | WITH (CTEs) | ❌ | |

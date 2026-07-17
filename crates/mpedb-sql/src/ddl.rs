@@ -4,7 +4,34 @@
 //! them via its policy-store API. `USING`/`WITH CHECK` predicates are captured
 //! as SOURCE text (re-bound by the planner per statement, §3.2).
 
-use mpedb_types::PolicyCmd;
+use mpedb_types::{ColumnType, PolicyCmd};
+
+/// One column of a `CREATE TABLE` (#47 stage 2). Types are the config's
+/// names (`int64`/`int`/`integer`, `text`, `real`, `bool`, `blob`,
+/// `timestamp`, `any`), constraints the useful subset: `NOT NULL`,
+/// `UNIQUE`, `PRIMARY KEY`. `DEFAULT`/`CHECK` are named refusals for now.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateColumnSpec {
+    pub name: String,
+    pub ty: ColumnType,
+    pub not_null: bool,
+    pub unique: bool,
+    pub pk: bool,
+}
+
+/// `CREATE TABLE <name> (col TYPE [cons…], …[, PRIMARY KEY (a, b)]
+/// [, UNIQUE (a, b)]…)` — applied by the facade as a catalog mutation
+/// under the writer lock, never compiled to a plan.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTableSpec {
+    pub name: String,
+    pub columns: Vec<CreateColumnSpec>,
+    /// Table-level `PRIMARY KEY (…)`; empty when a column carries the
+    /// inline `PRIMARY KEY` flag instead.
+    pub table_pk: Vec<String>,
+    /// Table-level `UNIQUE (…)` groups — composite unique indexes (#55).
+    pub uniques: Vec<Vec<String>>,
+}
 
 /// `CREATE POLICY <name> ON <table> [AS PERMISSIVE|RESTRICTIVE]
 ///   [FOR ALL|SELECT|INSERT|UPDATE|DELETE] USING (<expr>) [WITH CHECK (<expr>)]`
@@ -27,6 +54,7 @@ pub enum RlsAction {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DdlStmt {
+    CreateTable(CreateTableSpec),
     CreatePolicy(CreatePolicySpec),
     DropPolicy { table: String, name: String },
     AlterRls { table: String, action: RlsAction },
@@ -93,5 +121,69 @@ mod tests {
         assert!(parse_ddl("CREATE POLICY p ON orders USING (").is_err()); // unbalanced
         assert!(parse_ddl("ALTER TABLE orders ENABLE").is_err()); // missing ROW LEVEL SECURITY
         assert!(parse_ddl("CREATE POLICY p ON orders FOR BOGUS USING (id = 1)").is_err());
+    }
+
+    fn create_table(sql: &str) -> CreateTableSpec {
+        match parse_ddl(sql).unwrap().unwrap() {
+            DdlStmt::CreateTable(s) => s,
+            other => panic!("expected CreateTable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_table_inline_pk_and_constraints() {
+        let s = create_table(
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE, \
+             age INT NULL)",
+        );
+        assert_eq!(s.name, "users");
+        assert_eq!(s.columns.len(), 3);
+        assert_eq!(s.columns[0].name, "id");
+        assert_eq!(s.columns[0].ty, ColumnType::Int64);
+        assert!(s.columns[0].pk);
+        assert_eq!(s.columns[1].name, "email");
+        assert_eq!(s.columns[1].ty, ColumnType::Text);
+        assert!(s.columns[1].not_null && s.columns[1].unique);
+        assert!(!s.columns[2].not_null); // explicit NULL
+        assert!(s.table_pk.is_empty());
+        assert!(s.uniques.is_empty());
+    }
+
+    #[test]
+    fn create_table_composite_key_and_unique_groups() {
+        let s = create_table(
+            "CREATE TABLE lines (order_id INT, line_no INT, sku TEXT, qty INT, \
+             PRIMARY KEY (order_id, line_no), UNIQUE (order_id, sku))",
+        );
+        assert_eq!(s.columns.len(), 4);
+        assert!(s.columns.iter().all(|c| !c.pk));
+        assert_eq!(s.table_pk, vec!["order_id", "line_no"]);
+        assert_eq!(s.uniques, vec![vec!["order_id".to_string(), "sku".to_string()]]);
+    }
+
+    #[test]
+    fn create_table_every_type_word() {
+        let s = create_table(
+            "CREATE TABLE t (a INT PRIMARY KEY, b int64, c integer, d text, e string, \
+             f real, g float, h bool, i boolean, j blob, k bytes, l timestamp, m any)",
+        );
+        use ColumnType::*;
+        let got: Vec<ColumnType> = s.columns.iter().map(|c| c.ty).collect();
+        assert_eq!(
+            got,
+            vec![Int64, Int64, Int64, Text, Text, Float64, Float64, Bool, Bool, Blob, Blob,
+                 Timestamp, Any]
+        );
+    }
+
+    #[test]
+    fn create_table_malformed_and_unsupported_refuse() {
+        assert!(parse_ddl("CREATE TABLE t (id INT PRIMARY KEY,)").is_err()); // trailing comma → empty col
+        assert!(parse_ddl("CREATE TABLE t (id BOGUSTYPE)").is_err()); // unknown type
+        assert!(parse_ddl("CREATE TABLE t (id INT DEFAULT 0)").is_err()); // DEFAULT unsupported
+        assert!(parse_ddl("CREATE TABLE t (id INT CHECK (id > 0))").is_err()); // CHECK unsupported
+        assert!(parse_ddl("CREATE TABLE t (id INT REFERENCES o(id))").is_err()); // FK unsupported
+        assert!(parse_ddl("CREATE TABLE t id INT)").is_err()); // missing (
+        assert!(parse_ddl("CREATE TABLE t (id INT").is_err()); // missing )
     }
 }

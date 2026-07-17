@@ -109,7 +109,11 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
     let ddl = match p.peek_ident_ci().as_deref() {
         Some("create") => {
             p.advance();
-            p.parse_create_policy()?
+            if p.eat_word("TABLE") {
+                p.parse_create_table()?
+            } else {
+                p.parse_create_policy()?
+            }
         }
         Some("drop") => {
             p.advance();
@@ -394,6 +398,93 @@ impl<'a> Parser<'a> {
         self.expect_word("ROW")?;
         self.expect_word("LEVEL")?;
         self.expect_word("SECURITY")
+    }
+
+    /// `CREATE TABLE name (col TYPE [NOT NULL|UNIQUE|PRIMARY KEY]…,
+    /// …[, PRIMARY KEY (a, b)][, UNIQUE (a, b)]…)`. Semantics (id
+    /// assignment, pk resolution, validation) live in the facade/engine —
+    /// this only builds the spec. `DEFAULT`/`CHECK`/foreign keys refuse by
+    /// name so the gap is visible, not silent.
+    fn parse_create_table(&mut self) -> Result<DdlStmt> {
+        let name = self.ident("table name")?;
+        self.expect(&Tok::LParen, "(")?;
+        let mut columns = Vec::new();
+        let mut table_pk: Vec<String> = Vec::new();
+        let mut uniques: Vec<Vec<String>> = Vec::new();
+        loop {
+            if self.eat_word("PRIMARY") {
+                self.expect_word("KEY")?;
+                if !table_pk.is_empty() {
+                    return Err(self.err_here("duplicate table-level PRIMARY KEY"));
+                }
+                table_pk = self.paren_ident_list()?;
+            } else if self.eat_word("UNIQUE") {
+                uniques.push(self.paren_ident_list()?);
+            } else {
+                let cname = self.ident("column name")?;
+                let tyword = self.ident("column type")?;
+                let Some(ty) = mpedb_types::ColumnType::parse(&tyword.to_ascii_lowercase())
+                else {
+                    return Err(self.err_here(format!(
+                        "unknown column type `{tyword}` (int64/text/real/bool/blob/\
+                         timestamp/any)"
+                    )));
+                };
+                let mut col = crate::ddl::CreateColumnSpec {
+                    name: cname,
+                    ty,
+                    not_null: false,
+                    unique: false,
+                    pk: false,
+                };
+                loop {
+                    // NOT and NULL are reserved keywords (Tok::Kw), not
+                    // identifiers — the rest of the constraint words are not.
+                    if self.eat_kw(Kw::Not) {
+                        self.expect_kw(Kw::Null, "NULL")?;
+                        col.not_null = true;
+                    } else if self.eat_kw(Kw::Null) {
+                        col.not_null = false;
+                    } else if self.eat_word("UNIQUE") {
+                        col.unique = true;
+                    } else if self.eat_word("PRIMARY") {
+                        self.expect_word("KEY")?;
+                        col.pk = true;
+                    } else if self.eat_word("DEFAULT") || self.eat_word("CHECK")
+                        || self.eat_word("REFERENCES")
+                    {
+                        return Err(self.err_here(
+                            "DEFAULT/CHECK/REFERENCES are not supported in CREATE TABLE \
+                             yet — declare them in the config schema",
+                        ));
+                    } else {
+                        break;
+                    }
+                }
+                columns.push(col);
+            }
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RParen, ")")?;
+        Ok(DdlStmt::CreateTable(crate::ddl::CreateTableSpec {
+            name,
+            columns,
+            table_pk,
+            uniques,
+        }))
+    }
+
+    /// `( ident [, ident]* )`
+    fn paren_ident_list(&mut self) -> Result<Vec<String>> {
+        self.expect(&Tok::LParen, "(")?;
+        let mut out = vec![self.ident("column name")?];
+        while self.eat(&Tok::Comma) {
+            out.push(self.ident("column name")?);
+        }
+        self.expect(&Tok::RParen, ")")?;
+        Ok(out)
     }
 
     fn parse_create_policy(&mut self) -> Result<DdlStmt> {

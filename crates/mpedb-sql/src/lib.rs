@@ -25,7 +25,7 @@ mod planner;
 mod policy;
 mod token;
 
-pub use ddl::{CreatePolicySpec, DdlStmt, RlsAction};
+pub use ddl::{CreateColumnSpec, CreatePolicySpec, CreateTableSpec, DdlStmt, RlsAction};
 pub use plan::{
     AccessPath, AggCall, Aggregation, CompiledPlan, CompoundPlan, ConflictProbe, GroupKey,
     InsertSource, Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp, Projection,
