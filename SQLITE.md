@@ -129,9 +129,16 @@ The full design — reviewed hard (20 adversarial findings folded) — is
   commits under your unpushed deltas, per-PK conflicts are PROVEN rather
   than assumed — untouched deltas ride through, real conflicts resolve by
   the named policy you pass (`--reconcile ours|theirs` at open, or
-  `.reconcile ours|theirs` in the repl), counted and reported. Remaining
-  for v2 proper: non-INTEGER-PK WITHOUT ROWID shapes and the multi-process
-  co-attach story.
+  `.reconcile ours|theirs` in the repl), counted and reported. **Shapes**:
+  rowid tables (INTEGER PK or synthetic rowid) and WITHOUT ROWID tables
+  with one INTEGER- or TEXT-affinity PK — text keys merge in BINARY order
+  on both sides, which is the storage order of both engines.
+  **Co-attach**: several handles/processes share one overlay (the overlay
+  IS a multi-process mpedb file; each holds its own base SHARED), see each
+  other's deltas live, and a handle whose base moved under a co-attached
+  peer's checkpoint re-reads the shared stamp and adopts instead of
+  refusing. The one remaining v3 item: WAL-mode bases (needs a WAL-reading
+  native reader; refused by name today).
 - v3 (measured, maybe never): sqlite index probes for cold reads, hot-row
   promotion, WAL-mode bases.
 

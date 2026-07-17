@@ -114,6 +114,44 @@ fn checkpoint_roundtrip_against_the_library() {
 }
 
 #[test]
+fn text_pk_deltas_checkpoint_into_the_base() {
+    let p = std::env::temp_dir()
+        .join("mpedb-checkpoint-tests")
+        .join(format!("cp-textpk-{}.db", std::process::id()));
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    for suffix in ["", ".overlay.mpedb", ".overlay.probe"] {
+        let _ = std::fs::remove_file(format!("{}{}", p.display(), suffix));
+    }
+    {
+        let c = Connection::open(&p).unwrap();
+        c.execute_batch(
+            "PRAGMA journal_mode = DELETE;
+             CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID;
+             INSERT INTO kv VALUES ('alpha',1),('beta',2),('gamma',3);",
+        )
+        .unwrap();
+    }
+    let mut ovl = SqliteOverlay::open(&p).unwrap();
+    ovl.query("UPDATE kv SET v = 22 WHERE k = 'beta'", &[]).unwrap();
+    ovl.query("DELETE FROM kv WHERE k = 'gamma'", &[]).unwrap();
+    ovl.query("INSERT INTO kv (k, v) VALUES ('zeta', 9)", &[]).unwrap();
+    let r = ovl.checkpoint().unwrap();
+    assert_eq!((r.upserts, r.deletes), (2, 1));
+    drop(ovl);
+    let c = Connection::open(&p).unwrap();
+    let v: i64 = c.query_row("SELECT v FROM kv WHERE k = 'beta'", [], |r| r.get(0)).unwrap();
+    assert_eq!(v, 22);
+    let gone: i64 =
+        c.query_row("SELECT count(*) FROM kv WHERE k = 'gamma'", [], |r| r.get(0)).unwrap();
+    assert_eq!(gone, 0);
+    let z: i64 = c.query_row("SELECT v FROM kv WHERE k = 'zeta'", [], |r| r.get(0)).unwrap();
+    assert_eq!(z, 9);
+    drop(c);
+    let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
 fn reconcile_ours_then_checkpoint_lands_ours_in_the_base() {
     let p = setup("reconcile-ours");
     {
@@ -135,6 +173,35 @@ fn reconcile_ours_then_checkpoint_lands_ours_in_the_base() {
         lib.query_row("SELECT name FROM users WHERE id = 10", [], |r| r.get(0)).unwrap();
     assert_eq!(name, "vaar", "ours must overwrite theirs at checkpoint");
     drop(lib);
+    let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn co_attached_optimistic_handle_adopts_after_the_others_checkpoint() {
+    let p = setup("co-ckpt");
+    let mut a = SqliteOverlay::open_with_mode(&p, LockMode::Optimistic).unwrap();
+    let mut b = SqliteOverlay::open_with_mode(&p, LockMode::Optimistic).unwrap();
+
+    a.query("INSERT INTO users (id, name, age) VALUES (900, 'delt', 1)", &[]).unwrap();
+    // b sees the shared delta before any checkpoint.
+    assert_eq!(count(&mut b, "SELECT count(*) FROM users WHERE id = 900"), 1);
+
+    // a checkpoints: the base moves and the SHARED overlay gets the fresh
+    // stamp. b's next bracket finds its in-memory stamp stale, re-reads the
+    // stored one, sees it matches the base — a co-attached process moved it
+    // legitimately — and adopts instead of refusing.
+    let r = a.checkpoint().unwrap();
+    assert_eq!((r.upserts, r.deletes), (1, 0));
+    assert_eq!(count(&mut b, "SELECT count(*) FROM users WHERE id = 900"), 1);
+    assert_eq!(count(&mut b, "SELECT count(*) FROM users"), 51);
+    // …and b keeps writing normally on the adopted base.
+    b.query("UPDATE users SET name = 'etter' WHERE id = 900", &[]).unwrap();
+    let got = rows(b.query("SELECT name FROM users WHERE id = 900", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Text("etter".into())]]);
+
+    drop(a);
+    drop(b);
     let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));
     let _ = std::fs::remove_file(&p);
 }

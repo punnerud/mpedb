@@ -29,8 +29,11 @@ enum PkKind {
     Ipk(usize),
     /// No integer PK: a synthetic trailing `rowid` column carries it.
     SyntheticRowid,
-    /// WITHOUT ROWID, single integer PK at this declared index.
-    WithoutRowidInt(usize),
+    /// WITHOUT ROWID, single INTEGER- or TEXT-affinity PK at this declared
+    /// index. Storage order is the PK's b-tree order — int order for
+    /// integers, BINARY (memcmp) for text — which matches mpedb's keycode
+    /// order for the same types, so merges and range scans line up.
+    WithoutRowidKey(usize, ColumnType),
 }
 
 struct Attached {
@@ -76,10 +79,10 @@ fn any_col(name: &str) -> ColumnDef {
     }
 }
 
-fn int_pk_col(name: &str) -> ColumnDef {
+fn pk_col(name: &str, ty: ColumnType) -> ColumnDef {
     ColumnDef {
         name: name.to_string(),
-        ty: ColumnType::Int64,
+        ty,
         nullable: false,
         unique: false,
         indexed: false,
@@ -88,8 +91,23 @@ fn int_pk_col(name: &str) -> ColumnDef {
     }
 }
 
-fn int_affinity(decl: &str) -> bool {
-    decl.to_ascii_uppercase().contains("INT")
+fn int_pk_col(name: &str) -> ColumnDef {
+    pk_col(name, ColumnType::Int64)
+}
+
+/// sqlite's affinity classification, restricted to the two PK shapes the
+/// attach serves: INTEGER affinity (rule 1: contains "INT") and TEXT
+/// affinity (rule 2: contains "CHAR", "CLOB", or "TEXT"). Everything else
+/// (REAL/NUMERIC/BLOB PKs) stays a named skip.
+fn pk_affinity(decl: &str) -> Option<ColumnType> {
+    let d = decl.to_ascii_uppercase();
+    if d.contains("INT") {
+        Some(ColumnType::Int64)
+    } else if d.contains("CHAR") || d.contains("CLOB") || d.contains("TEXT") {
+        Some(ColumnType::Text)
+    } else {
+        None
+    }
 }
 
 impl SqliteAttach {
@@ -122,18 +140,25 @@ impl SqliteAttach {
                     TableDef { name: t.name.clone(), columns: cols, primary_key: vec![ipk as u16] },
                 )
             } else if t.without_rowid {
-                let pk_idx = (t.pk_order.len() == 1)
+                let found = (t.pk_order.len() == 1)
                     .then(|| {
                         t.columns
                             .iter()
                             .position(|c| c.eq_ignore_ascii_case(&t.pk_order[0]))
                     })
                     .flatten()
-                    .filter(|i| t.decl_types.get(*i).is_some_and(|d| int_affinity(d)));
-                let Some(i) = pk_idx else {
+                    .and_then(|i| {
+                        t.decl_types
+                            .get(i)
+                            .and_then(|d| pk_affinity(d))
+                            .map(|ty| (i, ty))
+                    });
+                let Some((i, ty)) = found else {
                     skipped.push((
                         t.name.clone(),
-                        "WITHOUT ROWID with a non-single-integer PK (v1 shape rule)".into(),
+                        "WITHOUT ROWID with a PK that is not one INTEGER- or TEXT-affinity \
+                         column (shape rule)"
+                            .into(),
                     ));
                     continue;
                 };
@@ -141,10 +166,10 @@ impl SqliteAttach {
                     .columns
                     .iter()
                     .enumerate()
-                    .map(|(j, c)| if j == i { int_pk_col(c) } else { any_col(c) })
+                    .map(|(j, c)| if j == i { pk_col(c, ty) } else { any_col(c) })
                     .collect();
                 (
-                    PkKind::WithoutRowidInt(i),
+                    PkKind::WithoutRowidKey(i, ty),
                     TableDef { name: t.name.clone(), columns: cols, primary_key: vec![i as u16] },
                 )
             } else {
@@ -228,30 +253,31 @@ impl SqliteCtx<'_> {
             .ok_or_else(|| Error::Internal("table id out of range".into()))
     }
 
-    /// Decode a raw keycode bound (single-column int64 PK) back to a rowid
+    /// Decode a raw keycode bound (single-column PK of `ty`) back to a key
     /// plus its EFFECTIVE inclusivity. Bounds arrive normalized with prefix
     /// semantics (`range_bounds`): a clean decode means the bound sits
     /// exactly at `enc(v)` — the flag carries; a 0xFF-suffixed raw sits just
     /// ABOVE every key equal to `v`, so the effective inclusivity FLIPS
     /// (lo-exclusive and hi-inclusive are the suffixed forms).
-    fn bound_to_int(b: Option<(&[u8], bool)>) -> Result<Option<(i64, bool)>> {
+    fn bound_to_key(b: Option<(&[u8], bool)>, ty: ColumnType) -> Result<Option<(Key, bool)>> {
         match b {
             None => Ok(None),
             Some((raw, incl)) => {
-                let (vals, flipped) = match keycode::decode_key(raw, &[ColumnType::Int64]) {
+                let (vals, flipped) = match keycode::decode_key(raw, &[ty]) {
                     Ok(v) => (v, false),
                     Err(_) => (
                         keycode::decode_key(
                             raw.get(..raw.len().saturating_sub(1)).unwrap_or(raw),
-                            &[ColumnType::Int64],
+                            &[ty],
                         )
                         .map_err(|_| Error::Internal("undecodable PK bound".into()))?,
                         true,
                     ),
                 };
-                match vals.first() {
-                    Some(Value::Int(i)) => Ok(Some((*i, incl != flipped))),
-                    _ => Err(Error::Internal("non-int PK bound".into())),
+                match vals.into_iter().next() {
+                    Some(Value::Int(i)) => Ok(Some((Key::Int(i), incl != flipped))),
+                    Some(Value::Text(s)) => Ok(Some((Key::Text(s), incl != flipped))),
+                    _ => Err(Error::Internal("PK bound of an unserved type".into())),
                 }
             }
         }
@@ -264,34 +290,43 @@ impl SqliteCtx<'_> {
         hi: Option<(&[u8], bool)>,
     ) -> Result<Vec<Vec<Value>>> {
         let a = self.table(id)?;
-        let lo = Self::bound_to_int(lo)?;
-        let hi = Self::bound_to_int(hi)?;
+        let (key_col, key_ty) = match a.pk {
+            PkKind::Ipk(i) => (Some(i), ColumnType::Int64),
+            PkKind::WithoutRowidKey(i, ty) => (Some(i), ty),
+            PkKind::SyntheticRowid => (None, ColumnType::Int64),
+        };
+        let lo = Self::bound_to_key(lo, key_ty)?;
+        let hi = Self::bound_to_key(hi, key_ty)?;
         let ti = id as usize;
         let mut out = Vec::new();
-        let in_lo = |k: i64| lo.is_none_or(|(v, incl)| if incl { k >= v } else { k > v });
-        let in_hi = |k: i64| hi.is_none_or(|(v, incl)| if incl { k <= v } else { k < v });
-        let key_col = match a.pk {
-            PkKind::Ipk(i) | PkKind::WithoutRowidInt(i) => Some(i),
-            PkKind::SyntheticRowid => None,
+        let in_lo = |k: &Key| {
+            lo.as_ref()
+                .is_none_or(|(v, incl)| if *incl { k >= v } else { k > v })
+        };
+        let in_hi = |k: &Key| {
+            hi.as_ref()
+                .is_none_or(|(v, incl)| if *incl { k <= v } else { k < v })
         };
         self.at
             .file
             .scan_table(&a.src, &mut |rowid, vals| {
                 let k = match key_col {
-                    None => rowid,
+                    None => Key::Int(rowid),
                     Some(i) => match vals.get(i) {
-                        Some(fmtx::Value::Int(x)) => *x,
+                        Some(fmtx::Value::Int(x)) => Key::Int(*x),
+                        Some(fmtx::Value::Text(s)) => Key::Text(s.clone()),
                         _ => {
                             return Err(fmtx::Error::Corrupt(
-                                "integer PK column holds a non-integer".into(),
+                                "PK column holds a value outside its declared affinity".into(),
                             ))
                         }
                     },
                 };
-                // Scans run in key order for every attached shape, so the
-                // upper bound could early-terminate; sqlitefmt's walker has
-                // no stop signal yet — correctness first, the valve later.
-                if in_lo(k) && in_hi(k) {
+                // Scans run in key order for every attached shape (int
+                // order / BINARY for text), so the upper bound could
+                // early-terminate; sqlitefmt's walker has no stop signal
+                // yet — correctness first, the valve later.
+                if in_lo(&k) && in_hi(&k) {
                     out.push(self.at.shape_row(ti, rowid, vals));
                 }
                 Ok(())
@@ -301,36 +336,50 @@ impl SqliteCtx<'_> {
     }
 }
 
+/// A decoded PK for the served shapes. One table only ever produces one
+/// variant; ordering mirrors the storage order (int order / BINARY memcmp),
+/// which is also mpedb's keycode order for the same types.
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum Key {
+    Int(i64),
+    Text(String),
+}
+
 impl TxnCtx for SqliteCtx<'_> {
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
         let a = self.table(table)?;
-        let [Value::Int(k)] = pk else {
-            return Ok(None); // NULL or non-int probe: no row can match
-        };
         let ti = table as usize;
         match a.pk {
             PkKind::Ipk(_) | PkKind::SyntheticRowid => {
+                let [Value::Int(k)] = pk else {
+                    return Ok(None); // NULL or non-int probe: no row can match
+                };
                 match self.at.file.seek_rowid(&a.src, *k).map_err(ferr)? {
                     None => Ok(None),
                     Some(vals) => Ok(Some(self.at.shape_row(ti, *k, vals))),
                 }
             }
-            PkKind::WithoutRowidInt(i) => {
-                // v1: linear probe in key order (honest O(n); the index-tree
-                // descent for WITHOUT ROWID rides v2's reader work).
+            PkKind::WithoutRowidKey(i, _) => {
+                // A probe of the wrong shape (NULL, or a type the PK cannot
+                // hold) matches nothing.
+                let want = match pk {
+                    [Value::Int(k)] => fmtx::Value::Int(*k),
+                    [Value::Text(s)] => fmtx::Value::Text(s.clone()),
+                    _ => return Ok(None),
+                };
+                // Honest O(n): linear probe in key order (the index-tree
+                // descent for WITHOUT ROWID is v3 reader work).
                 let mut found = None;
                 self.at
                     .file
                     .scan_table(&a.src, &mut |_r, vals| {
-                        if found.is_none()
-                            && matches!(vals.get(i), Some(fmtx::Value::Int(x)) if x == k)
-                        {
+                        if found.is_none() && vals.get(i) == Some(&want) {
                             found = Some(vals);
                         }
                         Ok(())
                     })
                     .map_err(ferr)?;
-                Ok(found.map(|vals| self.at.shape_row(ti, *k, vals)))
+                Ok(found.map(|vals| self.at.shape_row(ti, 0, vals)))
             }
         }
     }
