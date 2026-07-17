@@ -16,6 +16,10 @@ libc = { workspace = true }
 # only libsqlite3.so.0 (no dev symlink, no header): linking -lsqlite3 fails,
 # so the bundled build is required on this machine (verified 2026-07-13).
 rusqlite = { version = "0.31", features = ["bundled"] }
+# Turso (tursodatabase/turso, the Rust SQLite rewrite): async API, driven by a
+# per-worker current-thread tokio runtime in eng_turso.rs.
+turso = "0.7"
+tokio = { version = "1", features = ["rt"] }
 # Synchronous client for the throwaway PostgreSQL 16 instance (unix socket).
 postgres = "0.19"
 
