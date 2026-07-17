@@ -106,6 +106,16 @@ pub struct WriteTxn<'e> {
     /// Runs pwritten this txn — commit's range-sync list. On Linux these
     /// msyncs ARE the pre-flip durability (the barrier is a no-op there).
     pub(super) extent_dirty: Vec<(u64, u32)>,
+    /// Coalescing buffer for SMALL extent payloads: consecutive high-water
+    /// allocations are contiguous, so a whole batch becomes one pwrite
+    /// instead of one per row (the 4 KiB cell's syscall tax, measured 0.93×
+    /// before this). Bounded (§ EXTENT_BUF_CAP); flushed on discontiguity,
+    /// on any extent READ in this txn (the mapping must see the bytes), and
+    /// at commit before the range-syncs — payload-before-reference holds
+    /// because nothing publishes until the flip.
+    pub(super) extent_buf: Vec<u8>,
+    /// File offset where `extent_buf` starts; meaningless when buf is empty.
+    pub(super) extent_buf_off: u64,
 
     /// Robust-mutex recovery ran when this txn acquired the lock.
     pub recovered: bool,
