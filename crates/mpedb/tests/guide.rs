@@ -426,8 +426,17 @@ fn the_sqlite_differences_that_bite() {
     )
     .unwrap();
 
-    // 1. No CREATE TABLE. The schema comes from the config or `mirror import`.
-    assert!(db.query("CREATE TABLE t (id INTEGER)", &[]).is_err());
+    // 1. CREATE TABLE is live (with a PK); ALTER/DROP are not. A new table
+    //    takes the next free id and nothing renumbers.
+    db.query("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", &[]).unwrap();
+    db.query("INSERT INTO t (id, v) VALUES (1, 'x')", &[]).unwrap();
+    assert_eq!(
+        rows(db.query("SELECT v FROM t WHERE id = 1", &[]).unwrap()),
+        vec![vec![Value::Text("x".into())]]
+    );
+    // …but a PK is required, and changing an existing table is still refused.
+    assert!(db.query("CREATE TABLE u (id INTEGER)", &[]).is_err());
+    assert!(db.query("ALTER TABLE orders ADD COLUMN x INT", &[]).is_err());
 
     // 2. Division by zero raises; sqlite yields NULL. (Also a FROM-less
     // SELECT — one synthetic row, so the division is reached and raises.)

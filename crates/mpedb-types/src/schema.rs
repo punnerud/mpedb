@@ -95,6 +95,45 @@ fn valid_identifier(s: &str) -> bool {
 /// Upper bound on secondary indexes per table (canonical-bytes v2).
 pub const MAX_INDEXES: usize = 32;
 
+/// Normalize the column flag sugar and derive `TableDef::indexes` — shared
+/// by seeding (`Schema::new`) and evolution (`Schema::with_added_table`).
+/// A column that is both `unique` and `indexed` has ONE unique index (the
+/// engine has always treated it so), and flags on the single PK column are
+/// meaningless (the PK tree is index 0) — without normalization these
+/// spellings round-trip unequally through the wire format, which carries no
+/// flags. The `contains` guard keeps this IDEMPOTENT: re-wrapping a table
+/// that already went through it must not double-derive into a
+/// duplicate-shape refusal.
+fn normalize_and_derive(t: &mut TableDef) {
+    let single_pk = (t.primary_key.len() == 1).then(|| t.primary_key[0]);
+    for (i, c) in t.columns.iter_mut().enumerate() {
+        if c.unique {
+            c.indexed = false;
+        }
+        if single_pk == Some(i as u16) {
+            c.unique = false;
+            c.indexed = false;
+        }
+    }
+    let explicit = std::mem::take(&mut t.indexes);
+    let mut list: Vec<IndexDef> = t
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(i, c)| {
+            (c.unique || c.indexed)
+                && !(t.primary_key.len() == 1 && t.primary_key[0] == *i as u16)
+        })
+        .map(|(i, c)| IndexDef { columns: vec![i as u16], unique: c.unique })
+        .collect();
+    for e in explicit {
+        if !list.contains(&e) {
+            list.push(e);
+        }
+    }
+    t.indexes = list;
+}
+
 impl Schema {
     /// Build and validate a schema from table definitions (any order; sorted
     /// internally by name). Assigns DENSE stable ids 0..n in name-sorted
@@ -108,45 +147,23 @@ impl Schema {
         tables.sort_by(|a, b| a.name.cmp(&b.name));
         for (pos, t) in tables.iter_mut().enumerate() {
             t.id = pos as u32;
-            // Normalize sugar: a column that is both `unique` and `indexed`
-            // has ONE unique index (the engine has always treated it so),
-            // and flags on the single PK column are meaningless (the PK tree
-            // is index 0). Without normalization these spellings round-trip
-            // unequally through the wire format, which does not carry flags.
-            let single_pk =
-                (t.primary_key.len() == 1).then(|| t.primary_key[0]);
-            for (i, c) in t.columns.iter_mut().enumerate() {
-                if c.unique {
-                    c.indexed = false;
-                }
-                if single_pk == Some(i as u16) {
-                    c.unique = false;
-                    c.indexed = false;
-                }
-            }
-            let explicit = std::mem::take(&mut t.indexes);
-            let mut list: Vec<IndexDef> = t
-                .columns
-                .iter()
-                .enumerate()
-                .filter(|(i, c)| {
-                    (c.unique || c.indexed)
-                        && !(t.primary_key.len() == 1 && t.primary_key[0] == *i as u16)
-                })
-                .map(|(i, c)| IndexDef { columns: vec![i as u16], unique: c.unique })
-                .collect();
-            // Append explicit entries the derivation did not already produce.
-            // The `contains` guard makes `Schema::new` IDEMPOTENT: re-wrapping
-            // a table that already went through it (tests and tools clone
-            // tables into new schemas) must not double-derive the flag
-            // indexes into a duplicate-shape refusal.
-            for e in explicit {
-                if !list.contains(&e) {
-                    list.push(e);
-                }
-            }
-            t.indexes = list;
+            normalize_and_derive(t);
         }
+        let schema = Schema { tables };
+        schema.validate()?;
+        Ok(schema)
+    }
+
+    /// Evolve this schema by APPENDING one table — `CREATE TABLE` (#47).
+    /// Nothing renumbers: existing ids and positions are untouched, the new
+    /// table takes the lowest free id (= the current count while ids are
+    /// dense), and the vec stays id-sorted (creation order). Flags normalize
+    /// and indexes derive exactly as at seed.
+    pub fn with_added_table(&self, mut def: TableDef) -> Result<Schema> {
+        def.id = self.tables.len() as u32;
+        normalize_and_derive(&mut def);
+        let mut tables = self.tables.clone();
+        tables.push(def);
         let schema = Schema { tables };
         schema.validate()?;
         Ok(schema)
@@ -353,14 +370,19 @@ impl Schema {
         Ok(())
     }
 
+    /// Resolve a table NAME to its stable id. A LINEAR scan (≤ 64 tables):
+    /// `Schema::tables` is sorted by id (creation order), not by name, once
+    /// `CREATE TABLE` has appended out of name order — so a name binary
+    /// search is wrong. Returns the table's stable `id`, which equals its
+    /// position only while ids are dense (this window), but the id is the
+    /// correct value to return regardless.
     pub fn table_id(&self, name: &str) -> Option<u32> {
-        self.tables
-            .binary_search_by(|t| t.name.as_str().cmp(name))
-            .ok()
-            .map(|i| i as u32)
+        self.tables.iter().find(|t| t.name == name).map(|t| t.id)
     }
 
     pub fn table(&self, id: u32) -> Option<&TableDef> {
+        // Dense ids in this window ⇒ position == id ⇒ O(1) index. (DROP's
+        // audit revisits this for gapped ids.)
         self.tables.get(id as usize)
     }
 

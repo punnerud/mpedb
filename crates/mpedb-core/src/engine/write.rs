@@ -837,6 +837,54 @@ impl<'e> WriteTxn<'e> {
         Ok(out)
     }
 
+    /// `CREATE TABLE` (#47 stage 2): append `def` to the schema — nothing
+    /// renumbers (DESIGN-SCHEMA-V2: the new table takes the lowest free id;
+    /// `Schema::with_added_table` validates the merged set) — write the
+    /// re-canonicalized bytes to `CAT_SCHEMA_KEY`, seed the new table's
+    /// empty tree-root entries (`catalog_entry` hard-errors on a missing
+    /// key, exactly like bootstrap), and arm the schema-gen bump so every
+    /// other process reloads at its next transaction. One ordinary COW
+    /// commit publishes all of it atomically. Returns the new table's id.
+    ///
+    /// The txn's CAPTURED bundle still holds the old schema — a DDL txn
+    /// does nothing else; the caller swaps the engine bundle after commit
+    /// (`Engine::reload_schema_from_catalog`).
+    pub fn create_table(&mut self, def: mpedb_types::TableDef) -> Result<u32> {
+        let new_schema = self.bundle.schema.with_added_table(def)?;
+        let new = new_schema.tables.last().expect("just appended");
+        let tid = new.id;
+        let n_indexes = new.indexes.len();
+        let bytes = new_schema.canonical_bytes();
+        let root = self.catalog_root;
+        let out = btree::insert(
+            self,
+            root,
+            CAT_SCHEMA_KEY,
+            &mut btree::Payload::Flat(&bytes),
+            InsertMode::Upsert,
+        )?;
+        self.catalog_root = out.new_root;
+        let empty = [0u8; 16]; // root 0 (empty tree), count 0
+        for ino in 0..=n_indexes as u32 {
+            let root = self.catalog_root;
+            let out = btree::insert(
+                self,
+                root,
+                &cat_tree_key(tid, ino),
+                &mut btree::Payload::Flat(&empty),
+                InsertMode::InsertOnly,
+            )?;
+            if out.existed {
+                return Err(Error::Corrupt(format!(
+                    "catalog already has tree entries for new table id {tid}"
+                )));
+            }
+            self.catalog_root = out.new_root;
+        }
+        self.schema_gen_bump = true;
+        Ok(tid)
+    }
+
     pub fn sys_get(&mut self, subkey: &[u8]) -> Result<Option<Vec<u8>>> {
         btree::get(self, self.catalog_root, &sys_key(subkey))
     }

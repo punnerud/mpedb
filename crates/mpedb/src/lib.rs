@@ -355,6 +355,10 @@ impl Database {
     /// The bool is the `EXPLAIN` flag. An empty policy set behaves exactly as
     /// plain compilation.
     fn compile_maybe_explain(&self, sql: &str) -> Result<(CompiledPlan, bool)> {
+        // #47 stage 3: pick up another process's CREATE TABLE before we
+        // compile — a query against a just-created table must see it, and
+        // the txn-begin reload happens too late (compilation runs first).
+        self.engine.refresh_schema_if_stale()?;
         let catalog = self.load_policy_catalog()?;
         mpedb_sql::prepare_maybe_explain_with_policies(sql, &self.schema(), &catalog)
     }
@@ -362,9 +366,127 @@ impl Database {
     /// Apply a parsed RLS DDL statement to the catalog (autocommit — each takes
     /// the writer lock once and bumps the table's policy epoch). Returns
     /// `Affected(0)`; RLS DDL touches no user rows.
+    /// `CREATE TABLE` (#47 stage 2): build the [`TableDef`] from the parsed
+    /// spec, append it to the schema in one catalog commit (the engine
+    /// validates the merged set and seeds the empty tree roots), then swap
+    /// this process's schema bundle and drop the local plan cache. Other
+    /// processes reload at their next transaction via the schema-gen bump.
+    fn apply_create_table(&self, spec: mpedb_sql::CreateTableSpec) -> Result<ExecResult> {
+        // Resolve the PK: exactly one declaration form.
+        let inline_pk: Vec<&str> = spec
+            .columns
+            .iter()
+            .filter(|c| c.pk)
+            .map(|c| c.name.as_str())
+            .collect();
+        let pk_names: Vec<String> = match (inline_pk.is_empty(), spec.table_pk.is_empty()) {
+            (false, true) => {
+                // Multiple inline `PRIMARY KEY` columns is almost always a
+                // typo, not an intended composite key — sqlite and
+                // PostgreSQL both hard-refuse it. A composite PK must be
+                // declared once at table level: `PRIMARY KEY (a, b)`.
+                if inline_pk.len() > 1 {
+                    return Err(Error::Bind(format!(
+                        "CREATE TABLE {}: more than one column marked PRIMARY KEY \
+                         ({}) — for a composite key write `PRIMARY KEY ({})` at \
+                         table level",
+                        spec.name,
+                        inline_pk.join(", "),
+                        inline_pk.join(", ")
+                    )));
+                }
+                inline_pk.iter().map(|s| s.to_string()).collect()
+            }
+            (true, false) => spec.table_pk.clone(),
+            (true, true) => {
+                return Err(Error::Bind(format!(
+                    "CREATE TABLE {}: no PRIMARY KEY declared (mpedb requires one)",
+                    spec.name
+                )))
+            }
+            (false, false) => {
+                return Err(Error::Bind(format!(
+                    "CREATE TABLE {}: PRIMARY KEY declared both inline and at table \
+                     level — pick one",
+                    spec.name
+                )))
+            }
+        };
+        let col_index = |name: &str| -> Result<u16> {
+            spec.columns
+                .iter()
+                .position(|c| c.name == name)
+                .map(|i| i as u16)
+                .ok_or_else(|| {
+                    Error::Bind(format!(
+                        "CREATE TABLE {}: unknown column `{name}` in key list",
+                        spec.name
+                    ))
+                })
+        };
+        let primary_key = pk_names
+            .iter()
+            .map(|n| col_index(n))
+            .collect::<Result<Vec<u16>>>()?;
+        let columns = spec
+            .columns
+            .iter()
+            .map(|c| mpedb_types::ColumnDef {
+                name: c.name.clone(),
+                ty: c.ty,
+                // PK columns are implicitly NOT NULL, as in the config path.
+                nullable: !c.not_null && !pk_names.iter().any(|p| p == &c.name),
+                unique: c.unique,
+                indexed: false,
+                default: None,
+                check: None,
+            })
+            .collect();
+        let indexes = spec
+            .uniques
+            .iter()
+            .map(|group| {
+                Ok(mpedb_types::IndexDef {
+                    columns: group
+                        .iter()
+                        .map(|n| col_index(n))
+                        .collect::<Result<Vec<u16>>>()?,
+                    unique: true,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let def = mpedb_types::TableDef {
+            id: 0, // assigned by Schema::with_added_table (lowest free)
+            name: spec.name,
+            columns,
+            primary_key,
+            indexes,
+        };
+        let mut w = self.engine.begin_write()?;
+        match w.create_table(def) {
+            Ok(_tid) => w.commit()?,
+            Err(e) => {
+                w.abort();
+                return Err(e);
+            }
+        }
+        // The table is now DURABLE and visible to every process (the
+        // schema_gen bump). Refreshing THIS process's view is best-effort:
+        // dropping the plan cache is infallible and must always happen, but
+        // a transient reload failure must NOT report the durable CREATE as
+        // failed — the next statement's `refresh_schema_if_stale` (in
+        // `compile_maybe_explain`) self-heals the bundle (review finding).
+        self.cache.write().expect(POISON).clear();
+        let _ = self.engine.reload_schema_from_catalog();
+        Ok(ExecResult::Affected(0))
+    }
+
     fn apply_ddl(&self, ddl: mpedb_sql::DdlStmt) -> Result<ExecResult> {
         use mpedb_sql::{DdlStmt, RlsAction};
         match ddl {
+            DdlStmt::CreateTable(spec) => {
+                return self.apply_create_table(spec);
+            }
             DdlStmt::CreatePolicy(spec) => {
                 let def = mpedb_types::PolicyDef {
                     name: spec.name,

@@ -298,6 +298,9 @@ pub type CheckPrograms = Vec<Vec<Option<ExprProgram>>>;
 /// txn sees one schema version even while DDL swaps the engine's current
 /// bundle underneath. `TableDef.indexes` is the single derivation source.
 pub struct SchemaBundle {
+    /// The meta `schema_gen` this bundle was loaded at — compared against
+    /// the committed meta at txn begin; mismatch ⇒ reload from the catalog.
+    pub schema_gen: u64,
     pub schema: Schema,
     pub checks: CheckPrograms,
     /// Per table, per index (`index_no - 1`): the indexed column ordinals in
@@ -317,6 +320,12 @@ impl std::ops::Deref for SchemaBundle {
 }
 
 impl SchemaBundle {
+    pub fn new_at(schema_gen: u64, schema: Schema, checks: CheckPrograms) -> SchemaBundle {
+        let mut b = SchemaBundle::new(schema, checks);
+        b.schema_gen = schema_gen;
+        b
+    }
+
     pub fn new(schema: Schema, checks: CheckPrograms) -> SchemaBundle {
         let sec_indexes = schema
             .tables
@@ -333,7 +342,7 @@ impl SchemaBundle {
             .iter()
             .map(|t| t.columns.iter().map(|c| c.ty).collect())
             .collect();
-        SchemaBundle { schema, checks, sec_indexes, sec_unique, col_types }
+        SchemaBundle { schema_gen: 0, schema, checks, sec_indexes, sec_unique, col_types }
     }
 }
 
@@ -412,6 +421,19 @@ impl Engine {
         self.bundle.read().expect("schema bundle lock poisoned").clone()
     }
 
+    /// Refresh the cached schema if a DDL commit (this process or another)
+    /// bumped the meta's `schema_gen` past this process's bundle (#47 stage
+    /// 3). One `newest_meta` read (no pin); reloads from the catalog only on
+    /// mismatch. The facade calls this BEFORE compiling fresh SQL so a query
+    /// against a just-created table sees it — the txn-begin reload alone is
+    /// too late, compilation runs first.
+    pub fn refresh_schema_if_stale(&self) -> Result<()> {
+        if self.shm.newest_meta()?.schema_gen != self.bundle().schema_gen {
+            self.reload_schema_from_catalog()?;
+        }
+        Ok(())
+    }
+
     /// The CURRENT schema (an Arc'd bundle; derefs to [`Schema`]). Callers
     /// that need a `&Schema` bind the Arc first — the schema may be swapped
     /// by DDL, so no plain reference can be handed out.
@@ -424,12 +446,13 @@ impl Engine {
     /// DDL commit by another process; `&self` — in-flight transactions keep
     /// their captured bundle untouched.
     pub fn reload_schema_from_catalog(&self) -> Result<()> {
-        let r = self.begin_read()?;
+        let r = self.begin_read_unchecked()?;
+        let gen = r.meta.schema_gen;
         let stored = r.stored_schema();
         r.finish()?;
         let stored = stored?;
         let cur = self.bundle();
-        if stored == cur.schema {
+        if stored == cur.schema && gen == cur.schema_gen {
             return Ok(());
         }
         // CHECK programs are compiled by the facade from check sources; on a
@@ -439,7 +462,7 @@ impl Engine {
         let mut checks = cur.checks.clone();
         checks.resize(stored.tables.len(), Vec::new());
         *self.bundle.write().expect("schema bundle lock poisoned") =
-            Arc::new(SchemaBundle::new(stored, checks));
+            Arc::new(SchemaBundle::new_at(gen, stored, checks));
         Ok(())
     }
 
@@ -781,6 +804,22 @@ impl Engine {
     }
 
     pub fn begin_read(&self) -> Result<ReadTxn<'_>> {
+        let txn = self.begin_read_unchecked()?;
+        // #47 stage 3: a DDL commit bumped the meta's schema_gen past our
+        // bundle's — reload from the catalog (swap) and re-capture, so this
+        // reader sees the schema its pinned snapshot actually has.
+        if txn.meta.schema_gen != txn.bundle.schema_gen {
+            txn.finish()?;
+            self.reload_schema_from_catalog()?;
+            return self.begin_read_unchecked();
+        }
+        Ok(txn)
+    }
+
+    /// `begin_read` without the schema-gen staleness check — used BY the
+    /// reload itself (its inner read would otherwise recurse forever on the
+    /// very mismatch it exists to repair).
+    fn begin_read_unchecked(&self) -> Result<ReadTxn<'_>> {
         let (slot, word, meta) = self.shm.claim_and_pin()?;
         Ok(ReadTxn {
             eng: self,
@@ -824,6 +863,12 @@ impl Engine {
                 return Err(e);
             }
         };
+        // #47 stage 3: another process's DDL commit bumped schema_gen —
+        // reload before this txn captures its bundle (under the writer
+        // lock, so the reloaded schema cannot move again beneath us).
+        if meta.schema_gen != self.bundle().schema_gen {
+            self.reload_schema_from_catalog()?;
+        }
         Ok(WriteTxn {
             eng: self,
             bundle: self.bundle(),

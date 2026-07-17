@@ -116,11 +116,25 @@ from a customer.
 
 Two consequences worth knowing up front:
 
-- **There is no `CREATE TABLE` or `ALTER TABLE`.** A table's id is its index in
-  the name-sorted table list, and that id keys the catalog's B+tree roots, the
-  change-capture bitmap, and the mirror's per-table state. Adding `accounts` to a
-  database holding `orders` and `users` would renumber both and point `accounts`
-  at `orders`' rows. Schema change is a *rebuild* (`mpedb mirror regenerate`).
+- **`CREATE TABLE` is live; `ALTER`/`DROP TABLE` are not (yet).** You can add a
+  table on a running, multi-process database — the config is not the only way in:
+
+  ```sql
+  CREATE TABLE accounts (
+      id INTEGER PRIMARY KEY,
+      balance INT NOT NULL,
+      note TEXT,
+      UNIQUE (id, note)          -- composite unique; PRIMARY KEY (a, b) also works
+  );
+  ```
+
+  A new table takes the next free id and **nothing renumbers** — existing tables
+  keep their ids, their catalog B+tree roots, and their data (the format was
+  reworked in #47 so a table's id is stored, not its sort position). Other
+  processes attached to the same file pick up the new table on their next
+  statement. `DEFAULT`/`CHECK`/foreign keys in `CREATE TABLE` refuse by name for
+  now — declare those in the config. Changing an *existing* table (`ALTER`,
+  `DROP TABLE`) is still a config change or a rebuild (`mpedb mirror regenerate`).
 - **A `.mpedb` is one self-describing file.** `cp` is a complete snapshot:
 
   ```sh
@@ -346,7 +360,9 @@ streams). It pulls rather than handing you a writer on purpose — a
 
 Differences that will bite, each one exercised in `tests/guide.rs`:
 
-1. **No `CREATE TABLE`.** See above — the table-id numbering makes it a rebuild.
+1. **`CREATE TABLE` is live; `ALTER`/`DROP TABLE` are not.** See above — adding a
+   table (with a `PRIMARY KEY`) works on a running database; changing or dropping
+   an existing one is still a config change or a rebuild.
 2. **Division by zero raises.** sqlite yields NULL. So does overflow: mpedb
    errors where sqlite silently promotes to REAL.
 3. **`RIGHT`/`FULL` only join two tables.** The two-table forms work (a
