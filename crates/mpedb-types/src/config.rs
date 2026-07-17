@@ -146,7 +146,7 @@ struct RawDatabase {
     /// Values whose encoded payload exceeds this many KiB take an extent run
     /// instead of an overflow chain (DESIGN-BLOBEXTENT §8). `0` = explicitly
     /// off. Absent = the PLATFORM default: 4 on Linux (coalesced
-    /// pwrite made the 4 KiB cell win 1.7×), off on macOS (the sparse preallocation
+    /// pwrite made the 4 KiB cell win 1.7×), 32 on macOS (crossover ~16 KiB) (the sparse preallocation
     /// makes per-value pwrites lose at every measured size until the B4
     /// coalescing levers land).
     #[serde(default)]
@@ -167,7 +167,15 @@ pub fn default_extent_threshold() -> Option<usize> {
         // size. Below that, inline/overflow stays unmeasured and untouched.
         Some(4 * 1024)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    {
+        // M3, coalesced pwrite, paired: 4 KiB 0.85×, 16 KiB 1.09×, 32 KiB
+        // 1.16×, 64 KiB 1.32×, 1 MiB 1.39× (12.3 GB/s). Crossover ~16 KiB;
+        // 32 is the conservative side of it (the sparse-file allocation tax
+        // is amortized but not gone — F_PREALLOCATE density is still queued).
+        Some(32 * 1024)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         None
     }
