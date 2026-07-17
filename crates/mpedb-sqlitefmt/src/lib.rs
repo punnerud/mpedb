@@ -145,7 +145,7 @@ impl SqliteFile {
             .checked_sub(reserved)
             .filter(|u| *u >= 480)
             .ok_or_else(|| corrupt("reserved space leaves no usable page"))?;
-        if data.len() % page_size != 0 {
+        if !data.len().is_multiple_of(page_size) {
             return Err(corrupt("file size is not a page multiple"));
         }
         let n_pages = data.len() / page_size;
@@ -587,8 +587,7 @@ fn parse_create_table(sql: &str) -> Option<ParsedCreate> {
                     .into_iter()
                     .map(|c| {
                         unquote(
-                            c.trim()
-                                .split_whitespace()
+                            c.split_whitespace()
                                 .next()
                                 .unwrap_or("")
                                 .trim_end_matches(','),
