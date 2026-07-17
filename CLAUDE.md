@@ -70,11 +70,14 @@ every protocol there survived a 37-finding adversarial review, and the ordering 
   lock, the result store precedes the READY→DONE transition, owners may release from
   READY, and recovery never acts on DONE slots (DESIGN.md §5.3). Reordering any of these
   reintroduces a stress-reproducible phantom-result TOCTOU.
-- Index numbering: 0 = PK tree; secondary indexes 1.. are the columns with `unique` OR
-  `indexed` set, in column-declaration order (skip a column that is by itself the whole
-  PK). UNIQUE index trees are keyed `value → pk`; non-unique ones `(value ‖ pk) → pk`
-  (composite key, unique by construction — equality lookup is a prefix scan).
-  `engine::secondary_index_columns` and `mpedb_sql::secondary_indexes` must agree.
+- Index numbering: 0 = PK tree; `TableDef.indexes` is the SINGLE source
+  (DESIGN-SCHEMA-V2) — index_no = position + 1, populated by `Schema::new` (flag-derived
+  single-column entries in declaration order, then explicit `[[table.index]]` ones;
+  composite supported). UNIQUE trees are keyed `values → pk`; non-unique `(values ‖ pk)
+  → pk`. Membership: a row with ANY NULL indexed column has no entry. Table ids are
+  explicit in canonical-bytes v2 and DENSE 0..n in this format window (position == id
+  is validate-enforced; DROP relaxes it after the §6 positional audit). The planner
+  exploits single-column indexes only until #55.
 - Schema/geometry are file-authoritative: attach hard-errors on config drift.
 - Crash-safe on Linux (x86-64 + 32/64-bit ARM) and macOS/Apple Silicon (the FLD-2 flock
   writer lock, `crate::os`); single PID namespace; robust mutexes / flock locks do not
