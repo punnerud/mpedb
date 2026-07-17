@@ -51,11 +51,13 @@ mod registry;
 mod ring_exec;
 mod session;
 mod shard;
+mod sqlite_attach;
 mod stream;
 mod workspace;
 
 pub use session::Session;
 pub use shard::ShardSet;
+pub use sqlite_attach::SqliteAttach;
 pub use stream::RowStream;
 pub use workspace::{Workspace, WorkspaceTxn, WsPlan};
 
