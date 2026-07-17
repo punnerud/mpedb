@@ -134,7 +134,11 @@ impl<'e> WriteTxn<'e> {
         self.taken.clear();
         self.in_freelist_op = false;
 
-        // 3. durability: data must be durable before the meta references it
+        // 3. durability: data must be durable before the meta references it.
+        // The extent coalescing buffer flushes FIRST — in every mode the
+        // payload bytes must be in the page cache before the range-syncs
+        // run and before the flip makes any reference reachable.
+        self.flush_extent_buf()?;
         let snapshot = MetaSnapshot {
             slot: self.meta.slot,
             txn_id: new_txn,

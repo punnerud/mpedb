@@ -101,6 +101,12 @@ pub(super) fn encode_run_entry(runs: &[(u64, u32)]) -> Vec<u8> {
 /// ≤ 960 B inline cap ⇒ at most 80 pairs per entry (the freelist house rule).
 pub(super) const RUNS_PER_CHUNK: usize = 80;
 
+/// Payloads whose run is at most this big coalesce in the txn buffer; larger
+/// ones pwrite directly (buffering a 16 MiB value would just move the copy).
+pub(super) const EXTENT_COALESCE_MAX: usize = 256 * 1024;
+/// The buffer's cap — one flush per this many payload bytes.
+pub(super) const EXTENT_BUF_CAP: usize = 2 * 1024 * 1024;
+
 impl WriteTxn<'_> {
     /// Allocate a run of `npages`. First-fit over the private pool — allowed
     /// to SPAN adjacent pool runs (draw-time contiguity across entries, the
@@ -307,7 +313,9 @@ impl WriteTxn<'_> {
 
     /// Write an extent's payload through the FILE at its run, zero-filling
     /// the tail of the last page (deterministic bytes — commitment 4), and
-    /// remember the range for commit's range-sync.
+    /// remember the range for commit's range-sync. Small payloads coalesce
+    /// in `extent_buf` (one pwrite per BATCH, not per row); large ones go
+    /// straight through.
     pub(super) fn write_extent_payload(
         &mut self,
         start_page: u64,
@@ -315,15 +323,10 @@ impl WriteTxn<'_> {
         pieces: &[&[u8]],
         total_len: u64,
     ) -> Result<()> {
-        let mut off = start_page
+        let off = start_page
             .checked_mul(PAGE_SIZE as u64)
             .ok_or_else(|| Error::Internal("extent offset overflow".into()))?;
-        let mut written = 0u64;
-        for p in pieces {
-            self.eng.shm.file_write_at(p, off)?;
-            off += p.len() as u64;
-            written += p.len() as u64;
-        }
+        let written: u64 = pieces.iter().map(|p| p.len() as u64).sum();
         if written != total_len {
             return Err(Error::Internal(
                 "extent payload length disagrees with its pieces".into(),
@@ -331,15 +334,57 @@ impl WriteTxn<'_> {
         }
         let cap = u64::from(npages) * PAGE_SIZE as u64;
         debug_assert!(total_len <= cap && cap - total_len < PAGE_SIZE as u64);
+        self.extent_dirty.push((start_page, npages));
+
+        if cap as usize <= EXTENT_COALESCE_MAX {
+            // Coalesce: append when contiguous with the buffer's end, else
+            // flush and start a new buffer at this offset.
+            let contiguous = !self.extent_buf.is_empty()
+                && self.extent_buf_off + self.extent_buf.len() as u64 == off;
+            if !contiguous || self.extent_buf.len() + cap as usize > EXTENT_BUF_CAP {
+                self.flush_extent_buf()?;
+            }
+            if self.extent_buf.is_empty() {
+                self.extent_buf_off = off;
+            }
+            for p in pieces {
+                self.extent_buf.extend_from_slice(p);
+            }
+            // zero-fill the page tail INSIDE the buffer, so the flushed
+            // write is byte-identical to the direct path
+            self.extent_buf.resize(
+                (off + cap - self.extent_buf_off) as usize,
+                0,
+            );
+            return Ok(());
+        }
+
+        self.flush_extent_buf()?;
+        let mut woff = off;
+        for p in pieces {
+            self.eng.shm.file_write_at(p, woff)?;
+            woff += p.len() as u64;
+        }
         if total_len < cap {
-            // The tail is small (< one page): a stack buffer of zeros.
             let zeros = [0u8; 4096];
             debug_assert_eq!(PAGE_SIZE, zeros.len());
             self.eng
                 .shm
-                .file_write_at(&zeros[..(cap - total_len) as usize], off)?;
+                .file_write_at(&zeros[..(cap - total_len) as usize], woff)?;
         }
-        self.extent_dirty.push((start_page, npages));
+        Ok(())
+    }
+
+    /// Flush the coalescing buffer with one pwrite. Must run before any
+    /// extent READ in this txn (reads go through the mapping, which only
+    /// sees pwritten bytes) and before commit's range-syncs.
+    pub(super) fn flush_extent_buf(&mut self) -> Result<()> {
+        if self.extent_buf.is_empty() {
+            return Ok(());
+        }
+        let off = self.extent_buf_off;
+        self.eng.shm.file_write_at(&self.extent_buf, off)?;
+        self.extent_buf.clear();
         Ok(())
     }
 }

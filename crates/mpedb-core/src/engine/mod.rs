@@ -786,6 +786,8 @@ impl Engine {
             allocated_runs: std::collections::HashMap::new(),
             pending_map_edits: Vec::new(),
             extent_dirty: Vec::new(),
+            extent_buf: Vec::new(),
+            extent_buf_off: 0,
             high_water: meta.high_water,
             table_roots: HashMap::new(),
             dirty: DirtySet::default(),

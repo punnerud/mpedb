@@ -2,6 +2,19 @@ use super::*;
 
 impl PageStore for WriteTxn<'_> {
     fn read_extent(&self, start_page: u64, total_len: u64, out: &mut Vec<u8>) -> Result<()> {
+        // The mapping only sees pwritten bytes: a read of a payload still in
+        // the coalescing buffer must serve the BUFFER. Serving it directly
+        // (rather than flushing) keeps this &self — and the direct copy is
+        // exactly what the flush would have made visible.
+        if !self.extent_buf.is_empty() {
+            let off = start_page * PAGE_SIZE as u64;
+            let end = self.extent_buf_off + self.extent_buf.len() as u64;
+            if off >= self.extent_buf_off && off + total_len <= end {
+                let at = (off - self.extent_buf_off) as usize;
+                out.extend_from_slice(&self.extent_buf[at..at + total_len as usize]);
+                return Ok(());
+            }
+        }
         read_extent_from_shm(&self.eng.shm, start_page, total_len, out)
     }
 
