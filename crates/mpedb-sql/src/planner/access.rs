@@ -46,33 +46,66 @@ pub(super) fn extract_access(
     // 2. Index-equality probe — BEFORE any PK range: an index probe touches
     // O(matches) rows, so it dominates an unbounded range scan (`WHERE pk >=
     // $1 AND email = $2` must not scan the range; the range conjuncts stay
-    // behind as the residual filter). A UNIQUE index (at most one row) is
-    // preferred over a non-unique one when both have an equality conjunct —
-    // the only selectivity fact the schema can state without statistics.
-    // Within each pass the first matching conjunct in statement order wins;
-    // indexes beyond the 64-bit footprint bitmap are never chosen.
-    let sec = secondary_indexes(table);
-    let probe_pass = |unique_only: bool| {
-        cmps.iter().enumerate().find_map(|(i, c)| match c {
-            Some((col, BinOp::Eq, atom)) => sec
-                .iter()
-                .position(|sc| *sc == Some(*col))
-                .filter(|pos| *pos < 63)
+    // behind as the residual filter). #55: an index matches on the LONGEST
+    // equality-covered PREFIX of its columns (k = 1 is the single-column
+    // case). Selection: a UNIQUE index covered to its FULL width (at most
+    // one row) beats everything; otherwise the longest covered prefix wins,
+    // ties to the lowest index_no — deterministic, and the only selectivity
+    // facts the schema can state without statistics. Indexes beyond the
+    // 64-bit footprint bitmap are never chosen.
+    {
+        // Per index: the equality pins covering its column prefix.
+        let cover = |ix: &mpedb_types::IndexDef| -> Vec<(usize, Atom)> {
+            let mut pins = Vec::new();
+            for &col in &ix.columns {
                 // `any` can never be probed: index order is encoding order,
                 // not sql_cmp order. The schema refuses indexing it, so this
                 // is unreachable — kept as the planner's own guarantee.
-                .filter(|_| table.columns[*col as usize].ty != ColumnType::Any)
-                .filter(|_| !unique_only || table.columns[*col as usize].unique)
-                .map(|pos| (i, (pos + 1) as u32, atom.clone())),
-            _ => None,
-        })
-    };
-    let probe = probe_pass(true).or_else(|| probe_pass(false));
-    if let Some((i, index_no, atom)) = probe {
-        consumed[i] = true;
-        let part = atom.to_key_part(consts)?;
-        let residual = rebuild_residual(conjuncts, &consumed);
-        return Ok((AccessPath::IndexPoint { index_no, part }, residual));
+                if table.columns[col as usize].ty == ColumnType::Any {
+                    break;
+                }
+                match find(&consumed, col, &[BinOp::Eq]) {
+                    Some((i, _, atom)) => pins.push((i, atom)),
+                    None => break,
+                }
+            }
+            pins
+        };
+        // (index position, covering pins, full-width-unique)
+        type Candidate = (usize, Vec<(usize, Atom)>, bool);
+        let mut best: Option<Candidate> = None;
+        for (pos, ix) in table.indexes.iter().enumerate() {
+            if pos >= 63 {
+                break;
+            }
+            let pins = cover(ix);
+            if pins.is_empty() {
+                continue;
+            }
+            let full_unique = ix.unique && pins.len() == ix.columns.len();
+            let better = match &best {
+                None => true,
+                Some((_, bpins, bfull)) => {
+                    (full_unique && !bfull)
+                        || (full_unique == *bfull && pins.len() > bpins.len())
+                }
+            };
+            if better {
+                best = Some((pos, pins, full_unique));
+            }
+        }
+        if let Some((pos, pins, _)) = best {
+            let mut parts = Vec::with_capacity(pins.len());
+            for (i, atom) in pins {
+                consumed[i] = true;
+                parts.push(atom.to_key_part(consts)?);
+            }
+            let residual = rebuild_residual(conjuncts, &consumed);
+            return Ok((
+                AccessPath::IndexPoint { index_no: (pos + 1) as u32, parts },
+                residual,
+            ));
+        }
     }
 
     // 3. Range over the first PK column.
@@ -119,15 +152,16 @@ pub(super) fn extract_access(
     // have range conjuncts) and before a full scan. First index in
     // declaration order with a range conjunct wins; both bounds on the SAME
     // column are consumed together, everything else stays residual.
-    for (pos, col) in sec.iter().enumerate() {
+    for (pos, ix) in table.indexes.iter().enumerate() {
         if pos >= 63 {
             break; // beyond the footprint bitmap — never chosen
         }
-        let Some(col) = *col else {
-            continue; // composite: range access arrives with #55
-        };
+        // Phase-1 rule (same as PkRange): range over the FIRST index column
+        // only — its encoding is a key prefix, so this serves composite
+        // indexes unchanged.
+        let col = ix.columns[0];
         if table.columns[col as usize].ty == ColumnType::Any {
-            continue; // no order across types — see the probe_pass guard
+            continue; // no order across types — see the equality guard
         }
         let mut lo = None;
         let mut hi = None;

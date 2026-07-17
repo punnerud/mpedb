@@ -41,7 +41,7 @@ sqlite `STRICT` still converts losslessly (`'42'` → `42`); mpedb does not.
 | EXPLAIN | ✅ | plan form (access path, index choice, residuals), not VDBE opcodes |
 | CREATE TABLE / DROP TABLE | ❌ | schema is the config file or `mirror import`; live DDL is designed ([DESIGN-DDL.md](DESIGN-DDL.md)), not built |
 | ALTER TABLE | ❌ | same — a schema change is a config change today |
-| CREATE INDEX | **Not needed** | `unique = true` / `indexed = true` on the column in the config; equality + range scans, visible in EXPLAIN |
+| CREATE INDEX | **Not needed** | `unique = true` / `indexed = true` on a column, or `[[table.index]]` with a column LIST for composite (unique or not) — equality on the full width or any prefix, range on the first column, visible in EXPLAIN |
 | CREATE VIEW / CREATE TRIGGER | ❌ | triggers' job is planned as the PySpell/ETL layer, not in-SQL |
 | WITH (CTEs) | ❌ | |
 | VALUES (standalone) | ❌ | |
@@ -63,7 +63,7 @@ sqlite `STRICT` still converts losslessly (`'42'` → `42`); mpedb does not.
 | DISTINCT | ✅ | also `count(DISTINCT x)` |
 | SELECT-item aliases | ✅ | `expr AS name` and bare `expr name`; `ORDER BY alias` resolves the output first |
 | `t.*` / `*` | ✅ | |
-| INNER JOIN (N-way chains) | ✅ | left-deep, up to 16 tables; equality in ON becomes an index nested loop (PK > unique > non-unique), the rest stays residual — EXPLAIN shows which |
+| INNER JOIN (N-way chains) | ✅ | left-deep, up to 16 tables; equality in ON becomes an index nested loop (PK > full-width unique > longest prefix, composite included), the rest stays residual — EXPLAIN shows which |
 | LEFT [OUTER] JOIN | ✅ | NULL-extends; `WHERE inner IS NULL` anti-joins work |
 | RIGHT [OUTER] JOIN | 🚧 | two-table form (planned as LEFT with sides swapped); refused inside longer chains with the manual fix in the message |
 | FULL [OUTER] JOIN | 🚧 | two-table form; same chain restriction |

@@ -400,10 +400,10 @@ impl TxnCtx for SqliteCtx<'_> {
         }
     }
 
-    fn get_by_index(&mut self, _t: u32, _no: u32, _v: &Value) -> Result<Option<Vec<Value>>> {
+    fn get_by_index(&mut self, _t: u32, _no: u32, _v: &[Value]) -> Result<Option<Vec<Value>>> {
         Err(Error::Internal("index probe on a sqlite attach (schema has none)".into()))
     }
-    fn scan_by_index(&mut self, _t: u32, _no: u32, _v: &Value) -> Result<Vec<Vec<Value>>> {
+    fn scan_by_index(&mut self, _t: u32, _no: u32, _v: &[Value]) -> Result<Vec<Vec<Value>>> {
         Err(Error::Internal("index scan on a sqlite attach (schema has none)".into()))
     }
     fn scan_by_index_range(

@@ -492,32 +492,25 @@ impl CompiledPlan {
                 }
                 format!("PkRange({})", items.join(", "))
             }
-            AccessPath::IndexPoint { index_no, part } => {
-                let col = (*index_no as usize)
+            AccessPath::IndexPoint { index_no, parts } => {
+                let ix = (*index_no as usize)
                     .checked_sub(1)
-                    .and_then(|i| {
-                        schema
-                            .table(table)
-                            .map(crate::planner::secondary_indexes)
-                            .unwrap_or_default()
-                            .get(i)
-                            .copied()
-                            .flatten() // composite (#55): falls back below
-                    })
-                    .unwrap_or(0);
-                // A unique probe returns at most one row (IndexPoint); a
-                // non-unique index returns every equal row (IndexScan) — the
-                // label is the honest cost statement.
-                let unique = schema
-                    .table(table)
-                    .and_then(|t| t.columns.get(col as usize))
-                    .is_none_or(|c| c.unique);
+                    .and_then(|i| schema.table(table).and_then(|t| t.indexes.get(i)));
+                // At most one row only when a UNIQUE index is covered to its
+                // FULL width (IndexPoint); anything else returns every row
+                // equal on the covered prefix (IndexScan) — the label is the
+                // honest cost statement.
+                let unique = ix.is_none_or(|ix| ix.unique && parts.len() == ix.columns.len());
                 let label = if unique { "IndexPoint" } else { "IndexScan" };
-                format!(
-                    "{label}({} = {}) via index {index_no}",
-                    col_name(col),
-                    self.render_part_outer(part, outer)
-                )
+                let items: Vec<String> = parts
+                    .iter()
+                    .enumerate()
+                    .map(|(k, part)| {
+                        let col = ix.and_then(|ix| ix.columns.get(k).copied()).unwrap_or(0);
+                        format!("{} = {}", col_name(col), self.render_part_outer(part, outer))
+                    })
+                    .collect();
+                format!("{label}({}) via index {index_no}", items.join(", "))
             }
             AccessPath::IndexRange { index_no, lo, hi } => {
                 let col = (*index_no as usize)

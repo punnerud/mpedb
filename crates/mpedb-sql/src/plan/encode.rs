@@ -110,10 +110,10 @@ fn encode_access(a: &AccessPath, buf: &mut Vec<u8>) {
                 }
             }
         }
-        AccessPath::IndexPoint { index_no, part } => {
+        AccessPath::IndexPoint { index_no, parts } => {
             buf.push(ACCESS_INDEX_POINT);
             buf.extend_from_slice(&index_no.to_le_bytes());
-            encode_part(part, buf);
+            encode_parts(parts, buf);
         }
         AccessPath::IndexRange { index_no, lo, hi } => {
             buf.push(ACCESS_INDEX_RANGE);

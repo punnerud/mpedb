@@ -29,13 +29,13 @@ use gather::{cmp_rows, gather_joined, gather_rows, gather_topk, sort_rows};
 /// return `Error::Internal` if ever hit.
 pub(crate) trait TxnCtx {
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>>;
-    fn get_by_index(&mut self, table: u32, index_no: u32, value: &Value)
+    fn get_by_index(&mut self, table: u32, index_no: u32, values: &[Value])
         -> Result<Option<Vec<Value>>>;
     /// Every row matching an index equality — N rows for a non-unique index,
     /// 0 or 1 for a unique one (the engine takes an exact-get fast path for
     /// those, so routing everything through here costs the unique case
     /// nothing).
-    fn scan_by_index(&mut self, table: u32, index_no: u32, value: &Value)
+    fn scan_by_index(&mut self, table: u32, index_no: u32, values: &[Value])
         -> Result<Vec<Vec<Value>>>;
     /// Every row whose indexed value falls in the raw-encoded bound range —
     /// `AccessPath::IndexRange`. Bounds use the same prefix construction as
@@ -129,17 +129,17 @@ impl TxnCtx for WriteTxn<'_> {
         &mut self,
         table: u32,
         index_no: u32,
-        value: &Value,
+        values: &[Value],
     ) -> Result<Option<Vec<Value>>> {
-        WriteTxn::get_by_index(self, table, index_no, value)
+        WriteTxn::get_by_index(self, table, index_no, values)
     }
     fn scan_by_index(
         &mut self,
         table: u32,
         index_no: u32,
-        value: &Value,
+        values: &[Value],
     ) -> Result<Vec<Vec<Value>>> {
-        WriteTxn::scan_by_index(self, table, index_no, value)
+        WriteTxn::scan_by_index(self, table, index_no, values)
     }
     fn scan_by_index_range(
         &mut self,
@@ -180,17 +180,17 @@ impl TxnCtx for ReadCtx<'_, '_> {
         &mut self,
         table: u32,
         index_no: u32,
-        value: &Value,
+        values: &[Value],
     ) -> Result<Option<Vec<Value>>> {
-        self.0.get_by_index(table, index_no, value)
+        self.0.get_by_index(table, index_no, values)
     }
     fn scan_by_index(
         &mut self,
         table: u32,
         index_no: u32,
-        value: &Value,
+        values: &[Value],
     ) -> Result<Vec<Vec<Value>>> {
-        self.0.scan_by_index(table, index_no, value)
+        self.0.scan_by_index(table, index_no, values)
     }
     fn scan_by_index_range(
         &mut self,
@@ -999,16 +999,29 @@ fn exec_stmt_rest(
                                         ctx.get_by_pk(*table, &pk)?
                                     }
                                     ConflictProbe::Index(ino) => {
-                                        // A single-column target, by
-                                        // construction (see `conflict_probe`).
-                                        let v = &row[target[0] as usize];
-                                        // UNIQUE permits many NULLs, so a NULL
-                                        // here cannot have collided with
+                                        // Probe values in the INDEX's column
+                                        // order — a composite target's list
+                                        // order may differ (#55).
+                                        let cols = &t
+                                            .indexes
+                                            .get(*ino as usize - 1)
+                                            .ok_or_else(|| {
+                                                Error::Internal(
+                                                    "conflict probe index out of range".into(),
+                                                )
+                                            })?
+                                            .columns;
+                                        let vals: Vec<Value> = cols
+                                            .iter()
+                                            .map(|&c| row[c as usize].clone())
+                                            .collect();
+                                        // UNIQUE permits many NULLs, so any
+                                        // NULL here cannot have collided with
                                         // anything and there is no row to find.
-                                        if v.is_null() {
+                                        if vals.iter().any(|v| v.is_null()) {
                                             None
                                         } else {
-                                            ctx.get_by_index(*table, *ino, v)?
+                                            ctx.get_by_index(*table, *ino, &vals)?
                                         }
                                     }
                                 };

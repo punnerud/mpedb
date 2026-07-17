@@ -273,7 +273,7 @@ fn index_point_on_unique_column() {
         access_of(&p),
         &AccessPath::IndexPoint {
             index_no: 1,
-            part: KeyPart::Param(0)
+            parts: vec![KeyPart::Param(0)]
         }
     );
     assert!(filter_of(&p).is_some());

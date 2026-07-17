@@ -336,7 +336,7 @@ pub fn run_parent(argv: &[String]) -> CliResult {
             .collect();
         for v in probes {
             let got: Vec<i64> = r
-                .scan_by_index(0, 1, &Value::Int(v))? // index 1 = column `a`
+                .scan_by_index(0, 1, &[Value::Int(v)])? // index 1 = column `a`
                 .iter()
                 .map(|row| int(&row[0]))
                 .collect::<Result<_, _>>()?;

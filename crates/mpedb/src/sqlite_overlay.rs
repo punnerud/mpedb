@@ -781,10 +781,10 @@ impl TxnCtx for MergeCtx<'_> {
         self.at.base_get_by_pk(table, pk)
     }
 
-    fn get_by_index(&mut self, _t: u32, _n: u32, _v: &Value) -> Result<Option<Vec<Value>>> {
+    fn get_by_index(&mut self, _t: u32, _n: u32, _v: &[Value]) -> Result<Option<Vec<Value>>> {
         Err(Error::Internal("index probe on an overlay (schema has none)".into()))
     }
-    fn scan_by_index(&mut self, _t: u32, _n: u32, _v: &Value) -> Result<Vec<Vec<Value>>> {
+    fn scan_by_index(&mut self, _t: u32, _n: u32, _v: &[Value]) -> Result<Vec<Vec<Value>>> {
         Err(Error::Internal("index scan on an overlay (schema has none)".into()))
     }
     fn scan_by_index_range(

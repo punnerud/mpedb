@@ -587,22 +587,48 @@ fn extract_join_access(
         }
         chosen = Some(AccessPath::PkPoint(pp.into_iter().map(|(_, p)| p).collect()));
     } else {
-        let sec = secondary_indexes(inner);
-        'passes: for unique_only in [true, false] {
-            for (pos, col) in sec.iter().enumerate() {
-                let Some(col) = *col else { continue }; // composite: #55
-                if pos >= 63 || inner.columns[col as usize].unique != unique_only {
-                    continue;
-                }
-                if let Some((ci, part)) = pins[col as usize] {
-                    consumed[ci] = true;
-                    chosen = Some(AccessPath::IndexPoint {
-                        index_no: (pos + 1) as u32,
-                        part,
-                    });
-                    break 'passes;
+        // #55: an index qualifies when its FULL column prefix is pinned by
+        // the join equalities (k = 1 is the single-column case). Full-width
+        // unique first (at most one row per outer), then longest prefix.
+        let mut best: Option<(usize, Vec<usize>, Vec<KeyPart>, bool)> = None;
+        for (pos, ix) in inner.indexes.iter().enumerate() {
+            if pos >= 63 {
+                break;
+            }
+            let mut cis = Vec::new();
+            let mut parts = Vec::new();
+            for &col in &ix.columns {
+                match pins[col as usize] {
+                    Some((ci, part)) => {
+                        cis.push(ci);
+                        parts.push(part);
+                    }
+                    None => break,
                 }
             }
+            if parts.is_empty() {
+                continue;
+            }
+            let full_unique = ix.unique && parts.len() == ix.columns.len();
+            let better = match &best {
+                None => true,
+                Some((_, _, bparts, bfull)) => {
+                    (full_unique && !bfull)
+                        || (full_unique == *bfull && parts.len() > bparts.len())
+                }
+            };
+            if better {
+                best = Some((pos, cis, parts, full_unique));
+            }
+        }
+        if let Some((pos, cis, parts, _)) = best {
+            for ci in cis {
+                consumed[ci] = true;
+            }
+            chosen = Some(AccessPath::IndexPoint {
+                index_no: (pos + 1) as u32,
+                parts,
+            });
         }
     }
     let access = chosen.unwrap_or(AccessPath::FullScan);

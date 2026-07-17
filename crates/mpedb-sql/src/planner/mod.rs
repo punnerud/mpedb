@@ -253,19 +253,22 @@ pub(crate) fn conflict_probe_opt(table: &TableDef, target: &[u16]) -> Option<Con
     if target == table.primary_key {
         return Some(ConflictProbe::Pk);
     }
-    // The engine's secondary index probe takes ONE value (`get_by_index`), so a
-    // multi-column target has no index to use even if each column is unique
-    // alone — and "unique together" is not something the schema can declare.
-    let [col] = target else { return None };
-    // An `indexed` (non-unique) column cannot witness a conflict: nothing
-    // stops several rows from sharing the value, so there is no single row
-    // to have conflicted with. PG rejects the same shape at prepare.
-    if !table.columns[*col as usize].unique {
-        return None;
-    }
-    let ino = secondary_indexes(table)
-        .iter()
-        .position(|c| *c == Some(*col))?;
+    // A UNIQUE index whose column SET equals the target set can witness the
+    // conflict (#55: composite targets included — order-insensitive, as in
+    // PostgreSQL, which matches targets against unique indexes by column
+    // set). A non-unique index cannot: nothing stops several rows from
+    // sharing the values, so there is no single row to have conflicted
+    // with — PG rejects the same shape at prepare.
+    let mut want: Vec<u16> = target.to_vec();
+    want.sort_unstable();
+    let ino = table.indexes.iter().position(|ix| {
+        if !ix.unique || ix.columns.len() != want.len() {
+            return false;
+        }
+        let mut cols = ix.columns.clone();
+        cols.sort_unstable();
+        cols == want
+    })?;
     Some(ConflictProbe::Index(ino as u32 + 1))
 }
 
@@ -437,17 +440,20 @@ fn plan_on_conflict(
             .map(|i| table.columns[*i as usize].name.as_str())
             .collect();
         let mut usable = vec![format!("({})", pk_names.join(", "))];
-        for c in secondary_indexes(table).into_iter().flatten() {
-            // Only UNIQUE columns can witness a conflict; an `indexed`
-            // (non-unique) column is a secondary index but never usable here.
-            if table.columns[c as usize].unique {
-                usable.push(format!("({})", table.columns[c as usize].name));
-            }
+        // Only UNIQUE indexes can witness a conflict; a non-unique index
+        // never can (several rows may share the values).
+        for ix in table.indexes.iter().filter(|ix| ix.unique) {
+            let names: Vec<&str> = ix
+                .columns
+                .iter()
+                .map(|&c| table.columns[c as usize].name.as_str())
+                .collect();
+            usable.push(format!("({})", names.join(", ")));
         }
         return Err(bind_err(format!(
             "ON CONFLICT ({}) is not supported: the target must be a key this can probe to \
-             find the row you conflicted with — the primary key, or one UNIQUE column. \
-             Usable here: {}.",
+             find the row you conflicted with — the primary key, or a UNIQUE index's \
+             column set. Usable here: {}.",
             target.join(", "),
             usable.join(", ")
         )));

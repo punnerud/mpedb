@@ -524,7 +524,7 @@ impl CompiledPlan {
                     .flatten()
                     .flat_map(|b| b.parts.iter())
                     .try_for_each(&mut check),
-                AccessPath::IndexPoint { part, .. } => check(part),
+                AccessPath::IndexPoint { parts, .. } => parts.iter().try_for_each(&mut check),
                 AccessPath::IndexRange { lo, hi, .. } => [lo, hi]
                     .into_iter()
                     .flatten()
@@ -746,31 +746,34 @@ impl CompiledPlan {
                 }
                 Ok(())
             }
-            AccessPath::IndexPoint { index_no, part } => {
-                let sec = crate::planner::secondary_indexes(t);
+            AccessPath::IndexPoint { index_no, parts } => {
                 let no = *index_no as usize;
-                if no == 0 || no > sec.len() || no > 63 {
+                if no == 0 || no > t.indexes.len() || no > 63 {
                     return Err(corrupt("index_no out of range"));
                 }
-                // Composite access paths arrive with #55; until then a plan
-                // referencing one cannot have been produced by this planner.
-                let Some(col) = sec[no - 1] else {
-                    return Err(corrupt("composite index access predates #55"));
-                };
-                self.check_key_part(part, t.columns[col as usize].ty, outer, ptypes)
+                let ix = &t.indexes[no - 1];
+                // Parts cover a non-empty PREFIX of the index's columns, in
+                // key order, each typed as its column (#55).
+                if parts.is_empty() || parts.len() > ix.columns.len() {
+                    return Err(corrupt("IndexPoint parts do not fit the index"));
+                }
+                for (part, &col) in parts.iter().zip(&ix.columns) {
+                    self.check_key_part(part, t.columns[col as usize].ty, outer, ptypes)?;
+                }
+                Ok(())
             }
             AccessPath::IndexRange { index_no, lo, hi } => {
-                let sec = crate::planner::secondary_indexes(t);
                 let no = *index_no as usize;
-                if no == 0 || no > sec.len() || no > 63 {
+                if no == 0 || no > t.indexes.len() || no > 63 {
                     return Err(corrupt("index_no out of range"));
                 }
                 if lo.is_none() && hi.is_none() {
                     return Err(corrupt("IndexRange with no bounds"));
                 }
-                let Some(col) = sec[no - 1] else {
-                    return Err(corrupt("composite index access predates #55"));
-                };
+                // Phase-1 rule, same as PkRange: bounds over the FIRST index
+                // column only — valid for composite unchanged (the first
+                // column's encoding is a key prefix).
+                let col = t.indexes[no - 1].columns[0];
                 let ty = t.columns[col as usize].ty;
                 for bound in [lo, hi].into_iter().flatten() {
                     if bound.parts.len() != 1 {
