@@ -9,7 +9,7 @@
 //! is clearer).
 
 use std::io::{BufRead, Write as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use mpedb::{Config, Database, WriteSession};
 use mpedb_core::Engine;
@@ -19,11 +19,20 @@ use crate::util::{usage, CliResult};
 
 pub fn run(argv: &[String]) -> CliResult {
     let [config_path] = argv else {
-        return usage("repl needs <config.toml>");
+        return usage("repl needs <config.toml|db.mpedb>");
     };
-    let config = Config::from_file(Path::new(config_path))?;
-    let db_path = config.options.path.clone();
-    let db = Database::open_with_config(config)?;
+    // Same rule as `open_target`: a .toml is a config, anything else is the
+    // database file itself (`mpedb data.db` lands here via its sidecar).
+    let (db, db_path) = if Path::new(config_path).extension().is_some_and(|e| e == "toml") {
+        let config = Config::from_file(Path::new(config_path))?;
+        let db_path = config.options.path.clone();
+        (Database::open_with_config(config)?, db_path)
+    } else {
+        (
+            Database::open_from_file(Path::new(config_path))?,
+            PathBuf::from(config_path),
+        )
+    };
 
     let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
     let stdin = std::io::stdin();

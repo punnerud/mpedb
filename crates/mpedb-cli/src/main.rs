@@ -19,6 +19,7 @@ mod mirror_collide;
 mod powerloss;
 mod proc_cmd;
 mod render;
+mod openpath;
 mod repl;
 mod stress;
 mod util;
@@ -29,6 +30,10 @@ use util::{parse_params, usage, CliResult, Failure};
 
 const USAGE: &str = "\
 usage: mpedb <command> [args]
+         mpedb <path> [SQL [param ...]]           sqlite3-shaped: open a repl on a
+         config.toml / .mpedb file / sqlite .db (sidecar mirror), or run one
+         statement; `mpedb checkpoint <sqlite.db>` pushes sidecar writes back
+
 
   exec    <target> <SQL> [param ...]       run one statement
   prepare <target> <SQL>                   compile + publish, print plan hash
@@ -103,6 +108,11 @@ fn dispatch(argv: &[String]) -> CliResult {
         "crash" => crash::run_parent(rest),
         "collide" => collide::run_parent(rest),
         "mirror" => mirror::run(rest),
+        "open" => match rest.split_first() {
+            Some((path, more)) => openpath::run(path, more),
+            None => usage("open needs <config.toml|db.mpedb|sqlite.db>"),
+        },
+        "checkpoint" => openpath::checkpoint(rest),
         "mirror-collide" => mirror_collide::run_parent(rest),
         "powerloss" => powerloss::run_parent(rest),
         "stress-child" => stress::run_child(rest),
@@ -117,6 +127,10 @@ fn dispatch(argv: &[String]) -> CliResult {
             println!("{USAGE}");
             Ok(())
         }
+        // The sqlite3-shaped entry: a bare EXISTING path is unambiguous
+        // against the command names above (none of them are files), so
+        // `mpedb data.db` opens exactly like `sqlite3 data.db` does.
+        other if std::path::Path::new(other).exists() => openpath::run(other, rest),
         other => usage(format!("unknown command `{other}`")),
     }
 }
