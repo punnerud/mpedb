@@ -45,6 +45,7 @@ fn schema() -> Schema {
         ],
         primary_key: vec![0],
         indexes: vec![],
+        dead: false,
     };
     let orders = TableDef {
         id: 0,
@@ -67,6 +68,7 @@ fn schema() -> Schema {
         ],
         primary_key: vec![0, 1],
         indexes: vec![],
+        dead: false,
     };
     let events = TableDef {
         id: 0,
@@ -81,6 +83,7 @@ fn schema() -> Schema {
         ],
         primary_key: vec![0],
         indexes: vec![],
+        dead: false,
     };
     Schema::new(vec![users, orders, events]).unwrap()
 }

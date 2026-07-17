@@ -193,6 +193,7 @@ fn synthetic_grouped_table(
         columns: out,
         primary_key: vec![0],
         indexes: Vec::new(),
+        dead: false,
     }
 }
 

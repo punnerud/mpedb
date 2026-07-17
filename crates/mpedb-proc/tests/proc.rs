@@ -423,6 +423,7 @@ fn stale_plan_surfaces_plan_invalidated() {
         columns: vec![col("id"), col("balance"), col("extra")],
         primary_key: vec![0],
         indexes: vec![],
+        dead: false,
     }])
     .unwrap();
     let foreign = mpedb_sql::prepare(sql, &other_schema).unwrap();

@@ -37,6 +37,7 @@ pub(crate) fn test_schema() -> Schema {
         ],
         primary_key: vec![0],
         indexes: vec![],
+        dead: false,
     };
     let orders = TableDef {
         id: 0,
@@ -49,6 +50,7 @@ pub(crate) fn test_schema() -> Schema {
         ],
         primary_key: vec![0, 1],
         indexes: vec![],
+        dead: false,
     };
     let events = TableDef {
         id: 0,
@@ -63,6 +65,7 @@ pub(crate) fn test_schema() -> Schema {
         ],
         primary_key: vec![0],
         indexes: vec![],
+        dead: false,
     };
     Schema::new(vec![users, orders, events]).unwrap()
 }
@@ -108,6 +111,7 @@ fn secondary_index_numbering() {
         ],
         primary_key: vec![0, 1],
         indexes: vec![],
+        dead: false,
     };
     // The derivation lives in Schema::new now (single source: TableDef.indexes).
     let s = Schema::new(vec![t]).unwrap();

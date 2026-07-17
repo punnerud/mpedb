@@ -378,6 +378,7 @@ fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>) -> Result<Config> {
                 columns,
                 primary_key,
                 indexes,
+                dead: false,
             });
         }
 

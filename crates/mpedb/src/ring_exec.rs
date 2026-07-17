@@ -897,6 +897,7 @@ mod tests {
             columns: vec![col("id", false), col("v", true)],
             primary_key: vec![0],
             indexes: vec![],
+            dead: false,
         };
         Schema::new(vec![table("a"), table("b")]).unwrap()
     }
