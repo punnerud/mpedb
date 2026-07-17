@@ -701,3 +701,99 @@ fn unquote(s: &str) -> String {
     }
     s.to_string()
 }
+
+impl SqliteFile {
+    /// Point lookup by rowid — the b-tree descent (interior table cells hold
+    /// (child, K) where the child subtree's rowids are ≤ K; the rightmost
+    /// pointer covers the rest). Rowid tables only; a WITHOUT ROWID table
+    /// has no rowid to seek.
+    pub fn seek_rowid(&self, t: &Table, rowid: i64) -> Result<Option<Vec<Value>>> {
+        if t.without_rowid {
+            return Err(Error::Unsupported(
+                "seek_rowid on a WITHOUT ROWID table".into(),
+            ));
+        }
+        let mut page_no = t.root_page;
+        for _ in 0..40 {
+            let page = self.page(page_no)?;
+            let is_page1 = page_no == 1;
+            let hdr = if is_page1 { 100 } else { 0 };
+            let n_cells = u16::from_be_bytes([page[hdr + 3], page[hdr + 4]]) as usize;
+            match page[hdr] {
+                5 => {
+                    let ptrs = hdr + 12;
+                    if ptrs + 2 * n_cells > self.page_size {
+                        return Err(corrupt("cell pointer array past page end"));
+                    }
+                    let mut next = None;
+                    for i in 0..n_cells {
+                        let off = u16::from_be_bytes([
+                            page[ptrs + 2 * i],
+                            page[ptrs + 2 * i + 1],
+                        ]) as usize;
+                        let cell = page
+                            .get(off..)
+                            .filter(|c| c.len() >= 5)
+                            .ok_or_else(|| corrupt("truncated interior cell"))?;
+                        let child =
+                            u32::from_be_bytes([cell[0], cell[1], cell[2], cell[3]]);
+                        let (k, _) = varint(&cell[4..])?;
+                        if rowid <= k {
+                            next = Some(child);
+                            break;
+                        }
+                    }
+                    page_no = match next {
+                        Some(c) => c,
+                        None => {
+                            let rp = hdr + 8;
+                            u32::from_be_bytes([
+                                page[rp],
+                                page[rp + 1],
+                                page[rp + 2],
+                                page[rp + 3],
+                            ])
+                        }
+                    };
+                }
+                13 => {
+                    let ptrs = hdr + 8;
+                    if ptrs + 2 * n_cells > self.page_size {
+                        return Err(corrupt("cell pointer array past page end"));
+                    }
+                    for i in 0..n_cells {
+                        let off = u16::from_be_bytes([
+                            page[ptrs + 2 * i],
+                            page[ptrs + 2 * i + 1],
+                        ]) as usize;
+                        let cell = page
+                            .get(off..)
+                            .ok_or_else(|| corrupt("cell offset out of bounds"))?;
+                        let (payload_len, n1) = varint(cell)?;
+                        let (r, n2) = varint(&cell[n1..])?;
+                        if r == rowid {
+                            let payload = self.cell_payload(
+                                &cell[n1 + n2..],
+                                payload_len as usize,
+                                true,
+                            )?;
+                            let mut vals = decode_record(&payload, self.usable)?;
+                            if vals.len() < t.columns.len() {
+                                vals.resize(t.columns.len(), Value::Null);
+                            }
+                            vals.truncate(t.columns.len());
+                            if let Some(ipk) = t.ipk_column {
+                                vals[ipk] = Value::Int(rowid);
+                            }
+                            apply_real_affinity(t, &mut vals);
+                            return Ok(Some(vals));
+                        }
+                    }
+                    return Ok(None);
+                }
+                k => return Err(corrupt(format!("unexpected page kind {k} in seek"))),
+            }
+        }
+        Err(corrupt("b-tree too deep (cycle?)"))
+    }
+}

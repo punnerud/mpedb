@@ -10,10 +10,12 @@ description = "Embedded multi-process shared-memory database with SQL and conten
 leakstat = ["mpedb-core/leakstat"]
 
 [dev-dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
 # `examples/multiproc_check.rs` forks. Nothing in the library needs libc.
 libc = { workspace = true }
 
 [dependencies]
+mpedb-sqlitefmt = { path = "../mpedb-sqlitefmt" }
 mpedb-types = { workspace = true }
 mpedb-core = { workspace = true }
 mpedb-sql = { workspace = true }
