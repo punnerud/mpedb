@@ -54,7 +54,7 @@ sqlite `STRICT` still converts losslessly (`'42'` → `42`); mpedb does not.
 
 | Feature | Status | Comment |
 |---|---|---|
-| FROM-less `SELECT 3+5` | 🚧 | in progress (#67) — nearly all of the remaining corpus gap |
+| FROM-less `SELECT 3+5` | ✅ | one synthetic row (sqlite/PG semantics); WHERE filters it, aggregates see it, compound arms and subqueries may each be FROM-less |
 | WHERE | ✅ | full SQL three-valued logic, verified against sqlite 3.45 |
 | GROUP BY | ✅ | columns, expressions (`GROUP BY a/100`), output ordinals (`GROUP BY 1`) |
 | HAVING | ✅ | subqueries inside HAVING are refused |
@@ -92,7 +92,7 @@ sqlite `STRICT` still converts losslessly (`'42'` → `42`); mpedb does not.
 | IN / NOT IN (value list) | ✅ | |
 | IS NULL / IS NOT NULL | ✅ | |
 | `x IS y` (general distinct-from) | ❌ | only the NULL forms |
-| CASE (searched and simple) | ✅ | simple form desugars to searched |
+| CASE (searched and simple) | ✅ | simple form desugars to searched; arms mixing int64 and float64 are refused — sqlite types the winning arm per row, rigid typing cannot, and widening was measured to change division results (add a CAST) |
 | CAST(x AS type) | ✅ | NULL→NULL; float→int truncates toward zero (sqlite's rule); **text never parses into a number** — refused instead of guessed |
 | COLLATE | ❌ | text compares as UTF-8 bytes |
 | Parameters | ✅ | `$1, $2, …` (PostgreSQL style) rather than `?`; types unify at compile time |
@@ -105,7 +105,7 @@ sqlite `STRICT` still converts losslessly (`'42'` → `42`); mpedb does not.
 | length | ✅ | |
 | abs, round | ✅ | keep their argument's numeric type |
 | substr / substring | ✅ | |
-| coalesce, ifnull | ✅ | compiled to lazy control flow, not a call — arguments after the first non-NULL are never evaluated |
+| coalesce, ifnull | ✅ | compiled to lazy control flow, not a call — arguments after the first non-NULL are never evaluated; int64/float64 arm mixing refused, same rule as CASE |
 | nullif | ✅ | desugared to CASE |
 | everything else | ❌ | an unknown function is a compile error that lists what exists |
 

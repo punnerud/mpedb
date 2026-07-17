@@ -20,7 +20,11 @@ pub(crate) enum Stmt {
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SelectStmt {
-    pub table: String,
+    /// `None` = FROM-less (`SELECT 3+5`): the statement reads no table and
+    /// evaluates its items over ONE synthetic empty row (sqlite/PG semantics).
+    /// `joins` is empty whenever this is `None` — the parser cannot produce a
+    /// join without a FROM.
+    pub table: Option<String>,
     /// `FROM t [AS] a` — the name `t`'s columns are addressed by. When present,
     /// the table's own name is NOT in scope (`FROM orders o` makes `orders.c`
     /// invalid and `o.c` valid — PG's rule), and it is what lets a table join

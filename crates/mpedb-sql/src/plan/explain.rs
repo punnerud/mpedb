@@ -70,6 +70,9 @@ impl CompiledPlan {
     /// compound arm.
     fn render_select(&self, sp: &SelectPlan, schema: &Schema, out: &mut String) {
         let table_name = |id: u32| {
+            if id == super::DUAL_TABLE {
+                return "(no FROM — one synthetic row)".to_string();
+            }
             schema
                 .table(id)
                 .map(|t| t.name.clone())
@@ -284,6 +287,9 @@ impl CompiledPlan {
     /// The DML/txn arms of `explain`.
     fn render_rest(&self, schema: &Schema, out: &mut String) {
         let table_name = |id: u32| {
+            if id == super::DUAL_TABLE {
+                return "(no FROM — one synthetic row)".to_string();
+            }
             schema
                 .table(id)
                 .map(|t| t.name.clone())

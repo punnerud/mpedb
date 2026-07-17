@@ -265,12 +265,14 @@ statements, clauses, operators, functions, types — in the same format as
 Turso's COMPAT.md so the two read side by side.
 
 It is also measured against sqlite's own **sqllogictest corpus** (the
-`sqlite_corpus` runner in `crates/mpedb-testkit`): the classic `select1–3`
-files AND the entire random *select* tree — 127 files, 1.46 million records —
-pass at **100%**, with **zero wrong answers and zero error mismatches**
-across every statement both engines accept, over the full 5.3M-record corpus
-too. What remains of the corpus (~31%, the expr/aggregate trees) is almost
-entirely one feature: FROM-less `SELECT 3+5`, which is queued.
+`sqlite_corpus` runner in `crates/mpedb-testkit`), all 5.3 million records of
+it: **zero wrong answers and zero error mismatches across the entire corpus**,
+with **99.5% of attempted statements passing** — the classic `select1–3`, the
+whole random *select* tree, and (since FROM-less `SELECT 3+5` landed) the
+*expr* tree at 99.6% and the *aggregates* tree at 100.0%. The remaining half
+percent is deliberate refusals with error messages, mostly `CASE`/`COALESCE`
+arms that mix int and float (sqlite types those per row — rigid typing says
+`CAST`) and *groupby*-tree shapes not yet compiled.
 
 | | mpedb | note |
 |---|---|---|
@@ -297,7 +299,7 @@ entirely one feature: FROM-less `SELECT 3+5`, which is queued.
 | `UNION [ALL]` / `EXCEPT` / `INTERSECT` chains | ✅ | left-associative, sqlite's precedence; set ops dedup (NULLs equal); arms must agree on arity and exact types — `CAST` bridges deliberate mismatches |
 | Secondary indexes: `unique = true` and non-unique `indexed = true` | ✅ | equality and range (`IndexScan`/`IndexRange`) — `EXPLAIN` shows which |
 | Loose typing per column: `type = "any"` | ✅ | refused in keys and `UNIQUE`; the mirror pre-flight refuses pushing it to PG |
-| **FROM-less `SELECT 3+5`** | ❌ | queued — it is nearly all of the remaining corpus gap |
+| **FROM-less `SELECT 3+5`** | ✅ | one synthetic row; WHERE filters it, aggregates see it (`SELECT count(*)` → 1), compound arms and subqueries may each be FROM-less |
 | Scalar subqueries `(SELECT …)`, `[NOT] EXISTS (…)` — uncorrelated AND correlated | ✅ | one output column; 0 rows → NULL; **>1 row errors** (PG's rule — sqlite silently takes the first); correlated references become inner-plan parameters, the `OuterCol` idea applied to a whole plan |
 | **Cross-FILE refs** | ❌ | planned (workspace read-joins) |
 | **`CREATE TABLE` / `ALTER`** | ❌ | today: schema comes from the config or `mirror import`; live DDL is designed in [`DESIGN-DDL.md`](DESIGN-DDL.md) |

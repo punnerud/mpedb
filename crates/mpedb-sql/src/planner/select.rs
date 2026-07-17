@@ -271,7 +271,19 @@ pub(super) fn plan_select(
     let eff_params = n_params + subplans.len() as u16;
     let correlated: Vec<bool> = subplans.iter().map(|p| !p.outer_args.is_empty()).collect();
 
-    let (table_id, table) = resolve_table(schema, &s.table)?;
+    let (table_id, table) = match &s.table {
+        Some(name) => resolve_table(schema, name)?,
+        // FROM-less: the DUAL sentinel and a zero-column def. The whole plain
+        // pipeline below works over width 0 — access degrades to FullScan
+        // (no columns can pin a key), the executor yields ONE empty row, and
+        // ORDER BY by name errors exactly as sqlite's "no such column".
+        None => {
+            if s.items.is_none() {
+                return Err(bind_err("SELECT * without a FROM clause — no tables specified"));
+            }
+            (crate::plan::DUAL_TABLE, crate::plan::dual_def())
+        }
+    };
     if !s.joins.is_empty() {
         return plan_join_select(s, schema, n_params, catalog, consts, subplans, slot_types);
     }
@@ -295,8 +307,23 @@ pub(super) fn plan_select(
     // Inject the SELECT visibility policy AND-ed with the user WHERE, *before*
     // access extraction, so a policy conjunct that pins the PK/unique column
     // still becomes a Point/Range access and footprints only narrow (§3.3).
-    let policy = read_policy(&mut binder, catalog, table_id, &table.name, PolicyCmd::Select)?;
-    let (access, residual) = extract_access(merge_and(bound_where, policy), table, consts)?;
+    // A FROM-less statement reads no table, so there is no table whose policy
+    // could apply — and `table_id` is the DUAL sentinel, not a catalog key.
+    let policy = if s.table.is_some() {
+        read_policy(&mut binder, catalog, table_id, &table.name, PolicyCmd::Select)?
+    } else {
+        None
+    };
+    // Never run access extraction over the dual def: its EMPTY primary key
+    // satisfies a point probe vacuously (zero of zero parts pinned), and a
+    // `PkPoint([])` on a table that does not exist is exactly the "keyed
+    // access on a FROM-less select" shape validate refuses. FullScan + the
+    // whole predicate as residual is the only honest plan.
+    let (access, residual) = if s.table.is_some() {
+        extract_access(merge_and(bound_where, policy), table, consts)?
+    } else {
+        (AccessPath::FullScan, merge_and(bound_where, policy))
+    };
     let filter = residual.map(|e| compile_program(&e)).transpose()?;
     let post_filter = post_where.map(|e| compile_program(&e)).transpose()?;
     let joined_filter: Option<ExprProgram> = None;

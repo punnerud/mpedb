@@ -95,7 +95,21 @@ impl CompiledPlan {
                     order_junk,
                     ..
                 } = sp;
-                let t = get_table(*table)?;
+                // The DUAL sentinel (FROM-less SELECT) is legal ONLY in its
+                // narrowest shape: no joins (nothing to join a non-table to)
+                // and a full "scan" (no columns exist to probe). Everything
+                // below then bounds widths against the zero-column def.
+                let t = if *table == super::DUAL_TABLE {
+                    if !joins.is_empty() {
+                        return Err(corrupt("joins on a FROM-less select"));
+                    }
+                    if !matches!(access, AccessPath::FullScan) {
+                        return Err(corrupt("keyed access on a FROM-less select"));
+                    }
+                    super::dual_def()
+                } else {
+                    get_table(*table)?
+                };
                 // Junk columns are sort-only and get trimmed, so they must not
                 // be able to (a) eat the whole output, (b) survive a DISTINCT —
                 // where they would dedup on a value the caller never sees — or
@@ -456,6 +470,12 @@ impl CompiledPlan {
         // The outer base row: `[table0 ‖ … ‖ tableN]` types, for outer_args.
         let mut outer_types: Vec<ColumnType> = Vec::new();
         for id in std::iter::once(outer.table).chain(outer.joins.iter().map(|j| j.table)) {
+            // A FROM-less outer contributes zero columns — nothing can
+            // correlate against it (outer_args bounds-check against an
+            // empty tuple below, so a forged arg still fails).
+            if id == super::DUAL_TABLE {
+                continue;
+            }
             outer_types.extend(get_table(id)?.columns.iter().map(|c| c.ty));
         }
 

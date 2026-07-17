@@ -248,6 +248,25 @@ pub(super) fn gather_rows(
     params: &[Value],
     cap: Option<usize>,
 ) -> Result<Vec<Vec<Value>>> {
+    // FROM-less SELECT: the "table" is the DUAL sentinel — ONE synthetic
+    // empty row, never a TxnCtx call (there is nothing to read). The filter
+    // still runs (`SELECT 3 WHERE 1=0` is zero rows), over a width-0 row
+    // whose programs can only read consts and params — validate enforced
+    // that. Every select path funnels through here, so aggregates and
+    // subplans over the dual row need no cases of their own.
+    if table == mpedb_sql::DUAL_TABLE {
+        let mut rows = vec![Vec::new()];
+        if let Some(f) = filter {
+            let mut stack = Vec::with_capacity(f.max_stack());
+            if !f.eval_filter(&mut stack, &rows[0], params)? {
+                rows.clear();
+            }
+        }
+        if cap == Some(0) {
+            rows.clear();
+        }
+        return Ok(rows);
+    }
     // Scan paths push the filter AND the cap down into the (possibly
     // streaming) scan. Point and index-equality paths gather their matches —
     // one row for a PK/unique probe, every equal row for a non-unique index —

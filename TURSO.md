@@ -126,7 +126,7 @@ error message, not a silent gap (see [GUIDE.md](GUIDE.md) and the
 | views | yes (`IF NOT EXISTS` not idempotent) | no |
 | triggers | yes (no `INSTEAD OF`) | no — the PySpell/ETL layer is the planned mechanism |
 | `ALTER TABLE` / live DDL | yes | no — schema is the config file; live DDL designed ([DESIGN-DDL.md](DESIGN-DDL.md)), not built |
-| `FROM`-less `SELECT 3+5` | yes | not yet (#67) |
+| `FROM`-less `SELECT 3+5` | yes | yes — one synthetic row, aggregates and compound arms included |
 | typing | SQLite dynamic typing | rigid per-column types — a wrong type is a write-time error, stricter than sqlite `STRICT` |
 | plan model | SQL parsed per statement (prepared statements cached) | SQL compiles once to a content-hashed plan; `execute(hash, params)` re-parses nothing |
 

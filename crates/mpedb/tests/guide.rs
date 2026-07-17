@@ -429,8 +429,20 @@ fn the_sqlite_differences_that_bite() {
     // 1. No CREATE TABLE. The schema comes from the config or `mirror import`.
     assert!(db.query("CREATE TABLE t (id INTEGER)", &[]).is_err());
 
-    // 2. Division by zero raises; sqlite yields NULL.
+    // 2. Division by zero raises; sqlite yields NULL. (Also a FROM-less
+    // SELECT — one synthetic row, so the division is reached and raises.)
     assert!(db.query("SELECT 1 / 0", &[]).is_err());
+    assert_eq!(
+        rows(db.query("SELECT 3 + 5", &[]).unwrap()),
+        vec![vec![Value::Int(8)]],
+        "FROM-less SELECT evaluates over one synthetic row"
+    );
+
+    // 6. CASE/COALESCE arms cannot mix int64 and float64 — sqlite types the
+    // winning arm per row, rigid typing cannot. The CAST in the message works.
+    let err = db.query("SELECT coalesce(30, 1.5)", &[]).unwrap_err();
+    assert!(format!("{err}").contains("CAST"), "{err}");
+    assert!(db.query("SELECT coalesce(CAST(30 AS REAL), 1.5)", &[]).is_ok());
 
     // 3. Every join kind works two-table (RIGHT plans as a swapped LEFT;
     // FULL NULL-extends both sides); only a RIGHT/FULL inside a multi-join
