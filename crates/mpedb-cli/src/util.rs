@@ -273,8 +273,9 @@ pub fn write_config_durable(
     size_mb: u64,
     tables_toml: &str,
     durability: &str,
+    extent_kb: Option<u64>,
 ) -> CliResult {
-    write_config_concurrency(cfg_path, db_path, size_mb, tables_toml, durability, "serial")
+    write_config_concurrency(cfg_path, db_path, size_mb, tables_toml, durability, "serial", extent_kb)
 }
 
 /// Like [`write_config_durable`] but also pins the write-path `concurrency`
@@ -287,10 +288,14 @@ pub fn write_config_concurrency(
     tables_toml: &str,
     durability: &str,
     concurrency: &str,
+    extent_kb: Option<u64>,
 ) -> CliResult {
+    let extent = extent_kb
+        .map(|kb| format!("extent_threshold_kb = {kb}\n"))
+        .unwrap_or_default();
     let text = format!(
         "[database]\npath = \"{}\"\nsize_mb = {size_mb}\ndurability = \"{durability}\"\n\
-         concurrency = \"{concurrency}\"\n\n{tables_toml}",
+         concurrency = \"{concurrency}\"\n{extent}\n{tables_toml}",
         db_path.display()
     );
     std::fs::write(cfg_path, text)?;

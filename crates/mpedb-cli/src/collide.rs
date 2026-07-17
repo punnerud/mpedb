@@ -120,7 +120,7 @@ pub fn run_parent(argv: &[String]) -> CliResult {
     let cfg = dir.join("config.toml");
     let dbf = dir.join("collide.mpedb");
     let _ = std::fs::remove_file(&dbf);
-    write_config_concurrency(&cfg, &dbf, 128, COLLIDE_TOML, &durability, &concurrency)?;
+    write_config_concurrency(&cfg, &dbf, 128, COLLIDE_TOML, &durability, &concurrency, None)?;
 
     // Seed the PK keyspace so UPDATEs have live targets and PK inserts collide.
     {

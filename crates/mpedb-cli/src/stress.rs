@@ -119,7 +119,7 @@ struct Totals {
 pub fn run_parent(argv: &[String]) -> CliResult {
     let p = args::parse(
         argv,
-        &["dir", "workers", "secs", "mode", "durability", "concurrency", "size_mb"],
+        &["dir", "workers", "secs", "mode", "durability", "concurrency", "size_mb", "extent-kb"],
         &[],
     )?;
     let dir = PathBuf::from(p.require("dir")?);
@@ -165,7 +165,11 @@ pub fn run_parent(argv: &[String]) -> CliResult {
         "incr" => INCR_TOML,
         _ => MIXED_TOML,
     };
-    crate::util::write_config_concurrency(&cfg, &dbf, size_mb, tables, &durability, &concurrency)?;
+    let extent_kb = match p.u64_or("extent-kb", 0)? {
+        0 => None,
+        kb => Some(kb),
+    };
+    crate::util::write_config_concurrency(&cfg, &dbf, size_mb, tables, &durability, &concurrency, extent_kb)?;
 
     let db = Database::open(&cfg)?;
     seed(&db, &mode)?;
