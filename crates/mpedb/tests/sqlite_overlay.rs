@@ -3,7 +3,7 @@
 //! file, plus the LOCKED-mode contract (a foreign sqlite writer gets
 //! SQLITE_BUSY while the overlay is open) and the divergence refusal.
 
-use mpedb::{SqliteOverlay, Value};
+use mpedb::{LockMode, SqliteOverlay, Value};
 use rusqlite::Connection;
 
 fn setup(tag: &str) -> std::path::PathBuf {
@@ -50,7 +50,7 @@ fn ints(rows: &[Vec<Value>]) -> Vec<i64> {
 #[test]
 fn merged_view_reads_writes_and_tombstones() {
     let p = setup("merge");
-    let ovl = SqliteOverlay::open(&p).unwrap();
+    let mut ovl = SqliteOverlay::open(&p).unwrap();
 
     // Pure read-through: nothing in the overlay yet.
     let got = rows(ovl.query("SELECT count(*) FROM users", &[]).unwrap());
@@ -128,14 +128,14 @@ fn merged_view_reads_writes_and_tombstones() {
 fn deltas_survive_reopen_and_divergence_is_refused() {
     let p = setup("reopen");
     {
-        let ovl = SqliteOverlay::open(&p).unwrap();
+        let mut ovl = SqliteOverlay::open(&p).unwrap();
         ovl.query("INSERT INTO users (id, name, age) VALUES (777, 'varig', 1)", &[]).unwrap();
         ovl.query("DELETE FROM users WHERE id = 3", &[]).unwrap();
     } // drop releases the SHARED lock
 
     // Reopen: the stored settled stamp still matches — deltas are live.
     {
-        let ovl = SqliteOverlay::open(&p).unwrap();
+        let mut ovl = SqliteOverlay::open(&p).unwrap();
         let got = rows(ovl.query("SELECT name FROM users WHERE id = 777", &[]).unwrap());
         assert_eq!(got, vec![vec![Value::Text("varig".into())]]);
         let got = rows(ovl.query("SELECT count(*) FROM users WHERE id = 3", &[]).unwrap());
@@ -159,9 +159,77 @@ fn deltas_survive_reopen_and_divergence_is_refused() {
 }
 
 #[test]
+fn optimistic_mode_adopts_foreign_writes_and_guards_deltas() {
+    let p = setup("optimistic");
+    let mut ovl = SqliteOverlay::open_with_mode(&p, LockMode::Optimistic).unwrap();
+
+    // Plain read through a bracket.
+    let got = rows(ovl.query("SELECT count(*) FROM users", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Int(100)]]);
+
+    // A foreign writer commits BETWEEN our statements (no standing lock to
+    // stop it. With an empty overlay the next bracket adopts the moved base
+    // in place — that is the whole point of the mode.
+    {
+        let c = Connection::open(&p).unwrap();
+        c.execute("INSERT INTO users VALUES (500, 'fremmed', 9)", []).unwrap();
+    }
+    let got = rows(ovl.query("SELECT name FROM users WHERE id = 500", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Text("fremmed".into())]]);
+
+    // Our own writes land in the overlay and merge as usual.
+    ovl.query("INSERT INTO users (id, name, age) VALUES (600, 'egen', 1)", &[]).unwrap();
+    let got = rows(ovl.query("SELECT count(*) FROM users", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Int(102)]]);
+
+    // With UNPUSHED deltas, a foreign commit is genuine divergence: the
+    // next statement refuses by name instead of merging against a moved
+    // base (busy ≠ divergence; this is the stamp, not a lock).
+    {
+        let c = Connection::open(&p).unwrap();
+        c.execute("INSERT INTO users VALUES (700, 'kollisjon', 9)", []).unwrap();
+    }
+    let err = ovl.query("SELECT count(*) FROM users", &[]).unwrap_err();
+    assert!(format!("{err}").contains("unpushed deltas"), "{err}");
+
+    let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn offline_mode_serves_overlay_and_names_every_fall_through() {
+    let p = setup("offline");
+    // Seed the overlay in a LOCKED session, no checkpoint.
+    {
+        let mut ovl = SqliteOverlay::open(&p).unwrap();
+        ovl.query("UPDATE users SET name = 'lokal' WHERE id = 5", &[]).unwrap();
+    }
+    let mut ovl = SqliteOverlay::open_with_mode(&p, LockMode::Offline).unwrap();
+
+    // Overlay-resident point read and update: no base needed, they work.
+    let got = rows(ovl.query("SELECT name FROM users WHERE id = 5", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Text("lokal".into())]]);
+    ovl.query("UPDATE users SET age = 50 WHERE id = 5", &[]).unwrap();
+
+    // Everything needing the base refuses BY NAME: scans, fall-through
+    // misses, and insert's merged uniqueness probe.
+    for sql in [
+        "SELECT count(*) FROM users",
+        "SELECT name FROM users WHERE id = 7",
+        "INSERT INTO users (id, name, age) VALUES (900, 'x', 1)",
+    ] {
+        let err = ovl.query(sql, &[]).unwrap_err();
+        assert!(format!("{err}").contains("unlocked-offline"), "{sql}: {err}");
+    }
+
+    let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
 fn locked_mode_gives_foreign_writers_sqlite_busy() {
     let p = setup("busy");
-    let ovl = SqliteOverlay::open(&p).unwrap();
+    let mut ovl = SqliteOverlay::open(&p).unwrap();
 
     // A foreign sqlite writer must experience the held SHARED as plain BUSY
     // (OFD locks conflict with the library's classic locks even in-process).

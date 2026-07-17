@@ -40,7 +40,7 @@ fn rows(r: mpedb::ExecResult) -> Vec<Vec<Value>> {
     }
 }
 
-fn count(ovl: &SqliteOverlay, sql: &str) -> i64 {
+fn count(ovl: &mut SqliteOverlay, sql: &str) -> i64 {
     match &rows(ovl.query(sql, &[]).unwrap())[0][0] {
         Value::Int(i) => *i,
         other => panic!("expected int, got {other:?}"),
@@ -86,7 +86,7 @@ fn checkpoint_roundtrip_against_the_library() {
     drop(lib);
 
     // The handle keeps serving the SAME answers, now from the base alone.
-    assert_eq!(count(&ovl, "SELECT count(*) FROM users"), 50);
+    assert_eq!(count(&mut ovl, "SELECT count(*) FROM users"), 50);
     let got = rows(ovl.query("SELECT name FROM users WHERE id = 10", &[]).unwrap());
     assert_eq!(got, vec![vec![Value::Text("endret".into())]]);
 
@@ -123,8 +123,8 @@ fn reopen_after_checkpoint_survives_and_foreign_divergence_still_refuses() {
     }
     // Reopen after a clean checkpoint: fresh stamp matches, empty overlay.
     {
-        let ovl = SqliteOverlay::open(&p).unwrap();
-        assert_eq!(count(&ovl, "SELECT count(*) FROM users WHERE id = 200"), 1);
+        let mut ovl = SqliteOverlay::open(&p).unwrap();
+        assert_eq!(count(&mut ovl, "SELECT count(*) FROM users WHERE id = 200"), 1);
     }
     // A foreign write after the checkpointed epoch: the marker names an OLD
     // epoch, so reopen must refuse — never adopt foreign changes silently.
@@ -135,8 +135,8 @@ fn reopen_after_checkpoint_survives_and_foreign_divergence_still_refuses() {
     // …but only if there are unpushed deltas to be stale. With an EMPTY
     // overlay the deltas-vs-base check is vacuous and adoption is safe.
     {
-        let ovl = SqliteOverlay::open(&p).unwrap();
-        assert_eq!(count(&ovl, "SELECT count(*) FROM users WHERE id = 300"), 1);
+        let mut ovl = SqliteOverlay::open(&p).unwrap();
+        assert_eq!(count(&mut ovl, "SELECT count(*) FROM users WHERE id = 300"), 1);
     }
 
     let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));

@@ -51,6 +51,27 @@ nothing is writing. In Rust the same thing is `mpedb::SqliteAttach`, and the
 full mpedb planner/executor runs the SQL (joins, aggregates, EXPLAIN
 included).
 
+**The delta overlay (v2)** — read-WRITE over the base, zero copy: only your
+changes live in `app.db.overlay.mpedb` (row images + tombstones), everything
+else reads straight from the `.db`, and checkpoint folds the deltas in and
+empties the overlay:
+
+```console
+$ mpedb app.db --overlay "UPDATE users SET name = 'ny' WHERE id = 7"
+$ mpedb app.db --overlay "SELECT count(*) FROM users"    # merged view
+$ sqlite3 app.db "SELECT name FROM users WHERE id = 7"   # still the old value
+$ mpedb checkpoint app.db --overlay                      # fold + empty
+$ sqlite3 app.db "SELECT name FROM users WHERE id = 7"   # ny
+```
+
+Three lock modes via `--mode locked|optimistic|offline` (default `locked`):
+locked holds sqlite's own SHARED for the session (foreign writers get their
+normal `SQLITE_BUSY`); optimistic takes a µs-class SHARED bracket per
+statement, so foreign sqlite writers run freely BETWEEN your statements — a
+moved base is adopted in place when the overlay is empty and refused by name
+when deltas are unpushed; offline touches the base for nothing (bulk foreign
+rewrites). In Rust: `mpedb::SqliteOverlay::open_with_mode`.
+
 ## The WAL metaphor, honestly
 
 The metaphor is load-bearing, so its edges are too:
@@ -95,12 +116,17 @@ The full design — reviewed hard (20 adversarial findings folded) — is
   bounded batches. A crash between push and truncate self-heals at reopen
   (the base's marker plus a delta-by-delta base comparison authorize it; a
   cleanly-checkpointed overlay tolerates any foreign writes between
-  sessions). Still to land: the other two lock modes — **OPTIMISTIC** (no
-  standing lock — a transient SHARED plus a hot-journal check per statement,
-  µs-class, self-healing on divergence) and **UNLOCKED-OFFLINE**
-  (overlay-only, for bulk foreign rewrites) — and `mpedb <file>.db` CLI
-  wiring. The settled-stamp trick makes "did anything touch the base?" one
-  `stat()` after minutes or days unlocked.
+  sessions). All three lock modes are wired: **OPTIMISTIC** (no standing
+  lock — a transient SHARED plus a hot-journal check per statement,
+  µs-class; busy is bounded backoff, never divergence; an empty overlay
+  adopts a moved base in place) and **UNLOCKED-OFFLINE** (overlay-only, for
+  bulk foreign rewrites; every base fall-through refused by name) join
+  LOCKED, in the CLI as `mpedb file.db --overlay [--mode …]` with
+  `.checkpoint` / `mpedb checkpoint file.db --overlay`. The settled-stamp
+  trick makes "did anything touch the base?" one `stat()` after minutes or
+  days unlocked. Remaining for v2 proper: reconcile of diverged deltas
+  (today a named refusal), non-INTEGER-PK WITHOUT ROWID shapes, and the
+  multi-process co-attach story.
 - v3 (measured, maybe never): sqlite index probes for cold reads, hot-row
   promotion, WAL-mode bases.
 
@@ -117,7 +143,9 @@ and the experiments that would revive it is
 - v0 installs mirror's tracking tables + triggers in the base (visible to
   sqlite tools; that is how incremental pull works without re-reading
   everything).
-- `--direct` trusts you about quiescence until v2's lock modes land.
+- `--direct` trusts you about quiescence; `--overlay` does not (it speaks
+  sqlite's own locks). Divergence with unpushed deltas is still a named
+  refusal, not a merge — reconcile is the next v2 stage.
 - mpedb's SQL is a strict, measured subset — [COMPAT.md](COMPAT.md) row for
   row, 99.8% of sqlite's own 5.3M-record corpus passing with zero wrong
   answers.

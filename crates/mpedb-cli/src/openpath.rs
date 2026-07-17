@@ -54,7 +54,7 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
     }
     // `--direct`: read-only SQL straight over the sqlite file — the native
     // reader, no sidecar, no import, no sqlite library. Quiescence is the
-    // caller's responsibility until the v2 lock modes land.
+    // caller's responsibility (or use `--overlay`, which locks).
     let mut rest: Vec<String> = rest.to_vec();
     let direct = if let Some(i) = rest.iter().position(|a| a == "--direct") {
         rest.remove(i);
@@ -62,12 +62,43 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
     } else {
         false
     };
+    // `--overlay [--mode locked|optimistic|offline]`: the v2 delta overlay —
+    // read-write SQL over the base with only CHANGES in <file>.overlay.mpedb;
+    // `.checkpoint` (repl) / `mpedb checkpoint <file> --overlay` pushes them
+    // into the base and empties the overlay.
+    let overlay = if let Some(i) = rest.iter().position(|a| a == "--overlay") {
+        rest.remove(i);
+        true
+    } else {
+        false
+    };
+    let mode = if let Some(i) = rest.iter().position(|a| a == "--mode") {
+        if i + 1 >= rest.len() {
+            return usage("--mode needs a value: locked|optimistic|offline");
+        }
+        let m = rest.remove(i + 1);
+        rest.remove(i);
+        match m.as_str() {
+            "locked" => mpedb::LockMode::Locked,
+            "optimistic" => mpedb::LockMode::Optimistic,
+            "offline" => mpedb::LockMode::Offline,
+            other => return usage(format!("unknown --mode `{other}`: locked|optimistic|offline")),
+        }
+    } else {
+        mpedb::LockMode::Locked
+    };
     let rest = rest.as_slice();
     if direct {
         if !is_sqlite(p) {
             return runtime(format!("--direct needs a sqlite file, {path} is not one"));
         }
         return run_direct(p, rest);
+    }
+    if overlay {
+        if !is_sqlite(p) {
+            return runtime(format!("--overlay needs a sqlite file, {path} is not one"));
+        }
+        return run_overlay(p, mode, rest);
     }
     let target = if is_sqlite(p) {
         let side = sidecar(p);
@@ -116,13 +147,80 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
     }
 }
 
-/// `mpedb checkpoint <sqlite.db>` — push the sidecar's local writes back into
-/// the base through mirror push (one sqlite transaction; conflicts park per
-/// DESIGN-MIRROR §8 and are reported, never silently dropped).
+/// `mpedb data.db --overlay ['SQL' ...]` — the v2 delta overlay: read-write,
+/// zero-copy, deltas + tombstones beside the base, checkpoint on demand.
+fn run_overlay(p: &Path, mode: mpedb::LockMode, rest: &[String]) -> CliResult {
+    let mut ovl = mpedb::SqliteOverlay::open_with_mode(p, mode)?;
+    match rest {
+        [sql, params @ ..] => {
+            let vals: Vec<mpedb::Value> = params.iter().map(|s| parse_param(s)).collect();
+            print_result(&ovl.query(sql, &vals)?);
+            Ok(())
+        }
+        [] => {
+            use std::io::BufRead as _;
+            let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
+            let stdin = std::io::stdin();
+            for line in stdin.lock().lines() {
+                if interactive {
+                    eprint!("mpedb(ovl)> ");
+                }
+                let line = line?;
+                let stmt = line.trim().trim_end_matches(';').trim();
+                if stmt.is_empty() {
+                    continue;
+                }
+                if stmt == ".quit" || stmt == ".exit" {
+                    break;
+                }
+                if stmt == ".checkpoint" {
+                    match ovl.checkpoint() {
+                        Ok(r) => println!(
+                            "checkpoint: epoch {} pushed ({} upserts, {} deletes), overlay emptied",
+                            r.epoch, r.upserts, r.deletes
+                        ),
+                        Err(e) => eprintln!("error: {e}"),
+                    }
+                    continue;
+                }
+                match ovl.query(stmt, &[]) {
+                    Ok(r) => print_result(&r),
+                    Err(e) => eprintln!("error: {e}"),
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
+/// `mpedb checkpoint <sqlite.db>` — push local writes back into the base.
+/// Default: the v0 sidecar via mirror push (one sqlite transaction; conflicts
+/// park per DESIGN-MIRROR §8 and are reported, never silently dropped).
+/// `--overlay`: the v2 delta overlay's checkpoint (design §5).
 pub fn checkpoint(args: &[String]) -> CliResult {
-    let [path] = args else {
+    let mut args: Vec<String> = args.to_vec();
+    let overlay = if let Some(i) = args.iter().position(|a| a == "--overlay") {
+        args.remove(i);
+        true
+    } else {
+        false
+    };
+    let [path] = &args[..] else {
         return usage("checkpoint needs <sqlite.db> (the base file, not the sidecar)");
     };
+    if overlay {
+        let p = Path::new(path);
+        if !is_sqlite(p) {
+            return runtime(format!("{path} is not a sqlite database"));
+        }
+        let mut ovl = mpedb::SqliteOverlay::open(p)?;
+        let r = ovl.checkpoint()?;
+        println!(
+            "checkpoint: epoch {} pushed ({} upserts, {} deletes), overlay emptied",
+            r.epoch, r.upserts, r.deletes
+        );
+        return Ok(());
+    }
     let p = Path::new(path);
     if !is_sqlite(p) {
         return runtime(format!("{path} is not a sqlite database"));
