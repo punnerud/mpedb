@@ -78,16 +78,21 @@ The full design — reviewed hard (20 adversarial findings folded) — is
 - **v1 (shipped)**: the native reader — `dump`/`--direct`/`SqliteAttach`,
   zero import, both b-tree layouts, refusals by name (WAL-mode files,
   non-UTF8).
-- **v2 (designed)**: the true delta overlay. The `.mpedb` stops being a copy
-  and holds only what changed since the last checkpoint; untouched data is
-  read straight from the `.db` through the native reader. Three lock modes:
-  **LOCKED** (default — mpedb holds sqlite's own SHARED lock, so the fast
-  path needs zero validation and foreign writers get their normal
-  `SQLITE_BUSY`), **OPTIMISTIC** (no standing lock — a transient SHARED plus
-  a hot-journal check per statement, µs-class, self-healing on divergence),
-  and **UNLOCKED-OFFLINE** (overlay-only, for bulk foreign rewrites). The
-  settled-stamp trick makes "did anything touch the base?" one `stat()`
-  after minutes or days unlocked.
+- **v2 (in flight — the overlay itself is live)**: the true delta overlay.
+  The `.mpedb` stops being a copy and holds only what changed since the last
+  checkpoint (row images + tombstones); untouched data is read straight from
+  the `.db` through the native reader, merged per PK at read time.
+  `SqliteOverlay::open("app.db")` in the facade runs this today in **LOCKED**
+  mode (mpedb holds sqlite's own SHARED lock, so the fast path needs zero
+  validation and foreign writers get their normal `SQLITE_BUSY` — verified
+  against the real sqlite library in-tree), with the settled base-stamp
+  stored in the overlay and divergence refused by name at reopen. Still to
+  land: the checkpoint (push deltas into the base + truncate the overlay),
+  and the other two lock modes — **OPTIMISTIC** (no standing lock — a
+  transient SHARED plus a hot-journal check per statement, µs-class,
+  self-healing on divergence) and **UNLOCKED-OFFLINE** (overlay-only, for
+  bulk foreign rewrites). The settled-stamp trick makes "did anything touch
+  the base?" one `stat()` after minutes or days unlocked.
 - v3 (measured, maybe never): sqlite index probes for cold reads, hot-row
   promotion, WAL-mode bases.
 

@@ -222,24 +222,29 @@ impl SqliteCtx<'_> {
             .ok_or_else(|| Error::Internal("table id out of range".into()))
     }
 
-    /// Decode a raw keycode bound (single-column int64 PK) back to a rowid.
+    /// Decode a raw keycode bound (single-column int64 PK) back to a rowid
+    /// plus its EFFECTIVE inclusivity. Bounds arrive normalized with prefix
+    /// semantics (`range_bounds`): a clean decode means the bound sits
+    /// exactly at `enc(v)` — the flag carries; a 0xFF-suffixed raw sits just
+    /// ABOVE every key equal to `v`, so the effective inclusivity FLIPS
+    /// (lo-exclusive and hi-inclusive are the suffixed forms).
     fn bound_to_int(b: Option<(&[u8], bool)>) -> Result<Option<(i64, bool)>> {
         match b {
             None => Ok(None),
             Some((raw, incl)) => {
-                // Range bounds arrive with prefix semantics (a 0xFF
-                // continuation ceiling past the encoded value); decode the
-                // first int64 and let the inclusivity flag carry the rest.
-                let vals = keycode::decode_key(raw, &[ColumnType::Int64])
-                    .or_else(|_| {
+                let (vals, flipped) = match keycode::decode_key(raw, &[ColumnType::Int64]) {
+                    Ok(v) => (v, false),
+                    Err(_) => (
                         keycode::decode_key(
                             raw.get(..raw.len().saturating_sub(1)).unwrap_or(raw),
                             &[ColumnType::Int64],
                         )
-                    })
-                    .map_err(|_| Error::Internal("undecodable PK bound".into()))?;
+                        .map_err(|_| Error::Internal("undecodable PK bound".into()))?,
+                        true,
+                    ),
+                };
                 match vals.first() {
-                    Some(Value::Int(i)) => Ok(Some((*i, incl))),
+                    Some(Value::Int(i)) => Ok(Some((*i, incl != flipped))),
                     _ => Err(Error::Internal("non-int PK bound".into())),
                 }
             }
@@ -366,5 +371,25 @@ impl TxnCtx for SqliteCtx<'_> {
             "a sqlite attach is read-only — open the sidecar flow (`mpedb file.db`) to write"
                 .into(),
         ))
+    }
+}
+
+// ---- base access for the overlay (#69 v2) --------------------------------
+
+impl SqliteAttach {
+    /// Point lookup straight against the BASE — the overlay's fall-through.
+    pub(crate) fn base_get_by_pk(&self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
+        SqliteCtx { at: self }.get_by_pk(table, pk)
+    }
+
+    /// PK-ordered base scan with keycode bounds — the overlay merge's right-
+    /// hand stream.
+    pub(crate) fn base_scan(
+        &self,
+        table: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<Vec<Vec<Value>>> {
+        SqliteCtx { at: self }.scan_bounded(table, lo, hi)
     }
 }
