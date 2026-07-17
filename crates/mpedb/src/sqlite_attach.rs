@@ -100,6 +100,12 @@ impl SqliteAttach {
         let mut defs = Vec::new();
         let mut skipped = Vec::new();
         for t in src_tables {
+            // `_mpedb_`-prefixed tables are OURS (the overlay's checkpoint
+            // marker, mirror's tracking tables) — internal like `sqlite_`,
+            // never user-visible, and silently so (not `skipped`).
+            if t.name.starts_with("_mpedb_") {
+                continue;
+            }
             if defs.len() >= 64 {
                 skipped.push((t.name.clone(), "table-id space (64) exhausted".into()));
                 continue;

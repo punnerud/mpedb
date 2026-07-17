@@ -36,13 +36,24 @@ use crate::{Database, ExecResult};
 
 const STAMP_NS: &str = "ovl";
 const STAMP_KEY: &[u8] = b"base-stamp";
+const EPOCH_KEY: &[u8] = b"epoch";
+/// The checkpoint marker table in the BASE (design §5 [R#4]: "was epoch E
+/// pushed?" must be readable from the base itself, atomically with the push).
+const MARKER_TABLE: &str = "_mpedb_overlay_state";
+/// Truncation batch size [R#14]: deleting delta rows is COW — each batch
+/// commits (and frees) before the next allocates.
+const TRUNCATE_BATCH: usize = 512;
 
 pub struct SqliteOverlay {
     attach: SqliteAttach,
     db: Database,
     /// LOCKED mode: held for the overlay's lifetime, so the base provably
-    /// cannot move under the merge.
-    _lock: SharedLock,
+    /// cannot move under the merge. `None` after a checkpoint failed to
+    /// re-take it (or detected divergence) — the handle then refuses
+    /// queries by name until reopened.
+    lock: Option<SharedLock>,
+    #[cfg_attr(not(feature = "sqlite-checkpoint"), allow(dead_code))]
+    base: PathBuf,
     /// Per user-visible table: the PK column index (single int64 in every
     /// attachable shape; same index in user rows and overlay rows, since
     /// `__dead` trails).
@@ -181,6 +192,12 @@ impl SqliteOverlay {
                 attach.skipped()
             )));
         }
+        let pk_idx: Vec<usize> = attach
+            .schema()
+            .tables
+            .iter()
+            .map(|t| t.primary_key[0] as usize)
+            .collect();
         let ovl = overlay_path(base);
         let db = if ovl.exists() {
             let db = Database::open_from_file(&ovl)?;
@@ -191,12 +208,7 @@ impl SqliteOverlay {
                 .ok_or_else(|| Error::Corrupt("overlay has no stored base-stamp".into()))?;
             let stored = decode_stamp(&stored)?;
             if !stored.matches(base).map_err(oerr)? {
-                return Err(Error::Unsupported(format!(
-                    "the base {} changed since this overlay's deltas were captured — \
-                     reconcile is not built yet: checkpoint or discard {}",
-                    base.display(),
-                    ovl.display()
-                )));
+                recover_after_crashed_checkpoint(base, &db, &attach, &pk_idx, &ovl)?;
             }
             db
         } else {
@@ -209,25 +221,46 @@ impl SqliteOverlay {
             let stamp = settle_and_read(base, &scratch_path(base)).map_err(oerr)?;
             let _ = std::fs::remove_file(scratch_path(base));
             db.sys_record_put(STAMP_NS, STAMP_KEY, &encode_stamp(&stamp))?;
+            db.sys_record_put(STAMP_NS, EPOCH_KEY, &1u64.to_le_bytes())?;
             db
         };
-        let pk_idx: Vec<usize> = attach
-            .schema()
-            .tables
-            .iter()
-            .map(|t| t.primary_key[0] as usize)
-            .collect();
-        Ok(SqliteOverlay { attach, db, _lock: lock, pk_idx })
+        Ok(SqliteOverlay {
+            attach,
+            db,
+            lock: Some(lock),
+            base: base.to_path_buf(),
+            pk_idx,
+        })
     }
 
     pub fn schema(&self) -> &Schema {
         self.attach.schema()
     }
 
+    /// The LOCKED-mode guard: every merged read/write requires the held
+    /// SHARED. `None` means a checkpoint left the handle detached (retake
+    /// failed, or divergence was detected under the drop window).
+    fn ensure_locked(&self) -> Result<()> {
+        if self.lock.is_none() {
+            return Err(Error::Unsupported(
+                "the overlay is no longer holding the base's SHARED lock (a checkpoint \
+                 detached it) — reopen to recover"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(not(feature = "sqlite-checkpoint"), allow(dead_code))]
+    fn epoch(&self) -> Result<u64> {
+        read_epoch(&self.db)
+    }
+
     /// Compile + run one statement over the MERGED view. Reads run on an
     /// overlay read transaction (lock-free); writes run in one overlay write
     /// transaction, committed only on success.
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<ExecResult> {
+        self.ensure_locked()?;
         let (plan, is_explain) = mpedb_sql::prepare_maybe_explain(sql, self.attach.schema())?;
         if is_explain {
             return Ok(ExecResult::Rows {
@@ -419,4 +452,343 @@ impl TxnCtx for MergeCtx<'_> {
         self.ovl_upsert(table, &full)?;
         Ok(true)
     }
+}
+
+// ---- epoch + marker + delta plumbing (shared by checkpoint and recovery) --
+
+fn read_epoch(db: &Database) -> Result<u64> {
+    Ok(match db.sys_record_get(STAMP_NS, EPOCH_KEY)? {
+        Some(b) if b.len() == 8 => u64::from_le_bytes(b.try_into().expect("8")),
+        _ => 1,
+    })
+}
+
+/// Read `checkpointed_epoch` from the base's marker table via the NATIVE
+/// reader — recovery must work without the sqlite library.
+fn read_marker(base: &Path) -> Result<Option<i64>> {
+    let f = fmtx::SqliteFile::open(base).map_err(oerr)?;
+    let tables = f.tables().map_err(oerr)?;
+    let Some(t) = tables.iter().find(|t| t.name == MARKER_TABLE) else {
+        return Ok(None);
+    };
+    let mut v = None;
+    f.scan_table(t, &mut |_r, vals| {
+        if matches!(vals.first(), Some(fmtx::Value::Text(k)) if k == "checkpointed_epoch") {
+            if let Some(fmtx::Value::Int(e)) = vals.get(1) {
+                v = Some(*e);
+            }
+        }
+        Ok(())
+    })
+    .map_err(oerr)?;
+    Ok(v)
+}
+
+/// One consistent snapshot of EVERY delta row (including `__dead`), per
+/// table id.
+fn snapshot_deltas(db: &Database, n_tables: usize) -> Result<Vec<Vec<Vec<Value>>>> {
+    let r = db.engine.begin_read()?;
+    let mut out = Vec::with_capacity(n_tables);
+    let res = {
+        let mut ctx = ReadCtx(&r);
+        (0..n_tables).try_for_each(|ti| {
+            out.push(TxnCtx::scan_rows_raw(&mut ctx, ti as u32, None, None)?);
+            Ok(())
+        })
+    };
+    r.finish()?;
+    res.map(|()| out)
+}
+
+/// Delete exactly the snapshotted delta rows, in bounded batches [R#14] —
+/// each batch its own commit, so freeing keeps pace with the COW allocation
+/// deleting requires. A row that no longer equals its snapshot image is
+/// KEPT (it changed after the freeze and rides the next checkpoint).
+fn truncate_deltas(db: &Database, deltas: &[Vec<Vec<Value>>], pk_idx: &[usize]) -> Result<()> {
+    for (ti, rows) in deltas.iter().enumerate() {
+        let idx = pk_idx[ti];
+        for chunk in rows.chunks(TRUNCATE_BATCH) {
+            let mut w = db.engine.begin_write()?;
+            let res = chunk.iter().try_for_each(|row| {
+                let pk = [row[idx].clone()];
+                if TxnCtx::get_by_pk(&mut w, ti as u32, &pk)?.as_deref() == Some(&row[..]) {
+                    TxnCtx::delete_by_pk(&mut w, ti as u32, &pk)?;
+                }
+                Ok(())
+            });
+            match res {
+                Ok(()) => w.commit()?,
+                Err(e) => {
+                    w.abort();
+                    return Err(e);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The reopen path when the stored stamp no longer matches the base.
+///
+/// Three outcomes, in order:
+/// - The overlay is EMPTY: nothing was captured against the old base, so a
+///   moved base is not divergence at all — adopt it (fresh settled stamp)
+///   and carry on. A cleanly-checkpointed overlay thus acts like no overlay:
+///   foreign writers may do anything between our sessions.
+/// - The overlay has deltas and the movement is provably our own crashed
+///   checkpoint: the base's marker names exactly our epoch [R#4] AND every
+///   delta is exactly reflected in the base (live rows equal, tombstoned
+///   PKs absent). Truncate the redundant deltas and adopt.
+/// - Anything else means a foreign writer interleaved with unpushed deltas —
+///   refuse, never replay [R#3].
+fn recover_after_crashed_checkpoint(
+    base: &Path,
+    db: &Database,
+    attach: &SqliteAttach,
+    pk_idx: &[usize],
+    ovl: &Path,
+) -> Result<()> {
+    let refuse = |why: &str| {
+        Err(Error::Unsupported(format!(
+            "the base {} changed since this overlay's deltas were captured ({why}) — \
+             reconcile is not built yet: checkpoint or discard {}",
+            base.display(),
+            ovl.display()
+        )))
+    };
+    let deltas = snapshot_deltas(db, pk_idx.len())?;
+    if deltas.iter().all(|t| t.is_empty()) {
+        let stamp = settle_and_read(base, &scratch_path(base)).map_err(oerr)?;
+        let _ = std::fs::remove_file(scratch_path(base));
+        db.sys_record_put(STAMP_NS, STAMP_KEY, &encode_stamp(&stamp))?;
+        return Ok(());
+    }
+    let epoch = read_epoch(db)?;
+    if read_marker(base)? != Some(epoch as i64) {
+        return refuse("a foreign writer committed in an unlocked window");
+    }
+    for (ti, rows) in deltas.iter().enumerate() {
+        let idx = pk_idx[ti];
+        for row in rows {
+            let pk = [row[idx].clone()];
+            let in_base = attach.base_get_by_pk(ti as u32, &pk)?;
+            let consistent = if is_dead(row) {
+                in_base.is_none()
+            } else {
+                in_base.as_deref() == Some(&row[..row.len() - 1])
+            };
+            if !consistent {
+                return refuse("a foreign writer overwrote our crashed checkpoint's push");
+            }
+        }
+    }
+    // Adopt: the deltas are redundant shadows of the pushed base.
+    truncate_deltas(db, &deltas, pk_idx)?;
+    let stamp = settle_and_read(base, &scratch_path(base)).map_err(oerr)?;
+    let _ = std::fs::remove_file(scratch_path(base));
+    db.sys_record_put(STAMP_NS, STAMP_KEY, &encode_stamp(&stamp))?;
+    db.sys_record_put(STAMP_NS, EPOCH_KEY, &(epoch + 1).to_le_bytes())?;
+    Ok(())
+}
+
+// ---- the checkpoint itself (design §5) — needs the sqlite LIBRARY --------
+
+/// What one checkpoint did.
+#[cfg(feature = "sqlite-checkpoint")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CheckpointReport {
+    pub upserts: u64,
+    pub deletes: u64,
+    pub epoch: u64,
+}
+
+#[cfg(feature = "sqlite-checkpoint")]
+enum PushOutcome {
+    Done { upserts: u64, deletes: u64 },
+    /// The in-transaction re-validation [R#5c] found the base moved in the
+    /// drop window — nothing was written.
+    Diverged,
+}
+
+#[cfg(feature = "sqlite-checkpoint")]
+impl SqliteOverlay {
+    /// Push every delta into the base and truncate the overlay — design §5,
+    /// with the [R#5] drop → push-under-BEGIN-IMMEDIATE → re-take → re-stamp
+    /// dance spelled out in order. `&mut self` is load-bearing: the freeze
+    /// is exactly "no writes through this handle while the checkpoint runs"
+    /// (co-attaching the same overlay from another process during a
+    /// checkpoint is outside v2's contract).
+    pub fn checkpoint(&mut self) -> Result<CheckpointReport> {
+        self.ensure_locked()?;
+        let epoch = self.epoch()?;
+        let deltas = snapshot_deltas(&self.db, self.pk_idx.len())?;
+        if deltas.iter().all(|t| t.is_empty()) {
+            return Ok(CheckpointReport { upserts: 0, deletes: 0, epoch });
+        }
+        let stored = decode_stamp(
+            &self
+                .db
+                .sys_record_get(STAMP_NS, STAMP_KEY)?
+                .ok_or_else(|| Error::Corrupt("overlay has no stored base-stamp".into()))?,
+        )?;
+        // Drop our SHARED: we are about to BE the writer, and its EXCLUSIVE
+        // at COMMIT must not find our own reader lock in the way.
+        self.lock = None;
+        let push = push_deltas(&self.base, self.attach.schema(), &deltas, &self.pk_idx, &stored, epoch);
+        let retaken = retake_shared(&self.base);
+        match (push, retaken) {
+            (Ok(PushOutcome::Done { upserts, deletes }), Ok(lock)) => {
+                // Settle under the re-taken SHARED. A foreign commit in the
+                // re-take gap is FINE: it serialized after our push, the
+                // fresh stamp blesses it, and the deltas are truncated
+                // (compare-to-snapshot keeps nothing stale).
+                let stamp = settle_and_read(&self.base, &scratch_path(&self.base)).map_err(oerr)?;
+                let _ = std::fs::remove_file(scratch_path(&self.base));
+                self.db.sys_record_put(STAMP_NS, STAMP_KEY, &encode_stamp(&stamp))?;
+                // The native reader snapshots the file at open — refresh it
+                // so the handle's base view includes what was just pushed.
+                let fresh = SqliteAttach::open(&self.base)?;
+                if fresh.schema() != self.attach.schema() {
+                    return Err(Error::Unsupported(
+                        "foreign DDL changed the base's schema during the checkpoint \
+                         window — the handle is detached; reopen".into(),
+                    ));
+                }
+                self.attach = fresh;
+                truncate_deltas(&self.db, &deltas, &self.pk_idx)?;
+                self.db.sys_record_put(STAMP_NS, EPOCH_KEY, &(epoch + 1).to_le_bytes())?;
+                self.lock = Some(lock);
+                Ok(CheckpointReport { upserts, deletes, epoch })
+            }
+            (Ok(PushOutcome::Done { .. }), Err(e)) => Err(Error::Unsupported(format!(
+                "checkpoint pushed epoch {epoch} but could not re-take the base lock ({e}) — \
+                 the handle is detached; reopening recovers (the base's marker authorizes it)"
+            ))),
+            (Ok(PushOutcome::Diverged), _) => {
+                // Base moved under us: the deltas are stale. Stay detached
+                // (any re-taken lock drops here) — reopening decides.
+                Err(Error::Unsupported(
+                    "checkpoint refused: the base changed while unlocked — this overlay's \
+                     deltas are stale; reopen to decide (reconcile is not built yet)"
+                        .into(),
+                ))
+            }
+            (Err(e), Ok(lock)) => {
+                // IO-class push failure: BEGIN IMMEDIATE rolled back, the
+                // base is untouched, our stamp still matches — re-arm and
+                // keep serving.
+                self.lock = Some(lock);
+                Err(e)
+            }
+            (Err(e), Err(_)) => Err(e),
+        }
+    }
+}
+
+#[cfg(feature = "sqlite-checkpoint")]
+fn retake_shared(base: &Path) -> Result<SharedLock> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        if let Some(l) = SharedLock::acquire(base).map_err(oerr)? {
+            return Ok(l);
+        }
+        if std::time::Instant::now() > deadline {
+            return Err(Error::Unsupported(
+                "could not re-take the base SHARED within 5s".into(),
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(feature = "sqlite-checkpoint")]
+fn to_sq(v: &Value) -> rusqlite::types::Value {
+    use rusqlite::types::Value as S;
+    match v {
+        Value::Null => S::Null,
+        Value::Int(i) => S::Integer(*i),
+        Value::Float(f) => S::Real(*f),
+        Value::Bool(b) => S::Integer(*b as i64),
+        Value::Text(t) => S::Text(t.clone()),
+        Value::Blob(b) => S::Blob(b.clone()),
+        Value::Timestamp(t) => S::Integer(*t),
+        // Never stored: the row codec refuses lists (DESIGN-MULTIDB §2.6).
+        Value::List(_) => S::Null,
+    }
+}
+
+#[cfg(feature = "sqlite-checkpoint")]
+fn push_deltas(
+    base: &Path,
+    schema: &Schema,
+    deltas: &[Vec<Vec<Value>>],
+    pk_idx: &[usize],
+    stored: &BaseStamp,
+    epoch: u64,
+) -> Result<PushOutcome> {
+    let serr = |e: rusqlite::Error| Error::Unsupported(format!("sqlite checkpoint: {e}"));
+    let c = rusqlite::Connection::open(base).map_err(serr)?;
+    c.busy_timeout(std::time::Duration::from_secs(5)).map_err(serr)?;
+    // synchronous=FULL owns durability — no after-the-fact fsync [R#13].
+    c.pragma_update(None, "synchronous", "FULL").map_err(serr)?;
+    c.execute_batch("BEGIN IMMEDIATE").map_err(serr)?;
+    // [R#5c] re-validate UNDER the write lock: RESERVED is ours from here to
+    // COMMIT, so no foreign commit can slip between this check and the push.
+    if !stored.matches(base).map_err(oerr)? {
+        let _ = c.execute_batch("ROLLBACK");
+        return Ok(PushOutcome::Diverged);
+    }
+    let mut upserts = 0u64;
+    let mut deletes = 0u64;
+    let r = (|| -> rusqlite::Result<()> {
+        for (ti, rows) in deltas.iter().enumerate() {
+            if rows.is_empty() {
+                continue;
+            }
+            let t = &schema.tables[ti];
+            let cols: Vec<String> =
+                t.columns.iter().map(|c| format!("\"{}\"", c.name)).collect();
+            let qs = vec!["?"; cols.len()].join(", ");
+            // The synthetic-rowid shape's PK column is literally named
+            // `rowid`, which sqlite resolves to the real rowid (the attach
+            // shape rules guarantee no user column shadows it).
+            let mut ins = c.prepare(&format!(
+                "INSERT OR REPLACE INTO \"{}\" ({}) VALUES ({qs})",
+                t.name,
+                cols.join(", ")
+            ))?;
+            let mut del = c.prepare(&format!(
+                "DELETE FROM \"{}\" WHERE \"{}\" = ?",
+                t.name, t.columns[pk_idx[ti]].name
+            ))?;
+            for row in rows {
+                if is_dead(row) {
+                    del.execute([to_sq(&row[pk_idx[ti]])])?;
+                    deletes += 1;
+                } else {
+                    ins.execute(rusqlite::params_from_iter(
+                        row[..row.len() - 1].iter().map(to_sq),
+                    ))?;
+                    upserts += 1;
+                }
+            }
+        }
+        // [R#4]: the marker commits ATOMICALLY with the push, in the base.
+        c.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS {MARKER_TABLE} (k TEXT PRIMARY KEY, v INTEGER);"
+        ))?;
+        c.execute(
+            &format!(
+                "INSERT OR REPLACE INTO {MARKER_TABLE} (k, v) VALUES ('checkpointed_epoch', ?)"
+            ),
+            [epoch as i64],
+        )?;
+        c.execute_batch("COMMIT")?;
+        Ok(())
+    })();
+    if let Err(e) = r {
+        let _ = c.execute_batch("ROLLBACK");
+        return Err(serr(e));
+    }
+    Ok(PushOutcome::Done { upserts, deletes })
 }
