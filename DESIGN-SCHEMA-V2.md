@@ -186,26 +186,17 @@ dump with the old binary first). This is the project's standing rule applied:
 formats break freely; only near-free migrations earn their keep, and the
 review proved this one was nowhere near free.
 
-## 6. The stage-4 positional audit (enumerated now, executed with DROP)
+## 6. The stage-4 positional audit → DROP TABLE
 
-Dense ids make these correct today; DROP's gap-relaxation PR must convert or
-re-verify each before shipping:
-
-- engine per-table parallel caches: `checks`, `sec_indexes`, `sec_unique`,
-  `col_types` (built positionally, consumed by `table_id as usize` in index
-  maintenance and row codec — a positional miss here corrupts trees),
-- `bootstrap_catalog`'s `enumerate()`-as-id, facade `CheckPrograms`,
-  `require_policy` position-mint, `insert_row_streaming`'s
-  `position(..) as u32` (bypasses `table_id()` entirely),
-- CLI `dump`/repl positional scans; mirror's position-as-id derivations
-  (import/export/reconcile/preflight/regenerate) **and** its PERSISTED table
-  ids (park/skip/map keys) — reuse meets stale persisted ids here,
-- iteration-order-observable output (dump listing, export DDL order,
-  py `table_names`) flips from name order to creation order at the first
-  out-of-order CREATE — cosmetic, but golden tests must not assume,
-- overlay/`SqliteAttach` parallel vectors (`pk_idx`, `Attached`) — safe by
-  fresh `Schema::new` construction; that assumption is load-bearing and
-  stated here.
+Dense ids make every `[table_id as usize]` site correct today; DROP produces
+*gapped* ids, which turns each into a hazard. The exhaustive audit (74 sites,
+58 breaking) and the design that collapses it — **no-reuse monotonic id +
+tombstone-in-place**, so `position == id` survives and every persisted-id site
+becomes a harmless orphan leak — live in
+[DESIGN-DROP-TABLE.md](DESIGN-DROP-TABLE.md). The fix concentrates in two
+SchemaBundle constructors + the decoder's placement-by-id + the mint + a
+persisted `next_table_id` high-water; the ~35 downstream index sites become
+correct-by-inheritance.
 
 ## 7. What #55 builds on top (same window, own PR — the review's site list)
 
