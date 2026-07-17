@@ -72,6 +72,11 @@ pub enum DdlStmt {
     /// accepts only a nullable column (the facade refuses NOT NULL / UNIQUE /
     /// PRIMARY KEY on ADD — no DEFAULT fill and no online index build yet).
     AlterAddColumn { table: String, column: CreateColumnSpec },
+    /// `ALTER TABLE <t> DROP [COLUMN] <name>` (#47 stage 5) — removes a column
+    /// and rewrites existing rows without it. The facade/schema refuse dropping
+    /// a PK column, an indexed column, or the last column (no online index
+    /// rebuild, and a table needs its key).
+    AlterDropColumn { table: String, column: String },
     CreatePolicy(CreatePolicySpec),
     DropPolicy { table: String, name: String },
     AlterRls { table: String, action: RlsAction },
@@ -183,6 +188,18 @@ mod tests {
         // Unknown type / missing type error.
         assert!(parse_ddl("ALTER TABLE t ADD COLUMN c BOGUS").is_err());
         assert!(parse_ddl("ALTER TABLE t ADD COLUMN c").is_err());
+    }
+
+    #[test]
+    fn alter_drop_column_parses() {
+        // COLUMN keyword optional.
+        let with_kw = parse_ddl("ALTER TABLE t DROP COLUMN a").unwrap().unwrap();
+        let bare = parse_ddl("ALTER TABLE t DROP a").unwrap().unwrap();
+        assert_eq!(with_kw, bare);
+        assert_eq!(
+            with_kw,
+            DdlStmt::AlterDropColumn { table: "t".into(), column: "a".into() }
+        );
     }
 
     #[test]

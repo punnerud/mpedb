@@ -44,7 +44,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | DROP TABLE | ✅ | live, multi-process — `DROP TABLE [IF EXISTS] <name>`; frees the table's pages, tombstones its id in place (never reused — [DESIGN-DROP-TABLE.md](DESIGN-DROP-TABLE.md) §0), other processes see it gone on their next statement. No-reuse caps *lifetime* table creates at 64 (a bounded capacity limit, not a per-query gap; offline `regenerate` re-densifies) |
 | ALTER TABLE RENAME | ✅ | `RENAME TO` (table) and `RENAME [COLUMN] a TO b` — pure metadata, no data rewrite; sqlite/PG-equivalent refusals (name collision, unknown target) |
 | ALTER TABLE ADD COLUMN | ✅ | nullable column, live + multi-process (existing rows rewritten with NULL). `NOT NULL`/`UNIQUE`/`PRIMARY KEY` on ADD refuse (no default fill / online index build yet), matching sqlite's NOT-NULL-needs-default rule |
-| ALTER TABLE DROP COLUMN | ❌ | staged next (needs a row rewrite; a column drop is a config change today) |
+| ALTER TABLE DROP COLUMN | ✅ | live + multi-process (existing rows rewritten without the column; surviving index/PK column references renumbered). Refuses dropping a PK / indexed / last column, matching sqlite |
 | CREATE INDEX | **Not needed** | `unique = true` / `indexed = true` on a column, or `[[table.index]]` with a column LIST for composite (unique or not) — equality on the full width or any prefix, range on the first column, visible in EXPLAIN |
 | CREATE VIEW / CREATE TRIGGER | ❌ | triggers' job is planned as the PySpell/ETL layer, not in-SQL |
 | WITH (CTEs) | ❌ | |

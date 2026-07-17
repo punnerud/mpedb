@@ -187,6 +187,89 @@ fn add_column_refusals_and_persistence() {
 }
 
 #[test]
+fn drop_column_removes_it_and_keeps_the_rest() {
+    let (cfg, path) = config("drop-col");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b TEXT, c INT)", &[]).unwrap();
+    for id in 1..=4 {
+        db.query(
+            &format!("INSERT INTO t (id, a, b, c) VALUES ({id}, {}, 'r{id}', {})", id, id * 100),
+            &[],
+        )
+        .unwrap();
+    }
+
+    // Drop a middle column. The surviving columns (including `c`, which shifts
+    // down one index) must read back intact.
+    db.query("ALTER TABLE t DROP COLUMN a", &[]).unwrap();
+    assert!(db.query("SELECT a FROM t", &[]).is_err(), "dropped column gone");
+    assert_eq!(
+        rows(db.query("SELECT b FROM t WHERE id = 3", &[]).unwrap()),
+        vec![vec![Value::Text("r3".into())]]
+    );
+    assert_eq!(scalar_i64(&db, "SELECT c FROM t WHERE id = 3"), 300);
+    assert_eq!(scalar_i64(&db, "SELECT sum(c) FROM t"), 100 + 200 + 300 + 400);
+    // New inserts use the narrowed column list.
+    db.query("INSERT INTO t (id, b, c) VALUES (5, 'r5', 500)", &[]).unwrap();
+    assert_eq!(scalar_i64(&db, "SELECT c FROM t WHERE id = 5"), 500);
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn drop_column_renumbers_a_surviving_index() {
+    // A UNIQUE index on a column that sits AFTER the dropped one must keep
+    // working: its stored column reference shifts down by one, the value→pk
+    // tree is untouched, and uniqueness is still enforced.
+    let (cfg, path) = config("drop-col-idx");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, email TEXT, UNIQUE (email))", &[])
+        .unwrap();
+    db.query("INSERT INTO t (id, a, email) VALUES (1, 10, 'x@a')", &[]).unwrap();
+    db.query("INSERT INTO t (id, a, email) VALUES (2, 20, 'y@a')", &[]).unwrap();
+
+    db.query("ALTER TABLE t DROP COLUMN a", &[]).unwrap();
+    // The unique index on `email` still enforces and still serves lookups.
+    assert!(
+        db.query("INSERT INTO t (id, email) VALUES (3, 'x@a')", &[]).is_err(),
+        "UNIQUE(email) must still reject a duplicate after the drop"
+    );
+    assert_eq!(
+        rows(db.query("SELECT id FROM t WHERE email = 'y@a'", &[]).unwrap()),
+        vec![vec![Value::Int(2)]]
+    );
+    db.query("INSERT INTO t (id, email) VALUES (3, 'z@a')", &[]).unwrap();
+    assert_eq!(scalar_i64(&db, "SELECT count(*) FROM t"), 3);
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn drop_column_refusals() {
+    let (cfg, path) = config("drop-col-refuse");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query("CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, email TEXT, UNIQUE (email))", &[])
+        .unwrap();
+    db.query("CREATE TABLE one (id INTEGER PRIMARY KEY)", &[]).unwrap();
+
+    // Cannot drop a PK column, an indexed column, an unknown column, or the
+    // last remaining column.
+    assert!(db.query("ALTER TABLE t DROP COLUMN id", &[]).is_err());
+    assert!(db.query("ALTER TABLE t DROP COLUMN email", &[]).is_err());
+    assert!(db.query("ALTER TABLE t DROP COLUMN nope", &[]).is_err());
+    assert!(db.query("ALTER TABLE one DROP COLUMN id", &[]).is_err());
+    // A droppable column still works after the refusals.
+    db.query("INSERT INTO t (id, a, email) VALUES (1, 5, 'e')", &[]).unwrap();
+    db.query("ALTER TABLE t DROP COLUMN a", &[]).unwrap();
+    assert_eq!(
+        rows(db.query("SELECT email FROM t WHERE id = 1", &[]).unwrap()),
+        vec![vec![Value::Text("e".into())]]
+    );
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn rename_refusals_match_sqlite() {
     let (cfg, path) = config("refuse");
     let db = Database::open_with_config(cfg).unwrap();
