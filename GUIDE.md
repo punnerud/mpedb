@@ -116,8 +116,9 @@ from a customer.
 
 Two consequences worth knowing up front:
 
-- **`CREATE TABLE` is live; `ALTER`/`DROP TABLE` are not (yet).** You can add a
-  table on a running, multi-process database — the config is not the only way in:
+- **DDL is live and multi-process.** `CREATE TABLE`, `DROP TABLE [IF EXISTS]`,
+  `ALTER TABLE … RENAME` (table or column), and `ALTER … ADD COLUMN` (nullable)
+  all run on a running database — the config is not the only way in:
 
   ```sql
   CREATE TABLE accounts (
@@ -128,13 +129,11 @@ Two consequences worth knowing up front:
   );
   ```
 
-  A new table takes the next free id and **nothing renumbers** — existing tables
-  keep their ids, their catalog B+tree roots, and their data (the format was
-  reworked in #47 so a table's id is stored, not its sort position). Other
-  processes attached to the same file pick up the new table on their next
-  statement. `DEFAULT`/`CHECK`/foreign keys in `CREATE TABLE` refuse by name for
-  now — declare those in the config. Changing an *existing* table (`ALTER`,
-  `DROP TABLE`) is still a config change or a rebuild (`mpedb mirror regenerate`).
+  A new table takes the next free id and **nothing renumbers** — a table's id is
+  stored, not its sort position (#47), and a dropped id is never reused. Other
+  processes pick up the change on their next statement. Still a config change or
+  rebuild (`mpedb mirror regenerate`): `DEFAULT`/`CHECK`/foreign keys, `ADD COLUMN`
+  with `NOT NULL`/`UNIQUE`, and `DROP COLUMN`.
 - **A `.mpedb` is one self-describing file.** `cp` is a complete snapshot:
 
   ```sh
@@ -350,7 +349,7 @@ streams). It pulls rather than handing you a writer on purpose — a
 | you know | here |
 |---|---|
 | `sqlite3.connect("app.db")` | `Database::open("app.toml")` — file, no server, same idea |
-| `CREATE TABLE` | the config file (or `mirror import`) — live DDL is designed ([DESIGN-DDL.md](DESIGN-DDL.md)), not built |
+| `CREATE TABLE` | live — plus `DROP TABLE`, `ALTER … RENAME`/`ADD COLUMN`; or seed from the config / `mirror import` |
 | `?` placeholders | `$1`, `$2`, … |
 | `PRAGMA journal_mode=WAL` | `durability = "wal"` |
 | `cp app.db app.snap` | `cp app.mpedb app.snap` (plus `-wal` if you use it) |
@@ -360,9 +359,9 @@ streams). It pulls rather than handing you a writer on purpose — a
 
 Differences that will bite, each one exercised in `tests/guide.rs`:
 
-1. **`CREATE TABLE` is live; `ALTER`/`DROP TABLE` are not.** See above — adding a
-   table (with a `PRIMARY KEY`) works on a running database; changing or dropping
-   an existing one is still a config change or a rebuild.
+1. **DDL is live.** `CREATE`/`DROP TABLE`, `ALTER … RENAME`, and `ALTER … ADD
+   COLUMN` (nullable) work on a running database; a `PRIMARY KEY` is required, and
+   `ADD COLUMN NOT NULL` / `DROP COLUMN` are still a config change or a rebuild.
 2. **Division by zero raises.** sqlite yields NULL. So does overflow: mpedb
    errors where sqlite silently promotes to REAL.
 3. **`RIGHT`/`FULL` only join two tables.** The two-table forms work (a
@@ -533,11 +532,10 @@ conn.execute("SELECT ?, 'why?' FROM users WHERE id = ?", [42, 1]).fetchone()
 # -> (42, 'why?')
 ```
 
-**Two things it does not pretend.** There is no `CREATE TABLE`, so a program
-that runs DDL raises `ProgrammingError` here — the schema comes from the config
-or `mirror import`. And a connection's buffered writes are not visible to its own
-reads until `commit()`: mpedb has one exclusive writer lock, so the driver
-buffers rather than holding it open across an idle `input()`.
+**What it does not pretend.** A connection's buffered writes are not visible to
+its own reads until `commit()`: mpedb has one exclusive writer lock, so the
+driver buffers rather than holding it open across an idle `input()`. Unsupported
+SQL still raises `ProgrammingError` — a real subset, not a silent partial.
 
 The direct API is the other one — no cursors, no buffering:
 

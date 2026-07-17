@@ -69,11 +69,11 @@ around it. mpedb's SQL is a real subset that keeps growing — aggregates,
 self-joins, every join kind (`LEFT`/`RIGHT`/`FULL`/`CROSS`),
 `UNION`/`EXCEPT`/`INTERSECT`, scalar and `EXISTS` subqueries (correlated
 included), secondary indexes the planner actually uses, and live multi-process
-DDL (`CREATE TABLE`, `DROP TABLE`, `ALTER TABLE ... RENAME`) are in — but the
-surface is still a subset (no `ALTER ... ADD/DROP COLUMN` yet, no triggers or
-views), so a Django test suite will not run against it. Today mpedb is a
-validation and staging tool in that workflow, not the thing your ORM talks to.
-See [SQL support](#sql-support) for the exact surface, measured against the binary.
+DDL (`CREATE`/`DROP TABLE`, `ALTER … RENAME`/`ADD COLUMN`) are in — but it is
+still a subset (no triggers or views), so a Django test suite will not run
+against it. Today mpedb is a validation and staging tool in that workflow, not
+the thing your ORM talks to. See [SQL support](#sql-support) for the exact
+surface, measured against the binary.
 
 This cuts both ways, and honestly so: hardening mpedb against real sqlite3
 databases is how mpedb gets hardened. Every dialect mismatch found by importing
@@ -324,10 +324,8 @@ row — rigid typing says `CAST`).
 | **FROM-less `SELECT 3+5`** | ✅ | one synthetic row; WHERE filters it, aggregates see it (`SELECT count(*)` → 1), compound arms and subqueries may each be FROM-less |
 | Scalar subqueries `(SELECT …)`, `[NOT] EXISTS (…)` — uncorrelated AND correlated | ✅ | one output column; 0 rows → NULL; **>1 row errors** (PG's rule — sqlite silently takes the first); correlated references become inner-plan parameters, the `OuterCol` idea applied to a whole plan |
 | **Cross-FILE refs** | ❌ | planned (workspace read-joins) |
-| **`CREATE TABLE`** | ✅ | live, multi-process, on the shared file — inline/table-level `PRIMARY KEY`, `NOT NULL`, `UNIQUE` (column or composite); other processes see it on their next statement |
-| **`DROP TABLE [IF EXISTS]`** | ✅ | live, multi-process; frees the table's pages; ids are never reused (bounded at 64 lifetime creates, offline `regenerate` re-densifies) |
-| **`ALTER TABLE ... RENAME`** | ✅ | rename table (`RENAME TO`) or column (`RENAME [COLUMN] a TO b`) — pure metadata, no data rewrite |
-| **`ALTER ... ADD/DROP COLUMN`** | ❌ | needs a bounded row rewrite (mpedb's row image is schema-driven, not self-describing) — staged next |
+| **Live DDL** (multi-process) | ✅ | `CREATE TABLE` (PK / `NOT NULL` / `UNIQUE`), `DROP TABLE [IF EXISTS]`, `ALTER TABLE … RENAME` (table or column), `ALTER … ADD COLUMN` (nullable). Table ids are never reused (≤ 64 lifetime creates; `regenerate` resets) |
+| `ADD COLUMN NOT NULL`/`UNIQUE`, `DROP COLUMN` | ❌ | need a default fill / online index build — staged next |
 
 **Joins, and what they cost.** Joins are a left-deep chain of up to 16 tables,
 with aliases and self-joins. When a join's `ON` contains a plain equality
@@ -377,15 +375,11 @@ engines allow it. And under `SELECT DISTINCT` the key must be in the `SELECT`
 list, as in PostgreSQL: once duplicates collapse, a key outside the output means
 *which* duplicate survived is what decides the order, and the query never said.
 
-**Stable table ids under live DDL.** A table's id keys the catalog's B+tree
-roots, the CDC capture bitmap, and the mirror's per-table state, so the id must
-be stable across schema changes. It is: ids are explicit in the canonical bytes
-(not a sort position), so `CREATE`/`DROP` never renumber an existing table, and a
-`DROP`ped id is tombstoned in place and never reused — a re-created table gets a
-fresh id. That no-reuse rule caps *lifetime* table creates at 64 (a bounded
-capacity limit, not a per-query gap); `mirror regenerate` re-densifies to reset
-it. `ALTER ... ADD/DROP COLUMN` remains a rebuild for now. See
-[`DESIGN-DDL.md`](DESIGN-DDL.md) and [`DESIGN-DROP-TABLE.md`](DESIGN-DROP-TABLE.md).
+**Stable table ids under live DDL.** A table's id keys the catalog roots, the
+CDC bitmap, and the mirror's per-table state, so it is explicit in the file (not
+a sort position): `CREATE`/`DROP` never renumber, and a dropped id is never
+reused — capping lifetime creates at 64 (`regenerate` resets it). See
+[`DESIGN-DROP-TABLE.md`](DESIGN-DROP-TABLE.md).
 
 ## Performance
 

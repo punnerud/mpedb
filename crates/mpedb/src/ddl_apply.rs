@@ -191,6 +191,60 @@ impl Database {
         Ok(ExecResult::Affected(0))
     }
 
+    /// `ALTER TABLE ... ADD COLUMN` (#47 stage 5, v1). Only a NULLABLE column is
+    /// accepted: NOT NULL has no DEFAULT to fill existing rows with, and
+    /// UNIQUE / PRIMARY KEY would need an online index build — both refused with
+    /// a clear message (sqlite/PG also refuse NOT NULL without a default when the
+    /// table has rows). The engine rewrites existing rows with the new column
+    /// NULL in one commit.
+    pub(crate) fn apply_alter_add_column(
+        &self,
+        table: &str,
+        spec: mpedb_sql::CreateColumnSpec,
+    ) -> Result<ExecResult> {
+        if spec.not_null {
+            return Err(Error::Bind(format!(
+                "ALTER TABLE {table} ADD COLUMN {}: NOT NULL is not supported on ADD \
+                 (no DEFAULT to fill existing rows) — add it nullable",
+                spec.name
+            )));
+        }
+        if spec.unique || spec.pk {
+            return Err(Error::Bind(format!(
+                "ALTER TABLE {table} ADD COLUMN {}: UNIQUE / PRIMARY KEY on ADD is not \
+                 supported yet (would need an online index build)",
+                spec.name
+            )));
+        }
+        let col = mpedb_types::ColumnDef {
+            name: spec.name,
+            ty: spec.ty,
+            nullable: true,
+            unique: false,
+            indexed: false,
+            default: None,
+            check: None,
+        };
+        self.engine.refresh_schema_if_stale()?;
+        let id = self
+            .engine
+            .schema()
+            .schema
+            .table_id(table)
+            .ok_or_else(|| Error::Bind(format!("ALTER TABLE: no such table `{table}`")))?;
+        let mut w = self.engine.begin_write()?;
+        match w.alter_add_column(id, col) {
+            Ok(()) => w.commit()?,
+            Err(e) => {
+                w.abort();
+                return Err(e);
+            }
+        }
+        self.cache.write().expect(POISON).clear();
+        let _ = self.engine.reload_schema_from_catalog();
+        Ok(ExecResult::Affected(0))
+    }
+
     /// Apply a parsed DDL statement. Table DDL routes to the dedicated appliers
     /// above; RLS DDL (CREATE/DROP POLICY, ALTER TABLE ... ROW LEVEL SECURITY)
     /// takes the writer lock once and bumps the table's policy epoch. Returns
@@ -212,6 +266,9 @@ impl Database {
                 return self.apply_alter_rename(&table, |w, id| {
                     w.alter_rename_column(id, &column, &new_name)
                 });
+            }
+            DdlStmt::AlterAddColumn { table, column } => {
+                return self.apply_alter_add_column(&table, column);
             }
             DdlStmt::CreatePolicy(spec) => {
                 let def = mpedb_types::PolicyDef {

@@ -1002,6 +1002,51 @@ impl<'e> WriteTxn<'e> {
         self.publish_schema(&new_schema)
     }
 
+    /// ALTER TABLE ... ADD COLUMN (#47 stage 5). Appends a NULLABLE column
+    /// (the facade refuses NOT NULL / UNIQUE / PRIMARY KEY on ADD in v1) and
+    /// rewrites every existing row with the new column NULL — mpedb's row image
+    /// is schema-driven, not self-describing, so a widen cannot be lazy: an old
+    /// short row decoded with the new (longer) type list would misread. The
+    /// rewrite is one commit (whole table resident once, like DROP); batching
+    /// is deferred. No secondary index is touched (the new column is unindexed).
+    pub fn alter_add_column(&mut self, table_id: u32, col: mpedb_types::ColumnDef) -> Result<()> {
+        let bundle = Arc::clone(&self.bundle);
+        let new_schema = bundle.schema.with_added_column(table_id, col.clone())?;
+        let old_types = bundle.col_types[table_id as usize].clone();
+        // New column list = old ++ [new type]; the added column is trailing.
+        let mut new_types = old_types.clone();
+        new_types.push(col.ty);
+
+        // Pass 1: read every row (decode with OLD types) and re-encode it with
+        // the new column NULL. Collect fully before mutating so the cursor's
+        // read borrow is released before the write pass.
+        let (root, count) = self.tree_root(table_id, 0)?;
+        let mut rewritten: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        {
+            let mut c = btree::cursor(self, root, None, None)?;
+            while let Some((k, v)) = c.next(self)? {
+                let mut vals = row::decode_row(&v, &old_types)?;
+                vals.push(Value::Null);
+                let payload = row::encode_row(&vals, &new_types)?;
+                rewritten.push((k.to_vec(), payload));
+            }
+        }
+        // Pass 2: upsert the widened rows back at their (unchanged) keys.
+        let mut cur_root = root;
+        for (k, payload) in &rewritten {
+            let out = btree::insert(
+                self,
+                cur_root,
+                k,
+                &mut btree::Payload::Flat(payload),
+                InsertMode::Upsert,
+            )?;
+            cur_root = out.new_root;
+        }
+        self.set_tree_root(table_id, 0, cur_root, count);
+        self.publish_schema(&new_schema)
+    }
+
     /// Publish a new schema (already validated by the caller via one of the
     /// `Schema::with_*` evolvers) into the catalog and arm the schema-gen bump.
     /// For a PURE-METADATA change (rename): no tree roots move, so this single
