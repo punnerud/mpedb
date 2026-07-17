@@ -1,6 +1,6 @@
 # DESIGN-DROP-TABLE — #47 stage 4
 
-**Status: reviewed design draft.** DROP TABLE is the stage the dense-id
+**Status: BUILT (stage 4, 2026-07-17).** DROP TABLE is the stage the dense-id
 enforcement of DESIGN-SCHEMA-V2 §1.2 was deferring: removing a table produces
 *gapped* ids, and every site assuming `position == id` or holding a *persisted*
 id becomes a hazard. An exhaustive four-region audit (engine, sql/planner,
@@ -9,6 +9,19 @@ verified safe**; this design folds it. The core decision (below) collapses that
 58-site surface to a small, bounded set. The one persistence change (a
 monotonic id high-water) rides the project's wire/commit-path adversarial-review
 rule before build.
+
+**Shipped shape** (`WriteTxn::drop_table`, facade `apply_drop_table`, parser
+`DROP TABLE [IF EXISTS]`): tombstone-in-place + no-reuse exactly as §0; page
+reclamation done in the SAME UNLINK commit with a `MAX_DROP_PAGES` (6M ≈ 23 GiB)
+guard rather than the deferred two-phase worklist (see §2 — the one-commit free
+is proven by the 1 GiB-delete precedent; bounded cross-commit reclamation stays
+deferred for tables past the guard). A NEW required piece surfaced during build:
+the facade's **schema-gen cache gate** (`Database::gate_cache_on_schema`) — a
+plan cache HIT bypasses compilation, so a plan compiled before a DROP would be
+served stale; the gate drops the whole cache when `schema_gen` moves, so a
+cross-process DROP+re-CREATE returns fresh data (or a clean "no such table")
+instead of erroring on a tombstoned id's missing tree-roots. This gate is also
+the prerequisite the ALTER stage (5) needs.
 
 ## 0. The decision that gates everything
 
@@ -98,12 +111,25 @@ holds; after any DDL the live schema legitimately diverges from the config and
 the config-drift check compares only against the frozen SEED hash (stage 1).
 `regenerate` re-densifies (rebuilds without dead slots), resetting the ceiling.
 
-## 2. DROP TABLE mechanics (atomic UNLINK commit + bounded reclamation)
+## 2. DROP TABLE mechanics (one UNLINK+free commit, bounded by a page guard)
 
-The review (MEDIUM) killed the naive "free every page in one commit": a large
-table's page-free would blow the freelist's per-commit `u16` chunk index
-(wraps past ~7.86M freed pages ≈ a 32 GiB table) and can hit DbFull mid-DROP
-(the 1 GiB-delete precedent already writes ~2185 freelist chunks). So DROP
+The review (MEDIUM) flagged the naive "free every page in one commit": a large
+table's page-free would blow the freelist's per-commit `u16` chunk index (wraps
+past ~7.86M freed pages ≈ a 32 GiB table) and can hit DbFull mid-DROP (the 1 GiB-
+delete precedent already writes ~2185 freelist chunks). **As shipped**, DROP
+frees every page in the same UNLINK commit but **refuses closed at
+`MAX_DROP_PAGES` (6M pages ≈ 23 GiB)** — well under the `u16`-chunk wrap, with
+margin for the fixpoint's own freed pages — so the wrap is unreachable and a
+too-large table gets a clean `Error::Unsupported` (nothing freed, schema
+untouched) instead of corruption. The two-phase worklist below (bounded
+cross-commit reclamation for tables past the guard) stays **deferred**: no
+first-version table approaches 23 GiB, and the one-commit free is the proven
+1 GiB-delete path scaled up. `collect_pages` walks branch/leaf/overflow chains
+into a `BTreeSet`; each collected page is `free`d (keyed under this commit's txn
+id, so a reader still pinned on the pre-DROP snapshot keeps them un-reused — the
+same #37 discipline a large DELETE relies on).
+
+The original two-phase plan (kept for the deferred large-table path): DROP
 splits into **one atomic UNLINK commit** (which makes the table gone and its
 trees unreachable) plus **bounded page reclamation** (unreachable pages are
 safe to reclaim lazily — leaking a page until reclaimed is never corruption).

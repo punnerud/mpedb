@@ -183,8 +183,12 @@ impl Schema {
     /// and indexes derive exactly as at seed.
     pub fn with_added_table(&self, mut def: TableDef) -> Result<Schema> {
         // `tables.len()` (live + dead) is the monotone id high-water: dead
-        // slots are never removed, so a new table's id is never a reused one.
-        // Fail closed at the bitmap ceiling (footprint/CDC index by raw id).
+        // slots are never removed and ids are NEVER reused (DESIGN-DROP-TABLE
+        // §0 — reuse would require a crash-atomic distributed purge of every
+        // persisted `table_id` record, the exact silent-corruption class mpedb
+        // exists to prevent; the bounded-limit + offline `regenerate` compaction
+        // is the deliberate trade). Fail closed at the bitmap ceiling
+        // (footprint/CDC index by raw id).
         if self.tables.len() >= MAX_TABLES {
             return Err(Error::Schema(
                 "table-id space exhausted (MAX_TABLES lifetime creates); rebuild required".into(),
@@ -1017,11 +1021,15 @@ mod tests {
     #[test]
     fn create_refuses_at_the_id_ceiling() {
         // Fill to MAX_TABLES with live + dead slots; the next create fails
-        // closed rather than minting id >= 64 (the bitmap ceiling).
-        let mut tables: Vec<TableDef> = (0..MAX_TABLES - 8).map(|i| tbl(&format!("t{i}"))).collect();
-        let mut s = Schema::new(std::mem::take(&mut tables)).unwrap();
-        // Drop-and-recreate to burn ids up to the ceiling without exceeding
-        // the live-count guard.
+        // closed rather than minting id >= 64 (the bitmap ceiling). No-reuse
+        // means DROP+CREATE churn grows `tables.len()` by one per cycle, so a
+        // churny workload is what eventually reaches this bound — the
+        // deliberate, bounded, detectable limit (§0), with offline `regenerate`
+        // compaction as the escape hatch.
+        let tables: Vec<TableDef> = (0..MAX_TABLES - 8).map(|i| tbl(&format!("t{i}"))).collect();
+        let mut s = Schema::new(tables).unwrap();
+        // Burn ids up to the ceiling via drop+recreate without exceeding the
+        // live-count guard (dead slots accumulate; live count stays flat).
         while s.tables.len() < MAX_TABLES {
             let id = s.tables.iter().rposition(|t| !t.dead).unwrap() as u32;
             s = s.with_dropped_table(id).unwrap();

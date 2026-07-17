@@ -173,6 +173,16 @@ fn cat_tree_key(table_id: u32, index_no: u32) -> Vec<u8> {
 /// (DESIGN.md §4.5) converge.
 const FREELIST_CHUNK_PAGES: usize = 120; // 960-byte values
 
+/// DROP frees a whole table's pages in ONE commit, and `freelist_plan` keys the
+/// resulting freed-page chunks with a `u16` chunk index (`FREELIST_CHUNK_PAGES`
+/// pages each), so a single commit can record at most `65536 * 120` ≈ 7.86M
+/// freed pages before the index wraps and two chunks collide. We refuse a DROP
+/// whose table exceeds this bound (with margin for the fixpoint's own freed
+/// pages) rather than corrupt the freelist — ~23 GB in one table is far past any
+/// first-version workload, and cross-commit bounded reclamation is deferred
+/// (DESIGN-DROP-TABLE §2).
+const MAX_DROP_PAGES: u64 = 6_000_000;
+
 /// How deep a page pool a writer draws before allocating, and how many freelist
 /// entries it may draw from to get there (#37). Drawing is read-only and an
 /// undrawn-down entry costs nothing at commit, so the pool exists purely to

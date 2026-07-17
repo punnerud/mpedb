@@ -252,6 +252,15 @@ impl DetachedPlan {
 pub struct Database {
     engine: Engine,
     cache: RwLock<HashMap<PlanHash, Arc<CompiledPlan>>>,
+    /// The schema generation this process's plan cache was built against. A DDL
+    /// commit (here or in another process) bumps the meta `schema_gen`; on the
+    /// next statement `gate_cache_on_schema` observes the mismatch and drops the
+    /// whole cache, so a plan compiled against a table that has since been
+    /// dropped, re-created (its id reused in place), or altered is never
+    /// executed against the new catalog (#47 stage 4). Cache HITS bypass
+    /// compilation, so this gate — not the compile-path refresh — is what makes
+    /// id-reuse safe.
+    cache_gen: std::sync::atomic::AtomicU64,
     /// The database file path this handle attached (for `Workspace` dup-file
     /// detection and diagnostics).
     path: std::path::PathBuf,
@@ -280,6 +289,7 @@ impl Database {
         Ok(Database {
             engine,
             cache: RwLock::new(HashMap::new()),
+            cache_gen: std::sync::atomic::AtomicU64::new(0),
             path: path.to_path_buf(),
             // No config, so no §6.3 assertions — consistent with this
             // constructor's contract (it also skips CHECK programs): a
@@ -334,6 +344,7 @@ impl Database {
         Ok(Database {
             engine,
             cache: RwLock::new(HashMap::new()),
+            cache_gen: std::sync::atomic::AtomicU64::new(0),
             path,
             require_policy,
         })
@@ -354,11 +365,32 @@ impl Database {
     /// catalog sys-keyspace on a pinned read snapshot, DESIGN-MULTIDB.md §3).
     /// The bool is the `EXPLAIN` flag. An empty policy set behaves exactly as
     /// plain compilation.
-    fn compile_maybe_explain(&self, sql: &str) -> Result<(CompiledPlan, bool)> {
-        // #47 stage 3: pick up another process's CREATE TABLE before we
-        // compile — a query against a just-created table must see it, and
-        // the txn-begin reload happens too late (compilation runs first).
+    /// Refresh this process's schema bundle if another process bumped the meta
+    /// `schema_gen`, and — critically — drop the local plan cache when the gen
+    /// actually moved. A cached plan is bound to a specific catalog layout; a
+    /// DROP / re-CREATE (id reused in place) / ALTER since it was compiled makes
+    /// it stale, and cache HITS never recompile. One `newest_meta` read in the
+    /// common (unchanged) case; the cache is cleared only on a real gen change.
+    fn gate_cache_on_schema(&self) -> Result<()> {
         self.engine.refresh_schema_if_stale()?;
+        let gen = self.engine.schema().schema_gen;
+        // Relaxed is fine: DDL is serialized under the writer lock, and a
+        // same-instant race resolves at the txn's own captured snapshot. This
+        // gate closes the common case — a DDL that committed in a PRIOR
+        // statement — which is the one that would otherwise execute a stale plan.
+        if self.cache_gen.swap(gen, std::sync::atomic::Ordering::Relaxed) != gen {
+            self.cache.write().expect(POISON).clear();
+        }
+        Ok(())
+    }
+
+    fn compile_maybe_explain(&self, sql: &str) -> Result<(CompiledPlan, bool)> {
+        // #47 stage 3/4: pick up another process's CREATE/DROP/ALTER before we
+        // compile — a query against a just-created table must see it, one
+        // against a just-dropped table must fail to bind, and a stale cached
+        // plan must be evicted (the txn-begin reload happens too late, and a
+        // cache hit skips compilation entirely).
+        self.gate_cache_on_schema()?;
         let catalog = self.load_policy_catalog()?;
         mpedb_sql::prepare_maybe_explain_with_policies(sql, &self.schema(), &catalog)
     }
@@ -482,11 +514,47 @@ impl Database {
         Ok(ExecResult::Affected(0))
     }
 
+    fn apply_drop_table(&self, name: &str, if_exists: bool) -> Result<ExecResult> {
+        // Resolve the name against a fresh schema view (another process may have
+        // created/dropped since our last statement). The write txn re-checks the
+        // gen and `drop_table` re-validates the id against its own captured
+        // bundle, so a lost race surfaces as a clean error, never corruption.
+        self.engine.refresh_schema_if_stale()?;
+        let id = match self.engine.schema().schema.table_id(name) {
+            Some(id) => id,
+            None => {
+                if if_exists {
+                    return Ok(ExecResult::Affected(0));
+                }
+                return Err(Error::Bind(format!("DROP TABLE: no such table `{name}`")));
+            }
+        };
+        let mut w = self.engine.begin_write()?;
+        match w.drop_table(id) {
+            Ok(()) => w.commit()?,
+            Err(e) => {
+                w.abort();
+                return Err(e);
+            }
+        }
+        // Durable and globally visible via the schema_gen bump. Refreshing this
+        // process is best-effort for the same reason as CREATE: the plan cache
+        // clear is infallible and mandatory (cached plans reference the dropped
+        // table's id), and a transient reload failure self-heals at the next
+        // statement's `refresh_schema_if_stale`.
+        self.cache.write().expect(POISON).clear();
+        let _ = self.engine.reload_schema_from_catalog();
+        Ok(ExecResult::Affected(0))
+    }
+
     fn apply_ddl(&self, ddl: mpedb_sql::DdlStmt) -> Result<ExecResult> {
         use mpedb_sql::{DdlStmt, RlsAction};
         match ddl {
             DdlStmt::CreateTable(spec) => {
                 return self.apply_create_table(spec);
+            }
+            DdlStmt::DropTable { name, if_exists } => {
+                return self.apply_drop_table(&name, if_exists);
             }
             DdlStmt::CreatePolicy(spec) => {
                 let def = mpedb_types::PolicyDef {
@@ -560,6 +628,10 @@ impl Database {
         hash: &PlanHash,
         params: &[Value],
     ) -> Result<ExecResult> {
+        // Evict a plan whose catalog changed underneath it before serving it
+        // from cache (a DROP / re-CREATE / ALTER since prepare). Cheap in the
+        // common case: one `newest_meta` read, no clear.
+        self.gate_cache_on_schema()?;
         let plan = self.cached_or_load(hash)?;
         let full = session::resolve_params_timed(&plan, params, session)?;
         self.run_plan(Some(hash), &plan, &full)

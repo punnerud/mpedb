@@ -117,7 +117,11 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
         }
         Some("drop") => {
             p.advance();
-            p.parse_drop_policy()?
+            if p.eat_word("TABLE") {
+                p.parse_drop_table()?
+            } else {
+                p.parse_drop_policy()?
+            }
         }
         Some("alter") => {
             p.advance();
@@ -529,6 +533,18 @@ impl<'a> Parser<'a> {
             using_src,
             check_src,
         }))
+    }
+
+    fn parse_drop_table(&mut self) -> Result<DdlStmt> {
+        // Optional `IF EXISTS`.
+        let if_exists = if self.eat_word("IF") {
+            self.expect_word("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident("table name")?;
+        Ok(DdlStmt::DropTable { name, if_exists })
     }
 
     fn parse_drop_policy(&mut self) -> Result<DdlStmt> {

@@ -41,7 +41,8 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | SAVEPOINT / RELEASE | ❌ | savepoints exist at the engine level (import rollback), not in SQL |
 | EXPLAIN | ✅ | plan form (access path, index choice, residuals), not VDBE opcodes |
 | CREATE TABLE | ✅ | live, multi-process, on the shared file — `PRIMARY KEY` (inline or table-level composite), `NOT NULL`, `UNIQUE` (column or composite); other processes see the new table on their next statement. `DEFAULT`/`CHECK`/foreign keys refuse by name (declare them in the config schema for now) |
-| DROP TABLE / ALTER TABLE | ❌ | designed ([DESIGN-DDL.md](DESIGN-DDL.md)), staged after CREATE — a schema change beyond adding a table is a config change today |
+| DROP TABLE | ✅ | live, multi-process — `DROP TABLE [IF EXISTS] <name>`; frees the table's pages, tombstones its id in place (never reused — [DESIGN-DROP-TABLE.md](DESIGN-DROP-TABLE.md) §0), other processes see it gone on their next statement. No-reuse caps *lifetime* table creates at 64 (a bounded capacity limit, not a per-query gap; offline `regenerate` re-densifies) |
+| ALTER TABLE | ❌ | designed ([DESIGN-DDL.md](DESIGN-DDL.md)), staged after DROP — a column change is a config change today |
 | CREATE INDEX | **Not needed** | `unique = true` / `indexed = true` on a column, or `[[table.index]]` with a column LIST for composite (unique or not) — equality on the full width or any prefix, range on the first column, visible in EXPLAIN |
 | CREATE VIEW / CREATE TRIGGER | ❌ | triggers' job is planned as the PySpell/ETL layer, not in-SQL |
 | WITH (CTEs) | ❌ | |
