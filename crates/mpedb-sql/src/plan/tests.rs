@@ -33,6 +33,9 @@ fn sample_sqls() -> Vec<&'static str> {
         "SELECT 1 UNION SELECT 2",
         "SELECT 15 UNION SELECT id FROM users",
         "SELECT (SELECT 3)",
+        // IN (SELECT ...) (#70, format 11): LIST-kind subplan + InParam.
+        "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)",
+        "SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM orders) AND active",
         "SELECT id FROM users WHERE id = (SELECT 4)",
         "BEGIN",
         "COMMIT",

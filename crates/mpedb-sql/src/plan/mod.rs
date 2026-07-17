@@ -62,7 +62,9 @@ const MAX_JOINS: usize = 16;
 // 10: FROM-less SELECT (#67) — `SelectPlan.table` may be the DUAL_TABLE
 //    sentinel (one synthetic empty row, no table read). New decode contract
 //    for a value that format 9 rejected as out of range, hence the bump.
-const PLAN_FORMAT: u8 = 10;
+// 11: `IN (SELECT …)` (#70) — the subplan tag byte grew List(2); format 10
+//    decoders reject it as a bad exists tag, hence the bump.
+const PLAN_FORMAT: u8 = 11;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -168,10 +170,34 @@ pub enum OrderOver {
 pub struct SubPlan {
     pub plan: SelectPlan,
     pub outer_args: Vec<u16>,
-    /// `EXISTS (…)`: the result is `Bool(any rows)` instead of the scalar
-    /// rule (exactly one output column; 0 rows → NULL; >1 row → runtime
-    /// error, PostgreSQL's line — sqlite silently takes the first row).
-    pub exists: bool,
+    pub kind: SubPlanKind,
+}
+
+/// What a subplan's result slot HOLDS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SubPlanKind {
+    /// One column; 0 rows → NULL; >1 row → runtime error (PostgreSQL's
+    /// line — sqlite silently takes the first row).
+    Scalar = 0,
+    /// `EXISTS (…)`: `Bool(any rows)`.
+    Exists = 1,
+    /// `x IN (SELECT …)` (#70): the slot holds a LIST of the single output
+    /// column's values, consumed by the `InParam` membership instruction —
+    /// the same runtime-typed 3VL core session-context lists use.
+    /// Uncorrelated only (the planner refuses, the decoder re-refuses).
+    List = 2,
+}
+
+impl SubPlanKind {
+    pub fn from_tag(t: u8) -> Option<SubPlanKind> {
+        Some(match t {
+            0 => SubPlanKind::Scalar,
+            1 => SubPlanKind::Exists,
+            2 => SubPlanKind::List,
+            _ => return None,
+        })
+    }
 }
 
 /// Ceiling on subplans per statement — decoder DoS bound, far above real SQL.

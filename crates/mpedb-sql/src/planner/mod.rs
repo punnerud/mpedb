@@ -26,7 +26,7 @@ use crate::binder::{compile_program, BExpr, Binder, Scope, Ty};
 use crate::plan::{
     render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource,
     CompoundPlan, GroupKey, Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp,
-    Projection, SelectPlan, SubPlan,
+    Projection, SelectPlan, SubPlan, SubPlanKind,
 };
 use crate::policy::{PolicyCatalog, TablePolicies};
 use mpedb_types::{ExprProgram, ColumnType, Error, Footprint, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,

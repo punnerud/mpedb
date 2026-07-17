@@ -181,6 +181,15 @@ pub(crate) enum Expr {
     /// `[NOT] EXISTS (SELECT …)` — did the subquery produce any row. The
     /// bool is `negated`.
     Exists(Box<SelectStmt>, bool),
+    /// `x [NOT] IN (SELECT …)` (#70) — membership in the subquery's single
+    /// output column. The planner lifts the subquery into a LIST-kind
+    /// subplan and rewrites this into [`Expr::InParamSlot`]. Uncorrelated
+    /// only; the bool is `negated`.
+    InSubquery(Box<Expr>, Box<SelectStmt>, bool),
+    /// INTERNAL: produced only by the subquery lift — `lhs IN (<list at
+    /// reserved param slot>)`, bound to the `InParam` membership
+    /// instruction. Never comes out of the parser.
+    InParamSlot(Box<Expr>, u16, bool),
     /// `current_setting('key')` — a session-context value, bound to a reserved
     /// parameter filled from the caller's [`Session`](mpedb) at execute time
     /// (DESIGN-MULTIDB.md §2.1). The value never enters the plan bytes, so one

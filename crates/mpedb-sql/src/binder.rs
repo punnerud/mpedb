@@ -672,6 +672,20 @@ impl<'a> Binder<'a> {
             // reserved parameter) before binding. One reaching the binder is
             // therefore a subquery in a position the lift does not cover —
             // say so instead of "unknown expression".
+            // The lift's IN-subquery marker: the slot holds a LIST at
+            // runtime; membership is the same runtime-typed 3VL core the
+            // session-context lists use, so the lhs binds free.
+            ast::Expr::InParamSlot(lhs, slot, negated) => {
+                let (l, _lt) = self.bind_expr(lhs)?;
+                Ok((
+                    maybe_not(BExpr::InParam(Box::new(l), *slot), *negated),
+                    Some(ColumnType::Bool),
+                ))
+            }
+            ast::Expr::InSubquery(..) => Err(bind_err(
+                "an IN subquery here was not lifted — this expression position \
+                 does not support subqueries yet",
+            )),
             ast::Expr::Subquery(_) | ast::Expr::Exists(..) => Err(bind_err(
                 "a subquery is not supported in this position — subqueries work in \
                  the SELECT list and WHERE of a plain (non-aggregate) SELECT",

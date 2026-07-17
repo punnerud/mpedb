@@ -9,6 +9,7 @@ pub(super) fn contains_agg(e: &ast::Expr) -> bool {
         E::Unary(_, a) | E::IsNull(a, _) | E::Cast(a, _) => contains_agg(a),
         E::Binary(_, a, b) | E::Like(a, b) => contains_agg(a) || contains_agg(b),
         E::InContext(a, _, _) => contains_agg(a),
+        E::InSubquery(a, _, _) | E::InParamSlot(a, _, _) => contains_agg(a),
         E::InList(a, xs, _) => contains_agg(a) || xs.iter().any(contains_agg),
         E::Coalesce(xs) | E::Func(_, xs) => xs.iter().any(contains_agg),
         E::Case(arms, els) => {
@@ -103,6 +104,12 @@ fn lift_aggs(
             *n,
         ),
         E::InContext(a, k, n) => E::InContext(Box::new(rec(a, aggs)?), k.clone(), *n),
+        // The IN-subquery marker: the slot side is opaque here; only the lhs
+        // participates in the grouped tuple. (A raw InSubquery still present
+        // means the lift refused/skipped it — pass through to the binder's
+        // refusal, same as Subquery below.)
+        E::InParamSlot(a, slot, n) => E::InParamSlot(Box::new(rec(a, aggs)?), *slot, *n),
+        other @ E::InSubquery(..) => other.clone(),
         E::Coalesce(xs) => E::Coalesce(xs.iter().map(|x| rec(x, aggs)).collect::<Result<_>>()?),
         E::Func(f, xs) => E::Func(
             f.clone(),

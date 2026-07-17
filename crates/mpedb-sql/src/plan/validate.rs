@@ -491,7 +491,7 @@ impl CompiledPlan {
 
         let gather_ok = |p: &ExprProgram| -> Result<()> {
             for i in &p.instrs {
-                if let Instr::PushParam(pi) = *i {
+                if let Instr::PushParam(pi) | Instr::InParam(pi) = *i {
                     let pi = pi as usize;
                     if (sub_base..sub_base + self.subplans.len()).contains(&pi)
                         && correlated[pi - sub_base]
@@ -554,7 +554,12 @@ impl CompiledPlan {
                 }
             }
             // A scalar subquery IS one value; EXISTS ignores its projection.
-            if !s.exists && s.plan.projection.len() - s.plan.order_junk as usize != 1 {
+            if s.kind == SubPlanKind::List && !s.outer_args.is_empty() {
+                return Err(corrupt("correlated IN-list subplan"));
+            }
+            if s.kind != SubPlanKind::Exists
+                && s.plan.projection.len() - s.plan.order_junk as usize != 1
+            {
                 return Err(corrupt("scalar subplan must output exactly one column"));
             }
             // Subplans run through the plain executor too — see the arm rule.
