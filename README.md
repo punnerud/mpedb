@@ -481,11 +481,16 @@ Linux-shaped optimisation (there `msync(MS_SYNC)` really does sync only the
 range) meeting a platform where it multiplies. Logged as known-issue #0; use
 `wal`. Details: [BENCHMARKS.md](BENCHMARKS.md#apple-silicon-m3-pro-11-cores--and-the-durability-trap-it-exposed).
 
-**Bulk bytes are not mpedb's game.** Pushing 256 MiB of 4 KiB blobs, SQLite
-writes 998 MiB/s to mpedb's 602 (38% vs 23% of what a raw `std::fs` write does
-on the same medium) — a blob larger than the page takes an overflow chain and
-every touched page is copied before the meta flip. That is crash-safety paid for
-in bandwidth. See [BENCHMARKS.md](BENCHMARKS.md#bulk-mbs--and-the-number-that-makes-it-mean-something).
+**Bulk bytes are not mpedb's game — yet.** Pushing 256 MiB of 4 KiB blobs on
+Linux, SQLite writes 998 MiB/s to mpedb's 602 (38% vs 23% of what a raw
+`std::fs` write does on the same medium; on the M3 the cell already goes the
+other way) — a blob larger than the page takes an overflow chain, and the
+payload pays a page fault per fresh page on its way through the mapping. The
+plan that closes this is written and review-hardened:
+[`DESIGN-BLOBEXTENT.md`](DESIGN-BLOBEXTENT.md) — WiscKey-style key/value
+separation, where large values become immutable extents written once via
+`pwrite` and the COW tree keeps a 20-byte reference. See
+[BENCHMARKS.md](BENCHMARKS.md#bulk-mbs--and-the-number-that-makes-it-mean-something).
 
 ```sh
 cargo run --release -p mpedb-bench      # full head-to-head -> RESULTS-<machine>.md
