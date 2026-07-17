@@ -259,7 +259,10 @@ Correctness is checked against the established engines, not just against itself:
 
 Verified against the binary, not remembered. mpedb compiles SQL once to a
 content-hashed plan; the surface is deliberately narrow, and the narrowness is
-the design rather than a todo list.
+the design rather than a todo list. The highlights are below;
+**[`COMPAT.md`](COMPAT.md) is the full feature-by-feature status** —
+statements, clauses, operators, functions, types — in the same format as
+Turso's COMPAT.md so the two read side by side.
 
 It is also measured against sqlite's own **sqllogictest corpus** (the
 `sqlite_corpus` runner in `crates/mpedb-testkit`): the classic `select1–3`

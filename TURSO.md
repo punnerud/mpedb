@@ -107,7 +107,7 @@ known, documented Apple floor — which is why `wal` is the mode to compare.
 
 Two different yardsticks, kept apart on purpose. Turso's column is **its own
 COMPAT.md self-report** (quoted 2026-07-17) — mpedb has not independently
-verified it. mpedb's column is **measured**: the sqllogictest select corpus
+verified it. mpedb's own page in the same format is [COMPAT.md](COMPAT.md). mpedb's column is **measured**: the sqllogictest select corpus
 (127 files, 1,464,520 records) passes 100.0% with zero wrong results against
 sqlite3 ground truth, and every listed refusal is a deliberate, documented
 error message, not a silent gap (see [GUIDE.md](GUIDE.md) and the
