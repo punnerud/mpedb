@@ -208,7 +208,7 @@ enough to fill the host disk — until the benchmark adapter supplied manual
 | mpedb → sqlite | ✅ `mpedb mirror export` | round-trips are verified (`mirror roundtrip`) |
 | live two-way sync with sqlite | ✅ `mirror sync` / daemon | SIGKILL-fuzzed to convergence (`mirror-collide`: writers + a daemon killed at every instant must still converge exactly) |
 | PostgreSQL ⇄ mpedb | ✅ `mirror` with a PG source/target | same machinery, `--source-config` DSN handling |
-| open an existing `.db` file | 🚧 | `mpedb data.db` works like `sqlite3 data.db` (repl or one-shot): a `.mpedb` sidecar mirror imports on first open, pulls incrementally on later ones, and `mpedb checkpoint data.db` pushes local writes back — full sqlite3 interop both ways, with mirror's conflict rules. Today a full-copy sidecar (v0); the in-place delta overlay with lock modes is designed ([DESIGN-SQLITE-BACKED.md](DESIGN-SQLITE-BACKED.md), 20-finding review folded) and staged |
+| open an existing `.db` file | 🚧 | two ways today. **Sidecar (read-write)**: `mpedb data.db` works like `sqlite3 data.db` (repl or one-shot) — imports on first open, pulls incrementally on later ones, `mpedb checkpoint data.db` pushes writes back with mirror's conflict rules. **Native (read-only, zero import)**: `mpedb dump data.db` and `mpedb::SqliteAttach` read the sqlite file format directly — no sqlite library in the path, both b-tree layouts, differentially verified row-for-row against the real library; PK probes are b-tree seeks, writes are refused by name. The in-place delta overlay with lock modes is the designed next stage ([DESIGN-SQLITE-BACKED.md](DESIGN-SQLITE-BACKED.md), 20-finding review folded) |
 
 ## Measured speed against sqlite
 
