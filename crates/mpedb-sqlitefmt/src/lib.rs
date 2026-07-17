@@ -11,6 +11,8 @@
 //! non-UTF8 text encodings, page 1 corruption. The house rule applies:
 //! corrupt input yields [`Error::Corrupt`], never a panic.
 
+pub mod stamp;
+
 use std::fs::File;
 use std::io::Read as _;
 use std::path::Path;
