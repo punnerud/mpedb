@@ -106,6 +106,30 @@ fall-through pauses, the mirror reconcile runs (§2's re-lock path), and
 OPTIMISTIC resumes on the new stamp. mpedb writes continue into the overlay
 throughout — only fall-through waits.
 
+**The settled stamp (Morten's granularity trick) — what makes the cheap
+filter TRUSTWORTHY over days, not merely advisory.** Plain mtime cannot be
+trusted because a foreign write in the same timestamp tick as the stamp is
+invisible. The fix is in WHEN the stamp is taken: while still holding the
+SHARED lock, wait until the wall clock has crossed at least one mtime-
+granularity boundary (probed once at open by double-touching a scratch file
+in the same directory: ~ns on ext4/APFS → hold ~10 ms; up to 2 s on coarse
+filesystems), THEN read the stamp, THEN release. Because the file was
+provably quiescent under the lock across the boundary, any later mutation
+lands in a strictly newer tick — one `stat()` at any point afterwards says
+definitively "touched or not", after minutes or days equally. The stamp is
+the tuple (mtime, size, change counter, `-wal` mtime+size if present); the
+counter makes it robust to clock steps for sqlite writers (monotonic, in the
+file), and the `-wal` pair extends divergence DETECTION to WAL-mode bases
+without `-shm` machinery (read consistency there is still Q5). Residual
+holes, named: deliberate mtime forgery, NFS attribute caching, and non-
+sqlite mmap mutators (sqlite itself writes the main file with `write()`
+even in mmap mode) — the GETLK+counter double-check per statement remains
+the consistency backstop for exactly this reason.
+
+The settled stamp is taken at every lock release (OPTIMISTIC entry and
+UNLOCKED-OFFLINE alike), which is what makes re-lock validation after a long
+offline window one `stat()` in the common no-change case.
+
 So the honest mode ladder: **LOCKED** = zero validation, sqlite writers see
 BUSY. **OPTIMISTIC** = no lock held, sqlite writers free, fall-through pays
 ~µs per statement and self-heals through reconcile. The default stays LOCKED
@@ -250,10 +274,11 @@ owner-validated stamp.
   fcntl locks does not respect SHARED) — BaseStamp re-validation on every
   re-lock catches it after the fact; is a periodic in-LOCKED stamp audit
   (cheap: one header read) worth the syscall?
-- **Q5**: OPTIMISTIC over WAL-mode bases needs `-shm` lock inspection and a
-  WAL-tail stamp instead of the change counter (which only moves on
-  checkpoint there). Worth building, or is "checkpoint your base to
-  journal_mode=DELETE first" an acceptable permanent answer for this mode?
+- **Q5**: OPTIMISTIC over WAL-mode bases — divergence DETECTION is solved by
+  the settled stamp over the (.db, -wal) pair (§2), but read CONSISTENCY
+  still needs `-shm` lock inspection or the journal_mode=DELETE requirement.
+  Worth building the `-shm` reader, or is "checkpoint your base first" an
+  acceptable permanent answer for this mode?
 - **Q6**: OPTIMISTIC's GETLK+counter double-check needs an adversarial pass
   of its own against sqlite's exact lock/flush ordering (when precisely does
   page 1 with the counter hit the file relative to other pages and the
