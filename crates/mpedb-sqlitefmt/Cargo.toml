@@ -1,0 +1,13 @@
+[package]
+name = "mpedb-sqlitefmt"
+version = "0.1.0"
+edition = "2021"
+
+# Dependency-light BY DESIGN: this is the native sqlite-file READER
+# (DESIGN-SQLITE-BACKED §4) — the v2 overlay's fall-through reads run under
+# mpedb's own lock protocol with no sqlite library in the path, so nothing
+# here may drag one in. The library is what VERIFIES us, in dev-deps only.
+[dependencies]
+
+[dev-dependencies]
+rusqlite = { version = "0.31", features = ["bundled"] }
