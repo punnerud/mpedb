@@ -169,15 +169,17 @@ fn synthetic_grouped_table(
     for (i, (f, _, _)) in aggs.iter().enumerate() {
         let ty = match f {
             mpedb_types::AggFn::Count => ColumnType::Int64,
-            mpedb_types::AggFn::Avg => ColumnType::Float64,
+            mpedb_types::AggFn::Avg | mpedb_types::AggFn::Total => ColumnType::Float64,
+            mpedb_types::AggFn::GroupConcat => ColumnType::Text,
             // SUM/MIN/MAX keep the argument's type.
             _ => agg_types[i].unwrap_or(ColumnType::Int64),
         };
         out.push(mpedb_types::ColumnDef {
             name: format!("__g{}", key_types.len() + i),
             ty,
-            // Every aggregate except COUNT is NULL over an empty group.
-            nullable: !matches!(f, mpedb_types::AggFn::Count),
+            // COUNT and TOTAL are never NULL (0 / 0.0 over an empty group);
+            // every other aggregate is NULL over an empty group.
+            nullable: !matches!(f, mpedb_types::AggFn::Count | mpedb_types::AggFn::Total),
             unique: false,
             indexed: false,
             default: None,
