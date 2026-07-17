@@ -70,10 +70,17 @@ fn lock_cmds() -> (libc::c_int, libc::c_int, bool) {
     {
         (libc::F_OFD_SETLK, libc::F_OFD_GETLK, true)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
     {
-        // macOS: F_OFD_* exists on modern versions; verify on the M3 before
-        // flipping this (design Q1). Classic locks until then.
+        // Verified functionally on the M3 (design Q1, 2026-07-17):
+        // F_OFD_SETLK=90 / F_OFD_GETLK=92 exist and conflict correctly
+        // against a second description's write attempt.
+        (libc::F_OFD_SETLK, libc::F_OFD_GETLK, true)
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        // Other unixes: classic locks; callers must run the [R#5]
+        // drop/re-take dance around in-process sqlite use.
         (libc::F_SETLK, libc::F_GETLK, false)
     }
 }
