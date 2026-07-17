@@ -359,6 +359,12 @@ Differences that will bite, each one exercised in `tests/guide.rs`:
    and the query never said.
 5. **`ORDER BY 1 + 1` is refused.** Only a bare integer is an ordinal. sqlite
    sorts by the constant, which is to say not at all.
+6. **`CASE`/`COALESCE` arms cannot mix `int64` and `float64`.** sqlite types
+   the winning arm per row — `COALESCE(30, avg(x)) / 35` divides an INTEGER
+   when arm 1 wins — and rigid typing cannot express "the type of whichever
+   arm wins". Widening 30 to 30.0 silently changes that division (measured:
+   82 wrong answers in the sqllogictest expr tree), so the mix is a compile
+   error instead; an explicit `CAST` on the arms makes it legal.
 
 And the difference that is the entire point: **sqlite's `STRICT` is not this.**
 STRICT rejects what cannot convert *losslessly*; it still stores `'42'` in an

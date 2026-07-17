@@ -729,6 +729,20 @@ fn exec_select(
 /// belongs to an inner table and is named `<table>.<column>` (`id` alone would
 /// not say which side); a single-table read keeps plain column names.
 fn select_output_columns(schema: &Schema, sp: &SelectPlan) -> Result<Vec<String>> {
+    // FROM-less: no table to name columns from. Every projection is an Expr
+    // carrying its own name — the binder cannot produce a Column over the
+    // zero-column dual row.
+    if sp.table == mpedb_sql::DUAL_TABLE {
+        return sp
+            .projection
+            .iter()
+            .take(sp.projection.len() - sp.order_junk as usize)
+            .map(|p| match p {
+                Projection::Expr { name, .. } => Ok(name.clone()),
+                Projection::Column(_) => Err(internal("column projection on a FROM-less select")),
+            })
+            .collect();
+    }
     let t = table_def(schema, sp.table)?;
     let joined_tables: Vec<&TableDef> = if sp.joins.is_empty() {
         vec![t]
@@ -1320,6 +1334,12 @@ pub(crate) fn validate_params(plan: &CompiledPlan, params: &[Value]) -> Result<(
 }
 
 fn table_def(schema: &Schema, table: u32) -> Result<&TableDef> {
+    // FROM-less SELECT: the DUAL sentinel resolves to the shared zero-column
+    // def — every downstream width/name computation degrades correctly over
+    // zero columns, and the gather never reaches a TxnCtx call.
+    if table == mpedb_sql::DUAL_TABLE {
+        return Ok(mpedb_sql::dual_def());
+    }
     schema
         .table(table)
         .ok_or_else(|| internal("table id out of range"))

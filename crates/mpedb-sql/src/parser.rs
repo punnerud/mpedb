@@ -602,84 +602,91 @@ impl<'a> Parser<'a> {
             }
             Some(items)
         };
-        self.expect_kw(Kw::From, "FROM")?;
-        // `FROM ( a JOIN b ON … )` — parens around a join group. For the
-        // left-deep chains this grammar builds they are associativity no-ops,
-        // so opening parens are counted and their closers consumed between
-        // join steps. (A paren group as the INNER side of a join — `a JOIN
-        // (b JOIN c)` — is NOT expressible left-deep and stays a parse error.)
-        let mut from_parens = 0usize;
-        while self.eat(&Tok::LParen) {
-            from_parens += 1;
-        }
-        let table = self.ident("table name")?;
-        let from_alias = self.opt_table_alias()?;
-        let mut joins = Vec::new();
-        // ONE left-deep chain where `,` and the JOIN keywords are equal
-        // separators — sqlite's FROM grammar, and the corpus interleaves them
-        // freely (`FROM a CROSS JOIN b, c`). The comma-join and CROSS JOIN
-        // ARE the cartesian product, written in syntax whose whole meaning is
-        // "every pair" (unlike a bare `JOIN b` with a forgotten ON, which
-        // stays refused): desugared to `INNER JOIN … ON true`, with WHERE
-        // filtering over the joined row — sqlite/PG semantics exactly.
-        loop {
-            if from_parens > 0 && self.eat(&Tok::RParen) {
-                from_parens -= 1;
-            } else if self.eat(&Tok::Comma) {
-                let t = self.ident("table name after ','")?;
-                let alias = self.opt_table_alias()?;
-                joins.push(JoinClause {
-                    table: t,
-                    alias,
-                    kind: JoinKind::Inner,
-                    on: Expr::Lit(Value::Bool(true)),
-                });
-            } else if self.eat_kw(Kw::Inner) {
-                self.expect_kw(Kw::Join, "JOIN after INNER")?;
-                joins.push(self.join_tail(JoinKind::Inner)?);
-            } else if self.eat_kw(Kw::Join) {
-                joins.push(self.join_tail(JoinKind::Inner)?);
-            } else if self.eat_word("LEFT") {
-                // The optional OUTER changes nothing — LEFT JOIN and
-                // LEFT OUTER JOIN are the same join.
-                let _ = self.eat_word("OUTER");
-                self.expect_kw(Kw::Join, "JOIN after LEFT")?;
-                joins.push(self.join_tail(JoinKind::Left)?);
-            } else if self.eat_word("RIGHT") {
-                let _ = self.eat_word("OUTER");
-                self.expect_kw(Kw::Join, "JOIN after RIGHT")?;
-                joins.push(self.join_tail(JoinKind::Right)?);
-            } else if self.eat_word("FULL") {
-                let _ = self.eat_word("OUTER");
-                self.expect_kw(Kw::Join, "JOIN after FULL")?;
-                joins.push(self.join_tail(JoinKind::Full)?);
-            } else if matches!(self.peek_join_kind(), Some("CROSS")) {
-                // `CROSS JOIN t` is the cartesian product written in the
-                // syntax whose whole meaning is "every pair" — exactly the
-                // comma-join, so it desugars the same way (no ON clause).
-                self.pos += 1;
-                self.expect_kw(Kw::Join, "JOIN after CROSS")?;
-                let t = self.ident("table name after CROSS JOIN")?;
-                let alias = self.opt_table_alias()?;
-                joins.push(JoinClause {
-                    table: t,
-                    alias,
-                    kind: JoinKind::Inner,
-                    on: Expr::Lit(Value::Bool(true)),
-                });
-            } else if let Some(kind) = self.peek_join_kind() {
-                // Only NATURAL is left unsupported: its join condition is
-                // implicit in column NAMES, which rigid schemas make a trap.
-                return Err(self.err_here(format!(
-                    "{kind} JOIN is not supported — write the ON condition explicitly",
-                )));
-            } else {
-                break;
+        // FROM is optional (sqlite/PG): `SELECT 3+5` reads no table and
+        // evaluates over ONE synthetic empty row. WHERE/ORDER BY/LIMIT
+        // still parse below -- sqlite allows `SELECT 3 WHERE 1`.
+        let (table, from_alias, joins) = if self.eat_kw(Kw::From) {
+            // `FROM ( a JOIN b ON … )` — parens around a join group. For the
+            // left-deep chains this grammar builds they are associativity no-ops,
+            // so opening parens are counted and their closers consumed between
+            // join steps. (A paren group as the INNER side of a join — `a JOIN
+            // (b JOIN c)` — is NOT expressible left-deep and stays a parse error.)
+            let mut from_parens = 0usize;
+            while self.eat(&Tok::LParen) {
+                from_parens += 1;
             }
-        }
-        if from_parens > 0 {
-            return Err(self.err_here("unclosed `(` in FROM"));
-        }
+            let table = self.ident("table name")?;
+            let from_alias = self.opt_table_alias()?;
+            let mut joins = Vec::new();
+            // ONE left-deep chain where `,` and the JOIN keywords are equal
+            // separators — sqlite's FROM grammar, and the corpus interleaves them
+            // freely (`FROM a CROSS JOIN b, c`). The comma-join and CROSS JOIN
+            // ARE the cartesian product, written in syntax whose whole meaning is
+            // "every pair" (unlike a bare `JOIN b` with a forgotten ON, which
+            // stays refused): desugared to `INNER JOIN … ON true`, with WHERE
+            // filtering over the joined row — sqlite/PG semantics exactly.
+            loop {
+                if from_parens > 0 && self.eat(&Tok::RParen) {
+                    from_parens -= 1;
+                } else if self.eat(&Tok::Comma) {
+                    let t = self.ident("table name after ','")?;
+                    let alias = self.opt_table_alias()?;
+                    joins.push(JoinClause {
+                        table: t,
+                        alias,
+                        kind: JoinKind::Inner,
+                        on: Expr::Lit(Value::Bool(true)),
+                    });
+                } else if self.eat_kw(Kw::Inner) {
+                    self.expect_kw(Kw::Join, "JOIN after INNER")?;
+                    joins.push(self.join_tail(JoinKind::Inner)?);
+                } else if self.eat_kw(Kw::Join) {
+                    joins.push(self.join_tail(JoinKind::Inner)?);
+                } else if self.eat_word("LEFT") {
+                    // The optional OUTER changes nothing — LEFT JOIN and
+                    // LEFT OUTER JOIN are the same join.
+                    let _ = self.eat_word("OUTER");
+                    self.expect_kw(Kw::Join, "JOIN after LEFT")?;
+                    joins.push(self.join_tail(JoinKind::Left)?);
+                } else if self.eat_word("RIGHT") {
+                    let _ = self.eat_word("OUTER");
+                    self.expect_kw(Kw::Join, "JOIN after RIGHT")?;
+                    joins.push(self.join_tail(JoinKind::Right)?);
+                } else if self.eat_word("FULL") {
+                    let _ = self.eat_word("OUTER");
+                    self.expect_kw(Kw::Join, "JOIN after FULL")?;
+                    joins.push(self.join_tail(JoinKind::Full)?);
+                } else if matches!(self.peek_join_kind(), Some("CROSS")) {
+                    // `CROSS JOIN t` is the cartesian product written in the
+                    // syntax whose whole meaning is "every pair" — exactly the
+                    // comma-join, so it desugars the same way (no ON clause).
+                    self.pos += 1;
+                    self.expect_kw(Kw::Join, "JOIN after CROSS")?;
+                    let t = self.ident("table name after CROSS JOIN")?;
+                    let alias = self.opt_table_alias()?;
+                    joins.push(JoinClause {
+                        table: t,
+                        alias,
+                        kind: JoinKind::Inner,
+                        on: Expr::Lit(Value::Bool(true)),
+                    });
+                } else if let Some(kind) = self.peek_join_kind() {
+                    // Only NATURAL is left unsupported: its join condition is
+                    // implicit in column NAMES, which rigid schemas make a trap.
+                    return Err(self.err_here(format!(
+                        "{kind} JOIN is not supported — write the ON condition explicitly",
+                    )));
+                } else {
+                    break;
+                }
+            }
+            if from_parens > 0 {
+                return Err(self.err_here("unclosed `(` in FROM"));
+            }
+            (Some(table), from_alias, joins)
+        } else {
+            (None, None, Vec::new())
+        };
         let where_clause = if self.eat_kw(Kw::Where) {
             Some(self.expr()?)
         } else {
@@ -765,7 +772,14 @@ impl<'a> Parser<'a> {
         if self.eat_kw(Kw::As) {
             return Ok((e, Some(self.ident("alias after AS")?)));
         }
-        if matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_))) {
+        // A quoted identifier is always an alias. A bare one is too — UNLESS
+        // it is a compound operator: with FROM optional (#67), `SELECT 1
+        // UNION SELECT 2` puts `UNION` right after an item, and reading it as
+        // the item's alias would swallow the second arm.
+        if matches!(self.peek(), Some(Tok::QuotedIdent(_))) {
+            return Ok((e, Some(self.ident("select-item alias")?)));
+        }
+        if matches!(self.peek(), Some(Tok::Ident(_))) && self.peek_compound_op().is_none() {
             return Ok((e, Some(self.ident("select-item alias")?)));
         }
         Ok((e, None))
@@ -1753,7 +1767,7 @@ mod tests {
         assert_eq!(n, 0);
         match s {
             Stmt::Select(sel) => {
-                assert_eq!(sel.table, "t");
+                assert_eq!(sel.table.as_deref(), Some("t"));
                 assert_eq!(sel.items.as_ref().unwrap().len(), 2);
                 assert!(sel.where_clause.is_some());
                 assert_eq!(

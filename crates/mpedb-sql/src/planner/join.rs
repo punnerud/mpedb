@@ -48,12 +48,15 @@ pub(super) fn rewrite_right_join(
         ));
     }
     let j = &s.joins[0];
+    // Join paths are unreachable without a FROM — the parser cannot build a
+    // join clause on a FROM-less statement.
+    let s_table = s.table.as_deref().expect("join on a FROM-less SELECT");
     let items = match &s.items {
         Some(items) => Some(items.clone()),
         None => {
-            let (_, lt) = resolve_table(schema, &s.table)?;
+            let (_, lt) = resolve_table(schema, s_table)?;
             let (_, rt) = resolve_table(schema, &j.table)?;
-            let lname = s.alias.clone().unwrap_or_else(|| s.table.clone());
+            let lname = s.alias.clone().unwrap_or_else(|| s_table.to_string());
             let rname = j.alias.clone().unwrap_or_else(|| j.table.clone());
             let mut items = Vec::with_capacity(lt.columns.len() + rt.columns.len());
             for c in &lt.columns {
@@ -66,10 +69,10 @@ pub(super) fn rewrite_right_join(
         }
     };
     Ok(Some(ast::SelectStmt {
-        table: j.table.clone(),
+        table: Some(j.table.clone()),
         alias: j.alias.clone(),
         joins: vec![ast::JoinClause {
-            table: s.table.clone(),
+            table: s_table.to_string(),
             alias: s.alias.clone(),
             kind: ast::JoinKind::Left,
             on: j.on.clone(),
@@ -98,7 +101,8 @@ pub(super) fn plan_join_select(
     // reserved result slots sit right after the user params.
     let eff_params = n_params + subplans.len() as u16;
     let correlated: Vec<bool> = subplans.iter().map(|p| !p.outer_args.is_empty()).collect();
-    let (outer_id, outer) = resolve_table(schema, &s.table)?;
+    let outer_table = s.table.as_deref().expect("join on a FROM-less SELECT");
+    let (outer_id, outer) = resolve_table(schema, outer_table)?;
     let outer_name = s.alias.clone().unwrap_or_else(|| outer.name.clone());
 
     // The outer's policy binds over its own row and can pin an access path.

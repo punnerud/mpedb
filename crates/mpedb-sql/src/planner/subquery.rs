@@ -73,8 +73,13 @@ pub(super) fn lift_subqueries(
     // The OUTER scope, for correlation: the same `[table0 ‖ … ‖ tableN]`
     // tuple the outer statement's own expressions bind over.
     let mut named: Vec<(String, &TableDef)> = Vec::new();
-    let (_, outer_t) = resolve_table(schema, &s.table)?;
-    named.push((s.alias.clone().unwrap_or_else(|| s.table.clone()), outer_t));
+    // FROM-less outer: an EMPTY outer scope — with no outer columns, nothing
+    // can correlate, and every unresolved name inside a subquery stays that
+    // subquery's own error.
+    if let Some(t) = &s.table {
+        let (_, outer_t) = resolve_table(schema, t)?;
+        named.push((s.alias.clone().unwrap_or_else(|| t.clone()), outer_t));
+    }
     for j in &s.joins {
         let (_, jt) = resolve_table(schema, &j.table)?;
         named.push((j.alias.clone().unwrap_or_else(|| j.table.clone()), jt));
@@ -239,11 +244,13 @@ impl Lift<'_> {
         // resolve is tried against the OUTER scope and becomes a correlation
         // parameter. Bare names prefer the inner table — SQL's rule.
         let mut inner_named: Vec<(String, &TableDef)> = Vec::new();
-        let (_, it) = resolve_table(self.schema, &inner.table)?;
-        inner_named.push((
-            inner.alias.clone().unwrap_or_else(|| inner.table.clone()),
-            it,
-        ));
+        // A FROM-less subquery (`SELECT (SELECT 3)`) has an empty inner
+        // scope: every name falls through to the outer and correlates, or
+        // errors there — the same rule as any other unresolved inner name.
+        if let Some(t) = &inner.table {
+            let (_, it) = resolve_table(self.schema, t)?;
+            inner_named.push((inner.alias.clone().unwrap_or_else(|| t.clone()), it));
+        }
         for j in &inner.joins {
             let (_, jt) = resolve_table(self.schema, &j.table)?;
             inner_named.push((j.alias.clone().unwrap_or_else(|| j.table.clone()), jt));

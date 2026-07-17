@@ -40,7 +40,14 @@ fn select_footprint(sp: &SelectPlan, schema: &Schema) -> Result<Footprint> {
         // under-claim `tables_read`, and `conflicts_with` is a bitmap AND —
         // so a writer to the inner table would not be seen to conflict with
         // this reader, and the commit path would group them as independent.
-        let mut tables_read = table_bit(*table)?;
+        // FROM-less (DUAL sentinel): no table read, no bit set — the plan
+        // conflicts with nothing, which is exactly true. `table_bit` would
+        // rightly reject u32::MAX as out of range.
+        let mut tables_read = if *table == crate::plan::DUAL_TABLE {
+            0
+        } else {
+            table_bit(*table)?
+        };
         let mut key_access = key_access;
         for j in joins {
             tables_read |= table_bit(j.table)?;

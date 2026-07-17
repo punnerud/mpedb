@@ -24,6 +24,16 @@ fn sample_sqls() -> Vec<&'static str> {
         "SELECT users.id FROM users RIGHT JOIN orders ON users.id = orders.user_id",
         "SELECT id FROM users EXCEPT SELECT user_id FROM orders",
         "SELECT id FROM users INTERSECT SELECT user_id FROM orders OFFSET 1",
+        // FROM-less (#67, format 10): the DUAL sentinel must survive
+        // encode/decode/validate — alone, in compound arms, with WHERE and
+        // aggregates, and as a subquery on either side.
+        "SELECT 3+5",
+        "SELECT 3, 'x', 1.5 WHERE 1=1",
+        "SELECT count(*)",
+        "SELECT 1 UNION SELECT 2",
+        "SELECT 15 UNION SELECT id FROM users",
+        "SELECT (SELECT 3)",
+        "SELECT id FROM users WHERE id = (SELECT 4)",
         "BEGIN",
         "COMMIT",
         "ROLLBACK",

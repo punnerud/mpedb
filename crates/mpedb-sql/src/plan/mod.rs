@@ -59,7 +59,30 @@ const MAX_JOINS: usize = 16;
 //    format" instead of a confusing "bad tag" mid-decode.
 // 9: the #56 SQL window — the instruction set grew Cast/Concat (`CAST`, `||`);
 //    UNION/compound statements and uncorrelated subplans ride the same bump.
-const PLAN_FORMAT: u8 = 9;
+// 10: FROM-less SELECT (#67) — `SelectPlan.table` may be the DUAL_TABLE
+//    sentinel (one synthetic empty row, no table read). New decode contract
+//    for a value that format 9 rejected as out of range, hence the bump.
+const PLAN_FORMAT: u8 = 10;
+
+/// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
+/// The executor yields ONE synthetic zero-column row; the footprint sets no
+/// bits. Deliberately `u32::MAX` — a real schema caps table ids far below,
+/// so no future table can collide with it.
+pub const DUAL_TABLE: u32 = u32::MAX;
+
+/// The zero-column [`TableDef`] that stands in for `DUAL_TABLE` wherever the
+/// planner/validator needs "the table's" width or column names. It never
+/// reaches the row or key layer (its empty `primary_key` would violate that
+/// layer's invariant), and it is never registered in a schema.
+pub fn dual_def() -> &'static mpedb_types::TableDef {
+    use std::sync::OnceLock;
+    static DUAL: OnceLock<mpedb_types::TableDef> = OnceLock::new();
+    DUAL.get_or_init(|| mpedb_types::TableDef {
+        name: String::new(),
+        columns: Vec::new(),
+        primary_key: Vec::new(),
+    })
+}
 
 /// One table's RLS state, frozen at compile time. See
 /// [`CompiledPlan::policies`].
