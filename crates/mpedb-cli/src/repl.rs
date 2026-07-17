@@ -110,7 +110,7 @@ fn dot_command(cmd: &str, db: &Database, db_path: &Path, in_session: bool) {
         None => (cmd, ""),
     };
     match name {
-        "schema" => print!("{}", schema_toml(db.schema())),
+        "schema" => print!("{}", schema_toml(&db.schema())),
         "tables" => match tables(db_path) {
             Ok(lines) => print!("{lines}"),
             Err(e) => eprintln!("error: {e}"),

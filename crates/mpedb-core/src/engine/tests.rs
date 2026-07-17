@@ -334,7 +334,7 @@ fn page_accounting_sys_api_and_open_from_file() {
 
     // config-free open sees the same data and schema
     let eng2 = Engine::open_from_file(&cfg.options.path).unwrap();
-    assert_eq!(eng2.schema(), &cfg.schema);
+    assert_eq!(&eng2.schema().schema, &cfg.schema);
     let r = eng2.begin_read().unwrap();
     assert_eq!(r.row_count(0).unwrap(), 150);
     r.finish().unwrap();

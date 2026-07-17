@@ -265,7 +265,7 @@ fn execute_prepared(
     params: &[Value],
 ) -> Result<u64> {
     let mut partial = false;
-    match exec_stmt(txn, db.schema(), plan, params, &mut partial)? {
+    match exec_stmt(txn, &db.schema(), plan, params, &mut partial)? {
         ExecResult::Affected(n) => Ok(n),
         _ => Err(Error::Internal("write plan returned rows".into())),
     }
@@ -424,7 +424,8 @@ fn optimistic_prep(db: &Database, plan: &CompiledPlan, params: &[Value]) -> Prep
         return Prep::Fallback;
     };
     let types = types.to_vec();
-    let Some(tdef) = db.schema().table(table) else {
+    let bundle = db.schema();
+    let Some(tdef) = bundle.table(table) else {
         return Prep::Fallback;
     };
     let pk_cols = tdef.primary_key.clone();
@@ -632,7 +633,7 @@ fn tname(db: &Database, table: u32) -> String {
 fn serial_execute(db: &Database, plan: &CompiledPlan, params: &[Value]) -> Result<ExecResult> {
     let mut txn = db.engine.begin_write()?;
     let mut partial = false;
-    match exec_stmt(&mut txn, db.schema(), plan, params, &mut partial) {
+    match exec_stmt(&mut txn, &db.schema(), plan, params, &mut partial) {
         Ok(out) => {
             txn.commit()?;
             Ok(out)
@@ -750,7 +751,7 @@ pub(crate) fn lead_and_execute(
         let mut own_result = None;
         if let Some((plan, params)) = own {
             let mut partial = false;
-            match exec_stmt(&mut txn, db.schema(), plan, params, &mut partial) {
+            match exec_stmt(&mut txn, &db.schema(), plan, params, &mut partial) {
                 Ok(out) => own_result = Some(Ok(out)),
                 Err(e) => {
                     txn.abort();
@@ -823,7 +824,7 @@ pub(crate) fn lead_and_execute(
     if let Some((plan, params)) = own {
         let sp = txn.savepoint();
         let mut partial = false;
-        match exec_stmt(&mut txn, db.schema(), plan, params, &mut partial) {
+        match exec_stmt(&mut txn, &db.schema(), plan, params, &mut partial) {
             Ok(out) => own_result = Some(Ok(out)),
             Err(e) => {
                 txn.rollback_to(sp);

@@ -148,7 +148,7 @@ impl<'db> RowStream<'db> {
             let mut partial = false;
             let res = {
                 let mut ctx = ReadCtx(&r);
-                exec::exec_stmt(&mut ctx, schema, &plan, params, &mut partial)
+                exec::exec_stmt(&mut ctx, &schema, &plan, params, &mut partial)
             }?;
             r.finish()?; // SnapshotEvicted here invalidates the rows
             let ExecResult::Rows { rows, columns } = res else {

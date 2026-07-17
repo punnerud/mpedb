@@ -405,7 +405,7 @@ fn stale_plan_surfaces_plan_invalidated() {
     assert_eq!(int(&engine.call("get", &params![1]).unwrap()), 9);
 
     // The plan hash embedded in the proc (recomputable: same SQL, schema).
-    let h = mpedb_sql::prepare(sql, db.schema()).unwrap().hash();
+    let h = mpedb_sql::prepare(sql, &db.schema()).unwrap().hash();
 
     // A *different* schema whose shape still fits: same table, extra column.
     let col = |name: &str| ColumnDef {

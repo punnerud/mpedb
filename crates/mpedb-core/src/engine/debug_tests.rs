@@ -131,7 +131,7 @@ fn decompose_write_phases() {
         t_read += s.elapsed().as_nanos();
         // row encode (done in prep, reused at apply)
         let s = Instant::now();
-        let payload = row::encode_row(&[Value::Int(key), Value::Int(val)], &eng.col_types[0]).unwrap();
+        let payload = row::encode_row(&[Value::Int(key), Value::Int(val)], &eng.col_types(0).unwrap()).unwrap();
         t_encode += s.elapsed().as_nanos();
         // pure COW write: blind Upsert of the pre-encoded payload (this is
         // exactly what an optimistic apply on a PK-only table would run)

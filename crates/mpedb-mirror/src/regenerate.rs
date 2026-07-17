@@ -69,7 +69,7 @@ impl RegenReport {
 ///   half-swapped mirror is never writable.
 pub fn regenerate(db_path: &Path, size_bytes: u64) -> Result<RegenReport> {
     let old = Database::open_from_file(db_path)?;
-    let schema: Schema = old.schema().clone();
+    let schema: Schema = old.schema().schema.clone();
 
     // 1. Freeze. Every mirrored table refuses writes from here until the new
     //    file is in place, so the copy below sees a still target.
