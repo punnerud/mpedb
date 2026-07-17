@@ -257,6 +257,58 @@ impl Schema {
         Ok(schema)
     }
 
+    /// Evolve this schema by DROPPING one column of a table (#47 stage 5). The
+    /// caller rewrites existing rows without the column. Refused when the column
+    /// is part of the PK, referenced by any secondary index, or the table's last
+    /// column (no online index rebuild, and a table needs its key). Column
+    /// indices of surviving columns AFTER the dropped one shift down by one, so
+    /// the PK and every index's stored column references are renumbered to match.
+    pub fn with_dropped_column(&self, table_id: u32, column: &str) -> Result<Schema> {
+        let mut tables = self.tables.clone();
+        let slot = tables
+            .get_mut(table_id as usize)
+            .filter(|t| t.id == table_id && !t.dead)
+            .ok_or_else(|| Error::Schema(format!("no live table with id {table_id}")))?;
+        let idx = slot
+            .columns
+            .iter()
+            .position(|c| c.name == column)
+            .ok_or_else(|| Error::Schema(format!("no column `{column}` in table `{}`", slot.name)))?;
+        let i = idx as u16;
+        if slot.primary_key.contains(&i) {
+            return Err(Error::Schema(format!(
+                "cannot drop column `{column}`: it is part of the PRIMARY KEY of `{}`",
+                slot.name
+            )));
+        }
+        if slot.indexes.iter().any(|ix| ix.columns.contains(&i)) {
+            return Err(Error::Schema(format!(
+                "cannot drop column `{column}`: it is part of an index/UNIQUE on `{}`",
+                slot.name
+            )));
+        }
+        if slot.columns.len() == 1 {
+            return Err(Error::Schema(format!(
+                "cannot drop the last column of table `{}`",
+                slot.name
+            )));
+        }
+        slot.columns.remove(idx);
+        // Renumber references to columns that shifted down (index > i → -1).
+        let shift = |c: &mut u16| {
+            if *c > i {
+                *c -= 1;
+            }
+        };
+        slot.primary_key.iter_mut().for_each(shift);
+        for ix in &mut slot.indexes {
+            ix.columns.iter_mut().for_each(shift);
+        }
+        let schema = Schema { tables };
+        schema.validate()?;
+        Ok(schema)
+    }
+
     /// Evolve this schema by RENAMING one column of a table (#47 stage 5). Pure
     /// metadata: the column keeps its position and type, so no row image is
     /// touched. Errors if the column is unknown or the new name collides with a

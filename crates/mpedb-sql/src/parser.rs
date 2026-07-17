@@ -614,6 +614,11 @@ impl<'a> Parser<'a> {
             }
             return Ok(DdlStmt::AlterAddColumn { table, column: col });
         }
+        if self.eat_word("DROP") {
+            self.eat_word("COLUMN"); // optional, as in sqlite/PG
+            let column = self.ident("column name")?;
+            return Ok(DdlStmt::AlterDropColumn { table, column });
+        }
         let action = if self.eat_word("ENABLE") {
             self.expect_row_level_security()?;
             RlsAction::Enable { force: false }

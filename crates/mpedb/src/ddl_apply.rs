@@ -245,6 +245,34 @@ impl Database {
         Ok(ExecResult::Affected(0))
     }
 
+    /// `ALTER TABLE ... DROP COLUMN` (#47 stage 5). The engine refuses dropping a
+    /// PK / indexed / last column and rewrites existing rows without the column
+    /// in one commit.
+    pub(crate) fn apply_alter_drop_column(
+        &self,
+        table: &str,
+        column: &str,
+    ) -> Result<ExecResult> {
+        self.engine.refresh_schema_if_stale()?;
+        let id = self
+            .engine
+            .schema()
+            .schema
+            .table_id(table)
+            .ok_or_else(|| Error::Bind(format!("ALTER TABLE: no such table `{table}`")))?;
+        let mut w = self.engine.begin_write()?;
+        match w.alter_drop_column(id, column) {
+            Ok(()) => w.commit()?,
+            Err(e) => {
+                w.abort();
+                return Err(e);
+            }
+        }
+        self.cache.write().expect(POISON).clear();
+        let _ = self.engine.reload_schema_from_catalog();
+        Ok(ExecResult::Affected(0))
+    }
+
     /// Apply a parsed DDL statement. Table DDL routes to the dedicated appliers
     /// above; RLS DDL (CREATE/DROP POLICY, ALTER TABLE ... ROW LEVEL SECURITY)
     /// takes the writer lock once and bumps the table's policy epoch. Returns
@@ -269,6 +297,9 @@ impl Database {
             }
             DdlStmt::AlterAddColumn { table, column } => {
                 return self.apply_alter_add_column(&table, column);
+            }
+            DdlStmt::AlterDropColumn { table, column } => {
+                return self.apply_alter_drop_column(&table, &column);
             }
             DdlStmt::CreatePolicy(spec) => {
                 let def = mpedb_types::PolicyDef {

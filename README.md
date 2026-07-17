@@ -324,8 +324,8 @@ row — rigid typing says `CAST`).
 | **FROM-less `SELECT 3+5`** | ✅ | one synthetic row; WHERE filters it, aggregates see it (`SELECT count(*)` → 1), compound arms and subqueries may each be FROM-less |
 | Scalar subqueries `(SELECT …)`, `[NOT] EXISTS (…)` — uncorrelated AND correlated | ✅ | one output column; 0 rows → NULL; **>1 row errors** (PG's rule — sqlite silently takes the first); correlated references become inner-plan parameters, the `OuterCol` idea applied to a whole plan |
 | **Cross-FILE refs** | ❌ | planned (workspace read-joins) |
-| **Live DDL** (multi-process) | ✅ | `CREATE TABLE` (PK / `NOT NULL` / `UNIQUE`), `DROP TABLE [IF EXISTS]`, `ALTER TABLE … RENAME` (table or column), `ALTER … ADD COLUMN` (nullable). Table ids are never reused (≤ 64 lifetime creates; `regenerate` resets) |
-| `ADD COLUMN NOT NULL`/`UNIQUE`, `DROP COLUMN` | ❌ | need a default fill / online index build — staged next |
+| **Live DDL** (multi-process) | ✅ | `CREATE TABLE` (PK / `NOT NULL` / `UNIQUE`), `DROP TABLE [IF EXISTS]`, `ALTER … RENAME` (table or column), `ALTER … ADD COLUMN` (nullable) / `DROP COLUMN`. Table ids are never reused (≤ 64 lifetime creates; `regenerate` resets) |
+| `ADD COLUMN NOT NULL`/`UNIQUE`, triggers, views | ❌ | need a default fill / online index build — not planned for v1 |
 
 **Joins, and what they cost.** Joins are a left-deep chain of up to 16 tables,
 with aliases and self-joins. When a join's `ON` contains a plain equality

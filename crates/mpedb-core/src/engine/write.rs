@@ -1047,6 +1047,62 @@ impl<'e> WriteTxn<'e> {
         self.publish_schema(&new_schema)
     }
 
+    /// ALTER TABLE ... DROP COLUMN (#47 stage 5). Removes a column and rewrites
+    /// every existing row without it (decode with old types, drop the value at
+    /// the column's index, re-encode with new types). Refusals (PK column,
+    /// indexed column, last column) are enforced by `with_dropped_column`, so an
+    /// illegal drop bails before any row is touched. No secondary index tree is
+    /// rebuilt: the dropped column is unindexed, and the surviving indexed
+    /// columns' VALUES are unchanged — only their stored column *indices* shift
+    /// (handled in the schema), which future writes honor.
+    pub fn alter_drop_column(&mut self, table_id: u32, column: &str) -> Result<()> {
+        let bundle = Arc::clone(&self.bundle);
+        // Column index in the OLD layout (needed for the row rewrite). The
+        // schema evolver re-checks existence and the refusals below.
+        let idx = {
+            let table = bundle
+                .schema
+                .table(table_id)
+                .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
+            table
+                .columns
+                .iter()
+                .position(|c| c.name == column)
+                .ok_or_else(|| {
+                    Error::Schema(format!("no column `{column}` in table id {table_id}"))
+                })?
+        };
+        let new_schema = bundle.schema.with_dropped_column(table_id, column)?;
+        let old_types = bundle.col_types[table_id as usize].clone();
+        let mut new_types = old_types.clone();
+        new_types.remove(idx);
+
+        let (root, count) = self.tree_root(table_id, 0)?;
+        let mut rewritten: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        {
+            let mut c = btree::cursor(self, root, None, None)?;
+            while let Some((k, v)) = c.next(self)? {
+                let mut vals = row::decode_row(&v, &old_types)?;
+                vals.remove(idx);
+                let payload = row::encode_row(&vals, &new_types)?;
+                rewritten.push((k.to_vec(), payload));
+            }
+        }
+        let mut cur_root = root;
+        for (k, payload) in &rewritten {
+            let out = btree::insert(
+                self,
+                cur_root,
+                k,
+                &mut btree::Payload::Flat(payload),
+                InsertMode::Upsert,
+            )?;
+            cur_root = out.new_root;
+        }
+        self.set_tree_root(table_id, 0, cur_root, count);
+        self.publish_schema(&new_schema)
+    }
+
     /// Publish a new schema (already validated by the caller via one of the
     /// `Schema::with_*` evolvers) into the catalog and arm the schema-gen bump.
     /// For a PURE-METADATA change (rename): no tree roots move, so this single
