@@ -462,7 +462,8 @@ fn plan_on_conflict(
             .ok_or_else(|| bind_err(format!("unknown column `{name}` in DO UPDATE SET")))?;
         let (b, ty) = binder.bind_expr(e)?;
         if let Some(t) = ty {
-            if t != table.columns[i].ty {
+            // Same rule as `bind_assign`: `any` accepts every typed value.
+            if t != table.columns[i].ty && table.columns[i].ty != ColumnType::Any {
                 binder.set_allow_excluded(false);
                 return Err(bind_err(format!(
                     "cannot assign {t} to column `{name}` of type {}",

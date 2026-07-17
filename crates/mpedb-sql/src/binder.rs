@@ -392,6 +392,9 @@ impl<'a> Binder<'a> {
         let (b, ty) = self.unify_param(b, ty, col.ty);
         match ty {
             Some(t) if t == col.ty => Ok(b),
+            // `any` is the loose-type escape (#23): every runtime-typed value
+            // belongs, so a statically-typed assignment is never a type error.
+            Some(_) if col.ty == ColumnType::Any => Ok(b),
             Some(ColumnType::Int64) if col.ty == ColumnType::Float64 => {
                 fold_maybe(BExpr::Unary(BUnOp::ToFloat, Box::new(b)), self.suppress_fold)
             }

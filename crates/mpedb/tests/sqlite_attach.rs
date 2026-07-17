@@ -72,6 +72,16 @@ fn answers_match_the_library() {
     };
     assert_eq!(got.iter().map(|r| match &r[0] { Value::Int(i) => *i, _ => panic!() }).collect::<Vec<_>>(), expect);
 
+    // Exclusive lo + inclusive hi — the 0xFF-suffixed bound forms, where the
+    // effective inclusivity flips in the decoder (regression: the flag used
+    // to carry through unflipped, turning `> 5` into `>= 5` and `<= 10`
+    // into `< 10`).
+    let got = rows(at.query("SELECT id FROM users WHERE id > 5 AND id <= 10 ORDER BY id", &[]).unwrap());
+    assert_eq!(
+        got.iter().map(|r| match &r[0] { Value::Int(i) => *i, _ => panic!() }).collect::<Vec<_>>(),
+        vec![6, 7, 8, 9, 10]
+    );
+
     // Aggregate over the whole table.
     let got = rows(at.query("SELECT count(*), min(id), max(id) FROM users", &[]).unwrap());
     assert_eq!(got, vec![vec![Value::Int(500), Value::Int(0), Value::Int(499)]]);
