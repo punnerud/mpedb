@@ -70,13 +70,61 @@ Consequences, all inherited from sqlite's discipline rather than invented:
 The lock is held by ONE designated process on behalf of the attachment (see
 §7 — the mpedb writer-lock owner), not by every reader.
 
-### UNLOCKED (cooperative window): let sqlite tools write, then reconcile
+### OPTIMISTIC (unlocked, validated): no lock held, µs-level checks instead
+
+Morten's follow-up question — "can we check the last change date and trust
+it, and leave the base unlocked?" — splits into a NO and a YES:
+
+**mtime alone is not trustworthy.** Timestamp granularity, `touch`-ability,
+clock steps, and NFS attribute caching all defeat it — and the deeper hole is
+TOCTOU: a rollback-journal writer mutates the `.db` **in place, mid-
+transaction, before COMMIT**, so "unchanged mtime" around a read does not
+prove the pages were quiescent while you read them.
+
+**The sound cheap check is a double-check of two things sqlite itself
+maintains:**
+
+1. `F_GETLK` on sqlite's RESERVED/PENDING byte range — "is a write
+   transaction in flight right now?" Non-blocking, one fcntl.
+2. The header **change counter** (4 bytes, offset 24) — bumped by every
+   committing rollback-journal write transaction.
+
+Protocol per fall-through statement: GETLK (no writer) → read counter C₁ →
+read the base pages the statement needs → read counter C₂ + GETLK again. If
+both GETLKs saw no writer and C₁ = C₂, the read is consistent: an in-flight
+writer at any point during the read is caught by a GETLK (it must hold
+RESERVED before dirtying a byte), and a writer that started AND committed
+entirely between the checks is caught by the counter. Either check failing →
+retry once, then treat as divergence (below). Cost: two fcntls + two 16-byte
+preads per *statement* (not per page) — single-digit µs, amortizable further
+by validating once per read-batch. mtime serves as a free pre-filter in front
+of it (mtime unchanged → still run the check; mtime changed → skip straight
+to divergence handling), never as the check itself.
+
+Divergence detected (counter moved vs the overlay's parent BaseStamp): the
+fall-through pauses, the mirror reconcile runs (§2's re-lock path), and
+OPTIMISTIC resumes on the new stamp. mpedb writes continue into the overlay
+throughout — only fall-through waits.
+
+So the honest mode ladder: **LOCKED** = zero validation, sqlite writers see
+BUSY. **OPTIMISTIC** = no lock held, sqlite writers free, fall-through pays
+~µs per statement and self-heals through reconcile. The default stays LOCKED
+(an invariant beats a protocol), OPTIMISTIC is opt-in per attachment.
+
+WAL-mode bases break OPTIMISTIC's two primitives (writers live in `-wal`,
+their locks in `-shm`, the main-file counter only moves on checkpoint) — a
+WAL-mode base in OPTIMISTIC is refused by name in v2; §9 Q5.
+
+### UNLOCKED-OFFLINE (cooperative window): let sqlite tools write, then reconcile
 
 `mpedb release` (API/CLI) drops the SHARED lock after a checkpoint, leaving
-the base fully owned by whoever wants it. While unlocked, mpedb may continue
-serving **overlay-only** operations, but every fall-through read is refused
-(`BaseUnlocked` error) — serving possibly-moving base bytes would be a wrong
-answer waiting to happen, and callers chose this window on purpose.
+the base fully owned by whoever wants it. While offline-unlocked, mpedb may
+continue serving **overlay-only** operations, but every fall-through read is
+refused (`BaseUnlocked` error) — the caller chose a window with no
+validation at all, and serving possibly-moving base bytes would be a wrong
+answer waiting to happen. (OPTIMISTIC above is the "unlocked but validated"
+middle; this mode exists for bulk foreign rewrites where even µs checks and
+reconcile churn are unwanted.)
 
 Re-lock validates a **BaseStamp** captured at release:
 
@@ -202,3 +250,12 @@ owner-validated stamp.
   fcntl locks does not respect SHARED) — BaseStamp re-validation on every
   re-lock catches it after the fact; is a periodic in-LOCKED stamp audit
   (cheap: one header read) worth the syscall?
+- **Q5**: OPTIMISTIC over WAL-mode bases needs `-shm` lock inspection and a
+  WAL-tail stamp instead of the change counter (which only moves on
+  checkpoint there). Worth building, or is "checkpoint your base to
+  journal_mode=DELETE first" an acceptable permanent answer for this mode?
+- **Q6**: OPTIMISTIC's GETLK+counter double-check needs an adversarial pass
+  of its own against sqlite's exact lock/flush ordering (when precisely does
+  page 1 with the counter hit the file relative to other pages and the
+  RESERVED→EXCLUSIVE ladder?) — the §2 argument sketches it; the review must
+  ground it in sqlite's documented sequence before v2 ships the mode.
