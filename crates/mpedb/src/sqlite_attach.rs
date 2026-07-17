@@ -143,6 +143,7 @@ impl SqliteAttach {
                         columns: cols,
                         primary_key: vec![ipk as u16],
                         indexes: vec![],
+                        dead: false,
                     },
                 )
             } else if t.without_rowid {
@@ -182,6 +183,7 @@ impl SqliteAttach {
                         columns: cols,
                         primary_key: vec![i as u16],
                         indexes: vec![],
+                        dead: false,
                     },
                 )
             } else {
@@ -203,6 +205,7 @@ impl SqliteAttach {
                         columns: cols,
                         primary_key: vec![pk as u16],
                         indexes: vec![],
+                        dead: false,
                     },
                 )
             };

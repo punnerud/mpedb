@@ -461,6 +461,7 @@ impl Database {
             columns,
             primary_key,
             indexes,
+            dead: false,
         };
         let mut w = self.engine.begin_write()?;
         match w.create_table(def) {
@@ -1584,6 +1585,7 @@ primary_key = ["id"]
             }],
             primary_key: vec![0],
             indexes: vec![],
+            dead: false,
         }])
         .unwrap();
         let foreign = mpedb_sql::prepare("SELECT * FROM users WHERE id = $1", &other_schema).unwrap();
@@ -1892,6 +1894,7 @@ primary_key = ["id"]
             }],
             primary_key: vec![0],
             indexes: vec![],
+            dead: false,
         }])
         .unwrap();
         let foreign = mpedb_sql::prepare(sql, &foreign_schema).unwrap();

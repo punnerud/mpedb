@@ -58,6 +58,28 @@ pub struct TableDef {
     /// entries; hand-built `TableDef`s normally leave it empty and let
     /// `Schema::new` derive.
     pub indexes: Vec<IndexDef>,
+    /// TOMBSTONE marker (#47 stage 4, DROP TABLE). A dead slot keeps its `id`
+    /// so `position == id` stays dense (no gap in `Schema::tables`), but holds
+    /// no data: empty `name`, `columns`, `primary_key`, `indexes`. Its id is
+    /// NEVER reused, so `tables.len()` is a monotone id high-water and every
+    /// persisted `table_id` referencing a dropped table stays inert. `validate`
+    /// skips the shape rules for a dead slot and enforces it IS empty.
+    pub dead: bool,
+}
+
+impl TableDef {
+    /// The tombstone that replaces a dropped table's slot (#47 stage 4). Keeps
+    /// the id, frees the name for re-CREATE, holds no data.
+    pub fn tombstone(id: u32) -> TableDef {
+        TableDef {
+            id,
+            name: String::new(),
+            columns: Vec::new(),
+            primary_key: Vec::new(),
+            indexes: Vec::new(),
+            dead: true,
+        }
+    }
 }
 
 impl TableDef {
@@ -160,7 +182,16 @@ impl Schema {
     /// dense), and the vec stays id-sorted (creation order). Flags normalize
     /// and indexes derive exactly as at seed.
     pub fn with_added_table(&self, mut def: TableDef) -> Result<Schema> {
+        // `tables.len()` (live + dead) is the monotone id high-water: dead
+        // slots are never removed, so a new table's id is never a reused one.
+        // Fail closed at the bitmap ceiling (footprint/CDC index by raw id).
+        if self.tables.len() >= MAX_TABLES {
+            return Err(Error::Schema(
+                "table-id space exhausted (MAX_TABLES lifetime creates); rebuild required".into(),
+            ));
+        }
         def.id = self.tables.len() as u32;
+        def.dead = false;
         normalize_and_derive(&mut def);
         let mut tables = self.tables.clone();
         tables.push(def);
@@ -169,40 +200,77 @@ impl Schema {
         Ok(schema)
     }
 
+    /// Evolve this schema by DROPPING one table (#47 stage 4). The slot is
+    /// replaced with a tombstone in place — the id is retired, never reused,
+    /// `position == id` and every other table's id/data are untouched.
+    pub fn with_dropped_table(&self, id: u32) -> Result<Schema> {
+        let mut tables = self.tables.clone();
+        let slot = tables
+            .get_mut(id as usize)
+            .filter(|t| t.id == id && !t.dead)
+            .ok_or_else(|| Error::Schema(format!("no live table with id {id} to drop")))?;
+        *slot = TableDef::tombstone(id);
+        let schema = Schema { tables };
+        schema.validate()?;
+        Ok(schema)
+    }
+
+    /// Live (non-tombstone) tables — the user-visible set.
+    pub fn live_tables(&self) -> impl Iterator<Item = &TableDef> {
+        self.tables.iter().filter(|t| !t.dead)
+    }
+
     fn validate(&self) -> Result<()> {
-        if self.tables.is_empty() {
-            return Err(Error::Schema("schema defines no tables".into()));
+        // LIVE tables must exist (a schema of only tombstones is meaningless);
+        // the LIVE count carries the system-table headroom guard. The total
+        // (live + dead) is bounded by MAX_TABLES — dead slots hold an id.
+        let live = self.tables.iter().filter(|t| !t.dead).count();
+        if live == 0 {
+            return Err(Error::Schema("schema defines no live tables".into()));
         }
-        if self.tables.len() > MAX_TABLES - 8 {
+        if live > MAX_TABLES - 8 {
             return Err(Error::Schema(format!(
-                "too many tables ({} > {})",
-                self.tables.len(),
+                "too many tables ({live} > {})",
                 MAX_TABLES - 8 // headroom for system tables
             )));
         }
-        // Set-based, NOT `windows(2)` on the vec: the vec is id-sorted, and
-        // once CREATE TABLE appends out of name order, adjacency would stop
-        // detecting non-adjacent duplicates (adversarial-review finding).
-        let mut names: Vec<&str> = self.tables.iter().map(|t| t.name.as_str()).collect();
+        if self.tables.len() > MAX_TABLES {
+            return Err(Error::Schema("table-id space exhausted".into()));
+        }
+        // Duplicate LIVE names (dead slots have empty names, excluded). Set-
+        // based, NOT windows(2): the vec is id-sorted, not name-sorted.
+        let mut names: Vec<&str> = self.tables.iter().filter(|t| !t.dead).map(|t| t.name.as_str()).collect();
         names.sort_unstable();
         if names.windows(2).any(|w| w[0] == w[1]) {
             return Err(Error::Schema("duplicate table name".into()));
         }
-        // DENSE ids in this format window (DESIGN-SCHEMA-V2 §1.2): position
-        // == id is an ENFORCED invariant, so every positional site in the
-        // engine stays provably correct. DROP TABLE's PR relaxes this after
-        // the positional audit — a gapped file must refuse here rather than
-        // silently mis-decode rows through the wrong table's column types.
+        // DENSE ids: position == id is ENFORCED so every positional engine
+        // site stays correct. A DROP tombstones IN PLACE (keeps the slot), so
+        // this holds under drops too — a genuinely gapped vec is corrupt.
         for (pos, t) in self.tables.iter().enumerate() {
             if t.id != pos as u32 {
                 return Err(Error::Schema(format!(
-                    "table `{}` has id {} at position {pos}: ids must be dense 0..n \
-                     in this format window",
+                    "table `{}` has id {} at position {pos}: ids must be dense 0..n",
                     t.name, t.id
                 )));
             }
         }
         for t in &self.tables {
+            // A tombstone holds no data: it MUST be empty, and its shape rules
+            // are skipped (it has no name/columns/pk to validate).
+            if t.dead {
+                if !t.name.is_empty()
+                    || !t.columns.is_empty()
+                    || !t.primary_key.is_empty()
+                    || !t.indexes.is_empty()
+                {
+                    return Err(Error::Schema(format!(
+                        "tombstone slot id {} must be empty (no name/columns/pk/indexes)",
+                        t.id
+                    )));
+                }
+                continue;
+            }
             if !valid_identifier(&t.name) {
                 return Err(Error::Schema(format!("invalid table name `{}`", t.name)));
             }
@@ -393,10 +461,11 @@ impl Schema {
     /// and decode reconstructs the in-memory convenience flags from it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-        buf.push(2u8); // schema encoding version
+        buf.push(3u8); // schema encoding version (v3: TableDef.dead, #47 stage 4)
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             buf.extend_from_slice(&t.id.to_le_bytes());
+            buf.push(t.dead as u8); // tombstone marker; a dead slot's rest is empty
             write_str(&mut buf, &t.name);
             buf.extend_from_slice(&(t.columns.len() as u16).to_le_bytes());
             for c in &t.columns {
@@ -437,16 +506,16 @@ impl Schema {
 
     /// Parse [`canonical_bytes`] output (bounds-checked; used when attaching
     /// to an existing database to recover its schema from the catalog). Only
-    /// version 2 is accepted — v1 files refuse loudly and are regenerated
+    /// version 3 is accepted — older files refuse loudly and are regenerated
     /// (DESIGN-SCHEMA-V2 §5; the project carries no migration burden).
     pub fn from_canonical_bytes(buf: &[u8]) -> Result<Schema> {
         let err = || Error::Corrupt("truncated schema".into());
         let mut pos = 0usize;
         let version = *buf.get(pos).ok_or_else(err)?;
         pos += 1;
-        if version != 2 {
+        if version != 3 {
             return Err(Error::Corrupt(format!(
-                "unknown schema version {version} (v1 files predate canonical-bytes v2 — \
+                "unknown schema version {version} (v1/v2 predate canonical-bytes v3 — \
                  regenerate or re-import)"
             )));
         }
@@ -457,6 +526,12 @@ impl Schema {
         let mut tables = Vec::with_capacity(ntables);
         for _ in 0..ntables {
             let id = read_u32(buf, &mut pos)?;
+            let dead = match *buf.get(pos).ok_or_else(err)? {
+                0 => false,
+                1 => true,
+                _ => return Err(Error::Corrupt("bad table dead flag".into())),
+            };
+            pos += 1;
             let name = read_str(buf, &mut pos)?;
             let ncols = read_u16(buf, &mut pos)? as usize;
             if ncols > MAX_COLUMNS {
@@ -557,6 +632,7 @@ impl Schema {
                 columns,
                 primary_key,
                 indexes,
+                dead,
             });
         }
         if pos != buf.len() {
@@ -651,6 +727,7 @@ mod tests {
             ],
             primary_key: vec![0],
             indexes: vec![],
+            dead: false,
         }])
         .unwrap()
     }
@@ -683,6 +760,7 @@ mod tests {
                         }],
                         primary_key: vec![0],
                         indexes: vec![],
+                        dead: false,
                     })
                     .collect(),
             )
@@ -709,6 +787,7 @@ mod tests {
             }],
             primary_key: vec![0],
             indexes: vec![],
+            dead: false,
         }]);
         assert!(bad.is_err());
         // reserved prefix
@@ -726,6 +805,7 @@ mod tests {
             }],
             primary_key: vec![0],
             indexes: vec![],
+            dead: false,
         }]);
         assert!(bad.is_err());
     }
@@ -743,7 +823,7 @@ mod tests {
         let col = |n: &str| ColumnDef { name: n.into(), ty: ColumnType::Int64,
             nullable: false, unique: false, indexed: false, default: None, check: None };
         let tbl = |n: &str| TableDef { id: 0, name: n.into(), columns: vec![col("id")],
-            primary_key: vec![0], indexes: vec![] };
+            primary_key: vec![0], indexes: vec![], dead: false };
 
         let s = Schema::new(vec![tbl("orders"), tbl("users"), tbl("accounts")]).unwrap();
         let got: Vec<(&str, u32)> =
@@ -778,6 +858,7 @@ mod tests {
             ],
             primary_key: vec![0],
             indexes: vec![IndexDef { columns: vec![1, 2], unique: false }],
+            dead: false,
         };
         // The single-PK column's flags are noise and must normalize away.
         t.columns[0].unique = true;
@@ -817,6 +898,7 @@ mod tests {
             ],
             primary_key: vec![0],
             indexes: vec![IndexDef { columns: vec![2], unique: false }],
+            dead: false,
         }])
         .unwrap();
 
@@ -851,5 +933,104 @@ mod tests {
         for i in 0..bytes.len() {
             assert!(Schema::from_canonical_bytes(&bytes[..i]).is_err(), "offset {i}");
         }
+    }
+
+    fn tbl(n: &str) -> TableDef {
+        let col = |n: &str| ColumnDef {
+            name: n.into(), ty: ColumnType::Int64, nullable: false,
+            unique: false, indexed: false, default: None, check: None,
+        };
+        TableDef { id: 0, name: n.into(), columns: vec![col("id")],
+            primary_key: vec![0], indexes: vec![], dead: false }
+    }
+
+    #[test]
+    fn drop_tombstones_in_place_and_never_reuses_the_id() {
+        // Seed {a,b,c} → ids {0,1,2} (name-sorted).
+        let s = Schema::new(vec![tbl("a"), tbl("b"), tbl("c")]).unwrap();
+        assert_eq!(s.table_id("b"), Some(1));
+
+        // Drop the MIDDLE table (id 1). The slot is tombstoned in place:
+        // position == id still holds, `b` is gone, `a`/`c` untouched.
+        let s = s.with_dropped_table(1).unwrap();
+        assert_eq!(s.tables.len(), 3, "vec does not shrink — dead slot stays");
+        assert!(s.tables[1].dead && s.tables[1].name.is_empty());
+        assert_eq!(s.table_id("b"), None, "dropped name no longer resolves");
+        assert_eq!(s.table_id("a"), Some(0));
+        assert_eq!(s.table_id("c"), Some(2));
+        assert_eq!(s.live_tables().count(), 2);
+        // Every slot's id equals its position (dense, dead included).
+        for (pos, t) in s.tables.iter().enumerate() {
+            assert_eq!(t.id, pos as u32);
+        }
+
+        // A new table takes the NEXT id (3 = tables.len()), NEVER the dropped
+        // id 1 — the no-reuse guarantee, from the materialized dead slot.
+        let s = s.with_added_table(tbl("d")).unwrap();
+        assert_eq!(s.table_id("d"), Some(3));
+        assert_eq!(s.tables.len(), 4);
+
+        // Re-CREATE the dropped NAME: gets a fresh id (4), not the old 1.
+        let s = s.with_added_table(tbl("b")).unwrap();
+        assert_eq!(s.table_id("b"), Some(4));
+
+        // Drop the HIGHEST id (4) — len unchanged, so the next mint is still
+        // 5, not the just-freed 4.
+        let s = s.with_dropped_table(4).unwrap();
+        assert_eq!(s.tables.len(), 5);
+        let s = s.with_added_table(tbl("e")).unwrap();
+        assert_eq!(s.table_id("e"), Some(5));
+    }
+
+    #[test]
+    fn tombstoned_schema_round_trips_through_v3_bytes() {
+        let s = Schema::new(vec![tbl("a"), tbl("b"), tbl("c")]).unwrap();
+        let s = s.with_dropped_table(1).unwrap(); // dead slot at 1
+        let s = s.with_added_table(tbl("z")).unwrap(); // id 3
+        let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
+        assert_eq!(s, r, "dead slot + ids survive the wire byte-for-byte");
+        assert_eq!(s.hash(), r.hash());
+        // The version byte is 3.
+        assert_eq!(s.canonical_bytes()[0], 3);
+        // A v2 file refuses cleanly (no misread of the new dead flag).
+        let mut v2 = s.canonical_bytes();
+        v2[0] = 2;
+        let err = Schema::from_canonical_bytes(&v2).unwrap_err();
+        assert!(format!("{err}").contains("unknown schema version 2"), "{err}");
+    }
+
+    #[test]
+    fn hostile_tombstone_bytes_refuse() {
+        // A "dead" slot that carries content is corrupt.
+        let s = Schema::new(vec![tbl("a"), tbl("b")]).unwrap();
+        let mut evil = s.with_dropped_table(1).unwrap();
+        evil.tables[1].dead = true;
+        evil.tables[1].name = "ghost".into(); // a dead slot must be empty
+        let err = Schema::from_canonical_bytes(&evil.canonical_bytes()).unwrap_err();
+        assert!(format!("{err}").contains("tombstone"), "{err}");
+        // An all-tombstone schema (no live table) refuses.
+        let mut none = Schema::new(vec![tbl("a")]).unwrap();
+        none.tables[0] = TableDef::tombstone(0);
+        assert!(Schema::from_canonical_bytes(&none.canonical_bytes()).is_err());
+    }
+
+    #[test]
+    fn create_refuses_at_the_id_ceiling() {
+        // Fill to MAX_TABLES with live + dead slots; the next create fails
+        // closed rather than minting id >= 64 (the bitmap ceiling).
+        let mut tables: Vec<TableDef> = (0..MAX_TABLES - 8).map(|i| tbl(&format!("t{i}"))).collect();
+        let mut s = Schema::new(std::mem::take(&mut tables)).unwrap();
+        // Drop-and-recreate to burn ids up to the ceiling without exceeding
+        // the live-count guard.
+        while s.tables.len() < MAX_TABLES {
+            let id = s.tables.iter().rposition(|t| !t.dead).unwrap() as u32;
+            s = s.with_dropped_table(id).unwrap();
+            if s.tables.len() < MAX_TABLES {
+                s = s.with_added_table(tbl(&format!("r{}", s.tables.len()))).unwrap();
+            }
+        }
+        assert_eq!(s.tables.len(), MAX_TABLES);
+        let err = s.with_added_table(tbl("overflow")).unwrap_err();
+        assert!(format!("{err}").contains("exhausted"), "{err}");
     }
 }

@@ -298,6 +298,7 @@ pub fn to_table_def(src: &SourceTable) -> Result<TableDef> {
         columns,
         primary_key,
         indexes: vec![],
+        dead: false,
     })
 }
 

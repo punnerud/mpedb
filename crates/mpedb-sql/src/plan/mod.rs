@@ -89,6 +89,7 @@ pub fn dual_def() -> &'static mpedb_types::TableDef {
         columns: Vec::new(),
         primary_key: Vec::new(),
         indexes: Vec::new(),
+        dead: false,
     })
 }
 

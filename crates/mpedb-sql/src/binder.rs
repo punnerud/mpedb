@@ -1345,6 +1345,7 @@ mod tests {
             ],
             primary_key: vec![0],
             indexes: vec![],
+            dead: false,
         }
     }
 
@@ -1634,6 +1635,7 @@ mod tests {
             }],
             primary_key: vec![0],
             indexes: vec![],
+            dead: false,
         };
         let sc = Scope {
             names: vec![a.name.clone(), b.name.clone()],
@@ -1673,6 +1675,7 @@ mod tests {
             }],
             primary_key: vec![0],
             indexes: vec![],
+            dead: false,
         };
         let sc = Scope {
             names: vec![a.name.clone(), b.name.clone()],
