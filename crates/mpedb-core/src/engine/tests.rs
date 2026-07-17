@@ -1321,3 +1321,90 @@ primary_key = ["id"]
     r.finish().unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+/// DESIGN-SCHEMA-V2: a composite `[[table.index]]` is maintained by the
+/// k-column generalization — inserts/updates/deletes keep the tree exact
+/// (a key mismatch would fire the missing-index-entry Corrupt), the
+/// any-NULL membership rule skips entries, and a composite UNIQUE enforces
+/// over the column SET. The verifier proves the trees stay accounted.
+#[test]
+fn composite_indexes_are_maintained_and_unique_enforces() {
+    let path = std::path::PathBuf::from(format!(
+        "/dev/shm/mpedb-core-composite-{}.mpedb",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        r#"
+[database]
+path = "{}"
+size_mb = 8
+max_readers = 8
+
+[[table]]
+name = "t"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+
+  [[table.column]]
+  name = "a"
+  type = "int64"
+
+  [[table.column]]
+  name = "b"
+  type = "text"
+
+  [[table.column]]
+  name = "c"
+  type = "int64"
+
+  [[table.index]]
+  columns = ["a", "b"]
+
+  [[table.index]]
+  columns = ["b", "c"]
+  unique = true
+"#,
+        path.display()
+    );
+    let cfg = Config::from_toml_str(&toml).unwrap();
+    assert_eq!(cfg.schema.tables[0].indexes.len(), 2);
+    let eng = Engine::open(&cfg, vec![vec![]; 1]).unwrap();
+    let row = |id: i64, a: Option<i64>, b: Option<&str>, c: Option<i64>| {
+        vec![
+            Value::Int(id),
+            a.map_or(Value::Null, Value::Int),
+            b.map_or(Value::Null, |s| Value::Text(s.into())),
+            c.map_or(Value::Null, Value::Int),
+        ]
+    };
+    let mut w = eng.begin_write().unwrap();
+    w.insert_row(0, &row(1, Some(1), Some("x"), Some(1))).unwrap();
+    // Non-unique composite (a, b): a duplicate (1, "x") is fine — the unique
+    // (b, c) stays distinct (("x", 1) vs ("x", 2)).
+    w.insert_row(0, &row(2, Some(1), Some("x"), Some(2))).unwrap();
+    // Any-NULL: no entries in either tree, never a unique conflict.
+    w.insert_row(0, &row(3, None, Some("x"), None)).unwrap();
+    w.insert_row(0, &row(4, None, Some("x"), None)).unwrap();
+    w.commit().unwrap();
+
+    // Composite UNIQUE (b, c): another ("x", 1) must refuse, naming both.
+    let mut w = eng.begin_write().unwrap();
+    let err = w.insert_row(0, &row(5, Some(9), Some("x"), Some(1))).unwrap_err();
+    assert!(format!("{err}").contains("b, c"), "{err}");
+    w.abort();
+
+    // Update moving a member value re-keys both trees exactly; delete then
+    // removes every entry (a stale key would fire the Corrupt guard).
+    let mut w = eng.begin_write().unwrap();
+    w.update_by_pk(0, &row(1, Some(2), Some("x"), Some(7))).unwrap();
+    assert!(w.delete_by_pk(0, &[Value::Int(1)]).unwrap());
+    assert!(w.delete_by_pk(0, &[Value::Int(3)]).unwrap());
+    w.commit().unwrap();
+    eng.verify_page_accounting().unwrap();
+    drop(eng);
+    let _ = std::fs::remove_file(&path);
+}

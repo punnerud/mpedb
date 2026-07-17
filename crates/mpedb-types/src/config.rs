@@ -203,6 +203,20 @@ struct RawTable {
     require_policy: bool,
     #[serde(rename = "column")]
     columns: Vec<RawColumn>,
+    /// Explicit (possibly composite) secondary indexes — `[[table.index]]`.
+    /// Appended after the flag-derived single-column ones by `Schema::new`;
+    /// declaration order is significant (it is the index numbering).
+    #[serde(default, rename = "index")]
+    indexes: Vec<RawIndex>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawIndex {
+    /// Column NAMES in key order.
+    columns: Vec<String>,
+    #[serde(default)]
+    unique: bool,
 }
 
 #[derive(Deserialize)]
@@ -332,14 +346,38 @@ fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>) -> Result<Config> {
             if t.require_policy {
                 require_policy.insert(t.name.clone());
             }
+            let indexes = t
+                .indexes
+                .iter()
+                .map(|ix| {
+                    let cols = ix
+                        .columns
+                        .iter()
+                        .map(|name| {
+                            columns
+                                .iter()
+                                .position(|c| &c.name == name)
+                                .map(|i| i as u16)
+                                .ok_or_else(|| {
+                                    Error::Config(format!(
+                                        "index column `{name}` not found in table `{}`",
+                                        t.name
+                                    ))
+                                })
+                        })
+                        .collect::<Result<Vec<u16>>>()?;
+                    Ok(crate::schema::IndexDef { columns: cols, unique: ix.unique })
+                })
+                .collect::<Result<Vec<_>>>()?;
             tables.push(TableDef {
                 // Assigned by Schema::new (dense, name-sorted); the flags
-                // above are the index sugar it derives from.
+                // above are the single-column index sugar it derives from,
+                // and these explicit entries append after the derived ones.
                 id: 0,
                 name: t.name,
                 columns,
                 primary_key,
-                indexes: Vec::new(),
+                indexes,
             });
         }
 
