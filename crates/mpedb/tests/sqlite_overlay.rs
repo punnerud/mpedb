@@ -3,7 +3,7 @@
 //! file, plus the LOCKED-mode contract (a foreign sqlite writer gets
 //! SQLITE_BUSY while the overlay is open) and the divergence refusal.
 
-use mpedb::{LockMode, SqliteOverlay, Value};
+use mpedb::{LockMode, ReconcilePolicy, SqliteOverlay, Value};
 use rusqlite::Connection;
 
 fn setup(tag: &str) -> std::path::PathBuf {
@@ -153,6 +153,73 @@ fn deltas_survive_reopen_and_divergence_is_refused() {
     };
     let msg = format!("{err}");
     assert!(msg.contains("changed since"), "{msg}");
+
+    let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn reconcile_resolves_conflicts_by_named_policy() {
+    let p = setup("reconcile");
+    // Session 1 (LOCKED): three deltas — update, insert, delete — plus a
+    // second update to the same PK (the FIRST capture must be what survives).
+    {
+        let mut ovl = SqliteOverlay::open(&p).unwrap();
+        ovl.query("UPDATE users SET name = 'vaar' WHERE id = 10", &[]).unwrap();
+        ovl.query("UPDATE users SET age = 1 WHERE id = 10", &[]).unwrap();
+        ovl.query("INSERT INTO users (id, name, age) VALUES (100, 'ny', 1)", &[]).unwrap();
+        ovl.query("DELETE FROM users WHERE id = 20", &[]).unwrap();
+    }
+    // Foreign writer: touches id=10 (CONFLICT with our update) and id=30
+    // (no delta of ours — not a conflict at all).
+    {
+        let c = Connection::open(&p).unwrap();
+        c.execute("UPDATE users SET name = 'deres' WHERE id = 10", []).unwrap();
+        c.execute("UPDATE users SET name = 'ren-fremmed' WHERE id = 30", []).unwrap();
+    }
+    // Plain open still refuses by name.
+    let Err(err) = SqliteOverlay::open(&p) else {
+        panic!("divergence with unpushed deltas must refuse without a policy");
+    };
+    assert!(format!("{err}").contains("reconcile"), "{err}");
+
+    // THEIRS: the conflicted delta drops; the provably-untouched two stay.
+    {
+        let mut ovl =
+            SqliteOverlay::open_with_options(&p, LockMode::Locked, Some(ReconcilePolicy::Theirs))
+                .unwrap();
+        let got = rows(ovl.query("SELECT name FROM users WHERE id = 10", &[]).unwrap());
+        assert_eq!(got, vec![vec![Value::Text("deres".into())]], "theirs won id=10");
+        let got = rows(ovl.query("SELECT name FROM users WHERE id = 30", &[]).unwrap());
+        assert_eq!(got, vec![vec![Value::Text("ren-fremmed".into())]]);
+        let got = rows(ovl.query("SELECT name FROM users WHERE id = 100", &[]).unwrap());
+        assert_eq!(got, vec![vec![Value::Text("ny".into())]], "our insert survived");
+        let got = rows(ovl.query("SELECT count(*) FROM users WHERE id = 20", &[]).unwrap());
+        assert_eq!(got, vec![vec![Value::Int(0)]], "our tombstone survived");
+    }
+
+    // OURS, fresh scenario on the same base: conflict again, keep ours,
+    // checkpoint — OUR value lands in the base over theirs.
+    {
+        let mut ovl = SqliteOverlay::open(&p).unwrap();
+        ovl.query("UPDATE users SET name = 'vaar2' WHERE id = 11", &[]).unwrap();
+    }
+    {
+        let c = Connection::open(&p).unwrap();
+        c.execute("UPDATE users SET name = 'deres2' WHERE id = 11", []).unwrap();
+    }
+    {
+        let mut ovl =
+            SqliteOverlay::open_with_options(&p, LockMode::Locked, Some(ReconcilePolicy::Ours))
+                .unwrap();
+        let got = rows(ovl.query("SELECT name FROM users WHERE id = 11", &[]).unwrap());
+        assert_eq!(got, vec![vec![Value::Text("vaar2".into())]], "ours kept");
+        // A reconciled handle checkpoints normally (feature-gated builds
+        // exercise this in the checkpoint suite; here we just verify the
+        // handle serves).
+        let got = rows(ovl.query("SELECT count(*) FROM users", &[]).unwrap());
+        assert_eq!(got, vec![vec![Value::Int(100)]]);
+    }
 
     let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));
     let _ = std::fs::remove_file(&p);

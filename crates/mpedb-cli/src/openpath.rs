@@ -87,6 +87,22 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
     } else {
         mpedb::LockMode::Locked
     };
+    // `--reconcile ours|theirs`: when the base moved under unpushed deltas,
+    // resolve per-PK conflicts by this policy at open instead of refusing.
+    let reconcile = if let Some(i) = rest.iter().position(|a| a == "--reconcile") {
+        if i + 1 >= rest.len() {
+            return usage("--reconcile needs a value: ours|theirs");
+        }
+        let m = rest.remove(i + 1);
+        rest.remove(i);
+        match m.as_str() {
+            "ours" => Some(mpedb::ReconcilePolicy::Ours),
+            "theirs" => Some(mpedb::ReconcilePolicy::Theirs),
+            other => return usage(format!("unknown --reconcile `{other}`: ours|theirs")),
+        }
+    } else {
+        None
+    };
     let rest = rest.as_slice();
     if direct {
         if !is_sqlite(p) {
@@ -98,7 +114,7 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
         if !is_sqlite(p) {
             return runtime(format!("--overlay needs a sqlite file, {path} is not one"));
         }
-        return run_overlay(p, mode, rest);
+        return run_overlay(p, mode, reconcile, rest);
     }
     let target = if is_sqlite(p) {
         let side = sidecar(p);
@@ -149,8 +165,13 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
 
 /// `mpedb data.db --overlay ['SQL' ...]` — the v2 delta overlay: read-write,
 /// zero-copy, deltas + tombstones beside the base, checkpoint on demand.
-fn run_overlay(p: &Path, mode: mpedb::LockMode, rest: &[String]) -> CliResult {
-    let mut ovl = mpedb::SqliteOverlay::open_with_mode(p, mode)?;
+fn run_overlay(
+    p: &Path,
+    mode: mpedb::LockMode,
+    reconcile: Option<mpedb::ReconcilePolicy>,
+    rest: &[String],
+) -> CliResult {
+    let mut ovl = mpedb::SqliteOverlay::open_with_options(p, mode, reconcile)?;
     match rest {
         [sql, params @ ..] => {
             let vals: Vec<mpedb::Value> = params.iter().map(|s| parse_param(s)).collect();
@@ -178,6 +199,24 @@ fn run_overlay(p: &Path, mode: mpedb::LockMode, rest: &[String]) -> CliResult {
                         Ok(r) => println!(
                             "checkpoint: epoch {} pushed ({} upserts, {} deletes), overlay emptied",
                             r.epoch, r.upserts, r.deletes
+                        ),
+                        Err(e) => eprintln!("error: {e}"),
+                    }
+                    continue;
+                }
+                if let Some(pol) = stmt.strip_prefix(".reconcile") {
+                    let pol = match pol.trim() {
+                        "ours" => mpedb::ReconcilePolicy::Ours,
+                        "theirs" => mpedb::ReconcilePolicy::Theirs,
+                        other => {
+                            eprintln!("usage: .reconcile ours|theirs (got `{other}`)");
+                            continue;
+                        }
+                    };
+                    match ovl.reconcile(pol) {
+                        Ok(r) => println!(
+                            "reconcile: {} unchanged, {} ours-kept, {} theirs-dropped",
+                            r.unchanged, r.ours, r.theirs
                         ),
                         Err(e) => eprintln!("error: {e}"),
                     }

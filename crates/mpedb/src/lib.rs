@@ -59,7 +59,7 @@ mod workspace;
 pub use session::Session;
 pub use shard::ShardSet;
 pub use sqlite_attach::SqliteAttach;
-pub use sqlite_overlay::{LockMode, SqliteOverlay};
+pub use sqlite_overlay::{LockMode, ReconcilePolicy, ReconcileReport, SqliteOverlay};
 #[cfg(feature = "sqlite-checkpoint")]
 pub use sqlite_overlay::CheckpointReport;
 pub use stream::RowStream;
