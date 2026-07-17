@@ -1,286 +1,289 @@
 # DESIGN-SQLITE-BACKED: the .db as home, the .mpedb as its delta-"WAL"
 
-Status: **v0.1 draft — for adversarial review before any code** (the
-checkpoint protocol spans two files and is commit-path class). Task #69.
+Status: **v0.2 — the 20-finding adversarial review of v0.1 is folded in**
+([R#n] marks a finding's fix; the review grounded its CONFIRMED findings in
+sqlite.org/lockingv3, fileformat2, walformat, howtocorrupt, pragma). Still a
+design, not code — but the load-bearing mechanisms below are the reviewed
+ones, and building anything contradicting them re-opens a named finding.
+Task #69.
 
 The idea (Morten, 2026-07-17): work directly against a sqlite `.db` as the
 durable, canonical home — every sqlite tool can open it — while mpedb provides
 the hot path: `.mpedb` is a **delta overlay** playing the role a WAL plays for
 a database. All writes and all MVCC/multi-process reads go through the
 overlay; untouched data falls through to the base; a **checkpoint** pushes the
-deltas into the `.db` and then empties the overlay, exactly like a WAL
-checkpoint. Default: mpedb **holds a lock on the base**, so the fast path
-never has to ask whether the base moved; unlocking is a deliberate,
-detectable, cooperative act.
+deltas into the `.db` and then empties the overlay. Default: mpedb holds
+sqlite's own SHARED lock on the base, so the fast path never has to ask
+whether the base moved; unlocking is deliberate, detectable, and reconciled.
 
 ## 0. Honest scope (read first)
 
 - **This is not sqlite reimplemented.** mpedb never executes sqlite's write
   protocol. Writes reach the `.db` only through the checkpoint's one sqlite
   transaction (via the sqlite library, as `mirror push` already does).
+- **Rollback-journal bases only.** A WAL-mode base defeats the entire lock
+  model — [R#6]: WAL writers hold only SHARED on the main file (their write
+  locks live in `-shm`), so a held SHARED blocks *nothing*, and a WAL
+  checkpointer rewrites the main file *under* SHARED. Detection is by fact,
+  not assumption: header bytes 18/19 (read/write version; 2 = WAL) are
+  checked at open, at every re-lock, and inside every OPTIMISTIC bracket;
+  WAL → refuse with the fix in the message (`PRAGMA journal_mode=DELETE`).
+  While a SHARED is *held* the mode cannot flip (the transition requires
+  EXCLUSIVE); in unlocked windows it can, hence the per-bracket check.
 - **sqlite readers see the last checkpoint**, never un-checkpointed overlay
-  deltas. That is inherent to the metaphor — a sqlite reader of a *different
-  process's* WAL-before-checkpoint sees the same staleness class. Anyone
-  needing fresher reads uses mpedb.
-- **Simultaneous writers to both files is not a goal.** In LOCKED mode sqlite
-  writers are blocked (by sqlite's own lock discipline, so they see a normal
-  `SQLITE_BUSY`). In an UNLOCKED window sqlite writers may run; mpedb detects
-  the divergence at re-lock and reconciles through the mirror conflict
-  machinery (DESIGN-MIRROR §8) before the fast path resumes. Two live writers
-  with mutual immediate visibility would require living inside sqlite's
-  protocol — that project is called Turso.
-- The mirror subsystem (M1–M8, SIGKILL-fuzzed convergence, per-table cursors,
-  conflict taxonomy + policies, dialect handling) is the checkpoint and
-  reconcile plumbing. This design adds three genuinely new things: a sqlite
-  page **reader** (fall-through), the **read-merge** (overlay shadows base),
-  and the **two-file checkpoint lifecycle**.
+  deltas. Freshness lives in mpedb.
+- **Simultaneous writers to both files is not a goal.** LOCKED blocks foreign
+  writers via sqlite's own discipline (`SQLITE_BUSY`); unlocked windows admit
+  them and are reconciled through DESIGN-MIRROR §8 before the fast path
+  resumes. And two windows exist *uncommanded* [R#20]: the per-checkpoint
+  relock dance (§5) and an owner crash (§7) — both named, both stamped.
+- The mirror subsystem (M1–M8) is the checkpoint/reconcile plumbing. New
+  here: the sqlite page reader, the read-merge, and the two-file lifecycle.
+- The overlay inherits mirror's structural limits (≤ 56 user tables per
+  file, DESIGN-MIRROR §4.1) [R#20].
 
-## 1. Files and roles
+## 1. Files, roles, and who may create them
 
 | file | role | written by |
 |---|---|---|
-| `app.db` | base: canonical, durable, sqlite-format | the checkpoint's sqlite transaction; foreign sqlite writers only in UNLOCKED windows |
-| `app.db.mpedb` | overlay: deltas since the last checkpoint + all mpedb machinery (MVCC, reader table, plan registry) | mpedb, exactly as today |
-| `app.db.mpedb-wal` | the overlay's own WAL (durability modes unchanged) | mpedb |
+| `app.db` | base: canonical, durable, sqlite rollback-journal format | the checkpoint's sqlite transaction; foreign writers in unlocked windows |
+| `app.db.mpedb` | overlay: deltas since last checkpoint + all mpedb machinery | mpedb |
+| `app.db.mpedb-wal` | the overlay's own WAL | mpedb |
 
-The overlay is a normal mpedb database whose tables carry **delta rows**:
-upserted row images and **tombstones** (a per-table hidden `deleted` marker
-column in the overlay schema, never visible through SQL). Its schema is
-derived from the base at open (`mirror import`'s schema derivation, types via
-`ColumnType::Any` for sqlite affinity — #23.1 exists for exactly this).
+**Creation is O_EXCL 0600 and attachment is verified** [R#16]: an existing
+overlay must match the base's stored identity (dev+ino via realpath, schema
+hash) and the base's owner uid — otherwise a directory-writing attacker
+pre-plants an overlay whose fabricated deltas the victim's checkpoint would
+push into the base (directory-write → file-write escalation). Scratch files
+(granularity probe) are O_EXCL with random names.
 
-## 2. Lock modes — Morten's refinement, and why it is the load-bearing choice
+Overlay schema derives from the base at open. Types: **sniffed concrete
+types per DESIGN-MIRROR §4.5's fidelity rule, not blanket `Any`** [R#17] —
+sqlite affinity *coerces on insert*, so an `Any`-typed overlay value pushed
+into an INTEGER-affinity column comes back different, and the reconcile sees
+a divergence it caused itself (the CONF#35 anti-entropy storm mirror already
+closed). Columns that must stay loose use mirror's canonicalizer contract.
 
-### LOCKED (default): the base cannot move, so nobody checks it
+## 2. Lock modes
 
-At open, mpedb takes **sqlite's own SHARED lock** on the base (the advisory
-byte-range locks at sqlite's reserved offsets — `SHARED_FIRST`/`SHARED_SIZE`).
-Consequences, all inherited from sqlite's discipline rather than invented:
+### LOCKED (default): every attaching process holds SHARED
 
-- Foreign sqlite **readers proceed normally** (SHARED is compatible with
-  SHARED). They see the last checkpoint.
-- Foreign sqlite **writers block**: their EXCLUSIVE/PENDING acquisition
-  conflicts with our SHARED lock, so they get `SQLITE_BUSY` through their own
-  busy handler — the failure mode every sqlite program already handles.
-- **The fast path needs zero validation**: while the lock is held the base is
-  immutable, so fall-through reads carry no version check, no header read, no
-  stat. The only cost relative to a pure `.mpedb` is sqlite page decoding on
-  cold rows — hot rows live in the overlay and are read at full mpedb speed.
+**Each mpedb process takes its own sqlite SHARED lock at attach** [R#7] —
+fcntl SHARED is shareable, so this costs one fcntl per attach. The v0.1
+single-designated-owner model died in review: fcntl locks die with their
+process, so a SIGKILLed owner left every other mpedb reader raw-reading an
+unprotected base until the *next writer* happened to run recovery — an
+unbounded undetected-torn-read window. Per-process SHARED makes base
+protection survive any single death; releasing (for a cooperative window)
+becomes a coordinated act through the shm the processes already share.
 
-The lock is held by ONE designated process on behalf of the attachment (see
-§7 — the mpedb writer-lock owner), not by every reader.
+Consequences, inherited from sqlite's own discipline:
 
-### OPTIMISTIC (unlocked, validated): no lock held, µs-level checks instead
+- Foreign sqlite **readers proceed normally** — with one reviewed exception
+  [R#8]: if a foreign writer reaches RESERVED, flushes its journal, blocks
+  on our SHARED, and crashes, the journal is now *hot*, and every foreign
+  reader's mandatory rollback needs EXCLUSIVE → they get `SQLITE_BUSY` until
+  we act. mpedb therefore watches for journal appearance while LOCKED
+  (cheap stat) and mediates: drop SHARED → one `SELECT 1` through the
+  sqlite library (performs the rollback; content-wise a no-op since the
+  writer never reached EXCLUSIVE) → re-take SHARED → re-validate the stamp.
+- Foreign sqlite **writers block** with their normal `SQLITE_BUSY`.
+- **The fast path needs zero validation** while SHARED is genuinely held —
+  plus one cheap periodic stamp audit [R#20, Q4-answered]: advisory locks
+  bind sqlite tools, not `cp` or an NFS client, and the audit (one header
+  pread) is the only detection before the next re-lock.
 
-Morten's follow-up question — "can we check the last change date and trust
-it, and leave the base unlocked?" — splits into a NO and a YES:
+**Hot journal at open** [R#2]: before the first raw read — at open and at
+every re-lock — mpedb opens the base through the sqlite *library* and runs
+`SELECT 1`, forcing sqlite's own hot-journal recovery. Raw reads never run
+against a base whose journal nobody rolled back.
 
-**mtime alone is not trustworthy.** Timestamp granularity, `touch`-ability,
-clock steps, and NFS attribute caching all defeat it — and the deeper hole is
-TOCTOU: a rollback-journal writer mutates the `.db` **in place, mid-
-transaction, before COMMIT**, so "unchanged mtime" around a read does not
-prove the pages were quiescent while you read them.
+### OPTIMISTIC (no standing lock): a transient SHARED per fall-through, not a counter trick
 
-**The sound cheap check is a double-check of two things sqlite itself
-maintains:**
+v0.1 proposed GETLK + change-counter double-checks. **The review produced a
+concrete counterexample** [R#1]: a foreign writer can BEGIN, reach EXCLUSIVE
+(nothing stops it — we hold no lock), **spill dirty pages into the base
+mid-transaction** (lockingv3 documents cache spill), then ROLLBACK — journal
+playback restores every page including the counter's pre-image, all locks
+release, and both GETLKs plus the counter equality pass around a read of
+garbage. The counter also under-counts by its own definition [R#9]:
+fileformat2 says it increments "whenever the database file is **unlocked
+after having been modified**" — not per commit (a `locking_mode=EXCLUSIVE`
+session bumps once for N transactions; ROLLBACK never bumps).
 
-1. `F_GETLK` on sqlite's RESERVED/PENDING byte range — "is a write
-   transaction in flight right now?" Non-blocking, one fcntl.
-2. The header **change counter** (4 bytes, offset 24) — bumped by every
-   committing rollback-journal write transaction.
+The sound primitive is sqlite's own reader protocol, minus the rollback:
 
-Protocol per fall-through statement: GETLK (no writer) → read counter C₁ →
-read the base pages the statement needs → read counter C₂ + GETLK again. If
-both GETLKs saw no writer and C₁ = C₂, the read is consistent: an in-flight
-writer at any point during the read is caught by a GETLK (it must hold
-RESERVED before dirtying a byte), and a writer that started AND committed
-entirely between the checks is caught by the counter. Either check failing →
-retry once, then treat as divergence (below). Cost: two fcntls + two 16-byte
-preads per *statement* (not per page) — single-digit µs, amortizable further
-by validating once per read-batch. mtime serves as a free pre-filter in front
-of it (mtime unchanged → still run the check; mtime changed → skip straight
-to divergence handling), never as the check itself.
+```
+per fall-through STATEMENT:
+  F_SETLK SHARED (non-blocking)      — busy → writer active: backoff with a
+                                       deadline, then BaseBusy to the caller;
+                                       NEVER treated as divergence [R#19]
+  hot-journal check                  — per lockingv3's definition (exists ∧
+                                       >512 B ∧ valid header); PERSIST-mode
+                                       journals need the header read, not an
+                                       existence stat [R#1c]; hot → release,
+                                       recover via the library, retry
+  one 100-byte header pread          — change counter, size, schema cookie,
+                                       journal-mode bytes 18/19, all in one
+                                       read [R#20]; compare against the stamp
+  read the base pages the statement needs
+  unlock
+```
 
-Divergence detected (counter moved vs the overlay's parent BaseStamp): the
-fall-through pauses, the mirror reconcile runs (§2's re-lock path), and
-OPTIMISTIC resumes on the new stamp. mpedb writes continue into the overlay
-throughout — only fall-through waits.
+A held SHARED excludes any EXCLUSIVE — spill and commit alike — for the
+bracket's lifetime; the stamp comparison catches committed-since-last-time.
+This is "micro-LOCKED per statement": the only shape the review could prove
+consistent. Stamp movement (≠ busy) → pause fall-through, reconcile via
+mirror, resume on the new stamp; overlay writes continue throughout.
 
-**The settled stamp (Morten's granularity trick) — what makes the cheap
-filter TRUSTWORTHY over days, not merely advisory.** Plain mtime cannot be
-trusted because a foreign write in the same timestamp tick as the stamp is
-invisible. The fix is in WHEN the stamp is taken: while still holding the
-SHARED lock, wait until the wall clock has crossed at least one mtime-
-granularity boundary (probed once at open by double-touching a scratch file
-in the same directory: ~ns on ext4/APFS → hold ~10 ms; up to 2 s on coarse
-filesystems), THEN read the stamp, THEN release. Because the file was
-provably quiescent under the lock across the boundary, any later mutation
-lands in a strictly newer tick — one `stat()` at any point afterwards says
-definitively "touched or not", after minutes or days equally. The stamp is
-the tuple (mtime, size, change counter, `-wal` mtime+size if present); the
-counter makes it robust to clock steps for sqlite writers (monotonic, in the
-file), and the `-wal` pair extends divergence DETECTION to WAL-mode bases
-without `-shm` machinery (read consistency there is still Q5). Residual
-holes, named: deliberate mtime forgery, NFS attribute caching, and non-
-sqlite mmap mutators (sqlite itself writes the main file with `write()`
-even in mmap mode) — the GETLK+counter double-check per statement remains
-the consistency backstop for exactly this reason.
+**Isolation is weakened and must say so** [R#12]: mpedb's contract is
+snapshot-per-transaction; OPTIMISTIC fall-through re-validates per statement,
+so a multi-statement ReadTxn can observe two base states (statement-level
+read committed on the base side). This is declared per attachment — an
+application that needs the full snapshot contract uses LOCKED. And no
+statement output is emitted before its bracket completes — results buffer
+until the closing validation passes, never streamed out of an unvalidated
+read.
 
-The settled stamp is taken at every lock release (OPTIMISTIC entry and
-UNLOCKED-OFFLINE alike), which is what makes re-lock validation after a long
-offline window one `stat()` in the common no-change case.
+### UNLOCKED-OFFLINE (cooperative window)
 
-So the honest mode ladder: **LOCKED** = zero validation, sqlite writers see
-BUSY. **OPTIMISTIC** = no lock held, sqlite writers free, fall-through pays
-~µs per statement and self-heals through reconcile. The default stays LOCKED
-(an invariant beats a protocol), OPTIMISTIC is opt-in per attachment.
+All processes release SHARED (coordinated via shm); overlay-only operation;
+every fall-through refused (`BaseUnlocked`). For bulk foreign rewrites where
+even µs brackets and reconcile churn are unwanted.
 
-WAL-mode bases break OPTIMISTIC's two primitives (writers live in `-wal`,
-their locks in `-shm`, the main-file counter only moves on checkpoint) — a
-WAL-mode base in OPTIMISTIC is refused by name in v2; §9 Q5.
+## 3. The stamp — one definition, settled at release
 
-### UNLOCKED-OFFLINE (cooperative window): let sqlite tools write, then reconcile
+**One BaseStamp everywhere** [R#10]: `(mtime, size, change counter, schema
+cookie, header bytes 18/19, and if -wal exists: its salt pair (8-byte pread
+at offset 16) + size)`. The salts are the monotone WAL witness the counter
+cannot be (a WAL reset reuses the file from offset 0 with *new salts and
+unchanged size*); bytes 18/19 catch a journal-mode flip in a window [R#6].
+The counter's real semantics — "unlocked after modified", with the
+EXCLUSIVE-session and WAL under-count exceptions and the 2³² wrap — are
+quoted, not paraphrased optimistically [R#9]. The in-header db-size field
+(offset 28) is trusted only when its validity rule holds (counter at 24 ==
+version-valid-for at 92), else the file size is authoritative [R#20].
 
-`mpedb release` (API/CLI) drops the SHARED lock after a checkpoint, leaving
-the base fully owned by whoever wants it. While offline-unlocked, mpedb may
-continue serving **overlay-only** operations, but every fall-through read is
-refused (`BaseUnlocked` error) — the caller chose a window with no
-validation at all, and serving possibly-moving base bytes would be a wrong
-answer waiting to happen. (OPTIMISTIC above is the "unlocked but validated"
-middle; this mode exists for bulk foreign rewrites where even µs checks and
-reconcile churn are unwanted.)
-
-Re-lock validates a **BaseStamp** captured at release:
-
-- the sqlite header **change counter** (4 bytes at offset 24 — bumped by
-  every rollback-journal write transaction),
-- file size and the `-wal` tail state (salts + frame count) if present,
-- schema cookie (offset 40) for DDL drift.
-
-Unchanged stamp → resume LOCKED instantly, overlay still valid. Changed →
-**reconcile before resuming**: the mirror pull path re-reads diverged rows
-(tracked mode with triggers when installed; full re-diff otherwise — the
-`regenerate`/`reconcile` machinery), conflicts land in the DESIGN-MIRROR §8
-taxonomy with the same policies (authority-wins default, `manual` parks both
-images). Only after convergence does the fast path reopen.
-
-"Om ingen andre trenger vi ikke sjekke .db" — correct, and the lock is what
-turns that intuition into an invariant rather than a hope.
-
-## 3. Read-merge (v2)
-
-Per-PK rule: **overlay shadows base**. `get(pk)`: overlay hit (row or
-tombstone) answers; miss falls through to the base reader. Scans: a merge
-iterator over (overlay in PK order — mpedb's native order) × (base table
-b-tree in rowid/PK order via the sqlite reader), overlay wins per key,
-tombstones suppress. Secondary-index probes: v2 serves them as overlay-index
-probe + **base full scan with residual** (honest and correct); reading
-sqlite's index b-trees for base probes is v3. `EXPLAIN` must say which side
-each access takes.
-
-RLS/footprints: policies bind over the merged row — same shape as today, the
-merge happens below the policy layer. Footprints treat base tables as the
-same table id as their overlay twin (one logical table).
+**Settling (Morten's granularity trick), specified in the file-clock
+domain** [R#11]: while still holding SHARED, touch the scratch file in a
+loop until *its* mtime is strictly greater than the base's stamp candidate —
+this settles against the filesystem's own timestamp clock, immune to the
+wall-clock-vs-file-clock skew and to a probe that lands twice in one tick.
+Then read the stamp, then release. Any later mutation lands strictly newer;
+one `stat()` answers "touched?" after minutes or days. NFS is refused by
+statfs magic by default (both sqlite sources warn; attribute caching defeats
+every part of this), opt-in to override.
 
 ## 4. The sqlite page reader (v1)
 
-Read-only, from the mapping of a **locked, quiescent** base: file header,
-page b-trees, varint records, overflow chains, freelist skipping. The format
-is documented and frozen (sqlite.org/fileformat2). Refusals by name: WAL-mode
-bases with a non-empty `-wal` (v1 requires a checkpointed base — `mpedb open`
-runs `PRAGMA wal_checkpoint(TRUNCATE)` through the sqlite library first, or
-refuses if it cannot), encrypted files, non-UTF8 text per mirror's existing
-rules. Every decoder bounds-checked: corrupt input yields `Error::Corrupt`,
-never a panic — the house rule.
+Read-only, against a locked (or bracketed) base: header, table b-trees,
+varint records, overflow chains, freelist skipping. Refusals by name:
+WAL-mode bases (bytes 18/19), encrypted files, non-UTF8 per mirror's rules.
+Every decoder bounds-checked: corrupt input yields `Error::Corrupt`, never a
+panic. **Both table layouts are in scope and distinct** [R#15]: rowid tables
+(b-tree keyed on rowid; a declared non-INTEGER PK lives in a separate index
+b-tree) and WITHOUT ROWID tables (index-b-tree layout as the table).
 
-## 5. Checkpoint: push, then truncate — with a crash story at every arrow
+## 5. Checkpoint — the marker lives in the base, inside the push transaction
 
 ```
-freeze overlay epoch E                      (mpedb txn boundary)
-  → mirror push of E's deltas into .db     (ONE sqlite transaction)
-  → sqlite COMMIT (base now canonical for E)
-  → fsync(.db) per its journal mode
-  → overlay txn: mark E checkpointed + truncate delta tables
-  → mpedb commit (overlay's own durability modes apply)
+freeze overlay epoch E                       (mpedb txn boundary)
+  → drop this process's base SHARED         [R#5 — see the fcntl trap below]
+  → sqlite library: BEGIN IMMEDIATE
+      re-validate stamp/counter UNDER the write lock  [R#5c]
+      push E's deltas
+      update _mpedb_mirror_state: checkpointed_epoch = E   [R#4]
+        (epoch-fenced UPDATE … WHERE epoch = $e — mirror §6's own guard)
+    COMMIT                                   (synchronous=FULL owns durability
+                                              — no after-the-fact fsync [R#13])
+  → re-take SHARED, settle + re-stamp
+  → overlay: mark E checkpointed + truncate deltas in BOUNDED batches,
+    each its own commit                      [R#14]
 ```
 
-Crash matrix:
+**Why the marker moved into the base** [R#4]: v0.1 put it in the overlay's
+truncate commit — so in exactly the crash window the matrix cited it for
+(after sqlite COMMIT, before overlay commit), it never existed. In the base,
+"was E pushed?" is readable from the base itself, atomically with the push —
+mirror §5.4's "DECIDE before mutate" applied to checkpoints.
 
-| crash point | state on recovery | action |
-|---|---|---|
-| before sqlite COMMIT | sqlite rolls its journal back; overlay intact | re-push E — idempotent (row images upsert, tombstones delete-if-present) |
-| after COMMIT, before overlay truncate | base has E; overlay still has E | re-push E is a no-op by idempotence; then truncate — the marker says E was pushed, skip straight to truncate |
-| mid-truncate | mpedb's own atomicity (COW + meta flip) | overlay commit either happened or not; retry |
+**Why re-push is NOT blindly idempotent** [R#3]: our SHARED dies with a
+crash, so the base is unlocked all through the crash window and a foreign
+writer may commit — re-pushing E would then overwrite their v2 with our v1
+and resurrect tombstoned rows. Idempotence holds against *ourselves*, not
+third parties. Recovery therefore reads `checkpointed_epoch` and validates
+the stamp **before any re-push**; a moved stamp routes to full reconcile
+(mirror §5.5 merge-diff + §8 policy), never to a blind replay.
 
-Idempotence is the entire argument, and it is the same argument mirror push
-already survives under `mirror-collide` (a daemon SIGKILLed at every
-instant must converge). New writes during the push land in epoch E+1 —
-checkpointing never blocks the overlay's writers longer than the freeze.
+**The POSIX fcntl trap** [R#5]: classic POSIX locks are per (process,
+inode); sqlite's `close()` cancels *all* the process's locks on the file
+(howtocorrupt §2.2), and its own unlock at COMMIT releases the byte range
+regardless of which fd locked it. So the checkpoint's library use silently
+destroys a naive raw SHARED — every checkpoint would open an unnoticed
+unlocked window. The design therefore names the dance explicitly (drop →
+push with in-transaction re-validation under BEGIN IMMEDIATE's write lock →
+re-take → re-stamp), and prefers **OFD locks (`F_OFD_SETLK`)** for mpedb's
+own SHARED where available, so library close/unlock cannot cancel it
+(macOS OFD support: verify on the M3 before relying on it there). Either
+way the per-checkpoint window is *stamped and validated*, not assumed away.
 
-Truncate ("tømme .mpedb") reclaims overlay space through the normal freelist;
-the overlay file itself stays at its configured `size_mb` (mpedb files do not
-grow or shrink — the point is the DELTAS stay small, so a small `size_mb`
-suffices and checkpoint pressure is the valve; overlay-full = `DbFull` names
-`mpedb checkpoint` in the message).
+**Truncate under DbFull pressure** [R#14]: deleting delta rows is COW — it
+*allocates* before commit frees, so truncating a full overlay in one
+transaction deadlocks against the very condition checkpoint is the valve
+for. Bounded batches (each commit frees), the marker via the reserved pool,
+and a pre-flight COW-footprint estimate (mirror §5.4's) before checkpoint
+starts. `mirror regenerate` remains the named last resort.
 
-## 6. What "working directly against .db" is true, and what is not
+## 6. Read-merge (v2)
+
+Per-PK: overlay (row or tombstone) shadows base. Scans [R#15]: the merge
+iterator requires base order == overlay PK order, which holds for
+INTEGER-PK rowid tables and WITHOUT ROWID tables; declared-non-INTEGER-PK
+rowid tables (base order = rowid ≠ PK) are served in v2 as base scan +
+per-row overlay probe, honestly labeled in EXPLAIN — or wait for v3's index
+reader. Secondary-index probes: overlay-index probe + base scan with
+residual (v2), sqlite index b-trees (v3).
+
+RLS binds over the merged row. **Schema drift rules** [R#18]: a table
+created in the base during a window attaches as pull-only with
+policy-default-deny until an operator enables it; plan validation carries a
+schema epoch so base DDL invalidates registered plans atomically with the
+reconcile; type drift with unpushed deltas parks them under a dedicated
+kind (mirror's park store) rather than guessing a conversion.
+
+## 7. What "working directly against .db" is true, and what is not
 
 | claim | verdict |
 |---|---|
-| every sqlite tool can read `app.db` at any time | ✅ (sees last checkpoint) |
-| sqlite tools can write `app.db` | ✅ in UNLOCKED windows; `SQLITE_BUSY` while LOCKED — their normal experience of "another writer" |
-| mpedb reads+writes at full mpedb speed | ✅ for overlay-resident rows; cold fall-through pays sqlite decoding once per read (v3 option: promote hot fall-through rows into the overlay as a cache — measure first) |
-| no import step on open | ✅ schema derivation only; data stays in the base |
-| fresh mpedb writes visible to sqlite readers immediately | ❌ visible at next checkpoint — the WAL metaphor's honest edge |
-| two writers, both files, simultaneously | ❌ by design; UNLOCKED + reconcile is the supported shape |
+| every sqlite tool can read `app.db` at any time | ✅ — last-checkpoint state; footnote [R#8]: a crashed foreign writer's hot journal blocks foreign readers until mpedb's mediation runs |
+| sqlite tools can write `app.db` | ✅ in unlocked windows (commanded, per-checkpoint [R#5], or post-crash [R#3]) — all stamped and reconciled; `SQLITE_BUSY` otherwise |
+| mpedb reads+writes at full mpedb speed | ✅ overlay-resident; cold fall-through pays sqlite decoding (v3 option: hot-row promotion, measure first) |
+| no import step on open | ✅ schema derivation only — except v0, whose tracked sync installs mirror triggers in the base (visible to sqlite tools; v0's honest edge [R#20]) |
+| fresh mpedb writes visible to sqlite readers immediately | ❌ at next checkpoint |
+| two writers, both files, simultaneously | ❌ by design |
+| OPTIMISTIC preserves mpedb snapshot isolation on base reads | ❌ statement-level read committed, declared per attachment [R#12] |
 
-## 7. Multi-process, and who holds what
+## 8. Staging
 
-mpedb's own multi-process story is unchanged (the overlay IS an mpedb file).
-The base SHARED lock and the checkpoint duty belong to the **writer-lock
-owner's incarnation**, recovered exactly like the writer lock itself when a
-holder is SIGKILLed (the FLD-2/robust-mutex machinery; the base lock is
-re-acquired by the next owner — fcntl locks die with the process, which is
-the correct failure direction: a dead mpedb never blocks sqlite writers
-forever). Readers never touch the base lock; they read the base through the
-owner-validated stamp.
+- **v0 — UX over today's machinery**: `mpedb open app.db` = mirror import +
+  tracked sync; `mpedb checkpoint` = push. Full copy, triggers in the base
+  (named edge), no new engine code.
+- **v1 — sqlite reader + read-only attach** via #51; COMPAT "open in place"
+  ❌ → 🚧.
+- **v2 — the overlay**: deltas, read-merge, stamp machinery, LOCKED /
+  OPTIMISTIC / UNLOCKED-OFFLINE, checkpoint per §5. COMPAT → ✅ with §7's
+  table.
+- v3 (measured, maybe never): sqlite index probes, hot-row promotion,
+  WAL-mode bases.
 
-## 8. Staging (build order)
+## 9. Open questions (post-review residue)
 
-- **v0 — UX over today's machinery, no new engine code**: `mpedb open app.db`
-  = mirror import to a sidecar + tracked sync; `mpedb checkpoint` = push;
-  full copy rather than overlay. Proves the CLI shape and the checkpoint
-  habit. Cheap, useful immediately.
-- **v1 — the sqlite reader + read-only attach**: query a locked `.db` with
-  zero import, exposed through #51's cross-file machinery. COMPAT.md's
-  "open in place" row goes ❌ → 🚧 (read-only).
-- **v2 — the overlay**: delta writes, read-merge, BaseStamp, LOCKED/UNLOCKED,
-  checkpoint+truncate. COMPAT row → ✅ (with the §6 table's honest edges).
-- v3 (measured, maybe never): sqlite index probes for base, hot-row
-  promotion cache, WAL-mode bases without pre-checkpoint.
-
-## 9. Open questions for the review
-
-- **Q1**: sqlite WAL-mode bases in v2 — require journal_mode=DELETE at open
-  (simple, restrictive) or learn `-wal`/`-shm` reading + their lock protocol
-  (large)? v1/v2 ship with the requirement; measure demand.
-- **Q2**: non-PK-predicate reads over a large cold base without index probes
-  are honest full scans — is v2 acceptable shipping that, with EXPLAIN
-  labeling, or does v3's index reader gate the overlay release?
-- **Q3**: checkpoint trigger policy — explicit only (v2 default), or also
-  size/time watermarks? An unattended attachment that never checkpoints
-  makes sqlite readers arbitrarily stale and the overlay arbitrarily full.
-- **Q4**: advisory-lock bypass (a raw `cp` or an NFS client that drops
-  fcntl locks does not respect SHARED) — BaseStamp re-validation on every
-  re-lock catches it after the fact; is a periodic in-LOCKED stamp audit
-  (cheap: one header read) worth the syscall?
-- **Q5**: OPTIMISTIC over WAL-mode bases — divergence DETECTION is solved by
-  the settled stamp over the (.db, -wal) pair (§2), but read CONSISTENCY
-  still needs `-shm` lock inspection or the journal_mode=DELETE requirement.
-  Worth building the `-shm` reader, or is "checkpoint your base first" an
-  acceptable permanent answer for this mode?
-- **Q6**: OPTIMISTIC's GETLK+counter double-check needs an adversarial pass
-  of its own against sqlite's exact lock/flush ordering (when precisely does
-  page 1 with the counter hit the file relative to other pages and the
-  RESERVED→EXCLUSIVE ladder?) — the §2 argument sketches it; the review must
-  ground it in sqlite's documented sequence before v2 ships the mode.
+- **Q1**: OFD-lock portability — Linux yes; macOS `F_OFD_SETLK` must be
+  verified on the M3, else macOS runs the drop/re-take dance only.
+- **Q2**: is v2 acceptable shipping non-INTEGER-PK rowid tables as
+  probe-per-row scans (honest but O(n) probes), or does that gate v3?
+- **Q3**: checkpoint trigger policy — explicit only, or size/time
+  watermarks against unbounded staleness + overlay pressure.
+- **Q4**: the OPTIMISTIC bracket's real cost after the review's fixes
+  (SETLK pair + journal check + 100-byte pread) — measure; if the µs claim
+  doesn't survive, say the honest number in §2.
