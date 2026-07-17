@@ -1,6 +1,28 @@
 use super::*;
 
 impl PageStore for WriteTxn<'_> {
+    fn read_extent(&self, start_page: u64, total_len: u64, out: &mut Vec<u8>) -> Result<()> {
+        read_extent_from_shm(&self.eng.shm, start_page, total_len, out)
+    }
+
+    fn free_extent(&mut self, start_page: u64, npages: u32) -> Result<()> {
+        // Called by the btree exactly where it frees an overflow chain. It
+        // only RECORDS: map edits apply in one place at commit, and the
+        // attribution rule decides which set the run lands in.
+        self.pending_map_edits.push(extent::MapEdit::Delete(start_page));
+        leakstat::add(&leakstat::EXTENT_FREED_PAGES, u64::from(npages));
+        if self.allocated_runs.remove(&start_page).is_some() {
+            // Allocated by THIS txn and freed again: back to the pool as our
+            // own creation — never into a drawn entry's write-back, never
+            // into the committed-free set (nothing published references it).
+            self.pool_insert(start_page, npages, None);
+        } else {
+            // A committed extent: freed under this commit's txn id.
+            self.freed_runs.push((start_page, npages));
+        }
+        Ok(())
+    }
+
     fn page(&self, id: u64) -> Result<&[u8]> {
         self.eng.shm.page(id)
     }
@@ -193,7 +215,7 @@ impl<'e> WriteTxn<'e> {
     /// separate attempts to feed it made #37 strictly worse. Leaving the entry
     /// in place decouples them — an entry nobody allocates out of costs nothing
     /// at commit.
-    fn refill_reusable(&mut self) -> Result<bool> {
+    pub(super) fn refill_reusable(&mut self) -> Result<bool> {
         debug_assert!(!self.in_freelist_op, "refill re-entered a freelist op");
         leakstat::bump(&leakstat::REFILL_CALLS);
         if self.freelist_root == 0 {
@@ -213,19 +235,66 @@ impl<'e> WriteTxn<'e> {
             leakstat::bump(&leakstat::REFILL_NO_TREE);
             return Ok(false);
         };
-        if key.len() != 11 || val.len() % 8 != 0 {
+        if key.len() != 11 {
             return Err(Error::Corrupt("bad freelist entry".into()));
         }
-        // Run entries (FK_RUNS) join the draw path with the extent allocator
-        // (DESIGN-BLOBEXTENT §3.3); until then nothing writes them, so one in
-        // the tree is corruption, not a version skew.
         if key[8] != FK_RUNS && key[8] != FK_PAGES {
             return Err(Error::Corrupt("bad freelist entry kind".into()));
         }
         if key[8] == FK_RUNS {
-            return Err(Error::Corrupt(
-                "run freelist entry before the extent allocator exists".into(),
-            ));
+            // A kind-1 entry: extent runs (DESIGN-BLOBEXTENT §3.3/§6).
+            let freed_txn = u64::from_be_bytes(key[..8].try_into().unwrap());
+            let mut bound = self
+                .eng
+                .shm
+                .oldest_pinned_cache()
+                .load(std::sync::atomic::Ordering::Acquire);
+            if freed_txn > bound && !self.bound_recomputed {
+                self.bound_recomputed = true;
+                leakstat::bump(&leakstat::RECOMPUTES);
+                bound = self.eng.shm.compute_oldest_pinned(self.meta.txn_id);
+            }
+            if freed_txn > bound {
+                leakstat::bump(&leakstat::REFILL_NOT_YET);
+                return Ok(false);
+            }
+            // The durable-frontier gate (§6, review finding: async). Pages
+            // survive reuse-before-durability because replay RESTORES them
+            // from logged images; extents opted out of logging, so their
+            // reuse must wait for the freeing record's flush. `wal` satisfies
+            // this by construction (ack = durable before the lock releases);
+            // only `async` defers, hence only `async` gates.
+            if self.eng.shm.durability == mpedb_types::Durability::Async {
+                let durable = self
+                    .eng
+                    .shm
+                    .durable_txn()
+                    .load(std::sync::atomic::Ordering::Acquire);
+                if freed_txn > durable {
+                    leakstat::bump(&leakstat::REFILL_NOT_YET);
+                    return Ok(false);
+                }
+            }
+            let runs = extent::decode_run_entry(
+                &val,
+                self.eng.shm.data_start,
+                self.eng.shm.page_count,
+            )?;
+            let key: [u8; 11] = key.try_into().expect("checked len == 11 above");
+            self.taken_runs.push(extent::TakenRunEntry { key, runs: runs.clone() });
+            let idx = self.taken_runs.len() - 1;
+            let mut pages = 0u64;
+            for (start, npages) in runs {
+                pages += u64::from(npages);
+                self.pool_insert(start, npages, Some(idx));
+            }
+            leakstat::bump(&leakstat::REFILL_OK);
+            leakstat::add(&leakstat::REFILL_PAGES, pages);
+            self.refill_cursor = Some(key);
+            return Ok(true);
+        }
+        if val.len() % 8 != 0 {
+            return Err(Error::Corrupt("bad freelist entry".into()));
         }
         let freed_txn = u64::from_be_bytes(key[..8].try_into().unwrap());
         // Pages freed BY commit T are referenced only by snapshots < T (commit
@@ -285,7 +354,7 @@ impl<'e> WriteTxn<'e> {
 /// whatever is left unconsumed (or deletes it if nothing is).
 #[derive(Clone)]
 pub(super) struct TakenEntry {
-    /// Freelist keys are always (txn BE, chunk BE) — exactly 10 bytes. Inline,
+    /// Freelist keys are always (txn BE, kind, chunk BE) — exactly 11 bytes. Inline,
     /// not a `Vec`: the commit fixpoint rebuilds its plan on every pass, and a
     /// heap allocation per key per pass was a measurable slice of the write path.
     key: [u8; 11],

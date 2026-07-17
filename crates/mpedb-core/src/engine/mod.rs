@@ -48,6 +48,11 @@ pub mod leakstat {
         COMMITS,          // commit fixpoints entered
         COMMIT_FREED,     // pages genuinely freed by the txn
         COMMIT_LEFTOVER,  // reclaimed-but-unused pages handed back at commit
+        // DESIGN-BLOBEXTENT §6/§13.6: space reconciles like #40's time did.
+        EXTENT_ALLOC_PAGES, // pages allocated into extent runs
+        EXTENT_FREED_PAGES, // pages of committed extents freed again
+        EXTENT_FRAG_PAGES,  // free-but-fragmented pages at a DbFull
+        REFLINK_HITS,       // FICLONERANGE actually engaged, not fallback-copied
         // #40: where the ~3.8 µs per overflow page goes. Nanoseconds — the three
         // must add up to the wall time `btree::write_overflow` takes, or the
         // cost is somewhere this does not look.
@@ -96,6 +101,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod commit;
+mod extent;
 mod freelist;
 mod read;
 mod write;
@@ -216,6 +222,32 @@ pub(super) const FK_PAGES: u8 = 0;
 /// Lands with the extent allocator; until then a kind-1 entry is corrupt.
 pub(super) const FK_RUNS: u8 = 1;
 
+/// Read an extent's bytes out of the mapping, bounds-checked against the
+/// MAPPING (page_count), not just high_water — checked u64 math throughout
+/// (DESIGN-BLOBEXTENT §3.1).
+pub(super) fn read_extent_from_shm(
+    shm: &Shm,
+    start_page: u64,
+    total_len: u64,
+    out: &mut Vec<u8>,
+) -> Result<()> {
+    let npages = total_len
+        .checked_add(PAGE_SIZE as u64 - 1)
+        .ok_or_else(|| Error::Corrupt("extent length overflow".into()))?
+        / PAGE_SIZE as u64;
+    let end = start_page
+        .checked_add(npages)
+        .ok_or_else(|| Error::Corrupt("extent run overflows the page space".into()))?;
+    if start_page < shm.data_start || end > shm.page_count {
+        return Err(Error::Corrupt("extent outside the data region".into()));
+    }
+    let off = (start_page as usize)
+        .checked_mul(PAGE_SIZE)
+        .ok_or_else(|| Error::Corrupt("extent offset overflow".into()))?;
+    out.extend_from_slice(shm.bytes(off, total_len as usize)?);
+    Ok(())
+}
+
 fn freelist_key(txn: u64, kind: u8, chunk: u16) -> [u8; 11] {
     let mut k = [0u8; 11];
     k[..8].copy_from_slice(&txn.to_be_bytes());
@@ -277,6 +309,10 @@ pub struct Engine {
     concurrency: Concurrency,
     /// Deferred-fsync flusher; `Some` only for `durability = async` (§5.4.2).
     flusher: Option<Flusher>,
+    /// Payloads strictly larger than this take an extent run instead of an
+    /// overflow chain (DESIGN-BLOBEXTENT §8). `None` = disabled — today's
+    /// behavior byte for byte, and the A/B's control arm.
+    extent_threshold: Option<usize>,
 }
 
 impl Drop for Engine {
@@ -339,6 +375,7 @@ impl Engine {
             col_types,
             concurrency: config.options.concurrency,
             flusher,
+            extent_threshold: None,
         };
         engine.bootstrap_catalog()?;
         Ok(engine)
@@ -441,6 +478,7 @@ impl Engine {
             col_types,
             concurrency: Concurrency::Serial,
             flusher: None, // read-only tooling handle; async needs a config
+            extent_threshold: None,
         })
     }
 
@@ -485,6 +523,13 @@ impl Engine {
     /// it exists to be called a few times a second by a probe, not on any path
     /// that matters. It takes no writer lock and pins nothing: perturbing the
     /// reader table is exactly what would corrupt the measurement.
+    /// Enable/disable the extent path (DESIGN-BLOBEXTENT §8). Values whose
+    /// encoded payload exceeds the threshold take an extent run; `None`
+    /// keeps every value on the inline/overflow path.
+    pub fn set_extent_threshold(&mut self, threshold: Option<usize>) {
+        self.extent_threshold = threshold;
+    }
+
     pub fn leak_counters(&self) -> Result<(u64, u64, u64, u64)> {
         let meta = self.shm.newest_meta()?;
         let bound = self
@@ -548,11 +593,73 @@ impl Engine {
                 btree::collect_pages(&txn, r, &mut reachable)?;
             }
             btree::collect_pages(&txn, txn.freelist_root, &mut reachable)?;
+            btree::collect_pages(&txn, txn.extent_map_root, &mut reachable)?;
+
+            // Extent refs from every data tree must equal the extent map
+            // EXACTLY: an unmapped ref dangles, an unreferenced map entry
+            // leaks, a duplicated start means two cells own one run.
+            let mut refs: Vec<(u64, u32)> = Vec::new();
+            {
+                let lo = [0x01u8];
+                let hi = [SYS_PREFIX];
+                let mut c = btree::cursor(
+                    &txn,
+                    txn.catalog_root,
+                    Some((&lo[..], true)),
+                    Some((&hi[..], false)),
+                )?;
+                let mut roots2 = Vec::new();
+                while let Some((_k, v)) = c.next(&txn)? {
+                    if v.len() == 16 {
+                        roots2.push(u64::from_le_bytes(v[0..8].try_into().unwrap()));
+                    }
+                }
+                for r in roots2 {
+                    btree::collect_extents(&txn, r, &mut refs)?;
+                }
+            }
+            refs.sort_unstable();
+            if refs.windows(2).any(|w| w[0].0 == w[1].0) {
+                return Err(Error::Corrupt("two cells reference one extent".into()));
+            }
+            let mut mapped: Vec<(u64, u32)> = Vec::new();
+            if txn.extent_map_root != 0 {
+                let mut c = btree::cursor(&txn, txn.extent_map_root, None, None)?;
+                while let Some((k, v)) = c.next(&txn)? {
+                    if k.len() != 8 || v.len() != 4 {
+                        return Err(Error::Corrupt("bad extent map entry".into()));
+                    }
+                    mapped.push((
+                        u64::from_be_bytes(k.try_into().unwrap()),
+                        u32::from_le_bytes(v.try_into().unwrap()),
+                    ));
+                }
+            }
+            if refs != mapped {
+                return Err(Error::Corrupt(format!(
+                    "extent map disagrees with tree references \
+                     ({} mapped, {} referenced)",
+                    mapped.len(),
+                    refs.len()
+                )));
+            }
 
             let mut freelisted = std::collections::BTreeSet::new();
+            let mut free_runs: Vec<(u64, u32)> = Vec::new();
             if txn.freelist_root != 0 {
                 let mut c = btree::cursor(&txn, txn.freelist_root, None, None)?;
-                while let Some((_k, v)) = c.next(&txn)? {
+                while let Some((k, v)) = c.next(&txn)? {
+                    if k.len() != 11 {
+                        return Err(Error::Corrupt("bad freelist key length".into()));
+                    }
+                    if k[8] == FK_RUNS {
+                        free_runs.extend(extent::decode_run_entry(
+                            &v,
+                            self.shm.data_start,
+                            self.shm.page_count,
+                        )?);
+                        continue;
+                    }
                     for ch in v.chunks_exact(8) {
                         let id = u64::from_le_bytes(ch.try_into().unwrap());
                         if !freelisted.insert(id) {
@@ -563,6 +670,40 @@ impl Engine {
                     }
                 }
             }
+            // Interval discipline: live runs and free runs together must be
+            // pairwise DISJOINT — partial overlap is the corruption class a
+            // set-insert check cannot see (DESIGN-BLOBEXTENT §3.2).
+            let mut runs: Vec<(u64, u32)> = mapped.iter().chain(free_runs.iter()).copied().collect();
+            runs.sort_unstable();
+            for w in runs.windows(2) {
+                if w[0].0 + u64::from(w[0].1) > w[1].0 {
+                    return Err(Error::Corrupt(format!(
+                        "extent runs overlap: {}+{} and {}+{}",
+                        w[0].0, w[0].1, w[1].0, w[1].1
+                    )));
+                }
+            }
+            let in_runs = |id: u64| -> bool {
+                let i = runs.partition_point(|&(s, _)| s <= id);
+                i > 0 && {
+                    let (s, n) = runs[i - 1];
+                    id < s + u64::from(n)
+                }
+            };
+            for &id in &freelisted {
+                if in_runs(id) {
+                    return Err(Error::Corrupt(format!(
+                        "page {id} both freelisted and inside a run"
+                    )));
+                }
+            }
+            for &id in &reachable {
+                if in_runs(id) {
+                    return Err(Error::Corrupt(format!(
+                        "page {id} both tree-reachable and inside a run"
+                    )));
+                }
+            }
             for id in &freelisted {
                 if reachable.contains(id) {
                     return Err(Error::Corrupt(format!(
@@ -571,9 +712,9 @@ impl Engine {
                 }
             }
             for id in self.shm.data_start..txn.high_water {
-                if !reachable.contains(&id) && !freelisted.contains(&id) {
+                if !reachable.contains(&id) && !freelisted.contains(&id) && !in_runs(id) {
                     return Err(Error::Corrupt(format!(
-                        "page {id} leaked: neither reachable nor freelisted"
+                        "page {id} leaked: neither reachable, freelisted, nor in a run"
                     )));
                 }
             }
@@ -639,6 +780,12 @@ impl Engine {
             catalog_root: meta.catalog_root,
             freelist_root: meta.freelist_root,
             extent_map_root: meta.extent_map_root,
+            run_pool: Vec::new(),
+            taken_runs: Vec::new(),
+            freed_runs: Vec::new(),
+            allocated_runs: std::collections::HashMap::new(),
+            pending_map_edits: Vec::new(),
+            extent_dirty: Vec::new(),
             high_water: meta.high_water,
             table_roots: HashMap::new(),
             dirty: DirtySet::default(),
