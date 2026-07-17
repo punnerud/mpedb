@@ -776,6 +776,15 @@ pub trait BlobSource {
         self.len() == 0
     }
     fn next_into(&mut self, buf: &mut [u8]) -> Result<()>;
+    /// The underlying FILE, when the source is one — what lets the extent
+    /// import take the kernel-side `copy_file_range` fast path (#50) instead
+    /// of faulting every byte through userspace. A source that returns
+    /// `Some` promises the file's contents at offsets `0..len()` ARE the
+    /// stream (`next_into`'s cursor and this view must agree — the engine
+    /// uses exactly one of them per insert).
+    fn as_file(&self) -> Option<&std::fs::File> {
+        None
+    }
 }
 
 pub enum Payload<'a> {
