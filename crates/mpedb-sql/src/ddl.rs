@@ -55,6 +55,11 @@ pub enum RlsAction {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DdlStmt {
     CreateTable(CreateTableSpec),
+    /// `DROP TABLE [IF EXISTS] <name>` (#47 stage 4) — applied by the facade as
+    /// a catalog mutation: the slot is tombstoned in place and its id is never
+    /// reused (DESIGN-DROP-TABLE §0). `if_exists` suppresses the missing-table
+    /// error, matching sqlite/PG.
+    DropTable { name: String, if_exists: bool },
     CreatePolicy(CreatePolicySpec),
     DropPolicy { table: String, name: String },
     AlterRls { table: String, action: RlsAction },

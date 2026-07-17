@@ -885,6 +885,100 @@ impl<'e> WriteTxn<'e> {
         Ok(tid)
     }
 
+    /// DROP a table by id. Frees every reachable data/index page, unlinks the
+    /// table's catalog tree-root entries, tombstones its schema slot in place
+    /// (the id is NEVER reused — DESIGN-DROP-TABLE §0/§1), purges its CDC dirty
+    /// entries and clears its capture/blocked bits, and arms the schema-gen
+    /// bump. One ordinary COW commit publishes all of it atomically; other
+    /// processes reload the tombstoned schema at their next transaction.
+    ///
+    /// Bounded to one commit (§2): a table larger than [`MAX_DROP_PAGES`]
+    /// refuses — nothing is freed, the schema is untouched — rather than
+    /// overflow the `u16` freelist chunk index. Pages committed by earlier txns
+    /// are freed under THIS commit's id, so a reader still pinned on a snapshot
+    /// that predates the drop keeps them un-reused (identical discipline to a
+    /// large DELETE).
+    pub fn drop_table(&mut self, table_id: u32) -> Result<()> {
+        // Compute the tombstoned schema first: `with_dropped_table` validates
+        // the id is live (and not the last live table), so an illegal drop bails
+        // here before any page is freed or catalog entry unlinked.
+        let bundle = Arc::clone(&self.bundle);
+        let new_schema = bundle.schema.with_dropped_table(table_id)?;
+        let live = bundle
+            .schema
+            .table(table_id)
+            .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
+        let n_trees = 1 + live.indexes.len() as u32; // PK tree + secondaries
+
+        // 1. Collect every reachable page of the table's trees (branch, leaf,
+        //    and overflow chains).
+        let mut pages: BTreeSet<u64> = BTreeSet::new();
+        for ino in 0..n_trees {
+            let (root, _count) = self.tree_root(table_id, ino)?;
+            if root != 0 {
+                btree::collect_pages(self, root, &mut pages)?;
+            }
+        }
+        if pages.len() as u64 > MAX_DROP_PAGES {
+            return Err(Error::Unsupported(format!(
+                "table {table_id} spans {} pages; DROP is bounded to {MAX_DROP_PAGES} per commit",
+                pages.len()
+            )));
+        }
+
+        // 2. Free them. `free` keys past-committed pages under this txn's id;
+        //    the commit fixpoint records them, reader-pin safety governs reuse.
+        for p in pages {
+            PageStore::free(self, p)?;
+        }
+
+        // 3. Unlink the catalog tree-root entries so neither the page-accounting
+        //    verifier nor a later `tree_root` sees the now-freed roots.
+        for ino in 0..n_trees {
+            let root = self.catalog_root;
+            let out = btree::delete(self, root, &cat_tree_key(table_id, ino))?;
+            self.catalog_root = out.new_root;
+            self.table_roots.remove(&(table_id, ino));
+        }
+
+        // 4. Publish the tombstoned schema.
+        let bytes = new_schema.canonical_bytes();
+        let root = self.catalog_root;
+        let out = btree::insert(
+            self,
+            root,
+            CAT_SCHEMA_KEY,
+            &mut btree::Payload::Flat(&bytes),
+            InsertMode::Upsert,
+        )?;
+        self.catalog_root = out.new_root;
+
+        // 5. Purge the table's CDC dirty entries — a mirror push must not try to
+        //    re-read rows of a table that no longer exists.
+        let mut lo = cdc::CDC_DIRTY_PREFIX.to_vec();
+        lo.extend_from_slice(&table_id.to_be_bytes());
+        let mut hi = cdc::CDC_DIRTY_PREFIX.to_vec();
+        hi.extend_from_slice(&(table_id + 1).to_be_bytes());
+        for (subkey, _v) in self.sys_scan_range(&lo, &hi)? {
+            self.sys_delete(&subkey)?;
+        }
+
+        // 6. Clear any capture/blocked bits for the id (harmless if unset — a
+        //    dead id is never written again — but keeps the control record
+        //    clean and bumps the generation for per-process caches).
+        let mut cfg = self.capture_config()?;
+        if cfg.is_captured(table_id) || cfg.is_blocked(table_id) {
+            cfg.set_captured(table_id, false);
+            cfg.set_blocked(table_id, false);
+            cfg.generation += 1;
+            self.sys_put(cdc::CDC_TABS_KEY, &cfg.encode())?;
+            self.capture_cfg = Some(cfg);
+        }
+
+        self.schema_gen_bump = true;
+        Ok(())
+    }
+
     pub fn sys_get(&mut self, subkey: &[u8]) -> Result<Option<Vec<u8>>> {
         btree::get(self, self.catalog_root, &sys_key(subkey))
     }
