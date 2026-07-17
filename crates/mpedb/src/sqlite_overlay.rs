@@ -141,9 +141,13 @@ fn overlay_toml(base: &Path, schema: &Schema, size_mb: u64) -> String {
         for c in &table.columns {
             let ty = match c.ty {
                 ColumnType::Int64 => "int64",
+                // Text PKs (WITHOUT ROWID shapes) must be `text`, not `any`:
+                // the keycode order of a typed text column is what keeps the
+                // overlay's scan order aligned with the base's BINARY order.
+                ColumnType::Text => "text",
                 _ => "any",
             };
-            let nullable = c.ty != ColumnType::Int64;
+            let nullable = !matches!(c.ty, ColumnType::Int64 | ColumnType::Text);
             let _ = write!(
                 t,
                 "\n  [[table.column]]\n  name = \"{}\"\n  type = \"{ty}\"\n  nullable = {nullable}\n",
@@ -423,6 +427,32 @@ impl SqliteOverlay {
                 }
                 BracketOutcome::Held(b) => {
                     if b.stamp_matches(&self.expected).map_err(oerr)? {
+                        return Ok(b);
+                    }
+                    // Our in-memory stamp is stale — but a CO-ATTACHED
+                    // process may have moved the base legitimately (its
+                    // checkpoint/reconcile re-blessed it and stored the
+                    // fresh stamp in the shared overlay). Re-read the
+                    // stored one before calling this divergence.
+                    let stored = decode_stamp(
+                        &self
+                            .db
+                            .sys_record_get(STAMP_NS, STAMP_KEY)?
+                            .ok_or_else(|| {
+                                Error::Corrupt("overlay has no stored base-stamp".into())
+                            })?,
+                    )?;
+                    if stored != self.expected && b.stamp_matches(&stored).map_err(oerr)? {
+                        let fresh = SqliteAttach::open(&self.base)?;
+                        if fresh.schema() != self.attach.schema() {
+                            return Err(Error::Unsupported(
+                                "foreign DDL changed the base's schema — reopen to \
+                                 re-derive the attach (plans and table ids shift)"
+                                    .into(),
+                            ));
+                        }
+                        self.attach = fresh;
+                        self.expected = stored;
                         return Ok(b);
                     }
                     let deltas = snapshot_deltas(&self.db, self.pk_idx.len())?;
@@ -720,10 +750,14 @@ fn pre_matches(pre: &Value, cur_base: Option<&[Value]>) -> bool {
     matches!((pre, &pre_of(cur_base)), (Value::Blob(a), Value::Blob(b)) if a == b)
 }
 
-fn pk_of(row: &[Value], idx: usize) -> Result<i64> {
-    match row.get(idx) {
-        Some(Value::Int(i)) => Ok(*i),
-        _ => Err(Error::Internal("non-int PK in merged row".into())),
+/// Order two PK values from the SAME table (int64 or text — the served
+/// shapes; a table only ever produces one variant). Int order and BINARY
+/// text order both match the storage order on both sides of the merge.
+fn pk_cmp(a: &Value, b: &Value) -> Result<std::cmp::Ordering> {
+    match (a, b) {
+        (Value::Int(x), Value::Int(y)) => Ok(x.cmp(y)),
+        (Value::Text(x), Value::Text(y)) => Ok(x.as_bytes().cmp(y.as_bytes())),
+        _ => Err(Error::Internal("mixed-type PKs in one merged table".into())),
     }
 }
 
@@ -780,15 +814,13 @@ impl TxnCtx for MergeCtx<'_> {
         let (mut i, mut j) = (0usize, 0usize);
         loop {
             let take_ovl = match (ovl.get(i), base.get(j)) {
-                (Some(o), Some(b)) => {
-                    let (ko, kb) = (pk_of(o, idx)?, pk_of(b, idx)?);
-                    if ko == kb {
+                (Some(o), Some(b)) => match pk_cmp(&o[idx], &b[idx])? {
+                    std::cmp::Ordering::Equal => {
                         j += 1; // shadowed
                         true
-                    } else {
-                        ko < kb
                     }
-                }
+                    ord => ord == std::cmp::Ordering::Less,
+                },
                 (Some(_), None) => true,
                 (None, Some(_)) => false,
                 (None, None) => break,

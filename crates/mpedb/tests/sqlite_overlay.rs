@@ -159,6 +159,71 @@ fn deltas_survive_reopen_and_divergence_is_refused() {
 }
 
 #[test]
+fn text_pk_without_rowid_merges_like_any_other_shape() {
+    let p = std::env::temp_dir()
+        .join("mpedb-overlay-tests")
+        .join(format!("ovl-textpk-{}.db", std::process::id()));
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    for suffix in ["", ".overlay.mpedb", ".overlay.probe"] {
+        let _ = std::fs::remove_file(format!("{}{}", p.display(), suffix));
+    }
+    {
+        let c = Connection::open(&p).unwrap();
+        c.execute_batch(
+            "PRAGMA journal_mode = DELETE;
+             CREATE TABLE kv (k TEXT PRIMARY KEY, v INTEGER) WITHOUT ROWID;
+             INSERT INTO kv VALUES ('alpha',1),('beta',2),('gamma',3),('delta',4);",
+        )
+        .unwrap();
+    }
+    let mut ovl = SqliteOverlay::open(&p).unwrap();
+
+    // Point probe + full scan straight through.
+    let got = rows(ovl.query("SELECT v FROM kv WHERE k = 'beta'", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Int(2)]]);
+    let got = rows(ovl.query("SELECT k FROM kv ORDER BY k", &[]).unwrap());
+    let names: Vec<&str> = got
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.as_str(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(names, vec!["alpha", "beta", "delta", "gamma"], "BINARY order");
+
+    // Deltas of every kind on a text PK, merged per key.
+    ovl.query("UPDATE kv SET v = 22 WHERE k = 'beta'", &[]).unwrap();
+    ovl.query("DELETE FROM kv WHERE k = 'gamma'", &[]).unwrap();
+    ovl.query("INSERT INTO kv (k, v) VALUES ('epsilon', 5)", &[]).unwrap();
+    let got = rows(ovl.query("SELECT v FROM kv WHERE k = 'beta'", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Int(22)]]);
+    let got = rows(ovl.query("SELECT count(*) FROM kv", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Int(4)]]);
+    // Range over the merge: text keycode bounds both directions.
+    let got = rows(
+        ovl.query("SELECT k FROM kv WHERE k > 'alpha' AND k <= 'epsilon' ORDER BY k", &[])
+            .unwrap(),
+    );
+    let names: Vec<&str> = got
+        .iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.as_str(),
+            other => panic!("{other:?}"),
+        })
+        .collect();
+    assert_eq!(names, vec!["beta", "delta", "epsilon"]);
+
+    // The base is untouched until checkpoint.
+    drop(ovl);
+    let c = Connection::open(&p).unwrap();
+    let v: i64 = c.query_row("SELECT v FROM kv WHERE k = 'beta'", [], |r| r.get(0)).unwrap();
+    assert_eq!(v, 2);
+
+    let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
 fn reconcile_resolves_conflicts_by_named_policy() {
     let p = setup("reconcile");
     // Session 1 (LOCKED): three deltas — update, insert, delete — plus a
@@ -289,6 +354,34 @@ fn offline_mode_serves_overlay_and_names_every_fall_through() {
         assert!(format!("{err}").contains("unlocked-offline"), "{sql}: {err}");
     }
 
+    let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));
+    let _ = std::fs::remove_file(&p);
+}
+
+#[test]
+fn co_attached_handles_share_one_overlay() {
+    let p = setup("coattach");
+    // Two handles = two file descriptions = the multi-process shape (OFD
+    // locks are per-description; the overlay engine is multi-process by
+    // construction). Two SHAREDs coexist.
+    let mut a = SqliteOverlay::open(&p).unwrap();
+    let mut b = SqliteOverlay::open(&p).unwrap();
+
+    a.query("INSERT INTO users (id, name, age) VALUES (800, 'fra-a', 1)", &[]).unwrap();
+    let got = rows(b.query("SELECT name FROM users WHERE id = 800", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Text("fra-a".into())]], "b sees a's delta");
+    let got = rows(b.query("SELECT count(*) FROM users", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Int(101)]]);
+
+    b.query("UPDATE users SET name = 'fra-b' WHERE id = 800", &[]).unwrap();
+    let got = rows(a.query("SELECT name FROM users WHERE id = 800", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Text("fra-b".into())]], "a sees b's update");
+
+    drop(a);
+    let got = rows(b.query("SELECT count(*) FROM users", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Int(101)]], "b keeps serving after a closes");
+
+    drop(b);
     let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));
     let _ = std::fs::remove_file(&p);
 }
