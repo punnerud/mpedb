@@ -57,6 +57,9 @@ pub struct WriteTxn<'e> {
     pub(super) catalog_root: u64,
     pub(super) freelist_root: u64,
     pub(super) high_water: u64,
+    /// Root of the extent map (DESIGN-BLOBEXTENT §3.2). Carried through the
+    /// commit snapshot; mutated once the extent allocator lands.
+    pub(super) extent_map_root: u64,
     /// (table_id, index_no) → (root, row_count); loaded lazily, written back
     /// into the catalog at commit.
     pub(super) table_roots: HashMap<(u32, u32), (u64, u64)>,
@@ -72,7 +75,7 @@ pub struct WriteTxn<'e> {
     pub(super) taken: Vec<TakenEntry>,
     /// Last key `refill_reusable` drew from; the next draw starts strictly
     /// after it, so an entry is never drawn twice (it is still in the tree).
-    pub(super) refill_cursor: Option<[u8; 10]>,
+    pub(super) refill_cursor: Option<[u8; 11]>,
     pub(super) freed: BTreeSet<u64>,
     pub(super) bound_recomputed: bool,
     /// True while a mutation of the freelist tree itself is in progress.
@@ -837,7 +840,7 @@ pub struct TxnSavepoint {
     freed: BTreeSet<u64>,
     reusable: Vec<u64>,
     taken: Vec<TakenEntry>,
-    refill_cursor: Option<[u8; 10]>,
+    refill_cursor: Option<[u8; 11]>,
     high_water: u64,
 }
 

@@ -60,7 +60,7 @@ impl<'e> WriteTxn<'e> {
         // height-bounded freelist path, the sets grow monotonically, and once
         // `reusable` is consumed allocation falls back to `high_water`, which
         // frees nothing — so the loop is bounded by O(tree height).
-        let mut written: Vec<([u8; 10], Vec<u64>)> = Vec::new();
+        let mut written: Vec<([u8; 11], Vec<u64>)> = Vec::new();
         let mut iterations = 0;
         // The whole fixpoint mutates the freelist tree: block refill so no
         // cursor read can draw from an entry these writes are rewriting (see
@@ -121,6 +121,7 @@ impl<'e> WriteTxn<'e> {
             catalog_root: self.catalog_root,
             freelist_root: self.freelist_root,
             high_water: self.high_water,
+            extent_map_root: self.extent_map_root,
         };
         match self.eng.shm.durability {
             Durability::Commit => {

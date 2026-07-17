@@ -207,10 +207,20 @@ fn now_micros() -> i64 {
         .unwrap_or(0)
 }
 
-fn freelist_key(txn: u64, chunk: u16) -> [u8; 10] {
-    let mut k = [0u8; 10];
+/// Freelist entry kinds (the byte between txn and chunk in the key).
+/// DESIGN-BLOBEXTENT §3.3: there was no spare byte in the old 10-byte key, so
+/// v3 keys carry an explicit kind — txn stays FIRST so the refill scan's
+/// early-stop-by-oldest-txn order survives unchanged.
+pub(super) const FK_PAGES: u8 = 0;
+/// Extent runs: values are `(start_page u64 LE ‖ npages u32 LE)` pairs.
+/// Lands with the extent allocator; until then a kind-1 entry is corrupt.
+pub(super) const FK_RUNS: u8 = 1;
+
+fn freelist_key(txn: u64, kind: u8, chunk: u16) -> [u8; 11] {
+    let mut k = [0u8; 11];
     k[..8].copy_from_slice(&txn.to_be_bytes());
-    k[8..].copy_from_slice(&chunk.to_be_bytes());
+    k[8] = kind;
+    k[9..].copy_from_slice(&chunk.to_be_bytes());
     k
 }
 
@@ -507,7 +517,7 @@ impl Engine {
             let r = self.begin_read()?;
             let mut c = btree::cursor(&r, meta.freelist_root, None, None)?;
             while let Some((k, v)) = c.next(&r)? {
-                if k.len() == 10 {
+                if k.len() == 11 && k[8] == FK_PAGES {
                     out.push((u64::from_be_bytes(k[..8].try_into().unwrap()), v.len() / 8));
                 }
             }
@@ -628,6 +638,7 @@ impl Engine {
             meta,
             catalog_root: meta.catalog_root,
             freelist_root: meta.freelist_root,
+            extent_map_root: meta.extent_map_root,
             high_water: meta.high_water,
             table_roots: HashMap::new(),
             dirty: DirtySet::default(),
