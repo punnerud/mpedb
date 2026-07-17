@@ -177,7 +177,7 @@ pub(crate) fn create_mirror_db(
             concurrency: Concurrency::Serial,
             // A mirror file carries no RLS assertions: the mirror applier runs
             // at the engine level, BELOW policies, by design (DESIGN-MIRROR §0).
-            extent_threshold: None,
+            extent_threshold: mpedb_types::config::default_extent_threshold(),
             require_policy: Default::default(),
             perms: FilePerms {
                 mode: None,

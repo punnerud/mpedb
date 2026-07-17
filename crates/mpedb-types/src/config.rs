@@ -144,10 +144,30 @@ struct RawDatabase {
     #[serde(default)]
     group: Option<String>,
     /// Values whose encoded payload exceeds this many KiB take an extent run
-    /// instead of an overflow chain (DESIGN-BLOBEXTENT §8). Absent = the
-    /// extent path is off — today's behavior byte for byte.
+    /// instead of an overflow chain (DESIGN-BLOBEXTENT §8). `0` = explicitly
+    /// off. Absent = the PLATFORM default: 16 on Linux (measured win from
+    /// ~8 KiB, monotonic to 2.8×), off on macOS (the sparse preallocation
+    /// makes per-value pwrites lose at every measured size until the B4
+    /// coalescing levers land).
     #[serde(default)]
     extent_threshold_kb: Option<u64>,
+}
+
+/// The measured per-platform default (DESIGN-BLOBEXTENT §8; blob_bulk_ab,
+/// 2026-07-17): Linux crosses over at ~2 pages and is monotonic above —
+/// 16 KiB is conservative-side of clear wins. macOS loses at every measured
+/// size (sparse preallocation: each payload pwrite allocates APFS blocks),
+/// so its default stays OFF until the per-commit pwritev coalescing and
+/// F_PREALLOCATE levers land.
+pub fn default_extent_threshold() -> Option<usize> {
+    #[cfg(target_os = "linux")]
+    {
+        Some(16 * 1024)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
 }
 
 fn default_size_mb() -> u64 {
@@ -320,7 +340,11 @@ fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>) -> Result<Config> {
                     owner: db.owner,
                     group: db.group,
                 },
-                extent_threshold: db.extent_threshold_kb.map(|kb| kb as usize * 1024),
+                extent_threshold: match db.extent_threshold_kb {
+                    Some(0) => None,
+                    Some(kb) => Some(kb as usize * 1024),
+                    None => default_extent_threshold(),
+                },
                 require_policy,
             },
             schema: Schema::new(tables)?,

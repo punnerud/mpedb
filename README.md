@@ -481,15 +481,19 @@ Linux-shaped optimisation (there `msync(MS_SYNC)` really does sync only the
 range) meeting a platform where it multiplies. Logged as known-issue #0; use
 `wal`. Details: [BENCHMARKS.md](BENCHMARKS.md#apple-silicon-m3-pro-11-cores--and-the-durability-trap-it-exposed).
 
-**Bulk bytes are not mpedb's game — yet.** Pushing 256 MiB of 4 KiB blobs on
-Linux, SQLite writes 998 MiB/s to mpedb's 602 (38% vs 23% of what a raw
-`std::fs` write does on the same medium; on the M3 the cell already goes the
-other way) — a blob larger than the page takes an overflow chain, and the
-payload pays a page fault per fresh page on its way through the mapping. The
-plan that closes this is written and review-hardened:
-[`DESIGN-BLOBEXTENT.md`](DESIGN-BLOBEXTENT.md) — WiscKey-style key/value
-separation, where large values become immutable extents written once via
-`pwrite` and the COW tree keeps a 20-byte reference. See
+**Bulk bytes: extents changed the game — measured, per platform.** Large
+values now take the WiscKey path from
+[`DESIGN-BLOBEXTENT.md`](DESIGN-BLOBEXTENT.md): immutable extents written
+once via `pwrite`, with the COW tree keeping a 20-byte reference and every
+crash-safety property intact (SIGKILL-fuzzed and power-loss-simulated in
+both WAL modes). Paired same-binary A/B (`examples/blob_bulk_ab`): on Linux
+the extent path is **2.1–2.8× faster from 64 KiB up** (5.4 GB/s on 1 MiB
+blobs, tmpfs) and wins from ~8 KiB; on macOS it currently LOSES below ~1 MiB
+(sparse preallocation makes each payload pwrite allocate APFS blocks), so
+the default differs per platform: **on by default at 16 KiB on Linux, off on
+macOS** — `extent_threshold_kb` in the config overrides either way (`0` =
+off). The 4 KiB cell and the macOS curve share one queued fix: per-commit
+coalesced `pwritev`. See
 [BENCHMARKS.md](BENCHMARKS.md#bulk-mbs--and-the-number-that-makes-it-mean-something).
 
 ```sh
