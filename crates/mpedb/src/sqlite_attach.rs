@@ -137,7 +137,13 @@ impl SqliteAttach {
                     .collect();
                 (
                     PkKind::Ipk(ipk),
-                    TableDef { name: t.name.clone(), columns: cols, primary_key: vec![ipk as u16] },
+                    TableDef {
+                        id: 0,
+                        name: t.name.clone(),
+                        columns: cols,
+                        primary_key: vec![ipk as u16],
+                        indexes: vec![],
+                    },
                 )
             } else if t.without_rowid {
                 let found = (t.pk_order.len() == 1)
@@ -170,7 +176,13 @@ impl SqliteAttach {
                     .collect();
                 (
                     PkKind::WithoutRowidKey(i, ty),
-                    TableDef { name: t.name.clone(), columns: cols, primary_key: vec![i as u16] },
+                    TableDef {
+                        id: 0,
+                        name: t.name.clone(),
+                        columns: cols,
+                        primary_key: vec![i as u16],
+                        indexes: vec![],
+                    },
                 )
             } else {
                 if t.columns.iter().any(|c| c.eq_ignore_ascii_case("rowid")) {
@@ -186,22 +198,26 @@ impl SqliteAttach {
                 (
                     PkKind::SyntheticRowid,
                     TableDef {
+                        id: 0,
                         name: t.name.clone(),
                         columns: cols,
                         primary_key: vec![pk as u16],
+                        indexes: vec![],
                     },
                 )
             };
             defs.push(def);
             tables.push(Attached { src: t, pk });
         }
-        // `Schema::table_id` binary-searches by name: the tables MUST be
-        // name-sorted, and the attach list must mirror the same order so a
-        // plan's table id indexes both consistently.
+        // The attach list must mirror `Schema`'s table order so a plan's
+        // table id indexes both consistently. `Schema::new` sorts by name
+        // and assigns dense ids in that order (never a struct literal here —
+        // a literal would leave every id 0, and id-based lookups would then
+        // answer every query from table 0).
         let mut both: Vec<(TableDef, Attached)> = defs.into_iter().zip(tables).collect();
         both.sort_by(|a, b| a.0.name.cmp(&b.0.name));
         let (defs, tables): (Vec<_>, Vec<_>) = both.into_iter().unzip();
-        Ok(SqliteAttach { file, tables, schema: Schema { tables: defs }, skipped })
+        Ok(SqliteAttach { file, tables, schema: Schema::new(defs)?, skipped })
     }
 
     pub fn schema(&self) -> &Schema {

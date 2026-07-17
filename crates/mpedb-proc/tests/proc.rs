@@ -418,9 +418,11 @@ fn stale_plan_surfaces_plan_invalidated() {
         check: None,
     };
     let other_schema = Schema::new(vec![TableDef {
+        id: 0,
         name: "accounts".into(),
         columns: vec![col("id"), col("balance"), col("extra")],
         primary_key: vec![0],
+        indexes: vec![],
     }])
     .unwrap();
     let foreign = mpedb_sql::prepare(sql, &other_schema).unwrap();

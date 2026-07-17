@@ -1446,6 +1446,7 @@ primary_key = ["id"]
 
         // 3. Blob compiled against a different schema → PlanInvalidated.
         let other_schema = Schema::new(vec![TableDef {
+            id: 0,
             name: "users".into(),
             columns: vec![ColumnDef {
                 name: "id".into(),
@@ -1457,6 +1458,7 @@ primary_key = ["id"]
                 check: None,
             }],
             primary_key: vec![0],
+            indexes: vec![],
         }])
         .unwrap();
         let foreign = mpedb_sql::prepare("SELECT * FROM users WHERE id = $1", &other_schema).unwrap();
@@ -1752,6 +1754,7 @@ primary_key = ["id"]
         // its embedded schema_hash will not match the live one — exactly what a
         // client holding a stale detached plan across a schema migration has.
         let foreign_schema = Schema::new(vec![TableDef {
+            id: 0,
             name: "users".into(),
             columns: vec![ColumnDef {
                 name: "id".into(),
@@ -1763,6 +1766,7 @@ primary_key = ["id"]
                 check: None,
             }],
             primary_key: vec![0],
+            indexes: vec![],
         }])
         .unwrap();
         let foreign = mpedb_sql::prepare(sql, &foreign_schema).unwrap();

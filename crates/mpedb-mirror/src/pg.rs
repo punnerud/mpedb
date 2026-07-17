@@ -264,9 +264,11 @@ pub fn to_table_def(src: &PgTable) -> Result<TableDef> {
         });
     }
     Ok(TableDef {
+        id: 0, // assigned by Schema::new in build_schema
         name: src.name.clone(),
         columns,
         primary_key: src.pk.iter().map(|&i| i as u16).collect(),
+        indexes: vec![],
     })
 }
 

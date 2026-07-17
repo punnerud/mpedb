@@ -80,9 +80,11 @@ pub fn dual_def() -> &'static mpedb_types::TableDef {
     use std::sync::OnceLock;
     static DUAL: OnceLock<mpedb_types::TableDef> = OnceLock::new();
     DUAL.get_or_init(|| mpedb_types::TableDef {
+        id: 0,
         name: String::new(),
         columns: Vec::new(),
         primary_key: Vec::new(),
+        indexes: Vec::new(),
     })
 }
 

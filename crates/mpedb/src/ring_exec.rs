@@ -891,9 +891,11 @@ mod tests {
             check: None,
         };
         let table = |name: &str| TableDef {
+            id: 0,
             name: name.into(),
             columns: vec![col("id", false), col("v", true)],
             primary_key: vec![0],
+            indexes: vec![],
         };
         Schema::new(vec![table("a"), table("b")]).unwrap()
     }

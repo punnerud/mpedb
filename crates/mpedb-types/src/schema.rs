@@ -28,12 +28,36 @@ pub struct ColumnDef {
     pub check: Option<String>,
 }
 
+/// One secondary index (canonical-bytes v2, DESIGN-SCHEMA-V2). `index_no` in
+/// the catalog/plans is `1 + position` in `TableDef::indexes` (0 = PK tree).
+/// Column order is significant. This list is the SINGLE source of truth for
+/// index numbering — the per-column `unique`/`indexed` flags are input sugar
+/// and in-memory convenience, reconstructed from here on decode.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexDef {
+    /// Ordinals into `TableDef::columns`, in key order.
+    pub columns: Vec<u16>,
+    pub unique: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableDef {
+    /// Stable table id (DESIGN-SCHEMA-V2): explicit in the canonical bytes,
+    /// stable for the table's life, allocated lowest-free (always
+    /// `< MAX_TABLES`, which the footprint/CDC bitmaps require). In the
+    /// current format window ids are DENSE 0..n and equal the position in
+    /// `Schema::tables` — enforced by `validate`, relaxed only when DROP
+    /// TABLE lands with the positional audit (design §6).
+    pub id: u32,
     pub name: String,
     pub columns: Vec<ColumnDef>,
     /// Indices into `columns`. Non-empty; PK columns must be NOT NULL.
     pub primary_key: Vec<u16>,
+    /// Secondary indexes in `index_no` order. `Schema::new` fills this from
+    /// the column flags (declaration order) and appends explicitly declared
+    /// entries; hand-built `TableDef`s normally leave it empty and let
+    /// `Schema::new` derive.
+    pub indexes: Vec<IndexDef>,
 }
 
 impl TableDef {
@@ -68,11 +92,61 @@ fn valid_identifier(s: &str) -> bool {
         && !s.starts_with("__mpedb")
 }
 
+/// Upper bound on secondary indexes per table (canonical-bytes v2).
+pub const MAX_INDEXES: usize = 32;
+
 impl Schema {
     /// Build and validate a schema from table definitions (any order; sorted
-    /// internally by name).
+    /// internally by name). Assigns DENSE stable ids 0..n in name-sorted
+    /// order — deterministic under input reordering, which is what keeps the
+    /// schema hash independent of `[[table]]` declaration order. Normalizes
+    /// the column index flags (`unique` implies not separately `indexed` —
+    /// they build ONE unique index) and derives `TableDef::indexes` from the
+    /// flags in column-declaration order, appending any explicitly declared
+    /// entries after the derived ones.
     pub fn new(mut tables: Vec<TableDef>) -> Result<Schema> {
         tables.sort_by(|a, b| a.name.cmp(&b.name));
+        for (pos, t) in tables.iter_mut().enumerate() {
+            t.id = pos as u32;
+            // Normalize sugar: a column that is both `unique` and `indexed`
+            // has ONE unique index (the engine has always treated it so),
+            // and flags on the single PK column are meaningless (the PK tree
+            // is index 0). Without normalization these spellings round-trip
+            // unequally through the wire format, which does not carry flags.
+            let single_pk =
+                (t.primary_key.len() == 1).then(|| t.primary_key[0]);
+            for (i, c) in t.columns.iter_mut().enumerate() {
+                if c.unique {
+                    c.indexed = false;
+                }
+                if single_pk == Some(i as u16) {
+                    c.unique = false;
+                    c.indexed = false;
+                }
+            }
+            let explicit = std::mem::take(&mut t.indexes);
+            let mut list: Vec<IndexDef> = t
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(i, c)| {
+                    (c.unique || c.indexed)
+                        && !(t.primary_key.len() == 1 && t.primary_key[0] == *i as u16)
+                })
+                .map(|(i, c)| IndexDef { columns: vec![i as u16], unique: c.unique })
+                .collect();
+            // Append explicit entries the derivation did not already produce.
+            // The `contains` guard makes `Schema::new` IDEMPOTENT: re-wrapping
+            // a table that already went through it (tests and tools clone
+            // tables into new schemas) must not double-derive the flag
+            // indexes into a duplicate-shape refusal.
+            for e in explicit {
+                if !list.contains(&e) {
+                    list.push(e);
+                }
+            }
+            t.indexes = list;
+        }
         let schema = Schema { tables };
         schema.validate()?;
         Ok(schema)
@@ -89,9 +163,26 @@ impl Schema {
                 MAX_TABLES - 8 // headroom for system tables
             )));
         }
-        for w in self.tables.windows(2) {
-            if w[0].name == w[1].name {
-                return Err(Error::Schema(format!("duplicate table `{}`", w[0].name)));
+        // Set-based, NOT `windows(2)` on the vec: the vec is id-sorted, and
+        // once CREATE TABLE appends out of name order, adjacency would stop
+        // detecting non-adjacent duplicates (adversarial-review finding).
+        let mut names: Vec<&str> = self.tables.iter().map(|t| t.name.as_str()).collect();
+        names.sort_unstable();
+        if names.windows(2).any(|w| w[0] == w[1]) {
+            return Err(Error::Schema("duplicate table name".into()));
+        }
+        // DENSE ids in this format window (DESIGN-SCHEMA-V2 §1.2): position
+        // == id is an ENFORCED invariant, so every positional site in the
+        // engine stays provably correct. DROP TABLE's PR relaxes this after
+        // the positional audit — a gapped file must refuse here rather than
+        // silently mis-decode rows through the wrong table's column types.
+        for (pos, t) in self.tables.iter().enumerate() {
+            if t.id != pos as u32 {
+                return Err(Error::Schema(format!(
+                    "table `{}` has id {} at position {pos}: ids must be dense 0..n \
+                     in this format window",
+                    t.name, t.id
+                )));
             }
         }
         for t in &self.tables {
@@ -193,6 +284,71 @@ impl Schema {
                     )));
                 }
             }
+            // The authoritative index list (canonical-bytes v2). The flag
+            // check above is defense for hand-built defs; THIS is the check
+            // every decode path must pass.
+            if t.indexes.len() > MAX_INDEXES {
+                return Err(Error::Schema(format!(
+                    "table `{}` has {} indexes (max {MAX_INDEXES})",
+                    t.name,
+                    t.indexes.len()
+                )));
+            }
+            for ix in &t.indexes {
+                if ix.columns.is_empty() {
+                    return Err(Error::Schema(format!(
+                        "empty index column list in `{}`",
+                        t.name
+                    )));
+                }
+                let mut cols = ix.columns.clone();
+                cols.sort_unstable();
+                if cols.windows(2).any(|w| w[0] == w[1]) {
+                    return Err(Error::Schema(format!(
+                        "duplicate column in an index on `{}`",
+                        t.name
+                    )));
+                }
+                for &ci in &ix.columns {
+                    let c = t.columns.get(ci as usize).ok_or_else(|| {
+                        Error::Schema(format!(
+                            "index column ordinal {ci} out of range in `{}`",
+                            t.name
+                        ))
+                    })?;
+                    // Same reasoning as the PK/flag rules: index keys are
+                    // keycode-encoded, and `any` has no order across types —
+                    // a review-built v2 blob with an `any` index would
+                    // resurrect the wrong-rows/wrong-DELETE bug.
+                    if c.ty == ColumnType::Any {
+                        return Err(Error::Schema(format!(
+                            "index column `{}.{}` cannot be `any`: the index \
+                             is memcmp-ordered and `any` has no order across \
+                             types",
+                            t.name, c.name
+                        )));
+                    }
+                }
+                if ix.columns.len() == 1
+                    && t.primary_key.len() == 1
+                    && t.primary_key[0] == ix.columns[0]
+                {
+                    return Err(Error::Schema(format!(
+                        "index on `{}` duplicates the primary key tree (index 0)",
+                        t.name
+                    )));
+                }
+            }
+            for i in 0..t.indexes.len() {
+                for j in i + 1..t.indexes.len() {
+                    if t.indexes[i] == t.indexes[j] {
+                        return Err(Error::Schema(format!(
+                            "duplicate index shape on `{}`",
+                            t.name
+                        )));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -209,18 +365,22 @@ impl Schema {
     }
 
     /// Canonical, deterministic serialization — the schema-hash preimage and
-    /// the format stored in the database catalog.
+    /// the format stored in the database catalog (v2, DESIGN-SCHEMA-V2).
+    /// The per-column `unique`/`indexed` flags are NOT serialized (bits 1–7
+    /// written zero): `indexes` is the single source of truth on the wire,
+    /// and decode reconstructs the in-memory convenience flags from it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-        buf.push(1u8); // schema encoding version
+        buf.push(2u8); // schema encoding version
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
+            buf.extend_from_slice(&t.id.to_le_bytes());
             write_str(&mut buf, &t.name);
             buf.extend_from_slice(&(t.columns.len() as u16).to_le_bytes());
             for c in &t.columns {
                 write_str(&mut buf, &c.name);
                 buf.push(c.ty as u8);
-                buf.push((c.nullable as u8) | ((c.unique as u8) << 1) | ((c.indexed as u8) << 2));
+                buf.push(c.nullable as u8);
                 match &c.default {
                     None => buf.push(0),
                     Some(DefaultExpr::Const(v)) => {
@@ -241,19 +401,32 @@ impl Schema {
             for &i in &t.primary_key {
                 buf.extend_from_slice(&i.to_le_bytes());
             }
+            buf.extend_from_slice(&(t.indexes.len() as u16).to_le_bytes());
+            for ix in &t.indexes {
+                buf.push(ix.unique as u8);
+                buf.extend_from_slice(&(ix.columns.len() as u16).to_le_bytes());
+                for &ci in &ix.columns {
+                    buf.extend_from_slice(&ci.to_le_bytes());
+                }
+            }
         }
         buf
     }
 
     /// Parse [`canonical_bytes`] output (bounds-checked; used when attaching
-    /// to an existing database to recover its schema from the catalog).
+    /// to an existing database to recover its schema from the catalog). Only
+    /// version 2 is accepted — v1 files refuse loudly and are regenerated
+    /// (DESIGN-SCHEMA-V2 §5; the project carries no migration burden).
     pub fn from_canonical_bytes(buf: &[u8]) -> Result<Schema> {
         let err = || Error::Corrupt("truncated schema".into());
         let mut pos = 0usize;
         let version = *buf.get(pos).ok_or_else(err)?;
         pos += 1;
-        if version != 1 {
-            return Err(Error::Corrupt(format!("unknown schema version {version}")));
+        if version != 2 {
+            return Err(Error::Corrupt(format!(
+                "unknown schema version {version} (v1 files predate canonical-bytes v2 — \
+                 regenerate or re-import)"
+            )));
         }
         let ntables = read_u32(buf, &mut pos)? as usize;
         if ntables > MAX_TABLES {
@@ -261,6 +434,7 @@ impl Schema {
         }
         let mut tables = Vec::with_capacity(ntables);
         for _ in 0..ntables {
+            let id = read_u32(buf, &mut pos)?;
             let name = read_str(buf, &mut pos)?;
             let ncols = read_u16(buf, &mut pos)? as usize;
             if ncols > MAX_COLUMNS {
@@ -272,6 +446,8 @@ impl Schema {
                 let ty = ColumnType::from_tag(*buf.get(pos).ok_or_else(err)?)
                     .ok_or_else(|| Error::Corrupt("bad column type".into()))?;
                 pos += 1;
+                // bits 1–7 are reserved-zero on write and IGNORED on read:
+                // the index list is the only wire truth (design §1.5).
                 let flags = *buf.get(pos).ok_or_else(err)?;
                 pos += 1;
                 let default = match *buf.get(pos).ok_or_else(err)? {
@@ -304,8 +480,8 @@ impl Schema {
                     name: cname,
                     ty,
                     nullable: flags & 1 != 0,
-                    unique: flags & 2 != 0,
-                    indexed: flags & 4 != 0,
+                    unique: false,
+                    indexed: false,
                     default,
                     check,
                 });
@@ -318,19 +494,61 @@ impl Schema {
             for _ in 0..npk {
                 primary_key.push(read_u16(buf, &mut pos)?);
             }
+            let nindexes = read_u16(buf, &mut pos)? as usize;
+            if nindexes > MAX_INDEXES {
+                return Err(Error::Corrupt("index count out of range".into()));
+            }
+            let mut indexes = Vec::with_capacity(nindexes);
+            for _ in 0..nindexes {
+                let unique = match *buf.get(pos).ok_or_else(err)? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(Error::Corrupt("bad index unique tag".into())),
+                };
+                pos += 1;
+                let nic = read_u16(buf, &mut pos)? as usize;
+                if nic > MAX_COLUMNS {
+                    return Err(Error::Corrupt("index column count out of range".into()));
+                }
+                let mut cols = Vec::with_capacity(nic);
+                for _ in 0..nic {
+                    cols.push(read_u16(buf, &mut pos)?);
+                }
+                indexes.push(IndexDef { columns: cols, unique });
+            }
+            // Reconstruct the in-memory convenience flags from the index
+            // list, in one place: a single-column index marks its column.
+            for ix in &indexes {
+                if let [ci] = ix.columns[..] {
+                    if let Some(c) = columns.get_mut(ci as usize) {
+                        if ix.unique {
+                            c.unique = true;
+                        } else {
+                            c.indexed = true;
+                        }
+                    }
+                }
+            }
             tables.push(TableDef {
+                id,
                 name,
                 columns,
                 primary_key,
+                indexes,
             });
         }
         if pos != buf.len() {
             return Err(Error::Corrupt("trailing bytes in schema".into()));
         }
         // Re-validate: canonical bytes from a hostile/corrupt mapping must
-        // still produce a schema every other invariant can rely on.
+        // still produce a schema every other invariant can rely on —
+        // including the dense-id rule (position == id) that the engine's
+        // positional caches depend on.
         let schema = Schema { tables };
-        schema.validate()?;
+        schema.validate().map_err(|e| match e {
+            Error::Schema(m) => Error::Corrupt(format!("schema bytes invalid: {m}")),
+            other => other,
+        })?;
         Ok(schema)
     }
 
@@ -378,6 +596,7 @@ mod tests {
 
     fn sample() -> Schema {
         Schema::new(vec![TableDef {
+            id: 0,
             name: "users".into(),
             columns: vec![
                 ColumnDef {
@@ -409,6 +628,7 @@ mod tests {
                 },
             ],
             primary_key: vec![0],
+            indexes: vec![],
         }])
         .unwrap()
     }
@@ -428,6 +648,7 @@ mod tests {
                 names
                     .iter()
                     .map(|n| TableDef {
+                        id: 0,
                         name: n.to_string(),
                         columns: vec![ColumnDef {
                             name: "id".into(),
@@ -439,6 +660,7 @@ mod tests {
                             check: None,
                         }],
                         primary_key: vec![0],
+                        indexes: vec![],
                     })
                     .collect(),
             )
@@ -452,6 +674,7 @@ mod tests {
     fn rejects_bad_schemas() {
         // nullable PK
         let bad = Schema::new(vec![TableDef {
+            id: 0,
             name: "t".into(),
             columns: vec![ColumnDef {
                 name: "id".into(),
@@ -463,10 +686,12 @@ mod tests {
                 check: None,
             }],
             primary_key: vec![0],
+            indexes: vec![],
         }]);
         assert!(bad.is_err());
         // reserved prefix
         let bad = Schema::new(vec![TableDef {
+            id: 0,
             name: "__mpedb_plans".into(),
             columns: vec![ColumnDef {
                 name: "id".into(),
@@ -478,44 +703,131 @@ mod tests {
                 check: None,
             }],
             primary_key: vec![0],
+            indexes: vec![],
         }]);
         assert!(bad.is_err());
     }
-    /// **The constraint that blocks `CREATE TABLE`.** Read this before adding
-    /// schema evolution.
-    ///
-    /// A table's id is its index in the NAME-SORTED table vector. So adding a
-    /// table does not append an id — it RENUMBERS every table that sorts after
-    /// the new name. And a table id is not a label; it is a key:
-    ///
-    /// - `cat_tree_key(table_id, index_no)` maps a table to its actual B+tree
-    ///   ROOT. Renumber, and `accounts` (new id 0) reads the tree holding
-    ///   `orders`' rows — silent cross-table corruption, not a stale view.
-    /// - the `cdc\0tabs` capture/write-block bitmaps address tables BY BIT
-    ///   POSITION, so capture would follow the wrong table.
-    /// - the mirror's `map/<tid>`, `imp/<tid>`, `park/<tid>` families all key on
-    ///   it, so type provenance would describe the wrong table.
-    /// - every compiled plan carries `table: u32`.
-    ///
-    /// A Django migration adding `accounts` to a database with `orders` and
-    /// `users` hits exactly this. Making `CREATE TABLE` possible therefore means
-    /// decoupling the id from the sort position (a stable id stored in the
-    /// schema), not bolting DDL onto the parser.
+    /// **The constraint that used to block `CREATE TABLE`, and its fix**
+    /// (DESIGN-SCHEMA-V2). v1's table id WAS the name-sort position, so
+    /// adding a table renumbered every table sorting after it — and the id
+    /// is a key (`cat_tree_key`, CDC bitmaps, mirror families, every plan).
+    /// v2 makes the id EXPLICIT in the canonical bytes; seeding still
+    /// assigns name-sorted (deterministic under config reordering), but
+    /// CREATE TABLE will APPEND at the next free id. In this format window
+    /// ids must stay dense 0..n (`position == id` is enforced, which is
+    /// what keeps every positional engine cache correct until DROP's audit).
     #[test]
-    fn a_table_id_is_its_sort_position_so_adding_a_table_renumbers() {
+    fn ids_are_dense_explicit_and_survive_the_wire() {
         let col = |n: &str| ColumnDef { name: n.into(), ty: ColumnType::Int64,
             nullable: false, unique: false, indexed: false, default: None, check: None };
-        let tbl = |n: &str| TableDef { name: n.into(), columns: vec![col("id")], primary_key: vec![0] };
+        let tbl = |n: &str| TableDef { id: 0, name: n.into(), columns: vec![col("id")],
+            primary_key: vec![0], indexes: vec![] };
 
-        let before = Schema::new(vec![tbl("orders"), tbl("users")]).unwrap();
-        eprintln!("  before: orders={:?} users={:?}",
-            before.table_id("orders"), before.table_id("users"));
+        let s = Schema::new(vec![tbl("orders"), tbl("users"), tbl("accounts")]).unwrap();
+        let got: Vec<(&str, u32)> =
+            s.tables.iter().map(|t| (t.name.as_str(), t.id)).collect();
+        assert_eq!(got, vec![("accounts", 0), ("orders", 1), ("users", 2)]);
 
-        // A Django migration adds `accounts` -- a name that sorts FIRST.
-        let after = Schema::new(vec![tbl("orders"), tbl("users"), tbl("accounts")]).unwrap();
-        eprintln!("  after:  accounts={:?} orders={:?} users={:?}",
-            after.table_id("accounts"), after.table_id("orders"), after.table_id("users"));
-        assert_ne!(before.table_id("orders"), after.table_id("orders"),
-            "adding a table must renumber -- that is the finding");
+        // Explicit in the bytes: the id round-trips, it is not re-derived.
+        let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
+        assert_eq!(s, r);
+
+        // Non-dense ids refuse in this window — a gapped file must never
+        // reach the positional engine caches.
+        let mut gapped = s.clone();
+        gapped.tables[1].id = 5;
+        gapped.tables[2].id = 6;
+        let err = Schema::from_canonical_bytes(&gapped.canonical_bytes()).unwrap_err();
+        assert!(format!("{err}").contains("dense"), "{err}");
+    }
+
+    #[test]
+    fn indexes_derive_normalize_and_roundtrip() {
+        let mut t = TableDef {
+            id: 0,
+            name: "t".into(),
+            columns: vec![
+                ColumnDef { name: "id".into(), ty: ColumnType::Int64, nullable: false,
+                    unique: true, indexed: true, default: None, check: None },
+                ColumnDef { name: "a".into(), ty: ColumnType::Int64, nullable: true,
+                    unique: true, indexed: true, default: None, check: None },
+                ColumnDef { name: "b".into(), ty: ColumnType::Text, nullable: true,
+                    unique: false, indexed: true, default: None, check: None },
+            ],
+            primary_key: vec![0],
+            indexes: vec![IndexDef { columns: vec![1, 2], unique: false }],
+        };
+        // The single-PK column's flags are noise and must normalize away.
+        t.columns[0].unique = true;
+        let s = Schema::new(vec![t]).unwrap();
+        let t = &s.tables[0];
+        // Derived (declaration order) then explicit, with flags normalized:
+        // `a` unique+indexed → ONE unique index; PK column contributes none.
+        assert_eq!(
+            t.indexes,
+            vec![
+                IndexDef { columns: vec![1], unique: true },
+                IndexDef { columns: vec![2], unique: false },
+                IndexDef { columns: vec![1, 2], unique: false },
+            ]
+        );
+        assert!(!t.columns[0].unique && !t.columns[0].indexed);
+        assert!(t.columns[1].unique && !t.columns[1].indexed);
+
+        // Wire round-trip reconstructs the same flags and the same list.
+        let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
+        assert_eq!(s, r);
+        assert_eq!(s.hash(), r.hash());
+    }
+
+    #[test]
+    fn hostile_bytes_refuse_cleanly() {
+        let col = |n: &str, ty| ColumnDef { name: n.into(), ty, nullable: true,
+            unique: false, indexed: false, default: None, check: None };
+        let base = Schema::new(vec![TableDef {
+            id: 0,
+            name: "t".into(),
+            columns: vec![
+                ColumnDef { name: "id".into(), ty: ColumnType::Int64, nullable: false,
+                    unique: false, indexed: false, default: None, check: None },
+                col("v", ColumnType::Any),
+                col("w", ColumnType::Int64),
+            ],
+            primary_key: vec![0],
+            indexes: vec![IndexDef { columns: vec![2], unique: false }],
+        }])
+        .unwrap();
+
+        // An index over an `any` column would resurrect the documented
+        // wrong-rows/wrong-DELETE memcmp bug — decode must refuse it even
+        // though the bytes are structurally well-formed.
+        let mut evil = base.clone();
+        evil.tables[0].indexes = vec![IndexDef { columns: vec![1], unique: false }];
+        let err = Schema::from_canonical_bytes(&evil.canonical_bytes()).unwrap_err();
+        assert!(format!("{err}").contains("any"), "{err}");
+
+        // Duplicate index shapes refuse.
+        let mut evil = base.clone();
+        evil.tables[0]
+            .indexes
+            .push(IndexDef { columns: vec![2], unique: false });
+        assert!(Schema::from_canonical_bytes(&evil.canonical_bytes()).is_err());
+
+        // An index equal to the whole single-column PK duplicates index 0.
+        let mut evil = base.clone();
+        evil.tables[0].indexes = vec![IndexDef { columns: vec![0], unique: true }];
+        assert!(Schema::from_canonical_bytes(&evil.canonical_bytes()).is_err());
+
+        // v1 bytes (version byte 1) refuse by name — no migration exists.
+        let mut v1ish = base.canonical_bytes();
+        v1ish[0] = 1;
+        let err = Schema::from_canonical_bytes(&v1ish).unwrap_err();
+        assert!(format!("{err}").contains("unknown schema version 1"), "{err}");
+
+        // Truncation at EVERY offset yields Corrupt, never a panic.
+        let bytes = base.canonical_bytes();
+        for i in 0..bytes.len() {
+            assert!(Schema::from_canonical_bytes(&bytes[..i]).is_err(), "offset {i}");
+        }
     }
 }
