@@ -211,6 +211,45 @@ pub fn encode_row(values: &[Value], types: &[ColumnType]) -> Result<Vec<u8>> {
 }
 
 /// Decode one column from an encoded row without touching the others.
+/// Bytes of the row image the header occupies: null bitmap + fixed section.
+/// This prefix is all [`varlen_window`] needs — the chunked blob reader
+/// (#50 B4) reads it once and never materializes the varlen body.
+pub fn head_len(types: &[ColumnType]) -> usize {
+    bitmap_len(types.len()) + types.iter().map(|&t| fixed_width(t)).sum::<usize>()
+}
+
+/// The byte window of varlen column `col` inside the FULL row image:
+/// `Ok(None)` for NULL. `head` must hold at least [`head_len`] bytes (a
+/// prefix of the row image). Rigid `text`/`blob` columns only — an `any`
+/// column's payload layout is per value, and the reader refuses it by name.
+pub fn varlen_window(
+    head: &[u8],
+    types: &[ColumnType],
+    col: usize,
+) -> Result<Option<(u64, u64)>> {
+    let err = || Error::Corrupt("truncated row head".into());
+    let ty = *types
+        .get(col)
+        .ok_or_else(|| Error::Internal(format!("column {col} out of range")))?;
+    if !matches!(ty, ColumnType::Text | ColumnType::Blob) {
+        return Err(Error::Unsupported(format!(
+            "chunked reads need a rigid text/blob column, got {ty}"
+        )));
+    }
+    let bm_byte = *head.get(col / 8).ok_or_else(err)?;
+    if bm_byte & (1 << (col % 8)) != 0 {
+        return Ok(None);
+    }
+    let mut off = bitmap_len(types.len());
+    for &t in &types[..col] {
+        off += fixed_width(t);
+    }
+    let raw = head.get(off..off + 8).ok_or_else(err)?;
+    let var_off = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as u64;
+    let len = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as u64;
+    Ok(Some((head_len(types) as u64 + var_off, len)))
+}
+
 pub fn decode_column(buf: &[u8], types: &[ColumnType], col: usize) -> Result<Value> {
     let err = || Error::Corrupt("truncated row".into());
     if col >= types.len() {

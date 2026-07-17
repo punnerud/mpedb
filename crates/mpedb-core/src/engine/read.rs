@@ -55,6 +55,50 @@ impl ReadTxn<'_> {
         catalog_entry(self, self.meta.catalog_root, table_id, 0).map(|(_, c)| c)
     }
 
+    /// Open one `text`/`blob` column of one row for CHUNKED reading — the
+    /// eviction valve of DESIGN-BLOBEXTENT §5. `range` clamps to the value
+    /// (`None` = the whole value); `Ok(None)` when the row is absent or the
+    /// column is NULL. Each chunk is copied out AFTER a pin revalidation, so
+    /// eviction between chunks surfaces as `SnapshotEvicted` — never as
+    /// mixed bytes. One bounded memcpy per chunk is the honest cost;
+    /// zero-copy is deliberately NOT promised for live databases.
+    pub fn blob_read(
+        &self,
+        table_id: u32,
+        pk_values: &[Value],
+        col: usize,
+        range: Option<(u64, u64)>,
+    ) -> Result<Option<BlobReader<'_, '_>>> {
+        let types = self
+            .eng
+            .col_types
+            .get(table_id as usize)
+            .ok_or_else(|| Error::Internal("table id out of range".into()))?;
+        let key = keycode::encode_key(pk_values);
+        let root = self.tree_root(table_id, 0)?;
+        let Some(loc) = btree::value_loc(self, root, &key)? else {
+            return Ok(None);
+        };
+        // The row HEAD (bitmap + fixed) is all the window computation needs;
+        // it is bounded by the schema, never by the value.
+        let head_len = row::head_len(types).min(loc.len() as usize);
+        let mut head = vec![0u8; head_len];
+        btree::read_value_range(self, &loc, 0, &mut head)?;
+        let Some((start, len)) = row::varlen_window(&head, types, col)? else {
+            return Ok(None);
+        };
+        let (off, want) = range.unwrap_or((0, u64::MAX));
+        let off = off.min(len);
+        let len = want.min(len - off);
+        Ok(Some(BlobReader {
+            txn: self,
+            loc,
+            start: start + off,
+            len,
+            pos: 0,
+        }))
+    }
+
     pub fn get_by_pk(&self, table_id: u32, pk_values: &[Value]) -> Result<Option<Vec<Value>>> {
         let key = keycode::encode_key(pk_values);
         let root = self.tree_root(table_id, 0)?;
@@ -291,5 +335,53 @@ impl RowCursor<'_, '_> {
                 &self.txn.eng.col_types[self.table_id as usize],
             )?)),
         }
+    }
+}
+
+// ------------------------------------------------------------- BlobReader
+
+/// The chunked reads of one column's bytes (#50 B4). The [`ReadTxn`]'s pin is
+/// what keeps the pages/extent run unreusable while chunks stream; the
+/// per-chunk revalidation is what makes eviction an ERROR instead of a read
+/// of recycled bytes.
+pub struct BlobReader<'t, 'e> {
+    txn: &'t ReadTxn<'e>,
+    loc: btree::ValueLoc,
+    /// Window start inside the row image (column start + caller offset).
+    start: u64,
+    /// Window length (clamped to the value).
+    len: u64,
+    pos: u64,
+}
+
+/// Chunk ceiling — DESIGN-BLOBEXTENT §5's default. Small enough that a slow
+/// consumer never holds more than this much copied memory per step, big
+/// enough that an extent read is a handful of memcpys per MiB.
+pub const BLOB_CHUNK: usize = 256 * 1024;
+
+impl BlobReader<'_, '_> {
+    /// Total bytes this reader will yield (the clamped window).
+    pub fn len(&self) -> u64 {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The next chunk (≤ [`BLOB_CHUNK`] bytes), or `None` when done.
+    // fallible + stateful, so deliberately not std::iter::Iterator
+    #[allow(clippy::should_implement_trait)]
+    pub fn next(&mut self) -> Result<Option<Vec<u8>>> {
+        if self.pos >= self.len {
+            return Ok(None);
+        }
+        if !self.txn.still_pinned() {
+            return Err(Error::SnapshotEvicted);
+        }
+        let n = (self.len - self.pos).min(BLOB_CHUNK as u64) as usize;
+        let mut buf = vec![0u8; n];
+        btree::read_value_range(self.txn, &self.loc, self.start + self.pos, &mut buf)?;
+        self.pos += n as u64;
+        Ok(Some(buf))
     }
 }
