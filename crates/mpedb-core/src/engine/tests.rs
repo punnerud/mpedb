@@ -1220,3 +1220,104 @@ primary_key = ["id"]
     eng.verify_page_accounting().unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+/// #50 B4: the chunked blob reader against all three value shapes — inline,
+/// overflow chain, extent — full reads, ranged reads that cross page
+/// boundaries, NULL, and the absent row. Byte-exact against the source.
+#[test]
+fn blob_read_chunks_every_value_shape() {
+    let path = std::env::temp_dir()
+        .join("mpedb-engine-tests")
+        .join(format!("blobread-{}.mpedb", std::process::id()));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        r#"
+[database]
+path = "{}"
+size_mb = 32
+max_readers = 8
+
+[[table]]
+name = "blobs"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+
+  [[table.column]]
+  name = "data"
+  type = "blob"
+"#,
+        path.display()
+    );
+    let cfg = Config::from_toml_str(&toml).unwrap();
+    let mut eng = Engine::open(&cfg, vec![vec![]]).unwrap();
+    eng.set_extent_threshold(Some(4096));
+
+    let blob = |seed: u8, len: usize| -> Vec<u8> {
+        (0..len).map(|i| seed.wrapping_add((i % 251) as u8)).collect()
+    };
+    // id 1: inline (small); id 2: extent (past the 4 KiB threshold);
+    // id 3: NULL. An overflow CHAIN needs a value past the inline cap but
+    // under the threshold — id 4 with the threshold briefly OFF.
+    {
+        let mut w = eng.begin_write().unwrap();
+        w.insert_row(0, &[Value::Int(1), Value::Blob(blob(1, 100))]).unwrap();
+        w.insert_row(0, &[Value::Int(2), Value::Blob(blob(2, 1_500_000))]).unwrap();
+        w.insert_row(0, &[Value::Int(3), Value::Null]).unwrap();
+        w.commit().unwrap();
+    }
+    eng.set_extent_threshold(None);
+    {
+        let mut w = eng.begin_write().unwrap();
+        w.insert_row(0, &[Value::Int(4), Value::Blob(blob(4, 100_000))]).unwrap();
+        w.commit().unwrap();
+    }
+    eng.set_extent_threshold(Some(4096));
+
+    let r = eng.begin_read().unwrap();
+    let full = |id: i64| -> Vec<u8> {
+        let mut br = r.blob_read(0, &[Value::Int(id)], 1, None).unwrap().unwrap();
+        let mut out = Vec::new();
+        while let Some(chunk) = br.next().unwrap() {
+            assert!(chunk.len() <= super::read::BLOB_CHUNK);
+            out.extend_from_slice(&chunk);
+        }
+        assert_eq!(out.len() as u64, br.len());
+        out
+    };
+    assert_eq!(full(1), blob(1, 100), "inline");
+    assert_eq!(full(2), blob(2, 1_500_000), "extent");
+    assert_eq!(full(4), blob(4, 100_000), "overflow chain");
+
+    // Ranged reads crossing page boundaries, against the source slice.
+    for (id, len) in [(2i64, 1_500_000usize), (4, 100_000)] {
+        let src = blob(id as u8, len);
+        for (off, want) in [(4093u64, 10_000u64), (0, 1), (len as u64 - 7, 100)] {
+            let mut br = r
+                .blob_read(0, &[Value::Int(id)], 1, Some((off, want)))
+                .unwrap()
+                .unwrap();
+            let mut out = Vec::new();
+            while let Some(chunk) = br.next().unwrap() {
+                out.extend_from_slice(&chunk);
+            }
+            let lo = off as usize;
+            let hi = (off + want).min(len as u64) as usize;
+            assert_eq!(out, &src[lo..hi], "id {id} range {off}+{want}");
+        }
+    }
+
+    // NULL column and absent row are both a clean None.
+    assert!(r.blob_read(0, &[Value::Int(3)], 1, None).unwrap().is_none());
+    assert!(r.blob_read(0, &[Value::Int(99)], 1, None).unwrap().is_none());
+    // A non-varlen column is refused by name.
+    assert!(matches!(
+        r.blob_read(0, &[Value::Int(1)], 0, None),
+        Err(Error::Unsupported(_))
+    ));
+    r.finish().unwrap();
+    let _ = std::fs::remove_file(&path);
+}

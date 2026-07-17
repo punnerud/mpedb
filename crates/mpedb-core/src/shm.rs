@@ -2010,6 +2010,22 @@ impl Shm {
         durability: Durability,
         db_path: &Path,
     ) -> Result<Shm> {
+        // Q1 (DESIGN-BLOBEXTENT §14): on a 32-bit target `size as usize`
+        // below would silently TRUNCATE a ≥ 4 GiB size — the mapping comes up
+        // smaller than `page_count` believes, and the first access past it is
+        // a SIGSEGV, not an Error. Refuse here, where it is a config/file
+        // problem with a name; every downstream `page * PAGE_SIZE as usize`
+        // is then bounded by a size that fits the address space. (A size that
+        // fits usize but exceeds what the OS will map still fails cleanly at
+        // mmap below.)
+        if usize::try_from(size).is_err() {
+            return Err(Error::Config(format!(
+                "database size {} MiB does not fit this platform's {}-bit address space \
+                 — lower size_mb",
+                size / (1024 * 1024),
+                usize::BITS,
+            )));
+        }
         #[cfg(target_os = "linux")]
         let _ = db_path; // Linux uses the mapped robust mutex; no sidecar.
         let ptr = unsafe {

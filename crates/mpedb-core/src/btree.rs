@@ -561,6 +561,141 @@ fn read_leaf_val<S: PageStore + ?Sized>(store: &S, val: LeafVal<'_>) -> Result<V
 
 // ---------- public operations ----------
 
+/// Where one stored value's bytes live — the descriptor the chunked blob
+/// reader (#50 B4) walks WITHOUT materializing the value. `Inline` copies at
+/// open (bounded by a leaf cell, ≤ ~4 KB); the other two hold coordinates.
+#[derive(Debug, Clone)]
+pub enum ValueLoc {
+    Inline(Vec<u8>),
+    Overflow { total_len: u32, first_page: u64 },
+    Extent { start_page: u64, total_len: u64 },
+}
+
+impl ValueLoc {
+    pub fn len(&self) -> u64 {
+        match self {
+            ValueLoc::Inline(v) => v.len() as u64,
+            ValueLoc::Overflow { total_len, .. } => *total_len as u64,
+            ValueLoc::Extent { total_len, .. } => *total_len,
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// The [`ValueLoc`] for `key`, or `None` when absent — [`get`]'s descent
+/// without the read.
+pub fn value_loc<S: PageStore + ?Sized>(
+    store: &S,
+    root: u64,
+    key: &[u8],
+) -> Result<Option<ValueLoc>> {
+    if root == 0 {
+        return Ok(None);
+    }
+    let mut id = root;
+    for _ in 0..64 {
+        let p = store.page(id)?;
+        check_node(p)?;
+        match kind(p) {
+            KIND_BRANCH => id = branch_child(p, descent_index(p, key)?)?,
+            KIND_LEAF => {
+                return match search(p, key)? {
+                    Ok(i) => Ok(Some(match leaf_cell(p, i)?.1 {
+                        LeafVal::Inline(v) => ValueLoc::Inline(v.to_vec()),
+                        LeafVal::Overflow { total_len, first_page } => {
+                            ValueLoc::Overflow { total_len, first_page }
+                        }
+                        LeafVal::Extent { start_page, total_len, .. } => {
+                            ValueLoc::Extent { start_page, total_len }
+                        }
+                    })),
+                    Err(_) => Ok(None),
+                };
+            }
+            _ => return Err(corrupt("unexpected page kind in descent")),
+        }
+    }
+    Err(corrupt("tree too deep (cycle?)"))
+}
+
+/// Copy value bytes `[off, off + out.len())` into `out`. The caller bounds
+/// the window (`off + out.len() ≤ loc.len()`); overshooting is an error, not
+/// a short read. Overflow chains skip whole pages to the offset; an extent is
+/// pure offset math into its contiguous run — one bounded copy either way,
+/// which is the honest cost the chunked API promises (zero-copy is NOT
+/// offered on live databases; FrozenDb (#22) is where borrowing is sound).
+pub fn read_value_range<S: PageStore + ?Sized>(
+    store: &S,
+    loc: &ValueLoc,
+    off: u64,
+    out: &mut [u8],
+) -> Result<()> {
+    if out.is_empty() {
+        return Ok(());
+    }
+    let end = off
+        .checked_add(out.len() as u64)
+        .ok_or_else(|| corrupt("value range overflows"))?;
+    if end > loc.len() {
+        return Err(corrupt("value range past the end of the value"));
+    }
+    match loc {
+        ValueLoc::Inline(v) => {
+            out.copy_from_slice(&v[off as usize..off as usize + out.len()]);
+            Ok(())
+        }
+        ValueLoc::Overflow { total_len, first_page } => {
+            let mut id = *first_page;
+            let mut skip = off as usize;
+            let mut done = 0usize;
+            let mut hops = 0usize;
+            while id != 0 && done < out.len() {
+                if hops > (*total_len as usize / OVERFLOW_CAP) + 2 {
+                    return Err(corrupt("overflow chain too long"));
+                }
+                hops += 1;
+                let p = store.page(id)?;
+                if kind(p) != KIND_OVERFLOW {
+                    return Err(corrupt("bad overflow page kind"));
+                }
+                let len = u16::from_le_bytes([p[6], p[7]]) as usize;
+                if len > OVERFLOW_CAP {
+                    return Err(corrupt("overflow chunk too large"));
+                }
+                if skip >= len {
+                    skip -= len;
+                } else {
+                    let take = (len - skip).min(out.len() - done);
+                    out[done..done + take].copy_from_slice(&p[HDR + skip..HDR + skip + take]);
+                    done += take;
+                    skip = 0;
+                }
+                id = extra(p);
+            }
+            if done < out.len() {
+                return Err(corrupt("overflow chain shorter than its total_len"));
+            }
+            Ok(())
+        }
+        ValueLoc::Extent { start_page, .. } => {
+            // Sub-page reads land on the page holding `off`, then trim the
+            // in-page remainder — read_extent has no offset parameter, and
+            // growing the PageStore trait for one caller is not worth it.
+            let page = start_page + off / PAGE_SIZE as u64;
+            let skip = (off % PAGE_SIZE as u64) as usize;
+            let mut scratch = Vec::new();
+            store.read_extent(page, (skip + out.len()) as u64, &mut scratch)?;
+            if scratch.len() != skip + out.len() {
+                return Err(corrupt("extent read returned wrong length"));
+            }
+            out.copy_from_slice(&scratch[skip..]);
+            Ok(())
+        }
+    }
+}
+
 pub fn get<S: PageStore + ?Sized>(store: &S, root: u64, key: &[u8]) -> Result<Option<Vec<u8>>> {
     if root == 0 {
         return Ok(None);
