@@ -583,6 +583,46 @@ impl Database {
         }
     }
 
+    /// Stream one `text`/`blob` column of one row into `out` in bounded
+    /// chunks (≤ 256 KiB each) WITHOUT materializing the value — the chunked
+    /// read API of DESIGN-BLOBEXTENT §5. `range` is `(offset, len)` within
+    /// the value, `None` for all of it. Returns the byte count written, or
+    /// `None` when the row is absent or the column is NULL. A snapshot
+    /// eviction between chunks surfaces as an error — never as mixed bytes;
+    /// the caller decides whether to retry against a fresh snapshot.
+    pub fn blob_to_writer(
+        &self,
+        table: &str,
+        pk_values: &[Value],
+        col: &str,
+        range: Option<(u64, u64)>,
+        out: &mut dyn std::io::Write,
+    ) -> Result<Option<u64>> {
+        let table_id = self
+            .schema()
+            .table_id(table)
+            .ok_or_else(|| Error::Unsupported(format!("unknown table `{table}`")))?;
+        let t = self.schema().table(table_id).expect("id from table_id");
+        let col_idx = t
+            .column_index(col)
+            .ok_or_else(|| Error::Unsupported(format!("unknown column `{col}` in `{table}`")))?
+            as usize;
+        let r = self.engine.begin_read()?;
+        let result = (|| -> Result<Option<u64>> {
+            let Some(mut br) = r.blob_read(table_id, pk_values, col_idx, range)? else {
+                return Ok(None);
+            };
+            let mut written = 0u64;
+            while let Some(chunk) = br.next()? {
+                out.write_all(&chunk).map_err(Error::from)?;
+                written += chunk.len() as u64;
+            }
+            Ok(Some(written))
+        })();
+        r.finish()?;
+        result
+    }
+
     /// Read a system record (see [`Database::sys_record_put`]). Runs in a
     /// read transaction; never touches the writer lock.
     pub fn sys_record_get(&self, ns: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
