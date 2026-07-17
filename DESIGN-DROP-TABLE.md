@@ -79,45 +79,79 @@ Rules:
   ceiling: `next_table_id >= MAX_TABLES (64)` ⇒ `Error::Unsupported("table-id
   space exhausted; rebuild required")`. This turns the footprint/CDC `1u64 <<
   id` bitmap cap (§4) from silent overflow into an explicit, recoverable limit.
-- The counter must **survive reopen**: dropping the highest-id table erases its
-  id from the live set, so `max(live)+1` would silently reuse it. The
-  persisted counter is the source of truth; `Schema::new` (config seed) sets it
-  to `tables.len()`, and attach reads it from the sys-record (absent ⇒ derive
-  `max(id)+1` for pre-stage-4 files, which is safe because those never dropped).
+- **The counter must be MATERIALIZED, never merely derived** (review finding,
+  HIGH). `max(live)+1` is correct only at the instant of first attach, before
+  any gap exists; the moment a DROP removes the highest id, the live set gains
+  a gap and `max(live)+1` re-mints the dropped id — the exact aliasing no-reuse
+  exists to eliminate. Therefore write `sys/next_table_id` explicitly:
+  1. at **bootstrap** of a new file (`= tables.len()`),
+  2. in the **DROP commit** itself — DROP does not change the value, but it
+     **persists the current in-memory counter** so the record can never be
+     absent after a gap has been created,
+  3. as a **write-back at attach when the record is absent** (a pre-stage-4
+     file), BEFORE the first mutation — derive `max(id)+1` once, persist it,
+     and from then on the sys-record is the sole source of truth.
+  With all three, an absent record means only a genuinely untouched pre-stage-4
+  file with no gaps, where `max(id)+1` is provably correct. §2 step 3's "id is
+  not reclaimed" must NOT be read as "the DROP commit skips the counter write."
 - `with_added_table` (today `def.id = tables.len()`) reworks to take the
   counter and tombstone-aware placement.
 
-## 2. DROP TABLE mechanics (one COW commit, under the writer lock)
+## 2. DROP TABLE mechanics (atomic UNLINK commit + bounded reclamation)
+
+The review (MEDIUM) killed the naive "free every page in one commit": a large
+table's page-free would blow the freelist's per-commit `u16` chunk index
+(wraps past ~7.86M freed pages ≈ a 32 GiB table) and can hit DbFull mid-DROP
+(the 1 GiB-delete precedent already writes ~2185 freelist chunks). So DROP
+splits into **one atomic UNLINK commit** (which makes the table gone and its
+trees unreachable) plus **bounded page reclamation** (unreachable pages are
+safe to reclaim lazily — leaking a page until reclaimed is never corruption).
 
 `DROP TABLE <name>` (facade DDL route, like CREATE — never a plan):
-1. Resolve the id via `schema.table_id(name)` (linear scan; refuse unknown).
-2. **Free the data + index pages**: for `index_no` in `0..=n_indexes`, walk
-   `cat_tree_key(id, index_no)`'s tree and free every page, then delete the
-   catalog tree-root entries. Freeing goes through the ordinary freelist —
-   reusable only at/below the oldest-pinned bound (#37), so a reader still
-   pinned on a pre-DROP snapshot keeps reading the old table from ITS
-   `catalog_root` and its pages are not handed out until it releases. DROP adds
-   nothing to that bound logic (DESIGN-DDL §5.1 [believed yes]).
-3. **Tombstone the schema**: mark the table dead (a `dead: bool` on `TableDef`,
-   or replace with a reserved sentinel), re-canonicalize, write to
-   `CAT_SCHEMA_KEY`. The id is NOT reclaimed; `next_table_id` is unchanged.
-4. **Purge the id's own catalog-resident soft state that IS keyed by id and
-   would mislead even under no-reuse** — cheap and worth it: CDC
-   `set_captured(id,false)` / `set_blocked(id,false)` and delete the id's
-   dirty entries (`cdc.rs`), so the bitmaps stop marking a dead id. (Mirror
-   park/map records are left as orphan leaks — no-reuse makes them inert; an
-   optional GC can sweep them later.)
-5. Bump `schema_gen` (staleness signal). Commit. Other processes reload at
-   their next statement; every compiled plan referencing the dropped table
-   dies on the schema-hash check.
 
-Canonical bytes encode LIVE tables plus enough to reconstruct the holes: each
-table carries its explicit `id` already (v2), so a gap in the id sequence *is*
-the tombstone record — the decoder sees ids `0,1,2,4`, places them at those
-positions, and fills position 3 with a dead sentinel. No new per-table field is
-strictly required if a dead table is simply absent and the decoder pads gaps;
-a `dead` marker is only needed if a dropped name must stay reserved (it need
-not, under no-reuse — the name is free to re-CREATE at a NEW id).
+**The UNLINK commit (one COW commit, atomic — the table is gone after it):**
+1. Resolve the id via `schema.table_id(name)` (linear scan; refuse unknown).
+   Refuse if the table is in an active mirror's scope unless the mirror will
+   propagate the drop (see §3.5 — writes a pending-op instead of refusing).
+2. **Delete the catalog tree-root entries** `cat_tree_key(id, 0..=n_indexes)`.
+   This unlinks the table's trees from the reachable set in ONE step — no
+   page walk, O(index count) catalog deletes. The now-unreachable data/index
+   pages are recorded for reclamation (their roots go to a
+   `sys/drop-reclaim/<id>` worklist record, or the DROP simply frees them
+   later via a bounded scan; either way they are NOT freed in this commit).
+   A reader pinned on the pre-DROP `catalog_root` still reaches the old trees
+   through ITS snapshot and its pages are not reclaimed until the oldest-pinned
+   bound passes it (#37) — DROP adds nothing to that bound logic.
+3. **Tombstone the schema**: place a dead sentinel at the id's slot (see the
+   representation below), re-canonicalize, write to `CAT_SCHEMA_KEY`.
+4. **Persist `sys/next_table_id`** = the current counter (unchanged in value,
+   but written so the record is never absent after a gap — §1 HIGH fix).
+5. **Purge the id's catalog-resident soft state**: CDC `set_captured(id,false)`
+   / `set_blocked(id,false)` + delete the id's dirty entries (`cdc.rs`), so the
+   bitmaps stop marking a dead id. (Mirror park/map records stay orphan-leaked;
+   no-reuse makes them inert.)
+6. Bump `schema_gen`. Commit. The table is now gone for every process; compiled
+   plans referencing it die on the schema-hash check.
+
+**Bounded reclamation (follow-up commits, like the overlay's bounded
+truncate):** walk the unlinked trees and free their pages in per-commit batches
+(each batch its own commit, so freeing keeps pace with the COW allocation that
+freeing itself needs — the exact discipline `truncate_deltas` uses). Idempotent
+and crash-safe: the `sys/drop-reclaim/<id>` worklist survives a crash, so a
+reopen resumes reclamation; a partially-reclaimed tree just has fewer pages to
+free next round. Space returns eventually, never in one unbounded commit.
+
+**The tombstone sentinel** must be a MATERIALIZED entry in `schema.tables`
+(the review's soundness proof for the `[id]`-aligned SchemaBundle Vecs depends
+on the slot existing), and it must PASS `validate` — so it cannot be a
+zero-column / empty-pk `TableDef` (those violate the 1..=MAX_COLUMNS and
+non-empty-pk rules). Representation: add **`dead: bool` to `TableDef`** (a v2
+field addition — decode/encode a flag byte). A dead table encodes its id + the
+flag and validate SKIPS the shape rules for a dead slot (it holds no data). The
+"a gap in the id sequence IS the tombstone / no field needed" idea from the
+first draft is REJECTED: the decoder loop is `ntables`-driven and the sound
+`[id]`-alignment requires a real slot, so the dead marker is encoded, not
+inferred from a gap. The dropped NAME is freed for re-CREATE (at a new id).
 
 ## 3. The fix, grouped by the audit (ordered by risk)
 

@@ -28,10 +28,28 @@ both ways, and routes the **ambiguous** ones to the existing regenerate path:
 | column ALTER | either | **regenerate** (matches DESIGN-MIRROR "no ALTER"; revisit at #47 stage 5) |
 | both create same table | conflict | **park + regenerate** — never silently merge two schemas |
 
-Table add/drop is unambiguous because it is a whole-object create/delete with a
-name key; a conflict (same name, two shapes) is detectable and refused, not
-merged. Column-level ALTER is where silent merge would corrupt — it stays on
-the proven regenerate path until mpedb even *has* ALTER (#47 stage 5).
+Table add/drop is unambiguous ONLY when it is genuinely a whole-object
+create/delete. Two review findings (HIGH + MEDIUM) show the introspect-diff
+cannot assume that:
+
+- **Table RENAME looks byte-identical to DROP+ADD** at the introspect level
+  (`ALTER TABLE users RENAME TO customers` presents as `{users gone, customers
+  new}`). Blindly applying the incremental arms would DROP `users` on mpedb —
+  destroying its un-pushed local dirty set + parked conflicts, the exact loss
+  `regenerate` migrates the dirty set to prevent — and burn two lifetime ids.
+  **Rule**: detect rename and route it to `regenerate`. PG: persist and diff
+  the table `oid` (name changed, oid stable ⇒ rename). sqlite (no stable table
+  id): treat any *same-pull-window* drop-of-A + add-of-B whose column shapes
+  are compatible as ambiguous ⇒ regenerate, never incremental DROP+CREATE.
+- **A slow drop-and-recreate can't be bounded by N-snapshot absence.** The
+  missing-table→DROP arm (§3) additionally **refuses to DROP a table whose
+  mpedb-side dirty set is non-empty** (force regenerate/operator) and gates on
+  an explicit source tombstone signal (the `op='T'`/DDL changelog event),
+  never on "absent across two snapshots" alone.
+
+A genuine conflict (same name, two independent shapes) is detected and refused,
+not merged. Column-level ALTER stays on the regenerate path until mpedb even
+*has* ALTER (#47 stage 5).
 
 ## 1. The machinery already exists — this wires it incrementally
 
@@ -46,11 +64,15 @@ code:
   `pg::introspect` + the type mapping in `import.rs` already build the mpedb
   schema from a source; run it for the delta and feed the result to mpedb's
   `CREATE TABLE`.
-- **Drift detection substrate**: the `map/<table_id>` record already persists
-  BOTH "mpedb schema blake3" AND "source schema fingerprint" per table
-  (DESIGN-MIRROR line 105). A NEW mpedb table has no `map` record; a DROPPED
-  one leaves an orphan `map` (no-reuse ⇒ inert). A source table gained/lost
-  shows as a fingerprint set delta on introspect.
+- **Drift detection substrate** (review MEDIUM: verify before relying on it):
+  DESIGN-MIRROR line 105 lists "mpedb schema blake3, source schema fingerprint"
+  as `map/<id>` fields, but the review found the current `TableMap` codec does
+  NOT actually persist them yet. **D3/D4 must first extend the `TableMap`
+  record to persist the source-schema fingerprint (incl. typmod) + the mpedb
+  schema blake3**, bump its codec version, add truncation tests, and make the
+  pull diff recompute+compare them — that comparison IS the add/drop-vs-ALTER
+  boundary, so the boundary has no substrate until this lands. A NEW mpedb
+  table has no `map`; a DROPPED one leaves an orphan `map` (no-reuse ⇒ inert).
 - **The mpedb-side DDL signal is free**: `schema_gen` (#47) bumps on every DDL.
   `push` records the last-pushed gen; a bump means "diff the schema and drain
   any pending schema op."
@@ -64,8 +86,13 @@ code:
 - CREATE/DROP TABLE on mpedb bumps `schema_gen` and, IF a mirror `cfg`
   sys-record exists, writes a **pending schema op** to `sys/ddl/<seq>`:
   `{kind: C|D, table_name, [rendered-columns for C]}`. Written in the SAME COW
-  commit as the DDL (atomic: the op cannot exist without the schema change, nor
-  vice versa).
+  commit as the DDL. **Build note (review): this MUST use the `WriteTxn`'s own
+  `sys_put` inside `create_table`/`drop_table`'s txn** — the obvious facade
+  helper `Database::sys_record_put` is a SEPARATE commit and would silently
+  break atomicity (the op could exist without the schema change or vice versa
+  across a crash). The engine DDL methods therefore take the pending-op payload
+  and write it in-txn, or the facade passes a closure the txn runs before
+  commit.
 - `push_batch` drains `sys/ddl/*` in seq order BEFORE the data dirty-set (a
   create must reach the source before its rows; a drop after its last rows —
   seq ordering with the data watermark handles both). For each op:
@@ -88,7 +115,14 @@ code:
   against `scope`'s `map/<id>` source names.
   - **new source table** (in introspect, no `map`): introspect its shape,
     `CREATE TABLE` on mpedb (#47 stage 2), add to scope + capture + `map`. Then
-    its rows flow through the ordinary pull.
+    its rows flow through the ordinary pull. **Loop fence (review MEDIUM):**
+    the `map`-record-as-known fence has an open window — an mpedb→source CREATE
+    makes the source table visible BEFORE its `map/<id>` is written, so a
+    concurrent or post-crash pull could see it as "new" and re-import it. So
+    "new source table" additionally requires the name to NOT already exist in
+    mpedb's LIVE schema: a name match means either the just-pushed table (skip,
+    it's ours) or a genuine independent conflict (→ SchemaConflict park), never
+    a blind re-import. This closes the window without depending on `map` timing.
   - **missing source table** (has `map`, gone from introspect): `DROP TABLE` on
     mpedb (#47 **stage 4** — the hard dependency), remove from scope + `map`.
     Guard against a transient introspect miss (a source mid-migration) with the
