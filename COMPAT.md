@@ -73,7 +73,7 @@ sqlite `STRICT` still converts losslessly (`'42'` → `42`); mpedb does not.
 | UNION / UNION ALL / EXCEPT / INTERSECT | ✅ | chains, left-associative at equal precedence (sqlite's rule; PostgreSQL binds INTERSECT tighter — documented deviation); arms must agree on arity and exact types, `CAST` bridges deliberate mismatches |
 | Scalar subqueries `(SELECT …)` | ✅ | uncorrelated and correlated; 0 rows → NULL; **>1 row is an error** (PostgreSQL's rule — sqlite silently takes the first row) |
 | [NOT] EXISTS (…) | ✅ | uncorrelated and correlated |
-| `x IN (SELECT …)` | ❌ | `IN` over value lists and session-context lists only |
+| `x IN (SELECT …)` | ✅ | uncorrelated; the subquery becomes a LIST subplan over the same runtime-typed 3VL membership core as IN lists (empty → FALSE, NULL member without a match → NULL — sqlite-verified); correlated IN is refused with the EXISTS rewrite named |
 | Subqueries in FROM (derived tables) | ❌ | |
 | Nested subqueries (subquery in a subquery) | ❌ | refused with a message |
 | Window functions | ❌ | |
