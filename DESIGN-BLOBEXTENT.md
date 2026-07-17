@@ -360,6 +360,19 @@ on live databases (§5 — FrozenDb only).
 6. **Leak ledger**: EXTENT_*/REFLINK_HITS reconcile across the differential
    run — #40's method, applied to space.
 
+**Measured (reflink empirics, 2026-07-17 — the §"verify EMPIRICALLY before
+freezing" gate, now cleared).** On real btrfs AND xfs (loopback, kernel 6.8),
+a purpose-built probe answered all three hard questions YES: (1)
+`FICLONERANGE` succeeds into a `fallocate`-UNWRITTEN region of a file that is
+already `MAP_SHARED`-mapped; (2) the cloned bytes are visible THROUGH a
+pre-existing mapping whose page-cache pages were touched before the clone —
+the kernel invalidates/updates coherently; (3) an mmap write over a cloned
+range CoWs cleanly (`msync`, then the source re-read unchanged). The
+reflink import path can therefore be built as designed: clone whole pages
+straight into the extent region of the live mapping, pwrite+zero the tail.
+Paired extent A/B on the same mounts (4 KiB cells): btrfs 1.05×, xfs 1.07×
+— no COW-on-CoW write-amplification pathology, modest win intact.
+
 **Measured (Pi-paired closeout, 2026-07-17).** The Pi (armv7, SD card, the
 steadiest A/B instrument) reports **parity at both sizes**: 4 KiB blobs
 0.993, 64 KiB 1.004 (median of 4 ABAB reps, 16 MiB/arm, durability=none) —
