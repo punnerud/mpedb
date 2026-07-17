@@ -994,6 +994,49 @@ fn as_col_cmp(e: &BExpr) -> Option<(u16, BinOp, Atom)> {
     }
 }
 
+/// AND a conjunct list back together, preserving order. `None` for an empty
+/// list — the callers all mean "no predicate" by that.
+fn and_all(conjuncts: Vec<BExpr>) -> Option<BExpr> {
+    conjuncts.into_iter().reduce(and)
+}
+
+/// The highest column slot an expression reads, or `None` for a column-free
+/// expression (consts/params only). What the #65 pushdown places conjuncts
+/// by: left-deep prefixes share slot numbering, so a conjunct is evaluable
+/// at exactly the steps whose accumulated width exceeds this.
+fn max_col(e: &BExpr) -> Option<u16> {
+    let mut m: Option<u16> = None;
+    let mut stack = vec![e];
+    while let Some(e) = stack.pop() {
+        match e {
+            BExpr::Col(c) => m = Some(m.map_or(*c, |p| p.max(*c))),
+            BExpr::Unary(_, a) | BExpr::Like(a, _) | BExpr::Cast(a, _) | BExpr::InParam(a, _) => {
+                stack.push(a)
+            }
+            BExpr::Binary(_, a, b) => {
+                stack.push(a);
+                stack.push(b);
+            }
+            BExpr::InList(a, list) => {
+                stack.push(a);
+                stack.extend(list.iter());
+            }
+            BExpr::Case(arms, else_) => {
+                for (c, r) in arms {
+                    stack.push(c);
+                    stack.push(r);
+                }
+                if let Some(e) = else_ {
+                    stack.push(e);
+                }
+            }
+            BExpr::Coalesce(args) | BExpr::Call(_, args) => stack.extend(args.iter()),
+            BExpr::Const(_) | BExpr::Param(_) => {}
+        }
+    }
+    m
+}
+
 fn split_and(e: BExpr, out: &mut Vec<BExpr>) {
     match e {
         BExpr::Binary(BinOp::And, l, r) => {

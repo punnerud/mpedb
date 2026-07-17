@@ -111,8 +111,6 @@ pub(super) fn plan_join_select(
         ob.pin_param(n_params + i as u16, *ty);
     }
     let outer_policy = read_policy(&mut ob, catalog, outer_id, &outer.name, PolicyCmd::Select)?;
-    let (access, outer_residual) = extract_access(outer_policy, outer, consts)?;
-    let filter = outer_residual.map(|e| compile_program(&e)).transpose()?;
 
     // Fold left over the join chain. `acc_named` grows one table per join, so
     // join `k`'s ON binds over `[outer ‖ … ‖ table_k]` — exactly the rows that
@@ -121,8 +119,24 @@ pub(super) fn plan_join_select(
     // BEFORE any ON can raise on that row — the RLS-over-join ordering contract.
     let mut binder = ob;
     let mut acc_named: Vec<(String, &TableDef)> = vec![(outer_name.clone(), outer)];
-    let mut joins: Vec<Join> = Vec::new();
     let mut joined_columns = outer.columns.clone();
+    // Per-step raw material, held back so the WHERE (bound below, over the
+    // full joined scope) can push conjuncts INTO each step before access
+    // extraction runs — a pushed `WHERE a.x = b.y` becomes an index
+    // nested-loop candidate exactly as if it had been written in the ON.
+    struct StepDraft<'t> {
+        jid: u32,
+        jt: &'t TableDef,
+        kind: JoinKind,
+        policy: Option<ExprProgram>,
+        bound_on: BExpr,
+        /// The accumulated tuple types BEFORE this table joins in — what
+        /// `extract_join_access` resolves `KeyPart::OuterCol` against.
+        acc_types_before: Vec<ColumnType>,
+        /// Joined-tuple width once this step's table is in.
+        width_after: usize,
+    }
+    let mut drafts: Vec<StepDraft> = Vec::new();
     // The accumulated tuple's column types, for the equi-join pushdown: join
     // `k`'s access may reference outer slots (`KeyPart::OuterCol`), which are
     // slots of the tuple built BEFORE its own table joins in.
@@ -161,27 +175,17 @@ pub(super) fn plan_join_select(
                 JoinKind::Full
             }
         };
-        // #49: consume pure equality conjuncts into an inner access path —
-        // the index nested loop. What remains of the ON runs as the residual
-        // over the joined row, preserving every raise the query could observe.
-        // A FULL join never takes the index nested loop: emitting the
-        // UNMATCHED inner rows requires the inner side enumerated and held,
-        // so the whole ON stays residual over the held scan.
-        let (jaccess, residual_on) = if kind == JoinKind::Full {
-            (AccessPath::FullScan, bound_on)
-        } else {
-            extract_join_access(bound_on, &acc_types, jt, consts)?
-        };
-        let on = compile_program(&residual_on)?;
-
+        let acc_types_before = acc_types.clone();
         joined_columns.extend(jt.columns.iter().cloned());
         acc_types.extend(jt.columns.iter().map(|c| c.ty));
-        joins.push(Join {
-            table: jid,
+        drafts.push(StepDraft {
+            jid,
+            jt,
             kind,
-            access: jaccess,
-            on,
             policy,
+            bound_on,
+            acc_types_before,
+            width_after: acc_types.len(),
         });
     }
 
@@ -195,8 +199,91 @@ pub(super) fn plan_join_select(
         .transpose()?;
     let (bound_where, post_where) =
         subquery::split_correlated(bound_where, n_params, &correlated);
-    let joined_filter = bound_where.map(|e| compile_program(&e)).transpose()?;
     let post_filter = post_where.map(|e| compile_program(&e)).transpose()?;
+
+    // #65: push each WHERE conjunct to the EARLIEST position where every slot
+    // it reads is bound — the outer's own filter, or a join step's ON. A
+    // comma-join (`FROM t1, t2 WHERE t1.a = t2.b`) is `INNER ON true`, so
+    // without this the gather holds the full cartesian product before the
+    // WHERE sees a single row (measured: 13.5 GB on 30-60-row select4
+    // tables); with it, the same equality is an ON conjunct and therefore an
+    // index nested-loop candidate. Placement is by max referenced slot, and
+    // NULL-extension is the boundary the rewrite must respect:
+    //   - any FULL step: no pushdown at all — BOTH sides NULL-extend, so
+    //     every WHERE conjunct filters rows that do not exist yet;
+    //   - a conjunct whose latest table is a LEFT step's inner stays in
+    //     joined_filter — it filters the NULL-EXTENDED row, and inside the
+    //     ON it would decide matching instead (a different query);
+    //   - outer-only (and column-free) conjuncts go to the outer filter:
+    //     LEFT steps preserve every outer row, so pre-filtering the outer
+    //     removes exactly the groups the WHERE would have removed whole.
+    // Policies still run before any pushed conjunct's position: the outer
+    // merge keeps the single-table `merge_and(user, policy)` shape, and a
+    // step's ON already runs after that step's policy (#46/#49 contract).
+    let outer_width = outer.columns.len();
+    let any_full = drafts.iter().any(|d| d.kind == JoinKind::Full);
+    let mut outer_extra: Vec<BExpr> = Vec::new();
+    let mut step_extra: Vec<Vec<BExpr>> = drafts.iter().map(|_| Vec::new()).collect();
+    let mut remainder: Vec<BExpr> = Vec::new();
+    if let Some(w) = bound_where {
+        let mut conjuncts = Vec::new();
+        split_and(w, &mut conjuncts);
+        for c in conjuncts {
+            let dest = if any_full {
+                &mut remainder
+            } else {
+                match max_col(&c) {
+                    None => &mut outer_extra,
+                    Some(m) if (m as usize) < outer_width => &mut outer_extra,
+                    Some(m) => {
+                        let k = drafts
+                            .iter()
+                            .position(|d| (m as usize) < d.width_after)
+                            .expect("bound slot exceeds the joined width");
+                        if drafts[k].kind == JoinKind::Inner {
+                            &mut step_extra[k]
+                        } else {
+                            &mut remainder
+                        }
+                    }
+                }
+            };
+            dest.push(c);
+        }
+    }
+
+    let (access, outer_residual) = extract_access(
+        merge_and(and_all(outer_extra), outer_policy),
+        outer,
+        consts,
+    )?;
+    let filter = outer_residual.map(|e| compile_program(&e)).transpose()?;
+
+    let mut joins: Vec<Join> = Vec::new();
+    for (draft, extra) in drafts.into_iter().zip(step_extra) {
+        // The original ON first, pushed conjuncts after — statement order.
+        let on_src = merge_and(Some(draft.bound_on), and_all(extra)).expect("ON present");
+        // #49: consume pure equality conjuncts into an inner access path —
+        // the index nested loop. What remains of the ON runs as the residual
+        // over the joined row, preserving every raise the query could observe.
+        // A FULL join never takes the index nested loop: emitting the
+        // UNMATCHED inner rows requires the inner side enumerated and held,
+        // so the whole ON stays residual over the held scan.
+        let (jaccess, residual_on) = if draft.kind == JoinKind::Full {
+            (AccessPath::FullScan, on_src)
+        } else {
+            extract_join_access(on_src, &draft.acc_types_before, draft.jt, consts)?
+        };
+        joins.push(Join {
+            table: draft.jid,
+            kind: draft.kind,
+            access: jaccess,
+            on: compile_program(&residual_on)?,
+            policy: draft.policy,
+        });
+    }
+
+    let joined_filter = and_all(remainder).map(|e| compile_program(&e)).transpose()?;
 
     let full_scope = Scope::joined_named(acc_named.clone())?;
     let namer = joined_namer(&acc_named);
