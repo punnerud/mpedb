@@ -339,7 +339,9 @@ impl Database {
         })
     }
 
-    pub fn schema(&self) -> &Schema {
+    /// The CURRENT schema (Arc'd bundle; derefs to [`Schema`]). DDL may swap
+    /// it between calls — bind the Arc for a stable view.
+    pub fn schema(&self) -> std::sync::Arc<mpedb_core::engine::SchemaBundle> {
         self.engine.schema()
     }
 
@@ -354,7 +356,7 @@ impl Database {
     /// plain compilation.
     fn compile_maybe_explain(&self, sql: &str) -> Result<(CompiledPlan, bool)> {
         let catalog = self.load_policy_catalog()?;
-        mpedb_sql::prepare_maybe_explain_with_policies(sql, self.schema(), &catalog)
+        mpedb_sql::prepare_maybe_explain_with_policies(sql, &self.schema(), &catalog)
     }
 
     /// Apply a parsed RLS DDL statement to the catalog (autocommit — each takes
@@ -463,7 +465,7 @@ impl Database {
         }
         let (plan, is_explain) = self.compile_maybe_explain(sql)?;
         if is_explain {
-            return Ok(ExecResult::Explain(plan.explain(self.schema())));
+            return Ok(ExecResult::Explain(plan.explain(&self.schema())));
         }
         let hash = plan.hash();
         let plan = self.register(hash, plan, sql)?;
@@ -525,7 +527,7 @@ impl Database {
     pub fn execute_detached(&self, plan: &DetachedPlan, params: &[Value]) -> Result<ExecResult> {
         // (1)+(2): structural + schema re-validation. PlanInvalidated (schema
         // drift) propagates verbatim; any other decode failure is Corrupt.
-        let compiled = match CompiledPlan::decode(&plan.blob, self.schema()) {
+        let compiled = match CompiledPlan::decode(&plan.blob, &self.schema()) {
             Ok(p) => p,
             Err(Error::PlanInvalidated) => return Err(Error::PlanInvalidated),
             Err(e) => return Err(e),
@@ -640,7 +642,8 @@ impl Database {
             .schema()
             .table_id(table)
             .ok_or_else(|| Error::Unsupported(format!("unknown table `{table}`")))?;
-        let t = self.schema().table(table_id).expect("id from table_id");
+        let bundle = self.schema();
+        let t = bundle.table(table_id).expect("id from table_id");
         let col_idx = t
             .column_index(col)
             .ok_or_else(|| Error::Unsupported(format!("unknown column `{col}` in `{table}`")))?
@@ -751,7 +754,7 @@ impl Database {
             r.finish()?;
             rec.ok_or(Error::UnknownPlan(*hash))?
         };
-        let plan = Arc::new(decode_registry_plan(&record, hash, self.schema())?);
+        let plan = Arc::new(decode_registry_plan(&record, hash, &self.schema())?);
         self.cache
             .write()
             .expect(POISON)
@@ -789,7 +792,7 @@ impl Database {
             self.validate_policy_read(hash, plan, &r)?;
             let res = {
                 let mut ctx = ReadCtx(&r);
-                exec_stmt(&mut ctx, self.schema(), plan, params, &mut partial)
+                exec_stmt(&mut ctx, &self.schema(), plan, params, &mut partial)
             };
             match res {
                 Ok(out) => {
@@ -989,7 +992,7 @@ impl WriteSession<'_> {
         // created inside *this* uncommitted session is not yet visible here).
         let (plan, is_explain) = self.db.compile_maybe_explain(sql)?;
         if is_explain {
-            return Ok(ExecResult::Explain(plan.explain(schema)));
+            return Ok(ExecResult::Explain(plan.explain(&schema)));
         }
         let hash = plan.hash();
         let plan = {
@@ -1185,7 +1188,7 @@ impl WriteSession<'_> {
         let Some(record) = self.txn.sys_get(&subkey)? else {
             return Err(Error::UnknownPlan(*hash));
         };
-        let plan = Arc::new(decode_registry_plan(&record, hash, self.db.schema())?);
+        let plan = Arc::new(decode_registry_plan(&record, hash, &self.db.schema())?);
         // last_used_txn refresh rides on this transaction (commits or rolls
         // back with it — best-effort bookkeeping either way). A failed put
         // (e.g. DbFull) leaves the record as it was and must never fail the
@@ -1218,7 +1221,7 @@ impl WriteSession<'_> {
         self.db.validate_policy_write(None, plan, &mut self.txn)?;
         let full = session::resolve_params(plan, params, &self.session)?;
         let mut partial = false;
-        let res = exec_stmt(&mut self.txn, self.db.schema(), plan, &full, &mut partial);
+        let res = exec_stmt(&mut self.txn, &self.db.schema(), plan, &full, &mut partial);
         if res.is_err() && partial {
             // The failed statement may have applied part of its effects; the
             // transaction no longer reflects whole statements. See the
@@ -1431,7 +1434,7 @@ primary_key = ["id"]
 
         // 2. Structurally valid record whose blob is a DIFFERENT plan
         //    (content-hash mismatch on load).
-        let other = mpedb_sql::prepare("SELECT * FROM users WHERE id = $1 AND id > 0", db.schema())
+        let other = mpedb_sql::prepare("SELECT * FROM users WHERE id = $1 AND id > 0", &db.schema())
             .unwrap();
         assert_ne!(other.hash(), h);
         let rec = registry::encode_record("mismatch", &other.encode(), 1);
@@ -1498,7 +1501,7 @@ primary_key = ["id"]
             &registry::encode_record("sql", b"not a plan blob", 3)[..],
         ] {
             assert!(matches!(
-                decode_registry_plan(garbage, &h, db.schema()),
+                decode_registry_plan(garbage, &h, &db.schema()),
                 Err(Error::UnknownPlan(x)) if x == h
             ));
         }

@@ -92,7 +92,8 @@ fn put(args: &[String]) -> CliResult {
         return usage("blob put needs <target> <table> <pk> <file> [--col C]");
     };
     let db = open_target(target)?;
-    let (t, pk_idx, blob_idx) = resolve(db.schema(), table, col.as_deref())?;
+    let bundle = db.schema();
+    let (t, pk_idx, blob_idx) = resolve(&bundle, table, col.as_deref())?;
     let blob_col = t.columns[blob_idx].name.clone();
 
     // Full row: pk from the CLI, an empty-blob placeholder for the streamed
@@ -116,7 +117,8 @@ fn get(args: &[String]) -> CliResult {
         return usage("blob get needs <target> <table> <pk> <out-file> [--col C]");
     };
     let db = open_target(target)?;
-    let (t, pk_idx, blob_idx) = resolve(db.schema(), table, col.as_deref())?;
+    let bundle = db.schema();
+    let (t, pk_idx, blob_idx) = resolve(&bundle, table, col.as_deref())?;
     let blob_col = &t.columns[blob_idx].name;
     let pk_col = &t.columns[pk_idx].name;
 

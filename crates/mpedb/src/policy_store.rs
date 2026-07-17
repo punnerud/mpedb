@@ -69,8 +69,8 @@ impl Database {
     /// of suggesting an impossible remedy.
     pub fn lint_policy(&self, table: &str, def: &PolicyDef) -> Result<Vec<String>> {
         let table_id = self.require_table_id(table)?;
-        let t = self
-            .schema()
+        let bundle = self.schema();
+        let t = bundle
             .table(table_id)
             .ok_or_else(|| Error::Internal("table id out of range".into()))?;
         let mut disc: Vec<u16> = Vec::new();
@@ -136,8 +136,8 @@ impl Database {
     /// from this handle is open (it takes the writer lock).
     pub fn create_policy(&self, table: &str, def: &PolicyDef) -> Result<()> {
         let table_id = self.require_table_id(table)?;
-        let t = self
-            .schema()
+        let bundle = self.schema();
+        let t = bundle
             .table(table_id)
             .ok_or_else(|| Error::Internal("table id out of range".into()))?;
         if def.name.is_empty() || def.name.as_bytes().contains(&b'/') {

@@ -4,6 +4,9 @@ use super::*;
 
 pub struct ReadTxn<'e> {
     pub(super) eng: &'e Engine,
+    /// Schema view captured at begin (#47): stable for this txn's lifetime
+    /// even while DDL swaps the engine's current bundle.
+    pub(super) bundle: Arc<SchemaBundle>,
     pub(super) slot: u32,
     pub(super) word: u64,
     pub meta: MetaSnapshot,
@@ -70,7 +73,7 @@ impl ReadTxn<'_> {
         range: Option<(u64, u64)>,
     ) -> Result<Option<BlobReader<'_, '_>>> {
         let types = self
-            .eng
+            .bundle
             .col_types
             .get(table_id as usize)
             .ok_or_else(|| Error::Internal("table id out of range".into()))?;
@@ -106,7 +109,7 @@ impl ReadTxn<'_> {
             None => Ok(None),
             Some(bytes) => Ok(Some(row::decode_row(
                 &bytes,
-                &self.eng.col_types[table_id as usize],
+                &self.bundle.col_types[table_id as usize],
             )?)),
         }
     }
@@ -132,7 +135,7 @@ impl ReadTxn<'_> {
             )),
             Some(bytes) => Ok(Some(row::decode_row(
                 &bytes,
-                &self.eng.col_types[table_id as usize],
+                &self.bundle.col_types[table_id as usize],
             )?)),
         }
     }
@@ -158,14 +161,14 @@ impl ReadTxn<'_> {
         // (several rows may share the prefix).
         let full_unique = index_no >= 1
             && self
-                .eng
+                .bundle
                 .sec_unique
                 .get(table_id as usize)
                 .and_then(|v| v.get(index_no as usize - 1))
                 .copied()
                 .unwrap_or(false)
             && self
-                .eng
+                .bundle
                 .sec_indexes
                 .get(table_id as usize)
                 .and_then(|v| v.get(index_no as usize - 1))
@@ -176,7 +179,7 @@ impl ReadTxn<'_> {
         let prefix = keycode::encode_key(values);
         let iroot = self.tree_root(table_id, index_no)?;
         let root = self.tree_root(table_id, 0)?;
-        let types = &self.eng.col_types[table_id as usize];
+        let types = &self.bundle.col_types[table_id as usize];
         let mut out = Vec::new();
         let mut c = btree::cursor(self, iroot, Some((&prefix[..], true)), None)?;
         while let Some((k, pk_bytes)) = c.next(self)? {
@@ -207,7 +210,7 @@ impl ReadTxn<'_> {
     ) -> Result<Vec<Vec<Value>>> {
         let iroot = self.tree_root(table_id, index_no)?;
         let root = self.tree_root(table_id, 0)?;
-        let types = &self.eng.col_types[table_id as usize];
+        let types = &self.bundle.col_types[table_id as usize];
         let mut out = Vec::new();
         let mut c = btree::cursor(self, iroot, lo, hi)?;
         while let Some((_k, pk_bytes)) = c.next(self)? {
@@ -343,7 +346,7 @@ impl RowCursor<'_, '_> {
             None => Ok(None),
             Some((_k, v)) => Ok(Some(row::decode_row(
                 &v,
-                &self.txn.eng.col_types[self.table_id as usize],
+                &self.txn.bundle.col_types[self.table_id as usize],
             )?)),
         }
     }

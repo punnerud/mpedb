@@ -293,19 +293,55 @@ fn index_row_key(
 /// `None` = no CHECK on that column.
 pub type CheckPrograms = Vec<Vec<Option<ExprProgram>>>;
 
+/// The schema plus every per-table cache derived from it, immutable as a
+/// unit (#47): transactions capture ONE `Arc<SchemaBundle>` at begin, so a
+/// txn sees one schema version even while DDL swaps the engine's current
+/// bundle underneath. `TableDef.indexes` is the single derivation source.
+pub struct SchemaBundle {
+    pub schema: Schema,
+    pub checks: CheckPrograms,
+    /// Per table, per index (`index_no - 1`): the indexed column ordinals in
+    /// key order.
+    pub sec_indexes: Vec<Vec<Vec<u16>>>,
+    /// Parallel to `sec_indexes`: is index `k` UNIQUE (values→pk, enforced)
+    /// or plain non-unique (`(values ‖ pk)` key, duplicates allowed)?
+    pub sec_unique: Vec<Vec<bool>>,
+    pub col_types: Vec<Vec<ColumnType>>,
+}
+
+impl std::ops::Deref for SchemaBundle {
+    type Target = Schema;
+    fn deref(&self) -> &Schema {
+        &self.schema
+    }
+}
+
+impl SchemaBundle {
+    pub fn new(schema: Schema, checks: CheckPrograms) -> SchemaBundle {
+        let sec_indexes = schema
+            .tables
+            .iter()
+            .map(|t| t.indexes.iter().map(|ix| ix.columns.clone()).collect())
+            .collect();
+        let sec_unique = schema
+            .tables
+            .iter()
+            .map(|t| t.indexes.iter().map(|ix| ix.unique).collect())
+            .collect();
+        let col_types = schema
+            .tables
+            .iter()
+            .map(|t| t.columns.iter().map(|c| c.ty).collect())
+            .collect();
+        SchemaBundle { schema, checks, sec_indexes, sec_unique, col_types }
+    }
+}
+
 pub struct Engine {
     shm: Arc<Shm>,
-    schema: Schema,
-    checks: CheckPrograms,
-    /// Per table, per index (`index_no - 1`): the indexed column ordinals in
-    /// key order. Built from `TableDef.indexes` — the single source.
-    sec_indexes: Vec<Vec<Vec<u16>>>,
-    /// Parallel to `sec_indexes`: is index `k` UNIQUE (value→pk, enforced) or a
-    /// plain non-unique index (composite `(value‖pk)` key, duplicates allowed)?
-    /// The storage form and whether an insert is uniqueness-checked both follow
-    /// from this. Same order as `sec_indexes`.
-    sec_unique: Vec<Vec<bool>>,
-    col_types: Vec<Vec<ColumnType>>,
+    /// The CURRENT schema bundle. Swapped whole by DDL / staleness reload;
+    /// read paths clone the Arc once per transaction, never per operation.
+    bundle: std::sync::RwLock<Arc<SchemaBundle>>,
     concurrency: Concurrency,
     /// Deferred-fsync flusher; `Some` only for `durability = async` (§5.4.2).
     flusher: Option<Flusher>,
@@ -347,36 +383,15 @@ impl Engine {
             &schema.hash(),
             &config.options.perms,
         )?;
-        // `TableDef.indexes` is the single source of index numbering
-        // (DESIGN-SCHEMA-V2) — no flag re-derivation anywhere.
-        let sec_indexes: Vec<Vec<Vec<u16>>> = schema
-            .tables
-            .iter()
-            .map(|t| t.indexes.iter().map(|ix| ix.columns.clone()).collect())
-            .collect();
-        let sec_unique: Vec<Vec<bool>> = schema
-            .tables
-            .iter()
-            .map(|t| t.indexes.iter().map(|ix| ix.unique).collect())
-            .collect();
-        let col_types = schema
-            .tables
-            .iter()
-            .map(|t| t.columns.iter().map(|c| c.ty).collect())
-            .collect();
         let shm = Arc::new(shm);
         // durability = async: a background thread coalesces fdatasync on a
         // bounded interval so commits ack without waiting for the flush
         // (crash-consistent, power-loss loses a bounded window — §5.4.2).
         let flusher = (config.options.durability == Durability::Async)
             .then(|| spawn_flusher(shm.clone()));
-        let mut engine = Engine {
+        let engine = Engine {
             shm,
-            schema,
-            checks,
-            sec_indexes,
-            sec_unique,
-            col_types,
+            bundle: std::sync::RwLock::new(Arc::new(SchemaBundle::new(schema, checks))),
             concurrency: config.options.concurrency,
             flusher,
             extent_threshold: None,
@@ -391,42 +406,41 @@ impl Engine {
         Ok(engine)
     }
 
-    /// Replace the cached schema (and every per-table cache derived from it)
-    /// with the catalog's stored one. The schema-gen staleness check (#47
-    /// stage 3) routes writers here after a DDL commit by another process.
-    fn reload_schema_from_catalog(&mut self) -> Result<()> {
+    /// The current schema bundle — one Arc clone; transactions capture it at
+    /// begin so their view is stable for their whole lifetime.
+    pub fn bundle(&self) -> Arc<SchemaBundle> {
+        self.bundle.read().expect("schema bundle lock poisoned").clone()
+    }
+
+    /// The CURRENT schema (an Arc'd bundle; derefs to [`Schema`]). Callers
+    /// that need a `&Schema` bind the Arc first — the schema may be swapped
+    /// by DDL, so no plain reference can be handed out.
+    pub fn schema(&self) -> Arc<SchemaBundle> {
+        self.bundle()
+    }
+
+    /// Replace the current bundle with the catalog's stored schema. The
+    /// schema-gen staleness check (#47 stage 3) routes writers here after a
+    /// DDL commit by another process; `&self` — in-flight transactions keep
+    /// their captured bundle untouched.
+    pub fn reload_schema_from_catalog(&self) -> Result<()> {
         let r = self.begin_read()?;
         let stored = r.stored_schema();
         r.finish()?;
         let stored = stored?;
-        if stored == self.schema {
+        let cur = self.bundle();
+        if stored == cur.schema {
             return Ok(());
         }
-        self.sec_indexes = stored
-            .tables
-            .iter()
-            .map(|t| t.indexes.iter().map(|ix| ix.columns.clone()).collect())
-            .collect();
-        self.sec_unique = stored
-            .tables
-            .iter()
-            .map(|t| t.indexes.iter().map(|ix| ix.unique).collect())
-            .collect();
-        self.col_types = stored
-            .tables
-            .iter()
-            .map(|t| t.columns.iter().map(|c| c.ty).collect())
-            .collect();
-        // CHECK programs are compiled by the facade from the same check
-        // strings the seed carried; a table added by DDL gets an empty
-        // per-table entry until the facade recompiles (stage 2 wires that).
-        self.checks.resize(stored.tables.len(), Vec::new());
-        self.schema = stored;
+        // CHECK programs are compiled by the facade from check sources; on a
+        // pure reload, carry existing programs for tables that persist (by
+        // id-position — dense in this window) and leave new ones empty until
+        // the facade recompiles.
+        let mut checks = cur.checks.clone();
+        checks.resize(stored.tables.len(), Vec::new());
+        *self.bundle.write().expect("schema bundle lock poisoned") =
+            Arc::new(SchemaBundle::new(stored, checks));
         Ok(())
-    }
-
-    pub fn schema(&self) -> &Schema {
-        &self.schema
     }
 
     /// First writer initializes the catalog; racing processes see a non-zero
@@ -440,7 +454,8 @@ impl Engine {
             txn.abort();
             return Ok(());
         }
-        let schema_bytes = self.schema.canonical_bytes();
+        let bundle = self.bundle();
+        let schema_bytes = bundle.schema.canonical_bytes();
         let out = btree::insert(
             &mut txn,
             0,
@@ -449,9 +464,9 @@ impl Engine {
             InsertMode::InsertOnly,
         )?;
         txn.catalog_root = out.new_root;
-        for (tid, table) in self.schema.tables.iter().enumerate() {
+        for (tid, table) in bundle.schema.tables.iter().enumerate() {
             let mut index_nos = vec![0u32];
-            index_nos.extend((1..=self.sec_indexes[tid].len()).map(|i| i as u32));
+            index_nos.extend((1..=bundle.sec_indexes[tid].len()).map(|i| i as u32));
             for ino in index_nos {
                 let root = txn.catalog_root;
                 let out = btree::insert(
@@ -504,24 +519,11 @@ impl Engine {
             .iter()
             .map(|t| t.indexes.iter().map(|ix| ix.columns.clone()).collect())
             .collect();
-        let sec_unique: Vec<Vec<bool>> = schema
-            .tables
-            .iter()
-            .map(|t| t.indexes.iter().map(|ix| ix.unique).collect())
-            .collect();
-        let col_types = schema
-            .tables
-            .iter()
-            .map(|t| t.columns.iter().map(|c| c.ty).collect())
-            .collect();
+        let _ = sec_indexes; // derived inside SchemaBundle::new
         let checks = vec![Vec::new(); schema.tables.len()];
         Ok(Engine {
             shm: Arc::new(shm),
-            schema,
-            checks,
-            sec_indexes,
-            sec_unique,
-            col_types,
+            bundle: std::sync::RwLock::new(Arc::new(SchemaBundle::new(schema, checks))),
             concurrency: Concurrency::Serial,
             flusher: None, // read-only tooling handle; async needs a config
             extent_threshold: None,
@@ -539,7 +541,8 @@ impl Engine {
     /// maintenance needs the current row and degrades footprints below the
     /// key level (DESIGN.md §7.3 honesty rule).
     pub fn has_secondary_index(&self, table_id: u32) -> bool {
-        self.sec_indexes
+        self.bundle()
+            .sec_indexes
             .get(table_id as usize)
             .is_some_and(|s| !s.is_empty())
     }
@@ -552,9 +555,9 @@ impl Engine {
     }
 
     /// Column types for `table_id` (for off-lock row encoding in optimistic
-    /// prep).
-    pub fn col_types(&self, table_id: u32) -> Option<&[ColumnType]> {
-        self.col_types.get(table_id as usize).map(|v| v.as_slice())
+    /// prep). Cloned out of the current bundle — a rare, cold path.
+    pub fn col_types(&self, table_id: u32) -> Option<Vec<ColumnType>> {
+        self.bundle().col_types.get(table_id as usize).cloned()
     }
 
     /// Verify the page-accounting invariant (DESIGN.md §4.5): every page in
@@ -781,6 +784,7 @@ impl Engine {
         let (slot, word, meta) = self.shm.claim_and_pin()?;
         Ok(ReadTxn {
             eng: self,
+            bundle: self.bundle(),
             slot,
             word,
             meta,
@@ -822,6 +826,7 @@ impl Engine {
         };
         Ok(WriteTxn {
             eng: self,
+            bundle: self.bundle(),
             meta,
             catalog_root: meta.catalog_root,
             freelist_root: meta.freelist_root,
@@ -856,14 +861,12 @@ impl Engine {
 
     // ---------- row-level helpers shared by both txn kinds ----------
 
-    fn table(&self, table_id: u32) -> Result<&mpedb_types::TableDef> {
-        self.schema
-            .table(table_id)
-            .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))
-    }
-
     fn pk_key(&self, table_id: u32, values: &[Value]) -> Result<Vec<u8>> {
-        let table = self.table(table_id)?;
+        let bundle = self.bundle();
+        let table = bundle
+            .schema
+            .table(table_id)
+            .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
         let pk_vals: Vec<Value> = table
             .primary_key
             .iter()
@@ -876,7 +879,14 @@ impl Engine {
     /// CHECK (SQL semantics: violated only when the predicate is FALSE —
     /// NULL/UNKNOWN passes).
     fn validate_row(&self, table_id: u32, values: &[Value]) -> Result<()> {
-        let table = self.table(table_id)?;
+        // The current bundle: safe for every caller — writers hold the
+        // writer lock (which serializes DDL), and the optimistic prep pass
+        // re-validates under the lock.
+        let bundle = self.bundle();
+        let table = bundle
+            .schema
+            .table(table_id)
+            .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
         if values.len() != table.columns.len() {
             return Err(Error::TypeMismatch(format!(
                 "table `{}` has {} columns, row has {}",
@@ -903,7 +913,7 @@ impl Engine {
             }
         }
         let mut stack = Vec::new();
-        for (ci, check) in self.checks[table_id as usize].iter().enumerate() {
+        for (ci, check) in bundle.checks[table_id as usize].iter().enumerate() {
             if let Some(program) = check {
                 match program.eval_with_stack(&mut stack, values, &[])? {
                     Value::Bool(false) => {

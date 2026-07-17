@@ -167,7 +167,7 @@ impl<'db> ProcEngine<'db> {
         let mut plans = Vec::with_capacity(skel.calls.len());
         for call in &skel.calls {
             let at = |msg: String| cerr(lang_tag, call.line, call.col, msg);
-            let plan = mpedb_sql::prepare(&call.sql, schema)
+            let plan = mpedb_sql::prepare(&call.sql, &schema)
                 .map_err(|e| at(format!("embedded SQL failed to compile: {e}")))?;
             if matches!(
                 plan.stmt,

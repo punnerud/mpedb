@@ -53,6 +53,10 @@ impl Hasher for PageIdHasher {
 
 pub struct WriteTxn<'e> {
     pub(super) eng: &'e Engine,
+    /// Schema view captured at begin (#47). For writers this always equals
+    /// the engine's current bundle (the writer lock serializes DDL), but
+    /// capturing keeps one rule for both txn kinds.
+    pub(super) bundle: Arc<SchemaBundle>,
     pub meta: MetaSnapshot,
     pub(super) catalog_root: u64,
     pub(super) freelist_root: u64,
@@ -198,7 +202,7 @@ impl<'e> WriteTxn<'e> {
         key: &[u8],
         payload: &[u8],
     ) -> Result<bool> {
-        debug_assert!(self.eng.sec_indexes[table_id as usize].is_empty());
+        debug_assert!(self.bundle.sec_indexes[table_id as usize].is_empty());
         self.check_write_blocked(table_id)?;
         let (root, count) = self.tree_root(table_id, 0)?;
         let out = btree::insert(self, root, key, &mut btree::Payload::Flat(payload), InsertMode::InsertOnly)?;
@@ -217,7 +221,7 @@ impl<'e> WriteTxn<'e> {
         key: &[u8],
         payload: &[u8],
     ) -> Result<()> {
-        debug_assert!(self.eng.sec_indexes[table_id as usize].is_empty());
+        debug_assert!(self.bundle.sec_indexes[table_id as usize].is_empty());
         self.check_write_blocked(table_id)?;
         let (root, count) = self.tree_root(table_id, 0)?;
         let out = btree::insert(self, root, key, &mut btree::Payload::Flat(payload), InsertMode::Upsert)?;
@@ -228,7 +232,7 @@ impl<'e> WriteTxn<'e> {
 
     /// Blind DELETE of a PK. Returns whether the row existed.
     pub fn optimistic_delete(&mut self, table_id: u32, key: &[u8]) -> Result<bool> {
-        debug_assert!(self.eng.sec_indexes[table_id as usize].is_empty());
+        debug_assert!(self.bundle.sec_indexes[table_id as usize].is_empty());
         self.check_write_blocked(table_id)?;
         let (root, count) = self.tree_root(table_id, 0)?;
         let out = btree::delete(self, root, key)?;
@@ -263,9 +267,13 @@ impl<'e> WriteTxn<'e> {
     ) -> Result<()> {
         self.check_write_blocked(table_id)?;
         self.eng.validate_row(table_id, values)?;
-        let table = self.eng.table(table_id)?;
+        let table = self
+            .bundle
+            .schema
+            .table(table_id)
+            .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
         let tname = table.name.clone();
-        if !self.eng.sec_indexes[table_id as usize].is_empty() {
+        if !self.bundle.sec_indexes[table_id as usize].is_empty() {
             // A UNIQUE probe needs the value, and the whole point here is that
             // nobody has it. Refuse rather than half-check.
             return Err(Error::Unsupported(
@@ -273,7 +281,7 @@ impl<'e> WriteTxn<'e> {
             ));
         }
         let key = self.eng.pk_key(table_id, values)?;
-        let types = &self.eng.col_types[table_id as usize];
+        let types = &self.bundle.col_types[table_id as usize];
         let (head, _total) =
             row::encode_row_head_for_stream(values, types, stream_col, src.len())?;
         let (root, count) = self.tree_root(table_id, 0)?;
@@ -369,9 +377,13 @@ impl<'e> WriteTxn<'e> {
         let __t = std::time::Instant::now();
         self.eng.validate_row(table_id, values)?;
         leakstat::add(&leakstat::INS_NS_VALIDATE, __t.elapsed().as_nanos() as u64);
-        let table = self.eng.table(table_id)?;
+        let table = self
+            .bundle
+            .schema
+            .table(table_id)
+            .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
         let tname = table.name.clone();
-        let sec = self.eng.sec_indexes[table_id as usize].clone();
+        let sec = self.bundle.sec_indexes[table_id as usize].clone();
         let key = self.eng.pk_key(table_id, values)?;
         // #42: for a row that will SPILL, hand btree the parts instead of a
         // buffer. `encode_row` materialises the whole row — a large blob included
@@ -387,7 +399,7 @@ impl<'e> WriteTxn<'e> {
         // construction rather than by measurement, which matters here because
         // this box cannot resolve a few percent without ~50 paired runs.
         let __t = std::time::Instant::now();
-        let types = &self.eng.col_types[table_id as usize];
+        let types = &self.bundle.col_types[table_id as usize];
         let encoded_len = row::encoded_len(values, types);
         let spills = encoded_len > btree::MAX_INLINE_VAL;
         // DESIGN-BLOBEXTENT §4: a row whose payload exceeds the threshold is
@@ -414,7 +426,7 @@ impl<'e> WriteTxn<'e> {
         // UNIQUE pre-check on secondary indexes before mutating anything, so
         // a violation aborts with zero side effects on the dirty state. Only
         // UNIQUE indexes are checked — a plain `indexed` column allows dups.
-        let sec_unique = self.eng.sec_unique[table_id as usize].clone();
+        let sec_unique = self.bundle.sec_unique[table_id as usize].clone();
         for (i, cols) in sec.iter().enumerate() {
             if !sec_unique[i] {
                 continue;
@@ -514,7 +526,7 @@ impl<'e> WriteTxn<'e> {
             None => Ok(None),
             Some(bytes) => Ok(Some(row::decode_row(
                 &bytes,
-                &self.eng.col_types[table_id as usize],
+                &self.bundle.col_types[table_id as usize],
             )?)),
         }
     }
@@ -525,16 +537,16 @@ impl<'e> WriteTxn<'e> {
         let key = keycode::encode_key(pk_values);
         let (root, count) = self.tree_root(table_id, 0)?;
         // fetch old row first: index maintenance needs its column values
-        let sec_unique = self.eng.sec_unique[table_id as usize].clone();
+        let sec_unique = self.bundle.sec_unique[table_id as usize].clone();
         let Some(old_bytes) = btree::get(self, root, &key)? else {
             return Ok(false);
         };
-        let old = row::decode_row(&old_bytes, &self.eng.col_types[table_id as usize])?;
+        let old = row::decode_row(&old_bytes, &self.bundle.col_types[table_id as usize])?;
         let out = btree::delete(self, root, &key)?;
         debug_assert!(out.existed);
         self.set_tree_root(table_id, 0, out.new_root, count - 1);
 
-        let sec = self.eng.sec_indexes[table_id as usize].clone();
+        let sec = self.bundle.sec_indexes[table_id as usize].clone();
         for (i, cols) in sec.iter().enumerate() {
             let Some(ikey) = index_row_key(sec_unique[i], cols, &old, &key) else {
                 continue;
@@ -556,17 +568,21 @@ impl<'e> WriteTxn<'e> {
     pub fn update_by_pk(&mut self, table_id: u32, new_values: &[Value]) -> Result<bool> {
         self.check_write_blocked(table_id)?;
         self.eng.validate_row(table_id, new_values)?;
-        let table = self.eng.table(table_id)?;
+        let table = self
+            .bundle
+            .schema
+            .table(table_id)
+            .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
         let tname = table.name.clone();
         let key = self.eng.pk_key(table_id, new_values)?;
         let (root, count) = self.tree_root(table_id, 0)?;
         let Some(old_bytes) = btree::get(self, root, &key)? else {
             return Ok(false);
         };
-        let old = row::decode_row(&old_bytes, &self.eng.col_types[table_id as usize])?;
+        let old = row::decode_row(&old_bytes, &self.bundle.col_types[table_id as usize])?;
 
-        let sec = self.eng.sec_indexes[table_id as usize].clone();
-        let sec_unique = self.eng.sec_unique[table_id as usize].clone();
+        let sec = self.bundle.sec_indexes[table_id as usize].clone();
+        let sec_unique = self.bundle.sec_unique[table_id as usize].clone();
         // pre-check UNIQUE conflicts for changed unique-indexed columns
         for (i, cols) in sec.iter().enumerate() {
             if !sec_unique[i] {
@@ -592,7 +608,7 @@ impl<'e> WriteTxn<'e> {
             }
         }
 
-        let payload = row::encode_row(new_values, &self.eng.col_types[table_id as usize])?;
+        let payload = row::encode_row(new_values, &self.bundle.col_types[table_id as usize])?;
         // The threshold applies to updates exactly as to inserts; the upsert
         // frees the OLD value's chain/run through `free_old_val` either way.
         let extent_ref = if self.eng.extent_threshold.is_some_and(|t| payload.len() > t) {
@@ -666,7 +682,11 @@ impl<'e> WriteTxn<'e> {
             lo_k.as_ref().map(|(k, i)| (k.as_slice(), *i)),
             hi_k.as_ref().map(|(k, i)| (k.as_slice(), *i)),
         )?;
-        let table = self.eng.table(table_id)?;
+        let table = self
+            .bundle
+            .schema
+            .table(table_id)
+            .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
         let pk_types: Vec<ColumnType> = table.pk_types();
         let mut out = Vec::new();
         while let Some((k, _)) = c.next(self)? {
@@ -693,7 +713,7 @@ impl<'e> WriteTxn<'e> {
         )?;
         let mut out = Vec::new();
         while let Some((_k, v)) = c.next(self)? {
-            out.push(row::decode_row(&v, &self.eng.col_types[table_id as usize])?);
+            out.push(row::decode_row(&v, &self.bundle.col_types[table_id as usize])?);
         }
         Ok(out)
     }
@@ -713,7 +733,7 @@ impl<'e> WriteTxn<'e> {
         let mut c = btree::cursor(self, root, lo, hi)?;
         let mut out = Vec::new();
         while let Some((_k, v)) = c.next(self)? {
-            out.push(row::decode_row(&v, &self.eng.col_types[table_id as usize])?);
+            out.push(row::decode_row(&v, &self.bundle.col_types[table_id as usize])?);
         }
         Ok(out)
     }
@@ -735,7 +755,7 @@ impl<'e> WriteTxn<'e> {
             None => Err(Error::Corrupt("index entry points at a missing row".into())),
             Some(bytes) => Ok(Some(row::decode_row(
                 &bytes,
-                &self.eng.col_types[table_id as usize],
+                &self.bundle.col_types[table_id as usize],
             )?)),
         }
     }
@@ -754,14 +774,14 @@ impl<'e> WriteTxn<'e> {
         }
         let full_unique = index_no >= 1
             && self
-                .eng
+                .bundle
                 .sec_unique
                 .get(table_id as usize)
                 .and_then(|v| v.get(index_no as usize - 1))
                 .copied()
                 .unwrap_or(false)
             && self
-                .eng
+                .bundle
                 .sec_indexes
                 .get(table_id as usize)
                 .and_then(|v| v.get(index_no as usize - 1))
@@ -781,7 +801,7 @@ impl<'e> WriteTxn<'e> {
             match btree::get(self, root, &pk_bytes)? {
                 Some(bytes) => out.push(row::decode_row(
                     &bytes,
-                    &self.eng.col_types[table_id as usize],
+                    &self.bundle.col_types[table_id as usize],
                 )?),
                 None => {
                     return Err(Error::Corrupt("index entry points at a missing row".into()))
@@ -807,7 +827,7 @@ impl<'e> WriteTxn<'e> {
             match btree::get(self, root, &pk_bytes)? {
                 Some(bytes) => out.push(row::decode_row(
                     &bytes,
-                    &self.eng.col_types[table_id as usize],
+                    &self.bundle.col_types[table_id as usize],
                 )?),
                 None => {
                     return Err(Error::Corrupt("index entry points at a missing row".into()))
@@ -1034,7 +1054,8 @@ pub struct TxnSavepoint {
 }
 
 fn table_column_name(eng: &Engine, table_id: u32, col: u16) -> String {
-    eng.schema
+    eng.bundle()
+        .schema
         .table(table_id)
         .map(|t| t.columns[col as usize].name.clone())
         .unwrap_or_else(|| format!("col{col}"))
