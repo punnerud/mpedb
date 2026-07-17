@@ -448,6 +448,11 @@ verified in turso_core 0.7.0's source), so its commit-class cell is durable-on-a
 Turso has no blocking busy_timeout: a second concurrent writer gets Busy immediately, \
 and the adapter retries with a yielding backoff (up to 60 s), so contended cells measure \
 throughput-under-retry — SQLite arbitrates the same contention inside busy_timeout. \
+Turso 0.7 also has no WAL autocheckpoint (the pragma does not exist), and without one \
+its WAL grew ~1.9 GB inside a single 3 s disk cell (measured — it filled the host disk); \
+the adapter issues `PRAGMA wal_checkpoint(TRUNCATE)` every 1000 write ops, the closest \
+analog of SQLite's default autocheckpoint=1000, with its cost included in the measured \
+time exactly as SQLite's is. \
 Turso is excluded from the §5.4 durability table (its point-insert commit-class cell \
 already shows the same single-writer durable path; it has no deferred mode to pair it \
 with).

@@ -51,9 +51,19 @@ impl TursoEngine {
     }
 }
 
+/// Checkpoint cadence, in write ops. SQLite's default WAL autocheckpoint
+/// (1000 pages) is what its adapter runs with; turso 0.7 has NO autocheckpoint
+/// (the pragma does not exist), and without one its WAL grew ~1.9 GB inside a
+/// single 3 s disk cell — measured filling the dev box to ENOSPC. The manual
+/// TRUNCATE checkpoint below is the closest honest analog; its cost is
+/// included in the measured time, exactly as SQLite's autocheckpoint cost is.
+const CHECKPOINT_EVERY: u64 = 1000;
+
 struct TursoConn {
     rt: tokio::runtime::Runtime,
     conn: turso::Connection,
+    writes: u64,
+    in_txn: bool,
 }
 
 fn rt() -> BResult<tokio::runtime::Runtime> {
@@ -72,7 +82,7 @@ fn open_conn(path: &Path, mode: TursoMode) -> BResult<TursoConn> {
             .map_err(|e| BoxErr::from(format!("turso open: {e}")))?;
         db.connect().map_err(|e| BoxErr::from(format!("turso connect: {e}")))
     })?;
-    let mut c = TursoConn { rt, conn };
+    let mut c = TursoConn { rt, conn, writes: 0, in_txn: false };
     // Same honesty rule as the SQLite adapter: on Apple, `fsync()` does not
     // flush the drive's write cache, and turso's `PRAGMA fullfsync` (Apple-only
     // pragma) defaults OFF — without this, macOS commit-class numbers would be
@@ -109,6 +119,45 @@ impl TursoConn {
             }
         }
     }
+
+    /// Count a write and checkpoint every CHECKPOINT_EVERY of them (never
+    /// inside an open transaction — the catch-up happens after COMMIT).
+    fn note_write_and_checkpoint(&mut self) -> BResult<()> {
+        self.writes += 1;
+        if self.in_txn || self.writes < CHECKPOINT_EVERY {
+            return Ok(());
+        }
+        self.writes = 0;
+        self.checkpoint_now()
+    }
+
+    /// The pragma returns a row (busy, log, checkpointed), so it goes through
+    /// query; Busy gets the same yielding retry as writes do — a checkpointer
+    /// waiting out writers is exactly what SQLite's autocheckpoint does too.
+    fn checkpoint_now(&mut self) -> BResult<()> {
+        let deadline = Instant::now() + Duration::from_secs(60);
+        loop {
+            let r = self.rt.block_on(async {
+                let mut rows = self
+                    .conn
+                    .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+                    .await?;
+                while rows.next().await?.is_some() {}
+                Ok::<(), turso::Error>(())
+            });
+            match r {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    let msg = e.to_string();
+                    if is_busy(&msg) && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_micros(100));
+                        continue;
+                    }
+                    return Err(BoxErr::from(format!("turso checkpoint: {msg}")));
+                }
+            }
+        }
+    }
 }
 
 impl Conn for TursoConn {
@@ -116,7 +165,8 @@ impl Conn for TursoConn {
         self.exec_retry(
             "INSERT INTO users (id, email, age) VALUES (?, ?, ?)",
             (id, email.to_string(), age),
-        )
+        )?;
+        self.note_write_and_checkpoint()
     }
 
     fn select(&mut self, id: i64) -> BResult<bool> {
@@ -137,19 +187,29 @@ impl Conn for TursoConn {
     }
 
     fn update(&mut self, id: i64, age: i64) -> BResult<()> {
-        self.exec_retry("UPDATE users SET age = ? WHERE id = ?", (age, id))
+        self.exec_retry("UPDATE users SET age = ? WHERE id = ?", (age, id))?;
+        self.note_write_and_checkpoint()
     }
 
     fn insert_batch(&mut self, base_id: i64, n: i64) -> BResult<()> {
         self.exec_retry("BEGIN", ())?;
+        self.in_txn = true;
         for i in 0..n {
             let id = base_id + i;
             if let Err(e) = self.insert(id, &email_for(id), age_for(id)) {
                 let _ = self.exec_retry("ROLLBACK", ());
+                self.in_txn = false;
                 return Err(e);
             }
         }
-        self.exec_retry("COMMIT", ())
+        self.exec_retry("COMMIT", ())?;
+        self.in_txn = false;
+        // Catch up on any checkpoint threshold crossed inside the transaction.
+        if self.writes >= CHECKPOINT_EVERY {
+            self.writes = 0;
+            return self.checkpoint_now();
+        }
+        Ok(())
     }
 }
 
@@ -167,10 +227,14 @@ impl Engine for TursoEngine {
             (),
         )?;
         c.exec_retry("BEGIN", ())?;
+        c.in_txn = true;
         for id in 0..rows {
             c.insert(id, &email_for(id), age_for(id))?;
         }
         c.exec_retry("COMMIT", ())?;
+        c.in_txn = false;
+        c.checkpoint_now()?;
+        c.writes = 0;
         Ok(())
     }
 
