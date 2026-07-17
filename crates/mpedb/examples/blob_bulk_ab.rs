@@ -54,7 +54,17 @@ fn main() {
     let reps: usize = args.get(1).and_then(|s| s.parse().ok()).unwrap_or(4);
     let mib: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(64);
     let blob: usize = args.get(3).and_then(|s| s.parse().ok()).unwrap_or(4096);
-    let dir = "/dev/shm";
+    // /dev/shm on Linux; the temp dir elsewhere (macOS: APFS — a DISK cell,
+    // not a memory cell; compare ratios, never absolutes, across the two).
+    let fallback = std::env::temp_dir().display().to_string();
+    let dir: &str = args
+        .get(4)
+        .map(|s| s.as_str())
+        .unwrap_or(if std::path::Path::new("/dev/shm").is_dir() {
+            "/dev/shm"
+        } else {
+            &fallback
+        });
     let mut off = Vec::new();
     let mut on = Vec::new();
     // ABAB pairing: adjacent arms see the same machine state.
