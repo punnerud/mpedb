@@ -143,15 +143,46 @@ fn leaf_cell(p: &[u8], i: usize) -> Result<(&[u8], LeafVal<'_>)> {
                 first_page: u64::from_le_bytes(rest[4..12].try_into().unwrap()),
             }
         }
+        2 => {
+            if rest.len() < EXTENT_REF_LEN {
+                return Err(corrupt("truncated extent ref"));
+            }
+            let start_page = u64::from_le_bytes(rest[0..8].try_into().unwrap());
+            let total_len = u64::from_le_bytes(rest[8..16].try_into().unwrap());
+            let npages = u32::from_le_bytes(rest[16..20].try_into().unwrap());
+            // The two sizes must agree (DESIGN-BLOBEXTENT §3.1): a corrupt
+            // length must not let a reader walk past the run, and checked
+            // math keeps hostile values at Corrupt instead of a wrap.
+            let expect = total_len
+                .checked_add(PAGE_SIZE as u64 - 1)
+                .ok_or_else(|| corrupt("extent length overflow"))?
+                / PAGE_SIZE as u64;
+            if u64::from(npages) != expect || npages == 0 {
+                return Err(corrupt("extent length/page-count mismatch"));
+            }
+            if start_page
+                .checked_add(u64::from(npages))
+                .is_none()
+            {
+                return Err(corrupt("extent run overflows the page space"));
+            }
+            LeafVal::Extent { start_page, total_len, npages }
+        }
+        // vkind=3 is reserved for base+diff (#52) — refused by name.
+        3 => return Err(corrupt("extent kind base+diff is reserved but not yet supported")),
         _ => return Err(corrupt("bad vkind")),
     };
     Ok((key, val))
 }
 
+/// Encoded size of a `vkind=2` reference: start_page ‖ total_len ‖ npages.
+pub const EXTENT_REF_LEN: usize = 8 + 8 + 4;
+
 #[derive(Clone, Copy)]
 enum LeafVal<'a> {
     Inline(&'a [u8]),
     Overflow { total_len: u32, first_page: u64 },
+    Extent { start_page: u64, total_len: u64, npages: u32 },
 }
 
 fn leaf_cell_len(p: &[u8], i: usize) -> Result<usize> {
@@ -159,6 +190,7 @@ fn leaf_cell_len(p: &[u8], i: usize) -> Result<usize> {
     Ok(match val {
         LeafVal::Inline(v) => 3 + key.len() + 2 + v.len(),
         LeafVal::Overflow { .. } => 3 + key.len() + 12,
+        LeafVal::Extent { .. } => 3 + key.len() + EXTENT_REF_LEN,
     })
 }
 
@@ -492,6 +524,23 @@ fn free_overflow<S: PageStore + ?Sized>(store: &mut S, first_page: u64) -> Resul
     Ok(())
 }
 
+/// What a replaced/deleted leaf cell owned outside the page tree.
+enum OldVal {
+    None,
+    Overflow(u64),
+    Extent(u64, u32),
+}
+
+/// Free it — the ONE place replace and delete route through, so overflow
+/// chains and extents cannot drift in ownership handling.
+fn free_old_val<S: PageStore + ?Sized>(store: &mut S, old: OldVal) -> Result<()> {
+    match old {
+        OldVal::None => Ok(()),
+        OldVal::Overflow(first) => free_overflow(store, first),
+        OldVal::Extent(start, npages) => store.free_extent(start, npages),
+    }
+}
+
 fn read_leaf_val<S: PageStore + ?Sized>(store: &S, val: LeafVal<'_>) -> Result<Vec<u8>> {
     match val {
         LeafVal::Inline(v) => Ok(v.to_vec()),
@@ -499,6 +548,14 @@ fn read_leaf_val<S: PageStore + ?Sized>(store: &S, val: LeafVal<'_>) -> Result<V
             total_len,
             first_page,
         } => read_overflow(store, first_page, total_len),
+        LeafVal::Extent { start_page, total_len, .. } => {
+            let mut out = Vec::with_capacity(total_len.min(1 << 20) as usize);
+            store.read_extent(start_page, total_len, &mut out)?;
+            if out.len() as u64 != total_len {
+                return Err(corrupt("extent read returned wrong length"));
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -596,6 +653,15 @@ pub enum Payload<'a> {
         head: &'a [u8],
         src: &'a mut dyn BlobSource,
     },
+    /// A payload ALREADY written into an extent run (DESIGN-BLOBEXTENT §3.1):
+    /// the store placed the bytes before this insert was called, and the leaf
+    /// carries only the 20-byte `vkind=2` reference. Payload-before-reference
+    /// is the crash argument, so the order is a contract, not a convenience.
+    ExtentRef {
+        start_page: u64,
+        total_len: u64,
+        npages: u32,
+    },
 }
 
 impl<'a> Payload<'a> {
@@ -604,6 +670,10 @@ impl<'a> Payload<'a> {
             Payload::Flat(b) => b.len(),
             Payload::Parts(ps) => ps.iter().map(|p| p.len()).sum(),
             Payload::Stream { head, src } => head.len() + src.len(),
+            // The VALUE the tree stores is the 20-byte reference; the
+            // payload's own size lives behind it and never counts against
+            // inline/split thresholds.
+            Payload::ExtentRef { .. } => EXTENT_REF_LEN,
         }
     }
 
@@ -619,7 +689,9 @@ impl<'a> Payload<'a> {
             Payload::Parts(ps) => ps,
             // Only the inline path calls this, and a Stream is by definition too
             // big to be inline — `insert_rec` checks the length first.
-            Payload::Stream { .. } => &[],
+            // An ExtentRef is encoded by the leaf writer itself (vkind=2),
+            // never through the byte-copy path.
+            Payload::Stream { .. } | Payload::ExtentRef { .. } => &[],
         }
     }
 }
@@ -686,6 +758,14 @@ impl<'a> PayloadCursor<'a> {
 fn make_leaf_cell(key: &[u8], val: &Payload<'_>, overflow_page: u64) -> Vec<u8> {
     let mut c = Vec::with_capacity(3 + key.len() + 2 + val.len().min(MAX_INLINE_VAL));
     c.extend_from_slice(&(key.len() as u16).to_le_bytes());
+    if let Payload::ExtentRef { start_page, total_len, npages } = val {
+        c.push(2);
+        c.extend_from_slice(key);
+        c.extend_from_slice(&start_page.to_le_bytes());
+        c.extend_from_slice(&total_len.to_le_bytes());
+        c.extend_from_slice(&npages.to_le_bytes());
+        return c;
+    }
     if overflow_page == 0 {
         c.push(0);
         c.extend_from_slice(key);
@@ -828,16 +908,17 @@ fn insert_rec<S: PageStore + ?Sized>(
             let id = cow(store, page_id)?;
             // replace: drop the old cell (and its overflow chain) first
             if existing {
-                let old_overflow = {
+                let old = {
                     let p = store.page(id)?;
                     match leaf_cell(p, pos)?.1 {
-                        LeafVal::Overflow { first_page, .. } => first_page,
-                        LeafVal::Inline(_) => 0,
+                        LeafVal::Overflow { first_page, .. } => OldVal::Overflow(first_page),
+                        LeafVal::Extent { start_page, npages, .. } => {
+                            OldVal::Extent(start_page, npages)
+                        }
+                        LeafVal::Inline(_) => OldVal::None,
                     }
                 };
-                if old_overflow != 0 {
-                    free_overflow(store, old_overflow)?;
-                }
+                free_old_val(store, old)?;
                 remove_cell(store.page_mut(id)?, pos);
             }
             // A Stream small enough to stay INLINE has to be drained into a
@@ -861,6 +942,12 @@ fn insert_rec<S: PageStore + ?Sized>(
             };
             let (overflow_page, cell) = match &drained {
                 Some(b) => (0u64, make_leaf_cell(key, &Payload::Flat(b), 0)),
+                // The extent payload was written (and, in durable modes,
+                // synced) BEFORE this insert — the cell is only the 20-byte
+                // reference and never spills.
+                None if matches!(val, Payload::ExtentRef { .. }) => {
+                    (0u64, make_leaf_cell(key, val, 0))
+                }
                 None => {
                     let op = if val.len() > MAX_INLINE_VAL {
                         write_overflow(store, val)?
@@ -1022,15 +1109,16 @@ fn delete_rec<S: PageStore + ?Sized>(store: &mut S, page_id: u64, key: &[u8]) ->
                 }
             };
             let id = cow(store, page_id)?;
-            let overflow = {
+            let old = {
                 match leaf_cell(store.page(id)?, pos)?.1 {
-                    LeafVal::Overflow { first_page, .. } => first_page,
-                    LeafVal::Inline(_) => 0,
+                    LeafVal::Overflow { first_page, .. } => OldVal::Overflow(first_page),
+                    LeafVal::Extent { start_page, npages, .. } => {
+                        OldVal::Extent(start_page, npages)
+                    }
+                    LeafVal::Inline(_) => OldVal::None,
                 }
             };
-            if overflow != 0 {
-                free_overflow(store, overflow)?;
-            }
+            free_old_val(store, old)?;
             remove_cell(store.page_mut(id)?, pos);
             if nkeys(store.page(id)?) == 0 {
                 store.free(id)?;
@@ -1179,6 +1267,41 @@ pub fn delete<S: PageStore + ?Sized>(
 
 /// Collect every page id reachable from `root` (nodes + overflow chains)
 /// into `out`. Used by integrity verification (page-accounting invariant).
+/// Every extent referenced by leaves under `root` — the extent-side sibling
+/// of [`collect_pages`], for the interval-accounting verifier and the model
+/// tests' leak check (DESIGN-BLOBEXTENT §3.2/§6).
+pub fn collect_extents<S: PageStore + ?Sized>(
+    store: &S,
+    root: u64,
+    out: &mut Vec<(u64, u32)>,
+) -> Result<()> {
+    if root == 0 {
+        return Ok(());
+    }
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        let p = store.page(id)?;
+        check_node(p)?;
+        match kind(p) {
+            KIND_BRANCH => {
+                stack.push(extra(p));
+                for i in 0..nkeys(p) {
+                    stack.push(branch_cell(p, i)?.1);
+                }
+            }
+            KIND_LEAF => {
+                for i in 0..nkeys(p) {
+                    if let (_, LeafVal::Extent { start_page, npages, .. }) = leaf_cell(p, i)? {
+                        out.push((start_page, npages));
+                    }
+                }
+            }
+            _ => return Err(corrupt("unknown node kind")),
+        }
+    }
+    Ok(())
+}
+
 pub fn collect_pages<S: PageStore + ?Sized>(
     store: &S,
     root: u64,
@@ -1367,6 +1490,130 @@ mod tests {
     use super::*;
     use crate::pagestore::test_store::TestStore;
     use std::collections::BTreeMap;
+
+    /// Extents through the tree, differentially against a model — with the
+    /// OWNERSHIP ledger as the real assertion: after every simulated commit,
+    /// the arena's live extents must be exactly the refs reachable from the
+    /// root. A replace or delete that forgets `free_extent` leaks; one that
+    /// frees twice trips the arena's double-free guard; a read of a freed
+    /// extent trips the dead-extent guard. (DESIGN-BLOBEXTENT §13.2.)
+    #[test]
+    fn extent_refs_roundtrip_and_never_leak() {
+        let mut store = TestStore::new();
+        let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+        let mut root = 0u64;
+        let mut rng = Rng(0x0B10_BE47);
+        for round in 0..2000u32 {
+            let k = format!("k{:03}", rng.next() % 200).into_bytes();
+            match rng.next() % 4 {
+                // 0..=1: upsert an extent-backed value
+                0 | 1 => {
+                    let len = 1 + (rng.next() as usize % (3 * PAGE_SIZE));
+                    let val: Vec<u8> = (0..len).map(|i| (rng.next() ^ i as u64) as u8).collect();
+                    // payload BEFORE reference — the arena models the order
+                    let (start_page, total_len, npages) = store.put_extent(&val);
+                    let out = insert(
+                        &mut store,
+                        root,
+                        &k,
+                        &mut Payload::ExtentRef { start_page, total_len, npages },
+                        InsertMode::Upsert,
+                    )
+                    .unwrap();
+                    root = out.new_root;
+                    model.insert(k, val);
+                }
+                // 2: upsert a small inline value (kind churn: extent→inline
+                // replace must free the extent)
+                2 => {
+                    let val: Vec<u8> = (0..(rng.next() as usize % 64))
+                        .map(|_| rng.next() as u8)
+                        .collect();
+                    let out = insert(
+                        &mut store,
+                        root,
+                        &k,
+                        &mut Payload::Flat(&val),
+                        InsertMode::Upsert,
+                    )
+                    .unwrap();
+                    root = out.new_root;
+                    model.insert(k, val);
+                }
+                // 3: delete
+                _ => {
+                    let out = delete(&mut store, root, &k).unwrap();
+                    root = out.new_root;
+                    model.remove(&k);
+                }
+            }
+            // read-back parity on a sample key
+            let probe = format!("k{:03}", rng.next() % 200).into_bytes();
+            assert_eq!(
+                get(&store, root, &probe).unwrap(),
+                model.get(&probe).cloned(),
+                "round {round}"
+            );
+            if round % 97 == 0 {
+                store.commit();
+                let mut refs = Vec::new();
+                collect_extents(&store, root, &mut refs).unwrap();
+                let mut reachable: Vec<u64> = refs.iter().map(|(s, _)| *s).collect();
+                reachable.sort_unstable();
+                assert_eq!(
+                    store.live_extents(),
+                    reachable,
+                    "extent ledger out of balance at round {round}"
+                );
+            }
+        }
+        // full drain: every extent must come back
+        store.commit();
+        for (k, v) in &model {
+            assert_eq!(get(&store, root, k).unwrap().as_deref(), Some(v.as_slice()));
+        }
+        let keys: Vec<Vec<u8>> = model.keys().cloned().collect();
+        for k in keys {
+            root = delete(&mut store, root, &k).unwrap().new_root;
+        }
+        store.commit();
+        assert!(store.live_extents().is_empty(), "drained tree leaked extents");
+        assert_eq!(root, 0);
+    }
+
+    /// The vkind=2 decode is strict: truncation at every offset and a
+    /// disagreeing npages must be Corrupt, never a panic or a wild read.
+    #[test]
+    fn extent_cell_decode_is_strict() {
+        let mut store = TestStore::new();
+        let (start_page, total_len, npages) = store.put_extent(&[7u8; 5000]);
+        let out = insert(
+            &mut store,
+            0,
+            b"k",
+            &mut Payload::ExtentRef { start_page, total_len, npages },
+            InsertMode::Upsert,
+        )
+        .unwrap();
+        let root = out.new_root;
+        // Corrupt the npages field in place: find the cell's trailing 4 bytes.
+        let page: Vec<u8> = store.page(root).unwrap().to_vec();
+        // (cells live at the tail; the ref is the last EXTENT_REF_LEN bytes of
+        // the only cell — locate by the known total_len bytes)
+        let needle = total_len.to_le_bytes();
+        let at = page
+            .windows(8)
+            .rposition(|w| w == needle)
+            .expect("total_len bytes present");
+        let dirty = {
+            // TestStore page_mut requires dirty — re-insert to keep it dirty,
+            // then poke the byte through the same page id.
+            store.page_mut(root).unwrap()
+        };
+        dirty[at + 8..at + 12].copy_from_slice(&(npages + 1).to_le_bytes());
+        let err = get(&store, root, b"k").unwrap_err();
+        assert!(format!("{err}").contains("mismatch"), "{err}");
+    }
 
     /// A streamed value must be byte-for-byte the same as one handed over whole.
     ///

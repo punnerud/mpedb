@@ -43,6 +43,27 @@ pub trait PageStore {
     }
     fn free(&mut self, id: u64) -> Result<()>;
     fn is_dirty(&self, id: u64) -> bool;
+
+    // ---- extents (DESIGN-BLOBEXTENT) ----
+    //
+    // A store that can place large payloads OUTSIDE the page tree implements
+    // these; the defaults refuse, so a `vkind=2` cell in a store without
+    // extent support surfaces as an error instead of garbage. Allocation and
+    // the payload write are NOT trait methods: the engine pwrites through the
+    // file and the TestStore fills an arena — each on its own terms, before
+    // the tiny reference ever reaches the btree.
+
+    /// Read `total_len` bytes of the extent starting at `start_page` into
+    /// `out` (appended). The store bounds-checks against its own geometry.
+    fn read_extent(&self, _start_page: u64, _total_len: u64, _out: &mut Vec<u8>) -> Result<()> {
+        Err(Error::Unsupported("this store has no extents".into()))
+    }
+
+    /// Schedule the run for freeing (the btree calls this exactly where it
+    /// frees an overflow chain: replace and delete).
+    fn free_extent(&mut self, _start_page: u64, _npages: u32) -> Result<()> {
+        Err(Error::Unsupported("this store has no extents".into()))
+    }
 }
 
 /// Copy-on-write: dirty pages are modified in place; committed pages are
@@ -73,6 +94,12 @@ pub mod test_store {
         free: Vec<u64>,
         freed_pending: BTreeSet<u64>,
         dirty: BTreeSet<u64>,
+        /// Extent arena (DESIGN-BLOBEXTENT): start id → payload bytes. Ids
+        /// live in their own space (they never collide with page ids here —
+        /// the model checks OWNERSHIP, the engine checks geometry).
+        extents: std::collections::BTreeMap<u64, Vec<u8>>,
+        extents_pending_free: BTreeSet<u64>,
+        next_extent: u64,
     }
 
     impl TestStore {
@@ -85,11 +112,33 @@ pub mod test_store {
             self.free.extend(self.freed_pending.iter().copied());
             self.freed_pending.clear();
             self.dirty.clear();
+            for id in std::mem::take(&mut self.extents_pending_free) {
+                self.extents.remove(&id);
+            }
         }
 
         /// Number of live (allocated, not freed) pages.
         pub fn live_pages(&self) -> usize {
             self.pages.len() - self.free.len() - self.freed_pending.len()
+        }
+
+        /// Place `bytes` in the arena and hand back the reference the leaf
+        /// cell will carry — the payload-before-reference order, modeled.
+        pub fn put_extent(&mut self, bytes: &[u8]) -> (u64, u64, u32) {
+            self.next_extent += 1;
+            let start = self.next_extent;
+            let npages = bytes.len().div_ceil(PAGE_SIZE).max(1) as u32;
+            self.extents.insert(start, bytes.to_vec());
+            (start, bytes.len() as u64, npages)
+        }
+
+        /// Live (not pending-free) extents, for the model's leak check.
+        pub fn live_extents(&self) -> Vec<u64> {
+            self.extents
+                .keys()
+                .copied()
+                .filter(|id| !self.extents_pending_free.contains(id))
+                .collect()
         }
     }
 
@@ -147,6 +196,37 @@ pub mod test_store {
 
         fn is_dirty(&self, id: u64) -> bool {
             self.dirty.contains(&id)
+        }
+
+        fn read_extent(&self, start_page: u64, total_len: u64, out: &mut Vec<u8>) -> Result<()> {
+            let b = self
+                .extents
+                .get(&start_page)
+                .ok_or_else(|| Error::Internal(format!("read of dead extent {start_page}")))?;
+            if self.extents_pending_free.contains(&start_page) {
+                return Err(Error::Internal(format!(
+                    "read of pending-free extent {start_page}"
+                )));
+            }
+            if b.len() as u64 != total_len {
+                return Err(Error::Corrupt("extent length mismatch".into()));
+            }
+            out.extend_from_slice(b);
+            Ok(())
+        }
+
+        fn free_extent(&mut self, start_page: u64, _npages: u32) -> Result<()> {
+            if !self.extents.contains_key(&start_page) {
+                return Err(Error::Internal(format!(
+                    "free of unknown extent {start_page}"
+                )));
+            }
+            if !self.extents_pending_free.insert(start_page) {
+                return Err(Error::Internal(format!(
+                    "double free of extent {start_page}"
+                )));
+            }
+            Ok(())
         }
     }
 }
