@@ -249,19 +249,20 @@ pub(super) fn plan_aggregate_select(
                     ast::Expr::Qualified(q, n) => base_scope.resolve_qualified(q, n)?,
                     _ => unreachable!("matched above"),
                 };
+                // A repeated key is redundant, not wrong — `GROUP BY a, a`
+                // groups exactly as `GROUP BY a` in sqlite and PostgreSQL
+                // both (measured: refusing it was 14k+ corpus statements).
                 if key_cols.contains(&Some(i)) {
-                    return Err(bind_err(format!(
-                        "column `{}` repeated in GROUP BY",
-                        base_scope.slot_name(i)
-                    )));
+                    continue;
                 }
                 group_by.push(GroupKey::Col(i));
                 key_cols.push(Some(i));
                 key_types.push(ty);
             }
             expr => {
+                // Same rule as repeated columns: redundant, not wrong.
                 if key_asts.contains(expr) {
-                    return Err(bind_err("expression repeated in GROUP BY"));
+                    continue;
                 }
                 let (b, ty) = binder.bind_expr(expr)?;
                 group_by.push(GroupKey::Expr(compile_program(&b)?));

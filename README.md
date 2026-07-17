@@ -267,14 +267,14 @@ Turso's COMPAT.md so the two read side by side.
 It is also measured against sqlite's own **sqllogictest corpus** (the
 `sqlite_corpus` runner in `crates/mpedb-testkit`), all 5.3 million records of
 it: **zero wrong answers and zero error mismatches across the entire corpus**,
-with **99.5% of attempted statements passing** — the classic `select1–3`, the
+with **99.8% of attempted statements passing** — the classic `select1–3`, the
 whole random *select* tree, and (since FROM-less `SELECT 3+5` landed) the
-*expr* tree at 99.6% and the *aggregates* tree at 100.0%. `select4` — six-way
-comma-join products that were unrunnable before WHERE pushdown (13.5 GB and
-SIGKILLed) — passes at 99.6% inside a 3 GB memory guard. The remaining half
-percent is deliberate refusals with error messages, mostly `CASE`/`COALESCE`
-arms that mix int and float (sqlite types those per row — rigid typing says
-`CAST`) and *groupby*-tree shapes not yet compiled.
+*expr* tree at 99.6%, the *aggregates* tree at 100.0%, and the *groupby*
+tree at 99.0%. `select4` — six-way comma-join products that were unrunnable
+before WHERE pushdown (13.5 GB and SIGKILLed) — passes at 99.6% inside a
+3 GB memory guard. What remains is deliberate refusals with error messages,
+mostly `CASE`/`COALESCE` arms that mix int and float (sqlite types those per
+row — rigid typing says `CAST`).
 
 | | mpedb | note |
 |---|---|---|
