@@ -15,6 +15,7 @@ mod dur_compare;
 mod eng_mpedb;
 mod eng_pg;
 mod eng_sqlite;
+mod eng_turso;
 mod engines;
 mod report;
 mod util;
@@ -26,12 +27,13 @@ use std::time::Instant;
 use eng_mpedb::MpedbEngine;
 use eng_pg::{PgEngine, PgServer};
 use eng_sqlite::{SqliteEngine, SqliteMode};
+use eng_turso::{TursoEngine, TursoMode};
 use engines::Engine;
 use report::{CellRow, Report};
 use util::{cpu_model, fs_type, host_slug, mem_total, os_release, rustc_version, today_utc, BResult};
 use workloads::{run_workload, RunCfg, ALL_WORKLOADS};
 
-const ENGINE_KEYS: [&str; 3] = ["mpedb", "sqlite", "postgres"];
+const ENGINE_KEYS: [&str; 4] = ["mpedb", "sqlite", "postgres", "turso"];
 
 struct DirGuard(PathBuf);
 impl Drop for DirGuard {
@@ -93,6 +95,8 @@ fn config_label(key: &str, durable: bool) -> String {
         ("mpedb", true) => "disk, durability=commit".into(),
         ("sqlite", false) => "tmpfs, sync=OFF+MEMORY".into(),
         ("sqlite", true) => "disk, sync=FULL+WAL".into(),
+        ("turso", false) => "tmpfs, default (WAL)".into(),
+        ("turso", true) => "disk, default (WAL)".into(),
         (_, false) => "tmpfs, fsync=off+sc=off".into(),
         (_, true) => "disk, fsync=on+sc=on".into(),
     }
@@ -116,6 +120,14 @@ fn build_engine(
                 SqliteMode::CommitClass
             } else {
                 SqliteMode::NoneClass
+            },
+        )?)),
+        "turso" => Ok(Box::new(TursoEngine::new(
+            medium.join("turso"),
+            if durable {
+                TursoMode::CommitClass
+            } else {
+                TursoMode::NoneClass
             },
         )?)),
         _ => {
