@@ -179,6 +179,8 @@ fn agg_fn(name: &str) -> Option<mpedb_types::AggFn> {
         "avg" => Avg,
         "min" => Min,
         "max" => Max,
+        "total" => Total,
+        "group_concat" => GroupConcat,
         _ => return None,
     })
 }

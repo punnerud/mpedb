@@ -68,7 +68,10 @@ const MAX_JOINS: usize = 16;
 //    it carried exactly one, so a format-11 reader would take the count
 //    byte as a part tag and desynchronize. Rides the canonical-bytes-v2
 //    window (schemas carry explicit `TableDef.indexes`).
-const PLAN_FORMAT: u8 = 12;
+// 13: new aggregate tags `total` (6) and `group_concat` (7). Additive, but a
+//    format-12 reader hits `AggFn::from_tag` → None and rejects the plan, so
+//    the whole-plan version gates it cleanly.
+const PLAN_FORMAT: u8 = 13;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

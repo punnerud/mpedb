@@ -92,6 +92,36 @@ impl Accum {
         self.n += 1;
         match self.func {
             AggFn::Count => {}
+            AggFn::Total => match v {
+                // Always a float running sum; no overflow to raise (unlike Sum's
+                // integer path) and no NULL to return (finish is 0.0 over empty).
+                Value::Int(i) => self.fsum += *i as f64,
+                Value::Float(f) => self.fsum += *f,
+                other => {
+                    return Err(Error::TypeMismatch(format!(
+                        "total() expects a number, got {}",
+                        other.type_name()
+                    )))
+                }
+            },
+            AggFn::GroupConcat => {
+                // Concatenate the non-NULL values' text (raw, not the quoted
+                // Display form) with a ',' separator, in scan order.
+                let piece = group_concat_text(v)?;
+                self.acc = Some(match self.acc.take() {
+                    None => Value::Text(piece),
+                    Some(Value::Text(mut s)) => {
+                        s.push(',');
+                        s.push_str(&piece);
+                        Value::Text(s)
+                    }
+                    Some(other) => {
+                        return Err(Error::Internal(format!(
+                            "group_concat accumulator held a non-text value {other:?}"
+                        )))
+                    }
+                });
+            }
             AggFn::Sum | AggFn::Avg => {
                 match v {
                     Value::Int(i) => {
@@ -166,9 +196,33 @@ impl Accum {
                     Value::Float(self.fsum / self.n as f64)
                 }
             }
-            AggFn::Sum | AggFn::Min | AggFn::Max => self.acc.unwrap_or(Value::Null),
+            // `total` is the one that is 0.0 over an empty group, and always a
+            // float — the deliberate contrast with `sum`'s NULL.
+            AggFn::Total => Value::Float(self.fsum),
+            AggFn::Sum | AggFn::Min | AggFn::Max | AggFn::GroupConcat => {
+                self.acc.unwrap_or(Value::Null)
+            }
         }
     }
+}
+
+/// One value's contribution to `group_concat`: its raw text (NOT the quoted
+/// `Display` form). Text passes through; numbers/bool/timestamp stringify;
+/// a blob has no lossless text form here and is refused.
+fn group_concat_text(v: &Value) -> Result<String> {
+    Ok(match v {
+        Value::Text(s) => s.clone(),
+        Value::Int(i) => i.to_string(),
+        Value::Float(f) => format!("{f:?}"),
+        Value::Bool(b) => if *b { "true" } else { "false" }.to_string(),
+        Value::Timestamp(t) => t.to_string(),
+        other => {
+            return Err(Error::TypeMismatch(format!(
+                "group_concat() cannot render a {} as text",
+                other.type_name()
+            )))
+        }
+    })
 }
 
 fn mixed(f: AggFn, a: &Value, b: &Value) -> Error {

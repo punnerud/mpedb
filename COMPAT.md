@@ -123,7 +123,8 @@ with timestamp parameters accepted by the CLI and the Python API.
 |---|---|---|
 | count(*) / count(x) / count(DISTINCT x) | ✅ | NULL rules verified against sqlite 3.45 |
 | sum, avg, min, max | ✅ | including over joins and with GROUP BY / HAVING |
-| group_concat, total | ❌ | |
+| total | ✅ | always a float, 0.0 over an empty/all-NULL group (never NULL — the deliberate contrast with `sum`) |
+| group_concat | ✅ | non-NULL values' text joined with `,` in scan order; NULL over an empty group. Custom-separator `group_concat(x, sep)` refused (v1) |
 
 ## Types
 

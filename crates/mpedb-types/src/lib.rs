@@ -35,6 +35,13 @@ pub enum AggFn {
     Avg = 3,
     Min = 4,
     Max = 5,
+    /// `total(x)` — like `sum` but always a float and **0.0 over an empty group**
+    /// (never NULL), matching sqlite.
+    Total = 6,
+    /// `group_concat(x)` — concatenate the non-NULL values' text with a `,`
+    /// separator, in scan order; NULL over an empty group. The two-argument
+    /// (custom separator) form is refused by the parser in v1.
+    GroupConcat = 7,
 }
 
 impl AggFn {
@@ -45,6 +52,8 @@ impl AggFn {
             3 => AggFn::Avg,
             4 => AggFn::Min,
             5 => AggFn::Max,
+            6 => AggFn::Total,
+            7 => AggFn::GroupConcat,
             _ => return None,
         })
     }
@@ -55,6 +64,8 @@ impl AggFn {
             AggFn::Avg => "avg",
             AggFn::Min => "min",
             AggFn::Max => "max",
+            AggFn::Total => "total",
+            AggFn::GroupConcat => "group_concat",
         }
     }
 }
