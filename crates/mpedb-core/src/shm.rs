@@ -17,7 +17,7 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 
-pub const FORMAT_VERSION: u32 = 3; // v3: extent_map_root in the meta snapshot
+pub const FORMAT_VERSION: u32 = 4; // v4: schema_gen in the meta snapshot (#47 DDL)
                                    //     (DESIGN-BLOBEXTENT §3.4); WAL3 trailer.
                                    // v2: intent-ring region between reader table and data
 
@@ -40,8 +40,13 @@ const M_CATALOG_ROOT: usize = 72; // AtomicU64
 const M_FREELIST_ROOT: usize = 80; // AtomicU64
 const M_HIGH_WATER: usize = 88; // AtomicU64
 const M_EXTENT_MAP_ROOT: usize = 96; // AtomicU64 (v3, DESIGN-BLOBEXTENT §3.4)
-const M_CHECKSUM: usize = 104; // AtomicU64 (xxh3 of logical bytes 0..104)
-const META_LOGICAL_LEN: usize = 104;
+/// Schema generation (v4, #47): bumped by every DDL commit, IN the flipping
+/// snapshot — the staleness signal a writer compares against its cached
+/// schema. The FROZEN M_SCHEMA_HASH stays the SEED hash forever (the
+/// config-drift check target); the live schema lives in the catalog.
+const M_SCHEMA_GEN: usize = 104; // AtomicU64 (v4, #47 DDL)
+const M_CHECKSUM: usize = 112; // AtomicU64 (xxh3 of logical bytes 0..112)
+const META_LOGICAL_LEN: usize = 112;
 
 // ---- lock area field offsets (page 2) ----
 const LA_INIT_STATE: usize = 0; // AtomicU32: 0 empty, 1 formatting, 2 READY
@@ -479,6 +484,10 @@ pub struct MetaSnapshot {
     pub high_water: u64,
     /// Root of the extent map (DESIGN-BLOBEXTENT §3.2); 0 = empty tree.
     pub extent_map_root: u64,
+    /// Schema generation (#47): 0 at seed, +1 per DDL commit. Writers compare
+    /// against their cached value and reload the schema from the catalog on
+    /// mismatch; the frozen M_SCHEMA_HASH never changes (it is the seed hash).
+    pub schema_gen: u64,
 }
 
 pub struct Shm {
@@ -764,6 +773,7 @@ impl Shm {
         buf[M_HIGH_WATER..M_HIGH_WATER + 8].copy_from_slice(&s.high_water.to_le_bytes());
         buf[M_EXTENT_MAP_ROOT..M_EXTENT_MAP_ROOT + 8]
             .copy_from_slice(&s.extent_map_root.to_le_bytes());
+        buf[M_SCHEMA_GEN..M_SCHEMA_GEN + 8].copy_from_slice(&s.schema_gen.to_le_bytes());
         buf
     }
 
@@ -784,6 +794,7 @@ impl Shm {
             extent_map_root: self
                 .atomic_u64(base + M_EXTENT_MAP_ROOT)
                 .load(Ordering::Relaxed),
+            schema_gen: self.atomic_u64(base + M_SCHEMA_GEN).load(Ordering::Relaxed),
         };
         let expect = xxhash_rust::xxh3::xxh3_64(&self.meta_checksum_input(slot, &snap));
         // A torn read (fields from two different commits) fails the checksum
@@ -880,6 +891,8 @@ impl Shm {
             .store(s.high_water, Ordering::Relaxed);
         self.atomic_u64(base + M_EXTENT_MAP_ROOT)
             .store(s.extent_map_root, Ordering::Relaxed);
+        self.atomic_u64(base + M_SCHEMA_GEN)
+            .store(s.schema_gen, Ordering::Relaxed);
         let mut stamped = *s;
         stamped.slot = slot;
         let sum = xxhash_rust::xxh3::xxh3_64(&self.meta_checksum_input(slot, &stamped));
@@ -1598,6 +1611,10 @@ impl Shm {
                 freelist_root: rec.freelist_root,
                 high_water: rec.high_water,
                 extent_map_root: rec.extent_map_root,
+                // WAL records carry no gen; 0 after replay is SAFE — the
+                // signal is compared for INEQUALITY (any mismatch reloads
+                // from the catalog), and recovery re-attaches everyone.
+                schema_gen: 0,
             });
             off += rec.len;
         }
@@ -2208,6 +2225,7 @@ impl Shm {
             freelist_root: 0,
             extent_map_root: 0,
             high_water: data_start_page(max_readers),
+            schema_gen: 0,
         };
         self.write_meta_slot(META_PAGE_A, &genesis);
         // slot A gets the same genesis so both slots validate
@@ -2462,6 +2480,7 @@ mod tests {
         let mut next = MetaSnapshot {
             slot: 0,
             extent_map_root: 0,
+            schema_gen: 0,
             txn_id: 1,
             catalog_root: 100,
             freelist_root: 101,
@@ -2644,6 +2663,7 @@ mod tests {
         let snap = MetaSnapshot {
             slot: prev.slot,
             extent_map_root: 0,
+            schema_gen: 0,
             txn_id: txn,
             catalog_root: page_id,
             freelist_root: 0,
@@ -2673,6 +2693,7 @@ mod tests {
         let snap = MetaSnapshot {
             slot: prev.slot,
             extent_map_root: 0,
+            schema_gen: 0,
             txn_id: txn,
             catalog_root: page_id,
             freelist_root: 0,
@@ -2834,6 +2855,7 @@ mod tests {
         let genesis = MetaSnapshot {
             slot: 0,
             extent_map_root: 0,
+            schema_gen: 0,
             txn_id: 0,
             catalog_root: 0,
             freelist_root: 0,
@@ -3117,6 +3139,7 @@ mod tests {
         let genesis = MetaSnapshot {
             slot: 0,
             extent_map_root: 0,
+            schema_gen: 0,
             txn_id: 0,
             catalog_root: 0,
             freelist_root: 0,

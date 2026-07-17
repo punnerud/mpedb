@@ -412,7 +412,8 @@ fn simulate_reboot_and_recover(eng: &Engine, stale_ckpt: u64, stale_len: u64) ->
     let genesis = MetaSnapshot {
         slot: 0,
         extent_map_root: 0,
-            txn_id: 0,
+        schema_gen: 0,
+        txn_id: 0,
         catalog_root: 0,
         freelist_root: 0,
         high_water: eng.shm.data_start,
