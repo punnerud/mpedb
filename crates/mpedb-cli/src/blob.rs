@@ -9,7 +9,7 @@
 //! the surface.
 
 use crate::util::{open_target, parse_param, runtime, usage, CliResult, Failure};
-use mpedb::{ColumnType, ExecResult, TableDef, Value};
+use mpedb::{ColumnType, TableDef, Value};
 
 const BLOB_USAGE: &str = "blob needs a subcommand:\n  \
     blob put <target> <table> <pk> <file>     [--col C]  stream a file into a blob column\n  \
@@ -120,23 +120,19 @@ fn get(args: &[String]) -> CliResult {
     let blob_col = &t.columns[blob_idx].name;
     let pk_col = &t.columns[pk_idx].name;
 
-    let sql = format!("SELECT {blob_col} FROM {table} WHERE {pk_col} = $1");
-    let res = db.query(&sql, &[parse_param(pk)])?;
-    let ExecResult::Rows { mut rows, .. } = res else {
-        return runtime("SELECT did not return rows");
-    };
-    if rows.is_empty() {
-        return runtime(format!("no row in `{table}` with {pk_col} = {pk}"));
-    }
-    match rows.swap_remove(0).swap_remove(0) {
-        Value::Blob(b) => {
-            std::fs::write(out, &b)?;
-            println!("got {} bytes from {table}.{blob_col} (pk {pk}) -> {out}", b.len());
+    // Chunked streaming (#50 B4): the value never materializes — a 16 GiB
+    // blob costs one 256 KiB buffer, and eviction mid-read is a clean error
+    // instead of mixed bytes.
+    let mut f = std::io::BufWriter::new(std::fs::File::create(out)?);
+    match db.blob_to_writer(table, &[parse_param(pk)], blob_col, None, &mut f)? {
+        Some(n) => {
+            use std::io::Write as _;
+            f.flush()?;
+            println!("got {n} bytes from {table}.{blob_col} (pk {pk}) -> {out}");
             Ok(())
         }
-        Value::Null => runtime(format!("{table}.{blob_col} is NULL for {pk_col} = {pk}")),
-        other => runtime(format!(
-            "{table}.{blob_col} held a non-blob value ({other:?}) — schema drift?"
+        None => runtime(format!(
+            "no row in `{table}` with {pk_col} = {pk}, or {blob_col} is NULL"
         )),
     }
 }
