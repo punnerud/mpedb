@@ -25,11 +25,12 @@ pub const HONESTY_NOTES: &[&str] = &[
     "Single machine; every engine built/run with --release (debug assertions off). \
      Contended cells intentionally run more threads than cores — see the machine line \
      above for how many there are.",
-    "On Apple, all three engines are forced to actually reach the platter, because none \
-     of them do by default: macOS `fsync()` does not flush the drive's write cache — only \
-     `fcntl(F_FULLFSYNC)` does. SQLite needs `PRAGMA fullfsync` (defaults OFF), PostgreSQL \
-     needs `wal_sync_method=fsync_writethrough` (defaults to `open_datasync`), and mpedb \
-     issues F_FULLFSYNC natively. Each of the three was caught skipping it at some point; \
+    "On Apple, every engine is forced to actually reach the platter, because none of \
+     them do by default: macOS `fsync()` does not flush the drive's write cache — only \
+     `fcntl(F_FULLFSYNC)` does. SQLite needs `PRAGMA fullfsync` (defaults OFF), Turso \
+     likewise (its Apple-only `PRAGMA fullfsync` defaults OFF), PostgreSQL needs \
+     `wal_sync_method=fsync_writethrough` (defaults to `open_datasync`), and mpedb \
+     issues F_FULLFSYNC natively. Engines were caught skipping it at some point; \
      an unfixed engine posts commit-class numbers 20-165x too good and makes the honest \
      ones look slow. On Linux none of this applies.",
     "No cherry-picking: every cell is reported, including those mpedb loses.",
@@ -331,8 +332,10 @@ impl Report {
 
     pub fn to_text(&self) -> String {
         let mut out = String::new();
-        out.push_str("mpedb-bench — mpedb vs SQLite vs PostgreSQL (this machine, head-to-head)\n");
-        out.push_str("==========================================================================\n\n");
+        out.push_str(
+            "mpedb-bench — mpedb vs SQLite vs PostgreSQL vs Turso (this machine, head-to-head)\n",
+        );
+        out.push_str("==================================================================================\n\n");
         if self.quick_mode {
             out.push_str("!! QUICK MODE: shortened cells; numbers are NOT for comparison !!\n\n");
         }
@@ -361,7 +364,7 @@ impl Report {
 
     pub fn to_markdown(&self) -> String {
         let mut out = String::new();
-        out.push_str("# mpedb vs SQLite vs PostgreSQL — head-to-head on this machine\n\n");
+        out.push_str("# mpedb vs SQLite vs PostgreSQL vs Turso — head-to-head on this machine\n\n");
         if self.quick_mode {
             out.push_str("**QUICK MODE — shortened cells; numbers are NOT for comparison.**\n\n");
         }
@@ -438,6 +441,16 @@ and each B+tree node's unused free space is elided (stored as prefix+suffix, zer
 on replay — proven byte-safe against btree.rs). MPEDB_WAL_FULL_PAGES=1 disables it for \
 A/B; lean cut the per-commit fdatasync payload and measured ~1.15-1.2x single-client \
 insert throughput on this host.
+- Turso (the Rust SQLite rewrite, beta) is WAL-only by design and has no true none-mode \
+either; its none-class cell runs at engine defaults on tmpfs and does strictly more work \
+than mpedb/SQLite none-class. Its default sync mode is Full (one fsync per commit — \
+verified in turso_core 0.7.0's source), so its commit-class cell is durable-on-ack. \
+Turso has no blocking busy_timeout: a second concurrent writer gets Busy immediately, \
+and the adapter retries with a yielding backoff (up to 60 s), so contended cells measure \
+throughput-under-retry — SQLite arbitrates the same contention inside busy_timeout. \
+Turso is excluded from the §5.4 durability table (its point-insert commit-class cell \
+already shows the same single-writer durable path; it has no deferred mode to pair it \
+with).
 - Seeding is batched (one transaction / COPY) and unmeasured; measured ops always go \
 through prepared statements / precompiled plans.
 - FIXED mpedb engine race, and this benchmark is now its TRIPWIRE (durability=commit \

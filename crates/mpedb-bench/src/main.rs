@@ -79,6 +79,7 @@ fn engine_label(key: &str) -> String {
     match key {
         "mpedb" => format!("mpedb {}", env!("CARGO_PKG_VERSION")),
         "sqlite" => format!("SQLite {}", rusqlite::version()),
+        "turso" => format!("Turso {}", eng_turso::TURSO_VERSION),
         _ => {
             // "postgres (PostgreSQL) 16.14 (Ubuntu ...)" → "PostgreSQL 16.14"
             let v = pg_version_string();
@@ -299,7 +300,7 @@ fn main() {
                     || args[i - 1] == "--value-bytes"));
         if !known {
             eprintln!(
-                "usage: mpedb-bench [--quick] [--io] [--only mpedb|sqlite|postgres] \
+                "usage: mpedb-bench [--quick] [--io] [--only mpedb|sqlite|postgres|turso] \
                  [--tmpfs DIR] [--out FILE] [--value-bytes N]"
             );
             std::process::exit(2);
@@ -368,6 +369,11 @@ fn main() {
             "{} (throwaway cluster: initdb --auth=trust --locale=C, pg_ctl, unix socket, \
              `postgres` crate 0.19, one client per thread)",
             pg_version_string()
+        ),
+        format!(
+            "Turso {} (`turso` crate, embedded, one connection per thread via a per-thread \
+             tokio runtime; WAL-only by design, default sync=Full verified in its source)",
+            eng_turso::TURSO_VERSION
         ),
         rustc_version() + " (--release, lto=thin)",
         format!(
