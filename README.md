@@ -43,7 +43,10 @@ PostgreSQL does, and without contacting PostgreSQL at all. It runs in both
 directions and records what the source declared, so migration is a thing you
 validate rather than hope about.
 
-And you can start from the file you already have, sqlite3-style:
+And you can start from the file you already have, sqlite3-style —
+**[SQLITE.md](SQLITE.md) is the dedicated page**: your .db as the durable
+home, the .mpedb beside it as its WAL, checkpoints folding writes back.
+In short:
 **`mpedb data.db`** opens it exactly like `sqlite3 data.db` does (repl or
 one-shot statement) — a `.mpedb` sidecar mirrors it, pulls incrementally on
 every open, and **`mpedb checkpoint data.db`** pushes your writes back into
