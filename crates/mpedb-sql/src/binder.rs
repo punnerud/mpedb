@@ -1333,6 +1333,7 @@ mod tests {
             check: None,
         };
         TableDef {
+            id: 0,
             name: "t".into(),
             columns: vec![
                 col("id", ColumnType::Int64, false),
@@ -1343,6 +1344,7 @@ mod tests {
                 col("created", ColumnType::Timestamp, true),
             ],
             primary_key: vec![0],
+            indexes: vec![],
         }
     }
 
@@ -1619,6 +1621,7 @@ mod tests {
     fn a_scope_can_already_hold_two_tables() {
         let a = table(); // id, score, name, active, data, created
         let b = TableDef {
+            id: 0,
             name: "other".into(),
             columns: vec![ColumnDef {
                 name: "tag".into(),
@@ -1630,6 +1633,7 @@ mod tests {
                 check: None,
             }],
             primary_key: vec![0],
+            indexes: vec![],
         };
         let sc = Scope {
             names: vec![a.name.clone(), b.name.clone()],
@@ -1656,6 +1660,7 @@ mod tests {
     fn an_ambiguous_column_is_refused_rather_than_guessed() {
         let a = table();
         let b = TableDef {
+            id: 0,
             name: "other".into(),
             columns: vec![ColumnDef {
                 name: "id".into(), // collides with a.id
@@ -1667,6 +1672,7 @@ mod tests {
                 check: None,
             }],
             primary_key: vec![0],
+            indexes: vec![],
         };
         let sc = Scope {
             names: vec![a.name.clone(), b.name.clone()],

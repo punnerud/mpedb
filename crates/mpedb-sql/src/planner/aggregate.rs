@@ -188,9 +188,11 @@ fn synthetic_grouped_table(
         // Not a table anyone named, and nothing resolves a qualifier against
         // it: `lift_aggs` has already rewritten every column reference to the
         // positional `__gN`.
+        id: 0,
         name: String::new(),
         columns: out,
         primary_key: vec![0],
+        indexes: Vec::new(),
     }
 }
 

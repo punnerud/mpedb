@@ -333,9 +333,13 @@ fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>) -> Result<Config> {
                 require_policy.insert(t.name.clone());
             }
             tables.push(TableDef {
+                // Assigned by Schema::new (dense, name-sorted); the flags
+                // above are the index sugar it derives from.
+                id: 0,
                 name: t.name,
                 columns,
                 primary_key,
+                indexes: Vec::new(),
             });
         }
 

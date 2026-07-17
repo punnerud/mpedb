@@ -293,9 +293,11 @@ pub fn to_table_def(src: &SourceTable) -> Result<TableDef> {
     }
     let primary_key = src.pk.iter().map(|&i| i as u16).collect();
     Ok(TableDef {
+        id: 0, // assigned by Schema::new in build_schema
         name: src.name.clone(),
         columns,
         primary_key,
+        indexes: vec![],
     })
 }
 

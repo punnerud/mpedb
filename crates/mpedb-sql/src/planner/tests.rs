@@ -17,6 +17,7 @@ fn col(name: &str, ty: ColumnType) -> ColumnDef {
 /// Tables sort by name: events = 0, orders = 1, users = 2.
 pub(crate) fn test_schema() -> Schema {
     let users = TableDef {
+        id: 0,
         name: "users".into(),
         columns: vec![
             ColumnDef { nullable: false, ..col("id", ColumnType::Int64) },
@@ -35,8 +36,10 @@ pub(crate) fn test_schema() -> Schema {
             },
         ],
         primary_key: vec![0],
+        indexes: vec![],
     };
     let orders = TableDef {
+        id: 0,
         name: "orders".into(),
         columns: vec![
             ColumnDef { nullable: false, ..col("user_id", ColumnType::Int64) },
@@ -45,8 +48,10 @@ pub(crate) fn test_schema() -> Schema {
             col("note", ColumnType::Text),
         ],
         primary_key: vec![0, 1],
+        indexes: vec![],
     };
     let events = TableDef {
+        id: 0,
         name: "events".into(),
         columns: vec![
             ColumnDef {
@@ -57,6 +62,7 @@ pub(crate) fn test_schema() -> Schema {
             col("msg", ColumnType::Text),
         ],
         primary_key: vec![0],
+        indexes: vec![],
     };
     Schema::new(vec![users, orders, events]).unwrap()
 }
@@ -89,6 +95,7 @@ fn secondary_index_numbering() {
     assert_eq!(secondary_indexes(s.table(1).unwrap()), vec![2]);
     // A unique column that is part of a multi-column PK is NOT skipped.
     let t = TableDef {
+        id: 0,
         name: "t".into(),
         columns: vec![
             ColumnDef {
@@ -100,6 +107,7 @@ fn secondary_index_numbering() {
             ColumnDef { nullable: false, ..col("b", ColumnType::Int64) },
         ],
         primary_key: vec![0, 1],
+        indexes: vec![],
     };
     assert_eq!(secondary_indexes(&t), vec![0]);
 }

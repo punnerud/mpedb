@@ -21,6 +21,7 @@ fn col(name: &str, ty: ColumnType) -> ColumnDef {
 /// Tables sort by name: events = 0, orders = 1, users = 2.
 fn schema() -> Schema {
     let users = TableDef {
+        id: 0,
         name: "users".into(),
         columns: vec![
             ColumnDef {
@@ -43,8 +44,10 @@ fn schema() -> Schema {
             col("avatar", ColumnType::Blob),
         ],
         primary_key: vec![0],
+        indexes: vec![],
     };
     let orders = TableDef {
+        id: 0,
         name: "orders".into(),
         columns: vec![
             ColumnDef {
@@ -63,8 +66,10 @@ fn schema() -> Schema {
             col("note", ColumnType::Text),
         ],
         primary_key: vec![0, 1],
+        indexes: vec![],
     };
     let events = TableDef {
+        id: 0,
         name: "events".into(),
         columns: vec![
             ColumnDef {
@@ -75,6 +80,7 @@ fn schema() -> Schema {
             col("msg", ColumnType::Text),
         ],
         primary_key: vec![0],
+        indexes: vec![],
     };
     Schema::new(vec![users, orders, events]).unwrap()
 }
