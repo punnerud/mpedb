@@ -84,7 +84,7 @@ fn main() {
     };
     let (m_off, m_on) = (med(&mut off), med(&mut on));
     println!(
-        "median: off={m_off:.1} MiB/s  on={m_on:.1} MiB/s  ratio={:.3}  ({mib} MiB of {blob}-byte blobs, batch {BATCH}, none, tmpfs)",
+        "median: off={m_off:.1} MiB/s  on={m_on:.1} MiB/s  ratio={:.3}  ({mib} MiB of {blob}-byte blobs, batch {BATCH}, none, dir={dir})",
         m_on / m_off
     );
 }
