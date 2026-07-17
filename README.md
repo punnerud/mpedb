@@ -68,12 +68,12 @@ around it. mpedb's SQL is a real subset that keeps growing — aggregates,
 `GROUP BY`/`HAVING`, `DISTINCT`, N-way `INNER JOIN` chains with aliases and
 self-joins, every join kind (`LEFT`/`RIGHT`/`FULL`/`CROSS`),
 `UNION`/`EXCEPT`/`INTERSECT`, scalar and `EXISTS` subqueries (correlated
-included), and secondary indexes the planner actually uses are in — but there
-is no `CREATE TABLE` yet (the live-DDL plan is
-[`DESIGN-DDL.md`](DESIGN-DDL.md)) — so
-a Django test suite will not run against it. Today mpedb is a validation and
-staging tool in that workflow, not the thing your ORM talks to. See
-[SQL support](#sql-support) for the exact surface, measured against the binary.
+included), secondary indexes the planner actually uses, and live multi-process
+DDL (`CREATE TABLE`, `DROP TABLE`, `ALTER TABLE ... RENAME`) are in — but the
+surface is still a subset (no `ALTER ... ADD/DROP COLUMN` yet, no triggers or
+views), so a Django test suite will not run against it. Today mpedb is a
+validation and staging tool in that workflow, not the thing your ORM talks to.
+See [SQL support](#sql-support) for the exact surface, measured against the binary.
 
 This cuts both ways, and honestly so: hardening mpedb against real sqlite3
 databases is how mpedb gets hardened. Every dialect mismatch found by importing
@@ -324,7 +324,10 @@ row — rigid typing says `CAST`).
 | **FROM-less `SELECT 3+5`** | ✅ | one synthetic row; WHERE filters it, aggregates see it (`SELECT count(*)` → 1), compound arms and subqueries may each be FROM-less |
 | Scalar subqueries `(SELECT …)`, `[NOT] EXISTS (…)` — uncorrelated AND correlated | ✅ | one output column; 0 rows → NULL; **>1 row errors** (PG's rule — sqlite silently takes the first); correlated references become inner-plan parameters, the `OuterCol` idea applied to a whole plan |
 | **Cross-FILE refs** | ❌ | planned (workspace read-joins) |
-| **`CREATE TABLE` / `ALTER`** | ❌ | today: schema comes from the config or `mirror import`; live DDL is designed in [`DESIGN-DDL.md`](DESIGN-DDL.md) |
+| **`CREATE TABLE`** | ✅ | live, multi-process, on the shared file — inline/table-level `PRIMARY KEY`, `NOT NULL`, `UNIQUE` (column or composite); other processes see it on their next statement |
+| **`DROP TABLE [IF EXISTS]`** | ✅ | live, multi-process; frees the table's pages; ids are never reused (bounded at 64 lifetime creates, offline `regenerate` re-densifies) |
+| **`ALTER TABLE ... RENAME`** | ✅ | rename table (`RENAME TO`) or column (`RENAME [COLUMN] a TO b`) — pure metadata, no data rewrite |
+| **`ALTER ... ADD/DROP COLUMN`** | ❌ | needs a bounded row rewrite (mpedb's row image is schema-driven, not self-describing) — staged next |
 
 **Joins, and what they cost.** Joins are a left-deep chain of up to 16 tables,
 with aliases and self-joins. When a join's `ON` contains a plain equality
@@ -374,13 +377,15 @@ engines allow it. And under `SELECT DISTINCT` the key must be in the `SELECT`
 list, as in PostgreSQL: once duplicates collapse, a key outside the output means
 *which* duplicate survived is what decides the order, and the query never said.
 
-**Why no `CREATE TABLE` (yet).** A table's id is its index in the name-sorted
-table vector, and that id keys the catalog's B+tree roots, the CDC capture
-bitmap, and the mirror's per-table state. Adding `accounts` to a database holding
-`orders` and `users` would renumber both and point `accounts` at `orders`' rows.
-Schema change is therefore a *rebuild* (`mirror regenerate`) today. Live DDL on a
-running multi-process database is designed — [`DESIGN-DDL.md`](DESIGN-DDL.md) —
-and stable table ids are its explicit stage 0, precisely because of this trap.
+**Stable table ids under live DDL.** A table's id keys the catalog's B+tree
+roots, the CDC capture bitmap, and the mirror's per-table state, so the id must
+be stable across schema changes. It is: ids are explicit in the canonical bytes
+(not a sort position), so `CREATE`/`DROP` never renumber an existing table, and a
+`DROP`ped id is tombstoned in place and never reused — a re-created table gets a
+fresh id. That no-reuse rule caps *lifetime* table creates at 64 (a bounded
+capacity limit, not a per-query gap); `mirror regenerate` re-densifies to reset
+it. `ALTER ... ADD/DROP COLUMN` remains a rebuild for now. See
+[`DESIGN-DDL.md`](DESIGN-DDL.md) and [`DESIGN-DROP-TABLE.md`](DESIGN-DROP-TABLE.md).
 
 ## Performance
 
