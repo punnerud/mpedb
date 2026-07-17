@@ -191,17 +191,21 @@ scope afterward). This shapes exactly what DDL does and does not preserve:
   extend scope+capture+provenance incrementally, but it is a mirror feature,
   not a DROP-TABLE concern.
 
-- **`DROP` of a MIRRORED table must not silently diverge.** `push`/`apply`
-  already skip a scope id whose `schema.table(id)` is absent
-  (`resolve.rs:97` `else { continue }`), so a tombstoned mirrored table does
-  not corrupt — but it would **silently stop syncing** while the SOURCE table
-  lives on, an undetected divergence. **Rule for stage 4: DROP refuses a table
-  that is in an active mirror's scope**, with a message routing the operator to
-  `mirror detach`/`regenerate` first (the same "can't drop what something still
-  references" shape SQL uses for FK-referenced tables). Removing-from-scope +
-  propagating the drop to the source is a heavier bidirectional-DDL feature,
-  deferred; refuse-if-mirrored is the safe, honest v1. The check reads the
-  mirror `cfg` sys-record's scope, if present, in the DROP commit's txn.
+- **`DROP` of a MIRRORED table PROPAGATES to the source** (best-bidirectional-
+  sync direction, chosen 2026-07-17). `push`/`apply` already skip a scope id
+  whose `schema.table(id)` is absent (`resolve.rs:97` `else { continue }`), so
+  a tombstoned mirrored table never corrupts — but silently *not* syncing a
+  drop is a divergence. Instead: the DROP commit records a **pending schema op**
+  (a `sys/ddl/<seq>` record: `{drop, table_name}`) alongside the tombstone, and
+  the next `push` drains it — dropping the table on the source (the export
+  layer already renders per-dialect DDL) and removing it from `scope`. Until
+  the push confirms, the local drop is durable but the source still has the
+  table; that is the same eventual-consistency contract the data path already
+  has. A `push_only`/`pull_only` mode or a genuinely un-droppable source
+  (permissions) parks the op and surfaces it, exactly like a rejected row.
+  This is one arm of the bidirectional-DDL design (DESIGN-MIRROR-DDL.md); DROP
+  stage 4 only needs to WRITE the pending-op record in its commit — the drain
+  is mirror-side.
 
 1. **Crash atomicity of DROP**: page-free + catalog-tree-delete + schema
    rewrite + CDC-bit purge + gen bump — all in one COW commit? SIGKILL at every
