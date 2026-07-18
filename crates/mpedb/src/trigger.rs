@@ -9,11 +9,15 @@
 //! its cached [`TriggerSet`] and rebuilds it — the same freshness contract views
 //! and policies already ride (DESIGN-TRIGGERS §6).
 //!
-//! v1 fires only `AFTER INSERT FOR EACH ROW` with a single-statement SQL body
-//! and an optional `WHEN`; every other form is a named refusal at `CREATE`.
+//! Stage 2 fires `AFTER INSERT`, `AFTER UPDATE`, and `AFTER DELETE FOR EACH ROW`
+//! with a single-statement SQL body and an optional `WHEN`, binding `NEW.<col>`
+//! (post-image) and `OLD.<col>` (pre-image) per event. `BEFORE`, `UPDATE OF
+//! <cols>`, `INSTEAD OF`, `FOR EACH STATEMENT`, multi-statement bodies, and
+//! `EXECUTE PROCEDURE` are named refusals at `CREATE`.
 
 use super::*;
 use mpedb_core::WriteTxn;
+use mpedb_sql::RowMap;
 use mpedb_types::ExprProgram;
 
 /// Sys-keyspace prefix for a stored trigger: `trigger/<name>` → its record.
@@ -178,20 +182,24 @@ pub(crate) fn trigger_key(name: &str) -> Vec<u8> {
 // ---------------------------------------------------------- compiled fire-set
 
 /// One compiled trigger ready to fire: the body plan (whose leading parameters
-/// are the `NEW` columns named by `body_new_map`), and an optional `WHEN` guard
-/// (its own program over its own `NEW`-column map). See DESIGN-TRIGGERS §3.4 and
+/// are the `NEW`/`OLD` columns named by `body_map`), and an optional `WHEN` guard
+/// (its own program over its own row-slot map). See DESIGN-TRIGGERS §3.4 and
 /// `mpedb_sql::compile_trigger_body`.
 pub(crate) struct CompiledTrigger {
     pub name: String,
     pub body: CompiledPlan,
-    pub body_new_map: Vec<u16>,
-    pub when: Option<(ExprProgram, Vec<u16>)>,
+    pub body_map: RowMap,
+    pub when: Option<(ExprProgram, RowMap)>,
 }
 
-/// The gen-gated set of triggers this process can fire. v1 holds only
-/// `AFTER INSERT` triggers, grouped by target table id.
+/// The gen-gated set of triggers this process can fire, grouped by target table
+/// id. v2 (DESIGN-TRIGGERS stage 2) holds `AFTER INSERT`, `AFTER UPDATE`, and
+/// `AFTER DELETE` triggers; `BEFORE` and `UPDATE OF <cols>` are still refused at
+/// `CREATE`, so those never reach here.
 pub(crate) struct TriggerSet {
     pub after_insert: HashMap<u32, Vec<CompiledTrigger>>,
+    pub after_update: HashMap<u32, Vec<CompiledTrigger>>,
+    pub after_delete: HashMap<u32, Vec<CompiledTrigger>>,
 }
 
 impl TriggerSet {
@@ -200,6 +208,8 @@ impl TriggerSet {
     pub(crate) fn empty() -> TriggerSet {
         TriggerSet {
             after_insert: HashMap::new(),
+            after_update: HashMap::new(),
+            after_delete: HashMap::new(),
         }
     }
 }
@@ -215,37 +225,54 @@ impl Database {
         let r = self.engine.begin_read()?;
         let scan = r.sys_scan_range(TRIGGER_PREFIX, TRIGGER_PREFIX_END);
         r.finish()?;
-        let mut after_insert: HashMap<u32, Vec<CompiledTrigger>> = HashMap::new();
+        let mut set = TriggerSet::empty();
         for (subkey, value) in scan? {
             if !subkey.starts_with(TRIGGER_PREFIX) {
                 continue;
             }
             let st = StoredTrigger::decode(&value)?;
-            // v1 fires only AFTER INSERT FOR EACH ROW.
-            if st.timing != TrgTiming::After || st.event != TrgEvent::Insert {
+            // Only AFTER FOR EACH ROW fires (BEFORE is a later stage, refused at
+            // CREATE). `UPDATE OF <cols>` is refused at CREATE too, so a fireable
+            // UPDATE trigger always has an empty `update_of`; a lingering one
+            // would silently not fire, so skip it rather than fire on all columns.
+            if st.timing != TrgTiming::After {
                 continue;
             }
+            // Row-binding availability by event (DESIGN-TRIGGERS §1) and the
+            // bucket the compiled trigger fires from.
+            let (allow_new, allow_old, bucket) = match st.event {
+                TrgEvent::Insert => (true, false, &mut set.after_insert),
+                TrgEvent::Update if st.update_of.is_empty() => {
+                    (true, true, &mut set.after_update)
+                }
+                TrgEvent::Update => continue, // UPDATE OF <cols>: stage 3, never fires yet
+                TrgEvent::Delete => (false, true, &mut set.after_delete),
+            };
             let table = match schema.table(st.table_id) {
                 Some(t) if !t.dead => t,
                 _ => continue, // target dropped: orphan record, never fires
             };
-            let (body, body_new_map) =
-                mpedb_sql::compile_trigger_body(&st.body_sql, table, schema)?;
+            let (body, body_map) =
+                mpedb_sql::compile_trigger_body(&st.body_sql, table, schema, allow_new, allow_old)?;
             let when = match &st.when_src {
-                Some(src) => Some(mpedb_sql::compile_trigger_when(src, table)?),
+                Some(src) => Some(mpedb_sql::compile_trigger_when(
+                    src, table, allow_new, allow_old,
+                )?),
                 None => None,
             };
-            after_insert
+            bucket
                 .entry(st.table_id)
                 .or_default()
-                .push(CompiledTrigger { name: st.name, body, body_new_map, when });
+                .push(CompiledTrigger { name: st.name, body, body_map, when });
         }
         // Stable, deterministic fire order per table. Creation order is not
         // tracked in v1, so name order stands in for it (documented).
-        for v in after_insert.values_mut() {
-            v.sort_by(|a, b| a.name.cmp(&b.name));
+        for bucket in [&mut set.after_insert, &mut set.after_update, &mut set.after_delete] {
+            for v in bucket.values_mut() {
+                v.sort_by(|a, b| a.name.cmp(&b.name));
+            }
         }
-        Ok(TriggerSet { after_insert })
+        Ok(set)
     }
 
     /// The current [`TriggerSet`], rebuilt only when a DDL commit moved
@@ -266,12 +293,18 @@ impl Database {
         Ok(set)
     }
 
-    /// Does `table` carry an `AFTER INSERT` trigger? Used to keep the optimistic
-    /// blind-apply path off tables that must run the executor to fire. On error,
-    /// answers `true` (conservative: force the safe executor path).
-    pub(crate) fn table_has_after_insert_trigger(&self, table: u32) -> bool {
+    /// Does `table` carry ANY `AFTER` trigger (insert/update/delete)? Used to
+    /// keep the optimistic blind-apply path off tables that must run the executor
+    /// to fire — the blind path never calls the executor, so it would skip every
+    /// after-trigger, not just after-insert. On error, answers `true`
+    /// (conservative: force the safe executor path).
+    pub(crate) fn table_has_after_trigger(&self, table: u32) -> bool {
         self.trigger_set()
-            .map(|s| s.after_insert.contains_key(&table))
+            .map(|s| {
+                s.after_insert.contains_key(&table)
+                    || s.after_update.contains_key(&table)
+                    || s.after_delete.contains_key(&table)
+            })
             .unwrap_or(true)
     }
 
@@ -290,31 +323,39 @@ impl Database {
         })?;
         let table = bundle.schema.table(table_id).expect("table_id resolved");
 
-        // v1 named refusals (clean errors, never a stored-but-silent trigger).
+        // Named refusals (clean errors, never a stored-but-silent trigger).
+        // Stage 2 fires AFTER INSERT/UPDATE/DELETE FOR EACH ROW; BEFORE and
+        // `UPDATE OF <cols>` are later stages.
         if spec.timing != mpedb_sql::TriggerTiming::After {
             return Err(Error::Unsupported(
                 "only AFTER triggers are supported yet (BEFORE is a later stage)".into(),
             ));
         }
-        match &spec.event {
-            mpedb_sql::TriggerEvent::Insert => {}
+        // Map the event and derive `NEW`/`OLD` availability (DESIGN-TRIGGERS §1).
+        let (event, allow_new, allow_old) = match &spec.event {
+            mpedb_sql::TriggerEvent::Insert => (TrgEvent::Insert, true, false),
+            mpedb_sql::TriggerEvent::Update { of } if of.is_empty() => {
+                (TrgEvent::Update, true, true)
+            }
             mpedb_sql::TriggerEvent::Update { .. } => {
                 return Err(Error::Unsupported(
-                    "UPDATE triggers are not supported yet (INSERT only)".into(),
+                    "UPDATE OF <cols> triggers are not supported yet (plain UPDATE only)".into(),
                 ))
             }
-            mpedb_sql::TriggerEvent::Delete => {
-                return Err(Error::Unsupported(
-                    "DELETE triggers are not supported yet (INSERT only)".into(),
-                ))
-            }
-        }
+            mpedb_sql::TriggerEvent::Delete => (TrgEvent::Delete, false, true),
+        };
 
         // Compile-check at define time so a broken trigger is rejected at CREATE,
         // not discovered at fire time (DESIGN-TRIGGERS §3.1).
-        let _ = mpedb_sql::compile_trigger_body(&spec.body_sql, table, &bundle.schema)?;
+        let _ = mpedb_sql::compile_trigger_body(
+            &spec.body_sql,
+            table,
+            &bundle.schema,
+            allow_new,
+            allow_old,
+        )?;
         if let Some(when_src) = &spec.when_src {
-            let _ = mpedb_sql::compile_trigger_when(when_src, table)?;
+            let _ = mpedb_sql::compile_trigger_when(when_src, table, allow_new, allow_old)?;
         }
 
         let key = trigger_key(&spec.name);
@@ -333,7 +374,9 @@ impl Database {
             name: spec.name.clone(),
             table_id,
             timing: TrgTiming::After,
-            event: TrgEvent::Insert,
+            event,
+            // `UPDATE OF <cols>` is refused above, so this is always empty in v2;
+            // the field is kept in the record for format stability (stage 3).
             update_of: Vec::new(),
             when_src: spec.when_src.clone(),
             body_sql: spec.body_sql.clone(),
