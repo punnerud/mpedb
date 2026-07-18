@@ -721,6 +721,37 @@ pub fn get<S: PageStore + ?Sized>(store: &S, root: u64, key: &[u8]) -> Result<Op
     Err(corrupt("tree too deep (cycle?)"))
 }
 
+/// The largest key in the tree (the rightmost leaf cell), or `None` if the tree
+/// is empty. The tree is memcmp-ordered, so for a keycode-encoded key this is
+/// the maximum — the engine uses it to auto-assign the next INTEGER PRIMARY KEY
+/// rowid (`max(pk)+1`). O(tree height): descend the rightmost child at every
+/// branch, then read the last cell of that leaf.
+pub fn max_key<S: PageStore + ?Sized>(store: &S, root: u64) -> Result<Option<Vec<u8>>> {
+    if root == 0 {
+        return Ok(None);
+    }
+    let mut id = root;
+    for _ in 0..64 {
+        let p = store.page(id)?;
+        check_node(p)?;
+        match kind(p) {
+            // A branch with `n` keys has `n + 1` children; the rightmost
+            // (child index `n`) leads to the largest key.
+            KIND_BRANCH => id = branch_child(p, nkeys(p))?,
+            KIND_LEAF => {
+                let n = nkeys(p);
+                if n == 0 {
+                    return Ok(None);
+                }
+                let (key, _) = leaf_cell(p, n - 1)?;
+                return Ok(Some(key.to_vec()));
+            }
+            _ => return Err(corrupt("unexpected page kind in max_key descent")),
+        }
+    }
+    Err(corrupt("tree too deep (cycle?)"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InsertMode {
     /// Fail with `existed = true` if the key is present (engine maps this to

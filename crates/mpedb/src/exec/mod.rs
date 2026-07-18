@@ -121,6 +121,22 @@ pub(crate) trait TxnCtx {
         Ok(kept)
     }
     fn insert_row(&mut self, table: u32, values: &[Value]) -> Result<()>;
+    /// The next value to auto-assign to an INTEGER PRIMARY KEY rowid alias
+    /// (`pk_col` is that column's index): `max(existing pk) + 1`, or 1 for an
+    /// empty table — sqlite's plain, non-AUTOINCREMENT rule (a freed top id is
+    /// reusable). The default scans the table and takes the maximum, which is
+    /// correct for any backing store; `WriteTxn` overrides it with an
+    /// O(tree-height) rightmost-key descent.
+    fn next_rowid(&mut self, table: u32, pk_col: u16) -> Result<i64> {
+        let rows = self.scan_rows_raw(table, None, None)?;
+        let mut max: Option<i64> = None;
+        for row in &rows {
+            if let Some(Value::Int(v)) = row.get(pk_col as usize) {
+                max = Some(max.map_or(*v, |m: i64| m.max(*v)));
+            }
+        }
+        Ok(max.map_or(1, |m| m.saturating_add(1)))
+    }
     fn update_by_pk(&mut self, table: u32, new_values: &[Value]) -> Result<bool>;
     fn delete_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<bool>;
     /// Every posting entry whose key starts with `prefix`, as `(key, doclist)`
@@ -190,6 +206,11 @@ impl TxnCtx for WriteTxn<'_> {
     }
     fn insert_row(&mut self, table: u32, values: &[Value]) -> Result<()> {
         WriteTxn::insert_row(self, table, values)
+    }
+    fn next_rowid(&mut self, table: u32, _pk_col: u16) -> Result<i64> {
+        // The PK tree key IS the single integer PK, so the rightmost key is the
+        // maximum — no need to read `pk_col` out of a full row.
+        WriteTxn::next_rowid(self, table)
     }
     fn update_by_pk(&mut self, table: u32, new_values: &[Value]) -> Result<bool> {
         WriteTxn::update_by_pk(self, table, new_values)
@@ -1277,7 +1298,19 @@ fn exec_stmt_rest(
             // `applied` = rows fully inserted before the current one.
             let mut written = 0u64;
             let mut out: Vec<Vec<Value>> = Vec::new();
-            for (applied, row) in built_rows.into_iter().enumerate() {
+            // INTEGER PRIMARY KEY rowid alias (sqlite): a NULL value in the PK
+            // column — from an omitted column, an explicit NULL, or a NULL param
+            // — auto-assigns `max(rowid)+1`. Resolved here, per row and in order,
+            // AFTER earlier rows in the same statement have been inserted, so
+            // `INSERT INTO t VALUES(NULL),(NULL)` yields consecutive ids.
+            let rowid_col = t.rowid_alias_col();
+            for (applied, mut row) in built_rows.into_iter().enumerate() {
+                if let Some(rc) = rowid_col {
+                    if row.get(rc as usize).is_some_and(|v| v.is_null()) {
+                        let next = ctx.next_rowid(*table, rc)?;
+                        row.to_mut()[rc as usize] = Value::Int(next);
+                    }
+                }
                 // RLS WITH CHECK on the new row (before the engine's PK/unique
                 // pre-checks): NULL and FALSE both reject (§3.7).
                 if let Some(wc) = with_check {
