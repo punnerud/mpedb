@@ -124,6 +124,7 @@ pub(super) fn gather_joined(
     let mut acc_width = table_def(schema, outer_table)?.columns.len();
     for join in joins {
         let inner_width = table_def(schema, join.table)?.columns.len();
+        let join_tbl = join.table; // for the #74 attribution closure
         // An access with no OuterCol parts is resolved once: read the inner
         // side once and hold it (the pre-#49 execution — keeping it is what
         // stops an ON without equality from regressing to O(n·m) READS). One
@@ -161,6 +162,13 @@ pub(super) fn gather_joined(
             };
             let mut matched = false;
             for (ci, i) in candidates.iter().enumerate() {
+                // #74: one work-row per inner candidate considered. This is the
+                // O(n·m) cost of a cross join — a held inner side is read once
+                // (charged m by the scan layer) but paired against every outer
+                // row here, so the product must be counted at the pairing.
+                ctx.charge_work(1, &|| {
+                    format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
+                })?;
                 let mut joined = Vec::with_capacity(a.len() + i.len());
                 joined.extend_from_slice(a);
                 joined.extend_from_slice(i);

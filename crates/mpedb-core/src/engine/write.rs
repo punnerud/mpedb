@@ -147,6 +147,10 @@ pub struct WriteTxn<'e> {
     /// This txn may allocate from the reserved control-page band (§3.10). Set by
     /// the mirror for control-only commits; default off.
     pub(super) reserved_alloc: bool,
+    /// Deterministic per-execution work-row meter (#74). Scans charge it here;
+    /// the SQL executor charges the same meter via [`WriteTxn::charge_work`] for
+    /// DML that runs a correlated subquery or a nested-loop join.
+    pub(super) work: WorkMeter,
 }
 
 impl<'e> WriteTxn<'e> {
@@ -722,6 +726,24 @@ impl<'e> WriteTxn<'e> {
         self.tree_root(table_id, 0).map(|(_, c)| c)
     }
 
+    /// Charge `n` work-rows against this execution's budget (#74) and return
+    /// [`Error::RuntimeBudget`] once it is exceeded. Exposed so the SQL executor
+    /// can charge the SAME meter its scans do (a DML statement's correlated
+    /// subquery or nested-loop join). `which` is evaluated only on the error path.
+    pub fn charge_work(&self, n: u64, which: impl FnOnce() -> String) -> Result<()> {
+        self.work.charge(n, which)
+    }
+
+    /// Work-rows charged so far this execution (#74).
+    pub fn work_used(&self) -> u64 {
+        self.work.used()
+    }
+
+    /// The configured work-row budget (`0` = unlimited, #74).
+    pub fn work_budget(&self) -> u64 {
+        self.work.budget()
+    }
+
     /// Scan full rows with raw encoded-key bounds within the writer's view.
     pub fn scan_rows_raw(
         &mut self,
@@ -733,6 +755,7 @@ impl<'e> WriteTxn<'e> {
         let mut c = btree::cursor(self, root, lo, hi)?;
         let mut out = Vec::new();
         while let Some((_k, v)) = c.next(self)? {
+            self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
             out.push(row::decode_row(&v, &self.bundle.col_types[table_id as usize])?);
         }
         Ok(out)
@@ -798,6 +821,7 @@ impl<'e> WriteTxn<'e> {
             if !k.starts_with(&prefix) {
                 break; // past every (value, *) entry
             }
+            self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
             match btree::get(self, root, &pk_bytes)? {
                 Some(bytes) => out.push(row::decode_row(
                     &bytes,
@@ -824,6 +848,7 @@ impl<'e> WriteTxn<'e> {
         let mut out = Vec::new();
         let mut c = btree::cursor(self, iroot, lo, hi)?;
         while let Some((_k, pk_bytes)) = c.next(self)? {
+            self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
             match btree::get(self, root, &pk_bytes)? {
                 Some(bytes) => out.push(row::decode_row(
                     &bytes,

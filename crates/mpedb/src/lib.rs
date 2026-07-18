@@ -48,6 +48,7 @@ mod testdb;
 mod exec;
 mod policy_store;
 mod registry;
+pub mod risk;
 mod ring_exec;
 mod session;
 mod shard;
@@ -58,6 +59,7 @@ mod stream;
 mod trigger;
 mod workspace;
 
+pub use risk::{estimate_plan_risk, RiskEstimate};
 pub use session::Session;
 pub use shard::ShardSet;
 pub use sqlite_attach::SqliteAttach;
@@ -81,6 +83,12 @@ use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 const POISON: &str = "plan cache lock poisoned";
+
+/// Warn threshold for the prepare-time risk estimate (#74 layer 1) when the
+/// engine's `max_work_rows` is `0` (unlimited): a worst-case estimate above this
+/// still logs a warning, because even without a runtime cap a billion-plus
+/// work-row plan is almost always a mistake.
+const RISK_WARN_CEILING: u64 = 1_000_000_000;
 
 /// Result of executing one statement.
 #[derive(Debug, Clone, PartialEq)]
@@ -405,6 +413,52 @@ impl Database {
         mpedb_sql::prepare_maybe_explain_with_views(sql, &self.schema(), &catalog, &views)
     }
 
+    /// Prepare-time worst-case **risk estimate** (#74 layer 1) for an
+    /// already-compiled plan, using the catalog's transactionally-exact row
+    /// counts. Read-only: opens one read snapshot, executes nothing, and never
+    /// touches plan bytes. See [`risk::estimate_plan_risk`].
+    pub fn estimate_risk_for_plan(&self, plan: &CompiledPlan) -> Result<RiskEstimate> {
+        let bundle = self.schema();
+        let r = self.engine.begin_read()?;
+        let est = risk::estimate_plan_risk(plan, &bundle.schema, &|tid| {
+            r.row_count(tid).unwrap_or(0)
+        });
+        r.finish()?;
+        Ok(est)
+    }
+
+    /// Compile `sql` and return its prepare-time risk estimate (#74) — the MPEE
+    /// "answer at the start". Does not publish the plan or execute it.
+    pub fn estimate_risk_sql(&self, sql: &str) -> Result<RiskEstimate> {
+        let plan = self.compile_maybe_explain(sql)?.0;
+        self.estimate_risk_for_plan(&plan)
+    }
+
+    /// #74 layer-1 surface: for a plan that structurally multiplies, log a
+    /// warning when its worst-case estimate exceeds the warn threshold
+    /// (`max_work_rows` when finite, else [`RISK_WARN_CEILING`]), naming the
+    /// dominant node. Best-effort and advisory — a failure to open the read
+    /// snapshot is swallowed, and this never refuses (the hard-refuse hook is
+    /// [`RiskEstimate::exceeds`], left opt-in). Cheap: single-table plans skip
+    /// the estimate (and its row-count reads) entirely.
+    fn warn_if_risky(&self, plan: &CompiledPlan) {
+        if !RiskEstimate::plan_can_multiply(plan) {
+            return;
+        }
+        let budget = self.engine.work_budget();
+        let threshold = if budget != 0 { budget } else { RISK_WARN_CEILING };
+        if let Ok(est) = self.estimate_risk_for_plan(plan) {
+            if est.work_rows > threshold {
+                eprintln!(
+                    "mpedb: runtime-budget risk — worst-case ~{} work-rows \
+                     (dominant: {}) exceeds {}; this query is likely to hit \
+                     [runtime] max_work_rows",
+                    est.work_rows, est.dominant, threshold
+                );
+            }
+        }
+    }
+
     /// Compile `sql` to a content-hashed plan and publish it in the shared
     /// registry. Idempotent: statements differing only in whitespace, keyword
     /// case, or `?`/`$n` spelling produce the same hash.
@@ -418,6 +472,7 @@ impl Database {
     /// on the same thread (see the crate-level locking rules).
     pub fn prepare(&self, sql: &str) -> Result<PlanHash> {
         let plan = self.compile_maybe_explain(sql)?.0;
+        self.warn_if_risky(&plan);
         let hash = plan.hash();
         self.register(hash, plan, sql)?;
         Ok(hash)
@@ -478,6 +533,7 @@ impl Database {
         if is_explain {
             return Ok(ExecResult::Explain(plan.explain(&self.schema())));
         }
+        self.warn_if_risky(&plan);
         let hash = plan.hash();
         let plan = self.register(hash, plan, sql)?;
         let full = session::resolve_params_timed(&plan, params, session)?;
