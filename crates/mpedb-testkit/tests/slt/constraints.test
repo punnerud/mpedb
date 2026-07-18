@@ -194,9 +194,15 @@ SELECT nick FROM users WHERE id = 7
 ----
 al
 
-# PK columns are implicitly NOT NULL: a NULL PK can never be inserted.
-statement error NULL
+# A single-column INTEGER PRIMARY KEY is a rowid alias (sqlite): a NULL id
+# auto-assigns max(rowid)+1. The current max id is 7, so this row gets 8.
+statement ok
 INSERT INTO users (id, email) VALUES (NULL, 'h@x')
+
+query I nosort
+SELECT id FROM users WHERE email = 'h@x'
+----
+8
 
 # ---- ON CONFLICT on a SECONDARY unique column ---------------------------------------
 # The conflict target may name any key the executor can PROBE: the primary
