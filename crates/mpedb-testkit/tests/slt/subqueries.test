@@ -223,8 +223,12 @@ SELECT count(*) FROM t1 WHERE (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b) >=
 statement error only supported in WHERE
 SELECT count(*), (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b) FROM t1
 
-statement error nested subqueries
+# Uncorrelated nested subqueries are now supported (#73 §3 stage 1) — the inner
+# `(SELECT avg(c) …)` does not reference the middle scope. Result matches sqlite.
+query I nosort
 SELECT id FROM t1 WHERE b = (SELECT max(b) FROM t1 WHERE c > (SELECT avg(c) FROM t1))
+----
+4
 
 statement error HAVING is not supported yet
 SELECT b, count(*) FROM t1 GROUP BY b HAVING count(*) > (SELECT min(b) FROM t1)
