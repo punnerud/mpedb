@@ -17,11 +17,12 @@ use super::select::{describe_key, distinct_order_by, ordinal};
 /// ```
 ///
 /// Both policies run over ONE row, and before anything that can raise. mpedb's
-/// expressions raise on division by zero and on overflow, and a raise is
-/// observable — so `ON a.x / b.secret > 1` evaluated before b's policy would
+/// expressions raise on arithmetic overflow, and a raise is observable — so an
+/// `ON a.x * b.secret` that overflows, evaluated before b's policy, would
 /// report the existence of a row the policy hides, without ever returning it.
-/// AND-ing everything into one predicate would leave that ordering to whatever
-/// the compiler emitted.
+/// (Division by zero is not such a case: like sqlite it yields NULL.) AND-ing
+/// everything into one predicate would leave that ordering to whatever the
+/// compiler emitted.
 ///
 /// What this deliberately does NOT do yet: push the user's WHERE into either
 /// side. Every conjunct waits for the joined row, so the outer is a full scan

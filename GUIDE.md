@@ -362,8 +362,8 @@ Differences that will bite, each one exercised in `tests/guide.rs`:
 1. **DDL is live.** `CREATE`/`DROP TABLE`, `ALTER … RENAME`, and `ALTER … ADD
    COLUMN` (nullable) work on a running database; a `PRIMARY KEY` is required, and
    `ADD COLUMN NOT NULL` / `DROP COLUMN` are still a config change or a rebuild.
-2. **Division by zero raises.** sqlite yields NULL. So does overflow: mpedb
-   errors where sqlite silently promotes to REAL.
+2. **Integer overflow raises.** mpedb errors where sqlite silently promotes to
+   REAL. Division / modulo by zero, by contrast, yields NULL — matching sqlite.
 3. **`RIGHT`/`FULL` only join two tables.** The two-table forms work (a
    `RIGHT` plans as a `LEFT` with the sides swapped; `FULL` NULL-extends both
    sides); putting either inside a multi-join CHAIN is refused with a message

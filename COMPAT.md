@@ -93,7 +93,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 
 | Feature | Status | Comment |
 |---|---|---|
-| `+ - * / %`, unary `+`/`-` | ✅ | **division by zero errors** (sqlite yields NULL); **integer overflow errors** (sqlite promotes to REAL) — both deliberate |
+| `+ - * / %`, unary `+`/`-` | ✅ | **division / modulo by zero yields NULL**, matching sqlite (integer and real, literal or row value); **integer overflow errors** (sqlite promotes to REAL) — the overflow deviation is deliberate |
 | `= != < <= > >=` | ✅ | |
 | AND / OR / NOT | ✅ | SQL 3VL throughout |
 | `\|\|` concatenation | ✅ | NULL propagates; ints/bools render as text; floats refused until their formatting is pinned |
@@ -130,7 +130,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | sin, cos, tan, asin, acos, atan, atan2 | ✅ | radians; always float; `asin`/`acos` outside [-1, 1] → NULL; `atan2(y, x)` takes `y` first |
 | sinh, cosh, tanh | ✅ | hyperbolic; always float (overflow is `Inf`, matching sqlite) |
 | radians, degrees, pi | ✅ | angle conversions and the constant π; `pi()` is the one nullary function |
-| mod | ✅ | floating-point remainder `x - y*trunc(x/y)` (sign of the dividend); a zero divisor is NULL (not the `%` operator's error), matching sqlite |
+| mod | ✅ | floating-point remainder `x - y*trunc(x/y)` (sign of the dividend); a zero divisor is NULL — the same NULL the `%` operator yields — matching sqlite |
 | substr / substring | ✅ | |
 | coalesce, ifnull | ✅ | compiled to lazy control flow, not a call — arguments after the first non-NULL are never evaluated; int64/float64 arm mixing refused, same rule as CASE |
 | nullif | ✅ | desugared to CASE |
@@ -304,8 +304,8 @@ separation) in [BENCHMARKS.md](BENCHMARKS.md) and
 Each of these is a choice, exercised in `tests/guide.rs`, not an accident —
 see [GUIDE.md](GUIDE.md) for the full list with examples:
 
-1. Division by zero and integer overflow **raise**; sqlite yields NULL /
-   promotes to REAL.
+1. Integer overflow **raises**; sqlite promotes to REAL. (Division / modulo
+   by zero, by contrast, yields NULL to match sqlite.)
 2. A scalar subquery returning more than one row **errors** (PostgreSQL's
    rule); sqlite silently takes the first row.
 3. `ORDER BY` must name something the query outputs; `ORDER BY 1 + 1` is

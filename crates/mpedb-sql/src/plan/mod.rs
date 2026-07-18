@@ -239,11 +239,11 @@ pub struct Join {
     /// inner side is read, before `on` ever sees it.
     ///
     /// It cannot be folded into `on` or `filter`: those run over the joined
-    /// tuple, and mpedb's expressions can RAISE (division by zero, overflow).
-    /// A raise is observable, so an `on` that divides by an inner column would
-    /// report the existence of a row the policy hides — without ever returning
-    /// it. Filtering first is what makes the policy a filter rather than a
-    /// suggestion.
+    /// tuple, and mpedb's expressions can RAISE (arithmetic overflow; division
+    /// by zero is NULL, not a raise). A raise is observable, so an `on` that
+    /// overflows on an inner column would report the existence of a row the
+    /// policy hides — without ever returning it. Filtering first is what makes
+    /// the policy a filter rather than a suggestion.
     pub policy: Option<ExprProgram>,
 }
 
@@ -407,10 +407,11 @@ pub struct SelectPlan {
     /// The split from `filter` is the security-relevant part, not a
     /// refactor: RLS policies live in `filter` and `join.policy`, which run
     /// over one row each and BEFORE this. mpedb's expressions can raise
-    /// (division by zero, overflow), and a raise is observable — so a
-    /// predicate over the joined row that divides by a hidden row's column
-    /// would report that row's existence without returning it. Everything
-    /// that can raise waits until both policies have had their say.
+    /// (arithmetic overflow; division by zero is NULL, not a raise), and a
+    /// raise is observable — so a predicate over the joined row that overflows
+    /// on a hidden row's column would report that row's existence without
+    /// returning it. Everything that can raise waits until both policies have
+    /// had their say.
     pub joined_filter: Option<ExprProgram>,
     /// Predicate over the base row that may read CORRELATED subplan slots
     /// (params at `subplan_base()..`), so it cannot run inside the gather —

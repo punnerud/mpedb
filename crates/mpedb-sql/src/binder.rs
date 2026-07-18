@@ -284,20 +284,24 @@ pub(crate) struct Binder<'a> {
     /// column index is a column index.
     allow_excluded: bool,
     /// Are we binding a branch that constant control flow may delete
-    /// unevaluated? Then do not fold it, because folding RAISES.
+    /// unevaluated? Then do not fold it, because folding may RAISE.
     ///
-    /// PostgreSQL's rule, measured rather than assumed (live PG 16):
-    ///   EXPLAIN SELECT 1/0                        -> ERROR at PLAN time
-    ///   SELECT coalesce(1, 1/0)                   -> 1
-    ///   SELECT coalesce(NULL, 1/0)                -> ERROR
-    ///   SELECT CASE WHEN true  THEN 1 ELSE 1/0 END -> 1
-    ///   SELECT CASE WHEN false THEN 1 ELSE 1/0 END -> ERROR
+    /// Division by zero is NOT such a raise: like sqlite, mpedb folds `1/0`
+    /// to NULL. Arithmetic overflow still is — mpedb raises it where sqlite
+    /// wraps — and folding it in a dead branch would be just as wrong.
+    /// Measured against live PG 16 with an overflowing constant `V` (e.g.
+    /// `9223372036854775807 + 1`):
+    ///   EXPLAIN SELECT V                         -> ERROR at PLAN time
+    ///   SELECT coalesce(1, V)                    -> 1
+    ///   SELECT coalesce(NULL, V)                 -> ERROR
+    ///   SELECT CASE WHEN true  THEN 1 ELSE V END -> 1
+    ///   SELECT CASE WHEN false THEN 1 ELSE V END -> ERROR
     ///
-    /// So folding is not "never raise" (that would let `SELECT 1/0` prepare
+    /// So folding is not "never raise" (that would let `SELECT V` prepare
     /// cleanly and fail at every execute) and not "always raise" (that kills
-    /// `coalesce(1, 1/0)`, which both ancestors answer). It is: fold the
-    /// CONTROL FLOW first, drop the branch that cannot be taken WITHOUT
-    /// evaluating it, then fold whatever survives — and let that raise.
+    /// `coalesce(1, V)`). It is: fold the CONTROL FLOW first, drop the branch
+    /// that cannot be taken WITHOUT evaluating it, then fold whatever
+    /// survives — and let that raise.
     suppress_fold: bool,
     /// The tables this statement may name. See [`Scope`].
     pub scope: Scope<'a>,
@@ -1884,9 +1888,12 @@ mod tests {
     }
 
     #[test]
-    fn fold_time_division_by_zero_is_the_runtime_error() {
-        assert!(matches!(bind("1 / 0", 0), Err(Error::DivisionByZero)));
-        assert!(matches!(bind("1 % 0", 0), Err(Error::DivisionByZero)));
+    fn fold_matches_the_runtime_semantics() {
+        // Division / modulo by zero folds to NULL (sqlite semantics), exactly
+        // as the runtime `/` and `%` operators evaluate them.
+        assert_eq!(bind("1 / 0", 0).unwrap().0, BExpr::Const(Value::Null));
+        assert_eq!(bind("1 % 0", 0).unwrap().0, BExpr::Const(Value::Null));
+        // Overflow, however, still raises at fold time as it does at runtime.
         assert!(matches!(
             bind("9223372036854775807 + 1", 0),
             Err(Error::ArithmeticOverflow)
@@ -2005,13 +2012,15 @@ mod tests {
         format!("{}", b.bind_expr(&e).unwrap_err())
     }
 
-    /// The constant-folding / laziness boundary, pinned against MEASURED
-    /// PostgreSQL 16 behaviour rather than a guess. Every line here was run
-    /// against a live PG first; getting this wrong in either direction is easy:
+    /// The constant-folding / laziness boundary. The raising case that a dead
+    /// branch must NOT evaluate is arithmetic overflow (mpedb raises it where
+    /// sqlite wraps); `OVF` below is `9223372036854775807 + 1`. Division by
+    /// zero is deliberately NOT a raise — mpedb folds `1/0` to NULL like
+    /// sqlite — so it doubles here as the positive control:
     ///
-    ///   never raise at fold time -> `SELECT 1/0` prepares clean, fails at
-    ///     every execute. PG raises at PLAN time (EXPLAIN SELECT 1/0 errors).
-    ///   always raise at fold time -> `coalesce(1, 1/0)` dies, though BOTH
+    ///   never fold a live raise -> `SELECT OVF` would prepare clean and fail
+    ///     at every execute. PG raises at PLAN time.
+    ///   always fold every branch -> `coalesce(1, OVF)` dies, though both
     ///     sqlite and PG answer 1.
     ///
     /// The rule is neither: fold the CONTROL FLOW first and drop the
@@ -2019,24 +2028,35 @@ mod tests {
     /// that raise.
     #[test]
     fn folding_drops_dead_branches_before_it_can_raise_on_them() {
-        // arg0 is a non-NULL constant -> the whole coalesce IS it, and 1/0 is
-        // never folded. PG: 1.
-        assert_eq!(bind_ok("coalesce(1, 1/0)").0, BExpr::Const(Value::Int(1)));
-        // arg0 is a NULL constant -> dropped; 1/0 becomes reachable -> raises.
-        // PG: ERROR division by zero.
-        assert!(matches!(
-            bind_expr_res("coalesce(NULL, 1/0)"),
-            Err(Error::DivisionByZero)
-        ));
-        // Same rule through CASE. PG: 1, then ERROR.
+        const OVF: &str = "9223372036854775807 + 1";
+        // arg0 is a non-NULL constant -> the whole coalesce IS it, and the
+        // overflow is never folded. PG: 1.
         assert_eq!(
-            bind_ok("CASE WHEN true THEN 1 ELSE 1/0 END").0,
+            bind_ok(&format!("coalesce(1, {OVF})")).0,
+            BExpr::Const(Value::Int(1))
+        );
+        // arg0 is a NULL constant -> dropped; the overflow becomes reachable
+        // -> raises. PG: ERROR.
+        assert!(matches!(
+            bind_expr_res(&format!("coalesce(NULL, {OVF})")),
+            Err(Error::ArithmeticOverflow)
+        ));
+        // Same rule through CASE.
+        assert_eq!(
+            bind_ok(&format!("CASE WHEN true THEN 1 ELSE {OVF} END")).0,
             BExpr::Const(Value::Int(1))
         );
         assert!(matches!(
-            bind_expr_res("CASE WHEN false THEN 1 ELSE 1/0 END"),
-            Err(Error::DivisionByZero)
+            bind_expr_res(&format!("CASE WHEN false THEN 1 ELSE {OVF} END")),
+            Err(Error::ArithmeticOverflow)
         ));
+        // Division by zero, in contrast, is NULL, never a raise — even when
+        // reachable. `coalesce(NULL, 1/0)` reduces to `coalesce(1/0)` = NULL.
+        assert_eq!(bind_ok("coalesce(1, 1/0)").0, BExpr::Const(Value::Int(1)));
+        assert_eq!(
+            bind_expr_res("coalesce(NULL, 1/0)").unwrap().0,
+            BExpr::Const(Value::Null)
+        );
         // A live branch still folds normally.
         assert_eq!(bind_ok("1 + 2").0, BExpr::Const(Value::Int(3)));
     }

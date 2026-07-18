@@ -1,7 +1,7 @@
 # Expression evaluation: precedence, integer vs float arithmetic, the
-# int64 -> float64 coercion, constant folding (fold-time errors match
-# runtime errors exactly), division-by-zero and overflow as errors (sqlite
-# would yield NULL / wrap), and predicate typing.
+# int64 -> float64 coercion, constant folding (fold-time results match
+# runtime results exactly), division-by-zero as NULL (sqlite semantics),
+# overflow as an error (sqlite would wrap), and predicate typing.
 #
 # schema:
 # [[table]]
@@ -156,20 +156,32 @@ SELECT NOT true FROM t WHERE id = 1
 ----
 false
 
-# ---- errors: division by zero and overflow (fold-time and runtime agree) -------------
+# ---- division by zero is NULL; overflow is an error (fold-time and runtime agree) ----
 
-statement error division by zero
+# sqlite yields NULL on division / modulo by zero, not an error. Both rows of
+# t produce NULL (the divisor is the constant 0, folded before the scan).
+query I nosort
 SELECT 1 / 0 FROM t
+----
+NULL
+NULL
 
-statement error division by zero
+query I nosort
 SELECT 1 % 0 FROM t
+----
+NULL
+NULL
 
+# Overflow, in contrast, still raises.
 statement error overflow
 SELECT 9223372036854775807 + 1 FROM t
 
-# The same errors surface at runtime when the values come from rows.
-statement error division by zero
+# The same results surface at runtime when the values come from rows.
+# a / (a - a) is 5 / 0 -> NULL for id = 1.
+query I nosort
 SELECT a / (a - a) FROM t WHERE id = 1
+----
+NULL
 
 statement error overflow
 SELECT a * 9223372036854775807 FROM t WHERE id = 1

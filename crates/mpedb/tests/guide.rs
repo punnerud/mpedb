@@ -454,9 +454,12 @@ fn the_sqlite_differences_that_bite() {
     assert!(db.query("CREATE TABLE u (id INTEGER)", &[]).is_err());
     assert!(db.query("ALTER TABLE orders ADD COLUMN x INT NOT NULL", &[]).is_err());
 
-    // 2. Division by zero raises; sqlite yields NULL. (Also a FROM-less
-    // SELECT — one synthetic row, so the division is reached and raises.)
-    assert!(db.query("SELECT 1 / 0", &[]).is_err());
+    // 2. Division by zero yields NULL, matching sqlite. (Also a FROM-less
+    // SELECT — one synthetic row, so the division is reached and evaluated.)
+    assert_eq!(
+        rows(db.query("SELECT 1 / 0", &[]).unwrap()),
+        vec![vec![Value::Null]]
+    );
     assert_eq!(
         rows(db.query("SELECT 3 + 5", &[]).unwrap()),
         vec![vec![Value::Int(8)]],
