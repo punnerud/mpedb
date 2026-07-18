@@ -196,6 +196,18 @@ impl<'a> Scope<'a> {
             .collect()
     }
 
+    /// The `(addressing-name, table)` pairs, in tuple order. Lets a caller
+    /// rebuild an EXTENDED scope (base tables ‖ a synthetic tuple) without
+    /// knowing whether the base is one table or a join — the window planner
+    /// appends its `__w{k}` result table this way (design/DESIGN-WINDOW.md §3.3).
+    pub fn named(&self) -> Vec<(String, &'a TableDef)> {
+        self.names
+            .iter()
+            .cloned()
+            .zip(self.tables.iter().copied())
+            .collect()
+    }
+
     pub fn slot_name(&self, c: u16) -> String {
         let mut base = 0usize;
         for t in &self.tables {
@@ -722,6 +734,18 @@ impl<'a> Binder<'a> {
                  filter on a GROUPED result is HAVING.",
                 f.name()
             ))),
+            // A window function reaching the binder was NOT lifted by the window
+            // planner, so it sits somewhere a window has no meaning — a WHERE,
+            // HAVING, GROUP BY key, ON condition, an aggregate's argument, or a
+            // nested window's PARTITION/ORDER/argument. Refuse it here so the
+            // direct query path (which never round-trips through decode/validate)
+            // rejects it in-process, with a message naming where windows are
+            // allowed.
+            ast::Expr::Window { .. } => Err(bind_err(
+                "window functions may only appear in the SELECT list and ORDER BY \
+                 — not in WHERE, GROUP BY, HAVING, a JOIN condition, an aggregate's \
+                 argument, or inside another window",
+            )),
             ast::Expr::Coalesce(args) => {
                 if args.is_empty() {
                     return Err(bind_err("coalesce() needs at least one argument"));

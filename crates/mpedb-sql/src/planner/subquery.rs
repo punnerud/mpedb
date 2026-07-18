@@ -59,6 +59,10 @@ fn expr_has_subquery(e: &ast::Expr) -> bool {
                 || els.as_deref().is_some_and(expr_has_subquery)
         }
         E::Agg(_, arg, _) => arg.as_deref().is_some_and(expr_has_subquery),
+        // A subquery inside a window's arg/PARTITION/ORDER is not lifted in
+        // stage 1 (the window planner binds those sub-expressions directly); one
+        // that appears there is refused by the binder, not lifted here.
+        E::Window { .. } => false,
         E::Lit(_) | E::Param(_) | E::Col(_) | E::ContextRef(_) | E::Excluded(_)
         | E::Qualified(..) => false,
     }
@@ -268,6 +272,9 @@ impl Lift<'_> {
                 },
                 *d,
             ),
+            // Windows are not descended into for subquery lifting (stage 1); a
+            // subquery inside one reaches the binder's refusal unchanged.
+            other @ E::Window { .. } => other.clone(),
             other @ (E::Lit(_) | E::Param(_) | E::Col(_) | E::ContextRef(_)
             | E::Excluded(_) | E::Qualified(..)) => other.clone(),
         })
@@ -636,6 +643,10 @@ impl<'a> Correlate<'a, '_> {
                 },
                 *d,
             ),
+            // A window is not descended into for correlation rewriting (stage 1);
+            // a window inside a subquery that references an enclosing row reaches
+            // the binder's "unknown column" / window refusal unchanged.
+            other @ E::Window { .. } => other.clone(),
             other @ (E::Lit(_) | E::Param(_) | E::ContextRef(_) | E::Excluded(_)) => {
                 other.clone()
             }

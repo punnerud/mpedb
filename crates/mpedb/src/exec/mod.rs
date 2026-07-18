@@ -19,6 +19,7 @@ use std::collections::BinaryHeap;
 
 mod aggregate;
 mod gather;
+mod window;
 
 pub(crate) use gather::{range_bounds, resolve_part, RawBound};
 use aggregate::exec_aggregate;
@@ -735,6 +736,12 @@ fn exec_select(
     params: &[Value],
     sp: &SelectPlan,
 ) -> Result<ExecResult> {
+    // Window functions are their own phase: materialize the base rows, compute
+    // each window, project over the extended rows, then sort/trim/bound. Kept in
+    // its own function so this executor's other paths stay untouched.
+    if !sp.windows.is_empty() {
+        return window::exec_select_windowed(ctx, schema, plan, params, sp);
+    }
     let SelectPlan {
         table,
         access,
@@ -753,6 +760,7 @@ fn exec_select(
         distinct,
         order_over,
         order_junk,
+        windows: _,
     } = sp;
     {
         {
@@ -967,11 +975,18 @@ fn exec_select_with(
         distinct,
         order_over,
         order_junk,
+        windows,
     } = sp;
     if aggregate.is_some() {
         // A correlated aggregate is routed to `run_aggregate` from
         // `exec_select_top`; reaching here with one is a routing bug.
         return Err(internal("correlated subplans in an aggregate plan"));
+    }
+    // The planner refuses windows together with a correlated subquery, so a
+    // windowed plan never reaches this correlated path — its window results
+    // would be silently dropped here. Reaching it with one is a routing bug.
+    if !windows.is_empty() {
+        return Err(internal("windows in a correlated select plan"));
     }
     let mut rows = if !joins.is_empty() {
         gather_joined(

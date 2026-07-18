@@ -11,8 +11,8 @@
 //! `pub(super)` so the statement/DML/SELECT grammar and the `parse_expr_only`
 //! entry point can reach it.
 
-use super::{Parser, ParamStyle, MAX_EXPR_DEPTH, MAX_PARSER_STACK};
-use crate::ast::{BinOp, Expr, SelectStmt, UnOp};
+use super::{Parser, ParamStyle, MAX_EXPR_DEPTH, MAX_ORDER_BY_ITEMS, MAX_PARSER_STACK};
+use crate::ast::{BinOp, Expr, SelectStmt, UnOp, WindowFunc, WindowSpecAst};
 use crate::token::{Kw, Tok};
 use mpedb_types::{Error, Result, Value};
 
@@ -29,6 +29,19 @@ fn agg_fn(name: &str) -> Option<mpedb_types::AggFn> {
         "max" => Max,
         "total" => Total,
         "group_concat" => GroupConcat,
+        _ => return None,
+    })
+}
+
+/// The zero-argument ranking window functions (stage 1a). Recognized only when
+/// `(` follows (i.e. as a call), so a bare `rank` / `row_number` column name is
+/// unaffected — they are NOT reserved words. Each REQUIRES an `OVER` clause and
+/// takes no arguments; `sqlite` refuses `rank()` used any other way too.
+fn window_rank_fn(name: &str) -> Option<WindowFunc> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        "row_number" => WindowFunc::RowNumber,
+        "rank" => WindowFunc::Rank,
+        "dense_rank" => WindowFunc::DenseRank,
         _ => return None,
     })
 }
@@ -400,12 +413,31 @@ impl<'a> Parser<'a> {
     #[inline(never)]
     fn call_suffix(&mut self, name: String) -> Result<Expr> {
         self.expect(&Tok::LParen, "`(`")?;
+        // Ranking window functions (`row_number`/`rank`/`dense_rank`) take no
+        // argument and are meaningless without OVER — recognized here so they
+        // never fall through to `Expr::Func` (which would then fail as an
+        // unknown scalar) and so a bare `rank` column keeps working.
+        if let Some(func) = window_rank_fn(&name) {
+            if self.peek() != Some(&Tok::RParen) {
+                return Err(self.err_here(format!(
+                    "{name}() is a window function and takes no arguments"
+                )));
+            }
+            self.expect(&Tok::RParen, "`)` closing the window function")?;
+            if !self.peek_over() {
+                return Err(self.err_here(format!(
+                    "{name}() is a window function and requires an OVER clause"
+                )));
+            }
+            let spec = self.window_over()?;
+            return Ok(Expr::Window { func, arg: None, distinct: false, spec });
+        }
         // Aggregates are intercepted BEFORE the scalar argument parse, because
         // `count(*)` has an argument that is not an expression. `*` there is not
         // "all columns" — it means "the row itself", which is the whole reason
         // count(*) and count(x) differ on NULLs.
         if let Some(f) = agg_fn(&name) {
-            if self.eat(&Tok::Star) {
+            let (arg, distinct): (Option<Box<Expr>>, bool) = if self.eat(&Tok::Star) {
                 self.expect(&Tok::RParen, "`)` closing count(*)")?;
                 if f != mpedb_types::AggFn::Count {
                     return Err(self.err_here(format!(
@@ -415,28 +447,42 @@ impl<'a> Parser<'a> {
                         f.name()
                     )));
                 }
-                return Ok(Expr::Agg(f, None, false));
+                (None, false)
+            } else {
+                let distinct = self.eat_kw(Kw::Distinct);
+                if !distinct {
+                    self.eat_all_quantifier();
+                }
+                if distinct && self.peek() == Some(&Tok::Star) {
+                    // sqlite and PG both make this a syntax error, and they are
+                    // right: `count(*)` counts ROWS, and "distinct rows" is what
+                    // SELECT DISTINCT means — there is nothing for DISTINCT to
+                    // apply to inside the parens.
+                    return Err(self.err_here(format!(
+                        "{}(DISTINCT *) is not valid — use SELECT DISTINCT, or name a column",
+                        f.name()
+                    )));
+                }
+                let arg = self.expr()?;
+                if self.peek() == Some(&Tok::Comma) {
+                    return Err(self.err_here(format!("{}() takes exactly one argument", f.name())));
+                }
+                self.expect(&Tok::RParen, "`)` closing the argument list")?;
+                (Some(Box::new(arg)), distinct)
+            };
+            // An `OVER` clause turns the aggregate into a WINDOW aggregate
+            // (stage 1b): the same `AggFn`, but computed over a partition with
+            // every row surviving rather than collapsed into one.
+            if self.peek_over() {
+                let spec = self.window_over()?;
+                return Ok(Expr::Window {
+                    func: WindowFunc::Agg(f),
+                    arg,
+                    distinct,
+                    spec,
+                });
             }
-            let distinct = self.eat_kw(Kw::Distinct);
-            if !distinct {
-                self.eat_all_quantifier();
-            }
-            if distinct && self.peek() == Some(&Tok::Star) {
-                // sqlite and PG both make this a syntax error, and they are
-                // right: `count(*)` counts ROWS, and "distinct rows" is what
-                // SELECT DISTINCT means — there is nothing for DISTINCT to
-                // apply to inside the parens.
-                return Err(self.err_here(format!(
-                    "{}(DISTINCT *) is not valid — use SELECT DISTINCT, or name a column",
-                    f.name()
-                )));
-            }
-            let arg = self.expr()?;
-            if self.peek() == Some(&Tok::Comma) {
-                return Err(self.err_here(format!("{}() takes exactly one argument", f.name())));
-            }
-            self.expect(&Tok::RParen, "`)` closing the argument list")?;
-            return Ok(Expr::Agg(f, Some(Box::new(arg)), distinct));
+            return Ok(Expr::Agg(f, arg, distinct));
         }
         let mut args = Vec::new();
         if self.peek() != Some(&Tok::RParen) {
@@ -446,6 +492,16 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&Tok::RParen, "`)` closing the argument list")?;
+        // A scalar function call followed by OVER is a window function we do not
+        // support yet (the supported ones — ranking and aggregate windows — are
+        // handled above). Refuse it by name rather than misread the OVER.
+        if self.peek_over() {
+            return Err(self.err_here(format!(
+                "window function `{}` is not supported yet (window stage 2) — \
+                 only row_number/rank/dense_rank and aggregate `OVER` are available",
+                name.to_ascii_lowercase()
+            )));
+        }
         let lname = name.to_ascii_lowercase();
         Ok(match lname.as_str() {
             "coalesce" => Expr::Coalesce(args),
@@ -458,6 +514,82 @@ impl<'a> Parser<'a> {
                 Expr::Coalesce(args)
             }
             _ => Expr::Func(lname, args),
+        })
+    }
+
+    /// The next token is a bare `OVER` word immediately followed by `(` — the
+    /// start of a window spec. `OVER` is positional (not reserved), so a column
+    /// named `over` is unaffected.
+    fn peek_over(&self) -> bool {
+        matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("OVER"))
+            && matches!(self.peek_at(1), Some(Tok::LParen))
+    }
+
+    /// Consume the `OVER` word (its presence guaranteed by [`Self::peek_over`])
+    /// and parse the window spec.
+    fn window_over(&mut self) -> Result<WindowSpecAst> {
+        self.pos += 1; // OVER
+        self.window_spec()
+    }
+
+    /// `( [PARTITION BY <expr>, …] [ORDER BY <expr> [ASC|DESC], …] )`. Stage 1
+    /// has no explicit frame — a `ROWS`/`RANGE`/`GROUPS` keyword here is a clean
+    /// refusal. `PARTITION` is a positional word (not reserved), so a column of
+    /// that name still works; the `ORDER`/`BY`/`ASC`/`DESC` keywords are reused.
+    fn window_spec(&mut self) -> Result<WindowSpecAst> {
+        self.expect(&Tok::LParen, "`(` after OVER")?;
+        let mut partition_by = Vec::new();
+        if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("PARTITION")) {
+            self.pos += 1;
+            self.expect_kw(Kw::By, "BY after PARTITION")?;
+            loop {
+                partition_by.push(self.expr()?);
+                if partition_by.len() > MAX_ORDER_BY_ITEMS {
+                    return Err(self.err_here(format!(
+                        "too many PARTITION BY items (max {MAX_ORDER_BY_ITEMS})"
+                    )));
+                }
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        let mut order_by = Vec::new();
+        if self.eat_kw(Kw::Order) {
+            self.expect_kw(Kw::By, "BY after ORDER")?;
+            loop {
+                let key = self.expr()?;
+                let desc = if self.eat_kw(Kw::Desc) {
+                    true
+                } else {
+                    self.eat_kw(Kw::Asc);
+                    false
+                };
+                order_by.push((key, desc));
+                if order_by.len() > MAX_ORDER_BY_ITEMS {
+                    return Err(self.err_here(format!(
+                        "too many ORDER BY items in OVER (max {MAX_ORDER_BY_ITEMS})"
+                    )));
+                }
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
+            }
+        }
+        if matches!(self.peek(), Some(Tok::Ident(w))
+            if w.eq_ignore_ascii_case("ROWS")
+                || w.eq_ignore_ascii_case("RANGE")
+                || w.eq_ignore_ascii_case("GROUPS"))
+        {
+            return Err(self.err_here(
+                "explicit window frames are not supported yet (window stage 2) — \
+                 only the default frame is available",
+            ));
+        }
+        self.expect(&Tok::RParen, "`)` closing the window spec")?;
+        Ok(WindowSpecAst {
+            partition_by,
+            order_by,
         })
     }
 

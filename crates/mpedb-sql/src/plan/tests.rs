@@ -53,6 +53,13 @@ fn sample_sqls() -> Vec<&'static str> {
          AND EXISTS (SELECT 1 FROM events WHERE events.msg = orders.sku))",
         "SELECT id FROM users WHERE age = (SELECT max(item_no) FROM orders WHERE orders.user_id = users.id \
          AND EXISTS (SELECT 1 FROM events WHERE events.msg = orders.sku))",
+        // Window functions (design/DESIGN-WINDOW.md stage 1, format 24): the trailing
+        // window list on a Select must survive encode/decode/validate — ranking,
+        // aggregate OVER, multiple windows, and a window in ORDER BY (junk).
+        "SELECT id, row_number() OVER (PARTITION BY active ORDER BY age) FROM users",
+        "SELECT id, rank() OVER (ORDER BY age DESC), dense_rank() OVER (ORDER BY age DESC) FROM users",
+        "SELECT id, sum(age) OVER (PARTITION BY active ORDER BY age), count(*) OVER (PARTITION BY active) FROM users ORDER BY id",
+        "SELECT id FROM users ORDER BY dense_rank() OVER (ORDER BY age), id",
         "BEGIN",
         "COMMIT",
         "ROLLBACK",
@@ -102,6 +109,39 @@ fn decode_rejects_truncation_everywhere() {
             "truncation at {cut} must fail"
         );
     }
+}
+
+/// The window list bytes (format 24) get their own truncation sweep: a windowed
+/// plan carries a window count, per-window func/distinct bytes, an optional arg
+/// program, and PARTITION BY / ORDER BY program lists — every cut through them
+/// must fail closed rather than decode a half-read window.
+#[test]
+fn decode_rejects_truncation_in_windows() {
+    let s = test_schema();
+    let p = prepare(
+        "SELECT id, row_number() OVER (PARTITION BY active ORDER BY age), \
+         sum(age) OVER (PARTITION BY active ORDER BY age) FROM users \
+         ORDER BY rank() OVER (ORDER BY age DESC), id",
+        &s,
+    )
+    .unwrap();
+    // Sanity: this really carries a window list.
+    match &p.stmt {
+        PlanStmt::Select(sp) => assert!(!sp.windows.is_empty(), "expected windows"),
+        other => panic!("expected a Select, got {other:?}"),
+    }
+    // EXPLAIN renders the window phase (and does not panic on it).
+    let ex = p.explain(&s);
+    assert!(ex.contains("window __w"), "EXPLAIN should show the windows:\n{ex}");
+    let bytes = p.encode();
+    for cut in 0..bytes.len() {
+        assert!(
+            CompiledPlan::decode(&bytes[..cut], &s).is_err(),
+            "truncation at {cut} must fail"
+        );
+    }
+    // The full blob round-trips (and re-validates the window programs).
+    assert_eq!(CompiledPlan::decode(&bytes, &s).unwrap(), p);
 }
 
 /// The recursive SubPlan bytes (#73 §3, format 20) get their own truncation

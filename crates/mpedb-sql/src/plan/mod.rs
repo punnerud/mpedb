@@ -116,7 +116,15 @@ const MAX_JOINS: usize = 16;
 //     A format-22 reader hits the unknown opcode in `ExprProgram::decode` and
 //     reports the plan as corrupt rather than misreading it — same additive
 //     gating as the `Glob` opcode at format 19.
-const PLAN_FORMAT: u8 = 23;
+// 24: window functions (design/DESIGN-WINDOW.md stage 1) — every `Select` record grows
+//     a trailing `windows` LIST after its `aggregate` block (a count + one
+//     `WindowSpec` each: func tag, optional arg program, distinct byte, a
+//     PARTITION BY program list and an ORDER BY `(program, desc)` list). A
+//     format-23 reader would run past the aggregate block and desync on the
+//     extra bytes — exactly as every prior additive `Select` change did — so the
+//     whole-plan version gates it: a format-23 blob fails CLOSED at byte 0 with
+//     `PlanInvalidated` (the documented re-prepare path), never a misread.
+const PLAN_FORMAT: u8 = 24;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -402,7 +410,68 @@ pub struct SelectPlan {
     /// `aggregate` has, so the executor must not pass a scan bound down
     /// when this is set.
     pub distinct: bool,
+    /// Window functions, in output-slot order (design/DESIGN-WINDOW.md). Empty = none.
+    ///
+    /// Each produces one extra column APPENDED to the base row; the projection
+    /// (and any ORDER BY junk) reads window `k`'s result at slot
+    /// `base_width + k` via the synthetic windowed tuple. Present only on a plan
+    /// the window phase runs over; `aggregate` and `windows` are mutually
+    /// exclusive (validate refuses both together — stage 1). Non-empty forces
+    /// `order_over = Projection` (the sort must follow the window phase).
+    pub windows: Vec<WindowSpec>,
 }
+
+/// One window function call, compiled. The `arg`/`partition_by`/`order_by`
+/// programs all read the BASE row; the result lands in the synthetic windowed
+/// tuple at `base_width + k` (design/DESIGN-WINDOW.md §3.2).
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowSpec {
+    pub func: WindowFunc,
+    /// Aggregate/value argument, over the base row. `None` for `count(*)` and
+    /// the ranking functions.
+    pub arg: Option<ExprProgram>,
+    /// `DISTINCT` inside a window aggregate — always `false` in stage 1
+    /// (decode and validate refuse `true`).
+    pub distinct: bool,
+    /// PARTITION BY expressions, over the base row. Empty = one partition.
+    pub partition_by: Vec<ExprProgram>,
+    /// Window ORDER BY: `(program over base row, descending)`. Empty = the whole
+    /// partition is one peer group (no cumulative frame).
+    pub order_by: Vec<(ExprProgram, bool)>,
+}
+
+/// Which window function a [`WindowSpec`] computes. A closed enum with wire tags
+/// (like [`AggFn`]/`ScalarFn`): ranking is SQL-only, and the aggregate half
+/// reuses [`AggFn`] verbatim so the NULL/overflow/type rules never fork.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowFunc {
+    /// Distinct sequential 1..n within each partition; ties broken by input
+    /// (gather) order.
+    RowNumber,
+    /// Ties share a rank, the next rank SKIPS (1,1,3).
+    Rank,
+    /// Ties share a rank, no gaps (1,1,2).
+    DenseRank,
+    /// An aggregate over the default frame — cumulative (`RANGE … CURRENT ROW`)
+    /// when the window has ORDER BY, else the whole partition.
+    Agg(AggFn),
+}
+
+impl WindowFunc {
+    /// Wire tag. `Agg` is tag 4 followed by the [`AggFn`] tag byte.
+    pub(crate) fn tag(self) -> u8 {
+        match self {
+            WindowFunc::RowNumber => 1,
+            WindowFunc::Rank => 2,
+            WindowFunc::DenseRank => 3,
+            WindowFunc::Agg(_) => 4,
+        }
+    }
+}
+
+/// Self-imposed ceiling on window functions in one SELECT — a decoder DoS bound,
+/// far above any hand-written query.
+const MAX_WINDOWS: usize = 64;
 
 /// A compound-statement set operator. sqlite semantics: `UNION`, `EXCEPT`
 /// and `INTERSECT` are SET operators (the result is deduplicated); only
