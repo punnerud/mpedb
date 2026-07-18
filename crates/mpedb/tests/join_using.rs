@@ -2,9 +2,10 @@
 //!
 //! `a JOIN b USING (x)` ≡ `a JOIN b ON a.x = b.x`, EXCEPT that under `SELECT *`
 //! the join column `x` is COALESCED — it appears once (from the left side), not
-//! once per side. NATURAL JOIN (implicit USING over all common columns) stays
-//! refused; only the explicit column list is supported. Every expected result
-//! below was cross-checked against the `sqlite3` 3.45 CLI.
+//! once per side. NATURAL JOIN is the implicit USING over ALL common columns and
+//! is a thin desugar onto this machinery (see `natural_join.rs`); only its RIGHT
+//! and FULL forms stay refused, as they do here. Every expected result below was
+//! cross-checked against the `sqlite3` 3.45 CLI.
 use mpedb::{params, Config, Database, ExecResult, Value};
 use std::ops::Deref;
 
@@ -161,18 +162,20 @@ fn star_coalesced_multi() {
     assert_eq!(got, vec![(1, 1, 10, 100), (1, 2, 20, 200)]);
 }
 
-/// NATURAL JOIN stays refused — its condition is implicit in column names,
-/// which rigid schemas make a trap. Only explicit USING is supported.
+/// NATURAL JOIN is now supported (see `natural_join.rs`): `a NATURAL JOIN b`
+/// desugars to `USING (id)` — the one column common to `a` and `b` here — so it
+/// runs and coalesces `id`, rather than being refused.
 #[test]
-fn natural_join_refused() {
+fn natural_join_desugars_to_using() {
     let d = db("natural");
     seed(&d);
-    let err = d.query("SELECT * FROM a NATURAL JOIN b", &[]).unwrap_err();
-    let msg = format!("{err}");
-    assert!(
-        msg.to_lowercase().contains("natural"),
-        "expected a NATURAL-join refusal, got: {msg}"
-    );
+    let (cols, rs) = rows(&d, "SELECT * FROM a NATURAL JOIN b ORDER BY a.id");
+    assert_eq!(cols, ["a.id", "a.x", "b.y"]);
+    let got: Vec<(i64, i64, i64)> = rs
+        .iter()
+        .map(|r| (int(&r[0]), int(&r[1]), int(&r[2])))
+        .collect();
+    assert_eq!(got, vec![(1, 10, 100), (2, 20, 200)]);
 }
 
 /// A USING column must exist on BOTH sides — a clean bind error otherwise.

@@ -77,9 +77,10 @@ pub(super) fn rewrite_right_join(
             alias: s.alias.clone(),
             kind: ast::JoinKind::Left,
             on: j.on.clone(),
-            // RIGHT JOIN USING is refused in the parser, so `j.using` is empty
-            // here; the swapped LEFT join carries a plain ON.
+            // RIGHT JOIN USING / NATURAL RIGHT are refused in the parser, so
+            // `j.using` is empty here; the swapped LEFT join carries a plain ON.
             using: Vec::new(),
+            natural: false,
         }],
         distinct: s.distinct,
         items,
@@ -101,6 +102,20 @@ pub(super) fn plan_join_select(
     subplans: Vec<SubPlan>,
     slot_types: Vec<Ty>,
 ) -> Result<PlannedStmt> {
+    // A `NATURAL JOIN` is an implicit `USING` over the columns common to the two
+    // sides. Resolve that common set from the schema FIRST — a rigid schema makes
+    // it a static fact of the plan — and fill each natural join's `using`, so
+    // everything below (the `SELECT *` coalesce here, the USING→ON desugar in the
+    // join loop) handles a natural join exactly like an explicit USING one. A
+    // natural join with NO common column keeps an empty `using` and its `ON true`,
+    // i.e. a cross join — sqlite's rule.
+    let natural_desugared;
+    let s = if s.joins.iter().any(|j| j.natural) {
+        natural_desugared = desugar_natural_joins(s, schema)?;
+        &natural_desugared
+    } else {
+        s
+    };
     // `SELECT *` over a `USING` join coalesces the join columns — each appears
     // once, from the left side. Expand the star into explicit qualified items
     // BEFORE anything below looks at it, so projection / ORDER BY / DISTINCT all
@@ -462,6 +477,52 @@ pub(super) fn plan_join_select(
         out_types,
         subplans,
     ))
+}
+
+/// Resolve every `NATURAL JOIN` in `s` into the equivalent `JOIN … USING (…)`
+/// by filling its `using` with the columns common to the two sides. The common
+/// set is the intersection of the names VISIBLE on the left so far (the outer
+/// table plus every already-joined table, deduped, in first-seen / left-to-right
+/// column order) with the right table's own columns — which is the order sqlite
+/// coalesces them in for `SELECT *`. A column that is common but appears in
+/// SEVERAL left tables is NOT an error: `using_on_expr` equates the LEFTMOST
+/// occurrence, exactly as sqlite coalesces it. NO common column ⇒ `using` stays
+/// empty and the join keeps its `ON true`, i.e. a cross join (sqlite's rule).
+///
+/// Only reached when some join is `natural`; a plain USING/ON join is copied
+/// through unchanged (its own columns still join the left-visible set).
+fn desugar_natural_joins(s: &ast::SelectStmt, schema: &Schema) -> Result<ast::SelectStmt> {
+    let outer_table = s.table.as_deref().expect("join on a FROM-less SELECT");
+    let (_, outer) = resolve_table(schema, outer_table)?;
+    // Names visible on the left, first-seen (left-to-right) order, deduped so a
+    // column shared by two left tables becomes ONE USING entry.
+    let mut left_cols: Vec<String> = Vec::new();
+    let push_col = |cols: &mut Vec<String>, name: &str| {
+        if !cols.iter().any(|n| n == name) {
+            cols.push(name.to_string());
+        }
+    };
+    for c in &outer.columns {
+        push_col(&mut left_cols, &c.name);
+    }
+    let mut joins = Vec::with_capacity(s.joins.len());
+    for jc in &s.joins {
+        let (_, jt) = resolve_table(schema, &jc.table)?;
+        let mut jc = jc.clone();
+        if jc.natural {
+            jc.using = left_cols
+                .iter()
+                .filter(|name| jt.column_index(name.as_str()).is_some())
+                .cloned()
+                .collect();
+        }
+        // The right table's columns become visible to any join further right.
+        for c in &jt.columns {
+            push_col(&mut left_cols, &c.name);
+        }
+        joins.push(jc);
+    }
+    Ok(ast::SelectStmt { joins, ..s.clone() })
 }
 
 /// Desugar `JOIN … USING (cols)` into the AST predicate
