@@ -460,6 +460,11 @@ pub(super) fn plan_join_select<'s>(
         let mut keys = Vec::with_capacity(s.order_by.len());
         let mut all_cols = true;
         for (e, desc) in &s.order_by {
+            // Peel an explicit `COLLATE`; the inner expression must be a bare
+            // joined-row column for this fast path, and the collation rides the
+            // sort tuple.
+            let (e, coll) = peel_collate(e)?;
+            let coll = coll.unwrap_or_default();
             // Same PG rule as the single-table path: an output ALIAS wins
             // over an input column of the same name.
             if let ast::Expr::Col(n) = e {
@@ -471,7 +476,7 @@ pub(super) fn plan_join_select<'s>(
                 }
             }
             match binder.bind_expr(e) {
-                Ok((BExpr::Col(i), _)) => keys.push((i, *desc)),
+                Ok((BExpr::Col(i), _)) => keys.push((i, *desc, coll)),
                 _ => {
                     all_cols = false;
                     break;
@@ -656,18 +661,22 @@ fn join_order_by(
     projection: &mut Vec<Projection>,
     binder: &mut Binder<'_>,
     namer: &dyn Fn(u16) -> String,
-) -> Result<(Vec<(u16, bool)>, u16)> {
+) -> Result<(OrderKeys, u16)> {
     let items = s.items.as_ref();
     let mut keys = Vec::with_capacity(s.order_by.len());
     let mut n_junk = 0u16;
     for (i, (e, desc)) in s.order_by.iter().enumerate() {
+        // Peel an explicit `COLLATE`; the inner expression drives resolution
+        // (output position or sort-only column), the collation rides the sort.
+        let (e, coll) = peel_collate(e)?;
+        let coll = coll.unwrap_or_default();
         if let Some(items) = items {
             if let Some(pos) = ordinal(e, items.len())? {
-                keys.push((pos, *desc));
+                keys.push((pos, *desc, coll));
                 continue;
             }
             if let Some(pos) = items.iter().position(|it| &it.0 == e) {
-                keys.push((pos as u16, *desc));
+                keys.push((pos as u16, *desc, coll));
                 continue;
             }
             // A bare identifier naming an item's ALIAS is that output
@@ -676,7 +685,7 @@ fn join_order_by(
                 if let Some(pos) =
                     items.iter().position(|it| it.1.as_deref() == Some(n.as_str()))
                 {
-                    keys.push((pos as u16, *desc));
+                    keys.push((pos as u16, *desc, coll));
                     continue;
                 }
             }
@@ -691,7 +700,7 @@ fn join_order_by(
         let program = compile_program(&b)?;
         let name = render_program(&program, &namer);
         projection.push(Projection::Expr { program, name });
-        keys.push(((projection.len() - 1) as u16, *desc));
+        keys.push(((projection.len() - 1) as u16, *desc, coll));
         n_junk += 1;
     }
     Ok((keys, n_junk))

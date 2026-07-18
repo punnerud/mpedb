@@ -52,6 +52,7 @@ fn expr_has_subquery(e: &ast::Expr) -> bool {
         | E::Glob(a, b, _)
         | E::Regexp(a, b, _) => expr_has_subquery(a) || expr_has_subquery(b),
         E::InContext(a, _, _) => expr_has_subquery(a),
+        E::Collate(a, _) => expr_has_subquery(a),
         E::InList(a, xs, _) => expr_has_subquery(a) || xs.iter().any(expr_has_subquery),
         E::Coalesce(xs) | E::Func(_, xs) => xs.iter().any(expr_has_subquery),
         E::Case(arms, els) => {
@@ -233,6 +234,7 @@ impl Lift<'_> {
             E::InContext(a, k, n) => {
                 E::InContext(Box::new(self.rewrite(a)?), k.clone(), *n)
             }
+            E::Collate(a, name) => E::Collate(Box::new(self.rewrite(a)?), name.clone()),
             // `x IN (SELECT …)` (#70): the subquery becomes a LIST-kind
             // subplan; the node becomes the InParam membership marker over
             // its slot. Uncorrelated only in this step — a correlated IN
@@ -605,6 +607,7 @@ impl<'a> Correlate<'a, '_> {
             E::InContext(a, k, n) => {
                 E::InContext(Box::new(self.rewrite(a)?), k.clone(), *n)
             }
+            E::Collate(a, name) => E::Collate(Box::new(self.rewrite(a)?), name.clone()),
             // `x IN (SELECT …)` nested inside this subquery: rewrite the LHS (it
             // lives in the inner's scope, so it may correlate to the outer) and
             // DESCEND into the nested SELECT for transit correlations — same rule
@@ -709,11 +712,13 @@ fn refs_correlated(b: &BExpr, sub_base: u16, correlated: &[bool]) -> bool {
         | BExpr::Glob(a, _)
         | BExpr::Regexp(a, _)
         | BExpr::Cast(a, _) => refs_correlated(a, sub_base, correlated),
-        BExpr::Binary(_, a, bx) | BExpr::IsDistinct(a, bx, _) => {
+        BExpr::Binary(_, a, bx)
+        | BExpr::IsDistinct(a, bx, _)
+        | BExpr::CollateCmp(_, a, bx, _) => {
             refs_correlated(a, sub_base, correlated) || refs_correlated(bx, sub_base, correlated)
         }
         BExpr::InParam(a, i) => is_corr(*i) || refs_correlated(a, sub_base, correlated),
-        BExpr::InList(a, xs) => {
+        BExpr::InList(a, xs) | BExpr::InListColl(a, xs, _) => {
             refs_correlated(a, sub_base, correlated)
                 || xs.iter().any(|x| refs_correlated(x, sub_base, correlated))
         }

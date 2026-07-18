@@ -264,6 +264,13 @@ pub(crate) enum Expr {
     Regexp(Box<Expr>, Box<Expr>, bool),
     /// `CAST(x AS <type>)`.
     Cast(Box<Expr>, mpedb_types::ColumnType),
+    /// `<expr> COLLATE <name>` — a postfix collation annotation (task: COLLATE).
+    /// Binds tighter than any comparison. It carries the collation NAME as
+    /// written (validated to a built-in at bind time); the binder honors it only
+    /// as a direct comparison operand or ORDER BY term, and refuses it anywhere
+    /// else — a `COLLATE` that cannot change a comparison or a sort is an error
+    /// rather than a silently-ignored no-op.
+    Collate(Box<Expr>, String),
     /// `(SELECT …)` — a scalar subquery: one output column; 0 rows = NULL,
     /// more than one row is a runtime error (PostgreSQL's rule — sqlite
     /// silently takes the first row). The planner lifts it out into the

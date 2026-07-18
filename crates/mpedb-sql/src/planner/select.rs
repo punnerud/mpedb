@@ -27,7 +27,7 @@ pub(super) fn distinct_order_by(
     // callers that must refuse (DISTINCT, and the grouped path, where the sort
     // key lives in the grouped tuple instead).
     mut junk: Option<(&mut Vec<Projection>, &mut Binder<'_>)>,
-) -> Result<(Vec<(u16, bool)>, u16)> {
+) -> Result<(OrderKeys, u16)> {
     let Some(items) = s.items.as_ref() else {
         // `SELECT *`: the projection is the base row, column for column, so a
         // base-column index IS the output position and an ordinal counts over
@@ -35,19 +35,24 @@ pub(super) fn distinct_order_by(
         let mut out = Vec::with_capacity(s.order_by.len());
         let mut n_junk = 0u16;
         for (i, (e, desc)) in s.order_by.iter().enumerate() {
+            // Peel an explicit `COLLATE` off the key so the resolution below
+            // (ordinal / column / junk) sees the inner expression, and the
+            // collation rides the sort tuple.
+            let (e, coll) = peel_collate(e)?;
+            let coll = coll.unwrap_or_default();
             if let Some(pos) = ordinal(e, scope.width())? {
-                out.push((pos, *desc));
+                out.push((pos, *desc, coll));
                 continue;
             }
             // The projection IS the base row here, so a column's slot is its
             // output position.
             match col_slot(e, scope) {
-                Some(slot) => out.push((slot, *desc)),
+                Some(slot) => out.push((slot, *desc, coll)),
                 // `SELECT * FROM t ORDER BY a + 1`: every column is already in
                 // the output, but a computed key still is not.
                 None => {
                     let (pos, added) = push_junk(&mut junk, e, scope, i)?;
-                    out.push((pos, *desc));
+                    out.push((pos, *desc, coll));
                     n_junk += added;
                 }
             }
@@ -63,8 +68,12 @@ pub(super) fn distinct_order_by(
     let mut out = Vec::with_capacity(s.order_by.len());
     let mut n_junk = 0u16;
     for (i, (key, desc)) in s.order_by.iter().enumerate() {
+        // Peel an explicit `COLLATE`; the collation rides the sort tuple, the
+        // inner expression drives resolution.
+        let (key, coll) = peel_collate(key)?;
+        let coll = coll.unwrap_or_default();
         if let Some(pos) = ordinal(key, items.len())? {
-            out.push((pos, *desc));
+            out.push((pos, *desc, coll));
             continue;
         }
         // A bare identifier that matches a select-item's ALIAS names that
@@ -73,7 +82,7 @@ pub(super) fn distinct_order_by(
         // sorts by the output even when the table has its own `b`.
         if let ast::Expr::Col(n) = key {
             if let Some(pos) = items.iter().position(|it| it.1.as_deref() == Some(n.as_str())) {
-                out.push((pos as u16, *desc));
+                out.push((pos as u16, *desc, coll));
                 continue;
             }
         }
@@ -84,10 +93,10 @@ pub(super) fn distinct_order_by(
             None => items.iter().position(|it| &it.0 == key),
         };
         match pos {
-            Some(pos) => out.push((pos as u16, *desc)),
+            Some(pos) => out.push((pos as u16, *desc, coll)),
             None => {
                 let (pos, added) = push_junk(&mut junk, key, scope, i)?;
-                out.push((pos, *desc));
+                out.push((pos, *desc, coll));
                 n_junk += added;
             }
         }
@@ -213,6 +222,12 @@ fn check_distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<()> 
         }
     };
     for (i, (key, _)) in s.order_by.iter().enumerate() {
+        // Peel an explicit `COLLATE`: `SELECT DISTINCT s … ORDER BY s COLLATE
+        // NOCASE` orders by an output column (the collation only changes the
+        // comparator), so the DISTINCT rule must see the inner expression — not
+        // the `Collate` wrapper, which would match no select item. Also
+        // validates the collation name.
+        let (key, _) = peel_collate(key)?;
         // An ordinal already names an output position, so it cannot be outside
         // the SELECT list; `ordinal` range-checks it later.
         if matches!(key, ast::Expr::Lit(Value::Int(_))) {
@@ -490,6 +505,10 @@ pub(super) fn plan_select<'s>(
         if s.distinct {
             break;
         }
+        // Peel an explicit `COLLATE`; a bare `ORDER BY name COLLATE NOCASE` still
+        // sorts the base row (the collation only changes the comparator).
+        let (e, coll) = peel_collate(e)?;
+        let coll = coll.unwrap_or_default();
         // An unqualified name matching a select-item ALIAS orders the OUTPUT
         // (the PostgreSQL rule) — never the base row, even when a table
         // column shares the name. Route it to the projection-sort path.
@@ -513,7 +532,7 @@ pub(super) fn plan_select<'s>(
         let idx = table
             .column_index(name)
             .ok_or_else(|| bind_err(format!("unknown column `{name}` in ORDER BY")))?;
-        base_keys.push((idx, *desc));
+        base_keys.push((idx, *desc, coll));
     }
     let (mut order_by, order_over, order_junk) = if base_keys.len() == s.order_by.len()
         && !s.distinct
@@ -550,7 +569,11 @@ pub(super) fn plan_select<'s>(
         && order_by
             .iter()
             .enumerate()
-            .all(|(k, (c, desc))| !desc && table.primary_key[k] == *c)
+            // A non-Binary collation is NEVER satisfied by scan order (the
+            // keycode is bytewise), so a collated key blocks the elision.
+            .all(|(k, (c, desc, coll))| {
+                !desc && *coll == Collation::Binary && table.primary_key[k] == *c
+            })
     {
         order_by.clear();
     }

@@ -38,7 +38,7 @@ pub(super) fn exec_aggregate(
     joined_filter: Option<&ExprProgram>,
     agg: &Aggregation,
     projection: &[Projection],
-    order_by: &[(u16, bool)],
+    order_by: &[(u16, bool, Collation)],
     order_over: OrderOver,
     order_junk: u16,
     limit: Option<u64>,

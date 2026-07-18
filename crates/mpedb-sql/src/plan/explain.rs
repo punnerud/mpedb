@@ -1,5 +1,15 @@
 use super::*;
 
+/// EXPLAIN suffix for an ORDER BY key's collation: empty for the default
+/// [`Collation::Binary`] so plain sorts render exactly as before, ` COLLATE
+/// NOCASE`/` COLLATE RTRIM` otherwise.
+fn collate_suffix(coll: Collation) -> String {
+    match coll {
+        Collation::Binary => String::new(),
+        other => format!(" COLLATE {}", other.name()),
+    }
+}
+
 impl CompiledPlan {
     /// Human-readable plan rendering for `EXPLAIN`.
     pub fn explain(&self, schema: &Schema) -> String {
@@ -23,8 +33,13 @@ impl CompiledPlan {
                     let items: Vec<String> = c
                         .order_by
                         .iter()
-                        .map(|(i, desc)| {
-                            format!("output#{}{}", i + 1, if *desc { " DESC" } else { " ASC" })
+                        .map(|(i, desc, coll)| {
+                            format!(
+                                "output#{}{}{}",
+                                i + 1,
+                                collate_suffix(*coll),
+                                if *desc { " DESC" } else { " ASC" }
+                            )
                         })
                         .collect();
                     out.push_str(&format!("order by: {}\n", items.join(", ")));
@@ -351,8 +366,13 @@ impl CompiledPlan {
                     };
                     let items: Vec<String> = order_by
                         .iter()
-                        .map(|(c, desc)| {
-                            format!("{}{}", sort_name(*c), if *desc { " DESC" } else { " ASC" })
+                        .map(|(c, desc, coll)| {
+                            format!(
+                                "{}{}{}",
+                                sort_name(*c),
+                                collate_suffix(*coll),
+                                if *desc { " DESC" } else { " ASC" }
+                            )
                         })
                         .collect();
                     out.push_str(&format!("  order by: {}\n", items.join(", ")));
@@ -813,6 +833,36 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                 Item {
                     s: format!("{}({})", f.name(), args.join(", ")),
                     atom: true,
+                }
+            }
+            // A collated comparison `a <op> b COLLATE <coll>`.
+            Instr::CmpColl(kind, coll) => {
+                let b = pop(&mut st);
+                let a = pop(&mut st);
+                Item {
+                    s: format!(
+                        "{} {} {} COLLATE {}",
+                        wrap(&a),
+                        kind.symbol(),
+                        wrap(&b),
+                        coll.name()
+                    ),
+                    atom: false,
+                }
+            }
+            // A collated `x IN (a, b, c) COLLATE <coll>`.
+            Instr::InListColl(n, coll) => {
+                let mut items: Vec<String> = (0..n).map(|_| pop(&mut st).s).collect();
+                items.reverse();
+                let a = pop(&mut st);
+                Item {
+                    s: format!(
+                        "{} IN ({}) COLLATE {}",
+                        wrap(&a),
+                        items.join(", "),
+                        coll.name()
+                    ),
+                    atom: false,
                 }
             }
             // Unreachable: a program containing jumps returned early above.

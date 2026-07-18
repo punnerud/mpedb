@@ -29,6 +29,7 @@ pub(super) fn contains_window(e: &ast::Expr) -> bool {
         | E::Glob(a, b, _)
         | E::Regexp(a, b, _) => contains_window(a) || contains_window(b),
         E::InContext(a, _, _) => contains_window(a),
+        E::Collate(a, _) => contains_window(a),
         E::InSubquery(a, _, _) | E::InParamSlot(a, _, _) => contains_window(a),
         E::InList(a, xs, _) => contains_window(a) || xs.iter().any(contains_window),
         E::Coalesce(xs) | E::Func(_, xs) => xs.iter().any(contains_window),
@@ -103,6 +104,7 @@ fn lift_windows(e: &ast::Expr, specs: &mut Vec<WindowCollect>) -> Result<ast::Ex
             *n,
         ),
         E::InContext(a, k, n) => E::InContext(Box::new(rec(a, specs)?), k.clone(), *n),
+        E::Collate(a, name) => E::Collate(Box::new(rec(a, specs)?), name.clone()),
         E::InParamSlot(a, slot, n) => E::InParamSlot(Box::new(rec(a, specs)?), *slot, *n),
         E::InSubquery(a, sq, n) => E::InSubquery(Box::new(rec(a, specs)?), sq.clone(), *n),
         E::Coalesce(xs) => E::Coalesce(xs.iter().map(|x| rec(x, specs)).collect::<Result<_>>()?),
@@ -337,9 +339,14 @@ pub(super) fn plan_window_select(
     let mut order_by = Vec::with_capacity(rewritten_order.len());
     let mut order_junk = 0u16;
     for (i, ((e, desc), (orig, _))) in rewritten_order.iter().zip(&s.order_by).enumerate() {
+        // Collation comes from the original key text; peel both the original
+        // (for ordinal/alias) and the lifted expr (for item match / junk).
+        let (orig, coll) = peel_collate(orig)?;
+        let coll = coll.unwrap_or_default();
+        let (e, _) = peel_collate(e)?;
         // `ORDER BY 1` — an output ordinal.
         if let Some(pos) = ordinal(orig, n_items)? {
-            order_by.push((pos, *desc));
+            order_by.push((pos, *desc, coll));
             continue;
         }
         // A bare name matching a select-item ALIAS names that output position
@@ -347,7 +354,7 @@ pub(super) fn plan_window_select(
         if let ast::Expr::Col(n) = orig {
             if let Some(items) = &s.items {
                 if let Some(pos) = items.iter().position(|it| it.1.as_deref() == Some(n.as_str())) {
-                    order_by.push((pos as u16, *desc));
+                    order_by.push((pos as u16, *desc, coll));
                     continue;
                 }
             }
@@ -356,7 +363,7 @@ pub(super) fn plan_window_select(
         // slot — `ORDER BY rank() OVER w` when `rank() OVER w` is selected.
         if let Some(items) = &rewritten_items {
             if let Some(pos) = items.iter().position(|(it, _)| it == e) {
-                order_by.push((pos as u16, *desc));
+                order_by.push((pos as u16, *desc, coll));
                 continue;
             }
         }
@@ -369,7 +376,7 @@ pub(super) fn plan_window_select(
             Some((&mut projection, &mut binder))
         };
         let (pos, added) = push_junk(&mut junk, e, &name_scope, i)?;
-        order_by.push((pos, *desc));
+        order_by.push((pos, *desc, coll));
         order_junk += added;
     }
 
