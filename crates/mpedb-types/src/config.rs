@@ -66,6 +66,44 @@ pub enum Concurrency {
     Optimistic,
 }
 
+/// GROUP BY column-strictness dialect (COMPAT.md). Governs whether a **bare**
+/// column — one that is neither an aggregate nor a GROUP BY key — is accepted in
+/// a grouped (or otherwise aggregated) SELECT.
+///
+/// The mode travels with the data's ORIGIN: a database imported from PostgreSQL
+/// (`mirror import` from PG) is born [`Postgres`](BareGroupBy::Postgres); every
+/// other database defaults to [`Sqlite`](BareGroupBy::Sqlite). It is a
+/// per-process compilation option, like [`Durability`] — it decides what
+/// `prepare` accepts, never what a stored plan means (a plan is self-describing).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BareGroupBy {
+    /// sqlite's rule: a bare column is accepted **only when its value is
+    /// deterministic**, so the answer still matches sqlite exactly (mpedb's core
+    /// guarantee — never a wrong answer). Two cases qualify: the column is
+    /// provably never evaluated (a dead `COALESCE`/`CASE` branch that constant
+    /// folding removes), or the query has exactly one `min()`/`max()` and no
+    /// other aggregate (the bare column takes its value from the extremum's
+    /// row). A genuinely arbitrary bare column (any other shape) is REFUSED with
+    /// a clean bind error rather than guessed. The default.
+    #[default]
+    Sqlite,
+    /// PostgreSQL / SQL-standard strictness: a bare column is ALWAYS an error
+    /// (`must appear in GROUP BY …`). mpedb's original behavior; the mode a
+    /// PostgreSQL-imported database is born with, so a query that PG refused
+    /// keeps being refused here.
+    Postgres,
+}
+
+impl BareGroupBy {
+    /// The configured strictness as its config-string (`"sqlite"` / `"postgres"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BareGroupBy::Sqlite => "sqlite",
+            BareGroupBy::Postgres => "postgres",
+        }
+    }
+}
+
 /// Filesystem permissions applied to a freshly-created database file (and its
 /// `<path>-wal` companion). This is the ONLY OS-enforced isolation boundary in
 /// mpedb's serverless model (design/DESIGN-MULTIDB.md §1.4, §6): a process that cannot
@@ -115,6 +153,12 @@ pub struct DbOptions {
     /// catches the mistake it is aimed at: the developer's own forgotten DDL, in
     /// their own build, at prepare time.
     pub require_policy: BTreeSet<String>,
+    /// GROUP BY column-strictness dialect ([`BareGroupBy`], COMPAT.md). Set from
+    /// `[compat] bare_group_by` (default [`BareGroupBy::Sqlite`]); a PostgreSQL
+    /// `mirror import` overrides it to [`BareGroupBy::Postgres`] so the strictness
+    /// travels with the data's origin. A per-process compilation option like
+    /// `durability`, so it lives here rather than in the file-frozen schema.
+    pub bare_group_by: BareGroupBy,
 }
 
 #[derive(Debug, Clone)]
@@ -140,6 +184,9 @@ struct RawConfig {
     /// Optional `[runtime]` section (#74). Applies to this single database.
     #[serde(default)]
     runtime: Option<RawRuntime>,
+    /// Optional `[compat]` section (COMPAT.md). Applies to this single database.
+    #[serde(default)]
+    compat: Option<RawCompat>,
 }
 
 /// The `[runtime]` TOML section (#74): per-process execution limits.
@@ -156,6 +203,27 @@ impl RawRuntime {
     fn resolve(this: Option<&RawRuntime>) -> u64 {
         this.and_then(|r| r.max_work_rows)
             .unwrap_or(DEFAULT_MAX_WORK_ROWS)
+    }
+}
+
+/// The `[compat]` TOML section (COMPAT.md): per-process SQL-dialect toggles.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawCompat {
+    /// `"sqlite"` (lenient bare columns, the default) or `"postgres"` (strict).
+    #[serde(default)]
+    bare_group_by: Option<String>,
+}
+
+impl RawCompat {
+    fn resolve(this: Option<&RawCompat>) -> Result<BareGroupBy> {
+        match this.and_then(|c| c.bare_group_by.as_deref()) {
+            None | Some("sqlite") => Ok(BareGroupBy::Sqlite),
+            Some("postgres") => Ok(BareGroupBy::Postgres),
+            Some(other) => Err(Error::Config(format!(
+                "compat.bare_group_by must be sqlite|postgres, got `{other}`"
+            ))),
+        }
     }
 }
 
@@ -285,7 +353,8 @@ impl Config {
         let raw: RawConfig =
             toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
         let max_work_rows = RawRuntime::resolve(raw.runtime.as_ref());
-        raw_to_config(raw.database, raw.tables, max_work_rows)
+        let bare_group_by = RawCompat::resolve(raw.compat.as_ref())?;
+        raw_to_config(raw.database, raw.tables, max_work_rows, bare_group_by)
     }
 
     pub fn from_file(path: &std::path::Path) -> Result<Config> {
@@ -297,7 +366,12 @@ impl Config {
 /// Build a validated single-database `Config` from one `[database]` section and
 /// its declared tables. Shared by the single-file path and each `Workspace`
 /// member so validation is identical everywhere (design/DESIGN-MULTIDB.md §1.2).
-fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>, max_work_rows: u64) -> Result<Config> {
+fn raw_to_config(
+    db: RawDatabase,
+    raw_tables: Vec<RawTable>,
+    max_work_rows: u64,
+    bare_group_by: BareGroupBy,
+) -> Result<Config> {
         if db.path.is_empty() {
             return Err(Error::Config("database.path must be set".into()));
         }
@@ -440,6 +514,7 @@ fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>, max_work_rows: u64)
                 },
                 max_work_rows,
                 require_policy,
+                bare_group_by,
             },
             schema: Schema::new(tables)?,
         })
@@ -518,6 +593,10 @@ struct RawWorkspace {
     /// every member (a per-process execution option, not a per-file property).
     #[serde(default)]
     runtime: Option<RawRuntime>,
+    /// Workspace-wide `[compat]` section (COMPAT.md): the same SQL-dialect
+    /// strictness applies to every member (a per-process compilation option).
+    #[serde(default)]
+    compat: Option<RawCompat>,
 }
 
 impl WorkspaceConfig {
@@ -538,6 +617,7 @@ impl WorkspaceConfig {
                     ));
                 }
                 let max_work_rows = RawRuntime::resolve(raw.runtime.as_ref());
+                let bare_group_by = RawCompat::resolve(raw.compat.as_ref())?;
                 let mut members = Vec::with_capacity(raw.databases.len());
                 let mut seen_alias = std::collections::HashSet::new();
                 let mut seen_path = std::collections::HashSet::new();
@@ -556,7 +636,7 @@ impl WorkspaceConfig {
                     if !seen_alias.insert(alias.clone()) {
                         return Err(Error::Config(format!("duplicate database alias `{alias}`")));
                     }
-                    let config = raw_to_config(db, tables, max_work_rows)?;
+                    let config = raw_to_config(db, tables, max_work_rows, bare_group_by)?;
                     if !seen_path.insert(config.options.path.clone()) {
                         return Err(Error::Config(format!(
                             "two workspace members map to the same file `{}`",
@@ -804,6 +884,35 @@ path = "/dev/shm/shared.mpedb"
         // unknown key in [runtime] is rejected (deny_unknown_fields)
         assert!(
             Config::from_toml_str(&format!("{SAMPLE}\n[runtime]\nmax_time_ms = 5")).is_err()
+        );
+    }
+
+    #[test]
+    fn parses_compat_bare_group_by() {
+        // absent [compat] ⇒ the sqlite (lenient) default
+        assert_eq!(
+            Config::from_toml_str(SAMPLE).unwrap().options.bare_group_by,
+            BareGroupBy::Sqlite
+        );
+        // explicit sqlite / postgres
+        let cfg = Config::from_toml_str(&format!(
+            "{SAMPLE}\n[compat]\nbare_group_by = \"postgres\""
+        ))
+        .unwrap();
+        assert_eq!(cfg.options.bare_group_by, BareGroupBy::Postgres);
+        let cfg = Config::from_toml_str(&format!(
+            "{SAMPLE}\n[compat]\nbare_group_by = \"sqlite\""
+        ))
+        .unwrap();
+        assert_eq!(cfg.options.bare_group_by, BareGroupBy::Sqlite);
+        // unknown value rejected
+        assert!(Config::from_toml_str(&format!(
+            "{SAMPLE}\n[compat]\nbare_group_by = \"mysql\""
+        ))
+        .is_err());
+        // unknown key in [compat] rejected (deny_unknown_fields)
+        assert!(
+            Config::from_toml_str(&format!("{SAMPLE}\n[compat]\nstrict = true")).is_err()
         );
     }
 

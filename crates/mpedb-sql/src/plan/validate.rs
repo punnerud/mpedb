@@ -332,7 +332,30 @@ impl CompiledPlan {
                             self.check_program_width(p, base_width, ptypes)?;
                         }
                     }
-                    let out_width = a.group_by.len() + a.aggs.len();
+                    // sqlite bare columns (format 30) extend the grouped tuple to
+                    // `[keys ‖ aggs ‖ bare_cols]`. Each is a BASE-row column, so
+                    // bound it by `base_width`; and the executor reads them from
+                    // the group's single min/max witness row, so a non-empty list
+                    // is only meaningful with EXACTLY one aggregate that is
+                    // Min/Max — enforce it here so a forged plan cannot ask the
+                    // executor to carry a bare column out of a group that has no
+                    // extremum to pick a row by (the never-a-wrong-answer contract).
+                    for &c in &a.bare_cols {
+                        if c as usize >= base_width {
+                            return Err(corrupt("bare column out of the base row"));
+                        }
+                    }
+                    if !a.bare_cols.is_empty()
+                        && !matches!(
+                            a.aggs.as_slice(),
+                            [AggCall { func: AggFn::Min | AggFn::Max, .. }]
+                        )
+                    {
+                        return Err(corrupt(
+                            "bare columns without a single min/max aggregate",
+                        ));
+                    }
+                    let out_width = a.group_by.len() + a.aggs.len() + a.bare_cols.len();
                     if out_width == 0 {
                         return Err(corrupt("aggregation with no groups and no aggregates"));
                     }

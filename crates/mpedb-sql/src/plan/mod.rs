@@ -167,7 +167,18 @@ const MAX_JOINS: usize = 16;
 //     worse, old strict `Cast(Int64)` plans would now prefix-parse text — so the
 //     whole-plan version gates it: a format-28 blob fails CLOSED at byte 0 with
 //     `PlanInvalidated` and is re-prepared under the new semantics.
-const PLAN_FORMAT: u8 = 29;
+// 30: sqlite "bare columns" in a grouped SELECT (COMPAT.md, `[compat]
+//     bare_group_by = "sqlite"`). `Aggregation` grows a trailing `bare_cols`
+//     LIST (base-row column indices) after `having`: the columns whose value is
+//     carried from each group's single min()/max() witness row into the grouped
+//     tuple `[keys ‖ aggs ‖ bare_cols]`. Empty for every strict/postgres plan
+//     and every grouped plan without a live bare column, so only genuinely-bare
+//     plans differ. A format-29 reader would run past `having` and desync on the
+//     extra bytes, so the whole-plan version gates it: a format-29 blob fails
+//     CLOSED at byte 0 with `PlanInvalidated` (the documented re-prepare path),
+//     never a misread — the same additive `Aggregation` gating as every prior
+//     grouped-block change.
+const PLAN_FORMAT: u8 = 30;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -748,10 +759,26 @@ pub struct Aggregation {
     /// The aggregate calls, in output order. Their arguments are evaluated over
     /// the BASE row.
     pub aggs: Vec<AggCall>,
-    /// `HAVING`, evaluated over the GROUPED row `[group keys ‖ agg results]` —
-    /// a different tuple from the one `filter` sees, which is exactly why SQL
-    /// has two clauses rather than one.
+    /// `HAVING`, evaluated over the GROUPED row `[group keys ‖ agg results ‖
+    /// bare_cols]` — a different tuple from the one `filter` sees, which is
+    /// exactly why SQL has two clauses rather than one.
     pub having: Option<ExprProgram>,
+    /// sqlite "bare columns" (COMPAT.md, `[compat] bare_group_by = "sqlite"`):
+    /// base-row column indices whose value each group carries from its **single
+    /// `min()`/`max()` witness row** — the one input row that achieved the
+    /// extremum. They occupy the grouped tuple AFTER the aggregates, so the
+    /// grouped tuple is `[keys ‖ aggs ‖ bare_cols]` and a projection/HAVING/ORDER
+    /// BY term reads bare column `j` at slot `group_by.len() + aggs.len() + j`.
+    ///
+    /// **Empty for every strict/postgres plan, and for a sqlite plan whose bare
+    /// columns all constant-folded away** (the `COALESCE(const, col)` case — the
+    /// column reference is gone, so nothing is carried). Non-empty ⇒ the planner
+    /// and [`validate`] guarantee exactly one aggregate and it is `Min`/`Max`;
+    /// the executor reads the witness row's values for these columns. The
+    /// deterministic-value contract (never a wrong answer) lives in the planner:
+    /// a bare column that is neither folded away nor min/max-determined is
+    /// REFUSED, never represented here.
+    pub bare_cols: Vec<u16>,
 }
 
 /// One GROUP BY key (#56). `GROUP BY a` is a base-row column; `GROUP BY a+1`
