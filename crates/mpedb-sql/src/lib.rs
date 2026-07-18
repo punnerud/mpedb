@@ -97,18 +97,17 @@ pub fn prepare_maybe_explain_with_views(
     views: &ViewCatalog,
 ) -> Result<(CompiledPlan, bool)> {
     let (mut stmt, is_explain, n_params, ctes) = parser::parse_statement_ctes(sql)?;
-    // A `WITH` CTE is a statement-scoped named view: fold each into a throwaway
-    // copy of the view catalog (a CTE shadows a same-named persistent view for
-    // this one statement) and let `inline_views` flatten `FROM cte` exactly as
-    // it flattens `FROM view` — no planner/plan-bytes/executor change (#CTE).
+    // A `WITH` CTE is a statement-scoped named view. Pass the CTE bodies to
+    // `inline_views` in a SECOND catalog kept distinct from the persistent views,
+    // so a `FROM cte` reference is spliced by the keep-alias machinery (`cte.col`
+    // and `FROM cte AS x` resolve) while stored views keep their strip-name
+    // splice unchanged. A CTE shadows a same-named view for this one statement.
+    // No planner/plan-bytes/executor change (#CTE).
     if ctes.is_empty() {
         view::inline_views(&mut stmt, views)?;
     } else {
-        let mut scoped = views.clone();
-        for (name, body) in ctes {
-            scoped.insert(name, body);
-        }
-        view::inline_views(&mut stmt, &scoped)?;
+        let scope: view::ViewCatalog = ctes.into_iter().collect();
+        view::inline_views_with_ctes(&mut stmt, views, &scope)?;
     }
     let plan = planner::plan_statement(&stmt, schema, n_params, catalog)?;
     Ok((plan, is_explain))
