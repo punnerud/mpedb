@@ -7,9 +7,9 @@ mpedb's neighborhood, and since 2026-07-17 it runs as the fourth engine in
 `mpedb-bench`, measured under the same workloads, honesty rules, and durability
 classes as SQLite and PostgreSQL. This page is the curated comparison; the full
 generated tables live in the per-machine results files
-([Linux](crates/mpedb-bench/RESULTS-linux-amd-epyc-milan-2c.md),
-[M3](crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md)), and the
-three-engine campaign methodology lives in [BENCHMARKS.md](BENCHMARKS.md).
+([Linux](../crates/mpedb-bench/RESULTS-linux-amd-epyc-milan-2c.md),
+[M3](../crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md)), and the
+three-engine campaign methodology lives in [BENCHMARKS.md](../BENCHMARKS.md).
 
 Version measured: **turso 0.7.0** (crates.io, embedded via its Rust API).
 Turso is beta software by its own description; the compatibility notes below
@@ -61,7 +61,7 @@ full caveat list. Compare within a durability class only; "r / w" is the
 read-while-write cell (concurrent readers + one writer).
 
 **Linux — AMD EPYC-Milan, 2 cores, 7.6 GiB** (tmpfs for none-class, ext4 for
-commit-class; [full tables](crates/mpedb-bench/RESULTS-linux-amd-epyc-milan-2c.md)):
+commit-class; [full tables](../crates/mpedb-bench/RESULTS-linux-amd-epyc-milan-2c.md)):
 
 | ops/s | mpedb | SQLite | PostgreSQL | Turso |
 |---|---|---|---|---|
@@ -83,7 +83,7 @@ PostgreSQL.
 
 **macOS — Apple M3 Pro, 11 cores, 36 GiB** (HFS+ RAM disk for none-class,
 APFS for commit-class; every engine forced through `F_FULLFSYNC`;
-[full tables](crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md)):
+[full tables](../crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md)):
 
 | ops/s | mpedb | SQLite | PostgreSQL | Turso |
 |---|---|---|---|---|
@@ -107,11 +107,11 @@ known, documented Apple floor — which is why `wal` is the mode to compare.
 
 Two different yardsticks, kept apart on purpose. Turso's column is **its own
 COMPAT.md self-report** (quoted 2026-07-17) — mpedb has not independently
-verified it. mpedb's own page in the same format is [COMPAT.md](COMPAT.md). mpedb's column is **measured**: the sqllogictest select corpus
+verified it. mpedb's own page in the same format is [COMPAT.md](../COMPAT.md). mpedb's column is **measured**: the sqllogictest select corpus
 (127 files, 1,464,520 records) passes 100.0% with zero wrong results against
 sqlite3 ground truth, and every listed refusal is a deliberate, documented
-error message, not a silent gap (see [GUIDE.md](GUIDE.md) and the
-[testkit README](crates/mpedb-testkit/README.md)).
+error message, not a silent gap (see [GUIDE.md](../GUIDE.md) and the
+[testkit README](../crates/mpedb-testkit/README.md)).
 
 | feature | Turso (self-reported) | mpedb (measured) |
 |---|---|---|
@@ -125,7 +125,7 @@ error message, not a silent gap (see [GUIDE.md](GUIDE.md) and the
 | window functions | partial — `row_number()` and aggregates-over-`OVER` only | no |
 | views | yes (`IF NOT EXISTS` not idempotent) | no |
 | triggers | yes (no `INSTEAD OF`) | no — the PySpell/ETL layer is the planned mechanism |
-| `ALTER TABLE` / live DDL | yes | no — schema is the config file; live DDL designed ([design/DESIGN-DDL.md](design/DESIGN-DDL.md)), not built |
+| `ALTER TABLE` / live DDL | yes | no — schema is the config file; live DDL designed ([DESIGN-DDL.md](DESIGN-DDL.md)), not built |
 | `FROM`-less `SELECT 3+5` | yes | yes — one synthetic row, aggregates and compound arms included |
 | typing | SQLite dynamic typing | rigid per-column types — a wrong type is a write-time error, stricter than sqlite `STRICT` |
 | plan model | SQL parsed per statement (prepared statements cached) | SQL compiles once to a content-hashed plan; `execute(hash, params)` re-parses nothing |
@@ -145,10 +145,10 @@ reproduce them.
 |---|---|---|
 | multi-process access | "We don't support mixed SQLite and Turso in multi-process scenarios" (COMPAT.md); multi-process behavior otherwise undocumented | the core design: many processes attach to one shared-memory file, any of them SIGKILLable at any instant, fuzzed exactly that way (`mpedb crash`, `mirror-collide`) |
 | readers vs writer | WAL readers; second writer gets `Busy` | MVCC snapshots, lock-free readers that never block the writer or each other |
-| concurrent writers | `SQLITE_BUSY` immediately, no arbitration (deliberate, documented) | writer lock + intent-ring group commit under contention (design/DESIGN.md §5.3) |
+| concurrent writers | `SQLITE_BUSY` immediately, no arbitration (deliberate, documented) | writer lock + intent-ring group commit under contention (DESIGN.md §5.3) |
 | durability spectrum | WAL, sync `Full`/`Normal`/`Off` per connection | `none` / `commit` / `wal` / `async` per database, each a documented promise |
 | power-loss story | WAL; beta, no published torn-write testing | WAL torn-tail simulation (`mpedb powerloss`) run 20/20 green on wal+async, extent payloads included |
-| maturity | beta by its own README; moving fast | pre-1.0, but every concurrency/commit protocol survived a 37-finding adversarial review (design/DESIGN.md) |
+| maturity | beta by its own README; moving fast | pre-1.0, but every concurrency/commit protocol survived a 37-finding adversarial review (DESIGN.md) |
 
 ## Where the numbers land
 
