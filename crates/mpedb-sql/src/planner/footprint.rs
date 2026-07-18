@@ -241,7 +241,12 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
         // Transaction control touches no tables. KeyAccess::Full is the
         // honest "no key claim" value; read_only routes them past nothing —
         // the engine special-cases them anyway.
-        PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => Footprint {
+        PlanStmt::Begin
+        | PlanStmt::Commit
+        | PlanStmt::Rollback
+        | PlanStmt::Savepoint(_)
+        | PlanStmt::Release(_)
+        | PlanStmt::RollbackTo(_) => Footprint {
             tables_read: 0,
             tables_written: 0,
             indexes_used: 0,
