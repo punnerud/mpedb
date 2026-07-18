@@ -554,3 +554,46 @@ Stage 1b (aggregate windows), gated behind PLAN_FORMAT 23. Frames and offset
 functions (Stage 2) and named windows / GROUPS / EXCLUDE (Stage 3) follow, each with
 the format-bump discipline the plan registry already enforces, and named windows
 notably needing no bump at all.
+
+## §6 — Where the MPEE techniques apply (and where they do not)
+
+Honest verdict up front: **Stage 1 needs none of them** — ranking and the default
+running frame are an O(N log N) sort plus one O(N) pass; there is no N×N to avoid,
+so the straightforward materialize-sort-walk is already optimal. Reaching for MPEE
+here would be ceremony, not speed.
+
+MPEE becomes real at **Stage 2 (explicit frames) and for large partitions**, in
+three specific transfers — the same catalogue that shipped for subqueries, re-aimed:
+
+1. **Incremental frame aggregation = MPEE #10 (incremental delta local search) — the
+   big one.** A sliding frame `ROWS/RANGE BETWEEN k PRECEDING AND k FOLLOWING`
+   recomputed per row is O(N·frame); updated incrementally (add the entering row,
+   subtract/evict the leaving row from a running `Accum`, or a monotonic deque for
+   min/max) it is O(N). The default `UNBOUNDED PRECEDING` frame is already this — a
+   running accumulator down the partition — which is why Stage 1b is cheap; Stage 2
+   generalizes it to a moving window. "Don't recompute the cell, update the delta."
+
+2. **Per-partition streaming under a memory budget = MPEE #1.** Stage 1 materializes
+   every row and sorts once. When the access path already yields PARTITION-BY order
+   (an index on the partition key, or a PK prefix), a window can instead stream: fill
+   one partition, emit its rows, discard, advance — O(largest partition) memory, not
+   O(all rows). Same "stream the matrix through a bounded window, never hold the
+   whole thing" discipline as the LIMIT/top-K pushdown. Staged: needs the planner to
+   recognise the ordering-provided-by-access case (like the ORDER BY elision already
+   does for PK-prefix sorts).
+
+3. **PARTITION BY *is* MPEE #5 (cluster-first hierarchical decomposition), for free.**
+   Partitions are independent by definition — no boundary-repair, unlike routing —
+   so each is computed in isolation and the work is embarrassingly parallel across
+   partitions if we ever thread it.
+
+Not transferable: the "buy once / memoize by key" broker (a window is a single pass,
+nothing is re-derived across rows), consumer-cap pruning (a window is defined over
+the whole partition — you cannot stop early), and triangle-inequality derivation (no
+metric). **Footprint/precompute is unaffected either way**: a window is read-only and
+key-neutral (`select_footprint` destructures `SelectPlan { .. }`), so the static
+footprint, Calvin precompute, group-commit and CDC/mirror machinery never see it —
+exactly the property established for nested subqueries. So the answer to "is MPEE
+planned for windows?": not for Stage 1, deliberately; yes for Stage 2 frames
+(incremental) and large-partition streaming, where it is the difference between O(N)
+and O(N·frame) / between bounded and unbounded memory.
