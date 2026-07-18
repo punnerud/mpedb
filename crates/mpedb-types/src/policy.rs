@@ -1,4 +1,4 @@
-//! Row-level-security policy definitions (DESIGN-MULTIDB.md §3).
+//! Row-level-security policy definitions (design/DESIGN-MULTIDB.md §3).
 //!
 //! Policies are stored in the catalog sys-keyspace (NOT the schema bytes, so an
 //! edit is an online COW commit and never registers as config drift) and
@@ -6,7 +6,7 @@
 //! is the shared, dependency-light representation + a bounds-checked codec used
 //! by both the engine (storage) and the SQL planner (injection).
 //!
-//! **Honesty (DESIGN-MULTIDB.md §6):** in-file RLS is COOPERATIVE
+//! **Honesty (design/DESIGN-MULTIDB.md §6):** in-file RLS is COOPERATIVE
 //! defense-in-depth, not a boundary against a process that reads raw pages.
 
 use crate::{Error, Result};
@@ -66,7 +66,7 @@ impl PolicyCmd {
 /// SELECT and the target set of UPDATE/DELETE); `check_src` gates *writes* (the
 /// new row of INSERT/UPDATE). Both are SQL predicate SOURCE — re-bound by the
 /// planner so their `current_setting()` refs share the statement's parameter
-/// space (DESIGN-MULTIDB.md §3.2).
+/// space (design/DESIGN-MULTIDB.md §3.2).
 #[derive(Debug, Clone, PartialEq)]
 pub struct PolicyDef {
     pub name: String,

@@ -1,5 +1,5 @@
 //! Derived tables — a subquery used as a FROM source, `SELECT … FROM (SELECT …)
-//! t …` (#74, DESIGN-DERIVED-TABLES.md, Stage B). A simple projection/filter
+//! t …` (#74, design/DESIGN-DERIVED-TABLES.md, Stage B). A simple projection/filter
 //! body is flattened onto its base at bind time (like a view), keeping the
 //! derived alias so `t.col` refs resolve; complex bodies are refused (never
 //! answered wrongly). Cross-checked against sqlite 3.45.

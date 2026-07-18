@@ -33,13 +33,13 @@ pub enum Error {
         table: String,
     },
     /// An INSERT/UPDATE row failed a row-level-security `WITH CHECK` policy
-    /// (DESIGN-MULTIDB.md §3.7). Deliberately carries NO predicate text — the
+    /// (design/DESIGN-MULTIDB.md §3.7). Deliberately carries NO predicate text — the
     /// policy source may embed thresholds/allow-lists (§6.6).
     PolicyViolation {
         table: String,
     },
     /// A write to an **RLS-enabled** table was rejected by a constraint, with the
-    /// variant and column deliberately withheld (DESIGN-MULTIDB.md §6.5).
+    /// variant and column deliberately withheld (design/DESIGN-MULTIDB.md §6.5).
     ///
     /// Uniqueness pre-checks run over the whole B+tree with no RLS awareness, so
     /// a caller inserting a row valid under its own policy still collides with

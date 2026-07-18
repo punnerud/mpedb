@@ -4,7 +4,7 @@
 //! - `ReadTxn` — a pinned MVCC snapshot; lock-free, read-only.
 //! - `WriteTxn` — the writer-lock holder; implements [`PageStore`] with COW
 //!   discipline, allocates from the freelist/high-water mark, and commits via
-//!   the double-buffered meta protocol (DESIGN.md §5.2).
+//!   the double-buffered meta protocol (design/DESIGN.md §5.2).
 //!
 //! Catalog tree layout (root in meta.catalog_root):
 //! - key `[0x00]` → canonical schema bytes
@@ -170,7 +170,7 @@ fn cat_tree_key(table_id: u32, index_no: u32) -> Vec<u8> {
 /// Freed-page lists are chunked so every freelist value stays inline in its
 /// leaf (never an overflow chain): rewriting an inline value in a dirty leaf
 /// frees and allocates nothing, which is what makes the commit-time fixpoint
-/// (DESIGN.md §4.5) converge.
+/// (design/DESIGN.md §4.5) converge.
 const FREELIST_CHUNK_PAGES: usize = 120; // 960-byte values
 
 /// DROP frees a whole table's pages in ONE commit, and `freelist_plan` keys the
@@ -267,7 +267,7 @@ fn freelist_key(txn: u64, kind: u8, chunk: u16) -> [u8; 11] {
 }
 
 /// Secondary unique index columns for a table, per the shared numbering
-/// convention (DESIGN.md §4.4): index 0 = PK tree; unique columns in
+/// convention (design/DESIGN.md §4.4): index 0 = PK tree; unique columns in
 /// declaration order get 1, 2, …; a column that is by itself the whole PK is
 /// skipped.
 /// The secondary-index B+tree key for a row's indexed columns, or `None`
@@ -564,7 +564,7 @@ impl Engine {
     }
 
     /// The write-path concurrency discipline this engine was opened with
-    /// (DESIGN-PHASE3.md). Serial is the default and shipped behavior.
+    /// (design/DESIGN-PHASE3.md). Serial is the default and shipped behavior.
     pub fn concurrency(&self) -> Concurrency {
         self.concurrency
     }
@@ -572,7 +572,7 @@ impl Engine {
     /// Whether `table_id` has any secondary (unique) index. Optimistic
     /// blind-apply is only eligible for tables without one — index
     /// maintenance needs the current row and degrades footprints below the
-    /// key level (DESIGN.md §7.3 honesty rule).
+    /// key level (design/DESIGN.md §7.3 honesty rule).
     pub fn has_secondary_index(&self, table_id: u32) -> bool {
         self.bundle()
             .sec_indexes
@@ -593,7 +593,7 @@ impl Engine {
         self.bundle().col_types.get(table_id as usize).cloned()
     }
 
-    /// Verify the page-accounting invariant (DESIGN.md §4.5): every page in
+    /// Verify the page-accounting invariant (design/DESIGN.md §4.5): every page in
     /// the data region below the high-water mark is either reachable from the
     /// committed roots or listed in the freelist — exactly one of the two.
     /// Takes the writer lock for a stable view; commits nothing.

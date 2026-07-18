@@ -91,7 +91,7 @@ pub enum Value {
     /// Microseconds since the Unix epoch, UTC.
     Timestamp(i64),
     /// **A session-context list — a parameter value only, never a stored one**
-    /// (DESIGN-MULTIDB.md §2.6). It exists so `col IN (current_setting('k'))`
+    /// (design/DESIGN-MULTIDB.md §2.6). It exists so `col IN (current_setting('k'))`
     /// can bind a variable-length membership set to ONE reserved slot: the
     /// arity lives in the data, not the plan bytes, so the plan hash stays
     /// context-independent and one plan still serves every session (§4.1).

@@ -61,7 +61,7 @@ modes (`locked` speaks sqlite's own byte-range locks, `optimistic` takes a
 `offline` for cooperative windows). `mpedb dump data.db` inspects a `.db`
 directly, and `mpedb::SqliteAttach` runs read-only mpedb SQL over one with
 **zero import**. The full design survived a 20-finding adversarial review in
-[`DESIGN-SQLITE-BACKED.md`](DESIGN-SQLITE-BACKED.md).
+[`design/DESIGN-SQLITE-BACKED.md`](design/DESIGN-SQLITE-BACKED.md).
 
 **What it is not: a drop-in sqlite3.** Be clear-eyed about this before you plan
 around it. mpedb's SQL is a real subset that keeps growing — aggregates,
@@ -172,7 +172,7 @@ is locked".
   time, with cache leak-proofing (a stale cached plan is re-validated against the
   live policy epoch under the executing snapshot). *In-file RLS is cooperative
   defense-in-depth, not a hard boundary against a hostile process that maps the
-  raw pages — see [`DESIGN-MULTIDB.md`](DESIGN-MULTIDB.md) §6.*
+  raw pages — see [`design/DESIGN-MULTIDB.md`](design/DESIGN-MULTIDB.md) §6.*
 - **Near-data execution** — a PySpell/MPEE-inspired stored-procedure layer runs
   Python/Rust subsets next to the data (streaming cursors) instead of shipping
   rows to a client.
@@ -254,10 +254,10 @@ across processes. A lock-based fallback would have been silently wrong — the
 lock would live in one process's memory and guard nothing in another's.
 
 ARM is also where the fences earn their keep. x86-64 is TSO, so a missing
-barrier in the reader-pin protocol (DESIGN.md §4.3) usually hides; ARM is
+barrier in the reader-pin protocol (design/DESIGN.md §4.3) usually hides; ARM is
 weakly ordered and it would not.
 
-See [`DESIGN-MACOS-LOCK.md`](DESIGN-MACOS-LOCK.md) for the macOS lock design.
+See [`design/DESIGN-MACOS-LOCK.md`](design/DESIGN-MACOS-LOCK.md) for the macOS lock design.
 
 ## Differential testing vs sqlite3 / PostgreSQL
 
@@ -373,7 +373,7 @@ list, as in PostgreSQL: once duplicates collapse, a key outside the output means
 CDC bitmap, and the mirror's per-table state, so it is explicit in the file (not
 a sort position): `CREATE`/`DROP` never renumber, and a dropped id is never
 reused — capping lifetime creates at 64 (`regenerate` resets it). See
-[`DESIGN-DROP-TABLE.md`](DESIGN-DROP-TABLE.md).
+[`design/DESIGN-DROP-TABLE.md`](design/DESIGN-DROP-TABLE.md).
 
 ## Performance
 
@@ -476,7 +476,7 @@ parameter resolution, once building the insert row. Both paths now borrow the
 caller's values when nothing needs computing (almost every statement), taking a
 warm 16 MiB insert from 12.1 ms to ~2.2 ms. The remaining gap to a raw file
 write is page faults on cold pages, which is a storage-layout question
-([#50](DESIGN.md)), not a copy.
+([#50](design/DESIGN.md)), not a copy.
 
 **Large blobs got 77% faster (2026-07-16).** `row::encode_row` materialised the
 whole row — blob included — into a fresh heap buffer whose only purpose was to be
@@ -515,7 +515,7 @@ range) meeting a platform where it multiplies. Logged as known-issue #0; use
 
 **Bulk bytes: extents changed the game — measured, per platform.** Large
 values now take the WiscKey path from
-[`DESIGN-BLOBEXTENT.md`](DESIGN-BLOBEXTENT.md): immutable extents written
+[`design/DESIGN-BLOBEXTENT.md`](design/DESIGN-BLOBEXTENT.md): immutable extents written
 once via `pwrite`, with the COW tree keeping a 20-byte reference and every
 crash-safety property intact (SIGKILL-fuzzed and power-loss-simulated in
 both WAL modes). Paired same-binary A/B (`examples/blob_bulk_ab`): on Linux
@@ -547,7 +547,7 @@ mpedb mirrors a live sqlite or PostgreSQL database into a local `.mpedb`, lets
 you use it while **both sides keep writing**, pulls incremental diffs under
 concurrent source write load, pushes local changes back, and switches which side
 is authoritative — in both directions, repeatably. The protocol is specified in
-[`DESIGN-MIRROR.md`](DESIGN-MIRROR.md) (v1.1, hardened against a 58-finding
+[`design/DESIGN-MIRROR.md`](design/DESIGN-MIRROR.md) (v1.1, hardened against a 58-finding
 adversarial review).
 
 **What works today, and where:**
@@ -624,13 +624,13 @@ the source — no operation lost or duplicated across the kills.
 The design documents are the load-bearing contracts — **read them before touching
 concurrency, lock, or commit-path code:**
 
-- [`DESIGN.md`](DESIGN.md) — the core engine, concurrency, and crash-safety protocols.
-- [`DESIGN-MULTIDB.md`](DESIGN-MULTIDB.md) — parallel databases + cooperative RLS.
-- [`DESIGN-MIRROR.md`](DESIGN-MIRROR.md) — bidirectional sqlite/PostgreSQL mirroring & migration.
-- [`DESIGN-DDL.md`](DESIGN-DDL.md) — live `CREATE`/`DROP`/`ALTER TABLE` on a running
+- [`design/DESIGN.md`](design/DESIGN.md) — the core engine, concurrency, and crash-safety protocols.
+- [`design/DESIGN-MULTIDB.md`](design/DESIGN-MULTIDB.md) — parallel databases + cooperative RLS.
+- [`design/DESIGN-MIRROR.md`](design/DESIGN-MIRROR.md) — bidirectional sqlite/PostgreSQL mirroring & migration.
+- [`design/DESIGN-DDL.md`](design/DESIGN-DDL.md) — live `CREATE`/`DROP`/`ALTER TABLE` on a running
   multi-process database (design; stable table ids are stage 0).
-- [`DESIGN-MACOS-LOCK.md`](DESIGN-MACOS-LOCK.md) — the FLD-2 macOS crash-safe writer lock.
-- [`DESIGN-MPEE-OPT.md`](DESIGN-MPEE-OPT.md), [`DESIGN-PHASE3.md`](DESIGN-PHASE3.md) —
+- [`design/DESIGN-MACOS-LOCK.md`](design/DESIGN-MACOS-LOCK.md) — the FLD-2 macOS crash-safe writer lock.
+- [`design/DESIGN-MPEE-OPT.md`](design/DESIGN-MPEE-OPT.md), [`design/DESIGN-PHASE3.md`](design/DESIGN-PHASE3.md) —
   measured-and-documented explorations (including directions that were falsified
   and deliberately *not* shipped).
 

@@ -2,7 +2,7 @@
 //! embeds the format version, the full IR, the plan-hash table (with kinds
 //! and arities), the arity and the name. Two processes that compute the same
 //! `ProcHash` hold byte-identical procedures — the same protocol plans use
-//! (DESIGN.md §7), one level up.
+//! (design/DESIGN.md §7), one level up.
 
 use mpedb_types::{Error, Result};
 use std::fmt;

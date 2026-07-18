@@ -1,7 +1,7 @@
 //! Physical planning: decompose WHERE into AND-conjuncts, extract the access
 //! path (PK point > PK range > secondary unique point > full scan), compute
 //! the residual filter, elide provably redundant ORDER BY, and compute the
-//! precomputed footprint (DESIGN.md §7.3).
+//! precomputed footprint (design/DESIGN.md §7.3).
 
 use crate::ast::{self, BinOp};
 use std::collections::BTreeSet;
@@ -66,7 +66,7 @@ fn merge_and(user: Option<BExpr>, policy: Option<BExpr>) -> Option<BExpr> {
 
 /// Parse + bind one policy predicate SOURCE against the shared `binder`, so its
 /// `current_setting()` refs share the statement's reserved-parameter space
-/// (DESIGN-MULTIDB.md §2.2/§3.2). Policies may not use `$`/`?` params.
+/// (design/DESIGN-MULTIDB.md §2.2/§3.2). Policies may not use `$`/`?` params.
 fn bind_policy_src(binder: &mut Binder, src: &str) -> Result<BExpr> {
     let (expr, n_params) = crate::parser::parse_expr_only(src)?;
     if n_params > 0 {
@@ -217,7 +217,7 @@ fn write_check(
     Ok(Some(eff))
 }
 
-/// Canonical secondary-index numbering helper (DESIGN.md §4.4): index 0 is
+/// Canonical secondary-index numbering helper (design/DESIGN.md §4.4): index 0 is
 /// the PK tree; the returned vector lists the column index of secondary
 /// index 1, 2, ... — columns with `unique = true` OR `indexed = true`, in
 /// declaration order, skipping a column that is by itself the entire primary

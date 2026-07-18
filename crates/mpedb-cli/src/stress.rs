@@ -1,6 +1,6 @@
 //! `mpedb stress --dir D --workers N --secs S --mode bank|unique|mixed`
 //!
-//! Multi-process stress test (DESIGN.md §10.2). The parent writes a config +
+//! Multi-process stress test (design/DESIGN.md §10.2). The parent writes a config +
 //! database under `--dir`, seeds it, respawns itself N times as the hidden
 //! `stress-child` subcommand, then runs mode-specific invariant checks plus
 //! `Database::verify()` (page accounting).

@@ -1,4 +1,4 @@
-//! `CREATE VIEW` flattening (#73, DESIGN-VIEW.md). A view is a named `SELECT`;
+//! `CREATE VIEW` flattening (#73, design/DESIGN-VIEW.md). A view is a named `SELECT`;
 //! a query that names it in `FROM` is rewritten to read the view's base table
 //! with the view's `WHERE` merged in. mpedb has no derived-table machinery, so
 //! flattening reuses the ordinary single-table planner and adds zero plan

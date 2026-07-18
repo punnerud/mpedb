@@ -1,4 +1,4 @@
-//! Shared plan registry (DESIGN.md §7.2): plans live as system records inside
+//! Shared plan registry (design/DESIGN.md §7.2): plans live as system records inside
 //! the database so ANY attached process can `execute(hash, params)` without
 //! parsing SQL.
 //!
@@ -39,7 +39,7 @@ pub(crate) fn plan_subkey(hash: &PlanHash) -> Vec<u8> {
 
 pub(crate) struct Record<'a> {
     /// Original SQL text, kept for tooling (`mpedb-cli` registry listing) and
-    /// as the re-prepare fallback documented in DESIGN.md §7.2.
+    /// as the re-prepare fallback documented in design/DESIGN.md §7.2.
     #[allow(dead_code)]
     pub sql: &'a str,
     pub blob: &'a [u8],

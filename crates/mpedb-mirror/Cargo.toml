@@ -3,7 +3,7 @@ name = "mpedb-mirror"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Bidirectional sqlite3/PostgreSQL <-> mpedb mirror (DESIGN-MIRROR.md)"
+description = "Bidirectional sqlite3/PostgreSQL <-> mpedb mirror (design/DESIGN-MIRROR.md)"
 
 [dependencies]
 mpedb = { workspace = true }

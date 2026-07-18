@@ -4,7 +4,7 @@
 //! content-hashed plans ([`Database::prepare`]), executes plans by hash with
 //! no parsing on the hot path ([`Database::execute`]), and maintains the
 //! shared plan registry *inside* the database so any attached process can
-//! `execute(hash, params)` for a plan it never prepared (DESIGN.md §7.2).
+//! `execute(hash, params)` for a plan it never prepared (design/DESIGN.md §7.2).
 //!
 //! ```no_run
 //! use mpedb::{params, Config, Database};
@@ -158,7 +158,7 @@ impl mpedb_core::btree::BlobSource for FileBlobSource {
 
 /// A **detached (client-borne) plan**: the compiled plan the SDK/client
 /// carries itself instead of leaving in the shared registry (Morten's idea,
-/// DESIGN.md §7.2 turned inside-out). Shipping `(blob + hash + sql)` between
+/// design/DESIGN.md §7.2 turned inside-out). Shipping `(blob + hash + sql)` between
 /// components lets any process execute the plan with *no registry write* — the
 /// database only has to VALIDATE integrity ([`Database::execute_detached`]),
 /// never to store anything.
@@ -371,7 +371,7 @@ impl Database {
     }
 
     /// Compile `sql` with this database's RLS policies injected (loaded from the
-    /// catalog sys-keyspace on a pinned read snapshot, DESIGN-MULTIDB.md §3).
+    /// catalog sys-keyspace on a pinned read snapshot, design/DESIGN-MULTIDB.md §3).
     /// The bool is the `EXPLAIN` flag. An empty policy set behaves exactly as
     /// plain compilation.
     /// Refresh this process's schema bundle if another process bumped the meta
@@ -435,7 +435,7 @@ impl Database {
     }
 
     /// Like [`execute`](Self::execute) but with a [`Session`] whose values fill
-    /// the plan's `current_setting()` references (DESIGN-MULTIDB.md §2). `params`
+    /// the plan's `current_setting()` references (design/DESIGN-MULTIDB.md §2). `params`
     /// are the caller-facing parameters only; the reserved context slots are
     /// filled from `session` (fail-closed on a missing key / NULL / wrong type).
     pub fn execute_ctx(
@@ -462,7 +462,7 @@ impl Database {
     }
 
     /// Like [`query`](Self::query) but with a [`Session`] for `current_setting()`
-    /// (DESIGN-MULTIDB.md §2). `params` are the caller-facing parameters only.
+    /// (design/DESIGN-MULTIDB.md §2). `params` are the caller-facing parameters only.
     pub fn query_ctx(
         &self,
         session: &Session,
@@ -567,7 +567,7 @@ impl Database {
     }
 
     /// Begin a write transaction bound to a snapshot of `session` (SET LOCAL
-    /// semantics, DESIGN-MULTIDB.md §2.5): every statement in the transaction
+    /// semantics, design/DESIGN-MULTIDB.md §2.5): every statement in the transaction
     /// resolves `current_setting()` against the context as it was *here*, so a
     /// later mutation of the caller's `Session` cannot bleed into an open
     /// transaction. The context is fixed for the transaction's lifetime.
@@ -580,7 +580,7 @@ impl Database {
         })
     }
 
-    /// Verify the engine's page-accounting invariant (DESIGN.md §4.5).
+    /// Verify the engine's page-accounting invariant (design/DESIGN.md §4.5).
     /// Takes the writer lock briefly; do not call with an open session.
     pub fn verify(&self) -> Result<()> {
         self.engine.verify_page_accounting()
@@ -749,7 +749,7 @@ impl Database {
     /// Deliberately does NOT refresh the entry's `last_used_txn`: bumping it
     /// needs the single writer lock, and this path serves read-only executes
     /// — a cold-cache SELECT must never block behind (or msync alongside) a
-    /// live writer (DESIGN.md §7.3: read-only plans route to a read
+    /// live writer (design/DESIGN.md §7.3: read-only plans route to a read
     /// transaction, the writer lock is never touched). Registry recency is
     /// therefore insert time plus the ride-along bump in
     /// [`WriteSession::plan_by_hash`]; eviction tolerates entries whose
@@ -817,7 +817,7 @@ impl Database {
         }
     }
 
-    /// Autocommit DML with Phase-2 group commit (DESIGN.md §5.3).
+    /// Autocommit DML with Phase-2 group commit (design/DESIGN.md §5.3).
     ///
     /// Uncontended: take the lock immediately and lead (executing our own
     /// statement plus any pending intents in one commit). Contended: publish

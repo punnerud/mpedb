@@ -17,7 +17,7 @@
 //! - SQL appears in proc source exclusively as **string literals** inside
 //!   `db.query("...", [...])` / `db.execute("...", [...])`. Each is
 //!   compiled once at define time via the facade's `prepare` (published to
-//!   the shared plan registry, DESIGN.md §7.2) and only its `PlanHash` is
+//!   the shared plan registry, design/DESIGN.md §7.2) and only its `PlanHash` is
 //!   embedded in the proc — injection has nowhere to happen at run time.
 //! - Stored blobs are treated as hostile on load: bounds-checked decode,
 //!   jump-target and stack-depth analysis, plan-arity checks; anything off

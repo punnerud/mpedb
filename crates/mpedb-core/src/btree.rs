@@ -322,7 +322,7 @@ fn fits(p: &[u8], cell_len: usize) -> Result<bool> {
 
 /// The half-open byte range `[prefix_end, suffix_start)` of a node page that
 /// NO engine code ever reads back, and therefore is safe to omit from a WAL
-/// record and zero-fill on replay ("lean records", DESIGN.md §5.4.1).
+/// record and zero-fill on replay ("lean records", design/DESIGN.md §5.4.1).
 /// Reconstructing a page as `[0, prefix_end)` ++ zeros ++ `[suffix_start,
 /// PAGE_SIZE)` is *observationally identical* to the live page for every read
 /// path — even though the omitted bytes are not guaranteed zero in memory.
@@ -452,7 +452,7 @@ fn write_overflow<S: PageStore + ?Sized>(store: &mut S, data: &mut Payload<'_>) 
             reader.fill(&mut p[HDR + filled..HDR + take])?;
         }
         // The tail. `read_overflow` never looks past HDR+take and there is no
-        // per-data-page checksum (DESIGN.md §5.4.1), so leaving the previous
+        // per-data-page checksum (design/DESIGN.md §5.4.1), so leaving the previous
         // tenant's bytes here would be *correct* — and would quietly keep
         // deleted rows readable in a file that gets copied around. Zero it.
         p[HDR + take..].fill(0);

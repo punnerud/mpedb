@@ -92,7 +92,7 @@ sidecar flow pulls them in on the next open) or in explicit unlocked windows
 ## Where this is going
 
 The full design — reviewed hard (20 adversarial findings folded) — is
-[DESIGN-SQLITE-BACKED.md](DESIGN-SQLITE-BACKED.md). The staging:
+[design/DESIGN-SQLITE-BACKED.md](design/DESIGN-SQLITE-BACKED.md). The staging:
 
 - **v0 (shipped)**: the sidecar flow above — full-copy mirror, one-command
   UX, checkpoint = push.
@@ -145,7 +145,7 @@ The full design — reviewed hard (20 adversarial findings folded) — is
 A one-file variant (mpedb living *inside* the `.db` as blob regions) was
 explored seriously and set aside — the analysis with per-approach verdicts
 and the experiments that would revive it is
-[DESIGN-ONEFILE-EXPLORATION.md](DESIGN-ONEFILE-EXPLORATION.md).
+[design/DESIGN-ONEFILE-EXPLORATION.md](design/DESIGN-ONEFILE-EXPLORATION.md).
 
 ## Honest limits, today
 

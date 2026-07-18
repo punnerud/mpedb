@@ -427,7 +427,7 @@ WAL mode (commit-class) allows readers concurrent with the writer.
 its data dir sits on /dev/shm. The unix socket for BOTH PostgreSQL configs lives on \
 /dev/shm (sockets carry no data; the datadir location is what differs).
 - mpedb commit-class engages the intent-ring group commit only under contention \
-(DESIGN.md §5.3); single-client durable inserts pay one msync each, serialized.
+(design/DESIGN.md §5.3); single-client durable inserts pay one msync each, serialized.
 - DURABILITY CLASS TABLE (§5.4): the durable-on-ack class (mpedb wal / SQLite FULL / \
 PostgreSQL sc=on) acks only after the commit is power-loss-durable. The \
 crash-consistent-deferred class (mpedb async / SQLite NORMAL / PostgreSQL sc=off) acks \
@@ -436,7 +436,7 @@ power failure may lose a bounded recent window of acked commits. NEVER compare a
 deferred number against a durable-on-ack number. mpedb `async` bounds the window by a \
 flush interval (default 10 ms, MPEDB_WAL_FLUSH_MS); PostgreSQL sc=off by \
 wal_writer_delay; SQLite NORMAL flushes at checkpoint.
-- mpedb wal records are LEAN (DESIGN.md §5.4.1): only the touched COW pages are logged, \
+- mpedb wal records are LEAN (design/DESIGN.md §5.4.1): only the touched COW pages are logged, \
 and each B+tree node's unused free space is elided (stored as prefix+suffix, zero-filled \
 on replay — proven byte-safe against btree.rs). MPEDB_WAL_FULL_PAGES=1 disables it for \
 A/B; lean cut the per-commit fdatasync payload and measured ~1.15-1.2x single-client \

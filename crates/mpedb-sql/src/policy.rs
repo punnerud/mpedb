@@ -1,5 +1,5 @@
 //! Per-table RLS policy sets handed to the planner at prepare time
-//! (DESIGN-MULTIDB.md §3). Built by the facade from the catalog sys-keyspace;
+//! (design/DESIGN-MULTIDB.md §3). Built by the facade from the catalog sys-keyspace;
 //! the planner reads it to inject `USING`/`WITH CHECK` predicates.
 
 use mpedb_types::PolicyDef;
@@ -14,7 +14,7 @@ pub struct TablePolicies {
     pub force: bool,
     /// Monotonic per-table policy epoch (bumped on any policy edit). Recorded
     /// on plans and compared against the live value to detect staleness
-    /// (Phase-5 plan-cache leak-proofing, DESIGN-MULTIDB.md §4).
+    /// (Phase-5 plan-cache leak-proofing, design/DESIGN-MULTIDB.md §4).
     pub epoch: u64,
     pub policies: Vec<PolicyDef>,
 }

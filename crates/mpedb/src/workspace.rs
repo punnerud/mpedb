@@ -1,4 +1,4 @@
-//! Multi-database workspace handle (DESIGN-MULTIDB.md §1).
+//! Multi-database workspace handle (design/DESIGN-MULTIDB.md §1).
 //!
 //! A [`Workspace`] owns N fully-independent [`Database`] engines addressed by
 //! `alias.table`. Each member is its own file — its own writer lock, reader
@@ -147,7 +147,7 @@ impl Workspace {
         db.execute(&plan.hash, params)
     }
 
-    /// Begin a multi-member write (DESIGN-MULTIDB.md §1.5). See
+    /// Begin a multi-member write (design/DESIGN-MULTIDB.md §1.5). See
     /// [`WorkspaceTxn`] — **there is no atomic cross-file commit**, and the type
     /// exists to make that impossible to use by accident.
     pub fn begin_multi(&self) -> WorkspaceTxn<'_> {
@@ -159,7 +159,7 @@ impl Workspace {
 }
 
 /// A write spanning several workspace members — **NOT a transaction across
-/// files, and deliberately not shaped like one** (DESIGN-MULTIDB.md §1.5).
+/// files, and deliberately not shaped like one** (design/DESIGN-MULTIDB.md §1.5).
 ///
 /// There is no atomic cross-file commit and none should be added: members have
 /// entirely independent meta pages, intent rings and WALs, and a shared commit

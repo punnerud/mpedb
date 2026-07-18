@@ -280,7 +280,7 @@ pub(crate) struct Binder<'a> {
     /// Types of ALL parameters: the `n_user_params` caller params first, then
     /// one appended reserved slot per distinct `current_setting()` key (in
     /// `ctx_keys` order). `current_setting()` refs bind to `Param(n_user + pos)`
-    /// and are filled from the session at execute time (DESIGN-MULTIDB.md §2).
+    /// and are filled from the session at execute time (design/DESIGN-MULTIDB.md §2).
     pub param_types: Vec<Ty>,
     /// Number of caller-facing parameters; reserved context slots start here.
     n_user_params: u16,

@@ -1,4 +1,4 @@
-//! `CREATE VIEW` (#73, DESIGN-VIEW.md) — a view is flattened onto its base
+//! `CREATE VIEW` (#73, design/DESIGN-VIEW.md) — a view is flattened onto its base
 //! table at reference time. Cross-checked against sqlite 3.45: a `SELECT` over
 //! the view returns exactly the base rows the view's projection/filter admit,
 //! an outer filter AND-merges with the view's, `SELECT *` returns the view's

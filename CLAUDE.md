@@ -4,7 +4,7 @@ Embedded multi-process shared-memory database in Rust: sqlite's operational mode
 (no server, processes attach and may be SIGKILLed at any instant) + PostgreSQL-grade
 concurrency (MVCC snapshots, lock-free readers) + rigid schema validation that sqlite
 lacks. SQL compiles once to content-hashed plans (`execute(hash, params)` hot path with
-zero parsing). **Read DESIGN.md before touching concurrency, lock, or commit-path code —
+zero parsing). **Read design/DESIGN.md before touching concurrency, lock, or commit-path code —
 every protocol there survived a 37-finding adversarial review, and the ordering rules
 (fences, meta publication, slot generation-CAS) are load-bearing.**
 
@@ -59,16 +59,16 @@ every protocol there survived a 37-finding adversarial review, and the ordering 
   and LEAVES the entry (tracked in `taken`); the commit fixpoint strikes out only what
   was consumed, and never rewrites an entry nothing was allocated out of. Deleting on
   the way in is what made every drawn page a page the fixpoint had to write back —
-  coupling its appetite to the pool and leaking high-water forever (DESIGN.md §4.5).
+  coupling its appetite to the pool and leaking high-water forever (design/DESIGN.md §4.5).
   Freelist values are strictly ascending and binary-searched; `reusable` is kept sorted.
 - The fixpoint's fallback to `high_water` **is** its termination argument (§4.5) — it
   frees nothing, so the sets stop growing. That is why `in_freelist_op` must keep
   blocking refill even though refill no longer mutates.
 - The reader-pin protocol and writer scan pair SeqCst fences; weakening them reintroduces
-  a store-buffering race (DESIGN.md §4.3).
+  a store-buffering race (design/DESIGN.md §4.3).
 - Intent-ring posting is incarnation-safe ONLY because: posts happen under the writer
   lock, the result store precedes the READY→DONE transition, owners may release from
-  READY, and recovery never acts on DONE slots (DESIGN.md §5.3). Reordering any of these
+  READY, and recovery never acts on DONE slots (design/DESIGN.md §5.3). Reordering any of these
   reintroduces a stress-reproducible phantom-result TOCTOU.
 - Index numbering: 0 = PK tree; `TableDef.indexes` is the SINGLE source
   (DESIGN-SCHEMA-V2) — index_no = position + 1, populated by `Schema::new` (flag-derived
