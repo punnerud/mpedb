@@ -116,6 +116,8 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
                 p.parse_create_index(true)?
             } else if p.eat_word("INDEX") {
                 p.parse_create_index(false)?
+            } else if p.eat_word("VIEW") {
+                p.parse_create_view()?
             } else {
                 p.parse_create_policy()?
             }
@@ -124,6 +126,8 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
             p.advance();
             if p.eat_word("TABLE") {
                 p.parse_drop_table()?
+            } else if p.eat_word("VIEW") {
+                p.parse_drop_view()?
             } else {
                 p.parse_drop_policy()?
             }
@@ -540,6 +544,45 @@ impl<'a> Parser<'a> {
             using_src,
             check_src,
         }))
+    }
+
+    fn parse_create_view(&mut self) -> Result<DdlStmt> {
+        let if_not_exists = if self.eat_word("IF") {
+            self.expect_kw(Kw::Not, "NOT")?;
+            self.expect_word("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident("view name")?;
+        // `CREATE VIEW v(a,b) AS …` (explicit column names) is not supported yet.
+        if self.peek() == Some(&Tok::LParen) {
+            return Err(self.err_here("CREATE VIEW with an explicit column list is not supported"));
+        }
+        self.expect_kw(Kw::As, "AS")?;
+        // Capture the SELECT as source text (re-parsed + flattened at reference
+        // time, like an RLS predicate). Everything from here to the end is the
+        // view body; consume the tokens so `expect_eof` is satisfied.
+        let start = self.here();
+        let select_sql = self.src[start..].trim().trim_end_matches(';').trim().to_string();
+        if select_sql.is_empty() {
+            return Err(self.err_here("CREATE VIEW: empty SELECT body"));
+        }
+        while self.peek().is_some() {
+            self.advance();
+        }
+        Ok(DdlStmt::CreateView { name, select_sql, if_not_exists })
+    }
+
+    fn parse_drop_view(&mut self) -> Result<DdlStmt> {
+        let if_exists = if self.eat_word("IF") {
+            self.expect_word("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident("view name")?;
+        Ok(DdlStmt::DropView { name, if_exists })
     }
 
     fn parse_create_index(&mut self, unique: bool) -> Result<DdlStmt> {

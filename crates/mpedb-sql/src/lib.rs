@@ -24,6 +24,7 @@ mod plan;
 mod planner;
 mod policy;
 mod token;
+mod view;
 
 pub use ddl::{CreateColumnSpec, CreatePolicySpec, CreateTableSpec, DdlStmt, RlsAction};
 pub use plan::{
@@ -33,6 +34,7 @@ pub use plan::{
 };
 pub use planner::secondary_indexes;
 pub use policy::{table_policy_hash, PolicyCatalog, TablePolicies};
+pub use view::ViewCatalog;
 
 /// Parse a row-level-security DDL statement, or `None` if `sql` is ordinary
 /// DML/query text (DESIGN-MULTIDB.md §3.1). The facade calls this before
@@ -82,7 +84,20 @@ pub fn prepare_maybe_explain_with_policies(
     schema: &Schema,
     catalog: &PolicyCatalog,
 ) -> Result<(CompiledPlan, bool)> {
-    let (stmt, is_explain, n_params) = parser::parse_statement(sql)?;
+    prepare_maybe_explain_with_views(sql, schema, catalog, &view::ViewCatalog::new())
+}
+
+/// Like [`prepare_maybe_explain_with_policies`] but also given the view catalog
+/// (name → SELECT source); a query naming a view is flattened onto the view's
+/// base table before planning (DESIGN-VIEW.md).
+pub fn prepare_maybe_explain_with_views(
+    sql: &str,
+    schema: &Schema,
+    catalog: &PolicyCatalog,
+    views: &ViewCatalog,
+) -> Result<(CompiledPlan, bool)> {
+    let (mut stmt, is_explain, n_params) = parser::parse_statement(sql)?;
+    view::inline_views(&mut stmt, views)?;
     let plan = planner::plan_statement(&stmt, schema, n_params, catalog)?;
     Ok((plan, is_explain))
 }

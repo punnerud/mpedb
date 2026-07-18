@@ -89,6 +89,12 @@ pub enum DdlStmt {
         unique: bool,
         if_not_exists: bool,
     },
+    /// `CREATE VIEW [IF NOT EXISTS] <name> AS <select>` (#73). The SELECT is
+    /// captured as source text and re-parsed + flattened into referencing
+    /// queries (DESIGN-VIEW.md). Applied by the facade as a catalog mutation.
+    CreateView { name: String, select_sql: String, if_not_exists: bool },
+    /// `DROP VIEW [IF EXISTS] <name>` (#73).
+    DropView { name: String, if_exists: bool },
     CreatePolicy(CreatePolicySpec),
     DropPolicy { table: String, name: String },
     AlterRls { table: String, action: RlsAction },

@@ -49,7 +49,8 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | ALTER TABLE ADD COLUMN | ✅ | nullable column, live + multi-process (existing rows rewritten with NULL). `NOT NULL`/`UNIQUE`/`PRIMARY KEY` on ADD refuse (no default fill / online index build yet), matching sqlite's NOT-NULL-needs-default rule |
 | ALTER TABLE DROP COLUMN | ✅ | live + multi-process (existing rows rewritten without the column; surviving index/PK column references renumbered). Refuses dropping a PK / indexed / last column, matching sqlite |
 | CREATE INDEX | ✅ | `CREATE [UNIQUE] INDEX [IF NOT EXISTS] n ON t (cols)` — built over existing rows, live + multi-process; ASC/DESC per column accepted (indexes are ascending, used for equality/prefix/range lookups). Or declare via config `unique`/`indexed`/`[[table.index]]`. The index name is not persisted (indexes are positional) |
-| CREATE VIEW / CREATE TRIGGER | ❌ | triggers' job is planned as the PySpell/ETL layer, not in-SQL |
+| CREATE VIEW / DROP VIEW | ✅ | a query naming the view is flattened onto its base table (WHERE merged; `SELECT *` yields the view's columns; view-over-view chains). Simple projection/filter views over one table; aggregate/join/DISTINCT view bodies are refused at reference time (never answered wrongly) — [DESIGN-VIEW.md](DESIGN-VIEW.md) |
+| CREATE TRIGGER | ❌ | triggers' job is planned as the PySpell/ETL layer, not in-SQL |
 | WITH (CTEs) | ❌ | |
 | VALUES (standalone) | ❌ | |
 | PRAGMA | **Not needed** | everything a PRAGMA would set lives in the config file, per database, versioned |

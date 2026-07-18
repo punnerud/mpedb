@@ -1182,6 +1182,14 @@ impl<'e> WriteTxn<'e> {
         Ok(())
     }
 
+    /// Arm the schema-generation bump for this commit without changing the
+    /// catalog schema — used for sys-keyspace-only DDL (e.g. `CREATE VIEW`
+    /// stores its source under `view/<name>`) so peer processes drop caches that
+    /// baked in the old definition.
+    pub fn bump_schema_gen(&mut self) {
+        self.schema_gen_bump = true;
+    }
+
     pub fn sys_get(&mut self, subkey: &[u8]) -> Result<Option<Vec<u8>>> {
         btree::get(self, self.catalog_root, &sys_key(subkey))
     }
