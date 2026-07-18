@@ -44,6 +44,15 @@ fn sample_sqls() -> Vec<&'static str> {
         "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE item_no IN (SELECT age FROM users))",
         "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE EXISTS (SELECT 1 FROM events))",
         "SELECT id FROM users WHERE age = (SELECT max(age) FROM users WHERE age < (SELECT max(item_no) FROM orders))",
+        // Nested subqueries CORRELATED to their immediate parent (#73 §3 stage 2,
+        // same format 20): a nested lift now carries `outer_args` that index into
+        // its parent subplan's row and a parent `post_filter` — both must survive
+        // the recursive encode/decode/validate. EXISTS-in-EXISTS and a scalar
+        // whose correlated body holds another correlated EXISTS.
+        "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id \
+         AND EXISTS (SELECT 1 FROM events WHERE events.msg = orders.sku))",
+        "SELECT id FROM users WHERE age = (SELECT max(item_no) FROM orders WHERE orders.user_id = users.id \
+         AND EXISTS (SELECT 1 FROM events WHERE events.msg = orders.sku))",
         "BEGIN",
         "COMMIT",
         "ROLLBACK",
@@ -122,23 +131,75 @@ fn decode_rejects_truncation_in_nested_subplan() {
     assert_eq!(CompiledPlan::decode(&bytes, &s).unwrap(), p);
 }
 
-/// A forged blob claiming a CORRELATED nested subplan must be rejected: stage 1
-/// fills nested lifts ONCE (uncorrelated), so a per-row correlation there would
-/// be silently misexecuted. `validate` refuses it.
+/// The same truncation sweep for a CORRELATED nested tree (#73 §3 stage 2): the
+/// child carries `outer_args` bytes and the middle a `post_filter`, so a cut
+/// through any of them must fail closed rather than decode a half-read tree.
 #[test]
-fn decode_rejects_correlated_nested_subplan() {
+fn decode_rejects_truncation_in_correlated_nested_subplan() {
     let s = test_schema();
     let p = prepare(
-        "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE EXISTS (SELECT 1 FROM events))",
+        "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id \
+         AND EXISTS (SELECT 1 FROM events WHERE events.msg = orders.sku))",
         &s,
     )
     .unwrap();
+    // Sanity: a correlated child (one outer_arg) under a middle with a post_filter.
+    assert_eq!(p.subplans.len(), 1);
+    assert_eq!(p.subplans[0].subplans.len(), 1);
+    assert_eq!(p.subplans[0].subplans[0].outer_args.len(), 1);
+    assert!(p.subplans[0].plan.post_filter.is_some());
+    let bytes = p.encode();
+    for cut in 0..bytes.len() {
+        assert!(
+            CompiledPlan::decode(&bytes[..cut], &s).is_err(),
+            "truncation at {cut} must fail"
+        );
+    }
+    assert_eq!(CompiledPlan::decode(&bytes, &s).unwrap(), p);
+}
+
+/// A nested subquery CORRELATED to its immediate parent (#73 §3 stage 2) is a
+/// legal plan and must round-trip through encode/decode/validate. The forged
+/// shapes it is NOT allowed to take are still rejected: a correlation arg that
+/// does not match `sub_base`, or one that points past the parent's row.
+#[test]
+fn correlated_nested_subplan_round_trips_and_bounds() {
+    let s = test_schema();
+    let p = prepare(
+        "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id \
+         AND EXISTS (SELECT 1 FROM events WHERE events.msg = orders.sku))",
+        &s,
+    )
+    .unwrap();
+    // The grandchild really correlates to its immediate parent (orders): one
+    // outer_arg, and the middle plan carries a post_filter for the EXISTS.
+    assert_eq!(p.subplans.len(), 1);
+    assert_eq!(p.subplans[0].subplans.len(), 1);
+    assert_eq!(p.subplans[0].subplans[0].outer_args.len(), 1);
+    assert!(
+        p.subplans[0].plan.post_filter.is_some(),
+        "correlated child ⇒ parent post_filter"
+    );
+    // Legal blob round-trips (and re-validates the whole correlated tree).
+    assert_eq!(CompiledPlan::decode(&p.encode(), &s).unwrap(), p);
+
+    // Forge the grandchild's correlation arg to look correlated WITHOUT moving
+    // its sub_base: the executor would fill children into the wrong slots, so
+    // decode refuses the inconsistency.
     let mut evil = p.clone();
-    // Forge the inner (grandchild) lift into looking correlated.
-    evil.subplans[0].subplans[0].outer_args = vec![0];
+    evil.subplans[0].subplans[0].outer_args.push(0);
+    match CompiledPlan::decode(&evil.encode(), &s) {
+        Err(Error::Corrupt(m)) => assert!(m.contains("sub_base"), "{m}"),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
+
+    // Forge the correlation arg to point past the parent (orders has 4 columns):
+    // an outer_arg out of the parent row is corrupt.
+    let mut evil = p.clone();
+    evil.subplans[0].subplans[0].outer_args = vec![99];
     match CompiledPlan::decode(&evil.encode(), &s) {
         Err(Error::Corrupt(m)) => assert!(
-            m.contains("nested correlated") || m.contains("sub_base"),
+            m.contains("out of the outer row") || m.contains("sub_base"),
             "{m}"
         ),
         other => panic!("expected Corrupt, got {other:?}"),

@@ -492,16 +492,23 @@ fn subplan_value(r: ExecResult, kind: mpedb_sql::SubPlanKind) -> Result<Value> {
     }
 }
 
-/// Run one subplan, first filling its OWN nested lifts (#73 §3 stage 1).
+/// Run one subplan, first filling its OWN nested lifts (#73 §3).
 ///
 /// `base_params` is `[user ‖ this subplan's correlation args]` — of length
 /// `sub.sub_base` — so a plain leaf subplan (no nested lifts) runs exactly as
-/// before. When `sub` HAS nested lifts, they are UNCORRELATED (planner + validate
-/// guarantee it), so each depends only on `base_params` and is evaluated ONCE
-/// here, bottom-up, into `[.. ‖ children results]` at `sub_base + i`, before
-/// `sub.plan`'s own access resolution and gather. This generalizes the flat
-/// two-level fill (`exec_stmt_impl` once + per-row) into a recursion that bottoms
-/// out at today's leaf case.
+/// before. When `sub` HAS nested lifts:
+///
+/// - UNCORRELATED children depend only on `base_params`, so each is evaluated
+///   ONCE here, bottom-up, into `[.. ‖ children results]` at `sub_base + i`,
+///   before `sub.plan`'s own gather.
+/// - CORRELATED children (stage 2: correlated to THIS subplan's row) are NOT
+///   filled here — they are filled PER ROW of `sub.plan` by
+///   [`exec_select_leveled`], the same machinery the top level uses for its own
+///   correlated subplans, plus `sub.plan.post_filter` when the correlated child
+///   feeds `sub`'s WHERE.
+///
+/// This generalizes the flat two-level fill (`exec_stmt_impl` once + top per-row)
+/// into a recursion that bottoms out at the leaf case.
 fn run_subplan(
     ctx: &mut dyn TxnCtx,
     schema: &Schema,
@@ -516,18 +523,20 @@ fn run_subplan(
     let mut buf = base_params.to_vec();
     buf.resize(base + sub.subplans.len(), Value::Null);
     for (i, child) in sub.subplans.iter().enumerate() {
-        // Uncorrelated: the child sees the same `[user ‖ correlation]` prefix and
-        // fills its own nested lifts recursively; the bottom is a leaf.
-        let r = run_subplan(ctx, schema, plan, base_params, child)?;
-        buf[base + i] = subplan_value(r, child.kind)?;
+        // Only the uncorrelated children fill once here (into `sub_base + i`); a
+        // correlated child correlates to `sub.plan`'s row and is filled per row
+        // below. `base_params` (== `buf[..base]`) is the `[user ‖ correlation]`
+        // prefix each uncorrelated child inherits.
+        if child.outer_args.is_empty() {
+            let r = run_subplan(ctx, schema, plan, base_params, child)?;
+            buf[base + i] = subplan_value(r, child.kind)?;
+        }
     }
-    exec_select(ctx, schema, plan, &buf, &sub.plan)
+    exec_select_leveled(ctx, schema, plan, &buf, &sub.plan, base, &sub.subplans)
 }
 
-/// The top-level SELECT: the only place CORRELATED subplans are evaluated —
-/// per row, into a scratch param buffer, after the gather (and therefore
-/// after every policy) has produced the row. Compound arms and the subplans
-/// themselves recurse through plain [`exec_select`], which never fills slots.
+/// The top-level SELECT: routes to the leveled executor with the statement's
+/// own lifts (result slots at `subplan_base + i`). See [`exec_select_leveled`].
 fn exec_select_top(
     ctx: &mut dyn TxnCtx,
     schema: &Schema,
@@ -535,8 +544,41 @@ fn exec_select_top(
     params: &[Value],
     sp: &SelectPlan,
 ) -> Result<ExecResult> {
-    let correlated: Vec<(usize, &SubPlan)> = plan
-        .subplans
+    exec_select_leveled(
+        ctx,
+        schema,
+        plan,
+        params,
+        sp,
+        plan.subplan_base() as usize,
+        &plan.subplans,
+    )
+}
+
+/// Execute one SELECT whose CORRELATED subplans (and any `post_filter`) are
+/// handled PER ROW. `subplans` is this level's lift list, with result slots at
+/// `base + i` in `params` — every UNCORRELATED slot already filled by the
+/// caller. A correlated subplan is the ONLY place its result slot is filled:
+/// per row, after the gather (and therefore after every policy) has produced
+/// the row.
+///
+/// Shared by the top level (`base = subplan_base`, `subplans = plan.subplans`)
+/// and — via [`run_subplan`] — each NESTED subplan (`base = sub.sub_base`,
+/// `subplans = sub.subplans`). That is the recursion #73 §3 stage 2 turns the
+/// two hardcoded levels into: a nested subquery correlated to its immediate
+/// parent is filled per parent row here, exactly as the top level fills its
+/// correlated subplans per outer row. Compound arms and leaf subplans instead
+/// go through the plain [`exec_select`], which never fills slots.
+fn exec_select_leveled(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    sp: &SelectPlan,
+    base: usize,
+    subplans: &[SubPlan],
+) -> Result<ExecResult> {
+    let correlated: Vec<(usize, &SubPlan)> = subplans
         .iter()
         .enumerate()
         .filter(|(_, s)| !s.outer_args.is_empty())
@@ -551,9 +593,11 @@ fn exec_select_top(
     // there. Everything downstream (empty-group zero row, HAVING, ORDER BY,
     // LIMIT-bounds-groups) is unchanged.
     if sp.aggregate.is_some() {
-        return run_aggregate(ctx, schema, plan, params, sp, &correlated, sp.post_filter.as_ref());
+        return run_aggregate(
+            ctx, schema, plan, params, sp, base, &correlated, sp.post_filter.as_ref(),
+        );
     }
-    exec_select_with(ctx, schema, plan, params, sp, &correlated)
+    exec_select_with(ctx, schema, plan, params, sp, base, &correlated)
 }
 
 /// Combine already-projected rows under one set operator, left-associatively.
@@ -680,9 +724,12 @@ fn exec_select(
             if aggregate.is_some() {
                 // Plain aggregate: no correlated subplans and no post-filter (a
                 // correlated aggregate is routed straight to `run_aggregate`
-                // from `exec_select_top`, never through here — arms and subplans
-                // cannot carry either).
-                return run_aggregate(ctx, schema, plan, params, sp, &[], None);
+                // from `exec_select_leveled`, never through here — compound arms
+                // cannot carry either, and a correlated nested aggregate goes via
+                // `run_subplan`). `base` is unused with an empty correlated set.
+                return run_aggregate(
+                    ctx, schema, plan, params, sp, plan.subplan_base() as usize, &[], None,
+                );
             }
             let rows = if !joins.is_empty() {
                 // A join materializes: the sort, the dedup and the LIMIT all
@@ -844,6 +891,9 @@ fn exec_select_with(
     plan: &CompiledPlan,
     params: &[Value],
     sp: &SelectPlan,
+    // First reserved result slot of THIS level (`subplan_base` at the top,
+    // `sub.sub_base` for a nested subplan) — where correlated slots are filled.
+    base: usize,
     correlated: &[(usize, &SubPlan)],
 ) -> Result<ExecResult> {
     let SelectPlan {
@@ -890,8 +940,9 @@ fn exec_select_with(
     // survivor WITH the scratch that produced it — the projection may read a
     // correlated slot (a correlated scalar subquery in the SELECT list), so it
     // is evaluated against that scratch.
-    let survivors =
-        correlated_survivors(ctx, schema, plan, params, rows, correlated, post_filter.as_ref())?;
+    let survivors = correlated_survivors(
+        ctx, schema, plan, params, base, rows, correlated, post_filter.as_ref(),
+    )?;
 
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -942,6 +993,9 @@ fn run_aggregate(
     plan: &CompiledPlan,
     params: &[Value],
     sp: &SelectPlan,
+    // First reserved result slot of THIS level — threaded to `correlated_survivors`
+    // (unused when `correlated` is empty and `post_filter` is `None`).
+    base: usize,
     correlated: &[(usize, &SubPlan)],
     post_filter: Option<&ExprProgram>,
 ) -> Result<ExecResult> {
@@ -969,6 +1023,7 @@ fn run_aggregate(
         sp.limit,
         sp.offset,
         sp.distinct,
+        base,
         correlated,
         post_filter,
     )
@@ -999,11 +1054,15 @@ fn correlated_survivors(
     schema: &Schema,
     plan: &CompiledPlan,
     params: &[Value],
+    // First reserved result slot of THIS level: `subplan_base` at the top,
+    // `sub.sub_base` for a nested subplan. `params[..base]` is `[user ‖ this
+    // level's correlation args]` — the prefix a correlated child inherits — and a
+    // correlated subplan `i`'s result is written to `scratch[base + i]`.
+    base: usize,
     rows: Vec<Vec<Value>>,
     correlated: &[(usize, &SubPlan)],
     post_filter: Option<&ExprProgram>,
 ) -> Result<Vec<(Vec<Value>, Vec<Value>)>> {
-    let base = plan.subplan_base() as usize;
     let n_user = base;
     let mut scratch: Vec<Value> = params.to_vec();
     let mut stack: Vec<Value> = Vec::new();

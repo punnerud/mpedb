@@ -507,93 +507,12 @@ impl CompiledPlan {
             outer_types.extend(get_table(id)?.columns.iter().map(|c| c.ty));
         }
 
-        let correlated: Vec<bool> =
-            self.subplans.iter().map(|s| !s.outer_args.is_empty()).collect();
-
-        let gather_ok = |p: &ExprProgram| -> Result<()> {
-            for i in &p.instrs {
-                if let Instr::PushParam(pi) | Instr::InParam(pi) = *i {
-                    let pi = pi as usize;
-                    if (sub_base..sub_base + self.subplans.len()).contains(&pi)
-                        && correlated[pi - sub_base]
-                    {
-                        return Err(corrupt(
-                            "gather-side program reads a correlated subplan slot",
-                        ));
-                    }
-                }
-            }
-            Ok(())
-        };
-        let key_parts_ok = |a: &AccessPath| -> Result<()> {
-            let mut check = |p: &KeyPart| -> Result<()> {
-                if let KeyPart::Param(i) = p {
-                    let i = *i as usize;
-                    if (sub_base..sub_base + self.subplans.len()).contains(&i)
-                        && correlated[i - sub_base]
-                    {
-                        return Err(corrupt("access path reads a correlated subplan slot"));
-                    }
-                }
-                Ok(())
-            };
-            match a {
-                AccessPath::FullScan => Ok(()),
-                AccessPath::PkPoint(parts) => parts.iter().try_for_each(&mut check),
-                AccessPath::PkRange { lo, hi } => [lo, hi]
-                    .into_iter()
-                    .flatten()
-                    .flat_map(|b| b.parts.iter())
-                    .try_for_each(&mut check),
-                AccessPath::IndexPoint { parts, .. } => parts.iter().try_for_each(&mut check),
-                AccessPath::IndexRange { lo, hi, .. } => [lo, hi]
-                    .into_iter()
-                    .flatten()
-                    .flat_map(|b| b.parts.iter())
-                    .try_for_each(&mut check),
-            }
-        };
-        key_parts_ok(&outer.access)?;
-        if let Some(f) = &outer.filter {
-            gather_ok(f)?;
-        }
-        if let Some(f) = &outer.joined_filter {
-            gather_ok(f)?;
-        }
-        for j in &outer.joins {
-            key_parts_ok(&j.access)?;
-            gather_ok(&j.on)?;
-            if let Some(p) = &j.policy {
-                gather_ok(p)?;
-            }
-        }
-        // An aggregate's own programs are GATHER-side too (#73 §1.2c): the group
-        // keys and aggregate arguments run over the base row, HAVING and the
-        // grouped projection over the collapsed tuple — none has a per-row
-        // correlated slot to read. Only the WHERE (routed to `post_filter`) may.
-        // The projection is checked HERE only for an aggregate: a non-aggregate
-        // projection legitimately reads a correlated slot (a correlated scalar
-        // subquery in the SELECT list).
-        if let Some(agg) = &outer.aggregate {
-            for k in &agg.group_by {
-                if let GroupKey::Expr(p) = k {
-                    gather_ok(p)?;
-                }
-            }
-            for a in &agg.aggs {
-                if let Some(p) = &a.arg {
-                    gather_ok(p)?;
-                }
-            }
-            if let Some(h) = &agg.having {
-                gather_ok(h)?;
-            }
-            for p in &outer.projection {
-                if let Projection::Expr { program, .. } = p {
-                    gather_ok(program)?;
-                }
-            }
-        }
+        // The gather-side slot discipline (a correlated result slot may not be
+        // read by any gather-side program) applies at THIS level's `sub_base` and,
+        // recursively, at each nested subplan's own `sub_base` — factored into one
+        // helper (`check_slot_discipline`) so the top and nested levels (#73 §3
+        // stage 2) cannot drift.
+        self.check_slot_discipline(outer, sub_base, &self.subplans)?;
 
         // Each top subplan (and, recursively, its own nested lifts — #73 §3) is
         // validated against ITS level's parameter space and outer row. The
@@ -623,7 +542,100 @@ impl CompiledPlan {
         Ok(types)
     }
 
-    /// Validate one subplan and, recursively, its nested lifts (#73 §3 stage 1).
+    /// The gather-side SLOT DISCIPLINE for one level of subplans. A CORRELATED
+    /// result slot (at `base + i`, for a subplan with non-empty `outer_args`) is
+    /// filled PER ROW after the gather, so no gather-side program of `sp` — the
+    /// access parts, `filter`, `joined_filter`, a join's `on`/`policy`, or (for
+    /// an aggregate, #73 §1.2c) the group keys / aggregate args / HAVING / grouped
+    /// projection — may read it. `post_filter` and a non-aggregate projection are
+    /// the only readers of a correlated slot. Applied at the top level (`base =
+    /// subplan_base`) and, by `validate_subplan_rec`, at each nested subplan's own
+    /// `base = sub_base`, so every level (#73 §3 stage 2) is checked identically.
+    fn check_slot_discipline(
+        &self,
+        sp: &SelectPlan,
+        base: usize,
+        subplans: &[SubPlan],
+    ) -> Result<()> {
+        let correlated: Vec<bool> = subplans.iter().map(|s| !s.outer_args.is_empty()).collect();
+        let n = subplans.len();
+        let gather_ok = |p: &ExprProgram| -> Result<()> {
+            for i in &p.instrs {
+                if let Instr::PushParam(pi) | Instr::InParam(pi) = *i {
+                    let pi = pi as usize;
+                    if (base..base + n).contains(&pi) && correlated[pi - base] {
+                        return Err(corrupt(
+                            "gather-side program reads a correlated subplan slot",
+                        ));
+                    }
+                }
+            }
+            Ok(())
+        };
+        let key_parts_ok = |a: &AccessPath| -> Result<()> {
+            let mut check = |p: &KeyPart| -> Result<()> {
+                if let KeyPart::Param(i) = p {
+                    let i = *i as usize;
+                    if (base..base + n).contains(&i) && correlated[i - base] {
+                        return Err(corrupt("access path reads a correlated subplan slot"));
+                    }
+                }
+                Ok(())
+            };
+            match a {
+                AccessPath::FullScan => Ok(()),
+                AccessPath::PkPoint(parts) => parts.iter().try_for_each(&mut check),
+                AccessPath::PkRange { lo, hi } => [lo, hi]
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|b| b.parts.iter())
+                    .try_for_each(&mut check),
+                AccessPath::IndexPoint { parts, .. } => parts.iter().try_for_each(&mut check),
+                AccessPath::IndexRange { lo, hi, .. } => [lo, hi]
+                    .into_iter()
+                    .flatten()
+                    .flat_map(|b| b.parts.iter())
+                    .try_for_each(&mut check),
+            }
+        };
+        key_parts_ok(&sp.access)?;
+        if let Some(f) = &sp.filter {
+            gather_ok(f)?;
+        }
+        if let Some(f) = &sp.joined_filter {
+            gather_ok(f)?;
+        }
+        for j in &sp.joins {
+            key_parts_ok(&j.access)?;
+            gather_ok(&j.on)?;
+            if let Some(p) = &j.policy {
+                gather_ok(p)?;
+            }
+        }
+        if let Some(agg) = &sp.aggregate {
+            for k in &agg.group_by {
+                if let GroupKey::Expr(p) = k {
+                    gather_ok(p)?;
+                }
+            }
+            for a in &agg.aggs {
+                if let Some(p) = &a.arg {
+                    gather_ok(p)?;
+                }
+            }
+            if let Some(h) = &agg.having {
+                gather_ok(h)?;
+            }
+            for p in &sp.projection {
+                if let Projection::Expr { program, .. } = p {
+                    gather_ok(program)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate one subplan and, recursively, its nested lifts (#73 §3 stage 2).
     ///
     /// `base_ptypes` are the parameter types of the slots BELOW this subplan's
     /// reserved region — i.e. `[user ‖ … ‖ this subplan's-parent correlation]`,
@@ -664,17 +676,22 @@ impl CompiledPlan {
         {
             return Err(corrupt("scalar subplan must output exactly one column"));
         }
-        // Subplans run through the plain executor too — see the arm rule.
-        if s.plan.post_filter.is_some() {
-            return Err(corrupt("subplan carries a post-filter"));
+        // A `post_filter` is applied per row only when this subplan HAS children
+        // (the executor's leaf path runs the plain `exec_select`, which ignores
+        // it) — so a post-filter with no nested subplans would be silently
+        // dropped. Refuse it, mirroring the top-level "post-filter without
+        // subplans" rule. WITH children (#73 §3 stage 2), the post-filter rides
+        // the per-row fill of the correlated ones; the gather-side discipline for
+        // its slots is enforced by `check_slot_discipline` below.
+        if s.plan.post_filter.is_some() && s.subplans.is_empty() {
+            return Err(corrupt("subplan post-filter without nested subplans"));
         }
-        // Stage 1 is UNCORRELATED nesting: a nested lift may not correlate to any
-        // enclosing row (that is stages 2–3). A correlated child would be filled
-        // per outer row, but the executor fills nested children ONCE — so a plan
-        // claiming one is refused rather than misexecuted.
-        if s.subplans.iter().any(|c| !c.outer_args.is_empty()) {
-            return Err(corrupt("a nested correlated subplan is not supported"));
-        }
+        // #73 §3 stage 2: a nested lift MAY correlate to its IMMEDIATE parent —
+        // this subplan's row — which the executor fills per parent row. Its
+        // `outer_args` are bounds-checked against `s.plan`'s row in the recursion
+        // below; correlation to a MIDDLE/OUTER scope is unrepresentable (an
+        // `outer_arg` names only the immediate parent), so nothing here can encode
+        // it. (Stage 1's blanket refusal of a correlated child is retired.)
         // The inner parameter space: base ‖ this subplan's correlation ‖ its
         // children results. A correlation slot has the OUTER column's type; a
         // child result slot carries the child's declared `slot_type` (so a child
@@ -686,6 +703,9 @@ impl CompiledPlan {
             inner_types.push(c.slot_type);
         }
         self.validate_select(&s.plan, schema, &inner_types)?;
+        // This subplan's OWN children live at `s.sub_base + i`: enforce the same
+        // gather-side slot discipline one level down.
+        self.check_slot_discipline(&s.plan, s.sub_base as usize, &s.subplans)?;
 
         // Recurse: a nested child's base prefix is `[user ‖ … ‖ this
         // correlation]` (width `s.sub_base`), and its outer row is s.plan's row.
