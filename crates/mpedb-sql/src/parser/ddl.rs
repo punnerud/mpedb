@@ -8,7 +8,9 @@
 //! `Parser` are visible to descendants. This file holds only the DDL grammar.
 
 use super::Parser;
-use crate::ddl::{CreatePolicySpec, DdlStmt, RlsAction};
+use crate::ddl::{
+    CreatePolicySpec, CreateTriggerSpec, DdlStmt, RlsAction, TriggerEvent, TriggerTiming,
+};
 use crate::token::{tokenize, Kw, Tok};
 use mpedb_types::{PolicyCmd, Result};
 
@@ -32,6 +34,8 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
                 p.parse_create_index(false)?
             } else if p.eat_word("VIEW") {
                 p.parse_create_view()?
+            } else if p.eat_word("TRIGGER") {
+                p.parse_create_trigger()?
             } else {
                 p.parse_create_policy()?
             }
@@ -42,6 +46,8 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
                 p.parse_drop_table()?
             } else if p.eat_word("VIEW") {
                 p.parse_drop_view()?
+            } else if p.eat_word("TRIGGER") {
+                p.parse_drop_trigger()?
             } else {
                 p.parse_drop_policy()?
             }
@@ -292,6 +298,143 @@ impl<'a> Parser<'a> {
         };
         let name = self.ident("view name")?;
         Ok(DdlStmt::DropView { name, if_exists })
+    }
+
+    /// `CREATE TRIGGER [IF NOT EXISTS] <name> {BEFORE|AFTER}
+    ///    {INSERT|UPDATE [OF cols]|DELETE} ON <table> [FOR EACH ROW]
+    ///    [WHEN (<cond>)] BEGIN <stmt>; END` (DESIGN-TRIGGERS §2). The `WHEN`
+    /// predicate and the `BEGIN … END` body are captured as source text and
+    /// re-compiled by the facade at apply/load time — exactly like a view's
+    /// SELECT and a policy predicate. `INSTEAD OF`, `FOR EACH STATEMENT` and
+    /// `EXECUTE PROCEDURE` are named refusals (later stages / PySpell).
+    fn parse_create_trigger(&mut self) -> Result<DdlStmt> {
+        let if_not_exists = if self.eat_word("IF") {
+            self.expect_kw(Kw::Not, "NOT")?;
+            self.expect_word("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident("trigger name")?;
+        let timing = if self.eat_word("BEFORE") {
+            TriggerTiming::Before
+        } else if self.eat_word("AFTER") {
+            TriggerTiming::After
+        } else if self.eat_word("INSTEAD") {
+            let _ = self.eat_word("OF");
+            return Err(self.err_here(
+                "INSTEAD OF triggers are not supported (they need updatable views)",
+            ));
+        } else {
+            return Err(self.err_here("expected BEFORE, AFTER, or INSTEAD OF"));
+        };
+        let event = if self.eat_kw(Kw::Insert) {
+            TriggerEvent::Insert
+        } else if self.eat_kw(Kw::Delete) {
+            TriggerEvent::Delete
+        } else if self.eat_kw(Kw::Update) {
+            let of = if self.eat_word("OF") {
+                let mut cols = vec![self.ident("column name")?];
+                while self.eat(&Tok::Comma) {
+                    cols.push(self.ident("column name")?);
+                }
+                cols
+            } else {
+                Vec::new()
+            };
+            TriggerEvent::Update { of }
+        } else {
+            return Err(self.err_here("expected INSERT, UPDATE, or DELETE"));
+        };
+        self.expect_kw(Kw::On, "ON")?;
+        let table = self.ident("table name")?;
+        // FOR EACH ROW is the only granularity (accepted, and assumed if
+        // omitted). FOR EACH STATEMENT is a named refusal (Postgres-only).
+        if self.eat_word("FOR") {
+            self.expect_word("EACH")?;
+            if self.eat_word("ROW") {
+                // the only supported granularity
+            } else if self.eat_word("STATEMENT") {
+                return Err(self.err_here(
+                    "FOR EACH STATEMENT triggers are not supported (mpedb has no set-level trigger)",
+                ));
+            } else {
+                return Err(self.err_here("expected ROW or STATEMENT after FOR EACH"));
+            }
+        }
+        let when_src = if self.eat_kw(Kw::When) {
+            Some(self.capture_paren_source()?)
+        } else {
+            None
+        };
+        // Body: `BEGIN <stmt>; … END` (SQL). `EXECUTE PROCEDURE` (PySpell) is a
+        // named refusal until DESIGN-TRIGGERS stage 5.
+        let body_sql = if self.eat_word("EXECUTE") {
+            let _ = self.eat_word("PROCEDURE");
+            return Err(self.err_here(
+                "EXECUTE PROCEDURE (PySpell) trigger bodies are not supported yet",
+            ));
+        } else if self.eat_kw(Kw::Begin) {
+            self.capture_begin_end_source()?
+        } else {
+            return Err(
+                self.err_here("expected BEGIN … END (or EXECUTE PROCEDURE) for the trigger body")
+            );
+        };
+        Ok(DdlStmt::CreateTrigger(CreateTriggerSpec {
+            name,
+            timing,
+            event,
+            table,
+            when_src,
+            body_sql,
+            if_not_exists,
+        }))
+    }
+
+    /// Capture the SOURCE between a trigger's `BEGIN` (already consumed) and its
+    /// matching `END`, balancing nested `CASE … END` (and any nested block) so a
+    /// `CASE` inside the body does not terminate the capture early.
+    fn capture_begin_end_source(&mut self) -> Result<String> {
+        let start = self.here();
+        let mut depth = 1usize;
+        let end_pos = loop {
+            let here = self.here();
+            match self.advance() {
+                Some(Tok::Kw(Kw::Case)) | Some(Tok::Kw(Kw::Begin)) => depth += 1,
+                Some(Tok::Kw(Kw::End)) => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break here;
+                    }
+                }
+                Some(_) => {}
+                None => return Err(self.err_here("unterminated trigger body: expected END")),
+            }
+        };
+        let src = self
+            .src
+            .get(start..end_pos)
+            .unwrap_or("")
+            .trim()
+            .trim_end_matches(';')
+            .trim()
+            .to_string();
+        if src.is_empty() {
+            return Err(self.err_here("trigger body must contain a statement"));
+        }
+        Ok(src)
+    }
+
+    fn parse_drop_trigger(&mut self) -> Result<DdlStmt> {
+        let if_exists = if self.eat_word("IF") {
+            self.expect_word("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident("trigger name")?;
+        Ok(DdlStmt::DropTrigger { name, if_exists })
     }
 
     fn parse_create_index(&mut self, unique: bool) -> Result<DdlStmt> {
