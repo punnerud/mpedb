@@ -905,11 +905,13 @@ impl<'a> Binder<'a> {
             "sqrt" => ScalarFn::Sqrt,
             "pow" | "power" => ScalarFn::Pow,
             "sign" => ScalarFn::Sign,
+            "ceil" | "ceiling" => ScalarFn::Ceil,
+            "floor" => ScalarFn::Floor,
             other => {
                 return Err(bind_err(format!(
                     "unknown function `{other}()`; available: lower, upper, length, trim, \
-                     ltrim, rtrim, replace, instr, abs, round, substr, sqrt, pow, sign, \
-                     coalesce, ifnull, nullif"
+                     ltrim, rtrim, replace, instr, abs, round, ceil, floor, substr, sqrt, \
+                     pow, sign, coalesce, ifnull, nullif"
                 )))
             }
         };
@@ -932,9 +934,9 @@ impl<'a> Binder<'a> {
                 (&[Some(ColumnType::Text)], Some(ColumnType::Text))
             }
             ScalarFn::Length => (&[Some(ColumnType::Text)], Some(ColumnType::Int64)),
-            // abs/round keep their argument's numeric type, so they are checked
-            // below rather than pinned to one.
-            ScalarFn::Abs | ScalarFn::Round => (&[], None),
+            // abs/round/ceil/floor keep their argument's numeric type, so they
+            // are checked below rather than pinned to one.
+            ScalarFn::Abs | ScalarFn::Round | ScalarFn::Ceil | ScalarFn::Floor => (&[], None),
             ScalarFn::Substr => (
                 &[Some(ColumnType::Text), Some(ColumnType::Int64), Some(ColumnType::Int64)],
                 Some(ColumnType::Text),
@@ -974,7 +976,7 @@ impl<'a> Binder<'a> {
             }
         }
         let ret = match f {
-            ScalarFn::Abs | ScalarFn::Round => {
+            ScalarFn::Abs | ScalarFn::Round | ScalarFn::Ceil | ScalarFn::Floor => {
                 // Numeric in, same numeric out. The type is the argument's.
                 let t = self.static_type(&out[0]);
                 match t {
@@ -1013,7 +1015,9 @@ impl<'a> Binder<'a> {
                 Some(ColumnType::Int64)
             }
             BExpr::Call(ScalarFn::Sqrt | ScalarFn::Pow, _) => Some(ColumnType::Float64),
-            BExpr::Call(ScalarFn::Abs | ScalarFn::Round, a) => self.static_type(&a[0]),
+            BExpr::Call(ScalarFn::Abs | ScalarFn::Round | ScalarFn::Ceil | ScalarFn::Floor, a) => {
+                self.static_type(&a[0])
+            }
             BExpr::Call(_, _) => Some(ColumnType::Text),
             _ => None,
         }

@@ -75,7 +75,8 @@ const MAX_JOINS: usize = 16;
 //    additive `ScalarFn` tags in the expr bytes, gated the same way.
 // 15: math scalar fns `sqrt` (12), `pow`/`power` (13), `sign` (14) — same
 //    additive `ScalarFn`-tag gating.
-const PLAN_FORMAT: u8 = 15;
+// 16: `ceil`/`ceiling` (15), `floor` (16) — type-preserving, same gating.
+const PLAN_FORMAT: u8 = 16;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

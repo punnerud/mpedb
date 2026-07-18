@@ -123,6 +123,8 @@ pub enum ScalarFn {
     Sqrt = 12,
     Pow = 13,
     Sign = 14,
+    Ceil = 15,
+    Floor = 16,
 }
 
 impl ScalarFn {
@@ -142,6 +144,8 @@ impl ScalarFn {
             12 => ScalarFn::Sqrt,
             13 => ScalarFn::Pow,
             14 => ScalarFn::Sign,
+            15 => ScalarFn::Ceil,
+            16 => ScalarFn::Floor,
             other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
         })
     }
@@ -153,7 +157,7 @@ impl ScalarFn {
             ScalarFn::Lower | ScalarFn::Upper | ScalarFn::Length | ScalarFn::Trim
             | ScalarFn::Abs => argc == 1,
             ScalarFn::Round | ScalarFn::Ltrim | ScalarFn::Rtrim => argc == 1 || argc == 2,
-            ScalarFn::Sqrt | ScalarFn::Sign => argc == 1,
+            ScalarFn::Sqrt | ScalarFn::Sign | ScalarFn::Ceil | ScalarFn::Floor => argc == 1,
             ScalarFn::Substr => argc == 2 || argc == 3,
             ScalarFn::Instr | ScalarFn::Pow => argc == 2,
             ScalarFn::Replace => argc == 3,
@@ -176,6 +180,8 @@ impl ScalarFn {
             ScalarFn::Sqrt => "sqrt",
             ScalarFn::Pow => "pow",
             ScalarFn::Sign => "sign",
+            ScalarFn::Ceil => "ceil",
+            ScalarFn::Floor => "floor",
         }
     }
 }
@@ -438,6 +444,23 @@ fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
             other => {
                 return Err(Error::TypeMismatch(format!(
                     "sign() expects a number, got {}",
+                    other.type_name()
+                )))
+            }
+        },
+        // ceil/floor preserve the argument's type (sqlite: an integer stays an
+        // integer at any value; a float rounds toward +/-inf as a float).
+        ScalarFn::Ceil | ScalarFn::Floor => match &args[0] {
+            Value::Int(i) => Value::Int(*i),
+            Value::Float(x) => Value::Float(if matches!(f, ScalarFn::Ceil) {
+                x.ceil()
+            } else {
+                x.floor()
+            }),
+            other => {
+                return Err(Error::TypeMismatch(format!(
+                    "{}() expects a number, got {}",
+                    f.name(),
                     other.type_name()
                 )))
             }

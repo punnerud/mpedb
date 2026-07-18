@@ -109,6 +109,13 @@ fn sqrt_pow_sign_match_sqlite() {
     // NULL propagates; a non-number is a compile/runtime error.
     assert_eq!(one(&db, "SELECT sqrt(NULL)"), Value::Null);
     assert!(db.query("SELECT sqrt('x')", &[]).is_err());
+
+    // ceil/floor preserve the argument's type: int stays int, float rounds.
+    assert_eq!(one(&db, "SELECT ceil(5)"), Value::Int(5));
+    assert_eq!(one(&db, "SELECT ceil(1.2)"), Value::Float(2.0));
+    assert_eq!(one(&db, "SELECT ceiling(1.2)"), Value::Float(2.0)); // alias
+    assert_eq!(one(&db, "SELECT floor(-1.5)"), Value::Float(-2.0));
+    assert_eq!(one(&db, "SELECT floor(9)"), Value::Int(9));
     let _ = std::fs::remove_file(&path);
 }
 
