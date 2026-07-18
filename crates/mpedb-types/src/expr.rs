@@ -258,9 +258,9 @@ fn in_items_3vl(probe: &Value, items: &[Value]) -> Result<Value> {
     // `x IN ()` — membership in the EMPTY set — is FALSE for any `x`, NULL
     // included: nothing is a member of nothing (SQL 3VL). This MUST precede the
     // null-probe short-circuit below, or `NULL IN (<empty subquery>)` wrongly
-    // yields NULL where sqlite/PostgreSQL give 0. (A literal `IN ()` never
-    // reaches here — the IR rejects a zero-element `InList` — so this only fires
-    // for an empty subquery/context list.)
+    // yields NULL where sqlite/PostgreSQL give 0. Fires for a literal `IN ()`
+    // (a zero-element `InList`), an empty subquery, and an empty context list
+    // alike — all three share this core.
     if items.is_empty() {
         return Ok(Value::Bool(false));
     }
@@ -982,14 +982,11 @@ fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                     Instr::InParam(_) => (1, 1),
                     Instr::Cast(_) => (1, 1),
                     Instr::Concat => (2, 1),
-                    // n list elements plus the probe beneath them. n == 0 would be
-                    // a no-op leaving the probe posing as a bool — refuse it.
-                    Instr::InList(nl) => {
-                        if nl == 0 {
-                            return Err(Error::Corrupt("IN list with zero elements".into()));
-                        }
-                        (nl as usize + 1, 1)
-                    }
+                    // n list elements plus the probe beneath them. n == 0 is the
+                    // empty set `x IN ()`: eval pops the probe and pushes FALSE
+                    // (`in_items_3vl` on an empty slice), so it is a valid (1, 1)
+                    // op — NOT a no-op that leaves the probe posing as a bool.
+                    Instr::InList(nl) => (nl as usize + 1, 1),
                     Instr::Neg | Instr::Not | Instr::IsNull | Instr::IsNotNull | Instr::ToFloat => {
                         (1, 1)
                     }
@@ -1531,12 +1528,18 @@ mod in_list_tests {
         }
     }
 
-    /// A zero-arity InList would leave the probe on the stack posing as the
-    /// result — a bool-shaped hole. The verifier must refuse the program.
+    /// `x IN ()` — the empty set — is FALSE for every probe, NULL included
+    /// (SQL 3VL). A zero-arity InList pops the probe and pushes that FALSE, so
+    /// the verifier ACCEPTS the program and eval yields Bool(false), never the
+    /// probe left posing as a bool.
     #[test]
-    fn zero_arity_in_list_is_corrupt_not_a_silent_noop() {
-        let r = ExprProgram::new(vec![Instr::PushCol(0), Instr::InList(0)], vec![]);
-        assert!(matches!(r, Err(Error::Corrupt(_))), "got {r:?}");
+    fn zero_arity_in_list_is_empty_set_false() {
+        for probe in [Value::Int(5), Value::Null] {
+            let got = prog(vec![Instr::PushConst(0), Instr::InList(0)], vec![probe.clone()])
+                .eval(&[], &[])
+                .unwrap();
+            assert_eq!(got, Value::Bool(false), "{probe:?} IN () must be FALSE");
+        }
     }
 
     #[test]
