@@ -159,7 +159,15 @@ const MAX_JOINS: usize = 16;
 //     declaration is refused at parse time (stage 1b); a Binary comparison still
 //     emits the plain nullary opcode, so only genuinely-collated plans carry the
 //     new opcodes.
-const PLAN_FORMAT: u8 = 28;
+// 29: `CAST` becomes sqlite's permissive, affinity-based conversion. The
+//     `Instr::Cast` payload BYTE changes meaning: it was a `ColumnType`
+//     discriminant (1-7); it is now an `Affinity` (1=Integer, 2=Real, 3=Text,
+//     4=Blob, 5=Numeric). Same width (one byte), but a format-28 `Cast` byte
+//     would decode to the WRONG conversion (e.g. old Bool=3 → new Text=3) and,
+//     worse, old strict `Cast(Int64)` plans would now prefix-parse text — so the
+//     whole-plan version gates it: a format-28 blob fails CLOSED at byte 0 with
+//     `PlanInvalidated` and is re-prepared under the new semantics.
+const PLAN_FORMAT: u8 = 29;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

@@ -79,6 +79,93 @@ impl fmt::Display for ColumnType {
     }
 }
 
+/// sqlite's five type *affinities* — the target of `CAST(x AS <type>)`.
+///
+/// Unlike a [`ColumnType`], an affinity is not a storage type: it is a
+/// conversion *rule*. sqlite accepts ANY type name in a cast and folds it to
+/// one of these five by a substring scan of the name (`from_type_name`), then
+/// converts the value permissively (leading-numeric-prefix parses, truncation,
+/// text rendering) rather than rejecting. mpedb matches that behaviour so the
+/// sqllogictest corpus' `CAST(.. AS SIGNED/DECIMAL/VARCHAR/…)` no longer errors
+/// on an unknown target name.
+///
+/// The mapping onto mpedb's typed [`Value`]s (applied by `cast_value`):
+/// `Integer`→`Int`, `Real`→`Float`, `Text`→`Text`, `Blob`→`Blob`, and
+/// `Numeric`→`Int` when the result is integral (else `Float`) — exactly sqlite's
+/// `NUMERIC` affinity, whose runtime type is decided per value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[repr(u8)]
+pub enum Affinity {
+    Integer = 1,
+    Real = 2,
+    Text = 3,
+    Blob = 4,
+    Numeric = 5,
+}
+
+impl Affinity {
+    pub fn from_tag(tag: u8) -> Option<Affinity> {
+        Some(match tag {
+            1 => Affinity::Integer,
+            2 => Affinity::Real,
+            3 => Affinity::Text,
+            4 => Affinity::Blob,
+            5 => Affinity::Numeric,
+            _ => return None,
+        })
+    }
+
+    /// The SQL type name → affinity rule, a faithful port of sqlite's
+    /// `sqlite3AffinityType`: scan the name left-to-right keeping a rolling
+    /// 32-bit window; the default is `Numeric`. `INT` (once seen, anywhere)
+    /// wins and terminates; `CHAR`/`CLOB`/`TEXT` force `Text`; `BLOB` forces
+    /// `Blob` only while still `Numeric`/`Real`; `REAL`/`FLOA`/`DOUB` force
+    /// `Real` only while still `Numeric`. An empty name stays `Numeric` (as in
+    /// sqlite — NOT `Blob`). Multi-word names (`DOUBLE PRECISION`,
+    /// `UNSIGNED BIG INT`) scan as their joined text.
+    pub fn from_type_name(name: &str) -> Affinity {
+        let mut aff = Affinity::Numeric;
+        let mut h: u32 = 0;
+        const CHAR: u32 = u32::from_be_bytes(*b"char");
+        const CLOB: u32 = u32::from_be_bytes(*b"clob");
+        const TEXT: u32 = u32::from_be_bytes(*b"text");
+        const BLOB: u32 = u32::from_be_bytes(*b"blob");
+        const REAL: u32 = u32::from_be_bytes(*b"real");
+        const FLOA: u32 = u32::from_be_bytes(*b"floa");
+        const DOUB: u32 = u32::from_be_bytes(*b"doub");
+        const INT: u32 = 0x0069_6e74; // "int" in the low 24 bits
+        for &b in name.as_bytes() {
+            h = (h << 8).wrapping_add(b.to_ascii_lowercase() as u32);
+            if h == CHAR || h == CLOB || h == TEXT {
+                aff = Affinity::Text;
+            } else if h == BLOB && matches!(aff, Affinity::Numeric | Affinity::Real) {
+                aff = Affinity::Blob;
+            } else if (h == REAL || h == FLOA || h == DOUB) && aff == Affinity::Numeric {
+                aff = Affinity::Real;
+            } else if (h & 0x00ff_ffff) == INT {
+                return Affinity::Integer;
+            }
+        }
+        aff
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Affinity::Integer => "INTEGER",
+            Affinity::Real => "REAL",
+            Affinity::Text => "TEXT",
+            Affinity::Blob => "BLOB",
+            Affinity::Numeric => "NUMERIC",
+        }
+    }
+}
+
+impl fmt::Display for Affinity {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.name())
+    }
+}
+
 /// A single SQL value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {

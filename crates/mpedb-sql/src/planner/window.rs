@@ -88,7 +88,7 @@ fn lift_windows(e: &ast::Expr, specs: &mut Vec<WindowCollect>) -> Result<ast::Ex
             E::Col(format!("__w{slot}"))
         }
         E::Unary(op, a) => E::Unary(*op, Box::new(rec(a, specs)?)),
-        E::Cast(a, t) => E::Cast(Box::new(rec(a, specs)?), *t),
+        E::Cast(a, t) => E::Cast(Box::new(rec(a, specs)?), t.clone()),
         E::IsNull(a, n) => E::IsNull(Box::new(rec(a, specs)?), *n),
         E::Binary(op, a, b) => E::Binary(*op, Box::new(rec(a, specs)?), Box::new(rec(b, specs)?)),
         E::IsDistinct(a, b, n) => {

@@ -398,27 +398,40 @@ fn encode_decode_roundtrip_and_corrupt_safety() {
 
 #[test]
 fn cast_and_concat_semantics_and_codec() {
-    let cast = |v: Value, t: ColumnType| {
-        prog(vec![Instr::PushParam(0), Instr::Cast(t)], vec![]).eval(&[], &[v])
+    use crate::value::Affinity;
+    let cast = |v: Value, aff: Affinity| {
+        prog(vec![Instr::PushParam(0), Instr::Cast(aff)], vec![]).eval(&[], &[v])
     };
-    // NULL casts to NULL of every type.
-    assert_eq!(cast(Value::Null, ColumnType::Int64).unwrap(), Value::Null);
-    assert_eq!(cast(Value::Null, ColumnType::Blob).unwrap(), Value::Null);
+    // NULL casts to NULL for every affinity.
+    assert_eq!(cast(Value::Null, Affinity::Integer).unwrap(), Value::Null);
+    assert_eq!(cast(Value::Null, Affinity::Blob).unwrap(), Value::Null);
     // float→int truncates toward zero (sqlite's rule), NaN/inf saturate
     // deterministically instead of being UB.
-    assert_eq!(cast(Value::Float(-1.9), ColumnType::Int64).unwrap(), Value::Int(-1));
-    assert_eq!(cast(Value::Float(f64::NAN), ColumnType::Int64).unwrap(), Value::Int(0));
+    assert_eq!(cast(Value::Float(-1.9), Affinity::Integer).unwrap(), Value::Int(-1));
+    assert_eq!(cast(Value::Float(f64::NAN), Affinity::Integer).unwrap(), Value::Int(0));
     assert_eq!(
-        cast(Value::Float(f64::INFINITY), ColumnType::Int64).unwrap(),
+        cast(Value::Float(f64::INFINITY), Affinity::Integer).unwrap(),
         Value::Int(i64::MAX)
     );
-    assert_eq!(cast(Value::Int(3), ColumnType::Float64).unwrap(), Value::Float(3.0));
-    assert_eq!(cast(Value::Int(-7), ColumnType::Text).unwrap(), Value::Text("-7".into()));
-    assert_eq!(cast(Value::Bool(true), ColumnType::Int64).unwrap(), Value::Int(1));
-    assert_eq!(cast(Value::Int(0), ColumnType::Bool).unwrap(), Value::Bool(false));
-    // The strictness line: text never parses into a number.
-    assert!(cast(Value::Text("12".into()), ColumnType::Int64).is_err());
-    assert!(cast(Value::Blob(vec![1]), ColumnType::Text).is_err());
+    assert_eq!(cast(Value::Int(3), Affinity::Real).unwrap(), Value::Float(3.0));
+    assert_eq!(cast(Value::Int(-7), Affinity::Text).unwrap(), Value::Text("-7".into()));
+    assert_eq!(cast(Value::Bool(true), Affinity::Integer).unwrap(), Value::Int(1));
+    // Permissive text→number: a leading numeric prefix parses; INTEGER stops at
+    // the first non-digit, REAL takes the float prefix, NUMERIC decides int/real.
+    assert_eq!(cast(Value::Text("12ab".into()), Affinity::Integer).unwrap(), Value::Int(12));
+    assert_eq!(cast(Value::Text("1e3".into()), Affinity::Integer).unwrap(), Value::Int(1));
+    assert_eq!(cast(Value::Text("abc".into()), Affinity::Integer).unwrap(), Value::Int(0));
+    assert_eq!(cast(Value::Text("1e3".into()), Affinity::Real).unwrap(), Value::Float(1000.0));
+    assert_eq!(cast(Value::Text("3.5".into()), Affinity::Numeric).unwrap(), Value::Float(3.5));
+    assert_eq!(cast(Value::Text("3.0".into()), Affinity::Numeric).unwrap(), Value::Int(3));
+    // A real VALUE stays real under NUMERIC even when integral.
+    assert_eq!(cast(Value::Float(3.0), Affinity::Numeric).unwrap(), Value::Float(3.0));
+    // real→text uses sqlite's %!.15g; int→blob is the bytes of its text.
+    assert_eq!(cast(Value::Float(2.9), Affinity::Text).unwrap(), Value::Text("2.9".into()));
+    assert_eq!(cast(Value::Int(90), Affinity::Blob).unwrap(), Value::Blob(b"90".to_vec()));
+    assert_eq!(cast(Value::Blob(b"A".to_vec()), Affinity::Text).unwrap(), Value::Text("A".into()));
+    // The one deviation: a non-UTF-8 blob has no mpedb TEXT representation.
+    assert!(cast(Value::Blob(vec![0xff]), Affinity::Text).is_err());
 
     let cat = |a: Value, b: Value| {
         prog(
@@ -434,11 +447,11 @@ fn cast_and_concat_semantics_and_codec() {
     assert_eq!(cat(Value::Text("x".into()), Value::Null).unwrap(), Value::Null);
     assert!(cat(Value::Text("x".into()), Value::Float(1.5)).is_err());
 
-    // codec: roundtrip, truncation safety, and a bad CAST type tag.
+    // codec: roundtrip, truncation safety, and a bad CAST affinity tag.
     let p = prog(
         vec![
             Instr::PushCol(0),
-            Instr::Cast(ColumnType::Text),
+            Instr::Cast(Affinity::Text),
             Instr::PushCol(1),
             Instr::Concat,
         ],
