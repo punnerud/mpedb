@@ -936,6 +936,42 @@ impl<'a> Binder<'a> {
             );
             return self.bind_expr(&case);
         }
+        // `iif(c, a, b)` is control flow — exactly `CASE WHEN c THEN a ELSE b
+        // END`. Desugared here (like nullif) so the CASE path owns the
+        // bool-condition rule and the laziness, and iif never NULL-propagates.
+        if name == "iif" {
+            if args.len() != 3 {
+                return Err(bind_err("iif() takes exactly 3 arguments"));
+            }
+            let case = ast::Expr::Case(
+                vec![(args[0].clone(), args[1].clone())],
+                Some(Box::new(args[2].clone())),
+            );
+            return self.bind_expr(&case);
+        }
+        // `char(X1, …, Xn)` is variadic and every argument is an integer code
+        // point, so it is bound here rather than through the fixed-arity `want`
+        // table below — each argument is pinned/checked to int64 individually.
+        if name == "char" {
+            let mut out = Vec::with_capacity(args.len());
+            for a in args {
+                let (e, t) = self.bind_expr(a)?;
+                let (e, t) = self.unify_param(e, t, ColumnType::Int64);
+                match t {
+                    Some(ColumnType::Int64) | None => {}
+                    Some(other) => {
+                        return Err(bind_err(format!(
+                            "char() arguments must be int64 code points, got {other}"
+                        )))
+                    }
+                }
+                out.push(e);
+            }
+            if u8::try_from(out.len()).is_err() {
+                return Err(bind_err("char() takes at most 255 arguments"));
+            }
+            return Ok((BExpr::Call(ScalarFn::Char, out), Some(ColumnType::Text)));
+        }
         let f = match name {
             "lower" => ScalarFn::Lower,
             "upper" => ScalarFn::Upper,
@@ -953,11 +989,15 @@ impl<'a> Binder<'a> {
             "sign" => ScalarFn::Sign,
             "ceil" | "ceiling" => ScalarFn::Ceil,
             "floor" => ScalarFn::Floor,
+            "unicode" => ScalarFn::Unicode,
+            "hex" => ScalarFn::Hex,
+            "typeof" => ScalarFn::Typeof,
             other => {
                 return Err(bind_err(format!(
                     "unknown function `{other}()`; available: lower, upper, length, trim, \
-                     ltrim, rtrim, replace, instr, abs, round, ceil, floor, substr, sqrt, \
-                     pow, sign, coalesce, ifnull, nullif"
+                     ltrim, rtrim, replace, instr, substr, substring, char, unicode, hex, \
+                     typeof, abs, round, ceil, floor, sqrt, pow, sign, iif, coalesce, ifnull, \
+                     nullif"
                 )))
             }
         };
@@ -976,10 +1016,13 @@ impl<'a> Binder<'a> {
         // `$1` gets a type and a wrong type is a COMPILE error rather than a
         // per-row surprise.
         let (want, ret): (&[Option<ColumnType>], Ty) = match f {
-            ScalarFn::Lower | ScalarFn::Upper | ScalarFn::Trim => {
+            ScalarFn::Lower | ScalarFn::Upper => {
                 (&[Some(ColumnType::Text)], Some(ColumnType::Text))
             }
-            ScalarFn::Length => (&[Some(ColumnType::Text)], Some(ColumnType::Int64)),
+            // length/unicode: text in, integer out.
+            ScalarFn::Length | ScalarFn::Unicode => {
+                (&[Some(ColumnType::Text)], Some(ColumnType::Int64))
+            }
             // abs/round/ceil/floor keep their argument's numeric type, so they
             // are checked below rather than pinned to one.
             ScalarFn::Abs | ScalarFn::Round | ScalarFn::Ceil | ScalarFn::Floor => (&[], None),
@@ -991,8 +1034,8 @@ impl<'a> Binder<'a> {
                 &[Some(ColumnType::Text), Some(ColumnType::Text), Some(ColumnType::Text)],
                 Some(ColumnType::Text),
             ),
-            // ltrim/rtrim: text, and an optional text set of trim characters.
-            ScalarFn::Ltrim | ScalarFn::Rtrim => {
+            // trim/ltrim/rtrim: text, and an optional text set of trim chars.
+            ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => {
                 (&[Some(ColumnType::Text), Some(ColumnType::Text)], Some(ColumnType::Text))
             }
             ScalarFn::Instr => {
@@ -1002,6 +1045,14 @@ impl<'a> Binder<'a> {
             // ALWAYS return a float; sign always returns an integer.
             ScalarFn::Sqrt | ScalarFn::Pow => (&[], Some(ColumnType::Float64)),
             ScalarFn::Sign => (&[], Some(ColumnType::Int64)),
+            // hex accepts text OR blob — two types the fixed `want` table
+            // cannot express — so its argument is left unpinned and checked in
+            // the `ret` recomputation below. typeof accepts ANY type. Both
+            // return text.
+            ScalarFn::Hex | ScalarFn::Typeof => (&[], Some(ColumnType::Text)),
+            // char is variadic and bound specially above (never reached here);
+            // present only so this match stays exhaustive over ScalarFn.
+            ScalarFn::Char => (&[], Some(ColumnType::Text)),
         };
         let mut out = Vec::with_capacity(bound.len());
         for (i, (e, t)) in bound.into_iter().enumerate() {
@@ -1032,6 +1083,14 @@ impl<'a> Binder<'a> {
                     }
                 }
             }
+            // hex accepts text or blob (like the runtime); reject anything else
+            // at COMPILE time rather than at the first row.
+            ScalarFn::Hex => match self.static_type(&out[0]) {
+                Some(ColumnType::Text) | Some(ColumnType::Blob) | None => Some(ColumnType::Text),
+                Some(other) => {
+                    return Err(bind_err(format!("hex() expects text or blob, got {other}")))
+                }
+            },
             _ => ret,
         };
         Ok((BExpr::Call(f, out), ret))
@@ -1057,9 +1116,10 @@ impl<'a> Binder<'a> {
             }
             BExpr::Param(i) => self.param_types[*i as usize],
             BExpr::Unary(BUnOp::ToFloat, _) => Some(ColumnType::Float64),
-            BExpr::Call(ScalarFn::Length | ScalarFn::Instr | ScalarFn::Sign, _) => {
-                Some(ColumnType::Int64)
-            }
+            BExpr::Call(
+                ScalarFn::Length | ScalarFn::Instr | ScalarFn::Sign | ScalarFn::Unicode,
+                _,
+            ) => Some(ColumnType::Int64),
             BExpr::Call(ScalarFn::Sqrt | ScalarFn::Pow, _) => Some(ColumnType::Float64),
             BExpr::Call(ScalarFn::Abs | ScalarFn::Round | ScalarFn::Ceil | ScalarFn::Floor, a) => {
                 self.static_type(&a[0])

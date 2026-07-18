@@ -98,7 +98,14 @@ const MAX_JOINS: usize = 16;
 //     a format-19 blob decoded here (or a format-20 blob decoded by a format-19
 //     binary) fails CLOSED at byte 0 with `PlanInvalidated`, the documented
 //     re-prepare path, never a misread of the new shape.
-const PLAN_FORMAT: u8 = 20;
+// 21: batch of scalar fns — `char` (17), `unicode` (18), `hex` (19), `typeof`
+//     (20) as additive `ScalarFn` tags, plus `trim(x, y)` (the 2-arg form now
+//     passes `arity_ok`). A format-20 reader hits an unknown scalar tag in
+//     `ScalarFn::from_tag` (or rejects the new Trim arity) and reports the plan
+//     as corrupt rather than misreading it — same additive gating as the
+//     scalar-fn bumps 14-16. `iif` rides along with no new tag: it desugars to
+//     a CASE, exactly like `nullif`.
+const PLAN_FORMAT: u8 = 21;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
