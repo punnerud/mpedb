@@ -14,6 +14,7 @@ pub mod value;
 
 pub use config::{
     Concurrency, Config, DbOptions, Durability, FilePerms, WorkspaceConfig, WorkspaceMember,
+    DEFAULT_MAX_WORK_ROWS,
 };
 pub use error::{Error, Result};
 pub mod agg;

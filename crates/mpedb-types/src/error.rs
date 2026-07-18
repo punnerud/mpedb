@@ -92,6 +92,19 @@ pub enum Error {
     WriteConflict,
     DivisionByZero,
     ArithmeticOverflow,
+    /// A statement exceeded its deterministic per-execution work budget (#74):
+    /// `used` work-rows crossed `limit` while evaluating `which` (a coarse but
+    /// correct attribution of where the work went — a scan, a nested-loop join,
+    /// a correlated subquery, or a recursive CTE). Distinct from `Corrupt`: the
+    /// data is fine, the query is a runaway. Deterministic — the same query over
+    /// the same data trips at the same `used` on every machine — so it is
+    /// reproducible and CI-stable, unlike a wall-clock timeout. Raise
+    /// `[runtime] max_work_rows` in the config to allow more.
+    RuntimeBudget {
+        limit: u64,
+        used: u64,
+        which: String,
+    },
     Unsupported(String),
     /// A write targeted a table that is currently write-blocked (frozen) by the
     /// CDC control record — e.g. the mirror froze it during an authority switch
@@ -148,6 +161,12 @@ impl fmt::Display for Error {
             }
             Error::DivisionByZero => write!(f, "division by zero"),
             Error::ArithmeticOverflow => write!(f, "arithmetic overflow"),
+            Error::RuntimeBudget { limit, used, which } => write!(
+                f,
+                "runtime budget exceeded: {used} work-rows > limit {limit} while \
+                 evaluating {which}; raise [runtime] max_work_rows in the config to \
+                 allow more"
+            ),
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
             Error::Frozen { table_id } => {
                 write!(f, "table {table_id} is write-blocked (mirror frozen)")

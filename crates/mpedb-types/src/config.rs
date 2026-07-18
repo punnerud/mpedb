@@ -96,6 +96,13 @@ pub struct DbOptions {
     /// format self-describes (`vkind=2` cells), so processes with different
     /// thresholds only differ in what NEW writes do.
     pub extent_threshold: Option<usize>,
+    /// Per-statement-execution runtime budget in "work rows" (#74,
+    /// design/DESIGN-RUNTIME-BUDGET.md): rows yielded by scans, nested-loop join
+    /// candidates, and correlated-subquery re-evaluations. `0` = unlimited. A
+    /// per-process execution option like `durability`, NOT a file-frozen
+    /// property, so it lives here rather than in the schema. Absent in config ⇒
+    /// [`DEFAULT_MAX_WORK_ROWS`].
+    pub max_work_rows: u64,
     /// Names of tables declared `require_policy = true` (DESIGN-MULTIDB §6.3).
     /// A prepare touching one of these fails closed unless RLS is enabled AND a
     /// policy governs the command being compiled — the answer to "one forgotten
@@ -116,12 +123,40 @@ pub struct Config {
     pub schema: Schema,
 }
 
+/// The deterministic per-statement-execution work budget default (#74). One
+/// billion work-rows is far above any legitimate query on an embedded database,
+/// yet a genuine runaway (an accidental cross join, an unbounded correlated
+/// subquery) crosses it long before it exhausts memory — a backstop, not a
+/// quota. `0` in config means unlimited; the finite default is what makes a
+/// runaway caught-by-default (see design/DESIGN-RUNTIME-BUDGET.md).
+pub const DEFAULT_MAX_WORK_ROWS: u64 = 1_000_000_000;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
     database: RawDatabase,
     #[serde(default, rename = "table")]
     tables: Vec<RawTable>,
+    /// Optional `[runtime]` section (#74). Applies to this single database.
+    #[serde(default)]
+    runtime: Option<RawRuntime>,
+}
+
+/// The `[runtime]` TOML section (#74): per-process execution limits.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawRuntime {
+    /// Deterministic work-row budget per statement execution; `0` = unlimited.
+    /// Absent ⇒ [`DEFAULT_MAX_WORK_ROWS`].
+    #[serde(default)]
+    max_work_rows: Option<u64>,
+}
+
+impl RawRuntime {
+    fn resolve(this: Option<&RawRuntime>) -> u64 {
+        this.and_then(|r| r.max_work_rows)
+            .unwrap_or(DEFAULT_MAX_WORK_ROWS)
+    }
 }
 
 #[derive(Deserialize)]
@@ -249,7 +284,8 @@ impl Config {
     pub fn from_toml_str(text: &str) -> Result<Config> {
         let raw: RawConfig =
             toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
-        raw_to_config(raw.database, raw.tables)
+        let max_work_rows = RawRuntime::resolve(raw.runtime.as_ref());
+        raw_to_config(raw.database, raw.tables, max_work_rows)
     }
 
     pub fn from_file(path: &std::path::Path) -> Result<Config> {
@@ -261,7 +297,7 @@ impl Config {
 /// Build a validated single-database `Config` from one `[database]` section and
 /// its declared tables. Shared by the single-file path and each `Workspace`
 /// member so validation is identical everywhere (design/DESIGN-MULTIDB.md §1.2).
-fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>) -> Result<Config> {
+fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>, max_work_rows: u64) -> Result<Config> {
         if db.path.is_empty() {
             return Err(Error::Config("database.path must be set".into()));
         }
@@ -399,6 +435,7 @@ fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>) -> Result<Config> {
                     Some(kb) => Some(kb as usize * 1024),
                     None => default_extent_threshold(),
                 },
+                max_work_rows,
                 require_policy,
             },
             schema: Schema::new(tables)?,
@@ -474,6 +511,10 @@ impl RawMember {
 struct RawWorkspace {
     #[serde(rename = "database")]
     databases: Vec<RawMember>,
+    /// Workspace-wide `[runtime]` section (#74): the same work budget applies to
+    /// every member (a per-process execution option, not a per-file property).
+    #[serde(default)]
+    runtime: Option<RawRuntime>,
 }
 
 impl WorkspaceConfig {
@@ -493,6 +534,7 @@ impl WorkspaceConfig {
                         "workspace must declare at least one [[database]] member".into(),
                     ));
                 }
+                let max_work_rows = RawRuntime::resolve(raw.runtime.as_ref());
                 let mut members = Vec::with_capacity(raw.databases.len());
                 let mut seen_alias = std::collections::HashSet::new();
                 let mut seen_path = std::collections::HashSet::new();
@@ -511,7 +553,7 @@ impl WorkspaceConfig {
                     if !seen_alias.insert(alias.clone()) {
                         return Err(Error::Config(format!("duplicate database alias `{alias}`")));
                     }
-                    let config = raw_to_config(db, tables)?;
+                    let config = raw_to_config(db, tables, max_work_rows)?;
                     if !seen_path.insert(config.options.path.clone()) {
                         return Err(Error::Config(format!(
                             "two workspace members map to the same file `{}`",
@@ -739,6 +781,27 @@ path = "/dev/shm/shared.mpedb"
         }
         let bad = SAMPLE.replace("durability = \"none\"", "durability = \"walrus\"");
         assert!(Config::from_toml_str(&bad).is_err());
+    }
+
+    #[test]
+    fn parses_runtime_max_work_rows() {
+        // absent [runtime] ⇒ the finite default (caught-by-default guard)
+        assert_eq!(
+            Config::from_toml_str(SAMPLE).unwrap().options.max_work_rows,
+            DEFAULT_MAX_WORK_ROWS
+        );
+        // explicit value
+        let cfg = Config::from_toml_str(&format!("{SAMPLE}\n[runtime]\nmax_work_rows = 42"))
+            .unwrap();
+        assert_eq!(cfg.options.max_work_rows, 42);
+        // 0 = unlimited sentinel, preserved verbatim
+        let cfg0 = Config::from_toml_str(&format!("{SAMPLE}\n[runtime]\nmax_work_rows = 0"))
+            .unwrap();
+        assert_eq!(cfg0.options.max_work_rows, 0);
+        // unknown key in [runtime] is rejected (deny_unknown_fields)
+        assert!(
+            Config::from_toml_str(&format!("{SAMPLE}\n[runtime]\nmax_time_ms = 5")).is_err()
+        );
     }
 
     #[test]

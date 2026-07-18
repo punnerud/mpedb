@@ -178,6 +178,9 @@ pub(crate) fn create_mirror_db(
             // A mirror file carries no RLS assertions: the mirror applier runs
             // at the engine level, BELOW policies, by design (DESIGN-MIRROR §0).
             extent_threshold: mpedb_types::config::default_extent_threshold(),
+            // The mirror applier is a trusted bulk path; keep the standard
+            // default guard (#74) rather than disabling it.
+            max_work_rows: mpedb_types::config::DEFAULT_MAX_WORK_ROWS,
             require_policy: Default::default(),
             perms: FilePerms {
                 mode: None,
