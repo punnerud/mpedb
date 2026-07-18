@@ -273,6 +273,51 @@ impl Database {
         Ok(ExecResult::Affected(0))
     }
 
+    /// `CREATE [UNIQUE] INDEX … ON t (cols)`. Resolves the columns, treats an
+    /// identical existing index as a no-op (idempotent — covers `IF NOT
+    /// EXISTS`), then builds the index over the existing rows in one commit.
+    pub(crate) fn apply_create_index(
+        &self,
+        table: &str,
+        columns: &[String],
+        unique: bool,
+    ) -> Result<ExecResult> {
+        self.engine.refresh_schema_if_stale()?;
+        let bundle = self.engine.schema();
+        let id = bundle
+            .schema
+            .table_id(table)
+            .ok_or_else(|| Error::Bind(format!("CREATE INDEX: no such table `{table}`")))?;
+        let t = bundle.schema.table(id).expect("table_id resolved");
+        let cols: Vec<u16> = columns
+            .iter()
+            .map(|name| {
+                t.columns
+                    .iter()
+                    .position(|c| &c.name == name)
+                    .map(|i| i as u16)
+                    .ok_or_else(|| {
+                        Error::Bind(format!("CREATE INDEX on `{table}`: no column `{name}`"))
+                    })
+            })
+            .collect::<Result<_>>()?;
+        // Idempotent by shape: an identical index already present is a no-op.
+        if t.indexes.iter().any(|ix| ix.columns == cols && ix.unique == unique) {
+            return Ok(ExecResult::Affected(0));
+        }
+        let mut w = self.engine.begin_write()?;
+        match w.create_index(id, cols, unique) {
+            Ok(()) => w.commit()?,
+            Err(e) => {
+                w.abort();
+                return Err(e);
+            }
+        }
+        self.cache.write().expect(POISON).clear();
+        let _ = self.engine.reload_schema_from_catalog();
+        Ok(ExecResult::Affected(0))
+    }
+
     /// Apply a parsed DDL statement. Table DDL routes to the dedicated appliers
     /// above; RLS DDL (CREATE/DROP POLICY, ALTER TABLE ... ROW LEVEL SECURITY)
     /// takes the writer lock once and bumps the table's policy epoch. Returns
@@ -300,6 +345,9 @@ impl Database {
             }
             DdlStmt::AlterDropColumn { table, column } => {
                 return self.apply_alter_drop_column(&table, &column);
+            }
+            DdlStmt::CreateIndex { table, columns, unique, .. } => {
+                return self.apply_create_index(&table, &columns, unique);
             }
             DdlStmt::CreatePolicy(spec) => {
                 let def = mpedb_types::PolicyDef {

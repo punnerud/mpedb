@@ -219,6 +219,41 @@ impl Schema {
         Ok(schema)
     }
 
+    /// Evolve this schema by ADDING a secondary index (CREATE INDEX). The
+    /// caller builds the index tree over existing rows. `columns` are ordinals
+    /// into the table's columns, in key order. Errors on an unknown column, an
+    /// index-count overflow, or an identical index already present (the caller
+    /// treats "already exists" as a no-op for idempotency / `IF NOT EXISTS`).
+    pub fn with_added_index(&self, table_id: u32, index: IndexDef) -> Result<Schema> {
+        let mut tables = self.tables.clone();
+        let slot = tables
+            .get_mut(table_id as usize)
+            .filter(|t| t.id == table_id && !t.dead)
+            .ok_or_else(|| Error::Schema(format!("no live table with id {table_id}")))?;
+        for &c in &index.columns {
+            if c as usize >= slot.columns.len() {
+                return Err(Error::Schema(format!(
+                    "CREATE INDEX on `{}`: column ordinal {c} out of range",
+                    slot.name
+                )));
+            }
+        }
+        if slot
+            .indexes
+            .iter()
+            .any(|ix| ix.columns == index.columns && ix.unique == index.unique)
+        {
+            return Err(Error::Schema(format!(
+                "an identical index already exists on table `{}`",
+                slot.name
+            )));
+        }
+        slot.indexes.push(index);
+        let schema = Schema { tables };
+        schema.validate()?;
+        Ok(schema)
+    }
+
     /// Evolve this schema by RENAMING a table (#47 stage 5). Pure metadata: the
     /// id, columns, keys, indexes, and all row data are untouched — only the
     /// name changes. `validate` rejects a collision with another live table.

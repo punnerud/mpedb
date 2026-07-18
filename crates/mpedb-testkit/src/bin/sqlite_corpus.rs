@@ -1576,6 +1576,18 @@ fn exec_sql(db: &Database, sql: &str) -> Result<ExecResult, String> {
     let db = std::panic::AssertUnwindSafe(db);
     let sql_owned = sql.to_string();
     std::panic::catch_unwind(move || {
+        // Live DDL (CREATE INDEX, ALTER, …) is not a plannable statement — the
+        // facade applies it on the `query()` path, so route it there. The
+        // detached prepare/execute path (which compiles to a plan) is used for
+        // everything else.
+        let first = sql_owned
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_uppercase();
+        if matches!(first.as_str(), "CREATE" | "DROP" | "ALTER") {
+            return db.query(&sql_owned, &[]).map_err(|e| e.to_string());
+        }
         let plan = db.prepare_detached(&sql_owned).map_err(|e| e.to_string())?;
         db.execute_detached(&plan, &[]).map_err(|e| e.to_string())
     })
