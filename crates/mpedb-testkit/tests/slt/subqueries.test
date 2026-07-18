@@ -187,9 +187,40 @@ SELECT count(*) FROM t1 WHERE b > (SELECT avg(b) FROM t1)
 ----
 2
 
+# ---- #73 §1: aggregate over a correlated filter -----------------------------------------
+# The correlated WHERE residual runs per outer row BEFORE accumulation, so the
+# aggregate counts only the rows that pass EXISTS/the scalar test.
+
+# count(*) over a correlated EXISTS: rows with a strictly smaller b exist for
+# b in {20,30,40} — three of the four rows.
+query I nosort
+SELECT count(*) FROM t1 WHERE EXISTS (SELECT 1 FROM t1 AS x WHERE x.b < t1.b)
+----
+3
+
+# The GROUP BY form: one group per surviving c.
+query II nosort
+SELECT c, count(*) FROM t1 WHERE EXISTS (SELECT 1 FROM t1 AS x WHERE x.b < t1.b) GROUP BY c ORDER BY c
+----
+200
+1
+300
+1
+400
+1
+
+# A scalar-correlated filter under an aggregate.
+query I nosort
+SELECT count(*) FROM t1 WHERE (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b) >= 2
+----
+2
+
 # ---- refusals say what and why -----------------------------------------------------------
 
-statement error aggregate query is not supported yet
+# A correlated subquery in an aggregate query is admitted ONLY in WHERE: in the
+# SELECT list (here), an aggregate argument, GROUP BY or HAVING it has no single
+# value once the rows are grouped.
+statement error only supported in WHERE
 SELECT count(*), (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b) FROM t1
 
 statement error nested subqueries

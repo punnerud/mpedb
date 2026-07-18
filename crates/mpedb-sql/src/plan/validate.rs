@@ -509,13 +509,6 @@ impl CompiledPlan {
 
         let correlated: Vec<bool> =
             self.subplans.iter().map(|s| !s.outer_args.is_empty()).collect();
-        let any_correlated = correlated.iter().any(|&c| c);
-        // Aggregation consumes rows inside the gather phase; per-row slot
-        // filling happens after it. The planner refuses the combination —
-        // a blob claiming it is forged.
-        if any_correlated && outer.aggregate.is_some() {
-            return Err(corrupt("correlated subplans in an aggregate statement"));
-        }
 
         let gather_ok = |p: &ExprProgram| -> Result<()> {
             for i in &p.instrs {
@@ -572,6 +565,33 @@ impl CompiledPlan {
             gather_ok(&j.on)?;
             if let Some(p) = &j.policy {
                 gather_ok(p)?;
+            }
+        }
+        // An aggregate's own programs are GATHER-side too (#73 §1.2c): the group
+        // keys and aggregate arguments run over the base row, HAVING and the
+        // grouped projection over the collapsed tuple — none has a per-row
+        // correlated slot to read. Only the WHERE (routed to `post_filter`) may.
+        // The projection is checked HERE only for an aggregate: a non-aggregate
+        // projection legitimately reads a correlated slot (a correlated scalar
+        // subquery in the SELECT list).
+        if let Some(agg) = &outer.aggregate {
+            for k in &agg.group_by {
+                if let GroupKey::Expr(p) = k {
+                    gather_ok(p)?;
+                }
+            }
+            for a in &agg.aggs {
+                if let Some(p) = &a.arg {
+                    gather_ok(p)?;
+                }
+            }
+            if let Some(h) = &agg.having {
+                gather_ok(h)?;
+            }
+            for p in &outer.projection {
+                if let Projection::Expr { program, .. } = p {
+                    gather_ok(program)?;
+                }
             }
         }
 
