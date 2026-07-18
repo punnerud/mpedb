@@ -1633,6 +1633,13 @@ fn exec_stmt_rest(
              use Database::begin() and WriteSession::commit()/rollback()"
                 .into(),
         )),
+        PlanStmt::Savepoint(_) | PlanStmt::Release(_) | PlanStmt::RollbackTo(_) => {
+            Err(Error::Unsupported(
+                "SAVEPOINT/RELEASE/ROLLBACK TO are handled by the write session, \
+                 not executed as a plan; run them through WriteSession::query()"
+                    .into(),
+            ))
+        }
     }
 }
 

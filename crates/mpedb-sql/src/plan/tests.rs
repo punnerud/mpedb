@@ -63,6 +63,12 @@ fn sample_sqls() -> Vec<&'static str> {
         "BEGIN",
         "COMMIT",
         "ROLLBACK",
+        // Savepoint control statements carry a name in the plan bytes, so they
+        // must survive encode/decode/hash AND the decoder's truncation/bit-flip
+        // fuzz (a corrupt length or non-utf8 name must Err, never panic).
+        "SAVEPOINT my_point",
+        "RELEASE my_point",
+        "ROLLBACK TO my_point",
     ]
 }
 

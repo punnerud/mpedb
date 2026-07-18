@@ -373,9 +373,49 @@ impl<'a> Parser<'a> {
             }
             Some(Tok::Kw(Kw::Rollback)) => {
                 self.pos += 1;
-                Ok(Stmt::Rollback)
+                // `ROLLBACK [TRANSACTION] [TO [SAVEPOINT] <name>]`. `TRANSACTION`,
+                // `TO` and `SAVEPOINT` are positional words (not keywords), so a
+                // column named `to`/`transaction`/`savepoint` is unaffected.
+                self.eat_word("TRANSACTION");
+                if self.eat_word("TO") {
+                    self.eat_word("SAVEPOINT");
+                    let name = self.savepoint_name("a savepoint name after ROLLBACK TO")?;
+                    Ok(Stmt::RollbackTo(name))
+                } else {
+                    Ok(Stmt::Rollback)
+                }
             }
-            _ => Err(self.err_here("expected a statement (SELECT, VALUES, INSERT, UPDATE, DELETE, BEGIN, COMMIT, ROLLBACK)")),
+            _ => {
+                // `SAVEPOINT`/`RELEASE` are positional words (like `WITH`), so a
+                // table/column named `savepoint`/`release` is unaffected.
+                if self.eat_word("SAVEPOINT") {
+                    let name = self.savepoint_name("a savepoint name after SAVEPOINT")?;
+                    Ok(Stmt::Savepoint(name))
+                } else if self.eat_word("RELEASE") {
+                    self.eat_word("SAVEPOINT");
+                    let name = self.savepoint_name("a savepoint name after RELEASE")?;
+                    Ok(Stmt::Release(name))
+                } else {
+                    Err(self.err_here(
+                        "expected a statement (SELECT, VALUES, INSERT, UPDATE, DELETE, \
+                         BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE)",
+                    ))
+                }
+            }
+        }
+    }
+
+    /// A savepoint name: a bare/quoted identifier or a string literal (sqlite
+    /// accepts all three). Comparison for RELEASE/ROLLBACK TO is
+    /// case-insensitive (see the write session), matching sqlite.
+    fn savepoint_name(&mut self, what: &str) -> Result<String> {
+        match self.peek() {
+            Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_)) => self.ident(what),
+            Some(Tok::Str(_)) => match self.advance() {
+                Some(Tok::Str(s)) => Ok(s),
+                _ => unreachable!(),
+            },
+            _ => Err(self.err_here(format!("expected {what}"))),
         }
     }
 }

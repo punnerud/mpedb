@@ -171,10 +171,15 @@ impl<'db> ProcEngine<'db> {
                 .map_err(|e| at(format!("embedded SQL failed to compile: {e}")))?;
             if matches!(
                 plan.stmt,
-                PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback
+                PlanStmt::Begin
+                    | PlanStmt::Commit
+                    | PlanStmt::Rollback
+                    | PlanStmt::Savepoint(_)
+                    | PlanStmt::Release(_)
+                    | PlanStmt::RollbackTo(_)
             ) {
                 return Err(at(
-                    "BEGIN/COMMIT/ROLLBACK cannot appear inside a procedure; \
+                    "BEGIN/COMMIT/ROLLBACK/SAVEPOINT cannot appear inside a procedure; \
                      the whole procedure already is one transaction"
                         .into(),
                 ));

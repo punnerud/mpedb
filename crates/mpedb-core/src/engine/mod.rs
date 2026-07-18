@@ -115,7 +115,7 @@ mod debug_tests;
 mod tests;
 
 pub use read::{ReadTxn, RowCursor};
-pub use write::{TxnSavepoint, WriteTxn};
+pub use write::{TxnSavepoint, TxnSavepointFull, WriteTxn};
 use write::DirtySet;
 
 /// Deferred-fsync interval for `durability = async` (§5.4.2), env-overridable

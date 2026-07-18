@@ -789,6 +789,23 @@ fn decode_stmt_rest(tag: u8, buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
         STMT_BEGIN => Ok(PlanStmt::Begin),
         STMT_COMMIT => Ok(PlanStmt::Commit),
         STMT_ROLLBACK => Ok(PlanStmt::Rollback),
+        STMT_SAVEPOINT => Ok(PlanStmt::Savepoint(decode_savepoint_name(buf, pos)?)),
+        STMT_RELEASE => Ok(PlanStmt::Release(decode_savepoint_name(buf, pos)?)),
+        STMT_ROLLBACK_TO => Ok(PlanStmt::RollbackTo(decode_savepoint_name(buf, pos)?)),
         t => Err(corrupt(format!("bad statement tag {t}"))),
     }
+}
+
+/// A u16-length-prefixed, non-empty, valid-UTF-8 savepoint name from an
+/// untrusted blob. Every read is bounds-checked (via [`take`]).
+fn decode_savepoint_name(buf: &[u8], pos: &mut usize) -> Result<String> {
+    let n = r_u16(buf, pos)? as usize;
+    let b = take(buf, pos, n)?;
+    let name = std::str::from_utf8(b)
+        .map_err(|_| corrupt("savepoint name is not valid utf-8"))?
+        .to_string();
+    if name.is_empty() {
+        return Err(corrupt("empty savepoint name"));
+    }
+    Ok(name)
 }
