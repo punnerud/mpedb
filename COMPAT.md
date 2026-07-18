@@ -83,7 +83,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | Scalar subqueries `(SELECT …)` | ✅ | uncorrelated and correlated; 0 rows → NULL; **>1 row is an error** (PostgreSQL's rule — sqlite silently takes the first row) |
 | [NOT] EXISTS (…) | ✅ | uncorrelated and correlated |
 | `x IN (SELECT …)` | ✅ | uncorrelated; the subquery becomes a LIST subplan over the same runtime-typed 3VL membership core as IN lists (empty → FALSE, NULL member without a match → NULL — sqlite-verified); correlated IN is refused with the EXISTS rewrite named |
-| Subqueries in FROM (derived tables) | ❌ | |
+| Subqueries in FROM (derived tables) | 🚧 | a simple projection/filter body `FROM (SELECT … FROM t [WHERE …]) d` is flattened onto its base at bind time (WHERE merged; the derived alias `d` is kept, so `d.col` refs resolve; joins over the derived table work). Aggregate/join/DISTINCT/LIMIT/renamed-projection bodies are refused (never answered wrongly) — Stage A ([DESIGN-DERIVED-TABLES.md](DESIGN-DERIVED-TABLES.md)) |
 | Nested subqueries (subquery in a subquery) | ❌ | refused with a message |
 | Window functions | ❌ | |
 

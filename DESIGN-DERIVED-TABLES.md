@@ -1,6 +1,21 @@
 # DESIGN-DERIVED-TABLES — subquery in `FROM` (#74)
 
-**Status: design, not built.** After live DDL, `CREATE VIEW`, `INSERT … SELECT`,
+**Status: Stage B SHIPPED (2026-07-18); Stage A still open.** A simple
+projection/filter derived table `FROM (SELECT …) t` is flattened onto its base
+at bind time by `crate::view` — the AST carries an optional `from_derived`
+which the view-inline pass splices away (merge WHERE, keep the derived alias,
+remap the body's own qualifier onto it) BEFORE planning, so the planner and
+executor are untouched. Aggregate/join/DISTINCT/LIMIT/renamed-projection bodies
+are refused (never answered wrongly); those are Stage A. Verified against sqlite
+3.45 (`crates/mpedb/tests/derived_table.rs`) and the corpus `index/view` sets
+(zero wrong, zero error-mismatch). Stage A (materialized derived tables) below
+remains the follow-up for the complex bodies.
+
+The original design follows.
+
+## Original context
+
+After live DDL, `CREATE VIEW`, `INSERT … SELECT`,
 and the scalar/aggregate batch, the single largest remaining sqllogictest
 blocker is the `subquery` category (~9 168 blocked statements over the full
 corpus). Almost all of it is one missing shape: a **derived table** — a subquery

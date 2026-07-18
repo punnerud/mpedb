@@ -446,18 +446,37 @@ impl<'a> Parser<'a> {
         // FROM is optional (sqlite/PG): `SELECT 3+5` reads no table and
         // evaluates over ONE synthetic empty row. WHERE/ORDER BY/LIMIT
         // still parse below -- sqlite allows `SELECT 3 WHERE 1`.
-        let (table, from_alias, joins) = if self.eat_kw(Kw::From) {
-            // `FROM ( a JOIN b ON … )` — parens around a join group. For the
-            // left-deep chains this grammar builds they are associativity no-ops,
-            // so opening parens are counted and their closers consumed between
-            // join steps. (A paren group as the INNER side of a join — `a JOIN
-            // (b JOIN c)` — is NOT expressible left-deep and stays a parse error.)
-            let mut from_parens = 0usize;
-            while self.eat(&Tok::LParen) {
-                from_parens += 1;
-            }
-            let table = self.ident("table name")?;
-            let from_alias = self.opt_table_alias()?;
+        let (table, from_derived, from_alias, joins) = if self.eat_kw(Kw::From) {
+            // A `(` immediately followed by SELECT is a derived table
+            // `FROM (SELECT …) [AS] alias` (#74) — distinct from a `( join
+            // group )`, whose paren wraps table names. The view-inline pass
+            // flattens a simple derived body before planning; the rest refuse.
+            let (table, from_derived, from_alias, mut from_parens) = if self.peek()
+                == Some(&Tok::LParen)
+                && matches!(self.peek_at(1), Some(Tok::Kw(Kw::Select)))
+            {
+                self.expect(&Tok::LParen, "(")?;
+                let inner = self.select_core()?;
+                self.expect(&Tok::RParen, "`)` to close the derived table")?;
+                // The alias names the derived columns; the flatten enforces
+                // that one is present (accept bare or `AS` form here).
+                let from_alias = self.opt_table_alias()?;
+                (None, Some(Box::new(inner)), from_alias, 0usize)
+            } else {
+                // `FROM ( a JOIN b ON … )` — parens around a join group. For the
+                // left-deep chains this grammar builds they are associativity
+                // no-ops, so opening parens are counted and their closers
+                // consumed between join steps. (A paren group as the INNER side
+                // of a join — `a JOIN (b JOIN c)` — is NOT expressible left-deep
+                // and stays a parse error.)
+                let mut from_parens = 0usize;
+                while self.eat(&Tok::LParen) {
+                    from_parens += 1;
+                }
+                let table = self.ident("table name")?;
+                let from_alias = self.opt_table_alias()?;
+                (Some(table), None, from_alias, from_parens)
+            };
             let mut joins = Vec::new();
             // ONE left-deep chain where `,` and the JOIN keywords are equal
             // separators — sqlite's FROM grammar, and the corpus interleaves them
@@ -524,9 +543,9 @@ impl<'a> Parser<'a> {
             if from_parens > 0 {
                 return Err(self.err_here("unclosed `(` in FROM"));
             }
-            (Some(table), from_alias, joins)
+            (table, from_derived, from_alias, joins)
         } else {
-            (None, None, Vec::new())
+            (None, None, None, Vec::new())
         };
         let where_clause = if self.eat_kw(Kw::Where) {
             Some(self.expr()?)
@@ -590,6 +609,7 @@ impl<'a> Parser<'a> {
         };
         Ok(SelectStmt {
             table,
+            from_derived,
             alias: from_alias,
             joins,
             distinct,
@@ -1125,6 +1145,7 @@ impl<'a> Parser<'a> {
                 let tname = self.ident("table name after IN")?;
                 let inner = SelectStmt {
                     table: Some(tname),
+                    from_derived: None,
                     alias: None,
                     joins: Vec::new(),
                     distinct: false,

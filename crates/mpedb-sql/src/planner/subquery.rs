@@ -98,6 +98,7 @@ pub(super) fn lift_subqueries(
     };
     let stmt = ast::SelectStmt {
         table: s.table.clone(),
+        from_derived: None,
         alias: s.alias.clone(),
         joins: s
             .joins
@@ -279,6 +280,7 @@ impl Lift<'_> {
         };
         let rewritten = ast::SelectStmt {
             table: inner.table.clone(),
+            from_derived: None,
             alias: inner.alias.clone(),
             joins: inner
                 .joins
