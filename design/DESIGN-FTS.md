@@ -1,8 +1,10 @@
 # DESIGN-FTS — full-text search + the `MATCH` operator (sqlite FTS5 equivalence)
 
-**Status: design (2026-07-18). Prior-art gathered, staging fixed, not yet built. Design-first
-discipline, same as DESIGN-DDL / DESIGN-TRIGGERS / DESIGN-SQLITE-BACKED — adversarial review of the
-wire/index layout (§7) is required before stage 1 ships.**
+**Status: STAGE 1 SHIPPED (2026-07-18, #76, PLAN_FORMAT 25, schema canonical-bytes v4). Stages 2–3
+remain design. The wire/index layout (§7) is implemented as described below and carries
+truncation-at-every-offset decode tests (`mpedb-types/src/fts.rs`); an adversarial review of that
+layout is still warranted before stage 2 builds on it. See §8 for exactly what shipped vs.
+deferred.**
 
 ## 0. The compat fact this closes
 
@@ -143,3 +145,52 @@ Every stage is differential-tested against `sqlite3` 3.45 (FTS5 present) row-for
 own tests (own-code discipline). COMPAT.md `MATCH` row: ❌ → 🚧 (stage 1–2) → ✅ (stage 3); the
 "loadable extensions / virtual tables" row stays ❌ with a note that FTS5 specifically is native, the
 general vtable plugin ABI is a deliberate non-goal.
+
+## 8.1 What stage 1 actually shipped (2026-07-18)
+
+**Storage / maintenance.** `TableKind::Fts { tokenizer }` in the schema (canonical-bytes v4: a table
+gains a kind discriminant after its `dead` byte; the SEED-hash / dense-id / validate invariants all
+hold, and an FTS table is validated to be a single INTEGER `rowid` PK + TEXT content columns, no
+secondary indexes). `CREATE VIRTUAL TABLE ft USING fts5(cols [, tokenize='unicode61'|'ascii'])`
+parses (`parser/ddl.rs`) and applies through the live-DDL path (`ddl_apply.rs`), building an auto
+`rowid` INTEGER-PK content table. The inverted index lives at a reserved `index_no`
+(`FTS_INDEX_NO`, engine `fts.rs`); it is seeded by `create_table`, torn down by `drop_table`,
+discovered by the page-accounting verifier's catalog prefix scan, and maintained **in the row txn**
+by `insert_row`/`update_by_pk`/`delete_by_pk` (a NULL column contributes no postings). Optimistic
+blind-apply is disabled for FTS tables (they have no `TableDef.indexes`, so the row path is the only
+place the index is maintained). **Posting wire layout** (`mpedb-types/src/fts.rs`, §7): key =
+`term_utf8 ‖ 0x00 ‖ colno_be_u16`; value = a count-prefixed delta-varint doclist — `n:uvarint`, then
+per doc `zigzag(docid-delta), n_pos:uvarint, (uvarint pos-delta)*`. The leading count makes every
+proper-prefix truncation a clean `Corrupt` (tested at every offset). Tokenizers: `unicode61`
+(Unicode alnum split, casefold, common-Latin diacritic fold) and `ascii` (a-z/0-9 + high bytes kept,
+ASCII casefold only).
+
+**Query.** `MATCH` is a `Kw`/AST node (`Expr::Match`) parsed at comparison precedence. It is NOT a
+boolean: the binder errors on ANY `Expr::Match` it sees (*unable to use function MATCH in the
+requested context*), and the planner intercepts the ONE legal shape first — a top-level WHERE `AND`
+conjunct `<col-or-table> MATCH 'literal'` against the single FROM table — turning it into
+`AccessPath::FtsScan { query }` (plan format 25; recursive bounds-checked encode/decode/validate,
+footprint = table-level read). The literal is parsed (`planner/fts.rs`) into an `FtsQuery` tree with
+terms normalized by the table's frozen tokenizer: bare terms, `AND`/`OR`/`NOT` + implicit-AND, parens
+(precedence NOT > AND > OR), prefix `term*`, column filter `col:` / `{a b}:`, initial `^`. Execution
+(`exec/fts.rs`) is posting-list set algebra — AND intersects (driven by the rarer side), OR merges,
+`X NOT Y` differences — over the inverted-index prefix scans (`ReadTxn::fts_prefix`), charging the
+#74 work meter per posting entry visited, yielding rowids ascending; `gather_rows` then fetches each
+row by PK and applies the residual WHERE / RLS filter.
+
+**Deliberate stage-1 deviations (documented; each is a clean error, never a wrong answer):**
+- **Explicit `rowid` required on insert.** mpedb has no auto-increment PK; an FTS `INSERT` must
+  supply `rowid`. **Stage 1b:** auto-assign `max(rowid)+1` (a `DefaultExpr::AutoRowid` on the rowid
+  column, filled at insert exec + a `validate` relaxation), matching sqlite's omitted-rowid insert.
+- **`MATCH` must be a top-level `AND` conjunct against the single FROM table.** `MATCH` inside an
+  `OR`, a second `MATCH` conjunct, or `MATCH` with a join is refused (sqlite answers some of these
+  via vtable OR-union / multi-constraint). **Stage 1b/2:** multi-`MATCH` intersection and MATCH-in-OR.
+- **`SELECT *`** on an fts table returns `rowid` first (it is a real column here); sqlite hides it.
+- unicode61 diacritic folding covers the common Latin set, not sqlite's full Unicode table.
+
+**Follow-up (noted, not done):** the multi-process **SIGKILL crash test** for FTS atomicity — a CLI
+`crash --fts` / `powerloss --fts` workload proving the index and content commit atomically under a
+kill at every instant (§7 crash story). Stage 1 proves atomicity/durability at unit level only
+(`fts.rs::index_and_content_persist_across_reopen` — build, close, reopen from the file, MATCH still
+finds the rows), since the index rides the base row's ordinary COW+WAL commit. Add the CLI harness
+before relying on FTS under power loss.

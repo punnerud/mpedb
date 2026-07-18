@@ -89,6 +89,7 @@ pub(crate) enum Kw {
     Like,
     Glob,
     Regexp,
+    Match,
     True,
     False,
 }
@@ -140,6 +141,7 @@ fn keyword(word: &str) -> Option<Kw> {
         "LIKE" => Kw::Like,
         "GLOB" => Kw::Glob,
         "REGEXP" => Kw::Regexp,
+        "MATCH" => Kw::Match,
         "IN" => Kw::In,
         "TRUE" => Kw::True,
         "FALSE" => Kw::False,

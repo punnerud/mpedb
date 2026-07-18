@@ -213,6 +213,14 @@ pub(crate) enum Expr {
     IsDistinct(Box<Expr>, Box<Expr>, bool),
     /// `lhs LIKE pattern`.
     Like(Box<Expr>, Box<Expr>),
+    /// `<col-or-table> MATCH <literal>` — FTS5 full-text search
+    /// (design/DESIGN-FTS.md §3). Unlike LIKE/GLOB, MATCH is NOT a boolean
+    /// expression: it is usable ONLY as a top-level WHERE conjunct against an
+    /// FTS table, compiling to an `FtsScan` access path. Anywhere else — a scalar
+    /// context, a non-FTS column, a SELECT-list item — it is an ERROR (identical
+    /// to sqlite's "unable to use function MATCH in the requested context"),
+    /// enforced by the binder. There is no `NOT MATCH` in sqlite.
+    Match(Box<Expr>, Box<Expr>),
     /// `lhs [NOT] GLOB pattern` — sqlite's case-SENSITIVE `*`/`?`/`[...]`
     /// matcher. Carries `negated` (`NOT GLOB`), unlike [`Expr::Like`]: the
     /// bool is the whole difference from that node's shape.

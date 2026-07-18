@@ -303,8 +303,23 @@ pub(super) fn plan_select(
     for (i, ty) in slot_types.iter().enumerate() {
         binder.pin_param(n_params + i as u16, *ty);
     }
-    let bound_where = s
-        .where_clause
+    // FTS: a top-level `<col-or-table> MATCH 'literal'` conjunct against an FTS
+    // table compiles to an FtsScan access path BEFORE binding (the whole-row form
+    // `ft MATCH …` names the TABLE, which the binder cannot resolve as a column).
+    // The conjunct is removed from the WHERE; the rest binds normally, and any
+    // leftover MATCH (a second one, or one inside an OR) is rejected by the
+    // binder with sqlite's exact error. `None` ⇒ no MATCH, ordinary path.
+    let table_ref: String = s.alias.clone().or_else(|| s.table.clone()).unwrap_or_default();
+    let fts = if s.table.is_some() {
+        super::fts::extract_fts_where(s.where_clause.as_ref(), table, &table_ref)?
+    } else {
+        None
+    };
+    let where_ast: Option<ast::Expr> = match &fts {
+        Some((_, residual)) => residual.clone(),
+        None => s.where_clause.clone(),
+    };
+    let bound_where = where_ast
         .as_ref()
         .map(|e| binder.bind_predicate(e))
         .transpose()?;
@@ -328,10 +343,12 @@ pub(super) fn plan_select(
     // `PkPoint([])` on a table that does not exist is exactly the "keyed
     // access on a FROM-less select" shape validate refuses. FullScan + the
     // whole predicate as residual is the only honest plan.
-    let (access, residual) = if s.table.is_some() {
-        extract_access(merge_and(bound_where, policy), table, consts)?
-    } else {
-        (AccessPath::FullScan, merge_and(bound_where, policy))
+    let (access, residual) = match &fts {
+        // FtsScan already chosen; the remaining WHERE (and any SELECT policy)
+        // becomes the per-row residual filter over the matched rows.
+        Some((fts_access, _)) => (fts_access.clone(), merge_and(bound_where, policy)),
+        None if s.table.is_some() => extract_access(merge_and(bound_where, policy), table, consts)?,
+        None => (AccessPath::FullScan, merge_and(bound_where, policy)),
     };
     let filter = residual.map(|e| compile_program(&e)).transpose()?;
     let post_filter = post_where.map(|e| compile_program(&e)).transpose()?;
