@@ -5,6 +5,27 @@ use std::path::PathBuf;
 
 use crate::Database;
 
+/// Base directory for scratch databases: `/dev/shm` (mpedb's natural tmpfs
+/// habitat, and fast) when it exists, else the platform temp dir. The fallback
+/// is what keeps these tests portable to macOS, where `/dev/shm` does not exist
+/// (#66). On Linux the choice is unchanged.
+pub(crate) fn scratch_dir() -> PathBuf {
+    if std::path::Path::new("/dev/shm").is_dir() {
+        PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    }
+}
+
+/// Full scratch path for `name` under [`scratch_dir`], as a `String` — these
+/// call sites splice it straight into a TOML `path = "..."`.
+pub(crate) fn scratch_path(name: impl std::fmt::Display) -> String {
+    scratch_dir()
+        .join(name.to_string())
+        .to_string_lossy()
+        .into_owned()
+}
+
 /// Anything test-owned, plus the files it must take with it when it dies.
 ///
 /// Generic over the handle rather than tied to `Database`, because the leak was

@@ -8,8 +8,20 @@ struct Tmp { db: Database, path: String }
 impl Deref for Tmp { type Target = Database; fn deref(&self) -> &Database { &self.db } }
 impl Drop for Tmp { fn drop(&mut self) { let _ = std::fs::remove_file(&self.path); let _ = std::fs::remove_file(format!("{}-wal", self.path)); } }
 
+/// `/dev/shm` when present (fast tmpfs, mpedb's habitat), else the platform
+/// temp dir — keeps the scratch path portable to macOS, where `/dev/shm` does
+/// not exist (#66).
+fn scratch_path(name: String) -> String {
+    let dir = if std::path::Path::new("/dev/shm").is_dir() {
+        std::path::PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    };
+    dir.join(name).to_string_lossy().into_owned()
+}
+
 fn db() -> Tmp {
-    let path = format!("/dev/shm/mpedb-insfile-{}.mpedb", std::process::id());
+    let path = scratch_path(format!("mpedb-insfile-{}.mpedb", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let cfg = format!(
         "[database]\npath = \"{path}\"\nsize_mb = 64\n\
@@ -31,7 +43,7 @@ fn anon_kib() -> u64 {
 fn copy_a_file_into_mpedb_and_read_it_back() {
     // an 8 MiB file with a checkable pattern
     let n = 8 * 1024 * 1024usize;
-    let src_path = format!("/dev/shm/mpedb-src-{}.bin", std::process::id());
+    let src_path = scratch_path(format!("mpedb-src-{}.bin", std::process::id()));
     {
         let mut f = std::fs::File::create(&src_path).unwrap();
         let chunk: Vec<u8> = (0..4096u32).map(|i| i as u8).collect();

@@ -58,8 +58,20 @@ primary_key = ["id"]
   check = "age >= 0 AND age < 150"
 "#;
 
+/// `/dev/shm` when present (fast tmpfs, mpedb's habitat), else the platform
+/// temp dir — keeps the scratch path portable to macOS, where `/dev/shm` does
+/// not exist (#66).
+fn scratch_path(name: String) -> String {
+    let dir = if std::path::Path::new("/dev/shm").is_dir() {
+        std::path::PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    };
+    dir.join(name).to_string_lossy().into_owned()
+}
+
 fn open(tag: &str) -> Tmp {
-    let path = format!("/dev/shm/mpedb-guide-{tag}-{}.mpedb", std::process::id());
+    let path = scratch_path(format!("mpedb-guide-{tag}-{}.mpedb", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}-wal"));
     let toml = format!("[database]\npath = \"{path}\"\n{}", GUIDE_CONFIG.replacen("\n[database]\n", "\n", 1));
@@ -286,7 +298,7 @@ primary_key = ["oid"]
 "#;
 
 fn open_shop(tag: &str) -> Tmp {
-    let path = format!("/dev/shm/mpedb-guide-{tag}-{}.mpedb", std::process::id());
+    let path = scratch_path(format!("mpedb-guide-{tag}-{}.mpedb", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let toml = format!(
         "[database]\npath = \"{path}\"\nsize_mb = 16\nmax_readers = 8\n{SHOP_CONFIG}"
@@ -385,7 +397,7 @@ fn aggregates_and_joins() {
 /// GUIDE.md § Large values: stream them.
 #[test]
 fn stream_a_file_in() {
-    let path = format!("/dev/shm/mpedb-guide-blob-{}.mpedb", std::process::id());
+    let path = scratch_path(format!("mpedb-guide-blob-{}.mpedb", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let toml = format!(
         "[database]\npath = \"{path}\"\nsize_mb = 16\n\
@@ -398,7 +410,7 @@ fn stream_a_file_in() {
 
     // A stand-in for "a big file on disk" — the memory ceiling is proven at
     // 8 MiB in tests/insert_file.rs; the guide only shows the call shape.
-    let src = format!("/dev/shm/mpedb-guide-blob-src-{}", std::process::id());
+    let src = scratch_path(format!("mpedb-guide-blob-src-{}", std::process::id()));
     std::fs::write(&src, vec![7u8; 128 * 1024]).unwrap();
 
     // The guide's snippet: the `&[][..]` placeholder marks the streamed

@@ -1330,10 +1330,13 @@ primary_key = ["id"]
 /// over the column SET. The verifier proves the trees stay accounted.
 #[test]
 fn composite_indexes_are_maintained_and_unique_enforces() {
-    let path = std::path::PathBuf::from(format!(
-        "/dev/shm/mpedb-core-composite-{}.mpedb",
-        std::process::id()
-    ));
+    let base = std::path::Path::new("/dev/shm");
+    let dir = if base.is_dir() {
+        base.to_path_buf()
+    } else {
+        std::env::temp_dir()
+    };
+    let path = dir.join(format!("mpedb-core-composite-{}.mpedb", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let toml = format!(
         r#"

@@ -360,7 +360,8 @@ mod tests {
     use mpedb_types::{Config, Error as E, Value};
 
     fn db(tag: &str) -> crate::testdb::TestDb {
-        let path = format!("/dev/shm/mpedb-rls-{tag}-{}.mpedb", std::process::id());
+        let path =
+            crate::testdb::scratch_path(format!("mpedb-rls-{tag}-{}.mpedb", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let cfg = Config::from_toml_str(&format!(
             "[database]\npath = \"{path}\"\nsize_mb = 8\n\
@@ -440,7 +441,8 @@ mod tests {
 
     /// Same schema, but `orders` is declared tenant-scoped.
     fn db_requiring(tag: &str) -> crate::testdb::TestDb {
-        let path = format!("/dev/shm/mpedb-rls-{tag}-{}.mpedb", std::process::id());
+        let path =
+            crate::testdb::scratch_path(format!("mpedb-rls-{tag}-{}.mpedb", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let cfg = Config::from_toml_str(&format!(
             "[database]\npath = \"{path}\"\nsize_mb = 8\n\
@@ -519,7 +521,8 @@ mod tests {
     /// nothing forever.
     #[test]
     fn require_policy_naming_an_unknown_table_fails_at_open() {
-        let path = format!("/dev/shm/mpedb-rls-req-typo-{}.mpedb", std::process::id());
+        let path =
+            crate::testdb::scratch_path(format!("mpedb-rls-req-typo-{}.mpedb", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let cfg = Config::from_toml_str(&format!(
             "[database]\npath = \"{path}\"\nsize_mb = 8\n\
@@ -584,7 +587,8 @@ mod tests {
     /// attribute. On an RLS table those collapse to one opaque `WriteRejected`.
     #[test]
     fn rls_hides_which_constraint_a_hidden_row_collided_with() {
-        let path = format!("/dev/shm/mpedb-rls-oracle-{}.mpedb", std::process::id());
+        let path =
+            crate::testdb::scratch_path(format!("mpedb-rls-oracle-{}.mpedb", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let cfg = Config::from_toml_str(&format!(
             "[database]\npath = \"{path}\"\nsize_mb = 8\n\
@@ -673,7 +677,8 @@ mod tests {
     /// `orders(id PK, tenant, code UNIQUE)` — the shape the lint exists for:
     /// a PK that does not lead with `tenant`, and a tenant-spanning unique.
     fn db_leaky(tag: &str) -> crate::testdb::TestDb {
-        let path = format!("/dev/shm/mpedb-rls-{tag}-{}.mpedb", std::process::id());
+        let path =
+            crate::testdb::scratch_path(format!("mpedb-rls-{tag}-{}.mpedb", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let cfg = Config::from_toml_str(&format!(
             "[database]\npath = \"{path}\"\nsize_mb = 8\n\
@@ -706,7 +711,8 @@ mod tests {
     /// A tenant-leading PK and no tenant-spanning unique ⇒ nothing to say.
     #[test]
     fn lint_is_silent_when_the_key_leads_with_the_discriminator() {
-        let path = format!("/dev/shm/mpedb-rls-lint-ok-{}.mpedb", std::process::id());
+        let path =
+            crate::testdb::scratch_path(format!("mpedb-rls-lint-ok-{}.mpedb", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let _guard = crate::testdb::Owned::new((), vec![path.clone().into()]);
         let cfg = Config::from_toml_str(&format!(
@@ -912,7 +918,8 @@ mod tests {
     /// A two-table database for the join tests: `orders` and `lines`, each
     /// tenant-scoped.
     fn joindb(tag: &str) -> crate::testdb::TestDb {
-        let path = format!("/dev/shm/mpedb-rlsj-{tag}-{}.mpedb", std::process::id());
+        let path =
+            crate::testdb::scratch_path(format!("mpedb-rlsj-{tag}-{}.mpedb", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let cfg = Config::from_toml_str(&format!(
             "[database]\npath = \"{path}\"\nsize_mb = 8\n\
