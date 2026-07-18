@@ -51,9 +51,9 @@ pub fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
 
 // Re-export the shared types a plan consumer needs.
 pub use mpedb_types::{
-    ColumnDef, ColumnType, DefaultExpr, Error, ExprProgram, Footprint, Instr, KeyAccess,
-    KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema, TableDef, TableKind,
-    Tokenizer, Value, FORMAT_VERSION,
+    BareGroupBy, ColumnDef, ColumnType, DefaultExpr, Error, ExprProgram, Footprint, Instr,
+    KeyAccess, KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema, TableDef,
+    TableKind, Tokenizer, Value, FORMAT_VERSION,
 };
 
 /// Compile SQL against a schema. Deterministic: identical logical statements
@@ -90,17 +90,28 @@ pub fn prepare_maybe_explain_with_policies(
     schema: &Schema,
     catalog: &PolicyCatalog,
 ) -> Result<(CompiledPlan, bool)> {
-    prepare_maybe_explain_with_views(sql, schema, catalog, &view::ViewCatalog::new())
+    prepare_maybe_explain_with_views(
+        sql,
+        schema,
+        catalog,
+        &view::ViewCatalog::new(),
+        BareGroupBy::default(),
+    )
 }
 
 /// Like [`prepare_maybe_explain_with_policies`] but also given the view catalog
-/// (name → SELECT source); a query naming a view is flattened onto the view's
-/// base table before planning (design/DESIGN-VIEW.md).
+/// (name → SELECT source) and the GROUP BY strictness dialect (COMPAT.md); a
+/// query naming a view is flattened onto the view's base table before planning
+/// (design/DESIGN-VIEW.md). `compat` decides whether a bare (non-aggregated,
+/// non-grouped) column is accepted (sqlite) or refused (postgres) — the facade
+/// passes the database's configured [`BareGroupBy`]; the simpler `prepare*`
+/// wrappers default to [`BareGroupBy::Sqlite`].
 pub fn prepare_maybe_explain_with_views(
     sql: &str,
     schema: &Schema,
     catalog: &PolicyCatalog,
     views: &ViewCatalog,
+    compat: BareGroupBy,
 ) -> Result<(CompiledPlan, bool)> {
     let (mut stmt, is_explain, n_params, ctes) = parser::parse_statement_ctes(sql)?;
     // A `WITH` CTE is a statement-scoped named view. Pass the CTE bodies to
@@ -118,7 +129,7 @@ pub fn prepare_maybe_explain_with_views(
         let scope: view::ViewCatalog = ctes.into_iter().collect();
         view::inline_views_with_ctes(&mut stmt, views, &scope)?;
     }
-    let plan = planner::plan_statement(&stmt, schema, n_params, catalog)?;
+    let plan = planner::plan_statement(&stmt, schema, n_params, catalog, compat)?;
     Ok((plan, is_explain))
 }
 

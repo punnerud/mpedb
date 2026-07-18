@@ -14,7 +14,8 @@ pub mod schema;
 pub mod value;
 
 pub use config::{
-    Concurrency, Config, DbOptions, Durability, FilePerms, WorkspaceConfig, WorkspaceMember,
+    BareGroupBy, Concurrency, Config, DbOptions, Durability, FilePerms, WorkspaceConfig,
+    WorkspaceMember,
     DEFAULT_MAX_WORK_ROWS,
 };
 pub use error::{Error, Result};
@@ -69,6 +70,22 @@ impl AggFn {
             AggFn::Total => "total",
             AggFn::GroupConcat => "group_concat",
         }
+    }
+
+    /// For MIN / MAX only: does `candidate` STRICTLY beat the running `incumbent`
+    /// extreme? The single source of the min/max keep-rule, shared by
+    /// [`Accum::push`](crate::Accum) (which decides the aggregate value) and the
+    /// executor's sqlite "bare column" witness (which decides which input row a
+    /// bare column takes its value from). An incomparable pair keeps the
+    /// incumbent (`Ordering::None` ⇒ `false`), so on a tie the FIRST occurrence
+    /// wins — matching sqlite. Meaningless (and always `false`) for non-min/max.
+    pub fn min_max_prefers(self, incumbent: &Value, candidate: &Value) -> Result<bool> {
+        let ord = incumbent.sql_cmp(candidate)?;
+        Ok(matches!(
+            (self, ord),
+            (AggFn::Min, Some(std::cmp::Ordering::Greater))
+                | (AggFn::Max, Some(std::cmp::Ordering::Less))
+        ))
     }
 }
 pub use footprint::{Footprint, KeyAccess, KeyBound, KeyPart, PlanHash};

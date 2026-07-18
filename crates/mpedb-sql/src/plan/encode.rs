@@ -399,6 +399,13 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
                         }
                     }
                     encode_opt_program(a.having.as_ref(), buf);
+                    // sqlite bare columns (format 30): base-row indices carried
+                    // from the group's min/max witness row. Empty unless the plan
+                    // has live bare columns, so only those plans differ.
+                    w_u16(buf, a.bare_cols.len() as u16);
+                    for c in &a.bare_cols {
+                        w_u16(buf, *c);
+                    }
                 }
             }
             // Window functions (format 24): a trailing list after the aggregate

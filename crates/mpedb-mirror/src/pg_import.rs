@@ -97,7 +97,15 @@ pub fn import_pg(
         return Err(Error::Config("no mirrorable tables in source".into()));
     }
     let schema = pg::build_schema(&src_tables)?;
-    let db = create_mirror_db(dest, schema.clone(), opts.size_bytes, opts.durability)?;
+    // A PostgreSQL import is born strict: a bare GROUP BY column PG refused stays
+    // refused in the mirror (COMPAT.md — the mode travels with the origin).
+    let db = create_mirror_db(
+        dest,
+        schema.clone(),
+        opts.size_bytes,
+        opts.durability,
+        mpedb_types::BareGroupBy::Postgres,
+    )?;
 
     // install the changelog + triggers BEFORE the snapshot (§4.3 step 0) so a
     // write concurrent with or after the import is captured

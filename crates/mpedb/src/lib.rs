@@ -284,6 +284,11 @@ pub struct Database {
     /// renamed table fails immediately and loudly, rather than silently
     /// asserting nothing for the rest of the deployment's life.
     require_policy: std::collections::HashSet<u32>,
+    /// GROUP BY column-strictness dialect ([`BareGroupBy`], COMPAT.md), from
+    /// `[compat] bare_group_by` (default sqlite) — or `postgres` for a
+    /// PostgreSQL-imported mirror. Passed into every `prepare` so a bare column
+    /// is accepted (sqlite) or refused (postgres) per the data's origin.
+    bare_group_by: mpedb_types::BareGroupBy,
 }
 
 impl Database {
@@ -312,6 +317,11 @@ impl Database {
             // config-free attach enforces what the FILE carries, and
             // `require_policy` is a config-declared deployment assertion.
             require_policy: std::collections::HashSet::new(),
+            // A config-free attach (mirror daemon/CLI, dump) has no `[compat]`
+            // section to read, so it takes the lenient sqlite default — the same
+            // default any config without `[compat]` gets. A PostgreSQL mirror
+            // instead opens via `open_with_config` with the flag already set.
+            bare_group_by: mpedb_types::BareGroupBy::default(),
         })
     }
 
@@ -337,6 +347,7 @@ impl Database {
             checks.push(per_col);
         }
         let path = config.options.path.clone();
+        let bare_group_by = config.options.bare_group_by;
         // Resolve the §6.3 assertions against the schema now: an unknown name is
         // a config error, not a no-op assertion nobody notices.
         let mut require_policy = std::collections::HashSet::new();
@@ -364,6 +375,7 @@ impl Database {
             trigger_cache: RwLock::new(None),
             path,
             require_policy,
+            bare_group_by,
         })
     }
 
@@ -410,7 +422,13 @@ impl Database {
         self.gate_cache_on_schema()?;
         let catalog = self.load_policy_catalog()?;
         let views = self.load_view_catalog()?;
-        mpedb_sql::prepare_maybe_explain_with_views(sql, &self.schema(), &catalog, &views)
+        mpedb_sql::prepare_maybe_explain_with_views(
+            sql,
+            &self.schema(),
+            &catalog,
+            &views,
+            self.bare_group_by,
+        )
     }
 
     /// Prepare-time worst-case **risk estimate** (#74 layer 1) for an

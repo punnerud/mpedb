@@ -70,6 +70,16 @@ impl RegenReport {
 pub fn regenerate(db_path: &Path, size_bytes: u64) -> Result<RegenReport> {
     let old = Database::open_from_file(db_path)?;
     let schema: Schema = old.schema().schema.clone();
+    // Carry the GROUP BY strictness across the rebuild, keyed off the mirror's
+    // persisted origin (COMPAT.md): a PostgreSQL mirror stays strict, a sqlite
+    // one lenient — a regenerate must not silently relax a PG-origin mirror.
+    let bare_group_by = match old.sys_record_get(state::MIR_NS, state::KEY_CFG)? {
+        Some(bytes) => match state::MirrorConfig::decode(&bytes)?.source_kind {
+            state::SourceKind::Postgres => mpedb_types::BareGroupBy::Postgres,
+            state::SourceKind::Sqlite => mpedb_types::BareGroupBy::Sqlite,
+        },
+        None => mpedb_types::BareGroupBy::Sqlite,
+    };
 
     // 1. Freeze. Every mirrored table refuses writes from here until the new
     //    file is in place, so the copy below sees a still target.
@@ -90,6 +100,7 @@ pub fn regenerate(db_path: &Path, size_bytes: u64) -> Result<RegenReport> {
             schema.clone(),
             size_bytes,
             Durability::None,
+            bare_group_by,
         )?;
         let mut report = RegenReport {
             new_size_bytes: size_bytes,

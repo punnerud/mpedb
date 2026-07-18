@@ -257,6 +257,7 @@ pub(super) fn plan_select<'s>(
     schema: &'s Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
+    mode: BareGroupBy,
     consts: &mut Vec<Value>,
     // The recursive CTE working table in scope (`WITH RECURSIVE`), if any: a
     // `FROM <name>` matching it binds to the working table (id `CTE_TABLE`,
@@ -280,7 +281,7 @@ pub(super) fn plan_select<'s>(
     let lifted;
     let (s, subplans, slot_types): (&ast::SelectStmt, Vec<SubPlan>, Vec<Ty>) =
         if subquery::has_subquery(s) {
-            lifted = subquery::lift_subqueries(s, schema, n_params, catalog, consts)?;
+            lifted = subquery::lift_subqueries(s, schema, n_params, catalog, mode, consts)?;
             (&lifted.stmt, lifted.subplans, lifted.slot_types)
         } else {
             (s, Vec::new(), Vec::new())
@@ -313,7 +314,9 @@ pub(super) fn plan_select<'s>(
         }
     };
     if !s.joins.is_empty() {
-        return plan_join_select(s, schema, n_params, catalog, consts, subplans, slot_types, cte);
+        return plan_join_select(
+            s, schema, n_params, catalog, mode, consts, subplans, slot_types, cte,
+        );
     }
     let mut binder = match &s.alias {
         Some(a) => Binder::with_scope(Scope::single_named(a.clone(), table), eff_params, true),
@@ -445,6 +448,7 @@ pub(super) fn plan_select<'s>(
             None,
             post_filter,
             binder,
+            mode,
             consts,
             subplans,
         )?;
