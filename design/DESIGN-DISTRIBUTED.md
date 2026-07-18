@@ -14,7 +14,10 @@ no shared memory, no cross-host flock, unsynchronized clocks, and **network part
 theoretical**. So distributed mpedb is not "sync, but bigger" — it is a new problem, and the first
 duty is the **CAP choice**: under a partition you may keep serving (AP, eventually consistent) or
 refuse writes without quorum (CP, linearizable) — never both. Pick per use case; the two models below
-each own one side, and conflating them is how distributed systems get silent data loss.
+each own one side, and conflating them is how distributed systems get silent data loss. In practice
+the shape that resolves most of this is **sharded serverless replication** (§6): per-user shards with
+one master each, which turns "multi-master" into a set of non-overlapping single-writers — the clean
+2a model, cluster-wide, with no conflict machinery.
 
 ## 1. The serving topology — the easy, high-value 80%
 
@@ -130,3 +133,46 @@ All of this is **Phase 7+**, gated far behind the SQL-parity sprint. Each layer 
 useful; none is a prerequisite for the single-file product. Consensus/replication protocols get
 commit-path-class adversarial review (partition, split-brain, log-divergence, clock-skew) before any
 line ships — the bar the concurrency core already meets.
+
+## 6. The recommended concrete shape: sharded serverless replication (per-user shards)
+
+The instantiation that makes the whole thing tractable and ethos-fitting — and the one this vision
+converges on:
+
+- **Shard = per user** (or per key-range) — naturally a `.mpedb`, or a workspace member (#20/#51
+  already model a collection of `.mpedb` members, so the shard primitive half-exists). **One master
+  per shard**; different shards' masters live on different servers. So the cluster is "multi-master",
+  but every *shard* has a single writer → §2a's clean no-conflict model applies per shard, and 2b's
+  version-vector/CRDT merge is **never needed** (non-overlapping writers cannot conflict). This is
+  the elegant simplification: multi-master *scale* without the multi-master *problem*.
+- **Sharding is the unit of parallelism for serving AND sync.** Servers own different shards' masters;
+  load spreads; a shard is small, so bounded lag (§2a `max_lag`) is easy to hold — a follower never
+  hangs far behind, so it is always safely promotable ("aldri henge lenge etter").
+- **MPEE on sync = precompute on sync.** A shard's root content-hash answers "is this shard dirty?"
+  in O(1); ship only dirty shards' deltas, prioritized by staleness/cost — the same cost broker that
+  routes SQL batches (#73) routes replication. Sharding turns "what changed?" into O(dirty shards),
+  not O(rows); cluster-wide anti-entropy is a shallow tree of shard-root-hashes.
+- **Serverless per shard** (§1 Model A): no resident process; a shard is woken on request
+  (socket-activation) and its sync woken on change — a "stable replica environment without heavy
+  processes." Default role = **read replica** (zero resident); a write burst wakes write-acceptance on
+  the shard's master, or promotes a near-current follower — **elastic write reception**, so a server
+  contributes capacity only when requests arrive ("ikke trenge service kjørende før det kommer
+  requests").
+- **The one consistent thing: the shard→master directory.** Which server owns a shard's write master
+  must be agreed, or two writers appear. That tiny routing table is *exactly* the small CP core from
+  §3 — put it in **etcd / a consistent directory**, NOT the data plane. Data plane = AP/serverless per
+  shard; control plane = CP for shard ownership only. Fencing an old master on promotion reuses the
+  per-node FLD-2 writer lock.
+- **Prior art (not a castle in the air):** Cloudflare D1 / Durable Objects (per-tenant SQLite, one
+  writer, wake-on-request), Turso/libSQL per-tenant embedded replicas, Vitess/Citus per-tenant
+  sharding — this is the mpedb embedded-file version.
+- **Caveats, honestly:** a **cross-shard read** is a scatter-gather over shard members — mpedb's
+  cross-file read-join (#51) already does exactly this; a **cross-shard write** needs 2PC or is
+  disallowed (per-tenant isolation is usually the right boundary and sidesteps it); **rebalancing** a
+  user to another server = ship the shard `.mpedb` + flip the directory entry, cheap precisely because
+  the follower was bounded-lag (near-current at cutover).
+
+Recommended build order, refined: §5's staging instantiated as **per-user shards from the start** —
+the shard directory (small CP) + §2a async backup per shard + Model A serverless nodes. 2b
+multi-master and §3 in-tree consensus stay reserve options for the rare cases per-tenant sharding
+cannot express.
