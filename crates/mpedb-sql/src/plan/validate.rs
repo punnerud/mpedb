@@ -686,12 +686,15 @@ impl CompiledPlan {
         if s.plan.post_filter.is_some() && s.subplans.is_empty() {
             return Err(corrupt("subplan post-filter without nested subplans"));
         }
-        // #73 §3 stage 2: a nested lift MAY correlate to its IMMEDIATE parent —
-        // this subplan's row — which the executor fills per parent row. Its
-        // `outer_args` are bounds-checked against `s.plan`'s row in the recursion
-        // below; correlation to a MIDDLE/OUTER scope is unrepresentable (an
-        // `outer_arg` names only the immediate parent), so nothing here can encode
-        // it. (Stage 1's blanket refusal of a correlated child is retired.)
+        // #73 §3: a nested lift MAY correlate to its IMMEDIATE parent (stage 2)
+        // or, via a TRANSIT arg carried by an intervening level, to a MIDDLE or
+        // OUTER scope (stage 3). Either way its `outer_args` name slots of THIS
+        // subplan's parent row and are bounds-checked against `s.plan`'s row in
+        // the recursion below; a mid-scope reference is representable as an
+        // ordinary `outer_arg` on the ancestor's DIRECT child (registered by the
+        // planner's scope-descending `Correlate`) plus a plain inherited `Param`
+        // read by the descendant — nothing new to validate here, since the
+        // transit value occupies a normal, filled correlation slot.
         // The inner parameter space: base ‖ this subplan's correlation ‖ its
         // children results. A correlation slot has the OUTER column's type; a
         // child result slot carries the child's declared `slot_type` (so a child
