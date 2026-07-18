@@ -172,8 +172,9 @@ fn arg_text(v: &Value) -> Option<Vec<u8>> {
     }
 }
 
-/// sqlite's REAL→TEXT rendering is `printf("%!.15g", r)`.
-fn float_to_text(r: f64) -> Vec<u8> {
+/// sqlite's REAL→TEXT rendering is `printf("%!.15g", r)`. Shared with
+/// `CAST(x AS TEXT/BLOB)` so a real always renders identically everywhere.
+pub(crate) fn float_to_text(r: f64) -> Vec<u8> {
     let mut prec = 15;
     render_float(r, FloatKind::Generic, &mut prec, false, true, 0, false, false)
 }

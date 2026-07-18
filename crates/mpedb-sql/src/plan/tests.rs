@@ -78,6 +78,11 @@ fn sample_sqls() -> Vec<&'static str> {
         "SELECT id, email FROM users ORDER BY email COLLATE NOCASE, id",
         "SELECT id, email FROM users ORDER BY email COLLATE RTRIM DESC, id",
         "SELECT id FROM users UNION SELECT user_id FROM orders ORDER BY 1 COLLATE NOCASE",
+        // CAST affinity (format 29): the `Instr::Cast` payload byte is now an
+        // Affinity (1..=5). Each of the five affinities must survive
+        // encode/decode/validate/hash — reached via known and unknown type names.
+        "SELECT CAST(age AS SIGNED), CAST(score AS INTEGER), CAST(email AS REAL) FROM users",
+        "SELECT CAST(email AS BLOB), CAST(age AS VARCHAR(10)) FROM users",
         "BEGIN",
         "COMMIT",
         "ROLLBACK",
@@ -129,6 +134,41 @@ fn decode_rejects_truncation_in_collate() {
                 "truncation at {cut} must fail for {sql}"
             );
         }
+    }
+}
+
+/// The CAST affinity byte (format 29) gets its own sweep: a plan carrying each
+/// affinity opcode must round-trip, and every truncation through it must Err
+/// (never panic). It also guards the version bump itself — a plan blob whose
+/// leading format byte is set back to 28 must fail CLOSED with `PlanInvalidated`
+/// (re-prepare), never be misread as a valid plan under the new opcode meaning.
+#[test]
+fn decode_rejects_truncation_and_stale_format_in_cast() {
+    let s = test_schema();
+    for sql in [
+        "SELECT CAST(age AS SIGNED) FROM users",
+        "SELECT CAST(email AS DECIMAL), CAST(score AS BLOB) FROM users",
+        "SELECT CAST(age AS TEXT), CAST(email AS INTEGER), CAST(score AS REAL) FROM users",
+    ] {
+        let p = prepare(sql, &s).unwrap();
+        let _ = p.explain(&s); // must not panic rendering the affinity name
+        let bytes = p.encode();
+        assert_eq!(bytes[0], 29, "plan format byte for {sql}");
+        let q = CompiledPlan::decode(&bytes, &s).expect(sql);
+        assert_eq!(p, q, "roundtrip mismatch for {sql}");
+        for cut in 0..bytes.len() {
+            assert!(
+                CompiledPlan::decode(&bytes[..cut], &s).is_err(),
+                "truncation at {cut} must fail for {sql}"
+            );
+        }
+        // Stale format: an old (28) reader-era blob is re-prepared, not misread.
+        let mut stale = bytes.clone();
+        stale[0] = 28;
+        assert!(
+            matches!(CompiledPlan::decode(&stale, &s), Err(Error::PlanInvalidated)),
+            "a format-28 CAST plan must be PlanInvalidated, not misread, for {sql}"
+        );
     }
 }
 

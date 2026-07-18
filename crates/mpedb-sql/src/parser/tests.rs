@@ -28,16 +28,30 @@ fn unary_plus_is_identity() {
 /// ordinary identifier when not followed by `(`.
 #[test]
 fn cast_parses_and_concat_sits_in_the_additive_tier() {
-    use mpedb_types::ColumnType as T;
+    // The parser keeps the type name VERBATIM (any identifier is accepted; the
+    // binder folds it to an affinity). Multi-word names join with a space; a
+    // parenthesized size is dropped.
     assert_eq!(
         expr("CAST(a AS INTEGER)"),
-        Expr::Cast(Box::new(Expr::Col("a".into())), T::Int64)
+        Expr::Cast(Box::new(Expr::Col("a".into())), "INTEGER".into())
     );
     assert_eq!(
         expr("cast(NULL as real)"),
-        Expr::Cast(Box::new(Expr::Lit(Value::Null)), T::Float64)
+        Expr::Cast(Box::new(Expr::Lit(Value::Null)), "real".into())
     );
-    assert!(parse_expr_only("CAST(a AS lolwut)").is_err());
+    // An unknown name no longer errors — it is a valid type name to the parser.
+    assert_eq!(
+        expr("CAST(a AS lolwut)"),
+        Expr::Cast(Box::new(Expr::Col("a".into())), "lolwut".into())
+    );
+    assert_eq!(
+        expr("CAST(a AS VARCHAR(10))"),
+        Expr::Cast(Box::new(Expr::Col("a".into())), "VARCHAR".into())
+    );
+    assert_eq!(
+        expr("CAST(a AS DOUBLE PRECISION)"),
+        Expr::Cast(Box::new(Expr::Col("a".into())), "DOUBLE PRECISION".into())
+    );
     // bare `cast` is still a column name
     assert_eq!(expr("cast"), Expr::Col("cast".into()));
 
