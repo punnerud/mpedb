@@ -82,20 +82,48 @@ pub(super) fn exec_aggregate(
     };
 
     // sqlite "bare columns" (COMPAT.md): each group also carries the values of
-    // `agg.bare_cols` from its single min()/max() WITNESS row. The planner +
-    // `validate` guarantee that a non-empty `bare_cols` comes with exactly one
-    // aggregate and it is Min/Max, so `agg.aggs[0]` is the governing extremum.
+    // `agg.bare_cols` from a WITNESS row. Which row is sqlite's — and so mpedb's —
+    // is inferable from the aggregate set (no plan byte, so PLAN_FORMAT stays 30):
+    //   * EXACTLY ONE min()/max() (even alongside count/sum/avg) → that extremum's
+    //     row, sqlite's documented rule (#87, verified: `min(x), count(*)` follows
+    //     the min);
+    //   * ZERO min()/max() → sqlite's "arbitrary" pick, which is deterministic: the
+    //     group's LOWEST-ROWID row. mpedb identifies a single-table row by its PK,
+    //     so it tracks the minimum PK per group and takes that row. The planner
+    //     only emits this shape over a single INTEGER-PK table (`rowid_pick_ok`),
+    //     where PK == sqlite's rowid, so the pick matches sqlite EXACTLY.
+    // The planner refuses the ≥2 min/max case (sqlite follows the LAST min/max — an
+    // order-dependent, undocumented pick), so a legitimately compiled plan never
+    // reaches here with it; a forged one falls into the safe min-PK branch below.
     let has_bare = !agg.bare_cols.is_empty();
-    let mm = if has_bare { agg.aggs.first() } else { None };
+    let mm = {
+        let mut it = agg
+            .aggs
+            .iter()
+            .filter(|c| matches!(c.func, mpedb_types::AggFn::Min | mpedb_types::AggFn::Max));
+        match (it.next(), it.next()) {
+            // Exactly one min/max → its witness row governs the bare columns.
+            (Some(c), None) => Some(c),
+            // Zero (→ lowest rowid) or two-plus (planner-refused) → min-PK path.
+            _ => None,
+        }
+    };
 
     // Group. The key is the memcmp-ordered keycode of the group columns, so
     // groups come out in a deterministic order for free and NULL keys group
     // together (SQL treats NULLs as one group in GROUP BY, unlike `=`).
     //
-    // The optional third element is the bare-column witness: `(extreme, bare)`
-    // where `extreme` is the running min/max value (None until the first non-NULL
-    // arg) and `bare` is the extremum row's values for `agg.bare_cols`.
-    type Group = (Vec<Value>, Vec<Accum>, Option<(Option<Value>, Vec<Value>)>);
+    // The optional third element is the bare-column witness, in one of two shapes
+    // (chosen by `mm`): the min/max extremum row, or the lowest-rowid row.
+    enum Witness {
+        // #87: `extreme` is the running min/max (None until the first non-NULL
+        // arg); `bare` is the extremum row's values for `agg.bare_cols`.
+        MinMax { extreme: Option<Value>, bare: Vec<Value> },
+        // sqlite's arbitrary pick: `pk` is the encoded PK of the lowest-rowid row
+        // seen so far (empty = no row yet); `bare` is that row's bare values.
+        MinRowid { pk: Vec<u8>, bare: Vec<Value> },
+    }
+    type Group = (Vec<Value>, Vec<Accum>, Option<Witness>);
     let mut groups: std::collections::BTreeMap<Vec<u8>, Group> = Default::default();
     for row in &rows {
         let key_vals: Vec<Value> = agg
@@ -109,11 +137,14 @@ pub(super) fn exec_aggregate(
             .collect::<Result<_>>()?;
         let key = keycode::encode_key(&key_vals);
         let entry = groups.entry(key).or_insert_with(|| {
-            (
-                key_vals,
-                agg.aggs.iter().map(new_accum).collect(),
-                if has_bare { Some((None, Vec::new())) } else { None },
-            )
+            let witness = if !has_bare {
+                None
+            } else if mm.is_some() {
+                Some(Witness::MinMax { extreme: None, bare: Vec::new() })
+            } else {
+                Some(Witness::MinRowid { pk: Vec::new(), bare: Vec::new() })
+            };
+            (key_vals, agg.aggs.iter().map(new_accum).collect(), witness)
         });
         for (i, call) in agg.aggs.iter().enumerate() {
             match &call.arg {
@@ -126,34 +157,59 @@ pub(super) fn exec_aggregate(
                 }
             }
         }
-        // Update the bare-column witness. sqlite's rule, reproduced exactly: the
-        // bare columns come from the row that achieved the min/max; on a tie the
-        // FIRST such row wins (`min_max_prefers` replaces only on a strict beat);
-        // and until any non-NULL extremum is seen the witness tracks the LATEST
-        // row, so an all-NULL-argument group takes its bare values from its last
-        // row — the behavior differential-tested against sqlite 3.45.
-        if let (Some(mm), Some(w)) = (mm, entry.2.as_mut()) {
-            let v = match &mm.arg {
-                Some(p) => p.eval(row, params)?,
-                None => Value::Null,
-            };
+        // Update the bare-column witness, reproducing sqlite's rule EXACTLY.
+        if let Some(w) = entry.2.as_mut() {
             let capture = || -> Vec<Value> {
                 agg.bare_cols
                     .iter()
                     .map(|&c| row.get(c as usize).cloned().unwrap_or(Value::Null))
                     .collect()
             };
-            match &w.0 {
-                None => {
-                    w.1 = capture();
-                    if !v.is_null() {
-                        w.0 = Some(v);
+            match w {
+                // The bare columns come from the row that achieved the min/max; on
+                // a tie the FIRST such row wins (`min_max_prefers` replaces only on
+                // a strict beat); and until any non-NULL extremum is seen the
+                // witness tracks the LATEST row, so an all-NULL-argument group
+                // takes its bare values from its last row — differential-tested
+                // against sqlite 3.45.
+                Witness::MinMax { extreme, bare } => {
+                    let mm = mm.expect("MinMax witness implies a single min/max aggregate");
+                    let v = match &mm.arg {
+                        Some(p) => p.eval(row, params)?,
+                        None => Value::Null,
+                    };
+                    match extreme {
+                        None => {
+                            *bare = capture();
+                            if !v.is_null() {
+                                *extreme = Some(v);
+                            }
+                        }
+                        Some(e) => {
+                            if !v.is_null() && mm.func.min_max_prefers(e, &v)? {
+                                *extreme = Some(v);
+                                *bare = capture();
+                            }
+                        }
                     }
                 }
-                Some(e) => {
-                    if !v.is_null() && mm.func.min_max_prefers(e, &v)? {
-                        w.0 = Some(v);
-                        w.1 = capture();
+                // sqlite's "arbitrary" pick is the group's lowest-rowid row. The
+                // row's PK identifies it; over a single INTEGER-PK table (the only
+                // shape the planner emits this for) the PK IS sqlite's rowid, so
+                // the smallest encoded PK is sqlite's pick. Encoding gives memcmp
+                // order = ascending PK, so tracking the running minimum matches
+                // sqlite even when the scan is NOT PK-ordered (an index or
+                // descending-range access path).
+                Witness::MinRowid { pk, bare } => {
+                    let pk_vals: Vec<Value> = t
+                        .primary_key
+                        .iter()
+                        .map(|&c| row.get(c as usize).cloned().unwrap_or(Value::Null))
+                        .collect();
+                    let this = keycode::encode_key(&pk_vals);
+                    if pk.is_empty() || this < *pk {
+                        *pk = this;
+                        *bare = capture();
                     }
                 }
             }
@@ -177,7 +233,10 @@ pub(super) fn exec_aggregate(
         tuple.extend(accs.into_iter().map(|a| a.finish()));
         // Every group has at least one row, so the witness `bare` is populated;
         // extend the grouped tuple to `[keys ‖ aggs ‖ bare]`.
-        if let Some((_, bare)) = witness {
+        if let Some(w) = witness {
+            let bare = match w {
+                Witness::MinMax { bare, .. } | Witness::MinRowid { bare, .. } => bare,
+            };
             tuple.extend(bare);
         }
         out.push(tuple);

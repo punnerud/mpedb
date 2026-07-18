@@ -77,13 +77,16 @@ pub enum Concurrency {
 /// `prepare` accepts, never what a stored plan means (a plan is self-describing).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BareGroupBy {
-    /// sqlite's rule: a bare column is accepted **only when its value is
-    /// deterministic**, so the answer still matches sqlite exactly (mpedb's core
-    /// guarantee — never a wrong answer). Two cases qualify: the column is
-    /// provably never evaluated (a dead `COALESCE`/`CASE` branch that constant
-    /// folding removes), or the query has exactly one `min()`/`max()` and no
-    /// other aggregate (the bare column takes its value from the extremum's
-    /// row). A genuinely arbitrary bare column (any other shape) is REFUSED with
+    /// sqlite's rule: a bare column is accepted **only when mpedb reproduces
+    /// sqlite's value exactly** (mpedb's core guarantee — never a wrong answer).
+    /// Three cases qualify: the column is provably never evaluated (a dead
+    /// `COALESCE`/`CASE` branch that constant folding removes); the query has
+    /// exactly one `min()`/`max()` (the bare column takes the extremum's row,
+    /// even alongside a `count`/`sum`/`avg`); or the query has NO `min()`/`max()`
+    /// and reads a single INTEGER-PK table, where sqlite's "arbitrary" pick is
+    /// the group's lowest-rowid row and mpedb carries the minimum-PK row to match
+    /// it (#88). A bare column mpedb cannot reproduce — the lowest-rowid case over
+    /// a join or a non-rowid PK, or two-or-more `min()`/`max()` — is REFUSED with
     /// a clean bind error rather than guessed. The default.
     #[default]
     Sqlite,
