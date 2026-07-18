@@ -536,7 +536,12 @@ impl CompiledPlan {
                             }
                             None => {
                                 let col = &t.columns[ci];
-                                if !col.nullable && col.default.is_none() {
+                                // The INTEGER PRIMARY KEY rowid alias auto-assigns
+                                // when omitted, so it is exempt from the NOT-NULL rule.
+                                if !col.nullable
+                                    && col.default.is_none()
+                                    && t.rowid_alias_col() != Some(ci as u16)
+                                {
                                     return Err(corrupt(
                                         "INSERT … SELECT omits a NOT NULL column without a default",
                                     ));
@@ -578,7 +583,13 @@ impl CompiledPlan {
                                 }
                             }
                             InsertSource::Default => {
-                                if !col.nullable && col.default.is_none() {
+                                // Default on the rowid-alias PK column is the
+                                // auto-assign marker (resolved to max(rowid)+1 at
+                                // execution), so it is exempt from the NOT-NULL rule.
+                                if !col.nullable
+                                    && col.default.is_none()
+                                    && t.rowid_alias_col() != Some(ci as u16)
+                                {
                                     return Err(corrupt(
                                         "DEFAULT insert into NOT NULL column without default",
                                     ));

@@ -191,6 +191,19 @@ impl<'a> Parser<'a> {
                     } else if self.eat_word("PRIMARY") {
                         self.expect_word("KEY")?;
                         col.pk = true;
+                    } else if self.eat_word("AUTOINCREMENT") {
+                        // A plain single-column INTEGER PRIMARY KEY is already a
+                        // rowid alias (NULL/omitted auto-assigns max(rowid)+1).
+                        // AUTOINCREMENT's extra guarantee — never reuse a freed
+                        // id — needs a persisted high-water counter mpedb does
+                        // not keep, so it is refused by name rather than
+                        // silently downgraded to the reuse-allowed behavior.
+                        return Err(self.err_here(
+                            "AUTOINCREMENT is not supported — a single-column INTEGER \
+                             PRIMARY KEY already auto-assigns NULL/omitted ids as \
+                             max(rowid)+1 (ids are reused after delete, unlike \
+                             AUTOINCREMENT); drop the keyword to use it",
+                        ));
                     } else if self.eat_word("COLLATE") {
                         return Err(self.err_here(
                             "column-declared COLLATE is not supported yet (stage 1b) — put \

@@ -131,6 +131,26 @@ impl TableDef {
         self.primary_key.contains(&col)
     }
 
+    /// The column index of this table's INTEGER PRIMARY KEY *rowid alias*, if
+    /// it has one. Per sqlite, a table whose PRIMARY KEY is a SINGLE integer
+    /// column makes that column an alias for the rowid: a NULL or omitted value
+    /// on INSERT auto-assigns `max(existing rowid) + 1` (the plain,
+    /// non-AUTOINCREMENT rule — a freed top id is reusable). A composite PK, or
+    /// a non-integer single PK, is NOT a rowid alias — those stay strict, so a
+    /// NULL there is the usual NOT-NULL violation. FTS tables keep their own
+    /// rowid discipline and are deliberately excluded. Inferred, never stored:
+    /// the canonical schema bytes carry no rowid-alias flag, so this adds no
+    /// schema-format surface.
+    pub fn rowid_alias_col(&self) -> Option<u16> {
+        if !matches!(self.kind, TableKind::Standard) {
+            return None;
+        }
+        match self.primary_key.as_slice() {
+            [c] if self.columns[*c as usize].ty == ColumnType::Int64 => Some(*c),
+            _ => None,
+        }
+    }
+
     /// For an FTS table, the `(column_index, fts_colno)` of every content
     /// column — every non-primary-key column — with `fts_colno` assigned
     /// `0..n` in declaration order. This is the SINGLE colno rule shared by

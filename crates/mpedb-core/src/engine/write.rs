@@ -549,6 +549,26 @@ impl<'e> WriteTxn<'e> {
         }
     }
 
+    /// The next value to auto-assign to an INTEGER PRIMARY KEY rowid alias:
+    /// `max(existing pk) + 1`, or 1 for an empty table. This is sqlite's plain
+    /// (non-AUTOINCREMENT) rule — the *current* maximum plus one — so a deleted
+    /// top row's id can be reused. The PK tree is memcmp-ordered and `keycode`
+    /// preserves signed-integer order, so the rightmost key is the true maximum;
+    /// the lookup is O(tree height). Assumes a single-column integer PK (the
+    /// caller checked `rowid_alias_col`); a non-integer key here is a bug.
+    pub fn next_rowid(&mut self, table_id: u32) -> Result<i64> {
+        let (root, _) = self.tree_root(table_id, 0)?;
+        match btree::max_key(self, root)? {
+            None => Ok(1),
+            Some(key) => match keycode::decode_key(&key, &[ColumnType::Int64])?.into_iter().next() {
+                Some(Value::Int(m)) => Ok(m.saturating_add(1)),
+                _ => Err(Error::Internal(
+                    "rowid-alias primary key is not an integer".into(),
+                )),
+            },
+        }
+    }
+
     /// Delete by primary key; returns whether the row existed.
     pub fn delete_by_pk(&mut self, table_id: u32, pk_values: &[Value]) -> Result<bool> {
         self.check_write_blocked(table_id)?;
