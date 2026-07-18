@@ -248,6 +248,36 @@ that shared cache, the second being a hard privacy requirement:
    per-process or are quantized to buckets wide enough to be non-identifying, and that
    trade-off is documented at the feature, not discovered after it.
 
+## Correlated-subplan memoization — shipped 2026-07-18 (the broker "buy once", now on the N×N subquery loop)
+
+The broker discipline of §1.2 ("buy each cell exactly once, cache it, then only
+read") finally lands where it maps most literally: the correlated-subquery hot
+loop. `exec_select_with` (`crates/mpedb/src/exec/mod.rs`) evaluated a correlated
+subplan ONCE PER OUTER ROW — for `WHERE EXISTS (SELECT … WHERE b.k = a.g)` that
+is O(N_outer × M_inner), the N×N distance matrix recomputed cell-by-cell with no
+memory. A correlated subplan is a pure function of `(user params, correlation
+args)` over the read txn's stable MVCC snapshot, so two outer rows with the same
+correlation tuple MUST yield the same inner result. We now memoize it per subplan,
+keyed by the encoded correlation tuple (`keycode::encode_key`) — "buy the inner
+cells once, then only stream probes." O(N_outer × M_inner) collapses to one inner
+run per DISTINCT correlation tuple; all-distinct keys cost only a hash/insert per
+row (no regression, strict Pareto improvement); the cache is bounded by the
+distinct tuples (≤ the already-materialized outer rows, so no new order of memory).
+
+Falsifiability follows the §3 pattern: `MPEDB_NO_SUBPLAN_MEMO=1` restores per-row
+re-execution for A/B. **Measured** (release, correlated EXISTS, 4000 outer rows ×
+5 distinct correlation keys, 400 inner rows): memo OFF **368.45 ms**, ON
+**2.92 ms** — **126× faster**. Correctness pinned by `crates/mpedb/tests/
+correlated_memo.rs` (results identical to per-row, cross-checked against sqlite
+3.45) and the differential corpus (zero wrong).
+
+This is the memoization half of the broker. The **build-once hash semi-join** —
+detect equi-correlation `b.k = a.c`, build the inner keyed set once and turn each
+outer row into an O(log M) probe even when correlation values are all-distinct —
+is the staged follow-up that closes the remaining all-distinct case; it needs a
+planner de-correlation pass, not just an exec cache, and is where §5's cardinality
+broker will inform whether to hash-build vs. re-scan.
+
 ## Streaming LIMIT/top-K — shipped 2026-07-13
 
 The mapping's top opportunity was implemented immediately after this workbench run:

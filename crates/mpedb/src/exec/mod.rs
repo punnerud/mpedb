@@ -860,19 +860,48 @@ fn exec_select_with(
     let mut stack: Vec<Value> = Vec::new();
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    // A correlated subplan is a pure function of (user params, correlation
+    // args) over the txn's stable MVCC snapshot, so two outer rows with the
+    // SAME correlation values must yield the SAME inner result. Memoize it per
+    // subplan, keyed by the encoded correlation tuple — MPEE's "buy the inner
+    // cells once, then only stream probes" applied to the N×N outer×inner loop:
+    // O(N_outer × M_inner) re-execution collapses to ONE inner run per DISTINCT
+    // correlation tuple. All-distinct keys cost only a hash/insert per row (no
+    // regression); repeated keys skip the whole inner scan. The cache is bounded
+    // by the distinct correlation tuples, itself ≤ the already-materialized
+    // `rows`, so it adds no new order of memory.
+    let mut memo: Vec<std::collections::HashMap<Vec<u8>, Value>> =
+        vec![std::collections::HashMap::new(); correlated.len()];
+    // Kill switch for A/B measurement (matches the DESIGN-MPEE-OPT falsifiability
+    // pattern): MPEDB_NO_SUBPLAN_MEMO=1 restores per-row re-execution.
+    let use_memo = std::env::var_os("MPEDB_NO_SUBPLAN_MEMO").is_none();
     for row in rows {
-        for &(i, sub) in correlated {
-            let mut inner_params = Vec::with_capacity(n_user + sub.outer_args.len());
-            inner_params.extend_from_slice(&params[..n_user]);
+        for (ci, &(i, sub)) in correlated.iter().enumerate() {
+            let mut key_vals = Vec::with_capacity(sub.outer_args.len());
             for &a in &sub.outer_args {
-                inner_params.push(
+                key_vals.push(
                     row.get(a as usize)
                         .cloned()
                         .ok_or_else(|| internal("correlation arg out of row"))?,
                 );
             }
-            let r = exec_select(ctx, schema, plan, &inner_params, &sub.plan)?;
-            scratch[base + i] = subplan_value(r, sub.kind)?;
+            let memo_key = keycode::encode_key(&key_vals);
+            scratch[base + i] = if let Some(v) = memo[ci].get(&memo_key) {
+                v.clone()
+            } else {
+                let mut inner_params = Vec::with_capacity(n_user + key_vals.len());
+                inner_params.extend_from_slice(&params[..n_user]);
+                inner_params.extend(key_vals);
+                let r = exec_select(ctx, schema, plan, &inner_params, &sub.plan)?;
+                // A scalar subplan's >1-row error still fires on the first
+                // occurrence of that key (the miss path), before any insert, so
+                // error semantics are byte-identical to per-row re-execution.
+                let v = subplan_value(r, sub.kind)?;
+                if use_memo {
+                    memo[ci].insert(memo_key, v.clone());
+                }
+                v
+            };
         }
         if let Some(pf) = post_filter {
             if !pf.eval_filter(&mut stack, &row, &scratch)? {
