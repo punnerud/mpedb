@@ -12,10 +12,10 @@
 //! always its own base column name — the outer query's references need no
 //! rewriting; only `SELECT * FROM v` expands to the view's column list.
 
-use crate::ast::{Expr, SelectStmt, Stmt};
+use crate::ast::{Expr, JoinClause, JoinKind, SelectStmt, Stmt};
 use crate::parser::parse_statement;
 use mpedb_types::{Error, Result};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// View name → its `SELECT` source text (re-parsed at reference time). The same
 /// shape backs a statement-scoped CTE scope (CTE name → CTE body text).
@@ -96,6 +96,53 @@ fn refuse_view_target(
     Ok(())
 }
 
+/// Validate the ordering of a `WITH` clause's CTE definitions BEFORE flattening.
+///
+/// A CTE body may reference an EARLIER CTE (a backward reference), which resolves
+/// during flattening because both live in the statement's flat CTE scope. It may
+/// NOT reference itself, a LATER CTE (a forward reference), or form a cycle:
+/// each is refused here with a clear message. This keeps `WITH a AS (SELECT …
+/// FROM b), b AS (…) …` (forward) and `WITH a AS (SELECT … FROM a) …` (self) out
+/// of the flat scope, where the former would resolve leniently and the latter
+/// would only trip the depth guard with a vaguer message. It is stricter than
+/// sqlite (which accepts a non-cyclic forward reference) but matches its
+/// self/cyclic-reference refusal, and is never a wrong answer. Duplicate CTE
+/// names are refused too (sqlite: "duplicate WITH table name").
+///
+/// A body that fails to parse here is skipped, not refused: an UNUSED broken
+/// body stays a safe leniency, and a USED one is refused at flatten time.
+pub fn validate_cte_order(ctes: &[(String, String)]) -> Result<()> {
+    let all: HashSet<&str> = ctes.iter().map(|(n, _)| n.as_str()).collect();
+    // Names of the strictly-preceding CTEs — the only ones a body may reference.
+    let mut preceding: HashSet<&str> = HashSet::new();
+    for (name, body) in ctes {
+        if let Ok((stmt, _explain, _n)) = parse_statement(body) {
+            let mut refs = Vec::new();
+            match &stmt {
+                Stmt::Select(s) => collect_source_names(s, &mut refs),
+                Stmt::Compound(c) => {
+                    for arm in &c.arms {
+                        collect_source_names(arm, &mut refs);
+                    }
+                }
+                _ => {}
+            }
+            for r in &refs {
+                if all.contains(r.as_str()) && !preceding.contains(r.as_str()) {
+                    return Err(bind_err(format!(
+                        "CTE `{name}` references `{r}`, which is not defined before \
+                         it (self, forward, or cyclic CTE references are not supported)"
+                    )));
+                }
+            }
+        }
+        if !preceding.insert(name.as_str()) {
+            return Err(bind_err(format!("duplicate CTE name `{name}` in WITH")));
+        }
+    }
+    Ok(())
+}
+
 fn flatten_select(
     s: &mut SelectStmt,
     views: &ViewCatalog,
@@ -105,17 +152,17 @@ fn flatten_select(
     if depth > MAX_VIEW_DEPTH {
         return Err(bind_err("view nesting too deep (recursive view?)"));
     }
-    // A view or CTE in a JOIN position is not supported yet (the keep-alias
-    // splice only rewrites the main FROM; a joined CTE would need its body's
-    // WHERE folded into the join's ON). Refuse cleanly, never answer wrongly.
-    for j in &s.joins {
+    // A CTE named in a JOIN operand is spliced onto its base table with the
+    // SAME keep-alias derived-table logic used for the main FROM: the base is
+    // read `JOIN <base> AS <c>` and the CTE body's WHERE is AND-merged into the
+    // join's ON (`flatten_cte_join`). A view in a JOIN keeps the old refusal —
+    // views use the strip-name splice and have no alias to resolve `v.col`
+    // against, so folding them into a join is out of scope here.
+    let outer_has_items = s.items.is_some();
+    for j in &mut s.joins {
         if ctes.contains_key(&j.table) {
-            return Err(bind_err(format!(
-                "CTE `{}` used in a JOIN is not supported yet",
-                j.table
-            )));
-        }
-        if views.contains_key(&j.table) {
+            flatten_cte_join(j, views, ctes, depth, outer_has_items)?;
+        } else if views.contains_key(&j.table) {
             return Err(bind_err(format!(
                 "view `{}` used in a JOIN is not supported yet",
                 j.table
@@ -239,9 +286,98 @@ fn flatten_cte(
     s.alias = Some(ref_alias);
     s.where_clause = merge_where(body_where, s.where_clause.take());
     if s.items.is_none() {
-        // `SELECT * FROM cte`: expose the body's own column list, not a fresh
-        // `*` over the base (which could carry columns the body hid).
-        s.items = body.items.take();
+        if s.joins.is_empty() {
+            // `SELECT * FROM cte`: expose the body's own column list, not a
+            // fresh `*` over the base (which could carry columns the body hid).
+            s.items = body.items.take();
+        } else if body.items.is_some() {
+            // `SELECT * FROM cte JOIN …` with a PROJECTING body: `*` must expand
+            // to the CTE's columns PLUS the joined tables', which the single body
+            // item-list cannot express — installing it would silently drop the
+            // join's columns. Refuse rather than answer wrongly. (A `SELECT *`
+            // body is fine: its `*` correctly expands over every source below.)
+            return Err(bind_err(format!(
+                "`SELECT *` over a JOIN with a projecting CTE (`{tname}`) is not \
+                 supported yet; list the output columns explicitly"
+            )));
+        }
+        // else: `SELECT *`-bodied CTE with a join — leave `*` to expand over all
+        // sources; the base carries every column the body exposed.
+    }
+    Ok(())
+}
+
+/// Splice a CTE named in a JOIN operand (`… JOIN c ON p`) onto its base table,
+/// reusing the keep-alias derived-table logic: the base is read under the
+/// reference name (or an explicit `AS x`) and the CTE body's WHERE is AND-merged
+/// into the join's ON. So `c.col` in the ON / projection / outer WHERE resolves,
+/// exactly as it does for a CTE in the main FROM.
+///
+/// **Soundness.** Merging the CTE's WHERE into the ON is only correct when the
+/// CTE is NOT a preserved join side: for an INNER join, or the optional (right)
+/// side of a LEFT join, filtering the CTE's rows before the join is equivalent
+/// to filtering them in the ON. On the preserved side of a RIGHT/FULL join it is
+/// not (it would resurrect rows the body filtered out, NULL-extended), so those
+/// are refused. A projecting CTE body under an outer `SELECT *` is also refused:
+/// the join's `*` would expand to the base's full column list, exposing columns
+/// the body hid. Both are clean refusals, never a wrong answer.
+fn flatten_cte_join(
+    j: &mut JoinClause,
+    views: &ViewCatalog,
+    ctes: &ViewCatalog,
+    depth: usize,
+    outer_has_items: bool,
+) -> Result<()> {
+    let tname = j.table.clone();
+    if !matches!(j.kind, JoinKind::Inner | JoinKind::Left) {
+        return Err(bind_err(format!(
+            "CTE `{tname}` on the preserved side of a RIGHT/FULL JOIN is not \
+             supported yet"
+        )));
+    }
+    let cte_src = ctes.get(&tname).expect("caller checked the CTE exists");
+    // The name the outer query addresses the CTE by: an explicit `AS x`, else
+    // the CTE name itself. Kept as the base's alias so qualified refs resolve.
+    let ref_alias = j.alias.clone().unwrap_or_else(|| tname.clone());
+    let (cte_stmt, _explain, n_params) = parse_statement(cte_src)
+        .map_err(|e| bind_err(format!("CTE `{tname}` body does not parse: {e}")))?;
+    if n_params != 0 {
+        return Err(bind_err(format!("CTE `{tname}` body must not use parameters")));
+    }
+    let Stmt::Select(mut body) = cte_stmt else {
+        return Err(bind_err(format!("CTE `{tname}` body is not a simple SELECT")));
+    };
+    // The body itself may reference a view or another (preceding) CTE.
+    flatten_select(&mut body, views, ctes, depth + 1)?;
+    check_simple(&body, &tname)?;
+    // `SELECT *` over the join cannot expand a projecting CTE body correctly —
+    // the base carries columns the body hid. Refuse rather than answer wrongly.
+    if !outer_has_items && body.items.is_some() {
+        return Err(bind_err(format!(
+            "`SELECT *` over a JOIN with a projecting CTE (`{tname}`) is not \
+             supported yet; list the output columns explicitly"
+        )));
+    }
+
+    // Rename the body's own qualifier to the reference alias, so its WHERE reads
+    // under the same name the outer query and ON clause use.
+    let from_name = body
+        .alias
+        .clone()
+        .or_else(|| body.table.clone())
+        .expect("check_simple guarantees a FROM table");
+    let mut body_where = body.where_clause.take();
+    if let Some(w) = &mut body_where {
+        rename_qualifier(w, &from_name, &ref_alias);
+    }
+
+    // Splice: the join now reads the CTE's base under the reference alias, and
+    // the CTE's WHERE is AND-merged into the join's ON (sound for INNER/LEFT).
+    j.table = body.table.take().expect("check_simple guarantees a FROM table");
+    j.alias = Some(ref_alias);
+    if let Some(cw) = body_where {
+        let existing = j.on.clone();
+        j.on = Expr::Binary(crate::ast::BinOp::And, Box::new(existing), Box::new(cw));
     }
     Ok(())
 }
@@ -405,6 +541,82 @@ fn flatten_expr(
         }
         Expr::Agg(_, Some(arg), _) => flatten_expr(arg, views, ctes, depth),
         _ => Ok(()),
+    }
+}
+
+/// Collect every base name a SELECT reads FROM — its main table, its JOIN
+/// operands, its derived-table body, and any subquery inside its expressions.
+/// [`validate_cte_order`] uses this to see every CTE name a body references.
+fn collect_source_names(s: &SelectStmt, out: &mut Vec<String>) {
+    if let Some(t) = &s.table {
+        out.push(t.clone());
+    }
+    for j in &s.joins {
+        out.push(j.table.clone());
+    }
+    if let Some(d) = &s.from_derived {
+        collect_source_names(d, out);
+    }
+    if let Some(items) = &s.items {
+        for (e, _) in items {
+            collect_expr_sources(e, out);
+        }
+    }
+    if let Some(w) = &s.where_clause {
+        collect_expr_sources(w, out);
+    }
+    for g in &s.group_by {
+        collect_expr_sources(g, out);
+    }
+    if let Some(h) = &s.having {
+        collect_expr_sources(h, out);
+    }
+    for (e, _) in &s.order_by {
+        collect_expr_sources(e, out);
+    }
+}
+
+/// Recurse into a subquery-bearing expression, collecting the base names any
+/// nested SELECT reads FROM. Mirrors [`flatten_expr`]'s traversal.
+fn collect_expr_sources(e: &Expr, out: &mut Vec<String>) {
+    match e {
+        Expr::Subquery(s) | Expr::Exists(s, _) => collect_source_names(s, out),
+        Expr::InSubquery(lhs, s, _) => {
+            collect_expr_sources(lhs, out);
+            collect_source_names(s, out);
+        }
+        Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => collect_expr_sources(a, out),
+        Expr::Binary(_, a, b) | Expr::Like(a, b) => {
+            collect_expr_sources(a, out);
+            collect_expr_sources(b, out);
+        }
+        Expr::IsDistinct(a, b, _) | Expr::Glob(a, b, _) => {
+            collect_expr_sources(a, out);
+            collect_expr_sources(b, out);
+        }
+        Expr::InList(a, list, _) => {
+            collect_expr_sources(a, out);
+            for item in list {
+                collect_expr_sources(item, out);
+            }
+        }
+        Expr::Case(arms, else_) => {
+            for (c, r) in arms {
+                collect_expr_sources(c, out);
+                collect_expr_sources(r, out);
+            }
+            if let Some(x) = else_ {
+                collect_expr_sources(x, out);
+            }
+        }
+        Expr::Coalesce(items) | Expr::Func(_, items) => {
+            for item in items {
+                collect_expr_sources(item, out);
+            }
+        }
+        Expr::InParamSlot(a, _, _) | Expr::InContext(a, _, _) => collect_expr_sources(a, out),
+        Expr::Agg(_, Some(arg), _) => collect_expr_sources(arg, out),
+        _ => {}
     }
 }
 
