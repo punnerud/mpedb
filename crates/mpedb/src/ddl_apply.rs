@@ -486,6 +486,12 @@ impl Database {
             DdlStmt::DropTrigger { name, if_exists } => {
                 return self.apply_drop_trigger(&name, if_exists);
             }
+            // `ANALYZE`/`REINDEX` are accepted no-ops. The planner is rule-based
+            // (no statistics for ANALYZE to gather) and indexes are maintained
+            // eagerly on every write (nothing for REINDEX to rebuild), so both
+            // succeed touching nothing — matching sqlite's "it works" so tools
+            // and migrations that emit them do not break.
+            DdlStmt::Analyze { name: _ } | DdlStmt::Reindex { target: _ } => {}
             DdlStmt::DropPolicy { table, name } => {
                 self.drop_policy(&table, &name)?;
             }

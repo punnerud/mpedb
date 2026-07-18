@@ -57,7 +57,8 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | PRAGMA | **Not needed** | everything a PRAGMA would set lives in the config file, per database, versioned |
 | VACUUM | **Not needed** | COW pages + commit-time freelist fixpoint reclaim space continuously |
 | ATTACH / DETACH | ❌ | cross-file read-joins over workspace members are planned (#51) |
-| ANALYZE | ❌ | the planner is rule-based (PK > unique > non-unique index > scan) |
+| ANALYZE | **Not needed** | accepted as a no-op success (`ANALYZE` / `ANALYZE <name>`): the planner is rule-based (PK > unique > non-unique index > scan) and keeps no statistics, so there is nothing to gather — sqlite-equivalent success so tools/migrations emitting it don't break. The optional target is not required to exist (leniency is never a wrong answer) |
+| REINDEX | **Not needed** | accepted as a no-op success (`REINDEX` / `REINDEX <name>`): mpedb maintains every index eagerly on each write, so there is never a stale index to rebuild. A table vs index name is indistinguishable here (indexes are positional, names not persisted), so any target is accepted leniently |
 
 ## SELECT clauses
 

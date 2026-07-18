@@ -56,6 +56,14 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
             p.advance();
             p.parse_alter()?
         }
+        Some("analyze") => {
+            p.advance();
+            p.parse_analyze()?
+        }
+        Some("reindex") => {
+            p.advance();
+            p.parse_reindex()?
+        }
         _ => return Ok(None),
     };
     p.eat(&Tok::Semicolon);
@@ -478,6 +486,32 @@ impl<'a> Parser<'a> {
         self.expect_kw(Kw::On, "ON")?;
         let table = self.ident("table name")?;
         Ok(DdlStmt::DropPolicy { table, name })
+    }
+
+    /// `ANALYZE [<name>]` — an accepted no-op (mpedb's planner is rule-based and
+    /// keeps no statistics). The optional target (a table/index/schema name) is
+    /// consumed and ignored; it is not required to exist.
+    fn parse_analyze(&mut self) -> Result<DdlStmt> {
+        let name = self.opt_target_name()?;
+        Ok(DdlStmt::Analyze { name })
+    }
+
+    /// `REINDEX [<name>]` — an accepted no-op (mpedb maintains indexes eagerly).
+    /// The optional target (table or index name — indistinguishable here) is
+    /// consumed and ignored.
+    fn parse_reindex(&mut self) -> Result<DdlStmt> {
+        let target = self.opt_target_name()?;
+        Ok(DdlStmt::Reindex { target })
+    }
+
+    /// Consume an optional single identifier target (bare or quoted), returning
+    /// `None` at end of statement / a trailing `;`. Shared by ANALYZE/REINDEX.
+    fn opt_target_name(&mut self) -> Result<Option<String>> {
+        if matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_))) {
+            Ok(Some(self.ident("table or index name")?))
+        } else {
+            Ok(None)
+        }
     }
 
     fn parse_alter(&mut self) -> Result<DdlStmt> {
