@@ -45,7 +45,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | ALTER TABLE RENAME | ✅ | `RENAME TO` (table) and `RENAME [COLUMN] a TO b` — pure metadata, no data rewrite; sqlite/PG-equivalent refusals (name collision, unknown target) |
 | ALTER TABLE ADD COLUMN | ✅ | nullable column, live + multi-process (existing rows rewritten with NULL). `NOT NULL`/`UNIQUE`/`PRIMARY KEY` on ADD refuse (no default fill / online index build yet), matching sqlite's NOT-NULL-needs-default rule |
 | ALTER TABLE DROP COLUMN | ✅ | live + multi-process (existing rows rewritten without the column; surviving index/PK column references renumbered). Refuses dropping a PK / indexed / last column, matching sqlite |
-| CREATE INDEX | **Not needed** | `unique = true` / `indexed = true` on a column, or `[[table.index]]` with a column LIST for composite (unique or not) — equality on the full width or any prefix, range on the first column, visible in EXPLAIN |
+| CREATE INDEX | ✅ | `CREATE [UNIQUE] INDEX [IF NOT EXISTS] n ON t (cols)` — built over existing rows, live + multi-process; ASC/DESC per column accepted (indexes are ascending, used for equality/prefix/range lookups). Or declare via config `unique`/`indexed`/`[[table.index]]`. The index name is not persisted (indexes are positional) |
 | CREATE VIEW / CREATE TRIGGER | ❌ | triggers' job is planned as the PySpell/ETL layer, not in-SQL |
 | WITH (CTEs) | ❌ | |
 | VALUES (standalone) | ❌ | |

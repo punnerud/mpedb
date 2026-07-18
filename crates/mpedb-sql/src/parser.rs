@@ -111,6 +111,11 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
             p.advance();
             if p.eat_word("TABLE") {
                 p.parse_create_table()?
+            } else if p.eat_word("UNIQUE") {
+                p.expect_word("INDEX")?;
+                p.parse_create_index(true)?
+            } else if p.eat_word("INDEX") {
+                p.parse_create_index(false)?
             } else {
                 p.parse_create_policy()?
             }
@@ -535,6 +540,29 @@ impl<'a> Parser<'a> {
             using_src,
             check_src,
         }))
+    }
+
+    fn parse_create_index(&mut self, unique: bool) -> Result<DdlStmt> {
+        let if_not_exists = if self.eat_word("IF") {
+            self.expect_kw(Kw::Not, "NOT")?;
+            self.expect_word("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident("index name")?;
+        self.expect_kw(Kw::On, "ON")?;
+        let table = self.ident("table name")?;
+        self.expect(&Tok::LParen, "(")?;
+        let mut columns = vec![self.ident("column name")?];
+        // Per-column ASC/DESC is accepted and ignored (indexes are ascending).
+        let _ = self.eat_kw(Kw::Asc) || self.eat_kw(Kw::Desc);
+        while self.eat(&Tok::Comma) {
+            columns.push(self.ident("column name")?);
+            let _ = self.eat_kw(Kw::Asc) || self.eat_kw(Kw::Desc);
+        }
+        self.expect(&Tok::RParen, ")")?;
+        Ok(DdlStmt::CreateIndex { name, table, columns, unique, if_not_exists })
     }
 
     fn parse_drop_table(&mut self) -> Result<DdlStmt> {

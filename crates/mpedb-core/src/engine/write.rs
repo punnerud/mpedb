@@ -1103,6 +1103,65 @@ impl<'e> WriteTxn<'e> {
         self.publish_schema(&new_schema)
     }
 
+    /// CREATE INDEX: add a secondary index and BUILD its tree over the existing
+    /// rows. Scans the PK tree once, computes each row's index key (skipping
+    /// rows with any NULL indexed column — SQL membership), and inserts
+    /// `key → pk`. A UNIQUE index whose build hits a duplicate aborts with a
+    /// violation (nothing is published). One commit; the new tree's catalog
+    /// root is persisted by the commit's table-root write-back.
+    pub fn create_index(&mut self, table_id: u32, columns: Vec<u16>, unique: bool) -> Result<()> {
+        let bundle = Arc::clone(&self.bundle);
+        let new_schema = bundle.schema.with_added_index(
+            table_id,
+            mpedb_types::IndexDef { columns: columns.clone(), unique },
+        )?;
+        let (tname, new_ino) = {
+            let table = bundle
+                .schema
+                .table(table_id)
+                .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
+            // index 0 is the PK tree; the new secondary is appended after the
+            // existing ones.
+            (table.name.clone(), (table.indexes.len() + 1) as u32)
+        };
+        let col_types = bundle.col_types[table_id as usize].clone();
+
+        // Collect (index key, pk) for every row that has an entry.
+        let (pkroot, _) = self.tree_root(table_id, 0)?;
+        let mut entries: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        {
+            let mut c = btree::cursor(self, pkroot, None, None)?;
+            while let Some((k, v)) = c.next(self)? {
+                let values = row::decode_row(&v, &col_types)?;
+                if let Some(ikey) = index_row_key(unique, &columns, &values, &k) {
+                    entries.push((ikey, k));
+                }
+            }
+        }
+        // Build the index tree from an empty root.
+        let mut iroot = 0u64;
+        let mut icount = 0u64;
+        for (ikey, pk) in &entries {
+            let out = btree::insert(
+                self,
+                iroot,
+                ikey,
+                &mut btree::Payload::Flat(pk),
+                InsertMode::InsertOnly,
+            )?;
+            if unique && out.existed {
+                return Err(Error::UniqueViolation {
+                    table: tname,
+                    constraint: index_constraint_name(self.eng, table_id, &columns),
+                });
+            }
+            iroot = out.new_root;
+            icount += 1;
+        }
+        self.set_tree_root(table_id, new_ino, iroot, icount);
+        self.publish_schema(&new_schema)
+    }
+
     /// Publish a new schema (already validated by the caller via one of the
     /// `Schema::with_*` evolvers) into the catalog and arm the schema-gen bump.
     /// For a PURE-METADATA change (rename): no tree roots move, so this single

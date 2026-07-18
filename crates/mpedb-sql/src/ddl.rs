@@ -77,6 +77,18 @@ pub enum DdlStmt {
     /// a PK column, an indexed column, or the last column (no online index
     /// rebuild, and a table needs its key).
     AlterDropColumn { table: String, column: String },
+    /// `CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON <table> (<col> [ASC|DESC],
+    /// …)` — builds a secondary index over the existing rows. The index name is
+    /// accepted but not persisted (mpedb indexes are positional); ASC/DESC per
+    /// column is accepted and ignored (indexes are ascending, used for
+    /// equality/range lookups only).
+    CreateIndex {
+        name: String,
+        table: String,
+        columns: Vec<String>,
+        unique: bool,
+        if_not_exists: bool,
+    },
     CreatePolicy(CreatePolicySpec),
     DropPolicy { table: String, name: String },
     AlterRls { table: String, action: RlsAction },
@@ -199,6 +211,33 @@ mod tests {
         assert_eq!(
             with_kw,
             DdlStmt::AlterDropColumn { table: "t".into(), column: "a".into() }
+        );
+    }
+
+    #[test]
+    fn create_index_parses() {
+        assert_eq!(
+            parse_ddl("CREATE INDEX ix ON t (a)").unwrap().unwrap(),
+            DdlStmt::CreateIndex {
+                name: "ix".into(),
+                table: "t".into(),
+                columns: vec!["a".into()],
+                unique: false,
+                if_not_exists: false,
+            }
+        );
+        // UNIQUE, IF NOT EXISTS, composite, and per-column ASC/DESC (ignored).
+        assert_eq!(
+            parse_ddl("CREATE UNIQUE INDEX IF NOT EXISTS ix ON t (a, b DESC, c ASC)")
+                .unwrap()
+                .unwrap(),
+            DdlStmt::CreateIndex {
+                name: "ix".into(),
+                table: "t".into(),
+                columns: vec!["a".into(), "b".into(), "c".into()],
+                unique: true,
+                if_not_exists: true,
+            }
         );
     }
 
