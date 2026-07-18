@@ -55,6 +55,7 @@ mod sqlite_attach;
 mod ddl_apply;
 mod sqlite_overlay;
 mod stream;
+mod trigger;
 mod workspace;
 
 pub use session::Session;
@@ -265,6 +266,11 @@ pub struct Database {
     /// The database file path this handle attached (for `Workspace` dup-file
     /// detection and diagnostics).
     path: std::path::PathBuf,
+    /// The compiled trigger set (DESIGN-TRIGGERS), gated on `schema_gen` exactly
+    /// like the plan cache: `(gen, set)`, rebuilt only when a `CREATE`/`DROP
+    /// TRIGGER` (here or in another process) moves the gen. `None` = not yet
+    /// built. Consulted by the write executor to fire `AFTER INSERT` triggers.
+    trigger_cache: RwLock<Option<(u64, Arc<trigger::TriggerSet>)>>,
     /// Table ids this process declared `require_policy = true` for
     /// (DESIGN-MULTIDB §6.3). Resolved from names ONCE at open — so a typo or a
     /// renamed table fails immediately and loudly, rather than silently
@@ -291,6 +297,7 @@ impl Database {
             engine,
             cache: RwLock::new(HashMap::new()),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
+            trigger_cache: RwLock::new(None),
             path: path.to_path_buf(),
             // No config, so no §6.3 assertions — consistent with this
             // constructor's contract (it also skips CHECK programs): a
@@ -346,6 +353,7 @@ impl Database {
             engine,
             cache: RwLock::new(HashMap::new()),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
+            trigger_cache: RwLock::new(None),
             path,
             require_policy,
         })
@@ -1223,8 +1231,17 @@ impl WriteSession<'_> {
         // shared-registry eviction is needed here.
         self.db.validate_policy_write(None, plan, &mut self.txn)?;
         let full = session::resolve_params(plan, params, &self.session)?;
+        let triggers = self.db.trigger_set()?;
         let mut partial = false;
-        let res = exec_stmt(&mut self.txn, &self.db.schema(), plan, &full, &mut partial);
+        let res = exec::exec_stmt_triggered(
+            &mut self.txn,
+            &self.db.schema(),
+            plan,
+            &full,
+            &mut partial,
+            &triggers,
+            0,
+        );
         if res.is_err() && partial {
             // The failed statement may have applied part of its effects; the
             // transaction no longer reflects whole statements. See the

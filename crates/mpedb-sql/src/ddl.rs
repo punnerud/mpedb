@@ -52,6 +52,43 @@ pub enum RlsAction {
     Disable,
 }
 
+/// When a trigger fires relative to the row operation (DESIGN-TRIGGERS §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerTiming {
+    Before,
+    After,
+}
+
+/// Which row event a trigger watches. `Update { of }` names the columns whose
+/// change arms the trigger (`UPDATE OF a, b`); an empty list means any column.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Insert,
+    Update { of: Vec<String> },
+    Delete,
+}
+
+/// `CREATE TRIGGER [IF NOT EXISTS] <name> {BEFORE|AFTER}
+///    {INSERT|UPDATE [OF cols]|DELETE} ON <table> [FOR EACH ROW]
+///    [WHEN (<cond>)] BEGIN <stmt>; END` (DESIGN-TRIGGERS §1-2).
+///
+/// The `WHEN` predicate and the `BEGIN … END` body are captured as SOURCE text
+/// (like `CREATE VIEW`'s SELECT and a policy predicate), re-compiled against the
+/// live schema at catalog-load time. `EXECUTE PROCEDURE` (PySpell) bodies are a
+/// named parse refusal until DESIGN-TRIGGERS stage 5, so the body is always SQL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTriggerSpec {
+    pub name: String,
+    pub timing: TriggerTiming,
+    pub event: TriggerEvent,
+    pub table: String,
+    /// Captured `WHEN (…)` predicate source, if any.
+    pub when_src: Option<String>,
+    /// Captured `BEGIN … END` body source (a single statement in v1).
+    pub body_sql: String,
+    pub if_not_exists: bool,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum DdlStmt {
     CreateTable(CreateTableSpec),
@@ -98,6 +135,11 @@ pub enum DdlStmt {
     CreatePolicy(CreatePolicySpec),
     DropPolicy { table: String, name: String },
     AlterRls { table: String, action: RlsAction },
+    /// `CREATE TRIGGER …` (DESIGN-TRIGGERS). Stored as a sys-keyspace catalog
+    /// record (`trigger/<name>`), never a plan — like `CREATE VIEW`.
+    CreateTrigger(CreateTriggerSpec),
+    /// `DROP TRIGGER [IF EXISTS] <name>` (DESIGN-TRIGGERS).
+    DropTrigger { name: String, if_exists: bool },
 }
 
 #[cfg(test)]
@@ -245,6 +287,85 @@ mod tests {
                 if_not_exists: true,
             }
         );
+    }
+
+    #[test]
+    fn create_trigger_after_insert_parses() {
+        let ddl = parse_ddl(
+            "CREATE TRIGGER audit_ins AFTER INSERT ON orders FOR EACH ROW \
+             BEGIN INSERT INTO audit (oid) VALUES (NEW.id); END",
+        )
+        .unwrap()
+        .unwrap();
+        match ddl {
+            DdlStmt::CreateTrigger(s) => {
+                assert_eq!(s.name, "audit_ins");
+                assert_eq!(s.timing, TriggerTiming::After);
+                assert_eq!(s.event, TriggerEvent::Insert);
+                assert_eq!(s.table, "orders");
+                assert!(s.when_src.is_none());
+                assert!(!s.if_not_exists);
+                assert_eq!(s.body_sql, "INSERT INTO audit (oid) VALUES (NEW.id)");
+            }
+            other => panic!("expected CreateTrigger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_trigger_when_and_if_not_exists_and_case_body() {
+        let ddl = parse_ddl(
+            "CREATE TRIGGER IF NOT EXISTS t AFTER INSERT ON orders WHEN (NEW.total > 100) \
+             BEGIN INSERT INTO big (v) VALUES (CASE WHEN NEW.total > 200 THEN 2 ELSE 1 END); END",
+        )
+        .unwrap()
+        .unwrap();
+        match ddl {
+            DdlStmt::CreateTrigger(s) => {
+                assert!(s.if_not_exists);
+                assert_eq!(s.when_src.as_deref(), Some("NEW.total > 100"));
+                // The CASE … END inside the body must NOT end the BEGIN … END capture.
+                assert_eq!(
+                    s.body_sql,
+                    "INSERT INTO big (v) VALUES (CASE WHEN NEW.total > 200 THEN 2 ELSE 1 END)"
+                );
+            }
+            other => panic!("expected CreateTrigger, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn trigger_update_of_and_drop_parse() {
+        match parse_ddl(
+            "CREATE TRIGGER t BEFORE UPDATE OF a, b ON orders BEGIN DELETE FROM log; END",
+        )
+        .unwrap()
+        .unwrap()
+        {
+            DdlStmt::CreateTrigger(s) => {
+                assert_eq!(s.timing, TriggerTiming::Before);
+                assert_eq!(s.event, TriggerEvent::Update { of: vec!["a".into(), "b".into()] });
+            }
+            other => panic!("expected CreateTrigger, got {other:?}"),
+        }
+        assert_eq!(
+            parse_ddl("DROP TRIGGER audit_ins").unwrap().unwrap(),
+            DdlStmt::DropTrigger { name: "audit_ins".into(), if_exists: false }
+        );
+        assert_eq!(
+            parse_ddl("DROP TRIGGER IF EXISTS audit_ins").unwrap().unwrap(),
+            DdlStmt::DropTrigger { name: "audit_ins".into(), if_exists: true }
+        );
+    }
+
+    #[test]
+    fn trigger_named_refusals_parse_errors() {
+        assert!(parse_ddl("CREATE TRIGGER t INSTEAD OF INSERT ON v BEGIN DELETE FROM x; END").is_err());
+        assert!(parse_ddl(
+            "CREATE TRIGGER t AFTER INSERT ON o FOR EACH STATEMENT BEGIN DELETE FROM x; END"
+        )
+        .is_err());
+        assert!(parse_ddl("CREATE TRIGGER t AFTER INSERT ON o EXECUTE PROCEDURE p(NEW.id)").is_err());
+        assert!(parse_ddl("CREATE TRIGGER t AFTER INSERT ON o BEGIN INSERT INTO x VALUES (1)").is_err()); // no END
     }
 
     #[test]
