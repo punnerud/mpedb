@@ -4,12 +4,14 @@
 //! them via its policy-store API. `USING`/`WITH CHECK` predicates are captured
 //! as SOURCE text (re-bound by the planner per statement, §3.2).
 
-use mpedb_types::{ColumnType, PolicyCmd};
+use mpedb_types::{ColumnType, DefaultExpr, PolicyCmd};
 
-/// One column of a `CREATE TABLE` (#47 stage 2). Types are the config's
-/// names (`int64`/`int`/`integer`, `text`, `real`, `bool`, `blob`,
-/// `timestamp`, `any`), constraints the useful subset: `NOT NULL`,
-/// `UNIQUE`, `PRIMARY KEY`. `DEFAULT`/`CHECK` are named refusals for now.
+/// One column of a `CREATE TABLE` (#47 stage 2) or `ALTER TABLE ADD COLUMN`.
+/// Types are the config's names (`int64`/`int`/`integer`, `text`, `real`,
+/// `bool`, `blob`, `timestamp`, `any`), constraints the useful subset:
+/// `NOT NULL`, `UNIQUE`, `PRIMARY KEY`. `CHECK`/`REFERENCES` are named
+/// refusals for now; `DEFAULT <const>` is parsed for ADD COLUMN (below) and
+/// still refused by name in `CREATE TABLE`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateColumnSpec {
     pub name: String,
@@ -17,6 +19,13 @@ pub struct CreateColumnSpec {
     pub not_null: bool,
     pub unique: bool,
     pub pk: bool,
+    /// `DEFAULT <const>` on `ALTER TABLE ADD COLUMN` — a LITERAL constant
+    /// (integer/float/string/blob/bool/NULL or a signed number), folded at
+    /// parse time (sqlite refuses a non-constant ADD-COLUMN default). Always a
+    /// `DefaultExpr::Const`; the facade type-checks it against `ty` and, when
+    /// non-NULL, fills existing rows with it. `None` when no `DEFAULT` clause
+    /// (and always `None` on the `CREATE TABLE` path, which refuses DEFAULT).
+    pub default: Option<DefaultExpr>,
 }
 
 /// `CREATE TABLE <name> (col TYPE [cons…], …[, PRIMARY KEY (a, b)]
@@ -119,11 +128,13 @@ pub enum DdlStmt {
     /// `ALTER TABLE <t> RENAME [COLUMN] <old> TO <new>` — pure schema metadata
     /// (column position/type unchanged, so no row is touched).
     AlterRenameColumn { table: String, column: String, new_name: String },
-    /// `ALTER TABLE <t> ADD [COLUMN] <name> <type> [NULL]` (#47 stage 5) —
-    /// appends a column. Existing rows are rewritten with the new column NULL
-    /// (mpedb's row image is schema-driven, so a widen needs a rewrite). v1
-    /// accepts only a nullable column (the facade refuses NOT NULL / UNIQUE /
-    /// PRIMARY KEY on ADD — no DEFAULT fill and no online index build yet).
+    /// `ALTER TABLE <t> ADD [COLUMN] <name> <type> [NOT NULL] [DEFAULT <const>]`
+    /// (#47 stage 5) — appends a column. Existing rows are rewritten with the
+    /// new column set to the `DEFAULT <const>` (or NULL when there is none;
+    /// mpedb's row image is schema-driven, so a widen needs a rewrite). A
+    /// non-NULL default makes `NOT NULL` legal and is persisted for later
+    /// INSERTs. The facade refuses UNIQUE / PRIMARY KEY on ADD and NOT NULL
+    /// without a non-NULL default — matching sqlite.
     AlterAddColumn { table: String, column: CreateColumnSpec },
     /// `ALTER TABLE <t> DROP [COLUMN] <name>` (#47 stage 5) — removes a column
     /// and rewrites existing rows without it. The facade/schema refuse dropping
@@ -278,6 +289,49 @@ mod tests {
         // Unknown type / missing type error.
         assert!(parse_ddl("ALTER TABLE t ADD COLUMN c BOGUS").is_err());
         assert!(parse_ddl("ALTER TABLE t ADD COLUMN c").is_err());
+    }
+
+    #[test]
+    fn alter_add_column_default_literals() {
+        use mpedb_types::Value;
+        let default = |sql: &str| match parse_ddl(sql).unwrap().unwrap() {
+            DdlStmt::AlterAddColumn { column, .. } => column.default,
+            other => panic!("{other:?}"),
+        };
+        // Integer / signed / float / string / bool / NULL literals fold to Const.
+        assert_eq!(
+            default("ALTER TABLE t ADD c INT NOT NULL DEFAULT 5"),
+            Some(DefaultExpr::Const(Value::Int(5)))
+        );
+        assert_eq!(
+            default("ALTER TABLE t ADD c INT DEFAULT -7"),
+            Some(DefaultExpr::Const(Value::Int(-7)))
+        );
+        assert_eq!(
+            default("ALTER TABLE t ADD c REAL DEFAULT 1.5"),
+            Some(DefaultExpr::Const(Value::Float(1.5)))
+        );
+        assert_eq!(
+            default("ALTER TABLE t ADD c TEXT DEFAULT 'x'"),
+            Some(DefaultExpr::Const(Value::Text("x".into())))
+        );
+        assert_eq!(
+            default("ALTER TABLE t ADD c BOOL DEFAULT true"),
+            Some(DefaultExpr::Const(Value::Bool(true)))
+        );
+        assert_eq!(
+            default("ALTER TABLE t ADD c INT DEFAULT NULL"),
+            Some(DefaultExpr::Const(Value::Null))
+        );
+        // No DEFAULT clause → None.
+        assert_eq!(default("ALTER TABLE t ADD c INT"), None);
+        // A non-constant default (parenthesized expr, function, column ref,
+        // CURRENT_*) is refused at parse time, matching sqlite.
+        assert!(parse_ddl("ALTER TABLE t ADD c INT DEFAULT (1+2)").is_err());
+        assert!(parse_ddl("ALTER TABLE t ADD c INT DEFAULT abs(-5)").is_err());
+        assert!(parse_ddl("ALTER TABLE t ADD c INT DEFAULT other").is_err());
+        assert!(parse_ddl("ALTER TABLE t ADD c TEXT DEFAULT current_timestamp").is_err());
+        assert!(parse_ddl("ALTER TABLE t ADD c INT DEFAULT").is_err());
     }
 
     #[test]
