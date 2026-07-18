@@ -47,6 +47,7 @@ impl CompiledPlan {
                     }
                 }
             }
+            PlanStmt::RecursiveCte(rc) => self.validate_recursive_cte(rc, schema, ptypes)?,
             _other => self.validate_rest(schema)?,
         }
         if !self.subplans.is_empty() {
@@ -66,6 +67,79 @@ impl CompiledPlan {
         Ok(())
     }
 
+    /// Re-validate a recursive CTE and its §3 restrictions (design/
+    /// DESIGN-CTE-RECURSIVE.md §3) so a hand-crafted plan cannot smuggle an
+    /// illegal recursive reference past the binder. The three components are
+    /// then checked as ordinary selects (`CTE_TABLE` resolves through
+    /// `validate_select`'s CTE-aware `get_table`).
+    fn validate_recursive_cte(
+        &self,
+        rc: &RecursiveCtePlan,
+        schema: &Schema,
+        ptypes: &[Option<ColumnType>],
+    ) -> Result<()> {
+        // How many times a select's FROM/JOIN operands name the working table.
+        let reads_cte = |sp: &SelectPlan| -> usize {
+            (sp.table == super::CTE_TABLE) as usize
+                + sp.joins.iter().filter(|j| j.table == super::CTE_TABLE).count()
+        };
+        let arity = rc.columns.len();
+        if arity == 0 || arity != rc.col_types.len() {
+            return Err(corrupt("recursive CTE column/type arity mismatch"));
+        }
+        // Stage 1 carries no lifted subqueries and no correlated post-filters —
+        // the parameter layout is `[user]` only.
+        if !self.subplans.is_empty() {
+            return Err(corrupt("recursive CTE with lifted subqueries"));
+        }
+        for sp in [&rc.anchor, &rc.recursive, &rc.outer] {
+            if sp.post_filter.is_some() {
+                return Err(corrupt("recursive CTE component carries a post-filter"));
+            }
+        }
+        // The anchor is non-recursive: it must NOT reference the working table,
+        // and its projection arity fixes the CTE's shape.
+        if reads_cte(&rc.anchor) != 0 {
+            return Err(corrupt("recursive CTE anchor references the working table"));
+        }
+        if rc.anchor.projection.len() != arity {
+            return Err(corrupt("recursive CTE anchor arity does not match the column list"));
+        }
+        // The recursive term references the working table EXACTLY once, as a
+        // FROM/JOIN operand, and only through an INNER join — never a
+        // null-extended (LEFT/FULL) side (§3).
+        if reads_cte(&rc.recursive) != 1 {
+            return Err(corrupt(
+                "recursive CTE term must reference the working table exactly once",
+            ));
+        }
+        for j in &rc.recursive.joins {
+            if j.table == super::CTE_TABLE && j.kind != JoinKind::Inner {
+                return Err(corrupt(
+                    "recursive CTE reference on the null-extended side of an outer join",
+                ));
+            }
+        }
+        // No aggregate / GROUP BY / DISTINCT / window in the recursive term (§3).
+        if rc.recursive.aggregate.is_some()
+            || rc.recursive.distinct
+            || !rc.recursive.windows.is_empty()
+        {
+            return Err(corrupt(
+                "recursive CTE term uses an aggregate/GROUP BY/DISTINCT/window",
+            ));
+        }
+        if rc.recursive.projection.len() != arity {
+            return Err(corrupt("recursive CTE term arity does not match the column list"));
+        }
+        // Structural validation of each component (widths, access paths, program
+        // bounds). CTE_TABLE resolves through the CTE-aware `get_table`.
+        self.validate_select(&rc.anchor, schema, ptypes)?;
+        self.validate_select(&rc.recursive, schema, ptypes)?;
+        self.validate_select(&rc.outer, schema, ptypes)?;
+        Ok(())
+    }
+
     /// Everything `validate` checks about one SELECT — shared verbatim between
     /// a top-level SELECT and each compound arm, so the two can never drift.
     fn validate_select(
@@ -74,7 +148,20 @@ impl CompiledPlan {
         schema: &Schema,
         ptypes: &[Option<ColumnType>],
     ) -> Result<()> {
-        let get_table = |id: u32| {
+        // A recursive CTE's working table (CTE_TABLE) resolves to the synthetic
+        // def derived from THIS plan's RecursiveCte node — the only meaning
+        // CTE_TABLE has inside one plan. Built once here so `get_table` (and the
+        // outer-table selection below) can hand out a reference to it.
+        let cte_td: Option<TableDef> = match &self.stmt {
+            PlanStmt::RecursiveCte(rc) => Some(rc.cte_def()),
+            _ => None,
+        };
+        let get_table = |id: u32| -> Result<&TableDef> {
+            if id == super::CTE_TABLE {
+                return cte_td
+                    .as_ref()
+                    .ok_or_else(|| corrupt("CTE working table outside a recursive CTE"));
+            }
             schema
                 .table(id)
                 .ok_or_else(|| corrupt(format!("table id {id} out of range")))
@@ -107,6 +194,16 @@ impl CompiledPlan {
                         return Err(corrupt("keyed access on a FROM-less select"));
                     }
                     super::dual_def()
+                } else if *table == super::CTE_TABLE {
+                    // The recursive CTE's working table: no PK and no indexes, so
+                    // the ONLY sound access over it is a FullScan (the executor
+                    // reads it from an in-memory row set, never through a key
+                    // tree). Joins ARE allowed — the recursive term may join it
+                    // with a base table.
+                    if !matches!(access, AccessPath::FullScan) {
+                        return Err(corrupt("keyed access on a recursive CTE working table"));
+                    }
+                    get_table(*table)?
                 } else {
                     get_table(*table)?
                 };
@@ -149,6 +246,11 @@ impl CompiledPlan {
                     t.columns.iter().map(|c| c.ty).collect();
                 for j in joins {
                     let jt = get_table(j.table)?;
+                    // The working table as a join operand is FullScan-only, for
+                    // the same reason as in the outer position — no key tree.
+                    if j.table == super::CTE_TABLE && !matches!(j.access, AccessPath::FullScan) {
+                        return Err(corrupt("keyed access on a recursive CTE working table"));
+                    }
                     // FULL needs the inner side enumerated and held: single
                     // join, FullScan access — the executor's unmatched-inner
                     // sweep is built on exactly that.
@@ -339,7 +441,7 @@ impl CompiledPlan {
                 .ok_or_else(|| corrupt(format!("table id {id} out of range")))
         };
         match &self.stmt {
-            PlanStmt::Select(_) | PlanStmt::Compound(_) => {
+            PlanStmt::Select(_) | PlanStmt::Compound(_) | PlanStmt::RecursiveCte(_) => {
                 unreachable!("handled by validate")
             }
             PlanStmt::Insert {

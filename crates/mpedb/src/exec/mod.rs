@@ -20,6 +20,7 @@ use std::collections::BinaryHeap;
 mod aggregate;
 mod fts;
 mod gather;
+mod recursive;
 mod window;
 
 pub(crate) use gather::{range_bounds, resolve_part, RawBound};
@@ -517,6 +518,7 @@ fn exec_stmt_impl(
     match &plan.stmt {
         PlanStmt::Select(sp) => exec_select_top(ctx, schema, plan, params, sp),
         PlanStmt::Compound(c) => exec_compound(ctx, schema, plan, params, c),
+        PlanStmt::RecursiveCte(rc) => recursive::exec_recursive_cte(ctx, schema, plan, params, rc),
         _other => exec_stmt_rest(ctx, schema, plan, params, partial, triggers, depth),
     }
 }
@@ -900,7 +902,7 @@ fn exec_select(
                 }
                 out = out.into_iter().skip(skip).take(take).collect();
             }
-            let columns = select_output_columns(schema, sp)?;
+            let columns = select_output_columns(schema, plan, sp)?;
             Ok(ExecResult::Rows { columns, rows: out })
         }
     }
@@ -909,7 +911,7 @@ fn exec_select(
 /// Output column names of one SELECT. A joined slot past the outer's width
 /// belongs to an inner table and is named `<table>.<column>` (`id` alone would
 /// not say which side); a single-table read keeps plain column names.
-fn select_output_columns(schema: &Schema, sp: &SelectPlan) -> Result<Vec<String>> {
+fn select_output_columns(schema: &Schema, plan: &CompiledPlan, sp: &SelectPlan) -> Result<Vec<String>> {
     // FROM-less: no table to name columns from. Every projection is an Expr
     // carrying its own name — the binder cannot produce a Column over the
     // zero-column dual row.
@@ -924,19 +926,19 @@ fn select_output_columns(schema: &Schema, sp: &SelectPlan) -> Result<Vec<String>
             })
             .collect();
     }
-    let t = table_def(schema, sp.table)?;
-    let joined_tables: Vec<&TableDef> = if sp.joins.is_empty() {
+    let t = table_def(schema, plan, sp.table)?;
+    let joined_tables: Vec<std::borrow::Cow<TableDef>> = if sp.joins.is_empty() {
         vec![t]
     } else {
         let mut v = vec![t];
         for j in &sp.joins {
-            v.push(table_def(schema, j.table)?);
+            v.push(table_def(schema, plan, j.table)?);
         }
         v
     };
     let name_slot = |mut i: usize| -> Result<String> {
         if joined_tables.len() == 1 {
-            return t
+            return joined_tables[0]
                 .columns
                 .get(i)
                 .map(|c| c.name.clone())
@@ -1067,7 +1069,7 @@ fn exec_select_with(
     if skip > 0 || take != usize::MAX {
         out = out.into_iter().skip(skip).take(take).collect();
     }
-    let columns = select_output_columns(schema, sp)?;
+    let columns = select_output_columns(schema, plan, sp)?;
     Ok(ExecResult::Rows { columns, rows: out })
 }
 
@@ -1088,7 +1090,7 @@ fn run_aggregate(
     correlated: &[(usize, &SubPlan)],
     post_filter: Option<&ExprProgram>,
 ) -> Result<ExecResult> {
-    let t = table_def(schema, sp.table)?;
+    let t = table_def(schema, plan, sp.table)?;
     let agg = sp
         .aggregate
         .as_ref()
@@ -1098,7 +1100,7 @@ fn run_aggregate(
         plan,
         params,
         schema,
-        t,
+        &t,
         sp.table,
         &sp.access,
         sp.filter.as_ref(),
@@ -1220,7 +1222,7 @@ fn exec_stmt_rest(
     depth: u32,
 ) -> Result<ExecResult> {
     match &plan.stmt {
-        PlanStmt::Select(_) | PlanStmt::Compound(_) => {
+        PlanStmt::Select(_) | PlanStmt::Compound(_) | PlanStmt::RecursiveCte(_) => {
             unreachable!("handled by exec_stmt_impl")
         }
         PlanStmt::Insert {
@@ -1231,7 +1233,7 @@ fn exec_stmt_rest(
             on_conflict,
             returning,
         } => {
-            let t = table_def(schema, *table)?;
+            let t = table_def(schema, plan, *table)?;
             // Bind-time `now()`: captured exactly once per execute() call so
             // every DEFAULT now() in a multi-row INSERT gets the same value
             // (reviewed determinism requirement).
@@ -1268,7 +1270,7 @@ fn exec_stmt_rest(
             } else {
                 let mut built = Vec::with_capacity(rows.len());
                 for row_spec in rows {
-                    built.push(build_insert_row(t, plan, params, row_spec, now)?);
+                    built.push(build_insert_row(&t, plan, params, row_spec, now)?);
                 }
                 built
             };
@@ -1436,7 +1438,7 @@ fn exec_stmt_rest(
             }
             match returning {
                 Some(proj) => Ok(ExecResult::Rows {
-                    columns: projection_names(proj, t),
+                    columns: projection_names(proj, &t),
                     rows: out,
                 }),
                 None => Ok(ExecResult::Affected(written)),
@@ -1451,7 +1453,7 @@ fn exec_stmt_rest(
             with_check,
             returning,
         } => {
-            let t = table_def(schema, *table)?;
+            let t = table_def(schema, plan, *table)?;
             // Collect-then-mutate: gather the matching CURRENT rows first
             // (read-only; a failure here has no effects).
             let old_rows = gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?;
@@ -1552,7 +1554,7 @@ fn exec_stmt_rest(
             }
             match returning {
                 Some(proj) => Ok(ExecResult::Rows {
-                    columns: projection_names(proj, t),
+                    columns: projection_names(proj, &t),
                     rows: out,
                 }),
                 None => Ok(ExecResult::Affected(affected)),
@@ -1565,7 +1567,7 @@ fn exec_stmt_rest(
             filter,
             returning,
         } => {
-            let t = table_def(schema, *table)?;
+            let t = table_def(schema, plan, *table)?;
             // Gather full old rows (the residual filter needs them), then
             // delete by PK values extracted from each row.
             let old_rows = gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?;
@@ -1621,7 +1623,7 @@ fn exec_stmt_rest(
             }
             match returning {
                 Some(proj) => Ok(ExecResult::Rows {
-                    columns: projection_names(proj, t),
+                    columns: projection_names(proj, &t),
                     rows: out,
                 }),
                 None => Ok(ExecResult::Affected(affected)),
@@ -1924,15 +1926,30 @@ pub(crate) fn validate_params(plan: &CompiledPlan, params: &[Value]) -> Result<(
     Ok(())
 }
 
-fn table_def(schema: &Schema, table: u32) -> Result<&TableDef> {
+fn table_def<'a>(
+    schema: &'a Schema,
+    plan: &'a CompiledPlan,
+    table: u32,
+) -> Result<std::borrow::Cow<'a, TableDef>> {
+    use std::borrow::Cow;
     // FROM-less SELECT: the DUAL sentinel resolves to the shared zero-column
     // def — every downstream width/name computation degrades correctly over
     // zero columns, and the gather never reaches a TxnCtx call.
     if table == mpedb_sql::DUAL_TABLE {
-        return Ok(mpedb_sql::dual_def());
+        return Ok(Cow::Borrowed(mpedb_sql::dual_def()));
+    }
+    // The recursive CTE working table resolves to the synthetic def carried by
+    // THIS plan's `RecursiveCte` node — the only meaning `CTE_TABLE` has here.
+    // Owned (built from the plan's columns/types), so it needs no schema entry.
+    if table == mpedb_sql::CTE_TABLE {
+        if let PlanStmt::RecursiveCte(rc) = &plan.stmt {
+            return Ok(Cow::Owned(rc.cte_def()));
+        }
+        return Err(internal("CTE working table outside a recursive CTE"));
     }
     schema
         .table(table)
+        .map(Cow::Borrowed)
         .ok_or_else(|| internal("table id out of range"))
 }
 

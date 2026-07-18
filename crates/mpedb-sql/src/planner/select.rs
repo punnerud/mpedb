@@ -237,18 +237,22 @@ fn check_distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<()> 
     Ok(())
 }
 
-pub(super) fn plan_select(
+pub(super) fn plan_select<'s>(
     s: &ast::SelectStmt,
-    schema: &Schema,
+    schema: &'s Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
     consts: &mut Vec<Value>,
+    // The recursive CTE working table in scope (`WITH RECURSIVE`), if any: a
+    // `FROM <name>` matching it binds to the working table (id `CTE_TABLE`,
+    // FullScan-only). `None` for every ordinary statement.
+    cte: Option<CteRef<'s>>,
 ) -> Result<PlannedStmt> {
     // RIGHT rewrites to a swapped LEFT before anything else looks at the
     // statement — the subquery lift's correlation scope and every stage
     // below must see the FINAL table order.
     let rewritten_right;
-    let s = match super::join::rewrite_right_join(s, schema)? {
+    let s = match super::join::rewrite_right_join(s, schema, cte)? {
         Some(r) => {
             rewritten_right = r;
             &rewritten_right
@@ -281,7 +285,7 @@ pub(super) fn plan_select(
         ));
     }
     let (table_id, table) = match &s.table {
-        Some(name) => resolve_table(schema, name)?,
+        Some(name) => resolve_table_cte(schema, cte, name)?,
         // FROM-less: the DUAL sentinel and a zero-column def. The whole plain
         // pipeline below works over width 0 — access degrades to FullScan
         // (no columns can pin a key), the executor yields ONE empty row, and
@@ -294,7 +298,7 @@ pub(super) fn plan_select(
         }
     };
     if !s.joins.is_empty() {
-        return plan_join_select(s, schema, n_params, catalog, consts, subplans, slot_types);
+        return plan_join_select(s, schema, n_params, catalog, consts, subplans, slot_types, cte);
     }
     let mut binder = match &s.alias {
         Some(a) => Binder::with_scope(Scope::single_named(a.clone(), table), eff_params, true),
@@ -347,6 +351,12 @@ pub(super) fn plan_select(
         // FtsScan already chosen; the remaining WHERE (and any SELECT policy)
         // becomes the per-row residual filter over the matched rows.
         Some((fts_access, _)) => (fts_access.clone(), merge_and(bound_where, policy)),
+        // The recursive CTE working table has no PK and no indexes, so the ONLY
+        // sound access is a FullScan (the executor reads it from an in-memory
+        // row set) — never run access extraction over it (its empty PK would
+        // vacuously satisfy a PkPoint, exactly the dual hazard). The whole
+        // predicate stays as the residual filter.
+        None if table_id == CTE_TABLE => (AccessPath::FullScan, merge_and(bound_where, policy)),
         None if s.table.is_some() => extract_access(merge_and(bound_where, policy), table, consts)?,
         None => (AccessPath::FullScan, merge_and(bound_where, policy)),
     };

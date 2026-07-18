@@ -342,7 +342,7 @@ impl Lift<'_> {
         // reserved-slot layouts would have to be reconciled across levels).
         let inner_n = self.n_params + outer_args.len() as u16;
         let (stmt, inner_ptypes, inner_ctx, _inner_lists, inner_out, inner_subs) =
-            plan_select(&rewritten, self.schema, inner_n, self.catalog, self.consts)?;
+            plan_select(&rewritten, self.schema, inner_n, self.catalog, self.consts, None)?;
         // #73 §3 stage 3: a nested subquery may correlate to its IMMEDIATE
         // parent (stage 2), to a MIDDLE scope, or to the OUTERMOST scope. A
         // reference to a non-immediate ancestor was captured above as a TRANSIT

@@ -10,6 +10,10 @@ pub(crate) enum Stmt {
     Select(SelectStmt),
     /// `SELECT … UNION/EXCEPT/INTERSECT SELECT …` — set-operator chain.
     Compound(CompoundStmt),
+    /// `WITH RECURSIVE t(cols) AS (<anchor> UNION[ ALL] <recursive>) <outer>`
+    /// (design/DESIGN-CTE-RECURSIVE.md). A fixpoint, planned to
+    /// `PlanStmt::RecursiveCte` — NOT flattened like a non-recursive CTE.
+    RecursiveCte(RecursiveCteStmt),
     Insert(InsertStmt),
     Update(UpdateStmt),
     Delete(DeleteStmt),
@@ -26,6 +30,24 @@ pub(crate) enum Stmt {
     /// `ROLLBACK [TRANSACTION] TO [SAVEPOINT] <name>` — undo changes since
     /// `<name>` was established, keeping `<name>` on the stack.
     RollbackTo(String),
+}
+
+/// A `WITH RECURSIVE` statement (stage 1: a single recursive CTE, a single
+/// anchor and a single recursive term). The anchor and recursive term are
+/// captured as ordinary SELECTs; the outer statement follows the CTE body.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RecursiveCteStmt {
+    pub name: String,
+    /// The REQUIRED column list `t(c1, …)`.
+    pub columns: Vec<String>,
+    /// `UNION ALL` vs `UNION` between the anchor and the recursive term.
+    pub union_all: bool,
+    /// Non-recursive seed; must not reference the CTE.
+    pub anchor: Box<SelectStmt>,
+    /// Recursive term; references the CTE exactly once in a FROM/JOIN operand.
+    pub recursive: Box<SelectStmt>,
+    /// The outer statement (stage 1: a plain SELECT over the CTE).
+    pub outer: Box<Stmt>,
 }
 
 #[derive(Debug, Clone, PartialEq)]

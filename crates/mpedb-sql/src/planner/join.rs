@@ -34,9 +34,10 @@ use super::select::{describe_key, distinct_order_by, ordinal};
 /// items BEFORE the sides swap. Only the two-table form rewrites; a chain
 /// would need the right side as a subtree, which left-deep plans cannot
 /// express (the refusal says the manual fix).
-pub(super) fn rewrite_right_join(
+pub(super) fn rewrite_right_join<'s>(
     s: &ast::SelectStmt,
-    schema: &Schema,
+    schema: &'s Schema,
+    cte: Option<CteRef<'s>>,
 ) -> Result<Option<ast::SelectStmt>> {
     if !s.joins.iter().any(|j| j.kind == ast::JoinKind::Right) {
         return Ok(None);
@@ -54,8 +55,8 @@ pub(super) fn rewrite_right_join(
     let items = match &s.items {
         Some(items) => Some(items.clone()),
         None => {
-            let (_, lt) = resolve_table(schema, s_table)?;
-            let (_, rt) = resolve_table(schema, &j.table)?;
+            let (_, lt) = resolve_table_cte(schema, cte, s_table)?;
+            let (_, rt) = resolve_table_cte(schema, cte, &j.table)?;
             let lname = s.alias.clone().unwrap_or_else(|| s_table.to_string());
             let rname = j.alias.clone().unwrap_or_else(|| j.table.clone());
             let mut items = Vec::with_capacity(lt.columns.len() + rt.columns.len());
@@ -93,14 +94,16 @@ pub(super) fn rewrite_right_join(
     }))
 }
 
-pub(super) fn plan_join_select(
+#[allow(clippy::too_many_arguments)]
+pub(super) fn plan_join_select<'s>(
     s: &ast::SelectStmt,
-    schema: &Schema,
+    schema: &'s Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
     consts: &mut Vec<Value>,
     subplans: Vec<SubPlan>,
     slot_types: Vec<Ty>,
+    cte: Option<CteRef<'s>>,
 ) -> Result<PlannedStmt> {
     // A `NATURAL JOIN` is an implicit `USING` over the columns common to the two
     // sides. Resolve that common set from the schema FIRST — a rigid schema makes
@@ -133,7 +136,7 @@ pub(super) fn plan_join_select(
     let eff_params = n_params + subplans.len() as u16;
     let correlated: Vec<bool> = subplans.iter().map(|p| !p.outer_args.is_empty()).collect();
     let outer_table = s.table.as_deref().expect("join on a FROM-less SELECT");
-    let (outer_id, outer) = resolve_table(schema, outer_table)?;
+    let (outer_id, outer) = resolve_table_cte(schema, cte, outer_table)?;
     let outer_name = s.alias.clone().unwrap_or_else(|| outer.name.clone());
 
     // The outer's policy binds over its own row and can pin an access path.
@@ -173,7 +176,7 @@ pub(super) fn plan_join_select(
     // slots of the tuple built BEFORE its own table joins in.
     let mut acc_types: Vec<ColumnType> = outer.columns.iter().map(|c| c.ty).collect();
     for jc in &s.joins {
-        let (jid, jt) = resolve_table(schema, &jc.table)?;
+        let (jid, jt) = resolve_table_cte(schema, cte, &jc.table)?;
         let jname = jc.alias.clone().unwrap_or_else(|| jt.name.clone());
 
         let mut pb = binder.rescope(Scope::single(jt));
@@ -293,11 +296,18 @@ pub(super) fn plan_join_select(
         }
     }
 
-    let (access, outer_residual) = extract_access(
-        merge_and(and_all(outer_extra), outer_policy),
-        outer,
-        consts,
-    )?;
+    // The recursive CTE working table is FullScan-only (no PK, no indexes): keep
+    // the whole predicate as the residual rather than extracting a keyed access
+    // its empty PK would vacuously satisfy.
+    let (access, outer_residual) = if outer_id == CTE_TABLE {
+        (AccessPath::FullScan, merge_and(and_all(outer_extra), outer_policy))
+    } else {
+        extract_access(
+            merge_and(and_all(outer_extra), outer_policy),
+            outer,
+            consts,
+        )?
+    };
     let filter = outer_residual.map(|e| compile_program(&e)).transpose()?;
 
     let mut joins: Vec<Join> = Vec::new();
@@ -310,7 +320,9 @@ pub(super) fn plan_join_select(
         // A FULL join never takes the index nested loop: emitting the
         // UNMATCHED inner rows requires the inner side enumerated and held,
         // so the whole ON stays residual over the held scan.
-        let (jaccess, residual_on) = if draft.kind == JoinKind::Full {
+        // A FULL join, or the recursive CTE working table (FullScan-only, no key
+        // tree): the whole ON stays residual over the held scan.
+        let (jaccess, residual_on) = if draft.kind == JoinKind::Full || draft.jid == CTE_TABLE {
             (AccessPath::FullScan, on_src)
         } else {
             extract_join_access(on_src, &draft.acc_types_before, draft.jt, consts)?
