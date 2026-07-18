@@ -141,7 +141,12 @@ const MAX_JOINS: usize = 16;
 //     A format-25 reader hits the unknown statement tag in `decode_stmt` and
 //     rejects the plan as corrupt rather than misreading it — same whole-plan
 //     version gating as `STMT_COMPOUND` at format 9.
-const PLAN_FORMAT: u8 = 26;
+// 27: `printf` / `format` scalar function — the additive `ScalarFn::Printf` tag
+//     (41) in the expr bytes, an ordinary variadic `Instr::Call`. A format-26
+//     reader hits the unknown scalar tag in `ScalarFn::from_tag` and reports the
+//     plan as corrupt rather than misreading it — the same additive gating as
+//     every prior scalar-fn bump (14-16, 21, 22).
+const PLAN_FORMAT: u8 = 27;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
