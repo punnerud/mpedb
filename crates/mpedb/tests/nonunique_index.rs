@@ -12,7 +12,15 @@ impl Deref for Tmp { type Target = Database; fn deref(&self) -> &Database { &sel
 impl Drop for Tmp { fn drop(&mut self) { let _ = std::fs::remove_file(&self.path); let _ = std::fs::remove_file(format!("{}-wal", self.path)); } }
 
 fn db(tag: &str, col_attr: &str) -> Tmp {
-    let path = format!("/dev/shm/mpedb-nuidx-{tag}-{}.mpedb", std::process::id());
+    let dir = if std::path::Path::new("/dev/shm").is_dir() {
+        std::path::PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    };
+    let path = dir
+        .join(format!("mpedb-nuidx-{tag}-{}.mpedb", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
     let _ = std::fs::remove_file(&path);
     let cfg = format!(
         "[database]\npath = \"{path}\"\nsize_mb = 8\n\

@@ -229,7 +229,10 @@ mod tests {
     use crate::params;
 
     fn shards(tag: &str, k: usize) -> crate::testdb::Owned<ShardSet> {
-        let path = format!("/dev/shm/mpedb-shardset-{tag}-{}.mpedb", std::process::id());
+        let path = crate::testdb::scratch_path(format!(
+            "mpedb-shardset-{tag}-{}.mpedb",
+            std::process::id()
+        ));
         // A ShardSet fans out into <path>.shard0..k; every one of them is ours
         // to remove, panic or not.
         let files: Vec<std::path::PathBuf> =

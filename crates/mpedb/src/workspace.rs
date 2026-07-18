@@ -250,11 +250,13 @@ mod tests {
 
     fn ws_toml(tag: &str) -> String {
         let pid = std::process::id();
+        let dir = crate::testdb::scratch_dir();
+        let dir = dir.display();
         format!(
             r#"
 [[database]]
 alias = "billing"
-path = "/dev/shm/mpedb-ws-{tag}-{pid}-billing.mpedb"
+path = "{dir}/mpedb-ws-{tag}-{pid}-billing.mpedb"
 size_mb = 8
   [[database.table]]
   name = "orders"
@@ -265,7 +267,7 @@ size_mb = 8
 
 [[database]]
 alias = "shared"
-path = "/dev/shm/mpedb-ws-{tag}-{pid}-shared.mpedb"
+path = "{dir}/mpedb-ws-{tag}-{pid}-shared.mpedb"
 size_mb = 8
   [[database.table]]
   name = "tenants"
@@ -338,8 +340,9 @@ size_mb = 8
         let ws0 = open("att");
         // Build a single-member workspace to check the unqualified default.
         let single = WorkspaceConfig::from_toml_str(&format!(
-            "[database]\npath = \"/dev/shm/mpedb-ws-solo-{}.mpedb\"\nsize_mb = 8\n\
+            "[database]\npath = \"{}/mpedb-ws-solo-{}.mpedb\"\nsize_mb = 8\n\
              [[table]]\nname = \"t\"\nprimary_key=[\"id\"]\n  [[table.column]]\n  name=\"id\"\n  type=\"int64\"",
+            crate::testdb::scratch_dir().display(),
             std::process::id()
         ))
         .unwrap();
@@ -357,8 +360,9 @@ size_mb = 8
         ));
         // Attach a second member ⇒ the default disappears, qualifiers required.
         let second = mpedb_types::Config::from_toml_str(&format!(
-            "[database]\npath = \"/dev/shm/mpedb-ws-second-{}.mpedb\"\nsize_mb = 8\n\
+            "[database]\npath = \"{}/mpedb-ws-second-{}.mpedb\"\nsize_mb = 8\n\
              [[table]]\nname = \"u\"\nprimary_key=[\"id\"]\n  [[table.column]]\n  name=\"id\"\n  type=\"int64\"",
+            crate::testdb::scratch_dir().display(),
             std::process::id()
         ))
         .unwrap();

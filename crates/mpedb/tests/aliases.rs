@@ -21,7 +21,15 @@ impl Drop for Tmp {
 }
 
 fn db(tag: &str) -> Tmp {
-    let path = format!("/dev/shm/mpedb-alias-{tag}-{}.mpedb", std::process::id());
+    let dir = if std::path::Path::new("/dev/shm").is_dir() {
+        std::path::PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    };
+    let path = dir
+        .join(format!("mpedb-alias-{tag}-{}.mpedb", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
     let _ = std::fs::remove_file(&path);
     let db = Database::open_with_config(
         Config::from_toml_str(&format!(
