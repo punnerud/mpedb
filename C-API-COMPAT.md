@@ -92,6 +92,23 @@ clear error). Result-code **integers match sqlite exactly** (`SQLITE_OK=0`,
 | `sqlite3_expanded_sql` | 🚧 | Best-effort: the raw SQL text (no literal substitution — mpedb binds positionally); `sqlite3_free`-able. Only consumed by the trace hook, which the shim never fires |
 | `sqlite3_interrupt` | 🚧 | No-op — results materialize synchronously, nothing to signal mid-statement |
 
+### Introspection (shim-emulated — mpedb has no `PRAGMA`/`sqlite_master`)
+
+Answered entirely inside the shim (`introspect.rs`) as a pure function of the
+live schema (`db.schema()`); nothing reaches the engine. `classify` routes a
+`PRAGMA` leading keyword to `Kind::Pragma`, and a `SELECT … sqlite_master`/
+`sqlite_schema` read is detected by identifier and re-routed.
+
+| Feature | Status | Comment |
+|---|---|---|
+| `PRAGMA table_info(t)` / `table_xinfo` | 🚧 | `(cid, name, type, notnull, dflt_value, pk)` from the live schema; `dflt_value` is always NULL (defaults not reconstructed); a PK column reports `notnull=1` (mpedb PKs are genuinely NOT NULL, unlike sqlite's nullable rowid alias) |
+| `PRAGMA table_list` | ✅ | `(schema, name, type, ncol, wr, strict)` for user tables |
+| `PRAGMA index_list(t)` | 🚧 | `(seq, name, unique, origin, partial)`; synthesized index names |
+| `PRAGMA foreign_key_list` / `foreign_key_check` | ✅ | Empty (mpedb has no foreign keys) |
+| `PRAGMA foreign_keys` / `journal_mode` / `user_version` / … (getters) | 🚧 | Return a conventional value |
+| `PRAGMA <x> = <v>` and other pragmas (setters) | ✅ | Accepted as a no-op (the common DB-setup pragmas never error) |
+| `SELECT … FROM sqlite_master` / `sqlite_schema` | 🚧 | Emulated from the schema (user tables only; the bootstrap table is hidden). Projects any subset of `type, name, tbl_name, rootpage, sql` (or `*`, `count(*)`); `WHERE` supports AND-joined `col = 'x'` / `<>` / `IN (…)` / `[NOT] LIKE 'p'`; `ORDER BY name [DESC]`. `rootpage` is 0, `sql` is a reconstructed `CREATE TABLE`. Unsupported shapes error clearly. Views/indexes not listed yet — handles Django's `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'` |
+
 ### Transactions
 
 `BEGIN` / `COMMIT` / `END` / `ROLLBACK` and `SAVEPOINT` / `RELEASE` / `ROLLBACK
@@ -185,31 +202,40 @@ DDL via `parse_ddl`/`apply_ddl`, not the plan compiler), deferring them to step.
 
 ## Remaining blockers for the next milestone (Django), ranked
 
-1. **No `sqlite_master` / `PRAGMA`.** Django's connection setup and schema editor
-   lean on `PRAGMA foreign_keys`, `PRAGMA table_info(...)`, `PRAGMA
-   legacy_alter_table`, and `SELECT … FROM sqlite_master`. Nothing here is
-   introspectable through the shim yet — the single biggest gap.
-2. **DDL inside an explicit transaction is rejected.** mpedb's `CREATE`/`DROP`/
-   `ALTER` run only in the autocommit path, not inside a `WriteSession`; a
-   `BEGIN; CREATE TABLE …; COMMIT` fails. Django migrations wrap DDL in
-   transactions. (The shim already routes DDL correctly in autocommit — this is
-   an engine-level limitation, not a shim one.)
-3. **No user-defined functions/collations.** `sqlite3_create_function_v2` /
+Addressed since the import-loads milestone (see the tables above): the facade
+`last_insert_rowid`, `PRAGMA table_info`/`table_list`/setup pragmas, and the
+common `SELECT … FROM sqlite_master` introspection forms — the single biggest
+gap for Django's connection setup and schema editor is now covered.
+
+Still blocking:
+
+1. **DDL inside an explicit transaction is rejected** — now with a *clear* error
+   (`unsupported: DDL … run it in autocommit, outside BEGIN/COMMIT`) instead of
+   the engine's bare "expected a statement". mpedb's `CREATE`/`DROP`/`ALTER` run
+   only in the autocommit path, not inside a `WriteSession`; a `BEGIN; CREATE
+   TABLE …; COMMIT` fails. Django migrations wrap DDL in transactions. Faking it
+   (commit mid-transaction) would silently break rollback, so this needs
+   **engine** support for DDL in a write session — out of scope for a
+   facade-only shim.
+2. **No user-defined functions/collations.** `sqlite3_create_function_v2` /
    `_create_collation_v2` are exported but *refuse* (so `import` works); Django
    registers a few (e.g. `django_date_extract`, `django_power`) through the
    C-API and needs them to actually run.
-4. **Fixed database size** vs. sqlite's unbounded growth (16 MiB ephemeral /
+3. **Fixed database size** vs. sqlite's unbounded growth (16 MiB ephemeral /
    64 MiB file-backed here); exceeding it is `SQLITE_FULL`.
-5. **Named parameters** (`:name`) are unsupported by mpedb's SQL binder; only
+4. **Named parameters** (`:name`) are unsupported by mpedb's SQL binder; only
    `?`/`$N`. `sqlite3_bind_parameter_name` reports them, but binding by name
    still fails. Django uses `%s`/`?`-style params, so this is low priority.
+5. **`sqlite_master` breadth** — views and indexes are not listed; complex
+   `WHERE`/join forms error rather than returning wrong metadata.
 
 ## Verification
 
 - `cargo test -p mpedb-capi` (build/test **standalone** — the crate is excluded
-  from the unified workspace build because it exports `sqlite3_*`) — 10 Rust FFI
+  from the unified workspace build because it exports `sqlite3_*`) — 13 Rust FFI
   tests (open/create/prepare/bind/step/column/exec/errmsg/constraint/
-  transactions/persistence/tail) + `sql`-scanner unit tests + a **C smoke test**
+  transactions/persistence/tail/`last_insert_rowid`/`PRAGMA table_info`/
+  `sqlite_master`) + `sql`-scanner unit tests + a **C smoke test**
   (`tests/smoke.c` compiled against `sqlite3.h` and linked to the cdylib) + the
   **Python preload test** below.
 - `tests/py_preload.rs` → `tests/py_sqlite3_preload.py` — runs CPython's own
