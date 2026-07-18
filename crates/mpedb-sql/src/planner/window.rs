@@ -24,6 +24,7 @@ pub(super) fn contains_window(e: &ast::Expr) -> bool {
         E::Unary(_, a) | E::IsNull(a, _) | E::Cast(a, _) => contains_window(a),
         E::Binary(_, a, b)
         | E::Like(a, b)
+        | E::Match(a, b)
         | E::IsDistinct(a, b, _)
         | E::Glob(a, b, _)
         | E::Regexp(a, b, _) => contains_window(a) || contains_window(b),
@@ -93,6 +94,7 @@ fn lift_windows(e: &ast::Expr, specs: &mut Vec<WindowCollect>) -> Result<ast::Ex
             E::IsDistinct(Box::new(rec(a, specs)?), Box::new(rec(b, specs)?), *n)
         }
         E::Like(a, b) => E::Like(Box::new(rec(a, specs)?), Box::new(rec(b, specs)?)),
+        E::Match(a, b) => E::Match(Box::new(rec(a, specs)?), Box::new(rec(b, specs)?)),
         E::Glob(a, b, n) => E::Glob(Box::new(rec(a, specs)?), Box::new(rec(b, specs)?), *n),
         E::Regexp(a, b, n) => E::Regexp(Box::new(rec(a, specs)?), Box::new(rec(b, specs)?), *n),
         E::InList(a, xs, n) => E::InList(
@@ -178,6 +180,7 @@ fn synthetic_window_table(win_types: &[(ColumnType, bool)]) -> TableDef {
         primary_key: vec![0],
         indexes: Vec::new(),
         dead: false,
+        kind: mpedb_types::TableKind::Standard,
     }
 }
 

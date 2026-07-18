@@ -28,6 +28,8 @@ use crate::plan::{
     CompoundPlan, GroupKey, Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp,
     Projection, SelectPlan, SubPlan, SubPlanKind, WindowSpec,
 };
+#[allow(unused_imports)]
+use crate::plan::{FtsQuery, FtsTerm};
 use crate::policy::{PolicyCatalog, TablePolicies};
 use mpedb_types::{ExprProgram, ColumnType, Error, Footprint, Instr, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
     TableDef, Value,};
@@ -35,6 +37,7 @@ use mpedb_types::{ExprProgram, ColumnType, Error, Footprint, Instr, KeyAccess, K
 mod access;
 mod aggregate;
 mod footprint;
+mod fts;
 mod join;
 mod select;
 mod subquery;

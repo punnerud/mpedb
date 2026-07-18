@@ -116,10 +116,15 @@ fn card_access(access: &AccessPath, table: u32, schema: &Schema, rc: &dyn Fn(u32
                 .is_some_and(|ix| ix.unique && parts.len() == ix.columns.len());
             if uniq_full { 1 } else { rc(table) }
         }
-        // Ranges and full scans are bounded only by the table itself.
-        AccessPath::PkRange { .. } | AccessPath::IndexRange { .. } | AccessPath::FullScan => {
-            rc(table)
-        }
+        // Ranges and full scans are bounded only by the table itself. An
+        // FtsScan is bounded by the table too (a term can match at most every
+        // row); the tighter min(posting-list lengths) bound needs data the
+        // schema-only estimator cannot see, and the layer-2 work meter enforces
+        // the real cost per posting entry.
+        AccessPath::PkRange { .. }
+        | AccessPath::IndexRange { .. }
+        | AccessPath::FullScan
+        | AccessPath::FtsScan { .. } => rc(table),
     }
 }
 

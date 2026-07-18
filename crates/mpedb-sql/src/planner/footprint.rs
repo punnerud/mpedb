@@ -21,6 +21,12 @@ fn access_key_and_indexes(a: &AccessPath) -> (KeyAccess, u64) {
             (KeyAccess::Full, 1 | (1u64 << (*index_no).min(63)))
         }
         AccessPath::FullScan => (KeyAccess::Full, 1),
+        // An FtsScan reads the inverted-index tree, then fetches each matching
+        // row through the PK tree — a whole-table read as far as conflict
+        // detection is concerned. Table-level conflict (the FTS table's bit in
+        // `tables_read`, set by the caller) covers the inverted-index tree,
+        // whose reserved `index_no` sits far above the 64-bit bitmap.
+        AccessPath::FtsScan { .. } => (KeyAccess::Full, 1),
     }
 }
 

@@ -645,6 +645,9 @@ impl CompiledPlan {
                     .flatten()
                     .flat_map(|b| b.parts.iter())
                     .try_for_each(&mut check),
+                // An FtsScan carries a literal query tree, no key parts, so it
+                // can never read a correlated subplan slot.
+                AccessPath::FtsScan { .. } => Ok(()),
             }
         };
         key_parts_ok(&sp.access)?;
@@ -973,6 +976,40 @@ impl CompiledPlan {
                 }
                 Ok(())
             }
+            AccessPath::FtsScan { query } => {
+                // An FtsScan is legal ONLY against an FTS table (a forged plan
+                // pointing it at an ordinary table would have the executor probe
+                // a nonexistent inverted-index tree). Every term's column ordinal
+                // must be a real FTS content column.
+                if !t.kind.is_fts() {
+                    return Err(corrupt("FtsScan access on a non-FTS table"));
+                }
+                let ncols = t.fts_content_columns().len() as u16;
+                validate_fts_query(query, ncols)?;
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Recursively check a compiled FTS query: non-empty terms, in-range column
+/// ordinals. Depth is bounded by the decoder ([`MAX_FTS_DEPTH`]).
+fn validate_fts_query(q: &FtsQuery, ncols: u16) -> Result<()> {
+    match q {
+        FtsQuery::Term(t) => {
+            if t.token.is_empty() {
+                return Err(corrupt("empty FTS term"));
+            }
+            for &c in &t.columns {
+                if c >= ncols {
+                    return Err(corrupt("FTS term column ordinal out of range"));
+                }
+            }
+            Ok(())
+        }
+        FtsQuery::And(a, b) | FtsQuery::Or(a, b) | FtsQuery::AndNot(a, b) => {
+            validate_fts_query(a, ncols)?;
+            validate_fts_query(b, ncols)
         }
     }
 }

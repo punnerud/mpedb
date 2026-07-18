@@ -40,6 +40,35 @@ pub struct IndexDef {
     pub unique: bool,
 }
 
+/// Distinguishes an ordinary table from a full-text-search virtual table
+/// (`CREATE VIRTUAL TABLE … USING fts5(…)`, design/DESIGN-FTS.md §1). An FTS
+/// table is stored like any table — an auto `rowid` INTEGER PK plus its declared
+/// TEXT columns — but the engine ALSO maintains an inverted-index B+tree over
+/// its content (a reserved `index_no`), and `MATCH` compiles to an FtsScan
+/// against it. The tokenizer choice is FROZEN here (content-hashed with the
+/// schema and every plan) so a query can never tokenize differently than the
+/// index was built with — the rigid-schema advantage over sqlite's silently
+/// mismatched external tokenizers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TableKind {
+    /// An ordinary user table.
+    Standard,
+    /// An FTS5 content + inverted-index table, with its frozen tokenizer.
+    Fts { tokenizer: crate::fts::Tokenizer },
+}
+
+impl TableKind {
+    pub fn is_fts(self) -> bool {
+        matches!(self, TableKind::Fts { .. })
+    }
+    pub fn fts_tokenizer(self) -> Option<crate::fts::Tokenizer> {
+        match self {
+            TableKind::Fts { tokenizer } => Some(tokenizer),
+            TableKind::Standard => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TableDef {
     /// Stable table id (DESIGN-SCHEMA-V2): explicit in the canonical bytes,
@@ -65,6 +94,9 @@ pub struct TableDef {
     /// persisted `table_id` referencing a dropped table stays inert. `validate`
     /// skips the shape rules for a dead slot and enforces it IS empty.
     pub dead: bool,
+    /// Ordinary vs. FTS virtual table (design/DESIGN-FTS.md §1). Canonical-bytes
+    /// v4 carries this discriminant; a dead slot is always `Standard`.
+    pub kind: TableKind,
 }
 
 impl TableDef {
@@ -78,6 +110,7 @@ impl TableDef {
             primary_key: Vec::new(),
             indexes: Vec::new(),
             dead: true,
+            kind: TableKind::Standard,
         }
     }
 }
@@ -96,6 +129,33 @@ impl TableDef {
 
     pub fn is_pk_column(&self, col: u16) -> bool {
         self.primary_key.contains(&col)
+    }
+
+    /// For an FTS table, the `(column_index, fts_colno)` of every content
+    /// column — every non-primary-key column — with `fts_colno` assigned
+    /// `0..n` in declaration order. This is the SINGLE colno rule shared by
+    /// posting maintenance (engine) and query planning (SQL), so the two can
+    /// never disagree about which column is `colno` k (design/DESIGN-FTS.md §7).
+    pub fn fts_content_columns(&self) -> Vec<(u16, u16)> {
+        let mut out = Vec::new();
+        let mut colno = 0u16;
+        for i in 0..self.columns.len() as u16 {
+            if self.primary_key.contains(&i) {
+                continue;
+            }
+            out.push((i, colno));
+            colno += 1;
+        }
+        out
+    }
+
+    /// The FTS colno of a content column by its column index, or `None` if the
+    /// index names the rowid PK (not a content column).
+    pub fn fts_colno(&self, col_index: u16) -> Option<u16> {
+        self.fts_content_columns()
+            .into_iter()
+            .find(|(ci, _)| *ci == col_index)
+            .map(|(_, n)| n)
     }
 }
 
@@ -426,9 +486,10 @@ impl Schema {
                     || !t.columns.is_empty()
                     || !t.primary_key.is_empty()
                     || !t.indexes.is_empty()
+                    || t.kind != TableKind::Standard
                 {
                     return Err(Error::Schema(format!(
-                        "tombstone slot id {} must be empty (no name/columns/pk/indexes)",
+                        "tombstone slot id {} must be empty (no name/columns/pk/indexes/kind)",
                         t.id
                     )));
                 }
@@ -597,6 +658,39 @@ impl Schema {
                     }
                 }
             }
+            // An FTS content table is stored like any table, but its shape is
+            // fixed (design/DESIGN-FTS.md §1): a single INTEGER `rowid` primary
+            // key, and NO ordinary secondary indexes — the inverted index lives
+            // in a reserved tree, not `TableDef.indexes`. Every declared column
+            // is FTS content and must be TEXT (the only tokenizable type).
+            if t.kind.is_fts() {
+                if t.primary_key.len() != 1
+                    || t.columns[t.primary_key[0] as usize].ty != ColumnType::Int64
+                {
+                    return Err(Error::Schema(format!(
+                        "FTS table `{}` must have a single INTEGER rowid primary key",
+                        t.name
+                    )));
+                }
+                if !t.indexes.is_empty() {
+                    return Err(Error::Schema(format!(
+                        "FTS table `{}` must not declare secondary indexes",
+                        t.name
+                    )));
+                }
+                for (i, c) in t.columns.iter().enumerate() {
+                    if i as u16 == t.primary_key[0] {
+                        continue;
+                    }
+                    if c.ty != ColumnType::Text {
+                        return Err(Error::Schema(format!(
+                            "FTS table `{}` column `{}` must be text (FTS content columns are \
+                             tokenized text)",
+                            t.name, c.name
+                        )));
+                    }
+                }
+            }
         }
         Ok(())
     }
@@ -624,11 +718,19 @@ impl Schema {
     /// and decode reconstructs the in-memory convenience flags from it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-        buf.push(3u8); // schema encoding version (v3: TableDef.dead, #47 stage 4)
+        buf.push(4u8); // schema encoding version (v4: TableDef.kind, FTS §1)
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             buf.extend_from_slice(&t.id.to_le_bytes());
             buf.push(t.dead as u8); // tombstone marker; a dead slot's rest is empty
+            // Table-kind discriminant (v4): 0 = Standard, 1 = FTS ‖ tokenizer.
+            match t.kind {
+                TableKind::Standard => buf.push(0),
+                TableKind::Fts { tokenizer } => {
+                    buf.push(1);
+                    buf.push(tokenizer as u8);
+                }
+            }
             write_str(&mut buf, &t.name);
             buf.extend_from_slice(&(t.columns.len() as u16).to_le_bytes());
             for c in &t.columns {
@@ -676,9 +778,9 @@ impl Schema {
         let mut pos = 0usize;
         let version = *buf.get(pos).ok_or_else(err)?;
         pos += 1;
-        if version != 3 {
+        if version != 4 {
             return Err(Error::Corrupt(format!(
-                "unknown schema version {version} (v1/v2 predate canonical-bytes v3 — \
+                "unknown schema version {version} (v1/v2/v3 predate canonical-bytes v4 — \
                  regenerate or re-import)"
             )));
         }
@@ -695,6 +797,20 @@ impl Schema {
                 _ => return Err(Error::Corrupt("bad table dead flag".into())),
             };
             pos += 1;
+            let kind = match *buf.get(pos).ok_or_else(err)? {
+                0 => {
+                    pos += 1;
+                    TableKind::Standard
+                }
+                1 => {
+                    pos += 1;
+                    let tok = crate::fts::Tokenizer::from_tag(*buf.get(pos).ok_or_else(err)?)
+                        .ok_or_else(|| Error::Corrupt("bad fts tokenizer tag".into()))?;
+                    pos += 1;
+                    TableKind::Fts { tokenizer: tok }
+                }
+                _ => return Err(Error::Corrupt("bad table kind tag".into())),
+            };
             let name = read_str(buf, &mut pos)?;
             let ncols = read_u16(buf, &mut pos)? as usize;
             if ncols > MAX_COLUMNS {
@@ -796,6 +912,7 @@ impl Schema {
                 primary_key,
                 indexes,
                 dead,
+                kind,
             });
         }
         if pos != buf.len() {
@@ -890,7 +1007,7 @@ mod tests {
             ],
             primary_key: vec![0],
             indexes: vec![],
-            dead: false,
+            dead: false, kind: TableKind::Standard,
         }])
         .unwrap()
     }
@@ -923,7 +1040,7 @@ mod tests {
                         }],
                         primary_key: vec![0],
                         indexes: vec![],
-                        dead: false,
+                        dead: false, kind: TableKind::Standard,
                     })
                     .collect(),
             )
@@ -950,7 +1067,7 @@ mod tests {
             }],
             primary_key: vec![0],
             indexes: vec![],
-            dead: false,
+            dead: false, kind: TableKind::Standard,
         }]);
         assert!(bad.is_err());
         // reserved prefix
@@ -968,7 +1085,7 @@ mod tests {
             }],
             primary_key: vec![0],
             indexes: vec![],
-            dead: false,
+            dead: false, kind: TableKind::Standard,
         }]);
         assert!(bad.is_err());
     }
@@ -986,7 +1103,7 @@ mod tests {
         let col = |n: &str| ColumnDef { name: n.into(), ty: ColumnType::Int64,
             nullable: false, unique: false, indexed: false, default: None, check: None };
         let tbl = |n: &str| TableDef { id: 0, name: n.into(), columns: vec![col("id")],
-            primary_key: vec![0], indexes: vec![], dead: false };
+            primary_key: vec![0], indexes: vec![], dead: false, kind: TableKind::Standard };
 
         let s = Schema::new(vec![tbl("orders"), tbl("users"), tbl("accounts")]).unwrap();
         let got: Vec<(&str, u32)> =
@@ -1021,7 +1138,7 @@ mod tests {
             ],
             primary_key: vec![0],
             indexes: vec![IndexDef { columns: vec![1, 2], unique: false }],
-            dead: false,
+            dead: false, kind: TableKind::Standard,
         };
         // The single-PK column's flags are noise and must normalize away.
         t.columns[0].unique = true;
@@ -1061,7 +1178,7 @@ mod tests {
             ],
             primary_key: vec![0],
             indexes: vec![IndexDef { columns: vec![2], unique: false }],
-            dead: false,
+            dead: false, kind: TableKind::Standard,
         }])
         .unwrap();
 
@@ -1104,7 +1221,7 @@ mod tests {
             unique: false, indexed: false, default: None, check: None,
         };
         TableDef { id: 0, name: n.into(), columns: vec![col("id")],
-            primary_key: vec![0], indexes: vec![], dead: false }
+            primary_key: vec![0], indexes: vec![], dead: false, kind: TableKind::Standard }
     }
 
     #[test]
@@ -1153,13 +1270,13 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r, "dead slot + ids survive the wire byte-for-byte");
         assert_eq!(s.hash(), r.hash());
-        // The version byte is 3.
-        assert_eq!(s.canonical_bytes()[0], 3);
-        // A v2 file refuses cleanly (no misread of the new dead flag).
-        let mut v2 = s.canonical_bytes();
-        v2[0] = 2;
-        let err = Schema::from_canonical_bytes(&v2).unwrap_err();
-        assert!(format!("{err}").contains("unknown schema version 2"), "{err}");
+        // The version byte is 4.
+        assert_eq!(s.canonical_bytes()[0], 4);
+        // A v3 file refuses cleanly (no misread of the new kind discriminant).
+        let mut v3 = s.canonical_bytes();
+        v3[0] = 3;
+        let err = Schema::from_canonical_bytes(&v3).unwrap_err();
+        assert!(format!("{err}").contains("unknown schema version 3"), "{err}");
     }
 
     #[test]

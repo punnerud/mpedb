@@ -449,7 +449,7 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
             }
         }
         Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => rename_qualifier(a, from, to),
-        Expr::Binary(_, a, b) | Expr::Like(a, b) => {
+        Expr::Binary(_, a, b) | Expr::Like(a, b) | Expr::Match(a, b) => {
             rename_qualifier(a, from, to);
             rename_qualifier(b, from, to);
         }
@@ -521,7 +521,7 @@ fn flatten_expr(
         Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => {
             flatten_expr(a, views, ctes, depth)
         }
-        Expr::Binary(_, a, b) | Expr::Like(a, b) => {
+        Expr::Binary(_, a, b) | Expr::Like(a, b) | Expr::Match(a, b) => {
             flatten_expr(a, views, ctes, depth)?;
             flatten_expr(b, views, ctes, depth)
         }
@@ -599,7 +599,7 @@ fn collect_expr_sources(e: &Expr, out: &mut Vec<String>) {
             collect_source_names(s, out);
         }
         Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => collect_expr_sources(a, out),
-        Expr::Binary(_, a, b) | Expr::Like(a, b) => {
+        Expr::Binary(_, a, b) | Expr::Like(a, b) | Expr::Match(a, b) => {
             collect_expr_sources(a, out);
             collect_expr_sources(b, out);
         }

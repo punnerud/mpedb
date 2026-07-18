@@ -124,7 +124,16 @@ const MAX_JOINS: usize = 16;
 //     extra bytes — exactly as every prior additive `Select` change did — so the
 //     whole-plan version gates it: a format-23 blob fails CLOSED at byte 0 with
 //     `PlanInvalidated` (the documented re-prepare path), never a misread.
-const PLAN_FORMAT: u8 = 24;
+// 25: native full-text search (design/DESIGN-FTS.md stage 1) — a new
+//     `AccessPath::FtsScan` (tag `ACCESS_FTS_SCAN = 5`) carrying a recursively
+//     encoded FTS5 query tree, produced for `<col-or-table> MATCH 'literal'`
+//     against a `TableKind::Fts` table. A format-24 reader hits the unknown
+//     access-path tag in `decode_access` and rejects the plan as corrupt rather
+//     than misreading it — same additive gating as every prior access-path bump
+//     (IndexRange at format 8, IndexPoint parts at 12). The schema canonical
+//     bytes also gained a table-kind discriminant (v4), so a plan compiled
+//     against a v3 schema fails its `schema_hash` check first — belt and braces.
+const PLAN_FORMAT: u8 = 25;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -146,6 +155,7 @@ pub fn dual_def() -> &'static mpedb_types::TableDef {
         primary_key: Vec::new(),
         indexes: Vec::new(),
         dead: false,
+        kind: mpedb_types::TableKind::Standard,
     })
 }
 
@@ -711,7 +721,48 @@ pub enum AccessPath {
         hi: Option<KeyBound>,
     },
     FullScan,
+    /// Full-text search over an FTS table's inverted index (design/DESIGN-FTS.md
+    /// §4). The `query` is a compiled FTS5 query tree whose terms are already
+    /// normalized by the table's frozen tokenizer; the executor evaluates it by
+    /// posting-list set algebra and yields matching rows in rowid order. Only an
+    /// FTS table (`TableKind::Fts`) carries this access — `validate` enforces it.
+    FtsScan { query: FtsQuery },
 }
+
+/// A compiled FTS5 `MATCH` query tree (design/DESIGN-FTS.md §3), carried by
+/// [`AccessPath::FtsScan`] and content-hashed into the plan. Terms are already
+/// normalized by the table's frozen tokenizer, so execution never re-tokenizes.
+/// Precedence (highest first, sqlite fts5): `NOT`, then `AND` (and implicit-AND
+/// juxtaposition), then `OR`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FtsQuery {
+    Term(FtsTerm),
+    And(Box<FtsQuery>, Box<FtsQuery>),
+    Or(Box<FtsQuery>, Box<FtsQuery>),
+    /// `X NOT Y` — documents matching `X` but NOT `Y`.
+    AndNot(Box<FtsQuery>, Box<FtsQuery>),
+}
+
+/// One FTS query term (a bare word, `word*` prefix, `^word` initial, or a
+/// column-filtered `col:word` / `{a b}:word`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FtsTerm {
+    /// The normalized token; for a prefix term this is the prefix.
+    pub token: String,
+    /// `word*` — match every indexed token starting with `token`.
+    pub prefix: bool,
+    /// `^word` — the token must occur at position 0 in an allowed column.
+    pub initial: bool,
+    /// Restrict to these FTS column ordinals (0-based over declared columns);
+    /// empty = every column. A whole-row `ft MATCH …` leaves this empty; a
+    /// column-scoped `col MATCH …` and `col:`/`{a b}:` filters populate it.
+    pub columns: Vec<u16>,
+}
+
+/// Self-imposed ceiling on the depth of a compiled FTS query tree, so a corrupt
+/// plan cannot make the recursive decoder overflow the stack. Far above any
+/// hand-written `MATCH` string.
+pub(crate) const MAX_FTS_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Projection {
@@ -737,6 +788,13 @@ const ACCESS_PK_POINT: u8 = 1;
 const ACCESS_PK_RANGE: u8 = 2;
 const ACCESS_INDEX_POINT: u8 = 3;
 const ACCESS_INDEX_RANGE: u8 = 4;
+const ACCESS_FTS_SCAN: u8 = 5;
+
+// FTS query-node wire tags (design/DESIGN-FTS.md §3).
+const FTS_TERM: u8 = 0;
+const FTS_AND: u8 = 1;
+const FTS_OR: u8 = 2;
+const FTS_AND_NOT: u8 = 3;
 
 const PART_PARAM: u8 = 0;
 const PART_CONST: u8 = 1;

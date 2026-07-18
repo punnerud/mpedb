@@ -415,6 +415,9 @@ fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>, max_work_rows: u64)
                 primary_key,
                 indexes,
                 dead: false,
+                // Config-defined tables are always ordinary; FTS tables are
+                // created live via `CREATE VIRTUAL TABLE` (design/DESIGN-FTS.md).
+                kind: crate::schema::TableKind::Standard,
             });
         }
 

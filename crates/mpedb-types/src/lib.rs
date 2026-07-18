@@ -7,6 +7,7 @@ pub mod config;
 pub mod error;
 pub mod expr;
 pub mod footprint;
+pub mod fts;
 pub mod keycode;
 pub mod policy;
 pub mod schema;
@@ -71,8 +72,9 @@ impl AggFn {
     }
 }
 pub use footprint::{Footprint, KeyAccess, KeyBound, KeyPart, PlanHash};
+pub use fts::{Doclist, Tokenizer};
 pub use policy::{PolicyCmd, PolicyDef};
-pub use schema::{ColumnDef, DefaultExpr, IndexDef, Schema, TableDef, MAX_INDEXES};
+pub use schema::{ColumnDef, DefaultExpr, IndexDef, Schema, TableDef, TableKind, MAX_INDEXES};
 pub use value::{ColumnType, Value};
 
 /// Maximum number of tables (user + system) in one database. Bounded so that
