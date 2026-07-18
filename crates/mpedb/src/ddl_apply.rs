@@ -12,6 +12,106 @@
 
 use super::*;
 
+/// Sys-keyspace prefix for a stored view: `view/<name>` → its SELECT source.
+pub(crate) const VIEW_PREFIX: &[u8] = b"view/";
+
+impl Database {
+    /// Load every stored view (`view/<name>` → SELECT source) into a catalog.
+    /// Cheap when there are none. Cached by the facade behind the schema-gen
+    /// gate — views change only on a DDL commit, which bumps `schema_gen`.
+    pub(crate) fn load_view_catalog(&self) -> Result<mpedb_sql::ViewCatalog> {
+        let mut cat = mpedb_sql::ViewCatalog::new();
+        let r = self.engine.begin_read()?;
+        let scan = r.sys_scan();
+        r.finish()?;
+        for (subkey, value) in scan? {
+            if let Some(name) = subkey.strip_prefix(VIEW_PREFIX) {
+                let name = String::from_utf8_lossy(name).into_owned();
+                let src = String::from_utf8_lossy(&value).into_owned();
+                cat.insert(name, src);
+            }
+        }
+        Ok(cat)
+    }
+
+    /// `CREATE VIEW [IF NOT EXISTS] <name> AS <select>`. Stores the SELECT
+    /// source under `view/<name>` and bumps the schema gen so peers reload.
+    /// Refuses a name already taken by a table or (unless IF NOT EXISTS) a view.
+    pub(crate) fn apply_create_view(
+        &self,
+        name: &str,
+        select_sql: &str,
+        if_not_exists: bool,
+    ) -> Result<ExecResult> {
+        self.engine.refresh_schema_if_stale()?;
+        if self.engine.schema().schema.table_id(name).is_some() {
+            return Err(Error::Bind(format!(
+                "CREATE VIEW: `{name}` is already a table"
+            )));
+        }
+        let key = view_key(name);
+        let mut w = self.engine.begin_write()?;
+        let exists = matches!(w.sys_get(&key), Ok(Some(_)));
+        if exists {
+            w.abort();
+            if if_not_exists {
+                return Ok(ExecResult::Affected(0));
+            }
+            return Err(Error::Bind(format!("CREATE VIEW: view `{name}` already exists")));
+        }
+        let res = (|| {
+            w.sys_put(&key, select_sql.as_bytes())?;
+            w.bump_schema_gen();
+            Ok(())
+        })();
+        match res {
+            Ok(()) => w.commit()?,
+            Err(e) => {
+                w.abort();
+                return Err(e);
+            }
+        }
+        self.cache.write().expect(POISON).clear();
+        let _ = self.engine.reload_schema_from_catalog();
+        Ok(ExecResult::Affected(0))
+    }
+
+    /// `DROP VIEW [IF EXISTS] <name>`.
+    pub(crate) fn apply_drop_view(&self, name: &str, if_exists: bool) -> Result<ExecResult> {
+        let key = view_key(name);
+        let mut w = self.engine.begin_write()?;
+        let existed = matches!(w.sys_get(&key), Ok(Some(_)));
+        if !existed {
+            w.abort();
+            if if_exists {
+                return Ok(ExecResult::Affected(0));
+            }
+            return Err(Error::Bind(format!("DROP VIEW: no such view `{name}`")));
+        }
+        let res = (|| {
+            w.sys_delete(&key)?;
+            w.bump_schema_gen();
+            Ok(())
+        })();
+        match res {
+            Ok(()) => w.commit()?,
+            Err(e) => {
+                w.abort();
+                return Err(e);
+            }
+        }
+        self.cache.write().expect(POISON).clear();
+        let _ = self.engine.reload_schema_from_catalog();
+        Ok(ExecResult::Affected(0))
+    }
+}
+
+fn view_key(name: &str) -> Vec<u8> {
+    let mut k = VIEW_PREFIX.to_vec();
+    k.extend_from_slice(name.as_bytes());
+    k
+}
+
 impl Database {
     /// `CREATE TABLE` (#47 stage 2/3): build the [`TableDef`] from the parsed
     /// spec, append it to the schema in one catalog commit (the engine
@@ -348,6 +448,12 @@ impl Database {
             }
             DdlStmt::CreateIndex { table, columns, unique, .. } => {
                 return self.apply_create_index(&table, &columns, unique);
+            }
+            DdlStmt::CreateView { name, select_sql, if_not_exists } => {
+                return self.apply_create_view(&name, &select_sql, if_not_exists);
+            }
+            DdlStmt::DropView { name, if_exists } => {
+                return self.apply_drop_view(&name, if_exists);
             }
             DdlStmt::CreatePolicy(spec) => {
                 let def = mpedb_types::PolicyDef {

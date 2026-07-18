@@ -393,7 +393,8 @@ impl Database {
         // cache hit skips compilation entirely).
         self.gate_cache_on_schema()?;
         let catalog = self.load_policy_catalog()?;
-        mpedb_sql::prepare_maybe_explain_with_policies(sql, &self.schema(), &catalog)
+        let views = self.load_view_catalog()?;
+        mpedb_sql::prepare_maybe_explain_with_views(sql, &self.schema(), &catalog, &views)
     }
 
     /// Compile `sql` to a content-hashed plan and publish it in the shared
