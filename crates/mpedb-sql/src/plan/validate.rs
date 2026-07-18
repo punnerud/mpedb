@@ -334,26 +334,20 @@ impl CompiledPlan {
                     }
                     // sqlite bare columns (format 30) extend the grouped tuple to
                     // `[keys ‖ aggs ‖ bare_cols]`. Each is a BASE-row column, so
-                    // bound it by `base_width`; and the executor reads them from
-                    // the group's single min/max witness row, so a non-empty list
-                    // is only meaningful with EXACTLY one aggregate that is
-                    // Min/Max — enforce it here so a forged plan cannot ask the
-                    // executor to carry a bare column out of a group that has no
-                    // extremum to pick a row by (the never-a-wrong-answer contract).
+                    // bound it by `base_width` — the executor never indexes the row
+                    // past this, so the bound is the whole safety obligation here.
+                    // The WITNESS row a bare column is read from is inferred at exec
+                    // from the aggregate set (single min/max → the extremum's row;
+                    // otherwise → the group's lowest-rowid row via the min-PK
+                    // witness), and both readers are memory-safe for any aggregate
+                    // set, so no min/max shape is required of a decoded plan. The
+                    // never-a-wrong-answer gate for the lowest-rowid case (single
+                    // INTEGER-PK table, no join) lives in the planner, which is the
+                    // only producer of a legitimately compiled plan (COMPAT.md).
                     for &c in &a.bare_cols {
                         if c as usize >= base_width {
                             return Err(corrupt("bare column out of the base row"));
                         }
-                    }
-                    if !a.bare_cols.is_empty()
-                        && !matches!(
-                            a.aggs.as_slice(),
-                            [AggCall { func: AggFn::Min | AggFn::Max, .. }]
-                        )
-                    {
-                        return Err(corrupt(
-                            "bare columns without a single min/max aggregate",
-                        ));
                     }
                     let out_width = a.group_by.len() + a.aggs.len() + a.bare_cols.len();
                     if out_width == 0 {

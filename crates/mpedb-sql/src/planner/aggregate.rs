@@ -295,8 +295,10 @@ pub(super) fn plan_aggregate_select(
     post_filter: Option<ExprProgram>,
     mut binder: Binder<'_>,
     // GROUP BY strictness dialect (COMPAT.md): `Postgres` refuses every bare
-    // column; `Sqlite` accepts the deterministic ones (folded-away or fixed by a
-    // single min/max) and refuses the genuinely-arbitrary case.
+    // column; `Sqlite` accepts the deterministic ones — folded-away, fixed by a
+    // single min/max (witness row), or (over a single INTEGER-PK table) sqlite's
+    // lowest-rowid pick — and refuses only what it cannot reproduce exactly (the
+    // arbitrary case over a join or a non-rowid PK).
     mode: BareGroupBy,
     _consts: &mut Vec<Value>,
     subplans: Vec<SubPlan>,
@@ -464,13 +466,29 @@ pub(super) fn plan_aggregate_select(
     // legal? A bare slot at `k_aggs + j` is live iff some bound program (a
     // projection item, HAVING, or an ORDER BY key that indexes the grouped tuple)
     // actually reads it. A folded-away reference (`COALESCE(-24, col)`) leaves
-    // none → carry nothing (the deterministic never-evaluated case). If ANY bare
-    // column is live it must be fixed by a SINGLE min()/max() (the deterministic
-    // witness-row case) — anything else is sqlite's arbitrary-row pick, which we
-    // refuse rather than risk a value that differs from sqlite (the core
-    // never-a-wrong-answer guarantee). `grouped_order` names the ORDER BY slots
-    // ONLY when they index the grouped tuple (`OrderOver::Grouped`); projection
-    // ordinals and junk columns are already covered by the projection walk.
+    // none → carry nothing (the deterministic never-evaluated case). A live bare
+    // column is deterministic in one of two ways, both matching sqlite EXACTLY:
+    //   (a) a SINGLE min()/max() fixes it to the extremum's WITNESS row (#87); or
+    //   (b) otherwise sqlite's "arbitrary" pick is really the group's LOWEST-ROWID
+    //       row (verified vs sqlite 3.45), which the executor reproduces by
+    //       tracking the minimum PK per group — but ONLY where mpedb's row
+    //       identity IS that rowid (`rowid_pick_ok`).
+    // Anything else is refused rather than risk a value that differs from sqlite
+    // (the core never-a-wrong-answer guarantee). `grouped_order` names the ORDER
+    // BY slots ONLY when they index the grouped tuple (`OrderOver::Grouped`);
+    // projection ordinals and junk columns are already covered by the projection
+    // walk.
+    //
+    // `rowid_pick_ok`: the lowest-rowid pick matches sqlite only when mpedb reads
+    // rows FROM its rowid — a single INTEGER-PK table, no join. Over a join the
+    // aggregated "row" is `[outer ‖ inner]` with no single rowid, and a
+    // composite/text PK is not sqlite's implicit rowid, so the arbitrary case
+    // stays refused there (never a wrong answer; documented in COMPAT.md).
+    let rowid_pick_ok = joins.is_empty() && {
+        let t = base_scope.only();
+        t.primary_key.len() == 1
+            && t.columns.get(t.primary_key[0] as usize).map(|c| c.ty) == Some(ColumnType::Int64)
+    };
     let k_aggs = (group_by.len() + agg_specs.len()) as u16;
     let decide_bare_cols = |projection: &[Projection],
                             having: &Option<ExprProgram>,
@@ -503,22 +521,45 @@ pub(super) fn plan_aggregate_select(
             // byte-identical to the postgres one.
             return Ok(Vec::new());
         };
-        let single_min_max = matches!(
-            agg_specs.as_slice(),
-            [(mpedb_types::AggFn::Min | mpedb_types::AggFn::Max, _, _)]
-        );
-        if !single_min_max {
+        // sqlite's bare-column rule turns on how many min()/max() aggregates the
+        // query has (the OTHER aggregates — count/sum/avg — do not matter):
+        //   1  → every bare column takes that extremum's WITNESS row. sqlite's
+        //        documented, deterministic rule (#87), and it holds even over a
+        //        join, so no `rowid_pick_ok` gate.
+        //   0  → sqlite's "arbitrary" pick is really the group's LOWEST-ROWID row
+        //        (verified vs sqlite 3.45). The executor reproduces it with the
+        //        per-group min-PK witness, EXACTLY when mpedb reads rows from that
+        //        rowid — `rowid_pick_ok` (single INTEGER-PK table, no join).
+        //   ≥2 → sqlite takes the LAST min()/max()'s witness row, an order-
+        //        dependent pick its own docs call "arbitrary" — refuse it rather
+        //        than reproduce version-fragile behavior (never a wrong answer).
+        let n_minmax = agg_specs
+            .iter()
+            .filter(|(f, _, _)| matches!(f, mpedb_types::AggFn::Min | mpedb_types::AggFn::Max))
+            .count();
+        let reproducible = match n_minmax {
+            1 => true,
+            0 => rowid_pick_ok,
+            _ => false,
+        };
+        if !reproducible {
+            let reason = if n_minmax == 0 {
+                "over a join or a non-rowid primary key sqlite would take it from an \
+                 arbitrary row"
+            } else {
+                "with two or more min()/max() aggregates sqlite's pick is order-dependent"
+            };
             return Err(bind_err(format!(
                 "column `{}` must appear in GROUP BY, be inside an aggregate, or be \
-                 determined by a single min()/max() — sqlite would take it from an \
-                 arbitrary row, which mpedb refuses rather than return a value that \
-                 might differ from sqlite",
+                 determined by a single min()/max() — {reason}, which mpedb refuses \
+                 rather than return a value that might differ from sqlite",
                 base_scope.slot_name(bare[first_live].0)
             )));
         }
         // Keep EVERY recorded bare column (live and folded-away alike) so the
         // grouped-tuple slot positions the projection was bound against stay put;
-        // the executor fills them all from the group's min/max witness row.
+        // the executor fills them all from the group's witness row — the single
+        // min/max extremum, or the lowest-rowid row — inferred from the aggregate set.
         Ok(bare.iter().map(|(c, _)| *c).collect())
     };
 
