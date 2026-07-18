@@ -178,7 +178,18 @@ const MAX_JOINS: usize = 16;
 //     CLOSED at byte 0 with `PlanInvalidated` (the documented re-prepare path),
 //     never a misread — the same additive `Aggregation` gating as every prior
 //     grouped-block change.
-const PLAN_FORMAT: u8 = 30;
+// 31: compound bodies in a lifted subquery (`IN (SELECT … UNION …)`, a scalar
+//     `(SELECT … UNION … LIMIT 1)`, `EXISTS (SELECT … UNION …)`). A [`SubPlan`]'s
+//     body was always a `SelectPlan`; it is now a [`SubBody`] — `Select` OR
+//     `Compound` — so `encode_subplan` writes a body-discriminant BYTE (0=Select,
+//     1=Compound) where it used to inline the select directly. A format-30 reader
+//     would take that tag byte as the select's low table-id byte and desync, so
+//     the whole-plan version gates it: a format-30 blob fails CLOSED at byte 0
+//     with `PlanInvalidated` (the documented re-prepare path), never a misread.
+//     Compound-bodied subplans are UNCORRELATED and carry no nested lifts (a
+//     subquery inside a compound arm is still refused), so every other subplan
+//     field is unchanged — only genuinely-compound bodies differ.
+const PLAN_FORMAT: u8 = 31;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -304,7 +315,12 @@ pub enum OrderOver {
 /// before this subplan's own access resolution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubPlan {
-    pub plan: SelectPlan,
+    /// The subquery's body (#56, format 31). A plain `SELECT` OR — for
+    /// `IN (SELECT … UNION …)`, a scalar `(SELECT … UNION … LIMIT 1)`, or
+    /// `EXISTS (SELECT … UNION …)` — a whole `Compound`. A compound body is
+    /// UNCORRELATED and carries no nested lifts (`outer_args`/`subplans` empty),
+    /// so it is executed once, up front, exactly like an uncorrelated select.
+    pub body: SubBody,
     pub outer_args: Vec<u16>,
     pub kind: SubPlanKind,
     /// This subplan's OWN lifted subqueries. Empty = a leaf (the pre-#73 shape).
@@ -319,6 +335,46 @@ pub struct SubPlan {
     /// an IN-list). Carried so a parent's `validate` can type its inner param
     /// space — including a child used as a key part — without re-planning.
     pub slot_type: Option<ColumnType>,
+}
+
+/// A lifted subquery's BODY (#56, format 31): a plain `SELECT` or a whole
+/// compound `SELECT … UNION/EXCEPT/INTERSECT …`. Only the lift positions that
+/// consume the subquery as a value/list/existence — scalar `(…)`, `x IN (…)`,
+/// `EXISTS (…)` — accept a `Compound`; a compound body is always UNCORRELATED
+/// and carries no nested lifts, so wherever a subplan reaches back into its
+/// enclosing row (`outer_args`, `post_filter`, nested `subplans`) the body is a
+/// `Select`.
+// `Select` is naturally larger than `Compound` (which is a Vec of arms); like
+// [`PlanStmt`], the shape is part of the plan's frozen structure and `as_select`
+// hands out a `&SelectPlan`, so boxing to equalize the variants would only add
+// indirection to the common (simple-select) subplan.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub enum SubBody {
+    Select(SelectPlan),
+    Compound(CompoundPlan),
+}
+
+impl SubBody {
+    /// The caller-visible output arity of this body — a scalar/IN subplan must
+    /// output exactly one column. A `Select`'s ORDER BY junk is not output; a
+    /// compound's arms carry no junk (its `arms[0]` names the output).
+    pub fn output_arity(&self) -> usize {
+        match self {
+            SubBody::Select(sp) => sp.projection.len() - sp.order_junk as usize,
+            SubBody::Compound(c) => c.arms.first().map_or(0, |a| a.projection.len()),
+        }
+    }
+
+    /// The `Select` body, if this is one (never a `Compound`). Used where only a
+    /// plain select is representable — a correlated subplan, a post-filter, a
+    /// nested lift — all of which a compound body is guaranteed not to be.
+    pub fn as_select(&self) -> Option<&SelectPlan> {
+        match self {
+            SubBody::Select(sp) => Some(sp),
+            SubBody::Compound(_) => None,
+        }
+    }
 }
 
 /// What a subplan's result slot HOLDS.
@@ -965,6 +1021,11 @@ const STMT_SAVEPOINT: u8 = 9;
 const STMT_RELEASE: u8 = 10;
 const STMT_ROLLBACK_TO: u8 = 11;
 const STMT_RECURSIVE_CTE: u8 = 12;
+
+// A lifted subquery's body discriminant (format 31): a plain SELECT or a whole
+// compound. Written by `encode_subplan` right before the body.
+const SUBBODY_SELECT: u8 = 0;
+const SUBBODY_COMPOUND: u8 = 1;
 
 const ACCESS_FULL: u8 = 0;
 const ACCESS_PK_POINT: u8 = 1;

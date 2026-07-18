@@ -12,7 +12,7 @@
 //! and the catalog counts. The caller relates the estimate to `max_work_rows`
 //! and can warn (or, via [`RiskEstimate::exceeds`], refuse) at prepare time.
 
-use mpedb_sql::{AccessPath, CompiledPlan, CompoundPlan, PlanStmt, SelectPlan, SubPlan};
+use mpedb_sql::{AccessPath, CompiledPlan, CompoundPlan, PlanStmt, SelectPlan, SubBody, SubPlan};
 use mpedb_types::Schema;
 
 /// A prepare-time worst-case estimate of the work one execution may do.
@@ -160,22 +160,39 @@ fn estimate_select(
     }
     // `product` now = the number of rows a correlated subplan re-evaluates over.
     for sub in subplans {
-        let inner = estimate_select(&sub.plan, &sub.subplans, schema, rc);
+        let inner = estimate_body(&sub.body, &sub.subplans, schema, rc);
         if sub.outer_args.is_empty() {
             // Uncorrelated: evaluated once. Its own worst case is a candidate.
             let inner_rows = inner.rows;
             let inner_label = inner.into_estimate();
             acc.consider(inner_rows, || inner_label.dominant);
         } else {
-            // Correlated: re-evaluated per outer row ⇒ product · inner.
+            // Correlated: re-evaluated per outer row ⇒ product · inner. A
+            // correlated subplan always has a plain SELECT body (a compound body
+            // is uncorrelated).
             let sub_work = product.saturating_mul(inner.rows);
-            let it = sub.plan.table;
-            acc.consider(sub_work, || {
-                format!("correlated subquery over \"{}\"", table_name(schema, it))
+            let it = sub.body.as_select().map(|sp| sp.table);
+            acc.consider(sub_work, || match it {
+                Some(t) => format!("correlated subquery over \"{}\"", table_name(schema, t)),
+                None => "correlated subquery".to_string(),
             });
         }
     }
     acc
+}
+
+/// Worst-case estimate for a lifted subquery's body — a plain SELECT or a whole
+/// compound (#56/format 31).
+fn estimate_body(
+    body: &SubBody,
+    subplans: &[SubPlan],
+    schema: &Schema,
+    rc: &dyn Fn(u32) -> u64,
+) -> Acc {
+    match body {
+        SubBody::Select(sp) => estimate_select(sp, subplans, schema, rc),
+        SubBody::Compound(c) => estimate_compound(c, subplans, schema, rc),
+    }
 }
 
 fn estimate_compound(
@@ -224,16 +241,17 @@ pub fn estimate_plan_risk(
             let mut acc = Acc::new(base, format!("scan of table \"{}\"", table_name(schema, *table)));
             // A correlated subquery in the WHERE re-evaluates per matched row.
             for sub in &plan.subplans {
-                let inner = estimate_select(&sub.plan, &sub.subplans, schema, row_count);
+                let inner = estimate_body(&sub.body, &sub.subplans, schema, row_count);
                 if sub.outer_args.is_empty() {
                     let r = inner.rows;
                     let e = inner.into_estimate();
                     acc.consider(r, || e.dominant);
                 } else {
-                    let it = sub.plan.table;
+                    let it = sub.body.as_select().map(|sp| sp.table);
                     let w = base.saturating_mul(inner.rows);
-                    acc.consider(w, || {
-                        format!("correlated subquery over \"{}\"", table_name(schema, it))
+                    acc.consider(w, || match it {
+                        Some(t) => format!("correlated subquery over \"{}\"", table_name(schema, t)),
+                        None => "correlated subquery".to_string(),
                     });
                 }
             }

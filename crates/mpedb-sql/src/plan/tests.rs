@@ -83,6 +83,21 @@ fn sample_sqls() -> Vec<&'static str> {
         // encode/decode/validate/hash — reached via known and unknown type names.
         "SELECT CAST(age AS SIGNED), CAST(score AS INTEGER), CAST(email AS REAL) FROM users",
         "SELECT CAST(email AS BLOB), CAST(age AS VARCHAR(10)) FROM users",
+        // Compound bodies in a lifted subquery (#56/format 31): a scalar, an
+        // `IN`, and an `EXISTS` whose body is a whole UNION/INTERSECT/EXCEPT
+        // compound — the subplan now carries a body-discriminant byte + a
+        // `CompoundPlan`, which must survive encode/decode/validate.
+        "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders UNION SELECT age FROM users)",
+        "SELECT id FROM users WHERE age IN (SELECT item_no FROM orders INTERSECT SELECT age FROM users) AND active",
+        "SELECT id FROM users WHERE age NOT IN (SELECT item_no FROM orders EXCEPT SELECT age FROM users)",
+        "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders UNION ALL SELECT 2)",
+        "SELECT (SELECT 1 UNION SELECT 2 LIMIT 1)",
+        // A compound body NESTED inside a plain-select subquery: the outer IN's
+        // Select body carries an inner IN whose body is a whole compound — the
+        // compound rides as an (uncorrelated) child subplan of the middle.
+        "SELECT id FROM users WHERE id IN \
+         (SELECT user_id FROM orders WHERE item_no IN (SELECT age FROM users UNION SELECT id FROM users))",
+        "SELECT id FROM users WHERE id = (SELECT user_id FROM orders UNION SELECT 4 LIMIT 1)",
         "BEGIN",
         "COMMIT",
         "ROLLBACK",
@@ -153,7 +168,7 @@ fn decode_rejects_truncation_and_stale_format_in_cast() {
         let p = prepare(sql, &s).unwrap();
         let _ = p.explain(&s); // must not panic rendering the affinity name
         let bytes = p.encode();
-        assert_eq!(bytes[0], 30, "plan format byte for {sql}");
+        assert_eq!(bytes[0], 31, "plan format byte for {sql}");
         let q = CompiledPlan::decode(&bytes, &s).expect(sql);
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         for cut in 0..bytes.len() {
@@ -194,7 +209,7 @@ fn bare_group_by_roundtrips_and_rejects_truncation_and_stale_format() {
         assert!(!agg.bare_cols.is_empty(), "bare_cols must be populated for {sql}");
 
         let bytes = p.encode();
-        assert_eq!(bytes[0], 30, "plan format byte for {sql}");
+        assert_eq!(bytes[0], 31, "plan format byte for {sql}");
         let q = CompiledPlan::decode(&bytes, &s).expect(sql);
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         for cut in 0..bytes.len() {
@@ -328,6 +343,47 @@ fn decode_rejects_truncation_in_nested_subplan() {
     assert_eq!(CompiledPlan::decode(&bytes, &s).unwrap(), p);
 }
 
+/// The compound-subquery-body bytes (#56/format 31) get their own sweep: a
+/// subplan whose body is a whole compound carries a body-discriminant byte + a
+/// `CompoundPlan` (arm count, ops, per-arm SELECTs, ORDER BY/LIMIT), and every
+/// cut through them must fail closed rather than decode a half-read compound.
+/// EXPLAIN renders the compound body without panicking, and a format-30 blob is
+/// re-prepared (never misread) — the whole-plan version gate.
+#[test]
+fn compound_subplan_roundtrips_rejects_truncation_and_stale_format() {
+    let s = test_schema();
+    for sql in [
+        "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders UNION SELECT age FROM users)",
+        "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders INTERSECT SELECT 1 FROM events)",
+        "SELECT (SELECT 1 UNION SELECT 2 LIMIT 1)",
+    ] {
+        let p = prepare(sql, &s).unwrap();
+        // Sanity: the subplan really carries a COMPOUND body.
+        assert!(
+            p.subplans
+                .iter()
+                .any(|sp| matches!(sp.body, SubBody::Compound(_))),
+            "expected a compound subplan body for {sql}"
+        );
+        let _ = p.explain(&s); // must not panic on the compound body render
+        let bytes = p.encode();
+        assert_eq!(bytes[0], 31, "plan format byte for {sql}");
+        assert_eq!(CompiledPlan::decode(&bytes, &s).unwrap(), p, "roundtrip for {sql}");
+        for cut in 0..bytes.len() {
+            assert!(
+                CompiledPlan::decode(&bytes[..cut], &s).is_err(),
+                "truncation at {cut} must fail for {sql}"
+            );
+        }
+        let mut stale = bytes.clone();
+        stale[0] = 30;
+        assert!(
+            matches!(CompiledPlan::decode(&stale, &s), Err(Error::PlanInvalidated)),
+            "a format-30 compound-subplan plan must be PlanInvalidated, not misread, for {sql}"
+        );
+    }
+}
+
 /// The recursive-CTE bytes (format 26) get their own truncation sweep: a
 /// `RecursiveCte` plan carries a name, a columns+types list, a `union_all` byte
 /// and THREE nested SelectPlans (anchor / recursive / outer), and every cut
@@ -383,7 +439,7 @@ fn decode_rejects_truncation_in_correlated_nested_subplan() {
     assert_eq!(p.subplans.len(), 1);
     assert_eq!(p.subplans[0].subplans.len(), 1);
     assert_eq!(p.subplans[0].subplans[0].outer_args.len(), 1);
-    assert!(p.subplans[0].plan.post_filter.is_some());
+    assert!(p.subplans[0].body.as_select().unwrap().post_filter.is_some());
     let bytes = p.encode();
     for cut in 0..bytes.len() {
         assert!(
@@ -413,7 +469,7 @@ fn correlated_nested_subplan_round_trips_and_bounds() {
     assert_eq!(p.subplans[0].subplans.len(), 1);
     assert_eq!(p.subplans[0].subplans[0].outer_args.len(), 1);
     assert!(
-        p.subplans[0].plan.post_filter.is_some(),
+        p.subplans[0].body.as_select().unwrap().post_filter.is_some(),
         "correlated child ⇒ parent post_filter"
     );
     // Legal blob round-trips (and re-validates the whole correlated tree).
