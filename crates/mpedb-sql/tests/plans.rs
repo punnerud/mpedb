@@ -445,11 +445,9 @@ fn parse_and_bind_error_taxonomy() {
         prepare("SELECT * FROM users WHERE 1", &s),
         Err(Error::Bind(_))
     ));
-    // Fold-time division by zero surfaces as the runtime error.
-    assert!(matches!(
-        prepare("SELECT 1/0 FROM users", &s),
-        Err(Error::DivisionByZero)
-    ));
+    // Division by zero is NOT an error: it folds to NULL (sqlite semantics),
+    // so the statement prepares cleanly.
+    assert!(prepare("SELECT 1/0 FROM users", &s).is_ok());
 }
 
 #[test]

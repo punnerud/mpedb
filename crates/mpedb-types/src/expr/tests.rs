@@ -65,13 +65,24 @@ fn params_and_arith() {
         p.eval(&[Value::Int(52)], &[]),
         Err(Error::WrongParamCount { .. })
     ));
-    assert!(matches!(
+    // Division by zero yields NULL (sqlite semantics), not an error.
+    assert_eq!(
         prog(
             vec![Instr::PushConst(0), Instr::PushConst(0), Instr::Div],
             vec![Value::Int(0)]
         )
+        .eval(&[], &[])
+        .unwrap(),
+        Value::Null
+    );
+    // Overflow still raises: i64::MIN / -1.
+    assert!(matches!(
+        prog(
+            vec![Instr::PushConst(0), Instr::PushConst(1), Instr::Div],
+            vec![Value::Int(i64::MIN), Value::Int(-1)]
+        )
         .eval(&[], &[]),
-        Err(Error::DivisionByZero)
+        Err(Error::ArithmeticOverflow)
     ));
 }
 
