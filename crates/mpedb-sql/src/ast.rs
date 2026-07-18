@@ -77,7 +77,12 @@ pub(crate) struct InsertStmt {
     pub table: String,
     /// Explicit column list, if given.
     pub columns: Option<Vec<String>>,
+    /// `VALUES` rows. Empty exactly when `select` is `Some` (the two forms are
+    /// mutually exclusive).
     pub rows: Vec<Vec<Expr>>,
+    /// `INSERT INTO t [(cols)] SELECT …` — the source query. Its output tuple
+    /// (one per produced row) fills the listed columns in order.
+    pub select: Option<Box<SelectStmt>>,
     pub on_conflict: OnConflict,
     /// `RETURNING` items; `Some(None)` = `RETURNING *`.
     pub returning: Option<Option<Vec<Expr>>>,

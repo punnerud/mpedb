@@ -335,6 +335,7 @@ fn encode_stmt_rest(stmt: &PlanStmt, buf: &mut Vec<u8>) {
         PlanStmt::Insert {
             table,
             rows,
+            from_select,
             with_check,
             on_conflict,
             returning,
@@ -356,6 +357,25 @@ fn encode_stmt_rest(stmt: &PlanStmt, buf: &mut Vec<u8>) {
                             w_u16(buf, *i);
                         }
                         InsertSource::Default => buf.push(SRC_DEFAULT),
+                    }
+                }
+            }
+            // INSERT … SELECT source: presence byte, then the embedded select
+            // plan and the target-column map.
+            match from_select {
+                None => buf.push(0),
+                Some(sel) => {
+                    buf.push(1);
+                    encode_select(&sel.plan, buf);
+                    w_u16(buf, sel.col_map.len() as u16);
+                    for m in &sel.col_map {
+                        match m {
+                            None => buf.push(0),
+                            Some(i) => {
+                                buf.push(1);
+                                w_u16(buf, *i);
+                            }
+                        }
                     }
                 }
             }

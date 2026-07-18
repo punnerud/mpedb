@@ -296,6 +296,7 @@ impl CompiledPlan {
             PlanStmt::Insert {
                 table,
                 rows,
+                from_select,
                 with_check,
                 on_conflict,
                 returning,
@@ -342,7 +343,34 @@ impl CompiledPlan {
                 if let Some(r) = returning {
                     self.check_projection(r, t, ptypes)?;
                 }
-                if rows.is_empty() {
+                if let Some(sel) = from_select {
+                    if !rows.is_empty() {
+                        return Err(corrupt("INSERT has both VALUES rows and a SELECT source"));
+                    }
+                    // The embedded source query is re-validated in full.
+                    self.validate_select(&sel.plan, schema, ptypes)?;
+                    let width = sel.plan.projection.len();
+                    if sel.col_map.len() != t.columns.len() {
+                        return Err(corrupt("INSERT … SELECT col_map width mismatch"));
+                    }
+                    for (ci, m) in sel.col_map.iter().enumerate() {
+                        match m {
+                            Some(i) => {
+                                if *i as usize >= width {
+                                    return Err(corrupt("INSERT … SELECT col_map index out of range"));
+                                }
+                            }
+                            None => {
+                                let col = &t.columns[ci];
+                                if !col.nullable && col.default.is_none() {
+                                    return Err(corrupt(
+                                        "INSERT … SELECT omits a NOT NULL column without a default",
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                } else if rows.is_empty() {
                     return Err(corrupt("INSERT plan with no rows"));
                 }
                 if let Some(w) = with_check {

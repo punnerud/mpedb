@@ -76,7 +76,10 @@ const MAX_JOINS: usize = 16;
 // 15: math scalar fns `sqrt` (12), `pow`/`power` (13), `sign` (14) — same
 //    additive `ScalarFn`-tag gating.
 // 16: `ceil`/`ceiling` (15), `floor` (16) — type-preserving, same gating.
-const PLAN_FORMAT: u8 = 16;
+// 17: INSERT … SELECT — the Insert stmt carries an optional embedded select
+//     plan + column map after its VALUES rows, so a format-16 reader would
+//     desync on the extra bytes.
+const PLAN_FORMAT: u8 = 17;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -405,8 +408,11 @@ pub enum PlanStmt {
     Compound(CompoundPlan),
     Insert {
         table: u32,
-        /// `rows[r][col_idx]`: one entry per table column per row.
+        /// `rows[r][col_idx]`: one entry per table column per row. Empty when
+        /// `from_select` is `Some` (INSERT … SELECT).
         rows: Vec<Vec<InsertSource>>,
+        /// `INSERT … SELECT` source. Mutually exclusive with a non-empty `rows`.
+        from_select: Option<InsertSelect>,
         /// RLS `WITH CHECK` gate on the new row (DESIGN-MULTIDB.md §3.7).
         /// Evaluated with `eval_filter` semantics — NULL and FALSE both REJECT
         /// (NOT the CHECK-constraint rule). `None` = no RLS write gate.
@@ -537,6 +543,16 @@ pub enum InsertSource {
     /// Index into [`CompiledPlan::consts`].
     Const(u16),
     Default,
+}
+
+/// `INSERT INTO t [(cols)] SELECT …` source (COMPAT). The source query produces
+/// one output tuple per row to insert; `col_map[ci]` says where table column
+/// `ci`'s value comes from — an index into that tuple, or `None` for the
+/// column's DEFAULT / NULL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct InsertSelect {
+    pub plan: Box<SelectPlan>,
+    pub col_map: Vec<Option<u16>>,
 }
 
 /// Physical access path over the target table.
