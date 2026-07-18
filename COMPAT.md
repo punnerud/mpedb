@@ -111,6 +111,8 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | instr | ✅ | 1-based character position, 0 when absent (1 for an empty needle) |
 | length | ✅ | |
 | abs, round | ✅ | keep their argument's numeric type |
+| sqrt, pow / power | ✅ | always float; a non-real result (sqrt of a negative) is NULL, matching sqlite |
+| sign | ✅ | always an integer: -1 / 0 / 1 |
 | substr / substring | ✅ | |
 | coalesce, ifnull | ✅ | compiled to lazy control flow, not a call — arguments after the first non-NULL are never evaluated; int64/float64 arm mixing refused, same rule as CASE |
 | nullif | ✅ | desugared to CASE |

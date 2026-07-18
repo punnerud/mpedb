@@ -87,6 +87,32 @@ fn replace_ltrim_rtrim_instr_match_sqlite() {
 }
 
 #[test]
+fn sqrt_pow_sign_match_sqlite() {
+    let (db, path) = db();
+
+    // sqrt / pow: always float; a non-real result (sqrt of a negative, a
+    // fractional power of a negative base) is NULL, matching sqlite.
+    assert_eq!(one(&db, "SELECT sqrt(9.0)"), Value::Float(3.0));
+    assert_eq!(one(&db, "SELECT sqrt(9)"), Value::Float(3.0)); // int arg → float out
+    assert_eq!(one(&db, "SELECT sqrt(-1)"), Value::Null);
+    assert_eq!(one(&db, "SELECT pow(2, 10)"), Value::Float(1024.0));
+    assert_eq!(one(&db, "SELECT pow(2, -1)"), Value::Float(0.5));
+    assert_eq!(one(&db, "SELECT pow(-1, 0.5)"), Value::Null);
+    assert_eq!(one(&db, "SELECT power(3, 2)"), Value::Float(9.0)); // alias
+
+    // sign: always an integer, -1 / 0 / 1.
+    assert_eq!(one(&db, "SELECT sign(-4)"), Value::Int(-1));
+    assert_eq!(one(&db, "SELECT sign(0)"), Value::Int(0));
+    assert_eq!(one(&db, "SELECT sign(2.5)"), Value::Int(1));
+    assert_eq!(one(&db, "SELECT sign(-0.0)"), Value::Int(0));
+
+    // NULL propagates; a non-number is a compile/runtime error.
+    assert_eq!(one(&db, "SELECT sqrt(NULL)"), Value::Null);
+    assert!(db.query("SELECT sqrt('x')", &[]).is_err());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
 fn scalars_compose_and_filter_over_rows() {
     let (db, path) = db();
     for id in 1..=3 {
