@@ -8,7 +8,7 @@
 //! the result is exactly TRUE.
 
 use crate::error::{Error, Result};
-use crate::value::{ColumnType, Value};
+use crate::value::{Collation, ColumnType, Value};
 use std::cmp::Ordering;
 
 mod codec;
@@ -25,7 +25,9 @@ mod tests;
 
 pub use scalar::ScalarFn;
 
-use ops::{glob_match, in_items_3vl, in_list_3vl, like_match, regexp_match};
+use ops::{
+    glob_match, in_items_3vl, in_items_3vl_collated, in_list_3vl, like_match, regexp_match,
+};
 use scalar::call_scalar;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,6 +138,72 @@ pub enum Instr {
     /// Call a scalar function over the top `argc` values (leftmost deepest),
     /// replacing them with one result.
     Call(ScalarFn, u8),
+    /// A comparison under an explicit collating sequence (task: COLLATE). Pops
+    /// two values and pushes the 3VL verdict, exactly like the plain
+    /// [`Instr::Eq`]..[`Instr::Ge`] family, but TEXT operands are ordered by
+    /// `Collation` instead of bytewise. The binder emits it ONLY when the
+    /// resolved collation is non-`Binary` and the compared type is text — a
+    /// `Binary` or numeric comparison stays a plain nullary opcode, so existing
+    /// plan bytes are unchanged.
+    CmpColl(CmpKind, Collation),
+    /// `<scalar> IN (<e1>, …, <en>)` under an explicit collation — the collated
+    /// twin of [`Instr::InList`]. Pops `n` list elements plus the probe beneath
+    /// them; text membership is decided under `Collation`. Emitted only for a
+    /// non-`Binary` collation on a text probe.
+    InListColl(u16, Collation),
+}
+
+/// Which of the six SQL comparison operators a collated [`Instr::CmpColl`]
+/// evaluates. A tiny closed enum so one collated opcode covers all six rather
+/// than minting six; the plain uncollated comparisons stay their own nullary
+/// opcodes for wire stability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum CmpKind {
+    Eq = 0,
+    Ne = 1,
+    Lt = 2,
+    Le = 3,
+    Gt = 4,
+    Ge = 5,
+}
+
+impl CmpKind {
+    pub fn from_tag(t: u8) -> Option<CmpKind> {
+        Some(match t {
+            0 => CmpKind::Eq,
+            1 => CmpKind::Ne,
+            2 => CmpKind::Lt,
+            3 => CmpKind::Le,
+            4 => CmpKind::Gt,
+            5 => CmpKind::Ge,
+            _ => return None,
+        })
+    }
+
+    /// Map an ordering verdict to this operator's boolean result.
+    fn eval(self, ord: Ordering) -> bool {
+        match self {
+            CmpKind::Eq => ord == Ordering::Equal,
+            CmpKind::Ne => ord != Ordering::Equal,
+            CmpKind::Lt => ord == Ordering::Less,
+            CmpKind::Le => ord != Ordering::Greater,
+            CmpKind::Gt => ord == Ordering::Greater,
+            CmpKind::Ge => ord != Ordering::Less,
+        }
+    }
+
+    /// The operator symbol, for EXPLAIN.
+    pub fn symbol(self) -> &'static str {
+        match self {
+            CmpKind::Eq => "=",
+            CmpKind::Ne => "<>",
+            CmpKind::Lt => "<",
+            CmpKind::Le => "<=",
+            CmpKind::Gt => ">",
+            CmpKind::Ge => ">=",
+        }
+    }
 }
 
 /// A compiled expression: instruction sequence + constant pool.
@@ -398,6 +466,20 @@ impl ExprProgram {
                     let at = stack.len() - argc as usize;
                     let args: Vec<Value> = stack.split_off(at);
                     stack.push(call_scalar(f, &args)?);
+                }
+                Instr::CmpColl(kind, coll) => {
+                    let b = stack.pop().expect("validated");
+                    let a = stack.pop().expect("validated");
+                    stack.push(match a.sql_cmp_collated(&b, coll)? {
+                        None => Value::Null,
+                        Some(ord) => Value::Bool(kind.eval(ord)),
+                    });
+                }
+                Instr::InListColl(n, coll) => {
+                    let at = stack.len() - n as usize;
+                    let items: Vec<Value> = stack.split_off(at);
+                    let probe = stack.pop().expect("validated");
+                    stack.push(in_items_3vl_collated(&probe, &items, coll)?);
                 }
             }
         }

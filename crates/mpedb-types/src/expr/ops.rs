@@ -67,6 +67,34 @@ pub(super) fn in_items_3vl(probe: &Value, items: &[Value]) -> Result<Value> {
     Ok(if saw_null { Value::Null } else { Value::Bool(false) })
 }
 
+/// The 3VL core for `x COLLATE <coll> IN (…)` — identical to [`in_items_3vl`]
+/// except text membership is decided under an explicit collation. Every NULL /
+/// empty-set rule above is preserved verbatim; only the equality test changes.
+pub(super) fn in_items_3vl_collated(
+    probe: &Value,
+    items: &[Value],
+    coll: Collation,
+) -> Result<Value> {
+    if items.is_empty() {
+        return Ok(Value::Bool(false));
+    }
+    if probe.is_null() {
+        return Ok(Value::Null);
+    }
+    let mut saw_null = false;
+    for it in items {
+        if it.is_null() {
+            saw_null = true;
+            continue;
+        }
+        match probe.sql_cmp_collated(it, coll)? {
+            Some(std::cmp::Ordering::Equal) => return Ok(Value::Bool(true)),
+            _ => continue,
+        }
+    }
+    Ok(if saw_null { Value::Null } else { Value::Bool(false) })
+}
+
 /// SQL LIKE: `%` matches any run, `_` matches one char. Iterative
 /// two-pointer algorithm — O(n·m) worst case, no recursion, no regex dep.
 pub(super) fn like_match(pattern: &str, s: &str) -> bool {

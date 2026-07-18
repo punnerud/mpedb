@@ -306,6 +306,7 @@ fn rewrite_row_in_expr(e: &mut Expr, scope: &RowScope, map: &mut RowMap) -> Resu
         Expr::Unary(_, a)
         | Expr::IsNull(a, _)
         | Expr::Cast(a, _)
+        | Expr::Collate(a, _)
         | Expr::Agg(_, Some(a), _) => rewrite_row_in_expr(a, scope, map),
         Expr::Agg(_, None, _) => Ok(()),
         Expr::Binary(_, a, b)

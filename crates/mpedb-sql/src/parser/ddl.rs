@@ -191,6 +191,12 @@ impl<'a> Parser<'a> {
                     } else if self.eat_word("PRIMARY") {
                         self.expect_word("KEY")?;
                         col.pk = true;
+                    } else if self.eat_word("COLLATE") {
+                        return Err(self.err_here(
+                            "column-declared COLLATE is not supported yet (stage 1b) — put \
+                             the COLLATE on the comparison or ORDER BY instead \
+                             (e.g. `WHERE name = 'x' COLLATE NOCASE`)",
+                        ));
                     } else if self.eat_word("DEFAULT") || self.eat_word("CHECK")
                         || self.eat_word("REFERENCES")
                     {
@@ -658,6 +664,11 @@ impl<'a> Parser<'a> {
                 } else if self.eat_word("PRIMARY") {
                     self.expect_word("KEY")?;
                     col.pk = true;
+                } else if self.eat_word("COLLATE") {
+                    return Err(self.err_here(
+                        "column-declared COLLATE is not supported yet (stage 1b) — put \
+                         the COLLATE on the comparison or ORDER BY instead",
+                    ));
                 } else if self.eat_word("DEFAULT")
                     || self.eat_word("CHECK")
                     || self.eat_word("REFERENCES")

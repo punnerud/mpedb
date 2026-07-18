@@ -16,6 +16,11 @@ fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8]> {
     Ok(s)
 }
 
+/// Decode an ORDER-BY collation tag byte, rejecting an unknown value.
+fn r_collation(buf: &[u8], pos: &mut usize) -> Result<Collation> {
+    Collation::from_tag(r_u8(buf, pos)?).ok_or_else(|| corrupt("bad collation tag"))
+}
+
 fn r_u8(buf: &[u8], pos: &mut usize) -> Result<u8> {
     Ok(take(buf, pos, 1)?[0])
 }
@@ -451,7 +456,8 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                     1 => true,
                     t => return Err(corrupt(format!("bad order direction {t}"))),
                 };
-                order_by.push((c, desc));
+                let coll = r_collation(buf, pos)?;
+                order_by.push((c, desc, coll));
             }
             let limit = decode_opt_u64(buf, pos)?;
             let offset = decode_opt_u64(buf, pos)?;
@@ -565,7 +571,8 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                     1 => true,
                     t => return Err(corrupt(format!("bad order direction {t}"))),
                 };
-                order_by.push((c, desc));
+                let coll = r_collation(buf, pos)?;
+                order_by.push((c, desc, coll));
             }
             let limit = decode_opt_u64(buf, pos)?;
             let offset = decode_opt_u64(buf, pos)?;

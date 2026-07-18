@@ -12,7 +12,8 @@
 
 use crate::ast::{self, BinOp, UnOp};
 use mpedb_types::{
-    ColumnDef, ColumnType, Error, ExprProgram, Instr, Result, ScalarFn, TableDef, Value,
+    CmpKind, Collation, ColumnDef, ColumnType, Error, ExprProgram, Instr, Result, ScalarFn,
+    TableDef, Value,
 };
 
 /// Bound (name-resolved, type-checked, constant-folded) expression.
@@ -54,6 +55,17 @@ pub(crate) enum BExpr {
     Coalesce(Vec<BExpr>),
     /// `CAST(x AS t)` — semantics live in [`Instr::Cast`](mpedb_types::expr).
     Cast(Box<BExpr>, ColumnType),
+    /// A comparison under an explicit collating sequence (task: COLLATE). The
+    /// `BinOp` is one of the six comparison operators; TEXT operands compare
+    /// under `Collation`. A distinct node from [`BExpr::Binary`] on purpose: the
+    /// access-path extractor recognizes only `Binary(Eq, …)` as an index/PK
+    /// probe, so a collated comparison is never turned into a bytewise key
+    /// lookup — it always stays a residual filter over a full scan, which is
+    /// what keeps NOCASE/RTRIM correct without a collated index.
+    CollateCmp(BinOp, Box<BExpr>, Box<BExpr>, Collation),
+    /// `<probe> COLLATE <coll> IN (e1, …, en)` — the collated form of
+    /// [`BExpr::InList`].
+    InListColl(Box<BExpr>, Vec<BExpr>, Collation),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -645,7 +657,11 @@ impl<'a> Binder<'a> {
                 if items.len() > u16::MAX as usize {
                     return Err(bind_err("IN list is too long (max 65535 values)"));
                 }
-                let (l, lt) = self.bind_expr(lhs)?;
+                // `x COLLATE <coll> IN (…)` — the probe's collation governs the
+                // membership test (sqlite's left-operand rule). Peel it off the
+                // probe so the inner expression binds normally.
+                let (lhs_ast, lhs_coll) = peel_collate(lhs)?;
+                let (l, lt) = self.bind_expr(lhs_ast)?;
                 let mut all = vec![(l, lt)];
                 for it in items {
                     all.push(self.bind_expr(it)?);
@@ -657,10 +673,13 @@ impl<'a> Binder<'a> {
                 // runtime on a query the binder had already accepted.
                 let (mut all, _) = self.unify_many(all, "compare with IN list")?;
                 let l = all.remove(0);
-                Ok((
-                    maybe_not(BExpr::InList(Box::new(l), all), *negated),
-                    Some(ColumnType::Bool),
-                ))
+                let coll = lhs_coll.unwrap_or_default();
+                let node = if coll == Collation::Binary {
+                    BExpr::InList(Box::new(l), all)
+                } else {
+                    BExpr::InListColl(Box::new(l), all, coll)
+                };
+                Ok((maybe_not(node, *negated), Some(ColumnType::Bool)))
             }
             ast::Expr::Case(arms, else_) => {
                 let mut bound_conds = Vec::with_capacity(arms.len());
@@ -819,12 +838,42 @@ impl<'a> Binder<'a> {
                 let e = fold_maybe(BExpr::Cast(Box::new(a), *t), self.suppress_fold)?;
                 Ok((e, Some(*t)))
             }
+            ast::Expr::Collate(_, name) => {
+                // Validate the name so an unknown collation is reported as such
+                // even in an unsupported position. A COLLATE reaches here only
+                // when it is NOT a direct comparison operand or ORDER BY term
+                // (those peel it before binding) — so it could not change any
+                // comparison or sort, and mpedb refuses it rather than silently
+                // dropping it (which under DISTINCT/GROUP BY would be a wrong
+                // answer). Column-declared collation is stage 1b.
+                resolve_collation(name)?;
+                Err(bind_err(
+                    "COLLATE is only supported directly on a comparison operand \
+                     (e.g. `x = y COLLATE NOCASE`) or an ORDER BY term",
+                ))
+            }
         }
     }
 
     fn bind_binary(&mut self, op: BinOp, l: &ast::Expr, r: &ast::Expr) -> Result<(BExpr, Ty)> {
-        let (l, lt) = self.bind_expr(l)?;
-        let (r, rt) = self.bind_expr(r)?;
+        // COLLATE is honored on comparison operands only. Peel a top-level
+        // COLLATE off each side HERE, before binding, so the inner expression
+        // binds normally and the resolved collation feeds the precedence rule
+        // below. For every other operator the raw operands are bound, so a
+        // COLLATE there reaches `bind_expr` and is refused rather than ignored.
+        let is_cmp = matches!(
+            op,
+            BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+        );
+        let (l_ast, l_coll, r_ast, r_coll) = if is_cmp {
+            let (la, lc) = peel_collate(l)?;
+            let (ra, rc) = peel_collate(r)?;
+            (la, lc, ra, rc)
+        } else {
+            (l, None, r, None)
+        };
+        let (l, lt) = self.bind_expr(l_ast)?;
+        let (r, rt) = self.bind_expr(r_ast)?;
         match op {
             BinOp::And | BinOp::Or => {
                 let (l, lt) = self.unify_param(l, lt, ColumnType::Bool);
@@ -841,7 +890,22 @@ impl<'a> Binder<'a> {
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 let (l, r, _) = self.unify_operands(l, lt, r, rt, "compare")?;
-                let e = fold_maybe(BExpr::Binary(op, Box::new(l), Box::new(r)), self.suppress_fold)?;
+                // Precedence (task): explicit COLLATE on the LEFT operand wins,
+                // else the RIGHT operand's, else BINARY. (A column's declared
+                // collation — precedence rung 3 — is stage 1b and not yet
+                // consulted.) A non-Binary collation gets its own node so the
+                // access-path extractor never mistakes it for an index probe; a
+                // Binary comparison stays a plain `Binary` node, byte-for-byte
+                // unchanged. Collation degrades to bytewise for non-text at
+                // runtime, so emitting it for any statically-unpinned operand is
+                // safe.
+                let coll = l_coll.or(r_coll).unwrap_or_default();
+                let node = if coll == Collation::Binary {
+                    BExpr::Binary(op, Box::new(l), Box::new(r))
+                } else {
+                    BExpr::CollateCmp(op, Box::new(l), Box::new(r), coll)
+                };
+                let e = fold_maybe(node, self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
             }
             BinOp::Concat => {
@@ -1438,6 +1502,45 @@ fn cast_possible(src: ColumnType, dst: ColumnType) -> bool {
     )
 }
 
+/// Resolve a collation NAME (as written after `COLLATE`) to a built-in, or a
+/// clean bind error naming the unsupported collation.
+pub(crate) fn resolve_collation(name: &str) -> Result<Collation> {
+    Collation::parse(name).ok_or_else(|| bind_err(format!("no such collation sequence: {name}")))
+}
+
+/// Peel a top-level explicit `COLLATE` off an AST expression, returning the
+/// inner expression and its resolved collation (`None` when there is no
+/// `COLLATE`). Chained `COLLATE`s (`x COLLATE A COLLATE B`) resolve to the
+/// OUTERMOST — the last one written — matching sqlite; the shadowed inner names
+/// are still validated. Any `COLLATE` nested DEEPER than the peeled operand is
+/// left in `inner` for [`Binder::bind_expr`] to refuse, so it can never be
+/// silently dropped.
+pub(crate) fn peel_collate(e: &ast::Expr) -> Result<(&ast::Expr, Option<Collation>)> {
+    let ast::Expr::Collate(inner, name) = e else {
+        return Ok((e, None));
+    };
+    let coll = resolve_collation(name)?;
+    let mut cur = inner.as_ref();
+    while let ast::Expr::Collate(next, n) = cur {
+        resolve_collation(n)?;
+        cur = next.as_ref();
+    }
+    Ok((cur, Some(coll)))
+}
+
+/// Map one of the six comparison `BinOp`s to its collated-instruction kind.
+fn cmp_kind(op: BinOp) -> CmpKind {
+    match op {
+        BinOp::Eq => CmpKind::Eq,
+        BinOp::Ne => CmpKind::Ne,
+        BinOp::Lt => CmpKind::Lt,
+        BinOp::Le => CmpKind::Le,
+        BinOp::Gt => CmpKind::Gt,
+        BinOp::Ge => CmpKind::Ge,
+        _ => unreachable!("cmp_kind is only reached for comparison operators"),
+    }
+}
+
 pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
     let foldable = match &e {
         BExpr::Unary(_, a) => matches!(a.as_ref(), BExpr::Const(_)),
@@ -1447,6 +1550,13 @@ pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
         BExpr::IsDistinct(a, b, _) => {
             matches!(a.as_ref(), BExpr::Const(_)) && matches!(b.as_ref(), BExpr::Const(_))
         }
+        // `'ABC' = 'abc' COLLATE NOCASE` folds to a constant like any other
+        // all-const comparison — compile_program emits the CmpColl and eval
+        // applies the collation.
+        BExpr::CollateCmp(_, a, b, _) => {
+            matches!(a.as_ref(), BExpr::Const(_)) && matches!(b.as_ref(), BExpr::Const(_))
+        }
+        BExpr::InListColl(..) => false,
         BExpr::Like(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         BExpr::Glob(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         BExpr::Regexp(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
@@ -1639,6 +1749,18 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 emit(it, instrs, consts)?;
             }
             instrs.push(Instr::InList(items.len() as u16));
+        }
+        BExpr::CollateCmp(op, a, b, coll) => {
+            emit(a, instrs, consts)?;
+            emit(b, instrs, consts)?;
+            instrs.push(Instr::CmpColl(cmp_kind(*op), *coll));
+        }
+        BExpr::InListColl(a, items, coll) => {
+            emit(a, instrs, consts)?;
+            for it in items {
+                emit(it, instrs, consts)?;
+            }
+            instrs.push(Instr::InListColl(items.len() as u16, *coll));
         }
     }
     Ok(())
