@@ -227,6 +227,22 @@ pub(crate) struct JoinClause {
     pub natural: bool,
 }
 
+/// The body of a subquery used as a value/list/existence — a scalar `(…)`,
+/// `x IN (…)`, or `EXISTS (…)`. A plain `SELECT` or a whole compound
+/// `SELECT … UNION/EXCEPT/INTERSECT …` (the compound form is #56 in a subquery
+/// position). A derived-table FROM source is NOT this — it stays a plain
+/// [`SelectStmt`] because it is flattened onto its base table, which a compound
+/// cannot be.
+// `Select` is naturally larger than `Compound`; the shape mirrors the two
+// statement forms it wraps, so boxing one to equalize them would only add
+// indirection to the common (simple-select) case.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum SubqueryBody {
+    Select(SelectStmt),
+    Compound(CompoundStmt),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Expr {
     Lit(Value),
@@ -279,15 +295,17 @@ pub(crate) enum Expr {
     /// more than one row is a runtime error (PostgreSQL's rule — sqlite
     /// silently takes the first row). The planner lifts it out into the
     /// plan's subplan table and replaces this node with a reserved parameter.
-    Subquery(Box<SelectStmt>),
+    /// The body may be a whole compound `SELECT … UNION … LIMIT 1` (#56/format 31).
+    Subquery(Box<SubqueryBody>),
     /// `[NOT] EXISTS (SELECT …)` — did the subquery produce any row. The
-    /// bool is `negated`.
-    Exists(Box<SelectStmt>, bool),
+    /// bool is `negated`. The body may be a compound (#56/format 31).
+    Exists(Box<SubqueryBody>, bool),
     /// `x [NOT] IN (SELECT …)` (#70) — membership in the subquery's single
     /// output column. The planner lifts the subquery into a LIST-kind
     /// subplan and rewrites this into [`Expr::InParamSlot`]. Uncorrelated
-    /// only; the bool is `negated`.
-    InSubquery(Box<Expr>, Box<SelectStmt>, bool),
+    /// only; the bool is `negated`. The body may be a compound
+    /// `SELECT … UNION …` (#56/format 31).
+    InSubquery(Box<Expr>, Box<SubqueryBody>, bool),
     /// INTERNAL: produced only by the subquery lift — `lhs IN (<list at
     /// reserved param slot>)`, bound to the `InParam` membership
     /// instruction. Never comes out of the parser.

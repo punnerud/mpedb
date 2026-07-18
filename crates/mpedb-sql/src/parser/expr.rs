@@ -12,7 +12,7 @@
 //! entry point can reach it.
 
 use super::{Parser, ParamStyle, MAX_EXPR_DEPTH, MAX_ORDER_BY_ITEMS, MAX_PARSER_STACK};
-use crate::ast::{BinOp, Expr, SelectStmt, UnOp, WindowFunc, WindowSpecAst};
+use crate::ast::{BinOp, Expr, SelectStmt, SubqueryBody, UnOp, WindowFunc, WindowSpecAst};
 use crate::token::{Kw, Tok};
 use mpedb_types::{Error, Result, Value};
 
@@ -418,7 +418,11 @@ impl<'a> Parser<'a> {
                     limit: None,
                     offset: None,
                 };
-                return Ok(Expr::InSubquery(Box::new(e), Box::new(inner), negated));
+                return Ok(Expr::InSubquery(
+                    Box::new(e),
+                    Box::new(SubqueryBody::Select(inner)),
+                    negated,
+                ));
             }
             return Err(self.err_here("`(` or a table name after IN"));
         }
@@ -433,9 +437,10 @@ impl<'a> Parser<'a> {
         }
         // `IN (SELECT …)` — membership in a subquery's output (#70). The
         // SELECT keyword right after the paren decides, same rule as the
-        // scalar-subquery primary.
+        // scalar-subquery primary. The body may be a compound `SELECT … UNION …`
+        // (#56/format 31).
         if matches!(self.peek(), Some(Tok::Kw(Kw::Select))) {
-            let inner = self.select_core()?;
+            let inner = self.subquery_body()?;
             self.expect(&Tok::RParen, "`)` after IN subquery")?;
             return Ok(Expr::InSubquery(Box::new(e), Box::new(inner), negated));
         }
@@ -706,7 +711,7 @@ impl<'a> Parser<'a> {
             if !matches!(self.peek(), Some(Tok::Kw(Kw::Select))) {
                 return Err(self.err_here("EXISTS takes a subquery: EXISTS (SELECT …)"));
             }
-            let inner = self.select_core()?;
+            let inner = self.subquery_body()?;
             self.expect(&Tok::RParen, "`)` after EXISTS subquery")?;
             return Ok(Expr::Exists(Box::new(inner), false));
         }
@@ -755,9 +760,10 @@ impl<'a> Parser<'a> {
             Some(Tok::QuotedIdent(s)) => Ok(Expr::Col(s)),
             Some(Tok::LParen) => {
                 // `(SELECT …)` is a scalar subquery, not a parenthesized
-                // expression — the SELECT keyword right after `(` decides.
+                // expression — the SELECT keyword right after `(` decides. The
+                // body may be a compound `SELECT … UNION … LIMIT 1` (#56/format 31).
                 if matches!(self.peek(), Some(Tok::Kw(Kw::Select))) {
-                    let inner = self.select_core()?;
+                    let inner = self.subquery_body()?;
                     self.expect(&Tok::RParen, "`)` after subquery")?;
                     return Ok(Expr::Subquery(Box::new(inner)));
                 }

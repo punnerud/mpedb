@@ -289,13 +289,88 @@ impl Lift<'_> {
         })
     }
 
-    /// Plan one subquery: resolve its correlation against the outer scope,
-    /// plan the rewritten inner select, and hand back the reserved slot its
+    /// Plan one subquery, dispatching on its body: a plain `SELECT` (the
+    /// correlation-aware path below) or a whole compound `SELECT … UNION …`
+    /// (#56/format 31, always uncorrelated). Hands back the reserved slot its
     /// result will occupy.
-    fn plan_one(&mut self, inner: &ast::SelectStmt, kind: SubPlanKind) -> Result<u16> {
+    fn plan_one(&mut self, inner: &ast::SubqueryBody, kind: SubPlanKind) -> Result<u16> {
         if self.subplans.len() >= 16 {
             return Err(bind_err("too many subqueries in one statement (max 16)"));
         }
+        match inner {
+            ast::SubqueryBody::Select(sel) => self.plan_one_select(sel, kind),
+            ast::SubqueryBody::Compound(cs) => self.plan_one_compound(cs, kind),
+        }
+    }
+
+    /// Plan one lifted subquery whose body is a whole compound (#56/format 31).
+    /// A compound subquery body is UNCORRELATED: each arm binds only the outer's
+    /// user params, and an outer-column reference inside an arm resolves to
+    /// nothing and errors as an unknown column (a correlated compound subquery is
+    /// not supported yet — a clean refusal, never a wrong answer). So it is
+    /// planned standalone, exactly like a top-level compound, and evaluated ONCE
+    /// per execute.
+    fn plan_one_compound(&mut self, cs: &ast::CompoundStmt, kind: SubPlanKind) -> Result<u16> {
+        let (stmt, _ptypes, ctx, _lists, out, subs) =
+            plan_compound(cs, self.schema, self.n_params, self.catalog, self.mode, self.consts)?;
+        if !ctx.is_empty() {
+            return Err(bind_err(
+                "current_setting() inside a subquery is not supported yet",
+            ));
+        }
+        // `plan_compound` already refuses a subquery inside a compound arm, so a
+        // compound body never carries nested lifts — but assert the invariant the
+        // format-31 subplan relies on rather than trust it silently.
+        if !subs.is_empty() {
+            return Err(Error::Internal("compound subquery body carried nested lifts".into()));
+        }
+        let PlanStmt::Compound(mut cp) = stmt else {
+            return Err(Error::Internal("compound body planned to a non-compound".into()));
+        };
+        // A scalar/IN subquery must output exactly one column; EXISTS ignores it.
+        if kind != SubPlanKind::Exists && out.len() != 1 {
+            return Err(bind_err(match kind {
+                SubPlanKind::List => "an IN subquery must select exactly one column",
+                _ => "a scalar subquery must select exactly one column",
+            }));
+        }
+        // Consumer cap, mirroring the select path: EXISTS needs one surviving row,
+        // a scalar at most two (one value, or two to detect the >1-row error); IN
+        // needs every value. Applied to the COMPOUND-level LIMIT, which the
+        // executor honors after the set ops — a smaller user LIMIT wins via `min`.
+        let cap = match kind {
+            SubPlanKind::Exists => Some(1u64),
+            SubPlanKind::Scalar => Some(2),
+            SubPlanKind::List => None,
+        };
+        if let Some(cap) = cap {
+            cp.limit = Some(cp.limit.map_or(cap, |l| l.min(cap)));
+        }
+        let ty = match kind {
+            SubPlanKind::Exists => Some(ColumnType::Bool),
+            SubPlanKind::Scalar => out.first().copied().flatten(),
+            // The slot holds a LIST at runtime; membership is runtime-typed.
+            SubPlanKind::List => None,
+        };
+        let slot = self.n_params + self.subplans.len() as u16;
+        self.subplans.push(SubPlan {
+            body: SubBody::Compound(cp),
+            outer_args: Vec::new(),
+            kind,
+            subplans: Vec::new(),
+            // Uncorrelated, no nested lifts ⇒ the reserved region begins right
+            // after the user params (mirrors the select path's `inner_n`).
+            sub_base: self.n_params,
+            slot_type: ty,
+        });
+        self.slot_types.push(ty);
+        Ok(slot)
+    }
+
+    /// Plan one subquery whose body is a plain `SELECT`: resolve its correlation
+    /// against the outer scope, plan the rewritten inner select, and hand back
+    /// the reserved slot its result will occupy.
+    fn plan_one_select(&mut self, inner: &ast::SelectStmt, kind: SubPlanKind) -> Result<u16> {
         // #73 §3: a subquery MAY now contain subqueries, and (stage 3) a nested
         // one may correlate to a MIDDLE or the outermost scope, not only its
         // immediate parent. `Correlate` below resolves this subquery's OWN
@@ -410,7 +485,7 @@ impl Lift<'_> {
         // at `inner_n + i` — exactly the "results after user + trailing reserved"
         // shape the top level uses one layer up.
         self.subplans.push(SubPlan {
-            plan,
+            body: SubBody::Select(plan),
             outer_args,
             kind,
             subplans: inner_subs,
@@ -547,6 +622,18 @@ impl<'a> Correlate<'a, '_> {
         out
     }
 
+    /// Descend into a nested subquery BODY. A plain `SELECT` is descended into
+    /// for transit correlations (as above); a compound body (#56/format 31) is
+    /// UNCORRELATED and carries no reference to an enclosing row, so there is
+    /// nothing to capture — it is left verbatim, and the compound is lifted one
+    /// level down by that level's own `plan_one_compound`.
+    fn descend_body(&mut self, inner: &ast::SubqueryBody) -> Result<ast::SubqueryBody> {
+        Ok(match inner {
+            ast::SubqueryBody::Select(sel) => ast::SubqueryBody::Select(self.descend(sel)?),
+            ast::SubqueryBody::Compound(cs) => ast::SubqueryBody::Compound(cs.clone()),
+        })
+    }
+
     fn rewrite(&mut self, e: &ast::Expr) -> Result<ast::Expr> {
         use ast::Expr as E;
         Ok(match e {
@@ -582,8 +669,8 @@ impl<'a> Correlate<'a, '_> {
             // intervening level's own `plan_select` — descent only rewrites the
             // ancestor references it carries, leaving references to the nested or
             // intervening levels for those levels' own `Correlate`.
-            E::Subquery(inner) => E::Subquery(Box::new(self.descend(inner)?)),
-            E::Exists(inner, negated) => E::Exists(Box::new(self.descend(inner)?), *negated),
+            E::Subquery(inner) => E::Subquery(Box::new(self.descend_body(inner)?)),
+            E::Exists(inner, negated) => E::Exists(Box::new(self.descend_body(inner)?), *negated),
             E::Unary(op, a) => E::Unary(*op, Box::new(self.rewrite(a)?)),
             E::IsNull(a, n) => E::IsNull(Box::new(self.rewrite(a)?), *n),
             E::Cast(a, t) => E::Cast(Box::new(self.rewrite(a)?), t.clone()),
@@ -619,7 +706,7 @@ impl<'a> Correlate<'a, '_> {
             // as `Subquery`/`Exists` above.
             E::InSubquery(lhs, inner, negated) => E::InSubquery(
                 Box::new(self.rewrite(lhs)?),
-                Box::new(self.descend(inner)?),
+                Box::new(self.descend_body(inner)?),
                 *negated,
             ),
             E::InParamSlot(a, slot, negated) => {

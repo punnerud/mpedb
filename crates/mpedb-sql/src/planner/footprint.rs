@@ -107,9 +107,17 @@ pub(crate) fn compute_footprint(
 /// Union one subplan's table/index reads — and, recursively, its nested lifts'
 /// reads — into `fp`.
 fn union_subplan_reads(s: &SubPlan, schema: &Schema, fp: &mut Footprint) -> Result<()> {
-    let sf = select_footprint(&s.plan, schema)?;
-    fp.tables_read |= sf.tables_read;
-    fp.indexes_used |= sf.indexes_used;
+    // A compound body reads the union of what its arms read (#56, format 31); a
+    // plain select body reads itself.
+    let arms: &[SelectPlan] = match &s.body {
+        SubBody::Select(sp) => std::slice::from_ref(sp),
+        SubBody::Compound(c) => &c.arms,
+    };
+    for arm in arms {
+        let sf = select_footprint(arm, schema)?;
+        fp.tables_read |= sf.tables_read;
+        fp.indexes_used |= sf.indexes_used;
+    }
     for c in &s.subplans {
         union_subplan_reads(c, schema, fp)?;
     }

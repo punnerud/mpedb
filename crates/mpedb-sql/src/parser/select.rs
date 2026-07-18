@@ -122,6 +122,30 @@ impl<'a> Parser<'a> {
         if self.peek_compound_op().is_none() {
             return Ok(Stmt::Select(first));
         }
+        Ok(Stmt::Compound(self.compound_chain(first)?))
+    }
+
+    /// A subquery BODY used as a value/list/existence — a scalar `(…)`,
+    /// `x IN (…)` or `EXISTS (…)`. A plain `SELECT`, or a whole compound
+    /// `SELECT … UNION/EXCEPT/INTERSECT … [ORDER BY … LIMIT …]` (#56 in a
+    /// subquery position). The caller has already consumed the opening `(` and
+    /// consumes the closing `)` afterward, so a trailing ORDER BY/LIMIT here
+    /// belongs to the compound, exactly as in a top-level compound.
+    pub(super) fn subquery_body(&mut self) -> Result<crate::ast::SubqueryBody> {
+        use crate::ast::SubqueryBody;
+        let first = self.select_core()?;
+        if self.peek_compound_op().is_none() {
+            return Ok(SubqueryBody::Select(first));
+        }
+        Ok(SubqueryBody::Compound(self.compound_chain(first)?))
+    }
+
+    /// Parse the set-operator chain that follows an already-parsed first arm
+    /// (the caller has confirmed a compound op is next). Shared by a top-level
+    /// compound statement and a compound subquery body, so the arm rules — same
+    /// left-associative precedence, ORDER BY/LIMIT only after the last arm — can
+    /// never drift between the two positions.
+    fn compound_chain(&mut self, first: SelectStmt) -> Result<CompoundStmt> {
         let mut arms = vec![first];
         let mut ops = Vec::new();
         while let Some(word) = self.peek_compound_op() {
@@ -159,7 +183,7 @@ impl<'a> Parser<'a> {
         let order_by = std::mem::take(&mut last.order_by);
         let limit = last.limit.take();
         let offset = last.offset.take();
-        Ok(Stmt::Compound(CompoundStmt { arms, ops, order_by, limit, offset }))
+        Ok(CompoundStmt { arms, ops, order_by, limit, offset })
     }
 
     /// Eat the no-op `ALL` quantifier (the explicit opposite of DISTINCT):
@@ -227,6 +251,18 @@ impl<'a> Parser<'a> {
             {
                 self.expect(&Tok::LParen, "(")?;
                 let inner = self.select_core()?;
+                // A COMPOUND body in a derived table (`FROM (SELECT … UNION …)`)
+                // is not supported yet: unlike the lift positions (scalar / IN /
+                // EXISTS, format 31), a derived table is FLATTENED onto its base
+                // table, which a compound cannot be — it needs a materialized
+                // FROM-source of its own (a follow-up). Refuse it by name rather
+                // than emit a confusing "expected `)`" at the set operator.
+                if self.peek_compound_op().is_some() {
+                    return Err(self.err_here(
+                        "a compound (UNION/EXCEPT/INTERSECT) body in a derived table \
+                         `FROM (SELECT … UNION …)` is not supported yet",
+                    ));
+                }
                 self.expect(&Tok::RParen, "`)` to close the derived table")?;
                 // The alias names the derived columns; the flatten enforces
                 // that one is present (accept bare or `AS` form here).

@@ -181,14 +181,19 @@ fn decode_subplan(buf: &[u8], pos: &mut usize, budget: &mut usize) -> Result<Sub
     for _ in 0..n_args {
         outer_args.push(r_u16(buf, pos)?);
     }
-    let plan = decode_select(buf, pos)?;
+    // The body-discriminant byte (format 31): a plain SELECT or a whole compound.
+    let body = match r_u8(buf, pos)? {
+        SUBBODY_SELECT => SubBody::Select(decode_select(buf, pos)?),
+        SUBBODY_COMPOUND => SubBody::Compound(decode_compound(buf, pos)?),
+        t => return Err(corrupt(format!("bad subplan body tag {t}"))),
+    };
     let n_children = r_u8(buf, pos)? as usize;
     let mut subplans = Vec::with_capacity(n_children.min(MAX_SUBPLANS));
     for _ in 0..n_children {
         subplans.push(decode_subplan(buf, pos, budget)?);
     }
     Ok(SubPlan {
-        plan,
+        body,
         outer_args,
         kind,
         subplans,
@@ -427,48 +432,7 @@ fn decode_on_conflict(buf: &[u8], pos: &mut usize) -> Result<PlanOnConflict> {
 fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
     match r_u8(buf, pos)? {
         STMT_SELECT => Ok(PlanStmt::Select(decode_select(buf, pos)?)),
-        STMT_COMPOUND => {
-            let n_arms = r_u8(buf, pos)? as usize;
-            if !(2..=MAX_COMPOUND_ARMS).contains(&n_arms) {
-                return Err(corrupt("compound arm count out of range"));
-            }
-            let mut ops = Vec::with_capacity(n_arms - 1);
-            for _ in 0..n_arms - 1 {
-                let t = r_u8(buf, pos)?;
-                ops.push(
-                    SetOp::from_tag(t)
-                        .ok_or_else(|| corrupt(format!("bad set-operator tag {t}")))?,
-                );
-            }
-            let mut arms = Vec::with_capacity(n_arms);
-            for _ in 0..n_arms {
-                arms.push(decode_select(buf, pos)?);
-            }
-            let n_order = r_u16(buf, pos)? as usize;
-            if n_order > crate::parser::MAX_ORDER_BY_ITEMS {
-                return Err(corrupt("too many order-by items in plan"));
-            }
-            let mut order_by = Vec::with_capacity(n_order.min(1024));
-            for _ in 0..n_order {
-                let c = r_u16(buf, pos)?;
-                let desc = match r_u8(buf, pos)? {
-                    0 => false,
-                    1 => true,
-                    t => return Err(corrupt(format!("bad order direction {t}"))),
-                };
-                let coll = r_collation(buf, pos)?;
-                order_by.push((c, desc, coll));
-            }
-            let limit = decode_opt_u64(buf, pos)?;
-            let offset = decode_opt_u64(buf, pos)?;
-            Ok(PlanStmt::Compound(CompoundPlan {
-                arms,
-                ops,
-                order_by,
-                limit,
-                offset,
-            }))
-        }
+        STMT_COMPOUND => Ok(PlanStmt::Compound(decode_compound(buf, pos)?)),
         STMT_RECURSIVE_CTE => {
             let name = r_str(buf, pos)?;
             let n_cols = r_u16(buf, pos)? as usize;
@@ -507,6 +471,43 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
         }
         other => decode_stmt_rest(other, buf, pos),
     }
+}
+
+/// A compound `SELECT … UNION/EXCEPT/INTERSECT …` body — the exact mirror of
+/// `encode_compound`, shared between a top-level compound statement and a
+/// compound subquery body (format 31).
+fn decode_compound(buf: &[u8], pos: &mut usize) -> Result<CompoundPlan> {
+    let n_arms = r_u8(buf, pos)? as usize;
+    if !(2..=MAX_COMPOUND_ARMS).contains(&n_arms) {
+        return Err(corrupt("compound arm count out of range"));
+    }
+    let mut ops = Vec::with_capacity(n_arms - 1);
+    for _ in 0..n_arms - 1 {
+        let t = r_u8(buf, pos)?;
+        ops.push(SetOp::from_tag(t).ok_or_else(|| corrupt(format!("bad set-operator tag {t}")))?);
+    }
+    let mut arms = Vec::with_capacity(n_arms);
+    for _ in 0..n_arms {
+        arms.push(decode_select(buf, pos)?);
+    }
+    let n_order = r_u16(buf, pos)? as usize;
+    if n_order > crate::parser::MAX_ORDER_BY_ITEMS {
+        return Err(corrupt("too many order-by items in plan"));
+    }
+    let mut order_by = Vec::with_capacity(n_order.min(1024));
+    for _ in 0..n_order {
+        let c = r_u16(buf, pos)?;
+        let desc = match r_u8(buf, pos)? {
+            0 => false,
+            1 => true,
+            t => return Err(corrupt(format!("bad order direction {t}"))),
+        };
+        let coll = r_collation(buf, pos)?;
+        order_by.push((c, desc, coll));
+    }
+    let limit = decode_opt_u64(buf, pos)?;
+    let offset = decode_opt_u64(buf, pos)?;
+    Ok(CompoundPlan { arms, ops, order_by, limit, offset })
 }
 
 /// A u32-length-prefixed UTF-8 string (the mirror of `w_str`), bounded at 1 MiB
