@@ -366,6 +366,9 @@ pub(crate) fn plan_statement(
         ast::Stmt::Begin => txn(PlanStmt::Begin),
         ast::Stmt::Commit => txn(PlanStmt::Commit),
         ast::Stmt::Rollback => txn(PlanStmt::Rollback),
+        ast::Stmt::Savepoint(n) => txn(PlanStmt::Savepoint(n.clone())),
+        ast::Stmt::Release(n) => txn(PlanStmt::Release(n.clone())),
+        ast::Stmt::RollbackTo(n) => txn(PlanStmt::RollbackTo(n.clone())),
         ast::Stmt::Select(s) => plan_select(s, schema, n_params, catalog, &mut consts)?,
         ast::Stmt::Compound(c) => plan_compound(c, schema, n_params, catalog, &mut consts)?,
         ast::Stmt::Insert(s) => plan_insert(s, schema, n_params, catalog, &mut consts)?,
@@ -445,7 +448,12 @@ pub(crate) fn plan_statement(
         PlanStmt::Insert { table, .. }
         | PlanStmt::Update { table, .. }
         | PlanStmt::Delete { table, .. } => stamped.push(*table),
-        PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => {}
+        PlanStmt::Begin
+        | PlanStmt::Commit
+        | PlanStmt::Rollback
+        | PlanStmt::Savepoint(_)
+        | PlanStmt::Release(_)
+        | PlanStmt::RollbackTo(_) => {}
     }
     // One stamp per table is enough however many places read it.
     stamped.sort_unstable();

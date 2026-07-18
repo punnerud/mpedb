@@ -54,7 +54,12 @@ impl RiskEstimate {
                 from_select.as_ref().is_some_and(|s| sel(&s.plan)) || subs_correlated(&plan.subplans)
             }
             PlanStmt::Update { .. } | PlanStmt::Delete { .. } => subs_correlated(&plan.subplans),
-            PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => false,
+            PlanStmt::Begin
+            | PlanStmt::Commit
+            | PlanStmt::Rollback
+            | PlanStmt::Savepoint(_)
+            | PlanStmt::Release(_)
+            | PlanStmt::RollbackTo(_) => false,
         }
     }
 }
@@ -231,9 +236,12 @@ pub fn estimate_plan_risk(
             }
             acc
         }
-        PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => {
-            Acc::new(0, "no-op statement".to_string())
-        }
+        PlanStmt::Begin
+        | PlanStmt::Commit
+        | PlanStmt::Rollback
+        | PlanStmt::Savepoint(_)
+        | PlanStmt::Release(_)
+        | PlanStmt::RollbackTo(_) => Acc::new(0, "no-op statement".to_string()),
     };
     acc.into_estimate()
 }

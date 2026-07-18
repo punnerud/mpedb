@@ -475,6 +475,9 @@ impl CompiledPlan {
             PlanStmt::Begin => out.push_str("Begin\n"),
             PlanStmt::Commit => out.push_str("Commit\n"),
             PlanStmt::Rollback => out.push_str("Rollback\n"),
+            PlanStmt::Savepoint(name) => out.push_str(&format!("Savepoint {name}\n")),
+            PlanStmt::Release(name) => out.push_str(&format!("Release {name}\n")),
+            PlanStmt::RollbackTo(name) => out.push_str(&format!("RollbackTo {name}\n")),
         }
     }
 

@@ -204,7 +204,12 @@ fn prepare_intent(db: &Database, intent: PendingIntent) -> PreparedIntent {
         if plan.footprint.read_only
             || matches!(
                 plan.stmt,
-                PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback
+                PlanStmt::Begin
+                    | PlanStmt::Commit
+                    | PlanStmt::Rollback
+                    | PlanStmt::Savepoint(_)
+                    | PlanStmt::Release(_)
+                    | PlanStmt::RollbackTo(_)
             )
         {
             return Err(Error::Unsupported(

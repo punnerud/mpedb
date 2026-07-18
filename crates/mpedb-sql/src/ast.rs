@@ -16,6 +16,16 @@ pub(crate) enum Stmt {
     Begin,
     Commit,
     Rollback,
+    /// `SAVEPOINT <name>` — open a named savepoint on the current session's
+    /// stack (transaction-control, handled by the write session, not compiled
+    /// to an access path).
+    Savepoint(String),
+    /// `RELEASE [SAVEPOINT] <name>` — merge `<name>` and everything above it
+    /// into the enclosing savepoint/transaction.
+    Release(String),
+    /// `ROLLBACK [TRANSACTION] TO [SAVEPOINT] <name>` — undo changes since
+    /// `<name>` was established, keeping `<name>` on the stack.
+    RollbackTo(String),
 }
 
 #[derive(Debug, Clone, PartialEq)]

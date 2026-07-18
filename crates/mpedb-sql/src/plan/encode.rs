@@ -499,5 +499,17 @@ fn encode_stmt_rest(stmt: &PlanStmt, buf: &mut Vec<u8>) {
         PlanStmt::Begin => buf.push(STMT_BEGIN),
         PlanStmt::Commit => buf.push(STMT_COMMIT),
         PlanStmt::Rollback => buf.push(STMT_ROLLBACK),
+        PlanStmt::Savepoint(name) => encode_named_stmt(STMT_SAVEPOINT, name, buf),
+        PlanStmt::Release(name) => encode_named_stmt(STMT_RELEASE, name, buf),
+        PlanStmt::RollbackTo(name) => encode_named_stmt(STMT_ROLLBACK_TO, name, buf),
     }
+}
+
+/// A savepoint-control statement: tag byte then a u16-length-prefixed UTF-8
+/// name. The name is a SQL identifier, so it fits a u16 length by construction
+/// (the parser caps identifier length far below 65535).
+fn encode_named_stmt(tag: u8, name: &str, buf: &mut Vec<u8>) {
+    buf.push(tag);
+    w_u16(buf, name.len() as u16);
+    buf.extend_from_slice(name.as_bytes());
 }

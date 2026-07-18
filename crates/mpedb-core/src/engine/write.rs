@@ -1443,6 +1443,81 @@ impl<'e> WriteTxn<'e> {
             self.reusable.push(id);
         }
     }
+
+    /// A **full** savepoint for the SQL `SAVEPOINT` surface. It captures the
+    /// accounting snapshot ([`savepoint`](Self::savepoint)) AND the CONTENTS of
+    /// every page dirty at this instant, plus the few working-set scalars
+    /// `rollback_to` does not restore.
+    ///
+    /// The plain [`savepoint`](Self::savepoint)/[`rollback_to`](Self::rollback_to)
+    /// pair only reverts changes to pages that were COMMITTED at savepoint time
+    /// (the COW allocates a fresh page, which the root-pointer restore drops).
+    /// It does NOT revert an in-place mutation of a page that was ALREADY dirty
+    /// (txn-local) at savepoint time — the page id never changes, so restoring
+    /// root pointers leaves the mutated bytes in place. That is fine for the
+    /// mirror, which only rolls back a FAILED op (a constraint violation fails
+    /// before mutating, so there is nothing in-place to undo), but a SQL
+    /// `ROLLBACK TO` must undo SUCCESSFUL statements, whose in-place mutations
+    /// this method captures and [`rollback_to_full`](Self::rollback_to_full)
+    /// restores. Heavier (it copies dirty-page bytes), so it is deliberately not
+    /// on the mirror's per-row path.
+    pub fn savepoint_full(&self) -> Result<TxnSavepointFull> {
+        let base = self.savepoint();
+        let mut page_images = Vec::with_capacity(self.dirty.len());
+        for &id in &self.dirty {
+            page_images.push((id, self.eng.shm.page(id)?.to_vec()));
+        }
+        Ok(TxnSavepointFull {
+            base,
+            page_images,
+            schema_gen_bump: self.schema_gen_bump,
+            written_tables: self.written_tables,
+            commit_point: self.commit_point,
+            extent_map_root: self.extent_map_root,
+            ext_edits: self.pending_map_edits.len(),
+            ext_freed_runs: self.freed_runs.len(),
+            ext_taken_runs: self.taken_runs.len(),
+            ext_dirty: self.extent_dirty.len(),
+        })
+    }
+
+    /// Roll back to a [`savepoint_full`](Self::savepoint_full): restore the
+    /// accounting via [`rollback_to`](Self::rollback_to), then the captured
+    /// dirty-page contents and working-set scalars.
+    ///
+    /// Refuses (a clean [`Error::Unsupported`]) when a large-value **extent**
+    /// write (the out-of-tree blob allocator, `vkind=2`) happened since the
+    /// savepoint: that allocator's state is not snapshotted here, and undoing it
+    /// silently would corrupt the extent map / leak pages. Inline values never
+    /// touch extents, and btree overflow chains ARE ordinary dirty pages (so
+    /// they are covered by the page-image restore) — only genuinely large blob
+    /// columns can trip this, and they trip it cleanly rather than wrongly.
+    pub fn rollback_to_full(&mut self, sp: TxnSavepointFull) -> Result<()> {
+        if self.extent_map_root != sp.extent_map_root
+            || self.pending_map_edits.len() != sp.ext_edits
+            || self.freed_runs.len() != sp.ext_freed_runs
+            || self.taken_runs.len() != sp.ext_taken_runs
+            || self.extent_dirty.len() != sp.ext_dirty
+        {
+            return Err(Error::Unsupported(
+                "ROLLBACK TO across a large blob/overflow-extent write is not supported".into(),
+            ));
+        }
+        self.rollback_to(sp.base);
+        self.schema_gen_bump = sp.schema_gen_bump;
+        self.written_tables = sp.written_tables;
+        self.commit_point = sp.commit_point;
+        // Restore the bytes of pages that were dirty at the savepoint: these are
+        // exactly the pages `rollback_to` leaves in the dirty set, and an
+        // in-place mutation after the savepoint changed their contents.
+        for (id, bytes) in &sp.page_images {
+            self.eng
+                .shm
+                .page_mut_unchecked(*id)?
+                .copy_from_slice(bytes);
+        }
+        Ok(())
+    }
 }
 
 /// Equality as the index sees it: encoded-key comparison, so all NaNs are
@@ -1461,6 +1536,12 @@ fn index_value_equal(a: &Value, b: &Value) -> bool {
 }
 
 /// Opaque statement-savepoint state (see [`WriteTxn::savepoint`]).
+///
+/// `Clone` so a caller keeping a stack of savepoints (the SQL `SAVEPOINT`
+/// surface) can roll back to the same point more than once: `rollback_to`
+/// consumes the snapshot, so it is handed a clone while the original stays on
+/// the stack.
+#[derive(Clone)]
 pub struct TxnSavepoint {
     catalog_root: u64,
     freelist_root: u64,
@@ -1471,6 +1552,30 @@ pub struct TxnSavepoint {
     taken: Vec<TakenEntry>,
     refill_cursor: Option<[u8; 11]>,
     high_water: u64,
+}
+
+/// A full statement-savepoint for the SQL `SAVEPOINT` surface (see
+/// [`WriteTxn::savepoint_full`]): the accounting snapshot plus dirty-page
+/// contents and the working-set scalars `rollback_to` does not restore.
+///
+/// `Clone` so a caller keeping a savepoint STACK can `ROLLBACK TO` the same
+/// point more than once (`rollback_to_full` consumes the value; the caller
+/// clones and keeps the original).
+#[derive(Clone)]
+pub struct TxnSavepointFull {
+    base: TxnSavepoint,
+    /// `(page id, 4 KiB contents)` for every page dirty at savepoint time.
+    page_images: Vec<(u64, Vec<u8>)>,
+    schema_gen_bump: bool,
+    written_tables: u64,
+    commit_point: Option<(u32, u64)>,
+    extent_map_root: u64,
+    // Append-only extent-activity counters — a change means a large-value
+    // extent write happened in the scope, which `rollback_to_full` refuses.
+    ext_edits: usize,
+    ext_freed_runs: usize,
+    ext_taken_runs: usize,
+    ext_dirty: usize,
 }
 
 fn table_column_name(eng: &Engine, table_id: u32, col: u16) -> String {
