@@ -199,6 +199,11 @@ pub(crate) enum Expr {
     /// matcher. Carries `negated` (`NOT GLOB`), unlike [`Expr::Like`]: the
     /// bool is the whole difference from that node's shape.
     Glob(Box<Expr>, Box<Expr>, bool),
+    /// `lhs [NOT] REGEXP pattern` — sqlite's `ext/misc/regexp.c` matcher (POSIX
+    /// -ish: `.`, `* + ?`, `{p,q}`, `[...]`, `^`/`$`, `|`, `(...)`, `\d`/`\b`,
+    /// escapes), case-SENSITIVE, unanchored. Same shape as [`Expr::Glob`]:
+    /// `negated` carries `NOT REGEXP`.
+    Regexp(Box<Expr>, Box<Expr>, bool),
     /// `CAST(x AS <type>)`.
     Cast(Box<Expr>, mpedb_types::ColumnType),
     /// `(SELECT …)` — a scalar subquery: one output column; 0 rows = NULL,

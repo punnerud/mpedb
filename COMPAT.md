@@ -98,7 +98,8 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | `\|\|` concatenation | ✅ | NULL propagates; ints/bools render as text; floats refused until their formatting is pinned |
 | LIKE | ✅ | no ESCAPE clause |
 | GLOB / NOT GLOB | ✅ | sqlite semantics: case-SENSITIVE, `*` (any run) and `?` (one char) wildcards, `[...]` character classes (incl. `[^...]` and ranges); pattern must be a literal, as with LIKE |
-| REGEXP / MATCH | ❌ | |
+| REGEXP / NOT REGEXP | ✅ | sqlite's bundled `ext/misc/regexp.c` dialect: case-SENSITIVE, unanchored substring match with `.` (any char, incl. newline), `*` `+` `?`, counts `{p}`/`{p,}`/`{p,q}`, classes `[...]`/`[^...]` with ranges, anchors `^`/`$`, `\|` alternation, `(...)` grouping, the Perl escapes `\d \D \w \W \s \S`, word-boundary `\b`, the C escapes `\a \f \n \r \t \v`, `\uXXXX`/`\xXX` and `\`-before-a-metacharacter; pattern must be a literal, as with LIKE/GLOB. Hand-rolled Thompson NFA (no backtracking, no regex crate). Deviation: a MALFORMED pattern (one sqlite rejects with a runtime error — unmatched `(`/`{`, unterminated `[`, unknown escape, `{m,n}` with n<m or both zero, a quantifier with no operand) matches NOTHING here (`REGEXP` → FALSE, `NOT REGEXP` → TRUE) rather than raising — mpedb never errors on a REGEXP pattern |
+| MATCH | ❌ | sqlite-equivalent: the CLI's `MATCH` needs an FTS virtual table, which the bare `sqlite3` shell also lacks, so there is no built-in `MATCH` to be compatible with |
 | BETWEEN / NOT BETWEEN | ✅ | |
 | IN / NOT IN (value list) | ✅ | also `x IN (SELECT …)` and the sqlite shorthand `x IN <table>` (single-column). The empty set `x IN ()` is accepted (sqlite allows it) and is FALSE for every probe, `NOT IN ()` TRUE; `NULL IN (empty)` is FALSE (3VL), matching sqlite |
 | IS NULL / IS NOT NULL | ✅ | |

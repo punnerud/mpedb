@@ -38,6 +38,7 @@ const OP_CONCAT: u8 = 31;
 const OP_IS_NOT_DISTINCT: u8 = 32;
 const OP_IS_DISTINCT: u8 = 33;
 const OP_GLOB: u8 = 34;
+const OP_REGEXP: u8 = 35;
 
 impl ExprProgram {
     /// Deterministic serialization (part of plan blobs and plan hashing).
@@ -67,6 +68,10 @@ impl ExprProgram {
                 }
                 Instr::Glob(x) => {
                     buf.push(OP_GLOB);
+                    buf.extend_from_slice(&x.to_le_bytes());
+                }
+                Instr::Regexp(x) => {
+                    buf.push(OP_REGEXP);
                     buf.extend_from_slice(&x.to_le_bytes());
                 }
                 Instr::InList(x) => {
@@ -160,6 +165,7 @@ impl ExprProgram {
                 OP_PUSH_CONST => Instr::PushConst(read_u16_arg()?),
                 OP_LIKE => Instr::Like(read_u16_arg()?),
                 OP_GLOB => Instr::Glob(read_u16_arg()?),
+                OP_REGEXP => Instr::Regexp(read_u16_arg()?),
                 OP_IN_PARAM => Instr::InParam(read_u16_arg()?),
                 OP_IN_LIST => Instr::InList(read_u16_arg()?),
                 OP_JUMP_IF_NOT_TRUE => Instr::JumpIfNotTrue(read_u16_arg()?),
@@ -303,7 +309,7 @@ pub(super) fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                         }
                         (0, 1)
                     }
-                    Instr::Like(c) | Instr::Glob(c) => {
+                    Instr::Like(c) | Instr::Glob(c) | Instr::Regexp(c) => {
                         if c as usize >= consts.len() {
                             return Err(Error::Corrupt("const index out of range".into()));
                         }

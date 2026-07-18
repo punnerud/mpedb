@@ -259,6 +259,11 @@ impl<'a> Parser<'a> {
             && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Kw(Kw::Glob)))
     }
 
+    fn peek_not_regexp(&self) -> bool {
+        matches!(self.toks.get(self.pos).map(|t| &t.tok), Some(Tok::Kw(Kw::Not)))
+            && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Kw(Kw::Regexp)))
+    }
+
     fn peek_kw(&self, kw: Kw) -> bool {
         self.peek() == Some(&Tok::Kw(kw))
     }
