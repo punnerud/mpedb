@@ -37,6 +37,13 @@ fn sample_sqls() -> Vec<&'static str> {
         "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders)",
         "SELECT id FROM users WHERE id NOT IN (SELECT user_id FROM orders) AND active",
         "SELECT id FROM users WHERE id = (SELECT 4)",
+        // Nested subqueries (#73 §3 stage 1, format 20): a subplan carries its
+        // OWN uncorrelated lifts — IN-inside-IN, EXISTS-inside-EXISTS, and a
+        // scalar whose body holds another scalar — must all survive the recursive
+        // encode/decode/validate.
+        "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders WHERE item_no IN (SELECT age FROM users))",
+        "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE EXISTS (SELECT 1 FROM events))",
+        "SELECT id FROM users WHERE age = (SELECT max(age) FROM users WHERE age < (SELECT max(item_no) FROM orders))",
         "BEGIN",
         "COMMIT",
         "ROLLBACK",
@@ -85,6 +92,56 @@ fn decode_rejects_truncation_everywhere() {
             CompiledPlan::decode(&bytes[..cut], &s).is_err(),
             "truncation at {cut} must fail"
         );
+    }
+}
+
+/// The recursive SubPlan bytes (#73 §3, format 20) get their own truncation
+/// sweep: a nested-subplan plan carries `sub_base`/`slot_type`/child-count bytes
+/// and a whole inner SubPlan record, and every cut through them must fail closed
+/// rather than decode a half-read tree.
+#[test]
+fn decode_rejects_truncation_in_nested_subplan() {
+    let s = test_schema();
+    let p = prepare(
+        "SELECT id FROM users WHERE age = \
+         (SELECT max(age) FROM users WHERE age < (SELECT max(item_no) FROM orders))",
+        &s,
+    )
+    .unwrap();
+    // Sanity: this really is a nested tree (a subplan with a child subplan).
+    assert_eq!(p.subplans.len(), 1);
+    assert_eq!(p.subplans[0].subplans.len(), 1);
+    let bytes = p.encode();
+    for cut in 0..bytes.len() {
+        assert!(
+            CompiledPlan::decode(&bytes[..cut], &s).is_err(),
+            "truncation at {cut} must fail"
+        );
+    }
+    // The full blob round-trips (and re-validates the whole tree).
+    assert_eq!(CompiledPlan::decode(&bytes, &s).unwrap(), p);
+}
+
+/// A forged blob claiming a CORRELATED nested subplan must be rejected: stage 1
+/// fills nested lifts ONCE (uncorrelated), so a per-row correlation there would
+/// be silently misexecuted. `validate` refuses it.
+#[test]
+fn decode_rejects_correlated_nested_subplan() {
+    let s = test_schema();
+    let p = prepare(
+        "SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders WHERE EXISTS (SELECT 1 FROM events))",
+        &s,
+    )
+    .unwrap();
+    let mut evil = p.clone();
+    // Forge the inner (grandchild) lift into looking correlated.
+    evil.subplans[0].subplans[0].outer_args = vec![0];
+    match CompiledPlan::decode(&evil.encode(), &s) {
+        Err(Error::Corrupt(m)) => assert!(
+            m.contains("nested correlated") || m.contains("sub_base"),
+            "{m}"
+        ),
+        other => panic!("expected Corrupt, got {other:?}"),
     }
 }
 

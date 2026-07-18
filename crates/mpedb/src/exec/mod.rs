@@ -428,7 +428,10 @@ fn exec_stmt_impl(
             if !sub.outer_args.is_empty() {
                 continue;
             }
-            let inner = exec_select(ctx, schema, plan, &buf[..n_user], &sub.plan)?;
+            // `run_subplan` fills this subplan's OWN uncorrelated nested lifts
+            // (#73 §3) before running it — the recursion the flat two levels
+            // became.
+            let inner = run_subplan(ctx, schema, plan, &buf[..n_user], sub)?;
             buf[base + i] = subplan_value(inner, sub.kind)?;
         }
         filled = buf;
@@ -487,6 +490,38 @@ fn subplan_value(r: ExecResult, kind: mpedb_sql::SubPlanKind) -> Result<Value> {
             "a scalar subquery returned more than one row — it must return at most one".into(),
         )),
     }
+}
+
+/// Run one subplan, first filling its OWN nested lifts (#73 §3 stage 1).
+///
+/// `base_params` is `[user ‖ this subplan's correlation args]` — of length
+/// `sub.sub_base` — so a plain leaf subplan (no nested lifts) runs exactly as
+/// before. When `sub` HAS nested lifts, they are UNCORRELATED (planner + validate
+/// guarantee it), so each depends only on `base_params` and is evaluated ONCE
+/// here, bottom-up, into `[.. ‖ children results]` at `sub_base + i`, before
+/// `sub.plan`'s own access resolution and gather. This generalizes the flat
+/// two-level fill (`exec_stmt_impl` once + per-row) into a recursion that bottoms
+/// out at today's leaf case.
+fn run_subplan(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    base_params: &[Value],
+    sub: &SubPlan,
+) -> Result<ExecResult> {
+    if sub.subplans.is_empty() {
+        return exec_select(ctx, schema, plan, base_params, &sub.plan);
+    }
+    let base = sub.sub_base as usize;
+    let mut buf = base_params.to_vec();
+    buf.resize(base + sub.subplans.len(), Value::Null);
+    for (i, child) in sub.subplans.iter().enumerate() {
+        // Uncorrelated: the child sees the same `[user ‖ correlation]` prefix and
+        // fills its own nested lifts recursively; the bottom is a leaf.
+        let r = run_subplan(ctx, schema, plan, base_params, child)?;
+        buf[base + i] = subplan_value(r, child.kind)?;
+    }
+    exec_select(ctx, schema, plan, &buf, &sub.plan)
 }
 
 /// The top-level SELECT: the only place CORRELATED subplans are evaluated —
@@ -993,7 +1028,10 @@ fn correlated_survivors(
                 let mut inner_params = Vec::with_capacity(n_user + key_vals.len());
                 inner_params.extend_from_slice(&params[..n_user]);
                 inner_params.extend(key_vals);
-                let r = exec_select(ctx, schema, plan, &inner_params, &sub.plan)?;
+                // `inner_params` = `[user ‖ this subplan's correlation args]`,
+                // width == `sub.sub_base`; `run_subplan` extends it with the
+                // subplan's own (uncorrelated) nested lifts before running it.
+                let r = run_subplan(ctx, schema, plan, &inner_params, sub)?;
                 let v = subplan_value(r, sub.kind)?;
                 if use_memo {
                     memo[ci].insert(memo_key, v.clone());
