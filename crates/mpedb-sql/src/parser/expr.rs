@@ -156,6 +156,17 @@ impl<'a> Parser<'a> {
                 seen_cmp = true;
                 continue;
             }
+            // `x REGEXP pat` / `x NOT REGEXP pat` — same shape as GLOB: the `NOT`
+            // is part of the operator, so it needs the two-token lookahead that
+            // `not_expr` already passed on.
+            if !seen_cmp && (self.peek_kw(Kw::Regexp) || self.peek_not_regexp()) {
+                let negated = self.eat_kw(Kw::Not);
+                self.expect_kw(Kw::Regexp, "REGEXP")?;
+                let pat = self.add_expr()?;
+                e = Expr::Regexp(Box::new(e), Box::new(pat), negated);
+                seen_cmp = true;
+                continue;
+            }
             if !seen_cmp && (self.peek_kw(Kw::Between) || self.peek_not_between()) {
                 e = self.between_suffix(e)?;
                 seen_cmp = true;

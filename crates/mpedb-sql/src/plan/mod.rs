@@ -112,7 +112,11 @@ const MAX_JOINS: usize = 16;
 //     corrupt rather than misreading it — same additive gating as the scalar-fn
 //     bumps 14-16 and 21. `log`/`log10` and `mod`/`pi` add no new opcode: they
 //     are ordinary `Instr::Call`s, so only the whole-plan version gates them.
-const PLAN_FORMAT: u8 = 22;
+// 23: `REGEXP` / `NOT REGEXP` — the additive `Instr::Regexp` opcode (tag 35).
+//     A format-22 reader hits the unknown opcode in `ExprProgram::decode` and
+//     reports the plan as corrupt rather than misreading it — same additive
+//     gating as the `Glob` opcode at format 19.
+const PLAN_FORMAT: u8 = 23;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

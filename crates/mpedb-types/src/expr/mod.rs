@@ -24,7 +24,7 @@ mod tests;
 
 pub use scalar::ScalarFn;
 
-use ops::{glob_match, in_items_3vl, in_list_3vl, like_match};
+use ops::{glob_match, in_items_3vl, in_list_3vl, like_match, regexp_match};
 use scalar::call_scalar;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +80,13 @@ pub enum Instr {
     /// char) and `[...]` character classes rather than `%`/`_`. Same operand
     /// typing and NULL rules: any NULL operand yields NULL.
     Glob(u16),
+    /// SQL REGEXP with pattern from the const pool. Like [`Instr::Glob`] but the
+    /// pattern is sqlite's bundled `ext/misc/regexp.c` dialect (`.`, `* + ?`,
+    /// `{p,q}`, `[...]`, `^`/`$`, `|`, `(...)`, `\d`/`\w`/`\s`/`\b`, escapes) —
+    /// case-SENSITIVE, unanchored substring match. `NOT REGEXP` is a `Not`
+    /// wrapped around this by the binder. Same operand typing and NULL rules:
+    /// any NULL operand yields NULL. See [`regexp_match`].
+    Regexp(u16),
     /// `<scalar> IN (<list param n>)` — set membership against a
     /// [`Value::List`] bound to parameter `n` (DESIGN-MULTIDB.md §2.6).
     ///
@@ -324,6 +331,19 @@ impl ExprProgram {
                         _ => {
                             return Err(Error::TypeMismatch(
                                 "GLOB requires text operands".into(),
+                            ))
+                        }
+                    });
+                }
+                Instr::Regexp(pi) => {
+                    let a = stack.pop().expect("validated");
+                    let pattern = &self.consts[pi as usize];
+                    stack.push(match (&a, pattern) {
+                        (Value::Null, _) | (_, Value::Null) => Value::Null,
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(regexp_match(p, s)),
+                        _ => {
+                            return Err(Error::TypeMismatch(
+                                "REGEXP requires text operands".into(),
                             ))
                         }
                     });

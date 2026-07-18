@@ -453,7 +453,7 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
             rename_qualifier(a, from, to);
             rename_qualifier(b, from, to);
         }
-        Expr::IsDistinct(a, b, _) | Expr::Glob(a, b, _) => {
+        Expr::IsDistinct(a, b, _) | Expr::Glob(a, b, _) | Expr::Regexp(a, b, _) => {
             rename_qualifier(a, from, to);
             rename_qualifier(b, from, to);
         }
@@ -512,7 +512,7 @@ fn flatten_expr(
             flatten_expr(a, views, ctes, depth)?;
             flatten_expr(b, views, ctes, depth)
         }
-        Expr::IsDistinct(a, b, _) | Expr::Glob(a, b, _) => {
+        Expr::IsDistinct(a, b, _) | Expr::Glob(a, b, _) | Expr::Regexp(a, b, _) => {
             flatten_expr(a, views, ctes, depth)?;
             flatten_expr(b, views, ctes, depth)
         }
@@ -590,7 +590,7 @@ fn collect_expr_sources(e: &Expr, out: &mut Vec<String>) {
             collect_expr_sources(a, out);
             collect_expr_sources(b, out);
         }
-        Expr::IsDistinct(a, b, _) | Expr::Glob(a, b, _) => {
+        Expr::IsDistinct(a, b, _) | Expr::Glob(a, b, _) | Expr::Regexp(a, b, _) => {
             collect_expr_sources(a, out);
             collect_expr_sources(b, out);
         }
