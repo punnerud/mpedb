@@ -111,3 +111,42 @@ fn memo_speedup_on_repeated_correlation_keys() {
     );
     let _ = std::fs::remove_file(&path);
 }
+
+/// Timing for the EXISTS consumer-cap (LIMIT 1): DISTINCT outer keys (so the
+/// memoization never reuses) each matching MANY inner rows. Capping the inner
+/// at one row stops the scan at the first match instead of gathering every
+/// match. Prints an absolute time; compare against a build with the cap
+/// disabled for the A/B. Ignored by default. See P73 for the full session.
+#[test]
+#[ignore]
+fn exists_cap_absolute_time() {
+    use std::time::Instant;
+    let (db, path) = open();
+    db.query("CREATE TABLE a (id INTEGER PRIMARY KEY, g INT)", &[]).unwrap();
+    db.query("CREATE TABLE b (bid INTEGER PRIMARY KEY, g INT)", &[]).unwrap();
+    // 100 DISTINCT outer keys (g = 0..99) — no memo reuse.
+    for id in 0..100 {
+        db.query(&format!("INSERT INTO a (id, g) VALUES ({id}, {id})"), &[]).unwrap();
+    }
+    // 30000 inner rows, g = bid % 100 → each outer key matches 300 inner rows,
+    // interleaved so the first match is found early but gathering all is costly.
+    for bid in 0..30000 {
+        db.query(&format!("INSERT INTO b (bid, g) VALUES ({bid}, {})", bid % 100), &[]).unwrap();
+    }
+    let sql = "SELECT count(*) FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.g = a.g)";
+    // count(*) over the outer would hit the aggregate+correlated refusal, so
+    // materialize the ids instead.
+    let sql = if db.query(sql, &[]).is_err() {
+        "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.g = a.g)"
+    } else {
+        sql
+    };
+    let mut best = f64::MAX;
+    for _ in 0..3 {
+        let t = Instant::now();
+        db.query(sql, &[]).unwrap();
+        best = best.min(t.elapsed().as_secs_f64() * 1e3);
+    }
+    println!("EXISTS cap, 100 distinct outer × 300 inner matches each: {best:.2} ms");
+    let _ = std::fs::remove_file(&path);
+}
