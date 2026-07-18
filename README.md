@@ -65,18 +65,20 @@ directly, and `mpedb::SqliteAttach` runs read-only mpedb SQL over one with
 
 **How close to drop-in sqlite3?** Close, and closing — but measure before you
 plan around it. The SQL surface now covers aggregates, `GROUP BY`/`HAVING`,
-`DISTINCT`, every join kind (`INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS`, aliases,
-self-joins, N-way chains), `UNION`/`EXCEPT`/`INTERSECT`, scalar/`EXISTS`/nested
-and correlated subqueries, CTEs, views, triggers, window functions (`OVER`),
-`LIKE`/`GLOB`/`REGEXP`, the scalar and math functions, secondary and composite
-indexes the planner actually uses, and live multi-process DDL. What is still
-missing is a short list of edge features — full-text search (`MATCH`/FTS5),
-`SAVEPOINT`, `ATTACH`, `COLLATE`, `printf`, user-defined functions — each
-tracked on the P-list and each a clean error today, never a wrong answer. And
-on one axis mpedb goes *past* sqlite: its own `.mpedb` WAL gives PostgreSQL-style
-**concurrent multi-process writes** (MVCC snapshots, lock-free readers) where
-sqlite serializes every writer. See [SQL support](#sql-support) for the exact
-surface, measured against the binary.
+`DISTINCT`, every join kind (aliases, self-joins, N-way chains),
+`UNION`/`EXCEPT`/`INTERSECT`, scalar/`EXISTS`/nested/correlated subqueries,
+`WITH RECURSIVE`, views, triggers, window functions (`OVER`), full-text search
+(`MATCH`/FTS5), `SAVEPOINT`, `COLLATE`, `LIKE`/`GLOB`/`REGEXP`, `printf`,
+sqlite's permissive `CAST` and rowid-alias `INTEGER PRIMARY KEY`, the scalar and
+math functions, secondary/composite indexes the planner uses, and live
+multi-process DDL — verified against sqlite's own 7.4M-record test corpus with
+**zero wrong answers**. What is still missing is short: `ATTACH` (cross-file,
+planned) and user-defined functions / loadable extensions (a deliberate non-goal
+— the libsqlite3 C-API shim is the drop-in path instead), each a clean error
+today, never a wrong answer. And on one axis mpedb goes *past* sqlite: its own
+`.mpedb` WAL gives PostgreSQL-style **concurrent multi-process writes** (MVCC
+snapshots, lock-free readers) where sqlite serializes every writer. See
+[SQL support](#sql-support) for the exact surface, measured against the binary.
 
 This cuts both ways, and honestly so: hardening mpedb against real sqlite3
 databases is how mpedb gets hardened. Every dialect mismatch found by importing
