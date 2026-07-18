@@ -168,24 +168,31 @@ pub(crate) enum JoinKind {
     Full,
 }
 
-/// `[INNER | LEFT [OUTER]] JOIN <table> (ON <cond> | USING (c1, …))`.
+/// `[NATURAL] [INNER | LEFT [OUTER]] JOIN <table> (ON <cond> | USING (c1, …))`.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct JoinClause {
     pub table: String,
     pub alias: Option<String>,
     pub kind: JoinKind,
-    /// The ON condition. For a `USING` join this is the literal `true` at parse
-    /// time and `using` carries the columns — the planner desugars it to
+    /// The ON condition. For a `USING`/`NATURAL` join this is the literal `true`
+    /// at parse time and `using` carries the columns — the planner desugars it to
     /// `left.ci = right.ci AND …` there, because qualifying the LEFT side needs
     /// the schema (the column may live in any table left of this one). An empty
     /// `using` is a plain `ON` join.
     pub on: Expr,
     /// `JOIN … USING (c1, c2, …)` columns, in written order. Non-empty only for
-    /// the USING form. Two things follow from it, both at plan time: the ON
+    /// the USING form (or a NATURAL join whose common set is non-empty, filled at
+    /// plan time). Two things follow from it, both at plan time: the ON
     /// equalities above, and — under `SELECT *` — the join columns are COALESCED
     /// (each appears once, from the left side) instead of once per side.
-    /// NATURAL JOIN (implicit USING over all common columns) stays refused.
     pub using: Vec<String>,
+    /// `NATURAL JOIN` — an implicit `USING` over ALL columns common to the two
+    /// sides. The common set is a fact about the schema (rigid schema ⇒ static),
+    /// but not known at parse time; the planner computes it and fills `using`
+    /// before the USING→ON desugar, so a natural join is handled exactly like an
+    /// explicit USING one. A natural join with NO common column keeps `using`
+    /// empty and its `ON true`, i.e. a cross join (sqlite's rule).
+    pub natural: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
