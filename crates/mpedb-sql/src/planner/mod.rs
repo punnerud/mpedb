@@ -283,6 +283,12 @@ fn bind_err(msg: impl Into<String>) -> Error {
     Error::Bind(msg.into())
 }
 
+/// Count every subplan in the tree — the top-level lifts plus, recursively,
+/// each subplan's own nested lifts (#73 §3).
+fn total_subplans(subs: &[SubPlan]) -> usize {
+    subs.iter().map(|s| 1 + total_subplans(&s.subplans)).sum()
+}
+
 /// A CORRELATED subplan slot is filled per outer row AFTER the gather, so the
 /// only program allowed to read it is the WHERE — which the correlated split
 /// routes into `post_filter`. In an aggregate query the group keys, aggregate
@@ -361,6 +367,14 @@ pub(crate) fn plan_statement(
         ast::Stmt::Update(s) => plan_update(s, schema, n_params, catalog, &mut consts)?,
         ast::Stmt::Delete(s) => plan_delete(s, schema, n_params, catalog, &mut consts)?,
     };
+    // The 16-subplan ceiling bounds the WHOLE tree once nesting (#73 §3) can
+    // grow it past one level — matching the recursive decoder's DoS budget, so a
+    // plan `prepare` accepts is a plan `decode` accepts.
+    if total_subplans(&subplans) > 16 {
+        return Err(bind_err(
+            "too many subqueries in one statement (max 16, including nested)",
+        ));
+    }
     let footprint = compute_footprint(&plan_stmt, &subplans, schema)?;
     // A context slot whose type could not be inferred cannot be type-checked
     // against the session value at execute time — reject it at prepare with a

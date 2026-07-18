@@ -28,12 +28,7 @@ impl CompiledPlan {
         }
         buf.push(self.subplans.len() as u8);
         for s in &self.subplans {
-            buf.push(s.kind as u8);
-            buf.extend_from_slice(&(s.outer_args.len() as u16).to_le_bytes());
-            for a in &s.outer_args {
-                buf.extend_from_slice(&a.to_le_bytes());
-            }
-            encode_select(&s.plan, &mut buf);
+            encode_subplan(s, &mut buf);
         }
         self.footprint.encode_into(&mut buf);
         encode_stmt(&self.stmt, &mut buf);
@@ -42,6 +37,24 @@ impl CompiledPlan {
 }
 
 // ---- statement encode/decode ----------------------------------------------
+
+/// One lifted subquery, RECURSIVELY (#73 §3). Layout: kind, `sub_base`,
+/// `slot_type` tag, the correlation-arg list, the inner SELECT, then a COUNT and
+/// the inner's own nested subplans — the exact mirror of [`decode_subplan`].
+fn encode_subplan(s: &SubPlan, buf: &mut Vec<u8>) {
+    buf.push(s.kind as u8);
+    w_u16(buf, s.sub_base);
+    buf.push(s.slot_type.map_or(0, |t| t as u8));
+    w_u16(buf, s.outer_args.len() as u16);
+    for a in &s.outer_args {
+        buf.extend_from_slice(&a.to_le_bytes());
+    }
+    encode_select(&s.plan, buf);
+    buf.push(s.subplans.len() as u8);
+    for c in &s.subplans {
+        encode_subplan(c, buf);
+    }
+}
 
 fn w_u16(buf: &mut Vec<u8>, v: u16) {
     buf.extend_from_slice(&v.to_le_bytes());
