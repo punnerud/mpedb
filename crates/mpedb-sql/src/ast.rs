@@ -187,6 +187,12 @@ pub(crate) enum Expr {
     Binary(BinOp, Box<Expr>, Box<Expr>),
     /// `IS NULL` (`negated` = `IS NOT NULL`).
     IsNull(Box<Expr>, bool),
+    /// `x IS y` / `x IS NOT y` — NULL-safe "(not) distinct from". Unlike `=`/`<>`
+    /// this is 2-valued (never NULL): `a IS b` is TRUE when both are NULL, FALSE
+    /// when exactly one is, else `a = b`. `negated = false` is `IS`
+    /// (is-not-distinct-from); `negated = true` is `IS NOT` (is-distinct-from).
+    /// The `IS [NOT] NULL` forms stay [`Expr::IsNull`].
+    IsDistinct(Box<Expr>, Box<Expr>, bool),
     /// `lhs LIKE pattern`.
     Like(Box<Expr>, Box<Expr>),
     /// `CAST(x AS <type>)`.
