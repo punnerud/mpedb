@@ -341,9 +341,43 @@ SELECT amt / 100, count(*) FROM t GROUP BY amt / 100 HAVING count(*) > 1
 NULL
 2
 
-# A bare column that is not (a spelling of) a key is still refused.
-statement error must appear in GROUP BY
+# A bare column with a non-min/max aggregate is ACCEPTED in sqlite mode (#88) and
+# takes its value from the group's LOWEST-ROWID row — here bare `amt`, which over
+# this single INTEGER-PK table (rowid == id) matches sqlite EXACTLY. The group key
+# is `amt / 100`; each numeric group has one row, and the NULL group (id 4, id 5)
+# takes its `amt` from the lower rowid (id 4), which is NULL.
+query II rowsort
 SELECT amt, count(*) FROM t GROUP BY amt / 100
+----
+100
+1
+200
+1
+300
+1
+50
+1
+NULL
+2
+
+# A bare column with NO aggregate at all is the same lowest-rowid rule: each
+# dept group takes its `amt` from its lowest rowid (eng→id1=100, sales→id3=50,
+# ops→id5=NULL).
+query TI rowsort
+SELECT dept, amt FROM t GROUP BY dept
+----
+eng
+100
+ops
+NULL
+sales
+50
+
+# But TWO-OR-MORE min/max is still REFUSED: sqlite fills the bare column from the
+# LAST min/max (an order-dependent pick its own docs call "arbitrary"), so mpedb
+# declines rather than risk a value that differs from sqlite (#88).
+statement error must appear in GROUP BY
+SELECT dept, amt, min(amt), max(amt) FROM t GROUP BY dept
 
 # The key must decide the groups — an aggregate cannot.
 statement error cannot contain an aggregate
