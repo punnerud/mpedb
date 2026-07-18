@@ -100,7 +100,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | BETWEEN / NOT BETWEEN | ✅ | |
 | IN / NOT IN (value list) | ✅ | also `x IN (SELECT …)` and the sqlite shorthand `x IN <table>` (single-column). The empty set `x IN ()` is accepted (sqlite allows it) and is FALSE for every probe, `NOT IN ()` TRUE; `NULL IN (empty)` is FALSE (3VL), matching sqlite |
 | IS NULL / IS NOT NULL | ✅ | |
-| `x IS y` (general distinct-from) | ❌ | only the NULL forms |
+| `x IS y` (general distinct-from) | ✅ | NULL-safe equality (`IS`) / inequality (`IS NOT`): both-NULL is TRUE, one-NULL is FALSE, else `=`. Two-valued — never NULL, unlike `=` |
 | CASE (searched and simple) | ✅ | simple form desugars to searched; arms mixing int64 and float64 are refused — sqlite types the winning arm per row, rigid typing cannot, and widening was measured to change division results (add a CAST) |
 | CAST(x AS type) | ✅ | NULL→NULL; float→int truncates toward zero (sqlite's rule); **text never parses into a number** — refused instead of guessed |
 | COLLATE | ❌ | text compares as UTF-8 bytes |

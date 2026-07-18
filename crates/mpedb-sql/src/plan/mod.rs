@@ -79,7 +79,13 @@ const MAX_JOINS: usize = 16;
 // 17: INSERT … SELECT — the Insert stmt carries an optional embedded select
 //     plan + column map after its VALUES rows, so a format-16 reader would
 //     desync on the extra bytes.
-const PLAN_FORMAT: u8 = 17;
+// 18: general `x IS y` / `x IS NOT y` (NULL-safe distinct-from) — the expr
+//     bytes grew two additive `Instr` opcodes (IsNotDistinct=32, IsDistinct=33).
+//     A format-17 reader hits an unknown opcode in `ExprProgram::decode` and
+//     reports the plan as corrupt rather than "written by a newer mpedb", so
+//     the whole-plan version gates it cleanly — same additive pattern as the
+//     scalar-fn bumps (14-16).
+const PLAN_FORMAT: u8 = 18;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

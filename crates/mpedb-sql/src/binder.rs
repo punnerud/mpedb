@@ -23,6 +23,11 @@ pub(crate) enum BExpr {
     Col(u16),
     Unary(BUnOp, Box<BExpr>),
     Binary(BinOp, Box<BExpr>, Box<BExpr>),
+    /// `l IS r` / `l IS NOT r` — NULL-safe (not-)distinct-from, a 2-valued Bool.
+    /// The bool is `negated` (`IS NOT`). Its own node rather than a `BinOp`
+    /// because it is NOT 3VL: it compiles to a dedicated instruction that never
+    /// yields NULL, so folding it through the comparison path would be wrong.
+    IsDistinct(Box<BExpr>, Box<BExpr>, bool),
     /// LHS LIKE 'pattern' (pattern is always a literal in Phase 1).
     Like(Box<BExpr>, String),
     /// `LHS IN (<context list at reserved param n>)` (DESIGN-MULTIDB §2.6).
@@ -458,6 +463,20 @@ impl<'a> Binder<'a> {
                     BUnOp::IsNull
                 };
                 let e = fold_maybe(BExpr::Unary(op, Box::new(a)), self.suppress_fold)?;
+                Ok((e, Some(ColumnType::Bool)))
+            }
+            ast::Expr::IsDistinct(l, r, negated) => {
+                let (l, lt) = self.bind_expr(l)?;
+                let (r, rt) = self.bind_expr(r)?;
+                // Both operands unify exactly like `=` — same type, the single
+                // Int64->Float64 coercion. The difference is only in the RESULT,
+                // which is 2-valued: `IS` never yields NULL, so it is its own
+                // node with its own instruction rather than a 3VL comparison.
+                let (l, r, _) = self.unify_operands(l, lt, r, rt, "compare")?;
+                let e = fold_maybe(
+                    BExpr::IsDistinct(Box::new(l), Box::new(r), *negated),
+                    self.suppress_fold,
+                )?;
                 Ok((e, Some(ColumnType::Bool)))
             }
             ast::Expr::Like(lhs, pat) => {
@@ -1019,6 +1038,7 @@ impl<'a> Binder<'a> {
                 self.static_type(&a[0])
             }
             BExpr::Call(_, _) => Some(ColumnType::Text),
+            BExpr::IsDistinct(..) => Some(ColumnType::Bool),
             _ => None,
         }
     }
@@ -1146,6 +1166,9 @@ pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
         BExpr::Binary(_, a, b) => {
             matches!(a.as_ref(), BExpr::Const(_)) && matches!(b.as_ref(), BExpr::Const(_))
         }
+        BExpr::IsDistinct(a, b, _) => {
+            matches!(a.as_ref(), BExpr::Const(_)) && matches!(b.as_ref(), BExpr::Const(_))
+        }
         BExpr::Like(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         BExpr::Cast(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         // Never foldable: the list is a session value, not a literal.
@@ -1240,6 +1263,15 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 BinOp::Concat => Instr::Concat,
                 BinOp::And => Instr::And,
                 BinOp::Or => Instr::Or,
+            });
+        }
+        BExpr::IsDistinct(a, b, negated) => {
+            emit(a, instrs, consts)?;
+            emit(b, instrs, consts)?;
+            instrs.push(if *negated {
+                Instr::IsDistinct
+            } else {
+                Instr::IsNotDistinct
             });
         }
         BExpr::Like(a, pattern) => {

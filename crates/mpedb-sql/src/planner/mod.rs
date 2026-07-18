@@ -1127,7 +1127,7 @@ fn max_col(e: &BExpr) -> Option<u16> {
             BExpr::Unary(_, a) | BExpr::Like(a, _) | BExpr::Cast(a, _) | BExpr::InParam(a, _) => {
                 stack.push(a)
             }
-            BExpr::Binary(_, a, b) => {
+            BExpr::Binary(_, a, b) | BExpr::IsDistinct(a, b, _) => {
                 stack.push(a);
                 stack.push(b);
             }
