@@ -133,13 +133,31 @@ const MAX_JOINS: usize = 16;
 //     (IndexRange at format 8, IndexPoint parts at 12). The schema canonical
 //     bytes also gained a table-kind discriminant (v4), so a plan compiled
 //     against a v3 schema fails its `schema_hash` check first — belt and braces.
-const PLAN_FORMAT: u8 = 25;
+// 26: recursive CTEs (design/DESIGN-CTE-RECURSIVE.md stage 1) — a new
+//     `PlanStmt::RecursiveCte` (`STMT_RECURSIVE_CTE = 9`) carrying a name, the
+//     declared column names + types, a `union_all` byte and three nested
+//     `SelectPlan`s (anchor / recursive / outer). The recursive term and the
+//     outer statement read the working table through the [`CTE_TABLE`] sentinel.
+//     A format-25 reader hits the unknown statement tag in `decode_stmt` and
+//     rejects the plan as corrupt rather than misreading it — same whole-plan
+//     version gating as `STMT_COMPOUND` at format 9.
+const PLAN_FORMAT: u8 = 26;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
 /// bits. Deliberately `u32::MAX` — a real schema caps table ids far below,
 /// so no future table can collide with it.
 pub const DUAL_TABLE: u32 = u32::MAX;
+
+/// The table id a recursive CTE's WORKING TABLE carries
+/// (design/DESIGN-CTE-RECURSIVE.md). Like [`DUAL_TABLE`], it names no catalog
+/// table: the executor binds it to an in-memory row set (the fixpoint queue for
+/// the recursive term, the full result for the outer statement). The validator,
+/// footprint and EXPLAIN special-case it exactly as they do the dual sentinel,
+/// and its synthetic [`TableDef`] (columns, no PK, no indexes ⇒ always
+/// FullScan) is [`RecursiveCtePlan::cte_def`]. `u32::MAX - 1`, one below the
+/// dual sentinel and far above any real table id.
+pub const CTE_TABLE: u32 = u32::MAX - 1;
 
 /// The zero-column [`TableDef`] that stands in for `DUAL_TABLE` wherever the
 /// planner/validator needs "the table's" width or column names. It never
@@ -533,6 +551,92 @@ pub struct CompoundPlan {
 /// decoder allocate unboundedly. The corpus' longest chain is 9 arms.
 const MAX_COMPOUND_ARMS: usize = 64;
 
+/// A `WITH RECURSIVE <name>(<columns>) AS (<anchor> UNION[ ALL] <recursive>)
+/// <outer>` statement (design/DESIGN-CTE-RECURSIVE.md stage 1).
+///
+/// Unlike a non-recursive CTE — flattened onto its base table at bind time
+/// (DESIGN-CTE.md) — this is a genuine **fixpoint** the executor iterates: the
+/// anchor seeds a result set and a FIFO queue, the recursive term is
+/// re-evaluated with the working table bound to the PREVIOUS step's new rows
+/// (semi-naive), and survivors accumulate until a step adds nothing (natural
+/// fixpoint), the outer `LIMIT` is satisfied, or #74's work budget trips.
+///
+/// `anchor`, `recursive` and `outer` are ordinary [`SelectPlan`]s. The recursive
+/// term and the outer statement read the working table through the [`CTE_TABLE`]
+/// sentinel, whose synthetic [`TableDef`] is [`RecursiveCtePlan::cte_def`]; the
+/// executor binds it to the queue (recursive) or the full result (outer). The
+/// anchor never references it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RecursiveCtePlan {
+    /// The CTE name — used for the #74 attribution `recursive CTE "<name>"` and
+    /// for EXPLAIN.
+    pub name: String,
+    /// Declared column names (the REQUIRED `t(c1, …)` list). `columns.len()` is
+    /// the CTE's arity; the anchor's projection must match it.
+    pub columns: Vec<String>,
+    /// The CTE's column types, derived from the anchor's projection and aligned
+    /// to `columns`. A rigid engine fixes them here; the recursive term's
+    /// projection must agree (arity AND type).
+    pub col_types: Vec<ColumnType>,
+    /// `UNION ALL` keeps every recursive row; `UNION` deduplicates each step's
+    /// output against the full accumulated result (on the whole tuple).
+    pub union_all: bool,
+    /// Non-recursive seed. Reads real tables (or the dual row); NEVER the
+    /// working table.
+    pub anchor: SelectPlan,
+    /// Recursive term. References the working table exactly once ([`CTE_TABLE`]),
+    /// in a FROM/JOIN operand; `validate` re-enforces the §3 restrictions.
+    pub recursive: SelectPlan,
+    /// The outer statement, reading the CTE's full result via [`CTE_TABLE`].
+    pub outer: SelectPlan,
+}
+
+impl RecursiveCtePlan {
+    /// The synthetic [`TableDef`] the working table presents to the binder,
+    /// validator, planner and EXPLAIN — id [`CTE_TABLE`], the declared columns
+    /// typed by `col_types`, no PK and no indexes (so every access over it is a
+    /// FullScan). Never registered in a schema; never reaches the row/key layer.
+    pub fn cte_def(&self) -> TableDef {
+        cte_working_table_def(&self.name, &self.columns, &self.col_types)
+    }
+}
+
+/// Build the synthetic working-table [`TableDef`] for a recursive CTE. The
+/// SINGLE source of the working table's shape — used by the planner (at compile
+/// time) and by [`RecursiveCtePlan::cte_def`] (validate / footprint / EXPLAIN),
+/// so the def a plan is built against can never drift from the def it is
+/// re-validated against. Columns are nullable (sqlite treats every value as
+/// nullable; the anchor may seed one and the recursion NULL it — the permissive
+/// 3VL choice, never a wrong answer); no PK and no indexes ⇒ every access is a
+/// FullScan.
+pub(crate) fn cte_working_table_def(
+    name: &str,
+    columns: &[String],
+    col_types: &[ColumnType],
+) -> TableDef {
+    TableDef {
+        id: CTE_TABLE,
+        name: name.to_string(),
+        columns: columns
+            .iter()
+            .zip(col_types)
+            .map(|(name, &ty)| mpedb_types::ColumnDef {
+                name: name.clone(),
+                ty,
+                nullable: true,
+                unique: false,
+                indexed: false,
+                default: None,
+                check: None,
+            })
+            .collect(),
+        primary_key: Vec::new(),
+        indexes: Vec::new(),
+        dead: false,
+        kind: mpedb_types::TableKind::Standard,
+    }
+}
+
 /// Statement shape the executor consumes.
 // The Select variant is naturally larger than Begin/Commit/Rollback; the
 // shape is frozen by the public API, so boxing is not an option here.
@@ -542,6 +646,9 @@ pub enum PlanStmt {
     Select(SelectPlan),
     /// `SELECT … UNION/EXCEPT/INTERSECT SELECT …` (#56, format 9).
     Compound(CompoundPlan),
+    /// `WITH RECURSIVE … ` — a fixpoint over a working table (format 26,
+    /// design/DESIGN-CTE-RECURSIVE.md). A read-only statement, like `Select`.
+    RecursiveCte(RecursiveCtePlan),
     Insert {
         table: u32,
         /// `rows[r][col_idx]`: one entry per table column per row. Empty when
@@ -782,6 +889,7 @@ const STMT_BEGIN: u8 = 5;
 const STMT_COMMIT: u8 = 6;
 const STMT_ROLLBACK: u8 = 7;
 const STMT_COMPOUND: u8 = 8;
+const STMT_RECURSIVE_CTE: u8 = 9;
 
 const ACCESS_FULL: u8 = 0;
 const ACCESS_PK_POINT: u8 = 1;
@@ -822,6 +930,10 @@ impl CompiledPlan {
             // A compound has no SINGLE target; staleness is covered by the
             // per-arm entries in `policies`, which stamp every table read.
             PlanStmt::Compound(_) => None,
+            // A recursive CTE reads several base tables (across anchor /
+            // recursive / outer); like a compound it has no single target, and
+            // `policies` stamps each real table read.
+            PlanStmt::RecursiveCte(_) => None,
             PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => None,
         }
     }

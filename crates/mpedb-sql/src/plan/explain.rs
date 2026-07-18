@@ -36,6 +36,20 @@ impl CompiledPlan {
                     out.push_str(&format!("offset: {n}\n"));
                 }
             }
+            PlanStmt::RecursiveCte(rc) => {
+                out.push_str(&format!(
+                    "RecursiveCte {}({}) {}\n",
+                    rc.name,
+                    rc.columns.join(", "),
+                    if rc.union_all { "UNION ALL" } else { "UNION" },
+                ));
+                out.push_str("anchor:\n");
+                self.render_select(&rc.anchor, schema, &mut out);
+                out.push_str("recursive:\n");
+                self.render_select(&rc.recursive, schema, &mut out);
+                out.push_str("outer:\n");
+                self.render_select(&rc.outer, schema, &mut out);
+            }
             _other => self.render_rest(schema, &mut out),
         }
         for (i, s) in self.subplans.iter().enumerate() {
@@ -84,9 +98,21 @@ impl CompiledPlan {
     }
 
     fn render_select(&self, sp: &SelectPlan, schema: &Schema, out: &mut String) {
+        // The working table (CTE_TABLE) is named from THIS plan's RecursiveCte
+        // node, not the schema.
+        let cte_def: Option<TableDef> = match &self.stmt {
+            PlanStmt::RecursiveCte(rc) => Some(rc.cte_def()),
+            _ => None,
+        };
         let table_name = |id: u32| {
             if id == super::DUAL_TABLE {
                 return "(no FROM — one synthetic row)".to_string();
+            }
+            if id == super::CTE_TABLE {
+                return cte_def
+                    .as_ref()
+                    .map(|t| format!("{} (recursive working table)", t.name))
+                    .unwrap_or_else(|| "(recursive working table)".to_string());
             }
             schema
                 .table(id)
@@ -94,7 +120,11 @@ impl CompiledPlan {
                 .unwrap_or_else(|| format!("table#{id}"))
         };
         let col_namer = |id: u32| {
-            let t = schema.table(id).cloned();
+            let t = if id == super::CTE_TABLE {
+                cte_def.clone()
+            } else {
+                schema.table(id).cloned()
+            };
             move |c: u16| match &t {
                 Some(t) if (c as usize) < t.columns.len() => t.columns[c as usize].name.clone(),
                 _ => format!("col#{c}"),
@@ -356,7 +386,7 @@ impl CompiledPlan {
             }
         };
         match &self.stmt {
-            PlanStmt::Select(_) | PlanStmt::Compound(_) => {
+            PlanStmt::Select(_) | PlanStmt::Compound(_) | PlanStmt::RecursiveCte(_) => {
                 unreachable!("handled by explain")
             }
             PlanStmt::Insert {

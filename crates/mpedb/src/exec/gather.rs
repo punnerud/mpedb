@@ -124,9 +124,9 @@ pub(super) fn gather_joined(
     // The width of the tuple accumulated BEFORE each join — what a FULL
     // join's unmatched-inner sweep NULL-extends on the left. Tracked from the
     // schema rather than read off `acc`, which may hold no rows.
-    let mut acc_width = table_def(schema, outer_table)?.columns.len();
+    let mut acc_width = table_def(schema, plan, outer_table)?.columns.len();
     for join in joins {
-        let inner_width = table_def(schema, join.table)?.columns.len();
+        let inner_width = table_def(schema, plan, join.table)?.columns.len();
         let join_tbl = join.table; // for the #74 attribution closure
         // An access with no OuterCol parts is resolved once: read the inner
         // side once and hold it (the pre-#49 execution — keeping it is what

@@ -60,6 +60,14 @@ fn sample_sqls() -> Vec<&'static str> {
         "SELECT id, rank() OVER (ORDER BY age DESC), dense_rank() OVER (ORDER BY age DESC) FROM users",
         "SELECT id, sum(age) OVER (PARTITION BY active ORDER BY age), count(*) OVER (PARTITION BY active) FROM users ORDER BY id",
         "SELECT id FROM users ORDER BY dense_rank() OVER (ORDER BY age), id",
+        // Recursive CTEs (design/DESIGN-CTE-RECURSIVE.md stage 1, format 26): the
+        // new `RecursiveCte` node — name, columns+types, union_all byte and three
+        // nested SelectPlans — must survive encode/decode/validate. A DUAL-anchor
+        // counting generator (UNION ALL, outer LIMIT) and a transitive closure
+        // whose recursive term JOINs the working table (UNION dedup).
+        "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c LIMIT 10",
+        "WITH RECURSIVE r(n) AS (SELECT id FROM users UNION \
+         SELECT orders.user_id FROM orders JOIN r ON orders.user_id = r.n) SELECT n FROM r ORDER BY n",
         "BEGIN",
         "COMMIT",
         "ROLLBACK",
@@ -168,6 +176,45 @@ fn decode_rejects_truncation_in_nested_subplan() {
         );
     }
     // The full blob round-trips (and re-validates the whole tree).
+    assert_eq!(CompiledPlan::decode(&bytes, &s).unwrap(), p);
+}
+
+/// The recursive-CTE bytes (format 26) get their own truncation sweep: a
+/// `RecursiveCte` plan carries a name, a columns+types list, a `union_all` byte
+/// and THREE nested SelectPlans (anchor / recursive / outer), and every cut
+/// through them must fail closed rather than decode a half-read node. EXPLAIN
+/// renders the node without panicking.
+#[test]
+fn decode_rejects_truncation_in_recursive_cte() {
+    let s = test_schema();
+    let p = prepare(
+        "WITH RECURSIVE r(n) AS (SELECT id FROM users UNION \
+         SELECT orders.user_id FROM orders JOIN r ON orders.user_id = r.n) \
+         SELECT n FROM r WHERE n > 0 ORDER BY n LIMIT 5",
+        &s,
+    )
+    .unwrap();
+    // Sanity: this really is a recursive-CTE node whose recursive term joins the
+    // working table.
+    match &p.stmt {
+        PlanStmt::RecursiveCte(rc) => {
+            assert_eq!(rc.columns.len(), 1);
+            assert!(!rc.union_all);
+            assert_eq!(rc.recursive.joins.len(), 1);
+        }
+        other => panic!("expected a RecursiveCte, got {other:?}"),
+    }
+    // EXPLAIN renders the node (and does not panic naming the working table).
+    let ex = p.explain(&s);
+    assert!(ex.contains("RecursiveCte r(n)"), "EXPLAIN should show the node:\n{ex}");
+    let bytes = p.encode();
+    for cut in 0..bytes.len() {
+        assert!(
+            CompiledPlan::decode(&bytes[..cut], &s).is_err(),
+            "truncation at {cut} must fail"
+        );
+    }
+    // The full blob round-trips (and re-validates all three components + §3).
     assert_eq!(CompiledPlan::decode(&bytes, &s).unwrap(), p);
 }
 

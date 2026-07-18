@@ -87,7 +87,7 @@ pub(super) fn exec_select_windowed(
     if skip > 0 || take != usize::MAX {
         out = out.into_iter().skip(skip).take(take).collect();
     }
-    let columns = select_output_columns(schema, sp)?;
+    let columns = select_output_columns(schema, plan, sp)?;
     Ok(ExecResult::Rows { columns, rows: out })
 }
 

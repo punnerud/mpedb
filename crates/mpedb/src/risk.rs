@@ -54,6 +54,9 @@ impl RiskEstimate {
                 from_select.as_ref().is_some_and(|s| sel(&s.plan)) || subs_correlated(&plan.subplans)
             }
             PlanStmt::Update { .. } | PlanStmt::Delete { .. } => subs_correlated(&plan.subplans),
+            // A recursive CTE is a fixpoint: its cardinality is not statically
+            // boundable, so it always warrants the estimate (§6).
+            PlanStmt::RecursiveCte(_) => true,
             PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => false,
         }
     }
@@ -231,6 +234,22 @@ pub fn estimate_plan_risk(
             }
             acc
         }
+        // A recursive CTE's output cardinality is the halting-problem shadow —
+        // not statically boundable (design/DESIGN-CTE-RECURSIVE.md §6). With an
+        // outer LIMIT it is bounded by offset+limit (the idiom that makes an
+        // infinite generator finite); without one it is reported as unbounded, so
+        // a probable runaway is flagged at prepare and the #74 work counter is
+        // the real runtime guard.
+        PlanStmt::RecursiveCte(rc) => match rc.outer.limit {
+            Some(lim) => {
+                let bound = lim.saturating_add(rc.outer.offset.unwrap_or(0));
+                Acc::new(bound, format!("recursive CTE \"{}\" bounded by outer LIMIT", rc.name))
+            }
+            None => Acc::new(
+                u64::MAX,
+                format!("recursive CTE \"{}\" (unbounded — no outer LIMIT)", rc.name),
+            ),
+        },
         PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => {
             Acc::new(0, "no-op statement".to_string())
         }
