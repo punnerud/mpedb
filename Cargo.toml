@@ -10,9 +10,21 @@ members = [
     "crates/mpedb-mirror",
     "crates/mpedb-cli",
     "crates/mpedb-py",
+    "crates/mpedb-capi",
     "crates/mpedb-testkit",
     "crates/mpedb-bench",
     "crates/mpedb-sqlitefmt",
+]
+# mpedb-capi (the libsqlite3-compatible C-API shim) EXPORTS the sqlite3_* symbols,
+# so it cannot co-link the bundled sqlite3 that workspace feature-unification pulls
+# in (mpedb-cli/-bench enable mpedb/sqlite-checkpoint → rusqlite "bundled"). It is a
+# member for shared deps, but excluded from the default set: build/test it standalone
+# with `-p mpedb-capi` (mpedb then compiles WITHOUT sqlite), and use
+# `--workspace --exclude mpedb-capi` for whole-workspace commands.
+default-members = [
+    "crates/mpedb-types", "crates/mpedb-core", "crates/mpedb-sql", "crates/mpedb",
+    "crates/mpedb-sdk", "crates/mpedb-proc", "crates/mpedb-mirror", "crates/mpedb-cli",
+    "crates/mpedb-py", "crates/mpedb-testkit", "crates/mpedb-bench", "crates/mpedb-sqlitefmt",
 ]
 
 [workspace.package]

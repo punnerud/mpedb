@@ -1,0 +1,19 @@
+[package]
+name = "mpedb-capi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+description = "libsqlite3-compatible C-API shim backed by mpedb (ABI-level drop-in)"
+
+[lib]
+# Exports the sqlite3 C-API as extern "C" symbols. The cdylib is
+# libmpedb_sqlite3.{so,dylib}; LD_PRELOAD it (or link it as libsqlite3) and any
+# libsqlite3 consumer talks to mpedb. The rlib lets the in-crate Rust FFI tests
+# call the exported functions directly.
+name = "mpedb_sqlite3"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mpedb = { workspace = true }
+libc = { workspace = true }
