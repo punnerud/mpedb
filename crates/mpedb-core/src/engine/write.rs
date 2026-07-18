@@ -519,6 +519,9 @@ impl<'e> WriteTxn<'e> {
             }
             self.set_tree_root(table_id, ino, out.new_root, icount + 1);
         }
+        // FTS inverted-index maintenance rides the same txn (design/DESIGN-FTS.md
+        // §1): a no-op unless `table_id` is an FTS table.
+        self.fts_maybe_index(table_id, values, true)?;
         self.capture_dirty(table_id, &key, DirtyOp::Upsert)?;
         Ok(())
     }
@@ -563,6 +566,8 @@ impl<'e> WriteTxn<'e> {
             }
             self.set_tree_root(table_id, ino, out.new_root, icount - 1);
         }
+        // Remove the deleted row's postings (FTS tables only).
+        self.fts_maybe_index(table_id, &old, false)?;
         self.capture_dirty(table_id, &key, DirtyOp::Delete)?;
         Ok(true)
     }
@@ -665,6 +670,10 @@ impl<'e> WriteTxn<'e> {
             }
             self.set_tree_root(table_id, ino, iroot, icount);
         }
+        // FTS: the rowid PK is unchanged (enforced), so re-index in place —
+        // remove the OLD text's postings, add the NEW text's.
+        self.fts_maybe_index(table_id, &old, false)?;
+        self.fts_maybe_index(table_id, new_values, true)?;
         self.capture_dirty(table_id, &key, DirtyOp::Upsert)?;
         Ok(true)
     }
@@ -906,6 +915,25 @@ impl<'e> WriteTxn<'e> {
             }
             self.catalog_root = out.new_root;
         }
+        // An FTS table owns one extra tree — the inverted index at the reserved
+        // FTS_INDEX_NO. Seed its catalog entry (root 0, count 0) so the first
+        // `tree_root` finds it; the commit table-root write-back keeps it live.
+        if new.kind.is_fts() {
+            let root = self.catalog_root;
+            let out = btree::insert(
+                self,
+                root,
+                &cat_tree_key(tid, super::FTS_INDEX_NO),
+                &mut btree::Payload::Flat(&empty),
+                InsertMode::InsertOnly,
+            )?;
+            if out.existed {
+                return Err(Error::Corrupt(format!(
+                    "catalog already has an FTS tree entry for new table id {tid}"
+                )));
+            }
+            self.catalog_root = out.new_root;
+        }
         self.schema_gen_bump = true;
         Ok(tid)
     }
@@ -934,11 +962,14 @@ impl<'e> WriteTxn<'e> {
             .table(table_id)
             .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
         let n_trees = 1 + live.indexes.len() as u32; // PK tree + secondaries
+        // An FTS table owns one extra tree (the inverted index at FTS_INDEX_NO);
+        // fold it into the tree-id list so DROP frees and unlinks it too.
+        let fts_ino: Option<u32> = live.kind.is_fts().then_some(super::FTS_INDEX_NO);
 
         // 1. Collect every reachable page of the table's trees (branch, leaf,
         //    and overflow chains).
         let mut pages: BTreeSet<u64> = BTreeSet::new();
-        for ino in 0..n_trees {
+        for ino in (0..n_trees).chain(fts_ino) {
             let (root, _count) = self.tree_root(table_id, ino)?;
             if root != 0 {
                 btree::collect_pages(self, root, &mut pages)?;
@@ -959,7 +990,7 @@ impl<'e> WriteTxn<'e> {
 
         // 3. Unlink the catalog tree-root entries so neither the page-accounting
         //    verifier nor a later `tree_root` sees the now-freed roots.
-        for ino in 0..n_trees {
+        for ino in (0..n_trees).chain(fts_ino) {
             let root = self.catalog_root;
             let out = btree::delete(self, root, &cat_tree_key(table_id, ino))?;
             self.catalog_root = out.new_root;

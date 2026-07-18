@@ -597,7 +597,37 @@ impl CompiledPlan {
                 }
                 format!("IndexRange({}) via index {index_no}", items.join(", "))
             }
+            AccessPath::FtsScan { query } => {
+                format!("FtsScan({})", render_fts_query(query))
+            }
         }
+    }
+}
+
+/// Render a compiled FTS query tree back to a readable `MATCH`-string form (for
+/// EXPLAIN). Cosmetic only.
+fn render_fts_query(q: &FtsQuery) -> String {
+    match q {
+        FtsQuery::Term(t) => {
+            let mut s = String::new();
+            if !t.columns.is_empty() {
+                let cols: Vec<String> = t.columns.iter().map(|c| c.to_string()).collect();
+                s.push('{');
+                s.push_str(&cols.join(" "));
+                s.push_str("}:");
+            }
+            if t.initial {
+                s.push('^');
+            }
+            s.push_str(&t.token);
+            if t.prefix {
+                s.push('*');
+            }
+            s
+        }
+        FtsQuery::And(a, b) => format!("({} AND {})", render_fts_query(a), render_fts_query(b)),
+        FtsQuery::Or(a, b) => format!("({} OR {})", render_fts_query(a), render_fts_query(b)),
+        FtsQuery::AndNot(a, b) => format!("({} NOT {})", render_fts_query(a), render_fts_query(b)),
     }
 }
 

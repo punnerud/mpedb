@@ -9,6 +9,7 @@ pub(super) fn contains_agg(e: &ast::Expr) -> bool {
         E::Unary(_, a) | E::IsNull(a, _) | E::Cast(a, _) => contains_agg(a),
         E::Binary(_, a, b)
         | E::Like(a, b)
+        | E::Match(a, b)
         | E::IsDistinct(a, b, _)
         | E::Glob(a, b, _)
         | E::Regexp(a, b, _) => contains_agg(a) || contains_agg(b),
@@ -110,6 +111,7 @@ fn lift_aggs(
             E::IsDistinct(Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?), *n)
         }
         E::Like(a, b) => E::Like(Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?)),
+        E::Match(a, b) => E::Match(Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?)),
         E::Glob(a, b, n) => E::Glob(Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?), *n),
         E::Regexp(a, b, n) => E::Regexp(Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?), *n),
         E::InList(a, xs, n) => E::InList(
@@ -214,6 +216,7 @@ fn synthetic_grouped_table(
         primary_key: vec![0],
         indexes: Vec::new(),
         dead: false,
+        kind: mpedb_types::TableKind::Standard,
     }
 }
 

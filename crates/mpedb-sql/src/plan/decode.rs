@@ -273,7 +273,73 @@ fn decode_access(buf: &[u8], pos: &mut usize) -> Result<AccessPath> {
             let [lo, hi] = bounds;
             Ok(AccessPath::IndexRange { index_no, lo, hi })
         }
+        ACCESS_FTS_SCAN => {
+            let mut budget = MAX_FTS_DEPTH;
+            Ok(AccessPath::FtsScan { query: decode_fts_query(buf, pos, &mut budget)? })
+        }
         t => Err(corrupt(format!("bad access path tag {t}"))),
+    }
+}
+
+/// One FTS query node, RECURSIVELY (design/DESIGN-FTS.md §3) — the exact mirror
+/// of `encode_fts_query`. `budget` bounds the tree depth at [`MAX_FTS_DEPTH`], so
+/// a hostile blob cannot overflow the stack. Every read is bounds-checked; a bad
+/// tag or a truncated token is [`Error::Corrupt`], never a panic.
+fn decode_fts_query(buf: &[u8], pos: &mut usize, budget: &mut usize) -> Result<FtsQuery> {
+    if *budget == 0 {
+        return Err(corrupt("FTS query tree too deep"));
+    }
+    *budget -= 1;
+    match r_u8(buf, pos)? {
+        FTS_TERM => {
+            let len = r_u32(buf, pos)? as usize;
+            if len > 1 << 20 {
+                return Err(corrupt("FTS term too long"));
+            }
+            let token = std::str::from_utf8(take(buf, pos, len)?)
+                .map_err(|_| corrupt("invalid utf-8 in FTS term"))?
+                .to_string();
+            let prefix = match r_u8(buf, pos)? {
+                0 => false,
+                1 => true,
+                t => return Err(corrupt(format!("bad FTS prefix flag {t}"))),
+            };
+            let initial = match r_u8(buf, pos)? {
+                0 => false,
+                1 => true,
+                t => return Err(corrupt(format!("bad FTS initial flag {t}"))),
+            };
+            let n = r_u16(buf, pos)? as usize;
+            if n > MAX_COLUMNS {
+                return Err(corrupt("too many FTS term columns"));
+            }
+            let mut columns = Vec::with_capacity(n.min(64));
+            for _ in 0..n {
+                columns.push(r_u16(buf, pos)?);
+            }
+            // A bare (empty-token) term is never emitted; reject it so the
+            // executor never scans an all-columns empty prefix.
+            if token.is_empty() {
+                return Err(corrupt("empty FTS term"));
+            }
+            Ok(FtsQuery::Term(FtsTerm { token, prefix, initial, columns }))
+        }
+        FTS_AND => {
+            let a = decode_fts_query(buf, pos, budget)?;
+            let b = decode_fts_query(buf, pos, budget)?;
+            Ok(FtsQuery::And(Box::new(a), Box::new(b)))
+        }
+        FTS_OR => {
+            let a = decode_fts_query(buf, pos, budget)?;
+            let b = decode_fts_query(buf, pos, budget)?;
+            Ok(FtsQuery::Or(Box::new(a), Box::new(b)))
+        }
+        FTS_AND_NOT => {
+            let a = decode_fts_query(buf, pos, budget)?;
+            let b = decode_fts_query(buf, pos, budget)?;
+            Ok(FtsQuery::AndNot(Box::new(a), Box::new(b)))
+        }
+        t => Err(corrupt(format!("bad FTS query node tag {t}"))),
     }
 }
 

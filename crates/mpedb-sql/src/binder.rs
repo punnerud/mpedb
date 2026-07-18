@@ -518,6 +518,18 @@ impl<'a> Binder<'a> {
                 let e = fold_maybe(BExpr::Like(Box::new(l), pattern), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
             }
+            ast::Expr::Match(_, _) => {
+                // MATCH is NOT a boolean expression (design/DESIGN-FTS.md §3):
+                // it is usable ONLY as a top-level WHERE conjunct against an FTS
+                // table, where the planner intercepts it into an `FtsScan`
+                // BEFORE binding. Any MATCH reaching the binder — a scalar
+                // context, a non-FTS column/table, a SELECT-list item, inside an
+                // OR, or a second MATCH conjunct — is illegal, and mpedb raises
+                // the identical sqlite error rather than inventing a fallback.
+                Err(Error::Bind(
+                    "unable to use function MATCH in the requested context".into(),
+                ))
+            }
             ast::Expr::Glob(lhs, pat, negated) => {
                 // Same shape as LIKE: the pattern must be a text literal, both
                 // operands are text, the result is Bool. `NOT GLOB` is a real
@@ -1646,6 +1658,7 @@ mod tests {
             primary_key: vec![0],
             indexes: vec![],
             dead: false,
+            kind: mpedb_types::TableKind::Standard,
         }
     }
 
@@ -1936,6 +1949,7 @@ mod tests {
             primary_key: vec![0],
             indexes: vec![],
             dead: false,
+            kind: mpedb_types::TableKind::Standard,
         };
         let sc = Scope {
             names: vec![a.name.clone(), b.name.clone()],
@@ -1976,6 +1990,7 @@ mod tests {
             primary_key: vec![0],
             indexes: vec![],
             dead: false,
+            kind: mpedb_types::TableKind::Standard,
         };
         let sc = Scope {
             names: vec![a.name.clone(), b.name.clone()],

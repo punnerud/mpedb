@@ -376,6 +376,12 @@ fn optimistic_eligible(db: &Database, plan: &CompiledPlan) -> bool {
     if db.engine.has_secondary_index(table) {
         return false; // index maintenance defeats key-level footprints
     }
+    if db.engine.table_is_fts(table) {
+        // An FTS table has no `TableDef.indexes`, so `has_secondary_index` is
+        // false — but the row path maintains its inverted index, which the
+        // blind-apply route would skip. Route it through the serial executor.
+        return false;
+    }
     if db.table_has_trigger(table) {
         // The blind-apply path never calls the executor, so it would skip firing
         // ANY trigger — BEFORE or AFTER, insert/update/delete — route such tables
@@ -912,6 +918,7 @@ mod tests {
             primary_key: vec![0],
             indexes: vec![],
             dead: false,
+            kind: mpedb_types::TableKind::Standard,
         };
         Schema::new(vec![table("a"), table("b")]).unwrap()
     }

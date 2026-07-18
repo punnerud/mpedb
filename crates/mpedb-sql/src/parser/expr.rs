@@ -158,6 +158,17 @@ impl<'a> Parser<'a> {
                 seen_cmp = true;
                 continue;
             }
+            // `<col-or-table> MATCH <literal>` (FTS5). There is no `NOT MATCH`;
+            // the RHS parses at the additive tier like `=`'s, so MATCH sits at
+            // comparison precedence and does not chain. Whether it is legal
+            // (an FTS table/column) is decided in the binder/planner, not here.
+            if !seen_cmp && self.peek_kw(Kw::Match) {
+                self.pos += 1;
+                let pat = self.add_expr()?;
+                e = Expr::Match(Box::new(e), Box::new(pat));
+                seen_cmp = true;
+                continue;
+            }
             // `x GLOB pat` / `x NOT GLOB pat` — the `NOT` is part of the
             // operator (like `NOT IN`/`NOT BETWEEN`), so it needs the two-token
             // lookahead that the higher-precedence `not_expr` already passed on.

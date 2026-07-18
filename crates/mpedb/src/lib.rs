@@ -1539,6 +1539,7 @@ primary_key = ["id"]
             primary_key: vec![0],
             indexes: vec![],
             dead: false,
+            kind: mpedb_types::TableKind::Standard,
         }])
         .unwrap();
         let foreign = mpedb_sql::prepare("SELECT * FROM users WHERE id = $1", &other_schema).unwrap();
@@ -1848,6 +1849,7 @@ primary_key = ["id"]
             primary_key: vec![0],
             indexes: vec![],
             dead: false,
+            kind: mpedb_types::TableKind::Standard,
         }])
         .unwrap();
         let foreign = mpedb_sql::prepare(sql, &foreign_schema).unwrap();

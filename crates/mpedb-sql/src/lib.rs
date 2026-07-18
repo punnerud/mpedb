@@ -28,14 +28,15 @@ mod trigger;
 mod view;
 
 pub use ddl::{
-    CreateColumnSpec, CreatePolicySpec, CreateTableSpec, CreateTriggerSpec, DdlStmt, RlsAction,
-    TriggerEvent, TriggerTiming,
+    CreateColumnSpec, CreatePolicySpec, CreateTableSpec, CreateTriggerSpec, CreateVirtualTableSpec,
+    DdlStmt, RlsAction, TriggerEvent, TriggerTiming,
 };
 pub use trigger::{compile_trigger_body, compile_trigger_when, RowMap, RowSide};
 pub use plan::{
-    AccessPath, AggCall, Aggregation, CompiledPlan, CompoundPlan, ConflictProbe, GroupKey,
-    InsertSource, Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp, Projection,
-    dual_def, SelectPlan, SetOp, SubPlan, SubPlanKind, WindowFunc, WindowSpec, DUAL_TABLE,
+    AccessPath, AggCall, Aggregation, CompiledPlan, CompoundPlan, ConflictProbe, FtsQuery, FtsTerm,
+    GroupKey, InsertSource, Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp,
+    Projection, dual_def, SelectPlan, SetOp, SubPlan, SubPlanKind, WindowFunc, WindowSpec,
+    DUAL_TABLE,
 };
 pub use planner::secondary_indexes;
 pub use policy::{table_policy_hash, PolicyCatalog, TablePolicies};
@@ -51,8 +52,8 @@ pub fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
 // Re-export the shared types a plan consumer needs.
 pub use mpedb_types::{
     ColumnDef, ColumnType, DefaultExpr, Error, ExprProgram, Footprint, Instr, KeyAccess,
-    KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema, TableDef, Value,
-    FORMAT_VERSION,
+    KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema, TableDef, TableKind,
+    Tokenizer, Value, FORMAT_VERSION,
 };
 
 /// Compile SQL against a schema. Deterministic: identical logical statements
