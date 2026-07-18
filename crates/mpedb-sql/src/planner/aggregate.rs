@@ -213,6 +213,10 @@ pub(super) fn plan_aggregate_select(
     filter: Option<ExprProgram>,
     joins: Vec<Join>,
     joined_filter: Option<ExprProgram>,
+    // The correlated WHERE residual (#73 §1): filled and applied per outer row
+    // BEFORE accumulation, so aggregation still runs over the full
+    // `(WHERE ∧ policy)` set. `None` for a plain aggregate.
+    post_filter: Option<ExprProgram>,
     mut binder: Binder<'_>,
     _consts: &mut Vec<Value>,
     subplans: Vec<SubPlan>,
@@ -381,7 +385,7 @@ pub(super) fn plan_aggregate_select(
                 access,
                 joins,
                 joined_filter,
-                post_filter: None,
+                post_filter,
                 filter,
                 projection,
                 order_by,
@@ -444,7 +448,7 @@ pub(super) fn plan_aggregate_select(
             access,
             joins,
             joined_filter,
-            post_filter: None,
+            post_filter,
             filter,
             projection,
             order_by,

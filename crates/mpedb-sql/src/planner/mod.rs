@@ -29,7 +29,7 @@ use crate::plan::{
     Projection, SelectPlan, SubPlan, SubPlanKind,
 };
 use crate::policy::{PolicyCatalog, TablePolicies};
-use mpedb_types::{ExprProgram, ColumnType, Error, Footprint, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
+use mpedb_types::{ExprProgram, ColumnType, Error, Footprint, Instr, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
     TableDef, Value,};
 
 mod access;
@@ -281,6 +281,63 @@ pub(crate) fn conflict_probe(table: &TableDef, target: &[u16]) -> ConflictProbe 
 
 fn bind_err(msg: impl Into<String>) -> Error {
     Error::Bind(msg.into())
+}
+
+/// A CORRELATED subplan slot is filled per outer row AFTER the gather, so the
+/// only program allowed to read it is the WHERE — which the correlated split
+/// routes into `post_filter`. In an aggregate query the group keys, aggregate
+/// arguments, HAVING and the grouped projection all run over collapsed groups,
+/// where "which row's correlation?" has no answer, so a correlated slot in any
+/// of them is refused (#73 §1.2c).
+///
+/// This mirrors `validate`'s gather-side slot discipline and is enforced HERE
+/// as well because a freshly compiled plan is executed WITHOUT a decode
+/// round-trip (validate only runs when a plan is loaded from the registry), so
+/// leaning on validate alone would let the direct query path misanswer instead
+/// of refuse. `sub_base` is the first reserved subplan slot (the user param
+/// count at plan time); `correlated[i]` flags whether slot `sub_base + i` is
+/// correlated.
+fn reject_correlated_in_aggregate(
+    sp: &SelectPlan,
+    sub_base: u16,
+    correlated: &[bool],
+) -> Result<()> {
+    let Some(agg) = &sp.aggregate else { return Ok(()) };
+    if !correlated.iter().any(|&c| c) {
+        return Ok(());
+    }
+    let reads_correlated = |p: &ExprProgram| -> bool {
+        p.instrs.iter().any(|instr| {
+            let pi = match instr {
+                Instr::PushParam(pi) | Instr::InParam(pi) => *pi,
+                _ => return false,
+            };
+            pi >= sub_base
+                && ((pi - sub_base) as usize) < correlated.len()
+                && correlated[(pi - sub_base) as usize]
+        })
+    };
+    let leaks = agg
+        .group_by
+        .iter()
+        .any(|k| matches!(k, GroupKey::Expr(p) if reads_correlated(p)))
+        || agg
+            .aggs
+            .iter()
+            .any(|a| a.arg.as_ref().is_some_and(&reads_correlated))
+        || agg.having.as_ref().is_some_and(&reads_correlated)
+        || sp
+            .projection
+            .iter()
+            .any(|p| matches!(p, Projection::Expr { program, .. } if reads_correlated(program)));
+    if leaks {
+        return Err(bind_err(
+            "a correlated subquery in an aggregate query is only supported in WHERE — \
+             not in the SELECT list, an aggregate argument, GROUP BY, or HAVING, where \
+             the per-row correlation has no meaning once the rows are grouped",
+        ));
+    }
+    Ok(())
 }
 
 /// Bind and plan one parsed statement into a [`CompiledPlan`].

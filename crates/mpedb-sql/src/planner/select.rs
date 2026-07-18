@@ -351,15 +351,12 @@ pub(super) fn plan_select(
         || s.order_by.iter().any(|(e, _)| contains_agg(e))
         || !s.group_by.is_empty();
     if has_agg {
-        // Aggregation consumes rows in the gather phase; the per-row filling
-        // that correlated slots need happens after it. Uncorrelated slots are
-        // filled once up front and pass through untouched.
-        if correlated.iter().any(|&c| c) {
-            return Err(bind_err(
-                "a correlated subquery in an aggregate query is not supported yet",
-            ));
-        }
-        return plan_aggregate_select(
+        // Aggregation consumes rows in the gather phase; a correlated slot is
+        // filled per row AFTER it. The correlated WHERE residual therefore
+        // rides `post_filter` into the aggregate plan (#73 §1) and is applied
+        // per row BEFORE accumulation — so aggregation still runs over the full
+        // `(WHERE ∧ policy)` set. Uncorrelated slots are filled once up front.
+        let planned = plan_aggregate_select(
             s,
             // The scope carries the ALIAS when the query gave one — dropping
             // it here is how `SELECT cor0.c FROM t AS cor0 GROUP BY cor0.c`
@@ -373,10 +370,20 @@ pub(super) fn plan_select(
             filter,
             Vec::new(),
             None,
+            post_filter,
             binder,
             consts,
             subplans,
-        );
+        )?;
+        // A correlated slot may be read ONLY by the WHERE (→ post_filter). One
+        // in the projection, an aggregate argument, GROUP BY or HAVING has no
+        // per-row meaning over a grouped tuple — refuse it here (the direct
+        // query path runs without a decode round-trip, so validate's mirror of
+        // this rule is not reached in-process).
+        if let PlanStmt::Select(sp) = &planned.0 {
+            reject_correlated_in_aggregate(sp, n_params, &correlated)?;
+        }
+        return Ok(planned);
     }
 
     let mut out_types: Vec<Option<ColumnType>> = Vec::new();

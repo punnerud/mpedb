@@ -509,6 +509,15 @@ fn exec_select_top(
     if correlated.is_empty() && sp.post_filter.is_none() {
         return exec_select(ctx, schema, plan, params, sp);
     }
+    // #73 §1: an aggregate over a correlated filter. The aggregate path consumes
+    // rows in its gather, so the per-row correlated pre-filter must run BETWEEN
+    // the gather and the grouping — `exec_aggregate` takes the correlated
+    // subplans and the post-filter and runs the shared `correlated_survivors`
+    // there. Everything downstream (empty-group zero row, HAVING, ORDER BY,
+    // LIMIT-bounds-groups) is unchanged.
+    if sp.aggregate.is_some() {
+        return run_aggregate(ctx, schema, plan, params, sp, &correlated, sp.post_filter.as_ref());
+    }
     exec_select_with(ctx, schema, plan, params, sp, &correlated)
 }
 
@@ -612,7 +621,6 @@ fn exec_select(
     } = sp;
     {
         {
-            let t = table_def(schema, *table)?;
             // DISTINCT makes LIMIT bound DISTINCT rows, so the scan bound (and
             // the top-K path, which is the same bound wearing a hat) must not
             // apply — the same trap the aggregate path has. Forcing it to None
@@ -634,27 +642,12 @@ fn exec_select(
                     l.saturating_add(o)
                 })
             };
-            if let Some(agg) = aggregate {
-                return exec_aggregate(
-                    ctx,
-                    plan,
-                    params,
-                    schema,
-                    t,
-                    *table,
-                    access,
-                    filter.as_ref(),
-                    joins,
-                    joined_filter.as_ref(),
-                    agg,
-                    projection,
-                    order_by,
-                    *order_over,
-                    *order_junk,
-                    *limit,
-                    *offset,
-                    *distinct,
-                );
+            if aggregate.is_some() {
+                // Plain aggregate: no correlated subplans and no post-filter (a
+                // correlated aggregate is routed straight to `run_aggregate`
+                // from `exec_select_top`, never through here — arms and subplans
+                // cannot carry either).
+                return run_aggregate(ctx, schema, plan, params, sp, &[], None);
             }
             let rows = if !joins.is_empty() {
                 // A join materializes: the sort, the dedup and the LIMIT all
@@ -835,6 +828,8 @@ fn exec_select_with(
         order_junk,
     } = sp;
     if aggregate.is_some() {
+        // A correlated aggregate is routed to `run_aggregate` from
+        // `exec_select_top`; reaching here with one is a routing bug.
         return Err(internal("correlated subplans in an aggregate plan"));
     }
     let mut rows = if !joins.is_empty() {
@@ -856,60 +851,16 @@ fn exec_select_with(
         sort_rows(&mut rows, order_by);
     }
 
-    let base = plan.subplan_base() as usize;
-    let n_user = base;
-    let mut scratch: Vec<Value> = params.to_vec();
-    let mut stack: Vec<Value> = Vec::new();
+    // Fill every correlated slot per row and apply the post-filter, keeping each
+    // survivor WITH the scratch that produced it — the projection may read a
+    // correlated slot (a correlated scalar subquery in the SELECT list), so it
+    // is evaluated against that scratch.
+    let survivors =
+        correlated_survivors(ctx, schema, plan, params, rows, correlated, post_filter.as_ref())?;
+
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    // A correlated subplan is a pure function of (user params, correlation
-    // args) over the txn's stable MVCC snapshot, so two outer rows with the
-    // SAME correlation values must yield the SAME inner result. Memoize it per
-    // subplan, keyed by the encoded correlation tuple — MPEE's "buy the inner
-    // cells once, then only stream probes" applied to the N×N outer×inner loop:
-    // O(N_outer × M_inner) re-execution collapses to ONE inner run per DISTINCT
-    // correlation tuple. All-distinct keys cost only a hash/insert per row (no
-    // regression); repeated keys skip the whole inner scan. The cache is bounded
-    // by the distinct correlation tuples, itself ≤ the already-materialized
-    // `rows`, so it adds no new order of memory.
-    let mut memo: Vec<std::collections::HashMap<Vec<u8>, Value>> =
-        vec![std::collections::HashMap::new(); correlated.len()];
-    // Kill switch for A/B measurement (matches the DESIGN-MPEE-OPT falsifiability
-    // pattern): MPEDB_NO_SUBPLAN_MEMO=1 restores per-row re-execution.
-    let use_memo = std::env::var_os("MPEDB_NO_SUBPLAN_MEMO").is_none();
-    for row in rows {
-        for (ci, &(i, sub)) in correlated.iter().enumerate() {
-            let mut key_vals = Vec::with_capacity(sub.outer_args.len());
-            for &a in &sub.outer_args {
-                key_vals.push(
-                    row.get(a as usize)
-                        .cloned()
-                        .ok_or_else(|| internal("correlation arg out of row"))?,
-                );
-            }
-            let memo_key = keycode::encode_key(&key_vals);
-            scratch[base + i] = if let Some(v) = memo[ci].get(&memo_key) {
-                v.clone()
-            } else {
-                let mut inner_params = Vec::with_capacity(n_user + key_vals.len());
-                inner_params.extend_from_slice(&params[..n_user]);
-                inner_params.extend(key_vals);
-                let r = exec_select(ctx, schema, plan, &inner_params, &sub.plan)?;
-                // A scalar subplan's >1-row error still fires on the first
-                // occurrence of that key (the miss path), before any insert, so
-                // error semantics are byte-identical to per-row re-execution.
-                let v = subplan_value(r, sub.kind)?;
-                if use_memo {
-                    memo[ci].insert(memo_key, v.clone());
-                }
-                v
-            };
-        }
-        if let Some(pf) = post_filter {
-            if !pf.eval_filter(&mut stack, &row, &scratch)? {
-                continue;
-            }
-        }
+    for (row, scratch) in survivors {
         let mut orow = Vec::with_capacity(projection.len());
         for p in projection {
             orow.push(match p {
@@ -943,6 +894,122 @@ fn exec_select_with(
     }
     let columns = select_output_columns(schema, sp)?;
     Ok(ExecResult::Rows { columns, rows: out })
+}
+
+/// Run the aggregate path for one SELECT, threading the per-row correlated
+/// pre-filter. Shared by the plain aggregate dispatch ([`exec_select`], empty
+/// correlated / no post-filter) and the correlated-aggregate dispatch
+/// ([`exec_select_top`]) so the long argument wiring cannot drift.
+#[allow(clippy::too_many_arguments)]
+fn run_aggregate(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    sp: &SelectPlan,
+    correlated: &[(usize, &SubPlan)],
+    post_filter: Option<&ExprProgram>,
+) -> Result<ExecResult> {
+    let t = table_def(schema, sp.table)?;
+    let agg = sp
+        .aggregate
+        .as_ref()
+        .ok_or_else(|| internal("aggregate dispatch on a non-aggregate plan"))?;
+    exec_aggregate(
+        ctx,
+        plan,
+        params,
+        schema,
+        t,
+        sp.table,
+        &sp.access,
+        sp.filter.as_ref(),
+        &sp.joins,
+        sp.joined_filter.as_ref(),
+        agg,
+        &sp.projection,
+        &sp.order_by,
+        sp.order_over,
+        sp.order_junk,
+        sp.limit,
+        sp.offset,
+        sp.distinct,
+        correlated,
+        post_filter,
+    )
+}
+
+/// Per-row correlated pre-filter shared by the plain correlated SELECT
+/// ([`exec_select_with`]) and the aggregate path ([`exec_aggregate`]) so the two
+/// cannot drift (#73 §1). For each gathered row it fills every correlated
+/// subplan slot into a scratch buffer — memoized per subplan by the encoded
+/// correlation tuple, so two rows with the SAME tuple run the inner subplan once
+/// (MPEE "buy the inner cells once, then only stream probes"; the memo is bounded
+/// by the distinct tuples, itself ≤ `rows`, and `MPEDB_NO_SUBPLAN_MEMO=1`
+/// restores per-row re-execution for A/B measurement) — then keeps the row iff
+/// `post_filter` accepts it.
+///
+/// Each survivor is returned WITH the scratch that produced it, because a
+/// non-aggregate projection may read a correlated slot (a correlated scalar
+/// subquery in the SELECT list). The aggregate path discards the scratch:
+/// validate and the planner forbid a correlated slot in any grouped program, so
+/// grouping there reads `params`.
+///
+/// A scalar subplan's >1-row error still fires on the first occurrence of a key
+/// (the miss path, before any memo insert), so error semantics are
+/// byte-identical to per-row re-execution.
+#[allow(clippy::too_many_arguments)]
+fn correlated_survivors(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    rows: Vec<Vec<Value>>,
+    correlated: &[(usize, &SubPlan)],
+    post_filter: Option<&ExprProgram>,
+) -> Result<Vec<(Vec<Value>, Vec<Value>)>> {
+    let base = plan.subplan_base() as usize;
+    let n_user = base;
+    let mut scratch: Vec<Value> = params.to_vec();
+    let mut stack: Vec<Value> = Vec::new();
+    let mut memo: Vec<std::collections::HashMap<Vec<u8>, Value>> =
+        vec![std::collections::HashMap::new(); correlated.len()];
+    let use_memo = std::env::var_os("MPEDB_NO_SUBPLAN_MEMO").is_none();
+    let mut out = Vec::new();
+    for row in rows {
+        for (ci, &(i, sub)) in correlated.iter().enumerate() {
+            let mut key_vals = Vec::with_capacity(sub.outer_args.len());
+            for &a in &sub.outer_args {
+                key_vals.push(
+                    row.get(a as usize)
+                        .cloned()
+                        .ok_or_else(|| internal("correlation arg out of row"))?,
+                );
+            }
+            let memo_key = keycode::encode_key(&key_vals);
+            scratch[base + i] = if let Some(v) = memo[ci].get(&memo_key) {
+                v.clone()
+            } else {
+                let mut inner_params = Vec::with_capacity(n_user + key_vals.len());
+                inner_params.extend_from_slice(&params[..n_user]);
+                inner_params.extend(key_vals);
+                let r = exec_select(ctx, schema, plan, &inner_params, &sub.plan)?;
+                let v = subplan_value(r, sub.kind)?;
+                if use_memo {
+                    memo[ci].insert(memo_key, v.clone());
+                }
+                v
+            };
+        }
+        let keep = match post_filter {
+            Some(pf) => pf.eval_filter(&mut stack, &row, &scratch)?,
+            None => true,
+        };
+        if keep {
+            out.push((row, scratch.clone()));
+        }
+    }
+    Ok(out)
 }
 
 fn exec_stmt_rest(
