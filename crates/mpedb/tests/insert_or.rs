@@ -86,11 +86,27 @@ fn insert_or_abort_fail_rollback_error_on_conflict() {
 }
 
 #[test]
-fn insert_or_replace_is_refused() {
+fn insert_or_replace_replaces_on_pk_conflict() {
+    // On a PK-only table, OR REPLACE is a PK-keyed upsert-all (sqlite semantics),
+    // desugared to ON CONFLICT (pk) DO UPDATE SET <non-pk cols> = excluded.
     let (db, path) = open();
-    let err = db.query("INSERT OR REPLACE INTO t (id, v) VALUES (1, 10)", &[]).unwrap_err();
-    assert!(format!("{err}").contains("REPLACE"), "{err}");
+    db.query("INSERT INTO t (id, v) VALUES (1, 10)", &[]).unwrap();
+    db.query("INSERT OR REPLACE INTO t (id, v) VALUES (1, 99)", &[]).unwrap(); // replace
+    assert_eq!(scalar_i64(&db, "SELECT v FROM t WHERE id = 1"), 99);
+    db.query("INSERT OR REPLACE INTO t (id, v) VALUES (2, 20)", &[]).unwrap(); // insert
+    assert_eq!(scalar_i64(&db, "SELECT count(*) FROM t"), 2);
     // A garbage OR-action is a clean parse error, not a silent accept.
     assert!(db.query("INSERT OR BOGUS INTO t (id, v) VALUES (1, 10)", &[]).is_err());
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn insert_or_replace_refuses_secondary_unique() {
+    // With a secondary UNIQUE index, sqlite's REPLACE would delete rows
+    // conflicting on it too — different from a PK upsert — so mpedb refuses
+    // rather than answer differently.
+    let (db, path) = open();
+    db.query("CREATE TABLE u (id INTEGER PRIMARY KEY, e TEXT, UNIQUE (e))", &[]).unwrap();
+    assert!(db.query("INSERT OR REPLACE INTO u (id, e) VALUES (1, 'x')", &[]).is_err());
     let _ = std::fs::remove_file(&path);
 }

@@ -1097,10 +1097,7 @@ impl<'a> Parser<'a> {
             if self.eat_word("IGNORE") {
                 Some(OnConflict::DoNothing)
             } else if self.eat_word("REPLACE") {
-                return Err(self.err_here(
-                    "INSERT OR REPLACE is not supported — its multi-constraint replace \
-                     semantics differ from ON CONFLICT DO UPDATE; write ON CONFLICT explicitly",
-                ));
+                Some(OnConflict::Replace)
             } else if self.eat_word("ABORT") || self.eat_word("FAIL") || self.eat_word("ROLLBACK") {
                 Some(OnConflict::Error)
             } else {
