@@ -12,8 +12,8 @@
 //! — the inner correlates to `b` (its immediate parent), which itself correlates
 //! to the outer `a`.
 //!
-//! What STAYS refused: correlation to a MIDDLE/OUTER scope (stage 3) — see the
-//! last test, and `nested_subquery.rs`.
+//! Correlation to a MIDDLE/OUTER scope (stage 3) now also works — see the last
+//! test here and the dedicated `nested_midscope.rs`.
 
 use mpedb::{Config, Database, ExecResult, Value};
 use std::io::Write;
@@ -253,30 +253,16 @@ fn nested_correlated_direct() {
     d.verify().unwrap();
 }
 
-/// The refusal boundary that STAYS: a nested subquery that correlates to a
-/// MIDDLE/OUTER scope (`a.g`), skipping its immediate parent (`b`), is stage 3
-/// and must refuse cleanly — it surfaces as an unresolved name in the innermost
-/// bind, never a wrong answer.
+/// Stage 3, now SUPPORTED: a nested subquery that correlates to a MIDDLE/OUTER
+/// scope (`a.g`), skipping its immediate parent (`b`). The innermost `c.m = a.g`
+/// references the outermost `a` (a transit through `b`, which itself also uses
+/// `a.g`). Cross-checked against sqlite 3.45 cell-for-cell.
 #[test]
-fn mid_scope_correlation_is_refused() {
+fn mid_scope_correlation_matches_sqlite() {
     let d = db();
-    let err = d
-        .query(
-            "SELECT id FROM a \
+    let q = "SELECT id FROM a \
              WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.g \
-                           AND EXISTS (SELECT 1 FROM c WHERE c.m = a.g))",
-            &[],
-        )
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(!msg.is_empty(), "mid-scope correlation must refuse");
-    // It must NOT run as if it silently worked. The clean refusal is an
-    // unresolved reference from the innermost bind: `a` is not in c's scope, nor
-    // in b's — the only outer scope the inner sees — so the qualified `a.g`
-    // resolves to no table/column.
-    assert!(
-        msg.contains("no table named") || msg.contains("column") || msg.contains("unknown"),
-        "expected an unresolved-name refusal, got: {msg}"
-    );
+                           AND EXISTS (SELECT 1 FROM c WHERE c.m = a.g)) ORDER BY id";
+    assert_eq!(mpedb_rows(&d, q), sqlite_rows(q), "mismatch on `{q}`");
     d.verify().unwrap();
 }
