@@ -31,7 +31,7 @@ pub use ddl::{
     CreateColumnSpec, CreatePolicySpec, CreateTableSpec, CreateTriggerSpec, DdlStmt, RlsAction,
     TriggerEvent, TriggerTiming,
 };
-pub use trigger::{compile_trigger_body, compile_trigger_when};
+pub use trigger::{compile_trigger_body, compile_trigger_when, RowMap, RowSide};
 pub use plan::{
     AccessPath, AggCall, Aggregation, CompiledPlan, CompoundPlan, ConflictProbe, GroupKey,
     InsertSource, Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp, Projection,
