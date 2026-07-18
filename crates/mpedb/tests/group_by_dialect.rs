@@ -7,14 +7,17 @@
 //!
 //! (a) sqlite mode: differential-tests the accepted bare-column cases against the
 //!     `sqlite3` CLI (const-folded-away `COALESCE`, and the single-min/max
-//!     witness row, including ties, interior NULLs, all-NULL groups, no GROUP BY,
-//!     and an empty table);
-//! (b) postgres mode: the same queries are REJECTED (matching PostgreSQL, whose
+//!     witness row — even alongside a count/sum — including ties, interior NULLs,
+//!     all-NULL groups, no GROUP BY, and an empty table);
+//! (b) sqlite mode, the ARBITRARY case (#88): a bare column with NO min/max — a
+//!     count/sum/avg aggregate, or no aggregate — is now ACCEPTED and matches
+//!     sqlite's lowest-rowid pick (differential, including out-of-rowid-order
+//!     inserts). Still REFUSED where mpedb cannot reproduce that pick without a
+//!     wrong answer: over a join, over a non-rowid (text/composite) primary key,
+//!     or with two-or-more min/max (sqlite's order-dependent last-min/max pick);
+//! (c) postgres mode: EVERY bare column is REJECTED (matching PostgreSQL, whose
 //!     rejection was verified by hand against PG 16 — `column … must appear in
 //!     the GROUP BY clause …`);
-//! (c) the genuinely-arbitrary bare column (bare + a non-min/max aggregate, two
-//!     aggregates, or no aggregate) is cleanly REFUSED in sqlite mode too, rather
-//!     than returning a value that might differ from sqlite;
 //! (d) the config default is sqlite, and an explicit `postgres` config is strict.
 //!     (The mirror's PG-import → postgres default is covered in mpedb-mirror.)
 
@@ -43,9 +46,37 @@ primary_key = ["id"]
   [[table.column]]
   name = "name"
   type = "text"
+
+# A join partner, for the "arbitrary bare column over a join is refused" edge.
+[[table]]
+name = "u"
+primary_key = ["uid"]
+  [[table.column]]
+  name = "uid"
+  type = "int64"
+  [[table.column]]
+  name = "gid"
+  type = "int64"
+
+# A table with a NON-rowid (text) primary key, for the "arbitrary bare column
+# over a non-rowid PK is refused" edge — mpedb's min-PK is not sqlite's rowid.
+[[table]]
+name = "tk"
+primary_key = ["k"]
+  [[table.column]]
+  name = "k"
+  type = "text"
+  [[table.column]]
+  name = "g"
+  type = "int64"
+  [[table.column]]
+  name = "v"
+  type = "int64"
+  nullable = true
 "#;
 
-/// The same table shape for the `sqlite3` reference engine.
+/// The same table shape for the `sqlite3` reference engine (only `t` is used in
+/// differential queries; the edge tables `u`/`tk` are mpedb-only refusal checks).
 const SQLITE_DDL: &str = "CREATE TABLE t(id INTEGER PRIMARY KEY, g INTEGER, x INTEGER, name TEXT);";
 
 /// One row of shared test data. `x` is nullable (the min/max argument).
@@ -63,6 +94,20 @@ const DATA: &[Row] = &[
     (6, 20, Some(7), "f"),
     (7, 30, None, "g"),
     (8, 30, None, "h"),
+];
+
+/// The arbitrary-case corpus, INSERTED OUT OF ROWID ORDER on purpose. sqlite's
+/// bare-column pick follows the ROWID (the PK `id`), NOT insert order, so the
+/// lowest-`id` row of each group is the reference answer:
+///   g=10 → id 1 ('one'),  g=20 → id 4 ('four').
+/// mpedb must reproduce that from its min-PK witness, not from insert order.
+const OOO: &[Row] = &[
+    (3, 10, Some(5), "three"),
+    (1, 10, Some(9), "one"),
+    (2, 10, Some(1), "two"),
+    (6, 20, Some(4), "six"),
+    (4, 20, None, "four"),
+    (5, 20, Some(7), "five"),
 ];
 
 fn open(name: &str, compat: Option<&str>) -> (Database, PathBuf) {
@@ -111,6 +156,12 @@ fn canon(v: &Value) -> String {
         Value::Int(i) => i.to_string(),
         Value::Text(s) => s.clone(),
         Value::Bool(b) => b.to_string(),
+        // Render a "clean" float the way the sqlite CLI does: an integral value
+        // keeps a trailing `.0` (`5` → `5.0`); a terminating decimal (`5.5`) uses
+        // the shortest round-trip form, which agrees with sqlite. (Repeating
+        // decimals would diverge on the last digit, so the differential queries
+        // that use `avg()` keep group averages clean.)
+        Value::Float(f) if f.fract() == 0.0 && f.is_finite() => format!("{f:.1}"),
         Value::Float(f) => format!("{f}"),
         other => format!("{other:?}"),
     }
@@ -228,6 +279,21 @@ fn sqlite_mode_bare_column_follows_single_min() {
 }
 
 #[test]
+fn sqlite_mode_single_minmax_with_other_aggregate_follows_the_extremum() {
+    // A single min()/max() governs the bare column EVEN alongside a count/sum/avg
+    // — sqlite's documented rule ("exactly one min()/max()"). Verified vs sqlite
+    // 3.45: `min(x), count(*)` follows the min row, not the lowest-rowid row.
+    // (This whole shape was refused before #88.) Out-of-rowid-order data makes the
+    // "extremum, not first-inserted" distinction visible.
+    let (db, path) = open("mmplus", Some("sqlite"));
+    load(&db, OOO);
+    assert_matches_sqlite_data(&db, OOO, "SELECT g, name, min(x), count(*) FROM t GROUP BY g");
+    assert_matches_sqlite_data(&db, OOO, "SELECT g, name, max(x), sum(x) FROM t GROUP BY g");
+    assert_matches_sqlite_data(&db, OOO, "SELECT g, name, count(*), avg(x), max(x) FROM t GROUP BY g");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn sqlite_mode_bare_column_no_group_by() {
     // No GROUP BY: one group over the whole table, the bare column from the max
     // row. Also the min form and a bare column inside an expression.
@@ -283,7 +349,98 @@ fn sqlite_mode_distinct_over_bare_column_matches_sqlite() {
 }
 
 // ---------------------------------------------------------------------------
-// (b) postgres mode: the same queries are rejected (matching PostgreSQL).
+// (b) sqlite mode, the ARBITRARY case (#88): bare + no min/max now matches
+//     sqlite's lowest-rowid pick; the unreproducible edges stay refused.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn sqlite_mode_arbitrary_bare_column_matches_lowest_rowid() {
+    // bare + a non-min/max aggregate (count/sum/avg), and bare with NO aggregate.
+    // sqlite's "arbitrary" pick is really the group's LOWEST-ROWID row; mpedb
+    // reproduces it from its min-PK witness. OOO is inserted out of rowid order,
+    // so a first-inserted (rather than lowest-rowid) pick would diverge here.
+    let (db, path) = open("arb-match", Some("sqlite"));
+    load(&db, OOO);
+    for q in [
+        "SELECT g, name, count(*) FROM t GROUP BY g",
+        "SELECT g, name, sum(x) FROM t GROUP BY g",
+        "SELECT g, name, avg(x) FROM t GROUP BY g",
+        "SELECT g, count(*), name FROM t GROUP BY g",
+        "SELECT g, name || '?', count(*) FROM t GROUP BY g",
+        // bare with NO aggregate at all
+        "SELECT g, name FROM t GROUP BY g",
+        // no GROUP BY: one group over the whole table, lowest-rowid row (id 1).
+        "SELECT name, count(*) FROM t",
+    ] {
+        assert_matches_sqlite_data(&db, OOO, q);
+    }
+    // Pin the rule directly: lowest rowid is id 1 ('one') for g=10 and id 4
+    // ('four') for g=20 — NOT the first-inserted 'three'/'six'.
+    let rows = mpedb_rows(&db, "SELECT g, name, count(*) FROM t GROUP BY g");
+    assert!(rows.contains(&vec!["10".into(), "one".into(), "3".into()]), "{rows:?}");
+    assert!(rows.contains(&vec!["20".into(), "four".into(), "3".into()]), "{rows:?}");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_mode_arbitrary_bare_column_lowest_rowid_survives_a_filter() {
+    // The pick is the lowest rowid AMONG THE ROWS THAT SURVIVE THE WHERE — for
+    // g=20 that drops id 4 (x NULL), so the pick becomes id 5 ('five'). mpedb's
+    // min-PK is taken over the same filtered set, so it still matches sqlite.
+    let (db, path) = open("arb-filter", Some("sqlite"));
+    load(&db, OOO);
+    assert_matches_sqlite_data(
+        &db,
+        OOO,
+        "SELECT g, name, count(*) FROM t WHERE x IS NOT NULL GROUP BY g",
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_mode_refuses_the_unreproducible_arbitrary_edges() {
+    // These are the cases mpedb CANNOT reproduce as sqlite's exact value, so it
+    // refuses (never a wrong answer) even though sqlite accepts them:
+    let (db, path) = open("arb-refuse", Some("sqlite"));
+    load(&db, DATA);
+    for q in [
+        // Two-or-more min/max: sqlite follows the LAST min/max — an order-
+        // dependent pick its own docs call "arbitrary" (verified: `min(x), max(x)`
+        // and `max(x), min(x)` give DIFFERENT bare rows). Refused.
+        "SELECT name, min(x), max(x) FROM t GROUP BY g",
+        "SELECT name, max(x), max(x + 1) FROM t GROUP BY g",
+        // Over a JOIN there is no single rowid to pick by (the row is
+        // `[outer ‖ inner]`), so the arbitrary case stays refused.
+        "SELECT t.name, count(*) FROM t JOIN u ON t.g = u.gid GROUP BY t.g",
+    ] {
+        let err = db.query(q, &[]).unwrap_err().to_string();
+        assert!(
+            err.contains("must appear in GROUP BY"),
+            "sqlite mode should refuse `{q}`, got: {err}"
+        );
+    }
+    // Over a NON-rowid (text) primary key, mpedb's min-PK is not sqlite's rowid,
+    // so the arbitrary case is refused there too — but a single min/max still
+    // works (its witness rule does not depend on the PK being the rowid).
+    for q in [
+        "SELECT g, v FROM tk GROUP BY g",
+        "SELECT g, v, count(*) FROM tk GROUP BY g",
+    ] {
+        let err = db.query(q, &[]).unwrap_err().to_string();
+        assert!(
+            err.contains("must appear in GROUP BY"),
+            "non-rowid PK arbitrary bare column should be refused `{q}`, got: {err}"
+        );
+    }
+    assert!(
+        db.query("SELECT g, v, min(v) FROM tk GROUP BY g", &[]).is_ok(),
+        "a single min/max over a non-rowid PK is still accepted (witness rule)"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+// ---------------------------------------------------------------------------
+// (c) postgres mode: EVERY bare column is rejected (matching PostgreSQL).
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -294,6 +451,8 @@ fn postgres_mode_rejects_every_bare_column() {
         "SELECT g, COALESCE(-24, x) FROM t GROUP BY g",
         "SELECT g, name, max(x) FROM t GROUP BY g",
         "SELECT g, name, min(x) FROM t GROUP BY g",
+        "SELECT g, name, count(*) FROM t GROUP BY g",
+        "SELECT g, name, sum(x) FROM t GROUP BY g",
         "SELECT name, max(x) FROM t",
         "SELECT g, x FROM t GROUP BY g",
     ] {
@@ -301,34 +460,6 @@ fn postgres_mode_rejects_every_bare_column() {
         assert!(
             err.contains("must appear in GROUP BY"),
             "postgres mode should reject `{q}`, got: {err}"
-        );
-    }
-    let _ = std::fs::remove_file(path);
-}
-
-// ---------------------------------------------------------------------------
-// (c) genuinely-arbitrary bare column: refused in sqlite mode too (never wrong).
-// ---------------------------------------------------------------------------
-
-#[test]
-fn sqlite_mode_refuses_genuinely_arbitrary_bare_column() {
-    let (db, path) = open("arbitrary", Some("sqlite"));
-    load(&db, DATA);
-    // sqlite ACCEPTS all of these (returning an arbitrary row); mpedb refuses
-    // rather than risk a value that differs from sqlite.
-    for q in [
-        // bare + a non-min/max aggregate
-        "SELECT name, count(*) FROM t GROUP BY g",
-        "SELECT name, sum(x) FROM t GROUP BY g",
-        // bare + BOTH min and max (two aggregates)
-        "SELECT name, min(x), max(x) FROM t GROUP BY g",
-        // bare with no aggregate at all
-        "SELECT g, x FROM t GROUP BY g",
-    ] {
-        let err = db.query(q, &[]).unwrap_err().to_string();
-        assert!(
-            err.contains("must appear in GROUP BY"),
-            "sqlite mode should refuse arbitrary bare column in `{q}`, got: {err}"
         );
     }
     let _ = std::fs::remove_file(path);
