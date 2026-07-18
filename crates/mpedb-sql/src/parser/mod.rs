@@ -83,6 +83,26 @@ pub(crate) const MAX_SET_ITEMS: usize = 1024;
 /// `EXPLAIN`, and the number of parameters ($n gives max n; `?` are numbered
 /// left-to-right in statement order).
 pub(crate) fn parse_statement(sql: &str) -> Result<(Stmt, bool, u16)> {
+    let (stmt, is_explain, n_params, ctes) = parse_statement_ctes(sql)?;
+    if !ctes.is_empty() {
+        return Err(Error::Bind(
+            "WITH (common table expressions) is only handled by the top-level \
+             compile path, not here"
+                .into(),
+        ));
+    }
+    Ok((stmt, is_explain, n_params))
+}
+
+/// `WITH` CTE definitions: each `(name, body-source-text)`, re-parsed and
+/// flattened like a view at reference time (#CTE).
+pub(crate) type CteDefs = Vec<(String, String)>;
+
+/// Like [`parse_statement`] but also returns any leading `WITH` CTE definitions
+/// as `(name, body-source-text)` pairs (#CTE). The caller folds them into the
+/// view catalog so `crate::view::inline_views` flattens a `FROM cte` reference
+/// exactly as it flattens a view — no planner/plan-bytes/executor change.
+pub(crate) fn parse_statement_ctes(sql: &str) -> Result<(Stmt, bool, u16, CteDefs)> {
     let toks = tokenize(sql)?;
     let mut p = Parser::new(sql, toks);
     let is_explain = if p.eat_kw(Kw::Explain) {
@@ -93,11 +113,12 @@ pub(crate) fn parse_statement(sql: &str) -> Result<(Stmt, bool, u16)> {
     } else {
         false
     };
+    let ctes = p.with_prefix()?;
     let stmt = p.statement()?;
     p.eat(&Tok::Semicolon);
     p.expect_eof()?;
     let n_params = p.n_params()?;
-    Ok((stmt, is_explain, n_params))
+    Ok((stmt, is_explain, n_params, ctes))
 }
 
 /// Parse exactly one expression (used for CHECK constraints). Returns the
@@ -321,6 +342,43 @@ impl<'a> Parser<'a> {
     }
 
     // ---- statements ---------------------------------------------------
+
+    /// Parse an optional leading `WITH [RECURSIVE] name AS ( body ) [, …]`
+    /// prefix (#CTE), returning each CTE as `(name, body-source-text)`. `WITH`
+    /// and `RECURSIVE` are positional words (not keywords), so a table/column
+    /// named `with` is unaffected. Each body is captured verbatim between its
+    /// parentheses — re-parsed and flattened like a view at reference time — so
+    /// the body's own `$n`/`?` params never touch the outer parameter counter.
+    fn with_prefix(&mut self) -> Result<CteDefs> {
+        if !self.eat_word("WITH") {
+            return Ok(Vec::new());
+        }
+        if self.eat_word("RECURSIVE") {
+            return Err(self.err_here("WITH RECURSIVE is not supported yet"));
+        }
+        let mut ctes = Vec::new();
+        loop {
+            let name = self.ident("a CTE name after WITH")?;
+            // `WITH c(x, y) AS …` needs positional column remapping — the exact
+            // thing the flattener avoids — so it is refused, like a view with an
+            // explicit column list.
+            if self.peek() == Some(&Tok::LParen) {
+                return Err(self.err_here(
+                    "WITH with an explicit column list is not supported yet",
+                ));
+            }
+            self.expect_kw(Kw::As, "AS after the CTE name")?;
+            let body = self.capture_paren_source()?;
+            ctes.push((name, body));
+            if ctes.len() > 32 {
+                return Err(self.err_here("too many CTEs in one WITH (max 32)"));
+            }
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        Ok(ctes)
+    }
 
     fn statement(&mut self) -> Result<Stmt> {
         match self.peek() {
