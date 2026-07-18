@@ -526,8 +526,8 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
         ScalarFn::Degrees => float_or_null(num(&args[0])?.to_degrees()),
         ScalarFn::Pi => Value::Float(std::f64::consts::PI),
         // mod(x, y) = x - y*trunc(x/y), which is exactly Rust's `%` on floats
-        // (C fmod). A zero divisor gives NaN → NULL (sqlite), NOT the `%`
-        // operator's DivisionByZero error.
+        // (C fmod). A zero divisor gives NaN → NULL — the same NULL the `%`
+        // operator yields on a zero divisor (sqlite semantics).
         ScalarFn::Mod => float_or_null(num(&args[0])? % num(&args[1])?),
         // Handled ahead of the null gate above; unreachable here.
         ScalarFn::Typeof => unreachable!("typeof is dispatched before the null gate"),
