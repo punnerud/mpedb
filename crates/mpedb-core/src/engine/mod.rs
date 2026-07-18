@@ -96,7 +96,7 @@ use mpedb_types::{
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasherDefault, Hasher};
-use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -155,6 +155,62 @@ fn spawn_flusher(shm: Arc<Shm>) -> Flusher {
         })
         .expect("spawn mpedb wal flusher");
     Flusher { stop, handle }
+}
+
+/// Deterministic per-statement-execution "work-row" meter (#74,
+/// design/DESIGN-RUNTIME-BUDGET.md). Both txn kinds own one, seeded from
+/// [`Engine::work_budget`]; the scan/cursor layer and the SQL executor charge
+/// the SAME meter. `budget == 0` is the unlimited sentinel.
+///
+/// The counter is a running sum incremented once per row a scan yields (and per
+/// nested-loop-join candidate / correlated-subquery re-evaluation in the exec
+/// layer). Data-driven and never time/random: the same query over the same data
+/// trips at the same `used` on every machine.
+pub struct WorkMeter {
+    budget: u64,
+    used: AtomicU64,
+}
+
+impl WorkMeter {
+    pub fn new(budget: u64) -> WorkMeter {
+        WorkMeter { budget, used: AtomicU64::new(0) }
+    }
+
+    /// Charge `n` work-rows and return [`Error::RuntimeBudget`] once the running
+    /// total crosses the budget. `which` is called ONLY on the error path, so a
+    /// coarse attribution label costs nothing on the hot path. Relaxed ordering:
+    /// a transaction's cursors and its executor run on one thread — there is no
+    /// cross-thread ordering to establish, only the sum.
+    #[inline]
+    pub fn charge(&self, n: u64, which: impl FnOnce() -> String) -> Result<()> {
+        let used = self
+            .used
+            .fetch_add(n, AtomicOrdering::Relaxed)
+            .saturating_add(n);
+        if self.budget != 0 && used > self.budget {
+            return Err(Error::RuntimeBudget { limit: self.budget, used, which: which() });
+        }
+        Ok(())
+    }
+
+    /// Work-rows charged so far this execution.
+    pub fn used(&self) -> u64 {
+        self.used.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The configured budget (`0` = unlimited).
+    pub fn budget(&self) -> u64 {
+        self.budget
+    }
+}
+
+/// The `which` attribution for a scan of `table_id` (#74). Built lazily, only
+/// when the budget trips, so it costs nothing on the hot path.
+pub(super) fn scan_label(schema: &Schema, table_id: u32) -> String {
+    match schema.table(table_id) {
+        Some(t) => format!("scan of table \"{}\"", t.name),
+        None => format!("scan of table #{table_id}"),
+    }
 }
 
 const CAT_SCHEMA_KEY: &[u8] = &[0x00];
@@ -368,6 +424,9 @@ pub struct Engine {
     /// overflow chain (DESIGN-BLOBEXTENT §8). `None` = disabled — today's
     /// behavior byte for byte, and the A/B's control arm.
     extent_threshold: Option<usize>,
+    /// Per-statement-execution work-row budget (#74), copied into each txn's
+    /// [`WorkMeter`] at begin. `0` = unlimited.
+    work_budget: u64,
 }
 
 impl Drop for Engine {
@@ -414,6 +473,7 @@ impl Engine {
             concurrency: config.options.concurrency,
             flusher,
             extent_threshold: None,
+            work_budget: config.options.max_work_rows,
         };
         engine.bootstrap_catalog()?;
         // #47 stage 1: the FILE is authoritative for the schema. The config
@@ -560,7 +620,17 @@ impl Engine {
             concurrency: Concurrency::Serial,
             flusher: None, // read-only tooling handle; async needs a config
             extent_threshold: None,
+            // Tooling handle (no config): the budget is unlimited (a `dump`/
+            // verify pass legitimately scans whole tables).
+            work_budget: 0,
         })
+    }
+
+    /// The per-statement-execution work-row budget (#74) this engine was opened
+    /// with (`0` = unlimited). The facade reads it to relate a prepare-time risk
+    /// estimate to the runtime cap.
+    pub fn work_budget(&self) -> u64 {
+        self.work_budget
     }
 
     /// The write-path concurrency discipline this engine was opened with
@@ -838,6 +908,7 @@ impl Engine {
             word,
             meta,
             released: false,
+            work: WorkMeter::new(self.work_budget),
         })
     }
 
@@ -911,6 +982,7 @@ impl Engine {
             capture_enabled: true,
             capture_cfg: None,
             reserved_alloc: false,
+            work: WorkMeter::new(self.work_budget),
         })
     }
 
