@@ -63,16 +63,19 @@ directly, and `mpedb::SqliteAttach` runs read-only mpedb SQL over one with
 **zero import**. The full design survived a 20-finding adversarial review in
 [`design/DESIGN-SQLITE-BACKED.md`](design/DESIGN-SQLITE-BACKED.md).
 
-**What it is not: a drop-in sqlite3.** Be clear-eyed about this before you plan
-around it. mpedb's SQL is a real subset that keeps growing — aggregates,
-`GROUP BY`/`HAVING`, `DISTINCT`, N-way `INNER JOIN` chains with aliases and
-self-joins, every join kind (`LEFT`/`RIGHT`/`FULL`/`CROSS`),
-`UNION`/`EXCEPT`/`INTERSECT`, scalar and `EXISTS` subqueries (correlated
-included), secondary indexes the planner actually uses, and live multi-process
-DDL (`CREATE`/`DROP TABLE`, `ALTER … RENAME`/`ADD COLUMN`) are in — but it is
-still a subset (no triggers or views), so a Django test suite will not run
-against it. Today mpedb is a validation and staging tool in that workflow, not
-the thing your ORM talks to. See [SQL support](#sql-support) for the exact
+**How close to drop-in sqlite3?** Close, and closing — but measure before you
+plan around it. The SQL surface now covers aggregates, `GROUP BY`/`HAVING`,
+`DISTINCT`, every join kind (`INNER`/`LEFT`/`RIGHT`/`FULL`/`CROSS`, aliases,
+self-joins, N-way chains), `UNION`/`EXCEPT`/`INTERSECT`, scalar/`EXISTS`/nested
+and correlated subqueries, CTEs, views, triggers, window functions (`OVER`),
+`LIKE`/`GLOB`/`REGEXP`, the scalar and math functions, secondary and composite
+indexes the planner actually uses, and live multi-process DDL. What is still
+missing is a short list of edge features — full-text search (`MATCH`/FTS5),
+`SAVEPOINT`, `ATTACH`, `COLLATE`, `printf`, user-defined functions — each
+tracked on the P-list and each a clean error today, never a wrong answer. And
+on one axis mpedb goes *past* sqlite: its own `.mpedb` WAL gives PostgreSQL-style
+**concurrent multi-process writes** (MVCC snapshots, lock-free readers) where
+sqlite serializes every writer. See [SQL support](#sql-support) for the exact
 surface, measured against the binary.
 
 This cuts both ways, and honestly so: hardening mpedb against real sqlite3

@@ -100,7 +100,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | LIKE | ✅ | no ESCAPE clause |
 | GLOB / NOT GLOB | ✅ | sqlite semantics: case-SENSITIVE, `*` (any run) and `?` (one char) wildcards, `[...]` character classes (incl. `[^...]` and ranges); pattern must be a literal, as with LIKE |
 | REGEXP / NOT REGEXP | ✅ | sqlite's bundled `ext/misc/regexp.c` dialect: case-SENSITIVE, unanchored substring match with `.` (any char, incl. newline), `*` `+` `?`, counts `{p}`/`{p,}`/`{p,q}`, classes `[...]`/`[^...]` with ranges, anchors `^`/`$`, `\|` alternation, `(...)` grouping, the Perl escapes `\d \D \w \W \s \S`, word-boundary `\b`, the C escapes `\a \f \n \r \t \v`, `\uXXXX`/`\xXX` and `\`-before-a-metacharacter; pattern must be a literal, as with LIKE/GLOB. Hand-rolled Thompson NFA (no backtracking, no regex crate). Deviation: a MALFORMED pattern (one sqlite rejects with a runtime error — unmatched `(`/`{`, unterminated `[`, unknown escape, `{m,n}` with n<m or both zero, a quantifier with no operand) matches NOTHING here (`REGEXP` → FALSE, `NOT REGEXP` → TRUE) rather than raising — mpedb never errors on a REGEXP pattern |
-| MATCH | ❌ | sqlite-equivalent: the CLI's `MATCH` needs an FTS virtual table, which the bare `sqlite3` shell also lacks, so there is no built-in `MATCH` to be compatible with |
+| MATCH | ❌ (designed, #76) | sqlite's default build **does** ship FTS5, so `MATCH` is real there — but only against an FTS virtual table; `MATCH` on a plain column errors identically in sqlite (*unable to use function MATCH in the requested context*), which mpedb reproduces. Native full-text search — `TableKind::Fts`, unicode61 tokenizer, the FTS5 query grammar, bm25 `rank`, an inverted index on the COW B+tree (→ MVCC/crash-safety for free) — is designed in [design/DESIGN-FTS.md](design/DESIGN-FTS.md). Until it lands, `MATCH` is a clean error, never a wrong answer |
 | BETWEEN / NOT BETWEEN | ✅ | |
 | IN / NOT IN (value list) | ✅ | also `x IN (SELECT …)` and the sqlite shorthand `x IN <table>` (single-column). The empty set `x IN ()` is accepted (sqlite allows it) and is FALSE for every probe, `NOT IN ()` TRUE; `NULL IN (empty)` is FALSE (3VL), matching sqlite |
 | IS NULL / IS NOT NULL | ✅ | |
@@ -183,7 +183,7 @@ map as follows:
 | sqlite3_backup | **Not needed** | the database is one file; copy it (plus `-wal` if present) |
 | busy_timeout / busy_handler | **Not needed** | writers queue on a robust cross-process lock with an intent ring for group commit; a SIGKILLed owner is recovered, not waited out |
 | user-defined functions | ❌ | planned as the PySpell layer (compiled, typed IR — not callbacks) |
-| loadable extensions / virtual tables | ❌ | |
+| loadable extensions / virtual tables | ❌ | no extension ABI (deliberate — mpedb is rigid and in-process). FTS5 specifically is planned as a native table kind, not a plugin ([design/DESIGN-FTS.md](design/DESIGN-FTS.md), #76) |
 
 ## Journaling and durability
 
