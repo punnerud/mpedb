@@ -762,7 +762,12 @@ pub struct FtsTerm {
 /// Self-imposed ceiling on the depth of a compiled FTS query tree, so a corrupt
 /// plan cannot make the recursive decoder overflow the stack. Far above any
 /// hand-written `MATCH` string.
-pub(crate) const MAX_FTS_DEPTH: usize = 64;
+// Caps the TOTAL node count of an FTS query tree (the decoder spends one budget
+// unit per node; the planner enforces the same total at bind — see
+// `planner::fts::fts_node_count` — so a bind-accepted query always round-trips
+// through decode in another process). Also bounds parser/decoder recursion depth
+// (<= node count), kept modest so a left-leaning chain cannot overflow the stack.
+pub(crate) const MAX_FTS_DEPTH: usize = 512;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Projection {

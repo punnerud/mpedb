@@ -317,6 +317,14 @@ impl Doclist {
                         "doclist positions not strictly ascending".into(),
                     ));
                 }
+                // A delta between two u32 positions is itself <= u32::MAX. Reject
+                // a larger one BEFORE the arithmetic: otherwise `d as i64` can wrap
+                // negative (bypassing the `cur > u32::MAX` guard, a silent bad
+                // decode in release) and `prev_pos + d as i64` can overflow (a
+                // panic in checked builds — corrupt input must yield Corrupt).
+                if d > u32::MAX as u64 {
+                    return Err(Error::Corrupt("doclist position delta exceeds u32".into()));
+                }
                 let cur = if prev_pos < 0 { d as i64 } else { prev_pos + d as i64 };
                 if cur > u32::MAX as i64 {
                     return Err(Error::Corrupt("doclist position exceeds u32".into()));
@@ -387,6 +395,37 @@ mod tests {
         // 'é' is a high byte: kept verbatim, ASCII case folded → "café".
         assert_eq!(toks("Café"), vec!["café"]);
         assert_eq!(toks("foo_bar.baz"), vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn doclist_rejects_oversized_position_delta() {
+        // n=1 doc; zigzag docid-delta=1; npos=1; position delta = 2^40 (> u32::MAX).
+        // Must be Corrupt — never a panic (overflowing add in a checked build) and
+        // never a silent wrap-negative that slips past the `cur > u32::MAX` guard.
+        fn uv(mut v: u64, out: &mut Vec<u8>) {
+            loop {
+                let b = (v & 0x7f) as u8;
+                v >>= 7;
+                if v == 0 {
+                    out.push(b);
+                    break;
+                }
+                out.push(b | 0x80);
+            }
+        }
+        let mut buf = Vec::new();
+        uv(1, &mut buf); // 1 doc
+        uv(2, &mut buf); // zigzag(1) docid delta
+        uv(1, &mut buf); // npos = 1
+        uv(1u64 << 40, &mut buf); // position delta 2^40 > u32::MAX
+        assert!(matches!(Doclist::decode(&buf), Err(Error::Corrupt(_))));
+        // And a first-position delta that would wrap negative under `d as i64`.
+        let mut buf2 = Vec::new();
+        uv(1, &mut buf2);
+        uv(2, &mut buf2);
+        uv(1, &mut buf2);
+        uv(1u64 << 63, &mut buf2); // first position 2^63 (was silently -> 0)
+        assert!(matches!(Doclist::decode(&buf2), Err(Error::Corrupt(_))));
     }
 
     #[test]
