@@ -208,7 +208,7 @@ impl Lift<'_> {
             }
             E::Unary(op, a) => E::Unary(*op, Box::new(self.rewrite(a)?)),
             E::IsNull(a, n) => E::IsNull(Box::new(self.rewrite(a)?), *n),
-            E::Cast(a, t) => E::Cast(Box::new(self.rewrite(a)?), *t),
+            E::Cast(a, t) => E::Cast(Box::new(self.rewrite(a)?), t.clone()),
             E::Binary(op, a, b) => E::Binary(
                 *op,
                 Box::new(self.rewrite(a)?),
@@ -581,7 +581,7 @@ impl<'a> Correlate<'a, '_> {
             E::Exists(inner, negated) => E::Exists(Box::new(self.descend(inner)?), *negated),
             E::Unary(op, a) => E::Unary(*op, Box::new(self.rewrite(a)?)),
             E::IsNull(a, n) => E::IsNull(Box::new(self.rewrite(a)?), *n),
-            E::Cast(a, t) => E::Cast(Box::new(self.rewrite(a)?), *t),
+            E::Cast(a, t) => E::Cast(Box::new(self.rewrite(a)?), t.clone()),
             E::Binary(op, a, b) => E::Binary(
                 *op,
                 Box::new(self.rewrite(a)?),

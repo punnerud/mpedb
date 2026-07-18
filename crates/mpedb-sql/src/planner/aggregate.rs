@@ -103,7 +103,7 @@ fn lift_aggs(
             E::Col(format!("__g{pos}"))
         }
         E::Unary(op, a) => E::Unary(*op, Box::new(rec(a, aggs)?)),
-        E::Cast(a, t) => E::Cast(Box::new(rec(a, aggs)?), *t),
+        E::Cast(a, t) => E::Cast(Box::new(rec(a, aggs)?), t.clone()),
         E::IsNull(a, n) => E::IsNull(Box::new(rec(a, aggs)?), *n),
         E::Binary(op, a, b) => {
             E::Binary(*op, Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?))

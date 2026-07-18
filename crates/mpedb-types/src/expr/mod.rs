@@ -8,7 +8,7 @@
 //! the result is exactly TRUE.
 
 use crate::error::{Error, Result};
-use crate::value::{Collation, ColumnType, Value};
+use crate::value::{Affinity, Collation, Value};
 use std::cmp::Ordering;
 
 mod codec;
@@ -66,12 +66,12 @@ pub enum Instr {
     IsDistinct,
     /// Coerce Int -> Float (inserted by the binder for mixed numerics).
     ToFloat,
-    /// `CAST(x AS <type>)` — SQL type conversion (#56). NULL casts to NULL of
-    /// any type; numeric conversions follow sqlite (float→int truncates
-    /// toward zero, which is also what the corpus expects); a conversion that
-    /// would have to INVENT data (text→number) raises instead of
-    /// prefix-parsing the way sqlite does — that is the strictness line.
-    Cast(ColumnType),
+    /// `CAST(x AS <type>)` — sqlite's permissive, affinity-based conversion
+    /// (the type name resolves to one of five [`Affinity`]s in the binder).
+    /// NULL casts to NULL; text→number parses a leading numeric prefix
+    /// (`'12ab'`→12); real→int truncates toward zero; `NUMERIC` yields an int
+    /// when integral else a real. See `cast_value`.
+    Cast(Affinity),
     /// `a || b` — SQL concatenation. NULL propagates; ints and bools render
     /// as text first (sqlite's rule); floats are refused until someone needs
     /// their formatting pinned down.
@@ -567,36 +567,268 @@ fn arith(op: Instr, a: Value, b: Value) -> Result<Value> {
 }
 
 
-/// `CAST` semantics (#56): NULL → NULL of any type; lossy numeric narrowing
-/// follows sqlite (truncate toward zero — Rust's saturating `as`, which also
-/// makes NaN/±inf deterministic); text→number is REFUSED rather than
-/// prefix-parsed. Timestamps and blobs only cast to themselves.
-fn cast_value(v: Value, t: ColumnType) -> Result<Value> {
+/// `CAST` semantics — sqlite's permissive, affinity-based conversion. NULL
+/// casts to NULL for every affinity. The conversions match sqlite 3.45 exactly
+/// (differential-tested in `crates/mpedb/tests/cast_affinity.rs`):
+///
+/// - **Integer**: real truncates toward zero (saturating, so NaN→0, ±inf→i64
+///   min/max); text/blob parse a leading *integer* prefix (`'12ab'`→12,
+///   `'1e3'`→1 — stops at `e`, `'abc'`→0); bool→0/1; timestamp→its micros.
+/// - **Real**: int/bool/timestamp widen to f64; text/blob parse a leading
+///   *float* prefix (`'1e3'`→1000.0, `'abc'`→0.0).
+/// - **Text**: int/bool/timestamp/real render as sqlite text (real via
+///   `%!.15g`); blob is reinterpreted as its bytes — refused only when those
+///   bytes are not valid UTF-8 (mpedb `Text` is a Rust `String`; the one
+///   deviation from sqlite, which keeps raw bytes).
+/// - **Blob**: the value's *text rendering* as bytes (`90`→`x'3930'`), or a
+///   blob unchanged.
+/// - **Numeric**: an already-typed int/real is left as-is (a real stays real
+///   even when integral); text/blob become an int when the whole string is a
+///   pure `i64` or the parsed value is integral with `|v| < 2^51`, else a real
+///   — sqlite's `NUMERIC` affinity.
+fn cast_value(v: Value, aff: Affinity) -> Result<Value> {
     if v.is_null() {
         return Ok(Value::Null);
     }
-    Ok(match (v, t) {
-        (v, ColumnType::Any) => v,
-        (Value::Int(i), ColumnType::Int64) => Value::Int(i),
-        (Value::Float(f), ColumnType::Int64) => Value::Int(f as i64),
-        (Value::Bool(b), ColumnType::Int64) => Value::Int(b as i64),
-        (Value::Int(i), ColumnType::Float64) => Value::Float(i as f64),
-        (Value::Float(f), ColumnType::Float64) => Value::Float(f),
-        (Value::Bool(b), ColumnType::Float64) => Value::Float(b as u8 as f64),
-        (Value::Text(s), ColumnType::Text) => Value::Text(s),
-        (Value::Int(i), ColumnType::Text) => Value::Text(i.to_string()),
-        (Value::Bool(b), ColumnType::Text) => Value::Text((b as i64).to_string()),
-        (Value::Bool(b), ColumnType::Bool) => Value::Bool(b),
-        (Value::Int(i), ColumnType::Bool) => Value::Bool(i != 0),
-        (Value::Blob(b), ColumnType::Blob) => Value::Blob(b),
-        (Value::Timestamp(u), ColumnType::Timestamp) => Value::Timestamp(u),
-        (v, t) => {
-            return Err(Error::TypeMismatch(format!(
-                "CAST from {} to {t} would have to invent data",
-                v.type_name()
-            )))
-        }
+    Ok(match aff {
+        Affinity::Integer => Value::Int(to_integer(&v)),
+        Affinity::Real => Value::Float(to_real(&v)),
+        Affinity::Numeric => to_numeric(v),
+        Affinity::Text => match v {
+            Value::Text(s) => Value::Text(s),
+            Value::Blob(b) => Value::Text(String::from_utf8(b).map_err(|_| {
+                Error::TypeMismatch(
+                    "CAST of a non-UTF-8 BLOB to TEXT is not representable in mpedb".into(),
+                )
+            })?),
+            other => Value::Text(render_scalar_text(&other)),
+        },
+        Affinity::Blob => match v {
+            Value::Blob(b) => Value::Blob(b),
+            Value::Text(s) => Value::Blob(s.into_bytes()),
+            other => Value::Blob(render_scalar_text(&other).into_bytes()),
+        },
     })
+}
+
+/// sqlite whitespace for numeric-prefix skipping: space, tab, LF, FF, CR.
+fn is_sql_space(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | 0x0c | b'\r')
+}
+
+/// A non-blob, non-text scalar rendered to sqlite text (the shared path for
+/// TEXT and BLOB affinity). Reals use `%!.15g`; bools render as their integer.
+fn render_scalar_text(v: &Value) -> String {
+    match v {
+        Value::Int(i) => i.to_string(),
+        Value::Bool(b) => (*b as i64).to_string(),
+        Value::Float(f) => String::from_utf8(printf::float_to_text(*f))
+            .expect("float_to_text is ASCII"),
+        Value::Timestamp(t) => t.to_string(),
+        Value::Text(s) => s.clone(),
+        // Blob is handled by the caller (bytes are copied directly, not via
+        // this text path); a List never reaches CAST.
+        Value::Blob(_) | Value::Null | Value::List(_) => String::new(),
+    }
+}
+
+/// INTEGER-affinity conversion of a non-NULL value.
+fn to_integer(v: &Value) -> i64 {
+    match v {
+        Value::Int(i) => *i,
+        // `f as i64` saturates (NaN→0, ±inf→bounds) and truncates toward zero.
+        Value::Float(f) => *f as i64,
+        Value::Bool(b) => *b as i64,
+        Value::Timestamp(t) => *t,
+        Value::Text(s) => int_prefix(s.as_bytes()),
+        Value::Blob(b) => int_prefix(b),
+        Value::Null | Value::List(_) => 0,
+    }
+}
+
+/// REAL-affinity conversion of a non-NULL value.
+fn to_real(v: &Value) -> f64 {
+    match v {
+        Value::Int(i) => *i as f64,
+        Value::Float(f) => *f,
+        Value::Bool(b) => *b as u8 as f64,
+        Value::Timestamp(t) => *t as f64,
+        Value::Text(s) => float_prefix(s.as_bytes()),
+        Value::Blob(b) => float_prefix(b),
+        Value::Null | Value::List(_) => 0.0,
+    }
+}
+
+/// NUMERIC-affinity conversion of a non-NULL value. Already-numeric values are
+/// left untouched (a real stays real); text/blob are parsed by `bytes_to_numeric`.
+fn to_numeric(v: Value) -> Value {
+    match v {
+        Value::Int(_) | Value::Float(_) => v,
+        Value::Bool(b) => Value::Int(b as i64),
+        Value::Timestamp(t) => Value::Int(t),
+        Value::Text(s) => bytes_to_numeric(s.as_bytes()),
+        Value::Blob(b) => bytes_to_numeric(&b),
+        Value::Null | Value::List(_) => v,
+    }
+}
+
+/// Parse a leading integer prefix (sqlite `sqlite3Atoi64`): optional leading
+/// whitespace, optional sign, then decimal digits, stopping at the first
+/// non-digit. Overflow saturates to the i64 bounds. No digits → 0.
+fn int_prefix(b: &[u8]) -> i64 {
+    let mut i = 0;
+    while i < b.len() && is_sql_space(b[i]) {
+        i += 1;
+    }
+    let neg = match b.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let mut acc: i64 = 0;
+    let mut saw = false;
+    while i < b.len() && b[i].is_ascii_digit() {
+        saw = true;
+        let d = (b[i] - b'0') as i64;
+        acc = match acc.checked_mul(10).and_then(|a| a.checked_add(d)) {
+            Some(a) => a,
+            None => return if neg { i64::MIN } else { i64::MAX },
+        };
+        i += 1;
+    }
+    if !saw {
+        return 0;
+    }
+    if neg {
+        acc.checked_neg().unwrap_or(i64::MIN)
+    } else {
+        acc
+    }
+}
+
+/// The end index of the leading float token (sqlite `sqlite3AtoF` grammar):
+/// `[ws][sign]digits[.digits][(e|E)[sign]digits]`, also accepting `.5`. Returns
+/// `(numeric_start, numeric_end, saw_digit)` — the slice `b[start..end]` is
+/// ASCII and parseable by Rust's `f64::from_str`.
+fn float_token(b: &[u8]) -> (usize, usize, bool) {
+    let mut i = 0;
+    while i < b.len() && is_sql_space(b[i]) {
+        i += 1;
+    }
+    let start = i;
+    if matches!(b.get(i), Some(b'+') | Some(b'-')) {
+        i += 1;
+    }
+    let mut saw = false;
+    while i < b.len() && b[i].is_ascii_digit() {
+        saw = true;
+        i += 1;
+    }
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            saw = true;
+            i += 1;
+        }
+    }
+    // An exponent only counts when the mantissa had a digit AND the exponent
+    // itself has one (`'1e'` parses as `1`, not `1e<nothing>`).
+    if saw && matches!(b.get(i), Some(b'e') | Some(b'E')) {
+        let mut j = i + 1;
+        if matches!(b.get(j), Some(b'+') | Some(b'-')) {
+            j += 1;
+        }
+        if matches!(b.get(j), Some(d) if d.is_ascii_digit()) {
+            j += 1;
+            while j < b.len() && b[j].is_ascii_digit() {
+                j += 1;
+            }
+            i = j;
+        }
+    }
+    (start, i, saw)
+}
+
+/// Parse a leading float prefix; no numeric prefix → 0.0.
+fn float_prefix(b: &[u8]) -> f64 {
+    let (start, end, saw) = float_token(b);
+    if !saw {
+        return 0.0;
+    }
+    // The token is pure ASCII by construction.
+    std::str::from_utf8(&b[start..end])
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .unwrap_or(0.0)
+}
+
+/// sqlite's NUMERIC parse of text/blob bytes: an integer when the whole
+/// (trimmed) string is a pure `i64`, OR when the parsed float is integral and
+/// `|v| < 2^51` (sqlite's `sqlite3RealSameAsInt` bound); else a real.
+fn bytes_to_numeric(b: &[u8]) -> Value {
+    if let Some(i) = full_i64(b) {
+        return Value::Int(i);
+    }
+    let r = float_prefix(b);
+    let i = r as i64; // saturating
+    const LIM: i64 = 1 << 51;
+    if i as f64 == r && i > -LIM && i < LIM {
+        Value::Int(i)
+    } else {
+        Value::Float(r)
+    }
+}
+
+/// `Some(i)` iff the whole string (ignoring leading/trailing whitespace) is a
+/// valid `i64` integer literal — sqlite's `sqlite3Atoi64` returning 0. Any
+/// non-whitespace trailing byte, `.`/`e`, or overflow → `None`.
+fn full_i64(b: &[u8]) -> Option<i64> {
+    let mut i = 0;
+    while i < b.len() && is_sql_space(b[i]) {
+        i += 1;
+    }
+    let neg = match b.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let digit_start = i;
+    // Accumulate the magnitude in u64, as sqlite's `sqlite3Atoi64` does, so the
+    // i64::MIN magnitude (2^63, one past i64::MAX) still parses as an integer.
+    let mut acc: u64 = 0;
+    while i < b.len() && b[i].is_ascii_digit() {
+        let d = (b[i] - b'0') as u64;
+        acc = acc.checked_mul(10).and_then(|a| a.checked_add(d))?;
+        i += 1;
+    }
+    if i == digit_start {
+        return None; // no digits
+    }
+    let mut j = i;
+    while j < b.len() && is_sql_space(b[j]) {
+        j += 1;
+    }
+    if j != b.len() {
+        return None; // trailing non-whitespace (incl. '.'/'e')
+    }
+    if neg {
+        // Magnitude fits iff acc <= 2^63; acc == 2^63 negates to i64::MIN.
+        (acc <= (1u64 << 63)).then(|| acc.wrapping_neg() as i64)
+    } else {
+        (acc <= i64::MAX as u64).then_some(acc as i64)
+    }
 }
 
 /// `||` semantics: NULL propagates; ints and bools render as text (sqlite's

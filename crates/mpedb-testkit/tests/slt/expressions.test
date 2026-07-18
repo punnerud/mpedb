@@ -199,7 +199,7 @@ SELECT id FROM t WHERE a + 1
 statement error parse error
 SELECT id FROM t WHERE 1 < a < 10
 
-# ---- CAST (#56): NULL-safe, truncating, and strict ------------------------------------
+# ---- CAST: NULL-safe, truncating, sqlite affinity-based -------------------------------
 
 # NULL casts to NULL of any type — the corpus' favourite CAST.
 query I nosort
@@ -234,9 +234,25 @@ SELECT CAST(a AS TEXT) FROM t WHERE id = 1
 ----
 5
 
-# The strictness line: text never parses into a number (sqlite would).
-statement error would have to invent data
-SELECT CAST('12' AS INTEGER) FROM t
+# sqlite affinity: any type name is accepted and text parses its leading
+# numeric prefix. `'12ab'` -> 12 (INTEGER stops at the first non-digit).
+query I nosort
+SELECT CAST('12ab' AS INTEGER) FROM t WHERE id = 1
+----
+12
+
+# An unknown target name resolves by sqlite's substring rule: SIGNED/DECIMAL
+# -> NUMERIC affinity, which is INTEGER when the value is integral.
+query I nosort
+SELECT CAST(a AS SIGNED) FROM t WHERE id = 1
+----
+5
+
+# VARCHAR(n) -> TEXT affinity; the size is ignored. Real renders via %!.15g.
+query T nosort
+SELECT CAST(f AS VARCHAR(10)) FROM t WHERE id = 1
+----
+2.25
 
 # ---- || concatenation (#56) ------------------------------------------------------------
 
