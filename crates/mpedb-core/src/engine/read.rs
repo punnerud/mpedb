@@ -11,6 +11,9 @@ pub struct ReadTxn<'e> {
     pub(super) word: u64,
     pub meta: MetaSnapshot,
     pub(super) released: bool,
+    /// Deterministic per-execution work-row meter (#74). Scans charge it here;
+    /// the SQL executor charges the same meter via [`ReadTxn::charge_work`].
+    pub(super) work: WorkMeter,
 }
 
 impl PageStore for ReadTxn<'_> {
@@ -39,6 +42,24 @@ impl ReadTxn<'_> {
     /// Confirm the snapshot is still protected (long scans call this).
     pub fn still_pinned(&self) -> bool {
         self.eng.shm.slot_still_owned(self.slot, self.word)
+    }
+
+    /// Charge `n` work-rows against this execution's budget (#74) and return
+    /// [`Error::RuntimeBudget`] once it is exceeded. Exposed so the SQL executor
+    /// can charge the SAME meter its scans do (correlated-subquery /
+    /// nested-loop-join loops). `which` is evaluated only on the error path.
+    pub fn charge_work(&self, n: u64, which: impl FnOnce() -> String) -> Result<()> {
+        self.work.charge(n, which)
+    }
+
+    /// Work-rows charged so far this execution (#74).
+    pub fn work_used(&self) -> u64 {
+        self.work.used()
+    }
+
+    /// The configured work-row budget (`0` = unlimited, #74).
+    pub fn work_budget(&self) -> u64 {
+        self.work.budget()
     }
 
     pub fn finish(mut self) -> Result<()> {
@@ -186,6 +207,7 @@ impl ReadTxn<'_> {
             if !k.starts_with(&prefix) {
                 break; // past every (value, *) entry
             }
+            self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
             match btree::get(self, root, &pk_bytes)? {
                 Some(bytes) => out.push(row::decode_row(&bytes, types)?),
                 None => {
@@ -214,6 +236,7 @@ impl ReadTxn<'_> {
         let mut out = Vec::new();
         let mut c = btree::cursor(self, iroot, lo, hi)?;
         while let Some((_k, pk_bytes)) = c.next(self)? {
+            self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
             match btree::get(self, root, &pk_bytes)? {
                 Some(bytes) => out.push(row::decode_row(&bytes, types)?),
                 None => {
@@ -344,10 +367,16 @@ impl RowCursor<'_, '_> {
         }
         match self.cursor.next(self.txn)? {
             None => Ok(None),
-            Some((_k, v)) => Ok(Some(row::decode_row(
-                &v,
-                &self.txn.bundle.col_types[self.table_id as usize],
-            )?)),
+            Some((_k, v)) => {
+                // #74: one work-row per row this scan yields. Charged AFTER the
+                // cursor produced a row, so an empty/exhausted scan costs nothing.
+                self.txn
+                    .charge_work(1, || scan_label(&self.txn.bundle.schema, self.table_id))?;
+                Ok(Some(row::decode_row(
+                    &v,
+                    &self.txn.bundle.col_types[self.table_id as usize],
+                )?))
+            }
         }
     }
 }

@@ -120,6 +120,21 @@ pub(crate) trait TxnCtx {
     fn insert_row(&mut self, table: u32, values: &[Value]) -> Result<()>;
     fn update_by_pk(&mut self, table: u32, new_values: &[Value]) -> Result<bool>;
     fn delete_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<bool>;
+    /// Charge `n` work-rows against this execution's deterministic budget (#74)
+    /// and surface [`Error::RuntimeBudget`] once it is exceeded. Routes to the
+    /// SAME [`mpedb_core::WorkMeter`] the engine's scans charge, so the
+    /// exec-layer bumps (nested-loop join, correlated subquery) and the scan
+    /// bumps share one running count. `which` builds the attribution lazily —
+    /// evaluated only on the abort path. Object-safe: `&dyn Fn`, not a generic.
+    ///
+    /// The default is a no-op: the sqlite-backed contexts (`SqliteCtx`,
+    /// `MergeCtx`) are a different storage engine with no mpedb `WorkMeter`, so
+    /// the #74 budget applies only to the native engine paths that override this
+    /// (`ReadCtx`, `WriteTxn`).
+    fn charge_work(&self, n: u64, which: &dyn Fn() -> String) -> Result<()> {
+        let _ = (n, which);
+        Ok(())
+    }
 }
 
 impl TxnCtx for WriteTxn<'_> {
@@ -167,6 +182,9 @@ impl TxnCtx for WriteTxn<'_> {
     }
     fn delete_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<bool> {
         WriteTxn::delete_by_pk(self, table, pk)
+    }
+    fn charge_work(&self, n: u64, which: &dyn Fn() -> String) -> Result<()> {
+        WriteTxn::charge_work(self, n, which)
     }
 }
 
@@ -293,6 +311,9 @@ impl TxnCtx for ReadCtx<'_, '_> {
     fn delete_by_pk(&mut self, _table: u32, _pk: &[Value]) -> Result<bool> {
         Err(read_txn_write_bug())
     }
+    fn charge_work(&self, n: u64, which: &dyn Fn() -> String) -> Result<()> {
+        self.0.charge_work(n, which)
+    }
 }
 
 /// A row wrapped with its `ORDER BY` spec so a [`BinaryHeap`] (max-heap)
@@ -326,6 +347,15 @@ impl Eq for Ranked<'_> {}
 
 fn read_txn_write_bug() -> Error {
     Error::Internal("DML plan routed to a read transaction".into())
+}
+
+/// The `which` attribution (#74) for a table `id` in one of the exec-layer
+/// budget bumps. Built lazily, only on the abort path.
+fn table_name(schema: &Schema, id: u32) -> String {
+    schema
+        .table(id)
+        .map(|t| t.name.clone())
+        .unwrap_or_else(|| format!("table #{id}"))
 }
 
 fn internal(msg: &str) -> Error {
@@ -1095,8 +1125,20 @@ fn correlated_survivors(
     let mut memo: Vec<std::collections::HashMap<Vec<u8>, Value>> =
         vec![std::collections::HashMap::new(); correlated.len()];
     let use_memo = std::env::var_os("MPEDB_NO_SUBPLAN_MEMO").is_none();
+    // #74: attribute this driver to the (first) correlated subquery's inner
+    // table. The inner subplan's own scans additionally charge through the scan
+    // layer, so an N-outer × M-inner correlated bomb is counted as ~N·M.
+    let corr_table = correlated.first().map(|(_, s)| s.plan.table);
     let mut out = Vec::new();
     for row in rows {
+        // One work-row per outer row this correlated subquery re-evaluates over.
+        // Charged BEFORE the memo lookup, so the count is memo- (and
+        // `MPEDB_NO_SUBPLAN_MEMO`-) independent and therefore deterministic.
+        if let Some(t) = corr_table {
+            ctx.charge_work(1, &|| {
+                format!("correlated subquery over \"{}\"", table_name(schema, t))
+            })?;
+        }
         for (ci, &(i, sub)) in correlated.iter().enumerate() {
             let mut key_vals = Vec::with_capacity(sub.outer_args.len());
             for &a in &sub.outer_args {
