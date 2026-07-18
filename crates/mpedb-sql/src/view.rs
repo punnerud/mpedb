@@ -26,12 +26,12 @@ fn bind_err(msg: impl Into<String>) -> Error {
     Error::Bind(msg.into())
 }
 
-/// Rewrite every view reference in `stmt` into its base table. No-op when the
-/// catalog is empty or the statement names no view.
+/// Rewrite every view reference in `stmt` into its base table, and flatten any
+/// derived table `FROM (SELECT …)` (#74) onto its base. The walk always runs —
+/// a derived table must be flattened even with an empty view catalog, or the
+/// planner would silently ignore it — but it is a cheap no-op when the statement
+/// names no view and carries no derived table.
 pub fn inline_views(stmt: &mut Stmt, views: &ViewCatalog) -> Result<()> {
-    if views.is_empty() {
-        return Ok(());
-    }
     match stmt {
         Stmt::Select(s) => flatten_select(s, views, 0),
         Stmt::Compound(c) => {
@@ -89,6 +89,14 @@ fn flatten_select(s: &mut SelectStmt, views: &ViewCatalog, depth: usize) -> Resu
         flatten_expr(e, views, depth)?;
     }
 
+    // Derived table `FROM (SELECT …) t` (#74): splice its simple body onto the
+    // base table BEFORE the view splice below, so a base uncovered here is a
+    // real table (any view inside the body was already resolved by the recursive
+    // flatten). Runs only when the parser produced a `from_derived`.
+    if s.from_derived.is_some() {
+        flatten_derived(s, views, depth)?;
+    }
+
     // The main FROM: if it is a view, splice its body in.
     let Some(tname) = s.table.clone() else {
         return Ok(());
@@ -122,6 +130,107 @@ fn flatten_select(s: &mut SelectStmt, views: &ViewCatalog, depth: usize) -> Resu
         s.items = vsel.items.take();
     }
     Ok(())
+}
+
+/// Splice a derived table `FROM (SELECT …) t` onto its base (#74, Stage B).
+///
+/// A derived table is a view whose body is written inline and whose alias is
+/// intrinsic — `t` is how the outer query addresses the body's columns. So,
+/// unlike a stored view (which V1 refuses to alias), the alias is KEPT: the
+/// base is read `FROM base AS t`, which makes every outer `t.col` resolve to a
+/// base column. Only the same simple projection/filter body a view allows is
+/// flattenable; the body's own references are remapped to the single alias `t`
+/// so the collapsed query reads under one name.
+fn flatten_derived(s: &mut SelectStmt, views: &ViewCatalog, depth: usize) -> Result<()> {
+    if depth > MAX_VIEW_DEPTH {
+        return Err(bind_err("derived-table nesting too deep"));
+    }
+    let mut body = s.from_derived.take().expect("caller checked from_derived is Some");
+    // A derived table must be named: its alias is how the outer query addresses
+    // the exposed columns (PostgreSQL requires it; sqlite usually carries it).
+    let Some(dalias) = s.alias.clone() else {
+        return Err(bind_err(
+            "a derived table `FROM (SELECT …)` must have an alias",
+        ));
+    };
+    // The body itself may reference a view or a nested derived table.
+    flatten_select(&mut body, views, depth + 1)?;
+    check_simple(&body, &dalias)?;
+
+    // The body exposes its columns under its own source name — its inner alias
+    // if it has one, else its base table name. Rename that to the derived alias
+    // so the body's WHERE reads under the same `t` the outer query uses.
+    let from_name = body
+        .alias
+        .clone()
+        .or_else(|| body.table.clone())
+        .expect("check_simple guarantees a FROM table");
+    let mut body_where = body.where_clause.take();
+    if let Some(w) = &mut body_where {
+        rename_qualifier(w, &from_name, &dalias);
+    }
+
+    s.table = body.table.take();
+    // Keep the derived alias as the base's alias — this is what lets outer
+    // `t.col` refs resolve, and it shadows the base's real name (PG's rule).
+    s.alias = Some(dalias);
+    s.where_clause = merge_where(body_where, s.where_clause.take());
+    if s.items.is_none() {
+        // `SELECT * FROM (…) t`: expose the body's own column list, not a
+        // fresh `*` over the base (which could carry columns the body hid).
+        s.items = body.items.take();
+    }
+    Ok(())
+}
+
+/// Rewrite every `from.col` qualifier to `to.col` in place. Used to collapse a
+/// derived table's body onto the single outer alias; only the qualifier changes,
+/// never the column, and bare [`Expr::Col`] refs (no qualifier) are untouched.
+fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
+    match e {
+        Expr::Qualified(q, _) => {
+            if q == from {
+                *q = to.to_string();
+            }
+        }
+        Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => rename_qualifier(a, from, to),
+        Expr::Binary(_, a, b) | Expr::Like(a, b) => {
+            rename_qualifier(a, from, to);
+            rename_qualifier(b, from, to);
+        }
+        Expr::InList(a, list, _) => {
+            rename_qualifier(a, from, to);
+            for item in list {
+                rename_qualifier(item, from, to);
+            }
+        }
+        Expr::Case(arms, else_) => {
+            for (c, r) in arms {
+                rename_qualifier(c, from, to);
+                rename_qualifier(r, from, to);
+            }
+            if let Some(x) = else_ {
+                rename_qualifier(x, from, to);
+            }
+        }
+        Expr::Coalesce(items) | Expr::Func(_, items) => {
+            for item in items {
+                rename_qualifier(item, from, to);
+            }
+        }
+        Expr::InParamSlot(a, _, _) | Expr::InContext(a, _, _) => rename_qualifier(a, from, to),
+        Expr::Agg(_, Some(arg), _) => rename_qualifier(arg, from, to),
+        // A subquery in the body opens its own scope; refuse-by-check_simple
+        // keeps aggregate/correlated bodies out, and a plain uncorrelated
+        // subquery does not see the derived alias, so it is left as-is.
+        Expr::Subquery(_) | Expr::Exists(_, _) | Expr::InSubquery(_, _, _) => {}
+        Expr::Lit(_)
+        | Expr::Param(_)
+        | Expr::Col(_)
+        | Expr::ContextRef(_)
+        | Expr::Excluded(_)
+        | Expr::Agg(_, None, _) => {}
+    }
 }
 
 /// Recurse into any subquery `SelectStmt` carried by an expression.
@@ -169,8 +278,8 @@ fn flatten_expr(e: &mut Expr, views: &ViewCatalog, depth: usize) -> Result<()> {
 fn check_simple(v: &SelectStmt, name: &str) -> Result<()> {
     let bad = |what: &str| {
         Err(bind_err(format!(
-            "view `{name}` uses {what}, which is not supported yet (only a \
-             single-table projection/filter view can be flattened)"
+            "`{name}` uses {what}, which is not supported yet (only a \
+             single-table projection/filter source can be flattened)"
         )))
     };
     if v.table.is_none() {

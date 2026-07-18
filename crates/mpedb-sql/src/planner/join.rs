@@ -70,6 +70,7 @@ pub(super) fn rewrite_right_join(
     };
     Ok(Some(ast::SelectStmt {
         table: Some(j.table.clone()),
+        from_derived: None,
         alias: j.alias.clone(),
         joins: vec![ast::JoinClause {
             table: s_table.to_string(),

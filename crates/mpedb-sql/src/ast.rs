@@ -25,6 +25,13 @@ pub(crate) struct SelectStmt {
     /// `joins` is empty whenever this is `None` — the parser cannot produce a
     /// join without a FROM.
     pub table: Option<String>,
+    /// `FROM (SELECT …) [AS] alias` — a derived table (#74). Mutually exclusive
+    /// with `table` at parse time; the view-inline pass flattens it onto the
+    /// subquery's base table (merging WHERE, stripping the alias qualifier) and
+    /// clears this back to `None` BEFORE planning, so the planner and executor
+    /// never see it. Only simple projection/filter subquery bodies are
+    /// flattenable; anything else is refused (DESIGN-DERIVED-TABLES.md, Stage B).
+    pub from_derived: Option<Box<SelectStmt>>,
     /// `FROM t [AS] a` — the name `t`'s columns are addressed by. When present,
     /// the table's own name is NOT in scope (`FROM orders o` makes `orders.c`
     /// invalid and `o.c` valid — PG's rule), and it is what lets a table join
