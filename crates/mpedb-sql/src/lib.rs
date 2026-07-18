@@ -24,9 +24,14 @@ mod plan;
 mod planner;
 mod policy;
 mod token;
+mod trigger;
 mod view;
 
-pub use ddl::{CreateColumnSpec, CreatePolicySpec, CreateTableSpec, DdlStmt, RlsAction};
+pub use ddl::{
+    CreateColumnSpec, CreatePolicySpec, CreateTableSpec, CreateTriggerSpec, DdlStmt, RlsAction,
+    TriggerEvent, TriggerTiming,
+};
+pub use trigger::{compile_trigger_body, compile_trigger_when};
 pub use plan::{
     AccessPath, AggCall, Aggregation, CompiledPlan, CompoundPlan, ConflictProbe, GroupKey,
     InsertSource, Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp, Projection,

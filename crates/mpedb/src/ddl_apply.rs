@@ -245,7 +245,10 @@ impl Database {
             }
         };
         let mut w = self.engine.begin_write()?;
-        match w.drop_table(id) {
+        // Cascade: a dropped table's triggers are dead — remove their records in
+        // the same commit (DESIGN-TRIGGERS §3.1).
+        let res = crate::trigger::cascade_drop_triggers(&mut w, id).and_then(|()| w.drop_table(id));
+        match res {
             Ok(()) => w.commit()?,
             Err(e) => {
                 w.abort();
@@ -476,6 +479,12 @@ impl Database {
                         rows: findings.into_iter().map(|w| vec![Value::Text(w)]).collect(),
                     });
                 }
+            }
+            DdlStmt::CreateTrigger(spec) => {
+                return self.apply_create_trigger(spec);
+            }
+            DdlStmt::DropTrigger { name, if_exists } => {
+                return self.apply_drop_trigger(&name, if_exists);
             }
             DdlStmt::DropPolicy { table, name } => {
                 self.drop_policy(&table, &name)?;
