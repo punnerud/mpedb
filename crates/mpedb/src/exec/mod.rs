@@ -481,9 +481,11 @@ fn subplan_value(r: ExecResult, kind: mpedb_sql::SubPlanKind) -> Result<Value> {
             .and_then(|mut r| if r.len() == 1 { r.pop() } else { None })
             .ok_or_else(|| internal("scalar subplan output arity")),
         // sqlite silently takes the first row; saying so is the strict line.
-        n => Err(Error::Unsupported(format!(
-            "a scalar subquery returned {n} rows — it must return at most one"
-        ))),
+        // (The planner caps a scalar subplan at 2 rows — enough to detect this —
+        // so `n` is the capped count, i.e. "at least 2", not the true total.)
+        _ => Err(Error::Unsupported(
+            "a scalar subquery returned more than one row — it must return at most one".into(),
+        )),
     }
 }
 

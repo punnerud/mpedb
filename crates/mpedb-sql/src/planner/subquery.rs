@@ -278,6 +278,23 @@ impl Lift<'_> {
             outer_args: Vec::new(),
             arg_types: Vec::new(),
         };
+        // MPEE-style pruning: cap each subplan to the minimum rows its CONSUMER
+        // can possibly read, so the LIMIT pushdown stops the scan there instead
+        // of materializing rows that are then discarded ("don't compute the
+        // distances you won't use"). EXISTS needs one surviving row (existence);
+        // a scalar subquery needs at most two (one value, or two to detect the
+        // >1-row error); `IN` needs every value, so it is uncapped. OFFSET is
+        // preserved — the pushdown cap is offset+limit, so existence/value "after
+        // the offset" is still computed — and a smaller user LIMIT wins via `min`.
+        let consumer_cap = match kind {
+            SubPlanKind::Exists => Some(1),
+            SubPlanKind::Scalar => Some(2),
+            SubPlanKind::List => None,
+        };
+        let inner_limit = match consumer_cap {
+            Some(cap) => Some(inner.limit.map_or(cap, |l| l.min(cap))),
+            None => inner.limit,
+        };
         let rewritten = ast::SelectStmt {
             table: inner.table.clone(),
             from_derived: None,
@@ -320,7 +337,7 @@ impl Lift<'_> {
                 .iter()
                 .map(|(e, d)| Ok((corr.rewrite(e)?, *d)))
                 .collect::<Result<_>>()?,
-            limit: inner.limit,
+            limit: inner_limit,
             offset: inner.offset,
         };
         let outer_args = corr.outer_args;
