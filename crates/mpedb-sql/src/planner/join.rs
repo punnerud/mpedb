@@ -77,6 +77,9 @@ pub(super) fn rewrite_right_join(
             alias: s.alias.clone(),
             kind: ast::JoinKind::Left,
             on: j.on.clone(),
+            // RIGHT JOIN USING is refused in the parser, so `j.using` is empty
+            // here; the swapped LEFT join carries a plain ON.
+            using: Vec::new(),
         }],
         distinct: s.distinct,
         items,
@@ -98,6 +101,18 @@ pub(super) fn plan_join_select(
     subplans: Vec<SubPlan>,
     slot_types: Vec<Ty>,
 ) -> Result<PlannedStmt> {
+    // `SELECT *` over a `USING` join coalesces the join columns — each appears
+    // once, from the left side. Expand the star into explicit qualified items
+    // BEFORE anything below looks at it, so projection / ORDER BY / DISTINCT all
+    // see a normal item list and need no special-casing (the same trick RIGHT
+    // JOIN uses). The ON equalities are built separately, per join step below.
+    let using_star;
+    let s = if s.items.is_none() && s.joins.iter().any(|j| !j.using.is_empty()) {
+        using_star = expand_using_star(s, schema)?;
+        &using_star
+    } else {
+        s
+    };
     // Subqueries were lifted by `plan_select` before the join dispatch; the
     // reserved result slots sit right after the user params.
     let eff_params = n_params + subplans.len() as u16;
@@ -152,7 +167,17 @@ pub(super) fn plan_join_select(
 
         acc_named.push((jname, jt));
         let mut jb = pb.rescope(Scope::joined_named(acc_named.clone())?);
-        let bound_on = jb.bind_predicate(&jc.on)?;
+        // A `USING (…)` join desugars HERE to `left.ci = right.ci AND …`: only
+        // now is the schema available to qualify the LEFT column, which may live
+        // in any table already accumulated. A plain `ON` join binds unchanged.
+        let on_desugared;
+        let on_expr = if jc.using.is_empty() {
+            &jc.on
+        } else {
+            on_desugared = using_on_expr(&jc.using, &acc_named)?;
+            &on_desugared
+        };
+        let bound_on = jb.bind_predicate(on_expr)?;
         binder = jb;
 
         let kind = match jc.kind {
@@ -437,6 +462,76 @@ pub(super) fn plan_join_select(
         out_types,
         subplans,
     ))
+}
+
+/// Desugar `JOIN … USING (cols)` into the AST predicate
+/// `left.c1 = right.c1 AND …`. `acc_named` is the accumulated join scope with
+/// the RIGHT (just-joined) table as its LAST entry; the tables before it are the
+/// left side. Each USING column must exist in the right table AND in some table
+/// to its left, else a clean bind error. The left occurrence is the LEFTMOST
+/// match — the coalesce representative — so `a JOIN b USING(x) JOIN c USING(x)`
+/// pins `a.x = b.x AND a.x = c.x`, exactly sqlite's single coalesced column.
+fn using_on_expr(using: &[String], acc_named: &[(String, &TableDef)]) -> Result<ast::Expr> {
+    let (right_name, right) = acc_named.last().expect("the joined table is present");
+    let left = &acc_named[..acc_named.len() - 1];
+    let mut conds: Vec<ast::Expr> = Vec::with_capacity(using.len());
+    for col in using {
+        if right.column_index(col).is_none() {
+            return Err(bind_err(format!(
+                "USING column `{col}` does not exist in table `{right_name}`"
+            )));
+        }
+        let left_name = left
+            .iter()
+            .find(|(_, t)| t.column_index(col).is_some())
+            .map(|(n, _)| n.clone())
+            .ok_or_else(|| {
+                bind_err(format!(
+                    "USING column `{col}` does not exist on the left side of the join"
+                ))
+            })?;
+        conds.push(ast::Expr::Binary(
+            ast::BinOp::Eq,
+            Box::new(ast::Expr::Qualified(left_name, col.clone())),
+            Box::new(ast::Expr::Qualified(right_name.clone(), col.clone())),
+        ));
+    }
+    let mut it = conds.into_iter();
+    let first = it.next().expect("USING has at least one column");
+    Ok(it.fold(first, |acc, c| {
+        ast::Expr::Binary(ast::BinOp::And, Box::new(acc), Box::new(c))
+    }))
+}
+
+/// `SELECT *` over a `USING` join: expand the star into explicit qualified
+/// column items so the join columns are COALESCED — each shows once, taken from
+/// the LEFT side — matching sqlite. Every column is emitted in table order, but
+/// a joined table's OWN USING columns are dropped (their value equals the equal
+/// left column already emitted). Returns a clone of `s` with `items = Some(…)`;
+/// only reached when `s.items` is `None` and some join carries a `using` list.
+fn expand_using_star(s: &ast::SelectStmt, schema: &Schema) -> Result<ast::SelectStmt> {
+    let outer_table = s.table.as_deref().expect("join on a FROM-less SELECT");
+    let (_, outer) = resolve_table(schema, outer_table)?;
+    let outer_name = s.alias.clone().unwrap_or_else(|| outer.name.clone());
+    let mut items: Vec<(ast::Expr, Option<String>)> = Vec::new();
+    // The outer table contributes every column — a USING column keeps its
+    // natural position here and is the left side of the coalesce.
+    for c in &outer.columns {
+        items.push((ast::Expr::Qualified(outer_name.clone(), c.name.clone()), None));
+    }
+    for jc in &s.joins {
+        let (_, jt) = resolve_table(schema, &jc.table)?;
+        let jname = jc.alias.clone().unwrap_or_else(|| jt.name.clone());
+        for c in &jt.columns {
+            // Drop this table's USING columns: they equal the already-emitted
+            // left column, so `SELECT *` shows the join column once.
+            if jc.using.iter().any(|u| u == &c.name) {
+                continue;
+            }
+            items.push((ast::Expr::Qualified(jname.clone(), c.name.clone()), None));
+        }
+    }
+    Ok(ast::SelectStmt { items: Some(items), ..s.clone() })
 }
 
 /// Name a joined-tuple slot for EXPLAIN and output columns: `<table>.<column>`,
