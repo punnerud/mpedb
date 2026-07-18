@@ -1181,9 +1181,11 @@ fn max_col(e: &BExpr) -> Option<u16> {
     while let Some(e) = stack.pop() {
         match e {
             BExpr::Col(c) => m = Some(m.map_or(*c, |p| p.max(*c))),
-            BExpr::Unary(_, a) | BExpr::Like(a, _) | BExpr::Cast(a, _) | BExpr::InParam(a, _) => {
-                stack.push(a)
-            }
+            BExpr::Unary(_, a)
+            | BExpr::Like(a, _)
+            | BExpr::Glob(a, _)
+            | BExpr::Cast(a, _)
+            | BExpr::InParam(a, _) => stack.push(a),
             BExpr::Binary(_, a, b) | BExpr::IsDistinct(a, b, _) => {
                 stack.push(a);
                 stack.push(b);

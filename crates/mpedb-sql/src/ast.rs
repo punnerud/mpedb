@@ -195,6 +195,10 @@ pub(crate) enum Expr {
     IsDistinct(Box<Expr>, Box<Expr>, bool),
     /// `lhs LIKE pattern`.
     Like(Box<Expr>, Box<Expr>),
+    /// `lhs [NOT] GLOB pattern` — sqlite's case-SENSITIVE `*`/`?`/`[...]`
+    /// matcher. Carries `negated` (`NOT GLOB`), unlike [`Expr::Like`]: the
+    /// bool is the whole difference from that node's shape.
+    Glob(Box<Expr>, Box<Expr>, bool),
     /// `CAST(x AS <type>)`.
     Cast(Box<Expr>, mpedb_types::ColumnType),
     /// `(SELECT …)` — a scalar subquery: one output column; 0 rows = NULL,
