@@ -254,6 +254,7 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
             aggregate,
             distinct,
             order_junk,
+            windows,
     } = sp;
     buf.extend_from_slice(&table.to_le_bytes());
             encode_access(access, buf);
@@ -338,6 +339,34 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
                     encode_opt_program(a.having.as_ref(), buf);
                 }
             }
+            // Window functions (format 24): a trailing list after the aggregate
+            // block. Compound arms / INSERT…SELECT sources encode an empty list
+            // (the planner never puts windows there).
+            w_u16(buf, windows.len() as u16);
+            for w in windows {
+                encode_window(w, buf);
+            }
+}
+
+/// One [`WindowSpec`]: func tag (+ AggFn byte for `Agg`), optional arg program,
+/// distinct byte, a PARTITION BY program list, and an ORDER BY `(program, desc)`
+/// list — the exact mirror of `decode_window`.
+fn encode_window(w: &WindowSpec, buf: &mut Vec<u8>) {
+    buf.push(w.func.tag());
+    if let WindowFunc::Agg(f) = w.func {
+        buf.push(f as u8);
+    }
+    encode_opt_program(w.arg.as_ref(), buf);
+    buf.push(w.distinct as u8);
+    w_u16(buf, w.partition_by.len() as u16);
+    for p in &w.partition_by {
+        p.encode_into(buf);
+    }
+    w_u16(buf, w.order_by.len() as u16);
+    for (p, desc) in &w.order_by {
+        p.encode_into(buf);
+        buf.push(*desc as u8);
+    }
 }
 
 fn encode_stmt_rest(stmt: &PlanStmt, buf: &mut Vec<u8>) {

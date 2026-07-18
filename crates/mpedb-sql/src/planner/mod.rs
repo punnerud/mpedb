@@ -26,7 +26,7 @@ use crate::binder::{compile_program, BExpr, Binder, Scope, Ty};
 use crate::plan::{
     render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource,
     CompoundPlan, GroupKey, Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp,
-    Projection, SelectPlan, SubPlan, SubPlanKind,
+    Projection, SelectPlan, SubPlan, SubPlanKind, WindowSpec,
 };
 use crate::policy::{PolicyCatalog, TablePolicies};
 use mpedb_types::{ExprProgram, ColumnType, Error, Footprint, Instr, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
@@ -38,6 +38,7 @@ mod footprint;
 mod join;
 mod select;
 mod subquery;
+mod window;
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -47,6 +48,7 @@ use access::extract_access;
 use aggregate::{contains_agg, plan_aggregate_select};
 use join::plan_join_select;
 use select::plan_select;
+use window::{contains_window, plan_window_select};
 
 fn and(a: BExpr, b: BExpr) -> BExpr {
     BExpr::Binary(BinOp::And, Box::new(a), Box::new(b))

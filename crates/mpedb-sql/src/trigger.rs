@@ -296,6 +296,9 @@ fn rewrite_row_in_expr(e: &mut Expr, scope: &RowScope, map: &mut RowMap) -> Resu
                 "subqueries are not supported in a trigger body/WHEN yet",
             ))
         }
+        Expr::Window { .. } => Err(trg_err(
+            "window functions are not supported in a trigger body/WHEN yet",
+        )),
         Expr::ContextRef(_) | Expr::InContext(..) => Err(trg_err(
             "current_setting() is not supported in a trigger body/WHEN yet",
         )),

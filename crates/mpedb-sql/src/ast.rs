@@ -286,4 +286,42 @@ pub(crate) enum Expr {
     /// The bool is DISTINCT: `count(DISTINCT x)` counts distinct non-NULL
     /// values of x.
     Agg(mpedb_types::AggFn, Option<Box<Expr>>, bool),
+    /// `<fn>(args) OVER (<spec>)` — a WINDOW function (design/DESIGN-WINDOW.md).
+    ///
+    /// Its own node (not [`Expr::Agg`]/[`Expr::Func`]) because it is neither a
+    /// per-row scalar nor a group-collapsing aggregate: it produces one value
+    /// per row computed over a whole PARTITION, and every input row survives.
+    /// Conflating it with `Agg` is how a window function would wrongly reach the
+    /// GROUP BY machinery. Only ever appears in the SELECT list and ORDER BY;
+    /// anywhere else the binder refuses it.
+    Window {
+        func: WindowFunc,
+        /// The aggregate/value argument. `None` for `count(*)` and the ranking
+        /// functions (which take no argument).
+        arg: Option<Box<Expr>>,
+        /// `DISTINCT` inside a window aggregate — refused in stage 1.
+        distinct: bool,
+        spec: WindowSpecAst,
+    },
+}
+
+/// Which window function a [`Expr::Window`] calls.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum WindowFunc {
+    /// Ranking functions (stage 1a): distinct 1..n / gaps-on-ties / dense.
+    RowNumber,
+    Rank,
+    DenseRank,
+    /// An aggregate used as a window (stage 1b) — reuses the aggregate enum, so
+    /// the NULL rules, overflow-is-an-error and result typing are identical.
+    Agg(mpedb_types::AggFn),
+}
+
+/// The `OVER ( [PARTITION BY …] [ORDER BY …] )` spec. No explicit frame in
+/// stage 1 — the default frame is computed implicitly (design/DESIGN-WINDOW.md §3.5).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct WindowSpecAst {
+    pub partition_by: Vec<Expr>,
+    /// `(key, descending)`, mirroring [`SelectStmt::order_by`].
+    pub order_by: Vec<(Expr, bool)>,
 }

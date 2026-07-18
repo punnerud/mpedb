@@ -116,6 +116,7 @@ impl CompiledPlan {
                 aggregate,
                 distinct,
                 order_junk,
+                windows,
             } = sp;
             {
                 // With a join every tuple below is `[outer ‖ inner]`, so the
@@ -250,6 +251,43 @@ impl CompiledPlan {
                     if let Some(h) = &a.having {
                         out.push_str(&format!("  having: {}\n", render_program(h, &name)));
                     }
+                }
+                // Window functions run over the base row, so their sub-programs
+                // use the base namer. Shows the phase EXPLAIN otherwise hides.
+                for (k, w) in windows.iter().enumerate() {
+                    let fname = match w.func {
+                        crate::plan::WindowFunc::RowNumber => "row_number()".to_string(),
+                        crate::plan::WindowFunc::Rank => "rank()".to_string(),
+                        crate::plan::WindowFunc::DenseRank => "dense_rank()".to_string(),
+                        crate::plan::WindowFunc::Agg(f) => match &w.arg {
+                            None => format!("{}(*)", f.name()),
+                            Some(p) => format!("{}({})", f.name(), render_program(p, &base)),
+                        },
+                    };
+                    let mut spec = String::new();
+                    if !w.partition_by.is_empty() {
+                        let ps: Vec<String> =
+                            w.partition_by.iter().map(|p| render_program(p, &base)).collect();
+                        spec.push_str(&format!("PARTITION BY {}", ps.join(", ")));
+                    }
+                    if !w.order_by.is_empty() {
+                        if !spec.is_empty() {
+                            spec.push(' ');
+                        }
+                        let os: Vec<String> = w
+                            .order_by
+                            .iter()
+                            .map(|(p, desc)| {
+                                format!(
+                                    "{}{}",
+                                    render_program(p, &base),
+                                    if *desc { " DESC" } else { " ASC" }
+                                )
+                            })
+                            .collect();
+                        spec.push_str(&format!("ORDER BY {}", os.join(", ")));
+                    }
+                    out.push_str(&format!("  window __w{k}: {fname} OVER ({spec})\n"));
                 }
                 let cols: Vec<String> = projection
                     .iter()

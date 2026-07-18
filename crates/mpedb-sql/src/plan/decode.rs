@@ -541,6 +541,15 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                 }
                 t => return Err(corrupt(format!("bad aggregate tag {t}"))),
             };
+            // Window functions (format 24): the trailing list after aggregate.
+            let n_win = r_u16(buf, pos)? as usize;
+            if n_win > MAX_WINDOWS {
+                return Err(corrupt("too many windows in plan"));
+            }
+            let mut windows = Vec::with_capacity(n_win.min(MAX_WINDOWS));
+            for _ in 0..n_win {
+                windows.push(decode_window(buf, pos)?);
+            }
             Ok(SelectPlan {
                 table,
                 access,
@@ -556,8 +565,68 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                 aggregate,
                 distinct,
                 order_junk,
+                windows,
             })
     }
+}
+
+/// One [`WindowSpec`] — the exact mirror of `encode_window`. A closed func tag
+/// (unknown ⇒ `Corrupt`, like `AggFn::from_tag`), and `distinct` is rejected
+/// (stage 1 does not support it, and neither does the planner that emits this).
+fn decode_window(buf: &[u8], pos: &mut usize) -> Result<WindowSpec> {
+    let func = match r_u8(buf, pos)? {
+        1 => WindowFunc::RowNumber,
+        2 => WindowFunc::Rank,
+        3 => WindowFunc::DenseRank,
+        4 => {
+            let f = AggFn::from_tag(r_u8(buf, pos)?)
+                .ok_or_else(|| corrupt("unknown window aggregate function"))?;
+            WindowFunc::Agg(f)
+        }
+        t => return Err(corrupt(format!("bad window function tag {t}"))),
+    };
+    let arg = decode_opt_program(buf, pos)?;
+    let distinct = match r_u8(buf, pos)? {
+        0 => false,
+        // Refused in stage 1 — a blob claiming it is corrupt (matches the
+        // planner, which never emits it).
+        1 => return Err(corrupt("DISTINCT window aggregate is not supported")),
+        t => return Err(corrupt(format!("bad window distinct tag {t}"))),
+    };
+    // A ranking function takes no argument (the row itself is the input).
+    if arg.is_some() && matches!(func, WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank)
+    {
+        return Err(corrupt("ranking window function carries an argument"));
+    }
+    let n_part = r_u16(buf, pos)? as usize;
+    if n_part > crate::parser::MAX_ORDER_BY_ITEMS {
+        return Err(corrupt("too many PARTITION BY items in plan"));
+    }
+    let mut partition_by = Vec::with_capacity(n_part.min(64));
+    for _ in 0..n_part {
+        partition_by.push(ExprProgram::decode(buf, pos)?);
+    }
+    let n_ord = r_u16(buf, pos)? as usize;
+    if n_ord > crate::parser::MAX_ORDER_BY_ITEMS {
+        return Err(corrupt("too many window ORDER BY items in plan"));
+    }
+    let mut order_by = Vec::with_capacity(n_ord.min(64));
+    for _ in 0..n_ord {
+        let program = ExprProgram::decode(buf, pos)?;
+        let desc = match r_u8(buf, pos)? {
+            0 => false,
+            1 => true,
+            t => return Err(corrupt(format!("bad window order direction {t}"))),
+        };
+        order_by.push((program, desc));
+    }
+    Ok(WindowSpec {
+        func,
+        arg,
+        distinct,
+        partition_by,
+        order_by,
+    })
 }
 
 fn decode_stmt_rest(tag: u8, buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {

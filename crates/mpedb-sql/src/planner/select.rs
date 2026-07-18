@@ -339,6 +339,16 @@ pub(super) fn plan_select(
 
     check_distinct_order_by(s, table)?;
 
+    // Window functions in the SELECT list or ORDER BY route to the window
+    // planner — a post-pass over the base rows that keeps every row and appends
+    // one column per window (design/DESIGN-WINDOW.md). Detected BEFORE the aggregate
+    // check because a window is not an aggregate (`sum(x) OVER (…)` is a window).
+    let has_window = s
+        .items
+        .as_ref()
+        .is_some_and(|items| items.iter().any(|(e, _)| contains_window(e)))
+        || s.order_by.iter().any(|(e, _)| contains_window(e));
+
     // Is this an aggregate query? Either an aggregate appears, or GROUP BY does.
     let has_agg = s
         .items
@@ -350,6 +360,27 @@ pub(super) fn plan_select(
         // routing it to the plain planner would report the wrong problem.
         || s.order_by.iter().any(|(e, _)| contains_agg(e))
         || !s.group_by.is_empty();
+
+    if has_window {
+        if has_agg {
+            return Err(bind_err(
+                "window functions together with GROUP BY / aggregates in one SELECT \
+                 are not supported yet (window stage 2+)",
+            ));
+        }
+        // A correlated subquery makes the executor fill slots per row on a path
+        // that does not run the window phase — refuse the combination for now.
+        // (Uncorrelated subqueries are fine: filled once, before the phase.)
+        if post_filter.is_some() || correlated.iter().any(|&c| c) {
+            return Err(bind_err(
+                "a window function together with a correlated subquery is not supported yet",
+            ));
+        }
+        return plan_window_select(
+            s, table_id, access, filter, Vec::new(), None, binder, subplans,
+        );
+    }
+
     if has_agg {
         // Aggregation consumes rows in the gather phase; a correlated slot is
         // filled per row AFTER it. The correlated WHERE residual therefore
@@ -514,6 +545,7 @@ pub(super) fn plan_select(
             order_by,
             limit: s.limit,
             offset: s.offset,
+            windows: Vec::new(),
         }),
         param_types,
         context_keys,
