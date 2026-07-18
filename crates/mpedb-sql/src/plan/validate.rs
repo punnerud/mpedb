@@ -488,7 +488,12 @@ impl CompiledPlan {
                 // their column indices legitimately reach 2n-1. check_program
                 // only knows about n, hence the dedicated check.
                 match on_conflict {
-                    PlanOnConflict::Error | PlanOnConflict::DoNothing => {}
+                    // Replace carries no payload — the executor derives the
+                    // unique-index set from the live TableDef — so there is
+                    // nothing plan-level to validate.
+                    PlanOnConflict::Error
+                    | PlanOnConflict::DoNothing
+                    | PlanOnConflict::Replace => {}
                     PlanOnConflict::DoUpdate {
                         target,
                         probe,

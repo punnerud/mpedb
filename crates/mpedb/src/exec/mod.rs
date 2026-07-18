@@ -1394,6 +1394,49 @@ fn exec_stmt_rest(
                     *partial = true;
                     return Err(e);
                 }
+                // INSERT OR REPLACE: delete every existing row the proposed row
+                // would collide with — on the PK AND on each secondary UNIQUE
+                // index — so the insert below cannot trip a uniqueness
+                // constraint (sqlite's delete-on-any-unique semantics). All
+                // probes read BEFORE any delete; victims are de-duplicated so a
+                // row conflicting on several constraints is removed once. A NULL
+                // in a probed key means no entry and no conflict (UNIQUE and the
+                // rowid-alias auto-assign both permit it), so it is skipped.
+                if matches!(on_conflict, PlanOnConflict::Replace) {
+                    let mut victims: Vec<Vec<Value>> = Vec::new();
+                    let pk_of = |r: &[Value]| -> Vec<Value> {
+                        t.primary_key.iter().map(|&c| r[c as usize].clone()).collect()
+                    };
+                    let pk = pk_of(&row);
+                    if !pk.iter().any(|v| v.is_null()) {
+                        if let Some(existing) = ctx.get_by_pk(*table, &pk)? {
+                            victims.push(pk_of(&existing));
+                        }
+                    }
+                    for (pos, ix) in t.indexes.iter().enumerate() {
+                        if !ix.unique {
+                            continue;
+                        }
+                        let vals: Vec<Value> =
+                            ix.columns.iter().map(|&c| row[c as usize].clone()).collect();
+                        if vals.iter().any(|v| v.is_null()) {
+                            continue;
+                        }
+                        if let Some(existing) =
+                            ctx.get_by_index(*table, (pos + 1) as u32, &vals)?
+                        {
+                            victims.push(pk_of(&existing));
+                        }
+                    }
+                    let mut deleted: Vec<Vec<Value>> = Vec::new();
+                    for v in victims {
+                        if deleted.contains(&v) {
+                            continue;
+                        }
+                        ctx.delete_by_pk(*table, &v)?;
+                        deleted.push(v);
+                    }
+                }
                 match ctx.insert_row(*table, &row) {
                     Ok(()) => {
                         written += 1;
@@ -1429,6 +1472,18 @@ fn exec_stmt_rest(
                         match on_conflict {
                             PlanOnConflict::Error => unreachable!("guarded above"),
                             PlanOnConflict::DoNothing => { /* skip this row */ }
+                            PlanOnConflict::Replace => {
+                                // Replace pre-deletes every conflicting row above,
+                                // so a uniqueness error here means a constraint we
+                                // did not probe (should not happen) — surface it
+                                // rather than silently swallow.
+                                *partial = applied > 0 || !precheck_failure(&e);
+                                return Err(hide_constraint_variant(
+                                    e,
+                                    &t.name,
+                                    with_check.is_some(),
+                                ));
+                            }
                             PlanOnConflict::DoUpdate {
                                 target,
                                 probe,

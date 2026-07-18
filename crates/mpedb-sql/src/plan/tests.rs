@@ -12,6 +12,9 @@ fn sample_sqls() -> Vec<&'static str> {
         "SELECT * FROM orders WHERE user_id = 7 AND note IS NOT NULL",
         "SELECT * FROM users WHERE email LIKE 'a%' OR NOT active",
         "INSERT INTO users (id, email) VALUES ($1, $2)",
+        // INSERT OR REPLACE (format 33): the OC_REPLACE tag must survive
+        // encode/decode/validate/hash and the truncation/bit-flip fuzz.
+        "INSERT OR REPLACE INTO users (id, email) VALUES ($1, $2)",
         "INSERT INTO users (id, email, age) VALUES (1, 'a', NULL), (2, 'b', 3)",
         "INSERT INTO events (msg) VALUES (x'00ff')" ,
         "UPDATE users SET age = age + 1, score = 0.5 WHERE id = $1",
@@ -168,7 +171,7 @@ fn decode_rejects_truncation_and_stale_format_in_cast() {
         let p = prepare(sql, &s).unwrap();
         let _ = p.explain(&s); // must not panic rendering the affinity name
         let bytes = p.encode();
-        assert_eq!(bytes[0], 32, "plan format byte for {sql}");
+        assert_eq!(bytes[0], 33, "plan format byte for {sql}");
         let q = CompiledPlan::decode(&bytes, &s).expect(sql);
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         for cut in 0..bytes.len() {
@@ -209,7 +212,7 @@ fn bare_group_by_roundtrips_and_rejects_truncation_and_stale_format() {
         assert!(!agg.bare_cols.is_empty(), "bare_cols must be populated for {sql}");
 
         let bytes = p.encode();
-        assert_eq!(bytes[0], 32, "plan format byte for {sql}");
+        assert_eq!(bytes[0], 33, "plan format byte for {sql}");
         let q = CompiledPlan::decode(&bytes, &s).expect(sql);
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         for cut in 0..bytes.len() {
@@ -367,7 +370,7 @@ fn compound_subplan_roundtrips_rejects_truncation_and_stale_format() {
         );
         let _ = p.explain(&s); // must not panic on the compound body render
         let bytes = p.encode();
-        assert_eq!(bytes[0], 32, "plan format byte for {sql}");
+        assert_eq!(bytes[0], 33, "plan format byte for {sql}");
         assert_eq!(CompiledPlan::decode(&bytes, &s).unwrap(), p, "roundtrip for {sql}");
         for cut in 0..bytes.len() {
             assert!(

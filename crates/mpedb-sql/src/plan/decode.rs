@@ -394,6 +394,7 @@ fn decode_on_conflict(buf: &[u8], pos: &mut usize) -> Result<PlanOnConflict> {
     Ok(match r_u8(buf, pos)? {
         OC_ERROR => PlanOnConflict::Error,
         OC_DO_NOTHING => PlanOnConflict::DoNothing,
+        OC_REPLACE => PlanOnConflict::Replace,
         OC_DO_UPDATE => {
             let probe = match r_u8(buf, pos)? {
                 0 => ConflictProbe::Pk,

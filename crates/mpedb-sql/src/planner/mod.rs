@@ -573,42 +573,15 @@ fn plan_on_conflict(
     _table_id: u32,
     _consts: &mut Vec<Value>,
 ) -> Result<PlanOnConflict> {
-    // `INSERT OR REPLACE` desugars to a PK-keyed DO UPDATE of every non-PK
-    // column; built here (needs the schema) so it borrows for the rest.
-    let replace_desugar;
     let (target, set, where_clause) = match oc {
         ast::OnConflict::Error => return Ok(PlanOnConflict::Error),
         ast::OnConflict::DoNothing => return Ok(PlanOnConflict::DoNothing),
-        ast::OnConflict::Replace => {
-            // sqlite REPLACE deletes rows conflicting on ANY unique constraint;
-            // a PK-keyed upsert only covers PK conflicts, so refuse a table with
-            // a secondary UNIQUE index rather than answer differently.
-            if table.indexes.iter().any(|ix| ix.unique) {
-                return Err(bind_err(
-                    "INSERT OR REPLACE on a table with a UNIQUE index is not supported: its \
-                     delete-on-any-unique-constraint semantics differ from a PK upsert",
-                ));
-            }
-            let pk: Vec<String> = table
-                .primary_key
-                .iter()
-                .map(|&i| table.columns[i as usize].name.clone())
-                .collect();
-            let non_pk: Vec<(String, ast::Expr)> = table
-                .columns
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !table.primary_key.contains(&(*i as u16)))
-                .map(|(_, c)| (c.name.clone(), ast::Expr::Excluded(c.name.clone())))
-                .collect();
-            if non_pk.is_empty() {
-                // Every column is part of the PK: a conflicting row is
-                // identical, so REPLACE is a no-op — DO NOTHING.
-                return Ok(PlanOnConflict::DoNothing);
-            }
-            replace_desugar = (pk, non_pk, None);
-            (&replace_desugar.0, &replace_desugar.1, &replace_desugar.2)
-        }
+        // `INSERT OR REPLACE` is a first-class executor variant: it deletes
+        // every existing row the proposed row would conflict with (on the PK OR
+        // any secondary UNIQUE index) then inserts — sqlite's real
+        // delete-on-any-unique semantics, which a single PK-keyed upsert cannot
+        // express (it only covers PK conflicts and updates one row).
+        ast::OnConflict::Replace => return Ok(PlanOnConflict::Replace),
         ast::OnConflict::DoUpdate {
             target,
             set,
