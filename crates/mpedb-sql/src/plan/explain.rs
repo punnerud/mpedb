@@ -313,12 +313,16 @@ impl CompiledPlan {
             PlanStmt::Insert {
                 table,
                 rows,
+                from_select,
                 with_check,
                 on_conflict,
                 returning,
             } => {
                 let name = col_namer(*table);
                 out.push_str(&format!("Insert {}\n", table_name(*table)));
+                if from_select.is_some() {
+                    out.push_str("  source: SELECT\n");
+                }
                 if let Some(w) = with_check {
                     out.push_str(&format!("  with check: {}\n", render_program(w, &name)));
                 }

@@ -548,12 +548,33 @@ fn decode_stmt_rest(tag: u8, buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                 }
                 rows.push(row);
             }
+            let from_select = match r_u8(buf, pos)? {
+                0 => None,
+                1 => {
+                    let plan = Box::new(decode_select(buf, pos)?);
+                    let n = r_u16(buf, pos)? as usize;
+                    if n > MAX_COLUMNS {
+                        return Err(corrupt("INSERT … SELECT col_map out of range"));
+                    }
+                    let mut col_map = Vec::with_capacity(n.min(MAX_COLUMNS));
+                    for _ in 0..n {
+                        col_map.push(match r_u8(buf, pos)? {
+                            0 => None,
+                            1 => Some(r_u16(buf, pos)?),
+                            t => return Err(corrupt(format!("bad col_map tag {t}"))),
+                        });
+                    }
+                    Some(crate::plan::InsertSelect { plan, col_map })
+                }
+                t => return Err(corrupt(format!("bad from_select tag {t}"))),
+            };
             let with_check = decode_opt_program(buf, pos)?;
             let on_conflict = decode_on_conflict(buf, pos)?;
             let returning = decode_opt_projection(buf, pos)?;
             Ok(PlanStmt::Insert {
                 table,
                 rows,
+                from_select,
                 with_check,
                 on_conflict,
                 returning,

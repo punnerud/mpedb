@@ -135,13 +135,14 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
                 read_only: true,
             }
         }
-        PlanStmt::Insert { table, rows, .. } => {
+        PlanStmt::Insert { table, rows, from_select, .. } => {
             let t = schema
                 .table(*table)
                 .ok_or_else(|| Error::Corrupt("table id out of range".into()))?;
             // Single-row insert with every PK column from Param/Const gives an
-            // exact point write set; multi-row or defaulted PK degrades to Full.
-            let key_access = if rows.len() == 1 {
+            // exact point write set; multi-row, defaulted PK, or a SELECT source
+            // degrades to Full.
+            let key_access = if from_select.is_none() && rows.len() == 1 {
                 let parts: Option<Vec<KeyPart>> = t
                     .primary_key
                     .iter()
@@ -155,8 +156,17 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
             } else {
                 KeyAccess::Full
             };
+            // INSERT … SELECT reads its source table(s); record them so
+            // optimistic-concurrency validation and RLS stamping see the reads.
+            let mut tables_read = 0u64;
+            if let Some(sel) = from_select {
+                tables_read |= table_bit(sel.plan.table)?;
+                for j in &sel.plan.joins {
+                    tables_read |= table_bit(j.table)?;
+                }
+            }
             Footprint {
-                tables_read: 0,
+                tables_read,
                 tables_written: table_bit(*table)?,
                 // All unique indexes are maintained by an insert.
                 indexes_used: all_secondary_bits(t)?,

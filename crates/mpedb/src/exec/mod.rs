@@ -928,6 +928,7 @@ fn exec_stmt_rest(
         PlanStmt::Insert {
             table,
             rows,
+            from_select,
             with_check,
             on_conflict,
             returning,
@@ -937,19 +938,46 @@ fn exec_stmt_rest(
             // every DEFAULT now() in a multi-row INSERT gets the same value
             // (reviewed determinism requirement).
             let now = now_micros();
+            // Materialize the rows to insert. INSERT … SELECT reads its source
+            // FULLY first (so `INSERT INTO t SELECT … FROM t` reads the
+            // pre-insert state — sqlite's semantics), then inserts; each source
+            // tuple maps to the target columns via `col_map`, omitted columns
+            // taking their DEFAULT / NULL.
+            let built_rows: Vec<std::borrow::Cow<[Value]>> = if let Some(sel) = from_select {
+                let src = match exec_select(ctx, schema, plan, params, &sel.plan)? {
+                    ExecResult::Rows { rows, .. } => rows,
+                    _ => return Err(internal("INSERT … SELECT source produced no row set")),
+                };
+                let mut built = Vec::with_capacity(src.len());
+                for srow in src {
+                    let mut row = Vec::with_capacity(t.columns.len());
+                    for (ci, col) in t.columns.iter().enumerate() {
+                        row.push(match sel.col_map[ci] {
+                            Some(si) => coerce_insert_value(
+                                srow.get(si as usize).cloned().unwrap_or(Value::Null),
+                                col.ty,
+                            ),
+                            None => match &col.default {
+                                Some(DefaultExpr::Const(v)) => v.clone(),
+                                Some(DefaultExpr::Now) => Value::Timestamp(now),
+                                None => Value::Null,
+                            },
+                        });
+                    }
+                    built.push(std::borrow::Cow::Owned(row));
+                }
+                built
+            } else {
+                let mut built = Vec::with_capacity(rows.len());
+                for row_spec in rows {
+                    built.push(build_insert_row(t, plan, params, row_spec, now)?);
+                }
+                built
+            };
             // `applied` = rows fully inserted before the current one.
             let mut written = 0u64;
             let mut out: Vec<Vec<Value>> = Vec::new();
-            for (applied, row_spec) in rows.iter().enumerate() {
-                let row = match build_insert_row(t, plan, params, row_spec, now) {
-                    Ok(row) => row,
-                    Err(e) => {
-                        // Row construction touches nothing; only rows already
-                        // inserted count as partial effects.
-                        *partial = applied > 0;
-                        return Err(e);
-                    }
-                };
+            for (applied, row) in built_rows.into_iter().enumerate() {
                 // RLS WITH CHECK on the new row (before the engine's PK/unique
                 // pre-checks): NULL and FALSE both reject (§3.7).
                 if let Some(wc) = with_check {
@@ -1344,6 +1372,17 @@ fn build_insert_row_impl<'a>(
         });
     }
     Ok(std::borrow::Cow::Owned(row))
+}
+
+/// Coerce one `INSERT … SELECT` source value toward the target column type.
+/// Only the loss-less integer→float widening is applied (the same the VALUES
+/// path does at plan time via `coerce_const`); everything else passes through
+/// and the engine's `validate_row` enforces the rigid type at write time.
+fn coerce_insert_value(v: Value, ty: mpedb_types::ColumnType) -> Value {
+    match (&v, ty) {
+        (Value::Int(i), mpedb_types::ColumnType::Float64) => Value::Float(*i as f64),
+        _ => v,
+    }
 }
 
 pub(crate) fn validate_params(plan: &CompiledPlan, params: &[Value]) -> Result<()> {

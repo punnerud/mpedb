@@ -1029,22 +1029,28 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        self.expect_kw(Kw::Values, "VALUES")?;
+        // `INSERT INTO t [(cols)] SELECT …` — a source query instead of VALUES.
         let mut rows = Vec::new();
-        loop {
-            self.expect(&Tok::LParen, "`(`")?;
-            let mut row = vec![self.expr()?];
-            while self.eat(&Tok::Comma) {
-                row.push(self.expr()?);
+        let mut select = None;
+        if self.peek() == Some(&Tok::Kw(Kw::Select)) {
+            select = Some(Box::new(self.select_core()?));
+        } else {
+            self.expect_kw(Kw::Values, "VALUES")?;
+            loop {
+                self.expect(&Tok::LParen, "`(`")?;
+                let mut row = vec![self.expr()?];
+                while self.eat(&Tok::Comma) {
+                    row.push(self.expr()?);
+                }
+                self.expect(&Tok::RParen, "`)`")?;
+                rows.push(row);
+                if !self.eat(&Tok::Comma) {
+                    break;
+                }
             }
-            self.expect(&Tok::RParen, "`)`")?;
-            rows.push(row);
-            if !self.eat(&Tok::Comma) {
-                break;
+            if rows.len() > u16::MAX as usize {
+                return Err(self.err_here("too many rows in one INSERT (max 65535)"));
             }
-        }
-        if rows.len() > u16::MAX as usize {
-            return Err(self.err_here("too many rows in one INSERT (max 65535)"));
         }
         let on_conflict = self.on_conflict_clause()?;
         let returning = self.returning_clause()?;
@@ -1052,6 +1058,7 @@ impl<'a> Parser<'a> {
             table,
             columns,
             rows,
+            select,
             on_conflict,
             returning,
         }))

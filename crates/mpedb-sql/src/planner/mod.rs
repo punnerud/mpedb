@@ -742,8 +742,43 @@ fn plan_insert(
         }
     }
 
+    // INSERT … SELECT: plan the source query and map its output tuple to the
+    // target columns. Its params/context/list keys and subplans merge into
+    // this statement's below.
+    let mut from_select = None;
+    let mut sel_ptypes: Vec<Option<ColumnType>> = Vec::new();
+    let mut sel_ctx: Vec<String> = Vec::new();
+    let mut sel_list: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut sel_subplans: Vec<SubPlan> = Vec::new();
+    if let Some(sel_stmt) = &s.select {
+        let (sp_stmt, sp_pt, sp_ctx, sp_list, _sp_agg, sp_sub) =
+            plan_select(sel_stmt, schema, n_params, catalog, consts)?;
+        let PlanStmt::Select(sp) = sp_stmt else {
+            return Err(bind_err(
+                "INSERT … SELECT: a compound (UNION/EXCEPT/INTERSECT) source is not supported",
+            ));
+        };
+        if sp.projection.len() != listed.len() {
+            return Err(bind_err(format!(
+                "INSERT … SELECT: the source has {} column(s), but {} are expected",
+                sp.projection.len(),
+                listed.len()
+            )));
+        }
+        let col_map: Vec<Option<u16>> =
+            slot_of_col.iter().map(|s| s.map(|x| x as u16)).collect();
+        from_select = Some(crate::plan::InsertSelect { plan: Box::new(sp), col_map });
+        sel_ptypes = sp_pt;
+        sel_ctx = sp_ctx;
+        sel_list = sp_list;
+        sel_subplans = sp_sub;
+    }
+
     let mut rows = Vec::with_capacity(s.rows.len());
     for row in &s.rows {
+        if from_select.is_some() {
+            return Err(bind_err("INSERT cannot have both VALUES and a SELECT source"));
+        }
         if row.len() != listed.len() {
             return Err(bind_err(format!(
                 "INSERT row has {} values, expected {}",
@@ -826,11 +861,38 @@ fn plan_insert(
     let on_conflict = plan_on_conflict(&s.on_conflict, &mut binder, table, table_id, consts)?;
     let returning = plan_returning(s.returning.as_ref(), &mut binder, table)?;
 
-    let (param_types, context_keys, list_keys) = binder.into_parts();
+    let (mut param_types, mut context_keys, mut list_keys) = binder.into_parts();
+    // Merge the source query's inferences into this statement's (INSERT …
+    // SELECT). Param spaces are shared (both planned against the same
+    // `n_params`), so unify element-wise; a genuine type conflict is an error.
+    if from_select.is_some() {
+        if param_types.len() < sel_ptypes.len() {
+            param_types.resize(sel_ptypes.len(), None);
+        }
+        for (i, t) in sel_ptypes.into_iter().enumerate() {
+            if let Some(t) = t {
+                match param_types[i] {
+                    None => param_types[i] = Some(t),
+                    Some(existing) if existing == t => {}
+                    Some(existing) => {
+                        return Err(bind_err(format!(
+                            "parameter ${} used as both {existing} and {t}",
+                            i + 1
+                        )))
+                    }
+                }
+            }
+        }
+        context_keys.extend(sel_ctx);
+        context_keys.sort();
+        context_keys.dedup();
+        list_keys.extend(sel_list);
+    }
     Ok((
         PlanStmt::Insert {
             table: table_id,
             rows,
+            from_select,
             with_check,
             on_conflict,
             returning,
@@ -839,7 +901,7 @@ fn plan_insert(
         context_keys,
         list_keys,
         Vec::new(),
-        Vec::new(),
+        sel_subplans,
     ))
 }
 
