@@ -338,6 +338,137 @@ fn new_scalar_fns_eval_match_sqlite_and_propagate_null() {
 }
 
 #[test]
+fn math_scalar_fns_match_sqlite_and_domain_edges() {
+    // Build `f($1, $2, …)` over params so any Value (NULL included) reaches
+    // the function unchanged.
+    let call = |f: ScalarFn, args: &[Value]| -> Value {
+        let mut instrs: Vec<Instr> =
+            (0..args.len()).map(|i| Instr::PushParam(i as u16)).collect();
+        instrs.push(Instr::Call(f, args.len() as u8));
+        ExprProgram::new(instrs, vec![]).unwrap().eval(&[], args).unwrap()
+    };
+    // Approximate float equality (sqlite renders ~15 digits; here we compare the
+    // f64s directly, so a tight relative tolerance is plenty).
+    let approx = |v: Value, want: f64| match v {
+        Value::Float(x) => assert!(
+            (x - want).abs() <= 1e-12 * want.abs().max(1.0),
+            "got {x}, want {want}"
+        ),
+        other => panic!("expected Float, got {other:?}"),
+    };
+    let f = |x: f64| Value::Float(x);
+    let i = Value::Int;
+    use std::f64::consts::{E, PI};
+
+    // exp: e^x. Overflow is KEPT as +inf (sqlite returns Inf), never NULL.
+    approx(call(ScalarFn::Exp, &[i(0)]), 1.0);
+    approx(call(ScalarFn::Exp, &[f(1.0)]), E);
+    assert!(matches!(call(ScalarFn::Exp, &[f(1000.0)]), Value::Float(x) if x.is_infinite()));
+
+    // ln / log10 / log2: NULL for a non-positive argument (sqlite checks x<=0).
+    approx(call(ScalarFn::Ln, &[f(E)]), 1.0);
+    approx(call(ScalarFn::Ln, &[i(1)]), 0.0);
+    assert_eq!(call(ScalarFn::Ln, &[i(0)]), Value::Null);
+    assert_eq!(call(ScalarFn::Ln, &[i(-1)]), Value::Null);
+    approx(call(ScalarFn::Log10, &[i(100)]), 2.0);
+    assert_eq!(call(ScalarFn::Log10, &[i(0)]), Value::Null);
+    assert_eq!(call(ScalarFn::Log10, &[i(-1)]), Value::Null);
+    approx(call(ScalarFn::Log2, &[i(8)]), 3.0);
+    assert_eq!(call(ScalarFn::Log2, &[i(0)]), Value::Null);
+
+    // log(b, x): base b > 1 and x > 0, else NULL (matches sqlite exactly).
+    approx(call(ScalarFn::LogBase, &[i(2), i(8)]), 3.0);
+    approx(call(ScalarFn::LogBase, &[i(10), i(1000)]), 3.0);
+    approx(call(ScalarFn::LogBase, &[i(3), i(1)]), 0.0); // x == 1 is allowed
+    assert_eq!(call(ScalarFn::LogBase, &[i(1), i(5)]), Value::Null); // base == 1
+    assert_eq!(call(ScalarFn::LogBase, &[f(0.5), i(8)]), Value::Null); // base < 1
+    assert_eq!(call(ScalarFn::LogBase, &[i(0), i(5)]), Value::Null);
+    assert_eq!(call(ScalarFn::LogBase, &[i(-2), i(8)]), Value::Null);
+    assert_eq!(call(ScalarFn::LogBase, &[i(2), i(-1)]), Value::Null);
+
+    // Trig / hyperbolic. asin/acos out of [-1, 1] → NaN → NULL.
+    approx(call(ScalarFn::Sin, &[i(0)]), 0.0);
+    approx(call(ScalarFn::Cos, &[i(0)]), 1.0);
+    approx(call(ScalarFn::Tan, &[i(0)]), 0.0);
+    approx(call(ScalarFn::Asin, &[i(0)]), 0.0);
+    approx(call(ScalarFn::Acos, &[i(1)]), 0.0);
+    approx(call(ScalarFn::Atan, &[i(0)]), 0.0);
+    assert_eq!(call(ScalarFn::Asin, &[i(2)]), Value::Null);
+    assert_eq!(call(ScalarFn::Acos, &[i(2)]), Value::Null);
+    approx(call(ScalarFn::Sinh, &[i(0)]), 0.0);
+    approx(call(ScalarFn::Cosh, &[i(0)]), 1.0);
+    approx(call(ScalarFn::Tanh, &[i(0)]), 0.0);
+
+    // atan2(y, x): note y is the FIRST argument.
+    approx(call(ScalarFn::Atan2, &[i(1), i(1)]), PI / 4.0);
+    approx(call(ScalarFn::Atan2, &[i(1), i(0)]), PI / 2.0);
+    approx(call(ScalarFn::Atan2, &[i(0), i(1)]), 0.0);
+
+    // radians / degrees are exact inverses on these values.
+    approx(call(ScalarFn::Radians, &[i(180)]), PI);
+    approx(call(ScalarFn::Degrees, &[f(PI)]), 180.0);
+
+    // pi(): the one nullary scalar.
+    approx(call(ScalarFn::Pi, &[]), PI);
+
+    // mod(x, y) = fmod (sign of the dividend); a zero divisor → NULL, NOT the
+    // `%` operator's DivisionByZero error.
+    approx(call(ScalarFn::Mod, &[i(7), i(2)]), 1.0);
+    approx(call(ScalarFn::Mod, &[i(-7), i(2)]), -1.0);
+    approx(call(ScalarFn::Mod, &[i(7), i(-2)]), 1.0);
+    approx(call(ScalarFn::Mod, &[f(-7.5), i(2)]), -1.5);
+    assert_eq!(call(ScalarFn::Mod, &[i(5), i(0)]), Value::Null);
+
+    // trunc: type-PRESERVING like ceil/floor (int stays int, float truncates).
+    assert_eq!(call(ScalarFn::Trunc, &[f(2.9)]), Value::Float(2.0));
+    assert_eq!(call(ScalarFn::Trunc, &[f(-2.9)]), Value::Float(-2.0));
+    assert_eq!(call(ScalarFn::Trunc, &[i(5)]), Value::Int(5));
+
+    // NULL propagates through every one (pi has no argument).
+    for f in [ScalarFn::Exp, ScalarFn::Ln, ScalarFn::Sin, ScalarFn::Trunc] {
+        assert_eq!(call(f, &[Value::Null]), Value::Null);
+    }
+    assert_eq!(call(ScalarFn::Atan2, &[Value::Null, i(1)]), Value::Null);
+    assert_eq!(call(ScalarFn::LogBase, &[i(2), Value::Null]), Value::Null);
+    assert_eq!(call(ScalarFn::Mod, &[Value::Null, i(2)]), Value::Null);
+
+    // A non-number argument is a runtime type error, like sqrt/pow.
+    let bad = {
+        let p = prog(vec![Instr::PushParam(0), Instr::Call(ScalarFn::Sin, 1)], vec![]);
+        p.eval(&[], &[Value::Text("x".into())])
+    };
+    assert!(matches!(bad, Err(Error::Corrupt(_)) | Err(Error::TypeMismatch(_))));
+
+    // codec: a linear chain of the new tags round-trips, and truncation at every
+    // offset stays Corrupt rather than panicking (repo rule). Depth stays 1.
+    let p = prog(
+        vec![
+            Instr::PushConst(0),                // Float 8.0
+            Instr::Call(ScalarFn::Log2, 1),     // 3.0
+            Instr::Call(ScalarFn::Exp, 1),      // e^3
+            Instr::Call(ScalarFn::Ln, 1),       // 3.0
+            Instr::Call(ScalarFn::Trunc, 1),    // 3.0
+            Instr::Call(ScalarFn::Sin, 1),      // sin(3)
+        ],
+        vec![Value::Float(8.0)],
+    );
+    let mut buf = Vec::new();
+    p.encode_into(&mut buf);
+    let mut pos = 0;
+    assert_eq!(ExprProgram::decode(&buf, &mut pos).unwrap(), p);
+    assert_eq!(pos, buf.len());
+    for cut in 0..buf.len() {
+        let _ = ExprProgram::decode(&buf[..cut], &mut 0); // must not panic
+    }
+
+    // pi() round-trips as a zero-argument call.
+    let pp = prog(vec![Instr::Call(ScalarFn::Pi, 0)], vec![]);
+    let mut b2 = Vec::new();
+    pp.encode_into(&mut b2);
+    assert_eq!(ExprProgram::decode(&b2, &mut 0).unwrap(), pp);
+}
+
+#[test]
 fn is_distinct_is_null_safe_and_two_valued() {
     // `a IS b` == IsNotDistinct: NULL-safe equality that never yields NULL.
     let isnd = |a: Value, b: Value| {

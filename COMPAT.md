@@ -120,9 +120,14 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | unicode | ✅ | Unicode code point of the first character; NULL for the empty string |
 | hex | ✅ | uppercase hex of the argument's bytes (text or blob); a number is refused (sqlite renders it to text first). `hex(NULL)` is NULL, where sqlite gives `''` |
 | typeof | ✅ | datatype name; `typeof(NULL)` is `'null'` (the one scalar that does not NULL-propagate). The sqlite core names match (`integer`/`real`/`text`/`blob`); `bool`/`timestamp` report their own honest names |
-| abs, round, ceil / ceiling, floor | ✅ | keep their argument's numeric type (int stays int) |
+| abs, round, ceil / ceiling, floor, trunc | ✅ | keep their argument's numeric type (int stays int); `trunc` rounds toward zero |
 | sqrt, pow / power | ✅ | always float; a non-real result (sqrt of a negative) is NULL, matching sqlite |
 | sign | ✅ | always an integer: -1 / 0 / 1 |
+| exp, ln, log10 / log, log2, log(b, x) | ✅ | always float; `log`/`log10` is base-10, `log(b, x)` is base `b`; a non-positive argument is NULL (sqlite), and `log(b, x)` requires base `b > 1` |
+| sin, cos, tan, asin, acos, atan, atan2 | ✅ | radians; always float; `asin`/`acos` outside [-1, 1] → NULL; `atan2(y, x)` takes `y` first |
+| sinh, cosh, tanh | ✅ | hyperbolic; always float (overflow is `Inf`, matching sqlite) |
+| radians, degrees, pi | ✅ | angle conversions and the constant π; `pi()` is the one nullary function |
+| mod | ✅ | floating-point remainder `x - y*trunc(x/y)` (sign of the dividend); a zero divisor is NULL (not the `%` operator's error), matching sqlite |
 | substr / substring | ✅ | |
 | coalesce, ifnull | ✅ | compiled to lazy control flow, not a call — arguments after the first non-NULL are never evaluated; int64/float64 arm mixing refused, same rule as CASE |
 | nullif | ✅ | desugared to CASE |

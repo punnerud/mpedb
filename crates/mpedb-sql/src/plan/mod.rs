@@ -105,7 +105,14 @@ const MAX_JOINS: usize = 16;
 //     as corrupt rather than misreading it — same additive gating as the
 //     scalar-fn bumps 14-16. `iif` rides along with no new tag: it desugars to
 //     a CASE, exactly like `nullif`.
-const PLAN_FORMAT: u8 = 21;
+// 22: math scalar fns — `exp`/`ln`/`log10`/`log2`/`log`(base)/`sin`/`cos`/`tan`/
+//     `asin`/`acos`/`atan`/`atan2`/`sinh`/`cosh`/`tanh`/`radians`/`degrees`/`pi`/
+//     `mod`/`trunc` as additive `ScalarFn` tags 21..=40. A format-21 reader hits
+//     an unknown scalar tag in `ScalarFn::from_tag` and reports the plan as
+//     corrupt rather than misreading it — same additive gating as the scalar-fn
+//     bumps 14-16 and 21. `log`/`log10` and `mod`/`pi` add no new opcode: they
+//     are ordinary `Instr::Call`s, so only the whole-plan version gates them.
+const PLAN_FORMAT: u8 = 22;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

@@ -989,15 +989,47 @@ impl<'a> Binder<'a> {
             "sign" => ScalarFn::Sign,
             "ceil" | "ceiling" => ScalarFn::Ceil,
             "floor" => ScalarFn::Floor,
+            "trunc" => ScalarFn::Trunc,
             "unicode" => ScalarFn::Unicode,
             "hex" => ScalarFn::Hex,
             "typeof" => ScalarFn::Typeof,
+            // Math (sqlite 3.45). `log` is base-10 with one argument and
+            // log-base-b with two, so it dispatches on the argument count here —
+            // `log10`/`log2` name the fixed-base forms directly.
+            "exp" => ScalarFn::Exp,
+            "ln" => ScalarFn::Ln,
+            "log10" => ScalarFn::Log10,
+            "log2" => ScalarFn::Log2,
+            "log" => match args.len() {
+                1 => ScalarFn::Log10,
+                2 => ScalarFn::LogBase,
+                n => {
+                    return Err(bind_err(format!(
+                        "log() takes 1 argument (base-10) or 2 (log(base, x)), got {n}"
+                    )))
+                }
+            },
+            "sin" => ScalarFn::Sin,
+            "cos" => ScalarFn::Cos,
+            "tan" => ScalarFn::Tan,
+            "asin" => ScalarFn::Asin,
+            "acos" => ScalarFn::Acos,
+            "atan" => ScalarFn::Atan,
+            "atan2" => ScalarFn::Atan2,
+            "sinh" => ScalarFn::Sinh,
+            "cosh" => ScalarFn::Cosh,
+            "tanh" => ScalarFn::Tanh,
+            "radians" => ScalarFn::Radians,
+            "degrees" => ScalarFn::Degrees,
+            "pi" => ScalarFn::Pi,
+            "mod" => ScalarFn::Mod,
             other => {
                 return Err(bind_err(format!(
                     "unknown function `{other}()`; available: lower, upper, length, trim, \
                      ltrim, rtrim, replace, instr, substr, substring, char, unicode, hex, \
-                     typeof, abs, round, ceil, floor, sqrt, pow, sign, iif, coalesce, ifnull, \
-                     nullif"
+                     typeof, abs, round, ceil, floor, trunc, sqrt, pow, sign, exp, ln, log, \
+                     log10, log2, sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, \
+                     radians, degrees, pi, mod, iif, coalesce, ifnull, nullif"
                 )))
             }
         };
@@ -1023,9 +1055,10 @@ impl<'a> Binder<'a> {
             ScalarFn::Length | ScalarFn::Unicode => {
                 (&[Some(ColumnType::Text)], Some(ColumnType::Int64))
             }
-            // abs/round/ceil/floor keep their argument's numeric type, so they
-            // are checked below rather than pinned to one.
-            ScalarFn::Abs | ScalarFn::Round | ScalarFn::Ceil | ScalarFn::Floor => (&[], None),
+            // abs/round/ceil/floor/trunc keep their argument's numeric type, so
+            // they are checked below rather than pinned to one.
+            ScalarFn::Abs | ScalarFn::Round | ScalarFn::Ceil | ScalarFn::Floor
+            | ScalarFn::Trunc => (&[], None),
             ScalarFn::Substr => (
                 &[Some(ColumnType::Text), Some(ColumnType::Int64), Some(ColumnType::Int64)],
                 Some(ColumnType::Text),
@@ -1041,9 +1074,30 @@ impl<'a> Binder<'a> {
             ScalarFn::Instr => {
                 (&[Some(ColumnType::Text), Some(ColumnType::Text)], Some(ColumnType::Int64))
             }
-            // sqrt/pow take numbers (int or float, unpinned like abs/round) but
-            // ALWAYS return a float; sign always returns an integer.
-            ScalarFn::Sqrt | ScalarFn::Pow => (&[], Some(ColumnType::Float64)),
+            // sqrt/pow and the transcendental math functions take numbers (int
+            // or float, unpinned like abs/round) but ALWAYS return a float; `pi`
+            // is nullary and also returns a float. sign always returns an integer.
+            ScalarFn::Sqrt
+            | ScalarFn::Pow
+            | ScalarFn::Exp
+            | ScalarFn::Ln
+            | ScalarFn::Log10
+            | ScalarFn::Log2
+            | ScalarFn::LogBase
+            | ScalarFn::Sin
+            | ScalarFn::Cos
+            | ScalarFn::Tan
+            | ScalarFn::Asin
+            | ScalarFn::Acos
+            | ScalarFn::Atan
+            | ScalarFn::Atan2
+            | ScalarFn::Sinh
+            | ScalarFn::Cosh
+            | ScalarFn::Tanh
+            | ScalarFn::Radians
+            | ScalarFn::Degrees
+            | ScalarFn::Pi
+            | ScalarFn::Mod => (&[], Some(ColumnType::Float64)),
             ScalarFn::Sign => (&[], Some(ColumnType::Int64)),
             // hex accepts text OR blob — two types the fixed `want` table
             // cannot express — so its argument is left unpinned and checked in
@@ -1073,7 +1127,11 @@ impl<'a> Binder<'a> {
             }
         }
         let ret = match f {
-            ScalarFn::Abs | ScalarFn::Round | ScalarFn::Ceil | ScalarFn::Floor => {
+            ScalarFn::Abs
+            | ScalarFn::Round
+            | ScalarFn::Ceil
+            | ScalarFn::Floor
+            | ScalarFn::Trunc => {
                 // Numeric in, same numeric out. The type is the argument's.
                 let t = self.static_type(&out[0]);
                 match t {
@@ -1120,10 +1178,40 @@ impl<'a> Binder<'a> {
                 ScalarFn::Length | ScalarFn::Instr | ScalarFn::Sign | ScalarFn::Unicode,
                 _,
             ) => Some(ColumnType::Int64),
-            BExpr::Call(ScalarFn::Sqrt | ScalarFn::Pow, _) => Some(ColumnType::Float64),
-            BExpr::Call(ScalarFn::Abs | ScalarFn::Round | ScalarFn::Ceil | ScalarFn::Floor, a) => {
-                self.static_type(&a[0])
-            }
+            // sqrt/pow, the transcendental math functions, and nullary pi are
+            // always float.
+            BExpr::Call(
+                ScalarFn::Sqrt
+                | ScalarFn::Pow
+                | ScalarFn::Exp
+                | ScalarFn::Ln
+                | ScalarFn::Log10
+                | ScalarFn::Log2
+                | ScalarFn::LogBase
+                | ScalarFn::Sin
+                | ScalarFn::Cos
+                | ScalarFn::Tan
+                | ScalarFn::Asin
+                | ScalarFn::Acos
+                | ScalarFn::Atan
+                | ScalarFn::Atan2
+                | ScalarFn::Sinh
+                | ScalarFn::Cosh
+                | ScalarFn::Tanh
+                | ScalarFn::Radians
+                | ScalarFn::Degrees
+                | ScalarFn::Pi
+                | ScalarFn::Mod,
+                _,
+            ) => Some(ColumnType::Float64),
+            BExpr::Call(
+                ScalarFn::Abs
+                | ScalarFn::Round
+                | ScalarFn::Ceil
+                | ScalarFn::Floor
+                | ScalarFn::Trunc,
+                a,
+            ) => self.static_type(&a[0]),
             BExpr::Call(_, _) => Some(ColumnType::Text),
             BExpr::IsDistinct(..) => Some(ColumnType::Bool),
             _ => None,
