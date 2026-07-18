@@ -922,9 +922,20 @@ fn plan_insert(
     for (slot, &col) in listed.iter().enumerate() {
         slot_of_col[col as usize] = Some(slot);
     }
-    // Columns omitted from the list must be defaultable.
+    // A single-column INTEGER PRIMARY KEY is a rowid alias (sqlite): an omitted
+    // or NULL value auto-assigns at execution time, so it is exempt from both
+    // the "NOT NULL must be inserted" rule below and the NULL-const rejection.
+    // The auto-assign is carried as `InsertSource::Default` on that column —
+    // unambiguous, since a NOT-NULL no-default PK column could never take a
+    // Default before this feature (so no plan format change is needed).
+    let rowid_col = table.rowid_alias_col();
+    // Columns omitted from the list must be defaultable (the rowid alias is not).
     for (ci, col) in table.columns.iter().enumerate() {
-        if slot_of_col[ci].is_none() && !col.nullable && col.default.is_none() {
+        if slot_of_col[ci].is_none()
+            && !col.nullable
+            && col.default.is_none()
+            && Some(ci as u16) != rowid_col
+        {
             return Err(bind_err(format!(
                 "column `{}` is NOT NULL without a default and must be inserted",
                 col.name
@@ -983,6 +994,12 @@ fn plan_insert(
                 Some(slot) => {
                     let (b, _) = binder.bind_expr(&row[slot])?;
                     match b {
+                        // An explicit NULL on the rowid-alias PK auto-assigns,
+                        // exactly like an omitted value — carried as Default and
+                        // resolved to max(rowid)+1 at execution.
+                        BExpr::Const(v) if v.is_null() && Some(ci as u16) == rowid_col => {
+                            InsertSource::Default
+                        }
                         BExpr::Const(v) => {
                             let v = coerce_const(v, col.ty);
                             if v.is_null() && !col.nullable {
