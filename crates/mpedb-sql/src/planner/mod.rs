@@ -409,9 +409,23 @@ pub(crate) fn plan_statement(
             out.push(j.table);
         }
     };
+    // A subplan's tables are the statement's tables — stamp them too, and
+    // recursively for nested lifts (#73 §3), so a policy edit on ANY table read
+    // at ANY depth invalidates the cached plan. Missing a nested table's stamp
+    // would let it keep serving rows under a since-tightened policy (§4 leak).
+    fn stamp_subplan_tables(
+        s: &SubPlan,
+        select_tables: &impl Fn(&SelectPlan, &mut Vec<u32>),
+        out: &mut Vec<u32>,
+    ) {
+        select_tables(&s.plan, out);
+        for c in &s.subplans {
+            stamp_subplan_tables(c, select_tables, out);
+        }
+    }
     let mut stamped: Vec<u32> = Vec::new();
     for s in &subplans {
-        select_tables(&s.plan, &mut stamped);
+        stamp_subplan_tables(s, &select_tables, &mut stamped);
     }
     match &plan_stmt {
         PlanStmt::Select(sp) => select_tables(sp, &mut stamped),

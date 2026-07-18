@@ -44,6 +44,11 @@ pub(super) fn exec_aggregate(
     limit: Option<u64>,
     offset: Option<u64>,
     distinct: bool,
+    // First reserved result slot of THIS level (`subplan_base` at the top,
+    // `sub.sub_base` for a nested aggregate subplan) — where the per-row
+    // correlated fill writes. Unused when `correlated` is empty and
+    // `post_filter` is `None`.
+    base: usize,
     // #73 §1: the correlated subplans (per-row filled) and the correlated WHERE
     // residual. Empty/`None` for a plain aggregate, which behaves exactly as
     // before.
@@ -70,7 +75,7 @@ pub(super) fn exec_aggregate(
     let rows: Vec<Vec<Value>> = if correlated.is_empty() && post_filter.is_none() {
         rows
     } else {
-        correlated_survivors(ctx, schema, plan, params, rows, correlated, post_filter)?
+        correlated_survivors(ctx, schema, plan, params, base, rows, correlated, post_filter)?
             .into_iter()
             .map(|(row, _scratch)| row)
             .collect()
