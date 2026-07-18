@@ -52,7 +52,8 @@
 //! emits one `mpedb-ring-batch` stderr line per committed batch (never
 //! enable in throughput arms — the writes perturb timing).
 
-use crate::exec::{exec_stmt, resolve_part};
+use crate::exec::{exec_stmt_triggered, resolve_part};
+use crate::trigger::TriggerSet;
 use crate::{Database, ExecResult};
 use mpedb_core::{row, PendingIntent, WriteTxn};
 use mpedb_sql::{AccessPath, CompiledPlan, InsertSource, PlanStmt};
@@ -263,9 +264,10 @@ fn execute_prepared(
     txn: &mut WriteTxn<'_>,
     plan: &CompiledPlan,
     params: &[Value],
+    triggers: &TriggerSet,
 ) -> Result<u64> {
     let mut partial = false;
-    match exec_stmt(txn, &db.schema(), plan, params, &mut partial)? {
+    match exec_stmt_triggered(txn, &db.schema(), plan, params, &mut partial, triggers, 0)? {
         ExecResult::Affected(n) => Ok(n),
         _ => Err(Error::Internal("write plan returned rows".into())),
     }
@@ -373,6 +375,11 @@ fn optimistic_eligible(db: &Database, plan: &CompiledPlan) -> bool {
     let table = plan.footprint.tables_written.trailing_zeros();
     if db.engine.has_secondary_index(table) {
         return false; // index maintenance defeats key-level footprints
+    }
+    if db.table_has_after_insert_trigger(table) {
+        // The blind-apply path never calls the executor, so it would skip trigger
+        // firing — route such tables through the serial executor instead.
+        return false;
     }
     match &plan.stmt {
         PlanStmt::Insert { rows, .. } => rows.len() == 1,
@@ -631,9 +638,10 @@ fn tname(db: &Database, table: u32) -> String {
 /// Plain serial execute of one statement under a fresh writer lock — the
 /// optimistic fallback (ineligible statements and exhausted-retry conflicts).
 fn serial_execute(db: &Database, plan: &CompiledPlan, params: &[Value]) -> Result<ExecResult> {
+    let triggers = db.trigger_set()?;
     let mut txn = db.engine.begin_write()?;
     let mut partial = false;
-    match exec_stmt(&mut txn, &db.schema(), plan, params, &mut partial) {
+    match exec_stmt_triggered(&mut txn, &db.schema(), plan, params, &mut partial, &triggers, 0) {
         Ok(out) => {
             txn.commit()?;
             Ok(out)
@@ -744,6 +752,10 @@ pub(crate) fn lead_and_execute(
             }
         }
     }
+    // The trigger set to fire from: the leader's own gen-gated set, applied to
+    // its own statement AND every foreign intent it drains (DESIGN-TRIGGERS
+    // §4.5). Built here so the whole round shares one set.
+    let triggers = db.trigger_set()?;
     if !ring_enabled(db) {
         // pure direct path: no scans, no staging — nobody can be enqueued
         // (enqueue is gated identically, and durability is file-frozen so
@@ -751,7 +763,8 @@ pub(crate) fn lead_and_execute(
         let mut own_result = None;
         if let Some((plan, params)) = own {
             let mut partial = false;
-            match exec_stmt(&mut txn, &db.schema(), plan, params, &mut partial) {
+            match exec_stmt_triggered(&mut txn, &db.schema(), plan, params, &mut partial, &triggers, 0)
+            {
                 Ok(out) => own_result = Some(Ok(out)),
                 Err(e) => {
                     txn.abort();
@@ -799,7 +812,7 @@ pub(crate) fn lead_and_execute(
         match &p.prepared {
             Ok((plan, params)) => {
                 let sp = txn.savepoint();
-                match execute_prepared(db, &mut txn, plan, params) {
+                match execute_prepared(db, &mut txn, plan, params, &triggers) {
                     Ok(affected) => ring.stage_result(p.intent.idx, affected, 0, &[], next_txn),
                     Err(e) => {
                         txn.rollback_to(sp);
@@ -824,7 +837,7 @@ pub(crate) fn lead_and_execute(
     if let Some((plan, params)) = own {
         let sp = txn.savepoint();
         let mut partial = false;
-        match exec_stmt(&mut txn, &db.schema(), plan, params, &mut partial) {
+        match exec_stmt_triggered(&mut txn, &db.schema(), plan, params, &mut partial, &triggers, 0) {
             Ok(out) => own_result = Some(Ok(out)),
             Err(e) => {
                 txn.rollback_to(sp);

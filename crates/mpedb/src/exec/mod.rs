@@ -2,6 +2,7 @@
 //! transaction. Shared by the autocommit paths on [`crate::Database`] and the
 //! interactive [`crate::WriteSession`] via the [`TxnCtx`] abstraction.
 
+use crate::trigger::TriggerSet;
 use crate::ExecResult;
 use mpedb_core::{ReadTxn, WriteTxn};
 use mpedb_sql::{
@@ -392,12 +393,35 @@ pub(crate) fn exec_stmt(
     params: &[Value],
     partial: &mut bool,
 ) -> Result<ExecResult> {
+    // Read paths and any caller that cannot fire triggers use the trigger-free
+    // set — one empty-map lookup per written row, no allocation.
+    exec_stmt_triggered(ctx, schema, plan, params, partial, &TriggerSet::empty(), 0)
+}
+
+/// Maximum depth of the trigger cascade (DESIGN-TRIGGERS §4.4). Each level is a
+/// full statement execution, so this is deliberately conservative — far below
+/// sqlite's 1000. Exceeding it aborts the whole statement.
+pub(crate) const MAX_TRIGGER_DEPTH: u32 = 32;
+
+/// Like [`exec_stmt`], but with the trigger set to fire from (and the current
+/// cascade `depth`). The write paths pass the leader's/session's gen-gated
+/// [`TriggerSet`]; a trigger body re-enters here with `depth + 1` on the SAME
+/// `ctx`, never through the facade (DESIGN-TRIGGERS §4.3).
+pub(crate) fn exec_stmt_triggered(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    partial: &mut bool,
+    triggers: &TriggerSet,
+    depth: u32,
+) -> Result<ExecResult> {
     // #40 instrument: statement-total time, so resolve + stmt reconciles
     // against execute()'s wall clock and nothing hides between the phases.
     #[cfg(feature = "leakstat")]
     {
         let t0 = std::time::Instant::now();
-        let r = exec_stmt_impl(ctx, schema, plan, params, partial);
+        let r = exec_stmt_impl(ctx, schema, plan, params, partial, triggers, depth);
         mpedb_core::engine::leakstat::add(
             &mpedb_core::engine::leakstat::EXEC_NS_STMT,
             t0.elapsed().as_nanos() as u64,
@@ -405,7 +429,7 @@ pub(crate) fn exec_stmt(
         r
     }
     #[cfg(not(feature = "leakstat"))]
-    exec_stmt_impl(ctx, schema, plan, params, partial)
+    exec_stmt_impl(ctx, schema, plan, params, partial, triggers, depth)
 }
 
 fn exec_stmt_impl(
@@ -414,6 +438,8 @@ fn exec_stmt_impl(
     plan: &CompiledPlan,
     params: &[Value],
     partial: &mut bool,
+    triggers: &TriggerSet,
+    depth: u32,
 ) -> Result<ExecResult> {
     validate_params(plan, params)?;
     // Uncorrelated subplans evaluate ONCE per execute, into their reserved
@@ -442,7 +468,7 @@ fn exec_stmt_impl(
     match &plan.stmt {
         PlanStmt::Select(sp) => exec_select_top(ctx, schema, plan, params, sp),
         PlanStmt::Compound(c) => exec_compound(ctx, schema, plan, params, c),
-        _other => exec_stmt_rest(ctx, schema, plan, params, partial),
+        _other => exec_stmt_rest(ctx, schema, plan, params, partial, triggers, depth),
     }
 }
 
@@ -1056,6 +1082,8 @@ fn exec_stmt_rest(
     plan: &CompiledPlan,
     params: &[Value],
     partial: &mut bool,
+    triggers: &TriggerSet,
+    depth: u32,
 ) -> Result<ExecResult> {
     match &plan.stmt {
         PlanStmt::Select(_) | PlanStmt::Compound(_) => {
@@ -1134,6 +1162,16 @@ fn exec_stmt_rest(
                         written += 1;
                         if let Some(proj) = returning {
                             out.push(project_row(proj, &row, params)?);
+                        }
+                        // AFTER INSERT FOR EACH ROW triggers fire on the row just
+                        // written, on the SAME txn (DESIGN-TRIGGERS §4.1/§4.3). A
+                        // failing trigger poisons the statement: the row landed and
+                        // the body may have written before it raised.
+                        if let Err(e) =
+                            fire_after_insert(ctx, schema, *table, &row, triggers, depth)
+                        {
+                            *partial = true;
+                            return Err(e);
                         }
                     }
                     Err(e) if is_uniqueness(&e) && !matches!(on_conflict, PlanOnConflict::Error) => {
@@ -1394,6 +1432,65 @@ fn exec_stmt_rest(
                 .into(),
         )),
     }
+}
+
+/// Fire every `AFTER INSERT FOR EACH ROW` trigger on `table` for one written
+/// row, on the SAME `ctx` (DESIGN-TRIGGERS §4). Each trigger's optional `WHEN`
+/// is a 3VL gate (only TRUE fires; NULL and FALSE skip); the body is an ordinary
+/// plan whose leading parameters are the NEW columns, executed by recursing on
+/// the held txn at `depth + 1` — never through the facade, so the writer lock and
+/// intent ring are never re-entered. A hard depth cap bounds any cascade.
+fn fire_after_insert(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    table: u32,
+    new_row: &[Value],
+    triggers: &TriggerSet,
+    depth: u32,
+) -> Result<()> {
+    let Some(trigs) = triggers.after_insert.get(&table) else {
+        return Ok(());
+    };
+    if trigs.is_empty() {
+        return Ok(());
+    }
+    if depth + 1 > MAX_TRIGGER_DEPTH {
+        return Err(Error::Unsupported(format!(
+            "trigger recursion too deep (> {MAX_TRIGGER_DEPTH} levels)"
+        )));
+    }
+    // Fill a NEW-column map from the inserted row image.
+    let pick = |map: &[u16]| -> Result<Vec<Value>> {
+        map.iter()
+            .map(|&c| {
+                new_row
+                    .get(c as usize)
+                    .cloned()
+                    .ok_or_else(|| internal("trigger NEW column out of row bounds"))
+            })
+            .collect()
+    };
+    for trig in trigs {
+        if let Some((prog, when_map)) = &trig.when {
+            let wp = pick(when_map)?;
+            let mut stack = Vec::new();
+            if !prog.eval_filter(&mut stack, &[], &wp)? {
+                continue;
+            }
+        }
+        let body_params = pick(&trig.body_new_map)?;
+        let mut inner_partial = false;
+        exec_stmt_triggered(
+            ctx,
+            schema,
+            &trig.body,
+            &body_params,
+            &mut inner_partial,
+            triggers,
+            depth + 1,
+        )?;
+    }
+    Ok(())
 }
 
 /// Project one written row through a `RETURNING` clause.
