@@ -1,14 +1,16 @@
-//! SQL triggers (DESIGN-TRIGGERS, stages 0-2). Fires `AFTER INSERT`,
-//! `AFTER UPDATE`, and `AFTER DELETE FOR EACH ROW` triggers with a
-//! single-statement SQL body and an optional `WHEN`, binding `NEW.<col>` (the
+//! SQL triggers (DESIGN-TRIGGERS, stages 0-3). Fires `BEFORE`/`AFTER` ×
+//! `INSERT`/`UPDATE`/`DELETE FOR EACH ROW` triggers with a multi-statement SQL
+//! body (`BEGIN <stmt>; … END`) and an optional `WHEN`, binding `NEW.<col>` (the
 //! post-image) and `OLD.<col>` (the pre-image) per event. Cross-checked against
 //! sqlite 3.45: an AFTER INSERT audit trigger, an AFTER UPDATE trigger logging
 //! OLD+NEW, an AFTER DELETE trigger logging OLD, WHEN-gated ones (over OLD and
-//! NEW), and INSERT … SELECT bodies produce exactly the rows sqlite does. Also
-//! covers DROP TRIGGER, IF NOT EXISTS / IF EXISTS, persistence across reopen, the
-//! recursion-depth guard, and the named refusals (BEFORE / INSTEAD OF /
-//! FOR EACH STATEMENT / UPDATE OF cols / EXECUTE PROCEDURE / OLD in INSERT /
-//! NEW in DELETE).
+//! NEW), INSERT … SELECT bodies, a multi-statement AFTER INSERT body, an
+//! `UPDATE OF <col>` trigger that fires/does-not-fire on the SET target, and a
+//! BEFORE INSERT trigger that observes the pre-mutation table state — all
+//! producing exactly the rows sqlite does. Also covers DROP TRIGGER, IF NOT
+//! EXISTS / IF EXISTS, persistence across reopen, the recursion-depth guard, and
+//! the named refusals (INSTEAD OF / FOR EACH STATEMENT / EXECUTE PROCEDURE /
+//! OLD in INSERT / NEW in DELETE).
 
 use mpedb::{Config, Database, ExecResult, Value};
 use std::io::Write;
@@ -256,14 +258,10 @@ fn recursion_depth_guard_aborts_and_rolls_back() {
 }
 
 #[test]
-fn stage2_named_refusals() {
+fn stage3_named_refusals() {
     let (db, _p) = open("refuse");
     apply(&db, &["CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER, tag TEXT)"]);
     let body = "BEGIN INSERT INTO orders (id, total, tag) VALUES (9, 0, 'x'); END";
-    // Later-stage timings: BEFORE is refused by name at CREATE.
-    assert!(db.query(&format!("CREATE TRIGGER t BEFORE INSERT ON orders FOR EACH ROW {body}"), &[]).is_err());
-    // `UPDATE OF <cols>` column lists are stage 3 — refused (plain UPDATE fires).
-    assert!(db.query(&format!("CREATE TRIGGER t AFTER UPDATE OF total ON orders FOR EACH ROW {body}"), &[]).is_err());
     // Grammar-level refusals.
     assert!(db.query("CREATE TRIGGER t INSTEAD OF INSERT ON orders BEGIN DELETE FROM orders; END", &[]).is_err());
     assert!(db
@@ -389,5 +387,74 @@ fn after_delete_when_gated_matches_sqlite() {
             "DELETE FROM orders",
         ],
         "SELECT id, old_total FROM audit ORDER BY id",
+    );
+}
+
+#[test]
+fn multi_statement_after_insert_matches_sqlite() {
+    // A BEGIN <stmt>; <stmt>; END body: two inserts run in order on the same txn
+    // (DESIGN-TRIGGERS stage 3). Keyed by distinct NEW columns (id vs total) so
+    // both rows land — the test proves both body statements fire, in order.
+    cross_check_full(
+        "multi",
+        &[
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER, tag TEXT)",
+            "CREATE TABLE audit (id INTEGER PRIMARY KEY, oid INTEGER, note TEXT)",
+            "CREATE TRIGGER audit_multi AFTER INSERT ON orders FOR EACH ROW \
+             BEGIN \
+               INSERT INTO audit (id, oid, note) VALUES (NEW.id, NEW.id, 'a'); \
+               INSERT INTO audit (id, oid, note) VALUES (NEW.total, NEW.id, 'b'); \
+             END",
+            "INSERT INTO orders (id, total, tag) VALUES (1, 50, 'x')",
+            "INSERT INTO orders (id, total, tag) VALUES (2, 150, 'y')",
+        ],
+        "SELECT id, oid, note FROM audit ORDER BY id",
+    );
+}
+
+#[test]
+fn update_of_fires_only_on_named_column_matches_sqlite() {
+    // `AFTER UPDATE OF total`: fires when the SET list assigns `total`, and NOT
+    // when the UPDATE only touches `tag` (sqlite's SET-target semantics). id 1's
+    // total-changing UPDATE logs a row; id 2's tag-only UPDATE logs nothing.
+    cross_check_full(
+        "updof",
+        &[
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER, tag TEXT)",
+            "CREATE TABLE audit (id INTEGER PRIMARY KEY, new_total INTEGER)",
+            "CREATE TRIGGER audit_updof AFTER UPDATE OF total ON orders FOR EACH ROW \
+             BEGIN INSERT INTO audit (id, new_total) VALUES (NEW.id, NEW.total); END",
+            "INSERT INTO orders (id, total, tag) VALUES (1, 50, 'a')",
+            "INSERT INTO orders (id, total, tag) VALUES (2, 150, 'b')",
+            "UPDATE orders SET total = 77 WHERE id = 1",
+            "UPDATE orders SET tag = 'z' WHERE id = 2",
+        ],
+        "SELECT id, new_total FROM audit ORDER BY id",
+    );
+}
+
+#[test]
+fn before_insert_sees_pre_image_matches_sqlite() {
+    // A BEFORE INSERT multi-statement body. The first statement logs the row
+    // unconditionally; the second is an INSERT … SELECT reading the target table
+    // for the row being inserted. At BEFORE time that row is not yet present, so
+    // the self-select finds nothing and the second insert is a no-op — the audit
+    // holds only the 'pre' rows. (An AFTER trigger would additionally log the
+    // 'self' rows.) sqlite, fed the same BEFORE trigger, agrees exactly.
+    cross_check_full(
+        "before",
+        &[
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER, tag TEXT)",
+            "CREATE TABLE audit (id INTEGER PRIMARY KEY, oid INTEGER, note TEXT)",
+            "CREATE TRIGGER bins BEFORE INSERT ON orders FOR EACH ROW \
+             BEGIN \
+               INSERT INTO audit (id, oid, note) VALUES (NEW.id, NEW.id, 'pre'); \
+               INSERT INTO audit (id, oid, note) \
+                 SELECT NEW.id + 100, id, 'self' FROM orders WHERE id = NEW.id; \
+             END",
+            "INSERT INTO orders (id, total, tag) VALUES (1, 50, 'a')",
+            "INSERT INTO orders (id, total, tag) VALUES (2, 150, 'b')",
+        ],
+        "SELECT id, oid, note FROM audit ORDER BY id",
     );
 }

@@ -376,10 +376,10 @@ fn optimistic_eligible(db: &Database, plan: &CompiledPlan) -> bool {
     if db.engine.has_secondary_index(table) {
         return false; // index maintenance defeats key-level footprints
     }
-    if db.table_has_after_trigger(table) {
+    if db.table_has_trigger(table) {
         // The blind-apply path never calls the executor, so it would skip firing
-        // ANY after-trigger (insert/update/delete) — route such tables through
-        // the serial executor instead.
+        // ANY trigger — BEFORE or AFTER, insert/update/delete — route such tables
+        // through the serial executor instead.
         return false;
     }
     match &plan.stmt {

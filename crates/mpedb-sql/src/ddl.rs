@@ -84,7 +84,8 @@ pub struct CreateTriggerSpec {
     pub table: String,
     /// Captured `WHEN (…)` predicate source, if any.
     pub when_src: Option<String>,
-    /// Captured `BEGIN … END` body source (a single statement in v1).
+    /// Captured `BEGIN … END` body source — one or more `;`-separated
+    /// INSERT/UPDATE/DELETE statements, split and compiled at apply/load time.
     pub body_sql: String,
     pub if_not_exists: bool,
 }
