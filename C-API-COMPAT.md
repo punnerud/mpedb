@@ -207,8 +207,17 @@ Addressed since the import-loads milestone (see the tables above): the facade
 common `SELECT … FROM sqlite_master` introspection forms — the single biggest
 gap for Django's connection setup and schema editor is now covered.
 
-Still blocking:
+Still blocking (ranked by real-app impact):
 
+0. **No implicit `rowid` — a table must declare a PRIMARY KEY.** sqlite gives
+   every table without an explicit PK a hidden integer `rowid`; mpedb requires
+   one (`CREATE TABLE t(a)` → "no PRIMARY KEY declared"). This is the single
+   biggest C-API blocker: Django models, most sqlite apps, and CPython's own
+   `sqlite3` test suite create PK-less tables. Needs an engine feature — a
+   synthesized hidden auto-increment rowid column (the runner shim's synthetic
+   `rowid_` column is the same workaround). *A typeless NON-key column now works*
+   (`CREATE TABLE t(id INTEGER PRIMARY KEY, data)` → `data` is `Any`); only the
+   PK-less / typeless-key cases remain.
 1. **DDL inside an explicit transaction is rejected** — now with a *clear* error
    (`unsupported: DDL … run it in autocommit, outside BEGIN/COMMIT`) instead of
    the engine's bare "expected a statement". mpedb's `CREATE`/`DROP`/`ALTER` run
@@ -243,3 +252,10 @@ Still blocking:
   `lastrowid`), skipping gracefully when `python3` is absent.
 - `python3 crates/mpedb-capi/tests/smoke.py <cdylib>` — a `ctypes` consumer
   drives the same flow (the shape Python's `sqlite3` uses).
+- `tests/dbapi_battery.py` — a **DB-API 2.0 compliance battery** (module/
+  connection/cursor/execute/executemany/fetch*/description/type round-trip/
+  transactions/executescript/IntegrityError). Run it against the shim
+  (`LD_PRELOAD=<cdylib> python3 …/dbapi_battery.py`) and against stock sqlite3
+  (no preload) for a baseline. **Current: stock 23/23; shim 17/23** — the 6
+  gaps are all one of: PK-less tables (blocker 0), or named `:params`
+  (blocker 4). No wrong answers, only refusals.
