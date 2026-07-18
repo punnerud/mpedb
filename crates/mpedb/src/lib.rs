@@ -75,6 +75,7 @@ pub use mpedb_types::{
 };
 
 use exec::{exec_stmt, ReadCtx};
+pub use exec::take_last_insert_rowid;
 use mpedb_core::{CheckPrograms, Engine, WriteTxn};
 use mpedb_sql::{CompiledPlan, PlanStmt};
 use registry::{decode_registry_plan, patched_last_used, plan_subkey};

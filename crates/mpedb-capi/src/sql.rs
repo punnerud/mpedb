@@ -117,6 +117,60 @@ pub fn param_count(sql: &str) -> usize {
     auto.max(max_num)
 }
 
+/// `sqlite3_complete`: true if `sql` forms one or more complete statements —
+/// i.e. the last non-blank, non-comment code character is a `;`. Empty or
+/// comment-only input is not complete.
+pub fn is_complete(sql: &str) -> bool {
+    let mut last: Option<u8> = None;
+    scan_code(sql, |_, c| {
+        if !c.is_ascii_whitespace() {
+            last = Some(c);
+        }
+    });
+    last == Some(b';')
+}
+
+/// The name of each bound parameter in appearance order, for
+/// `sqlite3_bind_parameter_name`. A named parameter (`:name`, `@name`,
+/// `$name` where `name` starts with a letter or `_`) yields `Some` of its
+/// spelling *including* the leading sigil and a trailing NUL; an anonymous or
+/// numbered parameter (`?`, `?12`, `$3`) yields `None`. The vector length
+/// matches the sequential-parameter count (`?`/named tokens each advance the
+/// index; explicit `?N`/`$N` numbers are not gap-filled — mpedb refuses to mix
+/// the styles, so in practice a statement is all-`?`, all-`$N`, or all-named).
+pub fn param_names(sql: &str) -> Vec<Option<Vec<u8>>> {
+    let b = sql.as_bytes();
+    let mut out: Vec<Option<Vec<u8>>> = Vec::new();
+    scan_code(sql, |i, c| {
+        match c {
+            b'?' => {
+                // `?` or `?NNN` — anonymous/numbered, no name.
+                out.push(None);
+            }
+            b'$' | b':' | b'@' => {
+                let mut j = i + 1;
+                // `$3` is numbered (no name); `$a`/`:a`/`@a` is named.
+                if j < b.len() && (b[j].is_ascii_alphabetic() || b[j] == b'_') {
+                    let start = i; // include the sigil
+                    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                        j += 1;
+                    }
+                    let mut name = b[start..j].to_vec();
+                    name.push(0);
+                    out.push(Some(name));
+                } else if c == b'$' && j < b.len() && b[j].is_ascii_digit() {
+                    // `$NNN` — numbered positional, no name.
+                    out.push(None);
+                }
+                // A lone `:`/`@` (e.g. a cast `::`, or punctuation) is not a
+                // parameter and contributes nothing.
+            }
+            _ => {}
+        }
+    });
+    out
+}
+
 /// The leading keyword classification the shim acts on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kind {
@@ -132,7 +186,13 @@ pub enum Kind {
     /// SELECT / VALUES / WITH / EXPLAIN — produces rows, side-effect free, so
     /// column metadata may be resolved eagerly.
     Read,
-    /// CREATE / DROP / ALTER / everything else — hand straight to the engine.
+    /// CREATE / DROP / ALTER / REINDEX — schema DDL. mpedb routes these through
+    /// `parse_ddl`/`apply_ddl`, NOT the `compile`d-plan path, so the shim must
+    /// NOT validate them with `prepare_detached` (which only compiles queries):
+    /// it defers them to execution, where `Database::query` applies the DDL.
+    Ddl,
+    /// Everything else (PRAGMA, and any unrecognized leading word) — hand
+    /// straight to the engine, validating at prepare so typos surface there.
     Other,
 }
 
@@ -187,6 +247,10 @@ pub fn classify(sql: &str) -> Kind {
             has_returning: has_returning(sql),
         },
         "select" | "values" | "with" | "explain" => Kind::Read,
+        // Exactly what mpedb applies via `parse_ddl`/`apply_ddl`. Others that
+        // happen to be "DDL-ish" (VACUUM/ANALYZE/REINDEX) are left to `Other`,
+        // so they validate-and-refuse at prepare like any unsupported statement.
+        "create" | "drop" | "alter" => Kind::Ddl,
         _ => Kind::Other,
     }
 }
@@ -230,6 +294,10 @@ mod tests {
         assert_eq!(classify("SELECT 1"), Kind::Read);
         assert!(matches!(classify("INSERT INTO t VALUES (1) RETURNING id"), Kind::Dml { has_returning: true }));
         assert!(matches!(classify("delete from t"), Kind::Dml { has_returning: false }));
-        assert_eq!(classify("CREATE TABLE t (id int)"), Kind::Other);
+        assert_eq!(classify("CREATE TABLE t (id int)"), Kind::Ddl);
+        assert_eq!(classify("DROP TABLE t"), Kind::Ddl);
+        assert_eq!(classify("alter table t add column c int"), Kind::Ddl);
+        assert_eq!(classify("PRAGMA foreign_keys=ON"), Kind::Other);
+        assert_eq!(classify("SELCT typo"), Kind::Other);
     }
 }
