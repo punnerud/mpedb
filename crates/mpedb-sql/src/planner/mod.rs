@@ -26,7 +26,7 @@ use crate::binder::{compile_program, BExpr, Binder, Scope, Ty};
 use crate::plan::{
     render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource,
     CompoundPlan, GroupKey, Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp,
-    Projection, SelectPlan, SubPlan, SubPlanKind, WindowSpec,
+    Projection, RecursiveCtePlan, SelectPlan, SubPlan, SubPlanKind, WindowSpec, CTE_TABLE,
 };
 #[allow(unused_imports)]
 use crate::plan::{FtsQuery, FtsTerm};
@@ -39,6 +39,7 @@ mod aggregate;
 mod footprint;
 mod fts;
 mod join;
+mod recursive;
 mod select;
 mod subquery;
 mod window;
@@ -50,8 +51,20 @@ pub(crate) use footprint::compute_footprint;
 use access::extract_access;
 use aggregate::{contains_agg, plan_aggregate_select};
 use join::plan_join_select;
+use recursive::plan_recursive_cte;
 use select::plan_select;
 use window::{contains_window, plan_window_select};
+
+/// A recursive CTE's working table in name-resolution scope, present only while
+/// planning the RECURSIVE TERM and the OUTER statement of a `WITH RECURSIVE`
+/// (design/DESIGN-CTE-RECURSIVE.md). `None` for every ordinary statement. The
+/// `def` carries the [`CTE_TABLE`] sentinel id and the CTE's columns, so a
+/// `FROM <name>` reference binds to the working table instead of the schema.
+#[derive(Clone, Copy)]
+pub(super) struct CteRef<'a> {
+    pub name: &'a str,
+    pub def: &'a TableDef,
+}
 
 fn and(a: BExpr, b: BExpr) -> BExpr {
     BExpr::Binary(BinOp::And, Box::new(a), Box::new(b))
@@ -369,8 +382,11 @@ pub(crate) fn plan_statement(
         ast::Stmt::Savepoint(n) => txn(PlanStmt::Savepoint(n.clone())),
         ast::Stmt::Release(n) => txn(PlanStmt::Release(n.clone())),
         ast::Stmt::RollbackTo(n) => txn(PlanStmt::RollbackTo(n.clone())),
-        ast::Stmt::Select(s) => plan_select(s, schema, n_params, catalog, &mut consts)?,
+        ast::Stmt::Select(s) => plan_select(s, schema, n_params, catalog, &mut consts, None)?,
         ast::Stmt::Compound(c) => plan_compound(c, schema, n_params, catalog, &mut consts)?,
+        ast::Stmt::RecursiveCte(rc) => {
+            plan_recursive_cte(rc, schema, n_params, catalog, &mut consts)?
+        }
         ast::Stmt::Insert(s) => plan_insert(s, schema, n_params, catalog, &mut consts)?,
         ast::Stmt::Update(s) => plan_update(s, schema, n_params, catalog, &mut consts)?,
         ast::Stmt::Delete(s) => plan_delete(s, schema, n_params, catalog, &mut consts)?,
@@ -445,6 +461,13 @@ pub(crate) fn plan_statement(
             stamped.sort_unstable();
             stamped.dedup();
         }
+        // A recursive CTE reads the base tables of all three components; stamp
+        // each (the CTE working table itself is filtered out below).
+        PlanStmt::RecursiveCte(rc) => {
+            select_tables(&rc.anchor, &mut stamped);
+            select_tables(&rc.recursive, &mut stamped);
+            select_tables(&rc.outer, &mut stamped);
+        }
         PlanStmt::Insert { table, .. }
         | PlanStmt::Update { table, .. }
         | PlanStmt::Delete { table, .. } => stamped.push(*table),
@@ -455,6 +478,10 @@ pub(crate) fn plan_statement(
         | PlanStmt::Release(_)
         | PlanStmt::RollbackTo(_) => {}
     }
+    // The DUAL and recursive-CTE working-table sentinels are not catalog tables —
+    // they carry no policy, so never stamp them (and `catalog.get` would treat a
+    // u32::MAX-ish id as an ordinary miss, wasting a stamp slot).
+    stamped.retain(|&t| t != crate::plan::DUAL_TABLE && t != CTE_TABLE);
     // One stamp per table is enough however many places read it.
     stamped.sort_unstable();
     stamped.dedup();
@@ -492,6 +519,23 @@ fn resolve_table<'s>(schema: &'s Schema, name: &str) -> Result<(u32, &'s TableDe
         .table_id(name)
         .ok_or_else(|| bind_err(format!("unknown table `{name}`")))?;
     Ok((id, schema.table(id).expect("id from table_id")))
+}
+
+/// Like [`resolve_table`], but a name matching the in-scope recursive CTE (if
+/// any) resolves to its working table (id [`CTE_TABLE`], `def` from the
+/// [`CteRef`]) instead of the schema. Identifiers are case-sensitive (as
+/// everywhere in mpedb), matching `resolve_table`'s exact name lookup.
+fn resolve_table_cte<'s>(
+    schema: &'s Schema,
+    cte: Option<CteRef<'s>>,
+    name: &str,
+) -> Result<(u32, &'s TableDef)> {
+    if let Some(c) = cte {
+        if name == c.name {
+            return Ok((CTE_TABLE, c.def));
+        }
+    }
+    resolve_table(schema, name)
 }
 
 
@@ -697,7 +741,7 @@ fn plan_compound(
 
     for (k, arm_ast) in c.arms.iter().enumerate() {
         let (stmt, ptypes, ckeys, lkeys, otypes, arm_subs) =
-            plan_select(arm_ast, schema, n_params, catalog, consts)?;
+            plan_select(arm_ast, schema, n_params, catalog, consts, None)?;
         let PlanStmt::Select(sp) = stmt else {
             return Err(Error::Internal("plan_select produced a non-select".into()));
         };
@@ -883,7 +927,7 @@ fn plan_insert(
     let mut sel_subplans: Vec<SubPlan> = Vec::new();
     if let Some(sel_stmt) = &s.select {
         let (sp_stmt, sp_pt, sp_ctx, sp_list, _sp_agg, sp_sub) =
-            plan_select(sel_stmt, schema, n_params, catalog, consts)?;
+            plan_select(sel_stmt, schema, n_params, catalog, consts, None)?;
         let PlanStmt::Select(sp) = sp_stmt else {
             return Err(bind_err(
                 "INSERT … SELECT: a compound (UNION/EXCEPT/INTERSECT) source is not supported",

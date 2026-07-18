@@ -48,15 +48,20 @@ fn select_footprint(sp: &SelectPlan, schema: &Schema) -> Result<Footprint> {
         // this reader, and the commit path would group them as independent.
         // FROM-less (DUAL sentinel): no table read, no bit set — the plan
         // conflicts with nothing, which is exactly true. `table_bit` would
-        // rightly reject u32::MAX as out of range.
-        let mut tables_read = if *table == crate::plan::DUAL_TABLE {
-            0
-        } else {
-            table_bit(*table)?
-        };
+        // rightly reject u32::MAX as out of range. The recursive-CTE working
+        // table (CTE_TABLE) is likewise not a catalog table: it lives in memory
+        // and reads no real page, so it sets no bit either.
+        let mut tables_read =
+            if *table == crate::plan::DUAL_TABLE || *table == crate::plan::CTE_TABLE {
+                0
+            } else {
+                table_bit(*table)?
+            };
         let mut key_access = key_access;
         for j in joins {
-            tables_read |= table_bit(j.table)?;
+            if j.table != crate::plan::CTE_TABLE {
+                tables_read |= table_bit(j.table)?;
+            }
             let (jkey, jidx) = access_key_and_indexes(&j.access);
             indexes_used |= jidx;
             let _ = jkey;
@@ -141,6 +146,26 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
             let mut indexes_used = 0u64;
             for arm in &c.arms {
                 let f = select_footprint(arm, schema)?;
+                tables_read |= f.tables_read;
+                indexes_used |= f.indexes_used;
+            }
+            Footprint {
+                tables_read,
+                tables_written: 0,
+                indexes_used,
+                key_access: KeyAccess::Full,
+                read_only: true,
+            }
+        }
+        // A recursive CTE reads the UNION of what its anchor, recursive term and
+        // outer statement read (the working table itself sets no bit —
+        // `select_footprint` skips CTE_TABLE). Read-only, several key spaces ⇒
+        // Full, exactly like a compound.
+        PlanStmt::RecursiveCte(rc) => {
+            let mut tables_read = 0u64;
+            let mut indexes_used = 0u64;
+            for sp in [&rc.anchor, &rc.recursive, &rc.outer] {
+                let f = select_footprint(sp, schema)?;
                 tables_read |= f.tables_read;
                 indexes_used |= f.indexes_used;
             }

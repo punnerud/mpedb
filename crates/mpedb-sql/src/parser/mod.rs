@@ -123,6 +123,18 @@ pub(crate) fn parse_statement_ctes(sql: &str) -> Result<(Stmt, bool, u16, CteDef
     } else {
         false
     };
+    // `WITH RECURSIVE …` is a wholly different mechanism from a non-recursive
+    // `WITH` (a fixpoint, not bind-time flattening), so it is parsed here into a
+    // single `Stmt::RecursiveCte` rather than a `(name, body)` CTE list.
+    let is_recursive_with = matches!(p.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("WITH"))
+        && matches!(p.peek_at(1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("RECURSIVE"));
+    if is_recursive_with {
+        let stmt = p.recursive_cte_stmt()?;
+        p.eat(&Tok::Semicolon);
+        p.expect_eof()?;
+        let n_params = p.n_params()?;
+        return Ok((stmt, is_explain, n_params, Vec::new()));
+    }
     let ctes = p.with_prefix()?;
     let stmt = p.statement()?;
     p.eat(&Tok::Semicolon);
@@ -354,6 +366,91 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(ctes)
+    }
+
+    /// Parse a `WITH RECURSIVE t(c1, …) AS (<anchor> UNION[ ALL] <recursive>)
+    /// <outer>` statement (design/DESIGN-CTE-RECURSIVE.md stage 1). The body is
+    /// captured verbatim and re-parsed as a 2-arm UNION compound — reusing the
+    /// parser's own arm splitting rather than scanning for the operator, so a
+    /// UNION nested in a subquery cannot miscount the arms. The body must be
+    /// parameter-free (like a non-recursive CTE body); the OUTER statement's
+    /// params flow through the main parser as usual.
+    fn recursive_cte_stmt(&mut self) -> Result<Stmt> {
+        self.eat_word("WITH"); // presence checked by the caller
+        self.eat_word("RECURSIVE");
+        let name = self.ident("a CTE name after WITH RECURSIVE")?;
+        // The column list is REQUIRED for a recursive CTE (sqlite enforces it).
+        self.expect(&Tok::LParen, "a `(column, …)` list — required for a recursive CTE")?;
+        let mut columns = Vec::new();
+        loop {
+            columns.push(self.ident("a column name in the recursive CTE column list")?);
+            if columns.len() > 1024 {
+                return Err(self.err_here("too many columns in the recursive CTE list"));
+            }
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RParen, "`)` to close the recursive CTE column list")?;
+        self.expect_kw(Kw::As, "AS after the recursive CTE column list")?;
+        let body_src = self.capture_paren_source()?;
+        // Re-parse the body as its own statement: it must be a 2-arm
+        // UNION / UNION ALL compound, parameter-free.
+        let (body_stmt, body_explain, body_params) = parse_statement(&body_src)?;
+        if body_explain {
+            return Err(self.err_here("EXPLAIN is not allowed inside a recursive CTE body"));
+        }
+        if body_params != 0 {
+            return Err(self.err_here("a recursive CTE body may not use parameters"));
+        }
+        let comp = match body_stmt {
+            Stmt::Compound(c) => c,
+            _ => {
+                return Err(self.err_here(
+                    "a recursive CTE body must be `<anchor> UNION [ALL] <recursive>`",
+                ))
+            }
+        };
+        if comp.arms.len() != 2 {
+            return Err(self.err_here(
+                "stage 1 supports exactly one anchor and one recursive term \
+                 (a single UNION [ALL])",
+            ));
+        }
+        if !comp.order_by.is_empty() || comp.limit.is_some() || comp.offset.is_some() {
+            return Err(self.err_here(
+                "ORDER BY / LIMIT inside a recursive CTE body is not supported yet \
+                 (stage 1 is breadth-first FIFO)",
+            ));
+        }
+        let union_all = match comp.ops[0] {
+            crate::plan::SetOp::Union => false,
+            crate::plan::SetOp::UnionAll => true,
+            _ => {
+                return Err(self.err_here(
+                    "a recursive CTE must combine its terms with UNION or UNION ALL",
+                ))
+            }
+        };
+        let mut arms = comp.arms;
+        let recursive = arms.pop().expect("two arms");
+        let anchor = arms.pop().expect("two arms");
+        // Stage 1: exactly one recursive CTE (no mutual / multi-CTE recursion).
+        if self.eat(&Tok::Comma) {
+            return Err(self.err_here(
+                "multiple / mutually recursive CTEs in one WITH RECURSIVE are not \
+                 supported yet (stage 1: a single recursive CTE)",
+            ));
+        }
+        let outer = self.statement()?;
+        Ok(Stmt::RecursiveCte(crate::ast::RecursiveCteStmt {
+            name,
+            columns,
+            union_all,
+            anchor: Box::new(anchor),
+            recursive: Box::new(recursive),
+            outer: Box::new(outer),
+        }))
     }
 
     fn statement(&mut self) -> Result<Stmt> {

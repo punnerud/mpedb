@@ -271,8 +271,29 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             encode_opt_u64(c.limit, buf);
             encode_opt_u64(c.offset, buf);
         }
+        PlanStmt::RecursiveCte(rc) => {
+            buf.push(STMT_RECURSIVE_CTE);
+            w_str(buf, &rc.name);
+            // The declared columns paired with their types (equal length).
+            w_u16(buf, rc.columns.len() as u16);
+            for (name, ty) in rc.columns.iter().zip(&rc.col_types) {
+                w_str(buf, name);
+                buf.push(*ty as u8);
+            }
+            buf.push(rc.union_all as u8);
+            encode_select(&rc.anchor, buf);
+            encode_select(&rc.recursive, buf);
+            encode_select(&rc.outer, buf);
+        }
         _other => encode_stmt_rest(stmt, buf),
     }
+}
+
+/// A u32-length-prefixed UTF-8 string — the same convention projection names
+/// use (`encode_projection`).
+fn w_str(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
 }
 
 /// The body of a `Select` after its statement tag — shared verbatim between a
@@ -410,7 +431,7 @@ fn encode_window(w: &WindowSpec, buf: &mut Vec<u8>) {
 
 fn encode_stmt_rest(stmt: &PlanStmt, buf: &mut Vec<u8>) {
     match stmt {
-        PlanStmt::Select(_) | PlanStmt::Compound(_) => {
+        PlanStmt::Select(_) | PlanStmt::Compound(_) | PlanStmt::RecursiveCte(_) => {
             unreachable!("handled by encode_stmt")
         }
         PlanStmt::Insert {
