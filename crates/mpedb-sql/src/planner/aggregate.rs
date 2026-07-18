@@ -7,7 +7,7 @@ pub(super) fn contains_agg(e: &ast::Expr) -> bool {
     match e {
         E::Agg(..) => true,
         E::Unary(_, a) | E::IsNull(a, _) | E::Cast(a, _) => contains_agg(a),
-        E::Binary(_, a, b) | E::Like(a, b) | E::IsDistinct(a, b, _) => {
+        E::Binary(_, a, b) | E::Like(a, b) | E::IsDistinct(a, b, _) | E::Glob(a, b, _) => {
             contains_agg(a) || contains_agg(b)
         }
         E::InContext(a, _, _) => contains_agg(a),
@@ -103,6 +103,7 @@ fn lift_aggs(
             E::IsDistinct(Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?), *n)
         }
         E::Like(a, b) => E::Like(Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?)),
+        E::Glob(a, b, n) => E::Glob(Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?), *n),
         E::InList(a, xs, n) => E::InList(
             Box::new(rec(a, aggs)?),
             xs.iter().map(|x| rec(x, aggs)).collect::<Result<_>>()?,

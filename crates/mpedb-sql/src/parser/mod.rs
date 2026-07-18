@@ -308,6 +308,11 @@ impl<'a> Parser<'a> {
             && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Kw(Kw::In)))
     }
 
+    fn peek_not_glob(&self) -> bool {
+        matches!(self.toks.get(self.pos).map(|t| &t.tok), Some(Tok::Kw(Kw::Not)))
+            && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Kw(Kw::Glob)))
+    }
+
     fn peek_kw(&self, kw: Kw) -> bool {
         self.peek() == Some(&Tok::Kw(kw))
     }
@@ -1126,6 +1131,17 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 let pat = self.add_expr()?;
                 e = Expr::Like(Box::new(e), Box::new(pat));
+                seen_cmp = true;
+                continue;
+            }
+            // `x GLOB pat` / `x NOT GLOB pat` — the `NOT` is part of the
+            // operator (like `NOT IN`/`NOT BETWEEN`), so it needs the two-token
+            // lookahead that the higher-precedence `not_expr` already passed on.
+            if !seen_cmp && (self.peek_kw(Kw::Glob) || self.peek_not_glob()) {
+                let negated = self.eat_kw(Kw::Not);
+                self.expect_kw(Kw::Glob, "GLOB")?;
+                let pat = self.add_expr()?;
+                e = Expr::Glob(Box::new(e), Box::new(pat), negated);
                 seen_cmp = true;
                 continue;
             }

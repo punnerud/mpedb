@@ -60,6 +60,11 @@ pub enum Instr {
     Concat,
     /// SQL LIKE with pattern from the const pool (supports % and _).
     Like(u16),
+    /// SQL GLOB with pattern from the const pool. Like [`Instr::Like`] but
+    /// case-SENSITIVE, and the wildcards are sqlite's `*` (any run), `?` (one
+    /// char) and `[...]` character classes rather than `%`/`_`. Same operand
+    /// typing and NULL rules: any NULL operand yields NULL.
+    Glob(u16),
     /// `<scalar> IN (<list param n>)` — set membership against a
     /// [`Value::List`] bound to parameter `n` (DESIGN-MULTIDB.md §2.6).
     ///
@@ -227,6 +232,7 @@ const OP_CAST: u8 = 30;
 const OP_CONCAT: u8 = 31;
 const OP_IS_NOT_DISTINCT: u8 = 32;
 const OP_IS_DISTINCT: u8 = 33;
+const OP_GLOB: u8 = 34;
 
 /// SQL `x IN (…)` under three-valued logic — the semantics that decide whether
 /// a policy admits a row, so they are spelled out rather than approximated:
@@ -672,6 +678,19 @@ impl ExprProgram {
                         }
                     });
                 }
+                Instr::Glob(pi) => {
+                    let a = stack.pop().expect("validated");
+                    let pattern = &self.consts[pi as usize];
+                    stack.push(match (&a, pattern) {
+                        (Value::Null, _) | (_, Value::Null) => Value::Null,
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(glob_match(p, s)),
+                        _ => {
+                            return Err(Error::TypeMismatch(
+                                "GLOB requires text operands".into(),
+                            ))
+                        }
+                    });
+                }
                 Instr::InParam(pi) => {
                     let probe = stack.pop().expect("validated");
                     let list = params.get(pi as usize).ok_or_else(|| {
@@ -769,6 +788,10 @@ impl ExprProgram {
                     buf.push(OP_LIKE);
                     buf.extend_from_slice(&x.to_le_bytes());
                 }
+                Instr::Glob(x) => {
+                    buf.push(OP_GLOB);
+                    buf.extend_from_slice(&x.to_le_bytes());
+                }
                 Instr::InList(x) => {
                     buf.push(OP_IN_LIST);
                     buf.extend_from_slice(&x.to_le_bytes());
@@ -859,6 +882,7 @@ impl ExprProgram {
                 OP_PUSH_PARAM => Instr::PushParam(read_u16_arg()?),
                 OP_PUSH_CONST => Instr::PushConst(read_u16_arg()?),
                 OP_LIKE => Instr::Like(read_u16_arg()?),
+                OP_GLOB => Instr::Glob(read_u16_arg()?),
                 OP_IN_PARAM => Instr::InParam(read_u16_arg()?),
                 OP_IN_LIST => Instr::InList(read_u16_arg()?),
                 OP_JUMP_IF_NOT_TRUE => Instr::JumpIfNotTrue(read_u16_arg()?),
@@ -1002,7 +1026,7 @@ fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                         }
                         (0, 1)
                     }
-                    Instr::Like(c) => {
+                    Instr::Like(c) | Instr::Glob(c) => {
                         if c as usize >= consts.len() {
                             return Err(Error::Corrupt("const index out of range".into()));
                         }
@@ -1148,6 +1172,123 @@ fn like_match(pattern: &str, s: &str) -> bool {
         }
     }
     while pi < p.len() && p[pi] == '%' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// Result of matching one non-`*` GLOB pattern token against a single string
+/// character. A token is a literal, `?`, or a `[...]` set.
+enum GlobTok {
+    /// Matched; the pattern index just past this token.
+    Yes(usize),
+    /// A well-formed token that did NOT match this character.
+    No,
+    /// A `[` set with no closing `]`. sqlite treats that as a whole-match
+    /// failure (`patternCompare` returns NOMATCH), so the caller stops.
+    Unterminated,
+}
+
+/// Match the GLOB `[...]` set at `p[start]` (`p[start] == '['`) against char
+/// `c`. Mirrors sqlite `patternCompare`'s set logic:
+/// - a leading `^` inverts the class;
+/// - a `]` immediately after `[`/`[^` is a LITERAL member, not the terminator;
+/// - `a-z` is a range, but a `-` that is first, last-before-`]`, or right after
+///   a completed range is a literal `-`;
+/// - an unterminated set fails the whole comparison.
+fn glob_set(p: &[char], start: usize, c: char) -> GlobTok {
+    let mut i = start + 1;
+    let mut invert = false;
+    let mut seen = false;
+    // The previous set member available to start a range. `None` (sqlite's
+    // `prior_c == 0`) means no range can start here — which is why a leading
+    // literal `]` deliberately leaves it unset.
+    let mut prior: Option<char> = None;
+    if i < p.len() && p[i] == '^' {
+        invert = true;
+        i += 1;
+    }
+    if i < p.len() && p[i] == ']' {
+        if c == ']' {
+            seen = true;
+        }
+        i += 1; // leading `]` is literal; prior stays None (sqlite parity)
+    }
+    while i < p.len() && p[i] != ']' {
+        let ch = p[i];
+        if ch == '-' && prior.is_some() && i + 1 < p.len() && p[i + 1] != ']' {
+            let lo = prior.expect("checked is_some");
+            let hi = p[i + 1];
+            if c >= lo && c <= hi {
+                seen = true;
+            }
+            prior = None; // a completed range cannot itself start another
+            i += 2;
+        } else {
+            if ch == c {
+                seen = true;
+            }
+            prior = Some(ch);
+            i += 1;
+        }
+    }
+    if i >= p.len() {
+        return GlobTok::Unterminated; // no closing `]`
+    }
+    if seen ^ invert {
+        GlobTok::Yes(i + 1)
+    } else {
+        GlobTok::No
+    }
+}
+
+/// sqlite GLOB: `*` matches any run, `?` matches exactly one char, and `[...]`
+/// is a character class (`[^...]`, ranges). Case-SENSITIVE (unlike LIKE, which
+/// sqlite also leaves case-sensitive but with `%`/`_`). Iterative two-pointer
+/// with `*` backtracking — O(n·m) worst case, no recursion, no regex dep, the
+/// same shape as [`like_match`].
+fn glob_match(pattern: &str, s: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = s.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star_pi, mut star_ti) = (usize::MAX, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == '*' {
+            star_pi = pi;
+            star_ti = ti;
+            pi += 1;
+            continue;
+        }
+        // Does the current (non-`*`) token match this character?
+        let matched = if pi < p.len() {
+            match p[pi] {
+                '?' => Some(pi + 1),
+                '[' => match glob_set(&p, pi, t[ti]) {
+                    GlobTok::Yes(next) => Some(next),
+                    GlobTok::No => None,
+                    // An unterminated set fails the whole comparison, at every
+                    // position — so no amount of `*` backtracking can rescue it.
+                    GlobTok::Unterminated => return false,
+                },
+                c if c == t[ti] => Some(pi + 1),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        if let Some(next_pi) = matched {
+            pi = next_pi;
+            ti += 1;
+        } else if star_pi != usize::MAX {
+            // Let the most recent `*` absorb one more character.
+            star_ti += 1;
+            pi = star_pi + 1;
+            ti = star_ti;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
         pi += 1;
     }
     pi == p.len()
@@ -1301,6 +1442,77 @@ mod tests {
         assert!(like_match("a%", "a%c"));
         assert!(like_match("%c", "a%c"));
         assert!(like_match("a%c", "a%c"));
+    }
+
+    #[test]
+    fn glob_patterns() {
+        // `*` = any run (incl. empty); `?` = exactly one char.
+        assert!(glob_match("a*", "abc"));
+        assert!(glob_match("a*", "a"));
+        assert!(glob_match("*c", "abc"));
+        assert!(glob_match("a*c", "abxyzc"));
+        assert!(glob_match("a?c", "abc"));
+        assert!(!glob_match("a?c", "ac")); // `?` needs a char
+        assert!(!glob_match("a?c", "abbc"));
+        assert!(glob_match("*", ""));
+        assert!(glob_match("a*b*c", "axxbyyc"));
+
+        // Case-SENSITIVE — the property that distinguishes GLOB from a
+        // case-folding matcher (and the point sqlite makes about GLOB vs LIKE).
+        assert!(!glob_match("A*", "abc"));
+        assert!(glob_match("A*", "Abc"));
+        assert!(!glob_match("abc", "ABC"));
+
+        // Character classes: sets, ranges, negation.
+        assert!(glob_match("[abc]", "b"));
+        assert!(!glob_match("[abc]", "d"));
+        assert!(glob_match("[a-c]x", "bx"));
+        assert!(!glob_match("[a-c]x", "dx"));
+        assert!(glob_match("[^a-c]x", "dx"));
+        assert!(!glob_match("[^a-c]x", "bx"));
+        // Class is case-sensitive too: `[a-c]` excludes uppercase.
+        assert!(!glob_match("[a-c]", "B"));
+        // A leading `]` is a literal set member.
+        assert!(glob_match("[]x]", "]"));
+        assert!(glob_match("[]x]", "x"));
+        // `-` as first/last member is literal, not a range.
+        assert!(glob_match("[-a]", "-"));
+        assert!(glob_match("[a-]", "-"));
+        // A `*`/`?` inside a class is a literal char, not a wildcard.
+        assert!(glob_match("[*?]", "*"));
+        assert!(glob_match("[*?]", "?"));
+        assert!(!glob_match("[*?]", "a"));
+        // An unterminated set fails the whole match (sqlite NOMATCH).
+        assert!(!glob_match("[abc", "a"));
+
+        // Literal `*`/`?` in the pattern are ALWAYS wildcards (no escape), so a
+        // literal one must be matched via a class — the same rule sqlite has.
+        assert!(glob_match("a[*]b", "a*b"));
+        assert!(!glob_match("a[*]b", "axb"));
+    }
+
+    #[test]
+    fn glob_program_null_and_type_rules() {
+        // `col0 GLOB 'a*'` — NULL operand yields NULL, exactly like LIKE.
+        let p = prog(vec![Instr::PushCol(0), Instr::Glob(0)], vec![Value::Text("a*".into())]);
+        assert_eq!(p.eval(&[Value::Text("abc".into())], &[]).unwrap(), Value::Bool(true));
+        assert_eq!(p.eval(&[Value::Text("xbc".into())], &[]).unwrap(), Value::Bool(false));
+        assert_eq!(p.eval(&[Value::Null], &[]).unwrap(), Value::Null);
+        // A non-text operand is a type error, not a silent non-match.
+        assert!(matches!(
+            p.eval(&[Value::Int(1)], &[]),
+            Err(Error::TypeMismatch(_))
+        ));
+
+        // codec: roundtrip + truncation safety (repo rule: Corrupt, never panic).
+        let mut buf = Vec::new();
+        p.encode_into(&mut buf);
+        let mut pos = 0;
+        assert_eq!(ExprProgram::decode(&buf, &mut pos).unwrap(), p);
+        assert_eq!(pos, buf.len());
+        for cut in 0..buf.len() {
+            let _ = ExprProgram::decode(&buf[..cut], &mut 0); // must not panic
+        }
     }
 
     #[test]

@@ -317,7 +317,7 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
             rename_qualifier(a, from, to);
             rename_qualifier(b, from, to);
         }
-        Expr::IsDistinct(a, b, _) => {
+        Expr::IsDistinct(a, b, _) | Expr::Glob(a, b, _) => {
             rename_qualifier(a, from, to);
             rename_qualifier(b, from, to);
         }
@@ -376,7 +376,7 @@ fn flatten_expr(
             flatten_expr(a, views, ctes, depth)?;
             flatten_expr(b, views, ctes, depth)
         }
-        Expr::IsDistinct(a, b, _) => {
+        Expr::IsDistinct(a, b, _) | Expr::Glob(a, b, _) => {
             flatten_expr(a, views, ctes, depth)?;
             flatten_expr(b, views, ctes, depth)
         }
