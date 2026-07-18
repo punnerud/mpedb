@@ -98,7 +98,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | LIKE | ✅ | no ESCAPE clause |
 | GLOB / REGEXP / MATCH | ❌ | |
 | BETWEEN / NOT BETWEEN | ✅ | |
-| IN / NOT IN (value list) | ✅ | also `x IN (SELECT …)` and the sqlite shorthand `x IN <table>` (single-column). `NULL IN (empty)` is FALSE (3VL), matching sqlite |
+| IN / NOT IN (value list) | ✅ | also `x IN (SELECT …)` and the sqlite shorthand `x IN <table>` (single-column). The empty set `x IN ()` is accepted (sqlite allows it) and is FALSE for every probe, `NOT IN ()` TRUE; `NULL IN (empty)` is FALSE (3VL), matching sqlite |
 | IS NULL / IS NOT NULL | ✅ | |
 | `x IS y` (general distinct-from) | ❌ | only the NULL forms |
 | CASE (searched and simple) | ✅ | simple form desugars to searched; arms mixing int64 and float64 are refused — sqlite types the winning arm per row, rigid typing cannot, and widening was measured to change division results (add a CAST) |

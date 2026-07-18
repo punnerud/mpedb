@@ -1162,10 +1162,13 @@ impl<'a> Parser<'a> {
             return Err(self.err_here("`(` or a table name after IN"));
         }
         self.expect(&Tok::LParen, "`(` after IN")?;
-        // `IN ()` is a syntax error in PostgreSQL too, and it would also mean an
-        // InList(0) instruction, which the IR rejects.
-        if self.peek() == Some(&Tok::RParen) {
-            return Err(self.err_here("IN needs at least one value: `IN ()` is empty"));
+        // `IN ()` — the EMPTY set — is accepted (sqlite allows it; PostgreSQL
+        // does not, but accepting it rejects nothing PG accepts). It is FALSE
+        // for every probe, NULL included (`NOT IN ()` TRUE) — the 3VL empty-set
+        // rule. Compiles to a zero-element InList that evaluates the probe (so
+        // its errors still surface), then yields FALSE.
+        if self.eat(&Tok::RParen) {
+            return Ok(Expr::InList(Box::new(e), Vec::new(), negated));
         }
         // `IN (SELECT …)` — membership in a subquery's output (#70). The
         // SELECT keyword right after the paren decides, same rule as the
