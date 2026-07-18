@@ -85,7 +85,12 @@ const MAX_JOINS: usize = 16;
 //     reports the plan as corrupt rather than "written by a newer mpedb", so
 //     the whole-plan version gates it cleanly — same additive pattern as the
 //     scalar-fn bumps (14-16).
-const PLAN_FORMAT: u8 = 18;
+// 19: `GLOB` / `NOT GLOB` (sqlite's case-sensitive `*`/`?`/`[...]` matcher) —
+//     one additive `Instr` opcode (Glob=34) in the expr bytes. A format-18
+//     reader hits the unknown opcode in `ExprProgram::decode` and rejects the
+//     plan as corrupt rather than misreading it — the same additive gating as
+//     the LIKE-shaped and scalar-fn bumps above.
+const PLAN_FORMAT: u8 = 19;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

@@ -662,6 +662,13 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     atom: false,
                 }
             }
+            Instr::Glob(i) => {
+                let a = pop(&mut st);
+                Item {
+                    s: format!("{} GLOB {}", wrap(&a), cst(i)),
+                    atom: false,
+                }
+            }
             // `x IN ($n)` — a session-context list (§2.6). Pops the probe only.
             Instr::InParam(i) => {
                 let a = pop(&mut st);

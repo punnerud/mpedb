@@ -96,7 +96,8 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | AND / OR / NOT | ✅ | SQL 3VL throughout |
 | `\|\|` concatenation | ✅ | NULL propagates; ints/bools render as text; floats refused until their formatting is pinned |
 | LIKE | ✅ | no ESCAPE clause |
-| GLOB / REGEXP / MATCH | ❌ | |
+| GLOB / NOT GLOB | ✅ | sqlite semantics: case-SENSITIVE, `*` (any run) and `?` (one char) wildcards, `[...]` character classes (incl. `[^...]` and ranges); pattern must be a literal, as with LIKE |
+| REGEXP / MATCH | ❌ | |
 | BETWEEN / NOT BETWEEN | ✅ | |
 | IN / NOT IN (value list) | ✅ | also `x IN (SELECT …)` and the sqlite shorthand `x IN <table>` (single-column). The empty set `x IN ()` is accepted (sqlite allows it) and is FALSE for every probe, `NOT IN ()` TRUE; `NULL IN (empty)` is FALSE (3VL), matching sqlite |
 | IS NULL / IS NOT NULL | ✅ | |
