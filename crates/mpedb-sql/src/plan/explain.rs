@@ -39,21 +39,8 @@ impl CompiledPlan {
             _other => self.render_rest(schema, &mut out),
         }
         for (i, s) in self.subplans.iter().enumerate() {
-            out.push_str(&format!(
-                "subplan ${}: {}{}\n",
-                self.subplan_base() as usize + i + 1,
-                match s.kind {
-                    SubPlanKind::Exists => "EXISTS, ",
-                    SubPlanKind::Scalar => "scalar, ",
-                    SubPlanKind::List => "IN-list, ",
-                },
-                if s.outer_args.is_empty() {
-                    "uncorrelated (evaluated once)".to_string()
-                } else {
-                    format!("correlated on outer slots {:?} (per row)", s.outer_args)
-                }
-            ));
-            self.render_select(&s.plan, schema, &mut out);
+            let label = format!("${}", self.subplan_base() as usize + i + 1);
+            self.render_subplan(s, schema, &mut out, &label);
         }
         out.push_str(&format!(
             "  footprint: read_only={} tables_read={:#x} tables_written={:#x} indexes_used={:#x} key={}\n",
@@ -72,6 +59,30 @@ impl CompiledPlan {
 
     /// Render one SELECT — shared between a top-level SELECT and each
     /// compound arm.
+    /// Render one lifted subquery and, recursively, its own nested lifts
+    /// (#73 §3). `label` is the reserved slot name (`$n`, then `$n.k` for a
+    /// child).
+    fn render_subplan(&self, s: &SubPlan, schema: &Schema, out: &mut String, label: &str) {
+        out.push_str(&format!(
+            "subplan {}: {}{}\n",
+            label,
+            match s.kind {
+                SubPlanKind::Exists => "EXISTS, ",
+                SubPlanKind::Scalar => "scalar, ",
+                SubPlanKind::List => "IN-list, ",
+            },
+            if s.outer_args.is_empty() {
+                "uncorrelated (evaluated once)".to_string()
+            } else {
+                format!("correlated on outer slots {:?} (per row)", s.outer_args)
+            }
+        ));
+        self.render_select(&s.plan, schema, out);
+        for (k, c) in s.subplans.iter().enumerate() {
+            self.render_subplan(c, schema, out, &format!("{label}.{}", k + 1));
+        }
+    }
+
     fn render_select(&self, sp: &SelectPlan, schema: &Schema, out: &mut String) {
         let table_name = |id: u32| {
             if id == super::DUAL_TABLE {

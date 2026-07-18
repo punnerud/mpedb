@@ -263,9 +263,11 @@ impl Lift<'_> {
         if self.subplans.len() >= 16 {
             return Err(bind_err("too many subqueries in one statement (max 16)"));
         }
-        if has_subquery(inner) {
-            return Err(bind_err("nested subqueries are not supported yet"));
-        }
+        // #73 §3 stage 1: a subquery MAY now contain subqueries. The nested ones
+        // are lifted by the inner's own `plan_select` below (recorded on the
+        // `SubPlan` rather than refused). What stays refused — CORRELATED nesting
+        // (a nested subquery referencing an enclosing row) — is caught after the
+        // inner is planned, by inspecting its lifts' `outer_args`.
         // The INNER scope decides which names stay put; what it cannot
         // resolve is tried against the OUTER scope and becomes a correlation
         // parameter. Bare names prefer the inner table — SQL's rule.
@@ -361,7 +363,17 @@ impl Lift<'_> {
         let inner_n = self.n_params + outer_args.len() as u16;
         let (stmt, inner_ptypes, inner_ctx, _inner_lists, inner_out, inner_subs) =
             plan_select(&rewritten, self.schema, inner_n, self.catalog, self.consts)?;
-        debug_assert!(inner_subs.is_empty(), "nesting refused above");
+        // Stage 1 is UNCORRELATED nesting only: a nested subquery that references
+        // the enclosing (this subquery's) row — or a scope further out — is
+        // stages 2–3 and refused. The inner's lifts carry `outer_args` iff they
+        // correlate to the inner's scope; any non-empty one is that refusal.
+        // (A nested reference to a MIDDLE/OUTER scope instead falls through to an
+        // "unknown column" inside the innermost bind — also a clean refusal.)
+        if inner_subs.iter().any(|s| !s.outer_args.is_empty()) {
+            return Err(bind_err(
+                "a correlated subquery nested inside another subquery is not supported yet",
+            ));
+        }
         if !inner_ctx.is_empty() {
             return Err(bind_err(
                 "current_setting() inside a subquery is not supported yet",
@@ -405,7 +417,18 @@ impl Lift<'_> {
             SubPlanKind::List => None,
         };
         let slot = self.n_params + self.subplans.len() as u16;
-        self.subplans.push(SubPlan { plan, outer_args, kind });
+        // `sub_base = inner_n`: the inner was planned with `[user ‖ correlation]`
+        // as its param space, and its OWN lifts (`inner_subs`) sit right after —
+        // at `inner_n + i` — exactly the "results after user + trailing reserved"
+        // shape the top level uses one layer up.
+        self.subplans.push(SubPlan {
+            plan,
+            outer_args,
+            kind,
+            subplans: inner_subs,
+            sub_base: inner_n,
+            slot_type: ty,
+        });
         self.slot_types.push(ty);
         Ok(slot)
     }
@@ -461,9 +484,15 @@ impl Correlate<'_, '_> {
                     e.clone()
                 }
             }
-            E::Subquery(_) | E::Exists(..) => {
-                return Err(bind_err("nested subqueries are not supported yet"))
-            }
+            // A subquery nested inside THIS subquery is left for the inner's own
+            // `lift_subqueries` (#73 §3). We rewrite operands that live in the
+            // inner's expression scope (an `IN`'s LHS) so their correlation to
+            // the outer is captured, but we do NOT descend into the nested
+            // SELECT: its correlation is resolved one level down, against the
+            // inner's scope — a nested reference to the outer/middle then surfaces
+            // as an "unknown column" there (stage-3 refusal), never a misread.
+            E::Subquery(inner) => E::Subquery(inner.clone()),
+            E::Exists(inner, negated) => E::Exists(inner.clone(), *negated),
             E::Unary(op, a) => E::Unary(*op, Box::new(self.rewrite(a)?)),
             E::IsNull(a, n) => E::IsNull(Box::new(self.rewrite(a)?), *n),
             E::Cast(a, t) => E::Cast(Box::new(self.rewrite(a)?), *t),
@@ -486,10 +515,15 @@ impl Correlate<'_, '_> {
             E::InContext(a, k, n) => {
                 E::InContext(Box::new(self.rewrite(a)?), k.clone(), *n)
             }
-            // Inside a subquery, another subquery is NESTING — refused,
-            // the same line plan_one draws for Subquery/Exists.
-            E::InSubquery(..) | E::InParamSlot(..) => {
-                return Err(bind_err("nested subqueries are not supported yet"))
+            // `x IN (SELECT …)` nested inside this subquery: rewrite the LHS
+            // (it lives in the inner's scope, so it may correlate to the outer)
+            // but leave the nested SELECT for the inner's own lift — same rule
+            // as `Subquery`/`Exists` above.
+            E::InSubquery(lhs, inner, negated) => {
+                E::InSubquery(Box::new(self.rewrite(lhs)?), inner.clone(), *negated)
+            }
+            E::InParamSlot(a, slot, negated) => {
+                E::InParamSlot(Box::new(self.rewrite(a)?), *slot, *negated)
             }
             E::InList(a, xs, n) => E::InList(
                 Box::new(self.rewrite(a)?),
