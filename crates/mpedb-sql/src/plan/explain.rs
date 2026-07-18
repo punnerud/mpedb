@@ -16,41 +16,7 @@ impl CompiledPlan {
         let mut out = String::new();
         match &self.stmt {
             PlanStmt::Select(sp) => self.render_select(sp, schema, &mut out),
-            PlanStmt::Compound(c) => {
-                out.push_str(&format!("Compound ({} arms)\n", c.arms.len()));
-                for (k, arm) in c.arms.iter().enumerate() {
-                    if k > 0 {
-                        out.push_str(match c.ops[k - 1] {
-                            SetOp::Union => "UNION\n",
-                            SetOp::UnionAll => "UNION ALL\n",
-                            SetOp::Except => "EXCEPT\n",
-                            SetOp::Intersect => "INTERSECT\n",
-                        });
-                    }
-                    self.render_select(arm, schema, &mut out);
-                }
-                if !c.order_by.is_empty() {
-                    let items: Vec<String> = c
-                        .order_by
-                        .iter()
-                        .map(|(i, desc, coll)| {
-                            format!(
-                                "output#{}{}{}",
-                                i + 1,
-                                collate_suffix(*coll),
-                                if *desc { " DESC" } else { " ASC" }
-                            )
-                        })
-                        .collect();
-                    out.push_str(&format!("order by: {}\n", items.join(", ")));
-                }
-                if let Some(n) = c.limit {
-                    out.push_str(&format!("limit: {n}\n"));
-                }
-                if let Some(n) = c.offset {
-                    out.push_str(&format!("offset: {n}\n"));
-                }
-            }
+            PlanStmt::Compound(c) => self.render_compound(c, schema, &mut out),
             PlanStmt::RecursiveCte(rc) => {
                 out.push_str(&format!(
                     "RecursiveCte {}({}) {}\n",
@@ -106,9 +72,50 @@ impl CompiledPlan {
                 format!("correlated on outer slots {:?} (per row)", s.outer_args)
             }
         ));
-        self.render_select(&s.plan, schema, out);
+        match &s.body {
+            SubBody::Select(sp) => self.render_select(sp, schema, out),
+            SubBody::Compound(c) => self.render_compound(c, schema, out),
+        }
         for (k, c) in s.subplans.iter().enumerate() {
             self.render_subplan(c, schema, out, &format!("{label}.{}", k + 1));
+        }
+    }
+
+    /// Render a compound `SELECT … UNION/… …` — shared between a top-level
+    /// compound statement and a compound subquery body (format 31).
+    fn render_compound(&self, c: &CompoundPlan, schema: &Schema, out: &mut String) {
+        out.push_str(&format!("Compound ({} arms)\n", c.arms.len()));
+        for (k, arm) in c.arms.iter().enumerate() {
+            if k > 0 {
+                out.push_str(match c.ops[k - 1] {
+                    SetOp::Union => "UNION\n",
+                    SetOp::UnionAll => "UNION ALL\n",
+                    SetOp::Except => "EXCEPT\n",
+                    SetOp::Intersect => "INTERSECT\n",
+                });
+            }
+            self.render_select(arm, schema, out);
+        }
+        if !c.order_by.is_empty() {
+            let items: Vec<String> = c
+                .order_by
+                .iter()
+                .map(|(i, desc, coll)| {
+                    format!(
+                        "output#{}{}{}",
+                        i + 1,
+                        collate_suffix(*coll),
+                        if *desc { " DESC" } else { " ASC" }
+                    )
+                })
+                .collect();
+            out.push_str(&format!("order by: {}\n", items.join(", ")));
+        }
+        if let Some(n) = c.limit {
+            out.push_str(&format!("limit: {n}\n"));
+        }
+        if let Some(n) = c.offset {
+            out.push_str(&format!("offset: {n}\n"));
         }
     }
 

@@ -12,7 +12,7 @@
 //! always its own base column name — the outer query's references need no
 //! rewriting; only `SELECT * FROM v` expands to the view's column list.
 
-use crate::ast::{Expr, JoinClause, JoinKind, SelectStmt, Stmt};
+use crate::ast::{Expr, JoinClause, JoinKind, SelectStmt, Stmt, SubqueryBody};
 use crate::parser::parse_statement;
 use mpedb_types::{Error, Result};
 use std::collections::{HashMap, HashSet};
@@ -507,7 +507,26 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
     }
 }
 
-/// Recurse into any subquery `SelectStmt` carried by an expression.
+/// Flatten views/CTEs/derived tables inside a subquery BODY — a plain SELECT or
+/// each arm of a compound (#56/format 31 in a subquery position).
+fn flatten_body(
+    body: &mut SubqueryBody,
+    views: &ViewCatalog,
+    ctes: &ViewCatalog,
+    depth: usize,
+) -> Result<()> {
+    match body {
+        SubqueryBody::Select(s) => flatten_select(s, views, ctes, depth),
+        SubqueryBody::Compound(c) => {
+            for arm in &mut c.arms {
+                flatten_select(arm, views, ctes, depth)?;
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Recurse into any subquery body carried by an expression.
 fn flatten_expr(
     e: &mut Expr,
     views: &ViewCatalog,
@@ -515,10 +534,10 @@ fn flatten_expr(
     depth: usize,
 ) -> Result<()> {
     match e {
-        Expr::Subquery(s) | Expr::Exists(s, _) => flatten_select(s, views, ctes, depth),
+        Expr::Subquery(s) | Expr::Exists(s, _) => flatten_body(s, views, ctes, depth),
         Expr::InSubquery(lhs, s, _) => {
             flatten_expr(lhs, views, ctes, depth)?;
-            flatten_select(s, views, ctes, depth)
+            flatten_body(s, views, ctes, depth)
         }
         Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => {
             flatten_expr(a, views, ctes, depth)
@@ -591,14 +610,27 @@ fn collect_source_names(s: &SelectStmt, out: &mut Vec<String>) {
     }
 }
 
+/// Collect the base names a subquery BODY reads FROM — a plain SELECT or each
+/// arm of a compound (#56/format 31 in a subquery position).
+fn collect_body_sources(body: &SubqueryBody, out: &mut Vec<String>) {
+    match body {
+        SubqueryBody::Select(s) => collect_source_names(s, out),
+        SubqueryBody::Compound(c) => {
+            for arm in &c.arms {
+                collect_source_names(arm, out);
+            }
+        }
+    }
+}
+
 /// Recurse into a subquery-bearing expression, collecting the base names any
 /// nested SELECT reads FROM. Mirrors [`flatten_expr`]'s traversal.
 fn collect_expr_sources(e: &Expr, out: &mut Vec<String>) {
     match e {
-        Expr::Subquery(s) | Expr::Exists(s, _) => collect_source_names(s, out),
+        Expr::Subquery(s) | Expr::Exists(s, _) => collect_body_sources(s, out),
         Expr::InSubquery(lhs, s, _) => {
             collect_expr_sources(lhs, out);
-            collect_source_names(s, out);
+            collect_body_sources(s, out);
         }
         Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => collect_expr_sources(a, out),
         Expr::Binary(_, a, b) | Expr::Like(a, b) | Expr::Match(a, b) => {

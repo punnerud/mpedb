@@ -30,7 +30,7 @@ pub(crate) type OrderKeys = Vec<(u16, bool, Collation)>;
 use crate::plan::{
     render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource,
     CompoundPlan, GroupKey, Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp,
-    Projection, RecursiveCtePlan, SelectPlan, SubPlan, SubPlanKind, WindowSpec, CTE_TABLE,
+    Projection, RecursiveCtePlan, SelectPlan, SubBody, SubPlan, SubPlanKind, WindowSpec, CTE_TABLE,
 };
 #[allow(unused_imports)]
 use crate::plan::{FtsQuery, FtsTerm};
@@ -451,7 +451,14 @@ pub(crate) fn plan_statement(
         select_tables: &impl Fn(&SelectPlan, &mut Vec<u32>),
         out: &mut Vec<u32>,
     ) {
-        select_tables(&s.plan, out);
+        match &s.body {
+            SubBody::Select(sp) => select_tables(sp, out),
+            SubBody::Compound(c) => {
+                for arm in &c.arms {
+                    select_tables(arm, out);
+                }
+            }
+        }
         for c in &s.subplans {
             stamp_subplan_tables(c, select_tables, out);
         }

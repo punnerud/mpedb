@@ -10,43 +10,7 @@ impl CompiledPlan {
         let ptypes = &self.param_types;
         match &self.stmt {
             PlanStmt::Select(sp) => self.validate_select(sp, schema, ptypes)?,
-            PlanStmt::Compound(c) => {
-                if !(2..=MAX_COMPOUND_ARMS).contains(&c.arms.len()) {
-                    return Err(corrupt("compound arm count out of range"));
-                }
-                if c.ops.len() != c.arms.len() - 1 {
-                    return Err(corrupt("compound op count does not match arm count"));
-                }
-                let arity = c.arms[0].projection.len();
-                for arm in &c.arms {
-                    // The compound owns ORDER BY/LIMIT — SQL cannot express
-                    // them per arm, so an arm carrying its own is forged. And
-                    // with no junk, `projection.len()` IS the output arity,
-                    // which the set ops and the compound sort both index.
-                    if !arm.order_by.is_empty()
-                        || arm.order_junk != 0
-                        || arm.limit.is_some()
-                        || arm.offset.is_some()
-                    {
-                        return Err(corrupt("compound arm carries its own ORDER BY/LIMIT"));
-                    }
-                    // Arms run through the plain executor, which never fills
-                    // correlated slots — a post-filter there would be
-                    // silently ignored, so its presence is forgery.
-                    if arm.post_filter.is_some() {
-                        return Err(corrupt("compound arm carries a post-filter"));
-                    }
-                    if arm.projection.len() != arity {
-                        return Err(corrupt("compound arms disagree on output arity"));
-                    }
-                    self.validate_select(arm, schema, ptypes)?;
-                }
-                for (i, _, _) in &c.order_by {
-                    if *i as usize >= arity {
-                        return Err(corrupt("compound order-by column out of range"));
-                    }
-                }
-            }
+            PlanStmt::Compound(c) => self.validate_compound(c, schema, ptypes)?,
             PlanStmt::RecursiveCte(rc) => self.validate_recursive_cte(rc, schema, ptypes)?,
             _other => self.validate_rest(schema)?,
         }
@@ -63,6 +27,56 @@ impl CompiledPlan {
         let recomputed = planner::compute_footprint(&self.stmt, &self.subplans, schema)?;
         if recomputed != self.footprint {
             return Err(corrupt("plan footprint does not match its statement"));
+        }
+        Ok(())
+    }
+
+    /// Re-validate a compound `SELECT … UNION/… …` against `ptypes` — the arm
+    /// count, the op count, that no arm smuggles its own ORDER BY/LIMIT or a
+    /// post-filter, that every arm agrees on the output arity, and that the
+    /// compound ORDER BY names an output column. Shared between a top-level
+    /// compound statement and a compound subquery body (format 31), so the two
+    /// can never drift.
+    fn validate_compound(
+        &self,
+        c: &CompoundPlan,
+        schema: &Schema,
+        ptypes: &[Option<ColumnType>],
+    ) -> Result<()> {
+        if !(2..=MAX_COMPOUND_ARMS).contains(&c.arms.len()) {
+            return Err(corrupt("compound arm count out of range"));
+        }
+        if c.ops.len() != c.arms.len() - 1 {
+            return Err(corrupt("compound op count does not match arm count"));
+        }
+        let arity = c.arms[0].projection.len();
+        for arm in &c.arms {
+            // The compound owns ORDER BY/LIMIT — SQL cannot express them per arm,
+            // so an arm carrying its own is forged. And with no junk,
+            // `projection.len()` IS the output arity, which the set ops and the
+            // compound sort both index.
+            if !arm.order_by.is_empty()
+                || arm.order_junk != 0
+                || arm.limit.is_some()
+                || arm.offset.is_some()
+            {
+                return Err(corrupt("compound arm carries its own ORDER BY/LIMIT"));
+            }
+            // Arms run through the plain executor, which never fills correlated
+            // slots — a post-filter there would be silently ignored, so its
+            // presence is forgery.
+            if arm.post_filter.is_some() {
+                return Err(corrupt("compound arm carries a post-filter"));
+            }
+            if arm.projection.len() != arity {
+                return Err(corrupt("compound arms disagree on output arity"));
+            }
+            self.validate_select(arm, schema, ptypes)?;
+        }
+        for (i, _, _) in &c.order_by {
+            if *i as usize >= arity {
+                return Err(corrupt("compound order-by column out of range"));
+            }
         }
         Ok(())
     }
@@ -864,30 +878,9 @@ impl CompiledPlan {
         if s.kind == SubPlanKind::List && !s.outer_args.is_empty() {
             return Err(corrupt("correlated IN-list subplan"));
         }
-        if s.kind != SubPlanKind::Exists
-            && s.plan.projection.len() - s.plan.order_junk as usize != 1
-        {
+        if s.kind != SubPlanKind::Exists && s.body.output_arity() != 1 {
             return Err(corrupt("scalar subplan must output exactly one column"));
         }
-        // A `post_filter` is applied per row only when this subplan HAS children
-        // (the executor's leaf path runs the plain `exec_select`, which ignores
-        // it) — so a post-filter with no nested subplans would be silently
-        // dropped. Refuse it, mirroring the top-level "post-filter without
-        // subplans" rule. WITH children (#73 §3 stage 2), the post-filter rides
-        // the per-row fill of the correlated ones; the gather-side discipline for
-        // its slots is enforced by `check_slot_discipline` below.
-        if s.plan.post_filter.is_some() && s.subplans.is_empty() {
-            return Err(corrupt("subplan post-filter without nested subplans"));
-        }
-        // #73 §3: a nested lift MAY correlate to its IMMEDIATE parent (stage 2)
-        // or, via a TRANSIT arg carried by an intervening level, to a MIDDLE or
-        // OUTER scope (stage 3). Either way its `outer_args` name slots of THIS
-        // subplan's parent row and are bounds-checked against `s.plan`'s row in
-        // the recursion below; a mid-scope reference is representable as an
-        // ordinary `outer_arg` on the ancestor's DIRECT child (registered by the
-        // planner's scope-descending `Correlate`) plus a plain inherited `Param`
-        // read by the descendant — nothing new to validate here, since the
-        // transit value occupies a normal, filled correlation slot.
         // The inner parameter space: base ‖ this subplan's correlation ‖ its
         // children results. A correlation slot has the OUTER column's type; a
         // child result slot carries the child's declared `slot_type` (so a child
@@ -898,17 +891,51 @@ impl CompiledPlan {
         for c in &s.subplans {
             inner_types.push(c.slot_type);
         }
-        self.validate_select(&s.plan, schema, &inner_types)?;
-        // This subplan's OWN children live at `s.sub_base + i`: enforce the same
-        // gather-side slot discipline one level down.
-        self.check_slot_discipline(&s.plan, s.sub_base as usize, &s.subplans)?;
+        match &s.body {
+            // A compound body (format 31) is always UNCORRELATED and carries no
+            // nested lifts — the planner produces it only for an uncorrelated
+            // `IN`/scalar/`EXISTS`, and a subquery inside a compound arm is still
+            // refused. A forged one with correlation args or children would let a
+            // gather-side slot discipline go unchecked, so refuse both.
+            SubBody::Compound(c) => {
+                if !s.outer_args.is_empty() {
+                    return Err(corrupt("correlated compound subplan"));
+                }
+                if !s.subplans.is_empty() {
+                    return Err(corrupt("compound subplan with nested lifts"));
+                }
+                self.validate_compound(c, schema, &inner_types)?;
+            }
+            SubBody::Select(sp) => {
+                // A `post_filter` is applied per row only when this subplan HAS
+                // children (the executor's leaf path runs the plain `exec_select`,
+                // which ignores it) — so a post-filter with no nested subplans
+                // would be silently dropped. Refuse it, mirroring the top-level
+                // "post-filter without subplans" rule. WITH children (#73 §3 stage
+                // 2), the post-filter rides the per-row fill of the correlated
+                // ones; the gather-side discipline for its slots is enforced by
+                // `check_slot_discipline` below.
+                if sp.post_filter.is_some() && s.subplans.is_empty() {
+                    return Err(corrupt("subplan post-filter without nested subplans"));
+                }
+                // #73 §3: a nested lift MAY correlate to its IMMEDIATE parent
+                // (stage 2) or, via a TRANSIT arg carried by an intervening level,
+                // to a MIDDLE or OUTER scope (stage 3). Either way its `outer_args`
+                // name slots of THIS subplan's parent row and are bounds-checked
+                // against `sp`'s row in the recursion below.
+                self.validate_select(sp, schema, &inner_types)?;
+                // This subplan's OWN children live at `s.sub_base + i`: enforce the
+                // same gather-side slot discipline one level down.
+                self.check_slot_discipline(sp, s.sub_base as usize, &s.subplans)?;
 
-        // Recurse: a nested child's base prefix is `[user ‖ … ‖ this
-        // correlation]` (width `s.sub_base`), and its outer row is s.plan's row.
-        let child_base = &inner_types[..s.sub_base as usize];
-        let child_outer = self.select_row_types(&s.plan, schema)?;
-        for c in &s.subplans {
-            self.validate_subplan_rec(schema, c, child_base, &child_outer, budget)?;
+                // Recurse: a nested child's base prefix is `[user ‖ … ‖ this
+                // correlation]` (width `s.sub_base`), and its outer row is sp's row.
+                let child_base = &inner_types[..s.sub_base as usize];
+                let child_outer = self.select_row_types(sp, schema)?;
+                for c in &s.subplans {
+                    self.validate_subplan_rec(schema, c, child_base, &child_outer, budget)?;
+                }
+            }
         }
         Ok(())
     }
