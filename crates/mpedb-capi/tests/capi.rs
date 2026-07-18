@@ -218,6 +218,147 @@ fn transaction_control_via_prepare_step() {
 }
 
 #[test]
+fn last_insert_rowid_via_facade() {
+    // The rowid an INSERT assigns/uses on a rowid-alias (single-column INTEGER
+    // PRIMARY KEY) table is surfaced by the engine's facade hook
+    // (`mpedb::take_last_insert_rowid`, drained per statement in `exec_one`) —
+    // no RETURNING rewrite in the shim.
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"), SQLITE_OK);
+
+        // Omitted rowid: auto-assigned; last_insert_rowid reports it.
+        assert_eq!(exec(db, "INSERT INTO t (name) VALUES ('a')"), SQLITE_OK);
+        assert_eq!(sqlite3_last_insert_rowid(db), 1);
+        assert_eq!(sqlite3_changes(db), 1);
+
+        // Explicit id.
+        assert_eq!(exec(db, "INSERT INTO t (id, name) VALUES (42, 'b')"), SQLITE_OK);
+        assert_eq!(sqlite3_last_insert_rowid(db), 42);
+
+        // Next auto id continues after the max.
+        assert_eq!(exec(db, "INSERT INTO t (name) VALUES ('c')"), SQLITE_OK);
+        assert_eq!(sqlite3_last_insert_rowid(db), 43);
+
+        // A plain INSERT yields DONE with no result columns (the facade records
+        // the rowid out-of-band; nothing leaks into the caller's result set).
+        let mut st: *mut Stmt = ptr::null_mut();
+        let ins = cs("INSERT INTO t (name) VALUES ('d')");
+        assert_eq!(sqlite3_prepare_v2(db, ins.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_DONE);
+        assert_eq!(sqlite3_column_count(st), 0);
+        sqlite3_finalize(st);
+        assert_eq!(sqlite3_last_insert_rowid(db), 44);
+
+        // The table really has 4 rows (no double-insert).
+        assert_eq!(scalar_count(db, "SELECT COUNT(*) FROM t"), 4);
+
+        // A composite-PK table is not a rowid alias: rowid stays as it was.
+        assert_eq!(
+            exec(db, "CREATE TABLE c (a INT, b INT, v TEXT, PRIMARY KEY (a, b))"),
+            SQLITE_OK
+        );
+        assert_eq!(exec(db, "INSERT INTO c (a, b, v) VALUES (1, 2, 'x')"), SQLITE_OK);
+        assert_eq!(sqlite3_last_insert_rowid(db), 44); // unchanged
+
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+#[test]
+fn pragma_table_info_and_setup_pragmas() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(
+            exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL, w REAL)"),
+            SQLITE_OK
+        );
+
+        // Setup pragmas consumers issue must not error.
+        assert_eq!(exec(db, "PRAGMA foreign_keys = ON"), SQLITE_OK);
+        assert_eq!(exec(db, "PRAGMA synchronous = NORMAL"), SQLITE_OK);
+
+        // PRAGMA table_info(t) — column metadata, readable before step.
+        let mut st: *mut Stmt = ptr::null_mut();
+        let q = cs("PRAGMA table_info(t)");
+        assert_eq!(sqlite3_prepare_v2(db, q.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_column_count(st), 6);
+        assert_eq!(col_name(st, 1), "name");
+        assert_eq!(col_name(st, 5), "pk");
+
+        // Row 0: id INTEGER, notnull=1 (pk), pk=1.
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_int(st, 0), 0);
+        assert_eq!(col_text(st, 1), "id");
+        assert_eq!(col_text(st, 2), "INTEGER");
+        assert_eq!(sqlite3_column_int(st, 3), 1); // notnull (pk implies not null)
+        assert_eq!(sqlite3_column_int(st, 5), 1); // pk position
+        // Row 1: name TEXT NOT NULL, not a pk.
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(col_text(st, 1), "name");
+        assert_eq!(col_text(st, 2), "TEXT");
+        assert_eq!(sqlite3_column_int(st, 3), 1);
+        assert_eq!(sqlite3_column_int(st, 5), 0);
+        // Row 2: w REAL nullable.
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(col_text(st, 1), "w");
+        assert_eq!(col_text(st, 2), "REAL");
+        assert_eq!(sqlite3_column_int(st, 3), 0);
+        assert_eq!(sqlite3_step(st), SQLITE_DONE);
+        sqlite3_finalize(st);
+
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+#[test]
+fn sqlite_master_introspection() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE alpha (id INTEGER PRIMARY KEY, v TEXT)"), SQLITE_OK);
+        assert_eq!(exec(db, "CREATE TABLE beta (id INTEGER PRIMARY KEY)"), SQLITE_OK);
+
+        // Django/tooling's canonical "list tables" query. The internal bootstrap
+        // table must NOT appear.
+        let names = collect_text_col(
+            db,
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        );
+        assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()]);
+
+        // type IN (...) form.
+        let names2 = collect_text_col(
+            db,
+            "SELECT name FROM sqlite_master WHERE type in ('table','view') ORDER BY name",
+        );
+        assert_eq!(names2, vec!["alpha".to_string(), "beta".to_string()]);
+
+        // ORDER BY must actually sort (create out of name order so creation
+        // order != sorted order — guards the "ORDER BY name" parse).
+        assert_eq!(exec(db, "CREATE TABLE aardvark (id INTEGER PRIMARY KEY)"), SQLITE_OK);
+        let asc = collect_text_col(db, "SELECT name FROM sqlite_master ORDER BY name");
+        assert_eq!(asc, vec!["aardvark".to_string(), "alpha".to_string(), "beta".to_string()]);
+        let desc = collect_text_col(db, "SELECT name FROM sqlite_master ORDER BY name DESC");
+        assert_eq!(desc, vec!["beta".to_string(), "alpha".to_string(), "aardvark".to_string()]);
+
+        // Fetch a table's reconstructed DDL.
+        let ddl = collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name='alpha'");
+        assert_eq!(ddl.len(), 1);
+        assert!(ddl[0].contains("CREATE TABLE") && ddl[0].contains("alpha"), "{}", ddl[0]);
+
+        // count(*) form (alpha, beta, aardvark = 3 user tables).
+        let mut st: *mut Stmt = ptr::null_mut();
+        let q = cs("SELECT count(*) FROM sqlite_master");
+        assert_eq!(sqlite3_prepare_v2(db, q.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_int(st, 0), 3);
+        sqlite3_finalize(st);
+
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+#[test]
 fn errors_and_misuse() {
     unsafe {
         let db = open_memory();
@@ -377,4 +518,22 @@ unsafe fn scalar_count(db: *mut Sqlite3, sql: &str) -> i64 {
     let n = sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
     n
+}
+
+/// Collect column 0 (as text) from every row of a query.
+unsafe fn collect_text_col(db: *mut Sqlite3, sql: &str) -> Vec<String> {
+    let s = cs(sql);
+    let mut st: *mut Stmt = ptr::null_mut();
+    assert_eq!(sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK, "prepare {sql}");
+    let mut out = Vec::new();
+    while sqlite3_step(st) == SQLITE_ROW {
+        let p = sqlite3_column_text(st, 0);
+        out.push(if p.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(p as *const c_char).to_str().unwrap().to_string()
+        });
+    }
+    sqlite3_finalize(st);
+    out
 }

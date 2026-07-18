@@ -16,6 +16,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod consts;
+mod introspect;
 mod sql;
 mod valconv;
 
@@ -31,7 +32,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// The seed table every fresh mpedb file is created with: mpedb refuses a
 /// schema with no live tables, but `sqlite3_open("new.db")` carries no schema.
 /// It is otherwise inert; user tables are created live via `CREATE TABLE`.
-const SEED_TABLE: &str = "_mpedb_capi_bootstrap";
+/// `pub(crate)` so `introspect` can hide it from `PRAGMA`/`sqlite_master`.
+pub(crate) const SEED_TABLE: &str = "_mpedb_capi_bootstrap";
 
 static EPHEMERAL_SEQ: AtomicU64 = AtomicU64::new(0);
 
@@ -220,6 +222,18 @@ fn rollback_txn(c: &mut Sqlite3) {
 fn exec_one(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome, DbError> {
     use sql::Kind;
     match sql::classify(sqltext) {
+        // PRAGMA and sqlite_master reads are answered by the shim's schema
+        // introspection (mpedb has neither); they never reach the engine.
+        Kind::Pragma => {
+            let bundle = c.db.schema();
+            let (columns, rows) = introspect::pragma(&bundle, sqltext)?;
+            Ok(Outcome::Rows { columns, rows })
+        }
+        Kind::Read if introspect::references_sqlite_master(sqltext) => {
+            let bundle = c.db.schema();
+            let (columns, rows) = introspect::sqlite_master(&bundle, sqltext)?;
+            Ok(Outcome::Rows { columns, rows })
+        }
         Kind::Begin => {
             begin_txn(c)?;
             Ok(Outcome::Control)
@@ -248,6 +262,15 @@ fn exec_one(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome,
             s.query(sqltext, params)?;
             Ok(Outcome::Control)
         }
+        // DDL (CREATE/DROP/ALTER) runs only in mpedb's autocommit path; the
+        // write-session parser rejects it. Surface a clear reason rather than
+        // the engine's bare "expected a statement", and never fake it by
+        // committing mid-transaction (that would silently break rollback).
+        Kind::Ddl if c.txn.is_some() => Err(DbError::Unsupported(
+            "DDL (CREATE/DROP/ALTER) inside an explicit transaction is not supported by mpedb; \
+             run it in autocommit, outside BEGIN/COMMIT"
+                .into(),
+        )),
         _ => {
             let res = if let Some(s) = c.txn.as_mut() {
                 s.query(sqltext, params)
@@ -643,6 +666,9 @@ unsafe fn prepare_common(
     // `apply_ddl`), so `prepare_detached` cannot validate them — it only
     // compiles queries. Skip validation and defer these to execution, exactly
     // where mpedb applies them.
+    // PRAGMA and sqlite_master reads are answered by the shim (`introspect`),
+    // not compiled by mpedb, so they must NOT be handed to `prepare_detached`
+    // (which only compiles queries) — skip validation and defer them too.
     let skip_validation = matches!(
         kind,
         sql::Kind::Begin
@@ -652,7 +678,8 @@ unsafe fn prepare_common(
             | sql::Kind::Release
             | sql::Kind::RollbackTo
             | sql::Kind::Ddl
-    );
+            | sql::Kind::Pragma
+    ) || (matches!(kind, sql::Kind::Read) && introspect::references_sqlite_master(first));
 
     // Validate compilable statements now (surface syntax/bind errors at
     // prepare, as sqlite does), WITHOUT executing or publishing a plan.
@@ -993,9 +1020,11 @@ unsafe fn cell(p: *mut Stmt, col: c_int) -> Option<&'static Cell> {
 /// `step` by many consumers (Python's `sqlite3` builds `description` this way).
 /// mpedb only names the output once the statement runs, so a not-yet-run READ
 /// statement is executed here — safe because reads have no side effects, and
-/// the materialized rows are then served by the coming `step`s.
+/// the materialized rows are then served by the coming `step`s. PRAGMA (and
+/// sqlite_master reads, which classify as READ) are shim-introspection reads
+/// with the same "no side effects, resolve columns eagerly" property.
 unsafe fn ensure_columns(s: &mut Stmt) {
-    if !s.executed && matches!(sql::classify(&s.sql), sql::Kind::Read) {
+    if !s.executed && matches!(sql::classify(&s.sql), sql::Kind::Read | sql::Kind::Pragma) {
         let _ = run_stmt(s);
     }
 }
