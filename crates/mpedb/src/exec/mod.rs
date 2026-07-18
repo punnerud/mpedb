@@ -17,6 +17,34 @@ use mpedb_types::{
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+std::thread_local! {
+    /// The rowid the most recent INSERT statement assigned/used, for the
+    /// C-API's `sqlite3_last_insert_rowid`. Recorded per inserted row into a
+    /// rowid-alias (INTEGER PRIMARY KEY) table by [`record_last_insert_rowid`],
+    /// so the last row of a multi-row insert wins. Read (and cleared) by
+    /// [`take_last_insert_rowid`] immediately after the statement returns, on
+    /// the same thread that executed it — every write path (`Database::query`,
+    /// `WriteSession::query`, the group-commit leader) runs `exec_stmt`
+    /// synchronously in the caller's thread, so this needs no synchronization.
+    static LAST_INSERT_ROWID: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Record the rowid of a row just inserted into a rowid-alias table (facade hook
+/// for `sqlite3_last_insert_rowid`). Called from the INSERT loop after each
+/// successful `insert_row`, so the final call reflects the last inserted row.
+pub(crate) fn record_last_insert_rowid(rowid: i64) {
+    LAST_INSERT_ROWID.with(|c| c.set(Some(rowid)));
+}
+
+/// Take (read and clear) the rowid assigned by the last INSERT executed on this
+/// thread, or `None` if the last statement inserted nothing into a rowid-alias
+/// table. The C-API shim calls this once after each statement and updates its
+/// per-connection `last_insert_rowid` only when a value is present — matching
+/// sqlite, where a non-insert statement leaves `last_insert_rowid` unchanged.
+pub fn take_last_insert_rowid() -> Option<i64> {
+    LAST_INSERT_ROWID.with(|c| c.take())
+}
+
 mod aggregate;
 mod fts;
 mod gather;
@@ -1369,6 +1397,15 @@ fn exec_stmt_rest(
                 match ctx.insert_row(*table, &row) {
                     Ok(()) => {
                         written += 1;
+                        // Surface the assigned/used rowid for the C-API's
+                        // sqlite3_last_insert_rowid (facade hook). Only rowid-
+                        // alias tables have a last-insert-rowid in sqlite; the
+                        // last inserted row of the statement wins.
+                        if let Some(rc) = rowid_col {
+                            if let Some(Value::Int(id)) = row.get(rc as usize) {
+                                record_last_insert_rowid(*id);
+                            }
+                        }
                         if let Some(proj) = returning {
                             out.push(project_row(proj, &row, params)?);
                         }
