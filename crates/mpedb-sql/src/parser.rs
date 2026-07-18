@@ -1521,6 +1521,28 @@ impl<'a> Parser<'a> {
     fn in_suffix(&mut self, e: Expr) -> Result<Expr> {
         let negated = self.eat_kw(Kw::Not);
         self.expect_kw(Kw::In, "IN")?;
+        // sqlite shorthand: `x IN <table>` == `x IN (SELECT * FROM <table>)`
+        // (the table must have a single column; the InSubquery lift enforces it).
+        if self.peek() != Some(&Tok::LParen) {
+            if matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_))) {
+                let tname = self.ident("table name after IN")?;
+                let inner = SelectStmt {
+                    table: Some(tname),
+                    alias: None,
+                    joins: Vec::new(),
+                    distinct: false,
+                    items: None,
+                    where_clause: None,
+                    group_by: Vec::new(),
+                    having: None,
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                };
+                return Ok(Expr::InSubquery(Box::new(e), Box::new(inner), negated));
+            }
+            return Err(self.err_here("`(` or a table name after IN"));
+        }
         self.expect(&Tok::LParen, "`(` after IN")?;
         // `IN ()` is a syntax error in PostgreSQL too, and it would also mean an
         // InList(0) instruction, which the IR rejects.

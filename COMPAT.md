@@ -41,7 +41,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | DELETE FROM … [WHERE …] | ✅ | |
 | RETURNING (all three verbs) | ✅ | `RETURNING *` or an expression list |
 | BEGIN / COMMIT / ROLLBACK | ✅ | maps to a write session; readers use MVCC snapshots and never block |
-| SAVEPOINT / RELEASE | ❌ | savepoints exist at the engine level (import rollback), not in SQL |
+| SAVEPOINT / RELEASE | ❌ | savepoints exist at the engine level (import rollback); a SQL surface is planned |
 | EXPLAIN | ✅ | plan form (access path, index choice, residuals), not VDBE opcodes |
 | CREATE TABLE | ✅ | live, multi-process, on the shared file — `PRIMARY KEY` (inline or table-level composite), `NOT NULL`, `UNIQUE` (column or composite); other processes see the new table on their next statement. `DEFAULT`/`CHECK`/foreign keys refuse by name (declare them in the config schema for now) |
 | DROP TABLE | ✅ | live, multi-process — `DROP TABLE [IF EXISTS] <name>`; frees the table's pages, tombstones its id in place (never reused — [DESIGN-DROP-TABLE.md](DESIGN-DROP-TABLE.md) §0), other processes see it gone on their next statement. No-reuse caps *lifetime* table creates at 64 (a bounded capacity limit, not a per-query gap; offline `regenerate` re-densifies) |
@@ -50,7 +50,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | ALTER TABLE DROP COLUMN | ✅ | live + multi-process (existing rows rewritten without the column; surviving index/PK column references renumbered). Refuses dropping a PK / indexed / last column, matching sqlite |
 | CREATE INDEX | ✅ | `CREATE [UNIQUE] INDEX [IF NOT EXISTS] n ON t (cols)` — built over existing rows, live + multi-process; ASC/DESC per column accepted (indexes are ascending, used for equality/prefix/range lookups). Or declare via config `unique`/`indexed`/`[[table.index]]`. The index name is not persisted (indexes are positional) |
 | CREATE VIEW / DROP VIEW | ✅ | a query naming the view is flattened onto its base table (WHERE merged; `SELECT *` yields the view's columns; view-over-view chains). Simple projection/filter views over one table; aggregate/join/DISTINCT view bodies are refused at reference time (never answered wrongly) — [DESIGN-VIEW.md](DESIGN-VIEW.md) |
-| CREATE TRIGGER | ❌ | triggers' job is planned as the PySpell/ETL layer, not in-SQL |
+| CREATE TRIGGER | ❌ | planned both as in-SQL triggers and as PySpell/ETL-layer code |
 | WITH (CTEs) | ❌ | |
 | VALUES (standalone) | ❌ | |
 | PRAGMA | **Not needed** | everything a PRAGMA would set lives in the config file, per database, versioned |
@@ -97,7 +97,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | LIKE | ✅ | no ESCAPE clause |
 | GLOB / REGEXP / MATCH | ❌ | |
 | BETWEEN / NOT BETWEEN | ✅ | |
-| IN / NOT IN (value list) | ✅ | |
+| IN / NOT IN (value list) | ✅ | also `x IN (SELECT …)` and the sqlite shorthand `x IN <table>` (single-column). `NULL IN (empty)` is FALSE (3VL), matching sqlite |
 | IS NULL / IS NOT NULL | ✅ | |
 | `x IS y` (general distinct-from) | ❌ | only the NULL forms |
 | CASE (searched and simple) | ✅ | simple form desugars to searched; arms mixing int64 and float64 are refused — sqlite types the winning arm per row, rigid typing cannot, and widening was measured to change division results (add a CAST) |
