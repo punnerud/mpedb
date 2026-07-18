@@ -176,3 +176,37 @@ Recommended build order, refined: §5's staging instantiated as **per-user shard
 the shard directory (small CP) + §2a async backup per shard + Model A serverless nodes. 2b
 multi-master and §3 in-tree consensus stay reserve options for the rare cases per-tenant sharding
 cannot express.
+
+## 7. High availability: fast per-shard failover (answers survive a node dying)
+
+The sharded model makes HA unusually clean: **election is per shard, not cluster-wide** — only the
+dead shard's masters re-elect, so the blast radius and the election window are small. Split it by the
+two very different difficulty levels:
+
+- **Reads are trivially always-on.** Every up node holds a bounded-lag replica, so *any* node answers
+  a read. The LB (nginx / anycast) health-checks backends and retries away from a dead one — the
+  request never fails as long as ≥1 node is up. DNS multi-A is the coarse outer layer (TTL-cached,
+  slow); the LB does the fast failover.
+- **Writes need the shard's master — the "quickly elected" path.** A shard's mastership is a **lease
+  in the CP directory** (etcd, §3/§6), renewed by heartbeats ("regular contact between servers").
+  Master dies → lease expires → a live node holding a **near-current follower** (bounded lag!)
+  acquires the lease by compare-and-swap, **fences the old master** (per-node FLD-2 writer lock +
+  the single-grant lease), promotes its follower, and accepts writes. Bounded lag ⇒ promotion is
+  fast (minimal catch-up).
+- **No client timeout on switch.** Short lease TTL (fast detection) + **hold-and-retry at the
+  LB/node**: an in-flight write *waits out* the sub-second election as latency, not an error, inside
+  the client's timeout budget. So the response always works when a node falls, as long as several are
+  up — reads immediately, writes after a sub-second per-shard election.
+- **The one hard invariant — at most one master per shard.** Fencing + a single-grant lease must
+  prevent split-brain; electing two masters under a partition silently diverges the shard. Availability
+  is the *easy* part — "never two masters" is the thing to get right, and etcd's lease compare-and-swap
+  is the clean primitive for exactly it. Two-layer fencing: the CP directory grants at most one lease
+  per shard, and each node's FLD-2 writer lock refuses a second local writer.
+- **Honest tradeoff.** Short lease = fast failover but more false failovers on transient network blips
+  (the detection-time-vs-stability tradeoff, same as Raft election timeouts). Per-shard election keeps
+  a false positive's cost to one shard briefly re-homing, not a cluster-wide stall. Tune the lease TTL
+  to the network; expose it as config.
+
+This is standard lease-based HA (Cloudflare Durable Objects, Vitess, etcd-backed systems), localized
+by sharding — Phase 7+, and the fencing/lease protocol gets commit-path-class review (split-brain,
+partition, clock-skew on lease expiry) before any line ships.
