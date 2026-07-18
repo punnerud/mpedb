@@ -902,10 +902,14 @@ impl<'a> Binder<'a> {
             "ltrim" => ScalarFn::Ltrim,
             "rtrim" => ScalarFn::Rtrim,
             "instr" => ScalarFn::Instr,
+            "sqrt" => ScalarFn::Sqrt,
+            "pow" | "power" => ScalarFn::Pow,
+            "sign" => ScalarFn::Sign,
             other => {
                 return Err(bind_err(format!(
                     "unknown function `{other}()`; available: lower, upper, length, trim, \
-                     ltrim, rtrim, replace, instr, abs, round, substr, coalesce, ifnull, nullif"
+                     ltrim, rtrim, replace, instr, abs, round, substr, sqrt, pow, sign, \
+                     coalesce, ifnull, nullif"
                 )))
             }
         };
@@ -946,6 +950,10 @@ impl<'a> Binder<'a> {
             ScalarFn::Instr => {
                 (&[Some(ColumnType::Text), Some(ColumnType::Text)], Some(ColumnType::Int64))
             }
+            // sqrt/pow take numbers (int or float, unpinned like abs/round) but
+            // ALWAYS return a float; sign always returns an integer.
+            ScalarFn::Sqrt | ScalarFn::Pow => (&[], Some(ColumnType::Float64)),
+            ScalarFn::Sign => (&[], Some(ColumnType::Int64)),
         };
         let mut out = Vec::with_capacity(bound.len());
         for (i, (e, t)) in bound.into_iter().enumerate() {
@@ -1001,7 +1009,10 @@ impl<'a> Binder<'a> {
             }
             BExpr::Param(i) => self.param_types[*i as usize],
             BExpr::Unary(BUnOp::ToFloat, _) => Some(ColumnType::Float64),
-            BExpr::Call(ScalarFn::Length | ScalarFn::Instr, _) => Some(ColumnType::Int64),
+            BExpr::Call(ScalarFn::Length | ScalarFn::Instr | ScalarFn::Sign, _) => {
+                Some(ColumnType::Int64)
+            }
+            BExpr::Call(ScalarFn::Sqrt | ScalarFn::Pow, _) => Some(ColumnType::Float64),
             BExpr::Call(ScalarFn::Abs | ScalarFn::Round, a) => self.static_type(&a[0]),
             BExpr::Call(_, _) => Some(ColumnType::Text),
             _ => None,

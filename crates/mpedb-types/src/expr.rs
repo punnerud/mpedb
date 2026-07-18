@@ -120,6 +120,9 @@ pub enum ScalarFn {
     Ltrim = 9,
     Rtrim = 10,
     Instr = 11,
+    Sqrt = 12,
+    Pow = 13,
+    Sign = 14,
 }
 
 impl ScalarFn {
@@ -136,6 +139,9 @@ impl ScalarFn {
             9 => ScalarFn::Ltrim,
             10 => ScalarFn::Rtrim,
             11 => ScalarFn::Instr,
+            12 => ScalarFn::Sqrt,
+            13 => ScalarFn::Pow,
+            14 => ScalarFn::Sign,
             other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
         })
     }
@@ -147,8 +153,9 @@ impl ScalarFn {
             ScalarFn::Lower | ScalarFn::Upper | ScalarFn::Length | ScalarFn::Trim
             | ScalarFn::Abs => argc == 1,
             ScalarFn::Round | ScalarFn::Ltrim | ScalarFn::Rtrim => argc == 1 || argc == 2,
+            ScalarFn::Sqrt | ScalarFn::Sign => argc == 1,
             ScalarFn::Substr => argc == 2 || argc == 3,
-            ScalarFn::Instr => argc == 2,
+            ScalarFn::Instr | ScalarFn::Pow => argc == 2,
             ScalarFn::Replace => argc == 3,
         }
     }
@@ -166,6 +173,9 @@ impl ScalarFn {
             ScalarFn::Ltrim => "ltrim",
             ScalarFn::Rtrim => "rtrim",
             ScalarFn::Instr => "instr",
+            ScalarFn::Sqrt => "sqrt",
+            ScalarFn::Pow => "pow",
+            ScalarFn::Sign => "sign",
         }
     }
 }
@@ -289,6 +299,20 @@ fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
             ))),
         }
     };
+    let num = |v: &Value| -> Result<f64> {
+        match v {
+            Value::Int(i) => Ok(*i as f64),
+            Value::Float(x) => Ok(*x),
+            other => Err(Error::TypeMismatch(format!(
+                "{}() expects a number, got {}",
+                f.name(),
+                other.type_name()
+            ))),
+        }
+    };
+    // A math result that is NaN (e.g. sqrt of a negative) is SQL NULL, matching
+    // sqlite — never a NaN handed back into a typed column.
+    let float_or_null = |r: f64| if r.is_nan() { Value::Null } else { Value::Float(r) };
     Ok(match f {
         ScalarFn::Lower => Value::Text(text(&args[0])?.to_lowercase()),
         ScalarFn::Upper => Value::Text(text(&args[0])?.to_uppercase()),
@@ -398,6 +422,26 @@ fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
             };
             Value::Int(pos)
         }
+        // sqrt of a negative and pow with a non-real result are NULL (sqlite),
+        // and both always return a float regardless of the argument types.
+        ScalarFn::Sqrt => float_or_null(num(&args[0])?.sqrt()),
+        ScalarFn::Pow => float_or_null(num(&args[0])?.powf(num(&args[1])?)),
+        ScalarFn::Sign => match &args[0] {
+            Value::Int(i) => Value::Int(i.signum()),
+            Value::Float(x) => Value::Int(if *x > 0.0 {
+                1
+            } else if *x < 0.0 {
+                -1
+            } else {
+                0 // covers +0.0, -0.0, and (unreachable here) NaN
+            }),
+            other => {
+                return Err(Error::TypeMismatch(format!(
+                    "sign() expects a number, got {}",
+                    other.type_name()
+                )))
+            }
+        },
     })
 }
 
