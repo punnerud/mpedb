@@ -112,6 +112,34 @@ fn view_key(name: &str) -> Vec<u8> {
     k
 }
 
+/// Type-check + coerce an `ADD COLUMN DEFAULT <const>` value against the
+/// column's declared type (rigid schema). The one implicit widening is an
+/// integer literal into a `real`/`timestamp` column, matching the config
+/// schema's `parse_default`; everything else must match exactly or it is a
+/// clean error (never a silent conversion, the whole point of the rigid
+/// schema). `NULL` and an `any` column accept anything.
+fn coerce_default(
+    v: Value,
+    ty: mpedb_types::ColumnType,
+    table: &str,
+    col: &str,
+) -> Result<Value> {
+    use mpedb_types::ColumnType;
+    let v = match (&v, ty) {
+        (Value::Int(i), ColumnType::Float64) => Value::Float(*i as f64),
+        (Value::Int(i), ColumnType::Timestamp) => Value::Timestamp(*i),
+        _ => v,
+    };
+    if !v.fits(ty) {
+        return Err(Error::Bind(format!(
+            "ALTER TABLE {table} ADD COLUMN {col}: DEFAULT value of type {} does not \
+             match column type {ty}",
+            v.type_name()
+        )));
+    }
+    Ok(v)
+}
+
 impl Database {
     /// `CREATE TABLE` (#47 stage 2/3): build the [`TableDef`] from the parsed
     /// spec, append it to the schema in one catalog commit (the engine
@@ -365,38 +393,64 @@ impl Database {
         Ok(ExecResult::Affected(0))
     }
 
-    /// `ALTER TABLE ... ADD COLUMN` (#47 stage 5, v1). Only a NULLABLE column is
-    /// accepted: NOT NULL has no DEFAULT to fill existing rows with, and
-    /// UNIQUE / PRIMARY KEY would need an online index build — both refused with
-    /// a clear message (sqlite/PG also refuse NOT NULL without a default when the
-    /// table has rows). The engine rewrites existing rows with the new column
-    /// NULL in one commit.
+    /// `ALTER TABLE ... ADD COLUMN` (#47 stage 5). A NULLABLE column fills
+    /// existing rows with NULL; `DEFAULT <const>` fills them with the constant,
+    /// which also makes `NOT NULL DEFAULT <const>` legal (the fill value is
+    /// non-NULL) and is persisted so later INSERTs omitting the column get it.
+    /// Still refused, matching sqlite: NOT NULL *without* a non-NULL default
+    /// (no value for existing rows), and UNIQUE / PRIMARY KEY on ADD (would need
+    /// an online index build; sqlite refuses these outright). The DEFAULT const
+    /// is type-checked against the column type (rigid schema). The engine
+    /// rewrites existing rows in one commit.
     pub(crate) fn apply_alter_add_column(
         &self,
         table: &str,
         spec: mpedb_sql::CreateColumnSpec,
     ) -> Result<ExecResult> {
-        if spec.not_null {
-            return Err(Error::Bind(format!(
-                "ALTER TABLE {table} ADD COLUMN {}: NOT NULL is not supported on ADD \
-                 (no DEFAULT to fill existing rows) — add it nullable",
-                spec.name
-            )));
-        }
+        use mpedb_types::DefaultExpr;
         if spec.unique || spec.pk {
             return Err(Error::Bind(format!(
                 "ALTER TABLE {table} ADD COLUMN {}: UNIQUE / PRIMARY KEY on ADD is not \
-                 supported yet (would need an online index build)",
+                 supported (would need an online index build) — sqlite refuses these too",
                 spec.name
             )));
         }
+        // Resolve + type-check the DEFAULT const against the column type. The
+        // fill value seeds every existing row (NULL when there is no default).
+        let fill = match spec.default {
+            Some(DefaultExpr::Const(v)) => coerce_default(v, spec.ty, table, &spec.name)?,
+            // The ADD-COLUMN parser only ever emits a Const literal (no now()).
+            Some(DefaultExpr::Now) => {
+                return Err(Error::Bind(format!(
+                    "ALTER TABLE {table} ADD COLUMN {}: now() is not a constant default \
+                     (sqlite refuses a non-constant ADD-COLUMN default)",
+                    spec.name
+                )))
+            }
+            None => Value::Null,
+        };
+        if spec.not_null && fill.is_null() {
+            return Err(Error::Bind(format!(
+                "ALTER TABLE {table} ADD COLUMN {}: a NOT NULL column needs a non-NULL \
+                 DEFAULT to fill existing rows (matches sqlite: \"Cannot add a NOT NULL \
+                 column with default value NULL\")",
+                spec.name
+            )));
+        }
+        // A NULL fill is indistinguishable from "no default" for a nullable
+        // column — do not persist a redundant NULL default.
+        let default = if fill.is_null() {
+            None
+        } else {
+            Some(DefaultExpr::Const(fill.clone()))
+        };
         let col = mpedb_types::ColumnDef {
             name: spec.name,
             ty: spec.ty,
-            nullable: true,
+            nullable: !spec.not_null,
             unique: false,
             indexed: false,
-            default: None,
+            default,
             check: None,
         };
         self.engine.refresh_schema_if_stale()?;
@@ -407,7 +461,7 @@ impl Database {
             .table_id(table)
             .ok_or_else(|| Error::Bind(format!("ALTER TABLE: no such table `{table}`")))?;
         let mut w = self.engine.begin_write()?;
-        match w.alter_add_column(id, col) {
+        match w.alter_add_column(id, col, fill) {
             Ok(()) => w.commit()?,
             Err(e) => {
                 w.abort();

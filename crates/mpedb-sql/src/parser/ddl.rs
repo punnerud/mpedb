@@ -12,7 +12,7 @@ use crate::ddl::{
     CreatePolicySpec, CreateTriggerSpec, DdlStmt, RlsAction, TriggerEvent, TriggerTiming,
 };
 use crate::token::{tokenize, Kw, Tok};
-use mpedb_types::{PolicyCmd, Result};
+use mpedb_types::{DefaultExpr, PolicyCmd, Result, Value};
 
 /// Recognize and parse a row-level-security DDL statement (`CREATE POLICY`,
 /// `DROP POLICY`, `ALTER TABLE … ROW LEVEL SECURITY`). Returns `Ok(None)` if
@@ -177,6 +177,7 @@ impl<'a> Parser<'a> {
                     not_null: false,
                     unique: false,
                     pk: false,
+                    default: None,
                 };
                 loop {
                     // NOT and NULL are reserved keywords (Tok::Kw), not
@@ -665,6 +666,7 @@ impl<'a> Parser<'a> {
                 not_null: false,
                 unique: false,
                 pk: false,
+                default: None,
             };
             loop {
                 if self.eat_kw(Kw::Not) {
@@ -682,12 +684,16 @@ impl<'a> Parser<'a> {
                         "column-declared COLLATE is not supported yet (stage 1b) — put \
                          the COLLATE on the comparison or ORDER BY instead",
                     ));
-                } else if self.eat_word("DEFAULT")
-                    || self.eat_word("CHECK")
-                    || self.eat_word("REFERENCES")
-                {
+                } else if self.eat_word("DEFAULT") {
+                    // `ADD COLUMN … DEFAULT <const>` fills existing rows with the
+                    // constant (and a `NOT NULL DEFAULT <const>` becomes legal —
+                    // the fill value is non-NULL). Only a literal is accepted,
+                    // matching sqlite, which refuses a non-constant ADD-COLUMN
+                    // default. The facade type-checks the value against `ty`.
+                    col.default = Some(self.parse_add_column_default()?);
+                } else if self.eat_word("CHECK") || self.eat_word("REFERENCES") {
                     return Err(self.err_here(
-                        "DEFAULT/CHECK/REFERENCES are not supported in ADD COLUMN yet",
+                        "CHECK/REFERENCES are not supported in ADD COLUMN yet",
                     ));
                 } else {
                     break;
@@ -713,5 +719,51 @@ impl<'a> Parser<'a> {
             return Err(self.err_here("expected ENABLE, FORCE, or DISABLE ROW LEVEL SECURITY"));
         };
         Ok(DdlStmt::AlterRls { table, action })
+    }
+
+    /// Parse the `DEFAULT <const>` value of an `ALTER TABLE ADD COLUMN` clause.
+    /// sqlite accepts ONLY a literal constant here — an integer, float, string,
+    /// blob, boolean, `NULL`, or a signed number — and refuses anything that
+    /// needs evaluation (a parenthesized expression such as `(1+2)`, a function
+    /// call, a column reference, or `CURRENT_*`) with "Cannot add a column with
+    /// non-constant default". We match that: a non-literal default is a parse
+    /// error. The value is folded into a [`DefaultExpr::Const`]; the facade
+    /// type-checks it against the column type.
+    fn parse_add_column_default(&mut self) -> Result<DefaultExpr> {
+        // A leading sign only makes sense before a numeric literal.
+        let signed = if self.eat(&Tok::Minus) {
+            Some(true)
+        } else if self.eat(&Tok::Plus) {
+            Some(false)
+        } else {
+            None
+        };
+        let non_const = |p: &Self| {
+            p.err_here(
+                "ADD COLUMN DEFAULT must be a constant literal (a number, string, blob, \
+                 boolean, or NULL) — a parenthesized expression, function call, column \
+                 reference, or CURRENT_* default is not supported (matches sqlite)",
+            )
+        };
+        let val = match self.advance() {
+            Some(Tok::Int(i)) => {
+                let i = if signed == Some(true) {
+                    i.checked_neg()
+                        .ok_or_else(|| self.err_here("integer literal overflows i64"))?
+                } else {
+                    i
+                };
+                Value::Int(i)
+            }
+            Some(Tok::Float(f)) => Value::Float(if signed == Some(true) { -f } else { f }),
+            // A sign before a non-numeric literal is a syntax error.
+            Some(Tok::Str(s)) if signed.is_none() => Value::Text(s),
+            Some(Tok::Blob(b)) if signed.is_none() => Value::Blob(b),
+            Some(Tok::Kw(Kw::Null)) if signed.is_none() => Value::Null,
+            Some(Tok::Kw(Kw::True)) if signed.is_none() => Value::Bool(true),
+            Some(Tok::Kw(Kw::False)) if signed.is_none() => Value::Bool(false),
+            _ => return Err(non_const(self)),
+        };
+        Ok(DefaultExpr::Const(val))
     }
 }
