@@ -136,10 +136,19 @@ SELECT a, b FROM t WHERE id = 2
 11
 -1
 
-# ---- rejected SET forms --------------------------------------------------------------
+# ---- duplicate column assignment: rightmost wins (sqlite R-34751-18293) -------------
+# All but the rightmost occurrence is IGNORED (not evaluated). Scoped to id = 2
+# (whose `a` is not read again below) so the file's later state is undisturbed.
 
-statement error more than once
-UPDATE t SET a = 1, a = 2
+statement ok
+UPDATE t SET a = 1, a = 2 WHERE id = 2
+
+query I nosort
+SELECT a FROM t WHERE id = 2
+----
+2
+
+# ---- rejected SET forms --------------------------------------------------------------
 
 statement error unknown column
 UPDATE t SET nope = 1
