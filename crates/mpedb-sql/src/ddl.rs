@@ -141,6 +141,20 @@ pub enum DdlStmt {
     CreateTrigger(CreateTriggerSpec),
     /// `DROP TRIGGER [IF EXISTS] <name>` (DESIGN-TRIGGERS).
     DropTrigger { name: String, if_exists: bool },
+    /// `ANALYZE [<name>]` — sqlite gathers optimizer statistics here; mpedb's
+    /// planner is rule-based (PK > unique > non-unique index > scan) and keeps no
+    /// statistics, so there is nothing to gather. Accepted as a no-op success so
+    /// tools/migrations that emit ANALYZE do not break. The optional target name
+    /// (a table, index, or schema) is captured and ignored — it is NOT required
+    /// to exist (leniency is never a wrong answer, and matches sqlite's success).
+    Analyze { name: Option<String> },
+    /// `REINDEX [<name>]` — sqlite rebuilds indexes; mpedb maintains every index
+    /// eagerly on each write, so there is never a stale index to rebuild.
+    /// Accepted as a no-op success. The optional target is captured and ignored:
+    /// a table name and an index name are indistinguishable at parse time (mpedb
+    /// does not persist index names — indexes are positional), so accepting
+    /// leniently is the safe choice and never a wrong answer.
+    Reindex { target: Option<String> },
 }
 
 #[cfg(test)]
@@ -367,6 +381,26 @@ mod tests {
         .is_err());
         assert!(parse_ddl("CREATE TRIGGER t AFTER INSERT ON o EXECUTE PROCEDURE p(NEW.id)").is_err());
         assert!(parse_ddl("CREATE TRIGGER t AFTER INSERT ON o BEGIN INSERT INTO x VALUES (1)").is_err()); // no END
+    }
+
+    #[test]
+    fn analyze_and_reindex_parse() {
+        // Bare and named forms; trailing `;` tolerated by parse_ddl.
+        assert_eq!(parse_ddl("ANALYZE").unwrap().unwrap(), DdlStmt::Analyze { name: None });
+        assert_eq!(
+            parse_ddl("ANALYZE orders").unwrap().unwrap(),
+            DdlStmt::Analyze { name: Some("orders".into()) }
+        );
+        assert_eq!(parse_ddl("analyze;").unwrap().unwrap(), DdlStmt::Analyze { name: None });
+        assert_eq!(parse_ddl("REINDEX").unwrap().unwrap(), DdlStmt::Reindex { target: None });
+        assert_eq!(
+            parse_ddl("REINDEX orders").unwrap().unwrap(),
+            DdlStmt::Reindex { target: Some("orders".into()) }
+        );
+        // A column named `analyze`/`reindex` still parses as ordinary SQL — the
+        // DDL words are positional identifiers, not reserved keywords.
+        assert_eq!(parse_ddl("SELECT analyze FROM t").unwrap(), None);
+        assert_eq!(parse_ddl("INSERT INTO t (reindex) VALUES (1)").unwrap(), None);
     }
 
     #[test]
