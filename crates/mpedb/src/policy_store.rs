@@ -1,5 +1,5 @@
 //! RLS policy storage in the catalog sys-keyspace + the facade DDL API
-//! (DESIGN-MULTIDB.md §3.2). A policy edit is one ordinary COW commit (writer
+//! (design/DESIGN-MULTIDB.md §3.2). A policy edit is one ordinary COW commit (writer
 //! lock → sys_put → bump the table's `pol_epoch` → meta flip), so it publishes
 //! {schema+policy} atomically and never touches the reviewed commit protocol.
 //!
@@ -48,7 +48,7 @@ impl Database {
             .ok_or_else(|| Error::Bind(format!("unknown table `{name}`")))
     }
 
-    /// **Tenant-leading-key lint (DESIGN-MULTIDB.md §6.4).** Returns human-readable
+    /// **Tenant-leading-key lint (design/DESIGN-MULTIDB.md §6.4).** Returns human-readable
     /// findings for a policy about to be created — never an error, and never
     /// blocking: a leaky key is a design smell the author may have accepted, not a
     /// bug the database gets to veto.
@@ -130,7 +130,7 @@ impl Database {
         Ok(out)
     }
 
-    /// Create (or replace) an RLS policy on `table` (DESIGN-MULTIDB.md §3.1).
+    /// Create (or replace) an RLS policy on `table` (design/DESIGN-MULTIDB.md §3.1).
     /// The `USING`/`WITH CHECK` sources are validated against the table before
     /// storage. Must not be called while a [`WriteSession`](crate::WriteSession)
     /// from this handle is open (it takes the writer lock).

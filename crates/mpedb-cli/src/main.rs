@@ -64,7 +64,7 @@ bench --auto accepts --durability none|commit|async|wal (default none); use
   --disk DIR to place the scratch db on real disk (durable modes need it)
 stress/crash accept --durability none|commit|async|wal (default none)
 stress/crash accept --concurrency serial|optimistic (default serial; Phase-3,
-  experimental — see DESIGN-PHASE3.md; `incr` is the autocommit conservation mode)
+  experimental — see design/DESIGN-PHASE3.md; `incr` is the autocommit conservation mode)
 crash --blob-kb N mixes ~20% N-KiB blob writes into every wave (suggest 64;
   above 256 one blob write can dominate the 5-60ms kill window and starve the
   small-txn paths); content is deterministic and byte-verified after each wave.

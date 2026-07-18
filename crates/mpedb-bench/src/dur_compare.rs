@@ -1,5 +1,5 @@
 //! Single-client durable point-insert, compared BY DURABILITY CLASS
-//! (DESIGN.md §5.4). This is the focused answer to "make single-client durable
+//! (design/DESIGN.md §5.4). This is the focused answer to "make single-client durable
 //! INSERTs competitive with SQLite and PostgreSQL": one sequential writer, on
 //! the real ext4 disk, in each honest class.
 //!

@@ -637,7 +637,7 @@ merely noisy.
 
    ⚠ The two flushes CANNOT be merged into one, and an earlier draft of this
    entry wrongly proposed exactly that. The data barrier makes the data durable
-   BEFORE the meta that references it (DESIGN.md §4.1); a single barrier over both
+   BEFORE the meta that references it (design/DESIGN.md §4.1); a single barrier over both
    would let a power loss land meta on the platter and not its data, leaving
    meta_T checksum-valid and pointing at COW pages that were never written. Two is
    the floor. `wal` gets one because its record is a single self-describing
@@ -693,7 +693,7 @@ merely noisy.
    replacing that `HashSet<u64>` with a **bitset** — page ids are dense and
    bounded by `high_water`, so a shift and a mask replace the hash on every
    platform. The `contains` itself cannot go: it is the COW guard, and catching
-   a violation of it in production is the point (DESIGN.md §3).
+   a violation of it in production is the point (design/DESIGN.md §3).
 5. **CDC capture check on the write path (minor).** With change-capture in the
    engine (mirror foundation), each write txn does one `cdc\0tabs` sys-lookup even
    when no mirror is configured. It is *not* the cause of the run-to-run variance
@@ -706,7 +706,7 @@ merely noisy.
 These numbers are **Linux (x86-64)**. macOS/Apple Silicon perf has not been
 re-measured in this run; platform *correctness and crash-safety* parity (not
 throughput) is covered separately — see [Platforms](README.md#platforms) and
-[`DESIGN-MACOS-LOCK.md`](DESIGN-MACOS-LOCK.md).
+[`design/DESIGN-MACOS-LOCK.md`](design/DESIGN-MACOS-LOCK.md).
 
 **32-bit ARM** (Raspberry Pi 3 B+, armv7l) is a correctness platform here, not a
 throughput one — it is ~11× slower than the dev box and cannot run the other two

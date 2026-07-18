@@ -220,7 +220,7 @@ impl<'e> WriteTxn<'e> {
     /// Draw one freelist entry's pages into `reusable` — **without removing the
     /// entry**. Returns whether an entry was drawn.
     ///
-    /// Read-only, and that is the whole point (DESIGN.md §4.5). It used to
+    /// Read-only, and that is the whole point (design/DESIGN.md §4.5). It used to
     /// `btree::delete` the entry, which made every page drawn a page the commit
     /// fixpoint had to write back (it records what is free, and a drawn page is
     /// listed nowhere else). That coupled the fixpoint's own page appetite to

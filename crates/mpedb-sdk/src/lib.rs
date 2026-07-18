@@ -2,7 +2,7 @@
 //!
 //! The pitch: *the user sends just SQL; the SDK optimizes against mpedb.*
 //! Instead of every process pushing its compiled plans into the database's
-//! shared registry (DESIGN.md §7.2), a [`Session`] holds them **client-side**
+//! shared registry (design/DESIGN.md §7.2), a [`Session`] holds them **client-side**
 //! as [`DetachedPlan`]s (Morten's detached-plan model): it compiles each
 //! distinct SQL string exactly once via [`Database::prepare_detached`], caches
 //! the plan locally, and thereafter executes by

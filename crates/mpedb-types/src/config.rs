@@ -17,7 +17,7 @@ pub enum Durability {
     /// msync data and meta before a commit is acknowledged.
     Commit,
     /// **WAL with deferred (coalesced) fsync** — the "sqlite `synchronous=NORMAL`
-    /// / PostgreSQL `synchronous_commit=off`" class (DESIGN.md §5.4.2). Every
+    /// / PostgreSQL `synchronous_commit=off`" class (design/DESIGN.md §5.4.2). Every
     /// commit still APPENDS its record to `<path>-wal` and flips the meta, so
     /// the on-disk log is always a crash-consistent prefix; a background
     /// flusher issues `fdatasync` on a bounded interval rather than per commit.
@@ -29,7 +29,7 @@ pub enum Durability {
     /// Write-ahead log: every commit appends one sequential record to
     /// `<path>-wal` and issues a single fdatasync before it is acknowledged.
     /// Same durability guarantee as `commit`, much cheaper per commit
-    /// (DESIGN.md §5.4).
+    /// (design/DESIGN.md §5.4).
     Wal,
 }
 
@@ -37,20 +37,20 @@ impl Durability {
     /// Modes backed by the companion `<path>-wal` log (`wal` and `async`).
     /// They share the append/checkpoint/recovery machinery; they differ only
     /// in WHEN `fdatasync` runs (`wal`: per commit before ack; `async`:
-    /// deferred/coalesced by a background flusher — DESIGN.md §5.4).
+    /// deferred/coalesced by a background flusher — design/DESIGN.md §5.4).
     pub fn uses_wal(self) -> bool {
         matches!(self, Durability::Wal | Durability::Async)
     }
 
     /// True iff a commit is power-loss-durable at the moment it is
     /// acknowledged (`commit` and `wal`). `none` and `async` acknowledge
-    /// before power-loss durability (DESIGN.md §5.4).
+    /// before power-loss durability (design/DESIGN.md §5.4).
     pub fn durable_on_ack(self) -> bool {
         matches!(self, Durability::Commit | Durability::Wal)
     }
 }
 
-/// Write-path concurrency discipline (DESIGN-PHASE3.md).
+/// Write-path concurrency discipline (design/DESIGN-PHASE3.md).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Concurrency {
     /// Today's shipped behavior: one writer at a time under the global writer
@@ -62,13 +62,13 @@ pub enum Concurrency {
     /// critical section to validate its footprint (first-committer-wins,
     /// `Error::WriteConflict` on conflict) and blind-apply. Measured on this
     /// engine's COW B+tree and found NOT to beat the serial path; kept behind
-    /// the flag for reproducibility. See DESIGN-PHASE3.md for the verdict.
+    /// the flag for reproducibility. See design/DESIGN-PHASE3.md for the verdict.
     Optimistic,
 }
 
 /// Filesystem permissions applied to a freshly-created database file (and its
 /// `<path>-wal` companion). This is the ONLY OS-enforced isolation boundary in
-/// mpedb's serverless model (DESIGN-MULTIDB.md §1.4, §6): a process that cannot
+/// mpedb's serverless model (design/DESIGN-MULTIDB.md §1.4, §6): a process that cannot
 /// `open()` the file touches zero bytes. Files are always *born* owner-only
 /// (0o600) and then widened to `mode`; leaving `mode` unset keeps them 0o600.
 #[derive(Debug, Clone, Default)]
@@ -260,7 +260,7 @@ impl Config {
 
 /// Build a validated single-database `Config` from one `[database]` section and
 /// its declared tables. Shared by the single-file path and each `Workspace`
-/// member so validation is identical everywhere (DESIGN-MULTIDB.md §1.2).
+/// member so validation is identical everywhere (design/DESIGN-MULTIDB.md §1.2).
 fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>) -> Result<Config> {
         if db.path.is_empty() {
             return Err(Error::Config("database.path must be set".into()));
@@ -407,7 +407,7 @@ fn raw_to_config(db: RawDatabase, raw_tables: Vec<RawTable>) -> Result<Config> {
 
 /// One attached database inside a [`WorkspaceConfig`]: a routing `alias` and the
 /// member's own fully-independent [`Config`] (own file, lock, reader table,
-/// catalog — DESIGN-MULTIDB.md §1.1).
+/// catalog — design/DESIGN-MULTIDB.md §1.1).
 #[derive(Debug, Clone)]
 pub struct WorkspaceMember {
     pub alias: String,
@@ -416,7 +416,7 @@ pub struct WorkspaceMember {
 
 /// A set of independent databases addressed by alias (`alias.table`). Separate
 /// files → separate writer locks → linear write parallelism, and the honest
-/// hard-isolation boundary (DESIGN-MULTIDB.md §1). A plain single-`[database]`
+/// hard-isolation boundary (design/DESIGN-MULTIDB.md §1). A plain single-`[database]`
 /// config parses as a one-member workspace, so every existing config still
 /// opens as a workspace with no change.
 #[derive(Debug, Clone)]

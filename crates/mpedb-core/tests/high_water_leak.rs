@@ -32,7 +32,7 @@
 //!
 //! The fixpoint cannot refill (`in_freelist_op` — it is mutating the tree refill
 //! reads), so the instant its pool ran dry it took a page off `high_water`.
-//! DESIGN.md §4.5 calls that "a few pages of slack". It measured as ~1 page per
+//! design/DESIGN.md §4.5 calls that "a few pages of slack". It measured as ~1 page per
 //! 43 commits, forever, because **the pool's size is irrelevant to the bump
 //! rate**: refill handed over ONE entry no matter how many entries existed, so
 //! 12,000 free pages did a dry fixpoint no good at all.
@@ -40,7 +40,7 @@
 //! The fix is to make refill **read-only**: draw the pages, leave the entry, and
 //! let the fixpoint strike out only what got consumed. An entry nobody allocates
 //! out of is never rewritten — so a writer can hold a deep pool for free, and the
-//! fixpoint stops falling through to `high_water`. DESIGN.md §4.5 has the
+//! fixpoint stops falling through to `high_water`. design/DESIGN.md §4.5 has the
 //! protocol; the cost is a measured **-7.05% [-8.71, -5.40], n=20 pairs** on the
 //! write path.
 //!
@@ -76,7 +76,7 @@
 //!    (Right diagnosis, wrong half — the leftover has to stop needing a
 //!    write-back at all, not merely get smaller.)
 //! 7. **"Let the fixpoint unwind and refill instead of minting."** Killed by
-//!    READING DESIGN.md §4.5 rather than measuring: the `high_water` fallback IS
+//!    READING design/DESIGN.md §4.5 rather than measuring: the `high_water` fallback IS
 //!    the termination argument. Allocation falling back to something that frees
 //!    nothing is what bounds the loop. A refill inside the fixpoint frees pages
 //!    (its own COW), which grows the set, which needs another pass. Unbounded.

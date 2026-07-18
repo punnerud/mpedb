@@ -1,4 +1,4 @@
-//! Session context — the serverless "principal" (DESIGN-MULTIDB.md §2).
+//! Session context — the serverless "principal" (design/DESIGN-MULTIDB.md §2).
 //!
 //! A [`Session`] is a bag of caller-set variables read by `current_setting()`
 //! in SQL. It is the serverless analogue of a SQL session's `SET` variables and
@@ -39,7 +39,7 @@ impl Session {
     }
 
     /// Bind a **membership set** for `col IN (current_setting(key))`
-    /// (DESIGN-MULTIDB.md §2.6) — e.g. the orgs this principal belongs to.
+    /// (design/DESIGN-MULTIDB.md §2.6) — e.g. the orgs this principal belongs to.
     ///
     /// The arity lives here, in the data: one compiled plan serves a caller in
     /// one org and a caller in fifty, because the list never enters the plan
@@ -87,7 +87,7 @@ impl Session {
 /// Build the executor's full parameter array: the caller's params followed by
 /// the plan's reserved session-context slots, resolved from `session` by key.
 ///
-/// Fail-closed (DESIGN-MULTIDB.md §2.3/§2.4): a missing key, a NULL value, or a
+/// Fail-closed (design/DESIGN-MULTIDB.md §2.3/§2.4): a missing key, a NULL value, or a
 /// type mismatch is a hard error — never a silently-empty result. Only the
 /// `n_user` caller params are accepted; a caller cannot supply a value for the
 /// reserved tail (that is where §2.1's "refuse caller-supplied context" is

@@ -7,7 +7,7 @@
 //! lock is NOT the shared pthread mutex there. Instead `WriterLock` gives
 //! equivalent owner-death recovery via a sidecar `flock` (the kernel releases it
 //! when the holder dies) plus a private ERRORCHECK mutex and a shared-memory
-//! tri-state DIRTY word (DESIGN-MACOS-LOCK.md). Durability uses
+//! tri-state DIRTY word (design/DESIGN-MACOS-LOCK.md). Durability uses
 //! `fcntl(F_FULLFSYNC)` (real platter flush) and `msync` bases rounded to the
 //! 16 KiB Apple-Silicon page. Futex waits degrade to a polling "park" (correct,
 //! just busier). Verified: SIGKILL waves recover with `eowner_recovery=true`
@@ -174,7 +174,7 @@ pub fn futex_wake_all(word: &AtomicU32) {
     }
 }
 
-// ---- macOS crash-safe writer lock (DESIGN-MACOS-LOCK.md, FLD-2) -------------
+// ---- macOS crash-safe writer lock (design/DESIGN-MACOS-LOCK.md, FLD-2) -------------
 //
 // Linux uses the robust pthread mutex directly (in shm.rs). macOS has none, so
 // the writer lock is: a sidecar-inode `flock` (the KERNEL releases it when the

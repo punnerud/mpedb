@@ -260,7 +260,7 @@ fn crash_injection() {
 /// obsolete by 16 consecutive clean 8-worker×5s runs — at the historical
 /// ~2/3 failure rate that is ≈ 2e-8 if the bug were still alive. Kept
 /// #[ignore]d purely for TIME (~20 s), as the strongest known stressor of
-/// the oldest-pinned/freelist-reclamation machinery (DESIGN.md §4.3/§4.5).
+/// the oldest-pinned/freelist-reclamation machinery (design/DESIGN.md §4.3/§4.5).
 ///
 /// The historical failure signatures, should it ever return:
 ///   - child:  "internal error (bug in mpedb): double free of page N"

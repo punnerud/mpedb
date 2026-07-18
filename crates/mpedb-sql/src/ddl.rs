@@ -1,4 +1,4 @@
-//! Row-level-security DDL statements (DESIGN-MULTIDB.md §3.1). These do not
+//! Row-level-security DDL statements (design/DESIGN-MULTIDB.md §3.1). These do not
 //! compile to a [`CompiledPlan`](crate::CompiledPlan) — they mutate the catalog
 //! sys-keyspace — so the facade intercepts them before planning and applies
 //! them via its policy-store API. `USING`/`WITH CHECK` predicates are captured
@@ -129,7 +129,7 @@ pub enum DdlStmt {
     },
     /// `CREATE VIEW [IF NOT EXISTS] <name> AS <select>` (#73). The SELECT is
     /// captured as source text and re-parsed + flattened into referencing
-    /// queries (DESIGN-VIEW.md). Applied by the facade as a catalog mutation.
+    /// queries (design/DESIGN-VIEW.md). Applied by the facade as a catalog mutation.
     CreateView { name: String, select_sql: String, if_not_exists: bool },
     /// `DROP VIEW [IF EXISTS] <name>` (#73).
     DropView { name: String, if_exists: bool },

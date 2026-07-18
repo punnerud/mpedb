@@ -2,7 +2,7 @@
 //!
 //! x86-64 is TSO: a store-buffering race needs the store buffer to be visible,
 //! and it usually is not. ARM is weakly ordered, so the fences in the reader-pin
-//! protocol (DESIGN.md §4.3) are doing real work there and their absence would
+//! protocol (design/DESIGN.md §4.3) are doing real work there and their absence would
 //! be observable rather than theoretical.
 //!
 //! And armv7 is 32-bit: `usize` is 4 bytes, and every packed `{pid, seq}` word

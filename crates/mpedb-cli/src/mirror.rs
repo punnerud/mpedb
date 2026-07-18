@@ -1,5 +1,5 @@
 //! `mpedb mirror …` — bidirectional sqlite/PostgreSQL ⇄ mpedb mirroring
-//! (DESIGN-MIRROR.md). This stage (M2.4) wires the sqlite import and a status
+//! (design/DESIGN-MIRROR.md). This stage (M2.4) wires the sqlite import and a status
 //! read; pull/push/switch land in later milestones.
 
 use std::path::PathBuf;

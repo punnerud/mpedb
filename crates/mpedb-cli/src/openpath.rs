@@ -11,7 +11,7 @@
 //!
 //! v0 is deliberately a full-copy mirror with mirror's own authority and
 //! conflict rules — not the delta overlay. The overlay, the lock modes, and
-//! the stamp machinery are DESIGN-SQLITE-BACKED.md v2; this is the
+//! the stamp machinery are design/DESIGN-SQLITE-BACKED.md v2; this is the
 //! one-command UX proving the shape.
 
 use std::path::{Path, PathBuf};

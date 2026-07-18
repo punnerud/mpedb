@@ -1,5 +1,5 @@
 //! The shared-memory layer: file creation/attach, the lock area, meta pages,
-//! and the reader table. Implements DESIGN.md §3–§4 exactly; every protocol
+//! and the reader table. Implements design/DESIGN.md §3–§4 exactly; every protocol
 //! here was adversarially reviewed — read the design before changing ordering
 //! or lock semantics.
 //!
@@ -53,7 +53,7 @@ const LA_INIT_STATE: usize = 0; // AtomicU32: 0 empty, 1 formatting, 2 READY
 #[cfg(target_os = "linux")]
 const LA_MUTEX: usize = 64; // pthread_mutex_t, 128 bytes reserved (Linux)
 // macOS reuses the ex-mutex region (Linux never compiles these): the tri-state
-// recovered signal for the flock-based writer lock (DESIGN-MACOS-LOCK.md).
+// recovered signal for the flock-based writer lock (design/DESIGN-MACOS-LOCK.md).
 // 0 = CLEAN, 1 = a holder is in its critical section, 2 = POISONED (a prior
 // owner-death recovery failed = ENOTRECOVERABLE, fail-closed).
 #[cfg(not(target_os = "linux"))]
@@ -123,7 +123,7 @@ pub fn reader_table_pages(max_readers: u32) -> u64 {
     ((max_readers as usize * READER_SLOT_SIZE).div_ceil(PAGE_SIZE)) as u64
 }
 
-/// Intent-ring region (DESIGN.md §5.3): fixed geometry, directly after the
+/// Intent-ring region (design/DESIGN.md §5.3): fixed geometry, directly after the
 /// reader table.
 pub const RING_SLOTS: u32 = 256;
 pub const RING_SLOT_SIZE: usize = 1024;
@@ -160,7 +160,7 @@ fn durability_from_tag(t: u32) -> Option<Durability> {
     })
 }
 
-// ---- write-ahead log (durability = wal / async, DESIGN.md §5.4) ----
+// ---- write-ahead log (durability = wal / async, design/DESIGN.md §5.4) ----
 //
 // The WAL is a separate append-only file at `<db-path>-wal`, shared by both
 // wal-class modes: `wal` (fdatasync per commit, durable-on-ack) and `async`
@@ -187,7 +187,7 @@ fn durability_from_tag(t: u32) -> Option<Durability> {
 //               ‖ prefix[prefix_len] ‖ suffix[PAGE_SIZE - suffix_start]
 // ```
 //
-// SPLIT is the "lean record" encoding (DESIGN.md §5.4.1): a B+tree node uses
+// SPLIT is the "lean record" encoding (design/DESIGN.md §5.4.1): a B+tree node uses
 // only a header+slot prefix and a packed-cell suffix, so the unread middle
 // (or an overflow page's unused tail) is omitted from the log and zero-filled
 // on replay (`btree::used_span` proves which bytes are never read back). It is
@@ -534,7 +534,7 @@ fn io_err(context: &str) -> Error {
 /// (or its `-wal`). The file was born 0o600; this widens it to `perms.mode`
 /// (default: leave it 0o600) and, if requested, `chown`s it. A configured
 /// owner/group that cannot be applied is a hard error — a silently-unenforced
-/// isolation boundary is worse than a loud failure (DESIGN-MULTIDB.md §1.4).
+/// isolation boundary is worse than a loud failure (design/DESIGN-MULTIDB.md §1.4).
 fn apply_file_perms(fd: RawFd, perms: &FilePerms) -> Result<()> {
     let mode = perms.mode.unwrap_or(0o600);
     if unsafe { libc::fchmod(fd, mode as libc::mode_t) } != 0 {
@@ -876,7 +876,7 @@ impl Shm {
 
     /// Publish a commit into the alternate meta slot. Caller: writer lock
     /// held; all COW data pages already written via plain stores.
-    /// Ordering per DESIGN.md §4.1: fence(Release) → body fields (Relaxed) →
+    /// Ordering per design/DESIGN.md §4.1: fence(Release) → body fields (Relaxed) →
     /// checksum (Release).
     pub fn write_meta_slot(&self, prev_slot: u64, s: &MetaSnapshot) -> u64 {
         let slot = 1 - prev_slot;
@@ -961,7 +961,7 @@ impl Shm {
         // a burst of work per wake-up. Two is the worst case there is.
         //
         // This changes how we WAIT, not the protocol: the attributes
-        // (PROCESS_SHARED + ROBUST + ERRORCHECK, DESIGN.md §4.2) are untouched
+        // (PROCESS_SHARED + ROBUST + ERRORCHECK, design/DESIGN.md §4.2) are untouched
         // and `trylock` reports `EOWNERDEAD` exactly as `lock` does, so owner-
         // death recovery is unaffected.
         //
@@ -1007,7 +1007,7 @@ impl Shm {
     }
 
     /// macOS: acquire exclusion via the sidecar flock + private ERRORCHECK
-    /// mutex, then read the tri-state DIRTY word (DESIGN-MACOS-LOCK.md §2).
+    /// mutex, then read the tri-state DIRTY word (design/DESIGN-MACOS-LOCK.md §2).
     #[cfg(not(target_os = "linux"))]
     pub fn writer_lock(&self) -> Result<bool> {
         self.wl.lock()?; // on Err both levels are already released
@@ -1674,7 +1674,7 @@ impl Shm {
         ((word >> 32) as u32, word as u32)
     }
 
-    /// Claim a reader slot and pin the current snapshot (DESIGN.md §4.3 pin
+    /// Claim a reader slot and pin the current snapshot (design/DESIGN.md §4.3 pin
     /// protocol, with the paired-SeqCst-fence fix). Returns (slot index,
     /// owned word value, pinned meta).
     pub fn claim_and_pin(&self) -> Result<(u32, u64, MetaSnapshot)> {
@@ -1938,7 +1938,7 @@ impl Shm {
         // Born-restrictive: create owner-only (umask can only tighten, never
         // widen 0o600), so there is no world/group-readable instant even under
         // a concurrent open(). Widened to the configured mode by the formatter
-        // below (DESIGN-MULTIDB.md §1.4). `.mode()` only affects *creation*, so
+        // below (design/DESIGN-MULTIDB.md §1.4). `.mode()` only affects *creation*, so
         // attaching to an existing file leaves its perms untouched.
         let file = OpenOptions::new()
             .read(true)

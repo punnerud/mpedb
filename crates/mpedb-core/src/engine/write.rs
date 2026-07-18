@@ -73,7 +73,7 @@ pub struct WriteTxn<'e> {
     pub(super) table_roots: HashMap<(u32, u32), (u64, u64)>,
     pub(super) dirty: DirtySet,
     /// Pages this txn may allocate. They are **still listed in the freelist**:
-    /// `refill_reusable` reads entries, it does not remove them (DESIGN.md
+    /// `refill_reusable` reads entries, it does not remove them (design/DESIGN.md
     /// §4.5). `taken` remembers where each came from so the commit fixpoint can
     /// strike out exactly the ones that got consumed.
     pub(super) reusable: Vec<u64>,

@@ -29,7 +29,7 @@ pub(crate) use explain::render_program;
 /// in the catalog's sys-keyspace, so a file written by an older build hands
 /// this decoder bytes in a layout it no longer speaks.
 ///
-/// 2: reserved session-context parameter slots (DESIGN-MULTIDB.md §2).
+/// 2: reserved session-context parameter slots (design/DESIGN-MULTIDB.md §2).
 /// 3: aggregates. Every `Select` now encodes an `aggregate` tag byte after
 ///    `offset`, and every `AggCall` a `distinct` byte. Both are layout changes
 ///    to EXISTING records, not just new statement kinds — a v2 `Select` blob
@@ -290,13 +290,13 @@ pub struct CompiledPlan {
     /// last `context_keys.len()` entries are the reserved context slots and are
     /// always constrained (a context ref must be usable in a typed comparison).
     pub param_types: Vec<Option<ColumnType>>,
-    /// One session-context key per reserved parameter slot (DESIGN-MULTIDB.md
+    /// One session-context key per reserved parameter slot (design/DESIGN-MULTIDB.md
     /// §2.1), aligned to the final `context_keys.len()` entries of
     /// `param_types`. Empty for statements with no `current_setting()`. The
     /// values are NEVER stored here — they are filled from the caller's
     /// `Session` at execute time, so one content-hashed plan serves all sessions.
     pub context_keys: Vec<String>,
-    /// RLS leak-proofing (DESIGN-MULTIDB.md §4), one entry per table whose
+    /// RLS leak-proofing (design/DESIGN-MULTIDB.md §4), one entry per table whose
     /// policy this plan BAKED IN — which for a join is both of them.
     ///
     /// This is a list rather than a single pair because the check has to cover
@@ -470,7 +470,7 @@ pub enum PlanStmt {
         rows: Vec<Vec<InsertSource>>,
         /// `INSERT … SELECT` source. Mutually exclusive with a non-empty `rows`.
         from_select: Option<InsertSelect>,
-        /// RLS `WITH CHECK` gate on the new row (DESIGN-MULTIDB.md §3.7).
+        /// RLS `WITH CHECK` gate on the new row (design/DESIGN-MULTIDB.md §3.7).
         /// Evaluated with `eval_filter` semantics — NULL and FALSE both REJECT
         /// (NOT the CHECK-constraint rule). `None` = no RLS write gate.
         with_check: Option<ExprProgram>,

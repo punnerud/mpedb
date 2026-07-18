@@ -88,7 +88,7 @@ pub enum Instr {
     /// any NULL operand yields NULL. See [`regexp_match`].
     Regexp(u16),
     /// `<scalar> IN (<list param n>)` — set membership against a
-    /// [`Value::List`] bound to parameter `n` (DESIGN-MULTIDB.md §2.6).
+    /// [`Value::List`] bound to parameter `n` (design/DESIGN-MULTIDB.md §2.6).
     ///
     /// The list is a PARAM, not a const: that is the whole design. Arity lives
     /// in the data, so the plan bytes — and therefore the plan hash — stay

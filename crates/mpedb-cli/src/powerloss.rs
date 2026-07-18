@@ -1,5 +1,5 @@
 //! `mpedb powerloss --dir D [--rounds N] [--workers W] [--durability wal|async]`
-//! — WAL-class power-loss simulation (DESIGN.md §5.4). `wal` (durable-on-ack)
+//! — WAL-class power-loss simulation (design/DESIGN.md §5.4). `wal` (durable-on-ack)
 //! and `async` (deferred fsync, §5.4.2) share the same recovery machinery and
 //! the same crash-consistency invariant: a torn tail truncates whole records,
 //! so any surviving prefix conserves the workload invariants. `async` simply

@@ -4,7 +4,7 @@
 //! Hot path is `execute(hash, params)` — plans prepared once per reset.
 //! Durability comes from the file's config: `none` (no msync ever) or
 //! `commit` (msync before ack; the intent-ring group commit engages only
-//! here, DESIGN.md §5.3-5.4).
+//! here, design/DESIGN.md §5.3-5.4).
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};

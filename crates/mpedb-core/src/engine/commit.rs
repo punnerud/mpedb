@@ -48,7 +48,7 @@ impl<'e> WriteTxn<'e> {
             self.apply_map_edits()?;
         }
 
-        // 2. freelist fixpoint (DESIGN.md §4.5). Two things get written:
+        // 2. freelist fixpoint (design/DESIGN.md §4.5). Two things get written:
         //
         //   - each drawn entry, minus whatever we consumed out of it (deleted
         //     if we consumed all of it, left completely alone if we consumed
@@ -188,7 +188,7 @@ impl<'e> WriteTxn<'e> {
                     i += 1;
                 }
                 // ⚠ ORDERING: this barrier is what makes the data durable BEFORE
-                // the meta that will reference it (DESIGN.md §4.1). It cannot be
+                // the meta that will reference it (design/DESIGN.md §4.1). It cannot be
                 // merged with the meta's barrier below — a single barrier over
                 // both would let a power loss land meta on the platter and not
                 // its data, and meta_T would then be checksum-valid pointing at

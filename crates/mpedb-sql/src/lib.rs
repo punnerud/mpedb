@@ -42,7 +42,7 @@ pub use policy::{table_policy_hash, PolicyCatalog, TablePolicies};
 pub use view::ViewCatalog;
 
 /// Parse a row-level-security DDL statement, or `None` if `sql` is ordinary
-/// DML/query text (DESIGN-MULTIDB.md §3.1). The facade calls this before
+/// DML/query text (design/DESIGN-MULTIDB.md §3.1). The facade calls this before
 /// compiling, and applies any DDL against the catalog directly.
 pub fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
     parser::parse_ddl(sql)
@@ -72,7 +72,7 @@ pub fn prepare_maybe_explain(sql: &str, schema: &Schema) -> Result<(CompiledPlan
     prepare_maybe_explain_with_policies(sql, schema, &PolicyCatalog::empty())
 }
 
-/// Compile with row-level-security policies injected (DESIGN-MULTIDB.md §3).
+/// Compile with row-level-security policies injected (design/DESIGN-MULTIDB.md §3).
 /// The planner AND-folds each target table's applicable `USING`/`WITH CHECK`
 /// predicates from `catalog` into the statement; an empty catalog is identical
 /// to [`prepare`].
@@ -94,7 +94,7 @@ pub fn prepare_maybe_explain_with_policies(
 
 /// Like [`prepare_maybe_explain_with_policies`] but also given the view catalog
 /// (name → SELECT source); a query naming a view is flattened onto the view's
-/// base table before planning (DESIGN-VIEW.md).
+/// base table before planning (design/DESIGN-VIEW.md).
 pub fn prepare_maybe_explain_with_views(
     sql: &str,
     schema: &Schema,
@@ -122,7 +122,7 @@ pub fn prepare_maybe_explain_with_views(
 }
 
 /// Split an optional leading `alias.` database qualifier off a statement's
-/// table reference, for [`Workspace`](mpedb) routing (DESIGN-MULTIDB.md §1.3).
+/// table reference, for [`Workspace`](mpedb) routing (design/DESIGN-MULTIDB.md §1.3).
 /// Returns the alias (if present) and the SQL with the qualifier removed, so
 /// the chosen member database compiles an ordinary single-table plan and its
 /// content hash is unaffected by which alias addressed it.
@@ -164,7 +164,7 @@ pub fn split_db_alias(sql: &str) -> Result<(Option<String>, String)> {
 }
 
 /// Validate an RLS policy predicate source (`USING` / `WITH CHECK`) against a
-/// table at policy-creation time (DESIGN-MULTIDB.md §3): it must parse, type to
+/// table at policy-creation time (design/DESIGN-MULTIDB.md §3): it must parse, type to
 /// bool, reference only the table's columns / literals / `current_setting()`,
 /// and use no `$`/`?` parameters (policies cannot reference query params).
 pub fn validate_policy_expr(src: &str, table: &TableDef) -> Result<()> {

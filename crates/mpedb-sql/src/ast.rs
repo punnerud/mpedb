@@ -30,7 +30,7 @@ pub(crate) struct SelectStmt {
     /// subquery's base table (merging WHERE, stripping the alias qualifier) and
     /// clears this back to `None` BEFORE planning, so the planner and executor
     /// never see it. Only simple projection/filter subquery bodies are
-    /// flattenable; anything else is refused (DESIGN-DERIVED-TABLES.md, Stage B).
+    /// flattenable; anything else is refused (design/DESIGN-DERIVED-TABLES.md, Stage B).
     pub from_derived: Option<Box<SelectStmt>>,
     /// `FROM t [AS] a` — the name `t`'s columns are addressed by. When present,
     /// the table's own name is NOT in scope (`FROM orders o` makes `orders.c`
@@ -243,11 +243,11 @@ pub(crate) enum Expr {
     InParamSlot(Box<Expr>, u16, bool),
     /// `current_setting('key')` — a session-context value, bound to a reserved
     /// parameter filled from the caller's [`Session`](mpedb) at execute time
-    /// (DESIGN-MULTIDB.md §2.1). The value never enters the plan bytes, so one
+    /// (design/DESIGN-MULTIDB.md §2.1). The value never enters the plan bytes, so one
     /// content-hashed plan serves every session.
     ContextRef(String),
     /// `<expr> IN (current_setting('key'))` — membership in a session-context
-    /// list (DESIGN-MULTIDB.md §2.6). The key binds to ONE reserved param
+    /// list (design/DESIGN-MULTIDB.md §2.6). The key binds to ONE reserved param
     /// holding a [`mpedb_types::Value::List`], so the arity of the caller's
     /// membership set never reaches the plan bytes. The bool is `negated`.
     ///

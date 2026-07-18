@@ -8,7 +8,7 @@
 //! - **dropped packets** — a `--drop-rate`% fraction of writers arm a kill thread
 //!   and `SIGKILL` themselves at a random instant, modelling a submitter that
 //!   dies mid-commit / abandons a posted intent (the intent-ring incarnation
-//!   safety this stresses, DESIGN.md §5.3);
+//!   safety this stresses, design/DESIGN.md §5.3);
 //! - **data mutation** — UPDATEs rewrite (val, owner, seq, chk) atomically, so
 //!   write-write races on the same key are the norm;
 //! - **the SDK/hash path** — every write goes through a content-hashed plan

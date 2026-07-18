@@ -125,7 +125,7 @@ error message, not a silent gap (see [GUIDE.md](GUIDE.md) and the
 | window functions | partial — `row_number()` and aggregates-over-`OVER` only | no |
 | views | yes (`IF NOT EXISTS` not idempotent) | no |
 | triggers | yes (no `INSTEAD OF`) | no — the PySpell/ETL layer is the planned mechanism |
-| `ALTER TABLE` / live DDL | yes | no — schema is the config file; live DDL designed ([DESIGN-DDL.md](DESIGN-DDL.md)), not built |
+| `ALTER TABLE` / live DDL | yes | no — schema is the config file; live DDL designed ([design/DESIGN-DDL.md](design/DESIGN-DDL.md)), not built |
 | `FROM`-less `SELECT 3+5` | yes | yes — one synthetic row, aggregates and compound arms included |
 | typing | SQLite dynamic typing | rigid per-column types — a wrong type is a write-time error, stricter than sqlite `STRICT` |
 | plan model | SQL parsed per statement (prepared statements cached) | SQL compiles once to a content-hashed plan; `execute(hash, params)` re-parses nothing |
@@ -145,10 +145,10 @@ reproduce them.
 |---|---|---|
 | multi-process access | "We don't support mixed SQLite and Turso in multi-process scenarios" (COMPAT.md); multi-process behavior otherwise undocumented | the core design: many processes attach to one shared-memory file, any of them SIGKILLable at any instant, fuzzed exactly that way (`mpedb crash`, `mirror-collide`) |
 | readers vs writer | WAL readers; second writer gets `Busy` | MVCC snapshots, lock-free readers that never block the writer or each other |
-| concurrent writers | `SQLITE_BUSY` immediately, no arbitration (deliberate, documented) | writer lock + intent-ring group commit under contention (DESIGN.md §5.3) |
+| concurrent writers | `SQLITE_BUSY` immediately, no arbitration (deliberate, documented) | writer lock + intent-ring group commit under contention (design/DESIGN.md §5.3) |
 | durability spectrum | WAL, sync `Full`/`Normal`/`Off` per connection | `none` / `commit` / `wal` / `async` per database, each a documented promise |
 | power-loss story | WAL; beta, no published torn-write testing | WAL torn-tail simulation (`mpedb powerloss`) run 20/20 green on wal+async, extent payloads included |
-| maturity | beta by its own README; moving fast | pre-1.0, but every concurrency/commit protocol survived a 37-finding adversarial review (DESIGN.md) |
+| maturity | beta by its own README; moving fast | pre-1.0, but every concurrency/commit protocol survived a 37-finding adversarial review (design/DESIGN.md) |
 
 ## Where the numbers land
 

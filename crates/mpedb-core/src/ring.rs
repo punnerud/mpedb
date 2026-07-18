@@ -1,4 +1,4 @@
-//! The intent ring (DESIGN.md §5.3): Phase-2 deterministic batch scheduling.
+//! The intent ring (design/DESIGN.md §5.3): Phase-2 deterministic batch scheduling.
 //!
 //! Write requests arrive as `(plan_hash, params)` intents in a fixed table of
 //! shared-memory slots. Whoever holds the writer lock is the *leader*: it
