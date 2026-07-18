@@ -654,10 +654,23 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                         });
                     }
                     let having = decode_opt_program(buf, pos)?;
+                    // sqlite bare columns (format 30): base-row indices carried
+                    // from the group's min/max witness row. Bounded like any
+                    // column list; `validate` re-checks each index against the
+                    // base width and enforces the single-min/max invariant.
+                    let n = r_u16(buf, pos)? as usize;
+                    if n > MAX_COLUMNS {
+                        return Err(corrupt("too many bare columns in plan"));
+                    }
+                    let mut bare_cols = Vec::with_capacity(n.min(MAX_COLUMNS));
+                    for _ in 0..n {
+                        bare_cols.push(r_u16(buf, pos)?);
+                    }
                     Some(Aggregation {
                         group_by,
                         aggs,
                         having,
+                        bare_cols,
                     })
                 }
                 t => return Err(corrupt(format!("bad aggregate tag {t}"))),

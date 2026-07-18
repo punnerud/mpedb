@@ -101,6 +101,7 @@ pub(super) fn plan_join_select<'s>(
     schema: &'s Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
+    mode: BareGroupBy,
     consts: &mut Vec<Value>,
     subplans: Vec<SubPlan>,
     slot_types: Vec<Ty>,
@@ -368,6 +369,7 @@ pub(super) fn plan_join_select<'s>(
             joined_filter,
             post_filter,
             binder,
+            mode,
             consts,
             subplans,
         )?;

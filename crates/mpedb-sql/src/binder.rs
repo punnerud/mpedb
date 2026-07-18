@@ -999,6 +999,13 @@ impl<'a> Binder<'a> {
     fn fold_coalesce(&mut self, args: Vec<BExpr>) -> Result<BExpr> {
         let mut live = Vec::with_capacity(args.len());
         for a in args {
+            // Fold this REACHABLE arg first, so a foldable constant like `-24`
+            // (`Unary(Neg, Const)`, left unfolded by `suppress_fold`) is
+            // recognized as the answer — otherwise `coalesce(-24, col)` would
+            // keep `col` alive even though it can never be reached. Args AFTER
+            // the first non-NULL constant are unreachable and are NEVER folded
+            // below (their raise stays suppressed), exactly as before.
+            let a = fold(a)?;
             if matches!(&a, BExpr::Const(Value::Null)) {
                 continue; // a NULL constant is never the result
             }
@@ -1011,14 +1018,9 @@ impl<'a> Binder<'a> {
         match live.len() {
             // every argument was a NULL constant
             0 => Ok(BExpr::Const(Value::Null)),
-            1 => fold(live.pop().expect("len 1")),
-            _ => {
-                let mut out = Vec::with_capacity(live.len());
-                for a in live {
-                    out.push(fold(a)?);
-                }
-                Ok(BExpr::Coalesce(out))
-            }
+            // Survivors are already folded above.
+            1 => Ok(live.pop().expect("len 1")),
+            _ => Ok(BExpr::Coalesce(live)),
         }
     }
 

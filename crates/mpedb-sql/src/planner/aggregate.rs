@@ -43,6 +43,7 @@ pub(super) fn contains_agg(e: &ast::Expr) -> bool {
 /// the grouped tuple `[keys ‖ aggs]`, and so does everything the projection and
 /// HAVING say about it. Mixing them up is how `sum(x) + 1` ends up reading
 /// column 1 of the base row.
+#[allow(clippy::type_complexity)]
 fn lift_aggs(
     e: &ast::Expr,
     keys: &GroupKeys<'_>,
@@ -51,10 +52,20 @@ fn lift_aggs(
     // bare column must be a GROUP BY key") is about the ROW, and does not care
     // how many tables built it.
     scope: &Scope<'_>,
+    // GROUP BY strictness (COMPAT.md): `Postgres` refuses a bare column outright;
+    // `Sqlite` gives it a slot in the grouped tuple's `bare` region and lets the
+    // caller decide (after folding) whether it survives.
+    mode: BareGroupBy,
     aggs: &mut Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool)>,
+    // sqlite bare columns: `(base-row slot, type)`, deduped by slot. A bare
+    // column becomes `__b{j}` where `j` is its index here; the planner resolves
+    // those names against the extended grouped tuple `[keys ‖ aggs ‖ bare]`.
+    bare: &mut Vec<(u16, ColumnType)>,
 ) -> Result<ast::Expr> {
     use ast::Expr as E;
-    let rec = |x: &ast::Expr, aggs: &mut Vec<_>| lift_aggs(x, keys, scope, aggs);
+    let rec = |x: &ast::Expr,
+               aggs: &mut Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool)>,
+               bare: &mut Vec<(u16, ColumnType)>| lift_aggs(x, keys, scope, mode, aggs, bare);
     let group_by = keys.asts;
     // A selected/ordered expression that IS a group key — `SELECT a+1 …
     // GROUP BY a+1` — names that key's slot in the grouped tuple. Checked
@@ -81,67 +92,88 @@ fn lift_aggs(
             // `synthetic_grouped_table` below gives those names meaning.
             E::Col(format!("__g{slot}"))
         }
-        // A bare column in an aggregate query must be a GROUP BY key — SQL's
-        // rule, and not pedantry: `SELECT name, count(*) FROM t` with no GROUP
-        // BY has no answer for which `name` to show. sqlite invents one; the
-        // rigid engine says so instead.
+        // A bare column in an aggregate query is one that is neither a GROUP BY
+        // key nor inside an aggregate. `Postgres` refuses it (SQL's rule);
+        // `Sqlite` gives it a slot in the grouped tuple's `bare` region and lets
+        // the planner decide — after constant folding — whether it is genuinely
+        // used (must then be fixed by a single min()/max()) or folds away.
         E::Col(_) | E::Qualified(..) => {
-            let (idx, _) = match e {
+            let (idx, ty) = match e {
                 E::Col(n) => scope.resolve(n)?,
                 E::Qualified(q, n) => scope.resolve_qualified(q, n)?,
                 _ => unreachable!("matched above"),
             };
             // Slot-based match: `GROUP BY a` + `SELECT t.a` are the same key
             // under two spellings, which AST equality above cannot see.
-            let pos = keys.cols.iter().position(|g| *g == Some(idx)).ok_or_else(|| {
-                bind_err(format!(
-                    "column `{}` must appear in GROUP BY or be inside an aggregate — \
-                     otherwise there is no single value for it in the group",
-                    scope.slot_name(idx)
-                ))
-            })?;
-            E::Col(format!("__g{pos}"))
+            match keys.cols.iter().position(|g| *g == Some(idx)) {
+                Some(pos) => E::Col(format!("__g{pos}")),
+                None => match mode {
+                    BareGroupBy::Postgres => {
+                        return Err(bind_err(format!(
+                            "column `{}` must appear in GROUP BY or be inside an aggregate \
+                             — otherwise there is no single value for it in the group",
+                            scope.slot_name(idx)
+                        )))
+                    }
+                    BareGroupBy::Sqlite => {
+                        let j = match bare.iter().position(|(c, _)| *c == idx) {
+                            Some(j) => j,
+                            None => {
+                                bare.push((idx, ty));
+                                bare.len() - 1
+                            }
+                        };
+                        E::Col(format!("__b{j}"))
+                    }
+                },
+            }
         }
-        E::Unary(op, a) => E::Unary(*op, Box::new(rec(a, aggs)?)),
-        E::Cast(a, t) => E::Cast(Box::new(rec(a, aggs)?), t.clone()),
-        E::IsNull(a, n) => E::IsNull(Box::new(rec(a, aggs)?), *n),
+        E::Unary(op, a) => E::Unary(*op, Box::new(rec(a, aggs, bare)?)),
+        E::Cast(a, t) => E::Cast(Box::new(rec(a, aggs, bare)?), t.clone()),
+        E::IsNull(a, n) => E::IsNull(Box::new(rec(a, aggs, bare)?), *n),
         E::Binary(op, a, b) => {
-            E::Binary(*op, Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?))
+            E::Binary(*op, Box::new(rec(a, aggs, bare)?), Box::new(rec(b, aggs, bare)?))
         }
         E::IsDistinct(a, b, n) => {
-            E::IsDistinct(Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?), *n)
+            E::IsDistinct(Box::new(rec(a, aggs, bare)?), Box::new(rec(b, aggs, bare)?), *n)
         }
-        E::Like(a, b) => E::Like(Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?)),
-        E::Match(a, b) => E::Match(Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?)),
-        E::Glob(a, b, n) => E::Glob(Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?), *n),
-        E::Regexp(a, b, n) => E::Regexp(Box::new(rec(a, aggs)?), Box::new(rec(b, aggs)?), *n),
+        E::Like(a, b) => E::Like(Box::new(rec(a, aggs, bare)?), Box::new(rec(b, aggs, bare)?)),
+        E::Match(a, b) => E::Match(Box::new(rec(a, aggs, bare)?), Box::new(rec(b, aggs, bare)?)),
+        E::Glob(a, b, n) => {
+            E::Glob(Box::new(rec(a, aggs, bare)?), Box::new(rec(b, aggs, bare)?), *n)
+        }
+        E::Regexp(a, b, n) => {
+            E::Regexp(Box::new(rec(a, aggs, bare)?), Box::new(rec(b, aggs, bare)?), *n)
+        }
         E::InList(a, xs, n) => E::InList(
-            Box::new(rec(a, aggs)?),
-            xs.iter().map(|x| rec(x, aggs)).collect::<Result<_>>()?,
+            Box::new(rec(a, aggs, bare)?),
+            xs.iter().map(|x| rec(x, aggs, bare)).collect::<Result<_>>()?,
             *n,
         ),
-        E::InContext(a, k, n) => E::InContext(Box::new(rec(a, aggs)?), k.clone(), *n),
+        E::InContext(a, k, n) => E::InContext(Box::new(rec(a, aggs, bare)?), k.clone(), *n),
         // Preserve the COLLATE through the lift so the grouped ORDER BY path can
         // peel it (`ORDER BY name COLLATE NOCASE` in a GROUP BY query). The
         // collation itself carries no aggregate.
-        E::Collate(a, name) => E::Collate(Box::new(rec(a, aggs)?), name.clone()),
+        E::Collate(a, name) => E::Collate(Box::new(rec(a, aggs, bare)?), name.clone()),
         // The IN-subquery marker: the slot side is opaque here; only the lhs
         // participates in the grouped tuple. (A raw InSubquery still present
         // means the lift refused/skipped it — pass through to the binder's
         // refusal, same as Subquery below.)
-        E::InParamSlot(a, slot, n) => E::InParamSlot(Box::new(rec(a, aggs)?), *slot, *n),
+        E::InParamSlot(a, slot, n) => E::InParamSlot(Box::new(rec(a, aggs, bare)?), *slot, *n),
         other @ E::InSubquery(..) => other.clone(),
-        E::Coalesce(xs) => E::Coalesce(xs.iter().map(|x| rec(x, aggs)).collect::<Result<_>>()?),
+        E::Coalesce(xs) => {
+            E::Coalesce(xs.iter().map(|x| rec(x, aggs, bare)).collect::<Result<_>>()?)
+        }
         E::Func(f, xs) => E::Func(
             f.clone(),
-            xs.iter().map(|x| rec(x, aggs)).collect::<Result<_>>()?,
+            xs.iter().map(|x| rec(x, aggs, bare)).collect::<Result<_>>()?,
         ),
         E::Case(arms, els) => E::Case(
             arms.iter()
-                .map(|(c, r)| Ok((rec(c, aggs)?, rec(r, aggs)?)))
+                .map(|(c, r)| Ok((rec(c, aggs, bare)?, rec(r, aggs, bare)?)))
                 .collect::<Result<_>>()?,
             match els {
-                Some(x) => Some(Box::new(rec(x, aggs)?)),
+                Some(x) => Some(Box::new(rec(x, aggs, bare)?)),
                 None => None,
             },
         ),
@@ -178,8 +210,12 @@ fn synthetic_grouped_table(
     key_types: &[ColumnType],
     aggs: &[(mpedb_types::AggFn, Option<ast::Expr>, bool)],
     agg_types: &[Option<ColumnType>],
+    // sqlite bare columns `(base slot, type)`: the tuple's tail
+    // `[keys ‖ aggs ‖ bare]`, named `__b{j}`. Empty in postgres mode.
+    bare: &[(u16, ColumnType)],
 ) -> TableDef {
-    let mut out: Vec<mpedb_types::ColumnDef> = Vec::with_capacity(key_types.len() + aggs.len());
+    let mut out: Vec<mpedb_types::ColumnDef> =
+        Vec::with_capacity(key_types.len() + aggs.len() + bare.len());
     for (k, &ty) in key_types.iter().enumerate() {
         out.push(mpedb_types::ColumnDef {
             name: format!("__g{k}"),
@@ -205,6 +241,20 @@ fn synthetic_grouped_table(
             // COUNT and TOTAL are never NULL (0 / 0.0 over an empty group);
             // every other aggregate is NULL over an empty group.
             nullable: !matches!(f, mpedb_types::AggFn::Count | mpedb_types::AggFn::Total),
+            unique: false,
+            indexed: false,
+            default: None,
+            check: None,
+        });
+    }
+    // The bare region: named `__b{j}` (the names `lift_aggs` emitted), typed by
+    // the base column. Always nullable — a bare column is carried from a witness
+    // row that may hold NULL, and an empty group yields NULL.
+    for (j, (_, ty)) in bare.iter().enumerate() {
+        out.push(mpedb_types::ColumnDef {
+            name: format!("__b{j}"),
+            ty: *ty,
+            nullable: true,
             unique: false,
             indexed: false,
             default: None,
@@ -244,6 +294,10 @@ pub(super) fn plan_aggregate_select(
     // `(WHERE ∧ policy)` set. `None` for a plain aggregate.
     post_filter: Option<ExprProgram>,
     mut binder: Binder<'_>,
+    // GROUP BY strictness dialect (COMPAT.md): `Postgres` refuses every bare
+    // column; `Sqlite` accepts the deterministic ones (folded-away or fixed by a
+    // single min/max) and refuses the genuinely-arbitrary case.
+    mode: BareGroupBy,
     _consts: &mut Vec<Value>,
     subplans: Vec<SubPlan>,
 ) -> Result<PlannedStmt> {
@@ -317,15 +371,19 @@ pub(super) fn plan_aggregate_select(
         key_asts.push(g.clone());
     }
 
-    // 2. Lift the aggregates out of the SELECT list and HAVING.
+    // 2. Lift the aggregates out of the SELECT list and HAVING. In sqlite mode
+    //    `bare` collects any bare column (not a key, not an aggregate) — each
+    //    gets a slot in the grouped tuple's tail; whether it SURVIVES is decided
+    //    after folding (step 5). In postgres mode `lift_aggs` refuses instead.
     let keys = GroupKeys { asts: &key_asts, cols: &key_cols };
     let mut agg_specs: Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool)> = Vec::new();
+    let mut bare: Vec<(u16, ColumnType)> = Vec::new();
     let mut rewritten = Vec::with_capacity(items.len());
     for (item, _alias) in items {
-        rewritten.push(lift_aggs(item, &keys, base_scope, &mut agg_specs)?);
+        rewritten.push(lift_aggs(item, &keys, base_scope, mode, &mut agg_specs, &mut bare)?);
     }
     let rewritten_having = match &s.having {
-        Some(h) => Some(lift_aggs(h, &keys, base_scope, &mut agg_specs)?),
+        Some(h) => Some(lift_aggs(h, &keys, base_scope, mode, &mut agg_specs, &mut bare)?),
         None => None,
     };
     // ORDER BY is lifted HERE, with the others, because `ORDER BY count(*)` may
@@ -336,7 +394,10 @@ pub(super) fn plan_aggregate_select(
     // ordering by an aggregate that IS selected does not compute it twice.
     let mut rewritten_order = Vec::with_capacity(s.order_by.len());
     for (e, desc) in &s.order_by {
-        rewritten_order.push((lift_aggs(e, &keys, base_scope, &mut agg_specs)?, *desc));
+        rewritten_order.push((
+            lift_aggs(e, &keys, base_scope, mode, &mut agg_specs, &mut bare)?,
+            *desc,
+        ));
     }
 
     // 3. Bind each aggregate ARGUMENT over the BASE row.
@@ -366,7 +427,10 @@ pub(super) fn plan_aggregate_select(
 
     // 4. Bind the rewritten projection/HAVING over the GROUPED tuple — a
     //    different tuple from the base row, carrying the same parameter table.
-    let grouped = synthetic_grouped_table(&key_types, &agg_specs, &agg_types);
+    //    The tuple is `[keys ‖ aggs ‖ bare]`; folding runs here, so a bare column
+    //    in a dead branch (`COALESCE(-24, col)`) drops out and never reaches a
+    //    program.
+    let grouped = synthetic_grouped_table(&key_types, &agg_specs, &agg_types, &bare);
     let mut binder = binder.rescope(Scope::single(&grouped));
 
     let mut out_types: Vec<Option<ColumnType>> = Vec::with_capacity(rewritten.len());
@@ -396,6 +460,68 @@ pub(super) fn plan_aggregate_select(
         None => None,
     };
 
+    // sqlite bare columns: which of `bare`'s slots SURVIVED folding, and are they
+    // legal? A bare slot at `k_aggs + j` is live iff some bound program (a
+    // projection item, HAVING, or an ORDER BY key that indexes the grouped tuple)
+    // actually reads it. A folded-away reference (`COALESCE(-24, col)`) leaves
+    // none → carry nothing (the deterministic never-evaluated case). If ANY bare
+    // column is live it must be fixed by a SINGLE min()/max() (the deterministic
+    // witness-row case) — anything else is sqlite's arbitrary-row pick, which we
+    // refuse rather than risk a value that differs from sqlite (the core
+    // never-a-wrong-answer guarantee). `grouped_order` names the ORDER BY slots
+    // ONLY when they index the grouped tuple (`OrderOver::Grouped`); projection
+    // ordinals and junk columns are already covered by the projection walk.
+    let k_aggs = (group_by.len() + agg_specs.len()) as u16;
+    let decide_bare_cols = |projection: &[Projection],
+                            having: &Option<ExprProgram>,
+                            grouped_order: &[u16]|
+     -> Result<Vec<u16>> {
+        if bare.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut refs: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
+        for p in projection {
+            if let Projection::Expr { program, .. } = p {
+                for instr in &program.instrs {
+                    if let Instr::PushCol(i) = instr {
+                        refs.insert(*i);
+                    }
+                }
+            }
+        }
+        if let Some(h) = having {
+            for instr in &h.instrs {
+                if let Instr::PushCol(i) = instr {
+                    refs.insert(*i);
+                }
+            }
+        }
+        refs.extend(grouped_order.iter().copied());
+        let Some(first_live) = (0..bare.len()).find(|&j| refs.contains(&(k_aggs + j as u16)))
+        else {
+            // Every bare column folded away — nothing to carry, plan is
+            // byte-identical to the postgres one.
+            return Ok(Vec::new());
+        };
+        let single_min_max = matches!(
+            agg_specs.as_slice(),
+            [(mpedb_types::AggFn::Min | mpedb_types::AggFn::Max, _, _)]
+        );
+        if !single_min_max {
+            return Err(bind_err(format!(
+                "column `{}` must appear in GROUP BY, be inside an aggregate, or be \
+                 determined by a single min()/max() — sqlite would take it from an \
+                 arbitrary row, which mpedb refuses rather than return a value that \
+                 might differ from sqlite",
+                base_scope.slot_name(bare[first_live].0)
+            )));
+        }
+        // Keep EVERY recorded bare column (live and folded-away alike) so the
+        // grouped-tuple slot positions the projection was bound against stay put;
+        // the executor fills them all from the group's min/max witness row.
+        Ok(bare.iter().map(|(c, _)| *c).collect())
+    };
+
     // 5. ORDER BY. Preferred form: every key is a bare column of the GROUPED
     //    tuple — a group key or an aggregate slot — so the sort runs there and
     //    `ORDER BY count(*)` works even unselected. A key computed FROM those
@@ -403,6 +529,9 @@ pub(super) fn plan_aggregate_select(
     //    yet, so it gets a sort-only column appended to the projection, exactly
     //    as the plain path does for `ORDER BY amt + 1`.
     if s.distinct {
+        // DISTINCT sorts over the PROJECTION, so no ORDER BY key indexes the
+        // grouped tuple directly (`grouped_order` is empty).
+        let bare_cols = decide_bare_cols(&projection, &having, &[])?;
         let (order_by, _) = distinct_order_by(s, base_scope, None)?;
         let (param_types, context_keys, list_keys) = binder.into_parts();
         return Ok((
@@ -424,6 +553,7 @@ pub(super) fn plan_aggregate_select(
                     group_by,
                     aggs,
                     having,
+                    bare_cols,
                 }),
                 windows: Vec::new(),
             }),
@@ -479,6 +609,16 @@ pub(super) fn plan_aggregate_select(
         (keys, OrderOver::Projection, n_junk)
     };
 
+    // An ORDER BY over the grouped tuple (`OrderOver::Grouped`) may itself be the
+    // only reader of a bare column (`… ORDER BY name`), so feed those slots into
+    // the liveness decision; a projection-indexed sort is already covered.
+    let grouped_order: Vec<u16> = if order_over == OrderOver::Grouped {
+        order_by.iter().map(|(i, _, _)| *i).collect()
+    } else {
+        Vec::new()
+    };
+    let bare_cols = decide_bare_cols(&projection, &having, &grouped_order)?;
+
     let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
         PlanStmt::Select(SelectPlan {
@@ -499,6 +639,7 @@ pub(super) fn plan_aggregate_select(
                 group_by,
                 aggs,
                 having,
+                bare_cols,
             }),
             windows: Vec::new(),
         }),

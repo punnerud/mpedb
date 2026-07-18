@@ -111,7 +111,14 @@ pub fn import_sqlite(
     let schema = sqlite::build_schema(&src_tables)?;
 
     // 2. create the mpedb file (secure-by-default perms)
-    let db = create_mirror_db(dest_path, schema.clone(), opts.size_bytes, opts.durability)?;
+    // A sqlite import keeps the lenient (sqlite) bare-column dialect.
+    let db = create_mirror_db(
+        dest_path,
+        schema.clone(),
+        opts.size_bytes,
+        opts.durability,
+        mpedb_types::BareGroupBy::Sqlite,
+    )?;
 
     // 3. install tracked-mode changelog + triggers BEFORE the snapshot read
     //    (§4.2 step 1) so any source write concurrent with — or after — the
@@ -161,12 +168,14 @@ pub fn import_sqlite(
 
 /// Create a fresh `.mpedb` mirror file with the given schema (secure-by-default
 /// 0600 perms, serial concurrency). Shared by the sqlite and PostgreSQL import
-/// paths.
+/// paths — which differ in `bare_group_by`, so the GROUP BY strictness travels
+/// with the data's origin (COMPAT.md): a PostgreSQL import is born strict.
 pub(crate) fn create_mirror_db(
     dest_path: &Path,
     schema: mpedb_types::Schema,
     size_bytes: u64,
     durability: Durability,
+    bare_group_by: mpedb_types::BareGroupBy,
 ) -> Result<Database> {
     let config = Config {
         options: DbOptions {
@@ -182,6 +191,9 @@ pub(crate) fn create_mirror_db(
             // default guard (#74) rather than disabling it.
             max_work_rows: mpedb_types::config::DEFAULT_MAX_WORK_ROWS,
             require_policy: Default::default(),
+            // sqlite import → lenient (sqlite) bare columns; PostgreSQL import →
+            // strict (postgres), so a query PG refused keeps being refused here.
+            bare_group_by,
             perms: FilePerms {
                 mode: None,
                 owner: None,
@@ -615,5 +627,76 @@ mod tests {
         let err = import_sqlite(&mut src, &dest, &ImportOptions::default());
         assert!(err.is_err());
         let _ = std::fs::remove_file(&dest);
+    }
+
+    /// The GROUP BY strictness dialect travels with the origin (COMPAT.md): a
+    /// sqlite mirror is lenient (a bare column fixed by a single `max()` is
+    /// accepted, matching sqlite), a PostgreSQL mirror strict (the same query is
+    /// refused, matching PG). Exercised directly through `create_mirror_db`, the
+    /// factory both importers share, since the PG path needs a live server.
+    #[test]
+    fn import_origin_sets_bare_group_by_mode() {
+        let toml = r#"
+[database]
+path = "/unused"
+[[table]]
+name = "t"
+primary_key = ["id"]
+  [[table.column]]
+  name = "id"
+  type = "int64"
+  [[table.column]]
+  name = "g"
+  type = "int64"
+  [[table.column]]
+  name = "x"
+  type = "int64"
+  nullable = true
+  [[table.column]]
+  name = "name"
+  type = "text"
+"#;
+        let schema = mpedb_types::Config::from_toml_str(toml).unwrap().schema;
+
+        // sqlite origin → lenient: the bare column comes from the max row.
+        let sq = tmp("origin-sqlite");
+        let db = create_mirror_db(
+            &sq,
+            schema.clone(),
+            16 * 1024 * 1024,
+            Durability::None,
+            mpedb_types::BareGroupBy::Sqlite,
+        )
+        .unwrap();
+        db.query(
+            "INSERT INTO t (id, g, x, name) VALUES (1, 10, 5, 'a'), (2, 10, 9, 'b')",
+            &[],
+        )
+        .unwrap();
+        let r = rows(
+            db.query("SELECT name, max(x) FROM t GROUP BY g", &[])
+                .unwrap(),
+        );
+        assert_eq!(r, vec![vec![Value::Text("b".into()), Value::Int(9)]]);
+        drop(db);
+        let _ = std::fs::remove_file(&sq);
+
+        // PostgreSQL origin → strict: the same query is refused.
+        let pg = tmp("origin-postgres");
+        let db = create_mirror_db(
+            &pg,
+            schema,
+            16 * 1024 * 1024,
+            Durability::None,
+            mpedb_types::BareGroupBy::Postgres,
+        )
+        .unwrap();
+        db.query("INSERT INTO t (id, g, x, name) VALUES (1, 10, 5, 'a')", &[])
+            .unwrap();
+        assert!(db
+            .query("SELECT name, max(x) FROM t GROUP BY g", &[])
+            .is_err());
+        drop(db);
+        let _ = std::fs::remove_file(&pg);
     }
 }

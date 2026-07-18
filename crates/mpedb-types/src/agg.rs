@@ -159,18 +159,13 @@ impl Accum {
                 }
             }
             AggFn::Min | AggFn::Max => {
+                // `min_max_prefers` returns false for an incomparable pair, which
+                // keeps the incumbent rather than silently replacing it. The same
+                // rule drives the executor's bare-column witness, so the two can
+                // never disagree about which value (or row) an extremum picks.
                 let keep = match &self.acc {
                     None => true,
-                    Some(a) => {
-                        // `sql_cmp` returns None for an incomparable pair; that
-                        // keeps the incumbent rather than silently replacing it.
-                        let ord = a.sql_cmp(v)?;
-                        matches!(
-                            (self.func, ord),
-                            (AggFn::Min, Some(std::cmp::Ordering::Greater))
-                                | (AggFn::Max, Some(std::cmp::Ordering::Less))
-                        )
-                    }
+                    Some(a) => self.func.min_max_prefers(a, v)?,
                 };
                 if keep {
                     self.acc = Some(v.clone());
