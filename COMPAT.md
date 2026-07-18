@@ -111,17 +111,23 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 
 | Function | Status | Comment |
 |---|---|---|
-| lower, upper, trim | ✅ | text in, text out; argument types checked at compile time |
-| ltrim, rtrim | ✅ | whitespace by default, or a given set of characters (2-arg) |
+| lower, upper | ✅ | text in, text out; argument types checked at compile time |
+| trim, ltrim, rtrim | ✅ | whitespace by default, or a given set of characters (2-arg); `trim` strips both ends, `ltrim`/`rtrim` one end |
 | replace | ✅ | every occurrence; an empty search string is a no-op (sqlite's rule) |
 | instr | ✅ | 1-based character position, 0 when absent (1 for an empty needle) |
-| length | ✅ | |
+| length | ✅ | character count (not bytes) |
+| char | ✅ | variadic; Unicode code points → text (`char()` is the empty string). A NULL argument yields NULL — sqlite reads it as code point 0, the one documented gap |
+| unicode | ✅ | Unicode code point of the first character; NULL for the empty string |
+| hex | ✅ | uppercase hex of the argument's bytes (text or blob); a number is refused (sqlite renders it to text first). `hex(NULL)` is NULL, where sqlite gives `''` |
+| typeof | ✅ | datatype name; `typeof(NULL)` is `'null'` (the one scalar that does not NULL-propagate). The sqlite core names match (`integer`/`real`/`text`/`blob`); `bool`/`timestamp` report their own honest names |
 | abs, round, ceil / ceiling, floor | ✅ | keep their argument's numeric type (int stays int) |
 | sqrt, pow / power | ✅ | always float; a non-real result (sqrt of a negative) is NULL, matching sqlite |
 | sign | ✅ | always an integer: -1 / 0 / 1 |
 | substr / substring | ✅ | |
 | coalesce, ifnull | ✅ | compiled to lazy control flow, not a call — arguments after the first non-NULL are never evaluated; int64/float64 arm mixing refused, same rule as CASE |
 | nullif | ✅ | desugared to CASE |
+| iif | ✅ | `iif(c, a, b)` = `CASE WHEN c THEN a ELSE b END` (control flow, does not NULL-propagate); the condition is a rigid boolean, not sqlite truthiness |
+| printf / format | ❌ | format-string interpolation is refused (its per-specifier coercions are a loose-typing surface that does not map onto rigid types) |
 | everything else | ❌ | an unknown function is a compile error that lists what exists |
 
 Date/time functions (`date`, `strftime`, …) and JSON functions do not exist;
