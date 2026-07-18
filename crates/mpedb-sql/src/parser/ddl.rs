@@ -163,13 +163,23 @@ impl<'a> Parser<'a> {
                 uniques.push(self.paren_ident_list()?);
             } else {
                 let cname = self.ident("column name")?;
-                let tyword = self.ident("column type")?;
-                let Some(ty) = mpedb_types::ColumnType::parse(&tyword.to_ascii_lowercase())
-                else {
-                    return Err(self.err_here(format!(
-                        "unknown column type `{tyword}` (int64/text/real/bool/blob/\
-                         timestamp/any)"
-                    )));
+                // sqlite allows a TYPELESS column (`CREATE TABLE t(a)`, or
+                // `a PRIMARY KEY`) — its affinity is NONE, values stored as-is.
+                // mpedb models that with `ColumnType::Any` (the per-column
+                // loose-type escape hatch). A type word is present only when the
+                // next token parses as a known type; otherwise (a constraint
+                // keyword like PRIMARY/UNIQUE, or `,`/`)`) the column is typeless.
+                let ty = match self.peek() {
+                    Some(Tok::Ident(w)) => {
+                        match mpedb_types::ColumnType::parse(&w.to_ascii_lowercase()) {
+                            Some(t) => {
+                                self.pos += 1; // consume the type word
+                                t
+                            }
+                            None => mpedb_types::ColumnType::Any,
+                        }
+                    }
+                    _ => mpedb_types::ColumnType::Any,
                 };
                 let mut col = crate::ddl::CreateColumnSpec {
                     name: cname,
@@ -654,11 +664,19 @@ impl<'a> Parser<'a> {
         if self.eat_word("ADD") {
             self.eat_word("COLUMN"); // optional, as in sqlite/PG
             let cname = self.ident("column name")?;
-            let tyword = self.ident("column type")?;
-            let Some(ty) = mpedb_types::ColumnType::parse(&tyword.to_ascii_lowercase()) else {
-                return Err(self.err_here(format!(
-                    "unknown column type `{tyword}` (int64/text/real/bool/blob/timestamp/any)"
-                )));
+            // Typeless ADD COLUMN (`ALTER TABLE t ADD COLUMN c`) → Any, matching
+            // sqlite's no-affinity column (same rule as CREATE TABLE above).
+            let ty = match self.peek() {
+                Some(Tok::Ident(w)) => {
+                    match mpedb_types::ColumnType::parse(&w.to_ascii_lowercase()) {
+                        Some(t) => {
+                            self.pos += 1;
+                            t
+                        }
+                        None => mpedb_types::ColumnType::Any,
+                    }
+                }
+                _ => mpedb_types::ColumnType::Any,
             };
             let mut col = crate::ddl::CreateColumnSpec {
                 name: cname,
