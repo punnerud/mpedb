@@ -81,11 +81,22 @@ pub(super) fn exec_aggregate(
             .collect()
     };
 
+    // sqlite "bare columns" (COMPAT.md): each group also carries the values of
+    // `agg.bare_cols` from its single min()/max() WITNESS row. The planner +
+    // `validate` guarantee that a non-empty `bare_cols` comes with exactly one
+    // aggregate and it is Min/Max, so `agg.aggs[0]` is the governing extremum.
+    let has_bare = !agg.bare_cols.is_empty();
+    let mm = if has_bare { agg.aggs.first() } else { None };
+
     // Group. The key is the memcmp-ordered keycode of the group columns, so
     // groups come out in a deterministic order for free and NULL keys group
     // together (SQL treats NULLs as one group in GROUP BY, unlike `=`).
-    let mut groups: std::collections::BTreeMap<Vec<u8>, (Vec<Value>, Vec<Accum>)> =
-        Default::default();
+    //
+    // The optional third element is the bare-column witness: `(extreme, bare)`
+    // where `extreme` is the running min/max value (None until the first non-NULL
+    // arg) and `bare` is the extremum row's values for `agg.bare_cols`.
+    type Group = (Vec<Value>, Vec<Accum>, Option<(Option<Value>, Vec<Value>)>);
+    let mut groups: std::collections::BTreeMap<Vec<u8>, Group> = Default::default();
     for row in &rows {
         let key_vals: Vec<Value> = agg
             .group_by
@@ -101,6 +112,7 @@ pub(super) fn exec_aggregate(
             (
                 key_vals,
                 agg.aggs.iter().map(new_accum).collect(),
+                if has_bare { Some((None, Vec::new())) } else { None },
             )
         });
         for (i, call) in agg.aggs.iter().enumerate() {
@@ -114,6 +126,38 @@ pub(super) fn exec_aggregate(
                 }
             }
         }
+        // Update the bare-column witness. sqlite's rule, reproduced exactly: the
+        // bare columns come from the row that achieved the min/max; on a tie the
+        // FIRST such row wins (`min_max_prefers` replaces only on a strict beat);
+        // and until any non-NULL extremum is seen the witness tracks the LATEST
+        // row, so an all-NULL-argument group takes its bare values from its last
+        // row — the behavior differential-tested against sqlite 3.45.
+        if let (Some(mm), Some(w)) = (mm, entry.2.as_mut()) {
+            let v = match &mm.arg {
+                Some(p) => p.eval(row, params)?,
+                None => Value::Null,
+            };
+            let capture = || -> Vec<Value> {
+                agg.bare_cols
+                    .iter()
+                    .map(|&c| row.get(c as usize).cloned().unwrap_or(Value::Null))
+                    .collect()
+            };
+            match &w.0 {
+                None => {
+                    w.1 = capture();
+                    if !v.is_null() {
+                        w.0 = Some(v);
+                    }
+                }
+                Some(e) => {
+                    if !v.is_null() && mm.func.min_max_prefers(e, &v)? {
+                        w.0 = Some(v);
+                        w.1 = capture();
+                    }
+                }
+            }
+        }
     }
 
     // `SELECT count(*) FROM t` over an EMPTY table must return one row (0), not
@@ -122,11 +166,20 @@ pub(super) fn exec_aggregate(
     let mut out: Vec<Vec<Value>> = Vec::new();
     if groups.is_empty() && agg.group_by.is_empty() {
         let accs: Vec<Accum> = agg.aggs.iter().map(new_accum).collect();
-        out.push(accs.into_iter().map(|a| a.finish()).collect());
+        let mut tuple: Vec<Value> = accs.into_iter().map(|a| a.finish()).collect();
+        // No rows means no witness row, so a bare column is NULL — sqlite:
+        // `SELECT name, max(x) FROM empty` yields one row `(NULL, NULL)`.
+        tuple.resize(tuple.len() + agg.bare_cols.len(), Value::Null);
+        out.push(tuple);
     }
-    for (_, (keys, accs)) in groups {
+    for (_, (keys, accs, witness)) in groups {
         let mut tuple = keys;
         tuple.extend(accs.into_iter().map(|a| a.finish()));
+        // Every group has at least one row, so the witness `bare` is populated;
+        // extend the grouped tuple to `[keys ‖ aggs ‖ bare]`.
+        if let Some((_, bare)) = witness {
+            tuple.extend(bare);
+        }
         out.push(tuple);
     }
 

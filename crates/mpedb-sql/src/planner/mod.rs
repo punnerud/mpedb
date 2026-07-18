@@ -35,7 +35,7 @@ use crate::plan::{
 #[allow(unused_imports)]
 use crate::plan::{FtsQuery, FtsTerm};
 use crate::policy::{PolicyCatalog, TablePolicies};
-use mpedb_types::{Collation, ExprProgram, ColumnType, Error, Footprint, Instr, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
+use mpedb_types::{BareGroupBy, Collation, ExprProgram, ColumnType, Error, Footprint, Instr, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
     TableDef, Value,};
 
 mod access;
@@ -374,6 +374,11 @@ pub(crate) fn plan_statement(
     schema: &Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
+    // GROUP BY strictness dialect (COMPAT.md). Threaded to every aggregate
+    // planning site — including subqueries and CTEs — because a bare column can
+    // appear at any nesting depth, and a postgres-mode database must refuse it
+    // everywhere. Copy, so it rides alongside `catalog` without ceremony.
+    mode: BareGroupBy,
 ) -> Result<CompiledPlan> {
     let mut consts: Vec<Value> = Vec::new();
     let txn = |p: PlanStmt| {
@@ -386,12 +391,12 @@ pub(crate) fn plan_statement(
         ast::Stmt::Savepoint(n) => txn(PlanStmt::Savepoint(n.clone())),
         ast::Stmt::Release(n) => txn(PlanStmt::Release(n.clone())),
         ast::Stmt::RollbackTo(n) => txn(PlanStmt::RollbackTo(n.clone())),
-        ast::Stmt::Select(s) => plan_select(s, schema, n_params, catalog, &mut consts, None)?,
-        ast::Stmt::Compound(c) => plan_compound(c, schema, n_params, catalog, &mut consts)?,
+        ast::Stmt::Select(s) => plan_select(s, schema, n_params, catalog, mode, &mut consts, None)?,
+        ast::Stmt::Compound(c) => plan_compound(c, schema, n_params, catalog, mode, &mut consts)?,
         ast::Stmt::RecursiveCte(rc) => {
-            plan_recursive_cte(rc, schema, n_params, catalog, &mut consts)?
+            plan_recursive_cte(rc, schema, n_params, catalog, mode, &mut consts)?
         }
-        ast::Stmt::Insert(s) => plan_insert(s, schema, n_params, catalog, &mut consts)?,
+        ast::Stmt::Insert(s) => plan_insert(s, schema, n_params, catalog, mode, &mut consts)?,
         ast::Stmt::Update(s) => plan_update(s, schema, n_params, catalog, &mut consts)?,
         ast::Stmt::Delete(s) => plan_delete(s, schema, n_params, catalog, &mut consts)?,
     };
@@ -735,6 +740,7 @@ fn plan_compound(
     schema: &Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
+    mode: BareGroupBy,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let mut arms: Vec<SelectPlan> = Vec::with_capacity(c.arms.len());
@@ -745,7 +751,7 @@ fn plan_compound(
 
     for (k, arm_ast) in c.arms.iter().enumerate() {
         let (stmt, ptypes, ckeys, lkeys, otypes, arm_subs) =
-            plan_select(arm_ast, schema, n_params, catalog, consts, None)?;
+            plan_select(arm_ast, schema, n_params, catalog, mode, consts, None)?;
         let PlanStmt::Select(sp) = stmt else {
             return Err(Error::Internal("plan_select produced a non-select".into()));
         };
@@ -889,6 +895,7 @@ fn plan_insert(
     schema: &Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
+    mode: BareGroupBy,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
@@ -935,7 +942,7 @@ fn plan_insert(
     let mut sel_subplans: Vec<SubPlan> = Vec::new();
     if let Some(sel_stmt) = &s.select {
         let (sp_stmt, sp_pt, sp_ctx, sp_list, _sp_agg, sp_sub) =
-            plan_select(sel_stmt, schema, n_params, catalog, consts, None)?;
+            plan_select(sel_stmt, schema, n_params, catalog, mode, consts, None)?;
         let PlanStmt::Select(sp) = sp_stmt else {
             return Err(bind_err(
                 "INSERT … SELECT: a compound (UNION/EXCEPT/INTERSECT) source is not supported",

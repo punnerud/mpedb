@@ -88,8 +88,16 @@ pub fn compile_trigger_body(
         let scope = RowScope { target, allow_new, allow_old };
         let mut map: RowMap = Vec::new();
         rewrite_row_in_stmt(&mut stmt, &scope, &mut map)?;
-        let plan =
-            planner::plan_statement(&stmt, schema, map.len() as u16, &PolicyCatalog::empty())?;
+        // The GROUP BY dialect is irrelevant here: a trigger body is DML and
+        // refuses subqueries, so it never reaches aggregate planning where a bare
+        // column could appear. Compile under the lenient default.
+        let plan = planner::plan_statement(
+            &stmt,
+            schema,
+            map.len() as u16,
+            &PolicyCatalog::empty(),
+            mpedb_types::BareGroupBy::Sqlite,
+        )?;
         out.push((plan, map));
     }
     Ok(out)

@@ -153,7 +153,7 @@ fn decode_rejects_truncation_and_stale_format_in_cast() {
         let p = prepare(sql, &s).unwrap();
         let _ = p.explain(&s); // must not panic rendering the affinity name
         let bytes = p.encode();
-        assert_eq!(bytes[0], 29, "plan format byte for {sql}");
+        assert_eq!(bytes[0], 30, "plan format byte for {sql}");
         let q = CompiledPlan::decode(&bytes, &s).expect(sql);
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         for cut in 0..bytes.len() {
@@ -168,6 +168,46 @@ fn decode_rejects_truncation_and_stale_format_in_cast() {
         assert!(
             matches!(CompiledPlan::decode(&stale, &s), Err(Error::PlanInvalidated)),
             "a format-28 CAST plan must be PlanInvalidated, not misread, for {sql}"
+        );
+    }
+}
+
+/// sqlite "bare columns" (format 30): a grouped SELECT whose projection carries
+/// a bare column fixed by a single min/max must round-trip through the wire, hold
+/// the `bare_cols` list, survive truncation at every offset, and re-prepare
+/// (never be misread) when the format byte is set back to 29.
+#[test]
+fn bare_group_by_roundtrips_and_rejects_truncation_and_stale_format() {
+    let s = test_schema();
+    // `email` and `id` are bare; `max(age)` is the single extremum that fixes
+    // them. `prepare` defaults to sqlite-lenient mode, so this compiles.
+    for sql in [
+        "SELECT email, max(age) FROM users GROUP BY active",
+        "SELECT id, email, min(age) FROM users GROUP BY active",
+        "SELECT email, max(age) FROM users",
+    ] {
+        let p = prepare(sql, &s).unwrap();
+        // The plan must actually carry the bare columns (else exec has nothing
+        // to fill the projection's grouped-tuple slots from).
+        let PlanStmt::Select(sp) = &p.stmt else { panic!("expected select for {sql}") };
+        let agg = sp.aggregate.as_ref().expect("aggregate");
+        assert!(!agg.bare_cols.is_empty(), "bare_cols must be populated for {sql}");
+
+        let bytes = p.encode();
+        assert_eq!(bytes[0], 30, "plan format byte for {sql}");
+        let q = CompiledPlan::decode(&bytes, &s).expect(sql);
+        assert_eq!(p, q, "roundtrip mismatch for {sql}");
+        for cut in 0..bytes.len() {
+            assert!(
+                CompiledPlan::decode(&bytes[..cut], &s).is_err(),
+                "truncation at {cut} must fail for {sql}"
+            );
+        }
+        let mut stale = bytes.clone();
+        stale[0] = 29;
+        assert!(
+            matches!(CompiledPlan::decode(&stale, &s), Err(Error::PlanInvalidated)),
+            "a format-29 bare-column plan must be PlanInvalidated, not misread, for {sql}"
         );
     }
 }

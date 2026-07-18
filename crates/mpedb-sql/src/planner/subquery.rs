@@ -97,6 +97,7 @@ pub(super) fn lift_subqueries(
     schema: &Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
+    mode: BareGroupBy,
     consts: &mut Vec<Value>,
 ) -> Result<Lifted> {
     // The OUTER scope, for correlation: the same `[table0 ‖ … ‖ tableN]`
@@ -109,6 +110,7 @@ pub(super) fn lift_subqueries(
         schema,
         n_params,
         catalog,
+        mode,
         consts,
         outer_scope,
         subplans: Vec::new(),
@@ -185,6 +187,9 @@ struct Lift<'a> {
     schema: &'a Schema,
     n_params: u16,
     catalog: &'a PolicyCatalog,
+    /// GROUP BY strictness dialect (COMPAT.md), carried so a subquery's own
+    /// aggregate is planned under the SAME mode as the outer statement.
+    mode: BareGroupBy,
     consts: &'a mut Vec<Value>,
     outer_scope: Scope<'a>,
     subplans: Vec<SubPlan>,
@@ -344,7 +349,7 @@ impl Lift<'_> {
         // reserved-slot layouts would have to be reconciled across levels).
         let inner_n = self.n_params + outer_args.len() as u16;
         let (stmt, inner_ptypes, inner_ctx, _inner_lists, inner_out, inner_subs) =
-            plan_select(&rewritten, self.schema, inner_n, self.catalog, self.consts, None)?;
+            plan_select(&rewritten, self.schema, inner_n, self.catalog, self.mode, self.consts, None)?;
         // #73 §3 stage 3: a nested subquery may correlate to its IMMEDIATE
         // parent (stage 2), to a MIDDLE scope, or to the OUTERMOST scope. A
         // reference to a non-immediate ancestor was captured above as a TRANSIT
