@@ -286,10 +286,9 @@ Turso's COMPAT.md so the two read side by side.
 
 It is also measured against sqlite's own **sqllogictest corpus** (the
 `sqlite_corpus` runner in `crates/mpedb-testkit`), all 7.4 million records of it:
-**98.6% of attempted statements pass, with zero error mismatches and zero genuine
+**99.7% of attempted statements pass, with zero error mismatches and zero genuine
 wrong answers** — of everything mpedb accepts, essentially 100% matches sqlite.
-What does not pass is deliberate refusals with error messages; the largest is
-`CREATE VIEW`.
+What does not pass is deliberate refusals with error messages.
 
 | | mpedb | note |
 |---|---|---|
