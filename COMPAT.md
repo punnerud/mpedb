@@ -35,7 +35,8 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | INSERT INTO … VALUES | ✅ | multi-row VALUES; explicit or implicit column list |
 | INSERT … ON CONFLICT DO NOTHING | ✅ | |
 | INSERT … ON CONFLICT (target) DO UPDATE SET … [WHERE …] | ✅ | target may be the PK or one UNIQUE column; `excluded.<col>` works |
-| INSERT OR IGNORE / ABORT / FAIL / ROLLBACK | ✅ | IGNORE = DO NOTHING; ABORT/FAIL/ROLLBACK = error (the default). `INSERT OR REPLACE` refused (its multi-constraint delete semantics differ from a plain upsert) |
+| INSERT OR IGNORE / ABORT / FAIL / ROLLBACK | ✅ | IGNORE = DO NOTHING; ABORT/FAIL/ROLLBACK = error (the default) |
+| INSERT OR REPLACE | ✅ | on a PK conflict, replaces the row (desugars to `ON CONFLICT (pk) DO UPDATE SET …=excluded`). Refused on a table with a secondary UNIQUE index, where sqlite's delete-on-any-constraint semantics differ from a PK upsert |
 | INSERT INTO … SELECT | ✅ | `INSERT INTO t [(cols)] SELECT …`; the source is read fully first (self-insert safe), its tuple fills the listed columns, omitted columns default. Compound (UNION) source not yet supported |
 | UPDATE … SET … [WHERE …] | ✅ | |
 | DELETE FROM … [WHERE …] | ✅ | |

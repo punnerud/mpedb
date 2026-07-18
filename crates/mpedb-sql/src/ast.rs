@@ -94,6 +94,12 @@ pub(crate) enum OnConflict {
     /// No clause: a conflict is an error.
     Error,
     DoNothing,
+    /// `INSERT OR REPLACE` — replace the conflicting row. The planner desugars
+    /// it to `ON CONFLICT (<pk>) DO UPDATE SET <every non-pk col> = excluded`,
+    /// and refuses a table with a secondary UNIQUE index (where sqlite's
+    /// delete-on-any-unique-constraint semantics would diverge from a plain
+    /// PK-keyed upsert).
+    Replace,
     /// `ON CONFLICT (<target>) DO UPDATE SET … [WHERE …]`.
     DoUpdate {
         target: Vec<String>,
