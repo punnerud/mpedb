@@ -8,7 +8,7 @@ use mpedb_core::{ReadTxn, WriteTxn};
 use mpedb_sql::{
     AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, Join, JoinKind,
     CompoundPlan, GroupKey, OrderOver, PlanOnConflict, PlanStmt, Projection, RowMap, RowSide,
-    SelectPlan, SetOp, SubPlan,
+    SelectPlan, SetOp, SubBody, SubPlan,
 };
 use mpedb_types::{
     keycode, Accum, Collation, DefaultExpr, Error, ExprProgram, KeyBound, KeyPart, Result, Schema,
@@ -594,16 +594,18 @@ fn subplan_value(r: ExecResult, kind: mpedb_sql::SubPlanKind) -> Result<Value> {
 ///
 /// `base_params` is `[user ‖ this subplan's correlation args]` — of length
 /// `sub.sub_base` — so a plain leaf subplan (no nested lifts) runs exactly as
-/// before. When `sub` HAS nested lifts:
+/// before. A leaf subplan's body may be a plain SELECT or a whole compound
+/// (#56/format 31), run through [`exec_subbody`]. When `sub` HAS nested lifts
+/// (only a SELECT body ever does):
 ///
 /// - UNCORRELATED children depend only on `base_params`, so each is evaluated
 ///   ONCE here, bottom-up, into `[.. ‖ children results]` at `sub_base + i`,
-///   before `sub.plan`'s own gather.
+///   before the select body's own gather.
 /// - CORRELATED children (stage 2: correlated to THIS subplan's row) are NOT
-///   filled here — they are filled PER ROW of `sub.plan` by
+///   filled here — they are filled PER ROW of the select body by
 ///   [`exec_select_leveled`], the same machinery the top level uses for its own
-///   correlated subplans, plus `sub.plan.post_filter` when the correlated child
-///   feeds `sub`'s WHERE.
+///   correlated subplans, plus the body's `post_filter` when the correlated
+///   child feeds `sub`'s WHERE.
 ///
 /// This generalizes the flat two-level fill (`exec_stmt_impl` once + top per-row)
 /// into a recursion that bottoms out at the leaf case.
@@ -614,23 +616,46 @@ fn run_subplan(
     base_params: &[Value],
     sub: &SubPlan,
 ) -> Result<ExecResult> {
+    // A leaf subplan (no nested lifts) runs its body directly — a plain SELECT or
+    // a whole compound (#56/format 31). A compound body is always a leaf.
     if sub.subplans.is_empty() {
-        return exec_select(ctx, schema, plan, base_params, &sub.plan);
+        return exec_subbody(ctx, schema, plan, base_params, &sub.body);
     }
+    // With nested lifts the body is guaranteed a plain SELECT (a compound body
+    // never carries children — validate/planner enforce it).
+    let Some(sp) = sub.body.as_select() else {
+        return Err(internal("compound subplan body with nested lifts"));
+    };
     let base = sub.sub_base as usize;
     let mut buf = base_params.to_vec();
     buf.resize(base + sub.subplans.len(), Value::Null);
     for (i, child) in sub.subplans.iter().enumerate() {
         // Only the uncorrelated children fill once here (into `sub_base + i`); a
-        // correlated child correlates to `sub.plan`'s row and is filled per row
-        // below. `base_params` (== `buf[..base]`) is the `[user ‖ correlation]`
-        // prefix each uncorrelated child inherits.
+        // correlated child correlates to `sp`'s row and is filled per row below.
+        // `base_params` (== `buf[..base]`) is the `[user ‖ correlation]` prefix
+        // each uncorrelated child inherits.
         if child.outer_args.is_empty() {
             let r = run_subplan(ctx, schema, plan, base_params, child)?;
             buf[base + i] = subplan_value(r, child.kind)?;
         }
     }
-    exec_select_leveled(ctx, schema, plan, &buf, &sub.plan, base, &sub.subplans)
+    exec_select_leveled(ctx, schema, plan, &buf, sp, base, &sub.subplans)
+}
+
+/// Execute a lifted subquery's body — a plain `SELECT` or a whole compound
+/// `SELECT … UNION/… …` (#56/format 31) — into the row set its consumer
+/// (`subplan_value`) reduces to a value / list / existence.
+fn exec_subbody(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    body: &SubBody,
+) -> Result<ExecResult> {
+    match body {
+        SubBody::Select(sp) => exec_select(ctx, schema, plan, params, sp),
+        SubBody::Compound(c) => exec_compound(ctx, schema, plan, params, c),
+    }
 }
 
 /// The top-level SELECT: routes to the leveled executor with the statement's
@@ -1183,8 +1208,13 @@ fn correlated_survivors(
     let use_memo = std::env::var_os("MPEDB_NO_SUBPLAN_MEMO").is_none();
     // #74: attribute this driver to the (first) correlated subquery's inner
     // table. The inner subplan's own scans additionally charge through the scan
-    // layer, so an N-outer × M-inner correlated bomb is counted as ~N·M.
-    let corr_table = correlated.first().map(|(_, s)| s.plan.table);
+    // layer, so an N-outer × M-inner correlated bomb is counted as ~N·M. A
+    // correlated subplan always has a plain SELECT body (a compound body is
+    // uncorrelated), so `as_select` is `Some`.
+    let corr_table = correlated
+        .first()
+        .and_then(|(_, s)| s.body.as_select())
+        .map(|sp| sp.table);
     let mut out = Vec::new();
     for row in rows {
         // One work-row per outer row this correlated subquery re-evaluates over.

@@ -39,8 +39,9 @@ impl CompiledPlan {
 // ---- statement encode/decode ----------------------------------------------
 
 /// One lifted subquery, RECURSIVELY (#73 §3). Layout: kind, `sub_base`,
-/// `slot_type` tag, the correlation-arg list, the inner SELECT, then a COUNT and
-/// the inner's own nested subplans — the exact mirror of [`decode_subplan`].
+/// `slot_type` tag, the correlation-arg list, a body-discriminant BYTE + the
+/// body (a SELECT or a whole compound, #56/format 31), then a COUNT and the
+/// inner's own nested subplans — the exact mirror of [`decode_subplan`].
 fn encode_subplan(s: &SubPlan, buf: &mut Vec<u8>) {
     buf.push(s.kind as u8);
     w_u16(buf, s.sub_base);
@@ -49,11 +50,46 @@ fn encode_subplan(s: &SubPlan, buf: &mut Vec<u8>) {
     for a in &s.outer_args {
         buf.extend_from_slice(&a.to_le_bytes());
     }
-    encode_select(&s.plan, buf);
+    match &s.body {
+        SubBody::Select(sp) => {
+            buf.push(SUBBODY_SELECT);
+            encode_select(sp, buf);
+        }
+        SubBody::Compound(c) => {
+            buf.push(SUBBODY_COMPOUND);
+            encode_compound(c, buf);
+        }
+    }
     buf.push(s.subplans.len() as u8);
     for c in &s.subplans {
         encode_subplan(c, buf);
     }
+}
+
+/// The body of a `Compound` after its context (the statement tag or the subplan
+/// body-discriminant) — shared verbatim between a top-level compound statement
+/// and a compound subquery body, so the two encodings can never drift.
+fn encode_compound(c: &CompoundPlan, buf: &mut Vec<u8>) {
+    buf.push(c.arms.len() as u8);
+    for op in &c.ops {
+        buf.push(match op {
+            SetOp::Union => 0u8,
+            SetOp::UnionAll => 1,
+            SetOp::Except => 2,
+            SetOp::Intersect => 3,
+        });
+    }
+    for arm in &c.arms {
+        encode_select(arm, buf);
+    }
+    w_u16(buf, c.order_by.len() as u16);
+    for (col, desc, coll) in &c.order_by {
+        w_u16(buf, *col);
+        buf.push(*desc as u8);
+        buf.push(*coll as u8);
+    }
+    encode_opt_u64(c.limit, buf);
+    encode_opt_u64(c.offset, buf);
 }
 
 fn w_u16(buf: &mut Vec<u8>, v: u16) {
@@ -251,26 +287,7 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
         }
         PlanStmt::Compound(c) => {
             buf.push(STMT_COMPOUND);
-            buf.push(c.arms.len() as u8);
-            for op in &c.ops {
-                buf.push(match op {
-                    SetOp::Union => 0u8,
-                    SetOp::UnionAll => 1,
-                    SetOp::Except => 2,
-                    SetOp::Intersect => 3,
-                });
-            }
-            for arm in &c.arms {
-                encode_select(arm, buf);
-            }
-            w_u16(buf, c.order_by.len() as u16);
-            for (col, desc, coll) in &c.order_by {
-                w_u16(buf, *col);
-                buf.push(*desc as u8);
-                buf.push(*coll as u8);
-            }
-            encode_opt_u64(c.limit, buf);
-            encode_opt_u64(c.offset, buf);
+            encode_compound(c, buf);
         }
         PlanStmt::RecursiveCte(rc) => {
             buf.push(STMT_RECURSIVE_CTE);
