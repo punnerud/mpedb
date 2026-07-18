@@ -10,6 +10,7 @@ members = [
     "crates/mpedb-mirror",
     "crates/mpedb-cli",
     "crates/mpedb-py",
+    "crates/mpedb-capi",
     "crates/mpedb-testkit",
     "crates/mpedb-bench",
     "crates/mpedb-sqlitefmt",
