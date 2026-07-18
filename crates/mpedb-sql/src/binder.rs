@@ -898,10 +898,14 @@ impl<'a> Binder<'a> {
             "abs" => ScalarFn::Abs,
             "round" => ScalarFn::Round,
             "substr" | "substring" => ScalarFn::Substr,
+            "replace" => ScalarFn::Replace,
+            "ltrim" => ScalarFn::Ltrim,
+            "rtrim" => ScalarFn::Rtrim,
+            "instr" => ScalarFn::Instr,
             other => {
                 return Err(bind_err(format!(
                     "unknown function `{other}()`; available: lower, upper, length, trim, \
-                     abs, round, substr, coalesce, ifnull, nullif"
+                     ltrim, rtrim, replace, instr, abs, round, substr, coalesce, ifnull, nullif"
                 )))
             }
         };
@@ -931,6 +935,17 @@ impl<'a> Binder<'a> {
                 &[Some(ColumnType::Text), Some(ColumnType::Int64), Some(ColumnType::Int64)],
                 Some(ColumnType::Text),
             ),
+            ScalarFn::Replace => (
+                &[Some(ColumnType::Text), Some(ColumnType::Text), Some(ColumnType::Text)],
+                Some(ColumnType::Text),
+            ),
+            // ltrim/rtrim: text, and an optional text set of trim characters.
+            ScalarFn::Ltrim | ScalarFn::Rtrim => {
+                (&[Some(ColumnType::Text), Some(ColumnType::Text)], Some(ColumnType::Text))
+            }
+            ScalarFn::Instr => {
+                (&[Some(ColumnType::Text), Some(ColumnType::Text)], Some(ColumnType::Int64))
+            }
         };
         let mut out = Vec::with_capacity(bound.len());
         for (i, (e, t)) in bound.into_iter().enumerate() {
@@ -986,7 +1001,7 @@ impl<'a> Binder<'a> {
             }
             BExpr::Param(i) => self.param_types[*i as usize],
             BExpr::Unary(BUnOp::ToFloat, _) => Some(ColumnType::Float64),
-            BExpr::Call(ScalarFn::Length, _) => Some(ColumnType::Int64),
+            BExpr::Call(ScalarFn::Length | ScalarFn::Instr, _) => Some(ColumnType::Int64),
             BExpr::Call(ScalarFn::Abs | ScalarFn::Round, a) => self.static_type(&a[0]),
             BExpr::Call(_, _) => Some(ColumnType::Text),
             _ => None,

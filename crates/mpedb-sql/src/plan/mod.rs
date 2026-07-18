@@ -71,7 +71,9 @@ const MAX_JOINS: usize = 16;
 // 13: new aggregate tags `total` (6) and `group_concat` (7). Additive, but a
 //    format-12 reader hits `AggFn::from_tag` → None and rejects the plan, so
 //    the whole-plan version gates it cleanly.
-const PLAN_FORMAT: u8 = 13;
+// 14: new scalar fns `replace` (8), `ltrim` (9), `rtrim` (10), `instr` (11) —
+//    additive `ScalarFn` tags in the expr bytes, gated the same way.
+const PLAN_FORMAT: u8 = 14;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

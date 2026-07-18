@@ -106,6 +106,9 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | Function | Status | Comment |
 |---|---|---|
 | lower, upper, trim | ✅ | text in, text out; argument types checked at compile time |
+| ltrim, rtrim | ✅ | whitespace by default, or a given set of characters (2-arg) |
+| replace | ✅ | every occurrence; an empty search string is a no-op (sqlite's rule) |
+| instr | ✅ | 1-based character position, 0 when absent (1 for an empty needle) |
 | length | ✅ | |
 | abs, round | ✅ | keep their argument's numeric type |
 | substr / substring | ✅ | |

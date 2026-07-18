@@ -116,6 +116,10 @@ pub enum ScalarFn {
     Abs = 5,
     Round = 6,
     Substr = 7,
+    Replace = 8,
+    Ltrim = 9,
+    Rtrim = 10,
+    Instr = 11,
 }
 
 impl ScalarFn {
@@ -128,6 +132,10 @@ impl ScalarFn {
             5 => ScalarFn::Abs,
             6 => ScalarFn::Round,
             7 => ScalarFn::Substr,
+            8 => ScalarFn::Replace,
+            9 => ScalarFn::Ltrim,
+            10 => ScalarFn::Rtrim,
+            11 => ScalarFn::Instr,
             other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
         })
     }
@@ -138,8 +146,10 @@ impl ScalarFn {
         match self {
             ScalarFn::Lower | ScalarFn::Upper | ScalarFn::Length | ScalarFn::Trim
             | ScalarFn::Abs => argc == 1,
-            ScalarFn::Round => argc == 1 || argc == 2,
+            ScalarFn::Round | ScalarFn::Ltrim | ScalarFn::Rtrim => argc == 1 || argc == 2,
             ScalarFn::Substr => argc == 2 || argc == 3,
+            ScalarFn::Instr => argc == 2,
+            ScalarFn::Replace => argc == 3,
         }
     }
 
@@ -152,6 +162,10 @@ impl ScalarFn {
             ScalarFn::Abs => "abs",
             ScalarFn::Round => "round",
             ScalarFn::Substr => "substr",
+            ScalarFn::Replace => "replace",
+            ScalarFn::Ltrim => "ltrim",
+            ScalarFn::Rtrim => "rtrim",
+            ScalarFn::Instr => "instr",
         }
     }
 }
@@ -335,6 +349,54 @@ fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
             let begin = begin.min(s.len());
             let end = end.max(begin).min(s.len());
             Value::Text(s[begin..end].iter().collect())
+        }
+        ScalarFn::Replace => {
+            let s = text(&args[0])?;
+            let from = text(&args[1])?;
+            let to = text(&args[2])?;
+            // sqlite: an empty search string leaves the input unchanged (Rust's
+            // `str::replace("")` would instead splice `to` between every char).
+            if from.is_empty() {
+                Value::Text(s)
+            } else {
+                Value::Text(s.replace(&from, &to))
+            }
+        }
+        ScalarFn::Ltrim => {
+            let s = text(&args[0])?;
+            match args.get(1) {
+                Some(_) => {
+                    let set: Vec<char> = text(&args[1])?.chars().collect();
+                    Value::Text(s.trim_start_matches(|c| set.contains(&c)).to_string())
+                }
+                None => Value::Text(s.trim_start().to_string()),
+            }
+        }
+        ScalarFn::Rtrim => {
+            let s = text(&args[0])?;
+            match args.get(1) {
+                Some(_) => {
+                    let set: Vec<char> = text(&args[1])?.chars().collect();
+                    Value::Text(s.trim_end_matches(|c| set.contains(&c)).to_string())
+                }
+                None => Value::Text(s.trim_end().to_string()),
+            }
+        }
+        ScalarFn::Instr => {
+            // 1-based character position of the first occurrence of the needle,
+            // 0 when absent; an empty needle is at position 1 (sqlite's rule).
+            let hay: Vec<char> = text(&args[0])?.chars().collect();
+            let needle: Vec<char> = text(&args[1])?.chars().collect();
+            let pos = if needle.is_empty() {
+                1
+            } else if needle.len() > hay.len() {
+                0
+            } else {
+                (0..=hay.len() - needle.len())
+                    .find(|&i| hay[i..i + needle.len()] == needle[..])
+                    .map_or(0, |i| i as i64 + 1)
+            };
+            Value::Int(pos)
         }
     })
 }
