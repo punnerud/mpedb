@@ -138,6 +138,19 @@ pub enum ScalarFn {
     Sign = 14,
     Ceil = 15,
     Floor = 16,
+    /// `char(X1, …, Xn)` — the string of the given Unicode code points.
+    /// Variadic (0..=255 args); NULL-propagating like every other scalar here
+    /// (sqlite instead treats a NULL argument as code point 0 — a documented gap).
+    Char = 17,
+    /// `unicode(x)` — the Unicode code point of the FIRST character of `x`
+    /// (NULL for the empty string).
+    Unicode = 18,
+    /// `hex(x)` — uppercase hexadecimal of the argument's bytes (text/blob).
+    Hex = 19,
+    /// `typeof(x)` — the datatype name of `x`. The one scalar that must NOT
+    /// null-propagate: `typeof(NULL)` is the text `'null'`, so it is handled
+    /// ahead of the null gate in [`call_scalar`].
+    Typeof = 20,
 }
 
 impl ScalarFn {
@@ -159,6 +172,10 @@ impl ScalarFn {
             14 => ScalarFn::Sign,
             15 => ScalarFn::Ceil,
             16 => ScalarFn::Floor,
+            17 => ScalarFn::Char,
+            18 => ScalarFn::Unicode,
+            19 => ScalarFn::Hex,
+            20 => ScalarFn::Typeof,
             other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
         })
     }
@@ -167,13 +184,17 @@ impl ScalarFn {
     /// popped args without re-checking.
     pub fn arity_ok(self, argc: u8) -> bool {
         match self {
-            ScalarFn::Lower | ScalarFn::Upper | ScalarFn::Length | ScalarFn::Trim
-            | ScalarFn::Abs => argc == 1,
-            ScalarFn::Round | ScalarFn::Ltrim | ScalarFn::Rtrim => argc == 1 || argc == 2,
+            ScalarFn::Lower | ScalarFn::Upper | ScalarFn::Length | ScalarFn::Abs
+            | ScalarFn::Unicode | ScalarFn::Hex | ScalarFn::Typeof => argc == 1,
+            ScalarFn::Round | ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => {
+                argc == 1 || argc == 2
+            }
             ScalarFn::Sqrt | ScalarFn::Sign | ScalarFn::Ceil | ScalarFn::Floor => argc == 1,
             ScalarFn::Substr => argc == 2 || argc == 3,
             ScalarFn::Instr | ScalarFn::Pow => argc == 2,
             ScalarFn::Replace => argc == 3,
+            // char() is variadic: 0..=255 code points (the u8 argc caps it).
+            ScalarFn::Char => true,
         }
     }
 
@@ -195,6 +216,10 @@ impl ScalarFn {
             ScalarFn::Sign => "sign",
             ScalarFn::Ceil => "ceil",
             ScalarFn::Floor => "floor",
+            ScalarFn::Char => "char",
+            ScalarFn::Unicode => "unicode",
+            ScalarFn::Hex => "hex",
+            ScalarFn::Typeof => "typeof",
         }
     }
 }
@@ -307,6 +332,12 @@ fn in_items_3vl(probe: &Value, items: &[Value]) -> Result<Value> {
 /// null-tolerant functions (`coalesce`, `nullif`) are NOT here — they are
 /// compiled to control flow instead, precisely because they must NOT propagate.
 fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
+    // `typeof` is the one scalar here that must SEE a NULL rather than
+    // propagate it: `typeof(NULL)` is the text `'null'`, not NULL. So it runs
+    // ahead of the null gate every function below relies on.
+    if matches!(f, ScalarFn::Typeof) {
+        return Ok(Value::Text(sqlite_typeof(&args[0]).to_string()));
+    }
     if args.iter().any(|a| a.is_null()) {
         return Ok(Value::Null);
     }
@@ -351,7 +382,18 @@ fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
         // silent wrong answer for every non-ASCII string, which is most of the
         // strings in this author's part of the world.
         ScalarFn::Length => Value::Int(text(&args[0])?.chars().count() as i64),
-        ScalarFn::Trim => Value::Text(text(&args[0])?.trim().to_string()),
+        ScalarFn::Trim => {
+            let s = text(&args[0])?;
+            match args.get(1) {
+                // trim(x, set): strip any of the given characters from BOTH
+                // ends — the two-sided analogue of ltrim/rtrim (sqlite's rule).
+                Some(_) => {
+                    let set: Vec<char> = text(&args[1])?.chars().collect();
+                    Value::Text(s.trim_matches(|c| set.contains(&c)).to_string())
+                }
+                None => Value::Text(s.trim().to_string()),
+            }
+        }
         ScalarFn::Abs => match &args[0] {
             // i64::MIN has no positive counterpart: negating it overflows and
             // would panic in debug and silently wrap in release.
@@ -490,7 +532,74 @@ fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
                 )))
             }
         },
+        // char(X1, …, Xn): the string of the given Unicode code points.
+        // Variadic; char() is the empty string. NULL propagates (the gate
+        // above) — sqlite instead reads a NULL argument as code point 0
+        // (a NUL char); the rigid rule is uniform NULL propagation, and this
+        // is the one documented gap.
+        ScalarFn::Char => {
+            let mut s = String::with_capacity(args.len());
+            for a in args {
+                let cp = int(a)?;
+                // An out-of-range or surrogate code point becomes U+FFFD
+                // rather than erroring or panicking — a hostile plan must
+                // stay safe.
+                let c = u32::try_from(cp)
+                    .ok()
+                    .and_then(char::from_u32)
+                    .unwrap_or('\u{FFFD}');
+                s.push(c);
+            }
+            Value::Text(s)
+        }
+        // unicode(x): the code point of the FIRST character of x, or NULL for
+        // the empty string (sqlite — there is no first character to name).
+        ScalarFn::Unicode => match text(&args[0])?.chars().next() {
+            Some(c) => Value::Int(c as i64),
+            None => Value::Null,
+        },
+        // hex(x): uppercase hex of the argument's bytes. Text hexes its UTF-8
+        // bytes, a blob its raw bytes (sqlite). A number is refused rather
+        // than sqlite's render-to-text-then-hex, a loose-typing artifact.
+        ScalarFn::Hex => {
+            let bytes: &[u8] = match &args[0] {
+                Value::Text(s) => s.as_bytes(),
+                Value::Blob(b) => b.as_slice(),
+                other => {
+                    return Err(Error::TypeMismatch(format!(
+                        "hex() expects text or blob, got {}",
+                        other.type_name()
+                    )))
+                }
+            };
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            let mut out = String::with_capacity(bytes.len() * 2);
+            for &b in bytes {
+                out.push(HEX[(b >> 4) as usize] as char);
+                out.push(HEX[(b & 0x0f) as usize] as char);
+            }
+            Value::Text(out)
+        }
+        // Handled ahead of the null gate above; unreachable here.
+        ScalarFn::Typeof => unreachable!("typeof is dispatched before the null gate"),
     })
+}
+
+/// sqlite `typeof()` datatype string. The five sqlite core names
+/// (`null`/`integer`/`real`/`text`/`blob`) match sqlite exactly; mpedb's two
+/// extra first-class types report their own honest names (sqlite has no such
+/// type to agree or disagree with), and a param-only `List` names itself.
+fn sqlite_typeof(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Int(_) => "integer",
+        Value::Float(_) => "real",
+        Value::Text(_) => "text",
+        Value::Blob(_) => "blob",
+        Value::Bool(_) => "boolean",
+        Value::Timestamp(_) => "timestamp",
+        Value::List(_) => "list",
+    }
 }
 
 /// A compiled expression: instruction sequence + constant pool.
@@ -1613,6 +1722,81 @@ mod tests {
             ExprProgram::decode(&evil, &mut 0),
             Err(Error::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn new_scalar_fns_eval_match_sqlite_and_propagate_null() {
+        // Build `f($1, $2, …)` over params so any Value (NULL included) reaches
+        // the function unchanged.
+        let call = |f: ScalarFn, args: &[Value]| -> Result<Value> {
+            let mut instrs: Vec<Instr> =
+                (0..args.len()).map(|i| Instr::PushParam(i as u16)).collect();
+            instrs.push(Instr::Call(f, args.len() as u8));
+            ExprProgram::new(instrs, vec![]).unwrap().eval(&[], args)
+        };
+        let t = |s: &str| Value::Text(s.into());
+
+        // char: code points -> string; variadic; char() is empty. NULL
+        // propagates here (documented gap vs sqlite, which reads NULL as 0).
+        assert_eq!(call(ScalarFn::Char, &[Value::Int(72), Value::Int(105)]).unwrap(), t("Hi"));
+        assert_eq!(call(ScalarFn::Char, &[Value::Int(230)]).unwrap(), t("æ"));
+        assert_eq!(call(ScalarFn::Char, &[]).unwrap(), t(""));
+        assert_eq!(call(ScalarFn::Char, &[Value::Int(72), Value::Null]).unwrap(), Value::Null);
+        // An out-of-range code point becomes the replacement char, not a panic.
+        assert_eq!(call(ScalarFn::Char, &[Value::Int(-1)]).unwrap(), t("\u{FFFD}"));
+
+        // unicode: first char's code point; empty string -> NULL; NULL -> NULL.
+        assert_eq!(call(ScalarFn::Unicode, &[t("A")]).unwrap(), Value::Int(65));
+        assert_eq!(call(ScalarFn::Unicode, &[t("abc")]).unwrap(), Value::Int(97));
+        assert_eq!(call(ScalarFn::Unicode, &[t("æ")]).unwrap(), Value::Int(230));
+        assert_eq!(call(ScalarFn::Unicode, &[t("")]).unwrap(), Value::Null);
+        assert_eq!(call(ScalarFn::Unicode, &[Value::Null]).unwrap(), Value::Null);
+
+        // hex: uppercase hex of UTF-8 bytes (text) or raw bytes (blob).
+        assert_eq!(call(ScalarFn::Hex, &[t("abc")]).unwrap(), t("616263"));
+        assert_eq!(call(ScalarFn::Hex, &[t("z")]).unwrap(), t("7A"));
+        assert_eq!(
+            call(ScalarFn::Hex, &[Value::Blob(vec![0x00, 0xff, 0x10])]).unwrap(),
+            t("00FF10")
+        );
+        assert_eq!(call(ScalarFn::Hex, &[t("")]).unwrap(), t(""));
+        assert_eq!(call(ScalarFn::Hex, &[Value::Null]).unwrap(), Value::Null);
+        assert!(matches!(call(ScalarFn::Hex, &[Value::Int(1)]), Err(Error::TypeMismatch(_))));
+
+        // typeof: does NOT propagate NULL — typeof(NULL) is the text 'null'.
+        assert_eq!(call(ScalarFn::Typeof, &[Value::Null]).unwrap(), t("null"));
+        assert_eq!(call(ScalarFn::Typeof, &[Value::Int(1)]).unwrap(), t("integer"));
+        assert_eq!(call(ScalarFn::Typeof, &[Value::Float(1.0)]).unwrap(), t("real"));
+        assert_eq!(call(ScalarFn::Typeof, &[t("x")]).unwrap(), t("text"));
+        assert_eq!(call(ScalarFn::Typeof, &[Value::Blob(vec![1])]).unwrap(), t("blob"));
+        assert_eq!(call(ScalarFn::Typeof, &[Value::Bool(true)]).unwrap(), t("boolean"));
+
+        // trim(x, set): strip a set of chars from BOTH ends; 1-arg trims spaces.
+        assert_eq!(call(ScalarFn::Trim, &[t("xxhixx"), t("x")]).unwrap(), t("hi"));
+        assert_eq!(call(ScalarFn::Trim, &[t("  hi  ")]).unwrap(), t("hi"));
+        assert_eq!(call(ScalarFn::Trim, &[t("hi"), Value::Null]).unwrap(), Value::Null);
+
+        // codec: the four new tags round-trip and truncation stays Corrupt,
+        // never a panic (repo rule). A linear chain keeps depth at 1 throughout.
+        let p = prog(
+            vec![
+                Instr::PushConst(0),          // Int 104
+                Instr::Call(ScalarFn::Char, 1),   // "h"
+                Instr::Call(ScalarFn::Unicode, 1), // 104
+                Instr::Call(ScalarFn::Char, 1),    // "h"
+                Instr::Call(ScalarFn::Hex, 1),     // "68"
+                Instr::Call(ScalarFn::Typeof, 1),  // "text"
+            ],
+            vec![Value::Int(104)],
+        );
+        let mut buf = Vec::new();
+        p.encode_into(&mut buf);
+        let mut pos = 0;
+        assert_eq!(ExprProgram::decode(&buf, &mut pos).unwrap(), p);
+        assert_eq!(pos, buf.len());
+        for cut in 0..buf.len() {
+            let _ = ExprProgram::decode(&buf[..cut], &mut 0); // must not panic
+        }
     }
 
     #[test]
