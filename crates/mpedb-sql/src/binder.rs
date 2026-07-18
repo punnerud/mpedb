@@ -30,6 +30,11 @@ pub(crate) enum BExpr {
     IsDistinct(Box<BExpr>, Box<BExpr>, bool),
     /// LHS LIKE 'pattern' (pattern is always a literal in Phase 1).
     Like(Box<BExpr>, String),
+    /// LHS GLOB 'pattern' — case-SENSITIVE `*`/`?`/`[...]` (sqlite). The pattern
+    /// is always a literal in Phase 1, exactly like [`BExpr::Like`]; `NOT GLOB`
+    /// is a `Not` wrapped around this by the binder, so this node itself is
+    /// never negated.
+    Glob(Box<BExpr>, String),
     /// `LHS IN (<context list at reserved param n>)` (DESIGN-MULTIDB §2.6).
     InParam(Box<BExpr>, u16),
     /// `LHS IN (e1, …, en)` — a general value list (task #21).
@@ -494,6 +499,28 @@ impl<'a> Binder<'a> {
                     Some(t) => return Err(bind_err(format!("LIKE requires text, got {t}"))),
                 }
                 let e = fold_maybe(BExpr::Like(Box::new(l), pattern), self.suppress_fold)?;
+                Ok((e, Some(ColumnType::Bool)))
+            }
+            ast::Expr::Glob(lhs, pat, negated) => {
+                // Same shape as LIKE: the pattern must be a text literal, both
+                // operands are text, the result is Bool. `NOT GLOB` is a real
+                // `Not` over the 3VL result (via `maybe_not`) — NOT of NULL is
+                // NULL, so a NULL operand still yields NULL as SQL requires.
+                let pattern = match pat.as_ref() {
+                    ast::Expr::Lit(Value::Text(p)) => p.clone(),
+                    ast::Expr::Param(_) => {
+                        return Err(bind_err("GLOB pattern must be a literal in Phase 1"))
+                    }
+                    _ => return Err(bind_err("GLOB pattern must be a string literal")),
+                };
+                let (l, lt) = self.bind_expr(lhs)?;
+                let (l, lt) = self.unify_param(l, lt, ColumnType::Text);
+                match lt {
+                    None | Some(ColumnType::Text) => {}
+                    Some(t) => return Err(bind_err(format!("GLOB requires text, got {t}"))),
+                }
+                let g = fold_maybe(BExpr::Glob(Box::new(l), pattern), self.suppress_fold)?;
+                let e = fold_maybe(maybe_not(g, *negated), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
             }
             ast::Expr::ContextRef(key) => {
@@ -1170,6 +1197,7 @@ pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
             matches!(a.as_ref(), BExpr::Const(_)) && matches!(b.as_ref(), BExpr::Const(_))
         }
         BExpr::Like(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
+        BExpr::Glob(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         BExpr::Cast(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         // Never foldable: the list is a session value, not a literal.
         BExpr::InParam(..) => false,
@@ -1278,6 +1306,11 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
             emit(a, instrs, consts)?;
             let idx = push_const(consts, Value::Text(pattern.clone()))?;
             instrs.push(Instr::Like(idx));
+        }
+        BExpr::Glob(a, pattern) => {
+            emit(a, instrs, consts)?;
+            let idx = push_const(consts, Value::Text(pattern.clone()))?;
+            instrs.push(Instr::Glob(idx));
         }
         BExpr::InParam(a, idx) => {
             emit(a, instrs, consts)?;
