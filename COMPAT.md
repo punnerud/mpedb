@@ -78,7 +78,8 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | RIGHT [OUTER] JOIN | 🚧 | two-table form (planned as LEFT with sides swapped); refused inside longer chains with the manual fix in the message |
 | FULL [OUTER] JOIN | 🚧 | two-table form; same chain restriction |
 | CROSS JOIN / comma-joins | ✅ | desugared to `INNER JOIN … ON true`; WHERE conjuncts push into the chain, so a comma-join equality is an index-nested-loop candidate exactly like an ON equality |
-| NATURAL JOIN / JOIN … USING | ❌ | refused — "write the ON condition explicitly"; implicit name-matching is a trap under rigid schemas |
+| JOIN … USING (c, …) | 🚧 | [INNER] JOIN and LEFT JOIN only; desugars to `left.c = right.c AND …` at plan time, so the ON-equality is an index-nested-loop candidate like a written ON; under `SELECT *` the join column is COALESCED (appears once, from the left side) — sqlite-verified. RIGHT/FULL USING refused (the coalesced column would have to survive the side-swap/both-sides-whole rewrites); a USING column missing on either side is a clean bind error |
+| NATURAL JOIN | ❌ | refused — its condition is implicit in ALL common column names, which rigid schemas make a trap; write the ON condition explicitly, or use `JOIN … USING (…)` |
 | Table aliases, self-joins | ✅ | alias shadows the table name, as in PostgreSQL |
 | UNION / UNION ALL / EXCEPT / INTERSECT | ✅ | chains, left-associative at equal precedence (sqlite's rule; PostgreSQL binds INTERSECT tighter — documented deviation); arms must agree on arity and exact types, `CAST` bridges deliberate mismatches |
 | Scalar subqueries `(SELECT …)` | ✅ | uncorrelated and correlated; 0 rows → NULL; **>1 row is an error** (PostgreSQL's rule — sqlite silently takes the first row) |

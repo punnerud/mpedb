@@ -266,6 +266,7 @@ impl<'a> Parser<'a> {
                         alias,
                         kind: JoinKind::Inner,
                         on: Expr::Lit(Value::Bool(true)),
+                        using: Vec::new(),
                     });
                 } else if self.eat_kw(Kw::Inner) {
                     self.expect_kw(Kw::Join, "JOIN after INNER")?;
@@ -299,6 +300,7 @@ impl<'a> Parser<'a> {
                         alias,
                         kind: JoinKind::Inner,
                         on: Expr::Lit(Value::Bool(true)),
+                        using: Vec::new(),
                     });
                 } else if let Some(kind) = self.peek_join_kind() {
                     // Only NATURAL is left unsupported: its join condition is
@@ -444,7 +446,11 @@ impl<'a> Parser<'a> {
         if matches!(self.peek(), Some(Tok::QuotedIdent(_))) {
             return Ok(Some(self.ident("table alias")?));
         }
+        // `USING` is likewise positional (`JOIN b USING (id)`): reading it as an
+        // alias for `b` would lose the join condition. Quote it to name a table.
+        let is_using = matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("USING"));
         if matches!(self.peek(), Some(Tok::Ident(_)))
+            && !is_using
             && self.peek_join_kind().is_none()
             // …nor is a compound operator: `FROM t1 UNION SELECT` must not
             // read `UNION` as t1's alias and lose the second arm.
@@ -458,12 +464,55 @@ impl<'a> Parser<'a> {
     fn join_tail(&mut self, kind: JoinKind) -> Result<JoinClause> {
         let table = self.ident("table name after JOIN")?;
         let alias = self.opt_table_alias()?;
-        // ON is required. A comma-join / cross join is a cartesian product, and
-        // the times someone means one are far outnumbered by the times they
-        // forgot the condition.
-        self.expect_kw(Kw::On, "ON after JOIN — the join condition is required")?;
+        // The join condition — either `ON <cond>` or `USING (c1, …)`. `USING` is
+        // a positional word (not a keyword), so a table/column named `using` is
+        // unaffected; NATURAL (implicit USING over all common columns) stays
+        // refused in the caller. The desugaring to `left.ci = right.ci AND …`
+        // and the `SELECT *` coalescing happen at plan time (the LEFT qualifier
+        // needs the schema) — here we only capture the columns.
+        if self.eat_word("USING") {
+            // RIGHT/FULL USING would have to carry the coalesced column through
+            // the side-swap (RIGHT→LEFT) and both-sides-whole (FULL) rewrites;
+            // refuse rather than silently mis-order the output.
+            if matches!(kind, JoinKind::Right | JoinKind::Full) {
+                return Err(self.err_here(
+                    "JOIN … USING is only supported on [INNER] JOIN and LEFT JOIN — \
+                     write the ON condition explicitly for RIGHT/FULL joins",
+                ));
+            }
+            let using = self.using_columns()?;
+            return Ok(JoinClause {
+                table,
+                alias,
+                kind,
+                on: Expr::Lit(Value::Bool(true)),
+                using,
+            });
+        }
+        // ON is otherwise required. A comma-join / cross join is a cartesian
+        // product, and the times someone means one are far outnumbered by the
+        // times they forgot the condition.
+        self.expect_kw(Kw::On, "ON after JOIN — the join condition is required (or USING (…))")?;
         let on = self.expr()?;
-        Ok(JoinClause { table, alias, kind, on })
+        Ok(JoinClause { table, alias, kind, on, using: Vec::new() })
+    }
+
+    /// `(c1, c2, …)` — the non-empty column list of a `JOIN … USING`. Bare or
+    /// quoted identifiers; the plan-time desugar checks each one exists in BOTH
+    /// sides.
+    fn using_columns(&mut self) -> Result<Vec<String>> {
+        self.expect(&Tok::LParen, "`(` after USING")?;
+        let mut cols = vec![self.ident("column name in USING")?];
+        while self.eat(&Tok::Comma) {
+            if cols.len() >= MAX_SELECT_ITEMS {
+                return Err(self.err_here(format!(
+                    "too many USING columns (max {MAX_SELECT_ITEMS})"
+                )));
+            }
+            cols.push(self.ident("column name in USING")?);
+        }
+        self.expect(&Tok::RParen, "`)` closing the USING column list")?;
+        Ok(cols)
     }
 
     fn nonneg_int(&mut self, what: &str) -> Result<u64> {
