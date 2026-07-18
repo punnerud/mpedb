@@ -8,8 +8,20 @@ use mpedb::{Database, ExecResult, Value};
 use mpedb_sql::AccessPath;
 use mpedb_types::Config;
 
+/// `/dev/shm` when present (fast tmpfs, mpedb's habitat), else the platform
+/// temp dir — keeps the scratch path portable to macOS, where `/dev/shm` does
+/// not exist (#66).
+fn scratch_path(name: String) -> String {
+    let dir = if std::path::Path::new("/dev/shm").is_dir() {
+        std::path::PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    };
+    dir.join(name).to_string_lossy().into_owned()
+}
+
 fn setup(tag: &str) -> Database {
-    let path = format!("/dev/shm/mpedb-composite-{tag}-{}.mpedb", std::process::id());
+    let path = scratch_path(format!("mpedb-composite-{tag}-{}.mpedb", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let toml = format!(
         r#"
@@ -189,7 +201,7 @@ fn on_conflict_targets_a_composite_unique_order_insensitively() {
 
 #[test]
 fn join_pushdown_uses_a_composite_index() {
-    let path = format!("/dev/shm/mpedb-composite-join-{}.mpedb", std::process::id());
+    let path = scratch_path(format!("mpedb-composite-join-{}.mpedb", std::process::id()));
     let _ = std::fs::remove_file(&path);
     let toml = format!(
         r#"
