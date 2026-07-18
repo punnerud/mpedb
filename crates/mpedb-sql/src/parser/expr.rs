@@ -1,0 +1,602 @@
+//! Expression grammar for the recursive-descent parser.
+//!
+//! Precedence, loosest to tightest:
+//! `OR` < `AND` < `NOT` < comparison / `IS [NOT] NULL` / `LIKE`
+//! < `+ -` < `* / %` < unary `-` < primary.
+//! Comparisons do not chain (`a < b < c` is a parse error).
+//!
+//! Split out of [`super`] to keep that file under the size limit. The shared
+//! [`Parser`] token helpers and struct fields live in `super` and stay reachable
+//! here because `parser::expr` is a descendant module. `expr` itself is
+//! `pub(super)` so the statement/DML/SELECT grammar and the `parse_expr_only`
+//! entry point can reach it.
+
+use super::{Parser, ParamStyle, MAX_EXPR_DEPTH, MAX_PARSER_STACK};
+use crate::ast::{BinOp, Expr, SelectStmt, UnOp};
+use crate::token::{Kw, Tok};
+use mpedb_types::{Error, Result, Value};
+
+/// The aggregate names, matched case-insensitively. Kept out of the scalar
+/// function table on purpose: a scalar runs per row, an aggregate consumes a
+/// group, and the parser must not let one become the other.
+fn agg_fn(name: &str) -> Option<mpedb_types::AggFn> {
+    use mpedb_types::AggFn::*;
+    Some(match name.to_ascii_lowercase().as_str() {
+        "count" => Count,
+        "sum" => Sum,
+        "avg" => Avg,
+        "min" => Min,
+        "max" => Max,
+        "total" => Total,
+        "group_concat" => GroupConcat,
+        _ => return None,
+    })
+}
+
+/// Map a SQL type name to the CAST target. sqlite's affinity vocabulary and
+/// the standard's both land on mpedb's five scalars; NUMERIC/DECIMAL take
+/// float64 (mpedb has no arbitrary-precision numeric — documented).
+fn cast_type(name: &str) -> Option<mpedb_types::ColumnType> {
+    use mpedb_types::ColumnType as T;
+    let up = name.to_ascii_uppercase();
+    Some(match up.as_str() {
+        "INTEGER" | "INT" | "BIGINT" | "SMALLINT" | "TINYINT" | "INT2" | "INT8" => T::Int64,
+        "REAL" | "FLOAT" | "DOUBLE" | "NUMERIC" | "DECIMAL" => T::Float64,
+        "TEXT" | "CHAR" | "VARCHAR" | "CHARACTER" | "CLOB" | "STRING" => T::Text,
+        "BOOLEAN" | "BOOL" => T::Bool,
+        "BLOB" => T::Blob,
+        "TIMESTAMP" => T::Timestamp,
+        _ => return None,
+    })
+}
+
+impl<'a> Parser<'a> {
+    /// Enter one level of expression recursion, refusing to go deeper than the
+    /// stack can hold.
+    ///
+    /// Reads the approximate stack pointer (the address of a local) and compares
+    /// it to the base captured when parsing began. Stacks grow DOWN on every
+    /// platform mpedb supports (Linux x86-64/ARM, macOS/Apple Silicon), so
+    /// `base - here` is bytes consumed; `saturating_sub` keeps a surprise from
+    /// turning into a panic. This is what PostgreSQL's `check_stack_depth()`
+    /// does, for the same reason.
+    fn enter_expr(&mut self) -> Result<()> {
+        let probe = 0u8;
+        let here = &probe as *const u8 as usize;
+        if self.stack_base.saturating_sub(here) > MAX_PARSER_STACK {
+            return Err(self.err_here("expression nested too deeply (parser stack exhausted)"));
+        }
+        if self.depth >= MAX_EXPR_DEPTH {
+            return Err(self.err_here("expression nested too deeply"));
+        }
+        self.depth += 1;
+        Ok(())
+    }
+
+    fn exit_expr(&mut self) {
+        debug_assert!(self.depth > 0);
+        self.depth -= 1;
+    }
+
+    // ---- expressions ----------------------------------------------------
+
+    // Depth guards: `expr()` covers the `( expr )` cycle through `primary()`;
+    // `not_expr`/`unary_expr` guard their direct self-recursion, which does
+    // not pass back through `expr()`.
+
+    pub(super) fn expr(&mut self) -> Result<Expr> {
+        self.enter_expr()?;
+        let e = self.or_expr();
+        self.exit_expr();
+        e
+    }
+
+    fn or_expr(&mut self) -> Result<Expr> {
+        let mut e = self.and_expr()?;
+        while self.eat_kw(Kw::Or) {
+            let r = self.and_expr()?;
+            e = Expr::Binary(BinOp::Or, Box::new(e), Box::new(r));
+        }
+        Ok(e)
+    }
+
+    fn and_expr(&mut self) -> Result<Expr> {
+        let mut e = self.not_expr()?;
+        while self.eat_kw(Kw::And) {
+            let r = self.not_expr()?;
+            e = Expr::Binary(BinOp::And, Box::new(e), Box::new(r));
+        }
+        Ok(e)
+    }
+
+    fn not_expr(&mut self) -> Result<Expr> {
+        if self.eat_kw(Kw::Not) {
+            self.enter_expr()?;
+            let e = self.not_expr();
+            self.exit_expr();
+            Ok(Expr::Unary(UnOp::Not, Box::new(e?)))
+        } else {
+            self.cmp_expr()
+        }
+    }
+
+    fn cmp_expr(&mut self) -> Result<Expr> {
+        let mut e = self.add_expr()?;
+        let mut seen_cmp = false;
+        loop {
+            if self.eat_kw(Kw::Is) {
+                let negated = self.eat_kw(Kw::Not);
+                if self.eat_kw(Kw::Null) {
+                    e = Expr::IsNull(Box::new(e), negated);
+                } else {
+                    // General `x IS y` / `x IS NOT y` — NULL-safe (not-)distinct.
+                    // The right operand parses at the additive tier, like `=`'s
+                    // RHS, so `IS` sits at the comparison level and does not chain
+                    // into a following comparison.
+                    let rhs = self.add_expr()?;
+                    e = Expr::IsDistinct(Box::new(e), Box::new(rhs), negated);
+                }
+                continue;
+            }
+            if !seen_cmp && self.peek_kw(Kw::Like) {
+                self.pos += 1;
+                let pat = self.add_expr()?;
+                e = Expr::Like(Box::new(e), Box::new(pat));
+                seen_cmp = true;
+                continue;
+            }
+            // `x GLOB pat` / `x NOT GLOB pat` — the `NOT` is part of the
+            // operator (like `NOT IN`/`NOT BETWEEN`), so it needs the two-token
+            // lookahead that the higher-precedence `not_expr` already passed on.
+            if !seen_cmp && (self.peek_kw(Kw::Glob) || self.peek_not_glob()) {
+                let negated = self.eat_kw(Kw::Not);
+                self.expect_kw(Kw::Glob, "GLOB")?;
+                let pat = self.add_expr()?;
+                e = Expr::Glob(Box::new(e), Box::new(pat), negated);
+                seen_cmp = true;
+                continue;
+            }
+            if !seen_cmp && (self.peek_kw(Kw::Between) || self.peek_not_between()) {
+                e = self.between_suffix(e)?;
+                seen_cmp = true;
+                continue;
+            }
+            if !seen_cmp && (self.peek_kw(Kw::In) || self.peek_not_in()) {
+                e = self.in_suffix(e)?;
+                seen_cmp = true;
+                continue;
+            }
+            let op = match self.peek() {
+                Some(Tok::Eq) => BinOp::Eq,
+                Some(Tok::Ne) => BinOp::Ne,
+                Some(Tok::Lt) => BinOp::Lt,
+                Some(Tok::Le) => BinOp::Le,
+                Some(Tok::Gt) => BinOp::Gt,
+                Some(Tok::Ge) => BinOp::Ge,
+                _ => break,
+            };
+            if seen_cmp {
+                break; // non-chaining: leftover op is a trailing-input error
+            }
+            self.pos += 1;
+            let r = self.add_expr()?;
+            e = Expr::Binary(op, Box::new(e), Box::new(r));
+            seen_cmp = true;
+        }
+        Ok(e)
+    }
+
+    fn add_expr(&mut self) -> Result<Expr> {
+        let mut e = self.mul_expr()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Plus) => BinOp::Add,
+                Some(Tok::Minus) => BinOp::Sub,
+                // `||` sits in the additive tier (left-associative). sqlite
+                // technically binds it tighter than `*`; nothing in the corpus
+                // or a sane query observes the difference, and additive keeps
+                // the grammar flat.
+                Some(Tok::Concat) => BinOp::Concat,
+                _ => break,
+            };
+            self.pos += 1;
+            let r = self.mul_expr()?;
+            e = Expr::Binary(op, Box::new(e), Box::new(r));
+        }
+        Ok(e)
+    }
+
+    fn mul_expr(&mut self) -> Result<Expr> {
+        let mut e = self.unary_expr()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Star) => BinOp::Mul,
+                Some(Tok::Slash) => BinOp::Div,
+                Some(Tok::Percent) => BinOp::Mod,
+                _ => break,
+            };
+            self.pos += 1;
+            let r = self.unary_expr()?;
+            e = Expr::Binary(op, Box::new(e), Box::new(r));
+        }
+        Ok(e)
+    }
+
+    fn unary_expr(&mut self) -> Result<Expr> {
+        if self.eat(&Tok::Minus) {
+            self.enter_expr()?;
+            let e = self.unary_expr();
+            self.exit_expr();
+            Ok(Expr::Unary(UnOp::Neg, Box::new(e?)))
+        } else if self.eat(&Tok::Plus) {
+            // Unary `+` is the identity, as in sqlite and PostgreSQL — parsed
+            // and DROPPED, so `+ col`, `- + 43` and `+ ( - 78 )` all work.
+            // No AST node: identity would only be something for later stages
+            // to look through. This single arm was the sqllogictest corpus'
+            // single largest blocker (#62: ~55% of all refused statements).
+            self.enter_expr()?;
+            let e = self.unary_expr();
+            self.exit_expr();
+            e
+        } else {
+            self.primary()
+        }
+    }
+
+    /// `CASE [x] WHEN … THEN … [ELSE …] END`.
+    ///
+    /// The simple form is desugared into the searched form (`CASE x WHEN a` ->
+    /// `CASE WHEN x = a`), so only one shape reaches the binder. That duplicates
+    /// `x` per arm in the plan, and it is the one place this differs from the
+    /// standard's letter: SQL evaluates the operand once. For pure expressions —
+    /// and every expression here is pure, there are no functions with side
+    /// effects — the observable result is identical.
+    ///
+    /// 3VL falls out of the desugaring for free: `CASE x WHEN NULL` becomes
+    /// `x = NULL`, which is NULL, which is not TRUE, so the arm is skipped —
+    /// exactly what the standard requires.
+    fn case_expr(&mut self) -> Result<Expr> {
+        // A simple-form operand is anything up to WHEN.
+        let operand = if self.peek_kw(Kw::When) {
+            None
+        } else {
+            Some(self.expr()?)
+        };
+        let mut arms = Vec::new();
+        while self.eat_kw(Kw::When) {
+            let cond = self.expr()?;
+            self.expect_kw(Kw::Then, "THEN after WHEN")?;
+            let then = self.expr()?;
+            let cond = match &operand {
+                Some(x) => Expr::Binary(BinOp::Eq, Box::new(x.clone()), Box::new(cond)),
+                None => cond,
+            };
+            arms.push((cond, then));
+        }
+        if arms.is_empty() {
+            return Err(self.err_here("CASE needs at least one WHEN"));
+        }
+        let else_ = if self.eat_kw(Kw::Else) {
+            Some(Box::new(self.expr()?))
+        } else {
+            None
+        };
+        self.expect_kw(Kw::End, "END closing CASE")?;
+        Ok(Expr::Case(arms, else_))
+    }
+
+
+    /// `x BETWEEN a AND b`, split out of `cmp_expr`.
+    ///
+    /// `#[inline(never)]` and a separate frame on purpose: `cmp_expr` sits on
+    /// the mutually-recursive descent path, so every local here would otherwise
+    /// be paid on EVERY nesting level. Inlining these blocks back into cmp_expr
+    /// grew the per-level frame enough that MAX_EXPR_DEPTH=128 overflowed the
+    /// stack in a debug build — the exact crash the depth guard exists to stop.
+    #[inline(never)]
+    fn between_suffix(&mut self, e: Expr) -> Result<Expr> {
+        let negated = self.eat_kw(Kw::Not);
+        self.expect_kw(Kw::Between, "BETWEEN")?;
+        // add_expr, NOT expr: the AND below belongs to BETWEEN's own syntax, so
+        // a full expression parse would swallow it and then fail looking for an
+        // AND that is already gone.
+        let lo = self.add_expr()?;
+        self.expect_kw(Kw::And, "AND in BETWEEN")?;
+        let hi = self.add_expr()?;
+        // Desugared to `x >= lo AND x <= hi`: that is the shape the planner's
+        // extract_access already turns into a PkRange, so BETWEEN becomes a
+        // range SCAN rather than a full scan plus filter. The cost is `x`
+        // appearing twice in the plan.
+        let ge = Expr::Binary(BinOp::Ge, Box::new(e.clone()), Box::new(lo));
+        let le = Expr::Binary(BinOp::Le, Box::new(e), Box::new(hi));
+        let both = Expr::Binary(BinOp::And, Box::new(ge), Box::new(le));
+        // NOT BETWEEN negates the whole conjunct rather than being spelled out
+        // as (NOT a OR NOT b): De Morgan holds in 3VL, but writing it twice
+        // invites the two spellings to drift.
+        Ok(if negated {
+            Expr::Unary(UnOp::Not, Box::new(both))
+        } else {
+            both
+        })
+    }
+
+    /// `x IN (…)` / `x NOT IN (…)`, split out of `cmp_expr` (see
+    /// [`Self::between_suffix`] for why).
+    ///
+    /// Two shapes share the syntax: a session-context list (§2.6 — one reserved
+    /// param, because the arity must NOT reach the plan bytes) and a general
+    /// value list (#21 — the arity IS the query). What is inside the parens
+    /// decides which.
+    #[inline(never)]
+    fn in_suffix(&mut self, e: Expr) -> Result<Expr> {
+        let negated = self.eat_kw(Kw::Not);
+        self.expect_kw(Kw::In, "IN")?;
+        // sqlite shorthand: `x IN <table>` == `x IN (SELECT * FROM <table>)`
+        // (the table must have a single column; the InSubquery lift enforces it).
+        if self.peek() != Some(&Tok::LParen) {
+            if matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_))) {
+                let tname = self.ident("table name after IN")?;
+                let inner = SelectStmt {
+                    table: Some(tname),
+                    from_derived: None,
+                    alias: None,
+                    joins: Vec::new(),
+                    distinct: false,
+                    items: None,
+                    where_clause: None,
+                    group_by: Vec::new(),
+                    having: None,
+                    order_by: Vec::new(),
+                    limit: None,
+                    offset: None,
+                };
+                return Ok(Expr::InSubquery(Box::new(e), Box::new(inner), negated));
+            }
+            return Err(self.err_here("`(` or a table name after IN"));
+        }
+        self.expect(&Tok::LParen, "`(` after IN")?;
+        // `IN ()` — the EMPTY set — is accepted (sqlite allows it; PostgreSQL
+        // does not, but accepting it rejects nothing PG accepts). It is FALSE
+        // for every probe, NULL included (`NOT IN ()` TRUE) — the 3VL empty-set
+        // rule. Compiles to a zero-element InList that evaluates the probe (so
+        // its errors still surface), then yields FALSE.
+        if self.eat(&Tok::RParen) {
+            return Ok(Expr::InList(Box::new(e), Vec::new(), negated));
+        }
+        // `IN (SELECT …)` — membership in a subquery's output (#70). The
+        // SELECT keyword right after the paren decides, same rule as the
+        // scalar-subquery primary.
+        if matches!(self.peek(), Some(Tok::Kw(Kw::Select))) {
+            let inner = self.select_core()?;
+            self.expect(&Tok::RParen, "`)` after IN subquery")?;
+            return Ok(Expr::InSubquery(Box::new(e), Box::new(inner), negated));
+        }
+        let first = self.expr()?;
+        if let (Expr::ContextRef(key), Some(&Tok::RParen)) = (&first, self.peek()) {
+            let key = key.clone();
+            self.pos += 1;
+            return Ok(Expr::InContext(Box::new(e), key, negated));
+        }
+        let mut items = vec![first];
+        while self.eat(&Tok::Comma) {
+            items.push(self.expr()?);
+        }
+        self.expect(&Tok::RParen, "`)` closing IN")?;
+        Ok(Expr::InList(Box::new(e), items, negated))
+    }
+
+    /// `name(args…)`, split out of `primary` (see [`Self::between_suffix`]).
+    #[inline(never)]
+    fn call_suffix(&mut self, name: String) -> Result<Expr> {
+        self.expect(&Tok::LParen, "`(`")?;
+        // Aggregates are intercepted BEFORE the scalar argument parse, because
+        // `count(*)` has an argument that is not an expression. `*` there is not
+        // "all columns" — it means "the row itself", which is the whole reason
+        // count(*) and count(x) differ on NULLs.
+        if let Some(f) = agg_fn(&name) {
+            if self.eat(&Tok::Star) {
+                self.expect(&Tok::RParen, "`)` closing count(*)")?;
+                if f != mpedb_types::AggFn::Count {
+                    return Err(self.err_here(format!(
+                        "{}(*) is not valid — only count(*) takes the row itself; \
+                         {}() needs a value",
+                        f.name(),
+                        f.name()
+                    )));
+                }
+                return Ok(Expr::Agg(f, None, false));
+            }
+            let distinct = self.eat_kw(Kw::Distinct);
+            if !distinct {
+                self.eat_all_quantifier();
+            }
+            if distinct && self.peek() == Some(&Tok::Star) {
+                // sqlite and PG both make this a syntax error, and they are
+                // right: `count(*)` counts ROWS, and "distinct rows" is what
+                // SELECT DISTINCT means — there is nothing for DISTINCT to
+                // apply to inside the parens.
+                return Err(self.err_here(format!(
+                    "{}(DISTINCT *) is not valid — use SELECT DISTINCT, or name a column",
+                    f.name()
+                )));
+            }
+            let arg = self.expr()?;
+            if self.peek() == Some(&Tok::Comma) {
+                return Err(self.err_here(format!("{}() takes exactly one argument", f.name())));
+            }
+            self.expect(&Tok::RParen, "`)` closing the argument list")?;
+            return Ok(Expr::Agg(f, Some(Box::new(arg)), distinct));
+        }
+        let mut args = Vec::new();
+        if self.peek() != Some(&Tok::RParen) {
+            args.push(self.expr()?);
+            while self.eat(&Tok::Comma) {
+                args.push(self.expr()?);
+            }
+        }
+        self.expect(&Tok::RParen, "`)` closing the argument list")?;
+        let lname = name.to_ascii_lowercase();
+        Ok(match lname.as_str() {
+            "coalesce" => Expr::Coalesce(args),
+            // ifnull IS coalesce/2; a separate node would be a second place for
+            // the laziness to be got wrong.
+            "ifnull" => {
+                if args.len() != 2 {
+                    return Err(self.err_here("ifnull() takes exactly 2 arguments"));
+                }
+                Expr::Coalesce(args)
+            }
+            _ => Expr::Func(lname, args),
+        })
+    }
+
+
+    /// Everything a bare identifier can turn into: `current_setting(...)`, a
+    /// function call, `excluded.<col>`, or a plain column.
+    ///
+    /// `#[inline(never)]` and its own frame for the same reason as
+    /// [`Self::between_suffix`]: `primary` is on the mutually-recursive descent
+    /// path, so any local here is paid on EVERY nesting level. This one is not
+    /// hypothetical either — folding it back into `primary` overflowed the
+    /// stack at the permitted depth, and the test that caught it is
+    /// `deep_nesting_through_the_new_constructs_is_also_a_parse_error`.
+    #[inline(never)]
+    fn ident_suffix(&mut self, s: String) -> Result<Expr> {
+
+                // `current_setting('key')` is the only function form in Phase 1.
+                // Recognized only as a bare identifier immediately followed by
+                // `(`; a quoted "current_setting" or one without `(` is a column.
+                if s.eq_ignore_ascii_case("current_setting") && self.eat(&Tok::LParen) {
+                    let key = match self.advance() {
+                        Some(Tok::Str(k)) if !k.is_empty() => k,
+                        _ => {
+                            return Err(self.err_here(
+                                "current_setting() takes a single non-empty string-literal key",
+                            ))
+                        }
+                    };
+                    self.expect(&Tok::RParen, "`)`")?;
+                    return Ok(Expr::ContextRef(key));
+                }
+                if self.peek() == Some(&Tok::LParen) {
+                    return self.call_suffix(s);
+                }
+                // `excluded.<col>` — the proposed row inside ON CONFLICT DO
+                // UPDATE. Only a BARE `excluded` qualifies; a quoted
+                // "excluded" stays a column name, so a table that really has a
+                // column called `excluded` keeps working.
+                if s.eq_ignore_ascii_case("excluded") && self.peek() == Some(&Tok::Dot) {
+                    self.pos += 1;
+                    let col = self.ident("column name after `excluded.`")?;
+                    return Ok(Expr::Excluded(col));
+                }
+                // `<qualifier>.<column>` — both ancestors accept it, so mpedb
+                // does too. There is exactly one table in scope (no joins yet),
+                // so the qualifier is checked against it and then dropped: the
+                // binder resolves a plain column name either way. When joins
+                // arrive the qualifier stops being decoration and this is where
+                // it gets used.
+                if self.peek() == Some(&Tok::Dot) {
+                    self.pos += 1;
+                    let col = self.ident("column name after `.`")?;
+                    return Ok(Expr::Qualified(s, col));
+                }
+                Ok(Expr::Col(s))
+    }
+
+    fn primary(&mut self) -> Result<Expr> {
+        let pos = self.here();
+        if self.eat_kw(Kw::Case) {
+            return self.case_expr();
+        }
+        // `EXISTS ( SELECT … )` — positional word like CAST; NOT EXISTS
+        // arrives here through unary NOT, which is exactly `Exists` negated
+        // by a Not instruction, so no dedicated node is needed for it.
+        if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("EXISTS"))
+            && matches!(self.peek_at(1), Some(Tok::LParen))
+        {
+            self.pos += 2;
+            if !matches!(self.peek(), Some(Tok::Kw(Kw::Select))) {
+                return Err(self.err_here("EXISTS takes a subquery: EXISTS (SELECT …)"));
+            }
+            let inner = self.select_core()?;
+            self.expect(&Tok::RParen, "`)` after EXISTS subquery")?;
+            return Ok(Expr::Exists(Box::new(inner), false));
+        }
+        // `CAST ( expr AS <typename> )` — CAST is a positional word, not a
+        // keyword, so a table may still be named `cast`.
+        if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("CAST"))
+            && matches!(self.peek_at(1), Some(Tok::LParen))
+        {
+            self.pos += 2;
+            let e = self.expr()?;
+            self.expect_kw(Kw::As, "AS in CAST")?;
+            let tyname = self.ident("type name in CAST")?;
+            let ty = cast_type(&tyname).ok_or_else(|| {
+                self.err_here(format!("unknown CAST target type `{tyname}`"))
+            })?;
+            self.expect(&Tok::RParen, ") after CAST")?;
+            return Ok(Expr::Cast(Box::new(e), ty));
+        }
+        match self.advance() {
+            Some(Tok::Int(v)) => Ok(Expr::Lit(Value::Int(v))),
+            Some(Tok::Float(v)) => Ok(Expr::Lit(Value::Float(v))),
+            Some(Tok::Str(s)) => Ok(Expr::Lit(Value::Text(s))),
+            Some(Tok::Blob(b)) => Ok(Expr::Lit(Value::Blob(b))),
+            Some(Tok::Kw(Kw::True)) => Ok(Expr::Lit(Value::Bool(true))),
+            Some(Tok::Kw(Kw::False)) => Ok(Expr::Lit(Value::Bool(false))),
+            Some(Tok::Kw(Kw::Null)) => Ok(Expr::Lit(Value::Null)),
+            Some(Tok::DollarParam(i)) => {
+                self.param_style(ParamStyle::Dollar, pos)?;
+                self.max_params = self.max_params.max(i as u32 + 1);
+                Ok(Expr::Param(i))
+            }
+            Some(Tok::Question) => {
+                self.param_style(ParamStyle::Question, pos)?;
+                let i = self.next_question;
+                // Reject the 65536th `?` (index 65535): max_params must stay
+                // <= 65535 so it round-trips through the u16 plan encoding —
+                // the same limit the tokenizer enforces for `$n`.
+                if i >= u16::MAX as u32 {
+                    return Err(Error::Parse {
+                        pos,
+                        msg: "too many `?` parameters (max 65535)".into(),
+                    });
+                }
+                self.next_question += 1;
+                self.max_params = self.max_params.max(i + 1);
+                Ok(Expr::Param(i as u16))
+            }
+            Some(Tok::Ident(s)) => self.ident_suffix(s),
+            Some(Tok::QuotedIdent(s)) => Ok(Expr::Col(s)),
+            Some(Tok::LParen) => {
+                // `(SELECT …)` is a scalar subquery, not a parenthesized
+                // expression — the SELECT keyword right after `(` decides.
+                if matches!(self.peek(), Some(Tok::Kw(Kw::Select))) {
+                    let inner = self.select_core()?;
+                    self.expect(&Tok::RParen, "`)` after subquery")?;
+                    return Ok(Expr::Subquery(Box::new(inner)));
+                }
+                let e = self.expr()?;
+                self.expect(&Tok::RParen, "`)`")?;
+                Ok(e)
+            }
+            _ => Err(Error::Parse {
+                pos,
+                msg: "expected an expression".into(),
+            }),
+        }
+    }
+
+    fn param_style(&mut self, style: ParamStyle, pos: usize) -> Result<()> {
+        if self.style == ParamStyle::Unset {
+            self.style = style;
+        } else if self.style != style {
+            return Err(Error::Parse {
+                pos,
+                msg: "cannot mix `?` and `$n` parameters in one statement".into(),
+            });
+        }
+        Ok(())
+    }
+}
