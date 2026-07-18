@@ -111,6 +111,9 @@ pub fn prepare_maybe_explain_with_views(
     if ctes.is_empty() {
         view::inline_views(&mut stmt, views)?;
     } else {
+        // A CTE body may reference an EARLIER CTE (resolved by the flat scope);
+        // self/forward/cyclic references and duplicate names are refused here.
+        view::validate_cte_order(&ctes)?;
         let scope: view::ViewCatalog = ctes.into_iter().collect();
         view::inline_views_with_ctes(&mut stmt, views, &scope)?;
     }
