@@ -10,13 +10,13 @@ Two things make this page different from a typical compatibility list:
 
 1. **Every ✅ is measured, not remembered.** The `sqlite_corpus` runner
    (`crates/mpedb-testkit`) executes sqlite's own sqllogictest corpus
-   differentially against sqlite3. Over the **full 7.4M-record corpus, 98.6% of
+   differentially against sqlite3. Over the **full 7.4M-record corpus, 99.7% of
    attempted statements pass, with zero error mismatches and zero genuine wrong
    answers** (the 8 flagged divergences are cascades from a preceding
    unsupported statement, not answer bugs). Put the other way: of everything
-   mpedb *accepts*, essentially 100% matches sqlite. The ~1.4% that does not
-   pass is deliberate refusals — the largest by far being `CREATE VIEW`, then
-   compound-select and subquery forms.
+   mpedb *accepts*, essentially 100% matches sqlite. The ~0.3% that does not
+   pass is deliberate refusals — chiefly some subquery forms, `SELECT x IN
+   <table>`, and MySQL-only casts (`AS SIGNED`/`AS DECIMAL`).
 2. **Every ❌ is an error message, never a silent wrong answer.** SQL that
    mpedb does not support is refused at compile time, usually with the manual
    fix in the message. The narrowness is the design; what compiles, matches.
