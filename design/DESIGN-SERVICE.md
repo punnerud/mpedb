@@ -26,6 +26,13 @@ on infrastructure that already solves wake/route/hibernate; mpedb implements non
   attaches, claims + runs due tasks, and exits. Nothing resident between fires. Any process edits the
   table; a tiny reconcile (itself timer-driven, or rung by the edit) rewrites the OS units — DB is
   the source of truth, the OS scheduler is just the executor.
+  - Exact-time projection is the *tidy* form; a plain frequent `* * * * * mpedb run-due` also works
+    fine and is safe by construction — the "is anything due?" check is a **lock-free MVCC read** (N
+    idle pollers create zero writer contention; only an actual claim takes the writer lock), attach
+    is sub-millisecond, overlapping invocations claim disjoint tasks atomically (§2), and reader-table
+    liveness reaps dead claims while leaving a live long-running task's claim alone (so a run that
+    outlasts the next tick never double-fires). We project to exact times only to skip the tiny
+    "woke, nothing to do" wake — never for correctness or for overhead.
 - *On-demand API*: **nginx** routes to mpedb via **systemd socket-activation** or **FastCGI**
   (`fastcgi_pass`). The socket exists; the first request spawns a short-lived mpedb responder that
   serves and exits after idle. That *is* "expose an API that wakes on request and goes back to
@@ -39,18 +46,21 @@ on infrastructure that already solves wake/route/hibernate; mpedb implements non
   attaching one file is exactly mpedb's design point (writer-lock + MVCC) — safe by construction, no
   new race.
 
-**Model B — resident daemon `mpedb serve <db>` (optional; a throughput optimization).** When request
-rates are high enough that per-invocation attach/teardown dominates, a long-lived process amortizes
-the attach and adds an in-process **doorbell** — a futex/eventfd-style counter in the shm lock area
-(pages 2–3, CLAUDE.md) another process bumps on enqueue — for sub-tick enqueue→run latency without a
-round-trip through nginx. It blocks on the earliest of an inbound request, the next due task, or the
+**Model B — resident daemon `mpedb serve <db>` (optional; a latency optimization).** Attach is cheap
+by design (mmap + flock + meta read, no server handshake) and the due-check is a lock-free read, so
+frequent cron/spawn is fine on its own — the daemon earns its keep only when you need **sub-tick
+latency** (cron's floor is ~1 min): a long-lived process holds the attach warm and adds an in-process
+**doorbell** — a futex/eventfd-style counter in the shm lock area (pages 2–3, CLAUDE.md) another
+process bumps on enqueue — so an enqueue runs within milliseconds without a round-trip through nginx. It blocks on the earliest of an inbound request, the next due task, or the
 doorbell; multi-process identity reuses the existing {pid,seq}+start-time + boot-id recovery
 (`post_attach`). Same tables, same semantics — it just holds the attach warm and skips cold starts.
 **Correctness never depends on it**: everything it does is a normal transactional mutation any
 process could do; kill it and Model A still runs.
 
-**Choosing**: spiky / low / scheduled traffic (the "dvale" case) → A, no daemon at all. Sustained
-high throughput or sub-second enqueue latency → B. They compose — A for cron, B for the hot API path.
+**Choosing**: almost everything → A (no daemon) — frequent cron/spawn is cheap (sub-ms attach) and
+safe (lock-free due-check, atomic claim, liveness reaping). Reach for B *only* when you need sub-tick
+enqueue→run latency, below cron's ~1-min floor. They compose — A for scheduled work, B for a hot
+low-latency API path.
 The API request protocol (`submit`/`enqueue`/`query`/`wake`) is identical whether it arrives over
 FastCGI (A) or the daemon's socket (B); HTTP is a thin adapter either way.
 
