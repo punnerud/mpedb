@@ -210,3 +210,49 @@ two very different difficulty levels:
 This is standard lease-based HA (Cloudflare Durable Objects, Vitess, etcd-backed systems), localized
 by sharding — Phase 7+, and the fencing/lease protocol gets commit-path-class review (split-brain,
 partition, clock-skew on lease expiry) before any line ships.
+
+## 8. MPEE-driven adaptive sharding (the shard scheme itself as a cost-optimization)
+
+§6 took "shard per user" as given. But the shard *scheme* can be **MPEE's output, not a human guess**
+— MPEE is already a cost-matrix/routing engine (#12), and partitioning is the same problem: minimize
+cross-region cost, balance load. This is **workload-driven partitioning**, and it has a canonical
+form: **Schism** (Curino et al., VLDB 2010) builds a graph of tuples-accessed-together and min-cuts it
+to minimize distributed transactions. MPEE = that engine, with two mpedb advantages.
+
+**Input — the app's model (e.g. Django).** Django ORM metadata is machine-readable: the FK graph
+(`Model._meta`) plus the query log for access patterns. MPEE ingests:
+- the **FK / relationship graph** — which rows are related (co-access candidates),
+- **access patterns** — what is joined/queried together and how often (edge weights),
+- mpedb's **exact catalog `row_count`s** — volume per partition candidate, **exact, not sampled** as
+  Schism must (the precompute advantage — the same exact counts #74's risk estimate uses).
+
+**Output — the shard scheme:**
+- the **shard key**: in a multi-tenant app the `user` FK is usually the natural min-cut (each user's
+  data is a weakly-connected component, so "per user" *falls out of the graph automatically*), but
+  MPEE **detects when it is not** (many-to-many spanning users → a different key or denormalization);
+- a **table classification** — sharded (per key) vs. **replicated-everywhere** (small global/reference
+  tables) vs. needs-its-own-key. Getting this wrong is what fills a system with cross-shard joins; it
+  is the core decision;
+- the **cut** minimizing cross-shard edges subject to balanced shard sizes — the "one exit collapses
+  the region" heuristic, literally: a user's data subtree connects to the rest through few edges, so
+  that boundary is the shard cut.
+
+**Dynamic / adaptive.** At **model-upload / prepare time** MPEE proposes the scheme from the model +
+current counts (like its prepare-time risk estimate); at **runtime** it re-evaluates as data grows and
+access shifts and proposes **incremental** re-balancing — split a hot shard, merge cold ones, move a
+user — feeding §6's rebalance (ship the shard `.mpedb` + flip the directory) and §7's failover. This
+is Clay / E-Store adaptive re-partitioning, cost-weighed against the migration cost (never re-shard
+when the move costs more than the skew it fixes).
+
+**Honest limits.**
+- Not everything shards cleanly: genuine cross-user many-to-many relationships have **irreducible**
+  cross-shard transactions — MPEE *minimizes* them (min-cut), it cannot always reach zero. It must
+  **report the residual cross-shard rate** so the cost is known before committing to a scheme.
+- Re-sharding moves data; the optimizer weighs benefit vs. migration cost (incremental, not
+  stop-the-world).
+- The scheme is a **recommendation with a cost estimate, not a silent decision** — a human confirms a
+  re-shard, exactly as #74's risk estimate warns rather than blocks.
+
+**Prior art:** Schism (workload graph min-cut), Clay / E-Store (adaptive re-partitioning), Citus /
+Vitess (but human-chosen keys — MPEE's differentiator is *discovering* the key from the model + exact
+counts). Phase 7+, on top of §6/§7; cross-links [design/DESIGN-MPEE-OPT.md](DESIGN-MPEE-OPT.md).
