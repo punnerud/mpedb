@@ -237,7 +237,36 @@ fn parse_query(
     if p.pos != p.toks.len() {
         return Err(Error::Bind("fts5: syntax error in MATCH query".into()));
     }
+    // The decoder caps the TOTAL node count at MAX_FTS_DEPTH (one budget unit per
+    // node); parsing above only bounds paren nesting, so a flat `a b c …` /
+    // `a OR b OR …` chain could bind here yet fail to decode in another process,
+    // publishing an undecodable "poison" plan to the shared registry. Enforce the
+    // same total-node cap at bind so every accepted query round-trips.
+    if fts_node_count(&q) > crate::plan::MAX_FTS_DEPTH {
+        return Err(Error::Bind(
+            "fts5: MATCH query too large (too many terms/operators)".into(),
+        ));
+    }
     Ok(q)
+}
+
+/// Total node count of an FTS query tree (leaves + operators), counted
+/// ITERATIVELY so a long left-leaning chain cannot overflow the stack. Matches
+/// the decoder's per-node `budget`, so a bind-accepted query is decode-accepted.
+fn fts_node_count(root: &FtsQuery) -> usize {
+    let mut stack = vec![root];
+    let mut n = 0usize;
+    while let Some(q) = stack.pop() {
+        n += 1;
+        match q {
+            FtsQuery::And(a, b) | FtsQuery::Or(a, b) | FtsQuery::AndNot(a, b) => {
+                stack.push(a);
+                stack.push(b);
+            }
+            FtsQuery::Term(_) => {}
+        }
+    }
+    n
 }
 
 impl QParser<'_> {

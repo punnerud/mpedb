@@ -420,3 +420,38 @@ fn index_and_content_persist_across_reopen() {
     let _ = std::fs::remove_file(&path);
     let _ = std::fs::remove_file(format!("{path}-wal"));
 }
+
+#[test]
+fn large_match_query_is_capped_at_bind_not_poisoned() {
+    // Regression: the decoder caps total FTS query nodes; a flat OR/AND chain
+    // must be capped at BIND with the same limit, or a query prepares here yet
+    // fails to decode in another process — an undecodable "poison" plan in the
+    // shared registry. A 40-way OR (well under the cap) must execute; a query
+    // far over the cap must be a clean bind error, never a panic or a poison.
+    let d = db_with(DOCS);
+    let forty: String = (0..40).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" OR ");
+    // 'quick' matches docs 1 and 2 in DOCS; the OR chain executes cleanly.
+    let q = format!("SELECT rowid FROM ft WHERE ft MATCH '{forty} OR quick' ORDER BY rowid");
+    assert_eq!(mpedb_rows(&d, &q), vec![vec!["1".to_string()], vec!["2".to_string()]]);
+    // ~1200 nodes, far over MAX_FTS_DEPTH: a clean refusal, not a poison plan.
+    let huge: String = (0..600).map(|i| format!("w{i}")).collect::<Vec<_>>().join(" OR ");
+    let e = d.query(&format!("SELECT rowid FROM ft WHERE ft MATCH '{huge}'"), &[]).unwrap_err();
+    assert!(format!("{e}").contains("too large"), "expected 'too large', got {e}");
+}
+
+#[test]
+fn streaming_insert_into_fts_is_refused() {
+    // Regression: `insert_row_streaming` guarded only against a secondary UNIQUE
+    // index, which FTS tables lack, so a streamed insert committed a content row
+    // the inverted index never saw — silently unsearchable. Must refuse.
+    let d = db_with(&["CREATE VIRTUAL TABLE ft USING fts5(body)"]);
+    let mut tmp = std::env::temp_dir();
+    tmp.push(format!("mpedb-fts-stream-{}-{}.txt", std::process::id(), UNIQ.fetch_add(1, Ordering::Relaxed)));
+    std::fs::write(&tmp, b"streamedtoken uniquephrase").unwrap();
+    // FTS content table is (rowid, body); stream the last column (body, index 1).
+    let mut s = d.begin().unwrap();
+    let r = s.insert_file("ft", &[Value::Int(1), Value::Text(String::new())], 1, &tmp);
+    let _ = std::fs::remove_file(&tmp);
+    let e = r.expect_err("streaming insert into an FTS table must be refused");
+    assert!(format!("{e}").contains("FTS"), "expected an FTS refusal, got {e}");
+}

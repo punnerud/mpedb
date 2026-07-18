@@ -271,6 +271,17 @@ impl<'e> WriteTxn<'e> {
     ) -> Result<()> {
         self.check_write_blocked(table_id)?;
         self.eng.validate_row(table_id, values)?;
+        if self.eng.table_is_fts(table_id) {
+            // An FTS table's inverted index needs the full column text resident
+            // to tokenize; a never-resident stream cannot be indexed, so a
+            // streamed insert would commit a content row the index can't find —
+            // a silent wrong answer via a public API. Refuse. SQL INSERT routes
+            // through the typed `insert_row`, which does maintain the index.
+            return Err(Error::Unsupported(
+                "streaming insert into an FTS table (tokenization needs the full text resident)"
+                    .into(),
+            ));
+        }
         let table = self
             .bundle
             .schema
