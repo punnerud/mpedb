@@ -22,7 +22,11 @@ type PlannedStmt = (
     Vec<Option<ColumnType>>,
     Vec<SubPlan>,
 );
-use crate::binder::{compile_program, BExpr, Binder, Scope, Ty};
+use crate::binder::{compile_program, peel_collate, BExpr, Binder, Scope, Ty};
+
+/// Resolved ORDER BY keys: `(column index into the sorted tuple, descending,
+/// collation)`. The collation is [`Collation::Binary`] for a plain `ORDER BY`.
+pub(crate) type OrderKeys = Vec<(u16, bool, Collation)>;
 use crate::plan::{
     render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource,
     CompoundPlan, GroupKey, Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp,
@@ -31,7 +35,7 @@ use crate::plan::{
 #[allow(unused_imports)]
 use crate::plan::{FtsQuery, FtsTerm};
 use crate::policy::{PolicyCatalog, TablePolicies};
-use mpedb_types::{ExprProgram, ColumnType, Error, Footprint, Instr, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
+use mpedb_types::{Collation, ExprProgram, ColumnType, Error, Footprint, Instr, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
     TableDef, Value,};
 
 mod access;
@@ -834,10 +838,14 @@ fn plan_compound(
             }
         }
     };
-    let mut order_by: Vec<(u16, bool)> = Vec::with_capacity(c.order_by.len());
+    let mut order_by: Vec<(u16, bool, Collation)> = Vec::with_capacity(c.order_by.len());
     for (e, desc) in &c.order_by {
+        // Peel an explicit `COLLATE` off the term; the inner expression resolves
+        // to an output column/ordinal as before, and the collation rides the sort.
+        let (e, coll) = peel_collate(e)?;
+        let coll = coll.unwrap_or_default();
         if let Some(pos) = select::ordinal(e, arity)? {
-            order_by.push((pos, *desc));
+            order_by.push((pos, *desc, coll));
             continue;
         }
         let ast::Expr::Col(n) = e else {
@@ -849,7 +857,7 @@ fn plan_compound(
             out_name(&arms[0], j).is_some_and(|nm| nm.eq_ignore_ascii_case(n))
         });
         match pos {
-            Some(j) => order_by.push((j as u16, *desc)),
+            Some(j) => order_by.push((j as u16, *desc, coll)),
             None => {
                 return Err(bind_err(format!(
                     "ORDER BY `{n}` does not name an output column of the compound's \
@@ -1272,11 +1280,13 @@ fn max_col(e: &BExpr) -> Option<u16> {
             | BExpr::Regexp(a, _)
             | BExpr::Cast(a, _)
             | BExpr::InParam(a, _) => stack.push(a),
-            BExpr::Binary(_, a, b) | BExpr::IsDistinct(a, b, _) => {
+            BExpr::Binary(_, a, b)
+            | BExpr::IsDistinct(a, b, _)
+            | BExpr::CollateCmp(_, a, b, _) => {
                 stack.push(a);
                 stack.push(b);
             }
-            BExpr::InList(a, list) => {
+            BExpr::InList(a, list) | BExpr::InListColl(a, list, _) => {
                 stack.push(a);
                 stack.extend(list.iter());
             }

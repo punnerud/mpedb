@@ -274,8 +274,24 @@ impl<'a> Parser<'a> {
             self.exit_expr();
             e
         } else {
-            self.primary()
+            self.collate_expr()
         }
+    }
+
+    /// `<primary> [COLLATE <name>]*` — the postfix collation operator (task:
+    /// COLLATE). It sits just below unary so it binds TIGHTER than every binary
+    /// operator, matching the requirement that `x COLLATE NOCASE = y` parses as
+    /// `(x COLLATE NOCASE) = y`. Chained `COLLATE`s associate left-to-right, so
+    /// `x COLLATE A COLLATE B` is `(x COLLATE A) COLLATE B` (the outer wins, as
+    /// in sqlite). `COLLATE`/the collation names are non-reserved words, so a
+    /// column literally named `collate` still parses as an identifier here.
+    fn collate_expr(&mut self) -> Result<Expr> {
+        let mut e = self.primary()?;
+        while self.eat_word("COLLATE") {
+            let name = self.ident("collation name after COLLATE")?;
+            e = Expr::Collate(Box::new(e), name);
+        }
+        Ok(e)
     }
 
     /// `CASE [x] WHEN … THEN … [ELSE …] END`.

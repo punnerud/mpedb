@@ -14,6 +14,7 @@ pub(super) fn contains_agg(e: &ast::Expr) -> bool {
         | E::Glob(a, b, _)
         | E::Regexp(a, b, _) => contains_agg(a) || contains_agg(b),
         E::InContext(a, _, _) => contains_agg(a),
+        E::Collate(a, _) => contains_agg(a),
         E::InSubquery(a, _, _) | E::InParamSlot(a, _, _) => contains_agg(a),
         E::InList(a, xs, _) => contains_agg(a) || xs.iter().any(contains_agg),
         E::Coalesce(xs) | E::Func(_, xs) => xs.iter().any(contains_agg),
@@ -120,6 +121,10 @@ fn lift_aggs(
             *n,
         ),
         E::InContext(a, k, n) => E::InContext(Box::new(rec(a, aggs)?), k.clone(), *n),
+        // Preserve the COLLATE through the lift so the grouped ORDER BY path can
+        // peel it (`ORDER BY name COLLATE NOCASE` in a GROUP BY query). The
+        // collation itself carries no aggregate.
+        E::Collate(a, name) => E::Collate(Box::new(rec(a, aggs)?), name.clone()),
         // The IN-subquery marker: the slot side is opaque here; only the lhs
         // participates in the grouped tuple. (A raw InSubquery still present
         // means the lift refused/skipped it — pass through to the binder's
@@ -431,8 +436,13 @@ pub(super) fn plan_aggregate_select(
     }
     let mut grouped_keys = Vec::with_capacity(rewritten_order.len());
     for (e, desc) in &rewritten_order {
+        // The lift preserved any COLLATE (`ORDER BY name COLLATE NOCASE` in a
+        // GROUP BY query); peel it so the inner resolves to a grouped-tuple
+        // column and the collation rides the sort.
+        let (e, coll) = peel_collate(e)?;
+        let coll = coll.unwrap_or_default();
         match binder.bind_expr(e)? {
-            (BExpr::Col(i), _) => grouped_keys.push((i, *desc)),
+            (BExpr::Col(i), _) => grouped_keys.push((i, *desc, coll)),
             // Not a bare column of the grouped tuple. Stop: the keys must all
             // index the SAME tuple, so one computed key moves every key to the
             // projection.
@@ -445,17 +455,23 @@ pub(super) fn plan_aggregate_select(
         let mut keys = Vec::with_capacity(rewritten_order.len());
         let mut n_junk = 0u16;
         for (i, ((e, desc), (orig, _))) in rewritten_order.iter().zip(&s.order_by).enumerate() {
+            // Collation comes from the ORIGINAL key text; peel both the original
+            // (for the ordinal test) and the lifted expr (for the item match /
+            // junk column).
+            let (orig, coll) = peel_collate(orig)?;
+            let coll = coll.unwrap_or_default();
+            let (e, _) = peel_collate(e)?;
             // An ordinal or a repeat of a selected item needs no new column.
             if let Some(pos) = ordinal(orig, items.len())? {
-                keys.push((pos, *desc));
+                keys.push((pos, *desc, coll));
                 continue;
             }
             match rewritten.iter().position(|it| it == e) {
-                Some(pos) => keys.push((pos as u16, *desc)),
+                Some(pos) => keys.push((pos as u16, *desc, coll)),
                 None => {
                     let mut junk = Some((&mut projection, &mut binder));
                     let (pos, added) = push_junk(&mut junk, e, &Scope::single(&grouped), i)?;
-                    keys.push((pos, *desc));
+                    keys.push((pos, *desc, coll));
                     n_junk += added;
                 }
             }

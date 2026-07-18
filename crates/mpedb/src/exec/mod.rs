@@ -11,8 +11,8 @@ use mpedb_sql::{
     SelectPlan, SetOp, SubPlan,
 };
 use mpedb_types::{
-    keycode, Accum, DefaultExpr, Error, ExprProgram, KeyBound, KeyPart, Result, Schema, TableDef,
-    Value,
+    keycode, Accum, Collation, DefaultExpr, Error, ExprProgram, KeyBound, KeyPart, Result, Schema,
+    TableDef, Value,
 };
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -101,7 +101,7 @@ pub(crate) trait TxnCtx {
         lo: Option<(&[u8], bool)>,
         hi: Option<(&[u8], bool)>,
         filter: Option<(&ExprProgram, &[Value])>,
-        order_by: &[(u16, bool)],
+        order_by: &[(u16, bool, Collation)],
         keep: usize,
     ) -> Result<Vec<Vec<Value>>> {
         let rows = self.scan_rows_raw(table, lo, hi)?;
@@ -283,7 +283,7 @@ impl TxnCtx for ReadCtx<'_, '_> {
         lo: Option<(&[u8], bool)>,
         hi: Option<(&[u8], bool)>,
         filter: Option<(&ExprProgram, &[Value])>,
-        order_by: &[(u16, bool)],
+        order_by: &[(u16, bool, Collation)],
         keep: usize,
     ) -> Result<Vec<Vec<Value>>> {
         if keep == 0 {
@@ -341,7 +341,7 @@ impl TxnCtx for ReadCtx<'_, '_> {
 /// is the row that sorts *last*.
 struct Ranked<'a> {
     row: Vec<Value>,
-    order_by: &'a [(u16, bool)],
+    order_by: &'a [(u16, bool, Collation)],
     seq: u64,
 }
 

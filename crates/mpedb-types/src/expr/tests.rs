@@ -279,6 +279,79 @@ fn regexp_program_null_and_type_rules() {
 }
 
 #[test]
+fn collated_compare_and_in_semantics_and_codec() {
+    use crate::value::Collation;
+    // `col0 = 'abc' COLLATE NOCASE` — ASCII-case-insensitive equality.
+    let p = prog(
+        vec![
+            Instr::PushCol(0),
+            Instr::PushConst(0),
+            Instr::CmpColl(CmpKind::Eq, Collation::NoCase),
+        ],
+        vec![Value::Text("abc".into())],
+    );
+    assert_eq!(p.eval(&[Value::Text("ABC".into())], &[]).unwrap(), Value::Bool(true));
+    assert_eq!(p.eval(&[Value::Text("abc".into())], &[]).unwrap(), Value::Bool(true));
+    assert_eq!(p.eval(&[Value::Text("abd".into())], &[]).unwrap(), Value::Bool(false));
+    // NULL propagates, exactly like the plain comparison.
+    assert_eq!(p.eval(&[Value::Null], &[]).unwrap(), Value::Null);
+    // Unicode is NOT folded: 'É' != 'é' under NOCASE.
+    let up = prog(
+        vec![
+            Instr::PushCol(0),
+            Instr::PushConst(0),
+            Instr::CmpColl(CmpKind::Eq, Collation::NoCase),
+        ],
+        vec![Value::Text("É".into())],
+    );
+    assert_eq!(up.eval(&[Value::Text("é".into())], &[]).unwrap(), Value::Bool(false));
+
+    // RTRIM ignores trailing spaces.
+    let rt = prog(
+        vec![
+            Instr::PushCol(0),
+            Instr::PushConst(0),
+            Instr::CmpColl(CmpKind::Eq, Collation::Rtrim),
+        ],
+        vec![Value::Text("abc".into())],
+    );
+    assert_eq!(rt.eval(&[Value::Text("abc   ".into())], &[]).unwrap(), Value::Bool(true));
+
+    // `col0 COLLATE NOCASE IN ('X', 'y')`.
+    let inl = prog(
+        vec![
+            Instr::PushCol(0),
+            Instr::PushConst(0),
+            Instr::PushConst(1),
+            Instr::InListColl(2, Collation::NoCase),
+        ],
+        vec![Value::Text("X".into()), Value::Text("y".into())],
+    );
+    assert_eq!(inl.eval(&[Value::Text("x".into())], &[]).unwrap(), Value::Bool(true));
+    assert_eq!(inl.eval(&[Value::Text("Y".into())], &[]).unwrap(), Value::Bool(true));
+    assert_eq!(inl.eval(&[Value::Text("z".into())], &[]).unwrap(), Value::Bool(false));
+
+    // codec: roundtrip + truncation safety on both new opcodes.
+    for prog in [&p, &rt, &inl] {
+        let mut buf = Vec::new();
+        prog.encode_into(&mut buf);
+        let mut pos = 0;
+        assert_eq!(&ExprProgram::decode(&buf, &mut pos).unwrap(), prog);
+        assert_eq!(pos, buf.len());
+        for cut in 0..buf.len() {
+            let _ = ExprProgram::decode(&buf[..cut], &mut 0); // must not panic
+        }
+    }
+    // A bad collation tag byte in the CmpColl encoding is Corrupt, not a panic.
+    let mut buf = Vec::new();
+    p.encode_into(&mut buf);
+    let bad = *buf.last().unwrap(); // the collation byte is last
+    assert_eq!(bad, Collation::NoCase as u8);
+    *buf.last_mut().unwrap() = 0x7f;
+    assert!(matches!(ExprProgram::decode(&buf, &mut 0), Err(Error::Corrupt(_))));
+}
+
+#[test]
 fn rejects_malformed_programs() {
     assert!(ExprProgram::new(vec![Instr::Eq], vec![]).is_err()); // underflow
     assert!(ExprProgram::new(vec![], vec![]).is_err()); // empty
