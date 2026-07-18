@@ -267,6 +267,7 @@ impl<'a> Parser<'a> {
                         kind: JoinKind::Inner,
                         on: Expr::Lit(Value::Bool(true)),
                         using: Vec::new(),
+                        natural: false,
                     });
                 } else if self.eat_kw(Kw::Inner) {
                     self.expect_kw(Kw::Join, "JOIN after INNER")?;
@@ -301,10 +302,14 @@ impl<'a> Parser<'a> {
                         kind: JoinKind::Inner,
                         on: Expr::Lit(Value::Bool(true)),
                         using: Vec::new(),
+                        natural: false,
                     });
+                } else if matches!(self.peek_join_kind(), Some("NATURAL")) {
+                    joins.push(self.natural_join()?);
                 } else if let Some(kind) = self.peek_join_kind() {
-                    // Only NATURAL is left unsupported: its join condition is
-                    // implicit in column NAMES, which rigid schemas make a trap.
+                    // A stray side word (a bare `OUTER JOIN`, or a join kind we
+                    // do not accept in this position): the ON condition it would
+                    // need is not here, so refuse rather than guess.
                     return Err(self.err_here(format!(
                         "{kind} JOIN is not supported — write the ON condition explicitly",
                     )));
@@ -466,10 +471,11 @@ impl<'a> Parser<'a> {
         let alias = self.opt_table_alias()?;
         // The join condition — either `ON <cond>` or `USING (c1, …)`. `USING` is
         // a positional word (not a keyword), so a table/column named `using` is
-        // unaffected; NATURAL (implicit USING over all common columns) stays
-        // refused in the caller. The desugaring to `left.ci = right.ci AND …`
-        // and the `SELECT *` coalescing happen at plan time (the LEFT qualifier
-        // needs the schema) — here we only capture the columns.
+        // unaffected; NATURAL (the implicit USING over all common columns) is
+        // parsed by `natural_join`, not here. The desugaring to
+        // `left.ci = right.ci AND …` and the `SELECT *` coalescing happen at plan
+        // time (the LEFT qualifier needs the schema) — here we only capture the
+        // columns.
         if self.eat_word("USING") {
             // RIGHT/FULL USING would have to carry the coalesced column through
             // the side-swap (RIGHT→LEFT) and both-sides-whole (FULL) rewrites;
@@ -487,6 +493,7 @@ impl<'a> Parser<'a> {
                 kind,
                 on: Expr::Lit(Value::Bool(true)),
                 using,
+                natural: false,
             });
         }
         // ON is otherwise required. A comma-join / cross join is a cartesian
@@ -494,7 +501,46 @@ impl<'a> Parser<'a> {
         // times they forgot the condition.
         self.expect_kw(Kw::On, "ON after JOIN — the join condition is required (or USING (…))")?;
         let on = self.expr()?;
-        Ok(JoinClause { table, alias, kind, on, using: Vec::new() })
+        Ok(JoinClause { table, alias, kind, on, using: Vec::new(), natural: false })
+    }
+
+    /// `NATURAL [INNER | LEFT [OUTER]] JOIN <table> [alias]` — the join condition
+    /// is IMPLICIT: an equality over every column common to the two sides. That
+    /// set is a fact about the schema, which a rigid schema makes static, but it
+    /// is not known here — so we carry only `natural` and leave `using` empty for
+    /// the planner to fill before its USING→ON desugar (`join.rs`). RIGHT / FULL /
+    /// CROSS are refused for the SAME reason `JOIN … USING` refuses them: the
+    /// coalesced column cannot survive the side-swap / both-sides-whole rewrites.
+    fn natural_join(&mut self) -> Result<JoinClause> {
+        self.pos += 1; // consume NATURAL
+        let kind = if self.eat_kw(Kw::Inner) {
+            JoinKind::Inner
+        } else if self.eat_word("LEFT") {
+            let _ = self.eat_word("OUTER");
+            JoinKind::Left
+        } else if self.eat_word("RIGHT")
+            || self.eat_word("FULL")
+            || matches!(self.peek_join_kind(), Some("CROSS"))
+        {
+            return Err(self.err_here(
+                "NATURAL is only supported on [INNER] JOIN and NATURAL LEFT JOIN — \
+                 write the ON / USING condition explicitly for RIGHT/FULL/CROSS joins",
+            ));
+        } else {
+            // Bare `NATURAL JOIN` is an inner join.
+            JoinKind::Inner
+        };
+        self.expect_kw(Kw::Join, "JOIN after NATURAL")?;
+        let table = self.ident("table name after NATURAL JOIN")?;
+        let alias = self.opt_table_alias()?;
+        Ok(JoinClause {
+            table,
+            alias,
+            kind,
+            on: Expr::Lit(Value::Bool(true)),
+            using: Vec::new(),
+            natural: true,
+        })
     }
 
     /// `(c1, c2, …)` — the non-empty column list of a `JOIN … USING`. Bare or
