@@ -256,3 +256,42 @@ when the move costs more than the skew it fixes).
 **Prior art:** Schism (workload graph min-cut), Clay / E-Store (adaptive re-partitioning), Citus /
 Vitess (but human-chosen keys — MPEE's differentiator is *discovering* the key from the model + exact
 counts). Phase 7+, on top of §6/§7; cross-links [design/DESIGN-MPEE-OPT.md](DESIGN-MPEE-OPT.md).
+
+## 9. Shard feedback as an AI optimization signal (the model-design loop)
+
+§8 makes MPEE compute a shard scheme; the *feedback* it produces is useful on its own — as a
+**deterministic, attributed shardability oracle** an AI/LLM loop can hill-climb. People increasingly
+author models (Django schemas, relationships) with LLM help, so MPEE closes the loop:
+
+1. the AI proposes a model → 2. MPEE returns structured feedback (below) → 3. the AI revises →
+4. repeat → a model that shards well *by construction*.
+
+MPEE is the **cost oracle / reward function**; the LLM is the search. What makes mpedb a good oracle
+is the determinism thread again: the feedback is **deterministic** (same model + same counts → same
+score, no sampling noise — an AI loop converges only against a *stable* objective; a noisy one it
+could never hill-climb cleanly), **exact** (real catalog `row_count`s, not sampled stats), and
+computed at **prepare time** (no shards materialized, so the AI evaluates many candidate models
+cheaply).
+
+**The feedback signal** (structured, so an LLM consumes it well):
+- a scalar **shardability score** — estimated cross-shard transaction rate under the workload, shard-
+  size skew, count of tables with no clean shard key, hot-shard risk (so the AI knows if it improved);
+- **attributed hotspots** — *which* relationship/table causes the cost ("the `orders`↔`tags` M2M
+  forces cross-shard joins"; "the `user`→`org`→`user` cycle blocks a clean per-user cut") —
+  attribution like #74's error and §8's dominant node, so the feedback names the culprit, not just a
+  number;
+- **concrete rewrites** the AI can apply — "denormalize `tag_name` into `order_tags`", "make `country`
+  a replicated reference table", "add a denormalized `tenant_id` to `line_items` to co-locate it".
+
+**Honest limits.**
+- The objective is **workload-dependent**: the best feedback needs representative access patterns, not
+  just the schema. Schema-only feedback is structural (FK-graph min-cut); workload-aware feedback needs
+  the queries (a declared hot-path set or a real query log) — the signal should say which it had.
+- The suggestions optimize *one* objective (distribution): "denormalize X" helps shardability but costs
+  normalization / write-amplification / consistency — presented as a **tradeoff** weighed against the
+  other objectives, never a mandate.
+- Advisory, like §8: a recommendation with a cost estimate; the human/AI confirms. MPEE informs the
+  loop, it does not silently reshape the schema.
+
+This is "LLM + deterministic verifier" applied to distributed schema design — the verifier is MPEE,
+and the determinism is what makes the loop converge. Phase 7+, on top of §8.
