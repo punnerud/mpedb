@@ -39,6 +39,52 @@ pub enum ScalarFn {
     /// null-propagate: `typeof(NULL)` is the text `'null'`, so it is handled
     /// ahead of the null gate in [`call_scalar`].
     Typeof = 20,
+    // --- Math functions (sqlite 3.45 built-ins). Each takes number(s) and
+    // returns a Float64 (int in → float out), NULL-propagating like the rest,
+    // and models its sound domain on sqlite: an out-of-domain result is NULL.
+    /// `exp(x)` — e raised to `x`.
+    Exp = 21,
+    /// `ln(x)` — natural logarithm; NULL for `x <= 0` (sqlite).
+    Ln = 22,
+    /// `log10(x)` / `log(x)` — base-10 logarithm; NULL for `x <= 0` (sqlite).
+    Log10 = 23,
+    /// `log2(x)` — base-2 logarithm; NULL for `x <= 0` (sqlite).
+    Log2 = 24,
+    /// `log(b, x)` — logarithm of `x` in base `b`. NULL unless `b > 1` and
+    /// `x > 0` (sqlite requires ln(b) > 0, i.e. b > 1).
+    LogBase = 25,
+    /// `sin(x)` — sine (radians).
+    Sin = 26,
+    /// `cos(x)` — cosine (radians).
+    Cos = 27,
+    /// `tan(x)` — tangent (radians).
+    Tan = 28,
+    /// `asin(x)` — arcsine; NULL outside `[-1, 1]` (domain error → NaN → NULL).
+    Asin = 29,
+    /// `acos(x)` — arccosine; NULL outside `[-1, 1]`.
+    Acos = 30,
+    /// `atan(x)` — arctangent.
+    Atan = 31,
+    /// `atan2(y, x)` — angle of the point `(x, y)` from the positive x-axis.
+    Atan2 = 32,
+    /// `sinh(x)` — hyperbolic sine.
+    Sinh = 33,
+    /// `cosh(x)` — hyperbolic cosine.
+    Cosh = 34,
+    /// `tanh(x)` — hyperbolic tangent.
+    Tanh = 35,
+    /// `radians(x)` — degrees → radians.
+    Radians = 36,
+    /// `degrees(x)` — radians → degrees.
+    Degrees = 37,
+    /// `pi()` — the constant π. The one 0-argument scalar.
+    Pi = 38,
+    /// `mod(x, y)` — floating-point remainder `x - y*trunc(x/y)` (sqlite); a
+    /// zero divisor yields NULL (NaN → NULL), NOT the `%` operator's error.
+    Mod = 39,
+    /// `trunc(x)` — truncate toward zero. Type-PRESERVING like `ceil`/`floor`
+    /// (sqlite: an integer stays an integer, a float truncates to a float).
+    Trunc = 40,
 }
 
 impl ScalarFn {
@@ -64,6 +110,26 @@ impl ScalarFn {
             18 => ScalarFn::Unicode,
             19 => ScalarFn::Hex,
             20 => ScalarFn::Typeof,
+            21 => ScalarFn::Exp,
+            22 => ScalarFn::Ln,
+            23 => ScalarFn::Log10,
+            24 => ScalarFn::Log2,
+            25 => ScalarFn::LogBase,
+            26 => ScalarFn::Sin,
+            27 => ScalarFn::Cos,
+            28 => ScalarFn::Tan,
+            29 => ScalarFn::Asin,
+            30 => ScalarFn::Acos,
+            31 => ScalarFn::Atan,
+            32 => ScalarFn::Atan2,
+            33 => ScalarFn::Sinh,
+            34 => ScalarFn::Cosh,
+            35 => ScalarFn::Tanh,
+            36 => ScalarFn::Radians,
+            37 => ScalarFn::Degrees,
+            38 => ScalarFn::Pi,
+            39 => ScalarFn::Mod,
+            40 => ScalarFn::Trunc,
             other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
         })
     }
@@ -83,6 +149,17 @@ impl ScalarFn {
             ScalarFn::Replace => argc == 3,
             // char() is variadic: 0..=255 code points (the u8 argc caps it).
             ScalarFn::Char => true,
+            // Math: one-argument transcendentals and trunc.
+            ScalarFn::Exp | ScalarFn::Ln | ScalarFn::Log10 | ScalarFn::Log2
+            | ScalarFn::Sin | ScalarFn::Cos | ScalarFn::Tan | ScalarFn::Asin
+            | ScalarFn::Acos | ScalarFn::Atan | ScalarFn::Sinh | ScalarFn::Cosh
+            | ScalarFn::Tanh | ScalarFn::Radians | ScalarFn::Degrees | ScalarFn::Trunc => {
+                argc == 1
+            }
+            // Math: two-argument.
+            ScalarFn::LogBase | ScalarFn::Atan2 | ScalarFn::Mod => argc == 2,
+            // `pi()` is the one nullary scalar.
+            ScalarFn::Pi => argc == 0,
         }
     }
 
@@ -108,6 +185,26 @@ impl ScalarFn {
             ScalarFn::Unicode => "unicode",
             ScalarFn::Hex => "hex",
             ScalarFn::Typeof => "typeof",
+            ScalarFn::Exp => "exp",
+            ScalarFn::Ln => "ln",
+            ScalarFn::Log10 => "log10",
+            ScalarFn::Log2 => "log2",
+            ScalarFn::LogBase => "log",
+            ScalarFn::Sin => "sin",
+            ScalarFn::Cos => "cos",
+            ScalarFn::Tan => "tan",
+            ScalarFn::Asin => "asin",
+            ScalarFn::Acos => "acos",
+            ScalarFn::Atan => "atan",
+            ScalarFn::Atan2 => "atan2",
+            ScalarFn::Sinh => "sinh",
+            ScalarFn::Cosh => "cosh",
+            ScalarFn::Tanh => "tanh",
+            ScalarFn::Radians => "radians",
+            ScalarFn::Degrees => "degrees",
+            ScalarFn::Pi => "pi",
+            ScalarFn::Mod => "mod",
+            ScalarFn::Trunc => "trunc",
         }
     }
 }
@@ -161,8 +258,14 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
         }
     };
     // A math result that is NaN (e.g. sqrt of a negative) is SQL NULL, matching
-    // sqlite — never a NaN handed back into a typed column.
+    // sqlite — never a NaN handed back into a typed column. An infinity is KEPT
+    // (sqlite returns `Inf` for `exp(1000)`), so only NaN maps to NULL here.
     let float_or_null = |r: f64| if r.is_nan() { Value::Null } else { Value::Float(r) };
+    // The logarithms are NULL for a non-positive argument: sqlite explicitly
+    // checks `x <= 0` and returns NULL rather than the C library's `-inf`/NaN.
+    // For `x > 0` the result is finite, so no extra guard is needed after.
+    let log_or_null =
+        |x: f64, f: fn(f64) -> f64| if x > 0.0 { Value::Float(f(x)) } else { Value::Null };
     Ok(match f {
         ScalarFn::Lower => Value::Text(text(&args[0])?.to_lowercase()),
         ScalarFn::Upper => Value::Text(text(&args[0])?.to_uppercase()),
@@ -303,14 +406,15 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
                 )))
             }
         },
-        // ceil/floor preserve the argument's type (sqlite: an integer stays an
-        // integer at any value; a float rounds toward +/-inf as a float).
-        ScalarFn::Ceil | ScalarFn::Floor => match &args[0] {
+        // ceil/floor/trunc preserve the argument's type (sqlite: an integer
+        // stays an integer at any value; a float rounds toward +/-inf, or
+        // toward zero for trunc, as a float).
+        ScalarFn::Ceil | ScalarFn::Floor | ScalarFn::Trunc => match &args[0] {
             Value::Int(i) => Value::Int(*i),
-            Value::Float(x) => Value::Float(if matches!(f, ScalarFn::Ceil) {
-                x.ceil()
-            } else {
-                x.floor()
+            Value::Float(x) => Value::Float(match f {
+                ScalarFn::Ceil => x.ceil(),
+                ScalarFn::Floor => x.floor(),
+                _ => x.trunc(),
             }),
             other => {
                 return Err(Error::TypeMismatch(format!(
@@ -368,6 +472,43 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
             }
             Value::Text(out)
         }
+        // --- Math functions. Every one takes number(s) and returns a float.
+        // exp/sinh/cosh may overflow to +/-inf, which is KEPT (sqlite returns
+        // `Inf`); only a NaN (e.g. asin out of [-1,1]) becomes NULL.
+        ScalarFn::Exp => float_or_null(num(&args[0])?.exp()),
+        // ln/log10/log2: NULL for a non-positive argument (sqlite).
+        ScalarFn::Ln => log_or_null(num(&args[0])?, f64::ln),
+        ScalarFn::Log10 => log_or_null(num(&args[0])?, f64::log10),
+        ScalarFn::Log2 => log_or_null(num(&args[0])?, f64::log2),
+        // log(b, x): sqlite requires the base b > 1 (it checks ln(b) > 0) and
+        // x > 0, else NULL. The result is ln(x)/ln(b) = `x.log(b)`, finite there.
+        ScalarFn::LogBase => {
+            let b = num(&args[0])?;
+            let x = num(&args[1])?;
+            if b > 1.0 && x > 0.0 {
+                Value::Float(x.log(b))
+            } else {
+                Value::Null
+            }
+        }
+        ScalarFn::Sin => float_or_null(num(&args[0])?.sin()),
+        ScalarFn::Cos => float_or_null(num(&args[0])?.cos()),
+        ScalarFn::Tan => float_or_null(num(&args[0])?.tan()),
+        ScalarFn::Asin => float_or_null(num(&args[0])?.asin()),
+        ScalarFn::Acos => float_or_null(num(&args[0])?.acos()),
+        ScalarFn::Atan => float_or_null(num(&args[0])?.atan()),
+        // atan2(y, x): note the argument order — y first, like sqlite and C.
+        ScalarFn::Atan2 => float_or_null(num(&args[0])?.atan2(num(&args[1])?)),
+        ScalarFn::Sinh => float_or_null(num(&args[0])?.sinh()),
+        ScalarFn::Cosh => float_or_null(num(&args[0])?.cosh()),
+        ScalarFn::Tanh => float_or_null(num(&args[0])?.tanh()),
+        ScalarFn::Radians => float_or_null(num(&args[0])?.to_radians()),
+        ScalarFn::Degrees => float_or_null(num(&args[0])?.to_degrees()),
+        ScalarFn::Pi => Value::Float(std::f64::consts::PI),
+        // mod(x, y) = x - y*trunc(x/y), which is exactly Rust's `%` on floats
+        // (C fmod). A zero divisor gives NaN → NULL (sqlite), NOT the `%`
+        // operator's DivisionByZero error.
+        ScalarFn::Mod => float_or_null(num(&args[0])? % num(&args[1])?),
         // Handled ahead of the null gate above; unreachable here.
         ScalarFn::Typeof => unreachable!("typeof is dispatched before the null gate"),
     })
