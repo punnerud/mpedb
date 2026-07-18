@@ -18,6 +18,7 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
 mod aggregate;
+mod fts;
 mod gather;
 mod window;
 
@@ -121,6 +122,17 @@ pub(crate) trait TxnCtx {
     fn insert_row(&mut self, table: u32, values: &[Value]) -> Result<()>;
     fn update_by_pk(&mut self, table: u32, new_values: &[Value]) -> Result<bool>;
     fn delete_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<bool>;
+    /// Every posting entry whose key starts with `prefix`, as `(key, doclist)`
+    /// pairs in key order — the FTS set-algebra primitive (design/DESIGN-FTS.md
+    /// §4). Charges the #74 work meter per entry visited. The default errors:
+    /// only the native engine contexts (`WriteTxn`, `ReadCtx`) serve FTS; the
+    /// sqlite-backed contexts have no inverted index.
+    fn fts_prefix(&mut self, table: u32, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let _ = (table, prefix);
+        Err(mpedb_types::Error::Unsupported(
+            "full-text search is not available in this context".into(),
+        ))
+    }
     /// Charge `n` work-rows against this execution's deterministic budget (#74)
     /// and surface [`Error::RuntimeBudget`] once it is exceeded. Routes to the
     /// SAME [`mpedb_core::WorkMeter`] the engine's scans charge, so the
@@ -183,6 +195,9 @@ impl TxnCtx for WriteTxn<'_> {
     }
     fn delete_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<bool> {
         WriteTxn::delete_by_pk(self, table, pk)
+    }
+    fn fts_prefix(&mut self, table: u32, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        WriteTxn::fts_prefix(self, table, prefix)
     }
     fn charge_work(&self, n: u64, which: &dyn Fn() -> String) -> Result<()> {
         WriteTxn::charge_work(self, n, which)
@@ -311,6 +326,9 @@ impl TxnCtx for ReadCtx<'_, '_> {
     }
     fn delete_by_pk(&mut self, _table: u32, _pk: &[Value]) -> Result<bool> {
         Err(read_txn_write_bug())
+    }
+    fn fts_prefix(&mut self, table: u32, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.0.fts_prefix(table, prefix)
     }
     fn charge_work(&self, n: u64, which: &dyn Fn() -> String) -> Result<()> {
         self.0.charge_work(n, which)

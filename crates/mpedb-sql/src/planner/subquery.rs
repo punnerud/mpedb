@@ -47,6 +47,7 @@ fn expr_has_subquery(e: &ast::Expr) -> bool {
         E::Unary(_, a) | E::IsNull(a, _) | E::Cast(a, _) => expr_has_subquery(a),
         E::Binary(_, a, b)
         | E::Like(a, b)
+        | E::Match(a, b)
         | E::IsDistinct(a, b, _)
         | E::Glob(a, b, _)
         | E::Regexp(a, b, _) => expr_has_subquery(a) || expr_has_subquery(b),
@@ -213,6 +214,7 @@ impl Lift<'_> {
                 Box::new(self.rewrite(b)?),
             ),
             E::Like(a, b) => E::Like(Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?)),
+            E::Match(a, b) => E::Match(Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?)),
             E::IsDistinct(a, b, n) => E::IsDistinct(
                 Box::new(self.rewrite(a)?),
                 Box::new(self.rewrite(b)?),
@@ -584,6 +586,7 @@ impl<'a> Correlate<'a, '_> {
                 Box::new(self.rewrite(b)?),
             ),
             E::Like(a, b) => E::Like(Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?)),
+            E::Match(a, b) => E::Match(Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?)),
             E::IsDistinct(a, b, n) => E::IsDistinct(
                 Box::new(self.rewrite(a)?),
                 Box::new(self.rewrite(b)?),

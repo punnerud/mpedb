@@ -209,6 +209,7 @@ impl Database {
             primary_key,
             indexes,
             dead: false,
+            kind: mpedb_types::TableKind::Standard,
         };
         let mut w = self.engine.begin_write()?;
         match w.create_table(def) {
@@ -224,6 +225,76 @@ impl Database {
         // a transient reload failure must NOT report the durable CREATE as
         // failed — the next statement's `refresh_schema_if_stale` (in
         // `compile_maybe_explain`) self-heals the bundle (review finding).
+        self.cache.write().expect(POISON).clear();
+        let _ = self.engine.reload_schema_from_catalog();
+        Ok(ExecResult::Affected(0))
+    }
+
+    /// `CREATE VIRTUAL TABLE … USING fts5(cols [, tokenize=…])` (design/DESIGN-FTS.md
+    /// §1). Builds a `TableKind::Fts` table — an auto `rowid` INTEGER primary key
+    /// plus the declared columns as tokenized TEXT content — and appends it to
+    /// the schema in one catalog commit, exactly like `CREATE TABLE`. The engine
+    /// seeds the extra inverted-index tree; row-level maintenance keeps it live.
+    pub(crate) fn apply_create_virtual_table(
+        &self,
+        spec: mpedb_sql::CreateVirtualTableSpec,
+    ) -> Result<ExecResult> {
+        let mkcol = |name: &str, ty, nullable| mpedb_types::ColumnDef {
+            name: name.to_string(),
+            ty,
+            nullable,
+            unique: false,
+            indexed: false,
+            default: None,
+            check: None,
+        };
+        // `rowid` and `rank` are reserved fts5 column names; a declared column
+        // named for the table would shadow the whole-row `MATCH` operand.
+        for c in &spec.columns {
+            let lc = c.to_ascii_lowercase();
+            if lc == "rowid" || lc == "rank" {
+                return Err(Error::Bind(format!(
+                    "`{c}` is a reserved fts5 column name"
+                )));
+            }
+            if c.eq_ignore_ascii_case(&spec.name) {
+                return Err(Error::Bind(format!(
+                    "an fts5 column may not share the table name `{}`",
+                    spec.name
+                )));
+            }
+        }
+        let mut columns = vec![mkcol("rowid", mpedb_types::ColumnType::Int64, false)];
+        for c in &spec.columns {
+            columns.push(mkcol(c, mpedb_types::ColumnType::Text, true));
+        }
+        let def = mpedb_types::TableDef {
+            id: 0,
+            name: spec.name.clone(),
+            columns,
+            primary_key: vec![0],
+            indexes: Vec::new(),
+            dead: false,
+            kind: mpedb_types::TableKind::Fts { tokenizer: spec.tokenizer },
+        };
+        self.engine.refresh_schema_if_stale()?;
+        if self.engine.schema().schema.table_id(&spec.name).is_some() {
+            if spec.if_not_exists {
+                return Ok(ExecResult::Affected(0));
+            }
+            return Err(Error::Bind(format!(
+                "CREATE VIRTUAL TABLE: `{}` already exists",
+                spec.name
+            )));
+        }
+        let mut w = self.engine.begin_write()?;
+        match w.create_table(def) {
+            Ok(_tid) => w.commit()?,
+            Err(e) => {
+                w.abort();
+                return Err(e);
+            }
+        }
         self.cache.write().expect(POISON).clear();
         let _ = self.engine.reload_schema_from_catalog();
         Ok(ExecResult::Affected(0))
@@ -431,6 +502,9 @@ impl Database {
         match ddl {
             DdlStmt::CreateTable(spec) => {
                 return self.apply_create_table(spec);
+            }
+            DdlStmt::CreateVirtualTable(spec) => {
+                return self.apply_create_virtual_table(spec);
             }
             DdlStmt::DropTable { name, if_exists } => {
                 return self.apply_drop_table(&name, if_exists);

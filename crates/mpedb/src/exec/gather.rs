@@ -30,7 +30,10 @@ fn access_has_outer(a: &AccessPath) -> bool {
         AccessPath::PkRange { lo, hi } | AccessPath::IndexRange { lo, hi, .. } => {
             bound_outer(lo) || bound_outer(hi)
         }
-        AccessPath::FullScan => false,
+        // An FtsScan carries a literal query tree with no key parts, so it never
+        // references the outer row (and MATCH is single-table only — it never
+        // reaches a join inner side).
+        AccessPath::FullScan | AccessPath::FtsScan { .. } => false,
     }
 }
 
@@ -353,6 +356,20 @@ pub(super) fn gather_rows(
         AccessPath::FullScan => {
             return ctx.scan_rows_capped(table, None, None, filter.map(|f| (f, params)), cap);
         }
+        AccessPath::FtsScan { query } => {
+            // Posting-list set algebra → matching rowids in ascending order
+            // (design/DESIGN-FTS.md §4); fetch each row by its rowid PK. The
+            // residual WHERE / RLS policy is applied by the shared filter loop
+            // below, exactly as for a point/index path.
+            let rowids = super::fts::evaluate(ctx, table, query)?;
+            let mut out = Vec::with_capacity(rowids.len());
+            for id in rowids {
+                if let Some(row) = ctx.get_by_pk(table, &[Value::Int(id)])? {
+                    out.push(row);
+                }
+            }
+            out
+        }
     };
     if let Some(f) = filter {
         let mut stack = Vec::with_capacity(f.max_stack());
@@ -468,7 +485,10 @@ pub(super) fn gather_topk(
         // These materialize all matches before truncating; a streaming index
         // cursor is deliberately deferred (#48) until a real workload shows
         // the cost.
-        AccessPath::PkPoint(_) | AccessPath::IndexPoint { .. } | AccessPath::IndexRange { .. } => {
+        AccessPath::PkPoint(_)
+        | AccessPath::IndexPoint { .. }
+        | AccessPath::IndexRange { .. }
+        | AccessPath::FtsScan { .. } => {
             let mut r = gather_rows(ctx, table, access, filter, plan, params, None)?;
             sort_rows(&mut r, order_by);
             r.truncate(keep);

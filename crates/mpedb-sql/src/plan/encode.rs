@@ -141,6 +141,45 @@ fn encode_access(a: &AccessPath, buf: &mut Vec<u8>) {
                 }
             }
         }
+        AccessPath::FtsScan { query } => {
+            buf.push(ACCESS_FTS_SCAN);
+            encode_fts_query(query, buf);
+        }
+    }
+}
+
+/// One FTS query node, RECURSIVELY (design/DESIGN-FTS.md §3) — the exact mirror
+/// of `decode_fts_query`. Layout: a node tag, then for a `Term` its token
+/// (len-prefixed), the `prefix`/`initial` flag bytes, and its column list;
+/// for a boolean node its two children.
+fn encode_fts_query(q: &FtsQuery, buf: &mut Vec<u8>) {
+    match q {
+        FtsQuery::Term(t) => {
+            buf.push(FTS_TERM);
+            buf.extend_from_slice(&(t.token.len() as u32).to_le_bytes());
+            buf.extend_from_slice(t.token.as_bytes());
+            buf.push(t.prefix as u8);
+            buf.push(t.initial as u8);
+            w_u16(buf, t.columns.len() as u16);
+            for &c in &t.columns {
+                w_u16(buf, c);
+            }
+        }
+        FtsQuery::And(a, b) => {
+            buf.push(FTS_AND);
+            encode_fts_query(a, buf);
+            encode_fts_query(b, buf);
+        }
+        FtsQuery::Or(a, b) => {
+            buf.push(FTS_OR);
+            encode_fts_query(a, buf);
+            encode_fts_query(b, buf);
+        }
+        FtsQuery::AndNot(a, b) => {
+            buf.push(FTS_AND_NOT);
+            encode_fts_query(a, buf);
+            encode_fts_query(b, buf);
+        }
     }
 }
 

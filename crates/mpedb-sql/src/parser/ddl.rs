@@ -27,6 +27,9 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
             p.advance();
             if p.eat_word("TABLE") {
                 p.parse_create_table()?
+            } else if p.eat_word("VIRTUAL") {
+                p.expect_word("TABLE")?;
+                p.parse_create_virtual_table()?
             } else if p.eat_word("UNIQUE") {
                 p.expect_word("INDEX")?;
                 p.parse_create_index(true)?
@@ -211,6 +214,101 @@ impl<'a> Parser<'a> {
             columns,
             table_pk,
             uniques,
+        }))
+    }
+
+    /// `CREATE VIRTUAL TABLE [IF NOT EXISTS] <name> USING fts5(<col>, …
+    /// [, tokenize='unicode61'|'ascii'])` (design/DESIGN-FTS.md §1). Only the
+    /// `fts5` module is accepted (fts3/fts4/rtree and custom C modules refuse by
+    /// name — mpedb has no extension ABI). Columns are bare identifiers; the one
+    /// supported option is `tokenize=`. Semantics (rowid PK, tree seeding) live
+    /// in the facade/engine, exactly like `CREATE TABLE`.
+    fn parse_create_virtual_table(&mut self) -> Result<DdlStmt> {
+        let if_not_exists = if self.eat_word("IF") {
+            self.expect_kw(Kw::Not, "NOT")?;
+            self.expect_word("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.ident("virtual table name")?;
+        self.expect_word("USING")?;
+        let module = self.ident("virtual-table module")?;
+        if !module.eq_ignore_ascii_case("fts5") {
+            return Err(self.err_here(format!(
+                "only `fts5` virtual tables are supported (got `{module}`); fts3/fts4/rtree \
+                 and custom modules are a deliberate non-goal (mpedb has no extension ABI)"
+            )));
+        }
+        self.expect(&Tok::LParen, "(")?;
+        let mut columns: Vec<String> = Vec::new();
+        let mut tokenizer = mpedb_types::Tokenizer::Unicode61;
+        loop {
+            // An option `name = value` vs. a bare column name: look ahead for
+            // `<ident> =`.
+            let is_option = matches!(self.peek(), Some(Tok::Ident(_)))
+                && self.peek_at(1) == Some(&Tok::Eq);
+            if is_option {
+                let optname = self.ident("option name")?.to_ascii_lowercase();
+                self.expect(&Tok::Eq, "=")?;
+                let val = match self.advance() {
+                    Some(Tok::Str(s)) | Some(Tok::Ident(s)) | Some(Tok::QuotedIdent(s)) => s,
+                    _ => {
+                        return Err(
+                            self.err_here("expected a tokenizer name, e.g. 'unicode61' or 'ascii'")
+                        )
+                    }
+                };
+                if optname != "tokenize" {
+                    return Err(self.err_here(format!(
+                        "fts5 option `{optname}=` is not supported yet (stage 1 supports only \
+                         `tokenize=`; content/prefix/detail/columnsize are stage 3)"
+                    )));
+                }
+                // Accept only the bare tokenizer name — sqlite allows trailing
+                // args (`'unicode61 remove_diacritics 2'`), which are stage 3.
+                let mut parts = val.split_whitespace();
+                let base = parts.next().unwrap_or("");
+                if parts.next().is_some() {
+                    return Err(self.err_here(
+                        "tokenizer arguments beyond the name (remove_diacritics, separators, \
+                         a wrapped tokenizer) are not supported yet (stage 3)",
+                    ));
+                }
+                match mpedb_types::Tokenizer::parse(base) {
+                    Some(t) => tokenizer = t,
+                    None => {
+                        return Err(self.err_here(format!(
+                            "unsupported tokenizer `{base}` (stage 1: unicode61, ascii; \
+                             porter/trigram are stage 3)"
+                        )))
+                    }
+                }
+            } else {
+                let col = self.ident("column name")?;
+                // `col UNINDEXED` and other per-column options are stage 3: a
+                // trailing word that is not a comma/paren is refused.
+                if matches!(self.peek(), Some(Tok::Ident(_))) {
+                    let w = self.ident("").unwrap_or_default();
+                    return Err(self.err_here(format!(
+                        "fts5 column option `{w}` (e.g. UNINDEXED) is not supported yet"
+                    )));
+                }
+                columns.push(col);
+            }
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+        }
+        self.expect(&Tok::RParen, ")")?;
+        if columns.is_empty() {
+            return Err(self.err_here("an fts5 table needs at least one column"));
+        }
+        Ok(DdlStmt::CreateVirtualTable(crate::ddl::CreateVirtualTableSpec {
+            name,
+            columns,
+            tokenizer,
+            if_not_exists,
         }))
     }
 

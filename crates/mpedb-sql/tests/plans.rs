@@ -46,6 +46,7 @@ fn schema() -> Schema {
         primary_key: vec![0],
         indexes: vec![],
         dead: false,
+        kind: mpedb_sql::TableKind::Standard,
     };
     let orders = TableDef {
         id: 0,
@@ -69,6 +70,7 @@ fn schema() -> Schema {
         primary_key: vec![0, 1],
         indexes: vec![],
         dead: false,
+        kind: mpedb_sql::TableKind::Standard,
     };
     let events = TableDef {
         id: 0,
@@ -84,6 +86,7 @@ fn schema() -> Schema {
         primary_key: vec![0],
         indexes: vec![],
         dead: false,
+        kind: mpedb_sql::TableKind::Standard,
     };
     Schema::new(vec![users, orders, events]).unwrap()
 }

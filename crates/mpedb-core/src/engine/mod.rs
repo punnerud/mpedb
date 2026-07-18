@@ -102,9 +102,12 @@ use std::time::Duration;
 
 mod commit;
 mod extent;
+mod fts;
 mod freelist;
 mod read;
 mod write;
+
+pub(crate) use fts::FTS_INDEX_NO;
 
 #[cfg(test)]
 mod debug_tests;
@@ -648,6 +651,17 @@ impl Engine {
             .sec_indexes
             .get(table_id as usize)
             .is_some_and(|s| !s.is_empty())
+    }
+
+    /// Whether `table_id` is an FTS virtual table. An FTS table has an inverted
+    /// index maintained by the row-mutation path, so — like a table with a
+    /// secondary index — it must NOT take the optimistic blind-apply route,
+    /// which would skip that maintenance (see `optimistic_eligible`).
+    pub fn table_is_fts(&self, table_id: u32) -> bool {
+        self.bundle()
+            .schema
+            .table(table_id)
+            .is_some_and(|t| t.kind.is_fts())
     }
 
     /// Validate a full row against the schema (types, NOT NULL, CHECK) without

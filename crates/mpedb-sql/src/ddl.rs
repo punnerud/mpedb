@@ -33,6 +33,19 @@ pub struct CreateTableSpec {
     pub uniques: Vec<Vec<String>>,
 }
 
+/// `CREATE VIRTUAL TABLE [IF NOT EXISTS] <name> USING fts5(<col>, …
+/// [, tokenize='unicode61'|'ascii'])` (design/DESIGN-FTS.md §1). Applied by the
+/// facade like `CREATE TABLE`, but builds an FTS content + inverted-index table
+/// (`TableKind::Fts`) with an auto `rowid` INTEGER primary key and the declared
+/// columns as tokenized TEXT content.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateVirtualTableSpec {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub tokenizer: mpedb_types::Tokenizer,
+    pub if_not_exists: bool,
+}
+
 /// `CREATE POLICY <name> ON <table> [AS PERMISSIVE|RESTRICTIVE]
 ///   [FOR ALL|SELECT|INSERT|UPDATE|DELETE] USING (<expr>) [WITH CHECK (<expr>)]`
 #[derive(Debug, Clone, PartialEq)]
@@ -93,6 +106,8 @@ pub struct CreateTriggerSpec {
 #[derive(Debug, Clone, PartialEq)]
 pub enum DdlStmt {
     CreateTable(CreateTableSpec),
+    /// `CREATE VIRTUAL TABLE … USING fts5(…)` (design/DESIGN-FTS.md §1).
+    CreateVirtualTable(CreateVirtualTableSpec),
     /// `DROP TABLE [IF EXISTS] <name>` (#47 stage 4) — applied by the facade as
     /// a catalog mutation: the slot is tombstoned in place and its id is never
     /// reused (DESIGN-DROP-TABLE §0). `if_exists` suppresses the missing-table
