@@ -1,6 +1,7 @@
 //! Built-in scalar functions: the [`ScalarFn`] enum and the
 //! NULL-propagating [`call_scalar`] dispatch (plus `typeof`, which does not).
 
+use super::printf::sqlite_printf;
 use super::*;
 
 /// The built-in scalar functions. Deliberately a closed enum rather than a name
@@ -85,6 +86,14 @@ pub enum ScalarFn {
     /// `trunc(x)` — truncate toward zero. Type-PRESERVING like `ceil`/`floor`
     /// (sqlite: an integer stays an integer, a float truncates to a float).
     Trunc = 40,
+    /// `printf(FORMAT, …)` / `format(FORMAT, …)` — sqlite's C-printf-style string
+    /// formatter. Variadic; the first argument is the format string and the rest
+    /// are its data arguments, coerced per-specifier at RUNTIME (an arg used with
+    /// `%d` is cast to integer, with `%s` to text, following sqlite's rules). The
+    /// one scalar besides `typeof` that does NOT null-propagate: a NULL data
+    /// argument is handled per specifier (`%s` of NULL is empty, `%d` of NULL is
+    /// 0), and only a NULL/empty FORMAT yields NULL. See [`super::printf`].
+    Printf = 41,
 }
 
 impl ScalarFn {
@@ -130,6 +139,7 @@ impl ScalarFn {
             38 => ScalarFn::Pi,
             39 => ScalarFn::Mod,
             40 => ScalarFn::Trunc,
+            41 => ScalarFn::Printf,
             other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
         })
     }
@@ -149,6 +159,9 @@ impl ScalarFn {
             ScalarFn::Replace => argc == 3,
             // char() is variadic: 0..=255 code points (the u8 argc caps it).
             ScalarFn::Char => true,
+            // printf()/format() are variadic; the format string is required, so
+            // at least one argument.
+            ScalarFn::Printf => argc >= 1,
             // Math: one-argument transcendentals and trunc.
             ScalarFn::Exp | ScalarFn::Ln | ScalarFn::Log10 | ScalarFn::Log2
             | ScalarFn::Sin | ScalarFn::Cos | ScalarFn::Tan | ScalarFn::Asin
@@ -205,6 +218,7 @@ impl ScalarFn {
             ScalarFn::Pi => "pi",
             ScalarFn::Mod => "mod",
             ScalarFn::Trunc => "trunc",
+            ScalarFn::Printf => "printf",
         }
     }
 }
@@ -222,6 +236,12 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
     // ahead of the null gate every function below relies on.
     if matches!(f, ScalarFn::Typeof) {
         return Ok(Value::Text(sqlite_typeof(&args[0]).to_string()));
+    }
+    // printf/format also run ahead of the null gate: a NULL data argument is
+    // formatted per specifier, not propagated, and only a NULL/empty FORMAT
+    // yields NULL. (The whole arg vector is handed to the formatter.)
+    if matches!(f, ScalarFn::Printf) {
+        return sqlite_printf(args);
     }
     if args.iter().any(|a| a.is_null()) {
         return Ok(Value::Null);
@@ -511,6 +531,7 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
         ScalarFn::Mod => float_or_null(num(&args[0])? % num(&args[1])?),
         // Handled ahead of the null gate above; unreachable here.
         ScalarFn::Typeof => unreachable!("typeof is dispatched before the null gate"),
+        ScalarFn::Printf => unreachable!("printf is dispatched before the null gate"),
     })
 }
 

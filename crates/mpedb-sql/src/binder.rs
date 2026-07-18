@@ -1035,6 +1035,46 @@ impl<'a> Binder<'a> {
             }
             return Ok((BExpr::Call(ScalarFn::Char, out), Some(ColumnType::Text)));
         }
+        // `printf(FORMAT, …)` / `format(FORMAT, …)` is variadic: the first
+        // argument is the format string (pinned to text) and the rest are data
+        // arguments of ANY type — the format's specifiers coerce them at
+        // runtime, and the format may be a non-literal, so the binder cannot
+        // (and must not) pin the data arguments to a type. `format` is an exact
+        // alias for `printf`.
+        if name == "printf" || name == "format" {
+            if args.is_empty() {
+                return Err(bind_err(
+                    "printf()/format() requires at least a format string argument",
+                ));
+            }
+            let mut out = Vec::with_capacity(args.len());
+            for (idx, a) in args.iter().enumerate() {
+                let (e, t) = self.bind_expr(a)?;
+                if idx == 0 {
+                    // The format string must be text; a bare param adopts text.
+                    let (e, t) = self.unify_param(e, t, ColumnType::Text);
+                    match t {
+                        Some(ColumnType::Text) | None => {}
+                        Some(other) => {
+                            return Err(bind_err(format!(
+                                "printf()/format() format string must be text, got {other}"
+                            )))
+                        }
+                    }
+                    out.push(e);
+                } else {
+                    // A data argument keeps whatever type it has; an untyped bare
+                    // param is left for resolve_params to report (printf cannot
+                    // pin it — the specifier that consumes it is only known at
+                    // runtime).
+                    out.push(e);
+                }
+            }
+            if u8::try_from(out.len()).is_err() {
+                return Err(bind_err("printf()/format() takes at most 255 arguments"));
+            }
+            return Ok((BExpr::Call(ScalarFn::Printf, out), Some(ColumnType::Text)));
+        }
         let f = match name {
             "lower" => ScalarFn::Lower,
             "upper" => ScalarFn::Upper,
@@ -1092,7 +1132,7 @@ impl<'a> Binder<'a> {
                      ltrim, rtrim, replace, instr, substr, substring, char, unicode, hex, \
                      typeof, abs, round, ceil, floor, trunc, sqrt, pow, sign, exp, ln, log, \
                      log10, log2, sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, \
-                     radians, degrees, pi, mod, iif, coalesce, ifnull, nullif"
+                     radians, degrees, pi, mod, printf, format, iif, coalesce, ifnull, nullif"
                 )))
             }
         };
@@ -1167,9 +1207,9 @@ impl<'a> Binder<'a> {
             // the `ret` recomputation below. typeof accepts ANY type. Both
             // return text.
             ScalarFn::Hex | ScalarFn::Typeof => (&[], Some(ColumnType::Text)),
-            // char is variadic and bound specially above (never reached here);
-            // present only so this match stays exhaustive over ScalarFn.
-            ScalarFn::Char => (&[], Some(ColumnType::Text)),
+            // char/printf are variadic and bound specially above (never reached
+            // here); present only so this match stays exhaustive over ScalarFn.
+            ScalarFn::Char | ScalarFn::Printf => (&[], Some(ColumnType::Text)),
         };
         let mut out = Vec::with_capacity(bound.len());
         for (i, (e, t)) in bound.into_iter().enumerate() {
