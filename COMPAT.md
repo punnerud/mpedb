@@ -110,7 +110,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | replace | ✅ | every occurrence; an empty search string is a no-op (sqlite's rule) |
 | instr | ✅ | 1-based character position, 0 when absent (1 for an empty needle) |
 | length | ✅ | |
-| abs, round | ✅ | keep their argument's numeric type |
+| abs, round, ceil / ceiling, floor | ✅ | keep their argument's numeric type (int stays int) |
 | sqrt, pow / power | ✅ | always float; a non-real result (sqrt of a negative) is NULL, matching sqlite |
 | sign | ✅ | always an integer: -1 / 0 / 1 |
 | substr / substring | ✅ | |
