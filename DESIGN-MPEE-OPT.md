@@ -248,6 +248,31 @@ that shared cache, the second being a hard privacy requirement:
    per-process or are quantized to buckets wide enough to be non-identifying, and that
    trade-off is documented at the feature, not discovered after it.
 
+## Consumer-cap subplan pruning — shipped 2026-07-18 (MPEE #6, "don't compute the distances you won't use")
+
+The second MPEE transfer onto the subquery N×N loop: cap each subplan to the
+minimum rows its CONSUMER can read, so the LIMIT pushdown stops the scan there
+instead of materializing matches that are then discarded. In
+`crates/mpedb-sql/src/planner/subquery.rs`, `plan_one` sets the inner LIMIT by
+`SubPlanKind`: **EXISTS → 1** (existence is one surviving row), **scalar → 2**
+(one value, or two to detect the >1-row error), **IN/List → uncapped** (needs
+every value). OFFSET is preserved (the pushdown cap is offset+limit) and a
+smaller user LIMIT wins via `min`. EXISTS was the egregious case — it gathered
+EVERY matching inner row and then only tested non-emptiness.
+
+**Measured** (release, 100 DISTINCT outer keys × 300 inner matches each, so the
+correlation-key memoization never reuses and the EXISTS cap is isolated): **447
+ms → 1.79 ms, 250× faster**. Correctness is unchanged (existence/scalar/IN
+semantics identical), verified against sqlite 3.45
+(`crates/mpedb/tests/correlated_memo.rs`) and the differential corpus (zero
+wrong). This is the "single exit collapses an area to one point" / "prune before
+full evaluation" mindset: think of the outer×inner product abstractly and never
+run the full inner where the consumer only needs a bounded prefix.
+
+Next MPEE transfers staged under task #73 (DESIGN-SUBQUERY-NEXT.md): build-once
+hash semi-join for all-distinct correlation (KNN/lazy-single-pair), footprint
+skip on NULL/out-of-range correlation values, and aggregate-over-correlated.
+
 ## Correlated-subplan memoization — shipped 2026-07-18 (the broker "buy once", now on the N×N subquery loop)
 
 The broker discipline of §1.2 ("buy each cell exactly once, cache it, then only
