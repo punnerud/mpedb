@@ -1216,6 +1216,16 @@ fn exec_stmt_rest(
                         }
                     }
                 }
+                // BEFORE INSERT FOR EACH ROW triggers fire before the row is
+                // written (DESIGN-TRIGGERS §4.1), NEW = the row about to be
+                // inserted (read-only). A failing body may already have written
+                // to other tables on the shared txn, so it poisons the statement.
+                if let Err(e) =
+                    fire_insert(ctx, schema, &triggers.before_insert, *table, &row, triggers, depth)
+                {
+                    *partial = true;
+                    return Err(e);
+                }
                 match ctx.insert_row(*table, &row) {
                     Ok(()) => {
                         written += 1;
@@ -1227,7 +1237,7 @@ fn exec_stmt_rest(
                         // failing trigger poisons the statement: the row landed and
                         // the body may have written before it raised.
                         if let Err(e) =
-                            fire_after_insert(ctx, schema, *table, &row, triggers, depth)
+                            fire_insert(ctx, schema, &triggers.after_insert, *table, &row, triggers, depth)
                         {
                             *partial = true;
                             return Err(e);
@@ -1370,6 +1380,10 @@ fn exec_stmt_rest(
             // Collect-then-mutate: gather the matching CURRENT rows first
             // (read-only; a failure here has no effects).
             let old_rows = gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?;
+            // The UPDATE's SET target columns — an `UPDATE OF <cols>` trigger
+            // fires only when one of its columns is among these (sqlite
+            // semantics). Statement-wide, so computed once.
+            let changed: Vec<u16> = set.iter().map(|(c, _)| *c).collect();
             let mut affected = 0u64;
             let mut out: Vec<Vec<Value>> = Vec::new();
             for old in &old_rows {
@@ -1408,6 +1422,23 @@ fn exec_stmt_rest(
                         }
                     }
                 }
+                // BEFORE UPDATE FOR EACH ROW triggers fire before the row is
+                // rewritten (DESIGN-TRIGGERS §4.1): NEW = the post-image (read-
+                // only), OLD = the pre-image. A failing body poisons the statement.
+                if let Err(e) = fire_update(
+                    ctx,
+                    schema,
+                    &triggers.before_update,
+                    *table,
+                    &new_row,
+                    old,
+                    &changed,
+                    triggers,
+                    depth,
+                ) {
+                    *partial = true;
+                    return Err(e);
+                }
                 match ctx.update_by_pk(*table, &new_row) {
                     Ok(true) => {
                         affected += 1;
@@ -1421,9 +1452,17 @@ fn exec_stmt_rest(
                         // post-image, OLD = the pre-image. A failing trigger
                         // poisons the statement — the row changed and the body may
                         // have written before it raised.
-                        if let Err(e) =
-                            fire_after_update(ctx, schema, *table, &new_row, old, triggers, depth)
-                        {
+                        if let Err(e) = fire_update(
+                            ctx,
+                            schema,
+                            &triggers.after_update,
+                            *table,
+                            &new_row,
+                            old,
+                            &changed,
+                            triggers,
+                            depth,
+                        ) {
                             *partial = true;
                             return Err(e);
                         }
@@ -1469,6 +1508,15 @@ fn exec_stmt_rest(
                     };
                     pk.push(v);
                 }
+                // BEFORE DELETE FOR EACH ROW triggers fire before the row is
+                // removed (DESIGN-TRIGGERS §4.1): only OLD is available. A failing
+                // body poisons the statement.
+                if let Err(e) =
+                    fire_delete(ctx, schema, &triggers.before_delete, *table, old, triggers, depth)
+                {
+                    *partial = true;
+                    return Err(e);
+                }
                 match ctx.delete_by_pk(*table, &pk) {
                     Ok(true) => {
                         affected += 1;
@@ -1481,7 +1529,7 @@ fn exec_stmt_rest(
                         // row, on the SAME txn (DESIGN-TRIGGERS §4.1): only OLD is
                         // available. A failing trigger poisons the statement.
                         if let Err(e) =
-                            fire_after_delete(ctx, schema, *table, old, triggers, depth)
+                            fire_delete(ctx, schema, &triggers.after_delete, *table, old, triggers, depth)
                         {
                             *partial = true;
                             return Err(e);
@@ -1513,68 +1561,83 @@ fn exec_stmt_rest(
     }
 }
 
-/// Fire `AFTER INSERT` triggers on `table` for one inserted row (only `NEW` in
-/// scope). See [`fire_after`].
-fn fire_after_insert(
+/// Fire `INSERT` triggers of one timing on `table` for one inserted row (only
+/// `NEW` in scope). See [`fire_row_triggers`].
+fn fire_insert(
     ctx: &mut dyn TxnCtx,
     schema: &Schema,
+    bucket: &std::collections::HashMap<u32, Vec<CompiledTrigger>>,
     table: u32,
     new_row: &[Value],
     triggers: &TriggerSet,
     depth: u32,
 ) -> Result<()> {
-    match triggers.after_insert.get(&table) {
-        Some(trigs) => fire_after(ctx, schema, trigs, Some(new_row), None, triggers, depth),
+    match bucket.get(&table) {
+        Some(trigs) => fire_row_triggers(ctx, schema, trigs, Some(new_row), None, &[], triggers, depth),
         None => Ok(()),
     }
 }
 
-/// Fire `AFTER UPDATE` triggers on `table` for one updated row: `NEW` = the
-/// post-image, `OLD` = the pre-image (DESIGN-TRIGGERS §4.1). See [`fire_after`].
-fn fire_after_update(
+/// Fire `UPDATE` triggers of one timing on `table` for one updated row: `NEW` =
+/// the post-image, `OLD` = the pre-image (DESIGN-TRIGGERS §4.1). `changed` names
+/// the columns the UPDATE assigned (its SET target list) — an `UPDATE OF <cols>`
+/// trigger fires only when one of its columns is among them. See
+/// [`fire_row_triggers`].
+#[allow(clippy::too_many_arguments)]
+fn fire_update(
     ctx: &mut dyn TxnCtx,
     schema: &Schema,
+    bucket: &std::collections::HashMap<u32, Vec<CompiledTrigger>>,
     table: u32,
     new_row: &[Value],
     old_row: &[Value],
+    changed: &[u16],
     triggers: &TriggerSet,
     depth: u32,
 ) -> Result<()> {
-    match triggers.after_update.get(&table) {
-        Some(trigs) => fire_after(ctx, schema, trigs, Some(new_row), Some(old_row), triggers, depth),
+    match bucket.get(&table) {
+        Some(trigs) => {
+            fire_row_triggers(ctx, schema, trigs, Some(new_row), Some(old_row), changed, triggers, depth)
+        }
         None => Ok(()),
     }
 }
 
-/// Fire `AFTER DELETE` triggers on `table` for one deleted row (only `OLD` in
-/// scope, the deleted row). See [`fire_after`].
-fn fire_after_delete(
+/// Fire `DELETE` triggers of one timing on `table` for one deleted row (only
+/// `OLD` in scope, the deleted row). See [`fire_row_triggers`].
+fn fire_delete(
     ctx: &mut dyn TxnCtx,
     schema: &Schema,
+    bucket: &std::collections::HashMap<u32, Vec<CompiledTrigger>>,
     table: u32,
     old_row: &[Value],
     triggers: &TriggerSet,
     depth: u32,
 ) -> Result<()> {
-    match triggers.after_delete.get(&table) {
-        Some(trigs) => fire_after(ctx, schema, trigs, None, Some(old_row), triggers, depth),
+    match bucket.get(&table) {
+        Some(trigs) => fire_row_triggers(ctx, schema, trigs, None, Some(old_row), &[], triggers, depth),
         None => Ok(()),
     }
 }
 
-/// Fire a set of matching `AFTER … FOR EACH ROW` triggers for one changed row,
-/// on the SAME `ctx` (DESIGN-TRIGGERS §4). Each trigger's optional `WHEN` is a
-/// 3VL gate (only TRUE fires; NULL and FALSE skip); the body is an ordinary plan
-/// whose leading parameters are the `NEW`/`OLD` columns named by its row-slot
-/// map, filled from the `new`/`old` images and executed by recursing on the held
+/// Fire a set of matching `… FOR EACH ROW` triggers for one changed row, on the
+/// SAME `ctx` (DESIGN-TRIGGERS §4). `UPDATE OF <cols>` triggers are skipped
+/// unless one of their columns is in `changed` (the UPDATE's SET target list;
+/// empty for INSERT/DELETE, where `update_of` is always empty too). Each
+/// trigger's optional `WHEN` is a 3VL gate (only TRUE fires; NULL and FALSE
+/// skip); the body is a SEQUENCE of ordinary plans, each whose leading
+/// parameters are the `NEW`/`OLD` columns named by its row-slot map, filled from
+/// the `new`/`old` images and executed in body order by recursing on the held
 /// txn at `depth + 1` — never through the facade, so the writer lock and intent
 /// ring are never re-entered. A hard depth cap bounds any cascade.
-fn fire_after(
+#[allow(clippy::too_many_arguments)]
+fn fire_row_triggers(
     ctx: &mut dyn TxnCtx,
     schema: &Schema,
     trigs: &[CompiledTrigger],
     new: Option<&[Value]>,
     old: Option<&[Value]>,
+    changed: &[u16],
     triggers: &TriggerSet,
     depth: u32,
 ) -> Result<()> {
@@ -1602,6 +1665,11 @@ fn fire_after(
             .collect()
     };
     for trig in trigs {
+        // `UPDATE OF <cols>`: fire only when one named column is assigned by the
+        // UPDATE (sqlite semantics — the SET target list, not a value change).
+        if !trig.update_of.is_empty() && !trig.update_of.iter().any(|c| changed.contains(c)) {
+            continue;
+        }
         if let Some((prog, when_map)) = &trig.when {
             let wp = pick(when_map)?;
             let mut stack = Vec::new();
@@ -1609,17 +1677,20 @@ fn fire_after(
                 continue;
             }
         }
-        let body_params = pick(&trig.body_map)?;
-        let mut inner_partial = false;
-        exec_stmt_triggered(
-            ctx,
-            schema,
-            &trig.body,
-            &body_params,
-            &mut inner_partial,
-            triggers,
-            depth + 1,
-        )?;
+        // Multi-statement body: each statement runs in order on the same txn.
+        for (body_plan, body_map) in &trig.body {
+            let body_params = pick(body_map)?;
+            let mut inner_partial = false;
+            exec_stmt_triggered(
+                ctx,
+                schema,
+                body_plan,
+                &body_params,
+                &mut inner_partial,
+                triggers,
+                depth + 1,
+            )?;
+        }
     }
     Ok(())
 }
