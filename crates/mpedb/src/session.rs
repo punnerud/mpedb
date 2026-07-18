@@ -167,7 +167,10 @@ mod tests {
     use mpedb_types::{Config, Error, Value};
 
     fn db(tag: &str) -> crate::testdb::TestDb {
-        let path = format!("/dev/shm/mpedb-sess-{tag}-{}.mpedb", std::process::id());
+        let path = crate::testdb::scratch_path(format!(
+            "mpedb-sess-{tag}-{}.mpedb",
+            std::process::id()
+        ));
         let _ = std::fs::remove_file(&path);
         let cfg = Config::from_toml_str(&format!(
             "[database]\npath = \"{path}\"\nsize_mb = 8\n\

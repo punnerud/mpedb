@@ -143,10 +143,12 @@ impl Drop for FileGuard {
 #[test]
 #[ignore = "benchmark; run --release with --nocapture"]
 fn near_data_three_way() {
-    let db_path = PathBuf::from(format!(
-        "/dev/shm/mpedb-neardata-{}.mpedb",
-        std::process::id()
-    ));
+    let dir = if Path::new("/dev/shm").is_dir() {
+        PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    };
+    let db_path = dir.join(format!("mpedb-neardata-{}.mpedb", std::process::id()));
     let _guard = FileGuard(db_path.clone());
     let _ = std::fs::remove_file(&db_path);
     let toml = format!(
