@@ -38,6 +38,14 @@ pub enum Instr {
     Not,
     IsNull,
     IsNotNull,
+    /// `a IS b` — NULL-safe equality ("is not distinct from"). Pops 2, pushes a
+    /// Bool, and NEVER pushes NULL: TRUE when both operands are NULL, FALSE when
+    /// exactly one is, otherwise `a = b`. Two-valued, unlike [`Instr::Eq`], which
+    /// yields NULL on a NULL side. This is what sqlite's `IS` operator means.
+    IsNotDistinct,
+    /// `a IS NOT b` — NULL-safe inequality ("is distinct from"), the exact
+    /// negation of [`Instr::IsNotDistinct`]. Also two-valued: never NULL.
+    IsDistinct,
     /// Coerce Int -> Float (inserted by the binder for mixed numerics).
     ToFloat,
     /// `CAST(x AS <type>)` — SQL type conversion (#56). NULL casts to NULL of
@@ -217,6 +225,8 @@ const OP_POP: u8 = 28;
 const OP_CALL: u8 = 29;
 const OP_CAST: u8 = 30;
 const OP_CONCAT: u8 = 31;
+const OP_IS_NOT_DISTINCT: u8 = 32;
+const OP_IS_DISTINCT: u8 = 33;
 
 /// SQL `x IN (…)` under three-valued logic — the semantics that decide whether
 /// a policy admits a row, so they are spelled out rather than approximated:
@@ -609,6 +619,23 @@ impl ExprProgram {
                         !is_null
                     }));
                 }
+                Instr::IsNotDistinct | Instr::IsDistinct => {
+                    let b = stack.pop().expect("validated");
+                    let a = stack.pop().expect("validated");
+                    // NULL-safe: two NULLs MATCH, one NULL does not, otherwise
+                    // compare. This NEVER produces NULL — the whole point of IS,
+                    // and why it is 2-valued rather than 3VL like `=`.
+                    let same = match (a.is_null(), b.is_null()) {
+                        (true, true) => true,
+                        (true, false) | (false, true) => false,
+                        (false, false) => matches!(a.sql_cmp(&b)?, Some(Ordering::Equal)),
+                    };
+                    stack.push(Value::Bool(if instr == Instr::IsNotDistinct {
+                        same
+                    } else {
+                        !same
+                    }));
+                }
                 Instr::ToFloat => {
                     let a = stack.pop().expect("validated");
                     stack.push(match a {
@@ -785,6 +812,8 @@ impl ExprProgram {
                 Instr::Not => buf.push(OP_NOT),
                 Instr::IsNull => buf.push(OP_IS_NULL),
                 Instr::IsNotNull => buf.push(OP_IS_NOT_NULL),
+                Instr::IsNotDistinct => buf.push(OP_IS_NOT_DISTINCT),
+                Instr::IsDistinct => buf.push(OP_IS_DISTINCT),
                 Instr::ToFloat => buf.push(OP_TO_FLOAT),
                 Instr::Cast(t) => {
                     buf.push(OP_CAST);
@@ -859,6 +888,8 @@ impl ExprProgram {
                 OP_NOT => Instr::Not,
                 OP_IS_NULL => Instr::IsNull,
                 OP_IS_NOT_NULL => Instr::IsNotNull,
+                OP_IS_NOT_DISTINCT => Instr::IsNotDistinct,
+                OP_IS_DISTINCT => Instr::IsDistinct,
                 OP_TO_FLOAT => Instr::ToFloat,
                 OP_CAST => {
                     let t = *buf.get(*pos).ok_or_else(err)?;
@@ -1370,6 +1401,83 @@ mod tests {
             ExprProgram::decode(&evil, &mut 0),
             Err(Error::Corrupt(_))
         ));
+    }
+
+    #[test]
+    fn is_distinct_is_null_safe_and_two_valued() {
+        // `a IS b` == IsNotDistinct: NULL-safe equality that never yields NULL.
+        let isnd = |a: Value, b: Value| {
+            prog(
+                vec![Instr::PushParam(0), Instr::PushParam(1), Instr::IsNotDistinct],
+                vec![],
+            )
+            .eval(&[], &[a, b])
+            .unwrap()
+        };
+        assert_eq!(isnd(Value::Null, Value::Null), Value::Bool(true));
+        assert_eq!(isnd(Value::Null, Value::Int(1)), Value::Bool(false));
+        assert_eq!(isnd(Value::Int(1), Value::Null), Value::Bool(false));
+        assert_eq!(isnd(Value::Int(1), Value::Int(1)), Value::Bool(true));
+        assert_eq!(isnd(Value::Int(1), Value::Int(2)), Value::Bool(false));
+        // Text operands compare the same way.
+        assert_eq!(
+            isnd(Value::Text("a".into()), Value::Text("a".into())),
+            Value::Bool(true)
+        );
+        assert_eq!(
+            isnd(Value::Text("a".into()), Value::Text("b".into())),
+            Value::Bool(false)
+        );
+
+        // `a IS NOT b` == IsDistinct: the exact negation, still never NULL.
+        let isd = |a: Value, b: Value| {
+            prog(
+                vec![Instr::PushParam(0), Instr::PushParam(1), Instr::IsDistinct],
+                vec![],
+            )
+            .eval(&[], &[a, b])
+            .unwrap()
+        };
+        assert_eq!(isd(Value::Null, Value::Null), Value::Bool(false));
+        assert_eq!(isd(Value::Null, Value::Int(1)), Value::Bool(true));
+        assert_eq!(isd(Value::Int(1), Value::Null), Value::Bool(true));
+        assert_eq!(isd(Value::Int(1), Value::Int(1)), Value::Bool(false));
+        assert_eq!(isd(Value::Int(1), Value::Int(2)), Value::Bool(true));
+
+        // A NULL result is impossible, so as a filter predicate every case is
+        // decided — unlike `=`, where NULL denies. `NULL IS NULL` passes.
+        let p = prog(
+            vec![Instr::PushParam(0), Instr::PushParam(1), Instr::IsNotDistinct],
+            vec![],
+        );
+        assert!(p
+            .eval_filter(&mut Vec::new(), &[], &[Value::Null, Value::Null])
+            .unwrap());
+        assert!(!p
+            .eval_filter(&mut Vec::new(), &[], &[Value::Null, Value::Int(1)])
+            .unwrap());
+
+        // codec: roundtrip + truncation safety (repo rule: Corrupt, never panic).
+        let prog2 = prog(
+            vec![
+                Instr::PushCol(0),
+                Instr::PushCol(1),
+                Instr::IsNotDistinct,
+                Instr::PushCol(2),
+                Instr::PushCol(3),
+                Instr::IsDistinct,
+                Instr::And,
+            ],
+            vec![],
+        );
+        let mut buf = Vec::new();
+        prog2.encode_into(&mut buf);
+        let mut pos = 0;
+        assert_eq!(ExprProgram::decode(&buf, &mut pos).unwrap(), prog2);
+        assert_eq!(pos, buf.len());
+        for cut in 0..buf.len() {
+            let _ = ExprProgram::decode(&buf[..cut], &mut 0); // must not panic
+        }
     }
 
     // ---- §2.6 `col IN (context list)` under 3VL ----

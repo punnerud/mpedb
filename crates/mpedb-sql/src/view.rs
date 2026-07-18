@@ -208,6 +208,10 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
             rename_qualifier(a, from, to);
             rename_qualifier(b, from, to);
         }
+        Expr::IsDistinct(a, b, _) => {
+            rename_qualifier(a, from, to);
+            rename_qualifier(b, from, to);
+        }
         Expr::InList(a, list, _) => {
             rename_qualifier(a, from, to);
             for item in list {
@@ -253,6 +257,10 @@ fn flatten_expr(e: &mut Expr, views: &ViewCatalog, depth: usize) -> Result<()> {
         }
         Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) => flatten_expr(a, views, depth),
         Expr::Binary(_, a, b) | Expr::Like(a, b) => {
+            flatten_expr(a, views, depth)?;
+            flatten_expr(b, views, depth)
+        }
+        Expr::IsDistinct(a, b, _) => {
             flatten_expr(a, views, depth)?;
             flatten_expr(b, views, depth)
         }
