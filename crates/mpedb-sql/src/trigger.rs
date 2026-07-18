@@ -308,7 +308,8 @@ fn rewrite_row_in_expr(e: &mut Expr, scope: &RowScope, map: &mut RowMap) -> Resu
         Expr::Binary(_, a, b)
         | Expr::IsDistinct(a, b, _)
         | Expr::Like(a, b)
-        | Expr::Glob(a, b, _) => {
+        | Expr::Glob(a, b, _)
+        | Expr::Regexp(a, b, _) => {
             rewrite_row_in_expr(a, scope, map)?;
             rewrite_row_in_expr(b, scope, map)
         }

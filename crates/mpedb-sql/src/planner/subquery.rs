@@ -45,9 +45,11 @@ fn expr_has_subquery(e: &ast::Expr) -> bool {
         E::Subquery(_) | E::Exists(..) | E::InSubquery(..) => true,
         E::InParamSlot(a, _, _) => expr_has_subquery(a),
         E::Unary(_, a) | E::IsNull(a, _) | E::Cast(a, _) => expr_has_subquery(a),
-        E::Binary(_, a, b) | E::Like(a, b) | E::IsDistinct(a, b, _) | E::Glob(a, b, _) => {
-            expr_has_subquery(a) || expr_has_subquery(b)
-        }
+        E::Binary(_, a, b)
+        | E::Like(a, b)
+        | E::IsDistinct(a, b, _)
+        | E::Glob(a, b, _)
+        | E::Regexp(a, b, _) => expr_has_subquery(a) || expr_has_subquery(b),
         E::InContext(a, _, _) => expr_has_subquery(a),
         E::InList(a, xs, _) => expr_has_subquery(a) || xs.iter().any(expr_has_subquery),
         E::Coalesce(xs) | E::Func(_, xs) => xs.iter().any(expr_has_subquery),
@@ -213,6 +215,11 @@ impl Lift<'_> {
                 *n,
             ),
             E::Glob(a, b, n) => E::Glob(
+                Box::new(self.rewrite(a)?),
+                Box::new(self.rewrite(b)?),
+                *n,
+            ),
+            E::Regexp(a, b, n) => E::Regexp(
                 Box::new(self.rewrite(a)?),
                 Box::new(self.rewrite(b)?),
                 *n,
@@ -580,6 +587,11 @@ impl<'a> Correlate<'a, '_> {
                 Box::new(self.rewrite(b)?),
                 *n,
             ),
+            E::Regexp(a, b, n) => E::Regexp(
+                Box::new(self.rewrite(a)?),
+                Box::new(self.rewrite(b)?),
+                *n,
+            ),
             E::InContext(a, k, n) => {
                 E::InContext(Box::new(self.rewrite(a)?), k.clone(), *n)
             }
@@ -678,9 +690,11 @@ fn refs_correlated(b: &BExpr, sub_base: u16, correlated: &[bool]) -> bool {
     match b {
         BExpr::Param(i) => is_corr(*i),
         BExpr::Const(_) | BExpr::Col(_) => false,
-        BExpr::Unary(_, a) | BExpr::Like(a, _) | BExpr::Glob(a, _) | BExpr::Cast(a, _) => {
-            refs_correlated(a, sub_base, correlated)
-        }
+        BExpr::Unary(_, a)
+        | BExpr::Like(a, _)
+        | BExpr::Glob(a, _)
+        | BExpr::Regexp(a, _)
+        | BExpr::Cast(a, _) => refs_correlated(a, sub_base, correlated),
         BExpr::Binary(_, a, bx) | BExpr::IsDistinct(a, bx, _) => {
             refs_correlated(a, sub_base, correlated) || refs_correlated(bx, sub_base, correlated)
         }

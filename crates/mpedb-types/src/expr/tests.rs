@@ -139,11 +139,127 @@ fn glob_patterns() {
 }
 
 #[test]
+fn regexp_patterns() {
+    // Unanchored: a pattern matches ANY substring unless `^`/`$` pin an end.
+    assert!(regexp_match("abc", "xxabcyy"));
+    assert!(regexp_match("^abc", "abcyy"));
+    assert!(!regexp_match("^abc", "xabc"));
+    assert!(regexp_match("abc$", "xxabc"));
+    assert!(!regexp_match("abc$", "abcx"));
+    assert!(regexp_match("^$", ""));
+    assert!(regexp_match("", "anything")); // empty pattern matches everywhere
+    assert!(!regexp_match("^abc$", "abcd"));
+
+    // `.` — any single char, INCLUDING newline (sqlite's `.`).
+    assert!(regexp_match("a.c", "abc"));
+    assert!(regexp_match("^a.c$", "a\nc"));
+    assert!(!regexp_match("^a.c$", "ac"));
+
+    // Quantifiers `* + ?`.
+    assert!(regexp_match("^ab*c$", "ac"));
+    assert!(regexp_match("^ab*c$", "abbbc"));
+    assert!(!regexp_match("^ab+c$", "ac"));
+    assert!(regexp_match("^ab+c$", "abc"));
+    assert!(regexp_match("^ab?c$", "ac"));
+    assert!(regexp_match("^ab?c$", "abc"));
+    assert!(!regexp_match("^ab?c$", "abbc"));
+
+    // Counted repetition `{p}` / `{p,}` / `{p,q}` / `{,q}`.
+    assert!(regexp_match("^a{3}$", "aaa"));
+    assert!(!regexp_match("^a{3}$", "aa"));
+    assert!(regexp_match("^a{2,}$", "aaaa"));
+    assert!(!regexp_match("^a{2,}$", "a"));
+    assert!(regexp_match("^a{2,4}$", "aaa"));
+    assert!(!regexp_match("^a{2,4}$", "aaaaa"));
+    assert!(regexp_match("^a{,3}$", "aa")); // `{,3}` == `{0,3}`
+
+    // Character classes: set, range, negation, and sqlite's literal-`]`/`-`
+    // rules. A `[a-]` (dash consumed as a range upper bound past `]`) is
+    // malformed → non-matching, like sqlite.
+    assert!(regexp_match("^[abc]$", "b"));
+    assert!(!regexp_match("^[abc]$", "d"));
+    assert!(regexp_match("^[a-c]+$", "abcabc"));
+    assert!(!regexp_match("^[a-c]+$", "abd"));
+    assert!(regexp_match("^[^x]$", "y"));
+    assert!(!regexp_match("^[^x]$", "x"));
+    assert!(regexp_match("^[]x]$", "]")); // leading `]` is literal
+    assert!(regexp_match("^[-a]$", "-")); // leading `-` is literal
+    assert!(!regexp_match("[a-]", "-")); // malformed (sqlite: "unterminated")
+
+    // Alternation and grouping.
+    assert!(regexp_match("^(cat|dog)$", "dog"));
+    assert!(!regexp_match("^(cat|dog)$", "cow"));
+    assert!(regexp_match("^(ab)+$", "ababab"));
+    assert!(!regexp_match("^(ab)+$", "aba"));
+    assert!(regexp_match("^a(b|c)d$", "acd"));
+
+    // Backslash escapes: metacharacters, C escapes, Perl classes, `\b`.
+    assert!(regexp_match("^a\\.c$", "a.c"));
+    assert!(!regexp_match("^a\\.c$", "axc"));
+    assert!(regexp_match("^a\\*c$", "a*c"));
+    assert!(regexp_match("^a\\\\b$", "a\\b"));
+    assert!(regexp_match("^\\t$", "\t"));
+    assert!(regexp_match("^\\d+$", "2026"));
+    assert!(!regexp_match("^\\d+$", "20a6"));
+    assert!(regexp_match("^\\w+$", "a_1"));
+    assert!(regexp_match("\\bbar", "foo bar"));
+    assert!(!regexp_match("\\bbar", "foobar"));
+    assert!(regexp_match("^\\D$", "x"));
+    assert!(regexp_match("\\u0041", "A")); // \uXXXX code point
+    assert!(regexp_match("\\x41", "A")); // \xXX code point
+
+    // Case-SENSITIVE, like GLOB.
+    assert!(!regexp_match("abc", "ABC"));
+    assert!(regexp_match("ABC", "ABC"));
+
+    // Malformed patterns never panic and match nothing (sqlite raises instead).
+    assert!(!regexp_match("(ab", "ab")); // unmatched '('
+    assert!(!regexp_match("a)b", "a)b")); // unmatched ')'
+    assert!(!regexp_match("[abc", "a")); // unterminated class
+    assert!(!regexp_match("*a", "a")); // quantifier without operand
+    assert!(!regexp_match("a{3,1}", "aa")); // n < m
+    assert!(!regexp_match("a{0}", "")); // both zero
+    assert!(!regexp_match("\\y", "y")); // unknown escape
+
+    // A count far above the program cap is refused (bounded, no hang) — even
+    // over an empty body, where a naive expander would spin.
+    assert!(!regexp_match("a{999999999}", "aa"));
+    assert!(!regexp_match("(){999999999}", ""));
+}
+
+#[test]
 fn glob_program_null_and_type_rules() {
     // `col0 GLOB 'a*'` — NULL operand yields NULL, exactly like LIKE.
     let p = prog(vec![Instr::PushCol(0), Instr::Glob(0)], vec![Value::Text("a*".into())]);
     assert_eq!(p.eval(&[Value::Text("abc".into())], &[]).unwrap(), Value::Bool(true));
     assert_eq!(p.eval(&[Value::Text("xbc".into())], &[]).unwrap(), Value::Bool(false));
+    assert_eq!(p.eval(&[Value::Null], &[]).unwrap(), Value::Null);
+    // A non-text operand is a type error, not a silent non-match.
+    assert!(matches!(
+        p.eval(&[Value::Int(1)], &[]),
+        Err(Error::TypeMismatch(_))
+    ));
+
+    // codec: roundtrip + truncation safety (repo rule: Corrupt, never panic).
+    let mut buf = Vec::new();
+    p.encode_into(&mut buf);
+    let mut pos = 0;
+    assert_eq!(ExprProgram::decode(&buf, &mut pos).unwrap(), p);
+    assert_eq!(pos, buf.len());
+    for cut in 0..buf.len() {
+        let _ = ExprProgram::decode(&buf[..cut], &mut 0); // must not panic
+    }
+}
+
+#[test]
+fn regexp_program_null_and_type_rules() {
+    // `col0 REGEXP '^a.c$'` — NULL operand yields NULL, exactly like GLOB/LIKE.
+    let p = prog(
+        vec![Instr::PushCol(0), Instr::Regexp(0)],
+        vec![Value::Text("^a.c$".into())],
+    );
+    assert_eq!(p.eval(&[Value::Text("abc".into())], &[]).unwrap(), Value::Bool(true));
+    assert_eq!(p.eval(&[Value::Text("abbc".into())], &[]).unwrap(), Value::Bool(false));
     assert_eq!(p.eval(&[Value::Null], &[]).unwrap(), Value::Null);
     // A non-text operand is a type error, not a silent non-match.
     assert!(matches!(
