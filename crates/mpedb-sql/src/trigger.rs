@@ -23,6 +23,7 @@ use crate::ast::{self, Expr, Stmt};
 use crate::binder::{self, Binder};
 use crate::plan::dual_def;
 use crate::policy::PolicyCatalog;
+use crate::token::{tokenize, Tok};
 use crate::{parser, planner};
 use mpedb_types::{Error, ExprProgram, Result, Schema, TableDef};
 
@@ -51,35 +52,74 @@ fn trg_err(msg: impl Into<String>) -> Error {
     Error::Bind(msg.into())
 }
 
-/// Compile a trigger's `BEGIN … END` body (a single INSERT/UPDATE/DELETE in v1)
-/// against `target` — the table the trigger fires on. `allow_new`/`allow_old`
-/// gate the `NEW`/`OLD` pseudo-relations per the event (DESIGN-TRIGGERS §1).
-/// Returns the body plan and the row-slot map: body parameter slot `i` is filled
-/// from `map[i].0`'s image, column `map[i].1`, at fire time.
+/// Compile a trigger's `BEGIN <stmt>; … END` body against `target` — the table
+/// the trigger fires on. `allow_new`/`allow_old` gate the `NEW`/`OLD`
+/// pseudo-relations per the event (DESIGN-TRIGGERS §1). The body may hold a
+/// SEQUENCE of INSERT/UPDATE/DELETE statements (DESIGN-TRIGGERS stage 3), fired
+/// in order on the same txn; each compiles to its own plan and row-slot map (body
+/// parameter slot `i` of statement `n` is filled from `map[n][i].0`'s image,
+/// column `map[n][i].1`, at fire time). Returns one `(plan, map)` per statement,
+/// in body order.
 pub fn compile_trigger_body(
     body_sql: &str,
     target: &TableDef,
     schema: &Schema,
     allow_new: bool,
     allow_old: bool,
-) -> Result<(crate::CompiledPlan, RowMap)> {
-    let (mut stmt, is_explain, n_params, ctes) = parser::parse_statement_ctes(body_sql)?;
-    if is_explain {
-        return Err(trg_err("EXPLAIN is not allowed in a trigger body"));
+) -> Result<Vec<(crate::CompiledPlan, RowMap)>> {
+    let stmt_srcs = split_body_statements(body_sql)?;
+    if stmt_srcs.is_empty() {
+        return Err(trg_err("a trigger body must contain at least one statement"));
     }
-    if n_params > 0 {
-        return Err(trg_err(
-            "query parameters ($1 / ?) are not allowed in a trigger body",
-        ));
+    let mut out = Vec::with_capacity(stmt_srcs.len());
+    for stmt_src in &stmt_srcs {
+        let (mut stmt, is_explain, n_params, ctes) = parser::parse_statement_ctes(stmt_src)?;
+        if is_explain {
+            return Err(trg_err("EXPLAIN is not allowed in a trigger body"));
+        }
+        if n_params > 0 {
+            return Err(trg_err(
+                "query parameters ($1 / ?) are not allowed in a trigger body",
+            ));
+        }
+        if !ctes.is_empty() {
+            return Err(trg_err("WITH (CTE) is not supported in a trigger body yet"));
+        }
+        let scope = RowScope { target, allow_new, allow_old };
+        let mut map: RowMap = Vec::new();
+        rewrite_row_in_stmt(&mut stmt, &scope, &mut map)?;
+        let plan =
+            planner::plan_statement(&stmt, schema, map.len() as u16, &PolicyCatalog::empty())?;
+        out.push((plan, map));
     }
-    if !ctes.is_empty() {
-        return Err(trg_err("WITH (CTE) is not supported in a trigger body yet"));
+    Ok(out)
+}
+
+/// Split a trigger's `BEGIN … END` body source into its top-level statements at
+/// statement-separating semicolons. Tokenizing (rather than a naive `char` split)
+/// means a `;` inside a string literal is never mistaken for a separator, and
+/// empty fragments (from `;;` or a leading/trailing `;`) are dropped. A `;` token
+/// is always a statement boundary — it never nests inside an expression — so no
+/// depth tracking is needed here (the `CASE … END` balancing lives in the parser
+/// that captured this source).
+fn split_body_statements(body_sql: &str) -> Result<Vec<String>> {
+    let toks = tokenize(body_sql)?;
+    let mut stmts = Vec::new();
+    let mut start = 0usize;
+    for sp in &toks {
+        if sp.tok == Tok::Semicolon {
+            let frag = body_sql.get(start..sp.pos).unwrap_or("").trim();
+            if !frag.is_empty() {
+                stmts.push(frag.to_string());
+            }
+            start = sp.pos + 1; // one byte past the ASCII ';'
+        }
     }
-    let scope = RowScope { target, allow_new, allow_old };
-    let mut map: RowMap = Vec::new();
-    rewrite_row_in_stmt(&mut stmt, &scope, &mut map)?;
-    let plan = planner::plan_statement(&stmt, schema, map.len() as u16, &PolicyCatalog::empty())?;
-    Ok((plan, map))
+    let frag = body_sql.get(start..).unwrap_or("").trim();
+    if !frag.is_empty() {
+        stmts.push(frag.to_string());
+    }
+    Ok(stmts)
 }
 
 /// Compile a trigger's `WHEN (<cond>)` predicate against `target`. The predicate
