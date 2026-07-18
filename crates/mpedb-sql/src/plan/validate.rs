@@ -198,6 +198,13 @@ impl CompiledPlan {
                     // The OUTER's policy/residual, over the outer row alone.
                     self.check_program(f, t, ptypes)?;
                 }
+                // Windows and aggregation are mutually exclusive (stage 1): the
+                // window phase runs over base rows, the aggregate over grouped
+                // tuples — one tuple model per plan. A blob claiming both is
+                // forged (the planner refuses the SQL in-process).
+                if aggregate.is_some() && !sp.windows.is_empty() {
+                    return Err(corrupt("windows together with an aggregate"));
+                }
                 if let Some(a) = aggregate {
                     // GROUP BY columns and aggregate ARGUMENTS index the BASE
                     // row — which for a join is the JOINED row, hence
@@ -252,15 +259,50 @@ impl CompiledPlan {
                     }
                     return Ok(());
                 }
+                // Window functions widen the tuple the projection sees: each
+                // appends one result column at slot `base_width + k`. The
+                // window's OWN sub-programs (arg, PARTITION BY, ORDER BY) read
+                // the base row, so they bound by `base_width`; the projection and
+                // ORDER BY may reach the window slots, so they bound by
+                // `proj_width` — exactly as the aggregate branch widens the
+                // projection to the grouped tuple's width.
+                let win = &sp.windows;
+                if !win.is_empty() {
+                    if win.len() > super::MAX_WINDOWS {
+                        return Err(corrupt("too many windows in plan"));
+                    }
+                    for w in win {
+                        if w.distinct {
+                            return Err(corrupt("DISTINCT window aggregate is not supported"));
+                        }
+                        // A ranking function has no argument (the row is the
+                        // input); only an aggregate window carries one.
+                        if w.arg.is_some()
+                            && !matches!(w.func, super::WindowFunc::Agg(_))
+                        {
+                            return Err(corrupt("ranking window function carries an argument"));
+                        }
+                        if let Some(a) = &w.arg {
+                            self.check_program_width(a, base_width, ptypes)?;
+                        }
+                        for p in &w.partition_by {
+                            self.check_program_width(p, base_width, ptypes)?;
+                        }
+                        for (p, _) in &w.order_by {
+                            self.check_program_width(p, base_width, ptypes)?;
+                        }
+                    }
+                }
+                let proj_width = base_width + win.len();
                 for p in projection {
                     match p {
                         Projection::Column(i) => {
-                            if *i as usize >= base_width {
+                            if *i as usize >= proj_width {
                                 return Err(corrupt("projection column out of range"));
                             }
                         }
                         Projection::Expr { program, .. } => {
-                            self.check_program_width(program, base_width, ptypes)?
+                            self.check_program_width(program, proj_width, ptypes)?
                         }
                     }
                 }
@@ -269,7 +311,14 @@ impl CompiledPlan {
                 if *order_over == OrderOver::Grouped {
                     return Err(corrupt("order-over grouped without an aggregate"));
                 }
-                let w = order_width(projection.len(), None);
+                // A windowed plan sorts the PROJECTION (the window results live
+                // there), so its ORDER BY indexes the projection whatever
+                // `order_over` claims — bound it that way.
+                let w = if win.is_empty() {
+                    order_width(projection.len(), None)
+                } else {
+                    projection.len()
+                };
                 for (c, _) in order_by {
                     if *c as usize >= w {
                         return Err(corrupt("order-by column out of range"));

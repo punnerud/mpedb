@@ -368,6 +368,30 @@ pub(super) fn plan_join_select(
         return Ok(planned);
     }
 
+    // A window over a join runs the phase over the JOINED row — free here, since
+    // the window planner works off whatever base scope the binder carries.
+    let has_window = s
+        .items
+        .as_ref()
+        .is_some_and(|i| i.iter().any(|(e, _)| contains_window(e)))
+        || s.order_by.iter().any(|(e, _)| contains_window(e));
+    if has_window {
+        if has_agg {
+            return Err(bind_err(
+                "window functions together with GROUP BY / aggregates in one SELECT \
+                 are not supported yet (window stage 2+)",
+            ));
+        }
+        if post_filter.is_some() || correlated.iter().any(|&c| c) {
+            return Err(bind_err(
+                "a window function together with a correlated subquery is not supported yet",
+            ));
+        }
+        return plan_window_select(
+            s, outer_id, access, filter, joins, joined_filter, binder, subplans,
+        );
+    }
+
     // Projection over the joined tuple. `SELECT *` is every column of every
     // side, in join order — the same order the tuple is built in.
     let mut out_types: Vec<Option<ColumnType>> = Vec::new();
@@ -470,6 +494,7 @@ pub(super) fn plan_join_select(
             offset: s.offset,
             distinct: s.distinct,
             aggregate: None,
+            windows: Vec::new(),
         }),
         param_types,
         context_keys,

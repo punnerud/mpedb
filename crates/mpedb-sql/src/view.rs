@@ -479,6 +479,19 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
         }
         Expr::InParamSlot(a, _, _) | Expr::InContext(a, _, _) => rename_qualifier(a, from, to),
         Expr::Agg(_, Some(arg), _) => rename_qualifier(arg, from, to),
+        // A window's sub-expressions may name the derived alias too. (Derived
+        // bodies with windows are refused earlier, so this is belt-and-braces.)
+        Expr::Window { arg, spec, .. } => {
+            if let Some(a) = arg {
+                rename_qualifier(a, from, to);
+            }
+            for p in &mut spec.partition_by {
+                rename_qualifier(p, from, to);
+            }
+            for (o, _) in &mut spec.order_by {
+                rename_qualifier(o, from, to);
+            }
+        }
         // A subquery in the body opens its own scope; refuse-by-check_simple
         // keeps aggregate/correlated bodies out, and a plain uncorrelated
         // subquery does not see the derived alias, so it is left as-is.
