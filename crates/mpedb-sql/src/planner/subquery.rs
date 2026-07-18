@@ -45,7 +45,9 @@ fn expr_has_subquery(e: &ast::Expr) -> bool {
         E::Subquery(_) | E::Exists(..) | E::InSubquery(..) => true,
         E::InParamSlot(a, _, _) => expr_has_subquery(a),
         E::Unary(_, a) | E::IsNull(a, _) | E::Cast(a, _) => expr_has_subquery(a),
-        E::Binary(_, a, b) | E::Like(a, b) => expr_has_subquery(a) || expr_has_subquery(b),
+        E::Binary(_, a, b) | E::Like(a, b) | E::IsDistinct(a, b, _) => {
+            expr_has_subquery(a) || expr_has_subquery(b)
+        }
         E::InContext(a, _, _) => expr_has_subquery(a),
         E::InList(a, xs, _) => expr_has_subquery(a) || xs.iter().any(expr_has_subquery),
         E::Coalesce(xs) | E::Func(_, xs) => xs.iter().any(expr_has_subquery),
@@ -195,6 +197,11 @@ impl Lift<'_> {
                 Box::new(self.rewrite(b)?),
             ),
             E::Like(a, b) => E::Like(Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?)),
+            E::IsDistinct(a, b, n) => E::IsDistinct(
+                Box::new(self.rewrite(a)?),
+                Box::new(self.rewrite(b)?),
+                *n,
+            ),
             E::InContext(a, k, n) => {
                 E::InContext(Box::new(self.rewrite(a)?), k.clone(), *n)
             }
@@ -461,6 +468,11 @@ impl Correlate<'_, '_> {
                 Box::new(self.rewrite(b)?),
             ),
             E::Like(a, b) => E::Like(Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?)),
+            E::IsDistinct(a, b, n) => E::IsDistinct(
+                Box::new(self.rewrite(a)?),
+                Box::new(self.rewrite(b)?),
+                *n,
+            ),
             E::InContext(a, k, n) => {
                 E::InContext(Box::new(self.rewrite(a)?), k.clone(), *n)
             }
@@ -555,7 +567,7 @@ fn refs_correlated(b: &BExpr, sub_base: u16, correlated: &[bool]) -> bool {
         BExpr::Unary(_, a) | BExpr::Like(a, _) | BExpr::Cast(a, _) => {
             refs_correlated(a, sub_base, correlated)
         }
-        BExpr::Binary(_, a, bx) => {
+        BExpr::Binary(_, a, bx) | BExpr::IsDistinct(a, bx, _) => {
             refs_correlated(a, sub_base, correlated) || refs_correlated(bx, sub_base, correlated)
         }
         BExpr::InParam(a, i) => is_corr(*i) || refs_correlated(a, sub_base, correlated),

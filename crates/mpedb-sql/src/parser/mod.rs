@@ -1010,8 +1010,16 @@ impl<'a> Parser<'a> {
         loop {
             if self.eat_kw(Kw::Is) {
                 let negated = self.eat_kw(Kw::Not);
-                self.expect_kw(Kw::Null, "NULL after IS")?;
-                e = Expr::IsNull(Box::new(e), negated);
+                if self.eat_kw(Kw::Null) {
+                    e = Expr::IsNull(Box::new(e), negated);
+                } else {
+                    // General `x IS y` / `x IS NOT y` — NULL-safe (not-)distinct.
+                    // The right operand parses at the additive tier, like `=`'s
+                    // RHS, so `IS` sits at the comparison level and does not chain
+                    // into a following comparison.
+                    let rhs = self.add_expr()?;
+                    e = Expr::IsDistinct(Box::new(e), Box::new(rhs), negated);
+                }
                 continue;
             }
             if !seen_cmp && self.peek_kw(Kw::Like) {
@@ -1702,6 +1710,18 @@ mod tests {
         assert_eq!(
             expr("a LIKE 'x%'"),
             Expr::Like(col("a"), Box::new(Expr::Lit(Value::Text("x%".into()))))
+        );
+    }
+
+    #[test]
+    fn is_distinct_general_form() {
+        // `IS`/`IS NOT` with a non-NULL operand is the NULL-safe distinct-from
+        // node, while the NULL forms stay `IsNull` (checked above).
+        assert_eq!(expr("a IS b"), Expr::IsDistinct(col("a"), col("b"), false));
+        assert_eq!(expr("a IS NOT b"), Expr::IsDistinct(col("a"), col("b"), true));
+        assert_eq!(
+            expr("a IS 1"),
+            Expr::IsDistinct(col("a"), Box::new(Expr::Lit(Value::Int(1))), false)
         );
     }
 
