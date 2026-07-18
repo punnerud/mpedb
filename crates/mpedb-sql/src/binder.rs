@@ -12,8 +12,8 @@
 
 use crate::ast::{self, BinOp, UnOp};
 use mpedb_types::{
-    CmpKind, Collation, ColumnDef, ColumnType, Error, ExprProgram, Instr, Result, ScalarFn,
-    TableDef, Value,
+    Affinity, CmpKind, Collation, ColumnDef, ColumnType, Error, ExprProgram, Instr, Result,
+    ScalarFn, TableDef, Value,
 };
 
 /// Bound (name-resolved, type-checked, constant-folded) expression.
@@ -53,8 +53,9 @@ pub(crate) enum BExpr {
     /// `coalesce(a, b, …)` — compiled to control flow, not a call, so later
     /// arguments are never evaluated once an earlier one is non-NULL.
     Coalesce(Vec<BExpr>),
-    /// `CAST(x AS t)` — semantics live in [`Instr::Cast`](mpedb_types::expr).
-    Cast(Box<BExpr>, ColumnType),
+    /// `CAST(x AS t)` — the target name has been folded to an [`Affinity`];
+    /// conversion semantics live in [`Instr::Cast`](mpedb_types::expr).
+    Cast(Box<BExpr>, Affinity),
     /// A comparison under an explicit collating sequence (task: COLLATE). The
     /// `BinOp` is one of the six comparison operators; TEXT operands compare
     /// under `Collation`. A distinct node from [`BExpr::Binary`] on purpose: the
@@ -821,22 +822,27 @@ impl<'a> Binder<'a> {
                 "a subquery is not supported in this position — subqueries work in \
                  the SELECT list and WHERE of a plain (non-aggregate) SELECT",
             )),
-            ast::Expr::Cast(a, t) => {
+            ast::Expr::Cast(a, tyname) => {
+                let aff = Affinity::from_type_name(tyname);
                 let (a, at) = self.bind_expr(a)?;
-                // `CAST(? AS t)` pins the parameter — PG's canonical way to
-                // type a param, and it makes the cast the identity.
-                let (a, at) = self.unify_param(a, at, *t);
-                // Refuse at bind time the casts that cannot succeed on ANY
-                // non-NULL value (same accept set as Instr::Cast at runtime).
-                if let Some(src) = at {
-                    if !cast_possible(src, *t) {
-                        return Err(bind_err(format!(
-                            "CAST from {src} to {t} would have to invent data"
-                        )));
-                    }
-                }
-                let e = fold_maybe(BExpr::Cast(Box::new(a), *t), self.suppress_fold)?;
-                Ok((e, Some(*t)))
+                // `CAST(? AS t)` pins a bare parameter to the affinity's storage
+                // type — PG's canonical way to type a param. NUMERIC has no
+                // single storage type, so it does not pin.
+                let (a, at) = match affinity_pin_type(aff) {
+                    Some(pin) => self.unify_param(a, at, pin),
+                    None => (a, at),
+                };
+                let e = fold_maybe(BExpr::Cast(Box::new(a), aff), self.suppress_fold)?;
+                // The bind-time result type. A folded constant reports its own
+                // concrete type; otherwise the affinity fixes it, except NUMERIC
+                // whose type follows the source (an int/real source keeps its
+                // type; text/blob becomes `Any` — decided per value at runtime).
+                let ty = if let BExpr::Const(v) = &e {
+                    v.column_type()
+                } else {
+                    cast_result_type(aff, at)
+                };
+                Ok((e, ty))
             }
             ast::Expr::Collate(_, name) => {
                 // Validate the name so an unknown collation is reported as such
@@ -1486,20 +1492,40 @@ fn maybe_not(e: BExpr, negated: bool) -> BExpr {
 /// Constant-fold one node whose children are already folded: if every child
 /// is a constant, evaluate now (via the same IR evaluator used at run time,
 /// so semantics — including division-by-zero errors — match exactly).
-/// The type-level projection of `Instr::Cast`'s runtime accept set: true when
-/// SOME non-NULL value of `src` casts to `dst`. Text→number is the deliberate
-/// strictness line (no prefix-parse); blob/timestamp only cast to themselves.
-fn cast_possible(src: ColumnType, dst: ColumnType) -> bool {
+/// The storage type a bare `CAST(? AS t)` parameter is pinned to. sqlite's
+/// affinities map onto one mpedb type each — except NUMERIC, whose runtime type
+/// is decided per value, so a NUMERIC-cast parameter stays unpinned (`None`).
+fn affinity_pin_type(aff: Affinity) -> Option<ColumnType> {
+    Some(match aff {
+        Affinity::Integer => ColumnType::Int64,
+        Affinity::Real => ColumnType::Float64,
+        Affinity::Text => ColumnType::Text,
+        Affinity::Blob => ColumnType::Blob,
+        Affinity::Numeric => return None,
+    })
+}
+
+/// The bind-time result type of a non-constant `CAST` to `aff` over a source of
+/// type `src`. INTEGER/REAL/TEXT/BLOB are fixed. NUMERIC is the subtle one: an
+/// int/real/bool/timestamp source keeps a concrete numeric type (the runtime
+/// value is guaranteed to match), but a text/blob source can yield either an
+/// int or a real per value, so it is `Any` (mpedb's per-value-typed scalar).
+fn cast_result_type(aff: Affinity, src: Ty) -> Ty {
     use ColumnType as T;
-    if src == dst || src == T::Any || dst == T::Any {
-        return true;
-    }
-    matches!(
-        (src, dst),
-        (T::Int64, T::Float64 | T::Text | T::Bool)
-            | (T::Float64, T::Int64)
-            | (T::Bool, T::Int64 | T::Float64 | T::Text)
-    )
+    Some(match aff {
+        Affinity::Integer => T::Int64,
+        Affinity::Real => T::Float64,
+        Affinity::Text => T::Text,
+        Affinity::Blob => T::Blob,
+        Affinity::Numeric => match src {
+            Some(T::Int64) | Some(T::Bool) | Some(T::Timestamp) => T::Int64,
+            Some(T::Float64) => T::Float64,
+            // text, blob, or an already-`Any` source → per-value at runtime.
+            Some(T::Text) | Some(T::Blob) | Some(T::Any) => T::Any,
+            // NULL / untyped-parameter source: no static type.
+            None => return None,
+        },
+    })
 }
 
 /// Resolve a collation NAME (as written after `COLLATE`) to a built-in, or a

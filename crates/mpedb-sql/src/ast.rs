@@ -262,8 +262,12 @@ pub(crate) enum Expr {
     /// escapes), case-SENSITIVE, unanchored. Same shape as [`Expr::Glob`]:
     /// `negated` carries `NOT REGEXP`.
     Regexp(Box<Expr>, Box<Expr>, bool),
-    /// `CAST(x AS <type>)`.
-    Cast(Box<Expr>, mpedb_types::ColumnType),
+    /// `CAST(x AS <type>)` — the raw type name is kept verbatim (any identifier
+    /// is accepted, sqlite-style); the binder folds it to one of five
+    /// [`mpedb_types::Affinity`]s. A multi-word name (`DOUBLE PRECISION`) is
+    /// joined with single spaces; a parenthesized size (`VARCHAR(10)`) is
+    /// dropped (it never affects affinity).
+    Cast(Box<Expr>, String),
     /// `<expr> COLLATE <name>` — a postfix collation annotation (task: COLLATE).
     /// Binds tighter than any comparison. It carries the collation NAME as
     /// written (validated to a built-in at bind time); the binder honors it only

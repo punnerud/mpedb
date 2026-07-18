@@ -122,9 +122,9 @@ impl ExprProgram {
                 Instr::IsNotDistinct => buf.push(OP_IS_NOT_DISTINCT),
                 Instr::IsDistinct => buf.push(OP_IS_DISTINCT),
                 Instr::ToFloat => buf.push(OP_TO_FLOAT),
-                Instr::Cast(t) => {
+                Instr::Cast(aff) => {
                     buf.push(OP_CAST);
-                    buf.push(t as u8);
+                    buf.push(aff as u8);
                 }
                 Instr::Concat => buf.push(OP_CONCAT),
                 Instr::CmpColl(kind, coll) => {
@@ -214,8 +214,8 @@ impl ExprProgram {
                     let t = *buf.get(*pos).ok_or_else(err)?;
                     *pos += 1;
                     Instr::Cast(
-                        ColumnType::from_tag(t)
-                            .ok_or_else(|| Error::Corrupt("bad CAST type tag".into()))?,
+                        Affinity::from_tag(t)
+                            .ok_or_else(|| Error::Corrupt("bad CAST affinity tag".into()))?,
                     )
                 }
                 OP_CONCAT => Instr::Concat,

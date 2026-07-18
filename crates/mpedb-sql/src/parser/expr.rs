@@ -46,23 +46,6 @@ fn window_rank_fn(name: &str) -> Option<WindowFunc> {
     })
 }
 
-/// Map a SQL type name to the CAST target. sqlite's affinity vocabulary and
-/// the standard's both land on mpedb's five scalars; NUMERIC/DECIMAL take
-/// float64 (mpedb has no arbitrary-precision numeric — documented).
-fn cast_type(name: &str) -> Option<mpedb_types::ColumnType> {
-    use mpedb_types::ColumnType as T;
-    let up = name.to_ascii_uppercase();
-    Some(match up.as_str() {
-        "INTEGER" | "INT" | "BIGINT" | "SMALLINT" | "TINYINT" | "INT2" | "INT8" => T::Int64,
-        "REAL" | "FLOAT" | "DOUBLE" | "NUMERIC" | "DECIMAL" => T::Float64,
-        "TEXT" | "CHAR" | "VARCHAR" | "CHARACTER" | "CLOB" | "STRING" => T::Text,
-        "BOOLEAN" | "BOOL" => T::Bool,
-        "BLOB" => T::Blob,
-        "TIMESTAMP" => T::Timestamp,
-        _ => return None,
-    })
-}
-
 impl<'a> Parser<'a> {
     /// Enter one level of expression recursion, refusing to go deeper than the
     /// stack can hold.
@@ -73,6 +56,40 @@ impl<'a> Parser<'a> {
     /// `base - here` is bytes consumed; `saturating_sub` keeps a surprise from
     /// turning into a panic. This is what PostgreSQL's `check_stack_depth()`
     /// does, for the same reason.
+    /// Parse a `CAST` target type name — sqlite's liberal grammar: one or more
+    /// identifier words (`DOUBLE PRECISION`, `UNSIGNED BIG INT`) followed by an
+    /// OPTIONAL parenthesized size (`VARCHAR(10)`, `DECIMAL(10, 2)`). Any name
+    /// is accepted; the binder maps it to an affinity. The words are returned
+    /// joined by single spaces; the size is consumed and discarded (it never
+    /// changes the affinity). At least one word is required, except a single
+    /// quoted empty identifier (`CAST(x AS "")`) is allowed and yields "".
+    fn type_name(&mut self) -> Result<String> {
+        let mut words: Vec<String> = Vec::new();
+        while matches!(self.peek(), Some(Tok::Ident(_)) | Some(Tok::QuotedIdent(_))) {
+            words.push(self.ident("a type name in CAST")?);
+        }
+        if words.is_empty() {
+            return Err(self.err_here("expected a type name in CAST"));
+        }
+        // Optional `( number )` or `( number , number )` size/precision — accept
+        // and drop it. Signed numbers are allowed (some dialects write them).
+        if self.peek() == Some(&Tok::LParen) {
+            self.pos += 1;
+            while matches!(
+                self.peek(),
+                Some(Tok::Int(_))
+                    | Some(Tok::Float(_))
+                    | Some(Tok::Comma)
+                    | Some(Tok::Plus)
+                    | Some(Tok::Minus)
+            ) {
+                self.pos += 1;
+            }
+            self.expect(&Tok::RParen, ") after a type size in CAST")?;
+        }
+        Ok(words.join(" "))
+    }
+
     fn enter_expr(&mut self) -> Result<()> {
         let probe = 0u8;
         let here = &probe as *const u8 as usize;
@@ -701,12 +718,9 @@ impl<'a> Parser<'a> {
             self.pos += 2;
             let e = self.expr()?;
             self.expect_kw(Kw::As, "AS in CAST")?;
-            let tyname = self.ident("type name in CAST")?;
-            let ty = cast_type(&tyname).ok_or_else(|| {
-                self.err_here(format!("unknown CAST target type `{tyname}`"))
-            })?;
+            let tyname = self.type_name()?;
             self.expect(&Tok::RParen, ") after CAST")?;
-            return Ok(Expr::Cast(Box::new(e), ty));
+            return Ok(Expr::Cast(Box::new(e), tyname));
         }
         match self.advance() {
             Some(Tok::Int(v)) => Ok(Expr::Lit(Value::Int(v))),
