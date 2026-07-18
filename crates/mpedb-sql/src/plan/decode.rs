@@ -463,8 +463,56 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                 offset,
             }))
         }
+        STMT_RECURSIVE_CTE => {
+            let name = r_str(buf, pos)?;
+            let n_cols = r_u16(buf, pos)? as usize;
+            // At least one column (the required `t(c1, …)` list); capped like
+            // any projection so a forged count cannot balloon the allocation.
+            if n_cols == 0 || n_cols > MAX_COLUMNS {
+                return Err(corrupt("recursive CTE column count out of range"));
+            }
+            let mut columns = Vec::with_capacity(n_cols.min(1024));
+            let mut col_types = Vec::with_capacity(n_cols.min(1024));
+            for _ in 0..n_cols {
+                columns.push(r_str(buf, pos)?);
+                let tag = r_u8(buf, pos)?;
+                col_types.push(
+                    ColumnType::from_tag(tag)
+                        .ok_or_else(|| corrupt(format!("bad recursive CTE column type tag {tag}")))?,
+                );
+            }
+            let union_all = match r_u8(buf, pos)? {
+                0 => false,
+                1 => true,
+                t => return Err(corrupt(format!("bad recursive CTE union_all byte {t}"))),
+            };
+            let anchor = decode_select(buf, pos)?;
+            let recursive = decode_select(buf, pos)?;
+            let outer = decode_select(buf, pos)?;
+            Ok(PlanStmt::RecursiveCte(RecursiveCtePlan {
+                name,
+                columns,
+                col_types,
+                union_all,
+                anchor,
+                recursive,
+                outer,
+            }))
+        }
         other => decode_stmt_rest(other, buf, pos),
     }
+}
+
+/// A u32-length-prefixed UTF-8 string (the mirror of `w_str`), bounded at 1 MiB
+/// like every other string this decoder reads.
+fn r_str(buf: &[u8], pos: &mut usize) -> Result<String> {
+    let len = r_u32(buf, pos)? as usize;
+    if len > 1 << 20 {
+        return Err(corrupt("string too long in plan"));
+    }
+    Ok(std::str::from_utf8(take(buf, pos, len)?)
+        .map_err(|_| corrupt("invalid UTF-8 in plan string"))?
+        .to_string())
 }
 
 /// The body of a `Select` after its statement tag — the exact mirror of
