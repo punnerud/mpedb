@@ -1,8 +1,9 @@
 //! Common Table Expressions (`WITH cte AS (SELECT …) SELECT …`, #CTE). A
-//! non-recursive CTE is a statement-scoped named view: it is folded into the
-//! view catalog and flattened onto its base at bind time, reusing the view /
-//! derived-table machinery (no planner/plan-bytes/executor change). Only simple
-//! projection/filter bodies with unqualified outer refs (the view-path limit);
+//! non-recursive CTE is a statement-scoped named source: its body is flattened
+//! onto its base table at bind time, reusing the derived-table keep-alias splice
+//! (no planner/plan-bytes/executor change). Because the reference name is kept as
+//! the base's alias, both unqualified refs and qualified `cte.col` / `FROM cte
+//! AS x` (`x.col`) refs resolve. Only simple projection/filter bodies flatten;
 //! RECURSIVE, column-lists and complex bodies are refused. Cross-checked vs
 //! sqlite 3.45.
 
@@ -117,6 +118,84 @@ fn aggregate_over_cte_and_multiple_ctes() {
         &db,
         "WITH lo AS (SELECT * FROM t WHERE a < 3), hi AS (SELECT * FROM t WHERE a > 5) SELECT count(*) FROM hi",
     ), 2);
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn qualified_refs_resolve() {
+    let (db, path) = open();
+    setup(&db);
+    // `c.col` resolves in both the projection and the outer WHERE — the CTE name
+    // is kept as the spliced base's alias. (sqlite 3.45: 3,4,5.)
+    let got = rows(db.query(
+        "WITH c AS (SELECT id, a FROM t WHERE a > 2) SELECT c.a FROM c WHERE c.a < 6 ORDER BY c.a",
+        &[],
+    ).unwrap());
+    assert_eq!(got, vec![vec![Value::Int(3)], vec![Value::Int(4)], vec![Value::Int(5)]]);
+    // A `SELECT *`-bodied CTE addressed by qualifier, projecting two base columns
+    // (incl. column `c`, which the alias `c` must NOT shadow). (sqlite: 3,4,5.)
+    let got = rows(db.query(
+        "WITH c AS (SELECT * FROM t WHERE a > 2) SELECT c.id, c.c FROM c WHERE c.a < 6 ORDER BY c.id",
+        &[],
+    ).unwrap());
+    assert_eq!(got, vec![
+        vec![Value::Int(3), Value::Int(30)],
+        vec![Value::Int(4), Value::Int(40)],
+        vec![Value::Int(5), Value::Int(50)],
+    ]);
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn reference_alias_resolves() {
+    let (db, path) = open();
+    setup(&db);
+    // `FROM c AS x`: the reference alias `x` qualifies the columns. (sqlite: 3,4,5.)
+    let got = rows(db.query(
+        "WITH c AS (SELECT id, a FROM t WHERE a > 2) SELECT x.a FROM c AS x WHERE x.a < 6 ORDER BY x.a",
+        &[],
+    ).unwrap());
+    assert_eq!(got, vec![vec![Value::Int(3)], vec![Value::Int(4)], vec![Value::Int(5)]]);
+    // `SELECT *` over an aliased CTE exposes exactly the body's columns (id,a).
+    let got = rows(db.query(
+        "WITH c AS (SELECT id, a FROM t WHERE a > 4) SELECT * FROM c AS x ORDER BY x.id",
+        &[],
+    ).unwrap());
+    assert_eq!(got, vec![
+        vec![Value::Int(5), Value::Int(5)],
+        vec![Value::Int(6), Value::Int(6)],
+        vec![Value::Int(7), Value::Int(7)],
+    ]);
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn cte_joined_with_base_table() {
+    let (db, path) = open();
+    setup(&db);
+    db.query("CREATE TABLE u (uid INTEGER PRIMARY KEY, oid INT, x TEXT)", &[]).unwrap();
+    for uid in 1..=6 {
+        db.query(&format!("INSERT INTO u (uid, oid, x) VALUES ({uid}, {uid}, 'u{uid}')"), &[]).unwrap();
+    }
+    // A CTE in the main FROM joined with a base table, addressed by qualified
+    // refs on both sides. t rows a>4 = id 5,6,7; u.oid 1..6 → matches 5,6.
+    // (Cross-checked vs sqlite 3.45.)
+    let got = rows(db.query(
+        "WITH c AS (SELECT id, a FROM t WHERE a > 4) SELECT c.id, u.x FROM c JOIN u ON u.oid = c.id ORDER BY c.id",
+        &[],
+    ).unwrap());
+    assert_eq!(got, vec![
+        vec![Value::Int(5), Value::Text("u5".into())],
+        vec![Value::Int(6), Value::Text("u6".into())],
+    ]);
+    // A CTE in JOIN position is refused cleanly, never answered wrongly.
+    assert!(db.query(
+        "WITH c AS (SELECT id FROM t) SELECT u.x FROM u JOIN c ON c.id = u.oid",
+        &[],
+    ).is_err());
     db.verify().unwrap();
     let _ = std::fs::remove_file(&path);
 }
