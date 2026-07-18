@@ -82,16 +82,27 @@ pub(crate) fn compute_footprint(
     let mut fp = compute_stmt_footprint(stmt, schema)?;
     // A subplan's reads are the statement's reads — leaving them out would
     // let `conflicts_with` group this statement with a writer to the inner
-    // table as independent. Several key spaces ⇒ Full (the join argument).
+    // table as independent. This now walks the WHOLE subplan tree (nested lifts
+    // included, #73 §3). Several key spaces ⇒ Full (the join argument).
     for s in subplans {
-        let sf = select_footprint(&s.plan, schema)?;
-        fp.tables_read |= sf.tables_read;
-        fp.indexes_used |= sf.indexes_used;
-        if !subplans.is_empty() {
-            fp.key_access = KeyAccess::Full;
-        }
+        union_subplan_reads(s, schema, &mut fp)?;
+    }
+    if !subplans.is_empty() {
+        fp.key_access = KeyAccess::Full;
     }
     Ok(fp)
+}
+
+/// Union one subplan's table/index reads — and, recursively, its nested lifts'
+/// reads — into `fp`.
+fn union_subplan_reads(s: &SubPlan, schema: &Schema, fp: &mut Footprint) -> Result<()> {
+    let sf = select_footprint(&s.plan, schema)?;
+    fp.tables_read |= sf.tables_read;
+    fp.indexes_used |= sf.indexes_used;
+    for c in &s.subplans {
+        union_subplan_reads(c, schema, fp)?;
+    }
+    Ok(())
 }
 
 fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint> {

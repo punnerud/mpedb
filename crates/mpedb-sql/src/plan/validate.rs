@@ -595,34 +595,104 @@ impl CompiledPlan {
             }
         }
 
+        // Each top subplan (and, recursively, its own nested lifts — #73 §3) is
+        // validated against ITS level's parameter space and outer row. The
+        // budget bounds the whole tree at `MAX_SUBPLANS`, matching the decoder.
+        let user_ptypes = &self.param_types[..sub_base];
+        let mut budget = MAX_SUBPLANS;
         for s in &self.subplans {
-            for &a in &s.outer_args {
-                if a as usize >= outer_types.len() {
-                    return Err(corrupt("subplan correlation arg out of the outer row"));
-                }
+            self.validate_subplan_rec(schema, s, user_ptypes, &outer_types, &mut budget)?;
+        }
+        Ok(())
+    }
+
+    /// The base-row column types of one SELECT (`[table0 ‖ … ‖ tableN]`), used
+    /// as the OUTER row a subplan's `outer_args` index into. FROM-less (DUAL)
+    /// tables contribute nothing.
+    fn select_row_types(&self, sp: &SelectPlan, schema: &Schema) -> Result<Vec<ColumnType>> {
+        let mut types = Vec::new();
+        for id in std::iter::once(sp.table).chain(sp.joins.iter().map(|j| j.table)) {
+            if id == super::DUAL_TABLE {
+                continue;
             }
-            // A scalar subquery IS one value; EXISTS ignores its projection.
-            if s.kind == SubPlanKind::List && !s.outer_args.is_empty() {
-                return Err(corrupt("correlated IN-list subplan"));
+            let t = schema
+                .table(id)
+                .ok_or_else(|| corrupt(format!("table id {id} out of range")))?;
+            types.extend(t.columns.iter().map(|c| c.ty));
+        }
+        Ok(types)
+    }
+
+    /// Validate one subplan and, recursively, its nested lifts (#73 §3 stage 1).
+    ///
+    /// `base_ptypes` are the parameter types of the slots BELOW this subplan's
+    /// reserved region — i.e. `[user ‖ … ‖ this subplan's-parent correlation]`,
+    /// of width `parent.sub_base`. `parent_outer_types` is the enclosing plan's
+    /// base row, which this subplan's `outer_args` index into. The subplan's own
+    /// inner parameter space is then `base ‖ its correlation ‖ its children`, and
+    /// a nested child inherits `base ‖ its correlation` as ITS base.
+    fn validate_subplan_rec(
+        &self,
+        schema: &Schema,
+        s: &SubPlan,
+        base_ptypes: &[Option<ColumnType>],
+        parent_outer_types: &[ColumnType],
+        budget: &mut usize,
+    ) -> Result<()> {
+        if *budget == 0 {
+            return Err(corrupt("too many subplans in plan"));
+        }
+        *budget -= 1;
+
+        // `sub_base` locates the children slots; it must be exactly the level's
+        // param prefix plus this subplan's own correlation args, or the executor
+        // would fill children into the wrong indices.
+        if s.sub_base as usize != base_ptypes.len() + s.outer_args.len() {
+            return Err(corrupt("subplan sub_base inconsistent with its correlation args"));
+        }
+        for &a in &s.outer_args {
+            if a as usize >= parent_outer_types.len() {
+                return Err(corrupt("subplan correlation arg out of the outer row"));
             }
-            if s.kind != SubPlanKind::Exists
-                && s.plan.projection.len() - s.plan.order_junk as usize != 1
-            {
-                return Err(corrupt("scalar subplan must output exactly one column"));
-            }
-            // Subplans run through the plain executor too — see the arm rule.
-            if s.plan.post_filter.is_some() {
-                return Err(corrupt("subplan carries a post-filter"));
-            }
-            // The inner parameter space: [user params ‖ correlation args] —
-            // its own bound AND its own types (a correlation slot has the
-            // OUTER column's type, not whatever occupies that index in the
-            // outer layout).
-            let mut inner_types: Vec<Option<ColumnType>> =
-                self.param_types[..sub_base].to_vec();
-            inner_types
-                .extend(s.outer_args.iter().map(|&a| Some(outer_types[a as usize])));
-            self.validate_select(&s.plan, schema, &inner_types)?;
+        }
+        // A scalar subquery IS one value; EXISTS ignores its projection.
+        if s.kind == SubPlanKind::List && !s.outer_args.is_empty() {
+            return Err(corrupt("correlated IN-list subplan"));
+        }
+        if s.kind != SubPlanKind::Exists
+            && s.plan.projection.len() - s.plan.order_junk as usize != 1
+        {
+            return Err(corrupt("scalar subplan must output exactly one column"));
+        }
+        // Subplans run through the plain executor too — see the arm rule.
+        if s.plan.post_filter.is_some() {
+            return Err(corrupt("subplan carries a post-filter"));
+        }
+        // Stage 1 is UNCORRELATED nesting: a nested lift may not correlate to any
+        // enclosing row (that is stages 2–3). A correlated child would be filled
+        // per outer row, but the executor fills nested children ONCE — so a plan
+        // claiming one is refused rather than misexecuted.
+        if s.subplans.iter().any(|c| !c.outer_args.is_empty()) {
+            return Err(corrupt("a nested correlated subplan is not supported"));
+        }
+        // The inner parameter space: base ‖ this subplan's correlation ‖ its
+        // children results. A correlation slot has the OUTER column's type; a
+        // child result slot carries the child's declared `slot_type` (so a child
+        // used as a key part still type-checks).
+        let mut inner_types: Vec<Option<ColumnType>> = base_ptypes.to_vec();
+        inner_types.extend(s.outer_args.iter().map(|&a| Some(parent_outer_types[a as usize])));
+        // (`inner_types.len()` is now `s.sub_base`.)
+        for c in &s.subplans {
+            inner_types.push(c.slot_type);
+        }
+        self.validate_select(&s.plan, schema, &inner_types)?;
+
+        // Recurse: a nested child's base prefix is `[user ‖ … ‖ this
+        // correlation]` (width `s.sub_base`), and its outer row is s.plan's row.
+        let child_base = &inner_types[..s.sub_base as usize];
+        let child_outer = self.select_row_types(&s.plan, schema)?;
+        for c in &s.subplans {
+            self.validate_subplan_rec(schema, c, child_base, &child_outer, budget)?;
         }
         Ok(())
     }

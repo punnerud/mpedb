@@ -117,22 +117,13 @@ impl CompiledPlan {
         if n_sub + n_context > n_params as usize {
             return Err(corrupt("more reserved slots than parameters"));
         }
+        // `MAX_SUBPLANS` bounds the WHOLE tree (top + every nesting level), so a
+        // forged blob cannot make the decoder allocate an unbounded subplan
+        // forest — the DoS bound the flat format had, kept under recursion.
+        let mut budget = MAX_SUBPLANS;
         let mut subplans = Vec::with_capacity(n_sub);
         for _ in 0..n_sub {
-            let kind = match SubPlanKind::from_tag(r_u8(bytes, &mut pos)?) {
-                Some(k) => k,
-                None => return Err(corrupt("bad subplan kind tag")),
-            };
-            let n_args = r_u16(bytes, &mut pos)? as usize;
-            if n_args > MAX_COLUMNS {
-                return Err(corrupt("too many subplan correlation args"));
-            }
-            let mut outer_args = Vec::with_capacity(n_args.min(64));
-            for _ in 0..n_args {
-                outer_args.push(r_u16(bytes, &mut pos)?);
-            }
-            let plan = decode_select(bytes, &mut pos)?;
-            subplans.push(SubPlan { plan, outer_args, kind });
+            subplans.push(decode_subplan(bytes, &mut pos, &mut budget)?);
         }
         let footprint = Footprint::decode(bytes, &mut pos)?;
         let stmt = decode_stmt(bytes, &mut pos)?;
@@ -156,6 +147,49 @@ impl CompiledPlan {
         plan.validate(schema)?;
         Ok(plan)
     }
+}
+
+/// One lifted subquery, RECURSIVELY (#73 §3) — the exact mirror of
+/// [`encode_subplan`]. `budget` is decremented per subplan (top AND nested) and
+/// bounds the whole tree at `MAX_SUBPLANS`, so a hostile blob cannot balloon the
+/// subplan forest.
+fn decode_subplan(buf: &[u8], pos: &mut usize, budget: &mut usize) -> Result<SubPlan> {
+    if *budget == 0 {
+        return Err(corrupt("too many subplans in plan"));
+    }
+    *budget -= 1;
+    let kind =
+        SubPlanKind::from_tag(r_u8(buf, pos)?).ok_or_else(|| corrupt("bad subplan kind tag"))?;
+    let sub_base = r_u16(buf, pos)?;
+    let slot_type = match r_u8(buf, pos)? {
+        0 => None,
+        tag => Some(
+            ColumnType::from_tag(tag)
+                .ok_or_else(|| corrupt(format!("bad subplan slot type tag {tag}")))?,
+        ),
+    };
+    let n_args = r_u16(buf, pos)? as usize;
+    if n_args > MAX_COLUMNS {
+        return Err(corrupt("too many subplan correlation args"));
+    }
+    let mut outer_args = Vec::with_capacity(n_args.min(64));
+    for _ in 0..n_args {
+        outer_args.push(r_u16(buf, pos)?);
+    }
+    let plan = decode_select(buf, pos)?;
+    let n_children = r_u8(buf, pos)? as usize;
+    let mut subplans = Vec::with_capacity(n_children.min(MAX_SUBPLANS));
+    for _ in 0..n_children {
+        subplans.push(decode_subplan(buf, pos, budget)?);
+    }
+    Ok(SubPlan {
+        plan,
+        outer_args,
+        kind,
+        subplans,
+        sub_base,
+        slot_type,
+    })
 }
 
 fn decode_opt_program(buf: &[u8], pos: &mut usize) -> Result<Option<ExprProgram>> {

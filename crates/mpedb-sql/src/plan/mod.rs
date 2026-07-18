@@ -90,7 +90,15 @@ const MAX_JOINS: usize = 16;
 //     reader hits the unknown opcode in `ExprProgram::decode` and rejects the
 //     plan as corrupt rather than misreading it — the same additive gating as
 //     the LIKE-shaped and scalar-fn bumps above.
-const PLAN_FORMAT: u8 = 19;
+// 20: nested subqueries (#73 §3 stage 1) — `SubPlan` becomes RECURSIVE. Each
+//     subplan record grows a `sub_base` (u16), a `slot_type` byte, and a
+//     trailing COUNT + list of its OWN nested `SubPlan`s (its uncorrelated inner
+//     lifts). A format-19 reader would take the new `sub_base` bytes as the old
+//     `outer_args` count and desynchronize — so the whole-plan version gates it:
+//     a format-19 blob decoded here (or a format-20 blob decoded by a format-19
+//     binary) fails CLOSED at byte 0 with `PlanInvalidated`, the documented
+//     re-prepare path, never a misread of the new shape.
+const PLAN_FORMAT: u8 = 20;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -195,11 +203,31 @@ pub enum OrderOver {
 /// parametrization idea as the index nested loop's `OuterCol`, applied to a
 /// whole plan. `outer_args` empty = uncorrelated: evaluated ONCE per execute
 /// (before access resolution, so a PK probe may consume its slot), not per row.
+///
+/// **Recursive (#73 §3 stage 1).** A subquery may CONTAIN subqueries: `subplans`
+/// holds this inner's own lifts, with their result slots living in THIS subplan's
+/// inner parameter buffer `[user ‖ correlation args ‖ children results]` at
+/// `sub_base + i`. For stage 1 every nested child is UNCORRELATED (`outer_args`
+/// empty) — a nested subquery that references an enclosing row is stages 2–3 and
+/// is refused. The executor fills the uncorrelated children ONCE, bottom-up,
+/// before this subplan's own access resolution.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SubPlan {
     pub plan: SelectPlan,
     pub outer_args: Vec<u16>,
     pub kind: SubPlanKind,
+    /// This subplan's OWN lifted subqueries. Empty = a leaf (the pre-#73 shape).
+    pub subplans: Vec<SubPlan>,
+    /// First reserved child-result slot in this subplan's inner parameter buffer
+    /// = `n_user + outer_args.len()`; child `i`'s result occupies `sub_base + i`.
+    /// Its value is the `n_params` the inner was planned with, so exec/validate
+    /// can locate the children without re-deriving the layout.
+    pub sub_base: u16,
+    /// The type THIS subplan's result slot carries in its PARENT's buffer
+    /// (`Bool` for EXISTS, the projected column's type for a scalar, `None` for
+    /// an IN-list). Carried so a parent's `validate` can type its inner param
+    /// space — including a child used as a key part — without re-planning.
+    pub slot_type: Option<ColumnType>,
 }
 
 /// What a subplan's result slot HOLDS.
