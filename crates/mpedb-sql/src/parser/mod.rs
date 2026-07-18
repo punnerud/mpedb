@@ -172,6 +172,26 @@ fn agg_fn(name: &str) -> Option<mpedb_types::AggFn> {
     })
 }
 
+/// A FROM-less `SELECT <items>` — reads no table and evaluates its items over
+/// ONE synthetic row (the #67 DUAL sentinel). The building block a standalone
+/// `VALUES` row desugars into.
+fn from_less_select(items: Vec<(Expr, Option<String>)>) -> SelectStmt {
+    SelectStmt {
+        table: None,
+        from_derived: None,
+        alias: None,
+        joins: Vec::new(),
+        distinct: false,
+        items: Some(items),
+        where_clause: None,
+        group_by: Vec::new(),
+        having: None,
+        order_by: Vec::new(),
+        limit: None,
+        offset: None,
+    }
+}
+
 impl<'a> Parser<'a> {
     fn new(src: &'a str, toks: Vec<SpTok>) -> Self {
         Parser {
@@ -383,6 +403,7 @@ impl<'a> Parser<'a> {
     fn statement(&mut self) -> Result<Stmt> {
         match self.peek() {
             Some(Tok::Kw(Kw::Select)) => self.select_stmt(),
+            Some(Tok::Kw(Kw::Values)) => self.values_stmt(),
             Some(Tok::Kw(Kw::Insert)) => self.insert_stmt(),
             Some(Tok::Kw(Kw::Update)) => self.update_stmt(),
             Some(Tok::Kw(Kw::Delete)) => self.delete_stmt(),
@@ -398,8 +419,87 @@ impl<'a> Parser<'a> {
                 self.pos += 1;
                 Ok(Stmt::Rollback)
             }
-            _ => Err(self.err_here("expected a statement (SELECT, INSERT, UPDATE, DELETE, BEGIN, COMMIT, ROLLBACK)")),
+            _ => Err(self.err_here("expected a statement (SELECT, VALUES, INSERT, UPDATE, DELETE, BEGIN, COMMIT, ROLLBACK)")),
         }
+    }
+
+    /// Standalone `VALUES (a, b), (c, d), …` — a top-level row-returning
+    /// statement (sqlite). Desugared HERE, at parse time, into the equivalent
+    /// compound `SELECT a, b UNION ALL SELECT c, d UNION ALL …` of FROM-less
+    /// SELECTs (#67's DUAL sentinel), so it reuses the existing compound
+    /// planner/executor with ZERO plan-format change. Rules mirror sqlite:
+    /// every tuple has the SAME arity, at least one tuple, and the output
+    /// columns are named `column1..columnN` — aliases set on the FIRST arm,
+    /// since a compound takes its output names from arm 0. A single tuple is a
+    /// plain `Stmt::Select`; more than one becomes a `UNION ALL` compound.
+    ///
+    /// Only the top-level statement form is handled here. `VALUES` as a
+    /// subquery/derived-table source (`FROM (VALUES …)`) is not: a multi-row
+    /// VALUES is a compound, which a derived-table body (a single `SelectStmt`)
+    /// cannot hold, and wiring that would reach into the view-flatten pass.
+    fn values_stmt(&mut self) -> Result<Stmt> {
+        self.expect_kw(Kw::Values, "VALUES")?;
+        let mut arms: Vec<SelectStmt> = Vec::new();
+        loop {
+            self.expect(&Tok::LParen, "`(` starting a VALUES row")?;
+            let mut row = vec![self.expr()?];
+            while self.eat(&Tok::Comma) {
+                if row.len() >= MAX_SELECT_ITEMS {
+                    return Err(self.err_here(format!(
+                        "too many columns in a VALUES row (max {MAX_SELECT_ITEMS})"
+                    )));
+                }
+                row.push(self.expr()?);
+            }
+            self.expect(&Tok::RParen, "`)` closing a VALUES row")?;
+            // Every row must have the arity of the first — sqlite/PG both
+            // reject a ragged VALUES rather than NULL-padding it.
+            if let Some(first) = arms.first() {
+                let want = first.items.as_ref().map_or(0, Vec::len);
+                if row.len() != want {
+                    return Err(self.err_here(format!(
+                        "all VALUES rows must have the same number of columns \
+                         (the first row has {want}, this one has {})",
+                        row.len()
+                    )));
+                }
+            }
+            // Arm 0 names the output columns `column1..N` (sqlite's names); the
+            // later arms only supply values — a compound's output names come
+            // from its first arm, so naming them there would be dead weight.
+            let first_arm = arms.is_empty();
+            let items = row
+                .into_iter()
+                .enumerate()
+                .map(|(i, e)| {
+                    let alias = first_arm.then(|| format!("column{}", i + 1));
+                    (e, alias)
+                })
+                .collect();
+            arms.push(from_less_select(items));
+            if !self.eat(&Tok::Comma) {
+                break;
+            }
+            // The desugaring targets the compound-SELECT machinery, which caps
+            // its arms at the plan decoder's limit; a VALUES with more rows than
+            // that has no plan representation, so refuse it clearly.
+            if arms.len() >= MAX_COMPOUND_ARMS {
+                return Err(self.err_here(format!(
+                    "too many VALUES rows (max {MAX_COMPOUND_ARMS})"
+                )));
+            }
+        }
+        if arms.len() == 1 {
+            return Ok(Stmt::Select(arms.into_iter().next().expect("one arm")));
+        }
+        let ops = vec![SetOp::UnionAll; arms.len() - 1];
+        Ok(Stmt::Compound(CompoundStmt {
+            arms,
+            ops,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        }))
     }
 
     /// `SELECT …`, or a compound chain `SELECT … UNION [ALL]/EXCEPT/INTERSECT

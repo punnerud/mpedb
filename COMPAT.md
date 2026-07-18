@@ -53,7 +53,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | CREATE VIEW / DROP VIEW | ✅ | a query naming the view is flattened onto its base table (WHERE merged; `SELECT *` yields the view's columns; view-over-view chains). Simple projection/filter views over one table; aggregate/join/DISTINCT view bodies are refused at reference time (never answered wrongly) — [DESIGN-VIEW.md](DESIGN-VIEW.md) |
 | CREATE TRIGGER | ❌ | planned both as in-SQL triggers and as PySpell/ETL-layer code |
 | WITH (CTEs) | 🚧 | a non-recursive `WITH c AS (SELECT …) …` is a statement-scoped named view — folded into the view catalog and flattened onto its base at bind time (same simple projection/filter bodies as views; unqualified outer refs and `SELECT *`). RECURSIVE, explicit column-lists `WITH c(x,y)`, and aggregate/join/DISTINCT bodies are refused (never answered wrongly) — [DESIGN-CTE.md](DESIGN-CTE.md) |
-| VALUES (standalone) | ❌ | |
+| VALUES (standalone) | ✅ | top-level `VALUES (a,b),(c,d),…` — the listed tuples become the result rows in order; columns named `column1..columnN` (sqlite's names). Desugared at parse time into the equivalent compound `SELECT … UNION ALL SELECT …` of FROM-less SELECTs, so no new plan format. All tuples must have equal arity (ragged is refused). VALUES as a subquery/derived-table source (`FROM (VALUES …)`) is not yet supported — a multi-row VALUES is a compound, which a derived-table body cannot hold — and is refused, never mis-answered |
 | PRAGMA | **Not needed** | everything a PRAGMA would set lives in the config file, per database, versioned |
 | VACUUM | **Not needed** | COW pages + commit-time freelist fixpoint reclaim space continuously |
 | ATTACH / DETACH | ❌ | cross-file read-joins over workspace members are planned (#51) |
