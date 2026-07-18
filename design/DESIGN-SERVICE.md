@@ -12,27 +12,47 @@ A queue and a cron schedule are just *tables*. What makes a DB-backed task runne
 multi-process-safe claiming and crash-safety — and mpedb already has both (PostgreSQL-grade
 concurrency, SIGKILL-safe commit path). So mpedb can be **pg-boss / River / pg_cron, but embedded and
 serverless**: many unrelated OS processes enqueue, claim, and schedule work through one `.mpedb` file
-with transactional guarantees, no server to run. The optional daemon adds only what a file cannot do
-alone: *wake-ups* (timers, a doorbell) and *outbound* I/O (webhooks) under a rate budget.
+with transactional guarantees, no server to run. And the wake-ups + routing can come **entirely from
+the OS** (cron/systemd) and **nginx** — so the *default* needs no resident process at all (§1, model
+A); a long-lived daemon is only a throughput optimization on top.
 
-## 1. Service / daemon mode (`mpedb serve <db>`)
+## 1. Two ways to run it — and the serverless one is the default
 
-- A long-lived process that attaches the `.mpedb` and **hibernates** ("dvale") — no busy polling. It
-  blocks on the earliest of: (a) an inbound API request, (b) the next due scheduled task, (c) a
-  **doorbell** raised by another process that just enqueued work.
-- **Doorbell**: mpedb already has a shared lock area + reader table in the mmap (pages 2–3, CLAUDE.md).
-  Add a lightweight cross-process wake primitive there — a futex/eventfd-style counter another
-  process bumps on enqueue, so the daemon wakes immediately without polling. Falls back to a bounded
-  timer if the platform lacks the primitive. Multi-process identity/robustness reuses the existing
-  {pid,seq}+start-time + boot-id recovery (`post_attach`).
-- **API surface**: a local Unix-domain socket by default (and optional TCP), speaking a small
-  request protocol — `submit(proc, args)`, `enqueue(queue, payload, run_at?)`, `query(sql)`,
-  `wake`. "Exposes an API that wakes on request" = the socket accept loop is one of the hibernation
-  wake sources. HTTP is a thin adapter over the same protocol (Phase 6b).
-- The daemon is **optional and stateless w.r.t. correctness**: everything it does (claim a task, run
-  a proc, fire a webhook) is a normal transactional mutation any process could do. Kill the daemon
-  and direct attach still works; restart and it recovers from the tables. No daemon = no wake-ups and
-  no outbound callouts, but the data model is unchanged.
+**Model A — serverless / OS-integrated (default; the truest "dvale": zero resident process).** Lean
+on infrastructure that already solves wake/route/hibernate; mpedb implements none of it:
+- *Scheduled work*: the DB `cron` table is authoritative, and `mpedb cron sync` **projects it onto
+  the OS scheduler** — writing exact-time crontab lines / systemd timers / `at` jobs so a task due at
+  14:32:05 fires precisely then, not on a poll tick. The OS timer invokes `mpedb run-due <db>`, which
+  attaches, claims + runs due tasks, and exits. Nothing resident between fires. Any process edits the
+  table; a tiny reconcile (itself timer-driven, or rung by the edit) rewrites the OS units — DB is
+  the source of truth, the OS scheduler is just the executor.
+- *On-demand API*: **nginx** routes to mpedb via **systemd socket-activation** or **FastCGI**
+  (`fastcgi_pass`). The socket exists; the first request spawns a short-lived mpedb responder that
+  serves and exits after idle. That *is* "expose an API that wakes on request and goes back to
+  sleep" — the OS + nginx are the doorbell and the hibernation.
+- *State lives in the file, not in memory*: the queue, the schedule, and the callout token-bucket are
+  all tables, so short-lived processes read/CAS them transactionally. The rate budget works **better**
+  here than in a daemon — there is no resident memory to lose it in; it is durable and multi-process
+  by construction.
+- This is the CGI/inetd/serverless model, and it fits the no-server contract most purely: genuinely
+  no server, just a file + processes the OS spawns on a timer or a request. Many spawned workers
+  attaching one file is exactly mpedb's design point (writer-lock + MVCC) — safe by construction, no
+  new race.
+
+**Model B — resident daemon `mpedb serve <db>` (optional; a throughput optimization).** When request
+rates are high enough that per-invocation attach/teardown dominates, a long-lived process amortizes
+the attach and adds an in-process **doorbell** — a futex/eventfd-style counter in the shm lock area
+(pages 2–3, CLAUDE.md) another process bumps on enqueue — for sub-tick enqueue→run latency without a
+round-trip through nginx. It blocks on the earliest of an inbound request, the next due task, or the
+doorbell; multi-process identity reuses the existing {pid,seq}+start-time + boot-id recovery
+(`post_attach`). Same tables, same semantics — it just holds the attach warm and skips cold starts.
+**Correctness never depends on it**: everything it does is a normal transactional mutation any
+process could do; kill it and Model A still runs.
+
+**Choosing**: spiky / low / scheduled traffic (the "dvale" case) → A, no daemon at all. Sustained
+high throughput or sub-second enqueue latency → B. They compose — A for cron, B for the hot API path.
+The API request protocol (`submit`/`enqueue`/`query`/`wake`) is identical whether it arrives over
+FastCGI (A) or the daemon's socket (B); HTTP is a thin adapter either way.
 
 ## 2. Queues + task runner
 
@@ -52,8 +72,9 @@ alone: *wake-ups* (timers, a doorbell) and *outbound* I/O (webhooks) under a rat
 
 ## 3. Dynamic cron — better than crontab because it is a table
 
-- A `cron` table: `(name, schedule, proc, args, next_run, last_run, enabled, singleton)`. The daemon
-  keeps a min-heap on `next_run` and sleeps until the earliest; firing enqueues a task (§2) rather
+- A `cron` table: `(name, schedule, proc, args, next_run, last_run, enabled, singleton)`. Model A
+  projects `next_run` onto the OS scheduler (§1); Model B keeps an in-process min-heap and sleeps
+  until the earliest. Either way, firing enqueues a task (§2) rather
   than running inline, so cron and queue share one execution path.
 - **Dynamic, multi-process, transactional**: any process adds/removes/toggles cron rows via CLI
   (`mpedb cron add <name> "<sched>" <proc>`, `cron rm`, `cron list`, `cron pause`) or plain SQL —
