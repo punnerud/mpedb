@@ -2,9 +2,10 @@
 
 **Status: exploration (2026-07-18, #22). A *light* think, not a build commitment. Scope refined by
 Morten: the file need not be frozen — it is served live over HTTP and may be mutating; the whole
-question is **data layout**, because each HTTP call is a slow round-trip. Hard constraint: **nothing
-here may cost the local (mmap) hot path** — every lever below is opt-in or lives in the client
-fetcher.**
+question is **data layout**, because each HTTP call is a slow round-trip. Hard constraints: **nothing
+here may cost the local (mmap) hot path, and the on-disk format does not change** — the browser is a
+separate WASM build (feature-flagged) that swaps the `PageStore`; every optimization lives in its
+fetch strategy (see §2).**
 
 ## 0. The question
 
@@ -31,18 +32,29 @@ part is the **one-time bootstrap** (reading the catalog + plan-registry to learn
 table's tree root). So HTTP-range viability is almost entirely a **bootstrap-layout** question, not a
 per-query one.
 
-## 2. Levers (each additive / client-side — zero local hot-path cost)
+## 2. The two-mpedb model — a WASM read build, no format change
 
-1. **Contiguous bootstrap prefix (the big one).** Today the meta + catalog + plan-registry pages are
-   spread across the file (322 scattered pages → up to 322 range requests on first touch). If they
-   were **clustered into a contiguous region at a known offset**, the client fetches the whole
-   bootstrap in *one* coalesced range request. This is a *write-side layout* choice (where the
-   allocator places catalog/registry pages) or an **opt-in repack** that produces an
-   HTTP-optimized copy — neither touches the read hot path. Biggest single win.
-2. **The client fetcher is a `PageStore` over `Range: bytes=`** with a page cache + read-ahead
-   coalescing (fetch a small window around the needed page; adjacent B-tree pages ride along). The
-   bootstrap is cached once; thereafter each query adds 3–6 small fetches. A WASM build gives the
-   browser case (sql.js-httpvfs). All of this is *new client code*, not an engine change.
+Morten's framing sharpens it: this is essentially **two mpedbs sharing one on-disk format**. One is
+the normal disk engine (writes, mmap `PageStore` — unchanged). The other is a **WASM/browser build**
+(a feature flag, e.g. `http-range`) whose *only* difference is a **different `PageStore`
+implementation** — an HTTP-`Range` fetcher with a page cache — under the *same* btree/row/plan/exec
+code reading the *same* bytes. `PageStore` is already the seam (mmap `Shm` is one impl, `TestStore`
+another; the HTTP fetcher is a third, returning borrows into its own cache). **So the disk format
+never changes**, and the browser build is free to fetch *more, or differently* than the disk engine
+would — its cost model is round-trips, not page faults. Every lever below lives in that build's fetch
+strategy; none touches the format or the local hot path:
+
+1. **Over-fetch a span instead of clustering the format (the big win).** The 322 bootstrap pages span
+   ~1000 pages here (`[69..1106]` ≈ 4 MB). The browser fetches that **whole span in ONE range
+   request** and serves the 322 it needs from cache — one round-trip instead of 322, **no format
+   change**. One ~4 MB fetch beats 322 × latency by orders of magnitude. (*Optional* later: an opt-in
+   repack that clusters the bootstrap shrinks the useful span from ~4 MB to ~1.3 MB — less
+   over-fetch — but it is never required, and it does not touch the read path.)
+2. **Adaptive, predictive fetching** — all client-side. The fetcher caches fetched pages, coalesces a
+   read-ahead window around each needed page (adjacent B-tree nodes ride along), and can prefetch the
+   *predictable* descent path (a point query is root→internal→leaf — knowable ahead of the fetch). It
+   tunes the window from observed access. A point query is then ~3 small fetches (or a single
+   windowed one) after the cached bootstrap. sql.js-httpvfs is the reference.
 3. **Mutation fragmentation.** COW scatters a table's leaves as it churns, so a range scan that reads
    contiguous leaves on a fresh file reads scattered ones on a churned file → more round-trips. Fix
    with an **opt-in repack/compaction** that restores leaf locality (like `VACUUM` → contiguous). It
