@@ -286,9 +286,17 @@ mod tests {
             DdlStmt::AlterAddColumn { column, .. } => assert!(column.not_null),
             other => panic!("{other:?}"),
         }
-        // Unknown type / missing type error.
+        // A trailing unknown word after a typeless column is still a parse
+        // error (leftover token). But a TYPELESS ADD COLUMN is now valid,
+        // sqlite-style: the column becomes `Any` (no affinity).
         assert!(parse_ddl("ALTER TABLE t ADD COLUMN c BOGUS").is_err());
-        assert!(parse_ddl("ALTER TABLE t ADD COLUMN c").is_err());
+        match parse_ddl("ALTER TABLE t ADD COLUMN c").unwrap().unwrap() {
+            DdlStmt::AlterAddColumn { column, .. } => {
+                assert_eq!(column.name, "c");
+                assert_eq!(column.ty, ColumnType::Any);
+            }
+            other => panic!("expected typeless AlterAddColumn, got {other:?}"),
+        }
     }
 
     #[test]

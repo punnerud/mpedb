@@ -248,3 +248,26 @@ fn second_process_sees_the_new_table() {
     a.verify().unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn typeless_column_accepts_any_scalar_like_sqlite() {
+    // A column with no declared type is sqlite's no-affinity column; mpedb maps
+    // it to `Any` (the loose-type escape hatch), so it stores any scalar as-is.
+    // Requires an explicit PK (mpedb has no implicit rowid yet).
+    let (cfg, path) = config("typeless");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query("CREATE TABLE tl (id INTEGER PRIMARY KEY, data)", &[]).unwrap();
+    db.query("INSERT INTO tl VALUES (1, 'text')", &[]).unwrap();
+    db.query("INSERT INTO tl VALUES (2, 42)", &[]).unwrap();
+    db.query("INSERT INTO tl VALUES (3, 3.5)", &[]).unwrap();
+    db.query("INSERT INTO tl VALUES (4, NULL)", &[]).unwrap();
+    assert_eq!(scalar_i64(&db, "SELECT count(*) FROM tl"), 4);
+    // Each value comes back with its original dynamic type.
+    let r = rows(db.query("SELECT data FROM tl ORDER BY id", &[]).unwrap());
+    assert_eq!(r[0][0], Value::Text("text".into()));
+    assert_eq!(r[1][0], Value::Int(42));
+    assert_eq!(r[2][0], Value::Float(3.5));
+    assert_eq!(r[3][0], Value::Null);
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
