@@ -15,7 +15,7 @@ durability classes, all latency percentiles) live in its own file.
 
 Turso (the Rust SQLite rewrite) joined the field 2026-07-17; its adapter's
 honesty decisions and a compatibility-parity comparison live in
-[TURSO.md](TURSO.md).
+[design/TURSO.md](design/TURSO.md).
 
 The Pi is not a third data point in the engine comparison and never will be:
 `mpedb-bench` links SQLite (bundled C) and PostgreSQL, which needs a C

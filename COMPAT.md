@@ -3,7 +3,7 @@
 Feature-by-feature status of mpedb's SQL surface against SQLite, in the same
 format as [Turso's COMPAT.md](https://github.com/tursodatabase/turso/blob/main/COMPAT.md)
 so the two can be read side by side (the measured three-way comparison lives in
-[TURSO.md](TURSO.md)). Legend: ✅ yes · 🚧 partial · ❌ no · **Not needed** =
+[design/TURSO.md](design/TURSO.md)). Legend: ✅ yes · 🚧 partial · ❌ no · **Not needed** =
 deliberately solved another way, not a gap on the roadmap.
 
 Two things make this page different from a typical compatibility list:
@@ -203,14 +203,14 @@ writer, writers queue on a robust cross-process mutex, and any process may be
 SIGKILLed at any instant — that exact scenario is fuzzed continuously
 (`mpedb crash`, `mirror-collide`). sqlite serializes at the file level with
 busy-waiting; [Turso currently returns Busy to a second writer and does not
-support multi-process mixed use](TURSO.md).
+support multi-process mixed use](design/TURSO.md).
 
 | | sqlite | mpedb | notes |
 |---|---|---|---|
 | many processes, one database | ✅ file locks + busy_timeout | ✅ shared-memory attach, MVCC | measured (2-core Linux, readers beside one writer): commit-class mpedb 569k reads/s vs sqlite-WAL 568k — a tie; none-class mpedb 467k vs sqlite-journal 2,251 (that mode serializes readers against the writer) |
 | readers block the writer | in rollback-journal mode, yes; in WAL, no | never | |
 | a process dies mid-write (SIGKILL) | journal/WAL recovery on next open | robust-mutex takeover + intent-ring recovery, fuzzed at every instant | `mpedb crash` is the harness |
-| second concurrent writer | waits (busy_timeout) | queues on the writer lock; group commit under contention | Turso 0.7: immediate Busy, no arbitration — its contended p99 is 51–225 ms in [the measured field](TURSO.md) |
+| second concurrent writer | waits (busy_timeout) | queues on the writer lock; group commit under contention | Turso 0.7: immediate Busy, no arbitration — its contended p99 is 51–225 ms in [the measured field](design/TURSO.md) |
 
 ## Memory and resource discipline
 
@@ -228,7 +228,7 @@ The contrast that motivated writing this down: sqlite's WAL is bounded by
 autocheckpoint (1000 pages, default ON); **Turso 0.7 has no autocheckpoint at
 all, and its WAL measured 1.9 GB of growth inside one 3-second write cell** —
 enough to fill the host disk — until the benchmark adapter supplied manual
-`wal_checkpoint(TRUNCATE)` calls ([TURSO.md](TURSO.md) has the details).
+`wal_checkpoint(TRUNCATE)` calls ([design/TURSO.md](design/TURSO.md) has the details).
 
 ## Migration
 
@@ -245,7 +245,7 @@ enough to fill the host disk — until the benchmark adapter supplied manual
 From the 2026-07-17 head-to-head runs (one run per machine, all engines in the
 same run; full tables with latencies and methodology in
 [BENCHMARKS.md](BENCHMARKS.md) and the per-machine RESULTS files, the four-way
-field including PostgreSQL and Turso in [TURSO.md](TURSO.md)). Compare within
+field including PostgreSQL and Turso in [design/TURSO.md](design/TURSO.md)). Compare within
 a durability class only; absolute numbers are those hosts', ratios travel
 better. "r / w" is concurrent readers + one writer.
 

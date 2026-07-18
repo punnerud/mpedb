@@ -44,7 +44,7 @@ directions and records what the source declared, so migration is a thing you
 validate rather than hope about.
 
 And you can start from the file you already have, sqlite3-style —
-**[SQLITE.md](SQLITE.md) is the dedicated page**: your .db as the durable
+**[design/SQLITE.md](design/SQLITE.md) is the dedicated page**: your .db as the durable
 home, the .mpedb beside it as its WAL, checkpoints folding writes back.
 In short:
 **`mpedb data.db`** opens it exactly like `sqlite3 data.db` does (repl or
@@ -384,7 +384,7 @@ comparison** — methodology, every machine, and a link to each machine's full
 generated tables. The highlights from all of them are below.
 [Turso](https://github.com/tursodatabase/turso), the Rust SQLite rewrite, is
 measured as a fourth engine — numbers and a compatibility-parity comparison in
-[TURSO.md](TURSO.md).
+[design/TURSO.md](design/TURSO.md).
 
 Two things to know before reading any of it: numbers are only comparable
 **within a durability class** (none-class has no fsync guarantee, commit-class is
