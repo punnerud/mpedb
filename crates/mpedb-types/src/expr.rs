@@ -255,6 +255,15 @@ fn in_list_3vl(probe: &Value, list: &Value) -> Result<Value> {
 /// two forms cannot drift apart on the NULL rules above — which decide whether
 /// a policy admits a row.
 fn in_items_3vl(probe: &Value, items: &[Value]) -> Result<Value> {
+    // `x IN ()` — membership in the EMPTY set — is FALSE for any `x`, NULL
+    // included: nothing is a member of nothing (SQL 3VL). This MUST precede the
+    // null-probe short-circuit below, or `NULL IN (<empty subquery>)` wrongly
+    // yields NULL where sqlite/PostgreSQL give 0. (A literal `IN ()` never
+    // reaches here — the IR rejects a zero-element `InList` — so this only fires
+    // for an empty subquery/context list.)
+    if items.is_empty() {
+        return Ok(Value::Bool(false));
+    }
     if probe.is_null() {
         return Ok(Value::Null);
     }
