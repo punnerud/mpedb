@@ -38,9 +38,9 @@
 //!    rowid. Same lookup/uniqueness semantics for this schema, EXCEPT that
 //!    inserting NULL into it auto-assigns a rowid where mpedb raises
 //!    NOT NULL — so the generator never writes NULL (or omits) `pk`.
-//! 4. **Division/modulo.** sqlite yields NULL on division by zero; mpedb
-//!    raises an error (and PostgreSQL raises a different error). `/` and
-//!    `%` are never generated.
+//! 4. **Division/modulo.** sqlite yields NULL on division by zero, and mpedb
+//!    now matches it (PostgreSQL still raises). `/` and `%` are never
+//!    generated, so the three-way mode never hits PostgreSQL's divergence.
 //! 5. **Constraint errors.** PK/UNIQUE/NOT-NULL failures compare only as
 //!    "all engines failed", never by message. Every engine rolls back the
 //!    whole failed statement (sqlite: statement-level ABORT; mpedb:

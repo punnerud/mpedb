@@ -6,11 +6,12 @@ use super::*;
 /// detail — see [`mpedb_sql::Join::policy`]. Each table's RLS `USING` runs over
 /// ITS OWN row, before anything that can see both:
 ///
-/// mpedb's expressions raise on division by zero and on overflow, and a raise
-/// is observable. An `ON a.x / b.secret > 1` evaluated before b's policy would
-/// report the existence of a row the policy hides — the row never comes back,
-/// but the error says it was there. Filtering first is what makes the policy a
-/// filter rather than a suggestion.
+/// mpedb's expressions raise on arithmetic overflow, and a raise is
+/// observable. An `ON a.x * b.secret` that overflows, evaluated before b's
+/// policy, would report the existence of a row the policy hides — the row
+/// never comes back, but the error says it was there. (Division by zero is
+/// NOT such a case: like sqlite it yields NULL, which just fails to match.)
+/// Filtering first is what makes the policy a filter rather than a suggestion.
 ///
 /// Cost: the inner side is read ONCE and held, so this is O(n+m) reads and
 /// O(n·m) `on` evaluations, with the inner side resident. No predicate is

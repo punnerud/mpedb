@@ -48,10 +48,12 @@ fn rightmost_assignment_wins_and_others_are_ignored() {
     assert_eq!(scalar_i64(&db, "SELECT x FROM t WHERE id = 1"), 5);
     assert_eq!(scalar_i64(&db, "SELECT count(*) FROM t WHERE x = 3"), 0);
 
-    // The ignored occurrences are not even evaluated: a division-by-zero in a
-    // non-rightmost assignment (which mpedb would otherwise raise on) is silently
-    // dropped, exactly as sqlite ignores it.
-    db.query("UPDATE t SET x = 1 / 0, x = 7 WHERE id = 1", &[]).unwrap();
+    // The ignored occurrences are not even evaluated: an arithmetic OVERFLOW in
+    // a non-rightmost assignment (which mpedb would otherwise raise on) is
+    // silently dropped, exactly as sqlite ignores it. (Division by zero would
+    // no longer prove this — mpedb evaluates `1/0` to NULL, not a raise.)
+    db.query("UPDATE t SET x = 9223372036854775807 + 1, x = 7 WHERE id = 1", &[])
+        .unwrap();
     assert_eq!(scalar_i64(&db, "SELECT x FROM t WHERE id = 1"), 7);
     db.verify().unwrap();
     let _ = std::fs::remove_file(&path);

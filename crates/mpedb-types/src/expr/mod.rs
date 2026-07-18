@@ -128,10 +128,10 @@ pub enum Instr {
     /// discards it).
     ///
     /// This is what makes `coalesce` lazy. Eager evaluation would not just be a
-    /// nicety here: mpedb raises on division by zero (PostgreSQL's behaviour,
-    /// not sqlite's NULL), so an eager `coalesce(x, 1/0)` would ERROR where both
-    /// sqlite and PostgreSQL return x. Being a strict engine is the point;
-    /// being strict in a way neither ancestor is would just be a third dialect.
+    /// nicety here: mpedb raises on arithmetic overflow, so an eager
+    /// `coalesce(x, <overflowing expr>)` would ERROR where both sqlite and
+    /// PostgreSQL return x. (Division by zero is NOT such a case: like sqlite,
+    /// mpedb evaluates `1/0` to NULL rather than raising.)
     JumpIfNotNull(u16),
     /// Discard the top of the stack.
     Pop,
@@ -522,42 +522,30 @@ fn arith(op: Instr, a: Value, b: Value) -> Result<Value> {
         _ => {}
     }
     match (a, b) {
-        (Int(x), Int(y)) => Ok(Int(match op {
-            Instr::Add => x.checked_add(y).ok_or(Error::ArithmeticOverflow)?,
-            Instr::Sub => x.checked_sub(y).ok_or(Error::ArithmeticOverflow)?,
-            Instr::Mul => x.checked_mul(y).ok_or(Error::ArithmeticOverflow)?,
-            Instr::Div => {
-                if y == 0 {
-                    return Err(Error::DivisionByZero);
-                }
-                x.checked_div(y).ok_or(Error::ArithmeticOverflow)?
-            }
-            Instr::Mod => {
-                if y == 0 {
-                    return Err(Error::DivisionByZero);
-                }
-                x.checked_rem(y).ok_or(Error::ArithmeticOverflow)?
-            }
+        (Int(x), Int(y)) => Ok(match op {
+            Instr::Add => Int(x.checked_add(y).ok_or(Error::ArithmeticOverflow)?),
+            Instr::Sub => Int(x.checked_sub(y).ok_or(Error::ArithmeticOverflow)?),
+            Instr::Mul => Int(x.checked_mul(y).ok_or(Error::ArithmeticOverflow)?),
+            // sqlite yields NULL on division/modulo by zero (not an error). A
+            // non-zero divisor still guards the one i64::MIN / -1 overflow that
+            // `checked_div`/`checked_rem` report — that stays an error.
+            Instr::Div if y == 0 => Null,
+            Instr::Div => Int(x.checked_div(y).ok_or(Error::ArithmeticOverflow)?),
+            Instr::Mod if y == 0 => Null,
+            Instr::Mod => Int(x.checked_rem(y).ok_or(Error::ArithmeticOverflow)?),
             _ => unreachable!(),
-        })),
-        (Float(x), Float(y)) => Ok(Float(match op {
-            Instr::Add => x + y,
-            Instr::Sub => x - y,
-            Instr::Mul => x * y,
-            Instr::Div => {
-                if y == 0.0 {
-                    return Err(Error::DivisionByZero);
-                }
-                x / y
-            }
-            Instr::Mod => {
-                if y == 0.0 {
-                    return Err(Error::DivisionByZero);
-                }
-                x % y
-            }
+        }),
+        (Float(x), Float(y)) => Ok(match op {
+            Instr::Add => Float(x + y),
+            Instr::Sub => Float(x - y),
+            Instr::Mul => Float(x * y),
+            // sqlite yields NULL on division/modulo by zero (not an error).
+            Instr::Div if y == 0.0 => Null,
+            Instr::Div => Float(x / y),
+            Instr::Mod if y == 0.0 => Null,
+            Instr::Mod => Float(x % y),
             _ => unreachable!(),
-        })),
+        }),
         (a, b) => Err(Error::TypeMismatch(format!(
             "arithmetic on {} and {} (binder should have coerced)",
             a.type_name(),

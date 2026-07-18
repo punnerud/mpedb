@@ -1,11 +1,12 @@
-//! #46b: the RLS-over-join ORDERING contract, mutation-tested on the raise
-//! path. Each table's policy runs over its OWN row BEFORE the join's ON (or
-//! its residual) can raise on it — because mpedb expressions can raise
-//! (division by zero) and a raise is observable, so the wrong order reports
-//! the existence of rows the policy hides. These tests fail if anyone
-//! reorders policy evaluation after ON — in EITHER execution form (held
-//! full scan, or the #49 index nested loop) — or lets a LEFT join leak a
-//! policy-hidden row's values instead of NULL-extending.
+//! #46b: the RLS-over-join ORDERING contract. Each table's policy runs over
+//! its OWN row BEFORE the join's ON (or its residual) sees it — so a hidden
+//! row's values never reach the join predicate. The landmine here is a
+//! divide-by-a-hidden-zero: mpedb (like sqlite) evaluates `x/0` to NULL, so a
+//! policy that runs too late does not raise, but the row it should have hidden
+//! still fails to match (NULL is not TRUE) and, in the LEFT-join cases, must
+//! NULL-extend rather than leak the hidden row's values. These tests pin the
+//! exact visible result in EITHER execution form (held full scan, or the #49
+//! index nested loop).
 use mpedb::{params, Config, Database, ExecResult, Value};
 use std::ops::Deref;
 
@@ -61,10 +62,11 @@ fn rows(r: ExecResult) -> Vec<Vec<Value>> {
 
 /// HELD PATH (no ON equality → the inner side is read once, policy as the
 /// fetch filter): an ON that divides by the hidden row's zero must never see
-/// it. Reorder policy after ON and this query raises division-by-zero —
-/// reporting that a hidden row exists without returning it.
+/// it. The policy hides dept 200 (val=0), so every visible dept has val=10 and
+/// x/val = 1 pairs every employee with dept 100; the divide-by-zero never
+/// happens (it would evaluate to NULL, sqlite semantics, and drop the pair).
 #[test]
-fn held_path_policy_runs_before_on_can_raise() {
+fn held_path_policy_runs_before_on() {
     let d = db("held");
     hide_zero_depts(&d);
     // No equality conjunct → no pushdown. Every visible dept has val=10, so
@@ -84,7 +86,7 @@ fn held_path_policy_runs_before_on_can_raise() {
 /// fetch, and the POLICY must filter the fetched row BEFORE the residual ON
 /// runs. emp 2's fetch finds dept 200 by PK — policy hides it, so the
 /// residual `x / val = 1` never divides by its zero and the row is simply
-/// unmatched. Run the residual first and this raises.
+/// unmatched (were it evaluated, x/0 is NULL, which is not TRUE anyway).
 #[test]
 fn index_nested_loop_policy_runs_before_residual_on() {
     let d = db("inl");
