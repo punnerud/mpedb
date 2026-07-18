@@ -189,7 +189,11 @@ const MAX_JOINS: usize = 16;
 //     Compound-bodied subplans are UNCORRELATED and carry no nested lifts (a
 //     subquery inside a compound arm is still refused), so every other subplan
 //     field is unchanged — only genuinely-compound bodies differ.
-const PLAN_FORMAT: u8 = 31;
+// 32: table footprint bitmaps widened u64 → u128 (MAX_TABLES 64 → 128). The
+//     wire layout gained 16 bytes (two u128s where two u64s were); a format-31
+//     reader sees the changed FORMAT byte and re-prepares. No semantic change to
+//     the query path — a wider ceiling, nothing more.
+const PLAN_FORMAT: u8 = 32;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

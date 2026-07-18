@@ -1890,6 +1890,9 @@ impl Shm {
         if current_txn - snap_txn > OPT_RING_SLOTS {
             return true; // snapshot older than the ring can witness: conservative
         }
+        // `& 63`: the OFP ring is a u64 bitmap even though MAX_TABLES = 128, so
+        // ids fold mod 64. Sound (same table → same bit → real conflicts always
+        // caught); aliasing only ever adds false positives (see commit.rs).
         let my_bit = 1u64 << (table_id & 63);
         for t in (snap_txn + 1)..=current_txn {
             if self.opt_field(t, OFP_TXN).load(Ordering::Acquire) != t {

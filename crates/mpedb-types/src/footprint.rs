@@ -75,11 +75,13 @@ pub enum KeyAccess {
     Full,
 }
 
-/// Bitmaps are indexed by table id; `crate::MAX_TABLES` bounds them to u64.
+/// Table bitmaps are indexed by table id; `crate::MAX_TABLES` (128) bounds them
+/// to u128. `indexes_used` is a separate bitmap over the *per-table* index
+/// numbering (not table ids), which stays u64 (≤ 64 indexes per table).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Footprint {
-    pub tables_read: u64,
-    pub tables_written: u64,
+    pub tables_read: u128,
+    pub tables_written: u128,
     /// Indexes probed or maintained, as a bitmap over the per-table index
     /// numbering (bit 0 = PK tree).
     pub indexes_used: u64,
@@ -89,11 +91,11 @@ pub struct Footprint {
 
 impl Footprint {
     pub fn reads_table(&self, table_id: u32) -> bool {
-        self.tables_read & (1 << table_id) != 0
+        self.tables_read & (1u128 << table_id) != 0
     }
 
     pub fn writes_table(&self, table_id: u32) -> bool {
-        self.tables_written & (1 << table_id) != 0
+        self.tables_written & (1u128 << table_id) != 0
     }
 
     /// Two footprints conflict if either writes a table the other touches.
@@ -136,8 +138,13 @@ impl Footprint {
             *pos += 8;
             Ok(u64::from_le_bytes(raw.try_into().unwrap()))
         };
-        let tables_read = read_u64(pos)?;
-        let tables_written = read_u64(pos)?;
+        let read_u128 = |pos: &mut usize| -> Result<u128> {
+            let raw = buf.get(*pos..*pos + 16).ok_or_else(err)?;
+            *pos += 16;
+            Ok(u128::from_le_bytes(raw.try_into().unwrap()))
+        };
+        let tables_read = read_u128(pos)?;
+        let tables_written = read_u128(pos)?;
         let indexes_used = read_u64(pos)?;
         let read_only = match *buf.get(*pos).ok_or_else(err)? {
             0 => false,
@@ -271,9 +278,17 @@ mod tests {
                 read_only: false,
             },
             Footprint {
-                tables_read: u64::MAX,
-                tables_written: 1 << 63,
+                tables_read: u128::MAX,
+                tables_written: 1u128 << 127,
                 indexes_used: 0,
+                key_access: KeyAccess::Full,
+                read_only: false,
+            },
+            // A table id past the old u64 ceiling — the widen's reason to exist.
+            Footprint {
+                tables_read: 1u128 << 100,
+                tables_written: 1u128 << 100,
+                indexes_used: 0b11,
                 key_access: KeyAccess::Full,
                 read_only: false,
             },
@@ -316,5 +331,28 @@ mod tests {
         assert!(!read_t0.conflicts_with(&read_t0));
         assert!(read_t0.conflicts_with(&write_t0));
         assert!(!write_t0.conflicts_with(&write_t1));
+    }
+
+    #[test]
+    fn high_table_ids_are_distinct() {
+        // Tables 64 and 100 must NOT alias (they would under a u64 bitmap).
+        let write_t64 = Footprint {
+            tables_read: 1u128 << 64,
+            tables_written: 1u128 << 64,
+            indexes_used: 1,
+            key_access: KeyAccess::Full,
+            read_only: false,
+        };
+        let read_t100 = Footprint {
+            tables_read: 1u128 << 100,
+            tables_written: 0,
+            indexes_used: 1,
+            key_access: KeyAccess::Full,
+            read_only: true,
+        };
+        assert!(write_t64.reads_table(64) && write_t64.writes_table(64));
+        assert!(read_t100.reads_table(100));
+        assert!(!write_t64.conflicts_with(&read_t100));
+        assert!(write_t64.conflicts_with(&write_t64));
     }
 }
