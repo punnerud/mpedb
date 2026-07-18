@@ -251,6 +251,7 @@ fn encode_on_conflict(oc: &PlanOnConflict, buf: &mut Vec<u8>) {
     match oc {
         PlanOnConflict::Error => buf.push(OC_ERROR),
         PlanOnConflict::DoNothing => buf.push(OC_DO_NOTHING),
+        PlanOnConflict::Replace => buf.push(OC_REPLACE),
         PlanOnConflict::DoUpdate {
             target,
             probe,

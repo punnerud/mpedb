@@ -193,7 +193,12 @@ const MAX_JOINS: usize = 16;
 //     wire layout gained 16 bytes (two u128s where two u64s were); a format-31
 //     reader sees the changed FORMAT byte and re-prepares. No semantic change to
 //     the query path — a wider ceiling, nothing more.
-const PLAN_FORMAT: u8 = 32;
+// 33: native INSERT OR REPLACE (PlanOnConflict::Replace, OC tag 3). Was
+//     desugared to a PK-keyed DO UPDATE and REFUSED on any secondary UNIQUE;
+//     now a first-class variant the executor resolves by deleting every
+//     conflicting row (PK + each unique index) then inserting — sqlite's real
+//     semantics.
+const PLAN_FORMAT: u8 = 33;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -878,6 +883,15 @@ pub struct AggCall {
 pub enum PlanOnConflict {
     Error,
     DoNothing,
+    /// `INSERT OR REPLACE`: sqlite's delete-on-ANY-unique semantics. The
+    /// executor proactively deletes every existing row the proposed row would
+    /// conflict with — on the PK AND on each secondary UNIQUE index — then
+    /// inserts. Carries no payload: the executor derives the unique index set
+    /// from the live `TableDef` (unambiguous — "all unique indexes", not a
+    /// name→index mapping that could be re-derived inconsistently). Matches
+    /// default sqlite, which fires no DELETE triggers for these removals
+    /// (recursive_triggers off).
+    Replace,
     DoUpdate {
         /// Table column indices of the conflict target.
         target: Vec<u16>,
@@ -1058,6 +1072,7 @@ const SRC_DEFAULT: u8 = 2;
 const OC_ERROR: u8 = 0;
 const OC_DO_NOTHING: u8 = 1;
 const OC_DO_UPDATE: u8 = 2;
+const OC_REPLACE: u8 = 3;
 
 impl CompiledPlan {
     /// The table this plan targets (for RLS policy-epoch validation), if any.

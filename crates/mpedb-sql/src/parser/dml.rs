@@ -17,9 +17,8 @@ impl<'a> Parser<'a> {
         self.expect_kw(Kw::Insert, "INSERT")?;
         // sqlite's conflict-resolution prefix: INSERT OR {IGNORE | ABORT | FAIL
         // | ROLLBACK | REPLACE}. IGNORE = skip conflicting rows; ABORT/FAIL/
-        // ROLLBACK = error (mpedb's default). REPLACE is refused — its
-        // delete-on-ANY-unique-constraint semantics differ from a plain upsert,
-        // and guessing would risk a wrong answer.
+        // ROLLBACK = error (mpedb's default). REPLACE deletes every row the new
+        // one conflicts with (PK + each unique index) then inserts.
         let or_conflict = if self.eat_kw(Kw::Or) {
             if self.eat_word("IGNORE") {
                 Some(OnConflict::DoNothing)
@@ -35,6 +34,15 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
+        self.insert_body(or_conflict)
+    }
+
+    /// The `[…] INTO table [(cols)] {VALUES … | SELECT …} [ON CONFLICT …]
+    /// [RETURNING …]` tail shared by `INSERT [OR …]` and the bare `REPLACE INTO`
+    /// alias (sqlite's `REPLACE INTO t …` == `INSERT OR REPLACE INTO t …`).
+    /// `or_conflict` is the prefix-determined action (the `REPLACE` alias passes
+    /// `Some(OnConflict::Replace)`); when `None`, a trailing `ON CONFLICT` wins.
+    pub(super) fn insert_body(&mut self, or_conflict: Option<OnConflict>) -> Result<Stmt> {
         self.expect_kw(Kw::Into, "INTO")?;
         let table = self.ident("table name")?;
         let columns = if self.eat(&Tok::LParen) {

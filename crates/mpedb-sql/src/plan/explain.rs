@@ -435,6 +435,9 @@ impl CompiledPlan {
                 match on_conflict {
                     PlanOnConflict::Error => {}
                     PlanOnConflict::DoNothing => out.push_str("  on conflict: do nothing\n"),
+                    PlanOnConflict::Replace => {
+                        out.push_str("  on conflict: replace (delete conflicts, insert)\n")
+                    }
                     PlanOnConflict::DoUpdate {
                         target,
                         probe,

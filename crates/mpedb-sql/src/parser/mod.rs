@@ -483,6 +483,15 @@ impl<'a> Parser<'a> {
                 }
             }
             _ => {
+                // Bare `REPLACE INTO …` is sqlite's alias for `INSERT OR REPLACE
+                // INTO …`. Gated on a following `INTO` so a table/column named
+                // `replace` (or the `replace()` scalar) is never mis-consumed.
+                if matches!(self.peek(), Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("REPLACE"))
+                    && matches!(self.peek_at(1), Some(Tok::Kw(Kw::Into)))
+                {
+                    self.pos += 1; // consume REPLACE; insert_body expects INTO next
+                    return self.insert_body(Some(crate::ast::OnConflict::Replace));
+                }
                 // `SAVEPOINT`/`RELEASE` are positional words (like `WITH`), so a
                 // table/column named `savepoint`/`release` is unaffected.
                 if self.eat_word("SAVEPOINT") {
