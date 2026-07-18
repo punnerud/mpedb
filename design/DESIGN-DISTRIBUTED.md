@@ -30,12 +30,43 @@ DESIGN-SERVICE). PySpell procs render pages, serve static assets and blobs, answ
 So ship §1 first: it delivers distributed *serving* (the website/static/data-hosting use case the
 brief describes) with zero distributed-consensus risk.
 
-## 2. Model AP — multi-master mirror-mesh (eventual consistency; fits the ethos; build this first)
+## 2. Model AP — async replication (eventual consistency; fits the ethos; build this first)
 
-The mirror is **already** the transport and the conflict engine: bidirectional CDC, type-provenance,
+The mirror is **already** the transport and conflict engine: bidirectional CDC, type-provenance,
 conflict rules, and a proven convergence guarantee (the `mirror-collide` SIGKILL fuzz: a killed-at-
-every-instant mirror daemon's final drain converges *exactly* to the source). N-server sync is that,
-generalized:
+every-instant mirror daemon's final drain converges *exactly* to the source). Two forms, simplest
+first — and the common need (a few-seconds-lagged backup + drain-to-cold) is the simple one.
+
+### 2a. Single-primary async streaming backup — the common case (bounded-lag backup + read replicas)
+
+One node writes; N followers are fed the **continuous intent-log / CDC stream** and apply it with a
+small lag. The lag is a config knob — `[replication] max_lag = "5s"` — bounded by the ship interval /
+batch window; the intent-ring is already an ordered log, so shipping it is natural. This is exactly
+**Litestream (SQLite → continuous backup) / PostgreSQL async streaming replication**, on mpedb's log.
+- **No conflict resolution**: a single writer means followers never diverge — they are read-only
+  replicas trailing by ≤ `max_lag`. None of the version-vector/CRDT machinery of 2b is needed.
+- **RPO = the lag**: on primary failure, promote a follower and lose only the last < `max_lag`
+  seconds of un-shipped writes — the deal you accept for availability. For backup + read-scaling that
+  is the right trade; no quorum, no leader election, no split-brain (single writer).
+- **This is where the write-ack boundary sits.** A request (e.g. a streaming POST, §1a of
+  DESIGN-SERVICE) is acked on **local durable commit** — one group-commit fsync, fast — and
+  replication to the follower trails asynchronously within `max_lag`, off the critical path. So the
+  ack is fast and the only lost-on-failure window equals the RPO. A `sync = backup` knob makes the
+  ack wait for the follower to confirm (zero RPO) at the cost of one network round-trip per commit —
+  the async default is what a 5–10 s-lag backup wants.
+- **The backup node doubles as the cold tier**: the remote follower is also the natural
+  [SYNC-TIERING](DESIGN-SYNC-TIERING.md) destination — one remote `.mpedb` is your bounded-lag backup
+  AND your drain target for stale data (§5 of DESIGN-SERVICE). Backup and tiering are the same link
+  in two directions, which is the topology the brief actually asks for.
+
+This is the tractable, ethos-fitting first build, and it is all a 5–10 s backup delay + drain-to-cold
+needs. Failover/promotion policy (who promotes, fencing the old primary to avoid two writers) is the
+one careful bit — reuse the existing FLD-2 writer-lock semantics per node, and a manual/`etcd`-gated
+promotion (§3) if you want automatic failover without split-brain.
+
+### 2b. Multi-master mesh — the general case (multiple writers, needs merge)
+
+When more than one node must accept writes, generalize 2a with conflict resolution:
 - **Topology**: a mesh or ring of mirror links; nodes exchange over the service API (§1 of
   DESIGN-SERVICE) — the "ping-pong" is **anti-entropy gossip**: peers periodically compare per-range
   version state and pull only the deltas.

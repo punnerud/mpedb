@@ -37,6 +37,15 @@ on infrastructure that already solves wake/route/hibernate; mpedb implements non
   (`fastcgi_pass`). The socket exists; the first request spawns a short-lived mpedb responder that
   serves and exits after idle. That *is* "expose an API that wakes on request and goes back to
   sleep" — the OS + nginx are the doorbell and the hibernation.
+- *Streaming ingest — zero-buffer writes* (the primitive already exists): a large POST body streams
+  **straight into the DB** as it arrives — the responder pipes nginx's body chunks into the
+  incremental blob API (#43, the `sqlite3_blob_open`-form, built precisely because the memory ceiling
+  is the strongest reason) instead of buffering the whole upload. **Constant memory regardless of
+  size** (#42's scatter-gather keeps even the commit from materializing it), natural TCP backpressure
+  if the disk is slow (you never OOM on a huge upload), on the fast blob-write path (#40/#50, ~GiB/s
+  warm). The HTTP **200 is sent only after the txn durably commits** (group-commit fsync, `durability
+  = commit|wal`) — so an ack is a durability guarantee, stronger than app-memory-buffered stacks. The
+  ack waits on *local* durability; async replication (DESIGN-DISTRIBUTED §2a) fans it out after.
 - *State lives in the file, not in memory*: the queue, the schedule, and the callout token-bucket are
   all tables, so short-lived processes read/CAS them transactionally. The rate budget works **better**
   here than in a daemon — there is no resident memory to lose it in; it is durable and multi-process
