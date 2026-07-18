@@ -44,6 +44,11 @@ pub(super) fn exec_aggregate(
     limit: Option<u64>,
     offset: Option<u64>,
     distinct: bool,
+    // #73 §1: the correlated subplans (per-row filled) and the correlated WHERE
+    // residual. Empty/`None` for a plain aggregate, which behaves exactly as
+    // before.
+    correlated: &[(usize, &SubPlan)],
+    post_filter: Option<&ExprProgram>,
 ) -> Result<ExecResult> {
     // Unbounded on purpose: see the LIMIT note above. Over a join the row being
     // aggregated is the JOINED row — same rule, wider row.
@@ -52,6 +57,23 @@ pub(super) fn exec_aggregate(
         false => {
             gather_joined(ctx, plan, params, schema, table, access, filter, joins, joined_filter)?
         }
+    };
+
+    // #73 §1: aggregate over a correlated filter. Fill each correlated slot per
+    // gathered row and apply the correlated WHERE residual BEFORE grouping, so
+    // accumulation still consumes only the full `(WHERE ∧ policy)` set
+    // (DESIGN-MULTIDB §4 — the same ordering the plain gather guarantees). The
+    // shared `correlated_survivors` keeps this byte-identical to the
+    // non-aggregate correlated path, memo included. The grouped programs never
+    // read a correlated slot (planner + validate forbid it), so grouping below
+    // reads `params` and the per-row scratch is discarded here.
+    let rows: Vec<Vec<Value>> = if correlated.is_empty() && post_filter.is_none() {
+        rows
+    } else {
+        correlated_survivors(ctx, schema, plan, params, rows, correlated, post_filter)?
+            .into_iter()
+            .map(|(row, _scratch)| row)
+            .collect()
     };
 
     // Group. The key is the memcmp-ordered keycode of the group columns, so

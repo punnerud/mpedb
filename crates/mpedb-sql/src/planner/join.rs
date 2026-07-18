@@ -300,12 +300,12 @@ pub(super) fn plan_join_select(
         || s.order_by.iter().any(|(e, _)| contains_agg(e))
         || !s.group_by.is_empty();
     if has_agg {
-        if correlated.iter().any(|&c| c) {
-            return Err(bind_err(
-                "a correlated subquery in an aggregate query is not supported yet",
-            ));
-        }
-        return plan_aggregate_select(
+        // The correlated WHERE residual rides `post_filter` into the aggregate
+        // plan (#73 §1); it is filled and applied per JOINED row before
+        // accumulation, so aggregation still runs over the full
+        // `(WHERE ∧ every policy)` set. `post_filter` is already threaded into
+        // the non-aggregate SelectPlan below.
+        let planned = plan_aggregate_select(
             s,
             &full_scope,
             outer_id,
@@ -313,10 +313,19 @@ pub(super) fn plan_join_select(
             filter,
             joins,
             joined_filter,
+            post_filter,
             binder,
             consts,
             subplans,
-        );
+        )?;
+        // A correlated slot may be read ONLY by the WHERE (→ post_filter); one
+        // in the projection/aggregate-arg/GROUP BY/HAVING over the grouped
+        // tuple is refused (validate mirrors this, but the direct query path
+        // runs without a decode round-trip).
+        if let PlanStmt::Select(sp) = &planned.0 {
+            reject_correlated_in_aggregate(sp, n_params, &correlated)?;
+        }
+        return Ok(planned);
     }
 
     // Projection over the joined tuple. `SELECT *` is every column of every
