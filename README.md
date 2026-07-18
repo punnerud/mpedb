@@ -323,8 +323,8 @@ What does not pass is deliberate refusals with error messages.
 | **FROM-less `SELECT 3+5`** | ✅ | one synthetic row; WHERE filters it, aggregates see it (`SELECT count(*)` → 1), compound arms and subqueries may each be FROM-less |
 | Scalar subqueries `(SELECT …)`, `[NOT] EXISTS (…)` — uncorrelated AND correlated | ✅ | one output column; 0 rows → NULL; **>1 row errors** (PG's rule — sqlite silently takes the first); correlated references become inner-plan parameters, the `OuterCol` idea applied to a whole plan |
 | **Cross-FILE refs** | ❌ | planned (workspace read-joins) |
-| **Live DDL** (multi-process) | ✅ | `CREATE TABLE` (PK / `NOT NULL` / `UNIQUE`), `DROP TABLE [IF EXISTS]`, `ALTER … RENAME` (table or column), `ALTER … ADD COLUMN` (nullable) / `DROP COLUMN`. Table ids are never reused (≤ 64 lifetime creates; `regenerate` resets) |
-| `ADD COLUMN NOT NULL`/`UNIQUE` | ❌ | needs a default fill / online index build — out of scope for v1 (nullable `ADD COLUMN`, triggers, and views are all shipped; see the SQL-support table) |
+| **Live DDL** (multi-process) | ✅ | `CREATE TABLE` (PK / `NOT NULL` / `UNIQUE`), `DROP TABLE [IF EXISTS]`, `ALTER … RENAME` (table or column), `ALTER … ADD COLUMN` (nullable, or `[NOT NULL] DEFAULT <const>`) / `DROP COLUMN`. Table ids are never reused (≤ 64 lifetime creates; `regenerate` resets) |
+| `ADD COLUMN … DEFAULT <const>` | ✅ | a constant default fills existing rows (and `NOT NULL DEFAULT <const>` is allowed) — differential-tested vs sqlite 3.45. `UNIQUE` / `PRIMARY KEY` on ADD, and `NOT NULL` *without* a non-NULL default, are refused — sqlite refuses these too (a non-constant default likewise). Type-mismatched default = clean error (rigid schema) |
 
 **Joins, and what they cost.** Joins are a left-deep chain of up to 16 tables,
 with aliases and self-joins. When a join's `ON` contains a plain equality

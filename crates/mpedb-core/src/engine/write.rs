@@ -1089,14 +1089,22 @@ impl<'e> WriteTxn<'e> {
         self.publish_schema(&new_schema)
     }
 
-    /// ALTER TABLE ... ADD COLUMN (#47 stage 5). Appends a NULLABLE column
-    /// (the facade refuses NOT NULL / UNIQUE / PRIMARY KEY on ADD in v1) and
-    /// rewrites every existing row with the new column NULL — mpedb's row image
-    /// is schema-driven, not self-describing, so a widen cannot be lazy: an old
-    /// short row decoded with the new (longer) type list would misread. The
-    /// rewrite is one commit (whole table resident once, like DROP); batching
-    /// is deferred. No secondary index is touched (the new column is unindexed).
-    pub fn alter_add_column(&mut self, table_id: u32, col: mpedb_types::ColumnDef) -> Result<()> {
+    /// ALTER TABLE ... ADD COLUMN (#47 stage 5). Appends a column and rewrites
+    /// every existing row with `fill` in the new (trailing) position — mpedb's
+    /// row image is schema-driven, not self-describing, so a widen cannot be
+    /// lazy: an old short row decoded with the new (longer) type list would
+    /// misread. `fill` is `Value::Null` for a plain nullable ADD, or the
+    /// (already type-checked) constant of a `DEFAULT <const>` clause; the facade
+    /// refuses UNIQUE / PRIMARY KEY on ADD and NOT NULL without a non-NULL
+    /// default. The rewrite is one commit (whole table resident once, like
+    /// DROP); batching is deferred. No secondary index is touched (the new
+    /// column is unindexed).
+    pub fn alter_add_column(
+        &mut self,
+        table_id: u32,
+        col: mpedb_types::ColumnDef,
+        fill: Value,
+    ) -> Result<()> {
         let bundle = Arc::clone(&self.bundle);
         let new_schema = bundle.schema.with_added_column(table_id, col.clone())?;
         let old_types = bundle.col_types[table_id as usize].clone();
@@ -1105,15 +1113,15 @@ impl<'e> WriteTxn<'e> {
         new_types.push(col.ty);
 
         // Pass 1: read every row (decode with OLD types) and re-encode it with
-        // the new column NULL. Collect fully before mutating so the cursor's
-        // read borrow is released before the write pass.
+        // the new column set to `fill`. Collect fully before mutating so the
+        // cursor's read borrow is released before the write pass.
         let (root, count) = self.tree_root(table_id, 0)?;
         let mut rewritten: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         {
             let mut c = btree::cursor(self, root, None, None)?;
             while let Some((k, v)) = c.next(self)? {
                 let mut vals = row::decode_row(&v, &old_types)?;
-                vals.push(Value::Null);
+                vals.push(fill.clone());
                 let payload = row::encode_row(&vals, &new_types)?;
                 rewritten.push((k.to_vec(), payload));
             }
