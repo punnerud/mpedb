@@ -76,7 +76,8 @@ impl<'a> Parser<'a> {
 
     /// Capture the SOURCE of a `( <expr> )` — the balanced substring between the
     /// parentheses — without parsing it (stored verbatim, re-bound later, §3.2).
-    fn capture_paren_source(&mut self) -> Result<String> {
+    /// `pub(super)` so the CTE `WITH` prefix in the parent module can reuse it.
+    pub(super) fn capture_paren_source(&mut self) -> Result<String> {
         self.expect(&Tok::LParen, "`(`")?;
         let start = self.here();
         let mut depth = 1usize;

@@ -43,7 +43,17 @@ pub fn inline_views(stmt: &mut Stmt, views: &ViewCatalog) -> Result<()> {
         // A view target in a write is not supported (mpedb has no updatable
         // views); the write planner will reject the unknown table cleanly, but
         // catch an explicit view name here with a clearer message.
-        Stmt::Insert(i) => refuse_view_target(&i.table, views, "INSERT"),
+        Stmt::Insert(i) => {
+            refuse_view_target(&i.table, views, "INSERT")?;
+            // `INSERT … SELECT … FROM <view|cte|derived>` must flatten its
+            // source SELECT too (the target check above only guards the write
+            // target). Without this, a CTE/view named in the source is left
+            // unresolved for the planner.
+            if let Some(sel) = &mut i.select {
+                flatten_select(sel, views, 0)?;
+            }
+            Ok(())
+        }
         Stmt::Update(u) => refuse_view_target(&u.table, views, "UPDATE"),
         Stmt::Delete(d) => refuse_view_target(&d.table, views, "DELETE"),
         _ => Ok(()),
