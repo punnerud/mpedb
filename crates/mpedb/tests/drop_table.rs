@@ -295,12 +295,14 @@ fn create_drop_churn_reclaims_pages() {
 fn create_refuses_after_the_lifetime_id_ceiling() {
     // No-reuse's bounded cost, end to end: DROP+CREATE churn burns one id per
     // cycle, so eventually a CREATE refuses closed (a clean error, never
-    // corruption) rather than mint past the 64-id bitmap ceiling. This is the
-    // deliberate limit; the offline `regenerate` compaction is the escape hatch.
+    // corruption) rather than mint past the MAX_TABLES (128) id-space ceiling.
+    // This is the deliberate limit; the offline `regenerate` compaction is the
+    // escape hatch. The loop bound stays comfortably above MAX_TABLES so the
+    // ceiling is reached regardless of the exact system-table reserve.
     let (cfg, path) = config("ceiling");
     let db = Database::open_with_config(cfg).unwrap();
     let mut hit_ceiling = false;
-    for _ in 0..80 {
+    for _ in 0..200 {
         if db.query("CREATE TABLE spin (id INTEGER PRIMARY KEY)", &[]).is_err() {
             hit_ceiling = true;
             break;
