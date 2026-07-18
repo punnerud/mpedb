@@ -948,8 +948,14 @@ fn plan_update(
     let (table_id, table) = resolve_table(schema, &s.table)?;
     let mut binder = Binder::new(table, n_params, true);
 
-    let mut set = Vec::with_capacity(s.set.len());
-    let mut seen = vec![false; table.columns.len()];
+    // sqlite (R-34751-18293): when a column is assigned more than once, all but
+    // the RIGHTMOST occurrence is ignored — not evaluated, not type-checked. So
+    // resolve each name, then keep only the last expression per column (in
+    // first-appearance order) and bind/compile just those. The executor
+    // evaluates every SET against the OLD row, so collapsing duplicates never
+    // changes a surviving assignment.
+    let mut last_expr: Vec<Option<&ast::Expr>> = vec![None; table.columns.len()];
+    let mut order: Vec<u16> = Vec::new();
     for (name, expr) in &s.set {
         let idx = table.column_index(name).ok_or_else(|| {
             bind_err(format!("unknown column `{name}` in table `{}`", table.name))
@@ -959,11 +965,15 @@ fn plan_update(
                 "cannot update primary key column `{name}`"
             )));
         }
-        if seen[idx as usize] {
-            return Err(bind_err(format!("column `{name}` set more than once")));
+        if last_expr[idx as usize].is_none() {
+            order.push(idx);
         }
-        seen[idx as usize] = true;
+        last_expr[idx as usize] = Some(expr);
+    }
+    let mut set = Vec::with_capacity(order.len());
+    for idx in order {
         let col = &table.columns[idx as usize];
+        let expr = last_expr[idx as usize].expect("recorded in order");
         let b = binder.bind_assign(expr, col)?;
         set.push((idx, compile_program(&b)?));
     }

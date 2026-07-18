@@ -38,7 +38,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | INSERT OR IGNORE / ABORT / FAIL / ROLLBACK | ✅ | IGNORE = DO NOTHING; ABORT/FAIL/ROLLBACK = error (the default) |
 | INSERT OR REPLACE | ✅ | on a PK conflict, replaces the row (desugars to `ON CONFLICT (pk) DO UPDATE SET …=excluded`). Refused on a table with a secondary UNIQUE index, where sqlite's delete-on-any-constraint semantics differ from a PK upsert |
 | INSERT INTO … SELECT | ✅ | `INSERT INTO t [(cols)] SELECT …`; the source is read fully first (self-insert safe), its tuple fills the listed columns, omitted columns default. Compound (UNION) source not yet supported |
-| UPDATE … SET … [WHERE …] | ✅ | |
+| UPDATE … SET … [WHERE …] | ✅ | a column assigned more than once keeps the rightmost occurrence and ignores the rest (not evaluated), matching sqlite (R-34751-18293) |
 | DELETE FROM … [WHERE …] | ✅ | |
 | RETURNING (all three verbs) | ✅ | `RETURNING *` or an expression list |
 | BEGIN / COMMIT / ROLLBACK | ✅ | maps to a write session; readers use MVCC snapshots and never block |

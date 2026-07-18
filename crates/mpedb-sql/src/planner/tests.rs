@@ -425,10 +425,13 @@ fn update_rejects_pk_and_bad_types() {
         prepare("UPDATE users SET email = NULL", &s),
         Err(Error::Bind(_))
     ));
-    assert!(matches!(
-        prepare("UPDATE users SET age = 1, age = 2", &s),
-        Err(Error::Bind(_))
-    ));
+    // A column assigned more than once keeps only the rightmost occurrence
+    // (sqlite R-34751-18293) — accepted, not an error, and it compiles to ONE
+    // assignment for that column.
+    match &prepare("UPDATE users SET age = 1, age = 2", &s).unwrap().stmt {
+        PlanStmt::Update { set, .. } => assert_eq!(set.len(), 1),
+        other => panic!("expected Update, got {other:?}"),
+    }
     // Int expression into float column is coerced.
     let p = prepare("UPDATE users SET score = age + 1 WHERE id = 1", &s).unwrap();
     match &p.stmt {
