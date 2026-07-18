@@ -2,13 +2,13 @@
 //! transaction. Shared by the autocommit paths on [`crate::Database`] and the
 //! interactive [`crate::WriteSession`] via the [`TxnCtx`] abstraction.
 
-use crate::trigger::TriggerSet;
+use crate::trigger::{CompiledTrigger, TriggerSet};
 use crate::ExecResult;
 use mpedb_core::{ReadTxn, WriteTxn};
 use mpedb_sql::{
     AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, Join, JoinKind,
-    CompoundPlan, GroupKey, OrderOver, PlanOnConflict, PlanStmt, Projection, SelectPlan, SetOp,
-    SubPlan,
+    CompoundPlan, GroupKey, OrderOver, PlanOnConflict, PlanStmt, Projection, RowMap, RowSide,
+    SelectPlan, SetOp, SubPlan,
 };
 use mpedb_types::{
     keycode, Accum, DefaultExpr, Error, ExprProgram, KeyBound, KeyPart, Result, Schema, TableDef,
@@ -1416,6 +1416,17 @@ fn exec_stmt_rest(
                         if let Some(proj) = returning {
                             out.push(project_row(proj, &new_row, params)?);
                         }
+                        // AFTER UPDATE FOR EACH ROW triggers fire on the updated
+                        // row, on the SAME txn (DESIGN-TRIGGERS §4.1): NEW = the
+                        // post-image, OLD = the pre-image. A failing trigger
+                        // poisons the statement — the row changed and the body may
+                        // have written before it raised.
+                        if let Err(e) =
+                            fire_after_update(ctx, schema, *table, &new_row, old, triggers, depth)
+                        {
+                            *partial = true;
+                            return Err(e);
+                        }
                     }
                     Ok(false) => {} // row vanished: nothing changed
                     Err(e) => {
@@ -1466,6 +1477,15 @@ fn exec_stmt_rest(
                         if let Some(proj) = returning {
                             out.push(project_row(proj, old, params)?);
                         }
+                        // AFTER DELETE FOR EACH ROW triggers fire on the deleted
+                        // row, on the SAME txn (DESIGN-TRIGGERS §4.1): only OLD is
+                        // available. A failing trigger poisons the statement.
+                        if let Err(e) =
+                            fire_after_delete(ctx, schema, *table, old, triggers, depth)
+                        {
+                            *partial = true;
+                            return Err(e);
+                        }
                     }
                     Ok(false) => {}
                     Err(e) => {
@@ -1493,12 +1513,8 @@ fn exec_stmt_rest(
     }
 }
 
-/// Fire every `AFTER INSERT FOR EACH ROW` trigger on `table` for one written
-/// row, on the SAME `ctx` (DESIGN-TRIGGERS §4). Each trigger's optional `WHEN`
-/// is a 3VL gate (only TRUE fires; NULL and FALSE skip); the body is an ordinary
-/// plan whose leading parameters are the NEW columns, executed by recursing on
-/// the held txn at `depth + 1` — never through the facade, so the writer lock and
-/// intent ring are never re-entered. A hard depth cap bounds any cascade.
+/// Fire `AFTER INSERT` triggers on `table` for one inserted row (only `NEW` in
+/// scope). See [`fire_after`].
 fn fire_after_insert(
     ctx: &mut dyn TxnCtx,
     schema: &Schema,
@@ -1507,9 +1523,61 @@ fn fire_after_insert(
     triggers: &TriggerSet,
     depth: u32,
 ) -> Result<()> {
-    let Some(trigs) = triggers.after_insert.get(&table) else {
-        return Ok(());
-    };
+    match triggers.after_insert.get(&table) {
+        Some(trigs) => fire_after(ctx, schema, trigs, Some(new_row), None, triggers, depth),
+        None => Ok(()),
+    }
+}
+
+/// Fire `AFTER UPDATE` triggers on `table` for one updated row: `NEW` = the
+/// post-image, `OLD` = the pre-image (DESIGN-TRIGGERS §4.1). See [`fire_after`].
+fn fire_after_update(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    table: u32,
+    new_row: &[Value],
+    old_row: &[Value],
+    triggers: &TriggerSet,
+    depth: u32,
+) -> Result<()> {
+    match triggers.after_update.get(&table) {
+        Some(trigs) => fire_after(ctx, schema, trigs, Some(new_row), Some(old_row), triggers, depth),
+        None => Ok(()),
+    }
+}
+
+/// Fire `AFTER DELETE` triggers on `table` for one deleted row (only `OLD` in
+/// scope, the deleted row). See [`fire_after`].
+fn fire_after_delete(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    table: u32,
+    old_row: &[Value],
+    triggers: &TriggerSet,
+    depth: u32,
+) -> Result<()> {
+    match triggers.after_delete.get(&table) {
+        Some(trigs) => fire_after(ctx, schema, trigs, None, Some(old_row), triggers, depth),
+        None => Ok(()),
+    }
+}
+
+/// Fire a set of matching `AFTER … FOR EACH ROW` triggers for one changed row,
+/// on the SAME `ctx` (DESIGN-TRIGGERS §4). Each trigger's optional `WHEN` is a
+/// 3VL gate (only TRUE fires; NULL and FALSE skip); the body is an ordinary plan
+/// whose leading parameters are the `NEW`/`OLD` columns named by its row-slot
+/// map, filled from the `new`/`old` images and executed by recursing on the held
+/// txn at `depth + 1` — never through the facade, so the writer lock and intent
+/// ring are never re-entered. A hard depth cap bounds any cascade.
+fn fire_after(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    trigs: &[CompiledTrigger],
+    new: Option<&[Value]>,
+    old: Option<&[Value]>,
+    triggers: &TriggerSet,
+    depth: u32,
+) -> Result<()> {
     if trigs.is_empty() {
         return Ok(());
     }
@@ -1518,14 +1586,18 @@ fn fire_after_insert(
             "trigger recursion too deep (> {MAX_TRIGGER_DEPTH} levels)"
         )));
     }
-    // Fill a NEW-column map from the inserted row image.
-    let pick = |map: &[u16]| -> Result<Vec<Value>> {
+    // Fill a row-slot map from the NEW/OLD images. A slot naming a side not
+    // present for this event is an internal bug (the binder only emits slots the
+    // event allows), so it fails closed rather than mis-binding.
+    let pick = |map: &RowMap| -> Result<Vec<Value>> {
         map.iter()
-            .map(|&c| {
-                new_row
-                    .get(c as usize)
-                    .cloned()
-                    .ok_or_else(|| internal("trigger NEW column out of row bounds"))
+            .map(|&(side, c)| {
+                let row = match side {
+                    RowSide::New => new,
+                    RowSide::Old => old,
+                };
+                row.and_then(|r| r.get(c as usize).cloned())
+                    .ok_or_else(|| internal("trigger NEW/OLD column out of row bounds"))
             })
             .collect()
     };
@@ -1537,7 +1609,7 @@ fn fire_after_insert(
                 continue;
             }
         }
-        let body_params = pick(&trig.body_new_map)?;
+        let body_params = pick(&trig.body_map)?;
         let mut inner_partial = false;
         exec_stmt_triggered(
             ctx,

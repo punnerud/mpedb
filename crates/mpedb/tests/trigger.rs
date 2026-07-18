@@ -1,11 +1,14 @@
-//! SQL triggers (DESIGN-TRIGGERS, stages 0 + 1). v1 fires `AFTER INSERT FOR
-//! EACH ROW` triggers with a single-statement SQL body and an optional `WHEN`,
-//! binding `NEW.<col>` to the inserted row. Cross-checked against sqlite 3.45:
-//! an AFTER INSERT audit trigger, a WHEN-gated one, and INSERT … SELECT bodies
-//! produce exactly the rows sqlite does. Also covers DROP TRIGGER,
-//! IF NOT EXISTS / IF EXISTS, persistence across reopen, the recursion-depth
-//! guard, and the named refusals (BEFORE / UPDATE / DELETE / INSTEAD OF /
-//! FOR EACH STATEMENT / EXECUTE PROCEDURE).
+//! SQL triggers (DESIGN-TRIGGERS, stages 0-2). Fires `AFTER INSERT`,
+//! `AFTER UPDATE`, and `AFTER DELETE FOR EACH ROW` triggers with a
+//! single-statement SQL body and an optional `WHEN`, binding `NEW.<col>` (the
+//! post-image) and `OLD.<col>` (the pre-image) per event. Cross-checked against
+//! sqlite 3.45: an AFTER INSERT audit trigger, an AFTER UPDATE trigger logging
+//! OLD+NEW, an AFTER DELETE trigger logging OLD, WHEN-gated ones (over OLD and
+//! NEW), and INSERT … SELECT bodies produce exactly the rows sqlite does. Also
+//! covers DROP TRIGGER, IF NOT EXISTS / IF EXISTS, persistence across reopen, the
+//! recursion-depth guard, and the named refusals (BEFORE / INSTEAD OF /
+//! FOR EACH STATEMENT / UPDATE OF cols / EXECUTE PROCEDURE / OLD in INSERT /
+//! NEW in DELETE).
 
 use mpedb::{Config, Database, ExecResult, Value};
 use std::io::Write;
@@ -253,14 +256,14 @@ fn recursion_depth_guard_aborts_and_rolls_back() {
 }
 
 #[test]
-fn v1_named_refusals() {
+fn stage2_named_refusals() {
     let (db, _p) = open("refuse");
     apply(&db, &["CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER, tag TEXT)"]);
     let body = "BEGIN INSERT INTO orders (id, total, tag) VALUES (9, 0, 'x'); END";
-    // Later-stage timings/events: refused by name at CREATE.
+    // Later-stage timings: BEFORE is refused by name at CREATE.
     assert!(db.query(&format!("CREATE TRIGGER t BEFORE INSERT ON orders FOR EACH ROW {body}"), &[]).is_err());
-    assert!(db.query(&format!("CREATE TRIGGER t AFTER UPDATE ON orders FOR EACH ROW {body}"), &[]).is_err());
-    assert!(db.query(&format!("CREATE TRIGGER t AFTER DELETE ON orders FOR EACH ROW {body}"), &[]).is_err());
+    // `UPDATE OF <cols>` column lists are stage 3 — refused (plain UPDATE fires).
+    assert!(db.query(&format!("CREATE TRIGGER t AFTER UPDATE OF total ON orders FOR EACH ROW {body}"), &[]).is_err());
     // Grammar-level refusals.
     assert!(db.query("CREATE TRIGGER t INSTEAD OF INSERT ON orders BEGIN DELETE FROM orders; END", &[]).is_err());
     assert!(db
@@ -275,6 +278,14 @@ fn v1_named_refusals() {
             &[]
         )
         .is_err());
+    // NEW is unavailable in an AFTER DELETE trigger.
+    assert!(db
+        .query(
+            "CREATE TRIGGER t AFTER DELETE ON orders FOR EACH ROW \
+             BEGIN INSERT INTO orders (id, total, tag) VALUES (NEW.id, 0, 'x'); END",
+            &[]
+        )
+        .is_err());
     // A body referencing a missing NEW column is refused at CREATE (define-time).
     assert!(db
         .query(
@@ -286,4 +297,97 @@ fn v1_named_refusals() {
     // No trigger was actually stored by any of the above.
     apply(&db, &["INSERT INTO orders (id, total, tag) VALUES (1, 1, 'a')"]);
     assert_eq!(mpedb_rows(&db, "SELECT count(*) FROM orders"), vec![vec!["1"]]);
+}
+
+/// Apply a full setup script (schema + triggers + DML) to a fresh mpedb, then
+/// compare one final query against sqlite fed the identical script.
+fn cross_check_full(name: &str, setup: &[&str], final_query: &str) {
+    let (db, _p) = open(name);
+    apply(&db, setup);
+    let got = mpedb_rows(&db, final_query);
+    let want = sqlite_rows(setup, final_query);
+    assert_eq!(got, want, "mpedb vs sqlite disagree on `{final_query}`");
+    assert!(!got.is_empty(), "expected some audit rows");
+}
+
+#[test]
+fn after_update_logs_old_and_new_matches_sqlite() {
+    // OLD = pre-image total, NEW = post-image total, both bound in one body.
+    cross_check_full(
+        "upd",
+        &[
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER, tag TEXT)",
+            "CREATE TABLE audit (id INTEGER PRIMARY KEY, old_total INTEGER, new_total INTEGER)",
+            "CREATE TRIGGER audit_upd AFTER UPDATE ON orders FOR EACH ROW \
+             BEGIN INSERT INTO audit (id, old_total, new_total) \
+                   VALUES (NEW.id, OLD.total, NEW.total); END",
+            "INSERT INTO orders (id, total, tag) VALUES (1, 50, 'a')",
+            "INSERT INTO orders (id, total, tag) VALUES (2, 150, 'b')",
+            "UPDATE orders SET total = total + 5 WHERE id = 1",
+            "UPDATE orders SET total = 999 WHERE id = 2",
+        ],
+        "SELECT id, old_total, new_total FROM audit ORDER BY id",
+    );
+}
+
+#[test]
+fn after_delete_logs_old_matches_sqlite() {
+    // Only OLD is available; the deleted row is logged into audit.
+    cross_check_full(
+        "del",
+        &[
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER, tag TEXT)",
+            "CREATE TABLE audit (id INTEGER PRIMARY KEY, old_total INTEGER, old_tag TEXT)",
+            "CREATE TRIGGER audit_del AFTER DELETE ON orders FOR EACH ROW \
+             BEGIN INSERT INTO audit (id, old_total, old_tag) \
+                   VALUES (OLD.id, OLD.total, OLD.tag); END",
+            "INSERT INTO orders (id, total, tag) VALUES (1, 50, 'a')",
+            "INSERT INTO orders (id, total, tag) VALUES (2, 150, 'b')",
+            "INSERT INTO orders (id, total, tag) VALUES (3, 250, 'c')",
+            "DELETE FROM orders WHERE total >= 150",
+        ],
+        "SELECT id, old_total, old_tag FROM audit ORDER BY id",
+    );
+}
+
+#[test]
+fn when_gated_update_over_old_and_new_matches_sqlite() {
+    // Fire the audit only when the total strictly increased — a WHEN predicate
+    // over BOTH OLD and NEW. id 1 increases (fires), id 2 decreases (skipped).
+    cross_check_full(
+        "updwhen",
+        &[
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER, tag TEXT)",
+            "CREATE TABLE audit (id INTEGER PRIMARY KEY, old_total INTEGER, new_total INTEGER)",
+            "CREATE TRIGGER audit_inc AFTER UPDATE ON orders FOR EACH ROW \
+             WHEN (NEW.total > OLD.total) \
+             BEGIN INSERT INTO audit (id, old_total, new_total) \
+                   VALUES (NEW.id, OLD.total, NEW.total); END",
+            "INSERT INTO orders (id, total, tag) VALUES (1, 50, 'a')",
+            "INSERT INTO orders (id, total, tag) VALUES (2, 150, 'b')",
+            "UPDATE orders SET total = 90 WHERE id = 1",
+            "UPDATE orders SET total = 40 WHERE id = 2",
+        ],
+        "SELECT id, old_total, new_total FROM audit ORDER BY id",
+    );
+}
+
+#[test]
+fn after_delete_when_gated_matches_sqlite() {
+    // AFTER DELETE with a WHEN over OLD: only rows with total > 100 are logged.
+    cross_check_full(
+        "delwhen",
+        &[
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER, tag TEXT)",
+            "CREATE TABLE audit (id INTEGER PRIMARY KEY, old_total INTEGER)",
+            "CREATE TRIGGER audit_bigdel AFTER DELETE ON orders FOR EACH ROW \
+             WHEN (OLD.total > 100) \
+             BEGIN INSERT INTO audit (id, old_total) VALUES (OLD.id, OLD.total); END",
+            "INSERT INTO orders (id, total, tag) VALUES (1, 50, 'a')",
+            "INSERT INTO orders (id, total, tag) VALUES (2, 150, 'b')",
+            "INSERT INTO orders (id, total, tag) VALUES (3, 250, 'c')",
+            "DELETE FROM orders",
+        ],
+        "SELECT id, old_total FROM audit ORDER BY id",
+    );
 }
