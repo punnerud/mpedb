@@ -62,6 +62,24 @@ fn expr_has_subquery(e: &ast::Expr) -> bool {
     }
 }
 
+/// The FROM scope of a SELECT — its table plus any joined tables, each addressed
+/// by alias. A FROM-less SELECT (`SELECT 3`) yields an EMPTY scope, which
+/// resolves nothing (so nothing can correlate against it). Shared by the outer
+/// scope of `lift_subqueries`, the inner scope of `plan_one`, and — for stage 3
+/// — the scopes `Correlate` pushes as it descends into nested subqueries.
+fn stmt_scope<'s>(schema: &'s Schema, s: &ast::SelectStmt) -> Result<Scope<'s>> {
+    let mut named: Vec<(String, &TableDef)> = Vec::new();
+    if let Some(t) = &s.table {
+        let (_, it) = resolve_table(schema, t)?;
+        named.push((s.alias.clone().unwrap_or_else(|| t.clone()), it));
+    }
+    for j in &s.joins {
+        let (_, jt) = resolve_table(schema, &j.table)?;
+        named.push((j.alias.clone().unwrap_or_else(|| j.table.clone()), jt));
+    }
+    Scope::joined_named(named)
+}
+
 /// Lift every subquery out of `s`. `n_params` is the user parameter count;
 /// subplan result slots are allocated at `n_params + i` (the binder is later
 /// created with `n_params + subplans.len()` slots, and context slots append
@@ -74,20 +92,10 @@ pub(super) fn lift_subqueries(
     consts: &mut Vec<Value>,
 ) -> Result<Lifted> {
     // The OUTER scope, for correlation: the same `[table0 ‖ … ‖ tableN]`
-    // tuple the outer statement's own expressions bind over.
-    let mut named: Vec<(String, &TableDef)> = Vec::new();
-    // FROM-less outer: an EMPTY outer scope — with no outer columns, nothing
-    // can correlate, and every unresolved name inside a subquery stays that
-    // subquery's own error.
-    if let Some(t) = &s.table {
-        let (_, outer_t) = resolve_table(schema, t)?;
-        named.push((s.alias.clone().unwrap_or_else(|| t.clone()), outer_t));
-    }
-    for j in &s.joins {
-        let (_, jt) = resolve_table(schema, &j.table)?;
-        named.push((j.alias.clone().unwrap_or_else(|| j.table.clone()), jt));
-    }
-    let outer_scope = Scope::joined_named(named)?;
+    // tuple the outer statement's own expressions bind over. FROM-less outer:
+    // an EMPTY scope — with no outer columns, nothing can correlate, and every
+    // unresolved name inside a subquery stays that subquery's own error.
+    let outer_scope = stmt_scope(schema, s)?;
 
     let mut lift = Lift {
         schema,
@@ -263,30 +271,24 @@ impl Lift<'_> {
         if self.subplans.len() >= 16 {
             return Err(bind_err("too many subqueries in one statement (max 16)"));
         }
-        // #73 §3 stage 1: a subquery MAY now contain subqueries. The nested ones
-        // are lifted by the inner's own `plan_select` below (recorded on the
-        // `SubPlan` rather than refused). What stays refused — CORRELATED nesting
-        // (a nested subquery referencing an enclosing row) — is caught after the
-        // inner is planned, by inspecting its lifts' `outer_args`.
-        // The INNER scope decides which names stay put; what it cannot
-        // resolve is tried against the OUTER scope and becomes a correlation
-        // parameter. Bare names prefer the inner table — SQL's rule.
-        let mut inner_named: Vec<(String, &TableDef)> = Vec::new();
-        // A FROM-less subquery (`SELECT (SELECT 3)`) has an empty inner
-        // scope: every name falls through to the outer and correlates, or
+        // #73 §3: a subquery MAY now contain subqueries, and (stage 3) a nested
+        // one may correlate to a MIDDLE or the outermost scope, not only its
+        // immediate parent. `Correlate` below resolves this subquery's OWN
+        // references against the outer scope AND descends into its nested
+        // subqueries to collect their references to THIS subquery's parent —
+        // TRANSIT correlations this level forwards to the nested level (§3.3).
+        // The INNER scope decides which names stay put; what it cannot resolve
+        // (here or in a nested subquery) is tried against the OUTER scope and
+        // becomes a correlation parameter. Bare names prefer the inner table —
+        // SQL's rule. A FROM-less subquery (`SELECT (SELECT 3)`) has an empty
+        // inner scope: every name falls through to the outer and correlates, or
         // errors there — the same rule as any other unresolved inner name.
-        if let Some(t) = &inner.table {
-            let (_, it) = resolve_table(self.schema, t)?;
-            inner_named.push((inner.alias.clone().unwrap_or_else(|| t.clone()), it));
-        }
-        for j in &inner.joins {
-            let (_, jt) = resolve_table(self.schema, &j.table)?;
-            inner_named.push((j.alias.clone().unwrap_or_else(|| j.table.clone()), jt));
-        }
-        let inner_scope = Scope::joined_named(inner_named)?;
+        let inner_scope = stmt_scope(self.schema, inner)?;
 
         let mut corr = Correlate {
+            schema: self.schema,
             inner_scope,
+            nested: Vec::new(),
             outer_scope: &self.outer_scope,
             n_params: self.n_params,
             outer_args: Vec::new(),
@@ -309,51 +311,11 @@ impl Lift<'_> {
             Some(cap) => Some(inner.limit.map_or(cap, |l| l.min(cap))),
             None => inner.limit,
         };
-        let rewritten = ast::SelectStmt {
-            table: inner.table.clone(),
-            from_derived: None,
-            alias: inner.alias.clone(),
-            joins: inner
-                .joins
-                .iter()
-                .map(|j| {
-                    Ok(ast::JoinClause {
-                        table: j.table.clone(),
-                        alias: j.alias.clone(),
-                        kind: j.kind,
-                        on: corr.rewrite(&j.on)?,
-                    })
-                })
-                .collect::<Result<_>>()?,
-            distinct: inner.distinct,
-            items: match &inner.items {
-                None => None,
-                Some(items) => Some(
-                    items
-                        .iter()
-                        .map(|(e, a)| Ok((corr.rewrite(e)?, a.clone())))
-                        .collect::<Result<_>>()?,
-                ),
-            },
-            where_clause: inner
-                .where_clause
-                .as_ref()
-                .map(|e| corr.rewrite(e))
-                .transpose()?,
-            group_by: inner
-                .group_by
-                .iter()
-                .map(|e| corr.rewrite(e))
-                .collect::<Result<_>>()?,
-            having: inner.having.as_ref().map(|e| corr.rewrite(e)).transpose()?,
-            order_by: inner
-                .order_by
-                .iter()
-                .map(|(e, d)| Ok((corr.rewrite(e)?, *d)))
-                .collect::<Result<_>>()?,
-            limit: inner_limit,
-            offset: inner.offset,
-        };
+        // Rewrite every correlation-bearing clause (descending into nested
+        // subqueries for transit correlations, §3.3), then apply the
+        // consumer-cap LIMIT the un-capped `rewrite_select` leaves untouched.
+        let mut rewritten = corr.rewrite_select(inner)?;
+        rewritten.limit = inner_limit;
         let outer_args = corr.outer_args;
         let arg_types = corr.arg_types;
 
@@ -363,16 +325,18 @@ impl Lift<'_> {
         let inner_n = self.n_params + outer_args.len() as u16;
         let (stmt, inner_ptypes, inner_ctx, _inner_lists, inner_out, inner_subs) =
             plan_select(&rewritten, self.schema, inner_n, self.catalog, self.consts)?;
-        // #73 §3 stage 2: a nested subquery MAY now correlate to its IMMEDIATE
-        // parent (this subquery's row). Such a child was resolved against the
-        // inner's own scope by `plan_select` above and carries `outer_args` that
-        // index into THIS plan's row — the executor fills it per parent row, and
-        // `plan.post_filter` (produced by `split_correlated` when the correlated
-        // child feeds the WHERE) rides the recursive fill. Correlation to a
-        // MIDDLE/OUTER scope stays refused: it is UNREPRESENTABLE here (a child's
-        // `outer_args` can only name its immediate parent's row), so such a
-        // reference falls through to an "unknown column" inside the innermost
-        // bind — a clean refusal, never a misread.
+        // #73 §3 stage 3: a nested subquery may correlate to its IMMEDIATE
+        // parent (stage 2), to a MIDDLE scope, or to the OUTERMOST scope. A
+        // reference to a non-immediate ancestor was captured above as a TRANSIT
+        // correlation arg of THIS subquery (`Correlate::descend` turned the
+        // nested reference into a `Param` pointing into this subplan's own
+        // correlation region and registered the source column in `outer_args`).
+        // At exec, this subplan is filled per parent row, its correlation region
+        // — INCLUDING the transit values — is inherited by the nested subplan's
+        // param buffer, and the nested level reads the ancestor value as a plain
+        // (already-filled) param. A child correlated to THIS row rides the
+        // recursive per-row fill exactly as in stage 2; `plan.post_filter`
+        // (from `split_correlated`) carries the correlated WHERE conjunct.
         if !inner_ctx.is_empty() {
             return Err(bind_err(
                 "current_setting() inside a subquery is not supported yet",
@@ -434,8 +398,24 @@ impl Lift<'_> {
 }
 
 /// Rewrites OUTER references inside a subquery into correlation parameters.
+///
+/// **Stage 3 (#73 §3).** `rewrite` descends into NESTED subqueries to capture
+/// their references to THIS subquery's parent (`outer_scope`) — a correlation
+/// that skips the intervening level(s). Such a reference becomes an
+/// `outer_arg`/`Param` of THIS subquery exactly like a direct one: the executor
+/// pulls the ancestor column into this subplan's correlation region per parent
+/// row, and the nested subplan inherits it in its param buffer and reads it as a
+/// plain (already-filled) param. `nested` is the stack of scopes introduced by
+/// the subqueries we are currently descending through; a name resolvable in
+/// `inner_scope` OR any `nested` scope is bound at this level or a deeper one and
+/// is left for that level's own lift, so only a name bound by NEITHER, yet
+/// resolvable in `outer_scope`, is a (possibly transit) correlation.
 struct Correlate<'a, 'b> {
+    schema: &'a Schema,
     inner_scope: Scope<'a>,
+    /// Scopes of the nested subqueries currently being descended through
+    /// (innermost last). Empty while rewriting this subquery's OWN clauses.
+    nested: Vec<Scope<'a>>,
     outer_scope: &'b Scope<'a>,
     n_params: u16,
     /// Outer base-row slots, one per correlation parameter, in slot order.
@@ -443,9 +423,14 @@ struct Correlate<'a, 'b> {
     arg_types: Vec<ColumnType>,
 }
 
-impl Correlate<'_, '_> {
+impl<'a> Correlate<'a, '_> {
     fn arg_param(&mut self, outer_slot: u16, ty: ColumnType) -> ast::Expr {
-        // The same outer slot referenced twice is ONE parameter.
+        // The same outer slot referenced twice is ONE parameter. This dedup is
+        // what makes a column referenced BOTH directly by this subquery and by a
+        // transit from a nested one collapse to a single correlation arg — and,
+        // crucially, `arg_param` registers AND returns the slot in one step, so
+        // direct and transit references are numbered consistently with no
+        // separate collection pass to drift.
         let j = match self.outer_args.iter().position(|&a| a == outer_slot) {
             Some(j) => j,
             None => {
@@ -457,14 +442,94 @@ impl Correlate<'_, '_> {
         ast::Expr::Param(self.n_params + j as u16)
     }
 
+    /// Is this unqualified name bound at THIS subquery's level or a nested one
+    /// we are descending through? Then it is NOT a correlation to the outer.
+    fn bound_here(&self, name: &str) -> bool {
+        self.inner_scope.resolve(name).is_ok()
+            || self.nested.iter().any(|s| s.resolve(name).is_ok())
+    }
+
+    fn bound_here_qualified(&self, qual: &str, name: &str) -> bool {
+        self.inner_scope.resolve_qualified(qual, name).is_ok()
+            || self
+                .nested
+                .iter()
+                .any(|s| s.resolve_qualified(qual, name).is_ok())
+    }
+
+    /// Rewrite every correlation-bearing clause of `s` (items, join `ON`s,
+    /// WHERE, GROUP BY, HAVING, ORDER BY) with the current correlation state.
+    /// `limit`/`offset` carry no expressions and are copied verbatim (the
+    /// consumer-cap is applied by the caller). Used both for this subquery's own
+    /// clauses (`plan_one`) and, recursively, for a nested subquery's clauses
+    /// while descending (`descend`).
+    fn rewrite_select(&mut self, s: &ast::SelectStmt) -> Result<ast::SelectStmt> {
+        Ok(ast::SelectStmt {
+            table: s.table.clone(),
+            from_derived: None,
+            alias: s.alias.clone(),
+            joins: s
+                .joins
+                .iter()
+                .map(|j| {
+                    Ok(ast::JoinClause {
+                        table: j.table.clone(),
+                        alias: j.alias.clone(),
+                        kind: j.kind,
+                        on: self.rewrite(&j.on)?,
+                    })
+                })
+                .collect::<Result<_>>()?,
+            distinct: s.distinct,
+            items: match &s.items {
+                None => None,
+                Some(items) => Some(
+                    items
+                        .iter()
+                        .map(|(e, a)| Ok((self.rewrite(e)?, a.clone())))
+                        .collect::<Result<_>>()?,
+                ),
+            },
+            where_clause: s.where_clause.as_ref().map(|e| self.rewrite(e)).transpose()?,
+            group_by: s.group_by.iter().map(|e| self.rewrite(e)).collect::<Result<_>>()?,
+            having: s.having.as_ref().map(|e| self.rewrite(e)).transpose()?,
+            order_by: s
+                .order_by
+                .iter()
+                .map(|(e, d)| Ok((self.rewrite(e)?, *d)))
+                .collect::<Result<_>>()?,
+            limit: s.limit,
+            offset: s.offset,
+        })
+    }
+
+    /// Descend INTO a nested subquery (#73 §3 stage 3) to capture TRANSIT
+    /// correlations: a reference inside `inner` (or deeper still) that resolves
+    /// to THIS subquery's parent — skipping every level in between — becomes a
+    /// correlation arg of THIS subquery, so the executor threads the value down
+    /// through the intervening level. `inner`'s own tables join the `nested`
+    /// bound-here set while we recurse, so a reference to `inner` itself, or to
+    /// the intervening level, stays put and is resolved at its own level's lift.
+    /// The rewritten `inner` (with ancestor references turned into params) is
+    /// then lifted as usual by the intervening level's own `plan_select`.
+    fn descend(&mut self, inner: &ast::SelectStmt) -> Result<ast::SelectStmt> {
+        let ns = stmt_scope(self.schema, inner)?;
+        self.nested.push(ns);
+        let out = self.rewrite_select(inner);
+        self.nested.pop();
+        out
+    }
+
     fn rewrite(&mut self, e: &ast::Expr) -> Result<ast::Expr> {
         use ast::Expr as E;
         Ok(match e {
             // The names are the whole point. Inner resolution wins (SQL's
-            // innermost-scope rule); only a name the subquery CANNOT see is
-            // tried against the outer row and becomes a parameter.
+            // innermost-scope rule), and a name bound in a nested subquery we are
+            // descending through is likewise NOT ours; only a name bound by no
+            // inner-or-nested scope is tried against the outer row and becomes a
+            // (possibly transit) correlation parameter.
             E::Col(n) => {
-                if self.inner_scope.resolve(n).is_ok() {
+                if self.bound_here(n) {
                     e.clone()
                 } else if let Ok((slot, ty)) = self.outer_scope.resolve(n) {
                     self.arg_param(slot, ty)
@@ -475,7 +540,7 @@ impl Correlate<'_, '_> {
                 }
             }
             E::Qualified(q, n) => {
-                if self.inner_scope.resolve_qualified(q, n).is_ok() {
+                if self.bound_here_qualified(q, n) {
                     e.clone()
                 } else if let Ok((slot, ty)) = self.outer_scope.resolve_qualified(q, n) {
                     self.arg_param(slot, ty)
@@ -483,15 +548,15 @@ impl Correlate<'_, '_> {
                     e.clone()
                 }
             }
-            // A subquery nested inside THIS subquery is left for the inner's own
-            // `lift_subqueries` (#73 §3). We rewrite operands that live in the
-            // inner's expression scope (an `IN`'s LHS) so their correlation to
-            // the outer is captured, but we do NOT descend into the nested
-            // SELECT: its correlation is resolved one level down, against the
-            // inner's scope — a nested reference to the outer/middle then surfaces
-            // as an "unknown column" there (stage-3 refusal), never a misread.
-            E::Subquery(inner) => E::Subquery(inner.clone()),
-            E::Exists(inner, negated) => E::Exists(inner.clone(), *negated),
+            // A subquery nested inside THIS subquery: DESCEND (#73 §3 stage 3) to
+            // capture any reference it (or a deeper subquery) makes to THIS
+            // subquery's parent as a transit correlation of this level. The
+            // nested SELECT itself is still lifted one level down, by the
+            // intervening level's own `plan_select` — descent only rewrites the
+            // ancestor references it carries, leaving references to the nested or
+            // intervening levels for those levels' own `Correlate`.
+            E::Subquery(inner) => E::Subquery(Box::new(self.descend(inner)?)),
+            E::Exists(inner, negated) => E::Exists(Box::new(self.descend(inner)?), *negated),
             E::Unary(op, a) => E::Unary(*op, Box::new(self.rewrite(a)?)),
             E::IsNull(a, n) => E::IsNull(Box::new(self.rewrite(a)?), *n),
             E::Cast(a, t) => E::Cast(Box::new(self.rewrite(a)?), *t),
@@ -514,13 +579,15 @@ impl Correlate<'_, '_> {
             E::InContext(a, k, n) => {
                 E::InContext(Box::new(self.rewrite(a)?), k.clone(), *n)
             }
-            // `x IN (SELECT …)` nested inside this subquery: rewrite the LHS
-            // (it lives in the inner's scope, so it may correlate to the outer)
-            // but leave the nested SELECT for the inner's own lift — same rule
+            // `x IN (SELECT …)` nested inside this subquery: rewrite the LHS (it
+            // lives in the inner's scope, so it may correlate to the outer) and
+            // DESCEND into the nested SELECT for transit correlations — same rule
             // as `Subquery`/`Exists` above.
-            E::InSubquery(lhs, inner, negated) => {
-                E::InSubquery(Box::new(self.rewrite(lhs)?), inner.clone(), *negated)
-            }
+            E::InSubquery(lhs, inner, negated) => E::InSubquery(
+                Box::new(self.rewrite(lhs)?),
+                Box::new(self.descend(inner)?),
+                *negated,
+            ),
             E::InParamSlot(a, slot, negated) => {
                 E::InParamSlot(Box::new(self.rewrite(a)?), *slot, *negated)
             }
