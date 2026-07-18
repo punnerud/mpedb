@@ -1045,6 +1045,29 @@ impl<'a> Parser<'a> {
 
     fn insert_stmt(&mut self) -> Result<Stmt> {
         self.expect_kw(Kw::Insert, "INSERT")?;
+        // sqlite's conflict-resolution prefix: INSERT OR {IGNORE | ABORT | FAIL
+        // | ROLLBACK | REPLACE}. IGNORE = skip conflicting rows; ABORT/FAIL/
+        // ROLLBACK = error (mpedb's default). REPLACE is refused — its
+        // delete-on-ANY-unique-constraint semantics differ from a plain upsert,
+        // and guessing would risk a wrong answer.
+        let or_conflict = if self.eat_kw(Kw::Or) {
+            if self.eat_word("IGNORE") {
+                Some(OnConflict::DoNothing)
+            } else if self.eat_word("REPLACE") {
+                return Err(self.err_here(
+                    "INSERT OR REPLACE is not supported — its multi-constraint replace \
+                     semantics differ from ON CONFLICT DO UPDATE; write ON CONFLICT explicitly",
+                ));
+            } else if self.eat_word("ABORT") || self.eat_word("FAIL") || self.eat_word("ROLLBACK") {
+                Some(OnConflict::Error)
+            } else {
+                return Err(
+                    self.err_here("expected IGNORE, REPLACE, ABORT, FAIL, or ROLLBACK after OR")
+                );
+            }
+        } else {
+            None
+        };
         self.expect_kw(Kw::Into, "INTO")?;
         let table = self.ident("table name")?;
         let columns = if self.eat(&Tok::LParen) {
@@ -1080,7 +1103,10 @@ impl<'a> Parser<'a> {
                 return Err(self.err_here("too many rows in one INSERT (max 65535)"));
             }
         }
-        let on_conflict = self.on_conflict_clause()?;
+        // A trailing ON CONFLICT clause and the OR-prefix are two spellings of
+        // the same thing; the prefix wins when both are present.
+        let trailing = self.on_conflict_clause()?;
+        let on_conflict = or_conflict.unwrap_or(trailing);
         let returning = self.returning_clause()?;
         Ok(Stmt::Insert(InsertStmt {
             table,
