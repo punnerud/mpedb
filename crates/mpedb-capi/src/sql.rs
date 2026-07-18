@@ -186,13 +186,16 @@ pub enum Kind {
     /// SELECT / VALUES / WITH / EXPLAIN — produces rows, side-effect free, so
     /// column metadata may be resolved eagerly.
     Read,
+    /// PRAGMA — mpedb has no PRAGMA, so the shim answers these itself from the
+    /// live schema (`introspect::pragma`); they are never handed to the engine.
+    Pragma,
     /// CREATE / DROP / ALTER / REINDEX — schema DDL. mpedb routes these through
     /// `parse_ddl`/`apply_ddl`, NOT the `compile`d-plan path, so the shim must
     /// NOT validate them with `prepare_detached` (which only compiles queries):
     /// it defers them to execution, where `Database::query` applies the DDL.
     Ddl,
-    /// Everything else (PRAGMA, and any unrecognized leading word) — hand
-    /// straight to the engine, validating at prepare so typos surface there.
+    /// Everything else (any unrecognized leading word) — hand straight to the
+    /// engine, validating at prepare so typos surface there.
     Other,
 }
 
@@ -247,6 +250,8 @@ pub fn classify(sql: &str) -> Kind {
             has_returning: has_returning(sql),
         },
         "select" | "values" | "with" | "explain" => Kind::Read,
+        // PRAGMA is answered by the shim's introspection, not the engine.
+        "pragma" => Kind::Pragma,
         // Exactly what mpedb applies via `parse_ddl`/`apply_ddl`. Others that
         // happen to be "DDL-ish" (VACUUM/ANALYZE/REINDEX) are left to `Other`,
         // so they validate-and-refuse at prepare like any unsupported statement.
@@ -297,7 +302,8 @@ mod tests {
         assert_eq!(classify("CREATE TABLE t (id int)"), Kind::Ddl);
         assert_eq!(classify("DROP TABLE t"), Kind::Ddl);
         assert_eq!(classify("alter table t add column c int"), Kind::Ddl);
-        assert_eq!(classify("PRAGMA foreign_keys=ON"), Kind::Other);
+        assert_eq!(classify("PRAGMA foreign_keys=ON"), Kind::Pragma);
+        assert_eq!(classify("pragma table_info(t)"), Kind::Pragma);
         assert_eq!(classify("SELCT typo"), Kind::Other);
     }
 }
