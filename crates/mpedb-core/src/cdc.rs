@@ -17,7 +17,7 @@
 //! construction: a second touch of the same PK hashes to the same key and
 //! upserts the entry.
 
-use mpedb_types::{Error, Result};
+use mpedb_types::{Error, Result, MAX_TABLES};
 
 /// Sys subkey of the CDC control record.
 pub const CDC_TABS_KEY: &[u8] = b"cdc\0tabs";
@@ -28,28 +28,28 @@ pub const CDC_DIRTY_PREFIX: &[u8] = b"cdc\0d/";
 pub const CDC_DIRTY_PREFIX_END: &[u8] = b"cdc\0d0";
 
 /// The CDC control record (`cdc\0tabs`). Table ids are 0..[`MAX_TABLES`](mpedb_types::MAX_TABLES)
-/// (< 64), so membership is a `u64` bitmap.
+/// (< 128), so membership is a `u128` bitmap.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CaptureConfig {
     /// Bit `i` set → table id `i` has dirty-set capture enabled.
-    pub captured: u64,
+    pub captured: u128,
     /// Bit `i` set → writes to table id `i` are refused with [`Error::Frozen`].
-    pub blocked: u64,
+    pub blocked: u128,
     /// Bumped on every change so per-process caches can detect staleness.
     pub generation: u64,
 }
 
 impl CaptureConfig {
-    pub const ENCODED_LEN: usize = 24;
+    pub const ENCODED_LEN: usize = 40;
 
     #[inline]
     pub fn is_captured(&self, table_id: u32) -> bool {
-        table_id < 64 && (self.captured >> table_id) & 1 == 1
+        (table_id as usize) < MAX_TABLES && (self.captured >> table_id) & 1 == 1
     }
 
     #[inline]
     pub fn is_blocked(&self, table_id: u32) -> bool {
-        table_id < 64 && (self.blocked >> table_id) & 1 == 1
+        (table_id as usize) < MAX_TABLES && (self.blocked >> table_id) & 1 == 1
     }
 
     /// Whether anything at all is enabled — the engine's cheap "skip capture"
@@ -60,8 +60,8 @@ impl CaptureConfig {
     }
 
     pub fn set_captured(&mut self, table_id: u32, on: bool) {
-        debug_assert!(table_id < 64);
-        let bit = 1u64 << (table_id & 63);
+        debug_assert!((table_id as usize) < MAX_TABLES);
+        let bit = 1u128 << (table_id & (MAX_TABLES as u32 - 1));
         if on {
             self.captured |= bit;
         } else {
@@ -70,8 +70,8 @@ impl CaptureConfig {
     }
 
     pub fn set_blocked(&mut self, table_id: u32, on: bool) {
-        debug_assert!(table_id < 64);
-        let bit = 1u64 << (table_id & 63);
+        debug_assert!((table_id as usize) < MAX_TABLES);
+        let bit = 1u128 << (table_id & (MAX_TABLES as u32 - 1));
         if on {
             self.blocked |= bit;
         } else {
@@ -81,9 +81,9 @@ impl CaptureConfig {
 
     pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
         let mut b = [0u8; Self::ENCODED_LEN];
-        b[0..8].copy_from_slice(&self.captured.to_le_bytes());
-        b[8..16].copy_from_slice(&self.blocked.to_le_bytes());
-        b[16..24].copy_from_slice(&self.generation.to_le_bytes());
+        b[0..16].copy_from_slice(&self.captured.to_le_bytes());
+        b[16..32].copy_from_slice(&self.blocked.to_le_bytes());
+        b[32..40].copy_from_slice(&self.generation.to_le_bytes());
         b
     }
 
@@ -96,9 +96,9 @@ impl CaptureConfig {
             )));
         }
         Ok(CaptureConfig {
-            captured: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
-            blocked: u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            generation: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+            captured: u128::from_le_bytes(bytes[0..16].try_into().unwrap()),
+            blocked: u128::from_le_bytes(bytes[16..32].try_into().unwrap()),
+            generation: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
         })
     }
 }

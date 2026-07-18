@@ -517,12 +517,14 @@ fn parse_create_table(sql: &str) -> Option<TableInfo> {
     })
 }
 
-/// mpedb caps the number of tables per database (select5.test declares 64 and
-/// the engine rejects the config with "too many tables (64 > 56)"). Tables
-/// beyond the cap are left out of the schema and every statement touching
-/// them is counted under `engine-table-cap` instead of polluting the other
-/// categories.
-const ENGINE_TABLE_CAP: usize = 56;
+/// mpedb caps the number of user tables per database at `MAX_TABLES - 8` (128
+/// total minus an 8-slot system reserve = 120). Tables beyond the cap are left
+/// out of the schema and every statement touching them is counted under
+/// `engine-table-cap` instead of polluting the other categories. As of the
+/// u128-footprint widen (PLAN_FORMAT 32) this is 120, so `select5.test`'s 64
+/// tables are all created and differentially tested — the cap is now only a
+/// backstop for pathological files, none of which exist in the corpus.
+const ENGINE_TABLE_CAP: usize = 120;
 
 struct Shim {
     tables: Vec<TableInfo>,

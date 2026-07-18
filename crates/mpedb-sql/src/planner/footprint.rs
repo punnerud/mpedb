@@ -33,11 +33,11 @@ fn access_key_and_indexes(a: &AccessPath) -> (KeyAccess, u64) {
 /// The footprint of ONE select — shared between a top-level SELECT and each
 /// compound arm.
 fn select_footprint(sp: &SelectPlan, schema: &Schema) -> Result<Footprint> {
-    let table_bit = |id: u32| -> Result<u64> {
-        if schema.table(id).is_none() || id >= 64 {
+    let table_bit = |id: u32| -> Result<u128> {
+        if schema.table(id).is_none() || id as usize >= mpedb_types::MAX_TABLES {
             return Err(Error::Corrupt(format!("table id {id} out of range")));
         }
-        Ok(1u64 << id)
+        Ok(1u128 << id)
     };
     let SelectPlan { table, access, joins, .. } = sp;
     Ok({
@@ -125,11 +125,11 @@ fn union_subplan_reads(s: &SubPlan, schema: &Schema, fp: &mut Footprint) -> Resu
 }
 
 fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint> {
-    let table_bit = |id: u32| -> Result<u64> {
-        if schema.table(id).is_none() || id >= 64 {
+    let table_bit = |id: u32| -> Result<u128> {
+        if schema.table(id).is_none() || id as usize >= mpedb_types::MAX_TABLES {
             return Err(Error::Corrupt(format!("table id {id} out of range")));
         }
-        Ok(1u64 << id)
+        Ok(1u128 << id)
     };
     let all_secondary_bits = |t: &TableDef| -> Result<u64> {
         let n = secondary_indexes(t).len();
@@ -150,7 +150,7 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
         // per-STATEMENT and names ONE key space — with several arms Full is
         // the only honest claim (same argument as the join case below).
         PlanStmt::Compound(c) => {
-            let mut tables_read = 0u64;
+            let mut tables_read = 0u128;
             let mut indexes_used = 0u64;
             for arm in &c.arms {
                 let f = select_footprint(arm, schema)?;
@@ -170,7 +170,7 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
         // `select_footprint` skips CTE_TABLE). Read-only, several key spaces ⇒
         // Full, exactly like a compound.
         PlanStmt::RecursiveCte(rc) => {
-            let mut tables_read = 0u64;
+            let mut tables_read = 0u128;
             let mut indexes_used = 0u64;
             for sp in [&rc.anchor, &rc.recursive, &rc.outer] {
                 let f = select_footprint(sp, schema)?;
@@ -208,7 +208,7 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
             };
             // INSERT … SELECT reads its source table(s); record them so
             // optimistic-concurrency validation and RLS stamping see the reads.
-            let mut tables_read = 0u64;
+            let mut tables_read = 0u128;
             if let Some(sel) = from_select {
                 tables_read |= table_bit(sel.plan.table)?;
                 for j in &sel.plan.joins {

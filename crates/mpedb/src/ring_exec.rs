@@ -242,8 +242,9 @@ fn locality_key(p: &PreparedIntent) -> SortKey {
         return (u32::MAX, RANK_NO_KEY, Vec::new(), idx);
     };
     // DML writes exactly one table. A degenerate footprint with 0 bits gives
-    // 64 — still deterministic and > every valid table id (MAX_TABLES = 64);
-    // execute_prepared rejects read-only plans regardless.
+    // 128 (trailing_zeros of a zero u128) — still deterministic and > every
+    // valid table id (MAX_TABLES = 128); execute_prepared rejects read-only
+    // plans regardless.
     let table = plan.footprint.tables_written.trailing_zeros();
     let (rank, key) = match &plan.footprint.key_access {
         KeyAccess::Point(parts) => match resolve_key_bytes(parts, plan, params) {

@@ -95,8 +95,11 @@ pub use schema::{ColumnDef, DefaultExpr, IndexDef, Schema, TableDef, TableKind, 
 pub use value::{Affinity, Collation, ColumnType, Value};
 
 /// Maximum number of tables (user + system) in one database. Bounded so that
-/// plan footprints can use a single `u64` bitmap per access kind.
-pub const MAX_TABLES: usize = 64;
+/// plan footprints can use a single `u128` bitmap per access kind (one bit per
+/// table id, 0..127). Schema validation reserves 8 slots for system tables, so
+/// ~120 are user-visible — comfortably past sqlite's practical schemas and the
+/// 64-table corpus (`select5`) this ceiling used to reject.
+pub const MAX_TABLES: usize = 128;
 
 /// Maximum number of columns per table (bounded by `u16` column indices in
 /// the expression IR and row format, kept small for sane page layouts).
