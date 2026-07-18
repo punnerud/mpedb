@@ -39,6 +39,8 @@ const OP_IS_NOT_DISTINCT: u8 = 32;
 const OP_IS_DISTINCT: u8 = 33;
 const OP_GLOB: u8 = 34;
 const OP_REGEXP: u8 = 35;
+const OP_CMP_COLL: u8 = 36;
+const OP_IN_LIST_COLL: u8 = 37;
 
 impl ExprProgram {
     /// Deterministic serialization (part of plan blobs and plan hashing).
@@ -125,6 +127,16 @@ impl ExprProgram {
                     buf.push(t as u8);
                 }
                 Instr::Concat => buf.push(OP_CONCAT),
+                Instr::CmpColl(kind, coll) => {
+                    buf.push(OP_CMP_COLL);
+                    buf.push(kind as u8);
+                    buf.push(coll as u8);
+                }
+                Instr::InListColl(x, coll) => {
+                    buf.push(OP_IN_LIST_COLL);
+                    buf.extend_from_slice(&x.to_le_bytes());
+                    buf.push(coll as u8);
+                }
             }
         }
     }
@@ -207,6 +219,24 @@ impl ExprProgram {
                     )
                 }
                 OP_CONCAT => Instr::Concat,
+                OP_CMP_COLL => {
+                    let k = *buf.get(*pos).ok_or_else(err)?;
+                    let c = *buf.get(*pos + 1).ok_or_else(err)?;
+                    *pos += 2;
+                    let kind = CmpKind::from_tag(k)
+                        .ok_or_else(|| Error::Corrupt("bad collated-compare op tag".into()))?;
+                    let coll = Collation::from_tag(c)
+                        .ok_or_else(|| Error::Corrupt("bad collation tag".into()))?;
+                    Instr::CmpColl(kind, coll)
+                }
+                OP_IN_LIST_COLL => {
+                    let x = read_u16_arg()?;
+                    let c = *buf.get(*pos).ok_or_else(err)?;
+                    *pos += 1;
+                    let coll = Collation::from_tag(c)
+                        .ok_or_else(|| Error::Corrupt("bad collation tag".into()))?;
+                    Instr::InListColl(x, coll)
+                }
                 _ => return Err(Error::Corrupt(format!("invalid opcode {op}"))),
             });
         }
@@ -324,7 +354,7 @@ pub(super) fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                     // empty set `x IN ()`: eval pops the probe and pushes FALSE
                     // (`in_items_3vl` on an empty slice), so it is a valid (1, 1)
                     // op — NOT a no-op that leaves the probe posing as a bool.
-                    Instr::InList(nl) => (nl as usize + 1, 1),
+                    Instr::InList(nl) | Instr::InListColl(nl, _) => (nl as usize + 1, 1),
                     Instr::Neg | Instr::Not | Instr::IsNull | Instr::IsNotNull | Instr::ToFloat => {
                         (1, 1)
                     }

@@ -6,7 +6,7 @@
 
 use crate::planner;
 use mpedb_types::value::{read_value, write_value};
-use mpedb_types::{AggFn, 
+use mpedb_types::{AggFn, Collation,
     ColumnType, Error, ExprProgram, Footprint, Instr, KeyBound, KeyPart, PlanHash, Result, Schema,
     TableDef, Value, FORMAT_VERSION, MAX_COLUMNS,
 };
@@ -146,7 +146,20 @@ const MAX_JOINS: usize = 16;
 //     reader hits the unknown scalar tag in `ScalarFn::from_tag` and reports the
 //     plan as corrupt rather than misreading it — the same additive gating as
 //     every prior scalar-fn bump (14-16, 21, 22).
-const PLAN_FORMAT: u8 = 27;
+// 28: `COLLATE` collating sequences (BINARY/NOCASE/RTRIM). TWO shapes change in
+//     one bump: (a) two additive expr opcodes — `Instr::CmpColl` (36, a collated
+//     comparison) and `Instr::InListColl` (37, a collated `IN`) — for
+//     `x = y COLLATE NOCASE` and friends; (b) every ORDER BY key grows a
+//     trailing collation BYTE (`SelectPlan.order_by` and `CompoundPlan.order_by`
+//     are now `(u16, bool, Collation)`), so even a plain `ORDER BY a` reserializes
+//     one byte wider. A format-27 reader would take that extra order-by byte as
+//     the next field and desync — so the whole-plan version gates it: a format-27
+//     blob fails CLOSED at byte 0 with `PlanInvalidated` (the documented
+//     re-prepare path), never a misread. Explicit `COLLATE` on a column
+//     declaration is refused at parse time (stage 1b); a Binary comparison still
+//     emits the plain nullary opcode, so only genuinely-collated plans carry the
+//     new opcodes.
+const PLAN_FORMAT: u8 = 28;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -408,9 +421,12 @@ pub struct SelectPlan {
     pub post_filter: Option<ExprProgram>,
     /// Output columns, in order.
     pub projection: Vec<Projection>,
-    /// (column index, descending). Empty = scan order. The index is into
-    /// the tuple named by `order_over` — never assume the base row.
-    pub order_by: Vec<(u16, bool)>,
+    /// (column index, descending, collation). Empty = scan order. The index is
+    /// into the tuple named by `order_over` — never assume the base row. The
+    /// [`Collation`] is [`Collation::Binary`] unless an explicit `COLLATE` was
+    /// written on the ORDER BY term (`ORDER BY name COLLATE NOCASE`); it governs
+    /// text ordering at sort time and is ignored for non-text keys.
+    pub order_by: Vec<(u16, bool, Collation)>,
     /// Which tuple `order_by` indexes, and therefore where in the pipeline
     /// the sort runs. Explicit rather than inferred from `distinct` /
     /// `aggregate`, because it is a decision the planner makes and the
@@ -546,8 +562,10 @@ impl SetOp {
 pub struct CompoundPlan {
     pub arms: Vec<SelectPlan>,
     pub ops: Vec<SetOp>,
-    /// (output column index, descending) over the compound OUTPUT tuple.
-    pub order_by: Vec<(u16, bool)>,
+    /// (output column index, descending, collation) over the compound OUTPUT
+    /// tuple. Collation is [`Collation::Binary`] unless an explicit `COLLATE` was
+    /// written on the compound ORDER BY term.
+    pub order_by: Vec<(u16, bool, Collation)>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }

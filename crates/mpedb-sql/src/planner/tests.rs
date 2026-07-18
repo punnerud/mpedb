@@ -308,20 +308,27 @@ fn order_by_pk_prefix_elision() {
         PlanStmt::Select(SelectPlan { order_by, .. }) => order_by,
         other => panic!("{other:?}"),
     };
+    use mpedb_types::Collation::Binary;
     assert_eq!(order("SELECT * FROM users ORDER BY id"), vec![]);
     assert_eq!(order("SELECT * FROM users ORDER BY id ASC"), vec![]);
-    assert_eq!(order("SELECT * FROM users ORDER BY id DESC"), vec![(0, true)]);
-    assert_eq!(order("SELECT * FROM users ORDER BY email"), vec![(1, false)]);
+    assert_eq!(
+        order("SELECT * FROM users ORDER BY id DESC"),
+        vec![(0u16, true, Binary)]
+    );
+    assert_eq!(
+        order("SELECT * FROM users ORDER BY email"),
+        vec![(1u16, false, Binary)]
+    );
     assert_eq!(order("SELECT * FROM orders ORDER BY user_id, item_no"), vec![]);
     assert_eq!(order("SELECT * FROM orders ORDER BY user_id"), vec![]);
     assert_eq!(
         order("SELECT * FROM orders ORDER BY item_no, user_id"),
-        vec![(1, false), (0, false)]
+        vec![(1u16, false, Binary), (0, false, Binary)]
     );
     // Not elided over an index probe (index order != PK order).
     assert_eq!(
         order("SELECT * FROM users WHERE email = 'x' ORDER BY id"),
-        vec![(0, false)]
+        vec![(0u16, false, Binary)]
     );
     // Unknown ORDER BY column is a bind error.
     assert!(matches!(

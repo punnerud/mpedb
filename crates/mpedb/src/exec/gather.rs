@@ -460,7 +460,7 @@ pub(super) fn gather_topk(
     filter: Option<&ExprProgram>,
     plan: &CompiledPlan,
     params: &[Value],
-    order_by: &[(u16, bool)],
+    order_by: &[(u16, bool, Collation)],
     keep: usize,
 ) -> Result<Vec<Vec<Value>>> {
     match access {
@@ -497,19 +497,20 @@ pub(super) fn gather_topk(
     }
 }
 
-pub(super) fn sort_rows(rows: &mut [Vec<Value>], order_by: &[(u16, bool)]) {
+pub(super) fn sort_rows(rows: &mut [Vec<Value>], order_by: &[(u16, bool, Collation)]) {
     rows.sort_by(|a, b| cmp_rows(a, b, order_by));
 }
 
-/// Total sort order over two rows for an `ORDER BY` spec (column index +
-/// descending flag), NULLS FIRST ascending. Shared by [`sort_rows`] and the
-/// streaming top-K heap.
-pub(super) fn cmp_rows(a: &[Value], b: &[Value], order_by: &[(u16, bool)]) -> Ordering {
-    for &(col, desc) in order_by {
+/// Total sort order over two rows for an `ORDER BY` spec (column index,
+/// descending flag, collation), NULLS FIRST ascending. Shared by [`sort_rows`]
+/// and the streaming top-K heap. The [`Collation`] is applied to text keys and
+/// is [`Collation::Binary`] (bytewise) for a plain `ORDER BY`.
+pub(super) fn cmp_rows(a: &[Value], b: &[Value], order_by: &[(u16, bool, Collation)]) -> Ordering {
+    for &(col, desc, coll) in order_by {
         let (Some(x), Some(y)) = (a.get(col as usize), b.get(col as usize)) else {
             continue;
         };
-        let ord = cmp_order(x, y);
+        let ord = cmp_order(x, y, coll);
         if ord != Ordering::Equal {
             return if desc { ord.reverse() } else { ord };
         }
@@ -517,8 +518,8 @@ pub(super) fn cmp_rows(a: &[Value], b: &[Value], order_by: &[(u16, bool)]) -> Or
     Ordering::Equal
 }
 
-fn cmp_order(a: &Value, b: &Value) -> Ordering {
-    match a.sql_cmp(b) {
+fn cmp_order(a: &Value, b: &Value, coll: Collation) -> Ordering {
+    match a.sql_cmp_collated(b, coll) {
         Ok(Some(ord)) => ord,
         // NULL involved: NULLS FIRST in ascending order.
         Ok(None) => match (a.is_null(), b.is_null()) {

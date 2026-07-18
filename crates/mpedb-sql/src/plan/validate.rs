@@ -41,7 +41,7 @@ impl CompiledPlan {
                     }
                     self.validate_select(arm, schema, ptypes)?;
                 }
-                for (i, _) in &c.order_by {
+                for (i, _, _) in &c.order_by {
                     if *i as usize >= arity {
                         return Err(corrupt("compound order-by column out of range"));
                     }
@@ -354,7 +354,7 @@ impl CompiledPlan {
                         }
                     }
                     let w = order_width(projection.len(), Some(out_width));
-                    for (c, _) in order_by {
+                    for (c, _, _) in order_by {
                         if *c as usize >= w {
                             return Err(corrupt("order-by column out of range"));
                         }
@@ -421,7 +421,7 @@ impl CompiledPlan {
                 } else {
                     projection.len()
                 };
-                for (c, _) in order_by {
+                for (c, _, _) in order_by {
                     if *c as usize >= w {
                         return Err(corrupt("order-by column out of range"));
                     }

@@ -264,9 +264,10 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
                 encode_select(arm, buf);
             }
             w_u16(buf, c.order_by.len() as u16);
-            for (col, desc) in &c.order_by {
+            for (col, desc, coll) in &c.order_by {
                 w_u16(buf, *col);
                 buf.push(*desc as u8);
+                buf.push(*coll as u8);
             }
             encode_opt_u64(c.limit, buf);
             encode_opt_u64(c.offset, buf);
@@ -340,9 +341,10 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
                 OrderOver::Projection => 2,
             });
             w_u16(buf, order_by.len() as u16);
-            for (c, desc) in order_by {
+            for (c, desc, coll) in order_by {
                 w_u16(buf, *c);
                 buf.push(*desc as u8);
+                buf.push(*coll as u8);
             }
             encode_opt_u64(*limit, buf);
             encode_opt_u64(*offset, buf);

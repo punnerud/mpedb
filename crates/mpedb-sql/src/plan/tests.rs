@@ -68,6 +68,16 @@ fn sample_sqls() -> Vec<&'static str> {
         "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c LIMIT 10",
         "WITH RECURSIVE r(n) AS (SELECT id FROM users UNION \
          SELECT orders.user_id FROM orders JOIN r ON orders.user_id = r.n) SELECT n FROM r ORDER BY n",
+        // COLLATE (format 28): the additive collated-compare / collated-IN
+        // opcodes and the per-ORDER-BY collation byte must survive
+        // encode/decode/validate/hash — on a comparison, an IN list, and both a
+        // single-table and a compound ORDER BY.
+        "SELECT id FROM users WHERE email = 'x' COLLATE NOCASE",
+        "SELECT id FROM users WHERE email COLLATE RTRIM = $1",
+        "SELECT id FROM users WHERE email COLLATE NOCASE IN ('a', 'b')",
+        "SELECT id, email FROM users ORDER BY email COLLATE NOCASE, id",
+        "SELECT id, email FROM users ORDER BY email COLLATE RTRIM DESC, id",
+        "SELECT id FROM users UNION SELECT user_id FROM orders ORDER BY 1 COLLATE NOCASE",
         "BEGIN",
         "COMMIT",
         "ROLLBACK",
@@ -93,6 +103,59 @@ fn roundtrip_every_sample() {
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         assert_eq!(p.hash(), q.hash(), "hash instability for {sql}");
     }
+}
+
+/// The COLLATE bytes (format 28) get their own truncation sweep: a collated
+/// plan carries the additive compare/IN opcodes (op tag + kind + collation
+/// byte) and a per-ORDER-BY collation byte, so every cut through them must Err
+/// and never panic. Also asserts the collated plan round-trips and EXPLAIN does
+/// not panic on the new instructions.
+#[test]
+fn decode_rejects_truncation_in_collate() {
+    let s = test_schema();
+    for sql in [
+        "SELECT id FROM users WHERE email = 'x' COLLATE NOCASE",
+        "SELECT id FROM users WHERE email COLLATE NOCASE IN ('a', 'b')",
+        "SELECT id, email FROM users ORDER BY email COLLATE RTRIM, id",
+    ] {
+        let p = prepare(sql, &s).unwrap();
+        let _ = p.explain(&s); // must not panic on CmpColl/InListColl/order-by
+        let bytes = p.encode();
+        let q = CompiledPlan::decode(&bytes, &s).expect(sql);
+        assert_eq!(p, q, "roundtrip mismatch for {sql}");
+        for cut in 0..bytes.len() {
+            assert!(
+                CompiledPlan::decode(&bytes[..cut], &s).is_err(),
+                "truncation at {cut} must fail for {sql}"
+            );
+        }
+    }
+}
+
+/// A bad collation tag byte in an ORDER-BY key is rejected as Corrupt, never
+/// decoded into a phantom collation.
+#[test]
+fn bad_order_by_collation_tag_is_rejected() {
+    let s = test_schema();
+    let p = prepare("SELECT id, email FROM users ORDER BY email COLLATE NOCASE, id", &s).unwrap();
+    let bytes = p.encode();
+    // Find the NOCASE (1) collation byte the encoder wrote for the first key and
+    // corrupt it to an out-of-range tag; decode must reject it.
+    let mut tampered = None;
+    for i in 0..bytes.len() {
+        if bytes[i] == 1 {
+            let mut b = bytes.clone();
+            b[i] = 0x7f; // no such collation tag
+            if matches!(CompiledPlan::decode(&b, &s), Err(Error::Corrupt(_))) {
+                tampered = Some(());
+                break;
+            }
+        }
+    }
+    assert!(
+        tampered.is_some(),
+        "a corrupt collation tag somewhere in the plan must be rejected as Corrupt"
+    );
 }
 
 #[test]

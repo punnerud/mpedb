@@ -188,6 +188,112 @@ impl Value {
             }
         }))
     }
+
+    /// SQL comparison under an explicit collating sequence (task: COLLATE).
+    ///
+    /// Collation affects TEXT–TEXT comparison ONLY (sqlite's rule): every other
+    /// type — and any NULL — falls straight through to [`Value::sql_cmp`], so a
+    /// numeric or blob comparison is never perturbed by a stray `COLLATE`. For
+    /// two texts the bytes are ordered by `coll`. [`Collation::Binary`] is
+    /// byte-identical to `sql_cmp`, so a Binary-tagged comparison and an
+    /// untagged one can never disagree.
+    pub fn sql_cmp_collated(&self, other: &Value, coll: Collation) -> Result<Option<Ordering>> {
+        match (self, other) {
+            (Value::Text(a), Value::Text(b)) => Ok(Some(coll.compare_str(a, b))),
+            _ => self.sql_cmp(other),
+        }
+    }
+}
+
+/// A collating sequence: how two TEXT values are ordered for comparison and
+/// sorting. mpedb ships sqlite's three built-ins and nothing else; the tag is
+/// carried in plan bytes (comparison [`Instr`](crate::Instr)s and ORDER BY
+/// keys), so it is a closed enum with a stable wire tag like
+/// [`ColumnType`]/`ScalarFn`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[repr(u8)]
+pub enum Collation {
+    /// Compare by memcmp of the raw UTF-8 bytes — mpedb's native order and the
+    /// keycode order. The default when no `COLLATE` is in force.
+    #[default]
+    Binary = 0,
+    /// Case-insensitive, but ONLY for the 26 ASCII letters (sqlite does NOT
+    /// casefold Unicode): each byte in `A'..='Z'` is folded to lowercase before
+    /// comparison, everything else compared as-is.
+    NoCase = 1,
+    /// Like [`Collation::Binary`] but trailing ASCII spaces (`0x20`) are ignored
+    /// on both sides: `'abc'` == `'abc   '`.
+    Rtrim = 2,
+}
+
+impl Collation {
+    /// Decode a wire tag; `None` (→ `Corrupt`) for an unknown byte.
+    pub fn from_tag(t: u8) -> Option<Collation> {
+        Some(match t {
+            0 => Collation::Binary,
+            1 => Collation::NoCase,
+            2 => Collation::Rtrim,
+            _ => return None,
+        })
+    }
+
+    /// The SQL name, as written after `COLLATE` and rendered by EXPLAIN.
+    pub fn name(self) -> &'static str {
+        match self {
+            Collation::Binary => "BINARY",
+            Collation::NoCase => "NOCASE",
+            Collation::Rtrim => "RTRIM",
+        }
+    }
+
+    /// Resolve a collation name (case-insensitive), or `None` if unknown.
+    pub fn parse(name: &str) -> Option<Collation> {
+        if name.eq_ignore_ascii_case("BINARY") {
+            Some(Collation::Binary)
+        } else if name.eq_ignore_ascii_case("NOCASE") {
+            Some(Collation::NoCase)
+        } else if name.eq_ignore_ascii_case("RTRIM") {
+            Some(Collation::Rtrim)
+        } else {
+            None
+        }
+    }
+
+    /// Order two strings under this collation. `Binary` is exactly
+    /// `a.as_bytes().cmp(b.as_bytes())`.
+    pub fn compare_str(self, a: &str, b: &str) -> Ordering {
+        match self {
+            Collation::Binary => a.as_bytes().cmp(b.as_bytes()),
+            Collation::NoCase => nocase_cmp(a.as_bytes(), b.as_bytes()),
+            Collation::Rtrim => a
+                .trim_end_matches(' ')
+                .as_bytes()
+                .cmp(b.trim_end_matches(' ').as_bytes()),
+        }
+    }
+}
+
+/// sqlite NOCASE: fold each ASCII uppercase byte to lowercase and compare the
+/// folded byte streams, breaking a tie on length. Bytes outside `A'..='Z'`
+/// (including all non-ASCII UTF-8 continuation bytes) are compared unchanged —
+/// which is exactly why NOCASE does not casefold Unicode.
+fn nocase_cmp(a: &[u8], b: &[u8]) -> Ordering {
+    #[inline]
+    fn fold(x: u8) -> u8 {
+        if x.is_ascii_uppercase() {
+            x + 32
+        } else {
+            x
+        }
+    }
+    let n = a.len().min(b.len());
+    for i in 0..n {
+        let c = fold(a[i]).cmp(&fold(b[i]));
+        if c != Ordering::Equal {
+            return c;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// Total order over f64 matching the memcmp key encoding: -0.0 and 0.0 are
