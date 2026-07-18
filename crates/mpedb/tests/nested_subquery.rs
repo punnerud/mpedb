@@ -4,9 +4,10 @@
 //! bottom-up, before the enclosing subplan runs. Every expected value below is
 //! cross-checked against the `sqlite3` CLI (3.45), which has the same semantics.
 //!
-//! What STAYS refused (stage 1 boundary): a nested subquery that CORRELATES to
-//! an enclosing row — its own parent (stage 2) or a further-out scope (stage 3).
-//! Those must refuse with a clean message, never a wrong answer.
+//! Correlation to the IMMEDIATE parent (stage 2) now WORKS and is cross-checked
+//! in `nested_correlated.rs`. What STAYS refused here: a nested subquery that
+//! correlates to a MIDDLE/OUTER scope, skipping its parent (stage 3) — it must
+//! refuse with a clean message, never a wrong answer.
 
 use mpedb::{Config, Database, ExecResult, Value};
 use std::io::Write;
@@ -229,29 +230,17 @@ fn nested_scalar_and_exists_direct() {
     );
 }
 
-/// The refusal boundary that STAYS: a nested subquery that CORRELATES to an
-/// enclosing row is stages 2–3 and must refuse cleanly — never misexecute.
+/// The refusal boundary that STAYS: a nested subquery that CORRELATES to a
+/// MIDDLE/OUTER scope, skipping its immediate parent (stage 3), must refuse
+/// cleanly — never misexecute. (Immediate-parent correlation, stage 2, now
+/// works — see `nested_correlated.rs`.)
 #[test]
-fn correlated_nested_is_refused() {
+fn mid_scope_correlated_nested_is_refused() {
     let d = db();
 
-    // (Stage 2) the innermost references its immediate parent's row (`b.y`).
-    let err = d
-        .query(
-            "SELECT id FROM a \
-             WHERE EXISTS (SELECT 1 FROM b WHERE EXISTS (SELECT 1 FROM c WHERE c.w = b.y))",
-            &[],
-        )
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("correlated") && msg.contains("nested"),
-        "stage-2 nested correlation should refuse with a clear message, got: {msg}"
-    );
-
-    // (Stage 3) the innermost references a MIDDLE/OUTER scope (`a.x`), skipping
-    // its parent. Refused too — the scope stack is not built (it surfaces as an
-    // unresolved name in the innermost bind), so no wrong answer escapes.
+    // The innermost references a MIDDLE/OUTER scope (`a.x`), skipping its parent
+    // (`b`). Refused — the scope stack is not built, so `a.x` surfaces as an
+    // unresolved name in the innermost bind, and no wrong answer escapes.
     let err = d
         .query(
             "SELECT id FROM a \

@@ -363,17 +363,16 @@ impl Lift<'_> {
         let inner_n = self.n_params + outer_args.len() as u16;
         let (stmt, inner_ptypes, inner_ctx, _inner_lists, inner_out, inner_subs) =
             plan_select(&rewritten, self.schema, inner_n, self.catalog, self.consts)?;
-        // Stage 1 is UNCORRELATED nesting only: a nested subquery that references
-        // the enclosing (this subquery's) row — or a scope further out — is
-        // stages 2–3 and refused. The inner's lifts carry `outer_args` iff they
-        // correlate to the inner's scope; any non-empty one is that refusal.
-        // (A nested reference to a MIDDLE/OUTER scope instead falls through to an
-        // "unknown column" inside the innermost bind — also a clean refusal.)
-        if inner_subs.iter().any(|s| !s.outer_args.is_empty()) {
-            return Err(bind_err(
-                "a correlated subquery nested inside another subquery is not supported yet",
-            ));
-        }
+        // #73 §3 stage 2: a nested subquery MAY now correlate to its IMMEDIATE
+        // parent (this subquery's row). Such a child was resolved against the
+        // inner's own scope by `plan_select` above and carries `outer_args` that
+        // index into THIS plan's row — the executor fills it per parent row, and
+        // `plan.post_filter` (produced by `split_correlated` when the correlated
+        // child feeds the WHERE) rides the recursive fill. Correlation to a
+        // MIDDLE/OUTER scope stays refused: it is UNREPRESENTABLE here (a child's
+        // `outer_args` can only name its immediate parent's row), so such a
+        // reference falls through to an "unknown column" inside the innermost
+        // bind — a clean refusal, never a misread.
         if !inner_ctx.is_empty() {
             return Err(bind_err(
                 "current_setting() inside a subquery is not supported yet",
