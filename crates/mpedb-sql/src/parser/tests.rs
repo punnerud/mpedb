@@ -369,6 +369,49 @@ fn txn_statements() {
 }
 
 #[test]
+fn savepoint_statements() {
+    // SAVEPOINT / RELEASE / ROLLBACK TO — positional keywords, name is a
+    // bare/quoted identifier or string. `ROLLBACK` alone stays plain rollback.
+    assert!(matches!(
+        parse_statement("SAVEPOINT a").unwrap().0,
+        Stmt::Savepoint(n) if n == "a"
+    ));
+    assert!(matches!(
+        parse_statement("release savepoint a").unwrap().0,
+        Stmt::Release(n) if n == "a"
+    ));
+    assert!(matches!(
+        parse_statement("RELEASE a").unwrap().0,
+        Stmt::Release(n) if n == "a"
+    ));
+    assert!(matches!(
+        parse_statement("ROLLBACK TO a").unwrap().0,
+        Stmt::RollbackTo(n) if n == "a"
+    ));
+    assert!(matches!(
+        parse_statement("ROLLBACK TRANSACTION TO SAVEPOINT a").unwrap().0,
+        Stmt::RollbackTo(n) if n == "a"
+    ));
+    assert!(matches!(parse_statement("ROLLBACK").unwrap().0, Stmt::Rollback));
+    assert!(matches!(
+        parse_statement("ROLLBACK TRANSACTION").unwrap().0,
+        Stmt::Rollback
+    ));
+    // Quoted and string-literal names.
+    assert!(matches!(
+        parse_statement("SAVEPOINT \"My Point\"").unwrap().0,
+        Stmt::Savepoint(n) if n == "My Point"
+    ));
+    assert!(matches!(
+        parse_statement("SAVEPOINT 'sp one'").unwrap().0,
+        Stmt::Savepoint(n) if n == "sp one"
+    ));
+    // A missing name is a parse error, not a panic.
+    assert!(parse_statement("SAVEPOINT").is_err());
+    assert!(parse_statement("ROLLBACK TO").is_err());
+}
+
+#[test]
 fn deep_nesting_is_a_parse_error_not_a_crash() {
     // Each of these used to overflow the parser stack and abort the
     // process (uncatchable). They must return Error::Parse instead.

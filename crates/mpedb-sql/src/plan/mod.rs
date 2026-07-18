@@ -579,6 +579,14 @@ pub enum PlanStmt {
     Begin,
     Commit,
     Rollback,
+    /// `SAVEPOINT <name>` — session/transaction control (no access path). The
+    /// name is carried in the plan bytes so a prepared savepoint statement
+    /// round-trips through the registry like any other plan.
+    Savepoint(String),
+    /// `RELEASE [SAVEPOINT] <name>`.
+    Release(String),
+    /// `ROLLBACK [TRANSACTION] TO [SAVEPOINT] <name>`.
+    RollbackTo(String),
 }
 
 /// Compiled `GROUP BY` / aggregates / `HAVING`.
@@ -787,6 +795,9 @@ const STMT_BEGIN: u8 = 5;
 const STMT_COMMIT: u8 = 6;
 const STMT_ROLLBACK: u8 = 7;
 const STMT_COMPOUND: u8 = 8;
+const STMT_SAVEPOINT: u8 = 9;
+const STMT_RELEASE: u8 = 10;
+const STMT_ROLLBACK_TO: u8 = 11;
 
 const ACCESS_FULL: u8 = 0;
 const ACCESS_PK_POINT: u8 = 1;
@@ -827,7 +838,12 @@ impl CompiledPlan {
             // A compound has no SINGLE target; staleness is covered by the
             // per-arm entries in `policies`, which stamp every table read.
             PlanStmt::Compound(_) => None,
-            PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => None,
+            PlanStmt::Begin
+            | PlanStmt::Commit
+            | PlanStmt::Rollback
+            | PlanStmt::Savepoint(_)
+            | PlanStmt::Release(_)
+            | PlanStmt::RollbackTo(_) => None,
         }
     }
 

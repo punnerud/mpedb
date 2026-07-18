@@ -633,6 +633,7 @@ impl Database {
             txn: self.engine.begin_write()?,
             session: session.clone(),
             poisoned: false,
+            savepoints: Vec::new(),
         })
     }
 
@@ -849,6 +850,17 @@ impl Database {
                     .into(),
             ));
         }
+        if matches!(
+            plan.stmt,
+            PlanStmt::Savepoint(_) | PlanStmt::Release(_) | PlanStmt::RollbackTo(_)
+        ) {
+            return Err(Error::Unsupported(
+                "SAVEPOINT/RELEASE/ROLLBACK TO require an open transaction; \
+                 use Database::begin() and run them through the WriteSession \
+                 (there is no autocommit savepoint)"
+                    .into(),
+            ));
+        }
         if plan.footprint.read_only {
             // Reads never touch the writer lock or the ring.
             let mut partial = false;
@@ -991,6 +1003,18 @@ pub struct WriteSession<'db> {
     /// no longer corresponds to any sequence of complete statements and must
     /// not be committed. See the type-level docs.
     poisoned: bool,
+    /// The SQL `SAVEPOINT` stack (innermost last). Each entry pairs the
+    /// savepoint's name with the engine-level COW snapshot captured when it was
+    /// opened. `RELEASE`/`ROLLBACK TO` resolve the INNERMOST matching name
+    /// (sqlite's shadowing rule) and compare names case-insensitively. The
+    /// whole stack is discarded on commit/rollback (both consume the session).
+    savepoints: Vec<NamedSavepoint>,
+}
+
+/// One entry on the [`WriteSession`] savepoint stack.
+struct NamedSavepoint {
+    name: String,
+    snap: mpedb_core::TxnSavepointFull,
 }
 
 // ------------------------------------------------ system-record key helpers
@@ -1272,15 +1296,35 @@ impl WriteSession<'_> {
     }
 
     fn run(&mut self, plan: &CompiledPlan, params: &[Value]) -> Result<ExecResult> {
-        if matches!(
-            plan.stmt,
-            PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback
-        ) {
-            return Err(Error::Unsupported(
-                "the session already is a transaction; \
-                 use WriteSession::commit()/rollback()"
-                    .into(),
-            ));
+        // Transaction/savepoint control is handled here against the session's
+        // own state, never compiled to an access path. `run` is only reached
+        // from `query`/`execute`, which already refuse a poisoned session, so a
+        // savepoint op never runs on a torn transaction.
+        match &plan.stmt {
+            PlanStmt::Savepoint(name) => {
+                let snap = self.txn.savepoint_full()?;
+                self.savepoints.push(NamedSavepoint {
+                    name: name.clone(),
+                    snap,
+                });
+                return Ok(ExecResult::Affected(0));
+            }
+            PlanStmt::Release(name) => {
+                return self.release_savepoint(name).map(|()| ExecResult::Affected(0));
+            }
+            PlanStmt::RollbackTo(name) => {
+                return self
+                    .rollback_to_savepoint(name)
+                    .map(|()| ExecResult::Affected(0));
+            }
+            PlanStmt::Begin | PlanStmt::Commit | PlanStmt::Rollback => {
+                return Err(Error::Unsupported(
+                    "the session already is a transaction; \
+                     use WriteSession::commit()/rollback()"
+                        .into(),
+                ));
+            }
+            _ => {}
         }
         // Staleness check under this session's own write txn (holds the writer
         // lock, so no policy edit can race it). Local-cache plans only, so no
@@ -1306,6 +1350,52 @@ impl WriteSession<'_> {
         }
         res
     }
+
+    /// Innermost (topmost) savepoint matching `name`, case-insensitively —
+    /// sqlite's shadowing rule (a `RELEASE`/`ROLLBACK TO` targets the most
+    /// recently opened savepoint of that name).
+    fn find_savepoint(&self, name: &str) -> Option<usize> {
+        self.savepoints
+            .iter()
+            .rposition(|s| s.name.eq_ignore_ascii_case(name))
+    }
+
+    /// `RELEASE [SAVEPOINT] <name>`: drop `<name>` and everything above it from
+    /// the stack. The changes made since STAY (they merge into the enclosing
+    /// savepoint/transaction) — only the markers and their snapshots go. It does
+    /// NOT commit to disk (the surrounding `WriteSession` still owns the
+    /// transaction); commit is `WriteSession::commit`.
+    fn release_savepoint(&mut self, name: &str) -> Result<()> {
+        let idx = self
+            .find_savepoint(name)
+            .ok_or_else(|| no_such_savepoint(name))?;
+        self.savepoints.truncate(idx);
+        Ok(())
+    }
+
+    /// `ROLLBACK [TRANSACTION] TO [SAVEPOINT] <name>`: undo every change since
+    /// `<name>` was opened, but KEEP `<name>` on the stack (it can be rolled
+    /// back to again). Savepoints opened after it are discarded.
+    fn rollback_to_savepoint(&mut self, name: &str) -> Result<()> {
+        let idx = self
+            .find_savepoint(name)
+            .ok_or_else(|| no_such_savepoint(name))?;
+        // Keep the target; drop everything opened after it.
+        self.savepoints.truncate(idx + 1);
+        // `WriteTxn::rollback_to_full` consumes the snapshot; hand it a clone so
+        // the original stays on the stack for a repeat `ROLLBACK TO` the same
+        // name. A refusal (a large-blob extent write in the scope) leaves the
+        // stack intact and surfaces cleanly.
+        let snap = self.savepoints[idx].snap.clone();
+        self.txn.rollback_to_full(snap)
+    }
+}
+
+/// The "no such savepoint" error, matching sqlite's message text verbatim so a
+/// differential comparison sees the same failure. Uses `Error::Bind`, the
+/// crate's convention for "no such <named object>".
+fn no_such_savepoint(name: &str) -> Error {
+    Error::Bind(format!("no such savepoint: {name}"))
 }
 
 // ---------------------------------------------------------------- params!
