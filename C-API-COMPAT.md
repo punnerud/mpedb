@@ -46,6 +46,7 @@ clear error). Result-code **integers match sqlite exactly** (`SQLITE_OK=0`,
 | `sqlite3_bind_null` | ✅ | |
 | `sqlite3_bind_parameter_count` | ✅ | Counts `?`/`$N` placeholders (quote/comment aware) |
 | `sqlite3_bind_parameter_index` | 🚧 | Maps `?N`/`$N`/`:N` to its number; alphabetic named params (`:name`) → 0 (mpedb has no named params) |
+| `sqlite3_bind_parameter_name` | 🚧 | Returns the `idx`-th parameter's spelling (sigil included) for a named `:a`/`@a`/`$a`, or NULL for anonymous/numbered `?`/`?N`/`$N`. Metadata only — mpedb binds positionally |
 | `sqlite3_clear_bindings` | ✅ | |
 | index out of `1..=count` | ✅ | → `SQLITE_RANGE` |
 
@@ -73,12 +74,23 @@ clear error). Result-code **integers match sqlite exactly** (`SQLITE_OK=0`,
 | `sqlite3_extended_errcode` | ✅ | Extended constraint codes (`CONSTRAINT_PRIMARYKEY`/`_UNIQUE`/`_NOTNULL`/`_CHECK`) |
 | `sqlite3_changes` | ✅ | Rows from the last INSERT/UPDATE/DELETE (DDL leaves it unchanged) |
 | `sqlite3_total_changes` | ✅ | Accumulated DML row count |
-| `sqlite3_last_insert_rowid` | ❌ | **Returns 0.** The facade's result carries only an affected count, not the assigned rowid. Use `INSERT … RETURNING id` (mpedb auto-assigns a single-column INTEGER PRIMARY KEY like sqlite's rowid). Top blocker for ORMs — see below |
-| `sqlite3_libversion` / `_number` | ✅ | Reports `3.45.0-mpedb` / `3045000` |
+| `sqlite3_last_insert_rowid` | ✅ | **Real value.** A facade hook (`mpedb::take_last_insert_rowid`, thread-local, drained per statement in `exec_one`) surfaces the rowid an INSERT assigned/used on a rowid-alias (INTEGER PRIMARY KEY) table — the last row of a multi-row insert wins; a non-insert leaves it unchanged, as sqlite does. Powers `cursor.lastrowid` |
+| `sqlite3_libversion` / `_number` | ✅ | Reports `3.45.0` / `3045000`. **Pure `X.Y.Z`** — CPython's `dbapi2` parses each dotted field as an int, so no suffix. mpedb identity is in `sqlite3_sourceid` |
 | `sqlite3_free` / `sqlite3_malloc` / `_malloc64` | ✅ | libc alloc, so an `exec` `errmsg` is `sqlite3_free`-able |
 | `sqlite3_extended_result_codes` | ✅ | No-op toggle (extended codes always tracked) |
 | `sqlite3_get_autocommit` | ✅ | 1 unless an explicit transaction is open |
-| `sqlite3_sourceid` | ✅ | Extra |
+| `sqlite3_sourceid` | ✅ | Carries the mpedb identity (`mpedb-capi shim`) |
+| `sqlite3_errstr` | ✅ | Static message per primary result code (sqlite-matching strings) |
+| `sqlite3_complete` | ✅ | True if the text ends in `;` (quote/comment aware) |
+| `sqlite3_threadsafe` | ✅ | Reports `1` (mpedb is internally synchronized) |
+| `sqlite3_initialize` / `_shutdown` | ✅ | `SQLITE_OK` no-ops (no global init state) |
+| `sqlite3_sleep` | ✅ | Sleeps `ms` and returns it |
+| `sqlite3_stricmp` | ✅ | ASCII case-insensitive C-string compare |
+| `sqlite3_db_handle` | ✅ | The `sqlite3*` that prepared a statement |
+| `sqlite3_stmt_readonly` | ✅ | 1 for SELECT / transaction-control / blank, else 0 |
+| `sqlite3_stmt_busy` | ✅ | 1 while a statement is mid-iteration |
+| `sqlite3_expanded_sql` | 🚧 | Best-effort: the raw SQL text (no literal substitution — mpedb binds positionally); `sqlite3_free`-able. Only consumed by the trace hook, which the shim never fires |
+| `sqlite3_interrupt` | 🚧 | No-op — results materialize synchronously, nothing to signal mid-statement |
 
 ### Transactions
 
@@ -90,16 +102,29 @@ savepoints map to mpedb's savepoint API. This is Python's implicit-transaction
 model, so `sqlite3`-shaped code works. `COMMIT`/`ROLLBACK` with no active
 transaction are lenient no-ops.
 
-## Out of scope (design §2) — return a clear error / documented no-op
+## Extended surface — exported so CPython's `_sqlite3` loads
 
-| Function(s) | Status | Comment |
+CPython's `_sqlite3` C extension references ~50 `sqlite3_*` symbols at load
+time; **any one it cannot resolve is an `undefined symbol` at `LD_PRELOAD`**, so
+all of them are now exported. The ones not covered above are **safe stubs**:
+they never produce a wrong query answer — they refuse (a documented error code)
+or no-op, which is enough for `import sqlite3` + basic CRUD to work. Verified
+against `_sqlite3.cpython-312` on Linux/x86-64 (Python 3.12).
+
+| Function(s) | Status | Behaviour |
 |---|---|---|
-| `sqlite3_create_function[_v2]` | ❌ | Not exported — user-defined SQL functions in C are unsupported (FTS/scalars are native to mpedb) |
-| `sqlite3_create_collation[_v2]` | ❌ | Not exported |
-| `sqlite3_load_extension` | ❌ | Not exported — loadable extensions unsupported |
-| `sqlite3_create_module` (virtual tables) | ❌ | Not exported — FTS is native (design/DESIGN-FTS) |
-| Online-backup API (`sqlite3_backup_*`) | ❌ | Not exported — use `mpedb mirror` |
-| Incremental blob (`sqlite3_blob_*`) | ❌ | Not yet — will map onto mpedb's #43 incremental-blob API |
+| `sqlite3_create_function_v2` / `_create_window_function` | ❌ stub | Refuse with `SQLITE_ERROR` (UDFs are the Django milestone); the caller-supplied `xDestroy(pApp)` is invoked, so CPython does not leak the wrapped callable |
+| `sqlite3_create_collation_v2` | ❌ stub | Refuse with `SQLITE_ERROR` (destructor honored) |
+| `sqlite3_set_authorizer` | ❌ stub | `SQLITE_OK`, callback never invoked (mpedb enforces its own RLS) |
+| `sqlite3_trace_v2` / `_progress_handler` | ❌ stub | Registration accepted, callback never fired |
+| `sqlite3_enable_load_extension` / `_load_extension` | ❌ stub | Enable is a no-op `SQLITE_OK`; load refuses with `SQLITE_ERROR` + errmsg |
+| `sqlite3_db_config` | ❌ stub | Fixed-arg shim (register-compatible with the common `(int,int*)` forms on SysV/x86-64); honors no toggles, returns `SQLITE_OK` |
+| `sqlite3_limit` | ❌ stub | Reports "no limit"; set is ignored |
+| `sqlite3_result_*` / `sqlite3_value_*` / `sqlite3_user_data` / `sqlite3_aggregate_context` / `sqlite3_context_db_handle` | ❌ stub | UDF-callback accessors — only reachable from inside a UDF, which never fires; return NULL/0/`SQLITE_NULL` |
+| Online-backup API (`sqlite3_backup_*`) | ❌ stub | `_init` → NULL (use `mpedb mirror`); the rest are inert |
+| Incremental blob (`sqlite3_blob_*`) | ❌ stub | `_open` → `SQLITE_ERROR`; will map onto mpedb's #43 incremental-blob API |
+| `sqlite3_serialize` / `_deserialize` | ❌ stub | NULL / `SQLITE_ERROR` |
+| `sqlite3_create_module` (virtual tables) | ❌ | Not referenced by `_sqlite3`; FTS is native (design/DESIGN-FTS) |
 
 ## Notes, divergences, and design decisions
 
@@ -121,30 +146,74 @@ transaction are lenient no-ops.
 - **Concurrency is better, not bug-for-bug.** mpedb has MVCC readers and
   group-commit; a consumer expecting `SQLITE_BUSY` under contention gets progress
   instead (compatible-or-better).
+- **`prepare` `nByte` is an upper bound.** A positive `nByte` bounds the text but
+  the statement ends at the first NUL within it — CPython passes `strlen+1`, so
+  the shim must not feed the trailing `\0` to the parser.
+- **DDL prepares, then applies at `step`.** mpedb applies `CREATE`/`DROP`/`ALTER`
+  through `parse_ddl`/`apply_ddl`, not the plan compiler, so the shim skips
+  compile-time validation for DDL and defers it to execution (a syntax error in
+  DDL surfaces at `step`, not `prepare` — sqlite surfaces some at `prepare`).
+- **`lastrowid` is per-thread, copied per-connection.** The facade hook is a
+  thread-local drained into the connection's field right after each statement.
+  It is exact for single-connection use; the only theoretical bleed is a
+  group-commit *leader* draining another **process's** enqueued INSERT in the
+  same `query()` call, which the single-process/`durability=none` shim path does
+  not do.
 
-## Known blockers for the next milestones (Python `sqlite3` unittest / Django)
+## This iteration (2026-07-18): CPython `sqlite3` loads + CRUD + `lastrowid`
 
-1. **`last_insert_rowid()` → 0** (both the SQL function and this C function). ORMs
-   read `cursor.lastrowid` after INSERT; Django's autofield PKs depend on it.
-   Needs a facade hook that surfaces the assigned rowid (or a shim-side
-   `RETURNING` rewrite for single-INTEGER-PK inserts).
-2. **No `sqlite_master` / `PRAGMA`.** Introspection (`PRAGMA table_info`,
-   `SELECT … FROM sqlite_master`), `PRAGMA foreign_keys`, `journal_mode`, etc. are
-   unsupported. Django's schema editor and many test fixtures use them heavily.
-3. **DDL inside an explicit transaction is rejected.** mpedb's `CREATE`/`DROP`/
+`LD_PRELOAD=libmpedb_sqlite3.so python3` now runs the target script against
+mpedb:
+
+```
+$ LD_PRELOAD=target/debug/libmpedb_sqlite3.so python3 -c "import sqlite3; \
+    con=sqlite3.connect(':memory:'); cur=con.cursor(); \
+    cur.execute('CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT)'); \
+    cur.execute(\"INSERT INTO t(b) VALUES('x')\"); print(cur.lastrowid); \
+    con.commit(); cur.execute('SELECT a,b FROM t'); print(cur.fetchall())"
+1
+[(1, 'x')]
+```
+
+What it took beyond the core ~30: (a) exporting every `sqlite3_*` symbol
+`_sqlite3` resolves (real where easy, safe stubs otherwise); (b) the
+`last_insert_rowid` facade hook; (c) a pure-numeric `libversion` (CPython parses
+it); (d) treating a positive `nByte` as an upper bound and stopping at the first
+NUL — CPython passes `strlen+1`, so the terminator was reaching the parser; (e)
+routing `CREATE`/`DROP`/`ALTER` past the compile-time validation (mpedb applies
+DDL via `parse_ddl`/`apply_ddl`, not the plan compiler), deferring them to step.
+
+## Remaining blockers for the next milestone (Django), ranked
+
+1. **No `sqlite_master` / `PRAGMA`.** Django's connection setup and schema editor
+   lean on `PRAGMA foreign_keys`, `PRAGMA table_info(...)`, `PRAGMA
+   legacy_alter_table`, and `SELECT … FROM sqlite_master`. Nothing here is
+   introspectable through the shim yet — the single biggest gap.
+2. **DDL inside an explicit transaction is rejected.** mpedb's `CREATE`/`DROP`/
    `ALTER` run only in the autocommit path, not inside a `WriteSession`; a
    `BEGIN; CREATE TABLE …; COMMIT` fails. Django migrations wrap DDL in
-   transactions.
-4. **No user-defined functions/collations** — Django registers a few (e.g.
-   `django_date_extract`) through the C-API.
-5. **Fixed database size** vs. sqlite's unbounded growth (see above).
-6. **Named parameters** (`:name`) are unsupported by mpedb's SQL; only `?`/`$N`.
+   transactions. (The shim already routes DDL correctly in autocommit — this is
+   an engine-level limitation, not a shim one.)
+3. **No user-defined functions/collations.** `sqlite3_create_function_v2` /
+   `_create_collation_v2` are exported but *refuse* (so `import` works); Django
+   registers a few (e.g. `django_date_extract`, `django_power`) through the
+   C-API and needs them to actually run.
+4. **Fixed database size** vs. sqlite's unbounded growth (16 MiB ephemeral /
+   64 MiB file-backed here); exceeding it is `SQLITE_FULL`.
+5. **Named parameters** (`:name`) are unsupported by mpedb's SQL binder; only
+   `?`/`$N`. `sqlite3_bind_parameter_name` reports them, but binding by name
+   still fails. Django uses `%s`/`?`-style params, so this is low priority.
 
 ## Verification
 
-- `cargo test -p mpedb-capi` — 9 Rust FFI tests (open/create/prepare/bind/step/
-  column/exec/errmsg/constraint/transactions/persistence/tail) + `sql`-scanner
-  unit tests + a **C smoke test** (`tests/smoke.c` compiled against `sqlite3.h`
-  and linked to the cdylib).
+- `cargo test -p mpedb-capi` (build/test **standalone** — the crate is excluded
+  from the unified workspace build because it exports `sqlite3_*`) — 10 Rust FFI
+  tests (open/create/prepare/bind/step/column/exec/errmsg/constraint/
+  transactions/persistence/tail) + `sql`-scanner unit tests + a **C smoke test**
+  (`tests/smoke.c` compiled against `sqlite3.h` and linked to the cdylib) + the
+  **Python preload test** below.
+- `tests/py_preload.rs` → `tests/py_sqlite3_preload.py` — runs CPython's own
+  `sqlite3` module against the shim under `LD_PRELOAD` (import + CRUD +
+  `lastrowid`), skipping gracefully when `python3` is absent.
 - `python3 crates/mpedb-capi/tests/smoke.py <cdylib>` — a `ctypes` consumer
   drives the same flow (the shape Python's `sqlite3` uses).
