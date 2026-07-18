@@ -25,6 +25,12 @@ jobs:
       - name: toolchain
         run: rustc --version && cargo --version && sqlite3 --version
       - name: test
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude mpedb-capi
       - name: clippy
-        run: cargo clippy --workspace --all-targets -- -D warnings
+        run: cargo clippy --workspace --exclude mpedb-capi --all-targets -- -D warnings
+      # mpedb-capi is the libsqlite3-compatible shim: it EXPORTS sqlite3_* and so
+      # cannot co-link the bundled sqlite3 that workspace feature-unification pulls
+      # in via mpedb-cli/-bench (mpedb/sqlite-checkpoint → rusqlite "bundled" →
+      # duplicate symbols). Built standalone, where mpedb has no sqlite feature.
+      - name: capi (standalone — avoids bundled-sqlite symbol collision)
+        run: cargo test -p mpedb-capi && cargo clippy -p mpedb-capi --all-targets -- -D warnings
