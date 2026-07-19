@@ -119,7 +119,7 @@ fn op_symbol(op: BinOp) -> &'static str {
 /// `json_set`/`json_insert`/`json_replace` are `(X, PATH, VALUE, …)`: argument
 /// 0 is the document and the VALUEs are at the even positions from 2 on.
 fn json_edit_value_at(i: usize) -> Option<usize> {
-    if i >= 2 && i % 2 == 0 {
+    if i >= 2 && i.is_multiple_of(2) {
         Some(i / 2 - 1)
     } else {
         None
@@ -133,7 +133,7 @@ pub(crate) fn json_value_positions(name: &str) -> Option<fn(usize) -> Option<usi
     Some(match name {
         "json_quote" => |i| if i == 0 { Some(0) } else { None },
         "json_array" => Some,
-        "json_object" => |i| if i % 2 == 1 { Some(i / 2) } else { None },
+        "json_object" => |i| if i.is_multiple_of(2) { None } else { Some(i / 2) },
         "json_set" | "json_insert" | "json_replace" => json_edit_value_at,
         _ => return None,
     })
@@ -1983,23 +1983,17 @@ impl<'a> Binder<'a> {
         // The writers: a leading subtype bitmask, then the SQL arguments.
         // `value_at` says which argument positions are VALUES (the rest are
         // documents or paths, always read as JSON/text).
-        let (f, value_at): (ScalarFn, fn(usize) -> Option<usize>) = match name {
-            // json_array(v0, v1, …): every argument is a value.
-            "json_array" => (ScalarFn::JsonArray, |i| Some(i)),
-            // json_object(k0, v0, k1, v1, …): the odd positions.
-            "json_object" => (ScalarFn::JsonObject, |i| {
-                if i % 2 == 1 {
-                    Some(i / 2)
-                } else {
-                    None
-                }
-            }),
-            // json_set(X, p0, v0, p1, v1, …): positions 2, 4, 6, …
-            "json_set" => (ScalarFn::JsonSet, json_edit_value_at),
-            "json_insert" => (ScalarFn::JsonInsert, json_edit_value_at),
-            "json_replace" => (ScalarFn::JsonReplace, json_edit_value_at),
+        let f = match name {
+            "json_array" => ScalarFn::JsonArray,
+            "json_object" => ScalarFn::JsonObject,
+            "json_set" => ScalarFn::JsonSet,
+            "json_insert" => ScalarFn::JsonInsert,
+            "json_replace" => ScalarFn::JsonReplace,
             _ => return Ok(None),
         };
+        // ONE table of value positions, shared with the lifter's subquery
+        // refusal — the two must never drift apart.
+        let value_at = json_value_positions(name).expect("a writer has value positions");
         let mut mask: u64 = 0;
         let mut out: Vec<BExpr> = Vec::with_capacity(args.len() + 1);
         // Placeholder; filled in once the mask is known.

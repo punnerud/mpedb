@@ -119,6 +119,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | CAST(x AS type) | ✅ | sqlite's **permissive, affinity-based** casting, differential-tested against sqlite 3.45. ANY type name is accepted (`SIGNED`, `DECIMAL`, `VARCHAR(10)`, `DOUBLE PRECISION`, …) and folded by sqlite's substring rule to one of five affinities: name contains `INT`→INTEGER, else `CHAR`/`CLOB`/`TEXT`→TEXT, else `BLOB`→BLOB, else `REAL`/`FLOA`/`DOUB`→REAL, else→NUMERIC. Conversions match sqlite exactly: NULL→NULL; real→int truncates toward zero (saturating, so NaN→0, ±inf→i64 bounds); text/blob→int parse a leading *integer* prefix (`'12ab'`→12, `'1e3'`→1, `'abc'`→0); text/blob→real parse a leading *float* prefix (`'1e3'`→1000.0); int/real/bool→text render as sqlite text (real via `%!.15g`, e.g. `2.9`→`'2.9'`, `1e20`→`'1.0e+20'`); →blob is the value's text bytes (`90`→`x'3930'`); NUMERIC keeps an already-typed int/real (a real stays real even when integral) but makes text/blob an int when the string is a pure `i64` or the value is integral with `|v| < 2^51`, else a real. **Deviations (clean errors, never a wrong answer):** a non-UTF-8 BLOB cast to TEXT is refused (mpedb `Text` is a Rust `String`; sqlite keeps raw bytes); an empty type name (`CAST(x AS "")`) is a parse error, so sqlite's empty→NUMERIC quirk is not expressible; and where a NUMERIC-affinity cast of a text/blob column yields a per-value int-or-real (`Any`), mixing it with a concretely-typed operand in arithmetic/comparison/UNION is refused by rigid typing rather than silently coerced |
 | COLLATE | 🚧 | the three sqlite built-in collating sequences — **BINARY** (default; memcmp of the UTF-8 bytes), **NOCASE** (case-insensitive for ASCII `A–Z` ONLY — Unicode is NOT casefolded, exactly like sqlite), **RTRIM** (ignore trailing spaces). Available two ways: as an explicit postfix `COLLATE` **operator**, and as a **column-declared default** (`CREATE TABLE t(name TEXT COLLATE NOCASE)` and `ALTER TABLE … ADD COLUMN … COLLATE …`, canonical-bytes v6). A column's declared collation is the default for `= <> < <= > >= IN BETWEEN`, `ORDER BY`, `GROUP BY` and `DISTINCT` on that column, following sqlite's precedence: an explicit `COLLATE` on the **left** operand wins, else on the right; else the **left** operand's column collation, else the right's; else BINARY. Collation applies to TEXT only; numeric/blob comparisons are unaffected. A **collated UNIQUE / secondary index / PRIMARY KEY is now supported**: the engine folds each value under the column's collation before it enters the keycode tree, so `name TEXT COLLATE NOCASE UNIQUE` (and `CREATE INDEX` on a collated column, and a `COLLATE NOCASE PRIMARY KEY`) collapses case-variant values into one on-disk key — a duplicate is rejected and a case-variant `=` / prefix probe resolves, exactly as sqlite. Existing non-collated files are byte-for-byte unchanged (BINARY folds to the identity), so no format bump. Differential-tested vs sqlite 3.45 (comparisons on a NOCASE/RTRIM column, an explicit `COLLATE BINARY` override, IN/BETWEEN, `ORDER BY name`, `SELECT DISTINCT name`, `GROUP BY name`, `ALTER ADD COLUMN … COLLATE`, the BINARY control, Unicode-not-folded, and — through the C-API/Python — a NOCASE UNIQUE rejecting a case-variant duplicate + resolving a case-variant lookup + a same-value case UPDATE). **Still refused cleanly (never a wrong answer):** a non-BINARY collation on a non-TEXT column; a `COLLATE` in a position where it could not change a comparison or a sort (a bare projected `COLLATE`, or an explicit `COLLATE` inside a GROUP BY / DISTINCT key); `IN (SELECT …)` / window-`ORDER BY` explicit-COLLATE and column-collation in a compound (UNION) `ORDER BY` still default to BINARY. An inequality **RANGE** over a collated key column runs as a full scan with a collation-correct residual filter (correct, not index-accelerated), since a raw bytewise bound could skip a folded row. Plan format 36 (unchanged) |
 | Parameters | ✅ | `$1, $2, …` (PostgreSQL style) rather than `?`; types unify at compile time |
+| `->` and `->>` (JSON) | ✅ | sqlite's JSON accessors. `->` yields the selected node's JSON TEXT, `->>` the SQL value — a distinction the whole design turns on (a JSON `null` is the text `null` through `->` and SQL NULL through `->>`). Own precedence tier, tighter than `*`, left-associative; `->>` is lexed BEFORE `->` so `a ->> p` can never mis-lex as `a -> (> p)`, with a token test pinning `> >= -> ->> -` in one line. Both lower to a scalar call, so they are new grammar but not a new opcode. Full semantics in the JSON rows of the scalar-function table below |
 
 ## Scalar functions
 
@@ -148,14 +149,97 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | printf / format | ✅ | sqlite's C-printf formatter (`format` is an exact alias), variadic, differential-tested against sqlite 3.45 across ~2,800 value×specifier cases. Conversions: `%d %i %u %x %X %o %c %s %q %Q %w %% %f %e %E %g %G`; flags `- + space 0 # , !`; field width, `.precision`, and `*` (width/precision from an argument). sqlite's dialect, matched exactly (not C stdio): `%c` is the first *character of the argument's text* (`printf('%c',65)`→`6`, not `A`); `%u`/`%x`/`%o` are 64-bit; integer `.precision` zero-pads; text→number coercion parses a leading numeric prefix (`printf('%d','12ab')`→`12`, `'abc'`→`0`); `%q`/`%Q`/`%w` are the SQL escapes (NULL renders `(NULL)`/`NULL`/`(NULL)`); `%.0f` of `3.5` is `3` (sqlite's decimal decoder, ported faithfully). A NULL *data* argument is formatted per specifier, never propagated; a NULL or empty *format* yields NULL. Floats use the portable double-double decoder (bit-identical to sqlite's long-double CLI, and deterministic across mpedb's platforms). **Deviations (each a clean compile error, never a wrong answer):** the format argument must be text — mpedb refuses a non-text format that sqlite would coerce; and an *untyped bare parameter* in a data slot is refused (the consuming specifier is only known at runtime, so a rigid engine cannot type it — add a `CAST`). A conversion character outside the supported set halts output at that point, as sqlite does for an unknown specifier. One float deviation, deterministic by design: the `!` alt form asks the decoder for up to 26 significant digits, and beyond ~17 the portable double-double decoder can differ from a *long-double* sqlite build in the last digit(s) — mpedb's value is the same on every platform (a long-double sqlite build is not), so `%!` with precision past ~17 significant digits is the one place the byte-for-byte match with the CLI ends |
 | quote | ✅ | `quote(X)` — the SQL literal denoting `X`, sqlite's `sqlite3QuoteValue` (Django's `last_executed_query` calls `QUOTE(?)` per bound parameter). NULL → the bare word `NULL`; INTEGER → plain digits; TEXT → `'…'` with `''` doubling (newlines and every other byte verbatim); BLOB → `X'…'` UPPERCASE hex; mpedb's own `bool`/`timestamp` render as the integer they render as everywhere else. Does NOT null-propagate, and its argument is NOT type-pinned, so `quote($1)` binds with no declared parameter type. REAL: sqlite renders `%!.15g` and falls back to `%!.20e` when that text does not parse back to the same double — mpedb reproduces the first branch exactly (the same `%!.15g` formatter `CAST(x AS TEXT)` uses) and **REFUSES the second, by name and with the value**: sqlite's `sqlite3FpDecode` picks between an 80-bit `long double` scaling (18 significant digits) and a Dekker double-double one (19, different last digit) **per build**, at startup, via `sqlite3Config.bUseLongDouble`, so past 15 digits there is no single sqlite answer to match (the same boundary the `printf` `!` note above describes). **One deliberate divergence, a clean error:** sqlite reads the text through a NUL-terminated C string, so `quote(char(97,0,98))` silently truncates to `'a'`; mpedb TEXT holds the NUL and refuses rather than return a shortened literal |
 | strftime | ✅ | `strftime(FORMAT, TIMESTRING)` — a port of sqlite 3.45's `strftimeFunc` + its `isDate`/`computeJD`/`computeYMD`/`computeHMS` state machine. **Time strings:** `YYYY-MM-DD`, `YYYY-MM-DD[ \|T]HH:MM[:SS[.SSS…]]`, `HH:MM[:SS[.SSS…]]` (dated 2000-01-01, sqlite's rule), each with an optional `Z`/`z`/`+HH:MM`/`-HH:MM` suffix; a leading `-` on the year is accepted. **Specifiers:** all 23 sqlite 3.45 has — `%d %e %f %F %H %I %j %J %k %l %m %M %p %P %R %s %S %T %u %w %W %Y %%` (`%f` and `%J` go through the sqlite printf port, so their digits are sqlite's). sqlite's quirks are reproduced, not smoothed: `'2010-02-30'` normalises to `2010-03-02` (`isDate()` drops the parsed Y/M/D when D > 28) while `'2010-01-01 24:00'` keeps hour 24 (h/m/s are never renormalised alone), and `%S` of `…:56.9999` is `56` while `%f` of the same value is `57.000`. Differential-tested vs sqlite 3.45 over 23 specifiers × 35 time forms plus every day of 1999/2000/2001/2024. **Refused — always a NAMED error, never NULL:** modifiers (`'+1 day'`, `'start of month'`, `'unixepoch'`, `'localtime'`, `'subsec'`, …), `'now'`, the Julian-day/unix-epoch NUMBER time forms, any non-ISO or out-of-range time string, an unknown specifier, a trailing bare `%`. NULL is reserved for what sqlite also answers NULL to (a NULL argument): sqlite ANSWERS for `'now'` and for a modifier, so answering NULL there would be a silently different answer rather than a refusal |
+| json | ✅ | `json(X)` — validate `X` and return it MINIFIED. Minifying is not re-rendering: every token keeps its source spelling (`1.50` stays `1.50`, `1e3` stays `1e3`, an escape stays as written) and only whitespace BETWEEN tokens is dropped, which is what makes the output byte-identical to sqlite's without mpedb owning sqlite's number formatting. **Strict RFC 8259 only** — see the JSON5 note below the table |
+| json_valid | ✅ | `json_valid(X[, FLAGS])` → 1/0. A number argument is 1 (its own text is a document), a BLOB is 0, NULL is NULL — all sqlite's answers. FLAGS is sqlite 3.45's grammar bitmask; out of range 1..15 raises sqlite's own message verbatim, and **every in-range value other than 1 is refused by name**: bit 2 is JSON5 and bits 4/8 are JSONB |
+| json_type | ✅ | `json_type(X[, PATH])` → `object`/`array`/`integer`/`real`/`true`/`false`/`null`/`text`; NULL when the path selects nothing. Integer-vs-real follows the TOKEN's shape, as sqlite's does: `1.0` is `real`, `1` is `integer` |
+| json_array_length | ✅ | `json_array_length(X[, PATH])`; a non-array is 0, a path that selects nothing is NULL |
+| json_extract | ✅ | `json_extract(X, PATH, …)`. ONE path unwraps the node to a SQL value (a container → its minified JSON text, a string → its DECODED characters, `true`/`false` → the integers 1/0, `null` → SQL NULL); SEVERAL wrap into a JSON array with missing paths as `null`. A number becomes an INTEGER only if the token has no `.`/exponent AND fits an i64 — `9223372036854775808` is a real, exactly as in sqlite. Return type is `Any` (per value) |
+| `->` and `->>` | ✅ | sqlite's JSON accessors, as OPERATORS. `->` yields the node's JSON TEXT (`'{"a":"s"}' -> '$.a'` is the three characters `"s"`, and a JSON `null` is the four-character text `null`); `->>` yields the SQL value (`… ->> '$.a'` is the one character `s`, and a JSON `null` is SQL NULL). A path that selects nothing is SQL NULL for both. They accept the abbreviated right-hand side `json_extract` does not: an INTEGER is `$[N]` (a negative one selects nothing), text starting with `[` is rooted at `$`, and anything else is a whole quoted LABEL — `'a.b'` means `$."a.b"`, NOT `$.a.b`. Own precedence tier, tighter than `*`, left-associative, and `->>` is lexed before `->` so `a ->> p` can never mis-lex as `a -> (> p)` |
+| json_quote | ✅ | `json_quote(X)` — `X` as a JSON value. Does NOT null-propagate (`json_quote(NULL)` is the text `null`). An argument that is itself a JSON-producing call passes through unchanged, matching sqlite's subtype behaviour — see the subtype note below |
+| json_array, json_object | ✅ | `json_array(…)`, `json_object(LABEL, VALUE, …)`. Text escaping is sqlite's `jsonAppendString` (`\b \t \n \f \r`, other C0 as `\u00xx` lowercase, 0x7f and all non-ASCII verbatim); a REAL renders as `CAST(x AS TEXT)`; a BLOB is sqlite's own "JSON cannot hold BLOB values" error. `json_object` labels are pinned to text at COMPILE time, so sqlite's per-row "labels must be TEXT" is a bind error here |
+| json_set, json_insert, json_replace | ✅ | `(X, PATH, VALUE, …)`. `set` overwrites-or-creates, `insert` only creates, `replace` only overwrites; missing intermediate OBJECT levels are created (`json_set('{"a":1}','$.b.c',9)`), an array grows by at most one element, `$[#]` appends, and `$` addresses the whole document. Untouched parts keep their EXACT spelling. NULL rules are sqlite's and they differ per function: a NULL document propagates, a NULL VALUE becomes JSON `null`, a NULL PATH silently SKIPS its pair |
+| json_remove, json_patch | ✅ | `json_remove(X, PATH, …)` applies paths left to right (`'$'` removes the document → NULL, and a NULL document or NULL path makes the whole call NULL — unlike `json_set`). `json_patch(TARGET, PATCH)` is RFC 7396 merge patch with sqlite's semantics: a non-object patch replaces outright and a `null` member deletes |
+| json_each, json_tree, json_group_array, json_group_object, jsonb* | ❌ | table-valued functions, aggregates, and the JSONB binary encoding respectively. Each is refused with a message NAMING what it is, not "unknown function" |
 | everything else | ❌ | an unknown function is a compile error that lists what exists |
 
 The other date/time functions (`date`, `time`, `datetime`, `julianday`,
-`unixepoch`, `timediff`) do not exist, and neither do the JSON functions —
-see the `json()` note in `C-API-COMPAT.md` for why implementing `json(X)`
-alone would be a regression rather than a gain. There is a first-class
-`timestamp` column type (µs since epoch, UTC) instead, with timestamp
-parameters accepted by the CLI and the Python API.
+`unixepoch`, `timediff`) do not exist. There is a first-class `timestamp`
+column type (µs since epoch, UTC) instead, with timestamp parameters accepted
+by the CLI and the Python API.
+
+### JSON: the model, and the four things it refuses
+
+JSON is **TEXT**, exactly as in sqlite — there is no JSON `ColumnType`, no
+schema-format change, and no operator set over a typed `jsonb`. (PostgreSQL's
+typed `json`/`jsonb` with GIN indexes is a separate, later decision; nothing
+above pre-commits it.) The whole surface is differential-tested against
+`sqlite3` 3.45.1 in `crates/mpedb/tests/json_fn.rs`.
+
+**1. JSON5 is refused, so `json()` and `json_valid()` AGREE.** sqlite's do not:
+`json_valid('{a:1}')` is `0` (strict RFC 8259) while `json('{a:1}')` is
+`{"a":1}` — its `json()` accepts JSON5 and REWRITES it (`json('0x10')` is `16`,
+`json('+1')` is `1`, `json('.5')` is `0.5`, `json('1.')` is `1.0`,
+`json('Infinity')` is `9e999`, `json('NaN')` is `null`, and trailing commas and
+comments are dropped). Reproducing that rewrite byte-exactly is a large surface
+with no user in sight, so mpedb takes strict RFC 8259 in BOTH: `json_valid`
+answers `0` for JSON5 (agreeing with sqlite) and `json()` raises a named error
+instead of rewriting (a refusal, not a wrong answer). `json_valid(X, 2)` — the
+JSON5 grammar bit — is refused for the same reason.
+
+**2. JSONB is out of scope**, entirely: `jsonb()` and the `jsonb_*` family,
+`json_valid` flag bits 4 and 8, and a BLOB document argument. Django does not
+use it.
+
+**3. Nesting deeper than 128 levels is an ERROR, not an answer.** sqlite's bound
+is 1000; mpedb's parser is a recursive descent over a tree and 1000 frames
+overflow a default 2 MiB thread stack. Crucially `json_valid()` **raises** there
+rather than answering `0` — sqlite answers `1`, so a `0` would be a wrong answer
+instead of a refusal. (A document that is both too deep and malformed therefore
+raises where sqlite says `0`; still a refusal.)
+
+**4. Three smaller refusals, each because sqlite has no single answer to match:**
+a path key containing a backslash (sqlite compares a DECODED document label
+against a VERBATIM path key, so `$."a\"b"` matches nothing while `$.a"b`
+matches `{"a\"b":1}`); a lone surrogate escape in an extracted string (sqlite
+emits three raw bytes that are not UTF-8, which mpedb's TEXT cannot hold); and a
+non-finite REAL entering a document (`json_quote(9e999)` is `9.0e+999` but
+`json_set('{}','$.a',9e999)` is `9e999` — sqlite's two JSON writers disagree
+with each other).
+
+#### The JSON subtype, and the shapes it makes mpedb refuse
+
+sqlite marks a *value* with an internal JSON subtype whenever a JSON function
+produced it, and the value-taking writers read that mark:
+
+```
+json_object('a', json('[1,2]'))  ->  {"a":[1,2]}     -- spliced raw
+json_object('a',      '[1,2]' )  ->  {"a":"[1,2]"}   -- quoted as text
+```
+
+mpedb's values carry no subtype. They do not have to: sqlite sets that mark in
+exactly one place — the return of a JSON function — so the BINDER decides it,
+statically, and passes a bitmask to the writer. `json`, `json_array`,
+`json_object`, `json_insert`, `json_replace`, `json_set`, `json_remove`,
+`json_patch`, `json_quote` and `->` are JSON; everything else (a literal, a
+column, a parameter, `||`, `CAST`, an aggregate, a host UDF, and `->>`) is
+plain, which is exactly what sqlite gives too.
+
+Three shapes are **refused by name** rather than guessed, because a static
+answer could differ from sqlite's runtime one:
+
+* **`json_extract(…)` or `->>` in a value position** — sqlite subtypes
+  `json_extract`'s result only when the extracted node is an object or an array,
+  which is a property of the DATA, not the query.
+* **A scalar subquery** — sqlite propagates the subtype out of one
+  (`json_quote((SELECT json('[1]')))` is `[1]`) but *not* out of a FROM-subquery
+  column, an aggregate, or `||`; mpedb cannot see through the subplan boundary
+  to tell those apart.
+* **A `CASE`/`coalesce`/`iif` whose arms disagree** — sqlite's answer is
+  whichever arm fires.
+
+In each case the error says so and suggests `json(…)` for the JSON reading or
+`'' || …` for the quoted-string one. At most 64 value arguments per writer (the
+mask is 64 bits); beyond that is a named error.
 
 ## Aggregate functions
 
