@@ -899,6 +899,16 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     atom: false,
                 }
             }
+            // The dynamic-pattern form: the pattern is on the stack, so it is
+            // popped FIRST (it was pushed last).
+            Instr::RegexpDyn => {
+                let p = pop(&mut st);
+                let a = pop(&mut st);
+                Item {
+                    s: format!("{} REGEXP {}", wrap(&a), wrap(&p)),
+                    atom: false,
+                }
+            }
             // `x IN ($n)` — a session-context list (§2.6). Pops the probe only.
             Instr::InParam(i) => {
                 let a = pop(&mut st);

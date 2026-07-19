@@ -534,13 +534,35 @@ pub(super) fn glob_match(pattern: &str, s: &str) -> bool {
 // yields FALSE and `NOT REGEXP` yields TRUE, mirroring how GLOB treats an
 // unterminated `[`.
 
+// The LAST pattern this thread compiled, and the program it compiled to
+// (`None` for a pattern the engine rejects — that result is worth caching too,
+// since it is reached on every row of the scan).
+//
+// One entry, not an LRU: a REGEXP's pattern is the same on every row of a
+// scan, whether it arrived as a literal or — since #74 item 3 — as a bound
+// parameter, so a single slot has the hit rate an LRU would and none of the
+// bookkeeping. Purely a memo of a deterministic function of `pattern`, so it
+// cannot change an answer; it exists because `regexp_match` was recompiling the
+// pattern PER ROW even in the literal case, which is what made "the pattern
+// must be a literal" look like a performance guard when it never was one.
+std::thread_local! {
+    static RE_MEMO: std::cell::RefCell<Option<(String, Option<ReProg>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// sqlite `x REGEXP y`: does `pattern` (the sqlite regexp dialect) match some
 /// substring of `text`? A pattern that fails to compile matches nothing.
 pub(super) fn regexp_match(pattern: &str, text: &str) -> bool {
-    match ReProg::compile(pattern) {
-        Some(prog) => prog.is_match(text),
-        None => false,
-    }
+    RE_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if !matches!(&*memo, Some((p, _)) if p == pattern) {
+            *memo = Some((pattern.to_string(), ReProg::compile(pattern)));
+        }
+        match &memo.as_ref().expect("just filled").1 {
+            Some(prog) => prog.is_match(text),
+            None => false,
+        }
+    })
 }
 
 /// One member of a `[...]` class: a single char or an inclusive range. A range
