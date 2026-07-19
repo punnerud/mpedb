@@ -144,7 +144,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | substr / substring | ✅ | |
 | coalesce, ifnull | ✅ | compiled to lazy control flow, not a call — arguments after the first non-NULL are never evaluated; int64/float64 arm mixing refused, same rule as CASE |
 | nullif | ✅ | desugared to CASE |
-| iif | ✅ | `iif(c, a, b)` = `CASE WHEN c THEN a ELSE b END` (control flow, does not NULL-propagate); the condition is a rigid boolean, not sqlite truthiness |
+| iif | ✅ | `iif(c, a, b)` = `CASE WHEN c THEN a ELSE b END` (control flow, does not NULL-propagate); the condition is truthy-tested exactly as sqlite's is (see *Boolean contexts* under Types) |
 | printf / format | ✅ | sqlite's C-printf formatter (`format` is an exact alias), variadic, differential-tested against sqlite 3.45 across ~2,800 value×specifier cases. Conversions: `%d %i %u %x %X %o %c %s %q %Q %w %% %f %e %E %g %G`; flags `- + space 0 # , !`; field width, `.precision`, and `*` (width/precision from an argument). sqlite's dialect, matched exactly (not C stdio): `%c` is the first *character of the argument's text* (`printf('%c',65)`→`6`, not `A`); `%u`/`%x`/`%o` are 64-bit; integer `.precision` zero-pads; text→number coercion parses a leading numeric prefix (`printf('%d','12ab')`→`12`, `'abc'`→`0`); `%q`/`%Q`/`%w` are the SQL escapes (NULL renders `(NULL)`/`NULL`/`(NULL)`); `%.0f` of `3.5` is `3` (sqlite's decimal decoder, ported faithfully). A NULL *data* argument is formatted per specifier, never propagated; a NULL or empty *format* yields NULL. Floats use the portable double-double decoder (bit-identical to sqlite's long-double CLI, and deterministic across mpedb's platforms). **Deviations (each a clean compile error, never a wrong answer):** the format argument must be text — mpedb refuses a non-text format that sqlite would coerce; and an *untyped bare parameter* in a data slot is refused (the consuming specifier is only known at runtime, so a rigid engine cannot type it — add a `CAST`). A conversion character outside the supported set halts output at that point, as sqlite does for an unknown specifier. One float deviation, deterministic by design: the `!` alt form asks the decoder for up to 26 significant digits, and beyond ~17 the portable double-double decoder can differ from a *long-double* sqlite build in the last digit(s) — mpedb's value is the same on every platform (a long-double sqlite build is not), so `%!` with precision past ~17 significant digits is the one place the byte-for-byte match with the CLI ends |
 | everything else | ❌ | an unknown function is a compile error that lists what exists |
 
@@ -170,9 +170,45 @@ with timestamp parameters accepted by the CLI and the Python API.
 | REAL | `float64` | `int64 → float64` is the one implicit widening |
 | TEXT | `text` | UTF-8 |
 | BLOB | `blob` | plus streaming/incremental blob I/O and extent storage for large values |
-| — | `bool` | first-class, not an integer |
+| — | `bool` | first-class, not an integer — but observably identical to sqlite's 0/1 (see *Boolean contexts*) |
 | — | `timestamp` | µs since epoch, UTC |
 | dynamic typing | `any` | opt-in per column (sqlite-affinity semantics, tagged per value); refused in keys and UNIQUE columns |
+
+### Boolean contexts
+
+sqlite has no boolean type, and mpedb's rigid `bool` is nevertheless
+**observably identical** to it.
+
+*Truthiness.* A non-boolean value standing in a boolean position — `WHERE`,
+`HAVING`, `ON`, `FILTER (WHERE …)`, `NOT`, `AND`/`OR`, `CASE WHEN`, `iif()`,
+`CHECK`, `ON CONFLICT … WHERE` — is truthy-tested exactly as
+`sqlite3VdbeBooleanValue` does: NULL stays unknown (3VL), an integer is `!= 0`,
+and **everything else is `RealValue(x) != 0.0`** — the leading-float-prefix
+parse, applied to text and to a blob's raw bytes. So `'3abc'`, `'1e3'`, `'.5'`,
+`' 1 '` and `x'31'` are TRUE, while `'abc'`, `'0'`, `'0abc'`, `'0x1'`, `''`,
+`x'30'`, `x'00'` and `-0.0` are FALSE. It is implemented as a binder desugaring
+to `x <> 0` / `CAST(x AS REAL) <> 0.0`, so it costs no opcode and no plan
+format. 24 values × 8 boolean positions are differential-tested against sqlite
+3.45 in `crates/mpedb/tests/bool_truthiness.rs`.
+
+*The int/bool value bridge.* sqlite stores a boolean AS the integer 0/1, which
+is why Django writes `WHERE "t"."flag" = 1` for a `BooleanField` and binds
+`True` as 1. mpedb bridges the two **by the bool's integer value, never by
+truthiness of the integer**: in a comparison an int constant 0/1 folds into the
+bool domain (`flag = 1` → `flag = TRUE`, so an index probe on the column
+survives) and any other integer casts the bool side up instead — so `flag = 2`
+is FALSE, sqlite's answer. A bool assigned to an int64 column is exact
+(`TRUE` → 1); a parameter bound as 0/1 into a bool slot converts.
+
+**Refused (clean error, never a wrong answer):** a non-0/1 integer written into
+a `bool` column, and any non-constant int expression assigned to one — sqlite
+would store `2` and hand `2` back, which a rigid `bool` cannot represent, so
+guessing TRUE would be a wrong answer on read-back. Arithmetic on a bool
+(`flag + 1`) is also still rigid: the bridge is a comparison/assignment rule,
+not a general interchange.
+
+Under the PostgreSQL dialect (`bare_group_by = "postgres"`) every widening
+above is off and the original rigid refusals stand.
 
 The default is the opposite of sqlite's: columns are rigid, and a wrong type is
 a write-time error. sqlite `STRICT` accepts anything that converts losslessly

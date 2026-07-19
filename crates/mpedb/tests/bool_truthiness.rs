@@ -6,7 +6,7 @@
 //! the leading-float-prefix parse, over text AND over a blob's raw bytes.
 //! mpedb keeps a rigid `Bool` internally but must be observably identical, so
 //! the binder desugars a non-boolean in a boolean position into
-//! `x <> 0` / `CAST(x AS REAL) <> 0.0` (see `Binder::to_bool_ctx`).
+//! `x <> 0` / `CAST(x AS REAL) <> 0.0` (see `Binder::coerce_bool_ctx`).
 //!
 //! This drives the same matrix through both engines in every boolean position
 //! sqlite has — `WHERE`, `NOT`, `CASE WHEN`, `AND`, `OR` — and asserts they
