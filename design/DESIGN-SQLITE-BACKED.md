@@ -64,6 +64,25 @@ into an INTEGER-affinity column comes back different, and the reconcile sees
 a divergence it caused itself (the CONF#35 anti-entropy storm mirror already
 closed). Columns that must stay loose use mirror's canonicalizer contract.
 
+**RESOLVED, not by sniffing a concrete type.** [R#17] named the right
+failure and the wrong cure. A sqlite file is NOT rigid: an `int` column may
+genuinely hold `'abc'`, because sqlite stores whatever survives its
+affinity conversion — so a concrete `Int64` overlay column would make mpedb
+refuse to READ rows the base happily holds, trading one wrong behaviour for
+another. What sqlite actually guarantees is the CONVERSION, so that is what
+the overlay carries: the column stays `ColumnType::Any` and gains the base's
+declared `Affinity` (`ColumnDef.affinity`, canonical-bytes v7), and mpedb
+applies sqlite's store-time affinity itself. A value written through the
+overlay is therefore ALREADY in the class sqlite would have put it in, the
+push is a no-op for affinity, and the self-inflicted divergence [R#17]
+predicted cannot arise. Verified differentially for all five affinities.
+
+The base's NOT NULL and literal DEFAULTs ride along; what cannot be carried
+faithfully — CHECK, a non-literal DEFAULT, a GENERATED column — takes the
+table out of the attach BY NAME rather than being silently dropped, since a
+constraint enforced nowhere let in a row the base itself rejects and failed
+the checkpoint later, on an unrelated statement.
+
 ## 2. Lock modes
 
 ### LOCKED (default): every attaching process holds SHARED
