@@ -271,6 +271,7 @@ fn synthetic_grouped_table(
         primary_key: vec![0],
         indexes: Vec::new(),
         dead: false,
+        implicit_rowid: false,
         kind: mpedb_types::TableKind::Standard,
     }
 }

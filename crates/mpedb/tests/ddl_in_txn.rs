@@ -254,9 +254,9 @@ fn ddl_after_savepoint_is_refused() {
     assert_eq!(one_i64(db.query("SELECT n FROM base WHERE id = 1", &[]).unwrap()), 1);
 }
 
-/// A DDL statement that fails (here: no PRIMARY KEY) does NOT poison the
-/// session — it had no side effect, so the session stays fully usable and can
-/// commit its other work.
+/// A DDL statement that fails (here: two columns each marked inline PRIMARY KEY)
+/// does NOT poison the session — it had no side effect, so the session stays
+/// fully usable and can commit its other work.
 #[test]
 fn failed_ddl_leaves_session_usable() {
     let (cfg, _g) = config("ddl_error");
@@ -264,8 +264,11 @@ fn failed_ddl_leaves_session_usable() {
 
     let mut s = db.begin().unwrap();
     s.query("INSERT INTO base VALUES(1, 42)", &[]).unwrap();
-    // mpedb requires a PRIMARY KEY — this CREATE is refused with no side effect.
-    assert!(s.query("CREATE TABLE bad (a INTEGER)", &[]).is_err());
+    // Two inline PRIMARY KEY columns is refused (a composite must be declared
+    // once at table level) — this CREATE fails with no side effect.
+    assert!(s
+        .query("CREATE TABLE bad (a INTEGER PRIMARY KEY, b INTEGER PRIMARY KEY)", &[])
+        .is_err());
     // The session is not poisoned: a valid statement still runs and commits.
     s.query("CREATE TABLE good (id INTEGER PRIMARY KEY, v)", &[]).unwrap();
     s.query("INSERT INTO good VALUES(1, 7)", &[]).unwrap();

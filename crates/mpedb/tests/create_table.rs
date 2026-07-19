@@ -180,8 +180,13 @@ fn create_table_refusals() {
     let (cfg, path) = config("refuse");
     let db = Database::open_with_config(cfg).unwrap();
 
-    // No PK.
-    assert!(db.query("CREATE TABLE t (a INT, b TEXT)", &[]).is_err());
+    // No declared PK: sqlite parity (#94) SYNTHESIZES a hidden rowid, so the
+    // CREATE now SUCCEEDS (it used to be refused). Depth is covered by the
+    // `implicit_rowid` differential suite; here we just confirm it is accepted
+    // and stores rows.
+    db.query("CREATE TABLE norowid (a INT, b TEXT)", &[]).unwrap();
+    db.query("INSERT INTO norowid VALUES (1, 'x')", &[]).unwrap();
+    assert_eq!(scalar_i64(&db, "SELECT count(*) FROM norowid"), 1);
     // Duplicate name (a seed table).
     assert!(db.query("CREATE TABLE users (id INT PRIMARY KEY)", &[]).is_err());
     // Two PK forms at once.

@@ -449,9 +449,10 @@ fn the_sqlite_differences_that_bite() {
         vec![vec![Value::Text("x".into())]]
     );
     db.query("DROP TABLE t2", &[]).unwrap();
-    // …but a PK is required, and the changes that need a default fill / row
-    // rewrite still refuse: NOT NULL on ADD, and DROP COLUMN.
-    assert!(db.query("CREATE TABLE u (id INTEGER)", &[]).is_err());
+    // …a PK-less CREATE now gets sqlite's hidden rowid (#94), so it is accepted;
+    // but the changes that need a default fill / row rewrite still refuse:
+    // NOT NULL on ADD, and DROP COLUMN.
+    db.query("CREATE TABLE u (id INTEGER)", &[]).unwrap();
     assert!(db.query("ALTER TABLE orders ADD COLUMN x INT NOT NULL", &[]).is_err());
 
     // 2. Division by zero yields NULL, matching sqlite. (Also a FROM-less

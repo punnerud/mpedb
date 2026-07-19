@@ -97,6 +97,18 @@ pub struct TableDef {
     /// Ordinary vs. FTS virtual table (design/DESIGN-FTS.md §1). Canonical-bytes
     /// v4 carries this discriminant; a dead slot is always `Standard`.
     pub kind: TableKind,
+    /// A `CREATE TABLE` with NO declared PRIMARY KEY (#94, sqlite parity). The
+    /// engine synthesizes a HIDDEN auto-increment integer `rowid` column — the
+    /// LAST column, the sole PRIMARY KEY — and this flag records that it is
+    /// hidden: `SELECT *` and the default INSERT column list skip it, but it is
+    /// addressable by the names `rowid` / `_rowid_` / `oid`, exactly as sqlite's
+    /// implicit rowid. Storage/MVCC/btree treat it as an ordinary single-integer
+    /// PK (it IS a rowid alias for auto-assign), so the whole engine is unchanged
+    /// — only the SQL surface hides it. Canonical-bytes v5 carries this bit; a
+    /// dead slot and an FTS table are always `false`. NOT derivable from the
+    /// shape: an explicit `CREATE TABLE t(rowid INTEGER PRIMARY KEY)` has the
+    /// same columns but a VISIBLE rowid, so the flag must be stored.
+    pub implicit_rowid: bool,
 }
 
 impl TableDef {
@@ -111,6 +123,7 @@ impl TableDef {
             indexes: Vec::new(),
             dead: true,
             kind: TableKind::Standard,
+            implicit_rowid: false,
         }
     }
 }
@@ -149,6 +162,41 @@ impl TableDef {
             [c] if self.columns[*c as usize].ty == ColumnType::Int64 => Some(*c),
             _ => None,
         }
+    }
+
+    /// The column ordinal of the HIDDEN implicit `rowid` (#94), or `None` for a
+    /// table with an explicit PRIMARY KEY. Synthesized as the LAST column, so
+    /// the VISIBLE columns keep their natural declaration ordinals `0..n-1` and
+    /// only the trailing one is hidden — which is why every "slot == output
+    /// position" assumption in the `SELECT *` path survives unchanged.
+    pub fn hidden_rowid_col(&self) -> Option<u16> {
+        self.implicit_rowid
+            .then(|| (self.columns.len() - 1) as u16)
+    }
+
+    /// Count of VISIBLE columns — every column `SELECT *` and the default INSERT
+    /// column list expose. Equals `columns.len()` for an explicit-PK table and
+    /// one fewer when a hidden rowid is present (it is the trailing column).
+    pub fn visible_column_count(&self) -> usize {
+        self.columns.len() - self.implicit_rowid as usize
+    }
+
+    /// The VISIBLE columns, in declaration order — the trailing hidden rowid (if
+    /// any) elided. `SELECT *` / `RETURNING *` / the default INSERT list expand
+    /// over exactly these.
+    pub fn visible_columns(&self) -> &[ColumnDef] {
+        &self.columns[..self.visible_column_count()]
+    }
+
+    /// Resolve one of sqlite's three rowid spellings (`rowid`, `_rowid_`, `oid`,
+    /// case-insensitively) to the hidden rowid column of an implicit-rowid table.
+    /// A REAL column of that name always wins (checked by the caller before this
+    /// fallback), matching sqlite, and an explicit-PK table returns `None` so its
+    /// name resolution is completely unchanged (#94 requirement 7).
+    pub fn rowid_name_col(&self, name: &str) -> Option<u16> {
+        let hidden = self.hidden_rowid_col()?;
+        let lc = name.to_ascii_lowercase();
+        (lc == "rowid" || lc == "_rowid_" || lc == "oid").then_some(hidden)
     }
 
     /// For an FTS table, the `(column_index, fts_colno)` of every content
@@ -507,6 +555,7 @@ impl Schema {
                     || !t.primary_key.is_empty()
                     || !t.indexes.is_empty()
                     || t.kind != TableKind::Standard
+                    || t.implicit_rowid
                 {
                     return Err(Error::Schema(format!(
                         "tombstone slot id {} must be empty (no name/columns/pk/indexes/kind)",
@@ -711,6 +760,33 @@ impl Schema {
                     }
                 }
             }
+            // A hidden implicit rowid (#94) is a well-defined shape: an ordinary
+            // (non-FTS) table whose LAST column is the sole PRIMARY KEY, an
+            // Int64 named `rowid`, NOT NULL. Enforced here so a hostile/corrupt
+            // v5 blob that merely flips the bit cannot fabricate a table whose
+            // `SELECT *` would hide an arbitrary column or whose auto-assign
+            // would target a non-integer key.
+            if t.implicit_rowid {
+                if t.kind.is_fts() {
+                    return Err(Error::Schema(format!(
+                        "table `{}` cannot be both FTS and implicit-rowid",
+                        t.name
+                    )));
+                }
+                let last = (t.columns.len() - 1) as u16;
+                let c = &t.columns[last as usize];
+                if t.primary_key.as_slice() != [last]
+                    || c.name != "rowid"
+                    || c.ty != ColumnType::Int64
+                    || c.nullable
+                {
+                    return Err(Error::Schema(format!(
+                        "table `{}` has implicit_rowid set but its last column is not a \
+                         NOT-NULL Int64 `rowid` sole primary key",
+                        t.name
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -738,7 +814,7 @@ impl Schema {
     /// and decode reconstructs the in-memory convenience flags from it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-        buf.push(4u8); // schema encoding version (v4: TableDef.kind, FTS §1)
+        buf.push(5u8); // schema encoding version (v5: TableDef.implicit_rowid, #94)
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             buf.extend_from_slice(&t.id.to_le_bytes());
@@ -751,6 +827,9 @@ impl Schema {
                     buf.push(tokenizer as u8);
                 }
             }
+            // Hidden implicit-rowid flag (v5, #94). Always 0 for a dead slot or
+            // an FTS table (validate enforces it).
+            buf.push(t.implicit_rowid as u8);
             write_str(&mut buf, &t.name);
             buf.extend_from_slice(&(t.columns.len() as u16).to_le_bytes());
             for c in &t.columns {
@@ -791,16 +870,16 @@ impl Schema {
 
     /// Parse [`canonical_bytes`] output (bounds-checked; used when attaching
     /// to an existing database to recover its schema from the catalog). Only
-    /// version 3 is accepted — older files refuse loudly and are regenerated
+    /// version 5 is accepted — older files refuse loudly and are regenerated
     /// (DESIGN-SCHEMA-V2 §5; the project carries no migration burden).
     pub fn from_canonical_bytes(buf: &[u8]) -> Result<Schema> {
         let err = || Error::Corrupt("truncated schema".into());
         let mut pos = 0usize;
         let version = *buf.get(pos).ok_or_else(err)?;
         pos += 1;
-        if version != 4 {
+        if version != 5 {
             return Err(Error::Corrupt(format!(
-                "unknown schema version {version} (v1/v2/v3 predate canonical-bytes v4 — \
+                "unknown schema version {version} (v1..v4 predate canonical-bytes v5 — \
                  regenerate or re-import)"
             )));
         }
@@ -831,6 +910,12 @@ impl Schema {
                 }
                 _ => return Err(Error::Corrupt("bad table kind tag".into())),
             };
+            let implicit_rowid = match *buf.get(pos).ok_or_else(err)? {
+                0 => false,
+                1 => true,
+                _ => return Err(Error::Corrupt("bad implicit_rowid flag".into())),
+            };
+            pos += 1;
             let name = read_str(buf, &mut pos)?;
             let ncols = read_u16(buf, &mut pos)? as usize;
             if ncols > MAX_COLUMNS {
@@ -933,6 +1018,7 @@ impl Schema {
                 indexes,
                 dead,
                 kind,
+                implicit_rowid,
             });
         }
         if pos != buf.len() {
@@ -1027,7 +1113,7 @@ mod tests {
             ],
             primary_key: vec![0],
             indexes: vec![],
-            dead: false, kind: TableKind::Standard,
+            dead: false, kind: TableKind::Standard, implicit_rowid: false,
         }])
         .unwrap()
     }
@@ -1060,7 +1146,7 @@ mod tests {
                         }],
                         primary_key: vec![0],
                         indexes: vec![],
-                        dead: false, kind: TableKind::Standard,
+                        dead: false, kind: TableKind::Standard, implicit_rowid: false,
                     })
                     .collect(),
             )
@@ -1087,7 +1173,7 @@ mod tests {
             }],
             primary_key: vec![0],
             indexes: vec![],
-            dead: false, kind: TableKind::Standard,
+            dead: false, kind: TableKind::Standard, implicit_rowid: false,
         }]);
         assert!(bad.is_err());
         // reserved prefix
@@ -1105,7 +1191,7 @@ mod tests {
             }],
             primary_key: vec![0],
             indexes: vec![],
-            dead: false, kind: TableKind::Standard,
+            dead: false, kind: TableKind::Standard, implicit_rowid: false,
         }]);
         assert!(bad.is_err());
     }
@@ -1123,7 +1209,7 @@ mod tests {
         let col = |n: &str| ColumnDef { name: n.into(), ty: ColumnType::Int64,
             nullable: false, unique: false, indexed: false, default: None, check: None };
         let tbl = |n: &str| TableDef { id: 0, name: n.into(), columns: vec![col("id")],
-            primary_key: vec![0], indexes: vec![], dead: false, kind: TableKind::Standard };
+            primary_key: vec![0], indexes: vec![], dead: false, kind: TableKind::Standard, implicit_rowid: false };
 
         let s = Schema::new(vec![tbl("orders"), tbl("users"), tbl("accounts")]).unwrap();
         let got: Vec<(&str, u32)> =
@@ -1158,7 +1244,7 @@ mod tests {
             ],
             primary_key: vec![0],
             indexes: vec![IndexDef { columns: vec![1, 2], unique: false }],
-            dead: false, kind: TableKind::Standard,
+            dead: false, kind: TableKind::Standard, implicit_rowid: false,
         };
         // The single-PK column's flags are noise and must normalize away.
         t.columns[0].unique = true;
@@ -1198,7 +1284,7 @@ mod tests {
             ],
             primary_key: vec![0],
             indexes: vec![IndexDef { columns: vec![2], unique: false }],
-            dead: false, kind: TableKind::Standard,
+            dead: false, kind: TableKind::Standard, implicit_rowid: false,
         }])
         .unwrap();
 
@@ -1241,7 +1327,7 @@ mod tests {
             unique: false, indexed: false, default: None, check: None,
         };
         TableDef { id: 0, name: n.into(), columns: vec![col("id")],
-            primary_key: vec![0], indexes: vec![], dead: false, kind: TableKind::Standard }
+            primary_key: vec![0], indexes: vec![], dead: false, kind: TableKind::Standard, implicit_rowid: false }
     }
 
     #[test]
@@ -1290,13 +1376,13 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r, "dead slot + ids survive the wire byte-for-byte");
         assert_eq!(s.hash(), r.hash());
-        // The version byte is 4.
-        assert_eq!(s.canonical_bytes()[0], 4);
-        // A v3 file refuses cleanly (no misread of the new kind discriminant).
-        let mut v3 = s.canonical_bytes();
-        v3[0] = 3;
-        let err = Schema::from_canonical_bytes(&v3).unwrap_err();
-        assert!(format!("{err}").contains("unknown schema version 3"), "{err}");
+        // The version byte is 5.
+        assert_eq!(s.canonical_bytes()[0], 5);
+        // A v4 file refuses cleanly (no misread of the new implicit_rowid byte).
+        let mut v4 = s.canonical_bytes();
+        v4[0] = 4;
+        let err = Schema::from_canonical_bytes(&v4).unwrap_err();
+        assert!(format!("{err}").contains("unknown schema version 4"), "{err}");
     }
 
     #[test]
@@ -1336,5 +1422,67 @@ mod tests {
         assert_eq!(s.tables.len(), MAX_TABLES);
         let err = s.with_added_table(tbl("overflow")).unwrap_err();
         assert!(format!("{err}").contains("exhausted"), "{err}");
+    }
+
+    /// An implicit-rowid table (#94): visible columns plus a trailing hidden
+    /// Int64 `rowid` sole PK. It round-trips byte-for-byte through v5, the flag
+    /// survives, and the helpers report the right visible set.
+    #[test]
+    fn implicit_rowid_round_trips_and_helpers() {
+        let col = |n: &str, ty| ColumnDef {
+            name: n.into(), ty, nullable: true, unique: false, indexed: false,
+            default: None, check: None,
+        };
+        let rowid = ColumnDef {
+            name: "rowid".into(), ty: ColumnType::Int64, nullable: false,
+            unique: false, indexed: false, default: None, check: None,
+        };
+        let s = Schema::new(vec![TableDef {
+            id: 0,
+            name: "t".into(),
+            columns: vec![col("a", ColumnType::Any), col("b", ColumnType::Text), rowid],
+            primary_key: vec![2],
+            indexes: vec![],
+            dead: false,
+            kind: TableKind::Standard,
+            implicit_rowid: true,
+        }])
+        .unwrap();
+        let t = &s.tables[0];
+        assert_eq!(t.hidden_rowid_col(), Some(2));
+        assert_eq!(t.visible_column_count(), 2);
+        assert_eq!(
+            t.visible_columns().iter().map(|c| c.name.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+        assert_eq!(t.rowid_name_col("rowid"), Some(2));
+        assert_eq!(t.rowid_name_col("OID"), Some(2));
+        assert_eq!(t.rowid_name_col("_rowid_"), Some(2));
+        assert_eq!(t.rowid_name_col("a"), None);
+        // The auto-assign machinery treats it as a rowid alias.
+        assert_eq!(t.rowid_alias_col(), Some(2));
+
+        let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
+        assert_eq!(s, r);
+        assert_eq!(s.hash(), r.hash());
+        assert_eq!(s.canonical_bytes()[0], 5);
+
+        // Truncation at every offset is Corrupt, never a panic.
+        let bytes = s.canonical_bytes();
+        for i in 0..bytes.len() {
+            assert!(Schema::from_canonical_bytes(&bytes[..i]).is_err(), "offset {i}");
+        }
+    }
+
+    /// A hostile v5 blob that merely flips `implicit_rowid` on a shape that is
+    /// not a trailing NOT-NULL Int64 `rowid` sole PK must refuse — otherwise
+    /// `SELECT *` would hide an arbitrary column.
+    #[test]
+    fn hostile_implicit_rowid_bytes_refuse() {
+        let s = sample(); // explicit-PK `users`, last column is `age` (nullable Int64)
+        let mut evil = s.clone();
+        evil.tables[0].implicit_rowid = true;
+        let err = Schema::from_canonical_bytes(&evil.canonical_bytes()).unwrap_err();
+        assert!(format!("{err}").contains("implicit_rowid"), "{err}");
     }
 }
