@@ -339,6 +339,18 @@ impl SqliteAttach {
             defs.push(def);
             tables.push(Attached { src: t, pk });
         }
+        // When EVERY table was skipped, `Schema::new` would report the generic
+        // "schema defines no live tables" — true, but it hides the reasons the
+        // caller actually needs (measured: a one-table base with a CHECK
+        // constraint said "no live tables" instead of naming the CHECK). The
+        // skip list IS the explanation, so lead with it.
+        if defs.is_empty() && !skipped.is_empty() {
+            return Err(Error::Unsupported(format!(
+                "no table in {} is attachable under the v2 shape rules: {:?}",
+                path.display(),
+                skipped
+            )));
+        }
         // The attach list must mirror `Schema`'s table order so a plan's
         // table id indexes both consistently. `Schema::new` sorts by name
         // and assigns dense ids in that order (never a struct literal here —
