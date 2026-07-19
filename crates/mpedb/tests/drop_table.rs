@@ -291,13 +291,14 @@ fn create_drop_churn_reclaims_pages() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// SLOW (~110 s): 4096 DROP+CREATE cycles, each rewriting a schema record that
+/// SLOW (~22 s isolated, ~110 s alongside the rest of this file on a loaded
+/// 4-core box): 4096 DROP+CREATE cycles, each rewriting a schema record that
 /// grows by one tombstone — the O(n²) tombstone-bloat cost DESIGN-TABLE-CAP §3
 /// names as the thing that actually bounds MAX_TABLES. Run with `--ignored`.
 /// The in-memory equivalent (`schema::tests::create_refuses_at_the_id_ceiling`)
 /// covers the mint refusal and its message on every run.
 #[test]
-#[ignore = "~110 s: burns the whole 4096-id space through real commits"]
+#[ignore = "~22 s: burns the whole 4096-id space through real commits"]
 fn create_refuses_after_the_lifetime_id_ceiling() {
     // No-reuse's bounded cost, end to end: DROP+CREATE churn burns one id per
     // cycle, so eventually a CREATE refuses closed (a clean error, never
