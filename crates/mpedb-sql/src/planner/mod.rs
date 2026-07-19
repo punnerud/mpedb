@@ -28,9 +28,10 @@ use crate::binder::{compile_program, peel_collate, BExpr, Binder, Scope, Ty};
 /// collation)`. The collation is [`Collation::Binary`] for a plain `ORDER BY`.
 pub(crate) type OrderKeys = Vec<(u16, bool, Collation)>;
 use crate::plan::{
-    render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource,
-    CompoundPlan, GroupKey, Join, JoinKind, OrderOver, PlanOnConflict, PlanStmt, PolicyStamp,
-    Projection, RecursiveCtePlan, SelectPlan, SubBody, SubPlan, SubPlanKind, WindowSpec, CTE_TABLE,
+    render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, Frame,
+    FrameBound, FrameMode, InsertSource, CompoundPlan, GroupKey, Join, JoinKind, OrderOver,
+    PlanOnConflict, PlanStmt, PolicyStamp, Projection, RecursiveCtePlan, SelectPlan, SubBody,
+    SubPlan, SubPlanKind, WindowSpec, CTE_TABLE,
 };
 #[allow(unused_imports)]
 use crate::plan::{FtsQuery, FtsTerm};

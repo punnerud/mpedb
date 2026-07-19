@@ -300,10 +300,12 @@ fn value_functions_combine_and_order_match_sqlite() {
 fn out_of_scope_forms_are_refused() {
     let d = db();
     for q in [
-        // Explicit frames (ROWS/RANGE BETWEEN).
+        // A frame on lag/lead is refused (sqlite silently ignores it; the frame
+        // is meaningless for a physical-offset function). first_value/last_value/
+        // nth_value DO take a frame now — see `window_frames.rs`.
         "SELECT id, lag(v) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w2",
-        "SELECT id, first_value(v) OVER (ORDER BY k RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM w2",
-        // (ntile/percent_rank/cume_dist now ship — see `window3.rs`.)
+        // (ntile/percent_rank/cume_dist now ship — see `window3.rs`; explicit
+        // frames now ship — see `window_frames.rs`.)
         // Named window and FILTER.
         "SELECT id, lag(v) OVER w FROM w2 WINDOW w AS (ORDER BY k)",
         "SELECT id, count(v) FILTER (WHERE v > 0) OVER (ORDER BY k) FROM w2",

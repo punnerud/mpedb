@@ -12,7 +12,7 @@
 //! `select_footprint` never sees it).
 
 use super::*;
-use mpedb_sql::{WindowFunc, WindowSpec};
+use mpedb_sql::{Frame, FrameBound, FrameMode, WindowFunc, WindowSpec};
 use mpedb_types::Accum;
 use std::cmp::Ordering;
 
@@ -204,6 +204,26 @@ fn assign_window(
             q += 1;
         }
         let part = &idx[p..q];
+        // An explicit frame overrides the default-frame logic below for the
+        // functions whose result depends on it (aggregates and
+        // first_value/last_value/nth_value — the planner refuses a frame on any
+        // other function). lag/lead stay frame-independent; ranking/distribution
+        // never carry a frame.
+        if let Some(frame) = &w.frame {
+            assign_framed(
+                slot,
+                part,
+                rows,
+                w.func,
+                frame,
+                arg_vals,
+                order_vals,
+                dirs,
+                has_order,
+            )?;
+            p = q;
+            continue;
+        }
         match w.func {
             WindowFunc::RowNumber => {
                 for (off, &i) in part.iter().enumerate() {
@@ -404,6 +424,196 @@ fn assign_window(
         p = q;
     }
     Ok(())
+}
+
+/// Assign one window's values under an EXPLICIT frame, for the frame-sensitive
+/// functions (aggregate + first/last/nth_value). For each row of the partition
+/// (in window order) the frame resolves to a contiguous half-open range
+/// `part[lo..hi]`, and the function is computed over exactly those rows. This is
+/// a straightforward re-aggregation per row — O(partition · frame) — which is
+/// always correct (no incremental removal, so `min`/`max` stay exact); window
+/// partitions are small in practice and the default-frame fast paths are
+/// untouched.
+#[allow(clippy::too_many_arguments)]
+fn assign_framed(
+    slot: usize,
+    part: &[usize],
+    rows: &mut [Vec<Value>],
+    func: WindowFunc,
+    frame: &Frame,
+    arg_vals: &[Option<Value>],
+    order_vals: &[Vec<Value>],
+    dirs: &[bool],
+    has_order: bool,
+) -> Result<()> {
+    let len = part.len();
+    // Peer-group structure is needed only for GROUPS/RANGE (they count / span
+    // peer groups); ROWS is a purely physical offset and skips it.
+    let (group_of, group_starts) = if matches!(frame.mode, FrameMode::Rows) {
+        (Vec::new(), Vec::new())
+    } else {
+        build_groups(part, order_vals, dirs, has_order)
+    };
+    for off in 0..len {
+        let (lo, hi) = frame_bounds(off, len, frame, &group_of, &group_starts);
+        let target = part[off];
+        rows[target][slot] = match func {
+            WindowFunc::Agg(f) => {
+                let mut acc = Accum::new(f);
+                for &i in &part[lo..hi] {
+                    push_arg(&mut acc, &arg_vals[i])?;
+                }
+                acc.finish()
+            }
+            // The frame's FIRST / LAST row (in window order), or NULL for an
+            // empty frame.
+            WindowFunc::FirstValue => {
+                if lo < hi {
+                    arg_vals[part[lo]].clone().unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                }
+            }
+            WindowFunc::LastValue => {
+                if lo < hi {
+                    arg_vals[part[hi - 1]].clone().unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                }
+            }
+            // The n-th row (1-based) WITHIN the frame, or NULL if the frame is
+            // shorter than n. `nn >= 1` is validated; compute in i64 so an absurd
+            // constant n just yields NULL rather than overflowing.
+            WindowFunc::NthValue(nn) => {
+                let idx = lo as i64 + (nn - 1);
+                if idx >= lo as i64 && idx < hi as i64 {
+                    arg_vals[part[idx as usize]].clone().unwrap_or(Value::Null)
+                } else {
+                    Value::Null
+                }
+            }
+            // The planner refuses a frame on any other function, so this is
+            // unreachable for a valid plan; be defensive rather than panic.
+            _ => return Err(internal("explicit frame on an unsupported window function")),
+        };
+    }
+    Ok(())
+}
+
+/// Peer-group structure for one partition (already in window order): `group_of[p]`
+/// is the 0-based peer-group index of `part[p]`, and `group_starts[g]` is the
+/// position of group `g`'s first row. Peers are rows equal on every ORDER BY key
+/// (NULLs equal); with NO ORDER BY the whole partition is one group — exactly the
+/// grouping sqlite uses for RANGE/GROUPS framing.
+fn build_groups(
+    part: &[usize],
+    order_vals: &[Vec<Value>],
+    dirs: &[bool],
+    has_order: bool,
+) -> (Vec<usize>, Vec<usize>) {
+    let mut group_of = Vec::with_capacity(part.len());
+    let mut group_starts = Vec::new();
+    let mut g = 0usize;
+    for (pos, &i) in part.iter().enumerate() {
+        if pos == 0 {
+            group_starts.push(0);
+        } else {
+            let prev = part[pos - 1];
+            let same = !has_order
+                || order_cmp(&order_vals[i], &order_vals[prev], dirs) == Ordering::Equal;
+            if !same {
+                g += 1;
+                group_starts.push(pos);
+            }
+        }
+        group_of.push(g);
+    }
+    (group_of, group_starts)
+}
+
+/// Resolve a frame to the half-open range `[lo, hi)` of positions within the
+/// partition slice for the row at position `off`. `lo <= hi <= len` always; an
+/// empty frame is `lo == hi`. ROWS uses physical offsets; RANGE/GROUPS use the
+/// peer-group structure (`group_of`/`group_starts`). Offsets and positions are
+/// computed in i64 with saturating/clamping arithmetic, so a huge constant
+/// offset simply pins the boundary to the partition edge.
+fn frame_bounds(
+    off: usize,
+    len: usize,
+    frame: &Frame,
+    group_of: &[usize],
+    group_starts: &[usize],
+) -> (usize, usize) {
+    let n = len as i64;
+    match frame.mode {
+        FrameMode::Rows => {
+            let off = off as i64;
+            // Inclusive start `s` and inclusive end `e`; an illegal-as-a-bound
+            // value (UNBOUNDED FOLLOWING as start, UNBOUNDED PRECEDING as end)
+            // maps to an empty side and is rejected before exec anyway.
+            let s = match frame.start {
+                FrameBound::UnboundedPreceding => 0,
+                FrameBound::Preceding(k) => off.saturating_sub(k as i64),
+                FrameBound::CurrentRow => off,
+                FrameBound::Following(k) => off.saturating_add(k as i64),
+                FrameBound::UnboundedFollowing => n,
+            };
+            let e = match frame.end {
+                FrameBound::UnboundedPreceding => -1,
+                FrameBound::Preceding(k) => off.saturating_sub(k as i64),
+                FrameBound::CurrentRow => off,
+                FrameBound::Following(k) => off.saturating_add(k as i64),
+                FrameBound::UnboundedFollowing => n - 1,
+            };
+            let lo = s.clamp(0, n);
+            // `saturating_add` guards a pathologically huge FOLLOWING offset
+            // (`e` may already be `i64::MAX`); the clamp pins it to the partition.
+            let hi = e.saturating_add(1).clamp(0, n).max(lo);
+            (lo as usize, hi as usize)
+        }
+        FrameMode::Range | FrameMode::Groups => {
+            let g = group_of[off] as i64;
+            let n_groups = group_starts.len() as i64;
+            // First position of group `tg` (clamped: below range → 0, above → n).
+            let start_pos = |tg: i64| -> i64 {
+                if tg < 0 {
+                    0
+                } else if tg >= n_groups {
+                    n
+                } else {
+                    group_starts[tg as usize] as i64
+                }
+            };
+            // Exclusive end position just past group `tg` (below → 0, at/above the
+            // last group → n).
+            let end_excl = |tg: i64| -> i64 {
+                if tg < 0 {
+                    0
+                } else if tg + 1 >= n_groups {
+                    n
+                } else {
+                    group_starts[(tg + 1) as usize] as i64
+                }
+            };
+            let lo = match frame.start {
+                FrameBound::UnboundedPreceding => 0,
+                FrameBound::Preceding(k) => start_pos(g.saturating_sub(k as i64)),
+                FrameBound::CurrentRow => start_pos(g),
+                FrameBound::Following(k) => start_pos(g.saturating_add(k as i64)),
+                FrameBound::UnboundedFollowing => n,
+            };
+            let hi = match frame.end {
+                FrameBound::UnboundedPreceding => 0,
+                FrameBound::Preceding(k) => end_excl(g.saturating_sub(k as i64)),
+                FrameBound::CurrentRow => end_excl(g),
+                FrameBound::Following(k) => end_excl(g.saturating_add(k as i64)),
+                FrameBound::UnboundedFollowing => n,
+            };
+            let lo = lo.clamp(0, n);
+            let hi = hi.clamp(0, n).max(lo);
+            (lo as usize, hi as usize)
+        }
+    }
 }
 
 /// Push one row's argument into an aggregate accumulator. `None` is `count(*)`
