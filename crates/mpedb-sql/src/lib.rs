@@ -36,7 +36,7 @@ pub use trigger::{compile_trigger_body, compile_trigger_when, RowMap, RowSide};
 pub use plan::{
     AccessPath, AggCall, Aggregation, CompiledPlan, CompoundPlan, ConflictProbe, Frame, FrameBound,
     FrameMode, FtsQuery, FtsTerm, GroupKey, InsertSource, Join, JoinKind, OrderOver, PlanOnConflict,
-    PlanStmt, PolicyStamp, Projection, dual_def, RecursiveCtePlan, SelectPlan, SetOp, SortDir,
+    PlanStmt, PolicyStamp, Projection, DerivedPlan, dual_def, RecursiveCtePlan, SelectPlan, SetOp, SortDir,
     SubBody, SubPlan, SubPlanKind, WindowFunc, WindowSpec, CTE_TABLE, DUAL_TABLE,
 };
 pub use planner::secondary_indexes;

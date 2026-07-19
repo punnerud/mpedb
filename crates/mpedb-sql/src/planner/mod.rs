@@ -44,6 +44,7 @@ use mpedb_types::{exact_float_as_int, BareGroupBy, Collation, ExprProgram, Colum
 
 mod access;
 mod aggregate;
+mod derived;
 mod footprint;
 mod fts;
 mod join;
@@ -417,6 +418,11 @@ pub(crate) fn plan_statement(
         ast::Stmt::Savepoint(n) => txn(PlanStmt::Savepoint(n.clone())),
         ast::Stmt::Release(n) => txn(PlanStmt::Release(n.clone())),
         ast::Stmt::RollbackTo(n) => txn(PlanStmt::RollbackTo(n.clone())),
+        // A surviving derived table (`FROM (SELECT …) t` the Stage-B flattener
+        // could not splice) is MATERIALIZED — legal only here, at the top level.
+        ast::Stmt::Select(s) if s.from_derived.is_some() => {
+            derived::plan_derived_select(s, schema, n_params, catalog, mode, host_udfs, &mut consts)?
+        }
         ast::Stmt::Select(s) => {
             plan_select(s, schema, n_params, catalog, mode, host_udfs, &mut consts, None)?
         }
@@ -519,6 +525,20 @@ pub(crate) fn plan_statement(
             select_tables(&rc.anchor, &mut stamped);
             select_tables(&rc.recursive, &mut stamped);
             select_tables(&rc.outer, &mut stamped);
+        }
+        // A materialized derived table reads its body's tables (every arm of a
+        // compound body) plus the outer's; stamp each (the working table itself
+        // is filtered out below).
+        PlanStmt::Derived(dp) => {
+            match &dp.body {
+                SubBody::Select(sp) => select_tables(sp, &mut stamped),
+                SubBody::Compound(c) => {
+                    for arm in &c.arms {
+                        select_tables(arm, &mut stamped);
+                    }
+                }
+            }
+            select_tables(&dp.outer, &mut stamped);
         }
         PlanStmt::Insert { table, .. }
         | PlanStmt::Update { table, .. }
@@ -775,21 +795,35 @@ fn plan_compound(
     let mut context_keys: Vec<String> = Vec::new();
     let mut list_keys: BTreeSet<String> = BTreeSet::new();
     let mut out_types: Vec<Option<ColumnType>> = Vec::new();
+    let mut subplans: Vec<SubPlan> = Vec::new();
 
     for (k, arm_ast) in c.arms.iter().enumerate() {
+        // Arm-local subplans take the reserved slots AFTER those of the arms
+        // before them: planning arm `k` with the accumulated count as its
+        // parameter base numbers its `Param` references against the FINAL
+        // statement layout `[user ‖ arm0 subs ‖ arm1 subs ‖ …]` by
+        // construction — the cross-arm slot coordination the old refusal
+        // asked for, with no post-hoc remap to get wrong. The executor needs
+        // no change at all: uncorrelated slots are filled once, BEFORE
+        // dispatch (`exec_stmt_impl`), exactly as for a single SELECT.
+        let arm_base = n_params + subplans.len() as u16;
         let (stmt, ptypes, ckeys, lkeys, otypes, arm_subs) =
-            plan_select(arm_ast, schema, n_params, catalog, mode, host_udfs, consts, None)?;
+            plan_select(arm_ast, schema, arm_base, catalog, mode, host_udfs, consts, None)?;
         let PlanStmt::Select(sp) = stmt else {
             return Err(Error::Internal("plan_select produced a non-select".into()));
         };
-        // Arm-local subplans would need slot allocation coordinated across
-        // arms (each arm's binder numbers its own slots after the user
-        // params) — refuse until that is built.
-        if !arm_subs.is_empty() {
+        // A CORRELATED arm subplan needs a per-row fill phase, which the arm
+        // executor (`exec_select`, deliberately fill-free) does not have —
+        // refuse it, never read the unfilled hole. (`split_correlated` routes
+        // correlated conjuncts to `post_filter`, so a refused arm can carry
+        // neither.)
+        if arm_subs.iter().any(|s| !s.outer_args.is_empty()) {
             return Err(bind_err(
-                "a subquery inside a compound SELECT is not supported yet",
+                "a correlated subquery inside a compound SELECT is not supported yet",
             ));
         }
+        debug_assert!(sp.post_filter.is_none(), "uncorrelated arm with a post-filter");
+        subplans.extend(arm_subs);
         // Context slots are appended AFTER the user params, so two arms
         // binding different key sets would give the same slot index two
         // meanings. Identical key lists (the common case: same policy on the
@@ -797,25 +831,28 @@ fn plan_compound(
         // rather than silently misread.
         if k == 0 {
             context_keys = ckeys;
-            param_types = ptypes;
-        } else {
-            if ckeys != context_keys {
-                return Err(bind_err(
-                    "compound arms bind different session-context keys — not supported yet",
-                ));
+        } else if ckeys != context_keys {
+            return Err(bind_err(
+                "compound arms bind different session-context keys — not supported yet",
+            ));
+        }
+        // One statement, one parameter table: unify element-wise. Arms may
+        // return tables of different lengths now (each covers its own
+        // reserved slots); a slot outside an arm's table is simply
+        // unconstrained by that arm.
+        for (i, t) in ptypes.iter().enumerate() {
+            if param_types.len() <= i {
+                param_types.push(None);
             }
-            // One statement, one parameter table: unify element-wise.
-            for (i, (have, arm)) in param_types.iter_mut().zip(&ptypes).enumerate() {
-                match (&have, arm) {
-                    (None, Some(t)) => *have = Some(*t),
-                    (Some(a), Some(b)) if a != b => {
-                        return Err(bind_err(format!(
-                            "parameter ${} is used as {a} in one compound arm and {b} in another",
-                            i + 1
-                        )));
-                    }
-                    _ => {}
+            match (&param_types[i], t) {
+                (None, Some(t)) => param_types[i] = Some(*t),
+                (Some(a), Some(b)) if a != b => {
+                    return Err(bind_err(format!(
+                        "parameter ${} is used as {a} in one compound arm and {b} in another",
+                        i + 1
+                    )));
                 }
+                _ => {}
             }
         }
         list_keys.extend(lkeys);
@@ -900,6 +937,16 @@ fn plan_compound(
         }
     }
 
+    // Context slots sit LAST in the layout `[user ‖ subplan results ‖ context]`,
+    // but each arm numbered its own context slots right after ITS reserved
+    // region — with per-arm subplan offsets in play the positions no longer
+    // agree across arms. Refuse the combination rather than misnumber a slot.
+    if !subplans.is_empty() && !context_keys.is_empty() {
+        return Err(bind_err(
+            "current_setting() and a subquery together in a compound SELECT are \
+             not supported yet",
+        ));
+    }
     let ops = c.ops.clone();
     Ok((
         PlanStmt::Compound(CompoundPlan {
@@ -913,7 +960,7 @@ fn plan_compound(
         context_keys,
         list_keys,
         out_types,
-        Vec::new(),
+        subplans,
     ))
 }
 

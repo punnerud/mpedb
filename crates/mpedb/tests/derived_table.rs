@@ -146,16 +146,18 @@ fn derived_table_joined_with_base() {
 }
 
 #[test]
-fn refusals() {
+fn stage_a_materializes_former_refusals() {
     let (db, path) = open("refuse");
     setup(&db);
-    // Complex bodies are refused, never answered wrongly.
-    assert!(db.query("SELECT * FROM (SELECT count(*) FROM t) d", &[]).is_err()); // aggregate body
-    assert!(db.query("SELECT * FROM (SELECT DISTINCT a FROM t) d", &[]).is_err()); // DISTINCT
-    assert!(db.query("SELECT * FROM (SELECT a FROM t LIMIT 3) d", &[]).is_err()); // LIMIT
-    assert!(db.query("SELECT * FROM (SELECT a AS z FROM t) d", &[]).is_err()); // renamed column
-    // A derived table must have an alias.
-    assert!(db.query("SELECT * FROM (SELECT * FROM t)", &[]).is_err());
+    // Every Stage-B refusal is now MATERIALIZED (design/DESIGN-DERIVED-TABLES.md
+    // §5, `PlanStmt::Derived`) — cross-checked against sqlite in
+    // derived_materialize.rs; here just the smoke that each shape answers.
+    assert_eq!(scalar_i64(&db, "SELECT * FROM (SELECT count(*) FROM t) d"), 10); // aggregate body
+    assert_eq!(scalar_i64(&db, "SELECT count(*) FROM (SELECT DISTINCT a FROM t) d"), 10); // DISTINCT
+    assert_eq!(scalar_i64(&db, "SELECT count(*) FROM (SELECT a FROM t LIMIT 3) d"), 3); // LIMIT
+    assert_eq!(scalar_i64(&db, "SELECT z FROM (SELECT a AS z FROM t) d WHERE z = 7"), 7); // renamed
+    // Alias-less derived tables are legal too (sqlite allows them).
+    assert_eq!(scalar_i64(&db, "SELECT count(*) FROM (SELECT DISTINCT a FROM t)"), 10);
     db.verify().unwrap();
     let _ = std::fs::remove_file(&path);
 }

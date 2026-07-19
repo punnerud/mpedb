@@ -187,8 +187,9 @@ const MAX_JOINS: usize = 16;
 //     the whole-plan version gates it: a format-30 blob fails CLOSED at byte 0
 //     with `PlanInvalidated` (the documented re-prepare path), never a misread.
 //     Compound-bodied subplans are UNCORRELATED and carry no nested lifts (a
-//     subquery inside a compound arm is still refused), so every other subplan
-//     field is unchanged — only genuinely-compound bodies differ.
+//     subquery inside a compound SUBQUERY BODY is still refused; a TOP-LEVEL
+//     compound's arm subplans live on the statement, format 49), so every other
+//     subplan field is unchanged — only genuinely-compound bodies differ.
 // 32: table footprint bitmaps widened u64 → u128 (MAX_TABLES 64 → 128; retired
 //     by format 41, which drops the bitmap altogether). The
 //     wire layout gained 16 bytes (two u128s where two u64s were); a format-31
@@ -351,7 +352,23 @@ const MAX_JOINS: usize = 16;
 //     while a collision would silently call the wrong function. Additive: an
 //     unknown `ScalarFn` tag is already a decode error, and no existing plan
 //     can carry one.
-const PLAN_FORMAT: u8 = 47;
+// 49: MATERIALIZED derived tables (design/DESIGN-DERIVED-TABLES.md §5) — a new
+//     `PlanStmt::Derived` (`STMT_DERIVED = 13`) carrying the derived alias, the
+//     body's output column names + types, a body-discriminant byte
+//     (SUBBODY_SELECT/SUBBODY_COMPOUND, the format-31 tags) followed by the
+//     body plan, and the outer `SelectPlan` that reads the materialized rows
+//     through the [`CTE_TABLE`] sentinel. A format-48 reader hits the unknown
+//     statement tag in `decode_stmt` and rejects the plan as corrupt rather
+//     than misreading it — the same whole-plan gating as `STMT_RECURSIVE_CTE`
+//     at format 26. The SAME window also admits UNCORRELATED subplans on a
+//     top-level `Compound` (each arm's lifts take the reserved slots after the
+//     preceding arms', numbered against the final layout at plan time) — no
+//     wire change (`subplans` was always statement-level), but a format-48
+//     validate refused the shape, so the bump doubles as its staleness signal.
+//     NOTE (worktree, 2026-07-19): the base this was written on carries 47;
+//     48 is another agent's in-flight bump (LIKE opcodes), so this takes 49 by
+//     instruction and the numbers are reconciled at merge.
+const PLAN_FORMAT: u8 = 49;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -1109,6 +1126,48 @@ impl RecursiveCtePlan {
     }
 }
 
+/// A MATERIALIZED derived table (design/DESIGN-DERIVED-TABLES.md §5, format 49):
+/// `SELECT … FROM (<body>) [AS] alias …` whose body the Stage-B flattener could
+/// not splice (aggregate / GROUP BY / HAVING / DISTINCT / join / ORDER BY+LIMIT
+/// / window / compound bodies). The executor runs `body` EXACTLY ONCE into an
+/// in-memory row set — duplicates preserved (a derived table is a bag) — then
+/// runs `outer` with the [`CTE_TABLE`] sentinel bound to that set (the same
+/// working-table primitive the recursive CTE uses, minus the fixpoint).
+///
+/// Stage 1 keeps the parameter layout `[user]` only: lifted subqueries and
+/// `current_setting()` are refused in both components, exactly as in a
+/// recursive CTE (`validate` re-enforces it on a decoded blob).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DerivedPlan {
+    /// The derived alias — how the outer query addresses the body's columns,
+    /// used for EXPLAIN and the #74 attribution `derived table "<name>"`. An
+    /// alias-less derived table (`FROM (SELECT …)`) carries a synthetic,
+    /// unreferenceable name.
+    pub name: String,
+    /// The body's output column NAMES, in projection order: the item's alias,
+    /// else a bare column's own (short) name, else the rendered expression —
+    /// sqlite's naming rule, which is what makes outer references resolve.
+    pub columns: Vec<String>,
+    /// The body's output column types, aligned to `columns`. An output the body
+    /// leaves untyped (a bare NULL) is `any`, decided per value at runtime.
+    pub col_types: Vec<ColumnType>,
+    /// The materialized body — a plain `SELECT` or a whole compound. Never
+    /// references [`CTE_TABLE`] (a derived table cannot see itself).
+    pub body: SubBody,
+    /// The outer statement, reading the materialized rows via [`CTE_TABLE`]
+    /// (exactly one reference, FullScan only — no PK, no indexes).
+    pub outer: SelectPlan,
+}
+
+impl DerivedPlan {
+    /// The synthetic [`TableDef`] the materialized body presents to the binder,
+    /// validator, executor and EXPLAIN — the same working-table shape as
+    /// [`RecursiveCtePlan::cte_def`].
+    pub fn derived_def(&self) -> TableDef {
+        cte_working_table_def(&self.name, &self.columns, &self.col_types)
+    }
+}
+
 /// Build the synthetic working-table [`TableDef`] for a recursive CTE. The
 /// SINGLE source of the working table's shape — used by the planner (at compile
 /// time) and by [`RecursiveCtePlan::cte_def`] (validate / footprint / EXPLAIN),
@@ -1160,6 +1219,10 @@ pub enum PlanStmt {
     /// `WITH RECURSIVE … ` — a fixpoint over a working table (format 26,
     /// design/DESIGN-CTE-RECURSIVE.md). A read-only statement, like `Select`.
     RecursiveCte(RecursiveCtePlan),
+    /// A MATERIALIZED derived table `SELECT … FROM (<body>) alias …`
+    /// (format 49, design/DESIGN-DERIVED-TABLES.md §5). Read-only, like
+    /// `Select`.
+    Derived(DerivedPlan),
     Insert {
         table: u32,
         /// `rows[r][col_idx]`: one entry per table column per row. Empty when
@@ -1453,6 +1516,7 @@ const STMT_SAVEPOINT: u8 = 9;
 const STMT_RELEASE: u8 = 10;
 const STMT_ROLLBACK_TO: u8 = 11;
 const STMT_RECURSIVE_CTE: u8 = 12;
+const STMT_DERIVED: u8 = 13;
 
 // A lifted subquery's body discriminant (format 31): a plain SELECT or a whole
 // compound. Written by `encode_subplan` right before the body.
@@ -1539,6 +1603,9 @@ impl CompiledPlan {
             // recursive / outer); like a compound it has no single target, and
             // `policies` stamps each real table read.
             PlanStmt::RecursiveCte(_) => None,
+            // A derived-table statement likewise reads several tables (body +
+            // outer); `policies` stamps each real table read.
+            PlanStmt::Derived(_) => None,
             PlanStmt::Begin
             | PlanStmt::Commit
             | PlanStmt::Rollback
@@ -1634,6 +1701,9 @@ fn stmt_has_host_call(stmt: &PlanStmt) -> bool {
             select_has_host_call(&rc.anchor)
                 || select_has_host_call(&rc.recursive)
                 || select_has_host_call(&rc.outer)
+        }
+        PlanStmt::Derived(dp) => {
+            subbody_has_host_call(&dp.body) || select_has_host_call(&dp.outer)
         }
         PlanStmt::Insert {
             from_select,

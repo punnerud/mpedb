@@ -185,6 +185,29 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
                 read_only: true,
             }
         }
+        // A materialized derived table reads the UNION of what its body (arms)
+        // and outer statement read — the working table itself sets no bit,
+        // exactly as in a recursive CTE. Read-only, several key spaces ⇒ Full.
+        PlanStmt::Derived(dp) => {
+            let mut tables_read = TableSet::new();
+            let mut indexes_used = 0u64;
+            let body_arms: &[SelectPlan] = match &dp.body {
+                SubBody::Select(sp) => std::slice::from_ref(sp),
+                SubBody::Compound(c) => &c.arms,
+            };
+            for sp in body_arms.iter().chain(std::iter::once(&dp.outer)) {
+                let f = select_footprint(sp, schema)?;
+                tables_read.union_with(&f.tables_read);
+                indexes_used |= f.indexes_used;
+            }
+            Footprint {
+                tables_read,
+                tables_written: TableSet::new(),
+                indexes_used,
+                key_access: KeyAccess::Full,
+                read_only: true,
+            }
+        }
         PlanStmt::Insert { table, rows, from_select, .. } => {
             let t = schema
                 .table(*table)
