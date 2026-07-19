@@ -53,8 +53,9 @@ use crate::error::{Error, Result};
 use crate::value::Value;
 
 /// sqlite's `validJulianDay`: the millisecond Julian day must be non-negative
-/// and fit sqlite's own 48-bit-ish ceiling.
-const MAX_JD_MS: i64 = 0x7fff_ffff_ffff;
+/// and no larger than `INT_464269060799999` — Julian day 5373484.5, i.e. the
+/// end of the year 9999.
+const MAX_JD_MS: i64 = 464_269_060_799_999;
 
 /// sqlite's `DateTime`, restricted to the fields the supported grammar sets.
 #[derive(Clone, Copy)]

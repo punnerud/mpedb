@@ -1,0 +1,367 @@
+//! `strftime(FORMAT, TIMESTRING)` cross-checked against the real `sqlite3` CLI
+//! 3.45, specifier by specifier, over a wide spread of dates and times.
+//!
+//! Django reaches this through `Cast(…, DateTimeField)` / `Cast(…, TimeField)`,
+//! which compile to `strftime('%Y-%m-%d %H:%M:%f', …)` and
+//! `strftime('%H:%M:%f', …)` — those two format strings are asserted first, and
+//! then every specifier sqlite 3.45 has is swept individually.
+//!
+//! The refusals are asserted directly, by message: sqlite answers NULL for a
+//! time string it cannot parse, so an unsupported FORM (`'now'`, a Julian-day
+//! number, a modifier) must not be allowed to fall into that same NULL — it
+//! would be indistinguishable from sqlite's own NULL while actually being a
+//! different answer. Every such input is a named error instead.
+
+use mpedb::{Config, Database, ExecResult, Value};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static UNIQ: AtomicU64 = AtomicU64::new(0);
+
+/// The time strings both engines are loaded with: dates across leap years,
+/// century boundaries and week boundaries; times with and without seconds and
+/// with 1..6 fractional digits; the two timezone spellings; and a time-only
+/// string (which sqlite dates to 2000-01-01).
+const TIMES: &[&str] = &[
+    "2010-01-01",
+    "2010-06-05",
+    "2010-12-31",
+    "2000-02-29",
+    "1900-03-01",
+    "2024-02-29",
+    "1970-01-01",
+    "1969-12-31",
+    "0001-01-01",
+    "9999-12-31",
+    "2012-12-31",
+    "2010-01-03",
+    "2010-01-04",
+    "2021-01-01",
+    "2010-01-01 00:00",
+    "2010-06-05 07:08",
+    "2010-06-05 07:08:09",
+    "2010-06-05 07:08:09.5",
+    "2010-06-05 07:08:09.789",
+    "2010-06-05 07:08:09.789012",
+    "2010-06-05 23:59:59.999",
+    "2010-06-05T12:34:56.75",
+    "2010-06-05 12:34:56Z",
+    "2010-06-05 12:34:56z",
+    "2010-06-05 12:34:56+02:00",
+    "2010-06-05 12:34:56.5-05:30",
+    "2010-01-01 00:30:00+02:00",
+    "2010-12-31 23:00:00-02:00",
+    "2010-06-05 12:34:56+00:00",
+    "12:34",
+    "12:34:56",
+    "12:34:56.789",
+    "00:00:00",
+    "23:59:59.999",
+    "2010-01-01 ",
+];
+
+/// Every format specifier sqlite 3.45 implements.
+const SPECIFIERS: &[&str] = &[
+    "%d", "%e", "%f", "%F", "%H", "%I", "%j", "%J", "%k", "%l", "%m", "%M", "%p", "%P", "%R", "%s",
+    "%S", "%T", "%u", "%w", "%W", "%Y", "%%",
+];
+
+fn sqlite_available() -> bool {
+    Command::new("sqlite3")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn mpedb_db() -> (Database, PathBuf) {
+    let dir = if Path::new("/dev/shm").is_dir() {
+        PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    };
+    let path = dir.join(format!(
+        "mpedb-strftime-{}-{}.mpedb",
+        std::process::id(),
+        UNIQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        r#"
+[database]
+path = "{}"
+size_mb = 16
+max_readers = 8
+
+[[table]]
+name = "t"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+
+  [[table.column]]
+  name = "ts"
+  type = "text"
+"#,
+        path.display()
+    );
+    let db = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    for (i, t) in TIMES.iter().enumerate() {
+        db.query(
+            &format!("INSERT INTO t (id, ts) VALUES ({}, '{}')", i + 1, t),
+            &[],
+        )
+        .unwrap();
+    }
+    (db, path)
+}
+
+fn sqlite_setup() -> String {
+    let mut s = String::from("CREATE TABLE t (id INTEGER PRIMARY KEY, ts TEXT);\n");
+    for (i, t) in TIMES.iter().enumerate() {
+        s.push_str(&format!(
+            "INSERT INTO t (id, ts) VALUES ({}, '{}');\n",
+            i + 1,
+            t
+        ));
+    }
+    s
+}
+
+fn render(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".into(),
+        Value::Int(i) => i.to_string(),
+        Value::Text(s) => s.clone(),
+        other => format!("{other:?}"),
+    }
+}
+
+fn sqlite_rows(query: &str) -> Vec<String> {
+    let mut input = sqlite_setup();
+    input.push_str(query);
+    input.push_str(";\n");
+    let mut child = Command::new("sqlite3")
+        .args(["-batch", "-noheader", "-nullvalue", "NULL", ":memory:"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn sqlite3");
+    child
+        .stdin
+        .take()
+        .expect("stdin")
+        .write_all(input.as_bytes())
+        .expect("write to sqlite3");
+    let out = child.wait_with_output().expect("wait sqlite3");
+    assert!(
+        out.status.success(),
+        "sqlite3 failed for `{query}`: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout)
+        .expect("utf8")
+        .lines()
+        .map(|l| l.to_string())
+        .collect()
+}
+
+fn mpedb_rows(db: &Database, query: &str) -> Vec<String> {
+    match db.query(query, &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => rows
+            .iter()
+            .map(|r| r.iter().map(render).collect::<Vec<_>>().join("|"))
+            .collect(),
+        other => panic!("expected rows for `{query}`, got {other:?}"),
+    }
+}
+
+fn cross_check(db: &Database, query: &str) {
+    let m = mpedb_rows(db, query);
+    let s = sqlite_rows(query);
+    assert_eq!(m, s, "mpedb vs sqlite disagree on `{query}`");
+}
+
+#[test]
+fn strftime_matches_sqlite_for_every_specifier_and_time_form() {
+    if !sqlite_available() {
+        eprintln!("skipping: sqlite3 CLI not found");
+        return;
+    }
+    let (db, path) = mpedb_db();
+
+    // The two formats Django's `Cast` emits (functions/comparison.py).
+    cross_check(
+        &db,
+        "SELECT strftime('%Y-%m-%d %H:%M:%f', ts) FROM t ORDER BY id",
+    );
+    cross_check(&db, "SELECT strftime('%H:%M:%f', ts) FROM t ORDER BY id");
+
+    // Every specifier, one at a time, over every time form.
+    for spec in SPECIFIERS {
+        cross_check(
+            &db,
+            &format!("SELECT strftime('[{spec}]', ts) FROM t ORDER BY id"),
+        );
+    }
+    // …and all of them at once, so the literal-run copying between specifiers
+    // is exercised too (including a leading and a trailing literal).
+    let all = SPECIFIERS.join("|");
+    cross_check(
+        &db,
+        &format!("SELECT strftime('<{all}>', ts) FROM t ORDER BY id"),
+    );
+    // A format with no specifier at all, and one that is entirely literal
+    // text with multi-byte characters around the '%'.
+    cross_check(&db, "SELECT strftime('plain', ts) FROM t ORDER BY id");
+    cross_check(&db, "SELECT strftime('', ts) FROM t ORDER BY id");
+    cross_check(&db, "SELECT strftime('æ%Yø%må', ts) FROM t ORDER BY id");
+
+    // NULL propagates on both arguments, exactly as sqlite does.
+    cross_check(&db, "SELECT strftime('%Y', NULL)");
+    cross_check(&db, "SELECT strftime(NULL, '2010-01-01')");
+
+    // The seconds quirk: `%S` truncates the parsed double while `%f` rounds it
+    // to milliseconds, so the same value reports 56 and 57.000.
+    cross_check(
+        &db,
+        "SELECT strftime('%S %f %H %M', '2010-01-01 12:34:56.9999')",
+    );
+    cross_check(&db, "SELECT strftime('%f %S', '2010-01-01 12:34:59.9999')");
+    // Hour 24 is accepted by sqlite's parser and NOT renormalised.
+    cross_check(
+        &db,
+        "SELECT strftime('%Y-%m-%d %H:%M:%S %j %w %s', '2010-01-01 24:00')",
+    );
+    // …but a day past the end of the month IS renormalised (sqlite's isDate()
+    // invalidates the parsed Y/M/D when D > 28).
+    cross_check(
+        &db,
+        "SELECT strftime('%Y-%m-%d %H:%M:%S', '2010-02-30 12:00')",
+    );
+    cross_check(&db, "SELECT strftime('%Y-%m-%d', '2010-02-30')");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A dense sweep: every day of four whole years, formatted with the specifiers
+/// whose arithmetic is easy to get subtly wrong (day-of-year, week-of-year,
+/// weekday, unix epoch, Julian day).
+#[test]
+fn strftime_calendar_arithmetic_matches_sqlite_over_four_years() {
+    if !sqlite_available() {
+        eprintln!("skipping: sqlite3 CLI not found");
+        return;
+    }
+    let (db, path) = mpedb_db();
+    // A recursive CTE would be neater, but generating the dates in Rust keeps
+    // both engines reading the SAME literal text.
+    let mut days: Vec<String> = Vec::new();
+    for (y, leap) in [(1999, false), (2000, true), (2001, false), (2024, true)] {
+        let lens = [
+            31,
+            if leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        for (mi, len) in lens.iter().enumerate() {
+            for d in 1..=*len {
+                days.push(format!("{y:04}-{:02}-{d:02}", mi + 1));
+            }
+        }
+    }
+    assert_eq!(days.len(), 365 + 366 + 365 + 366);
+    // 200 dates per query keeps the CLI command line and the plan small.
+    for chunk in days.chunks(200) {
+        let list = chunk
+            .iter()
+            .map(|d| format!("strftime('%j %W %w %u %s %J %F %T', '{d}')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        cross_check(&db, &format!("SELECT {list}"));
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Every refusal, asserted by message. None of these may be NULL: sqlite
+/// ANSWERS for `'now'`, for a Julian-day number and for a modifier, so a NULL
+/// here would be a silently different answer rather than a refusal.
+#[test]
+fn strftime_refuses_by_name_what_it_cannot_reproduce() {
+    let (db, path) = mpedb_db();
+    let err = |sql: &str| -> String {
+        db.query(sql, &[])
+            .map(|r| panic!("`{sql}` should have been refused, got {r:?}"))
+            .unwrap_err()
+            .to_string()
+    };
+
+    // --- unsupported format specifiers, named ---------------------------
+    for (sql, want) in [
+        ("SELECT strftime('%q', '2010-01-01')", "'%q'"),
+        ("SELECT strftime('%G', '2010-01-01')", "'%G'"),
+        ("SELECT strftime('%V', '2010-01-01')", "'%V'"),
+        ("SELECT strftime('%U', '2010-01-01')", "'%U'"),
+        ("SELECT strftime('%n', '2010-01-01')", "'%n'"),
+        ("SELECT strftime('a%Zb', '2010-01-01')", "'%Z'"),
+    ] {
+        let m = err(sql);
+        assert!(m.contains("unsupported format specifier"), "{sql}: {m}");
+        assert!(m.contains(want), "{sql}: {m}");
+        assert!(m.contains("mpedb supports"), "{sql}: {m}");
+    }
+    // A bare trailing '%'.
+    let m = err("SELECT strftime('%Y-%', '2010-01-01')");
+    assert!(m.contains("bare '%'"), "{m}");
+
+    // --- unsupported time strings, named --------------------------------
+    for sql in [
+        "SELECT strftime('%Y', 'now')",
+        "SELECT strftime('%Y', '2455352.5')",
+        "SELECT strftime('%Y', 'garbage')",
+        "SELECT strftime('%Y', '')",
+        "SELECT strftime('%Y', '2010-1-1')",
+        "SELECT strftime('%Y', '2010-13-01')",
+        "SELECT strftime('%Y', '2010-01-32')",
+        "SELECT strftime('%Y', '2010-01-01 25:00')",
+        "SELECT strftime('%Y', '2010-01-01 12:60')",
+        "SELECT strftime('%Y', '2010-01-01 12:00:60')",
+        "SELECT strftime('%Y', '2010-01-01 12:34:56.')",
+        "SELECT strftime('%Y', '2010-01-01Z')",
+        "SELECT strftime('%Y', '2010-01-01 12:34:56+99:00')",
+    ] {
+        let m = err(sql);
+        assert!(m.contains("unsupported time string"), "{sql}: {m}");
+        assert!(m.contains("ISO-8601"), "{sql}: {m}");
+    }
+
+    // --- modifiers ------------------------------------------------------
+    let m = err("SELECT strftime('%Y-%m-%d', '2010-01-01', '+1 day')");
+    assert!(m.contains("modifiers are not supported"), "{m}");
+    let m = err("SELECT strftime('%Y', '2010-01-01', 'utc', 'start of month')");
+    assert!(m.contains("modifiers are not supported"), "{m}");
+
+    // --- a numeric time value (sqlite's Julian-day form) is a COMPILE error
+    let m = err("SELECT strftime('%Y', 2455352.5)");
+    assert!(m.contains("strftime()"), "{m}");
+    // …and so is a wrong arity.
+    assert!(db.query("SELECT strftime('%Y')", &[]).is_err());
+    assert!(db.query("SELECT strftime()", &[]).is_err());
+
+    let _ = std::fs::remove_file(&path);
+}
