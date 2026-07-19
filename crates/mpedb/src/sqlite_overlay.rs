@@ -600,7 +600,7 @@ impl SqliteOverlay {
         if plan.footprint.read_only {
             let r = self.db.engine.begin_read()?;
             let result = {
-                let mut octx = ReadCtx(&r);
+                let mut octx = ReadCtx(&r, None);
                 let mut ctx = MergeCtx {
                     ovl: &mut octx,
                     at: &self.attach,
@@ -931,7 +931,7 @@ fn snapshot_deltas(db: &Database, n_tables: usize) -> Result<Vec<Vec<Vec<Value>>
     let r = db.engine.begin_read()?;
     let mut out = Vec::with_capacity(n_tables);
     let res = {
-        let mut ctx = ReadCtx(&r);
+        let mut ctx = ReadCtx(&r, None);
         (0..n_tables).try_for_each(|ti| {
             out.push(TxnCtx::scan_rows_raw(&mut ctx, ti as u32, None, None)?);
             Ok(())

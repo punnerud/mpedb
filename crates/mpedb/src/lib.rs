@@ -77,13 +77,46 @@ pub use mpedb_types::{
 use exec::{exec_stmt, ReadCtx};
 pub use exec::take_last_insert_rowid;
 use mpedb_core::{CheckPrograms, Engine, WriteTxn};
-use mpedb_sql::{CompiledPlan, PlanStmt};
+use mpedb_sql::{CompiledPlan, HostUdfSet, PlanStmt};
 use registry::{decode_registry_plan, patched_last_used, plan_subkey};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
 const POISON: &str = "plan cache lock poisoned";
+
+/// A host-registered scalar UDF closure (the C-API `create_function` path,
+/// design/DESIGN-UDF.md): it receives the already-evaluated argument `Value`s
+/// and returns the result or an error. `Send + Sync` so a [`Database`] behind an
+/// `Arc` stays shareable across threads.
+pub type HostScalarFn = Arc<dyn Fn(&[Value]) -> Result<Value> + Send + Sync>;
+
+/// A snapshot of the per-connection UDF registry taken for ONE execution and
+/// handed to the executor as a [`mpedb_types::HostFns`] resolver. Snapshotting
+/// into a flat vector once per UDF-bearing statement keeps the registry lock off
+/// the per-row hot path; the arity set is tiny (Django registers ~30), so the
+/// linear name/arity lookup per call is negligible.
+struct HostFnTable {
+    fns: Vec<(String, i32, HostScalarFn)>,
+}
+
+impl mpedb_types::HostFns for HostFnTable {
+    fn call(&self, name: &str, args: &[Value]) -> Result<Value> {
+        let argc = args.len() as i32;
+        // Exact arity wins; a variadic `(name, -1)` registration is the fallback
+        // — sqlite's rule for `create_function(..., nArg = -1, ...)`.
+        let f = self
+            .fns
+            .iter()
+            .find(|(n, a, _)| n == name && *a == argc)
+            .or_else(|| self.fns.iter().find(|(n, a, _)| n == name && *a == -1))
+            .map(|(_, _, f)| f)
+            .ok_or_else(|| {
+                Error::Unsupported(format!("host function {name}/{argc} is not registered"))
+            })?;
+        f(args)
+    }
+}
 
 /// Warn threshold for the prepare-time risk estimate (#74 layer 1) when the
 /// engine's `max_work_rows` is `0` (unlimited): a worst-case estimate above this
@@ -290,6 +323,13 @@ pub struct Database {
     /// PostgreSQL-imported mirror. Passed into every `prepare` so a bare column
     /// is accepted (sqlite) or refused (postgres) per the data's origin.
     bare_group_by: mpedb_types::BareGroupBy,
+    /// Host-registered scalar UDFs (the C-API `create_function` path,
+    /// design/DESIGN-UDF.md), keyed by `(name, n_arg)` (`-1` = variadic). The
+    /// binder is handed the names + arities at compile; the executor is handed
+    /// the closures at run. A plan that calls one is compile-and-executed locally
+    /// and NEVER published to the shared content-hashed registry (its closures
+    /// live only in THIS connection). Per-connection, mutable at any time.
+    host_udfs: RwLock<HashMap<(String, i32), HostScalarFn>>,
 }
 
 impl Database {
@@ -323,6 +363,7 @@ impl Database {
             // default any config without `[compat]` gets. A PostgreSQL mirror
             // instead opens via `open_with_config` with the flag already set.
             bare_group_by: mpedb_types::BareGroupBy::default(),
+            host_udfs: RwLock::new(HashMap::new()),
         })
     }
 
@@ -377,6 +418,7 @@ impl Database {
             path,
             require_policy,
             bare_group_by,
+            host_udfs: RwLock::new(HashMap::new()),
         })
     }
 
@@ -389,6 +431,61 @@ impl Database {
     /// The database file path this handle attached.
     pub fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    /// Register a HOST scalar UDF on this connection (the C-API
+    /// `sqlite3_create_function` path, design/DESIGN-UDF.md). A SQL call
+    /// `name(args)` that matches no built-in function then invokes `f` with the
+    /// evaluated arguments. `n_arg` is the argument count, or `-1` for a variadic
+    /// function that accepts any arity. Re-registering the same `(name, n_arg)`
+    /// REPLACES the previous closure.
+    ///
+    /// A plan that calls a host UDF is valid only for the connection that
+    /// registered it, so it is never published to the shared content-hashed plan
+    /// registry — it is compiled and executed locally each time. Registering (or
+    /// unregistering) therefore drops this connection's local plan cache: a
+    /// cached plan may have resolved the name to the previous meaning, or errored
+    /// on it as unknown.
+    pub fn register_host_function<F>(&self, name: &str, n_arg: i32, f: F)
+    where
+        F: Fn(&[Value]) -> Result<Value> + Send + Sync + 'static,
+    {
+        self.host_udfs
+            .write()
+            .expect(POISON)
+            .insert((name.to_string(), n_arg), Arc::new(f));
+        self.cache.write().expect(POISON).clear();
+    }
+
+    /// Remove a host UDF registered with [`register_host_function`]. Returns
+    /// whether an entry was present. Drops the local plan cache (see that method).
+    pub fn unregister_host_function(&self, name: &str, n_arg: i32) -> bool {
+        let removed = self
+            .host_udfs
+            .write()
+            .expect(POISON)
+            .remove(&(name.to_string(), n_arg))
+            .is_some();
+        if removed {
+            self.cache.write().expect(POISON).clear();
+        }
+        removed
+    }
+
+    /// The names + arities of the registered host UDFs, for the binder to resolve
+    /// calls against (values never leave the registry — only names/arities reach
+    /// compile). Empty when none are registered, so compilation is unchanged.
+    fn host_udf_set(&self) -> HostUdfSet {
+        let g = self.host_udfs.read().expect(POISON);
+        HostUdfSet::new(g.keys().cloned().collect())
+    }
+
+    /// Snapshot the registry's closures for one execution (see [`HostFnTable`]).
+    fn host_fn_table(&self) -> HostFnTable {
+        let g = self.host_udfs.read().expect(POISON);
+        HostFnTable {
+            fns: g.iter().map(|((n, a), f)| (n.clone(), *a, f.clone())).collect(),
+        }
     }
 
     /// Compile `sql` with this database's RLS policies injected (loaded from the
@@ -429,6 +526,7 @@ impl Database {
             &catalog,
             &views,
             self.bare_group_by,
+            &self.host_udf_set(),
         )
     }
 
@@ -465,6 +563,7 @@ impl Database {
             &catalog,
             &views,
             self.bare_group_by,
+            &self.host_udf_set(),
         )
     }
 
@@ -822,6 +921,16 @@ impl Database {
             return Ok(p.clone());
         }
         let plan = Arc::new(plan);
+        // A plan that calls a HOST-registered UDF is valid ONLY for this
+        // connection (its closures live here), so it MUST NOT enter the shared
+        // content-hashed `plan/<hash>` registry (design/DESIGN-UDF.md §2). Keep it
+        // in the local cache only — this connection can still `execute(hash)` it,
+        // and it is recompiled per connection rather than shared. The local cache
+        // is dropped whenever the UDF set changes (`register_host_function`).
+        if plan.contains_host_call() {
+            self.cache.write().expect(POISON).insert(hash, plan.clone());
+            return Ok(plan);
+        }
         let blob = plan.encode();
         let subkey = plan_subkey(&hash);
 
@@ -919,13 +1028,18 @@ impl Database {
         if plan.footprint.read_only {
             // Reads never touch the writer lock or the ring.
             let mut partial = false;
+            // Host UDF closures for the executor, only for a plan that calls one
+            // (design/DESIGN-UDF.md). Snapshot once; kept alive for the whole scan.
+            let host_table = plan.contains_host_call().then(|| self.host_fn_table());
+            let host: Option<&dyn mpedb_types::HostFns> =
+                host_table.as_ref().map(|t| t as &dyn mpedb_types::HostFns);
             let r = self.engine.begin_read()?;
             // Staleness check UNDER THE SAME PIN that scans the rows (§4.3):
             // a policy edit that landed since compile invalidates the plan.
             // On error `r` drops here, releasing the reader slot.
             self.validate_policy_read(hash, plan, &r)?;
             let res = {
-                let mut ctx = ReadCtx(&r);
+                let mut ctx = ReadCtx(&r, host);
                 exec_stmt(&mut ctx, &self.schema(), plan, params, &mut partial)
             };
             match res {
@@ -1811,6 +1925,91 @@ primary_key = ["id"]
             path.display()
         );
         (Config::from_toml_str(&toml).unwrap(), path)
+    }
+
+    /// Host scalar UDF dispatch through the facade (design/DESIGN-UDF.md): a
+    /// registered `create_function`-style closure runs in SELECT/WHERE, with a
+    /// bound param, and over text; an unregistered name errors; unregistering
+    /// restores the error. Also verifies the plan-sharing bypass — a UDF plan is
+    /// never published to the shared registry.
+    #[test]
+    fn host_scalar_udf_dispatch_and_registry_bypass() {
+        let (cfg, path) = test_config("host-udf", 8);
+        let _g = FileGuard(path);
+        let db = Database::open_with_config(cfg).unwrap();
+        db.query(
+            "INSERT INTO users (id, email) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            &[],
+        )
+        .unwrap();
+
+        let ints = |r: ExecResult| -> Vec<i64> {
+            let ExecResult::Rows { rows, .. } = r else { panic!("want rows") };
+            rows.iter()
+                .map(|row| match row[0] {
+                    Value::Int(x) => x,
+                    ref v => panic!("want int, got {v:?}"),
+                })
+                .collect()
+        };
+
+        // Unregistered → bind error.
+        assert!(db.query("SELECT plus1(id) FROM users", &[]).is_err());
+
+        db.register_host_function("plus1", 1, |a| match a {
+            [Value::Int(x)] => Ok(Value::Int(x + 1)),
+            _ => Err(Error::Unsupported("plus1 wants one int".into())),
+        });
+        db.register_host_function("addk", 2, |a| match a {
+            [Value::Int(x), Value::Int(k)] => Ok(Value::Int(x + k)),
+            _ => Err(Error::Unsupported("addk wants two ints".into())),
+        });
+        db.register_host_function("shout", 1, |a| match a {
+            [Value::Text(s)] => Ok(Value::Text(s.to_uppercase())),
+            _ => Err(Error::Unsupported("shout wants text".into())),
+        });
+
+        // SELECT plus1(id)
+        assert_eq!(
+            ints(db.query("SELECT plus1(id) FROM users ORDER BY id", &[]).unwrap()),
+            vec![2, 3, 4]
+        );
+        // WHERE plus1(id) = 3  → id 2
+        assert_eq!(
+            ints(db.query("SELECT id FROM users WHERE plus1(id) = 3", &[]).unwrap()),
+            vec![2]
+        );
+        // Bound param: addk(id, $1)
+        assert_eq!(
+            ints(
+                db.query("SELECT addk(id, $1) FROM users ORDER BY id", &[Value::Int(10)])
+                    .unwrap()
+            ),
+            vec![11, 12, 13]
+        );
+        // Text UDF.
+        let ExecResult::Rows { rows, .. } =
+            db.query("SELECT shout(email) FROM users ORDER BY id", &[]).unwrap()
+        else {
+            panic!("want rows")
+        };
+        assert_eq!(rows[0][0], Value::Text("A".into()));
+
+        // Plan-sharing bypass: a UDF plan must NOT be in the shared registry, so a
+        // FRESH handle to the same file (which registered no UDF) cannot execute
+        // it by hash — it is UnknownPlan, not a silently-shared plan.
+        let hash = db.prepare("SELECT plus1(id) FROM users").unwrap();
+        let db2 = Database::open_from_file(_g.0.as_path()).unwrap();
+        assert!(matches!(
+            db2.execute(&hash, &[]),
+            Err(Error::UnknownPlan(_))
+        ));
+        // The registering handle still runs it by hash (local cache).
+        assert_eq!(ints(db.execute(&hash, &[]).unwrap()), vec![2, 3, 4]);
+
+        // Unregister → unknown again.
+        assert!(db.unregister_host_function("plus1", 1));
+        assert!(db.query("SELECT plus1(id) FROM users", &[]).is_err());
     }
 
     struct FileGuard(PathBuf);

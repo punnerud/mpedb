@@ -72,6 +72,14 @@ pub(crate) enum BExpr {
     /// `<probe> COLLATE <coll> IN (e1, …, en)` — the collated form of
     /// [`BExpr::InList`].
     InListColl(Box<BExpr>, Vec<BExpr>, Collation),
+    /// A call to a HOST-registered scalar UDF (the C-API `create_function`
+    /// path, design/DESIGN-UDF.md). Emitted when a function name matches no
+    /// native `ScalarFn`/`AggFn` but DOES match a registered `(name, argc)` in
+    /// the binder's [`HostUdfSet`]. Dynamically typed: the result is
+    /// [`ColumnType::Any`] and arguments pass through with whatever type they
+    /// have. Compiles to [`Instr::HostCall`], which stores the NAME (const pool)
+    /// + arity, never the closure.
+    HostCall { name: String, args: Vec<BExpr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +93,39 @@ pub(crate) enum BUnOp {
 
 /// Expression type: `None` = NULL literal or not yet constrained.
 pub(crate) type Ty = Option<ColumnType>;
+
+/// The names + arities of the HOST-registered scalar UDFs visible to the
+/// connection compiling this statement (the C-API `create_function` path,
+/// design/DESIGN-UDF.md). Threaded into the binder exactly as the compat dialect
+/// is (`set_dialect`/`set_host_udfs`): a function call that matches no native
+/// scalar/aggregate but DOES match a registered `(name, argc)` (or a variadic
+/// `(name, -1)`) compiles to a [`BExpr::HostCall`]. Empty for every connection
+/// that registered none — then function resolution is exactly as before.
+#[derive(Debug, Clone, Default)]
+pub struct HostUdfSet {
+    fns: Vec<(String, i32)>,
+}
+
+impl HostUdfSet {
+    /// Build from `(name, n_arg)` pairs; `n_arg == -1` is sqlite's variadic
+    /// "any arity" registration.
+    pub fn new(fns: Vec<(String, i32)>) -> HostUdfSet {
+        HostUdfSet { fns }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.fns.is_empty()
+    }
+
+    /// Does a call `name(<argc args>)` match a registered host UDF? An exact
+    /// `(name, argc)` wins; otherwise a variadic `(name, -1)` also matches.
+    fn resolves(&self, name: &str, argc: usize) -> bool {
+        let argc = argc as i32;
+        self.fns
+            .iter()
+            .any(|(n, a)| n == name && (*a == argc || *a == -1))
+    }
+}
 
 
 /// The tables a statement can name, and how a column reference resolves to a
@@ -356,6 +397,12 @@ pub(crate) struct Binder<'a> {
     /// the database's configured dialect (`set_dialect`); defaults to Sqlite so
     /// CHECK/policy binders and tests keep the sqlite behavior.
     bare_group_by: BareGroupBy,
+    /// Host-registered scalar UDFs in scope (design/DESIGN-UDF.md). Set by the
+    /// planner from the database's per-connection registry (`set_host_udfs`);
+    /// empty for CHECK/policy binders and tests, so their function resolution is
+    /// unchanged. Survives `rescope` like `bare_group_by` — a UDF call can appear
+    /// at any nesting depth or over the grouped tuple.
+    host_udfs: HostUdfSet,
 }
 
 fn bind_err(msg: impl Into<String>) -> Error {
@@ -381,6 +428,7 @@ impl<'a> Binder<'a> {
             // and, later, policy predicates); disallowed in CHECK constraints.
             allow_context: allow_params,
             bare_group_by: BareGroupBy::default(),
+            host_udfs: HostUdfSet::default(),
         }
     }
 
@@ -390,6 +438,15 @@ impl<'a> Binder<'a> {
     /// binders inherit it. Mirrors [`set_allow_excluded`](Self::set_allow_excluded).
     pub fn set_dialect(&mut self, mode: BareGroupBy) {
         self.bare_group_by = mode;
+    }
+
+    /// Install the HOST-registered scalar UDFs in scope for this binder
+    /// (design/DESIGN-UDF.md). The planner calls this right after `set_dialect`
+    /// on every root binder it constructs, so a UDF call resolves in queries,
+    /// join operands, aggregate arguments, and (via `rescope`) the grouped tuple.
+    /// Cheap: the set is a small `(name, arity)` vector cloned once per compile.
+    pub fn set_host_udfs(&mut self, set: &HostUdfSet) {
+        self.host_udfs = set.clone();
     }
 
     /// Pin a parameter slot's type before binding — used for the reserved
@@ -425,6 +482,9 @@ impl<'a> Binder<'a> {
             // The compat dialect is a database-wide fact, so it survives a scope
             // change (a join's per-table rescopes must keep the same LIKE rules).
             bare_group_by: self.bare_group_by,
+            // Host UDFs are a per-connection fact and likewise survive a rescope
+            // (a UDF over the grouped tuple, or in a join operand, must resolve).
+            host_udfs: self.host_udfs,
             // Neither survives a scope change: `excluded.` belongs to ON
             // CONFLICT, and fold suppression to whichever branch set it.
             allow_excluded: false,
@@ -1170,6 +1230,14 @@ impl<'a> Binder<'a> {
                 let r = fold_maybe(BExpr::Unary(BUnOp::ToFloat, Box::new(r)), self.suppress_fold)?;
                 Ok((l, r, Some(ColumnType::Float64)))
             }
+            // A dynamically-typed operand (`ColumnType::Any` — a host UDF result
+            // (design/DESIGN-UDF.md) or a typeless column) unifies with ANY
+            // concrete type: the real value is typed at runtime, where `sql_cmp`
+            // and `arith` handle the actual pair (numeric comparison already
+            // crosses Int/Float). The unified type stays `Any`.
+            (Some(ColumnType::Any), Some(_)) | (Some(_), Some(ColumnType::Any)) => {
+                Ok((l, r, Some(ColumnType::Any)))
+            }
             (Some(a), Some(b)) => Err(bind_err(format!("cannot {verb} {a} and {b}"))),
             (Some(t), None) | (None, Some(t)) => Ok((l, r, Some(t))),
             (None, None) => Ok((l, r, None)),
@@ -1390,14 +1458,38 @@ impl<'a> Binder<'a> {
             "degrees" => ScalarFn::Degrees,
             "pi" => ScalarFn::Pi,
             "mod" => ScalarFn::Mod,
+            // A name that matches no native scalar (nor an aggregate — those are
+            // lifted before binding) may still be a HOST-registered UDF (the
+            // C-API `create_function` path, design/DESIGN-UDF.md). A host UDF is
+            // dynamically typed: bind every argument through unchanged (no
+            // pinning) and grade the result to `Any`. A name matching neither is
+            // the unchanged "unknown function" error.
             other => {
+                if self.host_udfs.resolves(other, args.len()) {
+                    if u16::try_from(args.len()).is_err() {
+                        return Err(bind_err(format!(
+                            "{other}() called with too many arguments"
+                        )));
+                    }
+                    let mut bound = Vec::with_capacity(args.len());
+                    for a in args {
+                        bound.push(self.bind_expr(a)?.0);
+                    }
+                    return Ok((
+                        BExpr::HostCall {
+                            name: other.to_string(),
+                            args: bound,
+                        },
+                        Some(ColumnType::Any),
+                    ));
+                }
                 return Err(bind_err(format!(
                     "unknown function `{other}()`; available: lower, upper, length, trim, \
                      ltrim, rtrim, replace, instr, substr, substring, char, unicode, hex, \
                      typeof, abs, round, ceil, floor, trunc, sqrt, pow, sign, exp, ln, log, \
                      log10, log2, sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, \
                      radians, degrees, pi, mod, printf, format, iif, coalesce, ifnull, nullif"
-                )))
+                )));
             }
         };
         let mut bound = Vec::with_capacity(args.len());
@@ -2023,6 +2115,16 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 emit(it, instrs, consts)?;
             }
             instrs.push(Instr::InListColl(items.len() as u16, *coll));
+        }
+        BExpr::HostCall { name, args } => {
+            // The NAME rides the const pool (a plan stores the name + arity, not
+            // the closure); the arguments are pushed left-to-right, then the
+            // opcode pops `argc` and leaves the one result.
+            let name_idx = push_const(consts, Value::Text(name.clone()))?;
+            for a in args {
+                emit(a, instrs, consts)?;
+            }
+            instrs.push(Instr::HostCall(name_idx, args.len() as u16));
         }
     }
     Ok(())

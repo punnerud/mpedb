@@ -22,7 +22,9 @@ type PlannedStmt = (
     Vec<Option<ColumnType>>,
     Vec<SubPlan>,
 );
-use crate::binder::{compile_program, declared_collation, peel_collate, BExpr, Binder, Scope, Ty};
+use crate::binder::{
+    compile_program, declared_collation, peel_collate, BExpr, Binder, HostUdfSet, Scope, Ty,
+};
 
 /// Resolved ORDER BY keys: `(column index into the sorted tuple, descending,
 /// collation)`. The collation is [`Collation::Binary`] for a plain `ORDER BY`.
@@ -380,6 +382,10 @@ pub(crate) fn plan_statement(
     // appear at any nesting depth, and a postgres-mode database must refuse it
     // everywhere. Copy, so it rides alongside `catalog` without ceremony.
     mode: BareGroupBy,
+    // Host-registered scalar UDFs in scope (design/DESIGN-UDF.md). Threaded to
+    // every binder-construction site alongside `mode`, for the same reason: a
+    // UDF call can appear at any nesting depth.
+    host_udfs: &HostUdfSet,
 ) -> Result<CompiledPlan> {
     let mut consts: Vec<Value> = Vec::new();
     let txn = |p: PlanStmt| {
@@ -392,14 +398,24 @@ pub(crate) fn plan_statement(
         ast::Stmt::Savepoint(n) => txn(PlanStmt::Savepoint(n.clone())),
         ast::Stmt::Release(n) => txn(PlanStmt::Release(n.clone())),
         ast::Stmt::RollbackTo(n) => txn(PlanStmt::RollbackTo(n.clone())),
-        ast::Stmt::Select(s) => plan_select(s, schema, n_params, catalog, mode, &mut consts, None)?,
-        ast::Stmt::Compound(c) => plan_compound(c, schema, n_params, catalog, mode, &mut consts)?,
-        ast::Stmt::RecursiveCte(rc) => {
-            plan_recursive_cte(rc, schema, n_params, catalog, mode, &mut consts)?
+        ast::Stmt::Select(s) => {
+            plan_select(s, schema, n_params, catalog, mode, host_udfs, &mut consts, None)?
         }
-        ast::Stmt::Insert(s) => plan_insert(s, schema, n_params, catalog, mode, &mut consts)?,
-        ast::Stmt::Update(s) => plan_update(s, schema, n_params, catalog, mode, &mut consts)?,
-        ast::Stmt::Delete(s) => plan_delete(s, schema, n_params, catalog, mode, &mut consts)?,
+        ast::Stmt::Compound(c) => {
+            plan_compound(c, schema, n_params, catalog, mode, host_udfs, &mut consts)?
+        }
+        ast::Stmt::RecursiveCte(rc) => {
+            plan_recursive_cte(rc, schema, n_params, catalog, mode, host_udfs, &mut consts)?
+        }
+        ast::Stmt::Insert(s) => {
+            plan_insert(s, schema, n_params, catalog, mode, host_udfs, &mut consts)?
+        }
+        ast::Stmt::Update(s) => {
+            plan_update(s, schema, n_params, catalog, mode, host_udfs, &mut consts)?
+        }
+        ast::Stmt::Delete(s) => {
+            plan_delete(s, schema, n_params, catalog, mode, host_udfs, &mut consts)?
+        }
     };
     // The 16-subplan ceiling bounds the WHOLE tree once nesting (#73 §3) can
     // grow it past one level — matching the recursive decoder's DoS budget, so a
@@ -723,6 +739,7 @@ fn plan_compound(
     n_params: u16,
     catalog: &PolicyCatalog,
     mode: BareGroupBy,
+    host_udfs: &HostUdfSet,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let mut arms: Vec<SelectPlan> = Vec::with_capacity(c.arms.len());
@@ -733,7 +750,7 @@ fn plan_compound(
 
     for (k, arm_ast) in c.arms.iter().enumerate() {
         let (stmt, ptypes, ckeys, lkeys, otypes, arm_subs) =
-            plan_select(arm_ast, schema, n_params, catalog, mode, consts, None)?;
+            plan_select(arm_ast, schema, n_params, catalog, mode, host_udfs, consts, None)?;
         let PlanStmt::Select(sp) = stmt else {
             return Err(Error::Internal("plan_select produced a non-select".into()));
         };
@@ -878,11 +895,13 @@ fn plan_insert(
     n_params: u16,
     catalog: &PolicyCatalog,
     mode: BareGroupBy,
+    host_udfs: &HostUdfSet,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
     let mut binder = Binder::new(table, n_params, true);
     binder.set_dialect(mode);
+    binder.set_host_udfs(host_udfs);
 
     // Map each table column to its position in the VALUES tuples (or None).
     let listed: Vec<u16> = match &s.columns {
@@ -939,7 +958,7 @@ fn plan_insert(
     let mut sel_subplans: Vec<SubPlan> = Vec::new();
     if let Some(sel_stmt) = &s.select {
         let (sp_stmt, sp_pt, sp_ctx, sp_list, _sp_agg, sp_sub) =
-            plan_select(sel_stmt, schema, n_params, catalog, mode, consts, None)?;
+            plan_select(sel_stmt, schema, n_params, catalog, mode, host_udfs, consts, None)?;
         let PlanStmt::Select(sp) = sp_stmt else {
             return Err(bind_err(
                 "INSERT … SELECT: a compound (UNION/EXCEPT/INTERSECT) source is not supported",
@@ -1104,11 +1123,13 @@ fn plan_update(
     n_params: u16,
     catalog: &PolicyCatalog,
     mode: BareGroupBy,
+    host_udfs: &HostUdfSet,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
     let mut binder = Binder::new(table, n_params, true);
     binder.set_dialect(mode);
+    binder.set_host_udfs(host_udfs);
 
     // sqlite (R-34751-18293): when a column is assigned more than once, all but
     // the RIGHTMOST occurrence is ignored — not evaluated, not type-checked. So
@@ -1180,11 +1201,13 @@ fn plan_delete(
     n_params: u16,
     catalog: &PolicyCatalog,
     mode: BareGroupBy,
+    host_udfs: &HostUdfSet,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
     let mut binder = Binder::new(table, n_params, true);
     binder.set_dialect(mode);
+    binder.set_host_udfs(host_udfs);
     let bound_where = s
         .where_clause
         .as_ref()
@@ -1313,7 +1336,9 @@ fn max_col(e: &BExpr) -> Option<u16> {
                     stack.push(e);
                 }
             }
-            BExpr::Coalesce(args) | BExpr::Call(_, args) => stack.extend(args.iter()),
+            BExpr::Coalesce(args) | BExpr::Call(_, args) | BExpr::HostCall { args, .. } => {
+                stack.extend(args.iter())
+            }
             BExpr::Const(_) | BExpr::Param(_) => {}
         }
     }
