@@ -60,7 +60,10 @@ fn expr_has_subquery(e: &ast::Expr) -> bool {
                 .any(|(c, r)| expr_has_subquery(c) || expr_has_subquery(r))
                 || els.as_deref().is_some_and(expr_has_subquery)
         }
-        E::Agg(_, arg, _) => arg.as_deref().is_some_and(expr_has_subquery),
+        E::Agg(_, arg, _, filter) => {
+            arg.as_deref().is_some_and(expr_has_subquery)
+                || filter.as_deref().is_some_and(expr_has_subquery)
+        }
         // A subquery inside a window's arg/PARTITION/ORDER is not lifted in
         // stage 1 (the window planner binds those sub-expressions directly); one
         // that appears there is refused by the binder, not lifted here.
@@ -279,13 +282,19 @@ impl Lift<'_> {
                     None => None,
                 },
             ),
-            E::Agg(f, arg, d) => E::Agg(
+            E::Agg(f, arg, d, filter) => E::Agg(
                 *f,
                 match arg {
                     Some(a) => Some(Box::new(self.rewrite(a)?)),
                     None => None,
                 },
                 *d,
+                // A subquery inside `FILTER (WHERE …)` lifts exactly like one in
+                // the aggregate argument.
+                match filter {
+                    Some(a) => Some(Box::new(self.rewrite(a)?)),
+                    None => None,
+                },
             ),
             // Windows are not descended into for subquery lifting (stage 1); a
             // subquery inside one reaches the binder's refusal unchanged.
@@ -745,13 +754,19 @@ impl<'a> Correlate<'a, '_> {
                     None => None,
                 },
             ),
-            E::Agg(f, arg, d) => E::Agg(
+            E::Agg(f, arg, d, filter) => E::Agg(
                 *f,
                 match arg {
                     Some(a) => Some(Box::new(self.rewrite(a)?)),
                     None => None,
                 },
                 *d,
+                // A subquery inside `FILTER (WHERE …)` lifts exactly like one in
+                // the aggregate argument.
+                match filter {
+                    Some(a) => Some(Box::new(self.rewrite(a)?)),
+                    None => None,
+                },
             ),
             // A window is not descended into for correlation rewriting (stage 1);
             // a window inside a subquery that references an enclosing row reaches

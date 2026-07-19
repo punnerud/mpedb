@@ -415,6 +415,9 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
                                 p.encode_into(buf);
                             }
                         }
+                        // FILTER (WHERE …) (format 38): optional predicate over
+                        // the base row, same optional-program framing as `arg`.
+                        encode_opt_program(c.filter.as_ref(), buf);
                     }
                     encode_opt_program(a.having.as_ref(), buf);
                     // sqlite bare columns (format 30): base-row indices carried

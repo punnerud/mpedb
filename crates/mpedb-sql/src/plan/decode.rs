@@ -649,10 +649,14 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                             // rejects it; a blob claiming it is corrupt.
                             return Err(corrupt("aggregate is DISTINCT but has no argument"));
                         }
+                        // FILTER (WHERE …) (format 38): optional predicate over
+                        // the base row; `validate` re-checks its width and params.
+                        let filter = decode_opt_program(buf, pos)?;
                         aggs.push(AggCall {
                             func: f,
                             arg,
                             distinct,
+                            filter,
                         });
                     }
                     let having = decode_opt_program(buf, pos)?;

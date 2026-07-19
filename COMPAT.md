@@ -152,6 +152,7 @@ with timestamp parameters accepted by the CLI and the Python API.
 | sum, avg, min, max | ✅ | including over joins and with GROUP BY / HAVING |
 | total | ✅ | always a float, 0.0 over an empty/all-NULL group (never NULL — the deliberate contrast with `sum`) |
 | group_concat | ✅ | non-NULL values' text joined with `,` in scan order; NULL over an empty group. Custom-separator `group_concat(x, sep)` refused (v1) |
+| `agg(x) FILTER (WHERE cond)` | ✅ | sqlite 3.30+/PostgreSQL aggregate FILTER on any plain grouped/scalar aggregate (PLAN_FORMAT 38). The aggregate accumulates only rows where `cond` is TRUE over the base row (3VL — NULL/FALSE skip). Each aggregate filters INDEPENDENTLY (two aggregates in one SELECT may carry different filters, or none); the filter may reference a DIFFERENT column than the argument; it composes with GROUP BY (per-group filtering), DISTINCT (filter first, then dedupe), and a bare column governed by a single `min()`/`max()` (the bare value follows the FILTERED extremum's witness row). An empty filtered set yields the empty-group value (0 for count, NULL for sum/avg/min/max). Differential-tested vs sqlite 3.45. **Refused (clean error, never a wrong answer):** `FILTER` on a WINDOW aggregate (`agg(x) FILTER (WHERE …) OVER (…)`) — standard SQL allows it, mpedb supports FILTER only on plain grouped/scalar aggregates |
 
 ## Types
 

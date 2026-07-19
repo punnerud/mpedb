@@ -314,9 +314,18 @@ fn rewrite_row_in_expr(e: &mut Expr, scope: &RowScope, map: &mut RowMap) -> Resu
         Expr::Unary(_, a)
         | Expr::IsNull(a, _)
         | Expr::Cast(a, _)
-        | Expr::Collate(a, _)
-        | Expr::Agg(_, Some(a), _) => rewrite_row_in_expr(a, scope, map),
-        Expr::Agg(_, None, _) => Ok(()),
+        | Expr::Collate(a, _) => rewrite_row_in_expr(a, scope, map),
+        // An aggregate's argument AND its `FILTER (WHERE …)` both read the row;
+        // rewrite `new`/`old` references in each.
+        Expr::Agg(_, arg, _, filter) => {
+            if let Some(a) = arg {
+                rewrite_row_in_expr(a, scope, map)?;
+            }
+            if let Some(f) = filter {
+                rewrite_row_in_expr(f, scope, map)?;
+            }
+            Ok(())
+        }
         Expr::Binary(_, a, b)
         | Expr::IsDistinct(a, b, _)
         | Expr::Like(a, b)
