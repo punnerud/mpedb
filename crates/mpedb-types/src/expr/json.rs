@@ -1231,12 +1231,21 @@ pub(super) fn json_replace(args: &[Value]) -> Result<Value> {
 fn edit_at<'a>(root: &mut Node<'a>, steps: &[Step], new: Node<'a>, mode: Edit) {
     let (last, parents) = steps.split_last().expect("non-empty");
     let parent = if mode == Edit::Replace {
+        // `replace` never creates anything, so a plain lookup is the whole
+        // question.
         match lookup_mut(root, parents) {
             Some(p) => p,
             None => return,
         }
     } else {
-        match ensure_path(root, parents) {
+        // `set`/`insert` create missing levels — but ATOMICALLY: sqlite leaves
+        // the document untouched when the final step could not land, so
+        // `json_set('{}','$.b[2]',9)` is `{}`, NOT `{"b":[]}`. Hence the
+        // read-only pre-check: nothing is created unless everything lands.
+        if !path_lands(root, steps) {
+            return;
+        }
+        match ensure_path(root, parents, last) {
             Some(p) => p,
             None => return,
         }
@@ -1277,30 +1286,82 @@ fn edit_at<'a>(root: &mut Node<'a>, steps: &[Step], new: Node<'a>, mode: Edit) {
     }
 }
 
-/// Walk `steps`, creating missing OBJECT levels on the way (what `json_set`
-/// and `json_insert` do). Returns `None` when a step cannot be created —
-/// an array index that is not exactly one past the end, or a key step into a
-/// non-object.
-fn ensure_path<'n, 'a>(n: &'n mut Node<'a>, steps: &[Step]) -> Option<&'n mut Node<'a>> {
+/// Would a creating edit along `steps` reach its target? Read-only, and run
+/// BEFORE anything is created, because sqlite's create-on-the-way is atomic:
+/// a path whose final step cannot land leaves the document completely
+/// untouched.
+///
+/// The walk descends through structure that already exists. At the first step
+/// that does not resolve, that step must be CREATABLE in its (existing)
+/// parent, and every step after it then addresses a freshly made EMPTY
+/// container — where only a key, `[0]`, and `[#]` can land.
+fn path_lands(root: &Node<'_>, steps: &[Step]) -> bool {
+    let mut cur = root;
+    for (i, st) in steps.iter().enumerate() {
+        let creatable = match (st, cur) {
+            (Step::Key(_), Node::Obj(_)) => true,
+            (Step::Index(idx), Node::Arr(items)) => *idx as usize == items.len(),
+            (Step::Append, Node::Arr(_)) => true,
+            _ => false,
+        };
+        match lookup(cur, std::slice::from_ref(st)) {
+            // This level exists; keep descending through real structure.
+            Some(next) => cur = next,
+            None => {
+                // It does not: it must be creatable here, and everything after
+                // it addresses an empty container.
+                return creatable && steps[i + 1..].iter().all(fresh_step_lands);
+            }
+        }
+    }
+    true
+}
+
+/// Can this step land in a freshly created, EMPTY container? A key always can
+/// (the object gets it), `[0]` and `[#]` can (the array grows by one), and
+/// `[n>0]` / `[#-n]` cannot — there is nothing to count from.
+fn fresh_step_lands(st: &Step) -> bool {
+    matches!(st, Step::Key(_) | Step::Append | Step::Index(0))
+}
+
+/// Walk `steps`, creating missing intermediate levels on the way (what
+/// `json_set` and `json_insert` do). `final_step` is the step that will be
+/// applied AFTER this walk — it is needed because the kind of a level being
+/// created is decided by the step that will index INTO it:
+/// `json_set('{}','$.b[0]',9)` is `{"b":[9]}` (an array, because the next step
+/// is an index) while `json_set('{}','$.b.c',9)` is `{"b":{"c":9}}`.
+///
+/// `None` when a step cannot be created — an array index that is not exactly
+/// one past the end, or a key step into a non-object.
+fn ensure_path<'n, 'a>(
+    n: &'n mut Node<'a>,
+    steps: &[Step],
+    final_step: &Step,
+) -> Option<&'n mut Node<'a>> {
     let mut cur = n;
-    for st in steps {
+    for (i, st) in steps.iter().enumerate() {
+        // The step that will descend into whatever this level creates.
+        let fresh = match steps.get(i + 1).unwrap_or(final_step) {
+            Step::Key(_) => Node::Obj(Vec::new()),
+            _ => Node::Arr(Vec::new()),
+        };
         cur = match (st, cur) {
             (Step::Key(k), Node::Obj(pairs)) => {
-                let i = match pairs.iter().position(|(rk, _)| label_eq(rk, k)) {
-                    Some(i) => i,
+                let at = match pairs.iter().position(|(rk, _)| label_eq(rk, k)) {
+                    Some(at) => at,
                     None => {
-                        pairs.push((Cow::Owned(quote_json_string(k)), Node::Obj(Vec::new())));
+                        pairs.push((Cow::Owned(quote_json_string(k)), fresh));
                         pairs.len() - 1
                     }
                 };
-                &mut pairs[i].1
+                &mut pairs[at].1
             }
             (Step::Index(idx), Node::Arr(items)) => {
-                let i = *idx as usize;
-                if i == items.len() {
-                    items.push(Node::Obj(Vec::new()));
+                let at = *idx as usize;
+                if at == items.len() {
+                    items.push(fresh);
                 }
-                items.get_mut(i)?
+                items.get_mut(at)?
             }
             (Step::FromEnd(back), Node::Arr(items)) => {
                 let len = items.len();
@@ -1310,7 +1371,7 @@ fn ensure_path<'n, 'a>(n: &'n mut Node<'a>, steps: &[Step]) -> Option<&'n mut No
                 &mut items[len - *back as usize]
             }
             (Step::Append, Node::Arr(items)) => {
-                items.push(Node::Obj(Vec::new()));
+                items.push(fresh);
                 items.last_mut()?
             }
             _ => return None,

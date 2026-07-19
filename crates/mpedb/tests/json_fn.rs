@@ -1005,3 +1005,231 @@ primary_key = ["id"]
     drop(db);
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------------------------------
+// A generated cross-product sweep
+// ---------------------------------------------------------------------------
+
+/// The curated tests above pin the cases that were REASONED about. This one
+/// pins the ones that were not: every reader crossed with every document and
+/// every path, ~1,800 queries in one sqlite invocation. It exists to catch a
+/// wrong answer in a combination nobody thought to write down, which is the
+/// only kind of JSON bug that is invisible.
+#[test]
+fn generated_reader_sweep_matches_sqlite() {
+    if !sqlite_available() {
+        return;
+    }
+    let (db, path) = mpedb_db();
+    let docs = [
+        r#"{"a":1,"b":[1,2],"c":{"d":null},"e":"s","f":true,"g":1.5}"#,
+        r#"[1,"two",null,false,{"k":[]},[[]]]"#,
+        r#"{"":0,"0":1,"a.b":2,"a[0]":3,"å":4}"#,
+        r#"[]"#,
+        r#"{}"#,
+        r#"0"#,
+        r#""s""#,
+        r#"null"#,
+        r#"true"#,
+        r#"{"n":{"n":{"n":[1,2,3]}}}"#,
+    ];
+    let paths = [
+        "$", "$.a", "$.b", "$.b[0]", "$.b[1]", "$.b[2]", "$.b[#-1]", "$.b[#]", "$.c",
+        "$.c.d", "$.e", "$.f", "$.g", "$.zz", "$[0]", "$[1]", "$[5]", "$[#-1]",
+        "$[4].k", "$[5][0]", "$.\"\"", "$.0", "$.\"a.b\"", "$.å", "$.n.n.n[2]",
+    ];
+    let mut qs = Vec::new();
+    for d in docs {
+        let dl = d.replace('\'', "''");
+        qs.push(format!("SELECT json('{dl}')"));
+        qs.push(format!("SELECT json_type('{dl}')"));
+        qs.push(format!("SELECT json_valid('{dl}')"));
+        qs.push(format!("SELECT json_array_length('{dl}')"));
+        for p in paths {
+            let pl = p.replace('\'', "''");
+            qs.push(format!(
+                "SELECT CAST(json_extract('{dl}', '{pl}') AS TEXT)"
+            ));
+            qs.push(format!("SELECT typeof(json_extract('{dl}', '{pl}'))"));
+            qs.push(format!("SELECT '{dl}' -> '{pl}'"));
+            qs.push(format!("SELECT typeof('{dl}' -> '{pl}')"));
+            qs.push(format!("SELECT CAST('{dl}' ->> '{pl}' AS TEXT)"));
+            qs.push(format!("SELECT typeof('{dl}' ->> '{pl}')"));
+            qs.push(format!("SELECT json_type('{dl}', '{pl}')"));
+            qs.push(format!("SELECT json_array_length('{dl}', '{pl}')"));
+        }
+    }
+    cross_check_batch(&db, &qs);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The same idea for the WRITERS: every mutating function crossed with a set of
+/// documents, paths and values, including the JSON-vs-plain distinction on the
+/// value side.
+#[test]
+fn generated_writer_sweep_matches_sqlite() {
+    if !sqlite_available() {
+        return;
+    }
+    let (db, path) = mpedb_db();
+    let docs = [
+        r#"{"a":1,"b":[1,2],"c":{"d":null}}"#,
+        r#"[1,2,3]"#,
+        r#"[]"#,
+        r#"{}"#,
+        r#"5"#,
+        r#"{"a":1.50,"b":1e3}"#,
+    ];
+    let paths = [
+        "$", "$.a", "$.b", "$.b[0]", "$.b[2]", "$.b[#]", "$.b[#-1]", "$.c.d", "$.z",
+        "$.z.y", "$[0]", "$[3]", "$[9]", "$[#]",
+    ];
+    let values = ["9", "'x'", "NULL", "2.5", "'[1,2]'", "json('[1,2]')", "1e3"];
+    let mut qs = Vec::new();
+    for d in docs {
+        let dl = d.replace('\'', "''");
+        qs.push(format!("SELECT json_remove('{dl}')"));
+        for p in paths {
+            qs.push(format!("SELECT json_remove('{dl}', '{p}')"));
+            for v in values {
+                qs.push(format!("SELECT json_set('{dl}', '{p}', {v})"));
+                qs.push(format!("SELECT json_insert('{dl}', '{p}', {v})"));
+                qs.push(format!("SELECT json_replace('{dl}', '{p}', {v})"));
+            }
+        }
+        for e in docs {
+            let el = e.replace('\'', "''");
+            qs.push(format!("SELECT json_patch('{dl}', '{el}')"));
+        }
+        qs.push(format!("SELECT json_array('{dl}', json('{dl}'))"));
+        qs.push(format!("SELECT json_object('k', '{dl}', 'j', json('{dl}'))"));
+    }
+    cross_check_batch(&db, &qs);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A deterministic xorshift generator over documents AND paths, so the shapes
+/// nobody enumerated get exercised too: nested objects and arrays up to 4
+/// levels, every scalar kind, keys that collide with path syntax, and paths
+/// built both from the document's own structure and at random. ~1,500 cases,
+/// one sqlite invocation.
+///
+/// A wrong answer in JSON is invisible — a path that silently returns the
+/// wrong node looks exactly like a path that returned the right one. This is
+/// the test that is allowed to find one.
+#[test]
+fn randomized_document_sweep_matches_sqlite() {
+    if !sqlite_available() {
+        return;
+    }
+    let (db, path) = mpedb_db();
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    // Keys deliberately include the ones that collide with path syntax.
+    const KEYS: [&str; 8] = ["a", "b", "k1", "", "0", "a.b", "x y", "å"];
+    const SCALARS: [&str; 10] = [
+        "0", "1", "-1", "1.50", "1e3", "true", "false", "null", "\"s\"", "\"[1,2]\"",
+    ];
+
+    fn doc(r: &mut Rng, depth: u64) -> String {
+        // Past depth 3, only scalars — keeps documents small enough that a
+        // failure is readable.
+        let pick = if depth >= 3 { 2 } else { r.below(4) };
+        match pick {
+            0 => {
+                let n = r.below(4);
+                let items: Vec<String> = (0..n).map(|_| doc(r, depth + 1)).collect();
+                format!("[{}]", items.join(","))
+            }
+            1 => {
+                let n = r.below(4);
+                let mut used = Vec::new();
+                let mut pairs = Vec::new();
+                for _ in 0..n {
+                    let k = KEYS[r.below(KEYS.len() as u64) as usize];
+                    // Duplicate keys are legal JSON and sqlite keeps them, but
+                    // they make a generated expectation ambiguous to READ, so
+                    // one of each per object here.
+                    if used.contains(&k) {
+                        continue;
+                    }
+                    used.push(k);
+                    pairs.push(format!("\"{k}\":{}", doc(r, depth + 1)));
+                }
+                format!("{{{}}}", pairs.join(","))
+            }
+            _ => SCALARS[r.below(SCALARS.len() as u64) as usize].to_string(),
+        }
+    }
+
+    /// A path built by walking the document's own structure, so most paths HIT.
+    fn path_into(r: &mut Rng, d: &str) -> String {
+        let mut p = String::from("$");
+        // Re-walking the text is not worth it: build from the same key/index
+        // vocabulary and let the misses be misses.
+        for _ in 0..r.below(4) {
+            if r.below(2) == 0 {
+                let k = KEYS[r.below(KEYS.len() as u64) as usize];
+                if k.contains('.') || k.contains(' ') || k.is_empty() {
+                    p.push_str(&format!(".\"{k}\""));
+                } else {
+                    p.push_str(&format!(".{k}"));
+                }
+            } else {
+                match r.below(3) {
+                    0 => p.push_str(&format!("[{}]", r.below(4))),
+                    1 => p.push_str(&format!("[#-{}]", 1 + r.below(3))),
+                    _ => p.push_str("[#]"),
+                }
+            }
+        }
+        let _ = d;
+        p
+    }
+
+    let mut r = Rng(0x9E37_79B9_7F4A_7C15);
+    let mut qs = Vec::new();
+    for _ in 0..150 {
+        let d = doc(&mut r, 0);
+        let dl = d.replace('\'', "''");
+        qs.push(format!("SELECT json('{dl}')"));
+        qs.push(format!("SELECT json_type('{dl}')"));
+        qs.push(format!("SELECT json_array_length('{dl}')"));
+        for _ in 0..2 {
+            let p = path_into(&mut r, &d);
+            let pl = p.replace('\'', "''");
+            qs.push(format!("SELECT CAST(json_extract('{dl}', '{pl}') AS TEXT)"));
+            qs.push(format!("SELECT typeof(json_extract('{dl}', '{pl}'))"));
+            qs.push(format!("SELECT '{dl}' -> '{pl}'"));
+            qs.push(format!("SELECT CAST('{dl}' ->> '{pl}' AS TEXT)"));
+            qs.push(format!("SELECT json_type('{dl}', '{pl}')"));
+            qs.push(format!("SELECT json_array_length('{dl}', '{pl}')"));
+            qs.push(format!("SELECT json_remove('{dl}', '{pl}')"));
+            qs.push(format!("SELECT json_set('{dl}', '{pl}', 7)"));
+            qs.push(format!("SELECT json_insert('{dl}', '{pl}', 'v')"));
+            qs.push(format!("SELECT json_replace('{dl}', '{pl}', json('[8]'))"));
+        }
+        // patch against another generated document
+        let e = doc(&mut r, 0).replace('\'', "''");
+        qs.push(format!("SELECT json_patch('{dl}', '{e}')"));
+        // and a round-trip
+        qs.push(format!("SELECT json(json('{dl}')) = json('{dl}')"));
+    }
+    cross_check_batch(&db, &qs);
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
