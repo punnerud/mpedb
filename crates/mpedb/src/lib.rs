@@ -366,6 +366,35 @@ pub struct Database {
     host_aggs: RwLock<HashMap<(String, i32), HostAggFactory>>,
 }
 
+/// Compile every column CHECK source in `schema` into the engine's per-table /
+/// per-column program vector.
+///
+/// The ONE place a CHECK source becomes an executable program — used for the
+/// config's seed schema at open, and installed on the engine so every later
+/// bundle (a peer's `CREATE TABLE … CHECK (…)`, this process's own DDL, a
+/// writer's in-transaction reload) goes through the identical path. A source
+/// that will not compile is an error here, never a silently unenforced
+/// constraint.
+fn compile_schema_checks(schema: &mpedb_types::Schema) -> Result<CheckPrograms> {
+    let mut checks: CheckPrograms = Vec::with_capacity(schema.tables.len());
+    for table in &schema.tables {
+        let mut per_col = Vec::with_capacity(table.columns.len());
+        for col in &table.columns {
+            per_col.push(match &col.check {
+                None => None,
+                Some(src) => Some(mpedb_sql::compile_check(src, table).map_err(|e| {
+                    Error::Schema(format!(
+                        "CHECK on `{}.{}` failed to compile: {e}",
+                        table.name, col.name
+                    ))
+                })?),
+            });
+        }
+        checks.push(per_col);
+    }
+    Ok(checks)
+}
+
 impl Database {
     /// Open (or create) the database described by a TOML config file.
     pub fn open(config_path: &Path) -> Result<Database> {
@@ -405,24 +434,10 @@ impl Database {
     /// Open (or create) the database described by an already-parsed config.
     /// Compiles every column CHECK expression against its table and hands the
     /// programs to the engine, so constraint enforcement is identical in
-    /// every attached process.
+    /// every attached process — then installs the compiler itself, so the SAME
+    /// happens for every later schema the engine loads from the catalog.
     pub fn open_with_config(config: Config) -> Result<Database> {
-        let mut checks: CheckPrograms = Vec::with_capacity(config.schema.tables.len());
-        for table in &config.schema.tables {
-            let mut per_col = Vec::with_capacity(table.columns.len());
-            for col in &table.columns {
-                per_col.push(match &col.check {
-                    None => None,
-                    Some(src) => Some(mpedb_sql::compile_check(src, table).map_err(|e| {
-                        Error::Schema(format!(
-                            "CHECK on `{}.{}` failed to compile: {e}",
-                            table.name, col.name
-                        ))
-                    })?),
-                });
-            }
-            checks.push(per_col);
-        }
+        let checks = compile_schema_checks(&config.schema)?;
         let path = config.options.path.clone();
         let bare_group_by = config.options.bare_group_by;
         // Resolve the §6.3 assertions against the schema now: an unknown name is
@@ -445,6 +460,13 @@ impl Database {
         // DESIGN-BLOBEXTENT §8: per-process knob, like durability. The format
         // self-describes, so this only decides what NEW writes do.
         engine.set_extent_threshold(config.options.extent_threshold);
+        // From here on the ENGINE recompiles CHECK programs itself whenever it
+        // rebuilds a bundle from the catalog. The config-derived vector above
+        // only covers the SEED schema; a table created by `CREATE TABLE …
+        // CHECK (…)` — in this process or another — is picked up through this,
+        // instead of landing in the catalog as a constraint that is stored and
+        // never enforced.
+        engine.set_check_compiler(std::sync::Arc::new(compile_schema_checks))?;
         Ok(Database {
             engine,
             cache: RwLock::new(HashMap::new()),

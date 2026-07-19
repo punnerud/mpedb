@@ -74,6 +74,36 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
     Ok(Some(ddl))
 }
 
+/// Why `AUTOINCREMENT` refuses by name instead of being accepted and quietly
+/// downgraded.
+///
+/// `INTEGER PRIMARY KEY` is ALREADY a rowid alias here (#94/#85): a NULL or
+/// omitted id is auto-assigned `max(rowid) + 1`. That is sqlite's behaviour
+/// *without* the keyword, and mpedb matches it exactly — including the id reuse
+/// after the top row is deleted (pinned differentially in
+/// `crates/mpedb/tests/django_parse_gaps.rs`).
+///
+/// `AUTOINCREMENT` adds exactly ONE guarantee on top: a rowid is never REUSED,
+/// even after the row holding it is deleted. sqlite honours it with a persisted
+/// per-table high-water counter (the `sqlite_sequence` table), bumped inside the
+/// same transaction as the insert. mpedb keeps no such counter — `next_rowid`
+/// reads the current maximum out of the PK tree — so the guarantee cannot be
+/// made without a new persisted, crash-safe, multi-process-visible sequence in
+/// the catalog.
+///
+/// Accepting the keyword and not honouring it is the one outcome worse than
+/// either alternative. A caller writes `AUTOINCREMENT` *because* ids must never
+/// come back (an external reference, an audit trail, a resumable cursor);
+/// handing them a reused id is wrong data, not a missing feature. So it refuses,
+/// says what it cannot promise, and says what to use instead.
+const AUTOINCREMENT_REFUSAL: &str =
+    "AUTOINCREMENT is not supported — mpedb keeps no persisted rowid high-water \
+     counter, so it cannot promise that an id is never reused after a delete, and \
+     never reusing an id is the whole of what AUTOINCREMENT adds. A plain `INTEGER \
+     PRIMARY KEY` already auto-assigns a NULL or omitted id as max(rowid)+1 (ids \
+     ARE reused after deleting the top row, exactly as in sqlite without the \
+     keyword); drop the keyword to use it";
+
 impl<'a> Parser<'a> {
     /// The current token as a lowercased identifier, if it is a bare Ident.
     fn peek_ident_ci(&self) -> Option<String> {
@@ -155,13 +185,289 @@ impl<'a> Parser<'a> {
             .ok_or_else(|| self.err_here(format!("no such collation sequence: {name}")))
     }
 
+    /// The words that can START a column constraint and therefore can NOT be
+    /// part of a declared type name. sqlite makes these real keyword tokens, so
+    /// its `typetoken ::= ids*` rule stops at them for free; mpedb lexes them as
+    /// ordinary identifiers (so a column may be called `check`), which means the
+    /// stop set has to be written down. `NOT`/`NULL` are absent on purpose —
+    /// they are [`Tok::Kw`], which `declared_type` stops at anyway.
+    const COLUMN_CONSTRAINT_WORDS: &'static [&'static str] = &[
+        "constraint",
+        "primary",
+        "unique",
+        "check",
+        "default",
+        "collate",
+        "references",
+        "generated",
+        "autoincrement",
+        "deferrable",
+    ];
+
+    /// A declared SQL type name, in sqlite's liberal `typetoken` grammar: zero
+    /// or more identifier words (`bigint`, `double precision`, `integer
+    /// unsigned`, `unsigned big int`) optionally followed by a parenthesized
+    /// size (`varchar(100)`, `decimal(10, 2)`).
+    ///
+    /// ANY name is accepted, because in sqlite a declared type is not a
+    /// vocabulary but an input to the affinity rule — an unrecognized name is
+    /// legal and means NUMERIC. The size is consumed and DROPPED: it never
+    /// changes the affinity, and mpedb has no width-limited types, so honouring
+    /// `varchar(100)` as a length limit would reject rows sqlite stores.
+    ///
+    /// Zero words is the legal TYPELESS column (`CREATE TABLE t(a)`,
+    /// `a PRIMARY KEY`) → [`ColumnType::Any`], sqlite's no-affinity column.
+    ///
+    /// Resolution goes through [`mpedb_types::ColumnType::from_declared`], which
+    /// is the same [`mpedb_types::Affinity::from_type_name`] rule `CAST` uses:
+    /// one vocabulary and one mapping whether the name is written in a `CAST` or
+    /// in a `CREATE TABLE`.
+    fn declared_type(&mut self) -> Result<mpedb_types::ColumnType> {
+        let mut words: Vec<String> = Vec::new();
+        loop {
+            match self.peek() {
+                // A bare word is a type word unless it opens a constraint.
+                Some(Tok::Ident(w)) => {
+                    let lw = w.to_ascii_lowercase();
+                    if Self::COLUMN_CONSTRAINT_WORDS.contains(&lw.as_str()) {
+                        break;
+                    }
+                    words.push(lw);
+                    self.pos += 1;
+                }
+                // A QUOTED word can never be a constraint keyword, so it is
+                // always part of the type name (sqlite's `ids ::= ID|STRING`).
+                Some(Tok::QuotedIdent(_)) => {
+                    words.push(self.ident("a type name")?.to_ascii_lowercase())
+                }
+                _ => break,
+            }
+        }
+        if words.is_empty() {
+            return Ok(mpedb_types::ColumnType::Any);
+        }
+        // Optional `( n )` / `( n , m )` size — consumed and discarded.
+        if self.peek() == Some(&Tok::LParen) {
+            self.pos += 1;
+            while matches!(
+                self.peek(),
+                Some(Tok::Int(_))
+                    | Some(Tok::Float(_))
+                    | Some(Tok::Comma)
+                    | Some(Tok::Plus)
+                    | Some(Tok::Minus)
+            ) {
+                self.pos += 1;
+            }
+            self.expect(&Tok::RParen, "`)` after a column type size")?;
+        }
+        Ok(mpedb_types::ColumnType::from_declared(&words.join(" ")))
+    }
+
+    /// The tail of a `REFERENCES <table> [(col, …)] [ON …|MATCH …|[NOT]
+    /// DEFERRABLE …]*` clause — consumed and DISCARDED.
+    ///
+    /// This is not a shrug. sqlite's default is `PRAGMA foreign_keys = OFF`,
+    /// under which sqlite ITSELF parses a foreign key and enforces nothing:
+    /// the dangling child row goes in, the `ON DELETE CASCADE` never fires.
+    /// mpedb has no `foreign_keys = ON` to switch to, so parse-and-drop is
+    /// sqlite's default behaviour exactly — and mpedb must never claim to
+    /// enforce an FK. Pinned differentially in
+    /// `crates/mpedb/tests/django_parse_gaps.rs`.
+    fn skip_references_clause(&mut self) -> Result<()> {
+        let _table = self.ident("table name after REFERENCES")?;
+        if self.peek() == Some(&Tok::LParen) {
+            let _cols = self.paren_ident_list()?;
+        }
+        // `ON DELETE|UPDATE <action>`, `MATCH <name>`, `[NOT] DEFERRABLE
+        // [INITIALLY DEFERRED|IMMEDIATE]`. Every one of them is a rule about
+        // enforcement, and there is no enforcement, so every one is dropped.
+        // `SET` and `MATCH` are real keywords in this tokenizer, the action
+        // words are not.
+        loop {
+            if self.eat_kw(Kw::On) {
+                if !(self.eat_kw(Kw::Delete) || self.eat_kw(Kw::Update)) {
+                    return Err(self.err_here("expected DELETE or UPDATE after REFERENCES … ON"));
+                }
+                if self.eat_kw(Kw::Set) {
+                    if !(self.eat_kw(Kw::Null) || self.eat_word("DEFAULT")) {
+                        return Err(self.err_here("expected NULL or DEFAULT after ON … SET"));
+                    }
+                } else if self.eat_word("CASCADE") || self.eat_word("RESTRICT") {
+                    // nothing more
+                } else if self.eat_word("NO") {
+                    self.expect_word("ACTION")?;
+                } else {
+                    return Err(self.err_here(
+                        "expected SET NULL, SET DEFAULT, CASCADE, RESTRICT or NO ACTION",
+                    ));
+                }
+            } else if self.eat_kw(Kw::Match) {
+                let _ = self.ident("a name after MATCH")?;
+            } else if self.at_deferrable() {
+                let _ = self.eat_kw(Kw::Not);
+                self.expect_word("DEFERRABLE")?;
+                if self.eat_word("INITIALLY")
+                    && !(self.eat_word("DEFERRED") || self.eat_word("IMMEDIATE"))
+                {
+                    return Err(self.err_here("expected DEFERRED or IMMEDIATE after INITIALLY"));
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// At `DEFERRABLE` or `NOT DEFERRABLE`. The two-token lookahead is what
+    /// keeps `NOT NULL` — which follows a `REFERENCES` clause perfectly
+    /// legally — from being eaten as the start of a deferrability clause.
+    fn at_deferrable(&self) -> bool {
+        let deferrable = |t: Option<&Tok>| {
+            matches!(t, Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("DEFERRABLE"))
+        };
+        deferrable(self.peek())
+            || (matches!(self.peek(), Some(Tok::Kw(Kw::Not))) && deferrable(self.peek_at(1)))
+    }
+
+    /// `DEFAULT <value>` in a column definition.
+    ///
+    /// A literal constant only, which is `ALTER TABLE ADD COLUMN`'s existing
+    /// rule reused verbatim. sqlite is LOOSER here: it also takes a
+    /// parenthesized expression (`DEFAULT (datetime('now'))`) and the bare
+    /// `CURRENT_DATE`/`CURRENT_TIME`/`CURRENT_TIMESTAMP` words. mpedb's stored
+    /// [`DefaultExpr`] can hold neither — it is a `Const` or the engine's
+    /// commit-time `Now`, and `Now` is a microsecond `Timestamp` where sqlite's
+    /// `CURRENT_TIMESTAMP` is the TEXT `'YYYY-MM-DD HH:MM:SS'`. Accepting the
+    /// keyword would store a DIFFERENT value than sqlite stores, so both refuse
+    /// by name: a clean refusal beats a value that is quietly not sqlite's.
+    fn parse_column_default(&mut self) -> Result<DefaultExpr> {
+        if let Some(Tok::Ident(w)) = self.peek() {
+            let lw = w.to_ascii_lowercase();
+            if matches!(lw.as_str(), "current_date" | "current_time" | "current_timestamp") {
+                return Err(self.err_here(format!(
+                    "DEFAULT {} is not supported — mpedb has no TEXT datetime default, and \
+                     sqlite's is the string `YYYY-MM-DD HH:MM:SS`, so accepting the keyword \
+                     would store a different value than sqlite stores; use a constant, or \
+                     supply the value on INSERT",
+                    lw.to_ascii_uppercase()
+                )));
+            }
+        }
+        if self.peek() == Some(&Tok::LParen) {
+            return Err(self.err_here(
+                "a parenthesized DEFAULT expression is not supported — mpedb stores a \
+                 constant default, not an expression evaluated per row",
+            ));
+        }
+        self.parse_add_column_default()
+    }
+
+    /// One `<name> [type] [constraint…]` column definition inside CREATE TABLE.
+    fn parse_column_def(&mut self) -> Result<crate::ddl::CreateColumnSpec> {
+        let cname = self.ident("column name")?;
+        // sqlite's full declared-type grammar (`varchar(100)`,
+        // `double precision`, an unknown name, or none at all).
+        let ty = self.declared_type()?;
+        let mut col = crate::ddl::CreateColumnSpec {
+            name: cname,
+            ty,
+            not_null: false,
+            unique: false,
+            pk: false,
+            default: None,
+            check: None,
+            collation: Collation::Binary,
+        };
+        loop {
+            // A per-column constraint may carry a `CONSTRAINT <name>` prefix.
+            // The name is dropped — see `parse_create_table`.
+            let named = if self.eat_word("CONSTRAINT") {
+                Some(self.ident("constraint name after CONSTRAINT")?)
+            } else {
+                None
+            };
+            // NOT and NULL are reserved keywords (Tok::Kw), not
+            // identifiers — the rest of the constraint words are not.
+            if self.eat_kw(Kw::Not) {
+                self.expect_kw(Kw::Null, "NULL")?;
+                col.not_null = true;
+            } else if self.eat_kw(Kw::Null) {
+                col.not_null = false;
+            } else if self.eat_word("UNIQUE") {
+                col.unique = true;
+            } else if self.eat_word("PRIMARY") {
+                self.expect_word("KEY")?;
+                // sqlite's `PRIMARY KEY [ASC|DESC] [AUTOINCREMENT]`. A
+                // one-column index has no key order to choose, so the
+                // direction is accepted and dropped, exactly as sqlite
+                // does with it.
+                let _ = self.eat_kw(Kw::Asc) || self.eat_kw(Kw::Desc);
+                col.pk = true;
+                if self.eat_word("AUTOINCREMENT") {
+                    return Err(self.err_here(AUTOINCREMENT_REFUSAL));
+                }
+            } else if self.eat_word("AUTOINCREMENT") {
+                return Err(self.err_here(AUTOINCREMENT_REFUSAL));
+            } else if self.eat_word("COLLATE") {
+                col.collation = self.parse_collation_name()?;
+            } else if self.eat_word("DEFAULT") {
+                if col.default.is_some() {
+                    return Err(
+                        self.err_here(format!("column `{}` has more than one DEFAULT", col.name))
+                    );
+                }
+                col.default = Some(self.parse_column_default()?);
+            } else if self.eat_word("CHECK") {
+                let src = self.capture_paren_source()?;
+                // Several CHECKs on one column are one conjunction — which is
+                // exactly what sqlite means by them too (every CHECK must pass).
+                col.check = Some(match col.check.take() {
+                    Some(prev) => format!("({prev}) AND ({src})"),
+                    None => src,
+                });
+            } else if self.eat_word("REFERENCES") {
+                self.skip_references_clause()?;
+            } else if let Some(n) = named {
+                return Err(
+                    self.err_here(format!("expected a column constraint after `CONSTRAINT {n}`"))
+                );
+            } else {
+                break;
+            }
+        }
+        Ok(col)
+    }
+
+    /// `CREATE TABLE name (<column-def | table-constraint>, …)`.
+    ///
+    /// Column definitions take sqlite's constraint set; the table-level
+    /// constraints are `PRIMARY KEY (…)`, `UNIQUE (…)`, `CHECK (…)` and
+    /// `FOREIGN KEY (…) REFERENCES …`, each optionally introduced by
+    /// `CONSTRAINT <name>`. Semantics (id assignment, pk resolution, DEFAULT
+    /// type-checking, CHECK compilation, validation) live in the facade/engine —
+    /// this only builds the spec.
+    ///
+    /// **A constraint NAME is parsed and DROPPED.** sqlite keeps it only to
+    /// quote back in an error message; mpedb's constraint errors already name
+    /// the table and the column, and a name that is stored but never read would
+    /// be a schema-hash input that buys nothing. Duplicate names are therefore
+    /// not diagnosed either — nor are they by sqlite across tables.
     fn parse_create_table(&mut self) -> Result<DdlStmt> {
         let name = self.ident("table name")?;
         self.expect(&Tok::LParen, "(")?;
-        let mut columns = Vec::new();
+        let mut columns: Vec<crate::ddl::CreateColumnSpec> = Vec::new();
         let mut table_pk: Vec<String> = Vec::new();
         let mut uniques: Vec<Vec<String>> = Vec::new();
+        let mut checks: Vec<String> = Vec::new();
         loop {
+            // `CONSTRAINT <name>` introduces a NAMED table constraint; once it
+            // is there a column definition can no longer follow.
+            let named = if self.eat_word("CONSTRAINT") {
+                Some(self.ident("constraint name after CONSTRAINT")?)
+            } else {
+                None
+            };
             if self.eat_word("PRIMARY") {
                 self.expect_word("KEY")?;
                 if !table_pk.is_empty() {
@@ -170,75 +476,19 @@ impl<'a> Parser<'a> {
                 table_pk = self.paren_ident_list()?;
             } else if self.eat_word("UNIQUE") {
                 uniques.push(self.paren_ident_list()?);
+            } else if self.eat_word("CHECK") {
+                checks.push(self.capture_paren_source()?);
+            } else if self.eat_word("FOREIGN") {
+                self.expect_word("KEY")?;
+                let _cols = self.paren_ident_list()?;
+                self.expect_word("REFERENCES")?;
+                self.skip_references_clause()?;
+            } else if let Some(n) = named {
+                return Err(self.err_here(format!(
+                    "expected PRIMARY KEY, UNIQUE, CHECK or FOREIGN KEY after `CONSTRAINT {n}`"
+                )));
             } else {
-                let cname = self.ident("column name")?;
-                // sqlite allows a TYPELESS column (`CREATE TABLE t(a)`, or
-                // `a PRIMARY KEY`) — its affinity is NONE, values stored as-is.
-                // mpedb models that with `ColumnType::Any` (the per-column
-                // loose-type escape hatch). A type word is present only when the
-                // next token parses as a known type; otherwise (a constraint
-                // keyword like PRIMARY/UNIQUE, or `,`/`)`) the column is typeless.
-                let ty = match self.peek() {
-                    Some(Tok::Ident(w)) => {
-                        match mpedb_types::ColumnType::parse(&w.to_ascii_lowercase()) {
-                            Some(t) => {
-                                self.pos += 1; // consume the type word
-                                t
-                            }
-                            None => mpedb_types::ColumnType::Any,
-                        }
-                    }
-                    _ => mpedb_types::ColumnType::Any,
-                };
-                let mut col = crate::ddl::CreateColumnSpec {
-                    name: cname,
-                    ty,
-                    not_null: false,
-                    unique: false,
-                    pk: false,
-                    default: None,
-                    collation: Collation::Binary,
-                };
-                loop {
-                    // NOT and NULL are reserved keywords (Tok::Kw), not
-                    // identifiers — the rest of the constraint words are not.
-                    if self.eat_kw(Kw::Not) {
-                        self.expect_kw(Kw::Null, "NULL")?;
-                        col.not_null = true;
-                    } else if self.eat_kw(Kw::Null) {
-                        col.not_null = false;
-                    } else if self.eat_word("UNIQUE") {
-                        col.unique = true;
-                    } else if self.eat_word("PRIMARY") {
-                        self.expect_word("KEY")?;
-                        col.pk = true;
-                    } else if self.eat_word("AUTOINCREMENT") {
-                        // A plain single-column INTEGER PRIMARY KEY is already a
-                        // rowid alias (NULL/omitted auto-assigns max(rowid)+1).
-                        // AUTOINCREMENT's extra guarantee — never reuse a freed
-                        // id — needs a persisted high-water counter mpedb does
-                        // not keep, so it is refused by name rather than
-                        // silently downgraded to the reuse-allowed behavior.
-                        return Err(self.err_here(
-                            "AUTOINCREMENT is not supported — a single-column INTEGER \
-                             PRIMARY KEY already auto-assigns NULL/omitted ids as \
-                             max(rowid)+1 (ids are reused after delete, unlike \
-                             AUTOINCREMENT); drop the keyword to use it",
-                        ));
-                    } else if self.eat_word("COLLATE") {
-                        col.collation = self.parse_collation_name()?;
-                    } else if self.eat_word("DEFAULT") || self.eat_word("CHECK")
-                        || self.eat_word("REFERENCES")
-                    {
-                        return Err(self.err_here(
-                            "DEFAULT/CHECK/REFERENCES are not supported in CREATE TABLE \
-                             yet — declare them in the config schema",
-                        ));
-                    } else {
-                        break;
-                    }
-                }
-                columns.push(col);
+                columns.push(self.parse_column_def()?);
             }
             if !self.eat(&Tok::Comma) {
                 break;
@@ -250,6 +500,7 @@ impl<'a> Parser<'a> {
             columns,
             table_pk,
             uniques,
+            checks,
         }))
     }
 
@@ -670,20 +921,11 @@ impl<'a> Parser<'a> {
         if self.eat_word("ADD") {
             self.eat_word("COLUMN"); // optional, as in sqlite/PG
             let cname = self.ident("column name")?;
-            // Typeless ADD COLUMN (`ALTER TABLE t ADD COLUMN c`) → Any, matching
-            // sqlite's no-affinity column (same rule as CREATE TABLE above).
-            let ty = match self.peek() {
-                Some(Tok::Ident(w)) => {
-                    match mpedb_types::ColumnType::parse(&w.to_ascii_lowercase()) {
-                        Some(t) => {
-                            self.pos += 1;
-                            t
-                        }
-                        None => mpedb_types::ColumnType::Any,
-                    }
-                }
-                _ => mpedb_types::ColumnType::Any,
-            };
+            // The SAME declared-type grammar CREATE TABLE uses — `varchar(100)`
+            // must not mean one thing in a CREATE and another in an ADD. Zero
+            // type words is the typeless column (`ALTER TABLE t ADD COLUMN c`)
+            // → Any, matching sqlite's no-affinity column.
+            let ty = self.declared_type()?;
             let mut col = crate::ddl::CreateColumnSpec {
                 name: cname,
                 ty,
@@ -691,6 +933,7 @@ impl<'a> Parser<'a> {
                 unique: false,
                 pk: false,
                 default: None,
+                check: None,
                 collation: Collation::Binary,
             };
             loop {
@@ -703,7 +946,13 @@ impl<'a> Parser<'a> {
                     col.unique = true;
                 } else if self.eat_word("PRIMARY") {
                     self.expect_word("KEY")?;
+                    let _ = self.eat_kw(Kw::Asc) || self.eat_kw(Kw::Desc);
                     col.pk = true;
+                    if self.eat_word("AUTOINCREMENT") {
+                        return Err(self.err_here(AUTOINCREMENT_REFUSAL));
+                    }
+                } else if self.eat_word("AUTOINCREMENT") {
+                    return Err(self.err_here(AUTOINCREMENT_REFUSAL));
                 } else if self.eat_word("COLLATE") {
                     col.collation = self.parse_collation_name()?;
                 } else if self.eat_word("DEFAULT") {
@@ -713,10 +962,18 @@ impl<'a> Parser<'a> {
                     // matching sqlite, which refuses a non-constant ADD-COLUMN
                     // default. The facade type-checks the value against `ty`.
                     col.default = Some(self.parse_add_column_default()?);
-                } else if self.eat_word("CHECK") || self.eat_word("REFERENCES") {
+                } else if self.eat_word("CHECK") {
+                    // sqlite REFUSES a CHECK on ADD COLUMN ("Cannot add a
+                    // CHECK constraint"), because existing rows were never
+                    // tested against it. Refusing is agreeing with sqlite.
+                    let _ = self.capture_paren_source();
                     return Err(self.err_here(
-                        "CHECK/REFERENCES are not supported in ADD COLUMN yet",
+                        "ALTER TABLE ADD COLUMN cannot carry a CHECK — the rows already in                          the table were never tested against it (sqlite refuses this too);                          declare the CHECK in CREATE TABLE",
                     ));
+                } else if self.eat_word("REFERENCES") {
+                    // Parsed and dropped, exactly as in CREATE TABLE and
+                    // exactly as sqlite does under `foreign_keys = OFF`.
+                    self.skip_references_clause()?;
                 } else {
                     break;
                 }

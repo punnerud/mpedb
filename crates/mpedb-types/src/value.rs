@@ -60,6 +60,65 @@ impl ColumnType {
         })
     }
 
+    /// A **declared SQL type name** (whatever a `CREATE TABLE` wrote) → the
+    /// rigid column type it becomes.
+    ///
+    /// [`ColumnType::parse`] covers mpedb's own config vocabulary; this covers
+    /// everything else, which is to say sqlite's — `varchar(100)`, `bigint`,
+    /// `datetime`, `integer unsigned`, `double precision`, `decimal(10,2)`. The
+    /// rule is two steps, deliberately in this order:
+    ///
+    /// 1. mpedb's own name wins ([`ColumnType::parse`] on the lowercased name).
+    ///    This is what keeps `bool`/`boolean` a real [`ColumnType::Bool`] and
+    ///    `timestamp` a real [`ColumnType::Timestamp`] — both of which sqlite's
+    ///    affinity rule flattens to NUMERIC only because sqlite has no such
+    ///    types to flatten *to*. It is also what makes this change purely
+    ///    widening: every name mpedb already accepted still means exactly what
+    ///    it meant.
+    /// 2. Otherwise sqlite's affinity rule ([`Affinity::from_type_name`]) — the
+    ///    SAME algorithm `CAST(x AS …)` uses (#83). One vocabulary, one table:
+    ///
+    ///    | affinity | example declarations                            | column type |
+    ///    |----------|-------------------------------------------------|-------------|
+    ///    | INTEGER  | `bigint`, `smallint`, `int(8)`, `integer unsigned` | `Int64`  |
+    ///    | REAL     | `double precision`, `float`, `real`             | `Float64`   |
+    ///    | TEXT     | `varchar(100)`, `char(1)`, `clob`, `text`       | `Text`      |
+    ///    | BLOB     | `blob`, `longblob`                              | `Blob`      |
+    ///    | NUMERIC  | `decimal(10,2)`, `datetime`, `date`, `numeric`, `varbinary` | `Any` |
+    ///
+    /// NUMERIC becomes [`ColumnType::Any`] because it is the one affinity that
+    /// is not a single storage class: sqlite stores an integer, a real OR a
+    /// string in such a column depending on the value, so `Any` — mpedb's
+    /// per-value column — is the only faithful target. That is also what lets
+    /// `date`/`datetime` (NUMERIC affinity, but written as ISO *strings* by
+    /// every ORM) hold their strings.
+    ///
+    /// The other four are rigid, which is narrower than sqlite: sqlite converts
+    /// per its affinity at store time and keeps the value in whatever class
+    /// survives, where mpedb refuses a value of the wrong type. That is a clean
+    /// refusal, never a different answer — and it is the same rigidity a
+    /// config-declared `type = "int64"` column has always had.
+    ///
+    /// An EMPTY name is `Any`, not the `Numeric` this rule returns for a `CAST`:
+    /// a column with NO declared type is sqlite's no-affinity column, which
+    /// converts nothing — exactly `Any`.
+    pub fn from_declared(name: &str) -> ColumnType {
+        let lower = name.trim().to_ascii_lowercase();
+        if lower.is_empty() {
+            return ColumnType::Any;
+        }
+        if let Some(t) = ColumnType::parse(&lower) {
+            return t;
+        }
+        match Affinity::from_type_name(&lower) {
+            Affinity::Integer => ColumnType::Int64,
+            Affinity::Real => ColumnType::Float64,
+            Affinity::Text => ColumnType::Text,
+            Affinity::Blob => ColumnType::Blob,
+            Affinity::Numeric => ColumnType::Any,
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             ColumnType::Int64 => "int64",
@@ -608,6 +667,74 @@ mod tests {
         write_value(&mut buf, &Value::Text("hello".into()));
         for cut in 0..buf.len() {
             assert!(read_value(&buf[..cut], &mut 0).is_err());
+        }
+    }
+
+    /// The declared-name → column-type table, spelled out. Every row here is
+    /// cross-checked against the real `sqlite3` binary's affinity in
+    /// `crates/mpedb/tests/django_parse_gaps.rs`.
+    #[test]
+    fn declared_type_names_map_by_affinity() {
+        for (decl, want) in [
+            // mpedb's own vocabulary keeps its meaning (step 1).
+            ("int64", ColumnType::Int64),
+            ("INTEGER", ColumnType::Int64),
+            ("real", ColumnType::Float64),
+            ("bool", ColumnType::Bool),
+            ("BOOLEAN", ColumnType::Bool),
+            ("timestamp", ColumnType::Timestamp),
+            ("text", ColumnType::Text),
+            ("blob", ColumnType::Blob),
+            ("any", ColumnType::Any),
+            // INTEGER affinity (step 2).
+            ("bigint", ColumnType::Int64),
+            ("smallint", ColumnType::Int64),
+            ("tinyint", ColumnType::Int64),
+            ("int(8)", ColumnType::Int64),
+            ("integer unsigned", ColumnType::Int64),
+            ("unsigned big int", ColumnType::Int64),
+            ("int2", ColumnType::Int64),
+            // `INT` wins wherever it appears, even in the second word — this is
+            // sqlite's rule, and `floating point` really is INTEGER there.
+            ("floating point", ColumnType::Int64),
+            // REAL affinity.
+            ("double precision", ColumnType::Float64),
+            ("float", ColumnType::Float64),
+            // TEXT affinity.
+            ("varchar(100)", ColumnType::Text),
+            ("VARCHAR", ColumnType::Text),
+            ("char(1)", ColumnType::Text),
+            ("nchar(55)", ColumnType::Text),
+            ("clob", ColumnType::Text),
+            ("native character(70)", ColumnType::Text),
+            // BLOB affinity — only a name literally containing `blob`.
+            ("longblob", ColumnType::Blob),
+            // NUMERIC affinity → the per-value column. (`varbinary` really is
+            // NUMERIC in sqlite: the BLOB rule is a `blob` substring, nothing
+            // else.)
+            ("varbinary", ColumnType::Any),
+            ("decimal(10,2)", ColumnType::Any),
+            ("numeric", ColumnType::Any),
+            ("date", ColumnType::Any),
+            ("datetime", ColumnType::Any),
+            ("nosuchtype", ColumnType::Any),
+            // No declared type at all is sqlite's no-affinity column.
+            ("", ColumnType::Any),
+            ("   ", ColumnType::Any),
+        ] {
+            assert_eq!(ColumnType::from_declared(decl), want, "declared `{decl}`");
+        }
+    }
+
+    /// `from_declared` must never NARROW an existing config name: whatever
+    /// `parse` accepts, `from_declared` agrees with.
+    #[test]
+    fn from_declared_agrees_with_parse_on_every_config_name() {
+        for name in [
+            "int64", "int", "integer", "float64", "float", "real", "double", "bool", "boolean",
+            "text", "string", "blob", "bytes", "timestamp", "any",
+        ] {
+            assert_eq!(ColumnType::from_declared(name), ColumnType::parse(name).unwrap());
         }
     }
 
