@@ -260,14 +260,25 @@ gap for Django's connection setup and schema editor is now covered.
 
 Still blocking (ranked by real-app impact):
 
-1. **No user-defined functions/collations.** `sqlite3_create_function_v2` /
-   `_create_collation_v2` are exported but *refuse* (so `import` works); Django
-   registers a few (e.g. `django_date_extract`, `django_power`) through the
-   C-API and needs them to actually run.
-2. **Fixed database size** vs. sqlite's unbounded growth (16 MiB ephemeral /
-   64 MiB file-backed here); exceeding it is `SQLITE_FULL`.
-3. **`sqlite_master` breadth** — views and indexes are not listed; complex
+1. **No user-defined functions/collations — THE Django gate (measured).** The
+   `workbench/` (a real Django 5.2 ORM project run under the shim) confirms Django
+   fails *before any SQL*: `get_new_connection` → `register_functions(conn)` calls
+   `sqlite3_create_function` ~30× (`django_date_extract`, `django_date_trunc`,
+   `django_time_diff`, `regexp`, `django_power`, …) and the shim refuses →
+   `OperationalError: Error creating function`, so **no Django connection opens at
+   all**. Plain Python `sqlite3` is unaffected (it registers no UDFs — the DB-API
+   battery is 23/23). Unblocking needs a real host-UDF path: the shim's
+   `create_function[_v2]` must STORE the callback, a per-connection UDF registry
+   must reach the engine's binder (an unknown `f(args)` compiles to a host-call,
+   not an "unknown function" error), and exec must invoke `xFunc` via the
+   `sqlite3_context`/`sqlite3_value` ABI + `sqlite3_result_*`. A cross-cutting
+   feature (shim → facade registry → binder → exec → expr IR); it is the next
+   milestone. Run `crates/mpedb-capi/workbench/run.sh` to reproduce.
+2. **`sqlite_master` breadth** — views and indexes are not listed; complex
    `WHERE`/join forms error rather than returning wrong metadata.
+
+(Resolved since: **fixed database size** — a `file:…?size_mb=N` URI now
+pre-reserves any size up to 16 TiB, so this is no longer a blocker.)
 
 ## Verification
 
