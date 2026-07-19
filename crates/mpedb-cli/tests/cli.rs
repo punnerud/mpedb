@@ -77,6 +77,25 @@ fn run(args: &[&str]) -> Output {
     Command::new(bin()).args(args).output().unwrap()
 }
 
+/// Drive a repl with `script` on stdin. Piped stdin is not a tty, so this is
+/// the plain (non-rustyline) reader path.
+fn run_repl(args: &[&str], script: &str) -> Output {
+    let mut child = Command::new(bin())
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(script.as_bytes())
+        .unwrap();
+    child.wait_with_output().unwrap()
+}
+
 fn out_str(o: &Output) -> String {
     String::from_utf8_lossy(&o.stdout).into_owned()
 }
@@ -206,12 +225,12 @@ fn dump_data_without_config() {
     assert!(s.contains("2\tb@x"), "row 2 missing: {s}");
 }
 
-/// `mpedb new.db …` on a MISSING path CREATES the database, as `sqlite3
-/// new.db` does — and the created base stays a real sqlite file: DDL lands in
-/// it, deltas live in the overlay, `checkpoint` folds them back, and a foreign
-/// sqlite reader sees the result.
+/// `mpedb new.db 'SQL'` on a MISSING path CREATES the database, as `sqlite3
+/// new.db 'SQL'` does — and the created base stays a real sqlite file: DDL lands
+/// in it, deltas live in the overlay, `checkpoint` folds them back, and a
+/// foreign sqlite reader sees the result.
 #[test]
-fn creates_a_sqlite_database_on_open_like_sqlite3() {
+fn creates_a_sqlite_database_on_the_first_statement() {
     let td = TestDir::new("create-sqlite");
     let db = td.path().join("new.db");
     let dbs = db.to_str().unwrap().to_owned();
@@ -275,7 +294,7 @@ SELECT * FROM u
 /// NATIVE database (seeded with one inert bootstrap table, since a schema with
 /// no tables is refused), and live `CREATE TABLE` grows it from there.
 #[test]
-fn creates_a_native_database_on_open() {
+fn creates_a_native_database_on_the_first_statement() {
     let td = TestDir::new("create-native");
     let db = td.path().join("new.mpedb");
     let dbs = db.to_str().unwrap().to_owned();
@@ -315,6 +334,88 @@ fn creation_refuses_what_it_cannot_invent() {
     assert_eq!(o.status.code(), Some(2), "stderr: {}", err_str(&o));
     assert!(err_str(&o).contains("unknown command"), "stderr: {}", err_str(&o));
     assert!(!Path::new("exce").exists());
+}
+
+/// Creation is LAZY, exactly as `sqlite3`'s is: measured against sqlite3 3.45,
+/// `sqlite3 a.db` followed by `.exit` leaves NO FILE behind. Opening a repl and
+/// leaving it again — and typing only dot-commands while there — must create
+/// nothing at all, for a sqlite base and for a native `.mpedb` alike.
+#[test]
+fn opening_a_repl_and_exiting_creates_nothing() {
+    let td = TestDir::new("lazy-none");
+    for ext in ["db", "mpedb"] {
+        for (what, script) in [
+            ("exit-only", ".exit\n"),
+            ("quit-only", ".quit\n"),
+            ("eof-only", ""),
+            ("dots-only", ".help\n.exit\n"),
+            ("blank-lines", "\n\n.exit\n"),
+        ] {
+            let db = td.path().join(format!("{what}.{ext}"));
+            let o = run_repl(&[db.to_str().unwrap()], script);
+            assert_ok(&o);
+            assert!(
+                !db.exists(),
+                "`mpedb {}` + {script:?} created a file; sqlite3 leaves nothing\n\
+                 --- stdout ---\n{}\n--- stderr ---\n{}",
+                db.display(),
+                out_str(&o),
+                err_str(&o)
+            );
+            // Nothing else appeared beside it either (no sidecar, no overlay).
+            let left: Vec<_> = std::fs::read_dir(td.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert!(left.is_empty(), "{what}.{ext}: directory not left clean: {left:?}");
+        }
+    }
+}
+
+/// … and the file appears on the FIRST STATEMENT — in a repl as in a one-shot,
+/// and (matching sqlite3) even when that statement fails.
+#[test]
+fn the_first_statement_creates_the_database() {
+    for ext in ["db", "mpedb"] {
+        let td = TestDir::new(&format!("lazy-first-{ext}"));
+        let path = |name: &str| td.path().join(format!("{name}.{ext}"));
+
+        // repl: a statement, then exit → the file exists.
+        let db = path("repl");
+        let o = run_repl(&[db.to_str().unwrap()], "SELECT 1;\n.exit\n");
+        assert_ok(&o);
+        assert!(db.exists(), "repl statement did not create the database: {}", err_str(&o));
+        assert!(
+            err_str(&o).contains("created"),
+            "the create notice belongs on the first statement: {}",
+            err_str(&o)
+        );
+
+        // one-shot SELECT → the file exists (a table-less sqlite base cannot
+        // answer it yet — sqlite3 can; the file is what this asserts).
+        let db = path("oneshot");
+        let o = run(&[db.to_str().unwrap(), "SELECT 1"]);
+        assert!(db.exists(), "one-shot SELECT did not create the database: {}", err_str(&o));
+
+        // one-shot DDL → the file exists AND really holds the table.
+        let db = path("ddl");
+        let dbs = db.to_str().unwrap().to_owned();
+        assert_ok(&run(&[&dbs, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)"]));
+        assert!(db.exists());
+        assert_ok(&run(&[&dbs, "INSERT INTO t VALUES(1,'x')"]));
+        let o = run(&[&dbs, "SELECT * FROM t"]);
+        assert_ok(&o);
+        assert_eq!(out_str(&o), "id\tv\n1\tx\n");
+
+        // a statement that ERRORS still creates the file (sqlite3 parity).
+        let db = path("boom");
+        let o = run(&[db.to_str().unwrap(), "SELECT * FROM nope"]);
+        assert_eq!(o.status.code(), Some(1), "stderr: {}", err_str(&o));
+        assert!(
+            db.exists(),
+            "a failing first statement must still create the database (sqlite3 does)"
+        );
+    }
 }
 
 /// Multi-process bank invariant: concurrent transfer writers + full-scan
