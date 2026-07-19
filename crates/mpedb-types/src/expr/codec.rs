@@ -43,6 +43,12 @@ const OP_CMP_COLL: u8 = 36;
 const OP_IN_LIST_COLL: u8 = 37;
 const OP_LIKE_CS: u8 = 38;
 const OP_HOST_CALL: u8 = 39;
+// 40 is deliberately left free: a concurrently-developed `Instr::Affinity` is
+// claiming the next contiguous tag on another branch, and an opcode hole costs
+// nothing (an unknown tag is already a decode error) while a collision would
+// silently reinterpret one opcode as the other.
+const OP_LIKE_ESC: u8 = 41;
+const OP_LIKE_CS_ESC: u8 = 42;
 
 impl ExprProgram {
     /// Deterministic serialization (part of plan blobs and plan hashing).
@@ -73,6 +79,16 @@ impl ExprProgram {
                 Instr::LikeCs(x) => {
                     buf.push(OP_LIKE_CS);
                     buf.extend_from_slice(&x.to_le_bytes());
+                }
+                Instr::LikeEsc(p, e) => {
+                    buf.push(OP_LIKE_ESC);
+                    buf.extend_from_slice(&p.to_le_bytes());
+                    buf.extend_from_slice(&e.to_le_bytes());
+                }
+                Instr::LikeCsEsc(p, e) => {
+                    buf.push(OP_LIKE_CS_ESC);
+                    buf.extend_from_slice(&p.to_le_bytes());
+                    buf.extend_from_slice(&e.to_le_bytes());
                 }
                 Instr::Glob(x) => {
                     buf.push(OP_GLOB);
@@ -188,6 +204,16 @@ impl ExprProgram {
                 OP_PUSH_CONST => Instr::PushConst(read_u16_arg()?),
                 OP_LIKE => Instr::Like(read_u16_arg()?),
                 OP_LIKE_CS => Instr::LikeCs(read_u16_arg()?),
+                OP_LIKE_ESC => {
+                    let p = read_u16_arg()?;
+                    let e = read_u16_arg()?;
+                    Instr::LikeEsc(p, e)
+                }
+                OP_LIKE_CS_ESC => {
+                    let p = read_u16_arg()?;
+                    let e = read_u16_arg()?;
+                    Instr::LikeCsEsc(p, e)
+                }
                 OP_GLOB => Instr::Glob(read_u16_arg()?),
                 OP_REGEXP => Instr::Regexp(read_u16_arg()?),
                 OP_IN_PARAM => Instr::InParam(read_u16_arg()?),
@@ -360,6 +386,17 @@ pub(super) fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                         if c as usize >= consts.len() {
                             return Err(Error::Corrupt("const index out of range".into()));
                         }
+                        (1, 1)
+                    }
+                    // Both pool slots must exist, AND the escape slot must hold
+                    // a one-character TEXT — proved here so `eval` can never be
+                    // handed a plan whose escape is a blob, a number, or the
+                    // empty string (sqlite errors on all three).
+                    Instr::LikeEsc(p, e) | Instr::LikeCsEsc(p, e) => {
+                        if p as usize >= consts.len() || e as usize >= consts.len() {
+                            return Err(Error::Corrupt("const index out of range".into()));
+                        }
+                        escape_char(&consts[e as usize])?;
                         (1, 1)
                     }
                     // Pops the probe scalar, pushes the 3VL result; the list comes

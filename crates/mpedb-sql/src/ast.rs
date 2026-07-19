@@ -2,7 +2,7 @@
 //! Carries no source text except literal values and identifiers, so plans
 //! built from it are automatically whitespace/keyword-case canonical.
 
-use crate::plan::SetOp;
+use crate::plan::{SetOp, SortDir};
 use mpedb_types::Value;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -86,12 +86,13 @@ pub(crate) struct SelectStmt {
     pub group_by: Vec<Expr>,
     /// `HAVING` — a predicate over the GROUPED row, not the base row.
     pub having: Option<Expr>,
-    /// `ORDER BY <expr> [ASC|DESC]`, and whether it descends. An expression rather than a name because
-    /// `ORDER BY count(*)` is legal in both sqlite and PG, and an aggregate is
-    /// not a name. The planner still requires each item to REDUCE to a column
-    /// of the output tuple — sorting by a computed expression is rejected, not
-    /// silently mis-sorted.
-    pub order_by: Vec<(Expr, bool)>,
+    /// `ORDER BY <expr> [ASC|DESC] [NULLS FIRST|NULLS LAST]`, with the
+    /// direction and the resolved NULL placement in the [`SortDir`]. An
+    /// expression rather than a name because `ORDER BY count(*)` is legal in
+    /// both sqlite and PG, and an aggregate is not a name. The planner still
+    /// requires each item to REDUCE to a column of the output tuple — sorting
+    /// by a computed expression is rejected, not silently mis-sorted.
+    pub order_by: Vec<(Expr, SortDir)>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }
@@ -106,7 +107,7 @@ pub(crate) struct CompoundStmt {
     /// `ops.len() == arms.len() - 1`.
     pub ops: Vec<SetOp>,
     /// Over the compound OUTPUT: an ordinal or a first-arm output name.
-    pub order_by: Vec<(Expr, bool)>,
+    pub order_by: Vec<(Expr, SortDir)>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }
@@ -268,8 +269,12 @@ pub(crate) enum Expr {
     /// (is-not-distinct-from); `negated = true` is `IS NOT` (is-distinct-from).
     /// The `IS [NOT] NULL` forms stay [`Expr::IsNull`].
     IsDistinct(Box<Expr>, Box<Expr>, bool),
-    /// `lhs LIKE pattern`.
-    Like(Box<Expr>, Box<Expr>),
+    /// `lhs LIKE pattern [ESCAPE c]`. The third field is the ESCAPE character;
+    /// `None` is a bare LIKE. The parser has already proved the ESCAPE argument
+    /// is a single-character string literal — sqlite takes an arbitrary
+    /// expression there and raises `ESCAPE expression must be a single
+    /// character` at step time, which mpedb turns into a PREPARE-time refusal.
+    Like(Box<Expr>, Box<Expr>, Option<char>),
     /// `<col-or-table> MATCH <literal>` — FTS5 full-text search
     /// (design/DESIGN-FTS.md §3). Unlike LIKE/GLOB, MATCH is NOT a boolean
     /// expression: it is usable ONLY as a top-level WHERE conjunct against an

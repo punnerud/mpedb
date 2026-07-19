@@ -27,8 +27,8 @@ mod tests;
 pub use scalar::ScalarFn;
 
 use ops::{
-    glob_match, in_items_3vl, in_items_3vl_collated, in_list_3vl, like_match, like_match_cs,
-    regexp_match,
+    escape_char, glob_match, in_items_3vl, in_items_3vl_collated, in_list_3vl, like_match,
+    like_match_cs, regexp_match,
 };
 use scalar::call_scalar;
 
@@ -84,6 +84,14 @@ pub enum Instr {
     /// [`Instr::Like`]. Emitted for a `bare_group_by = "postgres"` database,
     /// where `'a' LIKE 'A'` is FALSE. See [`like_match_cs`](ops::like_match_cs).
     LikeCs(u16),
+    /// `x LIKE <pattern> ESCAPE <c>` — like [`Instr::Like`], with a SECOND
+    /// const-pool index holding the one-character escape string. A separate
+    /// opcode rather than a wider [`Instr::Like`] so that the overwhelmingly
+    /// common escape-less LIKE keeps its exact two-byte operand encoding.
+    LikeEsc(u16, u16),
+    /// Case-SENSITIVE `LIKE … ESCAPE` (PostgreSQL dialect); [`Instr::LikeEsc`]
+    /// is to [`Instr::LikeCsEsc`] what [`Instr::Like`] is to [`Instr::LikeCs`].
+    LikeCsEsc(u16, u16),
     /// SQL GLOB with pattern from the const pool. Like [`Instr::Like`] but
     /// case-SENSITIVE, and the wildcards are sqlite's `*` (any run), `?` (one
     /// char) and `[...]` character classes rather than `%`/`_`. Same operand
@@ -449,7 +457,7 @@ impl ExprProgram {
                     let pattern = &self.consts[pi as usize];
                     stack.push(match (&a, pattern) {
                         (Value::Null, _) | (_, Value::Null) => Value::Null,
-                        (Value::Text(s), Value::Text(p)) => Value::Bool(like_match(p, s)),
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(like_match(p, s, None)),
                         _ => {
                             return Err(Error::TypeMismatch(
                                 "LIKE requires text operands".into(),
@@ -462,7 +470,29 @@ impl ExprProgram {
                     let pattern = &self.consts[pi as usize];
                     stack.push(match (&a, pattern) {
                         (Value::Null, _) | (_, Value::Null) => Value::Null,
-                        (Value::Text(s), Value::Text(p)) => Value::Bool(like_match_cs(p, s)),
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(like_match_cs(p, s, None)),
+                        _ => {
+                            return Err(Error::TypeMismatch(
+                                "LIKE requires text operands".into(),
+                            ))
+                        }
+                    });
+                }
+                Instr::LikeEsc(pi, ei) | Instr::LikeCsEsc(pi, ei) => {
+                    let ci = matches!(instr, Instr::LikeEsc(_, _));
+                    let a = stack.pop().expect("validated");
+                    let pattern = &self.consts[pi as usize];
+                    // The escape const is validated to be a ONE-CHARACTER text
+                    // at decode; a NULL escape can never reach here (the binder
+                    // rejects it), so there is no third NULL arm to consider.
+                    let esc = escape_char(&self.consts[ei as usize])?;
+                    stack.push(match (&a, pattern) {
+                        (Value::Null, _) | (_, Value::Null) => Value::Null,
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(if ci {
+                            like_match(p, s, Some(esc))
+                        } else {
+                            like_match_cs(p, s, Some(esc))
+                        }),
                         _ => {
                             return Err(Error::TypeMismatch(
                                 "LIKE requires text operands".into(),

@@ -46,7 +46,7 @@ fn expr_has_subquery(e: &ast::Expr) -> bool {
         E::InParamSlot(a, _, _) => expr_has_subquery(a),
         E::Unary(_, a) | E::IsNull(a, _) | E::Cast(a, _) => expr_has_subquery(a),
         E::Binary(_, a, b)
-        | E::Like(a, b)
+        | E::Like(a, b, _)
         | E::Match(a, b)
         | E::IsDistinct(a, b, _)
         | E::Glob(a, b, _)
@@ -227,7 +227,9 @@ impl Lift<'_> {
                 Box::new(self.rewrite(a)?),
                 Box::new(self.rewrite(b)?),
             ),
-            E::Like(a, b) => E::Like(Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?)),
+            E::Like(a, b, esc) => {
+                E::Like(Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?), *esc)
+            }
             E::Match(a, b) => E::Match(Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?)),
             E::IsDistinct(a, b, n) => E::IsDistinct(
                 Box::new(self.rewrite(a)?),
@@ -699,7 +701,9 @@ impl<'a> Correlate<'a, '_> {
                 Box::new(self.rewrite(a)?),
                 Box::new(self.rewrite(b)?),
             ),
-            E::Like(a, b) => E::Like(Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?)),
+            E::Like(a, b, esc) => {
+                E::Like(Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?), *esc)
+            }
             E::Match(a, b) => E::Match(Box::new(self.rewrite(a)?), Box::new(self.rewrite(b)?)),
             E::IsDistinct(a, b, n) => E::IsDistinct(
                 Box::new(self.rewrite(a)?),
@@ -832,7 +836,7 @@ fn refs_correlated(b: &BExpr, sub_base: u16, correlated: &[bool]) -> bool {
         BExpr::Param(i) => is_corr(*i),
         BExpr::Const(_) | BExpr::Col(_) => false,
         BExpr::Unary(_, a)
-        | BExpr::Like(a, _, _)
+        | BExpr::Like(a, _, _, _)
         | BExpr::Glob(a, _)
         | BExpr::Regexp(a, _)
         | BExpr::Cast(a, _) => refs_correlated(a, sub_base, correlated),

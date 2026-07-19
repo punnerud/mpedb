@@ -8,7 +8,7 @@ use mpedb_core::{ReadTxn, WriteTxn};
 use mpedb_sql::{
     AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, Join, JoinKind,
     CompoundPlan, GroupKey, OrderOver, PlanOnConflict, PlanStmt, Projection, RowMap, RowSide,
-    SelectPlan, SetOp, SubBody, SubPlan,
+    SelectPlan, SetOp, SortDir, SubBody, SubPlan,
 };
 use mpedb_types::{
     keycode, Accum, Collation, DefaultExpr, Error, ExprProgram, HostFns, KeyBound, KeyPart, Result,
@@ -185,7 +185,7 @@ pub(crate) trait TxnCtx {
         lo: Option<(&[u8], bool)>,
         hi: Option<(&[u8], bool)>,
         filter: Option<(&ExprProgram, &[Value])>,
-        order_by: &[(u16, bool, Collation)],
+        order_by: &[(u16, SortDir, Collation)],
         keep: usize,
     ) -> Result<Vec<Vec<Value>>> {
         let rows = self.scan_rows_raw(table, lo, hi)?;
@@ -500,7 +500,7 @@ impl TxnCtx for ReadCtx<'_, '_> {
         lo: Option<(&[u8], bool)>,
         hi: Option<(&[u8], bool)>,
         filter: Option<(&ExprProgram, &[Value])>,
-        order_by: &[(u16, bool, Collation)],
+        order_by: &[(u16, SortDir, Collation)],
         keep: usize,
     ) -> Result<Vec<Vec<Value>>> {
         if keep == 0 {
@@ -559,7 +559,7 @@ impl TxnCtx for ReadCtx<'_, '_> {
 /// is the row that sorts *last*.
 struct Ranked<'a> {
     row: Vec<Value>,
-    order_by: &'a [(u16, bool, Collation)],
+    order_by: &'a [(u16, SortDir, Collation)],
     seq: u64,
 }
 

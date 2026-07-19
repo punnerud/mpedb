@@ -280,7 +280,31 @@ const MAX_JOINS: usize = 16;
 //     desync completely, so the whole-plan version gates it: a format-41 blob
 //     fails CLOSED at byte 0 with `PlanInvalidated` (the documented re-prepare
 //     path), never a misread. No semantic change to the query path.
-const PLAN_FORMAT: u8 = 42;
+// 44: `LIKE … ESCAPE c` — two additive expr opcodes, `Instr::LikeEsc` (41) and
+//     `Instr::LikeCsEsc` (42), each `(pattern_const, escape_const)`. NEW opcodes
+//     rather than a widened `Instr::Like`, so the escape-less LIKE that every
+//     other statement compiles keeps its exact one-byte-plus-u16 encoding and
+//     re-encodes byte-for-byte. Strictly, a new opcode fails CLOSED on an older
+//     reader all by itself (an unknown tag is already `Corrupt`), so the bump is
+//     not what makes it safe — but the plan-format byte is this codebase's
+//     single staleness signal for the expr IR (Glob at 19, REGEXP at 23, LikeCs
+//     at 37 each bumped for exactly this reason). Opcode 40 is left free on
+//     purpose: a concurrently-developed `Instr::Affinity` is claiming the next
+//     contiguous tag on another branch. (42 and 43 were skipped entirely —
+//     other live branches are bumping the plan format at the same time and the
+//     numbers are reconciled at merge.)
+//     Shared with `ORDER BY … NULLS FIRST/LAST`, which DOES need the bump: the
+//     one direction BYTE of every `SelectPlan.order_by`/`CompoundPlan.order_by`
+//     key gains bit 1, meaning "the NULL placement is the NON-default one for
+//     this direction". Bit 0 is still `desc`, so bytes 0 (ASC, NULLs first) and
+//     1 (DESC, NULLs last) keep their format-41 meaning EXACTLY and a plan with
+//     no `NULLS` clause encodes byte-for-byte as before — the regression
+//     argument for the default placement, written into the wire format itself.
+//     Bytes 2 and 3 are the explicit overrides; 4.. is still corrupt. A
+//     format-41 reader would silently take byte 2 for "ASC" and 3 for "DESC"
+//     and return a differently ordered result set, which is exactly why THIS
+//     half cannot rely on failing closed the way a new opcode does.
+const PLAN_FORMAT: u8 = 44;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -367,6 +391,71 @@ pub struct Join {
     /// policy hides — without ever returning it. Filtering first is what makes
     /// the policy a filter rather than a suggestion.
     pub policy: Option<ExprProgram>,
+}
+
+/// The direction AND the NULL placement of one `ORDER BY` key.
+///
+/// sqlite's default placement is a FUNCTION of the direction — NULLs first
+/// ascending, last descending (`patternCompare`'s ordering is irrelevant here;
+/// this is `sqlite3ExprOrderByOrder`'s `SQLITE_SO_ASC` rule) — and
+/// `NULLS FIRST` / `NULLS LAST` overrides it independently. Carrying the
+/// resolved placement rather than an `Option` keeps every consumer (the
+/// comparator, the top-K heap, the PK-prefix elision) from having to re-derive
+/// the default and disagree about it.
+///
+/// The wire form is ONE byte, and it is chosen so the default placement is
+/// literally unchanged from the pre-NULLS format: bit 0 is `desc` exactly as
+/// before, and bit 1 says "the placement is the NON-default one for this
+/// direction". A plan with no explicit `NULLS` clause therefore encodes
+/// byte-for-byte as it did at PLAN_FORMAT 41.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SortDir {
+    /// `DESC` — the key's non-NULL values compare reversed.
+    pub desc: bool,
+    /// NULLs sort BEFORE every non-NULL value. Defaults to `!desc`.
+    pub nulls_first: bool,
+}
+
+impl SortDir {
+    /// `ASC` with sqlite's default placement (NULLs first).
+    pub const ASC: SortDir = SortDir { desc: false, nulls_first: true };
+
+    /// A direction with sqlite's default NULL placement for it.
+    pub fn dir(desc: bool) -> SortDir {
+        SortDir { desc, nulls_first: !desc }
+    }
+
+    /// A direction with an optional explicit `NULLS FIRST`(`true`)/`LAST`
+    /// (`false`) override.
+    pub fn new(desc: bool, nulls_first: Option<bool>) -> SortDir {
+        SortDir { desc, nulls_first: nulls_first.unwrap_or(!desc) }
+    }
+
+    /// Whether the placement is the one the direction implies — i.e. whether
+    /// the statement could have been written without a `NULLS` clause.
+    pub fn default_nulls(self) -> bool {
+        // i.e. `nulls_first == !desc`: NULLs first for ASC, last for DESC.
+        self.nulls_first != self.desc
+    }
+
+    /// The one wire byte. 0 and 1 mean exactly what they meant before NULLS
+    /// placement existed.
+    pub(crate) fn to_byte(self) -> u8 {
+        u8::from(self.desc) | if self.default_nulls() { 0 } else { 2 }
+    }
+
+    /// Inverse of [`SortDir::to_byte`]; `None` for a byte outside 0..=3, which
+    /// the decoders report as corrupt exactly as they did for a bad direction.
+    pub(crate) fn from_byte(b: u8) -> Option<SortDir> {
+        if b > 3 {
+            return None;
+        }
+        let desc = b & 1 != 0;
+        // The non-default placement of ASC is LAST and of DESC is FIRST, which
+        // is `desc` either way.
+        let nulls_first = if b & 2 != 0 { desc } else { !desc };
+        Some(SortDir { desc, nulls_first })
+    }
 }
 
 /// Which tuple a `Select`'s `order_by` indexes.
@@ -594,7 +683,7 @@ pub struct SelectPlan {
     /// [`Collation`] is [`Collation::Binary`] unless an explicit `COLLATE` was
     /// written on the ORDER BY term (`ORDER BY name COLLATE NOCASE`); it governs
     /// text ordering at sort time and is ignored for non-text keys.
-    pub order_by: Vec<(u16, bool, Collation)>,
+    pub order_by: Vec<(u16, SortDir, Collation)>,
     /// Which tuple `order_by` indexes, and therefore where in the pipeline
     /// the sort runs. Explicit rather than inferred from `distinct` /
     /// `aggregate`, because it is a decision the planner makes and the
@@ -914,7 +1003,7 @@ pub struct CompoundPlan {
     /// (output column index, descending, collation) over the compound OUTPUT
     /// tuple. Collation is [`Collation::Binary`] unless an explicit `COLLATE` was
     /// written on the compound ORDER BY term.
-    pub order_by: Vec<(u16, bool, Collation)>,
+    pub order_by: Vec<(u16, SortDir, Collation)>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }

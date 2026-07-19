@@ -105,22 +105,95 @@ pub(super) fn in_items_3vl_collated(
 /// semantics the C-API drop-in must present. A `bare_group_by = "postgres"`
 /// database instead compiles case-SENSITIVE LIKE via [`like_match_cs`] behind the
 /// [`Instr::LikeCs`](super::Instr::LikeCs) opcode.)
-pub(super) fn like_match(pattern: &str, s: &str) -> bool {
-    like_impl(pattern, s, true)
+///
+/// `esc` is the `LIKE … ESCAPE c` character, or `None` for a bare LIKE. See
+/// [`compile_pattern`] for the escape rules — they are sqlite's, verbatim.
+pub(super) fn like_match(pattern: &str, s: &str, esc: Option<char>) -> bool {
+    like_impl(pattern, s, true, esc)
 }
 
 /// Case-SENSITIVE LIKE (PostgreSQL dialect): identical to [`like_match`] except
 /// literal characters compare exactly (`'a' LIKE 'A'` is FALSE). The `%`/`_`
-/// wildcards behave the same.
-pub(super) fn like_match_cs(pattern: &str, s: &str) -> bool {
-    like_impl(pattern, s, false)
+/// wildcards — and the ESCAPE rules — behave the same.
+pub(super) fn like_match_cs(pattern: &str, s: &str, esc: Option<char>) -> bool {
+    like_impl(pattern, s, false, esc)
+}
+
+/// The single character of a `LIKE … ESCAPE <c>` argument.
+///
+/// sqlite's `likeFunc` raises `ESCAPE expression must be a single character`
+/// for anything else, and mpedb's binder refuses a non-single-character literal
+/// at PREPARE time — so this is a decode/validate-level guard against a
+/// hand-built plan, not a user-facing path, and it must never panic.
+pub(super) fn escape_char(v: &crate::value::Value) -> crate::error::Result<char> {
+    match v {
+        crate::value::Value::Text(s) => {
+            let mut it = s.chars();
+            match (it.next(), it.next()) {
+                (Some(c), None) => Ok(c),
+                _ => Err(crate::error::Error::Corrupt(
+                    "ESCAPE expression must be a single character".into(),
+                )),
+            }
+        }
+        _ => Err(crate::error::Error::Corrupt(
+            "ESCAPE expression must be a single character".into(),
+        )),
+    }
+}
+
+/// One element of a compiled LIKE pattern. Making the wildcards distinct from a
+/// literal `%`/`_` is what lets ESCAPE work at all: after compilation there is
+/// no way to confuse an escaped `%` with the any-run wildcard.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pat {
+    /// `%` — matches any run of characters, including none.
+    Any,
+    /// `_` — matches exactly one character (never the end of the subject).
+    One,
+    /// A literal character (possibly one that was escaped).
+    Lit(char),
+}
+
+/// Compile a LIKE pattern under an optional ESCAPE character, mirroring
+/// sqlite's `patternCompare` + `likeFunc` exactly:
+///
+/// - The escape character is tested BEFORE `%` and `_`, which reproduces
+///   sqlite's rule that `ESCAPE '%'` clears `matchAll` and `ESCAPE '_'` clears
+///   `matchOne` (`likeFunc`): with `ESCAPE '%'`, `'axb' LIKE 'a%b'` is FALSE
+///   because the `%` escapes the `b` instead of matching a run.
+/// - The escaped character is a LITERAL whatever it is — sqlite does not
+///   restrict it to `%`/`_`/itself, so `'ab' LIKE 'a\b' ESCAPE '\'` is TRUE.
+/// - A literal produced by an escape still compares case-INsensitively under
+///   the sqlite dialect (`'aB' LIKE '\a\B' ESCAPE '\'` is TRUE).
+/// - A DANGLING escape at the end of the pattern makes the comparison fail
+///   against every subject (sqlite returns `NOMATCH`/`NOWILDCARDMATCH` the
+///   moment it reads past the pattern's end), which is `None` here.
+fn compile_pattern(pattern: &str, esc: Option<char>) -> Option<Vec<Pat>> {
+    let mut out = Vec::with_capacity(pattern.len());
+    let mut it = pattern.chars();
+    while let Some(c) = it.next() {
+        if Some(c) == esc {
+            out.push(Pat::Lit(it.next()?));
+        } else if c == '%' {
+            out.push(Pat::Any);
+        } else if c == '_' {
+            out.push(Pat::One);
+        } else {
+            out.push(Pat::Lit(c));
+        }
+    }
+    Some(out)
 }
 
 /// Shared LIKE matcher. `ci` selects case-INsensitive (ASCII A–Z, sqlite) vs
 /// case-sensitive (PostgreSQL) comparison of a literal pattern char; the `%`/`_`
 /// wildcards and the two-pointer backtracking are identical either way.
-fn like_impl(pattern: &str, s: &str, ci: bool) -> bool {
-    let p: Vec<char> = pattern.chars().collect();
+fn like_impl(pattern: &str, s: &str, ci: bool, esc: Option<char>) -> bool {
+    // A dangling ESCAPE never matches anything — not even the empty subject.
+    let Some(p) = compile_pattern(pattern, esc) else {
+        return false;
+    };
     let t: Vec<char> = s.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
     let (mut star_pi, mut star_ti) = (usize::MAX, 0usize);
@@ -128,17 +201,22 @@ fn like_impl(pattern: &str, s: &str, ci: bool) -> bool {
         // The wildcard branch MUST precede the literal branch: a literal '%'
         // in the SUBJECT would otherwise consume the pattern's '%' as a
         // one-character match ('a%c' LIKE 'a%' must be TRUE).
-        if pi < p.len() && p[pi] == '%' {
+        if pi < p.len() && p[pi] == Pat::Any {
             star_pi = pi;
             star_ti = ti;
             pi += 1;
         } else if pi < p.len()
-            && (p[pi] == '_'
-                || if ci {
-                    p[pi].eq_ignore_ascii_case(&t[ti])
-                } else {
-                    p[pi] == t[ti]
-                })
+            && match p[pi] {
+                Pat::Any => false,
+                Pat::One => true,
+                Pat::Lit(c) => {
+                    if ci {
+                        c.eq_ignore_ascii_case(&t[ti])
+                    } else {
+                        c == t[ti]
+                    }
+                }
+            }
         {
             pi += 1;
             ti += 1;
@@ -150,7 +228,7 @@ fn like_impl(pattern: &str, s: &str, ci: bool) -> bool {
             return false;
         }
     }
-    while pi < p.len() && p[pi] == '%' {
+    while pi < p.len() && p[pi] == Pat::Any {
         pi += 1;
     }
     pi == p.len()
