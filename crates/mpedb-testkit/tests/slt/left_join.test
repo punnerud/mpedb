@@ -367,10 +367,53 @@ empty
 dee
 NULL
 
-# ---- chains stay refused, and say the fix ------------------------------------------------
+# ---- FULL inside a multi-join chain now works (verified vs sqlite 3.45) ------------------
+# `(emp e JOIN dept d) FULL JOIN emp x`: the INNER (e⋈d) is the accumulated left
+# relation, then a FULL against x. x's NULL-did row (dee=13) matches no left row and
+# null-extends the whole left side; every left row matches some x.
+query II nosort
+SELECT e.eid, x.eid FROM emp e JOIN dept d ON e.did = d.did FULL JOIN emp x ON x.did = d.did ORDER BY e.eid, x.eid
+----
+NULL
+13
+10
+10
+10
+11
+11
+10
+11
+11
+12
+12
 
+# FULL FIRST, then LEFT: the FULL's unmatched-dept row ('empty', did 3) has emp NULL, and
+# the trailing LEFT re-joins dept on the (now NULL) emp.did → no match.
+query TTT nosort
+SELECT emp.ename, d.dname, d2.dname FROM emp FULL JOIN dept d ON emp.did = d.did LEFT JOIN dept d2 ON d2.did = emp.did ORDER BY emp.ename, d.dname
+----
+NULL
+empty
+NULL
+ann
+eng
+eng
+bob
+eng
+eng
+cy
+sales
+sales
+dee
+NULL
+NULL
+
+# ---- chains that stay refused, and say the fix -------------------------------------------
+
+# A RIGHT that is not the first join has no left-deep shape.
 statement error multi-join chain
 SELECT e.eid FROM emp e JOIN dept d ON e.did = d.did RIGHT JOIN emp x ON x.did = d.did
 
-statement error multi-join chain
-SELECT e.eid FROM emp e JOIN dept d ON e.did = d.did FULL JOIN emp x ON x.did = d.did
+# A FULL trailing a LEADING RIGHT: the RIGHT→LEFT swap composed with FULL stays refused.
+statement error FULL JOIN following a leading RIGHT
+SELECT e.eid FROM emp e RIGHT JOIN dept d ON e.did = d.did FULL JOIN emp x ON x.did = d.did
