@@ -275,90 +275,94 @@ fn glob_patterns() {
 #[test]
 fn regexp_patterns() {
     // Unanchored: a pattern matches ANY substring unless `^`/`$` pin an end.
-    assert!(regexp_match("abc", "xxabcyy"));
-    assert!(regexp_match("^abc", "abcyy"));
-    assert!(!regexp_match("^abc", "xabc"));
-    assert!(regexp_match("abc$", "xxabc"));
-    assert!(!regexp_match("abc$", "abcx"));
-    assert!(regexp_match("^$", ""));
-    assert!(regexp_match("", "anything")); // empty pattern matches everywhere
-    assert!(!regexp_match("^abc$", "abcd"));
+    assert!(regexp_match("abc", "xxabcyy").unwrap());
+    assert!(regexp_match("^abc", "abcyy").unwrap());
+    assert!(!regexp_match("^abc", "xabc").unwrap());
+    assert!(regexp_match("abc$", "xxabc").unwrap());
+    assert!(!regexp_match("abc$", "abcx").unwrap());
+    assert!(regexp_match("^$", "").unwrap());
+    assert!(regexp_match("", "anything").unwrap()); // empty pattern matches everywhere
+    assert!(!regexp_match("^abc$", "abcd").unwrap());
 
     // `.` — any single char, INCLUDING newline (sqlite's `.`).
-    assert!(regexp_match("a.c", "abc"));
-    assert!(regexp_match("^a.c$", "a\nc"));
-    assert!(!regexp_match("^a.c$", "ac"));
+    assert!(regexp_match("a.c", "abc").unwrap());
+    assert!(regexp_match("^a.c$", "a\nc").unwrap());
+    assert!(!regexp_match("^a.c$", "ac").unwrap());
 
     // Quantifiers `* + ?`.
-    assert!(regexp_match("^ab*c$", "ac"));
-    assert!(regexp_match("^ab*c$", "abbbc"));
-    assert!(!regexp_match("^ab+c$", "ac"));
-    assert!(regexp_match("^ab+c$", "abc"));
-    assert!(regexp_match("^ab?c$", "ac"));
-    assert!(regexp_match("^ab?c$", "abc"));
-    assert!(!regexp_match("^ab?c$", "abbc"));
+    assert!(regexp_match("^ab*c$", "ac").unwrap());
+    assert!(regexp_match("^ab*c$", "abbbc").unwrap());
+    assert!(!regexp_match("^ab+c$", "ac").unwrap());
+    assert!(regexp_match("^ab+c$", "abc").unwrap());
+    assert!(regexp_match("^ab?c$", "ac").unwrap());
+    assert!(regexp_match("^ab?c$", "abc").unwrap());
+    assert!(!regexp_match("^ab?c$", "abbc").unwrap());
 
     // Counted repetition `{p}` / `{p,}` / `{p,q}` / `{,q}`.
-    assert!(regexp_match("^a{3}$", "aaa"));
-    assert!(!regexp_match("^a{3}$", "aa"));
-    assert!(regexp_match("^a{2,}$", "aaaa"));
-    assert!(!regexp_match("^a{2,}$", "a"));
-    assert!(regexp_match("^a{2,4}$", "aaa"));
-    assert!(!regexp_match("^a{2,4}$", "aaaaa"));
-    assert!(regexp_match("^a{,3}$", "aa")); // `{,3}` == `{0,3}`
+    assert!(regexp_match("^a{3}$", "aaa").unwrap());
+    assert!(!regexp_match("^a{3}$", "aa").unwrap());
+    assert!(regexp_match("^a{2,}$", "aaaa").unwrap());
+    assert!(!regexp_match("^a{2,}$", "a").unwrap());
+    assert!(regexp_match("^a{2,4}$", "aaa").unwrap());
+    assert!(!regexp_match("^a{2,4}$", "aaaaa").unwrap());
+    assert!(regexp_match("^a{,3}$", "aa").unwrap()); // `{,3}` == `{0,3}`
 
     // Character classes: set, range, negation, and sqlite's literal-`]`/`-`
     // rules. A `[a-]` (dash consumed as a range upper bound past `]`) is
     // malformed → non-matching, like sqlite.
-    assert!(regexp_match("^[abc]$", "b"));
-    assert!(!regexp_match("^[abc]$", "d"));
-    assert!(regexp_match("^[a-c]+$", "abcabc"));
-    assert!(!regexp_match("^[a-c]+$", "abd"));
-    assert!(regexp_match("^[^x]$", "y"));
-    assert!(!regexp_match("^[^x]$", "x"));
-    assert!(regexp_match("^[]x]$", "]")); // leading `]` is literal
-    assert!(regexp_match("^[-a]$", "-")); // leading `-` is literal
-    assert!(!regexp_match("[a-]", "-")); // malformed (sqlite: "unterminated")
+    assert!(regexp_match("^[abc]$", "b").unwrap());
+    assert!(!regexp_match("^[abc]$", "d").unwrap());
+    assert!(regexp_match("^[a-c]+$", "abcabc").unwrap());
+    assert!(!regexp_match("^[a-c]+$", "abd").unwrap());
+    assert!(regexp_match("^[^x]$", "y").unwrap());
+    assert!(!regexp_match("^[^x]$", "x").unwrap());
+    assert!(regexp_match("^[]x]$", "]").unwrap()); // leading `]` is literal
+    assert!(regexp_match("^[-a]$", "-").unwrap()); // leading `-` is literal
+    assert!(regexp_match("[a-]", "-").is_err()); // malformed → named error (sqlite errors too)
 
     // Alternation and grouping.
-    assert!(regexp_match("^(cat|dog)$", "dog"));
-    assert!(!regexp_match("^(cat|dog)$", "cow"));
-    assert!(regexp_match("^(ab)+$", "ababab"));
-    assert!(!regexp_match("^(ab)+$", "aba"));
-    assert!(regexp_match("^a(b|c)d$", "acd"));
+    assert!(regexp_match("^(cat|dog)$", "dog").unwrap());
+    assert!(!regexp_match("^(cat|dog)$", "cow").unwrap());
+    assert!(regexp_match("^(ab)+$", "ababab").unwrap());
+    assert!(!regexp_match("^(ab)+$", "aba").unwrap());
+    assert!(regexp_match("^a(b|c)d$", "acd").unwrap());
 
     // Backslash escapes: metacharacters, C escapes, Perl classes, `\b`.
-    assert!(regexp_match("^a\\.c$", "a.c"));
-    assert!(!regexp_match("^a\\.c$", "axc"));
-    assert!(regexp_match("^a\\*c$", "a*c"));
-    assert!(regexp_match("^a\\\\b$", "a\\b"));
-    assert!(regexp_match("^\\t$", "\t"));
-    assert!(regexp_match("^\\d+$", "2026"));
-    assert!(!regexp_match("^\\d+$", "20a6"));
-    assert!(regexp_match("^\\w+$", "a_1"));
-    assert!(regexp_match("\\bbar", "foo bar"));
-    assert!(!regexp_match("\\bbar", "foobar"));
-    assert!(regexp_match("^\\D$", "x"));
-    assert!(regexp_match("\\u0041", "A")); // \uXXXX code point
-    assert!(regexp_match("\\x41", "A")); // \xXX code point
+    assert!(regexp_match("^a\\.c$", "a.c").unwrap());
+    assert!(!regexp_match("^a\\.c$", "axc").unwrap());
+    assert!(regexp_match("^a\\*c$", "a*c").unwrap());
+    assert!(regexp_match("^a\\\\b$", "a\\b").unwrap());
+    assert!(regexp_match("^\\t$", "\t").unwrap());
+    assert!(regexp_match("^\\d+$", "2026").unwrap());
+    assert!(!regexp_match("^\\d+$", "20a6").unwrap());
+    assert!(regexp_match("^\\w+$", "a_1").unwrap());
+    assert!(regexp_match("\\bbar", "foo bar").unwrap());
+    assert!(!regexp_match("\\bbar", "foobar").unwrap());
+    assert!(regexp_match("^\\D$", "x").unwrap());
+    assert!(regexp_match("\\u0041", "A").unwrap()); // \uXXXX code point
+    assert!(regexp_match("\\x41", "A").unwrap()); // \xXX code point
 
     // Case-SENSITIVE, like GLOB.
-    assert!(!regexp_match("abc", "ABC"));
-    assert!(regexp_match("ABC", "ABC"));
+    assert!(!regexp_match("abc", "ABC").unwrap());
+    assert!(regexp_match("ABC", "ABC").unwrap());
 
-    // Malformed patterns never panic and match nothing (sqlite raises instead).
-    assert!(!regexp_match("(ab", "ab")); // unmatched '('
-    assert!(!regexp_match("a)b", "a)b")); // unmatched ')'
-    assert!(!regexp_match("[abc", "a")); // unterminated class
-    assert!(!regexp_match("*a", "a")); // quantifier without operand
-    assert!(!regexp_match("a{3,1}", "aa")); // n < m
-    assert!(!regexp_match("a{0}", "")); // both zero
-    assert!(!regexp_match("\\y", "y")); // unknown escape
+    // Malformed patterns never panic; they are a NAMED error, as sqlite's own
+    // regexp extension raises. ("Match nothing" was wrong answer W3: a consumer
+    // whose registered regexp() UDF speaks a richer dialect got silent empty
+    // results — Django's __iregex prepends (?i) to every pattern.)
+    assert!(regexp_match("(ab", "ab").is_err()); // unmatched '('
+    assert!(regexp_match("a)b", "a)b").is_err()); // unmatched ')'
+    assert!(regexp_match("[abc", "a").is_err()); // unterminated class
+    assert!(regexp_match("*a", "a").is_err()); // quantifier without operand
+    assert!(regexp_match("a{3,1}", "aa").is_err()); // n < m
+    assert!(regexp_match("a{0}", "").is_err()); // both zero
+    assert!(regexp_match("\\y", "y").is_err()); // unknown escape
+    assert!(regexp_match("(?i)fo+", "FOO").is_err()); // the W3 shape itself
 
     // A count far above the program cap is refused (bounded, no hang) — even
     // over an empty body, where a naive expander would spin.
-    assert!(!regexp_match("a{999999999}", "aa"));
-    assert!(!regexp_match("(){999999999}", ""));
+    assert!(regexp_match("a{999999999}", "aa").is_err());
+    assert!(regexp_match("(){999999999}", "").is_err());
 }
 
 #[test]
