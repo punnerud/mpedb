@@ -21,63 +21,25 @@ adaptations, because the gaps behind them closed:
     parsed and dropped, which is sqlite's own `foreign_keys=OFF` behaviour.
   * `CONSTRAINT n UNIQUE (…)` keeps its name (D5).
 
-What is left is only what mpedb still does not do.
+Run 4 (2026-07-19, after the typeless-key merge) DELETED two more:
+
+  * The D9 index dropper (and its `WB_SOFT_CREATE_INDEX` lever): an `any`
+    column may now be a PRIMARY KEY / index key, so `CREATE INDEX` on
+    `datetime`/`decimal` columns succeeds and Django's own indexes are created.
+  * `supports_foreign_keys = False` (D4b): run 3's ablation measured it as
+    bit-identical in both arms (A labels and `backends`); run 3 recorded it as
+    deleted but the `backends`-triage merge reintroduced it by accident.
+
+What is left is only what mpedb still does not do. The two survivors have
+ablation switches (`WB_NO_D2`, `WB_NO_D8`) so their cost can be re-measured.
 """
 
 import os
-import re
 
 from django.db.backends.sqlite3.base import DatabaseWrapper as SQLiteDatabaseWrapper
-from django.db.backends.sqlite3.features import (
-    DatabaseFeatures as SQLiteDatabaseFeatures,
-)
 from django.db.backends.sqlite3.operations import (
     DatabaseOperations as SQLiteDatabaseOperations,
 )
-from django.db.backends.sqlite3.schema import (
-    DatabaseSchemaEditor as SQLiteDatabaseSchemaEditor,
-)
-
-
-# GAP D9 (mpedb-types `schema.rs`): an index key is memcmp-ordered, and
-# `ColumnType::Any` has no order ACROSS storage classes, so `Schema::validate`
-# refuses an index whose column is `any`. sqlite's NUMERIC affinity maps to
-# `any` (it is the one affinity that is not a single storage class), which makes
-# every `datetime`/`date`/`time`/`decimal` column unindexable — and Django's
-# `Session.expire_date` is a `DateTimeField(db_index=True)`, so `CREATE INDEX`
-# fails during `migrate` and NOT ONE test runs. Recorded, not fixed: it is an
-# engine decision, and lifting it is issue "`any` columns indexable".
-#
-# The adaptation drops exactly those `CREATE INDEX` statements, in BOTH arms.
-# An index is a pure performance feature — no answer depends on one — so the
-# only tests this can perturb are introspection tests, which then fail in both
-# arms and are excluded from the shim-only diff by construction.
-_NUMERIC_AFFINITY = re.compile(r"^(date|datetime|time|decimal|numeric)\b", re.I)
-
-
-def _is_any_typed(field, connection):
-    try:
-        t = field.db_parameters(connection)["type"]
-    except Exception:  # pragma: no cover - defensive
-        return False
-    if not t:
-        return False
-    # mpedb's own names win over the affinity rule, so `bool`/`timestamp` are
-    # real rigid types and stay indexable; only sqlite's NUMERIC bucket becomes
-    # `any`.
-    return bool(_NUMERIC_AFFINITY.match(t.strip()))
-
-
-class DatabaseSchemaEditor(SQLiteDatabaseSchemaEditor):
-    def _create_index_sql(self, model, *, fields=None, **kwargs):
-        if fields and any(_is_any_typed(f, self.connection) for f in fields):
-            return ""
-        return super()._create_index_sql(model, fields=fields, **kwargs)
-
-    def execute(self, sql, params=()):
-        if not str(sql).strip():
-            return
-        return super().execute(sql, params)
 
 
 class DatabaseOperations(SQLiteDatabaseOperations):
@@ -91,37 +53,26 @@ class DatabaseOperations(SQLiteDatabaseOperations):
         # `TransactionTestCase` teardown then leaves rows behind, cascading into
         # dozens of unrelated assertion failures.
         #
-        # The workbench runs with `supports_foreign_keys = False`, so no
-        # ENFORCED FK constraint exists to cascade through and the graph of a
-        # table is just the table. Applied to BOTH arms.
+        # mpedb enforces no FK constraint (`REFERENCES` is parsed and
+        # discarded, sqlite's own `foreign_keys=OFF` behaviour), so no ENFORCED
+        # cascade exists and the graph of a table is just the table. Applied to
+        # BOTH arms. Ablation: `WB_NO_D8=1`.
+        if os.environ.get("WB_NO_D8"):
+            return super()._references_graph
         return lambda table_name: [table_name]
 
 
-class DatabaseFeatures(SQLiteDatabaseFeatures):
-    # GAP D4b (mpedb-sql): `REFERENCES` is now PARSED, but the constraint is
-    # discarded — mpedb enforces no foreign key. That is sqlite's own default
-    # (`PRAGMA foreign_keys = OFF`) but not what Django's sqlite backend asks
-    # for. Telling Django there is no FK support keeps it from asserting
-    # enforcement it would not get, and skips its own
-    # `@skipUnlessDBFeature("supports_foreign_keys")` tests — in BOTH arms.
-    # The inline `REFERENCES …` column clause IS still emitted (the schema
-    # editor's `sql_create_inline_fk` is untouched), so the new parser surface
-    # is exercised on every ForeignKey.
-    supports_foreign_keys = False
-
-
 class DatabaseWrapper(SQLiteDatabaseWrapper):
-    features_class = DatabaseFeatures
     ops_class = DatabaseOperations
-    SchemaEditorClass = DatabaseSchemaEditor
 
     # GAP D2 (mpedb-sql): `AUTOINCREMENT` is refused BY NAME — mpedb's INTEGER
     # PRIMARY KEY auto-assigns max+1 but REUSES ids after a delete, and the
     # keyword's one added guarantee (never reuse) needs a persisted, crash-safe
     # sequence, so the parser refuses rather than silently weaken it. Django
     # appends the suffix to every AutoField pk, i.e. to essentially every model,
-    # so unpatched not one table is created.
-    data_types_suffix = {}
+    # so unpatched not one table is created. Ablation: `WB_NO_D2=1`.
+    if not os.environ.get("WB_NO_D2"):
+        data_types_suffix = {}
 
 
 # --- workbench debugging aid -------------------------------------------------
@@ -145,33 +96,3 @@ if os.environ.get("WB_TRACE_SQL_ERRORS"):
             raise
 
     CursorWrapper._execute = _execute
-
-
-# --- workbench measurement aid ------------------------------------------------
-# With WB_SOFT_CREATE_INDEX=1, a failing `CREATE INDEX` during `migrate` is
-# logged and SWALLOWED instead of taking down the whole label.
-#
-# Why this exists: an index is a performance structure, never an answer, so a
-# missing one changes no query RESULT — but a refused `CREATE INDEX` aborts
-# `create_test_db()` and hides every gap behind it. mpedb currently refuses to
-# index an `any` column ("the index is memcmp-ordered and `any` has no order
-# across types"), and Django's `datetime`/`decimal` columns take NUMERIC
-# affinity → `any`, so `django_session.expire_date` alone blocks BOTH label
-# groups outright. Off by default: this is a measurement lever for isolating a
-# DOWNSTREAM gap, not an adaptation the reported numbers may rest on. Anything
-# measured with it on must say so.
-if os.environ.get("WB_SOFT_CREATE_INDEX"):
-    from django.db.backends.base.schema import BaseDatabaseSchemaEditor
-
-    _orig_se_execute = BaseDatabaseSchemaEditor.execute
-
-    def _se_execute(self, sql, params=()):
-        try:
-            return _orig_se_execute(self, sql, params)
-        except Exception as exc:
-            if "CREATE INDEX" in str(sql).upper():
-                print(f"\n[WB-SOFT-INDEX] swallowed: {exc}\n  SQL: {sql}", flush=True)
-                return None
-            raise
-
-    BaseDatabaseSchemaEditor.execute = _se_execute
