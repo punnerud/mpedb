@@ -1,5 +1,8 @@
 //! `mpedb repl <config.toml>` — line-oriented session, friendly to piped
-//! stdin (no prompt unless stdin is a tty).
+//! stdin (no prompt unless stdin is a tty). On a tty the line editor is
+//! rustyline, so Tab completes dot-commands, SQL keywords, table names and
+//! `<table>.<column>` (see [`crate::line`]); piped stdin takes the same plain
+//! reader it always did.
 //!
 //! `BEGIN` opens a [`mpedb::WriteSession`]; statements then run inside it via
 //! `session.query` (compiled locally, never published — the facade's
@@ -8,14 +11,19 @@
 //! thread already holds (ERRORCHECK would error out, but the refusal message
 //! is clearer).
 
-use std::io::{BufRead, Write as _};
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use mpedb::{Config, Database, WriteSession};
 use mpedb_core::Engine;
 
+use crate::line::{LineSource, Names};
 use crate::render::{print_result, schema_toml};
 use crate::util::{usage, CliResult};
+
+/// The dot-commands this repl answers to — also the Tab-completion set.
+const DOTS: &[&str] = &[".tables", ".schema", ".hash", ".verify", ".quit", ".exit"];
 
 pub fn run(argv: &[String]) -> CliResult {
     let [config_path] = argv else {
@@ -34,17 +42,12 @@ pub fn run(argv: &[String]) -> CliResult {
         )
     };
 
-    let interactive = unsafe { libc::isatty(libc::STDIN_FILENO) == 1 };
-    let stdin = std::io::stdin();
-    let mut lines = stdin.lock().lines();
+    let names = Rc::new(RefCell::new(Names::new(DOTS)));
+    names.borrow_mut().set_schema(&db.schema());
+    let mut input = LineSource::new("mpedb> ", names.clone());
     let mut session: Option<WriteSession<'_>> = None;
 
-    loop {
-        if interactive {
-            print!("mpedb> ");
-            let _ = std::io::stdout().flush();
-        }
-        let Some(line) = lines.next() else { break };
+    while let Some(line) = input.next_line() {
         let line = line?;
         let stmt = line.trim().trim_end_matches(';').trim();
         if stmt.is_empty() {
@@ -94,6 +97,11 @@ pub fn run(argv: &[String]) -> CliResult {
             match res {
                 Ok(r) => print_result(&r),
                 Err(e) => eprintln!("error: {e}"),
+            }
+            // DDL moves the schema under the completer; refresh the snapshot
+            // (only when something is actually completing against it).
+            if input.prompts() {
+                names.borrow_mut().set_schema(&db.schema());
             }
         }
     }
