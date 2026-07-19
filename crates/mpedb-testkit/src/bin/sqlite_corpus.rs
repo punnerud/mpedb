@@ -37,6 +37,13 @@
 //!
 //! Usage: `cargo run -p mpedb-testkit --bin sqlite_corpus -- <file.test>...`
 //!
+//! Flags: `--as-sqlite` also answers to the `sqlite` engine name in
+//! `skipif`/`onlyif` (runs the sqlite-only records, and does NOT take the
+//! `skipif sqlite` + `halt` exit that truncates most `evidence/` files);
+//! `--samples-all` prints example failing statements for *every* category,
+//! not just the uncategorized ones — that is how the ranked blocker table in
+//! [`design/CORPUS-STATUS.md`] gets its per-category examples.
+//!
 //! Known shim limitations (also see the final report):
 //! - INSERT ... SELECT is not rewritten (fails as subquery).
 //! - `SELECT *` in comma-join FROM clauses is not expanded (comma joins are
@@ -1153,6 +1160,34 @@ fn categories(sql: &str, err: &str) -> Vec<&'static str> {
     if cats.is_empty() && err.contains("expected FROM") {
         cats.push("select-item-alias");
     }
+    // The deliberate arm-type refusal. It must out-rank the syntactic buckets
+    // above: these statements are machine-generated expression soup, so almost
+    // every one of them also *contains* a CAST, a `(SELECT`, or no FROM — and
+    // attributing them there hid the single largest real blocker behind three
+    // categories that are not what the engine actually rejected.
+    if err.contains("cannot mix coalesce() argument types")
+        || err.contains("cannot mix CASE result types")
+        || err.contains("cannot mix nullif() argument types")
+    {
+        cats.insert(0, "mixed-arm-types");
+    }
+    // Another *shim* artifact: `shim_select` expands a bare `*` only in the
+    // OUTER select list, so `x IN (SELECT * FROM t)` still sees the synthetic
+    // `rowid_` column and looks like a 2-column IN subquery. sqlite's `t` has
+    // one column there. (The corpus has no row-value INs, so this message is
+    // the artifact, not a real arity gap.)
+    if err.contains("an IN subquery must select exactly one column") {
+        cats.insert(0, "shim-star-arity");
+    }
+    // A *shim* artifact, not an index-DDL gap: `DROP TABLE` is simulated as
+    // `DELETE FROM` (a real DROP would burn one of mpedb's 64 lifetime table
+    // ids, and the corpus re-creates its tables hundreds of times per file),
+    // so every CREATE INDEX in a re-created table's block piles onto the SAME
+    // live table until it trips mpedb's 32-indexes-per-table cap. sqlite drops
+    // the indexes with the table and never has more than a handful live.
+    if err.contains("indexes (max") {
+        cats.insert(0, "shim-index-accumulation");
+    }
     if err.contains("ENGINE PANIC") {
         cats.insert(0, "ENGINE-PANIC");
     }
@@ -1239,7 +1274,10 @@ struct FileReport {
     hash_verified: usize,
     unsupported: BTreeMap<&'static str, usize>,
     co_counts: BTreeMap<&'static str, usize>,
-    other_samples: Vec<(usize, String, String)>,
+    /// `(line, sql, error)` samples of failing statements, keyed by primary
+    /// category. Only `other` is sampled by default; `--samples-all` samples
+    /// every category (how the ranked blocker table gets its examples).
+    other_samples: BTreeMap<&'static str, Vec<(usize, String, String)>>,
     wrong: Vec<Wrong>,
     wrong_total: usize,
     errmis: Vec<(usize, String)>,
@@ -1266,10 +1304,25 @@ impl FileReport {
     fn unsupported_total(&self) -> usize {
         self.unsupported.values().sum()
     }
+    /// Keep up to `MAX_SAMPLES_PER_CAT` failing statements per category, so
+    /// the ranked blocker table can quote a real example for each.
+    fn sample(&mut self, cat: &'static str, line: usize, sql: &str, err: &str) {
+        if !(cat == "other" || SAMPLE_ALL.load(std::sync::atomic::Ordering::Relaxed)) {
+            return;
+        }
+        let slot = self.other_samples.entry(cat).or_default();
+        if slot.len() < MAX_SAMPLES_PER_CAT {
+            slot.push((line, truncate_sql(sql, 120), truncate_sql(err, 160)));
+        }
+    }
 }
 
+/// Set by `--samples-all`: sample failing statements in every category, not
+/// just the uncategorized ones.
+static SAMPLE_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 const MAX_WRONG_STORED: usize = 12;
-const MAX_OTHER_SAMPLES: usize = 6;
+const MAX_SAMPLES_PER_CAT: usize = 3;
 const MAX_ERRMIS_STORED: usize = 5;
 
 fn truncate_sql(sql: &str, max: usize) -> String {
@@ -1402,10 +1455,7 @@ fn run_file(path: &Path, engines: &[&str]) -> FileReport {
                             *rep.co_counts.entry(c).or_default() += 1;
                         }
                         failed_writes += 1;
-                        if cats[0] == "other" && rep.other_samples.len() < MAX_OTHER_SAMPLES {
-                            rep.other_samples
-                                .push((rec.line, truncate_sql(&rec.sql, 100), e));
-                        }
+                        rep.sample(cats[0], rec.line, &rec.sql, &e);
                     }
                 }
             }
@@ -1438,13 +1488,7 @@ fn run_file(path: &Path, engines: &[&str]) -> FileReport {
                     Ok(_) => {
                         *rep.unsupported.entry("other").or_default() += 1;
                         *rep.co_counts.entry("other").or_default() += 1;
-                        if rep.other_samples.len() < MAX_OTHER_SAMPLES {
-                            rep.other_samples.push((
-                                rec.line,
-                                truncate_sql(&rec.sql, 100),
-                                "query returned no row set".into(),
-                            ));
-                        }
+                        rep.sample("other", rec.line, &rec.sql, "query returned no row set");
                         continue;
                     }
                     Err(e) => {
@@ -1453,10 +1497,7 @@ fn run_file(path: &Path, engines: &[&str]) -> FileReport {
                         for c in &cats {
                             *rep.co_counts.entry(c).or_default() += 1;
                         }
-                        if cats[0] == "other" && rep.other_samples.len() < MAX_OTHER_SAMPLES {
-                            rep.other_samples
-                                .push((rec.line, truncate_sql(&rec.sql, 100), e));
-                        }
+                        rep.sample(cats[0], rec.line, &rec.sql, &e);
                         continue;
                     }
                 };
@@ -1607,10 +1648,12 @@ fn main() {
     md5_self_test();
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let as_sqlite = args.iter().any(|a| a == "--as-sqlite");
-    args.retain(|a| a != "--as-sqlite");
+    let sample_all = args.iter().any(|a| a == "--samples-all");
+    args.retain(|a| a != "--as-sqlite" && a != "--samples-all");
+    SAMPLE_ALL.store(sample_all, std::sync::atomic::Ordering::Relaxed);
     let engines: &[&str] = if as_sqlite { &["mpedb", "sqlite"] } else { &["mpedb"] };
     if args.is_empty() {
-        eprintln!("usage: sqlite_corpus [--as-sqlite] <file.test> [...]");
+        eprintln!("usage: sqlite_corpus [--as-sqlite] [--samples-all] <file.test> [...]");
         std::process::exit(2);
     }
     let mut reports = Vec::new();
@@ -1772,12 +1815,14 @@ fn main() {
     }
 
     // ---------------- other-error samples ----------------
-    println!("\n== uncategorized error samples ==");
+    println!("\n== failing-statement samples ==");
     any = false;
     for r in &reports {
-        for (line, sql, err) in &r.other_samples {
-            any = true;
-            println!("{}:{}  {}\n    -> {}", r.name, line, sql, err);
+        for (cat, samples) in &r.other_samples {
+            for (line, sql, err) in samples {
+                any = true;
+                println!("[{cat}] {}:{}  {}\n    -> {}", r.name, line, sql, err);
+            }
         }
     }
     if !any {
