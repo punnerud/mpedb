@@ -363,7 +363,14 @@ pub(crate) enum Expr {
     /// `f([DISTINCT] arg)`, or `count(*)` (a `None` arg — the row itself).
     /// The bool is DISTINCT: `count(DISTINCT x)` counts distinct non-NULL
     /// values of x.
-    Agg(mpedb_types::AggFn, Option<Box<Expr>>, bool),
+    ///
+    /// The trailing `Option<Box<Expr>>` is an optional `FILTER (WHERE <cond>)`
+    /// (sqlite 3.30+/PostgreSQL): the aggregate accumulates ONLY the rows where
+    /// `cond` is TRUE (3VL — NULL/FALSE skip). It is a boolean predicate over
+    /// the SAME base row the argument sees, and each aggregate is filtered
+    /// independently. A FILTER on a WINDOW aggregate (`OVER`) is refused by the
+    /// parser, so it only ever rides a plain grouped/scalar aggregate here.
+    Agg(mpedb_types::AggFn, Option<Box<Expr>>, bool, Option<Box<Expr>>),
     /// `<fn>(args) OVER (<spec>)` — a WINDOW function (design/DESIGN-WINDOW.md).
     ///
     /// Its own node (not [`Expr::Agg`]/[`Expr::Func`]) because it is neither a

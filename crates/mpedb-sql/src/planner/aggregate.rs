@@ -56,7 +56,10 @@ fn lift_aggs(
     // `Sqlite` gives it a slot in the grouped tuple's `bare` region and lets the
     // caller decide (after folding) whether it survives.
     mode: BareGroupBy,
-    aggs: &mut Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool)>,
+    // Per aggregate: `(func, arg, distinct, filter)`. The last element is the
+    // optional `FILTER (WHERE …)` predicate AST, kept in the dedup key so two
+    // otherwise-identical aggregates with DIFFERENT filters stay separate slots.
+    aggs: &mut Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool, Option<ast::Expr>)>,
     // sqlite bare columns: `(base-row slot, type)`, deduped by slot. A bare
     // column becomes `__b{j}` where `j` is its index here; the planner resolves
     // those names against the extended grouped tuple `[keys ‖ aggs ‖ bare]`.
@@ -64,7 +67,7 @@ fn lift_aggs(
 ) -> Result<ast::Expr> {
     use ast::Expr as E;
     let rec = |x: &ast::Expr,
-               aggs: &mut Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool)>,
+               aggs: &mut Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool, Option<ast::Expr>)>,
                bare: &mut Vec<(u16, ColumnType)>| lift_aggs(x, keys, scope, mode, aggs, bare);
     let group_by = keys.asts;
     // A selected/ordered expression that IS a group key — `SELECT a+1 …
@@ -75,8 +78,10 @@ fn lift_aggs(
         return Ok(E::Col(format!("__g{pos}")));
     }
     Ok(match e {
-        E::Agg(f, arg, distinct) => {
-            let spec = (*f, arg.as_deref().cloned(), *distinct);
+        E::Agg(f, arg, distinct, filter) => {
+            // The FILTER predicate rides in the dedup key: `count(*) FILTER
+            // (WHERE a)` and `count(*) FILTER (WHERE b)` are two aggregates.
+            let spec = (*f, arg.as_deref().cloned(), *distinct, filter.as_deref().cloned());
             // Reuse an identical aggregate rather than adding a slot: `SELECT
             // count(*) ... ORDER BY count(*)` is one aggregate named twice, and
             // lifting it twice would accumulate it twice.
@@ -217,7 +222,7 @@ fn synthetic_grouped_table(
     // One collation per GROUP BY key — a bare column's declared collation, so an
     // `ORDER BY <grouped-key>` over this synthetic tuple inherits it.
     key_collations: &[Collation],
-    aggs: &[(mpedb_types::AggFn, Option<ast::Expr>, bool)],
+    aggs: &[(mpedb_types::AggFn, Option<ast::Expr>, bool, Option<ast::Expr>)],
     agg_types: &[Option<ColumnType>],
     // sqlite bare columns `(base slot, type)`: the tuple's tail
     // `[keys ‖ aggs ‖ bare]`, named `__b{j}`. Empty in postgres mode.
@@ -237,7 +242,7 @@ fn synthetic_grouped_table(
             collation: key_collations.get(k).copied().unwrap_or(Collation::Binary),
         });
     }
-    for (i, (f, _, _)) in aggs.iter().enumerate() {
+    for (i, (f, _, _, _)) in aggs.iter().enumerate() {
         let ty = match f {
             mpedb_types::AggFn::Count => ColumnType::Int64,
             mpedb_types::AggFn::Avg | mpedb_types::AggFn::Total => ColumnType::Float64,
@@ -398,7 +403,8 @@ pub(super) fn plan_aggregate_select(
     //    gets a slot in the grouped tuple's tail; whether it SURVIVES is decided
     //    after folding (step 5). In postgres mode `lift_aggs` refuses instead.
     let keys = GroupKeys { asts: &key_asts, cols: &key_cols };
-    let mut agg_specs: Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool)> = Vec::new();
+    let mut agg_specs: Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool, Option<ast::Expr>)> =
+        Vec::new();
     let mut bare: Vec<(u16, ColumnType)> = Vec::new();
     let mut rewritten = Vec::with_capacity(items.len());
     for (item, _alias) in items {
@@ -422,29 +428,36 @@ pub(super) fn plan_aggregate_select(
         ));
     }
 
-    // 3. Bind each aggregate ARGUMENT over the BASE row.
+    // 3. Bind each aggregate ARGUMENT and FILTER over the BASE row. The FILTER
+    //    is bound BEFORE the binder is rescoped to the grouped tuple (below), so
+    //    it resolves the same base columns/params the argument does — the two
+    //    always see the identical tuple. It is typed as a predicate (Bool),
+    //    exactly like WHERE/HAVING. The argument is bound first so params
+    //    register in source order (`sum(x) FILTER (WHERE y)`).
     let mut aggs = Vec::with_capacity(agg_specs.len());
     let mut agg_types = Vec::with_capacity(agg_specs.len());
-    for (f, arg, distinct) in &agg_specs {
-        match arg {
-            None => {
-                aggs.push(AggCall {
-                    func: *f,
-                    arg: None,
-                    distinct: false,
-                });
-                agg_types.push(Some(ColumnType::Int64));
-            }
+    for (f, arg, distinct, filt) in &agg_specs {
+        let (arg_prog, ty, distinct) = match arg {
+            None => (None, Some(ColumnType::Int64), false),
             Some(a) => {
                 let (b, ty) = binder.bind_expr(a)?;
-                agg_types.push(ty);
-                aggs.push(AggCall {
-                    func: *f,
-                    arg: Some(compile_program(&b)?),
-                    distinct: *distinct,
-                });
+                (Some(compile_program(&b)?), ty, *distinct)
             }
-        }
+        };
+        let filter = match filt {
+            Some(fe) => {
+                let b = binder.bind_predicate(fe)?;
+                Some(compile_program(&b)?)
+            }
+            None => None,
+        };
+        agg_types.push(ty);
+        aggs.push(AggCall {
+            func: *f,
+            arg: arg_prog,
+            distinct,
+            filter,
+        });
     }
 
     // 4. Bind the rewritten projection/HAVING over the GROUPED tuple — a
@@ -556,7 +569,7 @@ pub(super) fn plan_aggregate_select(
         //        than reproduce version-fragile behavior (never a wrong answer).
         let n_minmax = agg_specs
             .iter()
-            .filter(|(f, _, _)| matches!(f, mpedb_types::AggFn::Min | mpedb_types::AggFn::Max))
+            .filter(|(f, _, _, _)| matches!(f, mpedb_types::AggFn::Min | mpedb_types::AggFn::Max))
             .count();
         let reproducible = match n_minmax {
             1 => true,
@@ -721,8 +734,8 @@ fn agg_item_name(e: &ast::Expr) -> String {
     match e {
         ast::Expr::Col(c) => c.clone(),
         ast::Expr::Qualified(_, c) => c.clone(),
-        ast::Expr::Agg(f, None, _) => format!("{}(*)", f.name()),
-        ast::Expr::Agg(f, Some(a), distinct) => format!(
+        ast::Expr::Agg(f, None, _, _) => format!("{}(*)", f.name()),
+        ast::Expr::Agg(f, Some(a), distinct, _) => format!(
             "{}({}{})",
             f.name(),
             if *distinct { "DISTINCT " } else { "" },

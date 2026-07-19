@@ -160,6 +160,16 @@ pub(super) fn exec_aggregate(
             (key_vals, agg.aggs.iter().map(new_accum).collect(), witness)
         });
         for (i, call) in agg.aggs.iter().enumerate() {
+            // `agg(x) FILTER (WHERE cond)`: this row feeds THIS aggregate only
+            // when `cond` is TRUE over the base row (3VL — NULL/FALSE skip). The
+            // filter is per-aggregate, so two aggregates in one SELECT can have
+            // different filters (or none). For DISTINCT this runs BEFORE the
+            // dedupe inside `Accum` — filter first, then dedupe.
+            if let Some(f) = &call.filter {
+                if !f.eval_filter(&mut Vec::new(), row, params)? {
+                    continue;
+                }
+            }
             match &call.arg {
                 // count(*): the ROW is the input, so nothing is evaluated and
                 // NULL cannot arise.
@@ -187,21 +197,41 @@ pub(super) fn exec_aggregate(
                 // against sqlite 3.45.
                 Witness::MinMax { extreme, bare } => {
                     let mm = mm.expect("MinMax witness implies a single min/max aggregate");
-                    let v = match &mm.arg {
-                        Some(p) => p.eval(row, params)?,
-                        None => Value::Null,
+                    // A FILTER on the governing min/max restricts BOTH the
+                    // extremum AND the witness row to the rows it accepts
+                    // (verified vs sqlite 3.45: the bare column follows the
+                    // FILTERED extremum). A rejected row contributes nothing —
+                    // except that when the filter rejects EVERY row in the group,
+                    // sqlite falls back to the group's FIRST row for the bare
+                    // values, so seed `bare` from the first row while it is still
+                    // empty. With no filter this is byte-identical to before
+                    // (`passes` is always true, and the extreme=None branch already
+                    // captured every row, so the last row wins as documented).
+                    let passes = match &mm.filter {
+                        Some(fp) => fp.eval_filter(&mut Vec::new(), row, params)?,
+                        None => true,
                     };
-                    match extreme {
-                        None => {
+                    if !passes {
+                        if bare.is_empty() {
                             *bare = capture();
-                            if !v.is_null() {
-                                *extreme = Some(v);
-                            }
                         }
-                        Some(e) => {
-                            if !v.is_null() && mm.func.min_max_prefers(e, &v)? {
-                                *extreme = Some(v);
+                    } else {
+                        let v = match &mm.arg {
+                            Some(p) => p.eval(row, params)?,
+                            None => Value::Null,
+                        };
+                        match extreme {
+                            None => {
                                 *bare = capture();
+                                if !v.is_null() {
+                                    *extreme = Some(v);
+                                }
+                            }
+                            Some(e) => {
+                                if !v.is_null() && mm.func.min_max_prefers(e, &v)? {
+                                    *extreme = Some(v);
+                                    *bare = capture();
+                                }
                             }
                         }
                     }
