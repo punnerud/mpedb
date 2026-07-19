@@ -59,7 +59,7 @@ fn lift_aggs(
     // Per aggregate: `(func, arg, distinct, filter)`. The last element is the
     // optional `FILTER (WHERE …)` predicate AST, kept in the dedup key so two
     // otherwise-identical aggregates with DIFFERENT filters stay separate slots.
-    aggs: &mut Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool, Option<ast::Expr>)>,
+    aggs: &mut Vec<(mpedb_types::AggTarget, Option<ast::Expr>, bool, Option<ast::Expr>)>,
     // sqlite bare columns: `(base-row slot, type)`, deduped by slot. A bare
     // column becomes `__b{j}` where `j` is its index here; the planner resolves
     // those names against the extended grouped tuple `[keys ‖ aggs ‖ bare]`.
@@ -67,7 +67,7 @@ fn lift_aggs(
 ) -> Result<ast::Expr> {
     use ast::Expr as E;
     let rec = |x: &ast::Expr,
-               aggs: &mut Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool, Option<ast::Expr>)>,
+               aggs: &mut Vec<(mpedb_types::AggTarget, Option<ast::Expr>, bool, Option<ast::Expr>)>,
                bare: &mut Vec<(u16, ColumnType)>| lift_aggs(x, keys, scope, mode, aggs, bare);
     let group_by = keys.asts;
     // A selected/ordered expression that IS a group key — `SELECT a+1 …
@@ -81,7 +81,7 @@ fn lift_aggs(
         E::Agg(f, arg, distinct, filter) => {
             // The FILTER predicate rides in the dedup key: `count(*) FILTER
             // (WHERE a)` and `count(*) FILTER (WHERE b)` are two aggregates.
-            let spec = (*f, arg.as_deref().cloned(), *distinct, filter.as_deref().cloned());
+            let spec = (f.clone(), arg.as_deref().cloned(), *distinct, filter.as_deref().cloned());
             // Reuse an identical aggregate rather than adding a slot: `SELECT
             // count(*) ... ORDER BY count(*)` is one aggregate named twice, and
             // lifting it twice would accumulate it twice.
@@ -222,7 +222,7 @@ fn synthetic_grouped_table(
     // One collation per GROUP BY key — a bare column's declared collation, so an
     // `ORDER BY <grouped-key>` over this synthetic tuple inherits it.
     key_collations: &[Collation],
-    aggs: &[(mpedb_types::AggFn, Option<ast::Expr>, bool, Option<ast::Expr>)],
+    aggs: &[(mpedb_types::AggTarget, Option<ast::Expr>, bool, Option<ast::Expr>)],
     agg_types: &[Option<ColumnType>],
     // sqlite bare columns `(base slot, type)`: the tuple's tail
     // `[keys ‖ aggs ‖ bare]`, named `__b{j}`. Empty in postgres mode.
@@ -243,19 +243,29 @@ fn synthetic_grouped_table(
         });
     }
     for (i, (f, _, _, _)) in aggs.iter().enumerate() {
-        let ty = match f {
-            mpedb_types::AggFn::Count => ColumnType::Int64,
-            mpedb_types::AggFn::Avg | mpedb_types::AggFn::Total => ColumnType::Float64,
-            mpedb_types::AggFn::GroupConcat => ColumnType::Text,
+        let ty = match f.native() {
+            Some(mpedb_types::AggFn::Count) => ColumnType::Int64,
+            Some(mpedb_types::AggFn::Avg | mpedb_types::AggFn::Total) => ColumnType::Float64,
+            Some(mpedb_types::AggFn::GroupConcat) => ColumnType::Text,
             // SUM/MIN/MAX keep the argument's type.
-            _ => agg_types[i].unwrap_or(ColumnType::Int64),
+            Some(_) => agg_types[i].unwrap_or(ColumnType::Int64),
+            // A HOST aggregate returns whatever its `xFinal` writes — the same
+            // dynamic typing a host SCALAR gets (`ColumnType::Any`). Pinning it
+            // to the argument's type would reject `stddev_pop(int_col) / 2.0`.
+            None => ColumnType::Any,
         };
         out.push(mpedb_types::ColumnDef {
             name: format!("__g{}", key_types.len() + i),
             ty,
             // COUNT and TOTAL are never NULL (0 / 0.0 over an empty group);
             // every other aggregate is NULL over an empty group.
-            nullable: !matches!(f, mpedb_types::AggFn::Count | mpedb_types::AggFn::Total),
+            // COUNT and TOTAL are the only never-NULL aggregates; a host
+            // aggregate may return NULL from `xFinal` (an empty group always
+            // does), so it is nullable like the rest.
+            nullable: !matches!(
+                f.native(),
+                Some(mpedb_types::AggFn::Count | mpedb_types::AggFn::Total)
+            ),
             unique: false,
             indexed: false,
             default: None,
@@ -403,7 +413,7 @@ pub(super) fn plan_aggregate_select(
     //    gets a slot in the grouped tuple's tail; whether it SURVIVES is decided
     //    after folding (step 5). In postgres mode `lift_aggs` refuses instead.
     let keys = GroupKeys { asts: &key_asts, cols: &key_cols };
-    let mut agg_specs: Vec<(mpedb_types::AggFn, Option<ast::Expr>, bool, Option<ast::Expr>)> =
+    let mut agg_specs: Vec<(mpedb_types::AggTarget, Option<ast::Expr>, bool, Option<ast::Expr>)> =
         Vec::new();
     let mut bare: Vec<(u16, ColumnType)> = Vec::new();
     let mut rewritten = Vec::with_capacity(items.len());
@@ -453,7 +463,7 @@ pub(super) fn plan_aggregate_select(
         };
         agg_types.push(ty);
         aggs.push(AggCall {
-            func: *f,
+            func: f.clone(),
             arg: arg_prog,
             distinct,
             filter,
@@ -569,7 +579,9 @@ pub(super) fn plan_aggregate_select(
         //        than reproduce version-fragile behavior (never a wrong answer).
         let n_minmax = agg_specs
             .iter()
-            .filter(|(f, _, _, _)| matches!(f, mpedb_types::AggFn::Min | mpedb_types::AggFn::Max))
+            .filter(|(f, _, _, _)| {
+                matches!(f.native(), Some(mpedb_types::AggFn::Min | mpedb_types::AggFn::Max))
+            })
             .count();
         let reproducible = match n_minmax {
             1 => true,

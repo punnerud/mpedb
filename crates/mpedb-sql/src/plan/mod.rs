@@ -6,7 +6,7 @@
 
 use crate::planner;
 use mpedb_types::value::{read_value, write_value};
-use mpedb_types::{AggFn, Collation,
+use mpedb_types::{AggFn, AggTarget, Collation,
     ColumnType, Error, ExprProgram, Footprint, Instr, KeyBound, KeyPart, PlanHash, Result, Schema,
     TableDef, Value, FORMAT_VERSION, MAX_COLUMNS,
 };
@@ -243,7 +243,19 @@ const MAX_JOINS: usize = 16;
 //     first place (`CompiledPlan::contains_host_call`), so this format only ever
 //     round-trips through a single connection's local cache and the detached
 //     plan blob — but the version still gates a stray cross-version decode.
-const PLAN_FORMAT: u8 = 39;
+// 40: host AGGREGATE UDFs (`xStep`/`xFinal`, design/DESIGN-UDF.md stage 2). Each
+//     `AggCall`'s leading function byte becomes a discriminated tag: 1..=7 is an
+//     `AggFn` exactly as before, and **0** — a value `AggFn::from_tag` always
+//     rejected — introduces a host aggregate, followed by its NAME as a length-
+//     prefixed string. Native aggregate plans therefore encode byte-for-byte as
+//     in format 39; only a plan that actually names a host aggregate differs. A
+//     format-39 reader hits tag 0 → `AggFn::from_tag` → None and rejects the plan
+//     as corrupt rather than misreading it, and the whole-plan version gates it
+//     anyway: a format-39 blob fails CLOSED at byte 0 with the documented
+//     re-prepare. Like a `HostCall`, a plan naming a host aggregate is valid ONLY
+//     for the connection that registered it, so `contains_host_call` covers it
+//     and it never reaches the shared `plan/<hash>` registry.
+const PLAN_FORMAT: u8 = 40;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -1087,7 +1099,11 @@ pub enum GroupKey {
 /// One aggregate call.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AggCall {
-    pub func: AggFn,
+    /// The built-in aggregate, or a HOST aggregate by name (format 40,
+    /// design/DESIGN-UDF.md stage 2). A host call carries `arg: Some(_)` — the
+    /// single argument the parser's aggregate grammar allows — and its result
+    /// type is dynamic (`ColumnType::Any`), exactly as a host scalar's is.
+    pub func: AggTarget,
     /// `count(DISTINCT x)` — deduplicate this aggregate's INPUT values within
     /// each group before accumulating. Meaningless but legal for min/max.
     pub distinct: bool,
@@ -1379,8 +1395,9 @@ impl CompiledPlan {
         PlanHash(*hasher.finalize().as_bytes())
     }
 
-    /// Does any expression in this plan call a HOST-registered scalar UDF
-    /// (`Instr::HostCall`, design/DESIGN-UDF.md)? Such a plan is valid ONLY for
+    /// Does this plan call a HOST-registered UDF — a scalar (`Instr::HostCall`)
+    /// or, since stage 2, an aggregate (`AggTarget::Host`),
+    /// design/DESIGN-UDF.md? Such a plan is valid ONLY for
     /// the connection that registered the function, so the facade must NOT
     /// publish it to the shared content-hashed `plan/<hash>` registry — it
     /// compiles-and-executes it locally each time instead. Computed by scanning
@@ -1415,7 +1432,12 @@ fn select_has_host_call(sp: &SelectPlan) -> bool {
         || sp.aggregate.as_ref().is_some_and(|a| {
             a.group_by.iter().any(|k| matches!(k, GroupKey::Expr(p) if p.has_host_call()))
                 || a.aggs.iter().any(|c| {
-                    opt_prog_host_call(&c.arg) || opt_prog_host_call(&c.filter)
+                    // The aggregate ITSELF may be host-registered (stage 2), not
+                    // just its argument/filter expressions — same
+                    // one-connection-only rule, same registry gate.
+                    c.func.host().is_some()
+                        || opt_prog_host_call(&c.arg)
+                        || opt_prog_host_call(&c.filter)
                 })
                 || opt_prog_host_call(&a.having)
         })

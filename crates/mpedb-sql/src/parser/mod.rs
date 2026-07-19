@@ -93,7 +93,7 @@ pub(crate) const MAX_SET_ITEMS: usize = 1024;
 /// `EXPLAIN`, and the number of parameters ($n gives max n; `?` are numbered
 /// left-to-right in statement order).
 pub(crate) fn parse_statement(sql: &str) -> Result<(Stmt, bool, u16)> {
-    let (stmt, is_explain, n_params, ctes) = parse_statement_ctes(sql)?;
+    let (stmt, is_explain, n_params, ctes) = parse_statement_ctes(sql, &[])?;
     if !ctes.is_empty() {
         return Err(Error::Bind(
             "WITH (common table expressions) is only handled by the top-level \
@@ -112,9 +112,15 @@ pub(crate) type CteDefs = Vec<(String, String)>;
 /// as `(name, body-source-text)` pairs (#CTE). The caller folds them into the
 /// view catalog so `crate::view::inline_views` flattens a `FROM cte` reference
 /// exactly as it flattens a view — no planner/plan-bytes/executor change.
-pub(crate) fn parse_statement_ctes(sql: &str) -> Result<(Stmt, bool, u16, CteDefs)> {
+pub(crate) fn parse_statement_ctes(
+    sql: &str,
+    // HOST aggregate `(name, n_arg)` registrations (design/DESIGN-UDF.md stage
+    // 2); `&[]` for every caller that has none.
+    host_aggs: &[(String, i32)],
+) -> Result<(Stmt, bool, u16, CteDefs)> {
     let toks = tokenize(sql)?;
     let mut p = Parser::new(sql, toks);
+    p.host_aggs = host_aggs.to_vec();
     let is_explain = if p.eat_kw(Kw::Explain) {
         if p.peek_kw(Kw::Explain) {
             return Err(p.err_here("EXPLAIN cannot be nested"));
@@ -175,6 +181,13 @@ struct Parser<'a> {
     /// Approximate stack address where parsing began; the byte budget is
     /// measured against it (see [`Parser::enter_expr`]).
     stack_base: usize,
+    /// HOST-registered AGGREGATE `(name, n_arg)` pairs visible to the compiling
+    /// connection (design/DESIGN-UDF.md stage 2). The parser needs them because
+    /// `myagg(x)` must take the AGGREGATE grammar branch — the one that also
+    /// accepts `DISTINCT` and a trailing `FILTER (WHERE …)` — and that decision
+    /// is made before the argument list is read. Empty for every caller that
+    /// registered none, so the grammar is bit-for-bit unchanged for them.
+    host_aggs: Vec<(String, i32)>,
 }
 
 impl<'a> Parser<'a> {
@@ -187,6 +200,7 @@ impl<'a> Parser<'a> {
             next_question: 0,
             max_params: 0,
             depth: 0,
+            host_aggs: Vec::new(),
             stack_base: {
                 let probe = 0u8;
                 &probe as *const u8 as usize

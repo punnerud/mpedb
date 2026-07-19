@@ -1,5 +1,6 @@
-//! Host scalar UDF support for the C-API shim — the `sqlite3_create_function`
-//! path (design/DESIGN-UDF.md, stage 1: SCALAR only).
+//! Host UDF support for the C-API shim — the `sqlite3_create_function` path
+//! (design/DESIGN-UDF.md): stage 1 SCALAR (`xFunc`) and stage 2 AGGREGATE
+//! (`xStep`/`xFinal` + `sqlite3_aggregate_context`).
 //!
 //! A registered C `xFunc` is wrapped in a Rust closure that, on each SQL call,
 //! builds shim [`SqliteValue`] arguments and a [`SqliteContext`], calls back
@@ -7,6 +8,12 @@
 //! to an mpedb `Value`/`Error`. Every allocation is per-call; text/blob are
 //! copied in (into `SqliteValue`) and out (in `sqlite3_result_text/_blob`), so
 //! nothing aliases the engine's buffers.
+//!
+//! An aggregate uses the SAME marshalling, with one thing added: the per-
+//! aggregation memory sqlite exposes as `sqlite3_aggregate_context`. That
+//! buffer lives in the [`CAggState`] the engine mints for the group, so every
+//! `xStep` and the final `xFinal` see one stable, zero-initialized allocation,
+//! and it is freed when the state is consumed by `xFinal`.
 
 use crate::valconv;
 use mpedb::{Error as DbError, Result as DbResult, Value};
@@ -80,13 +87,47 @@ impl SqliteValue {
     }
 }
 
+/// The per-AGGREGATION memory behind `sqlite3_aggregate_context` — one buffer
+/// shared by every `xStep` of one group and by its `xFinal`.
+///
+/// Allocated lazily and exactly once, on the first `sqlite3_aggregate_context(
+/// ctx, n)` with `n > 0`, ZEROED (sqlite's documented contract — Django's
+/// accumulators rely on a zeroed struct being a valid empty state). The `Vec` is
+/// never grown afterwards, so `as_mut_ptr()` is the same address for the whole
+/// aggregation, which is the OTHER half of the contract.
+#[derive(Default)]
+pub struct AggMem {
+    buf: Vec<u8>,
+}
+
+impl AggMem {
+    /// sqlite semantics: `n > 0` allocates-and-zeroes on the first call and
+    /// returns the SAME pointer on every later call of this aggregation;
+    /// `n <= 0` never allocates — it returns the existing buffer, or NULL if
+    /// there is none (how `xFinal` detects a group that was never stepped).
+    fn context(&mut self, n: c_int) -> *mut c_void {
+        if self.buf.is_empty() {
+            if n <= 0 {
+                return std::ptr::null_mut();
+            }
+            self.buf = vec![0u8; n as usize];
+        }
+        self.buf.as_mut_ptr() as *mut c_void
+    }
+}
+
 /// The result/error cell a host UDF writes through `sqlite3_result_*`, plus the
-/// `pApp` returned by `sqlite3_user_data`.
+/// `pApp` returned by `sqlite3_user_data` and (for an aggregate) the
+/// aggregation's [`AggMem`].
 pub struct SqliteContext {
     result: Value,
     /// `Some((code, message))` once `sqlite3_result_error[_code]` was called.
     error: Option<(c_int, String)>,
     p_app: *mut c_void,
+    /// The aggregation's context memory, or NULL for a scalar call — where
+    /// `sqlite3_aggregate_context` correctly returns NULL, as sqlite does when
+    /// it is misused outside an aggregate.
+    agg: *mut AggMem,
 }
 
 impl SqliteContext {
@@ -99,15 +140,31 @@ impl SqliteContext {
     pub fn p_app(&self) -> *mut c_void {
         self.p_app
     }
+    /// `sqlite3_aggregate_context(ctx, nBytes)`.
+    ///
+    /// # Safety
+    /// Only valid while the [`CAggState`] that lent `agg` is alive — i.e. inside
+    /// the `xStep`/`xFinal` call this context was built for, which is the only
+    /// window a C callback ever holds the pointer.
+    pub unsafe fn aggregate_context(&mut self, n: c_int) -> *mut c_void {
+        match self.agg.is_null() {
+            true => std::ptr::null_mut(),
+            false => (*self.agg).context(n),
+        }
+    }
 }
 
-/// A registered scalar UDF's identity + teardown state, tracked on the
-/// connection so it can invoke the caller's `xDestroy(pApp)` when the entry is
-/// replaced, deleted, or the connection closes (so CPython doesn't leak the
-/// wrapped callable).
+/// A registered UDF's identity + teardown state, tracked on the connection so it
+/// can invoke the caller's `xDestroy(pApp)` when the entry is replaced, deleted,
+/// or the connection closes (so CPython doesn't leak the wrapped callable).
 pub struct HostFn {
     pub name: String,
     pub n_arg: i32,
+    /// `true` for an `xStep`/`xFinal` AGGREGATE registration. Scalars and
+    /// aggregates live in SEPARATE facade registries, so removing an entry has
+    /// to know which one it came from — getting this wrong would leave a stale
+    /// registration behind under the same `(name, n_arg)`.
+    pub aggregate: bool,
     pub x_destroy: *mut c_void,
     pub p_app: *mut c_void,
 }
@@ -141,6 +198,9 @@ pub fn make_scalar_closure(
             result: Value::Null,
             error: None,
             p_app: ptrs.p_app(),
+            // A scalar has no aggregation, so `sqlite3_aggregate_context` in a
+            // scalar callback returns NULL — sqlite's answer for that misuse.
+            agg: std::ptr::null_mut(),
         };
         // SAFETY: `argv` points into `values`, both live through the call; `ctx`
         // is a valid, owned cell. The callback writes only through the shim
@@ -159,6 +219,120 @@ pub fn make_scalar_closure(
             Some((_, msg)) => Err(DbError::Unsupported(format!("user function raised: {msg}"))),
             None => Ok(ctx.result),
         }
+    }
+}
+
+// ---- aggregates (design/DESIGN-UDF.md stage 2) -----------------------------
+
+/// The C aggregate step signature — identical to [`XFunc`]'s; sqlite reuses
+/// `void(*)(sqlite3_context*, int, sqlite3_value**)` for `xStep`.
+pub type XStep = XFunc;
+/// The C aggregate finalizer, `void(*)(sqlite3_context*)`.
+pub type XFinal = unsafe extern "C" fn(*mut SqliteContext);
+
+/// The `xStep`/`xFinal`/`pApp` triple a `create_function` aggregate
+/// registration carries. `Send`/`Sync` for the same reason [`XFuncPtrs`] is: a
+/// sqlite connection is single-threaded per the C-API contract, and the
+/// callbacks only ever run on the thread executing the statement.
+#[derive(Clone, Copy)]
+struct XAggPtrs {
+    x_step: XStep,
+    x_final: XFinal,
+    p_app: *mut c_void,
+}
+unsafe impl Send for XAggPtrs {}
+unsafe impl Sync for XAggPtrs {}
+
+impl XAggPtrs {
+    // Methods, not field reads, for the edition-2021 capture-by-field reason
+    // spelled out on `XFuncPtrs::invoke`.
+    unsafe fn step(&self, ctx: *mut SqliteContext, argc: c_int, argv: *mut *mut SqliteValue) {
+        (self.x_step)(ctx, argc, argv)
+    }
+    unsafe fn finalize(&self, ctx: *mut SqliteContext) {
+        (self.x_final)(ctx)
+    }
+    fn p_app(&self) -> *mut c_void {
+        self.p_app
+    }
+}
+
+/// One group's accumulation over a C aggregate: the callbacks, plus the
+/// aggregation's `sqlite3_aggregate_context` memory.
+pub struct CAggState {
+    ptrs: XAggPtrs,
+    mem: AggMem,
+}
+
+impl CAggState {
+    /// Build the [`SqliteContext`] a callback sees. Borrowing `mem` MUTABLY here
+    /// is what makes the aggregate-context pointer the same across steps.
+    fn ctx(&mut self) -> SqliteContext {
+        SqliteContext {
+            result: Value::Null,
+            error: None,
+            p_app: self.ptrs.p_app(),
+            agg: &mut self.mem as *mut AggMem,
+        }
+    }
+}
+
+impl mpedb::HostAggState for CAggState {
+    fn step(&mut self, args: &[Value]) -> DbResult<()> {
+        let mut values: Vec<SqliteValue> = args.iter().cloned().map(SqliteValue::new).collect();
+        let mut argv: Vec<*mut SqliteValue> =
+            values.iter_mut().map(|v| v as *mut SqliteValue).collect();
+        let ptrs = self.ptrs;
+        let mut ctx = self.ctx();
+        // SAFETY: `argv` points into `values` and `ctx.agg` at `self.mem`; all
+        // three outlive the call. The callback writes only through the shim
+        // result/value/aggregate-context accessors, which operate on them.
+        unsafe {
+            ptrs.step(
+                &mut ctx as *mut SqliteContext,
+                args.len() as c_int,
+                argv.as_mut_ptr(),
+            );
+        }
+        drop(argv);
+        drop(values);
+        match ctx.error {
+            Some((_, msg)) => Err(DbError::Unsupported(format!(
+                "user aggregate raised: {msg}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn finish(mut self: Box<Self>) -> DbResult<Value> {
+        let ptrs = self.ptrs;
+        let mut ctx = self.ctx();
+        // SAFETY: as `step`. `xFinal` runs exactly once — this method consumes
+        // the state — and the aggregate context is freed when `self` drops on
+        // return, which is sqlite's "freed after xFinal" contract.
+        unsafe {
+            ptrs.finalize(&mut ctx as *mut SqliteContext);
+        }
+        match ctx.error {
+            Some((_, msg)) => Err(DbError::Unsupported(format!(
+                "user aggregate raised: {msg}"
+            ))),
+            None => Ok(ctx.result),
+        }
+    }
+}
+
+/// Build the per-group factory the facade registers for an `xStep`/`xFinal`
+/// pair: each call mints a fresh [`CAggState`] with its own zero-length (not yet
+/// allocated) aggregate context.
+pub fn make_agg_factory(
+    x_step: XStep,
+    x_final: XFinal,
+    p_app: *mut c_void,
+) -> impl Fn() -> Box<dyn mpedb::HostAggState> + Send + Sync + 'static {
+    let ptrs = XAggPtrs { x_step, x_final, p_app };
+    move || -> Box<dyn mpedb::HostAggState> {
+        Box::new(CAggState { ptrs, mem: AggMem::default() })
     }
 }
 

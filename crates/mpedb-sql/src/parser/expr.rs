@@ -497,6 +497,43 @@ impl<'a> Parser<'a> {
 
     /// `name(args…)`, split out of `primary` (see [`Self::between_suffix`]).
     #[inline(never)]
+    /// Is `name` a HOST-registered aggregate (design/DESIGN-UDF.md stage 2)?
+    ///
+    /// Name-only, because the grammar branch is chosen before the arguments are
+    /// read. **The supported call shape is exactly one argument**: the AST's
+    /// `Expr::Agg` carries a single optional argument (`count(*)`'s `None` or one
+    /// expression), so a registration with any other arity is refused HERE, with
+    /// a message naming the arity, rather than silently binding a call the
+    /// executor could not feed. A `-1` (variadic) registration is accepted and
+    /// called with its one argument.
+    fn host_agg_target(&mut self, name: &str) -> Option<mpedb_types::AggTarget> {
+        let lname = name.to_ascii_lowercase();
+        self.host_aggs
+            .iter()
+            .any(|(n, _)| *n == lname)
+            .then_some(mpedb_types::AggTarget::Host(lname))
+    }
+
+    /// Post-parse arity gate for a host aggregate: the call shape is fixed at one
+    /// argument (see [`host_agg_target`](Self::host_agg_target)), so a
+    /// registration for a different arity cannot be called at all.
+    fn check_host_agg_arity(&self, name: &str, argc: usize) -> Result<()> {
+        if self.host_aggs.iter().any(|(n, a)| n == name && (*a == argc as i32 || *a == -1)) {
+            return Ok(());
+        }
+        let arities: Vec<String> = self
+            .host_aggs
+            .iter()
+            .filter(|(n, _)| n == name)
+            .map(|(_, a)| a.to_string())
+            .collect();
+        Err(self.err_here(format!(
+            "{name}() is a user-defined aggregate registered for {} argument(s); \
+             only a single-argument call is supported",
+            arities.join("/")
+        )))
+    }
+
     fn call_suffix(&mut self, name: String) -> Result<Expr> {
         self.expect(&Tok::LParen, "`(`")?;
         // Ranking window functions (`row_number`/`rank`/`dense_rank`) take no
@@ -528,15 +565,27 @@ impl<'a> Parser<'a> {
         // `count(*)` has an argument that is not an expression. `*` there is not
         // "all columns" — it means "the row itself", which is the whole reason
         // count(*) and count(x) differ on NULLs.
-        if let Some(f) = agg_fn(&name) {
+        //
+        // A HOST aggregate (`xStep`/`xFinal`, design/DESIGN-UDF.md stage 2) joins
+        // the built-ins here rather than falling through to `Expr::Func`: taking
+        // the aggregate branch is what gives it DISTINCT, `FILTER (WHERE …)`,
+        // and — decisively — an `Expr::Agg` node, which is what routes the whole
+        // SELECT to the aggregate planner. A built-in name always wins, so no
+        // registration can redefine `count`.
+        let target = match agg_fn(&name) {
+            Some(f) => Some(mpedb_types::AggTarget::Native(f)),
+            None => self.host_agg_target(&name),
+        };
+        if let Some(target) = target {
+            let f_native = target.native();
             let (arg, distinct): (Option<Box<Expr>>, bool) = if self.eat(&Tok::Star) {
                 self.expect(&Tok::RParen, "`)` closing count(*)")?;
-                if f != mpedb_types::AggFn::Count {
+                if f_native != Some(mpedb_types::AggFn::Count) {
                     return Err(self.err_here(format!(
                         "{}(*) is not valid — only count(*) takes the row itself; \
                          {}() needs a value",
-                        f.name(),
-                        f.name()
+                        target.name(),
+                        target.name()
                     )));
                 }
                 (None, false)
@@ -552,16 +601,22 @@ impl<'a> Parser<'a> {
                     // apply to inside the parens.
                     return Err(self.err_here(format!(
                         "{}(DISTINCT *) is not valid — use SELECT DISTINCT, or name a column",
-                        f.name()
+                        target.name()
                     )));
                 }
                 let arg = self.expr()?;
                 if self.peek() == Some(&Tok::Comma) {
-                    return Err(self.err_here(format!("{}() takes exactly one argument", f.name())));
+                    return Err(self.err_here(format!(
+                        "{}() takes exactly one argument",
+                        target.name()
+                    )));
                 }
                 self.expect(&Tok::RParen, "`)` closing the argument list")?;
                 (Some(Box::new(arg)), distinct)
             };
+            if let Some(hname) = target.host() {
+                self.check_host_agg_arity(hname, arg.is_some() as usize)?;
+            }
             // An OPTIONAL trailing `FILTER (WHERE <cond>)` (sqlite 3.30+/PG):
             // the aggregate accumulates only the rows where `cond` is TRUE. In
             // the grammar FILTER precedes OVER. `FILTER` is NOT a reserved word,
@@ -590,6 +645,18 @@ impl<'a> Parser<'a> {
                         "FILTER (WHERE …) on a window aggregate (OVER …) is not supported",
                     ));
                 }
+                // A HOST aggregate has no window form: `xStep`/`xFinal` cannot be
+                // rewound over a moving frame, and sqlite itself requires the
+                // separate `create_window_function` (xValue/xInverse) for that —
+                // which the shim refuses. Refuse here rather than silently
+                // computing a whole-partition value.
+                let Some(f) = f_native else {
+                    return Err(self.err_here(format!(
+                        "{}() is a user-defined aggregate and cannot be used with OVER \
+                         (user-defined window functions are not supported)",
+                        target.name()
+                    )));
+                };
                 let spec = self.window_over()?;
                 return Ok(Expr::Window {
                     func: WindowFunc::Agg(f),
@@ -599,7 +666,7 @@ impl<'a> Parser<'a> {
                     spec,
                 });
             }
-            return Ok(Expr::Agg(f, arg, distinct, filter));
+            return Ok(Expr::Agg(target, arg, distinct, filter));
         }
         let mut args = Vec::new();
         if self.peek() != Some(&Tok::RParen) {

@@ -73,7 +73,9 @@ pub fn compile_trigger_body(
     }
     let mut out = Vec::with_capacity(stmt_srcs.len());
     for stmt_src in &stmt_srcs {
-        let (mut stmt, is_explain, n_params, ctes) = parser::parse_statement_ctes(stmt_src)?;
+        // No host UDFs in a trigger body: it is compiled once and stored in the
+        // catalog, so it must not depend on one connection's registrations.
+        let (mut stmt, is_explain, n_params, ctes) = parser::parse_statement_ctes(stmt_src, &[])?;
         if is_explain {
             return Err(trg_err("EXPLAIN is not allowed in a trigger body"));
         }

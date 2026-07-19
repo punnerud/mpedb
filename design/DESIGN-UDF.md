@@ -13,6 +13,8 @@ callbacks" plan: a real sqlite drop-in needs the callback path. Approved.
 **Stage 1 scope: SCALAR functions only.** Aggregate UDFs (`xStep`/`xFinal`) and
 `create_collation` are later stages; register calls for them refuse cleanly
 (invoking the caller's `xDestroy(pApp)` so CPython doesn't leak the callable).
+Stage 2 (aggregates) has since shipped — see §Stage 2 at the end; the sections
+below describe the scalar path, which stage 2 reuses wholesale.
 
 ## The four layers
 
@@ -83,6 +85,78 @@ PAST `register_functions` and create its tables. Track Django progress in
 `C-API-COMPAT.md`; each subsequent blocker becomes the next item.
 
 ## Stages
-1. **Scalar dispatch** (this doc) → Django connects, migrates, basic ORM.
-2. **Aggregate UDFs** (`xStep`/`xFinal` + `aggregate_context`).
+1. **Scalar dispatch** (this doc) → Django connects, migrates, basic ORM. DONE.
+2. **Aggregate UDFs** (`xStep`/`xFinal` + `aggregate_context`). DONE — §Stage 2.
 3. **`create_collation`** (custom collations).
+
+## Stage 2 — AGGREGATE UDFs (`xStep`/`xFinal`)
+
+Same four layers, one extra idea: an aggregate has STATE, and the state is
+per-GROUP.
+
+### 1. Shim
+`create_function_v2` with `xFunc == NULL` and BOTH `xStep`/`xFinal` set registers
+an aggregate; half a pair is `SQLITE_MISUSE`; all-NULL deletes the `(name,nArg)`
+entry from both registries. The tracked `HostFn` carries an `aggregate` flag so a
+replace/close removes the entry from the registry it actually went into.
+
+`sqlite3_aggregate_context(ctx, nBytes)` is real. The memory lives in the
+per-group accumulator (`udf::AggMem`): the first call with `nBytes > 0`
+allocates that many ZEROED bytes; every later call in the SAME aggregation —
+`xFinal` included — returns the SAME pointer; `nBytes <= 0` never allocates and
+returns NULL when nothing was allocated, which is how `xFinal` recognizes an
+empty group. The buffer is freed when `xFinal` consumes the accumulator. In a
+SCALAR callback the context has no aggregation and the call returns NULL, as
+sqlite does for that misuse.
+
+### 2. Facade
+`register_host_aggregate(name, n_arg, factory)` / `unregister_host_aggregate`,
+in a registry beside the scalars. The value is a FACTORY (`Fn() -> Box<dyn
+HostAggState>`), called once per group — two groups never share state. The
+executor gets a `HostAggs` resolver (the aggregate twin of `HostFns`).
+
+### 3. Parser + binder + plan
+Unlike a scalar, a host aggregate is resolved in the **parser**: `myagg(DISTINCT
+x) FILTER (WHERE …)` is aggregate GRAMMAR and the branch must be taken before the
+argument list is read. `HostUdfSet` therefore carries the aggregate `(name,
+n_arg)` pairs too, and the parser emits `ast::Expr::Agg(AggTarget::Host(name),
+…)` — which makes `contains_agg` route the whole SELECT to the aggregate planner
+with no other change. A built-in name always wins, so `count` can't be redefined.
+
+`AggFn` stays a closed enum; the CALL carries `AggTarget = Native(AggFn) |
+Host(String)` (in `mpedb-types`, beside `AggFn`). Every rule that is about a
+specific built-in — `count(*)`'s argument shape, the min/max bare-column witness,
+the never-NULL typing — goes through `AggTarget::native()`, so a host aggregate
+can never be mistaken for one. Its result type is `ColumnType::Any`, exactly as a
+host scalar's is.
+
+**Call shape: exactly one argument.** `Expr::Agg` carries a single optional
+argument, so a registration for any other arity is refused at the call site with
+a message naming the arity (registration itself always succeeds — Django
+registers in bulk and must not fail there). `-1` (variadic) is accepted and
+called with its one argument. Windowing a host aggregate (`OVER`) is refused:
+that needs `xValue`/`xInverse`, i.e. `create_window_function`, which the shim
+refuses.
+
+**PLAN_FORMAT 39 → 40.** Each `AggCall`'s leading function byte becomes a
+discriminated tag: 1..=7 is the `AggFn` byte, unchanged, and **0** — a value
+`AggFn::from_tag` always rejected — introduces a host aggregate followed by its
+length-prefixed name. Native aggregate plans encode byte-for-byte as in 39.
+`CompiledPlan::contains_host_call` covers `AggTarget::Host`, so a plan naming a
+host aggregate is kept out of the shared `plan/<hash>` registry by the same gate
+as a `HostCall`.
+
+### 4. Exec
+`exec/aggregate.rs` accumulates through an `Acc` wrapper: a built-in `Accum`, or
+a host state. Per group the host state is minted on first row, stepped once per
+surviving row — after WHERE, the policy predicate, `FILTER (WHERE …)` and the
+DISTINCT dedup, identically to a built-in — and finished at the group's end. An
+EMPTY group still finishes a FRESH state, so `xFinal` runs on a never-stepped
+(NULL) aggregate context: Django's `STDDEV_POP` over no rows is NULL.
+
+**NULL is the one place the two differ, deliberately.** A built-in SKIPS NULL
+arguments; sqlite hands a USER aggregate every row, NULLs included, and lets
+`xStep` decide — which is what Django's accumulators expect.
+
+Scope is the READ path, as in stage 1: a host aggregate in a write statement
+returns a clean "not in scope" error.

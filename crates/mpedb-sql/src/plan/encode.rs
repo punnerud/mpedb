@@ -406,7 +406,17 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
                     }
                     w_u16(buf, a.aggs.len() as u16);
                     for c in &a.aggs {
-                        buf.push(c.func as u8);
+                        // Format 40: tag 1..=7 is the `AggFn` byte, unchanged;
+                        // tag 0 (never a valid `AggFn`) introduces a HOST
+                        // aggregate followed by its name. Native plans encode
+                        // exactly as in format 39.
+                        match &c.func {
+                            AggTarget::Native(f) => buf.push(*f as u8),
+                            AggTarget::Host(name) => {
+                                buf.push(0);
+                                w_str(buf, name);
+                            }
+                        }
                         buf.push(c.distinct as u8);
                         match &c.arg {
                             None => buf.push(0),

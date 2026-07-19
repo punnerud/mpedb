@@ -288,7 +288,7 @@ impl Lift<'_> {
                 },
             ),
             E::Agg(f, arg, d, filter) => E::Agg(
-                *f,
+                f.clone(),
                 match arg {
                     Some(a) => Some(Box::new(self.rewrite(a)?)),
                     None => None,
@@ -760,7 +760,7 @@ impl<'a> Correlate<'a, '_> {
                 },
             ),
             E::Agg(f, arg, d, filter) => E::Agg(
-                *f,
+                f.clone(),
                 match arg {
                     Some(a) => Some(Box::new(self.rewrite(a)?)),
                     None => None,

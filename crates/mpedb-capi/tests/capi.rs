@@ -794,21 +794,22 @@ fn create_function_scalar_dispatch() {
         assert_ne!(sqlite3_step(b), SQLITE_ROW, "a raising UDF must not yield a row");
         sqlite3_finalize(b);
 
-        // 7. An AGGREGATE registration refuses cleanly (stage 1 = scalar only).
+        // 7. HALF an aggregate (xStep without xFinal) is a misuse, not a
+        //    registration — sqlite requires the pair.
         assert_eq!(
             sqlite3_create_function_v2(
                 db,
-                cs("myagg").as_ptr(),
+                cs("halfagg").as_ptr(),
                 1,
                 SQLITE_UTF8,
                 ptr::null_mut(),
                 ptr::null_mut(),
-                fnptr(udf_plus1), // xStep present => aggregate
-                fnptr(udf_plus1), // xFinal present
+                fnptr(udf_plus1), // xStep present
+                ptr::null_mut(),  // xFinal missing
                 ptr::null_mut(),
             ),
-            SQLITE_ERROR,
-            "aggregate UDFs are stage 2 and must refuse"
+            SQLITE_MISUSE,
+            "an aggregate needs both xStep and xFinal"
         );
 
         // 8. xFunc == NULL deletes the registration: the name is unknown again.
@@ -832,6 +833,167 @@ fn create_function_scalar_dispatch() {
             sqlite3_prepare_v2(db, gs.as_ptr(), -1, &mut g, ptr::null_mut()),
             SQLITE_OK,
             "a deleted function must be unknown again"
+        );
+
+        sqlite3_close(db);
+    }
+}
+
+// ---- host AGGREGATE UDFs (design/DESIGN-UDF.md stage 2) --------------------
+
+/// The struct `mysum`'s `xStep`/`xFinal` keep in the aggregate context. Zeroed
+/// by `sqlite3_aggregate_context` on first use, which is exactly what makes
+/// `{0, 0}` a valid empty accumulator — sqlite's contract, and what Django's
+/// aggregates assume.
+#[repr(C)]
+#[derive(Debug)]
+struct MySumCtx {
+    total: i64,
+    rows: i64,
+}
+
+/// The `pApp` every `mysum` registration carries: a per-row bump the callbacks
+/// read back through `sqlite3_user_data`, so a broken `user_data` shows up as a
+/// wrong SUM rather than passing silently.
+static MYSUM_BUMP: i64 = 100;
+
+fn mysum_app() -> *mut c_void {
+    &MYSUM_BUMP as *const i64 as *mut c_void
+}
+
+unsafe extern "C" fn agg_step(ctx: *mut c_void, argc: c_int, argv: *mut *mut c_void) {
+    assert_eq!(argc, 1);
+    let app = sqlite3_user_data(ctx);
+    assert!(!app.is_null(), "sqlite3_user_data must reach xStep");
+    let bump = *(app as *const i64);
+    let p = sqlite3_aggregate_context(ctx, std::mem::size_of::<MySumCtx>() as c_int)
+        as *mut MySumCtx;
+    assert!(!p.is_null(), "aggregate_context(n>0) must allocate");
+    // The SAME pointer on every step of this aggregation, and zeroed on the
+    // first — both asserted implicitly by the totals the test checks.
+    (*p).total += sqlite3_value_int64(*argv) + bump;
+    (*p).rows += 1;
+}
+
+unsafe extern "C" fn agg_final(ctx: *mut c_void) {
+    let app = sqlite3_user_data(ctx);
+    assert!(!app.is_null(), "sqlite3_user_data must reach xFinal");
+    // n <= 0: never allocate. NULL here means the group was never stepped, which
+    // is how sqlite (and Django) recognize an empty aggregation.
+    let p = sqlite3_aggregate_context(ctx, 0) as *mut MySumCtx;
+    if p.is_null() {
+        sqlite3_result_null(ctx);
+        return;
+    }
+    sqlite3_result_int64(ctx, (*p).total * 10 + (*p).rows);
+}
+
+fn fnptr1(f: unsafe extern "C" fn(*mut c_void)) -> *mut c_void {
+    f as *const () as *mut c_void
+}
+
+/// A C aggregate registered through `sqlite3_create_function_v2`: bare, grouped,
+/// over an empty set, and with `pApp` visible in both callbacks.
+#[test]
+fn create_function_aggregate_dispatch() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(
+            exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, grp INTEGER)"),
+            SQLITE_OK
+        );
+        assert_eq!(
+            exec(db, "INSERT INTO t (id, grp) VALUES (1,0),(2,1),(3,0),(4,1)"),
+            SQLITE_OK
+        );
+
+        // Unregistered → prepare-time error, not a silent NULL.
+        let mut bad_st: *mut Stmt = ptr::null_mut();
+        let bad = cs("SELECT mysum(id) FROM t");
+        assert_ne!(
+            sqlite3_prepare_v2(db, bad.as_ptr(), -1, &mut bad_st, ptr::null_mut()),
+            SQLITE_OK,
+            "an unregistered aggregate must not prepare"
+        );
+
+        assert_eq!(
+            sqlite3_create_function_v2(
+                db,
+                cs("mysum").as_ptr(),
+                1,
+                SQLITE_UTF8,
+                mysum_app(),
+                ptr::null_mut(), // xFunc NULL => aggregate
+                fnptr(agg_step),
+                fnptr1(agg_final),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK,
+            "an aggregate registration must succeed (stage 2)"
+        );
+
+        // 1. Bare over the whole table: (1+2+3+4) + 4*100 = 410, 4 rows.
+        assert_eq!(scalar_count(db, "SELECT mysum(id) FROM t"), 410 * 10 + 4);
+
+        // 2. GROUP BY: grp 0 = {1,3} → 204, 2 rows; grp 1 = {2,4} → 206, 2 rows.
+        //    Each group gets its OWN aggregate context — a shared one would
+        //    show up here as the whole-table total.
+        let mut q: *mut Stmt = ptr::null_mut();
+        let qs = cs("SELECT mysum(id) FROM t GROUP BY grp ORDER BY grp");
+        assert_eq!(
+            sqlite3_prepare_v2(db, qs.as_ptr(), -1, &mut q, ptr::null_mut()),
+            SQLITE_OK
+        );
+        let mut got = Vec::new();
+        while sqlite3_step(q) == SQLITE_ROW {
+            got.push(sqlite3_column_int64(q, 0));
+        }
+        sqlite3_finalize(q);
+        assert_eq!(got, vec![204 * 10 + 2, 206 * 10 + 2]);
+
+        // 3. An EMPTY set still yields ONE row, and `xFinal` on a never-stepped
+        //    context returns NULL (Django's STDDEV of no rows).
+        let mut e: *mut Stmt = ptr::null_mut();
+        let es = cs("SELECT mysum(id) FROM t WHERE id > 100");
+        assert_eq!(
+            sqlite3_prepare_v2(db, es.as_ptr(), -1, &mut e, ptr::null_mut()),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_step(e), SQLITE_ROW, "an empty aggregation still yields a row");
+        assert_eq!(sqlite3_column_type(e, 0), SQLITE_NULL);
+        assert_ne!(sqlite3_step(e), SQLITE_ROW, "exactly one row");
+        sqlite3_finalize(e);
+
+        // 4. FILTER (WHERE …) narrows a host aggregate exactly as a built-in:
+        //    {3,4} → 7 + 200 = 207, 2 rows.
+        assert_eq!(
+            scalar_count(db, "SELECT mysum(id) FILTER (WHERE id > 2) FROM t"),
+            207 * 10 + 2
+        );
+
+        // 5. Deleting the registration (all callbacks NULL) makes the name
+        //    unknown again — the aggregate registry is cleared, not just the
+        //    scalar one.
+        assert_eq!(
+            sqlite3_create_function_v2(
+                db,
+                cs("mysum").as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+        let mut g: *mut Stmt = ptr::null_mut();
+        let gs = cs("SELECT mysum(id) FROM t");
+        assert_ne!(
+            sqlite3_prepare_v2(db, gs.as_ptr(), -1, &mut g, ptr::null_mut()),
+            SQLITE_OK,
+            "a deleted aggregate must be unknown again"
         );
 
         sqlite3_close(db);
