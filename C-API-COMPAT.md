@@ -18,7 +18,12 @@ clear error). Result-code **integers match sqlite exactly** (`SQLITE_OK=0`,
 sqlite's C reference lists ~300 functions and ~250 constants. This shim exports
 the **~50 the drop-in consumer path actually calls** — Python's `sqlite3`, language
 bindings, common tools — validated end-to-end by a DB-API 2.0 battery that matches
-stock sqlite **23/23**. It does *not* enumerate every symbol, because most are
+stock sqlite **23/23**, and measured against **CPython's own `test_sqlite3`
+suite** (the authoritative consumer test of that surface: 344 of the 461
+tests stock passes — see the section at the end; the suite hammers contract
+details — destructor rules, trace, limits, error codes — that "the ~50
+functions exist" does not capture, so it is the scope's honest yardstick).
+It does *not* enumerate every symbol, because most are
 deliberate non-goals for an in-process, rigid-schema engine (each a clean refusal
 or safe no-op, never a wrong answer):
 
@@ -317,7 +322,7 @@ pre-reserves any size up to 16 TiB, so this is no longer a blocker.)
 ## Verification
 
 - `cargo test -p mpedb-capi` (build/test **standalone** — the crate is excluded
-  from the unified workspace build because it exports `sqlite3_*`) — 15 Rust FFI
+  from the unified workspace build because it exports `sqlite3_*`) — 40 Rust FFI
   tests (open/create/prepare/bind/step/column/exec/errmsg/constraint/
   transactions/persistence/tail/`last_insert_rowid`/`PRAGMA table_info`/
   `sqlite_master`/named-params-by-index/named+positional-mixed) + `sql`-scanner
@@ -1168,3 +1173,144 @@ involvement. What that changed, measured:
 * Zero wrong answers is VIOLATED for the first time since W1/W2: W3's two
   FAILs, introduced by #74 item 3. Everything else refuses.
 * Still `--parallel=1`; no concurrency or multi-process behaviour measured.
+
+## CPython's own `test_sqlite3` — FIRST EVER RUN (2026-07-19)
+
+The stdlib's own suite — the authoritative consumer test of the `sqlite3`
+module, exercising the exact C-API surface this shim implements — had never
+been pointed at mpedb. Route: the distro strips the `test` package, so
+`Lib/test/` was fetched from CPython's GitHub at the EXACT tag of the local
+interpreter (v3.12.3) into `/mnt/xfs/cpython-tests/lib` and run with the
+system python: `PYTHONPATH=… python3 -m test test_sqlite3`, per-test results
+diffed via `--junit-xml`. Engine = `main` @ `acdf180` + the three capi commits
+below.
+
+### ⚠️ Silent divergences (no error, different behavior) — none in SQL answers, one in metadata
+
+No shim-only failure was a wrong SQL answer: every diverging test either
+raises an error, or asserts on error/trace/metadata behavior. ONE family is a
+silent behavioral divergence a consumer can feel without an error:
+
+**`column_decltype` is canonicalized, so `PARSE_DECLTYPES` converters
+silently do not fire for non-canonical declared types.** mpedb stores the
+canonical type (`REAL`, `BOOLEAN`), not the verbatim declared text, so a
+column declared `f float` reports decltype `REAL` — CPython looks up the
+converter under `FLOAT`, finds none, and hands back the RAW value with no
+error. 6 tests (`DeclTypesTests`: bool/float/foo/number1/number2/cblob):
+
+```python
+sqlite3.register_converter("FLOAT", lambda x: 47.2)
+con = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES)
+con.execute("create table t(f float)"); con.execute("insert into t values (3.14)")
+con.execute("select f from t").fetchone()   # stock: (47.2,)   mpedb: (3.14,)  — silently
+```
+
+Closing it needs the schema to carry the verbatim declared-type text
+(engine-side; the shim's decltype is derived from `ColumnType`). Canonical
+types (`INTEGER`/`TEXT`/`REAL`/`BLOB`/`TIMESTAMP`/`BOOLEAN` spelled that way)
+convert identically to stock — Django's `PARSE_DECLTYPES` use is unaffected
+(measured byte-identical in the Django runs above).
+
+### The crash that gated the whole suite (FIXED)
+
+The first run **segfaulted CPython** at `test_hooks.CollationTests`: the
+`sqlite3_create_collation_v2` refusal stub invoked the caller's
+`xDestroy(pApp)` — but sqlite's documented contract (unlike
+`create_function_v2`!) is that the destructor is NOT called when
+`create_collation_v2` fails, and CPython therefore frees the context itself
+on a non-OK return. The stub's call made that a double-free; the corrupted
+heap took down the interpreter ~200 tests later. The window-function stub's
+destructor call is CORRECT (sqlite does invoke it on failure; CPython relies
+on that by not freeing). Fixed + FFI-pinned
+(`collation_refusal_leaves_destructor_alone_window_refusal_runs_it`).
+
+### The two arms
+
+| | run | pass | fail/error | skip |
+|---|---|---|---|---|
+| stock libsqlite3 3.45.1 (baseline) | 466 | **461** | 0 | 5 |
+| shim, first non-crashing run | 466 | 283 | 178 | 5 |
+| **shim, after the 3 commits** | 466 | **344** | **117** | 5 |
+
+The 117 counts one test the run must EXCLUDE because it deadlocks (worse
+than failing — see engine gap E1). The 5 baseline skips are sqlite-version
+gates, identical in both arms. 344/461 = 74.6 % of the baseline-passing
+suite; the DB-API battery (23/23) and Django numbers elsewhere in this file
+measure breadth this suite does not, and vice versa — this suite is the one
+that hammers the API's CONTRACTS (destructor rules, trace, limits, error
+codes/messages, blob/backup surfaces).
+
+### What the shim fixed (the +61 after the crash fix, grouped)
+
+* **`SQLITE_TRACE_STMT` is REAL** (~30 tests): `sqlite3_trace_v2` dispatches
+  as a statement begins running, on the step path AND the exec path
+  (CPython's legacy-autocommit COMMIT goes through exec); the callback's P
+  argument is the statement handle (CPython re-enters `expanded_sql` /
+  `db_handle` on it — fired with no Rust borrows live). CPython's whole
+  isolation-level/autocommit family verifies THROUGH the trace, so a no-op
+  trace failed all of it.
+* **`sqlite3_progress_handler` fires** (4): once per statement execution
+  (mpedb has no VM opcode stream to count N against); non-zero return —
+  including CPython's -1 on a raising handler — interrupts.
+* **Stub honesty — refusals must live ON the handle** (converted 46 bare
+  `SystemError`s into proper exceptions): `blob_open`/`backup_init` (on the
+  DESTINATION, sqlite's contract)/`deserialize` now set the error state the
+  consumer reads. Same class: `db_config`'s toggle ops write 0 (the literal
+  truth) to the out-pointer CPython was reading uninitialized.
+* **`sqlite3_limit` is real storage** (~6): sqlite's defaults, prior-value
+  return, -1 on a bad category; `VARIABLE_NUMBER` enforced at prepare
+  ("too many SQL variables"), `LENGTH` in `expanded_sql` (NULL past it);
+  `SQL_LENGTH` is enforced by CPython itself reading the stored value.
+* **UDF error code/text passthrough** (~7): `sqlite3_result_error_nomem/
+  _toobig/_error` now surface their CODE (→ `MemoryError`/`DataError`) and
+  exact TEXT instead of the engine's opaque `unsupported: user function
+  raised: …` wrapper. Plus: NaN in `bind_double`/`result_double` stores NULL
+  (sqlite has no NaN); `create_function` refuses nArg outside -1..=127.
+* **Open-path correctness** (~5): a non-UTF-8 filename is an OS byte path
+  (it was silently opening an EPHEMERAL database instead!); `file:` URI
+  paths percent-decode byte-wise; `mode=ro` never creates and refuses writes
+  with `SQLITE_READONLY`; CANTOPEN messages lead with sqlite's canonical
+  "unable to open database file".
+* **Leading comments + maintenance statements** (4): mpedb's parser does not
+  skip LEADING comments — the shim strips them (classification and the text
+  the engine sees), so `-- comment\nINSERT …` (CPython suite, iterdump
+  scripts) runs; `VACUUM`/`ANALYZE` are accepted as no-ops (freelist page
+  reuse, no planner statistics — genuinely nothing to do).
+* **Message shapes consumers grep** (2): constraint errors lead with
+  sqlite's "… constraint failed:"; the sibling-lock error (below) reads
+  "database is locked".
+
+### Remaining 117, grouped by root cause, ranked by tests blocked
+
+**Engine-side, recorded (the shim cannot fix these):**
+
+| # | Tests | Gap | Repro / note |
+|---|---|---|---|
+| E1 | **1 + HANGS the suite** | **Cross-process writer contention BLOCKS forever; `busy_timeout` cannot be honored.** `Database::begin()` has no non-blocking form (the engine HAS `try_begin_write` — the ring leader uses it — the facade doesn't expose it). sqlite with timeout=0 answers "database is locked" immediately; CPython's `MultiprocessTests.test_ctx_mgr_rollback_if_commit_failed` RELIES on that BUSY to sequence two processes, so under the shim parent and child deadlock (child holds a txn waiting on stdin; parent's INSERT blocks in the engine). A hang is worse than any failure — this is the top engine item. | run the test; or: process A `BEGIN; INSERT…`, process B `INSERT` with timeout 0 → sqlite BUSY, mpedb blocks |
+| E2 | 38 | **Incremental blob I/O** (`sqlite3_blob_*` = mpedb #43). All of `BlobTests`; refusal is honest OperationalError now. | `con.blobopen("t", "b", 1)` |
+| E3 | 14 | **Declared-type family.** (a) 6 × decltype-canonicalization (the ⚠️ divergence above — needs verbatim decl text in the schema); (b) 8 × bind rigidity where sqlite coerces: text→`timestamp` (CPython's own adapters bind datetime as an ISO STRING — `insert into t(x) values (?)` with `"2026-07-19 10:00:00"` into `x timestamp` is IntegrityError; stock stores it), int→`text`, blob→`text`. | `crates/…/scratchpad` repros in section text |
+| E4 | 9 | **Window functions** (`sqlite3_create_window_function`) — DESIGN-UDF stage 3b; clean refusal. | |
+| E5 | 8 | **Authorizer** (`sqlite3_set_authorizer` accepted, never invoked — would need compile-time callbacks). | |
+| E6 | 6 | **Custom collations** — DESIGN-UDF stage 3; clean refusal (and no longer a segfault). | `con.create_collation("x", f)` |
+| E7 | 6 | **Host AGGREGATES are single-argument** — the plan carries one arg per DESIGN-UDF stage 2; CPython registers 2-arg checktype aggregates. | `create_aggregate("f", 2, C)` then `select f(a, b) …` → "takes exactly one argument" |
+| E8 | 5 | **First-compile of a NEW statement text needs the writer lock** (shared plan-registry publication is a write), so a sibling connection's first-time SELECT while this thread's other connection holds a write txn answers BUSY (was: "internal error (bug in mpedb)"; the shim now maps it to "database is locked" + busy-retry). sqlite readers proceed. Fix = compile-local-without-publishing when the lock is unavailable (the host-fn plan path already knows how). | `con1: CREATE t; BEGIN; INSERT` then `con2: SELECT (new text)` — pre-warmed text works, first-compile errors |
+| E9 | 4 | **`ON CONFLICT` clause family**: `INSERT OR ROLLBACK` refused — the parser's own error message LISTS ROLLBACK as expected (`OR IGNORE` works), and the table-constraint form `unique(x) on conflict rollback` doesn't parse. | `INSERT OR ROLLBACK INTO t …` → "expected IGNORE, REPLACE, ABORT, FAIL, or ROLLBACK after OR" (sic) |
+| E10 | 5 | **iterdump surface**: 2 × AUTOINCREMENT (deliberate refusal), 1 × fts4 (deliberate — fts5 only), 1 × sqlite_master query form, 1 × un-root-caused "one statement at a time" in `test_table_dump`. | |
+| E11 | 3 | **`zeroblob()`** absent. | `select zeroblob(100)` |
+| E12 | 1+1+1+1 | **Parser one-offs**: `==` (sqlite's alias for `=`); unquoted identifier bytes ≥ 0x80 (`select 1 as \xff`; the QUOTED form works); bare `current_timestamp` keyword; partial index `CREATE INDEX … WHERE`. | `select 1 where 1 == 1` → "expected an expression" |
+| E13 | 1 | **Unquoted table names are case-SENSITIVE** (`CREATE TABLE t` then `INSERT INTO T` fails; sqlite matches case-insensitively). One test here, but any consumer can trip it. | |
+| E14 | 1 | FROM-less SELECT can't resolve its own output alias in WHERE (`select 1 as a where a=?`). | |
+
+**Deliberate refusals / documented divergences (win by refusing loudly):**
+backup (7 — `mpedb mirror` is the answer), serialize/deserialize (2),
+`db_config` toggles not stored-and-echoed (1, the D10/D11 stance),
+`SQLITE_LIMIT_FUNCTION_ARG` not enforced (1 — the shim can't count a
+function call's args without parsing).
+
+### Verification added
+
+9 new FFI tests in `tests/capi.rs` (now 40): the collation/window destructor
+contract, trace on step+exec (expanded), limits round-trip + enforcement,
+leading comments + VACUUM/ANALYZE, NaN→NULL, `mode=ro`, percent-decoded URI
+paths, sibling-connection BUSY + recovery after COMMIT, refusal-stub handle
+errors.
