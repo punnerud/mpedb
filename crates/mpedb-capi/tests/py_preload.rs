@@ -85,5 +85,8 @@ fn py_sqlite3_preload() {
     // The exact target output: `lastrowid` then the fetched row, then OK.
     assert!(stdout.contains('1'), "expected lastrowid 1 in output");
     assert!(stdout.contains("[(1, 'x')]"), "expected fetched row [(1, 'x')]");
+    // Host UDFs called with NO intervening commit() — CPython's implicit
+    // transaction (design/DESIGN-UDF.md §Write path).
+    assert!(stdout.contains("UDF-OK"), "expected the UDF-in-transaction check to pass");
     assert!(stdout.trim_end().ends_with("OK"), "expected final OK");
 }

@@ -1000,6 +1000,159 @@ fn create_function_aggregate_dispatch() {
     }
 }
 
+// ---- host UDFs on the WRITE path (design/DESIGN-UDF.md §Write path) -------
+
+/// The shape CPython's `sqlite3` produces: the first DML opens an implicit
+/// transaction, and every later statement — reads included — runs INSIDE it,
+/// with no intervening `commit()`. A UDF called there must resolve exactly as
+/// it does in autocommit; it used to fail with an internal error.
+#[test]
+fn udf_inside_an_open_transaction() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(
+            exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)"),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3_create_function_v2(
+                db,
+                cs("plus1").as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                fnptr(udf_plus1),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3_create_function_v2(
+                db,
+                cs("mysum").as_ptr(),
+                1,
+                SQLITE_UTF8,
+                mysum_app(),
+                ptr::null_mut(),
+                fnptr(agg_step),
+                fnptr1(agg_final),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+
+        // BEGIN + DML: from here on the connection has an open WriteSession,
+        // which is where CPython leaves it after the first execute().
+        assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (id, n) VALUES (1,10),(2,20)"), SQLITE_OK);
+
+        // 1. a SCALAR UDF in a read, inside the transaction, no commit between
+        assert_eq!(scalar_count(db, "SELECT plus1(n) FROM t WHERE id = 1"), 11);
+        // 2. …and in the WHERE of that read
+        assert_eq!(scalar_count(db, "SELECT n FROM t WHERE plus1(id) = 2"), 10);
+        // 3. an AGGREGATE UDF, inside the transaction: (10+20) + 2*100 = 230
+        assert_eq!(scalar_count(db, "SELECT mysum(n) FROM t"), 230 * 10 + 2);
+        // 4. a scalar UDF in a WRITE statement: SET, WHERE, and RETURNING
+        assert_eq!(
+            exec(db, "UPDATE t SET n = plus1(n) WHERE plus1(id) = 2"),
+            SQLITE_OK
+        );
+        assert_eq!(scalar_count(db, "SELECT n FROM t WHERE id = 1"), 11);
+        assert_eq!(
+            scalar_count(db, "DELETE FROM t WHERE id = 2 RETURNING plus1(n)"),
+            21
+        );
+        // 5. the row-producing side of an INSERT
+        assert_eq!(
+            exec(db, "INSERT INTO t (id, n) SELECT 7, plus1(n) FROM t WHERE id = 1"),
+            SQLITE_OK
+        );
+        assert_eq!(scalar_count(db, "SELECT n FROM t WHERE id = 7"), 12);
+
+        assert_eq!(exec(db, "COMMIT"), SQLITE_OK);
+        // committed state is what the UDFs computed
+        assert_eq!(scalar_count(db, "SELECT n FROM t WHERE id = 7"), 12);
+        sqlite3_close(db);
+    }
+}
+
+/// The autocommit half of the same surface: a UDF in DML with no transaction
+/// open at all (CPython's `isolation_level=None`).
+#[test]
+fn udf_in_autocommit_dml() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(
+            exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)"),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3_create_function_v2(
+                db,
+                cs("plus1").as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                fnptr(udf_plus1),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(exec(db, "INSERT INTO t (id, n) VALUES (1, 10)"), SQLITE_OK);
+        assert_eq!(exec(db, "UPDATE t SET n = plus1(n) WHERE plus1(id) = 2"), SQLITE_OK);
+        assert_eq!(scalar_count(db, "SELECT n FROM t"), 11);
+        assert_eq!(
+            scalar_count(db, "DELETE FROM t WHERE plus1(id) = 2 RETURNING plus1(n)"),
+            12
+        );
+        sqlite3_close(db);
+    }
+}
+
+/// A UDF that raises (`sqlite3_result_error`) from a WRITE statement fails the
+/// statement rather than writing a guessed value, and leaves the connection
+/// usable.
+#[test]
+fn udf_error_from_a_write_statement() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(
+            exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER)"),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3_create_function_v2(
+                db,
+                cs("boom").as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                fnptr(udf_boom),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (id, n) VALUES (1, 10)"), SQLITE_OK);
+        assert_ne!(
+            exec(db, "UPDATE t SET n = boom(n) WHERE id = 1"),
+            SQLITE_OK,
+            "a raising UDF must fail the write, not write a guess"
+        );
+        // the value is untouched and the transaction still commits
+        assert_eq!(scalar_count(db, "SELECT n FROM t WHERE id = 1"), 10);
+        assert_eq!(exec(db, "COMMIT"), SQLITE_OK);
+        assert_eq!(scalar_count(db, "SELECT n FROM t WHERE id = 1"), 10);
+        sqlite3_close(db);
+    }
+}
+
 // ---- helpers -------------------------------------------------------------
 
 fn sqlite_transient() -> *mut c_void {
