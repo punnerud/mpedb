@@ -22,6 +22,16 @@ use std::fs::File;
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
+/// `F_RDLCK`/`F_UNLCK` as the `flock.l_type` field's type. The cast is REQUIRED
+/// on Linux (the libc consts are `c_int`, the field is `c_short`) and a no-op
+/// on macOS (the consts are already `c_short`) — which is why clippy on macOS
+/// flags the inline spelling as `unnecessary_cast`. One allowed cast here, and
+/// every use site stays cast-free on both platforms.
+#[allow(clippy::unnecessary_cast)]
+const RDLCK: i16 = libc::F_RDLCK as i16;
+#[allow(clippy::unnecessary_cast)]
+const UNLCK: i16 = libc::F_UNLCK as i16;
+
 use crate::{Error, Result};
 
 const PENDING_BYTE: i64 = 0x4000_0000;
@@ -105,10 +115,10 @@ impl SharedLock {
         let fd = file.as_raw_fd();
         let (setlk_cmd, getlk_cmd, ofd) = lock_cmds();
         // sqlite's sequence: a reader first proves PENDING is free.
-        if !getlk_free(fd, getlk_cmd, libc::F_RDLCK as i16, PENDING_BYTE, 1)? {
+        if !getlk_free(fd, getlk_cmd, RDLCK, PENDING_BYTE, 1)? {
             return Ok(None);
         }
-        if !setlk(fd, setlk_cmd, libc::F_RDLCK as i16, SHARED_FIRST, SHARED_SIZE)? {
+        if !setlk(fd, setlk_cmd, RDLCK, SHARED_FIRST, SHARED_SIZE)? {
             return Ok(None);
         }
         Ok(Some(SharedLock { file, ofd }))
@@ -129,8 +139,8 @@ impl SharedLock {
         let fd = self.file.as_raw_fd();
         let (_, getlk_cmd, _) = lock_cmds();
         Ok(
-            !getlk_free(fd, getlk_cmd, libc::F_RDLCK as i16, RESERVED_BYTE, 1)?
-                || !getlk_free(fd, getlk_cmd, libc::F_RDLCK as i16, PENDING_BYTE, 1)?,
+            !getlk_free(fd, getlk_cmd, RDLCK, RESERVED_BYTE, 1)?
+                || !getlk_free(fd, getlk_cmd, RDLCK, PENDING_BYTE, 1)?,
         )
     }
 }
@@ -142,7 +152,7 @@ impl Drop for SharedLock {
         let _ = setlk(
             self.file.as_raw_fd(),
             setlk_cmd,
-            libc::F_UNLCK as i16,
+            UNLCK,
             SHARED_FIRST,
             SHARED_SIZE,
         );
@@ -154,8 +164,8 @@ pub fn writer_active(base: &Path) -> Result<bool> {
     let file = File::options().read(true).write(true).open(base)?;
     let fd = file.as_raw_fd();
     let (_, getlk_cmd, _) = lock_cmds();
-    Ok(!getlk_free(fd, getlk_cmd, libc::F_RDLCK as i16, RESERVED_BYTE, 1)?
-        || !getlk_free(fd, getlk_cmd, libc::F_RDLCK as i16, PENDING_BYTE, 1)?)
+    Ok(!getlk_free(fd, getlk_cmd, RDLCK, RESERVED_BYTE, 1)?
+        || !getlk_free(fd, getlk_cmd, RDLCK, PENDING_BYTE, 1)?)
 }
 
 const JOURNAL_MAGIC: [u8; 8] = [0xd9, 0xd5, 0x05, 0xf9, 0x20, 0xa1, 0x63, 0xd7];

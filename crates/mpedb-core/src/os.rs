@@ -277,7 +277,9 @@ mod macos_lock {
     // (flock treats separate fds independently), deadlocking the process. The
     // registry hands every in-process handle the SAME OFD + mutex, so a double
     // open is caught as EDEADLK re-entrancy, not a self-deadlock.
-    static REGISTRY: LazyLock<Mutex<HashMap<(u64, u64), Weak<Inner>>>> =
+    /// `(dev, ino)` → the process-shared lock state for that file.
+    type LockRegistry = HashMap<(u64, u64), Weak<Inner>>;
+    static REGISTRY: LazyLock<Mutex<LockRegistry>> =
         LazyLock::new(|| Mutex::new(HashMap::new()));
 
     fn make_errorcheck_mutex() -> *mut libc::pthread_mutex_t {

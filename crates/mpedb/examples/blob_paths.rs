@@ -43,9 +43,12 @@
 //!
 //! Usage: `blob_paths <dir> [mib]`
 
+#[cfg(target_os = "linux")]
 use std::os::fd::AsRawFd;
 
+#[cfg(target_os = "linux")]
 const PAGE: usize = 4096;
+#[cfg(target_os = "linux")]
 const HDR: usize = 16; // mpedb's overflow page header (btree.rs)
 
 #[cfg(target_os = "linux")]
