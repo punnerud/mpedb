@@ -13,6 +13,7 @@ mod bench;
 mod blob;
 mod collide;
 mod crash;
+mod csvload;
 mod dump;
 mod line;
 mod mirror;
@@ -41,6 +42,16 @@ usage: mpedb <command> [args]
          creates it — opening a repl, or only READING (`SELECT 1` is answered
          without touching the directory), leaves no file behind. CREATE TABLE on
          a sqlite base is applied to the base itself.
+         mpedb <path> <file.csv> [--import|--analyse] [--table NAME]
+         A CSV/TSV where the statement would go is offered rather than parsed:
+         IMPORT it as a table, or ANALYSE it in an in-memory database and get a
+         repl over it that writes nothing. On a tty you are asked; with piped
+         stdin the answer is `analyse` (the one that writes nothing) unless
+         --import says otherwise. Types are inferred conservatively
+         (int64/float64/text; anything ambiguous is text) and an existing table
+         is NEVER overwritten.
+         In a repl, Tab on an EMPTY line opens a table picker: arrows to browse,
+         Enter for `SELECT * FROM <table> LIMIT 20;`, Tab for the bare name.
 
 
   exec    <target> <SQL> [param ...]       run one statement
