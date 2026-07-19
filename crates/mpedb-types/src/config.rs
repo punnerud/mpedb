@@ -287,6 +287,13 @@ pub fn default_extent_threshold() -> Option<usize> {
     }
 }
 
+/// Maximum `database.size_mb`. mpedb pre-reserves (`fallocate`) this many MiB up
+/// front, so the file size is a deliberate space reservation, not a growth cap.
+/// Bounded well within a 64-bit process's mmap address space (page ids are u64);
+/// the practical limit is disk, not this. 16 TiB — comfortably past an 800 GiB
+/// database.
+pub const MAX_DB_SIZE_MB: u64 = 1 << 24;
+
 fn default_size_mb() -> u64 {
     64
 }
@@ -378,8 +385,10 @@ fn raw_to_config(
         if db.path.is_empty() {
             return Err(Error::Config("database.path must be set".into()));
         }
-        if db.size_mb < 1 || db.size_mb > 1 << 20 {
-            return Err(Error::Config("database.size_mb must be in 1..=1048576".into()));
+        if db.size_mb < 1 || db.size_mb > MAX_DB_SIZE_MB {
+            return Err(Error::Config(format!(
+                "database.size_mb must be in 1..={MAX_DB_SIZE_MB}"
+            )));
         }
         if db.max_readers < 1 || db.max_readers > 65_536 {
             return Err(Error::Config("database.max_readers must be in 1..=65536".into()));

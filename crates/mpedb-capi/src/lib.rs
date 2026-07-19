@@ -488,6 +488,27 @@ fn resolve_target(filename: Option<&str>, flags: c_int) -> Target {
     }
 }
 
+/// A `size_mb=N` (or `max_size_mb=N`) query parameter on a `file:` URI — the
+/// pre-reserved maximum size of a NEW database (mpedb fallocates it, so this is
+/// "reserve N MiB and never grow"; exceeding it is `SQLITE_FULL`). Clamped to
+/// the engine cap. Ignored for an existing file, whose geometry is fixed at
+/// creation. Lets a C-API caller open a large (e.g. 800 GiB) mpedb the shim
+/// would otherwise cap at its 64 MiB default.
+fn requested_size_mb(filename: Option<&str>) -> Option<u64> {
+    let query = filename?.trim().strip_prefix("file:")?.split_once('?')?.1;
+    for kv in query.split('&') {
+        if let Some(v) = kv
+            .strip_prefix("size_mb=")
+            .or_else(|| kv.strip_prefix("max_size_mb="))
+        {
+            if let Ok(n) = v.parse::<u64>() {
+                return Some(n.clamp(1, mpedb::MAX_DB_SIZE_MB));
+            }
+        }
+    }
+    None
+}
+
 fn ephemeral_path() -> PathBuf {
     let dir = if std::path::Path::new("/dev/shm").is_dir() {
         PathBuf::from("/dev/shm")
@@ -510,9 +531,13 @@ fn seed_toml(path: &std::path::Path, size_mb: u64) -> String {
 
 fn open_impl(filename: Option<&str>, flags: c_int) -> Result<Box<Sqlite3>, (c_int, String)> {
     let target = resolve_target(filename, flags);
+    // `file:…?size_mb=N` requests a specific pre-reserved size (mpedb fallocates
+    // it — reserve, don't grow); otherwise a small default. Only meaningful for a
+    // NEW file; an existing one keeps the geometry it was created with.
+    let req = requested_size_mb(filename);
     let (path, ephemeral, size_mb) = match target {
-        Target::Ephemeral => (ephemeral_path(), true, 16),
-        Target::File(p) => (p, false, 64),
+        Target::Ephemeral => (ephemeral_path(), true, req.unwrap_or(16)),
+        Target::File(p) => (p, false, req.unwrap_or(64)),
     };
 
     let exists = !ephemeral && path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false);

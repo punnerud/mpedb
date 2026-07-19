@@ -748,3 +748,30 @@ fn open_v2_unknown_vfs_is_refused_builtin_ok() {
         sqlite3_close(db2);
     }
 }
+
+#[test]
+fn file_uri_size_mb_reserves_requested_geometry() {
+    unsafe {
+        // A `file:…?size_mb=N` URI pre-reserves an N-MiB database (mpedb
+        // fallocates it): the file is created at exactly that size, and a
+        // request SMALLER than the shim's 64 MiB file default is honored too —
+        // mpedb does NOT always take "several MB" more than asked.
+        let path = format!("/dev/shm/mpedb-capi-size-{}.mpedb", std::process::id());
+        let _ = std::fs::remove_file(&path);
+        let uri = cs(&format!("file:{path}?size_mb=8"));
+        let mut db: *mut Sqlite3 = ptr::null_mut();
+        let rc = sqlite3_open_v2(
+            uri.as_ptr(),
+            &mut db,
+            SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE | SQLITE_OPEN_URI,
+            ptr::null(),
+        );
+        assert_eq!(rc, SQLITE_OK, "open file: URI with size_mb");
+        assert_eq!(exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t(v) VALUES ('x')"), SQLITE_OK);
+        sqlite3_close(db);
+        let bytes = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(bytes, 8 * 1024 * 1024, "reserved exactly 8 MiB, got {bytes}");
+        let _ = std::fs::remove_file(&path);
+    }
+}
