@@ -94,6 +94,95 @@ pub(crate) enum BUnOp {
 /// Expression type: `None` = NULL literal or not yet constrained.
 pub(crate) type Ty = Option<ColumnType>;
 
+/// The symbol of a binary operator, for error messages.
+fn op_symbol(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "+",
+        BinOp::Sub => "-",
+        BinOp::Mul => "*",
+        BinOp::Div => "/",
+        BinOp::Mod => "%",
+        BinOp::Eq => "=",
+        BinOp::Ne => "<>",
+        BinOp::Lt => "<",
+        BinOp::Le => "<=",
+        BinOp::Gt => ">",
+        BinOp::Ge => ">=",
+        BinOp::And => "AND",
+        BinOp::Or => "OR",
+        BinOp::Concat => "||",
+        BinOp::JsonArrow => "->",
+        BinOp::JsonArrowText => "->>",
+    }
+}
+
+/// `json_set`/`json_insert`/`json_replace` are `(X, PATH, VALUE, …)`: argument
+/// 0 is the document and the VALUEs are at the even positions from 2 on.
+fn json_edit_value_at(i: usize) -> Option<usize> {
+    if i >= 2 && i % 2 == 0 {
+        Some(i / 2 - 1)
+    } else {
+        None
+    }
+}
+
+/// Which argument positions of a JSON function are VALUE positions — the ones
+/// whose reading depends on sqlite's per-value JSON subtype. `None` for a
+/// function that has none (every reader, `json_patch`, `json_remove`).
+pub(crate) fn json_value_positions(name: &str) -> Option<fn(usize) -> Option<usize>> {
+    Some(match name {
+        "json_quote" => |i| if i == 0 { Some(0) } else { None },
+        "json_array" => Some,
+        "json_object" => |i| if i % 2 == 1 { Some(i / 2) } else { None },
+        "json_set" | "json_insert" | "json_replace" => json_edit_value_at,
+        _ => return None,
+    })
+}
+
+/// Refuse a scalar subquery in a JSON VALUE position.
+///
+/// sqlite PROPAGATES its JSON subtype out of a scalar subquery
+/// (`json_quote((SELECT json('[1]')))` is `[1]`, not `"[1]"`) but not out of a
+/// FROM-subquery column, an aggregate, or `||`. mpedb cannot see through the
+/// subplan boundary to tell those apart, so the shape is refused rather than
+/// answered — and it has to be refused HERE, in the subquery lifter, because by
+/// the time the binder runs the lift has already replaced the subquery with a
+/// reserved parameter that is indistinguishable from a user one.
+pub(crate) fn reject_subquery_in_json_value(name: &str, args: &[ast::Expr]) -> Result<()> {
+    let lower = name.to_ascii_lowercase();
+    let Some(value_at) = json_value_positions(&lower) else {
+        return Ok(());
+    };
+    for (i, a) in args.iter().enumerate() {
+        if value_at(i).is_some() && reaches_subquery(a) {
+            return Err(bind_err(format!(
+                "{lower}(): mpedb cannot tell whether this argument is JSON text or a plain \
+                 string, because it is a scalar subquery, and sqlite decides it from a \
+                 per-value JSON subtype that mpedb's values do not carry — one that sqlite \
+                 propagates out of a scalar subquery but not out of a FROM-subquery column or \
+                 an aggregate. Wrap the argument in `json(…)` to splice it as JSON, or in \
+                 `'' || …` to force the quoted-string reading"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Does the subtype of `e` come from a scalar subquery? Follows exactly the
+/// shapes `Binder::json_ness` follows — a subquery buried under `||` or a CAST
+/// carries no subtype in sqlite either, so it is not reachable.
+fn reaches_subquery(e: &ast::Expr) -> bool {
+    match e {
+        ast::Expr::Subquery(_) => true,
+        ast::Expr::Case(arms, else_) => {
+            arms.iter().any(|(_, r)| reaches_subquery(r))
+                || else_.as_deref().is_some_and(reaches_subquery)
+        }
+        ast::Expr::Coalesce(items) => items.iter().any(reaches_subquery),
+        _ => false,
+    }
+}
+
 /// The names + arities of the HOST-registered UDFs visible to the connection
 /// compiling this statement (the C-API `create_function` path,
 /// design/DESIGN-UDF.md). Threaded into the binder exactly as the compat dialect
@@ -1062,6 +1151,52 @@ impl<'a> Binder<'a> {
         let (l, lt) = self.bind_expr(l_ast)?;
         let (r, rt) = self.bind_expr(r_ast)?;
         match op {
+            // The two JSON accessors are OPERATORS in the grammar but scalar
+            // CALLS in the IR, so they never reach `BExpr::Binary` — one less
+            // opcode, and `->`/`->>` share the whole path machinery with
+            // `json_extract`. `->` always yields JSON text (or NULL); `->>`
+            // yields whatever SQL value the node unwraps to, hence `Any`.
+            BinOp::JsonArrow | BinOp::JsonArrowText => {
+                let (l, lt) = self.unify_param(l, lt, ColumnType::Text);
+                match lt {
+                    Some(ColumnType::Text) | Some(ColumnType::Any) | None => {}
+                    Some(other) => {
+                        return Err(bind_err(format!(
+                            "`{}` expects JSON text on the left, got {other}",
+                            op_symbol(op)
+                        )))
+                    }
+                }
+                // The right operand is a path (text) or an array index
+                // (integer); a bare param adopts text, which is what every ORM
+                // binds there.
+                let (r, rt) = self.unify_param(r, rt, ColumnType::Text);
+                match rt {
+                    Some(ColumnType::Text)
+                    | Some(ColumnType::Int64)
+                    | Some(ColumnType::Any)
+                    | None => {}
+                    Some(other) => {
+                        return Err(bind_err(format!(
+                            "`{}` expects a JSON path (text) or an array index (int64) on the \
+                             right, got {other}",
+                            op_symbol(op)
+                        )))
+                    }
+                }
+                let f = if op == BinOp::JsonArrow {
+                    ScalarFn::JsonArrow
+                } else {
+                    ScalarFn::JsonArrowText
+                };
+                let ret = if op == BinOp::JsonArrow {
+                    ColumnType::Text
+                } else {
+                    ColumnType::Any
+                };
+                let e = fold_maybe(BExpr::Call(f, vec![l, r]), self.suppress_fold)?;
+                Ok((e, Some(ret)))
+            }
             BinOp::And | BinOp::Or => {
                 let (l, lt) = self.unify_param(l, lt, ColumnType::Bool);
                 let (r, rt) = self.unify_param(r, rt, ColumnType::Bool);
@@ -1125,7 +1260,16 @@ impl<'a> Binder<'a> {
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod => {
                 let (l, r, ty) = self.unify_operands(l, lt, r, rt, "arithmetic on")?;
                 if let Some(t) = ty {
-                    if t != ColumnType::Int64 && t != ColumnType::Float64 {
+                    // `Any` is admitted for the same reason comparison admits
+                    // it: the operand's real type is only known per value, and
+                    // the runtime `arith` already refuses a non-numeric one.
+                    // Without this, `doc ->> '$.n' + 1` — and every arithmetic
+                    // over a host UDF result — would be a COMPILE error even
+                    // though the values are numbers.
+                    if t != ColumnType::Int64
+                        && t != ColumnType::Float64
+                        && t != ColumnType::Any
+                    {
                         return Err(bind_err(format!(
                             "arithmetic requires int64 or float64 operands, got {t}"
                         )));
@@ -1454,6 +1598,16 @@ impl<'a> Binder<'a> {
             }
             return Ok((BExpr::Call(ScalarFn::Printf, out), Some(ColumnType::Text)));
         }
+        // The JSON family. `json_array`/`json_object`/`json_set`/`json_insert`/
+        // `json_replace` take VALUE arguments whose reading depends on sqlite's
+        // per-value JSON subtype, so they are bound specially (a leading
+        // bitmask argument); `json_quote` of an already-JSON argument is that
+        // argument. See [`Self::bind_json_call`].
+        if name.starts_with("json") {
+            if let Some(bound) = self.bind_json_call(name, args)? {
+                return Ok(bound);
+            }
+        }
         let f = match name {
             "lower" => ScalarFn::Lower,
             "upper" => ScalarFn::Upper,
@@ -1540,8 +1694,10 @@ impl<'a> Binder<'a> {
                      ltrim, rtrim, replace, instr, substr, substring, char, unicode, hex, \
                      typeof, abs, round, ceil, floor, trunc, sqrt, pow, sign, exp, ln, log, \
                      log10, log2, sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, \
-                     radians, degrees, pi, mod, printf, format, quote, strftime, iif, \
-                     coalesce, ifnull, nullif"
+                     radians, degrees, pi, mod, printf, format, quote, strftime, json, \
+                     json_valid, json_type, json_quote, json_array_length, json_extract, \
+                     json_array, json_object, json_patch, json_remove, json_replace, \
+                     json_set, json_insert, iif, coalesce, ifnull, nullif"
                 )));
             }
         };
@@ -1632,6 +1788,24 @@ impl<'a> Binder<'a> {
             // char/printf are variadic and bound specially above (never reached
             // here); present only so this match stays exhaustive over ScalarFn.
             ScalarFn::Char | ScalarFn::Printf => (&[], Some(ColumnType::Text)),
+            // The whole JSON family is bound by `bind_json_call` (and the two
+            // accessors by `bind_binary`), so none of these reach the generic
+            // path; the arm exists only to keep the match exhaustive.
+            ScalarFn::Json
+            | ScalarFn::JsonValid
+            | ScalarFn::JsonType
+            | ScalarFn::JsonQuote
+            | ScalarFn::JsonArrayLength
+            | ScalarFn::JsonExtract
+            | ScalarFn::JsonArrow
+            | ScalarFn::JsonArrowText
+            | ScalarFn::JsonArray
+            | ScalarFn::JsonObject
+            | ScalarFn::JsonPatch
+            | ScalarFn::JsonRemove
+            | ScalarFn::JsonReplace
+            | ScalarFn::JsonSet
+            | ScalarFn::JsonInsert => (&[], Some(ColumnType::Text)),
         };
         let mut out = Vec::with_capacity(bound.len());
         for (i, (e, t)) in bound.into_iter().enumerate() {
@@ -1677,6 +1851,290 @@ impl<'a> Binder<'a> {
             _ => ret,
         };
         Ok((BExpr::Call(f, out), ret))
+    }
+
+    /// Bind one of sqlite's JSON functions, or `Ok(None)` if `name` is not one
+    /// (so a host UDF called `jsonify()` still resolves normally).
+    ///
+    /// # The JSON subtype, and why it is decided HERE
+    ///
+    /// sqlite has no JSON type, but it does mark a *value* with an internal
+    /// `JSON` subtype whenever a JSON function produced it, and the functions
+    /// that take VALUE arguments read that mark:
+    ///
+    /// ```text
+    /// json_object('a', json('[1,2]'))  ->  {"a":[1,2]}     -- spliced raw
+    /// json_object('a',      '[1,2]' )  ->  {"a":"[1,2]"}   -- quoted as text
+    /// ```
+    ///
+    /// mpedb's `Value` carries no subtype, and adding one would mean threading
+    /// a flag through the whole expression stack. It does not have to: sqlite
+    /// sets that mark in exactly one place — the return of a JSON function —
+    /// and mpedb can see, at BIND time, whether an argument *is* such a call.
+    /// So the binder computes a bitmask of which value arguments are JSON and
+    /// prepends it as a hidden leading argument (see `ScalarFn::JsonArray`).
+    ///
+    /// The three shapes where a static answer could differ from sqlite's
+    /// runtime one are REFUSED by name rather than guessed:
+    ///
+    /// * `json_extract(…)` / `->>` in a value position — sqlite subtypes
+    ///   `json_extract`'s result only when the extracted node is an object or
+    ///   an array, which is a property of the DATA, not of the query;
+    /// * a scalar subquery — sqlite propagates the subtype out of one
+    ///   (`json_quote((SELECT json('[1]')))` is `[1]`) but not out of a FROM
+    ///   subquery's column, an aggregate, or `||`; mpedb cannot see through
+    ///   the subplan boundary to tell those apart;
+    /// * a `CASE`/`coalesce`/`iif` whose arms DISAGREE — sqlite's answer is
+    ///   whichever arm fires.
+    fn bind_json_call(
+        &mut self,
+        name: &str,
+        args: &[ast::Expr],
+    ) -> Result<Option<(BExpr, Ty)>> {
+        // The table-valued and aggregate JSON functions are a different
+        // machinery entirely; name them rather than report "unknown function".
+        if matches!(
+            name,
+            "json_each" | "json_tree" | "json_group_array" | "json_group_object"
+        ) {
+            return Err(bind_err(format!(
+                "{name}() is not implemented: `json_each`/`json_tree` are TABLE-VALUED \
+                 functions and `json_group_array`/`json_group_object` are AGGREGATES, neither \
+                 of which mpedb's scalar-function machinery can express"
+            )));
+        }
+        if name.starts_with("jsonb") {
+            return Err(bind_err(format!(
+                "{name}() is not implemented: sqlite 3.45's JSONB is a BINARY encoding stored \
+                 in a BLOB, and mpedb implements the TEXT JSON functions only"
+            )));
+        }
+        // Fixed-shape readers: no value arguments, so no subtype question.
+        let simple = match name {
+            "json" => Some((ScalarFn::Json, ColumnType::Text)),
+            "json_valid" => Some((ScalarFn::JsonValid, ColumnType::Int64)),
+            "json_type" => Some((ScalarFn::JsonType, ColumnType::Text)),
+            "json_array_length" => Some((ScalarFn::JsonArrayLength, ColumnType::Int64)),
+            // One path unwraps to whatever the node holds; several wrap into a
+            // JSON array (text). `Any` covers both.
+            "json_extract" => Some((ScalarFn::JsonExtract, ColumnType::Any)),
+            "json_patch" => Some((ScalarFn::JsonPatch, ColumnType::Text)),
+            "json_remove" => Some((ScalarFn::JsonRemove, ColumnType::Text)),
+            _ => None,
+        };
+        if let Some((f, ret)) = simple {
+            let argc = u8::try_from(args.len())
+                .map_err(|_| bind_err(format!("{name}() called with too many arguments")))?;
+            if !f.arity_ok(argc) {
+                return Err(bind_err(format!(
+                    "{name}() cannot take {argc} argument(s)"
+                )));
+            }
+            let mut out = Vec::with_capacity(args.len());
+            for (i, a) in args.iter().enumerate() {
+                let (e, t) = self.bind_expr(a)?;
+                // Argument 0 is the document, and every later argument is a
+                // path — except `json_valid`'s FLAGS, which is an integer.
+                let want = if i == 1 && f == ScalarFn::JsonValid {
+                    ColumnType::Int64
+                } else {
+                    ColumnType::Text
+                };
+                let (e, t) = self.unify_param(e, t, want);
+                match t {
+                    Some(t) if t == want => {}
+                    // `json_valid` accepts ANY type for its document argument
+                    // (sqlite answers 1 for a number, 0 for a blob), and `Any`
+                    // is decided per value at runtime.
+                    Some(ColumnType::Any) | None => {}
+                    Some(_) if i == 0 && f == ScalarFn::JsonValid => {}
+                    Some(other) => {
+                        return Err(bind_err(format!(
+                            "{name}() argument {} must be {want}, got {other}",
+                            i + 1
+                        )))
+                    }
+                }
+                out.push(e);
+            }
+            return Ok(Some((BExpr::Call(f, out), Some(ret))));
+        }
+        // `json_quote(X)`: an argument that is ALREADY JSON is returned
+        // unchanged by sqlite (its subtype survives), and every JSON-producing
+        // call already yields minified JSON text — so the whole call is that
+        // argument. Nothing to encode, no mask.
+        if name == "json_quote" {
+            if args.len() != 1 {
+                return Err(bind_err(format!(
+                    "json_quote() takes exactly 1 argument, got {}",
+                    args.len()
+                )));
+            }
+            if self.json_ness(&args[0], "json_quote()")? {
+                let (e, _) = self.bind_expr(&args[0])?;
+                return Ok(Some((e, Some(ColumnType::Text))));
+            }
+            let (e, _) = self.bind_expr(&args[0])?;
+            return Ok(Some((
+                BExpr::Call(ScalarFn::JsonQuote, vec![e]),
+                Some(ColumnType::Text),
+            )));
+        }
+        // The writers: a leading subtype bitmask, then the SQL arguments.
+        // `value_at` says which argument positions are VALUES (the rest are
+        // documents or paths, always read as JSON/text).
+        let (f, value_at): (ScalarFn, fn(usize) -> Option<usize>) = match name {
+            // json_array(v0, v1, …): every argument is a value.
+            "json_array" => (ScalarFn::JsonArray, |i| Some(i)),
+            // json_object(k0, v0, k1, v1, …): the odd positions.
+            "json_object" => (ScalarFn::JsonObject, |i| {
+                if i % 2 == 1 {
+                    Some(i / 2)
+                } else {
+                    None
+                }
+            }),
+            // json_set(X, p0, v0, p1, v1, …): positions 2, 4, 6, …
+            "json_set" => (ScalarFn::JsonSet, json_edit_value_at),
+            "json_insert" => (ScalarFn::JsonInsert, json_edit_value_at),
+            "json_replace" => (ScalarFn::JsonReplace, json_edit_value_at),
+            _ => return Ok(None),
+        };
+        let mut mask: u64 = 0;
+        let mut out: Vec<BExpr> = Vec::with_capacity(args.len() + 1);
+        // Placeholder; filled in once the mask is known.
+        out.push(BExpr::Const(Value::Int(0)));
+        for (i, a) in args.iter().enumerate() {
+            match value_at(i) {
+                Some(slot) => {
+                    if slot >= 64 {
+                        return Err(bind_err(format!(
+                            "{name}() takes at most 64 value arguments in mpedb: the JSON \
+                             subtype of each value is carried as a 64-bit mask on the compiled \
+                             call"
+                        )));
+                    }
+                    if self.json_ness(a, &format!("{name}()"))? {
+                        mask |= 1u64 << slot;
+                    }
+                    // A value argument keeps whatever type it has: every SQL
+                    // type has a JSON rendering (a BLOB is the one runtime
+                    // error, matching sqlite's "JSON cannot hold BLOB values").
+                    out.push(self.bind_expr(a)?.0);
+                }
+                None => {
+                    // A document/path/label position: text.
+                    let (e, t) = self.bind_expr(a)?;
+                    let (e, t) = self.unify_param(e, t, ColumnType::Text);
+                    match t {
+                        Some(ColumnType::Text) | Some(ColumnType::Any) | None => {}
+                        Some(other) => {
+                            return Err(bind_err(format!(
+                                "{name}() argument {} must be text, got {other}",
+                                i + 1
+                            )))
+                        }
+                    }
+                    out.push(e);
+                }
+            }
+        }
+        out[0] = BExpr::Const(Value::Int(mask as i64));
+        let argc = u8::try_from(out.len())
+            .map_err(|_| bind_err(format!("{name}() called with too many arguments")))?;
+        if !f.arity_ok(argc) {
+            return Err(bind_err(format!(
+                "{name}() cannot take {} argument(s)",
+                args.len()
+            )));
+        }
+        Ok(Some((BExpr::Call(f, out), Some(ColumnType::Text))))
+    }
+
+    /// Is `e` an expression sqlite would mark with the JSON subtype? See
+    /// [`Self::bind_json_call`] for why this is decidable and what is refused.
+    fn json_ness(&mut self, e: &ast::Expr, what: &str) -> Result<bool> {
+        let undecidable = |why: &str| {
+            Err(bind_err(format!(
+                "{what}: mpedb cannot tell whether this argument is JSON text or a plain \
+                 string, because {why}. sqlite decides it from a per-value JSON subtype that \
+                 mpedb's values do not carry. Wrap the argument in `json(…)` to splice it as \
+                 JSON, or in `'' || …` to force the quoted-string reading"
+            )))
+        };
+        Ok(match e {
+            ast::Expr::Func(name, _) => match name.to_ascii_lowercase().as_str() {
+                // Every one of these returns minified JSON text with the
+                // subtype set (verified against 3.45.1).
+                "json" | "json_array" | "json_object" | "json_insert" | "json_replace"
+                | "json_set" | "json_remove" | "json_patch" | "json_quote" => true,
+                // Value-dependent: sqlite subtypes json_extract's result only
+                // when the node is an object or an array.
+                "json_extract" => return undecidable("`json_extract()` is JSON only when the \
+                                                      extracted node is an object or an array"),
+                _ => false,
+            },
+            // `->` always yields JSON text; `->>` never does (verified:
+            // `json_quote('{\"a\":[9]}' ->> '$.a')` is the quoted `"[9]"`).
+            ast::Expr::Binary(BinOp::JsonArrow, _, _) => true,
+            ast::Expr::Binary(BinOp::JsonArrowText, _, _) => false,
+            // The subtype flows with the value through lazy control flow, so
+            // fold over the arms — and refuse when they disagree.
+            ast::Expr::Case(arms, else_) => {
+                let mut it = arms
+                    .iter()
+                    .map(|(_, r)| r)
+                    .chain(else_.iter().map(|b| b.as_ref()));
+                let mut acc: Option<bool> = None;
+                for arm in &mut it {
+                    // A NULL arm is neither: it cannot be observed either way.
+                    if matches!(arm, ast::Expr::Lit(Value::Null)) {
+                        continue;
+                    }
+                    let j = self.json_ness(arm, what)?;
+                    match acc {
+                        None => acc = Some(j),
+                        Some(prev) if prev == j => {}
+                        Some(_) => {
+                            return undecidable(
+                                "its CASE arms disagree — some are JSON, some are plain text",
+                            )
+                        }
+                    }
+                }
+                acc.unwrap_or(false)
+            }
+            ast::Expr::Coalesce(items) => {
+                let mut acc: Option<bool> = None;
+                for it in items {
+                    if matches!(it, ast::Expr::Lit(Value::Null)) {
+                        continue;
+                    }
+                    let j = self.json_ness(it, what)?;
+                    match acc {
+                        None => acc = Some(j),
+                        Some(prev) if prev == j => {}
+                        Some(_) => {
+                            return undecidable(
+                                "its coalesce/ifnull arms disagree — some are JSON, some are \
+                                 plain text",
+                            )
+                        }
+                    }
+                }
+                acc.unwrap_or(false)
+            }
+            ast::Expr::Subquery(_) => {
+                return undecidable(
+                    "it is a scalar subquery, and sqlite propagates the subtype out of one but \
+                     not out of a FROM-subquery column or an aggregate",
+                )
+            }
+            // Everything else — a literal, a column, a parameter, `||`, CAST,
+            // a non-JSON function, a host UDF — carries no subtype in sqlite
+            // either, so plain text is the exact answer.
+            _ => false,
+        })
     }
 
     /// The type of an already-bound expression, where it is knowable without
@@ -2067,6 +2525,13 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 BinOp::Concat => Instr::Concat,
                 BinOp::And => Instr::And,
                 BinOp::Or => Instr::Or,
+                // `->`/`->>` are bound to `BExpr::Call`, never to a binary
+                // node, so no opcode exists (or is needed) for them here.
+                BinOp::JsonArrow | BinOp::JsonArrowText => {
+                    return Err(bind_err(
+                        "internal: a JSON accessor reached the binary emitter",
+                    ))
+                }
             });
         }
         BExpr::IsDistinct(a, b, negated) => {

@@ -267,7 +267,21 @@ const MAX_JOINS: usize = 16;
 //     version gates it anyway: a format-40 blob fails CLOSED at byte 0 with the
 //     documented re-prepare. (The same additive gating as every earlier scalar
 //     bump — `hex`/`typeof` at 12, the math family at 26, `printf` at 27.)
-const PLAN_FORMAT: u8 = 41;
+// 45: sqlite's JSON function set (Django's `JSONField`). JSON is TEXT, exactly
+//     as in sqlite — no new `ColumnType`, no schema-format change. Fifteen
+//     additive `ScalarFn` tags inside the existing `Instr::Call(f, argc)`
+//     opcode (Json=44 — the tag format 41 reserved — JsonValid=45, JsonType=46,
+//     JsonQuote=47, JsonArrayLength=48, JsonExtract=49, JsonArrow=50,
+//     JsonArrowText=51, JsonArray=52, JsonObject=53, JsonPatch=54,
+//     JsonRemove=55, JsonReplace=56, JsonSet=57, JsonInsert=58), so a plan
+//     naming none of them encodes byte-for-byte as in format 41 and an older
+//     reader fails CLOSED at byte 0. The `->` and `->>` OPERATORS are new
+//     grammar but not a new opcode: the binder lowers them to
+//     `Call(JsonArrow|JsonArrowText, 2)`. The five value-taking writers carry a
+//     binder-computed JSON-SUBTYPE BITMASK as a hidden leading const argument
+//     (`binder::bind_json_call`), which is why their plan arity is one more
+//     than their SQL arity.
+const PLAN_FORMAT: u8 = 45;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
