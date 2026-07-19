@@ -64,12 +64,22 @@ pub struct Sqlite3 {
 /// the materialized result it hands out one row at a time.
 pub struct Stmt {
     db: *mut Sqlite3,
+    /// The original statement text as prepared (used for classification, PRAGMA/
+    /// `sqlite_master` introspection and `sqlite3_expanded_sql`).
     sql: String,
+    /// `sql` with every bound parameter rewritten to mpedb's numbered `$K` form
+    /// (see `sql::scan_params`). This is what the engine actually parses/executes,
+    /// so `:name`/`@name`/`$name`/`?` all reach mpedb — which only speaks `$N` —
+    /// as the numbered placeholders they were assigned.
+    exec_sql: String,
+    /// The sqlite parameter count (`sqlite3_bind_parameter_count`): the highest
+    /// parameter number used, across all kinds sharing one numbering space.
     n_params: usize,
-    /// Per-parameter name in appearance order (`sqlite3_bind_parameter_name`):
-    /// NUL-terminated bytes for a named param (`:a`/`@a`/`$a`, prefix included),
-    /// `None` for an anonymous/numbered `?`/`?N`/`$N`. mpedb binds positionally,
-    /// so this is metadata only.
+    /// Per-parameter spelling in number order (`sqlite3_bind_parameter_name`):
+    /// NUL-terminated bytes for a named `:a`/`@a`/`$a` or an explicit `?N`/`$n`
+    /// (sigil included), `None` for an anonymous `?` or a number an explicit `?N`
+    /// skipped. mpedb binds positionally against `exec_sql`, so this is the map a
+    /// caller uses to find a name's slot.
     param_names: Vec<Option<Vec<u8>>>,
     binds: Vec<Value>,
     /// True once the statement has run since the last `reset` (or ever).
@@ -310,7 +320,10 @@ fn run_stmt(s: &mut Stmt) -> c_int {
     };
     let is_dml = matches!(sql::classify(&s.sql), sql::Kind::Dml { .. });
     let params = s.binds.clone();
-    let outcome = catch_unwind(AssertUnwindSafe(|| exec_one(c, &s.sql, &params)));
+    // Execute the parameter-rewritten text (`$K` placeholders) so mpedb binds
+    // the caller's values by number; classification/introspection are unaffected
+    // by the rewrite (only placeholders change), so they still use `s.sql`.
+    let outcome = catch_unwind(AssertUnwindSafe(|| exec_one(c, &s.exec_sql, &params)));
     let outcome = match outcome {
         Ok(r) => r,
         Err(_) => {
@@ -689,10 +702,18 @@ unsafe fn prepare_common(
     // and every statement touching the new table land here).
     let skip_validation = skip_validation || c.txn.is_some();
 
+    // Rewrite named/positional parameters to mpedb's numbered `$K` form so the
+    // engine — which only speaks `?`/`$N` — sees `:name`/`@name`/`$name`/`?` as
+    // the numbered placeholders sqlite assigned them. Everything downstream
+    // (validation, execution) uses this rewritten text; the maps answer the
+    // `bind_parameter_*` family.
+    let scan = sql::scan_params(first);
+
     // Validate compilable statements now (surface syntax/bind errors at
-    // prepare, as sqlite does), WITHOUT executing or publishing a plan.
+    // prepare, as sqlite does), WITHOUT executing or publishing a plan. Validate
+    // the REWRITTEN text — mpedb's parser rejects a bare `:` — not the original.
     if !skip_validation {
-        match catch_unwind(AssertUnwindSafe(|| c.db.prepare_detached(first))) {
+        match catch_unwind(AssertUnwindSafe(|| c.db.prepare_detached(&scan.rewritten))) {
             Ok(Ok(_plan)) => {}
             Ok(Err(e)) => return c.set_db_error(&e),
             Err(_) => {
@@ -702,13 +723,13 @@ unsafe fn prepare_common(
         }
     }
 
-    let n_params = sql::param_count(first);
-    let param_names = sql::param_names(first);
+    let n_params = scan.count;
     let boxed = Box::new(Stmt {
         db,
         sql: first.to_string(),
+        exec_sql: scan.rewritten,
         n_params,
-        param_names,
+        param_names: scan.names,
         binds: vec![Value::Null; n_params],
         executed: false,
         columns: Vec::new(),
@@ -992,11 +1013,19 @@ pub unsafe extern "C" fn sqlite3_bind_parameter_count(p: *mut Stmt) -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_parameter_index(p: *mut Stmt, name: *const c_char) -> c_int {
-    let Some(_s) = stmt(p) else { return 0 };
-    let Some(nm) = c_str_opt(name) else { return 0 };
-    // mpedb supports positional `?`/`$N`; map "?N"/"$N"/":N" to the number.
-    let digits = nm.trim_start_matches(['?', '$', ':', '@']);
-    digits.parse::<c_int>().unwrap_or(0).max(0)
+    let Some(s) = stmt(p) else { return 0 };
+    let Some(nm) = c_bytes(name, -1) else { return 0 };
+    // Look up the parameter whose spelling (sigil included) matches `name`,
+    // returning its 1-based number — exactly as sqlite does. The stored spelling
+    // carries a trailing NUL; compare against the bytes before it. Absent → 0.
+    for (k, entry) in s.param_names.iter().enumerate() {
+        if let Some(spelling) = entry {
+            if spelling.split_last().map(|(_, b)| b) == Some(nm) {
+                return (k + 1) as c_int;
+            }
+        }
+    }
+    0
 }
 
 #[no_mangle]
