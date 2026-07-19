@@ -955,10 +955,14 @@ impl CompiledPlan {
                 return Err(corrupt("subplan correlation arg out of the outer row"));
             }
         }
+        // (#97) A CORRELATED `List` subplan used to be `corrupt` here, mirroring
+        // the planner's "rewrite as EXISTS" refusal. Both are gone: the kind
+        // changes only what `subplan_value` reduces the rows to, and the per-row
+        // fill is kind-agnostic. The rule that actually protects the slot is
+        // `check_slot_discipline`, which already counts `Instr::InParam` as a
+        // read — so a correlated List slot reaching a GATHER-side program is
+        // still rejected, while `post_filter` (its one legal reader) is not.
         // A scalar subquery IS one value; EXISTS ignores its projection.
-        if s.kind == SubPlanKind::List && !s.outer_args.is_empty() {
-            return Err(corrupt("correlated IN-list subplan"));
-        }
         if s.kind != SubPlanKind::Exists && s.body.output_arity() != 1 {
             return Err(corrupt("scalar subplan must output exactly one column"));
         }
