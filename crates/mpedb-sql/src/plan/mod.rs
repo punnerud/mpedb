@@ -375,14 +375,12 @@ const MAX_JOINS: usize = 16;
 //     `LikeCsDyn` (57), `LikeDynEsc` (58), `LikeCsDynEsc` (59) — four, not
 //     one, mirroring the const family: dialect × escape-ness are compile-time
 //     (the ESCAPE argument stays a literal by policy), so they select the
-//     opcode — and `GlobDyn` (60; no dialect, no ESCAPE). A LITERAL pattern
-//     still compiles to the const-pool opcodes with unchanged bytes. ALSO in
-//     this format: the sqlite-dialect binder no longer wraps a numeric/`any`
-//     LIKE/GLOB operand in a bind-time CAST — the opcodes now apply sqlite's
-//     `likeFunc` coercion at RUNTIME, which is where sqlite applies it (a
-//     bind-time CAST turned an `any` column's runtime BLOB into text and
-//     MATCHED it, where sqlite's blob rule answers FALSE), so plans over such
-//     operands lose one `Instr::Cast` and re-hash.
+//     opcode — and `GlobDyn` (60; no dialect, no ESCAPE). Purely additive: a
+//     LITERAL pattern still compiles to the const-pool opcodes with unchanged
+//     bytes (a constant that folds to text — `s LIKE 12` — rejoins them too),
+//     the sqlite-dialect CAST bridge on coercible operands is unchanged, and
+//     a reader one format back hits the unknown opcode in the expr decoder
+//     and rejects the blob as corrupt rather than misreading it.
 //     NOTE (worktree, 2026-07-19): rebased onto main at 49 (derived-table
 //     materialization); this takes 50 by instruction — expr opcode tags 56..60
 //     — and the numbers are reconciled at merge.

@@ -209,28 +209,107 @@ fn like_escape_matches_sqlite() {
 }
 
 /// Django's exact statement shape: the pattern is a BOUND parameter and the
-/// escape is the literal `'\'`.
+/// escape is the literal `'\'` — `s LIKE ? ESCAPE '\'` is the wire form of
+/// every `startswith`/`contains`/`endswith`/`icontains` lookup.
 ///
-/// mpedb refuses a parameterised LIKE pattern (`LIKE pattern must be a literal
-/// in Phase 1`) — a pre-existing, separate limit that ESCAPE does not change.
-/// The refusal must still name the PATTERN, not the escape clause: an ORM user
-/// reading it has to be sent to the right half of the statement.
+/// Since #74 item 3 (LIKE half) this WORKS instead of refusing: the whole
+/// escape battery from `like_escape_matches_sqlite` is re-run with the pattern
+/// bound, asserted equal to the literal form row-for-row — and the literal
+/// form is asserted against sqlite first, so the baseline is not mpedb's own
+/// answer. The dynamic form is the same matcher, not a second implementation.
 #[test]
-fn a_bound_pattern_is_refused_by_name_not_blamed_on_escape() {
+fn a_bound_pattern_matches_the_literal_form() {
     let (db, path) = open(None);
-    let e = db
-        .query(r"SELECT id FROM t WHERE s LIKE ? ESCAPE '\'", &[Value::Text("%foo%".into())])
-        .expect_err("a bound LIKE pattern is not supported");
-    let m = e.to_string();
-    assert!(
-        m.contains("pattern") && !m.contains("ESCAPE"),
-        "the refusal must name the PATTERN, not ESCAPE: {m}"
-    );
-    // The same statement with a literal pattern — Django's value inlined — runs.
+    let patterns = [
+        r"100\%", r"a\_b", r"\%", r"\_", r"a\b", r"A\B", r"a\\b",
+        // dangling escapes — a legal no-match at runtime, not an error
+        r"ab\", r"%a\", r"\", r"%\",
+        // unescaped wildcards next to an escape clause
+        "a%b", "a_b", "%",
+        // Django's exact lookup shapes
+        "%foo%", r"%\%foo%", r"100\%%", "",
+    ];
+    for pat in patterns {
+        let lit = format!(
+            "SELECT id, s LIKE '{p}' ESCAPE '\\', s NOT LIKE '{p}' ESCAPE '\\' FROM t ORDER BY id",
+            p = pat.replace('\'', "''")
+        );
+        let literal_rows = mpedb_rows(&db, &lit, &[]);
+        assert_eq!(literal_rows, sqlite_rows(&lit), "literal form diverged for `{pat}`");
+
+        let bound = mpedb_rows(
+            &db,
+            r"SELECT id, s LIKE ? ESCAPE '\', s NOT LIKE ? ESCAPE '\' FROM t ORDER BY id",
+            &[Value::Text(pat.into()), Value::Text(pat.into())],
+        );
+        assert_eq!(bound, literal_rows, "bound pattern diverged for `{pat}`");
+
+        // The same, escape-less — Django's `__regex`-free siblings aside,
+        // `s LIKE ?` is the plain-contains shape.
+        let lit = format!(
+            "SELECT id, s LIKE '{p}', s NOT LIKE '{p}' FROM t ORDER BY id",
+            p = pat.replace('\'', "''")
+        );
+        let literal_rows = mpedb_rows(&db, &lit, &[]);
+        assert_eq!(literal_rows, sqlite_rows(&lit), "literal form diverged for `{pat}` (no ESCAPE)");
+        let bound = mpedb_rows(
+            &db,
+            "SELECT id, s LIKE ?, s NOT LIKE ? FROM t ORDER BY id",
+            &[Value::Text(pat.into()), Value::Text(pat.into())],
+        );
+        assert_eq!(bound, literal_rows, "bound pattern diverged for `{pat}` (no ESCAPE)");
+    }
+
+    // Django's filtered shape, verbatim.
     assert_eq!(
-        mpedb_rows(&db, r"SELECT id FROM t WHERE s LIKE '%foo%' ESCAPE '\' ORDER BY id", &[]),
+        mpedb_rows(
+            &db,
+            r"SELECT id FROM t WHERE s LIKE ? ESCAPE '\' ORDER BY id",
+            &[Value::Text("%foo%".into())]
+        ),
         vec!["10".to_string(), "11".to_string()]
     );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The corners only a RUNTIME pattern can reach (the full differential
+/// battery over an `any` column — blob-beats-NULL included — lives in
+/// `like_bound.rs`): a NULL pattern propagates; a NON-TEXT bind is refused BY
+/// NAME (the pattern parameter is pinned to text, exactly like REGEXP's — a
+/// refusal, never sqlite's silent runtime coercion, which stays reachable
+/// through `any` columns where it is sqlite-exact); the memo must never serve
+/// a stale compiled pattern across alternating binds.
+#[test]
+fn bound_pattern_runtime_corners() {
+    let (db, path) = open(None);
+    let one = |sql: &str, params: &[Value]| -> String {
+        mpedb_rows(&db, sql, params).into_iter().next().unwrap()
+    };
+
+    // NULL pattern propagates, through NOT and under ESCAPE.
+    assert_eq!(one("SELECT s LIKE ? FROM t WHERE id = 1", &[Value::Null]), "NULL");
+    assert_eq!(one("SELECT s NOT LIKE ? FROM t WHERE id = 1", &[Value::Null]), "NULL");
+    assert_eq!(one(r"SELECT s LIKE ? ESCAPE '\' FROM t WHERE id = 1", &[Value::Null]), "NULL");
+
+    // A non-text BIND is refused by name — never coerced, never a guess.
+    for v in [Value::Blob(b"ab".to_vec()), Value::Int(12)] {
+        let m = db
+            .query("SELECT s LIKE ? FROM t WHERE id = 1", &[v.clone()])
+            .expect_err("a non-text pattern bind must refuse")
+            .to_string();
+        assert!(m.contains("statement requires text"), "{m}");
+    }
+
+    // Alternating patterns through one prepared statement: the memo is keyed
+    // on the pattern VALUE and must never answer from a stale compiled form.
+    for (pat, want) in [("ab", "1"), ("zz", "0"), ("ab", "1"), ("a%", "1"), ("a_", "1")] {
+        assert_eq!(
+            one("SELECT s LIKE ? FROM t WHERE id = 1", &[Value::Text(pat.into())]),
+            want,
+            "pattern `{pat}` against row 1 ('ab')"
+        );
+    }
     drop(db);
     let _ = std::fs::remove_file(&path);
 }
