@@ -14,7 +14,8 @@ enum Acc {
     Host {
         state: Box<dyn HostAggState>,
         /// `f(DISTINCT x)`: values already stepped in this group, keyed by their
-        /// memcmp encoding — the same mechanism [`Accum::new_distinct`] uses.
+        /// storage-class grouping encoding — the same mechanism
+        /// [`Accum::new_distinct`] uses.
         /// `None` for a non-DISTINCT call, so the common case pays nothing.
         seen: Option<std::collections::BTreeSet<Vec<u8>>>,
     },
@@ -32,7 +33,7 @@ impl Acc {
                     None => &[][..],
                 };
                 if let Some(seen) = seen {
-                    if !seen.insert(keycode::encode_key(args)) {
+                    if !seen.insert(keycode::encode_group_key(args, &[])) {
                         return Ok(());
                     }
                 }
@@ -251,7 +252,11 @@ pub(super) fn exec_aggregate(
                 GroupKey::Expr(p) => p.eval_host(row, row_params, ctx.host_fns()),
             })
             .collect::<Result<_>>()?;
-        let key = keycode::encode_key_collated(&key_vals, &group_collations);
+        // The grouping key is sqlite's storage-class key, NOT the on-disk one:
+        // over a typeless column `1` and `1.0` are ONE group and the text `'1'`
+        // another. Its byte order is also sqlite's class order, so this
+        // `BTreeMap` still iterates groups the way sqlite emits them.
+        let key = keycode::encode_group_key(&key_vals, &group_collations);
         // Not `or_insert_with`: minting a HOST accumulator can FAIL (an
         // out-of-scope or unregistered aggregate), and a closure cannot carry
         // that error out.
@@ -449,7 +454,7 @@ pub(super) fn exec_aggregate(
         // `SELECT DISTINCT dept, count(*) … GROUP BY dept` — the groups are
         // already distinct by key, but the PROJECTION need not be (two groups
         // can share a count), so this still has work to do.
-        if distinct && !seen.insert(keycode::encode_key(&orow)) {
+        if distinct && !seen.insert(keycode::encode_group_key(&orow, &[])) {
             continue;
         }
         projected.push(orow);

@@ -67,7 +67,7 @@ pub(super) fn exec_select_windowed(
                 }
             });
         }
-        if sp.distinct && !seen.insert(keycode::encode_key(&orow)) {
+        if sp.distinct && !seen.insert(keycode::encode_group_key(&orow, &[])) {
             continue;
         }
         out.push(orow);
@@ -128,9 +128,10 @@ pub(super) fn compute_windows(
             for p in &w.partition_by {
                 pk.push(p.eval(row, params)?);
             }
-            // NULLs group together (SQL's PARTITION BY rule) — the total,
-            // NULL-equal keycode is exactly the GROUP BY keying.
-            part_key.push(keycode::encode_key(&pk));
+            // NULLs group together (SQL's PARTITION BY rule) and so do `1`
+            // and `1.0` (partition membership is sqlite's comparison) — the
+            // total, NULL-equal GROUP key is exactly the GROUP BY keying.
+            part_key.push(keycode::encode_group_key(&pk, &[]));
             let mut ov = Vec::with_capacity(w.order_by.len());
             for (p, _) in &w.order_by {
                 ov.push(p.eval(row, params)?);
