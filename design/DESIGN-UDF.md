@@ -47,7 +47,8 @@ A per-Database UDF registry: `RwLock<HashMap<(String, i32), Arc<dyn Fn(&[Value])
 
 **Plan-sharing.** A plan that calls a host UDF is valid ONLY for a connection
 that registered that UDF, so it MUST NOT enter the shared content-hashed
-`plan/<hash>` registry. Stage-1 rule: **a compiled plan containing a `HostCall`
+`plan/<hash>` registry. This rule is unconditional — it holds for the WRITE path
+too (see §The WRITE path). Stage-1 rule: **a compiled plan containing a `HostCall`
 bypasses the shared registry** — the facade compiles-and-executes it locally and
 never publishes it. (Cost: recompile per execute for UDF queries — acceptable;
 a later optimization folds a UDF-set fingerprint into the plan hash to restore
@@ -87,7 +88,8 @@ PAST `register_functions` and create its tables. Track Django progress in
 ## Stages
 1. **Scalar dispatch** (this doc) → Django connects, migrates, basic ORM. DONE.
 2. **Aggregate UDFs** (`xStep`/`xFinal` + `aggregate_context`). DONE — §Stage 2.
-3. **`create_collation`** (custom collations).
+3. **Write-path dispatch** (Django gap #2) — DONE, §The WRITE path.
+4. **`create_collation`** (custom collations).
 
 ## Stage 2 — AGGREGATE UDFs (`xStep`/`xFinal`)
 
@@ -158,5 +160,102 @@ EMPTY group still finishes a FRESH state, so `xFinal` runs on a never-stepped
 arguments; sqlite hands a USER aggregate every row, NULLs included, and lets
 `xStep` decide — which is what Django's accumulators expect.
 
-Scope is the READ path, as in stage 1: a host aggregate in a write statement
-returns a clean "not in scope" error.
+## The WRITE path (Django gap #2 — DONE)
+
+Stages 1 and 2 shipped read-path only: the closures were threaded through
+`TxnCtx::host_fns()` / `host_aggs()` for `ReadCtx`, and the write path returned
+`None`. That was a bigger hole than it sounds, because **CPython opens an
+implicit transaction on the first DML**: from then on every statement — reads
+included — runs through `WriteSession`, so in real Django use almost every UDF
+call after the first INSERT took the broken path. It worked only with an
+intervening `commit()`.
+
+**What closes it.** `exec::WriteCtx` — the write-path twin of `ReadCtx`: a
+`&mut WriteTxn` plus the two resolvers. `impl TxnCtx for WriteTxn` could not
+carry them (the type lives in `mpedb-core`, which knows nothing about a
+connection's UDF registry), so the facade wraps the transaction for the duration
+of ONE statement. Every row operation delegates to the transaction unchanged —
+the wrapper adds resolution, never behaviour.
+
+`Database::host_tables(plan)` is the SINGLE gate: it snapshots the registries iff
+`plan.contains_host_call()`, and every execution path goes through it — the read
+path, `WriteSession::run`, and every own-statement site in `ring_exec`
+(`lead_and_execute`'s direct and leader branches, and the optimistic-mode serial
+fallback). A statement with no host call snapshots nothing and runs byte-for-byte
+as before.
+
+Covered from the write side: a UDF in a statement's `WHERE`, in `UPDATE … SET`,
+in `ON CONFLICT DO UPDATE`'s SET/WHERE, in a `RETURNING` projection, in the
+row-producing side of `INSERT … SELECT`, and in any SELECT (scalar or aggregate)
+run inside an open transaction.
+
+**Plan sharing survives untouched.** A plan naming a host UDF is still never
+published to the shared `plan/<hash>` registry — `Database::register` gates on
+`contains_host_call()` for every path, so a write-path plan is compiled and run
+locally exactly like a read-path one. Two consequences are enforced rather than
+assumed:
+- `run_write_plan` keeps such a plan **off the intent ring**. The ring is a
+  cross-PROCESS queue whose leader loads intents BY HASH FROM THE REGISTRY, so an
+  enqueued host-call plan could only come back `UnknownPlan` — and worse, the
+  closures are connection-local, so no other process may run ours.
+- `prepare_intent` refuses a drained foreign intent whose plan contains a host
+  call, explicitly, rather than resolving the name against the LEADER's registry
+  (same name, different function = a wrong answer). Unreachable in practice; it
+  is the belt to the brace above.
+
+`optimistic_eligible` also rejects a host-call plan: `concurrency = "optimistic"`
+builds and validates the row off the executor with no resolver, so such a
+statement takes the serial path, which has one.
+
+**§5.3 is untouched.** The ring_exec change is *which `dyn TxnCtx` the own
+statement executes against*, inside the same savepoint, at the same point in the
+round. Posting under the writer lock, result-store-before-READY→DONE, release
+from READY, and recovery ignoring DONE slots are all exactly as they were.
+
+### Safety: a UDF is arbitrary caller code inside the write path
+
+- **Panic.** `guard_panic` catches an unwind at the one boundary where caller
+  code is invoked — `HostFnTable::call`, and an aggregate's factory / `step` /
+  `finish` — and turns it into an ordinary statement error
+  (`Unsupported("host function f/1 panicked: …")`). Nothing unwinds through the
+  engine, so the executor's own contract handles it: the ring leader rolls its
+  per-intent savepoint back, `WriteSession::run` poisons a session whose
+  statement was partially applied, and the writer lock is released by the normal
+  commit/abort path. (Even an uncaught unwind was survivable — `WriteTxn::drop`
+  releases the lock and COW means nothing committed is touched — but a
+  `WriteSession` living on a C-API handle is NOT dropped by the shim's
+  `catch_unwind`, and would have survived with a torn statement and no poison
+  flag.)
+- **Slow / blocking.** A UDF called from the write path runs with the single
+  writer lock held, so it delays every other writer for as long as it takes. This
+  is inherent — sqlite has the same property — and mpedb does not interrupt it;
+  the #74 work budget bounds the number of CALLS, not the duration of one. Keep
+  write-path UDFs cheap, exactly as `insert_streaming`'s pull source must be.
+  Readers are unaffected (MVCC).
+- **What it can see.** Only its arguments, from the write side as from the read
+  side: the closure receives evaluated `Value`s and returns one `Value`; it is
+  never handed the transaction, the snapshot, the schema, or an engine handle. A
+  UDF that captures a `Database` of its own and re-enters is REFUSED by the
+  ERRORCHECK writer lock ("writer lock re-entered by its owner") rather than
+  deadlocking, so it cannot mutate the database behind the executor's back.
+- **Intent-ring parameter cap.** No interaction: a `HostCall` is part of the
+  plan's expression program, not a parameter, and the plan never rides the ring
+  anyway.
+
+### Still refused (and refused cleanly)
+
+- `INSERT … VALUES (<expression>)` — `InsertSource` is `Default | Const | Param`,
+  so **any** function call there is refused with "INSERT values must be literals
+  or parameters", host UDF or `abs()` alike. This is a general INSERT-surface
+  limit, not a UDF one; `INSERT … SELECT` is the working form and carries UDFs.
+- Contexts that structurally cannot carry closures: the streaming read path
+  (`stream_query`) and the sqlite-backed contexts (`SqliteCtx`, `MergeCtx`).
+- A policy predicate (RLS `USING` / `WITH CHECK`) and a trigger body are compiled
+  from the shared catalog and evaluate WITHOUT the connection's closures — on
+  purpose: a shared, multi-process security predicate must not depend on
+  connection-local functions.
+
+All of these refuse with `Unsupported("host function f() is not in scope for this
+execution")` / the aggregate twin. That message used to be `Error::Internal`,
+which renders as **"internal error (bug in mpedb)"** — telling a user they hit an
+engine bug when they hit a documented boundary. It is `Unsupported` now.
