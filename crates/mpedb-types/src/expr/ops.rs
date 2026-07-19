@@ -1270,3 +1270,73 @@ impl ReProg {
         false
     }
 }
+
+#[cfg(test)]
+mod like_memo_bench {
+    use super::*;
+
+    /// Instrumented A/B of the LIKE-pattern memo (#74 item 3, LIKE half):
+    /// the OLD literal path — `compile_pattern` on every call, which is
+    /// exactly what `like_impl` did before the memo — against the memoized
+    /// `like_match`, over the same scan-shaped workload (one pattern, many
+    /// rows). Run with:
+    ///
+    /// ```sh
+    /// cargo test -p mpedb-types --release -- --ignored --nocapture like_memo_ab
+    /// ```
+    ///
+    /// The memo must not LOSE (the acceptance bar is "the literal path does
+    /// not regress"); in practice it wins big because the per-row
+    /// compile allocated a fresh `Vec<Pat>` per row.
+    #[test]
+    #[ignore]
+    fn like_memo_ab() {
+        let pattern = "%foo%";
+        let esc = Some('\\');
+        // Deterministic subjects, scan-shaped: mostly misses, some hits.
+        let subjects: Vec<String> = (0..1000)
+            .map(|i| {
+                if i % 7 == 0 {
+                    format!("xx{i}fooyy")
+                } else {
+                    format!("subject-{i}-with-some-length")
+                }
+            })
+            .collect();
+        const ROUNDS: usize = 2_000;
+
+        let mut hits_old = 0usize;
+        let t0 = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            for s in &subjects {
+                // The pre-memo body of `like_impl`, verbatim.
+                if let Some(p) = compile_pattern(pattern, esc) {
+                    if like_match_compiled(&p, s, true) {
+                        hits_old += 1;
+                    }
+                }
+            }
+        }
+        let per_call = t0.elapsed();
+
+        let mut hits_new = 0usize;
+        let t1 = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            for s in &subjects {
+                if like_match(pattern, s, esc) {
+                    hits_new += 1;
+                }
+            }
+        }
+        let memoized = t1.elapsed();
+
+        assert_eq!(hits_old, hits_new, "the memo may not change an answer");
+        println!(
+            "LIKE literal path over {} calls: compile-per-row {:?}, memoized {:?} ({:+.1}%)",
+            ROUNDS * subjects.len(),
+            per_call,
+            memoized,
+            (memoized.as_secs_f64() / per_call.as_secs_f64() - 1.0) * 100.0,
+        );
+    }
+}

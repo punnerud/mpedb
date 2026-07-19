@@ -1474,6 +1474,8 @@ fn max_col(e: &BExpr) -> Option<u16> {
             | BExpr::IsDistinct(a, b, _)
             | BExpr::CollateCmp(_, a, b, _)
             | BExpr::RegexpDyn(a, b)
+            | BExpr::LikeDyn(a, b, _, _)
+            | BExpr::GlobDyn(a, b)
             | BExpr::ClassCmp(_, a, b, _, _) => {
                 stack.push(a);
                 stack.push(b);

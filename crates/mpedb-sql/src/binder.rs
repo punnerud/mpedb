@@ -29,7 +29,7 @@ pub(crate) enum BExpr {
     /// because it is NOT 3VL: it compiles to a dedicated instruction that never
     /// yields NULL, so folding it through the comparison path would be wrong.
     IsDistinct(Box<BExpr>, Box<BExpr>, bool),
-    /// LHS LIKE 'pattern' (pattern is always a literal in Phase 1). The bool is
+    /// LHS LIKE 'pattern' with a text-LITERAL pattern. The bool is
     /// `case_insensitive`: `true` under the sqlite dialect (ASCII case-folded,
     /// the default), `false` under the PostgreSQL dialect (`bare_group_by =
     /// "postgres"`, case-SENSITIVE). It picks the opcode at compile time —
@@ -39,11 +39,23 @@ pub(crate) enum BExpr {
     /// [`Instr::LikeEsc`]/[`Instr::LikeCsEsc`] opcodes instead — so an escaped
     /// and an unescaped LIKE also hash to distinct plans.
     Like(Box<BExpr>, String, bool, Option<char>),
-    /// LHS GLOB 'pattern' — case-SENSITIVE `*`/`?`/`[...]` (sqlite). The pattern
-    /// is always a literal in Phase 1, exactly like [`BExpr::Like`]; `NOT GLOB`
+    /// `LHS LIKE <expr> [ESCAPE c]` — the same matcher as [`BExpr::Like`] with
+    /// a pattern that is NOT a literal: a bound parameter (Django's exact wire
+    /// shape for every `startswith`/`contains`/`endswith`/`icontains` lookup,
+    /// the whole reason this exists — #74 item 3, LIKE half), a column, any
+    /// computed value. The bool/escape fields are [`BExpr::Like`]'s, and the
+    /// ESCAPE argument itself stays a compile-time literal by deliberate
+    /// policy — only the pattern goes dynamic.
+    LikeDyn(Box<BExpr>, Box<BExpr>, bool, Option<char>),
+    /// LHS GLOB 'pattern' — case-SENSITIVE `*`/`?`/`[...]` (sqlite), with a
+    /// text-LITERAL pattern exactly like [`BExpr::Like`]; `NOT GLOB`
     /// is a `Not` wrapped around this by the binder, so this node itself is
     /// never negated.
     Glob(Box<BExpr>, String),
+    /// `LHS GLOB <expr>` — [`BExpr::Glob`] with a non-literal pattern; the
+    /// GLOB half of the same gap, closed in the same style. Like `Glob` it is
+    /// never negated — `NOT GLOB` is a `Not` the binder wraps around it.
+    GlobDyn(Box<BExpr>, Box<BExpr>),
     /// LHS REGEXP 'pattern' — sqlite's `ext/misc/regexp.c` dialect. The pattern
     /// is always a literal in Phase 1, exactly like [`BExpr::Glob`]; `NOT REGEXP`
     /// is a `Not` wrapped around this by the binder, so this node is never
@@ -887,24 +899,51 @@ impl<'a> Binder<'a> {
                 Ok((e, Some(ColumnType::Bool)))
             }
             ast::Expr::Like(lhs, pat, escape) => {
-                let pattern = match pat.as_ref() {
-                    ast::Expr::Lit(Value::Text(p)) => p.clone(),
-                    ast::Expr::Param(_) => {
-                        return Err(bind_err("LIKE pattern must be a literal in Phase 1"))
-                    }
-                    _ => return Err(bind_err("LIKE pattern must be a string literal")),
-                };
                 let (l, lt) = self.bind_expr(lhs)?;
                 let (l, lt) = self.unify_param(l, lt, ColumnType::Text);
-                // sqlite dialect: case-INsensitive, and a numeric operand coerces
-                // to text. PostgreSQL dialect: case-SENSITIVE, and a numeric
-                // operand is refused (rigid) — both keyed off the same signal.
+                // sqlite dialect: case-INsensitive, and a non-text operand
+                // coerces to text. PostgreSQL dialect: case-SENSITIVE, and a
+                // non-text operand is refused (rigid) — both keyed off the
+                // same signal, for the pattern exactly as for the subject.
                 let ci = self.bare_group_by == BareGroupBy::Sqlite;
                 let l = like_glob_operand(l, lt, "LIKE", ci)?;
-                let e = fold_maybe(
-                    BExpr::Like(Box::new(l), pattern, ci, *escape),
-                    self.suppress_fold,
-                )?;
+                let e = match pat.as_ref() {
+                    // A text LITERAL keeps the const-pool form — every LIKE
+                    // mpedb could compile before #74; its plan bytes are
+                    // unchanged. Anything else (a bound parameter — Django
+                    // always binds the pattern, with `ESCAPE '\'`, which is
+                    // this whole task — a column, any computed value) takes
+                    // the STACK form. The old restriction was structural,
+                    // exactly as it was for REGEXP, and NOT a compiled-pattern
+                    // cache: like_impl was recompiling per row even for a
+                    // literal, and now memoizes for both forms.
+                    ast::Expr::Lit(Value::Text(p)) => fold_maybe(
+                        BExpr::Like(Box::new(l), p.clone(), ci, *escape),
+                        self.suppress_fold,
+                    )?,
+                    other => {
+                        let (p, pt) = self.bind_expr(other)?;
+                        let (p, pt) = self.unify_param(p, pt, ColumnType::Text);
+                        // The same text bridge as the subject's, then a fold:
+                        // a constant that lands on text — `s LIKE 12` casts
+                        // and folds to `'12'` — rejoins the LITERAL opcode
+                        // and its plan bytes. A constant NULL stays dynamic
+                        // (`BExpr::LikeDyn` is left out of `fold`'s foldable
+                        // set for RegexpDyn's reason; the opcode's NULL rule
+                        // answers it per row).
+                        let p = fold_maybe(
+                            like_glob_operand(p, pt, "LIKE pattern", ci)?,
+                            self.suppress_fold,
+                        )?;
+                        match p {
+                            BExpr::Const(Value::Text(s)) => fold_maybe(
+                                BExpr::Like(Box::new(l), s, ci, *escape),
+                                self.suppress_fold,
+                            )?,
+                            p => BExpr::LikeDyn(Box::new(l), Box::new(p), ci, *escape),
+                        }
+                    }
+                };
                 Ok((e, Some(ColumnType::Bool)))
             }
             ast::Expr::Match(_, _) => {
@@ -920,24 +959,38 @@ impl<'a> Binder<'a> {
                 ))
             }
             ast::Expr::Glob(lhs, pat, negated) => {
-                // Same shape as LIKE: the pattern must be a text literal, both
-                // operands are text, the result is Bool. `NOT GLOB` is a real
-                // `Not` over the 3VL result (via `maybe_not`) — NOT of NULL is
-                // NULL, so a NULL operand still yields NULL as SQL requires.
-                let pattern = match pat.as_ref() {
-                    ast::Expr::Lit(Value::Text(p)) => p.clone(),
-                    ast::Expr::Param(_) => {
-                        return Err(bind_err("GLOB pattern must be a literal in Phase 1"))
-                    }
-                    _ => return Err(bind_err("GLOB pattern must be a string literal")),
-                };
+                // Same shape as LIKE, dyn pattern included. `NOT GLOB` is a
+                // real `Not` over the 3VL result (via `maybe_not`) — NOT of
+                // NULL is NULL, so a NULL operand still yields NULL as SQL
+                // requires.
                 let (l, lt) = self.bind_expr(lhs)?;
                 let (l, lt) = self.unify_param(l, lt, ColumnType::Text);
-                // GLOB is always case-SENSITIVE in both dialects; only the numeric
-                // coercion follows the dialect (coerce under sqlite, refuse under PG).
+                // GLOB is always case-SENSITIVE in both dialects; only the
+                // coercion follows the dialect (coerce under sqlite, refuse
+                // under PG), for the pattern exactly as for the subject.
                 let coerce = self.bare_group_by == BareGroupBy::Sqlite;
                 let l = like_glob_operand(l, lt, "GLOB", coerce)?;
-                let g = fold_maybe(BExpr::Glob(Box::new(l), pattern), self.suppress_fold)?;
+                let g = match pat.as_ref() {
+                    ast::Expr::Lit(Value::Text(p)) => {
+                        fold_maybe(BExpr::Glob(Box::new(l), p.clone()), self.suppress_fold)?
+                    }
+                    other => {
+                        let (p, pt) = self.bind_expr(other)?;
+                        let (p, pt) = self.unify_param(p, pt, ColumnType::Text);
+                        // Text bridge + fold, exactly as in the LIKE arm: a
+                        // constant pattern rejoins the literal opcode.
+                        let p = fold_maybe(
+                            like_glob_operand(p, pt, "GLOB pattern", coerce)?,
+                            self.suppress_fold,
+                        )?;
+                        match p {
+                            BExpr::Const(Value::Text(s)) => {
+                                fold_maybe(BExpr::Glob(Box::new(l), s), self.suppress_fold)?
+                            }
+                            p => BExpr::GlobDyn(Box::new(l), Box::new(p)),
+                        }
+                    }
+                };
                 let e = fold_maybe(maybe_not(g, *negated), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
             }
@@ -2843,17 +2896,30 @@ fn maybe_not(e: BExpr, negated: bool) -> BExpr {
     }
 }
 
-/// Coerce a LIKE/GLOB operand to text the way sqlite does. sqlite applies TEXT
-/// affinity to a LIKE/GLOB operand, so `12 LIKE '1%'` is `'12' LIKE '1%'` — a
-/// numeric operand is CAST to text (the exact same conversion as `CAST(x AS
-/// TEXT)`, which is sqlite-verified) rather than refused. Text stays as-is; a
-/// bare parameter (`None`) has already been pinned to Text. A blob is still
-/// refused — sqlite matches a blob operand bytewise, a path mpedb does not take.
+/// Coerce a LIKE/GLOB operand to text the way sqlite does — the SUBJECT, and
+/// since #74 (LIKE half) the non-literal PATTERN too (`op = "LIKE pattern"`
+/// etc., so a refusal names the right half of the statement). sqlite applies
+/// `sqlite3_value_text` to both `likeFunc` operands, so `12 LIKE '1%'` is
+/// `'12' LIKE '1%'` and `'12' LIKE 12` is TRUE — a numeric operand is CAST to
+/// text (the exact same conversion as `CAST(x AS TEXT)`, which is
+/// sqlite-verified) rather than refused. Text stays as-is; a bare parameter
+/// (`None`) has already been pinned to Text.
 ///
-/// `coerce` follows the compat dialect: `true` (sqlite) casts a numeric operand
-/// to text; `false` (PostgreSQL) refuses it with mpedb's original rigid error,
-/// so `id LIKE '1%'` on an integer column is a bind error rather than a silent
-/// stringify. Text and blob handling are identical in both dialects.
+/// A statically-typed BLOB is refused by name — and deliberately so, because
+/// there is no single "sqlite answer" to match: LIKE-on-blob is BUILD-
+/// DEPENDENT. The bundled differential oracle (stock amalgamation defaults)
+/// coerces blob bytes as text via `sqlite3_value_text`, while a CLI built
+/// with `SQLITE_LIKE_DOESNT_MATCH_BLOBS` (Debian/Ubuntu's, e.g. the 3.45.1
+/// on this machine's PATH) answers FALSE for a blob on EITHER side. A
+/// runtime blob through an `any` column follows the ORACLE (the repo's
+/// acceptance baseline): the CAST bridge reinterprets its bytes as text, and
+/// refuses by name the non-UTF-8 bytes a Rust `String` cannot hold.
+///
+/// `coerce` follows the compat dialect: `true` (sqlite) casts a non-text
+/// operand to text; `false` (PostgreSQL) refuses it with mpedb's original
+/// rigid error, so `id LIKE '1%'` on an integer column is a bind error rather
+/// than a silent stringify. Text and blob handling are identical in both
+/// dialects.
 fn like_glob_operand(l: BExpr, lt: Option<ColumnType>, op: &str, coerce: bool) -> Result<BExpr> {
     match lt {
         None | Some(ColumnType::Text) => Ok(l),
@@ -3111,10 +3177,35 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 }
             });
         }
+        // The dyn-pattern forms: subject first, pattern on top (popped first).
+        // Dialect and escape-ness still select the opcode — the escape rides
+        // the const pool exactly as in the literal form; only the pattern is
+        // on the stack.
+        BExpr::LikeDyn(a, p, case_insensitive, escape) => {
+            emit(a, instrs, consts)?;
+            emit(p, instrs, consts)?;
+            instrs.push(match escape {
+                None if *case_insensitive => Instr::LikeDyn,
+                None => Instr::LikeCsDyn,
+                Some(c) => {
+                    let e = push_const(consts, Value::Text(c.to_string()))?;
+                    if *case_insensitive {
+                        Instr::LikeDynEsc(e)
+                    } else {
+                        Instr::LikeCsDynEsc(e)
+                    }
+                }
+            });
+        }
         BExpr::Glob(a, pattern) => {
             emit(a, instrs, consts)?;
             let idx = push_const(consts, Value::Text(pattern.clone()))?;
             instrs.push(Instr::Glob(idx));
+        }
+        BExpr::GlobDyn(a, p) => {
+            emit(a, instrs, consts)?;
+            emit(p, instrs, consts)?;
+            instrs.push(Instr::GlobDyn);
         }
         BExpr::RegexpDyn(a, p) => {
             emit(a, instrs, consts)?;
@@ -3317,7 +3408,10 @@ mod tests {
             "created = 1",
             "data = 'x'",
             "-name",
-            "name LIKE 1",
+            // (`name LIKE 1` used to sit here; a constant numeric pattern now
+            // binds under the sqlite dialect and coerces at runtime — sqlite's
+            // likeFunc rule, #74 item 3. The PG dialect still refuses it; see
+            // `like_pattern_dyn_binds_and_blob_refuses_by_name`.)
             // Arithmetic on a bool is still rigid — the int/bool bridge is a
             // COMPARISON/assignment rule, never a general interchange.
             "active + 1",
@@ -3436,12 +3530,27 @@ mod tests {
     }
 
     #[test]
-    fn like_pattern_must_be_literal() {
-        match bind("name LIKE $1", 1) {
-            Err(Error::Bind(m)) => assert!(m.contains("literal in Phase 1")),
+    fn like_pattern_dyn_binds_and_blob_refuses_by_name() {
+        // #74 item 3, LIKE half: a bound / column / computed pattern BINDS —
+        // the old "must be a literal" refusal was structural, exactly as it
+        // was for REGEXP. A bare parameter is pinned to text.
+        let (e, ty, params) = bind("name LIKE $1", 1).unwrap();
+        assert!(matches!(e, BExpr::LikeDyn(..)), "{e:?}");
+        assert_eq!(ty, Some(ColumnType::Bool));
+        assert_eq!(params[0], Some(ColumnType::Text));
+        // A per-row COLUMN pattern is legal (sqlite evaluates it per row).
+        assert!(matches!(bind("name LIKE name", 0), Ok((BExpr::LikeDyn(..), _, _))));
+        // GLOB closed the same way.
+        assert!(matches!(bind("name GLOB $1", 1), Ok((BExpr::GlobDyn(..), _, _))));
+        // A text LITERAL keeps the const-pool node — its plan bytes are the
+        // pre-#74 ones.
+        assert!(matches!(bind("name LIKE 'a%'", 0), Ok((BExpr::Like(..), _, _))));
+        // A statically-BLOB pattern is refused by name, naming the PATTERN
+        // half of the statement (`data` is the blob column).
+        match bind("name LIKE data", 0) {
+            Err(Error::Bind(m)) => assert!(m.contains("LIKE pattern"), "{m}"),
             other => panic!("expected bind error, got {other:?}"),
         }
-        assert!(bind("name LIKE name", 0).is_err());
     }
 
     #[test]

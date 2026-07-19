@@ -261,13 +261,12 @@ pub enum Instr {
     /// a literal (a bound parameter — Django's exact wire shape for every
     /// `startswith`/`contains`/`endswith`/`icontains` lookup — a column, any
     /// computed value). Pops the PATTERN, then the subject beneath it, and
-    /// pushes the 3VL verdict.
-    ///
-    /// Operand semantics are sqlite's `likeFunc`, read off the binary (3.45.1)
-    /// — see [`like_func_3vl`]: a BLOB on EITHER side yields FALSE, checked
-    /// BEFORE the NULL rule (`NULL LIKE x'41'` is FALSE, not NULL); then a
-    /// NULL on either side yields NULL; a numeric renders as its sqlite text
-    /// at runtime (`'12' LIKE 12` is TRUE).
+    /// pushes the 3VL verdict. Same operand typing and NULL rules as
+    /// [`Instr::Like`]: any NULL operand yields NULL, and the operands must
+    /// arrive as text — the binder wraps a coercible non-text operand
+    /// (pattern AND subject alike) in the same `CAST(… AS TEXT)` it always
+    /// wrapped subjects in, which is `sqlite3_value_text`'s conversion, i.e.
+    /// what the differential-oracle sqlite itself applies inside `likeFunc`.
     ///
     /// FOUR dyn opcodes rather than one, mirroring the const-pool family
     /// exactly: the DIALECT (case-folding, [`Instr::Like`] vs
@@ -283,10 +282,9 @@ pub enum Instr {
     /// faster too.
     LikeDyn,
     /// Case-SENSITIVE (PostgreSQL dialect) [`Instr::LikeDyn`] —
-    /// [`Instr::LikeCs`]'s dyn twin. STRICT, not coercing: the PG dialect's
-    /// binder refuses non-text operands statically, so a non-text runtime
-    /// value here is a corrupt-plan-grade [`Error::TypeMismatch`], never a
-    /// silent coercion.
+    /// [`Instr::LikeCs`]'s dyn twin. The PG dialect's binder refuses non-text
+    /// operands statically (no CAST bridge), so a non-text runtime value here
+    /// is a corrupt-plan-grade [`Error::TypeMismatch`].
     LikeCsDyn,
     /// [`Instr::LikeDyn`] with an `ESCAPE` character at the given const-pool
     /// index (a one-character text, validated at decode exactly like
@@ -295,13 +293,12 @@ pub enum Instr {
     LikeDynEsc(u16),
     /// Case-SENSITIVE `LIKE … ESCAPE` with a stack pattern;
     /// [`Instr::LikeDynEsc`] is to this what [`Instr::LikeEsc`] is to
-    /// [`Instr::LikeCsEsc`]. Strict like [`Instr::LikeCsDyn`].
+    /// [`Instr::LikeCsEsc`].
     LikeCsDynEsc(u16),
-    /// `x GLOB y` with the pattern from the STACK — [`Instr::Glob`] with the
-    /// same `likeFunc` operand rule as [`Instr::LikeDyn`] (GLOB shares
-    /// `likeFunc` in sqlite: blob → FALSE before NULL, numerics render as
-    /// text at runtime, verified on the binary). GLOB has no dialect split
-    /// (always case-sensitive) and no ESCAPE clause, so ONE opcode covers it.
+    /// `x GLOB y` with the pattern from the STACK — [`Instr::Glob`]'s dyn
+    /// twin, with `Glob`'s operand typing and NULL rules. GLOB has no dialect
+    /// split (always case-sensitive) and no ESCAPE clause, so ONE opcode
+    /// covers it.
     GlobDyn,
 }
 
@@ -589,23 +586,20 @@ impl ExprProgram {
                     let a = stack.pop().expect("validated");
                     stack.push(concat_value(a, b)?);
                 }
-                // The sqlite-dialect const-pattern forms coerce their SUBJECT
-                // at runtime via `like_func_3vl` — sqlite's `likeFunc` rule,
-                // reachable through an `any` column or a numeric operand,
-                // which the binder now passes through RAW instead of wrapping
-                // in a bind-time CAST (a CAST turned a runtime BLOB into text
-                // and MATCHED it, where sqlite's blob rule answers FALSE).
                 Instr::Like(pi) => {
                     let a = stack.pop().expect("validated");
                     let pattern = &self.consts[pi as usize];
-                    stack.push(like_func_3vl(&a, pattern, "LIKE", |s, p| {
-                        like_match(p, s, None)
-                    })?);
+                    stack.push(match (&a, pattern) {
+                        (Value::Null, _) | (_, Value::Null) => Value::Null,
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(like_match(p, s, None)),
+                        _ => {
+                            return Err(Error::TypeMismatch(
+                                "LIKE requires text operands".into(),
+                            ))
+                        }
+                    });
                 }
                 Instr::LikeCs(pi) => {
-                    // PostgreSQL dialect: STRICT. The PG binder refuses
-                    // non-text operands statically, so anything but text/NULL
-                    // here is a corrupt plan, not a coercion opportunity.
                     let a = stack.pop().expect("validated");
                     let pattern = &self.consts[pi as usize];
                     stack.push(match (&a, pattern) {
@@ -618,26 +612,21 @@ impl ExprProgram {
                         }
                     });
                 }
-                Instr::LikeEsc(pi, ei) => {
+                Instr::LikeEsc(pi, ei) | Instr::LikeCsEsc(pi, ei) => {
+                    let ci = matches!(instr, Instr::LikeEsc(_, _));
                     let a = stack.pop().expect("validated");
                     let pattern = &self.consts[pi as usize];
                     // The escape const is validated to be a ONE-CHARACTER text
                     // at decode; a NULL escape can never reach here (the binder
                     // rejects it), so there is no third NULL arm to consider.
                     let esc = escape_char(&self.consts[ei as usize])?;
-                    stack.push(like_func_3vl(&a, pattern, "LIKE", |s, p| {
-                        like_match(p, s, Some(esc))
-                    })?);
-                }
-                Instr::LikeCsEsc(pi, ei) => {
-                    let a = stack.pop().expect("validated");
-                    let pattern = &self.consts[pi as usize];
-                    let esc = escape_char(&self.consts[ei as usize])?;
                     stack.push(match (&a, pattern) {
                         (Value::Null, _) | (_, Value::Null) => Value::Null,
-                        (Value::Text(s), Value::Text(p)) => {
-                            Value::Bool(like_match_cs(p, s, Some(esc)))
-                        }
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(if ci {
+                            like_match(p, s, Some(esc))
+                        } else {
+                            like_match_cs(p, s, Some(esc))
+                        }),
                         _ => {
                             return Err(Error::TypeMismatch(
                                 "LIKE requires text operands".into(),
@@ -646,38 +635,38 @@ impl ExprProgram {
                     });
                 }
                 Instr::Glob(pi) => {
-                    // GLOB shares sqlite's `likeFunc`, so it shares the
-                    // coercion rule; under the PG dialect the binder admits
-                    // only text statically, so the coercing arms are inert.
                     let a = stack.pop().expect("validated");
                     let pattern = &self.consts[pi as usize];
-                    stack.push(like_func_3vl(&a, pattern, "GLOB", |s, p| glob_match(p, s))?);
+                    stack.push(match (&a, pattern) {
+                        (Value::Null, _) | (_, Value::Null) => Value::Null,
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(glob_match(p, s)),
+                        _ => {
+                            return Err(Error::TypeMismatch(
+                                "GLOB requires text operands".into(),
+                            ))
+                        }
+                    });
                 }
                 // The dyn-pattern LIKE/GLOB family: the pattern comes off the
                 // STACK (a parameter, a column, any computed value) instead of
-                // the const pool; matcher, NULL rules and the `likeFunc`
-                // coercion are the const forms', escape stays a const.
-                Instr::LikeDyn => {
-                    let pattern = stack.pop().expect("validated");
-                    let a = stack.pop().expect("validated");
-                    stack.push(like_func_3vl(&a, &pattern, "LIKE", |s, p| {
-                        like_match(p, s, None)
-                    })?);
-                }
-                Instr::LikeDynEsc(ei) => {
-                    let pattern = stack.pop().expect("validated");
-                    let a = stack.pop().expect("validated");
-                    let esc = escape_char(&self.consts[ei as usize])?;
-                    stack.push(like_func_3vl(&a, &pattern, "LIKE", |s, p| {
-                        like_match(p, s, Some(esc))
-                    })?);
-                }
-                Instr::LikeCsDyn => {
+                // the const pool; matcher and NULL rules are the const forms',
+                // the escape stays a const. STRICT like them, too: the binder
+                // wraps any coercible operand in the same `CAST(… AS TEXT)` it
+                // always has (sqlite3_value_text's conversion — what the
+                // bundled-oracle sqlite applies inside likeFunc), so a
+                // non-text value here is a corrupt plan or a misbound
+                // parameter, never a coercion opportunity.
+                Instr::LikeDyn | Instr::LikeCsDyn => {
+                    let ci = matches!(instr, Instr::LikeDyn);
                     let pattern = stack.pop().expect("validated");
                     let a = stack.pop().expect("validated");
                     stack.push(match (&a, &pattern) {
                         (Value::Null, _) | (_, Value::Null) => Value::Null,
-                        (Value::Text(s), Value::Text(p)) => Value::Bool(like_match_cs(p, s, None)),
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(if ci {
+                            like_match(p, s, None)
+                        } else {
+                            like_match_cs(p, s, None)
+                        }),
                         _ => {
                             return Err(Error::TypeMismatch(
                                 "LIKE requires text operands".into(),
@@ -685,15 +674,18 @@ impl ExprProgram {
                         }
                     });
                 }
-                Instr::LikeCsDynEsc(ei) => {
+                Instr::LikeDynEsc(ei) | Instr::LikeCsDynEsc(ei) => {
+                    let ci = matches!(instr, Instr::LikeDynEsc(_));
                     let pattern = stack.pop().expect("validated");
                     let a = stack.pop().expect("validated");
                     let esc = escape_char(&self.consts[ei as usize])?;
                     stack.push(match (&a, &pattern) {
                         (Value::Null, _) | (_, Value::Null) => Value::Null,
-                        (Value::Text(s), Value::Text(p)) => {
-                            Value::Bool(like_match_cs(p, s, Some(esc)))
-                        }
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(if ci {
+                            like_match(p, s, Some(esc))
+                        } else {
+                            like_match_cs(p, s, Some(esc))
+                        }),
                         _ => {
                             return Err(Error::TypeMismatch(
                                 "LIKE requires text operands".into(),
@@ -704,7 +696,15 @@ impl ExprProgram {
                 Instr::GlobDyn => {
                     let pattern = stack.pop().expect("validated");
                     let a = stack.pop().expect("validated");
-                    stack.push(like_func_3vl(&a, &pattern, "GLOB", |s, p| glob_match(p, s))?);
+                    stack.push(match (&a, &pattern) {
+                        (Value::Null, _) | (_, Value::Null) => Value::Null,
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(glob_match(p, s)),
+                        _ => {
+                            return Err(Error::TypeMismatch(
+                                "GLOB requires text operands".into(),
+                            ))
+                        }
+                    });
                 }
                 // The pattern comes off the STACK (a parameter, a column, any
                 // computed text) instead of the const pool; the operand rules,
@@ -1006,52 +1006,6 @@ fn cast_value(v: Value, aff: Affinity) -> Result<Value> {
             other => Value::Blob(render_scalar_text(&other).into_bytes()),
         },
     })
-}
-
-/// sqlite `likeFunc`'s operand rule for the sqlite-dialect LIKE/GLOB opcodes,
-/// read off the binary (3.45.1) rather than inferred:
-///
-/// 1. a BLOB on EITHER side yields FALSE — and this check comes BEFORE the
-///    NULL rule, so `NULL LIKE x'41'` and `x'41' LIKE NULL` are both FALSE
-///    (0), not NULL, and `NOT LIKE` over them is TRUE. `likeFunc` returns 0
-///    for a blob argument before it ever looks at NULLs;
-/// 2. then a NULL on either side yields NULL;
-/// 3. then a numeric/bool/timestamp renders as its sqlite text
-///    (`sqlite3_value_text`: `'12' LIKE 12` is TRUE, `'12' LIKE 12.0` is
-///    FALSE because `12.0` renders as `'12.0'`) — the same rendering as
-///    `CAST(x AS TEXT)`, which is differential-tested.
-///
-/// `matched` is the actual matcher over `(subject_text, pattern_text)` —
-/// LIKE (either escape-ness) or GLOB; `op` names the operator in the one
-/// refusal left (a `Value::List` operand, which no SQL type system admits
-/// here — reachable only from a corrupt plan or a misbound list parameter).
-///
-/// The PG-dialect (case-sensitive) opcodes deliberately do NOT use this: the
-/// PG binder refuses non-text operands statically, so their arms stay strict.
-fn like_func_3vl(
-    subject: &Value,
-    pattern: &Value,
-    op: &str,
-    matched: impl FnOnce(&str, &str) -> bool,
-) -> Result<Value> {
-    if matches!(subject, Value::Blob(_)) || matches!(pattern, Value::Blob(_)) {
-        return Ok(Value::Bool(false));
-    }
-    if subject.is_null() || pattern.is_null() {
-        return Ok(Value::Null);
-    }
-    fn text<'v>(v: &'v Value, op: &str) -> Result<std::borrow::Cow<'v, str>> {
-        match v {
-            Value::Text(s) => Ok(std::borrow::Cow::Borrowed(s.as_str())),
-            Value::Int(_) | Value::Float(_) | Value::Bool(_) | Value::Timestamp(_) => {
-                Ok(std::borrow::Cow::Owned(render_scalar_text(v)))
-            }
-            _ => Err(Error::TypeMismatch(format!("{op} requires text operands"))),
-        }
-    }
-    let s = text(subject, op)?;
-    let p = text(pattern, op)?;
-    Ok(Value::Bool(matched(&s, &p)))
 }
 
 /// sqlite whitespace for numeric-prefix skipping: space, tab, LF, FF, CR.
