@@ -12,8 +12,8 @@
 
 use crate::ast::{self, BinOp, UnOp};
 use mpedb_types::{
-    Affinity, CmpKind, Collation, ColumnDef, ColumnType, Error, ExprProgram, Instr, Result,
-    ScalarFn, TableDef, Value,
+    Affinity, BareGroupBy, CmpKind, Collation, ColumnDef, ColumnType, Error, ExprProgram, Instr,
+    Result, ScalarFn, TableDef, Value,
 };
 
 /// Bound (name-resolved, type-checked, constant-folded) expression.
@@ -29,8 +29,13 @@ pub(crate) enum BExpr {
     /// because it is NOT 3VL: it compiles to a dedicated instruction that never
     /// yields NULL, so folding it through the comparison path would be wrong.
     IsDistinct(Box<BExpr>, Box<BExpr>, bool),
-    /// LHS LIKE 'pattern' (pattern is always a literal in Phase 1).
-    Like(Box<BExpr>, String),
+    /// LHS LIKE 'pattern' (pattern is always a literal in Phase 1). The bool is
+    /// `case_insensitive`: `true` under the sqlite dialect (ASCII case-folded,
+    /// the default), `false` under the PostgreSQL dialect (`bare_group_by =
+    /// "postgres"`, case-SENSITIVE). It picks the opcode at compile time —
+    /// [`Instr::Like`] vs [`Instr::LikeCs`](mpedb_types::expr) — so the plan is
+    /// self-describing and two dialects hash to distinct plans.
+    Like(Box<BExpr>, String, bool),
     /// LHS GLOB 'pattern' — case-SENSITIVE `*`/`?`/`[...]` (sqlite). The pattern
     /// is always a literal in Phase 1, exactly like [`BExpr::Like`]; `NOT GLOB`
     /// is a `Not` wrapped around this by the binder, so this node itself is
@@ -343,6 +348,14 @@ pub(crate) struct Binder<'a> {
     ctx_list_keys: std::collections::BTreeSet<String>,
     allow_params: bool,
     allow_context: bool,
+    /// The compat dialect (COMPAT.md). Reused as the LIKE-strictness signal
+    /// exactly as it is the GROUP BY strictness signal (#87): [`BareGroupBy::Sqlite`]
+    /// (default) compiles case-INsensitive LIKE that coerces a numeric operand to
+    /// text; [`BareGroupBy::Postgres`] compiles case-SENSITIVE LIKE
+    /// ([`Instr::LikeCs`]) and refuses a numeric operand. Set by the planner from
+    /// the database's configured dialect (`set_dialect`); defaults to Sqlite so
+    /// CHECK/policy binders and tests keep the sqlite behavior.
+    bare_group_by: BareGroupBy,
 }
 
 fn bind_err(msg: impl Into<String>) -> Error {
@@ -367,7 +380,16 @@ impl<'a> Binder<'a> {
             // `current_setting()` is allowed wherever caller params are (queries
             // and, later, policy predicates); disallowed in CHECK constraints.
             allow_context: allow_params,
+            bare_group_by: BareGroupBy::default(),
         }
+    }
+
+    /// Select the compat dialect (COMPAT.md) that governs LIKE strictness. The
+    /// planner calls this right after constructing a root binder so the database's
+    /// configured [`BareGroupBy`] reaches the LIKE binding site; `rescope`d
+    /// binders inherit it. Mirrors [`set_allow_excluded`](Self::set_allow_excluded).
+    pub fn set_dialect(&mut self, mode: BareGroupBy) {
+        self.bare_group_by = mode;
     }
 
     /// Pin a parameter slot's type before binding — used for the reserved
@@ -400,6 +422,9 @@ impl<'a> Binder<'a> {
             ctx_list_keys: self.ctx_list_keys,
             allow_params: self.allow_params,
             allow_context: self.allow_context,
+            // The compat dialect is a database-wide fact, so it survives a scope
+            // change (a join's per-table rescopes must keep the same LIKE rules).
+            bare_group_by: self.bare_group_by,
             // Neither survives a scope change: `excluded.` belongs to ON
             // CONFLICT, and fold suppression to whichever branch set it.
             allow_excluded: false,
@@ -548,8 +573,12 @@ impl<'a> Binder<'a> {
                 };
                 let (l, lt) = self.bind_expr(lhs)?;
                 let (l, lt) = self.unify_param(l, lt, ColumnType::Text);
-                let l = like_glob_operand(l, lt, "LIKE")?;
-                let e = fold_maybe(BExpr::Like(Box::new(l), pattern), self.suppress_fold)?;
+                // sqlite dialect: case-INsensitive, and a numeric operand coerces
+                // to text. PostgreSQL dialect: case-SENSITIVE, and a numeric
+                // operand is refused (rigid) — both keyed off the same signal.
+                let ci = self.bare_group_by == BareGroupBy::Sqlite;
+                let l = like_glob_operand(l, lt, "LIKE", ci)?;
+                let e = fold_maybe(BExpr::Like(Box::new(l), pattern, ci), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
             }
             ast::Expr::Match(_, _) => {
@@ -578,7 +607,10 @@ impl<'a> Binder<'a> {
                 };
                 let (l, lt) = self.bind_expr(lhs)?;
                 let (l, lt) = self.unify_param(l, lt, ColumnType::Text);
-                let l = like_glob_operand(l, lt, "GLOB")?;
+                // GLOB is always case-SENSITIVE in both dialects; only the numeric
+                // coercion follows the dialect (coerce under sqlite, refuse under PG).
+                let coerce = self.bare_group_by == BareGroupBy::Sqlite;
+                let l = like_glob_operand(l, lt, "GLOB", coerce)?;
                 let g = fold_maybe(BExpr::Glob(Box::new(l), pattern), self.suppress_fold)?;
                 let e = fold_maybe(maybe_not(g, *negated), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
@@ -1532,11 +1564,17 @@ fn maybe_not(e: BExpr, negated: bool) -> BExpr {
 /// TEXT)`, which is sqlite-verified) rather than refused. Text stays as-is; a
 /// bare parameter (`None`) has already been pinned to Text. A blob is still
 /// refused — sqlite matches a blob operand bytewise, a path mpedb does not take.
-fn like_glob_operand(l: BExpr, lt: Option<ColumnType>, op: &str) -> Result<BExpr> {
+///
+/// `coerce` follows the compat dialect: `true` (sqlite) casts a numeric operand
+/// to text; `false` (PostgreSQL) refuses it with mpedb's original rigid error,
+/// so `id LIKE '1%'` on an integer column is a bind error rather than a silent
+/// stringify. Text and blob handling are identical in both dialects.
+fn like_glob_operand(l: BExpr, lt: Option<ColumnType>, op: &str, coerce: bool) -> Result<BExpr> {
     match lt {
         None | Some(ColumnType::Text) => Ok(l),
         Some(ColumnType::Blob) => Err(bind_err(format!("{op} requires text, got blob"))),
-        Some(_) => Ok(BExpr::Cast(Box::new(l), Affinity::Text)),
+        Some(_) if coerce => Ok(BExpr::Cast(Box::new(l), Affinity::Text)),
+        Some(t) => Err(bind_err(format!("{op} requires text, got {t}"))),
     }
 }
 
@@ -1650,7 +1688,7 @@ pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
             matches!(a.as_ref(), BExpr::Const(_)) && matches!(b.as_ref(), BExpr::Const(_))
         }
         BExpr::InListColl(..) => false,
-        BExpr::Like(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
+        BExpr::Like(a, _, _) => matches!(a.as_ref(), BExpr::Const(_)),
         BExpr::Glob(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         BExpr::Regexp(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         BExpr::Cast(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
@@ -1757,10 +1795,16 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 Instr::IsNotDistinct
             });
         }
-        BExpr::Like(a, pattern) => {
+        BExpr::Like(a, pattern, case_insensitive) => {
             emit(a, instrs, consts)?;
             let idx = push_const(consts, Value::Text(pattern.clone()))?;
-            instrs.push(Instr::Like(idx));
+            // The dialect chose case-(in)sensitivity at bind time; emit the
+            // matching opcode so the plan is self-describing.
+            instrs.push(if *case_insensitive {
+                Instr::Like(idx)
+            } else {
+                Instr::LikeCs(idx)
+            });
         }
         BExpr::Glob(a, pattern) => {
             emit(a, instrs, consts)?;

@@ -26,7 +26,8 @@ mod tests;
 pub use scalar::ScalarFn;
 
 use ops::{
-    glob_match, in_items_3vl, in_items_3vl_collated, in_list_3vl, like_match, regexp_match,
+    glob_match, in_items_3vl, in_items_3vl_collated, in_list_3vl, like_match, like_match_cs,
+    regexp_match,
 };
 use scalar::call_scalar;
 
@@ -78,6 +79,10 @@ pub enum Instr {
     Concat,
     /// SQL LIKE with pattern from the const pool (supports % and _).
     Like(u16),
+    /// Case-SENSITIVE LIKE (PostgreSQL dialect); otherwise identical to
+    /// [`Instr::Like`]. Emitted for a `bare_group_by = "postgres"` database,
+    /// where `'a' LIKE 'A'` is FALSE. See [`like_match_cs`](ops::like_match_cs).
+    LikeCs(u16),
     /// SQL GLOB with pattern from the const pool. Like [`Instr::Like`] but
     /// case-SENSITIVE, and the wildcards are sqlite's `*` (any run), `?` (one
     /// char) and `[...]` character classes rather than `%`/`_`. Same operand
@@ -384,6 +389,19 @@ impl ExprProgram {
                     stack.push(match (&a, pattern) {
                         (Value::Null, _) | (_, Value::Null) => Value::Null,
                         (Value::Text(s), Value::Text(p)) => Value::Bool(like_match(p, s)),
+                        _ => {
+                            return Err(Error::TypeMismatch(
+                                "LIKE requires text operands".into(),
+                            ))
+                        }
+                    });
+                }
+                Instr::LikeCs(pi) => {
+                    let a = stack.pop().expect("validated");
+                    let pattern = &self.consts[pi as usize];
+                    stack.push(match (&a, pattern) {
+                        (Value::Null, _) | (_, Value::Null) => Value::Null,
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(like_match_cs(p, s)),
                         _ => {
                             return Err(Error::TypeMismatch(
                                 "LIKE requires text operands".into(),
