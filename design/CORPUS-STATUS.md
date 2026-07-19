@@ -1,5 +1,52 @@
 # Corpus status — measured sqllogictest compatibility
 
+## UPDATE 2026-07-19 (later) — blocker #1 CLOSED: per-row CASE/COALESCE arm typing
+
+Re-measured on `worktree-agent-ab353fa3dff3636ce` (per-row arm typing, x86-64
+Linux, release build): same corpus, same runner, same 78-chunk /
+`ulimit -v 3000000` / `timeout 580` procedure as below. Mixed
+`int64 ∪ float64` CASE/COALESCE/ifnull/iif arms are now typed **per ROW**
+exactly as sqlite — each arm keeps its own type and value (never a widening
+cast; the 82-wrong-answers failure mode is structurally impossible), and the
+expression types as `ColumnType::Any`, decided per value at runtime. sqlite
+dialect only; the postgres dialect keeps the rigid refusal (PG promotes arms
+statically). Unary minus and IN-list unification admit `any` operands the
+same way.
+
+| metric | before (below) | after |
+|---|---|---|
+| files measured | 621 / 622 | 621 / 622 (`select5.test` still aborts, §4) |
+| attempted | 5,938,278 | 5,938,278 |
+| **passed** | 5,931,446 — 99.885 % | **5,936,362 — 99.968 %** |
+| queries verified vs sqlite's md5 hash | 954,717 | 954,717 |
+| genuine wrong answers | 0 | **0** (same 4 `slt_lang_replace` cascade artifacts, §3) |
+| error mismatches | 0 | **0** |
+| refused / unsupported | 6,828 | **1,912** |
+| post-file `Database::verify()` failures | 0 | 0 |
+
+What moved (every record re-verified by the runner against the corpus's
+expected results):
+
+- **`mixed-arm-types`: 4,913 → 0.** The category no longer occurs anywhere in
+  the sweep.
+- **IN-list residue: 5 → 0.** `NULL IN (…, COALESCE(mixed), …)` had shifted
+  the refusal into comparison-list unification; admitting `any` there closed
+  it (membership runs per value through `sql_cmp`).
+- **Blocker #9 (two-or-more `min()`/`max()`): 2 → 0.** Not a rule change: the
+  arm fix lets `COALESCE(54, …col…)` fold to its constant, so the bare column
+  becomes the never-evaluated case sqlite mode already accepts.
+
+Remaining 1,912 = **545 engine gaps (0.0092 %)** — subquery-in-compound
+260 + 260, legacy trigger timing 23, `DROP INDEX`/`REINDEX` 2 — and **1,367
+runner artifacts**: shim-index-accumulation 1,289, shim-star-arity 72,
+shim `REPLACE` arity 4, shim `INSERT…SELECT` rowid 2. Ceiling with artifacts
+discounted: **99.991 %**.
+
+Everything below is the pre-fix measurement, kept for the methodology and the
+hand-verified attribution of the categories.
+
+---
+
 **Measured 2026-07-19** on `worktree-agent-afa0f61bb39be0f63` @ `7e08d80`
 (x86-64 Linux, release build), against **sqlite 3.45.1** as the reference for
 the hand-checks.

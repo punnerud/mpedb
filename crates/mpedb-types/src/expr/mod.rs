@@ -814,6 +814,19 @@ fn arith(op: Instr, a: Value, b: Value) -> Result<Value> {
         (Null, _) | (_, Null) => return Ok(Null),
         _ => {}
     }
+    // An int meeting a float happens only through a DYNAMICALLY typed operand
+    // (`ColumnType::Any` — a mixed CASE/COALESCE arm, a host UDF result, a
+    // typeless column): every statically-typed plan had its int side coerced
+    // by the binder (`ToFloat`) before an Arith was emitted. sqlite's rule is
+    // that if either operand is REAL the arithmetic is real, so widen per
+    // VALUE here — exactly where sqlite decides it. This cannot change any
+    // previously-accepted answer: a mixed pair used to be the TypeMismatch
+    // fall-through below.
+    let (a, b) = match (a, b) {
+        (Int(x), Float(y)) => (Float(x as f64), Float(y)),
+        (Float(x), Int(y)) => (Float(x), Float(y as f64)),
+        other => other,
+    };
     match (a, b) {
         (Int(x), Int(y)) => Ok(match op {
             Instr::Add => Int(x.checked_add(y).ok_or(Error::ArithmeticOverflow)?),
