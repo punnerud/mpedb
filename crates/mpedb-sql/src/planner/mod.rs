@@ -44,6 +44,7 @@ use mpedb_types::{exact_float_as_int, BareGroupBy, Collation, ExprProgram, Colum
 
 mod access;
 mod aggregate;
+mod derived;
 mod footprint;
 mod fts;
 mod join;
@@ -417,6 +418,11 @@ pub(crate) fn plan_statement(
         ast::Stmt::Savepoint(n) => txn(PlanStmt::Savepoint(n.clone())),
         ast::Stmt::Release(n) => txn(PlanStmt::Release(n.clone())),
         ast::Stmt::RollbackTo(n) => txn(PlanStmt::RollbackTo(n.clone())),
+        // A surviving derived table (`FROM (SELECT …) t` the Stage-B flattener
+        // could not splice) is MATERIALIZED — legal only here, at the top level.
+        ast::Stmt::Select(s) if s.from_derived.is_some() => {
+            derived::plan_derived_select(s, schema, n_params, catalog, mode, host_udfs, &mut consts)?
+        }
         ast::Stmt::Select(s) => {
             plan_select(s, schema, n_params, catalog, mode, host_udfs, &mut consts, None)?
         }
@@ -519,6 +525,20 @@ pub(crate) fn plan_statement(
             select_tables(&rc.anchor, &mut stamped);
             select_tables(&rc.recursive, &mut stamped);
             select_tables(&rc.outer, &mut stamped);
+        }
+        // A materialized derived table reads its body's tables (every arm of a
+        // compound body) plus the outer's; stamp each (the working table itself
+        // is filtered out below).
+        PlanStmt::Derived(dp) => {
+            match &dp.body {
+                SubBody::Select(sp) => select_tables(sp, &mut stamped),
+                SubBody::Compound(c) => {
+                    for arm in &c.arms {
+                        select_tables(arm, &mut stamped);
+                    }
+                }
+            }
+            select_tables(&dp.outer, &mut stamped);
         }
         PlanStmt::Insert { table, .. }
         | PlanStmt::Update { table, .. }

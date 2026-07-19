@@ -12,6 +12,7 @@ impl CompiledPlan {
             PlanStmt::Select(sp) => self.validate_select(sp, schema, ptypes)?,
             PlanStmt::Compound(c) => self.validate_compound(c, schema, ptypes)?,
             PlanStmt::RecursiveCte(rc) => self.validate_recursive_cte(rc, schema, ptypes)?,
+            PlanStmt::Derived(dp) => self.validate_derived(dp, schema, ptypes)?,
             _other => self.validate_rest(schema)?,
         }
         if !self.subplans.is_empty() {
@@ -154,6 +155,67 @@ impl CompiledPlan {
         Ok(())
     }
 
+    /// Re-validate a MATERIALIZED derived table (design/DESIGN-DERIVED-TABLES.md
+    /// §5) so a hand-crafted blob cannot smuggle an illegal shape past the
+    /// planner: the column list matches the body's output arity, the body never
+    /// references the working table (a derived table cannot see itself), and the
+    /// outer reads it exactly once. The components are then checked as ordinary
+    /// selects (`CTE_TABLE` resolves through `validate_select`'s CTE-aware
+    /// `get_table`).
+    fn validate_derived(
+        &self,
+        dp: &DerivedPlan,
+        schema: &Schema,
+        ptypes: &[Option<ColumnType>],
+    ) -> Result<()> {
+        // How many times a select's FROM/JOIN operands name the working table.
+        let reads_cte = |sp: &SelectPlan| -> usize {
+            (sp.table == super::CTE_TABLE) as usize
+                + sp.joins.iter().filter(|j| j.table == super::CTE_TABLE).count()
+        };
+        let arity = dp.columns.len();
+        if arity == 0 || arity != dp.col_types.len() {
+            return Err(corrupt("derived-table column/type arity mismatch"));
+        }
+        if dp.body.output_arity() != arity {
+            return Err(corrupt("derived-table body arity does not match the column list"));
+        }
+        // Stage 1 carries no lifted subqueries and no correlated post-filters —
+        // the parameter layout is `[user]` only (same rule as a recursive CTE).
+        if !self.subplans.is_empty() {
+            return Err(corrupt("derived-table statement with lifted subqueries"));
+        }
+        let body_arms: &[SelectPlan] = match &dp.body {
+            SubBody::Select(sp) => std::slice::from_ref(sp),
+            SubBody::Compound(c) => &c.arms,
+        };
+        for sp in body_arms.iter().chain(std::iter::once(&dp.outer)) {
+            if sp.post_filter.is_some() {
+                return Err(corrupt("derived-table component carries a post-filter"));
+            }
+        }
+        // The body cannot reference the working table it DEFINES.
+        if body_arms.iter().map(reads_cte).sum::<usize>() != 0 {
+            return Err(corrupt("derived-table body references the working table"));
+        }
+        // The outer reads the materialized rows exactly once (its FROM, or —
+        // after the RIGHT-join rewrite — one join operand).
+        if reads_cte(&dp.outer) != 1 {
+            return Err(corrupt(
+                "derived-table outer must reference the working table exactly once",
+            ));
+        }
+        // Structural validation of each component (widths, access paths, program
+        // bounds). CTE_TABLE resolves through the CTE-aware `get_table`; the
+        // FullScan-only rule for it is enforced there.
+        match &dp.body {
+            SubBody::Select(sp) => self.validate_select(sp, schema, ptypes)?,
+            SubBody::Compound(c) => self.validate_compound(c, schema, ptypes)?,
+        }
+        self.validate_select(&dp.outer, schema, ptypes)?;
+        Ok(())
+    }
+
     /// Everything `validate` checks about one SELECT — shared verbatim between
     /// a top-level SELECT and each compound arm, so the two can never drift.
     fn validate_select(
@@ -162,19 +224,21 @@ impl CompiledPlan {
         schema: &Schema,
         ptypes: &[Option<ColumnType>],
     ) -> Result<()> {
-        // A recursive CTE's working table (CTE_TABLE) resolves to the synthetic
-        // def derived from THIS plan's RecursiveCte node — the only meaning
-        // CTE_TABLE has inside one plan. Built once here so `get_table` (and the
-        // outer-table selection below) can hand out a reference to it.
+        // The working table (CTE_TABLE) resolves to the synthetic def derived
+        // from THIS plan's node — RecursiveCte or Derived, the only two
+        // meanings CTE_TABLE can have inside one plan. Built once here so
+        // `get_table` (and the outer-table selection below) can hand out a
+        // reference to it.
         let cte_td: Option<TableDef> = match &self.stmt {
             PlanStmt::RecursiveCte(rc) => Some(rc.cte_def()),
+            PlanStmt::Derived(dp) => Some(dp.derived_def()),
             _ => None,
         };
         let get_table = |id: u32| -> Result<&TableDef> {
             if id == super::CTE_TABLE {
                 return cte_td
                     .as_ref()
-                    .ok_or_else(|| corrupt("CTE working table outside a recursive CTE"));
+                    .ok_or_else(|| corrupt("CTE working table outside a recursive CTE / derived table"));
             }
             schema
                 .table(id)
@@ -523,7 +587,10 @@ impl CompiledPlan {
                 .ok_or_else(|| corrupt(format!("table id {id} out of range")))
         };
         match &self.stmt {
-            PlanStmt::Select(_) | PlanStmt::Compound(_) | PlanStmt::RecursiveCte(_) => {
+            PlanStmt::Select(_)
+            | PlanStmt::Compound(_)
+            | PlanStmt::RecursiveCte(_)
+            | PlanStmt::Derived(_) => {
                 unreachable!("handled by validate")
             }
             PlanStmt::Insert {

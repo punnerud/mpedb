@@ -57,6 +57,15 @@ impl RiskEstimate {
             // A recursive CTE is a fixpoint: its cardinality is not statically
             // boundable, so it always warrants the estimate (§6).
             PlanStmt::RecursiveCte(_) => true,
+            // A materialized derived table multiplies only where its components
+            // do — a join in the body or in the outer statement.
+            PlanStmt::Derived(dp) => {
+                let body_joins = match &dp.body {
+                    mpedb_sql::SubBody::Select(sp) => sel(sp),
+                    mpedb_sql::SubBody::Compound(c) => c.arms.iter().any(sel),
+                };
+                body_joins || sel(&dp.outer) || subs_correlated(&plan.subplans)
+            }
             PlanStmt::Begin
             | PlanStmt::Commit
             | PlanStmt::Rollback
@@ -273,6 +282,19 @@ pub fn estimate_plan_risk(
                 format!("recursive CTE \"{}\" (unbounded — no outer LIMIT)", rc.name),
             ),
         },
+        // A materialized derived table: the body runs once (its own estimate)
+        // and the outer scans the materialized set — whose cardinality is the
+        // body's output, not statically known. The dominant term is the larger
+        // of the two component estimates; an outer join against a real table
+        // is already folded into the outer's own estimate.
+        PlanStmt::Derived(dp) => {
+            let mut acc = estimate_body(&dp.body, &plan.subplans, schema, row_count);
+            let outer = estimate_select(&dp.outer, &plan.subplans, schema, row_count);
+            let r = outer.rows;
+            let e = outer.into_estimate();
+            acc.consider(r, || e.dominant);
+            acc
+        }
         PlanStmt::Begin
         | PlanStmt::Commit
         | PlanStmt::Rollback

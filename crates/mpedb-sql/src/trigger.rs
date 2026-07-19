@@ -235,7 +235,14 @@ fn rewrite_row_in_select(s: &mut ast::SelectStmt, scope: &RowScope, map: &mut Ro
         rewrite_row_in_expr(&mut j.on, scope, map)?;
     }
     if let Some(d) = &mut s.from_derived {
-        rewrite_row_in_select(d, scope, map)?;
+        match d.as_mut() {
+            ast::SubqueryBody::Select(b) => rewrite_row_in_select(b, scope, map)?,
+            ast::SubqueryBody::Compound(c) => {
+                for arm in &mut c.arms {
+                    rewrite_row_in_select(arm, scope, map)?;
+                }
+            }
+        }
     }
     Ok(())
 }

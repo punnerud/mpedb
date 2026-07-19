@@ -122,7 +122,7 @@ pub(super) fn plan_recursive_cte(
 }
 
 /// A `plan_select` result is always a `PlanStmt::Select`.
-fn into_select(stmt: PlanStmt) -> SelectPlan {
+pub(super) fn into_select(stmt: PlanStmt) -> SelectPlan {
     match stmt {
         PlanStmt::Select(sp) => sp,
         _ => unreachable!("plan_select always yields PlanStmt::Select"),
@@ -199,7 +199,7 @@ fn check_recursive_term(sp: &SelectPlan, name: &str) -> Result<()> {
 /// `n_params`). A slot two components constrain to different types is an error;
 /// in stage 1 only the outer statement constrains anything (the body is
 /// parameter-free).
-fn unify_param_types(
+pub(super) fn unify_param_types(
     n_params: u16,
     sources: &[&[Option<ColumnType>]],
 ) -> Result<Vec<Option<ColumnType>>> {

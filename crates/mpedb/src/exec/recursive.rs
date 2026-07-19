@@ -85,6 +85,41 @@ pub(super) fn exec_recursive_cte(
     exec_select(&mut wctx, schema, plan, params, &rc.outer)
 }
 
+/// Execute a MATERIALIZED derived table (design/DESIGN-DERIVED-TABLES.md §5):
+/// run the body EXACTLY ONCE into an in-memory row set — against the same
+/// snapshot (`ctx`) the outer then reads, duplicates preserved (a derived table
+/// is a bag) — and run the outer statement with the working table bound to it.
+///
+/// #74: the materialized rows are charged to the work meter with the
+/// `derived table "<alias>"` attribution (the recursive-CTE convention), so a
+/// runaway body trips the budget instead of growing the Vec unbounded; the
+/// body's own table scans were additionally charged per row read, as
+/// everywhere.
+pub(super) fn exec_derived(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    dp: &mpedb_sql::DerivedPlan,
+) -> Result<ExecResult> {
+    let body_rows = match &dp.body {
+        mpedb_sql::SubBody::Select(sp) => select_rows(&mut *ctx, schema, plan, params, sp)?,
+        mpedb_sql::SubBody::Compound(c) => {
+            match exec_compound(&mut *ctx, schema, plan, params, c)? {
+                ExecResult::Rows { rows, .. } => rows,
+                _ => return Err(internal("derived-table body produced no row set")),
+            }
+        }
+    };
+    if !body_rows.is_empty() {
+        ctx.charge_work(body_rows.len() as u64, &|| {
+            format!("derived table \"{}\"", dp.name)
+        })?;
+    }
+    let mut wctx = WorkingTableCtx { inner: ctx, rows: &body_rows };
+    exec_select(&mut wctx, schema, plan, params, &dp.outer)
+}
+
 /// Run one recursive-CTE component and return just its projected rows.
 fn select_rows(
     ctx: &mut dyn TxnCtx,
