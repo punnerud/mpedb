@@ -111,7 +111,20 @@ fn cols(names: &[&str]) -> Vec<String> {
 
 /// Answer a `PRAGMA` statement. Returns `(columns, rows)`; an unknown pragma is
 /// a harmless empty result (matching sqlite's silence for no-op pragmas).
-pub fn pragma(schema: &mpedb::Schema, sql: &str) -> Result<(Vec<String>, Vec<Vec<Value>>), DbError> {
+///
+/// `busy_timeout_ms` is the connection's live busy timeout, passed in by
+/// reference because `PRAGMA busy_timeout = N` is the ONE setter pragma the
+/// shim can actually honour: it is the same knob `sqlite3_busy_timeout()` sets
+/// and the retry loop in `lib.rs` reads. Every other setter stays a no-op *and
+/// its getter keeps reporting what mpedb really does* — `synchronous` and
+/// `cache_size` are deliberately NOT stored-and-echoed, because answering "3"
+/// to a durability probe mpedb does not honour is a different answer rather
+/// than an error, which is the one thing this shim must never do.
+pub fn pragma(
+    schema: &mpedb::Schema,
+    sql: &str,
+    busy_timeout_ms: &mut i32,
+) -> Result<(Vec<String>, Vec<Vec<Value>>), DbError> {
     let (name, arg) = parse_pragma(sql);
     match name.to_ascii_lowercase().as_str() {
         "table_info" | "table_xinfo" => {
@@ -185,8 +198,28 @@ pub fn pragma(schema: &mpedb::Schema, sql: &str) -> Result<(Vec<String>, Vec<Vec
             vec![],
         )),
         "foreign_key_check" => Ok((cols(&["table", "rowid", "parent", "fkid"]), vec![])),
+        // `busy_timeout` is REAL on this shim: the same milliseconds
+        // `sqlite3_busy_timeout()` sets, honoured by the BUSY retry loop. Both
+        // forms answer one row named `timeout` holding the value in force —
+        // sqlite's exact shape, including for the setter (verified against the
+        // 3.45.1 binary). Before this, a consumer that set its lock timeout via
+        // the pragma rather than the C function was silently left at 0.
+        "busy_timeout" => {
+            if let Some(a) = arg.as_deref() {
+                // sqlite clamps a negative/unparsable value to 0.
+                *busy_timeout_ms = a.trim().parse::<i32>().unwrap_or(0).max(0);
+            }
+            Ok((cols(&["timeout"]), vec![vec![Value::Int(*busy_timeout_ms as i64)]]))
+        }
         // Getters that a consumer may read: return a single conventional value.
         // A setter form (`= value`) returns no rows, as sqlite does.
+        //
+        // `foreign_keys` answers 0 — which is BOTH sqlite's own default and the
+        // literal truth: mpedb parses `REFERENCES` and discards it, enforcing no
+        // foreign key. The setter is a no-op, so `PRAGMA foreign_keys = ON`
+        // followed by a read still reports 0. That divergence is deliberate:
+        // reporting 1 would tell a consumer its FK violations will be caught
+        // when they will not. See C-API-COMPAT gap D11.
         "foreign_keys" if arg.is_none() => Ok((cols(&["foreign_keys"]), vec![vec![Value::Int(0)]])),
         "journal_mode" => Ok((cols(&["journal_mode"]), vec![vec![Value::Text("memory".into())]])),
         "user_version" if arg.is_none() => {

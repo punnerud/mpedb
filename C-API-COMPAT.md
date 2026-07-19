@@ -82,7 +82,7 @@ The tables below list, by category, exactly what the shim implements.
 |---|---|---|
 | `sqlite3_column_count` | ✅ | Available before the first step for read statements (executes lazily to name the output — see Notes) |
 | `sqlite3_column_name` | ✅ | mpedb's output column names (an aliased/expression name where applicable) |
-| `sqlite3_column_type` | ✅ | `Int`/`Bool`/`Timestamp`→`SQLITE_INTEGER`, `Float`→`FLOAT`, `Text`→`TEXT`, `Blob`→`BLOB`, `Null`→`NULL` |
+| `sqlite3_column_type` | ✅ | `Int`/`Bool`/`Timestamp`→`SQLITE_INTEGER`, `Float`→`FLOAT`, `Text`→`TEXT`, `Blob`→`BLOB`, `Null`→`NULL`. **`typeof()` agrees with this for every value** — see the `typeof()` note below |
 | `sqlite3_column_int` / `_int64` | ✅ | With sqlite-style coercion (text → leading integer, etc.) |
 | `sqlite3_column_double` | ✅ | With coercion |
 | `sqlite3_column_text` | ✅ | UTF-8; non-text scalars render to text; `NULL` value → `NULL` pointer |
@@ -131,8 +131,10 @@ live schema (`db.schema()`); nothing reaches the engine. `classify` routes a
 | `PRAGMA table_list` | ✅ | `(schema, name, type, ncol, wr, strict)` for user tables |
 | `PRAGMA index_list(t)` | 🚧 | `(seq, name, unique, origin, partial)`; synthesized index names |
 | `PRAGMA foreign_key_list` / `foreign_key_check` | ✅ | Empty (mpedb has no foreign keys) |
-| `PRAGMA foreign_keys` / `journal_mode` / `user_version` / … (getters) | 🚧 | Return a conventional value |
-| `PRAGMA <x> = <v>` and other pragmas (setters) | ✅ | Accepted as a no-op (the common DB-setup pragmas never error) |
+| `PRAGMA busy_timeout` / `= N` | ✅ | **Real.** The same milliseconds `sqlite3_busy_timeout()` sets and the BUSY retry loop honours — the one setter pragma the shim can implement truthfully. Both forms answer one row named `timeout` holding the value now in force (sqlite's shape, including for the setter); a negative clamps to 0 |
+| `PRAGMA foreign_keys` (getter) | 🚧 | Always `0`, which is BOTH sqlite's own default and the literal truth: mpedb parses `REFERENCES` and discards it. The setter is a no-op, so `= ON` then a read still reports `0` — a deliberate divergence (gap D11): reporting `1` would tell a consumer its FK violations will be caught when they will not |
+| `PRAGMA journal_mode` / `user_version` / `schema_version` (getters) | 🚧 | Return a conventional value (`journal_mode` = `memory`, which is what mpedb actually does) |
+| `PRAGMA <x> = <v>` and other pragmas (setters) | 🚧 | Accepted as a no-op (the common DB-setup pragmas never error), and **their getters are not stored-and-echoed** — `PRAGMA synchronous` / `cache_size` return no row rather than replay a value mpedb does not honour (gap D10). Echoing would answer a durability probe differently rather than erroring, which is the one thing this shim must not do |
 | `SELECT … FROM sqlite_master` / `sqlite_schema` | 🚧 | Emulated from the schema (user tables only; the bootstrap table is hidden). Projects any subset of `type, name, tbl_name, rootpage, sql` (or `*`, `count(*)`); `WHERE` supports AND-joined `col = 'x'` / `<>` / `IN (…)` / `[NOT] LIKE 'p'`; `ORDER BY name [DESC]`. `rootpage` is 0, `sql` is a reconstructed `CREATE TABLE`. Unsupported shapes error clearly. Views/indexes not listed yet — handles Django's `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'` |
 
 ### Transactions
@@ -557,3 +559,116 @@ Removed (gap closed): `quote_name()` quote-stripping, the `data_types` table, th
 Kept: `data_types_suffix = {}` (D2 — now demonstrably free, see above),
 `supports_foreign_keys = False` (D4b — REFERENCES parsed, not enforced),
 `_references_graph` (D8).
+
+---
+
+## `typeof()` — the contract (2026-07-19)
+
+`SELECT typeof(flag)` over a `bool` column answered **`'boolean'`** where stock
+sqlite answers `'integer'`. No error, a different answer — the one failure mode
+this shim does not allow. `timestamp` answered `'timestamp'`, and the param-only
+`List` answered `'list'`.
+
+**Decision: `typeof()` reports EXACTLY one of sqlite's five storage classes —
+`null`/`integer`/`real`/`text`/`blob` — for every value, always. Natively and
+through the shim.** mpedb's `Bool` and `Timestamp` report `'integer'`.
+
+Why here and not in the shim, and why not behind the dialect flag:
+
+1. **Range.** `typeof()` is a borrowed sqlite function and it borrows sqlite's
+   contract: its documented range is those five strings, and every consumer
+   switches on exactly those five. A sixth string is wrong against the only
+   specification the function has. There is no PG reading to preserve either —
+   PG spells it `pg_typeof()` and has no `typeof()` — so gating it on the
+   sqlite-vs-PG flag would be a knob with one meaningful setting.
+2. **Internal consistency** — checked, not assumed. `valconv::sqlite_type`
+   already maps `Bool`/`Timestamp` onto `SQLITE_INTEGER`, and `as_i64`/`as_bytes`
+   render them `1` / `"1"`. Through *every other* C-API accessor the value
+   already IS an integer; `typeof` was the lone dissenter, so the shim disagreed
+   with itself about the same value. (`bool_truthiness.rs` had already made this
+   exact fold for VALUES — "a bool is sqlite's integer 0/1"; `typeof` was the
+   leftover.)
+3. **The shim cannot fix it.** `typeof()` is evaluated in the engine and reaches
+   the C boundary as an ordinary `Value::Text`, indistinguishable from a text
+   column whose content happens to be the word `boolean`. Remapping strings at
+   the boundary would corrupt real data — a shim-only mapping is not merely
+   inferior, it is unavailable.
+
+`Value::List` is param-only and cannot reach an expression result; it maps to
+`'null'`, matching `valconv::sqlite_type`'s defensive choice, which keeps
+"`typeof` and `column_type` never disagree" **total** over all eight `Value`
+variants rather than true only for the reachable ones.
+
+`timestamp` is declarable through the shim but **no value of it is reachable**:
+there is no bind path that produces a `Value::Timestamp`, and `DEFAULT
+CURRENT_TIMESTAMP` is refused by name, so `INSERT INTO ts VALUES (1, 1720…)` is
+a clean type-mismatch refusal. Its mapping is pinned where it IS reachable
+(`mpedb-types` `expr::tests`).
+
+Verified: `crates/mpedb/tests/typeof_storage_class.rs` (every value class, every
+mpedb column type, 15 literal/expression forms — diffed against the `sqlite3`
+3.45.1 binary) and `capi.rs::typeof_reports_only_sqlite_storage_classes_and_agrees_with_column_type`
+(the same through FFI, asserting `typeof()` and `sqlite3_column_type()` agree on
+every value). The curated `.slt` corpus needed no changes.
+
+---
+
+## Django `backends` — first triage (2026-07-19)
+
+**stock 319/324 · shim 311/324 · 13 shim failures, of which 5 are shared with
+stock (environmental / Django's own) and 8 are shim-only.** Both arms run the
+same workbench backend, so the diff isolates mpedb.
+
+**No wrong answers.** All 8 are refusals — mpedb declines a statement or
+reports a setting it does not implement. Nothing answered differently.
+
+### Blocker that had to be cleared first — gap D9
+
+`CREATE INDEX … ON django_session (expire_date)` fails: `expire_date` is a
+`DateTimeField`, `datetime` has sqlite NUMERIC affinity, NUMERIC maps to
+`ColumnType::Any`, and `Schema::validate` refuses an `any` index column ("the
+index is memcmp-ordered and `any` has no order across types"). This kills
+`migrate` during test-DB setup, so **not one test runs**. New workbench
+adaptation (both arms): the schema editor drops `CREATE INDEX` on NUMERIC-
+affinity columns. An index is a pure performance feature — no answer depends on
+one — so the only tests it can perturb fail in both arms and are excluded from
+the shim-only diff by construction. **Engine gap, recorded not fixed**; it is the
+subject of the in-flight "`any` columns indexable" work.
+
+### The 8, classified
+
+| # | Test(s) | Repro | Error | Class | Action |
+|---|---|---|---|---|---|
+| 1 | `test_get_primary_key_column`, `test_get_primary_key_column_pk_constraint` (2) | `BEGIN; SAVEPOINT s1; CREATE TABLE test_primary (id int PRIMARY KEY NOT NULL)` | `unsupported: DDL inside a SAVEPOINT is not supported by mpedb` | **engine** (`crates/mpedb` `apply_ddl`) — a `ROLLBACK TO` would have to revert the txn's captured schema bundle, which the savepoint snapshot does not restore; refused rather than risk a bundle/catalog desync | recorded |
+| 2 | `test_parameter_escaping` (`EscapingChecks`, `EscapingChecksDebug`) | `SELECT strftime('%s', date('now'))` | `bind error: unknown function 'date()'` | **mpedb-sql** — `date()`/`time()`/`datetime()`/`julianday()` are not implemented (`strftime()` is) | recorded |
+| 3 | `test_no_interpolation` | `SELECT strftime('%Y', 'now')` | `strftime(): unsupported time string "now"` | **mpedb-sql** — `'now'`, the Julian-day/unix-epoch numeric forms and the modifier language are refused by name rather than guessed | recorded |
+| 4 | `test_regexp_function` | `SELECT ? REGEXP ?` with both bound | `bind error: REGEXP pattern must be a literal in Phase 1` | **mpedb-sql** — a REGEXP pattern must be a compile-time literal (the plan is content-hashed and the regex compiled once) | recorded |
+| 5 | `test_init_command` | `PRAGMA synchronous = 3` then `PRAGMA synchronous` | `fetchone()` is `None` → `TypeError` | **shim**, deliberately NOT fixed — see below | recorded (gap D10) |
+| 6 | `test_constraint_checks_disabled_atomic_allowed` | `PRAGMA foreign_keys = ON` then `PRAGMA foreign_keys` → `0` | `AssertionError: False is not true` | **shim**, deliberately NOT fixed — see below | recorded (gap D11) |
+| 7 | `test_disable_constraint_checking_failure_disallowed` | same as 6 — Django's schema editor only raises when FK checks read as enabled | `NotSupportedError not raised` | same root cause as 6 | recorded (gap D11) |
+
+### Why 5–7 are recorded rather than fixed
+
+They are the only two of the eight that live inside `crates/mpedb-capi/`, and
+both would be "fixed" by having the shim store a setting and echo it back:
+
+* **D10 `synchronous`/`cache_size`.** Passing `test_init_command` requires
+  answering `3` to a durability probe. mpedb's durability is config-authoritative
+  and the shim does not honour the pragma, so the echo would be a claim about
+  fsync behaviour that is not true. That is the `typeof()` mistake one level up:
+  answering differently instead of erroring.
+* **D11 `foreign_keys`.** Reporting `1` would tell a consumer its FK violations
+  will be caught. mpedb parses `REFERENCES` and discards it; `0` is both the
+  truth and sqlite's own default. The workbench already declares
+  `supports_foreign_keys = False` for exactly this reason.
+
+**Fixed instead: the honest member of the same family** — `PRAGMA busy_timeout`
+/ `= N` now round-trips and IS the `sqlite3_busy_timeout()` knob the BUSY retry
+loop reads (`capi.rs::pragma_busy_timeout_round_trips_and_is_the_c_api_knob`).
+Before this, a consumer that set its lock timeout via the pragma rather than the
+C function was silently left at 0. It flips none of the 8 — it closes a real
+silent divergence the triage surfaced next to them.
+
+**Net: 0 of the 8 were both small and clearly correct to fix inside
+`mpedb-capi`.** Four are `mpedb-sql`/engine work owned elsewhere; the remaining
+two would require the shim to promise behaviour mpedb does not have.
