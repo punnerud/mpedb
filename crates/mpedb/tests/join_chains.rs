@@ -6,8 +6,10 @@
 //! the reference outputs inlined so the test stays deterministic and offline.
 //!
 //! Shapes that a left-deep plan cannot express stay REFUSED (never answered
-//! wrong): a RIGHT that is not first, a second RIGHT, any FULL in a chain, and a
-//! USING/NATURAL join trailing a leading RIGHT.
+//! wrong): a RIGHT that is not first, a second RIGHT, a FULL trailing a leading
+//! RIGHT, and a USING/NATURAL join trailing a leading RIGHT. A plain-chain FULL
+//! (no leading RIGHT) IS supported at any position — proven exhaustively in the
+//! `full_join_chains` differential; a couple of spot checks live here too.
 use mpedb::{Config, Database, ExecResult, Value};
 use std::ops::Deref;
 
@@ -338,21 +340,59 @@ fn second_right_is_refused() {
     assert!(e.contains("second RIGHT JOIN"), "{e}");
 }
 
+/// A FULL trailing a LEADING RIGHT stays refused: the RIGHT→LEFT swap composed
+/// with FULL's both-sides-whole handling is kept decoupled (the gather computes
+/// it correctly, but this combination is deliberately not enabled).
 #[test]
-fn full_in_chain_is_refused() {
+fn leading_right_then_full_is_refused() {
     let d = db("ref3");
-    // FULL trailing a leading RIGHT.
-    let e1 = err(
+    let e = err(
         &d,
         "SELECT a.av FROM a RIGHT JOIN b ON a.id = b.aid FULL JOIN c ON c.bid = b.id",
     );
-    assert!(e1.contains("FULL JOIN in a multi-join chain"), "{e1}");
-    // FULL as the first join of a longer chain (no RIGHT present).
-    let e2 = err(
+    assert!(e.contains("FULL JOIN following a leading RIGHT"), "{e}");
+}
+
+/// FULL as the FIRST join of a chain, then a LEFT: b11 (aid 3, no a) is the
+/// FULL's unmatched-right row → a NULL-extended; the trailing LEFT keeps it.
+/// (sqlite: a1|b10|c100 / NULL|b11|NULL / a2|b12|c101)
+#[test]
+fn full_first_then_left() {
+    let d = db("ffl");
+    let got = cells(&run(
         &d,
-        "SELECT a.av FROM a FULL JOIN b ON a.id = b.aid JOIN c ON c.bid = b.id",
+        "SELECT a.av, b.bv, c.cv FROM a FULL JOIN b ON a.id = b.aid \
+         LEFT JOIN c ON c.bid = b.id ORDER BY b.bv, c.cv",
+    ));
+    assert_eq!(
+        got,
+        vec![
+            vec![s("a1"), s("b10"), s("c100")],
+            vec![None, s("b11"), None],
+            vec![s("a2"), s("b12"), s("c101")],
+        ]
     );
-    assert!(e2.contains("multi-join chain"), "{e2}");
+}
+
+/// FULL as the LAST join: the accumulated INNER (a⋈b) is the left relation,
+/// then FULL against c — c102 (bid 99, no b) null-extends the whole left side.
+/// (sqlite: NULL|NULL|c102 / a1|b10|c100 / a2|b12|c101)
+#[test]
+fn inner_then_full_last() {
+    let d = db("itf");
+    let got = cells(&run(
+        &d,
+        "SELECT a.av, b.bv, c.cv FROM a JOIN b ON a.id = b.aid \
+         FULL JOIN c ON c.bid = b.id ORDER BY a.av, c.cv",
+    ));
+    assert_eq!(
+        got,
+        vec![
+            vec![None, None, s("c102")],
+            vec![s("a1"), s("b10"), s("c100")],
+            vec![s("a2"), s("b12"), s("c101")],
+        ]
+    );
 }
 
 #[test]
