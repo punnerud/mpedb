@@ -250,10 +250,12 @@ from READY, and recovery ignoring DONE slots are all exactly as they were.
   limit, not a UDF one; `INSERT … SELECT` is the working form and carries UDFs.
 - Contexts that structurally cannot carry closures: the streaming read path
   (`stream_query`) and the sqlite-backed contexts (`SqliteCtx`, `MergeCtx`).
-- A policy predicate (RLS `USING` / `WITH CHECK`) and a trigger body are compiled
-  from the shared catalog and evaluate WITHOUT the connection's closures — on
-  purpose: a shared, multi-process security predicate must not depend on
-  connection-local functions.
+- A trigger body is compiled from the shared catalog with an EMPTY host set
+  (`compile_trigger_body`), so it cannot contain a host call at all — a stored,
+  multi-process body must not depend on one connection's registrations. A
+  statement's RLS `WITH CHECK` program is likewise evaluated without the
+  closures, so a host call there refuses cleanly rather than resolving against
+  whichever connection happens to run the write.
 
 All of these refuse with `Unsupported("host function f() is not in scope for this
 execution")` / the aggregate twin. That message used to be `Error::Internal`,
