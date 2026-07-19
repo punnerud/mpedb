@@ -2692,6 +2692,22 @@ impl<'a> Binder<'a> {
     }
 
     fn unify_many(&mut self, operands: Vec<(BExpr, Ty)>, verb: &str) -> Result<(Vec<BExpr>, Ty)> {
+        // A dynamically-typed operand (`any` — a mixed CASE/COALESCE arm, a
+        // host UDF result, a typeless column) unifies with the whole set the
+        // way it unifies with one operand in `unify_operands`: nothing is
+        // coerced, and the settled type is `any`. The runtime handles the
+        // actual pairs — an IN membership runs each element through `sql_cmp`
+        // (numeric comparison crosses int/float; a cross-CLASS pair is a
+        // clean refusal, never a silent non-match). A bare parameter adopts
+        // `any` (= any value accepted), exactly as it did before this rule
+        // when EVERY operand was `any`.
+        if operands.iter().any(|(_, t)| *t == Some(ColumnType::Any)) {
+            let out = operands
+                .into_iter()
+                .map(|(e, t)| self.unify_param(e, t, ColumnType::Any).0)
+                .collect();
+            return Ok((out, Some(ColumnType::Any)));
+        }
         // Target type = the one every non-param operand agrees on, widened to
         // Float64 if ints and floats are mixed.
         let mut target: Ty = None;
