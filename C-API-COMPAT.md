@@ -13,6 +13,29 @@ clear error). Result-code **integers match sqlite exactly** (`SQLITE_OK=0`,
 `SQLITE_ROW=100`, `SQLITE_DONE=101`, `SQLITE_CONSTRAINT=19`, `SQLITE_MISUSE=21`,
 `SQLITE_RANGE=25`, …) because consumers `switch` on them.
 
+## Scope — what "100%" means
+
+sqlite's C reference lists ~300 functions and ~250 constants. This shim exports
+the **~50 the drop-in consumer path actually calls** — Python's `sqlite3`, language
+bindings, common tools — validated end-to-end by a DB-API 2.0 battery that matches
+stock sqlite **23/23**. It does *not* enumerate every symbol, because most are
+deliberate non-goals for an in-process, rigid-schema engine (each a clean refusal
+or safe no-op, never a wrong answer):
+
+- **UDF / collation registration** (`sqlite3_create_function*`, `_create_collation*`,
+  `_create_window_function`): exported but *refuse* (so `import` still works). The
+  typed compiled-IR layer (PySpell) is the intended path, not C callbacks.
+- **VFS / virtual-table module ABI** (`sqlite3_vfs_*`, `sqlite3_create_module*`):
+  mpedb has its own storage engine, not sqlite's pager — a named VFS is refused
+  (see `open_v2`); the one module that matters, **FTS5, is native**, not a plugin.
+- **Hooks & authorizer** (`_commit_hook`/`_rollback_hook`/`_update_hook`/`_wal_hook`/
+  `_set_authorizer`/`_trace_v2`/`_progress_handler`): safe no-ops.
+- **`sqlite3_config`, loadable extensions, serialize/backup internals, and
+  incremental blob I/O** beyond the listed set: out of scope.
+
+So "100%" is the **consumer / DB-API surface**, not every symbol in the reference.
+The tables below list, by category, exactly what the shim implements.
+
 ## The core ~30 (design §2)
 
 ### open / close
