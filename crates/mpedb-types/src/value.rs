@@ -358,6 +358,25 @@ impl Collation {
                 .cmp(b.trim_end_matches(' ').as_bytes()),
         }
     }
+
+    /// The CANONICAL fold of a text value under this collation: two strings are
+    /// equal under the collation iff their folds are byte-identical. This is the
+    /// equality half of [`compare_str`] made into a normal form, so a
+    /// collation-aware GROUP BY / DISTINCT key can be built by folding then
+    /// encoding bytewise (`keycode::encode_key_collated`).
+    ///
+    /// `Binary` is the identity. `NoCase` ASCII-lowercases (matching sqlite: only
+    /// A–Z fold, never Unicode); the fold is byte-length-preserving, so
+    /// folded-equal implies `nocase_cmp`-equal (which tie-breaks on length).
+    /// `Rtrim` drops trailing ASCII spaces.
+    pub fn fold_key(self, s: &str) -> std::borrow::Cow<'_, str> {
+        use std::borrow::Cow;
+        match self {
+            Collation::Binary => Cow::Borrowed(s),
+            Collation::NoCase => Cow::Owned(s.to_ascii_lowercase()),
+            Collation::Rtrim => Cow::Borrowed(s.trim_end_matches(' ')),
+        }
+    }
 }
 
 /// sqlite NOCASE: fold each ASCII uppercase byte to lowercase and compare the

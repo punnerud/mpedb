@@ -289,6 +289,8 @@ pub fn to_table_def(src: &SourceTable) -> Result<TableDef> {
             indexed: false,
             default: None,
             check: None,
+            // Mirror does not yet carry a source column collation (BINARY).
+            collation: mpedb_types::Collation::Binary,
         });
     }
     let primary_key = src.pk.iter().map(|&i| i as u16).collect();

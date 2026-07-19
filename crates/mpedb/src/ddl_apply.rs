@@ -234,6 +234,9 @@ pub(crate) fn table_def_from_spec(
             indexed: false,
             default: None,
             check: None,
+            // Declared `COLLATE` rides onto the column. A collated UNIQUE/PK is
+            // caught later by `Schema::validate` (collated indexes deferred).
+            collation: c.collation,
         })
         .collect();
     let indexes = spec
@@ -261,6 +264,7 @@ pub(crate) fn table_def_from_spec(
             indexed: false,
             default: None,
             check: None,
+            collation: mpedb_types::Collation::Binary,
         });
         vec![(columns.len() - 1) as u16]
     } else {
@@ -296,6 +300,7 @@ pub(crate) fn virtual_table_def_from_spec(
         indexed: false,
         default: None,
         check: None,
+        collation: mpedb_types::Collation::Binary,
     };
     // `rowid` and `rank` are reserved fts5 column names; a declared column
     // named for the table would shadow the whole-row `MATCH` operand.
@@ -380,6 +385,9 @@ pub(crate) fn add_column_from_spec(
         indexed: false,
         default,
         check: None,
+        // ADD COLUMN carries its declared `COLLATE`. UNIQUE on ADD is already
+        // refused above, so a collated index cannot arise here.
+        collation: spec.collation,
     };
     Ok((col, fill))
 }

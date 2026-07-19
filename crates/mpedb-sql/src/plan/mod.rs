@@ -937,6 +937,7 @@ pub(crate) fn cte_working_table_def(
                 indexed: false,
                 default: None,
                 check: None,
+                collation: mpedb_types::Collation::Binary,
             })
             .collect(),
         primary_key: Vec::new(),

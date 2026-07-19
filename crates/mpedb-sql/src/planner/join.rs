@@ -570,7 +570,7 @@ pub(super) fn plan_join_select<'s>(
             // joined-row column for this fast path, and the collation rides the
             // sort tuple.
             let (e, coll) = peel_collate(e)?;
-            let coll = coll.unwrap_or_default();
+            let coll = coll.unwrap_or_else(|| declared_collation(e, &binder.scope));
             // Same PG rule as the single-table path: an output ALIAS wins
             // over an input column of the same name.
             if let ast::Expr::Col(n) = e {
@@ -805,7 +805,7 @@ fn join_order_by(
         // Peel an explicit `COLLATE`; the inner expression drives resolution
         // (output position or sort-only column), the collation rides the sort.
         let (e, coll) = peel_collate(e)?;
-        let coll = coll.unwrap_or_default();
+        let coll = coll.unwrap_or_else(|| declared_collation(e, &binder.scope));
         if let Some(items) = items {
             if let Some(pos) = ordinal(e, items.len())? {
                 keys.push((pos, *desc, coll));

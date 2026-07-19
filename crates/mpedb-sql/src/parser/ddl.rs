@@ -12,7 +12,7 @@ use crate::ddl::{
     CreatePolicySpec, CreateTriggerSpec, DdlStmt, RlsAction, TriggerEvent, TriggerTiming,
 };
 use crate::token::{tokenize, Kw, Tok};
-use mpedb_types::{DefaultExpr, PolicyCmd, Result, Value};
+use mpedb_types::{Collation, DefaultExpr, PolicyCmd, Result, Value};
 
 /// Recognize and parse a row-level-security DDL statement (`CREATE POLICY`,
 /// `DROP POLICY`, `ALTER TABLE … ROW LEVEL SECURITY`). Returns `Ok(None)` if
@@ -146,6 +146,15 @@ impl<'a> Parser<'a> {
     /// assignment, pk resolution, validation) live in the facade/engine —
     /// this only builds the spec. `DEFAULT`/`CHECK`/foreign keys refuse by
     /// name so the gap is visible, not silent.
+    /// `COLLATE <name>` in a column definition → a built-in collating sequence
+    /// (BINARY/NOCASE/RTRIM, case-insensitive). An unknown name is a clean parse
+    /// error, matching sqlite's "no such collation sequence".
+    fn parse_collation_name(&mut self) -> Result<Collation> {
+        let name = self.ident("collation name after COLLATE")?;
+        Collation::parse(&name)
+            .ok_or_else(|| self.err_here(format!("no such collation sequence: {name}")))
+    }
+
     fn parse_create_table(&mut self) -> Result<DdlStmt> {
         let name = self.ident("table name")?;
         self.expect(&Tok::LParen, "(")?;
@@ -188,6 +197,7 @@ impl<'a> Parser<'a> {
                     unique: false,
                     pk: false,
                     default: None,
+                    collation: Collation::Binary,
                 };
                 loop {
                     // NOT and NULL are reserved keywords (Tok::Kw), not
@@ -216,11 +226,7 @@ impl<'a> Parser<'a> {
                              AUTOINCREMENT); drop the keyword to use it",
                         ));
                     } else if self.eat_word("COLLATE") {
-                        return Err(self.err_here(
-                            "column-declared COLLATE is not supported yet (stage 1b) — put \
-                             the COLLATE on the comparison or ORDER BY instead \
-                             (e.g. `WHERE name = 'x' COLLATE NOCASE`)",
-                        ));
+                        col.collation = self.parse_collation_name()?;
                     } else if self.eat_word("DEFAULT") || self.eat_word("CHECK")
                         || self.eat_word("REFERENCES")
                     {
@@ -685,6 +691,7 @@ impl<'a> Parser<'a> {
                 unique: false,
                 pk: false,
                 default: None,
+                collation: Collation::Binary,
             };
             loop {
                 if self.eat_kw(Kw::Not) {
@@ -698,10 +705,7 @@ impl<'a> Parser<'a> {
                     self.expect_word("KEY")?;
                     col.pk = true;
                 } else if self.eat_word("COLLATE") {
-                    return Err(self.err_here(
-                        "column-declared COLLATE is not supported yet (stage 1b) — put \
-                         the COLLATE on the comparison or ORDER BY instead",
-                    ));
+                    col.collation = self.parse_collation_name()?;
                 } else if self.eat_word("DEFAULT") {
                     // `ADD COLUMN … DEFAULT <const>` fills existing rows with the
                     // constant (and a `NOT NULL DEFAULT <const>` becomes legal —

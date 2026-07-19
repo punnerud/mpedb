@@ -916,6 +916,7 @@ mod tests {
             indexed: false,
             default: None,
             check: None,
+            collation: mpedb_types::Collation::Binary,
         };
         let table = |name: &str| TableDef {
             id: 0,
