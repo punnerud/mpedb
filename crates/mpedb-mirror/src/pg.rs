@@ -261,6 +261,8 @@ pub fn to_table_def(src: &PgTable) -> Result<TableDef> {
             indexed: false,
             default: None,
             check: None,
+            // Mirror does not yet carry a source column collation (BINARY).
+            collation: mpedb_types::Collation::Binary,
         });
     }
     Ok(TableDef {

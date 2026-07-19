@@ -55,6 +55,42 @@ pub(crate) use gather::{range_bounds, resolve_part, RawBound};
 use aggregate::exec_aggregate;
 use gather::{cmp_rows, gather_joined, gather_rows, gather_topk, sort_rows};
 
+/// The declared collation of every slot in the BASE (or joined) row being
+/// scanned — the concatenation of the scanned tables' column collations, in slot
+/// order. GROUP BY and DISTINCT fold their keys through this so a `NOCASE`/`RTRIM`
+/// column groups/deduplicates case-/space-insensitively (the collation is baked
+/// into the schema, so this is derived at execution and always agrees with the
+/// plan's `schema_hash`). `DUAL_TABLE`/`CTE_TABLE` and any out-of-range id
+/// contribute nothing — those slots default to BINARY.
+pub(super) fn base_row_collations(schema: &Schema, table: u32, joins: &[Join]) -> Vec<Collation> {
+    let mut out = Vec::new();
+    for id in std::iter::once(table).chain(joins.iter().map(|j| j.table)) {
+        if let Some(t) = schema.table(id) {
+            out.extend(t.columns.iter().map(|c| c.collation));
+        }
+    }
+    out
+}
+
+/// The declared collation of each PROJECTED output column: a bare column
+/// (`Projection::Column`) carries its declared collation; a computed column has
+/// none (BINARY), exactly as in sqlite. Used to fold `SELECT DISTINCT` keys.
+pub(super) fn output_collations(
+    schema: &Schema,
+    table: u32,
+    joins: &[Join],
+    projection: &[Projection],
+) -> Vec<Collation> {
+    let base = base_row_collations(schema, table, joins);
+    projection
+        .iter()
+        .map(|p| match p {
+            Projection::Column(i) => base.get(*i as usize).copied().unwrap_or(Collation::Binary),
+            Projection::Expr { .. } => Collation::Binary,
+        })
+        .collect()
+}
+
 /// The row operations the executor needs, implemented by both transaction
 /// kinds. Write operations on a read transaction are unreachable by
 /// construction (routing is by the recomputed `footprint.read_only`) and
@@ -942,6 +978,14 @@ fn exec_select(
             };
             let mut out = Vec::new();
             let mut seen = std::collections::HashSet::new();
+            // Per-output-column collation for DISTINCT: a NOCASE/RTRIM column
+            // deduplicates case-/space-insensitively (`SELECT DISTINCT name`),
+            // sqlite parity. Only built when DISTINCT (else unused).
+            let distinct_colls = if *distinct {
+                output_collations(schema, *table, joins, projection)
+            } else {
+                Vec::new()
+            };
             for row in rows.into_iter().skip(row_skip).take(row_take) {
                 let mut orow = Vec::with_capacity(projection.len());
                 for p in projection {
@@ -956,8 +1000,9 @@ fn exec_select(
                 // Keying on the memcmp encoding rather than on Value: DISTINCT
                 // must treat NULLs as equal to each other (unlike `=`), which
                 // is exactly what the key encoding does, and Value is neither
-                // Hash nor Ord.
-                if *distinct && !seen.insert(keycode::encode_key(&orow)) {
+                // Hash nor Ord. Text keys are folded under the output column's
+                // declared collation.
+                if *distinct && !seen.insert(keycode::encode_key_collated(&orow, &distinct_colls)) {
                     continue;
                 }
                 out.push(orow);
@@ -1111,6 +1156,14 @@ fn exec_select_with(
 
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
+    // DISTINCT folds each output column under its declared collation (as in the
+    // uncorrelated path above), so `SELECT DISTINCT name` on a NOCASE column
+    // deduplicates case-insensitively.
+    let distinct_colls = if *distinct {
+        output_collations(schema, *table, joins, projection)
+    } else {
+        Vec::new()
+    };
     for (row, scratch) in survivors {
         let mut orow = Vec::with_capacity(projection.len());
         for p in projection {
@@ -1122,7 +1175,7 @@ fn exec_select_with(
                 Projection::Expr { program, .. } => program.eval(&row, &scratch)?,
             });
         }
-        if *distinct && !seen.insert(keycode::encode_key(&orow)) {
+        if *distinct && !seen.insert(keycode::encode_key_collated(&orow, &distinct_colls)) {
             continue;
         }
         out.push(orow);

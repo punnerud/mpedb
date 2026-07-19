@@ -316,6 +316,7 @@ fn synthetic_window_table(win_types: &[(ColumnType, bool)]) -> TableDef {
             indexed: false,
             default: None,
             check: None,
+            collation: mpedb_types::Collation::Binary,
         })
         .collect();
     TableDef {
@@ -519,7 +520,7 @@ pub(super) fn plan_window_select(
         // Collation comes from the original key text; peel both the original
         // (for ordinal/alias) and the lifted expr (for item match / junk).
         let (orig, coll) = peel_collate(orig)?;
-        let coll = coll.unwrap_or_default();
+        let coll = coll.unwrap_or_else(|| declared_collation(orig, &name_scope));
         let (e, _) = peel_collate(e)?;
         // `ORDER BY 1` — an output ordinal.
         if let Some(pos) = ordinal(orig, n_items)? {

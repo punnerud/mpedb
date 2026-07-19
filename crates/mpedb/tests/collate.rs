@@ -10,9 +10,9 @@
 //!   * `ORDER BY <expr> COLLATE <coll>` (collated sort);
 //!   * NOCASE folds ONLY ASCII A–Z (Unicode is left byte-for-byte, as in sqlite).
 //!
-//! Column-declared `COLLATE` in `CREATE TABLE` is refused (stage 1b); a
-//! `COLLATE` anywhere it could not change a comparison or a sort is a clean
-//! error, never a silently-wrong answer.
+//! Column-declared `COLLATE` in `CREATE TABLE` / `ALTER ADD COLUMN` is now
+//! supported (see `collate_column.rs`); a `COLLATE` anywhere it could not change
+//! a comparison or a sort is still a clean error, never a silently-wrong answer.
 //!
 //! Determinism note: collated ORDER BY has ties sqlite may order arbitrarily
 //! ('abc' == 'ABC' under NOCASE), so every ordering query adds `, id` as a
@@ -313,11 +313,19 @@ fn collate_refusals_are_clean() {
         "unknown collation should say so: {e}"
     );
 
-    // Column-declared COLLATE in CREATE TABLE is stage 1b — refused by name.
-    let e = err("CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)");
+    // Column-declared COLLATE in CREATE TABLE is now SUPPORTED (collate_column.rs
+    // covers the semantics) — it must succeed, not refuse.
+    d.query(
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)",
+        &[],
+    )
+    .expect("column-declared COLLATE is now supported");
+    // But a collated UNIQUE/index is DEFERRED — refused cleanly (never a wrong
+    // uniqueness answer), naming COLLATE.
+    let e = err("CREATE TABLE cu (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE UNIQUE)");
     assert!(
         e.to_uppercase().contains("COLLATE"),
-        "column COLLATE should be refused by name: {e}"
+        "a collated UNIQUE should be refused by name: {e}"
     );
 
     // A COLLATE that could not change a comparison or a sort (here: buried in a

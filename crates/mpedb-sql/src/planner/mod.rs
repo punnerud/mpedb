@@ -22,7 +22,7 @@ type PlannedStmt = (
     Vec<Option<ColumnType>>,
     Vec<SubPlan>,
 );
-use crate::binder::{compile_program, peel_collate, BExpr, Binder, Scope, Ty};
+use crate::binder::{compile_program, declared_collation, peel_collate, BExpr, Binder, Scope, Ty};
 
 /// Resolved ORDER BY keys: `(column index into the sorted tuple, descending,
 /// collation)`. The collation is [`Collation::Binary`] for a plain `ORDER BY`.

@@ -242,6 +242,21 @@ impl<'a> Scope<'a> {
         format!("col#{c}")
     }
 
+    /// The DECLARED collating sequence of the column at tuple slot `c` — sqlite's
+    /// comparison/ORDER-BY precedence rung "if the operand is a column, use the
+    /// column's collation". [`Collation::Binary`] for an out-of-range slot (a
+    /// synthetic tuple with no such column), which degrades to the default.
+    pub fn column_collation(&self, c: u16) -> Collation {
+        let mut base = 0usize;
+        for t in &self.tables {
+            if (c as usize) < base + t.columns.len() {
+                return t.columns[c as usize - base].collation;
+            }
+            base += t.columns.len();
+        }
+        Collation::Binary
+    }
+
     /// Resolve a QUALIFIED `<table>.<column>`. The qualifier is checked rather
     /// than dropped: accepting `nonsense.id` as `id` turns a typo into a
     /// wrong-table read the moment a scope holds more than one table.
@@ -683,7 +698,15 @@ impl<'a> Binder<'a> {
                 // runtime on a query the binder had already accepted.
                 let (mut all, _) = self.unify_many(all, "compare with IN list")?;
                 let l = all.remove(0);
-                let coll = lhs_coll.unwrap_or_default();
+                // `x IN (…)` compares under the LEFT operand's (probe's)
+                // collation: an explicit `COLLATE` on the probe, else the probe
+                // COLUMN's declared collation (rung 2), else BINARY.
+                let coll = lhs_coll
+                    .or_else(|| match &l {
+                        BExpr::Col(idx) => Some(self.scope.column_collation(*idx)),
+                        _ => None,
+                    })
+                    .unwrap_or_default();
                 let node = if coll == Collation::Binary {
                     BExpr::InList(Box::new(l), all)
                 } else {
@@ -905,16 +928,25 @@ impl<'a> Binder<'a> {
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 let (l, r, _) = self.unify_operands(l, lt, r, rt, "compare")?;
-                // Precedence (task): explicit COLLATE on the LEFT operand wins,
-                // else the RIGHT operand's, else BINARY. (A column's declared
-                // collation — precedence rung 3 — is stage 1b and not yet
-                // consulted.) A non-Binary collation gets its own node so the
+                // sqlite's collation precedence, in order: an explicit `COLLATE`
+                // on the LEFT operand, else on the RIGHT; else the LEFT operand's
+                // COLUMN collation (rung 2), else the RIGHT column's; else BINARY.
+                // A non-Binary result gets its own `CollateCmp` node so the
                 // access-path extractor never mistakes it for an index probe; a
                 // Binary comparison stays a plain `Binary` node, byte-for-byte
-                // unchanged. Collation degrades to bytewise for non-text at
-                // runtime, so emitting it for any statically-unpinned operand is
-                // safe.
-                let coll = l_coll.or(r_coll).unwrap_or_default();
+                // unchanged (and a Binary-collated text column resolves to Binary,
+                // so an index/PK equality on it is untouched). Collation degrades
+                // to bytewise for non-text at runtime, so emitting it for any
+                // statically-unpinned operand is safe.
+                let col_coll = |e: &BExpr| match e {
+                    BExpr::Col(idx) => Some(self.scope.column_collation(*idx)),
+                    _ => None,
+                };
+                let coll = l_coll
+                    .or(r_coll)
+                    .or_else(|| col_coll(&l))
+                    .or_else(|| col_coll(&r))
+                    .unwrap_or_default();
                 let node = if coll == Collation::Binary {
                     BExpr::Binary(op, Box::new(l), Box::new(r))
                 } else {
@@ -1565,6 +1597,22 @@ pub(crate) fn peel_collate(e: &ast::Expr) -> Result<(&ast::Expr, Option<Collatio
     Ok((cur, Some(coll)))
 }
 
+/// The collation an ORDER BY / comparison key gets from the COLUMN it names,
+/// when no explicit `COLLATE` overrides — sqlite's precedence rung 2 ("if either
+/// operand is a column, use that column's declared collation"). Returns
+/// [`Collation::Binary`] when the key is not a bare column reference (an ordinal,
+/// an expression, a literal): those carry no column collation, exactly as in
+/// sqlite. A `+col` is NOT treated as a column here (rare; falls back to BINARY,
+/// which only differs from sqlite for a `+`-prefixed collated column in ORDER BY).
+pub(crate) fn declared_collation(key: &ast::Expr, scope: &Scope) -> Collation {
+    let slot = match key {
+        ast::Expr::Col(n) => scope.resolve(n).ok().map(|(i, _)| i),
+        ast::Expr::Qualified(q, n) => scope.resolve_qualified(q, n).ok().map(|(i, _)| i),
+        _ => None,
+    };
+    slot.map(|s| scope.column_collation(s)).unwrap_or(Collation::Binary)
+}
+
 /// Map one of the six comparison `BinOp`s to its collated-instruction kind.
 fn cmp_kind(op: BinOp) -> CmpKind {
     match op {
@@ -1841,7 +1889,7 @@ mod tests {
             unique: false,
             indexed: false,
             default: None,
-            check: None,
+            check: None, collation: Collation::Binary,
         };
         TableDef {
             id: 0,
@@ -2160,7 +2208,7 @@ mod tests {
                 unique: false,
                 indexed: false,
                 default: None,
-                check: None,
+                check: None, collation: Collation::Binary,
             }],
             primary_key: vec![0],
             indexes: vec![],
@@ -2202,7 +2250,7 @@ mod tests {
                 unique: false,
                 indexed: false,
                 default: None,
-                check: None,
+                check: None, collation: Collation::Binary,
             }],
             primary_key: vec![0],
             indexes: vec![],
