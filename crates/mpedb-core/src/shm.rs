@@ -978,11 +978,16 @@ impl Shm {
             match unsafe { libc::pthread_mutex_trylock(self.mutex_ptr()) } {
                 0 => return Ok(false),
                 libc::EOWNERDEAD => return self.adopt_after_owner_death(),
-                // EBUSY: someone holds it. EDEADLK never comes from trylock on
-                // an ERRORCHECK mutex — the owner re-entering gets EBUSY here
-                // and falls through to the blocking call below, which reports
-                // it properly (§7.2). The spin costs that path a few hundred
-                // nanoseconds before it errors.
+                // EBUSY: someone holds it. NOTE (measured, #109 review): on
+                // glibc a ROBUST+ERRORCHECK mutex answers the owner's own
+                // trylock with EDEADLK, not EBUSY — try_writer_lock maps that
+                // to the reentry error and the deadline path folds it to an
+                // immediate Busy. Apple's libpthread deliberately answers
+                // EBUSY for the same relock (rdar://16261552), so on macOS
+                // the owner falls through to the blocking call below, which
+                // reports the reentry properly (§7.2) — meaning the
+                // fold-to-immediate-Busy shortcut is glibc-only and a macOS
+                // same-thread sibling waits out its deadline instead.
                 libc::EBUSY => std::hint::spin_loop(),
                 _ => break,
             }

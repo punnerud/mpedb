@@ -309,6 +309,10 @@ fn exec_one(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome,
         Kind::Pragma => {
             let bundle = c.db.schema();
             let (columns, rows) = introspect::pragma(&bundle, sqltext, &mut c.busy_timeout_ms)?;
+            // `PRAGMA busy_timeout = N` may have moved the knob — mirror it
+            // into the engine's writer-lock deadline (#109), same as
+            // `sqlite3_busy_timeout`. Unconditional: an atomic store, cheap.
+            c.db.set_busy_timeout(Some(Duration::from_millis(c.busy_timeout_ms.max(0) as u64)));
             Ok(Outcome::Rows { columns, rows })
         }
         Kind::Read if introspect::references_sqlite_master(sqltext) => {
@@ -387,13 +391,16 @@ fn to_outcome(res: ExecResult) -> Outcome {
     }
 }
 
-/// Execute `stmt` (first step). Updates connection counters. Returns the
-/// primary result code to hand back from the failing API on error, else OK.
 /// A contention error a RETRY can clear — an optimistic-mode `WriteConflict`
 /// (the loser rolled back, nothing applied), a full reader table, or an evicted
 /// read snapshot. valconv maps all three to `SQLITE_BUSY`; `busy_timeout` waits
-/// on exactly these. (In the normal serial writer mode the writer lock BLOCKS
-/// instead of returning one of these, so there is nothing to wait on.)
+/// on exactly these.
+///
+/// `DbError::Busy` is deliberately NOT here (#109): it means the ENGINE
+/// already waited out this connection's busy timeout at the writer lock
+/// (`Database::set_busy_timeout`, wired at open / `sqlite3_busy_timeout` /
+/// `PRAGMA busy_timeout`) — retrying it in this loop would double the wait.
+/// It maps straight to `SQLITE_BUSY` ("database is locked").
 fn is_busy_err(e: &DbError) -> bool {
     matches!(
         e,
@@ -429,11 +436,14 @@ fn run_stmt(s: &mut Stmt) -> c_int {
     // The statement is about to run: drain any stale UDF-error stash so an
     // error surfaced by THIS run is attributable to this run alone.
     udf::take_last_udf_error();
-    // `busy_timeout(ms)`: on a BUSY-class contention error, sleep with sqlite's
-    // backoff and retry until the deadline, exactly as sqlite's default busy
-    // handler does — a transient conflict clears instead of failing the call.
-    // Zero timeout (the default) = no retry, immediate BUSY, as sqlite. Serial
-    // mode never enters the loop (the writer lock blocks, never returns BUSY).
+    // `busy_timeout(ms)`: on a RETRYABLE contention error (`is_busy_err`),
+    // sleep with sqlite's backoff and retry until the deadline, exactly as
+    // sqlite's default busy handler does — a transient conflict clears
+    // instead of failing the call. Zero timeout (the default) = no retry,
+    // immediate BUSY, as sqlite. Writer-LOCK contention never reaches this
+    // loop: the engine itself waits out the same timeout at the lock
+    // (`Database::set_busy_timeout`, #109) and returns the terminal
+    // `DbError::Busy` — retrying that here would double the wait.
     let deadline =
         (c.busy_timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(c.busy_timeout_ms as u64));
     // Execute the parameter-rewritten text (`$K` placeholders) so mpedb binds
@@ -867,6 +877,13 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
 
     register_shim_builtins(&db);
 
+    // #109: bound the facade's writer-lock waits from the very first
+    // statement. sqlite's default is NO busy handler — immediate SQLITE_BUSY
+    // on contention — which is timeout 0; `sqlite3_busy_timeout` / `PRAGMA
+    // busy_timeout` raise it. Without this the engine would block forever
+    // under cross-process writer contention (compat gap E1).
+    db.set_busy_timeout(Some(Duration::ZERO));
+
     let mut c = Box::new(Sqlite3 {
         txn: None,
         db,
@@ -1038,6 +1055,11 @@ pub unsafe extern "C" fn sqlite3_busy_timeout(db: *mut Sqlite3, ms: c_int) -> c_
     match conn(db) {
         Some(c) => {
             c.busy_timeout_ms = ms;
+            // The same knob bounds the ENGINE's writer-lock wait (#109):
+            // cross-process contention returns Busy → SQLITE_BUSY at this
+            // deadline instead of blocking forever. `ms <= 0` = sqlite's
+            // handler-cleared state: one immediate attempt, immediate BUSY.
+            c.db.set_busy_timeout(Some(Duration::from_millis(ms.max(0) as u64)));
             SQLITE_OK
         }
         None => SQLITE_MISUSE,

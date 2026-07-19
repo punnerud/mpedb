@@ -393,7 +393,7 @@ impl Database {
         }
 
         let key = trigger_key(&spec.name);
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         if matches!(w.sys_get(&key), Ok(Some(_))) {
             w.abort();
             if spec.if_not_exists {
@@ -434,7 +434,7 @@ impl Database {
     /// `DROP TRIGGER [IF EXISTS] <name>`.
     pub(crate) fn apply_drop_trigger(&self, name: &str, if_exists: bool) -> Result<ExecResult> {
         let key = trigger_key(name);
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         if !matches!(w.sys_get(&key), Ok(Some(_))) {
             w.abort();
             if if_exists {
