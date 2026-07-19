@@ -16,7 +16,10 @@
 //!
 //! A MISSING path is CREATED, as `sqlite3 db.db` creates one: `.mpedb` seeds a
 //! native database (see [`create_native`]), anything else an empty sqlite base
-//! so the file stays readable by every sqlite tool.
+//! so the file stays readable by every sqlite tool. Creation is LAZY, exactly
+//! as sqlite3's is: the file appears when the FIRST STATEMENT runs, so opening
+//! a repl and leaving it again (or typing only dot-commands) leaves the
+//! directory untouched. See [`PendingCreate`].
 
 use std::path::{Path, PathBuf};
 
@@ -111,10 +114,54 @@ fn create_sqlite_base(path: &Path) -> CliResult {
     Ok(())
 }
 
-/// A missing path: create the database, as `sqlite3 db.db` does. Only the
-/// PARENT directory is a hard error — inventing directories is not our call,
-/// and neither is inventing a config file.
-fn create_missing(path: &str, p: &Path) -> CliResult {
+/// A database that does not exist YET: what would be created, held until the
+/// first statement asks for it.
+///
+/// `sqlite3 new.db` followed by `.exit` leaves no file behind — the database is
+/// materialized by the first STATEMENT (even one that then fails), never by the
+/// open itself, and never by a dot-command. So a missing path is decided at open
+/// (that is where "no such directory" and "no such config file" are still hard
+/// errors) but not touched, and this value travels into the session that may
+/// need it.
+///
+/// [`materialize`](PendingCreate::materialize) takes `self`, so a pending create
+/// can be spent exactly once; every session holds it as an `Option` and `take`s
+/// it in the single function through which statements enter
+/// ([`OverlaySession::exec`], [`crate::repl::run_path`]'s pre-loop). There is no
+/// second door to forget about.
+pub struct PendingCreate {
+    path: PathBuf,
+    /// `.mpedb` → a native mpedb database; anything else → an empty sqlite base.
+    native: bool,
+}
+
+impl PendingCreate {
+    /// Would this create a sqlite base (rather than a native `.mpedb`)? Decides
+    /// the flow for a path that does not exist yet, where `is_sqlite` cannot.
+    fn is_sqlite_base(&self) -> bool {
+        !self.native
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Create the file, printing the "created …" notice. Consumes the pending
+    /// create: it can happen at most once.
+    pub fn materialize(self) -> CliResult {
+        if self.native {
+            create_native(&self.path)
+        } else {
+            create_sqlite_base(&self.path)
+        }
+    }
+}
+
+/// A missing path: decide what would be created, as `sqlite3 db.db` does — but
+/// do not create it yet (see [`PendingCreate`]). Only the PARENT directory is a
+/// hard error — inventing directories is not our call, and neither is inventing
+/// a config file; both are reported at OPEN, since neither is fixable later.
+fn plan_create(path: &str, p: &Path) -> Result<PendingCreate, Failure> {
     if let Some(dir) = p.parent() {
         if !dir.as_os_str().is_empty() && !dir.is_dir() {
             return runtime(format!(
@@ -131,19 +178,21 @@ fn create_missing(path: &str, p: &Path) -> CliResult {
              to have it created"
         ));
     }
-    if ext == "mpedb" {
-        create_native(p)
-    } else {
-        create_sqlite_base(p)
-    }
+    Ok(PendingCreate {
+        path: p.to_path_buf(),
+        native: ext == "mpedb",
+    })
 }
 
-/// The bare-path entry: dispatch on what the file actually is.
+/// The bare-path entry: dispatch on what the file actually is — or, when it does
+/// not exist yet, on what it WOULD be.
 pub fn run(path: &str, rest: &[String]) -> CliResult {
     let p = Path::new(path);
-    if !p.exists() {
-        create_missing(path, p)?;
-    }
+    let mut pending = if p.exists() {
+        None
+    } else {
+        Some(plan_create(path, p)?)
+    };
     // `--direct`: read-only SQL straight over the sqlite file — the native
     // reader, no sidecar, no import, no sqlite library. Quiescence is the
     // caller's responsibility (or use `--overlay`, which locks).
@@ -207,6 +256,15 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
         None
     };
     let rest = rest.as_slice();
+    // `--direct` (read-only attach) and `--mirror` (full sidecar import) are
+    // explicit, non-default flows that need a real file underneath before they
+    // can do anything at all — there is no statement to defer to. Settle a
+    // pending create here; the lazy path below is the sqlite3-shaped default.
+    if direct || mirror {
+        if let Some(c) = pending.take() {
+            c.materialize()?;
+        }
+    }
     if direct {
         if !is_sqlite(p) {
             return runtime(format!("--direct needs a sqlite file, {path} is not one"));
@@ -218,8 +276,12 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
     // through to the base via the native reader, and `checkpoint` folds them in.
     // `--mirror` chooses the full sidecar import instead; `--overlay` is accepted
     // for back-compat but is now the default.
-    if is_sqlite(p) && !mirror {
-        return run_overlay(p, mode, reconcile, rest);
+    // A path that does not exist yet routes on what it WOULD be: a pending
+    // sqlite base is an overlay session exactly like an existing one, it just
+    // creates the base on its first statement.
+    let sqlite_target = is_sqlite(p) || pending.as_ref().is_some_and(PendingCreate::is_sqlite_base);
+    if sqlite_target && !mirror {
+        return run_overlay(p, mode, reconcile, rest, pending);
     }
     if overlay {
         return runtime(format!("--overlay needs a sqlite file, {path} is not one"));
@@ -260,8 +322,13 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
     };
 
     match rest {
-        [] => crate::repl::run(&[target]),
+        // The repl creates nothing until its first statement (see
+        // `repl::run_path`); a one-shot IS a statement, so it creates now.
+        [] => crate::repl::run_path(&target, pending),
         [sql, params @ ..] => {
+            if let Some(c) = pending {
+                c.materialize()?;
+            }
             let db = open_target(&target)?;
             let vals: Vec<mpedb::Value> = params.iter().map(|p| parse_param(p)).collect();
             let res = db.query(sql, &vals)?;
@@ -280,12 +347,14 @@ fn run_overlay(
     mode: mpedb::LockMode,
     reconcile: Option<mpedb::ReconcilePolicy>,
     rest: &[String],
+    pending: Option<PendingCreate>,
 ) -> CliResult {
     let mut s = OverlaySession {
         base: p.to_path_buf(),
         mode,
         reconcile,
         handle: None,
+        pending,
     };
     match rest {
         [sql, params @ ..] => {
@@ -304,17 +373,31 @@ fn run_overlay(
 ///   tables mirror the base's schema, so there is nothing to build until the
 ///   base HAS a schema;
 /// - routes DDL to the BASE (see [`OverlaySession::base_ddl`]): the schema is
-///   the base's, exactly as it is for every other sqlite tool.
+///   the base's, exactly as it is for every other sqlite tool;
+/// - owns the [`PendingCreate`] for a base that does not exist yet, and spends
+///   it in [`exec`](OverlaySession::exec) — the ONE function a statement can
+///   enter this session through, so the file is created by the first statement
+///   and by nothing else.
 struct OverlaySession {
     base: PathBuf,
     mode: mpedb::LockMode,
     reconcile: Option<mpedb::ReconcilePolicy>,
     handle: Option<mpedb::SqliteOverlay>,
+    /// `Some` until the first statement materializes the base.
+    pending: Option<PendingCreate>,
 }
 
 impl OverlaySession {
     /// The open overlay, built on first use.
     fn handle(&mut self) -> Result<&mut mpedb::SqliteOverlay, Failure> {
+        if self.pending.is_some() {
+            // Only `exec` materializes, so anything else reaching for the
+            // overlay (`.checkpoint`, `.reconcile`) has nothing to open yet.
+            return runtime(format!(
+                "{} does not exist yet — run a statement to create it",
+                self.base.display()
+            ));
+        }
         if self.handle.is_none() {
             if base_user_tables(&self.base)? == 0 {
                 return runtime(format!(
@@ -334,7 +417,14 @@ impl OverlaySession {
 
     /// Run one statement: DDL against the base, everything else against the
     /// merged overlay view.
+    ///
+    /// This is where a missing base comes into existence — sqlite3 materializes
+    /// the file on the first STATEMENT, including one that then fails, so the
+    /// create happens BEFORE the statement is even classified.
     fn exec(&mut self, sql: &str, params: &[mpedb::Value]) -> CliResult {
+        if let Some(c) = self.pending.take() {
+            c.materialize()?;
+        }
         if is_ddl(sql) {
             return self.base_ddl(sql);
         }
@@ -375,6 +465,10 @@ impl OverlaySession {
     /// currently is. Never fails the session: a base we cannot attach yet just
     /// completes nothing.
     fn refresh_names(&mut self, names: &std::rc::Rc<std::cell::RefCell<Names>>) {
+        if self.pending.is_some() {
+            names.borrow_mut().tables.clear();
+            return;
+        }
         if self.handle.is_none() && base_user_tables(&self.base).unwrap_or(0) == 0 {
             names.borrow_mut().tables.clear();
             return;
@@ -431,6 +525,13 @@ impl OverlaySession {
                     ),
                     Err(e) => eprintln!("error: {}", failure_msg(&e)),
                 }
+                continue;
+            }
+            // Any OTHER dot-command is unknown — and must stay a dot-command,
+            // not fall through to `exec`, which would create a pending database
+            // for something that is not a statement at all.
+            if stmt.starts_with('.') {
+                eprintln!("error: unknown command {stmt} (try .checkpoint .reconcile .quit)");
                 continue;
             }
             if let Err(e) = self.exec(stmt, &[]) {
