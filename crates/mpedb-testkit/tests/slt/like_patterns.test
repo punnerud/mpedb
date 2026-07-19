@@ -4,8 +4,9 @@
 # clause -- `%`/`_` cannot be matched literally. A non-text operand is coerced
 # to text (`id LIKE 'x'` is `CAST(id AS TEXT) LIKE 'x'`), also like sqlite.
 # The pattern must be a string literal (Phase 1). NULL never matches.
-# (PostgreSQL's LIKE is case-sensitive and rigid -- a PG-strict dialect mode is
-# planned; this file exercises the sqlite default.)
+# (PostgreSQL's LIKE is case-sensitive and rigid -- that PG-strict mode is
+# selectable via the `[compat] bare_group_by = "postgres"` dialect, the same
+# signal that drives GROUP BY strictness; this file exercises the sqlite default.)
 #
 # schema:
 # [[table]]

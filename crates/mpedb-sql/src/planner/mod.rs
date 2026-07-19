@@ -398,8 +398,8 @@ pub(crate) fn plan_statement(
             plan_recursive_cte(rc, schema, n_params, catalog, mode, &mut consts)?
         }
         ast::Stmt::Insert(s) => plan_insert(s, schema, n_params, catalog, mode, &mut consts)?,
-        ast::Stmt::Update(s) => plan_update(s, schema, n_params, catalog, &mut consts)?,
-        ast::Stmt::Delete(s) => plan_delete(s, schema, n_params, catalog, &mut consts)?,
+        ast::Stmt::Update(s) => plan_update(s, schema, n_params, catalog, mode, &mut consts)?,
+        ast::Stmt::Delete(s) => plan_delete(s, schema, n_params, catalog, mode, &mut consts)?,
     };
     // The 16-subplan ceiling bounds the WHOLE tree once nesting (#73 §3) can
     // grow it past one level — matching the recursive decoder's DoS budget, so a
@@ -882,6 +882,7 @@ fn plan_insert(
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
     let mut binder = Binder::new(table, n_params, true);
+    binder.set_dialect(mode);
 
     // Map each table column to its position in the VALUES tuples (or None).
     let listed: Vec<u16> = match &s.columns {
@@ -1102,10 +1103,12 @@ fn plan_update(
     schema: &Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
+    mode: BareGroupBy,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
     let mut binder = Binder::new(table, n_params, true);
+    binder.set_dialect(mode);
 
     // sqlite (R-34751-18293): when a column is assigned more than once, all but
     // the RIGHTMOST occurrence is ignored — not evaluated, not type-checked. So
@@ -1176,10 +1179,12 @@ fn plan_delete(
     schema: &Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
+    mode: BareGroupBy,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
     let mut binder = Binder::new(table, n_params, true);
+    binder.set_dialect(mode);
     let bound_where = s
         .where_clause
         .as_ref()
@@ -1284,7 +1289,7 @@ fn max_col(e: &BExpr) -> Option<u16> {
         match e {
             BExpr::Col(c) => m = Some(m.map_or(*c, |p| p.max(*c))),
             BExpr::Unary(_, a)
-            | BExpr::Like(a, _)
+            | BExpr::Like(a, _, _)
             | BExpr::Glob(a, _)
             | BExpr::Regexp(a, _)
             | BExpr::Cast(a, _)

@@ -800,7 +800,7 @@ fn refs_correlated(b: &BExpr, sub_base: u16, correlated: &[bool]) -> bool {
         BExpr::Param(i) => is_corr(*i),
         BExpr::Const(_) | BExpr::Col(_) => false,
         BExpr::Unary(_, a)
-        | BExpr::Like(a, _)
+        | BExpr::Like(a, _, _)
         | BExpr::Glob(a, _)
         | BExpr::Regexp(a, _)
         | BExpr::Cast(a, _) => refs_correlated(a, sub_base, correlated),

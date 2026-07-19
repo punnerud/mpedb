@@ -217,7 +217,16 @@ const MAX_JOINS: usize = 16;
 //     hits an unknown window func tag and rejects the plan as corrupt rather
 //     than misreading it — the same additive whole-plan-version gating as the
 //     earlier window bumps (24, 34).
-const PLAN_FORMAT: u8 = 36;
+// 37: config-selectable PostgreSQL-strict LIKE. A new additive expr opcode —
+//     `Instr::LikeCs` (38, case-SENSITIVE LIKE) — is emitted for a
+//     `bare_group_by = "postgres"` database (the same dialect signal #87 uses for
+//     GROUP BY strictness); the sqlite default still emits `Instr::Like` (22).
+//     Case-sensitivity changes what the plan MEANS, so it is baked into the
+//     opcode rather than resolved at eval time — two dialects hash to distinct
+//     plans. A format-36 reader hits the unknown opcode 38 and rejects the plan
+//     as corrupt rather than misreading it, so the whole-plan version gates it:
+//     a format-36 blob fails CLOSED at byte 0 with the documented re-prepare.
+const PLAN_FORMAT: u8 = 37;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
