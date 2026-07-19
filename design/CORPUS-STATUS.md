@@ -1,5 +1,36 @@
 # Corpus status — measured sqllogictest compatibility
 
+## UPDATE 2026-07-19 (night) — blocker #3 CLOSED: subquery-in-compound (520 → 0)
+
+Measured on `worktree-agent-a92241e663ca8262a` (PLAN_FORMAT 49: materialized
+derived tables + uncorrelated subqueries in compound arms), release build,
+same runner/procedure. The whole 520-record category lives in the 16
+`index/view/*/slt_good_*.test` files; they were re-swept before/after with
+byte-identical baselines to the whole-corpus numbers below:
+
+| 16 view files | before (main @ 1b200a2) | after |
+|---|---|---|
+| attempted | 123,809 | 123,809 |
+| passed | 108,709 (99.5 %) | **109,229 (100.0 %)** |
+| unsupported | **520** (260 `subquery` + 260 `compound-select`) | **0** |
+| wrong answers / error mismatches | 0 / 0 | **0 / 0** |
+| queries verified vs sqlite's md5 | 39,005 | **39,525** |
+
+The root cause was NOT the derived table itself: the statements are
+`SELECT … FROM view_1 UNION [ALL] SELECT … FROM view_2` where the flattened
+view bodies carry uncorrelated `IN (SELECT …)` subqueries, tripping
+`plan_compound`'s "a subquery inside a compound SELECT is not supported yet".
+Closed by per-arm reserved-slot offsets (each arm's lifts numbered against the
+final statement layout at plan time; filled once before dispatch — zero
+executor change). Materialized derived tables (`PlanStmt::Derived`,
+design/DESIGN-DERIVED-TABLES.md §5) shipped in the same window and close the
+Django `SELECT <agg> FROM (<grouping body>) subquery` family.
+
+Regression: `select1-4` + `evidence/` re-swept before/after — TOTALs and the
+wrong-list byte-identical (the 4 known `slt_lang_replace` runner artifacts,
+nothing else). Remaining engine gaps from the list below: legacy trigger
+timing 23, `DROP INDEX`/`REINDEX` 2.
+
 ## UPDATE 2026-07-19 (later) — blocker #1 CLOSED: per-row CASE/COALESCE arm typing
 
 Re-measured on `worktree-agent-ab353fa3dff3636ce` (per-row arm typing, x86-64
