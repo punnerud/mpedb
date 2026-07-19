@@ -98,6 +98,110 @@ fn open_create_insert_select_step() {
 }
 
 #[test]
+fn named_parameters_bind_by_index() {
+    // The shim rewrites `:name`/`@name`/`$name` to mpedb's numbered `$K` before
+    // the engine parses, and answers `bind_parameter_count`/`_name`/`_index`
+    // from the maps — so an unmodified named-param consumer (CPython's sqlite3)
+    // works. This drives the exact calls CPython makes.
+    unsafe {
+        let db = open_memory();
+        assert_eq!(
+            exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)"),
+            SQLITE_OK
+        );
+        assert_eq!(exec(db, "INSERT INTO t VALUES (1, 'alice', 30)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t VALUES (2, 'bob', 40)"), SQLITE_OK);
+
+        // A three-sigil, name-reusing statement. `:lo` appears twice → one param.
+        let sql = cs("SELECT id FROM t WHERE age >= :lo AND age <= @hi AND name = $nm AND :lo > 0");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_OK
+        );
+        // Three distinct names → count 3 (the repeat of :lo shares number 1).
+        assert_eq!(sqlite3_bind_parameter_count(st), 3);
+        assert_eq!(param_name(st, 1), Some(":lo".to_string()));
+        assert_eq!(param_name(st, 2), Some("@hi".to_string()));
+        assert_eq!(param_name(st, 3), Some("$nm".to_string()));
+        // bind_parameter_index round-trips the spelling (sigil included); a wrong
+        // spelling or a missing name → 0.
+        assert_eq!(param_index(st, ":lo"), 1);
+        assert_eq!(param_index(st, "@hi"), 2);
+        assert_eq!(param_index(st, "$nm"), 3);
+        assert_eq!(param_index(st, "lo"), 0); // no sigil
+        assert_eq!(param_index(st, ":missing"), 0);
+
+        // Bind exactly as CPython does: look each name up by index, bind there.
+        assert_eq!(sqlite3_bind_int(st, param_index(st, ":lo"), 30), SQLITE_OK);
+        assert_eq!(sqlite3_bind_int(st, param_index(st, "@hi"), 35), SQLITE_OK);
+        let nm = cs("alice");
+        assert_eq!(
+            sqlite3_bind_text(st, param_index(st, "$nm"), nm.as_ptr(), -1, sqlite_transient()),
+            SQLITE_OK
+        );
+
+        // alice (age 30) matches 30<=30<=35 and :lo(30)>0; bob (40) does not.
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_int(st, 0), 1);
+        assert_eq!(sqlite3_step(st), SQLITE_DONE);
+
+        // Rebind the reused name once and it applies at BOTH occurrences: set
+        // :lo above every age so the WHERE excludes every row.
+        assert_eq!(sqlite3_reset(st), SQLITE_OK);
+        assert_eq!(sqlite3_bind_int(st, 1, 999), SQLITE_OK); // :lo
+        assert_eq!(sqlite3_step(st), SQLITE_DONE); // no rows: 999 > every age
+        sqlite3_finalize(st);
+
+        // Out-of-range index on a named statement is still SQLITE_RANGE.
+        let q = cs("SELECT :only");
+        let mut qp: *mut Stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, q.as_ptr(), -1, &mut qp, ptr::null_mut()),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_bind_parameter_count(qp), 1);
+        assert_eq!(sqlite3_bind_int(qp, 2, 0), SQLITE_RANGE);
+        sqlite3_finalize(qp);
+
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+#[test]
+fn named_and_positional_mixed_numbering() {
+    // Named and `?` share one numbering space (sqlite semantics). Bind by number
+    // and read the values straight back to prove each slot maps to the right one.
+    unsafe {
+        let db = open_memory();
+        // `?`=1, :a=2, `?`=3, :a reused=2  → count 3, columns echo the binds.
+        let sql = cs("SELECT ?, :a, ?, :a");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_bind_parameter_count(st), 3);
+        assert_eq!(param_name(st, 1), None); // anonymous `?`
+        assert_eq!(param_name(st, 2), Some(":a".to_string()));
+        assert_eq!(param_name(st, 3), None);
+        assert_eq!(param_index(st, ":a"), 2);
+
+        assert_eq!(sqlite3_bind_int(st, 1, 100), SQLITE_OK);
+        assert_eq!(sqlite3_bind_int(st, 2, 200), SQLITE_OK); // :a
+        assert_eq!(sqlite3_bind_int(st, 3, 300), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_int(st, 0), 100); // ?  -> 1
+        assert_eq!(sqlite3_column_int(st, 1), 200); // :a -> 2
+        assert_eq!(sqlite3_column_int(st, 2), 300); // ?  -> 3
+        assert_eq!(sqlite3_column_int(st, 3), 200); // :a reused -> 2
+        assert_eq!(sqlite3_step(st), SQLITE_DONE);
+        sqlite3_finalize(st);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+#[test]
 fn constraint_error_maps_to_sqlite_constraint() {
     unsafe {
         let db = open_memory();
@@ -502,6 +606,22 @@ fn sqlite_transient() -> *mut c_void {
 
 unsafe fn col_name(st: *mut Stmt, i: c_int) -> String {
     CStr::from_ptr(sqlite3_column_name(st, i)).to_str().unwrap().to_string()
+}
+
+/// `sqlite3_bind_parameter_name(i)` as an `Option<String>` (None → anonymous).
+unsafe fn param_name(st: *mut Stmt, i: c_int) -> Option<String> {
+    let p = sqlite3_bind_parameter_name(st, i);
+    if p.is_null() {
+        None
+    } else {
+        Some(CStr::from_ptr(p).to_str().unwrap().to_string())
+    }
+}
+
+/// `sqlite3_bind_parameter_index(name)` for a `&str` name (sigil included).
+unsafe fn param_index(st: *mut Stmt, name: &str) -> c_int {
+    let n = cs(name);
+    sqlite3_bind_parameter_index(st, n.as_ptr())
 }
 
 unsafe fn col_text(st: *mut Stmt, i: c_int) -> String {
