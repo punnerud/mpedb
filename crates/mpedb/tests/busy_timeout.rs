@@ -37,13 +37,14 @@ fn db_path(name: &str) -> PathBuf {
     ))
 }
 
-fn open_db(path: &Path) -> Database {
+fn open_db_opts(path: &Path, durability: &str) -> Database {
     let toml = format!(
         r#"
 [database]
 path = "{}"
 size_mb = 16
 max_readers = 16
+durability = "{durability}"
 
 [[table]]
 name = "t"
@@ -60,6 +61,10 @@ primary_key = ["id"]
         path.display()
     );
     Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap()
+}
+
+fn open_db(path: &Path) -> Database {
+    open_db_opts(path, "none")
 }
 
 fn marker(path: &Path) -> PathBuf {
@@ -218,5 +223,41 @@ fn sigkilled_holder_never_hangs_the_waiter() {
     s.query("INSERT INTO t (id, v) VALUES (999999, 'reclaimed')", &[])
         .expect("insert after recovery (holder's row must have vanished)");
     s.commit().expect("commit after recovery");
+    cleanup(&path);
+}
+
+/// `durability = commit` is the intent-ring (§5.3 group-commit) regime — the
+/// OTHER write path. A deadline-carrying write must skip the ring (an
+/// enqueued intent cannot be withdrawn at the deadline) and bound its direct
+/// lock wait; once the holder releases, the same bounded poll ACQUIRES and
+/// leads.
+#[test]
+fn busy_timeout_expires_under_ring_durability() {
+    let path = db_path("ring");
+    cleanup(&path);
+    let db = open_db_opts(&path, "commit");
+    let mut child = spawn_holder(&path, 2000);
+    wait_for_marker(&path);
+
+    db.set_busy_timeout(Some(Duration::from_millis(250)));
+    let t0 = Instant::now();
+    let r = db.query("INSERT INTO t (id, v) VALUES (10, 'ring')", &[]);
+    let dt = t0.elapsed();
+    assert!(matches!(r, Err(Error::Busy)), "expected Busy, got {r:?}");
+    assert!(dt >= Duration::from_millis(250), "returned before the timeout: {dt:?}");
+    assert!(dt < Duration::from_millis(1800), "overshot the timeout wildly: {dt:?}");
+    eprintln!("busy(DML, durability=commit, timeout 250ms): elapsed {dt:?}");
+
+    // A budget longer than the holder's grip: the bounded poll must acquire
+    // and commit once the child rolls back — the wait CLEARS on this path.
+    db.set_busy_timeout(Some(Duration::from_millis(8000)));
+    let t0 = Instant::now();
+    db.query("INSERT INTO t (id, v) VALUES (11, 'after-ring')", &[])
+        .expect("bounded wait should acquire after the holder releases");
+    let dt = t0.elapsed();
+    assert!(dt < Duration::from_millis(7000), "acquire should beat the deadline: {dt:?}");
+    eprintln!("acquire after holder release (durability=commit): elapsed {dt:?}");
+
+    child.wait().expect("child exit");
     cleanup(&path);
 }
