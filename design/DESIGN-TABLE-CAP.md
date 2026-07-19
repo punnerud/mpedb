@@ -185,12 +185,13 @@ and this change makes its bounded cost 32× less binding.
 
 ## 6. Formats bumped
 
-- **`PLAN_FORMAT` 40 → 41.** The footprint's wire layout changed shape (two
-  length-prefixed id lists where two fixed `u128`s were). A format-40 reader sees the
+- **`PLAN_FORMAT` 41 → 42.** The footprint's wire layout changed shape (two
+  length-prefixed id lists where two fixed `u128`s were). A format-41 reader sees the
   changed FORMAT byte at offset 0 and fails CLOSED with `PlanInvalidated`, i.e. the
   documented re-prepare path — never a misread.
-  ⚠️ **A sibling change in this batch also bumps `PLAN_FORMAT` for new scalar functions.
-  Whoever merges second renumbers; the two changes are independent.**
+  (Originally written as 40 → 41. A sibling change in the same batch — `quote()` and
+  `strftime()` — landed on `main` as 41 first, so this branch was rebased onto it and
+  renumbered to 42. The two changes are independent and additive.)
 - **CDC control record (`cdc\0tabs`)**: fixed 40 bytes → variable. `ENCODED_LEN` is gone.
   A stale 40-byte record decodes as corrupt (its trailing bytes do not parse as two
   ascending id lists) rather than as a wrong capture set. Per the project's standing

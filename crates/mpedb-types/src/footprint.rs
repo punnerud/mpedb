@@ -119,7 +119,21 @@ impl TableSet {
     }
 
     /// Add `id`, keeping the vec strictly ascending. Idempotent.
+    ///
+    /// Every production construction path range-checks upstream — the planner's
+    /// `checked_table` rejects an id that names no table, and CDC ids come from
+    /// a validated `Schema` where `validate` enforces `id == position` and
+    /// `len() <= MAX_TABLES`. The `debug_assert` states that contract. In
+    /// release an out-of-range id is still **fail-closed, never aliased**: it
+    /// goes in as itself, and the next `decode` rejects the record with
+    /// `Corrupt`. That is the whole point of dropping the bitmap — the old
+    /// `1u128 << (id & (MAX_TABLES - 1))` folded instead, and a fold is a
+    /// silently WRONG table (cdc.rs, DESIGN-TABLE-CAP §4).
     pub fn insert(&mut self, id: u32) {
+        debug_assert!(
+            (id as usize) < crate::MAX_TABLES,
+            "table id {id} >= MAX_TABLES"
+        );
         if let Err(pos) = self.0.binary_search(&id) {
             self.0.insert(pos, id);
         }
@@ -176,8 +190,10 @@ impl TableSet {
     }
 
     pub fn encode_into(&self, buf: &mut Vec<u8>) {
-        // `len() ≤ MAX_TABLES` by the ascending + in-range invariant, so the
-        // u16 count can never truncate (MAX_TABLES is far below u16::MAX).
+        // `len() ≤ MAX_TABLES` by the ascending + in-range invariant (see
+        // `insert`), and MAX_TABLES is far below u16::MAX, so the count can
+        // never truncate.
+        debug_assert!(self.0.len() <= crate::MAX_TABLES);
         buf.extend_from_slice(&(self.0.len() as u16).to_le_bytes());
         for &id in &self.0 {
             buf.extend_from_slice(&id.to_le_bytes());
@@ -450,6 +466,15 @@ mod tests {
             TableSet::decode(&buf, &mut 0),
             Err(Error::Corrupt(_))
         ));
+        // An out-of-range id built on the WRITE side is fail-closed, not
+        // aliased: it survives encode as itself and decode refuses the record.
+        // (Debug builds trip `insert`'s assert first, so construct directly.)
+        let mut buf = 1u16.to_le_bytes().to_vec();
+        buf.extend_from_slice(&99_999u32.to_le_bytes());
+        match TableSet::decode(&buf, &mut 0) {
+            Err(Error::Corrupt(m)) => assert!(m.contains("out of range"), "{m}"),
+            other => panic!("expected out-of-range rejection, got {other:?}"),
+        }
         // Truncation at every offset of a well-formed set: Corrupt, never panic.
         let good = ts(&[1, 4095]);
         let mut buf = Vec::new();

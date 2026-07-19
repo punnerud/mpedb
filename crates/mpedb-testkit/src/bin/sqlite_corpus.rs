@@ -528,7 +528,7 @@ fn parse_create_table(sql: &str) -> Option<TableInfo> {
 /// total minus an 8-slot system reserve = 4088). Tables beyond the cap are left
 /// out of the schema and every statement touching them is counted under
 /// `engine-table-cap` instead of polluting the other categories. As of the
-/// sparse-footprint change (PLAN_FORMAT 41, design/DESIGN-TABLE-CAP.md) this is
+/// sparse-footprint change (PLAN_FORMAT 42, design/DESIGN-TABLE-CAP.md) this is
 /// 4088 — no corpus file comes near it, so the category is now a pure backstop.
 const ENGINE_TABLE_CAP: usize = 4088;
 
