@@ -206,6 +206,117 @@ fn dump_data_without_config() {
     assert!(s.contains("2\tb@x"), "row 2 missing: {s}");
 }
 
+/// `mpedb new.db …` on a MISSING path CREATES the database, as `sqlite3
+/// new.db` does — and the created base stays a real sqlite file: DDL lands in
+/// it, deltas live in the overlay, `checkpoint` folds them back, and a foreign
+/// sqlite reader sees the result.
+#[test]
+fn creates_a_sqlite_database_on_open_like_sqlite3() {
+    let td = TestDir::new("create-sqlite");
+    let db = td.path().join("new.db");
+    let dbs = db.to_str().unwrap().to_owned();
+
+    // 1. DDL on a path that does not exist yet.
+    assert_ok(&run(&[&dbs, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)"]));
+    assert!(db.exists(), "the database was not created");
+    let head = std::fs::read(&db).unwrap();
+    assert_eq!(
+        &head[..16],
+        b"SQLite format 3\0",
+        "the created base is not a sqlite file"
+    );
+
+    // 2. Writes go to the overlay, 3. reads merge base + overlay.
+    let o = run(&[&dbs, "INSERT INTO t VALUES(1,'x')"]);
+    assert_ok(&o);
+    assert_eq!(out_str(&o).trim(), "affected: 1");
+    let o = run(&[&dbs, "SELECT * FROM t"]);
+    assert_ok(&o);
+    assert_eq!(out_str(&o), "id\tv\n1\tx\n");
+
+    // 4. checkpoint folds the delta into the base, 5. where foreign sqlite —
+    // a library that knows nothing about mpedb — reads it.
+    assert_ok(&run(&["checkpoint", &dbs]));
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let row: (i64, String) = conn
+        .query_row("SELECT id, v FROM t", [], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap();
+    assert_eq!(row, (1, "x".to_owned()));
+
+    // A repl session over the same base: DDL mid-session folds the pending
+    // delta first, and everything converges in the base.
+    let script = "\
+INSERT INTO t VALUES(2,'y')
+CREATE TABLE u(id INTEGER PRIMARY KEY)
+INSERT INTO u VALUES(9)
+SELECT * FROM u
+.checkpoint
+.quit
+";
+    let mut child = Command::new(bin())
+        .args([&dbs])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    let o = child.wait_with_output().unwrap();
+    assert_ok(&o);
+    assert!(out_str(&o).contains("9"), "stdout: {}", out_str(&o));
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let n: i64 = conn.query_row("SELECT count(*) FROM t", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 2, "the pre-DDL delta was not folded into the base");
+    let n: i64 = conn.query_row("SELECT count(*) FROM u", [], |r| r.get(0)).unwrap();
+    assert_eq!(n, 1);
+}
+
+/// The `.mpedb` variant: a missing path ending in `.mpedb` is created as a
+/// NATIVE database (seeded with one inert bootstrap table, since a schema with
+/// no tables is refused), and live `CREATE TABLE` grows it from there.
+#[test]
+fn creates_a_native_database_on_open() {
+    let td = TestDir::new("create-native");
+    let db = td.path().join("new.mpedb");
+    let dbs = db.to_str().unwrap().to_owned();
+
+    assert_ok(&run(&[&dbs, "CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)"]));
+    assert!(db.exists(), "the database was not created");
+    assert_ok(&run(&[&dbs, "INSERT INTO t VALUES(1,'x')"]));
+    let o = run(&[&dbs, "SELECT * FROM t"]);
+    assert_ok(&o);
+    assert_eq!(out_str(&o), "id\tv\n1\tx\n");
+
+    // It is a genuine mpedb file: the config-free dump reads it.
+    let o = run(&["dump", &dbs, "--data"]);
+    assert_ok(&o);
+    assert!(out_str(&o).contains("name = \"t\""), "dump: {}", out_str(&o));
+}
+
+/// What creation must NOT do: invent directories, invent a config, or turn a
+/// mistyped subcommand into a database.
+#[test]
+fn creation_refuses_what_it_cannot_invent() {
+    let td = TestDir::new("create-refuse");
+    let nested = td.path().join("nope").join("x.db");
+    let o = run(&[nested.to_str().unwrap(), "SELECT 1"]);
+    assert_eq!(o.status.code(), Some(1), "stderr: {}", err_str(&o));
+    assert!(err_str(&o).contains("no such directory"), "stderr: {}", err_str(&o));
+    assert!(!nested.exists());
+
+    let missing_cfg = td.path().join("gone.toml");
+    let o = run(&[missing_cfg.to_str().unwrap(), "SELECT 1"]);
+    assert_eq!(o.status.code(), Some(1), "stderr: {}", err_str(&o));
+    assert!(err_str(&o).contains("no such config file"), "stderr: {}", err_str(&o));
+    assert!(!missing_cfg.exists());
+
+    // A bare word with no separator and no extension is a command, not a path.
+    let o = run(&["exce"]);
+    assert_eq!(o.status.code(), Some(2), "stderr: {}", err_str(&o));
+    assert!(err_str(&o).contains("unknown command"), "stderr: {}", err_str(&o));
+    assert!(!Path::new("exce").exists());
+}
+
 /// Multi-process bank invariant: concurrent transfer writers + full-scan
 /// readers asserting sum conservation on every snapshot.
 #[test]
