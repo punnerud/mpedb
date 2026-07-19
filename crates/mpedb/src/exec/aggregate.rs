@@ -145,7 +145,7 @@ pub(super) fn exec_aggregate(
             .map(|k| match k {
                 GroupKey::Col(c) => Ok(row.get(*c as usize).cloned().unwrap_or(Value::Null)),
                 // A computed key — `GROUP BY a+1` — evaluated over the base row.
-                GroupKey::Expr(p) => p.eval(row, params),
+                GroupKey::Expr(p) => p.eval_host(row, params, ctx.host_fns()),
             })
             .collect::<Result<_>>()?;
         let key = keycode::encode_key_collated(&key_vals, &group_collations);
@@ -166,7 +166,7 @@ pub(super) fn exec_aggregate(
             // different filters (or none). For DISTINCT this runs BEFORE the
             // dedupe inside `Accum` — filter first, then dedupe.
             if let Some(f) = &call.filter {
-                if !f.eval_filter(&mut Vec::new(), row, params)? {
+                if !f.eval_filter_host(&mut Vec::new(), row, params, ctx.host_fns())? {
                     continue;
                 }
             }
@@ -175,7 +175,7 @@ pub(super) fn exec_aggregate(
                 // NULL cannot arise.
                 None => entry.1[i].push(None)?,
                 Some(p) => {
-                    let v = p.eval(row, params)?;
+                    let v = p.eval_host(row, params, ctx.host_fns())?;
                     entry.1[i].push(Some(&v))?;
                 }
             }
@@ -208,7 +208,7 @@ pub(super) fn exec_aggregate(
                     // (`passes` is always true, and the extreme=None branch already
                     // captured every row, so the last row wins as documented).
                     let passes = match &mm.filter {
-                        Some(fp) => fp.eval_filter(&mut Vec::new(), row, params)?,
+                        Some(fp) => fp.eval_filter_host(&mut Vec::new(), row, params, ctx.host_fns())?,
                         None => true,
                     };
                     if !passes {
@@ -217,7 +217,7 @@ pub(super) fn exec_aggregate(
                         }
                     } else {
                         let v = match &mm.arg {
-                            Some(p) => p.eval(row, params)?,
+                            Some(p) => p.eval_host(row, params, ctx.host_fns())?,
                             None => Value::Null,
                         };
                         match extreme {
@@ -290,7 +290,7 @@ pub(super) fn exec_aggregate(
     if let Some(h) = &agg.having {
         let mut keep = Vec::with_capacity(out.len());
         for tuple in out {
-            if h.eval_filter(&mut Vec::new(), &tuple, params)? {
+            if h.eval_filter_host(&mut Vec::new(), &tuple, params, ctx.host_fns())? {
                 keep.push(tuple);
             }
         }
@@ -315,7 +315,7 @@ pub(super) fn exec_aggregate(
                     .get(*i as usize)
                     .cloned()
                     .ok_or_else(|| internal("grouped projection column"))?,
-                Projection::Expr { program, .. } => program.eval(&tuple, params)?,
+                Projection::Expr { program, .. } => program.eval_host(&tuple, params, ctx.host_fns())?,
             });
         }
         // `SELECT DISTINCT dept, count(*) … GROUP BY dept` — the groups are

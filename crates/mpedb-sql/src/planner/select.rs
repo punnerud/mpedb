@@ -265,12 +265,14 @@ fn expand_implicit_rowid_star(s: &ast::SelectStmt, table: &TableDef) -> ast::Sel
     ast::SelectStmt { items: Some(items), ..s.clone() }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn plan_select<'s>(
     s: &ast::SelectStmt,
     schema: &'s Schema,
     n_params: u16,
     catalog: &PolicyCatalog,
     mode: BareGroupBy,
+    host_udfs: &HostUdfSet,
     consts: &mut Vec<Value>,
     // The recursive CTE working table in scope (`WITH RECURSIVE`), if any: a
     // `FROM <name>` matching it binds to the working table (id `CTE_TABLE`,
@@ -294,7 +296,8 @@ pub(super) fn plan_select<'s>(
     let lifted;
     let (s, subplans, slot_types): (&ast::SelectStmt, Vec<SubPlan>, Vec<Ty>) =
         if subquery::has_subquery(s) {
-            lifted = subquery::lift_subqueries(s, schema, n_params, catalog, mode, consts)?;
+            lifted =
+                subquery::lift_subqueries(s, schema, n_params, catalog, mode, host_udfs, consts)?;
             (&lifted.stmt, lifted.subplans, lifted.slot_types)
         } else {
             (s, Vec::new(), Vec::new())
@@ -328,7 +331,7 @@ pub(super) fn plan_select<'s>(
     };
     if !s.joins.is_empty() {
         return plan_join_select(
-            s, schema, n_params, catalog, mode, consts, subplans, slot_types, cte,
+            s, schema, n_params, catalog, mode, host_udfs, consts, subplans, slot_types, cte,
         );
     }
     // `SELECT *` over an implicit-rowid table (#94): expand to the VISIBLE columns
@@ -349,6 +352,7 @@ pub(super) fn plan_select<'s>(
         None => Binder::new(table, eff_params, true),
     };
     binder.set_dialect(mode);
+    binder.set_host_udfs(host_udfs);
     for (i, ty) in slot_types.iter().enumerate() {
         binder.pin_param(n_params + i as u16, *ty);
     }

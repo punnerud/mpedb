@@ -18,6 +18,7 @@
 mod consts;
 mod introspect;
 mod sql;
+mod udf;
 mod valconv;
 
 pub use consts::*;
@@ -64,6 +65,13 @@ pub struct Sqlite3 {
     changes: c_int,
     total_changes: c_int,
     last_insert_rowid: c_longlong,
+    /// Host scalar UDFs registered on this connection via
+    /// `sqlite3_create_function[_v2]` (design/DESIGN-UDF.md). The CLOSURES live
+    /// in the `Database` registry; this tracks each registration's `pApp` +
+    /// `xDestroy` so the caller's destructor runs when an entry is replaced,
+    /// deleted, or the connection closes — CPython wraps a Python callable in
+    /// `pApp` and would otherwise leak it.
+    host_fns: Vec<udf::HostFn>,
 }
 
 /// A prepared statement: the SQL, its bound parameters, and — once stepped —
@@ -584,6 +592,7 @@ fn open_impl(filename: Option<&str>, flags: c_int) -> Result<Box<Sqlite3>, (c_in
         changes: 0,
         total_changes: 0,
         last_insert_rowid: 0,
+        host_fns: Vec::new(),
     });
     c.clear_error();
     Ok(c)
@@ -666,6 +675,11 @@ unsafe fn close_common(db: *mut Sqlite3) -> c_int {
     let mut boxed = Box::from_raw(db);
     // Drop any open transaction before the engine (borrow discipline).
     boxed.txn = None;
+    // Run each registered UDF's `xDestroy(pApp)` — sqlite's contract on close,
+    // and what keeps CPython from leaking the wrapped Python callables.
+    for h in std::mem::take(&mut boxed.host_fns) {
+        h.destroy();
+    }
     let path = boxed.path.clone();
     let ephemeral = boxed.ephemeral;
     drop(boxed);
@@ -1750,23 +1764,103 @@ unsafe fn call_destroy(destroy: *mut c_void, app: *mut c_void) {
     }
 }
 
+/// The one implementation behind `sqlite3_create_function` and
+/// `sqlite3_create_function_v2` (design/DESIGN-UDF.md §1). Stage 1 is SCALAR
+/// only: an aggregate registration (`xStep`/`xFinal`) refuses cleanly, invoking
+/// the caller's `xDestroy(pApp)` so wrapped state (e.g. a CPython callable) is
+/// not leaked. `xFunc == NULL` DELETES the `(name, nArg)` registration; a repeat
+/// registration REPLACES it, running the previous entry's `xDestroy`.
+#[allow(clippy::too_many_arguments)]
+unsafe fn create_function_impl(
+    db: *mut Sqlite3,
+    name: *const c_char,
+    n_arg: c_int,
+    app: *mut c_void,
+    x_func: *mut c_void,
+    x_step: *mut c_void,
+    x_final: *mut c_void,
+    x_destroy: *mut c_void,
+) -> c_int {
+    let Some(c) = conn(db) else {
+        call_destroy(x_destroy, app);
+        return SQLITE_MISUSE;
+    };
+    c.clear_error();
+    let Some(raw_name) = c_str_opt(name) else {
+        call_destroy(x_destroy, app);
+        c.set_error(
+            SQLITE_MISUSE,
+            SQLITE_MISUSE,
+            "create_function: NULL or non-UTF-8 function name",
+        );
+        return SQLITE_MISUSE;
+    };
+    // sqlite function names are case-insensitive, and mpedb's parser lowercases
+    // them before the binder resolves — register under the same spelling.
+    let fname = raw_name.to_ascii_lowercase();
+    if !x_step.is_null() || !x_final.is_null() {
+        call_destroy(x_destroy, app);
+        c.set_error(
+            SQLITE_ERROR,
+            SQLITE_ERROR,
+            "aggregate user-defined functions are not supported yet (scalar only)",
+        );
+        return SQLITE_ERROR;
+    }
+    // A repeat registration replaces: run the previous entry's destructor first.
+    if let Some(i) = c
+        .host_fns
+        .iter()
+        .position(|h| h.name == fname && h.n_arg == n_arg)
+    {
+        let old = c.host_fns.remove(i);
+        old.destroy();
+    }
+    if x_func.is_null() {
+        // sqlite: a NULL xFunc deletes the function.
+        c.db.unregister_host_function(&fname, n_arg);
+        call_destroy(x_destroy, app);
+        return SQLITE_OK;
+    }
+    let f: udf::XFunc = std::mem::transmute(x_func);
+    c.db
+        .register_host_function(&fname, n_arg, udf::make_scalar_closure(f, app));
+    c.host_fns.push(udf::HostFn {
+        name: fname,
+        n_arg,
+        x_destroy,
+        p_app: app,
+    });
+    SQLITE_OK
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_create_function(
+    db: *mut Sqlite3,
+    name: *const c_char,
+    n_arg: c_int,
+    _enc: c_int,
+    app: *mut c_void,
+    x_func: *mut c_void,
+    x_step: *mut c_void,
+    x_final: *mut c_void,
+) -> c_int {
+    create_function_impl(db, name, n_arg, app, x_func, x_step, x_final, ptr::null_mut())
+}
+
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_function_v2(
     db: *mut Sqlite3,
-    _name: *const c_char,
-    _n_arg: c_int,
+    name: *const c_char,
+    n_arg: c_int,
     _enc: c_int,
     app: *mut c_void,
-    _x_func: *mut c_void,
-    _x_step: *mut c_void,
-    _x_final: *mut c_void,
+    x_func: *mut c_void,
+    x_step: *mut c_void,
+    x_final: *mut c_void,
     x_destroy: *mut c_void,
 ) -> c_int {
-    call_destroy(x_destroy, app);
-    if let Some(c) = conn(db) {
-        c.set_error(SQLITE_ERROR, SQLITE_ERROR, "user-defined functions are not supported");
-    }
-    SQLITE_ERROR
+    create_function_impl(db, name, n_arg, app, x_func, x_step, x_final, x_destroy)
 }
 
 #[no_mangle]
@@ -1805,13 +1899,37 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
     SQLITE_ERROR
 }
 
-// ---- UDF-callback accessors (only reachable from a UDF, which never fires) --
+// ---- UDF-callback accessors (design/DESIGN-UDF.md §1) ----------------------
+//
+// These operate on the shim's own `sqlite3_context` / `sqlite3_value` (see
+// `udf.rs`), which the C callback holds as opaque pointers. Outside a UDF call
+// the pointers are NULL/foreign, so every accessor is NULL-guarded and falls
+// back to sqlite's "no value" answer rather than dereferencing.
 
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_user_data(_ctx: *mut c_void) -> *mut c_void {
-    ptr::null_mut()
+/// The shim `sqlite3_context*` a UDF callback was handed.
+unsafe fn udf_ctx<'a>(p: *mut c_void) -> Option<&'a mut udf::SqliteContext> {
+    if p.is_null() {
+        None
+    } else {
+        Some(&mut *(p as *mut udf::SqliteContext))
+    }
 }
 
+/// One `sqlite3_value*` from a UDF callback's `argv`.
+unsafe fn udf_val<'a>(p: *mut c_void) -> Option<&'a udf::SqliteValue> {
+    if p.is_null() {
+        None
+    } else {
+        Some(&*(p as *const udf::SqliteValue))
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_user_data(ctx: *mut c_void) -> *mut c_void {
+    udf_ctx(ctx).map(|c| c.p_app()).unwrap_or(ptr::null_mut())
+}
+
+/// Aggregate UDFs are stage 2 — no aggregate context exists yet.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_aggregate_context(_ctx: *mut c_void, _n: c_int) -> *mut c_void {
     ptr::null_mut()
@@ -1823,57 +1941,126 @@ pub unsafe extern "C" fn sqlite3_context_db_handle(_ctx: *mut c_void) -> *mut Sq
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_result_null(_ctx: *mut c_void) {}
+pub unsafe extern "C" fn sqlite3_result_null(ctx: *mut c_void) {
+    if let Some(c) = udf_ctx(ctx) {
+        c.set_result(Value::Null);
+    }
+}
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_result_int64(_ctx: *mut c_void, _v: c_longlong) {}
+pub unsafe extern "C" fn sqlite3_result_int(ctx: *mut c_void, v: c_int) {
+    if let Some(c) = udf_ctx(ctx) {
+        c.set_result(Value::Int(v as i64));
+    }
+}
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_result_double(_ctx: *mut c_void, _v: c_double) {}
+pub unsafe extern "C" fn sqlite3_result_int64(ctx: *mut c_void, v: c_longlong) {
+    if let Some(c) = udf_ctx(ctx) {
+        c.set_result(Value::Int(v));
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_result_double(ctx: *mut c_void, v: c_double) {
+    if let Some(c) = udf_ctx(ctx) {
+        c.set_result(Value::Float(v));
+    }
+}
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_text(
-    _ctx: *mut c_void,
-    _t: *const c_char,
-    _n: c_int,
-    _d: *mut c_void,
+    ctx: *mut c_void,
+    t: *const c_char,
+    n: c_int,
+    d: *mut c_void,
 ) {
+    // Copy in immediately, then honor the caller's destructor exactly as the
+    // bind_* path does — we never alias the caller's buffer.
+    let bytes = udf::copy_result_bytes(t, n);
+    maybe_free(d, t as *mut c_void);
+    if let Some(c) = udf_ctx(ctx) {
+        c.set_result(Value::Text(String::from_utf8_lossy(&bytes).into_owned()));
+    }
 }
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_blob(
-    _ctx: *mut c_void,
-    _b: *const c_void,
-    _n: c_int,
-    _d: *mut c_void,
+    ctx: *mut c_void,
+    b: *const c_void,
+    n: c_int,
+    d: *mut c_void,
 ) {
+    let bytes = if b.is_null() || n < 0 {
+        Vec::new()
+    } else {
+        std::slice::from_raw_parts(b as *const u8, n as usize).to_vec()
+    };
+    maybe_free(d, b as *mut c_void);
+    if let Some(c) = udf_ctx(ctx) {
+        c.set_result(Value::Blob(bytes));
+    }
 }
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_result_error(_ctx: *mut c_void, _t: *const c_char, _n: c_int) {}
+pub unsafe extern "C" fn sqlite3_result_error(ctx: *mut c_void, t: *const c_char, n: c_int) {
+    let msg = c_bytes(t, n)
+        .map(|b| String::from_utf8_lossy(b).into_owned())
+        .unwrap_or_else(|| "user function error".to_string());
+    if let Some(c) = udf_ctx(ctx) {
+        c.set_error(SQLITE_ERROR, msg);
+    }
+}
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_result_error_nomem(_ctx: *mut c_void) {}
+pub unsafe extern "C" fn sqlite3_result_error_code(ctx: *mut c_void, code: c_int) {
+    if let Some(c) = udf_ctx(ctx) {
+        c.set_error(code, format!("user function error (code {code})"));
+    }
+}
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_result_error_toobig(_ctx: *mut c_void) {}
+pub unsafe extern "C" fn sqlite3_result_error_nomem(ctx: *mut c_void) {
+    if let Some(c) = udf_ctx(ctx) {
+        c.set_error(SQLITE_NOMEM, "out of memory".to_string());
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_result_error_toobig(ctx: *mut c_void) {
+    if let Some(c) = udf_ctx(ctx) {
+        c.set_error(SQLITE_TOOBIG, "string or blob too big".to_string());
+    }
+}
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_value_type(_v: *mut c_void) -> c_int {
-    SQLITE_NULL
+pub unsafe extern "C" fn sqlite3_value_type(v: *mut c_void) -> c_int {
+    udf_val(v)
+        .map(|x| valconv::sqlite_type(x.value()))
+        .unwrap_or(SQLITE_NULL)
 }
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_value_int64(_v: *mut c_void) -> c_longlong {
-    0
+pub unsafe extern "C" fn sqlite3_value_int(v: *mut c_void) -> c_int {
+    udf_val(v)
+        .map(|x| valconv::as_i64(x.value()) as c_int)
+        .unwrap_or(0)
 }
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_value_double(_v: *mut c_void) -> c_double {
-    0.0
+pub unsafe extern "C" fn sqlite3_value_int64(v: *mut c_void) -> c_longlong {
+    udf_val(v).map(|x| valconv::as_i64(x.value())).unwrap_or(0)
 }
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_value_bytes(_v: *mut c_void) -> c_int {
-    0
+pub unsafe extern "C" fn sqlite3_value_double(v: *mut c_void) -> c_double {
+    udf_val(v).map(|x| valconv::as_f64(x.value())).unwrap_or(0.0)
 }
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_value_text(_v: *mut c_void) -> *const c_uchar {
-    ptr::null()
+pub unsafe extern "C" fn sqlite3_value_bytes(v: *mut c_void) -> c_int {
+    udf_val(v).map(|x| x.bytes_len()).unwrap_or(0)
 }
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_value_blob(_v: *mut c_void) -> *const c_void {
-    ptr::null()
+pub unsafe extern "C" fn sqlite3_value_text(v: *mut c_void) -> *const c_uchar {
+    match udf_val(v) {
+        Some(x) if !matches!(x.value(), Value::Null) => x.text_ptr(),
+        _ => ptr::null(),
+    }
+}
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_value_blob(v: *mut c_void) -> *const c_void {
+    match udf_val(v) {
+        Some(x) if !matches!(x.value(), Value::Null) => x.blob_ptr(),
+        _ => ptr::null(),
+    }
 }
 
 // ---- online backup (refused — use `mpedb mirror`) -------------------------

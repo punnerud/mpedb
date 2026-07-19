@@ -42,6 +42,7 @@ const OP_REGEXP: u8 = 35;
 const OP_CMP_COLL: u8 = 36;
 const OP_IN_LIST_COLL: u8 = 37;
 const OP_LIKE_CS: u8 = 38;
+const OP_HOST_CALL: u8 = 39;
 
 impl ExprProgram {
     /// Deterministic serialization (part of plan blobs and plan hashing).
@@ -141,6 +142,11 @@ impl ExprProgram {
                     buf.push(OP_IN_LIST_COLL);
                     buf.extend_from_slice(&x.to_le_bytes());
                     buf.push(coll as u8);
+                }
+                Instr::HostCall(name_idx, argc) => {
+                    buf.push(OP_HOST_CALL);
+                    buf.extend_from_slice(&name_idx.to_le_bytes());
+                    buf.extend_from_slice(&argc.to_le_bytes());
                 }
             }
         }
@@ -242,6 +248,11 @@ impl ExprProgram {
                     let coll = Collation::from_tag(c)
                         .ok_or_else(|| Error::Corrupt("bad collation tag".into()))?;
                     Instr::InListColl(x, coll)
+                }
+                OP_HOST_CALL => {
+                    let name_idx = read_u16_arg()?;
+                    let argc = read_u16_arg()?;
+                    Instr::HostCall(name_idx, argc)
                 }
                 _ => return Err(Error::Corrupt(format!("invalid opcode {op}"))),
             });
@@ -373,6 +384,18 @@ pub(super) fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                                 "{}() called with {argc} argument(s)",
                                 f.name()
                             )));
+                        }
+                        (argc as usize, 1)
+                    }
+                    // A host UDF call pops `argc` and pushes its one result. The
+                    // name index must be a real const (checked here, once) so
+                    // eval can read it without re-checking; the closure itself is
+                    // supplied at eval time, not validated in the plan bytes.
+                    Instr::HostCall(name_idx, argc) => {
+                        if name_idx as usize >= consts.len() {
+                            return Err(Error::Corrupt(
+                                "host-call name index out of range".into(),
+                            ));
                         }
                         (argc as usize, 1)
                     }

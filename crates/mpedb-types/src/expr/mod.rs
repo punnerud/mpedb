@@ -156,6 +156,33 @@ pub enum Instr {
     /// them; text membership is decided under `Collation`. Emitted only for a
     /// non-`Binary` collation on a text probe.
     InListColl(u16, Collation),
+    /// Call a HOST-registered scalar UDF (the C-API `create_function` path,
+    /// design/DESIGN-UDF.md). The first `u16` is the const-pool index of the
+    /// function NAME (a [`Value::Text`]); the second is the argument count. Pops
+    /// `argc` values (leftmost deepest), looks the name up in the eval context's
+    /// [`HostFns`], invokes it, and pushes the one result.
+    ///
+    /// The plan stores only the NAME + arity, never the closure — closures are
+    /// not serializable, and a plan carrying a host call is valid ONLY for a
+    /// connection that registered that UDF, so the facade never publishes it to
+    /// the shared plan registry. With no host functions in scope (a plan without
+    /// a host call, a CHECK constraint, a test) this opcode is unreachable, so
+    /// the change is behavior-neutral for every existing plan.
+    HostCall(u16, u16),
+}
+
+/// Resolve a HOST-registered scalar UDF by name at eval time (the C-API
+/// `create_function` path, design/DESIGN-UDF.md). Implemented by the facade over
+/// its per-connection registry; `None` is threaded wherever no UDF can be in
+/// scope (CHECK constraints, tests, any plan without a [`Instr::HostCall`]), so
+/// the whole mechanism stays inert for existing plans.
+pub trait HostFns {
+    /// Invoke the scalar function `name` over already-evaluated `args`
+    /// (leftmost first), returning its result. An `Error` when no function of
+    /// that name/arity is registered — defensive; the binder already checked the
+    /// name at compile time, but a registration can change between compile and
+    /// execute.
+    fn call(&self, name: &str, args: &[Value]) -> Result<Value>;
 }
 
 /// Which of the six SQL comparison operators a collated [`Instr::CmpColl`]
@@ -236,10 +263,31 @@ impl ExprProgram {
         self.max_stack
     }
 
-    /// Evaluate against a decoded row and statement parameters.
+    /// Does this program call a host-registered UDF ([`Instr::HostCall`])? The
+    /// facade uses this to keep a plan that references a per-connection UDF OUT
+    /// of the shared content-hashed plan registry (design/DESIGN-UDF.md): such a
+    /// plan is valid only for the connection that registered the function.
+    pub fn has_host_call(&self) -> bool {
+        self.instrs.iter().any(|i| matches!(i, Instr::HostCall(..)))
+    }
+
+    /// Evaluate against a decoded row and statement parameters. No host UDFs in
+    /// scope — a program containing [`Instr::HostCall`] errors (defensive; only
+    /// the executor's host-aware path reaches such a program).
     pub fn eval(&self, cols: &[Value], params: &[Value]) -> Result<Value> {
+        self.eval_host(cols, params, None)
+    }
+
+    /// [`eval`](Self::eval) with a [`HostFns`] resolver for host-registered
+    /// scalar UDFs (design/DESIGN-UDF.md). `None` behaves exactly like `eval`.
+    pub fn eval_host(
+        &self,
+        cols: &[Value],
+        params: &[Value],
+        host: Option<&dyn HostFns>,
+    ) -> Result<Value> {
         let mut stack: Vec<Value> = Vec::with_capacity(self.max_stack);
-        self.eval_with_stack(&mut stack, cols, params)
+        self.eval_with_stack_host(&mut stack, cols, params, host)
     }
 
     /// Hot-path variant reusing a scratch stack across rows.
@@ -248,6 +296,18 @@ impl ExprProgram {
         stack: &mut Vec<Value>,
         cols: &[Value],
         params: &[Value],
+    ) -> Result<Value> {
+        self.eval_with_stack_host(stack, cols, params, None)
+    }
+
+    /// [`eval_with_stack`](Self::eval_with_stack) with a [`HostFns`] resolver.
+    /// `None` is behavior-identical to `eval_with_stack`.
+    pub fn eval_with_stack_host(
+        &self,
+        stack: &mut Vec<Value>,
+        cols: &[Value],
+        params: &[Value],
+        host: Option<&dyn HostFns>,
     ) -> Result<Value> {
         stack.clear();
         stack.reserve(self.max_stack);
@@ -499,6 +559,28 @@ impl ExprProgram {
                     let probe = stack.pop().expect("validated");
                     stack.push(in_items_3vl_collated(&probe, &items, coll)?);
                 }
+                Instr::HostCall(name_idx, argc) => {
+                    // The name lives in the const pool; validate proved the index
+                    // is in range, and a hostile blob whose const is not text is
+                    // Corrupt, not a panic.
+                    let name = match &self.consts[name_idx as usize] {
+                        Value::Text(s) => s,
+                        _ => {
+                            return Err(Error::Corrupt(
+                                "host-call name constant is not text".into(),
+                            ))
+                        }
+                    };
+                    // validate proved depth >= argc, so the split holds.
+                    let at = stack.len() - argc as usize;
+                    let args: Vec<Value> = stack.split_off(at);
+                    let host = host.ok_or_else(|| {
+                        Error::Internal(format!(
+                            "host function `{name}` called with no host functions in scope"
+                        ))
+                    })?;
+                    stack.push(host.call(name, &args)?);
+                }
             }
         }
         Ok(stack.pop().expect("validated: exactly one result"))
@@ -511,7 +593,20 @@ impl ExprProgram {
         cols: &[Value],
         params: &[Value],
     ) -> Result<bool> {
-        match self.eval_with_stack(stack, cols, params)? {
+        self.eval_filter_host(stack, cols, params, None)
+    }
+
+    /// [`eval_filter`](Self::eval_filter) with a [`HostFns`] resolver for
+    /// host-registered scalar UDFs (design/DESIGN-UDF.md). `None` is
+    /// behavior-identical to `eval_filter`.
+    pub fn eval_filter_host(
+        &self,
+        stack: &mut Vec<Value>,
+        cols: &[Value],
+        params: &[Value],
+        host: Option<&dyn HostFns>,
+    ) -> Result<bool> {
+        match self.eval_with_stack_host(stack, cols, params, host)? {
             Value::Bool(b) => Ok(b),
             Value::Null => Ok(false),
             v => Err(Error::TypeMismatch(format!(

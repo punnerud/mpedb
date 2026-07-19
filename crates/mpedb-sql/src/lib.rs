@@ -27,6 +27,7 @@ mod token;
 mod trigger;
 mod view;
 
+pub use binder::HostUdfSet;
 pub use ddl::{
     CreateColumnSpec, CreatePolicySpec, CreateTableSpec, CreateTriggerSpec, CreateVirtualTableSpec,
     DdlStmt, RlsAction, TriggerEvent, TriggerTiming,
@@ -96,6 +97,7 @@ pub fn prepare_maybe_explain_with_policies(
         catalog,
         &view::ViewCatalog::new(),
         BareGroupBy::default(),
+        &HostUdfSet::default(),
     )
 }
 
@@ -112,6 +114,10 @@ pub fn prepare_maybe_explain_with_views(
     catalog: &PolicyCatalog,
     views: &ViewCatalog,
     compat: BareGroupBy,
+    // Host-registered scalar UDFs visible to the compiling connection
+    // (design/DESIGN-UDF.md). Empty for callers that register none — then
+    // function resolution is exactly as before. Threaded alongside `compat`.
+    host_udfs: &HostUdfSet,
 ) -> Result<(CompiledPlan, bool)> {
     let (mut stmt, is_explain, n_params, ctes) = parser::parse_statement_ctes(sql)?;
     // A `WITH` CTE is a statement-scoped named view. Pass the CTE bodies to
@@ -129,7 +135,7 @@ pub fn prepare_maybe_explain_with_views(
         let scope: view::ViewCatalog = ctes.into_iter().collect();
         view::inline_views_with_ctes(&mut stmt, views, &scope)?;
     }
-    let plan = planner::plan_statement(&stmt, schema, n_params, catalog, compat)?;
+    let plan = planner::plan_statement(&stmt, schema, n_params, catalog, compat, host_udfs)?;
     Ok((plan, is_explain))
 }
 

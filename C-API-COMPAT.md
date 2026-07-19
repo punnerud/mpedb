@@ -22,9 +22,12 @@ stock sqlite **23/23**. It does *not* enumerate every symbol, because most are
 deliberate non-goals for an in-process, rigid-schema engine (each a clean refusal
 or safe no-op, never a wrong answer):
 
-- **UDF / collation registration** (`sqlite3_create_function*`, `_create_collation*`,
-  `_create_window_function`): exported but *refuse* (so `import` still works). The
-  typed compiled-IR layer (PySpell) is the intended path, not C callbacks.
+- **SCALAR UDF registration is REAL** (`sqlite3_create_function[_v2]`,
+  design/DESIGN-UDF.md stage 1): the callback is stored per connection and SQL
+  that calls the function dispatches to it. **Aggregate** UDFs (`xStep`/`xFinal`),
+  `_create_window_function` and `_create_collation*` still refuse cleanly
+  (invoking the caller's `xDestroy(pApp)`, so CPython does not leak the wrapped
+  callable) — stages 2 and 3.
 - **VFS / virtual-table module ABI** (`sqlite3_vfs_*`, `sqlite3_create_module*`):
   mpedb has its own storage engine, not sqlite's pager — a named VFS is refused
   (see `open_v2`); the one module that matters, **FTS5, is native**, not a plugin.
@@ -153,14 +156,18 @@ against `_sqlite3.cpython-312` on Linux/x86-64 (Python 3.12).
 
 | Function(s) | Status | Behaviour |
 |---|---|---|
-| `sqlite3_create_function_v2` / `_create_window_function` | ❌ stub | Refuse with `SQLITE_ERROR` (UDFs are the Django milestone); the caller-supplied `xDestroy(pApp)` is invoked, so CPython does not leak the wrapped callable |
-| `sqlite3_create_collation_v2` | ❌ stub | Refuse with `SQLITE_ERROR` (destructor honored) |
+| `sqlite3_create_function` / `_create_function_v2` (SCALAR) | ✅ | Real dispatch (design/DESIGN-UDF.md stage 1). The `xFunc` is stored per connection and a SQL call to that name invokes it with the evaluated arguments. `nArg = -1` is variadic; re-registering the same `(name, nArg)` replaces (running the old `xDestroy`); `xFunc == NULL` deletes. Names are matched case-insensitively. A plan containing a host call is compiled/executed LOCALLY and never published to the shared plan registry (it is valid only for the connection that registered the function) |
+| `sqlite3_create_function[_v2]` (AGGREGATE: `xStep`/`xFinal`) / `_create_window_function` | ❌ stub | Refuse with `SQLITE_ERROR` — DESIGN-UDF stage 2. The caller-supplied `xDestroy(pApp)` is invoked, so CPython does not leak the wrapped callable. **This is now Django's next gate** (`create_aggregate("STDDEV_POP", …)`) |
+| `sqlite3_create_collation_v2` | ❌ stub | Refuse with `SQLITE_ERROR` (destructor honored) — DESIGN-UDF stage 3 |
 | `sqlite3_set_authorizer` | ❌ stub | `SQLITE_OK`, callback never invoked (mpedb enforces its own RLS) |
 | `sqlite3_trace_v2` / `_progress_handler` | ❌ stub | Registration accepted, callback never fired |
 | `sqlite3_enable_load_extension` / `_load_extension` | ❌ stub | Enable is a no-op `SQLITE_OK`; load refuses with `SQLITE_ERROR` + errmsg |
 | `sqlite3_db_config` | ❌ stub | Fixed-arg shim (register-compatible with the common `(int,int*)` forms on SysV/x86-64); honors no toggles, returns `SQLITE_OK` |
 | `sqlite3_limit` | ❌ stub | Reports "no limit"; set is ignored |
-| `sqlite3_result_*` / `sqlite3_value_*` / `sqlite3_user_data` / `sqlite3_aggregate_context` / `sqlite3_context_db_handle` | ❌ stub | UDF-callback accessors — only reachable from inside a UDF, which never fires; return NULL/0/`SQLITE_NULL` |
+| `sqlite3_value_{type,int,int64,double,text,bytes,blob}` | ✅ | Read a scalar UDF's arguments, with sqlite's cross-type coercion (an integer read via `_text` yields its decimal text, …). `_text`/`_blob` pointers stay valid for the duration of the callback |
+| `sqlite3_result_{null,int,int64,double,text,blob,error,error_code,error_nomem,error_toobig}` | ✅ | Write a scalar UDF's result cell; `_text`/`_blob` copy in immediately and honor the caller's destructor (STATIC/TRANSIENT respected). `_error*` aborts the statement with that message instead of yielding a row |
+| `sqlite3_user_data` | ✅ | Returns the registration's `pApp` |
+| `sqlite3_aggregate_context` / `sqlite3_context_db_handle` | ❌ stub | Return NULL — aggregates are DESIGN-UDF stage 2 |
 | Online-backup API (`sqlite3_backup_*`) | ❌ stub | `_init` → NULL (use `mpedb mirror`); the rest are inert |
 | Incremental blob (`sqlite3_blob_*`) | ❌ stub | `_open` → `SQLITE_ERROR`; will map onto mpedb's #43 incremental-blob API |
 | `sqlite3_serialize` / `_deserialize` | ❌ stub | NULL / `SQLITE_ERROR` |
@@ -258,23 +265,34 @@ gap for Django's connection setup and schema editor is now covered.
   in-session visibility), so CPython's implicit-transaction-on-first-DML no longer
   blocks a `CREATE` after an `INSERT`, and `executescript` works.
 
+- ✅ **Host SCALAR UDFs — the old #1 Django gate, now open** (design/DESIGN-UDF.md
+  stage 1). `sqlite3_create_function[_v2]` stores the callback per connection, the
+  binder resolves an otherwise-unknown `f(args)` against that registry, and exec
+  invokes `xFunc` through the `sqlite3_context`/`sqlite3_value` ABI. Measured:
+  Django's `register_functions(conn)` now completes all **26** scalar
+  registrations (`django_date_extract`, `django_date_trunc`, `regexp`, `MD5`,
+  `SHA256`, `RAND`, …) instead of failing on the first one.
+
 Still blocking (ranked by real-app impact):
 
-1. **No user-defined functions/collations — THE Django gate (measured).** The
-   `workbench/` (a real Django 5.2 ORM project run under the shim) confirms Django
-   fails *before any SQL*: `get_new_connection` → `register_functions(conn)` calls
-   `sqlite3_create_function` ~30× (`django_date_extract`, `django_date_trunc`,
-   `django_time_diff`, `regexp`, `django_power`, …) and the shim refuses →
-   `OperationalError: Error creating function`, so **no Django connection opens at
-   all**. Plain Python `sqlite3` is unaffected (it registers no UDFs — the DB-API
-   battery is 23/23). Unblocking needs a real host-UDF path: the shim's
-   `create_function[_v2]` must STORE the callback, a per-connection UDF registry
-   must reach the engine's binder (an unknown `f(args)` compiles to a host-call,
-   not an "unknown function" error), and exec must invoke `xFunc` via the
-   `sqlite3_context`/`sqlite3_value` ABI + `sqlite3_result_*`. A cross-cutting
-   feature (shim → facade registry → binder → exec → expr IR); it is the next
-   milestone. Run `crates/mpedb-capi/workbench/run.sh` to reproduce.
-2. **`sqlite_master` breadth** — views and indexes are not listed; complex
+1. **No AGGREGATE UDFs — Django's NEXT gate (measured).** With scalars working,
+   the `workbench/` Django 5.2 project now proceeds past every
+   `create_function` and stops at the first `connection.create_aggregate(
+   "STDDEV_POP", 1, StdDevPop)` (`django/db/backends/sqlite3/_functions.py:79`)
+   → `OperationalError: Error creating aggregate`, so the connection still does
+   not open. Django registers four (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`,
+   `VAR_SAMP`). Unblocking is DESIGN-UDF **stage 2**: accept `xStep`/`xFinal`,
+   give each group an `sqlite3_aggregate_context` allocation, and drive them from
+   the aggregate executor. Run `crates/mpedb-capi/workbench/run.sh` to reproduce.
+2. **No custom collations** (`sqlite3_create_collation_v2`) — DESIGN-UDF stage 3.
+3. **Host UDFs in a WRITE statement / open transaction** — dispatch is wired on
+   the READ path (autocommit `SELECT`, its `WHERE`/projection/aggregate). A UDF in
+   an `UPDATE … SET`, an `INSERT` value, a `RETURNING` projection, a window
+   PARTITION/ORDER term, or any statement run inside an explicit transaction
+   (`WriteSession`) surfaces a clean "host function … not in scope" error rather
+   than a wrong answer. Closing it means giving the write context the same
+   `host_fns()` the read context has.
+4. **`sqlite_master` breadth** — views and indexes are not listed; complex
    `WHERE`/join forms error rather than returning wrong metadata.
 
 (Resolved since: **fixed database size** — a `file:…?size_mb=N` URI now

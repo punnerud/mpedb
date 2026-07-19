@@ -895,6 +895,24 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     atom: true,
                 }
             }
+            // A host-registered scalar UDF `name(a, b)` — the name lives in the
+            // const pool; pop `argc` arguments (never the fallback's fixed two).
+            Instr::HostCall(name_idx, argc) => {
+                let mut args: Vec<String> = (0..argc).map(|_| pop(&mut st).s).collect();
+                args.reverse();
+                let name = p
+                    .consts
+                    .get(name_idx as usize)
+                    .and_then(|v| match v {
+                        mpedb_types::Value::Text(s) => Some(s.clone()),
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| "?".into());
+                Item {
+                    s: format!("{name}({})", args.join(", ")),
+                    atom: true,
+                }
+            }
             // A collated comparison `a <op> b COLLATE <coll>`.
             Instr::CmpColl(kind, coll) => {
                 let b = pop(&mut st);
