@@ -1490,3 +1490,92 @@ fn compileoption_builtins_report_an_empty_option_set() {
         sqlite3_close(db);
     }
 }
+
+#[test]
+fn named_in_memory_database_is_shared_private_and_does_not_outlive_the_process() {
+    // `file:<name>?mode=memory` names an IN-MEMORY database, not a path. This is
+    // how Django's test runner names every test database
+    // (`file:memorydb_default?mode=memory&cache=shared`), and reading the name
+    // as a path both dropped a 64 MiB file in the caller's CWD and made the
+    // "in-memory" database survive the process — so the NEXT run silently
+    // reopened the previous run's data.
+    unsafe {
+        let uri = cs("file:wb_named_mem_test?mode=memory&cache=shared");
+        let cwd_artifact = std::path::Path::new("wb_named_mem_test");
+
+        let mut a: *mut Sqlite3 = ptr::null_mut();
+        assert_eq!(sqlite3_open(uri.as_ptr(), &mut a), SQLITE_OK);
+        assert_eq!(exec(a, "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)"), SQLITE_OK);
+        assert_eq!(exec(a, "INSERT INTO t VALUES (1, 'x')"), SQLITE_OK);
+
+        // No file appears where the name was mistaken for a path.
+        assert!(!cwd_artifact.exists(), "named in-memory db created a file in the CWD");
+
+        // A SECOND connection to the same name sees the same database
+        // (sqlite's shared-cache in-memory semantics).
+        let mut b: *mut Sqlite3 = ptr::null_mut();
+        assert_eq!(sqlite3_open(uri.as_ptr(), &mut b), SQLITE_OK);
+        let mut st: *mut Stmt = ptr::null_mut();
+        let q = cs("SELECT v FROM t WHERE id = 1");
+        assert_eq!(
+            sqlite3_prepare_v2(b, q.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_OK,
+            "prepare on second connection: {}",
+            CStr::from_ptr(sqlite3_errmsg(b)).to_string_lossy()
+        );
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(
+            CStr::from_ptr(sqlite3_column_text(st, 0) as *const c_char).to_str().unwrap(),
+            "x"
+        );
+        sqlite3_finalize(st);
+
+        // Closing ONE connection leaves the database alive for the other.
+        sqlite3_close(a);
+        let mut st2: *mut Stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(b, q.as_ptr(), -1, &mut st2, ptr::null_mut()),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_step(st2), SQLITE_ROW);
+        sqlite3_finalize(st2);
+
+        // Closing the LAST one destroys it: reopening the same name gives a
+        // fresh, empty database rather than the old contents.
+        sqlite3_close(b);
+        let mut c: *mut Sqlite3 = ptr::null_mut();
+        assert_eq!(sqlite3_open(uri.as_ptr(), &mut c), SQLITE_OK);
+        let mut st3: *mut Stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(c, q.as_ptr(), -1, &mut st3, ptr::null_mut()),
+            SQLITE_ERROR,
+            "table t survived the last close of a named in-memory database"
+        );
+        sqlite3_finalize(st3);
+        sqlite3_close(c);
+        assert!(!cwd_artifact.exists());
+    }
+}
+
+#[test]
+fn a_failed_open_reports_why_rather_than_out_of_memory() {
+    // A failed open returns NO handle, so `sqlite3_errmsg(NULL)` is the caller's
+    // only channel — and sqlite's fixed answer there is "out of memory".
+    // CPython's `sqlite3` reads exactly that, so every failed open surfaced to
+    // Python as `InterfaceError: out of memory`, whatever had actually gone
+    // wrong. Answer with the real reason instead.
+    unsafe {
+        let mut db: *mut Sqlite3 = ptr::null_mut();
+        let name = cs("/tmp/mpedb-capi-no-such-file-open-error-test.db");
+        let _ = std::fs::remove_file("/tmp/mpedb-capi-no-such-file-open-error-test.db");
+        // READWRITE without CREATE on a file that does not exist.
+        let rc = sqlite3_open_v2(name.as_ptr(), &mut db, SQLITE_OPEN_READWRITE, ptr::null());
+        assert_eq!(rc, SQLITE_CANTOPEN);
+        assert!(db.is_null());
+
+        let msg = CStr::from_ptr(sqlite3_errmsg(ptr::null_mut())).to_string_lossy().into_owned();
+        assert!(msg.contains("no such database file"), "errmsg was {msg:?}");
+        assert_eq!(sqlite3_errcode(ptr::null_mut()), SQLITE_CANTOPEN);
+        assert_eq!(sqlite3_extended_errcode(ptr::null_mut()), SQLITE_CANTOPEN);
+    }
+}
