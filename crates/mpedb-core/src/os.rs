@@ -69,7 +69,24 @@ pub fn sync_granularity() -> usize {
 pub fn preallocate(fd: RawFd, offset: i64, len: i64) -> libc::c_int {
     #[cfg(target_os = "linux")]
     {
-        unsafe { libc::fallocate(fd, 0, offset, len) }
+        let rc = unsafe { libc::fallocate(fd, 0, offset, len) };
+        if rc == 0 {
+            return 0;
+        }
+        // Some filesystems (FAT/exFAT, many network FS) do not implement
+        // fallocate and return EOPNOTSUPP/ENOSYS. Fall back to ftruncate. On
+        // those filesystems this is still SIGBUS-safe: they cannot represent a
+        // sparse hole, so growing the file physically allocates the blocks
+        // rather than leaving a lazy hole (unlike ext4/xfs, where we never take
+        // this path). Never shrinks.
+        let e = unsafe { *libc::__errno_location() };
+        if e == libc::EOPNOTSUPP || e == libc::ENOSYS {
+            let want = offset + len;
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let cur = if unsafe { libc::fstat(fd, &mut st) } == 0 { st.st_size } else { 0 };
+            return if want > cur { unsafe { libc::ftruncate(fd, want) } } else { 0 };
+        }
+        rc
     }
     #[cfg(not(target_os = "linux"))]
     {
