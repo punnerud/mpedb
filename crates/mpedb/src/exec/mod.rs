@@ -106,6 +106,14 @@ pub(crate) trait TxnCtx {
     fn host_fns(&self) -> Option<&dyn HostFns> {
         None
     }
+    /// Host-registered AGGREGATES in scope for this execution
+    /// (design/DESIGN-UDF.md stage 2), or `None`. Same scope rule as
+    /// [`host_fns`](Self::host_fns): read-only executions carry them, the write
+    /// path returns `None`, so a host aggregate in a write statement surfaces a
+    /// clean "not in scope" error rather than being silently dropped.
+    fn host_aggs(&self) -> Option<&dyn mpedb_types::HostAggs> {
+        None
+    }
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>>;
     fn get_by_index(&mut self, table: u32, index_no: u32, values: &[Value])
         -> Result<Option<Vec<Value>>>;
@@ -310,11 +318,17 @@ pub(crate) struct ReadCtx<'t, 'e>(
     /// `contains_host_call`; the streaming and sqlite-overlay read paths pass
     /// `None` (host UDFs there are out of scope for stage 1).
     pub Option<&'t dyn HostFns>,
+    /// Host-registered AGGREGATE factories in scope for this read (stage 2),
+    /// gated by the same `contains_host_call` test as the scalars above.
+    pub Option<&'t dyn mpedb_types::HostAggs>,
 );
 
 impl TxnCtx for ReadCtx<'_, '_> {
     fn host_fns(&self) -> Option<&dyn HostFns> {
         self.1
+    }
+    fn host_aggs(&self) -> Option<&dyn mpedb_types::HostAggs> {
+        self.2
     }
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
         self.0.get_by_pk(table, pk)

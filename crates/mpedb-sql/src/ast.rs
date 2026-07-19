@@ -370,7 +370,11 @@ pub(crate) enum Expr {
     /// the SAME base row the argument sees, and each aggregate is filtered
     /// independently. A FILTER on a WINDOW aggregate (`OVER`) is refused by the
     /// parser, so it only ever rides a plain grouped/scalar aggregate here.
-    Agg(mpedb_types::AggFn, Option<Box<Expr>>, bool, Option<Box<Expr>>),
+    /// The [`mpedb_types::AggTarget`] is the built-in aggregate, or — since
+    /// design/DESIGN-UDF.md stage 2 — a HOST aggregate carried by name. The
+    /// parser only produces the host form for a name the compiling connection
+    /// registered via `xStep`/`xFinal`, and only for a one-argument call.
+    Agg(mpedb_types::AggTarget, Option<Box<Expr>>, bool, Option<Box<Expr>>),
     /// `<fn>(args) OVER (<spec>)` — a WINDOW function (design/DESIGN-WINDOW.md).
     ///
     /// Its own node (not [`Expr::Agg`]/[`Expr::Func`]) because it is neither a

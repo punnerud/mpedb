@@ -20,7 +20,7 @@ pub use config::{
 };
 pub use error::{Error, Result};
 pub mod agg;
-pub use agg::Accum;
+pub use agg::{Accum, HostAggState, HostAggs};
 pub use expr::{CmpKind, ExprProgram, HostFns, Instr, ScalarFn};
 
 /// The aggregate functions.
@@ -88,6 +88,48 @@ impl AggFn {
         ))
     }
 }
+/// WHICH aggregate a call names: one of the closed built-ins, or a HOST
+/// aggregate registered on the connection through the C-API `xStep`/`xFinal`
+/// path (design/DESIGN-UDF.md stage 2).
+///
+/// A host aggregate is carried BY NAME, exactly as [`Instr::HostCall`] carries a
+/// host scalar: the accumulator is a live C callback pair, which is not
+/// serializable, and a plan naming one is valid only for the connection that
+/// registered it (so it never reaches the shared plan registry). The name is
+/// already lowercased by the parser — SQL function names are case-insensitive
+/// and the registry stores the same spelling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AggTarget {
+    Native(AggFn),
+    Host(String),
+}
+
+impl AggTarget {
+    /// The function name as written in SQL (for EXPLAIN and error messages).
+    pub fn name(&self) -> &str {
+        match self {
+            AggTarget::Native(f) => f.name(),
+            AggTarget::Host(n) => n,
+        }
+    }
+    /// The built-in this call names, or `None` for a host aggregate. Every rule
+    /// that is about a SPECIFIC built-in (the `count(*)` argument shape, the
+    /// min/max bare-column witness) goes through this, so a host aggregate can
+    /// never be mistaken for one of them.
+    pub fn native(&self) -> Option<AggFn> {
+        match self {
+            AggTarget::Native(f) => Some(*f),
+            AggTarget::Host(_) => None,
+        }
+    }
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            AggTarget::Native(_) => None,
+            AggTarget::Host(n) => Some(n),
+        }
+    }
+}
+
 pub use footprint::{Footprint, KeyAccess, KeyBound, KeyPart, PlanHash};
 pub use fts::{Doclist, Tokenizer};
 pub use policy::{PolicyCmd, PolicyDef};

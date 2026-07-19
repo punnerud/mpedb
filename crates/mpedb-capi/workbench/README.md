@@ -30,3 +30,23 @@ to measure drop-in compatibility beyond mpedb's own tests. Results feed
   back `sqlite3_aggregate_context` with a per-group allocation, and drive them
   from the aggregate executor. That is the whole remaining distance to a Django
   connection opening.
+
+## Findings (2026-07-19, after DESIGN-UDF stage 2: host AGGREGATE UDFs)
+- **Gate 2 is OPEN.** All four `connection.create_aggregate(...)` calls
+  (`STDDEV_POP`, `STDDEV_SAMP`, `VAR_POP`, `VAR_SAMP`) now succeed, and CPython's
+  aggregate bridge works end to end: a differential probe of
+  `STDDEV_POP` (bare / `GROUP BY` / empty set / all-NULL) returns **byte-identical
+  results to stock sqlite** (`3.0`; `1.0, 3.0`; `None`; `None`).
+- **The new blocker is three lines further on**, `_functions.py:85`:
+  `select sqlite_compileoption_used('ENABLE_MATH_FUNCTIONS')` →
+  `bind error: unknown function sqlite_compileoption_used()`. Django uses the
+  answer to decide whether to register its own `ACOS`/`SIN`/`POWER`/… fallbacks.
+  The shim needs `sqlite_compileoption_used(name)` (returning 0 is the honest
+  answer — it makes Django register the pure-Python fallbacks it already has).
+- **Known gap that will bite next:** host UDFs — scalar AND aggregate — are wired
+  on the **read path only**. A statement executed inside an OPEN transaction runs
+  through the write path, where they are out of scope
+  (`host aggregate … is not in scope for this execution`). CPython opens an
+  implicit transaction after DML and Django works inside transactions, so
+  extending `TxnCtx::host_fns`/`host_aggs` to the write path is the natural
+  stage 2.5. Verified: the same probe passes after an explicit `commit()`.
