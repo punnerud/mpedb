@@ -21,13 +21,14 @@
 //!    / DISTINCT / GROUP BY, cell-compared against sqlite (an integer cell
 //!    must be an integer in both engines — sqlite prints reals with a '.').
 //!
-//! Reference: `/usr/bin/sqlite3`. Skipped (not failed) if it is absent.
+//! Reference: the BUNDLED sqlite (3.45.0) via `sqlite_oracle` — no ambient
+//! binary, no skip-gate, machine-independent.
 
 use mpedb::{Config, Database, ExecResult};
 use mpedb_types::Value;
-use std::process::Command;
 
-const SQLITE3: &str = "/usr/bin/sqlite3";
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 /// The sqlite side of the shared table: same rows mpedb is seeded with.
 /// Row 5 holds the deliberate int/real collision (i=1 vs f=1.0) so DISTINCT
@@ -72,10 +73,6 @@ fn cleanup(path: &str) {
     let _ = std::fs::remove_file(format!("{path}-wal"));
 }
 
-fn sqlite_present() -> bool {
-    std::path::Path::new(SQLITE3).exists()
-}
-
 /// mpedb's rows for `sql`, or the error string.
 fn mpedb_rows(db: &Database, sql: &str) -> Result<Vec<Vec<Value>>, String> {
     match db.query(sql, &[]) {
@@ -88,15 +85,7 @@ fn mpedb_rows(db: &Database, sql: &str) -> Result<Vec<Vec<Value>>, String> {
 /// sqlite's list-mode rows for `sql` over the seeded table, or `None` if it
 /// errored. Cells are the CLI's default `|`-separated text.
 fn sqlite_rows(sql: &str) -> Option<Vec<Vec<String>>> {
-    let out = Command::new(SQLITE3)
-        .arg(":memory:")
-        .arg(format!("{SQLITE_SEED}\n{sql};"))
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8(out.stdout).ok()?;
+    let s = sqlite_oracle::try_script_stdout(&format!("{SQLITE_SEED}\n{sql};"), "").ok()?;
     Some(
         s.lines()
             .map(|l| l.split('|').map(str::to_string).collect())
@@ -140,15 +129,12 @@ fn rows_agree(mine: &[Vec<Value>], theirs: &[Vec<String>]) -> Result<(), String>
 
 /// sqlite's `typeof|quote` for a FROM-less `SELECT <expr>`, or `None` on error.
 fn sqlite_eval(expr: &str) -> Option<String> {
-    let out = Command::new(SQLITE3)
-        .arg(":memory:")
-        .arg(format!("SELECT typeof({expr}) || '|' || quote({expr});"))
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    String::from_utf8(out.stdout).ok().map(|s| s.trim_end().to_string())
+    sqlite_oracle::try_script_stdout(
+        &format!("SELECT typeof({expr}) || '|' || quote({expr});"),
+        "",
+    )
+    .ok()
+    .map(|s| s.trim_end().to_string())
 }
 
 /// mpedb's single value for a FROM-less `SELECT <expr>`, or the error string.
@@ -212,10 +198,6 @@ fn agree(v: &Value, sqlite: &str) -> Result<(), String> {
 /// refuse (documented deviation) but must agree whenever accepted.
 #[test]
 fn fromless_arm_matrix() {
-    if !sqlite_present() {
-        eprintln!("skipping: {SQLITE3} not present");
-        return;
-    }
     let (db, path) = open("matrix");
 
     // (literal, is-numeric-or-null) — bool/timestamp are mpedb-only types
@@ -279,10 +261,6 @@ fn fromless_arm_matrix() {
 /// hand-verified as refused before this change.
 #[test]
 fn corpus_classics() {
-    if !sqlite_present() {
-        eprintln!("skipping: {SQLITE3} not present");
-        return;
-    }
     let (db, path) = open("classics");
     for expr in [
         "coalesce(NULL, 1, 2.5)",
@@ -315,10 +293,6 @@ fn corpus_classics() {
 /// match in value AND storage class.
 #[test]
 fn table_battery() {
-    if !sqlite_present() {
-        eprintln!("skipping: {SQLITE3} not present");
-        return;
-    }
     let (db, path) = open("battery");
     let queries = [
         // Per-row winner keeps its own type, and typeof() sees it per row.
