@@ -207,7 +207,17 @@ const MAX_JOINS: usize = 16;
 //     reader hits an unknown window func tag (or desyncs on the i64 / default
 //     bytes) and rejects the plan as corrupt rather than misreading it — the
 //     same additive whole-plan-version gating as the stage-1 window bump (24).
-const PLAN_FORMAT: u8 = 34;
+// 35: window rank/distribution functions (design/DESIGN-WINDOW.md stage 2b) —
+//     `ntile`/`percent_rank`/`cume_dist`. `WindowFunc` grows three tags
+//     (Ntile=10, PercentRank=11, CumeDist=12); the Ntile tag carries a trailing
+//     i64 (the constant bucket count), while PercentRank/CumeDist carry nothing
+//     extra and take no argument. All three are argument-less at the WindowSpec
+//     level (ntile's `n` is baked into the tag, not the `arg` program), so the
+//     no-arg validate/decode guard extends to cover them. A format-34 reader
+//     hits an unknown window func tag and rejects the plan as corrupt rather
+//     than misreading it — the same additive whole-plan-version gating as the
+//     earlier window bumps (24, 34).
+const PLAN_FORMAT: u8 = 35;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -620,11 +630,25 @@ pub enum WindowFunc {
     /// `nth_value(expr, n)` — the n-th row (1-based, `i64`) of the frame, or NULL
     /// if the frame has fewer than n rows. `n` is a CONSTANT ≥ 1 (validated).
     NthValue(i64),
+    /// `ntile(n)` — the partition's rows distributed into `n` buckets as equally
+    /// as possible (bucket number 1..n). sqlite's rule: the first `rows % n`
+    /// buckets get `ceil(rows/n)` rows, the rest `floor`. `n` is a CONSTANT ≥ 1
+    /// (validated); requires ORDER BY (the planner refuses it otherwise). Result
+    /// is `Int64`, never NULL. Takes no per-row value.
+    Ntile(i64),
+    /// `percent_rank()` — `(rank - 1) / (rows_in_partition - 1)`, or 0.0 for a
+    /// one-row partition. Uses `rank()` semantics (ties share). `Float64`, never
+    /// NULL, no argument.
+    PercentRank,
+    /// `cume_dist()` — `(rows whose ORDER BY value is ≤ the current row's, peers
+    /// included) / rows_in_partition`. `Float64`, never NULL, no argument.
+    CumeDist,
 }
 
 impl WindowFunc {
     /// Wire tag. `Agg` is tag 4 followed by the [`AggFn`] tag byte;
-    /// `Lag`/`Lead`/`NthValue` are their tag followed by an i64 (offset / n).
+    /// `Lag`/`Lead`/`NthValue`/`Ntile` are their tag followed by an i64
+    /// (offset / n / bucket count).
     pub(crate) fn tag(self) -> u8 {
         match self {
             WindowFunc::RowNumber => 1,
@@ -636,6 +660,9 @@ impl WindowFunc {
             WindowFunc::FirstValue => 7,
             WindowFunc::LastValue => 8,
             WindowFunc::NthValue(_) => 9,
+            WindowFunc::Ntile(_) => 10,
+            WindowFunc::PercentRank => 11,
+            WindowFunc::CumeDist => 12,
         }
     }
 }

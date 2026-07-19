@@ -205,6 +205,29 @@ fn resolve_window_func(
             }
             (P::NthValue(n), None, arg_ty.unwrap_or(ColumnType::Int64), true)
         }
+        // ntile(n): the bucket count `n` is a constant integer ≥ 1 (like
+        // nth_value's n). It has NO per-row value argument — `n` is folded into
+        // the tag here. Result is Int64, never NULL. (The ORDER BY requirement is
+        // enforced by the caller, which sees the window's ORDER BY list.)
+        ast::WindowFunc::Ntile => {
+            let n = match extra_args.first() {
+                Some(e) => const_int_arg(binder, e, "ntile bucket count")?,
+                None => return Err(bind_err("ntile() requires an argument")),
+            };
+            if n < 1 {
+                return Err(bind_err(
+                    "ntile()'s argument must be a positive integer constant",
+                ));
+            }
+            (P::Ntile(n), None, ColumnType::Int64, false)
+        }
+        // percent_rank()/cume_dist(): argument-less distribution functions
+        // returning a float (never NULL). percent_rank uses rank() semantics;
+        // cume_dist counts peers-inclusive. Neither requires ORDER BY — with none,
+        // every row is a single peer group, so percent_rank is 0.0 and cume_dist
+        // is 1.0 everywhere (matching sqlite, and deterministic).
+        ast::WindowFunc::PercentRank => (P::PercentRank, None, ColumnType::Float64, false),
+        ast::WindowFunc::CumeDist => (P::CumeDist, None, ColumnType::Float64, false),
     })
 }
 
@@ -293,6 +316,9 @@ fn window_item_name(e: &ast::Expr) -> String {
             ast::WindowFunc::FirstValue => "first_value()".to_string(),
             ast::WindowFunc::LastValue => "last_value()".to_string(),
             ast::WindowFunc::NthValue => "nth_value()".to_string(),
+            ast::WindowFunc::Ntile => "ntile()".to_string(),
+            ast::WindowFunc::PercentRank => "percent_rank()".to_string(),
+            ast::WindowFunc::CumeDist => "cume_dist()".to_string(),
         },
         _ => "?column?".to_string(),
     }
@@ -359,6 +385,16 @@ pub(super) fn plan_window_select(
         if spec.distinct {
             return Err(bind_err(
                 "DISTINCT is not allowed in a window aggregate (sqlite refuses it too)",
+            ));
+        }
+        // ntile assigns buckets along the window order, so without an ORDER BY the
+        // bucket numbers depend on the (arbitrary) scan order — a version-brittle,
+        // non-reproducible answer. Refuse it cleanly rather than guess (the
+        // 0-wrong-answer contract). `percent_rank`/`cume_dist` are well-defined
+        // without ORDER BY (one peer group ⇒ 0.0 / 1.0), so they are allowed.
+        if matches!(spec.func, ast::WindowFunc::Ntile) && spec.order_by.is_empty() {
+            return Err(bind_err(
+                "ntile() requires an ORDER BY in its OVER clause",
             ));
         }
         let (arg_prog, arg_ty) = match &spec.arg {
