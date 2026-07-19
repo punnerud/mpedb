@@ -823,6 +823,15 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     atom: false,
                 }
             }
+            // Unary, so it must be listed here rather than falling into the
+            // two-operand catch-all at the bottom.
+            Instr::BitNot => {
+                let a = pop(&mut st);
+                Item {
+                    s: format!("~{}", wrap(&a)),
+                    atom: false,
+                }
+            }
             Instr::IsNull => {
                 let a = pop(&mut st);
                 Item {
@@ -887,6 +896,16 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                 let a = pop(&mut st);
                 Item {
                     s: format!("{} REGEXP {}", wrap(&a), cst(i)),
+                    atom: false,
+                }
+            }
+            // The dynamic-pattern form: the pattern is on the stack, so it is
+            // popped FIRST (it was pushed last).
+            Instr::RegexpDyn => {
+                let p = pop(&mut st);
+                let a = pop(&mut st);
+                Item {
+                    s: format!("{} REGEXP {}", wrap(&a), wrap(&p)),
                     atom: false,
                 }
             }
@@ -1040,6 +1059,10 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     Instr::And => "AND",
                     Instr::Or => "OR",
                     Instr::Concat => "||",
+                    Instr::BitAnd => "&",
+                    Instr::BitOr => "|",
+                    Instr::Shl => "<<",
+                    Instr::Shr => ">>",
                     _ => "?",
                 };
                 Item {

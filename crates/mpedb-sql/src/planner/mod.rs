@@ -39,7 +39,7 @@ use crate::plan::{
 #[allow(unused_imports)]
 use crate::plan::{FtsQuery, FtsTerm};
 use crate::policy::{PolicyCatalog, TablePolicies};
-use mpedb_types::{BareGroupBy, Collation, ExprProgram, ColumnType, Error, Footprint, Instr, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
+use mpedb_types::{exact_float_as_int, BareGroupBy, Collation, ExprProgram, ColumnType, Error, Footprint, Instr, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
     TableDef, TableSet, Value,};
 
 mod access;
@@ -1042,11 +1042,23 @@ fn plan_insert(
                                 )));
                             }
                             if !v.fits(col.ty) {
+                                // Name the reason when `coerce_const` TRIED and
+                                // the value itself was the obstacle — sqlite
+                                // STRICT refuses this one too ("cannot store
+                                // REAL value in INT column"), so saying which
+                                // real is the useful half of the message.
+                                let why = match (&v, col.ty) {
+                                    (Value::Float(_), ColumnType::Int64) => {
+                                        " — it is not exactly an integer in the int64 range"
+                                    }
+                                    _ => "",
+                                };
                                 return Err(bind_err(format!(
-                                    "value of type {} cannot be inserted into column `{}` of type {}",
+                                    "value of type {} cannot be inserted into column `{}` of type {}{}",
                                     v.type_name(),
                                     col.name,
-                                    col.ty
+                                    col.ty,
+                                    why
                                 )));
                             }
                             InsertSource::Const(push_plan_const(consts, v)?)
@@ -1315,9 +1327,21 @@ fn plan_delete(
 /// else falls through to the `fits` check and is refused rather than guessed.
 /// A `Bool` constant landing in an int64 column goes the other way and is
 /// always exact — that IS sqlite's storage (`TRUE` -> 1).
+///
+/// The Float -> Int direction (task #74) is sqlite's INTEGER affinity: a real
+/// is stored as an integer exactly when the round trip is lossless, so
+/// `INSERT INTO t (i) VALUES (8.0)` stores the integer 8 in sqlite and here.
+/// `8.5` is NOT converted — it falls through to the caller's `fits` check and
+/// is refused, because sqlite would keep the real in its typeless column and
+/// mpedb's rigid int64 cannot. Both dialects agree on the lossless case, so
+/// unlike the bool bridges this one is not dialect-gated.
 fn coerce_const(v: Value, ty: ColumnType, sqlite: bool) -> Value {
     match (&v, ty) {
         (Value::Int(i), ColumnType::Float64) => Value::Float(*i as f64),
+        (Value::Float(f), ColumnType::Int64) => match exact_float_as_int(*f) {
+            Some(i) => Value::Int(i),
+            None => v,
+        },
         (Value::Int(i @ (0 | 1)), ColumnType::Bool) if sqlite => Value::Bool(*i == 1),
         (Value::Bool(b), ColumnType::Int64) if sqlite => Value::Int(*b as i64),
         _ => v,
@@ -1402,6 +1426,7 @@ fn max_col(e: &BExpr) -> Option<u16> {
             BExpr::Binary(_, a, b)
             | BExpr::IsDistinct(a, b, _)
             | BExpr::CollateCmp(_, a, b, _)
+            | BExpr::RegexpDyn(a, b)
             | BExpr::ClassCmp(_, a, b, _, _) => {
                 stack.push(a);
                 stack.push(b);

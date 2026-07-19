@@ -330,7 +330,28 @@ const MAX_JOINS: usize = 16;
 //     binder-computed JSON-SUBTYPE BITMASK as a hidden leading const argument
 //     (`binder::bind_json_call`), which is why their plan arity is one more
 //     than their SQL arity.
-const PLAN_FORMAT: u8 = 46;
+// 47: the bitwise family `& | << >> ~` (task #74 item 2) — five additive expr
+//     opcodes, `Instr::BitAnd`/`BitOr`/`Shl`/`Shr`/`BitNot`, tags 50..54. Purely
+//     additive: no existing plan can contain one, so every plan that does not
+//     use a bitwise operator encodes byte-for-byte as in format 45/46, and a
+//     reader one format back hits the unknown opcode in the expr decoder and
+//     rejects the blob as corrupt rather than misreading it.
+//     NOTE (worktree, 2026-07-19): the base this was written on carries 45 and
+//     46 is another agent's in-flight bump, so this takes 47 by instruction and
+//     the numbers are reconciled at merge.
+// 48: `REGEXP` with a NON-literal pattern (task #74 item 3) — one additive expr
+//     opcode, `Instr::RegexpDyn` (tag 55), which pops the pattern off the stack
+//     instead of reading it from the const pool. A LITERAL pattern still
+//     compiles to `Instr::Regexp` and its plan bytes are unchanged, so this is
+//     additive in the same way 47 was.
+// 49: the SCALAR `max(a, b, …)` / `min(a, b, …)` (task #74 item 5) — two
+//     additive `ScalarFn` tags, `Max2` (60) and `Min2` (61). Tags 60/61 rather
+//     than 44/45 for the same reason the bitwise opcodes took 50..54: several
+//     branches were live in the 44..59 window, and a tag hole costs nothing
+//     while a collision would silently call the wrong function. Additive: an
+//     unknown `ScalarFn` tag is already a decode error, and no existing plan
+//     can carry one.
+const PLAN_FORMAT: u8 = 47;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
