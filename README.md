@@ -15,6 +15,13 @@ mpedb combines three things that normally don't come together:
   accepts any scalar in that column — sqlite-style flexibility where you ask
   for it, rigidity everywhere else. An `any` column cannot be a key.)
 
+**It opens an existing sqlite `.db` file directly** — `mpedb data.db` reads and
+writes it like `sqlite3 data.db`. With `--overlay` there is no import step: your
+changes live in a `.mpedb` delta-WAL beside the file, unchanged rows read
+straight from the `.db` through a native sqlite-format reader (no sqlite library
+in the path), and `mpedb checkpoint` folds the delta back so every other tool
+sees it. See [design/SQLITE.md](design/SQLITE.md).
+
 SQL is compiled **once** into a content-hashed plan; the hot path is
 `execute(hash, params)` with zero parsing. Plans carry precomputed read/write
 footprints ("pre-computed locks", Calvin-style), so the engine knows which
