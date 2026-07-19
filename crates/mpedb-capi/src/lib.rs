@@ -27,6 +27,7 @@ use std::os::raw::{c_char, c_double, c_int, c_longlong, c_uchar, c_uint, c_void}
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr;
+use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The seed table every fresh mpedb file is created with: mpedb refuses a
@@ -314,21 +315,53 @@ fn to_outcome(res: ExecResult) -> Outcome {
 
 /// Execute `stmt` (first step). Updates connection counters. Returns the
 /// primary result code to hand back from the failing API on error, else OK.
+/// A contention error a RETRY can clear — an optimistic-mode `WriteConflict`
+/// (the loser rolled back, nothing applied), a full reader table, or an evicted
+/// read snapshot. valconv maps all three to `SQLITE_BUSY`; `busy_timeout` waits
+/// on exactly these. (In the normal serial writer mode the writer lock BLOCKS
+/// instead of returning one of these, so there is nothing to wait on.)
+fn is_busy_err(e: &DbError) -> bool {
+    matches!(
+        e,
+        DbError::WriteConflict | DbError::ReadersFull | DbError::SnapshotEvicted
+    )
+}
+
+/// sqlite's own default-busy-handler delay table (ms), then 100 ms steady.
+fn busy_backoff(tries: u32) -> Duration {
+    const DELAYS: [u64; 12] = [1, 2, 5, 10, 15, 20, 25, 25, 25, 50, 50, 100];
+    Duration::from_millis(DELAYS[(tries as usize).min(DELAYS.len() - 1)])
+}
+
 fn run_stmt(s: &mut Stmt) -> c_int {
     let Some(c) = (unsafe { conn(s.db) }) else {
         return SQLITE_MISUSE;
     };
     let is_dml = matches!(sql::classify(&s.sql), sql::Kind::Dml { .. });
     let params = s.binds.clone();
+    // `busy_timeout(ms)`: on a BUSY-class contention error, sleep with sqlite's
+    // backoff and retry until the deadline, exactly as sqlite's default busy
+    // handler does — a transient conflict clears instead of failing the call.
+    // Zero timeout (the default) = no retry, immediate BUSY, as sqlite. Serial
+    // mode never enters the loop (the writer lock blocks, never returns BUSY).
+    let deadline =
+        (c.busy_timeout_ms > 0).then(|| Instant::now() + Duration::from_millis(c.busy_timeout_ms as u64));
     // Execute the parameter-rewritten text (`$K` placeholders) so mpedb binds
     // the caller's values by number; classification/introspection are unaffected
     // by the rewrite (only placeholders change), so they still use `s.sql`.
-    let outcome = catch_unwind(AssertUnwindSafe(|| exec_one(c, &s.exec_sql, &params)));
-    let outcome = match outcome {
-        Ok(r) => r,
-        Err(_) => {
-            c.set_error(SQLITE_ERROR, SQLITE_ERROR, "internal error (panic) in engine");
-            return SQLITE_ERROR;
+    let mut tries = 0u32;
+    let outcome = loop {
+        match catch_unwind(AssertUnwindSafe(|| exec_one(c, &s.exec_sql, &params))) {
+            Ok(Err(ref e)) if is_busy_err(e) && deadline.is_some_and(|d| Instant::now() < d) => {
+                std::thread::sleep(busy_backoff(tries));
+                tries += 1;
+                continue;
+            }
+            Ok(r) => break r,
+            Err(_) => {
+                c.set_error(SQLITE_ERROR, SQLITE_ERROR, "internal error (panic) in engine");
+                return SQLITE_ERROR;
+            }
         }
     };
     match outcome {
