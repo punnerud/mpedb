@@ -11,6 +11,22 @@
 //! `<table>.` qualifier — that table's columns. The schema is shared as
 //! `Rc<RefCell<Names>>` and refreshed by the repl after every statement, so a
 //! `CREATE TABLE` typed in the session completes on the next line.
+//!
+//! Tab on an EMPTY line is different: instead of dumping every name it opens a
+//! [`picker`] — a list of the database's tables you walk with the arrow keys and
+//! choose from with Enter. That is the one thing `sqlite3` has no answer for
+//! ("what is even in this file?"), and an empty prompt is the only place it can
+//! be offered without guessing, because there is no half-typed word to complete
+//! and therefore no intent to override.
+//!
+//! It needs no new dependency and no TUI crate. rustyline calls
+//! [`Completer::complete`] with the terminal ALREADY in raw mode, so the picker
+//! reads keys straight from fd 0 (unbuffered `libc::read`, so nothing is stolen
+//! from rustyline's own reader), paints itself with ANSI escapes, erases itself
+//! again, and hands back exactly ONE candidate — which rustyline inserts and
+//! redraws as if it had been an ordinary completion. An unsupported terminal
+//! never reaches the completer at all (rustyline takes `readline_direct`), so
+//! there is no dumb-terminal path to guard.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -56,11 +72,17 @@ impl Names {
 
     /// Replace the table/column snapshot (called after every statement — DDL
     /// changes it).
+    ///
+    /// `_mpedb_*` is filtered out: the inert bootstrap table a freshly created
+    /// native database is seeded with (a schema with no tables is refused) is an
+    /// implementation detail, and offering it as the first entry of the picker —
+    /// which is where an empty database's user looks FIRST — would be actively
+    /// misleading. Nothing stops you naming it; it is just never suggested.
     pub fn set_schema(&mut self, schema: &mpedb::Schema) {
         self.tables = schema
             .tables
             .iter()
-            .filter(|t| !t.dead && !t.name.is_empty())
+            .filter(|t| !t.dead && !t.name.is_empty() && !t.name.starts_with("_mpedb_"))
             .map(|t| {
                 (
                     t.name.clone(),
@@ -141,10 +163,255 @@ fn starts_ci(hay: &str, prefix: &str) -> bool {
     hay.len() >= prefix.len() && hay.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
+// ------------------------------------------------------------- table picker
+
+/// One keystroke, as the picker cares about it.
+enum Key {
+    Up,
+    Down,
+    Home,
+    End,
+    Enter,
+    Tab,
+    Cancel,
+    Other,
+}
+
+/// Read one byte from stdin, unbuffered. rustyline holds the terminal in raw
+/// mode for the whole of `readline`, so this returns a single keypress with no
+/// line discipline in the way. `libc::read` rather than `std::io::stdin()`
+/// because the latter buffers, and a buffer here would swallow keys rustyline
+/// still has to see.
+fn read_byte() -> Option<u8> {
+    let mut b = [0u8; 1];
+    loop {
+        let n = unsafe { libc::read(libc::STDIN_FILENO, b.as_mut_ptr().cast(), 1) };
+        if n == 1 {
+            return Some(b[0]);
+        }
+        if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        return None;
+    }
+}
+
+/// Is another byte available RIGHT NOW? The only way to tell a lone `Esc`
+/// (cancel) from the start of an arrow key's `Esc [ A`: a real escape sequence
+/// arrives as one burst, a human's Esc does not.
+fn byte_waiting(ms: i32) -> bool {
+    let mut pfd = libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 };
+    unsafe { libc::poll(&mut pfd, 1, ms) > 0 }
+}
+
+fn read_key() -> Key {
+    match read_byte() {
+        None => Key::Cancel,
+        Some(b'\r') | Some(b'\n') => Key::Enter,
+        Some(b'\t') => Key::Tab,
+        // Ctrl-C, Ctrl-G, Ctrl-D, `q`.
+        Some(3) | Some(7) | Some(4) | Some(b'q') => Key::Cancel,
+        Some(0x1b) => {
+            if !byte_waiting(30) {
+                return Key::Cancel; // a bare Esc
+            }
+            match read_byte() {
+                Some(b'[') | Some(b'O') => match read_byte() {
+                    Some(b'A') => Key::Up,
+                    Some(b'B') => Key::Down,
+                    Some(b'H') => Key::Home,
+                    Some(b'F') => Key::End,
+                    // `Esc [ 5 ~` and friends: swallow the tilde, ignore.
+                    Some(c) if c.is_ascii_digit() => {
+                        while byte_waiting(0) {
+                            if read_byte() == Some(b'~') {
+                                break;
+                            }
+                        }
+                        Key::Other
+                    }
+                    _ => Key::Other,
+                },
+                _ => Key::Other,
+            }
+        }
+        Some(b'k') => Key::Up,
+        Some(b'j') => Key::Down,
+        Some(_) => Key::Other,
+    }
+}
+
+/// Terminal size, or a conservative 80x24.
+fn term_size() -> (usize, usize) {
+    let mut ws: libc::winsize = unsafe { std::mem::zeroed() };
+    if unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, &mut ws) } == 0
+        && ws.ws_col > 0
+        && ws.ws_row > 0
+    {
+        (ws.ws_col as usize, ws.ws_row as usize)
+    } else {
+        (80, 24)
+    }
+}
+
+fn out(s: &str) {
+    use std::io::Write as _;
+    let mut o = std::io::stdout();
+    let _ = o.write_all(s.as_bytes());
+    let _ = o.flush();
+}
+
+/// Cut `s` to `w` display columns (counting chars, which is right for the
+/// identifiers and ASCII punctuation this paints) and pad it back out to `w`,
+/// so a reverse-video row is a full-width bar.
+fn fit(s: &str, w: usize) -> String {
+    let n = s.chars().count();
+    if n > w {
+        let mut t: String = s.chars().take(w.saturating_sub(1)).collect();
+        t.push('…');
+        t
+    } else {
+        format!("{s}{}", " ".repeat(w - n))
+    }
+}
+
+/// The interactive table list. Returns the text to insert, or `None` when the
+/// user backed out.
+///
+/// Contract with the caller: the cursor starts at the end of the (empty) prompt
+/// line, and is put back there before returning — the menu is painted BELOW and
+/// erased again, so rustyline's own idea of the layout is never disturbed.
+fn picker(names: &Names, prompt_cols: usize) -> Option<String> {
+    let (cols, rows) = term_size();
+    let width = cols.saturating_sub(1).max(20);
+
+    if names.tables.is_empty() {
+        out("\r\n\x1b[2m  no tables yet — CREATE TABLE <name> (id INTEGER PRIMARY KEY, …) \
+             to make one\x1b[0m\r");
+        let _ = read_key();
+        restore(1, prompt_cols);
+        return None;
+    }
+
+    // The list gets whatever vertical room is left after the prompt line and
+    // the footer, capped so it never dominates the screen (and, more to the
+    // point, never scrolls it — a scroll would move the prompt out from under
+    // the cursor arithmetic in `restore`).
+    let view = rows.saturating_sub(4).clamp(1, 12).min(names.tables.len());
+    let namew = names
+        .tables
+        .iter()
+        .map(|(t, _)| t.chars().count())
+        .max()
+        .unwrap_or(1)
+        .min(28);
+
+    let mut sel = 0usize;
+    let mut top = 0usize;
+    let mut painted = 0usize;
+    loop {
+        if sel < top {
+            top = sel;
+        } else if sel >= top + view {
+            top = sel + 1 - view;
+        }
+        let mut buf = String::new();
+        if painted == 0 {
+            buf.push_str("\r\n");
+        } else {
+            // Back to the first painted row.
+            buf.push_str(&format!("\x1b[{}A\r", painted - 1));
+        }
+        let mut lines: Vec<String> = Vec::new();
+        for (i, (t, cols_)) in names.tables.iter().enumerate().skip(top).take(view) {
+            let more = if i == top && top > 0 {
+                "↑"
+            } else if i + 1 == top + view && top + view < names.tables.len() {
+                "↓"
+            } else {
+                " "
+            };
+            let body = format!(
+                " {more} {:<namew$}  \x1b[2m{}\x1b[0m",
+                t,
+                fit(&cols_.join(", "), width.saturating_sub(namew + 6))
+            );
+            lines.push(if i == sel {
+                // Reverse video, with the dim escape stripped so the bar is one
+                // solid colour.
+                format!("\x1b[7m{}\x1b[0m", fit(&body.replace("\x1b[2m", "").replace("\x1b[0m", ""), width))
+            } else {
+                body
+            });
+        }
+        lines.push(format!(
+            "\x1b[2m   {} table{} · ↑↓ move · Enter SELECT · Tab name · Esc cancel\x1b[0m",
+            names.tables.len(),
+            if names.tables.len() == 1 { "" } else { "s" }
+        ));
+        painted = lines.len();
+        for (i, l) in lines.iter().enumerate() {
+            buf.push_str("\x1b[2K");
+            buf.push_str(l);
+            buf.push('\r');
+            if i + 1 < lines.len() {
+                buf.push('\n');
+            }
+        }
+        out(&buf);
+
+        match read_key() {
+            Key::Up => sel = sel.saturating_sub(1),
+            Key::Down => sel = (sel + 1).min(names.tables.len() - 1),
+            Key::Home => sel = 0,
+            Key::End => sel = names.tables.len() - 1,
+            Key::Enter => {
+                restore(painted, prompt_cols);
+                // Enter inserts a RUNNABLE statement, not a bare identifier.
+                // The picker only ever opens on an EMPTY line, where a lone
+                // table name is a syntax error and nothing at all is being
+                // overridden — and the statement is left ON the line to edit,
+                // not executed. `LIMIT 20` because the question a picker
+                // answers is "what is in here", and the honest answer to that
+                // is a peek, not a full table scan.
+                return Some(format!("SELECT * FROM {} LIMIT 20;", names.tables[sel].0));
+            }
+            Key::Tab => {
+                restore(painted, prompt_cols);
+                // The conservative half of the same gesture: just the name, for
+                // when the statement you have in mind is not a SELECT.
+                return Some(names.tables[sel].0.clone());
+            }
+            Key::Cancel => {
+                restore(painted, prompt_cols);
+                return None;
+            }
+            Key::Other => {}
+        }
+    }
+}
+
+/// Erase `painted` menu rows and put the cursor back where rustyline left it:
+/// end of the prompt on the line above. Deliberately does NOT touch the prompt
+/// row itself, so a cancelled pick leaves the screen byte-identical to before.
+fn restore(painted: usize, prompt_cols: usize) {
+    let mut s = String::new();
+    if painted > 1 {
+        s.push_str(&format!("\x1b[{}A", painted - 1));
+    }
+    s.push_str("\r\x1b[J\x1b[1A\r");
+    if prompt_cols > 0 {
+        s.push_str(&format!("\x1b[{prompt_cols}C"));
+    }
+    out(&s);
+}
+
 /// The rustyline helper: completion only — no hints, no highlighting, no
 /// multi-line validation (statements are one line, as they always were).
 pub struct SqlHelper {
     names: Rc<RefCell<Names>>,
+    /// Display width of the prompt, so the picker can put the cursor back.
+    prompt_cols: usize,
 }
 
 impl Completer for SqlHelper {
@@ -156,6 +423,14 @@ impl Completer for SqlHelper {
         pos: usize,
         _ctx: &Context<'_>,
     ) -> rustyline::Result<(usize, Vec<String>)> {
+        // An EMPTY line has no word to complete, so Tab means "show me what is
+        // here" — the browsable picker rather than a wall of every keyword.
+        if line[..pos].trim().is_empty() && line.trim().is_empty() {
+            let chosen = picker(&self.names.borrow(), self.prompt_cols);
+            // No choice → no candidates → rustyline beeps and redraws nothing,
+            // which is exactly right: `restore` already put the screen back.
+            return Ok((pos, chosen.into_iter().collect()));
+        }
         Ok(complete_at(&self.names.borrow(), line, pos))
     }
 }
@@ -189,7 +464,10 @@ impl LineSource {
                 .auto_add_history(true)
                 .build();
             if let Ok(mut editor) = Editor::<SqlHelper, DefaultHistory>::with_config(config) {
-                editor.set_helper(Some(SqlHelper { names }));
+                editor.set_helper(Some(SqlHelper {
+                    names,
+                    prompt_cols: prompt.chars().count(),
+                }));
                 return LineSource::Interactive {
                     editor: Box::new(editor),
                     prompt: prompt.to_owned(),

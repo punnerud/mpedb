@@ -453,6 +453,308 @@ fn the_first_write_creates_the_database() {
     }
 }
 
+// ------------------------------------------------------- CSV: import/analyse
+
+/// `mpedb <db> <file.csv>` — everything below drives it over a PIPE, which is
+/// the whole point of the flag pair: the interactive prompt must never fire
+/// where there is nobody to answer it.
+fn write_csv(dir: &Path, name: &str, body: &str) -> String {
+    let p = dir.join(name);
+    std::fs::write(&p, body).unwrap();
+    p.to_str().unwrap().to_owned()
+}
+
+/// What is left in a directory, sorted — the assertion that analysis wrote
+/// nothing has to be about the WHOLE directory, not just the database name.
+fn listing(dir: &Path) -> Vec<String> {
+    let mut v: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    v.sort();
+    v
+}
+
+/// `--import` really lands the rows in the database — in a sqlite base (where
+/// a foreign sqlite reader must see them) and in a native `.mpedb` alike.
+#[test]
+fn csv_import_puts_queryable_rows_in_the_database() {
+    let td = TestDir::new("csv-import");
+    let csv = write_csv(
+        td.path(),
+        "people.csv",
+        "id,name,score\n1,Ada,9.5\n2,Grace,7.25\n3,Alan,3\n",
+    );
+
+    // 1. A sqlite base that does not exist yet: the import is a WRITE, so it
+    //    creates the database (the lazy-create rule, unchanged).
+    let db = td.path().join("data.db");
+    let dbs = db.to_str().unwrap().to_owned();
+    let o = run(&[&dbs, &csv, "--import"]);
+    assert_ok(&o);
+    assert!(db.exists(), "an import must create the database");
+    assert!(out_str(&o).contains("imported 3 rows"), "stdout: {}", out_str(&o));
+
+    let o = run(&[&dbs, "SELECT count(*), sum(score) FROM people"]);
+    assert_ok(&o);
+    assert_eq!(out_str(&o), "count(*)\tsum(score)\n3\t19.75\n");
+
+    // The table is in the BASE, so plain sqlite reads it.
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let (n, name): (i64, String) = conn
+        .query_row("SELECT id, name FROM people WHERE id = 2", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!((n, name), (2, "Grace".to_owned()));
+
+    // 2. The native `.mpedb` target takes the same file through the typed row
+    //    API and answers the same question.
+    let ndb = td.path().join("native.mpedb");
+    let nds = ndb.to_str().unwrap().to_owned();
+    assert_ok(&run(&[&nds, &csv, "--import"]));
+    let o = run(&[&nds, "SELECT name FROM people WHERE id = 3"]);
+    assert_ok(&o);
+    assert_eq!(out_str(&o), "name\nAlan\n");
+
+    // 3. `--table` puts the same CSV somewhere else in the same database.
+    assert_ok(&run(&[&dbs, &csv, "--import", "--table", "people_v2"]));
+    let o = run(&[&dbs, "SELECT count(*) FROM people_v2"]);
+    assert_ok(&o);
+    assert_eq!(out_str(&o), "count(*)\n3\n");
+}
+
+/// `--analyse` answers questions about the CSV and leaves the directory exactly
+/// as it found it — the file it loads into is a scratch database in the temp
+/// directory, removed on the way out. This is the CSV face of the rule that a
+/// READ creates nothing.
+#[test]
+fn csv_analysis_writes_nothing_at_all() {
+    let td = TestDir::new("csv-analyse");
+    let csv = write_csv(
+        td.path(),
+        "sales.csv",
+        "region,amount\nnorth,10\nsouth,32\nnorth,8\n",
+    );
+    let before = listing(td.path());
+
+    let db = td.path().join("data.db");
+    let o = run_repl(
+        &[db.to_str().unwrap(), &csv, "--analyse"],
+        "SELECT region, sum(amount) FROM sales GROUP BY region;\n.quit\n",
+    );
+    assert_ok(&o);
+    assert!(out_str(&o).contains("north\t18"), "stdout: {}", out_str(&o));
+    assert!(out_str(&o).contains("south\t32"), "stdout: {}", out_str(&o));
+
+    assert_eq!(listing(td.path()), before, "analysis wrote to the directory");
+    assert!(!db.exists(), "analysis created the database");
+}
+
+/// RFC4180 in anger: a delimiter inside quotes, a doubled quote, a newline
+/// inside a field, CRLF line ends, and empty fields (which become NULL). The
+/// round trip through an import is the assertion — the bytes have to come back.
+#[test]
+fn csv_quoting_edge_cases_survive_the_round_trip() {
+    let td = TestDir::new("csv-quotes");
+    let csv = write_csv(
+        td.path(),
+        "q.csv",
+        "id,txt\r\n1,\"Doe, Jane\"\r\n2,\"he said \"\"hi\"\"\"\r\n3,\"two\nlines\"\r\n4,\r\n",
+    );
+    let db = td.path().join("q.db");
+    let dbs = db.to_str().unwrap().to_owned();
+    assert_ok(&run(&[&dbs, &csv, "--import"]));
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let got: Vec<(i64, Option<String>)> = conn
+        .prepare("SELECT id, txt FROM q ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (1, Some("Doe, Jane".to_owned())),
+            (2, Some("he said \"hi\"".to_owned())),
+            (3, Some("two\nlines".to_owned())),
+            (4, None), // an empty field is NULL
+        ]
+    );
+
+    // A tab-separated file is recognized without being told.
+    let tsv = write_csv(td.path(), "t.tsv", "a\tb\n1\tx\n2\ty\n");
+    assert_ok(&run(&[&dbs, &tsv, "--import"]));
+    let o = run(&[&dbs, "SELECT b FROM t WHERE a = 2"]);
+    assert_ok(&o);
+    assert_eq!(out_str(&o), "b\ny\n");
+
+    // An unterminated quote is truncated data, not something to guess at.
+    let bad = write_csv(td.path(), "bad.csv", "a,b\n1,\"oops\n");
+    let o = run(&[&dbs, &bad, "--import"]);
+    assert_eq!(o.status.code(), Some(1), "stderr: {}", err_str(&o));
+    assert!(err_str(&o).contains("unterminated"), "stderr: {}", err_str(&o));
+}
+
+/// Inference commits to a type per column, and is timid where being wrong
+/// would LOSE data: leading zeros stay text (zip codes, ids), a column that
+/// mixes integers and decimals is float, anything else is text.
+#[test]
+fn csv_type_inference_picks_int_float_and_text() {
+    let td = TestDir::new("csv-types");
+    let csv = write_csv(
+        td.path(),
+        "m.csv",
+        "n,f,s,zip,blank\n1,1.5,alpha,00501,\n2,3,beta,10001,\n-3,2e2,7up,00000,\n",
+    );
+    let db = td.path().join("m.db");
+    let dbs = db.to_str().unwrap().to_owned();
+    let o = run(&[&dbs, &csv, "--import"]);
+    assert_ok(&o);
+
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let sql: String = conn
+        .query_row("SELECT sql FROM sqlite_master WHERE name = 'm'", [], |r| r.get(0))
+        .unwrap();
+    assert!(sql.contains("\"n\" INTEGER PRIMARY KEY"), "{sql}");
+    assert!(sql.contains("\"f\" REAL"), "{sql}");
+    assert!(sql.contains("\"s\" TEXT"), "{sql}");
+    // The one that matters: `00501` is not the integer 501.
+    assert!(sql.contains("\"zip\" TEXT"), "{sql}");
+    // An all-empty column has nothing to infer from, so it is text and NULLable.
+    assert!(sql.contains("\"blank\" TEXT") && !sql.contains("\"blank\" TEXT NOT NULL"), "{sql}");
+    let zip: String = conn
+        .query_row("SELECT zip FROM m WHERE n = 1", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(zip, "00501");
+
+    // No header row (every field is a number): the rows are all DATA and the
+    // columns are named c1.., with a synthesized primary key since column 1
+    // repeats.
+    let nh = write_csv(td.path(), "nh.csv", "1,2\n1,3\n");
+    assert_ok(&run(&[&dbs, &nh, "--import"]));
+    let o = run(&[&dbs, "SELECT count(*) FROM nh"]);
+    assert_ok(&o);
+    assert_eq!(out_str(&o), "count(*)\n2\n", "the first row was eaten as a header");
+    let sql: String = conn
+        .query_row("SELECT sql FROM sqlite_master WHERE name = 'nh'", [], |r| r.get(0))
+        .unwrap();
+    assert!(sql.contains("\"rowid\" INTEGER PRIMARY KEY") && sql.contains("\"c1\""), "{sql}");
+}
+
+/// An import that lands on an existing table has no correct behaviour, so it
+/// has none: it refuses, names the flag that gets you out, and changes nothing.
+#[test]
+fn csv_import_never_overwrites_an_existing_table() {
+    let td = TestDir::new("csv-collide");
+    let db = td.path().join("c.db");
+    let dbs = db.to_str().unwrap().to_owned();
+    assert_ok(&run(&[&dbs, "CREATE TABLE users(id INTEGER PRIMARY KEY, keep TEXT)"]));
+    assert_ok(&run(&[&dbs, "INSERT INTO users VALUES(1,'original')"]));
+    assert_ok(&run(&["checkpoint", &dbs]));
+
+    // The CSV's header names a table that is already there.
+    let csv = write_csv(td.path(), "users.csv", "id,other\n9,new\n");
+    let o = run(&[&dbs, &csv, "--import"]);
+    assert_eq!(o.status.code(), Some(1), "stderr: {}", err_str(&o));
+    assert!(err_str(&o).contains("already exists"), "stderr: {}", err_str(&o));
+    assert!(err_str(&o).contains("--table"), "the way out must be named: {}", err_str(&o));
+
+    let o = run(&[&dbs, "SELECT keep FROM users"]);
+    assert_ok(&o);
+    assert_eq!(out_str(&o), "keep\noriginal\n", "the existing table was touched");
+
+    // The same refusal on a native database.
+    let ndb = td.path().join("c.mpedb");
+    let nds = ndb.to_str().unwrap().to_owned();
+    assert_ok(&run(&[&nds, &csv, "--import"]));
+    let o = run(&[&nds, &csv, "--import"]);
+    assert_eq!(o.status.code(), Some(1), "stderr: {}", err_str(&o));
+    assert!(err_str(&o).contains("already exists"), "stderr: {}", err_str(&o));
+}
+
+/// An empty CSV is not a table. It fails before anything is created — for the
+/// import that would have created the database as much as for the analysis.
+#[test]
+fn an_empty_csv_is_refused_and_creates_nothing() {
+    let td = TestDir::new("csv-empty");
+    let db = td.path().join("e.db");
+    let dbs = db.to_str().unwrap().to_owned();
+    for body in ["", "\n\n\n"] {
+        let csv = write_csv(td.path(), "empty.csv", body);
+        for flag in ["--import", "--analyse"] {
+            let o = run(&[&dbs, &csv, flag]);
+            assert_eq!(o.status.code(), Some(1), "{flag} {body:?}: {}", err_str(&o));
+            assert!(err_str(&o).contains("is empty"), "stderr: {}", err_str(&o));
+            assert!(!db.exists(), "{flag} on an empty CSV created the database");
+        }
+    }
+}
+
+/// Piped stdin gets NO prompt: the CSV question is only asked where somebody
+/// can answer it, and the unattended answer is the one that writes nothing.
+/// A prompt fired down a pipe would eat the caller's first line and then hang.
+#[test]
+fn a_csv_over_a_pipe_is_never_prompted_for() {
+    let td = TestDir::new("csv-nopipe");
+    let csv = write_csv(td.path(), "p.csv", "id,v\n1,x\n2,y\n");
+    let db = td.path().join("p.db");
+    let before = listing(td.path());
+
+    // No flag at all: the default must resolve itself, silently on stdout.
+    let o = run_repl(&[db.to_str().unwrap(), &csv], "SELECT count(*) FROM p;\n.quit\n");
+    assert_ok(&o);
+    assert!(out_str(&o).contains('2'), "stdout: {}", out_str(&o));
+    let err = err_str(&o);
+    assert!(err.contains("no tty"), "the default must say what it did: {err}");
+    assert!(!err.contains("choice ["), "a prompt fired down a pipe: {err}");
+    assert_eq!(listing(td.path()), before, "the unattended default wrote something");
+
+    // ... and the flags cannot be used without a CSV to apply them to.
+    let o = run(&[db.to_str().unwrap(), "--import", "SELECT 1"]);
+    assert_eq!(o.status.code(), Some(2), "stderr: {}", err_str(&o));
+    // ... nor can SQL trail a CSV, where it would silently never run.
+    let o = run(&[db.to_str().unwrap(), &csv, "SELECT 1"]);
+    assert_eq!(o.status.code(), Some(2), "stderr: {}", err_str(&o));
+    assert!(err_str(&o).contains("not a statement"), "stderr: {}", err_str(&o));
+}
+
+/// Tab on an empty line opens an interactive table picker — but ONLY on a tty.
+/// Over a pipe there is no line editor at all, so a Tab is just a character in
+/// a statement and nothing is painted: no menu, no prompt, no escape sequences.
+/// (The picker itself is verified on a real pty; it cannot be driven by a pipe,
+/// which is exactly what this asserts.)
+#[test]
+fn piped_stdin_gets_no_picker_and_no_prompt() {
+    let td = TestDir::new("no-picker");
+    let db = td.path().join("k.db");
+    let dbs = db.to_str().unwrap().to_owned();
+    assert_ok(&run(&[&dbs, "CREATE TABLE users(id INTEGER PRIMARY KEY)"]));
+
+    // A bare Tab, a Tab-indented line, and an empty line: none of them may
+    // produce a menu.
+    let o = run_repl(&[&dbs], "\t\n\t\nSELECT count(*) FROM users;\n\n.quit\n");
+    assert_ok(&o);
+    let all = format!("{}{}", out_str(&o), err_str(&o));
+    assert!(!all.contains("Esc cancel"), "a picker was painted over a pipe: {all}");
+    assert!(!all.contains("no tables yet"), "picker text over a pipe: {all}");
+    assert!(!all.contains('\x1b'), "escape sequences over a pipe: {all:?}");
+    assert!(!all.contains("mpedb(ovl)>"), "a prompt was printed over a pipe: {all:?}");
+    assert!(!all.contains("mpedb> "), "a prompt was printed over a pipe: {all:?}");
+
+    // The same for a native database's repl.
+    let ndb = td.path().join("k.mpedb");
+    let nds = ndb.to_str().unwrap().to_owned();
+    assert_ok(&run(&[&nds, "CREATE TABLE users(id INTEGER PRIMARY KEY)"]));
+    let o = run_repl(&[&nds], "\t\n.tables\n.quit\n");
+    assert_ok(&o);
+    let all = format!("{}{}", out_str(&o), err_str(&o));
+    assert!(!all.contains('\x1b') && !all.contains("Esc cancel"), "{all:?}");
+    assert!(all.contains("users"), ".tables still works: {all}");
+}
+
 /// Multi-process bank invariant: concurrent transfer writers + full-scan
 /// readers asserting sum conservation on every snapshot.
 #[test]
