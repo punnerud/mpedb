@@ -340,129 +340,168 @@ pre-reserves any size up to 16 TiB, so this is no longer a blocker.)
   **stock 11/11; shim 11/11** — the 3 former gaps were all DDL-in-(implicit)-
   transaction, now resolved (DDL applies to the open `WriteSession`'s txn).
 
-## Django's own test suite (2026-07-19)
+## Django's own test suite — run 2 (2026-07-19)
 
-The DB-API battery says the shim is a drop-in for *Python's* `sqlite3`. This
-section answers a harder question: what happens when a **real ORM's own test
-suite** — Django's, ~19 000 tests over 219 labels — runs on top of it.
+Run 2 re-measures both arms after the CREATE-TABLE-surface commits
+`7066a35 d45ad77 35358c6 05bf406 2097f18 fae9e73`, with four of the six
+workbench adaptations DELETED — a number measured through a workaround is not
+the number.
 
-**What was run.** Django `5.2.17.alpha.0` (`stable/5.2.x`, commit `3e389b7`),
-CPython 3.12, driven by `crates/mpedb-capi/workbench/djsuite/run_suite.sh`.
-Both arms use the **same** settings module, whose backend
-(`djsuite/mpedb_backend/base.py`) applies the adaptations listed under
-"Deployment-blocking gaps" below — so anything an adaptation breaks breaks in
-BOTH arms and is never counted against mpedb. The diff tool is
-`djsuite/diff_arms.py`.
+### ⚠️ Two WRONG ANSWERS (mpedb answers differently, without erroring)
 
-Labels, split into two groups because mpedb caps a schema at 120 user tables
-(gap **D6**) and one database holds every label's models:
+Both are silent: no error, a different result set. They outrank every gap below.
+
+**W1 — a NUMERIC-affinity column stores the text and compares/orders/aggregates
+as text.** `d45ad77` made `decimal(10,2)`/`numeric`/`datetime` legal declared
+types mapping to `ColumnType::Any`, but `Any` implements neither half of
+sqlite's affinity: no storage-class conversion on write, no numeric comparison
+affinity. So a refusal became a wrong answer.
+
+```python
+c.execute("CREATE TABLE t (id integer NOT NULL PRIMARY KEY, price decimal(10, 2) NOT NULL)")
+c.execute("INSERT INTO t (id, price) VALUES (1, ?)", ("1000",))   # Django binds Decimal as str
+c.execute("INSERT INTO t (id, price) VALUES (2, ?)", ("35",))
+c.execute("SELECT id, price, typeof(price) FROM t ORDER BY id")   # stock (1,1000,'integer'),(2,35,'integer')
+                                                                  # mpedb (1,'1000','text'),(2,'35','text')
+c.execute("SELECT id FROM t WHERE price < ? ORDER BY id", ("40.0",))  # stock [(2,)]      mpedb [(1,),(2,)]   WRONG
+c.execute("SELECT id FROM t ORDER BY price")                          # stock [(2,),(1,)] mpedb [(1,),(2,)]   WRONG
+c.execute("SELECT MAX(price) FROM t")                                 # stock [(1000,)]   mpedb [('35',)]     WRONG
+```
+
+This is the one that fails `aggregation.tests.AggregateTestCase.test_filtering`:
+`Publisher.objects.filter(book__price__lt=Decimal("40.0"))` returns the three
+1000-priced books too, because `'1000' < '40.0'` lexicographically. The loud
+faces of the same root (`sum() expects a number, got text`, `cannot compare text
+with int64`) are gap 1 below.
+
+**W2 — an aggregate `FILTER (WHERE …)` whose predicate contains a CORRELATED
+subquery matches no row at all.**
+
+```python
+# b=(1,4.5),(2,3.0)   ba=(1, book_id=1)
+"SELECT COUNT(*) FILTER (WHERE EXISTS(SELECT 1 FROM ba U0 WHERE U0.book_id = b.id)) FROM b"
+#   stock 1   mpedb 0            WRONG
+"SELECT COUNT(*) FILTER (WHERE NOT EXISTS(SELECT 1 FROM ba U0 WHERE U0.book_id = b.id)) FROM b"
+#   stock 1   mpedb 0            WRONG — and not the negation of the above, so the
+#                                predicate is not "always false", the row is dropped
+"SELECT b.id, MAX(b.rating) FILTER (WHERE EXISTS(SELECT 1 FROM ba U0 WHERE U0.book_id = b.id)) FROM b GROUP BY b.id"
+#   stock (1,4.5),(2,None)   mpedb (1,None),(2,None)     WRONG
+```
+
+Adjacent shapes are all CORRECT, which localizes it: an UNcorrelated `EXISTS` in
+`FILTER` (stock 2 / mpedb 2), a correlated `IN` subquery in `FILTER` (1 / 1), the
+same correlated `EXISTS` in the SELECT list (`(1,1),(2,0)` / same), and the same
+correlated `EXISTS` in `WHERE` (4.5 / 4.5). Only `FILTER` + correlated subquery
+is wrong. Fails `aggregation.test_filter_argument.FilteredAggregateTests.
+test_filtered_aggregate_on_exists` (`{'max_rating': None}` vs `{'max_rating': 4.5}`).
+
+### What was run
+
+Django `5.2.17.dev20260714173342` (`stable/5.2.x`, commit `3e389b7`), CPython
+3.12.3, `--parallel=1`, driven by `crates/mpedb-capi/workbench/djsuite/
+run_suite.sh`. Same labels, same two groups as run 1.
 
 | Group | Labels | Tests |
 |---|---|---|
 | G1 | `basic lookup transactions ordering update delete` | 392 |
 | G2 | `aggregation annotations expressions` | 439 |
 
-### The two arms, side by side
+A harness bug found and fixed on the way: `run_suite.sh` held its label groups in
+`GROUPS`, which bash owns (the caller's group ids). The assignment is silently
+ignored, so the script actually ran the labels `1000` and `27` — `Ran 1 test`
+per group. Renamed to `LABEL_GROUPS`.
+
+### The two arms, run 1 → run 2
 
 | | stock libsqlite3 3.45.1 | mpedb shim |
 |---|---|---|
-| G1 | **392 ran, 0 failed** (17 skipped) | 392 ran, **116 failed** (3 F / 113 E) |
-| G2 | 439 ran, **5 failed** (5 E, 5 skipped, 1 xfail) | 439 ran, **209 failed** (2 F / 207 E) |
-| **total** | **826 / 831 pass (99.4 %)** | **506 / 831 pass (60.9 %)** |
-| shim-only failures | — | **304** (4 failures are shared with the baseline) |
+| G1 | 392 ran, 0 failed → **392 ran, 0 failed** | 392 ran, 116 failed → **392 ran, 113 failed** (2 F / 111 E) |
+| G2 | 439 ran, 5 failed → **439 ran, 0 failed** | 439 ran, 209 failed → **439 ran, 209 failed** (2 F / 207 E) |
+| **total** | 826/831 (99.4 %) → **831/831 (100 %)** | 506/831 (60.9 %) → **509/831 (61.3 %)** |
+| delta | **+5** | **+3** |
 
-### Coverage — what was NOT run
+The honest reading of those two deltas:
 
-Honest scope: **9 of Django's 219 labels**, ~831 of ~19 000 tests. Not run, and
-why:
+* The stock arm's +5 is not sqlite improving — those five G2 errors were caused
+  by the workbench's own `data_types` adaptation, which is now gone. Run 1's
+  "baseline" was 5 tests worse than a real sqlite baseline.
+* The shim's +3 is small **because the four gaps that closed were all
+  deployment blockers that run 1 had already worked around**. What changed is
+  that run 2 needs no workaround for them: the same 831 tests, the same migrate,
+  with Django's own `quote_name`, its own `data_types`, its own `DEFAULT`/
+  `CHECK`/`REFERENCES`/`CONSTRAINT` DDL. That is the movement; the pass count
+  was never going to show it.
+* Flattering the shim by 2: G2 skips 7 under the shim vs 5 under stock.
+  `supports_json_field` probes with `SELECT JSON('{"a": "b"}')`, which mpedb has
+  no `json()` for, so `test_update_jsonfield_case_when_key_is_null` and
+  `test_values_expression_alias_sql_injection_json_field` are skipped rather
+  than failed. Adjusted, the shim is 507/831.
 
-- **`queries` (493 tests) — cannot run at all.** Its models alone push the schema
-  past mpedb's 120-table ceiling (gap **D6**). This is the largest single
-  ORM-behavior label in Django.
-- **`backends` — cannot run at all.** It defines a model whose auto-generated m2m
-  table name is 134 chars; mpedb caps an identifier at 128 (gap **D7**).
-- Everything else (`admin_*`, `migrations`, `model_fields`, `schema`,
-  `select_related`, `prefetch_related`, `postgres_tests`, …) was simply not
-  attempted — no time budget, and each added label risks re-crossing D6.
-- `--parallel=1` throughout; no concurrency/multi-process behavior was measured.
+### Deployment-blocking gaps: what closed
 
-### Deployment-blocking gaps (hit before a single test ran)
+| # | Gap | Status |
+|---|---|---|
+| **D1** | quoted identifier as the qualifier of a dotted reference (`"t"."id"`) | **CLOSED** (`7066a35`). The `quote_name()` quote-stripper is deleted; Django now quotes every name as it likes and 831 tests still run. |
+| **D2** | `AUTOINCREMENT` refused by name | **OPEN by design** — but it now **costs nothing measurable**. With the adaptation disabled (`WB_KEEP_AUTOINCREMENT=1`) G1 is bit-identical: 392 ran, 2 F / 111 E, migrate included. Django 5.2 in this configuration does not put the keyword in front of mpedb. NOT root-caused (see the caveat in the run report); the direct `CREATE TABLE t (id integer PRIMARY KEY AUTOINCREMENT)` probe through the shim is still owed. |
+| **D3** | sqlite's declared-type vocabulary | **CLOSED** (`d45ad77`). The hand-written `data_types` table is deleted; Django's own `varchar(100)`/`bigint`/`datetime`/`decimal(10,2)` go straight in. **But see W1** — for the NUMERIC-affinity family this converted a loud refusal into a silent wrong answer. |
+| **D4** | `DEFAULT` / `CHECK` / `REFERENCES` in CREATE TABLE | **CLOSED for DEFAULT and CHECK** (`05bf406`, `fae9e73` — parsed AND enforced). The `DEFAULT`-stripping `_iter_column_sql` and `data_type_check_constraints = {}` are deleted, and `supports_*_check_constraints` are back on. `REFERENCES` is **parsed and dropped**: the inline FK clause is now emitted on every ForeignKey (`sql_create_inline_fk` untouched), but nothing enforces it, so `supports_foreign_keys = False` stays as **D4b**. |
+| **D5** | table/column constraint may not be NAMED | **CLOSED** (`2097f18`). The `sql_constraint = "%(constraint)s"` override is deleted. |
+| **D6** | 120-table ceiling | **OPEN, re-verified.** `queries` still dies at `schema error: too many tables (121 > 120)`. |
+| **D7** | 128-byte identifier limit | **OPEN** (`schema.rs:250`, `s.len() <= 128`). Note `backends` now stops on **D6** first — same `too many tables (121 > 120)` — so D7 is confirmed present in the code but is no longer the label's proximate blocker. |
+| **D8** | `sqlite_master` breadth (recursive-CTE FK graph) | **OPEN.** The `_references_graph` adaptation is kept. |
 
-These are the walls `migrate` hits. Each is worked around in the workbench
-backend **for both arms** so the survey could continue; none of them is
-"supported".
+### Re-ranked MPEdb-only gaps
 
-| # | Gap | Where | Minimal repro |
+305 shim-only failing tests classified by terminal exception (322 failures total;
+the difference is subTest repeats collapsing onto one test id). Run-1 rank in
+brackets — the order barely moved, because nothing in this window touched the
+query path.
+
+| Rank | Tests | Gap | Where |
 |---|---|---|---|
-| **D1** | **A quoted identifier cannot QUALIFY a dotted reference.** `t.id` parses; `"t"."id"` does not. Django quotes every name, so **100 % of ORM queries fail**. Highest-leverage single fix in this document. | `mpedb-sql` parser | `SELECT "t"."id" FROM "t"` → `SQL parse error at byte 10: unexpected trailing input Dot` |
-| **D2** | **`AUTOINCREMENT` refused.** Django appends it to every `AutoField` pk, i.e. to essentially every model. | `mpedb-sql` | `CREATE TABLE t (id integer PRIMARY KEY AUTOINCREMENT)` |
-| **D3** | **sqlite's CREATE TABLE type vocabulary is rejected.** mpedb takes `int64/int/integer,text,real,bool,blob,timestamp,any` and nothing else — no affinity, no parameterized names. Django's `data_types` is written entirely in the other vocabulary. | `mpedb-sql` | `CREATE TABLE t (x varchar(100))`, `… numeric(10,2)`, `… bigint`, `… datetime`, `… integer unsigned` — all `expected )` |
-| **D4** | **`REFERENCES` / `CHECK` / `DEFAULT` in CREATE TABLE refused.** Every `ForeignKey`, every `Positive*Field` (`CHECK (x >= 0)`), every `db_default`. | `mpedb-sql` | `CREATE TABLE t (id integer PRIMARY KEY, fk integer REFERENCES u (id))` |
-| **D5** | **A table constraint may not be NAMED** — bare `UNIQUE (a,b)` works, `CONSTRAINT n UNIQUE (a,b)` does not. Django emits the named form for every `Meta.constraints` entry. | `mpedb-sql` | `CREATE TABLE t (a integer, CONSTRAINT u UNIQUE (a))` |
-| **D6** | **120-table ceiling** (`MAX_TABLES = 128`, u128 footprint bitmaps, minus 8 system slots) — and it counts **lifetime creates**, dead slots included. Django's `queries` label alone exceeds it; so does any mid-sized real project after a few migrations. | `mpedb-types` | 121st `CREATE TABLE` → `schema error: too many tables (121 > 120)` |
-| **D7** | **128-byte identifier limit** (`valid_identifier`); sqlite has none. Django generates long m2m table names mechanically. | `mpedb-types` | a 134-char table name → `schema error: invalid table name` |
-| **D8** | **`sqlite_master` breadth.** `sql_flush(allow_cascade=True)` walks the FK graph with a RECURSIVE CTE joining `sqlite_master` to itself through `sql REGEXP …`; the shim's mini-evaluator refuses. Left unfixed it cascades: every `TransactionTestCase` teardown leaves rows behind, and ~35 unrelated assertions fail. | `mpedb-capi/introspect.rs` | Django `django/db/backends/sqlite3/operations.py::__references_graph` |
+| 1 [1] | **68** | **No sqlite affinity; `any` neither coerces nor computes.** 49 × `TypeError: argument must be int or float` (Django's DecimalField converter gets a `str`), 10 × `arithmetic requires int64/float64, got any`, 3 × `cannot assign any to column of type text`, 2 × `cannot mix coalesce() argument types: any and float64`, 1 each `avg() expects a number, got text` / `floor() expects a number, got any` / `cannot compare int64 with text` / `cannot compare with IN list: text and int64`. **Plus wrong answer W1.** | `mpedb-sql`/`mpedb` |
+| 2 [2] | **47** | **Host UDFs (scalar and aggregate) are read-path only** — inside an open transaction: `internal error (bug in mpedb): host function X called with no host functions in scope` (43) and `host aggregate var_pop() is not in scope` (4). Statement hits: `django_format_dtdelta` 34, `django_timestamp_diff` 12, `django_datetime_extract` 10, `django_date_extract` 10, `django_time_extract` 6, `django_datetime_cast_date` 6, `rand` 4, `django_time_diff` 4, `django_date_trunc` 4, `django_datetime_trunc` 2. | `mpedb` `ring_exec` / write `TxnCtx` |
+| 3 [4] | **45** | **Subquery / derived-table restrictions**: JOIN inside a derived table 14, correlated subquery outside `WHERE` in an aggregate query 8, unlifted `IN` subquery 5, aliased/renamed column 4, GROUP BY/HAVING body 4, correlated `IN` ("rewrite as EXISTS") 4, subquery in `HAVING` 2, unsupported position 2, compound (`UNION`) body 1, `ORDER BY` body 1. | `mpedb-sql` planner |
+| 4 [3] | **44** | **Missing sqlite scalar functions**: `quote()` 40 statements (Django's `last_executed_query`), `strftime()` 8, `json()` (the feature probe → the 2 skips above). | `mpedb-sql` builtins |
+| 5 [5] | **39** | **No int↔bool bridge**: `predicate must be a boolean expression, got int64` 29, `NOT requires a boolean, got int64` 3, `parameter $N is int64, statement requires bool` 3, `cannot compare int64 and bool` 1, `cannot assign bool to column of type int64` 1, `predicate evaluated to int64, expected bool` 1, `CASE WHEN must be a bool condition, got int64` 1. | `mpedb-sql` binder |
+| 6 [6] | **20** | **`LIKE … ESCAPE` (44 statements) and `ORDER BY … NULLS FIRST/LAST` (6)** are not parsed. | `mpedb-sql` parser |
+| 7 [7] | **10** | **Rigid numeric parameter typing**: `$N is int64, statement requires float64` 6, `$N is float64, requires int64` 2, `cannot assign float64 to column of type int64` 2. | `mpedb-sql` |
+| 8 [8] | **8** | **Bitwise operators absent** (`\|`, `&`, `<<`, `>>`, `^`) — including 3 tests that surface as `cannot assign any to column of type int64` on Django's XOR emulation. | `mpedb-sql` tokenizer |
+| 9 [9] | **5** | **`REGEXP` requires a literal pattern**; Django always binds it. | `mpedb-sql` |
+| 10 | **3** | **`FILTER (WHERE …)` parse**: `expected ) closing FILTER (WHERE …)`. | `mpedb-sql` parser |
+| 11 | **3** | `expected ) after IN subquery` 2, `after EXISTS subquery` 1. | `mpedb-sql` parser |
+| 12 [10] | **2** | **2-argument `MAX(a,b)` / `MIN(a,b)`** (sqlite's scalar form). | `mpedb-sql` |
+| 13 | **2** | `INSERT values must be literals or parameters`. | `mpedb-sql` |
+| 14 [11] | **1** | **PANIC in the binder** (`binder.rs:235`, `Scope::only()` on a 2-table scope), surfaced as `internal error (panic) in engine`. | `mpedb-sql` |
 
-### Ranked MPEdb-only gaps (of the 304 shim-only failing tests)
+One-offs: `unknown column` 1, `expected parameter number after $` (an identifier
+containing `$`) 1, `expected X` 2.
 
-Ranked by tests unblocked. Every repro below was verified **differentially**: the
-same statement on stock sqlite in the same script.
+**Not counted against mpedb:** the two `delete` FAILs (`test_fast_delete_all`,
+`test_fast_delete_instance_set_pk_none`) are contamination, not behaviour —
+`delete.tests.DeletionTests.test_only_referenced_fields_selected` errors out
+between `signal.connect(receiver, sender=Referrer)` and its `disconnect`, so the
+leaked receiver makes `Collector.can_fast_delete()` return False for every later
+test in the class. Fix any earlier gap and they go away.
 
-| Rank | Tests | Gap | Where | Minimal repro (stock → mpedb) |
-|---|---|---|---|---|
-| 1 | **~66** | **No sqlite type affinity, and `any` does no coercion or arithmetic.** A column sqlite gives NUMERIC affinity converts `'1.50'` to a number on write; mpedb's `any` stores the text. Django's `DecimalField` converter then gets a `str` and raises `TypeError: argument must be int or float`. Related: `arithmetic requires int64/float64, got any`, `cannot assign any to column of type int64`, `cannot mix coalesce() argument types: any and float64`, `avg() expects a number, got text`. | `mpedb-sql`/`mpedb` | `d decimal` / `d any`; `INSERT … VALUES ('1.50')`; `SELECT d, typeof(d)` → stock `1.5, 'real'` · mpedb `'1.50', 'text'` |
-| 2 | **47** | **Host UDFs (scalar AND aggregate) are read-path only.** Inside an open transaction a registered UDF fails — and fails as `internal error (bug in mpedb)`, not a clean refusal. CPython opens an implicit transaction after the first DML, so nearly every Django query that uses `django_date_extract`/`django_format_dtdelta`/`RAND`/`VAR_POP` inside a test's write transaction dies. Top offenders: `django_format_dtdelta` (52 hits), `django_timestamp_diff` (18), `django_datetime_extract` (15), `django_date_extract` (15). | `mpedb` `ring_exec`/write `TxnCtx` | `c.execute("INSERT …"); c.execute("select sqlite_compileoption_used('X')")` → `host function … called with no host functions in scope`; passes after `commit()` |
-| 3 | **43** | **Missing sqlite scalar functions**: `quote()` (40 hits — Django's `last_executed_query`, so every `assertNumQueries`-style test), `strftime()` (12), `json()` (1). | `mpedb-sql` builtins | `SELECT QUOTE(?)`, `SELECT STRFTIME('%Y','2020-01-01')` → `unknown function` |
-| 4 | **~45** | **Subquery/derived-table restrictions.** In descending order: a subquery whose body has a JOIN (14), a correlated subquery outside `WHERE` in an aggregate query (8), an `IN` subquery in an unlifted position (5), a subquery projecting an aliased column (4), a subquery with GROUP BY/HAVING (4), a correlated `IN` (4, "rewrite as EXISTS"), a subquery in `HAVING` (2), a compound (`UNION`) derived table (1), a subquery with `ORDER BY` (1). | `mpedb-sql` planner | Django's `Subquery`/`Exists`/`OuterRef` annotations |
-| 5 | **~37** | **No int↔bool bridge.** sqlite has no boolean type: Django writes `WHERE tbl.flag` for a `BooleanField` and binds `True` as the integer 1. mpedb is rigid in BOTH directions, so **no mapping works**: as `integer`, `WHERE flag` → `predicate must be a boolean expression, got int64`; as `bool`, the INSERT → `value of type int64 cannot be inserted into column of type bool`. Also `NOT requires a boolean, got int64`, `cannot compare int64 and bool`, `parameter $1 is int64, statement requires bool`. | `mpedb-sql` binder | `SELECT i FROM t WHERE b` (b `integer`) → stock OK · mpedb `predicate must be a boolean expression, got int64`; `INSERT INTO bt (b) VALUES (1)` (b `bool`) → mpedb refuses |
-| 6 | **20** | **`LIKE … ESCAPE` (66 hits) and `ORDER BY … NULLS FIRST/LAST` (9)** are not parsed. Django emits `ESCAPE '\'` on *every* `startswith`/`contains`/`endswith`/`icontains` lookup, which is why 66 statements hit it. | `mpedb-sql` parser | `SELECT i FROM t WHERE s LIKE 'a%' ESCAPE '\'` → `unexpected trailing input Ident("ESCAPE")`; `ORDER BY s ASC NULLS LAST` → `Ident("NULLS")` |
-| 7 | **~10** | **Rigid parameter typing** — a bound integer will not satisfy a `float64` position (and vice versa), where sqlite coerces. | `mpedb-sql` | `r` is `real`; `SELECT i FROM t WHERE r > ?` bound with `1` → `type mismatch: parameter $1 is int64, statement requires float64` |
-| 8 | **~6** | **Bitwise operators absent**: `\|`, `&`, `<<`, `>>`, `^`. | `mpedb-sql` tokenizer | `SELECT i \| 1 FROM t` → ``` `\|` is not an operator — SQL concatenation is `\|\|` ```; `i & 1` → `unexpected character &`; `i << 1` → `expected an expression` |
-| 9 | **5** | **`REGEXP` requires a literal pattern** — Django always binds it. | `mpedb-sql` | `WHERE s REGEXP ?` → `REGEXP pattern must be a literal in Phase 2` |
-| 10 | **2** | **2-argument `MAX(a,b)` / `MIN(a,b)`** (sqlite's scalar form) rejected as the aggregate. | `mpedb-sql` | `SELECT MAX(i, 2) FROM t` → `max() takes exactly one argument` |
-| 11 | **1** | **PANIC in the binder** — an assertion failure, not a refusal. A scalar function applied to a joined table's column: `binder.rs:235` `assertion left == right failed: Scope::only() on a 2-table scope: this path has not been taught about joins`. The shim's `catch_unwind` converts it to `internal error (panic) in engine`, so no process dies, but it is a bug regardless of Django. | `mpedb-sql` `binder.rs:235` | `SELECT a.id FROM a INNER JOIN b ON (a.id = b.a_id) WHERE ABS(b.id) = 1` |
+### Coverage — re-checked, unchanged
 
-Smaller one-offs not tabulated: `INSERT values must be literals or parameters`
-(2), `expected ) closing FILTER (WHERE …)` (3), `expected ) after IN/EXISTS
-subquery` (4), `expected parameter number after $` (an identifier containing `$`,
-1), `unknown column` (1).
+* **`queries` (493 tests) — still cannot run.** `django.db.utils.OperationalError:
+  schema error: too many tables (121 > 120)` during migrate (D6).
+* **`backends` — still cannot run**, now for D6 rather than D7: same
+  `too many tables (121 > 120)`. The 128-byte identifier limit is still there
+  (`crates/mpedb-types/src/schema.rs:250`), it just is not what stops the label
+  first any more.
+* Still 9 of Django's 219 labels, 831 of ~19 000 tests, `--parallel=1`, no
+  concurrency or multi-process behaviour measured.
 
-### What was FIXED in the shim this session
+### Workbench adaptations after run 2
 
-Both are in `crates/mpedb-capi`, both have Rust FFI tests in `tests/capi.rs`, and
-neither invents an answer:
+Removed (gap closed): `quote_name()` quote-stripping, the `data_types` table, the
+`DEFAULT`-clause stripper, `data_type_check_constraints = {}`, the two
+`supports_*_check_constraints = False`, `sql_create_inline_fk`/
+`sql_create_column_inline_fk = None`, `sql_constraint`.
 
-1. **`sqlite_compileoption_used(name)` / `sqlite_compileoption_get(n)`** —
-   registered as connection built-ins at open (`register_shim_builtins`). mpedb
-   defines an EMPTY set of sqlite compile options, so `0` / `NULL` is the literal
-   truth for every input, and NULL-in-NULL-out matches sqlite 3.45. This was
-   Django's **third** gate: `register_functions()` will not return a connection
-   until the query answers, and the `0` is also the useful answer — it makes
-   Django register its own `ACOS`/`CEILING`/`POWER`/… fallbacks under its own
-   spellings. Test: `compileoption_builtins_report_an_empty_option_set`.
-2. **`sqlite_master` WHERE: clause-leading `NOT`** — Django's `get_table_list`
-   writes `WHERE type in ('table','view') AND NOT name='sqlite_sequence'`, which
-   the mini-evaluator refused; this was Django's **fourth** gate. While there, the
-   evaluator now **refuses any clause containing a top-level `OR`** instead of
-   silently dropping its operands — that was a latent *wrong-answer* path
-   (`name='x' OR name='y'` used to be evaluated as `name='x'`).
-
-Deliberately **not** fixed: `quote()` and `strftime()` as shim host UDFs. They
-would be registered on the host-UDF path, which gap #2 makes unusable inside a
-transaction — exactly where Django calls `QUOTE(?)` — so the fix would not
-actually unblock the tests, and `quote()` on a REAL cannot be made byte-identical
-to sqlite's `%!.15g` without more care than a workbench fix deserves.
-
-### Reproducing
-
-```bash
-git clone --depth 1 -b stable/5.2.x https://github.com/django/django /mnt/xfs/django-workbench/django
-python3 -m venv /mnt/xfs/django-workbench/venv
-/mnt/xfs/django-workbench/venv/bin/pip install asgiref sqlparse tzdata
-crates/mpedb-capi/workbench/djsuite/run_suite.sh
-python3 crates/mpedb-capi/workbench/djsuite/diff_arms.py \
-    /tmp/wb-django-suite/{stock_g1,stock_g2,shim_g1,shim_g2}.txt
-```
-
-`WB_TRACE_SQL_ERRORS=1` makes the backend print the exact SQL and parameters of
-every statement the driver rejects — that is how each repro above was reduced.
+Kept: `data_types_suffix = {}` (D2 — now demonstrably free, see above),
+`supports_foreign_keys = False` (D4b — REFERENCES parsed, not enforced),
+`_references_graph` (D8).
