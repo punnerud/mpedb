@@ -326,6 +326,9 @@ fn quote_of_a_bound_parameter_matches_sqlite() {
         ExecResult::Rows { rows, .. } => render(&rows[0][0]),
         other => panic!("{other:?}"),
     };
+    // Django writes it UPPERCASE (`SELECT QUOTE(?), QUOTE(?)`), so the name
+    // must fold — asserted here rather than assumed.
+    assert_eq!(one("SELECT QUOTE($1)", &[Value::Text("x".into())]), "'x'");
     assert_eq!(one("SELECT quote($1)", &[Value::Null]), "NULL");
     assert_eq!(one("SELECT quote($1)", &[Value::Int(-7)]), "-7");
     assert_eq!(

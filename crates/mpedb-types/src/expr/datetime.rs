@@ -278,6 +278,14 @@ fn parse_hh_mm_ss(b: &[u8], p: &mut Dt) -> bool {
         Some(tz) => tz,
         None => return false,
     };
+    // A fractional part long enough to overflow the accumulator (roughly 309+
+    // digits) makes `ms` and `scale` both infinite, so `ms/scale` is NaN. In C
+    // the cast of that NaN to an integer is undefined and sqlite ends up with a
+    // Julian day outside its valid range — a NULL. Here it would quietly cast
+    // to 0 and produce an ANSWER, so it is rejected at the parse instead.
+    if !ms.is_finite() {
+        return false;
+    }
     p.valid_jd = false;
     p.valid_hms = true;
     p.h = h;
