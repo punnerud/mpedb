@@ -52,7 +52,11 @@ use super::select::{describe_key, distinct_order_by, ordinal};
 ///     left side as a join SUBTREE on X's preserved side, which a left-deep
 ///     chain has no shape for;
 ///   - a SECOND RIGHT (it would be non-first after the swap); and
-///   - any FULL inside a chain (both sides whole — `plan_join_select` refuses).
+///   - a trailing FULL after this leading RIGHT: composing the RIGHT→LEFT swap
+///     with FULL's both-sides-whole handling is refused out of caution, even
+///     though the gather computes it correctly. A FULL in a PLAIN chain (no
+///     leading RIGHT) IS supported — `plan_join_select` allows it at any
+///     position and forces the held FullScan inner it needs.
 pub(super) fn rewrite_right_join<'s>(
     s: &ast::SelectStmt,
     schema: &'s Schema,
@@ -87,10 +91,18 @@ pub(super) fn rewrite_right_join<'s>(
                      swap the tables and write LEFT JOIN",
                 ))
             }
+            // A trailing FULL after a leading RIGHT composes the RIGHT→LEFT
+            // side-swap with FULL's both-sides-whole handling. The gather
+            // computes it correctly (differentially verified), but the swap is
+            // an extra transform on the preserved side, so this stays REFUSED
+            // out of caution — a plain-chain FULL (no leading RIGHT) is the
+            // supported form. Rewrite the RIGHT as a LEFT to lift the FULL into
+            // a plain chain.
             ast::JoinKind::Full => {
                 return Err(bind_err(
-                    "FULL JOIN in a multi-join chain is not supported — it needs \
-                     both sides whole, which a left-deep chain cannot give it",
+                    "FULL JOIN following a leading RIGHT JOIN is not supported — \
+                     swap the RIGHT's tables and write LEFT JOIN so the FULL sits \
+                     in a plain left-deep chain",
                 ))
             }
         }
@@ -278,15 +290,19 @@ pub(super) fn plan_join_select<'s>(
                      tables and write LEFT JOIN",
                 ))
             }
-            ast::JoinKind::Full => {
-                if s.joins.len() > 1 {
-                    return Err(bind_err(
-                        "FULL JOIN in a multi-join chain is not supported — it needs \
-                         both sides whole, which a left-deep chain cannot give it",
-                    ));
-                }
-                JoinKind::Full
-            }
+            // FULL is allowed at ANY position in the (non-leading-RIGHT) chain.
+            // The gather is a strictly left-deep nested loop, so `A J1 B FULL C`
+            // is `(A J1 B) FULL JOIN C` — FULL's NULL-extend-both-sides sweep
+            // runs over the accumulated left relation at whatever width it has
+            // reached, which composes correctly wherever FULL sits (first,
+            // middle, last, several FULLs; differentially verified against
+            // sqlite in `full_join_chains`). The inner side is forced to a held
+            // FullScan below (line ~394) — the unmatched-inner sweep needs it
+            // enumerated — and any FULL disables WHERE pushdown (below), so no
+            // conjunct filters a row that has not been NULL-extended yet. A
+            // leading RIGHT + FULL is the one refused case (`rewrite_right_join`
+            // rejects it), keeping the RIGHT→LEFT swap and FULL decoupled.
+            ast::JoinKind::Full => JoinKind::Full,
         };
         let acc_types_before = acc_types.clone();
         joined_columns.extend(jt.columns.iter().cloned());

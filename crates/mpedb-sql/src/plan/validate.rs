@@ -268,13 +268,14 @@ impl CompiledPlan {
                     // FULL needs the inner side enumerated and held: single
                     // join, FullScan access — the executor's unmatched-inner
                     // sweep is built on exactly that.
-                    if j.kind == JoinKind::Full {
-                        if joins.len() != 1 {
-                            return Err(corrupt("FULL join in a multi-join chain"));
-                        }
-                        if !matches!(j.access, AccessPath::FullScan) {
-                            return Err(corrupt("FULL join with a keyed inner access"));
-                        }
+                    // FULL is allowed at any chain position (the left-deep
+                    // gather composes it correctly wherever it sits), but its
+                    // inner side must be a held FullScan: the executor's
+                    // unmatched-inner sweep needs every inner row enumerated, so
+                    // a keyed FULL inner is refused as forged (the planner never
+                    // emits one — it forces FullScan for FULL).
+                    if j.kind == JoinKind::Full && !matches!(j.access, AccessPath::FullScan) {
+                        return Err(corrupt("FULL join with a keyed inner access"));
                     }
                     self.check_access(&j.access, jt, Some(&acc_types), ptypes)?;
                     if let Some(p) = &j.policy {
