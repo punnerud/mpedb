@@ -36,11 +36,11 @@ usage: mpedb <command> [args]
          opens as a delta-WAL overlay by default (changes in <db>.overlay.mpedb,
          zero import); `mpedb checkpoint <db>` folds them back. `--mirror` uses
          the full sidecar import instead; `--direct` is read-only, zero-setup.
-         A MISSING path is CREATED, as sqlite3 creates one: `.mpedb` → a native
-         mpedb database, anything else → an empty sqlite database. Creation is
-         LAZY, like sqlite3's: the file appears on the FIRST STATEMENT, so
-         opening a repl and leaving it again creates nothing. CREATE TABLE on a
-         sqlite base is applied to the base itself.
+         A MISSING path is CREATED by the FIRST WRITE: `.mpedb` → a native mpedb
+         database, anything else → an empty sqlite database. Nothing else
+         creates it — opening a repl, or only READING (`SELECT 1` is answered
+         without touching the directory), leaves no file behind. CREATE TABLE on
+         a sqlite base is applied to the base itself.
 
 
   exec    <target> <SQL> [param ...]       run one statement

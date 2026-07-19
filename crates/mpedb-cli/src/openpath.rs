@@ -83,15 +83,23 @@ fn seed_toml(path: &Path, size_mb: u64) -> String {
 
 /// Create a new NATIVE mpedb database at `path` (the `.mpedb` case).
 fn create_native(path: &Path) -> CliResult {
-    let cfg = mpedb::Config::from_toml_str(&seed_toml(path, NEW_DB_SIZE_MB))
+    make_native(path, NEW_DB_SIZE_MB, true)
+}
+
+/// Seed a native database. `announce` is off for the scratch database, which is
+/// an implementation detail of answering a read and must not narrate itself.
+fn make_native(path: &Path, size_mb: u64, announce: bool) -> CliResult {
+    let cfg = mpedb::Config::from_toml_str(&seed_toml(path, size_mb))
         .map_err(|e| Failure::Runtime(format!("cannot create {}: {e}", path.display())))?;
     let db = mpedb::Database::open_with_config(cfg)
         .map_err(|e| Failure::Runtime(format!("cannot create {}: {e}", path.display())))?;
     drop(db);
-    eprintln!(
-        "created {} ({NEW_DB_SIZE_MB} MB mpedb database) — use CREATE TABLE to define it",
-        path.display()
-    );
+    if announce {
+        eprintln!(
+            "created {} ({size_mb} MB mpedb database) — use CREATE TABLE to define it",
+            path.display()
+        );
+    }
     Ok(())
 }
 
@@ -155,6 +163,83 @@ impl PendingCreate {
             create_sqlite_base(&self.path)
         }
     }
+}
+
+/// Can this statement change anything? A WHITELIST on purpose, and the
+/// asymmetry is the whole argument: a write misjudged as a read would run
+/// against the scratch database and be silently LOST, while a read misjudged as
+/// a write only creates a file that sqlite3 would have created anyway. So
+/// anything not obviously read-only — `WITH …` included, since `WITH x AS (…)
+/// INSERT …` is legal — counts as a write.
+pub fn is_read_only(sql: &str) -> bool {
+    let word = sql
+        .trim_start()
+        .split(|c: char| c.is_whitespace() || c == '(')
+        .next()
+        .unwrap_or("");
+    ["SELECT", "VALUES", "EXPLAIN"]
+        .iter()
+        .any(|k| word.eq_ignore_ascii_case(k))
+}
+
+/// Geometry for the scratch database — nothing is ever stored in it.
+const SCRATCH_SIZE_MB: u64 = 8;
+
+/// An ephemeral empty database, used to answer READS against one that has
+/// nothing in it yet.
+///
+/// `mpedb data.db` followed by `SELECT 1` must leave the directory as it was:
+/// there is nothing to store, so there is nothing to create. But the answer
+/// still has to be the real one, and computing it needs an engine. A database
+/// that does not exist yet is EMPTY, and so is this one — so for every read the
+/// two are indistinguishable: `SELECT 1` returns 1, `SELECT * FROM t` reports no
+/// such table `t`. The scratch file lives in the temp directory and is removed
+/// when the session ends.
+///
+/// This is a deliberate divergence from sqlite3, which materializes the file on
+/// ANY statement including a plain `SELECT`. Only writes create here — see
+/// [`is_read_only`].
+pub struct Scratch {
+    db: mpedb::Database,
+    path: PathBuf,
+}
+
+impl Scratch {
+    fn open() -> Result<Self, Failure> {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static N: AtomicU32 = AtomicU32::new(0);
+        let path = std::env::temp_dir().join(format!(
+            "mpedb-scratch-{}-{}.mpedb",
+            std::process::id(),
+            N.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = std::fs::remove_file(&path);
+        make_native(&path, SCRATCH_SIZE_MB, false)?;
+        let db = mpedb::Database::open_from_file(&path)?;
+        Ok(Self { db, path })
+    }
+
+    /// Run a read and print it, exactly as the real session would.
+    pub fn run(&self, sql: &str, params: &[mpedb::Value]) -> Result<(), mpedb::Error> {
+        let res = self.db.query(sql, params)?;
+        print_result(&res);
+        Ok(())
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// The scratch database, opened on first use — a session that only ever runs
+/// writes never pays for one.
+pub fn scratch_ref(slot: &mut Option<Scratch>) -> Result<&Scratch, Failure> {
+    if slot.is_none() {
+        *slot = Some(Scratch::open()?);
+    }
+    Ok(slot.as_ref().expect("just opened"))
 }
 
 /// A missing path: decide what would be created, as `sqlite3 db.db` does — but
@@ -326,6 +411,14 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
         // `repl::run_path`); a one-shot IS a statement, so it creates now.
         [] => crate::repl::run_path(&target, pending),
         [sql, params @ ..] => {
+            // A read against a database that does not exist yet is answered
+            // from an empty scratch: nothing to store, nothing to create.
+            if pending.is_some() && is_read_only(sql) {
+                let vals: Vec<mpedb::Value> = params.iter().map(|p| parse_param(p)).collect();
+                let mut slot = None;
+                scratch_ref(&mut slot)?.run(sql, &vals)?;
+                return Ok(());
+            }
             if let Some(c) = pending {
                 c.materialize()?;
             }
@@ -355,6 +448,7 @@ fn run_overlay(
         reconcile,
         handle: None,
         pending,
+        scratch: None,
     };
     match rest {
         [sql, params @ ..] => {
@@ -383,8 +477,10 @@ struct OverlaySession {
     mode: mpedb::LockMode,
     reconcile: Option<mpedb::ReconcilePolicy>,
     handle: Option<mpedb::SqliteOverlay>,
-    /// `Some` until the first statement materializes the base.
+    /// `Some` until the first WRITE materializes the base.
     pending: Option<PendingCreate>,
+    /// Answers reads while the base is pending or still has no tables.
+    scratch: Option<Scratch>,
 }
 
 impl OverlaySession {
@@ -418,10 +514,16 @@ impl OverlaySession {
     /// Run one statement: DDL against the base, everything else against the
     /// merged overlay view.
     ///
-    /// This is where a missing base comes into existence — sqlite3 materializes
-    /// the file on the first STATEMENT, including one that then fails, so the
-    /// create happens BEFORE the statement is even classified.
+    /// This is where a missing base comes into existence — the first WRITE
+    /// materializes it, including one that then fails. A READ never does: there
+    /// is nothing to store, so there is nothing to create, and the answer comes
+    /// from an empty [`Scratch`] instead. That also covers a base that exists
+    /// but has no tables yet, where there is equally nothing to read.
     fn exec(&mut self, sql: &str, params: &[mpedb::Value]) -> CliResult {
+        if is_read_only(sql) && self.nothing_to_read()? {
+            scratch_ref(&mut self.scratch)?.run(sql, params)?;
+            return Ok(());
+        }
         if let Some(c) = self.pending.take() {
             c.materialize()?;
         }
@@ -431,6 +533,19 @@ impl OverlaySession {
         let res = self.handle()?.query(sql, params)?;
         print_result(&res);
         Ok(())
+    }
+
+    /// Is there provably nothing for a read to find — because the base does not
+    /// exist yet, or exists with no user tables? Only asked for a read, and only
+    /// while no overlay is open (one open overlay implies a schema).
+    fn nothing_to_read(&mut self) -> Result<bool, Failure> {
+        if self.pending.is_some() {
+            return Ok(true);
+        }
+        if self.handle.is_some() {
+            return Ok(false);
+        }
+        Ok(base_user_tables(&self.base)? == 0)
     }
 
     /// DDL is the BASE's business: the sqlite file owns the schema, and the
