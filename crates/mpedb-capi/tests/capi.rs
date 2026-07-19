@@ -1577,5 +1577,192 @@ fn a_failed_open_reports_why_rather_than_out_of_memory() {
         assert!(msg.contains("no such database file"), "errmsg was {msg:?}");
         assert_eq!(sqlite3_errcode(ptr::null_mut()), SQLITE_CANTOPEN);
         assert_eq!(sqlite3_extended_errcode(ptr::null_mut()), SQLITE_CANTOPEN);
+/// `typeof()` through the shim reports EXACTLY one of sqlite's five storage
+/// classes, for every value class and for every MPEdb-specific column type —
+/// and always the class `sqlite3_column_type()` reports for the same value.
+///
+/// The contract: `typeof()` is a *sqlite* function, and its documented range is
+/// `null|integer|real|text|blob`; consumers switch on exactly those five. mpedb
+/// used to answer `'boolean'`/`'timestamp'` for its own first-class types —
+/// honest natively, but through a libsqlite3 shim it is a DIFFERENT ANSWER
+/// rather than an error, and it contradicted `sqlite3_column_type`, which has
+/// always mapped `Bool`/`Timestamp` onto `SQLITE_INTEGER`.
+///
+/// Every expectation below was diffed against the stock `sqlite3` 3.45.1 binary.
+#[test]
+fn typeof_reports_only_sqlite_storage_classes_and_agrees_with_column_type() {
+    unsafe {
+        let db = open_memory();
+
+        // (typeof(expr), sqlite3_column_type(expr)) for a one-column query.
+        let probe = |sql: &str| -> (String, c_int) {
+            let s = cs(&format!("SELECT typeof({sql}), {sql}"));
+            let mut st: *mut Stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+                SQLITE_OK,
+                "prepare typeof({sql}): {}",
+                CStr::from_ptr(sqlite3_errmsg(db)).to_string_lossy()
+            );
+            assert_eq!(sqlite3_step(st), SQLITE_ROW, "step typeof({sql})");
+            let name = col_text(st, 0);
+            let ty = sqlite3_column_type(st, 1);
+            sqlite3_finalize(st);
+            (name, ty)
+        };
+
+        // --- every value class, as a literal. Stock sqlite 3.45.1:
+        //     null|integer|real|text|blob|integer|real
+        for (expr, want, want_ty) in [
+            ("NULL", "null", SQLITE_NULL),
+            ("1", "integer", SQLITE_INTEGER),
+            ("-9223372036854775807", "integer", SQLITE_INTEGER),
+            ("1.5", "real", SQLITE_FLOAT),
+            ("'x'", "text", SQLITE_TEXT),
+            ("''", "text", SQLITE_TEXT),
+            ("x'00ff'", "blob", SQLITE_BLOB),
+            ("2 + 3", "integer", SQLITE_INTEGER),
+            ("1.0 * 2", "real", SQLITE_FLOAT),
+        ] {
+            let (name, ty) = probe(expr);
+            assert_eq!(name, want, "typeof({expr})");
+            assert_eq!(ty, want_ty, "column_type({expr})");
+        }
+
+        // --- MPEdb-specific column types.
+        //
+        // `bool` is a real ColumnType::Bool (mpedb's own name wins over sqlite's
+        // affinity rule). `any` is mpedb's per-value column, which is what
+        // sqlite's NUMERIC affinity maps onto. `timestamp` is a real
+        // ColumnType::Timestamp — but NO value of it is reachable through this
+        // shim (there is no bind path that produces one, and `DEFAULT
+        // CURRENT_TIMESTAMP` is refused by name), so an int INSERT into one is a
+        // clean type-mismatch refusal, asserted below. Its `typeof` mapping is
+        // covered where it IS reachable: `mpedb-types` `expr::tests`.
+        assert_eq!(
+            exec(db, "CREATE TABLE t (id integer PRIMARY KEY, flag bool, v any)"),
+            SQLITE_OK
+        );
+        assert_eq!(
+            exec(
+                db,
+                "INSERT INTO t VALUES (1, 1, 'str'), (2, 0, 7), (3, NULL, 1.5), \
+                 (4, 1, x'0102'), (5, 0, NULL)"
+            ),
+            SQLITE_OK
+        );
+
+        // Stock sqlite over the same table (`bool`/`any` are NUMERIC/BLOB
+        // affinity there, and hold the same per-value classes):
+        //   flag: integer,integer,null,integer,integer
+        //   v:    text,integer,real,blob,null
+        let per_row = |col: &str| -> Vec<(String, c_int)> {
+            let s = cs(&format!("SELECT typeof({col}), {col} FROM t ORDER BY id"));
+            let mut st: *mut Stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+                SQLITE_OK
+            );
+            let mut out = Vec::new();
+            while sqlite3_step(st) == SQLITE_ROW {
+                out.push((col_text(st, 0), sqlite3_column_type(st, 1)));
+            }
+            sqlite3_finalize(st);
+            out
+        };
+
+        // The `bool` column: 'boolean' was the wrong answer this test pins shut.
+        assert_eq!(
+            per_row("flag"),
+            vec![
+                ("integer".into(), SQLITE_INTEGER),
+                ("integer".into(), SQLITE_INTEGER),
+                ("null".into(), SQLITE_NULL),
+                ("integer".into(), SQLITE_INTEGER),
+                ("integer".into(), SQLITE_INTEGER),
+            ]
+        );
+        // The `any` column: one class per VALUE, exactly as sqlite reports.
+        assert_eq!(
+            per_row("v"),
+            vec![
+                ("text".into(), SQLITE_TEXT),
+                ("integer".into(), SQLITE_INTEGER),
+                ("real".into(), SQLITE_FLOAT),
+                ("blob".into(), SQLITE_BLOB),
+                ("null".into(), SQLITE_NULL),
+            ]
+        );
+
+        // A bound parameter carries the binder's class, not the column's.
+        let s = cs("SELECT typeof(?), typeof(?), typeof(?), typeof(?)");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_bind_int64(st, 1, 42), SQLITE_OK);
+        assert_eq!(sqlite3_bind_double(st, 2, 1.5), SQLITE_OK);
+        let txt = cs("hi");
+        assert_eq!(sqlite3_bind_text(st, 3, txt.as_ptr(), -1, sqlite_transient()), SQLITE_OK);
+        assert_eq!(sqlite3_bind_null(st, 4), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(
+            (col_text(st, 0), col_text(st, 1), col_text(st, 2), col_text(st, 3)),
+            ("integer".into(), "real".into(), "text".into(), "null".into())
+        );
+        assert_eq!(sqlite3_finalize(st), SQLITE_OK);
+
+        // `timestamp` is declarable but unreachable: a clean, named refusal —
+        // never a value of a class sqlite has no name for.
+        assert_eq!(
+            exec(db, "CREATE TABLE ts (id integer PRIMARY KEY, t timestamp)"),
+            SQLITE_OK
+        );
+        assert_ne!(exec(db, "INSERT INTO ts VALUES (1, 1720000000000000)"), SQLITE_OK);
+
+        sqlite3_close(db);
+    }
+}
+
+/// `PRAGMA busy_timeout` is the one setter pragma the shim honours for real:
+/// it is the same knob `sqlite3_busy_timeout()` sets. Shape (one row named
+/// `timeout`, returned by the SETTER form too) matches sqlite 3.45.1.
+#[test]
+fn pragma_busy_timeout_round_trips_and_is_the_c_api_knob() {
+    unsafe {
+        let db = open_memory();
+
+        let one = |sql: &str| -> (String, i64) {
+            let s = cs(sql);
+            let mut st: *mut Stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+                SQLITE_OK,
+                "prepare {sql}"
+            );
+            assert_eq!(sqlite3_step(st), SQLITE_ROW, "step {sql}");
+            let out = (col_name(st, 0), sqlite3_column_int64(st, 0));
+            sqlite3_finalize(st);
+            out
+        };
+
+        assert_eq!(one("PRAGMA busy_timeout"), ("timeout".into(), 0));
+        // The setter answers with the value now in force (sqlite's shape).
+        assert_eq!(one("PRAGMA busy_timeout = 5000"), ("timeout".into(), 5000));
+        assert_eq!(one("PRAGMA busy_timeout"), ("timeout".into(), 5000));
+        // ... and it IS the C-API knob, not a second copy.
+        assert_eq!(sqlite3_busy_timeout(db, 250), SQLITE_OK);
+        assert_eq!(one("PRAGMA busy_timeout"), ("timeout".into(), 250));
+        // sqlite clamps a negative to 0.
+        assert_eq!(one("PRAGMA busy_timeout = -1"), ("timeout".into(), 0));
+
+        // `foreign_keys` stays 0 through a set: mpedb enforces no foreign key,
+        // and reporting 1 would promise enforcement that does not exist
+        // (C-API-COMPAT gap D11). sqlite's own default is 0 too.
+        assert_eq!(exec(db, "PRAGMA foreign_keys = ON"), SQLITE_OK);
+        assert_eq!(one("PRAGMA foreign_keys"), ("foreign_keys".into(), 0));
+
+        sqlite3_close(db);
     }
 }

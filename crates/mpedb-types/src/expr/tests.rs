@@ -734,7 +734,37 @@ fn new_scalar_fns_eval_match_sqlite_and_propagate_null() {
     assert_eq!(call(ScalarFn::Typeof, &[Value::Float(1.0)]).unwrap(), t("real"));
     assert_eq!(call(ScalarFn::Typeof, &[t("x")]).unwrap(), t("text"));
     assert_eq!(call(ScalarFn::Typeof, &[Value::Blob(vec![1])]).unwrap(), t("blob"));
-    assert_eq!(call(ScalarFn::Typeof, &[Value::Bool(true)]).unwrap(), t("boolean"));
+    // mpedb's own first-class types report a SQLITE storage class, not their
+    // own name: `typeof()` is a sqlite function whose whole documented range is
+    // the five class names, and `sqlite3_column_type` already calls both of
+    // these SQLITE_INTEGER. A sixth string would be a different answer to a
+    // sqlite question rather than an error.
+    assert_eq!(call(ScalarFn::Typeof, &[Value::Bool(true)]).unwrap(), t("integer"));
+    assert_eq!(call(ScalarFn::Typeof, &[Value::Bool(false)]).unwrap(), t("integer"));
+    assert_eq!(call(ScalarFn::Typeof, &[Value::Timestamp(0)]).unwrap(), t("integer"));
+    // Param-only, unreachable as a result value; mapped like `column_type` does.
+    assert_eq!(call(ScalarFn::Typeof, &[Value::List(vec![])]).unwrap(), t("null"));
+    // The range is CLOSED: no `Value` names anything outside the five.
+    for v in [
+        Value::Null,
+        Value::Int(1),
+        Value::Float(1.0),
+        t("x"),
+        Value::Blob(vec![1]),
+        Value::Bool(true),
+        Value::Timestamp(1),
+        Value::List(vec![Value::Int(1)]),
+    ] {
+        let got = call(ScalarFn::Typeof, std::slice::from_ref(&v)).unwrap();
+        let name = match &got {
+            Value::Text(s) => s.clone(),
+            other => panic!("typeof returned a non-text {other:?}"),
+        };
+        assert!(
+            matches!(name.as_str(), "null" | "integer" | "real" | "text" | "blob"),
+            "typeof({v:?}) = {name:?} is outside sqlite's five storage classes"
+        );
+    }
 
     // trim(x, set): strip a set of chars from BOTH ends; 1-arg trims spaces.
     assert_eq!(call(ScalarFn::Trim, &[t("xxhixx"), t("x")]).unwrap(), t("hi"));
