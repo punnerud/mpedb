@@ -384,9 +384,17 @@ fn stage1_refusals() {
     assert!(err("SELECT rank(val) OVER (ORDER BY val) FROM t")
         .to_lowercase()
         .contains("argument"));
-    // Explicit frames are stage 2.
+    // Explicit frames now ship (see `window_frames.rs`); the brittle/ignored
+    // shapes stay refused. A `RANGE` value-offset frame is refused (its
+    // DESC/NULL value arithmetic is version-brittle).
     assert!(err(
-        "SELECT sum(amt) OVER (ORDER BY val ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t"
+        "SELECT sum(amt) OVER (ORDER BY val RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t"
+    )
+    .to_lowercase()
+    .contains("range"));
+    // A frame on a ranking function (which sqlite silently ignores) is refused.
+    assert!(err(
+        "SELECT rank() OVER (ORDER BY val ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM t"
     )
     .to_lowercase()
     .contains("frame"));

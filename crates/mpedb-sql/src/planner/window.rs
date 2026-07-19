@@ -58,6 +58,9 @@ struct WindowCollect {
     distinct: bool,
     partition_by: Vec<ast::Expr>,
     order_by: Vec<(ast::Expr, bool)>,
+    /// Explicit frame (`None` = default). Part of the structural key so two
+    /// windows differing only by frame do not share a result slot.
+    frame: Option<ast::FrameAst>,
 }
 
 /// Lift every window function out of `e`, replacing each with a reference to its
@@ -83,6 +86,7 @@ fn lift_windows(e: &ast::Expr, specs: &mut Vec<WindowCollect>) -> Result<ast::Ex
                 distinct: *distinct,
                 partition_by: spec.partition_by.clone(),
                 order_by: spec.order_by.clone(),
+                frame: spec.frame,
             };
             let slot = match specs.iter().position(|s| *s == candidate) {
                 Some(i) => i,
@@ -229,6 +233,31 @@ fn resolve_window_func(
         ast::WindowFunc::PercentRank => (P::PercentRank, None, ColumnType::Float64, false),
         ast::WindowFunc::CumeDist => (P::CumeDist, None, ColumnType::Float64, false),
     })
+}
+
+/// Translate a parsed [`ast::FrameAst`] into a plan [`Frame`]. Pure structural
+/// mapping — the offsets are already constant non-negative integers captured by
+/// the parser, and legality (function compatibility, boundary ordering,
+/// RANGE-offset refusal, the ORDER BY requirement) is enforced by
+/// [`Frame::check`] at the call site.
+fn resolve_frame(fa: &ast::FrameAst) -> Frame {
+    let mode = match fa.mode {
+        ast::FrameMode::Rows => FrameMode::Rows,
+        ast::FrameMode::Range => FrameMode::Range,
+        ast::FrameMode::Groups => FrameMode::Groups,
+    };
+    let bound = |b: ast::FrameBound| match b {
+        ast::FrameBound::UnboundedPreceding => FrameBound::UnboundedPreceding,
+        ast::FrameBound::Preceding(n) => FrameBound::Preceding(n),
+        ast::FrameBound::CurrentRow => FrameBound::CurrentRow,
+        ast::FrameBound::Following(n) => FrameBound::Following(n),
+        ast::FrameBound::UnboundedFollowing => FrameBound::UnboundedFollowing,
+    };
+    Frame {
+        mode,
+        start: bound(fa.start),
+        end: bound(fa.end),
+    }
 }
 
 /// Bind a value-function offset / n argument and require it to fold to a
@@ -417,6 +446,18 @@ pub(super) fn plan_window_select(
         }
         let (func, default, ty, nullable) =
             resolve_window_func(&mut binder, &spec.func, arg_ty, &spec.extra_args)?;
+        // Resolve and validate any explicit frame against the plan-level function
+        // and whether the window has an ORDER BY. `Frame::check` is the single
+        // source of the frame rules (shared with decode/validate); a bad shape is
+        // a clean bind error, never a wrong answer.
+        let frame = match &spec.frame {
+            None => None,
+            Some(fa) => {
+                let f = resolve_frame(fa);
+                f.check(func, !order_by.is_empty()).map_err(bind_err)?;
+                Some(f)
+            }
+        };
         win_types.push((ty, nullable));
         windows.push(WindowSpec {
             func,
@@ -425,6 +466,7 @@ pub(super) fn plan_window_select(
             partition_by,
             order_by,
             default,
+            frame,
         });
     }
 

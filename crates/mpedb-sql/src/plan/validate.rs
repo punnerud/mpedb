@@ -453,6 +453,11 @@ impl CompiledPlan {
                         if w.default.is_some() && !matches!(w.func, WF::Lag(_) | WF::Lead(_)) {
                             return Err(corrupt("only lag/lead carry a default expression"));
                         }
+                        // Explicit frame legality — the same rule set the planner
+                        // and decoder apply, re-checked here on the semantic pass.
+                        if let Some(f) = &w.frame {
+                            f.check(w.func, !w.order_by.is_empty()).map_err(corrupt)?;
+                        }
                         if let Some(a) = &w.arg {
                             self.check_program_width(a, base_width, ptypes)?;
                         }
