@@ -308,6 +308,223 @@ fn autoincrement_refuses_by_name() {
     );
 }
 
+// ---------------------------------------------------------------- item 4 ----
+
+/// `DEFAULT` is not decoration: it changes what an INSERT stores, and it must
+/// store what sqlite stores — including through an INSERT that names only some
+/// columns, and through `INSERT … SELECT`.
+#[test]
+fn column_defaults_store_what_sqlite_stores() {
+    let setup: &[&str] = &[
+        "CREATE TABLE d (id INTEGER PRIMARY KEY, i INT DEFAULT 42, \
+          r REAL DEFAULT 1.5, s TEXT DEFAULT 'hi', z INT DEFAULT -7, \
+          nd INT DEFAULT NULL, nn INT NOT NULL DEFAULT 9)",
+        "INSERT INTO d (id) VALUES (1)",
+        "INSERT INTO d (id, i, s) VALUES (2, 0, '')",
+        "INSERT INTO d (id, i, r, s, z, nd, nn) VALUES (3, 1, 2.5, 'x', 8, 4, 5)",
+    ];
+    assert_same(setup, "SELECT id, i, r, s, z, nd, nn FROM d ORDER BY id");
+    // A NOT NULL column WITH a default may legally be omitted, in both engines.
+    assert_same(setup, "SELECT SUM(nn), SUM(i) FROM d");
+
+    // `INSERT … SELECT` takes the defaults for the columns it does not name.
+    // (Through a real FROM: a FROM-less `INSERT … SELECT 4, 77` hits an
+    // unrelated pre-existing bug — `Corrupt("table id 4294967295 out of
+    // range")`, the dual-table sentinel leaking into the insert path.)
+    let mut with_sel: Vec<&str> = setup.to_vec();
+    with_sel.push("INSERT INTO d (id, i) SELECT id + 10, 77 FROM d WHERE id = 1");
+    assert_same(&with_sel, "SELECT id, i, r, s, z, nd, nn FROM d ORDER BY id");
+}
+
+/// A `DEFAULT` whose type does not match the declared column type fails the
+/// `CREATE TABLE`, not the first INSERT.
+#[test]
+fn a_mistyped_default_fails_the_create() {
+    let t = open();
+    let e = t
+        .db
+        .query("CREATE TABLE bad (id INTEGER PRIMARY KEY, n INT DEFAULT 'nope')", &[])
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("DEFAULT"), "{e}");
+    assert!(t.db.query("SELECT * FROM bad", &[]).is_err(), "table must not exist");
+}
+
+/// A `CHECK` that arrived through `CREATE TABLE` must actually FIRE. A
+/// constraint that is stored, reported by the catalog and never enforced is
+/// strictly worse than one that was refused.
+#[test]
+fn create_table_checks_are_enforced() {
+    let t = open();
+    t.db.query(
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, pos INT CHECK (pos >= 0), \
+          lo INT, hi INT, CONSTRAINT ord CHECK (hi > lo))",
+        &[],
+    )
+    .unwrap();
+    t.db.query("INSERT INTO c (id, pos, lo, hi) VALUES (1, 0, 1, 2)", &[]).unwrap();
+    for (sql, what) in [
+        ("INSERT INTO c (id, pos, lo, hi) VALUES (2, -1, 1, 2)", "column CHECK"),
+        ("INSERT INTO c (id, pos, lo, hi) VALUES (3, 0, 5, 5)", "table CHECK"),
+    ] {
+        let e = t.db.query(sql, &[]).unwrap_err().to_string();
+        assert!(e.contains("CHECK"), "{what} must fire: {e}");
+    }
+    // An UPDATE into violation is refused too — the constraint is on the ROW,
+    // not on the INSERT statement.
+    let e = t.db.query("UPDATE c SET hi = 0 WHERE id = 1", &[]).unwrap_err().to_string();
+    assert!(e.contains("CHECK"), "CHECK must fire on UPDATE: {e}");
+    // …and only the legal row is there.
+    assert_eq!(mpedb_rows(&t.db, "SELECT COUNT(*) FROM c"), vec![vec!["1".to_string()]]);
+
+    // sqlite agrees on which rows are legal.
+    assert_same(
+        &[
+            "CREATE TABLE c (id INTEGER PRIMARY KEY, pos INT CHECK (pos >= 0), \
+              lo INT, hi INT, CONSTRAINT ord CHECK (hi > lo))",
+            "INSERT INTO c (id, pos, lo, hi) VALUES (1, 0, 1, 2)",
+            "INSERT INTO c (id, pos, lo, hi) VALUES (4, 3, 1, 9)",
+        ],
+        "SELECT id, pos, lo, hi FROM c ORDER BY id",
+    );
+}
+
+/// A CHECK naming a column that does not exist fails the `CREATE TABLE`, rather
+/// than landing in the catalog as a constraint that can never be loaded.
+#[test]
+fn an_uncompilable_check_fails_the_create() {
+    let t = open();
+    let e = t
+        .db
+        .query("CREATE TABLE bad (id INTEGER PRIMARY KEY, x INT CHECK (nosuch > 0))", &[])
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("nosuch"), "{e}");
+    assert!(t.db.query("SELECT * FROM bad", &[]).is_err(), "table must not exist");
+}
+
+/// A CHECK created by DDL is enforced by a SECOND handle that attaches
+/// afterwards — the programs are recompiled from the CATALOG's schema, not
+/// carried over from the config's seed. Without this, whether a constraint fires
+/// would depend on which process wrote it.
+#[test]
+fn a_ddl_check_is_enforced_by_a_later_attach() {
+    let t = open();
+    t.db.query("CREATE TABLE c2 (id INTEGER PRIMARY KEY, pos INT CHECK (pos >= 0))", &[])
+        .unwrap();
+    let toml = format!(
+        "[database]\npath = \"{}\"\nsize_mb = 8\nmax_readers = 8\n\n\
+         [[table]]\nname = \"seed\"\nprimary_key = [\"id\"]\n\
+         [[table.column]]\nname = \"id\"\ntype = \"int64\"\n",
+        t.path
+    );
+    let db2 = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    let e = db2.query("INSERT INTO c2 (id, pos) VALUES (1, -1)", &[]).unwrap_err().to_string();
+    assert!(e.contains("CHECK"), "a second attach must enforce the CHECK: {e}");
+    db2.query("INSERT INTO c2 (id, pos) VALUES (1, 1)", &[]).unwrap();
+}
+
+/// …and by the SAME transaction that created the table. This is the sharpest
+/// case: the rows written alongside a `CREATE TABLE … CHECK (…)` are exactly the
+/// ones an empty program slot would let through.
+#[test]
+fn a_check_fires_in_the_transaction_that_created_the_table() {
+    let t = open();
+    let mut s = t.db.begin().unwrap();
+    s.query("CREATE TABLE c3 (id INTEGER PRIMARY KEY, pos INT CHECK (pos >= 0))", &[])
+        .unwrap();
+    s.query("INSERT INTO c3 (id, pos) VALUES (1, 5)", &[]).unwrap();
+    let e = s.query("INSERT INTO c3 (id, pos) VALUES (2, -5)", &[]).unwrap_err().to_string();
+    assert!(e.contains("CHECK"), "in-transaction CHECK must fire: {e}");
+    s.commit().unwrap();
+    assert_eq!(mpedb_rows(&t.db, "SELECT COUNT(*) FROM c3"), vec![vec!["1".to_string()]]);
+}
+
+/// `REFERENCES` is PARSED and NOT ENFORCED — which is exactly what sqlite does
+/// under its default `PRAGMA foreign_keys = OFF`. Asserted rather than assumed:
+/// the dangling child row goes in and the `ON DELETE CASCADE` does not fire, in
+/// BOTH engines.
+#[test]
+fn references_is_parsed_and_not_enforced_like_sqlite_default() {
+    let setup: &[&str] = &[
+        "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE ch (id INTEGER PRIMARY KEY, \
+          p_id INT REFERENCES p (id) ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)",
+        "INSERT INTO p (id) VALUES (1)",
+        // 99 is not in `p` — sqlite (foreign_keys = OFF) accepts it, so mpedb must.
+        "INSERT INTO ch (id, p_id) VALUES (1, 99)",
+        "INSERT INTO ch (id, p_id) VALUES (2, 1)",
+        "DELETE FROM p WHERE id = 1",
+    ];
+    // No cascade happened in either engine: both child rows survive their parent.
+    assert_same(setup, "SELECT id, p_id FROM ch ORDER BY id");
+    assert_same(setup, "SELECT COUNT(*) FROM p");
+    // The table-level FOREIGN KEY spelling is equally inert.
+    assert_same(
+        &[
+            "CREATE TABLE p (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE ch (id INTEGER PRIMARY KEY, p_id INT, \
+              CONSTRAINT fk FOREIGN KEY (p_id) REFERENCES p (id) ON DELETE CASCADE)",
+            "INSERT INTO ch (id, p_id) VALUES (1, 404)",
+        ],
+        "SELECT id, p_id FROM ch",
+    );
+}
+
+/// The whole Django-shaped `CREATE TABLE`: sqlite's type vocabulary, `DEFAULT`,
+/// a column `CHECK`, a column `REFERENCES`, and named table constraints, all at
+/// once — and the same INSERTs must produce the same rows.
+#[test]
+fn a_django_create_table_with_defaults_checks_and_fks_agrees_with_sqlite() {
+    let setup: &[&str] = &[
+        "CREATE TABLE \"t\" (\
+           \"id\" integer NOT NULL PRIMARY KEY, \
+           \"name\" varchar(100) NOT NULL, \
+           \"code\" char(1) NULL, \
+           \"big\" bigint NULL, \
+           \"pos\" integer unsigned NOT NULL CHECK (\"pos\" >= 0), \
+           \"amount\" double precision NULL, \
+           \"note\" text NOT NULL DEFAULT 'none', \
+           \"n\" integer NOT NULL DEFAULT 7, \
+           \"other_id\" integer NULL REFERENCES \"t\" (\"id\") \
+             DEFERRABLE INITIALLY DEFERRED, \
+           CONSTRAINT \"t_name_code_uniq\" UNIQUE (\"name\", \"code\"), \
+           CONSTRAINT \"t_big_ck\" CHECK (\"big\" IS NULL OR \"big\" > 0))",
+        "INSERT INTO \"t\" (\"id\", \"name\", \"code\", \"big\", \"pos\", \"amount\", \
+           \"other_id\") VALUES (1, 'a', 'x', 100, 0, 1.5, NULL)",
+        "INSERT INTO \"t\" (\"id\", \"name\", \"code\", \"big\", \"pos\", \"amount\", \
+           \"other_id\") VALUES (2, 'b', 'y', 200, 9, -0.25, 1)",
+    ];
+    assert_same(
+        setup,
+        "SELECT \"id\", \"name\", \"code\", \"big\", \"pos\", \"amount\", \"note\", \"n\", \
+         \"other_id\" FROM \"t\" ORDER BY \"id\"",
+    );
+    assert_same(setup, "SELECT SUM(\"big\"), COUNT(\"other_id\") FROM \"t\"");
+    // …and the constraints in it are live in mpedb.
+    let t = open();
+    for s in setup {
+        t.db.query(s, &[]).unwrap();
+    }
+    for (bad, what) in [
+        (
+            "INSERT INTO \"t\" (\"id\", \"name\", \"code\", \"pos\") VALUES (3, 'c', 'z', -1)",
+            "column CHECK",
+        ),
+        (
+            "INSERT INTO \"t\" (\"id\", \"name\", \"code\", \"big\", \"pos\") \
+             VALUES (4, 'd', 'w', -5, 0)",
+            "named table CHECK",
+        ),
+        (
+            "INSERT INTO \"t\" (\"id\", \"name\", \"code\", \"pos\") VALUES (5, 'a', 'x', 0)",
+            "named UNIQUE",
+        ),
+    ] {
+        assert!(t.db.query(bad, &[]).is_err(), "{what} must still constrain");
+    }
+}
+
 // -------------------------------------------------------------- deviations ---
 
 /// The rigid half of the mapping, stated as a REFUSAL and pinned as such.

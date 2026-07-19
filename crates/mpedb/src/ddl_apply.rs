@@ -132,8 +132,7 @@ fn coerce_default(
     };
     if !v.fits(ty) {
         return Err(Error::Bind(format!(
-            "ALTER TABLE {table} ADD COLUMN {col}: DEFAULT value of type {} does not \
-             match column type {ty}",
+            "{table}.{col}: DEFAULT value of type {} does not match column type {ty}",
             v.type_name()
         )));
     }
@@ -225,20 +224,58 @@ pub(crate) fn table_def_from_spec(
     let mut columns: Vec<mpedb_types::ColumnDef> = spec
         .columns
         .iter()
-        .map(|c| mpedb_types::ColumnDef {
-            name: c.name.clone(),
-            ty: c.ty,
-            // PK columns are implicitly NOT NULL, as in the config path.
-            nullable: !c.not_null && !pk_names.iter().any(|p| p == &c.name),
-            unique: c.unique,
-            indexed: false,
-            default: None,
-            check: None,
-            // Declared `COLLATE` rides onto the column. A collated UNIQUE/PK is
-            // caught later by `Schema::validate` (collated indexes deferred).
-            collation: c.collation,
+        .map(|c| {
+            // `DEFAULT <const>` is type-checked against the declared column type
+            // NOW, so a mistyped default is a CREATE TABLE error instead of a
+            // surprise at the first INSERT. An explicit `DEFAULT NULL` is
+            // exactly "no default" and is not persisted — it is what an omitted
+            // column already stores.
+            let default = match &c.default {
+                Some(mpedb_types::DefaultExpr::Const(v)) => {
+                    let v = coerce_default(v.clone(), c.ty, &spec.name, &c.name)?;
+                    if v.is_null() {
+                        None
+                    } else {
+                        Some(mpedb_types::DefaultExpr::Const(v))
+                    }
+                }
+                // The column-default parser only ever emits a Const literal.
+                other => other.clone(),
+            };
+            Ok(mpedb_types::ColumnDef {
+                name: c.name.clone(),
+                ty: c.ty,
+                // PK columns are implicitly NOT NULL, as in the config path.
+                nullable: !c.not_null && !pk_names.iter().any(|p| p == &c.name),
+                unique: c.unique,
+                indexed: false,
+                default,
+                check: c.check.clone(),
+                // Declared `COLLATE` rides onto the column. A collated UNIQUE/PK is
+                // caught later by `Schema::validate` (collated indexes deferred).
+                collation: c.collation,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
+    // Table-level `CHECK (…)` bodies fold onto the FIRST column, ANDed with
+    // whatever CHECK it already carries. The engine evaluates a CHECK program
+    // over the WHOLE row — the per-column slot only decides which column a
+    // violation names — so a multi-column table CHECK is enforced identically
+    // wherever it hangs.
+    if !spec.checks.is_empty() {
+        let first = columns.first_mut().ok_or_else(|| {
+            Error::Bind(format!(
+                "CREATE TABLE {}: a table-level CHECK needs at least one column",
+                spec.name
+            ))
+        })?;
+        for src in &spec.checks {
+            first.check = Some(match first.check.take() {
+                Some(prev) => format!("({prev}) AND ({src})"),
+                None => src.clone(),
+            });
+        }
+    }
     let indexes = spec
         .uniques
         .iter()
@@ -273,7 +310,7 @@ pub(crate) fn table_def_from_spec(
             .map(|n| col_index(n))
             .collect::<Result<Vec<u16>>>()?
     };
-    Ok(mpedb_types::TableDef {
+    let def = mpedb_types::TableDef {
         id: 0, // assigned by Schema::with_added_table (lowest free)
         name: spec.name,
         columns,
@@ -282,7 +319,24 @@ pub(crate) fn table_def_from_spec(
         dead: false,
         implicit_rowid,
         kind: mpedb_types::TableKind::Standard,
-    })
+    };
+    // Compile every CHECK against the FINISHED table before the DDL commits: an
+    // expression naming a missing column, using a parameter, or not typing to
+    // bool must fail the CREATE TABLE, not sit in the catalog as a constraint
+    // that can never be loaded. The programs are recompiled from these same
+    // sources whenever a bundle is (re)built, so they are thrown away here —
+    // this call IS the validation.
+    for col in &def.columns {
+        if let Some(src) = &col.check {
+            mpedb_sql::compile_check(src, &def).map_err(|e| {
+                Error::Bind(format!(
+                    "CREATE TABLE {}: CHECK on `{}` failed to compile: {e}",
+                    def.name, col.name
+                ))
+            })?;
+        }
+    }
+    Ok(def)
 }
 
 /// Reserved-name checks + [`TableDef`] construction for `CREATE VIRTUAL TABLE …
