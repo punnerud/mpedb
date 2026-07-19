@@ -338,6 +338,13 @@ fn table_battery() {
         "SELECT DISTINCT coalesce(f, 1) FROM t ORDER BY 1",
         // GROUP BY an `any` key: 1 and 1.0 land in ONE group of 3.
         "SELECT coalesce(f, 1), count(*) FROM t GROUP BY coalesce(f, 1) ORDER BY 1",
+        "SELECT coalesce(f, 1), count(*) FROM t GROUP BY coalesce(f, 1) \
+         HAVING count(*) > 1 ORDER BY 1",
+        // Comparisons against the `any` result settle per value — the
+        // integer 1 and the real 1.0 both satisfy `= 1`.
+        "SELECT pk FROM t WHERE coalesce(i, f) = 1 ORDER BY pk",
+        "SELECT pk FROM t WHERE coalesce(i, f) > 2 ORDER BY pk",
+        "SELECT pk FROM t WHERE coalesce(i, f) BETWEEN 0.5 AND 8 ORDER BY pk",
     ];
     for sql in queries {
         let mine = mpedb_rows(&db, sql).unwrap_or_else(|e| panic!("mpedb refused {sql}: {e}"));
