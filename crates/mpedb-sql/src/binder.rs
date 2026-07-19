@@ -527,6 +527,13 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Whether the sqlite compat dialect is in force. Gates every "accept what
+    /// sqlite accepts" widening (truthiness, the bool/int bridge); the
+    /// PostgreSQL dialect keeps mpedb's original rigid refusals.
+    pub(crate) fn sqlite_dialect(&self) -> bool {
+        self.bare_group_by == BareGroupBy::Sqlite
+    }
+
     /// Bring `excluded.<col>` in or out of scope (ON CONFLICT DO UPDATE only).
     pub fn set_allow_excluded(&mut self, on: bool) {
         self.allow_excluded = on;
@@ -544,10 +551,12 @@ impl<'a> Binder<'a> {
         (self.param_types, self.ctx_keys, self.ctx_list_keys)
     }
 
-    /// Bind a WHERE predicate: must type to bool (or NULL).
+    /// Bind a WHERE predicate: must type to bool (or NULL). A non-boolean is
+    /// truthy-tested the way sqlite does — see [`Self::to_bool_ctx`].
     pub fn bind_predicate(&mut self, e: &ast::Expr) -> Result<BExpr> {
         let (b, ty) = self.bind_expr(e)?;
         let (b, ty) = self.unify_param(b, ty, ColumnType::Bool);
+        let (b, ty) = self.to_bool_ctx(b, ty)?;
         match ty {
             None | Some(ColumnType::Bool) => Ok(b),
             Some(t) => Err(bind_err(format!(
@@ -556,9 +565,14 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Bind a CHECK expression: must type to bool, strictly.
+    /// Bind a CHECK expression: must type to bool, strictly (an untyped NULL is
+    /// still refused here — a CHECK that can never be TRUE is a schema bug).
+    /// A non-boolean is truthy-tested like sqlite ([`Self::to_bool_ctx`]);
+    /// CHECK bodies are stored as SOURCE in the schema and recompiled at
+    /// attach, so widening what compiles moves no canonical bytes.
     pub fn bind_check(&mut self, e: &ast::Expr) -> Result<BExpr> {
         let (b, ty) = self.bind_expr(e)?;
+        let (b, ty) = self.to_bool_ctx(b, ty)?;
         match ty {
             Some(ColumnType::Bool) => Ok(b),
             Some(t) => Err(bind_err(format!(
@@ -593,6 +607,32 @@ impl<'a> Binder<'a> {
             Some(ColumnType::Any) => Ok(b),
             Some(ColumnType::Int64) if col.ty == ColumnType::Float64 => {
                 fold_maybe(BExpr::Unary(BUnOp::ToFloat, Box::new(b)), self.suppress_fold)
+            }
+            // sqlite stores a boolean AS the integer 0/1, so assigning one to an
+            // integer column is exactly `CAST(x AS INTEGER)` — lossless and
+            // sqlite-identical. This is Django's `SET flag = (a = b)` shape.
+            Some(ColumnType::Bool)
+                if col.ty == ColumnType::Int64 && self.bare_group_by == BareGroupBy::Sqlite =>
+            {
+                fold_maybe(BExpr::Cast(Box::new(b), Affinity::Integer), self.suppress_fold)
+            }
+            // The other direction is NOT symmetric, deliberately. `SET flag = 1`
+            // / `= 0` folds into the bool domain and is exact. Any other integer
+            // is REFUSED: sqlite would store `2` in its `bool` column and read
+            // `2` back, which mpedb's rigid `Bool` cannot represent — truthy-
+            // testing it to TRUE would be a wrong answer on read-back. A clean
+            // refusal is the honest outcome, and Django only ever sends 0/1.
+            Some(ColumnType::Int64)
+                if col.ty == ColumnType::Bool && self.bare_group_by == BareGroupBy::Sqlite =>
+            {
+                match &b {
+                    BExpr::Const(Value::Int(i @ (0 | 1))) => Ok(BExpr::Const(Value::Bool(*i == 1))),
+                    _ => Err(bind_err(format!(
+                        "cannot assign int64 to bool column `{}` — only the literals 0 and 1 \
+                         convert; mpedb's bool holds no other integer",
+                        col.name
+                    ))),
+                }
             }
             Some(t) => Err(bind_err(format!(
                 "cannot assign {t} to column `{}` of type {}",
@@ -639,6 +679,7 @@ impl<'a> Binder<'a> {
             ast::Expr::Unary(UnOp::Not, a) => {
                 let (a, at) = self.bind_expr(a)?;
                 let (a, at) = self.unify_param(a, at, ColumnType::Bool);
+                let (a, at) = self.to_bool_ctx(a, at)?;
                 match at {
                     None | Some(ColumnType::Bool) => {}
                     Some(t) => return Err(bind_err(format!("NOT requires a boolean, got {t}"))),
@@ -663,6 +704,7 @@ impl<'a> Binder<'a> {
                 // Int64->Float64 coercion. The difference is only in the RESULT,
                 // which is 2-valued: `IS` never yields NULL, so it is its own
                 // node with its own instruction rather than a 3VL comparison.
+                let (l, lt, r, rt) = self.bridge_bool_int(l, lt, r, rt)?;
                 let (l, r, _) = self.unify_operands(l, lt, r, rt, "compare")?;
                 let e = fold_maybe(
                     BExpr::IsDistinct(Box::new(l), Box::new(r), *negated),
@@ -852,9 +894,11 @@ impl<'a> Binder<'a> {
                 let mut results = Vec::with_capacity(arms.len() + 1);
                 for (c, r) in arms {
                     let (bc, ct) = self.bind_expr(c)?;
-                    // A WHEN must be a predicate. mpedb is rigidly typed, so
-                    // `CASE WHEN 1 THEN …` is an error here rather than sqlite's
-                    // truthiness coercion — the same trade the whole engine makes.
+                    // A WHEN must be a predicate. A non-boolean one is
+                    // truthy-tested exactly as sqlite does (`to_bool_ctx`), so
+                    // `CASE WHEN 1 THEN …` compiles; only the PostgreSQL dialect
+                    // keeps mpedb's original rigid refusal.
+                    let (bc, ct) = self.to_bool_ctx(bc, ct)?;
                     match ct {
                         Some(ColumnType::Bool) | None => {}
                         Some(t) => {
@@ -1065,6 +1109,8 @@ impl<'a> Binder<'a> {
             BinOp::And | BinOp::Or => {
                 let (l, lt) = self.unify_param(l, lt, ColumnType::Bool);
                 let (r, rt) = self.unify_param(r, rt, ColumnType::Bool);
+                let (l, lt) = self.to_bool_ctx(l, lt)?;
+                let (r, rt) = self.to_bool_ctx(r, rt)?;
                 for t in [lt, rt].into_iter().flatten() {
                     if t != ColumnType::Bool {
                         return Err(bind_err(format!(
@@ -1076,6 +1122,7 @@ impl<'a> Binder<'a> {
                 Ok((e, Some(ColumnType::Bool)))
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let (l, lt, r, rt) = self.bridge_bool_int(l, lt, r, rt)?;
                 let (l, r, _) = self.unify_operands(l, lt, r, rt, "compare")?;
                 // sqlite's collation precedence, in order: an explicit `COLLATE`
                 // on the LEFT operand, else on the RIGHT; else the LEFT operand's
@@ -1250,6 +1297,65 @@ impl<'a> Binder<'a> {
     /// legal coercion (Int64 -> Float64), reject everything else cross-type.
     /// Returns the (possibly coerced) operands and the common type
     /// (`None` when it could not be pinned).
+    /// Bridge a `bool`/`int64` COMPARISON the way sqlite's storage does, and
+    /// only for a comparison (`=`, `<`, …, `IS`) — never for arithmetic.
+    ///
+    /// sqlite has no boolean type: a `BooleanField` column literally holds the
+    /// integers 0 and 1, which is why Django writes `WHERE "t"."flag" = 1`.
+    /// mpedb keeps a rigid `Bool`, so the two must be reconciled — but by the
+    /// integer VALUE of the bool, never by truthiness of the int:
+    ///
+    /// * an int CONSTANT that is exactly 0 or 1 folds into the bool domain
+    ///   (`flag = 1` -> `flag = TRUE`). This is the shape Django emits, and
+    ///   keeping both sides `Bool` keeps the node a plain `Binary(Eq, Col,
+    ///   Const)` — so an index/PK probe on the column survives. Ordering is
+    ///   exact too: `FALSE < TRUE` is `0 < 1`, and 0/1 are the only bools.
+    /// * anything else casts the BOOL side UP to its integer 0/1
+    ///   (`Instr::Cast(Integer)`). So `flag = 2` is FALSE and `flag = -1` is
+    ///   FALSE — which is what sqlite answers, because the column only ever
+    ///   holds 0 or 1. Truthy-testing the int instead would make `flag = 2`
+    ///   TRUE: a wrong answer, and precisely the over-reach this avoids.
+    ///
+    /// NULL is untouched on both paths, so 3VL is unchanged.
+    fn bridge_bool_int(
+        &mut self,
+        l: BExpr,
+        lt: Ty,
+        r: BExpr,
+        rt: Ty,
+    ) -> Result<(BExpr, Ty, BExpr, Ty)> {
+        use ColumnType::{Bool, Int64};
+        if self.bare_group_by != BareGroupBy::Sqlite {
+            return Ok((l, lt, r, rt)); // PostgreSQL: `flag = 1` stays an error
+        }
+        // Fold a 0/1 int literal into the bool domain.
+        let as_bool = |e: &BExpr| match e {
+            BExpr::Const(Value::Int(i @ (0 | 1))) => Some(BExpr::Const(Value::Bool(*i == 1))),
+            _ => None,
+        };
+        match (lt, rt) {
+            (Some(Bool), Some(Int64)) => Ok(match as_bool(&r) {
+                Some(rb) => (l, Some(Bool), rb, Some(Bool)),
+                None => (
+                    BExpr::Cast(Box::new(l), Affinity::Integer),
+                    Some(Int64),
+                    r,
+                    Some(Int64),
+                ),
+            }),
+            (Some(Int64), Some(Bool)) => Ok(match as_bool(&l) {
+                Some(lb) => (lb, Some(Bool), r, Some(Bool)),
+                None => (
+                    l,
+                    Some(Int64),
+                    BExpr::Cast(Box::new(r), Affinity::Integer),
+                    Some(Int64),
+                ),
+            }),
+            _ => Ok((l, lt, r, rt)),
+        }
+    }
+
     fn unify_operands(
         &mut self,
         l: BExpr,
@@ -1793,6 +1899,66 @@ impl<'a> Binder<'a> {
             });
         }
         Ok((out, Some(target)))
+    }
+
+    /// sqlite's TRUTHINESS: coerce a non-boolean value that stands in a
+    /// **boolean context** (WHERE/HAVING/ON/FILTER, `NOT`, `AND`/`OR`,
+    /// `CASE WHEN`, `CHECK`) into a bool. Django writes `WHERE "tbl"."flag"`
+    /// for a `BooleanField` and binds `True` as the integer 1, so a rigid
+    /// refusal here is the single largest sqlite-compat gap.
+    ///
+    /// The rule is taken from the sqlite binary (3.45.1), not from intuition.
+    /// sqlite's `sqlite3VdbeBooleanValue` is: NULL stays unknown, an integer is
+    /// `!= 0`, and **everything else is `sqlite3VdbeRealValue(x) != 0.0`** — the
+    /// leading-float-prefix parse, applied to text AND to a blob's raw bytes.
+    /// Verified against the binary in every boolean position:
+    ///
+    /// | value | truthy | why |
+    /// |---|---|---|
+    /// | `2`, `-1`, `0.5` | yes | non-zero |
+    /// | `0`, `0.0`, `-0.0` | no | zero |
+    /// | `'3abc'`, `'1e3'`, `'.5'`, `' 1 '` | yes | float prefix is non-zero |
+    /// | `'abc'`, `'0'`, `'0abc'`, `'0x1'`, `''` | no | float prefix is 0.0 |
+    /// | `x'31'` (`"1"`) | yes | blob bytes read as text |
+    /// | `x'30'` (`"0"`), `x'00'`, `x''` | no | ditto |
+    /// | `NULL` | unknown | 3VL |
+    ///
+    /// That is EXACTLY [`Affinity::Real`] as `Instr::Cast` already implements
+    /// it (`to_real` -> `float_prefix`, itself differential-tested against
+    /// sqlite in `crates/mpedb/tests/cast_affinity.rs`), so the whole rule
+    /// desugars into instructions that already exist:
+    ///
+    /// * `int64`   -> `x <> 0`
+    /// * `float64` -> `x <> 0.0`      (`-0.0 == 0.0` in `sql_cmp`, so it is FALSE)
+    /// * anything else (text, blob, timestamp, `any`) -> `CAST(x AS REAL) <> 0.0`
+    ///
+    /// No new opcode, therefore **no `PLAN_FORMAT` bump**. `<>` is 3VL, so NULL
+    /// propagates and every consumer (WHERE skips the row, `CASE WHEN` takes
+    /// ELSE, `NOT NULL` is NULL, Kleene `AND`/`OR`) already behaves like sqlite.
+    ///
+    /// A bool or a still-unconstrained operand passes through untouched — this
+    /// only ever ACCEPTS more, it never changes an answer mpedb already gives.
+    /// Under the PostgreSQL dialect (`bare_group_by = "postgres"`) the rigid
+    /// refusal is kept, exactly as [`like_glob_operand`] keeps it there.
+    pub(crate) fn to_bool_ctx(&mut self, e: BExpr, t: Ty) -> Result<(BExpr, Ty)> {
+        let src = match t {
+            // Already boolean, or nothing to coerce (NULL literal / bare param).
+            None | Some(ColumnType::Bool) => return Ok((e, t)),
+            Some(src) => src,
+        };
+        if self.bare_group_by != BareGroupBy::Sqlite {
+            return Ok((e, t)); // PostgreSQL: `WHERE 1` stays an error
+        }
+        let (probe, zero) = match src {
+            ColumnType::Int64 => (e, Value::Int(0)),
+            ColumnType::Float64 => (e, Value::Float(0.0)),
+            _ => (BExpr::Cast(Box::new(e), Affinity::Real), Value::Float(0.0)),
+        };
+        let e = fold_maybe(
+            BExpr::Binary(BinOp::Ne, Box::new(probe), Box::new(BExpr::Const(zero))),
+            self.suppress_fold,
+        )?;
+        Ok((e, Some(ColumnType::Bool)))
     }
 
     /// If `e` is a bare parameter with no inferred type yet, pin it to `ty`.
