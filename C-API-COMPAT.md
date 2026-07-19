@@ -342,6 +342,14 @@ pre-reserves any size up to 16 TiB, so this is no longer a blocker.)
 
 ## Django's own test suite — run 2 (2026-07-19)
 
+> **⚠️ The shim arm's numbers in this section are NOT VALID** — see "The
+> contamination" under run 3. The shim read `file:…?mode=memory` as a path, so
+> Django's test database survived as a file between runs, and `migrate` then
+> skipped every table that already existed. Run 2's shim arm therefore issued no
+> DDL and ran against run 1's schema. The stock arm and the two WRONG-ANSWER
+> findings (W1, W2) stand; the pass counts and the "D2 costs nothing" finding do
+> not.
+
 Run 2 re-measures both arms after the CREATE-TABLE-surface commits
 `7066a35 d45ad77 35358c6 05bf406 2097f18 fae9e73`, with four of the six
 workbench adaptations DELETED — a number measured through a workaround is not
@@ -557,3 +565,222 @@ Removed (gap closed): `quote_name()` quote-stripping, the `data_types` table, th
 Kept: `data_types_suffix = {}` (D2 — now demonstrably free, see above),
 `supports_foreign_keys = False` (D4b — REFERENCES parsed, not enforced),
 `_references_graph` (D8).
+
+## Django's own test suite — run 3 (2026-07-19)
+
+Run 3 re-measures both arms after the six merges of 2026-07-19: type affinity
+(canonical-bytes v7), host UDFs on the WRITE path, `quote()`+`strftime()`
+(PLAN_FORMAT 41), the int↔bool bridge, `FILTER` + correlated subquery (W2), and
+the table cap 120 → 4088 with a 255-byte identifier limit (PLAN_FORMAT 42).
+
+**Read this first: run 2's shim numbers were measured against a database it did
+not create.** See "The contamination" below. Run 3's numbers are the first
+clean ones since run 1.
+
+### ⚠️ One ANSWER divergence (no error, a different answer)
+
+**`typeof()` of a BOOLEAN column answers `'boolean'`; sqlite answers
+`'integer'`.** sqlite's `typeof()` has exactly five possible answers
+(`null`/`integer`/`real`/`text`/`blob`); mpedb has first-class `Bool` and
+`Timestamp`, and `sqlite_typeof` (`mpedb-types/src/expr/scalar.rs`) names them
+honestly. That is defensible for NATIVE mpedb and is documented there as
+deliberate — but through a **libsqlite3 shim** it is a value sqlite can never
+return, so a consumer switching on `typeof(x)` takes the wrong branch.
+
+```python
+c.execute("CREATE TABLE bt (id integer PRIMARY KEY, flag bool NOT NULL)")
+c.execute("INSERT INTO bt VALUES (1, ?)", (True,))
+c.execute("SELECT flag, typeof(flag) FROM bt")   # stock (1,'integer')
+                                                 # mpedb (1,'boolean')   DIVERGES
+```
+
+Not fixed here: `scalar.rs` is `mpedb-types`, outside this workbench's remit,
+and the right fix is a decision about the shim's contract (map mpedb's extra
+type names to sqlite's five at the C-API boundary, or accept the divergence and
+document it as one). No Django test in the 1 155 measured hits it.
+
+**Nothing else.** Both W1 and W2 are gone as wrong answers: W2 is fixed, and W1
+(`decimal(10,2)` compared as text) is now a REFUSAL — affinity converts on
+store, the comparison half is still missing, so `price < '40.0'` errors instead
+of answering wrongly. And the strongest evidence is structural: of the 141
+failing test outcomes under the shim in group A, **141 are ERRORs and 0 are
+FAILs** — every one is a refusal, not a different answer. (Run 2 had 4 FAILs.)
+The differential probe behind this section covers affinity storage/ordering/
+aggregation, the bool bridge, `quote`/`strftime`, W2's shapes and the CAST/
+arithmetic/`IN` surface.
+
+### The contamination — why run 2's numbers were not real
+
+The shim read `file:<name>?mode=memory` as a PATH. Django's test runner names
+every test database exactly that way (`file:memorydb_default?mode=memory&
+cache=shared`), so the shim created a 64 MiB FILE called `memorydb_default` in
+Django's `tests/` directory — and because Django treats an in-memory database as
+never-closing, it never deleted it. **The file survived the process.**
+
+Django's `migrate --run-syncdb` skips any model whose table already exists
+(`sync_apps()` filters the manifest through `connection.introspection.
+table_names()`). So on every run after the first, the shim arm created **no
+tables at all** and ran against the schema left by the previous run. Run 2's
+headline claim — that it measured the new CREATE TABLE surface (D1–D5) without
+workarounds — was measuring a migrate that issued no DDL. Its "D2 costs
+nothing, migrate included" finding has the same explanation, and is false: D2
+now costs all 831 tests (below).
+
+Run 3 only noticed because canonical-bytes v7 made the stale file unopenable;
+before that it opened fine and the contamination was silent. Fixed in
+`b5b7405`: `mode=memory` now resolves to a per-process tmpfs file, refcounted
+per name — first open in a process starts empty, later opens attach to the same
+database (sqlite's shared-cache in-memory semantics), last close destroys it.
+Nothing in the CWD, nothing outliving the process. A second shim fix landed with
+it: a failed open reported `InterfaceError: out of memory` for every cause,
+because CPython reads `sqlite3_errmsg(NULL)` and sqlite's fixed answer there is
+that constant; the real reason is now recorded and answered.
+
+### What was run
+
+Django `5.2.17.dev20260714173342` (`stable/5.2.x`, commit `3e389b7`), CPython
+3.12.3, system libsqlite3 3.45.1, `--parallel=1`, driven by
+`crates/mpedb-capi/workbench/djsuite/run_suite.sh`.
+
+Reported as **two separate measurements**, because the table-cap closure changed
+the test population and a single total would conflate "the fixes worked" with
+"more tests now run".
+
+### A — comparability: the SAME 9 labels, 831 tests
+
+Frozen since run 1, so the arms are comparable across runs.
+
+| | stock 3.45.1 | mpedb shim run 2 | mpedb shim run 3 |
+|---|---|---|---|
+| G1 `basic lookup transactions ordering update delete` | 392 ran, 0 failed | 392 ran, 113 failed | **392 ran, 42 failed** (0 F / 42 E) |
+| G2 `aggregation annotations expressions` | 439 ran, 0 failed | 439 ran, 209 failed | **439 ran, 99 failed** (0 F / 99 E) |
+| **total** | **831/831 (100 %)** | 509/831 (61.3 %) | **690/831 (83.0 %)** |
+| delta vs run 2 | — | — | **+181** |
+
+Adjusted for the two tests the shim SKIPS rather than fails (the
+`supports_json_field` probe needs `json()`, so Django does not create either
+JSONField model — re-verified, same two tests as run 2), the honest comparable
+figure is **688/831**.
+
+**Which gaps closed, by test movement:**
+
+| Fix | Run-2 weight | Run-3 weight | Verdict |
+|---|---|---|---|
+| Host UDFs on the WRITE path | 47 | **0** | CLOSED — the bucket is gone entirely; no `internal error (bug in mpedb)` and no UDF-shaped failure remains. |
+| int↔bool bridge | 39 | **0** | CLOSED — bucket gone. |
+| `quote()` + `strftime()` | 44 | **3** | CLOSED for `quote()` (40 statements, bucket gone). `strftime()` remains only for `'now'`, which mpedb refuses by name. |
+| Type affinity | 68 | **18** | LARGELY CLOSED as a storage problem (and W1 downgraded from wrong answer to refusal). What is left is the COMPARISON half: `arithmetic … got any` 10, `cannot compare int64 with text` 3, `coalesce` type mixes 3, `floor() … got any` 1, `IN` list 1. |
+| `FILTER` + correlated subquery (W2) | wrong answer | **fixed** | CLOSED — all four shapes match stock. |
+| Table cap 120 → 4088 | — | — | See B. |
+
+### B — new coverage: `queries` and `backends`
+
+| Label | Tests | stock 3.45.1 | mpedb shim |
+|---|---|---|---|
+| `queries` | 493 | 493 ran, 0 failed | **BLOCKED at migrate — 0 tests run** |
+| `backends` | 324 | 324 ran, 5 failed (319/324) | **324 ran, 13 failed (311/324)**; 5 shared with stock, **8 shim-only** |
+
+`backends` runs for the first time — both of its blockers (D6 table cap, D7
+identifier limit) are genuinely closed. The cap is closed at the C-API level
+too, verified directly: 400 sequential `CREATE TABLE`s through the shim in one
+database all succeed, where the old ceiling was 120.
+
+`queries` is **still blocked, by a NEW gap, not by the cap** — it dies at the
+7th of its 95 models:
+
+```
+queries/models.py:69   class DateTimePK(models.Model):
+                           date = models.DateTimeField(primary_key=True, …)
+
+CREATE TABLE "queries_datetimepk" ("date" datetime NOT NULL PRIMARY KEY)
+  -> schema error: primary key column `queries_datetimepk.date` cannot be `any`:
+     a key is memcmp-ordered, and ordering across types would mean inventing
+     whether 5 sorts before "a" — declare the column's real type
+```
+
+This is gap D9 (below) in its PRIMARY KEY form, and unlike the index form it has
+no honest workaround — changing a model's pk type changes the model. It is the
+FIRST blocker, not provably the only one.
+
+The 8 shim-only `backends` failures: `DDL inside a SAVEPOINT` 2, unknown
+function `date()` 1, `strftime('now')` 1, `REGEXP` needs a literal 1, and three
+introspection/PRAGMA behaviours — `PRAGMA synchronous` returns NO ROW where
+sqlite returns a value (`test_init_command` gets `TypeError: 'NoneType' object
+is not subscriptable`), and `PRAGMA foreign_keys` always reads 0, so Django's
+two `constraint_checks_enabled()` assertions fail.
+
+### Workbench adaptations — re-measured, not assumed
+
+Each adaptation is now an ABLATION SWITCH (`WB_NO_D2`/`WB_NO_D8`/`WB_NO_D9`),
+and each was removed in turn and measured, both arms, on the A labels. The stock
+arm was 831/831 in all four ablations — every cost below is the shim's.
+
+| Adaptation | Ablated result (shim) | Cost | Kept? |
+|---|---|---|---|
+| `data_types_suffix = {}` (D2, AUTOINCREMENT) | migrate dies, **0 of 831 run** | **all 831** | KEEP |
+| `_references_graph` (D8, `sqlite_master` recursive CTE) | G1 66 F + 123 E; shim-only failing tests 42 → 74 | **32 tests** | KEEP |
+| numeric-affinity index dropper (D9, new) | migrate dies at `django_session.expire_date`, **0 of 831 run** | **all 831** | KEEP |
+| `supports_foreign_keys = False` (D4b) | **bit-identical**: 392/42, 439/99, same skips; `backends` also bit-identical (5 F/19 E) | **nothing** | **DELETED** |
+
+**D2's cost reversed from run 2's finding, and that is the contamination in one
+number**: run 2 measured it as free precisely because migrate created nothing.
+On a clean database, `CREATE TABLE … AUTOINCREMENT` is the first statement
+Django issues and mpedb refuses it by name, so without the adaptation not one
+label gets a database.
+
+Adaptations after run 3: `data_types_suffix = {}` (D2), `_references_graph`
+(D8), and the D9 index dropper. Every other one is gone.
+
+### Deployment-blocking gaps: the new one
+
+| # | Gap | Status |
+|---|---|---|
+| **D9** | **an index or a PRIMARY KEY on a NUMERIC-affinity (`any`) column is refused** | **OPEN, and it is the cost of closing D3.** Letting Django's own declared types through made `date`/`datetime`/`time`/`decimal`/`uuid`/`json` all `ColumnType::Any`, and `mpedb-types/src/schema.rs` refuses `any` as any kind of key: index keys are memcmp-ordered and `any` has no order across storage classes, so an `IndexRange` over one returns wrong rows — and DELETE/UPDATE through it deletes them. The refusal is right; the gap is that a NUMERIC-affinity column has no orderable representation to index. Two faces: the INDEX form (adapted around, costs all 831 without the adaptation) and the PRIMARY KEY form (no workaround — it is what blocks `queries`). |
+
+Minimal repro:
+
+```sql
+CREATE TABLE s (id integer NOT NULL PRIMARY KEY, expire_date datetime NULL);
+CREATE INDEX ix ON s (expire_date);
+-- schema error: index column `s.expire_date` cannot be `any`: the index is
+-- memcmp-ordered and `any` has no order across types
+CREATE TABLE p (d datetime NOT NULL PRIMARY KEY);
+-- schema error: primary key column `p.d` cannot be `any`: a key is memcmp-ordered …
+```
+
+Refused for `date`, `datetime`, `time`, `decimal(10,2)`, `uuid`, `json`;
+accepted for `integer`, `bigint`, `smallint`, `integer unsigned`, `bool`,
+`varchar(100)`, `text`, `real`, `double precision`, `BLOB`, `char(32)`,
+`interval`.
+
+### Re-ranked MPEdb-only gaps (group A: 132 tests, 141 outcomes)
+
+Run-2 rank in brackets. The ranking inverted at the top: the affinity and
+scalar-function gaps that led it are largely closed, and the planner's subquery
+restrictions are now the single biggest item.
+
+| Rank | Tests | Gap | Minimal repro | Where |
+|---|---|---|---|---|
+| 1 [3] | **53** | **Subquery / derived-table restrictions**: JOIN inside a derived table 14, unlifted `IN` subquery 9, correlated subquery outside `WHERE` in an aggregate query 8, aliased/renamed column 7, GROUP BY/HAVING body 5, correlated `IN` ("rewrite as EXISTS") 4, subquery in `HAVING` 2, unsupported position 2, compound (`UNION`) body 1, `ORDER BY` body 1 | `SELECT * FROM (SELECT a.x FROM a JOIN b ON b.id = a.b_id) s` | `mpedb-sql` planner |
+| 2 [6] | **29** | **`LIKE … ESCAPE` (26) and `ORDER BY … NULLS FIRST/LAST` (3)** are not parsed | `SELECT 1 WHERE 'a%b' LIKE 'a\%b' ESCAPE '\'` | `mpedb-sql` parser |
+| 3 [1] | **18** | **Comparison/arithmetic affinity — the half of sqlite affinity `any` still lacks.** Storage now converts (v7); comparing and computing does not: `arithmetic … got any` 10, `cannot compare int64 with text` 3, `coalesce` mixes 3, `floor() … got any` 1, `IN` list 1 | `SELECT price + 1 FROM t` where `price decimal(10,2)` | `mpedb-sql` |
+| 4 [7] | **12** | **Rigid numeric parameter typing**: `$N is int64, requires float64` 8, the reverse 2, `cannot assign float64 to column of type int64` 2 | `SELECT * FROM t WHERE ratio = ?` bound with `1` | `mpedb-sql` |
+| 5 [8] | **5** | **Bitwise operators absent** (`\|`, `&`, `<<`, `>>`, `^`) | `SELECT 5 \| 2` | `mpedb-sql` tokenizer |
+| 6 [9] | **5** | **`REGEXP` requires a literal pattern**; Django always binds it | `SELECT 1 WHERE 'ab' REGEXP ?` | `mpedb-sql` |
+| 7 [4] | **3** | **`strftime('…','now')`** — the only surviving piece of the scalar-function gap | `SELECT strftime('%Y','now')` | `mpedb-sql` builtins |
+| 8 [13] | **2** | `INSERT values must be literals or parameters` | `INSERT INTO t (v) VALUES (1 + 1)` | `mpedb-sql` |
+| 9 [12] | **2** | **2-argument `MAX(a,b)` / `MIN(a,b)`** (sqlite's scalar form) | `SELECT max(1, 2)` | `mpedb-sql` |
+| 10 [14] | **1** | **PANIC in the binder**, surfaced as `internal error (panic) in engine` | `queries`-shaped reverse-relation transform (`test_filter_by_reverse_related_field_transform`) | `mpedb-sql` |
+| 11 | **2** | One-offs: `unknown column` 1, `expected parameter number after $` (an identifier containing `$`) 1 | — | `mpedb-sql` |
+
+Gone since run 2: host UDFs on the write path (47), the int↔bool bridge (39),
+`quote()` (40 statements), the `json()`-shaped CHECK compile failure, and the
+two `delete` FAILs run 2 attributed to signal-receiver contamination — they were
+downstream of a gap that has since closed, exactly as predicted.
+
+### Coverage
+
+* 10 of Django's 219 labels now: the frozen 9 (831 tests) plus `backends`
+  (324) — 1 155 tests measured, of which the shim passes **1 001**.
+* `queries` (493) remains unmeasured, blocked by D9's PRIMARY KEY form.
+* Still `--parallel=1`; no concurrency or multi-process behaviour measured.
