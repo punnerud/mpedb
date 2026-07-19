@@ -39,7 +39,7 @@ pub(super) fn exec_recursive_cte(
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut queue: Vec<Vec<Value>> = Vec::new();
     for row in anchor_rows {
-        if rc.union_all || seen.insert(keycode::encode_key(&row)) {
+        if rc.union_all || seen.insert(keycode::encode_group_key(&row, &[])) {
             queue.push(row.clone());
             result.push(row);
         }
@@ -72,7 +72,7 @@ pub(super) fn exec_recursive_cte(
         }
         let mut next: Vec<Vec<Value>> = Vec::new();
         for row in step_rows {
-            if rc.union_all || seen.insert(keycode::encode_key(&row)) {
+            if rc.union_all || seen.insert(keycode::encode_group_key(&row, &[])) {
                 next.push(row.clone());
                 result.push(row);
             }

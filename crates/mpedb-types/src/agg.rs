@@ -114,7 +114,11 @@ impl Accum {
         // affects count, sum and avg alike, and min/max not at all (they are
         // idempotent, which is why `min(DISTINCT x)` is legal but pointless).
         if let Some(seen) = &mut self.seen {
-            if !seen.insert(crate::keycode::encode_key(std::slice::from_ref(v))) {
+            // The GROUP key, not the on-disk key: `count(DISTINCT v)` over a
+            // typeless column holding `1, 1.0, '1'` is 2, because sqlite's
+            // dedup asks its comparison — integer 1 and real 1.0 are one value,
+            // the text `'1'` another (`keycode::encode_group_key`).
+            if !seen.insert(crate::keycode::encode_group_key(std::slice::from_ref(v), &[])) {
                 return Ok(());
             }
         }
