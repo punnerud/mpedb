@@ -16,10 +16,11 @@
 //! and will not silently downgrade it to the reuse-allowed behavior).
 
 use mpedb::{Config, Database, Error, ExecResult, Value};
-use std::io::Write;
 use std::ops::Deref;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -103,27 +104,7 @@ fn sqlite_state(setup: &[&str], query: &str) -> Vec<Vec<String>> {
     script.push_str(query);
     script.push_str(";\n");
 
-    let mut child = Command::new("sqlite3")
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the sqlite3 CLI (3.45) must be on PATH for this cross-check");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "sqlite3 failed on script:\n{script}\nstderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout)
-        .unwrap()
+    sqlite_oracle::script_stdout(&script, "")
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| l.split('|').map(str::to_string).collect())
@@ -252,23 +233,9 @@ fn duplicate_explicit_id_errors() {
     // sqlite agrees: the duplicate makes the script fail.
     let mut script = String::from("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT);\n");
     script.push_str("INSERT INTO t VALUES (5, 'a');\nINSERT INTO t VALUES (5, 'b');\n");
-    let mut child = Command::new("sqlite3")
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("sqlite3 CLI required");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
     assert!(
-        !out.status.success(),
-        "sqlite3 should reject the duplicate explicit id"
+        sqlite_oracle::try_script_stdout(&script, "").is_err(),
+        "sqlite should reject the duplicate explicit id"
     );
 }
 

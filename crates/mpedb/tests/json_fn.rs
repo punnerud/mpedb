@@ -13,24 +13,15 @@
 //! this file also pins what mpedb promises not to guess.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 const NULL_SENTINEL: &str = "<NULL>";
-
-fn sqlite_available() -> bool {
-    Command::new("sqlite3")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 
 fn mpedb_db() -> (Database, PathBuf) {
     let dir = if Path::new("/dev/shm").is_dir() {
@@ -126,27 +117,7 @@ fn sqlite_lines(queries: &[String]) -> Vec<String> {
         input.push_str(q);
         input.push_str(";\n");
     }
-    let mut child = Command::new("sqlite3")
-        .args(["-batch", "-noheader", "-nullvalue", NULL_SENTINEL, ":memory:"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn sqlite3");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write to sqlite3");
-    let out = child.wait_with_output().expect("wait sqlite3");
-    assert!(
-        out.status.success(),
-        "sqlite3 batch failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout)
-        .expect("utf8")
+    sqlite_oracle::script_stdout(&input, NULL_SENTINEL)
         .lines()
         .map(|l| l.to_string())
         .collect()
@@ -198,9 +169,6 @@ fn refuses(db: &Database, query: &str, needle: &str) {
 /// `1.50`, `1e3` stays `1e3`) — minifying is not re-rendering.
 #[test]
 fn json_valid_documents_match_sqlite() {
-    if !sqlite_available() {
-        return;
-    }
     let (db, path) = mpedb_db();
     let docs = [
         "null",
@@ -261,9 +229,6 @@ fn json_valid_documents_match_sqlite() {
 /// itself errors.
 #[test]
 fn json_malformed_matches_sqlite() {
-    if !sqlite_available() {
-        return;
-    }
     let (db, path) = mpedb_db();
     let bad = [
         "",
@@ -324,9 +289,6 @@ fn json_malformed_matches_sqlite() {
 /// (which would be a wrong answer, not a refusal — sqlite says 1 there).
 #[test]
 fn json_depth_bound() {
-    if !sqlite_available() {
-        return;
-    }
     let (db, path) = mpedb_db();
     let nest = |n: usize| format!("{}{}", "[".repeat(n), "]".repeat(n));
     let mut qs = Vec::new();
@@ -385,9 +347,6 @@ fn json5_is_refused_by_name() {
 
 #[test]
 fn json_valid_matches_sqlite() {
-    if !sqlite_available() {
-        return;
-    }
     let (db, path) = mpedb_db();
     let mut qs = q(&[
         "SELECT json_valid(NULL)",
@@ -435,9 +394,6 @@ const DOC: &str = r#"{"a":1,"b":"x","c":[1,2,3],"d":{"e":9},"f":null,"g":true,"h
 
 #[test]
 fn json_extract_matches_sqlite() {
-    if !sqlite_available() {
-        return;
-    }
     let (db, path) = mpedb_db();
     let paths = [
         "$",
@@ -543,9 +499,6 @@ fn json_extract_matches_sqlite() {
 /// `'a.b'` means `$."a.b"`, NOT `$.a.b`), and `[…]` is rooted at `$`.
 #[test]
 fn json_arrow_path_sugar_matches_sqlite() {
-    if !sqlite_available() {
-        return;
-    }
     let (db, path) = mpedb_db();
     let qs = q(&[
         "SELECT '[1,2,3]' -> 0",
@@ -631,9 +584,6 @@ fn json_bad_paths_are_errors() {
 
 #[test]
 fn json_type_and_array_length_match_sqlite() {
-    if !sqlite_available() {
-        return;
-    }
     let (db, path) = mpedb_db();
     let mut qs = Vec::new();
     for p in [
@@ -672,9 +622,6 @@ fn json_type_and_array_length_match_sqlite() {
 
 #[test]
 fn json_quote_matches_sqlite() {
-    if !sqlite_available() {
-        return;
-    }
     let (db, path) = mpedb_db();
     let mut qs = q(&[
         "SELECT json_quote(1)",
@@ -736,9 +683,6 @@ fn json_quote_matches_sqlite() {
 
 #[test]
 fn json_array_and_object_match_sqlite() {
-    if !sqlite_available() {
-        return;
-    }
     let (db, path) = mpedb_db();
     let qs = q(&[
         "SELECT json_array()",
@@ -773,9 +717,6 @@ fn json_array_and_object_match_sqlite() {
 
 #[test]
 fn json_writers_match_sqlite() {
-    if !sqlite_available() {
-        return;
-    }
     let (db, path) = mpedb_db();
     let qs = q(&[
         // set / insert / replace, over both objects and arrays.
@@ -1005,9 +946,6 @@ primary_key = ["id"]
 /// only kind of JSON bug that is invisible.
 #[test]
 fn generated_reader_sweep_matches_sqlite() {
-    if !sqlite_available() {
-        return;
-    }
     let (db, path) = mpedb_db();
     let docs = [
         r#"{"a":1,"b":[1,2],"c":{"d":null},"e":"s","f":true,"g":1.5}"#,
@@ -1057,9 +995,6 @@ fn generated_reader_sweep_matches_sqlite() {
 /// value side.
 #[test]
 fn generated_writer_sweep_matches_sqlite() {
-    if !sqlite_available() {
-        return;
-    }
     let (db, path) = mpedb_db();
     let docs = [
         r#"{"a":1,"b":[1,2],"c":{"d":null}}"#,
@@ -1109,9 +1044,6 @@ fn generated_writer_sweep_matches_sqlite() {
 /// the test that is allowed to find one.
 #[test]
 fn randomized_document_sweep_matches_sqlite() {
-    if !sqlite_available() {
-        return;
-    }
     let (db, path) = mpedb_db();
 
     struct Rng(u64);

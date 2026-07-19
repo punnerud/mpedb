@@ -12,10 +12,11 @@
 //! than a silent wrong answer.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::io::Write;
 use std::ops::Deref;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -101,27 +102,8 @@ fn mpedb_out(db: &Database, sql: &str) -> (Vec<String>, Vec<Vec<String>>) {
 /// sqlite 3.45: `(column names, rows-as-strings)` for one query, via the CLI in
 /// list mode with headers on. First output line is the header row.
 fn sqlite_out(query: &str) -> (Vec<String>, Vec<Vec<String>>) {
-    let script = format!(".headers on\n.mode list\n{query};\n");
-    let mut child = Command::new("sqlite3")
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the sqlite3 CLI (3.45) must be on PATH for this cross-check");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "sqlite3 failed on `{query}`: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8(out.stdout).unwrap();
+    let script = format!("{query};\n");
+    let stdout = sqlite_oracle::script_stdout_headers(&script, "");
     let mut lines = stdout.lines();
     let header = lines
         .next()

@@ -1,4 +1,5 @@
-//! Differential testing vs /usr/bin/sqlite3 (STRICT tables) and, three-way,
+//! Differential testing vs the BUNDLED sqlite (rusqlite `bundled`, pinned in
+//! Cargo.toml — no `sqlite3` binary involved; STRICT tables) and, three-way,
 //! vs a throwaway PostgreSQL 16 cluster. Any divergence fails the test with
 //! the seed and a minimized reproduction program.
 //!

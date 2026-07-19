@@ -17,10 +17,11 @@
 //! autocommit implicit transaction), so the transaction body is what differs.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::io::Write;
 use std::ops::Deref;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -85,25 +86,11 @@ fn render(v: &Value) -> String {
     }
 }
 
-/// Feed a full script to the `sqlite3` CLI and capture stdout lines, IGNORING a
-/// non-zero exit (the CLI continues after a per-statement error but exits 1).
+/// Feed a full script to the bundled sqlite and capture its rows, CONTINUING
+/// past per-statement errors (the CLI's default batch behaviour, whose
+/// non-zero exit the old subprocess version ignored).
 fn sqlite_capture(script: &str) -> Vec<Vec<String>> {
-    let mut child = Command::new("sqlite3")
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the sqlite3 CLI (3.45) must be on PATH for this cross-check");
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    String::from_utf8(out.stdout)
-        .unwrap()
+    sqlite_oracle::script_stdout_lenient(script, "")
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| l.split('|').map(str::to_string).collect())
@@ -342,16 +329,8 @@ fn unknown_savepoint_is_an_error_matching_sqlite() {
     let script = format!(
         "{SQLITE_DDL}BEGIN;\nSAVEPOINT a;\nROLLBACK TO nope;\n"
     );
-    let mut child = Command::new("sqlite3")
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
-    let out = child.wait_with_output().unwrap();
-    let err = String::from_utf8_lossy(&out.stderr);
+    let err = sqlite_oracle::try_script_stdout(&script, "")
+        .expect_err("sqlite must reject the unknown savepoint name");
     assert!(
         err.contains("no such savepoint: nope"),
         "sqlite should also reject the unknown name, got `{err}`"
