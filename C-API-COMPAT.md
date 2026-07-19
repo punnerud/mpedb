@@ -959,3 +959,212 @@ silent divergence the triage surfaced next to them.
 **Net: 0 of the 8 were both small and clearly correct to fix inside
 `mpedb-capi`.** Four are `mpedb-sql`/engine work owned elsewhere; the remaining
 two would require the shim to promise behaviour mpedb does not have.
+
+---
+
+## Django's own test suite — run 4 (2026-07-19)
+
+Run 4 scores everything that landed after run 3: subqueries in UPDATE/DELETE
+WHERE + correlated `IN` + the correlated per-row aggregate positions, typeless
+(`any`) PRIMARY KEY / index keys, the #74 tail batch (the lossless int↔float
+parameter bridge, bitwise operators, bound REGEXP, scalar `max(a,b)`/
+`min(a,b)`, the binder-panic fix), `typeof()`'s five-storage-class contract,
+and the JSON function set flipping `supports_json_field` ON. Same Django
+(`5.2.17.dev20260714173342`, commit `3e389b7`), same CPython 3.12.3, same
+stock libsqlite3 3.45.1, `--parallel=1`; **both arms re-measured**, as every
+run since run 1's fake baseline demands. Four separate measurements (A–D),
+never one headline number.
+
+### ⚠️ One WRONG ANSWER (W3, open) — REGEXP silently matches nothing outside mpedb's dialect
+
+Bound REGEXP (#74 item 3) turned run 3's clean refusal into a **silent wrong
+answer** for every pattern outside mpedb's regexp dialect. Two Django tests
+FAIL on it (`lookup.tests.LookupTests.test_regex`,
+`test_regex_backreferencing`) — the only 2 FAILs among run 4's 1 648 measured
+tests; every other failing outcome is an ERROR (refusal).
+
+```python
+con.create_function("regexp", 2, lambda p, s: bool(re.search(p, s)))  # as Django does
+c.execute("CREATE TABLE a (id integer NOT NULL PRIMARY KEY, h text NOT NULL)")
+c.execute("INSERT INTO a VALUES (1, 'hey-Foo'), (2, 'barfoobaz')")
+c.execute("SELECT h FROM a WHERE h REGEXP ?", ("(?i)fo+",))   # stock [('hey-Foo',)]   mpedb []  WRONG
+c.execute("SELECT h FROM a WHERE h REGEXP ?", (r"b(.).*b\1",)) # stock [('barfoobaz',)] mpedb []  WRONG
+```
+
+Two roots, both engine-side (`mpedb-types/src/expr/ops.rs::regexp_match`),
+recorded not fixed:
+
+1. **The intercept.** In real sqlite, `x REGEXP y` has NO built-in meaning —
+   it is pure sugar for the consumer's registered `regexp(y, x)` UDF (Python's
+   `re.search` under Django). mpedb's engine evaluates REGEXP with its own
+   hand-rolled Thompson-NFA dialect and never calls the host UDF the consumer
+   registered, so every semantic difference between the two is a silent
+   divergence. Django's `__iregex` prepends `(?i)` to EVERY pattern, so the
+   whole iregex lookup family answers `[]`.
+2. **The malformed-pattern policy.** `regexp_match` documents "a pattern this
+   engine cannot compile matches NOTHING, and mpedb never errors on a REGEXP
+   pattern". For genuinely malformed patterns that is a defensible GLOB-like
+   choice, but `(?i)…` and `\1` are VALID patterns in the consumer's regexp
+   implementation — compile-failure-as-false converts an unsupported construct
+   into a wrong answer instead of a refusal. Run 3 never saw it because the
+   pattern had to be a literal and Django always binds; the moment binding
+   worked, the tests reached the dialect edge.
+
+The honest fix is dispatch: when the consumer has registered a `regexp` host
+UDF, `REGEXP` must call it (that is sqlite's contract); mpedb's own dialect is
+only defensible when no UDF exists — and even then, a pattern using a
+construct the dialect knows it does not support should refuse by name, not
+answer `[]`. Until then W3 also poisons the D8 ablation (below): Django's
+`_references_graph` pattern starts with `(?i)`, so an ablated D8 would
+"work" only by silently computing an empty recursive arm — the same answer the
+adaptation returns, for the wrong reason.
+
+**Nothing else diverges.** The differential probe
+(`djsuite/probe_answers.py`, extended with every run-4 surface: typeless-key
+ordering across storage classes under a real index, subquery lifts, bitwise,
+scalar max/min, the parameter bridge, the JSON set, `typeof()`) answers
+byte-identically to stock on every line where both arms answer; the remaining
+diffs are refusals and their documented cascades.
+
+### Workbench changes made before measuring
+
+* **D9 DELETED** (the NUMERIC-affinity index dropper and its
+  `WB_SOFT_CREATE_INDEX` lever): an `any` column may now be a PRIMARY KEY /
+  index key. Verified directly through the shim before the runs: `CREATE INDEX
+  ix ON s (expire_date)` and `CREATE TABLE p (d datetime NOT NULL PRIMARY
+  KEY)` both succeed, and the full suite below ran with Django's own indexes
+  actually created. Run 3's D9 gap is CLOSED, both faces.
+* **D4b actually deleted**: run 3 measured `supports_foreign_keys = False` as
+  bit-identical and recorded it deleted, but the `backends`-triage merge
+  (`f7d65fe`) took the triage branch's `base.py` wholesale and resurrected it.
+  Run 4's numbers are with Django's own feature flag (True). Consequence in
+  `backends`: 4 FK-violation tests now SELF-skip under the shim ("This backend
+  does not support integrity checks.") because mpedb parses and discards
+  `REFERENCES` — Django's own graceful degradation reporting a real recorded
+  gap, in the arm where it is true.
+* Ablation switches restored for the two survivors: `WB_NO_D2`, `WB_NO_D8`.
+
+`supports_json_field` needed no workbench change at all: Django probes with
+`SELECT JSON('{"a": "b"}')` inside `transaction.atomic`, and the shim answers
+it — the feature flipped ON by itself, in both arms.
+
+### A — comparability: the SAME 9 labels, 831 tests
+
+| | stock 3.45.1 | mpedb shim run 3 | mpedb shim run 4 |
+|---|---|---|---|
+| G1 `basic lookup transactions ordering update delete` | 392 ran, 0 failed | 392 ran, 42 failed | **392 ran, 29 failed** (2 F / 27 E) |
+| G2 `aggregation annotations expressions` | 439 ran, 0 failed | 439 ran, 99 failed | **439 ran, 65 failed** (0 F / 65 E) |
+| **total** | **831/831 (100 %)** | 690/831 (83.0 %) | **737/831 (88.7 %)** |
+| delta vs run 3 | — | — | **+47** |
+
+Skip parity is now exact (G1 17/17, G2 5/5, expected-failures 1/1), so no
+adjustment applies — run 3's two flattering skips (the JSONField pair) now RUN
+under the shim and are scored inside the failure counts. The 94 failing
+outcomes cover 87 unique tests; 92 outcomes are ERRORs, 2 are the W3 FAILs.
+
+**Which gaps closed, by test movement (run-3 rank → run-4 weight):**
+
+| Run-3 gap (weight) | Run-4 weight | Verdict |
+|---|---|---|
+| 1. Subquery / derived-table restrictions (53) | **32** | PARTIALLY CLOSED (−21): UPDATE/DELETE WHERE subqueries, correlated `IN`, and correlated per-row aggregate positions all landed. What remains is the named derived-table blockers (aliased/renamed column + JOIN/GROUP BY/DISTINCT combinations, 27) and subquery-position refusals (HAVING 2, compound body 1, grouped-correlation 1, other 1). |
+| 2. `LIKE … ESCAPE` not parsed (26) + `NULLS FIRST/LAST` (3) | **27 + 0** | ESCAPE now PARSES and `NULLS FIRST/LAST` is GONE (its 3 tests pass) — but the LIKE pattern must be a LITERAL, and Django always binds it, so the same tests now die one stage later: `LIKE pattern must be a literal in Phase 1`. The new rank 1. |
+| 3. Comparison/arithmetic affinity (18) | **13** | Slightly closed; still the `any` comparison half: `cannot compare int64 with text` 6, `coalesce`/`CASE` mixes 4, `arithmetic … (binder should have coerced)` 1, `floor() got any` 1, `IN` list 1. |
+| 4. Rigid numeric parameter typing (12) | **4** | LARGELY CLOSED by the lossless bridge (#74 item 1). Left: float64 param where int64 required (not exactly integral) 2, float→int column assignment 2. |
+| 5. Bitwise operators (5) | **0** | CLOSED. |
+| 6. REGEXP requires a literal (5) | **2 W3 FAILs + 2** | The literal restriction is gone — and its refusal became W3's wrong answer (above). The 2 remaining ERRORs are `REGEXP requires text, got int64` (Django's `test_regex_non_string` binds an int pattern; sqlite+Python str()s it). |
+| 7. `strftime('now')` (3) | **3** | Unchanged, refused BY DESIGN. |
+| 8. INSERT values must be literals (2) | **2** | Unchanged. |
+| 9. Scalar `MAX(a,b)`/`MIN(a,b)` (2) | **0** | CLOSED. |
+| 10. Binder PANIC (1) | **0** | CLOSED (`dcdd896`). |
+| 11. One-offs (2) | **2** | Unchanged (`unknown column` 1, identifier containing `$` 1). |
+| NEW: JSONField CASE mix | **1** | `test_update_jsonfield_case_when_key_is_null` now RUNS (was gated) and refuses: `cannot mix CASE result types: text and any`. |
+| NEW: affinity population growth | +1 | `DecimalFieldLookupTests` reach further than run 3, growing bucket 3. |
+
+### B — `queries` (493): FIRST EVER RUN
+
+| | stock 3.45.1 | mpedb shim |
+|---|---|---|
+| `queries` | 493 ran, 0 failed (15 skips, 2 xfail) | **493 ran, 34 failed (0 F / 34 E)** — 459/493 (93.1 %) |
+
+**The D9 PRIMARY-KEY wall is gone**: `migrate` creates all 95 models including
+`queries_datetimepk` (`datetime NOT NULL PRIMARY KEY`), with real indexes, and
+93 % of the label passes on first contact. All 34 outcomes (29 unique tests)
+are refusals; zero FAILs. The buckets, all `mpedb-sql`:
+
+| Tests | Gap | Minimal repro |
+|---|---|---|
+| 13 | **Compound (UNION/EXCEPT/INTERSECT) placement**: compound body in a derived table 6, correlated reference from inside a compound subquery arm (`no table named V0 in this statement`) 3, compound arms typed `any` vs `text` 2, subquery inside a compound SELECT 2 | `SELECT COUNT(*) FROM (SELECT id FROM a UNION SELECT id FROM b) u` |
+| 6 (1 test) | **`EXPLAIN QUERY PLAN` is not a statement** | `EXPLAIN QUERY PLAN SELECT 1` → `expected a statement` |
+| 5 | Derived-table aliased/renamed-column blockers (same family as A rank 2) | — |
+| 4 | **`LIMIT -1`** (sqlite's "no limit" idiom; Django emits it for `qs[5:]`) | `SELECT * FROM t LIMIT -1 OFFSET 5` → `LIMIT requires a non-negative integer literal` |
+| 3 | INSERT VALUES with an expression (`STRFTIME(…, 'NOW')` default) | `INSERT INTO t (created) VALUES (STRFTIME('%Y-%m-%d %H:%M:%f', 'NOW'))` |
+| 1 | CASE result into a bool column: `column X is bool, value is int64` | `UPDATE i SET alive = CASE WHEN id = ? THEN ? … ELSE alive END` binding True |
+| 1 | LIKE bound pattern (rank-1 family) | — |
+| 1 | `arithmetic on int64 and float64 (binder should have coerced)` | `…WHERE ptr_id IN (SELECT … WHERE F(x) % 1000000 …)` (`test_ticket_23605`) |
+
+### C — `backends` (324)
+
+| | stock 3.45.1 | mpedb shim run 3 | mpedb shim run 4 |
+|---|---|---|---|
+| `backends` | 324 ran, 5 failed → **319/324** (unchanged) | 13 failed → 311/324 | **12 failed → 312/324** (5 shared + **7 shim-only**) |
+
+`test_regexp_function` closed (bound REGEXP — its pattern is inside mpedb's
+dialect, so it answers correctly). The 7 remaining shim-only failures are
+run 3's list unchanged: DDL inside a SAVEPOINT 2, `date()` unknown 1,
+`strftime('now')` 1, D10 `PRAGMA synchronous` 1, D11 `PRAGMA foreign_keys` 2.
+Skips: 128 vs stock's 124 — the 4 extra are the FK self-skips described above,
+Django reporting mpedb's real no-FK-enforcement gap in the honest direction.
+
+### D — JSONField: `supports_json_field` is ON
+
+Django's own probe (`SELECT JSON('{"a": "b"}')` in a transaction) succeeds
+through the shim, so the feature is True in BOTH arms with no workbench
+involvement. What that changed, measured:
+
+* Both gated models (`annotations.JsonModel`, `expressions.JSONFieldModel`)
+  are now CREATED during migrate, with Django's own
+  `CHECK ((JSON_VALID("data") OR "data" IS NULL))` compiled and enforced —
+  the G2 label group ran all 439 tests with them present, and G2's failure
+  count still FELL 99 → 65. The run-2 prediction ("a trap worth 439 tests")
+  stayed defused at run 4 scale.
+* The two tests run 3 could only SKIP now run:
+  `test_values_expression_alias_sql_injection_json_field` **passes**;
+  `test_update_jsonfield_case_when_key_is_null` errors on a non-JSON gap
+  (`cannot mix CASE result types: text and any` — A's bucket 3).
+* Skip parity with stock is exact (5/5), so nothing is flattered.
+
+### Workbench adaptations — re-measured, not assumed
+
+| Adaptation | Ablated result (shim) | Cost | Kept? |
+|---|---|---|---|
+| `data_types_suffix = {}` (D2, AUTOINCREMENT) | `WB_NO_D2`: migrate dies at the FIRST `CREATE TABLE`, 0 tests run | **all 831** | KEEP |
+| `_references_graph` (D8, `sqlite_master` recursive CTE) | `WB_NO_D8`: G1 68 F + 108 E (vs 29 outcomes), G2 unchanged; stock arm still 831/831. Driving error: `this sqlite_master query form is not supported by the mpedb C-API shim` ×80 — the shim's `sqlite_master` mini-evaluator refuses Django's exact CTE shape, and every TransactionTestCase teardown then cascades | **~147 outcomes in G1** | KEEP — and it is DOUBLY pinned: even if the mini-evaluator learned the shape, W3 would silently empty the `(?i)…` REGEXP recursive arm and return the seed table alone. Fix W3 first, then re-ablate. |
+| D9 index dropper + `WB_SOFT_CREATE_INDEX` | removed for the whole run; migrate succeeds with real indexes everywhere (A, B, C) | **0** | **DELETED** |
+| `supports_foreign_keys = False` (D4b) | removed for the whole run; only visible change is 4 honest self-skips in `backends` | **0** | **DELETED** (again, this time in the file) |
+
+### Re-ranked MPEdb-only gaps (A+B: 116 tests, 128 outcomes)
+
+| Rank | Tests | Gap | Minimal repro | Where |
+|---|---|---|---|---|
+| 0 | 2 | **W3 — REGEXP wrong answer** (top of this section) | `h REGEXP ?` bound `(?i)fo+` → `[]` | `mpedb-types` `expr/ops.rs` + host-UDF dispatch |
+| 1 | 28 | **LIKE pattern must be a literal** (ESCAPE now parses; Django binds every pattern) | `name LIKE ? ESCAPE '\'` bound `('A\_b',)` | `mpedb-sql` (same lift bound REGEXP got) |
+| 2 | 32 | **Derived-table / subquery-position restrictions** (each blocker named by `check_simple`) | `SELECT s.x FROM (SELECT a.x AS x FROM a JOIN b ON b.id = a.b_id GROUP BY a.x) s` | `mpedb-sql` planner |
+| 3 | 13 | **Compound (UNION/INTERSECT/EXCEPT) placement**: in a derived table, in a correlated subquery (scoping: `no table named V0`), arm-type `any`/`text` unification, subquery inside a compound | `SELECT COUNT(*) FROM (SELECT id FROM a UNION SELECT id FROM b) u` | `mpedb-sql` |
+| 4 | 14 | **Affinity comparison/arithmetic half** (incl. the `coalesce`/`CASE` mixes and both `binder should have coerced` internal-inconsistency errors) | `SELECT price + 1 FROM t` (`price decimal(10,2)`) | `mpedb-sql` |
+| 5 | 6 (1 test) | **`EXPLAIN QUERY PLAN`** not a statement | `EXPLAIN QUERY PLAN SELECT 1` | `mpedb-sql` parser |
+| 6 | 5 | **INSERT VALUES with expressions** | `INSERT INTO t (v) VALUES (STRFTIME('%Y', '2020-01-01'))` | `mpedb-sql` |
+| 7 | 4 | **`LIMIT -1`** (sqlite's no-limit idiom) | `SELECT * FROM t LIMIT -1 OFFSET 5` | `mpedb-sql` parser |
+| 8 | 4 | **Residual param strictness**: non-integral float64 → int64 refusals | `WHERE int_col > ?` bound `1.5` | `mpedb-sql` |
+| 9 | 4 | `strftime('now')` 3 (BY DESIGN) + `date()` family (`backends`) | `SELECT date('now')` | `mpedb-sql` builtins |
+| 10 | 3 | `REGEXP requires text, got int64` 2 + CASE-into-bool-column 1 | `h REGEXP ?` bound `123` | `mpedb-sql` |
+| 11 | 4 | One-offs: `unknown column` 1, `$` in identifier 1, JSONField CASE mix 1, DDL-in-SAVEPOINT (`backends`) 2 | — | engine / `mpedb-sql` |
+
+### Coverage
+
+* 11 of Django's 219 labels: the frozen 9 (831) + `backends` (324) +
+  `queries` (493) = **1 648 tests measured, shim passes 1 508**
+  (A 737 + B 459 + C 312, the same per-section arithmetic run 3 used) —
+  91.5 %, vs run 3's 1 001/1 155 (86.7 %) over 493 fewer tests.
+* Zero wrong answers is VIOLATED for the first time since W1/W2: W3's two
+  FAILs, introduced by #74 item 3. Everything else refuses.
+* Still `--parallel=1`; no concurrency or multi-process behaviour measured.
