@@ -464,6 +464,45 @@ fn encode_window(w: &WindowSpec, buf: &mut Vec<u8>) {
         p.encode_into(buf);
         buf.push(*desc as u8);
     }
+    encode_opt_frame(w.frame.as_ref(), buf);
+}
+
+/// An optional explicit frame (format 36): a presence byte, then — when present
+/// — a mode byte and two boundaries. Mirror of `decode_opt_frame`. `None` (the
+/// default frame) is a single `0` byte, so every pre-frame window shape encodes
+/// exactly as before plus that terminator.
+fn encode_opt_frame(frame: Option<&Frame>, buf: &mut Vec<u8>) {
+    match frame {
+        None => buf.push(0),
+        Some(f) => {
+            buf.push(1);
+            buf.push(match f.mode {
+                FrameMode::Rows => 1,
+                FrameMode::Range => 2,
+                FrameMode::Groups => 3,
+            });
+            encode_frame_bound(f.start, buf);
+            encode_frame_bound(f.end, buf);
+        }
+    }
+}
+
+/// One boundary: a tag byte, plus a trailing u64 offset for `Preceding`/
+/// `Following`. Mirror of `decode_frame_bound`.
+fn encode_frame_bound(b: FrameBound, buf: &mut Vec<u8>) {
+    match b {
+        FrameBound::UnboundedPreceding => buf.push(1),
+        FrameBound::Preceding(n) => {
+            buf.push(2);
+            buf.extend_from_slice(&n.to_le_bytes());
+        }
+        FrameBound::CurrentRow => buf.push(3),
+        FrameBound::Following(n) => {
+            buf.push(4);
+            buf.extend_from_slice(&n.to_le_bytes());
+        }
+        FrameBound::UnboundedFollowing => buf.push(5),
+    }
 }
 
 fn encode_stmt_rest(stmt: &PlanStmt, buf: &mut Vec<u8>) {

@@ -12,7 +12,10 @@
 //! entry point can reach it.
 
 use super::{Parser, ParamStyle, MAX_EXPR_DEPTH, MAX_ORDER_BY_ITEMS, MAX_PARSER_STACK};
-use crate::ast::{BinOp, Expr, SelectStmt, SubqueryBody, UnOp, WindowFunc, WindowSpecAst};
+use crate::ast::{
+    BinOp, Expr, FrameAst, FrameBound, FrameMode, SelectStmt, SubqueryBody, UnOp, WindowFunc,
+    WindowSpecAst,
+};
 use crate::token::{Kw, Tok};
 use mpedb_types::{Error, Result, Value};
 
@@ -679,10 +682,11 @@ impl<'a> Parser<'a> {
         self.window_spec()
     }
 
-    /// `( [PARTITION BY <expr>, …] [ORDER BY <expr> [ASC|DESC], …] )`. Stage 1
-    /// has no explicit frame — a `ROWS`/`RANGE`/`GROUPS` keyword here is a clean
-    /// refusal. `PARTITION` is a positional word (not reserved), so a column of
-    /// that name still works; the `ORDER`/`BY`/`ASC`/`DESC` keywords are reused.
+    /// `( [PARTITION BY <expr>, …] [ORDER BY <expr> [ASC|DESC], …] [frame] )`.
+    /// `PARTITION` is a positional word (not reserved), so a column of that name
+    /// still works; the `ORDER`/`BY`/`ASC`/`DESC` keywords are reused. A trailing
+    /// `ROWS`/`RANGE`/`GROUPS` clause is parsed as an explicit frame
+    /// ([`Self::window_frame`]); its semantics are validated by the planner.
     fn window_spec(&mut self) -> Result<WindowSpecAst> {
         self.expect(&Tok::LParen, "`(` after OVER")?;
         let mut partition_by = Vec::new();
@@ -723,21 +727,86 @@ impl<'a> Parser<'a> {
                 }
             }
         }
-        if matches!(self.peek(), Some(Tok::Ident(w))
-            if w.eq_ignore_ascii_case("ROWS")
-                || w.eq_ignore_ascii_case("RANGE")
-                || w.eq_ignore_ascii_case("GROUPS"))
-        {
-            return Err(self.err_here(
-                "explicit window frames are not supported yet (window stage 2) — \
-                 only the default frame is available",
-            ));
-        }
+        let frame = self.window_frame()?;
         self.expect(&Tok::RParen, "`)` closing the window spec")?;
         Ok(WindowSpecAst {
             partition_by,
             order_by,
+            frame,
         })
+    }
+
+    /// An optional explicit frame: `{ROWS | RANGE | GROUPS} ( <start-bound> |
+    /// BETWEEN <start-bound> AND <end-bound> )`. `ROWS`/`RANGE`/`GROUPS`,
+    /// `BETWEEN`'s bound words (`UNBOUNDED`/`PRECEDING`/`CURRENT`/`ROW`/
+    /// `FOLLOWING`) are all positional words (not reserved), so columns of those
+    /// names still work outside an OVER clause. The shorthand `{…} <start>`
+    /// desugars to `BETWEEN <start> AND CURRENT ROW`. Boundary legality (a start
+    /// that isn't UNBOUNDED FOLLOWING, an end that isn't UNBOUNDED PRECEDING, and
+    /// start ≤ end) is enforced by the planner, so its message names the exact
+    /// problem uniformly.
+    fn window_frame(&mut self) -> Result<Option<FrameAst>> {
+        let mode = if self.eat_word("ROWS") {
+            FrameMode::Rows
+        } else if self.eat_word("RANGE") {
+            FrameMode::Range
+        } else if self.eat_word("GROUPS") {
+            FrameMode::Groups
+        } else {
+            return Ok(None);
+        };
+        let (start, end) = if self.eat_kw(Kw::Between) {
+            let start = self.frame_bound()?;
+            self.expect_kw(Kw::And, "AND in a BETWEEN frame")?;
+            let end = self.frame_bound()?;
+            (start, end)
+        } else {
+            // Shorthand: `{ROWS|RANGE|GROUPS} <start>` ≡ `BETWEEN <start> AND
+            // CURRENT ROW`.
+            (self.frame_bound()?, FrameBound::CurrentRow)
+        };
+        Ok(Some(FrameAst { mode, start, end }))
+    }
+
+    /// One frame boundary: `UNBOUNDED PRECEDING`, `<N> PRECEDING`, `CURRENT ROW`,
+    /// `<N> FOLLOWING`, or `UNBOUNDED FOLLOWING`. `<N>` is a non-negative integer
+    /// literal (a non-constant or non-integer offset is refused, since the
+    /// content-hashed plan bakes it in — a per-row/parameter offset would be
+    /// version-brittle).
+    fn frame_bound(&mut self) -> Result<FrameBound> {
+        if self.eat_word("UNBOUNDED") {
+            if self.eat_word("PRECEDING") {
+                return Ok(FrameBound::UnboundedPreceding);
+            }
+            if self.eat_word("FOLLOWING") {
+                return Ok(FrameBound::UnboundedFollowing);
+            }
+            return Err(self.err_here("expected PRECEDING or FOLLOWING after UNBOUNDED"));
+        }
+        if self.eat_word("CURRENT") {
+            if self.eat_word("ROW") {
+                return Ok(FrameBound::CurrentRow);
+            }
+            return Err(self.err_here("expected ROW after CURRENT"));
+        }
+        // `<N> PRECEDING | FOLLOWING`. Only a bare non-negative integer literal is
+        // accepted; a negative sign, a parameter, or any expression is a clean
+        // parse error here (the offset must be a constant baked into the plan).
+        if let Some(&Tok::Int(n)) = self.peek() {
+            self.pos += 1;
+            let n = n as u64; // Tok::Int is always ≥ 0 (a sign is a separate token)
+            if self.eat_word("PRECEDING") {
+                return Ok(FrameBound::Preceding(n));
+            }
+            if self.eat_word("FOLLOWING") {
+                return Ok(FrameBound::Following(n));
+            }
+            return Err(self.err_here("expected PRECEDING or FOLLOWING after a frame offset"));
+        }
+        Err(self.err_here(
+            "expected a frame boundary (UNBOUNDED PRECEDING, <N> PRECEDING, CURRENT ROW, \
+             <N> FOLLOWING, or UNBOUNDED FOLLOWING)",
+        ))
     }
 
 

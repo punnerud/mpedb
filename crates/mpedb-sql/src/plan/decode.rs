@@ -808,6 +808,14 @@ fn decode_window(buf: &[u8], pos: &mut usize) -> Result<WindowSpec> {
         };
         order_by.push((program, desc));
     }
+    let frame = decode_opt_frame(buf, pos)?;
+    // The frame's structural legality (which functions accept one, boundary
+    // ordering, RANGE-offset refusal, the ORDER BY requirement) is exactly the
+    // planner's rule set, applied here so a hostile blob cannot smuggle a shape
+    // `prepare` would never emit.
+    if let Some(f) = &frame {
+        f.check(func, !order_by.is_empty()).map_err(corrupt)?;
+    }
     Ok(WindowSpec {
         func,
         arg,
@@ -815,6 +823,40 @@ fn decode_window(buf: &[u8], pos: &mut usize) -> Result<WindowSpec> {
         partition_by,
         order_by,
         default,
+        frame,
+    })
+}
+
+/// One optional explicit frame — the exact mirror of `encode_opt_frame`. A `0`
+/// presence byte is the default frame; `1` is followed by a mode byte and two
+/// boundaries. Unknown mode/boundary tags are `Corrupt` (a closed enum).
+fn decode_opt_frame(buf: &[u8], pos: &mut usize) -> Result<Option<Frame>> {
+    match r_u8(buf, pos)? {
+        0 => Ok(None),
+        1 => {
+            let mode = match r_u8(buf, pos)? {
+                1 => FrameMode::Rows,
+                2 => FrameMode::Range,
+                3 => FrameMode::Groups,
+                t => return Err(corrupt(format!("bad window frame mode {t}"))),
+            };
+            let start = decode_frame_bound(buf, pos)?;
+            let end = decode_frame_bound(buf, pos)?;
+            Ok(Some(Frame { mode, start, end }))
+        }
+        t => Err(corrupt(format!("bad window frame presence tag {t}"))),
+    }
+}
+
+/// One frame boundary — the mirror of `encode_frame_bound`.
+fn decode_frame_bound(buf: &[u8], pos: &mut usize) -> Result<FrameBound> {
+    Ok(match r_u8(buf, pos)? {
+        1 => FrameBound::UnboundedPreceding,
+        2 => FrameBound::Preceding(r_u64(buf, pos)?),
+        3 => FrameBound::CurrentRow,
+        4 => FrameBound::Following(r_u64(buf, pos)?),
+        5 => FrameBound::UnboundedFollowing,
+        t => return Err(corrupt(format!("bad window frame boundary tag {t}"))),
     })
 }
 

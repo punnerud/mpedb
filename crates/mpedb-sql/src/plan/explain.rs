@@ -355,6 +355,12 @@ impl CompiledPlan {
                             .collect();
                         spec.push_str(&format!("ORDER BY {}", os.join(", ")));
                     }
+                    if let Some(f) = &w.frame {
+                        if !spec.is_empty() {
+                            spec.push(' ');
+                        }
+                        spec.push_str(&render_frame(f));
+                    }
                     out.push_str(&format!("  window __w{k}: {fname} OVER ({spec})\n"));
                 }
                 let cols: Vec<String> = projection
@@ -708,6 +714,25 @@ fn render_fts_query(q: &FtsQuery) -> String {
         FtsQuery::Or(a, b) => format!("({} OR {})", render_fts_query(a), render_fts_query(b)),
         FtsQuery::AndNot(a, b) => format!("({} NOT {})", render_fts_query(a), render_fts_query(b)),
     }
+}
+
+/// Render an explicit window frame, e.g. `ROWS BETWEEN 1 PRECEDING AND CURRENT
+/// ROW`. Always the `BETWEEN … AND …` long form (the shorthand is desugared away
+/// at parse time).
+fn render_frame(f: &Frame) -> String {
+    let unit = match f.mode {
+        FrameMode::Rows => "ROWS",
+        FrameMode::Range => "RANGE",
+        FrameMode::Groups => "GROUPS",
+    };
+    let bound = |b: FrameBound| match b {
+        FrameBound::UnboundedPreceding => "UNBOUNDED PRECEDING".to_string(),
+        FrameBound::Preceding(n) => format!("{n} PRECEDING"),
+        FrameBound::CurrentRow => "CURRENT ROW".to_string(),
+        FrameBound::Following(n) => format!("{n} FOLLOWING"),
+        FrameBound::UnboundedFollowing => "UNBOUNDED FOLLOWING".to_string(),
+    };
+    format!("{unit} BETWEEN {} AND {}", bound(f.start), bound(f.end))
 }
 
 // ---- expression decompiler (for EXPLAIN and projection names) -------------
