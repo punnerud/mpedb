@@ -11,10 +11,12 @@
 //! compares the COUNT multiset (representative-free) and the ORDER BY / DISTINCT
 //! cases add a stable `id` tiebreak.
 //!
-//! What is DEFERRED (refused cleanly, never a wrong answer): a collated
-//! UNIQUE/index/PRIMARY KEY — mpedb keys are memcmp-ordered and collated on-disk
-//! keys are not built yet. Those refusals are mpedb-only (sqlite accepts them),
-//! so they are asserted directly, not differentially.
+//! A collated UNIQUE / secondary index / PRIMARY KEY is now SUPPORTED: the engine
+//! folds each value under the column's collation before it enters the keycode
+//! tree, so `'Alice'` and `'ALICE'` share one on-disk key — a NOCASE UNIQUE
+//! rejects the case-variant duplicate exactly as sqlite does, and a NOCASE probe
+//! finds it. Those cases are verified differentially too. What stays refused: an
+//! unknown collation name, and a non-BINARY collation on a non-text column.
 
 use mpedb::{Config, Database, ExecResult, Value};
 use std::io::Write;
@@ -285,41 +287,169 @@ fn alter_add_column_collate_matches_sqlite() {
     assert_eq!(got, want, "ALTER ADD COLUMN COLLATE NOCASE mismatch");
 }
 
-/// The DEFERRED half: a collated UNIQUE / index / PRIMARY KEY is refused cleanly
-/// (mpedb keys are memcmp-ordered; collated on-disk keys are not built yet). Each
-/// refusal names COLLATE so the gap is visible, never a wrong uniqueness answer.
+/// Open a fresh mpedb (seed table only) and run `stmts` in order, returning the
+/// rows of the LAST statement — or the first error as `Err`, so a constraint
+/// violation is observable and comparable to sqlite's.
+fn run_mpedb(stmts: &[&str]) -> Result<Vec<Vec<String>>, String> {
+    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let path = format!(
+        "{dir}/mpedb-collate-idx-{}-{}.mpedb",
+        std::process::id(),
+        UNIQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let _ = std::fs::remove_file(&path);
+    struct G(String);
+    impl Drop for G {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_file(&self.0);
+            let _ = std::fs::remove_file(format!("{}-wal", self.0));
+        }
+    }
+    let _g = G(path.clone());
+    let toml = format!(
+        "[database]\npath = \"{path}\"\nsize_mb = 16\nmax_readers = 8\n\n\
+         [[table]]\nname = \"seed\"\nprimary_key = [\"id\"]\n\
+         [[table.column]]\nname = \"id\"\ntype = \"int64\"\n"
+    );
+    let db = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    let mut last = Vec::new();
+    for s in stmts {
+        match db.query(s, &[]) {
+            Ok(ExecResult::Rows { rows, .. }) => {
+                last = rows
+                    .into_iter()
+                    .map(|r| r.into_iter().map(render).collect())
+                    .collect();
+            }
+            Ok(_) => last = Vec::new(),
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    Ok(last)
+}
+
+/// The same script through the sqlite3 CLI: `Ok(rows)` on success, `Err` if any
+/// statement failed (so a UNIQUE / PK violation surfaces as `Err`, like mpedb).
+fn run_sqlite(stmts: &[&str]) -> Result<Vec<Vec<String>>, String> {
+    let mut script = String::from(".bail on\n");
+    for s in stmts {
+        script.push_str(s);
+        script.push_str(";\n");
+    }
+    let mut child = Command::new("sqlite3")
+        .arg(":memory:")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("sqlite3 CLI (3.45) required");
+    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    if !out.status.success() {
+        return Err(String::from_utf8_lossy(&out.stderr).to_string());
+    }
+    Ok(String::from_utf8(out.stdout)
+        .unwrap()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split('|').map(str::to_string).collect())
+        .collect())
+}
+
+/// Assert mpedb and sqlite AGREE on `stmts` — same rows on success, and both
+/// error on a constraint violation (the category must match; error text need
+/// not). This is the collated-index contract: fold-into-the-key must reject a
+/// case-variant duplicate and resolve a case-variant probe exactly as sqlite.
+fn agree(stmts: &[&str]) {
+    let m = run_mpedb(stmts);
+    let s = run_sqlite(stmts);
+    match (&m, &s) {
+        (Ok(mr), Ok(sr)) => assert_eq!(mr, sr, "row mismatch on {stmts:?}"),
+        (Err(_), Err(_)) => {}
+        _ => panic!("outcome category differs on {stmts:?}\n  mpedb={m:?}\n  sqlite={s:?}"),
+    }
+}
+
+/// A collated UNIQUE / secondary index / PRIMARY KEY now builds folded on-disk
+/// keys — verified to behave exactly like sqlite: case-variant duplicates are
+/// rejected, case-variant probes resolve, and ordering collapses the classes.
 #[test]
-fn collated_unique_and_index_refused_cleanly() {
-    let d = db(); // has table `t` with a NOCASE `name`
+fn collated_unique_index_pk_match_sqlite() {
+    // NOCASE UNIQUE: 'ALICE' is a duplicate of 'Alice' → both engines reject.
+    agree(&[
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE UNIQUE)",
+        "INSERT INTO a VALUES (1, 'Alice')",
+        "INSERT INTO a VALUES (2, 'ALICE')",
+        "SELECT id FROM a ORDER BY id",
+    ]);
+    // NOCASE UNIQUE, non-conflicting inserts + a case-variant equality probe.
+    agree(&[
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE UNIQUE)",
+        "INSERT INTO a VALUES (1, 'Alice')",
+        "INSERT INTO a VALUES (2, 'Bob')",
+        "SELECT id FROM a WHERE s = 'aLiCe'",
+    ]);
+    // Table-level UNIQUE over a NOCASE column.
+    agree(&[
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE, UNIQUE (s))",
+        "INSERT INTO b VALUES (1, 'x')",
+        "INSERT INTO b VALUES (2, 'X')",
+        "SELECT id FROM b ORDER BY id",
+    ]);
+    // NOCASE PRIMARY KEY: 'BOB' duplicates 'Bob'.
+    agree(&[
+        "CREATE TABLE c (s TEXT COLLATE NOCASE PRIMARY KEY)",
+        "INSERT INTO c VALUES ('Bob')",
+        "INSERT INTO c VALUES ('BOB')",
+        "SELECT s FROM c",
+    ]);
+    // A NOCASE PK point-lookup resolves the case-variant.
+    agree(&[
+        "CREATE TABLE c (s TEXT COLLATE NOCASE PRIMARY KEY)",
+        "INSERT INTO c VALUES ('Bob')",
+        "INSERT INTO c VALUES ('carol')",
+        "SELECT s FROM c WHERE s = 'BOB'",
+    ]);
+    // CREATE INDEX on a NOCASE column, then a case-variant equality lookup and
+    // an ordering that collapses case.
+    agree(&[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE)",
+        "INSERT INTO t VALUES (1,'Alice'),(2,'alice'),(3,'Bob'),(4,'ALICE')",
+        "CREATE INDEX ix ON t (name)",
+        "SELECT id FROM t WHERE name = 'ALICE' ORDER BY id",
+    ]);
+    // RTRIM UNIQUE: 'x ' duplicates 'x'.
+    agree(&[
+        "CREATE TABLE r (id INTEGER PRIMARY KEY, s TEXT COLLATE RTRIM UNIQUE)",
+        "INSERT INTO r VALUES (1, 'x')",
+        "INSERT INTO r VALUES (2, 'x  ')",
+        "SELECT id FROM r ORDER BY id",
+    ]);
+    // Updating a NOCASE-unique value to a case-variant of ITSELF is a no-op for
+    // the index (no phantom self-conflict), so the UPDATE succeeds in both.
+    agree(&[
+        "CREATE TABLE u (id INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE UNIQUE)",
+        "INSERT INTO u VALUES (1, 'Bob')",
+        "UPDATE u SET s = 'bob' WHERE id = 1",
+        "SELECT id, s FROM u",
+    ]);
+}
+
+/// Still refused (mpedb-only, sqlite accepts the first but we don't): an unknown
+/// collation name, and a non-BINARY collation on a non-text column.
+#[test]
+fn unsupported_collation_forms_refused() {
     let err = |sql: &str| -> String {
-        match d.query(sql, &[]) {
+        match run_mpedb(&[sql, "SELECT 1"]) {
             Ok(_) => panic!("expected `{sql}` to be refused, but it succeeded"),
-            Err(e) => e.to_string(),
+            Err(e) => e,
         }
     };
-
-    // Inline UNIQUE on a NOCASE column.
-    let e = err("CREATE TABLE a (id INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE UNIQUE)");
-    assert!(e.to_uppercase().contains("COLLATE"), "collated UNIQUE refusal: {e}");
-    // Table-level UNIQUE over a NOCASE column.
-    let e = err("CREATE TABLE b (id INTEGER PRIMARY KEY, s TEXT COLLATE NOCASE, UNIQUE (s))");
-    assert!(e.to_uppercase().contains("COLLATE"), "collated table UNIQUE refusal: {e}");
-    // A NOCASE PRIMARY KEY.
-    let e = err("CREATE TABLE c (s TEXT COLLATE NOCASE PRIMARY KEY)");
-    assert!(e.to_uppercase().contains("COLLATE"), "collated PK refusal: {e}");
-    // CREATE INDEX on an existing NOCASE column.
-    let e = err("CREATE INDEX ix ON t (name)");
-    assert!(e.to_uppercase().contains("COLLATE"), "collated CREATE INDEX refusal: {e}");
-
-    // An unknown collation name is a clean error, not a silent BINARY.
     let e = err("CREATE TABLE d (id INTEGER PRIMARY KEY, s TEXT COLLATE NOSUCH)");
     assert!(
         e.to_lowercase().contains("collation") || e.to_uppercase().contains("COLLATE"),
         "unknown collation refusal: {e}"
     );
-
-    // A non-BINARY collation on a non-text column is refused (collation is a
-    // text-only notion), matching a clean-refusal policy.
     let e = err("CREATE TABLE e (id INTEGER PRIMARY KEY, n INTEGER COLLATE NOCASE)");
     assert!(
         e.to_lowercase().contains("text") || e.to_uppercase().contains("COLLATE"),

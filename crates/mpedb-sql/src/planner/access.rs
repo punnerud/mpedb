@@ -108,11 +108,19 @@ pub(super) fn extract_access(
         }
     }
 
+    // A collated key column NEVER feeds a raw keycode BOUND: the executor builds
+    // range bounds bytewise (no fold), so a bound over folded on-disk keys could
+    // skip a matching row. Equality still works via the value-based Point paths
+    // above (the engine folds those); only <, >, BETWEEN, and the multi-col-PK
+    // equality-as-point-range fall through here — and for a collated column they
+    // must stay a residual filter (`sql_cmp` honors the collation) over a scan.
+    let collated = |col: u16| table.columns[col as usize].collation != Collation::Binary;
+
     // 3. Range over the first PK column.
     let first_pk = table.primary_key[0];
     let mut lo = None;
     let mut hi = None;
-    if table.primary_key.len() > 1 {
+    if table.primary_key.len() > 1 && !collated(first_pk) {
         // Equality on the first PK column of a multi-column PK when full
         // pinning failed: inclusive point-range lo = hi.
         if let Some((i, _, atom)) = find(&consumed, first_pk, &[BinOp::Eq]) {
@@ -126,7 +134,7 @@ pub(super) fn extract_access(
             hi = Some(bound);
         }
     }
-    if lo.is_none() && hi.is_none() {
+    if lo.is_none() && hi.is_none() && !collated(first_pk) {
         if let Some((i, op, atom)) = find(&consumed, first_pk, &[BinOp::Gt, BinOp::Ge]) {
             consumed[i] = true;
             lo = Some(KeyBound {
@@ -162,6 +170,9 @@ pub(super) fn extract_access(
         let col = ix.columns[0];
         if table.columns[col as usize].ty == ColumnType::Any {
             continue; // no order across types — see the equality guard
+        }
+        if collated(col) {
+            continue; // collated column: never a raw range bound (see above)
         }
         let mut lo = None;
         let mut hi = None;
