@@ -38,8 +38,11 @@ def load(path):
 
 
 def main():
+    # The cdylib's suffix is platform-specific: .so on Linux, .dylib on macOS.
+    # Hardcoding .so made this test unable to find the library on an M3 at all.
+    suffix = "dylib" if sys.platform == "darwin" else "so"
     default = os.path.join(os.path.dirname(__file__), "..", "..", "..",
-                           "target", "debug", "libmpedb_sqlite3.so")
+                           "target", "debug", f"libmpedb_sqlite3.{suffix}")
     path = sys.argv[1] if len(sys.argv) > 1 else os.path.abspath(default)
     lib = load(path)
     print("libversion:", lib.sqlite3_libversion().decode())
