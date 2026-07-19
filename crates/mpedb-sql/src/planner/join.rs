@@ -29,61 +29,126 @@ use super::select::{describe_key, distinct_order_by, ordinal};
 /// unless its POLICY pins a key, and the inner is re-scanned per outer row —
 /// O(n·m). Correct, and slow enough that EXPLAIN says so.
 #[allow(clippy::too_many_arguments)]
-/// `A RIGHT JOIN B ON c` is `B LEFT JOIN A ON c` — with one catch the swap
-/// alone gets wrong: the OUTPUT still lists A's columns first. So a bare
-/// `SELECT *` is pinned to the original column order as explicit qualified
-/// items BEFORE the sides swap. Only the two-table form rewrites; a chain
-/// would need the right side as a subtree, which left-deep plans cannot
-/// express (the refusal says the manual fix).
+/// `A RIGHT JOIN B ON c` is `B LEFT JOIN A ON c` — the two describe the SAME
+/// row set (each B row survives; an unmatched B pairs with a NULL-extended A),
+/// so the swap turns a preserved-right join into the left-deep LEFT the planner
+/// and executor already speak. The catch the swap alone gets wrong is column
+/// order: the OUTPUT still lists A's columns first, so a bare `SELECT *` is
+/// pinned to the original order as explicit qualified items BEFORE the swap.
+///
+/// This generalizes to a CHAIN as long as the RIGHT join is the FIRST one:
+/// `A RIGHT JOIN B ON c  [INNER|LEFT JOIN C …]` rewrites to
+/// `B LEFT JOIN A ON c   [INNER|LEFT JOIN C …]`. Because `(A RIGHT JOIN B)` and
+/// `(B LEFT JOIN A)` are the same row set, every INNER/LEFT join that FOLLOWS
+/// applies to identical input — the whole chain stays semantically equal, only
+/// the first two tables trade places (and the pinned `SELECT *` order undoes
+/// that for the output). B becomes the new outer, A its first LEFT-joined inner,
+/// and the trailing joins ride along unchanged (they name tables by alias, which
+/// the reorder leaves resolvable).
+///
+/// What still can't be expressed left-deep — and is REFUSED (never answered
+/// wrong), with the message pointing at the manual LEFT-JOIN rewrite:
+///   - a RIGHT that is NOT first: `(… ⋈ …) RIGHT JOIN X` needs the accumulated
+///     left side as a join SUBTREE on X's preserved side, which a left-deep
+///     chain has no shape for;
+///   - a SECOND RIGHT (it would be non-first after the swap); and
+///   - any FULL inside a chain (both sides whole — `plan_join_select` refuses).
 pub(super) fn rewrite_right_join<'s>(
     s: &ast::SelectStmt,
     schema: &'s Schema,
     cte: Option<CteRef<'s>>,
 ) -> Result<Option<ast::SelectStmt>> {
-    if !s.joins.iter().any(|j| j.kind == ast::JoinKind::Right) {
+    let Some(first_right) = s.joins.iter().position(|j| j.kind == ast::JoinKind::Right) else {
         return Ok(None);
-    }
-    if s.joins.len() != 1 {
+    };
+    // Only a LEADING RIGHT can be swapped into a left-deep LEFT chain: the swap
+    // has to make the RIGHT's own table the new outer, and that is only sound
+    // when nothing has accumulated to its left yet.
+    if first_right != 0 {
         return Err(bind_err(
-            "RIGHT JOIN in a multi-join chain is not supported — swap the tables \
-             and write LEFT JOIN",
+            "RIGHT JOIN in a multi-join chain is only supported as the FIRST join \
+             — for a RIGHT that follows another join, swap the tables and write \
+             LEFT JOIN",
         ));
     }
-    let j = &s.joins[0];
+    // The joins that FOLLOW the leading RIGHT must be plain INNER/LEFT with an
+    // explicit ON: a second RIGHT would be non-first after the swap, and FULL
+    // needs both sides whole. A trailing USING/NATURAL join is refused too — the
+    // swap moves the original outer from the leftmost position to second, so a
+    // USING column present in BOTH swapped tables would change which side is the
+    // coalesce representative (sqlite itself calls that "ambiguous"); refusing
+    // sidesteps the whole class rather than risk a shifted binding.
+    for j in &s.joins[1..] {
+        match j.kind {
+            ast::JoinKind::Inner | ast::JoinKind::Left => {}
+            ast::JoinKind::Right => {
+                return Err(bind_err(
+                    "a second RIGHT JOIN in a multi-join chain is not supported — \
+                     swap the tables and write LEFT JOIN",
+                ))
+            }
+            ast::JoinKind::Full => {
+                return Err(bind_err(
+                    "FULL JOIN in a multi-join chain is not supported — it needs \
+                     both sides whole, which a left-deep chain cannot give it",
+                ))
+            }
+        }
+        if j.natural || !j.using.is_empty() {
+            return Err(bind_err(
+                "USING / NATURAL is not supported on a join that follows a leading \
+                 RIGHT JOIN — write the ON condition explicitly",
+            ));
+        }
+    }
+
+    let j0 = &s.joins[0];
     // Join paths are unreachable without a FROM — the parser cannot build a
     // join clause on a FROM-less statement.
     let s_table = s.table.as_deref().expect("join on a FROM-less SELECT");
+    // `SELECT *` pins the ORIGINAL table order (outer, then each join table in
+    // written order) as explicit qualified items, so the swap does not surface
+    // the new outer's columns first. No join here carries USING/NATURAL (the
+    // leading RIGHT is parser-refused USING, the trailing joins refused above),
+    // so there is nothing to coalesce — every column shows once, in order.
     let items = match &s.items {
         Some(items) => Some(items.clone()),
         None => {
-            let (_, lt) = resolve_table_cte(schema, cte, s_table)?;
-            let (_, rt) = resolve_table_cte(schema, cte, &j.table)?;
-            let lname = s.alias.clone().unwrap_or_else(|| s_table.to_string());
-            let rname = j.alias.clone().unwrap_or_else(|| j.table.clone());
-            let mut items = Vec::with_capacity(lt.columns.len() + rt.columns.len());
-            for c in &lt.columns {
-                items.push((ast::Expr::Qualified(lname.clone(), c.name.clone()), None));
+            let outer_name = s.alias.clone().unwrap_or_else(|| s_table.to_string());
+            let (_, ot) = resolve_table_cte(schema, cte, s_table)?;
+            let mut items: Vec<(ast::Expr, Option<String>)> = Vec::new();
+            for c in &ot.columns {
+                items.push((ast::Expr::Qualified(outer_name.clone(), c.name.clone()), None));
             }
-            for c in &rt.columns {
-                items.push((ast::Expr::Qualified(rname.clone(), c.name.clone()), None));
+            for j in &s.joins {
+                let (_, jt) = resolve_table_cte(schema, cte, &j.table)?;
+                let jname = j.alias.clone().unwrap_or_else(|| j.table.clone());
+                for c in &jt.columns {
+                    items.push((ast::Expr::Qualified(jname.clone(), c.name.clone()), None));
+                }
             }
             Some(items)
         }
     };
+    // Swapped chain: the leading RIGHT's table (`j0`) is the new outer, the
+    // original outer becomes its first LEFT join, and the rest ride unchanged.
+    let mut joins = Vec::with_capacity(s.joins.len());
+    joins.push(ast::JoinClause {
+        table: s_table.to_string(),
+        alias: s.alias.clone(),
+        kind: ast::JoinKind::Left,
+        on: j0.on.clone(),
+        // RIGHT JOIN USING / NATURAL RIGHT are refused in the parser, so
+        // `j0.using` is empty here; the swapped LEFT join carries a plain ON.
+        using: Vec::new(),
+        natural: false,
+    });
+    joins.extend(s.joins[1..].iter().cloned());
     Ok(Some(ast::SelectStmt {
-        table: Some(j.table.clone()),
+        table: Some(j0.table.clone()),
         from_derived: None,
-        alias: j.alias.clone(),
-        joins: vec![ast::JoinClause {
-            table: s_table.to_string(),
-            alias: s.alias.clone(),
-            kind: ast::JoinKind::Left,
-            on: j.on.clone(),
-            // RIGHT JOIN USING / NATURAL RIGHT are refused in the parser, so
-            // `j.using` is empty here; the swapped LEFT join carries a plain ON.
-            using: Vec::new(),
-            natural: false,
-        }],
+        alias: j0.alias.clone(),
+        joins,
         distinct: s.distinct,
         items,
         where_clause: s.where_clause.clone(),
@@ -203,8 +268,10 @@ pub(super) fn plan_join_select<'s>(
         let kind = match jc.kind {
             ast::JoinKind::Inner => JoinKind::Inner,
             ast::JoinKind::Left => JoinKind::Left,
-            // RIGHT was rewritten to a swapped LEFT before planning; one
-            // still here is a RIGHT the rewrite cannot express as left-deep.
+            // Every RIGHT was resolved by `rewrite_right_join` before planning:
+            // a leading one became a swapped LEFT, a non-leading one was already
+            // refused. Reaching here would be a planner bug, but keep the clean
+            // refusal as defense rather than a panic.
             ast::JoinKind::Right => {
                 return Err(bind_err(
                     "RIGHT JOIN in a multi-join chain is not supported — swap the \
