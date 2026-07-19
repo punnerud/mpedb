@@ -164,6 +164,10 @@ impl<'e> WriteTxn<'e> {
     }
 
     pub(super) fn set_tree_root(&mut self, table_id: u32, index_no: u32, root: u64, count: u64) {
+        // `& 63`: deliberate mod-64 fold, unchanged by the sparse-footprint work
+        // (DESIGN-TABLE-CAP §5). A given table always folds to the same bit, so
+        // a real conflict is never missed; aliasing only ever costs an extra
+        // optimistic re-validation.
         self.written_tables |= 1u64 << (table_id & 63);
         self.table_roots.insert((table_id, index_no), (root, count));
     }
@@ -1097,7 +1101,7 @@ impl<'e> WriteTxn<'e> {
         // 6. Clear any capture/blocked bits for the id (harmless if unset — a
         //    dead id is never written again — but keeps the control record
         //    clean and bumps the generation for per-process caches).
-        let mut cfg = self.capture_config()?;
+        let mut cfg = self.capture_config()?.clone();
         if cfg.is_captured(table_id) || cfg.is_blocked(table_id) {
             cfg.set_captured(table_id, false);
             cfg.set_blocked(table_id, false);
@@ -1439,16 +1443,21 @@ impl<'e> WriteTxn<'e> {
 
     /// Lazily read and cache the `cdc\0tabs` control record (default empty when
     /// absent). Enablement is set in a separate txn, so it is stable for ours.
-    fn capture_config(&mut self) -> Result<CaptureConfig> {
-        if let Some(c) = self.capture_cfg {
-            return Ok(c);
+    /// Fill the cache, then hand back a BORROW. `CaptureConfig` holds sparse
+    /// `TableSet`s rather than two `u128`s, so it is no longer `Copy` — and
+    /// this is on the per-ROW write path (`check_write_blocked`,
+    /// `capture_dirty`), so returning by value would allocate per row. Callers
+    /// take the borrow, extract a `bool`, and drop it before touching `self`
+    /// again.
+    fn capture_config(&mut self) -> Result<&CaptureConfig> {
+        if self.capture_cfg.is_none() {
+            let c = match self.sys_get(cdc::CDC_TABS_KEY)? {
+                Some(bytes) => CaptureConfig::decode(&bytes)?,
+                None => CaptureConfig::default(),
+            };
+            self.capture_cfg = Some(c);
         }
-        let c = match self.sys_get(cdc::CDC_TABS_KEY)? {
-            Some(bytes) => CaptureConfig::decode(&bytes)?,
-            None => CaptureConfig::default(),
-        };
-        self.capture_cfg = Some(c);
-        Ok(c)
+        Ok(self.capture_cfg.as_ref().expect("just filled"))
     }
 
     /// Refuse a mutation targeting a write-blocked (frozen) table. Checked from
@@ -1474,8 +1483,7 @@ impl<'e> WriteTxn<'e> {
         if !self.capture_enabled {
             return Ok(());
         }
-        let cfg = self.capture_config()?;
-        if !cfg.is_captured(table_id) {
+        if !self.capture_config()?.is_captured(table_id) {
             return Ok(());
         }
         let entry = DirtyEntry {

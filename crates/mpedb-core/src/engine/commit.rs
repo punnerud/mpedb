@@ -245,8 +245,9 @@ impl<'e> WriteTxn<'e> {
         // validator never sees a spurious gap for a same-mode committer.
         if self.eng.concurrency == Concurrency::Optimistic {
             use crate::shm::{OFP_KIND_EMPTY, OFP_KIND_POINT, OFP_KIND_TABLE};
-            // The OFP ring stays a `u64` table bitmap: with MAX_TABLES = 128 the
-            // `& 63` fold aliases tables mod 64 (e.g. 0 and 64 share a bit). This
+            // The OFP ring stays a `u64` table bitmap even though footprints are
+            // now sparse (DESIGN-TABLE-CAP §5): the `& 63` fold aliases tables
+            // mod 64 (e.g. 0, 64 and 4096 share a bit). This
             // is SOUND — two writers of the *same* table always fold to the same
             // bit, so a real conflict is never missed; only distinct aliased
             // tables see a false conflict, costing an extra optimistic

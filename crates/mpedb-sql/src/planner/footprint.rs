@@ -30,37 +30,43 @@ fn access_key_and_indexes(a: &AccessPath) -> (KeyAccess, u64) {
     }
 }
 
+/// Range/existence check on a table id before it enters a [`TableSet`].
+///
+/// This replaces the two `1u128 << id` closures the bitmap form needed (each of
+/// which had to guard the shift against overflow — `#93` shipped two UNGUARDED
+/// ones that would have dropped high bits). A sparse set cannot lose a table to
+/// a shift, so the only remaining job is rejecting an id that names no table,
+/// which is a plan-corruption signal, not an arithmetic one.
+fn checked_table(id: u32, schema: &Schema) -> Result<u32> {
+    if schema.table(id).is_none() || id as usize >= mpedb_types::MAX_TABLES {
+        return Err(Error::Corrupt(format!("table id {id} out of range")));
+    }
+    Ok(id)
+}
+
 /// The footprint of ONE select — shared between a top-level SELECT and each
 /// compound arm.
 fn select_footprint(sp: &SelectPlan, schema: &Schema) -> Result<Footprint> {
-    let table_bit = |id: u32| -> Result<u128> {
-        if schema.table(id).is_none() || id as usize >= mpedb_types::MAX_TABLES {
-            return Err(Error::Corrupt(format!("table id {id} out of range")));
-        }
-        Ok(1u128 << id)
-    };
     let SelectPlan { table, access, joins, .. } = sp;
     Ok({
         let (key_access, mut indexes_used) = access_key_and_indexes(access);
-        // ONE BIT PER TABLE READ. A join that claimed only the outer would
-        // under-claim `tables_read`, and `conflicts_with` is a bitmap AND —
-        // so a writer to the inner table would not be seen to conflict with
+        // ONE ENTRY PER TABLE READ. A join that claimed only the outer would
+        // under-claim `tables_read`, and `conflicts_with` is a set intersection
+        // — so a writer to the inner table would not be seen to conflict with
         // this reader, and the commit path would group them as independent.
-        // FROM-less (DUAL sentinel): no table read, no bit set — the plan
-        // conflicts with nothing, which is exactly true. `table_bit` would
+        // FROM-less (DUAL sentinel): no table read, empty set — the plan
+        // conflicts with nothing, which is exactly true. `checked_table` would
         // rightly reject u32::MAX as out of range. The recursive-CTE working
         // table (CTE_TABLE) is likewise not a catalog table: it lives in memory
         // and reads no real page, so it sets no bit either.
-        let mut tables_read =
-            if *table == crate::plan::DUAL_TABLE || *table == crate::plan::CTE_TABLE {
-                0
-            } else {
-                table_bit(*table)?
-            };
+        let mut tables_read = TableSet::new();
+        if *table != crate::plan::DUAL_TABLE && *table != crate::plan::CTE_TABLE {
+            tables_read.insert(checked_table(*table, schema)?);
+        }
         let mut key_access = key_access;
         for j in joins {
             if j.table != crate::plan::CTE_TABLE {
-                tables_read |= table_bit(j.table)?;
+                tables_read.insert(checked_table(j.table, schema)?);
             }
             let (jkey, jidx) = access_key_and_indexes(&j.access);
             indexes_used |= jidx;
@@ -75,7 +81,7 @@ fn select_footprint(sp: &SelectPlan, schema: &Schema) -> Result<Footprint> {
         }
         Footprint {
             tables_read,
-            tables_written: 0,
+            tables_written: TableSet::new(),
             indexes_used,
             key_access,
             read_only: true,
@@ -115,7 +121,7 @@ fn union_subplan_reads(s: &SubPlan, schema: &Schema, fp: &mut Footprint) -> Resu
     };
     for arm in arms {
         let sf = select_footprint(arm, schema)?;
-        fp.tables_read |= sf.tables_read;
+        fp.tables_read.union_with(&sf.tables_read);
         fp.indexes_used |= sf.indexes_used;
     }
     for c in &s.subplans {
@@ -125,12 +131,6 @@ fn union_subplan_reads(s: &SubPlan, schema: &Schema, fp: &mut Footprint) -> Resu
 }
 
 fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint> {
-    let table_bit = |id: u32| -> Result<u128> {
-        if schema.table(id).is_none() || id as usize >= mpedb_types::MAX_TABLES {
-            return Err(Error::Corrupt(format!("table id {id} out of range")));
-        }
-        Ok(1u128 << id)
-    };
     let all_secondary_bits = |t: &TableDef| -> Result<u64> {
         let n = secondary_indexes(t).len();
         if n > 63 {
@@ -150,16 +150,16 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
         // per-STATEMENT and names ONE key space — with several arms Full is
         // the only honest claim (same argument as the join case below).
         PlanStmt::Compound(c) => {
-            let mut tables_read = 0u128;
+            let mut tables_read = TableSet::new();
             let mut indexes_used = 0u64;
             for arm in &c.arms {
                 let f = select_footprint(arm, schema)?;
-                tables_read |= f.tables_read;
+                tables_read.union_with(&f.tables_read);
                 indexes_used |= f.indexes_used;
             }
             Footprint {
                 tables_read,
-                tables_written: 0,
+                tables_written: TableSet::new(),
                 indexes_used,
                 key_access: KeyAccess::Full,
                 read_only: true,
@@ -170,16 +170,16 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
         // `select_footprint` skips CTE_TABLE). Read-only, several key spaces ⇒
         // Full, exactly like a compound.
         PlanStmt::RecursiveCte(rc) => {
-            let mut tables_read = 0u128;
+            let mut tables_read = TableSet::new();
             let mut indexes_used = 0u64;
             for sp in [&rc.anchor, &rc.recursive, &rc.outer] {
                 let f = select_footprint(sp, schema)?;
-                tables_read |= f.tables_read;
+                tables_read.union_with(&f.tables_read);
                 indexes_used |= f.indexes_used;
             }
             Footprint {
                 tables_read,
-                tables_written: 0,
+                tables_written: TableSet::new(),
                 indexes_used,
                 key_access: KeyAccess::Full,
                 read_only: true,
@@ -208,16 +208,18 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
             };
             // INSERT … SELECT reads its source table(s); record them so
             // optimistic-concurrency validation and RLS stamping see the reads.
-            let mut tables_read = 0u128;
+            let mut tables_read = TableSet::new();
             if let Some(sel) = from_select {
-                tables_read |= table_bit(sel.plan.table)?;
+                tables_read.insert(checked_table(sel.plan.table, schema)?);
                 for j in &sel.plan.joins {
-                    tables_read |= table_bit(j.table)?;
+                    tables_read.insert(checked_table(j.table, schema)?);
                 }
             }
+            let mut tables_written = TableSet::new();
+            tables_written.insert(checked_table(*table, schema)?);
             Footprint {
                 tables_read,
-                tables_written: table_bit(*table)?,
+                tables_written,
                 // All unique indexes are maintained by an insert.
                 indexes_used: all_secondary_bits(t)?,
                 key_access,
@@ -247,10 +249,10 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
                     }
                 }
             }
-            let bit = table_bit(*table)?;
+            let one: TableSet = [checked_table(*table, schema)?].into_iter().collect();
             Footprint {
-                tables_read: bit,
-                tables_written: bit,
+                tables_read: one.clone(),
+                tables_written: one,
                 indexes_used,
                 key_access,
                 read_only: false,
@@ -261,10 +263,10 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
                 .table(*table)
                 .ok_or_else(|| Error::Corrupt("table id out of range".into()))?;
             let (key_access, indexes_used) = access_key_and_indexes(access);
-            let bit = table_bit(*table)?;
+            let one: TableSet = [checked_table(*table, schema)?].into_iter().collect();
             Footprint {
-                tables_read: bit,
-                tables_written: bit,
+                tables_read: one.clone(),
+                tables_written: one,
                 // A delete unlinks the row from every index.
                 indexes_used: indexes_used | all_secondary_bits(t)?,
                 key_access,
@@ -280,8 +282,8 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
         | PlanStmt::Savepoint(_)
         | PlanStmt::Release(_)
         | PlanStmt::RollbackTo(_) => Footprint {
-            tables_read: 0,
-            tables_written: 0,
+            tables_read: TableSet::new(),
+            tables_written: TableSet::new(),
             indexes_used: 0,
             key_access: KeyAccess::Full,
             read_only: true,

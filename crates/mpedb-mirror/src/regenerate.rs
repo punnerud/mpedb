@@ -139,7 +139,7 @@ pub fn regenerate(db_path: &Path, size_bytes: u64) -> Result<RegenReport> {
             .sys_record_get("cdc", b"tabs")?
             .ok_or_else(|| Error::Unsupported("not a mirror (no cdc/tabs)".into()))?;
         let mut cap = CaptureConfig::decode(&cap)?;
-        cap.blocked = cap.captured; // born frozen; unfrozen after the swap
+        cap.blocked = cap.captured.clone(); // born frozen; unfrozen after the swap
         cap.generation = cap.generation.wrapping_add(1);
         s.sys_record_put("cdc", b"tabs", &cap.encode())?;
 

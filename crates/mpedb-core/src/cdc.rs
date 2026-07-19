@@ -17,7 +17,7 @@
 //! construction: a second touch of the same PK hashes to the same key and
 //! upserts the entry.
 
-use mpedb_types::{Error, Result, MAX_TABLES};
+use mpedb_types::{Error, Result, TableSet};
 
 /// Sys subkey of the CDC control record.
 pub const CDC_TABS_KEY: &[u8] = b"cdc\0tabs";
@@ -27,78 +27,93 @@ pub const CDC_DIRTY_PREFIX: &[u8] = b"cdc\0d/";
 /// `/` is 0x2f, so 0x30 is the first subkey past every `cdc\0d/…` entry.
 pub const CDC_DIRTY_PREFIX_END: &[u8] = b"cdc\0d0";
 
-/// The CDC control record (`cdc\0tabs`). Table ids are 0..[`MAX_TABLES`](mpedb_types::MAX_TABLES)
-/// (< 128), so membership is a `u128` bitmap.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// The CDC control record (`cdc\0tabs`): which tables are captured, and which
+/// are write-blocked.
+///
+/// Membership used to be a `u128` bitmap indexed by table id, set through
+/// `1u128 << (table_id & (MAX_TABLES - 1))`. That fold was guarded only by a
+/// `debug_assert!`, so in release it silently ALIASED any id past the bitmap:
+/// enabling capture on table 200 would have set table 72's bit, and the mirror
+/// would then replicate the wrong table's rows. Unlike the OFP ring's `& 63`
+/// (a conservative conflict signal where aliasing costs a false positive), this
+/// is an IDENTITY map — aliasing is a silent cross-table wrong answer. Both
+/// sets are therefore sparse [`TableSet`]s, which alias with nothing and put no
+/// ceiling on the table id at all (design/DESIGN-TABLE-CAP.md §4).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CaptureConfig {
-    /// Bit `i` set → table id `i` has dirty-set capture enabled.
-    pub captured: u128,
-    /// Bit `i` set → writes to table id `i` are refused with [`Error::Frozen`].
-    pub blocked: u128,
+    /// Table ids with dirty-set capture enabled.
+    pub captured: TableSet,
+    /// Table ids whose writes are refused with [`Error::Frozen`].
+    pub blocked: TableSet,
     /// Bumped on every change so per-process caches can detect staleness.
     pub generation: u64,
 }
 
 impl CaptureConfig {
-    pub const ENCODED_LEN: usize = 40;
-
     #[inline]
     pub fn is_captured(&self, table_id: u32) -> bool {
-        (table_id as usize) < MAX_TABLES && (self.captured >> table_id) & 1 == 1
+        self.captured.contains(table_id)
     }
 
     #[inline]
     pub fn is_blocked(&self, table_id: u32) -> bool {
-        (table_id as usize) < MAX_TABLES && (self.blocked >> table_id) & 1 == 1
+        self.blocked.contains(table_id)
     }
 
     /// Whether anything at all is enabled — the engine's cheap "skip capture"
     /// fast path when no table is mirrored.
     #[inline]
     pub fn is_empty(&self) -> bool {
-        self.captured == 0 && self.blocked == 0
+        self.captured.is_empty() && self.blocked.is_empty()
     }
 
     pub fn set_captured(&mut self, table_id: u32, on: bool) {
-        debug_assert!((table_id as usize) < MAX_TABLES);
-        let bit = 1u128 << (table_id & (MAX_TABLES as u32 - 1));
         if on {
-            self.captured |= bit;
+            self.captured.insert(table_id);
         } else {
-            self.captured &= !bit;
+            self.captured.remove(table_id);
         }
     }
 
     pub fn set_blocked(&mut self, table_id: u32, on: bool) {
-        debug_assert!((table_id as usize) < MAX_TABLES);
-        let bit = 1u128 << (table_id & (MAX_TABLES as u32 - 1));
         if on {
-            self.blocked |= bit;
+            self.blocked.insert(table_id);
         } else {
-            self.blocked &= !bit;
+            self.blocked.remove(table_id);
         }
     }
 
-    pub fn encode(&self) -> [u8; Self::ENCODED_LEN] {
-        let mut b = [0u8; Self::ENCODED_LEN];
-        b[0..16].copy_from_slice(&self.captured.to_le_bytes());
-        b[16..32].copy_from_slice(&self.blocked.to_le_bytes());
-        b[32..40].copy_from_slice(&self.generation.to_le_bytes());
+    /// `generation LE8 ‖ TableSet(captured) ‖ TableSet(blocked)` — variable
+    /// length now that the sets are sparse.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(8 + 4 + 8 * (self.captured.len() + self.blocked.len()));
+        b.extend_from_slice(&self.generation.to_le_bytes());
+        self.captured.encode_into(&mut b);
+        self.blocked.encode_into(&mut b);
         b
     }
 
     pub fn decode(bytes: &[u8]) -> Result<CaptureConfig> {
-        if bytes.len() != Self::ENCODED_LEN {
+        let generation = bytes
+            .get(0..8)
+            .map(|r| u64::from_le_bytes(r.try_into().unwrap()))
+            .ok_or_else(|| Error::Corrupt("truncated cdc control record".into()))?;
+        let mut pos = 8usize;
+        let captured = TableSet::decode(bytes, &mut pos)?;
+        let blocked = TableSet::decode(bytes, &mut pos)?;
+        // Exact consumption: trailing bytes mean this is not a control record
+        // of this format (e.g. a stale fixed-40-byte one), and must fail loudly
+        // rather than decode to a plausible-looking capture set.
+        if pos != bytes.len() {
             return Err(Error::Corrupt(format!(
-                "cdc control record is {} bytes (expected {})",
-                bytes.len(),
-                Self::ENCODED_LEN
+                "cdc control record has {} trailing bytes",
+                bytes.len() - pos
             )));
         }
         Ok(CaptureConfig {
-            captured: u128::from_le_bytes(bytes[0..16].try_into().unwrap()),
-            blocked: u128::from_le_bytes(bytes[16..32].try_into().unwrap()),
-            generation: u64::from_le_bytes(bytes[32..40].try_into().unwrap()),
+            captured,
+            blocked,
+            generation,
         })
     }
 }
@@ -178,7 +193,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capture_config_roundtrip_and_bitmaps() {
+    fn capture_config_roundtrip_and_membership() {
         let mut c = CaptureConfig::default();
         assert!(c.is_empty());
         c.set_captured(3, true);
@@ -188,27 +203,55 @@ mod tests {
         assert!(c.is_captured(3) && c.is_captured(55) && !c.is_captured(4));
         assert!(c.is_blocked(3) && !c.is_blocked(55));
         assert!(!c.is_empty());
-        // out-of-range ids never match
-        assert!(!c.is_captured(64) && !c.is_blocked(200));
+        // ids never enabled never match, at any magnitude
+        assert!(!c.is_captured(64) && !c.is_blocked(200) && !c.is_captured(4095));
         let round = CaptureConfig::decode(&c.encode()).unwrap();
         assert_eq!(round, c);
         c.set_captured(3, false);
+        c.set_captured(3, false); // idempotent
         assert!(!c.is_captured(3));
     }
 
     #[test]
-    fn capture_config_rejects_wrong_length() {
+    fn high_table_ids_do_not_alias() {
+        // REGRESSION (DESIGN-TABLE-CAP §4): the old bitmap folded ids
+        // `& (MAX_TABLES - 1)` behind a debug_assert, so capturing table 200
+        // silently captured table 72 in release builds — the mirror would then
+        // replicate the wrong table's rows. Sparse ids alias with nothing.
+        let mut c = CaptureConfig::default();
+        for id in [200u32, 128, 64, 3000] {
+            c.set_captured(id, true);
+            c.set_blocked(id, true);
+        }
+        for id in [200u32, 128, 64, 3000] {
+            assert!(c.is_captured(id) && c.is_blocked(id));
+            for fold in [id % 64, id % 128] {
+                if fold != id {
+                    assert!(!c.is_captured(fold), "{id} aliased {fold}");
+                    assert!(!c.is_blocked(fold), "{id} aliased {fold}");
+                }
+            }
+        }
+        assert_eq!(CaptureConfig::decode(&c.encode()).unwrap(), c);
+    }
+
+    #[test]
+    fn capture_config_rejects_malformed() {
         // truncation at every offset must yield Corrupt, never a panic
         let full = CaptureConfig {
-            captured: 1,
-            blocked: 2,
+            captured: [0u32, 4095].into_iter().collect(),
+            blocked: [2u32].into_iter().collect(),
             generation: 3,
         }
         .encode();
         for n in 0..full.len() {
-            assert!(CaptureConfig::decode(&full[..n]).is_err());
+            assert!(CaptureConfig::decode(&full[..n]).is_err(), "len {n}");
         }
-        assert!(CaptureConfig::decode(&[0u8; CaptureConfig::ENCODED_LEN + 1]).is_err());
+        // trailing bytes (e.g. the retired fixed-40-byte record) fail loudly
+        let mut long = full.clone();
+        long.push(0);
+        assert!(CaptureConfig::decode(&long).is_err());
+        assert!(CaptureConfig::decode(&[0u8; 40]).is_err());
         assert!(CaptureConfig::decode(&full).is_ok());
     }
 

@@ -501,7 +501,7 @@ Select emp
     access: PkPoint(did = emp.did)
     on: true
   project: emp.ename
-  footprint: read_only=true tables_read=0x3 tables_written=0x0 indexes_used=0x1 key=Full
+  footprint: read_only=true tables_read=[0,1] tables_written=[] indexes_used=0x1 key=Full
 
 # An ON with no equality still reads the inner side once and holds it — the
 # pre-pushdown execution, with the honest O(n*m) label.
@@ -514,7 +514,7 @@ Select emp
     access: FullScan
     on: emp.did > dept.did
   project: emp.ename
-  footprint: read_only=true tables_read=0x3 tables_written=0x0 indexes_used=0x1 key=Full
+  footprint: read_only=true tables_read=[0,1] tables_written=[] indexes_used=0x1 key=Full
 
 # ---- #65: WHERE pushdown into the chain -----------------------------------------------
 # A comma-join's WHERE equality is consumed exactly like an ON equality: the
@@ -538,7 +538,7 @@ Select emp
     access: PkPoint(did = emp.did)
     on: true
   project: emp.ename
-  footprint: read_only=true tables_read=0x3 tables_written=0x0 indexes_used=0x1 key=Full
+  footprint: read_only=true tables_read=[0,1] tables_written=[] indexes_used=0x1 key=Full
 
 # The NULL-extension boundary: a WHERE conjunct on a LEFT join's inner side
 # filters the NULL-EXTENDED row (it stays in joined_filter); pushing it into
