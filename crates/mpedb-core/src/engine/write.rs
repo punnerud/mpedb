@@ -1315,11 +1315,14 @@ impl<'e> WriteTxn<'e> {
     /// moves, and it moves back automatically on abort (the change lives in
     /// COW pages the abort discards).
     ///
-    /// CHECK programs are compiled by the SQL facade, not here: the current
-    /// bundle's programs are carried by table position (dense in this format
-    /// window) and a freshly-created table's slot is left empty — exactly as
-    /// [`Engine::reload_schema_from_catalog`] does on a peer-DDL reload. Returns
-    /// the new bundle so the caller can compile/execute against it.
+    /// CHECK programs come from the facade's compiler, installed on the engine
+    /// ([`Engine::set_check_compiler`]) — the same call
+    /// [`Engine::reload_schema_from_catalog`] makes. That matters here more than
+    /// anywhere: a table this txn just created with a `CHECK (…)` is inserted
+    /// into by the NEXT statement of the SAME transaction, so an empty program
+    /// slot would mean the constraint never fires for exactly the rows written
+    /// alongside it. Returns the new bundle so the caller can compile/execute
+    /// against it.
     pub fn reload_bundle_from_catalog(&mut self) -> Result<Arc<SchemaBundle>> {
         let root = self.catalog_root;
         let bytes = btree::get(self, root, CAT_SCHEMA_KEY)?
@@ -1329,8 +1332,7 @@ impl<'e> WriteTxn<'e> {
         // `schema_gen_bump`). It never escapes this txn's lifetime; it only
         // keeps the value distinct from the pre-DDL bundle's gen.
         let gen = self.meta.schema_gen + 1;
-        let mut checks = self.bundle.checks.clone();
-        checks.resize(schema.tables.len(), Vec::new());
+        let checks = self.eng.compile_checks(&schema, &self.bundle.checks);
         let bundle = Arc::new(SchemaBundle::new_at(gen, schema, checks));
         self.bundle = Arc::clone(&bundle);
         Ok(bundle)

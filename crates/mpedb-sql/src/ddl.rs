@@ -7,9 +7,11 @@
 use mpedb_types::{Collation, ColumnType, DefaultExpr, PolicyCmd};
 
 /// One column of a `CREATE TABLE` (#47 stage 2) or `ALTER TABLE ADD COLUMN`.
-/// Types are the config's names (`int64`/`int`/`integer`, `text`, `real`,
-/// `bool`, `blob`, `timestamp`, `any`), constraints the useful subset:
-/// `NOT NULL`, `UNIQUE`, `PRIMARY KEY`. `CHECK`/`REFERENCES` are named
+/// The declared type is sqlite's whole vocabulary — any word(s) with an
+/// optional size (`varchar(100)`, `bigint`, `double precision`, `decimal(10,2)`,
+/// or nothing at all) — folded to a rigid [`ColumnType`] by
+/// [`ColumnType::from_declared`]. Constraints are the useful subset: `NOT
+/// NULL`, `UNIQUE`, `PRIMARY KEY`, `COLLATE`. `CHECK`/`REFERENCES` are named
 /// refusals for now; `DEFAULT <const>` is parsed for ADD COLUMN (below) and
 /// still refused by name in `CREATE TABLE`.
 #[derive(Debug, Clone, PartialEq)]
@@ -31,6 +33,14 @@ pub struct CreateColumnSpec {
     /// non-NULL, fills existing rows with it. `None` when no `DEFAULT` clause
     /// (and always `None` on the `CREATE TABLE` path, which refuses DEFAULT).
     pub default: Option<DefaultExpr>,
+    /// `CHECK (<expr>)` declared on the column, captured as SOURCE text (like a
+    /// policy predicate or a view body) because the parser does not yet know the
+    /// column list to bind against. The facade compiles it against the finished
+    /// table before the DDL commits, so an expression naming a missing column
+    /// fails the `CREATE TABLE` instead of sitting in the catalog unloadable.
+    /// Several `CHECK`s on one column are folded into one `AND` conjunction —
+    /// which is what several CHECKs mean anyway.
+    pub check: Option<String>,
 }
 
 /// `CREATE TABLE <name> (col TYPE [cons…], …[, PRIMARY KEY (a, b)]
@@ -45,6 +55,10 @@ pub struct CreateTableSpec {
     pub table_pk: Vec<String>,
     /// Table-level `UNIQUE (…)` groups — composite unique indexes (#55).
     pub uniques: Vec<Vec<String>>,
+    /// Table-level `CHECK (<expr>)` bodies, as SOURCE text. A table CHECK may
+    /// name any column, so unlike a column CHECK it belongs to no single
+    /// column; the facade folds them into one row-level constraint.
+    pub checks: Vec<String>,
 }
 
 /// `CREATE VIRTUAL TABLE [IF NOT EXISTS] <name> USING fts5(<col>, …
@@ -291,10 +305,13 @@ mod tests {
             DdlStmt::AlterAddColumn { column, .. } => assert!(column.not_null),
             other => panic!("{other:?}"),
         }
-        // A trailing unknown word after a typeless column is still a parse
-        // error (leftover token). But a TYPELESS ADD COLUMN is now valid,
-        // sqlite-style: the column becomes `Any` (no affinity).
-        assert!(parse_ddl("ALTER TABLE t ADD COLUMN c BOGUS").is_err());
+        // An unrecognized type word is LEGAL, as in sqlite, and means NUMERIC
+        // affinity → `Any`. (It used to be a parse error.)
+        match parse_ddl("ALTER TABLE t ADD COLUMN c BOGUS").unwrap().unwrap() {
+            DdlStmt::AlterAddColumn { column, .. } => assert_eq!(column.ty, ColumnType::Any),
+            other => panic!("{other:?}"),
+        }
+        // A TYPELESS ADD COLUMN is valid too, sqlite-style: `Any` (no affinity).
         match parse_ddl("ALTER TABLE t ADD COLUMN c").unwrap().unwrap() {
             DdlStmt::AlterAddColumn { column, .. } => {
                 assert_eq!(column.name, "c");
@@ -558,13 +575,240 @@ mod tests {
         );
     }
 
+    /// sqlite's declared-type vocabulary: any word(s), with an optional size.
+    /// The expectations here are pinned against the real `sqlite3` binary in
+    /// `crates/mpedb/tests/django_parse_gaps.rs`.
+    #[test]
+    fn create_table_sqlite_declared_types() {
+        let s = create_table(
+            "CREATE TABLE t (id integer NOT NULL PRIMARY KEY, name varchar(100) NOT NULL, \
+             code char(1) NULL, big bigint, small smallint, pos integer unsigned, \
+             amount double precision, price decimal(10, 2), made datetime, day date, \
+             data BLOB, huge \"unsigned big int\", weird nosuchtype, bare)",
+        );
+        use ColumnType::*;
+        let got: Vec<ColumnType> = s.columns.iter().map(|c| c.ty).collect();
+        assert_eq!(
+            got,
+            vec![
+                Int64,   // integer
+                Text,    // varchar(100)
+                Text,    // char(1)
+                Int64,   // bigint
+                Int64,   // smallint
+                Int64,   // integer unsigned
+                Float64, // double precision
+                Any,     // decimal(10, 2)  → NUMERIC affinity
+                Any,     // datetime        → NUMERIC affinity
+                Any,     // date            → NUMERIC affinity
+                Blob,    // BLOB
+                Int64,   // "unsigned big int" (quoted words are type words)
+                Any,     // an unknown name is legal in sqlite and means NUMERIC
+                Any,     // no declared type at all
+            ]
+        );
+        // The size is consumed and dropped — mpedb has no width-limited types,
+        // so honouring `varchar(1)` as a limit would reject rows sqlite stores.
+        assert_eq!(create_table("CREATE TABLE t (a varchar(1))").columns[0].ty, Text);
+        // A malformed size is still a parse error.
+        assert!(parse_ddl("CREATE TABLE t (a varchar(100)").is_err());
+        assert!(parse_ddl("CREATE TABLE t (a varchar(x))").is_err());
+        // `ADD COLUMN` uses the identical grammar.
+        match parse_ddl("ALTER TABLE t ADD COLUMN c varchar(100)").unwrap().unwrap() {
+            DdlStmt::AlterAddColumn { column, .. } => assert_eq!(column.ty, ColumnType::Text),
+            other => panic!("{other:?}"),
+        }
+        match parse_ddl("ALTER TABLE t ADD COLUMN c double precision DEFAULT 1.5")
+            .unwrap()
+            .unwrap()
+        {
+            DdlStmt::AlterAddColumn { column, .. } => {
+                assert_eq!(column.ty, ColumnType::Float64);
+                assert_eq!(column.default, Some(DefaultExpr::Const(mpedb_types::Value::Float(1.5))));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A constraint word is never eaten as a type word — the column below is
+        // typeless with a PRIMARY KEY, not a column of type `primary`.
+        let s = create_table("CREATE TABLE t (a PRIMARY KEY, b UNIQUE, c COLLATE NOCASE)");
+        assert!(s.columns.iter().all(|c| c.ty == ColumnType::Any));
+        assert!(s.columns[0].pk && s.columns[1].unique);
+    }
+
+    /// `AUTOINCREMENT` refuses BY NAME, in every position it can be written,
+    /// and the message says what cannot be promised. `PRIMARY KEY ASC|DESC` —
+    /// the same production — is accepted and its direction dropped, as in
+    /// sqlite.
+    #[test]
+    fn autoincrement_refuses_by_name_everywhere() {
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY ASC AUTOINCREMENT, x INT)",
+            "CREATE TABLE t (id integer AUTOINCREMENT PRIMARY KEY)",
+            "ALTER TABLE t ADD COLUMN id INTEGER PRIMARY KEY AUTOINCREMENT",
+        ] {
+            let e = parse_ddl(sql).unwrap_err().to_string();
+            assert!(e.contains("AUTOINCREMENT"), "{sql}: {e}");
+            assert!(e.contains("reused"), "the refusal must say WHY — {sql}: {e}");
+        }
+        // Without the keyword the same column definitions are fine, direction
+        // and all.
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY ASC)",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY DESC, x INT)",
+        ] {
+            let s = create_table(sql);
+            assert!(s.columns[0].pk, "{sql}");
+            assert_eq!(s.columns[0].ty, ColumnType::Int64, "{sql}");
+        }
+    }
+
+    /// `DEFAULT`, `CHECK` and `REFERENCES` in a column definition.
+    #[test]
+    fn create_table_default_check_and_references() {
+        use mpedb_types::Value;
+        let s = create_table(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n INT NOT NULL DEFAULT 7, \
+             note TEXT DEFAULT 'none', z INT DEFAULT -3, r REAL DEFAULT 1.5, \
+             b BOOL DEFAULT true, nul INT DEFAULT NULL, \
+             pos INT CHECK (pos >= 0), \
+             other_id INT REFERENCES t (id) ON DELETE CASCADE)",
+        );
+        assert_eq!(s.columns[1].default, Some(DefaultExpr::Const(Value::Int(7))));
+        assert_eq!(s.columns[2].default, Some(DefaultExpr::Const(Value::Text("none".into()))));
+        assert_eq!(s.columns[3].default, Some(DefaultExpr::Const(Value::Int(-3))));
+        assert_eq!(s.columns[4].default, Some(DefaultExpr::Const(Value::Float(1.5))));
+        assert_eq!(s.columns[5].default, Some(DefaultExpr::Const(Value::Bool(true))));
+        assert_eq!(s.columns[6].default, Some(DefaultExpr::Const(Value::Null)));
+        assert_eq!(s.columns[7].check.as_deref(), Some("pos >= 0"));
+        // REFERENCES is consumed whole and leaves nothing on the column.
+        assert_eq!(s.columns[8].name, "other_id");
+        assert!(s.columns[8].check.is_none() && s.columns[8].default.is_none());
+
+        // Several CHECKs on one column fold into one conjunction.
+        let s = create_table("CREATE TABLE t (a INT CHECK (a > 0) CHECK (a < 10))");
+        assert_eq!(s.columns[0].check.as_deref(), Some("(a > 0) AND (a < 10)"));
+
+        // Every FK tail sqlite accepts, in both the column and table spelling.
+        for sql in [
+            "CREATE TABLE t (a INT REFERENCES o)",
+            "CREATE TABLE t (a INT REFERENCES o (id))",
+            "CREATE TABLE t (a INT REFERENCES o (id) ON DELETE SET NULL)",
+            "CREATE TABLE t (a INT REFERENCES o (id) ON DELETE SET DEFAULT)",
+            "CREATE TABLE t (a INT REFERENCES o (id) ON UPDATE NO ACTION)",
+            "CREATE TABLE t (a INT REFERENCES o (id) ON DELETE RESTRICT ON UPDATE CASCADE)",
+            "CREATE TABLE t (a INT REFERENCES o (id) MATCH FULL)",
+            "CREATE TABLE t (a INT REFERENCES o (id) DEFERRABLE INITIALLY DEFERRED)",
+            "CREATE TABLE t (a INT REFERENCES o (id) NOT DEFERRABLE INITIALLY IMMEDIATE)",
+            // …and a NOT NULL AFTER the clause is not eaten by the `NOT
+            // DEFERRABLE` lookahead.
+            "CREATE TABLE t (a INT REFERENCES o (id) NOT NULL)",
+            "CREATE TABLE t (a INT, b INT, FOREIGN KEY (a, b) REFERENCES o (x, y))",
+            "CREATE TABLE t (a INT, CONSTRAINT fk FOREIGN KEY (a) REFERENCES o (x) \
+             ON DELETE CASCADE DEFERRABLE INITIALLY DEFERRED)",
+        ] {
+            let s = create_table(sql);
+            assert!(!s.columns.is_empty(), "{sql}");
+        }
+        assert!(create_table("CREATE TABLE t (a INT REFERENCES o (id) NOT NULL)").columns[0]
+            .not_null);
+        // A malformed FK tail is still an error, not silently swallowed.
+        assert!(parse_ddl("CREATE TABLE t (a INT REFERENCES o (id) ON DELETE BOGUS)").is_err());
+        assert!(parse_ddl("CREATE TABLE t (a INT REFERENCES o (id) ON BOGUS CASCADE)").is_err());
+    }
+
+    /// The DEFAULT forms sqlite takes and mpedb cannot store the same value for
+    /// refuse BY NAME rather than storing something else.
+    #[test]
+    fn non_constant_defaults_refuse_by_name() {
+        for (sql, needle) in [
+            ("CREATE TABLE t (a TEXT DEFAULT CURRENT_TIMESTAMP)", "CURRENT_TIMESTAMP"),
+            ("CREATE TABLE t (a TEXT DEFAULT CURRENT_DATE)", "CURRENT_DATE"),
+            ("CREATE TABLE t (a TEXT DEFAULT CURRENT_TIME)", "CURRENT_TIME"),
+            ("CREATE TABLE t (a INT DEFAULT (1 + 2))", "parenthesized"),
+            ("CREATE TABLE t (a INT DEFAULT abs(-1))", "constant literal"),
+        ] {
+            let e = parse_ddl(sql).unwrap_err().to_string();
+            assert!(e.contains(needle), "{sql}: {e}");
+        }
+        // Two DEFAULTs on one column is a clean error, not last-wins.
+        assert!(parse_ddl("CREATE TABLE t (a INT DEFAULT 1 DEFAULT 2)").is_err());
+        // sqlite refuses a CHECK on ADD COLUMN; so do we, by name.
+        let e = parse_ddl("ALTER TABLE t ADD COLUMN a INT CHECK (a > 0)")
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("CHECK"), "{e}");
+        // …but REFERENCES on ADD COLUMN is fine, as in sqlite.
+        assert!(parse_ddl("ALTER TABLE t ADD COLUMN a INT REFERENCES o (id)").is_ok());
+    }
+
+    /// `CONSTRAINT <name>` in front of any table- or column-level constraint.
+    ///
+    /// The NAME is parsed and DROPPED: sqlite keeps it only to quote back in an
+    /// error message, mpedb's constraint errors already name the table and the
+    /// column, and storing a name nothing reads would be a schema-hash input
+    /// that buys nothing. Duplicate names are therefore not diagnosed either —
+    /// nor are they by sqlite (verified: it accepts two `CONSTRAINT dup`).
+    #[test]
+    fn named_constraints_parse_and_the_name_is_dropped() {
+        use mpedb_types::Value;
+        // Table level: the constraint itself survives, byte for byte the same
+        // spec an unnamed one produces.
+        let named = create_table(
+            "CREATE TABLE t (a INT, b INT, CONSTRAINT t_pk PRIMARY KEY (a), \
+             CONSTRAINT t_ab UNIQUE (a, b), CONSTRAINT t_ck CHECK (a > 0))",
+        );
+        let bare = create_table(
+            "CREATE TABLE t (a INT, b INT, PRIMARY KEY (a), UNIQUE (a, b), CHECK (a > 0))",
+        );
+        assert_eq!(named, bare);
+        assert_eq!(named.table_pk, vec!["a"]);
+        assert_eq!(named.uniques, vec![vec!["a".to_string(), "b".to_string()]]);
+        assert_eq!(named.checks, vec!["a > 0".to_string()]);
+
+        // Column level: every constraint word may carry a name, and several
+        // named constraints may follow one another.
+        let named = create_table(
+            "CREATE TABLE t (a INT CONSTRAINT c1 NOT NULL CONSTRAINT c2 CHECK (a > 0) \
+             CONSTRAINT c3 UNIQUE CONSTRAINT c4 DEFAULT 5 CONSTRAINT c5 COLLATE NOCASE, \
+             b INT CONSTRAINT c6 PRIMARY KEY, c INT CONSTRAINT c7 REFERENCES o (id))",
+        );
+        assert!(named.columns[0].not_null && named.columns[0].unique);
+        assert_eq!(named.columns[0].check.as_deref(), Some("a > 0"));
+        assert_eq!(named.columns[0].default, Some(DefaultExpr::Const(Value::Int(5))));
+        assert_eq!(named.columns[0].collation, Collation::NoCase);
+        assert!(named.columns[1].pk);
+
+        // Two table CHECKs are kept as two — each must pass.
+        let s = create_table(
+            "CREATE TABLE t (a INT, CONSTRAINT x CHECK (a > 0), CONSTRAINT y CHECK (a < 9))",
+        );
+        assert_eq!(s.checks, vec!["a > 0".to_string(), "a < 9".to_string()]);
+
+        // Duplicate names are accepted (sqlite does not diagnose them either).
+        assert!(parse_ddl(
+            "CREATE TABLE t (a INT, CONSTRAINT dup UNIQUE (a), CONSTRAINT dup CHECK (a > 0))"
+        )
+        .is_ok());
+
+        // A `CONSTRAINT <name>` with nothing constraint-shaped after it is a
+        // clean error that quotes the name back, not a silently skipped clause.
+        for sql in [
+            "CREATE TABLE t (a INT, CONSTRAINT n)",
+            "CREATE TABLE t (a INT, CONSTRAINT n b INT)",
+            "CREATE TABLE t (a INT CONSTRAINT n, b INT)",
+        ] {
+            let e = parse_ddl(sql).unwrap_err().to_string();
+            assert!(e.contains('n'), "{sql}: {e}");
+        }
+        // `constraint` is not usable as a column name — sqlite refuses it too.
+        assert!(parse_ddl("CREATE TABLE t (constraint INT)").is_err());
+    }
+
     #[test]
     fn create_table_malformed_and_unsupported_refuse() {
         assert!(parse_ddl("CREATE TABLE t (id INT PRIMARY KEY,)").is_err()); // trailing comma → empty col
-        assert!(parse_ddl("CREATE TABLE t (id BOGUSTYPE)").is_err()); // unknown type
-        assert!(parse_ddl("CREATE TABLE t (id INT DEFAULT 0)").is_err()); // DEFAULT unsupported
-        assert!(parse_ddl("CREATE TABLE t (id INT CHECK (id > 0))").is_err()); // CHECK unsupported
-        assert!(parse_ddl("CREATE TABLE t (id INT REFERENCES o(id))").is_err()); // FK unsupported
         assert!(parse_ddl("CREATE TABLE t id INT)").is_err()); // missing (
         assert!(parse_ddl("CREATE TABLE t (id INT").is_err()); // missing )
     }
