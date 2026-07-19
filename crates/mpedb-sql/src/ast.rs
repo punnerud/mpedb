@@ -407,11 +407,43 @@ pub(crate) enum WindowFunc {
     CumeDist,
 }
 
-/// The `OVER ( [PARTITION BY …] [ORDER BY …] )` spec. No explicit frame in
-/// stage 1 — the default frame is computed implicitly (design/DESIGN-WINDOW.md §3.5).
+/// The `OVER ( [PARTITION BY …] [ORDER BY …] [frame] )` spec. `frame` is `None`
+/// for the implicit default frame (design/DESIGN-WINDOW.md §3.5); an explicit
+/// `ROWS`/`RANGE`/`GROUPS BETWEEN …` clause fills it (stage 2 frames).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct WindowSpecAst {
     pub partition_by: Vec<Expr>,
     /// `(key, descending)`, mirroring [`SelectStmt::order_by`].
     pub order_by: Vec<(Expr, bool)>,
+    /// Explicit frame clause, or `None` for the default frame.
+    pub frame: Option<FrameAst>,
+}
+
+/// An explicit window frame `{ROWS | RANGE | GROUPS} BETWEEN <start> AND <end>`
+/// (or the `{…} <start>` shorthand, desugared to `BETWEEN <start> AND CURRENT
+/// ROW` by the parser).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct FrameAst {
+    pub mode: FrameMode,
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+/// Frame unit: physical rows, logical value range, or peer-group offsets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameMode {
+    Rows,
+    Range,
+    Groups,
+}
+
+/// A frame boundary. The offset for `<N> PRECEDING`/`<N> FOLLOWING` is a
+/// constant non-negative integer, captured directly from the literal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FrameBound {
+    UnboundedPreceding,
+    Preceding(u64),
+    CurrentRow,
+    Following(u64),
+    UnboundedFollowing,
 }

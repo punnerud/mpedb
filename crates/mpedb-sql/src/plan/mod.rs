@@ -217,7 +217,7 @@ const MAX_JOINS: usize = 16;
 //     hits an unknown window func tag and rejects the plan as corrupt rather
 //     than misreading it — the same additive whole-plan-version gating as the
 //     earlier window bumps (24, 34).
-const PLAN_FORMAT: u8 = 35;
+const PLAN_FORMAT: u8 = 36;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -597,6 +597,142 @@ pub struct WindowSpec {
     /// the partition; `None` (⇒ NULL) for every function other than lag/lead and
     /// for a lag/lead whose default was omitted.
     pub default: Option<ExprProgram>,
+    /// Explicit frame clause (format 36). `None` = the default frame (the exact
+    /// stage-1/2 behaviour: `RANGE UNBOUNDED PRECEDING → CURRENT ROW` with an
+    /// ORDER BY, else the whole partition). A frame is only carried on aggregate
+    /// and `first_value`/`last_value`/`nth_value` windows — the only functions
+    /// whose result depends on it; the planner refuses one on any other function.
+    pub frame: Option<Frame>,
+}
+
+/// An explicit window frame (format 36): a unit (`ROWS`/`RANGE`/`GROUPS`) plus a
+/// start and end boundary. The offsets are constants baked into the plan bytes,
+/// so one content-hashed plan reproduces the same frame in every process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Frame {
+    pub mode: FrameMode,
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+/// Frame unit. `Rows` counts physical rows; `Range` compares ORDER BY values
+/// (peer semantics for the supported UNBOUNDED/CURRENT ROW bounds); `Groups`
+/// counts peer groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameMode {
+    Rows,
+    Range,
+    Groups,
+}
+
+/// A frame boundary. `Preceding`/`Following` carry a constant non-negative
+/// offset (rows for `Rows`, peer-groups for `Groups`; refused for `Range`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(u64),
+    CurrentRow,
+    Following(u64),
+    UnboundedFollowing,
+}
+
+impl Frame {
+    /// Wire tag for a boundary as a FRAME START (`None` ⇒ illegal as a start,
+    /// i.e. `UNBOUNDED FOLLOWING`). Also the ordinal used to reject an end that
+    /// precedes the start — matching sqlite, which treats every `N PRECEDING`
+    /// alike (rank 1) and every `N FOLLOWING` alike (rank 3) regardless of `N`.
+    fn start_rank(b: FrameBound) -> Option<u8> {
+        match b {
+            FrameBound::UnboundedPreceding => Some(0),
+            FrameBound::Preceding(_) => Some(1),
+            FrameBound::CurrentRow => Some(2),
+            FrameBound::Following(_) => Some(3),
+            FrameBound::UnboundedFollowing => None,
+        }
+    }
+
+    /// Ordinal of a boundary as a FRAME END (`None` ⇒ illegal as an end, i.e.
+    /// `UNBOUNDED PRECEDING`).
+    fn end_rank(b: FrameBound) -> Option<u8> {
+        match b {
+            FrameBound::UnboundedPreceding => None,
+            FrameBound::Preceding(_) => Some(1),
+            FrameBound::CurrentRow => Some(2),
+            FrameBound::Following(_) => Some(3),
+            FrameBound::UnboundedFollowing => Some(4),
+        }
+    }
+
+    /// Whether this frame yields the same result regardless of the (arbitrary)
+    /// row order within a partition — the condition for allowing it with NO
+    /// window ORDER BY. `Range`/`Groups` collapse to a single peer group without
+    /// an ORDER BY, so every such frame is whole-partition-or-empty; a physical
+    /// `Rows` frame is order-dependent unless it spans the whole partition.
+    fn order_independent(&self) -> bool {
+        match self.mode {
+            FrameMode::Range | FrameMode::Groups => true,
+            FrameMode::Rows => matches!(
+                (self.start, self.end),
+                (FrameBound::UnboundedPreceding, FrameBound::UnboundedFollowing)
+            ),
+        }
+    }
+
+    /// Structural legality of the frame for `func`, given whether the window has
+    /// an ORDER BY. Returns a human message on failure; the planner maps it to a
+    /// `bind_err`, decode/validate to `Corrupt`, so the same rules gate both the
+    /// prepare path and a hostile blob. The rules are sqlite's, verified against
+    /// 3.45:
+    ///  - a frame is meaningful only on aggregate / `first_value` / `last_value`
+    ///    / `nth_value` windows (elsewhere sqlite silently ignores it — refused
+    ///    here so a frame never quietly changes nothing);
+    ///  - the start cannot be `UNBOUNDED FOLLOWING`, the end cannot be
+    ///    `UNBOUNDED PRECEDING`, and the end cannot precede the start;
+    ///  - `RANGE` with a `PRECEDING`/`FOLLOWING` offset is refused (its value
+    ///    arithmetic with DESC/NULL ordering is not reproduced exactly);
+    ///  - an order-dependent frame needs an ORDER BY.
+    pub(crate) fn check(&self, func: WindowFunc, has_order_by: bool) -> std::result::Result<(), String> {
+        if !matches!(
+            func,
+            WindowFunc::Agg(_)
+                | WindowFunc::FirstValue
+                | WindowFunc::LastValue
+                | WindowFunc::NthValue(_)
+        ) {
+            return Err(
+                "an explicit frame is only supported on aggregate and \
+                 first_value/last_value/nth_value window functions"
+                    .into(),
+            );
+        }
+        let Some(sr) = Self::start_rank(self.start) else {
+            return Err("a window frame cannot START at UNBOUNDED FOLLOWING".into());
+        };
+        let Some(er) = Self::end_rank(self.end) else {
+            return Err("a window frame cannot END at UNBOUNDED PRECEDING".into());
+        };
+        if sr > er {
+            return Err("unsupported frame specification: the end boundary precedes the start".into());
+        }
+        if matches!(self.mode, FrameMode::Range)
+            && (matches!(self.start, FrameBound::Preceding(_) | FrameBound::Following(_))
+                || matches!(self.end, FrameBound::Preceding(_) | FrameBound::Following(_)))
+        {
+            return Err(
+                "RANGE with a PRECEDING/FOLLOWING offset is not supported — use ROWS or GROUPS \
+                 for an offset frame, or RANGE with UNBOUNDED/CURRENT ROW bounds"
+                    .into(),
+            );
+        }
+        if !has_order_by && !self.order_independent() {
+            return Err(
+                "an explicit ROWS frame with a bounded edge requires an ORDER BY in the OVER clause \
+                 (without one the row order, and so the frame, is undefined)"
+                    .into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 /// Which window function a [`WindowSpec`] computes. A closed enum with wire tags

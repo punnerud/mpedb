@@ -76,6 +76,18 @@ fn sample_sqls() -> Vec<&'static str> {
         // encode/decode/validate/hash.
         "SELECT id, ntile(4) OVER (PARTITION BY active ORDER BY age) FROM users",
         "SELECT id, percent_rank() OVER (ORDER BY age), cume_dist() OVER (ORDER BY age) FROM users",
+        // Explicit window frames (design/DESIGN-WINDOW.md stage 2, format 36):
+        // the `Option<Frame>` on each WindowSpec (a mode byte + two boundaries,
+        // some carrying a u64 offset) must survive encode/decode/validate/hash —
+        // ROWS with offsets, GROUPS with a peer-group offset, RANGE with
+        // UNBOUNDED/CURRENT ROW bounds, and the value functions under a frame.
+        "SELECT id, sum(age) OVER (PARTITION BY active ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM users",
+        "SELECT id, sum(age) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM users",
+        "SELECT id, count(*) OVER (ORDER BY age GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM users",
+        "SELECT id, sum(age) OVER (ORDER BY age RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) FROM users",
+        "SELECT id, first_value(age) OVER (ORDER BY id ROWS BETWEEN 2 PRECEDING AND CURRENT ROW), \
+         last_value(age) OVER (ORDER BY id ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING), \
+         nth_value(age, 2) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) FROM users",
         // Recursive CTEs (design/DESIGN-CTE-RECURSIVE.md stage 1, format 26): the
         // new `RecursiveCte` node — name, columns+types, union_all byte and three
         // nested SelectPlans — must survive encode/decode/validate. A DUAL-anchor
@@ -184,7 +196,7 @@ fn decode_rejects_truncation_and_stale_format_in_cast() {
         let p = prepare(sql, &s).unwrap();
         let _ = p.explain(&s); // must not panic rendering the affinity name
         let bytes = p.encode();
-        assert_eq!(bytes[0], 35, "plan format byte for {sql}");
+        assert_eq!(bytes[0], 36, "plan format byte for {sql}");
         let q = CompiledPlan::decode(&bytes, &s).expect(sql);
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         for cut in 0..bytes.len() {
@@ -225,7 +237,7 @@ fn bare_group_by_roundtrips_and_rejects_truncation_and_stale_format() {
         assert!(!agg.bare_cols.is_empty(), "bare_cols must be populated for {sql}");
 
         let bytes = p.encode();
-        assert_eq!(bytes[0], 35, "plan format byte for {sql}");
+        assert_eq!(bytes[0], 36, "plan format byte for {sql}");
         let q = CompiledPlan::decode(&bytes, &s).expect(sql);
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         for cut in 0..bytes.len() {
@@ -300,12 +312,14 @@ fn decode_rejects_truncation_everywhere() {
 }
 
 /// The window list bytes (format 24 + the format-34 value/offset extension +
-/// the format-35 rank/distribution extension) get their own truncation sweep: a
-/// windowed plan carries a window count, per-window func/distinct bytes, an
-/// optional arg program, PARTITION BY / ORDER BY program lists, and — for the
-/// value/ntile functions — a trailing i64 (lag/lead offset, nth_value n, ntile
-/// bucket count) plus an optional `default` program. Every cut through them must
-/// fail closed rather than decode a half-read window.
+/// the format-35 rank/distribution extension + the format-36 explicit frame) get
+/// their own truncation sweep: a windowed plan carries a window count, per-window
+/// func/distinct bytes, an optional arg program, PARTITION BY / ORDER BY program
+/// lists, — for the value/ntile functions — a trailing i64 (lag/lead offset,
+/// nth_value n, ntile bucket count) plus an optional `default` program, and — for
+/// a framed window — a frame presence byte, mode byte and two boundaries (some
+/// carrying a u64 offset). Every cut through them must fail closed rather than
+/// decode a half-read window.
 #[test]
 fn decode_rejects_truncation_in_windows() {
     let s = test_schema();
@@ -314,9 +328,10 @@ fn decode_rejects_truncation_in_windows() {
     // lag/lead `default` program, and the no-extra distribution tags.
     let p = prepare(
         "SELECT id, row_number() OVER (PARTITION BY active ORDER BY age), \
-         sum(age) OVER (PARTITION BY active ORDER BY age), \
+         sum(age) OVER (PARTITION BY active ORDER BY age ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING), \
+         count(*) OVER (ORDER BY age GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW), \
          lag(age, 2, -1) OVER (PARTITION BY active ORDER BY id), \
-         nth_value(age, 3) OVER (ORDER BY age), \
+         nth_value(age, 3) OVER (ORDER BY age ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), \
          first_value(age) OVER (ORDER BY id), \
          last_value(age) OVER (ORDER BY age), \
          ntile(4) OVER (PARTITION BY active ORDER BY age), \
@@ -349,6 +364,10 @@ fn decode_rejects_truncation_in_windows() {
                 )),
                 "expected rank/distribution window functions"
             );
+            assert!(
+                sp.windows.iter().any(|w| w.frame.is_some()),
+                "expected an explicit frame (format 36)"
+            );
         }
         other => panic!("expected a Select, got {other:?}"),
     }
@@ -356,7 +375,7 @@ fn decode_rejects_truncation_in_windows() {
     let ex = p.explain(&s);
     assert!(ex.contains("window __w"), "EXPLAIN should show the windows:\n{ex}");
     let bytes = p.encode();
-    assert_eq!(bytes[0], 35, "plan format byte");
+    assert_eq!(bytes[0], 36, "plan format byte");
     for cut in 0..bytes.len() {
         assert!(
             CompiledPlan::decode(&bytes[..cut], &s).is_err(),
@@ -365,12 +384,12 @@ fn decode_rejects_truncation_in_windows() {
     }
     // The full blob round-trips (and re-validates the window programs).
     assert_eq!(CompiledPlan::decode(&bytes, &s).unwrap(), p);
-    // Stale format: a format-34 reader-era blob must be re-prepared, not misread.
+    // Stale format: a format-35 reader-era blob must be re-prepared, not misread.
     let mut stale = bytes.clone();
-    stale[0] = 34;
+    stale[0] = 35;
     assert!(
         matches!(CompiledPlan::decode(&stale, &s), Err(Error::PlanInvalidated)),
-        "a format-34 window plan must be PlanInvalidated, not misread"
+        "a format-35 window plan must be PlanInvalidated, not misread"
     );
 }
 
@@ -425,7 +444,7 @@ fn compound_subplan_roundtrips_rejects_truncation_and_stale_format() {
         );
         let _ = p.explain(&s); // must not panic on the compound body render
         let bytes = p.encode();
-        assert_eq!(bytes[0], 35, "plan format byte for {sql}");
+        assert_eq!(bytes[0], 36, "plan format byte for {sql}");
         assert_eq!(CompiledPlan::decode(&bytes, &s).unwrap(), p, "roundtrip for {sql}");
         for cut in 0..bytes.len() {
             assert!(
