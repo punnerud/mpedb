@@ -250,22 +250,14 @@ impl<'a> Parser<'a> {
                 && matches!(self.peek_at(1), Some(Tok::Kw(Kw::Select)))
             {
                 self.expect(&Tok::LParen, "(")?;
-                let inner = self.select_core()?;
-                // A COMPOUND body in a derived table (`FROM (SELECT … UNION …)`)
-                // is not supported yet: unlike the lift positions (scalar / IN /
-                // EXISTS, format 31), a derived table is FLATTENED onto its base
-                // table, which a compound cannot be — it needs a materialized
-                // FROM-source of its own (a follow-up). Refuse it by name rather
-                // than emit a confusing "expected `)`" at the set operator.
-                if self.peek_compound_op().is_some() {
-                    return Err(self.err_here(
-                        "a compound (UNION/EXCEPT/INTERSECT) body in a derived table \
-                         `FROM (SELECT … UNION …)` is not supported yet",
-                    ));
-                }
+                // A plain SELECT body, or a whole compound `SELECT … UNION …`
+                // (the same grammar a subquery position accepts). A compound
+                // body cannot be flattened onto a base table, so it is always
+                // MATERIALIZED (design/DESIGN-DERIVED-TABLES.md §5).
+                let inner = self.subquery_body()?;
                 self.expect(&Tok::RParen, "`)` to close the derived table")?;
-                // The alias names the derived columns; the flatten enforces
-                // that one is present (accept bare or `AS` form here).
+                // The alias names the derived columns; optional, as in sqlite
+                // (accept bare or `AS` form here).
                 let from_alias = self.opt_table_alias()?;
                 (None, Some(Box::new(inner)), from_alias, 0usize)
             } else {

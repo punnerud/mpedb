@@ -146,7 +146,11 @@ impl ShardSet {
             // single key to hash, so it fans out like any non-point read. A
             // recursive CTE reads several tables plus a working table — likewise
             // no single routing key, so it fans out too.
-            PlanStmt::Compound(_) | PlanStmt::RecursiveCte(_) => Ok(Route::All),
+            // A materialized derived table likewise reads several tables plus
+            // a working table — no single routing key, fan out.
+            PlanStmt::Compound(_) | PlanStmt::RecursiveCte(_) | PlanStmt::Derived(_) => {
+                Ok(Route::All)
+            }
             PlanStmt::Begin
             | PlanStmt::Commit
             | PlanStmt::Rollback

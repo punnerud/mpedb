@@ -42,6 +42,20 @@ impl CompiledPlan {
                 out.push_str("outer:\n");
                 self.render_select(&rc.outer, schema, &mut out);
             }
+            PlanStmt::Derived(dp) => {
+                out.push_str(&format!(
+                    "Derived {}({}) — materialized once\n",
+                    dp.name,
+                    dp.columns.join(", "),
+                ));
+                out.push_str("body:\n");
+                match &dp.body {
+                    SubBody::Select(sp) => self.render_select(sp, schema, &mut out),
+                    SubBody::Compound(c) => self.render_compound(c, schema, &mut out),
+                }
+                out.push_str("outer:\n");
+                self.render_select(&dp.outer, schema, &mut out);
+            }
             _other => self.render_rest(schema, &mut out),
         }
         for (i, s) in self.subplans.iter().enumerate() {
@@ -132,11 +146,12 @@ impl CompiledPlan {
     }
 
     fn render_select(&self, sp: &SelectPlan, schema: &Schema, out: &mut String) {
-        // The working table (CTE_TABLE) is named from THIS plan's RecursiveCte
-        // node, not the schema.
-        let cte_def: Option<TableDef> = match &self.stmt {
-            PlanStmt::RecursiveCte(rc) => Some(rc.cte_def()),
-            _ => None,
+        // The working table (CTE_TABLE) is named from THIS plan's node —
+        // RecursiveCte or Derived — not the schema.
+        let (cte_def, cte_role): (Option<TableDef>, &str) = match &self.stmt {
+            PlanStmt::RecursiveCte(rc) => (Some(rc.cte_def()), "recursive working table"),
+            PlanStmt::Derived(dp) => (Some(dp.derived_def()), "materialized derived table"),
+            _ => (None, "working table"),
         };
         let table_name = |id: u32| {
             if id == super::DUAL_TABLE {
@@ -145,8 +160,8 @@ impl CompiledPlan {
             if id == super::CTE_TABLE {
                 return cte_def
                     .as_ref()
-                    .map(|t| format!("{} (recursive working table)", t.name))
-                    .unwrap_or_else(|| "(recursive working table)".to_string());
+                    .map(|t| format!("{} ({cte_role})", t.name))
+                    .unwrap_or_else(|| format!("({cte_role})"));
             }
             schema
                 .table(id)
@@ -448,7 +463,10 @@ impl CompiledPlan {
             }
         };
         match &self.stmt {
-            PlanStmt::Select(_) | PlanStmt::Compound(_) | PlanStmt::RecursiveCte(_) => {
+            PlanStmt::Select(_)
+            | PlanStmt::Compound(_)
+            | PlanStmt::RecursiveCte(_)
+            | PlanStmt::Derived(_) => {
                 unreachable!("handled by explain")
             }
             PlanStmt::Insert {

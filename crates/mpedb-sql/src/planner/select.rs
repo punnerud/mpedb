@@ -307,13 +307,15 @@ pub(super) fn plan_select<'s>(
     let eff_params = n_params + subplans.len() as u16;
     let correlated: Vec<bool> = subplans.iter().map(|p| !p.outer_args.is_empty()).collect();
 
-    // A derived table must have been flattened by the view-inline pass before
-    // planning (crate::view). If one survives to here it is an unsupported body
-    // (aggregate/join/DISTINCT/…) — refuse, never silently drop the source.
+    // A derived table the view-inline pass could not flatten is MATERIALIZED —
+    // but only at the top level (`plan_derived_select` intercepts it there). One
+    // surviving to THIS planner sits in a nested position; refuse it by name,
+    // never silently drop the source.
     if s.from_derived.is_some() {
         return Err(bind_err(
-            "this derived table `FROM (SELECT …)` is not supported yet — only a \
-             simple single-table projection/filter subquery can be used as a FROM source",
+            "a derived table `FROM (SELECT …)` with a non-flattenable body is only \
+             supported in a statement's outermost FROM — not in a compound arm, a \
+             subquery body, an INSERT … SELECT source, or a recursive CTE component",
         ));
     }
     let (table_id, table) = match &s.table {
