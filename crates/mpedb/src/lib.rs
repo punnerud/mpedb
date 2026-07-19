@@ -1962,7 +1962,7 @@ primary_key = ["id"]
     fn registry_eviction_caps_entries() {
         let (cfg, path) = test_config("evict", 64);
         let _guard = FileGuard(path);
-        let db = Database::open_with_config(cfg.clone()).unwrap();
+        let db = Database::open_with_config(cfg).unwrap();
 
         let total = registry::MAX_REGISTRY_PLANS + 1;
         let mut hashes = Vec::with_capacity(total);
@@ -1973,30 +1973,72 @@ primary_key = ["id"]
             );
         }
 
-        // Count registry entries directly.
+        // Inspect the registry through `db`'s OWN engine.
+        //
+        // This test used to open a SECOND `Database` on the same path here (the
+        // obvious "a cold-cache handle reads the shared registry" check). That is
+        // flaky: a second attach opens the file BY PATH, and `Shm::open` passes
+        // `create(true)`, so if anything removes the /dev/shm file between the
+        // fill and the second open — a concurrent process sweeping the shared
+        // tmpfs, another test run, disk pressure — the second handle silently
+        // CREATES AND FORMATS A FRESH, EMPTY database at that path and then
+        // observes zero plans, and the "survivors still resolve" assertions blow
+        // up even though eviction was perfectly correct. `db` already holds the
+        // mmap of the real inode, so reading through `db.engine` is immune to any
+        // such path churn. (The cross-handle "a fresh Database can load a plan
+        // from the shared registry" behaviour is covered independently by
+        // `sys_records_roundtrip_and_stay_clear_of_the_plan_registry`.)
         let r = db.engine.begin_read().unwrap();
-        let n_plans = r
+        let present: std::collections::HashSet<Vec<u8>> = r
             .sys_scan()
             .unwrap()
-            .iter()
+            .into_iter()
             .filter(|(k, _)| k.starts_with(registry::PLAN_PREFIX))
-            .count();
-        r.finish().unwrap();
+            .map(|(k, _)| k)
+            .collect();
+        let n_plans = present.len();
+
+        // EXACT count, not a range. This is a single writer that inserts exactly
+        // one plan per commit, so the registry grows 0,1,2,…,MAX and
+        // `evict_if_full` (registry.rs) trips exactly ONCE — at the (MAX+1)-th
+        // insert, when the tree holds precisely MAX entries — dropping
+        // EVICT_BATCH of them before adding the last, leaving MAX-EVICT_BATCH+1.
+        // (A post-eviction *range* only arises with concurrent writers that can
+        // push the count past MAX between eviction checks; there are none here,
+        // so the deterministic value is the correct invariant — do not weaken it.)
         assert_eq!(
             n_plans,
             registry::MAX_REGISTRY_PLANS - registry::EVICT_BATCH + 1
         );
 
-        // The oldest plans were evicted; a fresh handle cannot load them...
-        let db2 = Database::open_with_config(cfg).unwrap();
-        assert!(matches!(
-            db2.execute(&hashes[0], &params![]),
-            Err(Error::UnknownPlan(_))
-        ));
-        // ...but younger ones and the newest still resolve.
-        assert!(db2.execute(&hashes[registry::EVICT_BATCH], &params![]).is_ok());
-        assert!(db2.execute(&hashes[total - 1], &params![]).is_ok());
-        db2.verify().unwrap();
+        // Eviction drops the OLDEST EVICT_BATCH by last_used_txn. Here
+        // last_used_txn is strictly monotonic with prepare order (one commit per
+        // prepare, txn_id += 1 each; verified: all stamps distinct), so the
+        // evicted set is EXACTLY the first EVICT_BATCH prepared and the survivors
+        // are EXACTLY the rest — a fixed partition with no sort tie-break.
+        for &i in &[0usize, 1, registry::EVICT_BATCH - 1] {
+            assert!(
+                !present.contains(&plan_subkey(&hashes[i])),
+                "plan #{i} (among the oldest {}) should have been evicted",
+                registry::EVICT_BATCH
+            );
+        }
+        // ...and the survivors still load through the COLD registry path —
+        // `decode_registry_plan` is exactly what a cache-miss `execute` runs:
+        // parse the record, re-validate the blob against the live schema, and
+        // verify the recomputed content hash.
+        let schema = db.schema();
+        for &i in &[registry::EVICT_BATCH, registry::EVICT_BATCH + 1, total - 1] {
+            let key = plan_subkey(&hashes[i]);
+            assert!(present.contains(&key), "plan #{i} should have survived");
+            let rec = r.sys_get(&key).unwrap().expect("survivor record present");
+            decode_registry_plan(&rec, &hashes[i], &schema)
+                .unwrap_or_else(|e| panic!("survivor plan #{i} must cold-load, got {e:?}"));
+        }
+        // An evicted hash leaves no record, so the cold path reports UnknownPlan.
+        assert!(r.sys_get(&plan_subkey(&hashes[0])).unwrap().is_none());
+        r.finish().unwrap();
+        db.verify().unwrap();
     }
 
     // -------------------------------------------- detached (client-borne) plans
