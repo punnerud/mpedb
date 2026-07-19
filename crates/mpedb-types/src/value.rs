@@ -71,6 +71,23 @@ impl ColumnType {
             ColumnType::Any => "any",
         }
     }
+
+    /// The canonical SQL type name reported as a column's `decltype` (the
+    /// libsqlite3 `sqlite3_column_decltype` / Python `cursor.description[*][1]`).
+    /// `None` for [`ColumnType::Any`] — a typeless column has no declared type,
+    /// exactly as sqlite reports `NULL` for one. mpedb stores the rigid type, not
+    /// the original DDL text, so this is the canonical spelling of that type.
+    pub fn decltype_name(self) -> Option<&'static str> {
+        Some(match self {
+            ColumnType::Int64 => "INTEGER",
+            ColumnType::Float64 => "REAL",
+            ColumnType::Bool => "BOOLEAN",
+            ColumnType::Text => "TEXT",
+            ColumnType::Blob => "BLOB",
+            ColumnType::Timestamp => "TIMESTAMP",
+            ColumnType::Any => return None,
+        })
+    }
 }
 
 impl fmt::Display for ColumnType {

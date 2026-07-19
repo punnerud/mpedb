@@ -1278,6 +1278,42 @@ const OC_DO_UPDATE: u8 = 2;
 const OC_REPLACE: u8 = 3;
 
 impl CompiledPlan {
+    /// Per output column: the declared type name to report as its `decltype`
+    /// (libsqlite3 `sqlite3_column_decltype`), or `None` where sqlite also
+    /// reports NULL. A `decltype` exists ONLY for an output column that is a
+    /// bare reference to a real base-table column — the plan-derived source
+    /// mapping, not a name heuristic. Anything computed (an expression, an
+    /// aggregate, a window, a join column, a typeless `ANY` column) has no
+    /// declared type ⇒ `None`. A non-SELECT (or RETURNING) yields an empty vec,
+    /// which the caller reads as "all NULL".
+    pub fn output_decltypes(&self, schema: &Schema) -> Vec<Option<String>> {
+        let PlanStmt::Select(sp) = &self.stmt else {
+            return Vec::new();
+        };
+        // Real OUTPUT columns exclude the trailing sort-only "junk" projections.
+        let out_n = sp.projection.len().saturating_sub(sp.order_junk as usize);
+        // Only a single-table scan with no aggregate/window keeps the projection
+        // over the BASE ROW, so `Projection::Column(n)` indexes table column `n`.
+        // Joins/aggregates/windows reshape the tuple — no base-column source.
+        if !sp.joins.is_empty() || sp.aggregate.is_some() || !sp.windows.is_empty() {
+            return vec![None; out_n];
+        }
+        let Some(table) = schema.table(sp.table) else {
+            return vec![None; out_n];
+        };
+        sp.projection
+            .iter()
+            .take(out_n)
+            .map(|p| match p {
+                Projection::Column(n) => table
+                    .columns
+                    .get(*n as usize)
+                    .and_then(|c| c.ty.decltype_name().map(str::to_string)),
+                Projection::Expr { .. } => None,
+            })
+            .collect()
+    }
+
     /// The table this plan targets (for RLS policy-epoch validation), if any.
     pub fn target_table(&self) -> Option<u32> {
         match &self.stmt {

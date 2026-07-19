@@ -432,6 +432,18 @@ impl Database {
         )
     }
 
+    /// Per output column, the `decltype` to report through the C-API shim
+    /// (`sqlite3_column_decltype`) / Python `cursor.description[*][1]`. Compiles
+    /// `sql` — surfacing any bind/plan error exactly as prepare would — and
+    /// derives each column's declared type from the plan's projection (see
+    /// [`CompiledPlan::output_decltypes`]): a bare base-table column reports its
+    /// type, everything computed reports `None`. A non-SELECT yields an empty
+    /// vec (all NULL). This does not execute or publish a plan.
+    pub fn output_decltypes(&self, sql: &str) -> Result<Vec<Option<String>>> {
+        let (plan, _explain) = self.compile_maybe_explain(sql)?;
+        Ok(plan.output_decltypes(&self.schema()))
+    }
+
     /// Compile `sql` against an EXPLICIT schema bundle — a [`WriteSession`]'s
     /// own view, which may already reflect DDL applied earlier in the SAME
     /// uncommitted transaction (#95). Unlike [`compile_maybe_explain`], there is
