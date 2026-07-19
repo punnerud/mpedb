@@ -114,7 +114,7 @@ pub fn schema_toml(schema: &Schema) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mpedb_types::{Collation, ColumnDef, ColumnType, Config, TableDef, TableKind};
+    use mpedb_types::{Affinity, Collation, ColumnDef, ColumnType, Config, TableDef, TableKind};
 
     /// A dumped schema must be re-readable as a config. Identifiers may now
     /// contain spaces, punctuation and `"` (design/DESIGN-TABLE-CAP.md §7), so
@@ -140,6 +140,7 @@ mod tests {
             default: None,
             check: None,
             collation: Collation::Binary,
+            affinity: Affinity::implied_by(ColumnType::Int64),
         };
         let tables: Vec<TableDef> = names
             .iter()
