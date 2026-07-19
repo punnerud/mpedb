@@ -272,7 +272,7 @@ Select emp
     access: PkPoint(did = emp.did)
     on: true
   project: emp.ename
-  footprint: read_only=true tables_read=0x3 tables_written=0x0 indexes_used=0x1 key=Full
+  footprint: read_only=true tables_read=[0,1] tables_written=[] indexes_used=0x1 key=Full
 
 query T nosort
 EXPLAIN SELECT emp.ename FROM emp LEFT JOIN dept ON emp.did > dept.did
@@ -283,7 +283,7 @@ Select emp
     access: FullScan
     on: emp.did > dept.did
   project: emp.ename
-  footprint: read_only=true tables_read=0x3 tables_written=0x0 indexes_used=0x1 key=Full
+  footprint: read_only=true tables_read=[0,1] tables_written=[] indexes_used=0x1 key=Full
 
 # ---- still required, still refused --------------------------------------------------
 

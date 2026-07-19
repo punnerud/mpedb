@@ -58,9 +58,10 @@ Why, precisely:
    maintenance tax on all future code.
 
 3. **No-reuse's cost is bounded, detectable, recoverable.** One persisted
-   monotonic counter; exhaustion only after **64 lifetime creates** (the
-   existing ≤ 56 *live*-count guard means non-churny workloads never approach
-   it); the wall is an explicit `Error::Unsupported` at mint, never
+   monotonic counter; exhaustion only after `MAX_TABLES` lifetime creates (**64**
+   when this was written, **4096** since design/DESIGN-TABLE-CAP.md dropped the
+   footprint bitmap — read every "64"/"56" below as `MAX_TABLES` /
+   `MAX_TABLES - 8`); the wall is an explicit `Error` at mint, never
    corruption. The escape hatch is an offline "compact table ids" maintenance
    op (rewrite to dense ids + rewrite every persisted `table_id` record + bump
    schema-gen, run exclusive so there is no aliasing window) — a single batch,

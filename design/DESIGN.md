@@ -39,10 +39,12 @@ documents rather than solves in Phase 1.
   being true in 2026-07.
 - **No joins, subqueries or EXISTS *yet*; no aggregates yet.** A build-order
   limit, not an architectural one — and the distinction matters, because the
-  first draft of this line asserted the opposite. `Footprint` is ALREADY a bitmap
-  over `MAX_TABLES` (`tables_read` / `tables_written` / `indexes_used`) carrying
+  first draft of this line asserted the opposite. `Footprint` ALREADY carries a
+  per-table access set (`tables_read` / `tables_written` — sparse `TableSet`s
+  since design/DESIGN-TABLE-CAP.md, per-table bitmaps before that — plus the
+  `indexes_used` bitmap over the per-table index numbering) and
   `KeyAccess::Point|Range|Full`, so it can already describe a multi-table,
-  key-scoped access set; `conflicts_with` is a bitmap AND with key-level
+  key-scoped access set; `conflicts_with` is a set intersection with key-level
   refinement for `Point`. What is single-table is the BINDER
   (`Binder { table: &TableDef }`) and `ExprProgram` (single-row scalar).
   Cross-**member** JOIN — across separate workspace files — is out of scope
@@ -50,7 +52,7 @@ documents rather than solves in Phase 1.
   mean separate catalogs and separate commit protocols. **Within one file the
   design says the opposite** (§21: shared data / joins across the wall = yes,
   cross-table atomic commit = yes). A multi-table binder must claim every table it
-  touches in the footprint — which is what the bitmap is for.
+  touches in the footprint — which is what the table set is for.
 - **Platform: Linux (x86-64, 32/64-bit ARM) and macOS/Apple Silicon.** The macOS
   port is the FLD-2 flock writer lock + `F_FULLFSYNC` durability barrier
   (`crate::os`); it is crash-safe and benchmarked, not a stub. Windows later.
@@ -728,8 +730,11 @@ let rows = db.execute(&h, params![42])?;                            // no parsin
 
 ### 7.3 Precomputed footprints ("pre-computed locks")
 
-Per-plan, computed at prepare: `tables_read`/`tables_written`/`indexes_used` bitmaps +
-`KeyAccess` (Point with param/const slots | Range | Full) + `read_only`.
+Per-plan, computed at prepare: the `tables_read`/`tables_written` table SETS (sparse,
+sorted `TableSet`s — design/DESIGN-TABLE-CAP.md; they were per-table bitmaps until the
+128-table ceiling made that untenable) + the `indexes_used` bitmap over the per-table
+index numbering + `KeyAccess` (Point with param/const slots | Range | Full) +
+`read_only`.
 
 - `read_only == true` → `execute` routes to a read txn; the writer lock is never touched.
 - **Honesty rule (confirmed finding):** exact key-level write sets exist only for

@@ -1,5 +1,14 @@
 # DESIGN-TABLE-ID-GEN — generation-safe table-id reclamation
 
+**Status: design, NOT BUILT — and no longer the pressing problem (2026-07-19).**
+[DESIGN-TABLE-CAP.md](DESIGN-TABLE-CAP.md) took the other branch: instead of making the cap
+apply to LIVE tables via generation-tagged reuse, it made the footprint (and the CDC capture
+config) SPARSE, so the id space stopped being an integer width at all. `MAX_TABLES` is 4096
+and is now a cost knob, not a representation limit. Everything below stays correct and stays
+the right answer if lifetime-create exhaustion ever becomes real; it is simply no longer
+urgent, and its premise ("`MAX_TABLES = 64` comes from the bitmap being a `u64`") is
+historical. Original status line follows.
+
 **Status: design (2026-07-18). Supersedes #81's "just widen the bitmap": lift the 64 *lifetime*-create
 cap by making the cap apply to LIVE tables only, via safe id reclamation. This is the fix
 [DESIGN-DROP-TABLE.md](DESIGN-DROP-TABLE.md) §0 deferred — it is the deepest schema/plan/CDC/

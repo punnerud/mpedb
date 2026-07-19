@@ -134,7 +134,7 @@ fn wide_schema_joins_above_the_old_cap_match_sqlite() {
     build(&db, &conn);
 
     // The seed table plus 200 user tables is past every retired ceiling.
-    assert!(N_TABLES > 128, "the fixture must clear the old u128 width");
+    const { assert!(N_TABLES > 128, "the fixture must clear the old u128 width") };
 
     let mut queries: Vec<String> = Vec::new();
     // Single-table reads at, on both sides of, and far past every old boundary.

@@ -498,8 +498,8 @@ The honest reading of those two deltas:
 | **D3** | sqlite's declared-type vocabulary | **CLOSED** (`d45ad77`). The hand-written `data_types` table is deleted; Django's own `varchar(100)`/`bigint`/`datetime`/`decimal(10,2)` go straight in. **But see W1** — for the NUMERIC-affinity family this converted a loud refusal into a silent wrong answer. |
 | **D4** | `DEFAULT` / `CHECK` / `REFERENCES` in CREATE TABLE | **CLOSED for DEFAULT and CHECK** (`05bf406`, `fae9e73` — parsed AND enforced). The `DEFAULT`-stripping `_iter_column_sql` and `data_type_check_constraints = {}` are deleted, and `supports_*_check_constraints` are back on. `REFERENCES` is **parsed and dropped**: the inline FK clause is now emitted on every ForeignKey (`sql_create_inline_fk` untouched), but nothing enforces it, so `supports_foreign_keys = False` stays as **D4b**. |
 | **D5** | table/column constraint may not be NAMED | **CLOSED** (`2097f18`). The `sql_constraint = "%(constraint)s"` override is deleted. |
-| **D6** | 120-table ceiling | **OPEN, re-verified.** `queries` still dies at `schema error: too many tables (121 > 120)`. |
-| **D7** | 128-byte identifier limit | **OPEN** (`schema.rs:250`, `s.len() <= 128`). Note `backends` now stops on **D6** first — same `too many tables (121 > 120)` — so D7 is confirmed present in the code but is no longer the label's proximate blocker. |
+| **D6** | 120-table ceiling | **CLOSED** (design/DESIGN-TABLE-CAP.md, PLAN_FORMAT 41). Footprints and the CDC capture config stopped being per-table bitmaps and became sparse `TableSet`s, so the id space is no longer an integer width: `MAX_TABLES` = 4096, **4088 live user tables**. Not re-measured against Django yet — the ceiling is gone from the code; whether `queries` then runs clean is the next measurement. |
+| **D7** | 128-byte identifier limit | **CLOSED** (same pass). Limit is 255 bytes, and the identifier CHARACTER set moved with it: a quoted name may contain spaces, punctuation, `"` (doubled), a leading digit and non-ASCII, matching sqlite 3.45.1. Only control characters (NUL above all — the C-API hands names out as NUL-terminated `const char*`), the empty name and the `__mpedb` prefix are refused. Django's 134-char generated m2m through-table name now fits. |
 | **D8** | `sqlite_master` breadth (recursive-CTE FK graph) | **OPEN.** The `_references_graph` adaptation is kept. |
 
 ### Re-ranked MPEdb-only gaps
@@ -538,12 +538,12 @@ test in the class. Fix any earlier gap and they go away.
 
 ### Coverage — re-checked, unchanged
 
-* **`queries` (493 tests) — still cannot run.** `django.db.utils.OperationalError:
-  schema error: too many tables (121 > 120)` during migrate (D6).
-* **`backends` — still cannot run**, now for D6 rather than D7: same
-  `too many tables (121 > 120)`. The 128-byte identifier limit is still there
-  (`crates/mpedb-types/src/schema.rs:250`), it just is not what stops the label
-  first any more.
+* **`queries` (493 tests) — the ceiling that blocked it is GONE** (D6 closed,
+  2026-07-19: `MAX_TABLES` 128 → 4096). Not yet re-measured: what the label does
+  once migrate completes is the next run's question, not a claim made here.
+* **`backends` — both of its blockers are closed** (D6 and D7). The 128-byte
+  identifier limit is now 255 and no longer rejects spaces or punctuation, so
+  the 134-char generated m2m name fits. Also unmeasured as yet.
 * Still 9 of Django's 219 labels, 831 of ~19 000 tests, `--parallel=1`, no
   concurrency or multi-process behaviour measured.
 
