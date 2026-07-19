@@ -1,0 +1,277 @@
+# A TYPELESS (`any`) column as a PRIMARY KEY.
+#
+# Every expected value here was produced by running the same program through
+# sqlite3 3.45.1 (`create table t(k primary key, tag text)` — a column with no
+# declared type, which is sqlite's no-affinity column and mpedb's `any`) rather
+# than reasoned out.
+#
+# `Schema::validate` refused this until now, on the grounds that "a key is
+# memcmp-ordered and `any` has no order across types". mpedb has that order now:
+# `Value::sort_cmp` is sqlite's storage-class order (NULL < numbers < TEXT <
+# BLOB) and `keycode::KeySpec { class: true }` is that order AS BYTES, with
+# equality that matches it. So the key is real, and it is what unblocks Django's
+# `queries` label (`DateTimeField(primary_key=True)`).
+#
+# The three pairs the TYPE-keyed encoder got wrong, and why each was a bug and
+# not a preference:
+#
+#   1 vs 1.0        it SPLIT them   — two rows where sqlite raises UNIQUE
+#   0 vs -0.0       it SPLIT them   — same
+#   '1' vs x'31'    it ALIASED them — ONE row where sqlite has two: the payload
+#                                     bytes are identical and the mpedb type is
+#                                     not in the encoding, so an INSERT would
+#                                     have overwritten an unrelated row
+#
+# and the pair no `as f64` cast can keep apart: the real 9007199254740992.0
+# sorts strictly BELOW the integer 9007199254740993.
+#
+# What is allowed is the STORAGE, not the access path: `planner::access` never
+# probes a typeless key, so every predicate below is a residual filter over a
+# full scan. That is also what keeps the comparison-affinity rule's own proof
+# intact (a `ClassCmp` is never an access path).
+#
+# schema:
+# [[table]]
+# name = "t"
+# primary_key = ["k"]
+#
+#   [[table.column]]
+#   name = "k"
+#   type = "any"
+#
+#   [[table.column]]
+#   name = "tag"
+#   type = "text"
+# end schema
+
+statement ok
+INSERT INTO t (k, tag) VALUES (1, 'int1')
+
+statement ok
+INSERT INTO t (k, tag) VALUES ('1', 'text1')
+
+statement ok
+INSERT INTO t (k, tag) VALUES (x'31', 'blob31')
+
+statement ok
+INSERT INTO t (k, tag) VALUES (-0.0, 'negzero')
+
+statement ok
+INSERT INTO t (k, tag) VALUES (2.5, 'r2.5')
+
+statement ok
+INSERT INTO t (k, tag) VALUES (-7, 'im7')
+
+statement ok
+INSERT INTO t (k, tag) VALUES ('abc', 'tabc')
+
+statement ok
+INSERT INTO t (k, tag) VALUES (9007199254740993, 'i2p53p1')
+
+statement ok
+INSERT INTO t (k, tag) VALUES (9007199254740992.0, 'r2p53')
+
+# --- uniqueness: exactly the values sqlite's `=` calls equal -----------------
+
+statement error
+INSERT INTO t (k, tag) VALUES (1.0, 'dup-of-int1')
+
+statement error
+INSERT INTO t (k, tag) VALUES (0, 'dup-of-negzero')
+
+statement error
+INSERT INTO t (k, tag) VALUES (0.0, 'dup-of-negzero')
+
+statement error
+INSERT INTO t (k, tag) VALUES ('abc', 'dup-of-tabc')
+
+statement error
+INSERT INTO t (k, tag) VALUES (x'31', 'dup-of-blob31')
+
+query I nosort
+SELECT count(*) FROM t
+----
+9
+
+# --- tree order IS sqlite's ORDER BY order ----------------------------------
+#
+# A single-key ORDER BY over the PK carries NO sort (the plan elides it), so
+# this reads the B+tree's own order. Note the interleaving: the real
+# 9007199254740992.0 comes before the integer 9007199254740993.
+
+query TT nosort
+SELECT typeof(k), tag FROM t ORDER BY k
+----
+integer
+im7
+real
+negzero
+integer
+int1
+real
+r2.5
+real
+r2p53
+integer
+i2p53p1
+text
+text1
+text
+tabc
+blob
+blob31
+
+# The SAME sequence through the EXPLICIT sorter: two keys is longer than the
+# one-column PK, so the elision does not fire and `cmp_rows`/`Value::sort_cmp`
+# decides. The tree and the comparator must not disagree.
+
+query TT nosort
+SELECT typeof(k), tag FROM t ORDER BY k, tag
+----
+integer
+im7
+real
+negzero
+integer
+int1
+real
+r2.5
+real
+r2p53
+integer
+i2p53p1
+text
+text1
+text
+tabc
+blob
+blob31
+
+query TT nosort
+SELECT typeof(k), tag FROM t ORDER BY k DESC
+----
+blob
+blob31
+text
+tabc
+text
+text1
+integer
+i2p53p1
+real
+r2p53
+real
+r2.5
+integer
+int1
+real
+negzero
+integer
+im7
+
+# --- point lookups: one key slot per sqlite `=` -----------------------------
+
+query T nosort
+SELECT tag FROM t WHERE k = 1
+----
+int1
+
+query T nosort
+SELECT tag FROM t WHERE k = 1.0
+----
+int1
+
+query T nosort
+SELECT tag FROM t WHERE k = '1'
+----
+text1
+
+query T nosort
+SELECT tag FROM t WHERE k = x'31'
+----
+blob31
+
+# --- ranges whose bound is in a DIFFERENT class from the stored values ------
+
+query T nosort
+SELECT tag FROM t WHERE k > 0 ORDER BY tag
+----
+blob31
+i2p53p1
+int1
+r2.5
+r2p53
+tabc
+text1
+
+query T nosort
+SELECT tag FROM t WHERE k < 0 ORDER BY tag
+----
+im7
+
+query T nosort
+SELECT tag FROM t WHERE k >= '1' ORDER BY tag
+----
+blob31
+tabc
+text1
+
+query T nosort
+SELECT tag FROM t WHERE k < 'abc' ORDER BY tag
+----
+i2p53p1
+im7
+int1
+negzero
+r2.5
+r2p53
+text1
+
+query T nosort
+SELECT tag FROM t WHERE k BETWEEN 1 AND 'abc' ORDER BY tag
+----
+i2p53p1
+int1
+r2.5
+r2p53
+tabc
+text1
+
+# The 2^53 pair, as a range: the integer is strictly above the real.
+
+query T nosort
+SELECT tag FROM t WHERE k > 9007199254740992.0 ORDER BY tag
+----
+blob31
+i2p53p1
+tabc
+text1
+
+query TT nosort
+SELECT typeof(min(k)), typeof(max(k)) FROM t
+----
+integer
+blob
+
+query T nosort
+SELECT tag FROM t WHERE k <> 1 ORDER BY tag
+----
+blob31
+i2p53p1
+im7
+negzero
+r2.5
+r2p53
+tabc
+text1
+
+query T nosort
+SELECT tag FROM t WHERE k <= -0.0 ORDER BY tag
+----
+im7
+negzero
+
+query T nosort
+SELECT tag FROM t WHERE k > x'00' ORDER BY tag
+----
+blob31

@@ -383,6 +383,43 @@ fn valid_identifier(s: &str) -> bool {
 /// Upper bound on secondary indexes per table (canonical-bytes v2).
 pub const MAX_INDEXES: usize = 32;
 
+/// **Why a typeless (`any`) column MAY be a PRIMARY KEY / index column.**
+///
+/// `Schema::validate` refused it until now, on a reason that was correct at the
+/// time and is no longer: "a key is memcmp-ordered and `any` has no order
+/// across types". mpedb now has that order. [`Value::sort_cmp`](crate::Value::sort_cmp)
+/// is sqlite's storage-class order (NULL < numbers < TEXT < BLOB), and
+/// [`keycode::encode_group_value`](crate::keycode::encode_group_value) is that
+/// order AS BYTES, with a pinned two-way contract: the bytes are equal exactly
+/// when `sort_cmp` says `Equal`, and their byte order equals `sort_cmp`
+/// wherever it answers. That is precisely what a key encoding is, so an `any`
+/// key column is encoded with it ([`keycode::KeySpec`](crate::keycode::KeySpec))
+/// rather than with the type-keyed encoder.
+///
+/// The refusal was ALSO covering a real bug, and dropping it without switching
+/// the encoder would have reinstated the bug rather than the refusal. The
+/// type-keyed encoder is wrong for a typeless column in BOTH directions,
+/// verified against sqlite 3.45.1:
+///
+/// - it SPLITS `1` from `1.0` and `0` from `-0.0` — two PK rows where sqlite
+///   raises `UNIQUE constraint failed`;
+/// - it ALIASES the text `'1'` with the blob `x'31'` (identical payload bytes;
+///   the type is not in the encoding) — ONE row where sqlite has two, i.e. an
+///   INSERT silently overwriting an unrelated row.
+///
+/// **What is still refused, and where.** Allowing the STORAGE is not allowing
+/// the ACCESS PATH. `planner::access` and `planner::join` never build a
+/// `PkPoint`/`PkRange`/`IndexPoint`/`IndexRange` over an `any` column: such a
+/// probe would have to apply the pair's *comparison affinity* to the bound
+/// before encoding it (sqlite's rule — the binder's `ClassCmp`), and mpedb's
+/// own `Bool`/`Timestamp` have no storage class at all, so `sort_cmp` calls
+/// them peers where the key ranks them. Every predicate over an `any` column
+/// therefore stays a residual filter over a full scan, which keeps the
+/// comparison-affinity work's proof (a `ClassCmp` is never an access path)
+/// true word for word. The cost is a scan; the alternative is an index that
+/// can disagree with one.
+pub const ANY_KEY_COLUMNS: () = ();
+
 /// Normalize the column flag sugar and derive `TableDef::indexes` — shared
 /// by seeding (`Schema::new`) and evolution (`Schema::with_added_table`).
 /// A column that is both `unique` and `indexed` has ONE unique index (the
@@ -789,34 +826,7 @@ impl Schema {
                         t.name, c.name
                     )));
                 }
-                if c.ty == ColumnType::Any {
-                    return Err(Error::Schema(format!(
-                        "primary key column `{}.{}` cannot be `any`: a key is \
-                         memcmp-ordered, and ordering across types would mean \
-                         inventing whether 5 sorts before \"a\" — declare the \
-                         column's real type",
-                        t.name, c.name
-                    )));
-                }
-            }
-            // Same reasoning for EVERY secondary index, unique or not: its keys
-            // are encoded with `keycode` too, so it needs an order across the
-            // column's values — and `any` has none. A non-unique index over
-            // `any` slipped through here once, and the adversarial review
-            // showed what that means: the memcmp order across mixed runtime
-            // types is arbitrary, so an IndexRange returned WRONG rows — and
-            // DELETE/UPDATE through it deleted them.
-            for c in &t.columns {
-                if (c.unique || c.indexed) && c.ty == ColumnType::Any {
-                    return Err(Error::Schema(format!(
-                        "column `{}.{}` cannot be `any` and carry an index \
-                         ({}): the index is memcmp-ordered and `any` has no \
-                         order across types",
-                        t.name,
-                        c.name,
-                        if c.unique { "UNIQUE" } else { "indexed" }
-                    )));
-                }
+                // `any` IS allowed here. See `ANY_KEY_COLUMNS` below.
             }
             // The authoritative index list (canonical-bytes v2). The flag
             // check above is defense for hand-built defs; THIS is the check
@@ -844,24 +854,13 @@ impl Schema {
                     )));
                 }
                 for &ci in &ix.columns {
-                    let c = t.columns.get(ci as usize).ok_or_else(|| {
+                    t.columns.get(ci as usize).ok_or_else(|| {
                         Error::Schema(format!(
                             "index column ordinal {ci} out of range in `{}`",
                             t.name
                         ))
                     })?;
-                    // Same reasoning as the PK/flag rules: index keys are
-                    // keycode-encoded, and `any` has no order across types —
-                    // a review-built v2 blob with an `any` index would
-                    // resurrect the wrong-rows/wrong-DELETE bug.
-                    if c.ty == ColumnType::Any {
-                        return Err(Error::Schema(format!(
-                            "index column `{}.{}` cannot be `any`: the index \
-                             is memcmp-ordered and `any` has no order across \
-                             types",
-                            t.name, c.name
-                        )));
-                    }
+                    // `any` IS allowed here. See `ANY_KEY_COLUMNS` below.
                 }
                 if ix.columns.len() == 1
                     && t.primary_key.len() == 1
@@ -1500,13 +1499,13 @@ mod tests {
         }])
         .unwrap();
 
-        // An index over an `any` column would resurrect the documented
-        // wrong-rows/wrong-DELETE memcmp bug — decode must refuse it even
-        // though the bytes are structurally well-formed.
-        let mut evil = base.clone();
-        evil.tables[0].indexes = vec![IndexDef { columns: vec![1], unique: false }];
-        let err = Schema::from_canonical_bytes(&evil.canonical_bytes()).unwrap_err();
-        assert!(format!("{err}").contains("any"), "{err}");
+        // An index over an `any` column is ACCEPTED now (`ANY_KEY_COLUMNS`):
+        // such a tree is keyed by storage class, whose equality and order are
+        // sqlite's, and the planner — not the schema — is what keeps it from
+        // ever being probed.
+        let mut ok = base.clone();
+        ok.tables[0].indexes = vec![IndexDef { columns: vec![1], unique: false }];
+        Schema::from_canonical_bytes(&ok.canonical_bytes()).unwrap();
 
         // Duplicate index shapes refuse.
         let mut evil = base.clone();

@@ -107,6 +107,76 @@ pub fn encode_key_collated(values: &[Value], collations: &[Collation]) -> Vec<u8
     buf
 }
 
+/// How ONE key column's values become ordered bytes: its collating sequence,
+/// plus whether the column is the TYPELESS one.
+///
+/// A rigidly typed column can hold exactly one storage class, so its on-disk
+/// key is the TYPE-keyed [`encode_value_collated`] and always has been. A
+/// [`ColumnType::Any`] column can hold several classes at once, and there the
+/// type-keyed encoding is a wrong answer in both directions — it splits `1`
+/// from `1.0` (two PK rows where sqlite has one) and ALIASES the text `'1'`
+/// with the blob `x'31'` (one PK row where sqlite has two, i.e. silent data
+/// loss). So an `any` key column is encoded by STORAGE CLASS instead
+/// ([`encode_group_value`]), whose equality is exactly `sort_cmp`'s and whose
+/// byte order is exactly sqlite's index order.
+///
+/// `KeySpec::default()` is "binary collation, typed" — the historical encoding
+/// byte for byte, which is why a short/empty spec slice means
+/// [`encode_key`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeySpec {
+    /// Collating sequence; folds TEXT before encoding. Applies to both modes.
+    pub coll: Collation,
+    /// `true` for a [`ColumnType::Any`] key column — encode by storage class.
+    pub class: bool,
+}
+
+impl KeySpec {
+    /// The spec a column of declared type `ty` and collation `coll` keys under.
+    #[inline]
+    pub fn for_column(ty: ColumnType, coll: Collation) -> KeySpec {
+        KeySpec { coll, class: ty == ColumnType::Any }
+    }
+
+    /// Whether this spec encodes exactly like plain [`encode_key`] — used by the
+    /// engine to keep the common table on the cheap path.
+    #[inline]
+    pub fn is_plain(self) -> bool {
+        self.coll == Collation::Binary && !self.class
+    }
+}
+
+/// Append one value under a [`KeySpec`].
+///
+/// Both arms are prefix-safe against each other, so a composite key may mix
+/// them: every payload is fixed-size or 0x00-terminated with the same `0xff`
+/// escape, and every leading tag either mode can emit is `<= 0x05`, i.e. below
+/// the escape byte. That is the same argument that already lets typed columns
+/// concatenate.
+#[inline]
+pub fn encode_value_spec(buf: &mut Vec<u8>, v: &Value, spec: KeySpec) {
+    if spec.class {
+        encode_group_value(buf, v, spec.coll);
+    } else {
+        encode_value_collated(buf, v, spec.coll);
+    }
+}
+
+/// Encode a composite key under per-column [`KeySpec`]s. `specs[i]` governs
+/// `values[i]`; a shorter slice defaults to [`KeySpec::default`], so
+/// `encode_key_spec(v, &[])` == [`encode_key`]`(v)`.
+///
+/// **This is the single on-disk key encoder.** Every tree — PK and secondary,
+/// unique and not — goes through it, so the write that inserts a key and the
+/// read that probes for it cannot disagree about what a key is.
+pub fn encode_key_spec(values: &[Value], specs: &[KeySpec]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(values.len() * 12);
+    for (i, v) in values.iter().enumerate() {
+        encode_value_spec(&mut buf, v, specs.get(i).copied().unwrap_or_default());
+    }
+    buf
+}
+
 // ---------------------------------------------------------------------------
 // The GROUP key: sqlite's storage-class equality, as bytes.
 // ---------------------------------------------------------------------------
@@ -261,6 +331,11 @@ fn encode_number(buf: &mut Vec<u8>, v: &Value) {
 /// corrupt input yields `Error::Corrupt`, never a panic.
 pub fn decode_value(buf: &[u8], pos: &mut usize, ty: ColumnType) -> Result<Value> {
     let err = || Error::Corrupt("truncated key".into());
+    // A typeless key column is CLASS-encoded (see [`KeySpec`]) and carries its
+    // own tag alphabet, so it is dispatched before the typed tag is read.
+    if ty == ColumnType::Any {
+        return decode_group_value(buf, pos);
+    }
     let tag = *buf.get(*pos).ok_or_else(err)?;
     *pos += 1;
     match tag {
@@ -269,15 +344,7 @@ pub fn decode_value(buf: &[u8], pos: &mut usize, ty: ColumnType) -> Result<Value
         t => return Err(Error::Corrupt(format!("invalid key tag {t:#x}"))),
     }
     match ty {
-        // Refused at schema validation, so reaching here means a corrupt or
-        // hand-built catalog rather than a user mistake. Ordering ACROSS types
-        // is the reason: a key must be memcmp-ordered, and deciding whether
-        // Int(5) sorts before Text("a") means inventing a cross-type order.
-        // sqlite has one; adopting it would hand back exactly the kind of
-        // surprise this project exists to remove. See `Schema::validate`.
-        ColumnType::Any => Err(Error::Corrupt(
-            "an `any` column cannot be part of a key".into(),
-        )),
+        ColumnType::Any => unreachable!("handled above"),
         ColumnType::Int64 | ColumnType::Timestamp => {
             let raw = buf.get(*pos..*pos + 8).ok_or_else(err)?;
             *pos += 8;
@@ -314,6 +381,66 @@ pub fn decode_value(buf: &[u8], pos: &mut usize, ty: ColumnType) -> Result<Value
                 Ok(Value::Blob(bytes))
             }
         }
+    }
+}
+
+/// Decode one CLASS-encoded value ([`encode_group_value`]), advancing `*pos`.
+///
+/// **Canonical, not verbatim, and that is the contract.** The class encoding
+/// deliberately gives integer `1` and real `1.0` the SAME bytes — that is what
+/// makes an `any` UNIQUE/PRIMARY KEY collide exactly where sqlite's `=` does —
+/// so no decoder can tell them apart. This one returns the integer, the
+/// representative sqlite itself stores under NUMERIC affinity.
+///
+/// What IS exact is the key-level round trip, which is the only property a key
+/// decoder owes: `encode_group_value(decode_group_value(k)) == k` for every `k`
+/// this encoder can produce (pinned by `class_key_round_trips`). Callers that
+/// need the value a row actually holds read the ROW, which stores it verbatim —
+/// the engine's PK-range collector does exactly that.
+pub fn decode_group_value(buf: &[u8], pos: &mut usize) -> Result<Value> {
+    let err = || Error::Corrupt("truncated class key".into());
+    let take8 = |pos: &mut usize| -> Result<[u8; 8]> {
+        let raw: [u8; 8] = buf.get(*pos..*pos + 8).ok_or_else(err)?.try_into().unwrap();
+        *pos += 8;
+        Ok(raw)
+    };
+    let class = *buf.get(*pos).ok_or_else(err)?;
+    *pos += 1;
+    match class {
+        CLASS_NULL => Ok(Value::Null),
+        CLASS_NUM => {
+            let floor = (u64::from_be_bytes(take8(pos)?) ^ (1 << 63)) as i64;
+            let sub = *buf.get(*pos).ok_or_else(err)?;
+            *pos += 1;
+            match sub {
+                // No f64 image follows: the value IS that integer.
+                NUM_EXACT => Ok(Value::Int(floor)),
+                NUM_BELOW | NUM_ABOVE | NUM_NAN => {
+                    let n = u64::from_be_bytes(take8(pos)?);
+                    let bits = if n >> 63 == 1 { n & !(1 << 63) } else { !n };
+                    Ok(Value::Float(f64::from_bits(bits)))
+                }
+                t => Err(Error::Corrupt(format!("invalid numeric sub-tag {t:#x} in key"))),
+            }
+        }
+        CLASS_TEXT => Ok(Value::Text(
+            String::from_utf8(decode_bytes(buf, pos)?)
+                .map_err(|_| Error::Corrupt("invalid utf-8 in key".into()))?,
+        )),
+        CLASS_BLOB => Ok(Value::Blob(decode_bytes(buf, pos)?)),
+        CLASS_BOOL => {
+            let b = *buf.get(*pos).ok_or_else(err)?;
+            *pos += 1;
+            match b {
+                0 => Ok(Value::Bool(false)),
+                1 => Ok(Value::Bool(true)),
+                _ => Err(Error::Corrupt("invalid bool in key".into())),
+            }
+        }
+        CLASS_TS => Ok(Value::Timestamp(
+            (u64::from_be_bytes(take8(pos)?) ^ (1 << 63)) as i64,
+        )),
+        t => Err(Error::Corrupt(format!("invalid class key tag {t:#x}"))),
     }
 }
 
@@ -626,5 +753,150 @@ mod tests {
         }
         let _ = decode_key(&[0x02], &[ColumnType::Int64]);
         let _ = decode_key(&[0x01, 0x05], &[ColumnType::Bool]);
+    }
+
+    // -- typeless (`any`) KEY columns: `KeySpec { class: true }` ------------
+
+    const CLASS: KeySpec = KeySpec { coll: Collation::Binary, class: true };
+
+    /// A key over an `any` column keys by STORAGE CLASS. That is the whole
+    /// licence for allowing such a key at all, so restate the contract through
+    /// the ON-DISK entry point rather than only through `encode_group_key`:
+    /// two values occupy the same key slot exactly when sqlite's comparison
+    /// calls them one value, and the tree's byte order is sqlite's order.
+    #[test]
+    fn class_key_slots_match_sort_cmp() {
+        let zoo = group_key_zoo();
+        for a in &zoo {
+            for b in &zoo {
+                let ord = encode_key_spec(std::slice::from_ref(a), &[CLASS])
+                    .cmp(&encode_key_spec(std::slice::from_ref(b), &[CLASS]));
+                match a.sort_cmp(b, Collation::Binary) {
+                    Some(o) => assert_eq!(ord, o, "key order: {a:?} vs {b:?}"),
+                    None => assert_eq!(
+                        ord == Ordering::Equal,
+                        a.is_null() && b.is_null(),
+                        "key slot: {a:?} vs {b:?}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The three pairs a `datetime`/`decimal` PRIMARY KEY lives or dies on,
+    /// each checked against sqlite 3.45.1 by hand:
+    ///
+    /// - `1` and `1.0` are ONE key (sqlite: `UNIQUE constraint failed`);
+    /// - `0` and `-0.0` are ONE key (same);
+    /// - `'1'` and `x'31'` are TWO — the payload bytes are identical and only
+    ///   the class differs, which is exactly what the type-keyed encoder used
+    ///   to lose (an INSERT would have overwritten an unrelated row);
+    /// - `9007199254740992.0` and `9007199254740993` are TWO, with the real
+    ///   BELOW the integer — no `as f64` anywhere to round them together.
+    #[test]
+    fn class_key_pairs_sqlite_agrees_on() {
+        let k = |v: Value| encode_key_spec(&[v], &[CLASS]);
+        assert_eq!(k(Value::Int(1)), k(Value::Float(1.0)));
+        assert_eq!(k(Value::Int(0)), k(Value::Float(-0.0)));
+        assert_ne!(k(Value::Text("1".into())), k(Value::Blob(b"1".to_vec())));
+        let lo = k(Value::Float(9007199254740992.0));
+        let hi = k(Value::Int(9007199254740993));
+        assert_ne!(lo, hi);
+        assert!(lo < hi);
+        // ...and the type-keyed encoder gets every one of them wrong, which is
+        // why the spec exists.
+        let t = |v: Value| encode_key(&[v]);
+        assert_ne!(t(Value::Int(1)), t(Value::Float(1.0)));
+        assert_eq!(t(Value::Text("1".into())), t(Value::Blob(b"1".to_vec())));
+    }
+
+    /// A class-keyed column decodes to the CANONICAL member of its slot, and
+    /// re-encoding it reproduces the key byte for byte. That round trip is the
+    /// only property a key decoder owes — the row, not the key, is where the
+    /// value a caller inserted is recovered from.
+    #[test]
+    fn class_key_round_trips() {
+        for v in group_key_zoo() {
+            let k = encode_key_spec(std::slice::from_ref(&v), &[CLASS]);
+            let back = decode_key(&k, &[ColumnType::Any]).unwrap();
+            assert_eq!(back.len(), 1);
+            assert_eq!(
+                encode_key_spec(&back, &[CLASS]),
+                k,
+                "{v:?} -> {back:?} did not re-encode"
+            );
+        }
+        // The canonicalization, stated: a real that IS an integer decodes as
+        // that integer (they share one key slot, so no decoder can do better).
+        assert_eq!(
+            decode_key(&encode_key_spec(&[Value::Float(1.0)], &[CLASS]), &[ColumnType::Any])
+                .unwrap(),
+            vec![Value::Int(1)]
+        );
+    }
+
+    /// A composite key may MIX class-encoded and type-encoded columns — a
+    /// `datetime` PK column beside an `int64` one, or the `(values ‖ pk)` key
+    /// of a non-unique index over an `any` column. Neither encoding may be a
+    /// prefix of the other's continuation.
+    #[test]
+    fn mixed_class_and_typed_composite_is_unambiguous() {
+        let specs = [CLASS, KeySpec::default()];
+        let firsts = group_key_zoo();
+        let seconds = [
+            Value::Int(i64::MIN),
+            Value::Int(0),
+            Value::Int(i64::MAX),
+            Value::Null,
+        ];
+        /// (composite key bytes, its two canonical component keys)
+        type Entry = (Vec<u8>, (Vec<u8>, Vec<u8>));
+        let mut seen: Vec<Entry> = Vec::new();
+        for a in &firsts {
+            for b in &seconds {
+                let k = encode_key_spec(&[a.clone(), b.clone()], &specs);
+                let canon = (
+                    encode_key_spec(std::slice::from_ref(a), &[CLASS]),
+                    encode_key(std::slice::from_ref(b)),
+                );
+                // Same bytes ⇒ same (slot, value); and the composite order must
+                // be lexicographic in the two components.
+                for (pk, pc) in &seen {
+                    if *pk == k {
+                        assert_eq!(*pc, canon, "composite aliased at {a:?}, {b:?}");
+                    }
+                    let want = pc.0.cmp(&canon.0).then_with(|| pc.1.cmp(&canon.1));
+                    assert_eq!(pk.cmp(&k), want, "composite order at {a:?}, {b:?}");
+                }
+                seen.push((k, canon));
+            }
+        }
+        // ...and both columns decode back out of the mixed key.
+        let k = encode_key_spec(
+            &[Value::Text("a\0b".into()), Value::Int(-7)],
+            &specs,
+        );
+        assert_eq!(
+            decode_key(&k, &[ColumnType::Any, ColumnType::Int64]).unwrap(),
+            vec![Value::Text("a\0b".into()), Value::Int(-7)]
+        );
+    }
+
+    /// A truncated or hostile class key is `Corrupt`, never a panic — the same
+    /// bar every other decoder in this crate is held to.
+    #[test]
+    fn corrupt_class_keys_error_not_panic() {
+        for v in group_key_zoo() {
+            let enc = encode_key_spec(std::slice::from_ref(&v), &[CLASS]);
+            for cut in 0..enc.len() {
+                let _ = decode_key(&enc[..cut], &[ColumnType::Any]);
+            }
+        }
+        for tag in 0u8..=0xff {
+            let _ = decode_key(&[tag], &[ColumnType::Any]);
+            let _ = decode_key(&[0x01, 0, 0, 0, 0, 0, 0, 0, 0, tag], &[ColumnType::Any]);
+        }
+        assert!(decode_key(&[0x06], &[ColumnType::Any]).is_err());
+        assert!(decode_key(&[0x04, 0x07], &[ColumnType::Any]).is_err());
     }
 }

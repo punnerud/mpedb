@@ -436,7 +436,7 @@ impl<'e> WriteTxn<'e> {
             .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
         let tname = table.name.clone();
         let sec = self.bundle.sec_indexes[table_id as usize].clone();
-        let sec_coll = self.bundle.sec_collations[table_id as usize].clone();
+        let sec_coll = self.bundle.sec_specs[table_id as usize].clone();
         let key = self.eng.pk_key_in(&self.bundle, table_id, values)?;
         // #42: for a row that will SPILL, hand btree the parts instead of a
         // buffer. `encode_row` materialises the whole row — a large blob included
@@ -576,7 +576,7 @@ impl<'e> WriteTxn<'e> {
     }
 
     pub fn get_by_pk(&mut self, table_id: u32, pk_values: &[Value]) -> Result<Option<Vec<Value>>> {
-        let key = keycode::encode_key_collated(pk_values, self.bundle.pk_coll(table_id));
+        let key = keycode::encode_key_spec(pk_values, self.bundle.pk_coll(table_id));
         let (root, _) = self.tree_root(table_id, 0)?;
         match btree::get(self, root, &key)? {
             None => Ok(None),
@@ -610,7 +610,7 @@ impl<'e> WriteTxn<'e> {
     /// Delete by primary key; returns whether the row existed.
     pub fn delete_by_pk(&mut self, table_id: u32, pk_values: &[Value]) -> Result<bool> {
         self.check_write_blocked(table_id)?;
-        let key = keycode::encode_key_collated(pk_values, self.bundle.pk_coll(table_id));
+        let key = keycode::encode_key_spec(pk_values, self.bundle.pk_coll(table_id));
         let (root, count) = self.tree_root(table_id, 0)?;
         // fetch old row first: index maintenance needs its column values
         let sec_unique = self.bundle.sec_unique[table_id as usize].clone();
@@ -623,7 +623,7 @@ impl<'e> WriteTxn<'e> {
         self.set_tree_root(table_id, 0, out.new_root, count - 1);
 
         let sec = self.bundle.sec_indexes[table_id as usize].clone();
-        let sec_coll = self.bundle.sec_collations[table_id as usize].clone();
+        let sec_coll = self.bundle.sec_specs[table_id as usize].clone();
         for (i, cols) in sec.iter().enumerate() {
             let Some(ikey) = index_row_key(sec_unique[i], cols, &old, &key, &sec_coll[i]) else {
                 continue;
@@ -664,7 +664,7 @@ impl<'e> WriteTxn<'e> {
 
         let sec = self.bundle.sec_indexes[table_id as usize].clone();
         let sec_unique = self.bundle.sec_unique[table_id as usize].clone();
-        let sec_coll = self.bundle.sec_collations[table_id as usize].clone();
+        let sec_coll = self.bundle.sec_specs[table_id as usize].clone();
         // pre-check UNIQUE conflicts for changed unique-indexed columns
         for (i, cols) in sec.iter().enumerate() {
             if !sec_unique[i] {
@@ -765,23 +765,44 @@ impl<'e> WriteTxn<'e> {
     ) -> Result<Vec<Vec<Value>>> {
         let (root, _) = self.tree_root(table_id, 0)?;
         let pkc = self.bundle.pk_coll(table_id);
-        let lo_k = lo.map(|(v, inc)| (keycode::encode_key_collated(v, pkc), inc));
-        let hi_k = hi.map(|(v, inc)| (keycode::encode_key_collated(v, pkc), inc));
+        let lo_k = lo.map(|(v, inc)| (keycode::encode_key_spec(v, pkc), inc));
+        let hi_k = hi.map(|(v, inc)| (keycode::encode_key_spec(v, pkc), inc));
         let mut c = btree::cursor(
             self,
             root,
             lo_k.as_ref().map(|(k, i)| (k.as_slice(), *i)),
             hi_k.as_ref().map(|(k, i)| (k.as_slice(), *i)),
         )?;
-        let table = self
+        // Project the PK out of the ROW, not out of the key. For every rigidly
+        // typed PK the two agree exactly; for a TYPELESS (`any`) PK column they
+        // do not, and the row is the one that is right. Such a column keys by
+        // STORAGE CLASS (`keycode::KeySpec`), which deliberately gives the
+        // integer `1` and the real `1.0` the same bytes — that is what makes it
+        // one PK, as sqlite has it — so no key decoder can say which of the two
+        // the row holds. The row stores the value verbatim and is already in
+        // hand here, so the collected PK round-trips a value-returning
+        // `UPDATE … RETURNING` unchanged.
+        let pk_cols = self
             .bundle
             .schema
             .table(table_id)
-            .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
-        let pk_types: Vec<ColumnType> = table.pk_types();
+            .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?
+            .primary_key
+            .clone();
+        let col_types = self.bundle.col_types[table_id as usize].clone();
         let mut out = Vec::new();
-        while let Some((k, _)) = c.next(self)? {
-            out.push(keycode::decode_key(&k, &pk_types)?);
+        while let Some((_k, v)) = c.next(self)? {
+            let row = row::decode_row(&v, &col_types)?;
+            out.push(
+                pk_cols
+                    .iter()
+                    .map(|&i| {
+                        row.get(i as usize).cloned().ok_or_else(|| {
+                            Error::Corrupt("row shorter than its primary key".into())
+                        })
+                    })
+                    .collect::<Result<Vec<Value>>>()?,
+            );
         }
         Ok(out)
     }
@@ -795,8 +816,8 @@ impl<'e> WriteTxn<'e> {
     ) -> Result<Vec<Vec<Value>>> {
         let (root, _) = self.tree_root(table_id, 0)?;
         let pkc = self.bundle.pk_coll(table_id);
-        let lo_k = lo.map(|(v, inc)| (keycode::encode_key_collated(v, pkc), inc));
-        let hi_k = hi.map(|(v, inc)| (keycode::encode_key_collated(v, pkc), inc));
+        let lo_k = lo.map(|(v, inc)| (keycode::encode_key_spec(v, pkc), inc));
+        let hi_k = hi.map(|(v, inc)| (keycode::encode_key_spec(v, pkc), inc));
         let mut c = btree::cursor(
             self,
             root,
@@ -856,7 +877,7 @@ impl<'e> WriteTxn<'e> {
         index_no: u32,
         values: &[Value],
     ) -> Result<Option<Vec<Value>>> {
-        let ikey = keycode::encode_key_collated(values, self.bundle.index_coll(table_id, index_no));
+        let ikey = keycode::encode_key_spec(values, self.bundle.index_coll(table_id, index_no));
         let (iroot, _) = self.tree_root(table_id, index_no)?;
         let Some(pk_bytes) = btree::get(self, iroot, &ikey)? else {
             return Ok(None);
@@ -900,7 +921,7 @@ impl<'e> WriteTxn<'e> {
         if full_unique {
             return Ok(self.get_by_index(table_id, index_no, values)?.into_iter().collect());
         }
-        let prefix = keycode::encode_key_collated(values, self.bundle.index_coll(table_id, index_no));
+        let prefix = keycode::encode_key_spec(values, self.bundle.index_coll(table_id, index_no));
         let (iroot, _) = self.tree_root(table_id, index_no)?;
         let (root, _) = self.tree_root(table_id, 0)?;
         let mut out = Vec::new();
@@ -1266,8 +1287,13 @@ impl<'e> WriteTxn<'e> {
             // index 0 is the PK tree; the new secondary is appended after the
             // existing ones. The new index's per-column collation comes straight
             // from the columns it covers (it is not in the bundle's caches yet).
-            let coll: Vec<Collation> =
-                columns.iter().map(|&c| table.columns[c as usize].collation).collect();
+            let coll: Vec<keycode::KeySpec> = columns
+                .iter()
+                .map(|&c| {
+                    let cd = &table.columns[c as usize];
+                    keycode::KeySpec::for_column(cd.ty, cd.collation)
+                })
+                .collect();
             (table.name.clone(), (table.indexes.len() + 1) as u32, coll)
         };
         let col_types = bundle.col_types[table_id as usize].clone();
@@ -1649,14 +1675,14 @@ impl<'e> WriteTxn<'e> {
 /// on NaN, which caused spurious UniqueViolations when updating rows that keep a
 /// NaN in a unique column), and two texts equal under a collated index (e.g.
 /// `'Bob'`/`'bob'` under NOCASE) compare equal — they occupy the same key slot.
-fn index_value_equal(a: &Value, b: &Value, coll: Collation) -> bool {
+fn index_value_equal(a: &Value, b: &Value, spec: keycode::KeySpec) -> bool {
     match (a.is_null(), b.is_null()) {
         (true, true) => true,
         (true, false) | (false, true) => false,
         _ => {
             let (mut ka, mut kb) = (Vec::new(), Vec::new());
-            keycode::encode_value_collated(&mut ka, a, coll);
-            keycode::encode_value_collated(&mut kb, b, coll);
+            keycode::encode_value_spec(&mut ka, a, spec);
+            keycode::encode_value_spec(&mut kb, b, spec);
             ka == kb
         }
     }
