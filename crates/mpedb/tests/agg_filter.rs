@@ -358,22 +358,29 @@ fn correlated_filter_survives_the_plan_registry() {
     }
 }
 
-/// The refusal boundary that STAYS. `FILTER (WHERE …)` runs per row, so a
-/// correlated subquery is admitted there; the SELECT list, an aggregate
-/// ARGUMENT, GROUP BY and HAVING run over a collapsed group and are still
-/// refused — CLEANLY, with a message that says why. A refusal beats a wrong
-/// answer; what must never happen is the third thing, silently dropping rows.
+/// The refusal boundary that STAYS, as #97 redrew it: PER-ROW vs PER-GROUP.
+/// `FILTER (WHERE …)`, a GROUP BY key and an aggregate ARGUMENT all run inside
+/// the row loop against that row's filled scratch, so a correlated subquery is
+/// admitted in each (`agg_correlated_perrow.rs` pins them against sqlite). A
+/// grouped SELECT-list expression that is not itself a group key, and HAVING,
+/// run over a collapsed group and are still refused — CLEANLY, with a message
+/// that says why. A refusal beats a wrong answer; what must never happen is the
+/// third thing, silently dropping rows.
 #[test]
 fn correlated_subquery_outside_filter_is_refused() {
     let d = db();
-    const EX: &str = "EXISTS (SELECT 1 FROM c WHERE c.ref = t.id)";
     for sql in [
-        // in the SELECT list of an aggregate query
+        // in the SELECT list of an aggregate query, NOT as a group key
         "SELECT count(*), (SELECT count(*) FROM c WHERE c.ref = t.id) FROM t".to_string(),
-        // as an aggregate ARGUMENT
-        "SELECT sum((SELECT count(*) FROM c WHERE c.ref = t.id)) FROM t".to_string(),
-        // as a GROUP BY key
-        format!("SELECT {EX}, count(*) FROM t GROUP BY {EX}"),
+        // …and the grouped form of the same thing
+        "SELECT t.g, count(*), (SELECT count(*) FROM c WHERE c.ref = t.id) FROM t GROUP BY t.g"
+            .to_string(),
+        // the SAME subquery spelled out in both the select list and the GROUP
+        // BY lifts TWICE, into two slots, so the item is not recognised as the
+        // key and the projection would read an unfilled hole.
+        "SELECT EXISTS (SELECT 1 FROM c WHERE c.ref = t.id), count(*) FROM t \
+         GROUP BY EXISTS (SELECT 1 FROM c WHERE c.ref = t.id)"
+            .to_string(),
     ] {
         let err = d
             .query(&sql, &[])
@@ -383,19 +390,34 @@ fn correlated_subquery_outside_filter_is_refused() {
             "must be a clean bind-time refusal, got {err:?} for `{sql}`"
         );
     }
-    // A genuinely CORRELATED `IN (SELECT …)` is refused everywhere it appears,
-    // FILTER included — the refusal names the rewrite, and no shape of it
-    // silently answers.
-    let err = d
-        .query(
-            "SELECT count(*) FILTER (WHERE t.id IN (SELECT ref FROM c WHERE c.ref > t.g)) FROM t",
-            &[],
-        )
-        .expect_err("a correlated IN must be refused, not answered");
-    assert!(
-        err.to_string().contains("correlated IN"),
-        "refusal should name the correlated IN, got: {err}"
-    );
+}
+
+/// A CORRELATED `IN (SELECT …)` inside `FILTER (WHERE …)` — refused until #97
+/// ("rewrite as EXISTS"), now ANSWERED, so it is checked the way every other
+/// case here is: differentially against sqlite. `FILTER` is the one aggregate
+/// clause evaluated PER ROW, against that row's filled correlation scratch, so
+/// it is exactly as legal a reader of a correlated slot as a `post_filter` is —
+/// the SELECT list, an aggregate ARGUMENT, GROUP BY and HAVING stay refused
+/// above because they run over a collapsed group.
+#[test]
+fn correlated_in_inside_filter_matches_sqlite() {
+    let d = db();
+    for q in [
+        // `c.ref > t.g` makes the inner list depend on the outer row.
+        "SELECT count(*) FILTER (WHERE t.id IN (SELECT ref FROM c WHERE c.ref > t.g)) FROM t",
+        // NOT IN over the same list — the 3VL half (`ref` is never NULL here,
+        // so this one CAN be TRUE).
+        "SELECT count(*) FILTER (WHERE t.id NOT IN (SELECT ref FROM c WHERE c.ref > t.g)) FROM t",
+        // Per group, and with a second unfiltered aggregate alongside.
+        "SELECT g, count(*) FILTER (WHERE t.id IN (SELECT ref FROM c WHERE c.ref > t.g)), count(*) FROM t GROUP BY g ORDER BY g",
+        // The filter's inner is EMPTY for every row.
+        "SELECT count(*) FILTER (WHERE t.id IN (SELECT ref FROM c WHERE c.ref > t.g + 1000)) FROM t",
+        // A correlated IN and a correlated EXISTS filtering two aggregates
+        // independently in the same statement.
+        "SELECT count(*) FILTER (WHERE t.id IN (SELECT ref FROM c WHERE c.ref > t.g)), sum(y) FILTER (WHERE EXISTS (SELECT 1 FROM c WHERE c.ref = t.id)) FROM t",
+    ] {
+        agree(&d, q);
+    }
 }
 
 /// FILTER on a WINDOW aggregate (`OVER (…)`) is refused with a clean error; the

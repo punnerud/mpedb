@@ -6,9 +6,11 @@
 //! only the full `(WHERE ∧ policy)` set. Every expected value below was
 //! cross-checked against the sqlite3 CLI (3.45).
 //!
-//! The refusal boundary that STAYS: a correlated slot may be read only by the
-//! WHERE. One in the SELECT list, an aggregate argument, GROUP BY or HAVING has
-//! no per-row meaning over a grouped tuple and is still refused.
+//! The refusal boundary that STAYS (redrawn by #97): a correlated slot may be
+//! read by any PER-ROW program — the WHERE, a GROUP BY key, an aggregate
+//! argument, an aggregate's FILTER. `HAVING` and a grouped SELECT-list
+//! expression that is not itself a group key run over the collapsed group,
+//! where no single row's correlation applies, and are still refused.
 
 use mpedb::{Config, Database, ExecResult, Value};
 use std::path::{Path, PathBuf};
@@ -183,28 +185,27 @@ fn aggregate_over_correlated_exists_matches_sqlite() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// The refusal boundary that STAYS (#73 §1.2c): a correlated subplan slot is
-/// filled per outer row, so once the rows are grouped it has no single value.
-/// A correlated subquery in an aggregate ARGUMENT, in the (grouped) SELECT list,
-/// or in HAVING is therefore still refused — the direct query path proves this
-/// in-process (validate mirrors it for the decode path).
+/// The refusal boundary that STAYS, as #97 redrew it: PER-ROW vs PER-GROUP, not
+/// "WHERE vs everything else". A `GROUP BY` key, an aggregate ARGUMENT and an
+/// aggregate's `FILTER` are all evaluated in `exec_aggregate`'s ROW loop against
+/// that row's filled scratch, so a correlated slot is meaningful in each (see
+/// `agg_correlated_perrow.rs`, which pins them against sqlite). `HAVING` and a
+/// grouped SELECT-list expression that is NOT itself a group key run after the
+/// collapse, against `params`, where the slot is still NULL — those stay refused.
 #[test]
 fn correlated_slot_outside_where_is_refused() {
     let (db, path) = open();
     seed(&db);
 
-    // The correlated subquery is an aggregate ARGUMENT — no per-row correlation
-    // survives into the grouped tuple, so refuse.
-    let err = db
-        .query(
-            "SELECT sum((SELECT count(*) FROM b WHERE b.k = a.g)) FROM a",
-            &[],
-        )
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("correlated") && msg.contains("WHERE"),
-        "unexpected error for correlated aggregate argument: {msg}"
+    // An aggregate ARGUMENT is now a PER-ROW position and is answered. Pinned
+    // here so this test still owns the boundary it names: `a.g` = 10 → 2, 20 →
+    // 1, 30/40 → 0, over ids 1..6 ⇒ 2+1+2+0+0+2 = 7 (sqlite3 3.45: 7).
+    assert_eq!(
+        one_int(
+            db.query("SELECT sum((SELECT count(*) FROM b WHERE b.k = a.g)) FROM a", &[])
+                .unwrap()
+        ),
+        7
     );
 
     // The correlated subquery sits in the SELECT list of an aggregate query
@@ -217,7 +218,7 @@ fn correlated_slot_outside_where_is_refused() {
         .unwrap_err();
     let msg = err.to_string();
     assert!(
-        msg.contains("correlated") && msg.contains("WHERE"),
+        msg.contains("correlated") && msg.contains("PER ROW"),
         "unexpected error for correlated subquery in an aggregate SELECT list: {msg}"
     );
 
