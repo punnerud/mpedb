@@ -33,6 +33,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 |---|---|---|
 | SELECT | ✅ | see the clause table below |
 | INSERT INTO … VALUES | ✅ | multi-row VALUES; explicit or implicit column list. A single-column **INTEGER PRIMARY KEY is a rowid alias** (sqlite): a NULL or omitted id auto-assigns `max(rowid)+1` (1 on an empty table) — the plain, non-AUTOINCREMENT rule, so a deleted top id can be reused (max of *current* rows, unlike AUTOINCREMENT); an explicit id inserts at that id, and a duplicate is a uniqueness error. A composite or non-integer PK is **not** a rowid alias — a NULL there stays a strict NOT-NULL error (mpedb is stricter than sqlite's historical NULL-in-PK leniency; a clean refusal, never a wrong answer). Inferred from the table shape, so no schema-format flag. `last_insert_rowid()` is not implemented (refused as an unknown function) — use `RETURNING id` to read the assigned rowid |
+| INSERT INTO … DEFAULT VALUES | ✅ | inserts one row where every column takes its default: a rowid alias auto-assigns, a column `DEFAULT` fills, a nullable column becomes NULL, and a NOT NULL column with no default is a clean error (sqlite rejects it too). A column list may not be combined with it |
 | INSERT … ON CONFLICT DO NOTHING | ✅ | |
 | INSERT … ON CONFLICT (target) DO UPDATE SET … [WHERE …] | ✅ | target may be the PK or one UNIQUE column; `excluded.<col>` works |
 | INSERT OR IGNORE / ABORT / FAIL / ROLLBACK | ✅ | IGNORE = DO NOTHING; ABORT/FAIL/ROLLBACK = error (the default) |
