@@ -7,3 +7,6 @@ license.workspace = true
 
 [dependencies]
 mpedb = { workspace = true }
+# The differential oracle: the SAME pinned sqlite on every machine, compiled
+# in. Bumping this version is the deliberate, reviewable way the oracle moves.
+rusqlite = { version = "0.31", features = ["bundled"] }
