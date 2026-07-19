@@ -27,7 +27,9 @@ or safe no-op, never a wrong answer):
   connection and SQL that calls the function dispatches to them, including a real
   `sqlite3_aggregate_context`. `_create_window_function` (`xValue`/`xInverse`) and
   `_create_collation*` still refuse cleanly (invoking the caller's
-  `xDestroy(pApp)`, so CPython does not leak the wrapped callable) — stage 3.
+  `xDestroy(pApp)`, so CPython does not leak the wrapped callable) — stage 4.
+  Dispatch covers the READ **and WRITE** paths, including any statement run
+  inside an open transaction (design/DESIGN-UDF.md §The WRITE path).
 - **VFS / virtual-table module ABI** (`sqlite3_vfs_*`, `sqlite3_create_module*`):
   mpedb has its own storage engine, not sqlite's pager — a named VFS is refused
   (see `open_v2`); the one module that matters, **FTS5, is native**, not a plugin.
@@ -156,8 +158,8 @@ against `_sqlite3.cpython-312` on Linux/x86-64 (Python 3.12).
 
 | Function(s) | Status | Behaviour |
 |---|---|---|
-| `sqlite3_create_function` / `_create_function_v2` (SCALAR) | ✅ | Real dispatch (design/DESIGN-UDF.md stage 1). The `xFunc` is stored per connection and a SQL call to that name invokes it with the evaluated arguments. `nArg = -1` is variadic; re-registering the same `(name, nArg)` replaces (running the old `xDestroy`); `xFunc == NULL` deletes. Names are matched case-insensitively. A plan containing a host call is compiled/executed LOCALLY and never published to the shared plan registry (it is valid only for the connection that registered the function) |
-| `sqlite3_create_function[_v2]` (AGGREGATE: `xStep`/`xFinal`) | ✅ | Real dispatch (design/DESIGN-UDF.md stage 2). `xFunc == NULL` + both of `xStep`/`xFinal` registers an aggregate; half a pair is `SQLITE_MISUSE`; all-NULL deletes. The executor mints one accumulator per group, steps it per surviving row (after `WHERE`/policy/`FILTER`/DISTINCT) and finalizes at the group's end; an EMPTY group finalizes a fresh, never-stepped context (→ NULL, sqlite's rule). Unlike a built-in, a user aggregate is stepped for NULL arguments too — sqlite's behaviour, which Django relies on. The call shape is one argument. Same local-plan rule as a scalar. Verified against CPython's `create_aggregate` (`STDDEV_POP` bare / `GROUP BY` / empty / all-NULL: identical to stock sqlite) |
+| `sqlite3_create_function` / `_create_function_v2` (SCALAR) | ✅ | Real dispatch (design/DESIGN-UDF.md stage 1). The `xFunc` is stored per connection and a SQL call to that name invokes it with the evaluated arguments. `nArg = -1` is variadic; re-registering the same `(name, nArg)` replaces (running the old `xDestroy`); `xFunc == NULL` deletes. Names are matched case-insensitively. A plan containing a host call is compiled/executed LOCALLY, never published to the shared plan registry and never enqueued on the intent ring (it is valid only for the connection that registered the function). Dispatch covers the write path too: `UPDATE … SET`, `WHERE`, `RETURNING`, `INSERT … SELECT`, and every statement inside an open transaction |
+| `sqlite3_create_function[_v2]` (AGGREGATE: `xStep`/`xFinal`) | ✅ | Real dispatch (design/DESIGN-UDF.md stage 2). `xFunc == NULL` + both of `xStep`/`xFinal` registers an aggregate; half a pair is `SQLITE_MISUSE`; all-NULL deletes. The executor mints one accumulator per group, steps it per surviving row (after `WHERE`/policy/`FILTER`/DISTINCT) and finalizes at the group's end; an EMPTY group finalizes a fresh, never-stepped context (→ NULL, sqlite's rule). Unlike a built-in, a user aggregate is stepped for NULL arguments too — sqlite's behaviour, which Django relies on. The call shape is one argument. Same local-plan rule as a scalar, and the same write-path scope (inside an open transaction included). Verified against CPython's `create_aggregate` (`STDDEV_POP` bare / `GROUP BY` / empty / all-NULL: identical to stock sqlite) |
 | `sqlite3_create_window_function` | ❌ stub | Refuse with `SQLITE_ERROR` (destructor honored) — `xValue`/`xInverse` have no mpedb equivalent, and `myagg(x) OVER (…)` is refused at parse |
 | `sqlite3_create_collation_v2` | ❌ stub | Refuse with `SQLITE_ERROR` (destructor honored) — DESIGN-UDF stage 3 |
 | `sqlite3_set_authorizer` | ❌ stub | `SQLITE_OK`, callback never invoked (mpedb enforces its own RLS) |
@@ -283,6 +285,18 @@ gap for Django's connection setup and schema editor is now covered.
   `create_aggregate` calls now all succeed, and a CPython `STDDEV_POP` probe
   matches stock sqlite exactly (bare / `GROUP BY` / empty set / all-NULL).
 
+- ✅ **Host UDFs on the WRITE path — Django gap #2, now closed**
+  (design/DESIGN-UDF.md §The WRITE path). Both registries reach the write context
+  through `exec::WriteCtx`, so a scalar or aggregate UDF resolves in `UPDATE …
+  SET`, in a `WHERE`, in a `RETURNING` projection, in the row-producing side of
+  `INSERT … SELECT`, and — the one that mattered — in ANY statement run inside an
+  open transaction. CPython opens an implicit transaction on the first DML, so
+  before this almost every Django UDF call after the first INSERT died, and died
+  as `internal error (bug in mpedb)`. Verified through CPython under `LD_PRELOAD`
+  with NO intervening `commit()`. A plan naming a host UDF is still never
+  published to the shared registry and never rides the intent ring — a UDF is
+  connection-local.
+
 Still blocking (ranked by real-app impact):
 
 1. **`sqlite_compileoption_used()` — Django's NEXT gate (measured).** With both
@@ -294,19 +308,8 @@ Still blocking (ranked by real-app impact):
    answer to decide whether to register its own pure-Python `ACOS`/`SIN`/`POWER`/…
    fallbacks, so returning **0** is both honest and the path of least resistance.
    Run `crates/mpedb-capi/workbench/run.sh` to reproduce.
-2. **Host UDFs in a WRITE statement / open transaction** — dispatch is wired on
-   the READ path (autocommit `SELECT`, its `WHERE`/projection/aggregate). A UDF or
-   host aggregate in an `UPDATE … SET`, an `INSERT` value, a `RETURNING`
-   projection, a window PARTITION/ORDER term, **or any statement run inside an
-   open transaction** (`WriteSession`) surfaces a clean "host function/aggregate …
-   not in scope" error rather than a wrong answer. This one is sharper than it
-   looks for Python: CPython opens an implicit transaction after the first DML, so
-   a `SELECT myagg(x) …` without an intervening `commit()` takes the write path.
-   Verified: the same CPython probe passes byte-identically to sqlite after an
-   explicit `commit()`. Closing it means giving the write context the same
-   `host_fns()`/`host_aggs()` the read context has.
-3. **No custom collations** (`sqlite3_create_collation_v2`) — DESIGN-UDF stage 3.
-4. **`sqlite_master` breadth** — views and indexes are not listed; complex
+2. **No custom collations** (`sqlite3_create_collation_v2`) — DESIGN-UDF stage 4.
+3. **`sqlite_master` breadth** — views and indexes are not listed; complex
    `WHERE`/join forms error rather than returning wrong metadata.
 
 (Resolved since: **fixed database size** — a `file:…?size_mb=N` URI now
@@ -411,7 +414,7 @@ same statement on stock sqlite in the same script.
 | Rank | Tests | Gap | Where | Minimal repro (stock → mpedb) |
 |---|---|---|---|---|
 | 1 | **~66** | **No sqlite type affinity, and `any` does no coercion or arithmetic.** A column sqlite gives NUMERIC affinity converts `'1.50'` to a number on write; mpedb's `any` stores the text. Django's `DecimalField` converter then gets a `str` and raises `TypeError: argument must be int or float`. Related: `arithmetic requires int64/float64, got any`, `cannot assign any to column of type int64`, `cannot mix coalesce() argument types: any and float64`, `avg() expects a number, got text`. | `mpedb-sql`/`mpedb` | `d decimal` / `d any`; `INSERT … VALUES ('1.50')`; `SELECT d, typeof(d)` → stock `1.5, 'real'` · mpedb `'1.50', 'text'` |
-| 2 | **47** | **Host UDFs (scalar AND aggregate) are read-path only.** Inside an open transaction a registered UDF fails — and fails as `internal error (bug in mpedb)`, not a clean refusal. CPython opens an implicit transaction after the first DML, so nearly every Django query that uses `django_date_extract`/`django_format_dtdelta`/`RAND`/`VAR_POP` inside a test's write transaction dies. Top offenders: `django_format_dtdelta` (52 hits), `django_timestamp_diff` (18), `django_datetime_extract` (15), `django_date_extract` (15). | `mpedb` `ring_exec`/write `TxnCtx` | `c.execute("INSERT …"); c.execute("select sqlite_compileoption_used('X')")` → `host function … called with no host functions in scope`; passes after `commit()` |
+| 2 | ~~47~~ | ✅ **FIXED — host UDFs now resolve on the WRITE path** (design/DESIGN-UDF.md §The WRITE path). Scalar and aggregate closures reach the write context through `exec::WriteCtx`, gated by the single `Database::host_tables(plan)` snapshot; `WriteSession`, autocommit DML and the group-commit leader's own statement all carry them. A host-call plan still never enters the shared `plan/<hash>` registry and never rides the intent ring. Remaining refusals name their limit (`Unsupported`, never `Internal`): `INSERT … VALUES (<expr>)` takes only literals/parameters for EVERY function (use `INSERT … SELECT`), and the streaming/sqlite-backed contexts carry no closures. | `mpedb` `exec`/`ring_exec` | `c.execute("INSERT …"); c.execute("SELECT plus1(n) FROM t")` with no `commit()` → now the same answer as stock sqlite |
 | 3 | **43** | **Missing sqlite scalar functions**: `quote()` (40 hits — Django's `last_executed_query`, so every `assertNumQueries`-style test), `strftime()` (12), `json()` (1). | `mpedb-sql` builtins | `SELECT QUOTE(?)`, `SELECT STRFTIME('%Y','2020-01-01')` → `unknown function` |
 | 4 | **~45** | **Subquery/derived-table restrictions.** In descending order: a subquery whose body has a JOIN (14), a correlated subquery outside `WHERE` in an aggregate query (8), an `IN` subquery in an unlifted position (5), a subquery projecting an aliased column (4), a subquery with GROUP BY/HAVING (4), a correlated `IN` (4, "rewrite as EXISTS"), a subquery in `HAVING` (2), a compound (`UNION`) derived table (1), a subquery with `ORDER BY` (1). | `mpedb-sql` planner | Django's `Subquery`/`Exists`/`OuterRef` annotations |
 | 5 | **~37** | **No int↔bool bridge.** sqlite has no boolean type: Django writes `WHERE tbl.flag` for a `BooleanField` and binds `True` as the integer 1. mpedb is rigid in BOTH directions, so **no mapping works**: as `integer`, `WHERE flag` → `predicate must be a boolean expression, got int64`; as `bool`, the INSERT → `value of type int64 cannot be inserted into column of type bool`. Also `NOT requires a boolean, got int64`, `cannot compare int64 and bool`, `parameter $1 is int64, statement requires bool`. | `mpedb-sql` binder | `SELECT i FROM t WHERE b` (b `integer`) → stock OK · mpedb `predicate must be a boolean expression, got int64`; `INSERT INTO bt (b) VALUES (1)` (b `bool`) → mpedb refuses |
@@ -447,11 +450,13 @@ neither invents an answer:
    silently dropping its operands — that was a latent *wrong-answer* path
    (`name='x' OR name='y'` used to be evaluated as `name='x'`).
 
-Deliberately **not** fixed: `quote()` and `strftime()` as shim host UDFs. They
-would be registered on the host-UDF path, which gap #2 makes unusable inside a
-transaction — exactly where Django calls `QUOTE(?)` — so the fix would not
-actually unblock the tests, and `quote()` on a REAL cannot be made byte-identical
-to sqlite's `%!.15g` without more care than a workbench fix deserves.
+Deliberately **not** fixed: `quote()` and `strftime()` as shim host UDFs.
+`quote()` on a REAL cannot be made byte-identical to sqlite's `%!.15g` without
+more care than a workbench fix deserves. (The other half of this reasoning — that
+the host-UDF path was unusable inside a transaction, exactly where Django calls
+`QUOTE(?)` — no longer applies: gap #2 is closed, so registering them there would
+now work. They belong in the `mpedb-sql` builtins regardless, which is where gap
+#3 puts them.)
 
 ### Reproducing
 
