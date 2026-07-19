@@ -320,13 +320,14 @@ fn collate_refusals_are_clean() {
         &[],
     )
     .expect("column-declared COLLATE is now supported");
-    // But a collated UNIQUE/index is DEFERRED — refused cleanly (never a wrong
-    // uniqueness answer), naming COLLATE.
-    let e = err("CREATE TABLE cu (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE UNIQUE)");
-    assert!(
-        e.to_uppercase().contains("COLLATE"),
-        "a collated UNIQUE should be refused by name: {e}"
-    );
+    // A collated UNIQUE/index/PK is now SUPPORTED too (the engine folds the value
+    // into the on-disk key) — it must succeed (collate_column.rs verifies the
+    // uniqueness/lookup semantics against sqlite).
+    d.query(
+        "CREATE TABLE cu (id INTEGER PRIMARY KEY, name TEXT COLLATE NOCASE UNIQUE)",
+        &[],
+    )
+    .expect("collated UNIQUE is now supported");
 
     // A COLLATE that could not change a comparison or a sort (here: buried in a
     // GROUP BY key, where honoring it would need a collated regroup we do not

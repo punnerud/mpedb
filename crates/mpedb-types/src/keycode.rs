@@ -19,6 +19,20 @@ const TAG_PRESENT: u8 = 0x01;
 const ESCAPE: u8 = 0xff;
 const TERMINATOR: u8 = 0x00;
 
+/// Append the ordered encoding of one value, folding TEXT under `coll` first
+/// (so two texts equal under the collation encode to identical bytes). Every
+/// non-TEXT value — and any value under [`Collation::Binary`] — is byte-for-byte
+/// identical to [`encode_value`], so a non-collated key never changes shape.
+pub fn encode_value_collated(buf: &mut Vec<u8>, v: &Value, coll: Collation) {
+    match v {
+        Value::Text(s) if coll != Collation::Binary => {
+            buf.push(TAG_PRESENT);
+            encode_bytes(buf, coll.fold_key(s).as_bytes());
+        }
+        _ => encode_value(buf, v),
+    }
+}
+
 /// Append the ordered encoding of one value.
 pub fn encode_value(buf: &mut Vec<u8>, v: &Value) {
     match v {
@@ -77,10 +91,9 @@ pub fn encode_key(values: &[Value]) -> Vec<u8> {
 
 /// Encode a composite key where TEXT columns are FOLDED under a per-column
 /// collating sequence before encoding, so two values that are equal under the
-/// collation produce identical bytes. This is what makes a collation-aware
-/// GROUP BY / DISTINCT collapse `'abc'` and `'ABC'` (NOCASE) into one bucket
-/// (executor use — mpedb does NOT yet build collated on-disk INDEXES; a
-/// non-BINARY collation on an indexed/PK column is refused at schema validation).
+/// collation produce identical bytes. This is what makes a collated PRIMARY KEY
+/// / secondary index collapse `'abc'` and `'ABC'` (NOCASE) into one on-disk key
+/// — the same folding also drives collation-aware GROUP BY / DISTINCT.
 ///
 /// `collations[i]` governs `values[i]`; a shorter slice (or `Binary`) leaves the
 /// value bytewise, so `encode_key_collated(v, &[])` equals [`encode_key`]. Only
@@ -89,13 +102,7 @@ pub fn encode_key_collated(values: &[Value], collations: &[Collation]) -> Vec<u8
     let mut buf = Vec::with_capacity(values.len() * 12);
     for (i, v) in values.iter().enumerate() {
         let coll = collations.get(i).copied().unwrap_or(Collation::Binary);
-        match v {
-            Value::Text(s) if coll != Collation::Binary => {
-                buf.push(TAG_PRESENT);
-                encode_bytes(&mut buf, coll.fold_key(s).as_bytes());
-            }
-            _ => encode_value(&mut buf, v),
-        }
+        encode_value_collated(&mut buf, v, coll);
     }
     buf
 }

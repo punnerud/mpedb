@@ -739,36 +739,21 @@ impl Schema {
                 }
             }
             // A DECLARED collating sequence (`COLLATE NOCASE`/`RTRIM`) is only
-            // meaningful for TEXT, and mpedb does not yet fold collated ON-DISK
-            // keys — so a non-BINARY collation may not sit on any key column
-            // (PRIMARY KEY or secondary index). Both are clean refusals, never a
-            // wrong uniqueness/ordering answer: a collated UNIQUE/index is
-            // deferred, while `=`/`<`/ORDER BY/GROUP BY/DISTINCT still honor the
-            // collation (they do not go through the keycode-ordered trees). This
-            // is the single chokepoint every path funnels through — CREATE TABLE,
-            // ALTER, CREATE INDEX, config, and a hostile v6 blob alike.
-            for (ci, c) in t.columns.iter().enumerate() {
-                if c.collation == Collation::Binary {
-                    continue;
-                }
-                if c.ty != ColumnType::Text {
+            // meaningful for TEXT. On a PRIMARY KEY or indexed column the engine
+            // folds the value under the collation before it enters the keycode
+            // tree (`encode_key_collated`), so a collated UNIQUE/index/PK is
+            // fully supported: two values equal under the collation share one
+            // on-disk key, and `=`/prefix probes fold identically. (Inequality
+            // RANGE access over a collated key column stays out of the keycode
+            // tree — the planner routes it to a scan with a collation-correct
+            // residual filter — since a raw bytewise bound could skip a row.)
+            // This is the single chokepoint every path funnels through — CREATE
+            // TABLE, ALTER, CREATE INDEX, config, and a hostile v6 blob alike.
+            for c in &t.columns {
+                if c.collation != Collation::Binary && c.ty != ColumnType::Text {
                     return Err(Error::Schema(format!(
                         "column `{}.{}`: COLLATE {} may only be declared on a text column \
                          (collation affects text comparison only)",
-                        t.name,
-                        c.name,
-                        c.collation.name()
-                    )));
-                }
-                let i = ci as u16;
-                if t.primary_key.contains(&i)
-                    || t.indexes.iter().any(|ix| ix.columns.contains(&i))
-                {
-                    return Err(Error::Schema(format!(
-                        "column `{}.{}`: a COLLATE {} column cannot be part of a PRIMARY KEY \
-                         or index — collated indexes are not supported yet (mpedb keys are \
-                         memcmp-ordered); the collation is still applied to comparisons, \
-                         ORDER BY, GROUP BY and DISTINCT",
                         t.name,
                         c.name,
                         c.collation.name()
@@ -1597,7 +1582,7 @@ mod tests {
     /// REFUSED — collated on-disk keys are deferred, never answered wrong. Also
     /// enforced on decode (a hostile v6 blob cannot smuggle one in).
     #[test]
-    fn collated_key_column_refused() {
+    fn collated_key_column_accepted_but_non_text_refused() {
         let mk = |unique: bool| {
             Schema::new(vec![TableDef {
                 id: 0,
@@ -1617,14 +1602,13 @@ mod tests {
                 implicit_rowid: false,
             }])
         };
-        // A UNIQUE and a plain index on a NOCASE column both refuse.
-        let err = mk(true).unwrap_err();
-        assert!(format!("{err}").contains("COLLATE"), "{err}");
-        let err = mk(false).unwrap_err();
-        assert!(format!("{err}").contains("COLLATE"), "{err}");
+        // A UNIQUE and a plain index on a NOCASE column are now ACCEPTED (the
+        // engine folds the value into the on-disk key).
+        assert!(mk(true).is_ok());
+        assert!(mk(false).is_ok());
 
-        // A NOCASE PRIMARY KEY column refuses too.
-        let err = Schema::new(vec![TableDef {
+        // A NOCASE PRIMARY KEY column is accepted too.
+        assert!(Schema::new(vec![TableDef {
             id: 0,
             name: "t".into(),
             columns: vec![ColumnDef { name: "k".into(), ty: ColumnType::Text, nullable: false,
@@ -1636,10 +1620,9 @@ mod tests {
             kind: TableKind::Standard,
             implicit_rowid: false,
         }])
-        .unwrap_err();
-        assert!(format!("{err}").contains("COLLATE"), "{err}");
+        .is_ok());
 
-        // And a non-TEXT collation is refused (collation affects text only).
+        // But a non-TEXT collation is still refused (collation affects text only).
         let err = Schema::new(vec![TableDef {
             id: 0,
             name: "t".into(),

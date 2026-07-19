@@ -91,7 +91,7 @@ use crate::pagestore::PageStore;
 use crate::row;
 use crate::shm::{MetaSnapshot, Shm};
 use mpedb_types::{
-    keycode, Concurrency, ColumnType, Config, Durability, Error, ExprProgram, Result, Schema, Value,
+    keycode, Collation, Concurrency, ColumnType, Config, Durability, Error, ExprProgram, Result, Schema, Value,
     PAGE_SIZE,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -342,16 +342,20 @@ fn index_row_key(
     cols: &[u16],
     row: &[mpedb_types::Value],
     pk_key: &[u8],
+    collations: &[Collation],
 ) -> Option<Vec<u8>> {
     let mut k = Vec::with_capacity(16 * cols.len() + pk_key.len());
-    for &c in cols {
+    for (j, &c) in cols.iter().enumerate() {
         let v = &row[c as usize];
         if v.is_null() {
             return None;
         }
-        keycode::encode_value(&mut k, v);
+        let coll = collations.get(j).copied().unwrap_or(Collation::Binary);
+        keycode::encode_value_collated(&mut k, v, coll);
     }
     if !unique {
+        // The PK suffix is the ROW IDENTITY and is never folded — it must
+        // round-trip to fetch the row. Only the indexed VALUE prefix collates.
         k.extend_from_slice(pk_key);
     }
     Some(k)
@@ -379,6 +383,18 @@ pub struct SchemaBundle {
     /// or plain non-unique (`(values ‖ pk)` key, duplicates allowed)?
     pub sec_unique: Vec<Vec<bool>>,
     pub col_types: Vec<Vec<ColumnType>>,
+    /// Per table: the declared collation of each PRIMARY KEY column, in key
+    /// order — parallel to `TableDef.primary_key`. Empty-folding when every
+    /// entry is `Binary` (the common case).
+    pub pk_collations: Vec<Vec<Collation>>,
+    /// Per table, per secondary index (`index_no - 1`): the declared collation
+    /// of each indexed column in key order — parallel to `sec_indexes`.
+    pub sec_collations: Vec<Vec<Vec<Collation>>>,
+    /// Per table: does ANY key column (a PK column or a column of any secondary
+    /// index) carry a non-`Binary` collation? `false` ⇒ every key builder takes
+    /// the plain bytewise path and never touches the collation vectors, so a
+    /// non-collated database pays nothing (and encodes byte-for-byte as before).
+    pub any_key_collation: Vec<bool>,
 }
 
 impl std::ops::Deref for SchemaBundle {
@@ -411,7 +427,68 @@ impl SchemaBundle {
             .iter()
             .map(|t| t.columns.iter().map(|c| c.ty).collect())
             .collect();
-        SchemaBundle { schema_gen: 0, schema, checks, sec_indexes, sec_unique, col_types }
+        let pk_collations: Vec<Vec<Collation>> = schema
+            .tables
+            .iter()
+            .map(|t| t.primary_key.iter().map(|&i| t.columns[i as usize].collation).collect())
+            .collect();
+        let sec_collations: Vec<Vec<Vec<Collation>>> = schema
+            .tables
+            .iter()
+            .map(|t| {
+                t.indexes
+                    .iter()
+                    .map(|ix| ix.columns.iter().map(|&i| t.columns[i as usize].collation).collect())
+                    .collect()
+            })
+            .collect();
+        let any_key_collation: Vec<bool> = pk_collations
+            .iter()
+            .zip(&sec_collations)
+            .map(|(pk, sec)| {
+                pk.iter().chain(sec.iter().flatten()).any(|&c| c != Collation::Binary)
+            })
+            .collect();
+        SchemaBundle {
+            schema_gen: 0,
+            schema,
+            checks,
+            sec_indexes,
+            sec_unique,
+            col_types,
+            pk_collations,
+            sec_collations,
+            any_key_collation,
+        }
+    }
+
+    /// Collations for the PK columns of `table_id`, in key order — or `&[]` when
+    /// the table has no collated key column, so the caller uses the plain
+    /// (bytewise) encoder. `encode_key_collated(v, &[])` == `encode_key(v)`.
+    #[inline]
+    pub fn pk_coll(&self, table_id: u32) -> &[Collation] {
+        let t = table_id as usize;
+        if self.any_key_collation.get(t).copied().unwrap_or(false) {
+            &self.pk_collations[t]
+        } else {
+            &[]
+        }
+    }
+
+    /// Collations for secondary index `index_no` (`>= 1`) of `table_id`, in key
+    /// order — or `&[]` when the table has no collated key column.
+    #[inline]
+    pub fn index_coll(&self, table_id: u32, index_no: u32) -> &[Collation] {
+        let t = table_id as usize;
+        if index_no >= 1 && self.any_key_collation.get(t).copied().unwrap_or(false) {
+            self.sec_collations
+                .get(t)
+                .and_then(|v| v.get(index_no as usize - 1))
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+        } else {
+            &[]
+        }
     }
 }
 
@@ -1022,7 +1099,7 @@ impl Engine {
             .iter()
             .map(|&i| values[i as usize].clone())
             .collect();
-        Ok(keycode::encode_key(&pk_vals))
+        Ok(keycode::encode_key_collated(&pk_vals, bundle.pk_coll(table_id)))
     }
 
     /// Validate a full row against the schema: arity, rigid types, NOT NULL,
