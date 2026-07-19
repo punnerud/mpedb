@@ -116,6 +116,48 @@ ceiling). A **hard refuse** before executing is available but off by default:
 `RiskEstimate::exceeds(budget)` is the hook — a deployment that wants
 fail-before-run calls it and returns `RuntimeBudget` at prepare time.
 
+### Layer 2b — the join-materialization cell budget (`max_join_cells`)
+
+The work-row counter bounds what a query READS; it cannot see what a join
+HOLDS. `select5.test`'s `join-17-4` (a 17-way comma join whose only constant
+anchor is the 16th of 17 conjuncts) materializes gigabytes of intermediate
+product while still far under the 10^9 work-row default — the process dies on
+an allocation abort (or the OOM killer) before the counter ever trips. The
+memory-proportional twin:
+
+- `JoinCells { budget, live }` lives in `exec/gather.rs`, per
+  `gather_joined` call (memory is per-pipeline, not per-statement): `live`
+  counts the `Value` cells currently held — the accumulated tuple set, the
+  held inner side, and the next stage being built. Charged per RETAINED
+  joined row (`+row width`; ON-rejected candidates are transient and not
+  charged), per held-inner gather (`+rows × width`), and RELEASED when a
+  stage is superseded — so a legitimate multi-step join is charged for its
+  peak footprint, not its history. Deterministic: a pure function of data
+  and plan, same trip point on every machine.
+- The limit reaches the executor through `TxnCtx::join_cells_budget()`
+  (engine-seeded from config, like the work meter; `0` for the
+  sqlite-backed contexts, mirroring `charge_work`'s scoping).
+- Trips as `Error::RuntimeBudget { kind: BudgetKind::JoinCells, .. }`;
+  `BudgetKind` carries the unit ("live joined cells") and the knob
+  (`max_join_cells`), so the Display hint always names the right knob.
+- Fallible allocation, two tiers. The accumulator's LARGE spines (the
+  `next` stage vec, the survivor vec) use `try_reserve` ALWAYS — one
+  predicted branch per retained row buys a clean `Error::OutOfMemory`
+  (capi: `SQLITE_NOMEM`) when the single biggest allocation hits a memory
+  rlimit / cgroup cap. The PER-ROW allocations (the row spine, each
+  text/blob payload clone) are fallible only under the explicit
+  `max_join_cells = 0` opt-out: with a finite budget the deterministic cap
+  is the guard, and the O(n·m) candidate loop keeps the plain
+  `with_capacity` + `extend_from_slice` build it always had (measured: the
+  always-fallible per-value build taxed a 400M-candidate join ~3-7%).
+  The backstop is best-effort by nature — a small foreign allocation at
+  the very wall can still abort, and Linux overcommit can OOM-kill before
+  malloc ever fails — which is exactly why the deterministic cell budget
+  is the primary guard and ships with a finite default: pick a
+  `max_join_cells` that fits the deployment's memory ceiling (~40 B
+  resident per cell on the corpus shapes) and the join errors before the
+  wall.
+
 ## Config
 
 New top-level TOML section:
@@ -123,9 +165,12 @@ New top-level TOML section:
 ```toml
 [runtime]
 max_work_rows = 1000000000   # 0 = unlimited
+max_join_cells = 268435456   # 0 = unlimited
 ```
 
 `DbOptions::max_work_rows: u64`. Absent ⇒ `DEFAULT_MAX_WORK_ROWS = 1_000_000_000`.
+`DbOptions::max_join_cells: u64`. Absent ⇒ `DEFAULT_MAX_JOIN_CELLS` (calibrated
+against the heaviest legitimate corpus query — see the constant's doc).
 
 **Default rationale.** One billion work rows is far above any legitimate OLTP or
 report query on an embedded database (a 1e9-row scan on this engine is already

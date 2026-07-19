@@ -190,6 +190,7 @@ pub(crate) fn create_mirror_db(
             // The mirror applier is a trusted bulk path; keep the standard
             // default guard (#74) rather than disabling it.
             max_work_rows: mpedb_types::config::DEFAULT_MAX_WORK_ROWS,
+            max_join_cells: mpedb_types::config::DEFAULT_MAX_JOIN_CELLS,
             require_policy: Default::default(),
             // sqlite import → lenient (sqlite) bare columns; PostgreSQL import →
             // strict (postgres), so a query PG refused keeps being refused here.

@@ -255,7 +255,7 @@ fn unbounded_union_all_trips_the_budget_deterministically() {
     let sql = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM c) SELECT x FROM c";
 
     let run = || match d.query(sql, &[]) {
-        Err(Error::RuntimeBudget { used, limit, which }) => {
+        Err(Error::RuntimeBudget { used, limit, which, .. }) => {
             assert!(used > limit, "used {used} must exceed the limit {limit}");
             (used, which)
         }

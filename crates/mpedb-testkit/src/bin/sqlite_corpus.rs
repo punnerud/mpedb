@@ -56,6 +56,7 @@
 
 use mpedb::{Config, Database, ExecResult, Value};
 use mpedb_testkit::TempDir;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::Path;
@@ -1320,6 +1321,13 @@ impl FileReport {
 /// just the uncategorized ones.
 static SAMPLE_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Set by `--join-cells N`: an explicit `[runtime] max_join_cells` for the
+/// generated config (`JOIN_CELLS_SET` distinguishes "flag absent" from an
+/// explicit 0 = unlimited).
+static JOIN_CELLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static JOIN_CELLS_SET: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 const MAX_WRONG_STORED: usize = 12;
 const MAX_SAMPLES_PER_CAT: usize = 3;
 const MAX_ERRMIS_STORED: usize = 5;
@@ -1386,6 +1394,13 @@ fn run_file(path: &Path, engines: &[&str]) -> FileReport {
         "[database]\npath = \"{}\"\nsize_mb = 128\nmax_readers = 8\n",
         dir.db_path("corpus").display()
     );
+    if JOIN_CELLS_SET.load(std::sync::atomic::Ordering::Relaxed) {
+        let _ = write!(
+            cfg,
+            "\n[runtime]\nmax_join_cells = {}\n",
+            JOIN_CELLS.load(std::sync::atomic::Ordering::Relaxed)
+        );
+    }
     if shim.tables.is_empty() {
         // Config needs at least one table; none of this file's DDL parsed.
         cfg.push_str("\n[[table]]\nname = \"shim_dummy_\"\nprimary_key = [\"rowid_\"]\n  [[table.column]]\n  name = \"rowid_\"\n  type = \"int64\"\n");
@@ -1649,10 +1664,28 @@ fn main() {
     let as_sqlite = args.iter().any(|a| a == "--as-sqlite");
     let sample_all = args.iter().any(|a| a == "--samples-all");
     args.retain(|a| a != "--as-sqlite" && a != "--samples-all");
+    // `--join-cells N`: set `[runtime] max_join_cells` in the generated
+    // config (0 = unlimited) — how the N-way-join battery (`select5.test`)
+    // is probed with an explicit budget instead of the default.
+    if let Some(i) = args.iter().position(|a| a == "--join-cells") {
+        let v = args
+            .get(i + 1)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                eprintln!("--join-cells needs an integer argument");
+                std::process::exit(2);
+            });
+        JOIN_CELLS.store(v, std::sync::atomic::Ordering::Relaxed);
+        JOIN_CELLS_SET.store(true, std::sync::atomic::Ordering::Relaxed);
+        args.drain(i..=i + 1);
+    }
     SAMPLE_ALL.store(sample_all, std::sync::atomic::Ordering::Relaxed);
     let engines: &[&str] = if as_sqlite { &["mpedb", "sqlite"] } else { &["mpedb"] };
     if args.is_empty() {
-        eprintln!("usage: sqlite_corpus [--as-sqlite] [--samples-all] <file.test> [...]");
+        eprintln!(
+            "usage: sqlite_corpus [--as-sqlite] [--samples-all] [--join-cells N] \
+             <file.test> [...]"
+        );
         std::process::exit(2);
     }
     let mut reports = Vec::new();

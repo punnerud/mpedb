@@ -62,6 +62,13 @@ impl ReadTxn<'_> {
         self.work.budget()
     }
 
+    /// The configured join-materialization live-cell budget (`0` = unlimited).
+    /// The SQL executor's nested-loop join reads it to bound its intermediate
+    /// product.
+    pub fn join_cells_budget(&self) -> u64 {
+        self.eng.join_cells_budget()
+    }
+
     pub fn finish(mut self) -> Result<()> {
         self.released = true;
         if self.eng.shm.release_slot(self.slot, self.word) {
