@@ -53,16 +53,59 @@ fn join_oom() -> Error {
     Error::OutOfMemory { what: "a nested-loop join's intermediate rows" }
 }
 
-/// Fallibly deep-clone `src`'s values onto the end of `dst` (spine capacity
-/// already reserved). A joined row's bytes are mostly its text/blob payloads,
-/// and at the memory wall those per-value clones are exactly what an
-/// infallible `extend_from_slice` aborts on (observed: a 26-byte `String`
-/// clone) — so their buffer reservations must be fallible too.
-fn extend_row_fallible(dst: &mut Vec<Value>, src: &[Value]) -> Result<()> {
-    for v in src {
-        dst.push(try_clone_value(v)?);
+/// Build one joined row of exactly `cap` values: `lead_nulls` NULLs (a FULL
+/// join's outer-side extension), then `head` and `tail`, then NULL-padding
+/// to `cap` (a LEFT/FULL join's inner-side extension).
+///
+/// Two regimes, chosen by the caller from the cell budget:
+///
+/// - **finite budget** (the default): the deterministic cell cap is the
+///   guard, so the build is the plain `with_capacity` + `extend_from_slice`
+///   it always was — the O(n·m) candidate loop pays nothing for the budget
+///   machinery beyond one predicted branch.
+/// - **`fallible` (budget `0` = unlimited)**: every allocation the row makes
+///   is fallible — the spine via `try_reserve_exact`, and each text/blob
+///   payload via [`try_clone_value`] (at the memory wall those per-value
+///   clones are exactly what an infallible `extend_from_slice` aborts on;
+///   observed: a 26-byte `String` clone). Scalars are cloned inline (their
+///   `Clone` cannot allocate); only heap-carrying values take the outlined
+///   fallible path, which never inlines (`List` makes it recursive).
+// inline(always): this is the body of the O(n·m) candidate loop — as a mere
+// hint the call stayed outlined and cost ~1-2 ns per candidate (measurable
+// on a 400M-candidate join).
+#[inline(always)]
+fn build_joined_row(
+    fallible: bool,
+    cap: usize,
+    lead_nulls: usize,
+    head: &[Value],
+    tail: &[Value],
+) -> Result<Vec<Value>> {
+    let mut joined;
+    if fallible {
+        joined = Vec::new();
+        joined.try_reserve_exact(cap).map_err(|_| join_oom())?;
+        joined.resize(lead_nulls, Value::Null);
+        for src in [head, tail] {
+            for v in src {
+                match v {
+                    Value::Null
+                    | Value::Int(_)
+                    | Value::Float(_)
+                    | Value::Bool(_)
+                    | Value::Timestamp(_) => joined.push(v.clone()),
+                    heap => joined.push(try_clone_value(heap)?),
+                }
+            }
+        }
+    } else {
+        joined = Vec::with_capacity(cap);
+        joined.resize(lead_nulls, Value::Null);
+        joined.extend_from_slice(head);
+        joined.extend_from_slice(tail);
     }
-    Ok(())
+    joined.resize(cap, Value::Null);
+    Ok(joined)
 }
 
 fn try_clone_value(v: &Value) -> Result<Value> {
@@ -228,6 +271,11 @@ pub(super) fn gather_joined(
     cells.charge((acc.len() * acc_width) as u64, || {
         format!("rows held by a join over \"{}\"", table_name(schema, outer_table))
     })?;
+    // With a FINITE budget the deterministic cap above is the guard and the
+    // row build stays on the plain infallible path it always was; only the
+    // explicit `max_join_cells = 0` opt-out pays for per-allocation
+    // fallibility (see `build_joined_row`).
+    let fallible = cells.budget == 0;
     for join in joins {
         let inner_width = table_def(schema, plan, join.table)?.columns.len();
         let join_tbl = join.table; // for the #74 attribution closures
@@ -279,10 +327,7 @@ pub(super) fn gather_joined(
                 ctx.charge_work(1, &|| {
                     format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
                 })?;
-                let mut joined = Vec::new();
-                joined.try_reserve_exact(a.len() + i.len()).map_err(|_| join_oom())?;
-                extend_row_fallible(&mut joined, a)?;
-                extend_row_fallible(&mut joined, i)?;
+                let joined = build_joined_row(fallible, a.len() + i.len(), 0, a, i)?;
                 if join.on.eval_filter_host(&mut stack, &joined, params, ctx.host_fns())? {
                     matched = true;
                     if let Some(m) = &mut inner_matched {
@@ -303,10 +348,7 @@ pub(super) fn gather_joined(
             // inner row reads as ABSENT (the outer row survives,
             // NULL-extended, never carrying the hidden row's values).
             if !matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
-                let mut joined = Vec::new();
-                joined.try_reserve_exact(a.len() + inner_width).map_err(|_| join_oom())?;
-                extend_row_fallible(&mut joined, a)?;
-                joined.resize(a.len() + inner_width, Value::Null);
+                let joined = build_joined_row(fallible, a.len() + inner_width, 0, a, &[])?;
                 cells.charge(joined.len() as u64, || {
                     format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
                 })?;
@@ -320,10 +362,8 @@ pub(super) fn gather_joined(
         if let (Some(m), Some(h)) = (&inner_matched, &held) {
             for (ci, i) in h.iter().enumerate() {
                 if !m[ci] {
-                    let mut joined = Vec::new();
-                    joined.try_reserve_exact(acc_width + i.len()).map_err(|_| join_oom())?;
-                    joined.resize(acc_width, Value::Null);
-                    extend_row_fallible(&mut joined, i)?;
+                    let joined =
+                        build_joined_row(fallible, acc_width + i.len(), acc_width, &[], i)?;
                     cells.charge(joined.len() as u64, || {
                         format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
                     })?;

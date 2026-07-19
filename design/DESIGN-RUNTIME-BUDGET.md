@@ -140,14 +140,23 @@ memory-proportional twin:
 - Trips as `Error::RuntimeBudget { kind: BudgetKind::JoinCells, .. }`;
   `BudgetKind` carries the unit ("live joined cells") and the knob
   (`max_join_cells`), so the Display hint always names the right knob.
-- The bulk allocations of the join accumulator (`joined` row spines, the
-  `next`/survivor vec spines) are additionally FALLIBLE (`try_reserve`),
-  so the opted-out (`max_join_cells = 0`) case under a memory rlimit /
-  cgroup cap fails with `Error::OutOfMemory` instead of aborting. This is
-  best-effort — a small allocation (e.g. a `String` clone) at the very
-  wall can still abort, and Linux overcommit can OOM-kill before malloc
-  ever fails — which is exactly why the deterministic cell budget is the
-  primary guard and ships with a finite default.
+- Fallible allocation, two tiers. The accumulator's LARGE spines (the
+  `next` stage vec, the survivor vec) use `try_reserve` ALWAYS — one
+  predicted branch per retained row buys a clean `Error::OutOfMemory`
+  (capi: `SQLITE_NOMEM`) when the single biggest allocation hits a memory
+  rlimit / cgroup cap. The PER-ROW allocations (the row spine, each
+  text/blob payload clone) are fallible only under the explicit
+  `max_join_cells = 0` opt-out: with a finite budget the deterministic cap
+  is the guard, and the O(n·m) candidate loop keeps the plain
+  `with_capacity` + `extend_from_slice` build it always had (measured: the
+  always-fallible per-value build taxed a 400M-candidate join ~3-7%).
+  The backstop is best-effort by nature — a small foreign allocation at
+  the very wall can still abort, and Linux overcommit can OOM-kill before
+  malloc ever fails — which is exactly why the deterministic cell budget
+  is the primary guard and ships with a finite default: pick a
+  `max_join_cells` that fits the deployment's memory ceiling (~40 B
+  resident per cell on the corpus shapes) and the join errors before the
+  wall.
 
 ## Config
 
