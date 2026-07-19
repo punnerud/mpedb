@@ -177,7 +177,32 @@ parameters accepted by the CLI and the Python API.
 | BLOB | `blob` | plus streaming/incremental blob I/O and extent storage for large values |
 | — | `bool` | first-class, not an integer — but observably identical to sqlite's 0/1 (see *Boolean contexts*) |
 | — | `timestamp` | µs since epoch, UTC |
-| dynamic typing | `any` | opt-in per column (sqlite-affinity semantics, tagged per value); refused in keys and UNIQUE columns |
+| dynamic typing | `any` | opt-in per column (sqlite-affinity semantics, tagged per value); allowed in PRIMARY KEY / UNIQUE / secondary indexes, where the tree is keyed by STORAGE CLASS — see below |
+
+#### A typeless column as a key
+
+A `PRIMARY KEY`, `UNIQUE` or secondary index over an `any` column is keyed by
+sqlite's **storage class** (`Value::sort_cmp` as bytes), not by mpedb's type.
+Two consequences, both matching sqlite 3.45.1:
+
+- **which values collide is sqlite's `=`.** `1` and `1.0` are one key (so are
+  `0` and `-0.0`); the text `'1'` and the blob `x'31'` are two, even though
+  their payload bytes are identical; `9007199254740992.0` and
+  `9007199254740993` are two, with the real sorting below the integer.
+- **the tree's order is sqlite's index order** — NULL < numbers < TEXT < BLOB
+  — so `ORDER BY <key>` needs no sort, and delivers what sqlite delivers.
+
+`decltype`s with NUMERIC affinity (`datetime`, `date`, `decimal(…)`, `numeric`,
+`uuid`, `json`, and any unrecognized name) map to `any`, so this is the shape
+behind Django's `DateTimeField(primary_key=True)`.
+
+**mpedb never uses such a key as an access path.** Every predicate over an
+`any` column stays a residual filter over a full scan — correct, but O(n) where
+sqlite is O(log n). A probe would have to apply the pair's comparison affinity
+to the bound first (sqlite's `sqlite3CompareAffinity`), and mpedb's own
+`bool`/`timestamp` have no storage class to rank against; until both are
+handled, a wrong answer is the failure mode, so the index is maintained and not
+consulted. `tests/any_key.rs` pins that maintaining it changes no answer.
 
 ### Boolean contexts
 
