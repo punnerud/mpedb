@@ -5,7 +5,7 @@
 use crate::error::{Error, Result};
 use std::collections::BTreeSet;
 use crate::schema::{ColumnDef, DefaultExpr, Schema, TableDef};
-use crate::value::{ColumnType, Value};
+use crate::value::{Collation, ColumnType, Value};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -434,6 +434,9 @@ fn raw_to_config(
                     indexed: c.indexed,
                     default,
                     check: c.check.clone(),
+                    // The config (TOML) schema path declares no collation yet —
+                    // COLLATE is a CREATE TABLE / ALTER surface (BINARY default).
+                    collation: Collation::Binary,
                 });
             }
             let primary_key = t

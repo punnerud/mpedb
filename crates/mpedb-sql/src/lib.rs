@@ -51,8 +51,8 @@ pub fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
 
 // Re-export the shared types a plan consumer needs.
 pub use mpedb_types::{
-    BareGroupBy, ColumnDef, ColumnType, DefaultExpr, Error, ExprProgram, Footprint, Instr,
-    KeyAccess, KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema, TableDef,
+    BareGroupBy, Collation, ColumnDef, ColumnType, DefaultExpr, Error, ExprProgram, Footprint,
+    Instr, KeyAccess, KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema, TableDef,
     TableKind, Tokenizer, Value, FORMAT_VERSION,
 };
 

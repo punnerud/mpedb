@@ -39,7 +39,7 @@ pub(super) fn distinct_order_by(
             // (ordinal / column / junk) sees the inner expression, and the
             // collation rides the sort tuple.
             let (e, coll) = peel_collate(e)?;
-            let coll = coll.unwrap_or_default();
+            let coll = coll.unwrap_or_else(|| declared_collation(e, scope));
             if let Some(pos) = ordinal(e, scope.width())? {
                 out.push((pos, *desc, coll));
                 continue;
@@ -71,7 +71,7 @@ pub(super) fn distinct_order_by(
         // Peel an explicit `COLLATE`; the collation rides the sort tuple, the
         // inner expression drives resolution.
         let (key, coll) = peel_collate(key)?;
-        let coll = coll.unwrap_or_default();
+        let coll = coll.unwrap_or_else(|| declared_collation(key, scope));
         if let Some(pos) = ordinal(key, items.len())? {
             out.push((pos, *desc, coll));
             continue;
@@ -538,7 +538,7 @@ pub(super) fn plan_select<'s>(
         // Peel an explicit `COLLATE`; a bare `ORDER BY name COLLATE NOCASE` still
         // sorts the base row (the collation only changes the comparator).
         let (e, coll) = peel_collate(e)?;
-        let coll = coll.unwrap_or_default();
+        let coll = coll.unwrap_or_else(|| declared_collation(e, &binder.scope));
         // An unqualified name matching a select-item ALIAS orders the OUTPUT
         // (the PostgreSQL rule) — never the base row, even when a table
         // column shares the name. Route it to the projection-sort path.

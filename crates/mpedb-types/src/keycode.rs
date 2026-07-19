@@ -10,7 +10,7 @@
 //! separator is needed and prefix ordering is preserved.
 
 use crate::error::{Error, Result};
-use crate::value::{normalize_float_bits, ColumnType, Value};
+use crate::value::{normalize_float_bits, Collation, ColumnType, Value};
 
 const TAG_NULL: u8 = 0x00;
 const TAG_PRESENT: u8 = 0x01;
@@ -71,6 +71,31 @@ pub fn encode_key(values: &[Value]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(values.len() * 12);
     for v in values {
         encode_value(&mut buf, v);
+    }
+    buf
+}
+
+/// Encode a composite key where TEXT columns are FOLDED under a per-column
+/// collating sequence before encoding, so two values that are equal under the
+/// collation produce identical bytes. This is what makes a collation-aware
+/// GROUP BY / DISTINCT collapse `'abc'` and `'ABC'` (NOCASE) into one bucket
+/// (executor use — mpedb does NOT yet build collated on-disk INDEXES; a
+/// non-BINARY collation on an indexed/PK column is refused at schema validation).
+///
+/// `collations[i]` governs `values[i]`; a shorter slice (or `Binary`) leaves the
+/// value bytewise, so `encode_key_collated(v, &[])` equals [`encode_key`]. Only
+/// TEXT is folded — every other type is collation-independent.
+pub fn encode_key_collated(values: &[Value], collations: &[Collation]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(values.len() * 12);
+    for (i, v) in values.iter().enumerate() {
+        let coll = collations.get(i).copied().unwrap_or(Collation::Binary);
+        match v {
+            Value::Text(s) if coll != Collation::Binary => {
+                buf.push(TAG_PRESENT);
+                encode_bytes(&mut buf, coll.fold_key(s).as_bytes());
+            }
+            _ => encode_value(&mut buf, v),
+        }
     }
     buf
 }
