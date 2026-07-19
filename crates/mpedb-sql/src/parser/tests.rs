@@ -667,3 +667,64 @@ fn table_qualified_columns_parse_and_are_distinct_from_excluded() {
     let (e, _) = parse_expr_only("\"excluded\"").unwrap();
     assert_eq!(e, Expr::Col("excluded".into()));
 }
+
+/// #1 — THE Django blocker. A quoted identifier must be usable everywhere a
+/// bare one is, and in particular on EITHER side of a qualifier dot: Django
+/// quotes every identifier it emits, so `"t"."c"` failing to parse failed ~every
+/// ORM query before a single row was read.
+///
+/// All four bare/quoted mixes, and all three sqlite quoting spellings, must
+/// produce the IDENTICAL expression — a quoted name differs from a bare one only
+/// in what characters it may contain.
+#[test]
+fn a_quoted_identifier_can_qualify_a_dotted_reference() {
+    let want = Expr::Qualified("t".into(), "c".into());
+    for src in [
+        "t.c",         // bare  . bare
+        "\"t\".\"c\"", // quoted . quoted
+        "\"t\".c",     // quoted . bare
+        "t.\"c\"",     // bare  . quoted
+        "`t`.`c`",     // backtick, both sides
+        "[t].[c]",     // bracket, both sides
+        "`t`.\"c\"",   // …and the spellings mix freely
+        "[t].c",
+    ] {
+        assert_eq!(parse_expr_only(src).unwrap().0, want, "{src}");
+    }
+    // Quoting is what turns a keyword-ish word into a plain name, on both sides.
+    assert_eq!(
+        parse_expr_only("\"select\".\"from\"").unwrap().0,
+        Expr::Qualified("select".into(), "from".into())
+    );
+    // A quoted qualifier is NOT the `excluded` pseudo-table and NOT a function:
+    // quoting says "this is a name", so a quoted `excluded` stays a column.
+    assert_eq!(
+        parse_expr_only("\"excluded\".\"c\"").unwrap().0,
+        Expr::Qualified("excluded".into(), "c".into())
+    );
+}
+
+/// A THREE-part name refuses BY NAME rather than emitting the confusing
+/// "unexpected trailing input `Dot`" the old grammar produced. mpedb's only
+/// schema qualifier is the Workspace alias, which is stripped off a TABLE
+/// reference and never off a column, so `db.t.c` could only ever be guessed at.
+#[test]
+fn three_part_names_refuse_by_name() {
+    for src in ["main.t.c", "\"main\".\"t\".\"c\"", "[a].[b].[c]"] {
+        let e = parse_expr_only(src).unwrap_err().to_string();
+        assert!(e.contains("three-part name"), "{src}: {e}");
+    }
+}
+
+/// `t.*` is per-table star expansion — a different feature from a qualified
+/// column, and one mpedb does not have. It refuses by NAME rather than
+/// complaining about a missing column name at a `*` the writer meant.
+#[test]
+fn per_table_star_refuses_by_name() {
+    for src in ["t.*", "\"t\".*", "[t].*"] {
+        let e = parse_statement(&format!("SELECT {src} FROM t"))
+            .unwrap_err()
+            .to_string();
+        assert!(e.contains("star expansion"), "{src}: {e}");
+    }
+}

@@ -966,11 +966,44 @@ impl<'a> Parser<'a> {
                 // arrive the qualifier stops being decoration and this is where
                 // it gets used.
                 if self.peek() == Some(&Tok::Dot) {
-                    self.pos += 1;
-                    let col = self.ident("column name after `.`")?;
-                    return Ok(Expr::Qualified(s, col));
+                    return self.dot_suffix(s);
                 }
                 Ok(Expr::Col(s))
+    }
+
+    /// `<qualifier> . <column>` — the caller has seen a bare or quoted
+    /// identifier and `Dot` is next. Both ancestors accept the form, so mpedb
+    /// does too: the qualifier names a table or alias in scope and the binder
+    /// resolves the pair.
+    ///
+    /// Quoting is irrelevant HERE by construction — the caller passes the
+    /// already-unquoted qualifier text and `ident()` accepts either spelling for
+    /// the part after the dot — which is what makes `"t"."c"`, `"t".c`, `t."c"`,
+    /// `` `t`.`c` ``, `[t].[c]` and `t.c` one grammar rather than six.
+    ///
+    /// A THIRD dot (`db.t.c`) is refused by name. sqlite reads it as
+    /// schema-qualified, but mpedb's only schema qualifier is the Workspace
+    /// alias, which `split_db_alias` strips off a TABLE reference and never off
+    /// a column — so accepting it here could only ever guess.
+    fn dot_suffix(&mut self, qualifier: String) -> Result<Expr> {
+        self.pos += 1; // the `.`
+        // `t.*` is per-table star expansion, a different feature from a
+        // qualified column — name it, rather than emit "expected a column name"
+        // at a `*` the writer put there on purpose.
+        if self.peek() == Some(&Tok::Star) {
+            return Err(self.err_here(format!(
+                "`{qualifier}.*` (per-table star expansion) is not supported — \
+                 use a bare `*`, or list the columns"
+            )));
+        }
+        let col = self.ident("column name after `.`")?;
+        if self.peek() == Some(&Tok::Dot) {
+            return Err(self.err_here(format!(
+                "a three-part name (`{qualifier}.{col}.…`) is not supported — \
+                 qualify a column with its table or alias only"
+            )));
+        }
+        Ok(Expr::Qualified(qualifier, col))
     }
 
     fn primary(&mut self) -> Result<Expr> {
@@ -1034,7 +1067,18 @@ impl<'a> Parser<'a> {
                 Ok(Expr::Param(i as u16))
             }
             Some(Tok::Ident(s)) => self.ident_suffix(s),
-            Some(Tok::QuotedIdent(s)) => Ok(Expr::Col(s)),
+            // A quoted identifier is a COLUMN, never a function/`excluded.`/
+            // `current_setting()` — quoting is precisely how you say "this is a
+            // name, not a word with a meaning". It does take the qualifier dot,
+            // though: `"t"."c"` must be exactly `t.c` (Django quotes every
+            // identifier it emits, so this is the difference between working
+            // and not).
+            Some(Tok::QuotedIdent(s)) => {
+                if self.peek() == Some(&Tok::Dot) {
+                    return self.dot_suffix(s);
+                }
+                Ok(Expr::Col(s))
+            }
             Some(Tok::LParen) => {
                 // `(SELECT …)` is a scalar subquery, not a parenthesized
                 // expression — the SELECT keyword right after `(` decides. The

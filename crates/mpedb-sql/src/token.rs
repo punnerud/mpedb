@@ -7,7 +7,11 @@ use mpedb_types::{Error, Result};
 pub(crate) enum Tok {
     /// Bare identifier (case-sensitive, not a keyword).
     Ident(String),
-    /// Double-quoted identifier (`""` escapes a quote).
+    /// Quoted identifier. Three spellings, all sqlite's and all folded to this
+    /// one token so the grammar never has to care which was written:
+    /// `"a"` (`""` escapes), `` `a` `` (``` `` ``` escapes), `[a]` (no escape,
+    /// closed by the first `]` — MS-Access/SQL-Server style, which sqlite
+    /// accepts too).
     QuotedIdent(String),
     Kw(Kw),
     Int(i64),
@@ -293,8 +297,18 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
                 i = next;
                 Tok::Str(s)
             }
-            b'"' => {
-                let (s, next) = lex_quoted_ident(sql, i)?;
+            // The three quoted-identifier spellings sqlite accepts. All produce
+            // the SAME token: a quoted identifier is usable everywhere a bare
+            // one is, and nothing downstream should be able to tell them apart.
+            b'"' | b'`' => {
+                let (s, next) = lex_quoted_ident(sql, i, c)?;
+                i = next;
+                Tok::QuotedIdent(s)
+            }
+            // `[name]` — no escape mechanism (sqlite has none either): the
+            // first `]` closes it, so a `]` cannot appear in a bracketed name.
+            b'[' => {
+                let (s, next) = lex_bracket_ident(sql, i)?;
                 i = next;
                 Tok::QuotedIdent(s)
             }
@@ -355,15 +369,17 @@ fn lex_string(sql: &str, start: usize) -> Result<(String, usize)> {
     Err(perr(start, "unterminated string literal"))
 }
 
-/// Lex a `"..."` identifier starting at the opening quote; `""` escapes.
-fn lex_quoted_ident(sql: &str, start: usize) -> Result<(String, usize)> {
+/// Lex a `"..."` / `` `...` `` identifier starting at the opening quote `q`; a
+/// doubled quote escapes one. Both spellings share this code because they share
+/// the rule — only the delimiter byte differs.
+fn lex_quoted_ident(sql: &str, start: usize, q: u8) -> Result<(String, usize)> {
     let b = sql.as_bytes();
     let mut i = start + 1;
     let mut s = String::new();
     let mut seg = i;
     while i < b.len() {
-        if b[i] == b'"' {
-            if b.get(i + 1) == Some(&b'"') {
+        if b[i] == q {
+            if b.get(i + 1) == Some(&q) {
                 s.push_str(&sql[seg..=i]);
                 i += 2;
                 seg = i;
@@ -377,6 +393,25 @@ fn lex_quoted_ident(sql: &str, start: usize) -> Result<(String, usize)> {
         } else {
             i += 1;
         }
+    }
+    Err(perr(start, "unterminated quoted identifier"))
+}
+
+/// Lex a `[...]` identifier starting at the opening bracket. sqlite gives this
+/// spelling NO escape mechanism, so the first `]` closes the name; an empty
+/// `[]` is refused for the same reason `""` is.
+fn lex_bracket_ident(sql: &str, start: usize) -> Result<(String, usize)> {
+    let b = sql.as_bytes();
+    let mut i = start + 1;
+    while i < b.len() {
+        if b[i] == b']' {
+            let s = &sql[start + 1..i];
+            if s.is_empty() {
+                return Err(perr(start, "empty quoted identifier"));
+            }
+            return Ok((s.to_owned(), i + 1));
+        }
+        i += 1;
     }
     Err(perr(start, "unterminated quoted identifier"))
 }
@@ -527,6 +562,39 @@ mod tests {
                 Tok::Percent
             ]
         );
+    }
+
+    /// #1: all THREE quoted-identifier spellings sqlite accepts lex to the SAME
+    /// token, so a quoted name is usable everywhere a bare one is and nothing
+    /// downstream can tell which spelling was written.
+    #[test]
+    fn every_quoting_spelling_is_one_token() {
+        let q = |s: &str| Tok::QuotedIdent(s.into());
+        assert_eq!(toks("\"t\""), vec![q("t")]);
+        assert_eq!(toks("`t`"), vec![q("t")]);
+        assert_eq!(toks("[t]"), vec![q("t")]);
+        // A doubled delimiter escapes one, for the two that have an escape.
+        assert_eq!(toks("\"a\"\"b\""), vec![q("a\"b")]);
+        assert_eq!(toks("`a``b`"), vec![q("a`b")]);
+        // `[...]` has NO escape in sqlite: the first `]` closes it.
+        assert_eq!(toks("[a b]"), vec![q("a b")]);
+        // Keywords, spaces and dots all survive quoting.
+        assert_eq!(toks("[select]"), vec![q("select")]);
+        assert_eq!(toks("`from`"), vec![q("from")]);
+        assert_eq!(toks("\"a.b\""), vec![q("a.b")]);
+        // Every spelling of the dotted path lexes to ident-dot-ident.
+        for src in ["\"t\".\"c\"", "`t`.`c`", "[t].[c]", "\"t\".c", "t.\"c\""] {
+            assert_eq!(
+                toks(src).len(),
+                3,
+                "{src} should lex to <ident> . <ident>"
+            );
+            assert_eq!(toks(src)[1], Tok::Dot, "{src}");
+        }
+        // Empty and unterminated are errors for every spelling.
+        for bad in ["\"\"", "``", "[]", "\"a", "`a", "[a"] {
+            assert!(tokenize(bad).is_err(), "{bad} should not lex");
+        }
     }
 
     #[test]
