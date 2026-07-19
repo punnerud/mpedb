@@ -383,6 +383,39 @@ fn int_parameter_in_a_bool_slot() {
     cleanup(&path);
 }
 
+/// The RUNTIME fallback. The binder desugars every boolean context whose
+/// operand type it can pin, which is every ordinary statement — but an
+/// expression over two unconstrained parameters has no static type, so it
+/// reaches the evaluator's boolean gate as a raw value. sqlite truthy-tests it;
+/// before this change mpedb raised `predicate evaluated to int64, expected
+/// bool`, which is one of the errors Django's suite hit.
+#[test]
+fn untyped_expressions_are_truthy_tested_at_runtime() {
+    let (db, path) = open("runtime");
+    let cnt = |sql: &str, p: &[Value]| match db.query(sql, p) {
+        Ok(ExecResult::Rows { rows, .. }) => rows[0][0].clone(),
+        other => panic!("{sql}: {other:?}"),
+    };
+    let i = |n: i64| Value::Int(n);
+    assert_eq!(cnt("SELECT count(*) FROM t WHERE $1 + $2", &[i(1), i(1)]), Value::Int(1));
+    assert_eq!(cnt("SELECT count(*) FROM t WHERE $1 + $2", &[i(1), i(-1)]), Value::Int(0));
+    assert_eq!(cnt("SELECT count(*) FROM t WHERE NOT ($1 + $2)", &[i(0), i(0)]), Value::Int(1));
+    assert_eq!(
+        cnt("SELECT count(*) FROM t WHERE ($1 + $2) AND ($1 + $2)", &[i(2), i(0)]),
+        Value::Int(1)
+    );
+    assert_eq!(
+        cnt("SELECT CASE WHEN $1 + $2 THEN 'T' ELSE 'F' END FROM t", &[i(0), i(0)]),
+        Value::Text("F".into())
+    );
+    // NULL still means unknown, not false-by-coercion.
+    assert_eq!(
+        cnt("SELECT count(*) FROM t WHERE $1 + $2", &[Value::Null, i(1)]),
+        Value::Int(0)
+    );
+    cleanup(&path);
+}
+
 /// What mpedb deliberately does NOT follow, and why. These are clean refusals,
 /// never wrong answers.
 #[test]

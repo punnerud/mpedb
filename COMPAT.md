@@ -188,7 +188,9 @@ parse, applied to text and to a blob's raw bytes. So `'3abc'`, `'1e3'`, `'.5'`,
 `' 1 '` and `x'31'` are TRUE, while `'abc'`, `'0'`, `'0abc'`, `'0x1'`, `''`,
 `x'30'`, `x'00'` and `-0.0` are FALSE. It is implemented as a binder desugaring
 to `x <> 0` / `CAST(x AS REAL) <> 0.0`, so it costs no opcode and no plan
-format. 24 values × 8 boolean positions are differential-tested against sqlite
+format; the same rule is applied at the evaluator's boolean gates for the
+residue the binder cannot pin statically (an expression over unconstrained
+parameters, e.g. `WHERE $1 + $2`). 24 values × 8 boolean positions are differential-tested against sqlite
 3.45 in `crates/mpedb/tests/bool_truthiness.rs`.
 
 *The int/bool value bridge.* sqlite stores a boolean AS the integer 0/1, which
