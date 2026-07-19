@@ -1769,3 +1769,314 @@ fn named_in_memory_database_is_shared_private_and_does_not_outlive_the_process()
         assert!(!cwd_artifact.exists());
     }
 }
+
+// ---- refusal-path destructor contracts (CPython heap safety) ---------------
+
+unsafe extern "C" fn count_destroy(p: *mut c_void) {
+    let c = &*(p as *const std::sync::atomic::AtomicU32);
+    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// sqlite's documented contract: when `sqlite3_create_collation_v2` FAILS the
+/// destructor is NOT invoked (the caller frees its context — CPython's
+/// `create_collation` does exactly that), while a failing
+/// `sqlite3_create_window_function` DOES invoke it (and CPython relies on
+/// that by not freeing). Invoking it on the collation refusal was a
+/// double-free that corrupted CPython's heap and segfaulted test_sqlite3.
+#[test]
+fn collation_refusal_leaves_destructor_alone_window_refusal_runs_it() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    unsafe {
+        let db = open_memory();
+        let hits = AtomicU32::new(0);
+        let app = &hits as *const AtomicU32 as *mut c_void;
+
+        let name = cs("mycoll");
+        let rc = sqlite3_create_collation_v2(
+            db,
+            name.as_ptr(),
+            1, // SQLITE_UTF8
+            app,
+            ptr::null_mut(),
+            fnptr1(count_destroy),
+        );
+        assert_eq!(rc, SQLITE_ERROR, "custom collations are refused");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "collation destructor must NOT run on failure (double-free under CPython)"
+        );
+
+        let wname = cs("mywin");
+        let rc = sqlite3_create_window_function(
+            db,
+            wname.as_ptr(),
+            1,
+            1, // SQLITE_UTF8
+            app,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            fnptr1(count_destroy),
+        );
+        assert_eq!(rc, SQLITE_ERROR, "window functions are refused");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "window-function destructor MUST run on failure (CPython does not free otherwise)"
+        );
+        sqlite3_close(db);
+    }
+}
+
+// ---- CPython test_sqlite3 batch: trace, limits, trivia, ro, busy ----------
+
+static TRACE_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+unsafe extern "C" fn record_trace(
+    ev: u32,
+    _ctx: *mut c_void,
+    p: *mut c_void,
+    sql: *mut c_void,
+) -> c_int {
+    assert_eq!(ev, SQLITE_TRACE_STMT);
+    // The P argument must be expandable, exactly as CPython uses it.
+    let expanded = sqlite3_expanded_sql(p as *mut Stmt);
+    let text = if expanded.is_null() {
+        CStr::from_ptr(sql as *const c_char).to_string_lossy().into_owned()
+    } else {
+        let t = CStr::from_ptr(expanded).to_string_lossy().into_owned();
+        sqlite3_free(expanded as *mut c_void);
+        t
+    };
+    TRACE_LOG.lock().unwrap().push(text);
+    0
+}
+
+fn trace_fnptr() -> *mut c_void {
+    record_trace as unsafe extern "C" fn(u32, *mut c_void, *mut c_void, *mut c_void) -> c_int
+        as *const () as *mut c_void
+}
+
+/// SQLITE_TRACE_STMT fires as a statement begins running — on the step path
+/// (with bound parameters expanded, sqlite's contract via expanded_sql) and on
+/// the exec path (CPython's legacy-autocommit COMMIT goes through exec).
+#[test]
+fn trace_v2_stmt_fires_on_step_and_exec() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (a INTEGER PRIMARY KEY, b TEXT)"), SQLITE_OK);
+        TRACE_LOG.lock().unwrap().clear();
+        assert_eq!(
+            sqlite3_trace_v2(db, SQLITE_TRACE_STMT, trace_fnptr(), ptr::null_mut()),
+            SQLITE_OK
+        );
+
+        // step path, with a bound parameter -> traced EXPANDED
+        let sql = cs("insert into t(b) values(?)");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        let v = cs("x");
+        assert_eq!(sqlite3_bind_text(st, 1, v.as_ptr(), -1, sqlite_transient()), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_DONE);
+        sqlite3_finalize(st);
+
+        // exec path
+        assert_eq!(exec(db, "delete from t"), SQLITE_OK);
+
+        // clearing stops events
+        assert_eq!(sqlite3_trace_v2(db, 0, ptr::null_mut(), ptr::null_mut()), SQLITE_OK);
+        assert_eq!(exec(db, "insert into t(b) values('y')"), SQLITE_OK);
+
+        let log = TRACE_LOG.lock().unwrap().clone();
+        assert_eq!(
+            log,
+            vec!["insert into t(b) values('x')".to_string(), "delete from t".to_string()],
+            "trace log"
+        );
+        sqlite3_close(db);
+    }
+}
+
+#[test]
+fn limits_round_trip_and_variable_number_enforced() {
+    unsafe {
+        let db = open_memory();
+        // bad category -> negative
+        assert!(sqlite3_limit(db, 99, -1) < 0);
+        // round trip: prior value comes back, new value sticks
+        let prior = sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, 1);
+        assert_eq!(prior, 32_766);
+        assert_eq!(sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1), 1);
+        // enforcement at prepare, sqlite's message
+        let sql = cs("select ?, ?");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_ERROR);
+        let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_string_lossy().into_owned();
+        assert!(msg.contains("too many SQL variables"), "errmsg {msg:?}");
+        // restore; expanded_sql honors SQLITE_LIMIT_LENGTH
+        sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, prior);
+        let sql = cs("select ?");
+        assert_eq!(sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        let v = cs("abcdefgh");
+        assert_eq!(sqlite3_bind_text(st, 1, v.as_ptr(), -1, sqlite_transient()), SQLITE_OK);
+        sqlite3_limit(db, SQLITE_LIMIT_LENGTH, 4);
+        assert!(sqlite3_expanded_sql(st).is_null(), "expansion above LENGTH limit must be NULL");
+        sqlite3_limit(db, SQLITE_LIMIT_LENGTH, 1_000_000_000);
+        let e = sqlite3_expanded_sql(st);
+        assert_eq!(CStr::from_ptr(e).to_string_lossy(), "select 'abcdefgh'");
+        sqlite3_free(e as *mut c_void);
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+    }
+}
+
+/// mpedb's parser does not skip leading comments; the shim strips them
+/// (classification AND the text the engine sees), as sqlite's parser does.
+#[test]
+fn leading_comments_and_maintenance_statements() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "create table t (a INTEGER PRIMARY KEY, b TEXT)"), SQLITE_OK);
+        assert_eq!(exec(db, "  -- leading comment\n  insert into t(b) values('x')"), SQLITE_OK);
+        assert_eq!(exec(db, "/* block */ insert into t(b) values('y')"), SQLITE_OK);
+        // prepare path too
+        let sql = cs("-- c\nselect count(*) from t");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_int(st, 0), 2);
+        sqlite3_finalize(st);
+        // VACUUM / ANALYZE: accepted no-ops (housekeeping with nothing to do)
+        assert_eq!(exec(db, "VACUUM"), SQLITE_OK);
+        assert_eq!(exec(db, "ANALYZE"), SQLITE_OK);
+        sqlite3_close(db);
+    }
+}
+
+/// A NaN has no sqlite representation: binding one stores NULL.
+#[test]
+fn nan_binds_as_null() {
+    unsafe {
+        let db = open_memory();
+        let sql = cs("select ? is null");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_bind_double(st, 1, f64::NAN), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_int(st, 0), 1);
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+    }
+}
+
+/// `file:…?mode=ro`: a missing file is not created (CANTOPEN), and writes on
+/// an existing one refuse with SQLITE_READONLY.
+#[test]
+fn uri_mode_ro_is_enforced() {
+    unsafe {
+        let path = "/tmp/mpedb-capi-ro-test.mpedb";
+        let _ = std::fs::remove_file(path);
+        let uri = cs("file:/tmp/mpedb-capi-ro-test.mpedb?mode=ro");
+        let mut db: *mut Sqlite3 = ptr::null_mut();
+        assert_eq!(
+            sqlite3_open_v2(&raw const *uri.as_ptr(), &mut db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | 0x40, ptr::null()),
+            SQLITE_CANTOPEN,
+            "mode=ro must not create"
+        );
+        assert!(!std::path::Path::new(path).exists());
+
+        // create it read-write, then reopen ro
+        let plain = cs(path);
+        assert_eq!(sqlite3_open(plain.as_ptr(), &mut db), SQLITE_OK);
+        assert_eq!(exec(db, "create table t (a INTEGER PRIMARY KEY)"), SQLITE_OK);
+        sqlite3_close(db);
+        assert_eq!(
+            sqlite3_open_v2(uri.as_ptr(), &mut db, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | 0x40, ptr::null()),
+            SQLITE_OK
+        );
+        assert_eq!(exec(db, "insert into t(a) values(1)"), SQLITE_READONLY);
+        let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_string_lossy().into_owned();
+        assert!(msg.contains("readonly"), "errmsg {msg:?}");
+        // reads still fine
+        let q = cs("select count(*) from t");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, q.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        sqlite3_finalize(st);
+        sqlite3_close(db);
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// A `file:` URI's path is percent-decoded, byte-wise.
+#[test]
+fn uri_path_percent_decodes() {
+    unsafe {
+        let path = "/tmp/mpedb capi pct test.mpedb";
+        let _ = std::fs::remove_file(path);
+        let uri = cs("file:/tmp/mpedb%20capi%20pct%20test.mpedb");
+        let mut db: *mut Sqlite3 = ptr::null_mut();
+        assert_eq!(sqlite3_open(uri.as_ptr(), &mut db), SQLITE_OK);
+        assert_eq!(exec(db, "create table t (a INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert!(std::path::Path::new(path).exists(), "decoded path was not the one created");
+        sqlite3_close(db);
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// A SIBLING connection on the same thread that needs the writer lock while
+/// this one holds it gets sqlite's BUSY ("database is locked"), not an
+/// "internal error (bug in mpedb)" — and the busy-timeout retry clears it.
+#[test]
+fn sibling_connection_write_is_busy_not_internal() {
+    unsafe {
+        let path = "/tmp/mpedb-capi-busy-sibling.mpedb";
+        let _ = std::fs::remove_file(path);
+        let name = cs(path);
+        let (mut a, mut b): (*mut Sqlite3, *mut Sqlite3) = (ptr::null_mut(), ptr::null_mut());
+        assert_eq!(sqlite3_open(name.as_ptr(), &mut a), SQLITE_OK);
+        assert_eq!(sqlite3_open(name.as_ptr(), &mut b), SQLITE_OK);
+        assert_eq!(exec(a, "create table t (a INTEGER PRIMARY KEY, b TEXT)"), SQLITE_OK);
+        assert_eq!(exec(a, "BEGIN"), SQLITE_OK);
+        assert_eq!(exec(a, "insert into t(b) values('x')"), SQLITE_OK);
+        // b: BEGIN needs the writer lock a holds -> BUSY, sqlite's message
+        assert_eq!(exec(b, "BEGIN"), SQLITE_BUSY);
+        let msg = CStr::from_ptr(sqlite3_errmsg(b)).to_string_lossy().into_owned();
+        assert_eq!(msg, "database is locked");
+        // commit on a, then b proceeds
+        assert_eq!(exec(a, "COMMIT"), SQLITE_OK);
+        assert_eq!(exec(b, "BEGIN"), SQLITE_OK);
+        assert_eq!(exec(b, "insert into t(b) values('y')"), SQLITE_OK);
+        assert_eq!(exec(b, "COMMIT"), SQLITE_OK);
+        sqlite3_close(a);
+        sqlite3_close(b);
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Refusal stubs must leave the refusal ON THE HANDLE (backup: the
+/// destination), or CPython raises bare SystemError.
+#[test]
+fn refusal_stubs_set_handle_error() {
+    unsafe {
+        let dst = open_memory();
+        let src = open_memory();
+        let main = cs("main");
+        assert!(sqlite3_backup_init(dst, main.as_ptr(), src, main.as_ptr()).is_null());
+        let msg = CStr::from_ptr(sqlite3_errmsg(dst)).to_string_lossy().into_owned();
+        assert!(msg.contains("backup"), "backup errmsg {msg:?}");
+
+        let mut blob: *mut c_void = ptr::null_mut();
+        let t = cs("t");
+        assert_eq!(
+            sqlite3_blob_open(src, main.as_ptr(), t.as_ptr(), t.as_ptr(), 1, 0, &mut blob),
+            SQLITE_ERROR
+        );
+        let msg = CStr::from_ptr(sqlite3_errmsg(src)).to_string_lossy().into_owned();
+        assert!(msg.contains("blob"), "blob errmsg {msg:?}");
+        sqlite3_close(dst);
+        sqlite3_close(src);
+    }
+}

@@ -75,7 +75,47 @@ pub struct Sqlite3 {
     /// deleted, or the connection closes — CPython wraps a Python callable in
     /// `pApp` and would otherwise leak it.
     host_fns: Vec<udf::HostFn>,
+    /// `sqlite3_trace_v2` registration: event mask + `xCallback` + `pCtx`. The
+    /// only event the shim emits is `SQLITE_TRACE_STMT`, fired as a statement
+    /// begins running (see `trace_stmt_begin`); other mask bits are accepted
+    /// and simply never fire.
+    trace_mask: u32,
+    trace_cb: *mut c_void,
+    trace_ctx: *mut c_void,
+    /// `sqlite3_progress_handler` registration. The shim has no VM opcode
+    /// stream to count, so the handler fires once per statement execution — a
+    /// coarse but honest "invoked periodically during evaluation" — and a
+    /// non-zero return interrupts the statement (`SQLITE_INTERRUPT`), which is
+    /// the part consumers (CPython) actually rely on for cancellation.
+    progress_cb: *mut c_void,
+    progress_ctx: *mut c_void,
+    /// Per-connection run-time limits (`sqlite3_limit`), seeded with sqlite's
+    /// compile-time defaults. Get/set is faithful (prior value returned, bad
+    /// category -> -1). Enforced where the shim itself does the work:
+    /// `VARIABLE_NUMBER` at prepare and `LENGTH` in `sqlite3_expanded_sql`;
+    /// CPython enforces `SQL_LENGTH` by reading the stored value.
+    limits: [c_int; SQLITE_N_LIMIT],
+    /// `file:…?mode=ro` (or an open_v2 READONLY flag without READWRITE/CREATE):
+    /// every non-read statement is refused with `SQLITE_READONLY`.
+    readonly: bool,
 }
+
+/// sqlite 3.45's compile-time limit defaults — both the initial value and the
+/// hard upper bound a `sqlite3_limit` set is truncated to.
+const DEFAULT_LIMITS: [c_int; SQLITE_N_LIMIT] = [
+    1_000_000_000, // LENGTH
+    1_000_000_000, // SQL_LENGTH
+    2000,          // COLUMN
+    1000,          // EXPR_DEPTH
+    500,           // COMPOUND_SELECT
+    250_000_000,   // VDBE_OP
+    127,           // FUNCTION_ARG
+    10,            // ATTACHED
+    50_000,        // LIKE_PATTERN_LENGTH
+    32_766,        // VARIABLE_NUMBER
+    1000,          // TRIGGER_DEPTH
+    0,             // WORKER_THREADS
+];
 
 /// A prepared statement: the SQL, its bound parameters, and — once stepped —
 /// the materialized result it hands out one row at a time.
@@ -208,7 +248,13 @@ impl Sqlite3 {
 
     fn set_db_error(&mut self, e: &DbError) -> c_int {
         let (code, ext) = valconv::error_codes(e);
-        self.set_error(code, ext, &e.to_string());
+        // Consumers grep sqlite's canonical phrasings ("… constraint failed",
+        // "database is locked"); render those messages sqlite-shaped, with
+        // mpedb's detail preserved after them.
+        match valconv::sqlite_shaped_message(e) {
+            Some(msg) => self.set_error(code, ext, &msg),
+            None => self.set_error(code, ext, &e.to_string()),
+        }
         code
     }
 }
@@ -253,6 +299,10 @@ fn rollback_txn(c: &mut Sqlite3) {
 /// routed to the open `WriteSession` (if any) or the autocommit facade.
 fn exec_one(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome, DbError> {
     use sql::Kind;
+    // sqlite's parser skips leading comments; mpedb's does not — strip them
+    // here so `-- comment\nINSERT …` (a shape CPython's suite and iterdump
+    // scripts use) reaches the engine as the statement it is.
+    let sqltext = sql::strip_leading_trivia(sqltext);
     match sql::classify(sqltext) {
         // PRAGMA and sqlite_master reads are answered by the shim's schema
         // introspection (mpedb has neither); they never reach the engine.
@@ -294,6 +344,9 @@ fn exec_one(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome,
             s.query(sqltext, params)?;
             Ok(Outcome::Control)
         }
+        // VACUUM / ANALYZE: nothing to do (see `Kind::Maintenance`) — succeed
+        // with no rows and no change counters, as sqlite's do on a tidy file.
+        Kind::Maintenance => Ok(Outcome::Control),
         // DDL (CREATE/DROP/ALTER) routes like any other statement (#95): to the
         // open WriteSession's txn when one is active — where it commits/rolls
         // back atomically with the transaction's DML — else to the autocommit
@@ -345,7 +398,7 @@ fn is_busy_err(e: &DbError) -> bool {
     matches!(
         e,
         DbError::WriteConflict | DbError::ReadersFull | DbError::SnapshotEvicted
-    )
+    ) || valconv::is_writer_lock_reentry(e)
 }
 
 /// sqlite's own default-busy-handler delay table (ms), then 100 ms steady.
@@ -366,6 +419,16 @@ fn run_stmt(s: &mut Stmt) -> c_int {
         c.set_error(SQLITE_INTERRUPT, SQLITE_INTERRUPT, "interrupted");
         return SQLITE_INTERRUPT;
     }
+    // A read-only connection (`file:…?mode=ro`) refuses every statement that
+    // could write. Transaction control is allowed (as sqlite does): the write
+    // inside it is what gets refused.
+    if c.readonly && matches!(sql::classify(&s.sql), sql::Kind::Dml { .. } | sql::Kind::Ddl) {
+        c.set_error(SQLITE_READONLY, SQLITE_READONLY, "attempt to write a readonly database");
+        return SQLITE_READONLY;
+    }
+    // The statement is about to run: drain any stale UDF-error stash so an
+    // error surfaced by THIS run is attributable to this run alone.
+    udf::take_last_udf_error();
     // `busy_timeout(ms)`: on a BUSY-class contention error, sleep with sqlite's
     // backoff and retry until the deadline, exactly as sqlite's default busy
     // handler does — a transient conflict clears instead of failing the call.
@@ -441,7 +504,23 @@ fn run_stmt(s: &mut Stmt) -> c_int {
             c.clear_error();
             SQLITE_OK
         }
-        Err(e) => c.set_db_error(&e),
+        Err(e) => {
+            // A host UDF that called `sqlite3_result_error*` failed this
+            // statement: the engine tunnels that as an opaque `Unsupported`
+            // wrapper ("user function raised: …"), but the CONSUMER'S contract
+            // is the code and text the callback itself set — CPython maps
+            // NOMEM -> MemoryError, TOOBIG -> DataError, and asserts the exact
+            // message. Present the callback's own error when this statement's
+            // failure is that error.
+            if let Some((code, msg)) = udf::take_last_udf_error() {
+                if e.to_string().ends_with(&msg) {
+                    let primary = code & 0xff;
+                    c.set_error(primary, code, &msg);
+                    return primary;
+                }
+            }
+            c.set_db_error(&e)
+        }
     }
 }
 
@@ -531,13 +610,56 @@ fn named_memory_path(name: &str) -> PathBuf {
     dir.join(format!("mpedb-capi-{}-mem-{}.mpedb", std::process::id(), safe))
 }
 
-fn resolve_target(filename: Option<&str>, flags: c_int) -> Target {
-    let name = filename.unwrap_or("").trim();
+/// Percent-decode a `file:` URI's path portion, byte-wise. sqlite decodes %HH
+/// escapes in URI filenames, and the RESULT is OS path bytes — not necessarily
+/// UTF-8 (CPython encodes undecodable paths with surrogateescape and quotes
+/// them into the URI).
+fn pct_decode(s: &str) -> Vec<u8> {
+    fn hex(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%' && i + 2 < b.len() {
+            if let (Some(hi), Some(lo)) = (hex(b[i + 1]), hex(b[i + 2])) {
+                out.push(hi << 4 | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    out
+}
+
+fn os_path(bytes: &[u8]) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    PathBuf::from(std::ffi::OsStr::from_bytes(bytes))
+}
+
+fn resolve_target(filename: Option<&str>, raw: Option<&[u8]>, flags: c_int) -> Target {
     if flags & SQLITE_OPEN_MEMORY != 0 {
         return Target::Ephemeral;
     }
+    // A filename that is not valid UTF-8 cannot be a `file:` URI (URIs are
+    // ASCII once percent-encoded): it is a plain OS path, byte-for-byte.
+    let Some(name) = filename else {
+        return match raw {
+            Some(b) if !b.is_empty() => Target::File(os_path(b)),
+            _ => Target::Ephemeral,
+        };
+    };
+    let name = name.trim();
     // Minimal file: URI handling.
-    let name = if let Some(rest) = name.strip_prefix("file:") {
+    if let Some(rest) = name.strip_prefix("file:") {
         let path = rest.split('?').next().unwrap_or("");
         if path == ":memory:" || path.is_empty() {
             return Target::Ephemeral;
@@ -551,10 +673,9 @@ fn resolve_target(filename: Option<&str>, flags: c_int) -> Target {
         if uri_param(filename, "mode") == Some("memory") {
             return Target::NamedMemory(named_memory_path(path));
         }
-        path
-    } else {
-        name
-    };
+        // sqlite percent-decodes the URI's path (the bytes may be non-UTF-8).
+        return Target::File(os_path(&pct_decode(path)));
+    }
     if name.is_empty() || name == ":memory:" {
         Target::Ephemeral
     } else {
@@ -662,8 +783,16 @@ fn register_shim_builtins(db: &Database) {
     });
 }
 
-fn open_impl(filename: Option<&str>, flags: c_int) -> Result<Box<Sqlite3>, (c_int, String)> {
-    let target = resolve_target(filename, flags);
+fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_int, String)> {
+    // URI/`:memory:` recognition needs text; a non-UTF-8 name is a plain path.
+    let filename = raw_name.and_then(|b| std::str::from_utf8(b).ok());
+    let target = resolve_target(filename, raw_name, flags);
+    // `file:…?mode=ro` (sqlite's URI read-only mode) or a READONLY flag with
+    // neither READWRITE nor CREATE: the connection refuses every write with
+    // SQLITE_READONLY, and a missing file is NOT created.
+    let readonly = uri_param(filename, "mode") == Some("ro")
+        || (flags & SQLITE_OPEN_READONLY != 0
+            && flags & (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE) == 0);
     // `file:…?size_mb=N` requests a specific pre-reserved size (mpedb fallocates
     // it — reserve, don't grow); otherwise a small default. Only meaningful for a
     // NEW file; an existing one keeps the geometry it was created with.
@@ -693,21 +822,36 @@ fn open_impl(filename: Option<&str>, flags: c_int) -> Result<Box<Sqlite3>, (c_in
     let attach = || -> Result<Database, (c_int, String)> {
         if exists {
             // Attach an existing mpedb file config-free (reads its stored schema).
-            return Database::open_from_file(&path)
-                .map_err(|e| (SQLITE_CANTOPEN, format!("cannot open `{}`: {e}", path.display())));
+            // The message leads with sqlite's canonical phrase — consumers
+            // (CPython's tests included) grep for "unable to open database
+            // file" — and keeps the real reason after it.
+            return Database::open_from_file(&path).map_err(|e| {
+                (
+                    SQLITE_CANTOPEN,
+                    format!("unable to open database file: cannot open `{}`: {e}", path.display()),
+                )
+            });
         }
         // Fresh database: creating requires the CREATE flag (open_v2 semantics;
-        // plain sqlite3_open always sets it — see the callers).
-        if flags & SQLITE_OPEN_CREATE == 0 {
+        // plain sqlite3_open always sets it — see the callers), and a read-only
+        // open never creates, whatever the flags say (sqlite's mode=ro rule).
+        if flags & SQLITE_OPEN_CREATE == 0 || readonly {
             return Err((
                 SQLITE_CANTOPEN,
-                format!("no such database file: {}", path.display()),
+                format!("unable to open database file: no such database file: {}", path.display()),
             ));
         }
-        let cfg = Config::from_toml_str(&seed_toml(&path, size_mb))
+        let mut cfg = Config::from_toml_str(&seed_toml(&path, size_mb))
             .map_err(|e| (SQLITE_CANTOPEN, format!("config error: {e}")))?;
-        Database::open_with_config(cfg)
-            .map_err(|e| (SQLITE_CANTOPEN, format!("cannot create `{}`: {e}", path.display())))
+        // The TOML carried a lossy rendering of the path (TOML strings are
+        // UTF-8; an OS path need not be). Overwrite with the exact bytes.
+        cfg.options.path = path.clone();
+        Database::open_with_config(cfg).map_err(|e| {
+            (
+                SQLITE_CANTOPEN,
+                format!("unable to open database file: cannot create `{}`: {e}", path.display()),
+            )
+        })
     };
     let db = match attach() {
         Ok(db) => db,
@@ -737,6 +881,13 @@ fn open_impl(filename: Option<&str>, flags: c_int) -> Result<Box<Sqlite3>, (c_in
         total_changes: 0,
         last_insert_rowid: 0,
         host_fns: Vec::new(),
+        trace_mask: 0,
+        trace_cb: ptr::null_mut(),
+        trace_ctx: ptr::null_mut(),
+        progress_cb: ptr::null_mut(),
+        progress_ctx: ptr::null_mut(),
+        limits: DEFAULT_LIMITS,
+        readonly,
     });
     c.clear_error();
     Ok(c)
@@ -826,7 +977,7 @@ unsafe fn open_common(filename: *const c_char, pp_db: *mut *mut Sqlite3, flags: 
     if pp_db.is_null() {
         return SQLITE_MISUSE;
     }
-    let name = c_str_opt(filename);
+    let name = c_bytes(filename, -1);
     match catch_unwind(AssertUnwindSafe(|| open_impl(name, flags))) {
         Ok(Ok(boxed)) => {
             *pp_db = Box::into_raw(boxed);
@@ -1001,6 +1152,7 @@ unsafe fn prepare_common(
             | sql::Kind::RollbackTo
             | sql::Kind::Ddl
             | sql::Kind::Pragma
+            | sql::Kind::Maintenance
     ) || (matches!(kind, sql::Kind::Read) && introspect::references_sqlite_master(first));
 
     // #95: with a transaction open, a compilable statement may reference a
@@ -1021,11 +1173,22 @@ unsafe fn prepare_common(
     // `bind_parameter_*` family.
     let scan = sql::scan_params(first);
 
+    // SQLITE_LIMIT_VARIABLE_NUMBER: sqlite refuses at parse when a statement
+    // uses more parameters than the connection's limit allows, with exactly
+    // this message (CPython's suite regex-matches it).
+    if scan.count > c.limits[SQLITE_LIMIT_VARIABLE_NUMBER as usize].max(0) as usize {
+        c.set_error(SQLITE_ERROR, SQLITE_ERROR, "too many SQL variables");
+        return SQLITE_ERROR;
+    }
+
     // Validate compilable statements now (surface syntax/bind errors at
     // prepare, as sqlite does), WITHOUT executing or publishing a plan. Validate
     // the REWRITTEN text — mpedb's parser rejects a bare `:` — not the original.
     if !skip_validation {
-        match catch_unwind(AssertUnwindSafe(|| c.db.prepare_detached(&scan.rewritten))) {
+        // The engine's parser does not skip leading comments (exec_one strips
+        // them at execution) — validate the same stripped text it will run.
+        let to_validate = sql::strip_leading_trivia(&scan.rewritten);
+        match catch_unwind(AssertUnwindSafe(|| c.db.prepare_detached(to_validate))) {
             Ok(Ok(_plan)) => {}
             Ok(Err(e)) => return c.set_db_error(&e),
             Err(_) => {
@@ -1059,15 +1222,26 @@ unsafe fn prepare_common(
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_step(p: *mut Stmt) -> c_int {
-    let Some(s) = stmt(p) else {
+    if p.is_null() {
         return SQLITE_MISUSE;
-    };
-    if !s.executed {
-        let code = run_stmt(s);
+    }
+    if !(*p).executed {
+        // Both callbacks run with NO Rust borrow of the statement or the
+        // connection live: a trace callback (CPython's, for one) re-enters the
+        // API with this very Stmt* (`sqlite3_expanded_sql`, `sqlite3_db_handle`).
+        trace_stmt_begin(p);
+        if progress_says_interrupt(p) {
+            if let Some(c) = conn((*p).db) {
+                c.set_error(SQLITE_INTERRUPT, SQLITE_INTERRUPT, "interrupted");
+            }
+            return SQLITE_INTERRUPT;
+        }
+        let code = run_stmt(&mut *p);
         if code != SQLITE_OK {
             return code;
         }
     }
+    let s = &mut *p;
     if s.pos < s.rows.len() {
         load_current_row(s);
         SQLITE_ROW
@@ -1076,6 +1250,42 @@ pub unsafe extern "C" fn sqlite3_step(p: *mut Stmt) -> c_int {
         s.cells.clear();
         SQLITE_DONE
     }
+}
+
+/// Fire a registered `SQLITE_TRACE_STMT` callback: `p` is about to (re)run.
+/// The P argument is the statement handle (the callback may expand it), the X
+/// argument the unexpanded statement text, NUL-terminated, valid for the call.
+unsafe fn trace_stmt_begin(p: *mut Stmt) {
+    let db = (*p).db;
+    if db.is_null() {
+        return;
+    }
+    let (mask, cb, ctx) = ((*db).trace_mask, (*db).trace_cb, (*db).trace_ctx);
+    if cb.is_null() || mask & SQLITE_TRACE_STMT == 0 {
+        return;
+    }
+    let mut sql_c = (*p).sql.as_bytes().to_vec();
+    sql_c.retain(|b| *b != 0);
+    sql_c.push(0);
+    let f: unsafe extern "C" fn(u32, *mut c_void, *mut c_void, *mut c_void) -> c_int =
+        std::mem::transmute(cb);
+    // The return value of an SQLITE_TRACE_STMT callback is ignored, as sqlite.
+    let _ = f(SQLITE_TRACE_STMT, ctx, p as *mut c_void, sql_c.as_ptr() as *mut c_void);
+}
+
+/// Fire a registered progress handler once for this statement execution.
+/// Non-zero (CPython returns -1 when the Python handler raised) interrupts.
+unsafe fn progress_says_interrupt(p: *mut Stmt) -> bool {
+    let db = (*p).db;
+    if db.is_null() {
+        return false;
+    }
+    let (cb, ctx) = ((*db).progress_cb, (*db).progress_ctx);
+    if cb.is_null() {
+        return false;
+    }
+    let f: unsafe extern "C" fn(*mut c_void) -> c_int = std::mem::transmute(cb);
+    f(ctx) != 0
 }
 
 #[no_mangle]
@@ -1131,6 +1341,39 @@ pub unsafe extern "C" fn sqlite3_exec(
     loop {
         let (first, tail) = sql::split_first(remaining);
         if !sql::is_blank(first) {
+            // Same read-only refusal as the step path (`run_stmt`).
+            if c.readonly && matches!(sql::classify(first), sql::Kind::Dml { .. } | sql::Kind::Ddl)
+            {
+                c.set_error(SQLITE_READONLY, SQLITE_READONLY, "attempt to write a readonly database");
+                set_exec_errmsg(c, errmsg);
+                return SQLITE_READONLY;
+            }
+            // sqlite's exec is prepare/step inside, so SQLITE_TRACE_STMT fires
+            // for exec'd statements too — CPython's legacy-autocommit COMMIT
+            // goes through exec and its suite asserts it is traced. A
+            // throwaway Stmt backs the callback's P argument (it may call
+            // sqlite3_expanded_sql / sqlite3_db_handle on it).
+            if !c.trace_cb.is_null() && c.trace_mask & SQLITE_TRACE_STMT != 0 {
+                let tmp = Box::new(Stmt {
+                    db,
+                    sql: first.to_string(),
+                    exec_sql: first.to_string(),
+                    n_params: 0,
+                    param_names: Vec::new(),
+                    binds: Vec::new(),
+                    executed: false,
+                    columns: Vec::new(),
+                    col_name_c: Vec::new(),
+                    decltype_c: None,
+                    rows: Vec::new(),
+                    pos: 0,
+                    have_row: false,
+                    cells: Vec::new(),
+                });
+                let p = Box::into_raw(tmp);
+                trace_stmt_begin(p);
+                drop(Box::from_raw(p));
+            }
             let outcome = catch_unwind(AssertUnwindSafe(|| exec_one(c, first, &[])));
             let outcome = match outcome {
                 Ok(r) => r,
@@ -1264,6 +1507,10 @@ pub unsafe extern "C" fn sqlite3_bind_int64(p: *mut Stmt, idx: c_int, v: c_longl
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_bind_double(p: *mut Stmt, idx: c_int, v: c_double) -> c_int {
+    // sqlite has no NaN: binding one stores NULL (CPython relies on this).
+    if v.is_nan() {
+        return bind(p, idx, Value::Null);
+    }
     bind(p, idx, Value::Float(v))
 }
 
@@ -1876,18 +2123,44 @@ fn expand_sql(exec_sql: &str, binds: &[Value]) -> String {
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_expanded_sql(p: *mut Stmt) -> *mut c_char {
     match stmt(p) {
-        Some(s) => dup_cstr(&expand_sql(&s.exec_sql, &s.binds)),
+        Some(s) => {
+            let out = expand_sql(&s.exec_sql, &s.binds);
+            // sqlite subjects the expanded string to SQLITE_LIMIT_LENGTH and
+            // answers NULL past it (CPython's trace path then falls back to
+            // the unexpanded text).
+            if let Some(c) = conn(s.db) {
+                if out.len() > c.limits[SQLITE_LIMIT_LENGTH as usize] as usize {
+                    return ptr::null_mut();
+                }
+            }
+            dup_cstr(&out)
+        }
         None => ptr::null_mut(),
     }
 }
 
 // ---- connection configuration / callbacks (safe no-op stubs) --------------
 
-/// Per-connection limits are not configurable; report "no limit". A set request
-/// is ignored. Never affects a query answer.
+/// Per-connection run-time limits: REAL get/set over `Sqlite3::limits`, seeded
+/// with sqlite's defaults. Enforced where the shim itself does the work
+/// (`VARIABLE_NUMBER` at prepare, `LENGTH` in `expanded_sql`); `SQL_LENGTH` is
+/// enforced by CPython, which reads the stored value through this call.
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_limit(_db: *mut Sqlite3, _id: c_int, _new_val: c_int) -> c_int {
-    0x7fff_ffff
+pub unsafe extern "C" fn sqlite3_limit(db: *mut Sqlite3, id: c_int, new_val: c_int) -> c_int {
+    let Some(c) = conn(db) else {
+        return -1;
+    };
+    if !(0..SQLITE_N_LIMIT as c_int).contains(&id) {
+        return -1; // sqlite: out-of-range category answers a negative value
+    }
+    let idx = id as usize;
+    let prior = c.limits[idx];
+    if new_val >= 0 {
+        // The compile-time default doubles as the hard upper bound; a larger
+        // request is silently truncated, exactly as sqlite.
+        c.limits[idx] = new_val.min(DEFAULT_LIMITS[idx]);
+    }
+    prior
 }
 
 /// Fixed-arg shim over the variadic `sqlite3_db_config`. On the SysV/x86-64 ABI
@@ -1897,10 +2170,19 @@ pub unsafe extern "C" fn sqlite3_limit(_db: *mut Sqlite3, _id: c_int, _new_val: 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_db_config(
     _db: *mut Sqlite3,
-    _op: c_int,
+    op: c_int,
     _a: c_int,
-    _b: *mut c_void,
+    b: *mut c_void,
 ) -> c_int {
+    // The `(int onoff, int *pCurrent)` toggle ops — 1002 (ENABLE_FKEY) through
+    // the 1019 range; NOT 1000/1001, whose varargs are pointers with different
+    // shapes: mpedb honors none of them, so the CURRENT state written back is
+    // always 0 — the literal truth (FK enforcement, triggers, … are not
+    // active), never a lie a consumer can build on. Leaving the out pointer
+    // unwritten made CPython's getconfig read an indeterminate int.
+    if (1002..=1019).contains(&op) && !b.is_null() {
+        *(b as *mut c_int) = 0;
+    }
     SQLITE_OK
 }
 
@@ -1927,22 +2209,45 @@ pub unsafe extern "C" fn sqlite3_load_extension(
 /// Tracing is not wired to mpedb; accept the registration and never call back.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_trace_v2(
-    _db: *mut Sqlite3,
-    _mask: c_uint,
-    _cb: *mut c_void,
-    _ctx: *mut c_void,
+    db: *mut Sqlite3,
+    mask: c_uint,
+    cb: *mut c_void,
+    ctx: *mut c_void,
 ) -> c_int {
+    let Some(c) = conn(db) else {
+        return SQLITE_MISUSE;
+    };
+    if cb.is_null() || mask == 0 {
+        c.trace_mask = 0;
+        c.trace_cb = ptr::null_mut();
+        c.trace_ctx = ptr::null_mut();
+    } else {
+        c.trace_mask = mask;
+        c.trace_cb = cb;
+        c.trace_ctx = ctx;
+    }
     SQLITE_OK
 }
 
-/// Progress callbacks are not wired to mpedb; accept and never call back.
+/// Register a progress handler. The shim fires it once per statement execution
+/// (it has no VM opcode stream to count `n` against — see the field's doc);
+/// `n <= 0` or a NULL callback clears, as sqlite.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_progress_handler(
-    _db: *mut Sqlite3,
-    _n: c_int,
-    _cb: *mut c_void,
-    _ctx: *mut c_void,
+    db: *mut Sqlite3,
+    n: c_int,
+    cb: *mut c_void,
+    ctx: *mut c_void,
 ) {
+    if let Some(c) = conn(db) {
+        if cb.is_null() || n <= 0 {
+            c.progress_cb = ptr::null_mut();
+            c.progress_ctx = ptr::null_mut();
+        } else {
+            c.progress_cb = cb;
+            c.progress_ctx = ctx;
+        }
+    }
 }
 
 /// No authorization layer: accept every statement (a permissive no-op — mpedb
@@ -2002,6 +2307,18 @@ unsafe fn create_function_impl(
         );
         return SQLITE_MISUSE;
     };
+    // sqlite refuses an argument count outside -1..=127 (SQLITE_MAX_FUNCTION_ARG)
+    // with SQLITE_MISUSE; the destructor still runs (create_function_v2's
+    // failure contract). CPython turns any non-OK into OperationalError.
+    if !(-1..=127).contains(&n_arg) {
+        call_destroy(x_destroy, app);
+        c.set_error(
+            SQLITE_MISUSE,
+            SQLITE_MISUSE,
+            "create_function: nArg must be between -1 and 127",
+        );
+        return SQLITE_MISUSE;
+    }
     // sqlite function names are case-insensitive, and mpedb's parser lowercases
     // them before the binder resolves — register under the same spelling.
     let fname = raw_name.to_ascii_lowercase();
@@ -2128,7 +2445,13 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
     _x_compare: *mut c_void,
     x_destroy: *mut c_void,
 ) -> c_int {
-    call_destroy(x_destroy, arg);
+    // Do NOT invoke x_destroy: sqlite's documented contract is that the
+    // destructor is NOT called when sqlite3_create_collation_v2() fails, and
+    // CPython's create_collation frees its callback context itself on a
+    // non-OK return ("the destructor callback is _not_ called if
+    // sqlite3_create_collation_v2() fails" — Modules/_sqlite/connection.c).
+    // Calling it here was a double-free that corrupted CPython's heap.
+    let _ = (x_destroy, arg);
     if let Some(c) = conn(db) {
         c.set_error(SQLITE_ERROR, SQLITE_ERROR, "user-defined collations are not supported");
     }
@@ -2208,7 +2531,12 @@ pub unsafe extern "C" fn sqlite3_result_int64(ctx: *mut c_void, v: c_longlong) {
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_result_double(ctx: *mut c_void, v: c_double) {
     if let Some(c) = udf_ctx(ctx) {
-        c.set_result(Value::Float(v));
+        // sqlite has no NaN: a NaN result is NULL (CPython's test suite pins it).
+        if v.is_nan() {
+            c.set_result(Value::Null);
+        } else {
+            c.set_result(Value::Float(v));
+        }
     }
 }
 #[no_mangle]
@@ -2314,11 +2642,21 @@ pub unsafe extern "C" fn sqlite3_value_blob(v: *mut c_void) -> *const c_void {
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_backup_init(
-    _dst: *mut Sqlite3,
+    dst: *mut Sqlite3,
     _dst_name: *const c_char,
     _src: *mut Sqlite3,
     _src_name: *const c_char,
 ) -> *mut c_void {
+    // sqlite's contract: on failure the error code and message are left in the
+    // DESTINATION connection — CPython reads them there; without this it
+    // raised a bare SystemError ("returned NULL without setting an exception").
+    if let Some(c) = conn(dst) {
+        c.set_error(
+            SQLITE_ERROR,
+            SQLITE_ERROR,
+            "online backup is not supported by mpedb (use `mpedb mirror`)",
+        );
+    }
     ptr::null_mut()
 }
 #[no_mangle]
@@ -2342,7 +2680,7 @@ pub unsafe extern "C" fn sqlite3_backup_pagecount(_b: *mut c_void) -> c_int {
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_blob_open(
-    _db: *mut Sqlite3,
+    db: *mut Sqlite3,
     _dbname: *const c_char,
     _table: *const c_char,
     _column: *const c_char,
@@ -2352,6 +2690,15 @@ pub unsafe extern "C" fn sqlite3_blob_open(
 ) -> c_int {
     if !pp_blob.is_null() {
         *pp_blob = ptr::null_mut();
+    }
+    // Set the refusal on the handle: consumers turn the handle's error state
+    // into their exception (CPython raised SystemError without it).
+    if let Some(c) = conn(db) {
+        c.set_error(
+            SQLITE_ERROR,
+            SQLITE_ERROR,
+            "incremental blob I/O is not supported by mpedb (mpedb #43)",
+        );
     }
     SQLITE_ERROR
 }
@@ -2398,12 +2745,15 @@ pub unsafe extern "C" fn sqlite3_serialize(
 }
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_deserialize(
-    _db: *mut Sqlite3,
+    db: *mut Sqlite3,
     _schema: *const c_char,
     _data: *mut c_uchar,
     _sz: c_longlong,
     _sz_buf: c_longlong,
     _flags: c_uint,
 ) -> c_int {
+    if let Some(c) = conn(db) {
+        c.set_error(SQLITE_ERROR, SQLITE_ERROR, "deserialize is not supported by mpedb");
+    }
     SQLITE_ERROR
 }
