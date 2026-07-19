@@ -12,18 +12,16 @@ Two things make this page different from a typical compatibility list:
    (`crates/mpedb-testkit`) executes sqlite's own sqllogictest corpus
    differentially against sqlite3. Measured 2026-07-19 over the **full 7.4M-record
    corpus (621 of 622 files; 5,938,278 records attempted after the mysql/mssql-only
-   ones are skipped): 99.885% pass, with zero error mismatches and zero genuine
+   ones are skipped): 99.968% pass, with zero error mismatches and zero genuine
    wrong answers** (the 4 flagged divergences are cascades from a preceding
    unsupported statement, not answer bugs; 954,717 of the queries are checked
    against sqlite's own md5 result hash). Put the other way: of everything
-   mpedb *accepts*, essentially 100% matches sqlite. The 0.115% that does not
-   pass is 0.092% deliberate refusals and 0.023% artifacts of the runner's
-   synthetic-`rowid_` shim. The single largest refusal — 72% of all of them —
-   is a `CASE`/`COALESCE` whose arms mix `int64` and `float64`; the rest is a
-   subquery inside a compound `SELECT`, the timing-less legacy `CREATE TRIGGER`
-   form, and `DROP INDEX`. The full ranked blocker table, the hand-verified
-   root causes, and the one file that is not measurable
-   (`select5.test` — a 17-way comma join OOMs) are in
+   mpedb *accepts*, essentially 100% matches sqlite. The 0.032% that does not
+   pass is 0.009% deliberate refusals — a subquery inside a compound `SELECT`,
+   the timing-less legacy `CREATE TRIGGER` form, and `DROP INDEX` — and
+   0.023% artifacts of the runner's synthetic-`rowid_` shim. The full ranked
+   blocker table, the hand-verified root causes, and the one file that is not
+   measurable (`select5.test` — a 17-way comma join OOMs) are in
    [design/CORPUS-STATUS.md](design/CORPUS-STATUS.md).
 2. **Every ❌ is an error message, never a silent wrong answer.** SQL that
    mpedb does not support is refused at compile time, usually with the manual
