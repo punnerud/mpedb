@@ -187,8 +187,9 @@ const MAX_JOINS: usize = 16;
 //     the whole-plan version gates it: a format-30 blob fails CLOSED at byte 0
 //     with `PlanInvalidated` (the documented re-prepare path), never a misread.
 //     Compound-bodied subplans are UNCORRELATED and carry no nested lifts (a
-//     subquery inside a compound arm is still refused), so every other subplan
-//     field is unchanged — only genuinely-compound bodies differ.
+//     subquery inside a compound SUBQUERY BODY is still refused; a TOP-LEVEL
+//     compound's arm subplans live on the statement, format 49), so every other
+//     subplan field is unchanged — only genuinely-compound bodies differ.
 // 32: table footprint bitmaps widened u64 → u128 (MAX_TABLES 64 → 128; retired
 //     by format 41, which drops the bitmap altogether). The
 //     wire layout gained 16 bytes (two u128s where two u64s were); a format-31
@@ -359,7 +360,11 @@ const MAX_JOINS: usize = 16;
 //     through the [`CTE_TABLE`] sentinel. A format-48 reader hits the unknown
 //     statement tag in `decode_stmt` and rejects the plan as corrupt rather
 //     than misreading it — the same whole-plan gating as `STMT_RECURSIVE_CTE`
-//     at format 26.
+//     at format 26. The SAME window also admits UNCORRELATED subplans on a
+//     top-level `Compound` (each arm's lifts take the reserved slots after the
+//     preceding arms', numbered against the final layout at plan time) — no
+//     wire change (`subplans` was always statement-level), but a format-48
+//     validate refused the shape, so the bump doubles as its staleness signal.
 //     NOTE (worktree, 2026-07-19): the base this was written on carries 47;
 //     48 is another agent's in-flight bump (LIKE opcodes), so this takes 49 by
 //     instruction and the numbers are reconciled at merge.
