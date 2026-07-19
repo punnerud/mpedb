@@ -1779,6 +1779,75 @@ impl<'a> Binder<'a> {
             }
             return Ok((BExpr::Call(ScalarFn::Printf, out), Some(ColumnType::Text)));
         }
+        // sqlite's SCALAR `max(a, b, …)` / `min(a, b, …)` (#74 item 5). Variadic
+        // and typed by SELECTION rather than by computation, which neither the
+        // fixed `want` table nor the `ret` recomputation below can express, so
+        // it binds here like `char`/`printf` do.
+        if (name == "max" || name == "min") && args.len() >= 2 {
+            let mut bound = Vec::with_capacity(args.len());
+            for a in args {
+                bound.push(self.bind_expr(a)?);
+            }
+            if u8::try_from(bound.len()).is_err() {
+                return Err(bind_err(format!("{name}() takes at most 255 arguments")));
+            }
+            // The distinct CONCRETE argument types (an untyped NULL or an
+            // unpinned bare parameter contributes none).
+            let mut kinds: Vec<ColumnType> = Vec::new();
+            for (_, t) in &bound {
+                if let Some(t) = t {
+                    if !kinds.contains(t) {
+                        kinds.push(*t);
+                    }
+                }
+            }
+            // The result type. This is a SELECTION: the winning ARGUMENT is
+            // returned unchanged, so a mixed-type call can produce either
+            // argument's type and the honest answer is `any`.
+            //
+            //  * one concrete type  -> that type. `max(i, 3)` is int64.
+            //  * numbers only       -> `any`. sqlite's `max(3, 2.5)` is the
+            //    INTEGER 3 and `max(1, 2.5)` is the REAL 2.5; widening to
+            //    float64 would turn the first into 3.0, a different value.
+            //  * an `any` present   -> `any`; the runtime orders by storage
+            //    class, which is sqlite's own rule (`Value::sort_cmp`).
+            //  * anything else      -> REFUSED by name. sqlite would order a
+            //    number against a text by storage class, but that is the same
+            //    cross-class comparison `sql_cmp` refuses everywhere else, and
+            //    mpedb's own bool/timestamp have no class at all.
+            let numeric = |t: &ColumnType| {
+                matches!(t, ColumnType::Int64 | ColumnType::Float64 | ColumnType::Any)
+            };
+            let ret = match kinds.len() {
+                0 => None,
+                1 => Some(kinds[0]),
+                _ if kinds.iter().all(numeric) || kinds.contains(&ColumnType::Any) => {
+                    Some(ColumnType::Any)
+                }
+                _ => {
+                    let names: Vec<String> = kinds.iter().map(|t| t.to_string()).collect();
+                    return Err(bind_err(format!(
+                        "{name}() cannot order arguments of different types ({}) — sqlite \
+                         would rank them by storage class, which is the cross-type comparison \
+                         mpedb refuses everywhere else; CAST them to one type",
+                        names.join(" and ")
+                    )));
+                }
+            };
+            // With exactly one concrete type, a bare parameter adopts it — so
+            // `max(?, i)` binds the way `? > i` does. With a mixed call there is
+            // nothing to adopt, and the parameter is left for `resolve_params`
+            // to report.
+            let out = bound
+                .into_iter()
+                .map(|(e, t)| match (kinds.len(), ret) {
+                    (1, Some(w)) => self.unify_param(e, t, w).0,
+                    _ => e,
+                })
+                .collect();
+            let f = if name == "max" { ScalarFn::Max2 } else { ScalarFn::Min2 };
+            return Ok((BExpr::Call(f, out), ret));
+        }
         let f = match name {
             "lower" => ScalarFn::Lower,
             "upper" => ScalarFn::Upper,
@@ -1954,9 +2023,11 @@ impl<'a> Binder<'a> {
                 &[Some(ColumnType::Text), Some(ColumnType::Text)],
                 Some(ColumnType::Text),
             ),
-            // char/printf are variadic and bound specially above (never reached
-            // here); present only so this match stays exhaustive over ScalarFn.
+            // char/printf and the scalar max/min are variadic and bound
+            // specially above (never reached here); present only so this match
+            // stays exhaustive over ScalarFn.
             ScalarFn::Char | ScalarFn::Printf => (&[], Some(ColumnType::Text)),
+            ScalarFn::Max2 | ScalarFn::Min2 => (&[], None),
         };
         let mut out = Vec::with_capacity(bound.len());
         for (i, (e, t)) in bound.into_iter().enumerate() {

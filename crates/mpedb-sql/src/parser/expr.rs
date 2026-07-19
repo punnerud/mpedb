@@ -652,6 +652,45 @@ impl<'a> Parser<'a> {
                 }
                 let arg = self.expr()?;
                 if self.peek() == Some(&Tok::Comma) {
+                    // `max(a, b)` / `min(a, b)` are sqlite's SCALAR forms — a
+                    // different C function from the aggregates of the same name
+                    // (`minmaxFunc` vs `minmaxStep`), routed here on ARITY, which
+                    // is exactly how sqlite's own function table resolves them
+                    // (`FUNCTION(min,1,…)` registers the aggregate and
+                    // `FUNCTION(min,-1,…)` the scalar).
+                    //
+                    // Three things this must NOT do, and each is tested:
+                    // `max(x)` stays the aggregate (no comma, never reaches
+                    // here); `max(DISTINCT x)` stays the aggregate (DISTINCT is
+                    // aggregate-only grammar, so it takes the arity error
+                    // below); and a HOST aggregate registered as `max` keeps its
+                    // own arity rule (`f_native` is None for it).
+                    if !distinct
+                        && matches!(
+                            f_native,
+                            Some(mpedb_types::AggFn::Min) | Some(mpedb_types::AggFn::Max)
+                        )
+                    {
+                        let mut args = vec![arg];
+                        while self.eat(&Tok::Comma) {
+                            args.push(self.expr()?);
+                        }
+                        self.expect(&Tok::RParen, "`)` closing the argument list")?;
+                        if self.peek_filter_paren() || self.peek_over() {
+                            return Err(self.err_here(format!(
+                                "{}() with {} arguments is the SCALAR form and takes no FILTER \
+                                 or OVER clause — those belong to the one-argument aggregate \
+                                 (sqlite: \"max() may not be used as a window function\")",
+                                target.name(),
+                                args.len()
+                            )));
+                        }
+                        // The generic scalar-call node; the binder resolves the
+                        // name to `ScalarFn::Max2`/`Min2`. Only ever built with
+                        // two or more arguments, which is what keeps the
+                        // one-argument aggregate unreachable from here.
+                        return Ok(Expr::Func(target.name().to_ascii_lowercase(), args));
+                    }
                     return Err(self.err_here(format!(
                         "{}() takes exactly one argument",
                         target.name()

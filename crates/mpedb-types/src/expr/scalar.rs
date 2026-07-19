@@ -106,6 +106,31 @@ pub enum ScalarFn {
     /// offending specifier or time string, never a guessed value.
     /// See [`super::datetime`].
     Strftime = 43,
+    /// `max(X, Y, …)` / `min(X, Y, …)` — sqlite's **scalar** two-or-more
+    /// argument forms, which are a different function from the one-argument
+    /// aggregates of the same name (`minmaxFunc` vs `minmaxStep`); the PARSER
+    /// routes on arity, so `max(x)` is still the aggregate.
+    ///
+    /// A SELECTION, not a computation: the winning ARGUMENT is returned
+    /// unchanged, so `max(3, 2.5)` is the integer 3 and `max(1, 2.5)` is the
+    /// real 2.5 — which is why the result type is `any` for a mixed-type call
+    /// rather than a widened number.
+    ///
+    /// Ordering is sqlite's storage-class order ([`Value::sort_cmp`], the same
+    /// one `ORDER BY`/`DISTINCT` use), and the TIE RULE is sqlite's
+    /// `minmaxFunc` loop verbatim: `max` keeps the EARLIER of two equal
+    /// arguments, `min` takes the LATER one. Observable when the tied values
+    /// have different classes — sqlite's `typeof(max(1, 1.0))` is `integer`
+    /// while `typeof(min(1, 1.0))` is `real`.
+    ///
+    /// NULL-propagating like the rest: ANY NULL argument yields NULL (sqlite:
+    /// `minmaxFunc` returns early on the first NULL it sees).
+    ///
+    /// Tags 60/61 rather than 44/45: several branches were in flight in the
+    /// 44..59 window, and a tag hole costs nothing while a collision would
+    /// silently call the wrong function.
+    Max2 = 60,
+    Min2 = 61,
 }
 
 impl ScalarFn {
@@ -154,6 +179,8 @@ impl ScalarFn {
             41 => ScalarFn::Printf,
             42 => ScalarFn::Quote,
             43 => ScalarFn::Strftime,
+            60 => ScalarFn::Max2,
+            61 => ScalarFn::Min2,
             other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
         })
     }
@@ -192,6 +219,9 @@ impl ScalarFn {
             ScalarFn::LogBase | ScalarFn::Atan2 | ScalarFn::Mod => argc == 2,
             // `pi()` is the one nullary scalar.
             ScalarFn::Pi => argc == 0,
+            // The scalar min/max start at TWO arguments — one argument is the
+            // aggregate, and the parser never emits these below that arity.
+            ScalarFn::Max2 | ScalarFn::Min2 => argc >= 2,
         }
     }
 
@@ -240,6 +270,8 @@ impl ScalarFn {
             ScalarFn::Printf => "printf",
             ScalarFn::Quote => "quote",
             ScalarFn::Strftime => "strftime",
+            ScalarFn::Max2 => "max",
+            ScalarFn::Min2 => "min",
         }
     }
 }
@@ -558,11 +590,61 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
         // strftime(FORMAT, TIMESTRING): sqlite's time formatter over the ISO-8601
         // time strings, restricted to the specifiers mpedb reproduces exactly.
         ScalarFn::Strftime => super::datetime::sqlite_strftime(args)?,
+        // sqlite's SCALAR max()/min(): pick the winning ARGUMENT and return it
+        // UNCHANGED (`sqlite3_result_value(context, argv[iBest])`), so the
+        // result keeps that argument's type — `max(3, 2.5)` is the integer 3.
+        // The null gate above already covers "any NULL argument yields NULL".
+        ScalarFn::Max2 | ScalarFn::Min2 => min_max_scalar(f, args)?,
         // Handled ahead of the null gate above; unreachable here.
         ScalarFn::Typeof => unreachable!("typeof is dispatched before the null gate"),
         ScalarFn::Printf => unreachable!("printf is dispatched before the null gate"),
         ScalarFn::Quote => unreachable!("quote is dispatched before the null gate"),
     })
+}
+
+/// sqlite's `minmaxFunc` — the scalar `max(X, Y, …)` / `min(X, Y, …)`.
+///
+/// A transcription of sqlite's loop, tie rule included:
+///
+/// ```c
+/// iBest = 0;
+/// for(i=1; i<argc; i++){
+///   if( (sqlite3MemCompare(argv[iBest], argv[i], pColl) ^ mask) >= 0 ) iBest = i;
+/// }
+/// sqlite3_result_value(context, argv[iBest]);
+/// ```
+///
+/// `mask` is 0 for `min` and -1 for `max`, so the test is `cmp >= 0` for `min`
+/// (a TIE replaces, taking the LATER argument) and `cmp < 0` for `max` (a tie
+/// does NOT replace, keeping the EARLIER one). That asymmetry is observable
+/// whenever two equal values have different storage classes: sqlite's
+/// `typeof(max(1, 1.0))` is `integer` and `typeof(min(1, 1.0))` is `real`.
+///
+/// `sqlite3MemCompare` is the storage-class order, which is exactly
+/// [`Value::sort_cmp`] — the same comparison `ORDER BY` and `DISTINCT` use, and
+/// the one whose doc comment already names MIN/MAX as a caller. NULLs are gone
+/// by the time this runs, so a `None` from it can only be an INCOMPARABLE pair
+/// (mpedb's own `Bool`/`Timestamp` against a different class, reachable only
+/// through an `any` value). That is an error rather than an arbitrary winner:
+/// sqlite has no such pair, so there is no answer of sqlite's to reproduce.
+fn min_max_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
+    let want_max = matches!(f, ScalarFn::Max2);
+    let mut best = 0usize;
+    for i in 1..args.len() {
+        let Some(ord) = args[best].sort_cmp(&args[i], Collation::Binary) else {
+            return Err(Error::TypeMismatch(format!(
+                "{}() cannot order {} against {}",
+                f.name(),
+                args[best].type_name(),
+                args[i].type_name()
+            )));
+        };
+        let replace = if want_max { ord == Ordering::Less } else { ord != Ordering::Less };
+        if replace {
+            best = i;
+        }
+    }
+    Ok(args[best].clone())
 }
 
 /// sqlite's `quoteFunc`: the SQL literal denoting `v`.
