@@ -295,7 +295,7 @@ fn bound_pattern_runtime_corners() {
     // A non-text BIND is refused by name — never coerced, never a guess.
     for v in [Value::Blob(b"ab".to_vec()), Value::Int(12)] {
         let m = db
-            .query("SELECT s LIKE ? FROM t WHERE id = 1", &[v.clone()])
+            .query("SELECT s LIKE ? FROM t WHERE id = 1", std::slice::from_ref(&v))
             .expect_err("a non-text pattern bind must refuse")
             .to_string();
         assert!(m.contains("statement requires text"), "{m}");
