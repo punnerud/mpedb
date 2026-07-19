@@ -102,6 +102,10 @@ impl ColumnType {
     /// An EMPTY name is `Any`, not the `Numeric` this rule returns for a `CAST`:
     /// a column with NO declared type is sqlite's no-affinity column, which
     /// converts nothing — exactly `Any`.
+    ///
+    /// **This function alone loses the NUMERIC/no-type distinction** — both land
+    /// on `Any`, and sqlite treats them OPPOSITELY at store time. Use
+    /// [`ColumnType::declared`], which returns the [`Affinity`] alongside.
     pub fn from_declared(name: &str) -> ColumnType {
         let lower = name.trim().to_ascii_lowercase();
         if lower.is_empty() {
@@ -117,6 +121,54 @@ impl ColumnType {
             Affinity::Blob => ColumnType::Blob,
             Affinity::Numeric => ColumnType::Any,
         }
+    }
+
+    /// A **declared SQL type name** → the pair a column definition needs: the
+    /// rigid storage type ([`ColumnType::from_declared`]) AND the sqlite
+    /// [`Affinity`] that decides what happens to a value on its way IN.
+    ///
+    /// The two are genuinely independent, and collapsing them is a wrong
+    /// answer, not a rounding error. `ColumnType::Any` is the storage side of
+    /// TWO sqlite affinities that behave OPPOSITELY:
+    ///
+    /// | declared            | affinity  | `'1.50'` stores as | mpedb column   |
+    /// |---------------------|-----------|--------------------|----------------|
+    /// | `decimal(10,2)`, `numeric`, `date`, `datetime` | NUMERIC | `1.5` real | `Any` + `Numeric` |
+    /// | *(nothing at all)*  | BLOB      | `'1.50'` text      | `Any` + `Blob` |
+    ///
+    /// so `Any` alone cannot say which one a column is. The affinity says.
+    ///
+    /// The rule, in the same order as [`ColumnType::from_declared`]:
+    /// 1. an EMPTY name is sqlite's no-affinity column → (`Any`, `Blob`);
+    /// 2. one of mpedb's OWN config words (`int64`, `bool`, `any`, …) keeps its
+    ///    meaning — including `any`, which has always meant *verbatim* here, so
+    ///    it stays `Blob`. d45ad77's promise that no name already accepted
+    ///    changes meaning covers the affinity too;
+    /// 3. otherwise sqlite's affinity of the name, which is `Numeric` exactly
+    ///    when [`ColumnType::from_declared`] chose `Any`.
+    ///
+    /// For every rigid type the affinity is [`Affinity::implied_by`] its
+    /// storage type — mpedb REFUSES a mismatched value there rather than
+    /// converting it (a narrowing, never a different answer), so recording
+    /// anything else would be recording a rule that is not applied.
+    pub fn declared(name: &str) -> (ColumnType, Affinity) {
+        let lower = name.trim().to_ascii_lowercase();
+        if lower.is_empty() {
+            return (ColumnType::Any, Affinity::Blob);
+        }
+        if let Some(t) = ColumnType::parse(&lower) {
+            return (t, Affinity::implied_by(t));
+        }
+        let ty = ColumnType::from_declared(&lower);
+        let aff = match Affinity::declared(&lower) {
+            Affinity::Numeric => Affinity::Numeric,
+            // The other four affinities each map onto a RIGID mpedb type, which
+            // enforces rather than converts — so the affinity that column
+            // actually has is the one its type implies, and they agree here by
+            // construction.
+            _ => Affinity::implied_by(ty),
+        };
+        (ty, aff)
     }
 
     pub fn name(self) -> &'static str {
@@ -223,6 +275,40 @@ impl Affinity {
             }
         }
         aff
+    }
+
+    /// The affinity a mpedb [`ColumnType`] already enforces on its own.
+    ///
+    /// A rigid column refuses a value of the wrong class instead of converting
+    /// it, so its affinity is descriptive: it is whatever class the column can
+    /// actually hold. `Any` maps to `Blob` — sqlite's BLOB (historically
+    /// "NONE") affinity, the one that converts nothing — because that is what
+    /// `Any` does by default; the NUMERIC-affinity `Any` column is the one case
+    /// this function cannot produce, and it comes from the DECLARED NAME via
+    /// [`ColumnType::declared`], never from the storage type.
+    pub fn implied_by(ty: ColumnType) -> Affinity {
+        match ty {
+            ColumnType::Int64 | ColumnType::Bool | ColumnType::Timestamp => Affinity::Integer,
+            ColumnType::Float64 => Affinity::Real,
+            ColumnType::Text => Affinity::Text,
+            ColumnType::Blob | ColumnType::Any => Affinity::Blob,
+        }
+    }
+
+    /// The affinity of a **column's declared type name** — `from_type_name`
+    /// plus the one case it does not cover.
+    ///
+    /// An EMPTY name is a column with NO declared type, which sqlite gives BLOB
+    /// (historically "NONE") affinity: it converts nothing. That is NOT what
+    /// [`Affinity::from_type_name`] returns for an empty string — a `CAST` to
+    /// an empty type name is NUMERIC — and the two are exact opposites at store
+    /// time, so the distinction has to be made here rather than at each caller.
+    pub fn declared(name: &str) -> Affinity {
+        if name.trim().is_empty() {
+            Affinity::Blob
+        } else {
+            Affinity::from_type_name(name)
+        }
     }
 
     pub fn name(self) -> &'static str {
