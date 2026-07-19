@@ -68,8 +68,71 @@ fn cast_parses_and_concat_sits_in_the_additive_tier() {
             Box::new(Expr::Col("c".into()))
         )
     );
-    // lone `|` is a clear parse error, not a mystery token
-    assert!(parse_expr_only("a | b").is_err());
+    // A lone `|` is the bitwise OR since #74 item 2 — the one-byte lookahead
+    // that separates it from `||` is what this pair of assertions pins.
+    assert_eq!(
+        expr("a | b"),
+        Expr::Binary(
+            BinOp::BitOr,
+            Box::new(Expr::Col("a".into())),
+            Box::new(Expr::Col("b".into()))
+        )
+    );
+    // The bitwise tier sits BETWEEN comparison and `+`/`-` (sqlite's parse.y),
+    // so `a + b | c` is `(a+b) | c` and `a = b | c` is `a = (b|c)`.
+    assert_eq!(
+        expr("a + b | c"),
+        Expr::Binary(
+            BinOp::BitOr,
+            Box::new(Expr::Binary(
+                BinOp::Add,
+                Box::new(Expr::Col("a".into())),
+                Box::new(Expr::Col("b".into()))
+            )),
+            Box::new(Expr::Col("c".into()))
+        )
+    );
+    assert_eq!(
+        expr("a = b | c"),
+        Expr::Binary(
+            BinOp::Eq,
+            Box::new(Expr::Col("a".into())),
+            Box::new(Expr::Binary(
+                BinOp::BitOr,
+                Box::new(Expr::Col("b".into())),
+                Box::new(Expr::Col("c".into()))
+            ))
+        )
+    );
+    // `&`, `<<`, `>>` share that tier and are left-associative with `|`.
+    assert_eq!(
+        expr("a | b & c"),
+        Expr::Binary(
+            BinOp::BitAnd,
+            Box::new(Expr::Binary(
+                BinOp::BitOr,
+                Box::new(Expr::Col("a".into())),
+                Box::new(Expr::Col("b".into()))
+            )),
+            Box::new(Expr::Col("c".into()))
+        )
+    );
+    // `~` is prefix-only, at unary-minus precedence.
+    assert_eq!(
+        expr("~a"),
+        Expr::Unary(UnOp::BitNot, Box::new(Expr::Col("a".into())))
+    );
+    assert_eq!(
+        expr("~a + b"),
+        Expr::Binary(
+            BinOp::Add,
+            Box::new(Expr::Unary(UnOp::BitNot, Box::new(Expr::Col("a".into())))),
+            Box::new(Expr::Col("b".into()))
+        )
+    );
+    // A trailing `~` still has nothing to apply to.
+    assert!(parse_expr_only("a ~").is_err());
+    assert!(parse_expr_only("a | ").is_err());
 }
 
 /// A compound chain parses left-associatively, hoists the trailing

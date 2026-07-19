@@ -1,6 +1,168 @@
-//! SQL `IN` three-valued-logic core and the LIKE / GLOB matchers.
+//! SQL `IN` three-valued-logic core, the LIKE / GLOB matchers, and the
+//! bitwise operators.
 
 use super::*;
+
+// ===== Bitwise `& | << >> ~` — sqlite's `OP_BitAnd`..`OP_BitNot` =====
+//
+// sqlite defines all five in terms of ONE coercion: both operands go through
+// `sqlite3VdbeIntValue`, and the result is always an integer. That coercion is
+// total — it never errors — which is why the operators have no type rules of
+// their own, only NULL propagation. Ported here value-for-value against
+// sqlite 3.45.1 rather than approximated, because every one of these corners
+// is a silent wrong answer if guessed:
+//
+// | input | sqlite | why |
+// |---|---|---|
+// | `3.7 \| 1` | 3 | reals TRUNCATE toward zero, they do not round |
+// | `1e300 \| 0` | i64::MAX | and CLAMP, they do not wrap |
+// | `'3' \| 1` | 3 | text takes an integer-PREFIX parse … |
+// | `'1e3' \| 0` | 1 | … which stops at `e`, unlike `CAST('1e3' AS INTEGER)` |
+// | `'abc' \| 1` | 1 | no digits at all is 0, not an error |
+// | `1 << 64` | 0 | a count of 64+ clears the value … |
+// | `-1 >> 64` | -1 | … except `>>` is ARITHMETIC, so a negative stays -1 |
+// | `1 >> -1` | 2 | a NEGATIVE count shifts the other way |
+// | `1 << -64` | 0 | counts at or below -64 clamp to 64 |
+// | `9223372036854775807 << 1` | -2 | `<<` WRAPS; a bit shift has no overflow |
+//
+// The binder does not let a statically-typed real, text or blob reach these —
+// it refuses with a message naming `CAST` — so the non-integer arms are
+// reachable only through an `any` (typeless) value, which is exactly the
+// contract `Instr::CmpClass` already has for comparisons.
+
+/// sqlite's `sqlite3VdbeIntValue`: a value as the i64 a bitwise operator sees.
+/// `None` means NULL (the caller propagates it); [`Error::TypeMismatch`] is
+/// reserved for mpedb's own `Timestamp`/`List`, which have no sqlite storage
+/// class and so have no sqlite answer to reproduce.
+pub(super) fn bit_i64(v: &Value) -> Result<Option<i64>> {
+    Ok(Some(match v {
+        Value::Null => return Ok(None),
+        Value::Int(x) => *x,
+        // sqlite has no boolean type: it IS the integer 0/1, the same mapping
+        // the binder already uses for `SET int_col = (a = b)`.
+        Value::Bool(b) => *b as i64,
+        Value::Float(f) => real_to_i64(*f),
+        Value::Text(s) => atoi64(s.as_bytes()),
+        Value::Blob(b) => atoi64(b),
+        other => {
+            return Err(Error::TypeMismatch(format!(
+                "a bitwise operator has no sqlite meaning for {}",
+                other.type_name()
+            )))
+        }
+    }))
+}
+
+/// sqlite's `sqlite3RealToI64`: truncate toward zero, clamping at both ends of
+/// the i64 range. The bounds are `>=`/`<=` against ±2^63 because that is the
+/// double nearest each limit — `9.3e18` is above i64::MAX and clamps.
+///
+/// NaN yields 0 (Rust's `as` rule). sqlite's C cast is undefined there, but it
+/// is unreachable from SQL: sqlite folds every NaN-producing expression to
+/// NULL before an operator sees it.
+fn real_to_i64(r: f64) -> i64 {
+    if r.is_nan() {
+        0
+    } else if r <= -9_223_372_036_854_775_808.0 {
+        i64::MIN
+    } else if r >= 9_223_372_036_854_775_808.0 {
+        i64::MAX
+    } else {
+        r as i64
+    }
+}
+
+/// sqlite's `sqlite3Atoi64`, as `memIntValue` calls it — the return code is
+/// ignored there, so a partial or absent parse is simply the value reached:
+/// leading whitespace, one optional sign, then the DIGIT PREFIX. Anything from
+/// the first non-digit on is dropped, which is why `'1e3'` is 1 and `'9x'` is 9.
+/// Overflow clamps to the end of the i64 range rather than wrapping.
+fn atoi64(bytes: &[u8]) -> i64 {
+    let mut i = 0;
+    // sqlite3Isspace: space, \t, \n, \v, \f, \r.
+    while matches!(bytes.get(i), Some(b' ' | b'\t' | b'\n' | 0x0b | 0x0c | b'\r')) {
+        i += 1;
+    }
+    let neg = match bytes.get(i) {
+        Some(b'-') => {
+            i += 1;
+            true
+        }
+        Some(b'+') => {
+            i += 1;
+            false
+        }
+        _ => false,
+    };
+    let mut u: u64 = 0;
+    let mut overflow = false;
+    while let Some(c) = bytes.get(i).filter(|c| c.is_ascii_digit()) {
+        if !overflow {
+            match u.checked_mul(10).and_then(|v| v.checked_add((c - b'0') as u64)) {
+                Some(v) => u = v,
+                None => overflow = true,
+            }
+        }
+        i += 1;
+    }
+    if overflow || u > i64::MAX as u64 {
+        if neg {
+            i64::MIN
+        } else {
+            i64::MAX
+        }
+    } else if neg {
+        -(u as i64)
+    } else {
+        u as i64
+    }
+}
+
+/// `a & b`, `a | b`, `a << b`, `a >> b`. Any NULL operand yields NULL.
+pub(super) fn bitwise(op: Instr, a: &Value, b: &Value) -> Result<Value> {
+    let (Some(x), Some(y)) = (bit_i64(a)?, bit_i64(b)?) else {
+        return Ok(Value::Null);
+    };
+    Ok(Value::Int(match op {
+        Instr::BitAnd => x & y,
+        Instr::BitOr => x | y,
+        Instr::Shl => shift(x, y, true),
+        Instr::Shr => shift(x, y, false),
+        _ => unreachable!("bitwise() called with {op:?}"),
+    }))
+}
+
+/// sqlite's `OP_ShiftLeft` / `OP_ShiftRight` body.
+///
+/// A NEGATIVE count shifts the other way — sqlite's own comment is "bit shifts
+/// by a negative amount are the same as shifts in the opposite direction with
+/// a positive amount". `-64` and below clamp to 64 rather than negating (which
+/// would overflow at `i64::MIN`).
+///
+/// At 64 or more the value is cleared, except that `>>` is ARITHMETIC: a
+/// negative value shifted right past its width stays `-1`. Rust's `i64 >> n`
+/// already sign-extends for `n` in `0..64`, so only the `>= 64` case is
+/// explicit. `<<` goes through `u64` so it WRAPS: sqlite shifts the bit
+/// pattern, and this is the one place mpedb does not raise on integer
+/// overflow — a bit shift has no overflow, only a bit pattern.
+fn shift(a: i64, count: i64, left: bool) -> i64 {
+    let (n, left) = if count < 0 {
+        (if count > -64 { -count } else { 64 }, !left)
+    } else {
+        (count, left)
+    };
+    if n >= 64 {
+        if left || a >= 0 {
+            0
+        } else {
+            -1
+        }
+    } else if left {
+        ((a as u64) << n) as i64
+    } else {
+        a >> n
+    }
+}
 
 /// SQL `x IN (…)` under three-valued logic — the semantics that decide whether
 /// a policy admits a row, so they are spelled out rather than approximated:
@@ -372,13 +534,35 @@ pub(super) fn glob_match(pattern: &str, s: &str) -> bool {
 // yields FALSE and `NOT REGEXP` yields TRUE, mirroring how GLOB treats an
 // unterminated `[`.
 
+// The LAST pattern this thread compiled, and the program it compiled to
+// (`None` for a pattern the engine rejects — that result is worth caching too,
+// since it is reached on every row of the scan).
+//
+// One entry, not an LRU: a REGEXP's pattern is the same on every row of a
+// scan, whether it arrived as a literal or — since #74 item 3 — as a bound
+// parameter, so a single slot has the hit rate an LRU would and none of the
+// bookkeeping. Purely a memo of a deterministic function of `pattern`, so it
+// cannot change an answer; it exists because `regexp_match` was recompiling the
+// pattern PER ROW even in the literal case, which is what made "the pattern
+// must be a literal" look like a performance guard when it never was one.
+std::thread_local! {
+    static RE_MEMO: std::cell::RefCell<Option<(String, Option<ReProg>)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// sqlite `x REGEXP y`: does `pattern` (the sqlite regexp dialect) match some
 /// substring of `text`? A pattern that fails to compile matches nothing.
 pub(super) fn regexp_match(pattern: &str, text: &str) -> bool {
-    match ReProg::compile(pattern) {
-        Some(prog) => prog.is_match(text),
-        None => false,
-    }
+    RE_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if !matches!(&*memo, Some((p, _)) if p == pattern) {
+            *memo = Some((pattern.to_string(), ReProg::compile(pattern)));
+        }
+        match &memo.as_ref().expect("just filled").1 {
+            Some(prog) => prog.is_match(text),
+            None => false,
+        }
+    })
 }
 
 /// One member of a `[...]` class: a single char or an inclusive range. A range

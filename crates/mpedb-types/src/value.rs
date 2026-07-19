@@ -670,6 +670,36 @@ pub fn float_total_cmp(a: f64, b: f64) -> Ordering {
     normalize_float_bits(a).cmp(&normalize_float_bits(b))
 }
 
+/// `n` as an `f64` when the conversion is EXACT, else `None`.
+///
+/// The obvious `(n as f64) as i64 == n` check is WRONG: the `f64 -> i64` cast
+/// saturates in Rust, so `i64::MAX` — whose nearest `f64` is 2^63, one past the
+/// range — would round-trip to `i64::MAX` and read as exact. Going out through
+/// `i128`, which holds every `f64` in this neighbourhood without saturating,
+/// gives the honest answer.
+///
+/// This is the losslessness test for the int↔float parameter bridge (#74):
+/// sqlite compares an integer against a real EXACTLY
+/// (`sqlite3IntFloatCompare`), so rounding an operand before the comparison
+/// could flip a `>` on a large key.
+pub fn exact_int_as_float(n: i64) -> Option<f64> {
+    let f = n as f64;
+    (f as i128 == n as i128).then_some(f)
+}
+
+/// `f` as an `i64` when the conversion is EXACT — finite, integral, and inside
+/// the i64 range — else `None`. NaN and the infinities fail the `fract` test.
+///
+/// This is sqlite's `applyNumericAffinity` rule: an INTEGER-affinity column
+/// stores a real as an integer only when the round trip loses nothing.
+pub fn exact_float_as_int(f: f64) -> Option<i64> {
+    if !f.is_finite() || f.fract() != 0.0 {
+        return None;
+    }
+    let i = f as i128;
+    (i >= i64::MIN as i128 && i <= i64::MAX as i128).then_some(i as i64)
+}
+
 /// Order-preserving u64 image of an f64: flips the sign bit for positives and
 /// all bits for negatives, after canonicalizing -0.0 and NaN.
 pub fn normalize_float_bits(v: f64) -> u64 {

@@ -12,8 +12,8 @@
 
 use crate::ast::{self, BinOp, UnOp};
 use mpedb_types::{
-    Affinity, BareGroupBy, CmpKind, Collation, ColumnDef, ColumnType, Error, ExprProgram, Instr,
-    Result, ScalarFn, TableDef, Value,
+    exact_float_as_int, Affinity, BareGroupBy, CmpKind, Collation, ColumnDef, ColumnType, Error,
+    ExprProgram, Instr, Result, ScalarFn, TableDef, Value,
 };
 
 /// Bound (name-resolved, type-checked, constant-folded) expression.
@@ -49,6 +49,12 @@ pub(crate) enum BExpr {
     /// is a `Not` wrapped around this by the binder, so this node is never
     /// negated.
     Regexp(Box<BExpr>, String),
+    /// `LHS REGEXP <expr>` — the same matcher as [`BExpr::Regexp`] with a
+    /// pattern that is NOT a literal (a bound parameter, a column, any computed
+    /// text). Django always BINDS its regex, which is the whole reason this
+    /// exists (#74 item 3). Like `Regexp` it is never negated — `NOT REGEXP` is
+    /// a `Not` the binder wraps around it.
+    RegexpDyn(Box<BExpr>, Box<BExpr>),
     /// `LHS IN (<context list at reserved param n>)` (DESIGN-MULTIDB §2.6).
     InParam(Box<BExpr>, u16),
     /// `LHS IN (e1, …, en)` — a general value list (task #21).
@@ -104,6 +110,9 @@ pub(crate) enum BUnOp {
     IsNull,
     IsNotNull,
     ToFloat,
+    /// `~x` — bitwise NOT. Same operand rule as the infix bitwise family
+    /// ([`Binder::bit_operand`]): int64/bool/any, and the result is int64.
+    BitNot,
 }
 
 /// Expression type: `None` = NULL literal or not yet constrained.
@@ -128,6 +137,10 @@ fn op_symbol(op: BinOp) -> &'static str {
         BinOp::Concat => "||",
         BinOp::JsonArrow => "->",
         BinOp::JsonArrowText => "->>",
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
     }
 }
 
@@ -729,6 +742,32 @@ impl<'a> Binder<'a> {
             Some(ColumnType::Int64) if col.ty == ColumnType::Float64 => {
                 fold_maybe(BExpr::Unary(BUnOp::ToFloat, Box::new(b)), self.suppress_fold)
             }
+            // The other direction, and CONSTANTS ONLY (task #74). sqlite's
+            // INTEGER affinity converts a real to an integer exactly when the
+            // round trip is lossless, so `SET i = 9.0` stores the integer 9 —
+            // which is Django's shape whenever a Python float reaches an
+            // IntegerField. A constant is the only case where mpedb can VERIFY
+            // losslessness at compile time, so it is the only case allowed:
+            // `SET i = r` stays refused, because truncating a column of reals
+            // would be a wrong answer rather than a wider one, and sqlite would
+            // have stored the real itself in its typeless column.
+            Some(ColumnType::Float64) if col.ty == ColumnType::Int64 => match &b {
+                BExpr::Const(Value::Float(f)) => match exact_float_as_int(*f) {
+                    Some(i) => Ok(BExpr::Const(Value::Int(i))),
+                    None => Err(bind_err(format!(
+                        "cannot assign the float64 constant {f:e} to int64 column `{}` — \
+                         it is not exactly an integer in the int64 range, and mpedb's \
+                         rigid int64 cannot hold what sqlite would have stored",
+                        col.name
+                    ))),
+                },
+                _ => Err(bind_err(format!(
+                    "cannot assign float64 to column `{}` of type int64: only a \
+                     constant whose value is exactly an integer converts, because \
+                     that is the only case losslessness can be checked at compile time",
+                    col.name
+                ))),
+            },
             // sqlite stores a boolean AS the integer 0/1, so assigning one to an
             // integer column is exactly `CAST(x AS INTEGER)` — lossless and
             // sqlite-identical. This is Django's `SET flag = (a = b)` shape.
@@ -796,6 +835,13 @@ impl<'a> Binder<'a> {
                 }
                 let e = fold_maybe(BExpr::Unary(BUnOp::Neg, Box::new(a)), self.suppress_fold)?;
                 Ok((e, at))
+            }
+            ast::Expr::Unary(UnOp::BitNot, a) => {
+                let (a, at) = self.bind_expr(a)?;
+                let (a, at) = self.unify_param(a, at, ColumnType::Int64);
+                let a = self.bit_operand(a, at, "~")?;
+                let e = fold_maybe(BExpr::Unary(BUnOp::BitNot, Box::new(a)), self.suppress_fold)?;
+                Ok((e, Some(ColumnType::Int64)))
             }
             ast::Expr::Unary(UnOp::Not, a) => {
                 let (a, at) = self.bind_expr(a)?;
@@ -889,24 +935,49 @@ impl<'a> Binder<'a> {
                 Ok((e, Some(ColumnType::Bool)))
             }
             ast::Expr::Regexp(lhs, pat, negated) => {
-                // Same shape as GLOB: the pattern must be a text literal, both
-                // operands are text, the result is Bool. `NOT REGEXP` is a real
-                // `Not` over the 3VL result (via `maybe_not`) — NOT of NULL is
-                // NULL, so a NULL operand still yields NULL as SQL requires.
-                let pattern = match pat.as_ref() {
-                    ast::Expr::Lit(Value::Text(p)) => p.clone(),
-                    ast::Expr::Param(_) => {
-                        return Err(bind_err("REGEXP pattern must be a literal in Phase 1"))
-                    }
-                    _ => return Err(bind_err("REGEXP pattern must be a string literal")),
-                };
+                // Both operands are text and the result is Bool. `NOT REGEXP`
+                // is a real `Not` over the 3VL result (via `maybe_not`) — NOT of
+                // NULL is NULL, so a NULL operand still yields NULL as SQL
+                // requires.
+                //
+                // A text LITERAL keeps the const-pool form (`BExpr::Regexp`),
+                // which is every REGEXP mpedb could compile before #74 — its
+                // plan bytes are unchanged. Anything else (a bound parameter,
+                // a column, a computed text) takes the STACK form. Django
+                // always binds its pattern, which is what item 3 is; the old
+                // restriction was structural, inherited from LIKE/GLOB, and NOT
+                // a compiled-regex cache — `regexp_match` was recompiling per
+                // row even for a literal, and now memoizes for both forms.
                 let (l, lt) = self.bind_expr(lhs)?;
                 let (l, lt) = self.unify_param(l, lt, ColumnType::Text);
                 match lt {
                     None | Some(ColumnType::Text) => {}
                     Some(t) => return Err(bind_err(format!("REGEXP requires text, got {t}"))),
                 }
-                let r = fold_maybe(BExpr::Regexp(Box::new(l), pattern), self.suppress_fold)?;
+                let r = match pat.as_ref() {
+                    ast::Expr::Lit(Value::Text(p)) => {
+                        fold_maybe(BExpr::Regexp(Box::new(l), p.clone()), self.suppress_fold)?
+                    }
+                    other => {
+                        let (p, pt) = self.bind_expr(other)?;
+                        let (p, pt) = self.unify_param(p, pt, ColumnType::Text);
+                        match pt {
+                            None | Some(ColumnType::Text) | Some(ColumnType::Any) => {}
+                            Some(t) => {
+                                return Err(bind_err(format!(
+                                    "REGEXP pattern must be text, got {t}"
+                                )))
+                            }
+                        }
+                        // Deliberately NOT folded even when both sides are
+                        // constants: `fold` evaluates the whole node through the
+                        // IR, and `BExpr::RegexpDyn` is left out of its foldable
+                        // set for the same reason `InList` is — the literal path
+                        // above already covers every constant pattern worth
+                        // folding, and a non-literal one is a parameter.
+                        BExpr::RegexpDyn(Box::new(l), Box::new(p))
+                    }
+                };
                 let e = fold_maybe(maybe_not(r, *negated), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
             }
@@ -1364,6 +1435,55 @@ impl<'a> Binder<'a> {
                 let e = fold_maybe(BExpr::Binary(op, Box::new(l), Box::new(r)), self.suppress_fold)?;
                 Ok((e, ty))
             }
+            // `&`, `|`, `<<`, `>>` (task #74 item 2). NOT unified like
+            // arithmetic: sqlite's bitwise operators do not have a "wider
+            // operand type" at all — both sides are cast to an integer and the
+            // result is ALWAYS an integer. So each side is typed on its own and
+            // the result is int64 regardless.
+            BinOp::BitAnd | BinOp::BitOr | BinOp::Shl | BinOp::Shr => {
+                let name = bit_op_name(op);
+                let (l, lt) = self.unify_param(l, lt, ColumnType::Int64);
+                let (r, rt) = self.unify_param(r, rt, ColumnType::Int64);
+                let l = self.bit_operand(l, lt, name)?;
+                let r = self.bit_operand(r, rt, name)?;
+                let e =
+                    fold_maybe(BExpr::Binary(op, Box::new(l), Box::new(r)), self.suppress_fold)?;
+                Ok((e, Some(ColumnType::Int64)))
+            }
+        }
+    }
+
+    /// Type-check ONE operand of a bitwise operator.
+    ///
+    /// sqlite casts every operand to an integer with a total conversion
+    /// (`sqlite3VdbeIntValue`): a real truncates toward zero, a text takes an
+    /// integer-prefix parse, `'abc'` becomes 0. mpedb accepts the operand types
+    /// where that conversion is a NO-OP and refuses the rest by name:
+    ///
+    /// * `int64` — the operand type these operators are for.
+    /// * `bool` — sqlite has no boolean; it IS the integer 0/1, the same
+    ///   mapping `bind_assign` already uses for `SET int_col = (a = b)`.
+    /// * `any` — the typeless escape. Its runtime value gets sqlite's FULL
+    ///   coercion in [`mpedb_types::expr`], which is the contract `any` already
+    ///   has for comparisons (`Instr::CmpClass`): rigid types are pinned at
+    ///   compile time, `any` gets sqlite's runtime rules.
+    /// * an untyped NULL — propagates, like every other operator.
+    ///
+    /// A statically-typed `float64`, `text` or `blob` is REFUSED, and refused
+    /// rather than silently truncated for the same reason a non-integral
+    /// parameter is (task #74 item 1): `r & 1` on a column of reals would
+    /// answer a question about `trunc(r)` without saying so. `CAST(r AS
+    /// INTEGER)` asks for it explicitly and is what the message names.
+    fn bit_operand(&mut self, e: BExpr, t: Ty, op: &str) -> Result<BExpr> {
+        match t {
+            None | Some(ColumnType::Int64) | Some(ColumnType::Bool) | Some(ColumnType::Any) => {
+                Ok(e)
+            }
+            Some(t) => Err(bind_err(format!(
+                "`{op}` requires int64 operands, got {t} — sqlite would silently \
+                 convert it to an integer (truncating a real, taking the leading \
+                 digits of a text); write `CAST(x AS INTEGER)` to ask for that"
+            ))),
         }
     }
 
@@ -1817,6 +1937,75 @@ impl<'a> Binder<'a> {
                 return Ok(bound);
             }
         }
+        // sqlite's SCALAR `max(a, b, …)` / `min(a, b, …)` (#74 item 5). Variadic
+        // and typed by SELECTION rather than by computation, which neither the
+        // fixed `want` table nor the `ret` recomputation below can express, so
+        // it binds here like `char`/`printf` do.
+        if (name == "max" || name == "min") && args.len() >= 2 {
+            let mut bound = Vec::with_capacity(args.len());
+            for a in args {
+                bound.push(self.bind_expr(a)?);
+            }
+            if u8::try_from(bound.len()).is_err() {
+                return Err(bind_err(format!("{name}() takes at most 255 arguments")));
+            }
+            // The distinct CONCRETE argument types (an untyped NULL or an
+            // unpinned bare parameter contributes none).
+            let mut kinds: Vec<ColumnType> = Vec::new();
+            for (_, t) in &bound {
+                if let Some(t) = t {
+                    if !kinds.contains(t) {
+                        kinds.push(*t);
+                    }
+                }
+            }
+            // The result type. This is a SELECTION: the winning ARGUMENT is
+            // returned unchanged, so a mixed-type call can produce either
+            // argument's type and the honest answer is `any`.
+            //
+            //  * one concrete type  -> that type. `max(i, 3)` is int64.
+            //  * numbers only       -> `any`. sqlite's `max(3, 2.5)` is the
+            //    INTEGER 3 and `max(1, 2.5)` is the REAL 2.5; widening to
+            //    float64 would turn the first into 3.0, a different value.
+            //  * an `any` present   -> `any`; the runtime orders by storage
+            //    class, which is sqlite's own rule (`Value::sort_cmp`).
+            //  * anything else      -> REFUSED by name. sqlite would order a
+            //    number against a text by storage class, but that is the same
+            //    cross-class comparison `sql_cmp` refuses everywhere else, and
+            //    mpedb's own bool/timestamp have no class at all.
+            let numeric = |t: &ColumnType| {
+                matches!(t, ColumnType::Int64 | ColumnType::Float64 | ColumnType::Any)
+            };
+            let ret = match kinds.len() {
+                0 => None,
+                1 => Some(kinds[0]),
+                _ if kinds.iter().all(numeric) || kinds.contains(&ColumnType::Any) => {
+                    Some(ColumnType::Any)
+                }
+                _ => {
+                    let names: Vec<String> = kinds.iter().map(|t| t.to_string()).collect();
+                    return Err(bind_err(format!(
+                        "{name}() cannot order arguments of different types ({}) — sqlite \
+                         would rank them by storage class, which is the cross-type comparison \
+                         mpedb refuses everywhere else; CAST them to one type",
+                        names.join(" and ")
+                    )));
+                }
+            };
+            // With exactly one concrete type, a bare parameter adopts it — so
+            // `max(?, i)` binds the way `? > i` does. With a mixed call there is
+            // nothing to adopt, and the parameter is left for `resolve_params`
+            // to report.
+            let out = bound
+                .into_iter()
+                .map(|(e, t)| match (kinds.len(), ret) {
+                    (1, Some(w)) => self.unify_param(e, t, w).0,
+                    _ => e,
+                })
+                .collect();
+            let f = if name == "max" { ScalarFn::Max2 } else { ScalarFn::Min2 };
+            return Ok((BExpr::Call(f, out), ret));
+        }
         let f = match name {
             "lower" => ScalarFn::Lower,
             "upper" => ScalarFn::Upper,
@@ -1994,8 +2183,9 @@ impl<'a> Binder<'a> {
                 &[Some(ColumnType::Text), Some(ColumnType::Text)],
                 Some(ColumnType::Text),
             ),
-            // char/printf are variadic and bound specially above (never reached
-            // here); present only so this match stays exhaustive over ScalarFn.
+            // char/printf and the scalar max/min are variadic and bound
+            // specially above (never reached here); present only so this match
+            // stays exhaustive over ScalarFn.
             ScalarFn::Char | ScalarFn::Printf => (&[], Some(ColumnType::Text)),
             // The whole JSON family is bound by `bind_json_call` (and the two
             // accessors by `bind_binary`), so none of these reach the generic
@@ -2015,6 +2205,7 @@ impl<'a> Binder<'a> {
             | ScalarFn::JsonReplace
             | ScalarFn::JsonSet
             | ScalarFn::JsonInsert => (&[], Some(ColumnType::Text)),
+            ScalarFn::Max2 | ScalarFn::Min2 => (&[], None),
         };
         let mut out = Vec::with_capacity(bound.len());
         for (i, (e, t)) in bound.into_iter().enumerate() {
@@ -2345,18 +2536,28 @@ impl<'a> Binder<'a> {
     fn static_type(&self, e: &BExpr) -> Ty {
         match e {
             BExpr::Const(v) => v.column_type(),
-            // An `excluded.<c>` binds to Col(n + i); fold the index back so a
-            // second-half reference reports the column's real type instead of
-            // indexing off the end.
-            // `excluded.<c>` binds to Col(n + i) over [existing ‖ proposed], so
-            // fold the index back into the base row's width.
+            // A column reference resolves through the WHOLE evaluated tuple —
+            // `Scope::column_shape` walks the scoped tables in slot order, the
+            // same walk `Scope::resolve` used to hand out the slot.
+            //
+            // This used to read `scope.only().columns[…]`, which ASSERTS on a
+            // scope wider than one table: `SELECT a.id FROM a JOIN b ON … WHERE
+            // ABS(b.id) = 1` panicked in the binder, because `abs`/`round`/
+            // `ceil`/`floor`/`trunc`/`hex` are the functions whose return type
+            // IS their argument's, so binding one over a joined column came
+            // through here. The scope was never single-table on this path; only
+            // the lookup assumed it was.
+            //
+            // `excluded.<c>` binds to Col(n + i) over `[existing ‖ proposed]`,
+            // which is the one tuple WIDER than the scope: fold the index back
+            // into the scope's width so a second-half reference reports the
+            // column's real type instead of falling off the end. That scope is
+            // single-table by construction (an ON CONFLICT target is one
+            // table), so the fold and the join walk never interact.
             BExpr::Col(i) => {
                 let n = self.scope.width();
-                self.scope
-                    .only()
-                    .columns
-                    .get(*i as usize % n.max(1))
-                    .map(|c| c.ty)
+                let slot = (*i as usize % n.max(1)) as u16;
+                self.scope.column_shape(slot).map(|(t, _)| t)
             }
             BExpr::Param(i) => self.param_types[*i as usize],
             BExpr::Unary(BUnOp::ToFloat, _) => Some(ColumnType::Float64),
@@ -2552,6 +2753,17 @@ impl<'a> Binder<'a> {
             }
         }
         (e, t)
+    }
+}
+
+/// The SQL spelling of a bitwise operator, for its error messages.
+fn bit_op_name(op: BinOp) -> &'static str {
+    match op {
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
+        _ => unreachable!("bit_op_name on {op:?}"),
     }
 }
 
@@ -2770,6 +2982,7 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 BUnOp::IsNull => Instr::IsNull,
                 BUnOp::IsNotNull => Instr::IsNotNull,
                 BUnOp::ToFloat => Instr::ToFloat,
+                BUnOp::BitNot => Instr::BitNot,
             });
         }
         BExpr::Cast(a, t) => {
@@ -2801,6 +3014,10 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                         "internal: a JSON accessor reached the binary emitter",
                     ))
                 }
+                BinOp::BitAnd => Instr::BitAnd,
+                BinOp::BitOr => Instr::BitOr,
+                BinOp::Shl => Instr::Shl,
+                BinOp::Shr => Instr::Shr,
             });
         }
         BExpr::IsDistinct(a, b, negated) => {
@@ -2835,6 +3052,11 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
             emit(a, instrs, consts)?;
             let idx = push_const(consts, Value::Text(pattern.clone()))?;
             instrs.push(Instr::Glob(idx));
+        }
+        BExpr::RegexpDyn(a, p) => {
+            emit(a, instrs, consts)?;
+            emit(p, instrs, consts)?;
+            instrs.push(Instr::RegexpDyn);
         }
         BExpr::Regexp(a, pattern) => {
             emit(a, instrs, consts)?;

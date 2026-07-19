@@ -380,3 +380,87 @@ fn strftime_refuses_by_name_what_it_cannot_reproduce() {
 
     let _ = std::fs::remove_file(&path);
 }
+
+/// Task #74 item 4 — `strftime(f, 'now')`: **re-examined and REFUSED BY
+/// DESIGN**, and this test is the decision written down so it is not quietly
+/// reversed.
+///
+/// The argument is determinism, not effort:
+///
+///  * mpedb has NO non-deterministic expression today. `'now'` would be the
+///    first, and `CURRENT_TIMESTAMP`/`CURRENT_DATE`/`CURRENT_TIME` are refused
+///    by name in DDL for the same reason (asserted below, so the two refusals
+///    cannot drift apart).
+///  * Compiled plans are content-hashed and published to a registry SHARED
+///    ACROSS PROCESSES. `strftime('%Y','now')` has all-constant arguments, so
+///    the day `fold` starts folding `Call` — which its own comment says is
+///    foldable "in principle" — the plan bytes would carry a COMPILE-TIME
+///    timestamp that every later process reuses. A wrong answer that outlives
+///    the process that made it, in a shared file.
+///  * sqlite fixes `'now'` ONCE PER STATEMENT (`iCurrentTime`). Reproducing
+///    that needs a statement-start instant threaded through every
+///    `ExprProgram::eval` call site; reading the clock inside `eval` would
+///    drift within one statement instead — a different wrong answer, and a
+///    syscall per row in a crate that has no clock dependency by design.
+///  * A CHECK body holding `'now'` would pass at INSERT and fail on any later
+///    re-validation, and the mirror's convergence criterion (replay reproduces
+///    the source EXACTLY) has no meaning for a time-dependent statement.
+///  * It would not close the shape Django actually uses: `'now'` is only useful
+///    with the modifier language (`'now','start of day'`), which stays refused.
+#[test]
+fn now_is_refused_by_design_and_says_why() {
+    let (db, path) = mpedb_db();
+
+    // The refusal names `'now'` AND the reason, so the next reader does not
+    // have to re-derive the argument above.
+    let m = db
+        .query("SELECT strftime('%Y', 'now')", &[])
+        .map(|r| panic!("'now' must be refused, got {r:?}"))
+        .unwrap_err()
+        .to_string();
+    assert!(m.contains("unsupported time string"), "{m}");
+    assert!(m.contains("\"now\""), "{m}");
+    assert!(m.contains("non-deterministic"), "{m}");
+    assert!(m.contains("content-hashed"), "{m}");
+
+    // Case and whitespace variants take the same path — sqlite accepts them all
+    // (`'NOW'`, `' now '`), so none may fall through to a different message or,
+    // worse, to a value.
+    for t in ["'NOW'", "'Now'", "' now '", "'now '"] {
+        let m = db
+            .query(&format!("SELECT strftime('%Y', {t})"), &[])
+            .map(|r| panic!("{t} must be refused, got {r:?}"))
+            .unwrap_err()
+            .to_string();
+        assert!(m.contains("unsupported time string"), "{t}: {m}");
+    }
+
+    // The neighbouring refusals that make this one consistent rather than
+    // arbitrary: mpedb has no non-deterministic expression ANYWHERE.
+    let m = db
+        .query("SELECT current_timestamp", &[])
+        .map(|r| panic!("current_timestamp must not resolve, got {r:?}"))
+        .unwrap_err()
+        .to_string();
+    assert!(m.contains("unknown column `current_timestamp`"), "{m}");
+    for f in ["current_timestamp()", "now()", "datetime('now')", "date('now')", "time('now')"] {
+        assert!(
+            db.query(&format!("SELECT {f}"), &[]).is_err(),
+            "{f} must not resolve to a value"
+        );
+    }
+    for kw in ["CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"] {
+        let m = db
+            .query(&format!("CREATE TABLE nowtest_{kw} (a INT PRIMARY KEY, b TEXT DEFAULT {kw})"), &[])
+            .map(|r| panic!("DEFAULT {kw} must be refused, got {r:?}"))
+            .unwrap_err()
+            .to_string();
+        assert!(m.contains(kw), "{kw}: {m}");
+    }
+
+    // And the deterministic time strings still work, so this is a refusal of
+    // non-determinism and not of `strftime`.
+    assert!(db.query("SELECT strftime('%Y-%m-%d', '2020-01-02')", &[]).is_ok());
+
+    let _ = std::fs::remove_file(&path);
+}
