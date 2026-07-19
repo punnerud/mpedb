@@ -124,7 +124,7 @@ pub fn cpu_model() -> String {
     #[cfg(target_os = "macos")]
     {
         // Apple Silicon reports e.g. "Apple M3 Pro" here.
-        return sysctl("machdep.cpu.brand_string").unwrap_or_else(|| "unknown cpu".into());
+        sysctl("machdep.cpu.brand_string").unwrap_or_else(|| "unknown cpu".into())
     }
     #[cfg(not(target_os = "macos"))]
     std::fs::read_to_string("/proc/cpuinfo")
@@ -141,10 +141,10 @@ pub fn cpu_model() -> String {
 pub fn mem_total() -> String {
     #[cfg(target_os = "macos")]
     {
-        return sysctl("hw.memsize")
+        sysctl("hw.memsize")
             .and_then(|v| v.parse::<u64>().ok())
             .map(|b| format!("{:.1} GiB", b as f64 / (1024.0 * 1024.0 * 1024.0)))
-            .unwrap_or_else(|| "unknown".into());
+            .unwrap_or_else(|| "unknown".into())
     }
     #[cfg(not(target_os = "macos"))]
     std::fs::read_to_string("/proc/meminfo")
@@ -186,7 +186,7 @@ pub fn os_release() -> String {
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string())
             .unwrap_or_else(|| "?".into());
-        return format!("macOS {product} (Darwin {darwin})");
+        format!("macOS {product} (Darwin {darwin})")
     }
     #[cfg(not(target_os = "macos"))]
     {
