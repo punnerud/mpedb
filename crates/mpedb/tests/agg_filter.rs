@@ -312,6 +312,16 @@ fn correlated_subquery_in_filter_matches_sqlite_3_45() {
         ),
         // ---- a correlated FILTER mixed with an ordinary one -----------------
         format!("SELECT g, count(*) FILTER (WHERE {EX} AND x > 4) FROM t GROUP BY g ORDER BY g"),
+        // ---- over a JOIN: the row the filter correlates from is the JOINED
+        // row, so the per-row fill must run after `gather_joined`, not before.
+        format!(
+            "SELECT t.g, count(*) FILTER (WHERE {EX}) FROM t JOIN c ON c.ref = t.id \
+             GROUP BY t.g ORDER BY t.g"
+        ),
+        format!(
+            "SELECT t.g, count(*) FILTER (WHERE NOT {EX}) FROM t LEFT JOIN c ON c.ref = t.id \
+             GROUP BY t.g ORDER BY t.g"
+        ),
         // ---- HAVING alongside a correlated FILTER ---------------------------
         // The HAVING itself carries no subquery (one in HAVING is refused
         // separately, see `correlated_subquery_outside_filter_is_refused`); this
