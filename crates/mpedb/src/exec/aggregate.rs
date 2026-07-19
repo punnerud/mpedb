@@ -18,6 +18,9 @@ enum Acc {
         /// [`Accum::new_distinct`] uses.
         /// `None` for a non-DISTINCT call, so the common case pays nothing.
         seen: Option<std::collections::BTreeSet<Vec<u8>>>,
+        /// The argument column's declared collation, folded into the dedup key
+        /// exactly as [`Accum`] does for a native aggregate.
+        coll: Collation,
     },
 }
 
@@ -27,13 +30,13 @@ impl Acc {
     fn push(&mut self, v: Option<&Value>) -> Result<()> {
         match self {
             Acc::Native(a) => a.push(v),
-            Acc::Host { state, seen } => {
+            Acc::Host { state, seen, coll } => {
                 let args = match v {
                     Some(v) => std::slice::from_ref(v),
                     None => &[][..],
                 };
                 if let Some(seen) = seen {
-                    if !seen.insert(keycode::encode_group_key(args, &[])) {
+                    if !seen.insert(keycode::encode_group_key(args, std::slice::from_ref(coll))) {
                         return Ok(());
                     }
                 }
@@ -56,11 +59,11 @@ impl Acc {
 /// needs the connection's factory table, so this is where a plan naming one
 /// executed OUT of scope (the write path, the streaming/overlay read paths)
 /// surfaces a clean error instead of a wrong answer.
-fn new_accum(a: &AggCall, host: Option<&dyn HostAggs>) -> Result<Acc> {
+fn new_accum(a: &AggCall, host: Option<&dyn HostAggs>, coll: Collation) -> Result<Acc> {
     let Some(name) = a.func.host() else {
         let f = a.func.native().ok_or_else(|| internal("aggregate with no target"))?;
         return Ok(Acc::Native(if a.distinct {
-            Accum::new_distinct(f)
+            Accum::new_distinct_collated(f, coll)
         } else {
             Accum::new(f)
         }));
@@ -76,7 +79,28 @@ fn new_accum(a: &AggCall, host: Option<&dyn HostAggs>) -> Result<Acc> {
     Ok(Acc::Host {
         state: host.create(name, argc)?,
         seen: a.distinct.then(std::collections::BTreeSet::new),
+        coll,
     })
+}
+
+/// The collation an `f(DISTINCT x)` dedup folds TEXT under: the DECLARED
+/// collation of the column `x` names, sqlite's rung-2 rule and exactly what
+/// `SELECT DISTINCT` already applies through `output_collations`.
+///
+/// Only a BARE column reference carries one — `count(DISTINCT lower(name))`
+/// dedups an expression's result, which has no column and therefore BINARY,
+/// as in sqlite. The argument program for a bare column is the single
+/// instruction `PushCol(i)`, so that is the shape matched.
+fn arg_collation(a: &AggCall, base_colls: &[Collation]) -> Collation {
+    if !a.distinct {
+        return Collation::Binary;
+    }
+    match a.arg.as_ref().map(|p| p.instrs.as_slice()) {
+        Some([mpedb_types::Instr::PushCol(i)]) => {
+            base_colls.get(*i as usize).copied().unwrap_or(Collation::Binary)
+        }
+        _ => Collation::Binary,
+    }
 }
 
 /// `GROUP BY` / aggregates / `HAVING`.
@@ -273,7 +297,7 @@ pub(super) fn exec_aggregate(
                 let accs = agg
                     .aggs
                     .iter()
-                    .map(|c| new_accum(c, host_aggs))
+                    .map(|c| new_accum(c, host_aggs, arg_collation(c, &base_colls)))
                     .collect::<Result<Vec<Acc>>>()?;
                 e.insert((key_vals, accs, witness))
             }
@@ -393,7 +417,7 @@ pub(super) fn exec_aggregate(
         let accs = agg
             .aggs
             .iter()
-            .map(|c| new_accum(c, host_aggs))
+            .map(|c| new_accum(c, host_aggs, arg_collation(c, &base_colls)))
             .collect::<Result<Vec<Acc>>>()?;
         let mut tuple: Vec<Value> =
             accs.into_iter().map(Acc::finish).collect::<Result<_>>()?;

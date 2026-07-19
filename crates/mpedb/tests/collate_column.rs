@@ -205,6 +205,21 @@ fn column_collation_matches_sqlite_3_45() {
         // ---- GROUP BY name: case-insensitive grouping (count multiset) -------
         // Representative-free: the group COUNTS (sorted) prove the collapse.
         "SELECT count(*) FROM t WHERE name IS NOT NULL GROUP BY name ORDER BY count(*)",
+        // ---- f(DISTINCT name): the dedup INSIDE an aggregate -----------------
+        // The same rung-2 rule as `SELECT DISTINCT`, and it was missing: the
+        // accumulator keyed on the raw bytes, so `count(DISTINCT name)` said 8
+        // where sqlite says 6.
+        "SELECT count(DISTINCT name) FROM t",
+        "SELECT count(DISTINCT code) FROM t",
+        "SELECT count(DISTINCT plain) FROM t",
+        "SELECT group_concat(DISTINCT name) FROM t WHERE name IS NOT NULL",
+        // Per group, and with a FILTER in front of the dedup.
+        "SELECT count(DISTINCT name) FROM t WHERE name IS NOT NULL GROUP BY code ORDER BY 1",
+        // An EXPRESSION argument names no column and therefore carries no
+        // collation — BINARY, as in sqlite, so the case variants come apart
+        // again. (`trim`, not `lower`: mpedb's `lower()` casefolds Unicode
+        // where sqlite's folds ASCII only, a divergence of its own.)
+        "SELECT count(DISTINCT trim(name)) FROM t",
         // ---- BINARY control column (no declared collation) -------------------
         "SELECT id FROM t WHERE plain = 'aa' ORDER BY id",
         // …but an explicit COLLATE still applies to a BINARY column.
