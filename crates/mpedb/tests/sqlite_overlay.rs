@@ -417,3 +417,188 @@ fn locked_mode_gives_foreign_writers_sqlite_busy() {
     let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));
     let _ = std::fs::remove_file(&p);
 }
+
+// ------------------------------------------- base schema fidelity (#B) -----
+
+/// A base table's DECLARED TYPE reaches the overlay as its sqlite AFFINITY, so
+/// a value written through the overlay is converted exactly as sqlite converts
+/// it. This was a wrong answer, not a lost annotation: an `int` column took
+/// `'1.50'` and returned `1.50`/`text` where sqlite returns `1.5`/`real`, and
+/// where mpedb's own native path correctly REFUSES.
+///
+/// The storage type stays `Any` deliberately — a sqlite file is not rigid, so a
+/// column declared `int` may genuinely hold `'abc'`, and declaring the overlay
+/// column `Int64` would make mpedb refuse to read rows sqlite happily holds.
+/// What sqlite guarantees is the CONVERSION, and that is what now survives.
+#[test]
+fn declared_affinity_survives_into_the_overlay() {
+    let p = setup("affinity");
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch(
+        "CREATE TABLE aff (id INTEGER PRIMARY KEY, num decimal(10,2), i int, \
+         s varchar(10), r double precision, none_)",
+    )
+    .unwrap();
+    drop(c);
+
+    let mut ovl = SqliteOverlay::open(&p).unwrap();
+    ovl.query(
+        "INSERT INTO aff (id, num, i, s, r, none_) VALUES (1, '1.50', '1.50', '1.50', '12', '1.50')",
+        &[],
+    )
+    .unwrap();
+    let got = rows(
+        ovl.query(
+            "SELECT typeof(num), typeof(i), typeof(s), typeof(r), typeof(none_) FROM aff",
+            &[],
+        )
+        .unwrap(),
+    );
+    // sqlite3 3.45.1 on the identical script: real|real|text|real|text.
+    assert_eq!(
+        got,
+        vec![vec![
+            Value::Text("real".into()),
+            Value::Text("real".into()),
+            Value::Text("text".into()),
+            Value::Text("real".into()),
+            // No declared type at all: BLOB affinity, stored verbatim.
+            Value::Text("text".into()),
+        ]]
+    );
+    let got = rows(ovl.query("SELECT num, i, r FROM aff", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Float(1.5), Value::Float(1.5), Value::Float(12.0)]]);
+}
+
+/// A base table with no `INTEGER PRIMARY KEY` gets a SYNTHESIZED `rowid`, and
+/// it must be HIDDEN — #94's rule on the native path. Leaving it visible made
+/// `SELECT *` return one column MORE than sqlite does: wrong result arity.
+#[test]
+fn a_synthesized_rowid_is_hidden_from_select_star() {
+    let p = setup("rowid-hidden");
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch(
+        "CREATE TABLE norowid (a TEXT, b INT);
+         INSERT INTO norowid VALUES ('x', 1), ('y', 2);
+         CREATE TABLE textpk (k TEXT PRIMARY KEY, n INT) WITHOUT ROWID;
+         INSERT INTO textpk VALUES ('a', 1);",
+    )
+    .unwrap();
+    drop(c);
+
+    let mut ovl = SqliteOverlay::open(&p).unwrap();
+    let got = rows(ovl.query("SELECT * FROM norowid ORDER BY a", &[]).unwrap());
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::Text("x".into()), Value::Int(1)],
+            vec![Value::Text("y".into()), Value::Int(2)],
+        ],
+        "SELECT * must return the base's 2 columns, not 3"
+    );
+    // …and the hidden rowid is still addressable by name, as sqlite's is.
+    let got = rows(ovl.query("SELECT rowid FROM norowid ORDER BY rowid", &[]).unwrap());
+    assert_eq!(ints(&got), vec![1, 2]);
+    // A WITHOUT ROWID table has a real declared PK and nothing synthesized.
+    let got = rows(ovl.query("SELECT * FROM textpk", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Text("a".into()), Value::Int(1)]]);
+}
+
+/// `NOT NULL` and `DEFAULT` survive the base→overlay translation. Dropping them
+/// stored a NULL where sqlite stores the default, and accepted a row sqlite
+/// refuses — and the second one only surfaced later, as a checkpoint failure on
+/// an unrelated statement.
+#[test]
+fn not_null_and_default_survive_into_the_overlay() {
+    let p = setup("constraints");
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch(
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT NOT NULL DEFAULT 'z', \
+         n INT DEFAULT 7, d decimal(10,2) DEFAULT '1.50', q TEXT DEFAULT 'NOT NULL', \
+         e TEXT DEFAULT 'a''b')",
+    )
+    .unwrap();
+    drop(c);
+
+    let mut ovl = SqliteOverlay::open(&p).unwrap();
+    // The DEFAULT fills an omitted column — sqlite stores 'z', 7 and the REAL
+    // 1.5 (the default takes the column's store-time affinity too).
+    ovl.query("INSERT INTO t (id) VALUES (2)", &[]).unwrap();
+    let got = rows(ovl.query("SELECT v, n, d, typeof(d), q, e FROM t", &[]).unwrap());
+    assert_eq!(
+        got,
+        vec![vec![
+            Value::Text("z".into()),
+            Value::Int(7),
+            Value::Float(1.5),
+            Value::Text("real".into()),
+            // A `NOT NULL` inside a string default is a string, not a
+            // constraint — `q` stays nullable and keeps its text.
+            Value::Text("NOT NULL".into()),
+            // A DOUBLED quote is one escaped quote inside the literal, not its
+            // end — reading it as the end gave the default `a`.
+            Value::Text("a'b".into()),
+        ]]
+    );
+    // An explicit NULL into the NOT NULL column is refused, as sqlite refuses it.
+    let err = ovl.query("INSERT INTO t (id, v) VALUES (4, NULL)", &[]).unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("null"), "{err}");
+    // …and so is an UPDATE that would introduce one.
+    let err = ovl.query("UPDATE t SET v = NULL WHERE id = 2", &[]).unwrap_err();
+    assert!(format!("{err}").to_lowercase().contains("null"), "{err}");
+    // The refused rows left nothing behind.
+    let got = rows(ovl.query("SELECT count(*) FROM t", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Int(1)]]);
+}
+
+/// What mpedb cannot carry is refused BY NAME rather than silently dropped. A
+/// dropped CHECK let a row the base itself rejects into the overlay, and the
+/// error then surfaced on an unrelated statement at checkpoint time; a DEFAULT
+/// mpedb cannot evaluate would store NULL where sqlite stores a value.
+///
+/// The overlay is strict about unattachable tables — it refuses to open at all
+/// rather than serve a database with silently unwritable tables — so the
+/// refusal is the open error, and it must NAME the table and the reason.
+#[test]
+fn unrepresentable_constraints_are_refused_by_name() {
+    for (tag, ddl, want) in [
+        (
+            "tblchk",
+            "CREATE TABLE chk (id INTEGER PRIMARY KEY, v TEXT, \
+               CONSTRAINT vchk CHECK (length(v) < 10))",
+            "CHECK",
+        ),
+        ("colchk", "CREATE TABLE chk (id INTEGER PRIMARY KEY, v INT CHECK (v > 0))", "CHECK"),
+        (
+            "dyndefault",
+            "CREATE TABLE chk (id INTEGER PRIMARY KEY, t TEXT DEFAULT CURRENT_TIMESTAMP)",
+            "DEFAULT",
+        ),
+        (
+            "generated",
+            "CREATE TABLE chk (id INTEGER PRIMARY KEY, a INT, b INT GENERATED ALWAYS AS (a+1))",
+            "GENERATED",
+        ),
+    ] {
+        let p = setup(tag);
+        let c = Connection::open(&p).unwrap();
+        c.execute_batch(ddl).unwrap();
+        drop(c);
+        let msg = match SqliteOverlay::open(&p) {
+            Ok(_) => panic!("`{tag}` must be refused, not silently half-enforced"),
+            Err(e) => format!("{e}"),
+        };
+        assert!(msg.contains("chk"), "must name the table: {msg}");
+        assert!(msg.contains(want), "must name the reason ({want}): {msg}");
+    }
+    // A LITERAL default is representable and does not trip the refusal.
+    let p = setup("litdefault");
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch("CREATE TABLE ok (id INTEGER PRIMARY KEY, v TEXT DEFAULT 'z', n INT DEFAULT -1)")
+        .unwrap();
+    drop(c);
+    let mut ovl = SqliteOverlay::open(&p).unwrap();
+    ovl.query("INSERT INTO ok (id) VALUES (1)", &[]).unwrap();
+    let got = rows(ovl.query("SELECT v, n FROM ok", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Text("z".into()), Value::Int(-1)]]);
+}

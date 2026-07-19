@@ -74,6 +74,22 @@ pub struct Table {
     /// PRIMARY KEY column names in key order — what WITHOUT ROWID storage
     /// leads with.
     pub pk_order: Vec<String>,
+    /// `NOT NULL` per column. Dropping this let the overlay accept a row
+    /// sqlite refuses, so it is parsed rather than assumed.
+    pub not_null: Vec<bool>,
+    /// The RAW `DEFAULT` text per column, exactly as written (`'z'`, `0`,
+    /// `-1.5`, `CURRENT_TIMESTAMP`, `(a+1)`). Dropping this made an omitted
+    /// column store NULL where sqlite stores the default — a wrong stored
+    /// value. The caller decides what it can represent.
+    pub defaults: Vec<Option<String>>,
+    /// Whether the table carries ANY `CHECK` (column-level or table-level).
+    /// mpedb cannot yet compile a base's CHECK, and silently not enforcing one
+    /// let an invalid row into the overlay that then failed the checkpoint on
+    /// an unrelated statement — so the caller refuses the table by name.
+    pub has_check: bool,
+    /// Whether any column is `GENERATED ALWAYS AS`. Its value is computed, not
+    /// stored, and mpedb has no expression to compute it with.
+    pub has_generated: bool,
 }
 
 impl Table {
@@ -193,6 +209,10 @@ impl SqliteFile {
                 decl_types: parsed.decl_types,
                 ipk_column: parsed.ipk_column,
                 pk_order: parsed.pk_cols,
+                not_null: parsed.not_null,
+                defaults: parsed.defaults,
+                has_check: parsed.has_check,
+                has_generated: parsed.has_generated,
             });
             Ok(())
         })?;
@@ -508,6 +528,10 @@ struct ParsedCreate {
     /// PRIMARY KEY column names in key order (declared inline or as a table
     /// constraint) — what WITHOUT ROWID storage leads with.
     pk_cols: Vec<String>,
+    not_null: Vec<bool>,
+    defaults: Vec<Option<String>>,
+    has_check: bool,
+    has_generated: bool,
 }
 
 /// The stored-vs-declared column order of a WITHOUT ROWID table: sqlite
@@ -575,6 +599,10 @@ fn parse_create_table(sql: &str) -> Option<ParsedCreate> {
     let mut decl_types = Vec::new();
     let mut pk_cols: Vec<String> = Vec::new();
     let mut ipk_column = None;
+    let mut not_null = Vec::new();
+    let mut defaults: Vec<Option<String>> = Vec::new();
+    let mut has_check = false;
+    let mut has_generated = false;
 
     for part in split_depth0(body) {
         let part = part.trim();
@@ -600,11 +628,20 @@ fn parse_create_table(sql: &str) -> Option<ParsedCreate> {
             }
             continue;
         }
-        if upper.starts_with("UNIQUE")
-            || upper.starts_with("CHECK")
-            || upper.starts_with("FOREIGN KEY")
-            || upper.starts_with("CONSTRAINT")
-        {
+        if upper.starts_with("CHECK") {
+            has_check = true;
+            continue;
+        }
+        if upper.starts_with("CONSTRAINT") {
+            // `CONSTRAINT <name> CHECK (…)` is a CHECK under a name; the rest
+            // (UNIQUE / FOREIGN KEY / PRIMARY KEY) is already handled or
+            // deliberately dropped.
+            if constraint_words(part).iter().any(|w| w == "CHECK") {
+                has_check = true;
+            }
+            continue;
+        }
+        if upper.starts_with("UNIQUE") || upper.starts_with("FOREIGN KEY") {
             continue;
         }
         // A column: name [type tokens] [constraints]
@@ -636,15 +673,211 @@ fn parse_create_table(sql: &str) -> Option<ParsedCreate> {
                 ipk_column = Some(columns.len());
             }
         }
+        // The constraint tail, tokenized at depth 0 and outside quotes, so a
+        // `NOT NULL` inside a CHECK body or a `DEFAULT 'NOT NULL'` string is
+        // not mistaken for the constraint itself.
+        let words = constraint_words(rest);
+        let mut nn = false;
+        let mut dflt = None;
+        for (k, w) in words.iter().enumerate() {
+            match w.as_str() {
+                "NOT" if words.get(k + 1).map(String::as_str) == Some("NULL") => nn = true,
+                "CHECK" => has_check = true,
+                "GENERATED" => has_generated = true,
+                // Bare `AS` after the type is the short form of GENERATED.
+                "AS" => has_generated = true,
+                "DEFAULT" => dflt = default_text(rest, k),
+                _ => {}
+            }
+        }
+        // A PK column of a rowid table is implicitly NOT NULL in sqlite only
+        // when it is the INTEGER PRIMARY KEY; leave that to the caller, which
+        // knows the shape. Recorded here is what was WRITTEN.
         columns.push(name);
         decl_types.push(ty);
+        not_null.push(nn);
+        defaults.push(dflt);
     }
     // `INTEGER PRIMARY KEY` detection above ran before knowing WITHOUT ROWID
     // (it trails the body); correct for it.
     if without_rowid {
         ipk_column = None;
     }
-    Some(ParsedCreate { columns, decl_types, without_rowid, ipk_column, pk_cols })
+    Some(ParsedCreate {
+        columns,
+        decl_types,
+        without_rowid,
+        ipk_column,
+        pk_cols,
+        not_null,
+        defaults,
+        has_check,
+        has_generated,
+    })
+}
+
+/// The bare, UPPERCASED words of a constraint tail, at paren depth 0 and
+/// outside every quote form. Parenthesized groups (a CHECK body, a `DEFAULT
+/// (expr)`) and string/identifier literals are skipped whole, so their contents
+/// can never be read as constraint keywords — the difference between seeing
+/// `NOT NULL` and seeing `DEFAULT 'NOT NULL'`.
+fn constraint_words(rest: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let b = rest.as_bytes();
+    let mut i = 0usize;
+    while i < b.len() {
+        let c = b[i] as char;
+        match c {
+            '(' => {
+                let mut depth = 1usize;
+                i += 1;
+                while i < b.len() && depth > 0 {
+                    match b[i] as char {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        '\'' | '"' | '`' => {
+                            let q = b[i];
+                            i += 1;
+                            while i < b.len() && b[i] != q {
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            '\'' | '"' | '`' => {
+                let q = b[i];
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '[' => {
+                while i < b.len() && b[i] != b']' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            _ if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i;
+                while i < b.len() && ((b[i] as char).is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                out.push(rest[start..i].to_ascii_uppercase());
+            }
+            _ => i += 1,
+        }
+    }
+    out
+}
+
+/// The RAW text of the `DEFAULT` clause that starts at word index `k` of
+/// `rest` — a literal, a signed number, a keyword like `CURRENT_TIMESTAMP`, or
+/// a parenthesized expression, returned verbatim for the caller to interpret.
+/// `None` when the clause is malformed or empty.
+fn default_text(rest: &str, k: usize) -> Option<String> {
+    // Re-walk to the k-th word's end, then take what follows up to the next
+    // depth-0 constraint keyword.
+    let mut seen = 0usize;
+    let b = rest.as_bytes();
+    let mut i = 0usize;
+    let mut after: Option<usize> = None;
+    while i < b.len() {
+        let c = b[i] as char;
+        match c {
+            '(' => {
+                let mut depth = 1usize;
+                i += 1;
+                while i < b.len() && depth > 0 {
+                    match b[i] as char {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        '\'' | '"' | '`' => {
+                            let q = b[i];
+                            i += 1;
+                            while i < b.len() && b[i] != q {
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+            }
+            '\'' | '"' | '`' => {
+                let q = b[i];
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '[' => {
+                while i < b.len() && b[i] != b']' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            _ if c.is_ascii_alphabetic() || c == '_' => {
+                while i < b.len() && ((b[i] as char).is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                if seen == k {
+                    after = Some(i);
+                    break;
+                }
+                seen += 1;
+            }
+            _ => i += 1,
+        }
+    }
+    let start = after?;
+    let tail = rest[start..].trim_start();
+    if tail.is_empty() {
+        return None;
+    }
+    // One "value": a parenthesized group, a quoted string, or a run of
+    // non-space characters (which covers `-1.5`, `0`, `x'00'`, `NULL`).
+    let vb = tail.as_bytes();
+    let end = match vb[0] as char {
+        '(' => {
+            let mut depth = 1usize;
+            let mut j = 1usize;
+            while j < vb.len() && depth > 0 {
+                match vb[j] as char {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            j
+        }
+        '\'' => {
+            // A doubled `''` is an ESCAPED quote inside the literal, not its
+            // end — stopping at the first one turned `DEFAULT 'a''b'` into the
+            // default `a`, a silently wrong stored value.
+            let mut j = 1usize;
+            loop {
+                while j < vb.len() && vb[j] != b'\'' {
+                    j += 1;
+                }
+                if j + 1 < vb.len() && vb[j + 1] == b'\'' {
+                    j += 2;
+                    continue;
+                }
+                break;
+            }
+            j + 1
+        }
+        _ => tail
+            .find(char::is_whitespace)
+            .unwrap_or(tail.len()),
+    };
+    Some(tail[..end.min(tail.len())].to_string())
 }
 
 fn split_depth0(s: &str) -> Vec<&str> {
