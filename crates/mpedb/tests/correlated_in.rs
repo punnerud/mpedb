@@ -205,6 +205,11 @@ const QUERIES: &[&str] = &[
     "SELECT a.id FROM a WHERE NOT (a.k IN (SELECT b.ak FROM b WHERE b.w < a.v)) ORDER BY a.id",
     // ORDER BY over a correlated IN value.
     "SELECT a.id FROM a ORDER BY a.k IN (SELECT b.ak FROM b WHERE b.w < a.v), a.id",
+    // A correlated IN as a GROUP BY key, next to a correlated IN in the WHERE
+    // (#97: a group key is a PER-ROW program, so both are filled per row).
+    "SELECT a.k IN (SELECT b.ak FROM b) AS m, count(a.v) FROM a \
+     WHERE a.id IN (SELECT b.id FROM b WHERE b.w < a.v) GROUP BY 1 ORDER BY 1",
+    "SELECT a.k IN (SELECT b.ak FROM b WHERE b.w < a.v) AS m, count(*) FROM a GROUP BY 1 ORDER BY 1",
 ];
 
 fn agree(indexed: bool) {
@@ -261,9 +266,12 @@ fn documented_refusals() {
         "SELECT a.id FROM a JOIN b ON a.k IN (SELECT c.ak FROM b c WHERE c.w < a.v)",
         "a subquery in a JOIN's ON condition is not supported yet",
     );
+    // A grouped SELECT-list expression that is NOT itself a group key reads the
+    // correlated slot after the collapse — refused. (`GROUP BY 1`, where the
+    // item IS the key, is answered; see the matrix above.)
     refuse(
-        "SELECT count(a.v) FROM a WHERE a.id IN (SELECT b.id FROM b WHERE b.w < a.v) GROUP BY a.k IN (SELECT b.ak FROM b)",
-        "an IN subquery here was not lifted",
+        "SELECT count(*), a.k IN (SELECT b.ak FROM b WHERE b.w < a.v) FROM a",
+        "only supported where it is evaluated PER ROW",
     );
     drop(db);
     let _ = std::fs::remove_file(&path);

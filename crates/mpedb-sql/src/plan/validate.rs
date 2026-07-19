@@ -893,24 +893,19 @@ impl CompiledPlan {
             }
         }
         if let Some(agg) = &sp.aggregate {
-            for k in &agg.group_by {
-                if let GroupKey::Expr(p) = k {
-                    gather_ok(p)?;
-                }
-            }
-            for a in &agg.aggs {
-                if let Some(p) = &a.arg {
-                    gather_ok(p)?;
-                }
-                // NOT `a.filter`: `agg(x) FILTER (WHERE …)` is evaluated PER ROW
-                // inside the aggregate loop, after the per-row correlated fill,
-                // against that row's scratch parameter vector — exactly like
-                // `post_filter`, and unlike everything else here. So a correlated
-                // slot IS meaningful in it and must not be rejected. (Rejecting it
-                // is not merely conservative: the executor used to evaluate the
-                // filter against the pre-fill `params`, read NULL, and DROP the
-                // row — a wrong answer for both `EXISTS` and `NOT EXISTS`.)
-            }
+            // NOT `agg.group_by`, NOT `a.arg`, NOT `a.filter` (#97). All three
+            // are evaluated PER ROW inside `exec_aggregate`'s row loop, after
+            // the per-row correlated fill, against THAT row's scratch parameter
+            // vector — exactly like `post_filter`, and unlike everything else
+            // here. So a correlated slot IS meaningful in each and must not be
+            // rejected. (Rejecting `a.filter` was not merely conservative: the
+            // executor used to evaluate the filter against the pre-fill
+            // `params`, read NULL, and DROP the row — a wrong answer for both
+            // `EXISTS` and `NOT EXISTS`.)
+            //
+            // HAVING and the grouped PROJECTION are the per-GROUP programs: they
+            // run after the loop, against `params`, where every correlated slot
+            // is still an unfilled hole. Those two stay gather-side.
             if let Some(h) = &agg.having {
                 gather_ok(h)?;
             }

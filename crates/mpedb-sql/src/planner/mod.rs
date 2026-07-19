@@ -357,24 +357,34 @@ fn reject_correlated_in_aggregate(
                 && correlated[(pi - sub_base) as usize]
         })
     };
-    let leaks = agg
-        .group_by
-        .iter()
-        .any(|k| matches!(k, GroupKey::Expr(p) if reads_correlated(p)))
-        || agg
-            .aggs
-            .iter()
-            .any(|a| a.arg.as_ref().is_some_and(&reads_correlated))
-        || agg.having.as_ref().is_some_and(&reads_correlated)
+    // The line is PER-ROW vs PER-GROUP, not WHERE vs everything else (#97).
+    //
+    // `exec_aggregate`'s row loop evaluates the GROUP BY key programs, each
+    // aggregate's ARGUMENT and each aggregate's `FILTER (WHERE …)` against
+    // `row_params` — that row's scratch, with its correlated slots already
+    // filled by `correlated_survivors`. All three are therefore exactly as legal
+    // readers of a correlated slot as `post_filter` is, and "which row's
+    // correlation?" has a perfectly good answer: this one's.
+    //
+    // `HAVING` and the grouped `projection` run AFTER the loop, over the
+    // collapsed group, against `params` — where every correlated slot is still
+    // NULL. Those two stay refused: reading a hole there is the silent wrong
+    // answer this guard exists to prevent. (`SELECT <corr> AS x, count(*) …
+    // GROUP BY 1` is not that case: `lift_aggs` maps a select item that IS a
+    // group key onto the grouped tuple's `__g0`, so the projection reads the
+    // KEY the row loop computed, never the slot.)
+    let leaks = agg.having.as_ref().is_some_and(&reads_correlated)
         || sp
             .projection
             .iter()
             .any(|p| matches!(p, Projection::Expr { program, .. } if reads_correlated(program)));
     if leaks {
         return Err(bind_err(
-            "a correlated subquery in an aggregate query is only supported in WHERE — \
-             not in the SELECT list, an aggregate argument, GROUP BY, or HAVING, where \
-             the per-row correlation has no meaning once the rows are grouped",
+            "a correlated subquery in an aggregate query is only supported where it is \
+             evaluated PER ROW — the WHERE, a GROUP BY key, an aggregate argument or an \
+             aggregate's FILTER. In HAVING, or in a SELECT-list expression that is not \
+             itself a GROUP BY key, it runs over the collapsed group, where no single \
+             row's correlation applies",
         ));
     }
     Ok(())

@@ -548,31 +548,32 @@ result depends on it). (b) These are STATEMENT counts, as the original was.
 | category | before | after #97 | root cause |
 |---|---|---|---|
 | derived body uses a JOIN | 14 | 14 | **NOT a join gap.** All 13 distinct statements ALSO have `GROUP BY` (11) or `DISTINCT` (2) — Django's `.aggregate()` over `.annotate()`. Flattening the join closes **zero**; only MATERIALIZING the body does. |
-| correlated subquery in an aggregate query, outside `WHERE` | 10 | 10 | All 10 are `SELECT (corr subq) AS x, count(*) … GROUP BY <that expr>`. The GROUP BY key and the aggregate ARGUMENT are per-ROW positions, so they are computable; `HAVING` and the grouped projection are not. The current refusal treats all four alike. |
+| correlated subquery in an aggregate query, outside `WHERE` | 10 | **1** ✅ | All 10 are `SELECT (corr subq) AS x, count(*) … GROUP BY <that expr>`. CLOSED by #97: a GROUP BY key and an aggregate ARGUMENT are per-ROW positions — `exec_aggregate`'s row loop already evaluated them against that row's FILLED scratch, so only the planner refusal and its `validate` mirror had to move from "WHERE only" to "per-row positions only". The 1 left is a genuine per-GROUP read (a grouped SELECT-list expression that is not itself a key) and stays refused. |
 | unlifted `IN` subquery (position) | 9 | **0** ✅ | **7 of the 9 were `DELETE`/`UPDATE … WHERE pk IN (SELECT …)`** — the write planners simply never ran the lift. CLOSED by #97, no format bump. The 2 left are an `INSERT … VALUES ((SELECT …))` and a subquery in a `GROUP BY` key, both still refused (and both counted under "unsupported position" below). |
 | derived body has an aliased/renamed column | 7 | 7 | **Flattening these closes zero too.** Every one projects a correlated scalar/`EXISTS`/window under an alias and is consumed by an outer aggregate `FILTER`/argument, so a projection remap converts it into "correlated subquery in an aggregate argument" — the row above. |
 | derived body has `GROUP BY`/`HAVING` | 5 | 5 | Materialization. |
 | correlated `IN` ("rewrite as EXISTS") | 4 | **0** ✅ | CLOSED by #97. The refusal predated the per-row correlation fill and needed nothing new; `List` differs from `Exists` only in what `subplan_value` reduces the rows to. |
 | subquery in `HAVING` | 2 | 2 | Per-GROUP position. |
-| unsupported position | 2 | 2 | `INSERT … VALUES ((SELECT …))`; a subquery as a `GROUP BY` key. |
+| unsupported position | 2 | **1** | `INSERT … VALUES ((SELECT …))` remains. A subquery as a `GROUP BY` key is CLOSED — the lift now descends into `GROUP BY`, which is a per-row program. |
 | compound (`UNION`) derived body | 1 | 1 | Materialization. |
 | derived body has `ORDER BY` | 1 | 1 | Dropping it would change an unspecified output order — refused. |
-| **total** | **55** | **42** | |
+| **total** | **55** | **32** | statements. Test ERRORS over the same two label groups: 137 → 114. |
 
-**The honest remaining shape of this gap is two things, not nine:**
+**After #97 the remaining gap is ONE thing, not nine: materializing a derived
+table.** 28 of the 32 remaining statements are Django's
+`SELECT <agg> FROM (<body that groups, aggregates or DISTINCTs>) subquery`
+(`.aggregate()` over `.annotate()`). There is no flattening rewrite for them —
+the body changes cardinality, which is exactly what a splice cannot express.
+The primitive already exists in the engine: the recursive-CTE working table
+(`CTE_TABLE`, `exec/recursive.rs`) answers a scan of a sentinel table id from an
+in-memory row set, which is what a materialized derived table needs. Cost: plan
+the body once, resolve the derived alias to a synthetic `TableDef` carrying the
+body's output columns and types, and a `PLAN_FORMAT` bump for the new node.
 
-1. **Materialize a derived table** (26 statements: JOIN 14 + aliased 7 + GROUP
-   BY/HAVING 5, plus the 1 compound body). Every one is Django's
-   `SELECT <agg> FROM (<body that groups or aggregates>) subquery`. There is no
-   flattening rewrite for these — the body changes cardinality. The primitive
-   already exists in the engine: the recursive-CTE working table (`CTE_TABLE`,
-   `exec/recursive.rs`) answers a scan from an in-memory row set. Cost: a new
-   plan node and a `PLAN_FORMAT` bump.
-2. **Per-row correlation in the aggregate path** (10 statements): fill
-   correlated slots before the GROUP BY key and aggregate arguments are
-   evaluated, which `exec_aggregate` currently does not do (it discards the
-   per-row scratch `correlated_survivors` hands it). `HAVING` and the grouped
-   projection must stay refused — they run after the collapse.
+The four stragglers: 2 × subquery in `HAVING`, 1 × `INSERT … VALUES ((SELECT
+…))`, 1 × a correlated subquery in a grouped SELECT-list expression that is not
+itself a GROUP BY key. All three positions are genuinely per-GROUP or per-VALUE
+holes and are refused by name.
 
 **Not counted against mpedb:** the two `delete` FAILs (`test_fast_delete_all`,
 `test_fast_delete_instance_set_pk_none`) are contamination, not behaviour —
