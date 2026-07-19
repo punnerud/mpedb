@@ -262,15 +262,12 @@ fn exec_one(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome,
             s.query(sqltext, params)?;
             Ok(Outcome::Control)
         }
-        // DDL (CREATE/DROP/ALTER) runs only in mpedb's autocommit path; the
-        // write-session parser rejects it. Surface a clear reason rather than
-        // the engine's bare "expected a statement", and never fake it by
-        // committing mid-transaction (that would silently break rollback).
-        Kind::Ddl if c.txn.is_some() => Err(DbError::Unsupported(
-            "DDL (CREATE/DROP/ALTER) inside an explicit transaction is not supported by mpedb; \
-             run it in autocommit, outside BEGIN/COMMIT"
-                .into(),
-        )),
+        // DDL (CREATE/DROP/ALTER) routes like any other statement (#95): to the
+        // open WriteSession's txn when one is active — where it commits/rolls
+        // back atomically with the transaction's DML — else to the autocommit
+        // facade. Python's sqlite3 opens an implicit transaction on the first
+        // DML, so a `CREATE TABLE` after an `INSERT` (and every `executescript`)
+        // lands here with `c.txn` set.
         _ => {
             let res = if let Some(s) = c.txn.as_mut() {
                 s.query(sqltext, params)
@@ -680,6 +677,17 @@ unsafe fn prepare_common(
             | sql::Kind::Ddl
             | sql::Kind::Pragma
     ) || (matches!(kind, sql::Kind::Read) && introspect::references_sqlite_master(first));
+
+    // #95: with a transaction open, a compilable statement may reference a
+    // table this session CREATED / ALTERed but has not committed — which
+    // `prepare_detached` (committed schema) cannot see, and would reject as
+    // "unknown table". Defer validation to execution, where the statement
+    // compiles against the session's OWN schema view. Errors then surface at
+    // `step` instead of `prepare` — still a clean DB error for the consumer,
+    // and the only way to honor uncommitted in-transaction DDL (Python's
+    // sqlite3 opens an implicit transaction on the first DML, so a later CREATE
+    // and every statement touching the new table land here).
+    let skip_validation = skip_validation || c.txn.is_some();
 
     // Validate compilable statements now (surface syntax/bind errors at
     // prepare, as sqlite does), WITHOUT executing or publishing a plan.
