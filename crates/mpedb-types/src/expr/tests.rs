@@ -32,9 +32,14 @@ fn host_call_dispatches_codec_roundtrips_and_needs_a_resolver() {
         p.eval_host(&[], &[Value::Int(41)], Some(&host)).unwrap(),
         Value::Int(42)
     );
-    // With NO resolver, the opcode errors defensively rather than panicking —
-    // the executor only reaches this program on the host-aware path.
-    assert!(matches!(p.eval(&[], &[Value::Int(1)]), Err(Error::Internal(_))));
+    // With NO resolver the opcode refuses — and refuses as a documented SCOPE
+    // limit (`Unsupported`, naming the function), never as `Internal`, which
+    // renders "internal error (bug in mpedb)" for what is a known boundary.
+    let e = p.eval(&[], &[Value::Int(1)]).unwrap_err();
+    assert!(
+        matches!(&e, Error::Unsupported(m) if m.contains("plus1") && m.contains("not in scope")),
+        "expected a clean out-of-scope refusal, got {e:?}"
+    );
     // An unregistered name/arity surfaces the resolver's error, not a panic.
     let q = prog(
         vec![Instr::PushParam(0), Instr::HostCall(0, 1)],

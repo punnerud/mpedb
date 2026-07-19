@@ -96,8 +96,40 @@ pub type HostScalarFn = Arc<dyn Fn(&[Value]) -> Result<Value> + Send + Sync>;
 /// into a flat vector once per UDF-bearing statement keeps the registry lock off
 /// the per-row hot path; the arity set is tiny (Django registers ~30), so the
 /// linear name/arity lookup per call is negligible.
-struct HostFnTable {
+pub(crate) struct HostFnTable {
     fns: Vec<(String, i32, HostScalarFn)>,
+}
+
+/// Run arbitrary CALLER code and turn a panic into an error instead of letting
+/// it unwind through the engine (design/DESIGN-UDF.md §Safety).
+///
+/// A host UDF is caller code executing inside a statement — and, on the write
+/// path, inside an open write transaction holding the single writer lock. An
+/// unwind from there is survivable (`WriteTxn::drop` releases the writer lock,
+/// COW means nothing committed is touched, and a ring leader that dies mid-round
+/// is exactly the case `recover_orphans` handles) but it is not *clean*: the
+/// statement's partial effects would be discarded by a stack unwind rather than
+/// by the executor's own savepoint/poison contract, and a `WriteSession` living
+/// on a C-API handle is not dropped by the shim's `catch_unwind` at all — it
+/// would survive with a torn statement and no poison flag.
+///
+/// So the panic is caught HERE, at the one boundary where caller code is
+/// invoked, and becomes an ordinary statement error. Every existing failure path
+/// then applies unchanged: the ring leader rolls its per-intent savepoint back,
+/// `WriteSession::run` poisons a session whose statement was partially applied,
+/// and the writer lock is released by the normal commit/abort path.
+fn guard_panic<T>(what: &str, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(r) => r,
+        Err(p) => {
+            let msg = p
+                .downcast_ref::<&str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| p.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "panic".to_string());
+            Err(Error::Unsupported(format!("{what} panicked: {msg}")))
+        }
+    }
 }
 
 impl mpedb_types::HostFns for HostFnTable {
@@ -114,7 +146,7 @@ impl mpedb_types::HostFns for HostFnTable {
             .ok_or_else(|| {
                 Error::Unsupported(format!("host function {name}/{argc} is not registered"))
             })?;
-        f(args)
+        guard_panic(&format!("host function {name}/{argc}"), || f(args))
     }
 }
 
@@ -127,8 +159,34 @@ pub type HostAggFactory = Arc<dyn Fn() -> Box<dyn mpedb_types::HostAggState> + S
 
 /// The aggregate twin of [`HostFnTable`]: a per-execution snapshot of the
 /// registry, handed to the executor as a [`mpedb_types::HostAggs`] resolver.
-struct HostAggTable {
+pub(crate) struct HostAggTable {
     aggs: Vec<(String, i32, HostAggFactory)>,
+}
+
+/// A host aggregate state with the same panic boundary the scalars get
+/// ([`guard_panic`]): `xStep`/`xFinal` are caller code, and neither may unwind
+/// into the engine.
+struct GuardedAggState {
+    name: String,
+    inner: Box<dyn mpedb_types::HostAggState>,
+}
+
+impl mpedb_types::HostAggState for GuardedAggState {
+    fn step(&mut self, args: &[Value]) -> Result<()> {
+        let name = &self.name;
+        let inner = &mut self.inner;
+        guard_panic(&format!("host aggregate {name}() step"), || {
+            inner.step(args)
+        })
+    }
+    fn finish(self: Box<Self>) -> Result<Value> {
+        let me = *self;
+        let name = me.name;
+        let inner = me.inner;
+        guard_panic(&format!("host aggregate {name}() finish"), move || {
+            inner.finish()
+        })
+    }
 }
 
 impl mpedb_types::HostAggs for HostAggTable {
@@ -142,7 +200,11 @@ impl mpedb_types::HostAggs for HostAggTable {
             .ok_or_else(|| {
                 Error::Unsupported(format!("host aggregate {name}/{argc} is not registered"))
             })?;
-        Ok(f())
+        let inner = guard_panic(&format!("host aggregate {name}() factory"), || Ok(f()))?;
+        Ok(Box::new(GuardedAggState {
+            name: name.to_string(),
+            inner,
+        }))
     }
 }
 
@@ -605,6 +667,20 @@ impl Database {
         HostAggTable {
             aggs: g.iter().map(|((n, a), f)| (n.clone(), *a, f.clone())).collect(),
         }
+    }
+
+    /// The closures ONE statement needs, or `None` when its plan calls no host
+    /// UDF — the single gate every execution path (read, write, session, ring
+    /// leader) goes through, so "which executions carry host closures" has one
+    /// answer in one place.
+    ///
+    /// Snapshotting only for a `contains_host_call()` plan keeps the registry
+    /// locks entirely off the hot path of every ordinary statement: a database
+    /// with no UDFs registered, or a statement that calls none, does exactly what
+    /// it did before.
+    pub(crate) fn host_tables(&self, plan: &CompiledPlan) -> Option<(HostFnTable, HostAggTable)> {
+        plan.contains_host_call()
+            .then(|| (self.host_fn_table(), self.host_agg_table()))
     }
 
     /// Compile `sql` with this database's RLS policies injected (loaded from the
@@ -1148,16 +1224,14 @@ impl Database {
             // Reads never touch the writer lock or the ring.
             let mut partial = false;
             // Host UDF closures for the executor, only for a plan that calls one
-            // (design/DESIGN-UDF.md). Snapshot once; kept alive for the whole scan.
-            let has_host = plan.contains_host_call();
-            let host_table = has_host.then(|| self.host_fn_table());
+            // (design/DESIGN-UDF.md). Snapshot once; kept alive for the whole
+            // scan. Scalars and aggregates ride ONE gate — a plan naming a host
+            // aggregate reports `contains_host_call` too.
+            let tables = self.host_tables(plan);
             let host: Option<&dyn mpedb_types::HostFns> =
-                host_table.as_ref().map(|t| t as &dyn mpedb_types::HostFns);
-            // Stage 2: the aggregate factories ride the SAME gate — a plan naming
-            // a host aggregate reports `contains_host_call` too.
-            let agg_table = has_host.then(|| self.host_agg_table());
+                tables.as_ref().map(|(f, _)| f as &dyn mpedb_types::HostFns);
             let host_aggs: Option<&dyn mpedb_types::HostAggs> =
-                agg_table.as_ref().map(|t| t as &dyn mpedb_types::HostAggs);
+                tables.as_ref().map(|(_, a)| a as &dyn mpedb_types::HostAggs);
             let r = self.engine.begin_read()?;
             // Staleness check UNDER THE SAME PIN that scans the rows (§4.3):
             // a policy edit that landed since compile invalidates the plan.
@@ -1219,7 +1293,16 @@ impl Database {
         // wait/wake round-trips would only add latency — block directly (the
         // lock holder still drains any intents, so mixed deployments stay
         // live).
-        let use_ring = ring_exec::ring_enabled(self);
+        //
+        // One plan class NEVER rides the ring: a plan that calls a host UDF
+        // (design/DESIGN-UDF.md). The ring is a cross-PROCESS queue — a leader
+        // loads an intent's plan BY HASH FROM THE SHARED REGISTRY, and a
+        // host-call plan is deliberately never published there, so an enqueued
+        // one could only come back as `UnknownPlan`. More importantly the
+        // closures are connection-local: no other process may run our UDF, and
+        // we may not run theirs. Leading our own statement keeps it in the
+        // process that owns the closures.
+        let use_ring = ring_exec::ring_enabled(self) && !plan.contains_host_call();
         let ring = self.engine.ring();
         let enqueued = if use_ring {
             hash.and_then(|h| {
@@ -1642,8 +1725,21 @@ impl WriteSession<'_> {
         // session that has applied no DDL this equals the committed schema.
         let schema = self.txn.schema_bundle();
         let mut partial = false;
+        // Host UDF closures for THIS statement (design/DESIGN-UDF.md). This is
+        // the path CPython's implicit transaction takes: after the first DML,
+        // every statement — reads included — arrives here, so a UDF that
+        // resolves in autocommit must resolve here too or Django breaks the
+        // moment it stops committing between statements. `None` for a plan with
+        // no host call, which then runs on the bare `&mut WriteTxn` exactly as
+        // before.
+        let tables = self.db.host_tables(plan);
+        let host: Option<&dyn mpedb_types::HostFns> =
+            tables.as_ref().map(|(f, _)| f as &dyn mpedb_types::HostFns);
+        let aggs: Option<&dyn mpedb_types::HostAggs> =
+            tables.as_ref().map(|(_, a)| a as &dyn mpedb_types::HostAggs);
+        let mut ctx = exec::WriteCtx::new(&mut self.txn, host, aggs);
         let res = exec::exec_stmt_triggered(
-            &mut self.txn,
+            &mut ctx,
             &schema,
             plan,
             &full,

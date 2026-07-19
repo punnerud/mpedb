@@ -97,20 +97,21 @@ pub(super) fn output_collations(
 /// return `Error::Internal` if ever hit.
 pub(crate) trait TxnCtx {
     /// Host-registered scalar UDFs in scope for this execution (design/DESIGN-UDF.md),
-    /// or `None` where none are (the default). Read-only executions carry them
-    /// (see [`ReadCtx`]); the write path returns `None` for stage 1, so a host UDF
-    /// in a write statement's expression surfaces a clean "not in scope" error
-    /// rather than being silently dropped. Every eval site threads this through
-    /// [`ExprProgram::eval_filter_host`]/`eval_host` so a plan that calls a UDF
-    /// resolves its closure.
+    /// or `None` where none are (the default). Both native contexts carry them —
+    /// [`ReadCtx`] on the read path and [`WriteCtx`] on the write path — so a UDF
+    /// called from DML, or from a read inside an open write transaction, resolves
+    /// the same closure the read path would. A context that structurally cannot
+    /// carry them (the streaming read path, the sqlite-backed contexts) keeps the
+    /// `None` default, and the eval site then refuses with a clean "not in scope"
+    /// error rather than silently dropping the call. Every eval site threads this
+    /// through [`ExprProgram::eval_filter_host`]/`eval_host`.
     fn host_fns(&self) -> Option<&dyn HostFns> {
         None
     }
     /// Host-registered AGGREGATES in scope for this execution
     /// (design/DESIGN-UDF.md stage 2), or `None`. Same scope rule as
-    /// [`host_fns`](Self::host_fns): read-only executions carry them, the write
-    /// path returns `None`, so a host aggregate in a write statement surfaces a
-    /// clean "not in scope" error rather than being silently dropped.
+    /// [`host_fns`](Self::host_fns): both native contexts carry them, everything
+    /// else refuses cleanly.
     fn host_aggs(&self) -> Option<&dyn mpedb_types::HostAggs> {
         None
     }
@@ -307,6 +308,100 @@ impl TxnCtx for WriteTxn<'_> {
     }
     fn charge_work(&self, n: u64, which: &dyn Fn() -> String) -> Result<()> {
         WriteTxn::charge_work(self, n, which)
+    }
+}
+
+/// A [`WriteTxn`] plus the connection's host-UDF closures — the WRITE-path twin
+/// of [`ReadCtx`] (design/DESIGN-UDF.md).
+///
+/// `impl TxnCtx for WriteTxn` cannot carry them (the type lives in
+/// `mpedb-core`, which knows nothing about a connection's UDF registry), so the
+/// facade wraps the transaction for the duration of ONE statement whose plan
+/// `contains_host_call()`. Every row operation delegates to the transaction
+/// unchanged — the wrapper adds resolution, never behaviour: a statement with no
+/// host call still runs on the bare `&mut WriteTxn`, byte for byte as before.
+///
+/// The closures reach the executor by value-passing only: `HostFns::call` gets
+/// the already-evaluated argument `Value`s and returns one `Value`, and
+/// `HostAggs::create` mints a state stepped with the same. Neither is handed the
+/// transaction, the snapshot, the schema, or any engine handle, so a host UDF on
+/// the write path sees exactly what it sees on the read path — its arguments.
+pub(crate) struct WriteCtx<'a, 'e> {
+    pub txn: &'a mut WriteTxn<'e>,
+    pub host: Option<&'a dyn HostFns>,
+    pub aggs: Option<&'a dyn mpedb_types::HostAggs>,
+}
+
+impl<'a, 'e> WriteCtx<'a, 'e> {
+    pub(crate) fn new(
+        txn: &'a mut WriteTxn<'e>,
+        host: Option<&'a dyn HostFns>,
+        aggs: Option<&'a dyn mpedb_types::HostAggs>,
+    ) -> WriteCtx<'a, 'e> {
+        WriteCtx { txn, host, aggs }
+    }
+}
+
+impl TxnCtx for WriteCtx<'_, '_> {
+    fn host_fns(&self) -> Option<&dyn HostFns> {
+        self.host
+    }
+    fn host_aggs(&self) -> Option<&dyn mpedb_types::HostAggs> {
+        self.aggs
+    }
+    fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
+        WriteTxn::get_by_pk(self.txn, table, pk)
+    }
+    fn get_by_index(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        values: &[Value],
+    ) -> Result<Option<Vec<Value>>> {
+        WriteTxn::get_by_index(self.txn, table, index_no, values)
+    }
+    fn scan_by_index(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        values: &[Value],
+    ) -> Result<Vec<Vec<Value>>> {
+        WriteTxn::scan_by_index(self.txn, table, index_no, values)
+    }
+    fn scan_by_index_range(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<Vec<Vec<Value>>> {
+        WriteTxn::scan_by_index_range(self.txn, table, index_no, lo, hi)
+    }
+    fn scan_rows_raw(
+        &mut self,
+        table: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<Vec<Vec<Value>>> {
+        WriteTxn::scan_rows_raw(self.txn, table, lo, hi)
+    }
+    fn insert_row(&mut self, table: u32, values: &[Value]) -> Result<()> {
+        WriteTxn::insert_row(self.txn, table, values)
+    }
+    fn next_rowid(&mut self, table: u32, _pk_col: u16) -> Result<i64> {
+        WriteTxn::next_rowid(self.txn, table)
+    }
+    fn update_by_pk(&mut self, table: u32, new_values: &[Value]) -> Result<bool> {
+        WriteTxn::update_by_pk(self.txn, table, new_values)
+    }
+    fn delete_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<bool> {
+        WriteTxn::delete_by_pk(self.txn, table, pk)
+    }
+    fn fts_prefix(&mut self, table: u32, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        WriteTxn::fts_prefix(self.txn, table, prefix)
+    }
+    fn charge_work(&self, n: u64, which: &dyn Fn() -> String) -> Result<()> {
+        WriteTxn::charge_work(self.txn, n, which)
     }
 }
 
@@ -1545,7 +1640,7 @@ fn exec_stmt_rest(
                             }
                         }
                         if let Some(proj) = returning {
-                            out.push(project_row(proj, &row, params)?);
+                            out.push(project_row(proj, &row, params, ctx.host_fns())?);
                         }
                         // AFTER INSERT FOR EACH ROW triggers fire on the row just
                         // written, on the SAME txn (DESIGN-TRIGGERS §4.1/§4.3). A
@@ -1645,7 +1740,12 @@ fn exec_stmt_rest(
                                 let mut both = existing.clone();
                                 both.extend_from_slice(&row);
                                 if let Some(f) = filter {
-                                    match f.eval_filter(&mut Vec::new(), &both, params) {
+                                    match f.eval_filter_host(
+                                        &mut Vec::new(),
+                                        &both,
+                                        params,
+                                        ctx.host_fns(),
+                                    ) {
                                         Ok(true) => {}
                                         // NULL and FALSE both skip: SQL needs
                                         // exactly TRUE to act.
@@ -1658,7 +1758,7 @@ fn exec_stmt_rest(
                                 }
                                 let mut new_row = existing;
                                 for (c, program) in set {
-                                    let v = program.eval(&both, params)?;
+                                    let v = program.eval_host(&both, params, ctx.host_fns())?;
                                     new_row[*c as usize] = v;
                                 }
                                 if let Err(e) = ctx.update_by_pk(*table, &new_row) {
@@ -1671,7 +1771,7 @@ fn exec_stmt_rest(
                                 }
                                 written += 1;
                                 if let Some(proj) = returning {
-                                    out.push(project_row(proj, &new_row, params)?);
+                                    out.push(project_row(proj, &new_row, params, ctx.host_fns())?);
                                 }
                             }
                         }
@@ -1722,7 +1822,7 @@ fn exec_stmt_rest(
                         let slot = new_row
                             .get_mut(*c as usize)
                             .ok_or_else(|| internal("SET column"))?;
-                        *slot = program.eval(old, params)?;
+                        *slot = program.eval_host(old, params, ctx.host_fns())?;
                     }
                     Ok(new_row)
                 })();
@@ -1772,7 +1872,7 @@ fn exec_stmt_rest(
                         // RETURNING on UPDATE projects the POST-image: SQL
                         // returns the row as it now is, not as it was.
                         if let Some(proj) = returning {
-                            out.push(project_row(proj, &new_row, params)?);
+                            out.push(project_row(proj, &new_row, params, ctx.host_fns())?);
                         }
                         // AFTER UPDATE FOR EACH ROW triggers fire on the updated
                         // row, on the SAME txn (DESIGN-TRIGGERS §4.1): NEW = the
@@ -1850,7 +1950,7 @@ fn exec_stmt_rest(
                         // RETURNING on DELETE projects the row as it WAS: there
                         // is no post-image to show.
                         if let Some(proj) = returning {
-                            out.push(project_row(proj, old, params)?);
+                            out.push(project_row(proj, old, params, ctx.host_fns())?);
                         }
                         // AFTER DELETE FOR EACH ROW triggers fire on the deleted
                         // row, on the SAME txn (DESIGN-TRIGGERS §4.1): only OLD is
@@ -2030,7 +2130,16 @@ fn fire_row_triggers(
 }
 
 /// Project one written row through a `RETURNING` clause.
-fn project_row(proj: &[Projection], row: &[Value], params: &[Value]) -> Result<Vec<Value>> {
+///
+/// `host` carries the connection's host UDF closures (design/DESIGN-UDF.md);
+/// `RETURNING plus1(x)` is a write-path expression like any other and resolves
+/// them exactly as a SELECT list would.
+fn project_row(
+    proj: &[Projection],
+    row: &[Value],
+    params: &[Value],
+    host: Option<&dyn HostFns>,
+) -> Result<Vec<Value>> {
     let mut out = Vec::with_capacity(proj.len());
     for p in proj {
         out.push(match p {
@@ -2038,7 +2147,7 @@ fn project_row(proj: &[Projection], row: &[Value], params: &[Value]) -> Result<V
                 .get(*i as usize)
                 .cloned()
                 .ok_or_else(|| internal("RETURNING column out of row bounds"))?,
-            Projection::Expr { program, .. } => program.eval(row, params)?,
+            Projection::Expr { program, .. } => program.eval_host(row, params, host)?,
         });
     }
     Ok(out)

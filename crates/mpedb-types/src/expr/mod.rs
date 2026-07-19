@@ -574,9 +574,17 @@ impl ExprProgram {
                     // validate proved depth >= argc, so the split holds.
                     let at = stack.len() - argc as usize;
                     let args: Vec<Value> = stack.split_off(at);
+                    // A context that carries no host closures (the streaming
+                    // read path, the sqlite-backed contexts, a CHECK program) is
+                    // a KNOWN LIMIT, not an engine bug: refuse with a message
+                    // that names it — `Unsupported`, never `Internal`, which
+                    // renders as "internal error (bug in mpedb)" and tells the
+                    // user to file a bug against a documented scope boundary.
+                    // Worded like the host-aggregate twin in
+                    // `mpedb::exec::aggregate::new_accum`.
                     let host = host.ok_or_else(|| {
-                        Error::Internal(format!(
-                            "host function `{name}` called with no host functions in scope"
+                        Error::Unsupported(format!(
+                            "host function {name}() is not in scope for this execution"
                         ))
                     })?;
                     stack.push(host.call(name, &args)?);

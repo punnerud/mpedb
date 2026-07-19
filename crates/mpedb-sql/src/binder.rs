@@ -579,6 +579,18 @@ impl<'a> Binder<'a> {
             // `any` is the loose-type escape (#23): every runtime-typed value
             // belongs, so a statically-typed assignment is never a type error.
             Some(_) if col.ty == ColumnType::Any => Ok(b),
+            // The mirror image: a DYNAMICALLY-typed right-hand side (`any` — a
+            // host UDF's result, design/DESIGN-UDF.md, or a typeless column) has
+            // no static type to compare, exactly as in `unify_operands`, which
+            // already lets `any` meet every concrete type and settles it at
+            // runtime. Assignment settles it at runtime too, and settles it
+            // EXACTLY: the engine validates every written value against its
+            // column (`validate_row_in` — `fits`), so `SET n = my_udf(x)` with a
+            // text result is a clean `TypeMismatch` on the row, never a wrong
+            // value in an int64 column. Refusing at compile time instead would
+            // reject `UPDATE … SET col = <udf>(…)` outright, which is the write
+            // half of the UDF surface Django uses.
+            Some(ColumnType::Any) => Ok(b),
             Some(ColumnType::Int64) if col.ty == ColumnType::Float64 => {
                 fold_maybe(BExpr::Unary(BUnOp::ToFloat, Box::new(b)), self.suppress_fold)
             }
