@@ -334,12 +334,19 @@ fn column_defaults_store_what_sqlite_stores() {
     assert_same(setup, "SELECT SUM(nn), SUM(i) FROM d");
 
     // `INSERT … SELECT` takes the defaults for the columns it does not name.
-    // (Through a real FROM: a FROM-less `INSERT … SELECT 4, 77` hits an
-    // unrelated pre-existing bug — `Corrupt("table id 4294967295 out of
-    // range")`, the dual-table sentinel leaking into the insert path.)
     let mut with_sel: Vec<&str> = setup.to_vec();
     with_sel.push("INSERT INTO d (id, i) SELECT id + 10, 77 FROM d WHERE id = 1");
     assert_same(&with_sel, "SELECT id, i, r, s, z, nd, nn FROM d ORDER BY id");
+
+    // …and through a FROM-less source. This used to report `Corrupt("table id
+    // 4294967295 out of range")`: the INSERT footprint inserted the source's
+    // table id unconditionally, and a FROM-less SELECT's "table" is the DUAL
+    // sentinel (u32::MAX), which the sparse TableSet rightly rejects. The
+    // SELECT footprint arm always guarded the sentinel; the INSERT arm now
+    // does too — a FROM-less source reads no catalog table at all.
+    let mut fromless: Vec<&str> = setup.to_vec();
+    fromless.push("INSERT INTO d (id, i) SELECT 20, 77");
+    assert_same(&fromless, "SELECT id, i, r, s, z, nd, nn FROM d ORDER BY id");
 }
 
 /// A `DEFAULT` whose type does not match the declared column type fails the

@@ -208,11 +208,22 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
             };
             // INSERT … SELECT reads its source table(s); record them so
             // optimistic-concurrency validation and RLS stamping see the reads.
+            // Same sentinel rule as the SELECT arm above: a FROM-less source
+            // (`INSERT INTO t SELECT 4, 77` — the DUAL sentinel) and the
+            // recursive-CTE working table read no catalog table, so neither
+            // enters the set. Without the guard, `checked_table(u32::MAX)`
+            // reports Corrupt for a perfectly well-formed statement.
             let mut tables_read = TableSet::new();
             if let Some(sel) = from_select {
-                tables_read.insert(checked_table(sel.plan.table, schema)?);
+                if sel.plan.table != crate::plan::DUAL_TABLE
+                    && sel.plan.table != crate::plan::CTE_TABLE
+                {
+                    tables_read.insert(checked_table(sel.plan.table, schema)?);
+                }
                 for j in &sel.plan.joins {
-                    tables_read.insert(checked_table(j.table, schema)?);
+                    if j.table != crate::plan::CTE_TABLE {
+                        tables_read.insert(checked_table(j.table, schema)?);
+                    }
                 }
             }
             let mut tables_written = TableSet::new();
