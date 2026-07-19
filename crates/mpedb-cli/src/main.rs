@@ -31,8 +31,10 @@ use util::{parse_params, usage, CliResult, Failure};
 const USAGE: &str = "\
 usage: mpedb <command> [args]
          mpedb <path> [SQL [param ...]]           sqlite3-shaped: open a repl on a
-         config.toml / .mpedb file / sqlite .db (sidecar mirror), or run one
-         statement; `mpedb checkpoint <sqlite.db>` pushes sidecar writes back
+         config.toml / .mpedb file / sqlite .db, or run one statement. A .db
+         opens as a delta-WAL overlay by default (changes in <db>.overlay.mpedb,
+         zero import); `mpedb checkpoint <db>` folds them back. `--mirror` uses
+         the full sidecar import instead; `--direct` is read-only, zero-setup
 
 
   exec    <target> <SQL> [param ...]       run one statement
