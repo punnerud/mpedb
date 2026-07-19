@@ -88,6 +88,21 @@ pub fn is_blank(sql: &str) -> bool {
     !any
 }
 
+/// The statement with leading whitespace AND comments removed. sqlite's parser
+/// skips leading trivia itself; mpedb's does not (a `-- comment\nINSERT …`
+/// is a parse error at the `--`), so the shim strips it before the engine
+/// sees the text. Comments elsewhere in the statement remain the engine's
+/// business.
+pub fn strip_leading_trivia(sql: &str) -> &str {
+    let mut first = sql.len();
+    scan_code(sql, |i, c| {
+        if first == sql.len() && !c.is_ascii_whitespace() {
+            first = i;
+        }
+    });
+    &sql[first..]
+}
+
 /// A character that may appear in a named parameter's body (after the sigil),
 /// matching sqlite's `IdChar`: ASCII alphanumerics, `_`, and any byte ≥ 0x80 (so
 /// UTF-8 identifier names bind). `$` is deliberately excluded here (it is only a
@@ -307,13 +322,16 @@ pub enum Kind {
     /// NOT validate them with `prepare_detached` (which only compiles queries):
     /// it defers them to execution, where `Database::query` applies the DDL.
     Ddl,
+    /// VACUUM / ANALYZE: storage maintenance mpedb has no equivalent work for
+    /// (freelist page reuse; no planner statistics). Accepted as a no-op.
+    Maintenance,
     /// Everything else (any unrecognized leading word) — hand straight to the
     /// engine, validating at prepare so typos surface there.
     Other,
 }
 
 fn first_word(sql: &str) -> String {
-    let t = sql.trim_start();
+    let t = strip_leading_trivia(sql).trim_start();
     t.chars()
         .take_while(|c| c.is_ascii_alphabetic())
         .flat_map(|c| c.to_lowercase())
@@ -321,7 +339,7 @@ fn first_word(sql: &str) -> String {
 }
 
 fn second_word(sql: &str) -> String {
-    let t = sql.trim_start();
+    let t = strip_leading_trivia(sql).trim_start();
     let rest = &t[first_word(t).len().min(t.len())..];
     let rest = rest.trim_start();
     rest.chars()
@@ -365,10 +383,16 @@ pub fn classify(sql: &str) -> Kind {
         "select" | "values" | "with" | "explain" => Kind::Read,
         // PRAGMA is answered by the shim's introspection, not the engine.
         "pragma" => Kind::Pragma,
-        // Exactly what mpedb applies via `parse_ddl`/`apply_ddl`. Others that
-        // happen to be "DDL-ish" (VACUUM/ANALYZE/REINDEX) are left to `Other`,
-        // so they validate-and-refuse at prepare like any unsupported statement.
+        // Exactly what mpedb applies via `parse_ddl`/`apply_ddl`. REINDEX is
+        // left to `Other`, so it validates-and-refuses at prepare like any
+        // unsupported statement.
         "create" | "drop" | "alter" => Kind::Ddl,
+        // Storage maintenance with nothing to maintain: mpedb reclaims pages
+        // through its freelist (no fragmenting pager to VACUUM) and its
+        // planner keeps no ANALYZE statistics. Consumers run these as routine
+        // housekeeping, so they are accepted as no-ops — no rows, no changes —
+        // rather than refused.
+        "vacuum" | "analyze" => Kind::Maintenance,
         _ => Kind::Other,
     }
 }
