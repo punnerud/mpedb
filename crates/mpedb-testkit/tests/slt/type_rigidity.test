@@ -48,17 +48,17 @@ INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 'x', 2.5, true, 'txt', x'ab')
 statement error int64
 INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 1.5, 2.5, true, 'txt', x'ab')
 
-statement error cannot be inserted into column
-INSERT INTO t (id, i, f, b, s, bl) VALUES (2, true, 2.5, true, 'txt', x'ab')
-
 statement error type text
 INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 1, 2.5, true, 5, x'ab')
 
 statement error type bool
-INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 1, 2.5, 1, 'txt', x'ab')
-
-statement error type bool
 INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 1, 2.5, 't', 'txt', x'ab')
+
+# A non-0/1 integer into a bool column IS still refused: sqlite would store 2
+# and hand 2 back, which mpedb's rigid bool cannot represent. Truthy-testing it
+# to TRUE would be a wrong answer on read-back, so mpedb refuses cleanly.
+statement error cannot be inserted into column
+INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 1, 2.5, 2, 'txt', x'ab')
 
 statement error type float64
 INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 1, 'x', true, 'txt', x'ab')
@@ -73,6 +73,30 @@ INSERT INTO t (id, i, f, b, s, bl) VALUES (2, 1, 2.5, true, x'00', x'ab')
 statement error type timestamp
 INSERT INTO t (id, ts) VALUES (2, 5)
 
+# ---- the int/bool bridge (sqlite has no boolean type) ------------------------
+
+# sqlite stores a boolean AS the integer 0/1, so `true` in an int column is 1
+# and `1` in a bool column is TRUE. Both directions are EXACT, and mpedb follows
+# them; the rows are removed again so the rest of the file is unaffected.
+statement ok
+INSERT INTO t (id, i, f, b, s, bl) VALUES (90, true, 2.5, 1, 'txt', x'ab')
+
+statement ok
+INSERT INTO t (id, i, f, b, s, bl) VALUES (91, false, 2.5, 0, 'txt', x'ab')
+
+query I nosort
+SELECT i FROM t WHERE id = 90
+----
+1
+
+query T nosort
+SELECT b FROM t WHERE id = 91
+----
+false
+
+statement ok
+DELETE FROM t WHERE id >= 90
+
 # ---- comparison type rejections ---------------------------------------------
 
 statement error cannot compare
@@ -81,11 +105,25 @@ SELECT id FROM t WHERE s = 1
 statement error cannot compare
 SELECT id FROM t WHERE i = 'x'
 
-statement error cannot compare
+# bool vs int compares by the bool's integer value (Django's `flag = 1`), so
+# these are legal and agree with sqlite. Row 1 is (i = 10, b = true).
+query I nosort
 SELECT id FROM t WHERE b = 1
+----
+1
 
-statement error cannot compare
+query I nosort
+SELECT id FROM t WHERE b = 0
+----
+
+# `b = 2` is FALSE, never TRUE — the int is not truthy-tested here.
+query I nosort
+SELECT id FROM t WHERE b = 2
+----
+
+query I nosort
 SELECT id FROM t WHERE i = true
+----
 
 statement error cannot compare
 SELECT id FROM t WHERE ts = 5
@@ -104,11 +142,24 @@ SELECT id FROM t WHERE s + s = 'xx'
 statement error cannot negate text
 SELECT id FROM t WHERE -s < 'a'
 
-statement error NOT requires a boolean
+# A non-boolean in a boolean position is truthy-tested like sqlite, not refused.
+# Row 1 has i = 10 (TRUE) and b = true.
+query I nosort
 SELECT id FROM t WHERE NOT i
+----
 
-statement error AND/OR requires boolean
+query I nosort
 SELECT id FROM t WHERE i AND b
+----
+1
+
+query I nosort
+SELECT id FROM t WHERE s
+----
+
+query I nosort
+SELECT id FROM t WHERE bl
+----
 
 # LIKE coerces a numeric operand to text (sqlite default) rather than refusing:
 # `i LIKE 'x'` runs as `CAST(i AS TEXT) LIKE 'x'` and matches nothing here.

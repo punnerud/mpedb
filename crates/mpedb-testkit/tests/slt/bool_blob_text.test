@@ -209,8 +209,26 @@ SELECT id FROM t WHERE flag + 1 = 2
 statement error cannot negate
 SELECT id FROM t WHERE -flag
 
-statement error cannot compare
+# sqlite has no boolean type — a bool column IS the integers 0/1, which is why
+# Django writes `WHERE "t"."flag" = 1` for a BooleanField. mpedb bridges the two
+# by the bool's integer VALUE, so these agree with sqlite exactly.
+query I nosort
 SELECT id FROM t WHERE flag = 1
+----
+1
+4
+
+query I nosort
+SELECT id FROM t WHERE flag = 0
+----
+2
+5
+
+# `flag = 2` is FALSE, not TRUE: the column only ever holds 0 or 1, so this is
+# what sqlite answers too. The int is NOT truthy-tested here.
+query I nosort
+SELECT id FROM t WHERE flag = 2
+----
 
 statement error LIKE requires text
 SELECT id FROM t WHERE data LIKE 'x'
