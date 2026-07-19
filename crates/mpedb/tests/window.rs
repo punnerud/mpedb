@@ -390,8 +390,12 @@ fn stage1_refusals() {
     )
     .to_lowercase()
     .contains("frame"));
-    // Offset/value functions are stage 2.
-    assert!(err("SELECT lag(val) OVER (ORDER BY val) FROM t")
+    // lag/lead/first_value/last_value/nth_value ship in stage 2 (see
+    // `window2.rs`); the remaining window functions do not yet.
+    assert!(err("SELECT ntile(4) OVER (ORDER BY val) FROM t")
+        .to_lowercase()
+        .contains("stage 2"));
+    assert!(err("SELECT percent_rank() OVER (ORDER BY val) FROM t")
         .to_lowercase()
         .contains("stage 2"));
     // A window may not appear in WHERE.

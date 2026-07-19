@@ -365,9 +365,14 @@ pub(crate) enum Expr {
     /// anywhere else the binder refuses it.
     Window {
         func: WindowFunc,
-        /// The aggregate/value argument. `None` for `count(*)` and the ranking
-        /// functions (which take no argument).
+        /// The aggregate/value argument (the FIRST argument). `None` for
+        /// `count(*)` and the ranking functions (which take no argument);
+        /// `Some(expr)` for an aggregate window and every value/offset function.
         arg: Option<Box<Expr>>,
+        /// Trailing arguments beyond `arg` for the stage-2 value/offset
+        /// functions: `lag`/`lead`'s optional `[offset[, default]]` and
+        /// `nth_value`'s required `[n]`. Empty for ranking and aggregate windows.
+        extra_args: Vec<Expr>,
         /// `DISTINCT` inside a window aggregate — refused in stage 1.
         distinct: bool,
         spec: WindowSpecAst,
@@ -384,6 +389,14 @@ pub(crate) enum WindowFunc {
     /// An aggregate used as a window (stage 1b) — reuses the aggregate enum, so
     /// the NULL rules, overflow-is-an-error and result typing are identical.
     Agg(mpedb_types::AggFn),
+    /// Value/offset functions (stage 2). The FIRST argument (`expr`) rides in
+    /// [`Expr::Window::arg`]; the remaining arguments (a `lag`/`lead` offset
+    /// and default, an `nth_value` n) ride in [`Expr::Window::extra_args`].
+    Lag,
+    Lead,
+    FirstValue,
+    LastValue,
+    NthValue,
 }
 
 /// The `OVER ( [PARTITION BY …] [ORDER BY …] )` spec. No explicit frame in

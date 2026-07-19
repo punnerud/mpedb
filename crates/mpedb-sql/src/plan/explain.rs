@@ -307,14 +307,27 @@ impl CompiledPlan {
                 // Window functions run over the base row, so their sub-programs
                 // use the base namer. Shows the phase EXPLAIN otherwise hides.
                 for (k, w) in windows.iter().enumerate() {
+                    use crate::plan::WindowFunc as WF;
+                    // The value `expr` (present for aggregate and value windows).
+                    let argp = || w.arg.as_ref().map_or_else(String::new, |p| render_program(p, &base));
                     let fname = match w.func {
-                        crate::plan::WindowFunc::RowNumber => "row_number()".to_string(),
-                        crate::plan::WindowFunc::Rank => "rank()".to_string(),
-                        crate::plan::WindowFunc::DenseRank => "dense_rank()".to_string(),
-                        crate::plan::WindowFunc::Agg(f) => match &w.arg {
+                        WF::RowNumber => "row_number()".to_string(),
+                        WF::Rank => "rank()".to_string(),
+                        WF::DenseRank => "dense_rank()".to_string(),
+                        WF::Agg(f) => match &w.arg {
                             None => format!("{}(*)", f.name()),
                             Some(p) => format!("{}({})", f.name(), render_program(p, &base)),
                         },
+                        WF::Lag(o) | WF::Lead(o) => {
+                            let name = if matches!(w.func, WF::Lag(_)) { "lag" } else { "lead" };
+                            match &w.default {
+                                Some(d) => format!("{name}({}, {o}, {})", argp(), render_program(d, &base)),
+                                None => format!("{name}({}, {o})", argp()),
+                            }
+                        }
+                        WF::FirstValue => format!("first_value({})", argp()),
+                        WF::LastValue => format!("last_value({})", argp()),
+                        WF::NthValue(n) => format!("nth_value({}, {n})", argp()),
                     };
                     let mut spec = String::new();
                     if !w.partition_by.is_empty() {
