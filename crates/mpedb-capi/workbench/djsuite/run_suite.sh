@@ -19,15 +19,27 @@ PY="${WB_PY:-/mnt/xfs/django-workbench/venv/bin/python}"
 OUT="${WB_OUT:-/tmp/wb-django-suite}"
 
 # The label GROUPS. Django's suite installs every label's models into ONE
-# database, and mpedb caps a schema at 120 user tables (MAX_TABLES = 128 minus 8
-# system slots), so the labels must be split into groups that each fit. `queries`
-# is absent because it alone exceeds the cap — see C-API-COMPAT.md gap D6.
+# database, so the labels are split into groups. G1/G2 are the COMPARABILITY set
+# — the same 9 labels / 831 tests every run since run 1, so the arms are
+# comparable across runs. They are frozen: add new coverage as a NEW group, in a
+# separate invocation (`WB_LABEL_GROUPS`), never by editing these two.
+#
+# `WB_LABEL_GROUPS` overrides them: newline-separated, one group of
+# space-separated labels per line. Group log files are numbered from
+# `WB_GROUP_BASE` (default 1) so a second invocation does not overwrite the
+# first's logs.
 LABEL_GROUPS=(  # NOT `GROUPS`: bash owns that name (the caller's group ids) and
                 # silently ignores the assignment — the suite then "runs" one
                 # bogus label per group and reports 1 test.
     "basic lookup transactions ordering update delete"
     "aggregation annotations expressions"
 )
+if [ -n "${WB_LABEL_GROUPS:-}" ]; then
+    LABEL_GROUPS=()
+    while IFS= read -r line; do
+        [ -n "$line" ] && LABEL_GROUPS+=("$line")
+    done <<< "$WB_LABEL_GROUPS"
+fi
 
 [ -x "$PY" ] || { echo "no venv python at $PY (set WB_PY)"; exit 1; }
 [ -d "$DJ/tests" ] || { echo "no Django checkout at $DJ (set WB_DJANGO)"; exit 1; }
@@ -37,7 +49,7 @@ mkdir -p "$OUT"
 run_arm() {  # $1 = stock|shim, $2 = group index, $3.. = labels
     local arm=$1 idx=$2; shift 2
     local log="$OUT/${arm}_g${idx}.txt"
-    rm -f /dev/shm/mpedb-capi-*
+    rm -f /dev/shm/mpedb-capi-* /dev/shm/mpedb-*.mpedb
     (
         cd "$DJ/tests" || exit 1
         export PYTHONPATH="$DJ:$HERE"
@@ -51,7 +63,7 @@ run_arm() {  # $1 = stock|shim, $2 = group index, $3.. = labels
 }
 
 for arm in ${WB_ARM:-stock shim}; do
-    i=1
+    i=${WB_GROUP_BASE:-1}
     for g in "${LABEL_GROUPS[@]}"; do
         # shellcheck disable=SC2086
         run_arm "$arm" "$i" $g

@@ -24,12 +24,14 @@ mod valconv;
 pub use consts::*;
 
 use mpedb::{Config, Database, Error as DbError, ExecResult, Value, WriteSession};
+use std::collections::HashMap;
 use std::os::raw::{c_char, c_double, c_int, c_longlong, c_uchar, c_uint, c_void};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr;
 use std::time::{Duration, Instant};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 
 /// The seed table every fresh mpedb file is created with: mpedb refuses a
 /// schema with no live tables, but `sqlite3_open("new.db")` carries no schema.
@@ -51,8 +53,9 @@ pub struct Sqlite3 {
     txn: Option<WriteSession<'static>>,
     db: Database,
     path: PathBuf,
-    /// A `:memory:`/temp database: its backing file is removed on close.
-    ephemeral: bool,
+    /// What `path` is: a real file the caller named, or the tmpfs file standing
+    /// in for an in-memory database (which is removed again on close).
+    backing: Backing,
     busy_timeout_ms: c_int,
     /// Set by `sqlite3_interrupt` (possibly from another thread); polled by the
     /// running statement at step entry and during the busy-retry wait. An
@@ -476,9 +479,56 @@ fn load_current_row(s: &mut Stmt) {
 // open / close
 // ===========================================================================
 
-enum Target {
+/// How a connection's backing file is owned. mpedb always has a file; what
+/// differs is whether the CALLER named it (and therefore keeps it) or asked for
+/// an in-memory database (and must not find it again afterwards).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Backing {
+    /// Unnamed in-memory (`:memory:`): removed when this connection closes.
     Ephemeral,
+    /// Named in-memory (`file:n?mode=memory`): removed when the LAST connection
+    /// to the name in this process closes.
+    NamedMemory,
+    /// A real file the caller named: never removed.
+    File,
+}
+
+enum Target {
+    /// A private, unnamed in-memory database: one per open, gone on close.
+    Ephemeral,
+    /// A NAMED in-memory database (`file:name?mode=memory`): private to this
+    /// process, but every open of the same name within it sees the same data
+    /// (sqlite's `cache=shared` in-memory semantics). Gone when the last
+    /// connection to the name closes.
+    NamedMemory(PathBuf),
     File(PathBuf),
+}
+
+/// Value of a `key=` parameter in a `file:` URI's query string.
+fn uri_param<'a>(filename: Option<&'a str>, key: &str) -> Option<&'a str> {
+    let query = filename?.trim().strip_prefix("file:")?.split_once('?')?.1;
+    query
+        .split('&')
+        .find_map(|kv| kv.strip_prefix(key)?.strip_prefix('='))
+}
+
+/// Map a named in-memory database to its backing path. mpedb has no pure
+/// in-memory pager — an "in-memory" database is a small file in `/dev/shm` (a
+/// tmpfs, so it never touches a disk) — but that file must behave like memory:
+/// PRIVATE TO THIS PROCESS (hence the pid) and NOT SURVIVING it. The name is
+/// sanitized because it comes from a URI and becomes a path component.
+fn named_memory_path(name: &str) -> PathBuf {
+    let safe: String = name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+        .take(64)
+        .collect();
+    let dir = if std::path::Path::new("/dev/shm").is_dir() {
+        PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    };
+    dir.join(format!("mpedb-capi-{}-mem-{}.mpedb", std::process::id(), safe))
 }
 
 fn resolve_target(filename: Option<&str>, flags: c_int) -> Target {
@@ -492,6 +542,15 @@ fn resolve_target(filename: Option<&str>, flags: c_int) -> Target {
         if path == ":memory:" || path.is_empty() {
             return Target::Ephemeral;
         }
+        // `mode=memory` makes the name an IN-MEMORY database's name, not a
+        // path — sqlite creates no file for it. Django's test runner names its
+        // test databases exactly this way (`file:memorydb_default?mode=memory&
+        // cache=shared`), so reading the name as a path both dropped a 64 MiB
+        // file in the caller's CWD and, worse, made the "in-memory" database
+        // SURVIVE the process and be silently reopened by the next run.
+        if uri_param(filename, "mode") == Some("memory") {
+            return Target::NamedMemory(named_memory_path(path));
+        }
         path
     } else {
         name
@@ -500,6 +559,35 @@ fn resolve_target(filename: Option<&str>, flags: c_int) -> Target {
         Target::Ephemeral
     } else {
         Target::File(PathBuf::from(name))
+    }
+}
+
+/// Open count per named in-memory database, for this process. The first open
+/// of a name starts it EMPTY (a fresh in-memory database), later opens attach
+/// to the same one, and the last close removes the backing file.
+static NAMED_MEMORY: Mutex<Option<HashMap<PathBuf, usize>>> = Mutex::new(None);
+
+fn named_memory_acquire(path: &std::path::Path) -> bool {
+    let mut g = NAMED_MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let map = g.get_or_insert_with(HashMap::new);
+    let n = map.entry(path.to_path_buf()).or_insert(0);
+    *n += 1;
+    *n == 1 // first opener: start from empty
+}
+
+fn named_memory_release(path: &std::path::Path) -> bool {
+    let mut g = NAMED_MEMORY.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(map) = g.as_mut() else { return false };
+    match map.get_mut(path) {
+        Some(n) if *n > 1 => {
+            *n -= 1;
+            false
+        }
+        Some(_) => {
+            map.remove(path);
+            true // last one out: the database ceases to exist
+        }
+        None => false,
     }
 }
 
@@ -580,21 +668,34 @@ fn open_impl(filename: Option<&str>, flags: c_int) -> Result<Box<Sqlite3>, (c_in
     // it — reserve, don't grow); otherwise a small default. Only meaningful for a
     // NEW file; an existing one keeps the geometry it was created with.
     let req = requested_size_mb(filename);
-    let (path, ephemeral, size_mb) = match target {
-        Target::Ephemeral => (ephemeral_path(), true, req.unwrap_or(16)),
-        Target::File(p) => (p, false, req.unwrap_or(64)),
+    let (path, kind, size_mb) = match target {
+        Target::Ephemeral => (ephemeral_path(), Backing::Ephemeral, req.unwrap_or(16)),
+        Target::NamedMemory(p) => (p, Backing::NamedMemory, req.unwrap_or(16)),
+        Target::File(p) => (p, Backing::File, req.unwrap_or(64)),
     };
 
-    let exists = !ephemeral && path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false);
-    if ephemeral {
+    // A named in-memory database starts empty on its FIRST open in this
+    // process and is attached (not recreated) by every later one.
+    let fresh_memory = matches!(kind, Backing::NamedMemory) && named_memory_acquire(&path);
+    let exists = match kind {
+        Backing::Ephemeral => false,
+        Backing::NamedMemory => {
+            if fresh_memory {
+                let _ = std::fs::remove_file(&path);
+            }
+            !fresh_memory
+        }
+        Backing::File => path.exists() && path.metadata().map(|m| m.len() > 0).unwrap_or(false),
+    };
+    if matches!(kind, Backing::Ephemeral) {
         let _ = std::fs::remove_file(&path);
     }
-
-    let db = if exists {
-        // Attach an existing mpedb file config-free (reads its stored schema).
-        Database::open_from_file(&path)
-            .map_err(|e| (SQLITE_CANTOPEN, format!("cannot open `{}`: {e}", path.display())))?
-    } else {
+    let attach = || -> Result<Database, (c_int, String)> {
+        if exists {
+            // Attach an existing mpedb file config-free (reads its stored schema).
+            return Database::open_from_file(&path)
+                .map_err(|e| (SQLITE_CANTOPEN, format!("cannot open `{}`: {e}", path.display())));
+        }
         // Fresh database: creating requires the CREATE flag (open_v2 semantics;
         // plain sqlite3_open always sets it — see the callers).
         if flags & SQLITE_OPEN_CREATE == 0 {
@@ -606,7 +707,18 @@ fn open_impl(filename: Option<&str>, flags: c_int) -> Result<Box<Sqlite3>, (c_in
         let cfg = Config::from_toml_str(&seed_toml(&path, size_mb))
             .map_err(|e| (SQLITE_CANTOPEN, format!("config error: {e}")))?;
         Database::open_with_config(cfg)
-            .map_err(|e| (SQLITE_CANTOPEN, format!("cannot create `{}`: {e}", path.display())))?
+            .map_err(|e| (SQLITE_CANTOPEN, format!("cannot create `{}`: {e}", path.display())))
+    };
+    let db = match attach() {
+        Ok(db) => db,
+        Err(e) => {
+            // A failed open holds no reference: undo the acquire, or the name
+            // would never be freshened again in this process.
+            if matches!(kind, Backing::NamedMemory) {
+                named_memory_release(&path);
+            }
+            return Err(e);
+        }
     };
 
     register_shim_builtins(&db);
@@ -615,7 +727,7 @@ fn open_impl(filename: Option<&str>, flags: c_int) -> Result<Box<Sqlite3>, (c_in
         txn: None,
         db,
         path,
-        ephemeral,
+        backing: kind,
         busy_timeout_ms: 0,
         interrupted: AtomicBool::new(false),
         err_code: SQLITE_OK,
@@ -669,6 +781,47 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     rc
 }
 
+/// Why the last `sqlite3_open*` in this process failed: `(code, NUL-terminated
+/// message)`.
+///
+/// A failed open hands back NO handle (sqlite may, but only when it got far
+/// enough to allocate one), so the caller's only way to ask "why" is
+/// `sqlite3_errmsg(NULL)` — for which sqlite has the fixed, useless answer
+/// "out of memory". CPython's `sqlite3` does exactly that and reported EVERY
+/// failed open as `InterfaceError: out of memory`, hiding e.g. a real
+/// "cannot open `x`: schema format v6, expected v7". Answering the real reason
+/// there cannot break a consumer that expects sqlite's constant — no consumer
+/// can act on "out of memory" — and it is the difference between a diagnosable
+/// failure and a lie.
+static LAST_OPEN_ERR: Mutex<Option<(c_int, Vec<u8>)>> = Mutex::new(None);
+
+fn set_open_error(code: c_int, msg: String) {
+    let mut bytes = msg.into_bytes();
+    bytes.retain(|b| *b != 0);
+    bytes.push(0);
+    *LAST_OPEN_ERR.lock().unwrap_or_else(|e| e.into_inner()) = Some((code, bytes));
+}
+
+thread_local! {
+    /// Per-thread copy of `LAST_OPEN_ERR`'s text, so `sqlite3_errmsg(NULL)` can
+    /// hand out a pointer that stays valid until this thread's next such call —
+    /// sqlite's own lifetime rule for an error string.
+    static OPEN_ERR_TLS: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn last_open_error() -> Option<(c_int, *const c_char)> {
+    let (code, bytes) = LAST_OPEN_ERR
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()?;
+    let ptr = OPEN_ERR_TLS.with(|t| {
+        let mut t = t.borrow_mut();
+        *t = bytes;
+        t.as_ptr() as *const c_char
+    });
+    Some((code, ptr))
+}
+
 unsafe fn open_common(filename: *const c_char, pp_db: *mut *mut Sqlite3, flags: c_int) -> c_int {
     if pp_db.is_null() {
         return SQLITE_MISUSE;
@@ -679,12 +832,14 @@ unsafe fn open_common(filename: *const c_char, pp_db: *mut *mut Sqlite3, flags: 
             *pp_db = Box::into_raw(boxed);
             SQLITE_OK
         }
-        Ok(Err((code, _msg))) => {
+        Ok(Err((code, msg))) => {
             *pp_db = ptr::null_mut();
+            set_open_error(code, msg);
             code
         }
         Err(_) => {
             *pp_db = ptr::null_mut();
+            set_open_error(SQLITE_CANTOPEN, "panic while opening database".to_string());
             SQLITE_CANTOPEN
         }
     }
@@ -713,9 +868,15 @@ unsafe fn close_common(db: *mut Sqlite3) -> c_int {
         h.destroy();
     }
     let path = boxed.path.clone();
-    let ephemeral = boxed.ephemeral;
+    let backing = boxed.backing;
+    // The engine handle must be gone before the file is: mpedb unmaps on drop.
     drop(boxed);
-    if ephemeral {
+    let remove = match backing {
+        Backing::Ephemeral => true,
+        Backing::NamedMemory => named_memory_release(&path),
+        Backing::File => false,
+    };
+    if remove {
         let _ = std::fs::remove_file(&path);
     }
     SQLITE_OK
@@ -1339,18 +1500,29 @@ pub unsafe extern "C" fn sqlite3_errmsg(db: *mut Sqlite3) -> *const c_char {
                 c.err_msg.as_ptr() as *const c_char
             }
         }
-        None => cstr!("out of memory"),
+        // No handle: the caller is almost always asking why an open failed (it
+        // got NULL back). Answer with THAT, not sqlite's constant lie.
+        None => match last_open_error() {
+            Some((_, msg)) => msg,
+            None => cstr!("out of memory"),
+        },
     }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_errcode(db: *mut Sqlite3) -> c_int {
-    conn(db).map(|c| c.err_code).unwrap_or(SQLITE_MISUSE)
+    match conn(db) {
+        Some(c) => c.err_code,
+        None => last_open_error().map(|(c, _)| c).unwrap_or(SQLITE_MISUSE),
+    }
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_extended_errcode(db: *mut Sqlite3) -> c_int {
-    conn(db).map(|c| c.err_ext).unwrap_or(SQLITE_MISUSE)
+    match conn(db) {
+        Some(c) => c.err_ext,
+        None => last_open_error().map(|(c, _)| c).unwrap_or(SQLITE_MISUSE),
+    }
 }
 
 #[no_mangle]
