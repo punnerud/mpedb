@@ -16,12 +16,14 @@ mpedb combines three things that normally don't come together:
   for it, rigidity everywhere else. An `any` column cannot be a key.)
 
 **It opens an existing sqlite `.db` file directly** — just `mpedb data.db`, no
-flags, reads and writes it like `sqlite3 data.db` with **no import step**: your
-changes live in a `<db>.overlay.mpedb` delta-WAL beside the file, unchanged rows
-read straight from the `.db` through a native sqlite-format reader (no sqlite
-library in the path), and `mpedb checkpoint data.db` folds the delta back so
-every other tool sees it. (`--mirror` does a full sidecar import instead;
-`--direct` is read-only with zero setup.) See [design/SQLITE.md](design/SQLITE.md).
+flags, no import. Writes land in a `<db>.overlay.mpedb` **write-ahead delta**
+beside the file — so several processes write **concurrently** without blocking,
+and a `SIGKILL` never corrupts the base — while reads fall through to unchanged
+rows in the `.db` via a native sqlite-format reader (no sqlite library in the
+path). `mpedb checkpoint data.db` **publishes** the delta back into the `.db`,
+**collision-validated** against the current base, holding the `.db`'s lock only
+briefly so a foreign `sqlite3` writer can interleave. (`--mirror` = full sidecar
+import; `--direct` = read-only.) See [design/SQLITE.md](design/SQLITE.md).
 
 SQL is compiled **once** into a content-hashed plan; the hot path is
 `execute(hash, params)` with zero parsing. Plans carry precomputed read/write
