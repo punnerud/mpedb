@@ -890,9 +890,38 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
             Instr::Call(f, argc) => {
                 let mut args: Vec<String> = (0..argc).map(|_| pop(&mut st).s).collect();
                 args.reverse();
-                Item {
-                    s: format!("{}({})", f.name(), args.join(", ")),
-                    atom: true,
+                // The five value-taking JSON writers carry a binder-computed
+                // JSON-subtype BITMASK as a hidden leading argument. It is not
+                // something anyone wrote, so it is not shown: rendering it
+                // would put `json_array(0, 1)` in a result-set column NAME
+                // where sqlite (and the query text) say `json_array(1)`.
+                if matches!(
+                    f,
+                    mpedb_types::ScalarFn::JsonArray
+                        | mpedb_types::ScalarFn::JsonObject
+                        | mpedb_types::ScalarFn::JsonSet
+                        | mpedb_types::ScalarFn::JsonInsert
+                        | mpedb_types::ScalarFn::JsonReplace
+                ) && !args.is_empty()
+                {
+                    args.remove(0);
+                }
+                // `->` and `->>` are OPERATORS in the grammar; render them as
+                // written rather than as the calls they lower to.
+                if matches!(
+                    f,
+                    mpedb_types::ScalarFn::JsonArrow | mpedb_types::ScalarFn::JsonArrowText
+                ) && args.len() == 2
+                {
+                    Item {
+                        s: format!("{} {} {}", args[0], f.name(), args[1]),
+                        atom: false,
+                    }
+                } else {
+                    Item {
+                        s: format!("{}({})", f.name(), args.join(", ")),
+                        atom: true,
+                    }
                 }
             }
             // A host-registered scalar UDF `name(a, b)` — the name lives in the
