@@ -189,6 +189,28 @@ SCRIPT = [
     ("SELECT 1 WHERE 'hey-Foo' REGEXP ?", ("(?i)fo+",)),
     ("SELECT 1 WHERE 'barfoobaz' REGEXP ?", (r"b(.).*b\1",)),
     "SELECT 1 WHERE 'a%b' LIKE 'a\\%b' ESCAPE '\\'",
+    # --- LIKE half of #74 item 3: BOUND patterns (run 4's rank-1 gap). ------
+    # Django's exact wire shapes for startswith/contains/endswith/icontains —
+    # the pattern is always bound and the escape is always the literal '\'.
+    ("SELECT 1 WHERE 'A_b' LIKE ? ESCAPE '\\'", (r"A\_b",)),
+    ("SELECT 1 WHERE 'Axb' LIKE ? ESCAPE '\\'", (r"A\_b",)),
+    ("SELECT 1 WHERE 'xxfooyy' LIKE ? ESCAPE '\\'", ("%foo%",)),
+    ("SELECT 1 WHERE 'xx%fooyy' LIKE ? ESCAPE '\\'", (r"%\%foo%",)),
+    ("SELECT 1 WHERE '100%' LIKE ? ESCAPE '\\'", (r"100\%",)),
+    ("SELECT 1 WHERE 'FOOBAR' LIKE ? ESCAPE '\\'", ("foo%",)),
+    ("SELECT 1 WHERE 'abc' NOT LIKE ? ESCAPE '\\'", ("z%",)),
+    # NULL pattern: 3VL — the WHERE is not TRUE, both arms answer [].
+    ("SELECT 1 WHERE 'a' LIKE ?", (None,)),
+    ("SELECT 1 WHERE 'a' NOT LIKE ?", (None,)),
+    # A BLOB pattern is BUILD-DEPENDENT in sqlite (SQLITE_LIKE_DOESNT_MATCH_
+    # BLOBS: Debian's libsqlite3 answers [], stock amalgamation coerces the
+    # bytes as text). mpedb REFUSES the bind by name ('statement requires
+    # text') — a refusal line in this diff, never a wrong answer in either
+    # world.
+    ("SELECT 1 WHERE 'ab' LIKE ?", (b"ab",)),
+    # GLOB had the same literal-only restriction; closed in the same style.
+    ("SELECT 1 WHERE 'abcd' GLOB ?", ("ab*",)),
+    ("SELECT 1 WHERE 'ABCD' GLOB ?", ("ab*",)),
 ]
 
 

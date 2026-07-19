@@ -348,14 +348,48 @@ fn compile_pattern(pattern: &str, esc: Option<char>) -> Option<Vec<Pat>> {
     Some(out)
 }
 
+// The LAST `(pattern, escape)` this thread compiled and the compiled form —
+// `None` for a pattern with a DANGLING escape, which matches nothing. That
+// failure is CACHED and stays a plain no-match, deliberately unlike REGEXP's
+// named error: sqlite's `patternCompare` returns NOMATCH the moment it reads
+// past the pattern's end, so "matches nothing" IS the binary's answer here,
+// not a swallowed dialect gap (the W3 lesson does not transfer).
+//
+// One entry, not an LRU, for `RE_MEMO`'s reason: a scan's pattern is the same
+// on every row whether it arrived as a literal or — since the LIKE half of
+// #74 item 3 — as a bound parameter, so a single slot has an LRU's hit rate
+// and none of the bookkeeping. Purely a memo of a deterministic function of
+// `(pattern, esc)`, so it cannot change an answer; it exists because
+// `like_impl` was recompiling the pattern PER ROW even in the literal case.
+// The key does NOT include case-sensitivity: the compiled form is
+// dialect-independent (`ci` only changes the literal comparison at match
+// time).
+type LikeMemoEntry = (String, Option<char>, Option<Vec<Pat>>);
+std::thread_local! {
+    static LIKE_MEMO: std::cell::RefCell<Option<LikeMemoEntry>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 /// Shared LIKE matcher. `ci` selects case-INsensitive (ASCII A–Z, sqlite) vs
 /// case-sensitive (PostgreSQL) comparison of a literal pattern char; the `%`/`_`
 /// wildcards and the two-pointer backtracking are identical either way.
 fn like_impl(pattern: &str, s: &str, ci: bool, esc: Option<char>) -> bool {
-    // A dangling ESCAPE never matches anything — not even the empty subject.
-    let Some(p) = compile_pattern(pattern, esc) else {
-        return false;
-    };
+    LIKE_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if !matches!(&*memo, Some((p, e, _)) if p == pattern && *e == esc) {
+            *memo = Some((pattern.to_string(), esc, compile_pattern(pattern, esc)));
+        }
+        match &memo.as_ref().expect("just filled").2 {
+            // A dangling ESCAPE never matches anything — not even the empty
+            // subject (worth caching too: it is reached on every row).
+            None => false,
+            Some(p) => like_match_compiled(p, s, ci),
+        }
+    })
+}
+
+/// The two-pointer match over an already-compiled pattern.
+fn like_match_compiled(p: &[Pat], s: &str, ci: bool) -> bool {
     let t: Vec<char> = s.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
     let (mut star_pi, mut star_ti) = (usize::MAX, 0usize);
@@ -1234,5 +1268,75 @@ impl ReProg {
             std::mem::swap(&mut cseen, &mut nseen);
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod like_memo_bench {
+    use super::*;
+
+    /// Instrumented A/B of the LIKE-pattern memo (#74 item 3, LIKE half):
+    /// the OLD literal path — `compile_pattern` on every call, which is
+    /// exactly what `like_impl` did before the memo — against the memoized
+    /// `like_match`, over the same scan-shaped workload (one pattern, many
+    /// rows). Run with:
+    ///
+    /// ```sh
+    /// cargo test -p mpedb-types --release -- --ignored --nocapture like_memo_ab
+    /// ```
+    ///
+    /// The memo must not LOSE (the acceptance bar is "the literal path does
+    /// not regress"); in practice it wins big because the per-row
+    /// compile allocated a fresh `Vec<Pat>` per row.
+    #[test]
+    #[ignore]
+    fn like_memo_ab() {
+        let pattern = "%foo%";
+        let esc = Some('\\');
+        // Deterministic subjects, scan-shaped: mostly misses, some hits.
+        let subjects: Vec<String> = (0..1000)
+            .map(|i| {
+                if i % 7 == 0 {
+                    format!("xx{i}fooyy")
+                } else {
+                    format!("subject-{i}-with-some-length")
+                }
+            })
+            .collect();
+        const ROUNDS: usize = 2_000;
+
+        let mut hits_old = 0usize;
+        let t0 = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            for s in &subjects {
+                // The pre-memo body of `like_impl`, verbatim.
+                if let Some(p) = compile_pattern(pattern, esc) {
+                    if like_match_compiled(&p, s, true) {
+                        hits_old += 1;
+                    }
+                }
+            }
+        }
+        let per_call = t0.elapsed();
+
+        let mut hits_new = 0usize;
+        let t1 = std::time::Instant::now();
+        for _ in 0..ROUNDS {
+            for s in &subjects {
+                if like_match(pattern, s, esc) {
+                    hits_new += 1;
+                }
+            }
+        }
+        let memoized = t1.elapsed();
+
+        assert_eq!(hits_old, hits_new, "the memo may not change an answer");
+        println!(
+            "LIKE literal path over {} calls: compile-per-row {:?}, memoized {:?} ({:+.1}%)",
+            ROUNDS * subjects.len(),
+            per_call,
+            memoized,
+            (memoized.as_secs_f64() / per_call.as_secs_f64() - 1.0) * 100.0,
+        );
     }
 }
