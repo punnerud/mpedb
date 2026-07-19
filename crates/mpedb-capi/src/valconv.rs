@@ -139,6 +139,7 @@ pub fn error_codes(e: &DbError) -> (c_int, c_int) {
         DbError::Corrupt(_) => (SQLITE_CORRUPT, SQLITE_CORRUPT),
         DbError::Io(_) => (SQLITE_IOERR, SQLITE_IOERR),
         DbError::DbFull => (SQLITE_FULL, SQLITE_FULL),
+        DbError::OutOfMemory { .. } => (SQLITE_NOMEM, SQLITE_NOMEM),
         DbError::ReadersFull | DbError::SnapshotEvicted | DbError::WriteConflict => {
             (SQLITE_BUSY, SQLITE_BUSY)
         }

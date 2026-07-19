@@ -250,6 +250,16 @@ pub(crate) trait TxnCtx {
         let _ = (n, which);
         Ok(())
     }
+    /// The live-cell budget for join materialization (`0` = unlimited): the
+    /// nested-loop join in `gather::gather_joined` bounds the `Value` cells
+    /// its intermediate product HOLDS against this — the memory-proportional
+    /// twin of the work-row budget, which only bounds what a query READS.
+    /// Default `0` for the sqlite-backed contexts (a different storage engine;
+    /// their joins run through the same gather, but the mpedb config does not
+    /// govern them — mirrors [`charge_work`](Self::charge_work)'s scoping).
+    fn join_cells_budget(&self) -> u64 {
+        0
+    }
 }
 
 impl TxnCtx for WriteTxn<'_> {
@@ -308,6 +318,9 @@ impl TxnCtx for WriteTxn<'_> {
     }
     fn charge_work(&self, n: u64, which: &dyn Fn() -> String) -> Result<()> {
         WriteTxn::charge_work(self, n, which)
+    }
+    fn join_cells_budget(&self) -> u64 {
+        WriteTxn::join_cells_budget(self)
     }
 }
 
@@ -402,6 +415,9 @@ impl TxnCtx for WriteCtx<'_, '_> {
     }
     fn charge_work(&self, n: u64, which: &dyn Fn() -> String) -> Result<()> {
         WriteTxn::charge_work(self.txn, n, which)
+    }
+    fn join_cells_budget(&self) -> u64 {
+        WriteTxn::join_cells_budget(self.txn)
     }
 }
 
@@ -551,6 +567,9 @@ impl TxnCtx for ReadCtx<'_, '_> {
     }
     fn charge_work(&self, n: u64, which: &dyn Fn() -> String) -> Result<()> {
         self.0.charge_work(n, which)
+    }
+    fn join_cells_budget(&self) -> u64 {
+        self.0.join_cells_budget()
     }
 }
 

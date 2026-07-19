@@ -191,7 +191,12 @@ impl WorkMeter {
             .fetch_add(n, AtomicOrdering::Relaxed)
             .saturating_add(n);
         if self.budget != 0 && used > self.budget {
-            return Err(Error::RuntimeBudget { limit: self.budget, used, which: which() });
+            return Err(Error::RuntimeBudget {
+                kind: mpedb_types::BudgetKind::WorkRows,
+                limit: self.budget,
+                used,
+                which: which(),
+            });
         }
         Ok(())
     }
@@ -518,6 +523,10 @@ pub struct Engine {
     /// Per-statement-execution work-row budget (#74), copied into each txn's
     /// [`WorkMeter`] at begin. `0` = unlimited.
     work_budget: u64,
+    /// Live-cell budget on join materialization (#74 extension): the SQL
+    /// executor's nested-loop join reads it via the txn and bounds the
+    /// `Value` cells its intermediate product holds. `0` = unlimited.
+    join_cells_budget: u64,
     /// Installed by the facade; recompiles CHECK programs whenever a bundle is
     /// (re)built from the catalog. `None` until then — and forever for the
     /// core's own tests, which declare no CHECKs.
@@ -569,6 +578,7 @@ impl Engine {
             flusher,
             extent_threshold: None,
             work_budget: config.options.max_work_rows,
+            join_cells_budget: config.options.max_join_cells,
             check_compiler: std::sync::RwLock::new(None),
         };
         engine.bootstrap_catalog()?;
@@ -764,9 +774,10 @@ impl Engine {
             concurrency: Concurrency::Serial,
             flusher: None, // read-only tooling handle; async needs a config
             extent_threshold: None,
-            // Tooling handle (no config): the budget is unlimited (a `dump`/
+            // Tooling handle (no config): the budgets are unlimited (a `dump`/
             // verify pass legitimately scans whole tables).
             work_budget: 0,
+            join_cells_budget: 0,
             // Read-only tooling: no SQL layer to install a compiler, and no
             // writes for a CHECK to guard.
             check_compiler: std::sync::RwLock::new(None),
@@ -778,6 +789,13 @@ impl Engine {
     /// estimate to the runtime cap.
     pub fn work_budget(&self) -> u64 {
         self.work_budget
+    }
+
+    /// The join-materialization live-cell budget this engine was opened with
+    /// (`0` = unlimited). The SQL executor's nested-loop join charges against
+    /// it per cell its intermediate product holds.
+    pub fn join_cells_budget(&self) -> u64 {
+        self.join_cells_budget
     }
 
     /// The write-path concurrency discipline this engine was opened with

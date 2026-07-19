@@ -3,6 +3,42 @@ use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Which deterministic per-execution budget tripped (#74,
+/// design/DESIGN-RUNTIME-BUDGET.md). Each kind carries its own unit and its
+/// own `[runtime]` config knob, so [`Error::RuntimeBudget`]'s Display always
+/// tells the user the RIGHT knob to raise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BudgetKind {
+    /// The work-row counter: rows yielded by scans, nested-loop join
+    /// candidates, correlated-subquery re-evaluations, recursive-CTE rows.
+    /// Knob: `[runtime] max_work_rows`.
+    WorkRows,
+    /// The join-materialization counter: `Value` cells LIVE in a nested-loop
+    /// join's held intermediate product (`rows × row width`). Work-rows bound
+    /// how much a query reads; this bounds how much a join HOLDS — the
+    /// memory-proportional guard that stops an N-way cross join from taking
+    /// the process down. Knob: `[runtime] max_join_cells`.
+    JoinCells,
+}
+
+impl BudgetKind {
+    /// The unit the `used`/`limit` counts are in, for the error message.
+    pub fn unit(self) -> &'static str {
+        match self {
+            BudgetKind::WorkRows => "work-rows",
+            BudgetKind::JoinCells => "live joined cells",
+        }
+    }
+
+    /// The `[runtime]` config knob that raises this budget.
+    pub fn knob(self) -> &'static str {
+        match self {
+            BudgetKind::WorkRows => "max_work_rows",
+            BudgetKind::JoinCells => "max_join_cells",
+        }
+    }
+}
+
 /// The single error type shared across the mpedb workspace.
 #[derive(Debug)]
 pub enum Error {
@@ -92,18 +128,30 @@ pub enum Error {
     WriteConflict,
     DivisionByZero,
     ArithmeticOverflow,
-    /// A statement exceeded its deterministic per-execution work budget (#74):
-    /// `used` work-rows crossed `limit` while evaluating `which` (a coarse but
-    /// correct attribution of where the work went — a scan, a nested-loop join,
-    /// a correlated subquery, or a recursive CTE). Distinct from `Corrupt`: the
-    /// data is fine, the query is a runaway. Deterministic — the same query over
-    /// the same data trips at the same `used` on every machine — so it is
-    /// reproducible and CI-stable, unlike a wall-clock timeout. Raise
-    /// `[runtime] max_work_rows` in the config to allow more.
+    /// A statement exceeded one of its deterministic per-execution budgets
+    /// (#74): `used` units of `kind` crossed `limit` while evaluating `which`
+    /// (a coarse but correct attribution of where the work went — a scan, a
+    /// nested-loop join, a correlated subquery, or a recursive CTE). Distinct
+    /// from `Corrupt`: the data is fine, the query is a runaway. Deterministic
+    /// — the same query over the same data trips at the same `used` on every
+    /// machine — so it is reproducible and CI-stable, unlike a wall-clock
+    /// timeout. The Display hint names the `[runtime]` knob for `kind`.
     RuntimeBudget {
+        kind: BudgetKind,
         limit: u64,
         used: u64,
         which: String,
+    },
+    /// An allocation inside a query's own row materialization failed — the
+    /// process is under a memory rlimit / cgroup cap, or genuinely out. The
+    /// statement aborts cleanly instead of taking the host process down.
+    /// Best-effort: only the bulk join-materialization allocations are
+    /// fallible; a small allocation elsewhere at the very wall can still
+    /// abort the process — the deterministic `[runtime] max_join_cells`
+    /// budget is the primary guard, this is the backstop for the opted-out
+    /// (`0` = unlimited) case.
+    OutOfMemory {
+        what: &'static str,
     },
     Unsupported(String),
     /// A write targeted a table that is currently write-blocked (frozen) by the
@@ -161,11 +209,19 @@ impl fmt::Display for Error {
             }
             Error::DivisionByZero => write!(f, "division by zero"),
             Error::ArithmeticOverflow => write!(f, "arithmetic overflow"),
-            Error::RuntimeBudget { limit, used, which } => write!(
+            Error::RuntimeBudget { kind, limit, used, which } => write!(
                 f,
-                "runtime budget exceeded: {used} work-rows > limit {limit} while \
-                 evaluating {which}; raise [runtime] max_work_rows in the config to \
-                 allow more"
+                "runtime budget exceeded: {used} {} > limit {limit} while \
+                 evaluating {which}; raise [runtime] {} in the config to \
+                 allow more",
+                kind.unit(),
+                kind.knob()
+            ),
+            Error::OutOfMemory { what } => write!(
+                f,
+                "out of memory: allocation failed while materializing {what}; \
+                 the statement was aborted (set [runtime] max_join_cells to \
+                 fail deterministically before memory pressure)"
             ),
             Error::Unsupported(m) => write!(f, "unsupported: {m}"),
             Error::Frozen { table_id } => {
