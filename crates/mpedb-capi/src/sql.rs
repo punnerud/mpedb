@@ -88,33 +88,187 @@ pub fn is_blank(sql: &str) -> bool {
     !any
 }
 
-/// Count bound parameters: the number of positional `?` plus the largest
-/// explicit `?N`/`$N` index (mpedb refuses to mix the styles, so in practice
-/// one term is zero). Named `:name`/`@name` parameters are not supported by
-/// mpedb and are not counted.
-pub fn param_count(sql: &str) -> usize {
+/// A character that may appear in a named parameter's body (after the sigil),
+/// matching sqlite's `IdChar`: ASCII alphanumerics, `_`, and any byte ≥ 0x80 (so
+/// UTF-8 identifier names bind). `$` is deliberately excluded here (it is only a
+/// sigil), keeping the common case unambiguous.
+fn is_name_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80
+}
+
+/// The result of a quote/comment-aware parameter scan: the SQL rewritten so that
+/// mpedb's numbered-`$N` binder sees *every* parameter, plus the sqlite-visible
+/// parameter count and per-number spelling.
+pub struct ParamScan {
+    /// `sql` with every parameter token (`?`, `?N`, `:name`, `@name`, `$name`)
+    /// replaced by the numbered mpedb placeholder `$K` it was assigned. Every
+    /// other byte — string/blob literals, quoted identifiers, comments — is
+    /// preserved verbatim, so only placeholders change.
+    pub rewritten: String,
+    /// The highest parameter number used, i.e. `sqlite3_bind_parameter_count`.
+    pub count: usize,
+    /// Per-parameter spelling in number order (1-based → `names[k-1]`), sigil
+    /// included and NUL-terminated, for `sqlite3_bind_parameter_name`. `None` for
+    /// an anonymous `?`, or for a number never spelled (a gap an explicit `?N`
+    /// skipped over). Matches sqlite: a `?N`/`:n`/`@n`/`$n` all report their own
+    /// spelling; only a bare `?` is anonymous.
+    pub names: Vec<Option<Vec<u8>>>,
+}
+
+/// Scan `sql` for bound parameters and rewrite them to mpedb's numbered `$K`
+/// form, assigning numbers exactly as sqlite's `sqlite3ExprAssignVarNumber`
+/// does (verified against sqlite 3.45):
+/// * a bare `?` takes the next number (one past the highest so far), anonymous;
+/// * an explicit `?N` takes number `N`, bumping the high-water mark if larger;
+/// * `:name`/`@name`/`$name` are all *named* — a new name takes the next number
+///   (so `$5` is a name, NOT positional `$5`); a repeated name reuses its number.
+///
+/// All parameter kinds share one numbering space. The rewrite emits `$K` for
+/// every token, giving mpedb a single-style numbered statement (mpedb refuses to
+/// mix `?` and `$N`, but the shim's uniform `$K` output never does). String/blob
+/// literals, quoted identifiers and comments are skipped verbatim, so a `?` or
+/// `:x` inside them is never mistaken for a parameter.
+pub fn scan_params(sql: &str) -> ParamScan {
     let b = sql.as_bytes();
-    let mut auto = 0usize;
-    let mut max_num = 0usize;
-    scan_code(sql, |i, c| {
-        if c == b'?' || c == b'$' {
-            // Read following digits.
-            let mut j = i + 1;
-            let mut num = 0usize;
-            let mut has_digits = false;
-            while j < b.len() && b[j].is_ascii_digit() {
-                has_digits = true;
-                num = num.saturating_mul(10).saturating_add((b[j] - b'0') as usize);
-                j += 1;
+    let mut out: Vec<u8> = Vec::with_capacity(b.len() + 8);
+    let mut names: Vec<Option<Vec<u8>>> = Vec::new();
+    // (spelling-without-NUL, number) for named-parameter reuse.
+    let mut seen: Vec<(Vec<u8>, usize)> = Vec::new();
+    let mut n_var: usize = 0;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        let start = i;
+        match c {
+            b'\'' | b'"' | b'`' => {
+                // String literal / quoted identifier: copy through the matching
+                // close quote (doubled quote = escaped, stays inside).
+                let q = c;
+                i += 1;
+                while i < b.len() {
+                    if b[i] == q {
+                        if i + 1 < b.len() && b[i + 1] == q {
+                            i += 2;
+                            continue;
+                        }
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                out.extend_from_slice(&b[start..i]);
             }
-            if has_digits {
-                max_num = max_num.max(num);
-            } else if c == b'?' {
-                auto += 1;
+            b'[' => {
+                // sqlite bracket-quoted identifier: closes at ']'.
+                i += 1;
+                while i < b.len() && b[i] != b']' {
+                    i += 1;
+                }
+                i += 1; // consume the ']' (or run to end, matching scan_code)
+                let end = i.min(b.len());
+                out.extend_from_slice(&b[start..end]);
+                i = end;
+            }
+            b'-' if i + 1 < b.len() && b[i + 1] == b'-' => {
+                i += 2;
+                while i < b.len() && b[i] != b'\n' {
+                    i += 1;
+                }
+                out.extend_from_slice(&b[start..i]);
+            }
+            b'/' if i + 1 < b.len() && b[i + 1] == b'*' => {
+                i += 2;
+                while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+                let end = i.min(b.len());
+                out.extend_from_slice(&b[start..end]);
+                i = end;
+            }
+            b'?' => {
+                i += 1;
+                let dstart = i;
+                let mut num: usize = 0;
+                while i < b.len() && b[i].is_ascii_digit() {
+                    num = num.saturating_mul(10).saturating_add((b[i] - b'0') as usize);
+                    i += 1;
+                }
+                if i > dstart {
+                    // `?N` explicit number. Ignore out-of-range values for the
+                    // count/name bookkeeping — the emitted `$N` makes mpedb reject
+                    // the statement, so a wrong number can never bind.
+                    if (1..=u16::MAX as usize).contains(&num) {
+                        if num > n_var {
+                            n_var = num;
+                        }
+                        if names.len() < num {
+                            names.resize(num, None);
+                        }
+                        let mut sp = b[start..i].to_vec();
+                        sp.push(0);
+                        names[num - 1] = Some(sp);
+                    }
+                    out.extend_from_slice(format!("${num}").as_bytes());
+                } else {
+                    // Bare `?`: next sequential number, anonymous.
+                    n_var += 1;
+                    if names.len() < n_var {
+                        names.resize(n_var, None);
+                    }
+                    // names[n_var - 1] stays None (anonymous).
+                    out.extend_from_slice(format!("${n_var}").as_bytes());
+                }
+            }
+            b':' | b'@' | b'$' => {
+                let mut j = i + 1;
+                while j < b.len() && is_name_char(b[j]) {
+                    j += 1;
+                }
+                if j > i + 1 {
+                    // Named parameter (sigil + ≥1 name char): reuse its number if
+                    // the same spelling was seen, else assign the next number.
+                    let spelling = &b[i..j];
+                    let num = match seen.iter().find(|(s, _)| s.as_slice() == spelling) {
+                        Some((_, n)) => *n,
+                        None => {
+                            n_var += 1;
+                            let n = n_var;
+                            seen.push((spelling.to_vec(), n));
+                            if names.len() < n {
+                                names.resize(n, None);
+                            }
+                            let mut sp = spelling.to_vec();
+                            sp.push(0);
+                            names[n - 1] = Some(sp);
+                            n
+                        }
+                    };
+                    out.extend_from_slice(format!("${num}").as_bytes());
+                    i = j;
+                } else {
+                    // A lone `:`/`@`/`$` (punctuation, `::` cast, …) is not a
+                    // parameter — copy it verbatim.
+                    out.push(c);
+                    i += 1;
+                }
+            }
+            _ => {
+                out.push(c);
+                i += 1;
             }
         }
-    });
-    auto.max(max_num)
+    }
+    if names.len() < n_var {
+        names.resize(n_var, None);
+    }
+    // `out` is original bytes plus ASCII `$K` — always valid UTF-8.
+    let rewritten = String::from_utf8(out).unwrap_or_else(|_| sql.to_string());
+    ParamScan {
+        rewritten,
+        count: n_var,
+        names,
+    }
 }
 
 /// `sqlite3_complete`: true if `sql` forms one or more complete statements —
@@ -128,47 +282,6 @@ pub fn is_complete(sql: &str) -> bool {
         }
     });
     last == Some(b';')
-}
-
-/// The name of each bound parameter in appearance order, for
-/// `sqlite3_bind_parameter_name`. A named parameter (`:name`, `@name`,
-/// `$name` where `name` starts with a letter or `_`) yields `Some` of its
-/// spelling *including* the leading sigil and a trailing NUL; an anonymous or
-/// numbered parameter (`?`, `?12`, `$3`) yields `None`. The vector length
-/// matches the sequential-parameter count (`?`/named tokens each advance the
-/// index; explicit `?N`/`$N` numbers are not gap-filled — mpedb refuses to mix
-/// the styles, so in practice a statement is all-`?`, all-`$N`, or all-named).
-pub fn param_names(sql: &str) -> Vec<Option<Vec<u8>>> {
-    let b = sql.as_bytes();
-    let mut out: Vec<Option<Vec<u8>>> = Vec::new();
-    scan_code(sql, |i, c| {
-        match c {
-            b'?' => {
-                // `?` or `?NNN` — anonymous/numbered, no name.
-                out.push(None);
-            }
-            b'$' | b':' | b'@' => {
-                let mut j = i + 1;
-                // `$3` is numbered (no name); `$a`/`:a`/`@a` is named.
-                if j < b.len() && (b[j].is_ascii_alphabetic() || b[j] == b'_') {
-                    let start = i; // include the sigil
-                    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
-                        j += 1;
-                    }
-                    let mut name = b[start..j].to_vec();
-                    name.push(0);
-                    out.push(Some(name));
-                } else if c == b'$' && j < b.len() && b[j].is_ascii_digit() {
-                    // `$NNN` — numbered positional, no name.
-                    out.push(None);
-                }
-                // A lone `:`/`@` (e.g. a cast `::`, or punctuation) is not a
-                // parameter and contributes nothing.
-            }
-            _ => {}
-        }
-    });
-    out
 }
 
 /// The leading keyword classification the shim acts on.
@@ -282,12 +395,61 @@ mod tests {
         assert!(!is_blank("SELECT 1"));
     }
 
+    /// Convenience: the per-number spellings a scan produced, as `Option<&str>`.
+    fn spellings(sql: &str) -> Vec<Option<String>> {
+        scan_params(sql)
+            .names
+            .iter()
+            .map(|n| {
+                n.as_ref().map(|b| {
+                    String::from_utf8(b[..b.len() - 1].to_vec()).unwrap()
+                })
+            })
+            .collect()
+    }
+
     #[test]
     fn counts_params() {
-        assert_eq!(param_count("SELECT ?, ?, ?"), 3);
-        assert_eq!(param_count("SELECT $1, $2, $2"), 2);
-        assert_eq!(param_count("SELECT '?', ?"), 1);
-        assert_eq!(param_count("SELECT 1"), 0);
+        assert_eq!(scan_params("SELECT ?, ?, ?").count, 3);
+        // `$n` is a *named* parameter (sqlite semantics), assigned sequentially —
+        // so `$1, $2, $2` is two distinct names reused, count 2.
+        assert_eq!(scan_params("SELECT $1, $2, $2").count, 2);
+        assert_eq!(scan_params("SELECT '?', ?").count, 1);
+        assert_eq!(scan_params("SELECT 1").count, 0);
+    }
+
+    #[test]
+    fn rewrites_named_to_numbered() {
+        // Named params become $K, sharing one numbering space; a `?` inside a
+        // string literal is untouched.
+        let s = scan_params("SELECT :a, @b, $c, :a WHERE x = '? :a'");
+        assert_eq!(s.count, 3);
+        assert_eq!(s.rewritten, "SELECT $1, $2, $3, $1 WHERE x = '? :a'");
+        assert_eq!(
+            spellings("SELECT :a, @b, $c, :a WHERE x = '? :a'"),
+            vec![Some(":a".into()), Some("@b".into()), Some("$c".into())]
+        );
+    }
+
+    #[test]
+    fn param_numbering_matches_sqlite() {
+        // Verified against sqlite 3.45 (see the shim's probe): all kinds share
+        // one numbering space, reuse repeats a number, `?N` sets an explicit slot.
+        assert_eq!(scan_params("SELECT ?, ?, ?").rewritten, "SELECT $1, $2, $3");
+        assert_eq!(scan_params("SELECT ?3, ?").count, 4);
+        assert_eq!(scan_params("SELECT ?3, ?").rewritten, "SELECT $3, $4");
+        assert_eq!(scan_params("SELECT :a, ?3").rewritten, "SELECT $1, $3");
+        assert_eq!(scan_params("SELECT :a, ?5, :b").count, 6);
+        assert_eq!(scan_params("SELECT :a, ?5, :b").rewritten, "SELECT $1, $5, $6");
+        // `$5` is a name, not a position → count 1.
+        assert_eq!(scan_params("SELECT $5").count, 1);
+        assert_eq!(scan_params("SELECT $5").rewritten, "SELECT $1");
+        assert_eq!(scan_params("SELECT $2, $1").rewritten, "SELECT $1, $2");
+        // Comment/line-comment bodies are preserved and never scanned.
+        assert_eq!(
+            scan_params("SELECT ? /* :not */ -- :also\n, ?").rewritten,
+            "SELECT $1 /* :not */ -- :also\n, $2"
+        );
     }
 
     #[test]

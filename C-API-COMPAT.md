@@ -44,9 +44,9 @@ clear error). Result-code **integers match sqlite exactly** (`SQLITE_OK=0`,
 | `sqlite3_bind_text` | ✅ | Copies the bytes (UTF-8, lossy on invalid input); honors a custom destructor, ignores `SQLITE_STATIC`/`SQLITE_TRANSIENT` |
 | `sqlite3_bind_blob` | ✅ | Copies the bytes; destructor handled as for `_text` |
 | `sqlite3_bind_null` | ✅ | |
-| `sqlite3_bind_parameter_count` | ✅ | Counts `?`/`$N` placeholders (quote/comment aware) |
-| `sqlite3_bind_parameter_index` | 🚧 | Maps `?N`/`$N`/`:N` to its number; alphabetic named params (`:name`) → 0 (mpedb has no named params) |
-| `sqlite3_bind_parameter_name` | 🚧 | Returns the `idx`-th parameter's spelling (sigil included) for a named `:a`/`@a`/`$a`, or NULL for anonymous/numbered `?`/`?N`/`$N`. Metadata only — mpedb binds positionally |
+| `sqlite3_bind_parameter_count` | ✅ | Highest parameter number used, all kinds sharing one numbering space (quote/comment aware) — `?`, `?N`, and named `:a`/`@a`/`$a` |
+| `sqlite3_bind_parameter_index` | ✅ | Returns a parameter's number by its spelling (sigil included, e.g. `:name`); unknown/sigil-less → 0. Answered from the prepare-time name map |
+| `sqlite3_bind_parameter_name` | ✅ | Returns the `idx`-th parameter's spelling (sigil included) for a named `:a`/`@a`/`$a` or an explicit `?N`, or NULL for an anonymous `?`. The shim rewrites named→numbered before mpedb parses |
 | `sqlite3_clear_bindings` | ✅ | |
 | index out of `1..=count` | ✅ | → `SQLITE_RANGE` |
 
@@ -207,7 +207,17 @@ Addressed since the import-loads milestone (see the tables above): the facade
 common `SELECT … FROM sqlite_master` introspection forms — the single biggest
 gap for Django's connection setup and schema editor is now covered.
 
-**Resolved (the two biggest Python/Django blockers):**
+**Resolved (the three biggest Python/Django blockers):**
+- ✅ **Named parameters** (`:name`, `@name`, `$name`) — the shim runs a
+  quote/comment-aware scan at prepare that assigns each parameter a number
+  exactly as sqlite does (all kinds share one space; a repeated name reuses its
+  number; a bare `?` takes the next), rewrites the SQL so mpedb's numbered-`$N`
+  binder sees `$K` placeholders, and answers `bind_parameter_count`/`_name`/
+  `_index` from the maps. mpedb's native binder stays positional — this is
+  shim-only. **DB-API battery now 23/23.** Note (sqlite-faithful, verified
+  against sqlite 3.45): the `$` sigil is a *named* parameter, so `$5` is the name
+  `$5` assigned the next sequential number, NOT positional slot 5 — matching
+  sqlite, not mpedb-native `$N`.
 - ✅ **Implicit `rowid`** — a PK-less `CREATE TABLE t(a, b)` now synthesizes a
   hidden auto-increment integer `rowid` as the key, exactly like sqlite;
   `SELECT *` hides it, `rowid`/`_rowid_`/`oid` address it, INSERT auto-assigns it,
@@ -219,27 +229,23 @@ gap for Django's connection setup and schema editor is now covered.
 
 Still blocking (ranked by real-app impact):
 
-1. **Named parameters** (`:name`) are unsupported by mpedb's SQL binder; only
-   `?`/`$N`. `sqlite3_bind_parameter_name` reports them, but binding by name
-   still fails. The single remaining DB-API battery gap (22/23). Django uses
-   `%s`/`?`-style params, so lower priority than it looks — but it's now the
-   top C-API item.
-2. **No user-defined functions/collations.** `sqlite3_create_function_v2` /
+1. **No user-defined functions/collations.** `sqlite3_create_function_v2` /
    `_create_collation_v2` are exported but *refuse* (so `import` works); Django
    registers a few (e.g. `django_date_extract`, `django_power`) through the
    C-API and needs them to actually run.
-3. **Fixed database size** vs. sqlite's unbounded growth (16 MiB ephemeral /
+2. **Fixed database size** vs. sqlite's unbounded growth (16 MiB ephemeral /
    64 MiB file-backed here); exceeding it is `SQLITE_FULL`.
-4. **`sqlite_master` breadth** — views and indexes are not listed; complex
+3. **`sqlite_master` breadth** — views and indexes are not listed; complex
    `WHERE`/join forms error rather than returning wrong metadata.
 
 ## Verification
 
 - `cargo test -p mpedb-capi` (build/test **standalone** — the crate is excluded
-  from the unified workspace build because it exports `sqlite3_*`) — 13 Rust FFI
+  from the unified workspace build because it exports `sqlite3_*`) — 15 Rust FFI
   tests (open/create/prepare/bind/step/column/exec/errmsg/constraint/
   transactions/persistence/tail/`last_insert_rowid`/`PRAGMA table_info`/
-  `sqlite_master`) + `sql`-scanner unit tests + a **C smoke test**
+  `sqlite_master`/named-params-by-index/named+positional-mixed) + `sql`-scanner
+  unit tests (incl. sqlite-matching parameter numbering) + a **C smoke test**
   (`tests/smoke.c` compiled against `sqlite3.h` and linked to the cdylib) + the
   **Python preload test** below.
 - `tests/py_preload.rs` → `tests/py_sqlite3_preload.py` — runs CPython's own
@@ -251,9 +257,9 @@ Still blocking (ranked by real-app impact):
   connection/cursor/execute/executemany/fetch*/description/type round-trip/
   transactions/executescript/IntegrityError). Run it against the shim
   (`LD_PRELOAD=<cdylib> python3 …/dbapi_battery.py`) and against stock sqlite3
-  (no preload) for a baseline. **Current: stock 23/23; shim 22/23** — after
-  implicit-rowid + DDL-in-transaction landed, the only remaining gap is named
-  `:params` (blocker 1). No wrong answers, only refusals.
+  (no preload) for a baseline. **Current: stock 23/23; shim 23/23** — with named
+  `:params` now rewritten to numbered placeholders, the shim matches stock across
+  the whole battery. No wrong answers, only refusals.
 - `tests/dbapi_extra.py` — companion probes over EXPLICIT-PK tables (row_factory/
   `sqlite3.Row`, cursor-as-iterator, arraysize, connection context manager,
   aliased/aggregate column names, unicode+blob, executescript, error classes).
