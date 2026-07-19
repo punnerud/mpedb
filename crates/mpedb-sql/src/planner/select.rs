@@ -252,6 +252,19 @@ fn check_distinct_order_by(s: &ast::SelectStmt, table: &TableDef) -> Result<()> 
     Ok(())
 }
 
+/// Rewrite a single-table `SELECT *` over an implicit-rowid table into an
+/// explicit item list of the VISIBLE columns (#94). The hidden trailing `rowid`
+/// is dropped, so the resulting projection, ORDER-BY ordinals and DISTINCT all
+/// operate over exactly the columns sqlite's `SELECT *` would show.
+fn expand_implicit_rowid_star(s: &ast::SelectStmt, table: &TableDef) -> ast::SelectStmt {
+    let items = table
+        .visible_columns()
+        .iter()
+        .map(|c| (ast::Expr::Col(c.name.clone()), None))
+        .collect();
+    ast::SelectStmt { items: Some(items), ..s.clone() }
+}
+
 pub(super) fn plan_select<'s>(
     s: &ast::SelectStmt,
     schema: &'s Schema,
@@ -318,6 +331,19 @@ pub(super) fn plan_select<'s>(
             s, schema, n_params, catalog, mode, consts, subplans, slot_types, cte,
         );
     }
+    // `SELECT *` over an implicit-rowid table (#94): expand to the VISIBLE columns
+    // as explicit items BEFORE projection/ORDER BY, so the hidden trailing rowid
+    // never enters the output and every downstream stage (projection width, the
+    // ORDER-BY ordinal bound, DISTINCT) needs no special-casing — the same trick
+    // the USING-star and RIGHT-JOIN rewrites already use. Explicit-PK tables keep
+    // the `None` fast path unchanged.
+    let rowid_star;
+    let s = if s.items.is_none() && table.implicit_rowid {
+        rowid_star = expand_implicit_rowid_star(s, table);
+        &rowid_star
+    } else {
+        s
+    };
     let mut binder = match &s.alias {
         Some(a) => Binder::with_scope(Scope::single_named(a.clone(), table), eff_params, true),
         None => Binder::new(table, eff_params, true),

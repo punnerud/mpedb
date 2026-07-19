@@ -673,9 +673,10 @@ fn plan_returning(
 ) -> Result<Option<Vec<Projection>>> {
     let Some(items) = r else { return Ok(None) };
     let Some(items) = items else {
-        // RETURNING *
+        // RETURNING * — the VISIBLE columns only; the hidden implicit rowid is
+        // never surfaced by a star (#94), exactly as `SELECT *`.
         return Ok(Some(
-            (0..table.columns.len() as u16).map(Projection::Column).collect(),
+            (0..table.visible_column_count() as u16).map(Projection::Column).collect(),
         ));
     };
     let mut proj = Vec::with_capacity(items.len());
@@ -896,7 +897,10 @@ fn plan_insert(
             }
             cols
         }
-        None => (0..table.columns.len() as u16).collect(),
+        // No column list: the VISIBLE columns, in order. A hidden implicit rowid
+        // (#94) is NOT listed — it falls through to `InsertSource::Default` below
+        // and the rowid-alias auto-assign (#85) fills it with `max(rowid)+1`.
+        None => (0..table.visible_column_count() as u16).collect(),
     };
     let mut slot_of_col: Vec<Option<usize>> = vec![None; table.columns.len()];
     for (slot, &col) in listed.iter().enumerate() {
