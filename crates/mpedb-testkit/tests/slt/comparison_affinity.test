@@ -1,0 +1,314 @@
+# COMPARISON AFFINITY — the query-time half of sqlite's affinity rules.
+#
+# Every expected value here was produced by running the same program through
+# sqlite3 3.45.1 rather than reasoned out.
+#
+# Store-time affinity converts a value on its way INTO a NUMERIC column
+# ('1000' → the integer 1000). Comparison affinity is the other half: sqlite
+# applies a column's affinity to the OTHER OPERAND before comparing, so
+#
+#   price < '40.0'      compares against the NUMBER 40.0, not the text
+#
+# and only then compares — by storage class, which is what makes a value the
+# affinity could NOT convert ('abc' in a NUMERIC column) still have an answer
+# rather than an error: every number sorts below every text.
+#
+# The two halves have to travel together. Applying the affinity without the
+# class order leaves a stray text row erroring out an otherwise numeric query;
+# ordering by class WITHOUT applying the affinity answers `price < '40.0'` with
+# "every number is smaller than a text" — the wrong answer, not a conservative
+# one. mpedb emits both, and only for a comparison touching a typeless (`any`)
+# column; every other comparison keeps mpedb's rigid refusal.
+#
+# `price` here is `numeric` (sqlite's NUMERIC affinity, mpedb's `any` storage);
+# `v` is `any` with NO declared type, which in sqlite is BLOB/"none" affinity:
+# it converts NOTHING, so `v = 35` and `v = '35'` are different questions.
+#
+# schema:
+# [[table]]
+# name = "t"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "price"
+#   type = "numeric"
+#   nullable = true
+#
+#   [[table.column]]
+#   name = "v"
+#   type = "any"
+#   nullable = true
+#
+#   [[table.column]]
+#   name = "s"
+#   type = "text"
+#   nullable = true
+#
+#   [[table.column]]
+#   name = "n"
+#   type = "int64"
+#   nullable = true
+# end schema
+
+statement ok
+INSERT INTO t (id, price, v, s, n) VALUES (1, 1000, 1000, '1000', 1000)
+
+statement ok
+INSERT INTO t (id, price, v, s, n) VALUES (2, 35, '35', '35', 35)
+
+# 'abc' is a NUMERIC column's unconvertible value: it stays TEXT.
+statement ok
+INSERT INTO t (id, price, v, s, n) VALUES (3, 'abc', 'abc', 'abc', 7)
+
+statement ok
+INSERT INTO t (id, price, v, s, n) VALUES (4, NULL, NULL, NULL, NULL)
+
+statement ok
+INSERT INTO t (id, price, v, s, n) VALUES (5, '40.5', x'41', '40.5', 40)
+
+# The column holds an integer, a real and a text at once.
+query TI nosort
+SELECT typeof(price), id FROM t ORDER BY price, id
+----
+null
+4
+integer
+2
+real
+5
+integer
+1
+text
+3
+
+# --- the repro ------------------------------------------------------------
+
+query I nosort
+SELECT id FROM t WHERE price < '40.0' ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE price <= '35' ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE price = '35' ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE price <> '35' ORDER BY id
+----
+1
+3
+5
+
+# The row with 'abc' answers `>=` because text sorts ABOVE every number, and
+# 40.5 does too — the affinity converted BOTH sides, the class order ranked
+# what was left.
+query I nosort
+SELECT id FROM t WHERE price >= '40.0' ORDER BY id
+----
+1
+3
+5
+
+# Reversed operands, same rule.
+query I nosort
+SELECT id FROM t WHERE '40.0' > price ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE '35' = price ORDER BY id
+----
+2
+
+# --- a text the affinity cannot convert ------------------------------------
+
+query I nosort
+SELECT id FROM t WHERE price = 'abc' ORDER BY id
+----
+3
+
+# Every number is below every text, so the three numeric rows match and the
+# text row does not (it equals 'abc').
+query I nosort
+SELECT id FROM t WHERE price < 'abc' ORDER BY id
+----
+1
+2
+5
+
+query I nosort
+SELECT id FROM t WHERE price > 'abc' ORDER BY id
+----
+
+# --- a plain number against the same column --------------------------------
+
+# The stray 'abc' row is compared by class rather than erroring the query.
+query I nosort
+SELECT id FROM t WHERE price < 40 ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE price = 1000 ORDER BY id
+----
+1
+
+# --- BETWEEN (two comparisons) ---------------------------------------------
+
+query I nosort
+SELECT id FROM t WHERE price BETWEEN '30' AND '40' ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE price BETWEEN 30 AND 41 ORDER BY id
+----
+2
+5
+
+query I nosort
+SELECT id FROM t WHERE price NOT BETWEEN '30' AND '40' ORDER BY id
+----
+1
+3
+5
+
+# --- NULL on either side ---------------------------------------------------
+
+query I nosort
+SELECT id FROM t WHERE price < NULL ORDER BY id
+----
+
+query I nosort
+SELECT id FROM t WHERE NULL = price ORDER BY id
+----
+
+query I nosort
+SELECT id FROM t WHERE price IS NULL ORDER BY id
+----
+4
+
+# --- the TYPELESS column: no affinity, nothing converted -------------------
+
+# `v` holds the integer 1000, the TEXT '35', the text 'abc', NULL and a blob.
+# Nothing is converted, so `v = '35'` matches and `v = 35` does not.
+query I nosort
+SELECT id FROM t WHERE v = '35' ORDER BY id
+----
+2
+
+query I nosort
+SELECT id FROM t WHERE v = 35 ORDER BY id
+----
+
+# 1000 is the only number, and every number is below every text and blob.
+query I nosort
+SELECT id FROM t WHERE v < 40 ORDER BY id
+----
+
+query I nosort
+SELECT id FROM t WHERE v >= 1000 ORDER BY id
+----
+1
+2
+3
+5
+
+query I nosort
+SELECT id FROM t WHERE v > 'a' ORDER BY id
+----
+3
+5
+
+# The blob is above every text.
+query I nosort
+SELECT id FROM t WHERE v < x'42' ORDER BY id
+----
+1
+2
+3
+5
+
+# --- column against column -------------------------------------------------
+
+# Both operands carry an affinity and one is numeric, so NUMERIC applies to
+# both: the typeless column's text '35' converts for THIS comparison.
+query I nosort
+SELECT id FROM t WHERE v = price ORDER BY id
+----
+1
+2
+3
+
+query I nosort
+SELECT id FROM t WHERE v < n ORDER BY id
+----
+
+query I nosort
+SELECT id FROM t WHERE price < n ORDER BY id
+----
+
+# A TEXT column against a typeless one: both have an affinity, neither is
+# numeric, so sqlite applies NOTHING and compares by class. `s` is text
+# throughout, so only the rows where `v` is text can match.
+query I nosort
+SELECT id FROM t WHERE v = s ORDER BY id
+----
+2
+3
+
+# …and against the NUMERIC column, where the numeric affinity DOES apply, so
+# every non-NULL row matches.
+query I nosort
+SELECT id FROM t WHERE price = s ORDER BY id
+----
+1
+2
+3
+5
+
+query I nosort
+SELECT id FROM t WHERE s < price ORDER BY id
+----
+
+# --- affinity belongs to the OPERAND, not to an expression around it -------
+
+# A CAST has its target's affinity, and the comparison then applies TEXT to
+# both sides — which changes nothing here, both are already text.
+query I nosort
+SELECT id FROM t WHERE CAST(price AS TEXT) = '35' ORDER BY id
+----
+2
+
+# --- the rest of the column's semantics are unchanged ----------------------
+
+query III
+SELECT count(*), count(price), count(DISTINCT price) FROM t
+----
+5
+4
+4
+
+query I nosort
+SELECT id FROM t WHERE price < '40.0' OR price > 500 ORDER BY id
+----
+1
+2
+3
+
+query I nosort
+SELECT id FROM t WHERE NOT (price < '40.0') ORDER BY id
+----
+1
+3
+5

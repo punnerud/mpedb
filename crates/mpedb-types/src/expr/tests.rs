@@ -435,6 +435,97 @@ fn collated_compare_and_in_semantics_and_codec() {
     assert!(matches!(ExprProgram::decode(&buf, &mut 0), Err(Error::Corrupt(_))));
 }
 
+/// Comparison affinity + the storage-class comparison: the two opcodes the
+/// binder emits for `price < '40.0'` over a typeless column.
+#[test]
+fn comparison_affinity_and_class_compare_semantics_and_codec() {
+    use crate::value::{Affinity, Collation};
+    use std::slice::from_ref;
+    // `affinity(col0, NUMERIC) < affinity('40.0', NUMERIC)`.
+    let p = prog(
+        vec![
+            Instr::PushCol(0),
+            Instr::Affinity(Affinity::Numeric),
+            Instr::PushConst(0),
+            Instr::Affinity(Affinity::Numeric),
+            Instr::CmpClass(CmpKind::Lt, Collation::Binary),
+        ],
+        vec![Value::Text("40.0".into())],
+    );
+    // The text operand converts to 40.0 and the numbers compare numerically —
+    // sqlite's answer for a NUMERIC column holding 1000 and 35.
+    assert_eq!(p.eval(&[Value::Int(1000)], &[]).unwrap(), Value::Bool(false));
+    assert_eq!(p.eval(&[Value::Int(35)], &[]).unwrap(), Value::Bool(true));
+    assert_eq!(p.eval(&[Value::Float(40.5)], &[]).unwrap(), Value::Bool(false));
+    // A value the affinity CANNOT convert stays text and is ranked by class:
+    // every number is below every text, so 'abc' is not < 40.0.
+    assert_eq!(p.eval(&[Value::Text("abc".into())], &[]).unwrap(), Value::Bool(false));
+    // NULL still propagates as NULL (3VL), not as "incomparable".
+    assert_eq!(p.eval(&[Value::Null], &[]).unwrap(), Value::Null);
+    // A blob is above every text, which is above every number.
+    assert_eq!(p.eval(&[Value::Blob(vec![0x41])], &[]).unwrap(), Value::Bool(false));
+
+    // **`Affinity` is NOT `Cast`**, and this is the divergence that forced its
+    // own opcode: a CAST forces a number out of anything, affinity converts
+    // only when the whole string is numeric.
+    let cast = prog(
+        vec![Instr::PushCol(0), Instr::Cast(Affinity::Numeric)],
+        vec![],
+    );
+    let aff = prog(
+        vec![Instr::PushCol(0), Instr::Affinity(Affinity::Numeric)],
+        vec![],
+    );
+    for (input, cast_out, aff_out) in [
+        (Value::Text("40.0".into()), Value::Int(40), Value::Int(40)),
+        (Value::Text("abc".into()), Value::Int(0), Value::Text("abc".into())),
+        (Value::Text("12ab".into()), Value::Int(12), Value::Text("12ab".into())),
+        (Value::Text("".into()), Value::Int(0), Value::Text("".into())),
+        (Value::Blob(b"7".to_vec()), Value::Int(7), Value::Blob(b"7".to_vec())),
+    ] {
+        assert_eq!(cast.eval(from_ref(&input), &[]).unwrap(), cast_out, "cast {input:?}");
+        assert_eq!(aff.eval(from_ref(&input), &[]).unwrap(), aff_out, "affinity {input:?}");
+    }
+
+    // A `Bool`/`Timestamp` has no sqlite storage class, so it is REFUSED here
+    // rather than given an invented rank.
+    assert!(p.eval(&[Value::Bool(true)], &[]).is_err());
+
+    // The collated form folds TEXT under the collation, numbers untouched.
+    let nc = prog(
+        vec![
+            Instr::PushCol(0),
+            Instr::PushConst(0),
+            Instr::CmpClass(CmpKind::Eq, Collation::NoCase),
+        ],
+        vec![Value::Text("ABC".into())],
+    );
+    assert_eq!(nc.eval(&[Value::Text("abc".into())], &[]).unwrap(), Value::Bool(true));
+    assert_eq!(nc.eval(&[Value::Int(1)], &[]).unwrap(), Value::Bool(false));
+
+    // codec: roundtrip + truncation safety on both new opcodes.
+    for prog in [&p, &aff, &nc] {
+        let mut buf = Vec::new();
+        prog.encode_into(&mut buf);
+        let mut pos = 0;
+        assert_eq!(&ExprProgram::decode(&buf, &mut pos).unwrap(), prog);
+        assert_eq!(pos, buf.len());
+        for cut in 0..buf.len() {
+            let _ = ExprProgram::decode(&buf[..cut], &mut 0); // must not panic
+        }
+    }
+    // Bad tag bytes are Corrupt, not a panic: the collation of a CmpClass…
+    let mut buf = Vec::new();
+    p.encode_into(&mut buf);
+    *buf.last_mut().unwrap() = 0x7f;
+    assert!(matches!(ExprProgram::decode(&buf, &mut 0), Err(Error::Corrupt(_))));
+    // …and the affinity byte of an Affinity.
+    let mut buf = Vec::new();
+    aff.encode_into(&mut buf);
+    *buf.last_mut().unwrap() = 0x7f;
+    assert!(matches!(ExprProgram::decode(&buf, &mut 0), Err(Error::Corrupt(_))));
+}
+
 #[test]
 fn rejects_malformed_programs() {
     assert!(ExprProgram::new(vec![Instr::Eq], vec![]).is_err()); // underflow
