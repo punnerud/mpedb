@@ -1,4 +1,4 @@
-//! The table-count ceiling (design/DESIGN-TABLE-CAP.md, PLAN_FORMAT 41).
+//! The table-count ceiling (design/DESIGN-TABLE-CAP.md, PLAN_FORMAT 42).
 //!
 //! `MAX_TABLES` was 128 with an 8-slot system reserve — 120 usable, counting
 //! LIFETIME creates because a dropped id is never reused. That is the ceiling
