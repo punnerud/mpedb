@@ -2080,18 +2080,28 @@ impl<'a> Binder<'a> {
     fn static_type(&self, e: &BExpr) -> Ty {
         match e {
             BExpr::Const(v) => v.column_type(),
-            // An `excluded.<c>` binds to Col(n + i); fold the index back so a
-            // second-half reference reports the column's real type instead of
-            // indexing off the end.
-            // `excluded.<c>` binds to Col(n + i) over [existing ‖ proposed], so
-            // fold the index back into the base row's width.
+            // A column reference resolves through the WHOLE evaluated tuple —
+            // `Scope::column_shape` walks the scoped tables in slot order, the
+            // same walk `Scope::resolve` used to hand out the slot.
+            //
+            // This used to read `scope.only().columns[…]`, which ASSERTS on a
+            // scope wider than one table: `SELECT a.id FROM a JOIN b ON … WHERE
+            // ABS(b.id) = 1` panicked in the binder, because `abs`/`round`/
+            // `ceil`/`floor`/`trunc`/`hex` are the functions whose return type
+            // IS their argument's, so binding one over a joined column came
+            // through here. The scope was never single-table on this path; only
+            // the lookup assumed it was.
+            //
+            // `excluded.<c>` binds to Col(n + i) over `[existing ‖ proposed]`,
+            // which is the one tuple WIDER than the scope: fold the index back
+            // into the scope's width so a second-half reference reports the
+            // column's real type instead of falling off the end. That scope is
+            // single-table by construction (an ON CONFLICT target is one
+            // table), so the fold and the join walk never interact.
             BExpr::Col(i) => {
                 let n = self.scope.width();
-                self.scope
-                    .only()
-                    .columns
-                    .get(*i as usize % n.max(1))
-                    .map(|c| c.ty)
+                let slot = (*i as usize % n.max(1)) as u16;
+                self.scope.column_shape(slot).map(|(t, _)| t)
             }
             BExpr::Param(i) => self.param_types[*i as usize],
             BExpr::Unary(BUnOp::ToFloat, _) => Some(ColumnType::Float64),
