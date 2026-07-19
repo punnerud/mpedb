@@ -292,4 +292,7 @@ impl TxnCtx for WorkingTableCtx<'_, '_> {
     fn charge_work(&self, n: u64, which: &dyn Fn() -> String) -> Result<()> {
         self.inner.charge_work(n, which)
     }
+    fn join_cells_budget(&self) -> u64 {
+        self.inner.join_cells_budget()
+    }
 }

@@ -97,7 +97,7 @@ fn fill(db: &Database, table: &str, n: u64) {
 /// Run `sql`, assert it aborted with `RuntimeBudget`, and return `(used, which)`.
 fn expect_budget(db: &Database, sql: &str) -> (u64, String) {
     match db.query(sql, &[]) {
-        Err(Error::RuntimeBudget { used, limit, which }) => {
+        Err(Error::RuntimeBudget { used, limit, which, .. }) => {
             assert!(used > limit, "used {used} must exceed limit {limit}");
             (used, which)
         }
@@ -222,5 +222,106 @@ fn unlimited_budget_never_trips() {
     match db.query("SELECT a.id FROM a, b", &[]) {
         Ok(ExecResult::Rows { rows, .. }) => assert_eq!(rows.len(), 3600),
         other => panic!("unlimited budget should run the 3600-row join: {other:?}"),
+    }
+}
+
+// ===================== the join-materialization cell budget =====================
+
+/// Six 2-column tables — the cheap reproduction of `select5.test`'s
+/// `join-17-4` SHAPE: an N-way comma join whose only constant anchor sits on
+/// the LAST table, so every earlier step is a cross join and the intermediate
+/// product multiplies by 30 per step (30^6 = 729M full-product rows).
+fn open_sixway(max_join_cells: u64) -> Tmp {
+    let dir = if std::path::Path::new("/dev/shm").is_dir() {
+        "/dev/shm"
+    } else {
+        "/tmp"
+    };
+    let path = format!(
+        "{dir}/mpedb-joincells-{}-{}.mpedb",
+        std::process::id(),
+        UNIQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let mut toml = format!(
+        "[database]\npath = \"{path}\"\nsize_mb = 64\nmax_readers = 8\n\n\
+         [runtime]\nmax_work_rows = 0\nmax_join_cells = {max_join_cells}\n"
+    );
+    for t in 1..=6 {
+        toml.push_str(&format!(
+            "\n[[table]]\nname = \"t{t}\"\nprimary_key = [\"id\"]\n\
+             \x20 [[table.column]]\n  name = \"id\"\n  type = \"int64\"\n\
+             \x20 [[table.column]]\n  name = \"val\"\n  type = \"int64\"\n"
+        ));
+    }
+    let db = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    for t in 1..=6 {
+        fill(&db, &format!("t{t}"), 30);
+    }
+    Tmp { db, path }
+}
+
+/// The runaway 17-way comma-join shape, scaled down: with `max_work_rows`
+/// UNLIMITED (isolating the cells budget), a 6-way cross join whose only
+/// anchor is on the last table must abort on `max_join_cells` — clean,
+/// deterministic, and attributed — instead of materializing 729M rows and
+/// letting the OOM killer take the process (the `select5.test` failure mode).
+#[test]
+fn late_anchor_cross_join_trips_the_cells_budget() {
+    let db = open_sixway(100_000);
+    let sql = "SELECT t1.id FROM t1, t2, t3, t4, t5, t6 WHERE t6.val = 5";
+
+    let run = || match db.query(sql, &[]) {
+        Err(Error::RuntimeBudget { kind, used, limit, which }) => {
+            assert_eq!(kind, mpedb::BudgetKind::JoinCells, "the CELLS budget must trip");
+            assert!(used > limit, "used {used} must exceed limit {limit}");
+            (used, which)
+        }
+        other => panic!("expected a JoinCells RuntimeBudget, got {other:?}"),
+    };
+    let (used1, which1) = run();
+    let (used2, which2) = run();
+    assert_eq!(used1, used2, "a cell counter must abort at the same count every run");
+    assert!(used1 > 100_000, "used {used1} must have crossed the 100k-cell limit");
+    assert!(
+        which1.contains("nested-loop join with"),
+        "attribution should name the join step: {which1}"
+    );
+    assert_eq!(which1, which2, "attribution must be stable too");
+
+    // The Display names the unit and the RIGHT knob (max_join_cells, not
+    // max_work_rows — the work budget is unlimited here and never tripped).
+    let msg = match db.query(sql, &[]) {
+        Err(e @ Error::RuntimeBudget { .. }) => e.to_string(),
+        other => panic!("expected RuntimeBudget, got {other:?}"),
+    };
+    assert!(msg.contains("runtime budget exceeded"), "msg: {msg}");
+    assert!(msg.contains("live joined cells"), "msg should state the unit: {msg}");
+    assert!(msg.contains("max_join_cells"), "msg should hint the right knob: {msg}");
+    assert!(!msg.contains("max_work_rows"), "msg must not hint the wrong knob: {msg}");
+}
+
+/// The same shape UNDER the budget completes with the right answer — the cell
+/// accounting releases superseded stages, so a join is charged for what it
+/// HOLDS, not for everything it ever built. 3 tables => at the widest ~166k
+/// live cells (27000 rows x 6 wide plus the superseded stage), which fits a
+/// 300k budget that the 6-way bomb above could never pass.
+#[test]
+fn bounded_join_under_the_cells_budget_completes() {
+    let db = open_sixway(300_000);
+    match db.query("SELECT t1.id FROM t1, t2, t3 WHERE t3.val = 5", &[]) {
+        // 30 x 30 x (30 rows with val = 5 -> ids 5,105.. none; val = id % 100
+        // over ids 1..=30 gives exactly one row with val 5: id 5)
+        Ok(ExecResult::Rows { rows, .. }) => assert_eq!(rows.len(), 900),
+        other => panic!("3-way join under the cells budget should succeed: {other:?}"),
+    }
+}
+
+/// `max_join_cells = 0` is the unlimited sentinel, mirroring `max_work_rows`.
+#[test]
+fn unlimited_cells_budget_never_trips() {
+    let db = open_sixway(0);
+    match db.query("SELECT t1.id FROM t1, t2, t3, t4 WHERE t4.val = 5", &[]) {
+        Ok(ExecResult::Rows { rows, .. }) => assert_eq!(rows.len(), 27_000),
+        other => panic!("unlimited cells budget should run the join: {other:?}"),
     }
 }

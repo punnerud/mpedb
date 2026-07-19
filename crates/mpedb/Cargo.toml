@@ -15,10 +15,11 @@ sqlite-checkpoint = ["dep:rusqlite"]
 
 [dev-dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
-# `examples/multiproc_check.rs` forks. Nothing in the library needs libc.
-libc = { workspace = true }
 
 [dependencies]
+# The join gather's budget_fits_in_memory rlimit probe. Already in the tree
+# via mpedb-core.
+libc = { workspace = true }
 rusqlite = { version = "0.31", features = ["bundled"], optional = true }
 mpedb-sqlitefmt = { path = "../mpedb-sqlitefmt" }
 mpedb-types = { workspace = true }

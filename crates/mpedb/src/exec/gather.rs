@@ -1,5 +1,170 @@
 use super::*;
 
+/// Live-cell accounting for a nested-loop join's materialized intermediate
+/// product (the #74 budget's memory-proportional twin, `[runtime]
+/// max_join_cells`). `live` counts the `Value` cells currently HELD by
+/// [`gather_joined`] — the accumulated tuple set, the held inner side, and
+/// the next stage being built — so the counter tracks the join's resident
+/// footprint, which the work-row meter (a count of rows READ) cannot see: a
+/// 17-way cross join materializes gigabytes while still far under the 10^9
+/// work-row default. Deterministic — a pure function of data and plan — so
+/// the trip point is reproducible on every machine. `budget == 0` is the
+/// unlimited sentinel.
+struct JoinCells {
+    budget: u64,
+    live: u64,
+}
+
+impl JoinCells {
+    fn new(budget: u64) -> JoinCells {
+        JoinCells { budget, live: 0 }
+    }
+
+    /// Charge `n` newly held cells; [`Error::RuntimeBudget`] once the live
+    /// total crosses the budget. `which` is evaluated only on the error path.
+    #[inline]
+    fn charge(&mut self, n: u64, which: impl FnOnce() -> String) -> Result<()> {
+        self.live = self.live.saturating_add(n);
+        if self.budget != 0 && self.live > self.budget {
+            return Err(Error::RuntimeBudget {
+                kind: mpedb_types::BudgetKind::JoinCells,
+                limit: self.budget,
+                used: self.live,
+                which: which(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Return `n` cells whose rows were dropped (a superseded accumulator
+    /// stage, a released held inner side).
+    fn release(&mut self, n: u64) {
+        self.live = self.live.saturating_sub(n);
+    }
+}
+
+/// The clean out-of-memory error for the join accumulator's own allocations:
+/// the bulk reservations in [`gather_joined`] are fallible, so under a memory
+/// rlimit / cgroup cap an unbounded (`max_join_cells = 0`) join fails with an
+/// [`Error`] instead of aborting the host process. Best-effort — a small
+/// allocation elsewhere at the very wall can still abort; the deterministic
+/// cell budget is the primary guard.
+fn join_oom() -> Error {
+    Error::OutOfMemory { what: "a nested-loop join's intermediate rows" }
+}
+
+/// Can a join budget of `cells` plausibly be allocated by this process?
+/// ~40 B resident per cell (the calibration constant from
+/// [`mpedb_types::config::DEFAULT_MAX_JOIN_CELLS`]'s measurement), compared
+/// against the tighter of the address-space rlimit and, on Linux,
+/// `MemAvailable`. Falls back to "fits" when nothing is readable — that is
+/// today's behaviour, so an exotic platform loses nothing. The 3/4 factor
+/// leaves room for the transient candidate row and the engine's own maps.
+fn budget_fits_in_memory(cells: u64) -> bool {
+    let need = cells.saturating_mul(40);
+    let mut bound = u64::MAX;
+    unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_AS, &mut rl) == 0 && rl.rlim_cur != libc::RLIM_INFINITY {
+            bound = bound.min(rl.rlim_cur as u64);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        if let Some(kb) = s
+            .lines()
+            .find(|l| l.starts_with("MemAvailable:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            bound = bound.min(kb.saturating_mul(1024));
+        }
+    }
+    bound == u64::MAX || need <= bound / 4 * 3
+}
+
+/// Build one joined row of exactly `cap` values: `lead_nulls` NULLs (a FULL
+/// join's outer-side extension), then `head` and `tail`, then NULL-padding
+/// to `cap` (a LEFT/FULL join's inner-side extension).
+///
+/// Two regimes, chosen by the caller from the cell budget:
+///
+/// - **finite budget** (the default): the deterministic cell cap is the
+///   guard, so the build is the plain `with_capacity` + `extend_from_slice`
+///   it always was — the O(n·m) candidate loop pays nothing for the budget
+///   machinery beyond one predicted branch.
+/// - **`fallible` (budget `0` = unlimited)**: every allocation the row makes
+///   is fallible — the spine via `try_reserve_exact`, and each text/blob
+///   payload via [`try_clone_value`] (at the memory wall those per-value
+///   clones are exactly what an infallible `extend_from_slice` aborts on;
+///   observed: a 26-byte `String` clone). Scalars are cloned inline (their
+///   `Clone` cannot allocate); only heap-carrying values take the outlined
+///   fallible path, which never inlines (`List` makes it recursive).
+// inline(always): this is the body of the O(n·m) candidate loop — as a mere
+// hint the call stayed outlined and cost ~1-2 ns per candidate (measurable
+// on a 400M-candidate join).
+#[inline(always)]
+fn build_joined_row(
+    fallible: bool,
+    cap: usize,
+    lead_nulls: usize,
+    head: &[Value],
+    tail: &[Value],
+) -> Result<Vec<Value>> {
+    let mut joined;
+    if fallible {
+        joined = Vec::new();
+        joined.try_reserve_exact(cap).map_err(|_| join_oom())?;
+        joined.resize(lead_nulls, Value::Null);
+        for src in [head, tail] {
+            for v in src {
+                match v {
+                    Value::Null
+                    | Value::Int(_)
+                    | Value::Float(_)
+                    | Value::Bool(_)
+                    | Value::Timestamp(_) => joined.push(v.clone()),
+                    heap => joined.push(try_clone_value(heap)?),
+                }
+            }
+        }
+    } else {
+        joined = Vec::with_capacity(cap);
+        joined.resize(lead_nulls, Value::Null);
+        joined.extend_from_slice(head);
+        joined.extend_from_slice(tail);
+    }
+    joined.resize(cap, Value::Null);
+    Ok(joined)
+}
+
+fn try_clone_value(v: &Value) -> Result<Value> {
+    Ok(match v {
+        Value::Text(s) => {
+            let mut t = String::new();
+            t.try_reserve_exact(s.len()).map_err(|_| join_oom())?;
+            t.push_str(s);
+            Value::Text(t)
+        }
+        Value::Blob(b) => {
+            let mut c = Vec::new();
+            c.try_reserve_exact(b.len()).map_err(|_| join_oom())?;
+            c.extend_from_slice(b);
+            Value::Blob(c)
+        }
+        Value::List(xs) => {
+            let mut c = Vec::new();
+            c.try_reserve_exact(xs.len()).map_err(|_| join_oom())?;
+            for x in xs {
+                c.push(try_clone_value(x)?);
+            }
+            Value::List(c)
+        }
+        // Null/Int/Float/Bool/Timestamp carry no heap: Clone cannot allocate.
+        other => other.clone(),
+    })
+}
+
 /// `INNER JOIN`, as a nested loop over the outer scan.
 ///
 /// The order of the four tests is the security contract, not an implementation
@@ -126,9 +291,35 @@ pub(super) fn gather_joined(
     // join's unmatched-inner sweep NULL-extends on the left. Tracked from the
     // schema rather than read off `acc`, which may hold no rows.
     let mut acc_width = table_def(schema, plan, outer_table)?.columns.len();
+    // Live-cell budget on what this join HOLDS ([`JoinCells`]): seeded with
+    // the outer rows, charged per retained joined row, released when a stage
+    // is superseded. The work-row charge below bounds the O(n·m) candidates
+    // CONSIDERED; this bounds the product RETAINED — the one that eats
+    // memory when a late constant anchor leaves every earlier step a cross
+    // join (select5's `join-17-4`).
+    let mut cells = JoinCells::new(ctx.join_cells_budget());
+    cells.charge((acc.len() * acc_width) as u64, || {
+        format!("rows held by a join over \"{}\"", table_name(schema, outer_table))
+    })?;
+    // With a FINITE budget the deterministic cap above is the guard and the
+    // row build stays on the plain infallible path it always was; the
+    // explicit `max_join_cells = 0` opt-out pays for per-allocation
+    // fallibility (see `build_joined_row`).
+    //
+    // …unless the budget CANNOT FIT: the cap only guards if it trips before
+    // the memory wall, and a budget of 2^28 cells ≈ 11 GB resident never
+    // trips inside a 3 GB rlimit — measured: `select5`'s `join-17-4` died on
+    // SIGABRT with the default config, exactly the host-killing failure this
+    // budget exists to prevent. So when the budget's byte-equivalent exceeds
+    // what this process can plausibly allocate (rlimit and, on Linux,
+    // MemAvailable), the row build goes fallible too: answers are unchanged
+    // (fallibility only changes the failure MODE at the wall, abort → clean
+    // Error::OutOfMemory), the deterministic trip point is unchanged, and a
+    // healthy box still pays nothing. One probe per gather, not per row.
+    let fallible = cells.budget == 0 || !budget_fits_in_memory(cells.budget);
     for join in joins {
         let inner_width = table_def(schema, plan, join.table)?.columns.len();
-        let join_tbl = join.table; // for the #74 attribution closure
+        let join_tbl = join.table; // for the #74 attribution closures
         // An access with no OuterCol parts is resolved once: read the inner
         // side once and hold it (the pre-#49 execution — keeping it is what
         // stops an ON without equality from regressing to O(n·m) READS). One
@@ -136,7 +327,7 @@ pub(super) fn gather_joined(
         let held: Option<Vec<Vec<Value>>> = if access_has_outer(&join.access) {
             None
         } else {
-            Some(gather_rows(
+            let h = gather_rows(
                 ctx,
                 join.table,
                 &join.access,
@@ -144,7 +335,11 @@ pub(super) fn gather_joined(
                 plan,
                 params,
                 None,
-            )?)
+            )?;
+            cells.charge((h.len() * inner_width) as u64, || {
+                format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
+            })?;
+            Some(h)
         };
         // FULL: which held inner rows matched at least one outer row.
         // validate pinned FULL to a single, held (FullScan) join, so `held`
@@ -173,14 +368,18 @@ pub(super) fn gather_joined(
                 ctx.charge_work(1, &|| {
                     format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
                 })?;
-                let mut joined = Vec::with_capacity(a.len() + i.len());
-                joined.extend_from_slice(a);
-                joined.extend_from_slice(i);
+                let joined = build_joined_row(fallible, a.len() + i.len(), 0, a, i)?;
                 if join.on.eval_filter_host(&mut stack, &joined, params, ctx.host_fns())? {
                     matched = true;
                     if let Some(m) = &mut inner_matched {
                         m[ci] = true;
                     }
+                    // The memory charge, per RETAINED row: candidates that the
+                    // ON rejects were transient, but this one is now held.
+                    cells.charge(joined.len() as u64, || {
+                        format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
+                    })?;
+                    next.try_reserve(1).map_err(|_| join_oom())?;
                     next.push(joined);
                 }
             }
@@ -190,9 +389,11 @@ pub(super) fn gather_joined(
             // inner row reads as ABSENT (the outer row survives,
             // NULL-extended, never carrying the hidden row's values).
             if !matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
-                let mut joined = Vec::with_capacity(a.len() + inner_width);
-                joined.extend_from_slice(a);
-                joined.resize(a.len() + inner_width, Value::Null);
+                let joined = build_joined_row(fallible, a.len() + inner_width, 0, a, &[])?;
+                cells.charge(joined.len() as u64, || {
+                    format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
+                })?;
+                next.try_reserve(1).map_err(|_| join_oom())?;
                 next.push(joined);
             }
         }
@@ -202,19 +403,32 @@ pub(super) fn gather_joined(
         if let (Some(m), Some(h)) = (&inner_matched, &held) {
             for (ci, i) in h.iter().enumerate() {
                 if !m[ci] {
-                    let mut joined = vec![Value::Null; acc_width];
-                    joined.extend_from_slice(i);
+                    let joined =
+                        build_joined_row(fallible, acc_width + i.len(), acc_width, &[], i)?;
+                    cells.charge(joined.len() as u64, || {
+                        format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
+                    })?;
+                    next.try_reserve(1).map_err(|_| join_oom())?;
                     next.push(joined);
                 }
             }
         }
+        // This stage's inputs are dropped here: `acc` is superseded by `next`
+        // and `held` goes out of scope. Return their cells so `live` keeps
+        // tracking what the join actually holds.
+        let dropped = (acc.len() * acc_width) as u64
+            + held.as_ref().map_or(0, |h| (h.len() * inner_width) as u64);
         acc_width += inner_width;
         acc = next;
+        cells.release(dropped);
     }
     // WHERE runs once, over the full joined row — after every ON and every
     // per-table policy, because it can raise and a raise is observable.
+    // Survivors are MOVED, not cloned, so no new cells are charged; the
+    // survivor vec's own spine is the one bulk allocation, made fallible.
     if let Some(f) = joined_filter {
-        let mut kept = Vec::with_capacity(acc.len());
+        let mut kept = Vec::new();
+        kept.try_reserve_exact(acc.len()).map_err(|_| join_oom())?;
         for row in acc {
             if f.eval_filter_host(&mut stack, &row, params, ctx.host_fns())? {
                 kept.push(row);

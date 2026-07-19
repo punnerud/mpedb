@@ -16,9 +16,9 @@ pub mod value;
 pub use config::{
     BareGroupBy, Concurrency, Config, DbOptions, Durability, FilePerms, WorkspaceConfig,
     WorkspaceMember,
-    DEFAULT_MAX_WORK_ROWS, MAX_DB_SIZE_MB,
+    DEFAULT_MAX_JOIN_CELLS, DEFAULT_MAX_WORK_ROWS, MAX_DB_SIZE_MB,
 };
-pub use error::{Error, Result};
+pub use error::{BudgetKind, Error, Result};
 pub mod agg;
 pub use agg::{Accum, HostAggState, HostAggs};
 pub use expr::{CmpKind, ExprProgram, HostFns, Instr, ScalarFn};
