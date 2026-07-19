@@ -178,6 +178,39 @@ pub enum Instr {
     /// a host call, a CHECK constraint, a test) this opcode is unreachable, so
     /// the change is behavior-neutral for every existing plan.
     HostCall(u16, u16),
+    /// **Comparison affinity**: apply `Affinity` to the top of the stack, in
+    /// place. sqlite's `OP_Affinity`/`applyAffinity`, the same conversion a
+    /// value gets on its way INTO a column ([`store_affinity`]) — which is why
+    /// this is that function and not [`Instr::Cast`].
+    ///
+    /// The two are NOT interchangeable and the difference is the whole reason
+    /// this opcode exists: `CAST('abc' AS NUMERIC)` FORCES a number (0), while
+    /// affinity CONVERTS ONLY WHEN LOSSLESS and otherwise leaves the value
+    /// alone — `'abc'` stays the text `'abc'` and then compares as text. Using
+    /// `Cast` here would turn every unconvertible operand into 0 and answer
+    /// `price < 'abc'` as `price < 0`, which is not sqlite's answer.
+    ///
+    /// Emitted only in front of [`Instr::CmpClass`], by the binder rule that
+    /// mirrors sqlite's `sqlite3CompareAffinity`.
+    Affinity(Affinity),
+    /// A comparison by sqlite's **storage-class order** — the comparison sqlite
+    /// performs AFTER comparison affinity has been applied to both operands.
+    /// Pops two values and pushes the 3VL verdict like [`Instr::Eq`]..
+    /// [`Instr::Ge`], but a cross-class pair is ORDERED (NULL < numbers < text
+    /// < blob, see [`Value::sort_cmp`]) instead of refused.
+    ///
+    /// **The binder emits it only where it has established sqlite's affinity
+    /// rule for that pair**, and that restriction is load-bearing: ordering a
+    /// cross-class pair without first applying affinity is a WRONG answer, not
+    /// a conservative one (`price < '40.0'` would compare a number against a
+    /// text and say "every number is smaller", where sqlite compares against
+    /// 40.0). Every comparison the binder has not vetted keeps the plain
+    /// opcodes, which keep refusing.
+    ///
+    /// mpedb's own `Bool`/`Timestamp` have no sqlite storage class, so a pair
+    /// involving one against a different class is REFUSED here rather than
+    /// given an invented rank.
+    CmpClass(CmpKind, Collation),
 }
 
 /// Resolve a HOST-registered scalar UDF by name at eval time (the C-API
@@ -576,6 +609,34 @@ impl ExprProgram {
                     stack.push(match a.sql_cmp_collated(&b, coll)? {
                         None => Value::Null,
                         Some(ord) => Value::Bool(kind.eval(ord)),
+                    });
+                }
+                Instr::Affinity(aff) => {
+                    let v = stack.pop().expect("validated");
+                    stack.push(store_affinity(aff, v));
+                }
+                Instr::CmpClass(kind, coll) => {
+                    let b = stack.pop().expect("validated");
+                    let a = stack.pop().expect("validated");
+                    // NULL first, so the 3VL answer is NULL rather than the
+                    // "incomparable" arm below: `sort_cmp` reports both as
+                    // `None` and only one of them is a missing order.
+                    stack.push(if a.is_null() || b.is_null() {
+                        Value::Null
+                    } else {
+                        match a.sort_cmp(&b, coll) {
+                            Some(ord) => Value::Bool(kind.eval(ord)),
+                            // A `Bool`/`Timestamp` against another class: mpedb
+                            // types with no sqlite class and therefore no place
+                            // in this order. Refuse rather than invent one.
+                            None => {
+                                return Err(Error::TypeMismatch(format!(
+                                    "cannot compare {} with {}",
+                                    a.type_name(),
+                                    b.type_name()
+                                )))
+                            }
+                        }
                     });
                 }
                 Instr::InListColl(n, coll) => {

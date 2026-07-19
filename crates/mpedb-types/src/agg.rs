@@ -69,6 +69,11 @@ pub struct Accum {
     /// proportional to the group's distinct values, so a plain `sum(x)` must
     /// not pay for it.
     seen: Option<BTreeSet<Vec<u8>>>,
+    /// The collating sequence the DISTINCT dedup folds TEXT under — the
+    /// argument column's declared one, so `count(DISTINCT name)` over a NOCASE
+    /// column counts 'abc' and 'ABC' once, as sqlite does. `Binary` (no
+    /// folding) for every other aggregate and every non-text argument.
+    coll: crate::Collation,
 }
 
 impl Accum {
@@ -79,6 +84,7 @@ impl Accum {
             acc: None,
             fsum: 0.0,
             seen: None,
+            coll: crate::Collation::Binary,
         }
     }
 
@@ -90,8 +96,17 @@ impl Accum {
     /// there NULL is a value being grouped and here it is a value being
     /// ignored.
     pub fn new_distinct(func: AggFn) -> Accum {
+        Accum::new_distinct_collated(func, crate::Collation::Binary)
+    }
+
+    /// `f(DISTINCT x)` where the argument carries a declared collation
+    /// (`count(DISTINCT name)` on a `TEXT COLLATE NOCASE` column): two values
+    /// equal under `coll` are ONE value to the dedup, sqlite's rule and the one
+    /// `SELECT DISTINCT` already followed.
+    pub fn new_distinct_collated(func: AggFn, coll: crate::Collation) -> Accum {
         Accum {
             seen: Some(BTreeSet::new()),
+            coll,
             ..Accum::new(func)
         }
     }
@@ -114,7 +129,14 @@ impl Accum {
         // affects count, sum and avg alike, and min/max not at all (they are
         // idempotent, which is why `min(DISTINCT x)` is legal but pointless).
         if let Some(seen) = &mut self.seen {
-            if !seen.insert(crate::keycode::encode_key(std::slice::from_ref(v))) {
+            // The GROUP key, not the on-disk key: `count(DISTINCT v)` over a
+            // typeless column holding `1, 1.0, '1'` is 2, because sqlite's
+            // dedup asks its comparison — integer 1 and real 1.0 are one value,
+            // the text `'1'` another (`keycode::encode_group_key`).
+            if !seen.insert(crate::keycode::encode_group_key(
+                std::slice::from_ref(v),
+                std::slice::from_ref(&self.coll),
+            )) {
                 return Ok(());
             }
         }

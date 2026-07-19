@@ -935,6 +935,28 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     atom: true,
                 }
             }
+            // Comparison affinity applied to one operand, in place — rendered
+            // as a pseudo-call so the operand it belongs to stays visible.
+            Instr::Affinity(aff) => {
+                let a = pop(&mut st);
+                Item {
+                    s: format!("affinity({}, {})", a.s, aff.name()),
+                    atom: true,
+                }
+            }
+            // A storage-class comparison over a typeless column.
+            Instr::CmpClass(kind, coll) => {
+                let b = pop(&mut st);
+                let a = pop(&mut st);
+                let tail = match coll {
+                    Collation::Binary => String::new(),
+                    c => format!(" COLLATE {}", c.name()),
+                };
+                Item {
+                    s: format!("{} {} {}{tail}", wrap(&a), kind.symbol(), wrap(&b)),
+                    atom: false,
+                }
+            }
             // A collated comparison `a <op> b COLLATE <coll>`.
             Instr::CmpColl(kind, coll) => {
                 let b = pop(&mut st);

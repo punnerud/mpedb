@@ -107,6 +107,156 @@ pub fn encode_key_collated(values: &[Value], collations: &[Collation]) -> Vec<u8
     buf
 }
 
+// ---------------------------------------------------------------------------
+// The GROUP key: sqlite's storage-class equality, as bytes.
+// ---------------------------------------------------------------------------
+
+/// Storage-class tags. Their order IS sqlite's: NULL < numbers < TEXT < BLOB.
+/// `Bool`/`Timestamp` are mpedb-native with no sqlite class, so they get ranks
+/// of their own above BLOB — a bool column holds only bools, so the rank never
+/// decides anything a differential can see, and giving them a rank keeps the
+/// key a TOTAL order (which [`Value::sort_cmp`] deliberately is not: it answers
+/// `None` for such a pair, meaning "peers", and peers must not merge into one
+/// group).
+const CLASS_NULL: u8 = 0x00;
+const CLASS_NUM: u8 = 0x01;
+const CLASS_TEXT: u8 = 0x02;
+const CLASS_BLOB: u8 = 0x03;
+const CLASS_BOOL: u8 = 0x04;
+const CLASS_TS: u8 = 0x05;
+
+/// Numeric sub-tags, ordered. A number is keyed as `(floor, sub, [bits])`:
+/// `NUM_EXACT` means the value IS that integer (9 bytes, no `bits`), the other
+/// three carry the f64 image so equal-floor floats still order among themselves.
+const NUM_BELOW: u8 = 0x00; // real below i64::MIN — sorts under every integer
+const NUM_EXACT: u8 = 0x01; // integral: an i64, or an f64 that IS one
+const NUM_ABOVE: u8 = 0x02; // floor < value < floor+1, or a real above i64::MAX
+const NUM_NAN: u8 = 0x03; // NaN, above everything (see `int_float_cmp`)
+
+/// Encode a composite **grouping** key: the key of `GROUP BY`, `DISTINCT`,
+/// `PARTITION BY`, `UNION`/`INTERSECT`/`EXCEPT` dedup and `f(DISTINCT x)`.
+///
+/// **This is NOT [`encode_key`], and the difference is a wrong answer.** The
+/// on-disk key encodes a value's mpedb TYPE, which is right for a tree over a
+/// rigidly typed column: `1` and `1.0` are different entries there because the
+/// column can only hold one of them. A grouping key is asked a different
+/// question — "did sqlite's comparison call these two the same value?" — and
+/// over a typeless (`any`) column the answer differs: sqlite groups by
+/// STORAGE CLASS, so integer `1` and real `1.0` are ONE key while the text
+/// `'1'` is another, and `count(DISTINCT v)` over `1, 1.0, '1'` is 2, not 3.
+///
+/// The contract, pinned by `group_key_matches_sort_cmp`:
+///
+/// - `enc(a) == enc(b)` **iff** [`Value::sort_cmp`] says `Equal` (or both are
+///   NULL, which sort_cmp reports as `None` and every grouping context treats
+///   as one value — sqlite's rule for `GROUP BY`/`DISTINCT`/set ops alike).
+/// - `enc(a).cmp(enc(b))` **equals** `sort_cmp` whenever that is `Some`, so a
+///   `BTreeMap` keyed by these bytes iterates in sqlite's order and the
+///   byte-hash paths (`HashSet` dedup) and the comparator paths (`sort_rows`)
+///   can never disagree. That agreement is the point of having one encoder.
+///
+/// `collations[i]` folds `values[i]` when it is TEXT, exactly as in
+/// [`encode_key_collated`]; a short slice means `Binary`.
+pub fn encode_group_key(values: &[Value], collations: &[Collation]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(values.len() * 12);
+    for (i, v) in values.iter().enumerate() {
+        let coll = collations.get(i).copied().unwrap_or(Collation::Binary);
+        encode_group_value(&mut buf, v, coll);
+    }
+    buf
+}
+
+/// Append one value's grouping key. See [`encode_group_key`].
+pub fn encode_group_value(buf: &mut Vec<u8>, v: &Value, coll: Collation) {
+    match v {
+        Value::Null => buf.push(CLASS_NULL),
+        Value::Int(_) | Value::Float(_) => {
+            buf.push(CLASS_NUM);
+            encode_number(buf, v);
+        }
+        Value::Text(s) => {
+            buf.push(CLASS_TEXT);
+            encode_bytes(buf, coll.fold_key(s).as_bytes());
+        }
+        Value::Blob(b) => {
+            buf.push(CLASS_BLOB);
+            encode_bytes(buf, b);
+        }
+        Value::Bool(x) => {
+            buf.push(CLASS_BOOL);
+            buf.push(*x as u8);
+        }
+        Value::Timestamp(x) => {
+            buf.push(CLASS_TS);
+            buf.extend_from_slice(&((*x as u64) ^ (1 << 63)).to_be_bytes());
+        }
+        // Same reasoning as `encode_value`: a context list is param-only and
+        // can never be a key.
+        Value::List(_) => unreachable!(
+            "a context list reached group-key encoding — it is param-only (DESIGN-MULTIDB §2.6)"
+        ),
+    }
+}
+
+/// The numeric payload: `(floor as i64, sub-tag, [f64 image])`.
+///
+/// Integers and reals must INTERLEAVE exactly — `9007199254740992.0` sorts
+/// below the integer `9007199254740993`, and no cast can be used to decide that
+/// (`as f64` rounds past 2^53, `as i64` truncates). Keying on the floor plus a
+/// sub-tag does it without any lossy conversion: an exact integer is
+/// `(n, EXACT)`; a fractional real is `(floor, ABOVE, bits)`, which lands
+/// strictly between `(floor, EXACT)` and `(floor+1, EXACT)`; and a real outside
+/// i64's range is pinned to the extreme integer with `BELOW`/`ABOVE`.
+///
+/// The image is [`normalize_float_bits`], monotone in the real value, so
+/// same-floor reals order correctly among themselves. Self-delimiting: the
+/// sub-tag says whether 8 more bytes follow, so composite keys concatenate.
+fn encode_number(buf: &mut Vec<u8>, v: &Value) {
+    let push_i = |buf: &mut Vec<u8>, i: i64| {
+        buf.extend_from_slice(&((i as u64) ^ (1 << 63)).to_be_bytes())
+    };
+    let push_f =
+        |buf: &mut Vec<u8>, f: f64| buf.extend_from_slice(&normalize_float_bits(f).to_be_bytes());
+    match v {
+        Value::Int(i) => {
+            push_i(buf, *i);
+            buf.push(NUM_EXACT);
+        }
+        Value::Float(f) => {
+            let f = *f;
+            if f.is_nan() {
+                push_i(buf, i64::MAX);
+                buf.push(NUM_NAN);
+                push_f(buf, f);
+            } else if f >= 9223372036854775808.0 {
+                // Above every i64 (2^63 is exactly representable; i64::MAX is
+                // 2^63-1, so `>=` is the right boundary).
+                push_i(buf, i64::MAX);
+                buf.push(NUM_ABOVE);
+                push_f(buf, f);
+            } else if f < -9223372036854775808.0 {
+                push_i(buf, i64::MIN);
+                buf.push(NUM_BELOW);
+                push_f(buf, f);
+            } else {
+                let fl = f.floor();
+                // In range by the guards, so the cast is exact. `-0.0` floors to
+                // `-0.0`, which equals `0.0` and casts to 0 — so `-0.0` and `0`
+                // are ONE group, as sqlite has them.
+                let i = fl as i64;
+                push_i(buf, i);
+                if fl == f {
+                    buf.push(NUM_EXACT);
+                } else {
+                    buf.push(NUM_ABOVE);
+                    push_f(buf, f);
+                }
+            }
+        }
+        _ => unreachable!("encode_number over a non-number"),
+    }
+}
+
 /// Decode one value of declared type `ty`, advancing `*pos`. Bounds-checked;
 /// corrupt input yields `Error::Corrupt`, never a panic.
 pub fn decode_value(buf: &[u8], pos: &mut usize, ty: ColumnType) -> Result<Value> {
@@ -317,6 +467,155 @@ mod tests {
         ];
         let enc = encode_key(&vals);
         assert_eq!(decode_key(&enc, &types).unwrap(), vals);
+    }
+
+    /// Every value a grouping key can meet, including the pairs the whole
+    /// exercise is about: `1`/`1.0`/`'1'`, `0`/`-0.0`, and an integer that no
+    /// f64 can hold next to the real that rounds to it.
+    fn group_key_zoo() -> Vec<Value> {
+        vec![
+            Value::Null,
+            Value::Int(0),
+            Value::Float(0.0),
+            Value::Float(-0.0),
+            Value::Int(1),
+            Value::Float(1.0),
+            Value::Float(1.5),
+            Value::Int(2),
+            Value::Int(-1),
+            Value::Float(-1.5),
+            Value::Int(-2),
+            Value::Int(i64::MAX),
+            Value::Int(i64::MIN),
+            Value::Float(9223372036854775808.0),  // 2^63: above every i64
+            Value::Float(-9223372036854775808.0), // -2^63: IS i64::MIN
+            Value::Float(-9223372036854777000.0), // below every i64
+            Value::Int(9007199254740993),         // not representable as f64
+            Value::Float(9007199254740992.0),
+            Value::Float(f64::INFINITY),
+            Value::Float(f64::NEG_INFINITY),
+            Value::Float(f64::NAN),
+            Value::Text("1".into()),
+            Value::Text("".into()),
+            Value::Text("abc".into()),
+            Value::Text("ABC".into()),
+            Value::Blob(vec![0x31]),
+            Value::Blob(vec![]),
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Timestamp(0),
+            Value::Timestamp(7),
+        ]
+    }
+
+    /// **The contract of [`encode_group_key`].** Byte order must equal
+    /// [`Value::sort_cmp`] wherever that answers, and bytes must be equal
+    /// exactly when the two values are one group (sort_cmp `Equal`, or two
+    /// NULLs). This is what keeps the hash-keyed paths (DISTINCT dedup) and the
+    /// comparator paths (ORDER BY, window peers) from disagreeing.
+    #[test]
+    fn group_key_matches_sort_cmp() {
+        let zoo = group_key_zoo();
+        for a in &zoo {
+            for b in &zoo {
+                let ord = encode_group_key(std::slice::from_ref(a), &[])
+                    .cmp(&encode_group_key(std::slice::from_ref(b), &[]));
+                match a.sort_cmp(b, Collation::Binary) {
+                    Some(o) => assert_eq!(ord, o, "order mismatch: {a:?} vs {b:?}"),
+                    // `None` = NULL involved, or an mpedb-native pair sort_cmp
+                    // calls peers. Only two NULLs may share a key.
+                    None => {
+                        let both_null = a.is_null() && b.is_null();
+                        assert_eq!(
+                            ord == Ordering::Equal,
+                            both_null,
+                            "grouping verdict wrong: {a:?} vs {b:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The repro that started this: sqlite's `count(DISTINCT v)` over
+    /// `1, 1.0, '1'` is 2. The on-disk key says 3 — and is right to, for a
+    /// typed column — so the two encoders must differ exactly here.
+    #[test]
+    fn group_key_folds_int_and_real_but_not_text() {
+        let k = |v: Value| encode_group_key(&[v], &[]);
+        assert_eq!(k(Value::Int(1)), k(Value::Float(1.0)));
+        assert_ne!(k(Value::Int(1)), k(Value::Text("1".into())));
+        assert_ne!(k(Value::Text("1".into())), k(Value::Blob(vec![0x31])));
+        assert_eq!(k(Value::Int(0)), k(Value::Float(-0.0)));
+        // …and the on-disk encoder still separates them.
+        assert_ne!(
+            encode_key(&[Value::Int(1)]),
+            encode_key(&[Value::Float(1.0)])
+        );
+    }
+
+    /// Collation folds TEXT in a grouping key exactly as it does on disk.
+    #[test]
+    fn group_key_folds_text_under_collation() {
+        let a = encode_group_key(&[Value::Text("ABC".into())], &[Collation::NoCase]);
+        let b = encode_group_key(&[Value::Text("abc".into())], &[Collation::NoCase]);
+        assert_eq!(a, b);
+        assert_ne!(
+            encode_group_key(&[Value::Text("ABC".into())], &[]),
+            encode_group_key(&[Value::Text("abc".into())], &[])
+        );
+    }
+
+    /// Composite grouping keys concatenate without ambiguity: the numeric
+    /// payload is variable-length (9 or 17 bytes), so the sub-tag has to be
+    /// self-delimiting or a two-column key could alias.
+    #[test]
+    fn group_key_composite_is_unambiguous() {
+        let mut seen = std::collections::HashSet::new();
+        let zoo = group_key_zoo();
+        for a in &zoo {
+            for b in &zoo {
+                let k = encode_group_key(&[a.clone(), b.clone()], &[]);
+                // Two DIFFERENT groups must never produce the same bytes; two
+                // equal ones must. Canonicalize by the single-value keys.
+                let canon = (
+                    encode_group_key(std::slice::from_ref(a), &[]),
+                    encode_group_key(std::slice::from_ref(b), &[]),
+                );
+                if let Some(prev) = seen.replace((k.clone(), canon.clone())) {
+                    assert_eq!(prev.1, canon, "composite key aliased: {a:?}, {b:?}");
+                }
+            }
+        }
+    }
+
+    /// A randomized cross-check of the same contract over the value generator,
+    /// mixing types the way an `any` column does.
+    #[test]
+    fn group_key_order_is_total_and_matches_sort_cmp_randomized() {
+        let types = [
+            ColumnType::Int64,
+            ColumnType::Float64,
+            ColumnType::Text,
+            ColumnType::Blob,
+        ];
+        let mut rng = Rng(0x243f6a8885a308d3);
+        for _ in 0..20000 {
+            let ta = types[(rng.next() % types.len() as u64) as usize];
+            let tb = types[(rng.next() % types.len() as u64) as usize];
+            let a = random_value(&mut rng, ta);
+            let b = random_value(&mut rng, tb);
+            let ord = encode_group_key(std::slice::from_ref(&a), &[])
+                .cmp(&encode_group_key(std::slice::from_ref(&b), &[]));
+            match a.sort_cmp(&b, Collation::Binary) {
+                Some(o) => assert_eq!(ord, o, "order mismatch: {a:?} vs {b:?}"),
+                None => assert_eq!(
+                    ord == Ordering::Equal,
+                    a.is_null() && b.is_null(),
+                    "grouping verdict wrong: {a:?} vs {b:?}"
+                ),
+            }
+        }
     }
 
     #[test]

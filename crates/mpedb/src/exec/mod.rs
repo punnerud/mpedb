@@ -924,15 +924,16 @@ fn exec_select_leveled(
 /// Combine already-projected rows under one set operator, left-associatively.
 /// `UNION`/`EXCEPT`/`INTERSECT` are SET ops: the result is deduplicated (and
 /// NULLs count as equal — the set-op rule, same as DISTINCT); only
-/// `UNION ALL` keeps duplicates. Keys are the memcmp row encoding, for the
-/// same reason DISTINCT uses it: Value is neither Hash nor Ord, and the
-/// encoding is total even across types.
+/// `UNION ALL` keeps duplicates. Keys are the storage-class GROUP encoding, for
+/// the same reason DISTINCT uses it: Value is neither Hash nor Ord, the
+/// encoding is total even across types, and set membership is decided by
+/// sqlite's comparison — `SELECT 1 UNION SELECT 1.0` is one row.
 fn apply_set_op(acc: Vec<Vec<Value>>, right: Vec<Vec<Value>>, op: SetOp) -> Vec<Vec<Value>> {
     use std::collections::HashSet;
     let dedup = |rows: Vec<Vec<Value>>| {
         let mut seen = HashSet::new();
         rows.into_iter()
-            .filter(|r| seen.insert(keycode::encode_key(r)))
+            .filter(|r| seen.insert(keycode::encode_group_key(r, &[])))
             .collect::<Vec<_>>()
     };
     match op {
@@ -948,11 +949,11 @@ fn apply_set_op(acc: Vec<Vec<Value>>, right: Vec<Vec<Value>>, op: SetOp) -> Vec<
         }
         SetOp::Except | SetOp::Intersect => {
             let rset: std::collections::HashSet<Vec<u8>> =
-                right.iter().map(|r| keycode::encode_key(r)).collect();
+                right.iter().map(|r| keycode::encode_group_key(r, &[])).collect();
             let keep_present = matches!(op, SetOp::Intersect);
             dedup(acc)
                 .into_iter()
-                .filter(|r| rset.contains(&keycode::encode_key(r)) == keep_present)
+                .filter(|r| rset.contains(&keycode::encode_group_key(r, &[])) == keep_present)
                 .collect()
         }
     }
@@ -1133,12 +1134,17 @@ fn exec_select(
                         }
                     });
                 }
-                // Keying on the memcmp encoding rather than on Value: DISTINCT
-                // must treat NULLs as equal to each other (unlike `=`), which
-                // is exactly what the key encoding does, and Value is neither
-                // Hash nor Ord. Text keys are folded under the output column's
-                // declared collation.
-                if *distinct && !seen.insert(keycode::encode_key_collated(&orow, &distinct_colls)) {
+                // Keying on the storage-class GROUP encoding rather than on
+                // Value: DISTINCT must treat NULLs as equal to each other
+                // (unlike `=`), which is exactly what the key encoding does,
+                // and Value is neither Hash nor Ord. It must ALSO treat `1` and
+                // `1.0` as one value (sqlite's DISTINCT asks its comparison,
+                // and the on-disk encoder answers by mpedb type — 3 values
+                // where sqlite sees 2). Text keys are folded under the output
+                // column's declared collation.
+                if *distinct
+                    && !seen.insert(keycode::encode_group_key(&orow, &distinct_colls))
+                {
                     continue;
                 }
                 out.push(orow);
@@ -1313,7 +1319,7 @@ fn exec_select_with(
                 }
             });
         }
-        if *distinct && !seen.insert(keycode::encode_key_collated(&orow, &distinct_colls)) {
+        if *distinct && !seen.insert(keycode::encode_group_key(&orow, &distinct_colls)) {
             continue;
         }
         out.push(orow);
@@ -1453,6 +1459,10 @@ fn correlated_survivors(
                         .ok_or_else(|| internal("correlation arg out of row"))?,
                 );
             }
+            // `encode_key`, NOT the grouping key: this is a CACHE keyed by the
+            // outer row's exact values, and the subquery may distinguish what
+            // grouping calls one value (`typeof($1)`, `printf`). Folding `1`
+            // and `1.0` together here would serve one's result for the other.
             let memo_key = keycode::encode_key(&key_vals);
             scratch[base + i] = if let Some(v) = memo[ci].get(&memo_key) {
                 v.clone()

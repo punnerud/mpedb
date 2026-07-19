@@ -43,12 +43,14 @@ const OP_CMP_COLL: u8 = 36;
 const OP_IN_LIST_COLL: u8 = 37;
 const OP_LIKE_CS: u8 = 38;
 const OP_HOST_CALL: u8 = 39;
-// 40 is deliberately left free: a concurrently-developed `Instr::Affinity` is
-// claiming the next contiguous tag on another branch, and an opcode hole costs
-// nothing (an unknown tag is already a decode error) while a collision would
-// silently reinterpret one opcode as the other.
+// `Instr::Affinity` took the free tag 40 as planned. `CmpClass` had to move off
+// 41: `LIKE … ESCAPE` landed first and owns 41/42, so the class-aware comparison
+// is 43. An opcode hole costs nothing (an unknown tag is already a decode error)
+// while a collision would silently reinterpret one opcode as the other.
 const OP_LIKE_ESC: u8 = 41;
 const OP_LIKE_CS_ESC: u8 = 42;
+const OP_AFFINITY: u8 = 40;
+const OP_CMP_CLASS: u8 = 43;
 
 impl ExprProgram {
     /// Deterministic serialization (part of plan blobs and plan hashing).
@@ -157,6 +159,15 @@ impl ExprProgram {
                 Instr::InListColl(x, coll) => {
                     buf.push(OP_IN_LIST_COLL);
                     buf.extend_from_slice(&x.to_le_bytes());
+                    buf.push(coll as u8);
+                }
+                Instr::Affinity(aff) => {
+                    buf.push(OP_AFFINITY);
+                    buf.push(aff as u8);
+                }
+                Instr::CmpClass(kind, coll) => {
+                    buf.push(OP_CMP_CLASS);
+                    buf.push(kind as u8);
                     buf.push(coll as u8);
                 }
                 Instr::HostCall(name_idx, argc) => {
@@ -274,6 +285,24 @@ impl ExprProgram {
                     let coll = Collation::from_tag(c)
                         .ok_or_else(|| Error::Corrupt("bad collation tag".into()))?;
                     Instr::InListColl(x, coll)
+                }
+                OP_AFFINITY => {
+                    let t = *buf.get(*pos).ok_or_else(err)?;
+                    *pos += 1;
+                    Instr::Affinity(
+                        Affinity::from_tag(t)
+                            .ok_or_else(|| Error::Corrupt("bad affinity tag".into()))?,
+                    )
+                }
+                OP_CMP_CLASS => {
+                    let k = *buf.get(*pos).ok_or_else(err)?;
+                    let c = *buf.get(*pos + 1).ok_or_else(err)?;
+                    *pos += 2;
+                    let kind = CmpKind::from_tag(k)
+                        .ok_or_else(|| Error::Corrupt("bad class-compare op tag".into()))?;
+                    let coll = Collation::from_tag(c)
+                        .ok_or_else(|| Error::Corrupt("bad collation tag".into()))?;
+                    Instr::CmpClass(kind, coll)
                 }
                 OP_HOST_CALL => {
                     let name_idx = read_u16_arg()?;
@@ -402,7 +431,7 @@ pub(super) fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                     // Pops the probe scalar, pushes the 3VL result; the list comes
                     // from a param slot, not the stack, so the arity is not here.
                     Instr::InParam(_) => (1, 1),
-                    Instr::Cast(_) => (1, 1),
+                    Instr::Cast(_) | Instr::Affinity(_) => (1, 1),
                     Instr::Concat => (2, 1),
                     // n list elements plus the probe beneath them. n == 0 is the
                     // empty set `x IN ()`: eval pops the probe and pushes FALSE
