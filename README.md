@@ -1,8 +1,11 @@
-# mpedb
+# MPEdb
 
 **An embedded, multi-process, shared-memory database in Rust.**
 
-mpedb combines three things that normally don't come together:
+(The project is **MPEdb**; the crate, command, and file extension stay lowercase
+`mpedb` / `.mpedb`, the way *SQLite* pairs with `sqlite3`.)
+
+MPEdb combines three things that normally don't come together:
 
 - **sqlite's operational model** — no server; processes `mmap` a shared file and
   attach directly, and any process may be `SIGKILL`ed at any instant without
