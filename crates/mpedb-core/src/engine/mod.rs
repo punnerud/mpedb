@@ -1110,6 +1110,57 @@ impl Engine {
         self.make_write_txn(recovered).map(Some)
     }
 
+    /// Bounded-wait variant of [`Engine::begin_write`] (#109): poll the writer
+    /// lock until `deadline`, then fail with [`Error::Busy`]. `None` delegates
+    /// to the blocking `begin_write` (identical semantics, including the
+    /// same-thread EDEADLK diagnostic). A deadline at-or-before now still makes
+    /// exactly ONE acquisition attempt — sqlite's "timeout 0 = immediate BUSY
+    /// on contention, immediate acquire otherwise".
+    ///
+    /// This sits entirely OUTSIDE the §5.3 intent-ring protocol and §4.2 lock
+    /// attributes: it only changes how long we WAIT for the lock, via the same
+    /// `try_writer_lock` the ring's wait-or-lead loop uses. Owner-death
+    /// recovery is unchanged — `try_writer_lock` adopts EOWNERDEAD (Linux) /
+    /// the DIRTY word (macOS flock), so a SIGKILLed holder converts a waiter's
+    /// next poll into an acquire, never a hang past the deadline.
+    pub fn begin_write_deadline(
+        &self,
+        deadline: Option<std::time::Instant>,
+    ) -> Result<WriteTxn<'_>> {
+        let Some(deadline) = deadline else {
+            return self.begin_write();
+        };
+        // Escalating poll: 100 µs doubling to a 5 ms cap. Fine-grained enough
+        // that a released lock is picked up promptly (and an elapsed-time
+        // assertion lands just past the timeout), coarse enough that a full
+        // 5 s CPython-default wait costs ~1k syscalls, not a spin.
+        let mut step = std::time::Duration::from_micros(100);
+        loop {
+            match self.try_begin_write() {
+                Ok(Some(txn)) => return Ok(txn),
+                Ok(None) => {}
+                // The lock is held by THIS VERY THREAD (the ERRORCHECK
+                // EDEADLK answer, same phrase on the macOS flock path —
+                // the contract mpedb-capi's `is_writer_lock_reentry` also
+                // matches): waiting out the deadline cannot succeed, the
+                // owner IS the caller. Answer Busy now — deterministic
+                // deadlock avoidance with the same terminal result sqlite
+                // reaches only after burning the whole timeout. The
+                // deadline-None path keeps the loud EDEADLK diagnostic.
+                Err(Error::Internal(m)) if m.contains("writer lock re-entered") => {
+                    return Err(Error::Busy);
+                }
+                Err(e) => return Err(e),
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                return Err(Error::Busy);
+            }
+            std::thread::sleep(step.min(deadline - now));
+            step = (step * 2).min(std::time::Duration::from_millis(5));
+        }
+    }
+
     /// The shared intent ring (leader-side methods require holding a
     /// [`WriteTxn`], i.e. the writer lock).
     pub fn ring(&self) -> crate::ring::IntentRing<'_> {
