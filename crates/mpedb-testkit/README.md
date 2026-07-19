@@ -17,10 +17,14 @@ SQLite's reliability comes from several test harnesses. Honestly accounted:
   *file format* (`statement ok` / `statement error` / `query` with expected
   results after `----`) plus the philosophy that correctness assertions
   should live in plain-text corpora, portable across engines. We implement
-  the format ([`src/slt.rs`]) and write our own corpus (`tests/slt/`); the
-  original sqllogictest *corpus* itself is not directly usable because it
-  assumes `CREATE TABLE`, type-coercing storage, functions, joins, and
-  hashed result blocks — all outside mpedb's Phase-1 subset.
+  the format ([`src/slt.rs`]) and write our own corpus (`tests/slt/`). The
+  original sqllogictest *corpus* needed a shim when this crate was written
+  (it assumes `CREATE TABLE`, type-coercing storage, and hashed result
+  blocks); it now runs end to end through
+  [`src/bin/sqlite_corpus.rs`](src/bin/sqlite_corpus.rs) — **99.885 % of
+  5,938,278 attempted records, zero wrong answers**, measured 2026-07-19.
+  Numbers, the ranked blocker table and the reproduce recipe live in
+  [`design/CORPUS-STATUS.md`](../../design/CORPUS-STATUS.md).
 - **TH3** is proprietary. Its coverage-driven, anomaly-injecting approach is
   not available to us; nothing here claims to replace it.
 - **The TCL test suite** is API-bound to SQLite's C interface and TCL
