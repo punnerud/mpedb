@@ -258,7 +258,7 @@ fn exec_one(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome,
         // introspection (mpedb has neither); they never reach the engine.
         Kind::Pragma => {
             let bundle = c.db.schema();
-            let (columns, rows) = introspect::pragma(&bundle, sqltext)?;
+            let (columns, rows) = introspect::pragma(&bundle, sqltext, &mut c.busy_timeout_ms)?;
             Ok(Outcome::Rows { columns, rows })
         }
         Kind::Read if introspect::references_sqlite_master(sqltext) => {
