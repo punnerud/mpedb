@@ -950,17 +950,23 @@ fn the_django_decimal_shape_agrees_with_sqlite() {
     assert_same(mixed, "SELECT MAX(price), MIN(price), COUNT(DISTINCT price) FROM t");
     assert_same(mixed, "SELECT id FROM t ORDER BY price DESC LIMIT 2");
 
-    // The refusal. sqlite answers `[2]`; mpedb refuses rather than answering
-    // `[1, 2]`, which is what an unconverted comparison would say.
-    let t = open();
-    for s in setup {
-        t.db.query(s, &[]).unwrap();
-    }
-    let err = t.db.query("SELECT id FROM t WHERE price < '40.0'", &[]).unwrap_err();
-    assert!(format!("{err}").contains("compare"), "{err}");
+    // The fourth query, which used to be the refusal: COMPARISON affinity now
+    // converts the literal to a number BEFORE comparing, so `[2]` — not the
+    // `[1, 2]` an unconverted class comparison would say.
+    assert_same(setup, "SELECT id FROM t WHERE price < '40.0' ORDER BY id");
     assert_eq!(sqlite_state(setup, "SELECT id FROM t WHERE price < '40.0'"), vec![vec!["2"]]);
     // Against a NUMBER there is no affinity to apply and mpedb agrees.
     assert_same(setup, "SELECT id FROM t WHERE price < 40 ORDER BY id");
+    // The whole operator family, both operand orders, and a text the affinity
+    // CANNOT convert (which is then compared by storage class: every number
+    // sorts below every text).
+    assert_same(setup, "SELECT id FROM t WHERE price <= '35' ORDER BY id");
+    assert_same(setup, "SELECT id FROM t WHERE price = '1000' ORDER BY id");
+    assert_same(setup, "SELECT id FROM t WHERE '40.0' > price ORDER BY id");
+    assert_same(setup, "SELECT id FROM t WHERE price < 'abc' ORDER BY id");
+    assert_same(setup, "SELECT id FROM t WHERE price > 'abc' ORDER BY id");
+    assert_same(setup, "SELECT id FROM t WHERE price BETWEEN '30' AND '40' ORDER BY id");
+    assert_same(setup, "SELECT id FROM t WHERE price < NULL ORDER BY id");
 }
 
 /// A NUMERIC column that holds a value sqlite could NOT convert keeps it as

@@ -255,7 +255,19 @@ const MAX_JOINS: usize = 16;
 //     re-prepare. Like a `HostCall`, a plan naming a host aggregate is valid ONLY
 //     for the connection that registered it, so `contains_host_call` covers it
 //     and it never reaches the shared `plan/<hash>` registry.
-const PLAN_FORMAT: u8 = 40;
+// 42: comparison affinity over a TYPELESS column — two additive expr opcodes,
+//     `Instr::Affinity` (40, applies sqlite's store-time affinity to the top of
+//     the stack) and `Instr::CmpClass` (41, a comparison by storage-class order
+//     instead of a refusal). Emitted ONLY for a comparison one of whose
+//     operands is a bare `any` column, so every plan that does not touch one
+//     encodes byte-for-byte as in format 40/41. A reader one format back hits
+//     the unknown opcode in the expr decoder and rejects the plan as corrupt
+//     rather than misreading it, and the whole-plan version gates it anyway:
+//     the blob fails CLOSED at byte 0 with the documented re-prepare.
+//     NOTE (worktree, 2026-07-19): the base this was written on carries 40;
+//     41 is another agent's in-flight bump, so this takes 42 by instruction and
+//     the numbers are reconciled at merge.
+const PLAN_FORMAT: u8 = 42;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

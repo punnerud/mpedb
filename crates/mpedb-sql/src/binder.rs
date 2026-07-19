@@ -69,6 +69,18 @@ pub(crate) enum BExpr {
     /// lookup — it always stays a residual filter over a full scan, which is
     /// what keeps NOCASE/RTRIM correct without a collated index.
     CollateCmp(BinOp, Box<BExpr>, Box<BExpr>, Collation),
+    /// A comparison against a TYPELESS (`any`) column, under sqlite's
+    /// **comparison affinity** + storage-class order (task: comparison
+    /// affinity). The `Affinity` is the one sqlite's `sqlite3CompareAffinity`
+    /// derives for the PAIR; it is applied to BOTH operands (as sqlite's
+    /// `OP_Lt`-family does) before they are compared by class. [`Affinity::Blob`]
+    /// means "apply nothing", sqlite's NONE.
+    ///
+    /// Like [`BExpr::CollateCmp`] this is a node of its own so the access-path
+    /// extractor cannot mistake it for an index probe — and here that is free,
+    /// since an `any` column can never be a key ([`Schema::validate`] refuses
+    /// it), which is also why this can only ever be a residual filter.
+    ClassCmp(BinOp, Box<BExpr>, Box<BExpr>, Collation, Affinity),
     /// `<probe> COLLATE <coll> IN (e1, …, en)` — the collated form of
     /// [`BExpr::InList`].
     InListColl(Box<BExpr>, Vec<BExpr>, Collation),
@@ -336,6 +348,23 @@ impl<'a> Scope<'a> {
             base += t.columns.len();
         }
         Collation::Binary
+    }
+
+    /// The `(type, affinity)` of the column at tuple slot `c` — what
+    /// `sqlite3ExprAffinity` reads off a column reference, plus the storage type
+    /// that says whether the column is the typeless one. `None` for a slot that
+    /// names no column (a synthetic tuple), which the caller reads as "no
+    /// affinity", exactly as sqlite reads a non-column expression.
+    pub fn column_shape(&self, c: u16) -> Option<(ColumnType, Affinity)> {
+        let mut base = 0usize;
+        for t in &self.tables {
+            if (c as usize) < base + t.columns.len() {
+                let col = &t.columns[c as usize - base];
+                return Some((col.ty, col.affinity));
+            }
+            base += t.columns.len();
+        }
+        None
     }
 
     /// Resolve a QUALIFIED `<table>.<column>`. The qualifier is checked rather
@@ -1076,7 +1105,7 @@ impl<'a> Binder<'a> {
                 Ok((e, Some(ColumnType::Bool)))
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                let (l, r, _) = self.unify_operands(l, lt, r, rt, "compare")?;
+                let (l, r, unified) = self.unify_operands(l, lt, r, rt, "compare")?;
                 // sqlite's collation precedence, in order: an explicit `COLLATE`
                 // on the LEFT operand, else on the RIGHT; else the LEFT operand's
                 // COLUMN collation (rung 2), else the RIGHT column's; else BINARY.
@@ -1096,10 +1125,14 @@ impl<'a> Binder<'a> {
                     .or_else(|| col_coll(&l))
                     .or_else(|| col_coll(&r))
                     .unwrap_or_default();
-                let node = if coll == Collation::Binary {
-                    BExpr::Binary(op, Box::new(l), Box::new(r))
-                } else {
-                    BExpr::CollateCmp(op, Box::new(l), Box::new(r), coll)
+                // Comparison affinity + storage-class order, for a comparison
+                // that touches a TYPELESS column. See `class_cmp_affinity`.
+                let node = match self.class_cmp_affinity(unified, &l, &r) {
+                    Some(aff) => BExpr::ClassCmp(op, Box::new(l), Box::new(r), coll, aff),
+                    None if coll == Collation::Binary => {
+                        BExpr::Binary(op, Box::new(l), Box::new(r))
+                    }
+                    None => BExpr::CollateCmp(op, Box::new(l), Box::new(r), coll),
                 };
                 let e = fold_maybe(node, self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
@@ -1289,6 +1322,70 @@ impl<'a> Binder<'a> {
             (Some(t), None) | (None, Some(t)) => Ok((l, r, Some(t))),
             (None, None) => Ok((l, r, None)),
         }
+    }
+
+    /// sqlite's **comparison affinity** for a comparison that touches a
+    /// TYPELESS (`any`) column: the affinity applied to BOTH operands before
+    /// they are compared by storage class. `None` means "not this rule" — the
+    /// caller then keeps the plain comparison, which REFUSES a cross-class pair
+    /// exactly as it does today.
+    ///
+    /// A port of `sqlite3CompareAffinity`, with `sqlite3ExprAffinity` narrowed
+    /// to the two shapes that carry one: a COLUMN (its declared affinity) and a
+    /// `CAST` (its target's). Everything else — a literal, a parameter, any
+    /// computed expression — has NO affinity, which is sqlite's rule too.
+    ///
+    /// Two gates, both deliberate:
+    ///
+    /// - the unified type must be `Any`. Only a dynamically typed comparison
+    ///   can meet two storage classes at runtime; every rigid one was already
+    ///   pinned by the binder and must stay byte-identical.
+    /// - one operand must be a bare `any` COLUMN. That is the case this exists
+    ///   for, and it keeps the rule from silently rewriting an
+    ///   `<indexed column> = <host UDF>` comparison — correct either way, but it
+    ///   would lose the index probe (`ClassCmp` is never an access path).
+    ///
+    /// Everything outside those gates keeps today's behavior, which is the only
+    /// reason this can be landed without auditing every comparison in the
+    /// language: an unvetted pair still refuses rather than ordering by class,
+    /// and ordering by class WITHOUT the affinity is the wrong answer this
+    /// rule exists to avoid (`price < '40.0'` would say "every number is
+    /// smaller than a text" where sqlite compares against 40.0).
+    fn class_cmp_affinity(&self, unified: Ty, l: &BExpr, r: &BExpr) -> Option<Affinity> {
+        if unified != Some(ColumnType::Any) {
+            return None;
+        }
+        let is_any_col = |e: &BExpr| match e {
+            BExpr::Col(i) => {
+                self.scope.column_shape(*i).is_some_and(|(t, _)| t == ColumnType::Any)
+            }
+            _ => false,
+        };
+        if !is_any_col(l) && !is_any_col(r) {
+            return None;
+        }
+        let aff_of = |e: &BExpr| match e {
+            BExpr::Col(i) => self.scope.column_shape(*i).map(|(_, a)| a),
+            BExpr::Cast(_, a) => Some(*a),
+            _ => None,
+        };
+        let numeric =
+            |a: Affinity| matches!(a, Affinity::Integer | Affinity::Real | Affinity::Numeric);
+        Some(match (aff_of(l), aff_of(r)) {
+            // Both operands carry an affinity: NUMERIC if either is numeric,
+            // else none. (This is where sqlite does NOT apply TEXT: a text
+            // column against a typeless one compares raw.)
+            (Some(a), Some(b)) => {
+                if numeric(a) || numeric(b) {
+                    Affinity::Numeric
+                } else {
+                    Affinity::Blob
+                }
+            }
+            // One side carries an affinity and the other does not: use it.
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => Affinity::Blob,
+        })
     }
 
     /// Fold a `coalesce`'s CONTROL FLOW, PostgreSQL-style.
@@ -2155,6 +2252,21 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
             emit(a, instrs, consts)?;
             emit(b, instrs, consts)?;
             instrs.push(Instr::CmpColl(cmp_kind(*op), *coll));
+        }
+        // Comparison affinity is applied to BOTH operands (sqlite's `OP_Lt`
+        // family does exactly that, and applying it to a value that already
+        // has the target class is a no-op), then they are compared by class.
+        // `Blob` is sqlite's NONE — nothing to apply, so nothing is emitted.
+        BExpr::ClassCmp(op, a, b, coll, aff) => {
+            emit(a, instrs, consts)?;
+            if *aff != Affinity::Blob {
+                instrs.push(Instr::Affinity(*aff));
+            }
+            emit(b, instrs, consts)?;
+            if *aff != Affinity::Blob {
+                instrs.push(Instr::Affinity(*aff));
+            }
+            instrs.push(Instr::CmpClass(cmp_kind(*op), *coll));
         }
         BExpr::InListColl(a, items, coll) => {
             emit(a, instrs, consts)?;
