@@ -154,25 +154,75 @@ fn params_and_arith() {
 
 #[test]
 fn like_patterns() {
-    assert!(like_match("he%o", "hello"));
-    assert!(like_match("%", ""));
-    assert!(like_match("h_llo", "hallo"));
-    assert!(!like_match("h_llo", "hllo"));
-    assert!(like_match("%abc", "xxabc"));
-    assert!(!like_match("abc%", "xabc"));
-    assert!(like_match("a%b%c", "a123b456c"));
+    assert!(like_match("he%o", "hello", None));
+    assert!(like_match("%", "", None));
+    assert!(like_match("h_llo", "hallo", None));
+    assert!(!like_match("h_llo", "hllo", None));
+    assert!(like_match("%abc", "xxabc", None));
+    assert!(!like_match("abc%", "xabc", None));
+    assert!(like_match("a%b%c", "a123b456c", None));
     // literal '%' in the subject must not consume the wildcard
-    assert!(like_match("%", "%%"));
-    assert!(like_match("a%", "a%c"));
-    assert!(like_match("%c", "a%c"));
-    assert!(like_match("a%c", "a%c"));
+    assert!(like_match("%", "%%", None));
+    assert!(like_match("a%", "a%c", None));
+    assert!(like_match("%c", "a%c", None));
+    assert!(like_match("a%c", "a%c", None));
     // Case-insensitive for ASCII (sqlite default): pattern and subject fold.
-    assert!(like_match("ab%", "Ab2"));
-    assert!(like_match("AB%", "abc"));
-    assert!(like_match("h_LLO", "Hello"));
-    assert!(like_match("ABC", "abc"));
+    assert!(like_match("ab%", "Ab2", None));
+    assert!(like_match("AB%", "abc", None));
+    assert!(like_match("h_LLO", "Hello", None));
+    assert!(like_match("ABC", "abc", None));
     // Non-ASCII is NOT folded (matches sqlite / NOCASE).
-    assert!(!like_match("héllo", "HÉLLO"));
+    assert!(!like_match("héllo", "HÉLLO", None));
+}
+
+/// `LIKE … ESCAPE c`. Every expectation here was READ OFF `sqlite3` 3.45.1 —
+/// see the doc comment on `compile_pattern` for the rules they pin.
+#[test]
+fn like_escape_matches_sqlite() {
+    let e = Some('\\');
+    // An escaped `%`/`_` is a literal one.
+    assert!(like_match("100\\%", "100%", e));
+    assert!(!like_match("100\\%", "100x", e));
+    assert!(like_match("a\\_b", "a_b", e));
+    assert!(!like_match("a\\_b", "axb", e));
+    // The escape before a character that is NEITHER wildcard nor itself: sqlite
+    // makes it a plain literal (`'ab' LIKE 'a\b' ESCAPE '\'` is TRUE).
+    assert!(like_match("a\\b", "ab", e));
+    assert!(!like_match("a\\b", "a\\b", e));
+    // A doubled escape is a literal escape character.
+    assert!(like_match("a\\\\b", "a\\b", e));
+    // A DANGLING escape at the end of the pattern never matches — not the empty
+    // subject, not the pattern's own text, not even under a preceding `%`.
+    assert!(!like_match("ab\\", "ab", e));
+    assert!(!like_match("ab\\", "ab\\", e));
+    assert!(!like_match("\\", "", e));
+    assert!(!like_match("%a\\", "ab", e));
+    // Unescaped wildcards keep working alongside an escape character.
+    assert!(like_match("a%c", "abbbc", e));
+    // sqlite's `likeFunc`: an escape that IS `%` clears matchAll, one that is
+    // `_` clears matchOne — the wildcard stops being a wildcard entirely.
+    assert!(like_match("a%%b", "a%b", Some('%')));
+    assert!(!like_match("a%%b", "axb", Some('%')));
+    assert!(!like_match("a%b", "axb", Some('%')));
+    assert!(like_match("a__b", "a_b", Some('_')));
+    assert!(!like_match("a_%b", "anythingb", Some('_')));
+    assert!(like_match("__", "_", Some('_')));
+    // An escaped literal still folds case under the sqlite dialect …
+    assert!(like_match("a\\b", "AB", e));
+    assert!(like_match("\\a\\B", "aB", e));
+    // … and does NOT under the PostgreSQL (case-sensitive) dialect.
+    assert!(!like_match_cs("a\\b", "AB", e));
+    assert!(like_match_cs("a\\b", "ab", e));
+    assert!(like_match_cs("100\\%", "100%", e));
+    assert!(!like_match_cs("ab\\", "ab", e));
+    // A multi-BYTE but single-CHARACTER escape is legal (sqlite reads one UTF-8
+    // character, not one byte).
+    assert!(!like_match("aéb", "aéb", Some('é')));
+    assert!(like_match("aéb", "ab", Some('é')));
+    // Django's exact shape: `%foo%` under ESCAPE '\'.
+    assert!(like_match("%foo%", "xxfooyy", e));
+    assert!(like_match("%\\%foo%", "xx%fooyy", e));
+    assert!(!like_match("%\\%foo%", "xxfooyy", e));
 }
 
 #[test]

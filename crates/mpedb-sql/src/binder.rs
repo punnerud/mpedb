@@ -34,8 +34,11 @@ pub(crate) enum BExpr {
     /// the default), `false` under the PostgreSQL dialect (`bare_group_by =
     /// "postgres"`, case-SENSITIVE). It picks the opcode at compile time —
     /// [`Instr::Like`] vs [`Instr::LikeCs`](mpedb_types::expr) — so the plan is
-    /// self-describing and two dialects hash to distinct plans.
-    Like(Box<BExpr>, String, bool),
+    /// self-describing and two dialects hash to distinct plans. The last field
+    /// is the `ESCAPE` character (`None` = a bare LIKE), which selects the
+    /// [`Instr::LikeEsc`]/[`Instr::LikeCsEsc`] opcodes instead — so an escaped
+    /// and an unescaped LIKE also hash to distinct plans.
+    Like(Box<BExpr>, String, bool, Option<char>),
     /// LHS GLOB 'pattern' — case-SENSITIVE `*`/`?`/`[...]` (sqlite). The pattern
     /// is always a literal in Phase 1, exactly like [`BExpr::Like`]; `NOT GLOB`
     /// is a `Not` wrapped around this by the binder, so this node itself is
@@ -670,7 +673,7 @@ impl<'a> Binder<'a> {
                 )?;
                 Ok((e, Some(ColumnType::Bool)))
             }
-            ast::Expr::Like(lhs, pat) => {
+            ast::Expr::Like(lhs, pat, escape) => {
                 let pattern = match pat.as_ref() {
                     ast::Expr::Lit(Value::Text(p)) => p.clone(),
                     ast::Expr::Param(_) => {
@@ -685,7 +688,10 @@ impl<'a> Binder<'a> {
                 // operand is refused (rigid) — both keyed off the same signal.
                 let ci = self.bare_group_by == BareGroupBy::Sqlite;
                 let l = like_glob_operand(l, lt, "LIKE", ci)?;
-                let e = fold_maybe(BExpr::Like(Box::new(l), pattern, ci), self.suppress_fold)?;
+                let e = fold_maybe(
+                    BExpr::Like(Box::new(l), pattern, ci, *escape),
+                    self.suppress_fold,
+                )?;
                 Ok((e, Some(ColumnType::Bool)))
             }
             ast::Expr::Match(_, _) => {
@@ -1971,7 +1977,7 @@ pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
             matches!(a.as_ref(), BExpr::Const(_)) && matches!(b.as_ref(), BExpr::Const(_))
         }
         BExpr::InListColl(..) => false,
-        BExpr::Like(a, _, _) => matches!(a.as_ref(), BExpr::Const(_)),
+        BExpr::Like(a, _, _, _) => matches!(a.as_ref(), BExpr::Const(_)),
         BExpr::Glob(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         BExpr::Regexp(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
         BExpr::Cast(a, _) => matches!(a.as_ref(), BExpr::Const(_)),
@@ -2078,15 +2084,23 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 Instr::IsNotDistinct
             });
         }
-        BExpr::Like(a, pattern, case_insensitive) => {
+        BExpr::Like(a, pattern, case_insensitive, escape) => {
             emit(a, instrs, consts)?;
             let idx = push_const(consts, Value::Text(pattern.clone()))?;
             // The dialect chose case-(in)sensitivity at bind time; emit the
-            // matching opcode so the plan is self-describing.
-            instrs.push(if *case_insensitive {
-                Instr::Like(idx)
-            } else {
-                Instr::LikeCs(idx)
+            // matching opcode so the plan is self-describing. The ESCAPE
+            // character rides in the const pool as a one-character text.
+            instrs.push(match escape {
+                None if *case_insensitive => Instr::Like(idx),
+                None => Instr::LikeCs(idx),
+                Some(c) => {
+                    let e = push_const(consts, Value::Text(c.to_string()))?;
+                    if *case_insensitive {
+                        Instr::LikeEsc(idx, e)
+                    } else {
+                        Instr::LikeCsEsc(idx, e)
+                    }
+                }
             });
         }
         BExpr::Glob(a, pattern) => {

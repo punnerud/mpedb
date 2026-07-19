@@ -1,7 +1,8 @@
 # LIKE: `%` matches any run (including empty), `_` matches exactly one
 # character. Matching is CASE-INSENSITIVE for ASCII A-Z (sqlite's default:
-# `'a' LIKE 'A'` is true; non-ASCII is NOT folded), and there is no ESCAPE
-# clause -- `%`/`_` cannot be matched literally. A non-text operand is coerced
+# `'a' LIKE 'A'` is true; non-ASCII is NOT folded). `LIKE ... ESCAPE c` makes
+# the character after `c` a literal (its own file, tests/like_escape.rs, checks
+# every corner against the sqlite3 binary). A non-text operand is coerced
 # to text (`id LIKE 'x'` is `CAST(id AS TEXT) LIKE 'x'`), also like sqlite.
 # The pattern must be a string literal (Phase 1). NULL never matches.
 # (PostgreSQL's LIKE is case-sensitive and rigid -- that PG-strict mode is

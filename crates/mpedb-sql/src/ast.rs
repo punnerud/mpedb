@@ -268,8 +268,12 @@ pub(crate) enum Expr {
     /// (is-not-distinct-from); `negated = true` is `IS NOT` (is-distinct-from).
     /// The `IS [NOT] NULL` forms stay [`Expr::IsNull`].
     IsDistinct(Box<Expr>, Box<Expr>, bool),
-    /// `lhs LIKE pattern`.
-    Like(Box<Expr>, Box<Expr>),
+    /// `lhs LIKE pattern [ESCAPE c]`. The third field is the ESCAPE character;
+    /// `None` is a bare LIKE. The parser has already proved the ESCAPE argument
+    /// is a single-character string literal — sqlite takes an arbitrary
+    /// expression there and raises `ESCAPE expression must be a single
+    /// character` at step time, which mpedb turns into a PREPARE-time refusal.
+    Like(Box<Expr>, Box<Expr>, Option<char>),
     /// `<col-or-table> MATCH <literal>` — FTS5 full-text search
     /// (design/DESIGN-FTS.md §3). Unlike LIKE/GLOB, MATCH is NOT a boolean
     /// expression: it is usable ONLY as a top-level WHERE conjunct against an

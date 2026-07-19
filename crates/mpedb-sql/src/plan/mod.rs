@@ -267,7 +267,20 @@ const MAX_JOINS: usize = 16;
 //     version gates it anyway: a format-40 blob fails CLOSED at byte 0 with the
 //     documented re-prepare. (The same additive gating as every earlier scalar
 //     bump — `hex`/`typeof` at 12, the math family at 26, `printf` at 27.)
-const PLAN_FORMAT: u8 = 41;
+// 44: `LIKE … ESCAPE c` — two additive expr opcodes, `Instr::LikeEsc` (41) and
+//     `Instr::LikeCsEsc` (42), each `(pattern_const, escape_const)`. NEW opcodes
+//     rather than a widened `Instr::Like`, so the escape-less LIKE that every
+//     other statement compiles keeps its exact one-byte-plus-u16 encoding and
+//     re-encodes byte-for-byte. Strictly, a new opcode fails CLOSED on an older
+//     reader all by itself (an unknown tag is already `Corrupt`), so the bump is
+//     not what makes it safe — but the plan-format byte is this codebase's
+//     single staleness signal for the expr IR (Glob at 19, REGEXP at 23, LikeCs
+//     at 37 each bumped for exactly this reason). Opcode 40 is left free on
+//     purpose: a concurrently-developed `Instr::Affinity` is claiming the next
+//     contiguous tag on another branch. (42 and 43 were skipped entirely —
+//     other live branches are bumping the plan format at the same time and the
+//     numbers are reconciled at merge.)
+const PLAN_FORMAT: u8 = 44;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

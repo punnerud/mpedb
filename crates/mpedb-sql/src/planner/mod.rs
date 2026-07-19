@@ -1320,7 +1320,7 @@ fn max_col(e: &BExpr) -> Option<u16> {
         match e {
             BExpr::Col(c) => m = Some(m.map_or(*c, |p| p.max(*c))),
             BExpr::Unary(_, a)
-            | BExpr::Like(a, _, _)
+            | BExpr::Like(a, _, _, _)
             | BExpr::Glob(a, _)
             | BExpr::Regexp(a, _)
             | BExpr::Cast(a, _)

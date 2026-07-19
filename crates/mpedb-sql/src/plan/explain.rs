@@ -854,6 +854,15 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     atom: false,
                 }
             }
+            // `LIKE … ESCAPE c`, both dialects — the escape const renders as the
+            // string literal it is, so the EXPLAIN round-trips to the SQL.
+            Instr::LikeEsc(i, e) | Instr::LikeCsEsc(i, e) => {
+                let a = pop(&mut st);
+                Item {
+                    s: format!("{} LIKE {} ESCAPE {}", wrap(&a), cst(i), cst(e)),
+                    atom: false,
+                }
+            }
             Instr::Glob(i) => {
                 let a = pop(&mut st);
                 Item {
