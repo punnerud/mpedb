@@ -535,6 +535,47 @@ fn plan_never_probes_a_typeless_key() {
     }
 }
 
+/// **fix(wrong answer), found while auditing every key built over a typeless
+/// column.** The correlated-subquery memo cached on `keycode::encode_key` — the
+/// ORDERED encoding, which drops the mpedb type. Over an `any` column that
+/// collides the text `'1'` with the blob `x'31'` and the integer `0` with the
+/// real `0.0`, so the cache served one value's subquery result for the other:
+///
+/// ```text
+/// SELECT id, (SELECT typeof(o.v) FROM m) FROM o ORDER BY id
+///   sqlite: text · blob · integer · real
+///   mpedb:  text · TEXT · integer · INTEGER
+/// ```
+///
+/// A cache key must be INJECTIVE, which neither the ordered key (drops the
+/// type) nor the grouping key (folds `1` and `1.0` on purpose) is;
+/// `keycode::encode_key_exact` is.
+#[test]
+fn a_correlated_memo_over_a_typeless_column_matches_sqlite() {
+    let d = db("memo");
+    let stmts = [
+        "CREATE TABLE o (id INTEGER PRIMARY KEY, v)",
+        "INSERT INTO o VALUES (1, '1')",
+        "INSERT INTO o VALUES (2, x'31')",
+        "INSERT INTO o VALUES (3, 0)",
+        "INSERT INTO o VALUES (4, 0.0)",
+        "INSERT INTO o VALUES (5, 1)",
+        "INSERT INTO o VALUES (6, 1.0)",
+        "INSERT INTO o VALUES (7, NULL)",
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, w TEXT)",
+        "INSERT INTO m VALUES (1, 'zz')",
+    ];
+    let setup = seed_both(&d, &stmts);
+    compare(
+        &d,
+        &setup,
+        &[
+            "SELECT id, (SELECT typeof(o.v) FROM m) FROM o ORDER BY id",
+            "SELECT id, (SELECT typeof(o.v) || '/' || m.w FROM m) FROM o ORDER BY id",
+        ],
+    );
+}
+
 /// The typeless key survives a reopen: the on-disk encoding is stable, and the
 /// schema (which now permits such a key) round-trips through canonical bytes.
 #[test]
