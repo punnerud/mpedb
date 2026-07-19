@@ -33,15 +33,21 @@ fn agg_fn(name: &str) -> Option<mpedb_types::AggFn> {
     })
 }
 
-/// The zero-argument ranking window functions (stage 1a). Recognized only when
-/// `(` follows (i.e. as a call), so a bare `rank` / `row_number` column name is
-/// unaffected — they are NOT reserved words. Each REQUIRES an `OVER` clause and
-/// takes no arguments; `sqlite` refuses `rank()` used any other way too.
+/// The zero-argument ranking / distribution window functions (stage 1a +
+/// stage 2b). Recognized only when `(` follows (i.e. as a call), so a bare
+/// `rank` / `row_number` column name is unaffected — they are NOT reserved
+/// words. Each REQUIRES an `OVER` clause and takes no arguments; `sqlite`
+/// refuses `rank()` used any other way too. `percent_rank`/`cume_dist` are
+/// zero-argument distribution functions and join the ranking functions here;
+/// `ntile(n)` DOES take an argument (its bucket count) and is handled
+/// separately in `call_suffix`.
 fn window_rank_fn(name: &str) -> Option<WindowFunc> {
     Some(match name.to_ascii_lowercase().as_str() {
         "row_number" => WindowFunc::RowNumber,
         "rank" => WindowFunc::Rank,
         "dense_rank" => WindowFunc::DenseRank,
+        "percent_rank" => WindowFunc::PercentRank,
+        "cume_dist" => WindowFunc::CumeDist,
         _ => return None,
     })
 }
@@ -604,14 +610,41 @@ impl<'a> Parser<'a> {
                 spec,
             });
         }
-        // A scalar function call followed by OVER is a window function we do not
-        // support yet (the supported ones — ranking, aggregate and value/offset
-        // windows — are handled above). Refuse it by name rather than misread the
-        // OVER.
+        // ntile(n) (stage 2b): a DISTRIBUTION function. Its single argument is the
+        // bucket count `n` (a constant integer ≥ 1, folded at plan time), NOT a
+        // per-row value expression — so it rides in `extra_args` with `arg =
+        // None`, like the argument-less ranking functions. Only valid as a window
+        // function (OVER required); the planner further requires an ORDER BY,
+        // since the bucket assignment is otherwise order-dependent.
+        if name.eq_ignore_ascii_case("ntile") {
+            if !self.peek_over() {
+                return Err(self.err_here(
+                    "ntile() may only be used as a window function — it requires an OVER clause",
+                ));
+            }
+            if args.len() != 1 {
+                return Err(self.err_here(format!(
+                    "ntile() takes exactly one argument (the bucket count), got {}",
+                    args.len()
+                )));
+            }
+            let spec = self.window_over()?;
+            return Ok(Expr::Window {
+                func: WindowFunc::Ntile,
+                arg: None,
+                extra_args: args,
+                distinct: false,
+                spec,
+            });
+        }
+        // A scalar function call followed by OVER is not a window function — every
+        // supported window function (ranking, distribution, aggregate `OVER`, and
+        // value/offset) is handled above. Refuse it by name rather than misread
+        // the OVER.
         if self.peek_over() {
             return Err(self.err_here(format!(
-                "window function `{}` is not supported yet (window stage 2) — \
-                 only row_number/rank/dense_rank, aggregate `OVER`, and \
+                "`{}` is not a window function — only row_number/rank/dense_rank, \
+                 ntile/percent_rank/cume_dist, aggregate `OVER`, and \
                  lag/lead/first_value/last_value/nth_value are available",
                 name.to_ascii_lowercase()
             )));

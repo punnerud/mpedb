@@ -435,15 +435,19 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
             }
 }
 
-/// One [`WindowSpec`]: func tag (+ an `AggFn` byte for `Agg`, or an i64 offset/n
-/// for `Lag`/`Lead`/`NthValue`), optional arg program, distinct byte, optional
-/// `default` program (lag/lead), a PARTITION BY program list, and an ORDER BY
-/// `(program, desc)` list — the exact mirror of `decode_window`.
+/// One [`WindowSpec`]: func tag (+ an `AggFn` byte for `Agg`, or an i64
+/// offset/n/bucket-count for `Lag`/`Lead`/`NthValue`/`Ntile`), optional arg
+/// program, distinct byte, optional `default` program (lag/lead), a PARTITION BY
+/// program list, and an ORDER BY `(program, desc)` list — the exact mirror of
+/// `decode_window`.
 fn encode_window(w: &WindowSpec, buf: &mut Vec<u8>) {
     buf.push(w.func.tag());
     match w.func {
         WindowFunc::Agg(f) => buf.push(f as u8),
-        WindowFunc::Lag(o) | WindowFunc::Lead(o) | WindowFunc::NthValue(o) => {
+        WindowFunc::Lag(o)
+        | WindowFunc::Lead(o)
+        | WindowFunc::NthValue(o)
+        | WindowFunc::Ntile(o) => {
             buf.extend_from_slice(&o.to_le_bytes());
         }
         _ => {}
