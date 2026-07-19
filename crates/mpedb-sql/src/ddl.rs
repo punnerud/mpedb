@@ -623,6 +623,35 @@ mod tests {
         assert!(s.columns[0].pk && s.columns[1].unique);
     }
 
+    /// `AUTOINCREMENT` refuses BY NAME, in every position it can be written,
+    /// and the message says what cannot be promised. `PRIMARY KEY ASC|DESC` —
+    /// the same production — is accepted and its direction dropped, as in
+    /// sqlite.
+    #[test]
+    fn autoincrement_refuses_by_name_everywhere() {
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT)",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY ASC AUTOINCREMENT, x INT)",
+            "CREATE TABLE t (id integer AUTOINCREMENT PRIMARY KEY)",
+            "ALTER TABLE t ADD COLUMN id INTEGER PRIMARY KEY AUTOINCREMENT",
+        ] {
+            let e = parse_ddl(sql).unwrap_err().to_string();
+            assert!(e.contains("AUTOINCREMENT"), "{sql}: {e}");
+            assert!(e.contains("reused"), "the refusal must say WHY — {sql}: {e}");
+        }
+        // Without the keyword the same column definitions are fine, direction
+        // and all.
+        for sql in [
+            "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY ASC)",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY DESC, x INT)",
+        ] {
+            let s = create_table(sql);
+            assert!(s.columns[0].pk, "{sql}");
+            assert_eq!(s.columns[0].ty, ColumnType::Int64, "{sql}");
+        }
+    }
+
     #[test]
     fn create_table_malformed_and_unsupported_refuse() {
         assert!(parse_ddl("CREATE TABLE t (id INT PRIMARY KEY,)").is_err()); // trailing comma → empty col

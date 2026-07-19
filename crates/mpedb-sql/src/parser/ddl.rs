@@ -74,6 +74,36 @@ pub(crate) fn parse_ddl(sql: &str) -> Result<Option<DdlStmt>> {
     Ok(Some(ddl))
 }
 
+/// Why `AUTOINCREMENT` refuses by name instead of being accepted and quietly
+/// downgraded.
+///
+/// `INTEGER PRIMARY KEY` is ALREADY a rowid alias here (#94/#85): a NULL or
+/// omitted id is auto-assigned `max(rowid) + 1`. That is sqlite's behaviour
+/// *without* the keyword, and mpedb matches it exactly — including the id reuse
+/// after the top row is deleted (pinned differentially in
+/// `crates/mpedb/tests/django_parse_gaps.rs`).
+///
+/// `AUTOINCREMENT` adds exactly ONE guarantee on top: a rowid is never REUSED,
+/// even after the row holding it is deleted. sqlite honours it with a persisted
+/// per-table high-water counter (the `sqlite_sequence` table), bumped inside the
+/// same transaction as the insert. mpedb keeps no such counter — `next_rowid`
+/// reads the current maximum out of the PK tree — so the guarantee cannot be
+/// made without a new persisted, crash-safe, multi-process-visible sequence in
+/// the catalog.
+///
+/// Accepting the keyword and not honouring it is the one outcome worse than
+/// either alternative. A caller writes `AUTOINCREMENT` *because* ids must never
+/// come back (an external reference, an audit trail, a resumable cursor);
+/// handing them a reused id is wrong data, not a missing feature. So it refuses,
+/// says what it cannot promise, and says what to use instead.
+const AUTOINCREMENT_REFUSAL: &str =
+    "AUTOINCREMENT is not supported — mpedb keeps no persisted rowid high-water \
+     counter, so it cannot promise that an id is never reused after a delete, and \
+     never reusing an id is the whole of what AUTOINCREMENT adds. A plain `INTEGER \
+     PRIMARY KEY` already auto-assigns a NULL or omitted id as max(rowid)+1 (ids \
+     ARE reused after deleting the top row, exactly as in sqlite without the \
+     keyword); drop the keyword to use it";
+
 impl<'a> Parser<'a> {
     /// The current token as a lowercased identifier, if it is a bare Ident.
     fn peek_ident_ci(&self) -> Option<String> {
@@ -275,20 +305,17 @@ impl<'a> Parser<'a> {
                         col.unique = true;
                     } else if self.eat_word("PRIMARY") {
                         self.expect_word("KEY")?;
+                        // sqlite's `PRIMARY KEY [ASC|DESC] [AUTOINCREMENT]`. A
+                        // one-column index has no key order to choose, so the
+                        // direction is accepted and dropped, exactly as sqlite
+                        // does with it.
+                        let _ = self.eat_kw(Kw::Asc) || self.eat_kw(Kw::Desc);
                         col.pk = true;
+                        if self.eat_word("AUTOINCREMENT") {
+                            return Err(self.err_here(AUTOINCREMENT_REFUSAL));
+                        }
                     } else if self.eat_word("AUTOINCREMENT") {
-                        // A plain single-column INTEGER PRIMARY KEY is already a
-                        // rowid alias (NULL/omitted auto-assigns max(rowid)+1).
-                        // AUTOINCREMENT's extra guarantee — never reuse a freed
-                        // id — needs a persisted high-water counter mpedb does
-                        // not keep, so it is refused by name rather than
-                        // silently downgraded to the reuse-allowed behavior.
-                        return Err(self.err_here(
-                            "AUTOINCREMENT is not supported — a single-column INTEGER \
-                             PRIMARY KEY already auto-assigns NULL/omitted ids as \
-                             max(rowid)+1 (ids are reused after delete, unlike \
-                             AUTOINCREMENT); drop the keyword to use it",
-                        ));
+                        return Err(self.err_here(AUTOINCREMENT_REFUSAL));
                     } else if self.eat_word("COLLATE") {
                         col.collation = self.parse_collation_name()?;
                     } else if self.eat_word("DEFAULT") || self.eat_word("CHECK")
@@ -758,7 +785,13 @@ impl<'a> Parser<'a> {
                     col.unique = true;
                 } else if self.eat_word("PRIMARY") {
                     self.expect_word("KEY")?;
+                    let _ = self.eat_kw(Kw::Asc) || self.eat_kw(Kw::Desc);
                     col.pk = true;
+                    if self.eat_word("AUTOINCREMENT") {
+                        return Err(self.err_here(AUTOINCREMENT_REFUSAL));
+                    }
+                } else if self.eat_word("AUTOINCREMENT") {
+                    return Err(self.err_here(AUTOINCREMENT_REFUSAL));
                 } else if self.eat_word("COLLATE") {
                     col.collation = self.parse_collation_name()?;
                 } else if self.eat_word("DEFAULT") {

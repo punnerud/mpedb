@@ -9,6 +9,9 @@
 //!      (already on main; the regression coverage lives in the sql crate).
 //!   2. sqlite's declared-type vocabulary in `CREATE TABLE`
 //!      (`varchar(100)`, `bigint`, `datetime`, `double precision`, …).
+//!   3. `AUTOINCREMENT` — a deliberate refusal, see
+//!      `autoincrement_refuses_by_name`. It is the one gap that cannot be
+//!      closed without lying about the never-reuse guarantee.
 
 use mpedb::{Config, Database, ExecResult, Value};
 use std::io::Write;
@@ -246,6 +249,66 @@ fn a_declared_size_is_not_a_length_limit_in_either_engine() {
     ];
     assert_same(setup, "SELECT id, s FROM t");
 }
+
+// ---------------------------------------------------------------- item 3 ----
+
+/// `AUTOINCREMENT` refuses BY NAME.
+///
+/// sqlite's guarantee is that a rowid is never REUSED after a delete, held up by
+/// a persisted per-table counter (`sqlite_sequence`). mpedb reads the current
+/// maximum out of the PK tree and keeps no counter, so it cannot make that
+/// promise. Accepting the keyword and quietly reusing ids would be wrong DATA
+/// for the caller who asked for it — the one outcome worse than either
+/// alternative.
+///
+/// The differential below is what makes the refusal honest rather than lazy: it
+/// shows mpedb's plain `INTEGER PRIMARY KEY` matching sqlite's plain
+/// (non-AUTOINCREMENT) rowid exactly — INCLUDING the reuse after deleting the
+/// top row, which is precisely the behaviour AUTOINCREMENT would have to change.
+#[test]
+fn autoincrement_refuses_by_name() {
+    let t = open();
+    let e = t
+        .db
+        .query("CREATE TABLE ai (id INTEGER PRIMARY KEY AUTOINCREMENT, x INT)", &[])
+        .unwrap_err()
+        .to_string();
+    assert!(e.contains("AUTOINCREMENT"), "{e}");
+    assert!(e.contains("reused"), "the refusal must say WHY: {e}");
+    // sqlite ACCEPTS it — the gap is real, and this pins that it is a gap and
+    // not a shared refusal.
+    assert!(sqlite_try(&["CREATE TABLE ai (id INTEGER PRIMARY KEY AUTOINCREMENT)"], "SELECT 1")
+        .is_ok());
+
+    // Without the keyword: identical to sqlite, ids auto-assigned AND reused
+    // after the top row is deleted.
+    let setup: &[&str] = &[
+        "CREATE TABLE ai (id INTEGER PRIMARY KEY, x INT)",
+        "INSERT INTO ai (x) VALUES (1)",
+        "INSERT INTO ai (x) VALUES (2)",
+        "INSERT INTO ai (x) VALUES (3)",
+        "DELETE FROM ai WHERE id = 3",
+        "INSERT INTO ai (x) VALUES (4)",
+    ];
+    assert_same(setup, "SELECT id, x FROM ai ORDER BY id");
+    // Said out loud: the id that came back is 3, the one AUTOINCREMENT forbids.
+    assert_eq!(
+        mpedb_state(setup, "SELECT MAX(id) FROM ai"),
+        vec![vec!["3".to_string()]]
+    );
+
+    // `PRIMARY KEY ASC|DESC` — the same production — is accepted, direction
+    // dropped, exactly as sqlite does with it.
+    assert_same(
+        &[
+            "CREATE TABLE d (id INTEGER PRIMARY KEY ASC, x INT)",
+            "INSERT INTO d (x) VALUES (7)",
+        ],
+        "SELECT id, x FROM d",
+    );
+}
+
+// -------------------------------------------------------------- deviations ---
 
 /// The rigid half of the mapping, stated as a REFUSAL and pinned as such.
 ///
