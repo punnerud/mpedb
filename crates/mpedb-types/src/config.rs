@@ -144,6 +144,17 @@ pub struct DbOptions {
     /// property, so it lives here rather than in the schema. Absent in config ⇒
     /// [`DEFAULT_MAX_WORK_ROWS`].
     pub max_work_rows: u64,
+    /// Per-statement-execution budget on `Value` cells LIVE in a nested-loop
+    /// join's materialized intermediate product (`rows × row width`, summed
+    /// over the accumulated tuple set, the held inner side, and the next
+    /// stage being built). `max_work_rows` bounds how much a query READS;
+    /// this bounds how much a join HOLDS — the memory-proportional guard
+    /// that turns an N-way cross join's OOM abort into a clean
+    /// [`crate::Error::RuntimeBudget`]. `0` = unlimited (the join then still
+    /// fails cleanly on allocation pressure via fallible reservation, but a
+    /// machine with overcommit may OOM-kill first — the deterministic cap is
+    /// the reliable guard). Absent in config ⇒ [`DEFAULT_MAX_JOIN_CELLS`].
+    pub max_join_cells: u64,
     /// Names of tables declared `require_policy = true` (DESIGN-MULTIDB §6.3).
     /// A prepare touching one of these fails closed unless RLS is enabled AND a
     /// policy governs the command being compiled — the answer to "one forgotten
@@ -178,6 +189,18 @@ pub struct Config {
 /// runaway caught-by-default (see design/DESIGN-RUNTIME-BUDGET.md).
 pub const DEFAULT_MAX_WORK_ROWS: u64 = 1_000_000_000;
 
+/// The join-materialization cell budget default (2^28). Calibrated against
+/// the heaviest legitimate queries in the sqllogictest corpus, measured at
+/// ~40 B resident per cell: `select4.test` (100% pass) peaks at 31.7 M live
+/// cells ≈ 1.1 GB resident, and `select5.test`'s passing prefix (through
+/// `join-17-3`, 871/871) peaks at 68 M ≈ 2.7 GB. 268 M cells is 8.5× the
+/// former and 3.9× the latter, yet a genuine runaway (`select5.test`'s
+/// `join-17-4`, a 17-way comma join whose only constant anchor is the 16th
+/// of 17 conjuncts, product 10^17 rows) crosses it while the intermediate
+/// product is ~11 GB — a clean deterministic error where unbounded execution
+/// is an OOM kill. `0` = unlimited.
+pub const DEFAULT_MAX_JOIN_CELLS: u64 = 268_435_456;
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
@@ -200,12 +223,29 @@ struct RawRuntime {
     /// Absent ⇒ [`DEFAULT_MAX_WORK_ROWS`].
     #[serde(default)]
     max_work_rows: Option<u64>,
+    /// Live-cell budget on join materialization; `0` = unlimited.
+    /// Absent ⇒ [`DEFAULT_MAX_JOIN_CELLS`].
+    #[serde(default)]
+    max_join_cells: Option<u64>,
+}
+
+/// The resolved `[runtime]` limits (#74), one value per knob.
+#[derive(Clone, Copy)]
+struct RuntimeLimits {
+    max_work_rows: u64,
+    max_join_cells: u64,
 }
 
 impl RawRuntime {
-    fn resolve(this: Option<&RawRuntime>) -> u64 {
-        this.and_then(|r| r.max_work_rows)
-            .unwrap_or(DEFAULT_MAX_WORK_ROWS)
+    fn resolve(this: Option<&RawRuntime>) -> RuntimeLimits {
+        RuntimeLimits {
+            max_work_rows: this
+                .and_then(|r| r.max_work_rows)
+                .unwrap_or(DEFAULT_MAX_WORK_ROWS),
+            max_join_cells: this
+                .and_then(|r| r.max_join_cells)
+                .unwrap_or(DEFAULT_MAX_JOIN_CELLS),
+        }
     }
 }
 
@@ -362,9 +402,9 @@ impl Config {
     pub fn from_toml_str(text: &str) -> Result<Config> {
         let raw: RawConfig =
             toml::from_str(text).map_err(|e| Error::Config(e.to_string()))?;
-        let max_work_rows = RawRuntime::resolve(raw.runtime.as_ref());
+        let runtime = RawRuntime::resolve(raw.runtime.as_ref());
         let bare_group_by = RawCompat::resolve(raw.compat.as_ref())?;
-        raw_to_config(raw.database, raw.tables, max_work_rows, bare_group_by)
+        raw_to_config(raw.database, raw.tables, runtime, bare_group_by)
     }
 
     pub fn from_file(path: &std::path::Path) -> Result<Config> {
@@ -379,7 +419,7 @@ impl Config {
 fn raw_to_config(
     db: RawDatabase,
     raw_tables: Vec<RawTable>,
-    max_work_rows: u64,
+    runtime: RuntimeLimits,
     bare_group_by: BareGroupBy,
 ) -> Result<Config> {
         if db.path.is_empty() {
@@ -540,7 +580,8 @@ fn raw_to_config(
                     Some(kb) => Some(kb as usize * 1024),
                     None => default_extent_threshold(),
                 },
-                max_work_rows,
+                max_work_rows: runtime.max_work_rows,
+                max_join_cells: runtime.max_join_cells,
                 require_policy,
                 bare_group_by,
             },
@@ -644,7 +685,7 @@ impl WorkspaceConfig {
                         "workspace must declare at least one [[database]] member".into(),
                     ));
                 }
-                let max_work_rows = RawRuntime::resolve(raw.runtime.as_ref());
+                let runtime = RawRuntime::resolve(raw.runtime.as_ref());
                 let bare_group_by = RawCompat::resolve(raw.compat.as_ref())?;
                 let mut members = Vec::with_capacity(raw.databases.len());
                 let mut seen_alias = std::collections::HashSet::new();
@@ -664,7 +705,7 @@ impl WorkspaceConfig {
                     if !seen_alias.insert(alias.clone()) {
                         return Err(Error::Config(format!("duplicate database alias `{alias}`")));
                     }
-                    let config = raw_to_config(db, tables, max_work_rows, bare_group_by)?;
+                    let config = raw_to_config(db, tables, runtime, bare_group_by)?;
                     if !seen_path.insert(config.options.path.clone()) {
                         return Err(Error::Config(format!(
                             "two workspace members map to the same file `{}`",
@@ -913,6 +954,28 @@ path = "/dev/shm/shared.mpedb"
         assert!(
             Config::from_toml_str(&format!("{SAMPLE}\n[runtime]\nmax_time_ms = 5")).is_err()
         );
+    }
+
+    #[test]
+    fn parses_runtime_max_join_cells() {
+        // absent [runtime] ⇒ the finite default (caught-by-default guard)
+        assert_eq!(
+            Config::from_toml_str(SAMPLE).unwrap().options.max_join_cells,
+            DEFAULT_MAX_JOIN_CELLS
+        );
+        // explicit value; both knobs coexist in one [runtime]
+        let cfg = Config::from_toml_str(&format!(
+            "{SAMPLE}\n[runtime]\nmax_work_rows = 42\nmax_join_cells = 7000"
+        ))
+        .unwrap();
+        assert_eq!(cfg.options.max_work_rows, 42);
+        assert_eq!(cfg.options.max_join_cells, 7000);
+        // 0 = unlimited sentinel, preserved verbatim; the other knob keeps
+        // its default when absent
+        let cfg0 = Config::from_toml_str(&format!("{SAMPLE}\n[runtime]\nmax_join_cells = 0"))
+            .unwrap();
+        assert_eq!(cfg0.options.max_join_cells, 0);
+        assert_eq!(cfg0.options.max_work_rows, DEFAULT_MAX_WORK_ROWS);
     }
 
     #[test]

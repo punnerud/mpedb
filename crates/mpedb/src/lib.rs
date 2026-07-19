@@ -70,8 +70,8 @@ pub use stream::RowStream;
 pub use workspace::{Workspace, WorkspaceTxn, WsPlan};
 
 pub use mpedb_types::{
-    ColumnDef, ColumnType, Config, DbOptions, Durability, Error, HostAggState, PlanHash, PolicyCmd,
-    PolicyDef, Result, Schema, TableDef, Value, MAX_DB_SIZE_MB,
+    BudgetKind, ColumnDef, ColumnType, Config, DbOptions, Durability, Error, HostAggState,
+    PlanHash, PolicyCmd, PolicyDef, Result, Schema, TableDef, Value, MAX_DB_SIZE_MB,
 };
 
 use exec::{exec_stmt, ReadCtx};
