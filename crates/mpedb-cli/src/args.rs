@@ -141,6 +141,7 @@ mod tests {
     /// default while reporting success. `--durability wal` importing with
     /// durability=none is the worst instance. Now it panics on first use.
     #[test]
+    #[cfg_attr(not(debug_assertions), ignore = "guards are debug_assert!, compiled out in release")]
     #[should_panic(expected = "move it to the value_flags list")]
     fn reading_a_switch_as_a_value_panics() {
         let p = parse(&argv(&["--size_mb", "64"]), &[], &["size_mb"]).unwrap();
@@ -148,6 +149,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(debug_assertions), ignore = "guards are debug_assert!, compiled out in release")]
     #[should_panic(expected = "use value()/require()")]
     fn reading_a_value_as_a_switch_panics() {
         let p = parse(&argv(&["--dir", "/tmp"]), &["dir"], &[]).unwrap();
@@ -155,6 +157,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(not(debug_assertions), ignore = "guards are debug_assert!, compiled out in release")]
     #[should_panic(expected = "was not declared")]
     fn reading_an_undeclared_flag_panics() {
         let p = parse(&argv(&[]), &["dir"], &[]).unwrap();
