@@ -106,10 +106,6 @@ pub enum ScalarFn {
     /// offending specifier or time string, never a guessed value.
     /// See [`super::datetime`].
     Strftime = 43,
-    /// `json(X)` — validate `X` as RFC 8259 JSON text and return it minified
-    /// (all whitespace outside strings removed, every token's spelling kept).
-    /// See [`super::json`].
-    Json = 44,
 }
 
 impl ScalarFn {
@@ -158,7 +154,6 @@ impl ScalarFn {
             41 => ScalarFn::Printf,
             42 => ScalarFn::Quote,
             43 => ScalarFn::Strftime,
-            44 => ScalarFn::Json,
             other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
         })
     }
@@ -168,8 +163,8 @@ impl ScalarFn {
     pub fn arity_ok(self, argc: u8) -> bool {
         match self {
             ScalarFn::Lower | ScalarFn::Upper | ScalarFn::Length | ScalarFn::Abs
-            | ScalarFn::Unicode | ScalarFn::Hex | ScalarFn::Typeof | ScalarFn::Quote
-            | ScalarFn::Json => argc == 1,
+            | ScalarFn::Unicode | ScalarFn::Hex | ScalarFn::Typeof
+            | ScalarFn::Quote => argc == 1,
             // sqlite's strftime is `(FORMAT, TIMESTRING, modifier…)`. mpedb
             // accepts the arity so the refusal can NAME the modifiers rather
             // than report a bare arity mismatch (see `call_scalar`).
@@ -245,7 +240,6 @@ impl ScalarFn {
             ScalarFn::Printf => "printf",
             ScalarFn::Quote => "quote",
             ScalarFn::Strftime => "strftime",
-            ScalarFn::Json => "json",
         }
     }
 }
@@ -564,10 +558,6 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
         // strftime(FORMAT, TIMESTRING): sqlite's time formatter over the ISO-8601
         // time strings, restricted to the specifiers mpedb reproduces exactly.
         ScalarFn::Strftime => super::datetime::sqlite_strftime(args)?,
-        // json(X): validate and minify. Text only — sqlite's `json(5)` (a bare
-        // number) and its JSON5 extensions are refused by name rather than
-        // approximated.
-        ScalarFn::Json => super::json::sqlite_json(&args[0])?,
         // Handled ahead of the null gate above; unreachable here.
         ScalarFn::Typeof => unreachable!("typeof is dispatched before the null gate"),
         ScalarFn::Printf => unreachable!("printf is dispatched before the null gate"),

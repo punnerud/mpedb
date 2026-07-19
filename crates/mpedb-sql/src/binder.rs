@@ -1464,11 +1464,10 @@ impl<'a> Binder<'a> {
             "hex" => ScalarFn::Hex,
             "typeof" => ScalarFn::Typeof,
             // sqlite built-ins added for the Django/C-API surface: `quote(X)`
-            // (Django's `last_executed_query` calls `QUOTE(?)` per parameter),
-            // `strftime(FORMAT, TIME)` and `json(X)`.
+            // (Django's `last_executed_query` calls `QUOTE(?)` per parameter)
+            // and `strftime(FORMAT, TIME)`.
             "quote" => ScalarFn::Quote,
             "strftime" => ScalarFn::Strftime,
-            "json" => ScalarFn::Json,
             // Math (sqlite 3.45). `log` is base-10 with one argument and
             // log-base-b with two, so it dispatches on the argument count here —
             // `log10`/`log2` name the fixed-base forms directly.
@@ -1529,7 +1528,7 @@ impl<'a> Binder<'a> {
                      ltrim, rtrim, replace, instr, substr, substring, char, unicode, hex, \
                      typeof, abs, round, ceil, floor, trunc, sqrt, pow, sign, exp, ln, log, \
                      log10, log2, sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, \
-                     radians, degrees, pi, mod, printf, format, quote, strftime, json, iif, \
+                     radians, degrees, pi, mod, printf, format, quote, strftime, iif, \
                      coalesce, ifnull, nullif"
                 )));
             }
@@ -1618,7 +1617,6 @@ impl<'a> Binder<'a> {
                 &[Some(ColumnType::Text), Some(ColumnType::Text)],
                 Some(ColumnType::Text),
             ),
-            ScalarFn::Json => (&[Some(ColumnType::Text)], Some(ColumnType::Text)),
             // char/printf are variadic and bound specially above (never reached
             // here); present only so this match stays exhaustive over ScalarFn.
             ScalarFn::Char | ScalarFn::Printf => (&[], Some(ColumnType::Text)),

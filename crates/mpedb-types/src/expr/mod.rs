@@ -13,7 +13,6 @@ use std::cmp::Ordering;
 
 mod codec;
 mod datetime;
-mod json;
 mod ops;
 mod printf;
 mod scalar;

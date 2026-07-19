@@ -215,8 +215,7 @@ fn parse_timezone(b: &[u8], mut at: usize) -> Option<i32> {
     while at < b.len() && is_space(b[at]) {
         at += 1;
     }
-    let tz;
-    match b.get(at).copied() {
+    let tz = match b.get(at).copied() {
         Some(b'-') | Some(b'+') => {
             let sgn = if b[at] == b'-' { -1 } else { 1 };
             at += 1;
@@ -224,15 +223,15 @@ fn parse_timezone(b: &[u8], mut at: usize) -> Option<i32> {
             let n_hr = get_digits(b, &mut i, 2, 0, 14, b':')?;
             let n_mn = get_digits(b, &mut i, 2, 0, 59, 0)?;
             at += 5;
-            tz = sgn * (n_mn + n_hr * 60);
+            sgn * (n_mn + n_hr * 60)
         }
         Some(b'Z') | Some(b'z') => {
             at += 1;
-            tz = 0;
+            0
         }
         None => return Some(0),
         Some(_) => return None,
-    }
+    };
     while at < b.len() && is_space(b[at]) {
         at += 1;
     }
