@@ -1752,7 +1752,7 @@ pub unsafe extern "C" fn sqlite3_set_authorizer(
     SQLITE_OK
 }
 
-// ---- user-defined functions / collations (refused — next milestone) -------
+// ---- user-defined functions (scalar + aggregate) / collations (refused) ----
 
 /// Invoke a caller-supplied destructor (`void(*)(void*)`) for `app` if present —
 /// sqlite's contract on a failed `create_*` registration, so the caller does
@@ -1765,11 +1765,14 @@ unsafe fn call_destroy(destroy: *mut c_void, app: *mut c_void) {
 }
 
 /// The one implementation behind `sqlite3_create_function` and
-/// `sqlite3_create_function_v2` (design/DESIGN-UDF.md §1). Stage 1 is SCALAR
-/// only: an aggregate registration (`xStep`/`xFinal`) refuses cleanly, invoking
+/// `sqlite3_create_function_v2` (design/DESIGN-UDF.md §1 + stage 2).
+///
+/// `xFunc` set registers a SCALAR; `xStep` + `xFinal` register an AGGREGATE (a
+/// half-supplied pair is a misuse and refuses). All three NULL DELETES the
+/// `(name, nArg)` registration in both namespaces; a repeat registration
+/// REPLACES it, running the previous entry's `xDestroy`. Every refusal path runs
 /// the caller's `xDestroy(pApp)` so wrapped state (e.g. a CPython callable) is
-/// not leaked. `xFunc == NULL` DELETES the `(name, nArg)` registration; a repeat
-/// registration REPLACES it, running the previous entry's `xDestroy`.
+/// not leaked.
 #[allow(clippy::too_many_arguments)]
 unsafe fn create_function_impl(
     db: *mut Sqlite3,
@@ -1798,36 +1801,65 @@ unsafe fn create_function_impl(
     // sqlite function names are case-insensitive, and mpedb's parser lowercases
     // them before the binder resolves — register under the same spelling.
     let fname = raw_name.to_ascii_lowercase();
-    if !x_step.is_null() || !x_final.is_null() {
+    let is_agg = !x_step.is_null() || !x_final.is_null();
+    if is_agg && (x_step.is_null() || x_final.is_null()) {
+        // sqlite requires the pair: half of one is a misuse, not an aggregate.
         call_destroy(x_destroy, app);
         c.set_error(
-            SQLITE_ERROR,
-            SQLITE_ERROR,
-            "aggregate user-defined functions are not supported yet (scalar only)",
+            SQLITE_MISUSE,
+            SQLITE_MISUSE,
+            "create_function: an aggregate needs BOTH xStep and xFinal",
         );
-        return SQLITE_ERROR;
+        return SQLITE_MISUSE;
+    }
+    if is_agg && !x_func.is_null() {
+        call_destroy(x_destroy, app);
+        c.set_error(
+            SQLITE_MISUSE,
+            SQLITE_MISUSE,
+            "create_function: a function is either scalar (xFunc) or aggregate \
+             (xStep/xFinal), not both",
+        );
+        return SQLITE_MISUSE;
     }
     // A repeat registration replaces: run the previous entry's destructor first.
+    // The stored entry knows which registry it went into, so a name re-registered
+    // from scalar to aggregate (or back) leaves nothing stale behind.
     if let Some(i) = c
         .host_fns
         .iter()
         .position(|h| h.name == fname && h.n_arg == n_arg)
     {
         let old = c.host_fns.remove(i);
+        if old.aggregate {
+            c.db.unregister_host_aggregate(&fname, n_arg);
+        } else {
+            c.db.unregister_host_function(&fname, n_arg);
+        }
         old.destroy();
     }
-    if x_func.is_null() {
-        // sqlite: a NULL xFunc deletes the function.
+    if x_func.is_null() && !is_agg {
+        // sqlite: all-NULL callbacks delete the function. The `(name, nArg)` may
+        // have been either kind, and the replace above already dropped whichever
+        // this connection tracked — clear both registries to be certain.
         c.db.unregister_host_function(&fname, n_arg);
+        c.db.unregister_host_aggregate(&fname, n_arg);
         call_destroy(x_destroy, app);
         return SQLITE_OK;
     }
-    let f: udf::XFunc = std::mem::transmute(x_func);
-    c.db
-        .register_host_function(&fname, n_arg, udf::make_scalar_closure(f, app));
+    if is_agg {
+        let step: udf::XStep = std::mem::transmute(x_step);
+        let fin: udf::XFinal = std::mem::transmute(x_final);
+        c.db.register_host_aggregate(&fname, n_arg, udf::make_agg_factory(step, fin, app));
+    } else {
+        let f: udf::XFunc = std::mem::transmute(x_func);
+        c.db
+            .register_host_function(&fname, n_arg, udf::make_scalar_closure(f, app));
+    }
     c.host_fns.push(udf::HostFn {
         name: fname,
         n_arg,
+        aggregate: is_agg,
         x_destroy,
         p_app: app,
     });
@@ -1929,10 +1961,21 @@ pub unsafe extern "C" fn sqlite3_user_data(ctx: *mut c_void) -> *mut c_void {
     udf_ctx(ctx).map(|c| c.p_app()).unwrap_or(ptr::null_mut())
 }
 
-/// Aggregate UDFs are stage 2 — no aggregate context exists yet.
+/// `sqlite3_aggregate_context(ctx, nBytes)` (design/DESIGN-UDF.md stage 2).
+///
+/// First call of an aggregation with `nBytes > 0` allocates that many ZEROED
+/// bytes and returns them; every later call in the SAME aggregation — including
+/// `xFinal`'s — returns the SAME pointer. `nBytes <= 0` never allocates: it
+/// returns the existing buffer, or NULL when the group was never stepped, which
+/// is exactly how a well-behaved `xFinal` recognizes an empty group and yields
+/// NULL. Outside an aggregate callback (a scalar's context, a NULL pointer) it
+/// returns NULL, as sqlite does for the same misuse.
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_aggregate_context(_ctx: *mut c_void, _n: c_int) -> *mut c_void {
-    ptr::null_mut()
+pub unsafe extern "C" fn sqlite3_aggregate_context(ctx: *mut c_void, n: c_int) -> *mut c_void {
+    match udf_ctx(ctx) {
+        Some(c) => c.aggregate_context(n),
+        None => ptr::null_mut(),
+    }
 }
 
 #[no_mangle]

@@ -632,8 +632,21 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                     }
                     let mut aggs = Vec::with_capacity(n.min(64));
                     for _ in 0..n {
-                        let f = AggFn::from_tag(r_u8(buf, pos)?)
-                            .ok_or_else(|| corrupt("unknown aggregate function"))?;
+                        // Format 40: tag 0 = HOST aggregate (name follows);
+                        // 1..=7 = the `AggFn` byte, exactly as before.
+                        let f = match r_u8(buf, pos)? {
+                            0 => {
+                                let name = r_str(buf, pos)?;
+                                if name.is_empty() {
+                                    return Err(corrupt("host aggregate with an empty name"));
+                                }
+                                AggTarget::Host(name)
+                            }
+                            t => AggTarget::Native(
+                                AggFn::from_tag(t)
+                                    .ok_or_else(|| corrupt("unknown aggregate function"))?,
+                            ),
+                        };
                         let distinct = match r_u8(buf, pos)? {
                             0 => false,
                             1 => true,
@@ -648,6 +661,13 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                             // count(DISTINCT *) has no meaning and the parser
                             // rejects it; a blob claiming it is corrupt.
                             return Err(corrupt("aggregate is DISTINCT but has no argument"));
+                        }
+                        if f.host().is_some() && arg.is_none() {
+                            // Only `count(*)` takes the row itself; a host
+                            // aggregate always carries its one argument (the
+                            // parser guarantees it), so the executor never has
+                            // to invent an argument list for `xStep`.
+                            return Err(corrupt("host aggregate with no argument"));
                         }
                         // FILTER (WHERE …) (format 38): optional predicate over
                         // the base row; `validate` re-checks its width and params.

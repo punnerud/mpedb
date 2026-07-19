@@ -1,11 +1,81 @@
 use super::*;
+use mpedb_types::{HostAggState, HostAggs};
 
-fn new_accum(a: &AggCall) -> Accum {
-    if a.distinct {
-        Accum::new_distinct(a.func)
-    } else {
-        Accum::new(a.func)
+/// One aggregate's running state over one group: a built-in [`Accum`], or a HOST
+/// aggregate's `xStep`/`xFinal` accumulator (design/DESIGN-UDF.md stage 2).
+///
+/// The two differ on NULL, deliberately. A built-in SKIPS NULL arguments
+/// ([`Accum::push`] is where that rule lives); sqlite hands a USER aggregate
+/// every row, NULLs included, and lets `xStep` decide — Django's `StdDevPop`
+/// depends on it. DISTINCT and `FILTER (WHERE …)` are applied identically to
+/// both: the filter by the caller before `push`, the dedup here.
+enum Acc {
+    Native(Accum),
+    Host {
+        state: Box<dyn HostAggState>,
+        /// `f(DISTINCT x)`: values already stepped in this group, keyed by their
+        /// memcmp encoding — the same mechanism [`Accum::new_distinct`] uses.
+        /// `None` for a non-DISTINCT call, so the common case pays nothing.
+        seen: Option<std::collections::BTreeSet<Vec<u8>>>,
+    },
+}
+
+impl Acc {
+    /// Feed one row. `None` is `count(*)`'s "the row itself" — never produced for
+    /// a host aggregate (the plan decoder rejects a host call with no argument).
+    fn push(&mut self, v: Option<&Value>) -> Result<()> {
+        match self {
+            Acc::Native(a) => a.push(v),
+            Acc::Host { state, seen } => {
+                let args = match v {
+                    Some(v) => std::slice::from_ref(v),
+                    None => &[][..],
+                };
+                if let Some(seen) = seen {
+                    if !seen.insert(keycode::encode_key(args)) {
+                        return Ok(());
+                    }
+                }
+                state.step(args)
+            }
+        }
     }
+
+    fn finish(self) -> Result<Value> {
+        match self {
+            Acc::Native(a) => Ok(a.finish()),
+            // sqlite frees the aggregate context right after `xFinal`; consuming
+            // the boxed state here is that free.
+            Acc::Host { state, .. } => state.finish(),
+        }
+    }
+}
+
+/// Mint a fresh accumulator for one aggregate over one group. A host aggregate
+/// needs the connection's factory table, so this is where a plan naming one
+/// executed OUT of scope (the write path, the streaming/overlay read paths)
+/// surfaces a clean error instead of a wrong answer.
+fn new_accum(a: &AggCall, host: Option<&dyn HostAggs>) -> Result<Acc> {
+    let Some(name) = a.func.host() else {
+        let f = a.func.native().ok_or_else(|| internal("aggregate with no target"))?;
+        return Ok(Acc::Native(if a.distinct {
+            Accum::new_distinct(f)
+        } else {
+            Accum::new(f)
+        }));
+    };
+    let host = host.ok_or_else(|| {
+        Error::Unsupported(format!(
+            "host aggregate {name}() is not in scope for this execution"
+        ))
+    })?;
+    // The plan's shape IS the arity: a host call always carries its one argument
+    // (decode enforces it), so the registry lookup asks for exactly that.
+    let argc = a.arg.is_some() as i32;
+    Ok(Acc::Host {
+        state: host.create(name, argc)?,
+        seen: a.distinct.then(std::collections::BTreeSet::new),
+    })
 }
 
 /// `GROUP BY` / aggregates / `HAVING`.
@@ -96,11 +166,13 @@ pub(super) fn exec_aggregate(
     // order-dependent, undocumented pick), so a legitimately compiled plan never
     // reaches here with it; a forged one falls into the safe min-PK branch below.
     let has_bare = !agg.bare_cols.is_empty();
-    let mm = {
-        let mut it = agg
-            .aggs
-            .iter()
-            .filter(|c| matches!(c.func, mpedb_types::AggFn::Min | mpedb_types::AggFn::Max));
+    // A HOST aggregate is never a min/max: `AggTarget::native()` is None for one,
+    // so it can neither govern the witness nor be miscounted here.
+    let mm: Option<(&AggCall, mpedb_types::AggFn)> = {
+        let mut it = agg.aggs.iter().filter_map(|c| match c.func.native() {
+            Some(f @ (mpedb_types::AggFn::Min | mpedb_types::AggFn::Max)) => Some((c, f)),
+            _ => None,
+        });
         match (it.next(), it.next()) {
             // Exactly one min/max → its witness row governs the bare columns.
             (Some(c), None) => Some(c),
@@ -136,8 +208,12 @@ pub(super) fn exec_aggregate(
             GroupKey::Expr(_) => Collation::Binary,
         })
         .collect();
-    type Group = (Vec<Value>, Vec<Accum>, Option<Witness>);
+    type Group = (Vec<Value>, Vec<Acc>, Option<Witness>);
     let mut groups: std::collections::BTreeMap<Vec<u8>, Group> = Default::default();
+    // Bound once: the factory table for host aggregates is read per GROUP (one
+    // fresh accumulator each), and both this and `ctx.host_fns()` are shared
+    // reborrows of the same context.
+    let host_aggs = ctx.host_aggs();
     for row in &rows {
         let key_vals: Vec<Value> = agg
             .group_by
@@ -149,16 +225,27 @@ pub(super) fn exec_aggregate(
             })
             .collect::<Result<_>>()?;
         let key = keycode::encode_key_collated(&key_vals, &group_collations);
-        let entry = groups.entry(key).or_insert_with(|| {
-            let witness = if !has_bare {
-                None
-            } else if mm.is_some() {
-                Some(Witness::MinMax { extreme: None, bare: Vec::new() })
-            } else {
-                Some(Witness::MinRowid { pk: Vec::new(), bare: Vec::new() })
-            };
-            (key_vals, agg.aggs.iter().map(new_accum).collect(), witness)
-        });
+        // Not `or_insert_with`: minting a HOST accumulator can FAIL (an
+        // out-of-scope or unregistered aggregate), and a closure cannot carry
+        // that error out.
+        let entry = match groups.entry(key) {
+            std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
+            std::collections::btree_map::Entry::Vacant(e) => {
+                let witness = if !has_bare {
+                    None
+                } else if mm.is_some() {
+                    Some(Witness::MinMax { extreme: None, bare: Vec::new() })
+                } else {
+                    Some(Witness::MinRowid { pk: Vec::new(), bare: Vec::new() })
+                };
+                let accs = agg
+                    .aggs
+                    .iter()
+                    .map(|c| new_accum(c, host_aggs))
+                    .collect::<Result<Vec<Acc>>>()?;
+                e.insert((key_vals, accs, witness))
+            }
+        };
         for (i, call) in agg.aggs.iter().enumerate() {
             // `agg(x) FILTER (WHERE cond)`: this row feeds THIS aggregate only
             // when `cond` is TRUE over the base row (3VL — NULL/FALSE skip). The
@@ -196,7 +283,8 @@ pub(super) fn exec_aggregate(
                 // takes its bare values from its last row — differential-tested
                 // against sqlite 3.45.
                 Witness::MinMax { extreme, bare } => {
-                    let mm = mm.expect("MinMax witness implies a single min/max aggregate");
+                    let (mm, mm_fn) =
+                        mm.expect("MinMax witness implies a single min/max aggregate");
                     // A FILTER on the governing min/max restricts BOTH the
                     // extremum AND the witness row to the rows it accepts
                     // (verified vs sqlite 3.45: the bare column follows the
@@ -228,7 +316,7 @@ pub(super) fn exec_aggregate(
                                 }
                             }
                             Some(e) => {
-                                if !v.is_null() && mm.func.min_max_prefers(e, &v)? {
+                                if !v.is_null() && mm_fn.min_max_prefers(e, &v)? {
                                     *extreme = Some(v);
                                     *bare = capture();
                                 }
@@ -264,8 +352,17 @@ pub(super) fn exec_aggregate(
     // GROUP BY, an empty input means no groups at all.
     let mut out: Vec<Vec<Value>> = Vec::new();
     if groups.is_empty() && agg.group_by.is_empty() {
-        let accs: Vec<Accum> = agg.aggs.iter().map(new_accum).collect();
-        let mut tuple: Vec<Value> = accs.into_iter().map(|a| a.finish()).collect();
+        // An EMPTY group still FINISHES a fresh accumulator — for a host
+        // aggregate that is `xFinal` on a never-stepped (NULL) aggregate
+        // context, which is exactly sqlite's rule and why Django's
+        // `STDDEV_POP` over no rows is NULL rather than an error.
+        let accs = agg
+            .aggs
+            .iter()
+            .map(|c| new_accum(c, host_aggs))
+            .collect::<Result<Vec<Acc>>>()?;
+        let mut tuple: Vec<Value> =
+            accs.into_iter().map(Acc::finish).collect::<Result<_>>()?;
         // No rows means no witness row, so a bare column is NULL — sqlite:
         // `SELECT name, max(x) FROM empty` yields one row `(NULL, NULL)`.
         tuple.resize(tuple.len() + agg.bare_cols.len(), Value::Null);
@@ -273,7 +370,9 @@ pub(super) fn exec_aggregate(
     }
     for (_, (keys, accs, witness)) in groups {
         let mut tuple = keys;
-        tuple.extend(accs.into_iter().map(|a| a.finish()));
+        for a in accs {
+            tuple.push(a.finish()?);
+        }
         // Every group has at least one row, so the witness `bare` is populated;
         // extend the grouped tuple to `[keys ‖ aggs ‖ bare]`.
         if let Some(w) = witness {

@@ -327,7 +327,15 @@ fn order_by_takes_an_aggregate_not_just_a_name() {
             assert_eq!(sel.group_by, vec![Expr::Col("dept".into())]);
             assert_eq!(
                 sel.order_by,
-                vec![(Expr::Agg(mpedb_types::AggFn::Count, None, false, None), true)]
+                vec![(
+                    Expr::Agg(
+                        mpedb_types::AggTarget::Native(mpedb_types::AggFn::Count),
+                        None,
+                        false,
+                        None
+                    ),
+                    true
+                )]
             );
         }
         other => panic!("expected select, got {other:?}"),
