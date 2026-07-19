@@ -994,7 +994,12 @@ impl Database {
     pub fn set_busy_timeout(&self, timeout: Option<std::time::Duration>) {
         let ms = match timeout {
             None => -1,
-            Some(t) => t.as_millis().min(i64::MAX as u128) as i64,
+            // Round sub-millisecond budgets UP: as_millis() truncates, and
+            // Some(500µs) silently becoming timeout-0 (immediate BUSY) is a
+            // trap. Zero stays zero — that spelling is the explicit
+            // one-attempt request.
+            Some(t) if t.is_zero() => 0,
+            Some(t) => t.as_millis().max(1).min(i64::MAX as u128) as i64,
         };
         self.busy_timeout_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1347,7 +1352,11 @@ impl Database {
         plan: &CompiledPlan,
         params: &[Value],
     ) -> Result<ExecResult> {
-        // #109: one busy budget for the whole statement, fixed at entry.
+        // #109: the busy budget for this statement's FIRST acquisition,
+        // fixed here. The optimistic-mode retry/serial-fallback sites in
+        // ring_exec recompute a fresh budget per acquisition — sqlite's
+        // busy handler is likewise per-lock-event, so a statement that
+        // needs several acquisitions may wait up to that many budgets.
         let deadline = self.busy_deadline();
         // fast path: uncontended — validate policy staleness under the writer
         // lock we now hold (no policy edit can race it, §4).
