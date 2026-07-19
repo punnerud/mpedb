@@ -45,7 +45,7 @@ impl<'a> Parser<'a> {
     pub(super) fn insert_body(&mut self, or_conflict: Option<OnConflict>) -> Result<Stmt> {
         self.expect_kw(Kw::Into, "INTO")?;
         let table = self.ident("table name")?;
-        let columns = if self.eat(&Tok::LParen) {
+        let mut columns = if self.eat(&Tok::LParen) {
             let mut cols = vec![self.ident("column name")?];
             while self.eat(&Tok::Comma) {
                 cols.push(self.ident("column name")?);
@@ -60,6 +60,21 @@ impl<'a> Parser<'a> {
         let mut select = None;
         if self.peek() == Some(&Tok::Kw(Kw::Select)) {
             select = Some(Box::new(self.select_core()?));
+        } else if self.eat_word("DEFAULT") {
+            // `INSERT INTO t DEFAULT VALUES` — insert ONE row where every column
+            // takes its default (a rowid alias auto-assigns; a NOT NULL column
+            // with no default is an error, exactly as sqlite). Represented as an
+            // explicit EMPTY column list + one empty values row, so `plan_insert`
+            // sources every column from its `Default`. A column list cannot be
+            // combined with it (sqlite rejects `INSERT INTO t (a) DEFAULT VALUES`).
+            self.expect_kw(Kw::Values, "VALUES after DEFAULT")?;
+            if columns.is_some() {
+                return Err(self.err_here(
+                    "DEFAULT VALUES cannot be combined with a column list",
+                ));
+            }
+            columns = Some(Vec::new());
+            rows.push(Vec::new());
         } else {
             self.expect_kw(Kw::Values, "VALUES")?;
             loop {
