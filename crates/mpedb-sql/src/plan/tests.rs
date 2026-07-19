@@ -126,6 +126,15 @@ fn sample_sqls() -> Vec<&'static str> {
         "SELECT id FROM users WHERE id IN \
          (SELECT user_id FROM orders WHERE item_no IN (SELECT age FROM users UNION SELECT id FROM users))",
         "SELECT id FROM users WHERE id = (SELECT user_id FROM orders UNION SELECT 4 LIMIT 1)",
+        // Aggregate FILTER (WHERE …) (format 38): each AggCall grows an optional
+        // filter program after `distinct`. A count(*) filter, a sum filter, two
+        // aggregates with DIFFERENT filters, a DISTINCT+FILTER, and FILTER + GROUP
+        // BY must all survive encode/decode/validate/hash and the truncation fuzz.
+        "SELECT count(*) FILTER (WHERE age > 18) FROM users",
+        "SELECT sum(age) FILTER (WHERE active) FROM users",
+        "SELECT sum(age) FILTER (WHERE active), count(*) FILTER (WHERE age > 18) FROM users",
+        "SELECT count(DISTINCT age) FILTER (WHERE age > 0) FROM users",
+        "SELECT active, avg(age) FILTER (WHERE score > 1.0) FROM users GROUP BY active",
         "BEGIN",
         "COMMIT",
         "ROLLBACK",
@@ -196,7 +205,7 @@ fn decode_rejects_truncation_and_stale_format_in_cast() {
         let p = prepare(sql, &s).unwrap();
         let _ = p.explain(&s); // must not panic rendering the affinity name
         let bytes = p.encode();
-        assert_eq!(bytes[0], 37, "plan format byte for {sql}");
+        assert_eq!(bytes[0], 38, "plan format byte for {sql}");
         let q = CompiledPlan::decode(&bytes, &s).expect(sql);
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         for cut in 0..bytes.len() {
@@ -237,7 +246,7 @@ fn bare_group_by_roundtrips_and_rejects_truncation_and_stale_format() {
         assert!(!agg.bare_cols.is_empty(), "bare_cols must be populated for {sql}");
 
         let bytes = p.encode();
-        assert_eq!(bytes[0], 37, "plan format byte for {sql}");
+        assert_eq!(bytes[0], 38, "plan format byte for {sql}");
         let q = CompiledPlan::decode(&bytes, &s).expect(sql);
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         for cut in 0..bytes.len() {
@@ -251,6 +260,48 @@ fn bare_group_by_roundtrips_and_rejects_truncation_and_stale_format() {
         assert!(
             matches!(CompiledPlan::decode(&stale, &s), Err(Error::PlanInvalidated)),
             "a format-29 bare-column plan must be PlanInvalidated, not misread, for {sql}"
+        );
+    }
+}
+
+/// Aggregate `FILTER (WHERE …)` (format 38): each AggCall now carries an
+/// optional filter program after `distinct`. The plan must actually hold it,
+/// round-trip through the wire, survive truncation at every offset, and
+/// re-prepare (never be misread) when the format byte is set back to 37.
+#[test]
+fn agg_filter_roundtrips_and_rejects_truncation_and_stale_format() {
+    let s = test_schema();
+    for sql in [
+        "SELECT count(*) FILTER (WHERE age > 18) FROM users",
+        "SELECT sum(age) FILTER (WHERE active), count(*) FILTER (WHERE age > 18) FROM users",
+        "SELECT count(DISTINCT age) FILTER (WHERE age > 0) FROM users",
+        "SELECT active, avg(age) FILTER (WHERE score > 1.0) FROM users GROUP BY active",
+    ] {
+        let p = prepare(sql, &s).unwrap();
+        // The plan must actually carry a filter program on at least one agg.
+        let PlanStmt::Select(sp) = &p.stmt else { panic!("expected select for {sql}") };
+        let agg = sp.aggregate.as_ref().expect("aggregate");
+        assert!(
+            agg.aggs.iter().any(|c| c.filter.is_some()),
+            "a FILTER program must be populated for {sql}"
+        );
+
+        let bytes = p.encode();
+        assert_eq!(bytes[0], 38, "plan format byte for {sql}");
+        let q = CompiledPlan::decode(&bytes, &s).expect(sql);
+        assert_eq!(p, q, "roundtrip mismatch for {sql}");
+        assert_eq!(p.hash(), q.hash(), "hash instability for {sql}");
+        for cut in 0..bytes.len() {
+            assert!(
+                CompiledPlan::decode(&bytes[..cut], &s).is_err(),
+                "truncation at {cut} must fail for {sql}"
+            );
+        }
+        let mut stale = bytes.clone();
+        stale[0] = 37;
+        assert!(
+            matches!(CompiledPlan::decode(&stale, &s), Err(Error::PlanInvalidated)),
+            "a format-37 FILTER plan must be PlanInvalidated, not misread, for {sql}"
         );
     }
 }
@@ -375,7 +426,7 @@ fn decode_rejects_truncation_in_windows() {
     let ex = p.explain(&s);
     assert!(ex.contains("window __w"), "EXPLAIN should show the windows:\n{ex}");
     let bytes = p.encode();
-    assert_eq!(bytes[0], 37, "plan format byte");
+    assert_eq!(bytes[0], 38, "plan format byte");
     for cut in 0..bytes.len() {
         assert!(
             CompiledPlan::decode(&bytes[..cut], &s).is_err(),
@@ -444,7 +495,7 @@ fn compound_subplan_roundtrips_rejects_truncation_and_stale_format() {
         );
         let _ = p.explain(&s); // must not panic on the compound body render
         let bytes = p.encode();
-        assert_eq!(bytes[0], 37, "plan format byte for {sql}");
+        assert_eq!(bytes[0], 38, "plan format byte for {sql}");
         assert_eq!(CompiledPlan::decode(&bytes, &s).unwrap(), p, "roundtrip for {sql}");
         for cut in 0..bytes.len() {
             assert!(

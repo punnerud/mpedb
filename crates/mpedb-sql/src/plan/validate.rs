@@ -346,6 +346,11 @@ impl CompiledPlan {
                         if let Some(p) = &c.arg {
                             self.check_program_width(p, base_width, ptypes)?;
                         }
+                        // FILTER (WHERE …) (format 38): a predicate over the same
+                        // base row as the argument, so bound it by `base_width`.
+                        if let Some(p) = &c.filter {
+                            self.check_program_width(p, base_width, ptypes)?;
+                        }
                     }
                     // sqlite bare columns (format 30) extend the grouped tuple to
                     // `[keys ‖ aggs ‖ bare_cols]`. Each is a BASE-row column, so
@@ -872,6 +877,9 @@ impl CompiledPlan {
             }
             for a in &agg.aggs {
                 if let Some(p) = &a.arg {
+                    gather_ok(p)?;
+                }
+                if let Some(p) = &a.filter {
                     gather_ok(p)?;
                 }
             }

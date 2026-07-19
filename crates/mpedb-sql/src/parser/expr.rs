@@ -562,10 +562,34 @@ impl<'a> Parser<'a> {
                 self.expect(&Tok::RParen, "`)` closing the argument list")?;
                 (Some(Box::new(arg)), distinct)
             };
+            // An OPTIONAL trailing `FILTER (WHERE <cond>)` (sqlite 3.30+/PG):
+            // the aggregate accumulates only the rows where `cond` is TRUE. In
+            // the grammar FILTER precedes OVER. `FILTER` is NOT a reserved word,
+            // so it is a keyword ONLY when immediately followed by `(` — a bare
+            // `count(*) filter` (no paren) is `filter` used as an output ALIAS,
+            // exactly as sqlite/PG parse it, so peek for the paren before
+            // committing. `(`, `WHERE`, the predicate, and `)` are then mandatory.
+            let filter = if self.peek_filter_paren() {
+                self.pos += 1; // FILTER
+                self.expect(&Tok::LParen, "`(` after FILTER")?;
+                self.expect_kw(Kw::Where, "WHERE inside `FILTER (WHERE …)`")?;
+                let cond = self.expr()?;
+                self.expect(&Tok::RParen, "`)` closing `FILTER (WHERE …)`")?;
+                Some(Box::new(cond))
+            } else {
+                None
+            };
             // An `OVER` clause turns the aggregate into a WINDOW aggregate
             // (stage 1b): the same `AggFn`, but computed over a partition with
-            // every row surviving rather than collapsed into one.
+            // every row surviving rather than collapsed into one. FILTER on a
+            // window aggregate is standard SQL but mpedb refuses it — only plain
+            // grouped/scalar aggregates carry a FILTER.
             if self.peek_over() {
+                if filter.is_some() {
+                    return Err(self.err_here(
+                        "FILTER (WHERE …) on a window aggregate (OVER …) is not supported",
+                    ));
+                }
                 let spec = self.window_over()?;
                 return Ok(Expr::Window {
                     func: WindowFunc::Agg(f),
@@ -575,7 +599,7 @@ impl<'a> Parser<'a> {
                     spec,
                 });
             }
-            return Ok(Expr::Agg(f, arg, distinct));
+            return Ok(Expr::Agg(f, arg, distinct, filter));
         }
         let mut args = Vec::new();
         if self.peek() != Some(&Tok::RParen) {
@@ -682,6 +706,15 @@ impl<'a> Parser<'a> {
     /// named `over` is unaffected.
     fn peek_over(&self) -> bool {
         matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("OVER"))
+            && matches!(self.peek_at(1), Some(Tok::LParen))
+    }
+
+    /// The next token is a bare `FILTER` word immediately followed by `(` — the
+    /// start of an aggregate `FILTER (WHERE …)` clause. `FILTER` is positional
+    /// (not reserved), so a bare `filter` NOT followed by `(` stays an ordinary
+    /// identifier / output alias, exactly as sqlite and PostgreSQL parse it.
+    fn peek_filter_paren(&self) -> bool {
+        matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("FILTER"))
             && matches!(self.peek_at(1), Some(Tok::LParen))
     }
 

@@ -480,7 +480,16 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
             }
         }
         Expr::InParamSlot(a, _, _) | Expr::InContext(a, _, _) => rename_qualifier(a, from, to),
-        Expr::Agg(_, Some(arg), _) => rename_qualifier(arg, from, to),
+        // Both the aggregate ARGUMENT and its `FILTER (WHERE …)` may name the
+        // derived alias — rename inside each.
+        Expr::Agg(_, arg, _, filter) => {
+            if let Some(a) = arg {
+                rename_qualifier(a, from, to);
+            }
+            if let Some(f) = filter {
+                rename_qualifier(f, from, to);
+            }
+        }
         // A window's sub-expressions may name the derived alias too. (Derived
         // bodies with windows are refused earlier, so this is belt-and-braces.)
         Expr::Window { arg, spec, .. } => {
@@ -502,8 +511,7 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
         | Expr::Param(_)
         | Expr::Col(_)
         | Expr::ContextRef(_)
-        | Expr::Excluded(_)
-        | Expr::Agg(_, None, _) => {}
+        | Expr::Excluded(_) => {}
     }
 }
 
@@ -573,7 +581,15 @@ fn flatten_expr(
             }
             Ok(())
         }
-        Expr::Agg(_, Some(arg), _) => flatten_expr(arg, views, ctes, depth),
+        Expr::Agg(_, arg, _, filter) => {
+            if let Some(a) = arg {
+                flatten_expr(a, views, ctes, depth)?;
+            }
+            if let Some(f) = filter {
+                flatten_expr(f, views, ctes, depth)?;
+            }
+            Ok(())
+        }
         _ => Ok(()),
     }
 }
@@ -662,7 +678,14 @@ fn collect_expr_sources(e: &Expr, out: &mut Vec<String>) {
             }
         }
         Expr::InParamSlot(a, _, _) | Expr::InContext(a, _, _) => collect_expr_sources(a, out),
-        Expr::Agg(_, Some(arg), _) => collect_expr_sources(arg, out),
+        Expr::Agg(_, arg, _, filter) => {
+            if let Some(a) = arg {
+                collect_expr_sources(a, out);
+            }
+            if let Some(f) = filter {
+                collect_expr_sources(f, out);
+            }
+        }
         _ => {}
     }
 }

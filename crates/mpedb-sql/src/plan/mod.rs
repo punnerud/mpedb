@@ -226,7 +226,14 @@ const MAX_JOINS: usize = 16;
 //     plans. A format-36 reader hits the unknown opcode 38 and rejects the plan
 //     as corrupt rather than misreading it, so the whole-plan version gates it:
 //     a format-36 blob fails CLOSED at byte 0 with the documented re-prepare.
-const PLAN_FORMAT: u8 = 37;
+// 38: aggregate `FILTER (WHERE …)`. Each `AggCall` grows an optional filter
+//     program (a boolean predicate over the base row) encoded right after
+//     `distinct`, in the same optional-ExprProgram framing (`arg`/`having` use)
+//     — a 0/1 presence byte, then the program when present. A format-37 reader
+//     desyncs on the extra byte and rejects the plan as corrupt rather than
+//     misreading it, so the whole-plan version gates it: a format-37 blob fails
+//     CLOSED at byte 0 with the documented re-prepare.
+const PLAN_FORMAT: u8 = 38;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -1078,6 +1085,13 @@ pub struct AggCall {
     /// arise and every row counts. `Some(p)` is evaluated over the base row and
     /// NULLs are skipped. That difference is the whole reason `count(*)` exists.
     pub arg: Option<ExprProgram>,
+    /// `agg(x) FILTER (WHERE <cond>)` (format 38): a boolean predicate over the
+    /// SAME base row `arg` is evaluated over. The executor accumulates a row into
+    /// THIS aggregate only when the predicate is exactly `true` (3VL — NULL and
+    /// FALSE skip the row). `None` = no FILTER (every row is a candidate). Each
+    /// aggregate filters independently; for `DISTINCT` the filter runs FIRST and
+    /// the survivors are then deduped.
+    pub filter: Option<ExprProgram>,
 }
 
 /// The compiled `ON CONFLICT` action.
