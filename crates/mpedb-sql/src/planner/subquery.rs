@@ -54,7 +54,7 @@ fn expr_has_subquery(e: &ast::Expr) -> bool {
         E::InContext(a, _, _) => expr_has_subquery(a),
         E::Collate(a, _) => expr_has_subquery(a),
         E::InList(a, xs, _) => expr_has_subquery(a) || xs.iter().any(expr_has_subquery),
-        E::Coalesce(xs) | E::Func(_, xs) => xs.iter().any(expr_has_subquery),
+        E::Coalesce(xs) | E::Func(_, xs) | E::RowValue(xs) => xs.iter().any(expr_has_subquery),
         E::Case(arms, els) => {
             arms.iter()
                 .any(|(c, r)| expr_has_subquery(c) || expr_has_subquery(r))
@@ -257,6 +257,12 @@ impl Lift<'_> {
                 xs.iter().map(|x| self.rewrite(x)).collect::<Result<_>>()?,
                 *n,
             ),
+            // A row value's elements can themselves contain subqueries — rewrite
+            // each (the desugar to scalar boolean logic happens later, in the
+            // binder). The RowValue node survives the lift untouched otherwise.
+            E::RowValue(xs) => {
+                E::RowValue(xs.iter().map(|x| self.rewrite(x)).collect::<Result<_>>()?)
+            }
             E::Coalesce(xs) => {
                 E::Coalesce(xs.iter().map(|x| self.rewrite(x)).collect::<Result<_>>()?)
             }
@@ -717,6 +723,12 @@ impl<'a> Correlate<'a, '_> {
                 xs.iter().map(|x| self.rewrite(x)).collect::<Result<_>>()?,
                 *n,
             ),
+            // A row value's elements can themselves contain subqueries — rewrite
+            // each (the desugar to scalar boolean logic happens later, in the
+            // binder). The RowValue node survives the lift untouched otherwise.
+            E::RowValue(xs) => {
+                E::RowValue(xs.iter().map(|x| self.rewrite(x)).collect::<Result<_>>()?)
+            }
             E::Coalesce(xs) => {
                 E::Coalesce(xs.iter().map(|x| self.rewrite(x)).collect::<Result<_>>()?)
             }

@@ -343,7 +343,7 @@ fn rewrite_row_in_expr(e: &mut Expr, scope: &RowScope, map: &mut RowMap) -> Resu
             }
             Ok(())
         }
-        Expr::Func(_, args) | Expr::Coalesce(args) => {
+        Expr::Func(_, args) | Expr::Coalesce(args) | Expr::RowValue(args) => {
             for a in args {
                 rewrite_row_in_expr(a, scope, map)?;
             }

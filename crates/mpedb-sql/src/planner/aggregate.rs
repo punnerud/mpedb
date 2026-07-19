@@ -17,7 +17,7 @@ pub(super) fn contains_agg(e: &ast::Expr) -> bool {
         E::Collate(a, _) => contains_agg(a),
         E::InSubquery(a, _, _) | E::InParamSlot(a, _, _) => contains_agg(a),
         E::InList(a, xs, _) => contains_agg(a) || xs.iter().any(contains_agg),
-        E::Coalesce(xs) | E::Func(_, xs) => xs.iter().any(contains_agg),
+        E::Coalesce(xs) | E::Func(_, xs) | E::RowValue(xs) => xs.iter().any(contains_agg),
         E::Case(arms, els) => {
             arms.iter().any(|(c, r)| contains_agg(c) || contains_agg(r))
                 || els.as_deref().is_some_and(contains_agg)
@@ -168,6 +168,12 @@ fn lift_aggs(
             f.clone(),
             xs.iter().map(|x| rec(x, aggs, bare)).collect::<Result<_>>()?,
         ),
+        // A row value's elements may hold aggregates (`HAVING (count(*), sum(x))
+        // > (?, ?)`), so lift each; the binder desugars the tuple comparison
+        // afterward over the grouped tuple.
+        E::RowValue(xs) => {
+            E::RowValue(xs.iter().map(|x| rec(x, aggs, bare)).collect::<Result<_>>()?)
+        }
         E::Case(arms, els) => E::Case(
             arms.iter()
                 .map(|(c, r)| Ok((rec(c, aggs, bare)?, rec(r, aggs, bare)?)))

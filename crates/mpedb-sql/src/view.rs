@@ -474,7 +474,7 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
                 rename_qualifier(x, from, to);
             }
         }
-        Expr::Coalesce(items) | Expr::Func(_, items) => {
+        Expr::Coalesce(items) | Expr::Func(_, items) | Expr::RowValue(items) => {
             for item in items {
                 rename_qualifier(item, from, to);
             }
