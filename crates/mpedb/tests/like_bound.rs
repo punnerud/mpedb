@@ -1,26 +1,31 @@
 //! #74 item 3, LIKE/GLOB half: NON-LITERAL patterns — bound parameters
 //! (Django's wire shape), per-row COLUMN patterns, computed patterns — and
-//! the `likeFunc` runtime operand rule they expose, all differential against
-//! the bundled sqlite oracle.
+//! the runtime operand coercion they expose, all differential against the
+//! bundled sqlite oracle.
 //!
-//! The rules being pinned were READ OFF the binary (3.45.1), not inferred:
+//! The rules being pinned, read off the ORACLE:
 //!
-//! - a BLOB on either side of LIKE or GLOB yields FALSE, and the check comes
-//!   BEFORE the NULL rule (`NULL LIKE x'41'` is 0, not NULL; `NOT LIKE` over
-//!   it is 1);
-//! - then NULL propagates;
-//! - then a numeric renders as its sqlite text at runtime (`'12' LIKE 12` is
-//!   1, `'12' LIKE 12.0` is 0 — `12.0` renders as `'12.0'`);
+//! - NULL on either side propagates;
+//! - a non-text operand takes `sqlite3_value_text`'s conversion — mpedb's
+//!   `CAST(x AS TEXT)` bridge, applied by the binder to pattern and subject
+//!   alike: `'12' LIKE 12` is 1, `'12' LIKE 12.0` is 0 (`12.0` renders as
+//!   `'12.0'`), and a BLOB matches as its bytes-as-text (x'6125' is the
+//!   pattern `a%`);
 //! - a DANGLING escape in a runtime pattern matches nothing — a legal
 //!   answer, not an error (unlike REGEXP, where an uncompilable pattern is a
 //!   named error: sqlite's own `patternCompare` returns NOMATCH here).
 //!
-//! The `any` column `p` is what makes the runtime rule REACHABLE with typed
-//! parameters: a bound parameter is pinned to text (a non-text bind refuses
-//! by name, see like_escape.rs), but a column can deliver a blob or a number
-//! to the opcode per row — which is also why the binder no longer wraps an
-//! `any` LIKE/GLOB operand in a bind-time CAST (the CAST turned a runtime
-//! blob into text and MATCHED it, where sqlite answers FALSE).
+//! THE BLOB RULE IS BUILD-DEPENDENT IN SQLITE, so it is pinned to the
+//! oracle deliberately: a CLI built with `SQLITE_LIKE_DOESNT_MATCH_BLOBS`
+//! (Debian's 3.45.1, the one on this machine's PATH) instead answers FALSE
+//! for a blob on either side — before even the NULL rule. The bundled
+//! oracle (stock amalgamation, the repo's acceptance baseline) coerces, and
+//! so does mpedb — which is also its pre-#74 CAST behavior, unchanged.
+//!
+//! The `any` column `p` is what makes the runtime coercion REACHABLE with
+//! typed parameters: a bound parameter is pinned to text (a non-text bind
+//! refuses by name, see like_escape.rs), but a column can deliver a blob or
+//! a number per row.
 
 use mpedb::{params, Config, Database, ExecResult, Value};
 use std::path::{Path, PathBuf};
@@ -203,11 +208,11 @@ fn per_row_column_pattern_matches_sqlite() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// The `any` column as the SUBJECT, against literal patterns — the corner the
-/// old bind-time CAST got WRONG: a runtime blob subject was cast to text and
-/// matched, where sqlite's likeFunc answers FALSE (row 10/11: `p` holds
-/// x'6125' = the bytes of "a%", and `p LIKE 'a%'` must be 0, not 1). Numeric
-/// subjects coerce (`p LIKE '1%'` is 1 for 12 and 12.0).
+/// The `any` column as the SUBJECT, against literal patterns: numeric
+/// subjects coerce (`p LIKE '1%'` is 1 for 12 and 12.0), and a runtime BLOB
+/// subject matches as its bytes-as-text (rows 10/11: `p` holds x'6125' = the
+/// bytes of "a%", so `p LIKE 'a%'` is 1) — the oracle's answer, see the
+/// module docs for why the flag-built CLI disagrees.
 #[test]
 fn any_subject_follows_the_blob_and_coercion_rules() {
     let (db, path) = open(None);
