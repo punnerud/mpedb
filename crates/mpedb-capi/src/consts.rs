@@ -80,3 +80,25 @@ pub const SQLITE_UTF16_ALIGNED: c_int = 8;
 pub const SQLITE_DETERMINISTIC: c_int = 0x0000_0800;
 pub const SQLITE_DIRECTONLY: c_int = 0x0008_0000;
 pub const SQLITE_INNOCUOUS: c_int = 0x0020_0000;
+
+// Run-time limit categories (`sqlite3_limit`), 0-based and dense.
+pub const SQLITE_LIMIT_LENGTH: c_int = 0;
+pub const SQLITE_LIMIT_SQL_LENGTH: c_int = 1;
+pub const SQLITE_LIMIT_COLUMN: c_int = 2;
+pub const SQLITE_LIMIT_EXPR_DEPTH: c_int = 3;
+pub const SQLITE_LIMIT_COMPOUND_SELECT: c_int = 4;
+pub const SQLITE_LIMIT_VDBE_OP: c_int = 5;
+pub const SQLITE_LIMIT_FUNCTION_ARG: c_int = 6;
+pub const SQLITE_LIMIT_ATTACHED: c_int = 7;
+pub const SQLITE_LIMIT_LIKE_PATTERN_LENGTH: c_int = 8;
+pub const SQLITE_LIMIT_VARIABLE_NUMBER: c_int = 9;
+pub const SQLITE_LIMIT_TRIGGER_DEPTH: c_int = 10;
+pub const SQLITE_LIMIT_WORKER_THREADS: c_int = 11;
+/// Number of limit categories (`SQLITE_N_LIMIT` in sqlite's internals).
+pub const SQLITE_N_LIMIT: usize = 12;
+
+// `sqlite3_trace_v2` event mask bits. The shim emits only SQLITE_TRACE_STMT.
+pub const SQLITE_TRACE_STMT: u32 = 0x01;
+pub const SQLITE_TRACE_PROFILE: u32 = 0x02;
+pub const SQLITE_TRACE_ROW: u32 = 0x04;
+pub const SQLITE_TRACE_CLOSE: u32 = 0x08;

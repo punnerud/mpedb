@@ -19,6 +19,27 @@ use crate::valconv;
 use mpedb::{Error as DbError, Result as DbResult, Value};
 use std::os::raw::{c_char, c_int, c_uchar, c_void};
 
+thread_local! {
+    /// The `(code, message)` of the LAST `sqlite3_result_error*` that failed a
+    /// UDF call on this thread. The engine can only tunnel the error as an
+    /// opaque string (`Error::Unsupported("user function raised: …")`), which
+    /// loses the CODE the callback chose — and CPython dispatches on it
+    /// (NOMEM -> MemoryError, TOOBIG -> DataError) and asserts the exact TEXT.
+    /// `run_stmt` drains this before executing and, when the statement's
+    /// failure IS this error, presents the callback's own code + message.
+    static LAST_UDF_ERROR: std::cell::RefCell<Option<(c_int, String)>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Take (and clear) the last UDF error recorded on this thread.
+pub fn take_last_udf_error() -> Option<(c_int, String)> {
+    LAST_UDF_ERROR.with(|c| c.borrow_mut().take())
+}
+
+fn stash_udf_error(code: c_int, msg: &str) {
+    LAST_UDF_ERROR.with(|c| *c.borrow_mut() = Some((code, msg.to_string())));
+}
+
 /// The C scalar-callback signature `void(*)(sqlite3_context*, int,
 /// sqlite3_value**)`. The shim's [`SqliteContext`]/[`SqliteValue`] stand in for
 /// sqlite's opaque `sqlite3_context`/`sqlite3_value`; at the ABI level both are
@@ -216,7 +237,10 @@ pub fn make_scalar_closure(
         drop(argv);
         drop(values);
         match ctx.error {
-            Some((_, msg)) => Err(DbError::Unsupported(format!("user function raised: {msg}"))),
+            Some((code, msg)) => {
+                stash_udf_error(code, &msg);
+                Err(DbError::Unsupported(format!("user function raised: {msg}")))
+            }
             None => Ok(ctx.result),
         }
     }
@@ -297,9 +321,12 @@ impl mpedb::HostAggState for CAggState {
         drop(argv);
         drop(values);
         match ctx.error {
-            Some((_, msg)) => Err(DbError::Unsupported(format!(
-                "user aggregate raised: {msg}"
-            ))),
+            Some((code, msg)) => {
+                stash_udf_error(code, &msg);
+                Err(DbError::Unsupported(format!(
+                    "user aggregate raised: {msg}"
+                )))
+            }
             None => Ok(()),
         }
     }
@@ -314,9 +341,12 @@ impl mpedb::HostAggState for CAggState {
             ptrs.finalize(&mut ctx as *mut SqliteContext);
         }
         match ctx.error {
-            Some((_, msg)) => Err(DbError::Unsupported(format!(
-                "user aggregate raised: {msg}"
-            ))),
+            Some((code, msg)) => {
+                stash_udf_error(code, &msg);
+                Err(DbError::Unsupported(format!(
+                    "user aggregate raised: {msg}"
+                )))
+            }
             None => Ok(ctx.result),
         }
     }

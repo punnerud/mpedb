@@ -144,9 +144,42 @@ pub fn error_codes(e: &DbError) -> (c_int, c_int) {
             (SQLITE_BUSY, SQLITE_BUSY)
         }
         DbError::Frozen { .. } => (SQLITE_LOCKED, SQLITE_LOCKED),
+        // ANOTHER connection on this thread holds the writer lock (the robust
+        // ERRORCHECK mutex answers EDEADLK for its own thread, so the engine
+        // cannot tell same-connection re-entry from a sibling connection).
+        // Through the C API the sibling-connection case is the ONLY reachable
+        // one — the shim's `begin_txn` already refuses nested BEGIN — and its
+        // sqlite-truthful answer is BUSY ("database is locked"), which the
+        // busy-timeout retry then waits out, not "internal error (bug)".
+        e if is_writer_lock_reentry(e) => (SQLITE_BUSY, SQLITE_BUSY),
         DbError::Internal(_) => (SQLITE_INTERNAL, SQLITE_INTERNAL),
         // Parse/Bind/param-count/plan/arith/budget/unsupported/config/schema:
         // all "the statement is wrong" -> SQLITE_ERROR.
         _ => (SQLITE_ERROR, SQLITE_ERROR),
+    }
+}
+
+/// The engine's EDEADLK answer from the writer mutex. See the mapping arm in
+/// [`error_codes`]: through the C API this means "a sibling connection on this
+/// thread holds the writer lock", which is sqlite's BUSY, not an engine bug.
+/// (mpedb needs the writer lock even for a first-time READ of a new statement
+/// text — publishing the compiled plan to the shared registry is a write.)
+pub fn is_writer_lock_reentry(e: &DbError) -> bool {
+    matches!(e, DbError::Internal(m) if m.contains("writer lock re-entered by its owner"))
+}
+
+/// sqlite's canonical message for errors whose TEXT consumers match on
+/// (CPython's own tests regex-search these), with mpedb's detail kept after
+/// the canonical phrase. `None` = use mpedb's message as-is.
+pub fn sqlite_shaped_message(e: &DbError) -> Option<String> {
+    let raw = e.to_string();
+    match e {
+        DbError::CheckViolation { .. } => Some(format!("CHECK constraint failed: {raw}")),
+        DbError::PrimaryKeyViolation { .. } | DbError::UniqueViolation { .. } => {
+            Some(format!("UNIQUE constraint failed: {raw}"))
+        }
+        DbError::NotNullViolation { .. } => Some(format!("NOT NULL constraint failed: {raw}")),
+        e if is_writer_lock_reentry(e) => Some("database is locked".to_string()),
+        _ => None,
     }
 }
