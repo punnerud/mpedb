@@ -19,7 +19,16 @@ The script covers the surfaces the 2026-07-19 merges touched: NUMERIC/INTEGER/
 REAL/TEXT/BLOB affinity on store, ordering and aggregation over mixed classes,
 the int/bool bridge in every boolean position, `quote()`/`strftime()`, W2's
 `FILTER` + correlated-subquery shapes, and the CAST/arithmetic/`IN` surface.
+
+Run 4 added the surfaces of the post-run-3 merges: typeless (`any`) PRIMARY
+KEY / index keys (including mixed-storage-class content under an index),
+subqueries in UPDATE/DELETE WHERE, correlated `IN`, correlated per-row
+aggregate positions, bitwise operators, bound REGEXP (a `regexp` UDF is
+registered in both arms, as Django does), scalar `max(a,b)`/`min(a,b)`,
+int<->float parameter bridging, the JSON function set, and `typeof()`'s
+five-storage-class contract.
 """
+import re as _re
 import sqlite3
 
 SCRIPT = [
@@ -104,12 +113,98 @@ SCRIPT = [
     "SELECT length('abc'), substr('abcdef',2,3), upper('ab'), abs(-3), round(2.567,2)",
     "SELECT coalesce(NULL, 3), nullif(1,1), ifnull(NULL,'x')",
     "SELECT 7/2, 7%2, -7/2, 7.0/2",
+    # --- run 4: typeless (`any`) PRIMARY KEY / index keys --------------------
+    "CREATE TABLE dtpk (d datetime NOT NULL PRIMARY KEY)",
+    ("INSERT INTO dtpk VALUES (?)", ("2026-07-19 12:00:00",)),
+    ("INSERT INTO dtpk VALUES (?)", ("2025-01-01 00:00:00",)),
+    "SELECT d FROM dtpk ORDER BY d",
+    ("SELECT d FROM dtpk WHERE d = ?", ("2025-01-01 00:00:00",)),
+    ("SELECT d FROM dtpk WHERE d > ? ORDER BY d", ("2025-06-01 00:00:00",)),
+    # mixed storage classes UNDER an index: sqlite orders NULL<INTEGER/REAL<TEXT<BLOB
+    "CREATE TABLE anyix (id integer NOT NULL PRIMARY KEY, v numeric NULL)",
+    "CREATE INDEX anyix_v ON anyix (v)",
+    ("INSERT INTO anyix VALUES (1, ?)", ("txt",)),
+    "INSERT INTO anyix VALUES (2, 5)",
+    "INSERT INTO anyix VALUES (3, 4.5)",
+    ("INSERT INTO anyix VALUES (4, ?)", (b"\x00",)),
+    "INSERT INTO anyix VALUES (5, NULL)",
+    ("INSERT INTO anyix VALUES (6, ?)", ("10",)),  # affinity: stores integer 10
+    "SELECT id, v, typeof(v) FROM anyix ORDER BY v, id",
+    "SELECT id FROM anyix WHERE v = 10",
+    "SELECT id FROM anyix WHERE v > 4 ORDER BY id",
+    "SELECT MIN(v), MAX(v) FROM anyix",
+    # --- run 4: subqueries in UPDATE/DELETE WHERE, correlated IN -------------
+    "CREATE TABLE p (id integer NOT NULL PRIMARY KEY, gid integer NOT NULL)",
+    "CREATE TABLE g (id integer NOT NULL PRIMARY KEY, ok bool NOT NULL)",
+    "INSERT INTO p VALUES (1,1),(2,2),(3,1)",
+    "INSERT INTO g VALUES (1,1),(2,0)",
+    "UPDATE p SET gid = gid + 10 WHERE gid IN (SELECT id FROM g WHERE ok)",
+    "SELECT id, gid FROM p ORDER BY id",
+    "DELETE FROM p WHERE EXISTS (SELECT 1 FROM g WHERE g.id = p.gid AND NOT g.ok)",
+    "SELECT id, gid FROM p ORDER BY id",
+    # correlated IN
+    "SELECT id FROM p WHERE id IN (SELECT g.id FROM g WHERE g.id = p.gid - 10) ORDER BY id",
+    # correlated subquery in a per-row aggregate position
+    "SELECT COUNT(*), SUM((SELECT g.id FROM g WHERE g.id = p.gid - 10)) FROM p",
+    # --- run 4: bitwise operators -------------------------------------------
+    "SELECT 5 | 2, 5 & 3, 1 << 4, 256 >> 3, ~5, -1 >> 60, 1 << 62",
+    "SELECT 5 | NULL, NULL & 3, ~NULL",
+    "SELECT '5' | '2', 4.9 & 7",
+    # --- run 4: scalar max/min ----------------------------------------------
+    "SELECT max(1, 2), min(3, 1, 2), max(1, NULL), max('a', 'b'), max(1, 2.5)",
+    # --- run 4: int<->float parameter bridge --------------------------------
+    "CREATE TABLE fr (id integer NOT NULL PRIMARY KEY, ratio real NOT NULL)",
+    ("INSERT INTO fr VALUES (1, ?)", (1,)),          # int bound to real column
+    ("INSERT INTO fr VALUES (2, ?)", (0.5,)),
+    ("SELECT id FROM fr WHERE ratio = ?", (1,)),      # int param vs real column
+    ("SELECT id FROM fr WHERE id = ?", (1.0,)),       # exact float vs int column
+    "SELECT id, ratio, typeof(ratio) FROM fr ORDER BY id",
+    # --- run 4: the JSON function set ----------------------------------------
+    """SELECT json('{"a": 1}'), json_valid('{"a": 1}'), json_valid('{a: 1}'), json_valid('not json')""",
+    """SELECT json_type('{"a": [1, 2]}'), json_type('{"a": [1, 2]}', '$.a'), json_quote('it''s')""",
+    """SELECT json_array_length('[1, 2, 3]'), json_extract('{"a": {"b": 7}}', '$.a.b')""",
+    """SELECT '{"a": 2}' -> 'a', '{"a": 2}' ->> 'a', '[1, 2]' ->> 1""",
+    """SELECT json_array(1, 'a', NULL), json_object('k', 1)""",
+    """SELECT json_set('{"a": 1}', '$.b', 2), json_remove('{"a": 1, "b": 2}', '$.b')""",
+    """SELECT json_replace('{"a": 1}', '$.a', 9), json_insert('{"a": 1}', '$.a', 9)""",
+    """SELECT json_patch('{"a": 1}', '{"b": 2}')""",
+    # Django's JSONField CHECK shape
+    "CREATE TABLE jf (id integer NOT NULL PRIMARY KEY, data text NULL CHECK ((JSON_VALID(data) OR data IS NULL)))",
+    ("INSERT INTO jf VALUES (1, ?)", ('{"k": "v"}',)),
+    ("INSERT INTO jf VALUES (2, ?)", (None,)),
+    "SELECT id, data ->> 'k' FROM jf ORDER BY id",
+    # --- run 4: typeof() five storage classes -------------------------------
+    "SELECT typeof(NULL), typeof(1), typeof(1.5), typeof('x'), typeof(x'00')",
+    "SELECT flag, typeof(flag) FROM bt ORDER BY id",
+    # --- run 4: bound REGEXP (via the regexp UDF both arms register) ---------
+    ("SELECT 1 WHERE 'abcd' REGEXP ?", ("bc",)),
+    ("SELECT 1 WHERE 'abcd' REGEXP ?", ("^bc",)),
+    ("SELECT 1 WHERE 'ABCD' REGEXP ?", ("bc",)),
+    # W3 (open): mpedb's engine intercepts REGEXP with its own dialect instead
+    # of calling the consumer's registered regexp() UDF, and a pattern outside
+    # that dialect MATCHES NOTHING instead of erroring. Inline flags and
+    # backreferences are valid Python/PCRE patterns that Django relies on
+    # (`__iregex` prepends `(?i)`), so these two lines are silent wrong answers
+    # until the engine dispatches REGEXP to a registered host UDF.
+    ("SELECT 1 WHERE 'hey-Foo' REGEXP ?", ("(?i)fo+",)),
+    ("SELECT 1 WHERE 'barfoobaz' REGEXP ?", (r"b(.).*b\1",)),
+    "SELECT 1 WHERE 'a%b' LIKE 'a\\%b' ESCAPE '\\'",
 ]
+
+
+def _regexp(pattern, string):
+    # Django's `_sqlite_regexp`, verbatim in behaviour.
+    if pattern is None or string is None:
+        return None
+    if not isinstance(string, str):
+        string = str(string)
+    return bool(_re.search(pattern, string))
 
 
 def main():
     con = sqlite3.connect(":memory:")
     con.isolation_level = None
+    con.create_function("regexp", 2, _regexp, deterministic=True)
     c = con.cursor()
     for item in SCRIPT:
         sql, params = (item, ()) if isinstance(item, str) else item
