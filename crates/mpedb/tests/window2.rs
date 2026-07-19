@@ -15,10 +15,11 @@
 //!   * nth_value(expr, n) is the fixed n-th row, visible only once the growing
 //!     frame reaches it.
 //!
-//! The out-of-scope forms (explicit frames, ntile/percent_rank/cume_dist, named
-//! `WINDOW w AS`, `FILTER`, a non-constant/non-integer offset, `n < 1`, and a
-//! value function used without `OVER`) are asserted to be REFUSED — the
-//! 0-wrong-answer contract means "clean error", never a differing answer.
+//! The out-of-scope forms (explicit frames, named `WINDOW w AS`, `FILTER`, a
+//! non-constant/non-integer offset, `n < 1`, and a value function used without
+//! `OVER`) are asserted to be REFUSED — the 0-wrong-answer contract means "clean
+//! error", never a differing answer. (ntile/percent_rank/cume_dist now ship —
+//! see `window3.rs`.)
 //!
 //! (The plan-bytes truncation sweep for the format-34 window bytes lives with the
 //! other decoder truncation tests, in `mpedb-sql`'s `plan::tests`.)
@@ -302,10 +303,7 @@ fn out_of_scope_forms_are_refused() {
         // Explicit frames (ROWS/RANGE BETWEEN).
         "SELECT id, lag(v) OVER (ORDER BY k ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM w2",
         "SELECT id, first_value(v) OVER (ORDER BY k RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) FROM w2",
-        // Unsupported ranking/distribution window functions.
-        "SELECT id, ntile(4) OVER (ORDER BY k) FROM w2",
-        "SELECT id, percent_rank() OVER (ORDER BY k) FROM w2",
-        "SELECT id, cume_dist() OVER (ORDER BY k) FROM w2",
+        // (ntile/percent_rank/cume_dist now ship — see `window3.rs`.)
         // Named window and FILTER.
         "SELECT id, lag(v) OVER w FROM w2 WINDOW w AS (ORDER BY k)",
         "SELECT id, count(v) FILTER (WHERE v > 0) OVER (ORDER BY k) FROM w2",

@@ -397,6 +397,14 @@ pub(crate) enum WindowFunc {
     FirstValue,
     LastValue,
     NthValue,
+    /// Rank/distribution functions (stage 2b). None takes a per-row value: an
+    /// `ntile(n)` bucket-count `n` is a CONSTANT that rides in
+    /// [`Expr::Window::extra_args`] (with `arg = None`), and `percent_rank()` /
+    /// `cume_dist()` take no argument at all — so all three carry `arg = None`,
+    /// like the ranking functions.
+    Ntile,
+    PercentRank,
+    CumeDist,
 }
 
 /// The `OVER ( [PARTITION BY …] [ORDER BY …] )` spec. No explicit frame in

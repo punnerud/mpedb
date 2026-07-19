@@ -735,6 +735,17 @@ fn decode_window(buf: &[u8], pos: &mut usize) -> Result<WindowSpec> {
             }
             WindowFunc::NthValue(n)
         }
+        // Rank/distribution functions (format 35). Ntile carries a trailing i64
+        // (the constant bucket count ≥ 1); PercentRank/CumeDist carry nothing.
+        10 => {
+            let n = r_u64(buf, pos)? as i64;
+            if n < 1 {
+                return Err(corrupt("ntile bucket count must be a positive integer"));
+            }
+            WindowFunc::Ntile(n)
+        }
+        11 => WindowFunc::PercentRank,
+        12 => WindowFunc::CumeDist,
         t => return Err(corrupt(format!("bad window function tag {t}"))),
     };
     let arg = decode_opt_program(buf, pos)?;
@@ -746,11 +757,17 @@ fn decode_window(buf: &[u8], pos: &mut usize) -> Result<WindowSpec> {
         t => return Err(corrupt(format!("bad window distinct tag {t}"))),
     };
     let default = decode_opt_program(buf, pos)?;
-    // A ranking function takes no argument (the row itself is the input); a value
-    // or aggregate function does. The `default` program is a lag/lead-only field.
+    // A ranking/distribution function takes no argument (the row itself is the
+    // input; ntile's bucket count rides in its tag); a value or aggregate
+    // function does. The `default` program is a lag/lead-only field.
     let is_ranking = matches!(
         func,
-        WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank
+        WindowFunc::RowNumber
+            | WindowFunc::Rank
+            | WindowFunc::DenseRank
+            | WindowFunc::Ntile(_)
+            | WindowFunc::PercentRank
+            | WindowFunc::CumeDist
     );
     let is_value = matches!(
         func,
