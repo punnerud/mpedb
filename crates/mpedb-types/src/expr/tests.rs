@@ -225,6 +225,147 @@ fn like_escape_matches_sqlite() {
     assert!(!like_match("%\\%foo%", "xxfooyy", e));
 }
 
+/// The pattern memo is keyed on `(pattern, escape)` VALUE, not on any notion
+/// of "the statement" — alternating patterns and escapes through the same
+/// thread must never answer from a stale compiled form. (This is what makes
+/// the one-slot memo safe for the dyn-pattern opcodes, where the pattern can
+/// change per row.)
+#[test]
+fn like_memo_alternating_patterns_and_escapes() {
+    for _ in 0..3 {
+        assert!(like_match("a%", "abc", None));
+        assert!(!like_match("b%", "abc", None));
+        // Same pattern, different ESCAPE: must recompile — under ESCAPE '%'
+        // the `%` stops being a wildcard.
+        assert!(like_match("a%", "abc", None));
+        assert!(!like_match("a%", "abc", Some('%')));
+        // Dangling-escape failure is cached per (pattern, esc) too, and must
+        // not leak onto the escape-less reading of the same bytes.
+        assert!(!like_match("ab\\", "ab", Some('\\')));
+        assert!(like_match("ab\\", "ab\\", None));
+        // ci is NOT part of the key: the same compiled form serves both
+        // dialects with different literal comparison.
+        assert!(like_match("AB%", "abc", None));
+        assert!(!like_match_cs("AB%", "abc", None));
+    }
+}
+
+/// The dyn-pattern LIKE/GLOB opcodes (#74 item 3, LIKE half): the const
+/// forms' matcher and NULL rules with the pattern popped off the stack.
+/// Operands arrive as text or NULL — the binder CAST-bridges coercible
+/// non-text operands exactly as it always did for subjects — so the raw
+/// non-text arms are corrupt-plan errors, asserted as such.
+#[test]
+fn like_dyn_opcodes_match_null_and_type_rules() {
+    let t = |s: &str| Value::Text(s.into());
+    let like2 = |a: Value, p: Value| {
+        prog(vec![Instr::PushParam(0), Instr::PushParam(1), Instr::LikeDyn], vec![])
+            .eval(&[], &[a, p])
+    };
+
+    // Plain dynamic matching, ASCII case folded (sqlite dialect).
+    assert_eq!(like2(t("hello"), t("he%o")).unwrap(), Value::Bool(true));
+    assert_eq!(like2(t("HELLO"), t("he%o")).unwrap(), Value::Bool(true));
+    assert_eq!(like2(t("hello"), t("x%")).unwrap(), Value::Bool(false));
+    // NULL propagates from either side.
+    assert_eq!(like2(Value::Null, t("a%")).unwrap(), Value::Null);
+    assert_eq!(like2(t("a"), Value::Null).unwrap(), Value::Null);
+    assert_eq!(like2(Value::Null, Value::Null).unwrap(), Value::Null);
+    // A raw non-text operand is a corrupt plan, not a coercion opportunity.
+    assert!(like2(t("12"), Value::Int(12)).is_err());
+    assert!(like2(t("A"), Value::Blob(vec![0x41])).is_err());
+
+    // The escape form takes its one-character escape from the const pool;
+    // Django's exact shape (`s LIKE ? ESCAPE '\'`) with the pattern bound.
+    let esc = |a: Value, p: Value| {
+        prog(
+            vec![Instr::PushParam(0), Instr::PushParam(1), Instr::LikeDynEsc(0)],
+            vec![Value::Text("\\".into())],
+        )
+        .eval(&[], &[a, p])
+        .unwrap()
+    };
+    assert_eq!(esc(t("100%"), t("100\\%")), Value::Bool(true));
+    assert_eq!(esc(t("100x"), t("100\\%")), Value::Bool(false));
+    // A DANGLING escape arriving AT RUNTIME matches nothing — sqlite's
+    // NOMATCH, a legal answer, not an error (unlike REGEXP's W3 rule).
+    assert_eq!(esc(t("ab"), t("ab\\")), Value::Bool(false));
+    assert_eq!(esc(t(""), t("\\")), Value::Bool(false));
+
+    // Case-SENSITIVE (PG dialect) twins.
+    let cs = |a: Value, p: Value| {
+        prog(vec![Instr::PushParam(0), Instr::PushParam(1), Instr::LikeCsDyn], vec![])
+            .eval(&[], &[a, p])
+    };
+    assert_eq!(cs(t("AB"), t("a%")).unwrap(), Value::Bool(false));
+    assert_eq!(cs(t("ab"), t("a%")).unwrap(), Value::Bool(true));
+    assert_eq!(cs(t("ab"), Value::Null).unwrap(), Value::Null);
+    assert!(cs(t("12"), Value::Int(12)).is_err());
+    let cse = prog(
+        vec![Instr::PushParam(0), Instr::PushParam(1), Instr::LikeCsDynEsc(0)],
+        vec![Value::Text("\\".into())],
+    );
+    assert_eq!(cse.eval(&[], &[t("100%"), t("100\\%")]).unwrap(), Value::Bool(true));
+    assert_eq!(cse.eval(&[], &[t("100%"), t("100\\%25")]).unwrap(), Value::Bool(false));
+
+    // GLOB dyn: glob wildcards, always case-sensitive, same NULL/type rules.
+    let glob2 = |a: Value, p: Value| {
+        prog(vec![Instr::PushParam(0), Instr::PushParam(1), Instr::GlobDyn], vec![])
+            .eval(&[], &[a, p])
+    };
+    assert_eq!(glob2(t("abc"), t("a*")).unwrap(), Value::Bool(true));
+    assert_eq!(glob2(t("ABC"), t("a*")).unwrap(), Value::Bool(false));
+    assert_eq!(glob2(t("abc"), t("a%")).unwrap(), Value::Bool(false)); // `%` is no GLOB wildcard
+    assert_eq!(glob2(Value::Null, t("a")).unwrap(), Value::Null);
+    assert!(glob2(t("1"), Value::Int(1)).is_err());
+
+    // codec: all five opcodes round-trip, and truncation at every offset is
+    // Corrupt, never a panic (repo rule).
+    let p5 = prog(
+        vec![
+            Instr::PushCol(0),
+            Instr::PushCol(1),
+            Instr::LikeDyn,
+            Instr::PushCol(0),
+            Instr::PushCol(1),
+            Instr::LikeCsDyn,
+            Instr::And,
+            Instr::PushCol(0),
+            Instr::PushCol(1),
+            Instr::LikeDynEsc(0),
+            Instr::And,
+            Instr::PushCol(0),
+            Instr::PushCol(1),
+            Instr::LikeCsDynEsc(0),
+            Instr::And,
+            Instr::PushCol(0),
+            Instr::PushCol(1),
+            Instr::GlobDyn,
+            Instr::And,
+        ],
+        vec![Value::Text("\\".into())],
+    );
+    let mut buf = Vec::new();
+    p5.encode_into(&mut buf);
+    let mut pos = 0;
+    assert_eq!(ExprProgram::decode(&buf, &mut pos).unwrap(), p5);
+    assert_eq!(pos, buf.len());
+    for cut in 0..buf.len() {
+        let _ = ExprProgram::decode(&buf[..cut], &mut 0); // must not panic
+    }
+
+    // The dyn-escape const is proved a one-character text at validation, so a
+    // hand-built plan with a bad escape slot is Corrupt, exactly like the
+    // const-pattern escape forms.
+    for bad in [Value::Text("".into()), Value::Text("ab".into()), Value::Int(5)] {
+        assert!(ExprProgram::new(
+            vec![Instr::PushCol(0), Instr::PushCol(1), Instr::LikeDynEsc(0)],
+            vec![bad],
+        )
+        .is_err());
+    }
+}
+
 #[test]
 fn glob_patterns() {
     // `*` = any run (incl. empty); `?` = exactly one char.
@@ -372,7 +513,9 @@ fn glob_program_null_and_type_rules() {
     assert_eq!(p.eval(&[Value::Text("abc".into())], &[]).unwrap(), Value::Bool(true));
     assert_eq!(p.eval(&[Value::Text("xbc".into())], &[]).unwrap(), Value::Bool(false));
     assert_eq!(p.eval(&[Value::Null], &[]).unwrap(), Value::Null);
-    // A non-text operand is a type error, not a silent non-match.
+    // A non-text operand is a type error, not a silent non-match — the binder
+    // CAST-bridges coercible operands (sqlite3_value_text's conversion), so
+    // one reaching the opcode raw is a corrupt plan.
     assert!(matches!(
         p.eval(&[Value::Int(1)], &[]),
         Err(Error::TypeMismatch(_))

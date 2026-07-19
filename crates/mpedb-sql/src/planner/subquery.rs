@@ -944,6 +944,8 @@ fn refs_correlated(b: &BExpr, sub_base: u16, correlated: &[bool]) -> bool {
         | BExpr::IsDistinct(a, bx, _)
         | BExpr::CollateCmp(_, a, bx, _)
         | BExpr::RegexpDyn(a, bx)
+        | BExpr::LikeDyn(a, bx, _, _)
+        | BExpr::GlobDyn(a, bx)
         | BExpr::ClassCmp(_, a, bx, _, _) => {
             refs_correlated(a, sub_base, correlated) || refs_correlated(bx, sub_base, correlated)
         }

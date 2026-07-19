@@ -368,7 +368,23 @@ const MAX_JOINS: usize = 16;
 //     NOTE (worktree, 2026-07-19): the base this was written on carries 47;
 //     48 is another agent's in-flight bump (LIKE opcodes), so this takes 49 by
 //     instruction and the numbers are reconciled at merge.
-const PLAN_FORMAT: u8 = 49;
+// 50: `LIKE`/`GLOB` with a NON-literal pattern (#74 item 3, LIKE half —
+//     `s LIKE ? ESCAPE '\'` is Django's exact wire shape for every
+//     startswith/contains/endswith/icontains lookup). Five additive expr
+//     opcodes popping the pattern off the stack: `Instr::LikeDyn` (tag 56),
+//     `LikeCsDyn` (57), `LikeDynEsc` (58), `LikeCsDynEsc` (59) — four, not
+//     one, mirroring the const family: dialect × escape-ness are compile-time
+//     (the ESCAPE argument stays a literal by policy), so they select the
+//     opcode — and `GlobDyn` (60; no dialect, no ESCAPE). Purely additive: a
+//     LITERAL pattern still compiles to the const-pool opcodes with unchanged
+//     bytes (a constant that folds to text — `s LIKE 12` — rejoins them too),
+//     the sqlite-dialect CAST bridge on coercible operands is unchanged, and
+//     a reader one format back hits the unknown opcode in the expr decoder
+//     and rejects the blob as corrupt rather than misreading it.
+//     NOTE (worktree, 2026-07-19): rebased onto main at 49 (derived-table
+//     materialization); this takes 50 by instruction — expr opcode tags 56..60
+//     — and the numbers are reconciled at merge.
+const PLAN_FORMAT: u8 = 50;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

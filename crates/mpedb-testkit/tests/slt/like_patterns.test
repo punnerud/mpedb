@@ -4,7 +4,8 @@
 # the character after `c` a literal (its own file, tests/like_escape.rs, checks
 # every corner against the sqlite3 binary). A non-text operand is coerced
 # to text (`id LIKE 'x'` is `CAST(id AS TEXT) LIKE 'x'`), also like sqlite.
-# The pattern must be a string literal (Phase 1). NULL never matches.
+# The pattern may be a literal, a bound parameter, or any expression —
+# a non-literal one is evaluated per row (#74 item 3). NULL never matches.
 # (PostgreSQL's LIKE is case-sensitive and rigid -- that PG-strict mode is
 # selectable via the `[compat] bare_group_by = "postgres"` dialect, the same
 # signal that drives GROUP BY strictness; this file exercises the sqlite default.)
@@ -275,8 +276,27 @@ query I nosort
 SELECT id FROM t WHERE id LIKE 'x'
 ----
 
-statement error string literal
+# The pattern no longer has to be a literal (#74 item 3, LIKE half — Django
+# binds it). A constant numeric pattern coerces at runtime like any other
+# likeFunc operand: '1' matches no row here…
+query I nosort
 SELECT id FROM t WHERE s LIKE 1
+----
 
-statement error literal
+# …and a per-row COLUMN pattern is legal: every non-NULL s matches itself
+# (a `%` in the pattern matches its own literal run, `_` its own char —
+# sqlite-verified on this exact data set, ids 8/9 included).
+query I nosort
 SELECT id FROM t WHERE s LIKE s
+----
+1
+2
+3
+4
+5
+6
+7
+8
+9
+11
+12

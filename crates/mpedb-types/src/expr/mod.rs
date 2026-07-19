@@ -256,6 +256,50 @@ pub enum Instr {
     /// of a scan, whether it came from a literal or a parameter, so neither
     /// form recompiles per row.
     RegexpDyn,
+    /// `x LIKE y` with the pattern from the STACK rather than the const pool —
+    /// the LIKE counterpart of [`Instr::RegexpDyn`], for a pattern that is not
+    /// a literal (a bound parameter — Django's exact wire shape for every
+    /// `startswith`/`contains`/`endswith`/`icontains` lookup — a column, any
+    /// computed value). Pops the PATTERN, then the subject beneath it, and
+    /// pushes the 3VL verdict. Same operand typing and NULL rules as
+    /// [`Instr::Like`]: any NULL operand yields NULL, and the operands must
+    /// arrive as text — the binder wraps a coercible non-text operand
+    /// (pattern AND subject alike) in the same `CAST(… AS TEXT)` it always
+    /// wrapped subjects in, which is `sqlite3_value_text`'s conversion, i.e.
+    /// what the differential-oracle sqlite itself applies inside `likeFunc`.
+    ///
+    /// FOUR dyn opcodes rather than one, mirroring the const-pool family
+    /// exactly: the DIALECT (case-folding, [`Instr::Like`] vs
+    /// [`Instr::LikeCs`]) and the ESCAPE-ness are compile-time properties —
+    /// the ESCAPE argument is a literal by deliberate policy — so they select
+    /// the opcode; only the pattern is runtime. The escape-less form keeps a
+    /// one-byte encoding this way, exactly as [`Instr::Like`] kept its
+    /// two-byte one when ESCAPE landed.
+    ///
+    /// Both pattern forms go through the [`ops`] matcher, which since this
+    /// task memoizes the LAST compiled `(pattern, escape)` per thread — so
+    /// neither form compiles the pattern per row, and the literal form got
+    /// faster too.
+    LikeDyn,
+    /// Case-SENSITIVE (PostgreSQL dialect) [`Instr::LikeDyn`] —
+    /// [`Instr::LikeCs`]'s dyn twin. The PG dialect's binder refuses non-text
+    /// operands statically (no CAST bridge), so a non-text runtime value here
+    /// is a corrupt-plan-grade [`Error::TypeMismatch`].
+    LikeCsDyn,
+    /// [`Instr::LikeDyn`] with an `ESCAPE` character at the given const-pool
+    /// index (a one-character text, validated at decode exactly like
+    /// [`Instr::LikeEsc`]'s). The ESCAPE stays a compile-time const while the
+    /// pattern rides the stack — Django's exact shape (`s LIKE ? ESCAPE '\'`).
+    LikeDynEsc(u16),
+    /// Case-SENSITIVE `LIKE … ESCAPE` with a stack pattern;
+    /// [`Instr::LikeDynEsc`] is to this what [`Instr::LikeEsc`] is to
+    /// [`Instr::LikeCsEsc`].
+    LikeCsDynEsc(u16),
+    /// `x GLOB y` with the pattern from the STACK — [`Instr::Glob`]'s dyn
+    /// twin, with `Glob`'s operand typing and NULL rules. GLOB has no dialect
+    /// split (always case-sensitive) and no ESCAPE clause, so ONE opcode
+    /// covers it.
+    GlobDyn,
 }
 
 /// Resolve a HOST-registered scalar UDF by name at eval time (the C-API
@@ -594,6 +638,65 @@ impl ExprProgram {
                     let a = stack.pop().expect("validated");
                     let pattern = &self.consts[pi as usize];
                     stack.push(match (&a, pattern) {
+                        (Value::Null, _) | (_, Value::Null) => Value::Null,
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(glob_match(p, s)),
+                        _ => {
+                            return Err(Error::TypeMismatch(
+                                "GLOB requires text operands".into(),
+                            ))
+                        }
+                    });
+                }
+                // The dyn-pattern LIKE/GLOB family: the pattern comes off the
+                // STACK (a parameter, a column, any computed value) instead of
+                // the const pool; matcher and NULL rules are the const forms',
+                // the escape stays a const. STRICT like them, too: the binder
+                // wraps any coercible operand in the same `CAST(… AS TEXT)` it
+                // always has (sqlite3_value_text's conversion — what the
+                // bundled-oracle sqlite applies inside likeFunc), so a
+                // non-text value here is a corrupt plan or a misbound
+                // parameter, never a coercion opportunity.
+                Instr::LikeDyn | Instr::LikeCsDyn => {
+                    let ci = matches!(instr, Instr::LikeDyn);
+                    let pattern = stack.pop().expect("validated");
+                    let a = stack.pop().expect("validated");
+                    stack.push(match (&a, &pattern) {
+                        (Value::Null, _) | (_, Value::Null) => Value::Null,
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(if ci {
+                            like_match(p, s, None)
+                        } else {
+                            like_match_cs(p, s, None)
+                        }),
+                        _ => {
+                            return Err(Error::TypeMismatch(
+                                "LIKE requires text operands".into(),
+                            ))
+                        }
+                    });
+                }
+                Instr::LikeDynEsc(ei) | Instr::LikeCsDynEsc(ei) => {
+                    let ci = matches!(instr, Instr::LikeDynEsc(_));
+                    let pattern = stack.pop().expect("validated");
+                    let a = stack.pop().expect("validated");
+                    let esc = escape_char(&self.consts[ei as usize])?;
+                    stack.push(match (&a, &pattern) {
+                        (Value::Null, _) | (_, Value::Null) => Value::Null,
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(if ci {
+                            like_match(p, s, Some(esc))
+                        } else {
+                            like_match_cs(p, s, Some(esc))
+                        }),
+                        _ => {
+                            return Err(Error::TypeMismatch(
+                                "LIKE requires text operands".into(),
+                            ))
+                        }
+                    });
+                }
+                Instr::GlobDyn => {
+                    let pattern = stack.pop().expect("validated");
+                    let a = stack.pop().expect("validated");
+                    stack.push(match (&a, &pattern) {
                         (Value::Null, _) | (_, Value::Null) => Value::Null,
                         (Value::Text(s), Value::Text(p)) => Value::Bool(glob_match(p, s)),
                         _ => {
