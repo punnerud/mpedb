@@ -836,6 +836,20 @@ impl<'a> Parser<'a> {
                     self.eat_kw(Kw::Asc);
                     false
                 };
+                // A WINDOW's ORDER BY carries only a direction — the window
+                // frame, the peer groups and the `dirs` comparator in the
+                // executor are all built on that, and none of them has a NULL
+                // placement to honour. sqlite accepts `NULLS FIRST/LAST` here;
+                // mpedb refuses it BY NAME rather than accepting it and sorting
+                // the partition sqlite's default way regardless, which would be
+                // a silently wrong row order. (Statement-level `ORDER BY …
+                // NULLS FIRST/LAST` IS supported — see `Parser::sort_dir`.)
+                if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("NULLS")) {
+                    return Err(self.err_here(
+                        "NULLS FIRST/LAST inside OVER (ORDER BY …) is not supported yet — \
+                         only ASC / DESC (the statement's own ORDER BY does support it)",
+                    ));
+                }
                 order_by.push((key, desc));
                 if order_by.len() > MAX_ORDER_BY_ITEMS {
                     return Err(self.err_here(format!(

@@ -646,11 +646,11 @@ fn a_rigid_column_refuses_what_sqlite_would_coerce() {
 /// Neither word is reserved, so the parser walked past the unsupported clause
 /// and only noticed at the paren, blaming the wrong clause.
 ///
-/// `LIKE … ESCAPE` now WORKS (tests/like_escape.rs pins its every corner
-/// against the sqlite3 binary), so these five statements are checked here for
-/// what they were really about: the clause parses in each enclosing construct —
-/// FILTER, IN-subquery, EXISTS-subquery — and the whole statement agrees with
-/// sqlite. `ORDER BY … NULLS FIRST/LAST` is still refused, by name.
+/// BOTH clauses now WORK (tests/like_escape.rs and tests/order_by_nulls.rs pin
+/// their corners against the sqlite3 binary), so these statements are checked
+/// here for what they were really about: the clause parses in each enclosing
+/// construct — FILTER, IN-subquery, EXISTS-subquery — and the whole statement
+/// agrees with sqlite.
 #[test]
 fn the_filter_and_subquery_paren_errors_are_really_like_escape_and_nulls_ordering() {
     let t = open();
@@ -680,22 +680,30 @@ fn the_filter_and_subquery_paren_errors_are_really_like_escape_and_nulls_orderin
         assert_same(&esc_setup, sql);
     }
 
-    // `ORDER BY … NULLS FIRST/LAST` — likewise.
+    // `ORDER BY … NULLS FIRST/LAST` — likewise, including inside a subquery,
+    // which is where the unconsumed `NULLS` used to resurface as a paren
+    // complaint. tests/order_by_nulls.rs pins the placement itself; here the
+    // point is that the ENCLOSING construct parses and the answer is sqlite's.
+    let nulls_setup = [
+        "CREATE TABLE t (id integer PRIMARY KEY, x integer, tag varchar(20))",
+        "CREATE TABLE u (uid integer PRIMARY KEY, x integer, tag varchar(20))",
+        "INSERT INTO t (id, x, tag) VALUES (1, 1, 'ab')",
+        "INSERT INTO t (id, x, tag) VALUES (2, 2, 'zz')",
+        "INSERT INTO t (id, x, tag) VALUES (3, NULL, 'qq')",
+        "INSERT INTO u (uid, x, tag) VALUES (1, 1, 'ab')",
+        "INSERT INTO u (uid, x, tag) VALUES (2, NULL, 'cd')",
+    ];
     for sql in [
-        r#"SELECT id FROM "t" WHERE "t"."x" IN (SELECT U0."x" FROM "u" U0 ORDER BY U0."x" ASC NULLS LAST)"#,
-        r#"SELECT id FROM "t" WHERE EXISTS(SELECT 1 FROM "u" U0 ORDER BY U0."x" NULLS LAST LIMIT 1)"#,
-        r#"SELECT id FROM "t" ORDER BY "t"."x" DESC NULLS FIRST"#,
+        r#"SELECT id FROM "t" WHERE "t"."x" IN (SELECT U0."x" FROM "u" U0 ORDER BY U0."x" ASC NULLS LAST) ORDER BY id"#,
+        r#"SELECT id FROM "t" WHERE EXISTS(SELECT 1 FROM "u" U0 ORDER BY U0."x" NULLS LAST LIMIT 1) ORDER BY id"#,
+        r#"SELECT id FROM "t" ORDER BY "t"."x" DESC NULLS FIRST, id"#,
+        r#"SELECT id FROM "t" ORDER BY "t"."x" ASC NULLS LAST, id"#,
     ] {
-        let e = t.db.query(sql, &[]).expect_err("NULLS FIRST/LAST is not supported");
-        let m = e.to_string();
-        assert!(
-            m.contains("NULLS") && m.contains("not supported"),
-            "the refusal must name NULLS FIRST/LAST, not a paren: {m}\n  for {sql}"
-        );
+        assert_same(&nulls_setup, sql);
     }
 
     // The enclosing constructs are NOT the gap: the identical statements with
-    // the unsupported tail removed all run, and agree with sqlite.
+    // the tail removed all run, and agree with sqlite.
     for sql in [
         r#"SELECT count(*) FILTER (WHERE "t"."tag" LIKE 'a%') FROM "t""#,
         r#"SELECT id FROM "t" WHERE "t"."x" IN (SELECT U0."x" FROM "u" U0 WHERE U0."tag" LIKE 'a%')"#,

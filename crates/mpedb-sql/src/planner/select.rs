@@ -606,8 +606,16 @@ pub(super) fn plan_select<'s>(
             .enumerate()
             // A non-Binary collation is NEVER satisfied by scan order (the
             // keycode is bytewise), so a collated key blocks the elision.
-            .all(|(k, (c, desc, coll))| {
-                !desc && *coll == Collation::Binary && table.primary_key[k] == *c
+            // A NON-default NULL placement blocks the elision too. PK columns
+            // are NOT NULL, so the two placements cannot actually differ here —
+            // but making the elision depend on that fact, rather than on the
+            // key being written the plain way, is exactly the kind of reasoning
+            // that stops being true when someone changes what a PK may hold.
+            .all(|(k, (c, dir, coll))| {
+                !dir.desc
+                    && dir.default_nulls()
+                    && *coll == Collation::Binary
+                    && table.primary_key[k] == *c
             })
     {
         order_by.clear();
