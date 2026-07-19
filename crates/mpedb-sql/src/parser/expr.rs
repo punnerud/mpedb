@@ -46,6 +46,24 @@ fn window_rank_fn(name: &str) -> Option<WindowFunc> {
     })
 }
 
+/// The value/offset window functions (stage 2), with their `(min, max)`
+/// argument arity. Each takes a real expression argument list (unlike the
+/// zero-argument ranking functions) and, like them, is only valid as a window
+/// function — `OVER` is required and a bare `lag`/`lead`/… column name is
+/// unaffected (recognized only when `(` follows).
+fn window_value_fn(name: &str) -> Option<(WindowFunc, usize, usize)> {
+    Some(match name.to_ascii_lowercase().as_str() {
+        // lag/lead: expr [, offset [, default]].
+        "lag" => (WindowFunc::Lag, 1, 3),
+        "lead" => (WindowFunc::Lead, 1, 3),
+        "first_value" => (WindowFunc::FirstValue, 1, 1),
+        "last_value" => (WindowFunc::LastValue, 1, 1),
+        // nth_value: expr, n.
+        "nth_value" => (WindowFunc::NthValue, 2, 2),
+        _ => return None,
+    })
+}
+
 impl<'a> Parser<'a> {
     /// Enter one level of expression recursion, refusing to go deeper than the
     /// stack can hold.
@@ -479,7 +497,13 @@ impl<'a> Parser<'a> {
                 )));
             }
             let spec = self.window_over()?;
-            return Ok(Expr::Window { func, arg: None, distinct: false, spec });
+            return Ok(Expr::Window {
+                func,
+                arg: None,
+                extra_args: Vec::new(),
+                distinct: false,
+                spec,
+            });
         }
         // Aggregates are intercepted BEFORE the scalar argument parse, because
         // `count(*)` has an argument that is not an expression. `*` there is not
@@ -527,6 +551,7 @@ impl<'a> Parser<'a> {
                 return Ok(Expr::Window {
                     func: WindowFunc::Agg(f),
                     arg,
+                    extra_args: Vec::new(),
                     distinct,
                     spec,
                 });
@@ -541,13 +566,53 @@ impl<'a> Parser<'a> {
             }
         }
         self.expect(&Tok::RParen, "`)` closing the argument list")?;
+        // Value/offset window functions (stage 2): lag/lead/first_value/
+        // last_value/nth_value. They take a real expression argument list
+        // (parsed just above) and, like the ranking functions, are ONLY valid as
+        // window functions — so an `OVER` clause is required and the argument
+        // arity is fixed per function. Their first argument is the value `expr`;
+        // any trailing arguments (a lag/lead offset+default, an nth_value n) ride
+        // in `extra_args`.
+        if let Some((func, min, max)) = window_value_fn(&name) {
+            let lname = name.to_ascii_lowercase();
+            if !self.peek_over() {
+                return Err(self.err_here(format!(
+                    "{lname}() may only be used as a window function — it requires an OVER clause"
+                )));
+            }
+            if args.len() < min || args.len() > max {
+                let want = if min == max {
+                    format!("exactly {min} argument(s)")
+                } else {
+                    format!("{min} to {max} arguments")
+                };
+                return Err(self.err_here(format!(
+                    "{lname}() takes {want}, got {}",
+                    args.len()
+                )));
+            }
+            let spec = self.window_over()?;
+            let mut it = args.into_iter();
+            // `min >= 1` for every value function, so the value `expr` is present.
+            let arg = Box::new(it.next().expect("value window function has an expr argument"));
+            let extra_args: Vec<Expr> = it.collect();
+            return Ok(Expr::Window {
+                func,
+                arg: Some(arg),
+                extra_args,
+                distinct: false,
+                spec,
+            });
+        }
         // A scalar function call followed by OVER is a window function we do not
-        // support yet (the supported ones — ranking and aggregate windows — are
-        // handled above). Refuse it by name rather than misread the OVER.
+        // support yet (the supported ones — ranking, aggregate and value/offset
+        // windows — are handled above). Refuse it by name rather than misread the
+        // OVER.
         if self.peek_over() {
             return Err(self.err_here(format!(
                 "window function `{}` is not supported yet (window stage 2) — \
-                 only row_number/rank/dense_rank and aggregate `OVER` are available",
+                 only row_number/rank/dense_rank, aggregate `OVER`, and \
+                 lag/lead/first_value/last_value/nth_value are available",
                 name.to_ascii_lowercase()
             )));
         }

@@ -63,6 +63,13 @@ fn sample_sqls() -> Vec<&'static str> {
         "SELECT id, rank() OVER (ORDER BY age DESC), dense_rank() OVER (ORDER BY age DESC) FROM users",
         "SELECT id, sum(age) OVER (PARTITION BY active ORDER BY age), count(*) OVER (PARTITION BY active) FROM users ORDER BY id",
         "SELECT id FROM users ORDER BY dense_rank() OVER (ORDER BY age), id",
+        // Window value/offset functions (design/DESIGN-WINDOW.md stage 2, format
+        // 34): lag/lead carry a constant i64 offset and an optional default
+        // program; nth_value carries a constant i64 n; first_value/last_value
+        // carry only the value arg. All must survive encode/decode/validate/hash.
+        "SELECT id, lag(age, 2, -1) OVER (PARTITION BY active ORDER BY id) FROM users",
+        "SELECT id, lead(age) OVER (ORDER BY id), first_value(age) OVER (ORDER BY id) FROM users",
+        "SELECT id, last_value(age) OVER (ORDER BY age), nth_value(age, 3) OVER (ORDER BY age) FROM users",
         // Recursive CTEs (design/DESIGN-CTE-RECURSIVE.md stage 1, format 26): the
         // new `RecursiveCte` node — name, columns+types, union_all byte and three
         // nested SelectPlans — must survive encode/decode/validate. A DUAL-anchor
@@ -171,7 +178,7 @@ fn decode_rejects_truncation_and_stale_format_in_cast() {
         let p = prepare(sql, &s).unwrap();
         let _ = p.explain(&s); // must not panic rendering the affinity name
         let bytes = p.encode();
-        assert_eq!(bytes[0], 33, "plan format byte for {sql}");
+        assert_eq!(bytes[0], 34, "plan format byte for {sql}");
         let q = CompiledPlan::decode(&bytes, &s).expect(sql);
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         for cut in 0..bytes.len() {
@@ -212,7 +219,7 @@ fn bare_group_by_roundtrips_and_rejects_truncation_and_stale_format() {
         assert!(!agg.bare_cols.is_empty(), "bare_cols must be populated for {sql}");
 
         let bytes = p.encode();
-        assert_eq!(bytes[0], 33, "plan format byte for {sql}");
+        assert_eq!(bytes[0], 34, "plan format byte for {sql}");
         let q = CompiledPlan::decode(&bytes, &s).expect(sql);
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         for cut in 0..bytes.len() {
@@ -286,29 +293,52 @@ fn decode_rejects_truncation_everywhere() {
     }
 }
 
-/// The window list bytes (format 24) get their own truncation sweep: a windowed
-/// plan carries a window count, per-window func/distinct bytes, an optional arg
-/// program, and PARTITION BY / ORDER BY program lists — every cut through them
-/// must fail closed rather than decode a half-read window.
+/// The window list bytes (format 24 + the format-34 value/offset extension) get
+/// their own truncation sweep: a windowed plan carries a window count, per-window
+/// func/distinct bytes, an optional arg program, PARTITION BY / ORDER BY program
+/// lists, and — for the value functions — a trailing i64 (lag/lead offset,
+/// nth_value n) plus an optional `default` program. Every cut through them must
+/// fail closed rather than decode a half-read window.
 #[test]
 fn decode_rejects_truncation_in_windows() {
     let s = test_schema();
+    // Mix ranking, aggregate AND value/offset windows so the sweep crosses every
+    // per-window shape: the i64 offset/n and the lag/lead `default` program.
     let p = prepare(
         "SELECT id, row_number() OVER (PARTITION BY active ORDER BY age), \
-         sum(age) OVER (PARTITION BY active ORDER BY age) FROM users \
+         sum(age) OVER (PARTITION BY active ORDER BY age), \
+         lag(age, 2, -1) OVER (PARTITION BY active ORDER BY id), \
+         nth_value(age, 3) OVER (ORDER BY age), \
+         first_value(age) OVER (ORDER BY id), \
+         last_value(age) OVER (ORDER BY age) FROM users \
          ORDER BY rank() OVER (ORDER BY age DESC), id",
         &s,
     )
     .unwrap();
-    // Sanity: this really carries a window list.
+    // Sanity: this really carries a window list including a value function with
+    // a default program.
     match &p.stmt {
-        PlanStmt::Select(sp) => assert!(!sp.windows.is_empty(), "expected windows"),
+        PlanStmt::Select(sp) => {
+            assert!(!sp.windows.is_empty(), "expected windows");
+            assert!(
+                sp.windows.iter().any(|w| w.default.is_some()),
+                "expected a lag/lead default program"
+            );
+            assert!(
+                sp.windows.iter().any(|w| matches!(
+                    w.func,
+                    WindowFunc::Lag(_) | WindowFunc::NthValue(_) | WindowFunc::FirstValue
+                )),
+                "expected value/offset window functions"
+            );
+        }
         other => panic!("expected a Select, got {other:?}"),
     }
     // EXPLAIN renders the window phase (and does not panic on it).
     let ex = p.explain(&s);
     assert!(ex.contains("window __w"), "EXPLAIN should show the windows:\n{ex}");
     let bytes = p.encode();
+    assert_eq!(bytes[0], 34, "plan format byte");
     for cut in 0..bytes.len() {
         assert!(
             CompiledPlan::decode(&bytes[..cut], &s).is_err(),
@@ -317,6 +347,13 @@ fn decode_rejects_truncation_in_windows() {
     }
     // The full blob round-trips (and re-validates the window programs).
     assert_eq!(CompiledPlan::decode(&bytes, &s).unwrap(), p);
+    // Stale format: a format-33 reader-era blob must be re-prepared, not misread.
+    let mut stale = bytes.clone();
+    stale[0] = 33;
+    assert!(
+        matches!(CompiledPlan::decode(&stale, &s), Err(Error::PlanInvalidated)),
+        "a format-33 window plan must be PlanInvalidated, not misread"
+    );
 }
 
 /// The recursive SubPlan bytes (#73 §3, format 20) get their own truncation
@@ -370,7 +407,7 @@ fn compound_subplan_roundtrips_rejects_truncation_and_stale_format() {
         );
         let _ = p.explain(&s); // must not panic on the compound body render
         let bytes = p.encode();
-        assert_eq!(bytes[0], 33, "plan format byte for {sql}");
+        assert_eq!(bytes[0], 34, "plan format byte for {sql}");
         assert_eq!(CompiledPlan::decode(&bytes, &s).unwrap(), p, "roundtrip for {sql}");
         for cut in 0..bytes.len() {
             assert!(

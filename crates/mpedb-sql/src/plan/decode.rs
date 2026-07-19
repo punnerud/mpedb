@@ -719,6 +719,22 @@ fn decode_window(buf: &[u8], pos: &mut usize) -> Result<WindowSpec> {
                 .ok_or_else(|| corrupt("unknown window aggregate function"))?;
             WindowFunc::Agg(f)
         }
+        // Value/offset functions (format 34). Lag/Lead/NthValue carry a trailing
+        // i64 (constant offset / n); FirstValue/LastValue carry nothing extra.
+        5 => WindowFunc::Lag(r_u64(buf, pos)? as i64),
+        6 => WindowFunc::Lead(r_u64(buf, pos)? as i64),
+        7 => WindowFunc::FirstValue,
+        8 => WindowFunc::LastValue,
+        9 => {
+            let n = r_u64(buf, pos)? as i64;
+            // nth_value's n is a POSITIVE integer (the planner refuses n < 1, and
+            // sqlite errors on it at runtime); a blob claiming otherwise is
+            // corrupt rather than a source of a wrong answer.
+            if n < 1 {
+                return Err(corrupt("nth_value n must be a positive integer"));
+            }
+            WindowFunc::NthValue(n)
+        }
         t => return Err(corrupt(format!("bad window function tag {t}"))),
     };
     let arg = decode_opt_program(buf, pos)?;
@@ -729,10 +745,29 @@ fn decode_window(buf: &[u8], pos: &mut usize) -> Result<WindowSpec> {
         1 => return Err(corrupt("DISTINCT window aggregate is not supported")),
         t => return Err(corrupt(format!("bad window distinct tag {t}"))),
     };
-    // A ranking function takes no argument (the row itself is the input).
-    if arg.is_some() && matches!(func, WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank)
-    {
+    let default = decode_opt_program(buf, pos)?;
+    // A ranking function takes no argument (the row itself is the input); a value
+    // or aggregate function does. The `default` program is a lag/lead-only field.
+    let is_ranking = matches!(
+        func,
+        WindowFunc::RowNumber | WindowFunc::Rank | WindowFunc::DenseRank
+    );
+    let is_value = matches!(
+        func,
+        WindowFunc::Lag(_)
+            | WindowFunc::Lead(_)
+            | WindowFunc::FirstValue
+            | WindowFunc::LastValue
+            | WindowFunc::NthValue(_)
+    );
+    if arg.is_some() && is_ranking {
         return Err(corrupt("ranking window function carries an argument"));
+    }
+    if arg.is_none() && is_value {
+        return Err(corrupt("value window function requires an argument"));
+    }
+    if default.is_some() && !matches!(func, WindowFunc::Lag(_) | WindowFunc::Lead(_)) {
+        return Err(corrupt("only lag/lead carry a default expression"));
     }
     let n_part = r_u16(buf, pos)? as usize;
     if n_part > crate::parser::MAX_ORDER_BY_ITEMS {
@@ -762,6 +797,7 @@ fn decode_window(buf: &[u8], pos: &mut usize) -> Result<WindowSpec> {
         distinct,
         partition_by,
         order_by,
+        default,
     })
 }
 
