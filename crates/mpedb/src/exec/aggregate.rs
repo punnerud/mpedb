@@ -123,6 +123,19 @@ pub(super) fn exec_aggregate(
         // seen so far (empty = no row yet); `bare` is that row's bare values.
         MinRowid { pk: Vec<u8>, bare: Vec<Value> },
     }
+    // The collation each GROUP BY key groups under: a bare NOCASE/RTRIM column
+    // collapses case-/space-variants into ONE group (sqlite parity); a computed
+    // key is BINARY. Folded before encoding, so `'abc'` and `'ABC'` (NOCASE) hash
+    // to the same bucket — the equality half of the column's declared collation.
+    let base_colls = super::base_row_collations(schema, table, joins);
+    let group_collations: Vec<Collation> = agg
+        .group_by
+        .iter()
+        .map(|k| match k {
+            GroupKey::Col(c) => base_colls.get(*c as usize).copied().unwrap_or(Collation::Binary),
+            GroupKey::Expr(_) => Collation::Binary,
+        })
+        .collect();
     type Group = (Vec<Value>, Vec<Accum>, Option<Witness>);
     let mut groups: std::collections::BTreeMap<Vec<u8>, Group> = Default::default();
     for row in &rows {
@@ -135,7 +148,7 @@ pub(super) fn exec_aggregate(
                 GroupKey::Expr(p) => p.eval(row, params),
             })
             .collect::<Result<_>>()?;
-        let key = keycode::encode_key(&key_vals);
+        let key = keycode::encode_key_collated(&key_vals, &group_collations);
         let entry = groups.entry(key).or_insert_with(|| {
             let witness = if !has_bare {
                 None

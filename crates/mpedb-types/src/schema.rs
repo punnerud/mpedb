@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use crate::value::{read_value, write_value, ColumnType, Value};
+use crate::value::{read_value, write_value, Collation, ColumnType, Value};
 use crate::{MAX_COLUMNS, MAX_TABLES};
 
 /// Default value for a column when an INSERT omits it.
@@ -26,6 +26,17 @@ pub struct ColumnDef {
     /// Compiled to expression IR at attach time by the SQL layer; the source
     /// text participates in the schema hash.
     pub check: Option<String>,
+    /// The column's DECLARED collating sequence (`name TEXT COLLATE NOCASE`),
+    /// the DEFAULT for `= <> < <= > >= IN BETWEEN`, `ORDER BY`, `GROUP BY` and
+    /// `DISTINCT` on this column (sqlite's precedence rung 2 — an explicit
+    /// `COLLATE` on an operand still overrides). [`Collation::Binary`] unless
+    /// declared. Only meaningful for TEXT: `validate` refuses a non-BINARY
+    /// collation on any other type, and — because mpedb does not yet fold
+    /// collated ON-DISK keys — on any PRIMARY KEY / indexed column (a collated
+    /// UNIQUE/index is refused, never answered wrong; comparisons and sorts
+    /// still honor the collation). Participates in the schema hash (canonical
+    /// bytes v6).
+    pub collation: Collation,
 }
 
 /// One secondary index (canonical-bytes v2, DESIGN-SCHEMA-V2). `index_no` in
@@ -727,6 +738,43 @@ impl Schema {
                     }
                 }
             }
+            // A DECLARED collating sequence (`COLLATE NOCASE`/`RTRIM`) is only
+            // meaningful for TEXT, and mpedb does not yet fold collated ON-DISK
+            // keys — so a non-BINARY collation may not sit on any key column
+            // (PRIMARY KEY or secondary index). Both are clean refusals, never a
+            // wrong uniqueness/ordering answer: a collated UNIQUE/index is
+            // deferred, while `=`/`<`/ORDER BY/GROUP BY/DISTINCT still honor the
+            // collation (they do not go through the keycode-ordered trees). This
+            // is the single chokepoint every path funnels through — CREATE TABLE,
+            // ALTER, CREATE INDEX, config, and a hostile v6 blob alike.
+            for (ci, c) in t.columns.iter().enumerate() {
+                if c.collation == Collation::Binary {
+                    continue;
+                }
+                if c.ty != ColumnType::Text {
+                    return Err(Error::Schema(format!(
+                        "column `{}.{}`: COLLATE {} may only be declared on a text column \
+                         (collation affects text comparison only)",
+                        t.name,
+                        c.name,
+                        c.collation.name()
+                    )));
+                }
+                let i = ci as u16;
+                if t.primary_key.contains(&i)
+                    || t.indexes.iter().any(|ix| ix.columns.contains(&i))
+                {
+                    return Err(Error::Schema(format!(
+                        "column `{}.{}`: a COLLATE {} column cannot be part of a PRIMARY KEY \
+                         or index — collated indexes are not supported yet (mpedb keys are \
+                         memcmp-ordered); the collation is still applied to comparisons, \
+                         ORDER BY, GROUP BY and DISTINCT",
+                        t.name,
+                        c.name,
+                        c.collation.name()
+                    )));
+                }
+            }
             // An FTS content table is stored like any table, but its shape is
             // fixed (design/DESIGN-FTS.md §1): a single INTEGER `rowid` primary
             // key, and NO ordinary secondary indexes — the inverted index lives
@@ -814,7 +862,7 @@ impl Schema {
     /// and decode reconstructs the in-memory convenience flags from it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-        buf.push(5u8); // schema encoding version (v5: TableDef.implicit_rowid, #94)
+        buf.push(6u8); // schema encoding version (v6: ColumnDef.collation, COLLATE)
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             buf.extend_from_slice(&t.id.to_le_bytes());
@@ -836,6 +884,10 @@ impl Schema {
                 write_str(&mut buf, &c.name);
                 buf.push(c.ty as u8);
                 buf.push(c.nullable as u8);
+                // Declared collating sequence (v6). BINARY (0) for every column
+                // that did not write `COLLATE`, so a plain schema's bytes grow by
+                // exactly one zero byte per column.
+                buf.push(c.collation as u8);
                 match &c.default {
                     None => buf.push(0),
                     Some(DefaultExpr::Const(v)) => {
@@ -877,9 +929,9 @@ impl Schema {
         let mut pos = 0usize;
         let version = *buf.get(pos).ok_or_else(err)?;
         pos += 1;
-        if version != 5 {
+        if version != 6 {
             return Err(Error::Corrupt(format!(
-                "unknown schema version {version} (v1..v4 predate canonical-bytes v5 — \
+                "unknown schema version {version} (v1..v5 predate canonical-bytes v6 — \
                  regenerate or re-import)"
             )));
         }
@@ -931,6 +983,10 @@ impl Schema {
                 // the index list is the only wire truth (design §1.5).
                 let flags = *buf.get(pos).ok_or_else(err)?;
                 pos += 1;
+                // Declared collating sequence (v6).
+                let collation = Collation::from_tag(*buf.get(pos).ok_or_else(err)?)
+                    .ok_or_else(|| Error::Corrupt("bad column collation tag".into()))?;
+                pos += 1;
                 let default = match *buf.get(pos).ok_or_else(err)? {
                     0 => {
                         pos += 1;
@@ -965,6 +1021,7 @@ impl Schema {
                     indexed: false,
                     default,
                     check,
+                    collation,
                 });
             }
             let npk = read_u16(buf, &mut pos)? as usize;
@@ -1090,7 +1147,7 @@ mod tests {
                     unique: false,
                     indexed: false,
                     default: None,
-                    check: None,
+                    check: None, collation: Collation::Binary,
                 },
                 ColumnDef {
                     name: "email".into(),
@@ -1099,7 +1156,7 @@ mod tests {
                     unique: true,
                     indexed: false,
                     default: None,
-                    check: None,
+                    check: None, collation: Collation::Binary,
                 },
                 ColumnDef {
                     name: "age".into(),
@@ -1109,6 +1166,7 @@ mod tests {
                     indexed: false,
                     default: Some(DefaultExpr::Const(Value::Int(0))),
                     check: Some("age >= 0 AND age < 200".into()),
+                    collation: Collation::Binary,
                 },
             ],
             primary_key: vec![0],
@@ -1142,7 +1200,7 @@ mod tests {
                             unique: false,
                             indexed: false,
                             default: None,
-                            check: None,
+                            check: None, collation: Collation::Binary,
                         }],
                         primary_key: vec![0],
                         indexes: vec![],
@@ -1169,7 +1227,7 @@ mod tests {
                 unique: false,
                 indexed: false,
                 default: None,
-                check: None,
+                check: None, collation: Collation::Binary,
             }],
             primary_key: vec![0],
             indexes: vec![],
@@ -1187,7 +1245,7 @@ mod tests {
                 unique: false,
                 indexed: false,
                 default: None,
-                check: None,
+                check: None, collation: Collation::Binary,
             }],
             primary_key: vec![0],
             indexes: vec![],
@@ -1207,7 +1265,7 @@ mod tests {
     #[test]
     fn ids_are_dense_explicit_and_survive_the_wire() {
         let col = |n: &str| ColumnDef { name: n.into(), ty: ColumnType::Int64,
-            nullable: false, unique: false, indexed: false, default: None, check: None };
+            nullable: false, unique: false, indexed: false, default: None, check: None, collation: Collation::Binary };
         let tbl = |n: &str| TableDef { id: 0, name: n.into(), columns: vec![col("id")],
             primary_key: vec![0], indexes: vec![], dead: false, kind: TableKind::Standard, implicit_rowid: false };
 
@@ -1236,11 +1294,11 @@ mod tests {
             name: "t".into(),
             columns: vec![
                 ColumnDef { name: "id".into(), ty: ColumnType::Int64, nullable: false,
-                    unique: true, indexed: true, default: None, check: None },
+                    unique: true, indexed: true, default: None, check: None, collation: Collation::Binary },
                 ColumnDef { name: "a".into(), ty: ColumnType::Int64, nullable: true,
-                    unique: true, indexed: true, default: None, check: None },
+                    unique: true, indexed: true, default: None, check: None, collation: Collation::Binary },
                 ColumnDef { name: "b".into(), ty: ColumnType::Text, nullable: true,
-                    unique: false, indexed: true, default: None, check: None },
+                    unique: false, indexed: true, default: None, check: None, collation: Collation::Binary },
             ],
             primary_key: vec![0],
             indexes: vec![IndexDef { columns: vec![1, 2], unique: false }],
@@ -1272,13 +1330,13 @@ mod tests {
     #[test]
     fn hostile_bytes_refuse_cleanly() {
         let col = |n: &str, ty| ColumnDef { name: n.into(), ty, nullable: true,
-            unique: false, indexed: false, default: None, check: None };
+            unique: false, indexed: false, default: None, check: None, collation: Collation::Binary };
         let base = Schema::new(vec![TableDef {
             id: 0,
             name: "t".into(),
             columns: vec![
                 ColumnDef { name: "id".into(), ty: ColumnType::Int64, nullable: false,
-                    unique: false, indexed: false, default: None, check: None },
+                    unique: false, indexed: false, default: None, check: None, collation: Collation::Binary },
                 col("v", ColumnType::Any),
                 col("w", ColumnType::Int64),
             ],
@@ -1324,7 +1382,7 @@ mod tests {
     fn tbl(n: &str) -> TableDef {
         let col = |n: &str| ColumnDef {
             name: n.into(), ty: ColumnType::Int64, nullable: false,
-            unique: false, indexed: false, default: None, check: None,
+            unique: false, indexed: false, default: None, check: None, collation: Collation::Binary,
         };
         TableDef { id: 0, name: n.into(), columns: vec![col("id")],
             primary_key: vec![0], indexes: vec![], dead: false, kind: TableKind::Standard, implicit_rowid: false }
@@ -1376,13 +1434,13 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r, "dead slot + ids survive the wire byte-for-byte");
         assert_eq!(s.hash(), r.hash());
-        // The version byte is 5.
-        assert_eq!(s.canonical_bytes()[0], 5);
-        // A v4 file refuses cleanly (no misread of the new implicit_rowid byte).
-        let mut v4 = s.canonical_bytes();
-        v4[0] = 4;
-        let err = Schema::from_canonical_bytes(&v4).unwrap_err();
-        assert!(format!("{err}").contains("unknown schema version 4"), "{err}");
+        // The version byte is 6.
+        assert_eq!(s.canonical_bytes()[0], 6);
+        // A v5 file refuses cleanly (no misread of the new collation byte).
+        let mut v5 = s.canonical_bytes();
+        v5[0] = 5;
+        let err = Schema::from_canonical_bytes(&v5).unwrap_err();
+        assert!(format!("{err}").contains("unknown schema version 5"), "{err}");
     }
 
     #[test]
@@ -1431,11 +1489,11 @@ mod tests {
     fn implicit_rowid_round_trips_and_helpers() {
         let col = |n: &str, ty| ColumnDef {
             name: n.into(), ty, nullable: true, unique: false, indexed: false,
-            default: None, check: None,
+            default: None, check: None, collation: Collation::Binary,
         };
         let rowid = ColumnDef {
             name: "rowid".into(), ty: ColumnType::Int64, nullable: false,
-            unique: false, indexed: false, default: None, check: None,
+            unique: false, indexed: false, default: None, check: None, collation: Collation::Binary,
         };
         let s = Schema::new(vec![TableDef {
             id: 0,
@@ -1465,13 +1523,142 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 5);
+        assert_eq!(s.canonical_bytes()[0], 6);
 
         // Truncation at every offset is Corrupt, never a panic.
         let bytes = s.canonical_bytes();
         for i in 0..bytes.len() {
             assert!(Schema::from_canonical_bytes(&bytes[..i]).is_err(), "offset {i}");
         }
+    }
+
+    /// A DECLARED column collation (`COLLATE NOCASE`) survives the v6 wire
+    /// byte-for-byte, contributes to the hash, and truncation at every offset is
+    /// Corrupt — the roundtrip/truncation contract extended to the new field.
+    #[test]
+    fn column_collation_round_trips_and_is_hostile_safe() {
+        let col = |n: &str, ty, coll| ColumnDef {
+            name: n.into(), ty, nullable: true, unique: false, indexed: false,
+            default: None, check: None, collation: coll,
+        };
+        let id = ColumnDef {
+            name: "id".into(), ty: ColumnType::Int64, nullable: false, unique: false,
+            indexed: false, default: None, check: None, collation: Collation::Binary,
+        };
+        let s = Schema::new(vec![TableDef {
+            id: 0,
+            name: "t".into(),
+            // A NOCASE and an RTRIM text column, neither indexed (a collated key
+            // is refused — see `collated_key_column_refused`).
+            columns: vec![
+                id,
+                col("name", ColumnType::Text, Collation::NoCase),
+                col("code", ColumnType::Text, Collation::Rtrim),
+            ],
+            primary_key: vec![0],
+            indexes: vec![],
+            dead: false,
+            kind: TableKind::Standard,
+            implicit_rowid: false,
+        }])
+        .unwrap();
+        assert_eq!(s.tables[0].columns[1].collation, Collation::NoCase);
+        assert_eq!(s.tables[0].columns[2].collation, Collation::Rtrim);
+
+        let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
+        assert_eq!(s, r);
+        assert_eq!(s.hash(), r.hash());
+        assert_eq!(s.canonical_bytes()[0], 6);
+
+        // The collation changes the hash: a BINARY `name` is a different schema.
+        let mut plain = s.clone();
+        plain.tables[0].columns[1].collation = Collation::Binary;
+        assert_ne!(s.hash(), plain.hash());
+
+        // Truncation at every offset is Corrupt, never a panic.
+        let bytes = s.canonical_bytes();
+        for i in 0..bytes.len() {
+            assert!(Schema::from_canonical_bytes(&bytes[..i]).is_err(), "offset {i}");
+        }
+
+        // A hostile v6 blob with an out-of-range collation tag refuses cleanly.
+        // Column `name` encodes as `<len> "name" <ty> <nullable> <collation> …`,
+        // so its collation byte is 6 bytes past the start of the literal "name".
+        let mut evil = s.canonical_bytes();
+        let np = evil.windows(4).position(|w| w == b"name").unwrap();
+        let coll_at = np + 4 /*name*/ + 1 /*ty*/ + 1 /*nullable*/;
+        assert_eq!(evil[coll_at], Collation::NoCase as u8, "located the collation byte");
+        evil[coll_at] = 0x7f;
+        let err = Schema::from_canonical_bytes(&evil).unwrap_err();
+        assert!(format!("{err}").to_lowercase().contains("collation"), "{err}");
+    }
+
+    /// A non-BINARY collation on a key column (PRIMARY KEY / UNIQUE / index) is
+    /// REFUSED — collated on-disk keys are deferred, never answered wrong. Also
+    /// enforced on decode (a hostile v6 blob cannot smuggle one in).
+    #[test]
+    fn collated_key_column_refused() {
+        let mk = |unique: bool| {
+            Schema::new(vec![TableDef {
+                id: 0,
+                name: "t".into(),
+                columns: vec![
+                    ColumnDef { name: "id".into(), ty: ColumnType::Int64, nullable: false,
+                        unique: false, indexed: false, default: None, check: None,
+                        collation: Collation::Binary },
+                    ColumnDef { name: "name".into(), ty: ColumnType::Text, nullable: true,
+                        unique, indexed: !unique, default: None, check: None,
+                        collation: Collation::NoCase },
+                ],
+                primary_key: vec![0],
+                indexes: vec![],
+                dead: false,
+                kind: TableKind::Standard,
+                implicit_rowid: false,
+            }])
+        };
+        // A UNIQUE and a plain index on a NOCASE column both refuse.
+        let err = mk(true).unwrap_err();
+        assert!(format!("{err}").contains("COLLATE"), "{err}");
+        let err = mk(false).unwrap_err();
+        assert!(format!("{err}").contains("COLLATE"), "{err}");
+
+        // A NOCASE PRIMARY KEY column refuses too.
+        let err = Schema::new(vec![TableDef {
+            id: 0,
+            name: "t".into(),
+            columns: vec![ColumnDef { name: "k".into(), ty: ColumnType::Text, nullable: false,
+                unique: false, indexed: false, default: None, check: None,
+                collation: Collation::NoCase }],
+            primary_key: vec![0],
+            indexes: vec![],
+            dead: false,
+            kind: TableKind::Standard,
+            implicit_rowid: false,
+        }])
+        .unwrap_err();
+        assert!(format!("{err}").contains("COLLATE"), "{err}");
+
+        // And a non-TEXT collation is refused (collation affects text only).
+        let err = Schema::new(vec![TableDef {
+            id: 0,
+            name: "t".into(),
+            columns: vec![
+                ColumnDef { name: "id".into(), ty: ColumnType::Int64, nullable: false,
+                    unique: false, indexed: false, default: None, check: None,
+                    collation: Collation::Binary },
+                ColumnDef { name: "n".into(), ty: ColumnType::Int64, nullable: true,
+                    unique: false, indexed: false, default: None, check: None,
+                    collation: Collation::NoCase },
+            ],
+            primary_key: vec![0],
+            indexes: vec![],
+            dead: false,
+            kind: TableKind::Standard,
+            implicit_rowid: false,
+        }])
+        .unwrap_err();
+        assert!(format!("{err}").contains("text"), "{err}");
     }
 
     /// A hostile v5 blob that merely flips `implicit_rowid` on a shape that is

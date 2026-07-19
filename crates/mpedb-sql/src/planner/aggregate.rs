@@ -208,6 +208,9 @@ fn synthetic_grouped_table(
     // One type per GROUP BY key — a plain column's declared type, or the
     // bound type of a computed key (`GROUP BY a + 1`).
     key_types: &[ColumnType],
+    // One collation per GROUP BY key — a bare column's declared collation, so an
+    // `ORDER BY <grouped-key>` over this synthetic tuple inherits it.
+    key_collations: &[Collation],
     aggs: &[(mpedb_types::AggFn, Option<ast::Expr>, bool)],
     agg_types: &[Option<ColumnType>],
     // sqlite bare columns `(base slot, type)`: the tuple's tail
@@ -225,6 +228,7 @@ fn synthetic_grouped_table(
             indexed: false,
             default: None,
             check: None,
+            collation: key_collations.get(k).copied().unwrap_or(Collation::Binary),
         });
     }
     for (i, (f, _, _)) in aggs.iter().enumerate() {
@@ -245,6 +249,7 @@ fn synthetic_grouped_table(
             indexed: false,
             default: None,
             check: None,
+            collation: Collation::Binary,
         });
     }
     // The bare region: named `__b{j}` (the names `lift_aggs` emitted), typed by
@@ -259,6 +264,7 @@ fn synthetic_grouped_table(
             indexed: false,
             default: None,
             check: None,
+            collation: Collation::Binary,
         });
     }
     TableDef {
@@ -317,6 +323,11 @@ pub(super) fn plan_aggregate_select(
     // (for matching selected/ordered expressions to key positions).
     let mut key_cols: Vec<Option<u16>> = Vec::with_capacity(s.group_by.len());
     let mut key_types: Vec<ColumnType> = Vec::with_capacity(s.group_by.len());
+    // Per key: the collation to GROUP/ORDER the key under — a bare column's
+    // declared collation (so `GROUP BY name` on a NOCASE column collapses case),
+    // BINARY for a computed key. Rides into the synthetic grouped tuple so an
+    // `ORDER BY <key>` over the grouped row picks it up.
+    let mut key_collations: Vec<Collation> = Vec::with_capacity(s.group_by.len());
     let mut key_asts: Vec<ast::Expr> = Vec::with_capacity(s.group_by.len());
     for g in &s.group_by {
         // `GROUP BY 2` is an OUTPUT ordinal in sqlite and PostgreSQL, so the
@@ -357,6 +368,7 @@ pub(super) fn plan_aggregate_select(
                 group_by.push(GroupKey::Col(i));
                 key_cols.push(Some(i));
                 key_types.push(ty);
+                key_collations.push(base_scope.column_collation(i));
             }
             expr => {
                 // Same rule as repeated columns: redundant, not wrong.
@@ -369,6 +381,7 @@ pub(super) fn plan_aggregate_select(
                 // An unpinnable key type (a bare NULL) grades to Any — the
                 // honest "decided per value" column type.
                 key_types.push(ty.unwrap_or(ColumnType::Any));
+                key_collations.push(Collation::Binary);
             }
         }
         key_asts.push(g.clone());
@@ -433,7 +446,8 @@ pub(super) fn plan_aggregate_select(
     //    The tuple is `[keys ‖ aggs ‖ bare]`; folding runs here, so a bare column
     //    in a dead branch (`COALESCE(-24, col)`) drops out and never reaches a
     //    program.
-    let grouped = synthetic_grouped_table(&key_types, &agg_specs, &agg_types, &bare);
+    let grouped =
+        synthetic_grouped_table(&key_types, &key_collations, &agg_specs, &agg_types, &bare);
     let mut binder = binder.rescope(Scope::single(&grouped));
 
     let mut out_types: Vec<Option<ColumnType>> = Vec::with_capacity(rewritten.len());
@@ -612,7 +626,10 @@ pub(super) fn plan_aggregate_select(
         // GROUP BY query); peel it so the inner resolves to a grouped-tuple
         // column and the collation rides the sort.
         let (e, coll) = peel_collate(e)?;
-        let coll = coll.unwrap_or_default();
+        // The lifted key names a grouped-tuple column (`__gN`); its declared
+        // collation was carried onto that synthetic column, so an `ORDER BY name`
+        // over a NOCASE group key sorts case-insensitively.
+        let coll = coll.unwrap_or_else(|| declared_collation(e, &binder.scope));
         match binder.bind_expr(e)? {
             (BExpr::Col(i), _) => grouped_keys.push((i, *desc, coll)),
             // Not a bare column of the grouped tuple. Stop: the keys must all
@@ -631,7 +648,7 @@ pub(super) fn plan_aggregate_select(
             // (for the ordinal test) and the lifted expr (for the item match /
             // junk column).
             let (orig, coll) = peel_collate(orig)?;
-            let coll = coll.unwrap_or_default();
+            let coll = coll.unwrap_or_else(|| declared_collation(orig, base_scope));
             let (e, _) = peel_collate(e)?;
             // An ordinal or a repeat of a selected item needs no new column.
             if let Some(pos) = ordinal(orig, items.len())? {

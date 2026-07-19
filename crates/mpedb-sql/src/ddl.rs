@@ -4,7 +4,7 @@
 //! them via its policy-store API. `USING`/`WITH CHECK` predicates are captured
 //! as SOURCE text (re-bound by the planner per statement, §3.2).
 
-use mpedb_types::{ColumnType, DefaultExpr, PolicyCmd};
+use mpedb_types::{Collation, ColumnType, DefaultExpr, PolicyCmd};
 
 /// One column of a `CREATE TABLE` (#47 stage 2) or `ALTER TABLE ADD COLUMN`.
 /// Types are the config's names (`int64`/`int`/`integer`, `text`, `real`,
@@ -19,6 +19,11 @@ pub struct CreateColumnSpec {
     pub not_null: bool,
     pub unique: bool,
     pub pk: bool,
+    /// `COLLATE <name>` declared on the column (BINARY/NOCASE/RTRIM). The parser
+    /// resolves the name (an unknown one is a clean error); the facade carries it
+    /// onto the [`ColumnDef`](mpedb_types::ColumnDef). [`Collation::Binary`] when
+    /// none was written.
+    pub collation: Collation,
     /// `DEFAULT <const>` on `ALTER TABLE ADD COLUMN` — a LITERAL constant
     /// (integer/float/string/blob/bool/NULL or a signed number), folded at
     /// parse time (sqlite refuses a non-constant ADD-COLUMN default). Always a
