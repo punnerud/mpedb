@@ -251,6 +251,15 @@ pub(crate) enum Expr {
     Col(String),
     Unary(UnOp, Box<Expr>),
     Binary(BinOp, Box<Expr>, Box<Expr>),
+    /// A ROW VALUE (tuple): a parenthesized list of ≥2 expressions, `(e1, e2, …)`.
+    /// Produced ONLY by the atom-level `( … , … )` grammar (a single `(expr)`
+    /// stays plain grouping, and `(SELECT …)` stays a subquery). It is NOT a
+    /// scalar: the binder consumes it ONLY as a direct operand of a comparison
+    /// (`= <> < <= > >=`), where it desugars to ordinary scalar boolean logic —
+    /// no plan/format change. Common uses are composite-key lookup
+    /// `WHERE (a, b) = (?, ?)` and keyset pagination `(created, id) > (?, ?)`.
+    /// Anywhere else it is a `"row value misused"` bind error (matching sqlite).
+    RowValue(Vec<Expr>),
     /// `IS NULL` (`negated` = `IS NOT NULL`).
     IsNull(Box<Expr>, bool),
     /// `x IS y` / `x IS NOT y` — NULL-safe "(not) distinct from". Unlike `=`/`<>`
