@@ -12,8 +12,8 @@
 
 use crate::ast::{self, BinOp, UnOp};
 use mpedb_types::{
-    Affinity, BareGroupBy, CmpKind, Collation, ColumnDef, ColumnType, Error, ExprProgram, Instr,
-    Result, ScalarFn, TableDef, Value,
+    exact_float_as_int, Affinity, BareGroupBy, CmpKind, Collation, ColumnDef, ColumnType, Error,
+    ExprProgram, Instr, Result, ScalarFn, TableDef, Value,
 };
 
 /// Bound (name-resolved, type-checked, constant-folded) expression.
@@ -640,6 +640,32 @@ impl<'a> Binder<'a> {
             Some(ColumnType::Int64) if col.ty == ColumnType::Float64 => {
                 fold_maybe(BExpr::Unary(BUnOp::ToFloat, Box::new(b)), self.suppress_fold)
             }
+            // The other direction, and CONSTANTS ONLY (task #74). sqlite's
+            // INTEGER affinity converts a real to an integer exactly when the
+            // round trip is lossless, so `SET i = 9.0` stores the integer 9 —
+            // which is Django's shape whenever a Python float reaches an
+            // IntegerField. A constant is the only case where mpedb can VERIFY
+            // losslessness at compile time, so it is the only case allowed:
+            // `SET i = r` stays refused, because truncating a column of reals
+            // would be a wrong answer rather than a wider one, and sqlite would
+            // have stored the real itself in its typeless column.
+            Some(ColumnType::Float64) if col.ty == ColumnType::Int64 => match &b {
+                BExpr::Const(Value::Float(f)) => match exact_float_as_int(*f) {
+                    Some(i) => Ok(BExpr::Const(Value::Int(i))),
+                    None => Err(bind_err(format!(
+                        "cannot assign the float64 constant {f:e} to int64 column `{}` — \
+                         it is not exactly an integer in the int64 range, and mpedb's \
+                         rigid int64 cannot hold what sqlite would have stored",
+                        col.name
+                    ))),
+                },
+                _ => Err(bind_err(format!(
+                    "cannot assign float64 to column `{}` of type int64: only a \
+                     constant whose value is exactly an integer converts, because \
+                     that is the only case losslessness can be checked at compile time",
+                    col.name
+                ))),
+            },
             // sqlite stores a boolean AS the integer 0/1, so assigning one to an
             // integer column is exactly `CAST(x AS INTEGER)` — lossless and
             // sqlite-identical. This is Django's `SET flag = (a = b)` shape.
