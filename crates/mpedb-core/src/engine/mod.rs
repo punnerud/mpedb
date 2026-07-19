@@ -366,6 +366,17 @@ fn index_row_key(
 /// `None` = no CHECK on that column.
 pub type CheckPrograms = Vec<Vec<Option<ExprProgram>>>;
 
+/// Compiles a schema's `ColumnDef::check` SOURCE strings into [`CheckPrograms`].
+///
+/// mpedb-core stores CHECK sources but cannot parse SQL, so the facade installs
+/// one of these ([`Engine::set_check_compiler`]) and the engine calls it every
+/// time it (re)builds a bundle from the catalog. Without it, a table created by
+/// `CREATE TABLE … CHECK (…)` carries its constraint in the schema and gets an
+/// EMPTY program slot — a constraint that is stored, reported by the catalog,
+/// and never enforced. Whether a CHECK fires must not depend on whether the
+/// table came from the config or from DDL.
+pub type CheckCompiler = dyn Fn(&Schema) -> Result<CheckPrograms> + Send + Sync;
+
 /// The schema plus every per-table cache derived from it, immutable as a
 /// unit (#47): transactions capture ONE `Arc<SchemaBundle>` at begin, so a
 /// txn sees one schema version even while DDL swaps the engine's current
@@ -507,6 +518,10 @@ pub struct Engine {
     /// Per-statement-execution work-row budget (#74), copied into each txn's
     /// [`WorkMeter`] at begin. `0` = unlimited.
     work_budget: u64,
+    /// Installed by the facade; recompiles CHECK programs whenever a bundle is
+    /// (re)built from the catalog. `None` until then — and forever for the
+    /// core's own tests, which declare no CHECKs.
+    check_compiler: std::sync::RwLock<Option<Arc<CheckCompiler>>>,
 }
 
 impl Drop for Engine {
@@ -554,6 +569,7 @@ impl Engine {
             flusher,
             extent_threshold: None,
             work_budget: config.options.max_work_rows,
+            check_compiler: std::sync::RwLock::new(None),
         };
         engine.bootstrap_catalog()?;
         // #47 stage 1: the FILE is authoritative for the schema. The config
@@ -591,6 +607,56 @@ impl Engine {
         self.bundle()
     }
 
+    /// Install the facade's CHECK compiler and immediately rebuild the current
+    /// bundle's programs with it.
+    ///
+    /// The rebuild is the point, not a nicety: [`Engine::open`] has already
+    /// loaded the LIVE schema from the catalog, which may carry CHECK sources
+    /// the config's seed schema never had (a peer process ran `CREATE TABLE …
+    /// CHECK (…)`). Without the rebuild this process would enforce the config's
+    /// checks and silently skip the catalog's.
+    pub fn set_check_compiler(&self, f: Arc<CheckCompiler>) -> Result<()> {
+        *self.check_compiler.write().expect("check compiler lock poisoned") = Some(f);
+        let cur = self.bundle();
+        let checks = self.compile_checks(&cur.schema, &cur.checks);
+        *self.bundle.write().expect("schema bundle lock poisoned") =
+            Arc::new(SchemaBundle::new_at(cur.schema_gen, cur.schema.clone(), checks));
+        Ok(())
+    }
+
+    /// CHECK programs for `schema`, via the installed compiler.
+    ///
+    /// The fallback — used before the facade installs one, and if compilation
+    /// fails — carries `prev` forward by table position (ids are dense in this
+    /// format window) and leaves a new table's slot empty. That is exactly what
+    /// this code did before the compiler existed.
+    ///
+    /// A compile FAILURE cannot be reported from here: this runs inside a bundle
+    /// swap that a reader/writer begin already committed to. It also cannot
+    /// happen in practice — every CHECK source is compiled against its finished
+    /// table before the DDL that stores it commits, so a source in the catalog
+    /// is a source that compiled. If one ever did fail, the empty slot is the
+    /// same "not yet compiled" state the pre-compiler code left, and the next
+    /// `CREATE`/`ALTER` naming that column re-reports it.
+    pub(super) fn compile_checks(&self, schema: &Schema, prev: &CheckPrograms) -> CheckPrograms {
+        let compiler = self
+            .check_compiler
+            .read()
+            .expect("check compiler lock poisoned")
+            .clone();
+        if let Some(f) = compiler {
+            if let Ok(c) = f(schema) {
+                debug_assert_eq!(c.len(), schema.tables.len());
+                if c.len() == schema.tables.len() {
+                    return c;
+                }
+            }
+        }
+        let mut checks = prev.clone();
+        checks.resize(schema.tables.len(), Vec::new());
+        checks
+    }
+
     /// Replace the current bundle with the catalog's stored schema. The
     /// schema-gen staleness check (#47 stage 3) routes writers here after a
     /// DDL commit by another process; `&self` — in-flight transactions keep
@@ -605,12 +671,10 @@ impl Engine {
         if stored == cur.schema && gen == cur.schema_gen {
             return Ok(());
         }
-        // CHECK programs are compiled by the facade from check sources; on a
-        // pure reload, carry existing programs for tables that persist (by
-        // id-position — dense in this window) and leave new ones empty until
-        // the facade recompiles.
-        let mut checks = cur.checks.clone();
-        checks.resize(stored.tables.len(), Vec::new());
+        // CHECK programs are compiled by the facade from check sources; the
+        // installed compiler recompiles the WHOLE stored schema, so a table a
+        // peer created with a CHECK is enforced here too and not merely stored.
+        let checks = self.compile_checks(&stored, &cur.checks);
         *self.bundle.write().expect("schema bundle lock poisoned") =
             Arc::new(SchemaBundle::new_at(gen, stored, checks));
         Ok(())
@@ -703,6 +767,9 @@ impl Engine {
             // Tooling handle (no config): the budget is unlimited (a `dump`/
             // verify pass legitimately scans whole tables).
             work_budget: 0,
+            // Read-only tooling: no SQL layer to install a compiler, and no
+            // writes for a CHECK to guard.
+            check_compiler: std::sync::RwLock::new(None),
         })
     }
 
