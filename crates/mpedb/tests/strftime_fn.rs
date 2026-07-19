@@ -60,6 +60,12 @@ const TIMES: &[&str] = &[
     "00:00:00",
     "23:59:59.999",
     "2010-01-01 ",
+    // Negative (BC) years: sqlite's parseYyyyMmDd accepts a leading '-'.
+    "-0500-03-04",
+    "-0001-12-31",
+    "0000-01-01",
+    // A fraction that rounds all the way up to the next second.
+    "12:00:00.999999999999999999999999",
 ];
 
 /// Every format specifier sqlite 3.45 implements.
@@ -344,11 +350,20 @@ fn strftime_refuses_by_name_what_it_cannot_reproduce() {
         "SELECT strftime('%Y', '2010-01-01 12:34:56.')",
         "SELECT strftime('%Y', '2010-01-01Z')",
         "SELECT strftime('%Y', '2010-01-01 12:34:56+99:00')",
+        // Before the Julian epoch: sqlite's validJulianDay() rejects it.
+        "SELECT strftime('%Y', '-4713-01-02')",
     ] {
         let m = err(sql);
         assert!(m.contains("unsupported time string"), "{sql}: {m}");
         assert!(m.contains("ISO-8601"), "{sql}: {m}");
     }
+
+    // A fractional part long enough to overflow the seconds accumulator: the
+    // NaN that produces is a NULL in sqlite (an undefined C cast lands the
+    // Julian day out of range) and must never become an mpedb answer.
+    let long = format!("SELECT strftime('%f', '00:00:00.{}')", "9".repeat(400));
+    let m = err(&long);
+    assert!(m.contains("unsupported time string"), "{m}");
 
     // --- modifiers ------------------------------------------------------
     let m = err("SELECT strftime('%Y-%m-%d', '2010-01-01', '+1 day')");
