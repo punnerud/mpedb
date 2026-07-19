@@ -390,14 +390,22 @@ fn stage1_refusals() {
     )
     .to_lowercase()
     .contains("frame"));
-    // lag/lead/first_value/last_value/nth_value ship in stage 2 (see
-    // `window2.rs`); the remaining window functions do not yet.
-    assert!(err("SELECT ntile(4) OVER (ORDER BY val) FROM t")
+    // The full standard window-function set now ships (ranking + aggregate OVER
+    // in `window.rs`; value/offset in `window2.rs`; ntile/percent_rank/cume_dist
+    // in `window3.rs`). What remains refused: a scalar function used with OVER
+    // (not a window function), and the out-of-scope forms — named windows and
+    // FILTER. Each is a clean parse/plan-time rejection, never a wrong answer.
+    assert!(err("SELECT abs(val) OVER (ORDER BY val) FROM t")
         .to_lowercase()
-        .contains("stage 2"));
-    assert!(err("SELECT percent_rank() OVER (ORDER BY val) FROM t")
+        .contains("window"));
+    // A named window (`OVER w` + `WINDOW w AS (...)`) is not supported.
+    err("SELECT rank() OVER w FROM t WINDOW w AS (ORDER BY val)");
+    // FILTER on a window aggregate is not supported.
+    err("SELECT count(amt) FILTER (WHERE amt > 0) OVER (ORDER BY val) FROM t");
+    // ntile without an ORDER BY is refused (its buckets would be order-dependent).
+    assert!(err("SELECT ntile(4) OVER () FROM t")
         .to_lowercase()
-        .contains("stage 2"));
+        .contains("order by"));
     // A window may not appear in WHERE.
     assert!(err("SELECT id FROM t WHERE row_number() OVER (ORDER BY val) = 1")
         .to_lowercase()

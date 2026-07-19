@@ -409,12 +409,20 @@ impl CompiledPlan {
                         if w.distinct {
                             return Err(corrupt("DISTINCT window aggregate is not supported"));
                         }
-                        // A ranking function has no argument (the row is the
-                        // input). An aggregate window MAY carry one (`sum(x)`) or
-                        // not (`count(*)`). Every value/offset function REQUIRES
-                        // its value `expr`.
-                        let is_ranking =
-                            matches!(w.func, WF::RowNumber | WF::Rank | WF::DenseRank);
+                        // A ranking/distribution function has no argument (the row
+                        // is the input; ntile's bucket count rides in its tag). An
+                        // aggregate window MAY carry one (`sum(x)`) or not
+                        // (`count(*)`). Every value/offset function REQUIRES its
+                        // value `expr`.
+                        let is_ranking = matches!(
+                            w.func,
+                            WF::RowNumber
+                                | WF::Rank
+                                | WF::DenseRank
+                                | WF::Ntile(_)
+                                | WF::PercentRank
+                                | WF::CumeDist
+                        );
                         let is_value = matches!(
                             w.func,
                             WF::Lag(_)
@@ -432,6 +440,11 @@ impl CompiledPlan {
                         if let WF::NthValue(n) = w.func {
                             if n < 1 {
                                 return Err(corrupt("nth_value n must be a positive integer"));
+                            }
+                        }
+                        if let WF::Ntile(n) = w.func {
+                            if n < 1 {
+                                return Err(corrupt("ntile bucket count must be a positive integer"));
                             }
                         }
                         // `default` is a lag/lead-only field (the out-of-range

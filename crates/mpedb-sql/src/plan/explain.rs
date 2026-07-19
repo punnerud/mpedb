@@ -328,6 +328,9 @@ impl CompiledPlan {
                         WF::FirstValue => format!("first_value({})", argp()),
                         WF::LastValue => format!("last_value({})", argp()),
                         WF::NthValue(n) => format!("nth_value({}, {n})", argp()),
+                        WF::Ntile(n) => format!("ntile({n})"),
+                        WF::PercentRank => "percent_rank()".to_string(),
+                        WF::CumeDist => "cume_dist()".to_string(),
                     };
                     let mut spec = String::new();
                     if !w.partition_by.is_empty() {

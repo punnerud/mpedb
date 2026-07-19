@@ -338,6 +338,68 @@ fn assign_window(
                     g = h;
                 }
             }
+            // ntile: distribute the partition's `sz` rows into `nb` buckets
+            // (1-based) along the window order. sqlite's rule: the first `sz % nb`
+            // buckets get `ceil(sz/nb)` rows, the rest `floor(sz/nb)`. The planner
+            // guarantees an ORDER BY (so the order is deterministic) and `nb >= 1`.
+            WindowFunc::Ntile(nb) => {
+                let sz = part.len() as i64;
+                let nb = nb.max(1); // validated ≥ 1; guard division regardless
+                let floor = sz / nb;
+                let rem = sz % nb;
+                // The first `rem` buckets each hold `floor + 1` rows; together they
+                // cover the leading `large` rows. Beyond that, buckets hold `floor`
+                // (only reached when floor >= 1, so the division below is safe).
+                let large = rem * (floor + 1);
+                for (off, &i) in part.iter().enumerate() {
+                    let off = off as i64;
+                    let bucket = if off < large {
+                        off / (floor + 1) + 1
+                    } else {
+                        rem + (off - large) / floor + 1
+                    };
+                    rows[i][slot] = Value::Int(bucket);
+                }
+            }
+            // percent_rank: (rank - 1) / (sz - 1), or 0.0 for a one-row partition.
+            // Uses rank() semantics — ties share, the next rank skips — so it walks
+            // the same peer-group boundary as `Rank`. With no ORDER BY every row is
+            // one peer group ⇒ rank 1 ⇒ 0.0 everywhere (matching sqlite).
+            WindowFunc::PercentRank => {
+                let sz = part.len();
+                let denom = (sz as f64) - 1.0;
+                let mut rank = 1i64;
+                for (off, &i) in part.iter().enumerate() {
+                    if off > 0 && !peers(i, part[off - 1]) {
+                        rank = (off + 1) as i64;
+                    }
+                    let pr = if sz <= 1 {
+                        0.0
+                    } else {
+                        (rank - 1) as f64 / denom
+                    };
+                    rows[i][slot] = Value::Float(pr);
+                }
+            }
+            // cume_dist: (rows whose order key is <= the current row's, peers
+            // included) / sz. Every row of a peer group shares the value: the index
+            // just past that group (`h`) over `sz`. With no ORDER BY the whole
+            // partition is one peer group ⇒ 1.0 everywhere (matching sqlite).
+            WindowFunc::CumeDist => {
+                let sz = part.len() as f64;
+                let mut g = 0usize;
+                while g < part.len() {
+                    let mut h = g + 1;
+                    while h < part.len() && peers(part[h], part[g]) {
+                        h += 1;
+                    }
+                    let cd = h as f64 / sz;
+                    for &i in &part[g..h] {
+                        rows[i][slot] = Value::Float(cd);
+                    }
+                    g = h;
+                }
+            }
         }
         p = q;
     }
