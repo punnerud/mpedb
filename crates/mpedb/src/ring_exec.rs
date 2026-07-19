@@ -569,7 +569,10 @@ fn optimistic_prep_inner(
                 return Prep::Direct(Err(e));
             }
             let pk_vals: Vec<Value> = pk_cols.iter().map(|&i| values[i as usize].clone()).collect();
-            let key = keycode::encode_key(&pk_vals);
+            // The engine's own PK-tree encoding, not `encode_key`: this key is
+            // applied to the tree verbatim, and a collated or TYPELESS (`any`)
+            // PK column does not encode the plain way (`keycode::KeySpec`).
+            let key = db.engine.pk_key(table, &pk_vals);
             let kh = key_hash(&key);
             match r.get_by_pk(table, &pk_vals) {
                 Ok(Some(_)) => Prep::Confirm {
@@ -603,7 +606,10 @@ fn optimistic_prep_inner(
             if pk_vals.iter().any(|v| v.is_null()) {
                 return Prep::Direct(Ok(ExecResult::Affected(0))); // pk = NULL matches nothing
             }
-            let key = keycode::encode_key(&pk_vals);
+            // The engine's own PK-tree encoding, not `encode_key`: this key is
+            // applied to the tree verbatim, and a collated or TYPELESS (`any`)
+            // PK column does not encode the plain way (`keycode::KeySpec`).
+            let key = db.engine.pk_key(table, &pk_vals);
             let kh = key_hash(&key);
             let old = match r.get_by_pk(table, &pk_vals) {
                 Ok(Some(old)) => old,
@@ -663,7 +669,10 @@ fn optimistic_prep_inner(
             if pk_vals.iter().any(|v| v.is_null()) {
                 return Prep::Direct(Ok(ExecResult::Affected(0)));
             }
-            let key = keycode::encode_key(&pk_vals);
+            // The engine's own PK-tree encoding, not `encode_key`: this key is
+            // applied to the tree verbatim, and a collated or TYPELESS (`any`)
+            // PK column does not encode the plain way (`keycode::KeySpec`).
+            let key = db.engine.pk_key(table, &pk_vals);
             let kh = key_hash(&key);
             let old = match r.get_by_pk(table, &pk_vals) {
                 Ok(Some(old)) => old,

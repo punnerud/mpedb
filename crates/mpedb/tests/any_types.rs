@@ -99,23 +99,59 @@ fn any_accepts_every_type_while_its_neighbour_stays_rigid() {
     }
 }
 
+/// An `any` column IS allowed in a key now — see `Schema::ANY_KEY_COLUMNS` and
+/// `tests/any_key.rs`, which verifies the semantics against sqlite 3.45.1. What
+/// this test holds is the part the schema is responsible for: such a table
+/// OPENS, and its key really is keyed by STORAGE CLASS rather than by mpedb
+/// type, which is what makes `1`/`1.0` one key and `'1'`/`x'31'` two.
 #[test]
-fn any_is_refused_in_a_key_and_in_a_unique_index() {
-    // A key is memcmp-ordered; `any` has no order across types. Refusing beats
-    // inventing whether 5 sorts before "a".
+fn any_is_allowed_in_a_key_and_keys_by_storage_class() {
     let pk = r#"[[table]]
 name = "t"
 primary_key = ["k"]
   [[table.column]]
   name = "k"
   type = "any"
+  [[table.column]]
+  name = "tag"
+  type = "text"
 "#;
-    let e = match db("pk", pk) {
-        Err(e) => e,
-        Ok(_) => panic!("an `any` primary key must be refused"),
-    };
-    assert!(format!("{e}").contains("cannot be `any`"), "got: {e}");
+    let d = db("pk", pk).expect("an `any` primary key is allowed");
+    let ins = d.prepare("INSERT INTO t (k, tag) VALUES ($1, $2)").unwrap();
+    let put = |v: Value, tag: &str| d.execute(&ins, &params![v, Value::Text(tag.into())]);
 
+    put(Value::Int(1), "int1").unwrap();
+    // The type-keyed encoder ALIASED these two (identical payload bytes, and the
+    // type is not in the encoding); the class-keyed one keeps them apart, which
+    // is the difference between two rows and one silently overwritten row.
+    put(Value::Text("1".into()), "text1").unwrap();
+    put(Value::Blob(b"1".to_vec()), "blob1").unwrap();
+    // ...and it SPLIT these, where sqlite has exactly one key.
+    assert!(put(Value::Float(1.0), "dup").is_err(), "1.0 must collide with 1");
+    put(Value::Float(-0.0), "negzero").unwrap();
+    assert!(put(Value::Int(0), "dup0").is_err(), "0 must collide with -0.0");
+
+    // Tree order is sqlite's: NULL < numbers < text < blob.
+    match d.query("SELECT tag FROM t ORDER BY k", &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => {
+            let tags: Vec<String> = rows
+                .iter()
+                .map(|r| match &r[0] {
+                    Value::Text(s) => s.clone(),
+                    o => panic!("{o:?}"),
+                })
+                .collect();
+            assert_eq!(tags, ["negzero", "int1", "text1", "blob1"]);
+        }
+        o => panic!("{o:?}"),
+    }
+}
+
+/// A UNIQUE index over `any` is allowed too, and collides exactly where
+/// sqlite's `=` does. (The full cross-engine battery lives in
+/// `tests/any_key.rs`; this pins the config/TOML declaration path.)
+#[test]
+fn any_unique_index_is_allowed_and_collides_by_class() {
     let uq = r#"[[table]]
 name = "t"
 primary_key = ["id"]
@@ -125,25 +161,27 @@ primary_key = ["id"]
   [[table.column]]
   name = "u"
   type = "any"
+  nullable = true
   unique = true
 "#;
-    let e = match db("uq", uq) {
-        Err(e) => e,
-        Ok(_) => panic!("an `any` UNIQUE column must be refused"),
-    };
-    assert!(
-        format!("{e}").contains("`any` and carry an index (UNIQUE)"),
-        "got: {e}"
-    );
+    let d = db("uq", uq).expect("an `any` UNIQUE column is allowed");
+    let ins = d.prepare("INSERT INTO t (id, u) VALUES ($1, $2)").unwrap();
+    let put = |id: i64, v: Value| d.execute(&ins, &params![id, v]);
+    put(1, Value::Int(1)).unwrap();
+    put(2, Value::Text("1".into())).unwrap();
+    put(3, Value::Blob(b"1".to_vec())).unwrap();
+    assert!(put(4, Value::Float(1.0)).is_err(), "1.0 must collide with 1");
+    // An any-NULL row has no index entry, so NULLs never collide.
+    put(5, Value::Null).unwrap();
+    put(6, Value::Null).unwrap();
 }
 
-/// A NON-unique index over `any` is refused for the same reason — the index
-/// is memcmp-ordered and `any` has no order across types. This slipped
-/// through once, and the adversarial review showed the consequence: an
-/// IndexRange over mixed runtime types returned WRONG rows, and DELETE
-/// through it deleted them.
+/// A NON-unique index over `any` is allowed as well. It is MAINTAINED and never
+/// PROBED (`planner::access` refuses a typeless access path), so its only
+/// observable effect must be none at all — pinned differentially in
+/// `tests/any_key.rs::a_typeless_index_never_changes_an_answer`.
 #[test]
-fn any_indexed_is_refused() {
+fn any_indexed_is_allowed() {
     let ix = r#"
 [[table]]
 name = "t"
@@ -154,14 +192,25 @@ primary_key = ["id"]
   [[table.column]]
   name = "u"
   type = "any"
+  nullable = true
   indexed = true
 "#;
-    let e = match db("ix", ix) {
-        Err(e) => e,
-        Ok(_) => panic!("an `any` indexed column must be refused"),
-    };
-    assert!(
-        format!("{e}").contains("`any` and carry an index (indexed)"),
-        "got: {e}"
-    );
+    let d = db("ix", ix).expect("an `any` indexed column is allowed");
+    let ins = d.prepare("INSERT INTO t (id, u) VALUES ($1, $2)").unwrap();
+    for (i, v) in [
+        Value::Int(1),
+        Value::Float(1.0),
+        Value::Text("1".into()),
+        Value::Blob(b"1".to_vec()),
+        Value::Null,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        d.execute(&ins, &params![i as i64, v]).unwrap();
+    }
+    match d.query("SELECT count(*) FROM t WHERE u = 1", &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => assert_eq!(rows[0][0], Value::Int(2)),
+        o => panic!("{o:?}"),
+    }
 }
