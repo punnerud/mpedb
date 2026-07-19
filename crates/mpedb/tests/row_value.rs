@@ -84,7 +84,7 @@ fn mpedb_rows(db: &Database, sql: &str) -> Vec<Vec<String>> {
 /// first column, so filtering blank lines cannot drop a genuine (possibly-NULL)
 /// result value.
 fn sqlite_rows(script: &str) -> Vec<Vec<String>> {
-    sqlite_oracle::script_stdout(&script, "")
+    sqlite_oracle::script_stdout(script, "")
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| l.split('|').map(str::to_string).collect())
