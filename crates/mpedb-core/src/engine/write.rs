@@ -270,7 +270,7 @@ impl<'e> WriteTxn<'e> {
         src: &mut dyn btree::BlobSource,
     ) -> Result<()> {
         self.check_write_blocked(table_id)?;
-        self.eng.validate_row(table_id, values)?;
+        self.eng.validate_row_in(&self.bundle, table_id, values)?;
         if self.eng.table_is_fts(table_id) {
             // An FTS table's inverted index needs the full column text resident
             // to tokenize; a never-resident stream cannot be indexed, so a
@@ -295,7 +295,7 @@ impl<'e> WriteTxn<'e> {
                 "streaming insert into a table with a secondary UNIQUE index".into(),
             ));
         }
-        let key = self.eng.pk_key(table_id, values)?;
+        let key = self.eng.pk_key_in(&self.bundle, table_id, values)?;
         let types = &self.bundle.col_types[table_id as usize];
         let (head, _total) =
             row::encode_row_head_for_stream(values, types, stream_col, src.len())?;
@@ -390,7 +390,7 @@ impl<'e> WriteTxn<'e> {
     pub fn insert_row(&mut self, table_id: u32, values: &[Value]) -> Result<()> {
         self.check_write_blocked(table_id)?;
         let __t = std::time::Instant::now();
-        self.eng.validate_row(table_id, values)?;
+        self.eng.validate_row_in(&self.bundle, table_id, values)?;
         leakstat::add(&leakstat::INS_NS_VALIDATE, __t.elapsed().as_nanos() as u64);
         let table = self
             .bundle
@@ -399,7 +399,7 @@ impl<'e> WriteTxn<'e> {
             .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
         let tname = table.name.clone();
         let sec = self.bundle.sec_indexes[table_id as usize].clone();
-        let key = self.eng.pk_key(table_id, values)?;
+        let key = self.eng.pk_key_in(&self.bundle, table_id, values)?;
         // #42: for a row that will SPILL, hand btree the parts instead of a
         // buffer. `encode_row` materialises the whole row — a large blob included
         // — into a fresh heap Vec whose only purpose is to be copied straight
@@ -607,14 +607,14 @@ impl<'e> WriteTxn<'e> {
     /// (enforced; the SQL layer rejects PK updates at bind time too).
     pub fn update_by_pk(&mut self, table_id: u32, new_values: &[Value]) -> Result<bool> {
         self.check_write_blocked(table_id)?;
-        self.eng.validate_row(table_id, new_values)?;
+        self.eng.validate_row_in(&self.bundle, table_id, new_values)?;
         let table = self
             .bundle
             .schema
             .table(table_id)
             .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
         let tname = table.name.clone();
-        let key = self.eng.pk_key(table_id, new_values)?;
+        let key = self.eng.pk_key_in(&self.bundle, table_id, new_values)?;
         let (root, count) = self.tree_root(table_id, 0)?;
         let Some(old_bytes) = btree::get(self, root, &key)? else {
             return Ok(false);
@@ -1283,6 +1283,45 @@ impl<'e> WriteTxn<'e> {
     /// baked in the old definition.
     pub fn bump_schema_gen(&mut self) {
         self.schema_gen_bump = true;
+    }
+
+    /// This transaction's captured schema view (one cheap Arc clone). For a
+    /// writer it starts equal to the engine's committed bundle, and moves ahead
+    /// of it only when this txn applies DDL and calls
+    /// [`reload_bundle_from_catalog`](Self::reload_bundle_from_catalog) — so a
+    /// facade session can compile and execute a statement against the exact
+    /// schema its own uncommitted DDL will commit with (#95).
+    pub fn schema_bundle(&self) -> Arc<SchemaBundle> {
+        Arc::clone(&self.bundle)
+    }
+
+    /// Rebuild this transaction's captured schema bundle from its OWN
+    /// (uncommitted) catalog pages, so a later statement in the SAME
+    /// transaction sees a DDL change this txn just applied (`create_table`,
+    /// `drop_table`, `alter_*`, `create_index`). The engine's committed bundle
+    /// and every other transaction are untouched — only THIS writer's view
+    /// moves, and it moves back automatically on abort (the change lives in
+    /// COW pages the abort discards).
+    ///
+    /// CHECK programs are compiled by the SQL facade, not here: the current
+    /// bundle's programs are carried by table position (dense in this format
+    /// window) and a freshly-created table's slot is left empty — exactly as
+    /// [`Engine::reload_schema_from_catalog`] does on a peer-DDL reload. Returns
+    /// the new bundle so the caller can compile/execute against it.
+    pub fn reload_bundle_from_catalog(&mut self) -> Result<Arc<SchemaBundle>> {
+        let root = self.catalog_root;
+        let bytes = btree::get(self, root, CAT_SCHEMA_KEY)?
+            .ok_or_else(|| Error::Corrupt("no schema stored in catalog".into()))?;
+        let schema = mpedb_types::Schema::from_canonical_bytes(&bytes)?;
+        // The gen this bundle WILL carry once this txn commits (its DDL armed
+        // `schema_gen_bump`). It never escapes this txn's lifetime; it only
+        // keeps the value distinct from the pre-DDL bundle's gen.
+        let gen = self.meta.schema_gen + 1;
+        let mut checks = self.bundle.checks.clone();
+        checks.resize(schema.tables.len(), Vec::new());
+        let bundle = Arc::new(SchemaBundle::new_at(gen, schema, checks));
+        self.bundle = Arc::clone(&bundle);
+        Ok(bundle)
     }
 
     pub fn sys_get(&mut self, subkey: &[u8]) -> Result<Option<Vec<u8>>> {
