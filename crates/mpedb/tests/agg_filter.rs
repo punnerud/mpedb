@@ -358,22 +358,29 @@ fn correlated_filter_survives_the_plan_registry() {
     }
 }
 
-/// The refusal boundary that STAYS. `FILTER (WHERE …)` runs per row, so a
-/// correlated subquery is admitted there; the SELECT list, an aggregate
-/// ARGUMENT, GROUP BY and HAVING run over a collapsed group and are still
-/// refused — CLEANLY, with a message that says why. A refusal beats a wrong
-/// answer; what must never happen is the third thing, silently dropping rows.
+/// The refusal boundary that STAYS, as #97 redrew it: PER-ROW vs PER-GROUP.
+/// `FILTER (WHERE …)`, a GROUP BY key and an aggregate ARGUMENT all run inside
+/// the row loop against that row's filled scratch, so a correlated subquery is
+/// admitted in each (`agg_correlated_perrow.rs` pins them against sqlite). A
+/// grouped SELECT-list expression that is not itself a group key, and HAVING,
+/// run over a collapsed group and are still refused — CLEANLY, with a message
+/// that says why. A refusal beats a wrong answer; what must never happen is the
+/// third thing, silently dropping rows.
 #[test]
 fn correlated_subquery_outside_filter_is_refused() {
     let d = db();
-    const EX: &str = "EXISTS (SELECT 1 FROM c WHERE c.ref = t.id)";
     for sql in [
-        // in the SELECT list of an aggregate query
+        // in the SELECT list of an aggregate query, NOT as a group key
         "SELECT count(*), (SELECT count(*) FROM c WHERE c.ref = t.id) FROM t".to_string(),
-        // as an aggregate ARGUMENT
-        "SELECT sum((SELECT count(*) FROM c WHERE c.ref = t.id)) FROM t".to_string(),
-        // as a GROUP BY key
-        format!("SELECT {EX}, count(*) FROM t GROUP BY {EX}"),
+        // …and the grouped form of the same thing
+        "SELECT t.g, count(*), (SELECT count(*) FROM c WHERE c.ref = t.id) FROM t GROUP BY t.g"
+            .to_string(),
+        // the SAME subquery spelled out in both the select list and the GROUP
+        // BY lifts TWICE, into two slots, so the item is not recognised as the
+        // key and the projection would read an unfilled hole.
+        "SELECT EXISTS (SELECT 1 FROM c WHERE c.ref = t.id), count(*) FROM t \
+         GROUP BY EXISTS (SELECT 1 FROM c WHERE c.ref = t.id)"
+            .to_string(),
     ] {
         let err = d
             .query(&sql, &[])

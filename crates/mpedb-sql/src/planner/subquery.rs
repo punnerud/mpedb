@@ -160,9 +160,25 @@ pub(super) fn lift_subqueries<'a>(
             ),
         },
         where_clause: s.where_clause.as_ref().map(|e| lift.rewrite(e)).transpose()?,
-        // GROUP BY keys must BE columns (the aggregate planner's rule) — a
-        // subquery there could never plan; leave it to error naturally.
-        group_by: s.group_by.clone(),
+        // GROUP BY keys lift like any other clause (#97). A key is computed PER
+        // ROW in `exec_aggregate`'s loop, against that row's filled scratch, so
+        // both an uncorrelated subquery (filled once, before dispatch) and a
+        // correlated one (filled per row) are meaningful there. An ordinal
+        // (`GROUP BY 1`) is a literal and rewrites to itself, so the
+        // select-item/key AST match `lift_aggs` performs is unaffected.
+        //
+        // NOTE the one shape this deliberately does NOT unify: writing the SAME
+        // subquery in both the select list and the GROUP BY (`SELECT (S), … GROUP
+        // BY (S)`) lifts it TWICE, into two distinct slots, so `lift_aggs`'s AST
+        // match sees `Param(0)` vs `Param(1)`, the item is not recognised as the
+        // key, and it is refused as a grouped projection reading a correlated
+        // slot. A clean refusal — and `GROUP BY 1`, which every ORM emits, takes
+        // the matching path.
+        group_by: s
+            .group_by
+            .iter()
+            .map(|e| lift.rewrite(e))
+            .collect::<Result<_>>()?,
         having: match &s.having {
             // HAVING runs over the grouped tuple inside the aggregate phase,
             // where per-row slot filling cannot reach.

@@ -217,10 +217,12 @@ SELECT count(*) FROM t1 WHERE (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b) >=
 
 # ---- refusals say what and why -----------------------------------------------------------
 
-# A correlated subquery in an aggregate query is admitted ONLY in WHERE: in the
-# SELECT list (here), an aggregate argument, GROUP BY or HAVING it has no single
-# value once the rows are grouped.
-statement error only supported in WHERE
+# A correlated subquery in an aggregate query is admitted in every PER-ROW
+# position (#97): the WHERE, a GROUP BY key, an aggregate argument, an
+# aggregate's FILTER. It is refused in the two PER-GROUP ones — HAVING, and a
+# SELECT-list expression (here) that is not itself a GROUP BY key — which run
+# after the collapse, where no single row's correlation applies.
+statement error evaluated PER ROW
 SELECT count(*), (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b) FROM t1
 
 # Uncorrelated nested subqueries are now supported (#73 §3 stage 1) — the inner
