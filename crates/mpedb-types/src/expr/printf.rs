@@ -179,6 +179,40 @@ pub(crate) fn float_to_text(r: f64) -> Vec<u8> {
     render_float(r, FloatKind::Generic, &mut prec, false, true, 0, false, false)
 }
 
+/// sqlite's `sqlite3QuoteValue` REAL rendering: `%!.15g`, handed back to
+/// `sqlite3AtoF` and — when the double does NOT come back bit-identical —
+/// re-rendered as `%!.20e` so the literal round-trips. `CAST(0.1+0.2 AS TEXT)`
+/// is `0.3`; `quote(0.1+0.2)` takes the second branch.
+///
+/// `None` means "that second branch, and mpedb will not guess it". The reason
+/// is in sqlite's own `sqlite3FpDecode`: it has TWO implementations, chosen at
+/// startup by `sqlite3Config.bUseLongDouble` (`hasHighPrecisionDouble()`).
+/// A build whose `long double` is wider than 8 bytes AND works — x86-64 — scales
+/// the value with 80-bit arithmetic and hands back **18** significant digits;
+/// a build without one (macOS/Apple Silicon, where `long double == double`)
+/// takes the Dekker double-double path this module ports and lands on **19**,
+/// with a different final digit. At `%!.15g` the two agree, because 15 digits
+/// is inside the region both compute identically. At `%!.20e` they do not:
+/// x86-64 sqlite prints `quote(0.1+0.2)` as `3.00000000000000044e-01`, and the
+/// digits past the 15th are an artifact of ~18 chained `× 10` roundings in a
+/// register format Rust cannot even name — not something a second decimal
+/// algorithm can reproduce, and not something two sqlite builds agree on.
+///
+/// So `quote()` is byte-exact on the branch that IS well defined and refuses,
+/// by name and with the value, on the branch that is not.
+///
+/// A non-finite value is NOT refused: `%!.15g` of an infinity is the renderer's
+/// platform-independent special case (`Inf` / `-Inf`), and sqlite's `%!.20e`
+/// fallback prints the same word, so both branches agree.
+pub(crate) fn quote_float(r: f64) -> Option<Vec<u8>> {
+    let short = float_to_text(r);
+    if !r.is_finite() || atof(&short) == r {
+        Some(short)
+    } else {
+        None
+    }
+}
+
 // ---- FpDecode (double-double path) ---------------------------------------
 
 /// Decoded floating-point value: sign, the significant decimal digits (ASCII),

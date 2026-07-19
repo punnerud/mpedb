@@ -12,6 +12,7 @@ use crate::value::{Affinity, Collation, Value};
 use std::cmp::Ordering;
 
 mod codec;
+mod datetime;
 mod ops;
 mod printf;
 mod scalar;
