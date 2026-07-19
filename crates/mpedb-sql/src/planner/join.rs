@@ -181,6 +181,7 @@ pub(super) fn plan_join_select<'s>(
     n_params: u16,
     catalog: &PolicyCatalog,
     mode: BareGroupBy,
+    host_udfs: &HostUdfSet,
     consts: &mut Vec<Value>,
     subplans: Vec<SubPlan>,
     slot_types: Vec<Ty>,
@@ -243,6 +244,7 @@ pub(super) fn plan_join_select<'s>(
     // ON/WHERE conjunct across the join follows the database's LIKE strictness.
     let mut ob = Binder::new(outer, eff_params, true);
     ob.set_dialect(mode);
+    ob.set_host_udfs(host_udfs);
     for (i, ty) in slot_types.iter().enumerate() {
         ob.pin_param(n_params + i as u16, *ty);
     }

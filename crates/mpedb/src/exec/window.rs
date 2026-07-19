@@ -62,7 +62,9 @@ pub(super) fn exec_select_windowed(
                     .get(*i as usize)
                     .cloned()
                     .ok_or_else(|| internal("window projection column"))?,
-                Projection::Expr { program, .. } => program.eval(row, params)?,
+                Projection::Expr { program, .. } => {
+                    program.eval_host(row, params, ctx.host_fns())?
+                }
             });
         }
         if sp.distinct && !seen.insert(keycode::encode_key(&orow)) {

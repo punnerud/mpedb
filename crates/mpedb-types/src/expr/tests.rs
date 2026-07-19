@@ -4,6 +4,67 @@ fn prog(instrs: Vec<Instr>, consts: Vec<Value>) -> ExprProgram {
     ExprProgram::new(instrs, consts).unwrap()
 }
 
+/// A trivial [`HostFns`] for the `HostCall` tests: `plus1(x)=x+1`, everything
+/// else is an unknown-function error (the defensive path).
+struct TestHost;
+impl HostFns for TestHost {
+    fn call(&self, name: &str, args: &[Value]) -> Result<Value> {
+        match (name, args) {
+            ("plus1", [Value::Int(x)]) => Ok(Value::Int(x + 1)),
+            _ => Err(Error::Internal(format!("no host fn {name}/{}", args.len()))),
+        }
+    }
+}
+
+#[test]
+fn host_call_dispatches_codec_roundtrips_and_needs_a_resolver() {
+    // `plus1($1)` — name in the const pool, one stack argument.
+    let p = prog(
+        vec![
+            Instr::PushParam(0),
+            Instr::HostCall(0, 1),
+        ],
+        vec![Value::Text("plus1".into())],
+    );
+    // With a resolver in scope the closure runs.
+    let host = TestHost;
+    assert_eq!(
+        p.eval_host(&[], &[Value::Int(41)], Some(&host)).unwrap(),
+        Value::Int(42)
+    );
+    // With NO resolver, the opcode errors defensively rather than panicking —
+    // the executor only reaches this program on the host-aware path.
+    assert!(matches!(p.eval(&[], &[Value::Int(1)]), Err(Error::Internal(_))));
+    // An unregistered name/arity surfaces the resolver's error, not a panic.
+    let q = prog(
+        vec![Instr::PushParam(0), Instr::HostCall(0, 1)],
+        vec![Value::Text("nope".into())],
+    );
+    assert!(q.eval_host(&[], &[Value::Int(1)], Some(&host)).is_err());
+
+    // codec: roundtrip + truncation safety (repo rule: Corrupt, never panic).
+    let mut buf = Vec::new();
+    p.encode_into(&mut buf);
+    let mut pos = 0;
+    assert_eq!(ExprProgram::decode(&buf, &mut pos).unwrap(), p);
+    assert_eq!(pos, buf.len());
+    for cut in 0..buf.len() {
+        let _ = ExprProgram::decode(&buf[..cut], &mut 0); // must not panic
+    }
+    // A name index past the const pool is Corrupt at construction, never a
+    // panic at eval.
+    assert!(matches!(
+        ExprProgram::new(vec![Instr::PushParam(0), Instr::HostCall(9, 1)], vec![Value::Text("x".into())]),
+        Err(Error::Corrupt(_))
+    ));
+    // A non-text name constant is Corrupt at eval (hostile-blob defense).
+    let bad = prog(vec![Instr::PushParam(0), Instr::HostCall(0, 1)], vec![Value::Int(7)]);
+    assert!(matches!(
+        bad.eval_host(&[], &[Value::Int(1)], Some(&host)),
+        Err(Error::Corrupt(_))
+    ));
+}
+
 #[test]
 fn check_constraint_age_range() {
     // age >= 0 AND age < 200

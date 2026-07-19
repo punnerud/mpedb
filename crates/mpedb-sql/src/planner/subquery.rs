@@ -95,13 +95,14 @@ fn stmt_scope<'s>(schema: &'s Schema, s: &ast::SelectStmt) -> Result<Scope<'s>> 
 /// subplan result slots are allocated at `n_params + i` (the binder is later
 /// created with `n_params + subplans.len()` slots, and context slots append
 /// after — the `[user ‖ sub ‖ context]` layout).
-pub(super) fn lift_subqueries(
+pub(super) fn lift_subqueries<'a>(
     s: &ast::SelectStmt,
-    schema: &Schema,
+    schema: &'a Schema,
     n_params: u16,
-    catalog: &PolicyCatalog,
+    catalog: &'a PolicyCatalog,
     mode: BareGroupBy,
-    consts: &mut Vec<Value>,
+    host_udfs: &'a HostUdfSet,
+    consts: &'a mut Vec<Value>,
 ) -> Result<Lifted> {
     // The OUTER scope, for correlation: the same `[table0 ‖ … ‖ tableN]`
     // tuple the outer statement's own expressions bind over. FROM-less outer:
@@ -114,6 +115,7 @@ pub(super) fn lift_subqueries(
         n_params,
         catalog,
         mode,
+        host_udfs,
         consts,
         outer_scope,
         subplans: Vec::new(),
@@ -193,6 +195,9 @@ struct Lift<'a> {
     /// GROUP BY strictness dialect (COMPAT.md), carried so a subquery's own
     /// aggregate is planned under the SAME mode as the outer statement.
     mode: BareGroupBy,
+    /// Host-registered scalar UDFs (design/DESIGN-UDF.md), carried so a subquery
+    /// can call the same UDFs as the outer statement.
+    host_udfs: &'a HostUdfSet,
     consts: &'a mut Vec<Value>,
     outer_scope: Scope<'a>,
     subplans: Vec<SubPlan>,
@@ -327,7 +332,7 @@ impl Lift<'_> {
     /// per execute.
     fn plan_one_compound(&mut self, cs: &ast::CompoundStmt, kind: SubPlanKind) -> Result<u16> {
         let (stmt, _ptypes, ctx, _lists, out, subs) =
-            plan_compound(cs, self.schema, self.n_params, self.catalog, self.mode, self.consts)?;
+            plan_compound(cs, self.schema, self.n_params, self.catalog, self.mode, self.host_udfs, self.consts)?;
         if !ctx.is_empty() {
             return Err(bind_err(
                 "current_setting() inside a subquery is not supported yet",
@@ -439,7 +444,7 @@ impl Lift<'_> {
         // reserved-slot layouts would have to be reconciled across levels).
         let inner_n = self.n_params + outer_args.len() as u16;
         let (stmt, inner_ptypes, inner_ctx, _inner_lists, inner_out, inner_subs) =
-            plan_select(&rewritten, self.schema, inner_n, self.catalog, self.mode, self.consts, None)?;
+            plan_select(&rewritten, self.schema, inner_n, self.catalog, self.mode, self.host_udfs, self.consts, None)?;
         // #73 §3 stage 3: a nested subquery may correlate to its IMMEDIATE
         // parent (stage 2), to a MIDDLE scope, or to the OUTERMOST scope. A
         // reference to a non-immediate ancestor was captured above as a TRANSIT
@@ -849,7 +854,7 @@ fn refs_correlated(b: &BExpr, sub_base: u16, correlated: &[bool]) -> bool {
                 .as_deref()
                 .is_some_and(|e| refs_correlated(e, sub_base, correlated))
         }
-        BExpr::Call(_, xs) | BExpr::Coalesce(xs) => {
+        BExpr::Call(_, xs) | BExpr::Coalesce(xs) | BExpr::HostCall { args: xs, .. } => {
             xs.iter().any(|x| refs_correlated(x, sub_base, correlated))
         }
     }

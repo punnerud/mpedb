@@ -598,6 +598,246 @@ fn version_and_alloc() {
     }
 }
 
+// ---- host scalar UDFs (design/DESIGN-UDF.md stage 1) ----------------------
+
+/// `plus1(x) = x + 1` — the integer round trip through `sqlite3_value_int64`
+/// and `sqlite3_result_int64`.
+unsafe extern "C" fn udf_plus1(ctx: *mut c_void, argc: c_int, argv: *mut *mut c_void) {
+    assert_eq!(argc, 1);
+    let x = sqlite3_value_int64(*argv);
+    sqlite3_result_int64(ctx, x + 1);
+}
+
+/// `addk(x, k) = x + k` — a 2-argument function reading both `argv` slots.
+unsafe extern "C" fn udf_addk(ctx: *mut c_void, argc: c_int, argv: *mut *mut c_void) {
+    assert_eq!(argc, 2);
+    let x = sqlite3_value_int64(*argv);
+    let k = sqlite3_value_int64(*argv.offset(1));
+    sqlite3_result_int64(ctx, x + k);
+}
+
+/// `shout(s)` — uppercases text, exercising `sqlite3_value_text`/`_bytes` in
+/// and `sqlite3_result_text` out.
+unsafe extern "C" fn udf_shout(ctx: *mut c_void, argc: c_int, argv: *mut *mut c_void) {
+    assert_eq!(argc, 1);
+    assert_eq!(sqlite3_value_type(*argv), SQLITE_TEXT);
+    let p = sqlite3_value_text(*argv);
+    let n = sqlite3_value_bytes(*argv);
+    let bytes = std::slice::from_raw_parts(p, n as usize);
+    let up = String::from_utf8_lossy(bytes).to_uppercase();
+    let c = cs(&up);
+    sqlite3_result_text(ctx, c.as_ptr(), -1, sqlite_transient());
+}
+
+/// A UDF that reports `pApp` back through `sqlite3_user_data`, proving the
+/// registration's application pointer reaches the callback.
+unsafe extern "C" fn udf_appval(ctx: *mut c_void, _argc: c_int, _argv: *mut *mut c_void) {
+    let p = sqlite3_user_data(ctx) as usize;
+    sqlite3_result_int64(ctx, p as i64);
+}
+
+/// A UDF that always raises, to check `sqlite3_result_error` surfaces as a
+/// statement error rather than a silent NULL.
+unsafe extern "C" fn udf_boom(ctx: *mut c_void, _argc: c_int, _argv: *mut *mut c_void) {
+    let m = cs("boom from the host");
+    sqlite3_result_error(ctx, m.as_ptr(), -1);
+}
+
+fn fnptr(f: unsafe extern "C" fn(*mut c_void, c_int, *mut *mut c_void)) -> *mut c_void {
+    f as *const () as *mut c_void
+}
+
+#[test]
+fn create_function_scalar_dispatch() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(
+            exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"),
+            SQLITE_OK
+        );
+        assert_eq!(
+            exec(db, "INSERT INTO t (id, name) VALUES (1,'ann'),(2,'bo'),(3,'cy')"),
+            SQLITE_OK
+        );
+
+        // An unregistered function is a prepare-time error.
+        let mut st: *mut Stmt = ptr::null_mut();
+        let bad = cs("SELECT plus1(id) FROM t");
+        assert_ne!(
+            sqlite3_prepare_v2(db, bad.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_OK,
+            "an unregistered function must not prepare"
+        );
+
+        // Register the scalars. `_v2` and the older arity share one impl.
+        assert_eq!(
+            sqlite3_create_function_v2(
+                db,
+                cs("plus1").as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                fnptr(udf_plus1),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3_create_function(
+                db,
+                cs("addk").as_ptr(),
+                2,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                fnptr(udf_addk),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3_create_function_v2(
+                db,
+                cs("shout").as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                fnptr(udf_shout),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+
+        // 1. In the SELECT list.
+        let mut q: *mut Stmt = ptr::null_mut();
+        let qs = cs("SELECT plus1(id) FROM t ORDER BY id");
+        assert_eq!(
+            sqlite3_prepare_v2(db, qs.as_ptr(), -1, &mut q, ptr::null_mut()),
+            SQLITE_OK
+        );
+        let mut got = Vec::new();
+        while sqlite3_step(q) == SQLITE_ROW {
+            got.push(sqlite3_column_int64(q, 0));
+        }
+        assert_eq!(got, vec![2, 3, 4]);
+        sqlite3_finalize(q);
+
+        // 2. In the WHERE clause.
+        assert_eq!(scalar_count(db, "SELECT id FROM t WHERE plus1(id) = 3"), 2);
+
+        // 3. With a bound parameter.
+        let mut p: *mut Stmt = ptr::null_mut();
+        let ps = cs("SELECT addk(id, ?) FROM t WHERE id = 2");
+        assert_eq!(
+            sqlite3_prepare_v2(db, ps.as_ptr(), -1, &mut p, ptr::null_mut()),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_bind_int(p, 1, 40), SQLITE_OK);
+        assert_eq!(sqlite3_step(p), SQLITE_ROW);
+        assert_eq!(sqlite3_column_int64(p, 0), 42);
+        sqlite3_finalize(p);
+
+        // 4. A text function, round-tripping value_text -> result_text.
+        let mut s: *mut Stmt = ptr::null_mut();
+        let ss = cs("SELECT shout(name) FROM t ORDER BY id");
+        assert_eq!(
+            sqlite3_prepare_v2(db, ss.as_ptr(), -1, &mut s, ptr::null_mut()),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_step(s), SQLITE_ROW);
+        assert_eq!(col_text(s, 0), "ANN");
+        sqlite3_finalize(s);
+
+        // 5. `sqlite3_user_data` hands the registration's pApp to the callback.
+        let app = 0x5eed_usize as *mut c_void;
+        assert_eq!(
+            sqlite3_create_function_v2(
+                db,
+                cs("appval").as_ptr(),
+                0,
+                SQLITE_UTF8,
+                app,
+                fnptr(udf_appval),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(scalar_count(db, "SELECT appval()"), 0x5eed);
+
+        // 6. `sqlite3_result_error` surfaces as a statement error.
+        assert_eq!(
+            sqlite3_create_function_v2(
+                db,
+                cs("boom").as_ptr(),
+                0,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                fnptr(udf_boom),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+        let mut b: *mut Stmt = ptr::null_mut();
+        let bs = cs("SELECT boom()");
+        assert_eq!(
+            sqlite3_prepare_v2(db, bs.as_ptr(), -1, &mut b, ptr::null_mut()),
+            SQLITE_OK
+        );
+        assert_ne!(sqlite3_step(b), SQLITE_ROW, "a raising UDF must not yield a row");
+        sqlite3_finalize(b);
+
+        // 7. An AGGREGATE registration refuses cleanly (stage 1 = scalar only).
+        assert_eq!(
+            sqlite3_create_function_v2(
+                db,
+                cs("myagg").as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                fnptr(udf_plus1), // xStep present => aggregate
+                fnptr(udf_plus1), // xFinal present
+                ptr::null_mut(),
+            ),
+            SQLITE_ERROR,
+            "aggregate UDFs are stage 2 and must refuse"
+        );
+
+        // 8. xFunc == NULL deletes the registration: the name is unknown again.
+        assert_eq!(
+            sqlite3_create_function_v2(
+                db,
+                cs("plus1").as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+        let mut g: *mut Stmt = ptr::null_mut();
+        let gs = cs("SELECT plus1(id) FROM t");
+        assert_ne!(
+            sqlite3_prepare_v2(db, gs.as_ptr(), -1, &mut g, ptr::null_mut()),
+            SQLITE_OK,
+            "a deleted function must be unknown again"
+        );
+
+        sqlite3_close(db);
+    }
+}
+
 // ---- helpers -------------------------------------------------------------
 
 fn sqlite_transient() -> *mut c_void {
