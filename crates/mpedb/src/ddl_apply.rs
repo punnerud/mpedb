@@ -140,6 +140,232 @@ fn coerce_default(
     Ok(v)
 }
 
+/// Translate a parsed `CREATE TABLE` spec into a [`TableDef`] (resolve the PK
+/// form, derive column nullability, build the UNIQUE indexes). Pure — no
+/// catalog access — so the autocommit facade and an in-transaction
+/// [`WriteSession`](crate::WriteSession) build the identical `TableDef` from one
+/// code path (#95). The engine's `create_table` assigns the id and validates
+/// the merged schema.
+pub(crate) fn table_def_from_spec(
+    spec: mpedb_sql::CreateTableSpec,
+) -> Result<mpedb_types::TableDef> {
+    // Resolve the PK: exactly one declaration form.
+    let inline_pk: Vec<&str> = spec
+        .columns
+        .iter()
+        .filter(|c| c.pk)
+        .map(|c| c.name.as_str())
+        .collect();
+    let pk_names: Vec<String> = match (inline_pk.is_empty(), spec.table_pk.is_empty()) {
+        (false, true) => {
+            // Multiple inline `PRIMARY KEY` columns is almost always a
+            // typo, not an intended composite key — sqlite and
+            // PostgreSQL both hard-refuse it. A composite PK must be
+            // declared once at table level: `PRIMARY KEY (a, b)`.
+            if inline_pk.len() > 1 {
+                return Err(Error::Bind(format!(
+                    "CREATE TABLE {}: more than one column marked PRIMARY KEY \
+                     ({}) — for a composite key write `PRIMARY KEY ({})` at \
+                     table level",
+                    spec.name,
+                    inline_pk.join(", "),
+                    inline_pk.join(", ")
+                )));
+            }
+            inline_pk.iter().map(|s| s.to_string()).collect()
+        }
+        (true, false) => spec.table_pk.clone(),
+        (true, true) => {
+            return Err(Error::Bind(format!(
+                "CREATE TABLE {}: no PRIMARY KEY declared (mpedb requires one)",
+                spec.name
+            )))
+        }
+        (false, false) => {
+            return Err(Error::Bind(format!(
+                "CREATE TABLE {}: PRIMARY KEY declared both inline and at table \
+                 level — pick one",
+                spec.name
+            )))
+        }
+    };
+    let col_index = |name: &str| -> Result<u16> {
+        spec.columns
+            .iter()
+            .position(|c| c.name == name)
+            .map(|i| i as u16)
+            .ok_or_else(|| {
+                Error::Bind(format!(
+                    "CREATE TABLE {}: unknown column `{name}` in key list",
+                    spec.name
+                ))
+            })
+    };
+    let primary_key = pk_names
+        .iter()
+        .map(|n| col_index(n))
+        .collect::<Result<Vec<u16>>>()?;
+    let columns = spec
+        .columns
+        .iter()
+        .map(|c| mpedb_types::ColumnDef {
+            name: c.name.clone(),
+            ty: c.ty,
+            // PK columns are implicitly NOT NULL, as in the config path.
+            nullable: !c.not_null && !pk_names.iter().any(|p| p == &c.name),
+            unique: c.unique,
+            indexed: false,
+            default: None,
+            check: None,
+        })
+        .collect();
+    let indexes = spec
+        .uniques
+        .iter()
+        .map(|group| {
+            Ok(mpedb_types::IndexDef {
+                columns: group
+                    .iter()
+                    .map(|n| col_index(n))
+                    .collect::<Result<Vec<u16>>>()?,
+                unique: true,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(mpedb_types::TableDef {
+        id: 0, // assigned by Schema::with_added_table (lowest free)
+        name: spec.name,
+        columns,
+        primary_key,
+        indexes,
+        dead: false,
+        kind: mpedb_types::TableKind::Standard,
+    })
+}
+
+/// Reserved-name checks + [`TableDef`] construction for `CREATE VIRTUAL TABLE …
+/// USING fts5(…)`, shared by the autocommit facade and an in-transaction
+/// session. The caller does the existence / `IF NOT EXISTS` check against its
+/// own schema view first.
+pub(crate) fn virtual_table_def_from_spec(
+    spec: mpedb_sql::CreateVirtualTableSpec,
+) -> Result<mpedb_types::TableDef> {
+    let mkcol = |name: &str, ty, nullable| mpedb_types::ColumnDef {
+        name: name.to_string(),
+        ty,
+        nullable,
+        unique: false,
+        indexed: false,
+        default: None,
+        check: None,
+    };
+    // `rowid` and `rank` are reserved fts5 column names; a declared column
+    // named for the table would shadow the whole-row `MATCH` operand.
+    for c in &spec.columns {
+        let lc = c.to_ascii_lowercase();
+        if lc == "rowid" || lc == "rank" {
+            return Err(Error::Bind(format!("`{c}` is a reserved fts5 column name")));
+        }
+        if c.eq_ignore_ascii_case(&spec.name) {
+            return Err(Error::Bind(format!(
+                "an fts5 column may not share the table name `{}`",
+                spec.name
+            )));
+        }
+    }
+    let mut columns = vec![mkcol("rowid", mpedb_types::ColumnType::Int64, false)];
+    for c in &spec.columns {
+        columns.push(mkcol(c, mpedb_types::ColumnType::Text, true));
+    }
+    Ok(mpedb_types::TableDef {
+        id: 0,
+        name: spec.name.clone(),
+        columns,
+        primary_key: vec![0],
+        indexes: Vec::new(),
+        dead: false,
+        kind: mpedb_types::TableKind::Fts { tokenizer: spec.tokenizer },
+    })
+}
+
+/// Type-check an `ALTER TABLE … ADD COLUMN` spec and produce the
+/// [`ColumnDef`](mpedb_types::ColumnDef) plus the fill value seeded into every
+/// existing row (`Value::Null` when there is no default). Shared by the
+/// autocommit facade and an in-transaction session (#95).
+pub(crate) fn add_column_from_spec(
+    table: &str,
+    spec: mpedb_sql::CreateColumnSpec,
+) -> Result<(mpedb_types::ColumnDef, Value)> {
+    use mpedb_types::DefaultExpr;
+    if spec.unique || spec.pk {
+        return Err(Error::Bind(format!(
+            "ALTER TABLE {table} ADD COLUMN {}: UNIQUE / PRIMARY KEY on ADD is not \
+             supported (would need an online index build) — sqlite refuses these too",
+            spec.name
+        )));
+    }
+    // Resolve + type-check the DEFAULT const against the column type. The
+    // fill value seeds every existing row (NULL when there is no default).
+    let fill = match spec.default {
+        Some(DefaultExpr::Const(v)) => coerce_default(v, spec.ty, table, &spec.name)?,
+        // The ADD-COLUMN parser only ever emits a Const literal (no now()).
+        Some(DefaultExpr::Now) => {
+            return Err(Error::Bind(format!(
+                "ALTER TABLE {table} ADD COLUMN {}: now() is not a constant default \
+                 (sqlite refuses a non-constant ADD-COLUMN default)",
+                spec.name
+            )))
+        }
+        None => Value::Null,
+    };
+    if spec.not_null && fill.is_null() {
+        return Err(Error::Bind(format!(
+            "ALTER TABLE {table} ADD COLUMN {}: a NOT NULL column needs a non-NULL \
+             DEFAULT to fill existing rows (matches sqlite: \"Cannot add a NOT NULL \
+             column with default value NULL\")",
+            spec.name
+        )));
+    }
+    // A NULL fill is indistinguishable from "no default" for a nullable
+    // column — do not persist a redundant NULL default.
+    let default = if fill.is_null() {
+        None
+    } else {
+        Some(DefaultExpr::Const(fill.clone()))
+    };
+    let col = mpedb_types::ColumnDef {
+        name: spec.name,
+        ty: spec.ty,
+        nullable: !spec.not_null,
+        unique: false,
+        indexed: false,
+        default,
+        check: None,
+    };
+    Ok((col, fill))
+}
+
+/// Resolve `CREATE INDEX` column names to ordinals against `t`. Shared by the
+/// autocommit facade and an in-transaction session (#95).
+pub(crate) fn resolve_index_columns(
+    t: &mpedb_types::TableDef,
+    table: &str,
+    columns: &[String],
+) -> Result<Vec<u16>> {
+    columns
+        .iter()
+        .map(|name| {
+            t.columns
+                .iter()
+                .position(|c| &c.name == name)
+                .map(|i| i as u16)
+                .ok_or_else(|| {
+                    Error::Bind(format!("CREATE INDEX on `{table}`: no column `{name}`"))
+                })
+        })
+        .collect()
+}
+
 impl Database {
     /// `CREATE TABLE` (#47 stage 2/3): build the [`TableDef`] from the parsed
     /// spec, append it to the schema in one catalog commit (the engine
@@ -147,98 +373,7 @@ impl Database {
     /// process's schema bundle and drop the local plan cache. Other processes
     /// reload at their next transaction via the schema-gen bump.
     pub(crate) fn apply_create_table(&self, spec: mpedb_sql::CreateTableSpec) -> Result<ExecResult> {
-        // Resolve the PK: exactly one declaration form.
-        let inline_pk: Vec<&str> = spec
-            .columns
-            .iter()
-            .filter(|c| c.pk)
-            .map(|c| c.name.as_str())
-            .collect();
-        let pk_names: Vec<String> = match (inline_pk.is_empty(), spec.table_pk.is_empty()) {
-            (false, true) => {
-                // Multiple inline `PRIMARY KEY` columns is almost always a
-                // typo, not an intended composite key — sqlite and
-                // PostgreSQL both hard-refuse it. A composite PK must be
-                // declared once at table level: `PRIMARY KEY (a, b)`.
-                if inline_pk.len() > 1 {
-                    return Err(Error::Bind(format!(
-                        "CREATE TABLE {}: more than one column marked PRIMARY KEY \
-                         ({}) — for a composite key write `PRIMARY KEY ({})` at \
-                         table level",
-                        spec.name,
-                        inline_pk.join(", "),
-                        inline_pk.join(", ")
-                    )));
-                }
-                inline_pk.iter().map(|s| s.to_string()).collect()
-            }
-            (true, false) => spec.table_pk.clone(),
-            (true, true) => {
-                return Err(Error::Bind(format!(
-                    "CREATE TABLE {}: no PRIMARY KEY declared (mpedb requires one)",
-                    spec.name
-                )))
-            }
-            (false, false) => {
-                return Err(Error::Bind(format!(
-                    "CREATE TABLE {}: PRIMARY KEY declared both inline and at table \
-                     level — pick one",
-                    spec.name
-                )))
-            }
-        };
-        let col_index = |name: &str| -> Result<u16> {
-            spec.columns
-                .iter()
-                .position(|c| c.name == name)
-                .map(|i| i as u16)
-                .ok_or_else(|| {
-                    Error::Bind(format!(
-                        "CREATE TABLE {}: unknown column `{name}` in key list",
-                        spec.name
-                    ))
-                })
-        };
-        let primary_key = pk_names
-            .iter()
-            .map(|n| col_index(n))
-            .collect::<Result<Vec<u16>>>()?;
-        let columns = spec
-            .columns
-            .iter()
-            .map(|c| mpedb_types::ColumnDef {
-                name: c.name.clone(),
-                ty: c.ty,
-                // PK columns are implicitly NOT NULL, as in the config path.
-                nullable: !c.not_null && !pk_names.iter().any(|p| p == &c.name),
-                unique: c.unique,
-                indexed: false,
-                default: None,
-                check: None,
-            })
-            .collect();
-        let indexes = spec
-            .uniques
-            .iter()
-            .map(|group| {
-                Ok(mpedb_types::IndexDef {
-                    columns: group
-                        .iter()
-                        .map(|n| col_index(n))
-                        .collect::<Result<Vec<u16>>>()?,
-                    unique: true,
-                })
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let def = mpedb_types::TableDef {
-            id: 0, // assigned by Schema::with_added_table (lowest free)
-            name: spec.name,
-            columns,
-            primary_key,
-            indexes,
-            dead: false,
-            kind: mpedb_types::TableKind::Standard,
-        };
+        let def = table_def_from_spec(spec)?;
         let mut w = self.engine.begin_write()?;
         match w.create_table(def) {
             Ok(_tid) => w.commit()?,
@@ -267,44 +402,6 @@ impl Database {
         &self,
         spec: mpedb_sql::CreateVirtualTableSpec,
     ) -> Result<ExecResult> {
-        let mkcol = |name: &str, ty, nullable| mpedb_types::ColumnDef {
-            name: name.to_string(),
-            ty,
-            nullable,
-            unique: false,
-            indexed: false,
-            default: None,
-            check: None,
-        };
-        // `rowid` and `rank` are reserved fts5 column names; a declared column
-        // named for the table would shadow the whole-row `MATCH` operand.
-        for c in &spec.columns {
-            let lc = c.to_ascii_lowercase();
-            if lc == "rowid" || lc == "rank" {
-                return Err(Error::Bind(format!(
-                    "`{c}` is a reserved fts5 column name"
-                )));
-            }
-            if c.eq_ignore_ascii_case(&spec.name) {
-                return Err(Error::Bind(format!(
-                    "an fts5 column may not share the table name `{}`",
-                    spec.name
-                )));
-            }
-        }
-        let mut columns = vec![mkcol("rowid", mpedb_types::ColumnType::Int64, false)];
-        for c in &spec.columns {
-            columns.push(mkcol(c, mpedb_types::ColumnType::Text, true));
-        }
-        let def = mpedb_types::TableDef {
-            id: 0,
-            name: spec.name.clone(),
-            columns,
-            primary_key: vec![0],
-            indexes: Vec::new(),
-            dead: false,
-            kind: mpedb_types::TableKind::Fts { tokenizer: spec.tokenizer },
-        };
         self.engine.refresh_schema_if_stale()?;
         if self.engine.schema().schema.table_id(&spec.name).is_some() {
             if spec.if_not_exists {
@@ -315,6 +412,7 @@ impl Database {
                 spec.name
             )));
         }
+        let def = virtual_table_def_from_spec(spec)?;
         let mut w = self.engine.begin_write()?;
         match w.create_table(def) {
             Ok(_tid) => w.commit()?,
@@ -407,52 +505,7 @@ impl Database {
         table: &str,
         spec: mpedb_sql::CreateColumnSpec,
     ) -> Result<ExecResult> {
-        use mpedb_types::DefaultExpr;
-        if spec.unique || spec.pk {
-            return Err(Error::Bind(format!(
-                "ALTER TABLE {table} ADD COLUMN {}: UNIQUE / PRIMARY KEY on ADD is not \
-                 supported (would need an online index build) — sqlite refuses these too",
-                spec.name
-            )));
-        }
-        // Resolve + type-check the DEFAULT const against the column type. The
-        // fill value seeds every existing row (NULL when there is no default).
-        let fill = match spec.default {
-            Some(DefaultExpr::Const(v)) => coerce_default(v, spec.ty, table, &spec.name)?,
-            // The ADD-COLUMN parser only ever emits a Const literal (no now()).
-            Some(DefaultExpr::Now) => {
-                return Err(Error::Bind(format!(
-                    "ALTER TABLE {table} ADD COLUMN {}: now() is not a constant default \
-                     (sqlite refuses a non-constant ADD-COLUMN default)",
-                    spec.name
-                )))
-            }
-            None => Value::Null,
-        };
-        if spec.not_null && fill.is_null() {
-            return Err(Error::Bind(format!(
-                "ALTER TABLE {table} ADD COLUMN {}: a NOT NULL column needs a non-NULL \
-                 DEFAULT to fill existing rows (matches sqlite: \"Cannot add a NOT NULL \
-                 column with default value NULL\")",
-                spec.name
-            )));
-        }
-        // A NULL fill is indistinguishable from "no default" for a nullable
-        // column — do not persist a redundant NULL default.
-        let default = if fill.is_null() {
-            None
-        } else {
-            Some(DefaultExpr::Const(fill.clone()))
-        };
-        let col = mpedb_types::ColumnDef {
-            name: spec.name,
-            ty: spec.ty,
-            nullable: !spec.not_null,
-            unique: false,
-            indexed: false,
-            default,
-            check: None,
-        };
+        let (col, fill) = add_column_from_spec(table, spec)?;
         self.engine.refresh_schema_if_stale()?;
         let id = self
             .engine
@@ -517,18 +570,7 @@ impl Database {
             .table_id(table)
             .ok_or_else(|| Error::Bind(format!("CREATE INDEX: no such table `{table}`")))?;
         let t = bundle.schema.table(id).expect("table_id resolved");
-        let cols: Vec<u16> = columns
-            .iter()
-            .map(|name| {
-                t.columns
-                    .iter()
-                    .position(|c| &c.name == name)
-                    .map(|i| i as u16)
-                    .ok_or_else(|| {
-                        Error::Bind(format!("CREATE INDEX on `{table}`: no column `{name}`"))
-                    })
-            })
-            .collect::<Result<_>>()?;
+        let cols = resolve_index_columns(t, table, columns)?;
         // Idempotent by shape: an identical index already present is a no-op.
         if t.indexes.iter().any(|ix| ix.columns == cols && ix.unique == unique) {
             return Ok(ExecResult::Affected(0));
