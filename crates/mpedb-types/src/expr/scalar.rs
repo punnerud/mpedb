@@ -94,6 +94,22 @@ pub enum ScalarFn {
     /// argument is handled per specifier (`%s` of NULL is empty, `%d` of NULL is
     /// 0), and only a NULL/empty FORMAT yields NULL. See [`super::printf`].
     Printf = 41,
+    /// `quote(X)` — the SQL literal that denotes `X`, exactly as sqlite's
+    /// `quoteFunc` writes it. NULL → the literal text `NULL` (so, like `typeof`
+    /// and `printf`, it must NOT null-propagate), text → single-quoted with
+    /// `''` doubling, integer → the plain digits, real → `%!.15g` with sqlite's
+    /// `%!.20e` round-trip fallback, blob → `X'…'` uppercase hex.
+    Quote = 42,
+    /// `strftime(FORMAT, TIMESTRING)` — sqlite's time formatter, restricted to
+    /// the ISO-8601 time strings and the specifier set mpedb can reproduce
+    /// BYTE-for-byte; anything outside that is a clean error naming the
+    /// offending specifier or time string, never a guessed value.
+    /// See [`super::datetime`].
+    Strftime = 43,
+    /// `json(X)` — validate `X` as RFC 8259 JSON text and return it minified
+    /// (all whitespace outside strings removed, every token's spelling kept).
+    /// See [`super::json`].
+    Json = 44,
 }
 
 impl ScalarFn {
@@ -140,6 +156,9 @@ impl ScalarFn {
             39 => ScalarFn::Mod,
             40 => ScalarFn::Trunc,
             41 => ScalarFn::Printf,
+            42 => ScalarFn::Quote,
+            43 => ScalarFn::Strftime,
+            44 => ScalarFn::Json,
             other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
         })
     }
@@ -149,7 +168,12 @@ impl ScalarFn {
     pub fn arity_ok(self, argc: u8) -> bool {
         match self {
             ScalarFn::Lower | ScalarFn::Upper | ScalarFn::Length | ScalarFn::Abs
-            | ScalarFn::Unicode | ScalarFn::Hex | ScalarFn::Typeof => argc == 1,
+            | ScalarFn::Unicode | ScalarFn::Hex | ScalarFn::Typeof | ScalarFn::Quote
+            | ScalarFn::Json => argc == 1,
+            // sqlite's strftime is `(FORMAT, TIMESTRING, modifier…)`. mpedb
+            // accepts the arity so the refusal can NAME the modifiers rather
+            // than report a bare arity mismatch (see `call_scalar`).
+            ScalarFn::Strftime => argc >= 2,
             ScalarFn::Round | ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => {
                 argc == 1 || argc == 2
             }
@@ -219,6 +243,9 @@ impl ScalarFn {
             ScalarFn::Mod => "mod",
             ScalarFn::Trunc => "trunc",
             ScalarFn::Printf => "printf",
+            ScalarFn::Quote => "quote",
+            ScalarFn::Strftime => "strftime",
+            ScalarFn::Json => "json",
         }
     }
 }
@@ -242,6 +269,11 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
     // yields NULL. (The whole arg vector is handed to the formatter.)
     if matches!(f, ScalarFn::Printf) {
         return sqlite_printf(args);
+    }
+    // `quote(NULL)` is the four-character text `NULL` — the SQL literal that
+    // denotes NULL — so it too runs ahead of the null gate.
+    if matches!(f, ScalarFn::Quote) {
+        return sqlite_quote(&args[0]);
     }
     if args.iter().any(|a| a.is_null()) {
         return Ok(Value::Null);
@@ -529,10 +561,96 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
         // (C fmod). A zero divisor gives NaN → NULL — the same NULL the `%`
         // operator yields on a zero divisor (sqlite semantics).
         ScalarFn::Mod => float_or_null(num(&args[0])? % num(&args[1])?),
+        // strftime(FORMAT, TIMESTRING): sqlite's time formatter over the ISO-8601
+        // time strings, restricted to the specifiers mpedb reproduces exactly.
+        ScalarFn::Strftime => super::datetime::sqlite_strftime(args)?,
+        // json(X): validate and minify. Text only — sqlite's `json(5)` (a bare
+        // number) and its JSON5 extensions are refused by name rather than
+        // approximated.
+        ScalarFn::Json => super::json::sqlite_json(&args[0])?,
         // Handled ahead of the null gate above; unreachable here.
         ScalarFn::Typeof => unreachable!("typeof is dispatched before the null gate"),
         ScalarFn::Printf => unreachable!("printf is dispatched before the null gate"),
+        ScalarFn::Quote => unreachable!("quote is dispatched before the null gate"),
     })
+}
+
+/// sqlite's `quoteFunc`: the SQL literal denoting `v`.
+///
+/// * NULL → the bare word `NULL` (not a quoted string).
+/// * INTEGER → the plain decimal digits.
+/// * REAL → [`printf::quote_float`] (`%!.15g`, with sqlite's `%!.20e`
+///   round-trip fallback).
+/// * TEXT → `'…'` with every embedded `'` doubled (sqlite's `%Q`). Newlines and
+///   every other byte pass through verbatim.
+/// * BLOB → `X'…'` with UPPERCASE hex digits.
+///
+/// **The one deliberate divergence:** sqlite reaches the text through
+/// `sqlite3_value_text`, a NUL-terminated C string, so `quote()` of a string
+/// containing an embedded NUL silently TRUNCATES the literal there
+/// (`quote(char(97,0,98))` is `'a'`). mpedb's TEXT can hold a NUL, and a
+/// quoting function that silently drops the tail of its input is exactly the
+/// kind of quiet wrong answer this engine refuses — so that case is a clean
+/// error naming the byte offset instead.
+fn sqlite_quote(v: &Value) -> Result<Value> {
+    Ok(Value::Text(match v {
+        Value::Null => "NULL".to_string(),
+        Value::Int(i) => i.to_string(),
+        // mpedb's two extra first-class scalars have no sqlite counterpart to
+        // agree with; both render as the integer they already render as under
+        // `||`, `CAST(… AS TEXT)` and `printf`, so the literal round-trips.
+        Value::Bool(b) => (*b as i64).to_string(),
+        Value::Timestamp(t) => t.to_string(),
+        Value::Float(x) => match super::printf::quote_float(*x) {
+            Some(bytes) => String::from_utf8(bytes).expect("quote_float is ASCII"),
+            None => {
+                return Err(Error::TypeMismatch(format!(
+                    "quote(): the real {x:?} needs more than 15 significant digits to round-trip, \
+                     and sqlite's fallback rendering for that case (`%!.20e`) is not portable — \
+                     sqlite3FpDecode picks between an 80-bit `long double` scaling (18 digits) \
+                     and a Dekker double-double one (19 digits, different last digit) at startup, \
+                     per build, via sqlite3Config.bUseLongDouble. mpedb refuses rather than emit \
+                     a near-miss literal; CAST({x:?} AS TEXT) gives sqlite's %!.15g rendering, \
+                     which IS portable"
+                )))
+            }
+        },
+        Value::Text(s) => {
+            if let Some(pos) = s.find('\0') {
+                return Err(Error::TypeMismatch(format!(
+                    "quote(): the text argument contains an embedded NUL byte at offset {pos}; \
+                     sqlite would silently truncate the literal there, so mpedb refuses it \
+                     rather than return a shortened literal"
+                )));
+            }
+            let mut out = String::with_capacity(s.len() + 2);
+            out.push('\'');
+            for c in s.chars() {
+                if c == '\'' {
+                    out.push('\'');
+                }
+                out.push(c);
+            }
+            out.push('\'');
+            out
+        }
+        Value::Blob(b) => {
+            const HEX: &[u8; 16] = b"0123456789ABCDEF";
+            let mut out = String::with_capacity(b.len() * 2 + 3);
+            out.push_str("X'");
+            for &byte in b {
+                out.push(HEX[(byte >> 4) as usize] as char);
+                out.push(HEX[(byte & 0x0f) as usize] as char);
+            }
+            out.push('\'');
+            out
+        }
+        Value::List(_) => {
+            return Err(Error::TypeMismatch(
+                "quote() has no literal form for a list value".into(),
+            ))
+        }
+    }))
 }
 
 /// sqlite `typeof()` datatype string. The five sqlite core names

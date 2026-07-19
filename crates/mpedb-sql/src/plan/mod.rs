@@ -255,7 +255,18 @@ const MAX_JOINS: usize = 16;
 //     re-prepare. Like a `HostCall`, a plan naming a host aggregate is valid ONLY
 //     for the connection that registered it, so `contains_host_call` covers it
 //     and it never reaches the shared `plan/<hash>` registry.
-const PLAN_FORMAT: u8 = 40;
+// 41: the three sqlite built-ins Django's own test suite needs — `quote(X)`
+//     (its `last_executed_query` calls `QUOTE(?)` for every bound parameter),
+//     `strftime(FORMAT, TIMESTRING)` and `json(X)`. Three additive `ScalarFn`
+//     tags (Quote=42, Strftime=43, Json=44) inside the existing
+//     `Instr::Call(f, argc)` opcode — no new opcode, no framing change, so a
+//     plan that names none of them encodes byte-for-byte as in format 40. A
+//     format-40 reader hits the unknown scalar tag in `ScalarFn::from_tag` and
+//     reports the plan as corrupt rather than misreading it, and the whole-plan
+//     version gates it anyway: a format-40 blob fails CLOSED at byte 0 with the
+//     documented re-prepare. (The same additive gating as every earlier scalar
+//     bump — `hex`/`typeof` at 12, the math family at 26, `printf` at 27.)
+const PLAN_FORMAT: u8 = 41;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

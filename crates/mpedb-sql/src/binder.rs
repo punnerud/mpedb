@@ -1463,6 +1463,12 @@ impl<'a> Binder<'a> {
             "unicode" => ScalarFn::Unicode,
             "hex" => ScalarFn::Hex,
             "typeof" => ScalarFn::Typeof,
+            // sqlite built-ins added for the Django/C-API surface: `quote(X)`
+            // (Django's `last_executed_query` calls `QUOTE(?)` per parameter),
+            // `strftime(FORMAT, TIME)` and `json(X)`.
+            "quote" => ScalarFn::Quote,
+            "strftime" => ScalarFn::Strftime,
+            "json" => ScalarFn::Json,
             // Math (sqlite 3.45). `log` is base-10 with one argument and
             // log-base-b with two, so it dispatches on the argument count here —
             // `log10`/`log2` name the fixed-base forms directly.
@@ -1523,7 +1529,8 @@ impl<'a> Binder<'a> {
                      ltrim, rtrim, replace, instr, substr, substring, char, unicode, hex, \
                      typeof, abs, round, ceil, floor, trunc, sqrt, pow, sign, exp, ln, log, \
                      log10, log2, sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, \
-                     radians, degrees, pi, mod, printf, format, iif, coalesce, ifnull, nullif"
+                     radians, degrees, pi, mod, printf, format, quote, strftime, json, iif, \
+                     coalesce, ifnull, nullif"
                 )));
             }
         };
@@ -1598,6 +1605,20 @@ impl<'a> Binder<'a> {
             // the `ret` recomputation below. typeof accepts ANY type. Both
             // return text.
             ScalarFn::Hex | ScalarFn::Typeof => (&[], Some(ColumnType::Text)),
+            // quote(X) accepts EVERY type (that is the point of it) and returns
+            // text. Its argument stays unpinned so `quote($1)` — the shape
+            // Django's `last_executed_query` emits — binds without the binder
+            // having to guess the parameter's type.
+            ScalarFn::Quote => (&[], Some(ColumnType::Text)),
+            // strftime(FORMAT, TIMESTRING): both text, text out. Pinning the
+            // time argument to text is what makes `strftime('%Y', 2455352.5)`
+            // — sqlite's Julian-day form — a COMPILE error rather than a
+            // per-row surprise.
+            ScalarFn::Strftime => (
+                &[Some(ColumnType::Text), Some(ColumnType::Text)],
+                Some(ColumnType::Text),
+            ),
+            ScalarFn::Json => (&[Some(ColumnType::Text)], Some(ColumnType::Text)),
             // char/printf are variadic and bound specially above (never reached
             // here); present only so this match stays exhaustive over ScalarFn.
             ScalarFn::Char | ScalarFn::Printf => (&[], Some(ColumnType::Text)),
