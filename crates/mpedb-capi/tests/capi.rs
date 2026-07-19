@@ -1769,3 +1769,63 @@ fn named_in_memory_database_is_shared_private_and_does_not_outlive_the_process()
         assert!(!cwd_artifact.exists());
     }
 }
+
+// ---- refusal-path destructor contracts (CPython heap safety) ---------------
+
+unsafe extern "C" fn count_destroy(p: *mut c_void) {
+    let c = &*(p as *const std::sync::atomic::AtomicU32);
+    c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// sqlite's documented contract: when `sqlite3_create_collation_v2` FAILS the
+/// destructor is NOT invoked (the caller frees its context — CPython's
+/// `create_collation` does exactly that), while a failing
+/// `sqlite3_create_window_function` DOES invoke it (and CPython relies on
+/// that by not freeing). Invoking it on the collation refusal was a
+/// double-free that corrupted CPython's heap and segfaulted test_sqlite3.
+#[test]
+fn collation_refusal_leaves_destructor_alone_window_refusal_runs_it() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    unsafe {
+        let db = open_memory();
+        let hits = AtomicU32::new(0);
+        let app = &hits as *const AtomicU32 as *mut c_void;
+
+        let name = cs("mycoll");
+        let rc = sqlite3_create_collation_v2(
+            db,
+            name.as_ptr(),
+            1, // SQLITE_UTF8
+            app,
+            ptr::null_mut(),
+            fnptr1(count_destroy),
+        );
+        assert_eq!(rc, SQLITE_ERROR, "custom collations are refused");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            0,
+            "collation destructor must NOT run on failure (double-free under CPython)"
+        );
+
+        let wname = cs("mywin");
+        let rc = sqlite3_create_window_function(
+            db,
+            wname.as_ptr(),
+            1,
+            1, // SQLITE_UTF8
+            app,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            fnptr1(count_destroy),
+        );
+        assert_eq!(rc, SQLITE_ERROR, "window functions are refused");
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "window-function destructor MUST run on failure (CPython does not free otherwise)"
+        );
+        sqlite3_close(db);
+    }
+}

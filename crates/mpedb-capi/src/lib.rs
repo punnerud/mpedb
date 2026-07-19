@@ -2128,7 +2128,13 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
     _x_compare: *mut c_void,
     x_destroy: *mut c_void,
 ) -> c_int {
-    call_destroy(x_destroy, arg);
+    // Do NOT invoke x_destroy: sqlite's documented contract is that the
+    // destructor is NOT called when sqlite3_create_collation_v2() fails, and
+    // CPython's create_collation frees its callback context itself on a
+    // non-OK return ("the destructor callback is _not_ called if
+    // sqlite3_create_collation_v2() fails" — Modules/_sqlite/connection.c).
+    // Calling it here was a double-free that corrupted CPython's heap.
+    let _ = (x_destroy, arg);
     if let Some(c) = conn(db) {
         c.set_error(SQLITE_ERROR, SQLITE_ERROR, "user-defined collations are not supported");
     }
