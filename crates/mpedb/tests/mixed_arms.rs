@@ -178,6 +178,10 @@ fn agree(v: &Value, sqlite: &str) -> Result<(), String> {
         Value::Int(i) => (ty == "integer" && rep == i.to_string())
             .then_some(())
             .ok_or_else(|| format!("mpedb integer {i} vs sqlite {ty} {rep}")),
+        // mpedb types a predicate bool; sqlite renders it as INTEGER 0/1.
+        Value::Bool(b) => (ty == "integer" && rep == i64::from(*b).to_string())
+            .then_some(())
+            .ok_or_else(|| format!("mpedb bool {b} vs sqlite {ty} {rep}")),
         Value::Float(f) => {
             if ty != "real" {
                 return Err(format!("mpedb real {f} vs sqlite {ty} {rep}"));
@@ -288,6 +292,15 @@ fn corpus_classics() {
         "coalesce(NULL, 2.5, 1) / 2", // real wins -> real division
         "typeof(coalesce(NULL, 1, 2.5))",
         "typeof(coalesce(NULL, 2.5, 1))",
+        // An `any`-typed mixed arm inside an IN list (the corpus writes
+        // `NULL IN (..., COALESCE(...), ...)` constantly): membership runs
+        // per value through sql_cmp, crossing int/real like sqlite.
+        "1 IN (2, coalesce(1, 2.5))",
+        "3 IN (2, coalesce(1, 2.5))",
+        "NULL IN (2, coalesce(1, 2.5))",
+        "coalesce(1, 2.5) IN (1.0, 3)",
+        "coalesce(2.5, 1) NOT IN (1, 2, 3)",
+        "2 NOT IN (coalesce(NULL, 1, 2.5), NULL)",
     ] {
         let v = mpedb_eval(&db, expr).unwrap_or_else(|e| panic!("{expr}: {e}"));
         let want = sqlite_eval(expr).expect("sqlite");
