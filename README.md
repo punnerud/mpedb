@@ -74,8 +74,9 @@ math functions, secondary/composite indexes the planner uses, and live
 multi-process DDL — verified against sqlite's own 7.4M-record test corpus with
 **zero wrong answers**. What is still missing is short: `ATTACH` (cross-file,
 planned) and user-defined functions / loadable extensions (a deliberate non-goal
-— the libsqlite3 C-API shim is the drop-in path instead), each a clean error
-today, never a wrong answer. And on one axis mpedb goes *past* sqlite: its own
+— the libsqlite3 C-API shim, which loads CPython's own `sqlite3` module via
+`LD_PRELOAD`, is the drop-in path instead), each a clean error today, never a
+wrong answer. And on one axis mpedb goes *past* sqlite: its own
 `.mpedb` WAL gives PostgreSQL-style **concurrent multi-process writes** (MVCC
 snapshots, lock-free readers) where sqlite serializes every writer. See
 [SQL support](#sql-support) for the exact surface, measured against the binary.
