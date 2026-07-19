@@ -8,6 +8,11 @@ to measure drop-in compatibility beyond mpedb's own tests. Results feed
 1. **DB-API 2.0 battery** (`../tests/dbapi_battery.py`) — 23/23 vs stock sqlite.
 2. **Django ORM** (`proj/`) — a minimal project (Author/Book models, a FK) whose
    `migrate` + ORM CRUD run under the shim.
+3. **Django's OWN test suite** (`djsuite/`) — `run_suite.sh` runs a subset of
+   Django's ~19 000-test suite twice, once on stock libsqlite3 and once under the
+   shim, and `diff_arms.py` ranks the shim-only failures. Django is not vendored;
+   point `WB_DJANGO` at a checkout. Results and the ranked gap list live in the
+   "Django's own test suite" section of `C-API-COMPAT.md`.
 
 ## Findings (2026-07-19, first Django baseline)
 - **Django `migrate` was blocked at connection open**, before any SQL:
@@ -50,3 +55,15 @@ to measure drop-in compatibility beyond mpedb's own tests. Results feed
   implicit transaction after DML and Django works inside transactions, so
   extending `TxnCtx::host_fns`/`host_aggs` to the write path is the natural
   stage 2.5. Verified: the same probe passes after an explicit `commit()`.
+
+## Findings (2026-07-19, Django's own test suite — see C-API-COMPAT.md)
+
+- Gates 3 and 4 (`sqlite_compileoption_used`, `sqlite_master`'s clause-leading
+  `NOT`) are now OPEN, both fixed in the shim. Django's `migrate` completes and
+  **506 of 831** Django tests pass under the shim (stock baseline: 826/831).
+- The **single highest-leverage remaining fix is in `mpedb-sql`, not the shim**:
+  a quoted identifier cannot qualify a dotted reference (`"t"."id"`), and Django
+  quotes every name. The workbench works around it by emitting bare identifiers;
+  without that, zero ORM queries run.
+- The hardest ceiling is **`MAX_TABLES` = 120**: Django's `queries` label alone
+  exceeds it, so it cannot be measured at all.

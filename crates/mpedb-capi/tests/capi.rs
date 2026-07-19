@@ -1224,3 +1224,47 @@ fn column_decltype_reports_base_column_types_null_for_expressions() {
         sqlite3_close(db);
     }
 }
+
+#[test]
+fn compileoption_builtins_report_an_empty_option_set() {
+    // Django's `register_functions()` refuses to hand out a connection until
+    // `select sqlite_compileoption_used('ENABLE_MATH_FUNCTIONS')` answers. mpedb
+    // defines NO sqlite compile options, so 0 / NULL is the literal truth, and
+    // the 0 is what makes Django register its own math fallbacks.
+    unsafe {
+        let db = open_memory();
+
+        // (value as int, sqlite type code) of the single column of `sql`.
+        let scalar = |sql: &str| -> (i64, c_int) {
+            let mut st: *mut Stmt = ptr::null_mut();
+            let s = cs(sql);
+            assert_eq!(
+                sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+                SQLITE_OK,
+                "prepare {sql}: {}",
+                CStr::from_ptr(sqlite3_errmsg(db)).to_string_lossy()
+            );
+            assert_eq!(sqlite3_step(st), SQLITE_ROW, "step {sql}");
+            let out = (sqlite3_column_int64(st, 0), sqlite3_column_type(st, 0));
+            sqlite3_finalize(st);
+            out
+        };
+
+        // No option is ever "used" — matches sqlite's answer for an undefined one.
+        assert_eq!(
+            scalar("SELECT sqlite_compileoption_used('ENABLE_MATH_FUNCTIONS')"),
+            (0, SQLITE_INTEGER)
+        );
+        assert_eq!(
+            scalar("SELECT sqlite_compileoption_used('THREADSAFE')"),
+            (0, SQLITE_INTEGER)
+        );
+        // NULL in, NULL out (verified against sqlite 3.45).
+        assert_eq!(scalar("SELECT sqlite_compileoption_used(NULL)").1, SQLITE_NULL);
+        // The option list is empty, so every index is past the end.
+        assert_eq!(scalar("SELECT sqlite_compileoption_get(0)").1, SQLITE_NULL);
+        assert_eq!(scalar("SELECT sqlite_compileoption_get(100000)").1, SQLITE_NULL);
+
+        sqlite3_close(db);
+    }
+}

@@ -544,6 +544,36 @@ fn seed_toml(path: &std::path::Path, size_mb: u64) -> String {
     )
 }
 
+/// SQL functions that describe the sqlite **build** rather than the data.
+/// mpedb's binder has no notion of them (it is not sqlite and has no compile
+/// options), yet a consumer may call them at connection setup — Django's
+/// `register_functions()` runs `select sqlite_compileoption_used(
+/// 'ENABLE_MATH_FUNCTIONS')` before it will hand out a connection at all.
+///
+/// Both are answered with the LITERAL TRUTH about mpedb, never a guess: mpedb
+/// defines an EMPTY set of sqlite compile options, so no name was ever "used"
+/// (0) and no index into the list is in range (NULL). For Django that 0 is also
+/// the useful answer: it makes Django register its own `ACOS`/`CEILING`/
+/// `POWER`/… fallbacks — its spellings, its semantics — instead of assuming
+/// sqlite's math built-ins are present under sqlite's exact names.
+///
+/// Registered per connection, at open, before any statement can run.
+fn register_shim_builtins(db: &Database) {
+    // sqlite: 1 iff the named option was defined at compile time; NULL in, NULL
+    // out (verified against sqlite 3.45).
+    db.register_host_function("sqlite_compileoption_used", 1, |args: &[Value]| {
+        Ok(match args.first() {
+            Some(Value::Null) | None => Value::Null,
+            Some(_) => Value::Int(0),
+        })
+    });
+    // sqlite: the N-th compile option's name, NULL once N runs past the end.
+    // mpedb's list is empty, so every N is past the end.
+    db.register_host_function("sqlite_compileoption_get", 1, |_args: &[Value]| {
+        Ok(Value::Null)
+    });
+}
+
 fn open_impl(filename: Option<&str>, flags: c_int) -> Result<Box<Sqlite3>, (c_int, String)> {
     let target = resolve_target(filename, flags);
     // `file:…?size_mb=N` requests a specific pre-reserved size (mpedb fallocates
@@ -578,6 +608,8 @@ fn open_impl(filename: Option<&str>, flags: c_int) -> Result<Box<Sqlite3>, (c_in
         Database::open_with_config(cfg)
             .map_err(|e| (SQLITE_CANTOPEN, format!("cannot create `{}`: {e}", path.display())))?
     };
+
+    register_shim_builtins(&db);
 
     let mut c = Box::new(Sqlite3 {
         txn: None,
