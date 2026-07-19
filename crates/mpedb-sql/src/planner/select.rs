@@ -348,6 +348,7 @@ pub(super) fn plan_select<'s>(
         Some(a) => Binder::with_scope(Scope::single_named(a.clone(), table), eff_params, true),
         None => Binder::new(table, eff_params, true),
     };
+    binder.set_dialect(mode);
     for (i, ty) in slot_types.iter().enumerate() {
         binder.pin_param(n_params + i as u16, *ty);
     }

@@ -845,6 +845,15 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     atom: false,
                 }
             }
+            // Case-sensitive (PostgreSQL dialect) LIKE renders as LIKE — the
+            // surface syntax is identical; the opcode carries the dialect.
+            Instr::LikeCs(i) => {
+                let a = pop(&mut st);
+                Item {
+                    s: format!("{} LIKE {}", wrap(&a), cst(i)),
+                    atom: false,
+                }
+            }
             Instr::Glob(i) => {
                 let a = pop(&mut st);
                 Item {

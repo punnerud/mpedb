@@ -101,9 +101,25 @@ pub(super) fn in_items_3vl_collated(
 /// **Case-insensitive for ASCII A–Z**, matching sqlite's default (`'a' LIKE 'A'`
 /// is true; Unicode is NOT casefolded, exactly like NOCASE and sqlite itself).
 /// GLOB stays case-sensitive. (Note: PostgreSQL's LIKE is case-sensitive — this
-/// is the canonical sqlite/PG divergence; mpedb follows sqlite, its primary
-/// compatibility target and the semantics the C-API drop-in must present.)
+/// is the canonical sqlite/PG divergence; sqlite is mpedb's default and the
+/// semantics the C-API drop-in must present. A `bare_group_by = "postgres"`
+/// database instead compiles case-SENSITIVE LIKE via [`like_match_cs`] behind the
+/// [`Instr::LikeCs`](super::Instr::LikeCs) opcode.)
 pub(super) fn like_match(pattern: &str, s: &str) -> bool {
+    like_impl(pattern, s, true)
+}
+
+/// Case-SENSITIVE LIKE (PostgreSQL dialect): identical to [`like_match`] except
+/// literal characters compare exactly (`'a' LIKE 'A'` is FALSE). The `%`/`_`
+/// wildcards behave the same.
+pub(super) fn like_match_cs(pattern: &str, s: &str) -> bool {
+    like_impl(pattern, s, false)
+}
+
+/// Shared LIKE matcher. `ci` selects case-INsensitive (ASCII A–Z, sqlite) vs
+/// case-sensitive (PostgreSQL) comparison of a literal pattern char; the `%`/`_`
+/// wildcards and the two-pointer backtracking are identical either way.
+fn like_impl(pattern: &str, s: &str, ci: bool) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = s.chars().collect();
     let (mut pi, mut ti) = (0usize, 0usize);
@@ -116,7 +132,14 @@ pub(super) fn like_match(pattern: &str, s: &str) -> bool {
             star_pi = pi;
             star_ti = ti;
             pi += 1;
-        } else if pi < p.len() && (p[pi] == '_' || p[pi].eq_ignore_ascii_case(&t[ti])) {
+        } else if pi < p.len()
+            && (p[pi] == '_'
+                || if ci {
+                    p[pi].eq_ignore_ascii_case(&t[ti])
+                } else {
+                    p[pi] == t[ti]
+                })
+        {
             pi += 1;
             ti += 1;
         } else if star_pi != usize::MAX {
