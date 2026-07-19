@@ -261,7 +261,6 @@ SELECT id FROM t WHERE s < 'u'
 #
 #   '42' -> INT   sqlite stores integer 42     mpedb: error
 #   42   -> TEXT  sqlite stores text '42'      mpedb: error
-#   2.0  -> INT   sqlite stores integer 2      mpedb: error
 #
 # The differential generator therefore never emits a cross-type value; these
 # would otherwise read as divergences when they are a deliberate difference.
@@ -273,12 +272,32 @@ INSERT INTO t (id, i) VALUES (900, '42')
 statement error cannot be inserted
 INSERT INTO t (id, s) VALUES (901, 42)
 
-statement error cannot be inserted
-INSERT INTO t (id, i) VALUES (902, 2.0)
-
 # 'abc' -> INT is rejected by BOTH — the lossy case is where they agree.
 statement error cannot be inserted
 INSERT INTO t (id, i) VALUES (903, 'abc')
+
+# 2.0 -> INT was on the divergence list above until #74. It is NOT a widening
+# of the rigid rule: mpedb converts a float64 CONSTANT into an int64 column
+# exactly when the round trip loses nothing, which is sqlite's INTEGER-affinity
+# rule and STRICT's rule too — sqlite STRICT stores 2.0 as the integer 2 and
+# refuses 2.5 with "cannot store REAL value in INT column". So does mpedb.
+statement ok
+INSERT INTO t (id, i) VALUES (902, 2.0)
+
+query IT nosort
+SELECT i, typeof(i) FROM t WHERE id = 902
+----
+2
+integer
+
+statement error not exactly an integer
+INSERT INTO t (id, i) VALUES (905, 2.5)
+
+# The losslessness has to be CHECKABLE, so only a constant converts: a float64
+# COLUMN into an int64 column stays refused (truncating a column of reals would
+# be a wrong answer, not a wider one).
+statement error only a constant whose value is exactly an integer converts
+UPDATE t SET i = f WHERE id = 902
 
 # And the one coercion both engines DO perform, so the rule above is not read
 # as "mpedb never coerces".

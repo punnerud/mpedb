@@ -141,7 +141,9 @@ pub use schema::{
     store_into, ColumnDef, DefaultExpr, IndexDef, Schema, TableDef, TableKind,
     MAX_IDENTIFIER_LEN, MAX_INDEXES,
 };
-pub use value::{Affinity, Collation, ColumnType, Value};
+pub use value::{
+    exact_float_as_int, exact_int_as_float, Affinity, Collation, ColumnType, Value,
+};
 
 /// Maximum number of tables (user + system) in one database — a **resource**
 /// bound, no longer a representation one (design/DESIGN-TABLE-CAP.md).
