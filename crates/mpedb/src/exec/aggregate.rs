@@ -139,17 +139,34 @@ pub(super) fn exec_aggregate(
     // accumulation still consumes only the full `(WHERE ∧ policy)` set
     // (DESIGN-MULTIDB §4 — the same ordering the plain gather guarantees). The
     // shared `correlated_survivors` keeps this byte-identical to the
-    // non-aggregate correlated path, memo included. The grouped programs never
-    // read a correlated slot (planner + validate forbid it), so grouping below
-    // reads `params` and the per-row scratch is discarded here.
-    let rows: Vec<Vec<Value>> = if correlated.is_empty() && post_filter.is_none() {
-        rows
-    } else {
-        correlated_survivors(ctx, schema, plan, params, base, rows, correlated, post_filter)?
-            .into_iter()
-            .map(|(row, _scratch)| row)
-            .collect()
-    };
+    // non-aggregate correlated path, memo included.
+    //
+    // Each survivor keeps its SCRATCH — the `[user ‖ subplan results]` vector
+    // with this row's correlated slots filled. The row loop below evaluates the
+    // PER-ROW programs (`FILTER (WHERE …)`, an aggregate argument, a computed
+    // GROUP BY key) against that scratch, not against `params`: `params` still
+    // holds NULL in every correlated slot, and a filter that reads one would
+    // evaluate to NULL and — 3VL — DROP the row rather than test it. That is the
+    // wrong answer `count(*) FILTER (WHERE EXISTS (…correlated…))` used to give,
+    // 0 for both the positive and the negated form. The GROUPED programs (HAVING,
+    // the projection, ORDER BY) still read `params`: they run over a collapsed
+    // group, where no single row's correlation applies, and both the planner
+    // (`reject_correlated_in_aggregate`) and validate refuse a correlated slot
+    // there.
+    let (rows, scratches): (Vec<Vec<Value>>, Option<Vec<Vec<Value>>>) =
+        if correlated.is_empty() && post_filter.is_none() {
+            (rows, None)
+        } else {
+            let survivors =
+                correlated_survivors(ctx, schema, plan, params, base, rows, correlated, post_filter)?;
+            let mut kept = Vec::with_capacity(survivors.len());
+            let mut scratch = Vec::with_capacity(survivors.len());
+            for (row, s) in survivors {
+                kept.push(row);
+                scratch.push(s);
+            }
+            (kept, Some(scratch))
+        };
 
     // sqlite "bare columns" (COMPAT.md): each group also carries the values of
     // `agg.bare_cols` from a WITNESS row. Which row is sqlite's — and so mpedb's —
@@ -214,14 +231,24 @@ pub(super) fn exec_aggregate(
     // fresh accumulator each), and both this and `ctx.host_fns()` are shared
     // reborrows of the same context.
     let host_aggs = ctx.host_aggs();
-    for row in &rows {
+    for (ri, row) in rows.iter().enumerate() {
+        // The parameter vector for THIS row's per-row programs: the correlated
+        // scratch when this plan has correlated subplans, otherwise `params`
+        // itself (no clone, no correlated slot to fill). The two agree on every
+        // user and uncorrelated-subplan slot — the scratch is a copy of `params`
+        // with only the correlated slots overwritten — so this is a no-op except
+        // exactly where a correlated slot is read.
+        let row_params: &[Value] = match &scratches {
+            Some(s) => &s[ri],
+            None => params,
+        };
         let key_vals: Vec<Value> = agg
             .group_by
             .iter()
             .map(|k| match k {
                 GroupKey::Col(c) => Ok(row.get(*c as usize).cloned().unwrap_or(Value::Null)),
                 // A computed key — `GROUP BY a+1` — evaluated over the base row.
-                GroupKey::Expr(p) => p.eval_host(row, params, ctx.host_fns()),
+                GroupKey::Expr(p) => p.eval_host(row, row_params, ctx.host_fns()),
             })
             .collect::<Result<_>>()?;
         let key = keycode::encode_key_collated(&key_vals, &group_collations);
@@ -253,7 +280,7 @@ pub(super) fn exec_aggregate(
             // different filters (or none). For DISTINCT this runs BEFORE the
             // dedupe inside `Accum` — filter first, then dedupe.
             if let Some(f) = &call.filter {
-                if !f.eval_filter_host(&mut Vec::new(), row, params, ctx.host_fns())? {
+                if !f.eval_filter_host(&mut Vec::new(), row, row_params, ctx.host_fns())? {
                     continue;
                 }
             }
@@ -262,7 +289,7 @@ pub(super) fn exec_aggregate(
                 // NULL cannot arise.
                 None => entry.1[i].push(None)?,
                 Some(p) => {
-                    let v = p.eval_host(row, params, ctx.host_fns())?;
+                    let v = p.eval_host(row, row_params, ctx.host_fns())?;
                     entry.1[i].push(Some(&v))?;
                 }
             }
@@ -296,7 +323,9 @@ pub(super) fn exec_aggregate(
                     // (`passes` is always true, and the extreme=None branch already
                     // captured every row, so the last row wins as documented).
                     let passes = match &mm.filter {
-                        Some(fp) => fp.eval_filter_host(&mut Vec::new(), row, params, ctx.host_fns())?,
+                        Some(fp) => {
+                            fp.eval_filter_host(&mut Vec::new(), row, row_params, ctx.host_fns())?
+                        }
                         None => true,
                     };
                     if !passes {
@@ -305,7 +334,7 @@ pub(super) fn exec_aggregate(
                         }
                     } else {
                         let v = match &mm.arg {
-                            Some(p) => p.eval_host(row, params, ctx.host_fns())?,
+                            Some(p) => p.eval_host(row, row_params, ctx.host_fns())?,
                             None => Value::Null,
                         };
                         match extreme {

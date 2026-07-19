@@ -636,3 +636,81 @@ fn a_rigid_column_refuses_what_sqlite_would_coerce() {
         ]
     );
 }
+
+/// Two Django run-2 gap rows — "`FILTER (WHERE …)` parse: `expected )`" (3 tests)
+/// and "`expected )` after IN/EXISTS subquery" (3 tests) — are NOT gaps in
+/// `FILTER`, `IN` or `EXISTS`. They are `LIKE … ESCAPE` and
+/// `ORDER BY … NULLS FIRST/LAST` (unsupported, already their own gap row)
+/// mis-reported at the token where the ENCLOSING construct next demanded a `)`.
+///
+/// Neither word is reserved, so the parser walked past the unsupported clause
+/// and only noticed at the paren, blaming the wrong clause. The refusals now
+/// name what is actually unsupported, which is what this pins: the same six
+/// statements, refused at the same place, with a message a reader can act on.
+/// The enclosing constructs themselves are fine and are asserted so alongside.
+#[test]
+fn the_filter_and_subquery_paren_errors_are_really_like_escape_and_nulls_ordering() {
+    let t = open();
+    t.db.query("CREATE TABLE t (id integer PRIMARY KEY, x integer, tag varchar(20))", &[])
+        .unwrap();
+    t.db.query("CREATE TABLE u (uid integer PRIMARY KEY, x integer, tag varchar(20))", &[])
+        .unwrap();
+
+    // `LIKE … ESCAPE` — the same refusal wherever it appears, including the
+    // three positions that used to blame a paren.
+    for sql in [
+        r#"SELECT count(*) FILTER (WHERE "t"."tag" LIKE 'a%' ESCAPE '\') FROM "t""#,
+        r#"SELECT count(*) FILTER (WHERE "t"."tag" NOT LIKE 'a%' ESCAPE '\') FROM "t""#,
+        r#"SELECT id FROM "t" WHERE "t"."x" IN (SELECT U0."x" FROM "u" U0 WHERE U0."tag" LIKE 'a%' ESCAPE '\')"#,
+        r#"SELECT id FROM "t" WHERE EXISTS(SELECT 1 FROM "u" U0 WHERE U0."tag" LIKE 'a%' ESCAPE '\')"#,
+        r#"SELECT id FROM "t" WHERE "t"."tag" LIKE 'a%' ESCAPE '\'"#,
+    ] {
+        let e = t.db.query(sql, &[]).expect_err("LIKE … ESCAPE is not supported");
+        let m = e.to_string();
+        assert!(
+            m.contains("ESCAPE") && m.contains("not supported"),
+            "the refusal must name ESCAPE, not a paren: {m}\n  for {sql}"
+        );
+    }
+
+    // `ORDER BY … NULLS FIRST/LAST` — likewise.
+    for sql in [
+        r#"SELECT id FROM "t" WHERE "t"."x" IN (SELECT U0."x" FROM "u" U0 ORDER BY U0."x" ASC NULLS LAST)"#,
+        r#"SELECT id FROM "t" WHERE EXISTS(SELECT 1 FROM "u" U0 ORDER BY U0."x" NULLS LAST LIMIT 1)"#,
+        r#"SELECT id FROM "t" ORDER BY "t"."x" DESC NULLS FIRST"#,
+    ] {
+        let e = t.db.query(sql, &[]).expect_err("NULLS FIRST/LAST is not supported");
+        let m = e.to_string();
+        assert!(
+            m.contains("NULLS") && m.contains("not supported"),
+            "the refusal must name NULLS FIRST/LAST, not a paren: {m}\n  for {sql}"
+        );
+    }
+
+    // The enclosing constructs are NOT the gap: the identical statements with
+    // the unsupported tail removed all run, and agree with sqlite.
+    for sql in [
+        r#"SELECT count(*) FILTER (WHERE "t"."tag" LIKE 'a%') FROM "t""#,
+        r#"SELECT id FROM "t" WHERE "t"."x" IN (SELECT U0."x" FROM "u" U0 WHERE U0."tag" LIKE 'a%')"#,
+        r#"SELECT id FROM "t" WHERE EXISTS(SELECT 1 FROM "u" U0 WHERE U0."tag" LIKE 'a%')"#,
+        r#"SELECT id FROM "t" WHERE "t"."x" IN (SELECT U0."x" FROM "u" U0 ORDER BY U0."x" ASC)"#,
+        r#"SELECT id FROM "t" WHERE EXISTS(SELECT 1 FROM "u" U0 ORDER BY U0."x" LIMIT 1)"#,
+    ] {
+        assert!(t.db.query(sql, &[]).is_ok(), "must parse and run: {sql}");
+    }
+    let setup = [
+        "CREATE TABLE t (id integer PRIMARY KEY, x integer, tag varchar(20))",
+        "CREATE TABLE u (uid integer PRIMARY KEY, x integer, tag varchar(20))",
+        "INSERT INTO t (id, x, tag) VALUES (1, 1, 'ab')",
+        "INSERT INTO t (id, x, tag) VALUES (2, 2, 'zz')",
+        "INSERT INTO u (uid, x, tag) VALUES (1, 1, 'ab')",
+    ];
+    assert_same(
+        &setup,
+        r#"SELECT count(*) FILTER (WHERE "t"."tag" LIKE 'a%') FROM "t""#,
+    );
+    assert_same(
+        &setup,
+        r#"SELECT id FROM "t" WHERE EXISTS(SELECT 1 FROM "u" U0 WHERE U0."x" = "t"."x") ORDER BY id"#,
+    );
+}

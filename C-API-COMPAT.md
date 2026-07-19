@@ -349,7 +349,8 @@ the number.
 
 ### ⚠️ Two WRONG ANSWERS (mpedb answers differently, without erroring)
 
-Both are silent: no error, a different result set. They outrank every gap below.
+Both were silent: no error, a different result set. They outrank every gap below.
+**W2 is FIXED (`b190bde`); W1 is still open.**
 
 **W1 — a NUMERIC-affinity column stores the text and compares/orders/aggregates
 as text.** `d45ad77` made `decimal(10,2)`/`numeric`/`datetime` legal declared
@@ -375,7 +376,7 @@ faces of the same root (`sum() expects a number, got text`, `cannot compare text
 with int64`) are gap 1 below.
 
 **W2 — an aggregate `FILTER (WHERE …)` whose predicate contains a CORRELATED
-subquery matches no row at all.**
+subquery matched no row at all. FIXED (`b190bde`).**
 
 ```python
 # b=(1,4.5),(2,3.0)   ba=(1, book_id=1)
@@ -388,12 +389,28 @@ subquery matches no row at all.**
 #   stock (1,4.5),(2,None)   mpedb (1,None),(2,None)     WRONG
 ```
 
-Adjacent shapes are all CORRECT, which localizes it: an UNcorrelated `EXISTS` in
-`FILTER` (stock 2 / mpedb 2), a correlated `IN` subquery in `FILTER` (1 / 1), the
-same correlated `EXISTS` in the SELECT list (`(1,1),(2,0)` / same), and the same
+Adjacent shapes were all CORRECT, which localized it: an UNcorrelated `EXISTS` in
+`FILTER` (stock 2 / mpedb 2), an `IN` subquery in `FILTER` (1 / 1), the same
+correlated `EXISTS` in the SELECT list (`(1,1),(2,0)` / same), and the same
 correlated `EXISTS` in `WHERE` (4.5 / 4.5). Only `FILTER` + correlated subquery
-is wrong. Fails `aggregation.test_filter_argument.FilteredAggregateTests.
+was wrong. Failed `aggregation.test_filter_argument.FilteredAggregateTests.
 test_filtered_aggregate_on_exists` (`{'max_rating': None}` vs `{'max_rating': 4.5}`).
+
+**Root cause.** A correlated subplan's result slot is filled PER ROW, after the
+gather, into a scratch `[user ‖ subplan results]` vector. `exec_aggregate` threw
+that scratch away and evaluated `AggCall::filter` against the pre-fill `params`,
+where the slot is still NULL — and a NULL filter REJECTS the row under 3VL. Hence
+both polarities counting 0: the row was dropped, never tested. The shape was not
+refused either, because the planner's `reject_correlated_in_aggregate` does not
+inspect `AggCall::filter` (correctly — `FILTER` is per-row, like `post_filter`),
+while `validate`'s mirror of it did, so the two paths disagreed about the same
+plan. Fixed by keeping the scratch per surviving row and evaluating the per-row
+programs against it; `validate` drops its `a.filter` check to match. The GROUPED
+programs (HAVING, projection, ORDER BY) still read `params` and a correlated slot
+in them is still refused — there is no per-row correlation once rows are grouped.
+No PLAN_FORMAT change. All four statements above now match stock exactly
+(`1`, `1`, `(1,4.5),(2,NULL)`, `max_rating = 4.5`); the differential coverage is
+`crates/mpedb/tests/agg_filter.rs`.
 
 ### What was run
 
@@ -464,12 +481,12 @@ query path.
 | 3 [4] | **45** | **Subquery / derived-table restrictions**: JOIN inside a derived table 14, correlated subquery outside `WHERE` in an aggregate query 8, unlifted `IN` subquery 5, aliased/renamed column 4, GROUP BY/HAVING body 4, correlated `IN` ("rewrite as EXISTS") 4, subquery in `HAVING` 2, unsupported position 2, compound (`UNION`) body 1, `ORDER BY` body 1. | `mpedb-sql` planner |
 | 4 [3] | **44** | **Missing sqlite scalar functions**: `quote()` 40 statements (Django's `last_executed_query`), `strftime()` 8, `json()` (the feature probe → the 2 skips above). | `mpedb-sql` builtins |
 | 5 [5] | **39** | **No int↔bool bridge**: `predicate must be a boolean expression, got int64` 29, `NOT requires a boolean, got int64` 3, `parameter $N is int64, statement requires bool` 3, `cannot compare int64 and bool` 1, `cannot assign bool to column of type int64` 1, `predicate evaluated to int64, expected bool` 1, `CASE WHEN must be a bool condition, got int64` 1. | `mpedb-sql` binder |
-| 6 [6] | **20** | **`LIKE … ESCAPE` (44 statements) and `ORDER BY … NULLS FIRST/LAST` (6)** are not parsed. | `mpedb-sql` parser |
+| 6 [6] | **20 (+6)** | **`LIKE … ESCAPE` (44 statements) and `ORDER BY … NULLS FIRST/LAST` (6)** are not parsed. **Absorbs rows 10 and 11** — those 6 tests are this gap seen through an enclosing `FILTER`/`IN`/`EXISTS` paren, so the true weight is ~26. | `mpedb-sql` parser |
 | 7 [7] | **10** | **Rigid numeric parameter typing**: `$N is int64, statement requires float64` 6, `$N is float64, requires int64` 2, `cannot assign float64 to column of type int64` 2. | `mpedb-sql` |
 | 8 [8] | **8** | **Bitwise operators absent** (`\|`, `&`, `<<`, `>>`, `^`) — including 3 tests that surface as `cannot assign any to column of type int64` on Django's XOR emulation. | `mpedb-sql` tokenizer |
 | 9 [9] | **5** | **`REGEXP` requires a literal pattern**; Django always binds it. | `mpedb-sql` |
-| 10 | **3** | **`FILTER (WHERE …)` parse**: `expected ) closing FILTER (WHERE …)`. | `mpedb-sql` parser |
-| 11 | **3** | `expected ) after IN subquery` 2, `after EXISTS subquery` 1. | `mpedb-sql` parser |
+| ~~10~~ | ~~3~~ | **MISATTRIBUTED — these are gap 6, and are folded into it.** `expected ) closing FILTER (WHERE …)` is `LIKE … ESCAPE` inside the FILTER predicate: `ESCAPE` is not a reserved word, so the parser walked past it and blamed the paren. `FILTER` itself parses. (`25b3633` makes the refusal name ESCAPE.) | — |
+| ~~11~~ | ~~3~~ | **MISATTRIBUTED — also gap 6.** `expected ) after IN/EXISTS subquery` is `ORDER BY … NULLS FIRST/LAST` or `LIKE … ESCAPE` *inside* the subquery, surfacing at the subquery's closing paren. `IN (SELECT …)` / `EXISTS (SELECT …)` themselves parse, `LIMIT`/`OFFSET`/`ORDER BY`/`GROUP BY`/`HAVING`/`DISTINCT`/`UNION` bodies included. Repros pinned in `crates/mpedb/tests/django_parse_gaps.rs`. | — |
 | 12 [10] | **2** | **2-argument `MAX(a,b)` / `MIN(a,b)`** (sqlite's scalar form). | `mpedb-sql` |
 | 13 | **2** | `INSERT values must be literals or parameters`. | `mpedb-sql` |
 | 14 [11] | **1** | **PANIC in the binder** (`binder.rs:235`, `Scope::only()` on a 2-table scope), surfaced as `internal error (panic) in engine`. | `mpedb-sql` |

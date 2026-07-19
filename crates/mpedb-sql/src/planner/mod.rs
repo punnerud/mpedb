@@ -315,11 +315,19 @@ fn total_subplans(subs: &[SubPlan]) -> usize {
 }
 
 /// A CORRELATED subplan slot is filled per outer row AFTER the gather, so the
-/// only program allowed to read it is the WHERE — which the correlated split
-/// routes into `post_filter`. In an aggregate query the group keys, aggregate
+/// programs allowed to read it are the ones that still run PER ROW: the WHERE —
+/// which the correlated split routes into `post_filter` — and an aggregate's
+/// `FILTER (WHERE …)`, which the aggregate loop evaluates row by row against that
+/// row's filled scratch. In an aggregate query the group keys, aggregate
 /// arguments, HAVING and the grouped projection all run over collapsed groups,
 /// where "which row's correlation?" has no answer, so a correlated slot in any
 /// of them is refused (#73 §1.2c).
+///
+/// `AggCall::filter` is therefore DELIBERATELY absent from the checks below, and
+/// from validate's mirror of them. Adding it back is a wrong answer, not a
+/// tightening: a rejected-at-runtime filter reads NULL from the unfilled slot and
+/// 3VL DROPS the row, so `count(*) FILTER (WHERE EXISTS (…))` and its negation
+/// both returned 0.
 ///
 /// This mirrors `validate`'s gather-side slot discipline and is enforced HERE
 /// as well because a freshly compiled plan is executed WITHOUT a decode

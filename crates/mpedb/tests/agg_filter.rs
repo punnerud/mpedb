@@ -47,6 +47,17 @@ impl Drop for Tmp {
 const CREATE: &str =
     "CREATE TABLE t (id INTEGER PRIMARY KEY, g INTEGER, x INTEGER, y INTEGER, tag TEXT)";
 
+/// A child table for the CORRELATED-subquery filters. `ref` points at `t.id`
+/// for some rows only, so `EXISTS (… WHERE c.ref = t.id)` splits `t` into
+/// matching and non-matching rows — and, per group, into groups where some
+/// match, some do not, and (group 2) none does.
+const CREATE_CHILD: &str = "CREATE TABLE c (cid INTEGER PRIMARY KEY, ref INTEGER)";
+
+/// `(cid, ref)`. Matching `t.id`s are {1, 2, 4}; 99 is dangling (matches no
+/// `t` row), and 4 appears twice so the correlated `EXISTS` is not accidentally
+/// a one-to-one join.
+const CHILD_ROWS: &[(i64, i64)] = &[(1, 1), (2, 2), (3, 4), (4, 4), (5, 99)];
+
 /// `(id, g, x, y, tag)`.
 type Row = (i64, i64, Option<i64>, Option<i64>, Option<&'static str>);
 
@@ -78,6 +89,11 @@ fn insert_statements() -> Vec<String> {
                 tlit(*tag)
             )
         })
+        .chain(
+            CHILD_ROWS
+                .iter()
+                .map(|(cid, r)| format!("INSERT INTO c (cid, ref) VALUES ({cid}, {r})")),
+        )
         .collect()
 }
 
@@ -104,6 +120,7 @@ fn db() -> Tmp {
     );
     let db = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
     db.query(CREATE, &[]).unwrap();
+    db.query(CREATE_CHILD, &[]).unwrap();
     for stmt in insert_statements() {
         db.query(&stmt, &[]).unwrap();
     }
@@ -122,6 +139,8 @@ fn mpedb_rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 fn sqlite_rows(query: &str) -> Vec<Vec<String>> {
     let mut script = String::from(".mode list\n.nullvalue NULL\n");
     script.push_str(CREATE);
+    script.push_str(";\n");
+    script.push_str(CREATE_CHILD);
     script.push_str(";\n");
     for stmt in insert_statements() {
         script.push_str(&stmt);
@@ -230,6 +249,153 @@ fn agg_filter_matches_sqlite_3_45() {
     for q in queries {
         agree(&d, q);
     }
+}
+
+/// `FILTER (WHERE <correlated subquery>)`. The filter predicate is evaluated
+/// PER ROW, so a subquery correlated to the outer row is meaningful there —
+/// unlike in the SELECT list / GROUP BY / HAVING, which run over a collapsed
+/// group and stay refused.
+///
+/// This is a WRONG-ANSWER regression test. The correlated result slots are
+/// filled per row into a scratch parameter vector AFTER the gather; the
+/// aggregate loop used to evaluate `FILTER` against the pre-fill `params`, where
+/// a correlated slot is still NULL. A NULL filter REJECTS the row (3VL), so BOTH
+/// `EXISTS` and `NOT EXISTS` returned 0 — the row was dropped, not evaluated.
+#[test]
+fn correlated_subquery_in_filter_matches_sqlite_3_45() {
+    let d = db();
+    // `EXISTS (… c.ref = t.id)` holds for t.id ∈ {1,2,4}: 2 rows in group 0,
+    // 1 in group 1, NONE in group 2 — so a per-group bug cannot hide.
+    const EX: &str = "EXISTS (SELECT 1 FROM c WHERE c.ref = t.id)";
+    let queries = [
+        // ---- the reported shape, scalar (one group) -------------------------
+        format!("SELECT count(*) FILTER (WHERE {EX}) FROM t"),
+        format!("SELECT count(*) FILTER (WHERE NOT {EX}) FROM t"),
+        // ---- GROUP BY: several groups, some matching, one matching NONE -----
+        format!("SELECT g, count(*) FILTER (WHERE {EX}) FROM t GROUP BY g ORDER BY g"),
+        format!("SELECT g, count(*) FILTER (WHERE NOT {EX}) FROM t GROUP BY g ORDER BY g"),
+        // sum/avg/min/max over a correlated filter, incl. an EMPTY filtered
+        // group (group 2 matches nothing → NULL, not 0).
+        format!("SELECT g, sum(y) FILTER (WHERE {EX}), avg(y) FILTER (WHERE {EX}) FROM t GROUP BY g ORDER BY g"),
+        format!("SELECT g, min(x) FILTER (WHERE {EX}), max(x) FILTER (WHERE {EX}) FROM t GROUP BY g ORDER BY g"),
+        // A bare column governed by a single min/max whose FILTER is correlated:
+        // the witness row must follow the FILTERED extremum (COMPAT bare-column
+        // rule) — this is the second `params` reader in the aggregate loop.
+        format!("SELECT g, tag, max(x) FILTER (WHERE {EX}) FROM t GROUP BY g ORDER BY g"),
+        // ---- FILTER + DISTINCT: filter first, then dedupe -------------------
+        format!("SELECT g, count(DISTINCT tag) FILTER (WHERE {EX}) FROM t GROUP BY g ORDER BY g"),
+        format!("SELECT count(DISTINCT g) FILTER (WHERE {EX}) FROM t"),
+        // ---- `IN (…)` as the filter predicate, outer column on the left -----
+        // The subquery itself is uncorrelated (filled once), but the row's own
+        // column drives the test, so this is the per-row shape Django emits.
+        "SELECT g, count(*) FILTER (WHERE t.id IN (SELECT ref FROM c)) \
+         FROM t GROUP BY g ORDER BY g"
+            .to_string(),
+        "SELECT count(*) FILTER (WHERE t.id NOT IN (SELECT ref FROM c)) FROM t".to_string(),
+        // ---- a correlated SCALAR subquery as the filter predicate -----------
+        "SELECT count(*) FILTER (WHERE (SELECT count(*) FROM c WHERE c.ref = t.id) > 1) FROM t".to_string(),
+        // ---- an UNCORRELATED EXISTS in FILTER (filled once, up front) -------
+        "SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM c WHERE c.ref = 99)) FROM t".to_string(),
+        "SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM c WHERE c.ref = -1)) FROM t".to_string(),
+        // ---- two aggregates whose filters read DIFFERENT correlated slots ---
+        format!(
+            "SELECT count(*) FILTER (WHERE {EX}), \
+             count(*) FILTER (WHERE (SELECT count(*) FROM c WHERE c.ref = t.id) > 1), \
+             count(*) FROM t"
+        ),
+        // ---- a correlated WHERE (post_filter) AND a correlated FILTER -------
+        // Both read per-row slots; the WHERE one runs before grouping, the
+        // FILTER one inside it.
+        format!(
+            "SELECT g, count(*) FILTER (WHERE {EX}) FROM t \
+             WHERE (SELECT count(*) FROM c WHERE c.ref = t.id) < 2 GROUP BY g ORDER BY g"
+        ),
+        // ---- a correlated FILTER mixed with an ordinary one -----------------
+        format!("SELECT g, count(*) FILTER (WHERE {EX} AND x > 4) FROM t GROUP BY g ORDER BY g"),
+        // ---- over a JOIN: the row the filter correlates from is the JOINED
+        // row, so the per-row fill must run after `gather_joined`, not before.
+        format!(
+            "SELECT t.g, count(*) FILTER (WHERE {EX}) FROM t JOIN c ON c.ref = t.id \
+             GROUP BY t.g ORDER BY t.g"
+        ),
+        format!(
+            "SELECT t.g, count(*) FILTER (WHERE NOT {EX}) FROM t LEFT JOIN c ON c.ref = t.id \
+             GROUP BY t.g ORDER BY t.g"
+        ),
+        // ---- HAVING alongside a correlated FILTER ---------------------------
+        // The HAVING itself carries no subquery (one in HAVING is refused
+        // separately, see `correlated_subquery_outside_filter_is_refused`); this
+        // checks the grouped stage still reads `params` and prunes correctly.
+        format!(
+            "SELECT g, count(*) FILTER (WHERE {EX}) FROM t GROUP BY g \
+             HAVING count(*) > 1 ORDER BY g"
+        ),
+    ];
+    for q in &queries {
+        agree(&d, q);
+    }
+}
+
+/// The same correlated `FILTER` through the REGISTRY round-trip
+/// (`prepare` → encode → decode → `validate` → `execute`), not just the direct
+/// `query` path. `validate`'s slot discipline used to reject a correlated slot in
+/// an aggregate's `FILTER` as corrupt, so the two paths would have disagreed:
+/// the direct one answering, the prepared one erroring. Same plan, same answer.
+#[test]
+fn correlated_filter_survives_the_plan_registry() {
+    let d = db();
+    for sql in [
+        "SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM c WHERE c.ref = t.id)) FROM t",
+        "SELECT g, count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM c WHERE c.ref = t.id)) \
+         FROM t GROUP BY g ORDER BY g",
+    ] {
+        let h = d.prepare(sql).expect("a correlated FILTER must compile and validate");
+        let prepared = match d.execute(&h, &[]).unwrap() {
+            ExecResult::Rows { rows, .. } => rows,
+            other => panic!("expected rows, got {other:?}"),
+        };
+        assert_eq!(prepared, mpedb_rows(&d, sql), "prepare/execute differs from query for `{sql}`");
+    }
+}
+
+/// The refusal boundary that STAYS. `FILTER (WHERE …)` runs per row, so a
+/// correlated subquery is admitted there; the SELECT list, an aggregate
+/// ARGUMENT, GROUP BY and HAVING run over a collapsed group and are still
+/// refused — CLEANLY, with a message that says why. A refusal beats a wrong
+/// answer; what must never happen is the third thing, silently dropping rows.
+#[test]
+fn correlated_subquery_outside_filter_is_refused() {
+    let d = db();
+    const EX: &str = "EXISTS (SELECT 1 FROM c WHERE c.ref = t.id)";
+    for sql in [
+        // in the SELECT list of an aggregate query
+        "SELECT count(*), (SELECT count(*) FROM c WHERE c.ref = t.id) FROM t".to_string(),
+        // as an aggregate ARGUMENT
+        "SELECT sum((SELECT count(*) FROM c WHERE c.ref = t.id)) FROM t".to_string(),
+        // as a GROUP BY key
+        format!("SELECT {EX}, count(*) FROM t GROUP BY {EX}"),
+    ] {
+        let err = d
+            .query(&sql, &[])
+            .expect_err(&format!("must be refused, not answered: {sql}"));
+        assert!(
+            matches!(err, mpedb::Error::Bind(_)),
+            "must be a clean bind-time refusal, got {err:?} for `{sql}`"
+        );
+    }
+    // A genuinely CORRELATED `IN (SELECT …)` is refused everywhere it appears,
+    // FILTER included — the refusal names the rewrite, and no shape of it
+    // silently answers.
+    let err = d
+        .query(
+            "SELECT count(*) FILTER (WHERE t.id IN (SELECT ref FROM c WHERE c.ref > t.g)) FROM t",
+            &[],
+        )
+        .expect_err("a correlated IN must be refused, not answered");
+    assert!(
+        err.to_string().contains("correlated IN"),
+        "refusal should name the correlated IN, got: {err}"
+    );
 }
 
 /// FILTER on a WINDOW aggregate (`OVER (…)`) is refused with a clean error; the
