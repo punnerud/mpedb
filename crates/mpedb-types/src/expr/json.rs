@@ -1272,11 +1272,7 @@ fn edit_at<'a>(root: &mut Node<'a>, steps: &[Step], new: Node<'a>, mode: Edit) {
                 items[len - *back as usize] = new;
             }
         }
-        (Step::Append, Node::Arr(items)) => {
-            if mode != Edit::Replace {
-                items.push(new);
-            }
-        }
+        (Step::Append, Node::Arr(items)) if mode != Edit::Replace => items.push(new),
         _ => {}
     }
 }
