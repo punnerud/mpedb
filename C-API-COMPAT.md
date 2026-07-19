@@ -218,14 +218,19 @@ Still blocking (ranked by real-app impact):
    `rowid_` column is the same workaround). *A typeless NON-key column now works*
    (`CREATE TABLE t(id INTEGER PRIMARY KEY, data)` → `data` is `Any`); only the
    PK-less / typeless-key cases remain.
-1. **DDL inside an explicit transaction is rejected** — now with a *clear* error
-   (`unsupported: DDL … run it in autocommit, outside BEGIN/COMMIT`) instead of
-   the engine's bare "expected a statement". mpedb's `CREATE`/`DROP`/`ALTER` run
-   only in the autocommit path, not inside a `WriteSession`; a `BEGIN; CREATE
-   TABLE …; COMMIT` fails. Django migrations wrap DDL in transactions. Faking it
-   (commit mid-transaction) would silently break rollback, so this needs
-   **engine** support for DDL in a write session — out of scope for a
-   facade-only shim.
+1. **DDL inside a transaction is rejected — and Python triggers it constantly.**
+   A clear error (`unsupported: DDL … run it in autocommit, outside
+   BEGIN/COMMIT`) rather than a bare "expected a statement", but the real problem
+   is bigger than explicit `BEGIN … COMMIT`: **CPython's `sqlite3` opens an
+   *implicit* transaction on the first DML** (legacy `isolation_level=""` mode),
+   so a `CREATE TABLE` issued after any `INSERT` — the most ordinary script
+   shape — is inside a transaction and fails. `executescript` hits the same wall.
+   The DB-API battery's `unicode_blob` and `executescript` probes both fail for
+   exactly this reason. mpedb's `CREATE`/`DROP`/`ALTER` run only in the
+   autocommit path, not inside a `WriteSession`. Faking it (commit
+   mid-transaction) would silently break rollback, so this needs **engine**
+   support for DDL in a write session — the #2 C-API blocker after implicit rowid
+   (blocker 0), and the two together gate almost every real Python/Django flow.
 2. **No user-defined functions/collations.** `sqlite3_create_function_v2` /
    `_create_collation_v2` are exported but *refuse* (so `import` works); Django
    registers a few (e.g. `django_date_extract`, `django_power`) through the
@@ -259,3 +264,9 @@ Still blocking (ranked by real-app impact):
   (no preload) for a baseline. **Current: stock 23/23; shim 17/23** — the 6
   gaps are all one of: PK-less tables (blocker 0), or named `:params`
   (blocker 4). No wrong answers, only refusals.
+- `tests/dbapi_extra.py` — companion probes over EXPLICIT-PK tables (row_factory/
+  `sqlite3.Row`, cursor-as-iterator, arraysize, connection context manager,
+  aliased/aggregate column names, unicode+blob, executescript, error classes).
+  **stock 11/11; shim 8/11** — the 3 shim gaps are all DDL-in-(implicit)-
+  transaction (blocker 1), surfacing that Python's default transaction mode makes
+  that blocker bite far more than explicit `BEGIN` alone.
