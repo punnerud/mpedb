@@ -49,6 +49,12 @@ pub(crate) enum BExpr {
     /// is a `Not` wrapped around this by the binder, so this node is never
     /// negated.
     Regexp(Box<BExpr>, String),
+    /// `LHS REGEXP <expr>` — the same matcher as [`BExpr::Regexp`] with a
+    /// pattern that is NOT a literal (a bound parameter, a column, any computed
+    /// text). Django always BINDS its regex, which is the whole reason this
+    /// exists (#74 item 3). Like `Regexp` it is never negated — `NOT REGEXP` is
+    /// a `Not` the binder wraps around it.
+    RegexpDyn(Box<BExpr>, Box<BExpr>),
     /// `LHS IN (<context list at reserved param n>)` (DESIGN-MULTIDB §2.6).
     InParam(Box<BExpr>, u16),
     /// `LHS IN (e1, …, en)` — a general value list (task #21).
@@ -836,24 +842,49 @@ impl<'a> Binder<'a> {
                 Ok((e, Some(ColumnType::Bool)))
             }
             ast::Expr::Regexp(lhs, pat, negated) => {
-                // Same shape as GLOB: the pattern must be a text literal, both
-                // operands are text, the result is Bool. `NOT REGEXP` is a real
-                // `Not` over the 3VL result (via `maybe_not`) — NOT of NULL is
-                // NULL, so a NULL operand still yields NULL as SQL requires.
-                let pattern = match pat.as_ref() {
-                    ast::Expr::Lit(Value::Text(p)) => p.clone(),
-                    ast::Expr::Param(_) => {
-                        return Err(bind_err("REGEXP pattern must be a literal in Phase 1"))
-                    }
-                    _ => return Err(bind_err("REGEXP pattern must be a string literal")),
-                };
+                // Both operands are text and the result is Bool. `NOT REGEXP`
+                // is a real `Not` over the 3VL result (via `maybe_not`) — NOT of
+                // NULL is NULL, so a NULL operand still yields NULL as SQL
+                // requires.
+                //
+                // A text LITERAL keeps the const-pool form (`BExpr::Regexp`),
+                // which is every REGEXP mpedb could compile before #74 — its
+                // plan bytes are unchanged. Anything else (a bound parameter,
+                // a column, a computed text) takes the STACK form. Django
+                // always binds its pattern, which is what item 3 is; the old
+                // restriction was structural, inherited from LIKE/GLOB, and NOT
+                // a compiled-regex cache — `regexp_match` was recompiling per
+                // row even for a literal, and now memoizes for both forms.
                 let (l, lt) = self.bind_expr(lhs)?;
                 let (l, lt) = self.unify_param(l, lt, ColumnType::Text);
                 match lt {
                     None | Some(ColumnType::Text) => {}
                     Some(t) => return Err(bind_err(format!("REGEXP requires text, got {t}"))),
                 }
-                let r = fold_maybe(BExpr::Regexp(Box::new(l), pattern), self.suppress_fold)?;
+                let r = match pat.as_ref() {
+                    ast::Expr::Lit(Value::Text(p)) => {
+                        fold_maybe(BExpr::Regexp(Box::new(l), p.clone()), self.suppress_fold)?
+                    }
+                    other => {
+                        let (p, pt) = self.bind_expr(other)?;
+                        let (p, pt) = self.unify_param(p, pt, ColumnType::Text);
+                        match pt {
+                            None | Some(ColumnType::Text) | Some(ColumnType::Any) => {}
+                            Some(t) => {
+                                return Err(bind_err(format!(
+                                    "REGEXP pattern must be text, got {t}"
+                                )))
+                            }
+                        }
+                        // Deliberately NOT folded even when both sides are
+                        // constants: `fold` evaluates the whole node through the
+                        // IR, and `BExpr::RegexpDyn` is left out of its foldable
+                        // set for the same reason `InList` is — the literal path
+                        // above already covers every constant pattern worth
+                        // folding, and a non-literal one is a parameter.
+                        BExpr::RegexpDyn(Box::new(l), Box::new(p))
+                    }
+                };
                 let e = fold_maybe(maybe_not(r, *negated), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
             }
@@ -2477,6 +2508,11 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
             emit(a, instrs, consts)?;
             let idx = push_const(consts, Value::Text(pattern.clone()))?;
             instrs.push(Instr::Glob(idx));
+        }
+        BExpr::RegexpDyn(a, p) => {
+            emit(a, instrs, consts)?;
+            emit(p, instrs, consts)?;
+            instrs.push(Instr::RegexpDyn);
         }
         BExpr::Regexp(a, pattern) => {
             emit(a, instrs, consts)?;

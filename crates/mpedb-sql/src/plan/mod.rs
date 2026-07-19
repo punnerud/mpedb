@@ -325,7 +325,12 @@ const MAX_JOINS: usize = 16;
 //     NOTE (worktree, 2026-07-19): the base this was written on carries 45 and
 //     46 is another agent's in-flight bump, so this takes 47 by instruction and
 //     the numbers are reconciled at merge.
-const PLAN_FORMAT: u8 = 47;
+// 48: `REGEXP` with a NON-literal pattern (task #74 item 3) — one additive expr
+//     opcode, `Instr::RegexpDyn` (tag 55), which pops the pattern off the stack
+//     instead of reading it from the const pool. A LITERAL pattern still
+//     compiles to `Instr::Regexp` and its plan bytes are unchanged, so this is
+//     additive in the same way 47 was.
+const PLAN_FORMAT: u8 = 48;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

@@ -4,9 +4,15 @@
 //! Modeled on the GLOB integration test, and every case here is cross-checked
 //! against the `sqlite3` CLI (3.45), whose `REGEXP` operator ships that engine.
 //!
-//! The pattern is a literal (as with LIKE/GLOB in Phase 1); the left operand is
-//! a text column that may be NULL, so the NULL-propagation rule (`NULL REGEXP p`
-//! and `NULL NOT REGEXP p` are both NULL) is exercised too.
+//! The left operand is a text column that may be NULL, so the NULL-propagation
+//! rule (`NULL REGEXP p` and `NULL NOT REGEXP p` are both NULL) is exercised
+//! too.
+//!
+//! Since #74 item 3 the PATTERN no longer has to be a literal — Django always
+//! binds it. `bound_pattern_matches_the_literal_form` re-runs the whole battery
+//! below with the pattern bound as a parameter and asserts the two forms agree
+//! row-for-row, which is the statement that matters: the dynamic form is the
+//! same matcher, not a second implementation.
 
 use mpedb::{Config, Database, ExecResult, Value};
 use std::io::Write;
@@ -243,4 +249,103 @@ fn regexp_null_and_case_direct() {
     // NULL), exactly as GLOB/LIKE do.
     assert_eq!(one("SELECT s REGEXP '^a' FROM t WHERE id = 12"), Value::Null);
     assert_eq!(one("SELECT s NOT REGEXP '^a' FROM t WHERE id = 12"), Value::Null);
+}
+
+/// #74 item 3 — the pattern bound as a PARAMETER must give exactly what the
+/// same pattern written as a literal gives (and therefore what sqlite gives).
+///
+/// The old restriction ("REGEXP pattern must be a literal") was STRUCTURAL, not
+/// a performance guard: the pattern lived in the plan's const pool because LIKE
+/// and GLOB put it there, and `regexp_match` recompiled it on every row anyway.
+/// It now memoizes the last pattern per thread, so the bound form costs what the
+/// literal form costs.
+#[test]
+fn bound_pattern_matches_the_literal_form() {
+    let d = db();
+    let patterns = [
+        "bc", "^a", "c$", "^a.c$", "a.*c", "^a{2}b", "[abc]", "[^abc]", "[0-9]+", "a|z", "(ab)+",
+        "\\d", "\\w+", "\\s", "\\bbar", "^a\\.c$", "", "zzz", "A",
+    ];
+    for pat in patterns {
+        // The same predicate, once with the pattern inline and once bound.
+        let lit = format!("SELECT id, s REGEXP '{pat}', s NOT REGEXP '{pat}' FROM t ORDER BY id");
+        let literal_rows = mpedb_rows(&d, &lit);
+        // sqlite must agree with the literal form first — otherwise the
+        // comparison below would be against a wrong baseline.
+        assert_eq!(literal_rows, sqlite_rows(&lit), "literal form diverged for /{pat}/");
+
+        let bound = match d
+            .query(
+                "SELECT id, s REGEXP ?, s NOT REGEXP ? FROM t ORDER BY id",
+                &[Value::Text(pat.into()), Value::Text(pat.into())],
+            )
+            .unwrap()
+        {
+            ExecResult::Rows { rows, .. } => rows
+                .into_iter()
+                .map(|r| r.into_iter().map(render).collect::<Vec<String>>())
+                .collect::<Vec<_>>(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(bound, literal_rows, "bound pattern diverged for /{pat}/");
+    }
+}
+
+/// The corners of the dynamic form that the literal form cannot reach.
+#[test]
+fn dynamic_pattern_nulls_columns_and_refusals() {
+    let d = db();
+    let one = |sql: &str, params: &[Value]| -> Value {
+        match d.query(sql, params).unwrap() {
+            ExecResult::Rows { rows, .. } => {
+                rows.into_iter().next().unwrap().into_iter().next().unwrap()
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+
+    // A NULL PATTERN propagates, on both sides and through NOT — the literal
+    // form could never express this, and sqlite answers NULL for it.
+    assert_eq!(one("SELECT s REGEXP ? FROM t WHERE id = 1", &[Value::Null]), Value::Null);
+    assert_eq!(one("SELECT s NOT REGEXP ? FROM t WHERE id = 1", &[Value::Null]), Value::Null);
+    // A NULL subject with a bound pattern, and NULL on both sides.
+    assert_eq!(
+        one("SELECT s REGEXP ? FROM t WHERE id = 12", &[Value::Text("a".into())]),
+        Value::Null
+    );
+    assert_eq!(one("SELECT s REGEXP ? FROM t WHERE id = 12", &[Value::Null]), Value::Null);
+
+    // A COLUMN as the pattern: a string matches itself as a pattern only when
+    // it has no metacharacters, so this is asserted per row against sqlite
+    // rather than assumed.
+    let q = "SELECT id, s REGEXP s FROM t ORDER BY id";
+    assert_eq!(mpedb_rows(&d, q), sqlite_rows(q));
+
+    // A statically non-text pattern is refused by name rather than coerced.
+    let e = d
+        .query("SELECT s REGEXP 3 FROM t", &[])
+        .expect_err("an integer pattern must not bind")
+        .to_string();
+    assert!(e.contains("REGEXP pattern must be text"), "{e}");
+    let e = d
+        .query("SELECT s REGEXP ? FROM t", &[Value::Int(3)])
+        .expect_err("an integer parameter must not bind to the pattern slot")
+        .to_string();
+    assert!(e.contains("statement requires text"), "{e}");
+
+    // The memo is keyed on the pattern VALUE, not on the statement: alternating
+    // patterns through one prepared plan must not answer from a stale program.
+    for (pat, id, want) in [
+        ("^abc$", 1, true),
+        ("^zzz$", 1, false),
+        ("^abc$", 1, true),
+        ("^a", 6, false),
+        ("^abc$", 1, true),
+    ] {
+        assert_eq!(
+            one(&format!("SELECT s REGEXP ? FROM t WHERE id = {id}"), &[Value::Text(pat.into())]),
+            Value::Bool(want),
+            "/{pat}/ against row {id}"
+        );
+    }
 }

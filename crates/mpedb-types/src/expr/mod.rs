@@ -241,6 +241,20 @@ pub enum Instr {
     /// `~a` — sqlite's bitwise NOT. Same [`bit_i64`] coercion, NULL propagates,
     /// result is always an integer (`~3.7` is -4: truncate to 3, then invert).
     BitNot,
+    /// `x REGEXP y` with the pattern from the STACK rather than the const pool
+    /// — the same matcher as [`Instr::Regexp`], for a pattern that is not a
+    /// literal (a bound parameter, a column, any computed text). Pops the
+    /// PATTERN, then the subject beneath it, and pushes the 3VL verdict.
+    ///
+    /// A separate opcode rather than a wider `Regexp` so the literal form —
+    /// which is every REGEXP mpedb could compile before #74 — keeps its exact
+    /// one-operand encoding and its plan bytes.
+    ///
+    /// Both forms go through [`regexp_match`], which memoizes the LAST compiled
+    /// pattern per thread: the pattern is almost always the same on every row
+    /// of a scan, whether it came from a literal or a parameter, so neither
+    /// form recompiles per row.
+    RegexpDyn,
 }
 
 /// Resolve a HOST-registered scalar UDF by name at eval time (the C-API
@@ -584,6 +598,22 @@ impl ExprProgram {
                         _ => {
                             return Err(Error::TypeMismatch(
                                 "GLOB requires text operands".into(),
+                            ))
+                        }
+                    });
+                }
+                // The pattern comes off the STACK (a parameter, a column, any
+                // computed text) instead of the const pool; the operand rules,
+                // the NULL rules and the matcher are the literal form's.
+                Instr::RegexpDyn => {
+                    let pattern = stack.pop().expect("validated");
+                    let a = stack.pop().expect("validated");
+                    stack.push(match (&a, &pattern) {
+                        (Value::Null, _) | (_, Value::Null) => Value::Null,
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(regexp_match(p, s)),
+                        _ => {
+                            return Err(Error::TypeMismatch(
+                                "REGEXP requires text operands".into(),
                             ))
                         }
                     });

@@ -60,6 +60,8 @@ const OP_BIT_OR: u8 = 51;
 const OP_SHL: u8 = 52;
 const OP_SHR: u8 = 53;
 const OP_BIT_NOT: u8 = 54;
+// #74 item 3: REGEXP with the pattern from the STACK instead of the const pool.
+const OP_REGEXP_DYN: u8 = 55;
 
 impl ExprProgram {
     /// Deterministic serialization (part of plan blobs and plan hashing).
@@ -165,6 +167,7 @@ impl ExprProgram {
                 Instr::Shl => buf.push(OP_SHL),
                 Instr::Shr => buf.push(OP_SHR),
                 Instr::BitNot => buf.push(OP_BIT_NOT),
+                Instr::RegexpDyn => buf.push(OP_REGEXP_DYN),
                 Instr::CmpColl(kind, coll) => {
                     buf.push(OP_CMP_COLL);
                     buf.push(kind as u8);
@@ -287,6 +290,7 @@ impl ExprProgram {
                 OP_SHL => Instr::Shl,
                 OP_SHR => Instr::Shr,
                 OP_BIT_NOT => Instr::BitNot,
+                OP_REGEXP_DYN => Instr::RegexpDyn,
                 OP_CMP_COLL => {
                     let k = *buf.get(*pos).ok_or_else(err)?;
                     let c = *buf.get(*pos + 1).ok_or_else(err)?;
