@@ -830,7 +830,14 @@ impl<'a> Binder<'a> {
             ast::Expr::Unary(UnOp::Neg, a) => {
                 let (a, at) = self.bind_expr(a)?;
                 match at {
-                    None | Some(ColumnType::Int64) | Some(ColumnType::Float64) => {}
+                    // `any` (a mixed CASE/COALESCE arm, host UDF result,
+                    // typeless column) negates per VALUE: the runtime `Neg`
+                    // already handles both numeric classes and refuses the
+                    // rest cleanly, and the result stays `any`.
+                    None
+                    | Some(ColumnType::Int64)
+                    | Some(ColumnType::Float64)
+                    | Some(ColumnType::Any) => {}
                     Some(t) => return Err(bind_err(format!("cannot negate {t}"))),
                 }
                 let e = fold_maybe(BExpr::Unary(BUnOp::Neg, Box::new(a)), self.suppress_fold)?;
