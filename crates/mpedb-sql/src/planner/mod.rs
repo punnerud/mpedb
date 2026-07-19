@@ -673,6 +673,15 @@ fn plan_on_conflict(
     let filter = match where_clause {
         Some(w) => {
             let (b, ty) = binder.bind_expr(w)?;
+            // A boolean context like any other: a non-bool is truthy-tested the
+            // way sqlite does (`Binder::coerce_bool_ctx`).
+            let (b, ty) = match binder.coerce_bool_ctx(b, ty) {
+                Ok(v) => v,
+                Err(e) => {
+                    binder.set_allow_excluded(false);
+                    return Err(e);
+                }
+            };
             if !matches!(ty, Some(ColumnType::Bool) | None) {
                 binder.set_allow_excluded(false);
                 return Err(bind_err("ON CONFLICT ... WHERE must be a bool condition"));
@@ -1014,7 +1023,7 @@ fn plan_insert(
                             InsertSource::Default
                         }
                         BExpr::Const(v) => {
-                            let v = coerce_const(v, col.ty);
+                            let v = coerce_const(v, col.ty, binder.sqlite_dialect());
                             if v.is_null() && !col.nullable {
                                 return Err(bind_err(format!(
                                     "cannot insert NULL into NOT NULL column `{}`",
@@ -1241,11 +1250,21 @@ fn plan_delete(
     ))
 }
 
-/// Fold an Int constant into a Float column context (the single legal
-/// implicit coercion).
-fn coerce_const(v: Value, ty: ColumnType) -> Value {
+/// Fold a constant into its column's type where the conversion is EXACT.
+///
+/// Two cases: the Int -> Float widening, and (sqlite dialect only) the
+/// int/bool bridge — sqlite has no boolean type, so `INSERT INTO t (flag)
+/// VALUES (1)` on a `BooleanField` is the shape Django emits. Only the
+/// literals 0 and 1 convert: sqlite would store `2` in its `bool` column and
+/// hand `2` back, which mpedb's rigid `Bool` cannot represent, so anything
+/// else falls through to the `fits` check and is refused rather than guessed.
+/// A `Bool` constant landing in an int64 column goes the other way and is
+/// always exact — that IS sqlite's storage (`TRUE` -> 1).
+fn coerce_const(v: Value, ty: ColumnType, sqlite: bool) -> Value {
     match (&v, ty) {
         (Value::Int(i), ColumnType::Float64) => Value::Float(*i as f64),
+        (Value::Int(i @ (0 | 1)), ColumnType::Bool) if sqlite => Value::Bool(*i == 1),
+        (Value::Bool(b), ColumnType::Int64) if sqlite => Value::Int(*b as i64),
         _ => v,
     }
 }

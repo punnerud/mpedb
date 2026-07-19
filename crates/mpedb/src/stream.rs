@@ -30,7 +30,7 @@
 //! so they are safe to hold across `prepare`/`query` calls on the same
 //! thread (unlike a `WriteSession`).
 
-use crate::exec::{range_bounds, validate_params, RawBound, ReadCtx};
+use crate::exec::{coerce_params, range_bounds, RawBound, ReadCtx};
 use crate::{exec, Database, ExecResult};
 use mpedb_core::ReadTxn;
 use mpedb_sql::{AccessPath, CompiledPlan, PlanStmt, Projection, SelectPlan};
@@ -107,7 +107,8 @@ impl<'db> RowStream<'db> {
                 "stream_query requires a read-only SELECT plan".into(),
             ));
         }
-        validate_params(&plan, params)?;
+        let coerced = coerce_params(&plan, params)?;
+        let params: &[Value] = &coerced;
 
         let table = *table;
         let schema = db.schema();
