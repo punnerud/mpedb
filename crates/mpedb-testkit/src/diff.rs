@@ -1,6 +1,7 @@
 //! Randomized differential tester: the same generated SQL program runs
-//! against **mpedb**, against **/usr/bin/sqlite3** (a STRICT table, whose
-//! rigid typing matches mpedb's), and — in the three-way mode — against a
+//! against **mpedb**, against the **bundled sqlite** (the rusqlite
+//! `bundled` build pinned in Cargo.toml — a STRICT table, whose rigid
+//! typing matches mpedb's), and — in the three-way mode — against a
 //! throwaway **PostgreSQL 16** cluster ([`crate::pg::PgCluster`]).
 //! Per-statement outcomes plus every SELECT's output are compared across
 //! all engines. Any divergence is minimized (greedy statement removal,
@@ -85,13 +86,9 @@
 use crate::pg::{PgCluster, PG_UNAVAILABLE};
 use crate::{Failure, Result, TempDir, Xorshift};
 use mpedb::{Config, Database, ExecResult, Value};
-use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::Write as _;
-use std::path::Path;
-use std::process::{Command, Stdio};
-
-const SQLITE3: &str = "/usr/bin/sqlite3";
+use std::process::Stdio;
 
 const MPEDB_SCHEMA: &str = r#"
 [[table]]
@@ -206,9 +203,6 @@ fn run_differential_impl(
     stmts_per_program: usize,
     pg: Option<&PgCluster>,
 ) -> Result<DiffStats> {
-    if !Path::new(SQLITE3).exists() {
-        return Err(Failure(format!("{SQLITE3} not found")));
-    }
     let mut stats = DiffStats::default();
     for k in 0..programs {
         let seed = base_seed + k as u64;
@@ -480,117 +474,92 @@ fn run_mpedb(program: &[GenStmt]) -> Result<Vec<Outcome>> {
 
 // ---------------------------------------------------------------- sqlite side
 
-/// Run the program in one sqlite3 batch process. Each statement occupies
-/// exactly one script line, bracketed by `SELECT '@S<i>';` markers, so
-/// stdout sections map to statements and stderr's `... near line N:` errors
-/// map back through the line number.
+/// Run the program on a fresh in-memory connection of the BUNDLED sqlite —
+/// the `rusqlite`/`libsqlite3-sys` pinned in Cargo.toml, identical on every
+/// machine. (The subprocess version drove `/usr/bin/sqlite3` and inherited
+/// whatever version the box had; a rendering change between 3.45 and 3.51
+/// could flip the differential on one machine and not another.)
+///
+/// Statements execute in order; one that errors becomes [`Outcome::Failed`]
+/// and the program continues, exactly like the shell without `.bail` — and
+/// the whole stderr-line/`@S<i>`-marker bookkeeping the batch process needed
+/// is gone. Each row is rendered to the same `NULL`-sentinel pipe line the
+/// CLI's `.mode list` produced (REAL through sqlite's own value-to-text
+/// conversion) and parsed back through [`parse_pipe_row`], so the downstream
+/// shape/tolerance comparison is byte-for-byte what it always was.
 fn run_sqlite(program: &[GenStmt]) -> Result<Vec<Outcome>> {
-    let dir = TempDir::new("sqlite")?;
-    let db_path = dir.path().join("diff.sqlite3");
-
-    let mut script = String::new();
-    let mut line_of_stmt: HashMap<usize, usize> = HashMap::new(); // line -> stmt idx
-    let mut lineno = 0usize;
-    let mut push_line = |script: &mut String, l: &str| {
-        script.push_str(l);
-        script.push('\n');
-        lineno += 1;
-        lineno
-    };
-    push_line(&mut script, ".mode list");
-    push_line(&mut script, ".nullvalue NULL");
-    push_line(&mut script, SQLITE_SCHEMA);
-    for (i, stmt) in program.iter().enumerate() {
-        push_line(&mut script, &format!("SELECT '@S{i}';"));
-        debug_assert!(!stmt.sql.contains('\n'), "one line per statement");
-        let ln = push_line(&mut script, &format!("{};", stmt.sql));
-        line_of_stmt.insert(ln, i);
-    }
-    push_line(&mut script, "SELECT '@SEND';");
-
-    let mut child = Command::new(SQLITE3)
-        .arg(&db_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| Failure(format!("failed to spawn {SQLITE3}: {e}")))?;
-    child
-        .stdin
-        .as_mut()
-        .expect("piped stdin")
-        .write_all(script.as_bytes())?;
-    let output = child.wait_with_output()?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-
-    // stderr: `Runtime error near line N: ...` / `Parse error near line N: ...`
-    let mut failed = vec![false; program.len()];
-    for line in stderr.lines() {
-        let Some(rest) = line.split("near line ").nth(1) else {
-            if line.trim().is_empty() {
-                continue;
-            }
-            return Err(Failure(format!(
-                "unrecognized sqlite3 stderr line: {line}\nscript:\n{script}"
-            )));
-        };
-        let n: usize = rest
-            .split(':')
-            .next()
-            .and_then(|s| s.trim().parse().ok())
-            .ok_or_else(|| Failure(format!("cannot parse sqlite3 error line: {line}")))?;
-        let idx = *line_of_stmt.get(&n).ok_or_else(|| {
-            Failure(format!(
-                "sqlite3 error on unexpected script line {n}: {line}"
-            ))
-        })?;
-        failed[idx] = true;
-    }
-
-    // stdout: marker-delimited sections.
-    let mut sections: Vec<Vec<&str>> = vec![Vec::new(); program.len()];
-    let mut current: Option<usize> = None;
-    let mut saw_end = false;
-    for line in stdout.lines() {
-        if let Some(idx) = line.strip_prefix("@S") {
-            if idx == "END" {
-                saw_end = true;
-                current = None;
-                continue;
-            }
-            if let Ok(i) = idx.parse::<usize>() {
-                if i < program.len() {
-                    current = Some(i);
-                    continue;
-                }
-            }
-        }
-        if let Some(i) = current {
-            sections[i].push(line);
-        }
-        // Output before the first marker (CREATE TABLE) would be a harness
-        // bug; there is none, so silently ignoring is fine.
-    }
-    if !saw_end {
-        return Err(Failure(format!(
-            "sqlite3 output truncated (no @SEND marker)\nstderr: {stderr}"
-        )));
-    }
+    let fail = |what: &str, e: rusqlite::Error| Failure(format!("bundled sqlite {what}: {e}"));
+    let conn = rusqlite::Connection::open_in_memory().map_err(|e| fail("open", e))?;
+    // Stock-sqlite default (what /usr/bin/sqlite3 ran with); libsqlite3-sys
+    // builds the bundled library with -DSQLITE_DEFAULT_FOREIGN_KEYS=1.
+    conn.pragma_update(None, "foreign_keys", false)
+        .map_err(|e| fail("pragma", e))?;
+    conn.execute_batch(SQLITE_SCHEMA)
+        .map_err(|e| fail("schema", e))?;
+    // sqlite's own REAL→TEXT conversion — the code path the CLI's output took.
+    let mut caster = conn
+        .prepare("SELECT CAST(?1 AS TEXT)")
+        .map_err(|e| fail("caster", e))?;
 
     let mut out = Vec::with_capacity(program.len());
-    for (i, stmt) in program.iter().enumerate() {
-        if failed[i] {
-            out.push(Outcome::Failed);
-        } else if stmt.is_select {
-            let mut rows = Vec::with_capacity(sections[i].len());
-            for line in &sections[i] {
-                rows.push(parse_pipe_row(line, &stmt.shape)?);
+    for stmt in program {
+        debug_assert!(!stmt.sql.contains('\n'), "one line per statement");
+        let mut prepared = match conn.prepare(&stmt.sql) {
+            Ok(p) => p,
+            Err(_) => {
+                out.push(Outcome::Failed);
+                continue;
             }
-            out.push(Outcome::Rows(rows));
-        } else {
-            out.push(Outcome::Ok);
+        };
+        if !stmt.is_select {
+            out.push(match prepared.raw_execute() {
+                Ok(_) => Outcome::Ok,
+                Err(_) => Outcome::Failed,
+            });
+            continue;
         }
+        let ncol = prepared.column_count();
+        let mut rows_out = Vec::new();
+        let mut rows = prepared.raw_query();
+        let outcome = loop {
+            match rows.next() {
+                Ok(Some(row)) => {
+                    let mut line = String::new();
+                    for i in 0..ncol {
+                        if i > 0 {
+                            line.push('|');
+                        }
+                        match row.get_ref(i).map_err(|e| fail("column", e))? {
+                            rusqlite::types::ValueRef::Null => line.push_str("NULL"),
+                            rusqlite::types::ValueRef::Integer(v) => {
+                                line.push_str(&v.to_string());
+                            }
+                            rusqlite::types::ValueRef::Real(f) => {
+                                let text: String = caster
+                                    .query_row([f], |r| r.get(0))
+                                    .map_err(|e| fail("real→text", e))?;
+                                line.push_str(&text);
+                            }
+                            rusqlite::types::ValueRef::Text(t) => {
+                                line.push_str(&String::from_utf8_lossy(t));
+                            }
+                            other => {
+                                return Err(Failure(format!(
+                                    "unexpected sqlite value class {other:?} for `{}`",
+                                    stmt.sql
+                                )))
+                            }
+                        }
+                    }
+                    rows_out.push(parse_pipe_row(&line, &stmt.shape)?);
+                }
+                Ok(None) => break Outcome::Rows(rows_out),
+                // A runtime error mid-SELECT: Failed, like the batch version
+                // (partial marker-section rows were discarded there too).
+                Err(_) => break Outcome::Failed,
+            }
+        };
+        out.push(outcome);
     }
     Ok(out)
 }
