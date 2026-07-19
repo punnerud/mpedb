@@ -22,10 +22,11 @@
 //!     (The mirror's PG-import → postgres default is covered in mpedb-mirror.)
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -180,11 +181,11 @@ fn mpedb_rows(db: &Database, query: &str) -> Vec<Vec<String>> {
     }
 }
 
-/// sqlite3's answer to `query` over `DDL + inserts`, SORTED. `None` if the
-/// `sqlite3` binary is not installed (the differential half is then skipped).
-fn sqlite_rows(rows: &[Row], query: &str) -> Option<Vec<Vec<String>>> {
+/// The bundled sqlite's answer to `query` over `DDL + inserts`, SORTED.
+/// (Always available — it is compiled in — so the `Option` the subprocess
+/// version had is gone; the differential half always runs.)
+fn sqlite_rows(rows: &[Row], query: &str) -> Vec<Vec<String>> {
     let mut script = String::new();
-    script.push_str(".mode list\n.separator |\n.nullvalue <NULL>\n");
     script.push_str(SQLITE_DDL);
     script.push('\n');
     for (id, g, x, name) in rows {
@@ -199,41 +200,20 @@ fn sqlite_rows(rows: &[Row], query: &str) -> Option<Vec<Vec<String>>> {
     script.push_str(query);
     script.push_str(";\n");
 
-    let mut child = Command::new("sqlite3")
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(script.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "sqlite3 failed on `{query}`: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let mut parsed: Vec<Vec<String>> = String::from_utf8(out.stdout)
-        .unwrap()
+    let mut parsed: Vec<Vec<String>> = sqlite_oracle::script_stdout(&script, "<NULL>")
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| l.split('|').map(|s| s.to_string()).collect())
         .collect();
     parsed.sort();
-    Some(parsed)
+    parsed
 }
 
 /// Assert mpedb's sqlite-mode answer equals sqlite's, over `rows`.
 fn assert_matches_sqlite_data(db: &Database, rows: &[Row], query: &str) {
     let got = mpedb_rows(db, query);
-    if let Some(want) = sqlite_rows(rows, query) {
-        assert_eq!(got, want, "mpedb vs sqlite differ on `{query}`");
-    }
+    let want = sqlite_rows(rows, query);
+    assert_eq!(got, want, "mpedb vs sqlite differ on `{query}`");
 }
 
 /// Assert mpedb's sqlite-mode answer equals sqlite's, over the shared `DATA`.

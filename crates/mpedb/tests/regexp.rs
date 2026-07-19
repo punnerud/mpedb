@@ -126,6 +126,13 @@ fn mpedb_rows(db: &Database, sql: &str) -> Vec<Vec<String>> {
 
 /// Run a full script (schema + data + one query) through the `sqlite3` CLI and
 /// parse its default list-mode output into rows.
+///
+/// DELIBERATELY the system binary, not the bundled oracle
+/// (`tests/sqlite_oracle/mod.rs`) every other differential test uses: the
+/// `regexp()` function is NOT part of the sqlite library — it is
+/// `ext/misc/regexp.c`, compiled into the SHELL — so the bundled library
+/// cannot answer REGEXP queries at all. This file is the one exemption, and
+/// the only differential left that still requires a `sqlite3` on PATH.
 fn sqlite_rows(query: &str) -> Vec<Vec<String>> {
     let mut script = String::from("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT);\n");
     for stmt in insert_statements() {

@@ -25,11 +25,11 @@
 //! access-path change must never change an answer.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::io::Write;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const SQLITE3: &str = "sqlite3";
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
+
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 /// `t` is the write target, `u` the subquery source. Both carry NULLs, `u.tk`
@@ -108,7 +108,7 @@ fn mpedb_image(db: &Database) -> Vec<String> {
 
 /// Run the seed + `dml` + the same post-image query through the sqlite3 CLI.
 fn sqlite_image(dml: &str, indexed: bool) -> Vec<String> {
-    let mut script = String::from(".mode list\n.nullvalue NULL\n.bail on\n");
+    let mut script = String::new();
     script.push_str(SQLITE_SCHEMA);
     if indexed {
         script.push_str(SQLITE_INDEXES);
@@ -120,21 +120,7 @@ fn sqlite_image(dml: &str, indexed: bool) -> Vec<String> {
     script.push_str(dml);
     script.push_str(";\nSELECT id, k, v, s FROM t ORDER BY id;\n");
 
-    let mut child = Command::new(SQLITE3)
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the sqlite3 CLI (3.45) must be on PATH for this cross-check");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "sqlite3 rejected `{dml}`: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout).unwrap().lines().map(str::to_string).collect()
+    sqlite_oracle::script_stdout(&script, "NULL").lines().map(str::to_string).collect()
 }
 
 /// Run `dml` in a FRESH database (both engines) and assert the post-images of

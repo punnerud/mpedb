@@ -14,24 +14,15 @@
 //! an untyped bare parameter in a data slot is refused) are asserted directly.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 const NULL_SENTINEL: &str = "<NULL>";
-
-fn sqlite_available() -> bool {
-    Command::new("sqlite3")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 
 fn mpedb_db() -> (Database, PathBuf) {
     let dir = if Path::new("/dev/shm").is_dir() {
@@ -122,27 +113,7 @@ fn sqlite_rows(query: &str) -> Vec<String> {
     let mut input = sqlite_setup();
     input.push_str(query);
     input.push_str(";\n");
-    let mut child = Command::new("sqlite3")
-        .args(["-batch", "-noheader", "-nullvalue", NULL_SENTINEL, ":memory:"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn sqlite3");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write to sqlite3");
-    let out = child.wait_with_output().expect("wait sqlite3");
-    assert!(
-        out.status.success(),
-        "sqlite3 failed for `{query}`: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout)
-        .expect("utf8")
+    sqlite_oracle::script_stdout(&input, NULL_SENTINEL)
         .lines()
         .map(|l| l.to_string())
         .collect()
@@ -166,23 +137,7 @@ fn cross_check_batch(db: &Database, queries: &[String]) {
         input.push_str(q);
         input.push_str(";\n");
     }
-    let mut child = Command::new("sqlite3")
-        .args(["-batch", "-noheader", "-nullvalue", NULL_SENTINEL, ":memory:"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn sqlite3");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write to sqlite3");
-    let out = child.wait_with_output().expect("wait sqlite3");
-    assert!(out.status.success(), "sqlite3 batch failed: {}", String::from_utf8_lossy(&out.stderr));
-    let s_lines: Vec<String> = String::from_utf8(out.stdout)
-        .expect("utf8")
+    let s_lines: Vec<String> = sqlite_oracle::script_stdout(&input, NULL_SENTINEL)
         .lines()
         .map(|l| l.to_string())
         .collect();
@@ -202,10 +157,6 @@ fn cross_check_batch(db: &Database, queries: &[String]) {
 
 #[test]
 fn printf_matches_sqlite() {
-    if !sqlite_available() {
-        eprintln!("skipping: sqlite3 CLI not found");
-        return;
-    }
     let (db, path) = mpedb_db();
 
     // Every case is a FROM-less SELECT (one synthetic row); the value is text or
@@ -400,10 +351,6 @@ fn printf_matches_sqlite() {
 #[allow(clippy::approx_constant)]
 #[test]
 fn printf_float_and_int_sweep_matches_sqlite() {
-    if !sqlite_available() {
-        eprintln!("skipping: sqlite3 CLI not found");
-        return;
-    }
     let (db, path) = mpedb_db();
 
     // A deterministic value set: halves, unit fractions, sevenths, and a fixed

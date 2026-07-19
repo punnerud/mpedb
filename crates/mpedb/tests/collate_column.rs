@@ -19,10 +19,11 @@
 //! unknown collation name, and a non-BINARY collation on a non-text column.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::io::Write;
 use std::ops::Deref;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -146,18 +147,7 @@ fn sqlite_rows(query: &str) -> Vec<Vec<String>> {
     script.push_str(query);
     script.push_str(";\n");
 
-    let mut child = Command::new("sqlite3")
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the sqlite3 CLI (3.45) must be on PATH for this cross-check");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success(), "sqlite3 failed: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8(out.stdout)
-        .unwrap()
+    sqlite_oracle::script_stdout(&script, "")
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| l.split('|').map(str::to_string).collect())
@@ -283,18 +273,7 @@ fn alter_add_column_collate_matches_sqlite() {
     }
     script.push_str(query);
     script.push_str(";\n");
-    let mut child = Command::new("sqlite3")
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("sqlite3 CLI required");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success(), "sqlite3: {}", String::from_utf8_lossy(&out.stderr));
-    let want: Vec<Vec<String>> = String::from_utf8(out.stdout)
-        .unwrap()
+    let want: Vec<Vec<String>> = sqlite_oracle::script_stdout(&script, "")
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| l.split('|').map(str::to_string).collect())
@@ -343,28 +322,16 @@ fn run_mpedb(stmts: &[&str]) -> Result<Vec<Vec<String>>, String> {
     Ok(last)
 }
 
-/// The same script through the sqlite3 CLI: `Ok(rows)` on success, `Err` if any
-/// statement failed (so a UNIQUE / PK violation surfaces as `Err`, like mpedb).
+/// The same script through the bundled sqlite: `Ok(rows)` on success, `Err` if
+/// any statement failed (so a UNIQUE / PK violation surfaces as `Err`, like
+/// mpedb; `try_script_stdout` is fail-fast, the old script's `.bail on`).
 fn run_sqlite(stmts: &[&str]) -> Result<Vec<Vec<String>>, String> {
-    let mut script = String::from(".bail on\n");
+    let mut script = String::new();
     for s in stmts {
         script.push_str(s);
         script.push_str(";\n");
     }
-    let mut child = Command::new("sqlite3")
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("sqlite3 CLI (3.45) required");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
-    let out = child.wait_with_output().unwrap();
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).to_string());
-    }
-    Ok(String::from_utf8(out.stdout)
-        .unwrap()
+    Ok(sqlite_oracle::try_script_stdout(&script, "")?
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| l.split('|').map(str::to_string).collect())

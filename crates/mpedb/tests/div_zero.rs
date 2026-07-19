@@ -9,10 +9,11 @@
 //! cases too, so the intent is explicit even if the CLI is absent.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -22,16 +23,6 @@ const ROWS: &[&str] = &[
     "INSERT INTO t (id, a, f) VALUES (1, 5, 5.5)",
     "INSERT INTO t (id, a, f) VALUES (2, NULL, NULL)",
 ];
-
-fn sqlite_available() -> bool {
-    Command::new("sqlite3")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 
 fn mpedb_db() -> (Database, PathBuf) {
     let dir = if Path::new("/dev/shm").is_dir() {
@@ -103,29 +94,7 @@ fn sqlite_cells(query: &str, with_table: bool) -> Vec<String> {
     let mut input = if with_table { sqlite_setup() } else { String::new() };
     input.push_str(query);
     input.push_str(";\n");
-    let mut child = Command::new("sqlite3")
-        .args(["-batch", "-noheader", "-nullvalue", "NULL", ":memory:"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn sqlite3");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write to sqlite3");
-    let out = child.wait_with_output().expect("wait sqlite3");
-    assert!(
-        out.status.success(),
-        "sqlite3 failed for `{query}`: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    // Each row prints its columns pipe-separated (only single-column queries
-    // are used here, so a line is a cell).
-    String::from_utf8(out.stdout)
-        .expect("utf8")
+    sqlite_oracle::script_stdout(&input, "NULL")
         .lines()
         .flat_map(|l| l.split('|').map(str::to_string).collect::<Vec<_>>())
         .collect()
@@ -179,10 +148,6 @@ fn scalar(db: &Database, sql: &str) -> Value {
 
 #[test]
 fn div_zero_matches_sqlite_differentially() {
-    if !sqlite_available() {
-        eprintln!("skipping: sqlite3 CLI not found");
-        return;
-    }
     let (db, path) = mpedb_db();
 
     // FROM-less scalars: every division / modulo by zero is NULL, in integer

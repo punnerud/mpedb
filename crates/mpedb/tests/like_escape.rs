@@ -25,10 +25,11 @@
 //! asserted to agree with the sqlite-dialect database as well.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -64,16 +65,6 @@ primary_key = ["id"]
   name = "s"
   type = "text"
 "#;
-
-fn sqlite_available() -> bool {
-    Command::new("sqlite3")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 
 fn inserts() -> Vec<String> {
     DATA.iter()
@@ -136,27 +127,7 @@ fn sqlite_rows(query: &str) -> Vec<String> {
     }
     input.push_str(query);
     input.push_str(";\n");
-    let mut child = Command::new("sqlite3")
-        .args(["-batch", "-noheader", "-nullvalue", "NULL", ":memory:"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn sqlite3");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write to sqlite3");
-    let out = child.wait_with_output().expect("wait sqlite3");
-    assert!(
-        out.status.success(),
-        "sqlite3 failed for `{query}`: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout)
-        .expect("utf8")
+    sqlite_oracle::script_stdout(&input, "NULL")
         .lines()
         .map(|l| l.to_string())
         .collect()
@@ -173,10 +144,6 @@ fn cross_check(db: &Database, query: &str) {
 /// disagreement names the row AND shows the boolean both engines produced.
 #[test]
 fn like_escape_matches_sqlite() {
-    if !sqlite_available() {
-        eprintln!("skipping: sqlite3 CLI not found");
-        return;
-    }
     let (db, path) = open(None);
 
     let preds = [
@@ -287,14 +254,12 @@ fn a_bad_escape_argument_is_refused_by_name() {
         assert!(m.contains("ESCAPE"), "the refusal must name ESCAPE: {m}\n  for {sql}");
     }
     // sqlite agrees that the first two are errors (it just raises later).
-    if sqlite_available() {
-        for pat in ["''", "'ab'"] {
-            let out = Command::new("sqlite3")
-                .args([":memory:", &format!("SELECT 'x' LIKE 'x' ESCAPE {pat}")])
-                .output()
-                .expect("spawn sqlite3");
-            assert!(!out.status.success(), "sqlite must reject ESCAPE {pat}");
-        }
+    for pat in ["''", "'ab'"] {
+        assert!(
+            sqlite_oracle::try_script_stdout(&format!("SELECT 'x' LIKE 'x' ESCAPE {pat};"), "")
+                .is_err(),
+            "sqlite must reject ESCAPE {pat}"
+        );
     }
     drop(db);
     let _ = std::fs::remove_file(&path);

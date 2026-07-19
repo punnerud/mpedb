@@ -10,14 +10,14 @@
 //! 2. A curated corpus of `.test` files under `tests/slt/` — executable
 //!    documentation of mpedb's SQL semantics.
 //! 3. [`diff`] — a randomized differential tester that runs the same
-//!    generated program against mpedb, `/usr/bin/sqlite3` (STRICT tables)
-//!    and — in three-way mode — a throwaway PostgreSQL 16 cluster
-//!    ([`pg::PgCluster`]), comparing SELECT outputs and per-statement
-//!    success across all engines.
+//!    generated program against mpedb, the BUNDLED sqlite (rusqlite
+//!    `bundled`, pinned in Cargo.toml; STRICT tables) and — in three-way
+//!    mode — a throwaway PostgreSQL 16 cluster ([`pg::PgCluster`]),
+//!    comparing SELECT outputs and per-statement success across all engines.
 //!
-//! No dependencies beyond the workspace: randomness is a seeded xorshift
-//! (the workspace convention — deterministic, reproducible failures);
-//! sqlite3 and psql are driven as batch subprocesses.
+//! Randomness is a seeded xorshift (the workspace convention —
+//! deterministic, reproducible failures); sqlite is in-process via the
+//! pinned bundled build, and psql is driven as a batch subprocess.
 
 pub mod diff;
 pub mod pg;
@@ -30,7 +30,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A test-harness failure: either the harness could not do its job (I/O,
-/// malformed .test file, sqlite3 missing) or — the interesting case — the
+/// malformed .test file) or — the interesting case — the
 /// engine under test produced something other than the expected result.
 /// The message is self-contained: file/line/SQL plus expected-vs-got.
 #[derive(Debug)]

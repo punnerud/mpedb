@@ -16,10 +16,11 @@
 //! grouped/scalar aggregates.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::io::Write;
 use std::ops::Deref;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -137,7 +138,7 @@ fn mpedb_rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 /// Run `CREATE t` + inserts + the query through the sqlite3 CLI in list mode
 /// (`|`-separated, NULL rendered as `NULL`) and parse each row's cells.
 fn sqlite_rows(query: &str) -> Vec<Vec<String>> {
-    let mut script = String::from(".mode list\n.nullvalue NULL\n");
+    let mut script = String::new();
     script.push_str(CREATE);
     script.push_str(";\n");
     script.push_str(CREATE_CHILD);
@@ -149,18 +150,7 @@ fn sqlite_rows(query: &str) -> Vec<Vec<String>> {
     script.push_str(query);
     script.push_str(";\n");
 
-    let mut child = Command::new("sqlite3")
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the sqlite3 CLI (3.45) must be on PATH for this cross-check");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success(), "sqlite3 failed: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8(out.stdout)
-        .unwrap()
+    sqlite_oracle::script_stdout(&script, "NULL")
         .lines()
         .map(|l| l.split('|').map(str::to_string).collect())
         .collect()

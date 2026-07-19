@@ -1,0 +1,10 @@
+# Compile the BUNDLED sqlite (libsqlite3-sys, pinned in Cargo.toml) with the
+# math scalar functions (sin/cos/log2/…). The sqlite3 CLI ships them by
+# default, and the differential tests (crates/mpedb/tests/sqlite_oracle) use
+# the bundled library as their oracle — without this flag the oracle would
+# lack functions mpedb implements and cross-checks. Strictly additive for the
+# production users of bundled rusqlite (mirror / sqlite-checkpoint).
+# mpedb-capi never builds bundled sqlite (it EXPORTS the sqlite3_* symbols),
+# so this does not affect the shim.
+[env]
+LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS"

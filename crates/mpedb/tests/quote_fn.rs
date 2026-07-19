@@ -16,10 +16,11 @@
 //! decimal-to-binary parser.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -30,16 +31,6 @@ fn rows() -> Vec<String> {
         v.push(format!("INSERT INTO t (id, n) VALUES ({n}, {n})"));
     }
     v
-}
-
-fn sqlite_available() -> bool {
-    Command::new("sqlite3")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 fn mpedb_db() -> (Database, PathBuf) {
@@ -114,27 +105,7 @@ fn sqlite_rows(query: &str) -> Vec<String> {
     let mut input = sqlite_setup();
     input.push_str(query);
     input.push_str(";\n");
-    let mut child = Command::new("sqlite3")
-        .args(["-batch", "-noheader", "-nullvalue", "NULL", ":memory:"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn sqlite3");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write to sqlite3");
-    let out = child.wait_with_output().expect("wait sqlite3");
-    assert!(
-        out.status.success(),
-        "sqlite3 failed for `{query}`: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout)
-        .expect("utf8")
+    sqlite_oracle::script_stdout(&input, "NULL")
         .lines()
         .map(|l| l.to_string())
         .collect()
@@ -148,10 +119,6 @@ fn cross_check(db: &Database, query: &str) {
 
 #[test]
 fn quote_matches_sqlite_for_every_storage_class() {
-    if !sqlite_available() {
-        eprintln!("skipping: sqlite3 CLI not found");
-        return;
-    }
     let (db, path) = mpedb_db();
 
     // --- NULL, text, integers -------------------------------------------
@@ -228,10 +195,6 @@ fn sig_digits(s: &str) -> usize {
 /// to guess (see `printf::quote_float`).
 #[test]
 fn quote_float_sweep_is_exact_or_a_refusal_of_the_unportable_branch() {
-    if !sqlite_available() {
-        eprintln!("skipping: sqlite3 CLI not found");
-        return;
-    }
     let (db, path) = mpedb_db();
     let mut answered = 0usize;
     let mut refused = 0usize;
@@ -315,10 +278,6 @@ fn quote_refuses_the_reals_whose_sqlite_rendering_is_build_dependent() {
 
 #[test]
 fn quote_of_a_bound_parameter_matches_sqlite() {
-    if !sqlite_available() {
-        eprintln!("skipping: sqlite3 CLI not found");
-        return;
-    }
     let (db, path) = mpedb_db();
     // Django's `last_executed_query` emits exactly `SELECT QUOTE(?)`, so the
     // argument is an UNTYPED parameter: quote() must not pin it to a type.
