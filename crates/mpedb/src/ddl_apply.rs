@@ -156,6 +156,10 @@ pub(crate) fn table_def_from_spec(
         .filter(|c| c.pk)
         .map(|c| c.name.as_str())
         .collect();
+    // `implicit_rowid` (#94): a `CREATE TABLE` with NO declared PRIMARY KEY gets
+    // sqlite's hidden auto-increment integer `rowid` synthesized as its sole key
+    // (built below), rather than the historical "mpedb requires one" refusal.
+    let mut implicit_rowid = false;
     let pk_names: Vec<String> = match (inline_pk.is_empty(), spec.table_pk.is_empty()) {
         (false, true) => {
             // Multiple inline `PRIMARY KEY` columns is almost always a
@@ -176,10 +180,24 @@ pub(crate) fn table_def_from_spec(
         }
         (true, false) => spec.table_pk.clone(),
         (true, true) => {
-            return Err(Error::Bind(format!(
-                "CREATE TABLE {}: no PRIMARY KEY declared (mpedb requires one)",
-                spec.name
-            )))
+            // No PRIMARY KEY: synthesize the hidden rowid. A visible column that
+            // is already spelled like one of sqlite's rowid names would collide
+            // with (or silently shadow) the synthesized `rowid` — refuse cleanly
+            // rather than risk answering differently than sqlite (#94: refuse the
+            // brittle case, never guess).
+            for c in &spec.columns {
+                let lc = c.name.to_ascii_lowercase();
+                if lc == "rowid" || lc == "_rowid_" || lc == "oid" {
+                    return Err(Error::Bind(format!(
+                        "CREATE TABLE {}: a table without a declared PRIMARY KEY may not \
+                         also declare a column named `{}` — it collides with the implicit \
+                         rowid; declare an explicit PRIMARY KEY instead",
+                        spec.name, c.name
+                    )));
+                }
+            }
+            implicit_rowid = true;
+            Vec::new()
         }
         (false, false) => {
             return Err(Error::Bind(format!(
@@ -201,11 +219,10 @@ pub(crate) fn table_def_from_spec(
                 ))
             })
     };
-    let primary_key = pk_names
-        .iter()
-        .map(|n| col_index(n))
-        .collect::<Result<Vec<u16>>>()?;
-    let columns = spec
+    // Visible columns first (declaration order, ordinals `0..n-1`); the uniques
+    // and any explicit PK resolve against these, so appending the hidden rowid
+    // last never shifts a referenced ordinal.
+    let mut columns: Vec<mpedb_types::ColumnDef> = spec
         .columns
         .iter()
         .map(|c| mpedb_types::ColumnDef {
@@ -232,6 +249,26 @@ pub(crate) fn table_def_from_spec(
             })
         })
         .collect::<Result<Vec<_>>>()?;
+    let primary_key = if implicit_rowid {
+        // Append the hidden rowid as the trailing column and make it the sole PK.
+        // It IS a single-Int64-PK rowid alias, so the existing NULL→max(rowid)+1
+        // auto-assign machinery (#85) drives it with no engine change.
+        columns.push(mpedb_types::ColumnDef {
+            name: "rowid".into(),
+            ty: mpedb_types::ColumnType::Int64,
+            nullable: false,
+            unique: false,
+            indexed: false,
+            default: None,
+            check: None,
+        });
+        vec![(columns.len() - 1) as u16]
+    } else {
+        pk_names
+            .iter()
+            .map(|n| col_index(n))
+            .collect::<Result<Vec<u16>>>()?
+    };
     Ok(mpedb_types::TableDef {
         id: 0, // assigned by Schema::with_added_table (lowest free)
         name: spec.name,
@@ -239,6 +276,7 @@ pub(crate) fn table_def_from_spec(
         primary_key,
         indexes,
         dead: false,
+        implicit_rowid,
         kind: mpedb_types::TableKind::Standard,
     })
 }
@@ -284,6 +322,7 @@ pub(crate) fn virtual_table_def_from_spec(
         primary_key: vec![0],
         indexes: Vec::new(),
         dead: false,
+        implicit_rowid: false,
         kind: mpedb_types::TableKind::Fts { tokenizer: spec.tokenizer },
     })
 }
