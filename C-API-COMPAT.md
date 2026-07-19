@@ -454,7 +454,7 @@ The honest reading of those two deltas:
   `test_values_expression_alias_sql_injection_json_field` are skipped rather
   than failed. Adjusted, the shim is 507/831.
 
-  **This was a trap worth 439 tests, not 2 — and it is now half-closed.** Both
+  **This was a trap worth 439 tests, not 2 — and it is now closed.** Both
   JSONField models in these labels (`tests/annotations/models.py::JsonModel`,
   `tests/expressions/models.py::JSONFieldModel`) declare
   `Meta.required_db_features = {"supports_json_field"}`, so at run 2 Django
@@ -471,10 +471,10 @@ The honest reading of those two deltas:
   ```
 
   A CREATE TABLE failure during `migrate` aborts `create_test_db()`, which takes
-  down the whole label. Closing this needs **two** things together, and only one
-  of them is here:
+  down the whole label. Closing this needed **two** things together, and both
+  are now in:
 
-  * **DONE (PLAN_FORMAT 45): the JSON function set**, not just `json()`. `json`,
+  * **DONE (PLAN_FORMAT 46): the JSON function set**, not just `json()`. `json`,
     `json_valid`, `json_type`, `json_quote`, `json_array_length`,
     `json_extract`, the `->` and `->>` operators, `json_array`, `json_object`,
     `json_patch`, `json_remove`, `json_replace`, `json_set`, `json_insert` —
@@ -482,12 +482,16 @@ The honest reading of those two deltas:
     differential-tested against `sqlite3` 3.45.1 in
     `crates/mpedb/tests/json_fn.rs`. `json_valid()` returns sqlite's INTEGER 0/1,
     which is what the CHECK needs.
-  * **STILL OPEN: gap 5, the int↔bool bridge.** The CHECK now fails on the
-    second line above and nothing else — `AND/OR requires boolean operands, got
-    int64`. Until that lands, `supports_json_field` must stay off and the label
-    stays skipped. `django_jsonfield_check_compiles_and_enforces` in
-    `json_fn.rs` asserts exactly this and reports which half is missing, so it
-    will start exercising the CHECK for real the moment the bridge arrives.
+  * **DONE: gap 5, the int↔bool bridge**, landed separately (an integer in a
+    boolean context is truthy-tested). That was the other half: it is what makes
+    `JSON_VALID()`'s INTEGER 0/1 usable as the left operand of the `OR`.
+
+  With both halves in, `django_jsonfield_check_compiles_and_enforces` in
+  `json_fn.rs` no longer takes its early-return path — it now compiles Django's
+  CHECK verbatim, accepts a valid document and `NULL`, **rejects** `'not json'`,
+  and resolves the `data__k` / `data__k__0` lookups Django compiles
+  (`JSON_EXTRACT`, `->>`, `JSON_TYPE`). `supports_json_field` can be turned on;
+  the 439 gated tests are unblocked and want a run 3 to be scored.
 
   On the JSON5 subtlety this note flagged: sqlite 3.45's `json()` and
   `json_valid()` **deliberately disagree** — `json('{a:1}')` is `{"a":1}` (it

@@ -920,10 +920,12 @@ fn out_of_scope_json_functions_name_themselves() {
 /// The exact table Django's `JSONField` creates on sqlite, and rows going in
 /// through the CHECK.
 ///
-/// If this test fails on the `AND/OR requires boolean operands` message, the
-/// int-to-bool bridge (a separate task) has not landed yet: `JSON_VALID()`
-/// returns the integer 0/1 that sqlite returns, and the CHECK needs that to be
-/// usable as a boolean.
+/// This needs BOTH halves of Django gap #4, and both have landed: the JSON
+/// function set (so `JSON_VALID()` resolves at all) and the int-to-bool bridge
+/// (so the INTEGER 0/1 it returns is usable as the left operand of the `OR`).
+/// Neither may regress silently, so the CHECK must now COMPILE — a failure on
+/// `AND/OR requires boolean operands` means the bridge regressed and is a test
+/// failure, not a skip.
 #[test]
 fn django_jsonfield_check_compiles_and_enforces() {
     let dir = if Path::new("/dev/shm").is_dir() {
@@ -959,23 +961,9 @@ primary_key = ["id"]
         "id" integer NOT NULL PRIMARY KEY,
         "data" text NULL CHECK ((JSON_VALID("data") OR "data" IS NULL))
     )"#;
-    let created = db.query(ddl, &[]);
-    match created {
-        Ok(_) => {}
-        Err(e) => {
-            let msg = e.to_string();
-            assert!(
-                msg.contains("AND/OR requires boolean operands"),
-                "Django's JSONField CHECK failed for a reason other than the \
-                 pending int-to-bool bridge: {msg}"
-            );
-            eprintln!(
-                "NOTE: Django's JSONField CHECK still blocked by the int-to-bool bridge: {msg}"
-            );
-            drop(db);
-            let _ = std::fs::remove_file(&path);
-            return;
-        }
+    if let Err(e) = db.query(ddl, &[]) {
+        panic!("Django's JSONField CHECK must compile — both halves of gap #4 \
+                have landed, so this is a regression: {e}");
     }
     db.query(r#"INSERT INTO "model" (id, data) VALUES (1, '{"k": [1, 2]}')"#, &[])
         .expect("a valid document must pass the CHECK");
