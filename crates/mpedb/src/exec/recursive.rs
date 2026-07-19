@@ -161,6 +161,16 @@ impl WorkingTableCtx<'_, '_> {
 }
 
 impl TxnCtx for WorkingTableCtx<'_, '_> {
+    // A wrapper must not narrow scope: a recursive CTE runs on whatever context
+    // it wraps, so the host UDF closures in scope there are in scope here too
+    // (design/DESIGN-UDF.md). Without this forwarding a UDF called inside a
+    // `WITH RECURSIVE` body silently left scope and refused.
+    fn host_fns(&self) -> Option<&dyn mpedb_types::HostFns> {
+        self.inner.host_fns()
+    }
+    fn host_aggs(&self) -> Option<&dyn mpedb_types::HostAggs> {
+        self.inner.host_aggs()
+    }
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
         if table == CTE_TABLE {
             return Err(Self::keyed_bug());
