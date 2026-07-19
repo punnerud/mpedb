@@ -156,8 +156,8 @@ converges on:
   (socket-activation) and its sync woken on change — a "stable replica environment without heavy
   processes." Default role = **read replica** (zero resident); a write burst wakes write-acceptance on
   the shard's master, or promotes a near-current follower — **elastic write reception**, so a server
-  contributes capacity only when requests arrive ("ikke trenge service kjørende før det kommer
-  requests").
+  contributes capacity only when requests arrive (the original requirement: "no
+  service needs to be running before requests come in").
 - **The one consistent thing: the shard→master directory.** Which server owns a shard's write master
   must be agreed, or two writers appear. That tiny routing table is *exactly* the small CP core from
   §3 — put it in **etcd / a consistent directory**, NOT the data plane. Data plane = AP/serverless per
