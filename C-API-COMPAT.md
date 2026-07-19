@@ -53,7 +53,8 @@ The tables below list, by category, exactly what the shim implements.
 | `sqlite3_open` | ✅ | Always create+read/write. `:memory:`, `""` and `file::memory:` → an ephemeral file on `/dev/shm` (or the temp dir), removed on close |
 | `sqlite3_open_v2` | 🚧 | Honors `SQLITE_OPEN_CREATE` (a missing file without it → `SQLITE_CANTOPEN`) and `SQLITE_OPEN_MEMORY`; minimal `file:` URI parsing. A named **`zVfs`**: the built-in names (`unix*`/`win32*`/`memdb`, or NULL) denote ordinary file I/O and are honored; a **custom/unknown VFS is REFUSED** with `SQLITE_ERROR` + "no such vfs" — mpedb runs no sqlite VFS modules (it has its own storage engine, not sqlite's pager), and silently ignoring e.g. an encryption VFS would be unsafe. `SQLITE_OPEN_READONLY` is **not** enforced (opens read/write) |
 | `sqlite3_close` / `sqlite3_close_v2` | ✅ | Rolls back any open transaction, unmaps the engine, deletes the file if ephemeral. `NULL` → `SQLITE_OK`. Does not track/return `SQLITE_BUSY` for unfinalized statements |
-| `sqlite3_busy_timeout` | ✅ | On a BUSY-class contention error — an optimistic-mode `WriteConflict` (loser rolled back), a full reader table, or an evicted snapshot, all mapped to `SQLITE_BUSY` — the shim retries with sqlite's own busy-handler backoff table until the timeout elapses, then returns `SQLITE_BUSY`. Timeout 0 (default) = no retry, immediate BUSY, as sqlite. In the normal serial writer mode the writer lock **blocks** (never returns `SQLITE_BUSY`), so the timeout has nothing to wait on — either way, sqlite-faithful |
+| `sqlite3_busy_timeout` | ✅ | **Honored end-to-end (#109).** The knob is mirrored into `Database::set_busy_timeout`, so the ENGINE's writer-lock wait itself is bounded: cross-process (or cross-thread) writer contention answers `SQLITE_BUSY` / "database is locked" *at the deadline* — measured 300 ms timeout → Busy at 300.1 ms — instead of blocking forever (was engine gap E1). Timeout 0 (default) = one immediate attempt, immediate BUSY, as sqlite. A sibling connection on the SAME thread is an unwinnable wait (the owner is the caller's thread), so it answers BUSY immediately rather than burning the timeout. On top of that, the shim still retries RETRYABLE contention errors (optimistic-mode `WriteConflict`, full reader table, evicted snapshot) with sqlite's own busy-handler backoff table; the engine's `Busy` is terminal for that loop (the timeout was already honored in full — no double wait). No `sqlite3_busy_handler` is exported (CPython never calls it; the timeout is the only mechanism) |
+Coverage note: the busy budget bounds every `Database` facade write entry; the sqlite-backed overlay (`SqliteOverlay`) still uses blocking acquisition — its lock discipline is sqlite's own file locks, a separate mechanism.
 
 ### prepare / step / exec
 
@@ -1231,6 +1232,7 @@ on that by not freeing). Fixed + FFI-pinned
 | stock libsqlite3 3.45.1 (baseline) | 466 | **461** | 0 | 5 |
 | shim, first non-crashing run | 466 | 283 | 178 | 5 |
 | **shim, after the 3 commits** | 466 | **344** | **117** | 5 |
+| **shim, after #109 (busy timeout end-to-end)** | 466 | **350** | **111** | 5 |
 
 The 117 counts one test the run must EXCLUDE because it deadlocks (worse
 than failing — see engine gap E1). The 5 baseline skips are sqlite-version
@@ -1286,14 +1288,14 @@ codes/messages, blob/backup surfaces).
 
 | # | Tests | Gap | Repro / note |
 |---|---|---|---|
-| E1 | **1 + HANGS the suite** | **Cross-process writer contention BLOCKS forever; `busy_timeout` cannot be honored.** `Database::begin()` has no non-blocking form (the engine HAS `try_begin_write` — the ring leader uses it — the facade doesn't expose it). sqlite with timeout=0 answers "database is locked" immediately; CPython's `MultiprocessTests.test_ctx_mgr_rollback_if_commit_failed` RELIES on that BUSY to sequence two processes, so under the shim parent and child deadlock (child holds a txn waiting on stdin; parent's INSERT blocks in the engine). A hang is worse than any failure — this is the top engine item. | run the test; or: process A `BEGIN; INSERT…`, process B `INSERT` with timeout 0 → sqlite BUSY, mpedb blocks |
+| E1 | **FIXED (#109, 2026-07-19)** | ~~Cross-process writer contention BLOCKS forever~~ → `Database::set_busy_timeout` + `Engine::begin_write_deadline` bound every facade writer-lock wait; the shim wires the knob at open (0), `sqlite3_busy_timeout`, and `PRAGMA busy_timeout`. `MultiprocessTests.test_ctx_mgr_rollback_if_commit_failed` passes UN-excluded (0.097 s); the suite no longer hangs. Two-process elapsed evidence in `crates/mpedb/tests/busy_timeout.rs` (timeout 300 ms → Busy at 300.1 ms; timeout 0 → 4.7 µs; SIGKILLed holder → waiter ACQUIRES via EOWNERDEAD adoption in 22.7 µs, never hangs). | |
 | E2 | 38 | **Incremental blob I/O** (`sqlite3_blob_*` = mpedb #43). All of `BlobTests`; refusal is honest OperationalError now. | `con.blobopen("t", "b", 1)` |
 | E3 | 14 | **Declared-type family.** (a) 6 × decltype-canonicalization (the ⚠️ divergence above — needs verbatim decl text in the schema); (b) 8 × bind rigidity where sqlite coerces: text→`timestamp` (CPython's own adapters bind datetime as an ISO STRING — `insert into t(x) values (?)` with `"2026-07-19 10:00:00"` into `x timestamp` is IntegrityError; stock stores it), int→`text`, blob→`text`. | `crates/…/scratchpad` repros in section text |
 | E4 | 9 | **Window functions** (`sqlite3_create_window_function`) — DESIGN-UDF stage 3b; clean refusal. | |
 | E5 | 8 | **Authorizer** (`sqlite3_set_authorizer` accepted, never invoked — would need compile-time callbacks). | |
 | E6 | 6 | **Custom collations** — DESIGN-UDF stage 3; clean refusal (and no longer a segfault). | `con.create_collation("x", f)` |
 | E7 | 6 | **Host AGGREGATES are single-argument** — the plan carries one arg per DESIGN-UDF stage 2; CPython registers 2-arg checktype aggregates. | `create_aggregate("f", 2, C)` then `select f(a, b) …` → "takes exactly one argument" |
-| E8 | 5 | **First-compile of a NEW statement text needs the writer lock** (shared plan-registry publication is a write), so a sibling connection's first-time SELECT while this thread's other connection holds a write txn answers BUSY (was: "internal error (bug in mpedb)"; the shim now maps it to "database is locked" + busy-retry). sqlite readers proceed. Fix = compile-local-without-publishing when the lock is unavailable (the host-fn plan path already knows how). | `con1: CREATE t; BEGIN; INSERT` then `con2: SELECT (new text)` — pre-warmed text works, first-compile errors |
+| E8 | **FIXED (#109, 2026-07-19)** | ~~First-compile of a NEW statement text needs the writer lock~~ → under a busy policy, plan-registry publication is OPPORTUNISTIC (one immediate-deadline attempt; a held lock — including a same-thread sibling's — skips the insert and keeps the plan in the local cache, exactly like the host-UDF plan path). All 5 `TransactionTests.*_starts_transaction` tests pass; readers proceed under a writer. | |
 | E9 | 4 | **`ON CONFLICT` clause family**: `INSERT OR ROLLBACK` refused — the parser's own error message LISTS ROLLBACK as expected (`OR IGNORE` works), and the table-constraint form `unique(x) on conflict rollback` doesn't parse. | `INSERT OR ROLLBACK INTO t …` → "expected IGNORE, REPLACE, ABORT, FAIL, or ROLLBACK after OR" (sic) |
 | E10 | 5 | **iterdump surface**: 2 × AUTOINCREMENT (deliberate refusal), 1 × fts4 (deliberate — fts5 only), 1 × sqlite_master query form, 1 × un-root-caused "one statement at a time" in `test_table_dump`. | |
 | E11 | 3 | **`zeroblob()`** absent. | `select zeroblob(100)` |
@@ -1314,3 +1316,25 @@ contract, trace on step+exec (expanded), limits round-trip + enforcement,
 leading comments + VACUUM/ANALYZE, NaN→NULL, `mode=ro`, percent-decoded URI
 paths, sibling-connection BUSY + recovery after COMMIT, refusal-stub handle
 errors.
+
+### #109 (2026-07-19 late): `busy_timeout` honored end-to-end — the hang is gone
+
+E1 and E8 closed engine-side (`Database::set_busy_timeout` /
+`Engine::begin_write_deadline`; opportunistic plan publication under a busy
+policy — see the annotated rows above). Both arms re-run **UN-excluded**
+(`/mnt/xfs/cpython-tests/{baseline2,shim5}.{xml,log}`):
+
+| | run | pass | fail/error | skip |
+|---|---|---|---|---|
+| stock libsqlite3 (re-run, un-excluded) | 466 | **461** | 0 | 5 |
+| **shim, after #109** | 466 | **350** | **111** | 5 |
+
+The suite terminates in 6.4 s with no exclusion —
+`MultiprocessTests.test_ctx_mgr_rollback_if_commit_failed` (the former
+deadlock) passes in 0.097 s. +6 vs run 3 (E1's 1 + E8's 5); the failing set
+is a strict subset of run 3's — zero regressions. 350/461 = 75.9 % of the
+baseline-passing suite. Verification: 2 new FFI tests in `tests/capi.rs`
+(now 42) — cross-thread holder with elapsed-time bounds (timeout 200 ms →
+BUSY ≥ 200 ms; timeout 0 → immediate; a 5 s timeout ACQUIRES when the holder
+commits mid-wait) and same-thread-sibling immediate BUSY — plus the
+two-process + SIGKILL-holder suite in `crates/mpedb/tests/busy_timeout.rs`.

@@ -199,7 +199,9 @@ pub fn pragma(
         )),
         "foreign_key_check" => Ok((cols(&["table", "rowid", "parent", "fkid"]), vec![])),
         // `busy_timeout` is REAL on this shim: the same milliseconds
-        // `sqlite3_busy_timeout()` sets, honoured by the BUSY retry loop. Both
+        // `sqlite3_busy_timeout()` sets, honoured by the BUSY retry loop AND —
+        // via the caller mirroring it into `Database::set_busy_timeout` (#109)
+        // — by the engine's bounded writer-lock wait. Both
         // forms answer one row named `timeout` holding the value in force —
         // sqlite's exact shape, including for the setter (verified against the
         // 3.45.1 binary). Before this, a consumer that set its lock timeout via

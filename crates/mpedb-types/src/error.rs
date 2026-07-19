@@ -126,6 +126,13 @@ pub enum Error {
     /// its snapshot. Retryable — the caller re-prepares against a fresh
     /// snapshot (the facade autocommit path does this transparently).
     WriteConflict,
+    /// The single writer lock was not acquired within the caller's busy
+    /// deadline (`Engine::begin_write_deadline` / the facade's
+    /// `Database::set_busy_timeout`). Another process holds a write
+    /// transaction; nothing was executed or enqueued. This is sqlite's
+    /// `SQLITE_BUSY` ("database is locked") — a liveness answer, not a fault:
+    /// the database is fine and the call may be retried.
+    Busy,
     DivisionByZero,
     ArithmeticOverflow,
     /// A statement exceeded one of its deterministic per-execution budgets
@@ -207,6 +214,11 @@ impl fmt::Display for Error {
             Error::WriteConflict => {
                 write!(f, "optimistic write conflict; retry the transaction")
             }
+            Error::Busy => write!(
+                f,
+                "database is busy: another process held the writer lock past \
+                 the busy timeout"
+            ),
             Error::DivisionByZero => write!(f, "division by zero"),
             Error::ArithmeticOverflow => write!(f, "arithmetic overflow"),
             Error::RuntimeBudget { kind, limit, used, which } => write!(

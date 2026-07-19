@@ -143,6 +143,11 @@ pub fn error_codes(e: &DbError) -> (c_int, c_int) {
         DbError::ReadersFull | DbError::SnapshotEvicted | DbError::WriteConflict => {
             (SQLITE_BUSY, SQLITE_BUSY)
         }
+        // #109: the engine's writer-lock wait ran out the connection's busy
+        // timeout (`Database::set_busy_timeout`) — sqlite's SQLITE_BUSY,
+        // message "database is locked" (shaped below). Terminal for the
+        // shim's retry loop: the timeout has already been honored in full.
+        DbError::Busy => (SQLITE_BUSY, SQLITE_BUSY),
         DbError::Frozen { .. } => (SQLITE_LOCKED, SQLITE_LOCKED),
         // ANOTHER connection on this thread holds the writer lock (the robust
         // ERRORCHECK mutex answers EDEADLK for its own thread, so the engine
@@ -179,6 +184,7 @@ pub fn sqlite_shaped_message(e: &DbError) -> Option<String> {
             Some(format!("UNIQUE constraint failed: {raw}"))
         }
         DbError::NotNullViolation { .. } => Some(format!("NOT NULL constraint failed: {raw}")),
+        DbError::Busy => Some("database is locked".to_string()),
         e if is_writer_lock_reentry(e) => Some("database is locked".to_string()),
         _ => None,
     }
