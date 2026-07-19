@@ -426,6 +426,15 @@ pub struct Database {
     /// between groups or between concurrent executions. Same one-connection-only
     /// plan rule as the scalars.
     host_aggs: RwLock<HashMap<(String, i32), HostAggFactory>>,
+    /// Writer-contention busy timeout in milliseconds (#109); `-1` = block
+    /// indefinitely (the native default — mpedb's historical behavior). When
+    /// `>= 0`, every facade path that takes the single writer lock bounds its
+    /// wait to this budget and fails with [`Error::Busy`] at the deadline —
+    /// the C-API shim maps that to `SQLITE_BUSY` / "database is locked". `0`
+    /// means one immediate attempt, sqlite's no-busy-handler default. Set via
+    /// [`Database::set_busy_timeout`]; atomic so the shim's
+    /// `sqlite3_busy_timeout` (any thread) needs no `&mut`.
+    busy_timeout_ms: std::sync::atomic::AtomicI64,
 }
 
 /// Compile every column CHECK source in `schema` into the engine's per-table /
@@ -502,6 +511,7 @@ impl Database {
             bare_group_by: mpedb_types::BareGroupBy::default(),
             host_udfs: RwLock::new(HashMap::new()),
             host_aggs: RwLock::new(HashMap::new()),
+            busy_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
         })
     }
 
@@ -551,6 +561,7 @@ impl Database {
             bare_group_by,
             host_udfs: RwLock::new(HashMap::new()),
             host_aggs: RwLock::new(HashMap::new()),
+            busy_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
         })
     }
 
@@ -963,10 +974,51 @@ impl Database {
         self.run_plan(None, &compiled, &full)
     }
 
+    /// Bound every writer-lock wait on this handle (#109). `None` (the
+    /// default) blocks indefinitely — mpedb's historical native behavior.
+    /// `Some(t)` makes [`Database::begin`], autocommit DML/DDL, and the other
+    /// facade write entries poll the lock for at most `t` and then fail with
+    /// [`Error::Busy`] — nothing executed, nothing enqueued; the caller may
+    /// retry. `Some(Duration::ZERO)` = one immediate attempt (sqlite's
+    /// timeout-0 semantics: immediate BUSY on contention).
+    ///
+    /// Two side effects of a bounded policy, both deliberate:
+    /// - Contended autocommit DML takes the direct lock path instead of the
+    ///   §5.3 intent ring: a published intent cannot be withdrawn at the
+    ///   deadline without racing the leader's stage/post, so a
+    ///   deadline-carrying write never publishes one (see `run_write_plan`).
+    /// - Shared-registry plan publication becomes opportunistic: a
+    ///   first-compile that finds the writer lock held keeps the plan in the
+    ///   local cache and skips the registry insert, so a SELECT never waits
+    ///   on (or fails behind) another process's write transaction.
+    pub fn set_busy_timeout(&self, timeout: Option<std::time::Duration>) {
+        let ms = match timeout {
+            None => -1,
+            Some(t) => t.as_millis().min(i64::MAX as u128) as i64,
+        };
+        self.busy_timeout_ms.store(ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The busy policy as a per-call deadline: `None` = block indefinitely.
+    /// Computed at each write entry so the whole statement (lock wait
+    /// included) shares one budget.
+    pub(crate) fn busy_deadline(&self) -> Option<std::time::Instant> {
+        let ms = self.busy_timeout_ms.load(std::sync::atomic::Ordering::Relaxed);
+        u64::try_from(ms)
+            .ok()
+            .map(|ms| std::time::Instant::now() + std::time::Duration::from_millis(ms))
+    }
+
+    /// True when a bounded busy policy is in force (`set_busy_timeout(Some)`).
+    fn busy_bounded(&self) -> bool {
+        self.busy_timeout_ms.load(std::sync::atomic::Ordering::Relaxed) >= 0
+    }
+
     /// Start an interactive multi-statement write transaction. Holds the
     /// single writer lock until commit/rollback/drop (drop = rollback).
     /// A second `begin()` from the same thread errors instead of hanging
-    /// (ERRORCHECK mutex).
+    /// (ERRORCHECK mutex). Under a [`Database::set_busy_timeout`] policy the
+    /// lock wait is bounded and fails with [`Error::Busy`] at the deadline.
     pub fn begin(&self) -> Result<WriteSession<'_>> {
         self.begin_as(&Session::empty())
     }
@@ -979,7 +1031,7 @@ impl Database {
     pub fn begin_as(&self, session: &Session) -> Result<WriteSession<'_>> {
         Ok(WriteSession {
             db: self,
-            txn: self.engine.begin_write()?,
+            txn: self.engine.begin_write_deadline(self.busy_deadline())?,
             session: session.clone(),
             poisoned: false,
             savepoints: Vec::new(),
@@ -1030,7 +1082,7 @@ impl Database {
                 value.len()
             )));
         }
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         match w.sys_put(&subkey, value) {
             Ok(()) => w.commit(),
             Err(e) => {
@@ -1142,13 +1194,41 @@ impl Database {
             // Genuine miss (or corrupt/stale entry): short write txn inserts
             // or overwrites. Re-checked under the lock so a racing process
             // that just published the same plan costs us no write.
-            let mut w = self.engine.begin_write()?;
-            match registry::insert_plan(&mut w, &hash, sql, &blob) {
-                Ok(true) => w.commit()?,
-                Ok(false) => w.abort(),
-                Err(e) => {
-                    w.abort();
-                    return Err(e);
+            //
+            // Under a busy policy (#109 / compat gap E8), publication is
+            // OPPORTUNISTIC: one non-blocking attempt, and a held lock skips
+            // the insert rather than waiting or failing — the plan still runs
+            // from the local cache (the host-UDF plan path has always worked
+            // this way), so a first-compile SELECT never answers BUSY behind
+            // another process's write transaction. sqlite readers proceed
+            // under a writer; so must ours. The registry entry appears the
+            // next time this text is compiled cold while the lock is free;
+            // an enqueued intent whose plan is not yet published falls back
+            // via the leader's `UnknownPlan` answer (handled below).
+            //
+            // The immediate-deadline probe (rather than raw `try_begin_write`)
+            // matters: it also answers `Busy` when the lock is held by THIS
+            // thread's sibling connection (the ERRORCHECK reentry case — the
+            // engine folds that in), which is exactly CPython's
+            // `TransactionTests`: con1 holds an implicit txn, con2's
+            // first-compile SELECT must read, not error.
+            let w = if self.busy_bounded() {
+                match self.engine.begin_write_deadline(Some(std::time::Instant::now())) {
+                    Ok(w) => Some(w),
+                    Err(Error::Busy) => None, // opportunistic: skip publication
+                    Err(e) => return Err(e),
+                }
+            } else {
+                Some(self.engine.begin_write()?)
+            };
+            if let Some(mut w) = w {
+                match registry::insert_plan(&mut w, &hash, sql, &blob) {
+                    Ok(true) => w.commit()?,
+                    Ok(false) => w.abort(),
+                    Err(e) => {
+                        w.abort();
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -1267,12 +1347,25 @@ impl Database {
         plan: &CompiledPlan,
         params: &[Value],
     ) -> Result<ExecResult> {
+        // #109: one busy budget for the whole statement, fixed at entry.
+        let deadline = self.busy_deadline();
         // fast path: uncontended — validate policy staleness under the writer
         // lock we now hold (no policy edit can race it, §4).
-        if let Some(mut txn) = self.engine.try_begin_write()? {
-            self.validate_policy_write(hash, plan, &mut txn)?;
-            return ring_exec::lead_and_execute(self, txn, Some((plan, params)))
-                .map(|r| r.expect("own statement always yields a result"));
+        match self.engine.try_begin_write() {
+            Ok(Some(mut txn)) => {
+                self.validate_policy_write(hash, plan, &mut txn)?;
+                return ring_exec::lead_and_execute(self, txn, Some((plan, params)))
+                    .map(|r| r.expect("own statement always yields a result"));
+            }
+            Ok(None) => {}
+            // Under a busy policy, a sibling connection on THIS thread
+            // holding the lock (ERRORCHECK reentry) is contention, not a
+            // bug: fall through — `begin_write_deadline` below answers Busy
+            // for it immediately (an unwinnable wait). With no policy the
+            // loud EDEADLK diagnostic stands.
+            Err(Error::Internal(ref m))
+                if deadline.is_some() && m.contains("writer lock re-entered") => {}
+            Err(e) => return Err(e),
         }
         // Contended: pre-check staleness on a read snapshot before enqueueing.
         // The leader that executes our intent also holds the writer lock, so a
@@ -1302,7 +1395,22 @@ impl Database {
         // closures are connection-local: no other process may run our UDF, and
         // we may not run theirs. Leading our own statement keeps it in the
         // process that owns the closures.
-        let use_ring = ring_exec::ring_enabled(self) && !plan.contains_host_call();
+        //
+        // A statement carrying a busy DEADLINE (#109) never rides the ring
+        // either. A published intent cannot be withdrawn at the deadline:
+        // release-from-READY before the result post would race the leader's
+        // collect→stage→post sequence (§5.3 pins READY+stamped slots to their
+        // incarnation precisely so that can't happen), so an abandoned intent
+        // could still COMMIT after we answered Busy — a phantom write — or the
+        // leader's post could land in a re-reserved slot. Rather than touch
+        // that ordering, a deadline-carrying write polls the lock directly and
+        // answers Busy having enqueued nothing; once it does acquire, it still
+        // leads and drains everyone else's intents, so ring deployments stay
+        // live. (The group-commit amortization forgone is the busy-timeout
+        // caller's explicit trade.)
+        let use_ring = deadline.is_none()
+            && ring_exec::ring_enabled(self)
+            && !plan.contains_host_call();
         let ring = self.engine.ring();
         let enqueued = if use_ring {
             hash.and_then(|h| {
@@ -1313,8 +1421,9 @@ impl Database {
             None
         };
         let Some((idx, owned)) = enqueued else {
-            // ring full / params too large / hash unavailable: block directly
-            let txn = self.engine.begin_write()?;
+            // ring off / full / params too large / hash unavailable / busy
+            // deadline set: take the lock directly (bounded iff a deadline).
+            let txn = self.engine.begin_write_deadline(deadline)?;
             return ring_exec::lead_and_execute(self, txn, Some((plan, params)))
                 .map(|r| r.expect("own statement always yields a result"));
         };

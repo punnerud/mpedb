@@ -50,7 +50,7 @@ impl Database {
             )));
         }
         let key = view_key(name);
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         let exists = matches!(w.sys_get(&key), Ok(Some(_)));
         if exists {
             w.abort();
@@ -79,7 +79,7 @@ impl Database {
     /// `DROP VIEW [IF EXISTS] <name>`.
     pub(crate) fn apply_drop_view(&self, name: &str, if_exists: bool) -> Result<ExecResult> {
         let key = view_key(name);
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         let existed = matches!(w.sys_get(&key), Ok(Some(_)));
         if !existed {
             w.abort();
@@ -494,7 +494,7 @@ impl Database {
     /// reload at their next transaction via the schema-gen bump.
     pub(crate) fn apply_create_table(&self, spec: mpedb_sql::CreateTableSpec) -> Result<ExecResult> {
         let def = table_def_from_spec(spec)?;
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         match w.create_table(def) {
             Ok(_tid) => w.commit()?,
             Err(e) => {
@@ -533,7 +533,7 @@ impl Database {
             )));
         }
         let def = virtual_table_def_from_spec(spec)?;
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         match w.create_table(def) {
             Ok(_tid) => w.commit()?,
             Err(e) => {
@@ -561,7 +561,7 @@ impl Database {
                 return Err(Error::Bind(format!("DROP TABLE: no such table `{name}`")));
             }
         };
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         // Cascade: a dropped table's triggers are dead — remove their records in
         // the same commit (DESIGN-TRIGGERS §3.1).
         let res = crate::trigger::cascade_drop_triggers(&mut w, id).and_then(|()| w.drop_table(id));
@@ -598,7 +598,7 @@ impl Database {
             .schema
             .table_id(table)
             .ok_or_else(|| Error::Bind(format!("ALTER TABLE: no such table `{table}`")))?;
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         match rename(&mut w, id) {
             Ok(()) => w.commit()?,
             Err(e) => {
@@ -633,7 +633,7 @@ impl Database {
             .schema
             .table_id(table)
             .ok_or_else(|| Error::Bind(format!("ALTER TABLE: no such table `{table}`")))?;
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         match w.alter_add_column(id, col, fill) {
             Ok(()) => w.commit()?,
             Err(e) => {
@@ -661,7 +661,7 @@ impl Database {
             .schema
             .table_id(table)
             .ok_or_else(|| Error::Bind(format!("ALTER TABLE: no such table `{table}`")))?;
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         match w.alter_drop_column(id, column) {
             Ok(()) => w.commit()?,
             Err(e) => {
@@ -695,7 +695,7 @@ impl Database {
         if t.indexes.iter().any(|ix| ix.columns == cols && ix.unique == unique) {
             return Ok(ExecResult::Affected(0));
         }
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         match w.create_index(id, cols, unique) {
             Ok(()) => w.commit()?,
             Err(e) => {
