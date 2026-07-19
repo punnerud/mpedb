@@ -432,6 +432,30 @@ impl Database {
         )
     }
 
+    /// Compile `sql` against an EXPLICIT schema bundle — a [`WriteSession`]'s
+    /// own view, which may already reflect DDL applied earlier in the SAME
+    /// uncommitted transaction (#95). Unlike [`compile_maybe_explain`], there is
+    /// no schema-gen gate: the session holds the single writer lock, so no peer
+    /// DDL can move the committed schema underneath it, and its own uncommitted
+    /// DDL is exactly what `schema` carries. Policies and views still come from
+    /// the COMMITTED catalog (a policy/view created in the same uncommitted
+    /// session is not yet visible — the pre-#95 contract, unchanged).
+    fn compile_maybe_explain_with_schema(
+        &self,
+        sql: &str,
+        schema: &mpedb_core::engine::SchemaBundle,
+    ) -> Result<(CompiledPlan, bool)> {
+        let catalog = self.load_policy_catalog()?;
+        let views = self.load_view_catalog()?;
+        mpedb_sql::prepare_maybe_explain_with_views(
+            sql,
+            schema,
+            &catalog,
+            &views,
+            self.bare_group_by,
+        )
+    }
+
     /// Prepare-time worst-case **risk estimate** (#74 layer 1) for an
     /// already-compiled plan, using the catalog's transactionally-exact row
     /// counts. Read-only: opens one read snapshot, executes nothing, and never
@@ -1097,10 +1121,20 @@ impl WriteSession<'_> {
         if self.poisoned {
             return Err(poisoned_err());
         }
-        let schema = self.db.schema();
-        // Policies are read from the committed catalog snapshot (a policy
-        // created inside *this* uncommitted session is not yet visible here).
-        let (plan, is_explain) = self.db.compile_maybe_explain(sql)?;
+        // #95: DDL (CREATE/DROP/ALTER TABLE, CREATE INDEX) runs THROUGH this
+        // session's transaction so the schema change lives in the txn's COW
+        // catalog pages and commits/rolls back atomically with the session's
+        // DML — never a mid-transaction commit.
+        if let Some(ddl) = mpedb_sql::parse_ddl(sql)? {
+            return self.apply_ddl(ddl);
+        }
+        // Compile against THIS session's schema view — which includes any DDL
+        // this session already applied (its txn's captured bundle), not just the
+        // committed schema. Policies/views are read from the committed catalog
+        // (a policy/view created inside this uncommitted session is not yet
+        // visible here).
+        let schema = self.txn.schema_bundle();
+        let (plan, is_explain) = self.db.compile_maybe_explain_with_schema(sql, &schema)?;
         if is_explain {
             return Ok(ExecResult::Explain(plan.explain(&schema)));
         }
@@ -1351,10 +1385,15 @@ impl WriteSession<'_> {
         self.db.validate_policy_write(None, plan, &mut self.txn)?;
         let full = session::resolve_params(plan, params, &self.session)?;
         let triggers = self.db.trigger_set()?;
+        // Execute against the session's OWN schema view (== the txn's captured
+        // bundle), so a statement touching a table this session created/altered
+        // earlier resolves against the shape it will commit with (#95). For a
+        // session that has applied no DDL this equals the committed schema.
+        let schema = self.txn.schema_bundle();
         let mut partial = false;
         let res = exec::exec_stmt_triggered(
             &mut self.txn,
-            &self.db.schema(),
+            &schema,
             plan,
             &full,
             &mut partial,
@@ -1407,6 +1446,182 @@ impl WriteSession<'_> {
         // stack intact and surfaces cleanly.
         let snap = self.savepoints[idx].snap.clone();
         self.txn.rollback_to_full(snap)
+    }
+
+    /// Apply a parsed DDL statement THROUGH this session's transaction (#95).
+    ///
+    /// Table DDL (CREATE / DROP / ALTER TABLE, CREATE INDEX, CREATE VIRTUAL
+    /// TABLE) runs on `self.txn`, so the schema change lives in the txn's COW
+    /// catalog pages and commits / rolls back atomically with the session's
+    /// DML — no separate transaction, no mid-transaction commit (the forbidden
+    /// "commit + autocommit-DDL + re-begin" hack). After a successful mutation
+    /// the txn's captured schema bundle is rebuilt so a later statement in the
+    /// SAME session sees the change, and the shared plan cache is dropped
+    /// (mirroring the autocommit DDL discipline in `ddl_apply.rs`).
+    ///
+    /// A mid-operation failure (e.g. `DbFull` during an ALTER row rewrite) is
+    /// undone with a full savepoint taken before the mutation, leaving the
+    /// session usable — scoped to just the DDL, like the autocommit path's
+    /// abort-on-error but without discarding the session's other work. If that
+    /// undo is itself impossible (a large-blob extent write in the DDL), the
+    /// session is poisoned instead (sound: commit then refuses).
+    ///
+    /// DDL that lives in a separate store or needs its own transaction (VIEW /
+    /// POLICY / TRIGGER, RLS) is refused inside a session with a clear error;
+    /// `ANALYZE` / `REINDEX` are accepted no-ops.
+    fn apply_ddl(&mut self, ddl: mpedb_sql::DdlStmt) -> Result<ExecResult> {
+        use mpedb_sql::DdlStmt;
+        if self.poisoned {
+            return Err(poisoned_err());
+        }
+        // A SAVEPOINT is open: a `ROLLBACK TO` it would have to revert the txn's
+        // captured schema bundle too, which the engine's savepoint snapshot does
+        // NOT restore (it captures catalog PAGES, not the in-memory bundle).
+        // Refuse cleanly rather than risk a bundle/catalog desync (#95).
+        if !self.savepoints.is_empty() {
+            return Err(Error::Unsupported(
+                "DDL inside a SAVEPOINT is not supported by mpedb; RELEASE or \
+                 ROLLBACK the savepoint first"
+                    .into(),
+            ));
+        }
+        // No-op DDL never touches the catalog — nothing to snapshot or reload.
+        if matches!(ddl, DdlStmt::Analyze { .. } | DdlStmt::Reindex { .. }) {
+            return Ok(ExecResult::Affected(0));
+        }
+        // Snapshot the txn BEFORE the mutation so a partial failure rolls back
+        // cleanly. This captures catalog_root, table_roots, dirty-page contents
+        // and schema_gen_bump — the bundle is NOT touched here, and we only
+        // advance it AFTER the mutation succeeds, so the pre-mutation bundle
+        // stays valid for the rollback path.
+        let snap = self.txn.savepoint_full()?;
+        match self.apply_ddl_inner(ddl) {
+            Ok(res) => {
+                // The mutation is in the txn's COW catalog pages. Rebuild the
+                // txn's captured bundle so a later statement in this session
+                // sees it, then drop the shared plan cache (a cached plan may
+                // reference the pre-DDL catalog — the autocommit discipline).
+                if let Err(e) = self.txn.reload_bundle_from_catalog() {
+                    // Reading back what we just wrote failed (Corrupt): the txn
+                    // view is now stale — poison so it cannot be committed.
+                    self.poisoned = true;
+                    return Err(e);
+                }
+                self.db.cache.write().expect(POISON).clear();
+                Ok(res)
+            }
+            Err(e) => {
+                // Undo any partial effect. `rollback_to_full` restores the
+                // catalog/pages; the bundle was never advanced, so the session
+                // view stays consistent and usable. If the scope crossed a
+                // large-blob extent write it refuses — the txn is then torn, so
+                // poison.
+                if self.txn.rollback_to_full(snap).is_err() {
+                    self.poisoned = true;
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The DDL dispatch for [`apply_ddl`](Self::apply_ddl): resolve names against
+    /// this session's CURRENT schema view and call the engine DDL primitive on
+    /// `self.txn`. Any error (or the rollback / reload) is handled by the caller.
+    fn apply_ddl_inner(&mut self, ddl: mpedb_sql::DdlStmt) -> Result<ExecResult> {
+        use mpedb_sql::DdlStmt;
+        // Resolve against the session's own (possibly uncommitted-DDL) view, so
+        // e.g. a CREATE INDEX names a table this same session just created.
+        let schema = self.txn.schema_bundle();
+        let resolve = |name: &str| -> Result<u32> {
+            schema
+                .schema
+                .table_id(name)
+                .ok_or_else(|| Error::Bind(format!("ALTER TABLE: no such table `{name}`")))
+        };
+        match ddl {
+            DdlStmt::CreateTable(spec) => {
+                let def = crate::ddl_apply::table_def_from_spec(spec)?;
+                self.txn.create_table(def)?;
+            }
+            DdlStmt::CreateVirtualTable(spec) => {
+                if schema.schema.table_id(&spec.name).is_some() {
+                    if spec.if_not_exists {
+                        return Ok(ExecResult::Affected(0));
+                    }
+                    return Err(Error::Bind(format!(
+                        "CREATE VIRTUAL TABLE: `{}` already exists",
+                        spec.name
+                    )));
+                }
+                let def = crate::ddl_apply::virtual_table_def_from_spec(spec)?;
+                self.txn.create_table(def)?;
+            }
+            DdlStmt::DropTable { name, if_exists } => {
+                let id = match schema.schema.table_id(&name) {
+                    Some(id) => id,
+                    None => {
+                        if if_exists {
+                            return Ok(ExecResult::Affected(0));
+                        }
+                        return Err(Error::Bind(format!("DROP TABLE: no such table `{name}`")));
+                    }
+                };
+                // Cascade: a dropped table's triggers are dead — remove their
+                // records in the same commit (DESIGN-TRIGGERS §3.1).
+                crate::trigger::cascade_drop_triggers(&mut self.txn, id)?;
+                self.txn.drop_table(id)?;
+            }
+            DdlStmt::AlterRenameTable { table, new_name } => {
+                let id = resolve(&table)?;
+                self.txn.alter_rename_table(id, &new_name)?;
+            }
+            DdlStmt::AlterRenameColumn { table, column, new_name } => {
+                let id = resolve(&table)?;
+                self.txn.alter_rename_column(id, &column, &new_name)?;
+            }
+            DdlStmt::AlterAddColumn { table, column } => {
+                let (col, fill) = crate::ddl_apply::add_column_from_spec(&table, column)?;
+                let id = resolve(&table)?;
+                self.txn.alter_add_column(id, col, fill)?;
+            }
+            DdlStmt::AlterDropColumn { table, column } => {
+                let id = resolve(&table)?;
+                self.txn.alter_drop_column(id, &column)?;
+            }
+            DdlStmt::CreateIndex { table, columns, unique, .. } => {
+                let id = schema
+                    .schema
+                    .table_id(&table)
+                    .ok_or_else(|| Error::Bind(format!("CREATE INDEX: no such table `{table}`")))?;
+                let t = schema.schema.table(id).expect("table_id resolved");
+                let cols = crate::ddl_apply::resolve_index_columns(t, &table, &columns)?;
+                // Idempotent by shape: an identical index already present is a no-op.
+                if t.indexes.iter().any(|ix| ix.columns == cols && ix.unique == unique) {
+                    return Ok(ExecResult::Affected(0));
+                }
+                self.txn.create_index(id, cols, unique)?;
+            }
+            // These live in a separate store or open their own transaction, so
+            // they cannot ride this session's txn. Refuse cleanly (out of scope
+            // for #95); run them in autocommit.
+            DdlStmt::CreateView { .. }
+            | DdlStmt::DropView { .. }
+            | DdlStmt::CreatePolicy(_)
+            | DdlStmt::DropPolicy { .. }
+            | DdlStmt::AlterRls { .. }
+            | DdlStmt::CreateTrigger(_)
+            | DdlStmt::DropTrigger { .. } => {
+                return Err(Error::Unsupported(
+                    "CREATE/DROP VIEW, POLICY or TRIGGER and ALTER … ROW LEVEL \
+                     SECURITY are not supported inside a transaction; run them in \
+                     autocommit (outside BEGIN/COMMIT)"
+                        .into(),
+                ));
+            }
+            // Handled before the savepoint in `apply_ddl`; unreachable here.
+            DdlStmt::Analyze { .. } | DdlStmt::Reindex { .. } => {}
+        }
+        Ok(ExecResult::Affected(0))
     }
 }
 

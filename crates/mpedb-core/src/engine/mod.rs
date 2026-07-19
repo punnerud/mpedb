@@ -1002,8 +1002,17 @@ impl Engine {
 
     // ---------- row-level helpers shared by both txn kinds ----------
 
-    fn pk_key(&self, table_id: u32, values: &[Value]) -> Result<Vec<u8>> {
-        let bundle = self.bundle();
+    /// The primary-key encoded key for `values`, resolved against an EXPLICIT
+    /// bundle — a writer passes its own captured bundle so a table it created
+    /// earlier in the SAME (uncommitted) transaction resolves, even though the
+    /// engine's committed bundle does not yet know it (#95). Identical to the
+    /// committed bundle on every path that is not in-transaction DDL.
+    pub(super) fn pk_key_in(
+        &self,
+        bundle: &SchemaBundle,
+        table_id: u32,
+        values: &[Value],
+    ) -> Result<Vec<u8>> {
         let table = bundle
             .schema
             .table(table_id)
@@ -1023,7 +1032,21 @@ impl Engine {
         // The current bundle: safe for every caller — writers hold the
         // writer lock (which serializes DDL), and the optimistic prep pass
         // re-validates under the lock.
-        let bundle = self.bundle();
+        self.validate_row_in(&self.bundle(), table_id, values)
+    }
+
+    /// [`validate_row`](Self::validate_row) against an EXPLICIT bundle — a
+    /// writer validates against its OWN captured bundle so a row for a table
+    /// created/altered earlier in the same uncommitted transaction is checked
+    /// against the shape it will commit with, and its CHECK programs, arity and
+    /// NOT NULL flags come from that same consistent view (#95). Identical to
+    /// `validate_row` when the captured and committed bundles agree.
+    pub(super) fn validate_row_in(
+        &self,
+        bundle: &SchemaBundle,
+        table_id: u32,
+        values: &[Value],
+    ) -> Result<()> {
         let table = bundle
             .schema
             .table(table_id)

@@ -71,15 +71,18 @@ fn text_to_i64(s: &str) -> i64 {
 }
 
 fn text_to_f64(s: &str) -> f64 {
-    // Longest leading prefix that parses as a float.
+    // Longest leading prefix that parses as a float (sqlite's numeric affinity
+    // on a text value). Iterate CHAR boundaries — slicing at `i + c.len_utf8()`
+    // never splits a multibyte char, so a value like "héllo→" coerces to 0.0
+    // instead of panicking on a non-char-boundary slice.
     let t = s.trim_start();
-    let mut end = 0;
-    for (i, _) in t.char_indices() {
-        if t[..=i.min(t.len() - 1)].parse::<f64>().is_ok() {
-            end = i + t[i..].chars().next().map_or(0, |c| c.len_utf8());
+    let mut best = 0.0;
+    for (i, c) in t.char_indices() {
+        if let Ok(v) = t[..i + c.len_utf8()].parse::<f64>() {
+            best = v;
         }
     }
-    t[..end].parse::<f64>().unwrap_or(0.0)
+    best
 }
 
 /// Coerce to i64 for `sqlite3_column_int/int64`.
