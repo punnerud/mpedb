@@ -454,15 +454,14 @@ The honest reading of those two deltas:
   `test_values_expression_alias_sql_injection_json_field` are skipped rather
   than failed. Adjusted, the shim is 507/831.
 
-  **Do not close that by adding `json()` alone — it is a trap, and it costs 439
-  tests, not 2.** Both JSONField models in these labels
-  (`tests/annotations/models.py::JsonModel`,
+  **This was a trap worth 439 tests, not 2 — and it is now half-closed.** Both
+  JSONField models in these labels (`tests/annotations/models.py::JsonModel`,
   `tests/expressions/models.py::JSONFieldModel`) declare
-  `Meta.required_db_features = {"supports_json_field"}`, so today Django simply
-  does not create them. Make the probe succeed and Django DOES create them —
-  with Django's own `data_type_check_constraints["JSONField"]`, i.e.
-  `CHECK ((JSON_VALID("data") OR "data" IS NULL))`. That CHECK fails to compile
-  in mpedb for **two independent reasons**, both verified directly:
+  `Meta.required_db_features = {"supports_json_field"}`, so at run 2 Django
+  simply did not create them. Make the probe succeed and Django DOES create them
+  — with Django's own `data_type_check_constraints["JSONField"]`, i.e.
+  `CHECK ((JSON_VALID("data") OR "data" IS NULL))`. That CHECK failed to compile
+  for **two independent reasons**, both verified directly:
 
   ```
   CREATE TABLE k (… data text NOT NULL CHECK ((json_valid(data) OR data IS NULL)))
@@ -472,22 +471,34 @@ The honest reading of those two deltas:
   ```
 
   A CREATE TABLE failure during `migrate` aborts `create_test_db()`, which takes
-  down the whole label — all 439 G2 tests, to buy 2 honest failures. Closing
-  this gap therefore needs **three** things together, not one: `json(X)`,
-  `json_valid(X)`, and gap 5 (the int↔bool bridge) so an integer-valued
-  predicate is legal inside `OR`. A strict-RFC-8259 `json(X)` (validate +
-  minify, every token keeping its input spelling — sqlite's own definition) was
-  written and differential-tested against sqlite 3.45 while measuring this, and
-  is recoverable from git history (`de9a023:crates/mpedb-types/src/expr/json.rs`,
-  with its test at `de9a023:crates/mpedb/tests/json_fn.rs`); it was removed
-  again rather than shipped for exactly the reason above. `ScalarFn` tag 44 is
-  left free for it. Note one thing that implementation records: sqlite 3.45
-  accepts **JSON5** (`{a:1}`, `'a'`, `0x10`, `+1`, `.5`, `1.`, trailing commas,
-  comments) and rewrites it into canonical JSON, so a strict-only `json()`
-  refuses inputs sqlite answers for — acceptable as a refusal, but it makes a
-  correct `json_valid()` harder: returning 0 where sqlite returns 1 would be a
-  wrong ANSWER, so `json_valid` would have to refuse rather than answer 0 for
-  anything it cannot prove malformed under JSON5 too.
+  down the whole label. Closing this needs **two** things together, and only one
+  of them is here:
+
+  * **DONE (PLAN_FORMAT 45): the JSON function set**, not just `json()`. `json`,
+    `json_valid`, `json_type`, `json_quote`, `json_array_length`,
+    `json_extract`, the `->` and `->>` operators, `json_array`, `json_object`,
+    `json_patch`, `json_remove`, `json_replace`, `json_set`, `json_insert` —
+    fifteen `ScalarFn` tags, 44 (the one this note reserved) through 58,
+    differential-tested against `sqlite3` 3.45.1 in
+    `crates/mpedb/tests/json_fn.rs`. `json_valid()` returns sqlite's INTEGER 0/1,
+    which is what the CHECK needs.
+  * **STILL OPEN: gap 5, the int↔bool bridge.** The CHECK now fails on the
+    second line above and nothing else — `AND/OR requires boolean operands, got
+    int64`. Until that lands, `supports_json_field` must stay off and the label
+    stays skipped. `django_jsonfield_check_compiles_and_enforces` in
+    `json_fn.rs` asserts exactly this and reports which half is missing, so it
+    will start exercising the CHECK for real the moment the bridge arrives.
+
+  On the JSON5 subtlety this note flagged: sqlite 3.45's `json()` and
+  `json_valid()` **deliberately disagree** — `json('{a:1}')` is `{"a":1}` (it
+  accepts JSON5 and REWRITES it) while `json_valid('{a:1}')` is `0` (strict
+  RFC 8259). The resolution shipped is to refuse JSON5 in `json()` too, so the
+  two AGREE: `json_valid` answers `0` there, matching sqlite, and `json()`
+  raises a named error instead of rewriting — a refusal, not a wrong answer. The
+  same reasoning drives the depth bound: mpedb parses 128 levels where sqlite
+  parses 1000, and `json_valid()` **raises** past that instead of answering `0`,
+  because sqlite answers `1`. See COMPAT.md's JSON section for the full list of
+  refusals, including the JSON-subtype shapes.
 
 ### Deployment-blocking gaps: what closed
 
@@ -514,8 +525,8 @@ query path.
 | 1 [1] | **68** | **No sqlite affinity; `any` neither coerces nor computes.** 49 × `TypeError: argument must be int or float` (Django's DecimalField converter gets a `str`), 10 × `arithmetic requires int64/float64, got any`, 3 × `cannot assign any to column of type text`, 2 × `cannot mix coalesce() argument types: any and float64`, 1 each `avg() expects a number, got text` / `floor() expects a number, got any` / `cannot compare int64 with text` / `cannot compare with IN list: text and int64`. **Plus wrong answer W1.** | `mpedb-sql`/`mpedb` |
 | 2 [2] | ~~47~~ | ✅ **FIXED after this run — host UDFs resolve on the WRITE path** (`design/DESIGN-UDF.md` §The WRITE path). Scalar and aggregate closures reach the write context via `exec::WriteCtx`, gated by a single `Database::host_tables(plan)` snapshot taken only when the plan contains a host call; `WriteSession`, autocommit DML and the group-commit leader's own statement all carry them. A host-call plan still never enters the shared `plan/<hash>` registry and never rides the intent ring. The out-of-scope contexts that remain refuse cleanly (`Unsupported`) instead of the old `internal error (bug in mpedb)`. **Not re-measured** — the 47 is run-2's number, and the next Django run should show it move. | `mpedb` `ring_exec` / write `TxnCtx` |
 | 3 [4] | **45** | **Subquery / derived-table restrictions**: JOIN inside a derived table 14, correlated subquery outside `WHERE` in an aggregate query 8, unlifted `IN` subquery 5, aliased/renamed column 4, GROUP BY/HAVING body 4, correlated `IN` ("rewrite as EXISTS") 4, subquery in `HAVING` 2, unsupported position 2, compound (`UNION`) body 1, `ORDER BY` body 1. | `mpedb-sql` planner |
-| 4 [3] | **44** | **Missing sqlite scalar functions**: `quote()` 40 statements (Django's `last_executed_query`), `strftime()` 8, `json()` (the feature probe → the 2 skips above). **`quote()` and `strftime()` CLOSED** (PLAN_FORMAT 41) — sqlite-differential-tested; `quote()` refuses only the reals whose sqlite rendering is build-dependent, `strftime()` only the modifier/`'now'`/Julian-day forms, each a named error. `json()` is in flight. **JSONField's DDL now fails on ONE count rather than two**: Django emits `CHECK ((JSON_VALID("data") OR "data" IS NULL))`, and the `AND/OR requires boolean operands, got int64` half is gone with gap 5 — only `unknown function json_valid()` is left. | `mpedb-sql` builtins |
-| 5 [5] | ~~39~~ | ✅ **FIXED after this run — sqlite truthiness + the int/bool value bridge.** A non-boolean in a boolean position (WHERE/HAVING/ON/FILTER, `NOT`, `AND`/`OR`, `CASE WHEN`, `CHECK`, `ON CONFLICT … WHERE`) is truthy-tested exactly as `sqlite3VdbeBooleanValue` does — NULL unknown, integer `!= 0`, everything else `RealValue(x) != 0.0` (the leading-float-prefix parse, over text AND a blob's raw bytes). It desugars in the binder to `x <> 0` / `CAST(x AS REAL) <> 0.0`, so **no new opcode and no `PLAN_FORMAT` bump**. The VALUE bridge is deliberately narrower than "int and bool are interchangeable": in a comparison an int const 0/1 folds into the bool domain (`flag = 1` → `flag = TRUE`, keeping the index-probe shape) and anything else casts the bool side up to its integer, so `flag = 2` is FALSE — sqlite's answer; a bool assigned to an int column is exact (`TRUE` → 1); an int into a bool column converts **only** 0/1; a parameter bound as 0/1 into a bool slot converts (CPython binds `True` via `sqlite3_bind_int64`). Arithmetic on a bool is still rigid. 24 values × 8 boolean positions diffed against the 3.45.1 binary in `crates/mpedb/tests/bool_truthiness.rs`; the C-API path in `capi.rs::django_boolean_field_through_the_c_api`. **Not re-measured** — 39 is run-2's number. | `mpedb-sql` binder |
+| 4 [3] | ~~44~~ | ✅ **CLOSED.** `quote()` 40 statements (Django's `last_executed_query`) and `strftime()` 8 closed at PLAN_FORMAT 41; the **whole JSON function set** closed at PLAN_FORMAT 46 (`ScalarFn` 44–58 plus the `->`/`->>` operators). All sqlite-differential-tested. `quote()` refuses only the reals whose sqlite rendering is build-dependent, `strftime()` only the modifier/`'now'`/Julian-day forms, JSON only JSON5/JSONB/>128-deep and the three JSON-subtype-undecidable argument shapes — each a named error, never a wrong answer. | `mpedb-sql` builtins |
+| 5 [5] | ~~39~~ | ✅ **FIXED after this run — sqlite truthiness + the int/bool value bridge.** A non-boolean in a boolean position (WHERE/HAVING/ON/FILTER, `NOT`, `AND`/`OR`, `CASE WHEN`, `CHECK`, `ON CONFLICT … WHERE`) is truthy-tested exactly as `sqlite3VdbeBooleanValue` does — NULL unknown, integer `!= 0`, everything else `RealValue(x) != 0.0` (the leading-float-prefix parse, over text AND a blob's raw bytes). It desugars in the binder to `x <> 0` / `CAST(x AS REAL) <> 0.0`, so **no new opcode and no `PLAN_FORMAT` bump**. The VALUE bridge is deliberately narrower than "int and bool are interchangeable": in a comparison an int const 0/1 folds into the bool domain (`flag = 1` → `flag = TRUE`, keeping the index-probe shape) and anything else casts the bool side up to its integer, so `flag = 2` is FALSE — sqlite's answer; a bool assigned to an int column is exact (`TRUE` → 1); an int into a bool column converts **only** 0/1; a parameter bound as 0/1 into a bool slot converts (CPython binds `True` via `sqlite3_bind_int64`). Arithmetic on a bool is still rigid. 24 values × 8 boolean positions diffed against the 3.45.1 binary in `crates/mpedb/tests/bool_truthiness.rs`; the C-API path in `capi.rs::django_boolean_field_through_the_c_api`. **Not re-measured** — 39 is run-2's number. Together with the JSON row above this also unblocks the **439-test JSONField label**: both halves of `CHECK ((JSON_VALID("data") OR "data" IS NULL))` — the unknown function AND the int64 boolean operands — are now closed, so Django should create those tables and RUN those tests. That is a prediction to be measured, not a claim. | `mpedb-sql` binder |
 | 6 [6] | **20 (+6)** | **`LIKE … ESCAPE` (44 statements) and `ORDER BY … NULLS FIRST/LAST` (6)** are not parsed. **Absorbs rows 10 and 11** — those 6 tests are this gap seen through an enclosing `FILTER`/`IN`/`EXISTS` paren, so the true weight is ~26. | `mpedb-sql` parser |
 | 7 [7] | **10** | **Rigid numeric parameter typing**: `$N is int64, statement requires float64` 6, `$N is float64, requires int64` 2, `cannot assign float64 to column of type int64` 2. | `mpedb-sql` |
 | 8 [8] | **8** | **Bitwise operators absent** (`\|`, `&`, `<<`, `>>`, `^`) — including 3 tests that surface as `cannot assign any to column of type int64` on Django's XOR emulation. | `mpedb-sql` tokenizer |

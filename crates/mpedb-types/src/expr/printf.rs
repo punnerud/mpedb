@@ -82,7 +82,7 @@ fn atoi64(z: &[u8]) -> i64 {
 /// `[+-]?digits(.digits)?([eE][+-]?digits)?` prefix and parse it; non-numeric
 /// text yields 0.0. Matches sqlite for the well-formed numeric text that a `%f`
 /// argument would carry, and gives 0.0 for `'abc'` exactly as sqlite does.
-fn atof(z: &[u8]) -> f64 {
+pub(crate) fn atof(z: &[u8]) -> f64 {
     let mut i = 0;
     while i < z.len() && is_space(z[i]) {
         i += 1;

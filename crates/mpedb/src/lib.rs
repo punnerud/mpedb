@@ -2312,15 +2312,24 @@ primary_key = ["id"]
         // them): `mysum(NULL)` sees 4 NULLs and no ints.
         assert_eq!(ints(db.query("SELECT mysum(NULL) FROM users", &[]).unwrap()), vec![4]);
         // The result is dynamically typed (`ColumnType::Any`), exactly as a host
-        // SCALAR's is — which today means arithmetic over it is refused at bind.
-        // Asserted rather than left implicit: it is the SAME stage-1 limitation,
-        // not a new one, and a future relaxation should change both together.
+        // SCALAR's is. Arithmetic over it USED to be a bind error and no longer
+        // is: `Any` now unifies for arithmetic the same way it always did for
+        // comparison, with the runtime `arith` refusing a non-numeric operand.
+        // (The relaxation arrived with the JSON functions, where `doc ->> '$.n'`
+        // is `Any` and arithmetic over it is the obvious thing to write; it
+        // changes both together, as this comment used to promise.)
         db.register_host_function("plus1", 1, |a| match a {
             [Value::Int(x)] => Ok(Value::Int(x + 1)),
             _ => Err(Error::Unsupported("plus1 wants one int".into())),
         });
-        assert!(db.query("SELECT mysum(id) + 1 FROM users", &[]).is_err());
-        assert!(db.query("SELECT plus1(id) + 1 FROM users", &[]).is_err());
+        assert_eq!(
+            ints(db.query("SELECT mysum(id) + 1 FROM users", &[]).unwrap()),
+            vec![10_001]
+        );
+        assert_eq!(
+            ints(db.query("SELECT sum(plus1(id)) FROM users", &[]).unwrap()),
+            vec![14]
+        );
         // Both are fine on their own, and a host scalar INSIDE a host
         // aggregate's argument composes (two registries, one execution).
         assert_eq!(

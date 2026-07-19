@@ -180,6 +180,12 @@ pub(crate) enum BinOp {
     Or,
     /// `||` — SQL concatenation.
     Concat,
+    /// `->` — sqlite's JSON accessor returning the selected node's JSON TEXT
+    /// (`'{"a":"s"}' -> '$.a'` is the three characters `"s"`).
+    JsonArrow,
+    /// `->>` — sqlite's JSON accessor returning the selected node as a SQL
+    /// value (`'{"a":"s"}' ->> '$.a'` is the one character `s`).
+    JsonArrowText,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

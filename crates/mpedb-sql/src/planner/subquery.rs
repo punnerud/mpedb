@@ -276,10 +276,18 @@ impl Lift<'_> {
             E::Coalesce(xs) => {
                 E::Coalesce(xs.iter().map(|x| self.rewrite(x)).collect::<Result<_>>()?)
             }
-            E::Func(f, xs) => E::Func(
-                f.clone(),
-                xs.iter().map(|x| self.rewrite(x)).collect::<Result<_>>()?,
-            ),
+            E::Func(f, xs) => {
+                // The JSON functions that take VALUE arguments read sqlite's
+                // per-value JSON subtype, which propagates out of a scalar
+                // subquery. This is the LAST place that shape is visible —
+                // after the lift, the subquery is a reserved parameter the
+                // binder cannot tell from a user one.
+                crate::binder::reject_subquery_in_json_value(f, xs)?;
+                E::Func(
+                    f.clone(),
+                    xs.iter().map(|x| self.rewrite(x)).collect::<Result<_>>()?,
+                )
+            }
             E::Case(arms, els) => E::Case(
                 arms.iter()
                     .map(|(c, r)| Ok((self.rewrite(c)?, self.rewrite(r)?)))
@@ -750,10 +758,18 @@ impl<'a> Correlate<'a, '_> {
             E::Coalesce(xs) => {
                 E::Coalesce(xs.iter().map(|x| self.rewrite(x)).collect::<Result<_>>()?)
             }
-            E::Func(f, xs) => E::Func(
-                f.clone(),
-                xs.iter().map(|x| self.rewrite(x)).collect::<Result<_>>()?,
-            ),
+            E::Func(f, xs) => {
+                // The JSON functions that take VALUE arguments read sqlite's
+                // per-value JSON subtype, which propagates out of a scalar
+                // subquery. This is the LAST place that shape is visible —
+                // after the lift, the subquery is a reserved parameter the
+                // binder cannot tell from a user one.
+                crate::binder::reject_subquery_in_json_value(f, xs)?;
+                E::Func(
+                    f.clone(),
+                    xs.iter().map(|x| self.rewrite(x)).collect::<Result<_>>()?,
+                )
+            }
             E::Case(arms, els) => E::Case(
                 arms.iter()
                     .map(|(c, r)| Ok((self.rewrite(c)?, self.rewrite(r)?)))
