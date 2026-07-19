@@ -1,6 +1,7 @@
 //! Built-in scalar functions: the [`ScalarFn`] enum and the
 //! NULL-propagating [`call_scalar`] dispatch (plus `typeof`, which does not).
 
+use super::json;
 use super::printf::sqlite_printf;
 use super::*;
 
@@ -106,6 +107,46 @@ pub enum ScalarFn {
     /// offending specifier or time string, never a guessed value.
     /// See [`super::datetime`].
     Strftime = 43,
+    // --- sqlite's JSON function set (see [`super::json`]). JSON is TEXT here,
+    // exactly as in sqlite: no JSON `ColumnType`, no schema-format change.
+    /// `json(X)` — validate `X` as JSON and return it MINIFIED (token spellings
+    /// preserved, whitespace between tokens dropped). Strict RFC 8259: sqlite
+    /// 3.45's JSON5 extensions are refused by name rather than rewritten.
+    Json = 44,
+    /// `json_valid(X[, FLAGS])` — 1/0. Grammar bit 1 (strict text) only; bits
+    /// 2 (JSON5) and 4/8 (JSONB) are refused by name.
+    JsonValid = 45,
+    /// `json_type(X[, PATH])` — `object`/`array`/`integer`/`real`/`true`/
+    /// `false`/`null`/`text`, or NULL when the path selects nothing.
+    JsonType = 46,
+    /// `json_quote(X)` — `X` as a JSON value. Does NOT null-propagate:
+    /// `json_quote(NULL)` is the four-character text `null`.
+    JsonQuote = 47,
+    /// `json_array_length(X[, PATH])`.
+    JsonArrayLength = 48,
+    /// `json_extract(X, PATH, …)` — one path unwraps to a SQL value, several
+    /// wrap into a JSON array.
+    JsonExtract = 49,
+    /// The `->` OPERATOR: the selected node's JSON TEXT.
+    JsonArrow = 50,
+    /// The `->>` OPERATOR: the selected node as a SQL value.
+    JsonArrowText = 51,
+    /// `json_array(…)`. Argument 0 is the binder-supplied JSON-subtype bitmask
+    /// (see `binder::json_ness`), not a user argument.
+    JsonArray = 52,
+    /// `json_object(LABEL, VALUE, …)`, with the same leading subtype bitmask.
+    JsonObject = 53,
+    /// `json_patch(TARGET, PATCH)` — RFC 7396 merge patch. No subtype mask:
+    /// both arguments are documents.
+    JsonPatch = 54,
+    /// `json_remove(X, PATH, …)`. No subtype mask: it takes no values.
+    JsonRemove = 55,
+    /// `json_replace(X, PATH, VALUE, …)`, with a leading subtype bitmask.
+    JsonReplace = 56,
+    /// `json_set(X, PATH, VALUE, …)`, with a leading subtype bitmask.
+    JsonSet = 57,
+    /// `json_insert(X, PATH, VALUE, …)`, with a leading subtype bitmask.
+    JsonInsert = 58,
 }
 
 impl ScalarFn {
@@ -154,6 +195,21 @@ impl ScalarFn {
             41 => ScalarFn::Printf,
             42 => ScalarFn::Quote,
             43 => ScalarFn::Strftime,
+            44 => ScalarFn::Json,
+            45 => ScalarFn::JsonValid,
+            46 => ScalarFn::JsonType,
+            47 => ScalarFn::JsonQuote,
+            48 => ScalarFn::JsonArrayLength,
+            49 => ScalarFn::JsonExtract,
+            50 => ScalarFn::JsonArrow,
+            51 => ScalarFn::JsonArrowText,
+            52 => ScalarFn::JsonArray,
+            53 => ScalarFn::JsonObject,
+            54 => ScalarFn::JsonPatch,
+            55 => ScalarFn::JsonRemove,
+            56 => ScalarFn::JsonReplace,
+            57 => ScalarFn::JsonSet,
+            58 => ScalarFn::JsonInsert,
             other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
         })
     }
@@ -192,6 +248,26 @@ impl ScalarFn {
             ScalarFn::LogBase | ScalarFn::Atan2 | ScalarFn::Mod => argc == 2,
             // `pi()` is the one nullary scalar.
             ScalarFn::Pi => argc == 0,
+            // --- JSON. `json`/`json_quote` take exactly one argument;
+            // `json_valid`/`json_type`/`json_array_length` take an optional
+            // second (FLAGS or PATH).
+            ScalarFn::Json | ScalarFn::JsonQuote => argc == 1,
+            ScalarFn::JsonValid | ScalarFn::JsonType | ScalarFn::JsonArrayLength => {
+                argc == 1 || argc == 2
+            }
+            // `json_extract(X, PATH, …)` and `json_remove(X, PATH, …)` are
+            // variadic over paths; the document plus at least one path.
+            ScalarFn::JsonExtract => argc >= 2,
+            ScalarFn::JsonRemove => argc >= 1,
+            // The two operators are strictly binary.
+            ScalarFn::JsonArrow | ScalarFn::JsonArrowText | ScalarFn::JsonPatch => argc == 2,
+            // The value-taking writers carry a BINDER-SUPPLIED leading subtype
+            // bitmask, so their plan arity is one more than the SQL arity:
+            // `json_array()` is argc 1, `json_object(k,v)` is argc 3, and
+            // `json_set(X,p,v)` is argc 4. The even/odd shape is re-checked at
+            // eval time, where the message can name the function.
+            ScalarFn::JsonArray | ScalarFn::JsonObject => argc >= 1,
+            ScalarFn::JsonReplace | ScalarFn::JsonSet | ScalarFn::JsonInsert => argc >= 2,
         }
     }
 
@@ -240,6 +316,21 @@ impl ScalarFn {
             ScalarFn::Printf => "printf",
             ScalarFn::Quote => "quote",
             ScalarFn::Strftime => "strftime",
+            ScalarFn::Json => "json",
+            ScalarFn::JsonValid => "json_valid",
+            ScalarFn::JsonType => "json_type",
+            ScalarFn::JsonQuote => "json_quote",
+            ScalarFn::JsonArrayLength => "json_array_length",
+            ScalarFn::JsonExtract => "json_extract",
+            ScalarFn::JsonArrow => "->",
+            ScalarFn::JsonArrowText => "->>",
+            ScalarFn::JsonArray => "json_array",
+            ScalarFn::JsonObject => "json_object",
+            ScalarFn::JsonPatch => "json_patch",
+            ScalarFn::JsonRemove => "json_remove",
+            ScalarFn::JsonReplace => "json_replace",
+            ScalarFn::JsonSet => "json_set",
+            ScalarFn::JsonInsert => "json_insert",
         }
     }
 }
@@ -268,6 +359,23 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
     // denotes NULL — so it too runs ahead of the null gate.
     if matches!(f, ScalarFn::Quote) {
         return sqlite_quote(&args[0]);
+    }
+    // The JSON functions that must SEE a NULL rather than propagate it.
+    // `json_quote(NULL)` is the text `null`; the writers turn a NULL VALUE
+    // argument into JSON `null` (`json_array(NULL)` is `[null]`); `json_valid`
+    // raises on a NULL FLAGS instead of returning NULL; and `json_remove`/
+    // `json_set` have their own, different NULL rules. Every one of these is
+    // verified against sqlite 3.45.1 — see [`super::json`].
+    match f {
+        ScalarFn::JsonQuote => return json::json_quote(args),
+        ScalarFn::JsonValid => return json::json_valid(args),
+        ScalarFn::JsonArray => return json::json_array(args),
+        ScalarFn::JsonObject => return json::json_object(args),
+        ScalarFn::JsonRemove => return json::json_remove(args),
+        ScalarFn::JsonSet => return json::json_set(args),
+        ScalarFn::JsonInsert => return json::json_insert(args),
+        ScalarFn::JsonReplace => return json::json_replace(args),
+        _ => {}
     }
     if args.iter().any(|a| a.is_null()) {
         return Ok(Value::Null);
@@ -558,10 +666,29 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
         // strftime(FORMAT, TIMESTRING): sqlite's time formatter over the ISO-8601
         // time strings, restricted to the specifiers mpedb reproduces exactly.
         ScalarFn::Strftime => super::datetime::sqlite_strftime(args)?,
+        // --- JSON readers. These DO null-propagate (verified: a NULL document
+        // or a NULL path yields NULL), so they sit under the gate.
+        ScalarFn::Json => json::json(args)?,
+        ScalarFn::JsonType => json::json_type(args)?,
+        ScalarFn::JsonArrayLength => json::json_array_length(args)?,
+        ScalarFn::JsonExtract => json::json_extract(args)?,
+        ScalarFn::JsonArrow => json::json_arrow(args)?,
+        ScalarFn::JsonArrowText => json::json_arrow_text(args)?,
+        ScalarFn::JsonPatch => json::json_patch(args)?,
         // Handled ahead of the null gate above; unreachable here.
         ScalarFn::Typeof => unreachable!("typeof is dispatched before the null gate"),
         ScalarFn::Printf => unreachable!("printf is dispatched before the null gate"),
         ScalarFn::Quote => unreachable!("quote is dispatched before the null gate"),
+        ScalarFn::JsonQuote
+        | ScalarFn::JsonValid
+        | ScalarFn::JsonArray
+        | ScalarFn::JsonObject
+        | ScalarFn::JsonRemove
+        | ScalarFn::JsonSet
+        | ScalarFn::JsonInsert
+        | ScalarFn::JsonReplace => {
+            unreachable!("the JSON writers are dispatched before the null gate")
+        }
     })
 }
 
