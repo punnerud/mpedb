@@ -1347,7 +1347,8 @@ fn max_col(e: &BExpr) -> Option<u16> {
             | BExpr::InParam(a, _) => stack.push(a),
             BExpr::Binary(_, a, b)
             | BExpr::IsDistinct(a, b, _)
-            | BExpr::CollateCmp(_, a, b, _) => {
+            | BExpr::CollateCmp(_, a, b, _)
+            | BExpr::ClassCmp(_, a, b, _, _) => {
                 stack.push(a);
                 stack.push(b);
             }

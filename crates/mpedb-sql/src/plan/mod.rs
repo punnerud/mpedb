@@ -304,7 +304,19 @@ const MAX_JOINS: usize = 16;
 //     format-41 reader would silently take byte 2 for "ASC" and 3 for "DESC"
 //     and return a differently ordered result set, which is exactly why THIS
 //     half cannot rely on failing closed the way a new opcode does.
-const PLAN_FORMAT: u8 = 44;
+// 42: comparison affinity over a TYPELESS column — two additive expr opcodes,
+//     `Instr::Affinity` (40, applies sqlite's store-time affinity to the top of
+//     the stack) and `Instr::CmpClass` (41, a comparison by storage-class order
+//     instead of a refusal). Emitted ONLY for a comparison one of whose
+//     operands is a bare `any` column, so every plan that does not touch one
+//     encodes byte-for-byte as in format 40/41. A reader one format back hits
+//     the unknown opcode in the expr decoder and rejects the plan as corrupt
+//     rather than misreading it, and the whole-plan version gates it anyway:
+//     the blob fails CLOSED at byte 0 with the documented re-prepare.
+//     NOTE (worktree, 2026-07-19): the base this was written on carries 40;
+//     41 is another agent's in-flight bump, so this takes 42 by instruction and
+//     the numbers are reconciled at merge.
+const PLAN_FORMAT: u8 = 45;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

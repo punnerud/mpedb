@@ -1,0 +1,371 @@
+# Grouping keys over a TYPELESS (`any`) column — sqlite's storage-class rule.
+#
+# Every expected value here was produced by running the same program through
+# sqlite3 3.45.1 rather than reasoned out.
+#
+# The rule: DISTINCT / GROUP BY / PARTITION BY / set-op dedup ask sqlite's
+# COMPARISON whether two values are one key, and that comparison works on
+# storage CLASSES — NULL < numbers < text < blob, with integers and reals
+# interleaved numerically. So over a column that can hold anything:
+#
+#   1 and 1.0 are ONE key (both numbers, equal)   — count(DISTINCT v) says 2
+#   '1'        is another  (text is its own class)   for the three of them
+#   x'31'      is a third  (blob), even though its bytes are the text's
+#   0 and -0.0 are ONE key; 9007199254740993 and 9007199254740992.0 are NOT
+#     (the comparison is exact, and no f64 holds the odd one)
+#
+# On a rigidly typed column none of this is observable — the column holds one
+# class — which is why the on-disk key encoding (`keycode::encode_key`, which
+# keys by mpedb TYPE) was enough until `any` columns arrived. It is not enough
+# here, in BOTH directions: it splits 1 from 1.0, and it ALIASES the text '1'
+# with the blob x'31' and the integer 0 with the real 0.0, because their
+# payload bytes coincide. `keycode::encode_group_key` is the grouping key.
+#
+# schema:
+# [[table]]
+# name = "t"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "v"
+#   type = "any"
+#
+#   [[table.column]]
+#   name = "g"
+#   type = "any"
+#
+# [[table]]
+# name = "u"
+# primary_key = ["id"]
+#
+#   [[table.column]]
+#   name = "id"
+#   type = "int64"
+#
+#   [[table.column]]
+#   name = "w"
+#   type = "any"
+# end schema
+
+statement ok
+INSERT INTO t (id, v, g) VALUES (1, NULL, 'a'), (2, 1, 'a'), (3, 1.0, 'b'), (4, '1', 'b')
+
+statement ok
+INSERT INTO t (id, v, g) VALUES (5, x'31', 'c'), (6, 0, 'c'), (7, -0.0, 1), (8, 9007199254740993, 1.0)
+
+statement ok
+INSERT INTO t (id, v, g) VALUES (9, 9007199254740992.0, 1.0), (10, 'abc', NULL), (11, 2.5, 'a'), (12, 1, 'a')
+
+statement ok
+INSERT INTO u (id, w) VALUES (1, 1), (2, 1.0), (3, '1'), (4, 2)
+
+# --- count(DISTINCT x) -----------------------------------------------------
+
+# 11 non-NULL values, 8 distinct keys: {1,1.0,1}, {'1'}, {x'31'}, {0,-0.0},
+# {9007199254740993}, {9007199254740992.0}, {'abc'}, {2.5}.
+query I
+SELECT count(DISTINCT v) FROM t
+----
+8
+
+# The repro, on its own: 1, 1.0, '1' and 2 are three keys plus one.
+query I
+SELECT count(DISTINCT w) FROM u
+----
+3
+
+# `g` holds 'a' 'b' 'c', the integer 1 and the real 1.0 — four keys.
+query I
+SELECT count(DISTINCT g) FROM t
+----
+4
+
+# NULL is not a value to count(DISTINCT), and the class rule does not change
+# that: it is skipped before the dedup.
+query I
+SELECT count(DISTINCT v) FROM t WHERE v IS NOT NULL
+----
+8
+
+# Text is its own class and dedups bytewise inside it: '1' and 'abc'.
+query I
+SELECT count(DISTINCT v) FROM t WHERE typeof(v) = 'text'
+----
+2
+
+# NULL, 1, 1.0, '1' — two keys (the NULL is skipped, 1 and 1.0 are one).
+query I
+SELECT count(DISTINCT v) FROM t WHERE id <= 4
+----
+2
+
+# The text '1' and the blob x'31' have the SAME bytes and are two keys. The
+# on-disk key encoder aliases them; this is the direction of the bug that made
+# `count(DISTINCT v)` too SMALL rather than too large.
+query I
+SELECT count(DISTINCT v) FROM t WHERE id IN (4, 5)
+----
+2
+
+# A rigidly typed column cannot hold two classes, so its keying is unchanged.
+query I
+SELECT count(DISTINCT id) FROM t
+----
+12
+
+# The dedup feeds sum() as well as count(): 1 + 0 + 9007199254740993 (the
+# second `1` and the `1.0` both drop out).
+query I
+SELECT sum(DISTINCT v) FROM t WHERE typeof(v) = 'integer'
+----
+9007199254740994
+
+# count(DISTINCT) and count() over the same column, one statement.
+query II
+SELECT count(DISTINCT w), count(w) FROM u
+----
+3
+4
+
+# --- GROUP BY --------------------------------------------------------------
+
+# One row per key, and the ORDER is sqlite's too: the grouping key's bytes are
+# class-ordered, so the group map iterates NULL, numbers (ascending, ints and
+# reals interleaved), text, blob. Note 9007199254740992.0 (real) sorting BELOW
+# the integer 9007199254740993 — an exact comparison, not a cast.
+query TI nosort
+SELECT typeof(v), count(*) FROM t GROUP BY v
+----
+null
+1
+integer
+2
+integer
+3
+real
+1
+real
+1
+integer
+1
+text
+1
+text
+1
+blob
+1
+
+# Five groups, not six: `1` and `1.0` in `g` are one.
+query TII nosort
+SELECT typeof(g), count(*), count(DISTINCT v) FROM t GROUP BY g
+----
+null
+1
+1
+integer
+3
+3
+text
+4
+2
+text
+2
+2
+text
+2
+2
+
+# Group sizes alone, in class order: NULL, {0,-0.0}, {1,1.0,1}, then one row
+# each for 2.5, the real 9007199254740992.0, the integer 9007199254740993,
+# '1', 'abc' and x'31'.
+query I nosort
+SELECT count(*) FROM t GROUP BY v
+----
+1
+2
+3
+1
+1
+1
+1
+1
+1
+
+# HAVING sees the same groups.
+query I nosort
+SELECT count(*) FROM t GROUP BY v HAVING count(*) > 1
+----
+2
+3
+
+# A COMPOSITE grouping key: eleven groups, and the one with two rows is
+# (1, 'a') — ids 2 and 12. Rowsorted, since two grouping columns leave the
+# emission order to the key bytes and only the multiset is the answer here.
+query I rowsort
+SELECT count(*) FROM t GROUP BY v, g
+----
+1
+1
+1
+1
+1
+1
+1
+1
+1
+1
+2
+
+# GROUP BY over the OTHER typeless column, listing the text keys.
+query T nosort
+SELECT g FROM t WHERE typeof(g) = 'text' GROUP BY g ORDER BY g
+----
+a
+b
+c
+
+# Distinct keys vs distinct CLASSES: 'a','b','c',{1,1.0} and NULL — four
+# non-NULL keys spread over four classes… of which two are text.
+query II
+SELECT count(DISTINCT g), count(DISTINCT typeof(g)) FROM t
+----
+4
+4
+
+# min/max pick across classes by the same order: the smallest is a number,
+# the largest the blob.
+query TT
+SELECT typeof(min(v)), typeof(max(v)) FROM t
+----
+integer
+blob
+
+# DISTINCT inside an aggregate, per group of a JOIN. Every `u` row pairs with
+# every `t` row, so each group sees all 11 non-NULL `v` values → 8 keys; and
+# `u.w` itself groups 1 with 1.0.
+query I nosort
+SELECT count(DISTINCT t.v) FROM t JOIN u ON 1=1 GROUP BY u.w
+----
+8
+8
+8
+
+# --- SELECT DISTINCT -------------------------------------------------------
+
+# The small numbers only, so the column renders under one typestring: rows
+# 1, 1.0, 0, -0.0, 2.5, 1 collapse to three keys.
+query R nosort
+SELECT DISTINCT v FROM t WHERE id IN (2, 3, 6, 7, 11, 12) ORDER BY v
+----
+0.000
+1.000
+2.500
+
+# All seven numbers, keyed: {1,1.0,1}, {0,-0.0}, {9007199254740993},
+# {9007199254740992.0}, {2.5}. FIVE, not four — the integer and the real are
+# compared exactly, and no f64 holds 9007199254740993. (Rendered as `R` they
+# would both print as …992.000, which is why this one is counted, not listed.)
+query I
+SELECT count(DISTINCT v) FROM t WHERE typeof(v) = 'integer' OR typeof(v) = 'real'
+----
+5
+
+query I
+SELECT count(DISTINCT v) FROM t WHERE id IN (8, 9)
+----
+2
+
+# Five storage classes are present, one row each.
+query T nosort
+SELECT DISTINCT typeof(v) FROM t ORDER BY typeof(v)
+----
+blob
+integer
+null
+real
+text
+
+# --- set operations --------------------------------------------------------
+
+# UNION dedups by the same rule: {1, 1.0} is one row.
+query R nosort
+SELECT w FROM u WHERE typeof(w) <> 'text' UNION SELECT v FROM t WHERE id IN (2, 3, 6, 12) ORDER BY 1
+----
+0.000
+1.000
+2.000
+
+query R nosort
+SELECT v FROM t WHERE typeof(v) = 'real' INTERSECT SELECT w FROM u WHERE typeof(w) <> 'text' ORDER BY 1
+----
+1.000
+
+query R nosort
+SELECT w FROM u WHERE typeof(w) <> 'text' EXCEPT SELECT v FROM t WHERE id IN (2, 3, 6, 12) ORDER BY 1
+----
+2.000
+
+# --- PARTITION BY ----------------------------------------------------------
+
+# The window partition is the same key: rows 2, 3 and 12 (1, 1.0, 1) are one
+# partition of three; rows 6 and 7 (0, -0.0) one of two; row 4 ('1') and row 5
+# (x'31') are alone.
+query II nosort
+SELECT id, count(*) OVER (PARTITION BY g) FROM t ORDER BY id
+----
+1
+4
+2
+4
+3
+2
+4
+2
+5
+2
+6
+2
+7
+3
+8
+3
+9
+3
+10
+1
+11
+4
+12
+4
+
+query II nosort
+SELECT id, count(*) OVER (PARTITION BY v) FROM t ORDER BY id
+----
+1
+1
+2
+3
+3
+3
+4
+1
+5
+1
+6
+2
+7
+2
+8
+1
+9
+1
+10
+1
+11
+1
+12
+3
