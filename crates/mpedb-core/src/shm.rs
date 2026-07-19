@@ -25,6 +25,12 @@ pub const FORMAT_VERSION: u32 = 4; // v4: schema_gen in the meta snapshot (#47 D
 /// [`Shm::writer_lock`] for why this exists and why it is small.
 #[cfg(target_os = "linux")]
 const WRITER_LOCK_SPINS: u32 = 64;
+/// Reserves at or below this size get their extents pre-written (zeroed) at
+/// create so per-commit COW writes never pay an unwritten→written extent
+/// conversion (`crate::os::prewrite_zeros`). Above it, the reserve is left
+/// fallocate'd-but-unwritten: zeroing e.g. an 800 GiB `size_mb` at create would
+/// dwarf the per-commit saving, and the conversion cost amortizes as it fills.
+const PREZERO_MAX_BYTES: u64 = 2 << 30; // 2 GiB
 const MAGIC: &[u8; 8] = b"MPEDB1\0\0";
 
 // ---- meta page field offsets (pages 0 and 1) ----
@@ -1997,6 +2003,18 @@ impl Shm {
             let rc = crate::os::preallocate(file.as_raw_fd(), 0, size as i64);
             if rc != 0 {
                 return Err(io_err("fallocate (preallocating database file)"));
+            }
+            // Convert the reserve from UNWRITTEN to WRITTEN extents up front, so
+            // per-commit COW writes are plain overwrites — not extent-state
+            // conversions each `fdatasync` must journal (measured ~7× on xfs, ~2×
+            // on ext4). Bounded: a huge reserve (e.g. an 800 GiB `size_mb`) is
+            // left unwritten — zeroing it at create would cost more than it saves,
+            // and it amortizes as that database fills. One-time, formatter-only.
+            if size <= PREZERO_MAX_BYTES {
+                let rc = crate::os::prewrite_zeros(file.as_raw_fd(), size);
+                if rc != 0 {
+                    return Err(io_err("pre-writing reserved region"));
+                }
             }
         }
         let mut shm = Self::map(&file, size, max_readers, durability, path)?;

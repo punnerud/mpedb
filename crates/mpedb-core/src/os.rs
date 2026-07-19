@@ -84,6 +84,38 @@ pub fn preallocate(fd: RawFd, offset: i64, len: i64) -> libc::c_int {
     }
 }
 
+/// Force `[0, len)` from UNWRITTEN to WRITTEN extents by writing zeros over it.
+///
+/// `preallocate` (fallocate) reserves blocks but leaves them *unwritten*; the
+/// FIRST write to an unwritten extent triggers a filesystem extent-state
+/// conversion that `fdatasync` must then journal. Because mpedb is copy-on-write
+/// — every commit allocates FRESH pages from the reserve — that conversion lands
+/// on nearly every commit, a measured ~7× stall on xfs and ~2× on ext4. Doing it
+/// ONCE up front turns every later commit into a plain overwrite. The caller
+/// gates this on file size: a multi-hundred-GiB reserve is left unwritten, since
+/// zeroing it at create would dwarf any per-commit saving. Returns 0 on success.
+/// No-op on non-Linux (macOS reserves via sparse `ftruncate`; it is bench-grade).
+#[cfg(target_os = "linux")]
+pub fn prewrite_zeros(fd: RawFd, len: u64) -> libc::c_int {
+    const CHUNK: usize = 1 << 20; // 1 MiB write buffer
+    let zeros = vec![0u8; CHUNK];
+    let mut off: u64 = 0;
+    while off < len {
+        let n = CHUNK.min((len - off) as usize);
+        let w = unsafe { libc::pwrite(fd, zeros.as_ptr() as *const libc::c_void, n, off as i64) };
+        if w < 0 || w as usize != n {
+            return -1;
+        }
+        off += n as u64;
+    }
+    0
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn prewrite_zeros(_fd: RawFd, _len: u64) -> libc::c_int {
+    0
+}
+
 /// Reclaim `[offset, offset+len)` as a hole (WAL checkpoint). Best-effort;
 /// failure only wastes space. macOS: no-op (space is not reclaimed).
 pub fn punch_hole(fd: RawFd, offset: i64, len: i64) {
