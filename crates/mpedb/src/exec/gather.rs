@@ -53,6 +53,36 @@ fn join_oom() -> Error {
     Error::OutOfMemory { what: "a nested-loop join's intermediate rows" }
 }
 
+/// Can a join budget of `cells` plausibly be allocated by this process?
+/// ~40 B resident per cell (the calibration constant from
+/// [`mpedb_types::config::DEFAULT_MAX_JOIN_CELLS`]'s measurement), compared
+/// against the tighter of the address-space rlimit and, on Linux,
+/// `MemAvailable`. Falls back to "fits" when nothing is readable — that is
+/// today's behaviour, so an exotic platform loses nothing. The 3/4 factor
+/// leaves room for the transient candidate row and the engine's own maps.
+fn budget_fits_in_memory(cells: u64) -> bool {
+    let need = cells.saturating_mul(40);
+    let mut bound = u64::MAX;
+    unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_AS, &mut rl) == 0 && rl.rlim_cur != libc::RLIM_INFINITY {
+            bound = bound.min(rl.rlim_cur as u64);
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        if let Some(kb) = s
+            .lines()
+            .find(|l| l.starts_with("MemAvailable:"))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|v| v.parse::<u64>().ok())
+        {
+            bound = bound.min(kb.saturating_mul(1024));
+        }
+    }
+    bound == u64::MAX || need <= bound / 4 * 3
+}
+
 /// Build one joined row of exactly `cap` values: `lead_nulls` NULLs (a FULL
 /// join's outer-side extension), then `head` and `tail`, then NULL-padding
 /// to `cap` (a LEFT/FULL join's inner-side extension).
@@ -272,10 +302,21 @@ pub(super) fn gather_joined(
         format!("rows held by a join over \"{}\"", table_name(schema, outer_table))
     })?;
     // With a FINITE budget the deterministic cap above is the guard and the
-    // row build stays on the plain infallible path it always was; only the
+    // row build stays on the plain infallible path it always was; the
     // explicit `max_join_cells = 0` opt-out pays for per-allocation
     // fallibility (see `build_joined_row`).
-    let fallible = cells.budget == 0;
+    //
+    // …unless the budget CANNOT FIT: the cap only guards if it trips before
+    // the memory wall, and a budget of 2^28 cells ≈ 11 GB resident never
+    // trips inside a 3 GB rlimit — measured: `select5`'s `join-17-4` died on
+    // SIGABRT with the default config, exactly the host-killing failure this
+    // budget exists to prevent. So when the budget's byte-equivalent exceeds
+    // what this process can plausibly allocate (rlimit and, on Linux,
+    // MemAvailable), the row build goes fallible too: answers are unchanged
+    // (fallibility only changes the failure MODE at the wall, abort → clean
+    // Error::OutOfMemory), the deterministic trip point is unchanged, and a
+    // healthy box still pays nothing. One probe per gather, not per row.
+    let fallible = cells.budget == 0 || !budget_fits_in_memory(cells.budget);
     for join in joins {
         let inner_width = table_def(schema, plan, join.table)?.columns.len();
         let join_tbl = join.table; // for the #74 attribution closures
