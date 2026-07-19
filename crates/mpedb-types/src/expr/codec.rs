@@ -62,6 +62,16 @@ const OP_SHR: u8 = 53;
 const OP_BIT_NOT: u8 = 54;
 // #74 item 3: REGEXP with the pattern from the STACK instead of the const pool.
 const OP_REGEXP_DYN: u8 = 55;
+// The LIKE/GLOB halves of the same gap: the pattern from the STACK. Four LIKE
+// tags mirroring the const-pool family (dialect × escape-ness are compile-time
+// properties, so they select the opcode — the ESCAPE argument itself stays a
+// const-pool literal by deliberate policy); GLOB has no dialect and no ESCAPE,
+// so one tag covers it.
+const OP_LIKE_DYN: u8 = 56;
+const OP_LIKE_CS_DYN: u8 = 57;
+const OP_LIKE_DYN_ESC: u8 = 58;
+const OP_LIKE_CS_DYN_ESC: u8 = 59;
+const OP_GLOB_DYN: u8 = 60;
 
 impl ExprProgram {
     /// Deterministic serialization (part of plan blobs and plan hashing).
@@ -168,6 +178,17 @@ impl ExprProgram {
                 Instr::Shr => buf.push(OP_SHR),
                 Instr::BitNot => buf.push(OP_BIT_NOT),
                 Instr::RegexpDyn => buf.push(OP_REGEXP_DYN),
+                Instr::LikeDyn => buf.push(OP_LIKE_DYN),
+                Instr::LikeCsDyn => buf.push(OP_LIKE_CS_DYN),
+                Instr::LikeDynEsc(e) => {
+                    buf.push(OP_LIKE_DYN_ESC);
+                    buf.extend_from_slice(&e.to_le_bytes());
+                }
+                Instr::LikeCsDynEsc(e) => {
+                    buf.push(OP_LIKE_CS_DYN_ESC);
+                    buf.extend_from_slice(&e.to_le_bytes());
+                }
+                Instr::GlobDyn => buf.push(OP_GLOB_DYN),
                 Instr::CmpColl(kind, coll) => {
                     buf.push(OP_CMP_COLL);
                     buf.push(kind as u8);
@@ -291,6 +312,11 @@ impl ExprProgram {
                 OP_SHR => Instr::Shr,
                 OP_BIT_NOT => Instr::BitNot,
                 OP_REGEXP_DYN => Instr::RegexpDyn,
+                OP_LIKE_DYN => Instr::LikeDyn,
+                OP_LIKE_CS_DYN => Instr::LikeCsDyn,
+                OP_LIKE_DYN_ESC => Instr::LikeDynEsc(read_u16_arg()?),
+                OP_LIKE_CS_DYN_ESC => Instr::LikeCsDynEsc(read_u16_arg()?),
+                OP_GLOB_DYN => Instr::GlobDyn,
                 OP_CMP_COLL => {
                     let k = *buf.get(*pos).ok_or_else(err)?;
                     let c = *buf.get(*pos + 1).ok_or_else(err)?;
@@ -450,6 +476,18 @@ pub(super) fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                         }
                         escape_char(&consts[e as usize])?;
                         (1, 1)
+                    }
+                    // The dyn-pattern escape forms: the pattern is on the
+                    // stack, but the escape slot gets the same one-character-
+                    // text proof as the const forms above. (The escape-less
+                    // dyn forms — LikeDyn/LikeCsDyn/GlobDyn — are plain (2, 1)
+                    // ops and ride the catch-all, like RegexpDyn.)
+                    Instr::LikeDynEsc(e) | Instr::LikeCsDynEsc(e) => {
+                        if e as usize >= consts.len() {
+                            return Err(Error::Corrupt("const index out of range".into()));
+                        }
+                        escape_char(&consts[e as usize])?;
+                        (2, 1)
                     }
                     // Pops the probe scalar, pushes the 3VL result; the list comes
                     // from a param slot, not the stack, so the arity is not here.
