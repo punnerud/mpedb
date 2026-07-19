@@ -21,7 +21,7 @@ pub use config::{
 pub use error::{Error, Result};
 pub mod agg;
 pub use agg::Accum;
-pub use expr::{CmpKind, ExprProgram, Instr, ScalarFn};
+pub use expr::{CmpKind, ExprProgram, HostFns, Instr, ScalarFn};
 
 /// The aggregate functions.
 ///

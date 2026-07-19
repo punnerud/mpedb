@@ -92,7 +92,7 @@ fn fetch_inner(
         let mut stack = Vec::with_capacity(p.max_stack());
         let mut kept = Vec::with_capacity(rows.len());
         for row in rows {
-            if p.eval_filter(&mut stack, &row, params)? {
+            if p.eval_filter_host(&mut stack, &row, params, ctx.host_fns())? {
                 kept.push(row);
             }
         }
@@ -176,7 +176,7 @@ pub(super) fn gather_joined(
                 let mut joined = Vec::with_capacity(a.len() + i.len());
                 joined.extend_from_slice(a);
                 joined.extend_from_slice(i);
-                if join.on.eval_filter(&mut stack, &joined, params)? {
+                if join.on.eval_filter_host(&mut stack, &joined, params, ctx.host_fns())? {
                     matched = true;
                     if let Some(m) = &mut inner_matched {
                         m[ci] = true;
@@ -216,7 +216,7 @@ pub(super) fn gather_joined(
     if let Some(f) = joined_filter {
         let mut kept = Vec::with_capacity(acc.len());
         for row in acc {
-            if f.eval_filter(&mut stack, &row, params)? {
+            if f.eval_filter_host(&mut stack, &row, params, ctx.host_fns())? {
                 kept.push(row);
             }
         }
@@ -279,7 +279,7 @@ pub(super) fn gather_rows(
         let mut rows = vec![Vec::new()];
         if let Some(f) = filter {
             let mut stack = Vec::with_capacity(f.max_stack());
-            if !f.eval_filter(&mut stack, &rows[0], params)? {
+            if !f.eval_filter_host(&mut stack, &rows[0], params, ctx.host_fns())? {
                 rows.clear();
             }
         }
@@ -376,7 +376,7 @@ pub(super) fn gather_rows(
         let mut stack = Vec::with_capacity(f.max_stack());
         let mut kept = Vec::with_capacity(rows.len());
         for row in rows {
-            if f.eval_filter(&mut stack, &row, params)? {
+            if f.eval_filter_host(&mut stack, &row, params, ctx.host_fns())? {
                 kept.push(row);
             }
         }

@@ -11,8 +11,8 @@ use mpedb_sql::{
     SelectPlan, SetOp, SubBody, SubPlan,
 };
 use mpedb_types::{
-    keycode, Accum, Collation, DefaultExpr, Error, ExprProgram, KeyBound, KeyPart, Result, Schema,
-    TableDef, Value,
+    keycode, Accum, Collation, DefaultExpr, Error, ExprProgram, HostFns, KeyBound, KeyPart, Result,
+    Schema, TableDef, Value,
 };
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -96,6 +96,16 @@ pub(super) fn output_collations(
 /// construction (routing is by the recomputed `footprint.read_only`) and
 /// return `Error::Internal` if ever hit.
 pub(crate) trait TxnCtx {
+    /// Host-registered scalar UDFs in scope for this execution (design/DESIGN-UDF.md),
+    /// or `None` where none are (the default). Read-only executions carry them
+    /// (see [`ReadCtx`]); the write path returns `None` for stage 1, so a host UDF
+    /// in a write statement's expression surfaces a clean "not in scope" error
+    /// rather than being silently dropped. Every eval site threads this through
+    /// [`ExprProgram::eval_filter_host`]/`eval_host` so a plan that calls a UDF
+    /// resolves its closure.
+    fn host_fns(&self) -> Option<&dyn HostFns> {
+        None
+    }
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>>;
     fn get_by_index(&mut self, table: u32, index_no: u32, values: &[Value])
         -> Result<Option<Vec<Value>>>;
@@ -136,11 +146,12 @@ pub(crate) trait TxnCtx {
         cap: Option<usize>,
     ) -> Result<Vec<Vec<Value>>> {
         let rows = self.scan_rows_raw(table, lo, hi)?;
+        let host = self.host_fns();
         let mut kept = Vec::new();
         let mut stack = Vec::new();
         for row in rows {
             let keep = match filter {
-                Some((f, params)) => f.eval_filter(&mut stack, &row, params)?,
+                Some((f, params)) => f.eval_filter_host(&mut stack, &row, params, host)?,
                 None => true,
             };
             if keep {
@@ -169,11 +180,12 @@ pub(crate) trait TxnCtx {
         keep: usize,
     ) -> Result<Vec<Vec<Value>>> {
         let rows = self.scan_rows_raw(table, lo, hi)?;
+        let host = self.host_fns();
         let mut kept = Vec::new();
         let mut stack = Vec::new();
         for row in rows {
             let ok = match filter {
-                Some((f, params)) => f.eval_filter(&mut stack, &row, params)?,
+                Some((f, params)) => f.eval_filter_host(&mut stack, &row, params, host)?,
                 None => true,
             };
             if ok {
@@ -291,9 +303,19 @@ impl TxnCtx for WriteTxn<'_> {
 }
 
 /// Adapter over a pinned read snapshot.
-pub(crate) struct ReadCtx<'t, 'e>(pub &'t ReadTxn<'e>);
+pub(crate) struct ReadCtx<'t, 'e>(
+    pub &'t ReadTxn<'e>,
+    /// Host-registered scalar UDFs in scope for this read (design/DESIGN-UDF.md),
+    /// or `None`. Set by [`crate::Database`] only for a plan that
+    /// `contains_host_call`; the streaming and sqlite-overlay read paths pass
+    /// `None` (host UDFs there are out of scope for stage 1).
+    pub Option<&'t dyn HostFns>,
+);
 
 impl TxnCtx for ReadCtx<'_, '_> {
+    fn host_fns(&self) -> Option<&dyn HostFns> {
+        self.1
+    }
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
         self.0.get_by_pk(table, pk)
     }
@@ -345,12 +367,13 @@ impl TxnCtx for ReadCtx<'_, '_> {
     ) -> Result<Vec<Vec<Value>>> {
         // true streaming: stop pulling from the B+tree cursor the moment the
         // cap is reached — `SELECT ... LIMIT k` does O(offset+k) work
+        let host = self.1;
         let mut cursor = self.0.scan_raw(table, lo, hi)?;
         let mut kept = Vec::new();
         let mut stack = Vec::new();
         while let Some(row) = cursor.next()? {
             let keep = match filter {
-                Some((f, params)) => f.eval_filter(&mut stack, &row, params)?,
+                Some((f, params)) => f.eval_filter_host(&mut stack, &row, params, host)?,
                 None => true,
             };
             if keep {
@@ -379,6 +402,7 @@ impl TxnCtx for ReadCtx<'_, '_> {
         // evicts it. Never more than `keep` rows are held, regardless of how
         // many the scan yields.
         let mut heap: BinaryHeap<Ranked<'_>> = BinaryHeap::with_capacity(keep + 1);
+        let host = self.1;
         let mut cursor = self.0.scan_raw(table, lo, hi)?;
         let mut stack = Vec::new();
         // Scan sequence = PK order; used as a stable tiebreaker so equal
@@ -387,7 +411,7 @@ impl TxnCtx for ReadCtx<'_, '_> {
         let mut seq: u64 = 0;
         while let Some(row) = cursor.next()? {
             let ok = match filter {
-                Some((f, params)) => f.eval_filter(&mut stack, &row, params)?,
+                Some((f, params)) => f.eval_filter_host(&mut stack, &row, params, host)?,
                 None => true,
             };
             if !ok {
@@ -994,7 +1018,9 @@ fn exec_select(
                             .get(*i as usize)
                             .cloned()
                             .ok_or_else(|| internal("projection column"))?,
-                        Projection::Expr { program, .. } => program.eval(&row, params)?,
+                        Projection::Expr { program, .. } => {
+                            program.eval_host(&row, params, ctx.host_fns())?
+                        }
                     });
                 }
                 // Keying on the memcmp encoding rather than on Value: DISTINCT
@@ -1172,7 +1198,9 @@ fn exec_select_with(
                     .get(*i as usize)
                     .cloned()
                     .ok_or_else(|| internal("projection column"))?,
-                Projection::Expr { program, .. } => program.eval(&row, &scratch)?,
+                Projection::Expr { program, .. } => {
+                    program.eval_host(&row, &scratch, ctx.host_fns())?
+                }
             });
         }
         if *distinct && !seen.insert(keycode::encode_key_collated(&orow, &distinct_colls)) {
@@ -1334,7 +1362,7 @@ fn correlated_survivors(
             };
         }
         let keep = match post_filter {
-            Some(pf) => pf.eval_filter(&mut stack, &row, &scratch)?,
+            Some(pf) => pf.eval_filter_host(&mut stack, &row, &scratch, ctx.host_fns())?,
             None => true,
         };
         if keep {

@@ -233,7 +233,17 @@ const MAX_JOINS: usize = 16;
 //     desyncs on the extra byte and rejects the plan as corrupt rather than
 //     misreading it, so the whole-plan version gates it: a format-37 blob fails
 //     CLOSED at byte 0 with the documented re-prepare.
-const PLAN_FORMAT: u8 = 38;
+// 39: host scalar UDFs (the C-API `create_function` path, design/DESIGN-UDF.md).
+//     One additive expr opcode — `Instr::HostCall(name_const_idx, argc)` (39) —
+//     for a call to a connection-registered scalar function. A format-38 reader
+//     hits the unknown opcode in `ExprProgram::decode` and rejects the plan as
+//     corrupt rather than misreading it — the same additive gating as every
+//     prior expr-opcode bump (Glob at 19, REGEXP at 23, LikeCs at 37). A plan
+//     carrying a `HostCall` is never published to the shared registry in the
+//     first place (`CompiledPlan::contains_host_call`), so this format only ever
+//     round-trips through a single connection's local cache and the detached
+//     plan blob — but the version still gates a stray cross-version decode.
+const PLAN_FORMAT: u8 = 39;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -1367,5 +1377,122 @@ impl CompiledPlan {
         hasher.update(&self.schema_hash);
         hasher.update(&FORMAT_VERSION.to_le_bytes());
         PlanHash(*hasher.finalize().as_bytes())
+    }
+
+    /// Does any expression in this plan call a HOST-registered scalar UDF
+    /// (`Instr::HostCall`, design/DESIGN-UDF.md)? Such a plan is valid ONLY for
+    /// the connection that registered the function, so the facade must NOT
+    /// publish it to the shared content-hashed `plan/<hash>` registry — it
+    /// compiles-and-executes it locally each time instead. Computed by scanning
+    /// every embedded [`ExprProgram`], so a plan decoded from the registry (which
+    /// by this very rule can never carry a host call) correctly reports `false`.
+    pub fn contains_host_call(&self) -> bool {
+        stmt_has_host_call(&self.stmt) || self.subplans.iter().any(subplan_has_host_call)
+    }
+}
+
+/// `Instr::HostCall` anywhere in an optional program.
+fn opt_prog_host_call(p: &Option<ExprProgram>) -> bool {
+    p.as_ref().is_some_and(ExprProgram::has_host_call)
+}
+
+/// `Instr::HostCall` anywhere in a projection list (SELECT list / RETURNING).
+fn projection_host_call(proj: &[Projection]) -> bool {
+    proj.iter().any(|p| match p {
+        Projection::Column(_) => false,
+        Projection::Expr { program, .. } => program.has_host_call(),
+    })
+}
+
+fn select_has_host_call(sp: &SelectPlan) -> bool {
+    opt_prog_host_call(&sp.filter)
+        || opt_prog_host_call(&sp.joined_filter)
+        || opt_prog_host_call(&sp.post_filter)
+        || sp.joins.iter().any(|j| {
+            j.on.has_host_call() || j.policy.as_ref().is_some_and(ExprProgram::has_host_call)
+        })
+        || projection_host_call(&sp.projection)
+        || sp.aggregate.as_ref().is_some_and(|a| {
+            a.group_by.iter().any(|k| matches!(k, GroupKey::Expr(p) if p.has_host_call()))
+                || a.aggs.iter().any(|c| {
+                    opt_prog_host_call(&c.arg) || opt_prog_host_call(&c.filter)
+                })
+                || opt_prog_host_call(&a.having)
+        })
+        || sp.windows.iter().any(|w| {
+            opt_prog_host_call(&w.arg)
+                || w.partition_by.iter().any(ExprProgram::has_host_call)
+                || w.order_by.iter().any(|(p, _)| p.has_host_call())
+                || opt_prog_host_call(&w.default)
+        })
+}
+
+fn compound_has_host_call(c: &CompoundPlan) -> bool {
+    c.arms.iter().any(select_has_host_call)
+}
+
+fn subbody_has_host_call(b: &SubBody) -> bool {
+    match b {
+        SubBody::Select(sp) => select_has_host_call(sp),
+        SubBody::Compound(c) => compound_has_host_call(c),
+    }
+}
+
+fn subplan_has_host_call(s: &SubPlan) -> bool {
+    subbody_has_host_call(&s.body) || s.subplans.iter().any(subplan_has_host_call)
+}
+
+fn stmt_has_host_call(stmt: &PlanStmt) -> bool {
+    match stmt {
+        PlanStmt::Select(sp) => select_has_host_call(sp),
+        PlanStmt::Compound(c) => compound_has_host_call(c),
+        PlanStmt::RecursiveCte(rc) => {
+            select_has_host_call(&rc.anchor)
+                || select_has_host_call(&rc.recursive)
+                || select_has_host_call(&rc.outer)
+        }
+        PlanStmt::Insert {
+            from_select,
+            with_check,
+            on_conflict,
+            returning,
+            ..
+        } => {
+            from_select.as_ref().is_some_and(|s| select_has_host_call(&s.plan))
+                || opt_prog_host_call(with_check)
+                || returning.as_ref().is_some_and(|r| projection_host_call(r))
+                || on_conflict_host_call(on_conflict)
+        }
+        PlanStmt::Update {
+            filter,
+            set,
+            with_check,
+            returning,
+            ..
+        } => {
+            opt_prog_host_call(filter)
+                || set.iter().any(|(_, p)| p.has_host_call())
+                || opt_prog_host_call(with_check)
+                || returning.as_ref().is_some_and(|r| projection_host_call(r))
+        }
+        PlanStmt::Delete { filter, returning, .. } => {
+            opt_prog_host_call(filter)
+                || returning.as_ref().is_some_and(|r| projection_host_call(r))
+        }
+        PlanStmt::Begin
+        | PlanStmt::Commit
+        | PlanStmt::Rollback
+        | PlanStmt::Savepoint(_)
+        | PlanStmt::Release(_)
+        | PlanStmt::RollbackTo(_) => false,
+    }
+}
+
+fn on_conflict_host_call(oc: &PlanOnConflict) -> bool {
+    match oc {
+        PlanOnConflict::Error | PlanOnConflict::DoNothing | PlanOnConflict::Replace => false,
+        PlanOnConflict::DoUpdate { set, filter, .. } => {
+            set.iter().any(|(_, p)| p.has_host_call()) || opt_prog_host_call(filter)
+        }
     }
 }

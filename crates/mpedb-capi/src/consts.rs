@@ -63,3 +63,20 @@ pub const SQLITE_OPEN_MEMORY: c_int = 0x0000_0080;
 // Text-destructor sentinels for sqlite3_bind_text/blob.
 pub const SQLITE_STATIC: isize = 0;
 pub const SQLITE_TRANSIENT: isize = -1;
+
+// Text encodings / function flags for the `eTextRep` argument of
+// `sqlite3_create_function[_v2]`. mpedb `Text` is always UTF-8, so the shim
+// accepts any of these and ignores the distinction; they exist so a caller can
+// pass the constant it would pass to real sqlite (CPython ORs
+// `SQLITE_DETERMINISTIC` in). See design/DESIGN-UDF.md §1.
+pub const SQLITE_UTF8: c_int = 1;
+pub const SQLITE_UTF16LE: c_int = 2;
+pub const SQLITE_UTF16BE: c_int = 3;
+pub const SQLITE_UTF16: c_int = 4;
+pub const SQLITE_ANY: c_int = 5;
+pub const SQLITE_UTF16_ALIGNED: c_int = 8;
+/// The function returns the same answer for the same inputs within one
+/// statement — an optimizer hint in sqlite; accepted and ignored here.
+pub const SQLITE_DETERMINISTIC: c_int = 0x0000_0800;
+pub const SQLITE_DIRECTONLY: c_int = 0x0008_0000;
+pub const SQLITE_INNOCUOUS: c_int = 0x0020_0000;
