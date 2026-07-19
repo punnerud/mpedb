@@ -526,13 +526,19 @@ pub(super) fn glob_match(pattern: &str, s: &str) -> bool {
 //
 // Implemented as a hand-rolled Thompson NFA (no backtracking, no regex crate) —
 // the same non-exponential shape sqlite uses, so a hostile pattern cannot hang a
-// reader. Deliberate deviations from sqlite, all on MALFORMED patterns that
-// sqlite rejects with a *runtime error*: mpedb never errors on a REGEXP pattern.
-// A pattern this engine cannot compile (unmatched `(`/`{`, unterminated `[`,
-// unknown `\` escape, `{m,n}` with n<m or both zero, a quantifier with no
-// operand — including one applied to `^`/`$`) matches NOTHING, i.e. `REGEXP`
-// yields FALSE and `NOT REGEXP` yields TRUE, mirroring how GLOB treats an
-// unterminated `[`.
+// reader. A pattern this engine cannot compile (unmatched `(`/`{`, unterminated
+// `[`, unknown `\` escape, `{m,n}` with n<m or both zero, a quantifier with no
+// operand — including one applied to `^`/`$`) is a named ERROR, exactly as
+// sqlite's own regexp extension errors on a malformed pattern at runtime.
+//
+// It used to "match NOTHING" instead — a policy that turned into wrong answer
+// W3 the moment bound patterns landed: a consumer whose registered `regexp()`
+// UDF speaks a richer dialect (Python's `(?i)…`, backreferences — Django's
+// `__iregex` prepends `(?i)` to EVERY pattern) got silent empty results where
+// stock sqlite returns rows. An error is honest in both worlds: the dialect
+// gap is named instead of swallowed. (The full fix — dispatching `x REGEXP y`
+// to a registered host `regexp()` UDF, which is the operator's entire meaning
+// in real sqlite — is tracked separately.)
 
 // The LAST pattern this thread compiled, and the program it compiled to
 // (`None` for a pattern the engine rejects — that result is worth caching too,
@@ -551,16 +557,20 @@ std::thread_local! {
 }
 
 /// sqlite `x REGEXP y`: does `pattern` (the sqlite regexp dialect) match some
-/// substring of `text`? A pattern that fails to compile matches nothing.
-pub(super) fn regexp_match(pattern: &str, text: &str) -> bool {
+/// substring of `text`? A pattern that fails to compile is a named error.
+pub(super) fn regexp_match(pattern: &str, text: &str) -> crate::Result<bool> {
     RE_MEMO.with(|memo| {
         let mut memo = memo.borrow_mut();
         if !matches!(&*memo, Some((p, _)) if p == pattern) {
             *memo = Some((pattern.to_string(), ReProg::compile(pattern)));
         }
         match &memo.as_ref().expect("just filled").1 {
-            Some(prog) => prog.is_match(text),
-            None => false,
+            Some(prog) => Ok(prog.is_match(text)),
+            None => Err(crate::Error::Unsupported(format!(
+                "REGEXP pattern {pattern:?} is not valid in mpedb's regexp \
+                 dialect (POSIX-style: classes, anchors, alternation, counts, \
+                 Perl escapes; no lookaround, no backreferences, no (?i) flags)"
+            ))),
         }
     })
 }

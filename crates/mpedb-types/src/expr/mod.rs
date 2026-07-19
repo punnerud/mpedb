@@ -611,7 +611,7 @@ impl ExprProgram {
                     let a = stack.pop().expect("validated");
                     stack.push(match (&a, &pattern) {
                         (Value::Null, _) | (_, Value::Null) => Value::Null,
-                        (Value::Text(s), Value::Text(p)) => Value::Bool(regexp_match(p, s)),
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(regexp_match(p, s)?),
                         _ => {
                             return Err(Error::TypeMismatch(
                                 "REGEXP requires text operands".into(),
@@ -624,7 +624,7 @@ impl ExprProgram {
                     let pattern = &self.consts[pi as usize];
                     stack.push(match (&a, pattern) {
                         (Value::Null, _) | (_, Value::Null) => Value::Null,
-                        (Value::Text(s), Value::Text(p)) => Value::Bool(regexp_match(p, s)),
+                        (Value::Text(s), Value::Text(p)) => Value::Bool(regexp_match(p, s)?),
                         _ => {
                             return Err(Error::TypeMismatch(
                                 "REGEXP requires text operands".into(),
