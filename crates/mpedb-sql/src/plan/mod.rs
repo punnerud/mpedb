@@ -330,7 +330,14 @@ const MAX_JOINS: usize = 16;
 //     instead of reading it from the const pool. A LITERAL pattern still
 //     compiles to `Instr::Regexp` and its plan bytes are unchanged, so this is
 //     additive in the same way 47 was.
-const PLAN_FORMAT: u8 = 48;
+// 49: the SCALAR `max(a, b, …)` / `min(a, b, …)` (task #74 item 5) — two
+//     additive `ScalarFn` tags, `Max2` (60) and `Min2` (61). Tags 60/61 rather
+//     than 44/45 for the same reason the bitwise opcodes took 50..54: several
+//     branches were live in the 44..59 window, and a tag hole costs nothing
+//     while a collision would silently call the wrong function. Additive: an
+//     unknown `ScalarFn` tag is already a decode error, and no existing plan
+//     can carry one.
+const PLAN_FORMAT: u8 = 49;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
