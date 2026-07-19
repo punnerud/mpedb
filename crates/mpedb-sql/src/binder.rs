@@ -2643,6 +2643,14 @@ impl<'a> Binder<'a> {
     ///    and mpedb's own bool/timestamp have no sqlite storage class at
     ///    all. No measured corpus record needs them (design/CORPUS-STATUS.md).
     ///
+    /// sqlite dialect ONLY ([`Self::sqlite_dialect`], like `coerce_bool_ctx`
+    /// and `like_glob_operand`): PostgreSQL types COALESCE/CASE statically by
+    /// promoting the arms to their common numeric supertype, so
+    /// `COALESCE(30, 1.5) / 35` is NUMERIC division in PG (≈0.857) where the
+    /// per-row rule divides integers (0). Under the postgres dialect the
+    /// original rigid refusal is kept — a clean error, never either engine's
+    /// wrong answer.
+    ///
     /// Comparison unification (`unify_many` for IN lists) keeps the int ->
     /// float widening: there the widened value only feeds a comparison, and
     /// a comparison's TYPE cannot leak.
@@ -2665,7 +2673,8 @@ impl<'a> Binder<'a> {
         let numeric = |t: &ColumnType| {
             matches!(t, ColumnType::Int64 | ColumnType::Float64 | ColumnType::Any)
         };
-        if kinds.iter().all(numeric) || kinds.contains(&ColumnType::Any) {
+        if self.sqlite_dialect() && (kinds.iter().all(numeric) || kinds.contains(&ColumnType::Any))
+        {
             // Mixed arms, typed per row. A bare parameter among them has
             // nothing to adopt (there is no one target type), and is left
             // for `resolve_params` to report — same as a mixed max()/min().
@@ -3590,6 +3599,20 @@ mod tests {
         // An `any` arm (here a NUMERIC cast of text) mixes with anything.
         let (_, ty) = bind_ok("coalesce(CAST(name AS NUMERIC), name)");
         assert_eq!(ty, Some(ColumnType::Any));
+    }
+
+    /// The per-row rule is sqlite's; PostgreSQL PROMOTES the arms statically
+    /// (`COALESCE(30, 1.5) / 35` is numeric division ≈0.857 in PG, integer
+    /// division 0 per-row), so under the postgres dialect the mix stays the
+    /// original rigid refusal — a clean error, never either engine's answer.
+    #[test]
+    fn mixed_arms_stay_refused_under_postgres_dialect() {
+        let t = table();
+        let (e, n) = parse_expr_only("coalesce(30, 1.5)").unwrap();
+        let mut b = Binder::new(&t, n, true);
+        b.set_dialect(BareGroupBy::Postgres);
+        let err = format!("{}", b.bind_expr(&e).unwrap_err());
+        assert!(err.contains("CAST"), "{err}");
     }
 
     #[test]
