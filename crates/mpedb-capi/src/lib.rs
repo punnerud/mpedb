@@ -93,6 +93,11 @@ pub struct Stmt {
     /// Result column names (known after execution).
     columns: Vec<String>,
     col_name_c: Vec<Vec<u8>>, // NUL-terminated, aligned to `columns`
+    /// Per-column declared type (`sqlite3_column_decltype`), computed LAZILY the
+    /// first time it is asked for (zero cost for consumers that never read it):
+    /// `None` = not yet computed; inner `None` = this column has no decltype
+    /// (NULL). NUL-terminated bytes, aligned to `columns`.
+    decltype_c: Option<Vec<Option<Vec<u8>>>>,
     rows: Vec<Vec<Value>>,
     /// Index of the NEXT row to yield; the current row is `pos - 1`.
     pos: usize,
@@ -408,6 +413,7 @@ fn run_stmt(s: &mut Stmt) -> c_int {
             }
             s.columns.clear();
             s.col_name_c.clear();
+            s.decltype_c = None;
             s.rows.clear();
             s.pos = 0;
             s.executed = true;
@@ -417,6 +423,7 @@ fn run_stmt(s: &mut Stmt) -> c_int {
         Ok(Outcome::Control) => {
             s.columns.clear();
             s.col_name_c.clear();
+            s.decltype_c = None;
             s.rows.clear();
             s.pos = 0;
             s.executed = true;
@@ -832,6 +839,7 @@ unsafe fn prepare_common(
         executed: false,
         columns: Vec::new(),
         col_name_c: Vec::new(),
+        decltype_c: None,
         rows: Vec::new(),
         pos: 0,
         have_row: false,
@@ -871,6 +879,7 @@ pub unsafe extern "C" fn sqlite3_reset(p: *mut Stmt) -> c_int {
             s.rows.clear();
             s.columns.clear();
             s.col_name_c.clear();
+            s.decltype_c = None;
             s.cells.clear();
             s.pos = 0;
             s.have_row = false;
@@ -1240,10 +1249,34 @@ pub unsafe extern "C" fn sqlite3_column_name(p: *mut Stmt, col: c_int) -> *const
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_column_decltype(_p: *mut Stmt, _col: c_int) -> *const c_char {
-    // mpedb's result metadata carries names, not declared types (an expression
-    // has no decltype anyway). NULL is a legal sqlite answer.
-    ptr::null()
+pub unsafe extern "C" fn sqlite3_column_decltype(p: *mut Stmt, col: c_int) -> *const c_char {
+    let Some(s) = stmt(p) else { return ptr::null() };
+    if col < 0 {
+        return ptr::null();
+    }
+    // Compute once, on first ask: derive each output column's declared type from
+    // the plan's projection (a bare base-table column reports its type; anything
+    // computed reports NULL) — the plan-derived source mapping, not a heuristic.
+    if s.decltype_c.is_none() {
+        let decl = conn(s.db)
+            .and_then(|c| c.db.output_decltypes(&s.exec_sql).ok())
+            .unwrap_or_default();
+        s.decltype_c = Some(
+            decl.into_iter()
+                .map(|o| {
+                    o.map(|name| {
+                        let mut v = name.into_bytes();
+                        v.push(0); // NUL-terminate
+                        v
+                    })
+                })
+                .collect(),
+        );
+    }
+    match s.decltype_c.as_ref().unwrap().get(col as usize) {
+        Some(Some(bytes)) => bytes.as_ptr() as *const c_char,
+        _ => ptr::null(),
+    }
 }
 
 // ===========================================================================

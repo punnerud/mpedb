@@ -85,7 +85,7 @@ The tables below list, by category, exactly what the shim implements.
 | `sqlite3_column_text` | ✅ | UTF-8; non-text scalars render to text; `NULL` value → `NULL` pointer |
 | `sqlite3_column_blob` | ✅ | Raw bytes; `NULL`/empty → `NULL` pointer |
 | `sqlite3_column_bytes` | ✅ | Payload length of the text/blob representation |
-| `sqlite3_column_decltype` | 🚧 | Returns `NULL` — mpedb's result metadata carries names, not declared types (a legal sqlite answer, but disables Python's `detect_types`) |
+| `sqlite3_column_decltype` | ✅ | Plan-derived: a bare base-table column reports its declared type (`INTEGER`/`TEXT`/`REAL`/`BLOB`/`BOOLEAN`/`TIMESTAMP`); a computed column (expression, aggregate, function, join/window output, typeless `ANY`) reports `NULL` — exactly what sqlite does. Drives Python's `PARSE_DECLTYPES` byte-identically. Computed lazily; no plan-format change |
 | `sqlite3_data_count` | ✅ | Extra, aids consumers |
 
 ### status / misc
@@ -187,8 +187,10 @@ against `_sqlite3.cpython-312` on Linux/x86-64 (Python 3.12).
   it. For read statements the shim executes lazily when column metadata is first
   requested (Python builds `description` this way); it materializes the whole
   result at that point (no server-side streaming cursor).
-- **`decltype` is `NULL`.** Disables `sqlite3.PARSE_DECLTYPES`/`PARSE_COLNAMES`
-  type detection.
+- **`decltype` is plan-derived.** A bare base-table column reports its declared
+  type, a computed column reports `NULL` — so `sqlite3.PARSE_DECLTYPES` converts
+  the same columns as under stock sqlite. (`PARSE_COLNAMES`, which reads a
+  `[type]` hint from the column *label*, is orthogonal and works regardless.)
 - **Concurrency is better, not bug-for-bug.** mpedb has MVCC readers and
   group-commit; a consumer expecting `SQLITE_BUSY` under contention gets progress
   instead (compatible-or-better).

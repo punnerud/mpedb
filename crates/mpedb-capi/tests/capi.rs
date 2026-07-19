@@ -775,3 +775,50 @@ fn file_uri_size_mb_reserves_requested_geometry() {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+#[test]
+fn column_decltype_reports_base_column_types_null_for_expressions() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(
+            exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, score REAL, data BLOB)"),
+            SQLITE_OK
+        );
+        assert_eq!(exec(db, "INSERT INTO t VALUES (1,'a',1.5,x'00')"), SQLITE_OK);
+
+        let decl = |sql: &str, col: c_int| -> Option<String> {
+            let mut st: *mut Stmt = ptr::null_mut();
+            let s = cs(sql);
+            assert_eq!(
+                sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+                SQLITE_OK,
+                "prepare {sql}"
+            );
+            let p = sqlite3_column_decltype(st, col);
+            let out = if p.is_null() {
+                None
+            } else {
+                Some(CStr::from_ptr(p).to_str().unwrap().to_string())
+            };
+            sqlite3_finalize(st);
+            out
+        };
+
+        // Bare base-table columns report their declared type (plan-derived).
+        assert_eq!(decl("SELECT id, name, score, data FROM t", 0).as_deref(), Some("INTEGER"));
+        assert_eq!(decl("SELECT id, name, score, data FROM t", 1).as_deref(), Some("TEXT"));
+        assert_eq!(decl("SELECT id, name, score, data FROM t", 2).as_deref(), Some("REAL"));
+        assert_eq!(decl("SELECT id, name, score, data FROM t", 3).as_deref(), Some("BLOB"));
+        // `SELECT *` expands to bare columns too.
+        assert_eq!(decl("SELECT * FROM t", 1).as_deref(), Some("TEXT"));
+        // A computed column has no declared type ⇒ NULL (like sqlite).
+        assert_eq!(decl("SELECT id + 1 FROM t", 0), None);
+        assert_eq!(decl("SELECT upper(name) FROM t", 0), None);
+        assert_eq!(decl("SELECT count(*) FROM t", 0), None);
+        // Mixed: expr NULL, bare column typed.
+        assert_eq!(decl("SELECT id + 1, name FROM t", 0), None);
+        assert_eq!(decl("SELECT id + 1, name FROM t", 1).as_deref(), Some("TEXT"));
+
+        sqlite3_close(db);
+    }
+}
