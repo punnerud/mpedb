@@ -203,9 +203,33 @@ query I nosort
 SELECT id FROM t WHERE NOT (a = 5)
 ----
 
-# A predicate must be boolean.
-statement error predicate must be a boolean
+# A non-boolean predicate is truthy-tested exactly as sqlite does: the value is
+# TRUE iff its REAL value is non-zero (`sqlite3VdbeBooleanValue`), NULL stays
+# unknown. Row 1 has a = 5, row 2 has a = NULL.
+query I nosort
 SELECT id FROM t WHERE a + 1
+----
+1
+
+# a - 5 is 0 for row 1 and NULL for row 2: neither row passes.
+query I nosort
+SELECT id FROM t WHERE a - 5
+----
+
+query I nosort
+SELECT id FROM t WHERE f
+----
+1
+
+query I nosort
+SELECT id FROM t WHERE NOT a
+----
+
+query T nosort
+SELECT CASE WHEN a THEN 'T' ELSE 'F' END FROM t
+----
+T
+F
 
 # Comparisons do not chain.
 statement error parse error

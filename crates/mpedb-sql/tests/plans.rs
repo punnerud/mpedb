@@ -388,9 +388,12 @@ fn compile_check_rejections() {
         other => panic!("expected bind error, got {other:?}"),
     }
     assert!(compile_check("age > ?", users).is_err());
-    // Must type to bool.
-    assert!(matches!(compile_check("age + 1", users), Err(Error::Bind(_))));
-    assert!(matches!(compile_check("'x'", users), Err(Error::Bind(_))));
+    // A non-boolean CHECK body is truthy-tested exactly as sqlite does
+    // (Django gap #5), so these now COMPILE rather than being refused —
+    // `CHECK (age + 1)` is `CHECK (age + 1 <> 0)`, `CHECK ('x')` is
+    // `CHECK (CAST('x' AS REAL) <> 0.0)`, i.e. constantly FALSE.
+    assert!(compile_check("age + 1", users).is_ok());
+    assert!(compile_check("'x'", users).is_ok());
     // Unknown column.
     assert!(matches!(compile_check("nope > 0", users), Err(Error::Bind(_))));
     // Statements are not expressions.
@@ -446,10 +449,10 @@ fn parse_and_bind_error_taxonomy() {
         prepare("SELECT missing FROM users", &s),
         Err(Error::Bind(_))
     ));
-    assert!(matches!(
-        prepare("SELECT * FROM users WHERE 1", &s),
-        Err(Error::Bind(_))
-    ));
+    // `WHERE 1` is sqlite truthiness, not a type error (Django gap #5): it
+    // folds to TRUE. `WHERE 0` folds to FALSE. Both prepare cleanly.
+    assert!(prepare("SELECT * FROM users WHERE 1", &s).is_ok());
+    assert!(prepare("SELECT * FROM users WHERE 0", &s).is_ok());
     // Division by zero is NOT an error: it folds to NULL (sqlite semantics),
     // so the statement prepares cleanly.
     assert!(prepare("SELECT 1/0 FROM users", &s).is_ok());

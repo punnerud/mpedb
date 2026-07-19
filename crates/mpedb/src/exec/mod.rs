@@ -709,7 +709,8 @@ fn exec_stmt_impl(
     triggers: &TriggerSet,
     depth: u32,
 ) -> Result<ExecResult> {
-    validate_params(plan, params)?;
+    let coerced = coerce_params(plan, params)?;
+    let params: &[Value] = &coerced;
     // Uncorrelated subplans evaluate ONCE per execute, into their reserved
     // slots — before dispatch, so a PK probe built on `id = (SELECT max…)`
     // resolves like any other param. Correlated ones wait for their row.
@@ -2281,26 +2282,60 @@ fn coerce_insert_value(v: Value, ty: mpedb_types::ColumnType) -> Value {
     }
 }
 
-pub(crate) fn validate_params(plan: &CompiledPlan, params: &[Value]) -> Result<()> {
+/// Validate bound parameters against the plan's inferred types, applying the
+/// one implicit conversion sqlite's *absence* of a boolean type forces.
+///
+/// CPython's `sqlite3` binds Python `True`/`False` through `sqlite3_bind_int64`
+/// as 1/0, and Django does exactly that for every `BooleanField` lookup — so a
+/// slot the binder pinned to `Bool` is handed an `Int`. 0 and 1 convert, since
+/// that IS sqlite's representation of a boolean. Any other integer is REFUSED
+/// rather than truthy-tested: mpedb's rigid `Bool` cannot hold it, and sqlite
+/// would have stored and returned the integer itself. The reverse — a real
+/// `Bool` in an int64 slot, which the Rust/Python SDKs can produce — is always
+/// exact (`TRUE` -> 1).
+///
+/// Returns `Cow::Borrowed` (no copy) whenever nothing needed converting, which
+/// is every statement without a bool parameter.
+pub(crate) fn coerce_params<'a>(
+    plan: &CompiledPlan,
+    params: &'a [Value],
+) -> Result<std::borrow::Cow<'a, [Value]>> {
+    use std::borrow::Cow;
     if params.len() != plan.n_params as usize {
         return Err(Error::WrongParamCount {
             expected: plan.n_params as usize,
             got: params.len(),
         });
     }
+    let mut out: Option<Vec<Value>> = None;
     for (i, pt) in plan.param_types.iter().enumerate() {
-        if let (Some(t), Some(v)) = (pt, params.get(i)) {
-            if !v.fits(*t) {
+        let (Some(t), Some(v)) = (pt, params.get(i)) else {
+            continue;
+        };
+        if v.fits(*t) {
+            continue;
+        }
+        let bridged = match (v, t) {
+            (Value::Int(n @ (0 | 1)), mpedb_types::ColumnType::Bool) => Some(Value::Bool(*n == 1)),
+            (Value::Bool(b), mpedb_types::ColumnType::Int64) => Some(Value::Int(*b as i64)),
+            _ => None,
+        };
+        match bridged {
+            Some(nv) => out.get_or_insert_with(|| params.to_vec())[i] = nv,
+            None => {
                 return Err(Error::TypeMismatch(format!(
                     "parameter ${} is {}, statement requires {}",
                     i + 1,
                     v.type_name(),
                     t
-                )));
+                )))
             }
         }
     }
-    Ok(())
+    Ok(match out {
+        Some(v) => Cow::Owned(v),
+        None => Cow::Borrowed(params),
+    })
 }
 
 fn table_def<'a>(
