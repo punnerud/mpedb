@@ -255,10 +255,11 @@ const MAX_JOINS: usize = 16;
 //     re-prepare. Like a `HostCall`, a plan naming a host aggregate is valid ONLY
 //     for the connection that registered it, so `contains_host_call` covers it
 //     and it never reaches the shared `plan/<hash>` registry.
-// 41: the three sqlite built-ins Django's own test suite needs — `quote(X)`
-//     (its `last_executed_query` calls `QUOTE(?)` for every bound parameter),
-//     `strftime(FORMAT, TIMESTRING)` and `json(X)`. Three additive `ScalarFn`
-//     tags (Quote=42, Strftime=43, Json=44) inside the existing
+// 41: two sqlite built-ins Django's own test suite needs — `quote(X)` (its
+//     `last_executed_query` calls `QUOTE(?)` for every bound parameter) and
+//     `strftime(FORMAT, TIMESTRING)`. Two additive `ScalarFn` tags
+//     (Quote=42, Strftime=43; 44 is deliberately left free for the `json(X)`
+//     that #4 could not ship — see C-API-COMPAT.md) inside the existing
 //     `Instr::Call(f, argc)` opcode — no new opcode, no framing change, so a
 //     plan that names none of them encodes byte-for-byte as in format 40. A
 //     format-40 reader hits the unknown scalar tag in `ScalarFn::from_tag` and

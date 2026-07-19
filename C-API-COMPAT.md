@@ -437,6 +437,41 @@ The honest reading of those two deltas:
   `test_values_expression_alias_sql_injection_json_field` are skipped rather
   than failed. Adjusted, the shim is 507/831.
 
+  **Do not close that by adding `json()` alone — it is a trap, and it costs 439
+  tests, not 2.** Both JSONField models in these labels
+  (`tests/annotations/models.py::JsonModel`,
+  `tests/expressions/models.py::JSONFieldModel`) declare
+  `Meta.required_db_features = {"supports_json_field"}`, so today Django simply
+  does not create them. Make the probe succeed and Django DOES create them —
+  with Django's own `data_type_check_constraints["JSONField"]`, i.e.
+  `CHECK ((JSON_VALID("data") OR "data" IS NULL))`. That CHECK fails to compile
+  in mpedb for **two independent reasons**, both verified directly:
+
+  ```
+  CREATE TABLE k (… data text NOT NULL CHECK ((json_valid(data) OR data IS NULL)))
+    -> CHECK on `data` failed to compile: unknown function `json_valid()`
+  CREATE TABLE j (… data text NOT NULL CHECK ((length(data) OR data IS NULL)))
+    -> CHECK on `data` failed to compile: AND/OR requires boolean operands, got int64
+  ```
+
+  A CREATE TABLE failure during `migrate` aborts `create_test_db()`, which takes
+  down the whole label — all 439 G2 tests, to buy 2 honest failures. Closing
+  this gap therefore needs **three** things together, not one: `json(X)`,
+  `json_valid(X)`, and gap 5 (the int↔bool bridge) so an integer-valued
+  predicate is legal inside `OR`. A strict-RFC-8259 `json(X)` (validate +
+  minify, every token keeping its input spelling — sqlite's own definition) was
+  written and differential-tested against sqlite 3.45 while measuring this, and
+  is recoverable from git history (`de9a023:crates/mpedb-types/src/expr/json.rs`,
+  with its test at `de9a023:crates/mpedb/tests/json_fn.rs`); it was removed
+  again rather than shipped for exactly the reason above. `ScalarFn` tag 44 is
+  left free for it. Note one thing that implementation records: sqlite 3.45
+  accepts **JSON5** (`{a:1}`, `'a'`, `0x10`, `+1`, `.5`, `1.`, trailing commas,
+  comments) and rewrites it into canonical JSON, so a strict-only `json()`
+  refuses inputs sqlite answers for — acceptable as a refusal, but it makes a
+  correct `json_valid()` harder: returning 0 where sqlite returns 1 would be a
+  wrong ANSWER, so `json_valid` would have to refuse rather than answer 0 for
+  anything it cannot prove malformed under JSON5 too.
+
 ### Deployment-blocking gaps: what closed
 
 | # | Gap | Status |
@@ -462,7 +497,7 @@ query path.
 | 1 [1] | **68** | **No sqlite affinity; `any` neither coerces nor computes.** 49 × `TypeError: argument must be int or float` (Django's DecimalField converter gets a `str`), 10 × `arithmetic requires int64/float64, got any`, 3 × `cannot assign any to column of type text`, 2 × `cannot mix coalesce() argument types: any and float64`, 1 each `avg() expects a number, got text` / `floor() expects a number, got any` / `cannot compare int64 with text` / `cannot compare with IN list: text and int64`. **Plus wrong answer W1.** | `mpedb-sql`/`mpedb` |
 | 2 [2] | **47** | **Host UDFs (scalar and aggregate) are read-path only** — inside an open transaction: `internal error (bug in mpedb): host function X called with no host functions in scope` (43) and `host aggregate var_pop() is not in scope` (4). Statement hits: `django_format_dtdelta` 34, `django_timestamp_diff` 12, `django_datetime_extract` 10, `django_date_extract` 10, `django_time_extract` 6, `django_datetime_cast_date` 6, `rand` 4, `django_time_diff` 4, `django_date_trunc` 4, `django_datetime_trunc` 2. | `mpedb` `ring_exec` / write `TxnCtx` |
 | 3 [4] | **45** | **Subquery / derived-table restrictions**: JOIN inside a derived table 14, correlated subquery outside `WHERE` in an aggregate query 8, unlifted `IN` subquery 5, aliased/renamed column 4, GROUP BY/HAVING body 4, correlated `IN` ("rewrite as EXISTS") 4, subquery in `HAVING` 2, unsupported position 2, compound (`UNION`) body 1, `ORDER BY` body 1. | `mpedb-sql` planner |
-| 4 [3] | **44** | **Missing sqlite scalar functions**: `quote()` 40 statements (Django's `last_executed_query`), `strftime()` 8, `json()` (the feature probe → the 2 skips above). | `mpedb-sql` builtins |
+| 4 [3] | **44** | **Missing sqlite scalar functions**: `quote()` 40 statements (Django's `last_executed_query`), `strftime()` 8, `json()` (the feature probe → the 2 skips above). **`quote()` and `strftime()` CLOSED** (PLAN_FORMAT 41) — sqlite-differential-tested; `quote()` refuses only the reals whose sqlite rendering is build-dependent, `strftime()` only the modifier/`'now'`/Julian-day forms, each a named error. `json()` deliberately NOT shipped — see the trap above. | `mpedb-sql` builtins |
 | 5 [5] | **39** | **No int↔bool bridge**: `predicate must be a boolean expression, got int64` 29, `NOT requires a boolean, got int64` 3, `parameter $N is int64, statement requires bool` 3, `cannot compare int64 and bool` 1, `cannot assign bool to column of type int64` 1, `predicate evaluated to int64, expected bool` 1, `CASE WHEN must be a bool condition, got int64` 1. | `mpedb-sql` binder |
 | 6 [6] | **20** | **`LIKE … ESCAPE` (44 statements) and `ORDER BY … NULLS FIRST/LAST` (6)** are not parsed. | `mpedb-sql` parser |
 | 7 [7] | **10** | **Rigid numeric parameter typing**: `$N is int64, statement requires float64` 6, `$N is float64, requires int64` 2, `cannot assign float64 to column of type int64` 2. | `mpedb-sql` |
