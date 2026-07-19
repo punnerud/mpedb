@@ -35,6 +35,19 @@ from django.db.backends.sqlite3.operations import (
 )
 
 
+# --- adaptation ABLATION switches -------------------------------------------
+# "A number measured through a workaround is not the number": each remaining
+# adaptation can be turned OFF from the environment so its cost can be MEASURED
+# rather than assumed. Set to 1 to run WITHOUT that adaptation (both arms).
+#
+#   WB_NO_D2=1   keep Django's AUTOINCREMENT suffix
+#   WB_NO_D4B=1  claim supports_foreign_keys = True
+#   WB_NO_D8=1   use Django's own recursive-CTE _references_graph
+NO_D2 = os.environ.get("WB_NO_D2") == "1"
+NO_D4B = os.environ.get("WB_NO_D4B") == "1"
+NO_D8 = os.environ.get("WB_NO_D8") == "1"
+
+
 class DatabaseOperations(SQLiteDatabaseOperations):
     @property
     def _references_graph(self):
@@ -49,6 +62,8 @@ class DatabaseOperations(SQLiteDatabaseOperations):
         # The workbench runs with `supports_foreign_keys = False`, so no
         # ENFORCED FK constraint exists to cascade through and the graph of a
         # table is just the table. Applied to BOTH arms.
+        if NO_D8:
+            return super()._references_graph
         return lambda table_name: [table_name]
 
 
@@ -62,7 +77,7 @@ class DatabaseFeatures(SQLiteDatabaseFeatures):
     # The inline `REFERENCES …` column clause IS still emitted (the schema
     # editor's `sql_create_inline_fk` is untouched), so the new parser surface
     # is exercised on every ForeignKey.
-    supports_foreign_keys = False
+    supports_foreign_keys = not NO_D4B
 
 
 class DatabaseWrapper(SQLiteDatabaseWrapper):
@@ -75,7 +90,8 @@ class DatabaseWrapper(SQLiteDatabaseWrapper):
     # sequence, so the parser refuses rather than silently weaken it. Django
     # appends the suffix to every AutoField pk, i.e. to essentially every model,
     # so unpatched not one table is created.
-    data_types_suffix = {}
+    if not NO_D2:
+        data_types_suffix = {}
 
 
 # --- workbench debugging aid -------------------------------------------------
