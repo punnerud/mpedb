@@ -218,11 +218,16 @@ impl<'a> Parser<'a> {
     /// Zero words is the legal TYPELESS column (`CREATE TABLE t(a)`,
     /// `a PRIMARY KEY`) → [`ColumnType::Any`], sqlite's no-affinity column.
     ///
-    /// Resolution goes through [`mpedb_types::ColumnType::from_declared`], which
-    /// is the same [`mpedb_types::Affinity::from_type_name`] rule `CAST` uses:
-    /// one vocabulary and one mapping whether the name is written in a `CAST` or
-    /// in a `CREATE TABLE`.
-    fn declared_type(&mut self) -> Result<mpedb_types::ColumnType> {
+    /// Resolution goes through [`mpedb_types::ColumnType::declared`], which is
+    /// the same [`mpedb_types::Affinity::from_type_name`] rule `CAST` uses: one
+    /// vocabulary and one mapping whether the name is written in a `CAST` or in
+    /// a `CREATE TABLE`. It returns the AFFINITY alongside the storage type,
+    /// because those two are what the declared name actually says and the
+    /// storage type alone cannot distinguish `decimal(10,2)` (NUMERIC affinity —
+    /// converts `'1.50'` to `1.5` on store) from no type at all (BLOB affinity —
+    /// stores it verbatim). Both are `Any` columns; sqlite treats them
+    /// oppositely.
+    fn declared_type(&mut self) -> Result<(mpedb_types::ColumnType, mpedb_types::Affinity)> {
         let mut words: Vec<String> = Vec::new();
         loop {
             match self.peek() {
@@ -244,7 +249,9 @@ impl<'a> Parser<'a> {
             }
         }
         if words.is_empty() {
-            return Ok(mpedb_types::ColumnType::Any);
+            // The typeless column: sqlite's BLOB (historically NONE) affinity,
+            // which converts nothing.
+            return Ok((mpedb_types::ColumnType::Any, mpedb_types::Affinity::Blob));
         }
         // Optional `( n )` / `( n , m )` size — consumed and discarded.
         if self.peek() == Some(&Tok::LParen) {
@@ -261,7 +268,7 @@ impl<'a> Parser<'a> {
             }
             self.expect(&Tok::RParen, "`)` after a column type size")?;
         }
-        Ok(mpedb_types::ColumnType::from_declared(&words.join(" ")))
+        Ok(mpedb_types::ColumnType::declared(&words.join(" ")))
     }
 
     /// The tail of a `REFERENCES <table> [(col, …)] [ON …|MATCH …|[NOT]
@@ -368,10 +375,11 @@ impl<'a> Parser<'a> {
         let cname = self.ident("column name")?;
         // sqlite's full declared-type grammar (`varchar(100)`,
         // `double precision`, an unknown name, or none at all).
-        let ty = self.declared_type()?;
+        let (ty, affinity) = self.declared_type()?;
         let mut col = crate::ddl::CreateColumnSpec {
             name: cname,
             ty,
+            affinity,
             not_null: false,
             unique: false,
             pk: false,
@@ -925,10 +933,11 @@ impl<'a> Parser<'a> {
             // must not mean one thing in a CREATE and another in an ADD. Zero
             // type words is the typeless column (`ALTER TABLE t ADD COLUMN c`)
             // → Any, matching sqlite's no-affinity column.
-            let ty = self.declared_type()?;
+            let (ty, affinity) = self.declared_type()?;
             let mut col = crate::ddl::CreateColumnSpec {
                 name: cname,
                 ty,
+                affinity,
                 not_null: false,
                 unique: false,
                 pk: false,

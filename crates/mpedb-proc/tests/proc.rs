@@ -417,6 +417,7 @@ fn stale_plan_surfaces_plan_invalidated() {
         default: None,
         check: None,
         collation: mpedb_types::Collation::Binary,
+        affinity: mpedb_types::Affinity::Integer,
     };
     let other_schema = Schema::new(vec![TableDef {
         id: 0,

@@ -133,7 +133,9 @@ impl AggTarget {
 pub use footprint::{Footprint, KeyAccess, KeyBound, KeyPart, PlanHash};
 pub use fts::{Doclist, Tokenizer};
 pub use policy::{PolicyCmd, PolicyDef};
-pub use schema::{ColumnDef, DefaultExpr, IndexDef, Schema, TableDef, TableKind, MAX_INDEXES};
+pub use schema::{
+    store_into, ColumnDef, DefaultExpr, IndexDef, Schema, TableDef, TableKind, MAX_INDEXES,
+};
 pub use value::{Affinity, Collation, ColumnType, Value};
 
 /// Maximum number of tables (user + system) in one database. Bounded so that

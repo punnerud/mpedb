@@ -67,7 +67,20 @@ fn val(v: fmtx::Value) -> Value {
     }
 }
 
-fn any_col(name: &str) -> ColumnDef {
+/// A non-PK base column: per-value storage (`Any`) carrying the base's DECLARED
+/// AFFINITY.
+///
+/// The storage type stays `Any` on purpose and is not a shortcut. A sqlite file
+/// is not rigid — an `int` column may genuinely hold the text `'abc'`, because
+/// sqlite stores whatever survives its affinity conversion — so declaring the
+/// overlay column `Int64` would make mpedb refuse to READ rows sqlite happily
+/// holds. What sqlite does guarantee is the CONVERSION applied on the way in,
+/// and that is the affinity: an `int`/`decimal(10,2)`/`datetime` column turns
+/// `'1.50'` into the real `1.5`, and a column with no declared type keeps it as
+/// text. Dropping the affinity is what made the overlay answer `'1.50'`/text
+/// where sqlite answers `1.5`/real — a wrong answer, and the reason this is no
+/// longer a blanket `Any` (DESIGN-SQLITE-BACKED §"Overlay schema" [R#17]).
+fn any_col(name: &str, decl: &str) -> ColumnDef {
     ColumnDef {
         name: name.to_string(),
         ty: ColumnType::Any,
@@ -77,6 +90,7 @@ fn any_col(name: &str) -> ColumnDef {
         default: None,
         check: None,
         collation: mpedb_types::Collation::Binary,
+        affinity: mpedb_types::Affinity::declared(decl),
     }
 }
 
@@ -90,6 +104,8 @@ fn pk_col(name: &str, ty: ColumnType) -> ColumnDef {
         default: None,
         check: None,
         collation: mpedb_types::Collation::Binary,
+        // A rigid column enforces its type; `validate` pins the affinity.
+        affinity: mpedb_types::Affinity::implied_by(ty),
     }
 }
 
@@ -135,7 +151,13 @@ impl SqliteAttach {
                     .columns
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| if i == ipk { int_pk_col(c) } else { any_col(c) })
+                    .map(|(i, c)| {
+                        if i == ipk {
+                            int_pk_col(c)
+                        } else {
+                            any_col(c, t.decl_types.get(i).map_or("", String::as_str))
+                        }
+                    })
                     .collect();
                 (
                     PkKind::Ipk(ipk),
@@ -177,7 +199,13 @@ impl SqliteAttach {
                     .columns
                     .iter()
                     .enumerate()
-                    .map(|(j, c)| if j == i { pk_col(c, ty) } else { any_col(c) })
+                    .map(|(j, c)| {
+                        if j == i {
+                            pk_col(c, ty)
+                        } else {
+                            any_col(c, t.decl_types.get(j).map_or("", String::as_str))
+                        }
+                    })
                     .collect();
                 (
                     PkKind::WithoutRowidKey(i, ty),
@@ -200,7 +228,12 @@ impl SqliteAttach {
                     ));
                     continue;
                 }
-                let mut cols: Vec<ColumnDef> = t.columns.iter().map(|c| any_col(c)).collect();
+                let mut cols: Vec<ColumnDef> = t
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| any_col(c, t.decl_types.get(i).map_or("", String::as_str)))
+                    .collect();
                 cols.push(int_pk_col("rowid"));
                 let pk = cols.len() - 1;
                 (
