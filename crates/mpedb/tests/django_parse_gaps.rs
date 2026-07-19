@@ -12,6 +12,12 @@
 //!   3. `AUTOINCREMENT` — a deliberate refusal, see
 //!      `autoincrement_refuses_by_name`. It is the one gap that cannot be
 //!      closed without lying about the never-reuse guarantee.
+//!   4. `DEFAULT` / `CHECK` / `REFERENCES` in `CREATE TABLE`. The first two are
+//!      ENFORCED; `REFERENCES` is parsed and not enforced, which is exactly
+//!      sqlite's own default (`PRAGMA foreign_keys = OFF`) and is asserted as
+//!      such rather than assumed.
+//!   5. Named constraints (`CONSTRAINT c UNIQUE (a, b)`), at table and column
+//!      level. The name is dropped; the constraint is not.
 
 use mpedb::{Config, Database, ExecResult, Value};
 use std::io::Write;
@@ -523,6 +529,75 @@ fn a_django_create_table_with_defaults_checks_and_fks_agrees_with_sqlite() {
     ] {
         assert!(t.db.query(bad, &[]).is_err(), "{what} must still constrain");
     }
+}
+
+// ---------------------------------------------------------------- item 5 ----
+
+/// Named table constraints: the NAME is accepted and dropped, the CONSTRAINT is
+/// real. Django names every one it emits, so this is the difference between
+/// `migrate` running and not — but a name that only appeared in error messages
+/// must not become a name that turns a constraint off.
+#[test]
+fn named_table_constraints_still_constrain() {
+    let t = open();
+    t.db.query(
+        "CREATE TABLE n (id INTEGER PRIMARY KEY, a INT, b INT, \
+          CONSTRAINT n_ab_uniq UNIQUE (a, b), CONSTRAINT n_a_ck CHECK (a >= 0))",
+        &[],
+    )
+    .unwrap();
+    t.db.query("INSERT INTO n (id, a, b) VALUES (1, 1, 2)", &[]).unwrap();
+    t.db.query("INSERT INTO n (id, a, b) VALUES (2, 1, 3)", &[]).unwrap();
+    // The named UNIQUE rejects the duplicate pair…
+    assert!(t.db.query("INSERT INTO n (id, a, b) VALUES (3, 1, 2)", &[]).is_err());
+    // …and the named CHECK rejects the negative.
+    assert!(t.db.query("INSERT INTO n (id, a, b) VALUES (4, -1, 9)", &[]).is_err());
+
+    // `CONSTRAINT <name> PRIMARY KEY (…)` is the key, not decoration —
+    // including the composite form Django writes for a through-table.
+    t.db.query("CREATE TABLE n2 (a INT, b INT, CONSTRAINT n2_pk PRIMARY KEY (a, b))", &[])
+        .unwrap();
+    t.db.query("INSERT INTO n2 (a, b) VALUES (1, 1)", &[]).unwrap();
+    t.db.query("INSERT INTO n2 (a, b) VALUES (1, 2)", &[]).unwrap();
+    assert!(t.db.query("INSERT INTO n2 (a, b) VALUES (1, 1)", &[]).is_err());
+
+    // Naming a constraint changes no answer: sqlite agrees on the rows.
+    assert_same(
+        &[
+            "CREATE TABLE n (id INTEGER PRIMARY KEY, a INT, b INT, \
+              CONSTRAINT n_ab_uniq UNIQUE (a, b), CONSTRAINT n_a_ck CHECK (a >= 0))",
+            "INSERT INTO n (id, a, b) VALUES (1, 1, 2)",
+            "INSERT INTO n (id, a, b) VALUES (2, 1, 3)",
+        ],
+        "SELECT id, a, b FROM n ORDER BY id",
+    );
+}
+
+/// Column-level `CONSTRAINT <name>` in front of each constraint word, which is
+/// the other half of sqlite's grammar and the shape a Django `unique=True` +
+/// `db_check` field pair lands in.
+#[test]
+fn named_column_constraints_still_constrain() {
+    let t = open();
+    t.db.query(
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, \
+          email TEXT CONSTRAINT m_email_nn NOT NULL CONSTRAINT m_email_uq UNIQUE, \
+          pos INT CONSTRAINT m_pos_ck CHECK (pos >= 0) CONSTRAINT m_pos_df DEFAULT 3)",
+        &[],
+    )
+    .unwrap();
+    t.db.query("INSERT INTO m (id, email) VALUES (1, 'a@b')", &[]).unwrap();
+    assert!(t.db.query("INSERT INTO m (id, email) VALUES (2, 'a@b')", &[]).is_err());
+    assert!(t.db.query("INSERT INTO m (id) VALUES (3)", &[]).is_err());
+    assert!(t
+        .db
+        .query("INSERT INTO m (id, email, pos) VALUES (4, 'c@d', -1)", &[])
+        .is_err());
+    // The named DEFAULT applied to row 1.
+    assert_eq!(
+        mpedb_rows(&t.db, "SELECT id, email, pos FROM m ORDER BY id"),
+        vec![vec!["1".to_string(), "a@b".to_string(), "3".to_string()]]
+    );
 }
 
 // -------------------------------------------------------------- deviations ---

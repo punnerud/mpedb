@@ -743,6 +743,69 @@ mod tests {
         assert!(parse_ddl("ALTER TABLE t ADD COLUMN a INT REFERENCES o (id)").is_ok());
     }
 
+    /// `CONSTRAINT <name>` in front of any table- or column-level constraint.
+    ///
+    /// The NAME is parsed and DROPPED: sqlite keeps it only to quote back in an
+    /// error message, mpedb's constraint errors already name the table and the
+    /// column, and storing a name nothing reads would be a schema-hash input
+    /// that buys nothing. Duplicate names are therefore not diagnosed either —
+    /// nor are they by sqlite (verified: it accepts two `CONSTRAINT dup`).
+    #[test]
+    fn named_constraints_parse_and_the_name_is_dropped() {
+        use mpedb_types::Value;
+        // Table level: the constraint itself survives, byte for byte the same
+        // spec an unnamed one produces.
+        let named = create_table(
+            "CREATE TABLE t (a INT, b INT, CONSTRAINT t_pk PRIMARY KEY (a), \
+             CONSTRAINT t_ab UNIQUE (a, b), CONSTRAINT t_ck CHECK (a > 0))",
+        );
+        let bare = create_table(
+            "CREATE TABLE t (a INT, b INT, PRIMARY KEY (a), UNIQUE (a, b), CHECK (a > 0))",
+        );
+        assert_eq!(named, bare);
+        assert_eq!(named.table_pk, vec!["a"]);
+        assert_eq!(named.uniques, vec![vec!["a".to_string(), "b".to_string()]]);
+        assert_eq!(named.checks, vec!["a > 0".to_string()]);
+
+        // Column level: every constraint word may carry a name, and several
+        // named constraints may follow one another.
+        let named = create_table(
+            "CREATE TABLE t (a INT CONSTRAINT c1 NOT NULL CONSTRAINT c2 CHECK (a > 0) \
+             CONSTRAINT c3 UNIQUE CONSTRAINT c4 DEFAULT 5 CONSTRAINT c5 COLLATE NOCASE, \
+             b INT CONSTRAINT c6 PRIMARY KEY, c INT CONSTRAINT c7 REFERENCES o (id))",
+        );
+        assert!(named.columns[0].not_null && named.columns[0].unique);
+        assert_eq!(named.columns[0].check.as_deref(), Some("a > 0"));
+        assert_eq!(named.columns[0].default, Some(DefaultExpr::Const(Value::Int(5))));
+        assert_eq!(named.columns[0].collation, Collation::NoCase);
+        assert!(named.columns[1].pk);
+
+        // Two table CHECKs are kept as two — each must pass.
+        let s = create_table(
+            "CREATE TABLE t (a INT, CONSTRAINT x CHECK (a > 0), CONSTRAINT y CHECK (a < 9))",
+        );
+        assert_eq!(s.checks, vec!["a > 0".to_string(), "a < 9".to_string()]);
+
+        // Duplicate names are accepted (sqlite does not diagnose them either).
+        assert!(parse_ddl(
+            "CREATE TABLE t (a INT, CONSTRAINT dup UNIQUE (a), CONSTRAINT dup CHECK (a > 0))"
+        )
+        .is_ok());
+
+        // A `CONSTRAINT <name>` with nothing constraint-shaped after it is a
+        // clean error that quotes the name back, not a silently skipped clause.
+        for sql in [
+            "CREATE TABLE t (a INT, CONSTRAINT n)",
+            "CREATE TABLE t (a INT, CONSTRAINT n b INT)",
+            "CREATE TABLE t (a INT CONSTRAINT n, b INT)",
+        ] {
+            let e = parse_ddl(sql).unwrap_err().to_string();
+            assert!(e.contains('n'), "{sql}: {e}");
+        }
+        // `constraint` is not usable as a column name — sqlite refuses it too.
+        assert!(parse_ddl("CREATE TABLE t (constraint INT)").is_err());
+    }
+
     #[test]
     fn create_table_malformed_and_unsupported_refuse() {
         assert!(parse_ddl("CREATE TABLE t (id INT PRIMARY KEY,)").is_err()); // trailing comma → empty col
