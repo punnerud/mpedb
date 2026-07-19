@@ -23,7 +23,7 @@ use mpedb::{Config, Database, WriteSession};
 use mpedb_core::Engine;
 
 use crate::line::{LineSource, Names};
-use crate::openpath::PendingCreate;
+use crate::openpath::{is_read_only, scratch_ref, PendingCreate, Scratch};
 use crate::render::{print_result, schema_toml};
 use crate::util::{usage, CliResult};
 
@@ -47,34 +47,18 @@ pub fn run_path(config_path: &str, pending: Option<PendingCreate>) -> CliResult 
     let names = Rc::new(RefCell::new(Names::new(DOTS)));
     let mut input = LineSource::new("mpedb> ", names.clone());
 
-    // Nothing on disk yet: blank lines and dot-commands (`.exit`, `.tables`)
-    // create nothing at all — `mpedb new.mpedb` then `.exit` must leave the
-    // directory exactly as it was. The first SQL statement is the trigger, and
-    // it is then run as the session's first statement.
+    // Nothing on disk yet: blank lines, dot-commands (`.exit`, `.tables`) and
+    // READS create nothing at all — `mpedb new.mpedb` then `SELECT 1` then
+    // `.exit` must leave the directory exactly as it was. The first WRITE is the
+    // trigger, and it is then run as the session's first statement.
     let mut queued: Option<String> = None;
     if let Some(create) = pending {
-        loop {
-            let Some(line) = input.next_line() else {
-                return Ok(());
-            };
-            let line = line?;
-            let stmt = line.trim().trim_end_matches(';').trim();
-            if stmt.is_empty() {
-                continue;
+        match pending_prelude(&mut input, &create)? {
+            None => return Ok(()),
+            Some(stmt) => {
+                create.materialize()?;
+                queued = Some(stmt);
             }
-            if let Some(dot) = stmt.strip_prefix('.') {
-                if matches!(dot.trim(), "quit" | "exit") {
-                    return Ok(());
-                }
-                eprintln!(
-                    "error: {} does not exist yet — run a statement to create it",
-                    create.path().display()
-                );
-                continue;
-            }
-            queued = Some(stmt.to_owned());
-            create.materialize()?;
-            break;
         }
     }
 
@@ -164,6 +148,47 @@ pub fn run_path(config_path: &str, pending: Option<PendingCreate>) -> CliResult 
         eprintln!("warning: open transaction rolled back at end of input");
     }
     Ok(())
+}
+
+/// Read lines until one of them is a statement that must CREATE the database.
+///
+/// Returns that statement (the caller materializes, then runs it as the
+/// session's first), or `None` when the input ended without ever needing a
+/// database — in which case nothing was written to disk at all. Reads along the
+/// way are answered from an empty [`Scratch`], which is indistinguishable from
+/// the empty database that would have been created.
+fn pending_prelude(
+    input: &mut LineSource,
+    create: &PendingCreate,
+) -> Result<Option<String>, crate::util::Failure> {
+    let mut scratch: Option<Scratch> = None;
+    loop {
+        let Some(line) = input.next_line() else {
+            return Ok(None);
+        };
+        let line = line?;
+        let stmt = line.trim().trim_end_matches(';').trim();
+        if stmt.is_empty() {
+            continue;
+        }
+        if let Some(dot) = stmt.strip_prefix('.') {
+            if matches!(dot.trim(), "quit" | "exit") {
+                return Ok(None);
+            }
+            eprintln!(
+                "error: {} does not exist yet — run a statement to create it",
+                create.path().display()
+            );
+            continue;
+        }
+        if is_read_only(stmt) {
+            if let Err(e) = scratch_ref(&mut scratch)?.run(stmt, &[]) {
+                eprintln!("error: {e}");
+            }
+            continue;
+        }
+        return Ok(Some(stmt.to_owned()));
+    }
 }
 
 fn dot_command(cmd: &str, db: &Database, db_path: &Path, in_session: bool) {

@@ -372,30 +372,67 @@ fn opening_a_repl_and_exiting_creates_nothing() {
     }
 }
 
-/// … and the file appears on the FIRST STATEMENT — in a repl as in a one-shot,
-/// and (matching sqlite3) even when that statement fails.
+/// A READ never creates the database — deliberately UNLIKE sqlite3, which
+/// materializes the file on any statement at all. There is nothing to store, so
+/// there is nothing to create; the answer comes from an empty scratch database
+/// and is the same one the created-then-queried file would have given.
 #[test]
-fn the_first_statement_creates_the_database() {
+fn a_read_does_not_create_the_database() {
+    for ext in ["db", "mpedb"] {
+        let td = TestDir::new(&format!("lazy-read-{ext}"));
+        let path = |name: &str| td.path().join(format!("{name}.{ext}"));
+
+        // repl reads: answered, and nothing lands on disk.
+        let db = path("repl");
+        let o = run_repl(&[db.to_str().unwrap()], "SELECT 1;\nSELECT 2+3;\n.exit\n");
+        assert_ok(&o);
+        assert!(out_str(&o).contains('1') && out_str(&o).contains('5'), "stdout: {}", out_str(&o));
+        assert!(!db.exists(), "a repl SELECT created the database: {}", err_str(&o));
+
+        // one-shot read: same.
+        let db = path("oneshot");
+        let o = run(&[db.to_str().unwrap(), "SELECT 7*6"]);
+        assert_ok(&o);
+        assert!(out_str(&o).contains("42"), "stdout: {}", out_str(&o));
+        assert!(!db.exists(), "a one-shot SELECT created the database");
+
+        // a read that FAILS creates nothing either — and fails for the right
+        // reason (no such table), not for a missing file.
+        let db = path("boom");
+        let o = run(&[db.to_str().unwrap(), "SELECT * FROM nope"]);
+        assert_eq!(o.status.code(), Some(1), "stderr: {}", err_str(&o));
+        assert!(err_str(&o).contains("nope"), "stderr: {}", err_str(&o));
+        assert!(!db.exists(), "a failing SELECT created the database");
+
+        // and the directory is still untouched after all of it.
+        let left: Vec<_> = std::fs::read_dir(td.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(left.is_empty(), "{ext}: directory not left clean: {left:?}");
+    }
+}
+
+/// … and the file appears on the first WRITE — in a repl as in a one-shot.
+#[test]
+fn the_first_write_creates_the_database() {
     for ext in ["db", "mpedb"] {
         let td = TestDir::new(&format!("lazy-first-{ext}"));
         let path = |name: &str| td.path().join(format!("{name}.{ext}"));
 
-        // repl: a statement, then exit → the file exists.
+        // repl: reads first (creating nothing), then DDL → the file exists.
         let db = path("repl");
-        let o = run_repl(&[db.to_str().unwrap()], "SELECT 1;\n.exit\n");
+        let o = run_repl(
+            &[db.to_str().unwrap()],
+            "SELECT 1;\nCREATE TABLE t(id INTEGER PRIMARY KEY);\n.exit\n",
+        );
         assert_ok(&o);
-        assert!(db.exists(), "repl statement did not create the database: {}", err_str(&o));
+        assert!(db.exists(), "repl DDL did not create the database: {}", err_str(&o));
         assert!(
             err_str(&o).contains("created"),
-            "the create notice belongs on the first statement: {}",
+            "the create notice belongs on the first write: {}",
             err_str(&o)
         );
-
-        // one-shot SELECT → the file exists (a table-less sqlite base cannot
-        // answer it yet — sqlite3 can; the file is what this asserts).
-        let db = path("oneshot");
-        let o = run(&[db.to_str().unwrap(), "SELECT 1"]);
-        assert!(db.exists(), "one-shot SELECT did not create the database: {}", err_str(&o));
 
         // one-shot DDL → the file exists AND really holds the table.
         let db = path("ddl");
@@ -407,14 +444,12 @@ fn the_first_statement_creates_the_database() {
         assert_ok(&o);
         assert_eq!(out_str(&o), "id\tv\n1\tx\n");
 
-        // a statement that ERRORS still creates the file (sqlite3 parity).
+        // a WRITE that then fails still creates the file: the create is the
+        // decision to have a database, not a consequence of the write working.
         let db = path("boom");
-        let o = run(&[db.to_str().unwrap(), "SELECT * FROM nope"]);
+        let o = run(&[db.to_str().unwrap(), "INSERT INTO nope VALUES(1)"]);
         assert_eq!(o.status.code(), Some(1), "stderr: {}", err_str(&o));
-        assert!(
-            db.exists(),
-            "a failing first statement must still create the database (sqlite3 does)"
-        );
+        assert!(db.exists(), "a failing first write must still create the database");
     }
 }
 
