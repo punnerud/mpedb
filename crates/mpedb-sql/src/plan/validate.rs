@@ -801,8 +801,10 @@ impl CompiledPlan {
     /// filled PER ROW after the gather, so no gather-side program of `sp` — the
     /// access parts, `filter`, `joined_filter`, a join's `on`/`policy`, or (for
     /// an aggregate, #73 §1.2c) the group keys / aggregate args / HAVING / grouped
-    /// projection — may read it. `post_filter` and a non-aggregate projection are
-    /// the only readers of a correlated slot. Applied at the top level (`base =
+    /// projection — may read it. `post_filter`, an aggregate's `FILTER (WHERE …)`
+    /// (evaluated per row inside the aggregate loop against that row's filled
+    /// scratch) and a non-aggregate projection are the only readers of a
+    /// correlated slot. Applied at the top level (`base =
     /// subplan_base`) and, by `validate_subplan_rec`, at each nested subplan's own
     /// `base = sub_base`, so every level (#73 §3 stage 2) is checked identically.
     fn check_slot_discipline(
@@ -879,9 +881,14 @@ impl CompiledPlan {
                 if let Some(p) = &a.arg {
                     gather_ok(p)?;
                 }
-                if let Some(p) = &a.filter {
-                    gather_ok(p)?;
-                }
+                // NOT `a.filter`: `agg(x) FILTER (WHERE …)` is evaluated PER ROW
+                // inside the aggregate loop, after the per-row correlated fill,
+                // against that row's scratch parameter vector — exactly like
+                // `post_filter`, and unlike everything else here. So a correlated
+                // slot IS meaningful in it and must not be rejected. (Rejecting it
+                // is not merely conservative: the executor used to evaluate the
+                // filter against the pre-fill `params`, read NULL, and DROP the
+                // row — a wrong answer for both `EXISTS` and `NOT EXISTS`.)
             }
             if let Some(h) = &agg.having {
                 gather_ok(h)?;
