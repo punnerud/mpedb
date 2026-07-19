@@ -26,11 +26,38 @@ pub(super) fn extract_access(
         })
     };
 
+    // A TYPELESS (`any`) key column is never an access path — not as a PK
+    // point, not as a PK range, not through an index. The schema now ALLOWS
+    // such a key (its tree is keyed by storage class, `keycode::KeySpec`, whose
+    // equality and order are sqlite's), but a probe is a strictly stronger
+    // claim than a well-ordered tree, and two things break it:
+    //
+    //   - **affinity.** sqlite compares `x = <bound>` on a typeless column
+    //     only AFTER applying the pair's comparison affinity to the bound
+    //     (`sqlite3CompareAffinity`; the binder's `BExpr::ClassCmp`). A raw
+    //     bound encoded straight into a key skips that step, so a NUMERIC
+    //     column would answer `dt < '2020-01-01'` by comparing a number
+    //     against a text — "every number is smaller" — instead of against the
+    //     converted value.
+    //   - **mpedb's own types.** `Bool`/`Timestamp` have no sqlite storage
+    //     class. `Value::sort_cmp` calls them peers (and `Instr::CmpClass`
+    //     raises a type error), while the key encoding must give them SOME
+    //     rank to stay a total order. A range bound would silently include or
+    //     exclude by that invented rank where the filter refuses.
+    //
+    // Keeping every predicate over an `any` column a residual filter over a
+    // full scan is what makes the comparison-affinity rule's own proof still
+    // hold: a `ClassCmp` is never an access path, so that rule can only ever
+    // rewrite a filter. `as_col_cmp` matches `BExpr::Binary` only and so
+    // already skips `ClassCmp`; this guard is the one that does not depend on
+    // which node the binder happened to choose.
+    let typeless = |col: u16| table.columns[col as usize].ty == ColumnType::Any;
+
     // 1. Every PK column pinned by equality -> PkPoint.
     let pins: Vec<Option<(usize, BinOp, Atom)>> = table
         .primary_key
         .iter()
-        .map(|&pk| find(&consumed, pk, &[BinOp::Eq]))
+        .map(|&pk| if typeless(pk) { None } else { find(&consumed, pk, &[BinOp::Eq]) })
         .collect();
     if pins.iter().all(Option::is_some) {
         let mut parts = Vec::with_capacity(pins.len());
@@ -58,10 +85,8 @@ pub(super) fn extract_access(
         let cover = |ix: &mpedb_types::IndexDef| -> Vec<(usize, Atom)> {
             let mut pins = Vec::new();
             for &col in &ix.columns {
-                // `any` can never be probed: index order is encoding order,
-                // not sql_cmp order. The schema refuses indexing it, so this
-                // is unreachable — kept as the planner's own guarantee.
-                if table.columns[col as usize].ty == ColumnType::Any {
+                // See `typeless` above.
+                if typeless(col) {
                     break;
                 }
                 match find(&consumed, col, &[BinOp::Eq]) {
@@ -116,11 +141,14 @@ pub(super) fn extract_access(
     // must stay a residual filter (`sql_cmp` honors the collation) over a scan.
     let collated = |col: u16| table.columns[col as usize].collation != Collation::Binary;
 
-    // 3. Range over the first PK column.
+    // 3. Range over the first PK column. `typeless` blocks it for the same
+    // reason `collated` does — the bound would be encoded raw, and for an
+    // `any` column raw is not what the tree is keyed by (see above).
     let first_pk = table.primary_key[0];
+    let unbounded = |col: u16| collated(col) || typeless(col);
     let mut lo = None;
     let mut hi = None;
-    if table.primary_key.len() > 1 && !collated(first_pk) {
+    if table.primary_key.len() > 1 && !unbounded(first_pk) {
         // Equality on the first PK column of a multi-column PK when full
         // pinning failed: inclusive point-range lo = hi.
         if let Some((i, _, atom)) = find(&consumed, first_pk, &[BinOp::Eq]) {
@@ -134,7 +162,7 @@ pub(super) fn extract_access(
             hi = Some(bound);
         }
     }
-    if lo.is_none() && hi.is_none() && !collated(first_pk) {
+    if lo.is_none() && hi.is_none() && !unbounded(first_pk) {
         if let Some((i, op, atom)) = find(&consumed, first_pk, &[BinOp::Gt, BinOp::Ge]) {
             consumed[i] = true;
             lo = Some(KeyBound {
@@ -168,11 +196,8 @@ pub(super) fn extract_access(
         // only — its encoding is a key prefix, so this serves composite
         // indexes unchanged.
         let col = ix.columns[0];
-        if table.columns[col as usize].ty == ColumnType::Any {
-            continue; // no order across types — see the equality guard
-        }
-        if collated(col) {
-            continue; // collated column: never a raw range bound (see above)
+        if unbounded(col) {
+            continue; // collated or typeless: never a raw range bound (above)
         }
         let mut lo = None;
         let mut hi = None;
