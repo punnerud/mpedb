@@ -28,7 +28,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::PathBuf;
 use std::ptr;
 use std::time::{Duration, Instant};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The seed table every fresh mpedb file is created with: mpedb refuses a
 /// schema with no live tables, but `sqlite3_open("new.db")` carries no schema.
@@ -53,6 +53,11 @@ pub struct Sqlite3 {
     /// A `:memory:`/temp database: its backing file is removed on close.
     ephemeral: bool,
     busy_timeout_ms: c_int,
+    /// Set by `sqlite3_interrupt` (possibly from another thread); polled by the
+    /// running statement at step entry and during the busy-retry wait. An
+    /// atomic so the interrupting thread touches ONLY this field, never the
+    /// rest of the connection.
+    interrupted: AtomicBool,
     err_code: c_int,
     err_ext: c_int,
     err_msg: Vec<u8>, // NUL-terminated
@@ -339,6 +344,12 @@ fn run_stmt(s: &mut Stmt) -> c_int {
     };
     let is_dml = matches!(sql::classify(&s.sql), sql::Kind::Dml { .. });
     let params = s.binds.clone();
+    // An interrupt requested before we start aborts this step and is consumed
+    // (sqlite clears the flag when the interrupted statement finishes).
+    if c.interrupted.swap(false, Ordering::SeqCst) {
+        c.set_error(SQLITE_INTERRUPT, SQLITE_INTERRUPT, "interrupted");
+        return SQLITE_INTERRUPT;
+    }
     // `busy_timeout(ms)`: on a BUSY-class contention error, sleep with sqlite's
     // backoff and retry until the deadline, exactly as sqlite's default busy
     // handler does — a transient conflict clears instead of failing the call.
@@ -353,6 +364,11 @@ fn run_stmt(s: &mut Stmt) -> c_int {
     let outcome = loop {
         match catch_unwind(AssertUnwindSafe(|| exec_one(c, &s.exec_sql, &params))) {
             Ok(Err(ref e)) if is_busy_err(e) && deadline.is_some_and(|d| Instant::now() < d) => {
+                // sqlite3_interrupt breaks the busy wait instead of sleeping on.
+                if c.interrupted.swap(false, Ordering::SeqCst) {
+                    c.set_error(SQLITE_INTERRUPT, SQLITE_INTERRUPT, "interrupted");
+                    return SQLITE_INTERRUPT;
+                }
                 std::thread::sleep(busy_backoff(tries));
                 tries += 1;
                 continue;
@@ -529,6 +545,7 @@ fn open_impl(filename: Option<&str>, flags: c_int) -> Result<Box<Sqlite3>, (c_in
         path,
         ephemeral,
         busy_timeout_ms: 0,
+        interrupted: AtomicBool::new(false),
         err_code: SQLITE_OK,
         err_ext: SQLITE_OK,
         err_msg: Vec::new(),
@@ -551,9 +568,32 @@ pub unsafe extern "C" fn sqlite3_open_v2(
     filename: *const c_char,
     pp_db: *mut *mut Sqlite3,
     flags: c_int,
-    _vfs: *const c_char,
+    vfs: *const c_char,
 ) -> c_int {
-    open_common(filename, pp_db, flags)
+    let rc = open_common(filename, pp_db, flags);
+    // A named VFS: mpedb runs no sqlite VFS modules (it has its own storage
+    // engine, not sqlite's pager). The built-in VFS names denote ordinary OS
+    // file I/O, which mpedb provides its own way — honor them as a no-op. A
+    // CUSTOM/unknown VFS (encryption, cloud, in-memory shim) CANNOT be honored,
+    // and silently ignoring one would be unsafe (plaintext where an encryption
+    // VFS was expected). So refuse it with an error — as sqlite refuses an
+    // unregistered VFS — rather than pretend it is active. The handle is still
+    // returned (sqlite contract: close it even on open error).
+    if rc == SQLITE_OK && !pp_db.is_null() {
+        if let Some(name) = c_str_opt(vfs) {
+            const BUILTIN: &[&str] = &[
+                "unix", "unix-none", "unix-dotfile", "unix-excl", "unix-namedsem",
+                "win32", "win32-none", "win32-longpath", "memdb",
+            ];
+            if !BUILTIN.iter().any(|b| b.eq_ignore_ascii_case(name)) {
+                if let Some(c) = conn(*pp_db) {
+                    c.set_error(SQLITE_ERROR, SQLITE_ERROR, &format!("no such vfs: {name}"));
+                }
+                return SQLITE_ERROR;
+            }
+        }
+    }
+    rc
 }
 
 unsafe fn open_common(filename: *const c_char, pp_db: *mut *mut Sqlite3, flags: c_int) -> c_int {
@@ -1323,7 +1363,17 @@ pub extern "C" fn sqlite3_sleep(ms: c_int) -> c_int {
 /// No cooperative mid-statement interrupt: the shim materializes each result
 /// synchronously, so there is nothing to signal. No-op (never wrong).
 #[no_mangle]
-pub unsafe extern "C" fn sqlite3_interrupt(_db: *mut Sqlite3) {}
+pub unsafe extern "C" fn sqlite3_interrupt(db: *mut Sqlite3) {
+    if !db.is_null() {
+        // Touch ONLY the atomic flag — never the rest of the connection — so
+        // this is safe to call from another thread while a statement runs. The
+        // running statement polls it at step entry and during the busy-retry
+        // wait (mpedb materializes a result synchronously, so those are the
+        // points at which an interrupt can take effect; a runaway scan is
+        // bounded instead by the per-statement runtime budget).
+        (*db).interrupted.store(true, Ordering::SeqCst);
+    }
+}
 
 /// ASCII case-insensitive C-string compare (sqlite's `sqlite3_stricmp`).
 #[no_mangle]
@@ -1441,14 +1491,116 @@ pub unsafe extern "C" fn sqlite3_bind_parameter_name(p: *mut Stmt, idx: c_int) -
     }
 }
 
-/// Best-effort `sqlite3_expanded_sql`: the raw statement text (mpedb binds
-/// positionally, so no literal substitution is performed). Returned in a
-/// libc-allocated buffer the caller frees with `sqlite3_free`. Only consumed by
-/// the trace hook, which the shim never invokes.
+/// One bound value as a SQL literal for `sqlite3_expanded_sql`.
+fn value_literal(v: &Value) -> String {
+    match v {
+        Value::Null => "NULL".to_string(),
+        Value::Int(i) => i.to_string(),
+        Value::Bool(b) => (if *b { "1" } else { "0" }).to_string(),
+        Value::Float(f) if f.is_finite() => {
+            let s = format!("{f}");
+            // Keep it recognizably a float (sqlite renders `5.0`, not `5`).
+            if s.contains(['.', 'e', 'E']) { s } else { format!("{s}.0") }
+        }
+        Value::Float(_) => "NULL".to_string(), // NaN/inf: no SQL literal
+        Value::Timestamp(us) => us.to_string(), // stored as int microseconds
+        // A session-context list is not a value a C-API caller can bind, so it
+        // never reaches here; render defensively rather than match-panic.
+        Value::List(_) => "NULL".to_string(),
+        Value::Text(s) => format!("'{}'", s.replace('\'', "''")),
+        Value::Blob(b) => {
+            let mut o = String::with_capacity(3 + b.len() * 2);
+            o.push_str("X'");
+            for byte in b {
+                o.push_str(&format!("{byte:02X}"));
+            }
+            o.push('\'');
+            o
+        }
+    }
+}
+
+/// Expand the numbered-`$K` statement by substituting each parameter with its
+/// bound value as a SQL literal — quote/comment aware, so a `$K` inside a string
+/// literal or a comment is left untouched. (The shim rewrites `?`/`:name`/… to
+/// `$K` at prepare, so this covers every sqlite parameter spelling.)
+fn expand_sql(exec_sql: &str, binds: &[Value]) -> String {
+    let mut out = String::with_capacity(exec_sql.len() + 16);
+    let mut chars = exec_sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                out.push('\'');
+                while let Some(d) = chars.next() {
+                    out.push(d);
+                    if d == '\'' {
+                        if matches!(chars.peek(), Some('\'')) {
+                            out.push('\''); // doubled '' — stays in the string
+                            chars.next();
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+            '-' if matches!(chars.peek(), Some('-')) => {
+                out.push('-');
+                for d in chars.by_ref() {
+                    out.push(d);
+                    if d == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if matches!(chars.peek(), Some('*')) => {
+                out.push('/');
+                out.push('*');
+                chars.next();
+                let mut prev = ' ';
+                for d in chars.by_ref() {
+                    out.push(d);
+                    if prev == '*' && d == '/' {
+                        break;
+                    }
+                    prev = d;
+                }
+            }
+            '$' => {
+                let mut num = String::new();
+                while let Some(d) = chars.peek() {
+                    if d.is_ascii_digit() {
+                        num.push(*d);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                if num.is_empty() {
+                    out.push('$');
+                } else {
+                    let lit = num
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|n| n.checked_sub(1))
+                        .and_then(|k| binds.get(k))
+                        .map(value_literal)
+                        .unwrap_or_else(|| "NULL".to_string());
+                    out.push_str(&lit);
+                }
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// `sqlite3_expanded_sql`: the statement with its bound parameters substituted
+/// as literals (sqlite semantics). Returned in a libc-allocated buffer the
+/// caller frees with `sqlite3_free`.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_expanded_sql(p: *mut Stmt) -> *mut c_char {
     match stmt(p) {
-        Some(s) => dup_cstr(&s.sql),
+        Some(s) => dup_cstr(&expand_sql(&s.exec_sql, &s.binds)),
         None => ptr::null_mut(),
     }
 }

@@ -657,3 +657,94 @@ unsafe fn collect_text_col(db: *mut Sqlite3, sql: &str) -> Vec<String> {
     sqlite3_finalize(st);
     out
 }
+
+#[test]
+fn expanded_sql_substitutes_bound_params() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)"), SQLITE_OK);
+        let mut st: *mut Stmt = ptr::null_mut();
+        // A positional `?` and a named `:n` share one numbering space; the
+        // expansion substitutes each with its bound value as a SQL literal.
+        let sql = cs("SELECT id, name FROM t WHERE id = ? AND name = :n");
+        assert_eq!(
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_bind_int(st, 1, 5), SQLITE_OK);
+        let nm = cs("o'brien");
+        assert_eq!(sqlite3_bind_text(st, 2, nm.as_ptr(), -1, sqlite_transient()), SQLITE_OK);
+        let p = sqlite3_expanded_sql(st);
+        assert!(!p.is_null());
+        let expanded = CStr::from_ptr(p).to_str().unwrap().to_string();
+        sqlite3_free(p as *mut c_void);
+        assert_eq!(
+            expanded,
+            "SELECT id, name FROM t WHERE id = 5 AND name = 'o''brien'",
+            "expanded_sql"
+        );
+        sqlite3_finalize(st);
+    }
+}
+
+#[test]
+fn interrupt_before_step_returns_interrupted_and_clears() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t VALUES (1)"), SQLITE_OK);
+        let mut st: *mut Stmt = ptr::null_mut();
+        let sql = cs("SELECT id FROM t");
+        assert_eq!(
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_OK
+        );
+        sqlite3_interrupt(db);
+        assert_eq!(sqlite3_step(st), SQLITE_INTERRUPT);
+        sqlite3_finalize(st);
+        // The flag is consumed: a fresh statement runs normally.
+        let mut s2: *mut Stmt = ptr::null_mut();
+        let q = cs("SELECT id FROM t");
+        assert_eq!(
+            sqlite3_prepare_v2(db, q.as_ptr(), -1, &mut s2, ptr::null_mut()),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_step(s2), SQLITE_ROW);
+        sqlite3_finalize(s2);
+    }
+}
+
+#[test]
+fn open_v2_unknown_vfs_is_refused_builtin_ok() {
+    unsafe {
+        let name = cs(":memory:");
+        // A custom/unknown VFS cannot be honored — refuse rather than silently
+        // ignore (which would be unsafe for e.g. an encryption VFS).
+        let mut db: *mut Sqlite3 = ptr::null_mut();
+        let vfs = cs("my-encryption-vfs");
+        let rc = sqlite3_open_v2(
+            name.as_ptr(),
+            &mut db,
+            SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE,
+            vfs.as_ptr(),
+        );
+        assert_eq!(rc, SQLITE_ERROR);
+        assert!(!db.is_null(), "handle returned even on error (close contract)");
+        let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_str().unwrap();
+        assert!(msg.contains("no such vfs"), "{msg}");
+        sqlite3_close(db);
+        // A built-in VFS name (or NULL) opens normally.
+        let mut db2: *mut Sqlite3 = ptr::null_mut();
+        let vfs2 = cs("unix");
+        assert_eq!(
+            sqlite3_open_v2(
+                name.as_ptr(),
+                &mut db2,
+                SQLITE_OPEN_CREATE | SQLITE_OPEN_READWRITE,
+                vfs2.as_ptr()
+            ),
+            SQLITE_OK
+        );
+        sqlite3_close(db2);
+    }
+}
