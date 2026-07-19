@@ -134,20 +134,36 @@ impl AggTarget {
     }
 }
 
-pub use footprint::{Footprint, KeyAccess, KeyBound, KeyPart, PlanHash};
+pub use footprint::{Footprint, KeyAccess, KeyBound, KeyPart, PlanHash, TableSet};
 pub use fts::{Doclist, Tokenizer};
 pub use policy::{PolicyCmd, PolicyDef};
 pub use schema::{
-    store_into, ColumnDef, DefaultExpr, IndexDef, Schema, TableDef, TableKind, MAX_INDEXES,
+    store_into, ColumnDef, DefaultExpr, IndexDef, Schema, TableDef, TableKind,
+    MAX_IDENTIFIER_LEN, MAX_INDEXES,
 };
 pub use value::{Affinity, Collation, ColumnType, Value};
 
-/// Maximum number of tables (user + system) in one database. Bounded so that
-/// plan footprints can use a single `u128` bitmap per access kind (one bit per
-/// table id, 0..127). Schema validation reserves 8 slots for system tables, so
-/// ~120 are user-visible — comfortably past sqlite's practical schemas and the
-/// 64-table corpus (`select5`) this ceiling used to reject.
-pub const MAX_TABLES: usize = 128;
+/// Maximum number of tables (user + system) in one database — a **resource**
+/// bound, no longer a representation one (design/DESIGN-TABLE-CAP.md).
+///
+/// Footprints and the CDC capture config used to be per-table bitmaps, so this
+/// constant *was* an integer width (u64 → 64, then u128 → 128). Both are now
+/// sparse [`TableSet`]s, which impose no ceiling at all. What still bounds the
+/// count is cost, not encoding:
+///
+/// 1. **Tombstone bloat** — table ids are never reused (DESIGN-DROP-TABLE §0),
+///    so `Schema::tables` keeps a dead slot (~17 encoded bytes) per LIFETIME
+///    create, and the whole schema is one catalog record re-encoded on every
+///    DDL. That is the real cost curve, and it is proportional to actual use.
+/// 2. **Decode safety** — `Schema::from_canonical_bytes` reads `ntables` from
+///    untrusted bytes and must bound it before allocating.
+/// 3. Schema validation reserves 8 slots for system tables, so 4088 are
+///    user-visible — ~34× what Django's `queries` label needs, which is the
+///    workload this number was raised for.
+///
+/// Raising it further is now a one-constant change: no format bump, no bit
+/// audit.
+pub const MAX_TABLES: usize = 4096;
 
 /// Maximum number of columns per table (bounded by `u16` column indices in
 /// the expression IR and row format, kept small for sane page layouts).

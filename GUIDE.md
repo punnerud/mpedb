@@ -243,7 +243,7 @@ EXPLAIN SELECT email FROM users WHERE id = $1
 Select users
   access: PkPoint(id = $1)
   project: email
-  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Point
+  footprint: read_only=true tables_read=[0] tables_written=[] indexes_used=0x1 key=Point
 ```
 
 `access` is the thing to look at: `PkPoint` is a point lookup, `PkRange` a range

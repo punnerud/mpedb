@@ -39,7 +39,7 @@ use crate::plan::{
 use crate::plan::{FtsQuery, FtsTerm};
 use crate::policy::{PolicyCatalog, TablePolicies};
 use mpedb_types::{BareGroupBy, Collation, ExprProgram, ColumnType, Error, Footprint, Instr, KeyAccess, KeyBound, KeyPart, PolicyCmd, Result, Schema,
-    TableDef, Value,};
+    TableDef, TableSet, Value,};
 
 mod access;
 mod aggregate;

@@ -257,11 +257,12 @@ fn locality_key(p: &PreparedIntent) -> SortKey {
         // staged per-intent regardless of position
         return (u32::MAX, RANK_NO_KEY, Vec::new(), idx);
     };
-    // DML writes exactly one table. A degenerate footprint with 0 bits gives
-    // 128 (trailing_zeros of a zero u128) — still deterministic and > every
-    // valid table id (MAX_TABLES = 128); execute_prepared rejects read-only
-    // plans regardless.
-    let table = plan.footprint.tables_written.trailing_zeros();
+    // DML writes exactly one table. A degenerate footprint with an EMPTY write
+    // set sorts last under `u32::MAX` — still deterministic and > every valid
+    // table id; execute_prepared rejects read-only plans regardless. (This was
+    // `trailing_zeros()` over a u128 bitmap; the set is sparse now, so the
+    // written table is simply its first — and only — element.)
+    let table = plan.footprint.tables_written.first().unwrap_or(u32::MAX);
     let (rank, key) = match &plan.footprint.key_access {
         KeyAccess::Point(parts) => match resolve_key_bytes(parts, plan, params) {
             Some(k) => (RANK_KEYED, k),
@@ -428,10 +429,12 @@ fn optimistic_eligible(db: &Database, plan: &CompiledPlan) -> bool {
         // (design/DESIGN-UDF.md).
         return false;
     }
-    if plan.footprint.tables_written.count_ones() != 1 {
+    if plan.footprint.tables_written.len() != 1 {
         return false;
     }
-    let table = plan.footprint.tables_written.trailing_zeros();
+    let Some(table) = plan.footprint.tables_written.first() else {
+        return false;
+    };
     if db.engine.has_secondary_index(table) {
         return false; // index maintenance defeats key-level footprints
     }
@@ -492,7 +495,11 @@ enum Prep {
 
 /// Build the prep decision against a pinned read snapshot (no writer lock).
 fn optimistic_prep(db: &Database, plan: &CompiledPlan, params: &[Value]) -> Prep {
-    let table = plan.footprint.tables_written.trailing_zeros();
+    // Only reached for an `optimistic_eligible` plan, which requires exactly
+    // one written table; the fallback keeps the extraction total regardless.
+    let Some(table) = plan.footprint.tables_written.first() else {
+        return Prep::Fallback;
+    };
     let Some(types) = db.engine.col_types(table) else {
         return Prep::Fallback;
     };

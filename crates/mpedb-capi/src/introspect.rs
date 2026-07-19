@@ -29,13 +29,21 @@ fn type_name(t: ColumnType) -> &'static str {
     }
 }
 
+/// Quote an identifier for SQL text, DOUBLING any embedded `"` (sqlite's own
+/// rule, and what mpedb's tokenizer un-escapes). Identifiers may contain spaces
+/// and punctuation, so the quoting is not optional; without the doubling a name
+/// like `a"b` would emit `"a"b"`, which reparses as a DIFFERENT name.
+fn q(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
 /// Reconstruct a `CREATE TABLE` statement for the `sql` column of sqlite_master.
 fn create_ddl(t: &mpedb::TableDef) -> String {
     let mut cols: Vec<String> = t
         .columns
         .iter()
         .map(|c| {
-            let mut s = format!("\"{}\" {}", c.name, type_name(c.ty));
+            let mut s = format!("{} {}", q(&c.name), type_name(c.ty));
             if !c.nullable {
                 s.push_str(" NOT NULL");
             }
@@ -50,11 +58,11 @@ fn create_ddl(t: &mpedb::TableDef) -> String {
             .primary_key
             .iter()
             .filter_map(|&i| t.columns.get(i as usize))
-            .map(|c| format!("\"{}\"", c.name))
+            .map(|c| q(&c.name))
             .collect();
         cols.push(format!("PRIMARY KEY ({})", pk.join(", ")));
     }
-    format!("CREATE TABLE \"{}\" ({})", t.name, cols.join(", "))
+    format!("CREATE TABLE {} ({})", q(&t.name), cols.join(", "))
 }
 
 // ------------------------------------------------------------------ PRAGMA
