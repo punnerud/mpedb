@@ -371,8 +371,8 @@ impl ExprProgram {
                     });
                 }
                 Instr::And | Instr::Or => {
-                    let b = to_bool3(stack.pop().expect("validated"))?;
-                    let a = to_bool3(stack.pop().expect("validated"))?;
+                    let b = truthy3(&stack.pop().expect("validated"));
+                    let a = truthy3(&stack.pop().expect("validated"));
                     stack.push(match instr {
                         // Kleene 3VL
                         Instr::And => match (a, b) {
@@ -388,7 +388,7 @@ impl ExprProgram {
                     });
                 }
                 Instr::Not => {
-                    let a = to_bool3(stack.pop().expect("validated"))?;
+                    let a = truthy3(&stack.pop().expect("validated"));
                     stack.push(match a {
                         None => Value::Null,
                         Some(x) => Value::Bool(!x),
@@ -512,18 +512,12 @@ impl ExprProgram {
                 Instr::JumpIfNotTrue(t) => {
                     // Jump on FALSE *and* on NULL: an unknown WHEN must not be
                     // taken, or `CASE WHEN <null> THEN a ELSE b END` yields a.
+                    // A non-bool condition is truthy-tested like sqlite's
+                    // (`truthy3`); the binder has already desugared every
+                    // statically-typed WHEN, so this is the fallback for an
+                    // expression whose type could not be pinned at bind time.
                     let c = stack.pop().expect("validated");
-                    if !matches!(c, Value::Bool(true)) {
-                        // A non-bool condition is a bind-time error, but a
-                        // hand-built program can still get here; treating it as
-                        // "not true" is the safe reading and matches to_bool3's
-                        // refusal to invent a truth value.
-                        if !matches!(c, Value::Bool(false) | Value::Null) {
-                            return Err(Error::TypeMismatch(format!(
-                                "CASE condition must be bool, got {}",
-                                c.type_name()
-                            )));
-                        }
+                    if truthy3(&c) != Some(true) {
                         pc = t as usize;
                     }
                 }
@@ -614,25 +608,38 @@ impl ExprProgram {
         params: &[Value],
         host: Option<&dyn HostFns>,
     ) -> Result<bool> {
-        match self.eval_with_stack_host(stack, cols, params, host)? {
-            Value::Bool(b) => Ok(b),
-            Value::Null => Ok(false),
-            v => Err(Error::TypeMismatch(format!(
-                "predicate evaluated to {}, expected bool",
-                v.type_name()
-            ))),
-        }
+        // Passes only on exactly TRUE — NULL and FALSE both skip the row. A
+        // non-boolean is truthy-tested the way sqlite does (`truthy3`); the
+        // binder has already desugared every statically-typed boolean context,
+        // so this only catches expressions whose type could not be pinned.
+        Ok(truthy3(&self.eval_with_stack_host(stack, cols, params, host)?) == Some(true))
     }
 }
 
-fn to_bool3(v: Value) -> Result<Option<bool>> {
+/// sqlite's `sqlite3VdbeBooleanValue`, as SQL 3VL: `None` for NULL, otherwise
+/// the value is TRUE iff its REAL value is non-zero — integers directly, and
+/// **everything else** through the leading-float-prefix parse ([`to_real`]),
+/// which reads a blob's raw bytes as text. So `2`, `0.5`, `'3abc'`, `'1e3'` and
+/// `x'31'` are TRUE while `0`, `-0.0`, `'abc'`, `'0'`, `'0x1'`, `x'30'` and
+/// `x'00'` are FALSE.
+///
+/// The binder desugars this statically wherever a boolean context has a known
+/// operand type (`Binder::coerce_bool_ctx`), which is every ordinary statement.
+/// This is the runtime fallback for the residue: an expression whose type could
+/// NOT be pinned at bind time, e.g. `WHERE $1 + $2` over two unconstrained
+/// parameters. Before, that reached the gate as an `Int` and raised
+/// `predicate evaluated to int64, expected bool`; sqlite truthy-tests it, so
+/// mpedb does too — never a truth value invented for a type sqlite has no rule
+/// for, because sqlite's rule covers every storage class.
+fn truthy3(v: &Value) -> Option<bool> {
     match v {
-        Value::Null => Ok(None),
-        Value::Bool(b) => Ok(Some(b)),
-        v => Err(Error::TypeMismatch(format!(
-            "expected bool, got {}",
-            v.type_name()
-        ))),
+        Value::Null => None,
+        Value::Bool(b) => Some(*b),
+        Value::Int(i) => Some(*i != 0),
+        // A context list has no truth value in any dialect; it is param-only
+        // and reaches only `IN`. Report FALSE rather than inventing one.
+        Value::List(_) => Some(false),
+        other => Some(to_real(other) != 0.0),
     }
 }
 
