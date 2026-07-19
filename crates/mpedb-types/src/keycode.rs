@@ -177,6 +177,32 @@ pub fn encode_key_spec(values: &[Value], specs: &[KeySpec]) -> Vec<u8> {
     buf
 }
 
+/// Encode a tuple as an **injective** byte string: `enc(a) == enc(b)` iff the
+/// values are the same value, type included.
+///
+/// Neither of the other two encoders is that, and both omissions are
+/// deliberate. [`encode_key`] keys by ORDER and drops the mpedb type, so the
+/// text `'1'` and the blob `x'31'` (identical payload bytes) collide, as do the
+/// integer `0` and the real `0.0` (identical 8-byte images).
+/// [`encode_group_key`] folds `1` and `1.0` on purpose, because sqlite's
+/// comparison calls them one value.
+///
+/// Use this where the key is a **cache or identity** rather than an order or a
+/// grouping — where serving one value's answer for another is a wrong answer.
+/// The correlated-subquery memo is the case that motivated it: a subquery may
+/// ask `typeof($1)`, which distinguishes exactly what the other two encoders
+/// merge.
+pub fn encode_key_exact(values: &[Value]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(values.len() * 13);
+    for v in values {
+        // The mpedb type tag (0 for NULL, which has none), then the ordered
+        // payload. The tag is what the other encoders drop.
+        buf.push(v.column_type().map_or(0u8, |t| t as u8));
+        encode_value(&mut buf, v);
+    }
+    buf
+}
+
 // ---------------------------------------------------------------------------
 // The GROUP key: sqlite's storage-class equality, as bytes.
 // ---------------------------------------------------------------------------
@@ -880,6 +906,55 @@ mod tests {
             decode_key(&k, &[ColumnType::Any, ColumnType::Int64]).unwrap(),
             vec![Value::Text("a\0b".into()), Value::Int(-7)]
         );
+    }
+
+    /// [`encode_key_exact`] is INJECTIVE where the other two encoders are
+    /// deliberately not: exactly the pairs they merge must come apart here.
+    #[test]
+    fn exact_key_is_injective_where_the_others_merge() {
+        let zoo: Vec<Value> = group_key_zoo()
+            .into_iter()
+            .chain([
+                Value::Text("1".into()),
+                Value::Blob(b"1".to_vec()),
+                Value::Text(String::new()),
+                Value::Blob(Vec::new()),
+                Value::Bool(false),
+                Value::Bool(true),
+                Value::Timestamp(0),
+                Value::Timestamp(1),
+            ])
+            .collect();
+        for a in &zoo {
+            for b in &zoo {
+                let same = encode_key_exact(std::slice::from_ref(a))
+                    == encode_key_exact(std::slice::from_ref(b));
+                // `Value`'s own equality, except that NaN is not `PartialEq` to
+                // itself while the key image is — the encoder normalizes float
+                // bits, which is right for a cache (one NaN answer serves
+                // another) and is the only place the two rules differ.
+                let want = match (a, b) {
+                    (Value::Float(x), Value::Float(y)) => {
+                        normalize_float_bits(*x) == normalize_float_bits(*y)
+                    }
+                    _ => a == b,
+                };
+                assert_eq!(same, want, "exact-key verdict wrong: {a:?} vs {b:?}");
+            }
+        }
+        // The four collisions this exists to remove, named.
+        let k = |v: Value| encode_key_exact(&[v]);
+        assert_ne!(k(Value::Text("1".into())), k(Value::Blob(b"1".to_vec())));
+        assert_ne!(k(Value::Int(0)), k(Value::Float(0.0)));
+        assert_ne!(k(Value::Int(1)), k(Value::Float(1.0)));
+        assert_ne!(k(Value::Int(7)), k(Value::Timestamp(7)));
+        // ...and the ordered encoder really does merge the first two, which is
+        // why it was the wrong tool for a cache.
+        assert_eq!(
+            encode_key(&[Value::Text("1".into())]),
+            encode_key(&[Value::Blob(b"1".to_vec())])
+        );
+        assert_eq!(encode_key(&[Value::Int(0)]), encode_key(&[Value::Float(0.0)]));
     }
 
     /// A truncated or hostile class key is `Corrupt`, never a panic — the same
