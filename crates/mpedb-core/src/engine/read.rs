@@ -98,7 +98,7 @@ impl ReadTxn<'_> {
             .col_types
             .get(table_id as usize)
             .ok_or_else(|| Error::Internal("table id out of range".into()))?;
-        let key = keycode::encode_key_collated(pk_values, self.bundle.pk_coll(table_id));
+        let key = keycode::encode_key_spec(pk_values, self.bundle.pk_coll(table_id));
         let root = self.tree_root(table_id, 0)?;
         let Some(loc) = btree::value_loc(self, root, &key)? else {
             return Ok(None);
@@ -124,7 +124,7 @@ impl ReadTxn<'_> {
     }
 
     pub fn get_by_pk(&self, table_id: u32, pk_values: &[Value]) -> Result<Option<Vec<Value>>> {
-        let key = keycode::encode_key_collated(pk_values, self.bundle.pk_coll(table_id));
+        let key = keycode::encode_key_spec(pk_values, self.bundle.pk_coll(table_id));
         let root = self.tree_root(table_id, 0)?;
         match btree::get(self, root, &key)? {
             None => Ok(None),
@@ -144,7 +144,7 @@ impl ReadTxn<'_> {
         index_no: u32,
         values: &[Value],
     ) -> Result<Option<Vec<Value>>> {
-        let ikey = keycode::encode_key_collated(values, self.bundle.index_coll(table_id, index_no));
+        let ikey = keycode::encode_key_spec(values, self.bundle.index_coll(table_id, index_no));
         let iroot = self.tree_root(table_id, index_no)?;
         let Some(pk_bytes) = btree::get(self, iroot, &ikey)? else {
             return Ok(None);
@@ -197,7 +197,7 @@ impl ReadTxn<'_> {
         if full_unique {
             return Ok(self.get_by_index(table_id, index_no, values)?.into_iter().collect());
         }
-        let prefix = keycode::encode_key_collated(values, self.bundle.index_coll(table_id, index_no));
+        let prefix = keycode::encode_key_spec(values, self.bundle.index_coll(table_id, index_no));
         let iroot = self.tree_root(table_id, index_no)?;
         let root = self.tree_root(table_id, 0)?;
         let types = &self.bundle.col_types[table_id as usize];
@@ -255,8 +255,8 @@ impl ReadTxn<'_> {
     ) -> Result<RowCursor<'_, '_>> {
         let root = self.tree_root(table_id, 0)?;
         let pkc = self.bundle.pk_coll(table_id);
-        let lo_k = lo.map(|(v, inc)| (keycode::encode_key_collated(v, pkc), inc));
-        let hi_k = hi.map(|(v, inc)| (keycode::encode_key_collated(v, pkc), inc));
+        let lo_k = lo.map(|(v, inc)| (keycode::encode_key_spec(v, pkc), inc));
+        let hi_k = hi.map(|(v, inc)| (keycode::encode_key_spec(v, pkc), inc));
         let cursor = btree::cursor(
             self,
             root,

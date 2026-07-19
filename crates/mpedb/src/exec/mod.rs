@@ -1459,11 +1459,17 @@ fn correlated_survivors(
                         .ok_or_else(|| internal("correlation arg out of row"))?,
                 );
             }
-            // `encode_key`, NOT the grouping key: this is a CACHE keyed by the
-            // outer row's exact values, and the subquery may distinguish what
-            // grouping calls one value (`typeof($1)`, `printf`). Folding `1`
-            // and `1.0` together here would serve one's result for the other.
-            let memo_key = keycode::encode_key(&key_vals);
+            // `encode_key_exact`, and neither of the other two encoders: this
+            // is a CACHE keyed by the outer row's exact values, and the
+            // subquery may distinguish what they merge (`typeof($1)`,
+            // `printf`). The grouping key folds `1` and `1.0` on purpose; the
+            // ORDERED key drops the mpedb type, so over a typeless (`any`)
+            // column it collided the text `'1'` with the blob `x'31'` and the
+            // integer `0` with the real `0.0` — and served one's result for the
+            // other, which the differential caught as
+            // `SELECT id, (SELECT typeof(o.v) FROM m) FROM o` answering "text"
+            // where sqlite says "blob".
+            let memo_key = keycode::encode_key_exact(&key_vals);
             scratch[base + i] = if let Some(v) = memo[ci].get(&memo_key) {
                 v.clone()
             } else {

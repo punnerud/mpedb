@@ -73,6 +73,11 @@ pub struct RowStream<'db> {
     /// Streaming-mode scan state (unused after materialization).
     table: u32,
     pk_cols: Vec<usize>,
+    /// On-disk key specs for the PK columns, in key order — what the resume
+    /// bound must be encoded with. NOT `encode_key`: a collated key column
+    /// folds its text and a typeless (`any`) one keys by storage class, so a
+    /// raw encoding would resume at a byte string the tree never stores.
+    pk_specs: Vec<keycode::KeySpec>,
     /// Lower bound of the NEXT batch's scan; updated to resume strictly
     /// after the last scanned row.
     lo: Option<RawBound>,
@@ -116,6 +121,11 @@ impl<'db> RowStream<'db> {
             .table(table)
             .ok_or_else(|| Error::Internal("validated plan table out of range".into()))?;
         let pk_cols: Vec<usize> = tdef.primary_key.iter().map(|&i| i as usize).collect();
+        let pk_specs: Vec<keycode::KeySpec> = tdef
+            .primary_key
+            .iter()
+            .map(|&i| keycode::KeySpec::for_column(tdef.columns[i as usize].ty, tdef.columns[i as usize].collation))
+            .collect();
 
         let mut stream = RowStream {
             txn: None,
@@ -125,6 +135,7 @@ impl<'db> RowStream<'db> {
             buf: VecDeque::new(),
             table,
             pk_cols,
+            pk_specs,
             lo: None,
             hi: None,
             skip: offset.unwrap_or(0).min(usize::MAX as u64) as usize,
@@ -289,7 +300,7 @@ impl<'db> RowStream<'db> {
                             .ok_or_else(|| Error::Internal("PK column".into()))?,
                     );
                 }
-                resume = Some(keycode::encode_key(&pk));
+                resume = Some(keycode::encode_key_spec(&pk, &self.pk_specs));
                 break;
             }
         }
