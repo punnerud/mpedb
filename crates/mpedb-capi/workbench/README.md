@@ -65,5 +65,11 @@ to measure drop-in compatibility beyond mpedb's own tests. Results feed
   a quoted identifier cannot qualify a dotted reference (`"t"."id"`), and Django
   quotes every name. The workbench works around it by emitting bare identifiers;
   without that, zero ORM queries run.
-- The hardest ceiling is **`MAX_TABLES` = 120**: Django's `queries` label alone
-  exceeds it, so it cannot be measured at all.
+- ~~The hardest ceiling is **`MAX_TABLES` = 120**: Django's `queries` label alone
+  exceeds it, so it cannot be measured at all.~~ **LIFTED** (2026-07-19,
+  design/DESIGN-TABLE-CAP.md): footprints and the CDC capture config are sparse
+  `TableSet`s instead of per-table bitmaps, so `MAX_TABLES` is 4096 (4088 live
+  user tables). The 128-byte identifier limit that independently blocked
+  `backends` (a generated m2m name is 134 chars) moved to 255 in the same pass,
+  along with the identifier CHARACTER set — a quoted name may now contain spaces
+  and punctuation, as sqlite allows. `queries` and `backends` are measurable.
