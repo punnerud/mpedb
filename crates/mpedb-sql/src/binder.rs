@@ -94,27 +94,62 @@ pub(crate) enum BUnOp {
 /// Expression type: `None` = NULL literal or not yet constrained.
 pub(crate) type Ty = Option<ColumnType>;
 
-/// The names + arities of the HOST-registered scalar UDFs visible to the
-/// connection compiling this statement (the C-API `create_function` path,
+/// The names + arities of the HOST-registered UDFs visible to the connection
+/// compiling this statement (the C-API `create_function` path,
 /// design/DESIGN-UDF.md). Threaded into the binder exactly as the compat dialect
 /// is (`set_dialect`/`set_host_udfs`): a function call that matches no native
 /// scalar/aggregate but DOES match a registered `(name, argc)` (or a variadic
 /// `(name, -1)`) compiles to a [`BExpr::HostCall`]. Empty for every connection
 /// that registered none — then function resolution is exactly as before.
+///
+/// Stage 2 adds `aggs`, the `xStep`/`xFinal` registrations. Those are resolved
+/// EARLIER than scalars — in the PARSER, because `myagg(DISTINCT x) FILTER
+/// (WHERE …)` is aggregate GRAMMAR and the parser must know to take that branch
+/// before it reads the argument list. The two namespaces are checked in the
+/// order native aggregate → host aggregate → native scalar → host scalar, so a
+/// name registered as both an aggregate and a scalar is read as the aggregate.
 #[derive(Debug, Clone, Default)]
 pub struct HostUdfSet {
     fns: Vec<(String, i32)>,
+    aggs: Vec<(String, i32)>,
 }
 
 impl HostUdfSet {
     /// Build from `(name, n_arg)` pairs; `n_arg == -1` is sqlite's variadic
     /// "any arity" registration.
     pub fn new(fns: Vec<(String, i32)>) -> HostUdfSet {
-        HostUdfSet { fns }
+        HostUdfSet { fns, aggs: Vec::new() }
+    }
+
+    /// Build from the scalar AND aggregate registrations.
+    pub fn with_aggs(fns: Vec<(String, i32)>, aggs: Vec<(String, i32)>) -> HostUdfSet {
+        HostUdfSet { fns, aggs }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.fns.is_empty()
+        self.fns.is_empty() && self.aggs.is_empty()
+    }
+
+    /// The registered host AGGREGATE names, for the parser's grammar decision.
+    /// Name-only on purpose: the parser must choose the aggregate branch BEFORE
+    /// it has parsed the arguments, so arity is checked afterwards
+    /// ([`host_agg_arity_ok`](Self::host_agg_arity_ok)).
+    pub fn agg_names(&self) -> Vec<String> {
+        self.aggs.iter().map(|(n, _)| n.clone()).collect()
+    }
+
+    /// The `(name, n_arg)` pairs of the registered host aggregates.
+    pub fn aggs(&self) -> &[(String, i32)] {
+        &self.aggs
+    }
+
+    /// Is `name` registered as a host aggregate accepting `argc` arguments?
+    /// Exact arity or a variadic `-1`, the same rule scalars use.
+    pub fn host_agg_arity_ok(&self, name: &str, argc: usize) -> bool {
+        let argc = argc as i32;
+        self.aggs
+            .iter()
+            .any(|(n, a)| n == name && (*a == argc || *a == -1))
     }
 
     /// Does a call `name(<argc args>)` match a registered host UDF? An exact

@@ -70,8 +70,8 @@ pub use stream::RowStream;
 pub use workspace::{Workspace, WorkspaceTxn, WsPlan};
 
 pub use mpedb_types::{
-    ColumnDef, ColumnType, Config, DbOptions, Durability, Error, PlanHash, PolicyCmd, PolicyDef,
-    Result, Schema, TableDef, Value, MAX_DB_SIZE_MB,
+    ColumnDef, ColumnType, Config, DbOptions, Durability, Error, HostAggState, PlanHash, PolicyCmd,
+    PolicyDef, Result, Schema, TableDef, Value, MAX_DB_SIZE_MB,
 };
 
 use exec::{exec_stmt, ReadCtx};
@@ -115,6 +115,34 @@ impl mpedb_types::HostFns for HostFnTable {
                 Error::Unsupported(format!("host function {name}/{argc} is not registered"))
             })?;
         f(args)
+    }
+}
+
+/// A host-registered AGGREGATE's factory (the C-API `xStep`/`xFinal` path,
+/// design/DESIGN-UDF.md stage 2): called ONCE PER GROUP to mint a fresh
+/// accumulator. A factory rather than a closure because an aggregate has state
+/// — sqlite's per-aggregation `sqlite3_aggregate_context` — and two groups must
+/// never share it.
+pub type HostAggFactory = Arc<dyn Fn() -> Box<dyn mpedb_types::HostAggState> + Send + Sync>;
+
+/// The aggregate twin of [`HostFnTable`]: a per-execution snapshot of the
+/// registry, handed to the executor as a [`mpedb_types::HostAggs`] resolver.
+struct HostAggTable {
+    aggs: Vec<(String, i32, HostAggFactory)>,
+}
+
+impl mpedb_types::HostAggs for HostAggTable {
+    fn create(&self, name: &str, argc: i32) -> Result<Box<dyn mpedb_types::HostAggState>> {
+        let f = self
+            .aggs
+            .iter()
+            .find(|(n, a, _)| n == name && *a == argc)
+            .or_else(|| self.aggs.iter().find(|(n, a, _)| n == name && *a == -1))
+            .map(|(_, _, f)| f)
+            .ok_or_else(|| {
+                Error::Unsupported(format!("host aggregate {name}/{argc} is not registered"))
+            })?;
+        Ok(f())
     }
 }
 
@@ -330,6 +358,12 @@ pub struct Database {
     /// and NEVER published to the shared content-hashed registry (its closures
     /// live only in THIS connection). Per-connection, mutable at any time.
     host_udfs: RwLock<HashMap<(String, i32), HostScalarFn>>,
+    /// Host-registered AGGREGATE UDFs (the C-API `xStep`/`xFinal` path,
+    /// design/DESIGN-UDF.md stage 2), keyed the same way. The value is a FACTORY:
+    /// the executor mints one accumulator per group, so no state is shared
+    /// between groups or between concurrent executions. Same one-connection-only
+    /// plan rule as the scalars.
+    host_aggs: RwLock<HashMap<(String, i32), HostAggFactory>>,
 }
 
 impl Database {
@@ -364,6 +398,7 @@ impl Database {
             // instead opens via `open_with_config` with the flag already set.
             bare_group_by: mpedb_types::BareGroupBy::default(),
             host_udfs: RwLock::new(HashMap::new()),
+            host_aggs: RwLock::new(HashMap::new()),
         })
     }
 
@@ -419,6 +454,7 @@ impl Database {
             require_policy,
             bare_group_by,
             host_udfs: RwLock::new(HashMap::new()),
+            host_aggs: RwLock::new(HashMap::new()),
         })
     }
 
@@ -472,12 +508,53 @@ impl Database {
         removed
     }
 
+    /// Register a HOST AGGREGATE on this connection (the C-API `xStep`/`xFinal`
+    /// path, design/DESIGN-UDF.md stage 2). A SQL call `name(arg)` then routes
+    /// the whole SELECT through the aggregate planner and, per group, mints a
+    /// fresh accumulator from `factory`, steps it once per surviving row (after
+    /// `WHERE`, the policy predicate and any `FILTER`), and finishes it at the
+    /// group's end. An EMPTY group still finishes a fresh accumulator, which is
+    /// sqlite's rule (`xFinal` on a never-stepped context ⇒ typically NULL).
+    ///
+    /// The call shape is exactly ONE argument (`n_arg` 1, or `-1` for variadic);
+    /// any other registered arity compiles to a clear error at the call site.
+    /// Same plan-sharing rule as [`register_host_function`]: a plan naming a host
+    /// aggregate never enters the shared registry, and registering drops this
+    /// connection's local plan cache.
+    pub fn register_host_aggregate<F>(&self, name: &str, n_arg: i32, factory: F)
+    where
+        F: Fn() -> Box<dyn mpedb_types::HostAggState> + Send + Sync + 'static,
+    {
+        self.host_aggs
+            .write()
+            .expect(POISON)
+            .insert((name.to_string(), n_arg), Arc::new(factory));
+        self.cache.write().expect(POISON).clear();
+    }
+
+    /// Remove a host aggregate registered with [`register_host_aggregate`].
+    /// Returns whether an entry was present. Drops the local plan cache.
+    pub fn unregister_host_aggregate(&self, name: &str, n_arg: i32) -> bool {
+        let removed = self
+            .host_aggs
+            .write()
+            .expect(POISON)
+            .remove(&(name.to_string(), n_arg))
+            .is_some();
+        if removed {
+            self.cache.write().expect(POISON).clear();
+        }
+        removed
+    }
+
     /// The names + arities of the registered host UDFs, for the binder to resolve
     /// calls against (values never leave the registry — only names/arities reach
     /// compile). Empty when none are registered, so compilation is unchanged.
+    /// Aggregates ride along: the PARSER needs them (see `HostUdfSet`).
     fn host_udf_set(&self) -> HostUdfSet {
-        let g = self.host_udfs.read().expect(POISON);
-        HostUdfSet::new(g.keys().cloned().collect())
+        let f = self.host_udfs.read().expect(POISON);
+        let a = self.host_aggs.read().expect(POISON);
+        HostUdfSet::with_aggs(f.keys().cloned().collect(), a.keys().cloned().collect())
     }
 
     /// Snapshot the registry's closures for one execution (see [`HostFnTable`]).
@@ -485,6 +562,14 @@ impl Database {
         let g = self.host_udfs.read().expect(POISON);
         HostFnTable {
             fns: g.iter().map(|((n, a), f)| (n.clone(), *a, f.clone())).collect(),
+        }
+    }
+
+    /// Snapshot the aggregate factories for one execution (see [`HostAggTable`]).
+    fn host_agg_table(&self) -> HostAggTable {
+        let g = self.host_aggs.read().expect(POISON);
+        HostAggTable {
+            aggs: g.iter().map(|((n, a), f)| (n.clone(), *a, f.clone())).collect(),
         }
     }
 
@@ -1030,16 +1115,22 @@ impl Database {
             let mut partial = false;
             // Host UDF closures for the executor, only for a plan that calls one
             // (design/DESIGN-UDF.md). Snapshot once; kept alive for the whole scan.
-            let host_table = plan.contains_host_call().then(|| self.host_fn_table());
+            let has_host = plan.contains_host_call();
+            let host_table = has_host.then(|| self.host_fn_table());
             let host: Option<&dyn mpedb_types::HostFns> =
                 host_table.as_ref().map(|t| t as &dyn mpedb_types::HostFns);
+            // Stage 2: the aggregate factories ride the SAME gate — a plan naming
+            // a host aggregate reports `contains_host_call` too.
+            let agg_table = has_host.then(|| self.host_agg_table());
+            let host_aggs: Option<&dyn mpedb_types::HostAggs> =
+                agg_table.as_ref().map(|t| t as &dyn mpedb_types::HostAggs);
             let r = self.engine.begin_read()?;
             // Staleness check UNDER THE SAME PIN that scans the rows (§4.3):
             // a policy edit that landed since compile invalidates the plan.
             // On error `r` drops here, releasing the reader slot.
             self.validate_policy_read(hash, plan, &r)?;
             let res = {
-                let mut ctx = ReadCtx(&r, host);
+                let mut ctx = ReadCtx(&r, host, host_aggs);
                 exec_stmt(&mut ctx, &self.schema(), plan, params, &mut partial)
             };
             match res {
@@ -2010,6 +2101,117 @@ primary_key = ["id"]
         // Unregister → unknown again.
         assert!(db.unregister_host_function("plus1", 1));
         assert!(db.query("SELECT plus1(id) FROM users", &[]).is_err());
+    }
+
+    /// Host AGGREGATE dispatch through the facade (design/DESIGN-UDF.md stage 2):
+    /// a registered `xStep`/`xFinal`-style factory accumulates per group, sees
+    /// NULL arguments (unlike a built-in), honors `FILTER`, produces one value
+    /// for an EMPTY group, and — like a scalar UDF — keeps its plan out of the
+    /// shared registry.
+    #[test]
+    fn host_aggregate_dispatch_and_registry_bypass() {
+        /// `mysum(x)`: sums ints, and COUNTS the NULLs it is handed — the visible
+        /// proof that a host aggregate is stepped for every row, where a built-in
+        /// `sum` would have skipped them.
+        #[derive(Default)]
+        struct MySum {
+            total: i64,
+            nulls: i64,
+        }
+        impl mpedb_types::HostAggState for MySum {
+            fn step(&mut self, args: &[Value]) -> Result<()> {
+                match args {
+                    [Value::Int(x)] => self.total += x,
+                    [Value::Null] => self.nulls += 1,
+                    _ => return Err(Error::Unsupported("mysum wants one int".into())),
+                }
+                Ok(())
+            }
+            fn finish(self: Box<Self>) -> Result<Value> {
+                Ok(Value::Int(self.total * 1000 + self.nulls))
+            }
+        }
+
+        let (cfg, path) = test_config("host-agg", 8);
+        let _g = FileGuard(path);
+        let db = Database::open_with_config(cfg).unwrap();
+
+        let ints = |r: ExecResult| -> Vec<i64> {
+            let ExecResult::Rows { rows, .. } = r else { panic!("want rows") };
+            rows.iter()
+                .map(|row| match row[0] {
+                    Value::Int(x) => x,
+                    ref v => panic!("want int, got {v:?}"),
+                })
+                .collect()
+        };
+
+        // Unregistered → bind error (an unknown function, not a silent NULL).
+        assert!(db.query("SELECT mysum(id) FROM users", &[]).is_err());
+
+        db.register_host_aggregate("mysum", 1, || Box::<MySum>::default());
+
+        // EMPTY table: one group, `xFinal` on a never-stepped state.
+        assert_eq!(ints(db.query("SELECT mysum(id) FROM users", &[]).unwrap()), vec![0]);
+
+        db.query(
+            "INSERT INTO users (id, email) VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
+            &[],
+        )
+        .unwrap();
+
+        // Bare aggregate over the whole table: 1+2+3+4 = 10, no NULLs.
+        assert_eq!(ints(db.query("SELECT mysum(id) FROM users", &[]).unwrap()), vec![10_000]);
+        // GROUP BY: odd ids 1+3 = 4, even 2+4 = 6.
+        assert_eq!(
+            ints(
+                db.query("SELECT mysum(id) FROM users GROUP BY id % 2 ORDER BY id % 2", &[])
+                    .unwrap()
+            ),
+            vec![6_000, 4_000]
+        );
+        // FILTER (WHERE …) applies to a host aggregate exactly as to a built-in.
+        assert_eq!(
+            ints(
+                db.query("SELECT mysum(id) FILTER (WHERE id > 2) FROM users", &[])
+                    .unwrap()
+            ),
+            vec![7_000]
+        );
+        // NULL arguments REACH `xStep` (sqlite's rule; a built-in would skip
+        // them): `mysum(NULL)` sees 4 NULLs and no ints.
+        assert_eq!(ints(db.query("SELECT mysum(NULL) FROM users", &[]).unwrap()), vec![4]);
+        // The result is dynamically typed (`ColumnType::Any`), exactly as a host
+        // SCALAR's is — which today means arithmetic over it is refused at bind.
+        // Asserted rather than left implicit: it is the SAME stage-1 limitation,
+        // not a new one, and a future relaxation should change both together.
+        db.register_host_function("plus1", 1, |a| match a {
+            [Value::Int(x)] => Ok(Value::Int(x + 1)),
+            _ => Err(Error::Unsupported("plus1 wants one int".into())),
+        });
+        assert!(db.query("SELECT mysum(id) + 1 FROM users", &[]).is_err());
+        assert!(db.query("SELECT plus1(id) + 1 FROM users", &[]).is_err());
+        // Both are fine on their own, and a host scalar INSIDE a host
+        // aggregate's argument composes (two registries, one execution).
+        assert_eq!(
+            ints(db.query("SELECT mysum(plus1(id)) FROM users", &[]).unwrap()),
+            vec![14_000]
+        );
+
+        // Plan-sharing bypass, exactly as for a host scalar: a fresh handle to
+        // the same file cannot execute the plan by hash.
+        let hash = db.prepare("SELECT mysum(id) FROM users").unwrap();
+        let db2 = Database::open_from_file(_g.0.as_path()).unwrap();
+        assert!(matches!(db2.execute(&hash, &[]), Err(Error::UnknownPlan(_))));
+        assert_eq!(ints(db.execute(&hash, &[]).unwrap()), vec![10_000]);
+
+        // A built-in name can never be shadowed by a registration.
+        db.register_host_aggregate("sum", 1, || Box::<MySum>::default());
+        assert_eq!(ints(db.query("SELECT sum(id) FROM users", &[]).unwrap()), vec![10]);
+
+        // Unregister → unknown again.
+        assert!(db.unregister_host_aggregate("mysum", 1));
+        assert!(db.query("SELECT mysum(id) FROM users", &[]).is_err());
     }
 
     struct FileGuard(PathBuf);

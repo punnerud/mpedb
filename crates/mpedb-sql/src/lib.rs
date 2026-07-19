@@ -119,7 +119,12 @@ pub fn prepare_maybe_explain_with_views(
     // function resolution is exactly as before. Threaded alongside `compat`.
     host_udfs: &HostUdfSet,
 ) -> Result<(CompiledPlan, bool)> {
-    let (mut stmt, is_explain, n_params, ctes) = parser::parse_statement_ctes(sql)?;
+    // The HOST AGGREGATE registrations reach the PARSER, not just the binder:
+    // `myagg(DISTINCT x) FILTER (WHERE …)` is aggregate grammar, and the branch
+    // has to be chosen before the argument list is read (design/DESIGN-UDF.md
+    // stage 2). Host SCALARS still resolve in the binder, unchanged.
+    let (mut stmt, is_explain, n_params, ctes) =
+        parser::parse_statement_ctes(sql, host_udfs.aggs())?;
     // A `WITH` CTE is a statement-scoped named view. Pass the CTE bodies to
     // `inline_views` in a SECOND catalog kept distinct from the persistent views,
     // so a `FROM cte` reference is spliced by the keep-alias machinery (`cte.col`

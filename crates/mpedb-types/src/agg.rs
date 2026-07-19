@@ -24,6 +24,35 @@
 use crate::{AggFn, Error, Result, Value};
 use std::collections::BTreeSet;
 
+/// One HOST aggregate's running state over ONE group (the C-API `xStep`/
+/// `xFinal` path, design/DESIGN-UDF.md stage 2). The engine creates one per
+/// group, feeds it every surviving row, and consumes it once.
+///
+/// The NULL rule here is deliberately the OPPOSITE of [`Accum`]'s: a built-in
+/// aggregate skips NULL inputs, but sqlite hands a user aggregate every row
+/// including NULL arguments and lets `xStep` decide. Django's `StdDevPop.step`
+/// relies on exactly that.
+pub trait HostAggState {
+    /// Feed one row's already-evaluated arguments.
+    fn step(&mut self, args: &[Value]) -> Result<()>;
+    /// The group's result. Consumes the state (`xFinal` runs once and the
+    /// aggregate context is freed straight after), so it takes `Box<Self>` to
+    /// stay object-safe.
+    fn finish(self: Box<Self>) -> Result<Value>;
+}
+
+/// Resolve a HOST-registered aggregate by name at exec time, mirroring
+/// [`HostFns`](crate::HostFns) for scalars. Implemented by the facade over its
+/// per-connection registry; `None` is threaded wherever no host aggregate can be
+/// in scope, so the mechanism stays inert for every existing plan.
+pub trait HostAggs {
+    /// Start a fresh accumulation of `name` over `argc` arguments. An `Error`
+    /// when nothing of that name/arity is registered — defensive; the binder
+    /// already checked, but a registration can change between compile and
+    /// execute.
+    fn create(&self, name: &str, argc: i32) -> Result<Box<dyn HostAggState>>;
+}
+
 /// Running state for one aggregate over one group.
 #[derive(Debug, Clone)]
 pub struct Accum {
