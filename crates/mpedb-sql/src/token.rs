@@ -32,6 +32,11 @@ pub(crate) enum Tok {
     Ge,
     Plus,
     Minus,
+    /// `->` — sqlite's JSON operator returning the selected node's JSON TEXT.
+    Arrow,
+    /// `->>` — sqlite's JSON operator returning the selected node as a SQL
+    /// value. Lexed BEFORE `->`; see the `-` arm of the scanner.
+    ArrowText,
     Star,
     Slash,
     Percent,
@@ -209,10 +214,23 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
                 i += 1;
                 Tok::Plus
             }
-            b'-' => {
-                i += 1;
-                Tok::Minus
-            }
+            // `-` also opens the two JSON operators. `->>` MUST be tested
+            // before `->`, or `a ->> '$.x'` lexes as `a -> (> '$.x')` and the
+            // SQL-text form silently becomes the JSON-text one.
+            b'-' => match (b.get(i + 1), b.get(i + 2)) {
+                (Some(b'>'), Some(b'>')) => {
+                    i += 3;
+                    Tok::ArrowText
+                }
+                (Some(b'>'), _) => {
+                    i += 2;
+                    Tok::Arrow
+                }
+                _ => {
+                    i += 1;
+                    Tok::Minus
+                }
+            },
             b'*' => {
                 i += 1;
                 Tok::Star
@@ -561,6 +579,42 @@ mod tests {
                 Tok::Slash,
                 Tok::Percent
             ]
+        );
+    }
+
+    /// The whole `>`/`>=`/`->`/`->>`/`-` family in one line, in an order that
+    /// would expose a maximal-munch mistake: a scanner that tried `->` before
+    /// `->>` turns `a ->> p` into `a -> (> p)`, which still PARSES (a
+    /// comparison as the right operand) and silently returns JSON text where
+    /// SQL text was asked for.
+    #[test]
+    fn json_arrows_vs_greater_than() {
+        assert_eq!(
+            toks("> >= -> ->> - >-> ->>>"),
+            vec![
+                Tok::Gt,
+                Tok::Ge,
+                Tok::Arrow,
+                Tok::ArrowText,
+                Tok::Minus,
+                Tok::Gt,
+                Tok::Arrow,
+                Tok::ArrowText,
+                Tok::Gt,
+            ]
+        );
+        // No whitespace anywhere: `a->>'$.b'` is how every ORM writes it.
+        assert_eq!(
+            toks("a->>'$.b'"),
+            vec![
+                Tok::Ident("a".into()),
+                Tok::ArrowText,
+                Tok::Str("$.b".into()),
+            ]
+        );
+        assert_eq!(
+            toks("a-1"),
+            vec![Tok::Ident("a".into()), Tok::Minus, Tok::Int(1)]
         );
     }
 

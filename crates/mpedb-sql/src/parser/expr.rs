@@ -306,12 +306,30 @@ impl<'a> Parser<'a> {
     }
 
     fn mul_expr(&mut self) -> Result<Expr> {
-        let mut e = self.unary_expr()?;
+        let mut e = self.json_expr()?;
         loop {
             let op = match self.peek() {
                 Some(Tok::Star) => BinOp::Mul,
                 Some(Tok::Slash) => BinOp::Div,
                 Some(Tok::Percent) => BinOp::Mod,
+                _ => break,
+            };
+            self.pos += 1;
+            let r = self.json_expr()?;
+            e = Expr::Binary(op, Box::new(e), Box::new(r));
+        }
+        Ok(e)
+    }
+
+    /// `a -> b`, `a ->> b` — sqlite's JSON accessors. Its own tier, tighter
+    /// than `*`, because that is where sqlite puts them, and left-associative
+    /// so `doc -> '$.a' -> '$.b'` walks two levels (verified against 3.45.1).
+    fn json_expr(&mut self) -> Result<Expr> {
+        let mut e = self.unary_expr()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::Arrow) => BinOp::JsonArrow,
+                Some(Tok::ArrowText) => BinOp::JsonArrowText,
                 _ => break,
             };
             self.pos += 1;
