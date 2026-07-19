@@ -254,36 +254,32 @@ fn run_overlay(
 /// `--overlay`: the v2 delta overlay's checkpoint (design §5).
 pub fn checkpoint(args: &[String]) -> CliResult {
     let mut args: Vec<String> = args.to_vec();
-    let overlay = if let Some(i) = args.iter().position(|a| a == "--overlay") {
-        args.remove(i);
-        true
-    } else {
-        false
-    };
+    let force_overlay = pop_flag(&mut args, &["--overlay"]);
+    let force_mirror = pop_flag(&mut args, &["--mirror", "--sidecar"]);
     let [path] = &args[..] else {
         return usage("checkpoint needs <sqlite.db> (the base file, not the sidecar)");
     };
-    if overlay {
-        let p = Path::new(path);
-        if !is_sqlite(p) {
-            return runtime(format!("{path} is not a sqlite database"));
-        }
-        let mut ovl = mpedb::SqliteOverlay::open(p)?;
-        let r = ovl.checkpoint()?;
+    let p = Path::new(path);
+    if !is_sqlite(p) {
+        return runtime(format!("{path} is not a sqlite database"));
+    }
+    let side = sidecar(p); // <db>.mpedb (v0 full sidecar)
+    let ovl = overlay_file(p); // <db>.overlay.mpedb (default delta overlay)
+    // Match the OPEN default: fold the OVERLAY delta unless a `--mirror` sidecar
+    // is what exists (or was asked for). `--overlay` forces the overlay.
+    let use_overlay = force_overlay || (!force_mirror && (ovl.exists() || !side.exists()));
+    if use_overlay {
+        let mut o = mpedb::SqliteOverlay::open(p)?;
+        let r = o.checkpoint()?;
         println!(
             "checkpoint: epoch {} pushed ({} upserts, {} deletes), overlay emptied",
             r.epoch, r.upserts, r.deletes
         );
         return Ok(());
     }
-    let p = Path::new(path);
-    if !is_sqlite(p) {
-        return runtime(format!("{path} is not a sqlite database"));
-    }
-    let side = sidecar(p);
     if !side.exists() {
         return runtime(format!(
-            "no sidecar {} — open the database first (`mpedb {path}`)",
+            "no sidecar {} — open the database first (`mpedb {path} --mirror`)",
             side.display()
         ));
     }
@@ -294,6 +290,25 @@ pub fn checkpoint(args: &[String]) -> CliResult {
         "--db",
         side.to_str().expect("utf-8 path"),
     ]))
+}
+
+/// Remove the first occurrence of any of `names` from `args`; returns whether
+/// one was present.
+fn pop_flag(args: &mut Vec<String>, names: &[&str]) -> bool {
+    if let Some(i) = args.iter().position(|a| names.contains(&a.as_str())) {
+        args.remove(i);
+        true
+    } else {
+        false
+    }
+}
+
+/// `<base>.overlay.mpedb` — the default delta overlay's file (mirrors
+/// `mpedb::sqlite_overlay::overlay_path`).
+fn overlay_file(base: &Path) -> PathBuf {
+    let mut s = base.as_os_str().to_owned();
+    s.push(".overlay.mpedb");
+    PathBuf::from(s)
 }
 
 /// `mpedb data.db --direct ['SQL' ...]` — read-only, zero-import attach.
