@@ -376,6 +376,17 @@ fn budget_trips_on_runaway_body() {
         other => panic!("{other:?}"),
     }
     d.verify().unwrap();
+
+    // The #101 memory-proportional twin: the HELD materialized set is checked
+    // against `max_join_cells`, attributed to the derived table by name.
+    let d = open("[runtime]\nmax_join_cells = 10\n\n");
+    let e = d
+        // The LIMIT makes the body non-flattenable, so it materializes.
+        .query("SELECT count(*) FROM (SELECT a, s FROM t LIMIT 100) big", &[])
+        .unwrap_err(); // 6 rows × 2 cells = 12 > 10
+    let msg = e.to_string();
+    assert!(msg.contains("max_join_cells"), "msg should name the knob: {msg}");
+    assert!(msg.contains("derived table"), "msg should attribute the holder: {msg}");
 }
 
 /// The materialized statement round-trips through prepare/execute (the shared
