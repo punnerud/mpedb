@@ -498,13 +498,10 @@ fn decode_compound(buf: &[u8], pos: &mut usize) -> Result<CompoundPlan> {
     let mut order_by = Vec::with_capacity(n_order.min(1024));
     for _ in 0..n_order {
         let c = r_u16(buf, pos)?;
-        let desc = match r_u8(buf, pos)? {
-            0 => false,
-            1 => true,
-            t => return Err(corrupt(format!("bad order direction {t}"))),
-        };
+        let dir = SortDir::from_byte(r_u8(buf, pos)?)
+            .ok_or_else(|| corrupt("bad order direction"))?;
         let coll = r_collation(buf, pos)?;
-        order_by.push((c, desc, coll));
+        order_by.push((c, dir, coll));
     }
     let limit = decode_opt_u64(buf, pos)?;
     let offset = decode_opt_u64(buf, pos)?;
@@ -568,13 +565,10 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
             let mut order_by = Vec::with_capacity(n_order.min(1024));
             for _ in 0..n_order {
                 let c = r_u16(buf, pos)?;
-                let desc = match r_u8(buf, pos)? {
-                    0 => false,
-                    1 => true,
-                    t => return Err(corrupt(format!("bad order direction {t}"))),
-                };
+                let dir = SortDir::from_byte(r_u8(buf, pos)?)
+                    .ok_or_else(|| corrupt("bad order direction"))?;
                 let coll = r_collation(buf, pos)?;
-                order_by.push((c, desc, coll));
+                order_by.push((c, dir, coll));
             }
             let limit = decode_opt_u64(buf, pos)?;
             let offset = decode_opt_u64(buf, pos)?;

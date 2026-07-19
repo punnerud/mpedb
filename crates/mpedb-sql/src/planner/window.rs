@@ -23,7 +23,7 @@ pub(super) fn contains_window(e: &ast::Expr) -> bool {
         E::Window { .. } => true,
         E::Unary(_, a) | E::IsNull(a, _) | E::Cast(a, _) => contains_window(a),
         E::Binary(_, a, b)
-        | E::Like(a, b)
+        | E::Like(a, b, _)
         | E::Match(a, b)
         | E::IsDistinct(a, b, _)
         | E::Glob(a, b, _)
@@ -104,7 +104,7 @@ fn lift_windows(e: &ast::Expr, specs: &mut Vec<WindowCollect>) -> Result<ast::Ex
         E::IsDistinct(a, b, n) => {
             E::IsDistinct(Box::new(rec(a, specs)?), Box::new(rec(b, specs)?), *n)
         }
-        E::Like(a, b) => E::Like(Box::new(rec(a, specs)?), Box::new(rec(b, specs)?)),
+        E::Like(a, b, esc) => E::Like(Box::new(rec(a, specs)?), Box::new(rec(b, specs)?), *esc),
         E::Match(a, b) => E::Match(Box::new(rec(a, specs)?), Box::new(rec(b, specs)?)),
         E::Glob(a, b, n) => E::Glob(Box::new(rec(a, specs)?), Box::new(rec(b, specs)?), *n),
         E::Regexp(a, b, n) => E::Regexp(Box::new(rec(a, specs)?), Box::new(rec(b, specs)?), *n),
@@ -397,9 +397,10 @@ pub(super) fn plan_window_select(
         }
         None => None,
     };
-    let mut rewritten_order: Vec<(ast::Expr, bool)> = Vec::with_capacity(s.order_by.len());
-    for (e, desc) in &s.order_by {
-        rewritten_order.push((lift_windows(e, &mut specs)?, *desc));
+    let mut rewritten_order: Vec<(ast::Expr, crate::plan::SortDir)> =
+        Vec::with_capacity(s.order_by.len());
+    for (e, dir) in &s.order_by {
+        rewritten_order.push((lift_windows(e, &mut specs)?, *dir));
     }
     if specs.is_empty() {
         return Err(bind_err("internal: window planner reached with no window function"));

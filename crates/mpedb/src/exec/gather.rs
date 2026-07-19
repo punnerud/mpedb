@@ -461,7 +461,7 @@ pub(super) fn gather_topk(
     filter: Option<&ExprProgram>,
     plan: &CompiledPlan,
     params: &[Value],
-    order_by: &[(u16, bool, Collation)],
+    order_by: &[(u16, SortDir, Collation)],
     keep: usize,
 ) -> Result<Vec<Vec<Value>>> {
     match access {
@@ -498,27 +498,51 @@ pub(super) fn gather_topk(
     }
 }
 
-pub(super) fn sort_rows(rows: &mut [Vec<Value>], order_by: &[(u16, bool, Collation)]) {
+pub(super) fn sort_rows(rows: &mut [Vec<Value>], order_by: &[(u16, SortDir, Collation)]) {
     rows.sort_by(|a, b| cmp_rows(a, b, order_by));
 }
 
 /// Total sort order over two rows for an `ORDER BY` spec (column index,
-/// descending flag, collation), NULLS FIRST ascending. Shared by [`sort_rows`]
-/// and the streaming top-K heap. The [`Collation`] is applied to text keys and
-/// is [`Collation::Binary`] (bytewise) for a plain `ORDER BY`.
-pub(super) fn cmp_rows(a: &[Value], b: &[Value], order_by: &[(u16, bool, Collation)]) -> Ordering {
-    for &(col, desc, coll) in order_by {
+/// direction + NULL placement, collation). Shared by [`sort_rows`] and the
+/// streaming top-K heap. The [`Collation`] is applied to text keys and is
+/// [`Collation::Binary`] (bytewise) for a plain `ORDER BY`.
+///
+/// The NULL placement is decided BEFORE the direction is applied, and is NOT
+/// reversed by `DESC`: `NULLS FIRST` means first in the delivered order either
+/// way. That is the whole content of the explicit clause — sqlite's DEFAULTS
+/// (first for ASC, last for DESC) are what `SortDir::dir` already resolved to,
+/// so a plain `ORDER BY x` and a plain `ORDER BY x DESC` come out here exactly
+/// as they did before the clause existed.
+pub(super) fn cmp_rows(
+    a: &[Value],
+    b: &[Value],
+    order_by: &[(u16, SortDir, Collation)],
+) -> Ordering {
+    for &(col, dir, coll) in order_by {
         let (Some(x), Some(y)) = (a.get(col as usize), b.get(col as usize)) else {
             continue;
         };
+        match (x.is_null(), y.is_null()) {
+            // Two NULLs are peers on this key; fall through to the next one.
+            (true, true) => continue,
+            (true, false) => {
+                return if dir.nulls_first { Ordering::Less } else { Ordering::Greater }
+            }
+            (false, true) => {
+                return if dir.nulls_first { Ordering::Greater } else { Ordering::Less }
+            }
+            (false, false) => {}
+        }
         let ord = cmp_order(x, y, coll);
         if ord != Ordering::Equal {
-            return if desc { ord.reverse() } else { ord };
+            return if dir.desc { ord.reverse() } else { ord };
         }
     }
     Ordering::Equal
 }
 
+/// Order two NON-NULL values (the NULL cases are settled by the caller's
+/// placement rule before this is reached).
 fn cmp_order(a: &Value, b: &Value, coll: Collation) -> Ordering {
     // `sort_cmp`, not `sql_cmp`: an `any` column really can hold a number AND a
     // string, and sqlite orders those by storage class (NULL < numbers < text <
@@ -527,11 +551,8 @@ fn cmp_order(a: &Value, b: &Value, coll: Collation) -> Ordering {
     // returning rows in an arbitrary sequence.
     match a.sort_cmp(b, coll) {
         Some(ord) => ord,
-        // NULL involved: NULLS FIRST in ascending order.
-        None => match (a.is_null(), b.is_null()) {
-            (true, false) => Ordering::Less,
-            (false, true) => Ordering::Greater,
-            _ => Ordering::Equal,
-        },
+        // A pair `sort_cmp` will not rank even by storage class (mpedb's own
+        // Bool/Timestamp against another class): peers, as before.
+        None => Ordering::Equal,
     }
 }

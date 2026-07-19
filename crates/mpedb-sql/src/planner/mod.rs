@@ -26,9 +26,10 @@ use crate::binder::{
     compile_program, declared_collation, peel_collate, BExpr, Binder, HostUdfSet, Scope, Ty,
 };
 
-/// Resolved ORDER BY keys: `(column index into the sorted tuple, descending,
-/// collation)`. The collation is [`Collation::Binary`] for a plain `ORDER BY`.
-pub(crate) type OrderKeys = Vec<(u16, bool, Collation)>;
+/// Resolved ORDER BY keys: `(column index into the sorted tuple, direction +
+/// NULL placement, collation)`. The collation is [`Collation::Binary`] for a
+/// plain `ORDER BY`.
+pub(crate) type OrderKeys = Vec<(u16, crate::plan::SortDir, Collation)>;
 use crate::plan::{
     render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, Frame,
     FrameBound, FrameMode, InsertSource, CompoundPlan, GroupKey, Join, JoinKind, OrderOver,
@@ -860,14 +861,14 @@ fn plan_compound(
             }
         }
     };
-    let mut order_by: Vec<(u16, bool, Collation)> = Vec::with_capacity(c.order_by.len());
-    for (e, desc) in &c.order_by {
+    let mut order_by: OrderKeys = Vec::with_capacity(c.order_by.len());
+    for (e, dir) in &c.order_by {
         // Peel an explicit `COLLATE` off the term; the inner expression resolves
         // to an output column/ordinal as before, and the collation rides the sort.
         let (e, coll) = peel_collate(e)?;
         let coll = coll.unwrap_or_default();
         if let Some(pos) = select::ordinal(e, arity)? {
-            order_by.push((pos, *desc, coll));
+            order_by.push((pos, *dir, coll));
             continue;
         }
         let ast::Expr::Col(n) = e else {
@@ -879,7 +880,7 @@ fn plan_compound(
             out_name(&arms[0], j).is_some_and(|nm| nm.eq_ignore_ascii_case(n))
         });
         match pos {
-            Some(j) => order_by.push((j as u16, *desc, coll)),
+            Some(j) => order_by.push((j as u16, *dir, coll)),
             None => {
                 return Err(bind_err(format!(
                     "ORDER BY `{n}` does not name an output column of the compound's \
@@ -1339,7 +1340,7 @@ fn max_col(e: &BExpr) -> Option<u16> {
         match e {
             BExpr::Col(c) => m = Some(m.map_or(*c, |p| p.max(*c))),
             BExpr::Unary(_, a)
-            | BExpr::Like(a, _, _)
+            | BExpr::Like(a, _, _, _)
             | BExpr::Glob(a, _)
             | BExpr::Regexp(a, _)
             | BExpr::Cast(a, _)

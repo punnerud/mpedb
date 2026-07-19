@@ -10,6 +10,17 @@ fn collate_suffix(coll: Collation) -> String {
     }
 }
 
+/// EXPLAIN suffix for an ORDER BY key's NULL placement: empty when it is the
+/// one the direction implies (sqlite's default: first for ASC, last for DESC),
+/// so every sort written without a `NULLS` clause renders exactly as before.
+fn nulls_suffix(dir: SortDir) -> &'static str {
+    match (dir.default_nulls(), dir.nulls_first) {
+        (true, _) => "",
+        (false, true) => " NULLS FIRST",
+        (false, false) => " NULLS LAST",
+    }
+}
+
 impl CompiledPlan {
     /// Human-readable plan rendering for `EXPLAIN`.
     pub fn explain(&self, schema: &Schema) -> String {
@@ -100,12 +111,13 @@ impl CompiledPlan {
             let items: Vec<String> = c
                 .order_by
                 .iter()
-                .map(|(i, desc, coll)| {
+                .map(|(i, dir, coll)| {
                     format!(
-                        "output#{}{}{}",
+                        "output#{}{}{}{}",
                         i + 1,
                         collate_suffix(*coll),
-                        if *desc { " DESC" } else { " ASC" }
+                        if dir.desc { " DESC" } else { " ASC" },
+                        nulls_suffix(*dir)
                     )
                 })
                 .collect();
@@ -395,12 +407,13 @@ impl CompiledPlan {
                     };
                     let items: Vec<String> = order_by
                         .iter()
-                        .map(|(c, desc, coll)| {
+                        .map(|(c, dir, coll)| {
                             format!(
-                                "{}{}{}",
+                                "{}{}{}{}",
                                 sort_name(*c),
                                 collate_suffix(*coll),
-                                if *desc { " DESC" } else { " ASC" }
+                                if dir.desc { " DESC" } else { " ASC" },
+                                nulls_suffix(*dir)
                             )
                         })
                         .collect();
@@ -851,6 +864,15 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                 let a = pop(&mut st);
                 Item {
                     s: format!("{} LIKE {}", wrap(&a), cst(i)),
+                    atom: false,
+                }
+            }
+            // `LIKE … ESCAPE c`, both dialects — the escape const renders as the
+            // string literal it is, so the EXPLAIN round-trips to the SQL.
+            Instr::LikeEsc(i, e) | Instr::LikeCsEsc(i, e) => {
+                let a = pop(&mut st);
+                Item {
+                    s: format!("{} LIKE {} ESCAPE {}", wrap(&a), cst(i), cst(e)),
                     atom: false,
                 }
             }

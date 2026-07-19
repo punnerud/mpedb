@@ -8,7 +8,7 @@ pub(super) fn contains_agg(e: &ast::Expr) -> bool {
         E::Agg(..) => true,
         E::Unary(_, a) | E::IsNull(a, _) | E::Cast(a, _) => contains_agg(a),
         E::Binary(_, a, b)
-        | E::Like(a, b)
+        | E::Like(a, b, _)
         | E::Match(a, b)
         | E::IsDistinct(a, b, _)
         | E::Glob(a, b, _)
@@ -142,7 +142,11 @@ fn lift_aggs(
         E::IsDistinct(a, b, n) => {
             E::IsDistinct(Box::new(rec(a, aggs, bare)?), Box::new(rec(b, aggs, bare)?), *n)
         }
-        E::Like(a, b) => E::Like(Box::new(rec(a, aggs, bare)?), Box::new(rec(b, aggs, bare)?)),
+        E::Like(a, b, esc) => E::Like(
+            Box::new(rec(a, aggs, bare)?),
+            Box::new(rec(b, aggs, bare)?),
+            *esc,
+        ),
         E::Match(a, b) => E::Match(Box::new(rec(a, aggs, bare)?), Box::new(rec(b, aggs, bare)?)),
         E::Glob(a, b, n) => {
             E::Glob(Box::new(rec(a, aggs, bare)?), Box::new(rec(b, aggs, bare)?), *n)

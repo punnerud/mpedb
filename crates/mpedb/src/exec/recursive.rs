@@ -256,7 +256,7 @@ impl TxnCtx for WorkingTableCtx<'_, '_> {
         lo: Option<(&[u8], bool)>,
         hi: Option<(&[u8], bool)>,
         filter: Option<(&ExprProgram, &[Value])>,
-        order_by: &[(u16, bool, Collation)],
+        order_by: &[(u16, SortDir, Collation)],
         keep: usize,
     ) -> Result<Vec<Vec<Value>>> {
         if table == CTE_TABLE {
