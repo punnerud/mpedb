@@ -944,9 +944,24 @@ impl<'a> Parser<'a> {
                     self.expect(&Tok::RParen, "`)` after subquery")?;
                     return Ok(Expr::Subquery(Box::new(inner)));
                 }
-                let e = self.expr()?;
+                let first = self.expr()?;
+                // A comma here makes this a ROW VALUE (tuple): `(e1, e2, …)` with
+                // ≥2 elements — the operand of a row-value comparison
+                // `(a, b) = (c, d)` / `< <= > >=` (keyset pagination). A single
+                // `(expr)` stays plain grouping. This does NOT affect `(SELECT …)`
+                // (handled above), function-call argument lists, `IN (…)` lists,
+                // or `VALUES (…)` — each of those consumes its own `(` elsewhere
+                // and never reaches this atom-level paren.
+                if self.peek() == Some(&Tok::Comma) {
+                    let mut items = vec![first];
+                    while self.eat(&Tok::Comma) {
+                        items.push(self.expr()?);
+                    }
+                    self.expect(&Tok::RParen, "`)` closing a row value")?;
+                    return Ok(Expr::RowValue(items));
+                }
                 self.expect(&Tok::RParen, "`)`")?;
-                Ok(e)
+                Ok(first)
             }
             _ => Err(Error::Parse {
                 pos,

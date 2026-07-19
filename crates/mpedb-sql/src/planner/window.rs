@@ -32,7 +32,7 @@ pub(super) fn contains_window(e: &ast::Expr) -> bool {
         E::Collate(a, _) => contains_window(a),
         E::InSubquery(a, _, _) | E::InParamSlot(a, _, _) => contains_window(a),
         E::InList(a, xs, _) => contains_window(a) || xs.iter().any(contains_window),
-        E::Coalesce(xs) | E::Func(_, xs) => xs.iter().any(contains_window),
+        E::Coalesce(xs) | E::Func(_, xs) | E::RowValue(xs) => xs.iter().any(contains_window),
         E::Case(arms, els) => {
             arms.iter().any(|(c, r)| contains_window(c) || contains_window(r))
                 || els.as_deref().is_some_and(contains_window)
@@ -122,6 +122,7 @@ fn lift_windows(e: &ast::Expr, specs: &mut Vec<WindowCollect>) -> Result<ast::Ex
             f.clone(),
             xs.iter().map(|x| rec(x, specs)).collect::<Result<_>>()?,
         ),
+        E::RowValue(xs) => E::RowValue(xs.iter().map(|x| rec(x, specs)).collect::<Result<_>>()?),
         E::Case(arms, els) => E::Case(
             arms.iter()
                 .map(|(c, r)| Ok((rec(c, specs)?, rec(r, specs)?)))

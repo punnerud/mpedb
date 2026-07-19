@@ -916,6 +916,12 @@ impl<'a> Binder<'a> {
                      (e.g. `x = y COLLATE NOCASE`) or an ORDER BY term",
                 ))
             }
+            // A row value is not a scalar: it is legal ONLY as a direct operand
+            // of a comparison, which `bind_binary` intercepts BEFORE reaching
+            // here. Anything else — a SELECT-list item, an arithmetic operand, a
+            // function argument, an IN probe/element — is a misuse, exactly as
+            // sqlite reports it.
+            ast::Expr::RowValue(_) => Err(bind_err("row value misused")),
         }
     }
 
@@ -929,6 +935,16 @@ impl<'a> Binder<'a> {
             op,
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
         );
+        // Row-value (tuple) comparison — `(a, …) OP (b, …)` with a parenthesized
+        // list of ≥2 expressions on at least one side. Desugars to scalar boolean
+        // logic (see `bind_row_value_cmp`); NO plan/format change. Intercepted
+        // before the operand bind below so the row values do not hit the
+        // "row value misused" arm.
+        if is_cmp
+            && (matches!(l, ast::Expr::RowValue(_)) || matches!(r, ast::Expr::RowValue(_)))
+        {
+            return self.bind_row_value_cmp(op, l, r);
+        }
         let (l_ast, l_coll, r_ast, r_coll) = if is_cmp {
             let (la, lc) = peel_collate(l)?;
             let (ra, rc) = peel_collate(r)?;
@@ -1011,6 +1027,115 @@ impl<'a> Binder<'a> {
                 let e = fold_maybe(BExpr::Binary(op, Box::new(l), Box::new(r)), self.suppress_fold)?;
                 Ok((e, ty))
             }
+        }
+    }
+
+    /// Bind a ROW-VALUE (tuple) comparison `(a1,…,an) OP (b1,…,bn)`. Both sides
+    /// must be explicit row values of EQUAL arity; the comparison desugars to
+    /// ordinary scalar boolean logic (see [`Self::desugar_row_cmp`]) which is
+    /// provably NULL-correct 3VL and matches sqlite bit-for-bit — there is no
+    /// plan/format change. Every other shape is refused as a clean bind error
+    /// (never a wrong answer): a row value against a scalar, a subquery RHS, or
+    /// an arity mismatch.
+    fn bind_row_value_cmp(&mut self, op: BinOp, l: &ast::Expr, r: &ast::Expr) -> Result<(BExpr, Ty)> {
+        use ast::Expr as E;
+        let (lhs, rhs) = match (l, r) {
+            (E::RowValue(a), E::RowValue(b)) => (a, b),
+            // `(a, b) = (SELECT …)` — a row value against a subquery. Deferred by
+            // name. (In a plain SELECT the scalar-subquery lift runs before the
+            // binder, so the subquery arrives here only from a CHECK / policy /
+            // trigger expression, which is not lifted; a single-column subquery
+            // in a plain SELECT is lifted to a scalar param and lands in the
+            // "row value misused" arm below, which is likewise a clean refusal.)
+            (E::RowValue(_), E::Subquery(_))
+            | (E::Subquery(_), E::RowValue(_))
+            | (E::RowValue(_), E::InSubquery(..))
+            | (E::InSubquery(..), E::RowValue(_)) => {
+                return Err(bind_err(
+                    "a row value compared against a subquery is not supported",
+                ));
+            }
+            // A row value against a scalar (or vice versa) — sqlite: "row value
+            // misused".
+            _ => return Err(bind_err("row value misused")),
+        };
+        if lhs.len() != rhs.len() {
+            return Err(bind_err(format!(
+                "row values have an unequal number of columns: left has {}, right has {}",
+                lhs.len(),
+                rhs.len()
+            )));
+        }
+        // The parser only ever builds a RowValue with ≥2 elements; be defensive
+        // rather than index out of range if that ever changes.
+        if lhs.is_empty() {
+            return Err(bind_err("row value misused"));
+        }
+        let desugared = Self::desugar_row_cmp(op, lhs, rhs);
+        // Bind the desugared scalar expression through the ordinary path: each
+        // element pair binds exactly like the corresponding scalar comparison
+        // (same type unification, coercions, collation precedence and folding),
+        // and the And/Or/Not combinators fold bottom-up — so the result is a
+        // fully constant-folded `BExpr` typed `Bool`, with no new node kind.
+        self.bind_expr(&desugared)
+    }
+
+    /// Desugar `(a1,…,an) OP (b1,…,bn)` (equal arity ≥ 1) into the scalar boolean
+    /// expression sqlite uses — provably NULL-correct 3VL:
+    ///
+    /// - `=`  → `a1=b1 AND … AND an=bn`
+    /// - `<>` → `NOT (a1=b1 AND … AND an=bn)`
+    /// - `<`  → `a1<b1 OR (a1=b1 AND (a2<b2 OR (a2=b2 AND (… AND an<bn))))`
+    ///   (right-nested, lexicographic).
+    /// - `<=` / `>` / `>=` — the same lexicographic shape; only the operator
+    ///   differs: a STRICT `<`/`>` at every non-last level, and the base operator
+    ///   `<`/`<=`/`>`/`>=` at the LAST element.
+    ///
+    /// Building an `ast::Expr` (rather than a `BExpr`) and re-binding it is what
+    /// makes each element pair reuse the scalar comparison binding verbatim.
+    fn desugar_row_cmp(op: BinOp, a: &[ast::Expr], b: &[ast::Expr]) -> ast::Expr {
+        use ast::Expr as E;
+        let cmp = |i: usize, o: BinOp| -> E {
+            E::Binary(o, Box::new(a[i].clone()), Box::new(b[i].clone()))
+        };
+        let eq = |i: usize| cmp(i, BinOp::Eq);
+        let n = a.len();
+        match op {
+            BinOp::Eq | BinOp::Ne => {
+                // Conjunction of element equalities; `<>` negates the whole.
+                let mut acc = eq(0);
+                for i in 1..n {
+                    acc = E::Binary(BinOp::And, Box::new(acc), Box::new(eq(i)));
+                }
+                if op == BinOp::Ne {
+                    E::Unary(ast::UnOp::Not, Box::new(acc))
+                } else {
+                    acc
+                }
+            }
+            // The four ordering operators share one right-nested recursion; the
+            // strict per-level operator and the base (last-element) operator are
+            // the only difference between them.
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
+                let (strict, last) = match op {
+                    BinOp::Lt => (BinOp::Lt, BinOp::Lt),
+                    BinOp::Le => (BinOp::Lt, BinOp::Le),
+                    BinOp::Gt => (BinOp::Gt, BinOp::Gt),
+                    BinOp::Ge => (BinOp::Gt, BinOp::Ge),
+                    _ => unreachable!(),
+                };
+                // Build from the last element back to the first.
+                let mut acc = cmp(n - 1, last);
+                for i in (0..n - 1).rev() {
+                    // a_i strict b_i OR (a_i = b_i AND acc)
+                    let tail = E::Binary(BinOp::And, Box::new(eq(i)), Box::new(acc));
+                    acc = E::Binary(BinOp::Or, Box::new(cmp(i, strict)), Box::new(tail));
+                }
+                acc
+            }
+            // Not reachable: `bind_row_value_cmp` is only called for the six
+            // comparison operators.
+            _ => unreachable!("desugar_row_cmp called with a non-comparison operator"),
         }
     }
 
