@@ -818,6 +818,16 @@ impl CompiledPlan {
                 }
                 None
             }
+            // A compound's arm subplans are UNCORRELATED (the arm executor has
+            // no per-row fill phase), filled once before dispatch — same shape
+            // as a write statement's. The slot discipline is then vacuous: no
+            // correlated slot exists to leak into a gather-side program.
+            PlanStmt::Compound(_) => {
+                if self.subplans.iter().any(|s| !s.outer_args.is_empty()) {
+                    return Err(corrupt("correlated subplan on a compound SELECT"));
+                }
+                None
+            }
             _ => return Err(corrupt("subplans on a non-SELECT statement")),
         };
         if self.subplans.len() > MAX_SUBPLANS {
@@ -1006,10 +1016,18 @@ impl CompiledPlan {
         }
         *budget -= 1;
 
-        // `sub_base` locates the children slots; it must be exactly the level's
-        // param prefix plus this subplan's own correlation args, or the executor
-        // would fill children into the wrong indices.
-        if s.sub_base as usize != base_ptypes.len() + s.outer_args.len() {
+        // `sub_base` locates the children slots: the level's param prefix, plus
+        // — for a subplan lifted from a LATER compound arm (format 49) — the
+        // reserved-slot GAP of the preceding arms' subplans (those slots exist
+        // in the statement layout but are invisible to this arm's inner, which
+        // never reads them; the executor pads them NULL), plus this subplan's
+        // own correlation args. A prefix below the level's width would make the
+        // executor fill children over live slots; a gap above `MAX_SUBPLANS`
+        // has no honest producer and would only inflate the pad allocation.
+        let prefix = (s.sub_base as usize)
+            .checked_sub(s.outer_args.len())
+            .ok_or_else(|| corrupt("subplan sub_base inconsistent with its correlation args"))?;
+        if prefix < base_ptypes.len() || prefix - base_ptypes.len() > MAX_SUBPLANS {
             return Err(corrupt("subplan sub_base inconsistent with its correlation args"));
         }
         for &a in &s.outer_args {
@@ -1028,11 +1046,14 @@ impl CompiledPlan {
         if s.kind != SubPlanKind::Exists && s.body.output_arity() != 1 {
             return Err(corrupt("scalar subplan must output exactly one column"));
         }
-        // The inner parameter space: base ‖ this subplan's correlation ‖ its
-        // children results. A correlation slot has the OUTER column's type; a
-        // child result slot carries the child's declared `slot_type` (so a child
-        // used as a key part still type-checks).
+        // The inner parameter space: base ‖ (compound-arm gap, untyped — the
+        // inner never reads those slots and the executor pads them NULL) ‖ this
+        // subplan's correlation ‖ its children results. A correlation slot has
+        // the OUTER column's type; a child result slot carries the child's
+        // declared `slot_type` (so a child used as a key part still
+        // type-checks).
         let mut inner_types: Vec<Option<ColumnType>> = base_ptypes.to_vec();
+        inner_types.resize(prefix, None);
         inner_types.extend(s.outer_args.iter().map(|&a| Some(parent_outer_types[a as usize])));
         // (`inner_types.len()` is now `s.sub_base`.)
         for c in &s.subplans {

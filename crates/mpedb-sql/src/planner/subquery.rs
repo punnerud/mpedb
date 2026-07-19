@@ -423,11 +423,15 @@ impl Lift<'_> {
                 "current_setting() inside a subquery is not supported yet",
             ));
         }
-        // `plan_compound` already refuses a subquery inside a compound arm, so a
-        // compound body never carries nested lifts — but assert the invariant the
-        // format-31 subplan relies on rather than trust it silently.
+        // A top-level compound may now carry (uncorrelated) arm subplans, but a
+        // compound in a SUBQUERY position may not: its arms' slots were numbered
+        // against THIS statement's user params and would collide with the outer
+        // lift's own reserved slots. Refuse by name — the format-31 subplan
+        // shape (no nested lifts under a compound body) is unchanged.
         if !subs.is_empty() {
-            return Err(Error::Internal("compound subquery body carried nested lifts".into()));
+            return Err(bind_err(
+                "a subquery inside a compound subquery body is not supported yet",
+            ));
         }
         let PlanStmt::Compound(mut cp) = stmt else {
             return Err(Error::Internal("compound body planned to a non-compound".into()));
