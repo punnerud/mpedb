@@ -129,13 +129,15 @@ pub(super) fn rewrite_right_join<'s>(
             let outer_name = s.alias.clone().unwrap_or_else(|| s_table.to_string());
             let (_, ot) = resolve_table_cte(schema, cte, s_table)?;
             let mut items: Vec<(ast::Expr, Option<String>)> = Vec::new();
-            for c in &ot.columns {
+            // VISIBLE columns only — a hidden implicit rowid (#94) is never in a
+            // `SELECT *`, on either side of the swapped chain.
+            for c in ot.visible_columns() {
                 items.push((ast::Expr::Qualified(outer_name.clone(), c.name.clone()), None));
             }
             for j in &s.joins {
                 let (_, jt) = resolve_table_cte(schema, cte, &j.table)?;
                 let jname = j.alias.clone().unwrap_or_else(|| j.table.clone());
-                for c in &jt.columns {
+                for c in jt.visible_columns() {
                     items.push((ast::Expr::Qualified(jname.clone(), c.name.clone()), None));
                 }
             }
@@ -207,6 +209,24 @@ pub(super) fn plan_join_select<'s>(
     let s = if s.items.is_none() && s.joins.iter().any(|j| !j.using.is_empty()) {
         using_star = expand_using_star(s, schema)?;
         &using_star
+    } else {
+        s
+    };
+    // A plain (non-USING) join whose `SELECT *` spans any implicit-rowid table
+    // (#94): expand to the VISIBLE columns as explicit qualified items so no
+    // hidden rowid leaks into the output and the projection / ORDER BY / DISTINCT
+    // below see a normal item list. USING stars were expanded just above (that
+    // path is visible-aware too); a join with NO implicit-rowid table keeps the
+    // `None` fast path unchanged.
+    let implicit_star;
+    let s = if s.items.is_none() {
+        match expand_join_star_visible(s, schema, cte)? {
+            Some(exp) => {
+                implicit_star = exp;
+                &implicit_star
+            }
+            None => s,
+        }
     } else {
         s
     };
@@ -703,15 +723,16 @@ fn expand_using_star(s: &ast::SelectStmt, schema: &Schema) -> Result<ast::Select
     let (_, outer) = resolve_table(schema, outer_table)?;
     let outer_name = s.alias.clone().unwrap_or_else(|| outer.name.clone());
     let mut items: Vec<(ast::Expr, Option<String>)> = Vec::new();
-    // The outer table contributes every column — a USING column keeps its
-    // natural position here and is the left side of the coalesce.
-    for c in &outer.columns {
+    // The outer table contributes every VISIBLE column (a hidden implicit rowid
+    // is never in `SELECT *`, #94) — a USING column keeps its natural position
+    // here and is the left side of the coalesce.
+    for c in outer.visible_columns() {
         items.push((ast::Expr::Qualified(outer_name.clone(), c.name.clone()), None));
     }
     for jc in &s.joins {
         let (_, jt) = resolve_table(schema, &jc.table)?;
         let jname = jc.alias.clone().unwrap_or_else(|| jt.name.clone());
-        for c in &jt.columns {
+        for c in jt.visible_columns() {
             // Drop this table's USING columns: they equal the already-emitted
             // left column, so `SELECT *` shows the join column once.
             if jc.using.iter().any(|u| u == &c.name) {
@@ -721,6 +742,35 @@ fn expand_using_star(s: &ast::SelectStmt, schema: &Schema) -> Result<ast::Select
         }
     }
     Ok(ast::SelectStmt { items: Some(items), ..s.clone() })
+}
+
+/// `SELECT *` over a plain (non-USING) join that spans at least one
+/// implicit-rowid table (#94): expand the star into explicit qualified items of
+/// the VISIBLE columns, in table order. Returns `None` when no joined table has
+/// a hidden rowid, so an all-explicit-PK join keeps the untouched `None` fast
+/// path and its behavior is unchanged.
+fn expand_join_star_visible(
+    s: &ast::SelectStmt,
+    schema: &Schema,
+    cte: Option<CteRef<'_>>,
+) -> Result<Option<ast::SelectStmt>> {
+    let outer_table = s.table.as_deref().expect("join on a FROM-less SELECT");
+    let (_, outer) = resolve_table_cte(schema, cte, outer_table)?;
+    let outer_name = s.alias.clone().unwrap_or_else(|| outer.name.clone());
+    let mut any_hidden = outer.implicit_rowid;
+    let mut items: Vec<(ast::Expr, Option<String>)> = Vec::new();
+    for c in outer.visible_columns() {
+        items.push((ast::Expr::Qualified(outer_name.clone(), c.name.clone()), None));
+    }
+    for jc in &s.joins {
+        let (_, jt) = resolve_table_cte(schema, cte, &jc.table)?;
+        any_hidden |= jt.implicit_rowid;
+        let jname = jc.alias.clone().unwrap_or_else(|| jc.table.clone());
+        for c in jt.visible_columns() {
+            items.push((ast::Expr::Qualified(jname.clone(), c.name.clone()), None));
+        }
+    }
+    Ok(any_hidden.then(|| ast::SelectStmt { items: Some(items), ..s.clone() }))
 }
 
 /// Name a joined-tuple slot for EXPLAIN and output columns: `<table>.<column>`,

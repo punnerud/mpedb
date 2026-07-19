@@ -176,7 +176,12 @@ impl<'a> Scope<'a> {
     pub fn resolve(&self, name: &str) -> Result<(u16, ColumnType)> {
         let mut found: Option<(u16, ColumnType)> = None;
         for (k, t) in self.tables.iter().enumerate() {
-            if let Some(i) = t.column_index(name) {
+            // A real column wins; only then does an implicit-rowid table's
+            // `rowid`/`_rowid_`/`oid` alias resolve to the hidden column (#94),
+            // matching sqlite's shadowing rule. `column_index` already finds the
+            // literal `rowid` column, so this fallback covers the other spellings
+            // and case variants without changing explicit-PK name resolution.
+            if let Some(i) = t.column_index(name).or_else(|| t.rowid_name_col(name)) {
                 let slot = (self.base(k) + i as usize) as u16;
                 if found.is_some() {
                     return Err(bind_err(format!(
@@ -243,7 +248,7 @@ impl<'a> Scope<'a> {
     pub fn resolve_qualified(&self, qual: &str, name: &str) -> Result<(u16, ColumnType)> {
         for (k, t) in self.tables.iter().enumerate() {
             if self.names[k].eq_ignore_ascii_case(qual) {
-                let i = t.column_index(name).ok_or_else(|| {
+                let i = t.column_index(name).or_else(|| t.rowid_name_col(name)).ok_or_else(|| {
                     bind_err(format!("unknown column `{qual}.{name}`"))
                 })?;
                 return Ok((
@@ -1852,6 +1857,7 @@ mod tests {
             primary_key: vec![0],
             indexes: vec![],
             dead: false,
+            implicit_rowid: false,
             kind: mpedb_types::TableKind::Standard,
         }
     }
@@ -2159,6 +2165,7 @@ mod tests {
             primary_key: vec![0],
             indexes: vec![],
             dead: false,
+            implicit_rowid: false,
             kind: mpedb_types::TableKind::Standard,
         };
         let sc = Scope {
@@ -2200,6 +2207,7 @@ mod tests {
             primary_key: vec![0],
             indexes: vec![],
             dead: false,
+            implicit_rowid: false,
             kind: mpedb_types::TableKind::Standard,
         };
         let sc = Scope {

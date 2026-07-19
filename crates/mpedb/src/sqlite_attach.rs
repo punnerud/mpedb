@@ -144,6 +144,7 @@ impl SqliteAttach {
                         primary_key: vec![ipk as u16],
                         indexes: vec![],
                         dead: false,
+                        implicit_rowid: false,
                         kind: mpedb_types::TableKind::Standard,
                     },
                 )
@@ -185,6 +186,7 @@ impl SqliteAttach {
                         primary_key: vec![i as u16],
                         indexes: vec![],
                         dead: false,
+                        implicit_rowid: false,
                         kind: mpedb_types::TableKind::Standard,
                     },
                 )
@@ -208,6 +210,7 @@ impl SqliteAttach {
                         primary_key: vec![pk as u16],
                         indexes: vec![],
                         dead: false,
+                        implicit_rowid: false,
                         kind: mpedb_types::TableKind::Standard,
                     },
                 )
