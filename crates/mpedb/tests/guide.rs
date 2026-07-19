@@ -254,7 +254,7 @@ fn explain_says_what_it_will_do() {
                 "Select users\n  \
                  access: PkPoint(id = $1)\n  \
                  project: email\n  \
-                 footprint: read_only=true tables_read=0x1 tables_written=0x0 \
+                 footprint: read_only=true tables_read=[0] tables_written=[] \
                  indexes_used=0x1 key=Point",
                 "GUIDE.md's EXPLAIN transcript is stale"
             );

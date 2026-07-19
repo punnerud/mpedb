@@ -291,25 +291,48 @@ fn create_drop_churn_reclaims_pages() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// SLOW (~110 s): 4096 DROP+CREATE cycles, each rewriting a schema record that
+/// grows by one tombstone — the O(n²) tombstone-bloat cost DESIGN-TABLE-CAP §3
+/// names as the thing that actually bounds MAX_TABLES. Run with `--ignored`.
+/// The in-memory equivalent (`schema::tests::create_refuses_at_the_id_ceiling`)
+/// covers the mint refusal and its message on every run.
 #[test]
+#[ignore = "~110 s: burns the whole 4096-id space through real commits"]
 fn create_refuses_after_the_lifetime_id_ceiling() {
     // No-reuse's bounded cost, end to end: DROP+CREATE churn burns one id per
     // cycle, so eventually a CREATE refuses closed (a clean error, never
-    // corruption) rather than mint past the MAX_TABLES (128) id-space ceiling.
-    // This is the deliberate limit; the offline `regenerate` compaction is the
-    // escape hatch. The loop bound stays comfortably above MAX_TABLES so the
-    // ceiling is reached regardless of the exact system-table reserve.
+    // corruption) rather than mint past the MAX_TABLES id-space ceiling. This
+    // is the deliberate limit; the offline `regenerate` compaction is the
+    // escape hatch. The bound is derived from MAX_TABLES (4096 as of
+    // design/DESIGN-TABLE-CAP.md) with slack, so the ceiling is reached
+    // regardless of the exact system-table reserve.
     let (cfg, path) = config("ceiling");
     let db = Database::open_with_config(cfg).unwrap();
-    let mut hit_ceiling = false;
-    for _ in 0..200 {
-        if db.query("CREATE TABLE spin (id INTEGER PRIMARY KEY)", &[]).is_err() {
-            hit_ceiling = true;
-            break;
+    let mut hit_ceiling = None;
+    for cycle in 0..mpedb_types::MAX_TABLES + 64 {
+        match db.query("CREATE TABLE spin (id INTEGER PRIMARY KEY)", &[]) {
+            Ok(_) => {}
+            Err(e) => {
+                hit_ceiling = Some((cycle, e.to_string()));
+                break;
+            }
         }
         db.query("DROP TABLE spin", &[]).unwrap();
     }
-    assert!(hit_ceiling, "id ceiling must eventually refuse a create");
+    let (cycle, msg) = hit_ceiling.expect("id ceiling must eventually refuse a create");
+    // A GOOD error: it names the exhausted resource and the way out, and it is
+    // a schema error rather than a panic or a corruption.
+    assert!(
+        msg.contains("table-id space exhausted") && msg.contains("rebuild"),
+        "unhelpful ceiling error at cycle {cycle}: {msg}"
+    );
+    // The ceiling is the id space, not some smaller accident: churn must have
+    // burned essentially the whole of MAX_TABLES before refusing.
+    assert!(
+        cycle + 16 >= mpedb_types::MAX_TABLES,
+        "refused far too early (cycle {cycle} of {})",
+        mpedb_types::MAX_TABLES
+    );
     // The database is still fully usable after the refusal — the seed table
     // and any survivor work.
     db.query("INSERT INTO users (id, name) VALUES (1, 'ok')", &[]).unwrap();

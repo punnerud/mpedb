@@ -38,7 +38,7 @@ impl CompiledPlan {
             self.render_subplan(s, schema, &mut out, &label);
         }
         out.push_str(&format!(
-            "  footprint: read_only={} tables_read={:#x} tables_written={:#x} indexes_used={:#x} key={}\n",
+            "  footprint: read_only={} tables_read={} tables_written={} indexes_used={:#x} key={}\n",
             self.footprint.read_only,
             self.footprint.tables_read,
             self.footprint.tables_written,

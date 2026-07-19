@@ -121,6 +121,13 @@ So `MAX_TABLES` becomes a **policy number picked for cost**, and the right quest
 - Worst case realistic *live* schema (4088 tables × ~10 columns) ≈ 1.4 MB of schema
   record rewritten per DDL. That is the honest cost of tombstone-in-place at extreme
   scale, and it is proportional to **actual** table count, never to the cap.
+- **Measured**: burning the whole 4096-id space through real DROP+CREATE commits
+  (`drop_table::create_refuses_after_the_lifetime_id_ceiling`) takes ~110 s — i.e.
+  ~27 ms per DDL pair averaged over a record growing from 0 to 4096 tombstones. That
+  is the cost curve, and it is why the test is `#[ignore]`d rather than why the cap
+  is 4096: a workload doing 4096 lifetime creates has already accepted DDL at that
+  scale. If this ever becomes the binding constraint, the answer is the offline
+  `regenerate` id-compaction escape hatch (DESIGN-DROP-TABLE §0), not a smaller cap.
 - Corrupt-input allocation bound: 4096 × `size_of::<TableDef>()` ≈ 0.5 MB, and the
   `min(256)` reserve keeps even that off the table until the bytes are really there.
 

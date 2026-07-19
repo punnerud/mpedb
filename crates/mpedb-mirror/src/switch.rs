@@ -9,7 +9,7 @@
 
 use mpedb::Database;
 use mpedb_core::CaptureConfig;
-use mpedb_types::{Error, Result};
+use mpedb_types::{Error, Result, TableSet};
 
 use crate::adapter::{Cursor, SourceAdapter};
 use crate::apply::apply_batch;
@@ -46,7 +46,7 @@ pub fn set_frozen(db: &Database, frozen: bool) -> Result<()> {
         None => return Err(Error::Unsupported("mirror has no CDC capture record".into())),
     };
     // block exactly the captured (mirrored) tables while frozen
-    cap.blocked = if frozen { cap.captured } else { 0 };
+    cap.blocked = if frozen { cap.captured.clone() } else { TableSet::new() };
     cap.generation = cap.generation.wrapping_add(1);
     s.sys_record_put("cdc", b"tabs", &cap.encode())?;
 
@@ -202,7 +202,7 @@ fn finish_switch_to_source(db: &Database, new_epoch: u64) -> Result<()> {
         .map(|b| CaptureConfig::decode(&b))
         .transpose()?
         .ok_or_else(|| Error::Unsupported("mirror has no CDC record".into()))?;
-    cap.blocked = 0;
+    cap.blocked = TableSet::new();
     cap.generation = cap.generation.wrapping_add(1);
     s.sys_record_put("cdc", b"tabs", &cap.encode())?;
     s.sys_record_put(

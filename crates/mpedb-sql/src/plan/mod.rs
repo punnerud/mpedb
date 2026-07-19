@@ -189,7 +189,8 @@ const MAX_JOINS: usize = 16;
 //     Compound-bodied subplans are UNCORRELATED and carry no nested lifts (a
 //     subquery inside a compound arm is still refused), so every other subplan
 //     field is unchanged — only genuinely-compound bodies differ.
-// 32: table footprint bitmaps widened u64 → u128 (MAX_TABLES 64 → 128). The
+// 32: table footprint bitmaps widened u64 → u128 (MAX_TABLES 64 → 128; retired
+//     by format 41, which drops the bitmap altogether). The
 //     wire layout gained 16 bytes (two u128s where two u64s were); a format-31
 //     reader sees the changed FORMAT byte and re-prepares. No semantic change to
 //     the query path — a wider ceiling, nothing more.
@@ -267,7 +268,19 @@ const MAX_JOINS: usize = 16;
 //     version gates it anyway: a format-40 blob fails CLOSED at byte 0 with the
 //     documented re-prepare. (The same additive gating as every earlier scalar
 //     bump — `hex`/`typeof` at 12, the math family at 26, `printf` at 27.)
-const PLAN_FORMAT: u8 = 41;
+// 42: the footprint's table sets go SPARSE (design/DESIGN-TABLE-CAP.md). Where
+//     `tables_read`/`tables_written` were two fixed 16-byte `u128` bitmaps,
+//     each is now a length-prefixed list of ids (`u16 count ‖ count × u32 LE`),
+//     held strictly ascending so the encoding stays canonical and the plan hash
+//     stays stable. This LIFTS the table-id ceiling out of the plan format
+//     entirely: MAX_TABLES 128 → 4096, and that number is now a cost knob
+//     (tombstone bloat) rather than an integer width. A typical single-table
+//     plan's footprint SHRINKS from 32 bytes to 8. A format-41 reader would
+//     take the u16 count as the low half of the old `tables_read` word and
+//     desync completely, so the whole-plan version gates it: a format-41 blob
+//     fails CLOSED at byte 0 with `PlanInvalidated` (the documented re-prepare
+//     path), never a misread. No semantic change to the query path.
+const PLAN_FORMAT: u8 = 42;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

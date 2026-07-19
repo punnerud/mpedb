@@ -135,7 +135,7 @@ impl TableKind {
 pub struct TableDef {
     /// Stable table id (DESIGN-SCHEMA-V2): explicit in the canonical bytes,
     /// stable for the table's life, allocated lowest-free (always
-    /// `< MAX_TABLES`, which the footprint/CDC bitmaps require). In the
+    /// `< MAX_TABLES`, which footprint/CDC decode re-checks). In the
     /// current format window ids are DENSE 0..n and equal the position in
     /// `Schema::tables` — enforced by `validate`, relaxed only when DROP
     /// TABLE lands with the positional audit (design §6).
@@ -325,11 +325,58 @@ pub struct Schema {
     pub tables: Vec<TableDef>,
 }
 
+/// Maximum length of a table / column / index identifier, in BYTES.
+///
+/// Pure policy: `write_str` length-prefixes with a `u32`, `read_str` bounds at
+/// 1 MiB, and no identifier is ever a component of a btree key. It was 128,
+/// which independently blocked Django's `backends` label — a generated m2m
+/// through-table name comes out at 134 characters (design/DESIGN-TABLE-CAP.md
+/// §7). Bytes, not chars: a non-ASCII name is measured by its UTF-8 length.
+pub const MAX_IDENTIFIER_LEN: usize = 255;
+
+/// What may be a table / column / index name.
+///
+/// This used to be `[A-Za-z_][A-Za-z0-9_]*`, which made mpedb's quoted-identifier
+/// support ornamental: the tokenizer accepts all three spellings (`"x"`, `[x]`,
+/// `` `x` ``, with `""` doubling), and then the schema validator rejected the
+/// only names quoting EXISTS for. `CREATE TABLE "weird tbl"(x INT)` — accepted
+/// by sqlite — failed with `invalid table name`.
+///
+/// The rule is now "anything we can represent faithfully", because everything
+/// downstream can in fact represent it:
+///
+/// - **canonical bytes**: `write_str` is a `u32` length + raw UTF-8. No
+///   constraint beyond valid UTF-8 (which `&str` guarantees) and the length.
+/// - **the keycode ordering**: identifiers are never key components — catalog
+///   keys are `[0x01, table_id BE, index_no BE]`, and the CDC/policy/mirror
+///   sys-keys all use the numeric `table_id`. Nothing sorts a name.
+/// - **the TOML config surface**: a dumped schema is re-readable because
+///   `mpedb-cli`'s `schema_toml` now emits names as escaped TOML basic strings
+///   (it used to interpolate them raw, which is why this had to move with it).
+/// - **SQL text we emit**: the C-API's `sqlite_master.sql` reconstruction now
+///   DOUBLES embedded `"` when quoting, as the mirror's exporters already did.
+///
+/// What is still refused, and why — each is a wrong answer, not a taste:
+///
+/// - **empty** — has no distinct identity in any surface, and the tokenizer
+///   already refuses `""` / `[]` (as sqlite does).
+/// - **control characters** (C0, DEL, C1 — `char::is_control`). `NUL` above all:
+///   the C-API hands names out as NUL-terminated `const char*`
+///   (`sqlite3_column_name`), so an embedded NUL silently TRUNCATES the name a
+///   consumer sees — it would read back as a different identifier. The rest
+///   (newline, CR, tab) would break the line-oriented surfaces that parse our
+///   output — `mpedb dump`, EXPLAIN, the REPL.
+/// - **the `__mpedb` prefix** — reserved for internal objects.
+///
+/// Everything else is allowed and matches sqlite 3.45.1, verified differentially:
+/// spaces (interior, leading and trailing), punctuation including `"`, a leading
+/// digit, non-ASCII/Unicode, and an all-whitespace name. An all-whitespace name
+/// is a footgun but not a hazard — it round-trips byte-exactly through every
+/// encoder above — and refusing it would be a divergence bought with nothing.
 fn valid_identifier(s: &str) -> bool {
     !s.is_empty()
-        && s.len() <= 128
-        && s.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-        && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && s.len() <= MAX_IDENTIFIER_LEN
+        && !s.chars().any(char::is_control)
         && !s.starts_with("__mpedb")
 }
 
@@ -406,8 +453,8 @@ impl Schema {
         // §0 — reuse would require a crash-atomic distributed purge of every
         // persisted `table_id` record, the exact silent-corruption class mpedb
         // exists to prevent; the bounded-limit + offline `regenerate` compaction
-        // is the deliberate trade). Fail closed at the bitmap ceiling
-        // (footprint/CDC index by raw id).
+        // is the deliberate trade). Fail closed at MAX_TABLES — now a cost
+        // bound (tombstone bloat), not a bitmap width (DESIGN-TABLE-CAP).
         if self.tables.len() >= MAX_TABLES {
             return Err(Error::Schema(
                 "table-id space exhausted (MAX_TABLES lifetime creates); rebuild required".into(),
@@ -1026,7 +1073,10 @@ impl Schema {
         if ntables > MAX_TABLES {
             return Err(Error::Corrupt("table count out of range".into()));
         }
-        let mut tables = Vec::with_capacity(ntables);
+        // `.min(256)`: `ntables` comes from untrusted bytes and MAX_TABLES is
+        // now 4096, so reserving it outright would let a corrupt count drive a
+        // half-megabyte speculative allocation before the first field is read.
+        let mut tables = Vec::with_capacity(ntables.min(256));
         for _ in 0..ntables {
             let id = read_u32(buf, &mut pos)?;
             let dead = match *buf.get(pos).ok_or_else(err)? {
@@ -1494,6 +1544,50 @@ mod tests {
     }
 
     #[test]
+    fn identifier_rule_allows_what_quoting_exists_for() {
+        // Everything sqlite 3.45.1 accepts and we can represent faithfully.
+        for good in [
+            "weird tbl",
+            "tbl-with.punct!",
+            "1st table",
+            "tabell_æøå",
+            "a\"b",
+            "  padded  ",
+            "   ", // whitespace-only: a footgun, not a hazard, and sqlite allows it
+            "[bracketish]",
+            "`tick`",
+            &"a".repeat(MAX_IDENTIFIER_LEN),
+            &format!("app_{}", "m".repeat(130)), // 134: Django's m2m through-table
+        ] {
+            assert!(valid_identifier(good), "should be valid: {good:?}");
+            // …and it survives canonical bytes byte-for-byte.
+            let sch = Schema::new(vec![tbl(good)]).unwrap();
+            let back = Schema::from_canonical_bytes(&sch.canonical_bytes()).unwrap();
+            assert_eq!(back.tables[0].name, good);
+            assert_eq!(back, sch);
+        }
+        // What stays refused, and why (see `valid_identifier`).
+        for bad in [
+            "",                              // no identity in any surface
+            "nul\u{0}name",                  // NUL truncates the C-API's const char*
+            "line\nbreak",                   // breaks every line-oriented surface
+            "carriage\rreturn",
+            "tab\tsep",
+            "del\u{7f}",
+            "c1\u{85}",                       // C1 control
+            "__mpedb_internal",              // reserved prefix
+            &"a".repeat(MAX_IDENTIFIER_LEN + 1),
+        ] {
+            assert!(!valid_identifier(bad), "should be invalid: {bad:?}");
+        }
+        // A non-ASCII name is measured in BYTES, not chars: 128 × 2-byte chars
+        // is 256 bytes and over the limit even though it is 128 characters.
+        let wide = "æ".repeat(128);
+        assert_eq!(wide.chars().count(), 128);
+        assert!(!valid_identifier(&wide));
+    }
+
+    #[test]
     fn drop_tombstones_in_place_and_never_reuses_the_id() {
         // Seed {a,b,c} → ids {0,1,2} (name-sorted).
         let s = Schema::new(vec![tbl("a"), tbl("b"), tbl("c")]).unwrap();
@@ -1566,7 +1660,7 @@ mod tests {
     #[test]
     fn create_refuses_at_the_id_ceiling() {
         // Fill to MAX_TABLES with live + dead slots; the next create fails
-        // closed rather than minting id >= 64 (the bitmap ceiling). No-reuse
+        // closed rather than minting id >= MAX_TABLES. No-reuse
         // means DROP+CREATE churn grows `tables.len()` by one per cycle, so a
         // churny workload is what eventually reaches this bound — the
         // deliberate, bounded, detectable limit (§0), with offline `regenerate`
