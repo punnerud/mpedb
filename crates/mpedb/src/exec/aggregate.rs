@@ -241,7 +241,7 @@ pub(super) fn exec_aggregate(
     // collapses case-/space-variants into ONE group (sqlite parity); a computed
     // key is BINARY. Folded before encoding, so `'abc'` and `'ABC'` (NOCASE) hash
     // to the same bucket — the equality half of the column's declared collation.
-    let base_colls = super::base_row_collations(schema, table, joins);
+    let base_colls = super::base_row_collations(schema, plan, table, joins);
     let group_collations: Vec<Collation> = agg
         .group_by
         .iter()

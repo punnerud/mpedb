@@ -60,12 +60,20 @@ use gather::{cmp_rows, gather_joined, gather_rows, gather_topk, sort_rows};
 /// order. GROUP BY and DISTINCT fold their keys through this so a `NOCASE`/`RTRIM`
 /// column groups/deduplicates case-/space-insensitively (the collation is baked
 /// into the schema, so this is derived at execution and always agrees with the
-/// plan's `schema_hash`). `DUAL_TABLE`/`CTE_TABLE` and any out-of-range id
-/// contribute nothing — those slots default to BINARY.
-pub(super) fn base_row_collations(schema: &Schema, table: u32, joins: &[Join]) -> Vec<Collation> {
+/// plan's `schema_hash`). The working-table sentinel (`CTE_TABLE`) resolves
+/// through the plan's own node and contributes one BINARY slot per column —
+/// PADDED, not skipped, so a joined table's collations stay aligned with the
+/// joined row (skipping used to shift a collated join column onto the wrong
+/// slot the day a working table joined a `NOCASE` table).
+pub(super) fn base_row_collations(
+    schema: &Schema,
+    plan: &CompiledPlan,
+    table: u32,
+    joins: &[Join],
+) -> Vec<Collation> {
     let mut out = Vec::new();
     for id in std::iter::once(table).chain(joins.iter().map(|j| j.table)) {
-        if let Some(t) = schema.table(id) {
+        if let Ok(t) = table_def(schema, plan, id) {
             out.extend(t.columns.iter().map(|c| c.collation));
         }
     }
@@ -77,11 +85,12 @@ pub(super) fn base_row_collations(schema: &Schema, table: u32, joins: &[Join]) -
 /// none (BINARY), exactly as in sqlite. Used to fold `SELECT DISTINCT` keys.
 pub(super) fn output_collations(
     schema: &Schema,
+    plan: &CompiledPlan,
     table: u32,
     joins: &[Join],
     projection: &[Projection],
 ) -> Vec<Collation> {
-    let base = base_row_collations(schema, table, joins);
+    let base = base_row_collations(schema, plan, table, joins);
     projection
         .iter()
         .map(|p| match p {
@@ -757,6 +766,7 @@ fn exec_stmt_impl(
         PlanStmt::Select(sp) => exec_select_top(ctx, schema, plan, params, sp),
         PlanStmt::Compound(c) => exec_compound(ctx, schema, plan, params, c),
         PlanStmt::RecursiveCte(rc) => recursive::exec_recursive_cte(ctx, schema, plan, params, rc),
+        PlanStmt::Derived(dp) => recursive::exec_derived(ctx, schema, plan, params, dp),
         _other => exec_stmt_rest(ctx, schema, plan, params, partial, triggers, depth),
     }
 }
@@ -1136,7 +1146,7 @@ fn exec_select(
             // deduplicates case-/space-insensitively (`SELECT DISTINCT name`),
             // sqlite parity. Only built when DISTINCT (else unused).
             let distinct_colls = if *distinct {
-                output_collations(schema, *table, joins, projection)
+                output_collations(schema, plan, *table, joins, projection)
             } else {
                 Vec::new()
             };
@@ -1321,7 +1331,7 @@ fn exec_select_with(
     // uncorrelated path above), so `SELECT DISTINCT name` on a NOCASE column
     // deduplicates case-insensitively.
     let distinct_colls = if *distinct {
-        output_collations(schema, *table, joins, projection)
+        output_collations(schema, plan, *table, joins, projection)
     } else {
         Vec::new()
     };
@@ -1527,7 +1537,10 @@ fn exec_stmt_rest(
     depth: u32,
 ) -> Result<ExecResult> {
     match &plan.stmt {
-        PlanStmt::Select(_) | PlanStmt::Compound(_) | PlanStmt::RecursiveCte(_) => {
+        PlanStmt::Select(_)
+        | PlanStmt::Compound(_)
+        | PlanStmt::RecursiveCte(_)
+        | PlanStmt::Derived(_) => {
             unreachable!("handled by exec_stmt_impl")
         }
         PlanStmt::Insert {
@@ -2441,14 +2454,15 @@ fn table_def<'a>(
     if table == mpedb_sql::DUAL_TABLE {
         return Ok(Cow::Borrowed(mpedb_sql::dual_def()));
     }
-    // The recursive CTE working table resolves to the synthetic def carried by
-    // THIS plan's `RecursiveCte` node — the only meaning `CTE_TABLE` has here.
-    // Owned (built from the plan's columns/types), so it needs no schema entry.
+    // The working table resolves to the synthetic def carried by THIS plan's
+    // node — `RecursiveCte` or `Derived`, the only two meanings `CTE_TABLE` has
+    // here. Owned (built from the plan's columns/types): no schema entry.
     if table == mpedb_sql::CTE_TABLE {
-        if let PlanStmt::RecursiveCte(rc) = &plan.stmt {
-            return Ok(Cow::Owned(rc.cte_def()));
-        }
-        return Err(internal("CTE working table outside a recursive CTE"));
+        return match &plan.stmt {
+            PlanStmt::RecursiveCte(rc) => Ok(Cow::Owned(rc.cte_def())),
+            PlanStmt::Derived(dp) => Ok(Cow::Owned(dp.derived_def())),
+            _ => Err(internal("CTE working table outside a recursive CTE / derived table")),
+        };
     }
     schema
         .table(table)

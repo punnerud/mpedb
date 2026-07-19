@@ -470,6 +470,39 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                 outer,
             }))
         }
+        STMT_DERIVED => {
+            let name = r_str(buf, pos)?;
+            let n_cols = r_u16(buf, pos)? as usize;
+            // A SELECT projects at least one column; capped like any projection
+            // so a forged count cannot balloon the allocation.
+            if n_cols == 0 || n_cols > MAX_COLUMNS {
+                return Err(corrupt("derived-table column count out of range"));
+            }
+            let mut columns = Vec::with_capacity(n_cols.min(1024));
+            let mut col_types = Vec::with_capacity(n_cols.min(1024));
+            for _ in 0..n_cols {
+                columns.push(r_str(buf, pos)?);
+                let tag = r_u8(buf, pos)?;
+                col_types.push(ColumnType::from_tag(tag).ok_or_else(|| {
+                    corrupt(format!("bad derived-table column type tag {tag}"))
+                })?);
+            }
+            // The body under the format-31 body-discriminant byte, then the
+            // outer statement (the mirror of the encoder).
+            let body = match r_u8(buf, pos)? {
+                SUBBODY_SELECT => SubBody::Select(decode_select(buf, pos)?),
+                SUBBODY_COMPOUND => SubBody::Compound(decode_compound(buf, pos)?),
+                t => return Err(corrupt(format!("bad derived-table body tag {t}"))),
+            };
+            let outer = decode_select(buf, pos)?;
+            Ok(PlanStmt::Derived(DerivedPlan {
+                name,
+                columns,
+                col_types,
+                body,
+                outer,
+            }))
+        }
         other => decode_stmt_rest(other, buf, pos),
     }
 }

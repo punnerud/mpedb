@@ -304,6 +304,29 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
             encode_select(&rc.recursive, buf);
             encode_select(&rc.outer, buf);
         }
+        PlanStmt::Derived(dp) => {
+            buf.push(STMT_DERIVED);
+            w_str(buf, &dp.name);
+            // The body's output columns paired with their types (equal length).
+            w_u16(buf, dp.columns.len() as u16);
+            for (name, ty) in dp.columns.iter().zip(&dp.col_types) {
+                w_str(buf, name);
+                buf.push(*ty as u8);
+            }
+            // The body under the format-31 body-discriminant byte, then the
+            // outer statement — mirroring `encode_subplan`'s body framing.
+            match &dp.body {
+                SubBody::Select(sp) => {
+                    buf.push(SUBBODY_SELECT);
+                    encode_select(sp, buf);
+                }
+                SubBody::Compound(c) => {
+                    buf.push(SUBBODY_COMPOUND);
+                    encode_compound(c, buf);
+                }
+            }
+            encode_select(&dp.outer, buf);
+        }
         _other => encode_stmt_rest(stmt, buf),
     }
 }
@@ -520,7 +543,10 @@ fn encode_frame_bound(b: FrameBound, buf: &mut Vec<u8>) {
 
 fn encode_stmt_rest(stmt: &PlanStmt, buf: &mut Vec<u8>) {
     match stmt {
-        PlanStmt::Select(_) | PlanStmt::Compound(_) | PlanStmt::RecursiveCte(_) => {
+        PlanStmt::Select(_)
+        | PlanStmt::Compound(_)
+        | PlanStmt::RecursiveCte(_)
+        | PlanStmt::Derived(_) => {
             unreachable!("handled by encode_stmt")
         }
         PlanStmt::Insert {

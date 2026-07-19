@@ -382,15 +382,20 @@ fn flatten_cte_join(
     Ok(())
 }
 
-/// Splice a derived table `FROM (SELECT …) t` onto its base (#74, Stage B).
+/// Splice a derived table `FROM (SELECT …) t` onto its base (#74, Stage B) —
+/// or leave it in place for the planner to MATERIALIZE (Stage A).
 ///
 /// A derived table is a view whose body is written inline and whose alias is
 /// intrinsic — `t` is how the outer query addresses the body's columns. So,
 /// unlike a stored view (which V1 refuses to alias), the alias is KEPT: the
 /// base is read `FROM base AS t`, which makes every outer `t.col` resolve to a
-/// base column. Only the same simple projection/filter body a view allows is
-/// flattenable; the body's own references are remapped to the single alias `t`
-/// so the collapsed query reads under one name.
+/// base column. Only a simple, ALIASED projection/filter body (the same
+/// grammar a view allows) is spliced — it yields the better plan (index access
+/// paths on the base). Everything else — aggregate/GROUP BY/DISTINCT/join/
+/// ORDER BY+LIMIT bodies, compound bodies, and alias-less derived tables —
+/// stays in `from_derived` for `PlanStmt::Derived` materialization at the top
+/// level (a nested position refuses it by name at plan time), never an error
+/// here.
 fn flatten_derived(
     s: &mut SelectStmt,
     views: &ViewCatalog,
@@ -401,16 +406,30 @@ fn flatten_derived(
         return Err(bind_err("derived-table nesting too deep"));
     }
     let mut body = s.from_derived.take().expect("caller checked from_derived is Some");
-    // A derived table must be named: its alias is how the outer query addresses
-    // the exposed columns (PostgreSQL requires it; sqlite usually carries it).
-    let Some(dalias) = s.alias.clone() else {
-        return Err(bind_err(
-            "a derived table `FROM (SELECT …)` must have an alias",
-        ));
+    // The body's own view/CTE/nested-derived references flatten first, whatever
+    // happens to the body itself.
+    match body.as_mut() {
+        SubqueryBody::Select(b) => flatten_select(b, views, ctes, depth + 1)?,
+        SubqueryBody::Compound(c) => {
+            for arm in &mut c.arms {
+                flatten_select(arm, views, ctes, depth + 1)?;
+            }
+        }
+    }
+    let splice_alias = match (body.as_ref(), s.alias.clone()) {
+        (SubqueryBody::Select(b), Some(dalias)) if check_simple(b, &dalias).is_ok() => {
+            Some(dalias)
+        }
+        _ => None,
     };
-    // The body itself may reference a view, a CTE, or a nested derived table.
-    flatten_select(&mut body, views, ctes, depth + 1)?;
-    check_simple(&body, &dalias)?;
+    let Some(dalias) = splice_alias else {
+        // Not flattenable: hand the body to the planner unchanged.
+        s.from_derived = Some(body);
+        return Ok(());
+    };
+    let SubqueryBody::Select(mut body) = *body else {
+        unreachable!("splice_alias is only Some for a Select body")
+    };
 
     // The body exposes its columns under its own source name — its inner alias
     // if it has one, else its base table name. Rename that to the derived alias
@@ -605,7 +624,7 @@ fn collect_source_names(s: &SelectStmt, out: &mut Vec<String>) {
         out.push(j.table.clone());
     }
     if let Some(d) = &s.from_derived {
-        collect_source_names(d, out);
+        collect_body_sources(d, out);
     }
     if let Some(items) = &s.items {
         for (e, _) in items {

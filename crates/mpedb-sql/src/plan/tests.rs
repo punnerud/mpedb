@@ -135,6 +135,27 @@ fn sample_sqls() -> Vec<&'static str> {
         "SELECT sum(age) FILTER (WHERE active), count(*) FILTER (WHERE age > 18) FROM users",
         "SELECT count(DISTINCT age) FILTER (WHERE age > 0) FROM users",
         "SELECT active, avg(age) FILTER (WHERE score > 1.0) FROM users GROUP BY active",
+        // Materialized derived tables (design/DESIGN-DERIVED-TABLES.md §5,
+        // format 49): the new `Derived` node — name, columns+types, a
+        // body-discriminant byte with a Select or Compound body, and the outer
+        // SelectPlan over the CTE_TABLE sentinel — must survive
+        // encode/decode/validate and the truncation/bit-flip fuzz. A grouped
+        // body under an aggregating outer (the Django shape), a compound body,
+        // an ORDER BY+LIMIT body, a joined outer, and an alias-less form.
+        "SELECT count(*) FROM (SELECT active, count(*) AS n FROM users GROUP BY active) sub",
+        "SELECT * FROM (SELECT age FROM users UNION SELECT item_no FROM orders) sub ORDER BY 1",
+        "SELECT x FROM (SELECT age AS x FROM users ORDER BY age LIMIT 3) sub WHERE x > 1",
+        "SELECT sub.n FROM (SELECT count(*) AS n FROM users) sub JOIN orders ON orders.user_id = sub.n",
+        "SELECT count(*) FROM (SELECT DISTINCT age FROM users)",
+        // Uncorrelated subplans on a top-level COMPOUND (format-49 window): each
+        // arm's lifts take the reserved slots after the preceding arms'. One
+        // arm, both arms, and a scalar+list mix must survive
+        // encode/decode/validate and the truncation fuzz.
+        "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders) UNION ALL SELECT id FROM users",
+        "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders) \
+         UNION SELECT user_id FROM orders WHERE item_no IN (SELECT age FROM users)",
+        "SELECT id FROM users WHERE age = (SELECT max(age) FROM users) \
+         EXCEPT SELECT user_id FROM orders WHERE item_no IN (SELECT age FROM users)",
         "BEGIN",
         "COMMIT",
         "ROLLBACK",

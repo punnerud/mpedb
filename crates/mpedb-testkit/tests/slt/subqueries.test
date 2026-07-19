@@ -235,8 +235,22 @@ SELECT id FROM t1 WHERE b = (SELECT max(b) FROM t1 WHERE c > (SELECT avg(c) FROM
 statement error HAVING is not supported yet
 SELECT b, count(*) FROM t1 GROUP BY b HAVING count(*) > (SELECT min(b) FROM t1)
 
-statement error compound SELECT is not supported yet
+# An UNCORRELATED subquery inside a compound ARM is now supported (format-49
+# window): each arm's lifts take the reserved slots after the preceding arms',
+# filled once before dispatch. UNION dedups {40} ∪ {10,20,30,40}; verified
+# against sqlite 3.45.
+query I rowsort
 SELECT (SELECT max(b) FROM t1) FROM t1 UNION SELECT b FROM t1
+----
+10
+20
+30
+40
+
+# A CORRELATED subquery in an arm stays refused (the arm executor has no
+# per-row fill phase).
+statement error compound SELECT is not supported yet
+SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM u WHERE u.v = t1.b) UNION SELECT id FROM t1
 
 statement error ON condition is not supported yet
 SELECT t1.id FROM t1 JOIN u ON t1.b = (SELECT max(v) FROM u)

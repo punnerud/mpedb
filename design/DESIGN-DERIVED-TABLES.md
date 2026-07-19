@@ -1,6 +1,7 @@
 # DESIGN-DERIVED-TABLES — subquery in `FROM` (#74)
 
-**Status: Stage B SHIPPED (2026-07-18); Stage A still open.** A simple
+**Status: Stage B SHIPPED (2026-07-18); Stage A (materialization) SHIPPED
+(2026-07-19) — see §5 below for the as-built design.** A simple
 projection/filter derived table `FROM (SELECT …) t` is flattened onto its base
 at bind time by `crate::view` — the AST carries an optional `from_derived`
 which the view-inline pass splices away (merge WHERE, keep the derived alias,
@@ -95,3 +96,84 @@ already is). One `PLAN_FORMAT` bump.
 - A derived table in a write target — refuse (as views are).
 - Anything Stage B cannot flatten and Stage A is not yet built for — a clean
   "not supported" message, categorized, never a silent divergence.
+
+## 5. Stage A as built (2026-07-19, PLAN_FORMAT 49)
+
+The body the flattener refuses is MATERIALIZED: run once into an in-memory row
+set against the statement's snapshot, then scanned by the outer query. The
+primitive is the recursive-CTE working table (`CTE_TABLE` +
+`exec/recursive.rs::WorkingTableCtx`), reused verbatim.
+
+### 5.1 Plan shape: a statement node, not a `FromSource`
+
+`PlanStmt::Derived(DerivedPlan { name, columns, col_types, body: SubBody,
+outer: SelectPlan })` — the exact shape `RecursiveCtePlan` proved, minus the
+fixpoint. Why NOT §3's `FromSource = Base | Derived` generalization of
+`SelectPlan`: that touches every `SelectPlan` consumer (codec, validate,
+explain, exec, gather, footprint — at every recursion site) and makes a derived
+source representable in positions whose slot layout is exactly what
+`plan_compound` refuses today (a subquery inside a compound arm). The statement
+node makes those shapes UNREPRESENTABLE, and EXPLAIN/validate/footprint each
+get one new arm that mirrors the recursive-CTE arm line for line. Why not a
+"table-valued `SubPlan` slot kind": a subplan's result is a VALUE in a
+parameter slot; a table-valued result is consumed by the GATHER as a scan
+source — a different consumer, which the sentinel working table already models.
+
+The `CTE_TABLE` sentinel is REUSED rather than minting a `DERIVED_TABLE`: the
+semantics are identical (an in-memory row set answering FullScans only; no
+PK/indexes; no catalog identity; no footprint bit; no policy; def resolved from
+THIS plan's node — `RecursiveCte` or `Derived`, the only two meanings the
+sentinel can have). `WorkingTableCtx`, validate's FullScan-only rule, the
+footprint skip and the policy-stamp filter apply unchanged.
+
+The body is a `SubBody` (`Select` | `Compound`), so a compound
+(`UNION`/`EXCEPT`/`INTERSECT`) body rides the existing compound plan/executor.
+Aggregate / GROUP BY / HAVING / DISTINCT / window / join / ORDER BY+LIMIT
+bodies are all just `SelectPlan`s — the body's own LIMIT binds INSIDE the body
+because the body plan carries it and is executed as a unit.
+
+### 5.2 Equivalence argument (zero wrong answers)
+
+- **Exactly once, one snapshot**: the executor runs the body plan ONCE per
+  execute, against the same `TxnCtx` (same MVCC snapshot) the outer then reads;
+  the outer scans the materialized Vec through `WorkingTableCtx`.
+- **Bag semantics**: `exec_select`/`exec_compound` return bags; nothing dedups
+  the working set (only a body-level set operator dedups, as SQL says).
+- **Column order/names**: the synthetic `TableDef` carries the body's output
+  columns in projection order; names follow sqlite's rule — item alias, else a
+  bare column's own (short) name, else the rendered expression — so outer
+  references resolve exactly against the body's projection, and `SELECT *`
+  exposes exactly the body's columns. Types are the body's inferred output
+  types; an untyped output (bare NULL) becomes `any`, decided per value.
+- **RLS**: the body plan bakes the read policies of every table it reads
+  (stamped like any select); the working set is exactly the visible rows.
+
+### 5.3 Memory bound (#74 from day one)
+
+Materialized rows are charged to the runtime work meter — `charge_work(n)` with
+attribution `derived table "<alias>"` — the same convention the recursive-CTE
+fixpoint uses, so a runaway body trips `Error::RuntimeBudget` naming the
+`max_work_rows` knob before the Vec grows unbounded (the body's own scans are
+additionally charged per row read, as everywhere).
+
+### 5.4 Scope / refusals (by name)
+
+- Correlated derived tables (LATERAL): the body is planned with the outer scope
+  NOT visible, so an outer reference fails as an unknown table/column — the
+  same error sqlite gives (sqlite has no LATERAL either).
+- One derived table per statement, in the outermost FROM. Nested positions
+  (compound arm, subquery body, `INSERT … SELECT` source, recursive-CTE
+  components, another derived body) keep a clean refusal. A derived table as a
+  JOIN operand (`FROM t JOIN (SELECT …) d`) does not parse (join operands are
+  table names) — `FROM (SELECT …) d JOIN t` covers the joined case, on either
+  side via the RIGHT-join rewrite.
+- The alias is optional (sqlite allows `FROM (SELECT …)`); an absent alias gets
+  an unreferenceable synthetic name. Re-referencing the alias as a join operand
+  (`FROM (…) d JOIN d`) is refused (sqlite: "no such table: d").
+- Lifted subqueries and `current_setting()` in the body or the outer are stage-1
+  refusals (same `[user]`-only parameter layout as the recursive CTE, same
+  reserved-slot reconciliation cost to lift later).
+
+Simple aliased projection/filter bodies still take the Stage-B flatten (better
+plans: index access paths); materialization is the fallback, so every
+previously-answered shape plans exactly as before.

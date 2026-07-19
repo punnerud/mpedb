@@ -229,14 +229,70 @@ fn compound_subquery_direct_values() {
     );
 }
 
+/// UNCORRELATED subqueries inside compound ARMS (the 520-record corpus gap):
+/// each arm's lifted subplans take the reserved slots after the preceding
+/// arms', numbered against the final statement layout at plan time and filled
+/// once before dispatch — exactly like a single SELECT's. Cross-checked
+/// against the bundled sqlite; the corpus shape (two views with IN-subquery
+/// bodies under UNION / UNION ALL) is the last case.
+#[test]
+fn subquery_in_compound_arms_matches_sqlite() {
+    let d = db();
+    let queries = [
+        // One arm with a subquery.
+        "SELECT id FROM t WHERE a IN (SELECT b FROM u) UNION ALL SELECT id FROM u ORDER BY 1",
+        // Both arms with subqueries (slot offsets in play).
+        "SELECT id FROM t WHERE a IN (SELECT b FROM u) \
+         UNION SELECT id FROM u WHERE b IN (SELECT a FROM t) ORDER BY 1",
+        // Scalar + EXISTS subqueries across three arms and mixed set ops.
+        "SELECT id FROM t WHERE a = (SELECT max(b) FROM u) \
+         UNION ALL SELECT id FROM u WHERE EXISTS (SELECT 1 FROM t WHERE a = 10) \
+         EXCEPT SELECT id FROM t WHERE a IN (SELECT b FROM u WHERE b IS NULL) ORDER BY 1",
+        // NOT IN with a NULL-bearing membership list in an arm (3VL).
+        "SELECT id FROM t WHERE a NOT IN (SELECT b FROM u) UNION SELECT 77 ORDER BY 1",
+    ];
+    for q in queries {
+        assert_eq!(mpedb_rows(&d, q), sqlite_rows(q), "mismatch on `{q}`");
+    }
+    // The corpus shape: views whose bodies carry IN-subqueries, referenced in
+    // UNION / UNION ALL arms (the flatten splices the subquery into the arm).
+    d.query("CREATE VIEW v1 AS SELECT id, a FROM t WHERE a IN (SELECT b FROM u)", &[])
+        .unwrap();
+    d.query("CREATE VIEW v2 AS SELECT id, a FROM t WHERE a NOT IN (SELECT b FROM u)", &[])
+        .unwrap();
+    let with_views = |q: &str| {
+        format!(
+            "CREATE VIEW v1 AS SELECT id, a FROM t WHERE a IN (SELECT b FROM u);\n\
+             CREATE VIEW v2 AS SELECT id, a FROM t WHERE a NOT IN (SELECT b FROM u);\n{q}"
+        )
+    };
+    for q in [
+        "SELECT id, a FROM v1 UNION ALL SELECT id, a FROM v2 ORDER BY 1, 2",
+        "SELECT id, a FROM v1 UNION SELECT id, a FROM v2 ORDER BY 1, 2",
+    ] {
+        assert_eq!(mpedb_rows(&d, q), sqlite_rows(&with_views(q)), "mismatch on `{q}`");
+    }
+    // A CORRELATED subquery in an arm stays refused (the arm executor has no
+    // per-row fill phase) — a clean error, never an unfilled-hole answer.
+    assert!(d
+        .query(
+            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.b = t.a) \
+             UNION SELECT id FROM u",
+            &[]
+        )
+        .is_err());
+    d.verify().unwrap();
+}
+
 /// The refusals that must stay refusals (never a WRONG answer): a compound
-/// subquery body cannot itself contain a subquery (a subquery inside a compound
-/// arm is not supported), and a scalar/IN compound must project exactly one
-/// column. These are clean errors, not silent misreads.
+/// subquery BODY cannot itself contain a subquery (its arms' slots would
+/// collide with the outer lift's), and a scalar/IN compound must project
+/// exactly one column. These are clean errors, not silent misreads.
 #[test]
 fn compound_subquery_refusals() {
     let d = db();
-    // A subquery inside a compound arm is refused (matches the top-level rule).
+    // A subquery inside a compound SUBQUERY BODY is refused (only a top-level
+    // compound coordinates arm slots).
     assert!(d
         .query(
             "SELECT id FROM t WHERE a IN \
@@ -255,13 +311,24 @@ fn compound_subquery_refusals() {
             &[]
         )
         .is_err());
-    // A COMPOUND body in a DERIVED-TABLE FROM source is a DEFERRED feature and
-    // is refused by name (not a wrong answer): a derived table is flattened onto
-    // its base, which a compound cannot be. (The simple-body derived table still
-    // works — that path is untouched.)
-    assert!(d
-        .query("SELECT x.a FROM (SELECT a FROM t UNION SELECT b FROM u) x", &[])
-        .is_err());
+    // A COMPOUND body in a DERIVED-TABLE FROM source is now MATERIALIZED
+    // (design/DESIGN-DERIVED-TABLES.md §5, format 49): the body runs once and
+    // the outer scans the row set — checked against sqlite in
+    // derived_materialize.rs. Here: it answers, with the UNION-deduped rows.
+    {
+        let got = mpedb_rows(
+            &d,
+            "SELECT x.a FROM (SELECT a FROM t UNION SELECT b FROM u) x \
+             WHERE x.a IS NOT NULL ORDER BY x.a",
+        );
+        assert_eq!(
+            got,
+            sqlite_rows(
+                "SELECT x.a FROM (SELECT a FROM t UNION SELECT b FROM u) x \
+                 WHERE x.a IS NOT NULL ORDER BY x.a"
+            )
+        );
+    }
     assert!(d
         .query("SELECT * FROM (SELECT a FROM t WHERE a > 15) x ORDER BY a", &[])
         .is_ok());
