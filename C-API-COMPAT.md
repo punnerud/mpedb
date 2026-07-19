@@ -174,9 +174,15 @@ against `_sqlite3.cpython-312` on Linux/x86-64 (Python 3.12).
   created live with `CREATE TABLE`. It is not dropped (mpedb has no
   `sqlite_master` for a consumer to trip over it yet). An **existing** file is
   attached config-free and reads its stored schema.
-- **Fixed size.** An mpedb file has a fixed maximum size (16 MiB ephemeral,
-  64 MiB file-backed here); it is not currently configurable through the C-API.
-  Exceeding it is `SQLITE_FULL`, not silent growth.
+- **Fixed size — configurable, reserved not grown.** An mpedb file has a fixed
+  maximum size, `fallocate`d at creation (crash-safety: no SIGBUS on a disk-full
+  mmap write). Defaults are small (16 MiB ephemeral, 64 MiB file-backed); a
+  `file:…?size_mb=N` URI (alias `max_size_mb=N`) pre-reserves exactly N MiB for a
+  **new** file — both *smaller* than the default (mpedb does not always take
+  "several MB" more than asked) and up to the 16 TiB engine cap, so an 800 GiB
+  database is `file:big.mpedb?size_mb=819200`. The size is fixed at creation;
+  reopening an existing file keeps its geometry and ignores the parameter.
+  Exceeding the reservation is `SQLITE_FULL`, never silent growth.
 - **`column_count`/`_name` before `step`.** mpedb names a result only by running
   it. For read statements the shim executes lazily when column metadata is first
   requested (Python builds `description` this way); it materializes the whole
