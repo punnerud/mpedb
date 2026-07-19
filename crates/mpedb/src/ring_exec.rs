@@ -52,7 +52,7 @@
 //! emits one `mpedb-ring-batch` stderr line per committed batch (never
 //! enable in throughput arms — the writes perturb timing).
 
-use crate::exec::{exec_stmt_triggered, resolve_part};
+use crate::exec::{exec_stmt_triggered, resolve_part, WriteCtx};
 use crate::trigger::TriggerSet;
 use crate::{Database, ExecResult};
 use mpedb_core::{row, PendingIntent, WriteTxn};
@@ -216,6 +216,22 @@ fn prepare_intent(db: &Database, intent: PendingIntent) -> PreparedIntent {
                 "only DML plans may enter the intent ring".into(),
             ));
         }
+        // A plan calling a host UDF is CONNECTION-LOCAL (design/DESIGN-UDF.md):
+        // its closures live in the enqueuing process's registry, so this leader
+        // must not execute it — resolving the name against OUR registry could
+        // call a different function of the same name, which is a wrong answer.
+        // Unreachable in practice (such a plan is never published to the shared
+        // registry, and `run_write_plan` keeps it off the ring), so this is the
+        // belt to that braces: an explicit refusal, staged per-intent like any
+        // other prepare error, never a silent mis-resolution.
+        if plan.contains_host_call() {
+            return Err(Error::Unsupported(
+                "a statement calling a host-registered UDF is connection-local \
+                 and cannot be executed by another connection's group-commit \
+                 leader"
+                    .into(),
+            ));
+        }
         let params = decode_params(&intent.params)?;
         Ok((plan, params))
     })();
@@ -262,6 +278,35 @@ fn locality_key(p: &PreparedIntent) -> SortKey {
         KeyAccess::Full => (RANK_NO_KEY, Vec::new()),
     };
     (table, rank, key, idx)
+}
+
+/// Execute the CALLER'S OWN statement inside the writer transaction it holds,
+/// with this connection's host UDF closures in scope (design/DESIGN-UDF.md).
+///
+/// Only the OWN statement gets them, never a drained foreign intent: the
+/// closures belong to this connection, and `prepare_intent` refuses a host-call
+/// intent outright (a leader must never run another connection's UDF name
+/// against its own registry — same name, different function).
+///
+/// This changes nothing about the ring protocol (§5.3): it swaps which `dyn
+/// TxnCtx` the statement executes against, inside the same savepoint, at the
+/// same point in the round. No staging, posting, commit, or release ordering is
+/// touched.
+fn exec_own(
+    db: &Database,
+    txn: &mut WriteTxn<'_>,
+    plan: &CompiledPlan,
+    params: &[Value],
+    triggers: &TriggerSet,
+    partial: &mut bool,
+) -> Result<ExecResult> {
+    let tables = db.host_tables(plan);
+    let host: Option<&dyn mpedb_types::HostFns> =
+        tables.as_ref().map(|(f, _)| f as &dyn mpedb_types::HostFns);
+    let aggs: Option<&dyn mpedb_types::HostAggs> =
+        tables.as_ref().map(|(_, a)| a as &dyn mpedb_types::HostAggs);
+    let mut ctx = WriteCtx::new(txn, host, aggs);
+    exec_stmt_triggered(&mut ctx, &db.schema(), plan, params, partial, triggers, 0)
 }
 
 /// Execute one prepared foreign intent inside the leader's transaction.
@@ -375,6 +420,14 @@ fn opt_now_micros() -> i64 {
 
 /// Is this plan eligible for the optimistic blind-apply path?
 fn optimistic_eligible(db: &Database, plan: &CompiledPlan) -> bool {
+    if plan.contains_host_call() {
+        // The blind-apply route builds and validates the row OFF the executor
+        // (`optimistic_prep` evaluates filters with no host resolver), so a plan
+        // calling a host UDF would refuse there. Route it to the serial
+        // executor, which carries the connection's closures
+        // (design/DESIGN-UDF.md).
+        return false;
+    }
     if plan.footprint.tables_written.count_ones() != 1 {
         return false;
     }
@@ -654,7 +707,7 @@ fn serial_execute(db: &Database, plan: &CompiledPlan, params: &[Value]) -> Resul
     let triggers = db.trigger_set()?;
     let mut txn = db.engine.begin_write()?;
     let mut partial = false;
-    match exec_stmt_triggered(&mut txn, &db.schema(), plan, params, &mut partial, &triggers, 0) {
+    match exec_own(db, &mut txn, plan, params, &triggers, &mut partial) {
         Ok(out) => {
             txn.commit()?;
             Ok(out)
@@ -776,8 +829,7 @@ pub(crate) fn lead_and_execute(
         let mut own_result = None;
         if let Some((plan, params)) = own {
             let mut partial = false;
-            match exec_stmt_triggered(&mut txn, &db.schema(), plan, params, &mut partial, &triggers, 0)
-            {
+            match exec_own(db, &mut txn, plan, params, &triggers, &mut partial) {
                 Ok(out) => own_result = Some(Ok(out)),
                 Err(e) => {
                     txn.abort();
@@ -850,7 +902,7 @@ pub(crate) fn lead_and_execute(
     if let Some((plan, params)) = own {
         let sp = txn.savepoint();
         let mut partial = false;
-        match exec_stmt_triggered(&mut txn, &db.schema(), plan, params, &mut partial, &triggers, 0) {
+        match exec_own(db, &mut txn, plan, params, &triggers, &mut partial) {
             Ok(out) => own_result = Some(Ok(out)),
             Err(e) => {
                 txn.rollback_to(sp);
