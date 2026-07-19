@@ -1,4 +1,5 @@
 use super::*;
+use crate::plan::SortDir;
 use crate::prepare;
 use mpedb_types::{ColumnDef, DefaultExpr};
 
@@ -319,28 +320,63 @@ fn order_by_pk_prefix_elision() {
     assert_eq!(order("SELECT * FROM users ORDER BY id ASC"), vec![]);
     assert_eq!(
         order("SELECT * FROM users ORDER BY id DESC"),
-        vec![(0u16, true, Binary)]
+        vec![(0u16, SortDir::dir(true), Binary)]
     );
     assert_eq!(
         order("SELECT * FROM users ORDER BY email"),
-        vec![(1u16, false, Binary)]
+        vec![(1u16, SortDir::dir(false), Binary)]
     );
     assert_eq!(order("SELECT * FROM orders ORDER BY user_id, item_no"), vec![]);
     assert_eq!(order("SELECT * FROM orders ORDER BY user_id"), vec![]);
     assert_eq!(
         order("SELECT * FROM orders ORDER BY item_no, user_id"),
-        vec![(1u16, false, Binary), (0, false, Binary)]
+        vec![(1u16, SortDir::dir(false), Binary), (0, SortDir::dir(false), Binary)]
     );
     // Not elided over an index probe (index order != PK order).
     assert_eq!(
         order("SELECT * FROM users WHERE email = 'x' ORDER BY id"),
-        vec![(0u16, false, Binary)]
+        vec![(0u16, SortDir::dir(false), Binary)]
     );
+    // An explicit NULL placement blocks the elision even on the PK. A PK column
+    // cannot be NULL, so the two orders coincide — but the elision is allowed to
+    // depend only on the key being written the plain way, never on a fact about
+    // what a PK may hold.
+    assert_eq!(
+        order("SELECT * FROM users ORDER BY id NULLS LAST"),
+        vec![(0u16, SortDir::new(false, Some(false)), Binary)]
+    );
+    // …and the DEFAULT placement, however it is spelled, still elides.
+    assert_eq!(order("SELECT * FROM users ORDER BY id ASC NULLS FIRST"), vec![]);
     // Unknown ORDER BY column is a bind error.
     assert!(matches!(
         prepare("SELECT * FROM users ORDER BY nope", &s),
         Err(Error::Bind(_))
     ));
+}
+
+/// The one wire byte of an ORDER BY key. Bytes 0 and 1 must keep the meaning
+/// they had before NULL placement existed — that is what makes "a plan without
+/// a NULLS clause encodes exactly as it did" a fact rather than a hope — and
+/// anything above 3 must still be corrupt.
+#[test]
+fn sort_dir_wire_byte_keeps_the_pre_nulls_meaning() {
+    assert_eq!(SortDir::dir(false).to_byte(), 0);
+    assert_eq!(SortDir::dir(true).to_byte(), 1);
+    assert_eq!(SortDir::new(false, Some(false)).to_byte(), 2);
+    assert_eq!(SortDir::new(true, Some(true)).to_byte(), 3);
+    for b in 0u8..=3 {
+        let d = SortDir::from_byte(b).expect("0..=3 decode");
+        assert_eq!(d.to_byte(), b, "round trip for {b}");
+    }
+    assert_eq!(SortDir::from_byte(0), Some(SortDir::dir(false)));
+    assert_eq!(SortDir::from_byte(1), Some(SortDir::dir(true)));
+    for b in 4u8..=255 {
+        assert!(SortDir::from_byte(b).is_none(), "byte {b} must be rejected");
+    }
+    // An explicit clause that names the default placement is INDISTINGUISHABLE
+    // from no clause at all, in the plan bytes and therefore in the plan hash.
+    assert_eq!(SortDir::new(false, Some(true)), SortDir::dir(false));
+    assert_eq!(SortDir::new(true, Some(false)), SortDir::dir(true));
 }
 
 #[test]

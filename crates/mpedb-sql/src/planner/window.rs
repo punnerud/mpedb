@@ -397,9 +397,10 @@ pub(super) fn plan_window_select(
         }
         None => None,
     };
-    let mut rewritten_order: Vec<(ast::Expr, bool)> = Vec::with_capacity(s.order_by.len());
-    for (e, desc) in &s.order_by {
-        rewritten_order.push((lift_windows(e, &mut specs)?, *desc));
+    let mut rewritten_order: Vec<(ast::Expr, crate::plan::SortDir)> =
+        Vec::with_capacity(s.order_by.len());
+    for (e, dir) in &s.order_by {
+        rewritten_order.push((lift_windows(e, &mut specs)?, *dir));
     }
     if specs.is_empty() {
         return Err(bind_err("internal: window planner reached with no window function"));

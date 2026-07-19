@@ -5,7 +5,7 @@
 
 use super::{parse_expr_only, parse_statement, MAX_ORDER_BY_ITEMS, MAX_SELECT_ITEMS, MAX_SET_ITEMS};
 use crate::ast::{BinOp, DeleteStmt, Expr, InsertStmt, SelectStmt, Stmt, UnOp};
-use crate::plan::SetOp;
+use crate::plan::{SetOp, SortDir};
 use mpedb_types::{Error, Value};
 
 fn expr(src: &str) -> Expr {
@@ -346,8 +346,8 @@ fn full_select() {
             assert_eq!(
                 sel.order_by,
                 vec![
-                    (Expr::Col("a".into()), false),
-                    (Expr::Col("b".into()), true)
+                    (Expr::Col("a".into()), SortDir::dir(false)),
+                    (Expr::Col("b".into()), SortDir::dir(true))
                 ]
             );
             assert_eq!(sel.limit, Some(10));
@@ -378,7 +378,7 @@ fn order_by_takes_an_aggregate_not_just_a_name() {
                         false,
                         None
                     ),
-                    true
+                    SortDir::dir(true)
                 )]
             );
         }

@@ -290,6 +290,46 @@ impl<'a> Parser<'a> {
             && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Kw(Kw::Like)))
     }
 
+    /// The `[ASC|DESC] [NULLS FIRST|NULLS LAST]` tail of one ORDER BY term.
+    ///
+    /// sqlite's default placement is a function of the direction — NULLs first
+    /// for ASC, last for DESC — and `NULLS FIRST`/`NULLS LAST` overrides it
+    /// independently of the direction, including on a term with no explicit
+    /// ASC/DESC (`ORDER BY s NULLS LAST` is ASC with NULLs last).
+    ///
+    /// Neither `NULLS` nor `FIRST`/`LAST` is a reserved word. That is safe HERE
+    /// and nowhere else: an ORDER BY term has just been parsed, so a following
+    /// bare `nulls` cannot be a column or an alias — which is exactly why the
+    /// unconsumed token used to resurface as whatever the ENCLOSING construct
+    /// wanted next (`expected ) after IN subquery`) and send gap reports
+    /// chasing the paren.
+    fn sort_dir(&mut self) -> Result<crate::plan::SortDir> {
+        let desc = if self.eat_kw(Kw::Desc) {
+            true
+        } else {
+            self.eat_kw(Kw::Asc);
+            false
+        };
+        let nulls_first = if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("NULLS"))
+        {
+            self.pos += 1;
+            match self.peek() {
+                Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("FIRST") => {
+                    self.pos += 1;
+                    Some(true)
+                }
+                Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("LAST") => {
+                    self.pos += 1;
+                    Some(false)
+                }
+                _ => return Err(self.err_here("expected FIRST or LAST after NULLS")),
+            }
+        } else {
+            None
+        };
+        Ok(crate::plan::SortDir::new(desc, nulls_first))
+    }
+
     /// The argument of `LIKE … ESCAPE <c>`, already past the `ESCAPE` word.
     ///
     /// sqlite takes an arbitrary EXPRESSION here and raises `ESCAPE expression
