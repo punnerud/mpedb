@@ -547,11 +547,16 @@ impl Lift<'_> {
                 _ => "a scalar subquery must select exactly one column",
             }));
         }
-        if kind == SubPlanKind::List && !outer_args.is_empty() {
-            return Err(bind_err(
-                "a correlated IN subquery is not supported yet — rewrite as EXISTS",
-            ));
-        }
+        // (#97) A CORRELATED `IN (SELECT …)` was refused here — "rewrite as
+        // EXISTS" — since #70, when the List kind landed before the per-row fill
+        // existed. It needs nothing the other kinds do not: `split_correlated`
+        // already classifies `BExpr::InParam(_, slot)` as a correlated reference
+        // and routes the conjunct into `post_filter`; the executor's per-row
+        // phase fills a List slot with the same `subplan_value` call it uses for
+        // Exists/Scalar, memoized by the same correlation tuple; `validate`'s
+        // `gather_ok` already treats `Instr::InParam` as a slot read, so the
+        // gather-side discipline covers it. The refusal is gone; the shape is
+        // sqlite-differentially tested in `correlated_in.rs`.
         let ty = match kind {
             SubPlanKind::Exists => Some(ColumnType::Bool),
             SubPlanKind::Scalar => inner_out.first().copied().flatten(),

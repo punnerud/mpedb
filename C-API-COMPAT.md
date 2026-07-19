@@ -513,7 +513,7 @@ query path.
 |---|---|---|---|
 | 1 [1] | **68** | **No sqlite affinity; `any` neither coerces nor computes.** 49 × `TypeError: argument must be int or float` (Django's DecimalField converter gets a `str`), 10 × `arithmetic requires int64/float64, got any`, 3 × `cannot assign any to column of type text`, 2 × `cannot mix coalesce() argument types: any and float64`, 1 each `avg() expects a number, got text` / `floor() expects a number, got any` / `cannot compare int64 with text` / `cannot compare with IN list: text and int64`. **Plus wrong answer W1.** | `mpedb-sql`/`mpedb` |
 | 2 [2] | ~~47~~ | ✅ **FIXED after this run — host UDFs resolve on the WRITE path** (`design/DESIGN-UDF.md` §The WRITE path). Scalar and aggregate closures reach the write context via `exec::WriteCtx`, gated by a single `Database::host_tables(plan)` snapshot taken only when the plan contains a host call; `WriteSession`, autocommit DML and the group-commit leader's own statement all carry them. A host-call plan still never enters the shared `plan/<hash>` registry and never rides the intent ring. The out-of-scope contexts that remain refuse cleanly (`Unsupported`) instead of the old `internal error (bug in mpedb)`. **Not re-measured** — the 47 is run-2's number, and the next Django run should show it move. | `mpedb` `ring_exec` / write `TxnCtx` |
-| 3 [4] | **45** | **Subquery / derived-table restrictions**: JOIN inside a derived table 14, correlated subquery outside `WHERE` in an aggregate query 8, unlifted `IN` subquery 5, aliased/renamed column 4, GROUP BY/HAVING body 4, correlated `IN` ("rewrite as EXISTS") 4, subquery in `HAVING` 2, unsupported position 2, compound (`UNION`) body 1, `ORDER BY` body 1. | `mpedb-sql` planner |
+| 3 [4] | **45** | **Subquery / derived-table restrictions.** ⚠️ **This row's sub-breakdown was MIS-ATTRIBUTED — see "Subquery family, re-derived" below.** Two of its lines are CLOSED (#97: unlifted `IN` subquery, correlated `IN`) and the rest collapses to two root causes, neither of which is "a JOIN in a derived table". | `mpedb-sql` planner |
 | 4 [3] | **44** | **Missing sqlite scalar functions**: `quote()` 40 statements (Django's `last_executed_query`), `strftime()` 8, `json()` (the feature probe → the 2 skips above). **`quote()` and `strftime()` CLOSED** (PLAN_FORMAT 41) — sqlite-differential-tested; `quote()` refuses only the reals whose sqlite rendering is build-dependent, `strftime()` only the modifier/`'now'`/Julian-day forms, each a named error. `json()` is in flight. **JSONField's DDL now fails on ONE count rather than two**: Django emits `CHECK ((JSON_VALID("data") OR "data" IS NULL))`, and the `AND/OR requires boolean operands, got int64` half is gone with gap 5 — only `unknown function json_valid()` is left. | `mpedb-sql` builtins |
 | 5 [5] | ~~39~~ | ✅ **FIXED after this run — sqlite truthiness + the int/bool value bridge.** A non-boolean in a boolean position (WHERE/HAVING/ON/FILTER, `NOT`, `AND`/`OR`, `CASE WHEN`, `CHECK`, `ON CONFLICT … WHERE`) is truthy-tested exactly as `sqlite3VdbeBooleanValue` does — NULL unknown, integer `!= 0`, everything else `RealValue(x) != 0.0` (the leading-float-prefix parse, over text AND a blob's raw bytes). It desugars in the binder to `x <> 0` / `CAST(x AS REAL) <> 0.0`, so **no new opcode and no `PLAN_FORMAT` bump**. The VALUE bridge is deliberately narrower than "int and bool are interchangeable": in a comparison an int const 0/1 folds into the bool domain (`flag = 1` → `flag = TRUE`, keeping the index-probe shape) and anything else casts the bool side up to its integer, so `flag = 2` is FALSE — sqlite's answer; a bool assigned to an int column is exact (`TRUE` → 1); an int into a bool column converts **only** 0/1; a parameter bound as 0/1 into a bool slot converts (CPython binds `True` via `sqlite3_bind_int64`). Arithmetic on a bool is still rigid. 24 values × 8 boolean positions diffed against the 3.45.1 binary in `crates/mpedb/tests/bool_truthiness.rs`; the C-API path in `capi.rs::django_boolean_field_through_the_c_api`. **Not re-measured** — 39 is run-2's number. | `mpedb-sql` binder |
 | 6 [6] | **20 (+6)** | **`LIKE … ESCAPE` (44 statements) and `ORDER BY … NULLS FIRST/LAST` (6)** are not parsed. **Absorbs rows 10 and 11** — those 6 tests are this gap seen through an enclosing `FILTER`/`IN`/`EXISTS` paren, so the true weight is ~26. | `mpedb-sql` parser |
@@ -528,6 +528,51 @@ query path.
 
 One-offs: `unknown column` 1, `expected parameter number after $` (an identifier
 containing `$`) 1, `expected X` 2.
+
+### Subquery family, re-derived (2026-07-19, #97)
+
+Gap 3's sub-breakdown was re-measured from a fresh `WB_TRACE_SQL_ERRORS=1` run
+and **root-caused**, statement by statement. The published line items were an
+artifact of the order in which `view.rs::check_simple` tests the derived-table
+grammar: it reported only the FIRST failing check, so a body that had a JOIN
+*and* a `GROUP BY` was filed under "JOIN". Fixing only what the label named
+would have closed nothing. `check_simple` now names EVERY blocking reason.
+
+Two caveats on the run itself. (a) The suite could not run at all on `main`
+that day — `CREATE INDEX … ON django_session(expire_date)` fails because
+Django's `datetime` takes NUMERIC affinity → `any` and mpedb cannot index an
+`any` column, which aborts `create_test_db()` for BOTH label groups. The run
+therefore used `WB_SOFT_CREATE_INDEX=1` (an index is never an answer, so no
+result depends on it). (b) These are STATEMENT counts, as the original was.
+
+| category | before | after #97 | root cause |
+|---|---|---|---|
+| derived body uses a JOIN | 14 | 14 | **NOT a join gap.** All 13 distinct statements ALSO have `GROUP BY` (11) or `DISTINCT` (2) — Django's `.aggregate()` over `.annotate()`. Flattening the join closes **zero**; only MATERIALIZING the body does. |
+| correlated subquery in an aggregate query, outside `WHERE` | 10 | 10 | All 10 are `SELECT (corr subq) AS x, count(*) … GROUP BY <that expr>`. The GROUP BY key and the aggregate ARGUMENT are per-ROW positions, so they are computable; `HAVING` and the grouped projection are not. The current refusal treats all four alike. |
+| unlifted `IN` subquery (position) | 9 | **0** ✅ | **7 of the 9 were `DELETE`/`UPDATE … WHERE pk IN (SELECT …)`** — the write planners simply never ran the lift. CLOSED by #97, no format bump. The 2 left are an `INSERT … VALUES ((SELECT …))` and a subquery in a `GROUP BY` key, both still refused (and both counted under "unsupported position" below). |
+| derived body has an aliased/renamed column | 7 | 7 | **Flattening these closes zero too.** Every one projects a correlated scalar/`EXISTS`/window under an alias and is consumed by an outer aggregate `FILTER`/argument, so a projection remap converts it into "correlated subquery in an aggregate argument" — the row above. |
+| derived body has `GROUP BY`/`HAVING` | 5 | 5 | Materialization. |
+| correlated `IN` ("rewrite as EXISTS") | 4 | **0** ✅ | CLOSED by #97. The refusal predated the per-row correlation fill and needed nothing new; `List` differs from `Exists` only in what `subplan_value` reduces the rows to. |
+| subquery in `HAVING` | 2 | 2 | Per-GROUP position. |
+| unsupported position | 2 | 2 | `INSERT … VALUES ((SELECT …))`; a subquery as a `GROUP BY` key. |
+| compound (`UNION`) derived body | 1 | 1 | Materialization. |
+| derived body has `ORDER BY` | 1 | 1 | Dropping it would change an unspecified output order — refused. |
+| **total** | **55** | **42** | |
+
+**The honest remaining shape of this gap is two things, not nine:**
+
+1. **Materialize a derived table** (26 statements: JOIN 14 + aliased 7 + GROUP
+   BY/HAVING 5, plus the 1 compound body). Every one is Django's
+   `SELECT <agg> FROM (<body that groups or aggregates>) subquery`. There is no
+   flattening rewrite for these — the body changes cardinality. The primitive
+   already exists in the engine: the recursive-CTE working table (`CTE_TABLE`,
+   `exec/recursive.rs`) answers a scan from an in-memory row set. Cost: a new
+   plan node and a `PLAN_FORMAT` bump.
+2. **Per-row correlation in the aggregate path** (10 statements): fill
+   correlated slots before the GROUP BY key and aggregate arguments are
+   evaluated, which `exec_aggregate` currently does not do (it discards the
+   per-row scratch `correlated_survivors` hands it). `HAVING` and the grouped
+   projection must stay refused — they run after the collapse.
 
 **Not counted against mpedb:** the two `delete` FAILs (`test_fast_delete_all`,
 `test_fast_delete_instance_set_pk_none`) are contamination, not behaviour —

@@ -298,25 +298,46 @@ fn mid_scope_correlation_direct() {
     d.verify().unwrap();
 }
 
-/// The refusal boundary that STAYS: an intervening `IN (SELECT …)` that would
-/// have to become correlated in order to transit an ancestor value is still
-/// refused (a correlated IN-list is unsupported) — a clean refusal, never a
-/// wrong answer.
+/// An intervening `IN (SELECT …)` that becomes CORRELATED in order to transit an
+/// ancestor value. Refused until #97 ("a correlated IN subquery is not supported
+/// yet — rewrite as EXISTS"); now answered, because the `List` kind rides the
+/// same per-row correlation fill as `Exists`/`Scalar` and changes only what
+/// `subplan_value` reduces the rows to. This is the hardest shape the change
+/// unlocks — a correlated IN whose own body carries a mid-scope transit — so it
+/// is pinned cell-for-cell against sqlite, not merely "no longer an error".
 #[test]
-fn transit_through_in_list_is_refused() {
+fn transit_through_in_list_matches_sqlite() {
     let d = db();
-    let err = d
-        .query(
-            "SELECT id FROM a \
-             WHERE a.k IN (SELECT x FROM b WHERE EXISTS (SELECT 1 FROM c WHERE c.y = a.k))",
-            &[],
-        )
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(!msg.is_empty(), "correlated IN transit must refuse");
-    assert!(
-        msg.contains("correlated IN") || msg.contains("EXISTS") || msg.contains("IN subquery"),
-        "expected a correlated-IN refusal, got: {msg}"
-    );
+    let queries = [
+        // The former refusal, verbatim: the IN-list body correlates to `a` for
+        // its own filter AND transits `a.k` down to `c`.
+        "SELECT id FROM a \
+         WHERE a.k IN (SELECT x FROM b WHERE EXISTS (SELECT 1 FROM c WHERE c.y = a.k)) \
+         ORDER BY id",
+        // NOT IN over the same body — 3VL: `b.x` is never NULL here, so this
+        // one can be TRUE, and `a4` (k IS NULL) must still be excluded.
+        "SELECT id FROM a \
+         WHERE a.k NOT IN (SELECT x FROM b WHERE EXISTS (SELECT 1 FROM c WHERE c.y = a.k)) \
+         ORDER BY id",
+        // The IN-list value in the SELECT list: TRUE / FALSE / UNKNOWN per row.
+        "SELECT a.id, a.k IN (SELECT x FROM b WHERE EXISTS (SELECT 1 FROM c WHERE c.y = a.k)) \
+         FROM a ORDER BY a.id",
+        // A correlated IN nested INSIDE a correlated EXISTS — the middle level
+        // forwards `a.k` to an IN-list one level further down.
+        "SELECT id FROM a \
+         WHERE EXISTS (SELECT 1 FROM b WHERE b.w IN (SELECT c.z FROM c WHERE c.y = a.k)) \
+         ORDER BY id",
+        // The IN-list body itself aggregates while transiting: its WHERE
+        // carries the correlated nested scalar, its GROUP BY collapses the
+        // survivors.
+        "SELECT id FROM a \
+         WHERE a.k IN (SELECT x FROM b \
+                       WHERE b.w >= (SELECT min(c.z) FROM c WHERE c.y = a.k) \
+                       GROUP BY x HAVING count(*) >= 1) \
+         ORDER BY id",
+    ];
+    for q in queries {
+        assert_eq!(mpedb_rows(&d, q), sqlite_rows(q), "mismatch on `{q}`");
+    }
     d.verify().unwrap();
 }

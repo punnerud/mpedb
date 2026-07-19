@@ -691,44 +691,109 @@ fn collect_expr_sources(e: &Expr, out: &mut Vec<String>) {
 }
 
 /// The V1 flattenable grammar. Anything outside it is refused (never answered).
+///
+/// The message names **every** reason the body cannot flatten, not just the
+/// first one hit. That is not cosmetics: this refusal is the front door to the
+/// derived-table gap, and when it reported only the first failing check the
+/// gap was mis-attributed downstream. A measured Django run classified 14
+/// statements as "a JOIN inside a derived table" — and every one of those 14
+/// ALSO had a `GROUP BY` or `DISTINCT` body, so flattening the join would have
+/// closed exactly none of them. One `check_simple` call is one bind error, so
+/// listing all the reasons costs nothing and stops the next reader from
+/// building the wrong thing.
 fn check_simple(v: &SelectStmt, name: &str) -> Result<()> {
-    let bad = |what: &str| {
-        Err(bind_err(format!(
-            "`{name}` uses {what}, which is not supported yet (only a \
-             single-table projection/filter source can be flattened)"
-        )))
-    };
+    let mut bad: Vec<&str> = Vec::new();
     if v.table.is_none() {
-        return bad("a FROM-less body");
+        bad.push("a FROM-less body");
     }
     if !v.joins.is_empty() {
-        return bad("a JOIN");
+        bad.push("a JOIN");
     }
     if v.distinct {
-        return bad("DISTINCT");
+        bad.push("DISTINCT");
     }
     if !v.group_by.is_empty() || v.having.is_some() {
-        return bad("GROUP BY/HAVING");
+        bad.push("GROUP BY/HAVING");
     }
     if !v.order_by.is_empty() {
-        return bad("ORDER BY");
+        bad.push("ORDER BY");
     }
     if v.limit.is_some() || v.offset.is_some() {
-        return bad("LIMIT/OFFSET");
+        bad.push("LIMIT/OFFSET");
     }
     // Items must be `*` or bare, un-aliased columns (so exposed name == base
     // column name and no expression remapping is needed).
     if let Some(items) = &v.items {
-        for (e, alias) in items {
-            if alias.is_some() {
-                return bad("an aliased/renamed column");
-            }
-            if !matches!(e, Expr::Col(_)) {
-                return bad("a computed (non-column) projection");
-            }
+        if items.iter().any(|(_, alias)| alias.is_some()) {
+            bad.push("an aliased/renamed column");
+        }
+        // A QUALIFIED column (`b.c`) is named separately from a genuinely
+        // computed item: it is blocked only because `flatten_derived` renames
+        // the body's qualifier in the WHERE and not in the item list, so the
+        // spliced `b.c` would not resolve under the derived alias. Calling that
+        // "computed" sent a reader looking for an expression that is not there.
+        if items.iter().any(|(e, _)| matches!(e, Expr::Qualified(..))) {
+            bad.push("a qualified column (`t.c`) in the projection");
+        }
+        if items
+            .iter()
+            .any(|(e, _)| !matches!(e, Expr::Col(_) | Expr::Qualified(..)))
+        {
+            bad.push("a computed (non-column) projection");
+        }
+        // An aggregate with no GROUP BY still collapses the body to one row —
+        // named separately from "computed" because the cardinality change, not
+        // the expression, is what makes it unflattenable.
+        if items.iter().any(|(e, _)| expr_aggregates(e)) && v.group_by.is_empty() {
+            bad.push("an aggregate");
         }
     }
-    Ok(())
+    if bad.is_empty() {
+        return Ok(());
+    }
+    Err(bind_err(format!(
+        "`{name}` uses {}, which is not supported yet (only a single-table \
+         projection/filter source can be flattened)",
+        bad.join(" + ")
+    )))
+}
+
+/// Does this projection item aggregate (or window-aggregate) the body's rows?
+/// Only the top-level shape matters — a subquery opens its own scope, so an
+/// aggregate inside one does not collapse THIS body.
+fn expr_aggregates(e: &Expr) -> bool {
+    match e {
+        Expr::Agg(..) | Expr::Window { .. } => true,
+        Expr::Unary(_, a)
+        | Expr::IsNull(a, _)
+        | Expr::Cast(a, _)
+        | Expr::Collate(a, _)
+        | Expr::InParamSlot(a, _, _)
+        | Expr::InContext(a, _, _) => expr_aggregates(a),
+        Expr::Binary(_, a, b)
+        | Expr::Like(a, b, _)
+        | Expr::Match(a, b)
+        | Expr::IsDistinct(a, b, _)
+        | Expr::Glob(a, b, _)
+        | Expr::Regexp(a, b, _) => expr_aggregates(a) || expr_aggregates(b),
+        Expr::InList(a, list, _) => expr_aggregates(a) || list.iter().any(expr_aggregates),
+        Expr::Case(arms, els) => {
+            arms.iter().any(|(c, r)| expr_aggregates(c) || expr_aggregates(r))
+                || els.as_deref().is_some_and(expr_aggregates)
+        }
+        Expr::Coalesce(xs) | Expr::Func(_, xs) | Expr::RowValue(xs) => {
+            xs.iter().any(expr_aggregates)
+        }
+        Expr::Subquery(_)
+        | Expr::Exists(..)
+        | Expr::InSubquery(..)
+        | Expr::Lit(_)
+        | Expr::Param(_)
+        | Expr::Col(_)
+        | Expr::Qualified(..)
+        | Expr::ContextRef(_)
+        | Expr::Excluded(_) => false,
+    }
 }
 
 fn merge_where(a: Option<Expr>, b: Option<Expr>) -> Option<Expr> {
