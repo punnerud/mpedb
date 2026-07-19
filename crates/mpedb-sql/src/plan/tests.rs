@@ -205,7 +205,7 @@ fn decode_rejects_truncation_and_stale_format_in_cast() {
         let p = prepare(sql, &s).unwrap();
         let _ = p.explain(&s); // must not panic rendering the affinity name
         let bytes = p.encode();
-        assert_eq!(bytes[0], 41, "plan format byte for {sql}");
+        assert_eq!(bytes[0], PLAN_FORMAT, "plan format byte for {sql}");
         let q = CompiledPlan::decode(&bytes, &s).expect(sql);
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         for cut in 0..bytes.len() {
@@ -246,7 +246,7 @@ fn bare_group_by_roundtrips_and_rejects_truncation_and_stale_format() {
         assert!(!agg.bare_cols.is_empty(), "bare_cols must be populated for {sql}");
 
         let bytes = p.encode();
-        assert_eq!(bytes[0], 41, "plan format byte for {sql}");
+        assert_eq!(bytes[0], PLAN_FORMAT, "plan format byte for {sql}");
         let q = CompiledPlan::decode(&bytes, &s).expect(sql);
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         for cut in 0..bytes.len() {
@@ -287,7 +287,7 @@ fn agg_filter_roundtrips_and_rejects_truncation_and_stale_format() {
         );
 
         let bytes = p.encode();
-        assert_eq!(bytes[0], 41, "plan format byte for {sql}");
+        assert_eq!(bytes[0], PLAN_FORMAT, "plan format byte for {sql}");
         let q = CompiledPlan::decode(&bytes, &s).expect(sql);
         assert_eq!(p, q, "roundtrip mismatch for {sql}");
         assert_eq!(p.hash(), q.hash(), "hash instability for {sql}");
@@ -426,7 +426,7 @@ fn decode_rejects_truncation_in_windows() {
     let ex = p.explain(&s);
     assert!(ex.contains("window __w"), "EXPLAIN should show the windows:\n{ex}");
     let bytes = p.encode();
-    assert_eq!(bytes[0], 41, "plan format byte");
+    assert_eq!(bytes[0], PLAN_FORMAT, "plan format byte");
     for cut in 0..bytes.len() {
         assert!(
             CompiledPlan::decode(&bytes[..cut], &s).is_err(),
@@ -495,7 +495,7 @@ fn compound_subplan_roundtrips_rejects_truncation_and_stale_format() {
         );
         let _ = p.explain(&s); // must not panic on the compound body render
         let bytes = p.encode();
-        assert_eq!(bytes[0], 41, "plan format byte for {sql}");
+        assert_eq!(bytes[0], PLAN_FORMAT, "plan format byte for {sql}");
         assert_eq!(CompiledPlan::decode(&bytes, &s).unwrap(), p, "roundtrip for {sql}");
         for cut in 0..bytes.len() {
             assert!(
@@ -645,16 +645,28 @@ fn tampered_footprint_byte_is_rejected() {
         off += tmp.len();
     }
     off += 1; // subplan count byte
-    // Flip the low bit of tables_read: decode must catch the forgery.
+    // The footprint now opens with `tables_read` as a SPARSE set (format 41):
+    // u16 count, then that many u32 ids. This plan reads exactly `users`, so
+    // the layout at `off` is [01 00] [id u32]. Retarget the id to a DIFFERENT
+    // real table: structurally valid, semantically a forgery, and the
+    // recompute-and-compare in `validate` must catch it.
+    assert_eq!(&bytes[off..off + 2], &1u16.to_le_bytes(), "read-set count");
     let mut evil = bytes.clone();
-    evil[off] ^= 1;
+    evil[off + 2] ^= 1;
     match CompiledPlan::decode(&evil, &s) {
         Err(Error::Corrupt(m)) => assert!(m.contains("footprint"), "{m}"),
         other => panic!("expected footprint corruption error, got {other:?}"),
     }
-    // Flip read_only (offset +24): rejected as inconsistent.
+    // A count that claims a second id the buffer does not hold: truncation.
     let mut evil = bytes.clone();
-    evil[off + 24] ^= 1;
+    evil[off] = 2;
+    assert!(CompiledPlan::decode(&evil, &s).is_err());
+    // Flip read_only. Layout: read set (2 + 4) + write set (2, empty)
+    // + indexes_used (8) = 16 bytes in.
+    let ro_at = off + 2 + 4 + 2 + 8;
+    assert_eq!(bytes[ro_at], 1, "read_only byte");
+    let mut evil = bytes.clone();
+    evil[ro_at] ^= 1;
     assert!(CompiledPlan::decode(&evil, &s).is_err());
 }
 

@@ -289,7 +289,7 @@ EXPLAIN SELECT DISTINCT dept FROM t
 Select DISTINCT t
   access: FullScan
   project: dept
-  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Full
+  footprint: read_only=true tables_read=[0] tables_written=[] indexes_used=0x1 key=Full
 
 # ---- ORDER BY by output position, and by an expression ------------------------------
 # `ORDER BY 1` is an ORDINAL — it names the first output column, not the

@@ -363,8 +363,8 @@ fn insert_footprint_point_extraction() {
     // Single row, PK from a literal: exact point write set.
     let p = prepare("INSERT INTO users (id, email) VALUES (1, 'a')", &s).unwrap();
     assert_eq!(p.footprint.key_access, KeyAccess::Point(vec![KeyPart::Const(0)]));
-    assert_eq!(p.footprint.tables_written, 1 << 2);
-    assert_eq!(p.footprint.tables_read, 0);
+    assert_eq!(p.footprint.tables_written.as_slice(), &[2]);
+    assert!(p.footprint.tables_read.is_empty());
     assert_eq!(p.footprint.indexes_used, 0b11); // PK + email index
     assert!(!p.footprint.read_only);
     // Multi-row: Full.
@@ -392,8 +392,8 @@ fn insert_footprint_point_extraction() {
 fn update_delete_footprints() {
     let s = test_schema();
     let p = prepare("UPDATE users SET age = age + 1 WHERE id = $1", &s).unwrap();
-    assert_eq!(p.footprint.tables_read, 1 << 2);
-    assert_eq!(p.footprint.tables_written, 1 << 2);
+    assert_eq!(p.footprint.tables_read.as_slice(), &[2]);
+    assert_eq!(p.footprint.tables_written.as_slice(), &[2]);
     assert_eq!(p.footprint.indexes_used, 0b01); // age has no index
     assert!(matches!(p.footprint.key_access, KeyAccess::Point(_)));
     assert!(!p.footprint.read_only);
@@ -414,8 +414,8 @@ fn txn_control_footprints() {
     let s = test_schema();
     for sql in ["BEGIN", "COMMIT", "ROLLBACK"] {
         let p = prepare(sql, &s).unwrap();
-        assert_eq!(p.footprint.tables_read, 0);
-        assert_eq!(p.footprint.tables_written, 0);
+        assert!(p.footprint.tables_read.is_empty());
+        assert!(p.footprint.tables_written.is_empty());
         assert_eq!(p.footprint.indexes_used, 0);
         assert_eq!(p.footprint.key_access, KeyAccess::Full);
         assert!(p.footprint.read_only);

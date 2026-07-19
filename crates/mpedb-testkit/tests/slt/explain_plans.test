@@ -30,7 +30,7 @@ EXPLAIN SELECT * FROM users WHERE id = 1
 Select users
   access: PkPoint(id = 1)
   project: id, email, age
-  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Point
+  footprint: read_only=true tables_read=[0] tables_written=[] indexes_used=0x1 key=Point
 
 # Bounds on the PK: range access; both bounds consumed, no residual filter.
 query T nosort
@@ -39,7 +39,7 @@ EXPLAIN SELECT * FROM users WHERE id > 1 AND id <= 5
 Select users
   access: PkRange(id > 1, id <= 5)
   project: id, email, age
-  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Range
+  footprint: read_only=true tables_read=[0] tables_written=[] indexes_used=0x1 key=Range
 
 # Equality on a unique column: secondary-index point probe (index 1), which
 # also touches the PK tree to fetch the row (indexes_used = 0x3).
@@ -49,7 +49,7 @@ EXPLAIN SELECT * FROM users WHERE email = 'a@x'
 Select users
   access: IndexPoint(email = 'a@x') via index 1
   project: id, email, age
-  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x3 key=Full
+  footprint: read_only=true tables_read=[0] tables_written=[] indexes_used=0x3 key=Full
 
 # No usable key: full scan with the predicate as a residual filter.
 query T nosort
@@ -59,7 +59,7 @@ Select users
   access: FullScan
   filter: age = 3
   project: id, email, age
-  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Full
+  footprint: read_only=true tables_read=[0] tables_written=[] indexes_used=0x1 key=Full
 
 # ORDER BY on an ascending PK prefix is elided (scan order already
 # satisfies it): no `order by:` line.
@@ -69,7 +69,7 @@ EXPLAIN SELECT * FROM users ORDER BY id
 Select users
   access: FullScan
   project: id, email, age
-  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Full
+  footprint: read_only=true tables_read=[0] tables_written=[] indexes_used=0x1 key=Full
 
 # Descending PK order is NOT elided.
 query T nosort
@@ -79,7 +79,7 @@ Select users
   access: FullScan
   project: id, email, age
   order by: id DESC
-  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Full
+  footprint: read_only=true tables_read=[0] tables_written=[] indexes_used=0x1 key=Full
 
 query T nosort
 EXPLAIN SELECT id, age + 1 FROM users WHERE id = 2 LIMIT 3 OFFSET 1
@@ -89,7 +89,7 @@ Select users
   project: id, age + 1
   limit: 3
   offset: 1
-  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Point
+  footprint: read_only=true tables_read=[0] tables_written=[] indexes_used=0x1 key=Point
 
 # Non-key conjuncts stay behind as the residual filter.
 query T nosort
@@ -99,7 +99,7 @@ Select users
   access: PkPoint(id = 1)
   filter: age > 2
   project: id, email, age
-  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Point
+  footprint: read_only=true tables_read=[0] tables_written=[] indexes_used=0x1 key=Point
 
 # PK access beats the secondary index; the email conjunct becomes a filter.
 query T nosort
@@ -109,7 +109,7 @@ Select users
   access: PkPoint(id = 1)
   filter: email = 'a@x'
   project: id, email, age
-  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Point
+  footprint: read_only=true tables_read=[0] tables_written=[] indexes_used=0x1 key=Point
 
 query T nosort
 EXPLAIN SELECT * FROM users WHERE age IS NULL ORDER BY email LIMIT 2
@@ -120,7 +120,7 @@ Select users
   project: id, email, age
   order by: email ASC
   limit: 2
-  footprint: read_only=true tables_read=0x1 tables_written=0x0 indexes_used=0x1 key=Full
+  footprint: read_only=true tables_read=[0] tables_written=[] indexes_used=0x1 key=Full
 
 # ---- DML plans -----------------------------------------------------------------
 
@@ -131,7 +131,7 @@ EXPLAIN INSERT INTO users (id, email) VALUES (1, 'a@x')
 ----
 Insert users
   row 1: id = 1, email = 'a@x', age = DEFAULT
-  footprint: read_only=false tables_read=0x0 tables_written=0x1 indexes_used=0x3 key=Point
+  footprint: read_only=false tables_read=[] tables_written=[0] indexes_used=0x3 key=Point
 
 # Multi-row insert degrades the write-set claim to Full.
 query T nosort
@@ -140,7 +140,7 @@ EXPLAIN INSERT INTO users (id, email, age) VALUES (2, 'b@x', 30), (3, 'c@x', NUL
 Insert users
   row 1: id = 2, email = 'b@x', age = 30
   row 2: id = 3, email = 'c@x', age = NULL
-  footprint: read_only=false tables_read=0x0 tables_written=0x1 indexes_used=0x3 key=Full
+  footprint: read_only=false tables_read=[] tables_written=[0] indexes_used=0x3 key=Full
 
 # Updating a non-indexed column touches only the PK tree (0x1).
 query T nosort
@@ -149,7 +149,7 @@ EXPLAIN UPDATE users SET age = age + 1 WHERE id = 1
 Update users
   access: PkPoint(id = 1)
   set: age = age + 1
-  footprint: read_only=false tables_read=0x1 tables_written=0x1 indexes_used=0x1 key=Point
+  footprint: read_only=false tables_read=[0] tables_written=[0] indexes_used=0x1 key=Point
 
 # Updating an indexed column adds its index bit (0x3).
 query T nosort
@@ -159,7 +159,7 @@ Update users
   access: FullScan
   filter: age > 10
   set: email = 'x@x'
-  footprint: read_only=false tables_read=0x1 tables_written=0x1 indexes_used=0x3 key=Full
+  footprint: read_only=false tables_read=[0] tables_written=[0] indexes_used=0x3 key=Full
 
 # Deletes unlink from every index regardless of access path.
 query T nosort
@@ -167,14 +167,14 @@ EXPLAIN DELETE FROM users WHERE id > 3
 ----
 Delete users
   access: PkRange(id > 3)
-  footprint: read_only=false tables_read=0x1 tables_written=0x1 indexes_used=0x3 key=Range
+  footprint: read_only=false tables_read=[0] tables_written=[0] indexes_used=0x3 key=Range
 
 query T nosort
 EXPLAIN DELETE FROM users
 ----
 Delete users
   access: FullScan
-  footprint: read_only=false tables_read=0x1 tables_written=0x1 indexes_used=0x3 key=Full
+  footprint: read_only=false tables_read=[0] tables_written=[0] indexes_used=0x3 key=Full
 
 # ---- EXPLAIN never executes -----------------------------------------------------
 
@@ -186,7 +186,7 @@ EXPLAIN INSERT INTO users (id, email) VALUES (2, 'b@x')
 ----
 Insert users
   row 1: id = 2, email = 'b@x', age = DEFAULT
-  footprint: read_only=false tables_read=0x0 tables_written=0x1 indexes_used=0x3 key=Point
+  footprint: read_only=false tables_read=[] tables_written=[0] indexes_used=0x3 key=Point
 
 # The explained INSERT above did not run.
 query I nosort
@@ -200,7 +200,7 @@ EXPLAIN UPDATE users SET age = 99
 Update users
   access: FullScan
   set: age = 99
-  footprint: read_only=false tables_read=0x1 tables_written=0x1 indexes_used=0x1 key=Full
+  footprint: read_only=false tables_read=[0] tables_written=[0] indexes_used=0x1 key=Full
 
 query I nosort
 SELECT age FROM users WHERE id = 1
@@ -212,7 +212,7 @@ EXPLAIN DELETE FROM users
 ----
 Delete users
   access: FullScan
-  footprint: read_only=false tables_read=0x1 tables_written=0x1 indexes_used=0x3 key=Full
+  footprint: read_only=false tables_read=[0] tables_written=[0] indexes_used=0x3 key=Full
 
 query I nosort
 SELECT id FROM users WHERE id = 1

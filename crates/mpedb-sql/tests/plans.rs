@@ -272,9 +272,9 @@ fn read_only_routing() {
         let is_write = sql.contains("INSERT") || sql.contains("UPDATE") || sql.contains("DELETE");
         assert_eq!(p.footprint.read_only, !is_write, "read_only wrong: {sql}");
         if p.footprint.read_only {
-            assert_eq!(p.footprint.tables_written, 0, "{sql}");
+            assert!(p.footprint.tables_written.is_empty(), "{sql}");
         } else {
-            assert_ne!(p.footprint.tables_written, 0, "{sql}");
+            assert!(!p.footprint.tables_written.is_empty(), "{sql}");
         }
     }
 }
