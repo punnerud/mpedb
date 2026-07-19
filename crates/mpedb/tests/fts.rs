@@ -9,10 +9,11 @@
 //! sqlite accepts too, keeping the diff exact.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::io::Write;
 use std::ops::Deref;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -98,18 +99,7 @@ fn sqlite_rows(setup: &[&str], query: &str) -> Vec<Vec<String>> {
     script.push_str(query);
     script.push_str(";\n");
 
-    let mut child = Command::new("sqlite3")
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the sqlite3 CLI (3.45, FTS5) must be on PATH for this cross-check");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(out.status.success(), "sqlite3 failed: {}", String::from_utf8_lossy(&out.stderr));
-    String::from_utf8(out.stdout)
-        .unwrap()
+    sqlite_oracle::script_stdout(&script, "")
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| l.split('|').map(str::to_string).collect())
@@ -309,12 +299,8 @@ fn match_on_non_fts_column_errors_identically() {
         "CREATE TABLE t(x TEXT PRIMARY KEY); INSERT INTO t VALUES('a'); \
          SELECT x FROM t WHERE x MATCH 'w'",
     ] {
-        let out = Command::new("sqlite3")
-            .arg(":memory:")
-            .arg(q)
-            .output()
-            .expect("sqlite3 on PATH");
-        let msg = String::from_utf8_lossy(&out.stderr);
+        let msg = sqlite_oracle::try_script_stdout(q, "")
+            .expect_err("sqlite must reject the misused MATCH");
         assert!(
             msg.contains("unable to use function MATCH in the requested context"),
             "sqlite said: {msg}"

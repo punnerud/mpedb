@@ -82,6 +82,23 @@ fn printf_percent_f_rounding_is_pinned_to_3_45() {
     assert_eq!(script_stdout("SELECT printf('%.1f', 0.25);", ""), "0.3\n");
 }
 
+/// The CLI prints C strings, so an embedded NUL truncates the cell. The value
+/// underneath is real — `printf('%c', NULL)` is a ONE-BYTE `\0` string in
+/// sqlite (`hex()` proves it) — but every differential expectation was written
+/// against the CLI's truncated rendering, so the oracle reproduces it.
+/// (mpedb's own `printf('%c', NULL)` is a genuinely empty string; the
+/// difference is invisible through this rendering, exactly as it was through
+/// the subprocess.)
+#[test]
+fn embedded_nul_truncates_like_the_clis_c_strings() {
+    assert_eq!(script_stdout("SELECT printf('%c', NULL);", ""), "\n");
+    assert_eq!(script_stdout("SELECT hex(printf('%c', NULL));", ""), "00\n");
+    assert_eq!(
+        script_stdout("SELECT 'a' || printf('%c', NULL) || 'b';", ""),
+        "a\n"
+    );
+}
+
 #[test]
 fn error_paths_carry_sqlites_message_and_lenient_mode_continues() {
     // Fail-fast: first error, sqlite's own text.

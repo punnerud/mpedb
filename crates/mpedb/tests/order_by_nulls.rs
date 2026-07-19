@@ -22,10 +22,11 @@
 //! full sort, which is what would catch the two paths drifting apart.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -66,16 +67,6 @@ primary_key = ["id"]
   name = "nonull"
   type = "text"
 "#;
-
-fn sqlite_available() -> bool {
-    Command::new("sqlite3")
-        .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
 
 fn inserts() -> Vec<String> {
     DATA.iter()
@@ -149,27 +140,7 @@ fn sqlite_rows(query: &str) -> Vec<String> {
     }
     input.push_str(query);
     input.push_str(";\n");
-    let mut child = Command::new("sqlite3")
-        .args(["-batch", "-noheader", "-nullvalue", "NULL", ":memory:"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn sqlite3");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(input.as_bytes())
-        .expect("write to sqlite3");
-    let out = child.wait_with_output().expect("wait sqlite3");
-    assert!(
-        out.status.success(),
-        "sqlite3 failed for `{query}`: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout)
-        .expect("utf8")
+    sqlite_oracle::script_stdout(&input, "NULL")
         .lines()
         .map(|l| l.to_string())
         .collect()
@@ -185,10 +156,6 @@ fn cross_check(db: &Database, query: &str) {
 /// NO-NULL column, in both the projection and the sort key.
 #[test]
 fn nulls_placement_matches_sqlite_for_every_direction_and_column() {
-    if !sqlite_available() {
-        eprintln!("skipping: sqlite3 CLI not found");
-        return;
-    }
     let (db, path) = open();
 
     for col in ["s", "n", "allnull", "nonull"] {
@@ -216,10 +183,6 @@ fn nulls_placement_matches_sqlite_for_every_direction_and_column() {
 /// it would look like "rows in a slightly odd order", not like a failure.
 #[test]
 fn default_placement_is_unchanged() {
-    if !sqlite_available() {
-        eprintln!("skipping: sqlite3 CLI not found");
-        return;
-    }
     let (db, path) = open();
 
     for q in [
@@ -262,10 +225,6 @@ fn default_placement_is_unchanged() {
 /// A NULL placement on every pipeline shape, not only the base-row sort.
 #[test]
 fn nulls_placement_matches_sqlite_in_every_pipeline_shape() {
-    if !sqlite_available() {
-        eprintln!("skipping: sqlite3 CLI not found");
-        return;
-    }
     let (db, path) = open();
 
     for q in [
@@ -301,10 +260,6 @@ fn nulls_placement_matches_sqlite_in_every_pipeline_shape() {
 /// every single-key test above and still be wrong.
 #[test]
 fn per_key_placements_are_independent() {
-    if !sqlite_available() {
-        eprintln!("skipping: sqlite3 CLI not found");
-        return;
-    }
     let (db, path) = open();
 
     for q in [
@@ -329,10 +284,6 @@ fn per_key_placements_are_independent() {
 /// would not if BOTH were wrong the same way.
 #[test]
 fn the_top_k_heap_agrees_with_the_full_sort_and_with_sqlite() {
-    if !sqlite_available() {
-        eprintln!("skipping: sqlite3 CLI not found");
-        return;
-    }
     let (db, path) = open();
 
     for order in [

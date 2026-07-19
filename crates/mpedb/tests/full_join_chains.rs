@@ -8,14 +8,16 @@
 //! matched (NULL-extended on the left, at the current accumulated width). That
 //! composition is position-independent, so FULL is allowed at ANY position in a
 //! chain — this test PROVES it by running many 3- and 4-table shapes through
-//! BOTH mpedb and the real `/usr/bin/sqlite3` and requiring byte-identical
+//! BOTH mpedb and the BUNDLED sqlite 3.45.0 and requiring byte-identical
 //! output.
 //!
-//! The test is a true differential: sqlite is the oracle, shelled out per query.
-//! If `sqlite3` is not present the test is skipped (CI images without it still
-//! build), but on this repo's dev box it runs and gates every allowed shape.
+//! The test is a true differential: sqlite is the oracle — the in-process
+//! bundled library (`tests/sqlite_oracle`), so it runs identically on every
+//! machine and never skips.
 use mpedb::{Config, Database, ExecResult, Value};
-use std::process::Command;
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 // ---- schema + data, identical on both engines --------------------------------
 
@@ -75,9 +77,10 @@ fn open_mpedb(path: &str) -> Database {
     db
 }
 
-/// Build the sqlite reference file once. Returns None if sqlite3 is unavailable.
-fn build_sqlite(path: &str) -> Option<()> {
-    let _ = std::fs::remove_file(path);
+/// The sqlite reference schema+data, replayed on a fresh in-memory bundled
+/// connection for every query (the old version materialized a `.sqlite` file
+/// for the system binary).
+fn build_sqlite_ddl() -> String {
     let mut ddl = String::new();
     for t in TABLES {
         ddl.push_str(&format!(
@@ -90,11 +93,7 @@ fn build_sqlite(path: &str) -> Option<()> {
             ));
         }
     }
-    let out = Command::new("/usr/bin/sqlite3").arg(path).arg(ddl).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(())
+    ddl
 }
 
 // ---- running + formatting ----------------------------------------------------
@@ -121,23 +120,8 @@ fn run_mpedb(db: &Database, sql: &str) -> Result<Vec<String>, String> {
     }
 }
 
-fn run_sqlite(path: &str, sql: &str) -> Vec<String> {
-    let out = Command::new("/usr/bin/sqlite3")
-        .arg("-list")
-        .arg("-separator")
-        .arg("|")
-        .arg("-nullvalue")
-        .arg("NULL")
-        .arg(path)
-        .arg(sql)
-        .output()
-        .expect("sqlite3 spawn");
-    assert!(
-        out.status.success(),
-        "sqlite3 failed on {sql:?}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let s = String::from_utf8(out.stdout).expect("utf8");
+fn run_sqlite(ddl: &str, sql: &str) -> Vec<String> {
+    let s = sqlite_oracle::script_stdout(&format!("{ddl}{sql};\n"), "NULL");
     s.lines().map(|l| l.to_string()).collect()
 }
 
@@ -238,16 +222,9 @@ fn full_join_chains_match_sqlite() {
         "/tmp"
     };
     let mpath = format!("{dir}/mpedb-fjc-{pid}.mpedb");
-    let spath = format!("{dir}/mpedb-fjc-{pid}.sqlite");
 
     let db = open_mpedb(&mpath);
-    let have_sqlite = build_sqlite(&spath).is_some();
-    if !have_sqlite {
-        eprintln!("sqlite3 unavailable — skipping FULL-join differential");
-        let _ = std::fs::remove_file(&mpath);
-        let _ = std::fs::remove_file(format!("{mpath}-wal"));
-        return;
-    }
+    let sddl = build_sqlite_ddl();
 
     let mut checked = 0usize;
     let mut refused_ok = 0usize;
@@ -291,7 +268,7 @@ fn full_join_chains_match_sqlite() {
                                         continue;
                                     }
                                     checked += 1;
-                                    let want = run_sqlite(&spath, &q);
+                                    let want = run_sqlite(&sddl, &q);
                                     if got != want {
                                         failures.push(format!(
                                             "DIVERGED [{tag}]\n  SQL: {q}\n  mpedb:  {got:?}\n  \
@@ -322,7 +299,6 @@ fn full_join_chains_match_sqlite() {
 
     let _ = std::fs::remove_file(&mpath);
     let _ = std::fs::remove_file(format!("{mpath}-wal"));
-    let _ = std::fs::remove_file(&spath);
 
     eprintln!("matched {checked} shapes vs sqlite; {refused_ok} leading-RIGHT+FULL cleanly refused");
     assert!(checked > 250, "too few shapes exercised: {checked}");

@@ -22,7 +22,11 @@
 //!   `sqlite3_column_text` itself uses, so `1.5` → `1.5`, `1e20` → `1.0e+20`,
 //!   `-0.0` → `0.0` exactly as the CLI prints them);
 //! - TEXT verbatim; BLOB as its raw bytes (lossily UTF-8, like piping the
-//!   CLI's stdout through `String::from_utf8`).
+//!   CLI's stdout through `String::from_utf8`);
+//! - both TRUNCATED at an embedded NUL byte, because the CLI prints C
+//!   strings: `printf('%c', NULL)` really is a one-byte `\0` string in
+//!   sqlite (`hex()` says `00`), but the shell prints it as the empty
+//!   string, and the differential expectations were written against that.
 //!
 //! Two semantic corrections to match the CLI environment the tests were
 //! written against:
@@ -88,7 +92,24 @@ pub fn script_stdout_lenient(script: &str, nullvalue: &str) -> String {
     }
 }
 
+/// Like [`script_stdout`] with the CLI's `.headers on`: each statement that
+/// produces at least one row is preceded by its column names, `|`-joined.
+/// (Verified against the CLI: a zero-row statement prints NO header line.)
+pub fn script_stdout_headers(script: &str, nullvalue: &str) -> String {
+    match run(script, nullvalue, false, true) {
+        Ok(out) => out,
+        Err(e) => panic!(
+            "bundled sqlite ({}) failed: {e}\nscript:\n{script}",
+            version()
+        ),
+    }
+}
+
 fn run_script(script: &str, nullvalue: &str, lenient: bool) -> Result<String, String> {
+    run(script, nullvalue, lenient, false)
+}
+
+fn run(script: &str, nullvalue: &str, lenient: bool, headers: bool) -> Result<String, String> {
     let conn = Connection::open_in_memory().expect("open in-memory bundled sqlite");
     // Stock-sqlite default (see module docs); the bundled build flips it.
     conn.pragma_update(None, "foreign_keys", false)
@@ -109,7 +130,7 @@ fn run_script(script: &str, nullvalue: &str, lenient: bool) -> Result<String, St
             // continuable — lenient callers get the panic in their wrapper.
             Err(e) => return Err(e.to_string()),
         };
-        if let Err(e) = run_stmt(&mut stmt, &mut caster, nullvalue, &mut out) {
+        if let Err(e) = run_stmt(&mut stmt, &mut caster, nullvalue, headers, &mut out) {
             if lenient {
                 continue;
             }
@@ -123,6 +144,7 @@ fn run_stmt(
     stmt: &mut Statement,
     caster: &mut Statement,
     nullvalue: &str,
+    headers: bool,
     out: &mut String,
 ) -> rusqlite::Result<()> {
     if stmt.column_count() == 0 {
@@ -130,8 +152,22 @@ fn run_stmt(
         return Ok(());
     }
     let ncol = stmt.column_count();
+    let header: Option<String> = if headers {
+        let names: Vec<&str> = stmt.column_names();
+        Some(names.join("|"))
+    } else {
+        None
+    };
+    let mut first = true;
     let mut rows = stmt.raw_query();
     while let Some(row) = rows.next()? {
+        if first {
+            if let Some(h) = &header {
+                out.push_str(h);
+                out.push('\n');
+            }
+            first = false;
+        }
         for i in 0..ncol {
             if i > 0 {
                 out.push('|');
@@ -143,11 +179,19 @@ fn run_stmt(
                     let text: String = caster.query_row([f], |r| r.get(0))?;
                     out.push_str(&text);
                 }
-                ValueRef::Text(t) => out.push_str(&String::from_utf8_lossy(t)),
-                ValueRef::Blob(b) => out.push_str(&String::from_utf8_lossy(b)),
+                ValueRef::Text(t) => out.push_str(&String::from_utf8_lossy(c_str(t))),
+                ValueRef::Blob(b) => out.push_str(&String::from_utf8_lossy(c_str(b))),
             }
         }
         out.push('\n');
     }
     Ok(())
+}
+
+/// The CLI prints values as C strings — an embedded NUL truncates.
+fn c_str(bytes: &[u8]) -> &[u8] {
+    match bytes.iter().position(|&b| b == 0) {
+        Some(n) => &bytes[..n],
+        None => bytes,
+    }
 }

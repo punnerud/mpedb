@@ -21,10 +21,11 @@
 //! query, and the two outputs must match exactly.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::io::Write;
 use std::ops::Deref;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -105,22 +106,7 @@ fn sqlite_rows(setup: &[String], query: &str) -> Vec<Vec<String>> {
     }
     script.push_str(query);
     script.push_str(";\n");
-    let mut child = Command::new("sqlite3")
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the sqlite3 CLI (3.45) must be on PATH for this cross-check");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
-    let out = child.wait_with_output().unwrap();
-    assert!(
-        out.status.success(),
-        "sqlite3 failed on `{query}`: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8(out.stdout)
-        .unwrap()
+    sqlite_oracle::script_stdout(&script, "")
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| l.split('|').map(str::to_string).collect())
@@ -135,8 +121,8 @@ fn seed_both(d: &Database, stmts: &[&str]) -> Vec<String> {
     let mut accepted: Vec<String> = Vec::new();
     for s in stmts {
         let mine = d.query(s, &[]).is_ok();
-        // Replay everything accepted so far, then this statement, in a fresh
-        // sqlite process; a non-zero exit means sqlite rejected it.
+        // Replay everything accepted so far, then this statement, on a fresh
+        // bundled-sqlite connection; an error means sqlite rejected it.
         let mut script = String::new();
         for a in &accepted {
             script.push_str(a);
@@ -144,15 +130,7 @@ fn seed_both(d: &Database, stmts: &[&str]) -> Vec<String> {
         }
         script.push_str(s);
         script.push_str(";\n");
-        let mut child = Command::new("sqlite3")
-            .arg(":memory:")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("the sqlite3 CLI (3.45) must be on PATH for this cross-check");
-        child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
-        let theirs = child.wait_with_output().unwrap().status.success();
+        let theirs = sqlite_oracle::try_script_stdout(&script, "").is_ok();
         assert_eq!(
             mine, theirs,
             "accept/reject disagreement on `{s}` (mpedb ok={mine}, sqlite ok={theirs})"

@@ -7,7 +7,7 @@
 //! than rejected. This test drives `CAST(<value> AS <type>)` through both
 //! engines over a matrix of type names × source values and asserts they agree.
 //!
-//! Reference: `/usr/bin/sqlite3`. Skipped (not failed) if it is absent.
+//! Reference: the BUNDLED sqlite (`tests/sqlite_oracle`) — always present.
 //!
 //! Deliberate, documented deviations (NOT diffed here; asserted separately in
 //! `documented_deviations`):
@@ -19,9 +19,9 @@
 
 use mpedb::{Config, Database, ExecResult};
 use mpedb_types::Value;
-use std::process::Command;
 
-const SQLITE3: &str = "/usr/bin/sqlite3";
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 /// One throwaway database (FROM-less SELECT needs no user tables, but a config
 /// needs at least one, so we declare a trivial one and never touch it).
@@ -66,17 +66,13 @@ fn mpedb_eval(db: &Database, expr: &str) -> Result<Value, String> {
     }
 }
 
-/// sqlite's `typeof|quote` for `SELECT <expr>`, or `None` if sqlite errored.
+/// The bundled sqlite's `typeof|quote` for `SELECT <expr>`, or `None` if it errored.
 fn sqlite_eval(expr: &str) -> Option<String> {
-    let out = Command::new(SQLITE3)
-        .arg(":memory:")
-        .arg(format!("SELECT typeof({expr}) || '|' || quote({expr});"))
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8(out.stdout).ok()?;
+    let s = sqlite_oracle::try_script_stdout(
+        &format!("SELECT typeof({expr}) || '|' || quote({expr});"),
+        "",
+    )
+    .ok()?;
     Some(s.trim_end().to_string())
 }
 
@@ -208,10 +204,6 @@ fn matrix() -> Vec<String> {
 
 #[test]
 fn cast_matches_sqlite_across_affinities() {
-    if !std::path::Path::new(SQLITE3).exists() {
-        eprintln!("skipping: {SQLITE3} not found");
-        return;
-    }
     let (db, path) = open();
     let mut mismatches = Vec::new();
     for expr in matrix() {

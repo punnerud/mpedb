@@ -8,14 +8,14 @@
 //! caller asking a sqlite question, and one that contradicted the C-API's
 //! `sqlite3_column_type`, which has always mapped both onto `SQLITE_INTEGER`.
 //!
-//! Reference: `/usr/bin/sqlite3` (3.45); the differential is skipped, not
-//! failed, if the binary is absent.
+//! Reference: the BUNDLED sqlite 3.45 (`tests/sqlite_oracle`) — always
+//! present, so the differential never skips.
 
 use mpedb::{params, Config, Database, ExecResult, Value};
 use std::ops::Deref;
-use std::process::Command;
 
-const SQLITE3: &str = "/usr/bin/sqlite3";
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 /// Takes its file with it when it dies (the `/dev/shm` leak discipline).
 struct Tmp {
@@ -65,12 +65,8 @@ fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
 
 /// sqlite's answer for `script`, one line per row, columns joined by `|`.
 fn sq(script: &str) -> Option<Vec<String>> {
-    let out = Command::new(SQLITE3).arg(":memory:").arg(script).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
     Some(
-        String::from_utf8(out.stdout)
+        sqlite_oracle::try_script_stdout(script, "")
             .ok()?
             .lines()
             .map(|l| l.trim_end().to_string())
@@ -204,8 +200,7 @@ fn typeof_over_every_class_and_every_mpedb_type_matches_sqlite() {
                   SELECT typeof(b), typeof(ts), typeof(a), typeof(i), typeof(f), \
                   typeof(s), typeof(l) FROM t ORDER BY id;";
     let Some(want) = sq(script) else {
-        eprintln!("sqlite3 unavailable — differential skipped");
-        return;
+        panic!("the bundled sqlite rejected the reference script");
     };
     assert_eq!(got, want, "mpedb typeof() disagrees with sqlite 3.45");
 }
@@ -245,8 +240,7 @@ fn typeof_over_literals_and_expressions_matches_sqlite() {
     }
 
     let Some(want) = sq(&format!("SELECT {select};")) else {
-        eprintln!("sqlite3 unavailable — differential skipped");
-        return;
+        panic!("the bundled sqlite rejected the reference SELECT");
     };
     assert_eq!(vec![got], want, "mpedb typeof() disagrees with sqlite 3.45");
 }

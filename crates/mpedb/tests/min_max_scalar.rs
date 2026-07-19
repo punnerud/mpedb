@@ -16,10 +16,11 @@
 //! `typeof(max(1, 1.0)) = 'integer'` and `typeof(min(1, 1.0)) = 'real'`.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use std::io::Write;
 use std::ops::Deref;
-use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -100,26 +101,14 @@ fn mpedb_rows(db: &Database, sql: &str) -> Vec<Vec<String>> {
 }
 
 fn sqlite_rows(query: &str) -> Vec<Vec<String>> {
-    let mut script = format!(".nullvalue NULL\n{SQLITE_DDL};\n");
+    let mut script = format!("{SQLITE_DDL};\n");
     for r in ROWS {
         script.push_str(r);
         script.push_str(";\n");
     }
     script.push_str(query);
     script.push_str(";\n");
-    let mut child = Command::new("sqlite3")
-        .arg(":memory:")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("the sqlite3 CLI must be on PATH for this cross-check");
-    child.stdin.take().unwrap().write_all(script.as_bytes()).unwrap();
-    let out = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr).to_string();
-    assert!(out.status.success() && stderr.is_empty(), "sqlite3 failed: {stderr}\n{script}");
-    String::from_utf8(out.stdout)
-        .unwrap()
+    sqlite_oracle::script_stdout(&script, "NULL")
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| l.split('|').map(str::to_string).collect())
