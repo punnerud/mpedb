@@ -336,6 +336,9 @@ enum Pred {
     Ne(String, String),
     In(String, Vec<String>),
     Like(String, String, bool), // (col, pattern, negated)
+    /// A clause-leading `NOT` (Django's introspection writes
+    /// `AND NOT name='sqlite_sequence'`).
+    Not(Box<Pred>),
 }
 
 impl Pred {
@@ -351,6 +354,7 @@ impl Pred {
             Pred::Ne(c, v) => val(c) != *v,
             Pred::In(c, vs) => vs.iter().any(|v| *v == val(c)),
             Pred::Like(c, pat, neg) => like_match(&val(c), pat) != *neg,
+            Pred::Not(inner) => !inner.matches(r),
         }
     }
 }
@@ -374,43 +378,66 @@ fn parse_where(w: &str) -> Result<Vec<Pred>, DbError> {
     let mut preds = Vec::new();
     // Split on AND (case-insensitive), at top level (no nested parens support).
     for clause in split_and(w) {
-        let c = clause.trim();
-        let cl = c.to_ascii_lowercase();
-        let col_of = |c: &str| {
-            let t = c.trim().trim_matches('"').to_ascii_lowercase();
-            if ["type", "name", "tbl_name"].contains(&t.as_str()) {
-                Some(t)
-            } else {
-                None
-            }
-        };
-        if let Some(idx) = cl.find(" not like ") {
-            let col = col_of(&c[..idx]).ok_or_else(unsupported)?;
-            let pat = str_literal(&c[idx + 10..]).ok_or_else(unsupported)?;
-            preds.push(Pred::Like(col, pat, true));
-        } else if let Some(idx) = cl.find(" like ") {
-            let col = col_of(&c[..idx]).ok_or_else(unsupported)?;
-            let pat = str_literal(&c[idx + 6..]).ok_or_else(unsupported)?;
-            preds.push(Pred::Like(col, pat, false));
-        } else if let Some(idx) = cl.find(" in ") {
-            let col = col_of(&c[..idx]).ok_or_else(unsupported)?;
-            let list = &c[idx + 4..];
-            let inner = list.trim().trim_start_matches('(').trim_end_matches(')');
-            let vals: Option<Vec<String>> = inner.split(',').map(str_literal).collect();
-            preds.push(Pred::In(col, vals.ok_or_else(unsupported)?));
-        } else if let Some(idx) = cl.find("!=").or_else(|| cl.find("<>")) {
-            let col = col_of(&c[..idx]).ok_or_else(unsupported)?;
-            let v = str_literal(&c[idx + 2..]).ok_or_else(unsupported)?;
-            preds.push(Pred::Ne(col, v));
-        } else if let Some(idx) = c.find('=') {
-            let col = col_of(&c[..idx]).ok_or_else(unsupported)?;
-            let v = str_literal(&c[idx + 1..]).ok_or_else(unsupported)?;
-            preds.push(Pred::Eq(col, v));
-        } else {
-            return Err(unsupported());
+        let mut c = clause.trim();
+        // A clause-leading `NOT` negates the comparison that follows — Django's
+        // `get_table_list` writes `AND NOT name='sqlite_sequence'`. Doubled
+        // `NOT`s cancel.
+        let mut negate = false;
+        while c.len() >= 4
+            && c[..3].eq_ignore_ascii_case("not")
+            && c.as_bytes()[3].is_ascii_whitespace()
+        {
+            negate = !negate;
+            c = c[3..].trim_start();
         }
+        let p = parse_cmp(c)?;
+        preds.push(if negate { Pred::Not(Box::new(p)) } else { p });
     }
     Ok(preds)
+}
+
+/// One comparison of a `sqlite_master` WHERE clause. A shape this does not
+/// recognize is REFUSED — including anything containing a top-level `OR`, whose
+/// operands this AND-only evaluator would otherwise silently drop and answer
+/// wrongly.
+fn parse_cmp(c: &str) -> Result<Pred, DbError> {
+    let cl = c.to_ascii_lowercase();
+    if cl.starts_with("or ") || cl.contains(" or ") {
+        return Err(unsupported());
+    }
+    let col_of = |c: &str| {
+        let t = c.trim().trim_matches('"').to_ascii_lowercase();
+        if ["type", "name", "tbl_name"].contains(&t.as_str()) {
+            Some(t)
+        } else {
+            None
+        }
+    };
+    if let Some(idx) = cl.find(" not like ") {
+        let col = col_of(&c[..idx]).ok_or_else(unsupported)?;
+        let pat = str_literal(&c[idx + 10..]).ok_or_else(unsupported)?;
+        Ok(Pred::Like(col, pat, true))
+    } else if let Some(idx) = cl.find(" like ") {
+        let col = col_of(&c[..idx]).ok_or_else(unsupported)?;
+        let pat = str_literal(&c[idx + 6..]).ok_or_else(unsupported)?;
+        Ok(Pred::Like(col, pat, false))
+    } else if let Some(idx) = cl.find(" in ") {
+        let col = col_of(&c[..idx]).ok_or_else(unsupported)?;
+        let list = &c[idx + 4..];
+        let inner = list.trim().trim_start_matches('(').trim_end_matches(')');
+        let vals: Option<Vec<String>> = inner.split(',').map(str_literal).collect();
+        Ok(Pred::In(col, vals.ok_or_else(unsupported)?))
+    } else if let Some(idx) = cl.find("!=").or_else(|| cl.find("<>")) {
+        let col = col_of(&c[..idx]).ok_or_else(unsupported)?;
+        let v = str_literal(&c[idx + 2..]).ok_or_else(unsupported)?;
+        Ok(Pred::Ne(col, v))
+    } else if let Some(idx) = c.find('=') {
+        let col = col_of(&c[..idx]).ok_or_else(unsupported)?;
+        let v = str_literal(&c[idx + 1..]).ok_or_else(unsupported)?;
+        Ok(Pred::Eq(col, v))
+    } else {
+        Err(unsupported())
+    }
 }
 
 /// Split on top-level ` AND ` (case-insensitive). No parenthesized-group support.
