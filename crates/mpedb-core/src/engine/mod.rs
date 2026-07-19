@@ -1139,10 +1139,13 @@ impl Engine {
             match self.try_begin_write() {
                 Ok(Some(txn)) => return Ok(txn),
                 Ok(None) => {}
-                // The lock is held by THIS VERY THREAD (the ERRORCHECK
-                // EDEADLK answer, same phrase on the macOS flock path —
-                // the contract mpedb-capi's `is_writer_lock_reentry` also
-                // matches): waiting out the deadline cannot succeed, the
+                // The lock is held by THIS VERY THREAD (glibc's ROBUST+
+                // ERRORCHECK trylock answers the owner EDEADLK; the contract
+                // mpedb-capi's `is_writer_lock_reentry` also matches). On
+                // macOS trylock answers EBUSY for the same relock
+                // (rdar://16261552), so this arm is dead there and a
+                // same-thread sibling waits out its full deadline — bounded,
+                // just not immediate: waiting cannot succeed, the
                 // owner IS the caller. Answer Busy now — deterministic
                 // deadlock avoidance with the same terminal result sqlite
                 // reaches only after burning the whole timeout. The
@@ -1187,8 +1190,20 @@ impl Engine {
         // #47 stage 3: another process's DDL commit bumped schema_gen —
         // reload before this txn captures its bundle (under the writer
         // lock, so the reloaded schema cannot move again beneath us).
+        //
+        // The error arm MUST unlock, exactly as newest_meta's above: the
+        // reload takes a read pin internally, so a full reader table
+        // (ReadersFull — a designed-for, retryable state) reaches here, and
+        // propagating it with the lock held leaks the writer lock for the
+        // process's lifetime. Repro'd during the #109 review: every later
+        // same-thread write became EDEADLK — or, under a busy policy, a
+        // silent terminal Busy — and every OTHER process burned its full
+        // timeout per statement until this process died.
         if meta.schema_gen != self.bundle().schema_gen {
-            self.reload_schema_from_catalog()?;
+            if let Err(e) = self.reload_schema_from_catalog() {
+                self.shm.writer_unlock();
+                return Err(e);
+            }
         }
         Ok(WriteTxn {
             eng: self,

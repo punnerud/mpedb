@@ -2155,6 +2155,11 @@ fn busy_timeout_bounds_writer_lock_wait() {
 /// the caller's own thread — it cannot release while we poll), so a busy
 /// timeout is deliberately NOT burned down: immediate BUSY, sqlite's message.
 #[test]
+// glibc-only: Apple's libpthread answers EBUSY (not EDEADLK) for an
+// owner's errorcheck trylock (rdar://16261552), so on macOS the reentry
+// fold is dead and a same-thread sibling waits out its full deadline —
+// bounded, just not immediate.
+#[cfg_attr(target_os = "macos", ignore = "EBUSY-on-relock: no immediate fold on macOS")]
 fn busy_timeout_same_thread_sibling_is_immediate() {
     use std::time::{Duration, Instant};
     unsafe {
