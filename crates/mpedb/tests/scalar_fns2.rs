@@ -191,11 +191,21 @@ fn new_scalar_fns_match_sqlite_over_a_table() {
 }
 
 #[test]
-fn iif_condition_must_be_boolean_and_hex_rejects_numbers() {
+fn iif_condition_is_truthy_tested_and_hex_rejects_numbers() {
     let (db, path) = mpedb_db();
-    // iif's condition is a rigid boolean, like a CASE WHEN — a bare number is
-    // a compile error (sqlite would coerce; mpedb does not).
-    assert!(db.query("SELECT iif(id, 'a', 'b') FROM t", &[]).is_err());
+    // iif's condition is a CASE WHEN, so it is truthy-tested exactly as sqlite
+    // does (Django gap #5): a bare number, a text value and NULL all follow
+    // `sqlite3VdbeBooleanValue`. Diffed against the sqlite3 binary.
+    if sqlite_available() {
+        for q in [
+            "SELECT iif(id, 'a', 'b') FROM t",
+            "SELECT iif(c, 'a', 'b') FROM t",
+            "SELECT iif(s, 'a', 'b') FROM t",
+            "SELECT iif(id - 1, 'a', 'b') FROM t",
+        ] {
+            cross_check(&db, q);
+        }
+    }
     // hex accepts text/blob only; an integer argument is a compile error
     // rather than sqlite's render-to-text-then-hex.
     assert!(db.query("SELECT hex(c) FROM t", &[]).is_err());

@@ -1952,7 +1952,13 @@ impl<'a> Binder<'a> {
         let (probe, zero) = match src {
             ColumnType::Int64 => (e, Value::Int(0)),
             ColumnType::Float64 => (e, Value::Float(0.0)),
-            _ => (BExpr::Cast(Box::new(e), Affinity::Real), Value::Float(0.0)),
+            // Fold the CAST first, so a constant boolean context (`WHERE 'abc'`)
+            // reduces all the way to a Bool const and the planner can see it is
+            // dead. `Affinity::Real` never errors, so folding it is always safe.
+            _ => (
+                fold_maybe(BExpr::Cast(Box::new(e), Affinity::Real), self.suppress_fold)?,
+                Value::Float(0.0),
+            ),
         };
         let e = fold_maybe(
             BExpr::Binary(BinOp::Ne, Box::new(probe), Box::new(BExpr::Const(zero))),
@@ -2417,21 +2423,50 @@ mod tests {
         for src in [
             "name = 1",
             "id = 'x'",
-            "active = 1",
             "id + 'x'",
             "name + name",
             "created = 1",
             "data = 'x'",
             "-name",
-            "NOT id",
-            "id AND active",
             "name LIKE 1",
+            // Arithmetic on a bool is still rigid — the int/bool bridge is a
+            // COMPARISON/assignment rule, never a general interchange.
+            "active + 1",
         ] {
             assert!(
                 matches!(bind(src, 0), Err(Error::Bind(_))),
                 "expected bind error for {src}"
             );
         }
+        // Formerly rigid, now sqlite-compatible (Django gap #5). `active` is a
+        // bool column, `id` an int64 one.
+        for src in ["active = 1", "active = 0", "NOT id", "id AND active"] {
+            assert!(bind(src, 0).is_ok(), "expected {src} to bind");
+        }
+        // `active = 1` keeps the plain `Binary(Eq, Col, Const)` shape — the int
+        // literal folds into the bool domain rather than casting the column, so
+        // an index probe on the column survives.
+        let (e, ty, _) = bind("active = 1", 0).unwrap();
+        assert_eq!(ty, Some(ColumnType::Bool));
+        assert_eq!(
+            e,
+            BExpr::Binary(
+                BinOp::Eq,
+                Box::new(BExpr::Col(3)),
+                Box::new(BExpr::Const(Value::Bool(true))),
+            )
+        );
+        // A non-0/1 integer casts the BOOL side up instead, so `active = 2` is
+        // FALSE (sqlite's answer) rather than TRUE.
+        let (e, _, _) = bind("active = 2", 0).unwrap();
+        assert_eq!(
+            e,
+            BExpr::Binary(
+                BinOp::Eq,
+                Box::new(BExpr::Cast(Box::new(BExpr::Col(3)), Affinity::Integer)),
+                Box::new(BExpr::Const(Value::Int(2))),
+            )
+        );
     }
 
     #[test]
@@ -2532,8 +2567,17 @@ mod tests {
     fn predicate_typing() {
         let t = table();
         let mut b = Binder::new(&t, 0, true);
+        // A non-boolean predicate is truthy-tested like sqlite, not refused:
+        // `WHERE 42` desugars to `42 <> 0` and folds to TRUE.
         let (ast, _) = parse_expr_only("42").unwrap();
-        assert!(matches!(b.bind_predicate(&ast), Err(Error::Bind(_))));
+        assert_eq!(b.bind_predicate(&ast).unwrap(), BExpr::Const(Value::Bool(true)));
+        let (ast, _) = parse_expr_only("0").unwrap();
+        assert_eq!(b.bind_predicate(&ast).unwrap(), BExpr::Const(Value::Bool(false)));
+        // A text predicate takes the CAST-to-REAL path (sqlite's RealValue).
+        let (ast, _) = parse_expr_only("'3abc'").unwrap();
+        assert_eq!(b.bind_predicate(&ast).unwrap(), BExpr::Const(Value::Bool(true)));
+        let (ast, _) = parse_expr_only("'abc'").unwrap();
+        assert_eq!(b.bind_predicate(&ast).unwrap(), BExpr::Const(Value::Bool(false)));
         let (ast, _) = parse_expr_only("id = 42").unwrap();
         assert!(b.bind_predicate(&ast).is_ok());
         // NULL predicate is legal (never passes).
