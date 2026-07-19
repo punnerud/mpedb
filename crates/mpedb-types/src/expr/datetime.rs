@@ -347,13 +347,50 @@ fn parse_yyyy_mm_dd(b: &[u8], p: &mut Dt) -> bool {
 /// an ERROR rather than sqlite's NULL: sqlite ANSWERS for `'now'`, for a
 /// Julian-day number and for a modifier, so returning NULL there would be a
 /// silently different answer rather than a refusal.
+///
+/// **`'now'` is refused for a reason of its own** (task #74 item 4 —
+/// re-examined and REFUSED BY DESIGN), and the reason is worth stating where
+/// the refusal is, so it does not have to be re-derived:
+///
+/// * mpedb has NO non-deterministic expression today — `CURRENT_TIMESTAMP` /
+///   `CURRENT_DATE` / `CURRENT_TIME` are refused by name in DDL as well, and
+///   there is no `current_timestamp()` function. `'now'` would be the first.
+/// * Compiled plans are CONTENT-HASHED and published to a registry SHARED
+///   ACROSS PROCESSES (`plan/<hash>` in the catalog's sys-keyspace). A
+///   `strftime('%Y','now')` has all-constant arguments; `fold` happens not to
+///   fold `Call` today, but its own comment says the node is "const-foldable in
+///   principle", and the day that gap closes the plan bytes would carry a
+///   COMPILE-TIME timestamp that every later process reuses. That is a wrong
+///   answer that outlives the process that made it, in a shared file.
+/// * sqlite fixes `'now'` ONCE PER STATEMENT (`iCurrentTime`), so
+///   `SELECT strftime('%s','now') FROM big_table` gives one value on every row.
+///   Reproducing that needs a statement-start instant threaded through every
+///   `ExprProgram::eval` call site (filters, projections, CHECK bodies, index
+///   expressions, triggers). Reading the clock inside `eval` instead would
+///   drift WITHIN one statement — a different wrong answer, and a syscall in
+///   the per-row hot path. `mpedb-types` has no clock dependency by design.
+/// * A CHECK body containing `'now'` would pass at INSERT and fail on any later
+///   re-validation (CHECKs are stored as SOURCE and recompiled at attach), and
+///   the mirror's convergence criterion — replay must reproduce the source
+///   EXACTLY — has no meaning for a statement whose answer depends on when it
+///   ran.
+/// * It would not even close the shape Django uses: `'now'` is only useful with
+///   the modifier language (`'now','start of day'`), which stays refused.
 fn unsupported_time(z: &str) -> Error {
     let shown: String = z.chars().take(64).collect();
+    let why = if z.trim().eq_ignore_ascii_case("now") {
+        " ('now' in particular: mpedb has no non-deterministic expression, and compiled \
+         plans are content-hashed and shared across processes, so a clock read here \
+         could outlive the statement that made it)"
+    } else {
+        ""
+    };
     Error::TypeMismatch(format!(
         "strftime(): unsupported time string {shown:?}; mpedb accepts only the ISO-8601 forms \
          'YYYY-MM-DD', 'YYYY-MM-DD[ T]HH:MM[:SS[.SSS]]' and 'HH:MM[:SS[.SSS]]', each with an \
          optional 'Z' or '+HH:MM'/'-HH:MM' suffix. sqlite's 'now', its Julian-day and \
-         unix-epoch number forms and its modifier language are refused rather than guessed"
+         unix-epoch number forms and its modifier language are refused rather than \
+         guessed{why}"
     ))
 }
 
