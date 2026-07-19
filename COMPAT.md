@@ -132,7 +132,7 @@ converts losslessly (`'42'` → `42`); mpedb does not.
 | char | ✅ | variadic; Unicode code points → text (`char()` is the empty string). A NULL argument yields NULL — sqlite reads it as code point 0, the one documented gap |
 | unicode | ✅ | Unicode code point of the first character; NULL for the empty string |
 | hex | ✅ | uppercase hex of the argument's bytes (text or blob); a number is refused (sqlite renders it to text first). `hex(NULL)` is NULL, where sqlite gives `''` |
-| typeof | ✅ | datatype name; `typeof(NULL)` is `'null'` (the one scalar that does not NULL-propagate). The sqlite core names match (`integer`/`real`/`text`/`blob`); `bool`/`timestamp` report their own honest names |
+| typeof | ✅ | sqlite storage class; `typeof(NULL)` is `'null'` (the one scalar that does not NULL-propagate). The range is **closed over sqlite's five names** — `null`/`integer`/`real`/`text`/`blob` — for every value, always. mpedb's own `bool`/`timestamp` report `'integer'`, not their own names: `typeof()` is a *sqlite* function whose documented range is those five and which every consumer switches on, and `sqlite3_column_type` already calls both of them `SQLITE_INTEGER` |
 | abs, round, ceil / ceiling, floor, trunc | ✅ | keep their argument's numeric type (int stays int); `trunc` rounds toward zero |
 | sqrt, pow / power | ✅ | always float; a non-real result (sqrt of a negative) is NULL, matching sqlite |
 | sign | ✅ | always an integer: -1 / 0 / 1 |

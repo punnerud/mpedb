@@ -643,19 +643,45 @@ fn sqlite_quote(v: &Value) -> Result<Value> {
     }))
 }
 
-/// sqlite `typeof()` datatype string. The five sqlite core names
-/// (`null`/`integer`/`real`/`text`/`blob`) match sqlite exactly; mpedb's two
-/// extra first-class types report their own honest names (sqlite has no such
-/// type to agree or disagree with), and a param-only `List` names itself.
+/// sqlite `typeof()` datatype string — **exactly** one of the five sqlite
+/// storage-class names `null`/`integer`/`real`/`text`/`blob`, for every
+/// `Value`, always.
+///
+/// `typeof()` is a borrowed sqlite function, and it borrows sqlite's contract
+/// with it: its documented range is those five strings and nothing else, so
+/// every consumer switches on exactly those five. mpedb's own first-class
+/// `Bool` and `Timestamp` used to answer `'boolean'`/`'timestamp'` here —
+/// honest about mpedb's type system, but a *different answer* rather than an
+/// error to a caller who asked a sqlite question. Three things settle it:
+///
+///  1. Range. A sixth string is wrong against the only specification the
+///     function has. There is no PG reading to preserve either — PG spells it
+///     `pg_typeof()` and has no `typeof()` at all — so this is not a dialect
+///     question and must not be gated on one.
+///  2. Internal consistency. `sqlite3_column_type` already reports
+///     `SQLITE_INTEGER` for `Bool`/`Timestamp` (mpedb-capi `valconv::sqlite_type`),
+///     and `_int64`/`_text` render them `1` / `"1"`. Through every other
+///     accessor the value already IS an integer; `typeof` was the lone
+///     dissenter, so the two disagreed about the same value.
+///  3. The shim cannot fix it. `typeof()` is evaluated in the engine and
+///     reaches the C boundary as an ordinary `Value::Text`, indistinguishable
+///     from a text column whose content happens to be the word `boolean`.
+///     Remapping strings at the boundary would corrupt real data — so the only
+///     place the fix can live without inventing a new wrong answer is here.
+///
+/// A `Value::List` is param-only (`IN (?)` context) and cannot reach an
+/// expression result; it maps to `null` to match the same defensive choice
+/// `valconv::sqlite_type` makes, which keeps "typeof and column_type never
+/// disagree" total over all eight variants.
 fn sqlite_typeof(v: &Value) -> &'static str {
     match v {
         Value::Null => "null",
-        Value::Int(_) => "integer",
+        // mpedb's Bool and Timestamp are integer storage: 0/1 and microseconds
+        // since the epoch. Both read back as SQLITE_INTEGER through the C API.
+        Value::Int(_) | Value::Bool(_) | Value::Timestamp(_) => "integer",
         Value::Float(_) => "real",
         Value::Text(_) => "text",
         Value::Blob(_) => "blob",
-        Value::Bool(_) => "boolean",
-        Value::Timestamp(_) => "timestamp",
-        Value::List(_) => "list",
+        Value::List(_) => "null",
     }
 }
