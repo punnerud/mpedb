@@ -195,10 +195,20 @@ impl<'a> Parser<'a> {
                 }
                 continue;
             }
-            if !seen_cmp && self.peek_kw(Kw::Like) {
-                self.pos += 1;
+            // `x LIKE pat` / `x NOT LIKE pat`. `NOT LIKE` ≡ `NOT (x LIKE pat)`
+            // under 3VL (a NULL operand stays NULL through the outer NOT), so it
+            // desugars here without a distinct AST node — the `NOT` needs the
+            // two-token lookahead `not_expr` already passed on, like `NOT GLOB`.
+            if !seen_cmp && (self.peek_kw(Kw::Like) || self.peek_not_like()) {
+                let negated = self.eat_kw(Kw::Not);
+                self.expect_kw(Kw::Like, "LIKE")?;
                 let pat = self.add_expr()?;
-                e = Expr::Like(Box::new(e), Box::new(pat));
+                let like = Expr::Like(Box::new(e), Box::new(pat));
+                e = if negated {
+                    Expr::Unary(UnOp::Not, Box::new(like))
+                } else {
+                    like
+                };
                 seen_cmp = true;
                 continue;
             }

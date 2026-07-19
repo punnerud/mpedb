@@ -1,7 +1,11 @@
 # LIKE: `%` matches any run (including empty), `_` matches exactly one
-# character. Matching is CASE-SENSITIVE (unlike sqlite's ASCII-insensitive
-# LIKE) and there is no ESCAPE clause -- `%`/`_` cannot be matched literally.
+# character. Matching is CASE-INSENSITIVE for ASCII A-Z (sqlite's default:
+# `'a' LIKE 'A'` is true; non-ASCII is NOT folded), and there is no ESCAPE
+# clause -- `%`/`_` cannot be matched literally. A non-text operand is coerced
+# to text (`id LIKE 'x'` is `CAST(id AS TEXT) LIKE 'x'`), also like sqlite.
 # The pattern must be a string literal (Phase 1). NULL never matches.
+# (PostgreSQL's LIKE is case-sensitive and rigid -- a PG-strict dialect mode is
+# planned; this file exercises the sqlite default.)
 #
 # schema:
 # [[table]]
@@ -29,12 +33,14 @@ INSERT INTO t (id, s) VALUES (7, 'abc'), (8, 'a%c'), (9, 'a_c')
 statement ok
 INSERT INTO t (id, s) VALUES (10, NULL), (11, 'aXc'), (12, 'axc')
 
+# Case-insensitive: 'HELLO' (id 6) matches a lowercase pattern.
 query I nosort
 SELECT id FROM t WHERE s LIKE 'hel%'
 ----
 1
 2
 3
+6
 
 query I nosort
 SELECT id FROM t WHERE s LIKE 'h_ll'
@@ -72,17 +78,20 @@ query I nosort
 SELECT id FROM t WHERE s LIKE '%o'
 ----
 1
+6
 
-# Case-sensitive: 'HELLO' and 'hello' are different worlds.
+# Case-insensitive: 'HELLO' and 'hello' fold to the same world (ASCII).
 query I nosort
 SELECT id FROM t WHERE s LIKE 'HELLO'
 ----
+1
 6
 
 query I nosort
 SELECT id FROM t WHERE s LIKE 'hello'
 ----
 1
+6
 
 # There is no NOT LIKE keyword; negate the whole predicate. NULL still
 # never appears (NOT UNKNOWN = UNKNOWN).
@@ -91,7 +100,6 @@ SELECT id FROM t WHERE NOT (s LIKE 'hel%')
 ----
 4
 5
-6
 7
 8
 9
@@ -147,6 +155,7 @@ query I nosort
 SELECT id FROM t WHERE s LIKE '%e%o%'
 ----
 1
+6
 
 query I nosort
 SELECT id FROM t WHERE s LIKE 'hello_'
@@ -156,6 +165,7 @@ query I nosort
 SELECT id FROM t WHERE s LIKE '_ello'
 ----
 1
+6
 
 query I nosort
 SELECT id FROM t WHERE s LIKE '%l%'
@@ -163,13 +173,14 @@ SELECT id FROM t WHERE s LIKE '%l%'
 1
 2
 3
+6
 
 query I nosort
 SELECT id FROM t WHERE s LIKE 'x%'
 ----
 
 # LIKE is an ordinary boolean expression: usable in projections, NULL for
-# NULL input.
+# NULL input. 'HELLO' (id 6) is now true (case-insensitive).
 query IT nosort
 SELECT id, s LIKE 'h%' FROM t
 ----
@@ -184,7 +195,7 @@ true
 5
 false
 6
-false
+true
 7
 false
 8
@@ -212,6 +223,7 @@ SELECT id FROM t WHERE s LIKE 'h%' OR s LIKE 'a%'
 2
 3
 4
+6
 7
 8
 9
@@ -251,11 +263,15 @@ SELECT id FROM t WHERE s LIKE 'h%l%'
 1
 2
 3
+6
 
 # ---- LIKE typing rules ----------------------------------------------------------
 
-statement error LIKE requires text
+# A non-text operand is coerced to text (sqlite default), so `id LIKE 'x'`
+# runs and matches no integer id rendered as text.
+query I nosort
 SELECT id FROM t WHERE id LIKE 'x'
+----
 
 statement error string literal
 SELECT id FROM t WHERE s LIKE 1

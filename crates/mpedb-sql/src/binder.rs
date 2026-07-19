@@ -548,10 +548,7 @@ impl<'a> Binder<'a> {
                 };
                 let (l, lt) = self.bind_expr(lhs)?;
                 let (l, lt) = self.unify_param(l, lt, ColumnType::Text);
-                match lt {
-                    None | Some(ColumnType::Text) => {}
-                    Some(t) => return Err(bind_err(format!("LIKE requires text, got {t}"))),
-                }
+                let l = like_glob_operand(l, lt, "LIKE")?;
                 let e = fold_maybe(BExpr::Like(Box::new(l), pattern), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
             }
@@ -581,10 +578,7 @@ impl<'a> Binder<'a> {
                 };
                 let (l, lt) = self.bind_expr(lhs)?;
                 let (l, lt) = self.unify_param(l, lt, ColumnType::Text);
-                match lt {
-                    None | Some(ColumnType::Text) => {}
-                    Some(t) => return Err(bind_err(format!("GLOB requires text, got {t}"))),
-                }
+                let l = like_glob_operand(l, lt, "GLOB")?;
                 let g = fold_maybe(BExpr::Glob(Box::new(l), pattern), self.suppress_fold)?;
                 let e = fold_maybe(maybe_not(g, *negated), self.suppress_fold)?;
                 Ok((e, Some(ColumnType::Bool)))
@@ -1529,6 +1523,20 @@ fn maybe_not(e: BExpr, negated: bool) -> BExpr {
         BExpr::Unary(BUnOp::Not, Box::new(e))
     } else {
         e
+    }
+}
+
+/// Coerce a LIKE/GLOB operand to text the way sqlite does. sqlite applies TEXT
+/// affinity to a LIKE/GLOB operand, so `12 LIKE '1%'` is `'12' LIKE '1%'` — a
+/// numeric operand is CAST to text (the exact same conversion as `CAST(x AS
+/// TEXT)`, which is sqlite-verified) rather than refused. Text stays as-is; a
+/// bare parameter (`None`) has already been pinned to Text. A blob is still
+/// refused — sqlite matches a blob operand bytewise, a path mpedb does not take.
+fn like_glob_operand(l: BExpr, lt: Option<ColumnType>, op: &str) -> Result<BExpr> {
+    match lt {
+        None | Some(ColumnType::Text) => Ok(l),
+        Some(ColumnType::Blob) => Err(bind_err(format!("{op} requires text, got blob"))),
+        Some(_) => Ok(BExpr::Cast(Box::new(l), Affinity::Text)),
     }
 }
 
