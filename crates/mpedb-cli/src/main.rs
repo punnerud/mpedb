@@ -14,6 +14,7 @@ mod blob;
 mod collide;
 mod crash;
 mod dump;
+mod line;
 mod mirror;
 mod mirror_collide;
 mod powerloss;
@@ -34,7 +35,10 @@ usage: mpedb <command> [args]
          config.toml / .mpedb file / sqlite .db, or run one statement. A .db
          opens as a delta-WAL overlay by default (changes in <db>.overlay.mpedb,
          zero import); `mpedb checkpoint <db>` folds them back. `--mirror` uses
-         the full sidecar import instead; `--direct` is read-only, zero-setup
+         the full sidecar import instead; `--direct` is read-only, zero-setup.
+         A MISSING path is CREATED, as sqlite3 creates one: `.mpedb` → a native
+         mpedb database, anything else → an empty sqlite database. CREATE TABLE
+         on a sqlite base is applied to the base itself.
 
 
   exec    <target> <SQL> [param ...]       run one statement
@@ -129,12 +133,25 @@ fn dispatch(argv: &[String]) -> CliResult {
             println!("{USAGE}");
             Ok(())
         }
-        // The sqlite3-shaped entry: a bare EXISTING path is unambiguous
-        // against the command names above (none of them are files), so
-        // `mpedb data.db` opens exactly like `sqlite3 data.db` does.
-        other if std::path::Path::new(other).exists() => openpath::run(other, rest),
+        // The sqlite3-shaped entry: a bare path is unambiguous against the
+        // command names above (none of them are files), so `mpedb data.db`
+        // opens — or, like `sqlite3 data.db`, CREATES — exactly as sqlite3
+        // does. A MISSING name only counts as a path when it looks like one
+        // (a separator or an extension); a bare misspelled word stays
+        // "unknown command" instead of quietly creating a database called
+        // `exce`. `mpedb open <name>` is the explicit form for the rest.
+        other if looks_like_path(other) => openpath::run(other, rest),
         other => usage(format!("unknown command `{other}`")),
     }
+}
+
+/// Is this argument a database path rather than a mistyped command? An
+/// existing file always is. A missing one counts when it carries a directory
+/// separator or a file extension — the shapes a database name has, and shapes
+/// no subcommand name has.
+fn looks_like_path(arg: &str) -> bool {
+    let p = std::path::Path::new(arg);
+    p.exists() || arg.contains(std::path::MAIN_SEPARATOR) || p.extension().is_some()
 }
 
 fn cmd_exec(args: &[String]) -> CliResult {

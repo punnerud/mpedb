@@ -20,3 +20,6 @@ libc = { workspace = true }
 # sqlite source for `mirror import` (bundled 3.45, as in mpedb-bench).
 postgres = "0.19"
 rusqlite = { version = "0.31", features = ["bundled"] }
+# repl line editing + Tab completion. default-features off: no history file,
+# no fuzzy/skim, no derive — the completer is hand-written in `src/line.rs`.
+rustyline = { version = "18", default-features = false }
