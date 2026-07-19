@@ -155,6 +155,85 @@ impl<'a> Parser<'a> {
             .ok_or_else(|| self.err_here(format!("no such collation sequence: {name}")))
     }
 
+    /// The words that can START a column constraint and therefore can NOT be
+    /// part of a declared type name. sqlite makes these real keyword tokens, so
+    /// its `typetoken ::= ids*` rule stops at them for free; mpedb lexes them as
+    /// ordinary identifiers (so a column may be called `check`), which means the
+    /// stop set has to be written down. `NOT`/`NULL` are absent on purpose —
+    /// they are [`Tok::Kw`], which `declared_type` stops at anyway.
+    const COLUMN_CONSTRAINT_WORDS: &'static [&'static str] = &[
+        "constraint",
+        "primary",
+        "unique",
+        "check",
+        "default",
+        "collate",
+        "references",
+        "generated",
+        "autoincrement",
+        "deferrable",
+    ];
+
+    /// A declared SQL type name, in sqlite's liberal `typetoken` grammar: zero
+    /// or more identifier words (`bigint`, `double precision`, `integer
+    /// unsigned`, `unsigned big int`) optionally followed by a parenthesized
+    /// size (`varchar(100)`, `decimal(10, 2)`).
+    ///
+    /// ANY name is accepted, because in sqlite a declared type is not a
+    /// vocabulary but an input to the affinity rule — an unrecognized name is
+    /// legal and means NUMERIC. The size is consumed and DROPPED: it never
+    /// changes the affinity, and mpedb has no width-limited types, so honouring
+    /// `varchar(100)` as a length limit would reject rows sqlite stores.
+    ///
+    /// Zero words is the legal TYPELESS column (`CREATE TABLE t(a)`,
+    /// `a PRIMARY KEY`) → [`ColumnType::Any`], sqlite's no-affinity column.
+    ///
+    /// Resolution goes through [`mpedb_types::ColumnType::from_declared`], which
+    /// is the same [`mpedb_types::Affinity::from_type_name`] rule `CAST` uses:
+    /// one vocabulary and one mapping whether the name is written in a `CAST` or
+    /// in a `CREATE TABLE`.
+    fn declared_type(&mut self) -> Result<mpedb_types::ColumnType> {
+        let mut words: Vec<String> = Vec::new();
+        loop {
+            match self.peek() {
+                // A bare word is a type word unless it opens a constraint.
+                Some(Tok::Ident(w)) => {
+                    let lw = w.to_ascii_lowercase();
+                    if Self::COLUMN_CONSTRAINT_WORDS.contains(&lw.as_str()) {
+                        break;
+                    }
+                    words.push(lw);
+                    self.pos += 1;
+                }
+                // A QUOTED word can never be a constraint keyword, so it is
+                // always part of the type name (sqlite's `ids ::= ID|STRING`).
+                Some(Tok::QuotedIdent(_)) => {
+                    words.push(self.ident("a type name")?.to_ascii_lowercase())
+                }
+                _ => break,
+            }
+        }
+        if words.is_empty() {
+            return Ok(mpedb_types::ColumnType::Any);
+        }
+        // Optional `( n )` / `( n , m )` size — consumed and discarded.
+        if self.peek() == Some(&Tok::LParen) {
+            self.pos += 1;
+            while matches!(
+                self.peek(),
+                Some(Tok::Int(_))
+                    | Some(Tok::Float(_))
+                    | Some(Tok::Comma)
+                    | Some(Tok::Plus)
+                    | Some(Tok::Minus)
+            ) {
+                self.pos += 1;
+            }
+            self.expect(&Tok::RParen, "`)` after a column type size")?;
+        }
+        Ok(mpedb_types::ColumnType::from_declared(&words.join(" ")))
+    }
+
     fn parse_create_table(&mut self) -> Result<DdlStmt> {
         let name = self.ident("table name")?;
         self.expect(&Tok::LParen, "(")?;
@@ -172,24 +251,9 @@ impl<'a> Parser<'a> {
                 uniques.push(self.paren_ident_list()?);
             } else {
                 let cname = self.ident("column name")?;
-                // sqlite allows a TYPELESS column (`CREATE TABLE t(a)`, or
-                // `a PRIMARY KEY`) — its affinity is NONE, values stored as-is.
-                // mpedb models that with `ColumnType::Any` (the per-column
-                // loose-type escape hatch). A type word is present only when the
-                // next token parses as a known type; otherwise (a constraint
-                // keyword like PRIMARY/UNIQUE, or `,`/`)`) the column is typeless.
-                let ty = match self.peek() {
-                    Some(Tok::Ident(w)) => {
-                        match mpedb_types::ColumnType::parse(&w.to_ascii_lowercase()) {
-                            Some(t) => {
-                                self.pos += 1; // consume the type word
-                                t
-                            }
-                            None => mpedb_types::ColumnType::Any,
-                        }
-                    }
-                    _ => mpedb_types::ColumnType::Any,
-                };
+                // sqlite's full declared-type grammar (`varchar(100)`,
+                // `double precision`, an unknown name, or none at all).
+                let ty = self.declared_type()?;
                 let mut col = crate::ddl::CreateColumnSpec {
                     name: cname,
                     ty,
@@ -670,20 +734,11 @@ impl<'a> Parser<'a> {
         if self.eat_word("ADD") {
             self.eat_word("COLUMN"); // optional, as in sqlite/PG
             let cname = self.ident("column name")?;
-            // Typeless ADD COLUMN (`ALTER TABLE t ADD COLUMN c`) → Any, matching
-            // sqlite's no-affinity column (same rule as CREATE TABLE above).
-            let ty = match self.peek() {
-                Some(Tok::Ident(w)) => {
-                    match mpedb_types::ColumnType::parse(&w.to_ascii_lowercase()) {
-                        Some(t) => {
-                            self.pos += 1;
-                            t
-                        }
-                        None => mpedb_types::ColumnType::Any,
-                    }
-                }
-                _ => mpedb_types::ColumnType::Any,
-            };
+            // The SAME declared-type grammar CREATE TABLE uses — `varchar(100)`
+            // must not mean one thing in a CREATE and another in an ADD. Zero
+            // type words is the typeless column (`ALTER TABLE t ADD COLUMN c`)
+            // → Any, matching sqlite's no-affinity column.
+            let ty = self.declared_type()?;
             let mut col = crate::ddl::CreateColumnSpec {
                 name: cname,
                 ty,

@@ -7,9 +7,11 @@
 use mpedb_types::{Collation, ColumnType, DefaultExpr, PolicyCmd};
 
 /// One column of a `CREATE TABLE` (#47 stage 2) or `ALTER TABLE ADD COLUMN`.
-/// Types are the config's names (`int64`/`int`/`integer`, `text`, `real`,
-/// `bool`, `blob`, `timestamp`, `any`), constraints the useful subset:
-/// `NOT NULL`, `UNIQUE`, `PRIMARY KEY`. `CHECK`/`REFERENCES` are named
+/// The declared type is sqlite's whole vocabulary — any word(s) with an
+/// optional size (`varchar(100)`, `bigint`, `double precision`, `decimal(10,2)`,
+/// or nothing at all) — folded to a rigid [`ColumnType`] by
+/// [`ColumnType::from_declared`]. Constraints are the useful subset: `NOT
+/// NULL`, `UNIQUE`, `PRIMARY KEY`, `COLLATE`. `CHECK`/`REFERENCES` are named
 /// refusals for now; `DEFAULT <const>` is parsed for ADD COLUMN (below) and
 /// still refused by name in `CREATE TABLE`.
 #[derive(Debug, Clone, PartialEq)]
@@ -291,10 +293,13 @@ mod tests {
             DdlStmt::AlterAddColumn { column, .. } => assert!(column.not_null),
             other => panic!("{other:?}"),
         }
-        // A trailing unknown word after a typeless column is still a parse
-        // error (leftover token). But a TYPELESS ADD COLUMN is now valid,
-        // sqlite-style: the column becomes `Any` (no affinity).
-        assert!(parse_ddl("ALTER TABLE t ADD COLUMN c BOGUS").is_err());
+        // An unrecognized type word is LEGAL, as in sqlite, and means NUMERIC
+        // affinity → `Any`. (It used to be a parse error.)
+        match parse_ddl("ALTER TABLE t ADD COLUMN c BOGUS").unwrap().unwrap() {
+            DdlStmt::AlterAddColumn { column, .. } => assert_eq!(column.ty, ColumnType::Any),
+            other => panic!("{other:?}"),
+        }
+        // A TYPELESS ADD COLUMN is valid too, sqlite-style: `Any` (no affinity).
         match parse_ddl("ALTER TABLE t ADD COLUMN c").unwrap().unwrap() {
             DdlStmt::AlterAddColumn { column, .. } => {
                 assert_eq!(column.name, "c");
@@ -558,10 +563,69 @@ mod tests {
         );
     }
 
+    /// sqlite's declared-type vocabulary: any word(s), with an optional size.
+    /// The expectations here are pinned against the real `sqlite3` binary in
+    /// `crates/mpedb/tests/django_parse_gaps.rs`.
+    #[test]
+    fn create_table_sqlite_declared_types() {
+        let s = create_table(
+            "CREATE TABLE t (id integer NOT NULL PRIMARY KEY, name varchar(100) NOT NULL, \
+             code char(1) NULL, big bigint, small smallint, pos integer unsigned, \
+             amount double precision, price decimal(10, 2), made datetime, day date, \
+             data BLOB, huge \"unsigned big int\", weird nosuchtype, bare)",
+        );
+        use ColumnType::*;
+        let got: Vec<ColumnType> = s.columns.iter().map(|c| c.ty).collect();
+        assert_eq!(
+            got,
+            vec![
+                Int64,   // integer
+                Text,    // varchar(100)
+                Text,    // char(1)
+                Int64,   // bigint
+                Int64,   // smallint
+                Int64,   // integer unsigned
+                Float64, // double precision
+                Any,     // decimal(10, 2)  → NUMERIC affinity
+                Any,     // datetime        → NUMERIC affinity
+                Any,     // date            → NUMERIC affinity
+                Blob,    // BLOB
+                Int64,   // "unsigned big int" (quoted words are type words)
+                Any,     // an unknown name is legal in sqlite and means NUMERIC
+                Any,     // no declared type at all
+            ]
+        );
+        // The size is consumed and dropped — mpedb has no width-limited types,
+        // so honouring `varchar(1)` as a limit would reject rows sqlite stores.
+        assert_eq!(create_table("CREATE TABLE t (a varchar(1))").columns[0].ty, Text);
+        // A malformed size is still a parse error.
+        assert!(parse_ddl("CREATE TABLE t (a varchar(100)").is_err());
+        assert!(parse_ddl("CREATE TABLE t (a varchar(x))").is_err());
+        // `ADD COLUMN` uses the identical grammar.
+        match parse_ddl("ALTER TABLE t ADD COLUMN c varchar(100)").unwrap().unwrap() {
+            DdlStmt::AlterAddColumn { column, .. } => assert_eq!(column.ty, ColumnType::Text),
+            other => panic!("{other:?}"),
+        }
+        match parse_ddl("ALTER TABLE t ADD COLUMN c double precision DEFAULT 1.5")
+            .unwrap()
+            .unwrap()
+        {
+            DdlStmt::AlterAddColumn { column, .. } => {
+                assert_eq!(column.ty, ColumnType::Float64);
+                assert_eq!(column.default, Some(DefaultExpr::Const(mpedb_types::Value::Float(1.5))));
+            }
+            other => panic!("{other:?}"),
+        }
+        // A constraint word is never eaten as a type word — the column below is
+        // typeless with a PRIMARY KEY, not a column of type `primary`.
+        let s = create_table("CREATE TABLE t (a PRIMARY KEY, b UNIQUE, c COLLATE NOCASE)");
+        assert!(s.columns.iter().all(|c| c.ty == ColumnType::Any));
+        assert!(s.columns[0].pk && s.columns[1].unique);
+    }
+
     #[test]
     fn create_table_malformed_and_unsupported_refuse() {
         assert!(parse_ddl("CREATE TABLE t (id INT PRIMARY KEY,)").is_err()); // trailing comma → empty col
-        assert!(parse_ddl("CREATE TABLE t (id BOGUSTYPE)").is_err()); // unknown type
         assert!(parse_ddl("CREATE TABLE t (id INT DEFAULT 0)").is_err()); // DEFAULT unsupported
         assert!(parse_ddl("CREATE TABLE t (id INT CHECK (id > 0))").is_err()); // CHECK unsupported
         assert!(parse_ddl("CREATE TABLE t (id INT REFERENCES o(id))").is_err()); // FK unsupported
