@@ -714,3 +714,283 @@ fn the_filter_and_subquery_paren_errors_are_really_like_escape_and_nulls_orderin
         r#"SELECT id FROM "t" WHERE EXISTS(SELECT 1 FROM "u" U0 WHERE U0."x" = "t"."x") ORDER BY id"#,
     );
 }
+// ------------------------------------------------------- store affinity ----
+
+/// sqlite's **store-time NUMERIC affinity**, differentially, value by value.
+///
+/// This is the bug this section exists for: `decimal(10,2)` and a column with
+/// NO declared type are BOTH `ColumnType::Any`, and sqlite treats them
+/// OPPOSITELY — the first converts `'1.50'` to the real `1.5`, the second keeps
+/// the text. Collapsing them onto one behaviour traded a clean refusal for a
+/// WRONG ANSWER (`1.50`/`text` where sqlite says `1.5`/`real`), which is the one
+/// trade this project never makes.
+///
+/// The projection is `typeof(v)` and `CAST(v AS TEXT)`: the storage class AND
+/// the exact bytes, so a conversion that lands on the right class with the
+/// wrong value (a `f64` rounding `'9007199254740993'` down, say) still fails.
+fn numeric_affinity_cases() -> Vec<&'static str> {
+    vec![
+        // Lossless and reversible → converted.
+        "'1.50'",
+        "'0012'",
+        "'1e3'",
+        "'1E2'",
+        "'1.5e2'",
+        "'  7  '",
+        "'+5'",
+        "'-0'",
+        "'5.'",
+        "'.5'",
+        "'-1.50'",
+        "'0012.5'",
+        "'1.0'",
+        "'3.0'",
+        "'0.0'",
+        "'-00.00'",
+        "'00'",
+        "'1e-2'",
+        "'0.1'",
+        // Exact past 2^53 — an f64 would round this to ...992.
+        "'9007199254740993'",
+        // The i64 extremes: the pure-integer path keeps them, the real path
+        // must not (sqlite ticket #3922).
+        "'9223372036854775807'",
+        "'-9223372036854775808'",
+        "'9223372036854775808'",
+        "'-9223372036854775809'",
+        // Too big for an integer → real.
+        "'99999999999999999999'",
+        "'1e18'",
+        "'1e19'",
+        "'1e400'",
+        "'0.30000000000000004'",
+        // NOT losslessly numeric → stays TEXT.
+        "'abc'",
+        "''",
+        "'  '",
+        "'12abc'",
+        "'0x10'",
+        "'1_000'",
+        "'1,5'",
+        "'inf'",
+        "'Infinity'",
+        "'nan'",
+        "'true'",
+        "'2024-01-01'",
+        "'2024-01-01 00:00:00'",
+        // Non-text inputs: integers pass through, reals collapse when integral,
+        // blobs are never parsed (unlike CAST), NULL stays NULL.
+        "7",
+        "1.5",
+        "1.0",
+        "-0.0",
+        "1e100",
+        "x'6162'",
+        "NULL",
+    ]
+}
+
+#[test]
+fn numeric_affinity_converts_on_store_exactly_as_sqlite_does() {
+    // Every NUMERIC-affinity spelling Django and the sqlite type vocabulary
+    // produce. They must behave identically to each other AND to sqlite.
+    for decl in ["numeric", "decimal(10,2)", "datetime", "date", "nosuchtype"] {
+        for lit in numeric_affinity_cases() {
+            let create = format!("CREATE TABLE t (id INTEGER PRIMARY KEY, v {decl})");
+            let insert = format!("INSERT INTO t (id, v) VALUES (1, {lit})");
+            let setup: &[&str] = &[&create, &insert];
+            assert_same(setup, "SELECT typeof(v), CAST(v AS TEXT) FROM t");
+        }
+    }
+}
+
+/// The regression guard the fix must not trip: a column with NO declared type
+/// is sqlite's BLOB ("NONE") affinity and stores **verbatim**. Same values, same
+/// comparison, opposite expectation — which is exactly why one mpedb type could
+/// not serve both.
+#[test]
+fn a_typeless_column_still_stores_verbatim_like_sqlite() {
+    for lit in numeric_affinity_cases() {
+        let create = "CREATE TABLE t (id INTEGER PRIMARY KEY, v)".to_string();
+        let insert = format!("INSERT INTO t (id, v) VALUES (1, {lit})");
+        let setup: &[&str] = &[&create, &insert];
+        assert_same(setup, "SELECT typeof(v), CAST(v AS TEXT) FROM t");
+    }
+    // …and it really is the opposite behaviour, not a coincidence of the
+    // sample: the same literal lands in two different storage classes.
+    let m = mpedb_state(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, n numeric, b)",
+            "INSERT INTO t (id, n, b) VALUES (1, '1.50', '1.50')",
+        ],
+        "SELECT typeof(n), typeof(b) FROM t",
+    );
+    assert_eq!(m, vec![vec!["real".to_string(), "text".to_string()]]);
+}
+
+/// The other three affinities are RIGID columns in mpedb, and rigid means the
+/// value is refused rather than converted. Pinned as a refusal so it can never
+/// quietly become a coercion — and asserted against what sqlite would have
+/// stored, so the narrowing stays visible.
+#[test]
+fn text_integer_real_blob_affinities_still_refuse_rather_than_convert() {
+    let t = open();
+    t.db.query(
+        "CREATE TABLE r (id integer PRIMARY KEY, i bigint, f double precision, \
+         s varchar(10), b blob)",
+        &[],
+    )
+    .unwrap();
+    for bad in [
+        "INSERT INTO r (id, i) VALUES (1, '1.50')",
+        "INSERT INTO r (id, f) VALUES (2, '1.50')",
+        "INSERT INTO r (id, s) VALUES (3, 1.5)",
+        "INSERT INTO r (id, b) VALUES (4, '1.50')",
+    ] {
+        assert!(t.db.query(bad, &[]).is_err(), "must refuse, not coerce: {bad}");
+    }
+    // What sqlite does with those same four, recorded so the gap is a stated
+    // narrowing rather than an assumption.
+    assert_eq!(
+        sqlite_state(
+            &[
+                "CREATE TABLE r (id integer PRIMARY KEY, i bigint, f double precision, \
+                 s varchar(10), b blob)",
+                "INSERT INTO r (id, i) VALUES (1, '1.50')",
+                "INSERT INTO r (id, f) VALUES (2, '1.50')",
+                "INSERT INTO r (id, s) VALUES (3, 1.5)",
+                "INSERT INTO r (id, b) VALUES (4, '1.50')",
+            ],
+            "SELECT typeof(i), typeof(f), typeof(s), typeof(b) FROM r ORDER BY id",
+        ),
+        vec![
+            vec!["real", "null", "null", "null"],
+            vec!["null", "real", "null", "null"],
+            vec!["null", "null", "text", "null"],
+            vec!["null", "null", "null", "text"],
+        ]
+        .into_iter()
+        .map(|r| r.into_iter().map(str::to_string).collect::<Vec<_>>())
+        .collect::<Vec<_>>()
+    );
+}
+
+/// Affinity is applied on EVERY way a value enters the column, not just
+/// `INSERT … VALUES`: UPDATE, DEFAULT, `INSERT … SELECT`, and a bound
+/// parameter. sqlite converts in all four, and a path that skipped one would
+/// leave the same wrong answer behind a different statement.
+#[test]
+fn store_affinity_applies_on_update_default_and_insert_select() {
+    assert_same(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v numeric)",
+            "INSERT INTO t (id) VALUES (1)",
+            "UPDATE t SET v = '1.50' WHERE id = 1",
+        ],
+        "SELECT typeof(v), CAST(v AS TEXT) FROM t",
+    );
+    assert_same(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v numeric DEFAULT '1.50')",
+            "INSERT INTO t (id) VALUES (1)",
+        ],
+        "SELECT typeof(v), CAST(v AS TEXT) FROM t",
+    );
+    assert_same(
+        &[
+            "CREATE TABLE s (id INTEGER PRIMARY KEY, v varchar(10))",
+            "INSERT INTO s (id, v) VALUES (1, '1.50')",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, v numeric)",
+            "INSERT INTO t (id, v) SELECT id, v FROM s",
+        ],
+        "SELECT typeof(v), CAST(v AS TEXT) FROM t",
+    );
+    // A bound parameter takes the same conversion — this is the Django shape:
+    // the ORM binds a Decimal as a STRING.
+    let t = open();
+    t.db.query("CREATE TABLE p (id INTEGER PRIMARY KEY, v numeric)", &[]).unwrap();
+    t.db.query("INSERT INTO p (id, v) VALUES (1, $1)", &[Value::Text("1.50".into())])
+        .unwrap();
+    assert_eq!(
+        mpedb_rows(&t.db, "SELECT typeof(v), CAST(v AS TEXT) FROM p"),
+        vec![vec!["real".to_string(), "1.5".to_string()]]
+    );
+}
+
+// ---------------------------------------------- the four Django queries ----
+
+/// The measured Django regression, end to end. A `decimal(10,2)` column bound
+/// as a STRING (which is what the ORM does) got stored as text, so the value,
+/// the ordering and the extremum were all sqlite's answers' opposites.
+///
+/// Three of the four now AGREE with sqlite. The fourth — comparing the column
+/// against a text literal — needs COMPARISON affinity (sqlite converts the
+/// literal to a number BEFORE comparing) and is a clean refusal until that
+/// lands, asserted here as such so it cannot quietly become a guess.
+#[test]
+fn the_django_decimal_shape_agrees_with_sqlite() {
+    let setup: &[&str] = &[
+        "CREATE TABLE t (id integer NOT NULL PRIMARY KEY, price decimal(10,2) NOT NULL)",
+        "INSERT INTO t (id, price) VALUES (1, '1000')",
+        "INSERT INTO t (id, price) VALUES (2, '35')",
+    ];
+    assert_same(setup, "SELECT id, price, typeof(price) FROM t ORDER BY id");
+    assert_same(setup, "SELECT id FROM t ORDER BY price");
+    assert_same(setup, "SELECT MAX(price), MIN(price) FROM t");
+    // …and with a mixed magnitude, where the column really does hold an INTEGER
+    // and a REAL at once — the case a lexicographic order got backwards.
+    let mixed: &[&str] = &[
+        "CREATE TABLE t (id integer NOT NULL PRIMARY KEY, price decimal(10,2) NOT NULL)",
+        "INSERT INTO t (id, price) VALUES (1, '1000')",
+        "INSERT INTO t (id, price) VALUES (2, '35')",
+        "INSERT INTO t (id, price) VALUES (3, '9.99')",
+        "INSERT INTO t (id, price) VALUES (4, '200.5')",
+    ];
+    assert_same(mixed, "SELECT id FROM t ORDER BY price");
+    assert_same(mixed, "SELECT MAX(price), MIN(price), COUNT(DISTINCT price) FROM t");
+    assert_same(mixed, "SELECT id FROM t ORDER BY price DESC LIMIT 2");
+
+    // The refusal. sqlite answers `[2]`; mpedb refuses rather than answering
+    // `[1, 2]`, which is what an unconverted comparison would say.
+    let t = open();
+    for s in setup {
+        t.db.query(s, &[]).unwrap();
+    }
+    let err = t.db.query("SELECT id FROM t WHERE price < '40.0'", &[]).unwrap_err();
+    assert!(format!("{err}").contains("compare"), "{err}");
+    assert_eq!(sqlite_state(setup, "SELECT id FROM t WHERE price < '40.0'"), vec![vec!["2"]]);
+    // Against a NUMBER there is no affinity to apply and mpedb agrees.
+    assert_same(setup, "SELECT id FROM t WHERE price < 40 ORDER BY id");
+}
+
+/// A NUMERIC column that holds a value sqlite could NOT convert keeps it as
+/// text, so the column holds several storage classes at once — and sqlite orders
+/// those `NULL < numbers < text < blob`. Every sort context has to follow that:
+/// treating the pair as "equal" (which is what refusing inside a comparator
+/// amounts to) is not an order at all.
+#[test]
+fn mixed_storage_classes_sort_in_sqlites_class_order() {
+    let setup: &[&str] = &[
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, v NUMERIC)",
+        "INSERT INTO m VALUES (1, 'abc')",
+        "INSERT INTO m VALUES (2, '10')",
+        "INSERT INTO m VALUES (3, NULL)",
+        "INSERT INTO m VALUES (4, '2.5')",
+        "INSERT INTO m VALUES (5, 'zz')",
+    ];
+    assert_same(setup, "SELECT id FROM m ORDER BY v, id");
+    assert_same(setup, "SELECT id FROM m ORDER BY v DESC, id");
+    assert_same(setup, "SELECT MAX(v), MIN(v) FROM m");
+    assert_same(setup, "SELECT typeof(MAX(v)), typeof(MIN(v)) FROM m");
+    // The same over a TYPELESS column, which stores every one of those verbatim.
+    let loose: &[&str] = &[
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, v)",
+        "INSERT INTO m VALUES (1, 'abc')",
+        "INSERT INTO m VALUES (2, 10)",
+        "INSERT INTO m VALUES (3, NULL)",
+        "INSERT INTO m VALUES (4, 2.5)",
+        "INSERT INTO m VALUES (5, x'00')",
+    ];
+    assert_same(loose, "SELECT id FROM m ORDER BY v, id");
+    assert_same(loose, "SELECT id FROM m ORDER BY v DESC, id");
+}

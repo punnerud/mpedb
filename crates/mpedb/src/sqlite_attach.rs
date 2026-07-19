@@ -67,17 +67,70 @@ fn val(v: fmtx::Value) -> Value {
     }
 }
 
-fn any_col(name: &str) -> ColumnDef {
+/// A non-PK base column: per-value storage (`Any`) carrying the base's DECLARED
+/// AFFINITY.
+///
+/// The storage type stays `Any` on purpose and is not a shortcut. A sqlite file
+/// is not rigid — an `int` column may genuinely hold the text `'abc'`, because
+/// sqlite stores whatever survives its affinity conversion — so declaring the
+/// overlay column `Int64` would make mpedb refuse to READ rows sqlite happily
+/// holds. What sqlite does guarantee is the CONVERSION applied on the way in,
+/// and that is the affinity: an `int`/`decimal(10,2)`/`datetime` column turns
+/// `'1.50'` into the real `1.5`, and a column with no declared type keeps it as
+/// text. Dropping the affinity is what made the overlay answer `'1.50'`/text
+/// where sqlite answers `1.5`/real — a wrong answer, and the reason this is no
+/// longer a blanket `Any` (DESIGN-SQLITE-BACKED §"Overlay schema" [R#17]).
+fn any_col(name: &str, decl: &str, not_null: bool, default: Option<Value>) -> ColumnDef {
     ColumnDef {
         name: name.to_string(),
         ty: ColumnType::Any,
-        nullable: true,
+        nullable: !not_null,
         unique: false,
         indexed: false,
-        default: None,
+        default: default.map(mpedb_types::DefaultExpr::Const),
         check: None,
         collation: mpedb_types::Collation::Binary,
+        affinity: mpedb_types::Affinity::declared(decl),
     }
+}
+
+/// A base column's `DEFAULT` text → the mpedb constant it stores, or `Err` when
+/// mpedb cannot represent it.
+///
+/// Only LITERALS are representable: sqlite evaluates `CURRENT_TIMESTAMP` and a
+/// parenthesized expression at insert time, and mpedb has no machinery to do
+/// that for a base's dialect. Guessing is the wrong answer this whole change
+/// exists to stop, and silently dropping it is worse still — a column whose
+/// default vanished stores NULL where sqlite stores a value — so an
+/// unrepresentable default takes the table out of the attach BY NAME.
+///
+/// The literal takes the column's store-time affinity, exactly as a value
+/// written by an INSERT would: sqlite stores `DEFAULT '1.50'` on a NUMERIC
+/// column as the real 1.5.
+fn default_const(text: &str, affinity: mpedb_types::Affinity) -> std::result::Result<Value, ()> {
+    let t = text.trim();
+    let v = if t.eq_ignore_ascii_case("NULL") {
+        Value::Null
+    } else if t.eq_ignore_ascii_case("TRUE") {
+        Value::Int(1)
+    } else if t.eq_ignore_ascii_case("FALSE") {
+        Value::Int(0)
+    } else if let Some(rest) = t.strip_prefix('\'') {
+        // A string literal; sqlite doubles an embedded quote.
+        let body = rest.strip_suffix('\'').ok_or(())?;
+        if body.contains('\'') && !body.contains("''") {
+            return Err(());
+        }
+        Value::Text(body.replace("''", "'"))
+    } else if let Ok(i) = t.parse::<i64>() {
+        Value::Int(i)
+    } else if let Ok(f) = t.parse::<f64>() {
+        Value::Float(f)
+    } else {
+        // `CURRENT_TIMESTAMP`, `(expr)`, `x'…'`, anything else.
+        return Err(());
+    };
+    Ok(mpedb_types::store_into(ColumnType::Any, affinity, v))
 }
 
 fn pk_col(name: &str, ty: ColumnType) -> ColumnDef {
@@ -90,6 +143,8 @@ fn pk_col(name: &str, ty: ColumnType) -> ColumnDef {
         default: None,
         check: None,
         collation: mpedb_types::Collation::Binary,
+        // A rigid column enforces its type; `validate` pins the affinity.
+        affinity: mpedb_types::Affinity::implied_by(ty),
     }
 }
 
@@ -130,12 +185,69 @@ impl SqliteAttach {
                 skipped.push((t.name.clone(), "table-id space (64) exhausted".into()));
                 continue;
             }
+            // Constraints mpedb cannot carry are a NAMED SKIP, never a silent
+            // drop. A dropped CHECK let an invalid row into the overlay that
+            // then failed the base's own constraint at checkpoint time — the
+            // error surfacing on a later, unrelated statement — and a dropped
+            // NOT NULL/DEFAULT changed what a row STORES. A table nobody can
+            // see is a clean refusal; a table that answers differently is not.
+            if t.has_check {
+                skipped.push((
+                    t.name.clone(),
+                    "CHECK constraint (mpedb cannot compile a base's CHECK, and not                      enforcing it would let in a row the base itself rejects)"
+                        .into(),
+                ));
+                continue;
+            }
+            if t.has_generated {
+                skipped.push((
+                    t.name.clone(),
+                    "GENERATED column (its value is computed by the base, not stored)".into(),
+                ));
+                continue;
+            }
+            // Resolve every DEFAULT up front: one unrepresentable default takes
+            // the whole table, because a column whose default vanished stores
+            // NULL where sqlite stores a value.
+            let mut col_defaults: Vec<Option<Value>> = Vec::with_capacity(t.columns.len());
+            let mut bad_default = None;
+            for (i, d) in t.defaults.iter().enumerate() {
+                let aff = mpedb_types::Affinity::declared(
+                    t.decl_types.get(i).map_or("", String::as_str),
+                );
+                match d {
+                    None => col_defaults.push(None),
+                    Some(text) => match default_const(text, aff) {
+                        Ok(Value::Null) => col_defaults.push(None), // == no default
+                        Ok(v) => col_defaults.push(Some(v)),
+                        Err(()) => {
+                            bad_default = Some((t.columns[i].clone(), text.clone()));
+                            break;
+                        }
+                    },
+                }
+            }
+            if let Some((col, text)) = bad_default {
+                skipped.push((
+                    t.name.clone(),
+                    format!("DEFAULT on `{col}` is not a literal mpedb can store (`{text}`)"),
+                ));
+                continue;
+            }
+            let mkcol = |i: usize| {
+                any_col(
+                    &t.columns[i],
+                    t.decl_types.get(i).map_or("", String::as_str),
+                    t.not_null.get(i).copied().unwrap_or(false),
+                    col_defaults.get(i).cloned().flatten(),
+                )
+            };
             let (pk, def) = if let Some(ipk) = t.ipk_column {
                 let cols = t
                     .columns
                     .iter()
                     .enumerate()
-                    .map(|(i, c)| if i == ipk { int_pk_col(c) } else { any_col(c) })
+                    .map(|(i, c)| if i == ipk { int_pk_col(c) } else { mkcol(i) })
                     .collect();
                 (
                     PkKind::Ipk(ipk),
@@ -177,7 +289,7 @@ impl SqliteAttach {
                     .columns
                     .iter()
                     .enumerate()
-                    .map(|(j, c)| if j == i { pk_col(c, ty) } else { any_col(c) })
+                    .map(|(j, c)| if j == i { pk_col(c, ty) } else { mkcol(j) })
                     .collect();
                 (
                     PkKind::WithoutRowidKey(i, ty),
@@ -200,7 +312,7 @@ impl SqliteAttach {
                     ));
                     continue;
                 }
-                let mut cols: Vec<ColumnDef> = t.columns.iter().map(|c| any_col(c)).collect();
+                let mut cols: Vec<ColumnDef> = (0..t.columns.len()).map(mkcol).collect();
                 cols.push(int_pk_col("rowid"));
                 let pk = cols.len() - 1;
                 (
@@ -212,7 +324,14 @@ impl SqliteAttach {
                         primary_key: vec![pk as u16],
                         indexes: vec![],
                         dead: false,
-                        implicit_rowid: false,
+                        // HIDDEN, exactly as #94 made it on the native path.
+                        // The base table has no INTEGER PRIMARY KEY, so this
+                        // `rowid` is mpedb's synthesis of sqlite's implicit one
+                        // — and sqlite does not return it from `SELECT *`.
+                        // Leaving it visible made `SELECT *` yield one column
+                        // MORE than sqlite does: wrong result arity, which is a
+                        // wrong answer and not a cosmetic difference.
+                        implicit_rowid: true,
                         kind: mpedb_types::TableKind::Standard,
                     },
                 )

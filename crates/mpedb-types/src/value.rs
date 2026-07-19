@@ -102,6 +102,10 @@ impl ColumnType {
     /// An EMPTY name is `Any`, not the `Numeric` this rule returns for a `CAST`:
     /// a column with NO declared type is sqlite's no-affinity column, which
     /// converts nothing — exactly `Any`.
+    ///
+    /// **This function alone loses the NUMERIC/no-type distinction** — both land
+    /// on `Any`, and sqlite treats them OPPOSITELY at store time. Use
+    /// [`ColumnType::declared`], which returns the [`Affinity`] alongside.
     pub fn from_declared(name: &str) -> ColumnType {
         let lower = name.trim().to_ascii_lowercase();
         if lower.is_empty() {
@@ -117,6 +121,54 @@ impl ColumnType {
             Affinity::Blob => ColumnType::Blob,
             Affinity::Numeric => ColumnType::Any,
         }
+    }
+
+    /// A **declared SQL type name** → the pair a column definition needs: the
+    /// rigid storage type ([`ColumnType::from_declared`]) AND the sqlite
+    /// [`Affinity`] that decides what happens to a value on its way IN.
+    ///
+    /// The two are genuinely independent, and collapsing them is a wrong
+    /// answer, not a rounding error. `ColumnType::Any` is the storage side of
+    /// TWO sqlite affinities that behave OPPOSITELY:
+    ///
+    /// | declared            | affinity  | `'1.50'` stores as | mpedb column   |
+    /// |---------------------|-----------|--------------------|----------------|
+    /// | `decimal(10,2)`, `numeric`, `date`, `datetime` | NUMERIC | `1.5` real | `Any` + `Numeric` |
+    /// | *(nothing at all)*  | BLOB      | `'1.50'` text      | `Any` + `Blob` |
+    ///
+    /// so `Any` alone cannot say which one a column is. The affinity says.
+    ///
+    /// The rule, in the same order as [`ColumnType::from_declared`]:
+    /// 1. an EMPTY name is sqlite's no-affinity column → (`Any`, `Blob`);
+    /// 2. one of mpedb's OWN config words (`int64`, `bool`, `any`, …) keeps its
+    ///    meaning — including `any`, which has always meant *verbatim* here, so
+    ///    it stays `Blob`. d45ad77's promise that no name already accepted
+    ///    changes meaning covers the affinity too;
+    /// 3. otherwise sqlite's affinity of the name, which is `Numeric` exactly
+    ///    when [`ColumnType::from_declared`] chose `Any`.
+    ///
+    /// For every rigid type the affinity is [`Affinity::implied_by`] its
+    /// storage type — mpedb REFUSES a mismatched value there rather than
+    /// converting it (a narrowing, never a different answer), so recording
+    /// anything else would be recording a rule that is not applied.
+    pub fn declared(name: &str) -> (ColumnType, Affinity) {
+        let lower = name.trim().to_ascii_lowercase();
+        if lower.is_empty() {
+            return (ColumnType::Any, Affinity::Blob);
+        }
+        if let Some(t) = ColumnType::parse(&lower) {
+            return (t, Affinity::implied_by(t));
+        }
+        let ty = ColumnType::from_declared(&lower);
+        let aff = match Affinity::declared(&lower) {
+            Affinity::Numeric => Affinity::Numeric,
+            // The other four affinities each map onto a RIGID mpedb type, which
+            // enforces rather than converts — so the affinity that column
+            // actually has is the one its type implies, and they agree here by
+            // construction.
+            _ => Affinity::implied_by(ty),
+        };
+        (ty, aff)
     }
 
     pub fn name(self) -> &'static str {
@@ -225,6 +277,40 @@ impl Affinity {
         aff
     }
 
+    /// The affinity a mpedb [`ColumnType`] already enforces on its own.
+    ///
+    /// A rigid column refuses a value of the wrong class instead of converting
+    /// it, so its affinity is descriptive: it is whatever class the column can
+    /// actually hold. `Any` maps to `Blob` — sqlite's BLOB (historically
+    /// "NONE") affinity, the one that converts nothing — because that is what
+    /// `Any` does by default; the NUMERIC-affinity `Any` column is the one case
+    /// this function cannot produce, and it comes from the DECLARED NAME via
+    /// [`ColumnType::declared`], never from the storage type.
+    pub fn implied_by(ty: ColumnType) -> Affinity {
+        match ty {
+            ColumnType::Int64 | ColumnType::Bool | ColumnType::Timestamp => Affinity::Integer,
+            ColumnType::Float64 => Affinity::Real,
+            ColumnType::Text => Affinity::Text,
+            ColumnType::Blob | ColumnType::Any => Affinity::Blob,
+        }
+    }
+
+    /// The affinity of a **column's declared type name** — `from_type_name`
+    /// plus the one case it does not cover.
+    ///
+    /// An EMPTY name is a column with NO declared type, which sqlite gives BLOB
+    /// (historically "NONE") affinity: it converts nothing. That is NOT what
+    /// [`Affinity::from_type_name`] returns for an empty string — a `CAST` to
+    /// an empty type name is NUMERIC — and the two are exact opposites at store
+    /// time, so the distinction has to be made here rather than at each caller.
+    pub fn declared(name: &str) -> Affinity {
+        if name.trim().is_empty() {
+            Affinity::Blob
+        } else {
+            Affinity::from_type_name(name)
+        }
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Affinity::Integer => "INTEGER",
@@ -329,6 +415,17 @@ impl Value {
             (Null, _) | (_, Null) => return Ok(None),
             (Int(a), Int(b)) => a.cmp(b),
             (Float(a), Float(b)) => float_total_cmp(*a, *b),
+            // An INTEGER against a REAL — the one CROSS-class comparison mpedb
+            // answers, because it is the one that cannot depend on affinity.
+            // Affinity never turns a number into something other than a number,
+            // so `1000 < 1.5` has sqlite's answer no matter what column either
+            // side came from; number-against-TEXT does depend on it, and stays
+            // a refusal until comparison affinity lands. This case is ordinary
+            // now rather than exotic: a NUMERIC-affinity column stores '1000' as
+            // an integer and '1.50' as a real, so ORDER BY, MAX and DISTINCT
+            // over one meet both classes in the same column.
+            (Int(a), Float(b)) => int_float_cmp(*a, *b),
+            (Float(a), Int(b)) => int_float_cmp(*b, *a).reverse(),
             (Bool(a), Bool(b)) => a.cmp(b),
             (Text(a), Text(b)) => a.as_bytes().cmp(b.as_bytes()),
             (Blob(a), Blob(b)) => a.cmp(b),
@@ -350,6 +447,48 @@ impl Value {
                 )))
             }
         }))
+    }
+
+    /// sqlite's **storage-class total order**, for contexts that compare stored
+    /// values AGAINST EACH OTHER: `ORDER BY`, `MIN`/`MAX`, `GROUP BY`,
+    /// `DISTINCT`, window ordering.
+    ///
+    /// `NULL < numbers < TEXT < BLOB`, integers and reals interleaved
+    /// numerically, text bytewise (or by `coll`), blobs bytewise. NULL is
+    /// returned as `None` so each caller keeps its own NULLS FIRST/LAST rule.
+    ///
+    /// Distinct from [`Value::sql_cmp`], which REFUSES a cross-class pair, and
+    /// the split is the point. A `WHERE` comparison puts a stored value against
+    /// an operand whose class sqlite would have converted first (comparison
+    /// affinity: `price < '40.0'` compares 40.0, not the string), so answering
+    /// it by class order alone would be a WRONG ANSWER — `sql_cmp` keeps
+    /// refusing until that conversion exists. A sort compares stored values
+    /// only: affinity was already applied on the way IN, nothing is left to
+    /// convert, and the class order IS sqlite's answer.
+    ///
+    /// Without this, an `any` column holding both `'abc'` and `10` sorted
+    /// arbitrarily: `sql_cmp` refused the pair and every sort comparator turned
+    /// the refusal into `Equal`, which is not an order at all.
+    pub fn sort_cmp(&self, other: &Value, coll: Collation) -> Option<Ordering> {
+        use Value::*;
+        if self.is_null() || other.is_null() {
+            return None;
+        }
+        match (self, other) {
+            (Text(a), Text(b)) => Some(coll.compare_str(a, b)),
+            _ => match self.sql_cmp_collated(other, coll) {
+                Ok(o) => o,
+                // A cross-class pair `sql_cmp` refuses: order it by sqlite's
+                // storage classes. mpedb's own Bool/Timestamp have no sqlite
+                // class, so a pair involving one stays incomparable (`None`,
+                // read by every caller as "peers") rather than being given an
+                // invented rank.
+                Err(_) => match (class_rank(self), class_rank(other)) {
+                    (Some(x), Some(y)) => Some(x.cmp(&y)),
+                    _ => None,
+                },
+            },
+        }
     }
 
     /// SQL comparison under an explicit collating sequence (task: COLLATE).
@@ -480,6 +619,53 @@ fn nocase_cmp(a: &[u8], b: &[u8]) -> Ordering {
 
 /// Total order over f64 matching the memcmp key encoding: -0.0 and 0.0 are
 /// equal, all NaNs are equal and sort above +inf.
+/// sqlite's storage-class rank: NULL (not ranked here) < numbers < text < blob.
+/// `None` for mpedb's own `Bool`/`Timestamp` and for a context `List`, none of
+/// which is a sqlite storage class to rank against one.
+fn class_rank(v: &Value) -> Option<u8> {
+    Some(match v {
+        Value::Int(_) | Value::Float(_) => 1,
+        Value::Text(_) => 2,
+        Value::Blob(_) => 3,
+        Value::Null | Value::Bool(_) | Value::Timestamp(_) | Value::List(_) => return None,
+    })
+}
+
+/// An `i64` against an `f64`, EXACTLY — a port of sqlite's
+/// `sqlite3IntFloatCompare`.
+///
+/// Casting either side to the other's type is wrong at the edges: `i as f64`
+/// rounds every magnitude past 2^53, so `9007199254740993 < 9007199254740992.0`
+/// would compare equal, and `r as i64` truncates. So: reject the out-of-range
+/// reals first, compare against the truncated integer, and only then break a
+/// tie by widening the integer — which is exact whenever the truncation was.
+///
+/// NaN sorts ABOVE every integer. That is where [`float_total_cmp`] already
+/// puts it (the canonicalized NaN image is the largest), and a total order
+/// matters more here than agreeing with sqlite's `i > NaN`: sqlite cannot store
+/// a NaN at all — it turns into NULL on the way in — so no differential can
+/// observe the difference, while an order that is not total would break every
+/// sort that meets one.
+fn int_float_cmp(i: i64, r: f64) -> Ordering {
+    if r.is_nan() {
+        return Ordering::Less;
+    }
+    if r < -9223372036854775808.0 {
+        return Ordering::Greater;
+    }
+    if r >= 9223372036854775808.0 {
+        return Ordering::Less;
+    }
+    let y = r as i64; // in range by the guards above; truncates toward zero
+    match i.cmp(&y) {
+        Ordering::Equal => {}
+        other => return other,
+    }
+    // Equal after truncation: the fractional part decides. `i as f64` is exact
+    // here because `i == r.trunc() as i64` and that round-tripped.
+    (i as f64).partial_cmp(&r).unwrap_or(Ordering::Equal)
+}
+
 pub fn float_total_cmp(a: f64, b: f64) -> Ordering {
     normalize_float_bits(a).cmp(&normalize_float_bits(b))
 }
@@ -748,5 +934,158 @@ mod tests {
             float_total_cmp(f64::NEG_INFINITY, f64::MIN),
             Ordering::Less
         );
+    }
+}
+
+#[cfg(test)]
+mod affinity_tests {
+    use super::*;
+    use crate::expr::store_affinity;
+
+    /// The declared-name → (type, affinity) pair, which is what a column
+    /// definition needs and what one `ColumnType` alone cannot say.
+    #[test]
+    fn declared_splits_numeric_from_typeless() {
+        for n in ["numeric", "decimal(10,2)", "decimal", "datetime", "date", "nosuchtype"] {
+            assert_eq!(ColumnType::declared(n), (ColumnType::Any, Affinity::Numeric), "{n}");
+        }
+        // A column with NO declared type is the OPPOSITE behaviour under the
+        // same storage type.
+        assert_eq!(ColumnType::declared(""), (ColumnType::Any, Affinity::Blob));
+        assert_eq!(ColumnType::declared("  "), (ColumnType::Any, Affinity::Blob));
+        // mpedb's own words keep their meaning, `any` included (verbatim).
+        assert_eq!(ColumnType::declared("any"), (ColumnType::Any, Affinity::Blob));
+        assert_eq!(ColumnType::declared("int64"), (ColumnType::Int64, Affinity::Integer));
+        assert_eq!(ColumnType::declared("bool"), (ColumnType::Bool, Affinity::Integer));
+        assert_eq!(
+            ColumnType::declared("timestamp"),
+            (ColumnType::Timestamp, Affinity::Integer)
+        );
+        // The rigid four: the affinity is always the one the type implies.
+        for (n, t) in [
+            ("bigint", ColumnType::Int64),
+            ("double precision", ColumnType::Float64),
+            ("varchar(100)", ColumnType::Text),
+            ("blob", ColumnType::Blob),
+        ] {
+            let (ty, aff) = ColumnType::declared(n);
+            assert_eq!((ty, aff), (t, Affinity::implied_by(t)), "{n}");
+        }
+    }
+
+    /// Store-time affinity is NOT `CAST`. Both are sqlite's, and they disagree —
+    /// pinned so the two can never be merged into one function with a flag.
+    #[test]
+    fn store_affinity_is_not_cast() {
+        use crate::expr::{ExprProgram, Instr};
+        let cast = |v: Value, aff: Affinity| {
+            ExprProgram::new(vec![Instr::PushParam(0), Instr::Cast(aff)], vec![])
+                .unwrap()
+                .eval(&[], &[v])
+                .unwrap()
+        };
+        // A numeric PREFIX is a number to CAST and not a number at all to
+        // affinity, which leaves the text alone.
+        assert_eq!(cast(Value::Text("12abc".into()), Affinity::Numeric), Value::Int(12));
+        assert_eq!(
+            store_affinity(Affinity::Numeric, Value::Text("12abc".into())),
+            Value::Text("12abc".into())
+        );
+        // CAST stops at sqlite's 2^51 `RealSameAsInt` bound; store-time affinity
+        // uses the full i64 round trip, so this one really does become an int.
+        assert_eq!(cast(Value::Text("1e18".into()), Affinity::Numeric), Value::Float(1e18));
+        assert_eq!(
+            store_affinity(Affinity::Numeric, Value::Text("1e18".into())),
+            Value::Int(1_000_000_000_000_000_000)
+        );
+        // A blob is parsed by CAST and never by affinity.
+        assert_eq!(cast(Value::Blob(b"12".to_vec()), Affinity::Numeric), Value::Int(12));
+        assert_eq!(
+            store_affinity(Affinity::Numeric, Value::Blob(b"12".to_vec())),
+            Value::Blob(b"12".to_vec())
+        );
+    }
+
+    /// BLOB affinity — the typeless column — converts nothing, ever.
+    #[test]
+    fn blob_affinity_is_verbatim() {
+        for v in [
+            Value::Text("1.50".into()),
+            Value::Text("abc".into()),
+            Value::Int(3),
+            Value::Float(1.0),
+            Value::Blob(b"7".to_vec()),
+            Value::Null,
+        ] {
+            assert_eq!(store_affinity(Affinity::Blob, v.clone()), v);
+        }
+    }
+
+    /// The two affinities only the sqlite-overlay path can produce today.
+    #[test]
+    fn real_and_text_affinity_follow_sqlite() {
+        // REAL: the NUMERIC rule, then widen an integer result.
+        assert_eq!(store_affinity(Affinity::Real, Value::Text("0012".into())), Value::Float(12.0));
+        assert_eq!(store_affinity(Affinity::Real, Value::Int(1)), Value::Float(1.0));
+        assert_eq!(
+            store_affinity(Affinity::Real, Value::Text("abc".into())),
+            Value::Text("abc".into())
+        );
+        assert_eq!(
+            store_affinity(Affinity::Real, Value::Blob(b"1".to_vec())),
+            Value::Blob(b"1".to_vec())
+        );
+        // TEXT: numbers render, everything else is left alone.
+        assert_eq!(store_affinity(Affinity::Text, Value::Int(1)), Value::Text("1".into()));
+        assert_eq!(store_affinity(Affinity::Text, Value::Float(1.5)), Value::Text("1.5".into()));
+        assert_eq!(
+            store_affinity(Affinity::Text, Value::Blob(b"a".to_vec())),
+            Value::Blob(b"a".to_vec())
+        );
+        assert_eq!(store_affinity(Affinity::Text, Value::Null), Value::Null);
+        // INTEGER is NUMERIC at store time (sqlite's own documented equality).
+        for v in [Value::Text("1.50".into()), Value::Text("abc".into()), Value::Float(1.0)] {
+            assert_eq!(
+                store_affinity(Affinity::Integer, v.clone()),
+                store_affinity(Affinity::Numeric, v)
+            );
+        }
+    }
+
+    /// INTEGER against REAL is exact — no cast to a common type, which would
+    /// lose every magnitude past 2^53.
+    #[test]
+    fn int_against_real_is_exact() {
+        let cmp = |a: Value, b: Value| a.sql_cmp(&b).unwrap().unwrap();
+        assert_eq!(cmp(Value::Int(1000), Value::Float(1.5)), Ordering::Greater);
+        assert_eq!(cmp(Value::Float(1.5), Value::Int(1000)), Ordering::Less);
+        assert_eq!(cmp(Value::Int(1), Value::Float(1.0)), Ordering::Equal);
+        assert_eq!(cmp(Value::Int(1), Value::Float(1.5)), Ordering::Less);
+        assert_eq!(cmp(Value::Int(2), Value::Float(1.5)), Ordering::Greater);
+        // Past 2^53: `i as f64` would round these together.
+        assert_eq!(
+            cmp(Value::Int(9007199254740993), Value::Float(9007199254740992.0)),
+            Ordering::Greater
+        );
+        assert_eq!(
+            cmp(Value::Float(9007199254740992.0), Value::Int(9007199254740993)),
+            Ordering::Less
+        );
+        // Reals outside i64 range: no truncation, no UB.
+        assert_eq!(cmp(Value::Int(i64::MAX), Value::Float(1e300)), Ordering::Less);
+        assert_eq!(cmp(Value::Int(i64::MIN), Value::Float(-1e300)), Ordering::Greater);
+        assert_eq!(cmp(Value::Int(0), Value::Float(f64::INFINITY)), Ordering::Less);
+        assert_eq!(cmp(Value::Int(0), Value::Float(f64::NEG_INFINITY)), Ordering::Greater);
+        // NaN sorts above every integer, agreeing with `float_total_cmp` so the
+        // order stays total.
+        assert_eq!(cmp(Value::Int(i64::MAX), Value::Float(f64::NAN)), Ordering::Less);
+        assert_eq!(
+            float_total_cmp(f64::NAN, f64::INFINITY),
+            Ordering::Greater,
+            "the two must agree on where NaN sits"
+        );
+        // A number against TEXT is still a clean REFUSAL: its answer depends on
+        // comparison affinity, which is not implemented yet.
+        assert!(Value::Int(1).sql_cmp(&Value::Text("1".into())).is_err());
     }
 }

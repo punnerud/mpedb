@@ -520,16 +520,18 @@ pub(super) fn cmp_rows(a: &[Value], b: &[Value], order_by: &[(u16, bool, Collati
 }
 
 fn cmp_order(a: &Value, b: &Value, coll: Collation) -> Ordering {
-    match a.sql_cmp_collated(b, coll) {
-        Ok(Some(ord)) => ord,
+    // `sort_cmp`, not `sql_cmp`: an `any` column really can hold a number AND a
+    // string, and sqlite orders those by storage class (NULL < numbers < text <
+    // blob). `sql_cmp` refuses that pair, and turning the refusal into `Equal`
+    // — as this did — is not an order: it left `ORDER BY` over such a column
+    // returning rows in an arbitrary sequence.
+    match a.sort_cmp(b, coll) {
+        Some(ord) => ord,
         // NULL involved: NULLS FIRST in ascending order.
-        Ok(None) => match (a.is_null(), b.is_null()) {
+        None => match (a.is_null(), b.is_null()) {
             (true, false) => Ordering::Less,
             (false, true) => Ordering::Greater,
             _ => Ordering::Equal,
         },
-        // Cross-type comparison cannot happen within one rigidly-typed
-        // column; treat the impossible as equal rather than panicking.
-        Err(_) => Ordering::Equal,
     }
 }

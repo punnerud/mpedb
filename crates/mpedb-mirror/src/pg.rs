@@ -263,6 +263,10 @@ pub fn to_table_def(src: &PgTable) -> Result<TableDef> {
             check: None,
             // Mirror does not yet carry a source column collation (BINARY).
             collation: mpedb_types::Collation::Binary,
+            // Mirror maps every source column to a RIGID mpedb type (never
+            // `any`), and a rigid column enforces rather than converts — so the
+            // affinity is the one its type implies. Import stays strict-reject.
+            affinity: mpedb_types::Affinity::implied_by(ty),
         });
     }
     Ok(TableDef {

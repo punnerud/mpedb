@@ -18,6 +18,12 @@ use mpedb_types::{Collation, ColumnType, DefaultExpr, PolicyCmd};
 pub struct CreateColumnSpec {
     pub name: String,
     pub ty: ColumnType,
+    /// The sqlite TYPE AFFINITY the declared name resolves to, carried
+    /// alongside `ty` because `ty` alone cannot say it: `decimal(10,2)` and a
+    /// column with NO declared type are both [`ColumnType::Any`], but sqlite
+    /// treats them OPPOSITELY on store — the first converts `'1.50'` to the
+    /// real `1.5`, the second keeps the text. See [`ColumnType::declared`].
+    pub affinity: mpedb_types::Affinity,
     pub not_null: bool,
     pub unique: bool,
     pub pk: bool,

@@ -940,6 +940,129 @@ fn full_i64(b: &[u8]) -> Option<i64> {
     }
 }
 
+/// sqlite's **store-time** affinity conversion: what happens to a value on its
+/// way INTO a column. This is NOT [`cast_value`], and the two deliberately
+/// disagree — verified against sqlite3 3.45.1:
+///
+/// | expression                       | `CAST` | stored in a `NUMERIC` column |
+/// |----------------------------------|--------|------------------------------|
+/// | `'12abc'`                        | `12`   | `'12abc'` (TEXT)             |
+/// | `'1e18'`                         | `1.0e18` (real) | `1000000000000000000` (int) |
+/// | `x'3132'`                        | `12`   | `x'3132'` (BLOB)             |
+///
+/// `CAST` parses a numeric PREFIX and always yields a number; store-time
+/// affinity converts only when the conversion is lossless and reversible, and
+/// otherwise leaves the value exactly as it was. Mixing them up is a wrong
+/// answer, which is why they are separate functions rather than one with a
+/// flag.
+///
+/// This is applied ONLY to a [`ColumnType::Any`](crate::ColumnType::Any)
+/// column, which is mpedb's per-value column and therefore the only one that
+/// can hold whatever the conversion produces. Every rigid column REFUSES a
+/// mismatched value instead — narrower than sqlite, never a different answer —
+/// so [`ColumnDef::converts_on_store`](crate::ColumnDef::converts_on_store) is
+/// what decides, not this function.
+///
+/// The five affinities, all differentially checked against sqlite3 3.45.1:
+///
+/// * **NUMERIC** and **INTEGER** — identical at store time (sqlite's own docs
+///   say so, and `applyAffinity` really does take the same branch for both). A
+///   TEXT value is converted only if the WHOLE string (ignoring surrounding
+///   whitespace) is a well-formed decimal literal: `'1.50'`→`1.5`,
+///   `'0012'`→`12`, `'1e3'`→`1000`, `'  7  '`→`7`. `'abc'`, `''`, `'12abc'`,
+///   `'0x10'`, `'1_000'`, `'inf'` and `'2024-01-01'` all stay TEXT. A pure
+///   integer literal that fits an `i64` keeps its EXACT value even past 2^53
+///   (`'9007199254740993'`, which no `f64` could hold); everything else becomes
+///   a real and then collapses back to an integer only if it round-trips
+///   through `i64` exactly. A REAL value collapses to an integer under that
+///   same rule (`1.0`→`1`, `-0.0`→`0`). Blobs are NOT parsed (unlike `CAST`).
+/// * **REAL** — the NUMERIC rule, and then anything that ended up an integer is
+///   widened to a real, so the column reads back `12.0`, not `12`.
+/// * **TEXT** — a number is rendered to its sqlite text spelling (`1`→`'1'`,
+///   `1.5`→`'1.5'`, `%!.15g`); text, blobs and NULL are left alone.
+/// * **BLOB** — sqlite's "NONE" affinity: nothing is converted, ever. This is
+///   the affinity of a column with NO declared type.
+///
+/// mpedb's own `Bool` and `Timestamp` values pass through unchanged under every
+/// affinity: sqlite has no such storage classes to agree or disagree with, no
+/// differential test can observe them, and an `Any` column has always stored
+/// them as themselves.
+pub fn store_affinity(aff: Affinity, v: Value) -> Value {
+    match aff {
+        // NONE/BLOB affinity converts nothing — the typeless column.
+        Affinity::Blob => v,
+        Affinity::Integer | Affinity::Numeric => numerify(v),
+        Affinity::Real => match numerify(v) {
+            Value::Int(i) => Value::Float(i as f64),
+            other => other,
+        },
+        Affinity::Text => match v {
+            Value::Int(_) | Value::Float(_) => Value::Text(render_scalar_text(&v)),
+            other => other,
+        },
+    }
+}
+
+/// The shared NUMERIC/INTEGER store-time step (`applyNumericAffinity(_, 1)`).
+fn numerify(v: Value) -> Value {
+    match v {
+        Value::Text(s) => match numeric_from_full_text(s.as_bytes()) {
+            Some(n) => n,
+            None => Value::Text(s),
+        },
+        Value::Float(f) => match real_as_int(f) {
+            Some(i) => Value::Int(i),
+            None => Value::Float(f),
+        },
+        other => other,
+    }
+}
+
+/// `Some(number)` iff the whole byte string is a well-formed numeric literal —
+/// sqlite's `sqlite3AtoF` returning > 0 — else `None`, meaning "leave it TEXT".
+fn numeric_from_full_text(b: &[u8]) -> Option<Value> {
+    let (start, end, saw) = float_token(b);
+    if !saw {
+        return None;
+    }
+    // `sqlite3AtoF` reports a *partial* parse (rc <= 0) for anything with
+    // extraneous text, and `applyNumericAffinity` then stores the string
+    // unchanged. Leading whitespace was already skipped by `float_token`.
+    if b[end..].iter().any(|&c| !is_sql_space(c)) {
+        return None;
+    }
+    // The token is pure ASCII by construction; an out-of-range exponent parses
+    // to ±inf, exactly as sqlite's strtod does.
+    let r: f64 = std::str::from_utf8(&b[start..end]).ok()?.parse().ok()?;
+    // sqlite's `alsoAnInt`: a pure integer literal keeps its exact i64 value,
+    // which is how `'9007199254740993'` survives a round trip that `f64` would
+    // round to ...992.
+    if let Some(i) = full_i64(b) {
+        return Some(Value::Int(i));
+    }
+    Some(match real_as_int(r) {
+        Some(i) => Value::Int(i),
+        None => Value::Float(r),
+    })
+}
+
+/// sqlite's `sqlite3VdbeIntegerAffinity`: a real becomes an integer only when
+/// the real→int→real round trip is exact AND the integer is neither `i64`
+/// extreme (sqlite ticket #3922 — `9223372036854775807.0` is not a value any
+/// `f64` names, so calling it that integer would not be reversible).
+fn real_as_int(r: f64) -> Option<i64> {
+    // sqlite3RealToI64 clamps rather than invoking UB on an out-of-range cast.
+    let ix = if r <= i64::MIN as f64 {
+        i64::MIN
+    } else if r >= i64::MAX as f64 {
+        i64::MAX
+    } else {
+        r as i64
+    };
+    // NaN fails this comparison, so a NaN stays a real.
+    (r == ix as f64 && ix > i64::MIN && ix < i64::MAX).then_some(ix)
+}
+
 /// `||` semantics: NULL propagates; ints and bools render as text (sqlite's
 /// rule); floats are refused until their text formatting is pinned down.
 fn concat_value(a: Value, b: Value) -> Result<Value> {

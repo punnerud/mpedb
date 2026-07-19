@@ -5,7 +5,7 @@
 use crate::error::{Error, Result};
 use std::collections::BTreeSet;
 use crate::schema::{ColumnDef, DefaultExpr, Schema, TableDef};
-use crate::value::{Collation, ColumnType, Value};
+use crate::value::{Affinity, Collation, ColumnType, Value};
 use serde::Deserialize;
 use std::path::PathBuf;
 
@@ -426,9 +426,20 @@ fn raw_to_config(
         for t in raw_tables {
             let mut columns = Vec::with_capacity(t.columns.len());
             for c in &t.columns {
-                let ty = ColumnType::parse(&c.ty).ok_or_else(|| {
-                    Error::Config(format!("unknown type `{}` for {}.{}", c.ty, t.name, c.name))
-                })?;
+                // `numeric` is the config spelling of an `any` column carrying
+                // sqlite's NUMERIC affinity: it holds an int, a real or a
+                // string per value like `any`, but text that is losslessly
+                // numeric is CONVERTED on the way in ('1.50' → 1.5). `any`
+                // itself stays verbatim — the two are opposites and the config
+                // vocabulary has to be able to say which one is meant.
+                let (ty, affinity) = if c.ty.eq_ignore_ascii_case("numeric") {
+                    (ColumnType::Any, Affinity::Numeric)
+                } else {
+                    let ty = ColumnType::parse(&c.ty).ok_or_else(|| {
+                        Error::Config(format!("unknown type `{}` for {}.{}", c.ty, t.name, c.name))
+                    })?;
+                    (ty, Affinity::implied_by(ty))
+                };
                 let default = match &c.default {
                     None => None,
                     Some(v) => Some(parse_default(v, ty).map_err(|m| {
@@ -446,6 +457,7 @@ fn raw_to_config(
                     // The config (TOML) schema path declares no collation yet —
                     // COLLATE is a CREATE TABLE / ALTER surface (BINARY default).
                     collation: Collation::Binary,
+                    affinity,
                 });
             }
             let primary_key = t
