@@ -110,8 +110,11 @@ SELECT id FROM t WHERE NOT i
 statement error AND/OR requires boolean
 SELECT id FROM t WHERE i AND b
 
-statement error LIKE requires text
+# LIKE coerces a numeric operand to text (sqlite default) rather than refusing:
+# `i LIKE 'x'` runs as `CAST(i AS TEXT) LIKE 'x'` and matches nothing here.
+query I nosort
 SELECT id FROM t WHERE i LIKE 'x'
+----
 
 # ---- name resolution ----------------------------------------------------------
 

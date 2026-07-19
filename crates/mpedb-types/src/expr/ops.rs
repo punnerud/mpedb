@@ -97,6 +97,12 @@ pub(super) fn in_items_3vl_collated(
 
 /// SQL LIKE: `%` matches any run, `_` matches one char. Iterative
 /// two-pointer algorithm — O(n·m) worst case, no recursion, no regex dep.
+///
+/// **Case-insensitive for ASCII A–Z**, matching sqlite's default (`'a' LIKE 'A'`
+/// is true; Unicode is NOT casefolded, exactly like NOCASE and sqlite itself).
+/// GLOB stays case-sensitive. (Note: PostgreSQL's LIKE is case-sensitive — this
+/// is the canonical sqlite/PG divergence; mpedb follows sqlite, its primary
+/// compatibility target and the semantics the C-API drop-in must present.)
 pub(super) fn like_match(pattern: &str, s: &str) -> bool {
     let p: Vec<char> = pattern.chars().collect();
     let t: Vec<char> = s.chars().collect();
@@ -110,7 +116,7 @@ pub(super) fn like_match(pattern: &str, s: &str) -> bool {
             star_pi = pi;
             star_ti = ti;
             pi += 1;
-        } else if pi < p.len() && (p[pi] == '_' || p[pi] == t[ti]) {
+        } else if pi < p.len() && (p[pi] == '_' || p[pi].eq_ignore_ascii_case(&t[ti])) {
             pi += 1;
             ti += 1;
         } else if star_pi != usize::MAX {

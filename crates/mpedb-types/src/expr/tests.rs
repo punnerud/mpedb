@@ -100,6 +100,13 @@ fn like_patterns() {
     assert!(like_match("a%", "a%c"));
     assert!(like_match("%c", "a%c"));
     assert!(like_match("a%c", "a%c"));
+    // Case-insensitive for ASCII (sqlite default): pattern and subject fold.
+    assert!(like_match("ab%", "Ab2"));
+    assert!(like_match("AB%", "abc"));
+    assert!(like_match("h_LLO", "Hello"));
+    assert!(like_match("ABC", "abc"));
+    // Non-ASCII is NOT folded (matches sqlite / NOCASE).
+    assert!(!like_match("héllo", "HÉLLO"));
 }
 
 #[test]
