@@ -238,8 +238,11 @@ pub(super) fn plan_join_select<'s>(
     let (outer_id, outer) = resolve_table_cte(schema, cte, outer_table)?;
     let outer_name = s.alias.clone().unwrap_or_else(|| outer.name.clone());
 
-    // The outer's policy binds over its own row and can pin an access path.
+    // The outer's policy binds over its own row and can pin an access path. The
+    // dialect set here flows to every per-table `rescope` below, so a LIKE in any
+    // ON/WHERE conjunct across the join follows the database's LIKE strictness.
     let mut ob = Binder::new(outer, eff_params, true);
+    ob.set_dialect(mode);
     for (i, ty) in slot_types.iter().enumerate() {
         ob.pin_param(n_params + i as u16, *ty);
     }
