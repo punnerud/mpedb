@@ -403,13 +403,25 @@ impl Database {
 
     /// Attach an existing database file config-free, reading its stored schema
     /// and geometry (the file is schema-authoritative). Used by tooling — the
-    /// mirror daemon/CLI, `dump`, etc. — that must open a file it did not create
-    /// a TOML for. CHECK programs are NOT reconstructed (a file that carries
-    /// CHECK constraints must be opened via a config for enforcement); durability
-    /// = `async` also needs a config (no background flusher). Mirror files use
-    /// neither, so this is exactly what they need.
+    /// mirror daemon/CLI, `dump`, the `mpedb <file.mpedb>` CLI — that must open a
+    /// file it did not create a TOML for. Durability = `async` still needs a
+    /// config (no background flusher); mirror files do not use it.
+    ///
+    /// CHECK constraints ARE enforced here. They did not used to be — this
+    /// constructor once documented "a file that carries CHECK constraints must be
+    /// opened via a config", which held only while a CHECK could arrive from
+    /// nowhere but a config. `CREATE TABLE … CHECK (…)` is live DDL now, so a
+    /// constraint can be born INSIDE the file, and every config-free attach then
+    /// stored it and silently never enforced it — the CLI's own `.mpedb` path
+    /// included. The compiler works off the schema, which the file carries, so
+    /// there was never a reason to withhold it.
     pub fn open_from_file(path: &Path) -> Result<Database> {
         let engine = Engine::open_from_file(path)?;
+        // Installing the compiler also REBUILDS the bundle it just loaded, so
+        // this covers both what the file already carries and any later schema
+        // the engine loads from the catalog — including one a peer process
+        // creates while we are attached.
+        engine.set_check_compiler(std::sync::Arc::new(compile_schema_checks))?;
         Ok(Database {
             engine,
             cache: RwLock::new(HashMap::new()),
