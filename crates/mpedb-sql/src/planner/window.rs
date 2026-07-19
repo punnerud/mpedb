@@ -51,6 +51,10 @@ pub(super) fn contains_window(e: &ast::Expr) -> bool {
 struct WindowCollect {
     func: ast::WindowFunc,
     arg: Option<ast::Expr>,
+    /// Trailing arguments (stage 2): lag/lead `[offset[, default]]`, nth_value
+    /// `[n]`. Part of the structural key so two lag calls with different offsets
+    /// do not share a slot.
+    extra_args: Vec<ast::Expr>,
     distinct: bool,
     partition_by: Vec<ast::Expr>,
     order_by: Vec<(ast::Expr, bool)>,
@@ -68,12 +72,14 @@ fn lift_windows(e: &ast::Expr, specs: &mut Vec<WindowCollect>) -> Result<ast::Ex
         E::Window {
             func,
             arg,
+            extra_args,
             distinct,
             spec,
         } => {
             let candidate = WindowCollect {
                 func: func.clone(),
                 arg: arg.as_deref().cloned(),
+                extra_args: extra_args.clone(),
                 distinct: *distinct,
                 partition_by: spec.partition_by.clone(),
                 order_by: spec.order_by.clone(),
@@ -129,19 +135,25 @@ fn lift_windows(e: &ast::Expr, specs: &mut Vec<WindowCollect>) -> Result<ast::Ex
     })
 }
 
-/// The plan-level function tag plus the synthetic result column's `(type,
-/// nullable)`. Ranking functions are `Int64`, never NULL; aggregate windows
-/// adopt the aggregate result typing verbatim (design/DESIGN-WINDOW.md §3.2).
+/// The plan-level function tag, an optional `default` program (lag/lead only),
+/// and the synthetic result column's `(type, nullable)`. Ranking functions are
+/// `Int64`, never NULL; aggregate windows adopt the aggregate result typing
+/// verbatim; value/offset functions adopt the value's type and are always
+/// nullable (an out-of-range offset or a short frame yields NULL). The value
+/// functions' constant arguments (offset / n) and lag/lead's default are bound
+/// HERE, so this takes `binder` (design/DESIGN-WINDOW.md §3.2 / stage 2).
 fn resolve_window_func(
-    f: &ast::WindowFunc,
+    binder: &mut Binder<'_>,
+    func: &ast::WindowFunc,
     arg_ty: Option<ColumnType>,
-) -> (crate::plan::WindowFunc, ColumnType, bool) {
+    extra_args: &[ast::Expr],
+) -> Result<(crate::plan::WindowFunc, Option<ExprProgram>, ColumnType, bool)> {
     use crate::plan::WindowFunc as P;
     use mpedb_types::AggFn;
-    match f {
-        ast::WindowFunc::RowNumber => (P::RowNumber, ColumnType::Int64, false),
-        ast::WindowFunc::Rank => (P::Rank, ColumnType::Int64, false),
-        ast::WindowFunc::DenseRank => (P::DenseRank, ColumnType::Int64, false),
+    Ok(match func {
+        ast::WindowFunc::RowNumber => (P::RowNumber, None, ColumnType::Int64, false),
+        ast::WindowFunc::Rank => (P::Rank, None, ColumnType::Int64, false),
+        ast::WindowFunc::DenseRank => (P::DenseRank, None, ColumnType::Int64, false),
         ast::WindowFunc::Agg(af) => {
             let (ty, nullable) = match af {
                 AggFn::Count => (ColumnType::Int64, false),
@@ -152,8 +164,87 @@ fn resolve_window_func(
                 // partition, like the grouped path.
                 AggFn::Sum | AggFn::Min | AggFn::Max => (arg_ty.unwrap_or(ColumnType::Int64), true),
             };
-            (P::Agg(*af), ty, nullable)
+            (P::Agg(*af), None, ty, nullable)
         }
+        // lag/lead(expr [, offset [, default]]). The offset is a constant integer
+        // (folded here); the default is an arbitrary expression evaluated at the
+        // current row, so it must share the value's type.
+        ast::WindowFunc::Lag | ast::WindowFunc::Lead => {
+            let offset = match extra_args.first() {
+                None => 1,
+                Some(e) => const_int_arg(binder, e, "lag/lead offset")?,
+            };
+            let (default_prog, def_ty) = match extra_args.get(1) {
+                None => (None, None),
+                Some(e) => {
+                    let (b, t) = binder.bind_expr(e)?;
+                    (Some(compile_program(&b)?), t)
+                }
+            };
+            let ty = unify_value_default(arg_ty, def_ty)?;
+            let f = if matches!(func, ast::WindowFunc::Lag) {
+                P::Lag(offset)
+            } else {
+                P::Lead(offset)
+            };
+            (f, default_prog, ty, true)
+        }
+        ast::WindowFunc::FirstValue => (P::FirstValue, None, arg_ty.unwrap_or(ColumnType::Int64), true),
+        ast::WindowFunc::LastValue => (P::LastValue, None, arg_ty.unwrap_or(ColumnType::Int64), true),
+        // nth_value(expr, n). `n` is a constant integer ≥ 1 (sqlite errors at
+        // runtime on n < 1; a constant lets us refuse it cleanly at prepare).
+        ast::WindowFunc::NthValue => {
+            let n = match extra_args.first() {
+                Some(e) => const_int_arg(binder, e, "nth_value n")?,
+                None => return Err(bind_err("nth_value() requires a second argument")),
+            };
+            if n < 1 {
+                return Err(bind_err(
+                    "nth_value()'s second argument must be a positive integer constant",
+                ));
+            }
+            (P::NthValue(n), None, arg_ty.unwrap_or(ColumnType::Int64), true)
+        }
+    })
+}
+
+/// Bind a value-function offset / n argument and require it to fold to a
+/// constant integer. A non-constant (a column, a parameter, an arithmetic
+/// expression) or non-integer value is REFUSED: sqlite coerces the offset
+/// per-row with brittle, version-specific rules (a non-integer float yields
+/// all-NULL, non-numeric text yields 0), and the 0-wrong-answer contract forbids
+/// guessing. The overwhelmingly common forms — `lag(x, 2)`, `nth_value(x, 3)` —
+/// are integer literals and pass; a bare `lag(x)` never reaches here (offset
+/// defaults to 1).
+fn const_int_arg(binder: &mut Binder<'_>, e: &ast::Expr, what: &str) -> Result<i64> {
+    let (b, _) = binder.bind_expr(e)?;
+    match b {
+        BExpr::Const(Value::Int(n)) => Ok(n),
+        _ => Err(bind_err(format!(
+            "{what} must be a constant integer — a non-constant or non-integer \
+             {what} is refused (sqlite's per-row coercion is not reproducible)"
+        ))),
+    }
+}
+
+/// The result type of `lag`/`lead(expr, offset, default)`: the value and the
+/// default share ONE type (a rigid engine has a single result column). A NULL /
+/// untyped side adopts the other; a genuine int-vs-float or int-vs-text mismatch
+/// is REFUSED (sqlite would type it per row). Both untyped ⇒ an all-NULL,
+/// type-neutral column.
+fn unify_value_default(
+    value_ty: Option<ColumnType>,
+    default_ty: Option<ColumnType>,
+) -> Result<ColumnType> {
+    match (value_ty, default_ty) {
+        (Some(a), Some(b)) if a == b => Ok(a),
+        (Some(a), Some(b)) => Err(bind_err(format!(
+            "lag/lead default type ({b}) differs from the value type ({a}) — a rigid \
+             engine needs a single result type; add an explicit CAST"
+        ))),
+        (Some(a), None) => Ok(a),
+        (None, Some(b)) => Ok(b),
+        (None, None) => Ok(ColumnType::Int64),
     }
 }
 
@@ -197,6 +288,11 @@ fn window_item_name(e: &ast::Expr) -> String {
             ast::WindowFunc::Rank => "rank()".to_string(),
             ast::WindowFunc::DenseRank => "dense_rank()".to_string(),
             ast::WindowFunc::Agg(f) => format!("{}()", f.name()),
+            ast::WindowFunc::Lag => "lag()".to_string(),
+            ast::WindowFunc::Lead => "lead()".to_string(),
+            ast::WindowFunc::FirstValue => "first_value()".to_string(),
+            ast::WindowFunc::LastValue => "last_value()".to_string(),
+            ast::WindowFunc::NthValue => "nth_value()".to_string(),
         },
         _ => "?column?".to_string(),
     }
@@ -282,7 +378,8 @@ pub(super) fn plan_window_select(
             let (b, _) = binder.bind_expr(p)?;
             order_by.push((compile_program(&b)?, *desc));
         }
-        let (func, ty, nullable) = resolve_window_func(&spec.func, arg_ty);
+        let (func, default, ty, nullable) =
+            resolve_window_func(&mut binder, &spec.func, arg_ty, &spec.extra_args)?;
         win_types.push((ty, nullable));
         windows.push(WindowSpec {
             func,
@@ -290,6 +387,7 @@ pub(super) fn plan_window_select(
             distinct: false,
             partition_by,
             order_by,
+            default,
         });
     }
 

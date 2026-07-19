@@ -118,6 +118,9 @@ pub(super) fn compute_windows(
         let mut part_key: Vec<Vec<u8>> = Vec::with_capacity(n);
         let mut order_vals: Vec<Vec<Value>> = Vec::with_capacity(n);
         let mut arg_vals: Vec<Option<Value>> = Vec::with_capacity(n);
+        // `lag`/`lead` out-of-range default, evaluated at each (current) row —
+        // NULL for every other function and for a lag/lead with no default.
+        let mut default_vals: Vec<Value> = Vec::with_capacity(n);
         for row in rows.iter() {
             let mut pk = Vec::with_capacity(w.partition_by.len());
             for p in &w.partition_by {
@@ -134,6 +137,10 @@ pub(super) fn compute_windows(
             arg_vals.push(match &w.arg {
                 None => None,
                 Some(p) => Some(p.eval(row, params)?),
+            });
+            default_vals.push(match &w.default {
+                Some(p) => p.eval(row, params)?,
+                None => Value::Null,
             });
         }
 
@@ -157,6 +164,7 @@ pub(super) fn compute_windows(
             &part_key,
             &order_vals,
             &arg_vals,
+            &default_vals,
             &dirs,
         )?;
     }
@@ -176,6 +184,7 @@ fn assign_window(
     part_key: &[Vec<u8>],
     order_vals: &[Vec<Value>],
     arg_vals: &[Option<Value>],
+    default_vals: &[Value],
     dirs: &[bool],
 ) -> Result<()> {
     let slot = base_width + k;
@@ -254,6 +263,79 @@ fn assign_window(
                         }
                         g = h;
                     }
+                }
+            }
+            // lag/lead: frame-INDEPENDENT. A PHYSICAL row offset in window order
+            // (not a peer-group hop) — the value `offset` rows before (lag) /
+            // after (lead) the current row; out of range ⇒ the per-row default
+            // (or NULL). A negative constant offset is legal and simply looks the
+            // other way (`p - offset`), exactly as sqlite computes it.
+            WindowFunc::Lag(offset) | WindowFunc::Lead(offset) => {
+                let forward = matches!(w.func, WindowFunc::Lead(_));
+                for (off, &i) in part.iter().enumerate() {
+                    let cur = off as i64;
+                    let target = if forward {
+                        cur.checked_add(offset)
+                    } else {
+                        cur.checked_sub(offset)
+                    };
+                    rows[i][slot] = match target {
+                        Some(t) if (0..part.len() as i64).contains(&t) => {
+                            arg_vals[part[t as usize]].clone().unwrap_or(Value::Null)
+                        }
+                        _ => default_vals[i].clone(),
+                    };
+                }
+            }
+            // first_value: the frame START is UNBOUNDED PRECEDING, so it is the
+            // partition's FIRST row for every row — constant across the partition.
+            WindowFunc::FirstValue => {
+                let fv = arg_vals[part[0]].clone().unwrap_or(Value::Null);
+                for &i in part {
+                    rows[i][slot] = fv.clone();
+                }
+            }
+            // last_value: the frame END is the current row's peer-group end (or
+            // the partition end with no ORDER BY). Every row of a peer group sees
+            // the group's FINAL row — the RANGE-frame default, matching sqlite.
+            WindowFunc::LastValue => {
+                let mut g = 0usize;
+                while g < part.len() {
+                    let mut h = g + 1;
+                    while h < part.len() && peers(part[h], part[g]) {
+                        h += 1;
+                    }
+                    let lv = arg_vals[part[h - 1]].clone().unwrap_or(Value::Null);
+                    for &i in &part[g..h] {
+                        rows[i][slot] = lv.clone();
+                    }
+                    g = h;
+                }
+            }
+            // nth_value: the n-th row (1-based) of the frame, else NULL. The frame
+            // for a peer group ends at that group's last row (exclusive index
+            // `h`), so the FIXED row `part[n-1]` is in-frame once `h >= n` — it
+            // appears at the peer group that first reaches it and stays for the
+            // rest of the partition.
+            WindowFunc::NthValue(nn) => {
+                let mut g = 0usize;
+                while g < part.len() {
+                    let mut h = g + 1;
+                    while h < part.len() && peers(part[h], part[g]) {
+                        h += 1;
+                    }
+                    // `nn >= 1` (validated); present ⇒ 1 <= nn <= h <= part.len(),
+                    // so `nn - 1` is a valid index. Compare in i64 to stay correct
+                    // for an absurdly large constant n (which just yields NULL).
+                    let v = if (h as i64) >= nn {
+                        arg_vals[part[(nn - 1) as usize]].clone().unwrap_or(Value::Null)
+                    } else {
+                        Value::Null
+                    };
+                    for &i in &part[g..h] {
+                        rows[i][slot] = v.clone();
+                    }
+                    g = h;
                 }
             }
         }

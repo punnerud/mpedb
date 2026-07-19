@@ -198,7 +198,16 @@ const MAX_JOINS: usize = 16;
 //     now a first-class variant the executor resolves by deleting every
 //     conflicting row (PK + each unique index) then inserting — sqlite's real
 //     semantics.
-const PLAN_FORMAT: u8 = 33;
+// 34: window value/offset functions (design/DESIGN-WINDOW.md stage 2) —
+//     `lag`/`lead`/`first_value`/`last_value`/`nth_value`. `WindowFunc` grows
+//     five tags (Lag=5, Lead=6, FirstValue=7, LastValue=8, NthValue=9), the
+//     Lag/Lead/NthValue tags each carry a trailing i64 (the constant offset /
+//     n), and every `WindowSpec` grows an optional `default` program (the
+//     lag/lead out-of-range default) encoded right after `distinct`. A format-33
+//     reader hits an unknown window func tag (or desyncs on the i64 / default
+//     bytes) and rejects the plan as corrupt rather than misreading it — the
+//     same additive whole-plan-version gating as the stage-1 window bump (24).
+const PLAN_FORMAT: u8 = 34;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -572,6 +581,11 @@ pub struct WindowSpec {
     /// Window ORDER BY: `(program over base row, descending)`. Empty = the whole
     /// partition is one peer group (no cumulative frame).
     pub order_by: Vec<(ExprProgram, bool)>,
+    /// `lag`/`lead`'s out-of-range DEFAULT expression, over the base row (stage
+    /// 2, format 34). Evaluated at the CURRENT row when the offset lands outside
+    /// the partition; `None` (⇒ NULL) for every function other than lag/lead and
+    /// for a lag/lead whose default was omitted.
+    pub default: Option<ExprProgram>,
 }
 
 /// Which window function a [`WindowSpec`] computes. A closed enum with wire tags
@@ -589,16 +603,39 @@ pub enum WindowFunc {
     /// An aggregate over the default frame — cumulative (`RANGE … CURRENT ROW`)
     /// when the window has ORDER BY, else the whole partition.
     Agg(AggFn),
+    /// `lag(expr, offset, …)` — the value `offset` rows BEFORE the current row in
+    /// the partition (window order); out of range ⇒ the spec's `default` (or
+    /// NULL). Frame-independent. The `i64` is the CONSTANT offset (folded at
+    /// prepare; a non-constant offset is refused).
+    Lag(i64),
+    /// `lead(expr, offset, …)` — the value `offset` rows AFTER the current row.
+    Lead(i64),
+    /// `first_value(expr)` — the first row of the frame, i.e. (default frame)
+    /// the partition's first row: constant across the partition.
+    FirstValue,
+    /// `last_value(expr)` — the last row of the frame: the current row's
+    /// peer-group end (default RANGE frame with ORDER BY), or the partition's
+    /// last row (no ORDER BY).
+    LastValue,
+    /// `nth_value(expr, n)` — the n-th row (1-based, `i64`) of the frame, or NULL
+    /// if the frame has fewer than n rows. `n` is a CONSTANT ≥ 1 (validated).
+    NthValue(i64),
 }
 
 impl WindowFunc {
-    /// Wire tag. `Agg` is tag 4 followed by the [`AggFn`] tag byte.
+    /// Wire tag. `Agg` is tag 4 followed by the [`AggFn`] tag byte;
+    /// `Lag`/`Lead`/`NthValue` are their tag followed by an i64 (offset / n).
     pub(crate) fn tag(self) -> u8 {
         match self {
             WindowFunc::RowNumber => 1,
             WindowFunc::Rank => 2,
             WindowFunc::DenseRank => 3,
             WindowFunc::Agg(_) => 4,
+            WindowFunc::Lag(_) => 5,
+            WindowFunc::Lead(_) => 6,
+            WindowFunc::FirstValue => 7,
+            WindowFunc::LastValue => 8,
+            WindowFunc::NthValue(_) => 9,
         }
     }
 }

@@ -405,18 +405,45 @@ impl CompiledPlan {
                         return Err(corrupt("too many windows in plan"));
                     }
                     for w in win {
+                        use super::WindowFunc as WF;
                         if w.distinct {
                             return Err(corrupt("DISTINCT window aggregate is not supported"));
                         }
                         // A ranking function has no argument (the row is the
-                        // input); only an aggregate window carries one.
-                        if w.arg.is_some()
-                            && !matches!(w.func, super::WindowFunc::Agg(_))
-                        {
+                        // input). An aggregate window MAY carry one (`sum(x)`) or
+                        // not (`count(*)`). Every value/offset function REQUIRES
+                        // its value `expr`.
+                        let is_ranking =
+                            matches!(w.func, WF::RowNumber | WF::Rank | WF::DenseRank);
+                        let is_value = matches!(
+                            w.func,
+                            WF::Lag(_)
+                                | WF::Lead(_)
+                                | WF::FirstValue
+                                | WF::LastValue
+                                | WF::NthValue(_)
+                        );
+                        if w.arg.is_some() && is_ranking {
                             return Err(corrupt("ranking window function carries an argument"));
+                        }
+                        if w.arg.is_none() && is_value {
+                            return Err(corrupt("value window function requires an argument"));
+                        }
+                        if let WF::NthValue(n) = w.func {
+                            if n < 1 {
+                                return Err(corrupt("nth_value n must be a positive integer"));
+                            }
+                        }
+                        // `default` is a lag/lead-only field (the out-of-range
+                        // value); anything else carrying one is malformed.
+                        if w.default.is_some() && !matches!(w.func, WF::Lag(_) | WF::Lead(_)) {
+                            return Err(corrupt("only lag/lead carry a default expression"));
                         }
                         if let Some(a) = &w.arg {
                             self.check_program_width(a, base_width, ptypes)?;
+                        }
+                        if let Some(d) = &w.default {
+                            self.check_program_width(d, base_width, ptypes)?;
                         }
                         for p in &w.partition_by {
                             self.check_program_width(p, base_width, ptypes)?;
