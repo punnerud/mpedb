@@ -39,7 +39,7 @@ pub(super) fn has_subquery(s: &ast::SelectStmt) -> bool {
         || s.order_by.iter().any(|(e, _)| expr_has_subquery(e))
 }
 
-fn expr_has_subquery(e: &ast::Expr) -> bool {
+pub(super) fn expr_has_subquery(e: &ast::Expr) -> bool {
     use ast::Expr as E;
     match e {
         E::Subquery(_) | E::Exists(..) | E::InSubquery(..) => true,
@@ -186,6 +186,65 @@ pub(super) fn lift_subqueries<'a>(
         subplans: lift.subplans,
         slot_types: lift.slot_types,
     })
+}
+
+/// Lift every subquery out of an UPDATE/DELETE `WHERE` clause (#97).
+///
+/// The write planners bind their `WHERE` directly — no lift ran, so a
+/// `(SELECT …)` reached the binder and was refused ("this expression position
+/// does not support subqueries yet"). This is the same lift `plan_select`
+/// performs, applied to the one expression a DML statement has: each subquery
+/// becomes a [`SubPlan`] on the plan and is replaced by `Param(slot)`, so the
+/// write planner's `extract_access` / `compile_program` see only a parameter
+/// and need no change at all. `exec_stmt_impl` already fills every UNCORRELATED
+/// result slot once, before dispatch, for EVERY statement kind — so the
+/// executor needs no change either.
+///
+/// **Uncorrelated only, and that is load-bearing.** `outer_scope` is the write
+/// target's own row, so a reference to it RESOLVES here and is refused BY NAME
+/// instead of silently becoming an "unknown column" inside the subquery. A
+/// correlated DML subquery would need the per-row fill (`post_filter`) that
+/// only the SELECT executor has; the write path has no such phase, so admitting
+/// one would read an unfilled hole. Refused, never answered.
+///
+/// **Snapshot semantics.** An uncorrelated subplan is evaluated ONCE, before
+/// the write begins, against the transaction's stable MVCC snapshot. So
+/// `DELETE FROM t WHERE id IN (SELECT id FROM t WHERE …)` — a subquery over the
+/// very table being written — reads the PRE-write state, which is both SQL's
+/// rule and what sqlite does (it materializes the `IN` set into an ephemeral
+/// index first). The Halloween problem cannot arise.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn lift_dml_where<'a>(
+    where_clause: &ast::Expr,
+    target: &'a TableDef,
+    target_name: &str,
+    schema: &'a Schema,
+    n_params: u16,
+    catalog: &'a PolicyCatalog,
+    mode: BareGroupBy,
+    host_udfs: &'a HostUdfSet,
+    consts: &'a mut Vec<Value>,
+    op: &str,
+) -> Result<(ast::Expr, Vec<SubPlan>, Vec<Ty>)> {
+    let mut lift = Lift {
+        schema,
+        n_params,
+        catalog,
+        mode,
+        host_udfs,
+        consts,
+        outer_scope: Scope::single_named(target_name.to_string(), target),
+        subplans: Vec::new(),
+        slot_types: Vec::new(),
+    };
+    let rewritten = lift.rewrite(where_clause)?;
+    if lift.subplans.iter().any(|s| !s.outer_args.is_empty()) {
+        return Err(bind_err(format!(
+            "a correlated subquery in {op} … WHERE is not supported yet — the \
+             correlated value is filled per row, which only the SELECT path does"
+        )));
+    }
+    Ok((rewritten, lift.subplans, lift.slot_types))
 }
 
 struct Lift<'a> {
