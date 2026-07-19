@@ -99,3 +99,33 @@ if os.environ.get("WB_TRACE_SQL_ERRORS"):
             raise
 
     CursorWrapper._execute = _execute
+
+
+# --- workbench measurement aid ------------------------------------------------
+# With WB_SOFT_CREATE_INDEX=1, a failing `CREATE INDEX` during `migrate` is
+# logged and SWALLOWED instead of taking down the whole label.
+#
+# Why this exists: an index is a performance structure, never an answer, so a
+# missing one changes no query RESULT — but a refused `CREATE INDEX` aborts
+# `create_test_db()` and hides every gap behind it. mpedb currently refuses to
+# index an `any` column ("the index is memcmp-ordered and `any` has no order
+# across types"), and Django's `datetime`/`decimal` columns take NUMERIC
+# affinity → `any`, so `django_session.expire_date` alone blocks BOTH label
+# groups outright. Off by default: this is a measurement lever for isolating a
+# DOWNSTREAM gap, not an adaptation the reported numbers may rest on. Anything
+# measured with it on must say so.
+if os.environ.get("WB_SOFT_CREATE_INDEX"):
+    from django.db.backends.base.schema import BaseDatabaseSchemaEditor
+
+    _orig_se_execute = BaseDatabaseSchemaEditor.execute
+
+    def _se_execute(self, sql, params=()):
+        try:
+            return _orig_se_execute(self, sql, params)
+        except Exception as exc:
+            if "CREATE INDEX" in str(sql).upper():
+                print(f"\n[WB-SOFT-INDEX] swallowed: {exc}\n  SQL: {sql}", flush=True)
+                return None
+            raise
+
+    BaseDatabaseSchemaEditor.execute = _se_execute

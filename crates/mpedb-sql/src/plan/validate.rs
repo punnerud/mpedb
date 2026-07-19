@@ -733,8 +733,25 @@ impl CompiledPlan {
     /// it would read an unfilled hole. Uncorrelated slots are filled once
     /// before access resolution and are legal everywhere.
     fn validate_subplans(&self, schema: &Schema) -> Result<()> {
-        let PlanStmt::Select(outer) = &self.stmt else {
-            return Err(corrupt("subplans on a non-SELECT statement"));
+        // A SELECT owns an outer ROW that a subplan may correlate to. An
+        // UPDATE/DELETE (#97) does not: `exec_stmt_impl` fills its reserved
+        // slots ONCE before dispatch and the write path has no per-row fill
+        // phase at all, so a correlated slot there would be an unfilled hole.
+        // Requiring every top-level subplan uncorrelated makes the whole
+        // gather-side slot discipline vacuous — there is no correlated slot to
+        // leak into `access`/`filter` — so it is checked here instead of via
+        // `check_slot_discipline`, which needs a `SelectPlan`. (An INSERT's
+        // subplans belong to its source SELECT, whose param space is merged
+        // rather than reserved; that shape stays refused.)
+        let outer = match &self.stmt {
+            PlanStmt::Select(outer) => Some(outer),
+            PlanStmt::Update { .. } | PlanStmt::Delete { .. } => {
+                if self.subplans.iter().any(|s| !s.outer_args.is_empty()) {
+                    return Err(corrupt("correlated subplan on an UPDATE/DELETE"));
+                }
+                None
+            }
+            _ => return Err(corrupt("subplans on a non-SELECT statement")),
         };
         if self.subplans.len() > MAX_SUBPLANS {
             return Err(corrupt("too many subplans in plan"));
@@ -750,23 +767,27 @@ impl CompiledPlan {
                 .ok_or_else(|| corrupt(format!("table id {id} out of range")))
         };
         // The outer base row: `[table0 ‖ … ‖ tableN]` types, for outer_args.
+        // EMPTY for a write statement — nothing may correlate to it, and the
+        // bounds check below turns a forged `outer_arg` into `corrupt`.
         let mut outer_types: Vec<ColumnType> = Vec::new();
-        for id in std::iter::once(outer.table).chain(outer.joins.iter().map(|j| j.table)) {
-            // A FROM-less outer contributes zero columns — nothing can
-            // correlate against it (outer_args bounds-check against an
-            // empty tuple below, so a forged arg still fails).
-            if id == super::DUAL_TABLE {
-                continue;
+        if let Some(outer) = outer {
+            for id in std::iter::once(outer.table).chain(outer.joins.iter().map(|j| j.table)) {
+                // A FROM-less outer contributes zero columns — nothing can
+                // correlate against it (outer_args bounds-check against an
+                // empty tuple below, so a forged arg still fails).
+                if id == super::DUAL_TABLE {
+                    continue;
+                }
+                outer_types.extend(get_table(id)?.columns.iter().map(|c| c.ty));
             }
-            outer_types.extend(get_table(id)?.columns.iter().map(|c| c.ty));
-        }
 
-        // The gather-side slot discipline (a correlated result slot may not be
-        // read by any gather-side program) applies at THIS level's `sub_base` and,
-        // recursively, at each nested subplan's own `sub_base` — factored into one
-        // helper (`check_slot_discipline`) so the top and nested levels (#73 §3
-        // stage 2) cannot drift.
-        self.check_slot_discipline(outer, sub_base, &self.subplans)?;
+            // The gather-side slot discipline (a correlated result slot may not be
+            // read by any gather-side program) applies at THIS level's `sub_base` and,
+            // recursively, at each nested subplan's own `sub_base` — factored into one
+            // helper (`check_slot_discipline`) so the top and nested levels (#73 §3
+            // stage 2) cannot drift.
+            self.check_slot_discipline(outer, sub_base, &self.subplans)?;
+        }
 
         // Each top subplan (and, recursively, its own nested lifts — #73 §3) is
         // validated against ITS level's parameter space and outer row. The

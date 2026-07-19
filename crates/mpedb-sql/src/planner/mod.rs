@@ -1145,9 +1145,20 @@ fn plan_update(
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
-    let mut binder = Binder::new(table, n_params, true);
+    // Subqueries in the WHERE lift out FIRST (#97), exactly as they do for a
+    // SELECT: each becomes a `SubPlan` + reserved slot and is replaced by
+    // `Param(slot)`, so everything below sees only a parameter.
+    let (where_ast, subplans, slot_types) = lift_where(
+        s.where_clause.as_ref(), table, &s.table, schema, n_params, catalog, mode, host_udfs,
+        consts, "UPDATE",
+    )?;
+    let eff_params = n_params + subplans.len() as u16;
+    let mut binder = Binder::new(table, eff_params, true);
     binder.set_dialect(mode);
     binder.set_host_udfs(host_udfs);
+    for (i, ty) in slot_types.iter().enumerate() {
+        binder.pin_param(n_params + i as u16, *ty);
+    }
 
     // sqlite (R-34751-18293): when a column is assigned more than once, all but
     // the RIGHTMOST occurrence is ignored — not evaluated, not type-checked. So
@@ -1179,8 +1190,7 @@ fn plan_update(
         set.push((idx, compile_program(&b)?));
     }
 
-    let bound_where = s
-        .where_clause
+    let bound_where = where_ast
         .as_ref()
         .map(|e| binder.bind_predicate(e))
         .transpose()?;
@@ -1209,8 +1219,34 @@ fn plan_update(
         context_keys,
         list_keys,
         Vec::new(),
-        Vec::new(),
+        subplans,
     ))
+}
+
+/// The shared WHERE-lift both write planners run (#97). `None` / subquery-free
+/// WHERE clauses take the zero-cost path and produce no subplans at all.
+#[allow(clippy::too_many_arguments)]
+fn lift_where(
+    where_clause: Option<&ast::Expr>,
+    table: &TableDef,
+    table_name: &str,
+    schema: &Schema,
+    n_params: u16,
+    catalog: &PolicyCatalog,
+    mode: BareGroupBy,
+    host_udfs: &HostUdfSet,
+    consts: &mut Vec<Value>,
+    op: &str,
+) -> Result<(Option<ast::Expr>, Vec<SubPlan>, Vec<Ty>)> {
+    match where_clause {
+        Some(w) if subquery::expr_has_subquery(w) => {
+            let (e, subs, tys) = subquery::lift_dml_where(
+                w, table, table_name, schema, n_params, catalog, mode, host_udfs, consts, op,
+            )?;
+            Ok((Some(e), subs, tys))
+        }
+        other => Ok((other.cloned(), Vec::new(), Vec::new())),
+    }
 }
 
 fn plan_delete(
@@ -1223,11 +1259,19 @@ fn plan_delete(
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
-    let mut binder = Binder::new(table, n_params, true);
+    // Subqueries in the WHERE lift out FIRST (#97) — see `plan_update`.
+    let (where_ast, subplans, slot_types) = lift_where(
+        s.where_clause.as_ref(), table, &s.table, schema, n_params, catalog, mode, host_udfs,
+        consts, "DELETE",
+    )?;
+    let eff_params = n_params + subplans.len() as u16;
+    let mut binder = Binder::new(table, eff_params, true);
     binder.set_dialect(mode);
     binder.set_host_udfs(host_udfs);
-    let bound_where = s
-        .where_clause
+    for (i, ty) in slot_types.iter().enumerate() {
+        binder.pin_param(n_params + i as u16, *ty);
+    }
+    let bound_where = where_ast
         .as_ref()
         .map(|e| binder.bind_predicate(e))
         .transpose()?;
@@ -1247,7 +1291,7 @@ fn plan_delete(
         context_keys,
         list_keys,
         Vec::new(),
-        Vec::new(),
+        subplans,
     ))
 }
 
