@@ -72,6 +72,17 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
     } else {
         false
     };
+    // `--mirror` (alias `--sidecar`): opt OUT of the default overlay into the v0
+    // full sidecar mirror — import the whole base into a `<file>.mpedb` and
+    // `checkpoint` writes back. Useful for migration / round-trip validation.
+    let mirror = if let Some(i) =
+        rest.iter().position(|a| a == "--mirror" || a == "--sidecar")
+    {
+        rest.remove(i);
+        true
+    } else {
+        false
+    };
     let mode = if let Some(i) = rest.iter().position(|a| a == "--mode") {
         if i + 1 >= rest.len() {
             return usage("--mode needs a value: locked|optimistic|offline");
@@ -110,11 +121,16 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
         }
         return run_direct(p, rest);
     }
-    if overlay {
-        if !is_sqlite(p) {
-            return runtime(format!("--overlay needs a sqlite file, {path} is not one"));
-        }
+    // A sqlite `.db` opens as the delta-WAL OVERLAY by DEFAULT: the
+    // `<file>.overlay.mpedb` beside the base holds only your changes, reads fall
+    // through to the base via the native reader, and `checkpoint` folds them in.
+    // `--mirror` chooses the full sidecar import instead; `--overlay` is accepted
+    // for back-compat but is now the default.
+    if is_sqlite(p) && !mirror {
         return run_overlay(p, mode, reconcile, rest);
+    }
+    if overlay {
+        return runtime(format!("--overlay needs a sqlite file, {path} is not one"));
     }
     let target = if is_sqlite(p) {
         let side = sidecar(p);
