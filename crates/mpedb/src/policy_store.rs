@@ -146,7 +146,7 @@ impl Database {
         for src in [def.using_src.as_deref(), def.check_src.as_deref()].into_iter().flatten() {
             mpedb_sql::validate_policy_expr(src, t)?;
         }
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         w.sys_put(&pol_subkey(table_id, &def.name), &def.encode_value())?;
         bump_epoch(&mut w, table_id)?;
         w.commit()
@@ -155,7 +155,7 @@ impl Database {
     /// Drop a policy by name. Returns whether it existed.
     pub fn drop_policy(&self, table: &str, name: &str) -> Result<bool> {
         let table_id = self.require_table_id(table)?;
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         let existed = w.sys_delete(&pol_subkey(table_id, name))?;
         if existed {
             bump_epoch(&mut w, table_id)?;
@@ -170,7 +170,7 @@ impl Database {
     pub fn enable_rls(&self, table: &str, force: bool) -> Result<()> {
         let table_id = self.require_table_id(table)?;
         let flags: u8 = 0b01 | if force { 0b10 } else { 0 };
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         w.sys_put(&with_table_id(RLSEN_PREFIX, table_id), &[flags])?;
         bump_epoch(&mut w, table_id)?;
         w.commit()
@@ -180,7 +180,7 @@ impl Database {
     /// (all rows visible again). Policies themselves are left in place.
     pub fn disable_rls(&self, table: &str) -> Result<()> {
         let table_id = self.require_table_id(table)?;
-        let mut w = self.engine.begin_write()?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         w.sys_delete(&with_table_id(RLSEN_PREFIX, table_id))?;
         bump_epoch(&mut w, table_id)?;
         w.commit()

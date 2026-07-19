@@ -721,7 +721,7 @@ fn tname(db: &Database, table: u32) -> String {
 /// optimistic fallback (ineligible statements and exhausted-retry conflicts).
 fn serial_execute(db: &Database, plan: &CompiledPlan, params: &[Value]) -> Result<ExecResult> {
     let triggers = db.trigger_set()?;
-    let mut txn = db.engine.begin_write()?;
+    let mut txn = db.engine.begin_write_deadline(db.busy_deadline())?;
     let mut partial = false;
     match exec_own(db, &mut txn, plan, params, &triggers, &mut partial) {
         Ok(out) => {
@@ -759,7 +759,7 @@ fn optimistic_execute(
                 return outcome;
             }
             Prep::Confirm { table, key_hash, snap, outcome } => {
-                let txn = db.engine.begin_write()?;
+                let txn = db.engine.begin_write_deadline(db.busy_deadline())?;
                 if txn.optimistic_validate(snap, table, key_hash).is_err() {
                     txn.abort();
                     conflicts += 1;
@@ -770,7 +770,7 @@ fn optimistic_execute(
                 return outcome;
             }
             Prep::Apply { table, key, key_hash, snap, op, affected } => {
-                let mut txn = db.engine.begin_write()?;
+                let mut txn = db.engine.begin_write_deadline(db.busy_deadline())?;
                 if txn.optimistic_validate(snap, table, key_hash).is_err() {
                     txn.abort();
                     conflicts += 1;
