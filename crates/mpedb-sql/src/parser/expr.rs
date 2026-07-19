@@ -203,20 +203,17 @@ impl<'a> Parser<'a> {
                 let negated = self.eat_kw(Kw::Not);
                 self.expect_kw(Kw::Like, "LIKE")?;
                 let pat = self.add_expr()?;
-                // `LIKE … ESCAPE <char>` is not supported. Say THAT. `ESCAPE`
-                // is not a reserved word, so without this the leftover token
-                // surfaces wherever the enclosing construct next demanded one —
-                // `expected ) closing FILTER (WHERE …)`, `expected ) after IN
-                // subquery` — which sent three separate Django gap reports
-                // chasing the paren instead of the escape clause. Unambiguous
-                // here: sqlite's grammar admits nothing but ESCAPE in this
-                // position, so a bare `escape` can never be a column or alias.
-                if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("ESCAPE")) {
-                    return Err(self.err_here(
-                        "LIKE … ESCAPE is not supported yet — only `x [NOT] LIKE pattern`",
-                    ));
-                }
-                let like = Expr::Like(Box::new(e), Box::new(pat));
+                // `LIKE … ESCAPE <char>`. `ESCAPE` is not a reserved word, but
+                // sqlite's grammar admits nothing else in this position, so a
+                // bare `escape` here can never be a column or an alias.
+                let escape = if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("ESCAPE"))
+                {
+                    self.pos += 1;
+                    Some(self.escape_char()?)
+                } else {
+                    None
+                };
+                let like = Expr::Like(Box::new(e), Box::new(pat), escape);
                 e = if negated {
                     Expr::Unary(UnOp::Not, Box::new(like))
                 } else {

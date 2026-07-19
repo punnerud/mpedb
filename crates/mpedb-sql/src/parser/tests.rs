@@ -235,8 +235,52 @@ fn is_null_and_like() {
     assert_eq!(expr("a IS NOT NULL"), Expr::IsNull(col("a"), true));
     assert_eq!(
         expr("a LIKE 'x%'"),
-        Expr::Like(col("a"), Box::new(Expr::Lit(Value::Text("x%".into()))))
+        Expr::Like(col("a"), Box::new(Expr::Lit(Value::Text("x%".into()))), None)
     );
+    // `ESCAPE c` is part of the LIKE node, not a trailing token.
+    assert_eq!(
+        expr(r"a LIKE 'x%' ESCAPE '\'"),
+        Expr::Like(
+            col("a"),
+            Box::new(Expr::Lit(Value::Text("x%".into()))),
+            Some('\\')
+        )
+    );
+    // `NOT LIKE … ESCAPE` desugars to NOT over the same node.
+    assert_eq!(
+        expr(r"a NOT LIKE 'x%' ESCAPE '\'"),
+        Expr::Unary(
+            UnOp::Not,
+            Box::new(Expr::Like(
+                col("a"),
+                Box::new(Expr::Lit(Value::Text("x%".into()))),
+                Some('\\')
+            ))
+        )
+    );
+}
+
+/// The ESCAPE argument is a single-character string LITERAL. sqlite takes an
+/// arbitrary expression and raises at step time; mpedb refuses at prepare, and
+/// the refusal has to name ESCAPE — the whole point of the clause being parsed
+/// here rather than surfacing as a stray token in the enclosing construct.
+#[test]
+fn escape_argument_must_be_one_character() {
+    for sql in [
+        "a LIKE 'x' ESCAPE ''",
+        "a LIKE 'x' ESCAPE 'ab'",
+        "a LIKE 'x' ESCAPE 5",
+        "a LIKE 'x' ESCAPE b",
+        "a LIKE 'x' ESCAPE ?",
+        "a LIKE 'x' ESCAPE NULL",
+    ] {
+        let e = parse_expr_only(sql).expect_err(sql);
+        let m = e.to_string();
+        assert!(
+            m.contains("ESCAPE"),
+            "the refusal must name ESCAPE: {m} (for {sql})"
+        );
+    }
 }
 
 #[test]

@@ -290,6 +290,33 @@ impl<'a> Parser<'a> {
             && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Kw(Kw::Like)))
     }
 
+    /// The argument of `LIKE … ESCAPE <c>`, already past the `ESCAPE` word.
+    ///
+    /// sqlite takes an arbitrary EXPRESSION here and raises `ESCAPE expression
+    /// must be a single character` at step time for anything that is not a
+    /// one-character string. mpedb accepts only the literal — the same
+    /// restriction the LIKE pattern itself already carries — and refuses the
+    /// rest at PREPARE time, by name. In particular sqlite's coercions
+    /// (`ESCAPE 5` ≡ `ESCAPE '5'`) are NOT imitated: a clean refusal beats a
+    /// second, silently different set of numeric-to-text rules.
+    fn escape_char(&mut self) -> Result<char> {
+        let s = match self.peek() {
+            Some(Tok::Str(s)) => s.clone(),
+            _ => {
+                return Err(self.err_here(
+                    "ESCAPE requires a single-character string literal, e.g. ESCAPE '\\'",
+                ))
+            }
+        };
+        self.pos += 1;
+        let mut it = s.chars();
+        match (it.next(), it.next()) {
+            (Some(c), None) => Ok(c),
+            // sqlite's own wording, so a Django/ORM user sees what sqlite says.
+            _ => Err(self.err_here("ESCAPE expression must be a single character")),
+        }
+    }
+
     fn peek_not_regexp(&self) -> bool {
         matches!(self.toks.get(self.pos).map(|t| &t.tok), Some(Tok::Kw(Kw::Not)))
             && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Kw(Kw::Regexp)))

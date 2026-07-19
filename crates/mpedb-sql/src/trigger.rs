@@ -333,7 +333,7 @@ fn rewrite_row_in_expr(e: &mut Expr, scope: &RowScope, map: &mut RowMap) -> Resu
         }
         Expr::Binary(_, a, b)
         | Expr::IsDistinct(a, b, _)
-        | Expr::Like(a, b)
+        | Expr::Like(a, b, _)
         | Expr::Match(a, b)
         | Expr::Glob(a, b, _)
         | Expr::Regexp(a, b, _) => {
