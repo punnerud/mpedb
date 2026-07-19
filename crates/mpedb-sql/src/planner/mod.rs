@@ -674,8 +674,8 @@ fn plan_on_conflict(
         Some(w) => {
             let (b, ty) = binder.bind_expr(w)?;
             // A boolean context like any other: a non-bool is truthy-tested the
-            // way sqlite does (`Binder::to_bool_ctx`).
-            let (b, ty) = match binder.to_bool_ctx(b, ty) {
+            // way sqlite does (`Binder::coerce_bool_ctx`).
+            let (b, ty) = match binder.coerce_bool_ctx(b, ty) {
                 Ok(v) => v,
                 Err(e) => {
                     binder.set_allow_excluded(false);

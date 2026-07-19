@@ -1153,6 +1153,75 @@ fn udf_error_from_a_write_statement() {
     }
 }
 
+/// Django's `BooleanField`, end to end through the C API exactly as CPython's
+/// `sqlite3` module drives it: the column is declared `bool`, and `True`/`False`
+/// arrive as `sqlite3_bind_int` 1/0 — sqlite has no boolean type, so there is
+/// nothing else for a driver to send. (Django gap #5.)
+#[test]
+fn django_boolean_field_through_the_c_api() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(
+            exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, flag bool NOT NULL)"),
+            SQLITE_OK
+        );
+
+        // INSERT ... VALUES (?, ?) with True/False as CPython binds them.
+        for (id, flag) in [(1, 1), (2, 0), (3, 1)] {
+            let mut st: *mut Stmt = ptr::null_mut();
+            let sql = cs("INSERT INTO t (id, flag) VALUES (?, ?)");
+            assert_eq!(
+                sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut()),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_bind_int(st, 1, id), SQLITE_OK);
+            assert_eq!(sqlite3_bind_int(st, 2, flag), SQLITE_OK);
+            assert_eq!(sqlite3_step(st), SQLITE_DONE, "insert id={id}");
+            assert_eq!(sqlite3_finalize(st), SQLITE_OK);
+        }
+
+        // filter(flag=True) — the bound form, which is what Django emits.
+        let mut st: *mut Stmt = ptr::null_mut();
+        let sql = cs("SELECT COUNT(*) FROM t WHERE t.flag = ?");
+        assert_eq!(
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_bind_int(st, 1, 1), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_int64(st, 0), 2);
+        // exclude(flag=True) via the same statement, rebound to False.
+        assert_eq!(sqlite3_reset(st), SQLITE_OK);
+        assert_eq!(sqlite3_bind_int(st, 1, 0), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_int64(st, 0), 1);
+        assert_eq!(sqlite3_finalize(st), SQLITE_OK);
+
+        // The bare-column predicate, and its negation.
+        assert_eq!(scalar_count(db, "SELECT COUNT(*) FROM t WHERE t.flag"), 2);
+        assert_eq!(scalar_count(db, "SELECT COUNT(*) FROM t WHERE NOT t.flag"), 1);
+        assert_eq!(scalar_count(db, "SELECT COUNT(*) FROM t WHERE t.flag = 1"), 2);
+        // `flag = 2` is FALSE, not TRUE — sqlite's answer, since the column only
+        // ever holds 0 or 1.
+        assert_eq!(scalar_count(db, "SELECT COUNT(*) FROM t WHERE t.flag = 2"), 0);
+
+        // Read-back is SQLITE_INTEGER 0/1, which is what Django's converter
+        // (`bool(value)`) and every sqlite consumer expects.
+        let mut st: *mut Stmt = ptr::null_mut();
+        let sql = cs("SELECT flag FROM t WHERE id = 2");
+        assert_eq!(
+            sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_OK
+        );
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_type(st, 0), SQLITE_INTEGER);
+        assert_eq!(sqlite3_column_int(st, 0), 0);
+        assert_eq!(sqlite3_finalize(st), SQLITE_OK);
+
+        sqlite3_close(db);
+    }
+}
+
 // ---- helpers -------------------------------------------------------------
 
 fn sqlite_transient() -> *mut c_void {

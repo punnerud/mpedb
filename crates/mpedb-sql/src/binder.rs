@@ -552,11 +552,11 @@ impl<'a> Binder<'a> {
     }
 
     /// Bind a WHERE predicate: must type to bool (or NULL). A non-boolean is
-    /// truthy-tested the way sqlite does — see [`Self::to_bool_ctx`].
+    /// truthy-tested the way sqlite does — see [`Self::coerce_bool_ctx`].
     pub fn bind_predicate(&mut self, e: &ast::Expr) -> Result<BExpr> {
         let (b, ty) = self.bind_expr(e)?;
         let (b, ty) = self.unify_param(b, ty, ColumnType::Bool);
-        let (b, ty) = self.to_bool_ctx(b, ty)?;
+        let (b, ty) = self.coerce_bool_ctx(b, ty)?;
         match ty {
             None | Some(ColumnType::Bool) => Ok(b),
             Some(t) => Err(bind_err(format!(
@@ -567,12 +567,12 @@ impl<'a> Binder<'a> {
 
     /// Bind a CHECK expression: must type to bool, strictly (an untyped NULL is
     /// still refused here — a CHECK that can never be TRUE is a schema bug).
-    /// A non-boolean is truthy-tested like sqlite ([`Self::to_bool_ctx`]);
+    /// A non-boolean is truthy-tested like sqlite ([`Self::coerce_bool_ctx`]);
     /// CHECK bodies are stored as SOURCE in the schema and recompiled at
     /// attach, so widening what compiles moves no canonical bytes.
     pub fn bind_check(&mut self, e: &ast::Expr) -> Result<BExpr> {
         let (b, ty) = self.bind_expr(e)?;
-        let (b, ty) = self.to_bool_ctx(b, ty)?;
+        let (b, ty) = self.coerce_bool_ctx(b, ty)?;
         match ty {
             Some(ColumnType::Bool) => Ok(b),
             Some(t) => Err(bind_err(format!(
@@ -679,7 +679,7 @@ impl<'a> Binder<'a> {
             ast::Expr::Unary(UnOp::Not, a) => {
                 let (a, at) = self.bind_expr(a)?;
                 let (a, at) = self.unify_param(a, at, ColumnType::Bool);
-                let (a, at) = self.to_bool_ctx(a, at)?;
+                let (a, at) = self.coerce_bool_ctx(a, at)?;
                 match at {
                     None | Some(ColumnType::Bool) => {}
                     Some(t) => return Err(bind_err(format!("NOT requires a boolean, got {t}"))),
@@ -895,10 +895,10 @@ impl<'a> Binder<'a> {
                 for (c, r) in arms {
                     let (bc, ct) = self.bind_expr(c)?;
                     // A WHEN must be a predicate. A non-boolean one is
-                    // truthy-tested exactly as sqlite does (`to_bool_ctx`), so
+                    // truthy-tested exactly as sqlite does (`coerce_bool_ctx`), so
                     // `CASE WHEN 1 THEN …` compiles; only the PostgreSQL dialect
                     // keeps mpedb's original rigid refusal.
-                    let (bc, ct) = self.to_bool_ctx(bc, ct)?;
+                    let (bc, ct) = self.coerce_bool_ctx(bc, ct)?;
                     match ct {
                         Some(ColumnType::Bool) | None => {}
                         Some(t) => {
@@ -1109,8 +1109,8 @@ impl<'a> Binder<'a> {
             BinOp::And | BinOp::Or => {
                 let (l, lt) = self.unify_param(l, lt, ColumnType::Bool);
                 let (r, rt) = self.unify_param(r, rt, ColumnType::Bool);
-                let (l, lt) = self.to_bool_ctx(l, lt)?;
-                let (r, rt) = self.to_bool_ctx(r, rt)?;
+                let (l, lt) = self.coerce_bool_ctx(l, lt)?;
+                let (r, rt) = self.coerce_bool_ctx(r, rt)?;
                 for t in [lt, rt].into_iter().flatten() {
                     if t != ColumnType::Bool {
                         return Err(bind_err(format!(
@@ -1940,7 +1940,7 @@ impl<'a> Binder<'a> {
     /// only ever ACCEPTS more, it never changes an answer mpedb already gives.
     /// Under the PostgreSQL dialect (`bare_group_by = "postgres"`) the rigid
     /// refusal is kept, exactly as [`like_glob_operand`] keeps it there.
-    pub(crate) fn to_bool_ctx(&mut self, e: BExpr, t: Ty) -> Result<(BExpr, Ty)> {
+    pub(crate) fn coerce_bool_ctx(&mut self, e: BExpr, t: Ty) -> Result<(BExpr, Ty)> {
         let src = match t {
             // Already boolean, or nothing to coerce (NULL literal / bare param).
             None | Some(ColumnType::Bool) => return Ok((e, t)),
