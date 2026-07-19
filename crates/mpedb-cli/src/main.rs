@@ -37,8 +37,10 @@ usage: mpedb <command> [args]
          zero import); `mpedb checkpoint <db>` folds them back. `--mirror` uses
          the full sidecar import instead; `--direct` is read-only, zero-setup.
          A MISSING path is CREATED, as sqlite3 creates one: `.mpedb` → a native
-         mpedb database, anything else → an empty sqlite database. CREATE TABLE
-         on a sqlite base is applied to the base itself.
+         mpedb database, anything else → an empty sqlite database. Creation is
+         LAZY, like sqlite3's: the file appears on the FIRST STATEMENT, so
+         opening a repl and leaving it again creates nothing. CREATE TABLE on a
+         sqlite base is applied to the base itself.
 
 
   exec    <target> <SQL> [param ...]       run one statement

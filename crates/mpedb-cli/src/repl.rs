@@ -10,6 +10,10 @@
 //! refused while a session is open: both may need the writer lock this
 //! thread already holds (ERRORCHECK would error out, but the refusal message
 //! is clearer).
+//!
+//! [`run_path`] additionally takes a database that does not exist YET (a
+//! [`PendingCreate`] from `mpedb new.mpedb`): it is created by the first SQL
+//! statement, not by opening the repl.
 
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
@@ -19,6 +23,7 @@ use mpedb::{Config, Database, WriteSession};
 use mpedb_core::Engine;
 
 use crate::line::{LineSource, Names};
+use crate::openpath::PendingCreate;
 use crate::render::{print_result, schema_toml};
 use crate::util::{usage, CliResult};
 
@@ -29,6 +34,50 @@ pub fn run(argv: &[String]) -> CliResult {
     let [config_path] = argv else {
         return usage("repl needs <config.toml|db.mpedb>");
     };
+    run_path(config_path, None)
+}
+
+/// The repl on a target that may not EXIST yet (`mpedb new.mpedb` with no
+/// statement). `pending` is the database that would be created: sqlite3
+/// materializes the file on the first STATEMENT, so this reads lines until one
+/// arrives, creates the database then, and only then opens it. The `Database`
+/// value literally cannot exist before the create — the session below is
+/// unreachable without it, so there is no path that skips materializing.
+pub fn run_path(config_path: &str, pending: Option<PendingCreate>) -> CliResult {
+    let names = Rc::new(RefCell::new(Names::new(DOTS)));
+    let mut input = LineSource::new("mpedb> ", names.clone());
+
+    // Nothing on disk yet: blank lines and dot-commands (`.exit`, `.tables`)
+    // create nothing at all — `mpedb new.mpedb` then `.exit` must leave the
+    // directory exactly as it was. The first SQL statement is the trigger, and
+    // it is then run as the session's first statement.
+    let mut queued: Option<String> = None;
+    if let Some(create) = pending {
+        loop {
+            let Some(line) = input.next_line() else {
+                return Ok(());
+            };
+            let line = line?;
+            let stmt = line.trim().trim_end_matches(';').trim();
+            if stmt.is_empty() {
+                continue;
+            }
+            if let Some(dot) = stmt.strip_prefix('.') {
+                if matches!(dot.trim(), "quit" | "exit") {
+                    return Ok(());
+                }
+                eprintln!(
+                    "error: {} does not exist yet — run a statement to create it",
+                    create.path().display()
+                );
+                continue;
+            }
+            queued = Some(stmt.to_owned());
+            create.materialize()?;
+            break;
+        }
+    }
+
     // Same rule as `open_target`: a .toml is a config, anything else is the
     // database file itself (`mpedb data.db` lands here via its sidecar).
     let (db, db_path) = if Path::new(config_path).extension().is_some_and(|e| e == "toml") {
@@ -42,13 +91,18 @@ pub fn run(argv: &[String]) -> CliResult {
         )
     };
 
-    let names = Rc::new(RefCell::new(Names::new(DOTS)));
     names.borrow_mut().set_schema(&db.schema());
-    let mut input = LineSource::new("mpedb> ", names.clone());
     let mut session: Option<WriteSession<'_>> = None;
 
-    while let Some(line) = input.next_line() {
-        let line = line?;
+    loop {
+        // The statement that triggered the create, if any, runs first.
+        let line = match queued.take() {
+            Some(l) => l,
+            None => match input.next_line() {
+                Some(l) => l?,
+                None => break,
+            },
+        };
         let stmt = line.trim().trim_end_matches(';').trim();
         if stmt.is_empty() {
             continue;
