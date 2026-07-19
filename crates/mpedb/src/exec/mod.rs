@@ -1552,7 +1552,17 @@ fn exec_stmt_rest(
             // AFTER earlier rows in the same statement have been inserted, so
             // `INSERT INTO t VALUES(NULL),(NULL)` yields consecutive ids.
             let rowid_col = t.rowid_alias_col();
+            // sqlite's STORE-TIME AFFINITY, applied before anything else looks
+            // at the row: `'1.50'` into a `decimal(10,2)` column IS the real
+            // 1.5, so RLS, triggers, CHECK, uniqueness, the index keys and
+            // RETURNING must all see 1.5 and `typeof()` must say `real`. Guarded
+            // by `converts_on_store` so a table with no such column never leaves
+            // the borrowed zero-copy row (#40).
+            let converts = t.converts_on_store();
             for (applied, mut row) in built_rows.into_iter().enumerate() {
+                if converts {
+                    t.apply_store_affinity(row.to_mut());
+                }
                 if let Some(rc) = rowid_col {
                     if row.get(rc as usize).is_some_and(|v| v.is_null()) {
                         let next = ctx.next_rowid(*table, rc)?;
@@ -1761,6 +1771,9 @@ fn exec_stmt_rest(
                                     let v = program.eval_host(&both, params, ctx.host_fns())?;
                                     new_row[*c as usize] = v;
                                 }
+                                // DO UPDATE assigns into the column like any
+                                // other write, so the same store-time affinity.
+                                t.apply_store_affinity(&mut new_row);
                                 if let Err(e) = ctx.update_by_pk(*table, &new_row) {
                                     *partial = applied > 0 || !precheck_failure(&e);
                                     return Err(hide_constraint_variant(
@@ -1824,6 +1837,11 @@ fn exec_stmt_rest(
                             .ok_or_else(|| internal("SET column"))?;
                         *slot = program.eval_host(old, params, ctx.host_fns())?;
                     }
+                    // The assigned values enter the column exactly as an
+                    // INSERT's do, so they take the same store-time affinity
+                    // (sqlite applies it to `UPDATE … SET` too) — before the
+                    // WITH CHECK, the triggers and RETURNING below see the row.
+                    t.apply_store_affinity(&mut new_row);
                     Ok(new_row)
                 })();
                 let new_row = match new_row {

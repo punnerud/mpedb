@@ -16,6 +16,7 @@ fn col(name: &str, ty: ColumnType) -> ColumnDef {
         default: None,
         check: None,
         collation: mpedb_sql::Collation::Binary,
+        affinity: mpedb_types::Affinity::implied_by(ty),
     }
 }
 

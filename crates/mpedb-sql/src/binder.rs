@@ -2216,6 +2216,7 @@ mod tests {
             indexed: false,
             default: None,
             check: None, collation: Collation::Binary,
+            affinity: mpedb_types::Affinity::implied_by(ty),
         };
         TableDef {
             id: 0,
@@ -2535,6 +2536,7 @@ mod tests {
                 indexed: false,
                 default: None,
                 check: None, collation: Collation::Binary,
+                affinity: mpedb_types::Affinity::implied_by(ColumnType::Text),
             }],
             primary_key: vec![0],
             indexes: vec![],
@@ -2577,6 +2579,7 @@ mod tests {
                 indexed: false,
                 default: None,
                 check: None, collation: Collation::Binary,
+                affinity: mpedb_types::Affinity::implied_by(ColumnType::Int64),
             }],
             primary_key: vec![0],
             indexes: vec![],

@@ -232,7 +232,12 @@ pub(crate) fn table_def_from_spec(
             // column already stores.
             let default = match &c.default {
                 Some(mpedb_types::DefaultExpr::Const(v)) => {
-                    let v = coerce_default(v.clone(), c.ty, &spec.name, &c.name)?;
+                    // A DEFAULT lands in the column like any other value, so it
+                    // takes the column's store-time affinity FIRST — sqlite
+                    // stores `DEFAULT '1.50'` on a NUMERIC column as the real
+                    // 1.5, and reports `typeof()` accordingly.
+                    let v = mpedb_types::store_into(c.ty, c.affinity, v.clone());
+                    let v = coerce_default(v, c.ty, &spec.name, &c.name)?;
                     if v.is_null() {
                         None
                     } else {
@@ -254,6 +259,9 @@ pub(crate) fn table_def_from_spec(
                 // Declared `COLLATE` rides onto the column. A collated UNIQUE/PK is
                 // caught later by `Schema::validate` (collated indexes deferred).
                 collation: c.collation,
+                // What the DECLARED TYPE NAME said about conversion on the way
+                // in — the half `ty` cannot carry (`decimal(10,2)` vs no type).
+                affinity: c.affinity,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -302,6 +310,7 @@ pub(crate) fn table_def_from_spec(
             default: None,
             check: None,
             collation: mpedb_types::Collation::Binary,
+            affinity: mpedb_types::Affinity::Integer,
         });
         vec![(columns.len() - 1) as u16]
     } else {
@@ -355,6 +364,7 @@ pub(crate) fn virtual_table_def_from_spec(
         default: None,
         check: None,
         collation: mpedb_types::Collation::Binary,
+        affinity: mpedb_types::Affinity::implied_by(ty),
     };
     // `rowid` and `rank` are reserved fts5 column names; a declared column
     // named for the table would shadow the whole-row `MATCH` operand.
@@ -405,7 +415,15 @@ pub(crate) fn add_column_from_spec(
     // Resolve + type-check the DEFAULT const against the column type. The
     // fill value seeds every existing row (NULL when there is no default).
     let fill = match spec.default {
-        Some(DefaultExpr::Const(v)) => coerce_default(v, spec.ty, table, &spec.name)?,
+        // The store-time affinity applies to the fill value too: it is what
+        // lands in every existing row, so it must be the value the column would
+        // have held had the rows been inserted with it.
+        Some(DefaultExpr::Const(v)) => coerce_default(
+            mpedb_types::store_into(spec.ty, spec.affinity, v),
+            spec.ty,
+            table,
+            &spec.name,
+        )?,
         // The ADD-COLUMN parser only ever emits a Const literal (no now()).
         Some(DefaultExpr::Now) => {
             return Err(Error::Bind(format!(
@@ -442,6 +460,7 @@ pub(crate) fn add_column_from_spec(
         // ADD COLUMN carries its declared `COLLATE`. UNIQUE on ADD is already
         // refused above, so a collated index cannot arise here.
         collation: spec.collation,
+        affinity: spec.affinity,
     };
     Ok((col, fill))
 }

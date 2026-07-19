@@ -318,6 +318,7 @@ fn synthetic_window_table(win_types: &[(ColumnType, bool)]) -> TableDef {
             default: None,
             check: None,
             collation: mpedb_types::Collation::Binary,
+            affinity: mpedb_types::Affinity::implied_by(ty),
         })
         .collect();
     TableDef {

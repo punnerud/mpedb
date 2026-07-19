@@ -772,6 +772,36 @@ impl MergeCtx<'_> {
     }
 }
 
+impl MergeCtx<'_> {
+    /// The base's `NOT NULL`, enforced HERE rather than by the overlay's own
+    /// engine.
+    ///
+    /// The overlay file's physical columns are all nullable and must stay that
+    /// way: a DELETE is written as a TOMBSTONE — the PK, `__dead = true`, and
+    /// NULL everywhere else — so a NOT NULL on a physical column would make
+    /// deleting a row impossible. The constraint therefore lives on the write
+    /// path that carries real rows, where the attach's schema (which does know
+    /// the base's `NOT NULL`) is in hand. Without this, the overlay accepted a
+    /// row the base rejects, and the failure surfaced much later as a
+    /// checkpoint error on an unrelated statement.
+    fn check_not_null(&self, table: u32, values: &[Value]) -> Result<()> {
+        let t = self
+            .at
+            .schema()
+            .table(table)
+            .ok_or_else(|| Error::Internal("table id out of range".into()))?;
+        for (v, c) in values.iter().zip(&t.columns) {
+            if v.is_null() && !c.nullable {
+                return Err(Error::NotNullViolation {
+                    table: t.name.clone(),
+                    column: c.name.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
 impl TxnCtx for MergeCtx<'_> {
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
         if let Some(row) = self.ovl.get_by_pk(table, pk)? {
@@ -840,6 +870,7 @@ impl TxnCtx for MergeCtx<'_> {
     }
 
     fn insert_row(&mut self, table: u32, values: &[Value]) -> Result<()> {
+        self.check_not_null(table, values)?;
         // INSERT's uniqueness is over the MERGED view: a live base row
         // collides exactly as a live overlay row does; a tombstoned PK is
         // free again.
@@ -861,6 +892,7 @@ impl TxnCtx for MergeCtx<'_> {
     }
 
     fn update_by_pk(&mut self, table: u32, new_values: &[Value]) -> Result<bool> {
+        self.check_not_null(table, new_values)?;
         // The executor only calls this for rows it just read from the merged
         // view, so existence is established; materialize into the overlay.
         let pk = new_values[self.pk_idx[table as usize]].clone();

@@ -270,6 +270,11 @@ impl<'e> WriteTxn<'e> {
         src: &mut dyn btree::BlobSource,
     ) -> Result<()> {
         self.check_write_blocked(table_id)?;
+        // The streamed column is always TEXT or BLOB (`row` refuses to stream
+        // anything else), and neither is a column that converts — but the
+        // row's OTHER columns can be, so the same rule applies here.
+        let values = self.with_store_affinity(table_id, values);
+        let values = &values[..];
         self.eng.validate_row_in(&self.bundle, table_id, values)?;
         if self.eng.table_is_fts(table_id) {
             // An FTS table's inverted index needs the full column text resident
@@ -387,8 +392,36 @@ impl<'e> WriteTxn<'e> {
         Ok(())
     }
 
+    /// sqlite's STORE-TIME AFFINITY, applied to a row on its way in.
+    ///
+    /// The backstop under every writer: the SQL layer already converts so that
+    /// RETURNING and the triggers see the same row the engine writes, but this
+    /// is the choke point all three write entry points share, so a caller that
+    /// reaches the typed row API directly cannot store an unconverted value
+    /// into an affinity column. The conversion is idempotent, so doing it twice
+    /// costs a copy and changes nothing.
+    ///
+    /// Borrows unless the table actually has a converting column, keeping the
+    /// zero-copy insert path (#40) intact for every rigid table.
+    fn with_store_affinity<'v>(
+        &self,
+        table_id: u32,
+        values: &'v [Value],
+    ) -> std::borrow::Cow<'v, [Value]> {
+        match self.bundle.schema.table(table_id) {
+            Some(t) if t.converts_on_store() => {
+                let mut owned = values.to_vec();
+                t.apply_store_affinity(&mut owned);
+                std::borrow::Cow::Owned(owned)
+            }
+            _ => std::borrow::Cow::Borrowed(values),
+        }
+    }
+
     pub fn insert_row(&mut self, table_id: u32, values: &[Value]) -> Result<()> {
         self.check_write_blocked(table_id)?;
+        let values = self.with_store_affinity(table_id, values);
+        let values = &values[..];
         let __t = std::time::Instant::now();
         self.eng.validate_row_in(&self.bundle, table_id, values)?;
         leakstat::add(&leakstat::INS_NS_VALIDATE, __t.elapsed().as_nanos() as u64);
@@ -609,6 +642,8 @@ impl<'e> WriteTxn<'e> {
     /// (enforced; the SQL layer rejects PK updates at bind time too).
     pub fn update_by_pk(&mut self, table_id: u32, new_values: &[Value]) -> Result<bool> {
         self.check_write_blocked(table_id)?;
+        let new_values = self.with_store_affinity(table_id, new_values);
+        let new_values = &new_values[..];
         self.eng.validate_row_in(&self.bundle, table_id, new_values)?;
         let table = self
             .bundle

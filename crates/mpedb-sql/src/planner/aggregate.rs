@@ -240,6 +240,7 @@ fn synthetic_grouped_table(
             default: None,
             check: None,
             collation: key_collations.get(k).copied().unwrap_or(Collation::Binary),
+            affinity: mpedb_types::Affinity::implied_by(ty),
         });
     }
     for (i, (f, _, _, _)) in aggs.iter().enumerate() {
@@ -271,6 +272,7 @@ fn synthetic_grouped_table(
             default: None,
             check: None,
             collation: Collation::Binary,
+            affinity: mpedb_types::Affinity::implied_by(ty),
         });
     }
     // The bare region: named `__b{j}` (the names `lift_aggs` emitted), typed by
@@ -286,6 +288,7 @@ fn synthetic_grouped_table(
             default: None,
             check: None,
             collation: Collation::Binary,
+            affinity: mpedb_types::Affinity::implied_by(*ty),
         });
     }
     TableDef {

@@ -80,7 +80,11 @@ impl AggFn {
     /// incumbent (`Ordering::None` ⇒ `false`), so on a tie the FIRST occurrence
     /// wins — matching sqlite. Meaningless (and always `false`) for non-min/max.
     pub fn min_max_prefers(self, incumbent: &Value, candidate: &Value) -> Result<bool> {
-        let ord = incumbent.sql_cmp(candidate)?;
+        // `sort_cmp`: MIN/MAX over an `any` column meets mixed storage classes,
+        // and sqlite's extremum is taken in its class order (a number always
+        // beats a string to MIN). Comparing stored values only, so no
+        // comparison affinity is involved.
+        let ord = incumbent.sort_cmp(candidate, crate::Collation::Binary);
         Ok(matches!(
             (self, ord),
             (AggFn::Min, Some(std::cmp::Ordering::Greater))
@@ -133,7 +137,9 @@ impl AggTarget {
 pub use footprint::{Footprint, KeyAccess, KeyBound, KeyPart, PlanHash};
 pub use fts::{Doclist, Tokenizer};
 pub use policy::{PolicyCmd, PolicyDef};
-pub use schema::{ColumnDef, DefaultExpr, IndexDef, Schema, TableDef, TableKind, MAX_INDEXES};
+pub use schema::{
+    store_into, ColumnDef, DefaultExpr, IndexDef, Schema, TableDef, TableKind, MAX_INDEXES,
+};
 pub use value::{Affinity, Collation, ColumnType, Value};
 
 /// Maximum number of tables (user + system) in one database. Bounded so that
