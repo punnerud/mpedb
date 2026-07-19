@@ -10,7 +10,7 @@
 //!
 //! This drives the same matrix through both engines in every boolean position
 //! sqlite has — `WHERE`, `NOT`, `CASE WHEN`, `AND`, `OR` — and asserts they
-//! agree. Reference: `/usr/bin/sqlite3`; skipped (not failed) if absent.
+//! agree. Reference: the BUNDLED sqlite (`tests/sqlite_oracle`) — always present.
 //!
 //! Deliberate, documented NON-follows (asserted in `documented_refusals`):
 //!   * A non-0/1 integer written INTO a `bool` column is refused. sqlite would
@@ -21,9 +21,9 @@
 
 use mpedb::{Config, Database, ExecResult};
 use mpedb_types::Value;
-use std::process::Command;
 
-const SQLITE3: &str = "/usr/bin/sqlite3";
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 /// Every value the matrix drives through a boolean position. Written so the
 /// literal text is legal in BOTH dialects.
@@ -109,15 +109,12 @@ fn sq(sql: &str) -> Option<String> {
          INSERT INTO t VALUES (1, NULL, NULL, NULL);\n\
          WITH q(x) AS ({sql}) SELECT typeof(x) || '|' || quote(x) FROM q;"
     );
-    let out = Command::new(SQLITE3)
-        .arg(":memory:")
-        .arg(script)
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    Some(String::from_utf8(out.stdout).ok()?.trim_end().to_string())
+    Some(
+        sqlite_oracle::try_script_stdout(&script, "")
+            .ok()?
+            .trim_end()
+            .to_string(),
+    )
 }
 
 /// Compare an mpedb `Value` to sqlite's `typeof|quote`, folding mpedb's `Bool`
@@ -172,16 +169,8 @@ fn positions(v: &str) -> Vec<(String, String)> {
     ]
 }
 
-fn have_sqlite() -> bool {
-    std::path::Path::new(SQLITE3).exists()
-}
-
 #[test]
 fn truthiness_matches_sqlite_in_every_boolean_position() {
-    if !have_sqlite() {
-        eprintln!("skipping: {SQLITE3} not present");
-        return;
-    }
     let (db, path) = open("matrix");
     let mut bad = Vec::new();
     let mut checked = 0usize;
@@ -212,9 +201,6 @@ fn truthiness_matches_sqlite_in_every_boolean_position() {
 /// is only known at runtime.
 #[test]
 fn column_values_are_truthy_tested_like_sqlite() {
-    if !have_sqlite() {
-        return;
-    }
     let (db, path) = open("cols");
     // Rows: (n, s) covering the interesting truthiness classes.
     let rows: &[(&str, &str)] = &[
@@ -255,12 +241,7 @@ fn column_values_are_truthy_tested_like_sqlite() {
              INSERT INTO t VALUES (1, NULL, NULL, NULL);\n{inserts}\
              WITH r(x) AS ({q}) SELECT typeof(x) || '|' || quote(x) FROM r;"
         );
-        let out = Command::new(SQLITE3)
-            .arg(":memory:")
-            .arg(&script)
-            .output()
-            .expect("sqlite3");
-        let want = String::from_utf8(out.stdout).unwrap().trim_end().to_string();
+        let want = sqlite_oracle::script_stdout(&script, "").trim_end().to_string();
         match mp(&db, q) {
             Ok(got) => {
                 if let Err(why) = agree(&got, &want) {
