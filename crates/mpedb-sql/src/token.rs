@@ -35,6 +35,17 @@ pub(crate) enum Tok {
     Star,
     Slash,
     Percent,
+    /// `&` — bitwise AND. A single `&`; sqlite has no `&&`.
+    BitAnd,
+    /// `|` — bitwise OR. Two of them (`||`) are [`Tok::Concat`] instead, which
+    /// is why the lexer must look ahead one byte here.
+    BitOr,
+    /// `<<` — left shift. Lexed before `<` / `<=` / `<>` for the same reason.
+    Shl,
+    /// `>>` — right shift.
+    Shr,
+    /// `~` — bitwise NOT (prefix). sqlite has no infix `~`.
+    Tilde,
     LParen,
     RParen,
     Comma,
@@ -239,12 +250,18 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
                     Tok::Concat
                 }
                 _ => {
-                    return Err(perr(
-                        start,
-                        "`|` is not an operator — SQL concatenation is `||`",
-                    ))
+                    i += 1;
+                    Tok::BitOr
                 }
             },
+            b'&' => {
+                i += 1;
+                Tok::BitAnd
+            }
+            b'~' => {
+                i += 1;
+                Tok::Tilde
+            }
             b'<' => match b.get(i + 1) {
                 Some(b'=') => {
                     i += 2;
@@ -254,20 +271,29 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
                     i += 2;
                     Tok::Ne
                 }
+                Some(b'<') => {
+                    i += 2;
+                    Tok::Shl
+                }
                 _ => {
                     i += 1;
                     Tok::Lt
                 }
             },
-            b'>' => {
-                if b.get(i + 1) == Some(&b'=') {
+            b'>' => match b.get(i + 1) {
+                Some(b'=') => {
                     i += 2;
                     Tok::Ge
-                } else {
+                }
+                Some(b'>') => {
+                    i += 2;
+                    Tok::Shr
+                }
+                _ => {
                     i += 1;
                     Tok::Gt
                 }
-            }
+            },
             b'?' => {
                 i += 1;
                 Tok::Question

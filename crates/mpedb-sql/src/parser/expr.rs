@@ -178,7 +178,7 @@ impl<'a> Parser<'a> {
     }
 
     fn cmp_expr(&mut self) -> Result<Expr> {
-        let mut e = self.add_expr()?;
+        let mut e = self.bit_expr()?;
         let mut seen_cmp = false;
         loop {
             if self.eat_kw(Kw::Is) {
@@ -190,7 +190,7 @@ impl<'a> Parser<'a> {
                     // The right operand parses at the additive tier, like `=`'s
                     // RHS, so `IS` sits at the comparison level and does not chain
                     // into a following comparison.
-                    let rhs = self.add_expr()?;
+                    let rhs = self.bit_expr()?;
                     e = Expr::IsDistinct(Box::new(e), Box::new(rhs), negated);
                 }
                 continue;
@@ -202,7 +202,7 @@ impl<'a> Parser<'a> {
             if !seen_cmp && (self.peek_kw(Kw::Like) || self.peek_not_like()) {
                 let negated = self.eat_kw(Kw::Not);
                 self.expect_kw(Kw::Like, "LIKE")?;
-                let pat = self.add_expr()?;
+                let pat = self.bit_expr()?;
                 // `LIKE … ESCAPE <char>`. `ESCAPE` is not a reserved word, but
                 // sqlite's grammar admits nothing else in this position, so a
                 // bare `escape` here can never be a column or an alias.
@@ -228,7 +228,7 @@ impl<'a> Parser<'a> {
             // (an FTS table/column) is decided in the binder/planner, not here.
             if !seen_cmp && self.peek_kw(Kw::Match) {
                 self.pos += 1;
-                let pat = self.add_expr()?;
+                let pat = self.bit_expr()?;
                 e = Expr::Match(Box::new(e), Box::new(pat));
                 seen_cmp = true;
                 continue;
@@ -239,7 +239,7 @@ impl<'a> Parser<'a> {
             if !seen_cmp && (self.peek_kw(Kw::Glob) || self.peek_not_glob()) {
                 let negated = self.eat_kw(Kw::Not);
                 self.expect_kw(Kw::Glob, "GLOB")?;
-                let pat = self.add_expr()?;
+                let pat = self.bit_expr()?;
                 e = Expr::Glob(Box::new(e), Box::new(pat), negated);
                 seen_cmp = true;
                 continue;
@@ -250,7 +250,7 @@ impl<'a> Parser<'a> {
             if !seen_cmp && (self.peek_kw(Kw::Regexp) || self.peek_not_regexp()) {
                 let negated = self.eat_kw(Kw::Not);
                 self.expect_kw(Kw::Regexp, "REGEXP")?;
-                let pat = self.add_expr()?;
+                let pat = self.bit_expr()?;
                 e = Expr::Regexp(Box::new(e), Box::new(pat), negated);
                 seen_cmp = true;
                 continue;
@@ -278,9 +278,36 @@ impl<'a> Parser<'a> {
                 break; // non-chaining: leftover op is a trailing-input error
             }
             self.pos += 1;
-            let r = self.add_expr()?;
+            let r = self.bit_expr()?;
             e = Expr::Binary(op, Box::new(e), Box::new(r));
             seen_cmp = true;
+        }
+        Ok(e)
+    }
+
+    /// The bitwise tier: `&`, `|`, `<<`, `>>`, all at ONE precedence level and
+    /// left-associative, sitting between the comparisons above and `+`/`-`
+    /// below. That is sqlite's `parse.y` verbatim
+    /// (`%left BITAND BITOR LSHIFT RSHIFT` between `%left GT LE LT GE` and
+    /// `%left PLUS MINUS`) and it is observable: `1 + 2 | 4` is `(1+2) | 4` = 7,
+    /// `2 | 1 << 2` is `(2|1) << 2` = 12, and `x = a | b` is `x = (a|b)`.
+    ///
+    /// Every comparison-tier right operand parses HERE rather than at the
+    /// additive tier, which is what puts `a | b` on the right of `=`, `LIKE`,
+    /// `BETWEEN` and friends.
+    fn bit_expr(&mut self) -> Result<Expr> {
+        let mut e = self.add_expr()?;
+        loop {
+            let op = match self.peek() {
+                Some(Tok::BitAnd) => BinOp::BitAnd,
+                Some(Tok::BitOr) => BinOp::BitOr,
+                Some(Tok::Shl) => BinOp::Shl,
+                Some(Tok::Shr) => BinOp::Shr,
+                _ => break,
+            };
+            self.pos += 1;
+            let r = self.add_expr()?;
+            e = Expr::Binary(op, Box::new(e), Box::new(r));
         }
         Ok(e)
     }
@@ -327,6 +354,15 @@ impl<'a> Parser<'a> {
             let e = self.unary_expr();
             self.exit_expr();
             Ok(Expr::Unary(UnOp::Neg, Box::new(e?)))
+        } else if self.eat(&Tok::Tilde) {
+            // `~` sits exactly where unary `-` does: sqlite declares
+            // `%right BITNOT` and gives unary minus that same precedence, so
+            // the two nest freely (`~-5` = 4, `-~5` = 6) and both bind tighter
+            // than any infix operator (`~5 + 1` = -5).
+            self.enter_expr()?;
+            let e = self.unary_expr();
+            self.exit_expr();
+            Ok(Expr::Unary(UnOp::BitNot, Box::new(e?)))
         } else if self.eat(&Tok::Plus) {
             // Unary `+` is the identity, as in sqlite and PostgreSQL — parsed
             // and DROPPED, so `+ col`, `- + 43` and `+ ( - 78 )` all work.
@@ -415,9 +451,9 @@ impl<'a> Parser<'a> {
         // add_expr, NOT expr: the AND below belongs to BETWEEN's own syntax, so
         // a full expression parse would swallow it and then fail looking for an
         // AND that is already gone.
-        let lo = self.add_expr()?;
+        let lo = self.bit_expr()?;
         self.expect_kw(Kw::And, "AND in BETWEEN")?;
-        let hi = self.add_expr()?;
+        let hi = self.bit_expr()?;
         // Desugared to `x >= lo AND x <= hi`: that is the shape the planner's
         // extract_access already turns into a PkRange, so BETWEEN becomes a
         // range SCAN rather than a full scan plus filter. The cost is `x`

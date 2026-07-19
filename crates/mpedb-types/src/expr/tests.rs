@@ -1075,3 +1075,133 @@ fn list_value_roundtrips_through_the_param_codec() {
     let mut pos = 0;
     assert!(matches!(read_value(&nested, &mut pos), Err(Error::Corrupt(_))));
 }
+
+/// The bitwise family (#74 item 2): the coercion, the shift corners, NULL
+/// propagation, and the codec round trip including truncation safety.
+///
+/// Every expected value here was read off `sqlite3` 3.45.1 before it was
+/// written down; `crates/mpedb/tests/bitwise.rs` re-checks the same cases
+/// against the live binary so the two cannot drift.
+#[test]
+fn bitwise_semantics_and_codec() {
+    let bin = |op: Instr, a: Value, b: Value| {
+        prog(vec![Instr::PushParam(0), Instr::PushParam(1), op], vec![]).eval(&[], &[a, b])
+    };
+    let not = |a: Value| prog(vec![Instr::PushParam(0), Instr::BitNot], vec![]).eval(&[], &[a]);
+    let i = Value::Int;
+
+    // Plain integer AND/OR.
+    assert_eq!(bin(Instr::BitOr, i(3), i(1)).unwrap(), i(3));
+    assert_eq!(bin(Instr::BitAnd, i(3), i(1)).unwrap(), i(1));
+    assert_eq!(bin(Instr::BitAnd, i(-1), i(5)).unwrap(), i(5));
+    assert_eq!(not(i(5)).unwrap(), i(-6));
+    assert_eq!(not(i(0)).unwrap(), i(-1));
+
+    // Shifts: a count of 64+ clears, except `>>` of a negative (arithmetic).
+    assert_eq!(bin(Instr::Shl, i(1), i(64)).unwrap(), i(0));
+    assert_eq!(bin(Instr::Shl, i(1), i(63)).unwrap(), i(i64::MIN));
+    assert_eq!(bin(Instr::Shr, i(8), i(64)).unwrap(), i(0));
+    assert_eq!(bin(Instr::Shr, i(-8), i(64)).unwrap(), i(-1));
+    assert_eq!(bin(Instr::Shr, i(-1), i(63)).unwrap(), i(-1));
+    assert_eq!(bin(Instr::Shr, i(-8), i(1)).unwrap(), i(-4));
+    assert_eq!(bin(Instr::Shr, i(-8), i(0)).unwrap(), i(-8));
+    // A NEGATIVE count shifts the other way; -64 and below clamp to 64.
+    assert_eq!(bin(Instr::Shl, i(1), i(-1)).unwrap(), i(0));
+    assert_eq!(bin(Instr::Shr, i(1), i(-1)).unwrap(), i(2));
+    assert_eq!(bin(Instr::Shl, i(5), i(-2)).unwrap(), i(1));
+    assert_eq!(bin(Instr::Shr, i(-5), i(-2)).unwrap(), i(-20));
+    assert_eq!(bin(Instr::Shl, i(1), i(-64)).unwrap(), i(0));
+    assert_eq!(bin(Instr::Shl, i(1), i(i64::MIN)).unwrap(), i(0));
+    // `<<` WRAPS — the one integer op in mpedb that does not raise.
+    assert_eq!(bin(Instr::Shl, i(i64::MAX), i(1)).unwrap(), i(-2));
+    assert_eq!(bin(Instr::Shl, i(i64::MIN), i(1)).unwrap(), i(0));
+    assert_eq!(bin(Instr::Shr, i(i64::MIN), i(1)).unwrap(), i(-4611686018427387904));
+
+    // sqlite's coercion: reals truncate toward zero and clamp…
+    assert_eq!(bin(Instr::BitOr, Value::Float(3.7), i(0)).unwrap(), i(3));
+    assert_eq!(bin(Instr::BitOr, Value::Float(-3.7), i(0)).unwrap(), i(-3));
+    assert_eq!(bin(Instr::BitOr, Value::Float(1e300), i(0)).unwrap(), i(i64::MAX));
+    assert_eq!(bin(Instr::BitOr, Value::Float(-1e300), i(0)).unwrap(), i(i64::MIN));
+    assert_eq!(bin(Instr::BitOr, Value::Float(9.3e18), i(0)).unwrap(), i(i64::MAX));
+    assert_eq!(bin(Instr::BitOr, Value::Float(f64::NAN), i(0)).unwrap(), i(0));
+    // …text takes an integer-PREFIX parse that stops at the first non-digit…
+    let t = |s: &str| Value::Text(s.into());
+    for (s, want) in [
+        ("3", 3i64),
+        ("abc", 0),
+        ("", 0),
+        ("1e3", 1),
+        ("3.9", 3),
+        ("12abc", 12),
+        (" -5", -5),
+        ("+5", 5),
+        ("--5", 0),
+        ("5 ", 5),
+        ("\t\n\x0b\x0c\r7", 7),
+        ("0x10", 0),
+        ("  +0009 ", 9),
+    ] {
+        assert_eq!(bin(Instr::BitOr, t(s), i(0)).unwrap(), i(want), "for {s:?}");
+    }
+    // …and overflow in that parse CLAMPS rather than wrapping a u64.
+    for (s, want) in [
+        ("99999999999999999999", i64::MAX),
+        ("-99999999999999999999", i64::MIN),
+        ("9223372036854775808", i64::MAX),
+        ("-9223372036854775809", i64::MIN),
+        ("18446744073709551617", i64::MAX),
+        ("000000000000000000000000000000009223372036854775807", i64::MAX),
+        ("9223372036854775807", i64::MAX),
+        ("-9223372036854775808", i64::MIN),
+    ] {
+        assert_eq!(bin(Instr::BitOr, t(s), i(0)).unwrap(), i(want), "for {s:?}");
+    }
+    // Blobs take the same parse over their bytes; bool IS the integer 0/1.
+    assert_eq!(bin(Instr::BitOr, Value::Blob(b"12".to_vec()), i(0)).unwrap(), i(12));
+    assert_eq!(bin(Instr::BitOr, Value::Blob(b"A".to_vec()), i(0)).unwrap(), i(0));
+    assert_eq!(bin(Instr::BitOr, Value::Bool(true), i(2)).unwrap(), i(3));
+    assert_eq!(not(Value::Bool(false)).unwrap(), i(-1));
+
+    // NULL propagates through all five, and 0 is not NULL.
+    for op in [Instr::BitOr, Instr::BitAnd, Instr::Shl, Instr::Shr] {
+        assert_eq!(bin(op, Value::Null, i(1)).unwrap(), Value::Null);
+        assert_eq!(bin(op, i(1), Value::Null).unwrap(), Value::Null);
+        assert_eq!(bin(op, Value::Null, Value::Null).unwrap(), Value::Null);
+    }
+    assert_eq!(not(Value::Null).unwrap(), Value::Null);
+
+    // mpedb's own Timestamp has no sqlite storage class, so it has no answer
+    // to reproduce — a clean error, never an invented integer.
+    assert!(matches!(
+        bin(Instr::BitOr, Value::Timestamp(0), i(1)),
+        Err(Error::TypeMismatch(_))
+    ));
+
+    // Codec: all five round-trip, and every truncation is a clean error.
+    let p = prog(
+        vec![
+            Instr::PushParam(0),
+            Instr::BitNot,
+            Instr::PushConst(0),
+            Instr::BitAnd,
+            Instr::PushConst(0),
+            Instr::BitOr,
+            Instr::PushConst(0),
+            Instr::Shl,
+            Instr::PushConst(0),
+            Instr::Shr,
+        ],
+        vec![Value::Int(1)],
+    );
+    let mut buf = Vec::new();
+    p.encode_into(&mut buf);
+    let mut pos = 0;
+    assert_eq!(ExprProgram::decode(&buf, &mut pos).unwrap(), p);
+    assert_eq!(pos, buf.len());
+    for cut in 0..buf.len() {
+        let _ = ExprProgram::decode(&buf[..cut], &mut 0); // must not panic
+    }
+    // `BitNot` is UNARY: a program that treats it as binary must not validate.
+    assert!(ExprProgram::new(vec![Instr::BitNot], vec![]).is_err());
+    assert!(ExprProgram::new(vec![Instr::PushParam(0), Instr::BitAnd], vec![]).is_err());
+}

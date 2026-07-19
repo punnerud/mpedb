@@ -104,6 +104,9 @@ pub(crate) enum BUnOp {
     IsNull,
     IsNotNull,
     ToFloat,
+    /// `~x` — bitwise NOT. Same operand rule as the infix bitwise family
+    /// ([`Binder::bit_operand`]): int64/bool/any, and the result is int64.
+    BitNot,
 }
 
 /// Expression type: `None` = NULL literal or not yet constrained.
@@ -734,6 +737,13 @@ impl<'a> Binder<'a> {
                 let e = fold_maybe(BExpr::Unary(BUnOp::Neg, Box::new(a)), self.suppress_fold)?;
                 Ok((e, at))
             }
+            ast::Expr::Unary(UnOp::BitNot, a) => {
+                let (a, at) = self.bind_expr(a)?;
+                let (a, at) = self.unify_param(a, at, ColumnType::Int64);
+                let a = self.bit_operand(a, at, "~")?;
+                let e = fold_maybe(BExpr::Unary(BUnOp::BitNot, Box::new(a)), self.suppress_fold)?;
+                Ok((e, Some(ColumnType::Int64)))
+            }
             ast::Expr::Unary(UnOp::Not, a) => {
                 let (a, at) = self.bind_expr(a)?;
                 let (a, at) = self.unify_param(a, at, ColumnType::Bool);
@@ -1246,6 +1256,55 @@ impl<'a> Binder<'a> {
                 let e = fold_maybe(BExpr::Binary(op, Box::new(l), Box::new(r)), self.suppress_fold)?;
                 Ok((e, ty))
             }
+            // `&`, `|`, `<<`, `>>` (task #74 item 2). NOT unified like
+            // arithmetic: sqlite's bitwise operators do not have a "wider
+            // operand type" at all — both sides are cast to an integer and the
+            // result is ALWAYS an integer. So each side is typed on its own and
+            // the result is int64 regardless.
+            BinOp::BitAnd | BinOp::BitOr | BinOp::Shl | BinOp::Shr => {
+                let name = bit_op_name(op);
+                let (l, lt) = self.unify_param(l, lt, ColumnType::Int64);
+                let (r, rt) = self.unify_param(r, rt, ColumnType::Int64);
+                let l = self.bit_operand(l, lt, name)?;
+                let r = self.bit_operand(r, rt, name)?;
+                let e =
+                    fold_maybe(BExpr::Binary(op, Box::new(l), Box::new(r)), self.suppress_fold)?;
+                Ok((e, Some(ColumnType::Int64)))
+            }
+        }
+    }
+
+    /// Type-check ONE operand of a bitwise operator.
+    ///
+    /// sqlite casts every operand to an integer with a total conversion
+    /// (`sqlite3VdbeIntValue`): a real truncates toward zero, a text takes an
+    /// integer-prefix parse, `'abc'` becomes 0. mpedb accepts the operand types
+    /// where that conversion is a NO-OP and refuses the rest by name:
+    ///
+    /// * `int64` — the operand type these operators are for.
+    /// * `bool` — sqlite has no boolean; it IS the integer 0/1, the same
+    ///   mapping `bind_assign` already uses for `SET int_col = (a = b)`.
+    /// * `any` — the typeless escape. Its runtime value gets sqlite's FULL
+    ///   coercion in [`mpedb_types::expr`], which is the contract `any` already
+    ///   has for comparisons (`Instr::CmpClass`): rigid types are pinned at
+    ///   compile time, `any` gets sqlite's runtime rules.
+    /// * an untyped NULL — propagates, like every other operator.
+    ///
+    /// A statically-typed `float64`, `text` or `blob` is REFUSED, and refused
+    /// rather than silently truncated for the same reason a non-integral
+    /// parameter is (task #74 item 1): `r & 1` on a column of reals would
+    /// answer a question about `trunc(r)` without saying so. `CAST(r AS
+    /// INTEGER)` asks for it explicitly and is what the message names.
+    fn bit_operand(&mut self, e: BExpr, t: Ty, op: &str) -> Result<BExpr> {
+        match t {
+            None | Some(ColumnType::Int64) | Some(ColumnType::Bool) | Some(ColumnType::Any) => {
+                Ok(e)
+            }
+            Some(t) => Err(bind_err(format!(
+                "`{op}` requires int64 operands, got {t} — sqlite would silently \
+                 convert it to an integer (truncating a real, taking the leading \
+                 digits of a text); write `CAST(x AS INTEGER)` to ask for that"
+            ))),
         }
     }
 
@@ -2129,6 +2188,17 @@ impl<'a> Binder<'a> {
     }
 }
 
+/// The SQL spelling of a bitwise operator, for its error messages.
+fn bit_op_name(op: BinOp) -> &'static str {
+    match op {
+        BinOp::BitAnd => "&",
+        BinOp::BitOr => "|",
+        BinOp::Shl => "<<",
+        BinOp::Shr => ">>",
+        _ => unreachable!("bit_op_name on {op:?}"),
+    }
+}
+
 /// Wrap in NOT when the source said `NOT IN`. Deliberately a real `Not` over
 /// the 3VL result rather than an inverted membership test: `NOT IN` must yield
 /// NULL (not TRUE) when the list holds a NULL and nothing matched, and NOT of
@@ -2344,6 +2414,7 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 BUnOp::IsNull => Instr::IsNull,
                 BUnOp::IsNotNull => Instr::IsNotNull,
                 BUnOp::ToFloat => Instr::ToFloat,
+                BUnOp::BitNot => Instr::BitNot,
             });
         }
         BExpr::Cast(a, t) => {
@@ -2368,6 +2439,10 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 BinOp::Concat => Instr::Concat,
                 BinOp::And => Instr::And,
                 BinOp::Or => Instr::Or,
+                BinOp::BitAnd => Instr::BitAnd,
+                BinOp::BitOr => Instr::BitOr,
+                BinOp::Shl => Instr::Shl,
+                BinOp::Shr => Instr::Shr,
             });
         }
         BExpr::IsDistinct(a, b, negated) => {
