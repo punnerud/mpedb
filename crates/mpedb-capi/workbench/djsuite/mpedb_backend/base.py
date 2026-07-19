@@ -25,6 +25,7 @@ What is left is only what mpedb still does not do.
 """
 
 import os
+import re
 
 from django.db.backends.sqlite3.base import DatabaseWrapper as SQLiteDatabaseWrapper
 from django.db.backends.sqlite3.features import (
@@ -33,6 +34,50 @@ from django.db.backends.sqlite3.features import (
 from django.db.backends.sqlite3.operations import (
     DatabaseOperations as SQLiteDatabaseOperations,
 )
+from django.db.backends.sqlite3.schema import (
+    DatabaseSchemaEditor as SQLiteDatabaseSchemaEditor,
+)
+
+
+# GAP D9 (mpedb-types `schema.rs`): an index key is memcmp-ordered, and
+# `ColumnType::Any` has no order ACROSS storage classes, so `Schema::validate`
+# refuses an index whose column is `any`. sqlite's NUMERIC affinity maps to
+# `any` (it is the one affinity that is not a single storage class), which makes
+# every `datetime`/`date`/`time`/`decimal` column unindexable — and Django's
+# `Session.expire_date` is a `DateTimeField(db_index=True)`, so `CREATE INDEX`
+# fails during `migrate` and NOT ONE test runs. Recorded, not fixed: it is an
+# engine decision, and lifting it is issue "`any` columns indexable".
+#
+# The adaptation drops exactly those `CREATE INDEX` statements, in BOTH arms.
+# An index is a pure performance feature — no answer depends on one — so the
+# only tests this can perturb are introspection tests, which then fail in both
+# arms and are excluded from the shim-only diff by construction.
+_NUMERIC_AFFINITY = re.compile(r"^(date|datetime|time|decimal|numeric)\b", re.I)
+
+
+def _is_any_typed(field, connection):
+    try:
+        t = field.db_parameters(connection)["type"]
+    except Exception:  # pragma: no cover - defensive
+        return False
+    if not t:
+        return False
+    # mpedb's own names win over the affinity rule, so `bool`/`timestamp` are
+    # real rigid types and stay indexable; only sqlite's NUMERIC bucket becomes
+    # `any`.
+    return bool(_NUMERIC_AFFINITY.match(t.strip()))
+
+
+class DatabaseSchemaEditor(SQLiteDatabaseSchemaEditor):
+    def _create_index_sql(self, model, *, fields=None, **kwargs):
+        if fields and any(_is_any_typed(f, self.connection) for f in fields):
+            return ""
+        return super()._create_index_sql(model, fields=fields, **kwargs)
+
+    def execute(self, sql, params=()):
+        if not str(sql).strip():
+            return
+        return super().execute(sql, params)
 
 
 class DatabaseOperations(SQLiteDatabaseOperations):
@@ -68,6 +113,7 @@ class DatabaseFeatures(SQLiteDatabaseFeatures):
 class DatabaseWrapper(SQLiteDatabaseWrapper):
     features_class = DatabaseFeatures
     ops_class = DatabaseOperations
+    SchemaEditorClass = DatabaseSchemaEditor
 
     # GAP D2 (mpedb-sql): `AUTOINCREMENT` is refused BY NAME — mpedb's INTEGER
     # PRIMARY KEY auto-assigns max+1 but REUSES ids after a delete, and the
