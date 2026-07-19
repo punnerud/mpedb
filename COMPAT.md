@@ -16,13 +16,16 @@ Two things make this page different from a typical compatibility list:
    wrong answers** (the 4 flagged divergences are cascades from a preceding
    unsupported statement, not answer bugs; 954,717 of the queries are checked
    against sqlite's own md5 result hash). Put the other way: of everything
-   mpedb *accepts*, essentially 100% matches sqlite. The 0.032% that does not
-   pass is 0.009% deliberate refusals — a subquery inside a compound `SELECT`,
-   the timing-less legacy `CREATE TRIGGER` form, and `DROP INDEX` — and
-   0.023% artifacts of the runner's synthetic-`rowid_` shim. The full ranked
-   blocker table, the hand-verified root causes, and the one file that is not
-   measurable (`select5.test` — a 17-way comma join OOMs) are in
-   [design/CORPUS-STATUS.md](design/CORPUS-STATUS.md).
+   mpedb *accepts*, essentially 100% matches sqlite. Since that sweep the
+   compound-subquery refusal (520 records, the largest single item) closed —
+   measured to 100.0% on the 16 files holding all of them — leaving the
+   deliberate refusals at the timing-less legacy `CREATE TRIGGER` form and
+   `DROP INDEX` (25 records); the rest of the shortfall is artifacts of the
+   runner's synthetic-`rowid_` shim. The full ranked blocker table and the
+   hand-verified root causes are in
+   [design/CORPUS-STATUS.md](design/CORPUS-STATUS.md). (`select5.test`'s
+   17-way-join runaway, formerly an OOM abort, is now a clean
+   `max_join_cells` budget refusal — every file is measurable.)
 2. **Every ❌ is an error message, never a silent wrong answer.** SQL that
    mpedb does not support is refused at compile time, usually with the manual
    fix in the message. The narrowness is the design; what compiles, matches.
@@ -32,6 +35,27 @@ file (or `mirror import` from an existing sqlite/PostgreSQL database) or from
 in-band `CREATE TABLE` (#47 — live, multi-process, on the shared file). Columns
 are rigidly typed, and a wrong type is a write-time error. sqlite `STRICT` still
 converts losslessly (`'42'` → `42`); mpedb does not.
+
+## The sqlite vs PostgreSQL dialect switch
+
+One config knob (`bare_group_by = "sqlite" | "postgres"`, default sqlite)
+selects which engine mpedb agrees with wherever the two genuinely disagree.
+Every other row in this document is dialect-independent. The gated behaviors,
+each differential-tested against its engine:
+
+| Behavior | `sqlite` (default) | `postgres` |
+|---|---|---|
+| Bare column in `GROUP BY` query | picked from the lowest-rowid row of the group (sqlite's rule) | refused: `must appear in GROUP BY or be inside an aggregate` |
+| `LIKE` | case-INsensitive; non-text operand coerces to text | case-SENSITIVE (`Instr::LikeCs`); non-text operand refused |
+| Non-boolean in a boolean position (`WHERE 1`, `CASE WHEN 1 …`) | truthy-tested exactly as `sqlite3VdbeBooleanValue` | refused: rigid boolean typing |
+| Mixed numeric `CASE`/`COALESCE` arm types | per-row winning-arm typing (`COALESCE(NULL,1,2.5)` is the integer 1) | refused — PG *promotes statically* (`COALESCE(30,1.5)/35` ≈ 0.857 in PG vs 0 in sqlite), so either engine's answer is wrong for the other |
+| Constant coerced into a column slot | sqlite's affinity-style acceptance | rigid |
+
+The switch exists because these are the rows where matching one engine *means*
+diverging from the other — a single permissive superset would answer someone
+wrongly. PG-only surface (e.g. `pg_typeof`) is out of scope here; the
+PostgreSQL side of mirroring is measured in the mirror's own differential
+suite.
 
 ## Statements
 
