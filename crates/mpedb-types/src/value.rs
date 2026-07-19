@@ -449,6 +449,48 @@ impl Value {
         }))
     }
 
+    /// sqlite's **storage-class total order**, for contexts that compare stored
+    /// values AGAINST EACH OTHER: `ORDER BY`, `MIN`/`MAX`, `GROUP BY`,
+    /// `DISTINCT`, window ordering.
+    ///
+    /// `NULL < numbers < TEXT < BLOB`, integers and reals interleaved
+    /// numerically, text bytewise (or by `coll`), blobs bytewise. NULL is
+    /// returned as `None` so each caller keeps its own NULLS FIRST/LAST rule.
+    ///
+    /// Distinct from [`Value::sql_cmp`], which REFUSES a cross-class pair, and
+    /// the split is the point. A `WHERE` comparison puts a stored value against
+    /// an operand whose class sqlite would have converted first (comparison
+    /// affinity: `price < '40.0'` compares 40.0, not the string), so answering
+    /// it by class order alone would be a WRONG ANSWER — `sql_cmp` keeps
+    /// refusing until that conversion exists. A sort compares stored values
+    /// only: affinity was already applied on the way IN, nothing is left to
+    /// convert, and the class order IS sqlite's answer.
+    ///
+    /// Without this, an `any` column holding both `'abc'` and `10` sorted
+    /// arbitrarily: `sql_cmp` refused the pair and every sort comparator turned
+    /// the refusal into `Equal`, which is not an order at all.
+    pub fn sort_cmp(&self, other: &Value, coll: Collation) -> Option<Ordering> {
+        use Value::*;
+        if self.is_null() || other.is_null() {
+            return None;
+        }
+        match (self, other) {
+            (Text(a), Text(b)) => Some(coll.compare_str(a, b)),
+            _ => match self.sql_cmp_collated(other, coll) {
+                Ok(o) => o,
+                // A cross-class pair `sql_cmp` refuses: order it by sqlite's
+                // storage classes. mpedb's own Bool/Timestamp have no sqlite
+                // class, so a pair involving one stays incomparable (`None`,
+                // read by every caller as "peers") rather than being given an
+                // invented rank.
+                Err(_) => match (class_rank(self), class_rank(other)) {
+                    (Some(x), Some(y)) => Some(x.cmp(&y)),
+                    _ => None,
+                },
+            },
+        }
+    }
+
     /// SQL comparison under an explicit collating sequence (task: COLLATE).
     ///
     /// Collation affects TEXT–TEXT comparison ONLY (sqlite's rule): every other
@@ -577,6 +619,18 @@ fn nocase_cmp(a: &[u8], b: &[u8]) -> Ordering {
 
 /// Total order over f64 matching the memcmp key encoding: -0.0 and 0.0 are
 /// equal, all NaNs are equal and sort above +inf.
+/// sqlite's storage-class rank: NULL (not ranked here) < numbers < text < blob.
+/// `None` for mpedb's own `Bool`/`Timestamp` and for a context `List`, none of
+/// which is a sqlite storage class to rank against one.
+fn class_rank(v: &Value) -> Option<u8> {
+    Some(match v {
+        Value::Int(_) | Value::Float(_) => 1,
+        Value::Text(_) => 2,
+        Value::Blob(_) => 3,
+        Value::Null | Value::Bool(_) | Value::Timestamp(_) | Value::List(_) => return None,
+    })
+}
+
 /// An `i64` against an `f64`, EXACTLY — a port of sqlite's
 /// `sqlite3IntFloatCompare`.
 ///

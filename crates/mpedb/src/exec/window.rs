@@ -645,15 +645,15 @@ fn order_cmp(a: &[Value], b: &[Value], dirs: &[bool]) -> Ordering {
 }
 
 fn value_cmp(a: &Value, b: &Value) -> Ordering {
-    match a.sql_cmp(b) {
-        Ok(Some(o)) => o,
+    // Storage-class order, as `ORDER BY` uses: a window key can be an `any`
+    // column, which really does hold more than one class.
+    match a.sort_cmp(b, mpedb_types::Collation::Binary) {
+        Some(o) => o,
         // NULL involved: NULLS FIRST in ascending order (two NULLs are peers).
-        Ok(None) => match (a.is_null(), b.is_null()) {
+        None => match (a.is_null(), b.is_null()) {
             (true, false) => Ordering::Less,
             (false, true) => Ordering::Greater,
             _ => Ordering::Equal,
         },
-        // Cross-type comparison cannot happen within one rigidly-typed key.
-        Err(_) => Ordering::Equal,
     }
 }

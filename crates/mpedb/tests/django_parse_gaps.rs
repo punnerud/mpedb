@@ -839,3 +839,81 @@ fn store_affinity_applies_on_update_default_and_insert_select() {
         vec![vec!["real".to_string(), "1.5".to_string()]]
     );
 }
+
+// ---------------------------------------------- the four Django queries ----
+
+/// The measured Django regression, end to end. A `decimal(10,2)` column bound
+/// as a STRING (which is what the ORM does) got stored as text, so the value,
+/// the ordering and the extremum were all sqlite's answers' opposites.
+///
+/// Three of the four now AGREE with sqlite. The fourth — comparing the column
+/// against a text literal — needs COMPARISON affinity (sqlite converts the
+/// literal to a number BEFORE comparing) and is a clean refusal until that
+/// lands, asserted here as such so it cannot quietly become a guess.
+#[test]
+fn the_django_decimal_shape_agrees_with_sqlite() {
+    let setup: &[&str] = &[
+        "CREATE TABLE t (id integer NOT NULL PRIMARY KEY, price decimal(10,2) NOT NULL)",
+        "INSERT INTO t (id, price) VALUES (1, '1000')",
+        "INSERT INTO t (id, price) VALUES (2, '35')",
+    ];
+    assert_same(setup, "SELECT id, price, typeof(price) FROM t ORDER BY id");
+    assert_same(setup, "SELECT id FROM t ORDER BY price");
+    assert_same(setup, "SELECT MAX(price), MIN(price) FROM t");
+    // …and with a mixed magnitude, where the column really does hold an INTEGER
+    // and a REAL at once — the case a lexicographic order got backwards.
+    let mixed: &[&str] = &[
+        "CREATE TABLE t (id integer NOT NULL PRIMARY KEY, price decimal(10,2) NOT NULL)",
+        "INSERT INTO t (id, price) VALUES (1, '1000')",
+        "INSERT INTO t (id, price) VALUES (2, '35')",
+        "INSERT INTO t (id, price) VALUES (3, '9.99')",
+        "INSERT INTO t (id, price) VALUES (4, '200.5')",
+    ];
+    assert_same(mixed, "SELECT id FROM t ORDER BY price");
+    assert_same(mixed, "SELECT MAX(price), MIN(price), COUNT(DISTINCT price) FROM t");
+    assert_same(mixed, "SELECT id FROM t ORDER BY price DESC LIMIT 2");
+
+    // The refusal. sqlite answers `[2]`; mpedb refuses rather than answering
+    // `[1, 2]`, which is what an unconverted comparison would say.
+    let t = open();
+    for s in setup {
+        t.db.query(s, &[]).unwrap();
+    }
+    let err = t.db.query("SELECT id FROM t WHERE price < '40.0'", &[]).unwrap_err();
+    assert!(format!("{err}").contains("compare"), "{err}");
+    assert_eq!(sqlite_state(setup, "SELECT id FROM t WHERE price < '40.0'"), vec![vec!["2"]]);
+    // Against a NUMBER there is no affinity to apply and mpedb agrees.
+    assert_same(setup, "SELECT id FROM t WHERE price < 40 ORDER BY id");
+}
+
+/// A NUMERIC column that holds a value sqlite could NOT convert keeps it as
+/// text, so the column holds several storage classes at once — and sqlite orders
+/// those `NULL < numbers < text < blob`. Every sort context has to follow that:
+/// treating the pair as "equal" (which is what refusing inside a comparator
+/// amounts to) is not an order at all.
+#[test]
+fn mixed_storage_classes_sort_in_sqlites_class_order() {
+    let setup: &[&str] = &[
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, v NUMERIC)",
+        "INSERT INTO m VALUES (1, 'abc')",
+        "INSERT INTO m VALUES (2, '10')",
+        "INSERT INTO m VALUES (3, NULL)",
+        "INSERT INTO m VALUES (4, '2.5')",
+        "INSERT INTO m VALUES (5, 'zz')",
+    ];
+    assert_same(setup, "SELECT id FROM m ORDER BY v, id");
+    assert_same(setup, "SELECT id FROM m ORDER BY v DESC, id");
+    assert_same(setup, "SELECT MAX(v), MIN(v) FROM m");
+    assert_same(setup, "SELECT typeof(MAX(v)), typeof(MIN(v)) FROM m");
+    // The same over a TYPELESS column, which stores every one of those verbatim.
+    let loose: &[&str] = &[
+        "CREATE TABLE m (id INTEGER PRIMARY KEY, v)",
+        "INSERT INTO m VALUES (1, 'abc')",
+        "INSERT INTO m VALUES (2, 10)",
+        "INSERT INTO m VALUES (3, NULL)",
+        "INSERT INTO m VALUES (4, 2.5)",
+        "INSERT INTO m VALUES (5, x'00')",
+    ];
+    assert_same(loose, "SELECT id FROM m ORDER BY v, id");
+    assert_same(loose, "SELECT id FROM m ORDER BY v DESC, id");
+}
