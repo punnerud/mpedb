@@ -51,6 +51,15 @@ const OP_LIKE_ESC: u8 = 41;
 const OP_LIKE_CS_ESC: u8 = 42;
 const OP_AFFINITY: u8 = 40;
 const OP_CMP_CLASS: u8 = 43;
+// The bitwise family (task #74 item 2) starts at 50 rather than 44: three other
+// branches were in flight in the 44..49 window, and an opcode hole costs nothing
+// (an unknown tag is already a decode error) while a collision would silently
+// reinterpret one opcode as another.
+const OP_BIT_AND: u8 = 50;
+const OP_BIT_OR: u8 = 51;
+const OP_SHL: u8 = 52;
+const OP_SHR: u8 = 53;
+const OP_BIT_NOT: u8 = 54;
 
 impl ExprProgram {
     /// Deterministic serialization (part of plan blobs and plan hashing).
@@ -151,6 +160,11 @@ impl ExprProgram {
                     buf.push(aff as u8);
                 }
                 Instr::Concat => buf.push(OP_CONCAT),
+                Instr::BitAnd => buf.push(OP_BIT_AND),
+                Instr::BitOr => buf.push(OP_BIT_OR),
+                Instr::Shl => buf.push(OP_SHL),
+                Instr::Shr => buf.push(OP_SHR),
+                Instr::BitNot => buf.push(OP_BIT_NOT),
                 Instr::CmpColl(kind, coll) => {
                     buf.push(OP_CMP_COLL);
                     buf.push(kind as u8);
@@ -268,6 +282,11 @@ impl ExprProgram {
                     )
                 }
                 OP_CONCAT => Instr::Concat,
+                OP_BIT_AND => Instr::BitAnd,
+                OP_BIT_OR => Instr::BitOr,
+                OP_SHL => Instr::Shl,
+                OP_SHR => Instr::Shr,
+                OP_BIT_NOT => Instr::BitNot,
                 OP_CMP_COLL => {
                     let k = *buf.get(*pos).ok_or_else(err)?;
                     let c = *buf.get(*pos + 1).ok_or_else(err)?;
@@ -438,9 +457,12 @@ pub(super) fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                     // (`in_items_3vl` on an empty slice), so it is a valid (1, 1)
                     // op — NOT a no-op that leaves the probe posing as a bool.
                     Instr::InList(nl) | Instr::InListColl(nl, _) => (nl as usize + 1, 1),
-                    Instr::Neg | Instr::Not | Instr::IsNull | Instr::IsNotNull | Instr::ToFloat => {
-                        (1, 1)
-                    }
+                    Instr::Neg
+                    | Instr::Not
+                    | Instr::IsNull
+                    | Instr::IsNotNull
+                    | Instr::ToFloat
+                    | Instr::BitNot => (1, 1),
                     Instr::Pop => (1, 0),
                     // Arity is checked HERE, once per program, so eval can index
                     // the args without re-checking per row.

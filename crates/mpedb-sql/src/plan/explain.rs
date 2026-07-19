@@ -823,6 +823,15 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     atom: false,
                 }
             }
+            // Unary, so it must be listed here rather than falling into the
+            // two-operand catch-all at the bottom.
+            Instr::BitNot => {
+                let a = pop(&mut st);
+                Item {
+                    s: format!("~{}", wrap(&a)),
+                    atom: false,
+                }
+            }
             Instr::IsNull => {
                 let a = pop(&mut st);
                 Item {
@@ -1011,6 +1020,10 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     Instr::And => "AND",
                     Instr::Or => "OR",
                     Instr::Concat => "||",
+                    Instr::BitAnd => "&",
+                    Instr::BitOr => "|",
+                    Instr::Shl => "<<",
+                    Instr::Shr => ">>",
                     _ => "?",
                 };
                 Item {

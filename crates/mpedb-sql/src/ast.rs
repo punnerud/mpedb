@@ -180,12 +180,24 @@ pub(crate) enum BinOp {
     Or,
     /// `||` — SQL concatenation.
     Concat,
+    /// `&`, `|`, `<<`, `>>` — sqlite's bitwise operators. One precedence tier,
+    /// left-associative, looser than `+`/`-` and tighter than a comparison
+    /// (sqlite's `parse.y`: `%left BITAND BITOR LSHIFT RSHIFT` sits between
+    /// `%left GT LE LT GE` and `%left PLUS MINUS`).
+    BitAnd,
+    BitOr,
+    Shl,
+    Shr,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum UnOp {
     Neg,
     Not,
+    /// `~` — bitwise NOT. sqlite gives it the same precedence as unary minus
+    /// (`%right BITNOT`, and unary minus is declared `[BITNOT]`), so it binds
+    /// tighter than every infix operator: `~5 + 1` is `(~5) + 1` = -5.
+    BitNot,
 }
 
 /// What a missing inner match means for one join step.

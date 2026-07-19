@@ -316,7 +316,16 @@ const MAX_JOINS: usize = 16;
 //     NOTE (worktree, 2026-07-19): the base this was written on carries 40;
 //     41 is another agent's in-flight bump, so this takes 42 by instruction and
 //     the numbers are reconciled at merge.
-const PLAN_FORMAT: u8 = 45;
+// 47: the bitwise family `& | << >> ~` (task #74 item 2) — five additive expr
+//     opcodes, `Instr::BitAnd`/`BitOr`/`Shl`/`Shr`/`BitNot`, tags 50..54. Purely
+//     additive: no existing plan can contain one, so every plan that does not
+//     use a bitwise operator encodes byte-for-byte as in format 45/46, and a
+//     reader one format back hits the unknown opcode in the expr decoder and
+//     rejects the blob as corrupt rather than misreading it.
+//     NOTE (worktree, 2026-07-19): the base this was written on carries 45 and
+//     46 is another agent's in-flight bump, so this takes 47 by instruction and
+//     the numbers are reconciled at merge.
+const PLAN_FORMAT: u8 = 47;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no

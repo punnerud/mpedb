@@ -27,8 +27,8 @@ mod tests;
 pub use scalar::ScalarFn;
 
 use ops::{
-    escape_char, glob_match, in_items_3vl, in_items_3vl_collated, in_list_3vl, like_match,
-    like_match_cs, regexp_match,
+    bit_i64, bitwise, escape_char, glob_match, in_items_3vl, in_items_3vl_collated, in_list_3vl,
+    like_match, like_match_cs, regexp_match,
 };
 use scalar::call_scalar;
 
@@ -211,6 +211,36 @@ pub enum Instr {
     /// involving one against a different class is REFUSED here rather than
     /// given an invented rank.
     CmpClass(CmpKind, Collation),
+    /// `a & b`, `a | b` — sqlite's bitwise AND / OR. Pop 2, push 1.
+    ///
+    /// Both operands go through [`bit_i64`], which is `sqlite3VdbeIntValue`:
+    /// integers pass, reals TRUNCATE toward zero and clamp to the i64 range,
+    /// text and blobs take sqlite's integer-PREFIX parse. Any NULL operand
+    /// yields NULL. The result is always an integer, in sqlite and here.
+    ///
+    /// The binder only ever emits these over operands it typed `int64`, `bool`
+    /// or `any` — the coercion of a real or a text is reachable only through an
+    /// `any` (typeless) value, exactly like [`Instr::CmpClass`]. A statically
+    /// typed real/text operand is a bind error naming `CAST`.
+    BitAnd,
+    BitOr,
+    /// `a << b`, `a >> b` — sqlite's shifts, ported from `OP_ShiftLeft` /
+    /// `OP_ShiftRight` including the two corners that are easy to get wrong:
+    ///
+    /// * a NEGATIVE shift count shifts the OTHER WAY (`1 >> -1` is `1 << 1`,
+    ///   i.e. 2), with counts at or below -64 clamped to 64;
+    /// * a count of 64 or more gives 0 — except `>>` of a NEGATIVE value, which
+    ///   gives -1, because the right shift is ARITHMETIC (sign-extending).
+    ///
+    /// `<<` wraps rather than overflowing (`9223372036854775807 << 1` is -2):
+    /// sqlite shifts the u64 bit pattern. This is the one place mpedb does not
+    /// raise on integer overflow, and it is deliberate — a bit shift has no
+    /// "overflow", only a bit pattern.
+    Shl,
+    Shr,
+    /// `~a` — sqlite's bitwise NOT. Same [`bit_i64`] coercion, NULL propagates,
+    /// result is always an integer (`~3.7` is -4: truncate to 3, then invert).
+    BitNot,
 }
 
 /// Resolve a HOST-registered scalar UDF by name at eval time (the C-API
@@ -395,6 +425,18 @@ impl ExprProgram {
                     let b = stack.pop().expect("validated");
                     let a = stack.pop().expect("validated");
                     stack.push(arith(instr, a, b)?);
+                }
+                Instr::BitAnd | Instr::BitOr | Instr::Shl | Instr::Shr => {
+                    let b = stack.pop().expect("validated");
+                    let a = stack.pop().expect("validated");
+                    stack.push(bitwise(instr, &a, &b)?);
+                }
+                Instr::BitNot => {
+                    let a = stack.pop().expect("validated");
+                    stack.push(match bit_i64(&a)? {
+                        None => Value::Null,
+                        Some(x) => Value::Int(!x),
+                    });
                 }
                 Instr::Neg => {
                     let a = stack.pop().expect("validated");
