@@ -82,16 +82,21 @@ and arrow keys pick one.
 plan around it. The SQL surface now covers aggregates, `GROUP BY`/`HAVING`,
 `DISTINCT`, every join kind (aliases, self-joins, N-way chains),
 `UNION`/`EXCEPT`/`INTERSECT`, scalar/`EXISTS`/nested/correlated subqueries,
-`WITH RECURSIVE`, views, triggers, window functions (`OVER`), full-text search
-(`MATCH`/FTS5), `SAVEPOINT`, `COLLATE`, `LIKE`/`GLOB`/`REGEXP`, `printf`,
-sqlite's permissive `CAST` and rowid-alias `INTEGER PRIMARY KEY`, the scalar and
-math functions, secondary/composite indexes the planner uses, and live
-multi-process DDL — verified against sqlite's own 7.4M-record test corpus with
-**zero wrong answers**. What is still missing is short: `ATTACH` (cross-file,
-planned) and user-defined functions / loadable extensions (a deliberate non-goal
-— the libsqlite3 C-API shim, which loads CPython's own `sqlite3` module via
-`LD_PRELOAD`, is the drop-in path instead), each a clean error today, never a
-wrong answer. And on one axis mpedb goes *past* sqlite: its own
+`WITH RECURSIVE`, views, triggers, window functions (`OVER`, incl. explicit
+frames), full-text search (`MATCH`/FTS5), `SAVEPOINT`, `COLLATE`,
+`LIKE … ESCAPE`/`GLOB`/`REGEXP`, `ORDER BY … NULLS FIRST/LAST`, the JSON
+function set (`json`, `json_extract`, `->`/`->>`, …), bitwise operators,
+`printf`/`quote`/`strftime`, sqlite's type affinity, truthiness and permissive
+`CAST`, rowid-alias `INTEGER PRIMARY KEY`, user-defined functions (scalar and
+aggregate, registered through the libsqlite3 C-API shim — CPython's own
+`sqlite3` module loads it via `LD_PRELOAD`), secondary/composite indexes the
+planner uses, and live multi-process DDL — verified against sqlite's own
+7.4M-record test corpus with **zero wrong answers**. Django's test suite runs
+against the shim: **83% of the measured labels pass and climbing**
+([`C-API-COMPAT.md`](C-API-COMPAT.md) tracks it run by run). What is still
+missing is short — `ATTACH` (cross-file, planned) and loadable extensions (a
+non-goal) — each a clean error today, never a wrong answer. And on one axis
+mpedb goes *past* sqlite: its own
 `.mpedb` WAL gives PostgreSQL-style **concurrent multi-process writes** (MVCC
 snapshots, lock-free readers) where sqlite serializes every writer. See
 [SQL support](#sql-support) for the exact surface, measured against the binary.
@@ -307,9 +312,10 @@ Turso's COMPAT.md so the two read side by side.
 
 It is also measured against sqlite's own **sqllogictest corpus** (the
 `sqlite_corpus` runner in `crates/mpedb-testkit`), all 7.4 million records of it:
-**99.7% of attempted statements pass, with zero error mismatches and zero genuine
+**99.9% of attempted statements pass, with zero error mismatches and zero genuine
 wrong answers** — of everything mpedb accepts, essentially 100% matches sqlite.
-What does not pass is deliberate refusals with error messages.
+What does not pass is deliberate refusals with error messages
+([`design/CORPUS-STATUS.md`](design/CORPUS-STATUS.md) ranks them).
 
 | | mpedb | note |
 |---|---|---|
