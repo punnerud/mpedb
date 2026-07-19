@@ -2605,43 +2605,74 @@ impl<'a> Binder<'a> {
         }
     }
 
-    /// Unify n operands to one common type: the same rules as
-    /// [`Self::unify_operands`] (bare params adopt, Int64 -> Float64 is the only
-    /// coercion, anything else cross-type is an error) but applied across the
-    /// whole set, so no operand is left behind at a type the others moved off.
-    /// Like [`unify_many`], for arms whose unified value IS the result
-    /// (CASE / COALESCE): int64/float64 mixing is REFUSED rather than
-    /// widened. sqlite types these per ROW — the arm actually taken keeps
-    /// its own type, so `COALESCE(30, avg(x)) / 35` divides an INTEGER when
-    /// arm 1 wins; widening 30 to 30.0 silently turns that into float
-    /// division (measured: 82 wrong answers in the sqllogictest expr tree).
-    /// Rigid typing cannot express "the type of the winning arm", so the mix
-    /// is a compile error that names the fix. Comparison unification
-    /// (`unify_many` for IN lists) keeps the widening: there the widened
-    /// value only feeds a comparison, and a comparison's TYPE cannot leak.
+    /// Type the RESULT arms of a CASE / COALESCE (and their sugar: ifnull,
+    /// iif, nullif) — arms whose value IS the result. sqlite types these per
+    /// ROW: the arm actually taken keeps its own type, so
+    /// `COALESCE(30, avg(x)) / 35` divides an INTEGER when arm 1 wins.
+    /// Widening 30 to 30.0 is therefore a WRONG ANSWER factory (measured: 82
+    /// in the sqllogictest expr tree when it was tried), so **no arm is ever
+    /// coerced here**. Instead:
+    ///
+    ///  * zero or one concrete arm type -> that type, exactly as before; a
+    ///    bare parameter adopts it ([`Self::unify_many`], whose int->float
+    ///    widening is unreachable with a single kind).
+    ///  * a NUMERIC mix (int64 ∪ float64), or any arm already `any` -> every
+    ///    arm keeps its own type AND its own value, and the result is typed
+    ///    per VALUE at runtime: [`ColumnType::Any`]. The CASE/COALESCE
+    ///    runtime is pure control flow (the winning arm's value is returned
+    ///    untouched), so the per-row semantics are exact; every downstream
+    ///    consumer of `any` already exists — `typeof()` reads the value,
+    ///    comparison unification admits `any` ([`Self::unify_operands`]),
+    ///    arithmetic settles per value, ORDER BY uses `Value::sort_cmp`,
+    ///    DISTINCT/GROUP BY key via `encode_group_key`, and sum/avg/min/max
+    ///    accumulate mixed int/float exactly as sqlite does. This is the
+    ///    same rule, for the same selection-not-computation reason, as
+    ///    scalar `max()`/`min()`.
+    ///  * any other mix (text ∪ int64, blob ∪ text, bool/timestamp ∪
+    ///    anything) -> still refused with the CAST fix in the message.
+    ///    sqlite legalizes those too, but the mpedb runtime refuses a
+    ///    cross-CLASS comparison rather than rank number-vs-text, so an
+    ///    `any` holding such a mix invites runtime refusals downstream —
+    ///    and mpedb's own bool/timestamp have no sqlite storage class at
+    ///    all. No measured corpus record needs them (design/CORPUS-STATUS.md).
+    ///
+    /// Comparison unification (`unify_many` for IN lists) keeps the int ->
+    /// float widening: there the widened value only feeds a comparison, and
+    /// a comparison's TYPE cannot leak.
     fn unify_result_arms(
         &mut self,
         operands: Vec<(BExpr, Ty)>,
         verb: &str,
     ) -> Result<(Vec<BExpr>, Ty)> {
-        let mixes = |a: ColumnType, b: ColumnType| {
-            (a == ColumnType::Int64 && b == ColumnType::Float64)
-                || (a == ColumnType::Float64 && b == ColumnType::Int64)
-        };
-        let mut seen: Ty = None;
+        let mut kinds: Vec<ColumnType> = Vec::new();
         for (_, t) in &operands {
-            let Some(t) = *t else { continue };
-            match seen {
-                Some(prev) if mixes(prev, t) => {
-                    return Err(bind_err(format!(
-                        "cannot {verb}: int64 and float64 — sqlite would type this per row; \
-                         add an explicit CAST so every arm is one type"
-                    )));
+            if let Some(t) = *t {
+                if !kinds.contains(&t) {
+                    kinds.push(t);
                 }
-                _ => seen = Some(t),
             }
         }
-        self.unify_many(operands, verb)
+        if kinds.len() <= 1 {
+            return self.unify_many(operands, verb);
+        }
+        let numeric = |t: &ColumnType| {
+            matches!(t, ColumnType::Int64 | ColumnType::Float64 | ColumnType::Any)
+        };
+        if kinds.iter().all(numeric) || kinds.contains(&ColumnType::Any) {
+            // Mixed arms, typed per row. A bare parameter among them has
+            // nothing to adopt (there is no one target type), and is left
+            // for `resolve_params` to report — same as a mixed max()/min().
+            return Ok((
+                operands.into_iter().map(|(e, _)| e).collect(),
+                Some(ColumnType::Any),
+            ));
+        }
+        let names: Vec<String> = kinds.iter().map(|t| t.to_string()).collect();
+        Err(bind_err(format!(
+            "cannot {verb}: {} — sqlite would type this per row; \
+             add an explicit CAST so every arm is one type",
+            names.join(" and ")
+        )))
     }
 
     fn unify_many(&mut self, operands: Vec<(BExpr, Ty)>, verb: &str) -> Result<(Vec<BExpr>, Ty)> {
@@ -3515,14 +3546,43 @@ mod tests {
 
     #[test]
     fn coalesce_arguments_must_unify() {
-        assert!(bind_err_msg("coalesce(id, 'x')").contains("coalesce"));
-        // int/float mixing in RESULT arms is refused, not widened: sqlite
-        // types the winning arm per row, so widening 30 to 30.0 changes the
-        // arithmetic downstream (measured: 82 wrong answers in the expr
-        // corpus). The message names the fix, and the CAST works.
-        assert!(bind_err_msg("coalesce(id, 1.5)").contains("CAST"));
+        // A non-numeric mix stays refused (sqlite would rank number-vs-text
+        // by storage class downstream, which mpedb refuses everywhere), and
+        // the message names both types and the CAST fix.
+        let msg = bind_err_msg("coalesce(id, 'x')");
+        assert!(msg.contains("coalesce") && msg.contains("CAST"), "{msg}");
+        assert!(bind_err_msg("coalesce(name, active)").contains("CAST"));
+        // Explicitly casting every arm to one type still yields that type.
         let (_, ty) = bind_ok("coalesce(CAST(id AS REAL), 1.5)");
         assert_eq!(ty, Some(ColumnType::Float64));
+    }
+
+    /// int64 ∪ float64 RESULT arms: sqlite types the winning arm per ROW
+    /// (`COALESCE(30, avg(x))` is the INTEGER 30 when arm 1 wins), so no arm
+    /// is coerced — each keeps its own type and value, and the expression
+    /// types as `any`, decided per value at runtime. Widening instead was
+    /// measured at 82 wrong answers in the sqllogictest expr corpus.
+    #[test]
+    fn mixed_numeric_result_arms_type_as_any() {
+        // Constant COALESCE folds to the winning arm UNWIDENED: the integer 30.
+        let (e, ty) = bind_ok("coalesce(30, 1.5)");
+        assert_eq!(e, BExpr::Const(Value::Int(30)));
+        assert_eq!(ty, Some(ColumnType::Any));
+        // Non-constant arms stay control flow, typed any.
+        let (_, ty) = bind_ok("coalesce(score, 1)");
+        assert_eq!(ty, Some(ColumnType::Any));
+        // Same rule through CASE (and its sugar iif); the winning constant
+        // arm keeps its own type: sqlite answers 1, not 1.0.
+        let (e, ty) = bind_ok("CASE WHEN true THEN 1 ELSE 2.5 END");
+        assert_eq!(e, BExpr::Const(Value::Int(1)));
+        assert_eq!(ty, Some(ColumnType::Any));
+        let (_, ty) = bind_ok("CASE WHEN active THEN 1 ELSE 2.5 END");
+        assert_eq!(ty, Some(ColumnType::Any));
+        let (_, ty) = bind_ok("iif(active, 1, 2.5)");
+        assert_eq!(ty, Some(ColumnType::Any));
+        // An `any` arm (here a NUMERIC cast of text) mixes with anything.
+        let (_, ty) = bind_ok("coalesce(CAST(name AS NUMERIC), name)");
+        assert_eq!(ty, Some(ColumnType::Any));
     }
 
     #[test]

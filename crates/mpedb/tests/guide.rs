@@ -467,11 +467,22 @@ fn the_sqlite_differences_that_bite() {
         "FROM-less SELECT evaluates over one synthetic row"
     );
 
-    // 6. CASE/COALESCE arms cannot mix int64 and float64 — sqlite types the
-    // winning arm per row, rigid typing cannot. The CAST in the message works.
-    let err = db.query("SELECT coalesce(30, 1.5)", &[]).unwrap_err();
-    assert!(format!("{err}").contains("CAST"), "{err}");
+    // 6. CASE/COALESCE arms MAY mix int64 and float64 — sqlite types the
+    // winning arm per row, and so does mpedb: the arms keep their own values
+    // (no widening cast) and the expression types as `any`. coalesce(30, 1.5)
+    // is the INTEGER 30, exactly sqlite's answer — never 30.0.
+    assert_eq!(
+        rows(db.query("SELECT coalesce(30, 1.5)", &[]).unwrap()),
+        vec![vec![Value::Int(30)]]
+    );
+    assert_eq!(
+        rows(db.query("SELECT typeof(coalesce(NULL, 1, 2.5))", &[]).unwrap()),
+        vec![vec![Value::Text("integer".into())]]
+    );
     assert!(db.query("SELECT coalesce(CAST(30 AS REAL), 1.5)", &[]).is_ok());
+    // A non-numeric arm mix is still refused, and the CAST in the message works.
+    let err = db.query("SELECT coalesce(30, 'x')", &[]).unwrap_err();
+    assert!(format!("{err}").contains("CAST"), "{err}");
 
     // 3. Every join kind works two-table (RIGHT plans as a swapped LEFT;
     // FULL NULL-extends both sides); only a RIGHT/FULL inside a multi-join
