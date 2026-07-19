@@ -207,40 +207,30 @@ Addressed since the import-loads milestone (see the tables above): the facade
 common `SELECT … FROM sqlite_master` introspection forms — the single biggest
 gap for Django's connection setup and schema editor is now covered.
 
+**Resolved (the two biggest Python/Django blockers):**
+- ✅ **Implicit `rowid`** — a PK-less `CREATE TABLE t(a, b)` now synthesizes a
+  hidden auto-increment integer `rowid` as the key, exactly like sqlite;
+  `SELECT *` hides it, `rowid`/`_rowid_`/`oid` address it, INSERT auto-assigns it,
+  explicit-PK tables unchanged (canonical-bytes v5, differential-verified).
+- ✅ **DDL inside a transaction** — `CREATE`/`DROP`/`ALTER`/`CREATE INDEX` now
+  apply to the open `WriteSession`'s own transaction (atomic commit/rollback,
+  in-session visibility), so CPython's implicit-transaction-on-first-DML no longer
+  blocks a `CREATE` after an `INSERT`, and `executescript` works.
+
 Still blocking (ranked by real-app impact):
 
-0. **No implicit `rowid` — a table must declare a PRIMARY KEY.** sqlite gives
-   every table without an explicit PK a hidden integer `rowid`; mpedb requires
-   one (`CREATE TABLE t(a)` → "no PRIMARY KEY declared"). This is the single
-   biggest C-API blocker: Django models, most sqlite apps, and CPython's own
-   `sqlite3` test suite create PK-less tables. Needs an engine feature — a
-   synthesized hidden auto-increment rowid column (the runner shim's synthetic
-   `rowid_` column is the same workaround). *A typeless NON-key column now works*
-   (`CREATE TABLE t(id INTEGER PRIMARY KEY, data)` → `data` is `Any`); only the
-   PK-less / typeless-key cases remain.
-1. **DDL inside a transaction is rejected — and Python triggers it constantly.**
-   A clear error (`unsupported: DDL … run it in autocommit, outside
-   BEGIN/COMMIT`) rather than a bare "expected a statement", but the real problem
-   is bigger than explicit `BEGIN … COMMIT`: **CPython's `sqlite3` opens an
-   *implicit* transaction on the first DML** (legacy `isolation_level=""` mode),
-   so a `CREATE TABLE` issued after any `INSERT` — the most ordinary script
-   shape — is inside a transaction and fails. `executescript` hits the same wall.
-   The DB-API battery's `unicode_blob` and `executescript` probes both fail for
-   exactly this reason. mpedb's `CREATE`/`DROP`/`ALTER` run only in the
-   autocommit path, not inside a `WriteSession`. Faking it (commit
-   mid-transaction) would silently break rollback, so this needs **engine**
-   support for DDL in a write session — the #2 C-API blocker after implicit rowid
-   (blocker 0), and the two together gate almost every real Python/Django flow.
+1. **Named parameters** (`:name`) are unsupported by mpedb's SQL binder; only
+   `?`/`$N`. `sqlite3_bind_parameter_name` reports them, but binding by name
+   still fails. The single remaining DB-API battery gap (22/23). Django uses
+   `%s`/`?`-style params, so lower priority than it looks — but it's now the
+   top C-API item.
 2. **No user-defined functions/collations.** `sqlite3_create_function_v2` /
    `_create_collation_v2` are exported but *refuse* (so `import` works); Django
    registers a few (e.g. `django_date_extract`, `django_power`) through the
    C-API and needs them to actually run.
 3. **Fixed database size** vs. sqlite's unbounded growth (16 MiB ephemeral /
    64 MiB file-backed here); exceeding it is `SQLITE_FULL`.
-4. **Named parameters** (`:name`) are unsupported by mpedb's SQL binder; only
-   `?`/`$N`. `sqlite3_bind_parameter_name` reports them, but binding by name
-   still fails. Django uses `%s`/`?`-style params, so this is low priority.
-5. **`sqlite_master` breadth** — views and indexes are not listed; complex
+4. **`sqlite_master` breadth** — views and indexes are not listed; complex
    `WHERE`/join forms error rather than returning wrong metadata.
 
 ## Verification
@@ -261,12 +251,11 @@ Still blocking (ranked by real-app impact):
   connection/cursor/execute/executemany/fetch*/description/type round-trip/
   transactions/executescript/IntegrityError). Run it against the shim
   (`LD_PRELOAD=<cdylib> python3 …/dbapi_battery.py`) and against stock sqlite3
-  (no preload) for a baseline. **Current: stock 23/23; shim 17/23** — the 6
-  gaps are all one of: PK-less tables (blocker 0), or named `:params`
-  (blocker 4). No wrong answers, only refusals.
+  (no preload) for a baseline. **Current: stock 23/23; shim 22/23** — after
+  implicit-rowid + DDL-in-transaction landed, the only remaining gap is named
+  `:params` (blocker 1). No wrong answers, only refusals.
 - `tests/dbapi_extra.py` — companion probes over EXPLICIT-PK tables (row_factory/
   `sqlite3.Row`, cursor-as-iterator, arraysize, connection context manager,
   aliased/aggregate column names, unicode+blob, executescript, error classes).
-  **stock 11/11; shim 8/11** — the 3 shim gaps are all DDL-in-(implicit)-
-  transaction (blocker 1), surfacing that Python's default transaction mode makes
-  that blocker bite far more than explicit `BEGIN` alone.
+  **stock 11/11; shim 11/11** — the 3 former gaps were all DDL-in-(implicit)-
+  transaction, now resolved (DDL applies to the open `WriteSession`'s txn).
