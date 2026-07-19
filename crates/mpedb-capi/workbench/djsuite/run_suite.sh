@@ -22,7 +22,9 @@ OUT="${WB_OUT:-/tmp/wb-django-suite}"
 # database, and mpedb caps a schema at 120 user tables (MAX_TABLES = 128 minus 8
 # system slots), so the labels must be split into groups that each fit. `queries`
 # is absent because it alone exceeds the cap — see C-API-COMPAT.md gap D6.
-GROUPS=(
+LABEL_GROUPS=(  # NOT `GROUPS`: bash owns that name (the caller's group ids) and
+                # silently ignores the assignment — the suite then "runs" one
+                # bogus label per group and reports 1 test.
     "basic lookup transactions ordering update delete"
     "aggregation annotations expressions"
 )
@@ -50,7 +52,7 @@ run_arm() {  # $1 = stock|shim, $2 = group index, $3.. = labels
 
 for arm in ${WB_ARM:-stock shim}; do
     i=1
-    for g in "${GROUPS[@]}"; do
+    for g in "${LABEL_GROUPS[@]}"; do
         # shellcheck disable=SC2086
         run_arm "$arm" "$i" $g
         i=$((i + 1))
