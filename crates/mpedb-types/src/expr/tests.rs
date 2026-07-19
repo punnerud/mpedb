@@ -225,6 +225,172 @@ fn like_escape_matches_sqlite() {
     assert!(!like_match("%\\%foo%", "xxfooyy", e));
 }
 
+/// The pattern memo is keyed on `(pattern, escape)` VALUE, not on any notion
+/// of "the statement" — alternating patterns and escapes through the same
+/// thread must never answer from a stale compiled form. (This is what makes
+/// the one-slot memo safe for the dyn-pattern opcodes, where the pattern can
+/// change per row.)
+#[test]
+fn like_memo_alternating_patterns_and_escapes() {
+    for _ in 0..3 {
+        assert!(like_match("a%", "abc", None));
+        assert!(!like_match("b%", "abc", None));
+        // Same pattern, different ESCAPE: must recompile — under ESCAPE '%'
+        // the `%` stops being a wildcard.
+        assert!(like_match("a%", "abc", None));
+        assert!(!like_match("a%", "abc", Some('%')));
+        // Dangling-escape failure is cached per (pattern, esc) too, and must
+        // not leak onto the escape-less reading of the same bytes.
+        assert!(!like_match("ab\\", "ab", Some('\\')));
+        assert!(like_match("ab\\", "ab\\", None));
+        // ci is NOT part of the key: the same compiled form serves both
+        // dialects with different literal comparison.
+        assert!(like_match("AB%", "abc", None));
+        assert!(!like_match_cs("AB%", "abc", None));
+    }
+}
+
+/// The dyn-pattern LIKE/GLOB opcodes (#74 item 3, LIKE half): operand rule =
+/// sqlite's `likeFunc`, READ OFF the binary (3.45.1):
+///
+/// - a BLOB on either side is FALSE, and the check precedes the NULL rule
+///   (`NULL LIKE x'41'` is 0, not NULL — so `NOT LIKE` over it is 1);
+/// - then NULL propagates;
+/// - then numerics render as sqlite text (`'12' LIKE 12` is 1,
+///   `'12' LIKE 12.0` is 0 because `12.0` renders as `'12.0'`).
+#[test]
+fn like_dyn_follows_likefunc() {
+    let like2 = |a: Value, p: Value| {
+        prog(vec![Instr::PushParam(0), Instr::PushParam(1), Instr::LikeDyn], vec![])
+            .eval(&[], &[a, p])
+            .unwrap()
+    };
+    let t = |s: &str| Value::Text(s.into());
+
+    // Plain dynamic matching, ASCII case folded (sqlite dialect).
+    assert_eq!(like2(t("hello"), t("he%o")), Value::Bool(true));
+    assert_eq!(like2(t("HELLO"), t("he%o")), Value::Bool(true));
+    assert_eq!(like2(t("hello"), t("x%")), Value::Bool(false));
+    // NULL propagates from either side …
+    assert_eq!(like2(Value::Null, t("a%")), Value::Null);
+    assert_eq!(like2(t("a"), Value::Null), Value::Null);
+    // … but a BLOB beats NULL: FALSE, not NULL (read off the binary).
+    assert_eq!(like2(Value::Null, Value::Blob(vec![0x41])), Value::Bool(false));
+    assert_eq!(like2(Value::Blob(vec![0x41]), Value::Null), Value::Bool(false));
+    // A blob on either side is FALSE even against matching text/bytes.
+    assert_eq!(like2(t("ABC"), Value::Blob(b"ABC".to_vec())), Value::Bool(false));
+    assert_eq!(like2(Value::Blob(b"ABC".to_vec()), t("ABC")), Value::Bool(false));
+    assert_eq!(
+        like2(Value::Blob(b"A".to_vec()), Value::Blob(b"A".to_vec())),
+        Value::Bool(false)
+    );
+    // Numerics render as sqlite text at runtime.
+    assert_eq!(like2(t("12"), Value::Int(12)), Value::Bool(true));
+    assert_eq!(like2(t("12"), Value::Float(12.0)), Value::Bool(false)); // '12.0'
+    assert_eq!(like2(t("12.0"), Value::Float(12.0)), Value::Bool(true));
+    assert_eq!(like2(Value::Int(12), t("1%")), Value::Bool(true));
+
+    // The escape form takes its one-character escape from the const pool;
+    // Django's exact shape (`s LIKE ? ESCAPE '\'`) with the pattern bound.
+    let esc = |a: Value, p: Value| {
+        prog(
+            vec![Instr::PushParam(0), Instr::PushParam(1), Instr::LikeDynEsc(0)],
+            vec![Value::Text("\\".into())],
+        )
+        .eval(&[], &[a, p])
+        .unwrap()
+    };
+    assert_eq!(esc(t("100%"), t("100\\%")), Value::Bool(true));
+    assert_eq!(esc(t("100x"), t("100\\%")), Value::Bool(false));
+    // A DANGLING escape arriving AT RUNTIME matches nothing — sqlite's
+    // NOMATCH, a legal answer, not an error (unlike REGEXP's W3 rule).
+    assert_eq!(esc(t("ab"), t("ab\\")), Value::Bool(false));
+
+    // Case-SENSITIVE (PG dialect) twins: strict — the PG binder admits only
+    // text/NULL, so a non-text operand is an error, never a coercion.
+    let cs = |a: Value, p: Value| {
+        prog(vec![Instr::PushParam(0), Instr::PushParam(1), Instr::LikeCsDyn], vec![])
+            .eval(&[], &[a, p])
+    };
+    assert_eq!(cs(t("AB"), t("a%")).unwrap(), Value::Bool(false));
+    assert_eq!(cs(t("ab"), t("a%")).unwrap(), Value::Bool(true));
+    assert_eq!(cs(t("ab"), Value::Null).unwrap(), Value::Null);
+    assert!(cs(t("12"), Value::Int(12)).is_err());
+    assert!(cs(Value::Blob(vec![0x41]), t("A")).is_err());
+
+    // GLOB dyn: same likeFunc rule (verified on the binary: blob → 0 before
+    // NULL, numerics coerce), glob wildcards, always case-sensitive.
+    let glob2 = |a: Value, p: Value| {
+        prog(vec![Instr::PushParam(0), Instr::PushParam(1), Instr::GlobDyn], vec![])
+            .eval(&[], &[a, p])
+            .unwrap()
+    };
+    assert_eq!(glob2(t("abc"), t("a*")), Value::Bool(true));
+    assert_eq!(glob2(t("ABC"), t("a*")), Value::Bool(false));
+    assert_eq!(glob2(t("abc"), t("a%")), Value::Bool(false)); // `%` is not a GLOB wildcard
+    assert_eq!(glob2(Value::Null, t("a")), Value::Null);
+    assert_eq!(glob2(Value::Null, Value::Blob(vec![0x41])), Value::Bool(false));
+    assert_eq!(glob2(Value::Int(12), t("1*")), Value::Bool(true));
+
+    // The CONST-pattern sqlite-dialect forms share the rule: a numeric or
+    // blob SUBJECT (reachable through an `any` column, which the binder now
+    // passes raw instead of CASTing) coerces/refuses exactly the same way.
+    let like_const = |a: Value| {
+        prog(vec![Instr::PushParam(0), Instr::Like(0)], vec![Value::Text("1%".into())])
+            .eval(&[], &[a])
+            .unwrap()
+    };
+    assert_eq!(like_const(Value::Int(12)), Value::Bool(true));
+    assert_eq!(like_const(Value::Blob(b"12".to_vec())), Value::Bool(false));
+    assert_eq!(like_const(Value::Null), Value::Null);
+
+    // codec: all five opcodes round-trip, and truncation at every offset is
+    // Corrupt, never a panic (repo rule).
+    let p5 = prog(
+        vec![
+            Instr::PushCol(0),
+            Instr::PushCol(1),
+            Instr::LikeDyn,
+            Instr::PushCol(0),
+            Instr::PushCol(1),
+            Instr::LikeCsDyn,
+            Instr::And,
+            Instr::PushCol(0),
+            Instr::PushCol(1),
+            Instr::LikeDynEsc(0),
+            Instr::And,
+            Instr::PushCol(0),
+            Instr::PushCol(1),
+            Instr::LikeCsDynEsc(0),
+            Instr::And,
+            Instr::PushCol(0),
+            Instr::PushCol(1),
+            Instr::GlobDyn,
+            Instr::And,
+        ],
+        vec![Value::Text("\\".into())],
+    );
+    let mut buf = Vec::new();
+    p5.encode_into(&mut buf);
+    let mut pos = 0;
+    assert_eq!(ExprProgram::decode(&buf, &mut pos).unwrap(), p5);
+    assert_eq!(pos, buf.len());
+    for cut in 0..buf.len() {
+        let _ = ExprProgram::decode(&buf[..cut], &mut 0); // must not panic
+    }
+
+    // The dyn-escape const is proved a one-character text at validation, so a
+    // hand-built plan with a bad escape slot is Corrupt, exactly like the
+    // const-pattern escape forms.
+    for bad in [Value::Text("".into()), Value::Text("ab".into()), Value::Int(5)] {
+        assert!(ExprProgram::new(
+            vec![Instr::PushCol(0), Instr::PushCol(1), Instr::LikeDynEsc(0)],
+            vec![bad],
+        )
+        .is_err());
+    }
+}
+
 #[test]
 fn glob_patterns() {
     // `*` = any run (incl. empty); `?` = exactly one char.
@@ -372,11 +538,16 @@ fn glob_program_null_and_type_rules() {
     assert_eq!(p.eval(&[Value::Text("abc".into())], &[]).unwrap(), Value::Bool(true));
     assert_eq!(p.eval(&[Value::Text("xbc".into())], &[]).unwrap(), Value::Bool(false));
     assert_eq!(p.eval(&[Value::Null], &[]).unwrap(), Value::Null);
-    // A non-text operand is a type error, not a silent non-match.
-    assert!(matches!(
-        p.eval(&[Value::Int(1)], &[]),
-        Err(Error::TypeMismatch(_))
-    ));
+    // GLOB shares sqlite's `likeFunc`, so a numeric operand COERCES to its
+    // sqlite text at runtime (`1 GLOB 'a*'` is FALSE because `'1'` is; and
+    // `12 GLOB '1*'` is TRUE on the binary) — and a BLOB operand is FALSE,
+    // not an error. This replaced the old "non-text is a TypeMismatch"
+    // policy when the binder stopped CAST-wrapping `any` operands (#74
+    // item 3, LIKE half).
+    assert_eq!(p.eval(&[Value::Int(1)], &[]).unwrap(), Value::Bool(false));
+    let p12 = prog(vec![Instr::PushCol(0), Instr::Glob(0)], vec![Value::Text("1*".into())]);
+    assert_eq!(p12.eval(&[Value::Int(12)], &[]).unwrap(), Value::Bool(true));
+    assert_eq!(p.eval(&[Value::Blob(b"abc".to_vec())], &[]).unwrap(), Value::Bool(false));
 
     // codec: roundtrip + truncation safety (repo rule: Corrupt, never panic).
     let mut buf = Vec::new();

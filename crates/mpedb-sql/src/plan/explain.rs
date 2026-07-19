@@ -927,6 +927,34 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     atom: false,
                 }
             }
+            // The dyn-pattern LIKE/GLOB family (#74 item 3, LIKE half): both
+            // dialects render as their surface syntax — the opcode carries the
+            // dialect, exactly as with Like vs LikeCs. The escape const still
+            // renders as the string literal it is.
+            Instr::LikeDyn | Instr::LikeCsDyn => {
+                let p = pop(&mut st);
+                let a = pop(&mut st);
+                Item {
+                    s: format!("{} LIKE {}", wrap(&a), wrap(&p)),
+                    atom: false,
+                }
+            }
+            Instr::LikeDynEsc(e) | Instr::LikeCsDynEsc(e) => {
+                let p = pop(&mut st);
+                let a = pop(&mut st);
+                Item {
+                    s: format!("{} LIKE {} ESCAPE {}", wrap(&a), wrap(&p), cst(e)),
+                    atom: false,
+                }
+            }
+            Instr::GlobDyn => {
+                let p = pop(&mut st);
+                let a = pop(&mut st);
+                Item {
+                    s: format!("{} GLOB {}", wrap(&a), wrap(&p)),
+                    atom: false,
+                }
+            }
             // `x IN ($n)` — a session-context list (§2.6). Pops the probe only.
             Instr::InParam(i) => {
                 let a = pop(&mut st);
