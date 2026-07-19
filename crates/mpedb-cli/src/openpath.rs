@@ -200,12 +200,22 @@ const SCRATCH_SIZE_MB: u64 = 8;
 /// ANY statement including a plain `SELECT`. Only writes create here — see
 /// [`is_read_only`].
 pub struct Scratch {
-    db: mpedb::Database,
+    /// `None` after [`close`](Scratch::close) — the file survives (and is still
+    /// deleted on drop) so a repl can attach it in this same process without
+    /// two live handles to one database.
+    db: Option<mpedb::Database>,
     path: PathBuf,
 }
 
 impl Scratch {
-    fn open() -> Result<Self, Failure> {
+    pub fn open() -> Result<Self, Failure> {
+        Self::open_sized(SCRATCH_SIZE_MB)
+    }
+
+    /// A scratch database of a chosen size — the CSV analysis session needs
+    /// room for the file it just read, which the 8 MB read-answering default
+    /// does not have.
+    pub fn open_sized(size_mb: u64) -> Result<Self, Failure> {
         use std::sync::atomic::{AtomicU32, Ordering};
         static N: AtomicU32 = AtomicU32::new(0);
         let path = std::env::temp_dir().join(format!(
@@ -214,16 +224,31 @@ impl Scratch {
             N.fetch_add(1, Ordering::Relaxed)
         ));
         let _ = std::fs::remove_file(&path);
-        make_native(&path, SCRATCH_SIZE_MB, false)?;
+        make_native(&path, size_mb, false)?;
         let db = mpedb::Database::open_from_file(&path)?;
-        Ok(Self { db, path })
+        Ok(Self { db: Some(db), path })
     }
 
     /// Run a read and print it, exactly as the real session would.
     pub fn run(&self, sql: &str, params: &[mpedb::Value]) -> Result<(), mpedb::Error> {
-        let res = self.db.query(sql, params)?;
+        let res = self.db().query(sql, params)?;
         print_result(&res);
         Ok(())
+    }
+
+    /// The open handle. Only reachable before [`close`](Scratch::close).
+    pub fn db(&self) -> &mpedb::Database {
+        self.db.as_ref().expect("scratch database still open")
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Release the handle, keeping the FILE (and this guard, which still
+    /// removes it on drop). A repl then opens the same path for itself.
+    pub fn close(&mut self) {
+        self.db = None;
     }
 }
 
@@ -282,6 +307,9 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
     // reader, no sidecar, no import, no sqlite library. Quiescence is the
     // caller's responsibility (or use `--overlay`, which locks).
     let mut rest: Vec<String> = rest.to_vec();
+    // `--import` / `--analyse` / `--table N` belong to the CSV flow below; take
+    // them out of the way before anything else reads `rest`.
+    let csv_flags = crate::csvload::take_flags(&mut rest)?;
     let direct = if let Some(i) = rest.iter().position(|a| a == "--direct") {
         rest.remove(i);
         true
@@ -341,6 +369,26 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
         None
     };
     let rest = rest.as_slice();
+    // A CSV where a STATEMENT would go is not SQL: `mpedb data.db people.csv`
+    // asks what to do with it (import / analyse in memory) instead of trying to
+    // parse a file name. See [`crate::csvload`].
+    match rest.split_first() {
+        Some((first, tail)) if crate::csvload::looks_like_csv(first) => {
+            if !tail.is_empty() {
+                return usage(format!(
+                    "`{first}` is a CSV file, so `{}` is not a statement — \
+                     import or analyse it on its own, then run SQL",
+                    tail[0]
+                ));
+            }
+            return run_csv(p, Path::new(first), csv_flags, pending);
+        }
+        _ => {
+            if csv_flags.action.is_some() || csv_flags.table.is_some() {
+                return usage("--import/--analyse/--table need a CSV file argument");
+            }
+        }
+    }
     // `--direct` (read-only attach) and `--mirror` (full sidecar import) are
     // explicit, non-default flows that need a real file underneath before they
     // can do anything at all — there is no statement to defer to. Settle a
@@ -426,6 +474,69 @@ pub fn run(path: &str, rest: &[String]) -> CliResult {
             let vals: Vec<mpedb::Value> = params.iter().map(|p| parse_param(p)).collect();
             let res = db.query(sql, &vals)?;
             print_result(&res);
+            Ok(())
+        }
+    }
+}
+
+/// `mpedb <db> <file.csv>` — the CSV fork.
+///
+/// The two outcomes are deliberately asymmetric with respect to the lazy-create
+/// rule next door: **analysis is a READ** and touches the directory not at all
+/// (it builds the table inside a [`Scratch`] that is deleted on the way out),
+/// while **import is a WRITE** and therefore materializes a pending database,
+/// exactly as a first `INSERT` would.
+fn run_csv(
+    target: &Path,
+    csv: &Path,
+    flags: crate::csvload::CsvFlags,
+    pending: Option<PendingCreate>,
+) -> CliResult {
+    use crate::csvload::{self, Action};
+
+    let t = csvload::plan(csv, flags.table.as_deref())?;
+    match csvload::choose(flags.action, &t, target, csv) {
+        Action::Quit => Ok(()),
+        Action::Analyse => {
+            // Sized for the file: the 8 MB read-answering default is not room
+            // for a real CSV, and mpedb pre-reserves — it never grows.
+            let bytes = std::fs::metadata(csv).map(|m| m.len()).unwrap_or(0);
+            let mb = (bytes / (1024 * 1024) * 4 + 16).min(mpedb::MAX_DB_SIZE_MB);
+            let mut scratch = Scratch::open_sized(mb)?;
+            csvload::load_native(scratch.db(), &t)?;
+            eprintln!(
+                "analysing in memory: {} row{} in `{}` — nothing is written to disk. \
+                 Tab lists the tables; .quit to leave.",
+                t.rows.len(),
+                if t.rows.len() == 1 { "" } else { "s" },
+                t.table
+            );
+            // Hand the FILE to the repl (one live handle at a time); the guard
+            // stays alive here and removes it when this returns.
+            scratch.close();
+            let path = scratch.path().to_string_lossy().into_owned();
+            crate::repl::run_path(&path, None)
+        }
+        Action::Import => {
+            if let Some(c) = pending {
+                c.materialize()?;
+            }
+            if is_sqlite(target) {
+                // The table must land in the BASE, where every other sqlite
+                // tool will look for it — so fold the overlay first, as DDL does.
+                fold_overlay(target, "import")?;
+                csvload::load_sqlite(target, &t)?;
+            } else {
+                let db = open_target(&target.to_string_lossy())?;
+                csvload::load_native(&db, &t)?;
+            }
+            println!(
+                "imported {} row{} into `{}` in {}",
+                t.rows.len(),
+                if t.rows.len() == 1 { "" } else { "s" },
+                t.table,
+                target.display()
+            );
             Ok(())
         }
     }
@@ -556,19 +667,7 @@ impl OverlaySession {
     /// rebuilds an overlay against the new schema.
     fn base_ddl(&mut self, sql: &str) -> CliResult {
         self.handle = None;
-        let ovl = overlay_file(&self.base);
-        if ovl.exists() {
-            let mut o = mpedb::SqliteOverlay::open(&self.base)?;
-            let r = o.checkpoint()?;
-            drop(o);
-            if r.upserts + r.deletes > 0 {
-                println!(
-                    "checkpoint before DDL: epoch {} pushed ({} upserts, {} deletes)",
-                    r.epoch, r.upserts, r.deletes
-                );
-            }
-            std::fs::remove_file(&ovl)?;
-        }
+        fold_overlay(&self.base, "DDL")?;
         let conn = rusqlite::Connection::open(&self.base)
             .map_err(|e| Failure::Runtime(format!("open {}: {e}", self.base.display())))?;
         conn.execute_batch(sql)
@@ -658,6 +757,28 @@ impl OverlaySession {
         }
         Ok(())
     }
+}
+
+/// Push any unpushed overlay deltas into the base and remove the (now stale)
+/// overlay file. Called before anything that changes the base's SCHEMA — DDL
+/// typed in a session, and a CSV import — because the overlay's mpedb tables
+/// are derived from the base's schema and a changed schema retires them.
+fn fold_overlay(base: &Path, why: &str) -> CliResult {
+    let ovl = overlay_file(base);
+    if !ovl.exists() {
+        return Ok(());
+    }
+    let mut o = mpedb::SqliteOverlay::open(base)?;
+    let r = o.checkpoint()?;
+    drop(o);
+    if r.upserts + r.deletes > 0 {
+        println!(
+            "checkpoint before {why}: epoch {} pushed ({} upserts, {} deletes)",
+            r.epoch, r.upserts, r.deletes
+        );
+    }
+    std::fs::remove_file(&ovl)?;
+    Ok(())
 }
 
 fn failure_msg(f: &Failure) -> &str {
