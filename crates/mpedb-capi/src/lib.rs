@@ -299,6 +299,10 @@ fn rollback_txn(c: &mut Sqlite3) {
 /// routed to the open `WriteSession` (if any) or the autocommit facade.
 fn exec_one(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome, DbError> {
     use sql::Kind;
+    // sqlite's parser skips leading comments; mpedb's does not — strip them
+    // here so `-- comment\nINSERT …` (a shape CPython's suite and iterdump
+    // scripts use) reaches the engine as the statement it is.
+    let sqltext = sql::strip_leading_trivia(sqltext);
     match sql::classify(sqltext) {
         // PRAGMA and sqlite_master reads are answered by the shim's schema
         // introspection (mpedb has neither); they never reach the engine.
@@ -340,6 +344,9 @@ fn exec_one(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome,
             s.query(sqltext, params)?;
             Ok(Outcome::Control)
         }
+        // VACUUM / ANALYZE: nothing to do (see `Kind::Maintenance`) — succeed
+        // with no rows and no change counters, as sqlite's do on a tidy file.
+        Kind::Maintenance => Ok(Outcome::Control),
         // DDL (CREATE/DROP/ALTER) routes like any other statement (#95): to the
         // open WriteSession's txn when one is active — where it commits/rolls
         // back atomically with the transaction's DML — else to the autocommit
@@ -1145,6 +1152,7 @@ unsafe fn prepare_common(
             | sql::Kind::RollbackTo
             | sql::Kind::Ddl
             | sql::Kind::Pragma
+            | sql::Kind::Maintenance
     ) || (matches!(kind, sql::Kind::Read) && introspect::references_sqlite_master(first));
 
     // #95: with a transaction open, a compilable statement may reference a
@@ -1177,7 +1185,10 @@ unsafe fn prepare_common(
     // prepare, as sqlite does), WITHOUT executing or publishing a plan. Validate
     // the REWRITTEN text — mpedb's parser rejects a bare `:` — not the original.
     if !skip_validation {
-        match catch_unwind(AssertUnwindSafe(|| c.db.prepare_detached(&scan.rewritten))) {
+        // The engine's parser does not skip leading comments (exec_one strips
+        // them at execution) — validate the same stripped text it will run.
+        let to_validate = sql::strip_leading_trivia(&scan.rewritten);
+        match catch_unwind(AssertUnwindSafe(|| c.db.prepare_detached(to_validate))) {
             Ok(Ok(_plan)) => {}
             Ok(Err(e)) => return c.set_db_error(&e),
             Err(_) => {
@@ -1330,6 +1341,39 @@ pub unsafe extern "C" fn sqlite3_exec(
     loop {
         let (first, tail) = sql::split_first(remaining);
         if !sql::is_blank(first) {
+            // Same read-only refusal as the step path (`run_stmt`).
+            if c.readonly && matches!(sql::classify(first), sql::Kind::Dml { .. } | sql::Kind::Ddl)
+            {
+                c.set_error(SQLITE_READONLY, SQLITE_READONLY, "attempt to write a readonly database");
+                set_exec_errmsg(c, errmsg);
+                return SQLITE_READONLY;
+            }
+            // sqlite's exec is prepare/step inside, so SQLITE_TRACE_STMT fires
+            // for exec'd statements too — CPython's legacy-autocommit COMMIT
+            // goes through exec and its suite asserts it is traced. A
+            // throwaway Stmt backs the callback's P argument (it may call
+            // sqlite3_expanded_sql / sqlite3_db_handle on it).
+            if !c.trace_cb.is_null() && c.trace_mask & SQLITE_TRACE_STMT != 0 {
+                let tmp = Box::new(Stmt {
+                    db,
+                    sql: first.to_string(),
+                    exec_sql: first.to_string(),
+                    n_params: 0,
+                    param_names: Vec::new(),
+                    binds: Vec::new(),
+                    executed: false,
+                    columns: Vec::new(),
+                    col_name_c: Vec::new(),
+                    decltype_c: None,
+                    rows: Vec::new(),
+                    pos: 0,
+                    have_row: false,
+                    cells: Vec::new(),
+                });
+                let p = Box::into_raw(tmp);
+                trace_stmt_begin(p);
+                drop(Box::from_raw(p));
+            }
             let outcome = catch_unwind(AssertUnwindSafe(|| exec_one(c, first, &[])));
             let outcome = match outcome {
                 Ok(r) => r,
@@ -2126,10 +2170,19 @@ pub unsafe extern "C" fn sqlite3_limit(db: *mut Sqlite3, id: c_int, new_val: c_i
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_db_config(
     _db: *mut Sqlite3,
-    _op: c_int,
+    op: c_int,
     _a: c_int,
-    _b: *mut c_void,
+    b: *mut c_void,
 ) -> c_int {
+    // The `(int onoff, int *pCurrent)` toggle ops — 1002 (ENABLE_FKEY) through
+    // the 1019 range; NOT 1000/1001, whose varargs are pointers with different
+    // shapes: mpedb honors none of them, so the CURRENT state written back is
+    // always 0 — the literal truth (FK enforcement, triggers, … are not
+    // active), never a lie a consumer can build on. Leaving the out pointer
+    // unwritten made CPython's getconfig read an indeterminate int.
+    if (1002..=1019).contains(&op) && !b.is_null() {
+        *(b as *mut c_int) = 0;
+    }
     SQLITE_OK
 }
 
