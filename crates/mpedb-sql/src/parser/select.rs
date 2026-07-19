@@ -399,6 +399,18 @@ impl<'a> Parser<'a> {
                     self.eat_kw(Kw::Asc);
                     false
                 };
+                // `NULLS FIRST` / `NULLS LAST` (sqlite 3.30+) is not supported —
+                // mpedb's ORDER BY carries only a direction. Name it here rather
+                // than letting the unconsumed `NULLS` resurface as whatever the
+                // ENCLOSING construct wanted next: inside a subquery it read
+                // `expected ) after IN subquery`, which is a diagnosis of the
+                // wrong clause. `NULLS` cannot be an ORDER BY term of its own
+                // (a term was just parsed), so this is unambiguous.
+                if matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("NULLS")) {
+                    return Err(self.err_here(
+                        "ORDER BY … NULLS FIRST/LAST is not supported yet — only ASC / DESC",
+                    ));
+                }
                 order_by.push((col, desc));
                 if order_by.len() > MAX_ORDER_BY_ITEMS {
                     return Err(self.err_here(format!(
