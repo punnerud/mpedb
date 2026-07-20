@@ -401,7 +401,22 @@ const MAX_JOINS: usize = 16;
 //
 //     Additive on the wire: an unknown `ScalarFn` tag is already a decode error,
 //     and no format-50 plan can carry one.
-const PLAN_FORMAT: u8 = 51;
+// 52: BODY-OWNED subplans on a materialized derived table
+//     (design/DESIGN-DERIVED-TABLES.md §5.5). `PlanStmt::Derived` gains a
+//     trailing `body_sub_base` (u16) + COUNT + the body's own `SubPlan`s,
+//     framed exactly like the statement-level list and decoded under the same
+//     `MAX_SUBPLANS` tree budget. Written AFTER both components, so a
+//     format-51 plan's bytes are a strict prefix — but the format byte gates
+//     the whole plan anyway, so a stale reader rejects rather than
+//     short-reads.
+//
+//     What it buys: a derived body may lift subqueries CORRELATED TO ITS OWN
+//     ROW — Django's `SELECT count(*) FROM (SELECT …, EXISTS(SELECT … WHERE
+//     i.x = t.y) AS f FROM t) s WHERE f`. The statement-level `subplans` list
+//     stays EMPTY for a derived plan (validate-enforced): those are filled
+//     before dispatch against the OUTER row, which scans a materialised set
+//     and has no base-table row to correlate to.
+const PLAN_FORMAT: u8 = 52;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -737,6 +752,30 @@ impl CompiledPlan {
         self.n_params - self.context_keys.len() as u16 - self.subplans.len() as u16
     }
 
+    /// Reserved slots that hold a SUBPLAN RESULT — statement-level lifts plus,
+    /// for a materialized derived table, the BODY's own (format 52).
+    ///
+    /// The two are mutually exclusive by construction (a derived plan's
+    /// statement-level list is empty, `validate`-enforced), so this is a sum
+    /// only in the arithmetic sense. It exists because the CALLER's parameter
+    /// count is `n_params` minus every reserved slot, and a body-owned lift
+    /// reserves one just as a statement-level lift does — miss it and the
+    /// facade demands one parameter too many for `SELECT count(*) FROM
+    /// (SELECT …, EXISTS(…) f FROM t) s WHERE f`.
+    pub fn n_subplan_slots(&self) -> u16 {
+        self.subplans.len() as u16
+            + match &self.stmt {
+                PlanStmt::Derived(dp) => dp.body_subplans.len() as u16,
+                _ => 0,
+            }
+    }
+
+    /// How many parameters the CALLER supplies: everything that is not a
+    /// reserved slot (subplan results, session context — including the
+    /// statement-instant slot a literal `'now'` binds to).
+    pub fn n_user_params(&self) -> u16 {
+        self.n_params - self.context_keys.len() as u16 - self.n_subplan_slots()
+    }
 }
 
 /// One SELECT, compiled. Extracted from the `PlanStmt::Select` variant so a
@@ -1168,9 +1207,27 @@ impl RecursiveCtePlan {
 /// runs `outer` with the [`CTE_TABLE`] sentinel bound to that set (the same
 /// working-table primitive the recursive CTE uses, minus the fixpoint).
 ///
-/// Stage 1 keeps the parameter layout `[user]` only: lifted subqueries and
-/// `current_setting()` are refused in both components, exactly as in a
-/// recursive CTE (`validate` re-enforces it on a decoded blob).
+/// # Subquery OWNERSHIP across the two components (format 52)
+///
+/// The body may lift its OWN subqueries — the Django shape
+/// `SELECT count(*) FROM (SELECT …, EXISTS(SELECT … WHERE i.x = t.y) AS f
+/// FROM t) s WHERE f`, whose `EXISTS` correlates to the BODY's row, not to the
+/// outer statement's. Those lifts belong to the BODY: they are listed in
+/// [`body_subplans`](Self::body_subplans), their result slots start at
+/// [`body_sub_base`](Self::body_sub_base), and the executor fills them WHILE
+/// MATERIALISING the body — uncorrelated ones once, correlated ones per body
+/// row, exactly as a top-level SELECT fills its own.
+///
+/// The OUTER statement never sees them. That is the whole point of the
+/// ownership split: the outer scans a materialised row set through
+/// [`CTE_TABLE`], so a slot correlated to a base-table row of the BODY has no
+/// meaning there, and the statement-level `subplans` list (which the executor
+/// fills before dispatch, against the OUTER row) stays EMPTY for a derived
+/// plan — `validate` re-enforces both.
+///
+/// The parameter layout is therefore `[user ‖ body subplans]`: the outer
+/// carries no lifts of its own (refused) and neither component may reference
+/// `current_setting()` (the recursive-CTE rule, unchanged).
 #[derive(Debug, Clone, PartialEq)]
 pub struct DerivedPlan {
     /// The derived alias — how the outer query addresses the body's columns,
@@ -1188,6 +1245,21 @@ pub struct DerivedPlan {
     /// The materialized body — a plain `SELECT` or a whole compound. Never
     /// references [`CTE_TABLE`] (a derived table cannot see itself).
     pub body: SubBody,
+    /// The BODY's own lifted subqueries (format 52). Empty for every plan a
+    /// format-51 reader could produce. Non-empty only for a `Select` body: a
+    /// compound body's arms have no per-row fill phase, so a lift there stays
+    /// refused (the same rule a compound subquery body follows).
+    ///
+    /// Filled by the executor DURING materialisation, against the body's own
+    /// row — never by the pre-dispatch pass that fills the statement-level
+    /// `subplans`, and never visible to `outer`.
+    pub body_subplans: Vec<SubPlan>,
+    /// First reserved slot of `body_subplans`: child `i`'s result lives at
+    /// `body_sub_base + i`. Equal to the user parameter count (the body was
+    /// planned with exactly the caller's parameters in scope), carried
+    /// EXPLICITLY rather than re-derived so exec and validate read one number
+    /// instead of two arithmetic identities that could drift.
+    pub body_sub_base: u16,
     /// The outer statement, reading the materialized rows via [`CTE_TABLE`]
     /// (exactly one reference, FullScan only — no PK, no indexes).
     pub outer: SelectPlan,
@@ -1737,7 +1809,12 @@ fn stmt_has_host_call(stmt: &PlanStmt) -> bool {
                 || select_has_host_call(&rc.outer)
         }
         PlanStmt::Derived(dp) => {
-            subbody_has_host_call(&dp.body) || select_has_host_call(&dp.outer)
+            subbody_has_host_call(&dp.body)
+                || select_has_host_call(&dp.outer)
+                // A body-owned lift can call a host UDF too (format 52).
+                // Missing it would publish a connection-local plan to the
+                // SHARED registry — the leak this gate exists to close.
+                || dp.body_subplans.iter().any(subplan_has_host_call)
         }
         PlanStmt::Insert {
             from_select,

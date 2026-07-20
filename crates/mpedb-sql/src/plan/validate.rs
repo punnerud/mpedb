@@ -180,8 +180,11 @@ impl CompiledPlan {
         if dp.body.output_arity() != arity {
             return Err(corrupt("derived-table body arity does not match the column list"));
         }
-        // Stage 1 carries no lifted subqueries and no correlated post-filters —
-        // the parameter layout is `[user]` only (same rule as a recursive CTE).
+        // The STATEMENT-level list stays empty: those are filled before
+        // dispatch against the OUTER row, and the outer scans a materialised
+        // set through the working table, where a base-table correlation has no
+        // meaning. A derived table's lifts belong to its BODY (format 52), and
+        // are checked below.
         if !self.subplans.is_empty() {
             return Err(corrupt("derived-table statement with lifted subqueries"));
         }
@@ -213,6 +216,60 @@ impl CompiledPlan {
             SubBody::Compound(c) => self.validate_compound(c, schema, ptypes)?,
         }
         self.validate_select(&dp.outer, schema, ptypes)?;
+        self.validate_body_subplans(dp, schema)?;
+        Ok(())
+    }
+
+    /// Re-validate the BODY's own lifted subqueries (format 52) — the exact
+    /// checks [`validate_subplans`](Self::validate_subplans) makes at the
+    /// statement level, but against the BODY's row and the BODY's reserved-slot
+    /// base, because that is what the executor fills them from.
+    ///
+    /// Everything the two levels share is shared as CODE
+    /// (`check_slot_discipline`, `validate_subplan_rec`), so a hand-crafted
+    /// blob cannot get a weaker check by putting its lifts on the body.
+    fn validate_body_subplans(&self, dp: &DerivedPlan, schema: &Schema) -> Result<()> {
+        if dp.body_subplans.is_empty() {
+            // Nothing to check — but the base must still be inside the
+            // parameter space, so a forged base on an empty list cannot become
+            // meaningful if the list is later extended.
+            if dp.body_sub_base > self.n_params {
+                return Err(corrupt("derived-table body subplan base out of range"));
+            }
+            return Ok(());
+        }
+        // Only a plain SELECT body has the per-row fill phase a correlated lift
+        // needs; a compound body is executed as a unit (the same rule a
+        // compound subquery body follows).
+        let body = dp.body.as_select().ok_or_else(|| {
+            corrupt("derived-table subplans on a compound body")
+        })?;
+        if dp.body_subplans.len() > MAX_SUBPLANS {
+            return Err(corrupt("too many derived-table body subplans"));
+        }
+        // `[user ‖ body subplans]`, with nothing after: the reserved region
+        // must fit, and the context region must be empty (a derived table
+        // refuses `current_setting()` and `'now'` in both components).
+        let base = dp.body_sub_base as usize;
+        if !self.context_keys.is_empty() {
+            return Err(corrupt("derived-table statement with reserved context slots"));
+        }
+        if base + dp.body_subplans.len() != self.n_params as usize {
+            return Err(corrupt(
+                "derived-table body subplan slots do not fill the reserved parameter region",
+            ));
+        }
+        // The OUTER row a body lift correlates to is the BODY's base row —
+        // `[table0 ‖ … ‖ tableN]` — NOT the outer statement's materialised
+        // tuple. Getting this wrong is exactly how a forged `outer_arg` would
+        // read the wrong column, so it is bounds-checked against the real one.
+        let outer_types = self.select_row_types(body, schema)?;
+        self.check_slot_discipline(body, base, &dp.body_subplans)?;
+        let user_ptypes = &self.param_types[..base];
+        let mut budget = MAX_SUBPLANS;
+        for s in &dp.body_subplans {
+            self.validate_subplan_rec(schema, s, user_ptypes, &outer_types, &mut budget)?;
+        }
         Ok(())
     }
 

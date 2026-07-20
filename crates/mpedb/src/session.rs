@@ -123,7 +123,9 @@ pub(crate) fn resolve_params<'a>(
 ) -> Result<std::borrow::Cow<'a, [Value]>> {
     let total = plan.n_params as usize;
     let n_ctx = plan.context_keys.len();
-    let n_sub = plan.subplans.len();
+    // Every SUBPLAN-RESULT slot, statement-level AND a derived table's
+    // body-owned ones (format 52) — the caller supplies neither.
+    let n_sub = plan.n_subplan_slots() as usize;
     let n_user = total - n_ctx - n_sub;
     if user_params.len() != n_user {
         return Err(Error::WrongParamCount {

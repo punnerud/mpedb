@@ -170,9 +170,64 @@ additionally charged per row read, as everywhere).
 - The alias is optional (sqlite allows `FROM (SELECT …)`); an absent alias gets
   an unreferenceable synthetic name. Re-referencing the alias as a join operand
   (`FROM (…) d JOIN d`) is refused (sqlite: "no such table: d").
-- Lifted subqueries and `current_setting()` in the body or the outer are stage-1
-  refusals (same `[user]`-only parameter layout as the recursive CTE, same
-  reserved-slot reconciliation cost to lift later).
+- `current_setting()` — and the literal `'now'`, which rides the same reserved
+  slot — in the body or the outer are stage-1 refusals (same reserved-slot
+  reconciliation cost across components as the recursive CTE).
+- Lifted subqueries in the body are **no longer refused** — see §5.5. In the
+  OUTER statement they still are.
+
+## 5.5 Body-OWNED subplans (2026-07-20, PLAN_FORMAT 52)
+
+Stage A shipped with "no lifted subqueries in either component". The refusal
+was one line, but it blocked the single largest remaining Django shape:
+
+```sql
+SELECT count(*) FROM (
+  SELECT …, EXISTS (SELECT 1 FROM i WHERE i.x = t.y) AS f
+  FROM t
+) s WHERE f
+```
+
+`.annotate(Exists(...))` followed by `.aggregate()` / `.filter()`. The body
+projects a correlated `EXISTS` under an alias; the outer consumes it as an
+ordinary column.
+
+**Why the flat statement-level `subplans` list could not hold it.** The
+executor fills `plan.subplans` in two places: uncorrelated ones ONCE before
+dispatch, correlated ones PER OUTER ROW after the gather. For a derived plan
+the "outer row" is a row of the MATERIALISED set, read through `CTE_TABLE` —
+it has no base-table columns, so a slot correlated to `t.y` has no meaning
+there. Putting the body's lifts on the statement would either fill them
+against the wrong row or leave them as unfilled holes.
+
+**The fix is ownership, not a new mechanism.** `DerivedPlan` carries
+`body_subplans: Vec<SubPlan>` and `body_sub_base: u16`; the parameter layout
+becomes `[user ‖ body subplans]`. `exec_derived` runs *exactly the discipline
+`exec_stmt_impl` runs one level up*, against the body: fill the uncorrelated
+lifts once, then execute the body through `exec_select_leveled` with
+`(base = body_sub_base, subplans = body_subplans)` so the correlated ones are
+filled per BODY row after the body's own gather. By the time the outer runs,
+`f` is a materialised column and there is nothing left to fill — which is why
+the statement-level list stays EMPTY, and `validate` enforces that it does.
+
+Everything the two levels share is shared as CODE, not duplicated:
+`check_slot_discipline`, `validate_subplan_rec`, `run_subplan`,
+`exec_select_leveled`. A hand-crafted blob therefore cannot buy a weaker check
+by moving its lifts onto the body. `validate_body_subplans` additionally pins
+the layout (`base + len == n_params`, no context slots) and derives the
+correlation row from the BODY's `[table0 ‖ … ‖ tableN]` — the one place a
+forged `outer_arg` would otherwise read the wrong column.
+
+**Still refused, by name:** lifts in a COMPOUND body (its arms execute as a
+unit with no per-row fill phase — the same rule a compound *subquery* body
+follows), and lifts in the OUTER statement (they would number their slots from
+the same base the body's occupy).
+
+**Accounting.** A body-owned lift reserves a parameter slot exactly as a
+statement-level one does, so `CompiledPlan::n_subplan_slots()` counts both and
+`resolve_params` subtracts both — miss it and the facade demands one parameter
+too many. The 16-subplan DoS ceiling and the footprint's table-read union
+likewise count the body's tree.
 
 Simple aliased projection/filter bodies still take the Stage-B flatten (better
 plans: index access paths); materialization is the fallback, so every

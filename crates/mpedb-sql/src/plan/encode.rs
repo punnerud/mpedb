@@ -326,6 +326,15 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
                 }
             }
             encode_select(&dp.outer, buf);
+            // The BODY's own lifts (format 52), after both components so a
+            // format-51 prefix reads identically up to here — the tail is
+            // what the format byte gates. Framed exactly like the
+            // statement-level list: base, COUNT, then each subplan.
+            w_u16(buf, dp.body_sub_base);
+            buf.push(dp.body_subplans.len() as u8);
+            for s in &dp.body_subplans {
+                encode_subplan(s, buf);
+            }
         }
         _other => encode_stmt_rest(stmt, buf),
     }
