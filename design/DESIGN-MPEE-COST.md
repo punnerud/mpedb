@@ -26,6 +26,18 @@ within-plan spread, and the worst/best plan in a bucket differs by a median **21
 table T) and for invalidation.** The same measurement returns don't-build verdicts for a
 footprint conflict index, for memoized routing, and for delta-compressing `TableSet`.
 
+**Update 2026-07-20 (#118) — §4's advisor now has its own design and its own measurement.**
+[DESIGN-WORKLOAD-INDEXES.md](DESIGN-WORKLOAD-INDEXES.md) takes §4 apart: it settles index
+**identity** (a content hash over table/column NAMES + collation + predicate, so an app upgrade
+that still implies an index does not rebuild it), designs **partial indexes** (`CREATE INDEX …
+WHERE`, the membership rule, the UPDATE enter/leave transitions, and the *sound-but-incomplete*
+implication test that decides when one may answer a query), and measures the candidate space:
+**112 distinct whole-table candidates over 99,279 real statements**, ≤ 23 per table — an
+enumeration, not a search. It also names what §4 silently assumes and mpedb does not have: a
+per-plan-hash **execution count** (§9.1 item 4 of the solver doc), an index **state bit** for a
+background build, and **`DROP INDEX`** — without which "auto-drop the unused" is unimplementable
+and auto-create is a ratchet. §6's recommend-only first stage is unaffected and stays correct.
+
 ## 0. Beyond `row_count`
 
 MPEE prices plans today with exact `row_count` (transactionally exact, a real advantage). Richer, and
