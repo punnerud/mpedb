@@ -500,6 +500,9 @@ pub(super) fn exec_aggregate(
     // before.
     correlated: &[(usize, &SubPlan)],
     post_filter: Option<&ExprProgram>,
+    // #125: which slots of the gathered tuple this aggregate can observe.
+    // `count(*)` observes none of them, so its input is folded from EMPTY rows.
+    prune: Option<&RowPrune>,
 ) -> Result<ExecResult> {
     let mut folder = Folder::new(&*ctx, schema, plan, t, table, joins, agg);
 
@@ -537,9 +540,20 @@ pub(super) fn exec_aggregate(
         // Unbounded on purpose: see the LIMIT note above. Over a join the row
         // being aggregated is the JOINED row — same rule, wider row.
         let rows = match joins.is_empty() {
-            true => gather_rows(ctx, table, access, filter, plan, params, None)?,
+            // #125: the fold reads only what `agg`/`group_by`/`FILTER` name
+            // (plus the PK, for the bare-column witness), so everything else is
+            // dropped as the set is read. This is the materializing path — a
+            // WRITE context, or a correlated aggregate whose per-row scratch the
+            // streaming fold cannot carry — and it is exactly where the input IS
+            // held.
+            true => match prune {
+                Some(p) => gather::gather_narrowed(
+                    ctx, table, access, filter, plan, params, t, p.stage(0),
+                )?,
+                None => gather_rows(ctx, table, access, filter, plan, params, None)?,
+            },
             false => gather_joined(
-                ctx, plan, params, schema, table, access, filter, joins, joined_filter,
+                ctx, plan, params, schema, table, access, filter, joins, joined_filter, prune,
             )?,
         };
 

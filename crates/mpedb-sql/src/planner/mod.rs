@@ -65,6 +65,7 @@ mod footprint;
 mod fts;
 mod join;
 mod mpee;
+mod prune;
 mod recursive;
 mod select;
 mod subquery;
@@ -72,6 +73,8 @@ mod window;
 
 #[cfg(test)]
 pub(crate) mod tests;
+
+pub use prune::{row_prune, Mask, RowPrune};
 
 pub(crate) use footprint::compute_footprint;
 use access::extract_access;

@@ -42,6 +42,11 @@ pub(super) fn exec_select_windowed(
             sp.filter.as_ref(),
             &sp.joins,
             sp.joined_filter.as_ref(),
+            // No #125 pruning under a window: the projection here indexes the
+            // EXTENDED tuple `[base ‖ w0..wk]` and `compute_windows` reads the
+            // base row through side vectors the analysis does not model, so
+            // `row_prune` refuses a windowed plan outright.
+            None,
         )?
     } else {
         gather_rows(ctx, sp.table, &sp.access, sp.filter.as_ref(), plan, params, None)?
