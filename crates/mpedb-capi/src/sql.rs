@@ -103,6 +103,162 @@ pub fn strip_leading_trivia(sql: &str) -> &str {
     &sql[first..]
 }
 
+/// Rewrite `zeroblob(<constant>)` calls to the equivalent blob LITERAL
+/// (`x'00…'`) in code regions, leaving strings/quoted-idents/comments untouched.
+///
+/// `zeroblob(N)` is a sqlite core scalar function (N zero bytes). mpedb has it
+/// only as a shim-registered host UDF (`register_shim_builtins`), which returns
+/// a dynamically-typed `Any` value — and mpedb's binder refuses a function
+/// CALL in `INSERT … VALUES` position ("must be literals or parameters") and
+/// pins `length()`'s argument to text. Both are dodged by turning a constant
+/// zeroblob into the byte-identical blob literal at the text level, which is
+/// accepted everywhere a literal is and carries the correct `blob` type.
+///
+/// Only the simple shape `zeroblob(<numeric | 'string' | NULL>)` with a single
+/// constant argument is rewritten, and only when the resulting literal is small
+/// enough to materialize inline (`MAX_INLINE`). A non-constant argument, a
+/// nested expression, or an over-large constant is left verbatim for the host
+/// UDF (which materializes it and enforces sqlite's `SQLITE_TOOBIG` cap) — so
+/// e.g. `select zeroblob(1000000001)` still raises "string or blob too big".
+pub fn rewrite_zeroblob(sql: &str) -> std::borrow::Cow<'_, str> {
+    // 16 MiB: far beyond any realistic INSERT/UPDATE zeroblob and a hard bound
+    // on the literal we build; larger constants fall through to the host UDF.
+    const MAX_INLINE: i64 = 16 * 1024 * 1024;
+    let b = sql.as_bytes();
+    // Collect (start, end, n) for each rewritable call in a first scan, then
+    // splice — so the byte offsets from `scan_code` stay valid.
+    let mut hits: Vec<(usize, usize, i64)> = Vec::new();
+    let lower = sql.to_ascii_lowercase();
+    let lb = lower.as_bytes();
+    let mut i = 0;
+    while i + 8 <= lb.len() {
+        // Must be an identifier boundary before `zeroblob`.
+        if &lb[i..i + 8] == b"zeroblob"
+            && (i == 0 || !is_name_char(b[i - 1]))
+            && !is_name_char(*b.get(i + 8).unwrap_or(&b' '))
+        {
+            if let Some((end, n)) = parse_zeroblob_arg(b, i + 8) {
+                if n <= MAX_INLINE {
+                    hits.push((i, end, n));
+                    i = end;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    if hits.is_empty() {
+        return std::borrow::Cow::Borrowed(sql);
+    }
+    // Verify each hit is in a CODE region (not inside a string/comment) by
+    // re-scanning and intersecting; scan_code visits only code bytes.
+    let mut code_starts = std::collections::HashSet::new();
+    scan_code(sql, |idx, _| {
+        code_starts.insert(idx);
+    });
+    let mut out = String::with_capacity(sql.len());
+    let mut pos = 0;
+    for (start, end, n) in hits {
+        if !code_starts.contains(&start) {
+            continue; // the `zeroblob` text was inside a literal/comment
+        }
+        out.push_str(&sql[pos..start]);
+        let count = n.max(0) as usize;
+        out.push_str("x'");
+        for _ in 0..count {
+            out.push_str("00");
+        }
+        out.push('\'');
+        pos = end;
+    }
+    out.push_str(&sql[pos..]);
+    std::borrow::Cow::Owned(out)
+}
+
+/// Starting just past `zeroblob`, parse `( <const> )` and return the byte index
+/// past the `)` plus the sqlite integer value of the constant. `None` if the
+/// argument is not a single literal (leave the call for the host UDF).
+fn parse_zeroblob_arg(b: &[u8], mut i: usize) -> Option<(usize, i64)> {
+    let skip_ws = |b: &[u8], mut i: usize| {
+        while i < b.len() && b[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        i
+    };
+    i = skip_ws(b, i);
+    if b.get(i) != Some(&b'(') {
+        return None;
+    }
+    i = skip_ws(b, i + 1);
+    let n = if b.get(i) == Some(&b'\'') {
+        // Single-quoted string: capture with '' escapes, then sqlite text→int.
+        let mut s = Vec::new();
+        i += 1;
+        loop {
+            match b.get(i) {
+                None => return None,
+                Some(&q) if q == b'\'' => {
+                    if b.get(i + 1) == Some(&b'\'') {
+                        s.push(b'\'');
+                        i += 2;
+                        continue;
+                    }
+                    i += 1;
+                    break;
+                }
+                Some(&c) => {
+                    s.push(c);
+                    i += 1;
+                }
+            }
+        }
+        crate::blob::text_to_i64(&String::from_utf8_lossy(&s))
+    } else if b[i..].len() >= 4 && b[i..i + 4].eq_ignore_ascii_case(b"null") {
+        i += 4;
+        0
+    } else {
+        // Numeric: optional sign, digits, optional fraction/exponent.
+        let start = i;
+        if b.get(i) == Some(&b'+') || b.get(i) == Some(&b'-') {
+            i += 1;
+        }
+        let mut saw_digit = false;
+        while b.get(i).is_some_and(|c| c.is_ascii_digit()) {
+            i += 1;
+            saw_digit = true;
+        }
+        if b.get(i) == Some(&b'.') {
+            i += 1;
+            while b.get(i).is_some_and(|c| c.is_ascii_digit()) {
+                i += 1;
+                saw_digit = true;
+            }
+        }
+        if saw_digit && (b.get(i) == Some(&b'e') || b.get(i) == Some(&b'E')) {
+            let mut j = i + 1;
+            if b.get(j) == Some(&b'+') || b.get(j) == Some(&b'-') {
+                j += 1;
+            }
+            if b.get(j).is_some_and(|c| c.is_ascii_digit()) {
+                while b.get(j).is_some_and(|c| c.is_ascii_digit()) {
+                    j += 1;
+                }
+                i = j;
+            }
+        }
+        if !saw_digit {
+            return None;
+        }
+        let text = std::str::from_utf8(&b[start..i]).ok()?;
+        crate::blob::text_to_i64(text)
+    };
+    i = skip_ws(b, i);
+    if b.get(i) != Some(&b')') {
+        return None;
+    }
+    Some((i + 1, n))
+}
+
 /// A character that may appear in a named parameter's body (after the sigil),
 /// matching sqlite's `IdChar`: ASCII alphanumerics, `_`, and any byte ≥ 0x80 (so
 /// UTF-8 identifier names bind). `$` is deliberately excluded here (it is only a
