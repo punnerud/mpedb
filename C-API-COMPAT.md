@@ -2186,9 +2186,10 @@ shape (`crafted_alia$.id`) does not hit it.
 > **Reading order note — SUPERSEDED.** The two sections that follow were measured at
 > *different* commits (the consolidated run 7 at `b41b713`; E3(b)'s before/after pair on
 > the Linux box against a control build of that same commit). Both are kept as history.
-> **The current headline is "AT HEAD — both suites, one machine, one commit" at the end
-> of this file**: `03ff5ea` on the Apple M3, Django **826/831** and CPython **450/474**,
-> which is run 7 + E3(b)'s deltas and nothing else.
+> **The current headline is "AT HEAD (2) — re-measured at `d83c21d`" at the end
+> of this file**: `d83c21d` on the Apple M3, Django A **826/831**, `queries`
+> **490/493** and CPython **450/474** — the `03ff5ea` run plus `f27f2b6`'s +2 in
+> `queries` and nothing else.
 
 ## The consolidated measurement — Django run 7 + CPython, ONE commit (2026-07-20)
 
@@ -2715,6 +2716,117 @@ under the shim:
 * **`model_fields`, 1 test** (`test_lookups_special_chars_double_quotes`,
   58 → 59 skips). Django skips it when `sqlite_version_info < (3, 47)`; the shim
   reports **3.45.0**, so it is skipped rather than run.
+
+### Reproduction
+
+```
+WB_DJANGO=…/django WB_PY=…/venv/bin/python \
+  crates/mpedb-capi/workbench/djsuite/run_suite.sh                       # A (G1+G2)
+WB_GROUP_BASE=3 WB_LABEL_GROUPS=$'queries\nbackends\nmodel_fields' … run_suite.sh
+/usr/bin/env DYLD_LIBRARY_PATH=$WB_OUT/shim python3.12 -m test test_sqlite3 \
+  --junit-xml=shim.xml                                                   # CPython
+```
+
+## AT HEAD (2) — re-measured at `d83c21d` (2026-07-20)
+
+**This is the current headline.** It re-runs the section above at `main`s head
+## AT HEAD (2) — re-measured at `d83c21d` (2026-07-20)
+
+**This is the current headline.** It re-runs the section above at `main`'s head
+after a batch of work landed: `f27f2b6` (the pass-through derived-table wrapper),
+`dac2ada` (the streaming aggregate), `e277644` (the registry/compile fix) and the
+two commit-path changes `d54d6ae` + `0bcb94e` (#119, statement atomicity across a
+ring batch).
+
+**Commit: `d83c21d`.** Measured before `368f3db` (the #121 power-loss simulator)
+landed upstream mid-run; that commit is additive (a new `plsim` module and a CLI
+subcommand) and touches nothing either suite exercises.
+**Machine: Apple M3 Pro, macOS, arm64.** Release build.
+**Interpreter: Homebrew CPython 3.12.12** for both suites, so the CPython
+denominator is the M3's own **474 tests / 7 skips**.
+**Baseline: libsqlite3 3.53.1.** Django `5.2.17.dev20260714173342`,
+`--parallel=1`, the frozen G1/G2 labels, the same workbench backend in both arms.
+
+**The result is the `03ff5ea` run plus `f27f2b6`'s +2 in `queries`, and nothing
+else.** Every other failing test id across all five label groups and CPython is
+identical to `03ff5ea`'s, one for one.
+
+### Interposition proof — the shim really answered
+
+`run_suite.sh`'s self-check ran through the **same** wrapper chain as the
+measurement (`run_capped` + `arm_prefix` + `env DYLD_LIBRARY_PATH=… python`);
+the CPython arms were launched through the same form and verified the same way:
+
+```
+interposition: stock=3.53.1 shim=3.45.0        (Django, both invocations)
+stock: 3.53.1   shim : 3.45.0                  (CPython, same chain)
+```
+
+Corroborated by log content — the shim arm's errors carry mpedb's own wording,
+which no libsqlite3 can emit:
+
+```
+bind error: cannot compare with IN list: text and int64
+bind error: a derived table `FROM (SELECT …)` with a non-flattenable bod…
+bind error: a CORRELATED subquery in HAVING is not supported yet — HAVIN…
+bind error: INSERT values must be literals or parameters
+type mismatch: parameter $1 is float64, statement requires int64 (not an ex…
+```
+
+### Django — stock vs shim at `d83c21d`
+
+| label set | tests | stock | shim: FAIL / ERROR | shim score | vs `03ff5ea` |
+|---|---|---|---|---|---|
+| G1 `basic lookup transactions ordering update delete` | 392 | OK (17 skipped) | 0 / 2 | 390 | = |
+| G2 `aggregation annotations expressions` | 439 | OK (5 skipped, 1 xfail) | 0 / 3 | 436 | = |
+| **A = G1+G2 (frozen)** | **831** | **831 / 831** | **0 / 5** | **826 / 831 (99.4 %)** | **=** |
+| B `queries` | 493 | OK (15 skipped, 2 xfail) | 0 / 3 | **490 / 493 (99.4 %)** | **+2** |
+| C `backends` | 324 | 3F / 2E (Django's own sqlite expectations) | 5F / 11E — 16 outcomes, **10 unique** | **314 / 324** unique-rule (308 outcome-rule) | = |
+| E `model_fields` | 528 | OK (58 skipped) | 1F / 13E — 14 outcomes, **3 unique** | **514 / 528** outcome-rule (525 unique-rule) | = |
+
+* Comparable set (A + B + C, 1,648): **1,630**, vs `03ff5ea`'s 1,628 — **+2**, **98.9 %**.
+* Including `model_fields`: **2,138 / 2,176 by the outcome rule (98.2 %)**,
+  **2,155 / 2,176 by the unique-test rule (99.0 %)**.
+* **Wrong answers in the SQL surface: 0.**
+
+### The delta, attributed
+
+| delta | attribution |
+|---|---|
+| `queries` 488 → **490** | **`f27f2b6`** — the pass-through derived-table wrapper. The two ids that now pass are `test_union_nested` and `test_distinct_ordered_sliced_subquery_aggregation`, both previously refused with `a derived table with a non-flattenable body is only supported in a statement's outermost FROM`. |
+| everything else | **byte-identical failing sets** to `03ff5ea` — A's 5, `queries`' remaining 3, `backends`' 16 outcomes / 10 unique, `model_fields`' 14 outcomes / 3 unique, and all 17 CPython ids |
+
+`dac2ada` (streaming aggregate), `e277644` (compile no longer scans everything)
+and #119's `d54d6ae` + `0bcb94e` moved **no** test in either suite, in either
+direction — which is the intended result for three changes whose subject is
+memory, compile cost and crash-atomicity rather than SQL surface.
+
+### `queries` — the 3 remaining errors
+
+| error | tests |
+|---|---|
+| `a derived table with a non-flattenable body is only supported in a statement's outermost FROM` | `test_qs_with_subcompound_qs`, `test_distinct_ordered_sliced_subquery` |
+| `INSERT values must be literals or parameters` | `test_bulk_insert` |
+
+### CPython `test_sqlite3` at the same commit
+
+| arm | run | pass | FAIL | ERROR | skip |
+|---|---|---|---|---|---|
+| stock libsqlite3 3.53.1 | 474 | **467** | 0 | 0 | 7 |
+| **shim @ `d83c21d`** | 474 | **450** | **6** | **11** | 7 |
+
+**450 / 467 = 96.4 %** of the baseline-passing suite — unchanged from `03ff5ea`.
+The 6 FAIL ids and the 11 ERROR ids are **exactly** `03ff5ea`'s, verified one for
+one from the JUnit XML; each is already reduced above to a refusal or a
+metadata/text divergence, and **none is a wrong SQL answer.**
+
+### macOS-only artifact, recorded
+
+CPython's regrtest warns `files was modified by test_sqlite3 … After:
+['@test_<pid>_tmpæ.wlock']`. That is the FLD-2 sidecar-inode lock file
+(`design/DESIGN-MACOS-LOCK.md`) left behind next to a test database. It is a
+warning only — it fails no test and does not affect the score — but the sidecar
+outliving the database it guarded is worth knowing about.
 
 ### Reproduction
 
