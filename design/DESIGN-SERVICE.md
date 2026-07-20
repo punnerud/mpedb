@@ -145,7 +145,8 @@ FastCGI (A) or the daemon's socket (B); HTTP is a thin adapter either way.
 ## 7. Staging
 
 1. **Queue + claim + PySpell-proc runner** (no daemon required — any process claims/runs; the model
-   is correct without wake-ups, just poll-based).
+   is correct without wake-ups, just poll-based). **SHIPPED (2026-07-20) — this stage is the v1
+   spine**; see §8 for what landed and where the code drifted from this doc.
 2. **Daemon `mpedb serve`** with hibernation + doorbell + the socket API (turns poll into wake).
 3. **Dynamic cron** (table + heap + CLI).
 4. **Webhooks + `[callout]` config budgets**.
@@ -155,3 +156,39 @@ Each stage is independently useful and independently testable (multi-process cla
 the CLI stress harness, like all multi-process behavior — not unit tests). Own design docs, own
 adversarial review of the doorbell/claim protocol before it ships (new cross-process primitive =
 commit-path-class scrutiny, per the verification discipline).
+
+## 8. Stage 1 as shipped (v1), and drift from this doc
+
+`mpedb queue init|enqueue|run|list` + the `queue-collide` SIGKILL fuzz
+(`crates/mpedb-cli/src/queue.rs`, `queue_collide.rs`). The table is `mq_task` — §2's column list
+**plus a `proc` column** (§2 says the runner executes a proc but gives it no column; it lives in the
+row; `payload` is the proc's args as newline-joined CLI literals). `id INTEGER PRIMARY KEY` rides
+the #94 rowid alias for auto-assignment. No new cross-process primitive was introduced — the claim
+is exactly §2's single statement, now expressible verbatim since #97 (subquery-in-UPDATE) and
+RETURNING landed:
+`UPDATE … SET state='claimed', claimed_by=$pid, claimed_at=$now, attempts=attempts+1 WHERE
+state='pending' AND id = (SELECT … ORDER BY priority, id LIMIT 1) RETURNING …` — atomic under the
+writer lock, so overlapping runners claim disjoint tasks by construction (fuzz-verified: thousands
+of kills, `hits ≤ attempts` everywhere, zero double-runs).
+
+Drift found while building against the landed code:
+
+- **RETURNING writes and the intent ring**: under `durability = commit|wal` a contended write used
+  to be published as a §5.3 intent, whose result slot carries only an affected count — the claim
+  statement surfaced "write plan returned rows". Fixed facade-side: `CompiledPlan::has_returning`
+  keeps such plans on the direct writer-lock path (same carve-out class as host-call and
+  #109 deadline-carrying plans).
+- **Procs vs. live DDL**: any `CREATE TABLE` (including the queue's own lazy one) permanently
+  invalidates plans embedded in already-defined write procs ("built against a different schema") —
+  pre-existing limitation, surfaced by the queue; `queue init` first is the documented order.
+- **Reaping**: §2's "built-in cron task" does not exist yet (stage 3); `queue run` reaps expired
+  leases inline when the queue looks idle. v1's reap rule is the lease timestamp ONLY — the
+  reader-table pid-liveness refinement is deferred (a naive `/proc` check would let a recycled pid
+  block reclaim forever; it needs the {pid,seq}+start-time identity). Set `--lease` above the
+  longest task runtime.
+- **States**: `failed` = ran and errored with retries exhausted (`error` has the message); `dead` =
+  lease expired with retries exhausted (a crash loop that never completed). §2 listed both without
+  assigning meanings.
+- Deferred to their stages: daemon/doorbell (§1B), cron table + OS projection (§3), webhooks +
+  `[callout]` budgets (§4), retention (§5), per-queue workers, and a claim-path index on
+  `(state, run_at)` (v1 claims via full scan — fine at queue sizes where a scan is µs).

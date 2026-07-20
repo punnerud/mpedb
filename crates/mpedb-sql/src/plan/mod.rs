@@ -1651,6 +1651,23 @@ impl CompiledPlan {
     pub fn contains_host_call(&self) -> bool {
         stmt_has_host_call(&self.stmt) || self.subplans.iter().any(subplan_has_host_call)
     }
+
+    /// True when this WRITE statement carries a `RETURNING` clause, i.e. its
+    /// result is `Rows`, not `Affected`. Such a plan must never be enqueued
+    /// on the intent ring: a ring result slot carries only an affected count
+    /// (design/DESIGN.md §5.3), so a leader executing it as a FOREIGN intent
+    /// has nowhere to post the rows (`execute_prepared` refuses with "write
+    /// plan returned rows"). The facade keeps these on the direct
+    /// writer-lock path, where the owner executes its own statement and
+    /// keeps the full result.
+    pub fn has_returning(&self) -> bool {
+        matches!(
+            &self.stmt,
+            PlanStmt::Insert { returning: Some(_), .. }
+                | PlanStmt::Update { returning: Some(_), .. }
+                | PlanStmt::Delete { returning: Some(_), .. }
+        )
+    }
 }
 
 /// `Instr::HostCall` anywhere in an optional program.
