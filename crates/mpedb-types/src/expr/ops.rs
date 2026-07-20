@@ -570,9 +570,11 @@ pub(super) fn glob_match(pattern: &str, s: &str) -> bool {
 // UDF speaks a richer dialect (Python's `(?i)…`, backreferences — Django's
 // `__iregex` prepends `(?i)` to EVERY pattern) got silent empty results where
 // stock sqlite returns rows. An error is honest in both worlds: the dialect
-// gap is named instead of swallowed. (The full fix — dispatching `x REGEXP y`
-// to a registered host `regexp()` UDF, which is the operator's entire meaning
-// in real sqlite — is tracked separately.)
+// gap is named instead of swallowed. The full fix landed as W3 part 2 (task
+// #108, binder-side): when the connection has a registered host `regexp/2`,
+// `x REGEXP y` compiles to that call — `regexp(y, x)`, the operator's entire
+// meaning in real sqlite — and this engine only answers when NO host regexp
+// exists (a documented mpedb extension; see COMPAT.md's REGEXP row).
 
 // The LAST pattern this thread compiled, and the program it compiled to
 // (`None` for a pattern the engine rejects — that result is worth caching too,
