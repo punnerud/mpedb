@@ -353,6 +353,269 @@ throughput, it is that the whole engine is 72 KB of anonymous memory and no
 daemon. PostgreSQL runs on a Pi 3 too; what it cannot do is cost nothing while
 idle.
 
+## The one cell PostgreSQL wins: durable writes (2026-07-20, Linux, #111)
+
+PostgreSQL beats mpedb in exactly one class, and the 07-17 run says so plainly:
+
+| commit-class, disk | mpedb `commit` | SQLite FULL+WAL | **PostgreSQL** |
+|---|--:|--:|--:|
+| point-insert, 1 client | 391 (p50 2598 µs) | 848 (1120 µs) | **1457 (649 µs)** |
+| contended writes, 4 threads | 687 | 840 | **6370** |
+
+Three hypotheses were put to it. **Two were wrong**, and writing down which is
+the point of this section — each one was the obvious explanation.
+
+### Hypothesis 1: "the intent ring does not amortise the flush across concurrent transactions" — REFUTED
+
+`MPEDB_RING_STATS=1`, four writer *processes*, `durability = commit`, ext4,
+796 committed batches:
+
+| | measured |
+|---|--:|
+| **committed ops per batch (= per meta flip, per flush group)** | **2.82** |
+| batch-size histogram (1/2/3/4 intents) | 97 / 188 / 274 / 237 |
+| dirty pages per batch | 3.7 |
+| **dirty RUNS per batch** | **2.84** |
+| leader `exec_us` (prepare + execute the whole batch) | **67 µs** |
+| leader `commit_us` (fixpoint + msyncs + flip) | **10,028 µs** |
+
+Group commit works. At four writers the ring puts 2.82 independent transactions
+behind one meta flip; batches of 3 and 4 are the mode. It is not ~1, so the
+"mpedb has no group commit" story is simply false.
+
+### Hypothesis 3: "the writer lock is held across the whole transaction, so shorten it" — REFUTED, with a number
+
+The same two counters answer it: **the work is 0.7 % of the lock hold**
+(67 µs of 10,095 µs). Everything else is the durability barrier. Moving 100 % of
+the executable work off the critical section — which is what
+`concurrency = "optimistic"` (#17, DESIGN-PHASE3) does — has a ceiling of
+**+0.7 %** on the durable path, and it pays for that by bypassing the ring, i.e.
+by giving up the 2.82× amortization above. That is the same conclusion
+DESIGN-PHASE3 §5 reached by measurement (`commit` −82 %), now with the mechanism
+in one ratio rather than an end-to-end number.
+
+So the answer to "can an optimistic writer join the ring's group commit instead
+of bypassing it?" is: it could, and it would be worth **at most 0.7 %** here,
+because on durable media the critical section is not the work — it is the flush.
+The composition is not the prize. The flush count is.
+
+### Hypothesis 2: "msync of a mapped range is more expensive than append + fdatasync" — REFUTED as stated, but it led to the real bug
+
+A 5-arm probe on this box, all arms interleaved **inside one loop** so host drift
+cancels (`scratchpad/syncprobe.rs`, 64 MiB mapping, 1,200 iterations, p50 µs;
+the box was NOT idle, so read the ratios, not the absolutes):
+
+| arm | ext4 p50 | xfs p50 |
+|---|--:|--:|
+| A `msync(MS_SYNC)` of 2 meta pages | 1,847 | 2,480 |
+| B `pwrite(200 B)` + `fdatasync` | 1,887 | 2,554 |
+| C **8 scattered 1-page msyncs** + meta msync | **15,280** | **15,846** |
+| D 1 msync of 8 *contiguous* pages + meta msync | 2,276 | 4,449 |
+| E `pwrite(32 KiB)` + `fdatasync` | 2,181 | 3,019 |
+
+**A ≈ B.** msync of a mapped range and pwrite+fdatasync of a small record cost
+the same thing, because both are one device cache flush. `wal` is not cheaper
+per flush — it is cheaper because it issues *one*.
+
+**C is the finding.** Eight one-page msyncs cost **6.7×** one msync. On Linux
+`msync(MS_SYNC)` IS `vfs_fsync_range`: every call ends in a jbd2/XFS-log commit
+plus a `blkdev_issue_flush`. And that is exactly what the commit path did.
+
+### The bug: `durability = commit` paid runs+1 device flushes, not 2
+
+design/DESIGN.md §4.1 puts the floor at **two** flushes — data, then the meta that
+references it. The code issued one `msync_range_nobarrier` **per contiguous run
+of dirty COW pages**, then one `sync_barrier`. On macOS that is right and is what
+#41 measured: msync is cheap there, `F_FULLFSYNC` is the flush, and one barrier
+covers every preceding run — N cheap calls + 1 flush = 2 platter flushes. **On
+Linux `sync_barrier` compiles away** (`shm.rs`: *"Linux: nothing to do"*), so
+every run-msync was a full flush and the barrier added none. #41 fixed Apple and
+left Linux at `runs + 1`.
+
+With 2.84 runs per batch that is **3.84 flushes per commit group** where the
+floor is 2. `strace -c -e msync`, single writer, both arms of one binary:
+
+| arm | msync calls | commits | **per commit** |
+|---|--:|--:|--:|
+| per-run (old) | 1,271 | 314 | **4.05** |
+| span (new) | 720 | 356 | **2.02** |
+
+The fix is one msync over the `[min, max]` span of the dirty set (plus the
+extent ranges), which makes exactly the same pages durable — writeback is driven
+by the page cache's DIRTY tag, so a wider range walks *dirty pages*, not pages.
+The §4.1 ordering is untouched: the span provably cannot reach the meta pages
+(every id in `dirty` comes from `alloc_id`, i.e. is a data page above the reader
+table), and the barrier stays exactly where it was.
+
+**Is a wide span free?** That is the obvious objection — a commit touching page
+10 and page 250,000 now msyncs a 1 GiB range. Measured directly
+(`scratchpad/spanprobe.rs`: 1 GiB mapping, 8 dirty pages spread evenly over the
+span, arms interleaved in one loop, p50 µs):
+
+| span | ext4 | xfs |
+|--:|--:|--:|
+| 4 MiB | 4,453 | 10,246 |
+| 64 MiB | 2,940 | 5,524 |
+| 512 MiB | 2,963 | 5,583 |
+| **1,023 MiB** | **2,990** | **5,497** |
+
+**256× wider costs nothing** — flat from 64 MiB to 1 GiB on both filesystems.
+(The 4 MiB arm being the *slowest* is the tell that this is not a range scan at
+all.) So the span carries no hidden cost, which is what the change bets on.
+
+**Paired arms, one binary, alternating, `examples/mp_writes` on ext4,
+`durability = commit`. Two independent sessions**, because this file's own rule
+is that a result that matters gets reproduced in a second session:
+
+| | n | result | 95% CI | box |
+|---|--:|--:|---|---|
+| 1 writer process | 10 pairs | **+41.5 %** | [+32.6, +51.0] | loaded (3 other agents) |
+| 4 writer processes | 10 pairs | **+55.7 %** | [+42.6, +70.0] | loaded |
+| 1 writer process | 8 pairs | **+45.0 %** | [+23.5, +70.1] | **idle** |
+| 4 writer processes | 8 pairs | **+63.3 %** | [+42.9, +86.6] | **idle** |
+
+`MPEDB_MSYNC_PER_RUN=1` restores the old loop, so both arms are the same binary
+— the mistake BENCHMARKS.md records under "the arms were the same binary" cuts
+both ways, and one binary with a switch is the safe side of it.
+
+⚠ **Absolutes in this section are on ext4 (`/dev/sdc`); the 07-17 tables were on
+xfs (`/dev/sdb`), and `mp_writes` is not the bench harness's `point-insert`
+cell.** Nothing here should be read against those tables as an absolute. Every
+claim above is a paired ratio measured inside one session.
+
+**And the same counters after the fix** (4 writers, `MPEDB_RING_STATS=1`, idle,
+1,173 batches):
+
+| | before | after |
+|---|--:|--:|
+| committed ops per batch | 2.82 | 2.68 |
+| **msyncs per batch** | **3.84** | **2** |
+| **commits per msync** | **0.73** | **1.34** |
+| leader `commit_us` | 10,028 | 6,742 |
+| work as a share of the writer-lock hold | 0.7 % | 1.2 % |
+
+The batch size did not change — it is not what was broken — and the flush count
+did. Note the last row: shortening the critical section is now worth **1.2 %**
+instead of 0.7 %, which is the honest ceiling on "stream the work, keep the lock
+small" for `durability = commit` on this hardware.
+
+### The flush-count model, and what it says about PostgreSQL
+
+Take PG's own single-client p50 (**649 µs**, which *includes* a unix-socket
+round trip) as this box's one-flush unit, and the 07-17 latencies fall out:
+
+| engine / mode | p50 | ÷ 649 µs | flushes per commit | agrees? |
+|---|--:|--:|--:|---|
+| PostgreSQL `sc=on` | 649 | 1.0 | 1 (`pwrite` + `fdatasync`) | ✅ |
+| mpedb `wal` | 1,219 | 1.9 | 1 (`pwrite` + `fdatasync`) | ❌ **unexplained** |
+| SQLite `FULL`+WAL | 1,120 | 1.7 | 1 | ❌ same shape |
+| mpedb `commit` (before #111) | 2,598 | 4.0 | **4.05 (measured)** | ✅ |
+
+The `commit` row closes exactly: 4.05 measured msyncs, 4.0 flush-units of
+latency. That is the whole of mpedb's single-client durable deficit, and #111
+takes it to 2.
+
+The two ❌ rows are an honest open item: **mpedb `wal` and SQLite-WAL both sit at
+~1.8 flush-units while doing one `fdatasync` each**, and PostgreSQL does not. It
+is not payload size — probe B vs E says 200 B → 32 KiB costs +10-17 %, not 90 %.
+PG's WAL segments are fully written and *recycled* so the file never changes
+size (`XLogFileInitInternal`, `wal_init_zero`); mpedb pre-zeros too
+(`shm.rs: prezero`) but still grows its log in 4 MiB `fallocate` chunks. That is
+a hypothesis, not a result — it has not been measured, and it is the next thing
+to measure.
+
+### What PostgreSQL actually does, and what mpedb has
+
+Read from source (`postgres@d5751c33`, `src/backend/access/transam/`):
+
+| PG mechanism | where | mpedb |
+|---|---|---|
+| **Flush-progress re-check before AND after the lock** — a committer whose LSN is already flushed returns with **zero I/O** | `XLogFlush`, `xlog.c:2820/2854/2886` | **Has an analog, differently shaped.** A ring waiter cannot be "already covered" — an intent must be *executed* by a leader, not merely logged — so the equivalent is the leader draining every READY intent into one txn. Measured 2.82 per flush at 4 writers. |
+| **`LWLockAcquireOrWait`** — followers wait for the lock to *free* and never acquire it; woken as a batch | `lwlock.c:1378`, `xlog.c:2870` | **Has it.** Wait-or-lead: futex-wait 2 ms, then `trylock`-promote (§5.3). |
+| **The leader writes/flushes everything inserted so far**, not just its own LSN | `xlog.c:2922`, `flexible=false` | **Has it.** `collect_ready()` drains the whole slot table. |
+| **Work happens outside the flush lock** — WAL space reserved by atomic bump, record bytes copied into shared buffers with no global lock | `XLogInsert` / `XLogCtlInsert` | **Lacks it** — and it is worth ≤0.7 % here (see Hypothesis 3). PG needs it because its backends do real per-transaction work; mpedb's batch execution is 67 µs. |
+| **One `pwrite` + one `fdatasync` per flush**, into a preallocated, zero-filled, recycled segment; **no mmap/msync anywhere in the WAL durability path** (verified: zero `msync` in `xlog.c`) | `xlog.c:2461`, `xlog.c:3300` | **`wal` has it** (`wal_commit`: one `pwrite`, one `fdatasync`, pre-zeroed log). **`commit` does not** — it is an msync-of-a-mapping design, which is why its floor is 2 flushes and `wal`'s is 1. |
+| **`commit_delay` / `commit_siblings`** — the leader *sleeps inside* WALWriteLock to manufacture followers | `xlog.c:2903`, default **0** (off) | **Lacks it, and should not add it.** PG's own docs say the free "gangway effect" already does most of it at zero delay; mpedb's ring self-clocks the same way (a slower flush queues more intents). Do not add a sleep before the free mechanism is measured — mpedb's free mechanism measures 2.82. |
+| **Explicit leader/follower CAS queue** (CLOG, not WAL) with the completion flag cleared before the wake | `TransactionGroupUpdateXidStatus`, `clog.c:526/578/651` | **Has it, for WAL-equivalent work** — the intent ring *is* this shape, and PG deliberately did not build it for WAL because an fsync is long enough that followers pile up on the lock by themselves (`9b38d46d9f`). |
+
+The mapping is short: **mpedb already has PG's group-commit machinery.** What it
+did not have was PG's flush *count*.
+
+### Durability evidence for #111
+
+The change alters *how many syscalls* make a page set durable, not *which* pages
+or *in what order*. Stated so a reviewer can attack it:
+
+- **Same pages.** `[min, max]` over `dirty ∪ extent_dirty` is a superset of every
+  run the old loop msynced, and `msync(MS_SYNC)` writes back every dirty page in
+  the range. Nothing that was flushed before is skipped now.
+- **Same ordering.** The data barrier still precedes the meta publish; the
+  `sync_barrier()` call is byte-for-byte where it was. §4.1's "data durable
+  BEFORE the meta that references it" is unchanged.
+- **The span cannot reach the meta.** Every id in `dirty` comes from
+  `alloc_id()`, which draws from the freelist or `high_water` — always a data
+  page, above the reader table, which is above the lock page, which is above
+  meta A/B. (`msync_range_nobarrier` rounds the base down to the OS sync
+  granularity — 4 KiB on Linux, 16 KiB on Apple — which cannot span the gap
+  either. Unchanged from before, and the pre-flip meta bytes are the *previous*
+  committed metas, already durable.)
+- **What the span may sweep in that the run loop did not:** COW pages of an
+  ABORTED transaction. Those are unreferenced garbage; writing them is wasted
+  I/O at worst, never a correctness issue. Nothing else can be dirty — the
+  writer lock is exclusive and readers never dirty pages.
+- **Empirical:** `mpedb crash --waves 6 --children 6 --durability commit` —
+  **36 SIGKILLs, 6/6 EOWNERDEAD recoveries, `verify=ok` and `index-probe=ok`
+  every wave, all invariants held.** Plus `cargo test --release` on mpedb-core,
+  mpedb, mpedb-types, mpedb-sql: **112 suites, 0 failures**; clippy
+  `-D warnings` clean.
+- **Not covered:** `mpedb powerloss` only models the WAL torn tail
+  (`--durability wal|async`), so there is no power-loss simulator for `commit`
+  mode to run. The argument for `commit` is the ordering argument above plus the
+  SIGKILL harness, and that gap in the harness is worth recording.
+
+### The classes that must not have moved, and did not
+
+The diff is one hunk inside `match durability { Durability::Commit => … }`, so
+`none`, `wal`, `async` and every read path are untouched by construction. Shown
+anyway, same paired method, idle box:
+
+| class | span | per-run | ratio |
+|---|--:|--:|--:|
+| **none-class**, 4 writer processes | 178,890/s | 179,888/s | **0.994×** (range 0.975-1.009, n=4) |
+
+Reads were not re-measured because no read path calls `commit_inner`; the
+none-class row is the control that says the shared write path did not move
+either.
+
+**Memory, 4 concurrent writer processes, commit-class** (`mp_writes` reports
+the parent's peak): RssAnon 456 KiB (span) vs 392 KiB (per-run) at 1,037 vs 803
+rows written — i.e. proportional to work done, not a footprint change. `wal`
+costs more (908 KiB, 6.5 MB VmHWM) because it buffers a page-image record per
+commit. Nothing here regresses the "~300 KB per writer process" figure above.
+
+### Guidance, unchanged in direction and sharpened in degree
+
+For durable writes use **`durability = wal`**. Measured post-#111, idle, paired:
+
+| durable mode, ext4 | 1 writer | 4 writers |
+|---|--:|--:|
+| `commit` (2 flushes/group) | 154/s | 364/s |
+| **`wal` (1 flush/group)** | **425/s** | **763/s** |
+| **wal / commit** | **2.80×** [2.38, 3.29] | **2.01×** [1.52, 2.65] |
+
+Before #111 that ratio was ~3.5× at both. So the fix closes about 40 % of the
+gap between mpedb's two durable modes, and the rest is the §4.1 two-flush floor
+that `commit` cannot escape.
+
+**Recommendation for the benchmark itself:** the commit-class row runs mpedb at
+`durability = commit`, i.e. in its *slowest* durable mode, against SQLite's WAL
+and PostgreSQL's WAL. That is a fair reading of a default and an unfair reading
+of the engine — both other engines are measured in their log-based durable mode
+and mpedb is not. Adding an `mpedb wal` row to the commit-class table (rather
+than replacing the `commit` one) would make the comparison like-for-like without
+hiding what the default does. That changes the meaning of a published table, so
+it is proposed here, not done.
+
 ## Apple Silicon (M3 Pro, 11 cores) — and the durability trap it exposed
 
 Second machine, 2026-07-14: **M3 Pro, 5 perf + 6 eff cores, 36 GB, macOS 26.6**,
@@ -635,6 +898,16 @@ merely noisy.
    4 writers group commit already amortizes the meta flush across a batch, and
    the win is per-commit.
 
+   ⚠ **This fix was Apple-only, and nobody noticed for four days (#111,
+   2026-07-20).** On Linux `sync_barrier` compiles away and `msync(MS_SYNC)` *is*
+   `vfs_fsync_range`, so taking the barrier out of the per-run loop removed
+   nothing — every run-msync was still its own device flush and Linux went on
+   paying `runs + 1`. Measured: 4.05 msyncs per durable commit. The fix is one
+   msync over the dirty SPAN; see "The one cell PostgreSQL wins" above. **The
+   general lesson: a per-platform durability fix must be measured on every
+   platform, because "N+1 → 2" was true on the platform it was written for and
+   false on the reference one.**
+
    ⚠ The two flushes CANNOT be merged into one, and an earlier draft of this
    entry wrongly proposed exactly that. The data barrier makes the data durable
    BEFORE the meta that references it (design/DESIGN.md §4.1); a single barrier over both
@@ -680,12 +953,27 @@ merely noisy.
    `newest_meta`'s retry has regressed and the fix belongs there, not in the
    adapter.
 
-3. **`durability=commit` single-client floor.** Group-commit engages only under
-   contention, so a lone durable writer pays one serialized msync per commit —
-   525 ops/s insert, the slowest cell in the suite (SQLite FULL does 1,632, and
-   mpedb's own `wal` does 2,598). `wal` already closed this gap for itself; the
-   remaining opportunity is a single-writer fast path for `commit` mode, or
-   simply steering users to `wal` (which the docs do).
+3. ~~**`durability=commit` single-client floor.**~~ **Halved 2026-07-20 (#111);
+   what remains is structural.** The entry used to say a lone durable writer
+   "pays one serialized msync per commit". It paid **four** (measured: 4.05),
+   because the data barrier was issued once per contiguous dirty run and on
+   Linux each of those is a device flush. One msync over the span took it to
+   **2.02** — the §4.1 floor — worth **+41.5 % [+32.6, +51.0]** at one writer and
+   **+55.7 % [+42.6, +70.0]** at four, n=10 paired each.
+
+   What is left is not a bug: `commit` needs *two* flushes (data, then the meta
+   that references it) and `wal` needs *one* (a single self-describing
+   checksummed record), so `wal` remains ~2× `commit` on durable media and the
+   guidance to use it stands. A genuine single-writer fast path for `commit`
+   would have to break the §4.1 ordering, which is not available.
+
+3b. **The `wal` per-flush gap (open, quantified, unexplained).** mpedb `wal` and
+   SQLite-WAL both sit at ~1.8 flush-units of latency while issuing one
+   `fdatasync` each; PostgreSQL sits at 1.0. It is not payload size (200 B →
+   32 KiB costs +10-17 %, probed). PG never changes a WAL segment's size —
+   segments are zero-filled once and then *recycled* — while mpedb grows its log
+   in 4 MiB `fallocate` chunks. That is the hypothesis to test next, and it is
+   worth up to ~1.8× on the mode the docs recommend.
 4. **~1 µs of fixed per-row cost in the write path.** The bulk write is not
    limited by copies — see "Where the bulk write actually spends its time". With
    the SQL layer removed entirely, ~1 µs/row remains: btree descent, COW page
