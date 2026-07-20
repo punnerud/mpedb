@@ -268,7 +268,7 @@ EXPLAIN SELECT emp.ename FROM emp LEFT JOIN dept ON emp.did = dept.did
 ----
 Select emp
   access: FullScan
-  join order: emp [scan] -> dept [pk] (MPEE: 0 cartesian steps)
+  join order: emp [scan] -> dept [pk] (0 cartesian steps)
   left join dept (index nested loop, NULL-extends on no match — ON equality pushed into the inner fetch)
     access: PkPoint(did = emp.did)
     on: true
@@ -280,7 +280,7 @@ EXPLAIN SELECT emp.ename FROM emp LEFT JOIN dept ON emp.did > dept.did
 ----
 Select emp
   access: FullScan
-  join order: emp [scan] -> dept [scan] (MPEE: 0 cartesian steps)
+  join order: emp [scan] -> dept [scan] (0 cartesian steps)
   left join dept (nested loop, NULL-extends on no match — no predicate pushdown)
     access: FullScan
     on: emp.did > dept.did

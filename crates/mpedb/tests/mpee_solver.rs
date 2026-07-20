@@ -141,7 +141,7 @@ fn explain_shows_the_chosen_order_and_the_reason() {
     assert_eq!(
         line,
         "  join order: t1 [scan] -> t2 [pk] -> t3 [pk] -> t4 [pk] -> t5 [pk] -> t6 [pk] \
-         (MPEE: 0 cartesian steps)",
+         (0 cartesian steps)",
         "the solver should walk the path:\n{plan}"
     );
     assert!(
@@ -270,7 +270,7 @@ fn join_17_4_answers() {
         .find(|l| l.trim_start().starts_with("join order:"))
         .unwrap_or_else(|| panic!("no join-order line:\n{plan}"));
     assert!(
-        line.ends_with("(MPEE: 0 cartesian steps)"),
+        line.ends_with("(0 cartesian steps)"),
         "every one of the 16 steps must be linked: {line}"
     );
     assert_eq!(
@@ -573,11 +573,11 @@ fn a_left_join_no_longer_costs_the_whole_scope_its_ordering() {
         .find(|l| l.trim_start().starts_with("join order:"))
         .unwrap_or_else(|| panic!("no join-order line:\n{plan}"));
     assert!(
-        line.ends_with("(MPEE: 0 cartesian steps)"),
+        line.ends_with("(0 cartesian steps)"),
         "the run in front of the barrier must be walked, not crossed: {line}"
     );
     assert!(
-        line.trim().starts_with("join order: t1 ") && line.contains("t11 [pk] (MPEE:"),
+        line.trim().starts_with("join order: t1 ") && line.contains("t11 [pk] ("),
         "the barrier must stay LAST while the run reorders: {line}"
     );
     let r = rows(&db, &sql);
