@@ -3183,3 +3183,81 @@ fn explain_query_plan_answers_in_sqlites_shape() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }
+
+/// `PRAGMA table_info` HIDES generated columns and renumbers `cid` over the ones
+/// it lists; `PRAGMA table_xinfo` lists them all and adds the seventh `hidden`
+/// column (0 = ordinary, 2 = VIRTUAL, 3 = STORED). Django's sqlite3
+/// introspection unpacks exactly seven values from `table_xinfo` and filters on
+/// `hidden`, so an aliased six-column answer is not a narrower one — it is an
+/// unpacking error on every table in the project.
+#[test]
+fn table_info_hides_generated_columns_and_xinfo_reports_hidden() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(
+            exec(
+                db,
+                "CREATE TABLE t (a INTEGER PRIMARY KEY, \
+                 g INTEGER GENERATED ALWAYS AS (a * 2) STORED, \
+                 b INTEGER, v INTEGER GENERATED ALWAYS AS (a + 1) VIRTUAL)"
+            ),
+            SQLITE_OK
+        );
+
+        // table_info: only `a` and `b`, renumbered 0,1 (sqlite numbers the rows
+        // it emits, not the columns of the table).
+        assert_eq!(collect_text_col(db, "PRAGMA table_info(t)"), ["0", "1"]);
+        assert_eq!(
+            collect_col_text(db, "PRAGMA table_info(t)", 1),
+            ["a", "b"]
+        );
+
+        // table_xinfo: all four, TRUE ordinals, with the hidden codes.
+        assert_eq!(
+            collect_col_text(db, "PRAGMA table_xinfo(t)", 0),
+            ["0", "1", "2", "3"]
+        );
+        assert_eq!(
+            collect_col_text(db, "PRAGMA table_xinfo(t)", 1),
+            ["a", "g", "b", "v"]
+        );
+        assert_eq!(
+            collect_col_text(db, "PRAGMA table_xinfo(t)", 6),
+            ["0", "3", "0", "2"]
+        );
+
+        // The reconstructed sqlite_master DDL carries the clause, so a dump
+        // replays as the same table rather than one with an ordinary column
+        // that the dump's INSERTs (built from `table_info`) never fill.
+        let ddl = collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 't'");
+        assert!(
+            ddl[0].contains("GENERATED ALWAYS AS (a * 2) STORED")
+                && ddl[0].contains("GENERATED ALWAYS AS (a + 1) VIRTUAL"),
+            "{ddl:?}"
+        );
+
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+/// Read column `n` of every row as text.
+unsafe fn collect_col_text(db: *mut Sqlite3, sql: &str, n: i32) -> Vec<String> {
+    let s = cs(sql);
+    let mut st: *mut Stmt = ptr::null_mut();
+    assert_eq!(
+        sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+        SQLITE_OK,
+        "prepare {sql}"
+    );
+    let mut out = Vec::new();
+    while sqlite3_step(st) == SQLITE_ROW {
+        let p = sqlite3_column_text(st, n);
+        out.push(if p.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(p as *const c_char).to_str().unwrap().to_string()
+        });
+    }
+    sqlite3_finalize(st);
+    out
+}

@@ -461,11 +461,12 @@ impl<'a> Parser<'a> {
             ));
         }
         let src = self.capture_paren_source()?;
+        // VIRTUAL is sqlite's default when neither word is written, so the
+        // explicit `VIRTUAL` and the absent one deliberately land in one arm.
         let kind = if self.eat_word("STORED") {
             mpedb_types::GeneratedKind::Stored
-        } else if self.eat_word("VIRTUAL") {
-            mpedb_types::GeneratedKind::Virtual
         } else {
+            let _ = self.eat_word("VIRTUAL");
             mpedb_types::GeneratedKind::Virtual
         };
         Ok((src, kind))
