@@ -13,6 +13,8 @@
 mod bulk;
 mod dur_compare;
 mod eng_mpedb;
+mod extents;
+mod h2h;
 mod eng_pg;
 mod eng_sqlite;
 mod eng_turso;
@@ -33,7 +35,17 @@ use report::{CellRow, Report};
 use util::{cpu_model, fs_type, host_slug, mem_total, os_release, rustc_version, today_utc, BResult};
 use workloads::{run_workload, RunCfg, ALL_WORKLOADS};
 
-const ENGINE_KEYS: [&str; 4] = ["mpedb", "sqlite", "postgres", "turso"];
+/// `mpedb-wal` is a SECOND mpedb arm, not a replacement for the first.
+///
+/// The commit-class matrix used to run mpedb only at `durability = commit` —
+/// the mapped-page barrier, design/DESIGN.md §4.1's two-flush floor — against
+/// SQLite-WAL and PostgreSQL, both of which are log-based and issue one flush.
+/// That is mpedb's slowest durable mode against the other engines' fast ones.
+/// mpedb's log-based mode is the like-for-like comparand, so it gets a row;
+/// `commit` keeps its row because "what does the mapped-page barrier cost" is
+/// a real question about the default and dropping it would hide the floor.
+/// (`mpedb-wal` has no none-class meaning and is skipped there.)
+const ENGINE_KEYS: [&str; 5] = ["mpedb", "mpedb-wal", "sqlite", "postgres", "turso"];
 
 struct DirGuard(PathBuf);
 impl Drop for DirGuard {
@@ -77,7 +89,7 @@ fn pg_version_string() -> String {
 
 fn engine_label(key: &str) -> String {
     match key {
-        "mpedb" => format!("mpedb {}", env!("CARGO_PKG_VERSION")),
+        "mpedb" | "mpedb-wal" => format!("mpedb {}", env!("CARGO_PKG_VERSION")),
         "sqlite" => format!("SQLite {}", rusqlite::version()),
         "turso" => format!("Turso {}", eng_turso::TURSO_VERSION),
         _ => {
@@ -94,6 +106,7 @@ fn config_label(key: &str, durable: bool) -> String {
     match (key, durable) {
         ("mpedb", false) => "tmpfs, durability=none".into(),
         ("mpedb", true) => "disk, durability=commit".into(),
+        ("mpedb-wal", _) => "disk, durability=wal".into(),
         ("sqlite", false) => "tmpfs, sync=OFF+MEMORY".into(),
         ("sqlite", true) => "disk, sync=FULL+WAL".into(),
         ("turso", false) => "tmpfs, default (WAL)".into(),
@@ -115,6 +128,7 @@ fn build_engine(
             medium.join("mpedb"),
             if durable { "commit" } else { "none" },
         )?)),
+        "mpedb-wal" => Ok(Box::new(MpedbEngine::new(medium.join("mpedb-wal"), "wal")?)),
         "sqlite" => Ok(Box::new(SqliteEngine::new(
             medium.join("sqlite"),
             if durable {
@@ -286,22 +300,44 @@ fn main() {
         .windows(2)
         .find(|w| w[0] == "--value-bytes")
         .and_then(|w| w[1].parse().ok());
+    // Where the DISK (durable) cells live. Default: next to the build output,
+    // which is the workspace `target/` — on this box that is the small system
+    // disk, and it is also a different filesystem from the one a durable
+    // number is usually wanted on. Any published durable ratio has to say
+    // which filesystem it was measured on, so it has to be selectable.
+    let disk_arg: Option<String> = args
+        .windows(2)
+        .find(|w| w[0] == "--disk")
+        .map(|w| w[1].clone());
+    // Paired, interleaved durable head-to-head (#122): N repetitions.
+    let h2h_arg: Option<usize> = args
+        .windows(2)
+        .find(|w| w[0] == "--h2h")
+        .and_then(|w| w[1].parse().ok());
+    // Known-issue-3b probe: append+fdatasync by log-file layout.
+    let extents_arg: Option<usize> = args
+        .windows(2)
+        .find(|w| w[0] == "--extents")
+        .and_then(|w| w[1].parse().ok());
+    const VALUED: [&str; 7] = [
+        "--only",
+        "--tmpfs",
+        "--out",
+        "--value-bytes",
+        "--disk",
+        "--h2h",
+        "--extents",
+    ];
     for (i, a) in args.iter().enumerate() {
         let known = a == "--quick"
             || a == "--io"
-            || a == "--only"
-            || a == "--tmpfs"
-            || a == "--out"
-            || a == "--value-bytes"
-            || (i > 0
-                && (args[i - 1] == "--only"
-                    || args[i - 1] == "--tmpfs"
-                    || args[i - 1] == "--out"
-                    || args[i - 1] == "--value-bytes"));
+            || VALUED.contains(&a.as_str())
+            || (i > 0 && VALUED.contains(&args[i - 1].as_str()));
         if !known {
             eprintln!(
                 "usage: mpedb-bench [--quick] [--io] [--only mpedb|sqlite|postgres|turso] \
-                 [--tmpfs DIR] [--out FILE] [--value-bytes N]"
+                 [--tmpfs DIR] [--disk DIR] [--out FILE] [--value-bytes N] \
+                 [--h2h REPS] [--extents ITERS]"
             );
             std::process::exit(2);
         }
@@ -311,7 +347,10 @@ fn main() {
     let pid = std::process::id();
     let tmpfs_root = tmpfs_arg.unwrap_or_else(|| "/dev/shm".to_string());
     let tmpfs_base = PathBuf::from(format!("{tmpfs_root}/mpedb-bench-{pid}"));
-    let disk_base = disk_scratch(pid);
+    let disk_base = match &disk_arg {
+        Some(d) => PathBuf::from(d).join(format!("mpedb-bench-scratch-{pid}")),
+        None => disk_scratch(pid),
+    };
     for d in [&tmpfs_base, &disk_base] {
         if let Err(e) = std::fs::create_dir_all(d) {
             eprintln!("cannot create scratch dir {}: {e}", d.display());
@@ -340,6 +379,31 @@ fn main() {
             "WARNING: disk scratch {} is on tmpfs — 'disk' cells are not disk-backed!",
             disk_base.display()
         );
+    }
+
+    // Focused modes: they print their own tables and exit. Neither belongs in
+    // the generated per-machine report — both are paired A/B instruments, not
+    // a matrix cell, and mixing the two output kinds is how a ratio measured
+    // under one method ends up quoted as an absolute measured under another.
+    if let Some(iters) = extents_arg {
+        let r = extents::run(&disk_base, iters, 16 * 1024);
+        if let Err(e) = r {
+            eprintln!("extents probe failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    if let Some(reps) = h2h_arg {
+        eprintln!(
+            "disk = {} ({disk_ty}); tmpfs = {} ({tmpfs_ty})",
+            disk_base.display(),
+            tmpfs_base.display()
+        );
+        if let Err(e) = h2h::run(&disk_base, &tmpfs_base, &cfg, reps) {
+            eprintln!("h2h failed: {e}");
+            std::process::exit(1);
+        }
+        return;
     }
 
     let info_lines = vec![
@@ -391,6 +455,10 @@ fn main() {
                 if !key.contains(f.as_str()) {
                     continue;
                 }
+            }
+            // `wal` is a durable mode; there is no none-class version of it.
+            if key == "mpedb-wal" && !durable {
+                continue;
             }
             let elabel = engine_label(key);
             let clabel = config_label(key, durable);

@@ -144,8 +144,19 @@ Reproduce:
 cargo run --release -p mpedb-bench          # full run → RESULTS-<machine>.md
 cargo run --release -p mpedb-bench -- --out RESULTS-mybox.md   # explicit name
 cargo run --release -p mpedb-bench -- --only mpedb   # one engine, least noise
+cargo run --release -p mpedb-bench -- --disk /mnt/ext4/scratch # pick the medium
+cargo run --release -p mpedb-bench -- --h2h 8       # paired durable head-to-head
+cargo run --release -p mpedb-bench -- --extents 800 # append+fdatasync by layout
 mpedb bench --auto --durability none|commit|wal|async   # mpedb-only, quick
 ```
+
+`--h2h` and `--extents` are **paired A/B instruments, not report cells**: they
+walk their arms round-robin inside one loop and print ratios formed *inside* a
+repetition, and they deliberately write nothing to `RESULTS-<machine>.md`.
+`--disk` matters more than it looks: the default scratch sits next to the build
+output, which on the dev box is the *system* disk — a different filesystem from
+the one durable numbers usually want, and a durable number that does not say
+which filesystem it was taken on is not a number.
 
 ## How to read these numbers
 
@@ -241,6 +252,14 @@ one: **`durability=commit` single-client (~560 ops/s insert)** — the slowest i
 the suite, because every commit msyncs the meta double-buffer with no batching
 partner. Guidance: for durable writes use `wal`, and batch in a `WriteSession`
 when you can.
+
+*(2026-07-20: these absolutes are the 07-14 run on that day's medium and predate
+#111, which halved `commit`'s flush count. The durable head-to-head has since
+been re-measured with all four arms interleaved in one session, and the
+`mpedb wal` row that was missing from the curated commit-class table added —
+see ["The durable head-to-head,
+re-measured"](#the-durable-head-to-head-re-measured-with-an-mpedb-wal-row-2026-07-20-122).
+The direction of the guidance is unchanged.)*
 
 ### Contended writes — where mpedb's single writer lock costs it
 
@@ -353,11 +372,110 @@ throughput, it is that the whole engine is 72 KB of anonymous memory and no
 daemon. PostgreSQL runs on a Pi 3 too; what it cannot do is cost nothing while
 idle.
 
+## The durable head-to-head, re-measured with an `mpedb wal` row (2026-07-20, #122)
+
+**The published durable cell compared mpedb's slowest durable mode against two
+log-based engines' fast ones.** It ran mpedb at `durability = commit` — full
+mapped-page `msync` plus meta `msync`, design/DESIGN.md §4.1's two-flush floor —
+against SQLite-WAL and PostgreSQL `synchronous_commit=on`, both of which are
+log-based and issue one flush. mpedb *has* a log-based mode. It was not in the
+table.
+
+It is now, **as an addition**: `commit` keeps its row, because "what does the
+mapped-page barrier cost" is a real question about the default and deleting the
+row would hide a real property of that mode. `wal` gets a row next to it,
+because "how does mpedb's log compare to their logs" is the like-for-like
+question and it was unanswerable from this page. The harness change is the same
+shape — `mpedb-bench` now runs a fifth engine key, `mpedb-wal`, in the
+commit-class matrix (none-class skips it: `wal` is a durable mode).
+
+**Method.** `--h2h 8`: all four durable arms built once and then walked
+round-robin, eight repetitions, so every arm is measured within seconds of
+every other and each ratio is formed *inside* a repetition. **Two independent
+sessions**, because this file's own rule is that a result that matters gets
+reproduced in a second one. ext4 (`/dev/sdc`, `--disk /mnt/ext4/...`) — xfs was
+occupied by another workload for the whole window, so **there is no xfs arm
+here and the two filesystems are not mixed.** The box was NOT idle (another
+agent's `cargo test` and a `powerloss` run on the other disk), which is why
+every claim below is a paired ratio and the absolutes carry the spread.
+
+| point-insert, 1 client | session A ops/s | session B | A p50 µs | B p50 µs | **barriers/commit** |
+|---|--:|--:|--:|--:|--:|
+| mpedb `commit` (mapped-page, §4.1 floor) | 157 [142-170] | 151 [141-173] | 5,486 | 5,576 | **2.26** |
+| **mpedb `wal` (log, one flush)** | **350 [287-405]** | **371 [303-402]** | **1,875** | **1,854** | **1.11** |
+| SQLite `FULL`+WAL (log) | 143 [125-168] | 150 [138-164] | 5,738 | 5,776 | **2.22** |
+| PostgreSQL `sc=on` (log) | 468 [437-485] | 424 [325-465] | 1,814 | 1,938 | **1.10** |
+
+| contended writes, 4 threads | session A ops/s | session B |
+|---|--:|--:|
+| mpedb `commit` | 341 [287-411] | 356 [305-405] |
+| **mpedb `wal`** | **838 [756-967]** | **866 [679-931]** |
+| SQLite `FULL`+WAL | 139 [126-160] | 154 [143-163] |
+| PostgreSQL `sc=on` | 1,013 [995-1,182] | 999 [799-1,115] |
+
+Medians of 8, `[min-max]` across the 8 repetitions. Paired ratios, formed per
+repetition (session B, n=8):
+
+| vs PostgreSQL, paired | ops/s | p50 |
+|---|--:|--:|
+| **mpedb `wal`** | **0.86× [0.76-1.08]** | **0.96× [0.79-1.04]** |
+| mpedb `commit` | 0.36× [0.32-0.49] | 2.86× [2.28-3.00] |
+| SQLite `FULL`+WAL | 0.36× [0.31-0.45] | 2.89× [2.51-3.17] |
+
+**The like-for-like comparison is a tie, and the old table did not contain it.**
+mpedb's log-based mode sits at 0.96× PostgreSQL's typical durable commit
+latency and 0.86× its throughput, where the published cell showed mpedb losing
+by 3.7×. Against the other embedded engine in its own log mode, `wal` is
+**2.4-2.5× SQLite** single-client and **5.6× contended**. And `commit` really
+is the slow mode: 2.2-2.9× the latency of the two log-based engines,
+2.18× [1.85-2.56] / 2.45× [1.90-2.62] slower than mpedb's own `wal`
+single-client and 2.5× slower contended (paired, per session).
+
+### The barrier count, measured by the kernel rather than argued
+
+The last column above is new and it is the load-bearing one. `/proc/diskstats`
+has counted **device cache-flush requests** since Linux 5.5, so the harness
+brackets each cell with them and reports flushes per committed insert. That
+separates "this engine issues more barriers" from "this engine's barriers are
+slower", which no engine-level timer can do:
+
+| arm | barriers/commit | µs/barrier | p50 |
+|---|--:|--:|--:|
+| PostgreSQL `sc=on` | 1.10 | 132-141 | 1,814-1,938 |
+| **mpedb `wal`** | **1.11** | 152-156 | **1,854-1,875** |
+| SQLite `FULL`+WAL | 2.22 | 167-353 | 5,738-5,776 |
+| mpedb `commit` | 2.26 | 156-164 | 5,486-5,576 |
+
+Identical to two decimals in both sessions. Read it as: mpedb `wal` and
+PostgreSQL are at the one-flush floor, mpedb `commit` is at §4.1's two-flush
+floor (post-#111 — it was at 4.05), and **SQLite pays two barriers per durable
+commit as well**, which was not known and is the subject of the 3b section
+below.
+
+### What this contradicts
+
+⚠ **The 07-17 table below reports mpedb `commit` at 391 ops/s / p50 2,598 µs
+and PostgreSQL at 1,457 / 649 µs. This section measures 151-157 and
+424-468 on the same workload, and it is not a regression in anything.** Every
+arm is ~3× slower here, PostgreSQL included; the earlier table was taken on
+**xfs** on a differently loaded box, this one on **ext4** with three other
+agents on the machine. That is the whole reason the rule exists: absolutes do
+not cross a medium or a session, ratios inside one session do. Nothing in this
+section should be read against those absolutes, and the two tables are kept
+apart rather than merged.
+
+Also superseded: the `mpedb commit` row of that table predates #111 (4.05
+msyncs per commit, now 2.02), so it was stale in mpedb's *disfavour* — which is
+the second reason re-measuring was required and not merely fairer.
+
 ## The one cell PostgreSQL wins: durable writes (2026-07-20, Linux, #111)
 
-PostgreSQL beats mpedb in exactly one class, and the 07-17 run says so plainly:
+⚠ **This section's opening table is the 2026-07-17 run on xfs, kept as
+measured.** It is superseded as a head-to-head by #122 above (which adds the
+`mpedb wal` row and re-measures on ext4); its absolutes are not comparable to
+that section's, and its `mpedb commit` row predates #111.
 
-| commit-class, disk | mpedb `commit` | SQLite FULL+WAL | **PostgreSQL** |
+| commit-class, disk (2026-07-17, xfs) | mpedb `commit` | SQLite FULL+WAL | **PostgreSQL** |
 |---|--:|--:|--:|
 | point-insert, 1 client | 391 (p50 2598 µs) | 848 (1120 µs) | **1457 (649 µs)** |
 | contended writes, 4 threads | 687 | 840 | **6370** |
@@ -547,14 +665,90 @@ The `commit` row closes exactly: 4.05 measured msyncs, 4.0 flush-units of
 latency. That is the whole of mpedb's single-client durable deficit, and #111
 takes it to 2.
 
-The two ❌ rows are an honest open item: **mpedb `wal` and SQLite-WAL both sit at
-~1.8 flush-units while doing one `fdatasync` each**, and PostgreSQL does not. It
-is not payload size — probe B vs E says 200 B → 32 KiB costs +10-17 %, not 90 %.
-PG's WAL segments are fully written and *recycled* so the file never changes
-size (`XLogFileInitInternal`, `wal_init_zero`); mpedb pre-zeros too
-(`shm.rs: prezero`) but still grows its log in 4 MiB `fallocate` chunks. That is
-a hypothesis, not a result — it has not been measured, and it is the next thing
-to measure.
+The two ❌ rows were an open item — **mpedb `wal` and SQLite-WAL both sitting at
+~1.8 flush-units while issuing one `fdatasync` each**. Both are now closed, and
+the model was wrong in its third column rather than its second: the two engines
+were not doing one barrier each. See the next section.
+
+### Known issue 3b, settled: the flush-unit model was counting `fdatasync` calls, not barriers (2026-07-20, #122)
+
+The recorded hypothesis was that PostgreSQL never changes a WAL segment's size
+— segments are zero-filled once and then *recycled* — while mpedb grows its log
+in 4 MiB `fallocate` chunks, so every `fdatasync` also journals an extent
+conversion. **The mechanism is real and large. The attribution to mpedb was
+wrong.**
+
+`cargo run --release -p mpedb-bench -- --disk <dir> --extents 800`: five
+log-file layouts, same 16 KiB record, all arms **interleaved inside one loop**,
+with the kernel's flush counters read around each append. ext4, three sessions:
+
+| layout | p50 µs (3 sessions) | × recycled | **barriers/append** |
+|---|--:|--:|--:|
+| `grow-sparse` — pwrite past EOF, i_size changes every append | 5,717 · 5,831 · 5,871 | 2.83 · 2.88 · 2.86 | **2.00** |
+| `fallocate-unwritten` — 4 MiB chunks, appends into UNWRITTEN extents | 5,578 · 5,724 · 5,708 | 2.76 · 2.82 · 2.78 | **2.01** |
+| **`fallocate-prezero` — 4 MiB chunks + written zeros (what mpedb does)** | **2,001 · 1,959 · 2,067** | **0.99 · 0.97 · 1.01** | **1.01** |
+| `recycled` — whole file written and fsynced once, then appended into (PG) | 2,020 · 2,028 · 2,051 | 1.00 | **1.00** |
+| `recycled-fsync` — identical, but `fsync` instead of `fdatasync` | — · — · 5,723 | 2.79 | **2.00** |
+
+**The hypothesis's mechanism: confirmed, 2.8× and exactly one extra barrier.**
+Appending into a file that has to change — its size, or an unwritten extent —
+makes `fdatasync` commit a filesystem journal transaction, and on ext4 that
+transaction is its own `blkdev_issue_flush`. Two barriers, 2.8× the latency, no
+engine-level cause whatsoever. That is a trap worth having measured.
+
+**The hypothesis as applied to mpedb: REFUTED.** `wal_ensure_alloc` already
+writes zeros over each fresh 4 MiB chunk (`shm.rs: prezero`), and the probe puts
+that layout at **1.01 barriers and 0.99-1.01× the recycled arm** — i.e.
+byte-for-byte PostgreSQL's cost, amortized 1-in-256 growth included. There is
+nothing to fix. The predicted ~1.8× win on the mode the docs recommend does not
+exist, and the code comment in `wal_ensure_alloc` that claims 958 µs vs 350 µs
+for the un-prezeroed case is exactly right — it is why there is no gap left.
+
+**And the residual gap does not reproduce at all.** mpedb `wal`'s measured
+barrier count is **1.11 per commit** and its p50 is **0.96× [0.79-1.04]**
+PostgreSQL's, paired, n=8. The 1.9 flush-units in the table above was measured
+on a different filesystem before #111; on ext4 the two engines' typical durable
+commit is the same commit.
+
+**What the model got wrong was SQLite**, and the fifth arm says why. SQLite's
+WAL sync is `fsync`, not `fdatasync`: `os_unix.c`'s `full_fsync()` only takes
+the `fdatasync` branch for a DATAONLY sync, and `wal.c` never requests one. An
+`fsync` must persist inode metadata — mtime is enough — so on ext4 it commits a
+journal transaction and buys a second barrier **even when nothing about the file
+changed**: the `recycled-fsync` arm is byte-identical to `recycled` and costs
+2.00 barriers and 2.79×. That is the whole of SQLite's 2.22 measured
+barriers/commit, and it is not configurable short of leaving the durable class.
+(The growth explanation does not fit SQLite: its `-wal` stops growing about 250
+commits into a cell — measured — while the barrier count stays at 2.22 for the
+whole cell.)
+
+So the corrected model, all four rows now agreeing, all counts measured rather
+than inferred:
+
+| engine / mode | barriers per commit | why | p50 (ext4, #122) |
+|---|--:|---|--:|
+| PostgreSQL `sc=on` | **1.10** | `pwrite` + `fdatasync` into a recycled, fully-written segment | 1,814-1,938 |
+| mpedb `wal` | **1.11** | `pwrite` + `fdatasync` into a pre-zeroed log | 1,854-1,875 |
+| SQLite `FULL`+WAL | **2.22** | one `fsync` = data barrier + inode-journal barrier | 5,738-5,776 |
+| mpedb `commit` | **2.26** | §4.1: data msync, then meta msync (was 4.05 before #111) | 5,486-5,576 |
+
+Two notes on the excess over the whole number. Both one-flush engines measure
+1.10, not 1.00: ~10 % of commits buy a second barrier, and for mpedb that is
+the *main* file, which is `fallocate`d but deliberately not pre-zeroed (zeroing
+an 800 GiB `size_mb` at create is not on) — so a commit that first touches a
+fresh region pays the conversion the probe's second row measures. At 0.11 per
+commit it is a 10 % effect, not a 1.8× one, and pre-zeroing the data file would
+trade it against create-time cost. mpedb `commit`'s 2.26 has the same
+explanation on top of its two msyncs.
+
+**One residual, quantified and not closed:** mpedb `wal` matches PostgreSQL at
+p50 but trails by ~14 % on throughput, i.e. on the *mean* — mean/p50 1.45-1.57
+against PostgreSQL's 1.18-1.30. It is a tail, not the typical commit. Raising
+`MPEDB_WAL_CKPT_BYTES` from its 16 MiB default to 4 GiB (a diagnostic, not a
+recommendation — it trades recovery time and log space) moved mpedb `wal`'s
+mean latency 2,935 → 2,393 µs and mean/p50 1.57 → 1.31 while the other three
+arms did not move. n=3, so that is indicative and not resolved: the suspect is
+the checkpoint's whole-mapping `msync`.
 
 ### What PostgreSQL actually does, and what mpedb has
 
@@ -627,7 +821,8 @@ commit. Nothing here regresses the "~300 KB per writer process" figure above.
 
 ### Guidance, unchanged in direction and sharpened in degree
 
-For durable writes use **`durability = wal`**. Measured post-#111, idle, paired:
+For durable writes use **`durability = wal`**. Measured post-#111, idle, paired,
+with `examples/mp_writes` (multi-PROCESS writers):
 
 | durable mode, ext4 | 1 writer | 4 writers |
 |---|--:|--:|
@@ -639,14 +834,23 @@ Before #111 that ratio was ~3.5× at both. So the fix closes about 40 % of the
 gap between mpedb's two durable modes, and the rest is the §4.1 two-flush floor
 that `commit` cannot escape.
 
-**Recommendation for the benchmark itself:** the commit-class row runs mpedb at
-`durability = commit`, i.e. in its *slowest* durable mode, against SQLite's WAL
-and PostgreSQL's WAL. That is a fair reading of a default and an unfair reading
-of the engine — both other engines are measured in their log-based durable mode
-and mpedb is not. Adding an `mpedb wal` row to the commit-class table (rather
-than replacing the `commit` one) would make the comparison like-for-like without
-hiding what the default does. That changes the meaning of a published table, so
-it is proposed here, not done.
+⚠ The #122 re-measurement gets **2.18× [1.85-2.56]** and **2.45× [1.90-2.62]**
+single-client and **2.51× / 2.43×** at four writers — same direction, and the
+four-writer figure disagrees with the 2.01× above. The two are not the same
+experiment (`mp_writes` runs writer *processes*, the head-to-head runs threads
+in one process, on a different filesystem and a busier box), so neither
+supersedes the other; the honest summary is that `wal` is **~2-2.5× `commit`**
+on durable media and the guidance does not depend on which end of that it is.
+
+**Recommendation for the benchmark itself — DONE (#122).** The commit-class row
+ran mpedb at `durability = commit`, its *slowest* durable mode, against
+SQLite's WAL and PostgreSQL's WAL: a fair reading of a default and an unfair
+reading of the engine, because both other engines were measured in their
+log-based durable mode and mpedb was not. An `mpedb wal` row has been **added**
+— not substituted, so nothing about the default's cost is hidden — to both the
+generated matrix (`mpedb-bench` engine key `mpedb-wal`) and the curated table;
+see "The durable head-to-head, re-measured" above for the numbers, which
+change the conclusion of that cell.
 
 ## Apple Silicon (M3 Pro, 11 cores) — and the durability trap it exposed
 
@@ -999,13 +1203,30 @@ merely noisy.
    guidance to use it stands. A genuine single-writer fast path for `commit`
    would have to break the §4.1 ordering, which is not available.
 
-3b. **The `wal` per-flush gap (open, quantified, unexplained).** mpedb `wal` and
-   SQLite-WAL both sit at ~1.8 flush-units of latency while issuing one
-   `fdatasync` each; PostgreSQL sits at 1.0. It is not payload size (200 B →
-   32 KiB costs +10-17 %, probed). PG never changes a WAL segment's size —
-   segments are zero-filled once and then *recycled* — while mpedb grows its log
-   in 4 MiB `fallocate` chunks. That is the hypothesis to test next, and it is
-   worth up to ~1.8× on the mode the docs recommend.
+3b. ~~**The `wal` per-flush gap.**~~ **Closed 2026-07-20 (#122) — the
+   hypothesis was refuted and the gap was an artifact of counting.** The entry
+   said mpedb `wal` and SQLite-WAL sit at ~1.8 flush-units while issuing one
+   `fdatasync` each, and proposed that mpedb's 4 MiB `fallocate` growth (vs
+   PostgreSQL's recycled, never-resized segments) made every `fdatasync`
+   journal an extent conversion. Measured, with the kernel's own device-flush
+   counters:
+
+   - **The mechanism is real**: appending into a growing file or an unwritten
+     extent costs **2.00 barriers and 2.8×** one into a fully-written one.
+   - **mpedb is already on the right side of it**: `wal_ensure_alloc`
+     pre-zeros, and that layout measures **1.01 barriers, 0.99-1.01× the
+     recycled arm**. Nothing to fix; the ~1.8× win does not exist.
+   - **Neither engine was doing one flush.** SQLite's WAL sync is `fsync`, not
+     `fdatasync` (`os_unix.c` takes the `fdatasync` branch only for a DATAONLY
+     sync), so it commits an inode-journal transaction and pays **2.22
+     barriers per commit** — measured, and reproduced by an `fsync`-only
+     control arm on a file where nothing changed.
+   - **mpedb `wal` vs PostgreSQL is a tie**: 1.11 vs 1.10 barriers per commit,
+     p50 **0.96× [0.79-1.04]** paired, n=8, two sessions.
+
+   What is left is ~14 % of *mean* latency (mpedb `wal` mean/p50 1.45-1.57 vs
+   PostgreSQL's 1.18-1.30) — a tail, with the WAL checkpoint's whole-mapping
+   `msync` as the indicative (n=3) suspect. See "Known issue 3b, settled" above.
 4. **~1 µs of fixed per-row cost in the write path.** The bulk write is not
    limited by copies — see "Where the bulk write actually spends its time". With
    the SQL layer removed entirely, ~1 µs/row remains: btree descent, COW page
