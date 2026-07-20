@@ -71,6 +71,12 @@
 //! slope, so every fixed cost cancels. Full table and analysis in
 //! `design/DESIGN-STREAM-EXEC.md` §2.
 //!
+//! **This table is the BASELINE — the state that motivated the work, not the
+//! state today.** It is kept as measured rather than refreshed in place,
+//! because it is the evidence the design was argued from; overwriting it would
+//! delete the before-number that makes the after-number mean anything. See
+//! "What has changed since" at the end.
+//!
 //! ```text
 //!   shape          held@160k    B/row   out@160k   what is held
 //!   agg_many       167875378   1049.4     160000   input + group map + 3 spines
@@ -97,11 +103,12 @@
 //!
 //! Three things worth keeping:
 //!
-//! 1. **Aggregation materialises its whole input.** `SELECT count(*)` holds
-//!    50.8 MB to produce one integer (`exec/aggregate.rs:172-177` gathers in
-//!    full and says "Unbounded on purpose"). Ranked by bytes held it is joint
-//!    8th; ranked by bytes held per byte of answer it is first by orders of
-//!    magnitude.
+//! 1. **Aggregation materialised its whole input.** `SELECT count(*)` held
+//!    50.8 MB to produce one integer — `exec/aggregate.rs` gathered in full and
+//!    said "Unbounded on purpose". Ranked by bytes held it was joint 8th;
+//!    ranked by bytes held per byte of ANSWER it was first by orders of
+//!    magnitude, which is what made it the first thing to fix rather than the
+//!    biggest row in the table.
 //! 2. **`INSERT … SELECT` costs 12% over a plain SELECT, not 100%.** The double
 //!    materialisation is real in the code, but `for srow in src` consumes the
 //!    source by value, so only the two SPINES are simultaneously full-length —
@@ -109,6 +116,25 @@
 //! 3. **mpedb already streams, twice, and both are flat.** `stream_query` at
 //!    61.8 KB over 160 k rows and `insert_streaming` at 4537 B over 64 MiB. The
 //!    gap is the row pipeline in between, not the idea.
+//!
+//! # What has changed since (re-run this probe to refresh)
+//!
+//! Finding 1 is fixed: the aggregate is a fold, so it no longer holds its input
+//! (`design/DESIGN-STREAM-EXEC.md` §5.1). The invariant is asserted in
+//! `tests/agg_stream_mem.rs` rather than left to this probe.
+//!
+//! ```text
+//!   shape        held@160k before   after      note
+//!   count             50822241      79526      639x, and 32% FASTER
+//!   agg_few           50826842      84110      604x
+//!   agg_many         167875378  117132646      1.43x — output is genuinely O(n)
+//! ```
+//!
+//! Three baseline rows are DELIBERATELY still true and are the next target
+//! (#125): `join_rows`, an aggregate over a join, and an aggregate under a
+//! correlated `FILTER` did not move at all. The fold streams, but it is still
+//! handed WIDE rows — nothing tells the join which columns anything downstream
+//! reads. That is a width problem, not a streaming one.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
