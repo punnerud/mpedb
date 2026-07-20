@@ -14,7 +14,9 @@
 //!     sqlite's lowest-rowid pick (differential, including out-of-rowid-order
 //!     inserts). Still REFUSED where mpedb cannot reproduce that pick without a
 //!     wrong answer: over a join, over a non-rowid (text/composite) primary key,
-//!     or with two-or-more min/max (sqlite's order-dependent last-min/max pick);
+//!     or with two-or-more min/max (sqlite's order-dependent last-min/max pick) —
+//!     EXCEPT when the last min/max is an unfiltered non-NULL-constant one, whose
+//!     pick is provably the lowest-rowid row (differential-tested below);
 //! (c) postgres mode: EVERY bare column is REJECTED (matching PostgreSQL, whose
 //!     rejection was verified by hand against PG 16 — `column … must appear in
 //!     the GROUP BY clause …`);
@@ -416,6 +418,59 @@ fn sqlite_mode_refuses_the_unreproducible_arbitrary_edges() {
         db.query("SELECT g, v, min(v) FROM tk GROUP BY g", &[]).is_ok(),
         "a single min/max over a non-rowid PK is still accepted (witness rule)"
     );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn sqlite_mode_two_minmax_with_const_last_follows_lowest_rowid() {
+    // The ≥2-min/max carve-out (slt_good_12.test:72600 shape): sqlite follows
+    // the LAST min/max, and one with a non-NULL CONSTANT argument "improves"
+    // only on the group's first row — so the pick is the LOWEST-ROWID row,
+    // which mpedb reproduces with the same min-PK witness as the 0-min/max
+    // case. Every accepted shape is verified against the bundled sqlite.
+    let (db, path) = open("mm-const-last", Some("sqlite"));
+    load(&db, DATA);
+    for q in [
+        // min-const and max-const last; includes the ties (g=10), the interior
+        // NULL (g=20) and the all-NULL group (g=30 — sqlite still takes the
+        // FIRST row here, not the all-NULL "last row" of the single-min rule).
+        "SELECT g, name, min(x), min(-52) FROM t GROUP BY g",
+        "SELECT g, name, min(x), max(99) FROM t GROUP BY g",
+        // Three min/max: only the LAST governs, the others may be arbitrary.
+        "SELECT g, name, min(x), max(x), min(-52) FROM t GROUP BY g",
+        // The corpus shape: both min/max live in HAVING, const one last.
+        "SELECT g, name FROM t GROUP BY g HAVING min(x) IS NULL OR min(-52) = -52",
+    ] {
+        assert_matches_sqlite(&db, q);
+    }
+    let (db2, path2) = open("mm-const-last-ooo", Some("sqlite"));
+    load(&db2, OOO);
+    assert_matches_sqlite_data(
+        &db2,
+        OOO,
+        "SELECT g, name, min(x), min(-52) FROM t GROUP BY g",
+    );
+    let _ = std::fs::remove_file(path2);
+    // Still refused — each of these breaks the "provably lowest-rowid" proof:
+    for q in [
+        // The const min/max is NOT last: sqlite follows min(x)'s extremum row.
+        "SELECT name, min(-52), min(x) FROM t GROUP BY g",
+        // A NULL constant never "improves", so sqlite drifts to the LAST row.
+        "SELECT name, min(x), max(NULL) FROM t GROUP BY g",
+        // A FILTER moves the pick to the first row the filter ACCEPTS.
+        "SELECT name, min(x), min(-52) FILTER (WHERE x > 3) FROM t GROUP BY g",
+        // ORDER BY references a min/max: sqlite builds its aggregate list as
+        // SELECT → ORDER BY → HAVING, so ITS last min/max is min(x) (probed on
+        // 3.45: the bare column follows the HAVING min/max, not the ORDER BY
+        // one) while mpedb lifts HAVING first — refused instead of guessing.
+        "SELECT g, name FROM t GROUP BY g HAVING min(x) < 100 ORDER BY min(-52)",
+    ] {
+        let err = db.query(q, &[]).unwrap_err().to_string();
+        assert!(
+            err.contains("must appear in GROUP BY"),
+            "should refuse `{q}`, got: {err}"
+        );
+    }
     let _ = std::fs::remove_file(path);
 }
 

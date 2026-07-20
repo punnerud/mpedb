@@ -453,14 +453,30 @@ pub(super) fn plan_aggregate_select(
     //    register in source order (`sum(x) FILTER (WHERE y)`).
     let mut aggs = Vec::with_capacity(agg_specs.len());
     let mut agg_types = Vec::with_capacity(agg_specs.len());
+    // Parallel to `agg_specs`: an UNFILTERED min()/max() whose argument folded
+    // to a non-NULL CONSTANT. Such an aggregate "improves" exactly once — on
+    // the group's first row — so when it is sqlite's designated (last) min/max
+    // it pins the bare-column witness to the lowest-rowid row (see
+    // `decide_bare_cols`).
+    let mut minmax_const = Vec::with_capacity(agg_specs.len());
     for (f, arg, distinct, filt) in &agg_specs {
+        let mut const_nonnull = false;
         let (arg_prog, ty, distinct) = match arg {
             None => (None, Some(ColumnType::Int64), false),
             Some(a) => {
                 let (b, ty) = binder.bind_expr(a)?;
+                const_nonnull = matches!(&b, BExpr::Const(v) if !v.is_null());
                 (Some(compile_program(&b)?), ty, *distinct)
             }
         };
+        minmax_const.push(
+            const_nonnull
+                && filt.is_none()
+                && matches!(
+                    f.native(),
+                    Some(mpedb_types::AggFn::Min | mpedb_types::AggFn::Max)
+                ),
+        );
         let filter = match filt {
             Some(fe) => {
                 let b = binder.bind_predicate(fe)?;
@@ -523,7 +539,9 @@ pub(super) fn plan_aggregate_select(
     //   (b) otherwise sqlite's "arbitrary" pick is really the group's LOWEST-ROWID
     //       row (verified vs sqlite 3.45), which the executor reproduces by
     //       tracking the minimum PK per group — but ONLY where mpedb's row
-    //       identity IS that rowid (`rowid_pick_ok`).
+    //       identity IS that rowid (`rowid_pick_ok`). With ≥2 min()/max() this
+    //       same pick applies when sqlite's designated LAST min/max is an
+    //       unfiltered non-NULL-constant one (see the carve-out below).
     // Anything else is refused rather than risk a value that differs from sqlite
     // (the core never-a-wrong-answer guarantee). `grouped_order` names the ORDER
     // BY slots ONLY when they index the grouped tuple (`OrderOver::Grouped`);
@@ -541,9 +559,14 @@ pub(super) fn plan_aggregate_select(
             && t.columns.get(t.primary_key[0] as usize).map(|c| c.ty) == Some(ColumnType::Int64)
     };
     let k_aggs = (group_by.len() + agg_specs.len()) as u16;
+    let n_keys = group_by.len();
+    // `order_refs`: every grouped-tuple slot the ORDER BY reads (key slots via
+    // `OrderOver::Grouped`, or the PushCols of its junk projection columns).
+    // Only the ≥2-min/max carve-out reads it — see there.
     let decide_bare_cols = |projection: &[Projection],
                             having: &Option<ExprProgram>,
-                            grouped_order: &[u16]|
+                            grouped_order: &[u16],
+                            order_refs: &[u16]|
      -> Result<Vec<u16>> {
         if bare.is_empty() {
             return Ok(Vec::new());
@@ -582,18 +605,41 @@ pub(super) fn plan_aggregate_select(
         //        per-group min-PK witness, EXACTLY when mpedb reads rows from that
         //        rowid — `rowid_pick_ok` (single INTEGER-PK table, no join).
         //   ≥2 → sqlite takes the LAST min()/max()'s witness row, an order-
-        //        dependent pick its own docs call "arbitrary" — refuse it rather
-        //        than reproduce version-fragile behavior (never a wrong answer).
-        let n_minmax = agg_specs
+        //        dependent pick its own docs call "arbitrary" — refused, with
+        //        ONE carve-out. When that designated last min/max has a
+        //        non-NULL CONSTANT argument and no FILTER, it "improves"
+        //        exactly once — on the group's first row — so sqlite's pick IS
+        //        the lowest-rowid row (probed on 3.45: `min(a), min(-52)`
+        //        follows min(-52) to the first row; an index scan, a third
+        //        min/max, or the const living in HAVING change nothing). That
+        //        is the same witness the 0-min/max case reproduces, under the
+        //        same `rowid_pick_ok` gate. One caveat: sqlite builds its
+        //        aggregate list as SELECT list → ORDER BY → HAVING, while the
+        //        lift above runs SELECT list → HAVING → ORDER BY, so "last"
+        //        agrees between the two only while ORDER BY references no
+        //        min/max at all (`order_refs`) — refuse that overlap instead
+        //        of reconstructing sqlite's order.
+        let minmax_ix: Vec<usize> = agg_specs
             .iter()
-            .filter(|(f, _, _, _)| {
+            .enumerate()
+            .filter(|(_, (f, _, _, _))| {
                 matches!(f.native(), Some(mpedb_types::AggFn::Min | mpedb_types::AggFn::Max))
             })
-            .count();
+            .map(|(i, _)| i)
+            .collect();
+        let n_minmax = minmax_ix.len();
         let reproducible = match n_minmax {
             1 => true,
             0 => rowid_pick_ok,
-            _ => false,
+            _ => {
+                rowid_pick_ok
+                    && minmax_const[*minmax_ix.last().expect("n_minmax >= 2")]
+                    && !order_refs.iter().any(|&s| {
+                        (s as usize) >= n_keys
+                            && s < k_aggs
+                            && minmax_ix.contains(&(s as usize - n_keys))
+                    })
+            }
         };
         if !reproducible {
             let reason = if n_minmax == 0 {
@@ -624,8 +670,10 @@ pub(super) fn plan_aggregate_select(
     //    as the plain path does for `ORDER BY amt + 1`.
     if s.distinct {
         // DISTINCT sorts over the PROJECTION, so no ORDER BY key indexes the
-        // grouped tuple directly (`grouped_order` is empty).
-        let bare_cols = decide_bare_cols(&projection, &having, &[])?;
+        // grouped tuple directly (`grouped_order` is empty), and every ORDER BY
+        // key must repeat a select item — an aggregate it names dedups into its
+        // SELECT-list slot, so no `order_refs` divergence can arise either.
+        let bare_cols = decide_bare_cols(&projection, &having, &[], &[])?;
         let (order_by, _) = distinct_order_by(s, base_scope, None)?;
         let (param_types, context_keys, list_keys) = binder.into_parts();
         return Ok((
@@ -714,7 +762,30 @@ pub(super) fn plan_aggregate_select(
     } else {
         Vec::new()
     };
-    let bare_cols = decide_bare_cols(&projection, &having, &grouped_order)?;
+    // For the ≥2-min/max carve-out: every grouped-tuple slot ORDER BY reads.
+    // Grouped keys index the tuple directly; a projection sort reads it only
+    // through the junk columns appended above (an ordinal or repeated-item key
+    // reuses a SELECT-list slot, which sqlite's aggregate list also scans
+    // first, so no order divergence can come from those).
+    let order_refs: Vec<u16> = if order_over == OrderOver::Grouped {
+        grouped_order.clone()
+    } else {
+        projection[projection.len() - order_junk as usize..]
+            .iter()
+            .flat_map(|p| match p {
+                Projection::Column(c) => vec![*c],
+                Projection::Expr { program, .. } => program
+                    .instrs
+                    .iter()
+                    .filter_map(|i| match i {
+                        Instr::PushCol(c) => Some(*c),
+                        _ => None,
+                    })
+                    .collect(),
+            })
+            .collect()
+    };
+    let bare_cols = decide_bare_cols(&projection, &having, &grouped_order, &order_refs)?;
 
     let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
