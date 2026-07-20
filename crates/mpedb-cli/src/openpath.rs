@@ -698,11 +698,16 @@ impl OverlaySession {
         use std::cell::RefCell;
         use std::rc::Rc;
 
-        const DOTS: &[&str] = &[".checkpoint", ".reconcile", ".quit", ".exit"];
+        const DOTS: &[&str] =
+            &[".tables", ".schema", ".checkpoint", ".reconcile", ".help", ".quit", ".exit"];
         let names = Rc::new(RefCell::new(Names::new(DOTS)));
-        let mut input = LineSource::new("mpedb(ovl)> ", names.clone());
+        let mut input = LineSource::new("mpedb> ", names.clone());
         if input.prompts() {
             self.refresh_names(&names);
+            println!(
+                "mpedb {} (sqlite overlay) — .help for commands, .quit to exit",
+                env!("CARGO_PKG_VERSION")
+            );
         }
         while let Some(line) = input.next_line() {
             let line = line?;
@@ -712,6 +717,57 @@ impl OverlaySession {
             }
             if stmt == ".quit" || stmt == ".exit" {
                 break;
+            }
+            if stmt == ".help" {
+                println!(
+                    "SQL statements run against the merged view (base + overlay deltas).\n\
+                     .tables            table names + merged row counts\n\
+                     .schema            the attached schema as config TOML\n\
+                     .checkpoint        push overlay deltas into the base, empty the overlay\n\
+                     .reconcile ours|theirs  resolve a diverged base\n\
+                     .help              this list\n\
+                     .quit / .exit      leave"
+                );
+                continue;
+            }
+            if stmt == ".tables" {
+                match self.handle() {
+                    Ok(h) => {
+                        let tables: Vec<String> =
+                            h.schema().tables.iter().map(|t| t.name.clone()).collect();
+                        for name in tables {
+                            let quoted = name.replace('"', "\"\"");
+                            let count = match self
+                                .handle()
+                                .map_err(Failure::from)
+                                .and_then(|h| {
+                                    h.query(&format!("SELECT count(*) FROM \"{quoted}\""), &[])
+                                        .map_err(Failure::from)
+                                }) {
+                                Ok(mpedb::ExecResult::Rows { rows, .. }) => rows
+                                    .first()
+                                    .and_then(|r| r.first())
+                                    .map(|v| format!("{v:?}"))
+                                    .unwrap_or_default(),
+                                _ => "?".into(),
+                            };
+                            let count = count
+                                .trim_start_matches("Int(")
+                                .trim_end_matches(')')
+                                .to_string();
+                            println!("{name}  {count}");
+                        }
+                    }
+                    Err(e) => eprintln!("error: {}", failure_msg(&e)),
+                }
+                continue;
+            }
+            if stmt == ".schema" {
+                match self.handle() {
+                    Ok(h) => print!("{}", crate::render::schema_toml(h.schema())),
+                    Err(e) => eprintln!("error: {}", failure_msg(&e)),
+                }
+                continue;
             }
             if stmt == ".checkpoint" {
                 match self.handle().and_then(|h| h.checkpoint().map_err(Failure::from)) {
@@ -745,7 +801,7 @@ impl OverlaySession {
             // not fall through to `exec`, which would create a pending database
             // for something that is not a statement at all.
             if stmt.starts_with('.') {
-                eprintln!("error: unknown command {stmt} (try .checkpoint .reconcile .quit)");
+                eprintln!("error: unknown command {stmt} (.help lists commands)");
                 continue;
             }
             if let Err(e) = self.exec(stmt, &[]) {
