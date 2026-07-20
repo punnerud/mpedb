@@ -272,15 +272,94 @@ fn subquery_in_compound_arms_matches_sqlite() {
     ] {
         assert_eq!(mpedb_rows(&d, q), sqlite_rows(&with_views(q)), "mismatch on `{q}`");
     }
-    // A CORRELATED subquery in an arm stays refused (the arm executor has no
-    // per-row fill phase) — a clean error, never an unfilled-hole answer.
-    assert!(d
-        .query(
-            "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.b = t.a) \
-             UNION SELECT id FROM u",
-            &[]
-        )
-        .is_err());
+    d.verify().unwrap();
+}
+
+/// CORRELATED subqueries inside compound ARMS (format 56). The arm OWNS the
+/// lift, so it is filled per ARM row by the same `exec_select_leveled`
+/// discipline the top level and a derived body use — the arm's row is the only
+/// row such a correlation can name, which is why hoisting it onto the statement
+/// could never work. Every shape is matched against the bundled sqlite.
+#[test]
+fn correlated_subquery_in_compound_arms_matches_sqlite() {
+    let d = db();
+    let queries = [
+        // The canonical shape: a correlated EXISTS in one arm.
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.b = t.a) \
+         UNION SELECT id FROM u ORDER BY 1",
+        // NOT EXISTS — the negated 3VL side.
+        "SELECT id FROM t WHERE NOT EXISTS (SELECT 1 FROM u WHERE u.b = t.a) \
+         UNION ALL SELECT id FROM u WHERE b IS NULL ORDER BY 1",
+        // BOTH arms correlated: each numbers its own reserved slots after the
+        // preceding arm's, and each fills only its own.
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.b = t.a) \
+         UNION SELECT id FROM u WHERE EXISTS (SELECT 1 FROM t WHERE t.a = u.b) ORDER BY 1",
+        // A correlated SCALAR subquery in the projection of an arm. Two output
+        // columns so a NULL row still renders as a non-empty line in both arms.
+        "SELECT id, (SELECT max(b) FROM u WHERE u.b = t.a) FROM t \
+         UNION SELECT id, b FROM u ORDER BY 1, 2",
+        // A correlated IN, and an uncorrelated one in the other arm (mixed
+        // fill phases in one statement).
+        "SELECT id FROM t WHERE a IN (SELECT b FROM u WHERE u.id = t.id) \
+         UNION ALL SELECT id FROM u WHERE b IN (SELECT a FROM t) ORDER BY 1",
+        // EXCEPT / INTERSECT over a correlated arm.
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.b = t.a) \
+         EXCEPT SELECT id FROM u WHERE b = 20 ORDER BY 1",
+        "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.b = t.a) \
+         INTERSECT SELECT id FROM u ORDER BY 1",
+        // An AGGREGATE arm over a correlated filter (the per-row fill runs
+        // between the gather and the grouping).
+        "SELECT count(*) FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.b = t.a) \
+         UNION ALL SELECT count(*) FROM u ORDER BY 1",
+    ];
+    for q in queries {
+        assert_eq!(mpedb_rows(&d, q), sqlite_rows(q), "mismatch on `{q}`");
+    }
+    d.verify().unwrap();
+}
+
+/// A compound SUBQUERY BODY whose arms reference the ENCLOSING row (format 56).
+/// The correlation region belongs to the SUBPLAN — filled once per outer row
+/// before the compound runs — so every arm reads it as an ordinary parameter.
+/// This is the `no table named V0 in this statement` refusal, closed.
+#[test]
+fn correlated_compound_subquery_body_matches_sqlite() {
+    let d = db();
+    let queries = [
+        // EXISTS over a correlated compound: both arms name the outer row.
+        "SELECT id FROM t \
+         WHERE EXISTS (SELECT 1 FROM u WHERE u.b = t.a UNION SELECT 1 FROM u WHERE u.id = t.id) \
+         ORDER BY id",
+        // Only ONE arm correlates; the other is a constant.
+        "SELECT id FROM t \
+         WHERE EXISTS (SELECT b FROM u WHERE u.b = t.a UNION SELECT 999) ORDER BY id",
+        // INTERSECT: the outer row must be in both arms.
+        "SELECT id FROM t \
+         WHERE EXISTS (SELECT u.b FROM u WHERE u.b = t.a INTERSECT SELECT a FROM t) ORDER BY id",
+        // EXCEPT under NOT EXISTS.
+        "SELECT id FROM t \
+         WHERE NOT EXISTS (SELECT u.b FROM u WHERE u.b = t.a EXCEPT SELECT 20) ORDER BY id",
+        // A correlated IN whose membership list is a compound.
+        "SELECT id FROM t \
+         WHERE a IN (SELECT b FROM u WHERE u.id = t.id UNION SELECT a FROM t WHERE a = 40) \
+         ORDER BY id",
+        // A correlated SCALAR compound (LIMIT 1 makes it single-valued).
+        "SELECT id, (SELECT b FROM u WHERE u.b = t.a UNION SELECT 0 ORDER BY 1 DESC LIMIT 1) \
+         FROM t ORDER BY id",
+        // The SAME outer column named by both arms — one shared correlation
+        // slot, by the arg dedup.
+        "SELECT id FROM t \
+         WHERE EXISTS (SELECT 1 FROM u WHERE u.b = t.a UNION ALL SELECT 1 FROM u WHERE u.b = t.a + 10) \
+         ORDER BY id",
+        // A compound subquery body NESTED inside a plain-select subquery, whose
+        // arms reach OUT to the outermost row (a transit correlation).
+        "SELECT id FROM t WHERE EXISTS (\
+           SELECT 1 FROM u WHERE EXISTS (SELECT 1 FROM u u2 WHERE u2.b = t.a UNION SELECT 1 FROM t WHERE t.id = u.id)\
+         ) ORDER BY id",
+    ];
+    for q in queries {
+        assert_eq!(mpedb_rows(&d, q), sqlite_rows(q), "mismatch on `{q}`");
+    }
     d.verify().unwrap();
 }
 
@@ -291,15 +370,19 @@ fn subquery_in_compound_arms_matches_sqlite() {
 #[test]
 fn compound_subquery_refusals() {
     let d = db();
-    // A subquery inside a compound SUBQUERY BODY is refused (only a top-level
-    // compound coordinates arm slots).
-    assert!(d
-        .query(
-            "SELECT id FROM t WHERE a IN \
-             (SELECT a FROM t WHERE a IN (SELECT b FROM u) UNION SELECT b FROM u)",
-            &[]
-        )
-        .is_err());
+    // A subquery inside a compound SUBQUERY BODY used to be refused (the arms'
+    // slots would have collided with the outer lift's). The arms now OWN their
+    // lifts and number them after this subplan's correlation region, so it
+    // answers — matched against sqlite.
+    for q in [
+        "SELECT id FROM t WHERE a IN \
+         (SELECT a FROM t WHERE a IN (SELECT b FROM u) UNION SELECT b FROM u) ORDER BY id",
+        "SELECT id FROM t WHERE EXISTS \
+         (SELECT 1 FROM u WHERE u.b = t.a AND u.b IN (SELECT a FROM t) \
+          UNION SELECT 1 FROM u WHERE u.id = (SELECT max(id) FROM t)) ORDER BY id",
+    ] {
+        assert_eq!(mpedb_rows(&d, q), sqlite_rows(q), "mismatch on `{q}`");
+    }
     // A scalar compound projecting two columns is refused.
     assert!(d
         .query("SELECT (SELECT id, a FROM t UNION SELECT id, b FROM u LIMIT 1)", &[])
@@ -332,15 +415,15 @@ fn compound_subquery_refusals() {
     assert!(d
         .query("SELECT * FROM (SELECT a FROM t WHERE a > 15) x ORDER BY a", &[])
         .is_ok());
-    // A CORRELATED compound subquery (an arm references the outer row) is not
-    // supported yet — a compound body is planned standalone, so an outer column
-    // is simply unknown inside the arm. It must be a clean error, never a wrong
-    // answer or a panic. (sqlite would correlate it; a "not supported" gap.)
-    assert!(d
-        .query(
-            "SELECT id FROM t WHERE EXISTS \
-             (SELECT 1 FROM u WHERE u.b = t.a UNION SELECT 1 FROM u WHERE u.b > 100)",
-            &[]
-        )
-        .is_err());
+    // A CORRELATED compound subquery (an arm references the outer row) is
+    // ANSWERED as of format 56 — see `correlated_compound_subquery_body_*`.
+    // What stays refused here is `current_setting()` inside one: its reserved
+    // slot would have to be reconciled across the arms AND the correlation
+    // region, which this stage does not do.
+    {
+        let q = "SELECT id FROM t WHERE EXISTS \
+                 (SELECT 1 FROM u WHERE u.b = t.a UNION SELECT 1 FROM u WHERE u.b > 100) \
+                 ORDER BY id";
+        assert_eq!(mpedb_rows(&d, q), sqlite_rows(q));
+    }
 }

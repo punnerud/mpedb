@@ -138,8 +138,8 @@ pub(super) fn exec_derived(
                 _ => return Err(internal("derived-table body produced no row set")),
             }
         }
-        // A compound body carries no lifts (planner refuses, validate
-        // re-refuses), so it runs exactly as before.
+        // A compound body's lifts belong to its ARMS (format 56);
+        // `exec_compound` fills them per arm, so nothing is left to do here.
         mpedb_sql::SubBody::Compound(c) => {
             match exec_compound(&mut *ctx, schema, plan, params, c)? {
                 ExecResult::Rows { rows, .. } => rows,

@@ -8,15 +8,26 @@ impl CompiledPlan {
     /// otherwise well-formed blob is rejected).
     pub(crate) fn validate(&self, schema: &Schema) -> Result<()> {
         let ptypes = &self.param_types;
+        // ONE tree budget for the whole plan — statement-level lifts, a derived
+        // body's owned lifts and every compound arm's owned lifts draw from it,
+        // exactly as the decoder does, so ownership can never buy a bigger
+        // forest than the flat format allowed.
+        let mut budget = MAX_SUBPLANS;
         match &self.stmt {
             PlanStmt::Select(sp) => self.validate_select(sp, schema, ptypes)?,
-            PlanStmt::Compound(c) => self.validate_compound(c, schema, ptypes)?,
+            PlanStmt::Compound(c) => self.validate_compound(
+                c,
+                schema,
+                ptypes,
+                self.n_user_params() as usize,
+                &mut budget,
+            )?,
             PlanStmt::RecursiveCte(rc) => self.validate_recursive_cte(rc, schema, ptypes)?,
-            PlanStmt::Derived(dp) => self.validate_derived(dp, schema, ptypes)?,
+            PlanStmt::Derived(dp) => self.validate_derived(dp, schema, ptypes, &mut budget)?,
             _other => self.validate_rest(schema)?,
         }
         if !self.subplans.is_empty() {
-            self.validate_subplans(schema)?;
+            self.validate_subplans(schema, &mut budget)?;
         } else if let PlanStmt::Select(sp) = &self.stmt {
             if sp.post_filter.is_some() {
                 return Err(corrupt("post-filter without subplans"));
@@ -38,11 +49,19 @@ impl CompiledPlan {
     /// compound ORDER BY names an output column. Shared between a top-level
     /// compound statement and a compound subquery body (format 31), so the two
     /// can never drift.
+    ///
+    /// `level_base` is where THIS compound's parameter level ends and its arms'
+    /// OWNED reserved slots begin (format 56) — the statement's user-param count
+    /// at the top, `sub_base` inside a lifted subquery, `body_sub_base` inside a
+    /// derived table. Pinning it here is what stops a forged `arm_sub_base` from
+    /// pointing the arms' fill at live user slots.
     fn validate_compound(
         &self,
         c: &CompoundPlan,
         schema: &Schema,
         ptypes: &[Option<ColumnType>],
+        level_base: usize,
+        budget: &mut usize,
     ) -> Result<()> {
         if !(2..=MAX_COMPOUND_ARMS).contains(&c.arms.len()) {
             return Err(corrupt("compound arm count out of range"));
@@ -50,8 +69,44 @@ impl CompiledPlan {
         if c.ops.len() != c.arms.len() - 1 {
             return Err(corrupt("compound op count does not match arm count"));
         }
+        // The arms' OWNED lifts (format 56). Either no list at all, or exactly
+        // one per arm, based where this level's parameters end.
+        if !c.arm_subplans.is_empty() && c.arm_subplans.len() != c.arms.len() {
+            return Err(corrupt("compound arm-subplan list count does not match arm count"));
+        }
+        if c.arm_sub_base as usize != level_base {
+            return Err(corrupt("compound arm-subplan base does not match its parameter level"));
+        }
+        if level_base > ptypes.len() {
+            return Err(corrupt("compound arm-subplan base out of range"));
+        }
+        // The arms' parameter space: this level's, then one slot per arm lift in
+        // layout order, typed by the lift's own declared `slot_type` (so a lift
+        // used as a key part still type-checks, and a forged `param_types` entry
+        // cannot re-type a reserved slot).
+        let mut types: Vec<Option<ColumnType>> = ptypes.to_vec();
+        if !c.arm_subplans.is_empty() {
+            types.truncate(level_base);
+            for arm in &c.arm_subplans {
+                if arm.len() > MAX_SUBPLANS {
+                    return Err(corrupt("too many subplans in one compound arm"));
+                }
+                for s in arm {
+                    types.push(s.slot_type);
+                }
+            }
+        }
+        // The gather-side slot discipline runs over the WHOLE arm-lift region
+        // for EVERY arm, not just over the arm's own slice: a correlated slot of
+        // ANY arm is an unfilled hole while another arm gathers, so reading one
+        // across arms is exactly as illegal as reading one's own.
+        let all_correlated: Vec<bool> = c
+            .arm_subplans
+            .iter()
+            .flat_map(|a| a.iter().map(|s| !s.outer_args.is_empty()))
+            .collect();
         let arity = c.arms[0].projection.len();
-        for arm in &c.arms {
+        for (k, arm) in c.arms.iter().enumerate() {
             // The compound owns ORDER BY/LIMIT — SQL cannot express them per arm,
             // so an arm carrying its own is forged. And with no junk,
             // `projection.len()` IS the output arity, which the set ops and the
@@ -63,16 +118,34 @@ impl CompiledPlan {
             {
                 return Err(corrupt("compound arm carries its own ORDER BY/LIMIT"));
             }
-            // Arms run through the plain executor, which never fills correlated
-            // slots — a post-filter there would be silently ignored, so its
-            // presence is forgery.
-            if arm.post_filter.is_some() {
+            // A `post_filter` is applied only on the per-row path, which an arm
+            // takes only when it OWNS a correlated lift — the same rule the
+            // subplan level follows. Without one it would be silently ignored,
+            // so its presence is forgery.
+            let lifts = c.arm_lifts(k);
+            if arm.post_filter.is_some() && !lifts.iter().any(|s| !s.outer_args.is_empty()) {
                 return Err(corrupt("compound arm carries a post-filter"));
             }
             if arm.projection.len() != arity {
                 return Err(corrupt("compound arms disagree on output arity"));
             }
-            self.validate_select(arm, schema, ptypes)?;
+            self.validate_select(arm, schema, &types)?;
+            self.check_correlated_slots(arm, level_base, &all_correlated)?;
+        }
+        // Each arm's lifts, against the ARM's row and the ARM's reserved base —
+        // the same recursion, and the same shared helpers, the statement level
+        // and the derived body use.
+        for (k, lifts) in c.arm_subplans.iter().enumerate() {
+            let base_k = c.arm_base(k) as usize;
+            let arm = c
+                .arms
+                .get(k)
+                .ok_or_else(|| corrupt("compound arm-subplan list longer than the arms"))?;
+            let arm_outer = self.select_row_types(arm, schema)?;
+            let arm_ptypes = &types[..base_k.min(types.len())];
+            for s in lifts {
+                self.validate_subplan_rec(schema, s, arm_ptypes, &arm_outer, budget)?;
+            }
         }
         for (i, _, _) in &c.order_by {
             if *i as usize >= arity {
@@ -167,6 +240,7 @@ impl CompiledPlan {
         dp: &DerivedPlan,
         schema: &Schema,
         ptypes: &[Option<ColumnType>],
+        budget: &mut usize,
     ) -> Result<()> {
         // How many times a select's FROM/JOIN operands name the working table.
         let reads_cte = |sp: &SelectPlan| -> usize {
@@ -192,9 +266,18 @@ impl CompiledPlan {
             SubBody::Select(sp) => std::slice::from_ref(sp),
             SubBody::Compound(c) => &c.arms,
         };
-        for sp in body_arms.iter().chain(std::iter::once(&dp.outer)) {
-            if sp.post_filter.is_some() {
-                return Err(corrupt("derived-table component carries a post-filter"));
+        // The OUTER never has a per-row fill phase (it scans a materialised
+        // set), so a post-filter there is forgery. A SELECT body's is governed
+        // by `validate_body_subplans`; a COMPOUND body's arms by
+        // `validate_compound`, which allows one exactly where the arm owns a
+        // correlated lift.
+        if dp.outer.post_filter.is_some() {
+            return Err(corrupt("derived-table outer carries a post-filter"));
+        }
+        if let SubBody::Select(sp) = &dp.body {
+            if sp.post_filter.is_some() && !dp.body_subplans.iter().any(|s| !s.outer_args.is_empty())
+            {
+                return Err(corrupt("derived-table body carries a post-filter"));
             }
         }
         // The body cannot reference the working table it DEFINES.
@@ -213,10 +296,19 @@ impl CompiledPlan {
         // FullScan-only rule for it is enforced there.
         match &dp.body {
             SubBody::Select(sp) => self.validate_select(sp, schema, ptypes)?,
-            SubBody::Compound(c) => self.validate_compound(c, schema, ptypes)?,
+            // A COMPOUND body owns its lifts one level further down, per ARM
+            // (format 56); its reserved region starts where the body's own
+            // would have.
+            SubBody::Compound(c) => self.validate_compound(
+                c,
+                schema,
+                ptypes,
+                dp.body_sub_base as usize,
+                budget,
+            )?,
         }
         self.validate_select(&dp.outer, schema, ptypes)?;
-        self.validate_body_subplans(dp, schema)?;
+        self.validate_body_subplans(dp, schema, budget)?;
         Ok(())
     }
 
@@ -228,36 +320,40 @@ impl CompiledPlan {
     /// Everything the two levels share is shared as CODE
     /// (`check_slot_discipline`, `validate_subplan_rec`), so a hand-crafted
     /// blob cannot get a weaker check by putting its lifts on the body.
-    fn validate_body_subplans(&self, dp: &DerivedPlan, schema: &Schema) -> Result<()> {
+    fn validate_body_subplans(
+        &self,
+        dp: &DerivedPlan,
+        schema: &Schema,
+        budget: &mut usize,
+    ) -> Result<()> {
+        // Reserved slots the body owns: its own lifts, or — for a compound body
+        // — its arms' (format 56, checked by `validate_compound`).
+        let arm_slots = match &dp.body {
+            SubBody::Compound(c) => c.n_arm_slots() as usize,
+            SubBody::Select(_) => 0,
+        };
+        let base = dp.body_sub_base as usize;
+        if base + dp.body_subplans.len() + arm_slots != self.n_params as usize {
+            return Err(corrupt(
+                "derived-table body subplan slots do not fill the reserved parameter region",
+            ));
+        }
         if dp.body_subplans.is_empty() {
-            // Nothing to check — but the base must still be inside the
-            // parameter space, so a forged base on an empty list cannot become
-            // meaningful if the list is later extended.
-            if dp.body_sub_base > self.n_params {
-                return Err(corrupt("derived-table body subplan base out of range"));
-            }
             return Ok(());
         }
         // Only a plain SELECT body has the per-row fill phase a correlated lift
-        // needs; a compound body is executed as a unit (the same rule a
-        // compound subquery body follows).
+        // needs; a compound body's lifts belong to its ARMS, never to the body.
         let body = dp.body.as_select().ok_or_else(|| {
             corrupt("derived-table subplans on a compound body")
         })?;
         if dp.body_subplans.len() > MAX_SUBPLANS {
             return Err(corrupt("too many derived-table body subplans"));
         }
-        // `[user ‖ body subplans]`, with nothing after: the reserved region
-        // must fit, and the context region must be empty (a derived table
-        // refuses `current_setting()` and `'now'` in both components).
-        let base = dp.body_sub_base as usize;
+        // `[user ‖ body subplans]`, with nothing after: the context region must
+        // be empty (a derived table refuses `current_setting()` and `'now'` in
+        // both components).
         if !self.context_keys.is_empty() {
             return Err(corrupt("derived-table statement with reserved context slots"));
-        }
-        if base + dp.body_subplans.len() != self.n_params as usize {
-            return Err(corrupt(
-                "derived-table body subplan slots do not fill the reserved parameter region",
-            ));
         }
         // The OUTER row a body lift correlates to is the BODY's base row —
         // `[table0 ‖ … ‖ tableN]` — NOT the outer statement's materialised
@@ -266,9 +362,8 @@ impl CompiledPlan {
         let outer_types = self.select_row_types(body, schema)?;
         self.check_slot_discipline(body, base, &dp.body_subplans)?;
         let user_ptypes = &self.param_types[..base];
-        let mut budget = MAX_SUBPLANS;
         for s in &dp.body_subplans {
-            self.validate_subplan_rec(schema, s, user_ptypes, &outer_types, &mut budget)?;
+            self.validate_subplan_rec(schema, s, user_ptypes, &outer_types, budget)?;
         }
         Ok(())
     }
@@ -873,7 +968,7 @@ impl CompiledPlan {
     /// filter, join on/policy, joined_filter, aggregate args/HAVING) reading
     /// it would read an unfilled hole. Uncorrelated slots are filled once
     /// before access resolution and are legal everywhere.
-    fn validate_subplans(&self, schema: &Schema) -> Result<()> {
+    fn validate_subplans(&self, schema: &Schema, budget: &mut usize) -> Result<()> {
         // A SELECT owns an outer ROW that a subplan may correlate to. An
         // UPDATE/DELETE (#97) does not: `exec_stmt_impl` fills its reserved
         // slots ONCE before dispatch and the write path has no per-row fill
@@ -892,15 +987,12 @@ impl CompiledPlan {
                 }
                 None
             }
-            // A compound's arm subplans are UNCORRELATED (the arm executor has
-            // no per-row fill phase), filled once before dispatch — same shape
-            // as a write statement's. The slot discipline is then vacuous: no
-            // correlated slot exists to leak into a gather-side program.
+            // A compound's lifts belong to its ARMS (format 56), not to the
+            // statement: the statement-level fill happens once, before dispatch,
+            // against an outer row a compound does not have. The list must
+            // therefore be EMPTY — exactly the rule a derived plan follows.
             PlanStmt::Compound(_) => {
-                if self.subplans.iter().any(|s| !s.outer_args.is_empty()) {
-                    return Err(corrupt("correlated subplan on a compound SELECT"));
-                }
-                None
+                return Err(corrupt("compound statement with statement-level subplans"));
             }
             _ => return Err(corrupt("subplans on a non-SELECT statement")),
         };
@@ -944,9 +1036,8 @@ impl CompiledPlan {
         // validated against ITS level's parameter space and outer row. The
         // budget bounds the whole tree at `MAX_SUBPLANS`, matching the decoder.
         let user_ptypes = &self.param_types[..sub_base];
-        let mut budget = MAX_SUBPLANS;
         for s in &self.subplans {
-            self.validate_subplan_rec(schema, s, user_ptypes, &outer_types, &mut budget)?;
+            self.validate_subplan_rec(schema, s, user_ptypes, &outer_types, budget)?;
         }
         Ok(())
     }
@@ -986,7 +1077,21 @@ impl CompiledPlan {
         subplans: &[SubPlan],
     ) -> Result<()> {
         let correlated: Vec<bool> = subplans.iter().map(|s| !s.outer_args.is_empty()).collect();
-        let n = subplans.len();
+        self.check_correlated_slots(sp, base, &correlated)
+    }
+
+    /// The same rule, expressed over the correlation FLAGS of a contiguous
+    /// reserved region rather than over one owner's list — so a compound can
+    /// check every arm against the WHOLE arm-lift region (a slot owned by
+    /// another arm is just as unfilled). The single implementation both entry
+    /// points share: no level can get a weaker check by owning its lifts.
+    fn check_correlated_slots(
+        &self,
+        sp: &SelectPlan,
+        base: usize,
+        correlated: &[bool],
+    ) -> Result<()> {
+        let n = correlated.len();
         let gather_ok = |p: &ExprProgram| -> Result<()> {
             for i in &p.instrs {
                 if let Instr::PushParam(pi) | Instr::InParam(pi) = *i {
@@ -1140,13 +1245,16 @@ impl CompiledPlan {
             // refused. A forged one with correlation args or children would let a
             // gather-side slot discipline go unchecked, so refuse both.
             SubBody::Compound(c) => {
-                if !s.outer_args.is_empty() {
-                    return Err(corrupt("correlated compound subplan"));
-                }
+                // A compound body's lifts belong to its ARMS (format 56), never
+                // to this subplan: `SubPlan::subplans` are filled per row of a
+                // SELECT body, and a compound has no such phase. Correlation,
+                // on the other hand, IS this subplan's: the region is filled
+                // once per outer row BEFORE the compound runs, so every arm
+                // reads it as an ordinary parameter.
                 if !s.subplans.is_empty() {
                     return Err(corrupt("compound subplan with nested lifts"));
                 }
-                self.validate_compound(c, schema, &inner_types)?;
+                self.validate_compound(c, schema, &inner_types, s.sub_base as usize, budget)?;
             }
             SubBody::Select(sp) => {
                 // A `post_filter` is applied per row only when this subplan HAS

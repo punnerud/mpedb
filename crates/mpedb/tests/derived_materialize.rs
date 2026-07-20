@@ -420,18 +420,18 @@ fn refusals_and_error_parity() {
     check(&d, "SELECT * FROM (SELECT a FROM t GROUP BY a) d JOIN d ON 1");
     // A subquery inside the body used to be a stage-1 refusal; the body now
     // OWNS its lifts (format 52, §5.5), so this ANSWERS and is diffed above in
-    // `body_owned_subplans_match_sqlite`. What is still refused is a lift in a
-    // COMPOUND body — its arms execute as a unit, with no per-row fill phase.
-    let e = d
-        .query(
-            "SELECT count(*) FROM (SELECT a FROM t WHERE a IN (SELECT b FROM u) \
-             UNION SELECT id FROM u) sub",
-            &[],
-        )
-        .unwrap_err();
-    assert!(
-        e.to_string().contains("compound derived-table body"),
-        "unexpected refusal text: {e}"
+    // `body_owned_subplans_match_sqlite`. A lift in a COMPOUND body was refused
+    // one stage longer — until the ARMS owned theirs (format 56, §5.6). Both
+    // answer now, and are diffed against sqlite.
+    check(
+        &d,
+        "SELECT count(*) FROM (SELECT a FROM t WHERE a IN (SELECT b FROM u) \
+         UNION SELECT id FROM u) sub",
+    );
+    check(
+        &d,
+        "SELECT count(*) FROM (SELECT a FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.b = t.a) \
+         UNION ALL SELECT id FROM u WHERE b IS NULL) sub",
     );
     // A subquery in the outer statement.
     let e = d
@@ -468,6 +468,25 @@ fn refusals_and_error_parity() {
         e.to_string().contains("outermost FROM"),
         "unexpected refusal text: {e}"
     );
+    // …and the same nested derived table in a select that ALSO lifts a
+    // subquery. The refusal used to be placed AFTER the lift, and the lift
+    // rebuilds the statement without a `from_derived` — so the FROM source was
+    // silently DROPPED and the select fell through to the FROM-less DUAL path,
+    // answering ONE synthetic row where sqlite answers the body's rows. A
+    // refusal is the only honest outcome until the nested position is
+    // supported.
+    for q in [
+        "SELECT 1 FROM (SELECT a FROM t GROUP BY a) x WHERE 1 IN (SELECT b FROM u) \
+         UNION ALL SELECT 2",
+        "SELECT id FROM t WHERE EXISTS \
+         (SELECT 1 FROM (SELECT b FROM u GROUP BY b) x WHERE x.b IN (SELECT a FROM t))",
+    ] {
+        let e = d.query(q, &[]).unwrap_err();
+        assert!(
+            e.to_string().contains("outermost FROM"),
+            "expected the nested-derived refusal on `{q}`, got: {e}"
+        );
+    }
     d.verify().unwrap();
 }
 

@@ -139,6 +139,15 @@ fn corpus() -> Vec<&'static str> {
         "COMMIT",
         "ROLLBACK",
         "EXPLAIN SELECT * FROM users WHERE id = $1",
+        // Compound ARM-OWNED lifts (format 56): the codec, the plan hash and
+        // the truncation/bit-flip sweeps must cover the per-arm subplan block
+        // — uncorrelated in one arm, correlated in the other, and a compound
+        // subquery body that correlates to the enclosing row.
+        "SELECT id FROM users WHERE id IN (SELECT user_id FROM orders) \
+         UNION SELECT id FROM users WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = users.id)",
+        "SELECT id FROM users \
+         WHERE EXISTS (SELECT 1 FROM orders o WHERE o.user_id = users.id \
+                       UNION SELECT 1 FROM orders o2 WHERE o2.item_no = users.age)",
     ]
 }
 

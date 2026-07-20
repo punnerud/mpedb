@@ -445,7 +445,23 @@ const MAX_JOINS: usize = 16;
 //     name is resolved against a separate registry, and a plain
 //     `create_function` aggregate still cannot appear here. Like every other
 //     host reference such a plan is connection-local (`contains_host_call`).
-const PLAN_FORMAT: u8 = 55;
+// 56: ARM-OWNED compound lifts (design/DESIGN-DERIVED-TABLES.md §5.6). A
+//     `CompoundPlan` grows a trailing `arm_sub_base: u16` plus a per-arm list of
+//     lifted subqueries, encoded after `offset`. The lifts an arm's own
+//     expressions raise used to be HOISTED onto the enclosing statement's flat
+//     `subplans` list, which forced them to be uncorrelated: the statement-level
+//     fill happens once, before dispatch, and a compound has no outer row for a
+//     correlation to name. Ownership moves them to the ARM — the same move
+//     format 52 made for a derived BODY — so `exec_compound` runs each arm
+//     through `exec_select_leveled` and its correlated lifts are filled per ARM
+//     row. A compound's statement-level `subplans` list is consequently EMPTY
+//     (validate-enforced), exactly as a derived plan's is.
+//
+//     What it buys: `SELECT … WHERE EXISTS (…) UNION SELECT …` (a correlated
+//     subquery inside a compound arm), a lift inside a COMPOUND derived-table
+//     body, and — with the correlation scope of `plan_one_compound` — a
+//     compound SUBQUERY body whose arms reference the enclosing row.
+const PLAN_FORMAT: u8 = 56;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -639,9 +655,12 @@ pub enum OrderOver {
 pub struct SubPlan {
     /// The subquery's body (#56, format 31). A plain `SELECT` OR — for
     /// `IN (SELECT … UNION …)`, a scalar `(SELECT … UNION … LIMIT 1)`, or
-    /// `EXISTS (SELECT … UNION …)` — a whole `Compound`. A compound body is
-    /// UNCORRELATED and carries no nested lifts (`outer_args`/`subplans` empty),
-    /// so it is executed once, up front, exactly like an uncorrelated select.
+    /// `EXISTS (SELECT … UNION …)` — a whole `Compound`. A compound body MAY
+    /// correlate (format 56): the correlation region belongs to this subplan
+    /// and is filled before the compound runs, so every arm reads it as an
+    /// ordinary parameter. It never carries `subplans` of its own — a compound
+    /// has no per-row fill phase, so its arms own their lifts instead
+    /// (`CompoundPlan::arm_subplans`).
     pub body: SubBody,
     pub outer_args: Vec<u16>,
     pub kind: SubPlanKind,
@@ -662,10 +681,11 @@ pub struct SubPlan {
 /// A lifted subquery's BODY (#56, format 31): a plain `SELECT` or a whole
 /// compound `SELECT … UNION/EXCEPT/INTERSECT …`. Only the lift positions that
 /// consume the subquery as a value/list/existence — scalar `(…)`, `x IN (…)`,
-/// `EXISTS (…)` — accept a `Compound`; a compound body is always UNCORRELATED
-/// and carries no nested lifts, so wherever a subplan reaches back into its
-/// enclosing row (`outer_args`, `post_filter`, nested `subplans`) the body is a
-/// `Select`.
+/// `EXISTS (…)` — accept a `Compound`. A compound body carries no nested
+/// `subplans` and never a `post_filter`: both are per-ROW mechanisms and a
+/// compound has no row phase, so its arms own their lifts
+/// (`CompoundPlan::arm_subplans`). Its `outer_args` may be non-empty
+/// (format 56) — that region is filled once per enclosing row, before it runs.
 // `Select` is naturally larger than `Compound` (which is a Vec of arms); like
 // [`PlanStmt`], the shape is part of the plan's frozen structure and `as_select`
 // hands out a `&SelectPlan`, so boxing to equalize the variants would only add
@@ -727,7 +747,14 @@ impl SubPlanKind {
 }
 
 /// Ceiling on subplans per statement — decoder DoS bound, far above real SQL.
+/// It bounds the WHOLE tree of one plan: statement-level lifts, a derived
+/// body's owned lifts and every compound arm's owned lifts draw from the same
+/// budget, so ownership can never buy a bigger forest.
 const MAX_SUBPLANS: usize = 16;
+
+/// The same ceiling, for the planner (which must refuse what the decoder would
+/// reject as corrupt).
+pub const MAX_PLAN_SUBPLANS: usize = MAX_SUBPLANS;
 
 /// A compiled, content-addressed statement plan.
 #[derive(Debug, Clone, PartialEq)]
@@ -781,20 +808,28 @@ impl CompiledPlan {
         self.n_params - self.context_keys.len() as u16 - self.subplans.len() as u16
     }
 
-    /// Reserved slots that hold a SUBPLAN RESULT — statement-level lifts plus,
-    /// for a materialized derived table, the BODY's own (format 52).
+    /// Reserved slots that hold a SUBPLAN RESULT — statement-level lifts, plus
+    /// the OWNED lifts of a materialized derived table's body (format 52) and
+    /// of a compound's arms (format 56).
     ///
-    /// The two are mutually exclusive by construction (a derived plan's
-    /// statement-level list is empty, `validate`-enforced), so this is a sum
-    /// only in the arithmetic sense. It exists because the CALLER's parameter
-    /// count is `n_params` minus every reserved slot, and a body-owned lift
-    /// reserves one just as a statement-level lift does — miss it and the
+    /// The three are mutually exclusive by construction (a derived plan's and a
+    /// compound's statement-level list is empty, `validate`-enforced), so this
+    /// is a sum only in the arithmetic sense. It exists because the CALLER's
+    /// parameter count is `n_params` minus every reserved slot, and an owned
+    /// lift reserves one just as a statement-level lift does — miss it and the
     /// facade demands one parameter too many for `SELECT count(*) FROM
     /// (SELECT …, EXISTS(…) f FROM t) s WHERE f`.
     pub fn n_subplan_slots(&self) -> u16 {
         self.subplans.len() as u16
             + match &self.stmt {
-                PlanStmt::Derived(dp) => dp.body_subplans.len() as u16,
+                PlanStmt::Derived(dp) => {
+                    dp.body_subplans.len() as u16
+                        + match &dp.body {
+                            SubBody::Compound(c) => c.n_arm_slots(),
+                            SubBody::Select(_) => 0,
+                        }
+                }
+                PlanStmt::Compound(c) => c.n_arm_slots(),
                 _ => 0,
             }
     }
@@ -1186,6 +1221,44 @@ pub struct CompoundPlan {
     pub order_by: Vec<(u16, SortDir, OrderColl)>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    /// Per-arm OWNED lifted subqueries (format 56). EMPTY when no arm lifts
+    /// anything (every compound before format 56); otherwise EXACTLY one entry
+    /// per arm, in arm order.
+    ///
+    /// An arm's lift belongs to the ARM, not to the enclosing statement — the
+    /// same ownership move a derived table's body made (§5.5). A compound has
+    /// no outer row of its own, so a lift hoisted to the statement could only
+    /// ever be filled once, before dispatch; owned by the arm, it rides
+    /// `exec_select_leveled` over the ARM's rows and may correlate to them.
+    pub arm_subplans: Vec<Vec<SubPlan>>,
+    /// First reserved arm-lift slot, in the parameter buffer this compound is
+    /// executed with. Arm `k`'s lifts occupy `arm_base(k) + i`, where
+    /// `arm_base(k) = arm_sub_base + Σ_{j<k} arm_subplans[j].len()` — the
+    /// layout `[level params ‖ arm0 lifts ‖ arm1 lifts ‖ …]`, which is what
+    /// lets each arm number its `Param` references against the FINAL layout at
+    /// plan time with no post-hoc remap.
+    pub arm_sub_base: u16,
+}
+
+impl CompoundPlan {
+    /// Total reserved slots the arms' lifts occupy.
+    pub fn n_arm_slots(&self) -> u16 {
+        self.arm_subplans.iter().map(|a| a.len() as u16).sum()
+    }
+
+    /// First reserved slot of arm `k`'s own lifts.
+    pub fn arm_base(&self, k: usize) -> u16 {
+        self.arm_sub_base
+            + self.arm_subplans[..k.min(self.arm_subplans.len())]
+                .iter()
+                .map(|a| a.len() as u16)
+                .sum::<u16>()
+    }
+
+    /// Arm `k`'s own lifts (empty when the compound lifts nothing).
+    pub fn arm_lifts(&self, k: usize) -> &[SubPlan] {
+        self.arm_subplans.get(k).map_or(&[], |v| v.as_slice())
+    }
 }
 
 /// Self-imposed ceiling on compound arms, so a corrupt plan cannot make the
