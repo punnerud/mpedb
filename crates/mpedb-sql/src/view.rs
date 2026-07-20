@@ -12,8 +12,9 @@
 //! always its own base column name — the outer query's references need no
 //! rewriting; only `SELECT * FROM v` expands to the view's column list.
 
-use crate::ast::{Expr, JoinClause, JoinKind, SelectStmt, Stmt, SubqueryBody};
+use crate::ast::{CompoundStmt, Expr, JoinClause, JoinKind, SelectStmt, Stmt, SubqueryBody};
 use crate::parser::parse_statement;
+use crate::plan::SetOp;
 use mpedb_types::{Error, Result};
 use std::collections::{HashMap, HashSet};
 
@@ -55,12 +56,7 @@ pub fn inline_views_with_ctes(
 ) -> Result<()> {
     match stmt {
         Stmt::Select(s) => flatten_select(s, views, ctes, 0),
-        Stmt::Compound(c) => {
-            for arm in &mut c.arms {
-                flatten_select(arm, views, ctes, 0)?;
-            }
-            Ok(())
-        }
+        Stmt::Compound(c) => flatten_compound(c, views, ctes, 0),
         // A view/CTE target in a write is not supported (mpedb has no updatable
         // views); the write planner will reject the unknown table cleanly, but
         // catch an explicit view/CTE name here with a clearer message.
@@ -410,11 +406,22 @@ fn flatten_derived(
     // happens to the body itself.
     match body.as_mut() {
         SubqueryBody::Select(b) => flatten_select(b, views, ctes, depth + 1)?,
-        SubqueryBody::Compound(c) => {
-            for arm in &mut c.arms {
-                flatten_select(arm, views, ctes, depth + 1)?;
-            }
+        SubqueryBody::Compound(c) => flatten_compound(c, views, ctes, depth + 1)?,
+    }
+    // §5.7: a body that is only a WRAPPER around another derived table is that
+    // derived table — `FROM (SELECT * FROM (<X>)) o` and Django's
+    // projection-restricting `FROM (SELECT sq.a, sq.b FROM (<X>) sq) o` both
+    // read exactly `<X>`'s rows. Collapsing here is what turns a
+    // derived-inside-a-derived (a nested position, refused by name) back into
+    // the single outermost derived table Stage A materializes.
+    for _ in 0..MAX_VIEW_DEPTH {
+        collapse_passthrough(&mut body);
+        if !collapse_projection_passthrough(s, &mut body) {
+            break;
         }
+    }
+    if let SubqueryBody::Compound(c) = body.as_mut() {
+        splice_passthrough_arms(c);
     }
     let splice_alias = match (body.as_ref(), s.alias.clone()) {
         (SubqueryBody::Select(b), Some(dalias)) if check_simple(b, &dalias).is_ok() => {
@@ -455,6 +462,310 @@ fn flatten_derived(
         s.items = body.items.take();
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// A derived table in a NESTED position, via the pass-through wrapper
+// (design/DESIGN-DERIVED-TABLES.md §5.7).
+//
+// sqlite has no parenthesized compound operand and no way to name a
+// non-flattenable body inline, so every generator that needs one writes the
+// SAME wrapper: `SELECT * FROM ( <body> )`. Django's `SQLCompiler` writes it for
+// a nested combinator, and its `subquery`-wrapping path writes the
+// projection-restricting cousin `SELECT sq.a, sq.b FROM ( <body> ) sq`.
+//
+// Both wrappers are IDENTITIES over the body's rows, so they can be removed
+// where a derived table would otherwise have to be materialized in a position
+// mpedb cannot represent. Removing them is a pure AST rewrite: no plan-format
+// change, no new executor surface, and the shapes that are NOT identities keep
+// their existing refusal rather than being approximated.
+// ---------------------------------------------------------------------------
+
+/// `SELECT * FROM (<body>) [alias]` — and nothing else: no projection list, no
+/// join, no DISTINCT, no WHERE / GROUP BY / HAVING / ORDER BY / LIMIT / OFFSET.
+///
+/// Such a SELECT **is** its body. It filters nothing, reprojects nothing,
+/// reorders nothing, dedups nothing and limits nothing; and by sqlite's naming
+/// rule a `SELECT *` over a derived table exposes exactly the body's own output
+/// names, in the body's own order. The alias is irrelevant: with no expression
+/// anywhere in the wrapper, nothing can reference it.
+fn is_passthrough(s: &SelectStmt) -> bool {
+    s.from_derived.is_some()
+        && s.items.is_none()
+        && s.joins.is_empty()
+        && !s.distinct
+        && s.where_clause.is_none()
+        && s.group_by.is_empty()
+        && s.having.is_none()
+        && s.order_by.is_empty()
+        && s.limit.is_none()
+        && s.offset.is_none()
+}
+
+/// Drop every pass-through wrapper standing where a subquery BODY may stand
+/// (a lifted subquery's body, a derived table's body). Bounded by the same
+/// nesting limit the view splice uses; each step strictly removes one level.
+fn collapse_passthrough(body: &mut SubqueryBody) {
+    for _ in 0..MAX_VIEW_DEPTH {
+        let SubqueryBody::Select(s) = body else { return };
+        if !is_passthrough(s) {
+            return;
+        }
+        let inner = s.from_derived.take().expect("is_passthrough checked it");
+        *body = *inner;
+    }
+}
+
+/// Flatten each arm of a compound, then splice away any pass-through arm.
+fn flatten_compound(
+    c: &mut CompoundStmt,
+    views: &ViewCatalog,
+    ctes: &ViewCatalog,
+    depth: usize,
+) -> Result<()> {
+    for arm in &mut c.arms {
+        flatten_select(arm, views, ctes, depth)?;
+    }
+    splice_passthrough_arms(c);
+    Ok(())
+}
+
+/// May arm `k` — a pass-through wrapper — be replaced by its body IN PLACE,
+/// left-associatively, without changing what the compound computes?
+fn arm_splice_ok(c: &CompoundStmt, k: usize) -> bool {
+    match c.arms[k].from_derived.as_deref() {
+        // A plain SELECT body simply becomes the arm — unless it carries its
+        // own ORDER BY / LIMIT / OFFSET, which bind INSIDE the parenthesized
+        // body and would become the WHOLE compound's if spliced out. That is a
+        // different query, so it keeps the refusal.
+        Some(SubqueryBody::Select(b)) => {
+            b.order_by.is_empty() && b.limit.is_none() && b.offset.is_none()
+        }
+        Some(SubqueryBody::Compound(inner)) => {
+            if !inner.order_by.is_empty() || inner.limit.is_some() || inner.offset.is_some() {
+                return false;
+            }
+            // Arm 0 is EXACT for any operators: a compound chain is already
+            // evaluated left-associatively, so `(b0 ⊕ b1) op a1 …` and the flat
+            // `b0 ⊕ b1 op a1 …` are the same evaluation, bracket for bracket.
+            if k == 0 {
+                return true;
+            }
+            // Anywhere else the splice turns `acc op (b0 ⊕ b1)` into
+            // `(acc op b0) ⊕ b1`, which is equal only when `op` == `⊕` and that
+            // operator is ASSOCIATIVE. `UNION` (∪), `UNION ALL` (⊎) and
+            // `INTERSECT` (∩) are. `EXCEPT` is not — `A \ (B \ C) ≠ (A \ B) \ C`
+            // — and neither is a MIXED chain: `A ∪ (B ⊎ C)` dedups C's
+            // duplicates where `(A ∪ B) ⊎ C` keeps them. Both stay refused.
+            let op = c.ops[k - 1];
+            matches!(op, SetOp::Union | SetOp::UnionAll | SetOp::Intersect)
+                && inner.ops.iter().all(|o| *o == op)
+        }
+        None => false,
+    }
+}
+
+/// Replace every spliceable pass-through arm by its body: a plain SELECT
+/// becomes the arm, a compound contributes its own arms and operators to the
+/// enclosing chain.
+fn splice_passthrough_arms(c: &mut CompoundStmt) {
+    let mut k = 0;
+    while k < c.arms.len() {
+        if !(is_passthrough(&c.arms[k]) && arm_splice_ok(c, k)) {
+            k += 1;
+            continue;
+        }
+        let body = *c.arms[k].from_derived.take().expect("arm_splice_ok checked it");
+        match body {
+            SubqueryBody::Select(b) => {
+                c.arms[k] = b;
+                k += 1;
+            }
+            SubqueryBody::Compound(inner) => {
+                let n = inner.arms.len();
+                // `ops[i]` sits between `arms[i]` and `arms[i+1]`, so the inner
+                // chain's operators go in at exactly `k`.
+                c.ops.splice(k..k, inner.ops);
+                c.arms.splice(k..=k, inner.arms);
+                k += n;
+            }
+        }
+    }
+}
+
+/// The output column NAMES of a subquery body, when they can be read off the
+/// AST: the item's alias, else a bare (possibly qualified) column's own short
+/// name. `None` when any name would depend on the planner's rendering of an
+/// expression, or on a `SELECT *` expansion — in which case the caller must not
+/// reason about the body's columns and simply declines to rewrite.
+///
+/// A compound's names come from its first arm (sqlite's and PG's rule), which
+/// is the same rule `planner::derived::body_output_names` applies to the plan.
+fn body_output_names(b: &SubqueryBody) -> Option<Vec<String>> {
+    let arm = match b {
+        SubqueryBody::Select(s) => s,
+        SubqueryBody::Compound(c) => c.arms.first()?,
+    };
+    arm.items
+        .as_ref()?
+        .iter()
+        .map(|(e, alias)| match (alias, e) {
+            (Some(a), _) => Some(a.clone()),
+            (None, Expr::Col(n)) | (None, Expr::Qualified(_, n)) => Some(n.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The columns a PROJECTION-ONLY pass-through selects out of its derived
+/// source: `SELECT i.a, i.b FROM (<X>) i` → `["a", "b"]`.
+///
+/// Every item must be a BARE column reference with no rename, so its output
+/// name is the inner column's own name and the outer query's references carry
+/// over unchanged. A qualifier must name the wrapper's own alias — nothing else
+/// is in scope — and everything else about the wrapper must be inert, exactly
+/// as for [`is_passthrough`].
+fn projection_passthrough(m: &SelectStmt) -> Option<Vec<String>> {
+    if m.from_derived.is_none()
+        || !m.joins.is_empty()
+        || m.distinct
+        || m.where_clause.is_some()
+        || !m.group_by.is_empty()
+        || m.having.is_some()
+        || !m.order_by.is_empty()
+        || m.limit.is_some()
+        || m.offset.is_some()
+    {
+        return None;
+    }
+    m.items
+        .as_ref()?
+        .iter()
+        .map(|(e, alias)| match (alias, e) {
+            (None, Expr::Col(n)) => Some(n.clone()),
+            (None, Expr::Qualified(q, n)) if m.alias.as_deref() == Some(q.as_str()) => {
+                Some(n.clone())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Does any expression in this statement name one of `hidden`?
+fn mentions_any(s: &SelectStmt, hidden: &[String]) -> bool {
+    let hit = |e: &Expr| expr_mentions(e, hidden);
+    s.items.as_ref().is_some_and(|it| it.iter().any(|(e, _)| hit(e)))
+        || s.where_clause.as_ref().is_some_and(hit)
+        || s.group_by.iter().any(hit)
+        || s.having.as_ref().is_some_and(hit)
+        || s.order_by.iter().any(|(e, _)| hit(e))
+        || s.joins.iter().any(|j| hit(&j.on))
+}
+
+/// A deliberately CONSERVATIVE name scan: any column reference spelled `n` (or
+/// `<anything>.n`) counts as a mention. Over-counting only costs a rewrite that
+/// was in fact safe; under-counting would turn sqlite's "no such column" into
+/// an answer, which is the one outcome that is never allowed.
+fn expr_mentions(e: &Expr, hidden: &[String]) -> bool {
+    let sub = |x: &Expr| expr_mentions(x, hidden);
+    let body = |b: &SubqueryBody| match b {
+        SubqueryBody::Select(s) => mentions_any(s, hidden),
+        SubqueryBody::Compound(c) => c.arms.iter().any(|a| mentions_any(a, hidden)),
+    };
+    match e {
+        Expr::Col(n) | Expr::Qualified(_, n) => {
+            hidden.iter().any(|h| h.eq_ignore_ascii_case(n))
+        }
+        Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) | Expr::Collate(a, _) => sub(a),
+        Expr::Binary(_, a, b) | Expr::Like(a, b, _) | Expr::Match(a, b) => sub(a) || sub(b),
+        Expr::IsDistinct(a, b, _) | Expr::Glob(a, b, _) | Expr::Regexp(a, b, _) => {
+            sub(a) || sub(b)
+        }
+        Expr::InList(a, list, _) => sub(a) || list.iter().any(sub),
+        Expr::Case(arms, else_) => {
+            arms.iter().any(|(c, r)| sub(c) || sub(r)) || else_.as_deref().is_some_and(sub)
+        }
+        Expr::Coalesce(items) | Expr::Func(_, items) | Expr::RowValue(items) => {
+            items.iter().any(sub)
+        }
+        Expr::InParamSlot(a, _, _) | Expr::InContext(a, _, _) => sub(a),
+        Expr::Agg(_, arg, _, filter, extra) => {
+            arg.as_deref().is_some_and(sub)
+                || extra.iter().any(sub)
+                || filter.as_deref().is_some_and(sub)
+        }
+        Expr::Window { arg, spec, .. } => {
+            arg.as_deref().is_some_and(sub)
+                || spec.partition_by.iter().any(sub)
+                || spec.order_by.iter().any(|(o, _)| sub(o))
+        }
+        // A subquery opens its own scope but MAY correlate outward, so scan it
+        // too — over-counting is the safe direction here.
+        Expr::Subquery(b) | Expr::Exists(b, _) => body(b),
+        Expr::InSubquery(a, b, _) => sub(a) || body(b),
+        Expr::Lit(_)
+        | Expr::Param(_)
+        | Expr::ContextRef(_)
+        | Expr::Excluded(_) => false,
+    }
+}
+
+/// Collapse a derived-table body that is a projection-only pass-through over
+/// ANOTHER derived table — Django's `subquery` wrapper:
+///
+/// ```sql
+/// SELECT count(*) FROM (SELECT sq.a, sq.b FROM (<X>) sq) o
+/// ```
+///
+/// The middle SELECT reads `<X>`'s rows and drops columns; it does not filter,
+/// reorder, dedup or limit. So the outer statement may read `<X>` DIRECTLY,
+/// keeping its own alias — provided the columns the middle hid stay hidden.
+/// They do, because:
+///
+/// - a `SELECT *` outer is first expanded to exactly the middle's item list
+///   (so the output tuple is unchanged, in the middle's order); and
+/// - if the outer mentions any hidden name anywhere, the rewrite is DECLINED
+///   and the nested-derived refusal stands. sqlite answers "no such column"
+///   there, and a refusal agrees with an error where an answer would not.
+///
+/// Returns `true` when it rewrote `body`.
+fn collapse_projection_passthrough(s: &mut SelectStmt, body: &mut SubqueryBody) -> bool {
+    let SubqueryBody::Select(m) = body else { return false };
+    let Some(sel) = projection_passthrough(m) else { return false };
+    let inner = m.from_derived.as_deref().expect("projection_passthrough checked it");
+    let Some(xnames) = body_output_names(inner) else { return false };
+    // Every selected name must really be one of the inner body's columns —
+    // otherwise the original statement is an error, and this pass must not
+    // turn it into anything else.
+    if !sel.iter().all(|n| xnames.iter().any(|x| x.eq_ignore_ascii_case(n))) {
+        return false;
+    }
+    let hidden: Vec<String> = xnames
+        .iter()
+        .filter(|x| !sel.iter().any(|n| n.eq_ignore_ascii_case(x)))
+        .cloned()
+        .collect();
+    // `SELECT * FROM (<middle>) o` must keep exposing the MIDDLE's columns, in
+    // the middle's order. With no join, spelling them out does exactly that;
+    // with a join, `*` also spans the joined tables and one item list cannot
+    // express the union — decline.
+    let expand_star = s.items.is_none();
+    if expand_star && !s.joins.is_empty() {
+        return false;
+    }
+    // Decided BEFORE anything is mutated. The `*` expansion can only introduce
+    // `sel` names, never a hidden one, so scanning the un-expanded statement is
+    // the same question.
+    if !hidden.is_empty() && mentions_any(s, &hidden) {
+        return false;
+    }
+    if expand_star {
+        s.items = Some(sel.iter().map(|n| (Expr::Col(n.clone()), None)).collect());
+    }
+    let SubqueryBody::Select(m) = body else { unreachable!("matched above") };
+    let inner = m.from_derived.take().expect("projection_passthrough checked it");
+    *body = *inner;
+    true
 }
 
 /// Rewrite every `from.col` qualifier to `to.col` in place. Used to collapse a
@@ -546,14 +857,18 @@ fn flatten_body(
     depth: usize,
 ) -> Result<()> {
     match body {
-        SubqueryBody::Select(s) => flatten_select(s, views, ctes, depth),
-        SubqueryBody::Compound(c) => {
-            for arm in &mut c.arms {
-                flatten_select(arm, views, ctes, depth)?;
-            }
-            Ok(())
-        }
+        SubqueryBody::Select(s) => flatten_select(s, views, ctes, depth)?,
+        SubqueryBody::Compound(c) => flatten_compound(c, views, ctes, depth)?,
     }
+    // `IN (SELECT * FROM (<body>))` — the wrapper adds nothing, so the BODY is
+    // the subquery. Dropping it is what lets a compound (or any other
+    // non-flattenable body) stand in a subquery position, where a derived
+    // table itself is still refused by name.
+    collapse_passthrough(body);
+    if let SubqueryBody::Compound(c) = body {
+        splice_passthrough_arms(c);
+    }
+    Ok(())
 }
 
 /// Recurse into any subquery body carried by an expression.
