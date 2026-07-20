@@ -174,6 +174,17 @@ pub(super) fn rewrite_right_join<'s>(
     }))
 }
 
+/// MPEE (task #114, design/DESIGN-MPEE-SOLVER.md): solve this scope's join
+/// order BEFORE anything else looks at the statement, and re-enter with the
+/// rewritten one. Every join chain in every scope — the top SELECT, a lifted
+/// subquery body, a derived body, a compound arm, a recursive-CTE component —
+/// passes through here, so "run the solver after each sub-compilation, as each
+/// N in the N×N" needs no extra plumbing: this IS every N.
+///
+/// The rewrite is answer-preserving by construction (only all-INNER chains are
+/// eligible, and an INNER join chain is commutative), and it is adopted only
+/// when it is STRICTLY cheaper than what the user wrote — mpedb never reorders
+/// without a reason it can name in EXPLAIN.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn plan_join_select<'s>(
     s: &ast::SelectStmt,
@@ -182,11 +193,53 @@ pub(super) fn plan_join_select<'s>(
     catalog: &PolicyCatalog,
     mode: BareGroupBy,
     host_udfs: &HostUdfSet,
+    row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
     subplans: Vec<SubPlan>,
     slot_types: Vec<Ty>,
     cte: Option<CteRef<'s>>,
 ) -> Result<PlannedStmt> {
+    // A CORRELATED subplan was lifted BEFORE the join dispatch, and its
+    // `outer_args` are slots of the joined tuple in the TEXTUAL order — a
+    // reorder would leave them pointing at the wrong columns (measured: a
+    // silently wrong `count(*) FILTER (WHERE EXISTS (… c.ref = t.id))` over a
+    // join). Remapping them through the permutation is the obvious follow-up;
+    // v1 simply keeps the user's order whenever one exists.
+    let correlated = subplans.iter().any(|p| !p.outer_args.is_empty());
+    let solved = if correlated {
+        Err(super::mpee::Skip::Ineligible)
+    } else {
+        super::mpee::reorder(
+            s, schema, n_params, catalog, mode, host_udfs, &slot_types, cte, row_count,
+        )
+    };
+    match solved {
+        Ok(reordered) => plan_join_select_inner(
+            &reordered, schema, n_params, catalog, mode, host_udfs, row_count, consts, subplans,
+            slot_types, cte,
+        ),
+        Err(_skip) => plan_join_select_inner(
+            s, schema, n_params, catalog, mode, host_udfs, row_count, consts, subplans, slot_types,
+            cte,
+        ),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn plan_join_select_inner<'s>(
+    s: &ast::SelectStmt,
+    schema: &'s Schema,
+    n_params: u16,
+    catalog: &PolicyCatalog,
+    mode: BareGroupBy,
+    host_udfs: &HostUdfSet,
+    row_count: RowCountFn<'_>,
+    consts: &mut Vec<Value>,
+    subplans: Vec<SubPlan>,
+    slot_types: Vec<Ty>,
+    cte: Option<CteRef<'s>>,
+) -> Result<PlannedStmt> {
+    let _ = row_count; // the solver above is the only consumer at this level
     // A `NATURAL JOIN` is an implicit `USING` over the columns common to the two
     // sides. Resolve that common set from the schema FIRST — a rigid schema makes
     // it a static fact of the plan — and fill each natural join's `using`, so
