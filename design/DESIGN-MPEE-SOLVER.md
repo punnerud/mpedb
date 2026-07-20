@@ -1,6 +1,8 @@
 # DESIGN-MPEE-SOLVER — MPEE as the plan solver
 
-**Status: implemented (task #114, 2026-07-20).** Companion to
+**Status: implemented (task #114, 2026-07-20; extended by #116 the same day —
+§7.1 turns three of v1's refusals into constraints, §9.5 makes the cost side
+demand-driven, §9.6 designs the execution-time half).** Companion to
 [DESIGN-MPEE-OPT.md](DESIGN-MPEE-OPT.md) (what transferred from the offline
 route engine and what was falsified) and [DESIGN-MPEE-COST.md](DESIGN-MPEE-COST.md)
 (the self-tuning cost catalog, still Phase 7+ / #88 and still deferred).
@@ -100,10 +102,11 @@ change wants those, that is DESIGN-MPEE-COST.md / #88 and it stays deferred.
 
 For a candidate left-deep order `t₀, t₁, …, t_{n−1}`, each position `i` is
 scored against the set `S` of tables already placed, and the scores are summed
-componentwise into a **lexicographic triple**:
+componentwise into a **lexicographic tuple** (a triple in v1; #116 appended the
+fourth term, §7.1):
 
 ```
-Cost = (worst_log, cartesian, late_unconstrained)
+Cost = (worst_log, cartesian, late_unconstrained, residual_late)
 ```
 
 1. **`worst_log`** — `0` if the step is KNOWN (full PK pinned, or a full-width
@@ -123,6 +126,14 @@ Cost = (worst_log, cartesian, late_unconstrained)
    else `0`. An unconstrained table inflates its own stage and every stage after
    it, so it is charged once per remaining step. This is what pushes
    certainly-full scans to the end.
+
+4. **`residual_late`** (#116) — the position `i` at which a conjunct becomes
+   evaluable, charged once per conjunct resolved at that step. #65 evaluates a
+   conjunct at the step that places its LAST table, so a residual's position is
+   a *choice*, and one that shrinks everything downstream when it is early.
+   Purely structural. Last in the tuple, so it decides only among candidates the
+   first three rate identically — the population v1 handed back to the textual
+   order. See §7.1.
 
 Ties are broken by the **textual order**: the solver's order is adopted only if
 it is *strictly* better than the order the user wrote. mpedb never reorders
@@ -334,33 +345,92 @@ their exact previous hashes for every non-join statement.
 
 ---
 
-## 7. What the solver deliberately does NOT do (v1)
+## 7. Refusals — and which of them became constraints (#116)
 
-Eligibility is refused — the textual order is kept verbatim — whenever any of
-these holds. Each is a correctness boundary, not a shortcut:
+Morten's framing for v2: *"Left join, where etc er som constraints i
+vehicle-optimalisering, og samme gjelder her og inngår da i N×N-kost-analysene
+FØR solver kjører."* In vehicle routing a time window, a capacity or a
+forbidden turn is not a reason to abandon the route — it is a constraint the
+solver prices and searches the feasible region under. v1's eligibility list was
+a list of situations where the solver gave up. v2 converts the three that
+carried the value and keeps two, each with a stated reason.
 
-- **any non-INNER join in the chain** (LEFT / FULL; RIGHT is already rewritten
-  to LEFT before planning). Outer joins are neither commutative nor associative
-  in general, and the gather's NULL-extension is defined over a fixed left-deep
-  shape.
+### 7.1 Converted (v2, #116)
+
+**A LEFT JOIN is a BARRIER, not a veto.** An outer-join step pins its own
+position: the set of tables placed *before* it is exactly the set the user
+wrote, so what it preserves and what it NULL-extends is untouched. Every
+maximal INNER run *between* barriers is then an independent sub-problem the
+same solver orders, on the one-line argument
+
+```
+(A ⋈ B) ⟕ C  ≡  (B ⋈ A) ⟕ C
+```
+
+— reordering inside the run cannot change what the following outer join sees,
+because the run's row set is identical either way. Three consequences fall out
+for free: the barriers are *cut points* in the query graph, so each segment is a
+smaller `N` (§4's collapse, arrived at from the other side); segment-local
+optimisation is globally optimal, because a segment's internal order cannot
+change the SET any later segment sees and `step`'s cost depends on the set, not
+on how it was built (§3); and the emitted statement keeps each barrier's `ON`
+**on its join**, since moving a LEFT join's ON into the WHERE turns "does this
+row match" into "does this row survive".
+
+Two costing rules follow from #65's pushdown and are load-bearing:
+
+- a **barrier's own ON** constrains only its NULL-extended table. Under a LEFT
+  join every preserved-side row survives whatever the ON says, so crediting the
+  preserved side with it would be a false constraint;
+- a conjunct whose **last** table is a barrier lands in `joined_filter` (it
+  filters the already-NULL-extended row), so it restricts no step and is priced
+  at nothing.
+
+**A CORRELATED lifted subplan is remapped.** Subqueries are lifted *before* the
+join dispatch and a correlated subplan's `outer_args` are base-row slots of the
+joined tuple **in the textual order**, so a reorder left them pointing at the
+wrong columns. That was a genuine wrong answer during v1's development — a
+`count(*) FILTER (WHERE EXISTS (… c.ref = t.id))` over a join returned 1 where
+sqlite returns 2 — and v1 refused the whole scope whenever any correlated
+subplan existed. v2 has the solver report the permutation as a slot map
+(`Solved::slot_map`) and applies it to every top-level subplan's `outer_args`
+(`Solved::remap`). Only the top level is ours: a nested lift's args name slots
+of *its* parent's row, which this reorder does not touch. The registry path
+re-validates every `outer_arg` against the reordered base row on decode, so a
+stale slot would surface as `Corrupt` rather than as an answer.
+
+**Residual PLACEMENT is priced.** #65 evaluates a conjunct at the step that
+places its LAST table — so *when* a filter runs is a consequence of the order,
+not a fixed property of the text. v1 had no term for it and fell back to
+"wherever the textual order put it" whenever the first three terms tied. v2 adds
+a fourth, last-place lexicographic term, `residual_late`: every conjunct is
+charged the position at which it becomes evaluable. It is purely structural (it
+reads no statistics), it is a sum over steps that depends only on `(S, tᵢ, i)`
+so the DP stays correct, and — sitting last — it can only decide among
+candidates the first three terms rate identically. That is exactly the
+population v1 left to the text.
+
+### 7.2 Still refused, and why
+
+- **FULL JOIN.** #65 disables WHERE pushdown *entirely* when any FULL is in the
+  chain, because both sides NULL-extend and every conjunct would filter rows
+  that do not exist yet. The rewrite is built on `INNER JOIN … ON p ≡ CROSS JOIN
+  … WHERE p` plus that pushdown putting each conjunct back at the earliest step
+  where its slots are bound; under FULL there is no way back to a per-step ON,
+  so the move has no counterpart. Named, not overlooked.
 - **USING / NATURAL joins.** Their desugaring picks the *leftmost* occurrence of
   a shared column as the coalesce representative; reordering would silently move
   it.
 - **the recursive-CTE working table** (`CTE_TABLE`) or a non-flattened derived
   table in the chain.
-- **a CORRELATED lifted subquery.** Subqueries are lifted *before* the join
-  dispatch, and a correlated subplan's `outer_args` are slots of the joined
-  tuple **in the textual order**; a reorder would leave them pointing at the
-  wrong columns. This was caught by `crates/mpedb/tests/agg_filter.rs` as a
-  genuine wrong answer during development (a `count(*) FILTER (WHERE EXISTS (…
-  c.ref = t.id))` over a join returned 1 where sqlite returns 2) and is now
-  refused. Remapping `outer_args` through the permutation is a ~10-line
-  follow-up and the obvious next step; v1 keeps the user's order instead.
-- **any RLS policy on any table in the chain.** The join path's evaluation order
-  is a security contract (each table's policy runs over its own row, before any
-  ON that could raise on it). The reorder preserves it — the #65 pushdown places
-  every conjunct at or after the step of its last referenced table — but v1
-  declines to reason about it under reordering at all.
+- **any RLS policy on any table in the chain.** This one is kept deliberately,
+  and the argument is the overflow channel below: a reorder changes which pairs
+  a predicate is evaluated over, mpedb **raises** on arithmetic overflow, and
+  under a policy scope a raise is an information channel and not just an error.
+  Pricing that would mean proving that no reachable reorder changes the set of
+  *raises* a policy-scoped query can produce — a much stronger claim than
+  preserving the row set, and not one this solver can make. A named refusal is
+  the honest answer.
 - **a scope with more than 17 tables**, which cannot occur (`MAX_JOINS = 16`).
 
 One behavioural consequence is worth naming rather than discovering: mpedb's
@@ -368,9 +438,7 @@ expressions **raise** on arithmetic overflow, and a reorder changes which pairs
 a predicate is evaluated over (an index nested loop never visits the pairs a
 scan would). A query that raised may therefore stop raising, or vice versa. This
 is inherent to join reordering in every engine that does it — the *row set* is
-unchanged, which is what "0 wrong" measures — and it is one more reason the
-reorder is refused wherever an RLS policy is in scope, since there a raise is an
-information channel and not just an error.
+unchanged, which is what "0 wrong" measures.
 
 Beyond eligibility, the solver does not yet consider: bushy (non-left-deep)
 plans; semi-join / hash-join alternatives; the cost of ORDER BY or GROUP BY
@@ -396,8 +464,11 @@ The reorder happens at the **AST** level, before binding, following the pattern
    its *links* (any multi-table conjunct).
 3. Solve (§4). Adopt only if strictly better than textual (§3).
 4. Emit a new `SelectStmt`: the chosen first table becomes the outer, every
-   other becomes an `INNER JOIN … ON true` in the chosen order, and **all
-   original ON conjuncts move into the WHERE**. `INNER JOIN ON p` ≡ `CROSS JOIN
+   other becomes an `INNER JOIN … ON true` in the chosen order, and **every
+   INNER ON conjunct moves into the WHERE**. (#116: a BARRIER position keeps its
+   table, its `LEFT` kind and its `ON` verbatim — moving a LEFT join's ON into
+   the WHERE would turn "does this row match" into "does this row survive".)
+   `INNER JOIN ON p` ≡ `CROSS JOIN
    … WHERE p`, and mpedb's #65 pushdown then places each conjunct at the
    earliest step where all its slots are bound — which is exactly the index
    nested-loop candidate the ON used to be. `SELECT *` is pinned to the
@@ -526,6 +597,112 @@ Not built. Written down so that when it is, it does not reach for the plan bytes
 
 ---
 
+### 9.5 The compile-time ping-pong — BUILT (#116)
+
+Morten: *"ved å slå sammen N×N/kost og solver, kan den dynamisk teste og løse
+bedre ruter … gir ekstra verdi til N×N-streaming, for valg av N kan da gjøres
+med MPEE-styring."*
+
+v1 streamed the *step costs* on demand inside the DP but bought every table's
+`row_count` **eagerly, up front**, before the search started. Fusing cost and
+solver means the opposite: the solver asks, and only then does the cost side
+pay. That is what turns "enumerate then prune" into **branch-and-bound with an
+MPEE-chosen exploration order**.
+
+**The mechanism.** `Node::bucket` is a memoizing `Cell<Option<u32>>`. Nothing
+but `Problem::buy` ever calls `row_count`, and an unbought table prices at
+`UNBOUGHT = 1`. The solve is then a loop:
+
+```
+propose  = solve_chain()                       // under the current beliefs
+owed     = the non-KNOWN positions of `propose` whose count is unbought
+if owed is empty  → `propose` is optimal, stop
+buy(owed); repeat                              // bounded: PING_PONG_ROUNDS = 3
+```
+
+**Why the stopping rule is a proof, not a heuristic.** Every cost term is
+monotone non-decreasing in a table's bucket, so an unbought table priced at a
+lower bound makes *every* candidate's cost a lower bound. When the winner `O`
+has all of its own contributors bought, `cost(O)` is exact while every rejected
+`P` satisfied `cost_est(P) ≥ cost_est(O) = cost_true(O)` and `cost_true(P) ≥
+cost_est(P)`. So `O` is optimal over everything the search explored — the same
+guarantee eager v1 gave, for fewer cost reads. A chain that has not settled
+within `PING_PONG_ROUNDS` buys everything and solves once, which *is* v1's eager
+solve, so the fallback is bit-identical to the pre-#116 behaviour and the whole
+mechanism is bounded at four searches.
+
+**Why the lower bound is `1` and not `0`.** `magnitude(n) = 1` for a one-row
+table, so `1` is a genuine lower bound for every table holding at least one row.
+`0` is unconditionally safe and also useless: with every unbought table at `0`
+the *leading* cost term is `0` for every candidate, the first round decides on
+tie-breakers alone, and the solver goes off buying counts for an order it is
+about to discard — measured, on the 6-table chain, as 5 of 6 counts bought
+instead of 1. At `1` the leading term of an all-unbought round *is* the count of
+un-probed steps, so the first proposal is the one whose cost the solver can most
+cheaply certify. The one exception is an **empty** table (`magnitude(0) = 0`),
+where the bound is one too high and the search could in principle prune the true
+optimum; a query joining an empty table returns no rows and terminates
+immediately whatever the order, so nothing is at stake, and the row SET is never
+affected either way.
+
+**The adoption test is the same bound, used the same way.** A reorder is
+adopted only if it is strictly better than the textual order. The textual
+order's cost starts as a lower bound and is refined **one count at a time**,
+stopping the instant `chosen < textual` appears — because buying can only raise
+the textual cost, the first such comparison is final. That is literally the
+solver's current best bound deciding which `N` is worth examining next.
+
+**Measured** (`planner::mpee::tests`, a counting `RowCountFn`): the scrambled
+chain with a late constant anchor — the `join-17-4` shape — costs **exactly one
+`row_count`, at n = 6, 10 and 17 alike**, against `n` under v1. Every position
+but the first is a PK probe, and a probe's cardinality is a *proof*, not a
+statistic, so its magnitude is never worth buying. The honest other half is
+pinned by a second test: a chain joined entirely on non-key columns is decided
+by size alone and pays for its sizes. Laziness is a property of the *question*.
+
+**What this does NOT do.** A `row_count` is a catalog B-tree lookup, so one
+probe versus seventeen is not a wall-clock story today — `select4`'s time is
+unchanged within noise. The value is that the seam is now demand-driven, which
+is the precondition for §9.0's `CostSource`: the moment an answer can come from
+*persisted measured history* instead of a catalog counter, "which N to examine
+next" stops being free and this loop is what makes it affordable.
+
+### 9.6 Execution-time ping-pong — designed, not built
+
+The compile-time loop above is free because it happens *before the plan exists*.
+Execution-time re-decision is a different contract, and the identity rule fixes
+it (§9.2, quoted because it is already law):
+
+> **Plan bytes are immutable under their hash.** Statistics inform *costing*,
+> never plan identity. A persisted better plan is a NEW hash.
+
+So an execution-time ping-pong may change **strategy**, never **bytes**. The
+shape, for whoever builds it:
+
+1. after position 0 has drained, the gather knows the ACTUAL rows out of it —
+   the one number the solver had to bound rather than know;
+2. if that contradicts the assumption by more than a magnitude bucket, re-solve
+   the remaining **suffix** with position 0's bucket replaced by the observed
+   one. The prefix already emitted stays valid **for INNER joins**: an inner
+   chain's row set is order-independent, so re-ordering the tail cannot change
+   which tuples the whole chain produces;
+3. that safety argument is exactly why LEFT/FULL need care here. A barrier's
+   position is part of what the outer join preserves; a suffix re-solve must
+   treat every barrier as immovable, i.e. it may only permute inside the
+   *current* free run and the runs after it — the same segmentation §7.1
+   already defines;
+4. the re-decision is executor-local (which side of a nested loop is held versus
+   re-probed, whether a correlated memo is built eagerly, the working-set
+   materialization of a recursive term) and therefore invisible to the plan
+   bytes. If the better order is worth keeping, the compiler emits a NEW plan
+   with a NEW hash and the caller's SQL→hash mapping moves; the old hash keeps
+   naming exactly what it always named.
+
+Not built at v2: it needs the gather to expose a per-position row counter to the
+planner mid-statement and a re-entry point into `plan_join_select` for a suffix,
+neither of which exists. Written down so that when it is built it does not reach
+for the plan bytes.
+
 ## 10. Measured
 
 Release build, x86-64 Linux, the gregrahn sqllogictest corpus, runner
@@ -560,6 +737,60 @@ instance of the same shape and is where the 19.6× comes from.
 
 There is **no join cell in `crates/mpedb-bench`** to compare against; the join
 battery above is the measurement.
+
+### 10.1 v2 (#116) — measured against v1 in the same worktree
+
+Control group: v1 is `2fe36f7`'s `planner/mpee.rs` + `planner/join.rs` checked
+out into this worktree and rebuilt, so both sides are the same machine, the same
+compiler and the same everything else. `crates/mpedb/tests/mpee_solver.rs` is
+the harness; every "v2" line below is an assertion in it.
+
+**Each converted refusal, before and after.** The `join order:` line is
+EXPLAIN's, verbatim.
+
+| shape | v1 | v2 |
+|---|---|---|
+| correlated `FILTER (WHERE EXISTS (… k.ref = a.id))` over `FROM a, b WHERE b.aref = a.id AND b.id = 3` | `a [scan] -> b [pk]` — refused, textual order kept, because a correlated subplan existed | `b [pk] -> a [pk]`, **0 cartesian steps**, answer differential-identical to bundled sqlite 3.45 (and through the plan registry) |
+| `FROM a, b LEFT JOIN c ON c.id = b.y WHERE b.aref = a.id AND b.id = 3` | `a [scan] -> b [pk] -> c [pk]` — refused, LEFT anywhere in the chain | `b [pk] -> a [pk] -> c [pk]` — the preserved run reorders, the barrier stays put; answer differential-identical |
+| the `join-17-4` chain (10 tables, scrambled) + `LEFT JOIN t11`, 200 k-cell budget | `t1 [scan] -> t3 [cartesian] -> t5 [cartesian] -> t7 [cartesian] -> t9 [cartesian] -> …` — **`runtime budget exceeded: 200010 live joined cells > limit 200000 while evaluating nested-loop join with "t9"`** | `t1 [scan] -> t2 [pk] -> … -> t11 [pk]`, **0 cartesian steps**, **1 row** |
+| `FROM c, b, a` joined on non-key columns, three single-table filters on `a` and one on `c` | `c [scan] -> b [scan] -> a [scan]` — first three cost terms tie, so the textual order stands | `a [scan] -> b [scan] -> c [scan]` — `residual_late` places the most-restricted table first; answer differential-identical |
+| `FULL JOIN` | `a [scan] -> c [scan]` | `a [scan] -> c [scan]` — **unchanged, by design** (§7.2) |
+
+**The ping-pong, measured** (`planner::mpee::tests`, a counting `RowCountFn`):
+
+| chain width `n` | v1 `row_count` reads | v2 |
+|---|---|---|
+| 6 | 6 | **1** |
+| 10 | 10 | **1** |
+| 17 | 17 | **1** |
+
+and the honest converse: a 4-table chain joined entirely on non-key columns is
+decided by size alone and buys ≥ 3 of its 4 counts. Laziness is a property of
+the question, not a trick that always wins. With `UNBOUGHT = 0` instead of `1`
+the 6-table case buys **5** — see §9.5 for why the lower bound matters.
+
+**Regression — `select1-4` + `evidence/` (9,689 records):**
+
+| | v1 | v2 |
+|---|---|---|
+| passed | 9,489 (98.9 %) | 9,489 (98.9 %) |
+| unsupported | 101 | 101 |
+| **wrong answers** | 4 | **4** — the same four `slt_lang_replace` shim artifacts |
+| error mismatches | 0 | 0 |
+| whole report body | — | **diffs BYTE-IDENTICAL** (timings excluded) |
+| `select4.test` | 39.7 s | 38.6 s |
+| whole run, wall | 44.75 s | 42.96 s |
+
+**`select5.test`:** 872 / 1436, 0 wrong, report body **byte-identical**;
+1.14 s → 1.02 s.
+
+(The 22.8 s / 447.2 s figures in §10 above were measured on a different machine;
+39.7 s is this worktree's v1 control for the same file.)
+
+Also green: `cargo test --workspace --exclude mpedb-bench`,
+`crates/mpedb-testkit/tests/slt_files.rs` (the `join order:` expectations in
+`slt/joins.test` and `slt/left_join.test` are unchanged), and
+`cargo clippy --workspace --exclude mpedb-bench --all-targets -- -D warnings`.
 
 Also green: `cargo test --workspace`, `crates/mpedb-testkit/tests/slt_files.rs`
 (two EXPLAIN expectations gained the new `join order:` line), and

@@ -191,10 +191,11 @@ fn row_counts_move_the_plan_only_by_magnitude() {
     }
 }
 
-/// A LEFT join anywhere makes the whole scope ineligible — outer joins are not
-/// commutative — so the written order survives and the query still answers.
+/// A chain that is ALL barriers has no free run wider than one table, so the
+/// written order survives — not because outer joins are refused (#116 makes
+/// them a constraint), but because there is nothing left to permute.
 #[test]
-fn outer_join_chains_keep_the_written_order() {
+fn an_all_barrier_chain_has_nothing_to_reorder() {
     let db = open_chain(3, 0);
     let sql = "SELECT t1.a FROM t1 LEFT JOIN t2 ON t1.b = t2.a \
                LEFT JOIN t3 ON t2.b = t3.a WHERE t1.a = 7";
@@ -279,4 +280,308 @@ fn join_17_4_answers() {
     );
     let r = rows(&db, J17_SQL);
     assert_eq!(r.len(), 1, "the anchored path pins one tuple: {} rows", r.len());
+}
+
+// ===================== #116: constraints, not refusals =====================
+//
+// v1 REFUSED to reorder on a correlated lifted subplan, on any LEFT join, and
+// left every residual conjunct wherever the textual order happened to put it.
+// Each of those is a CONSTRAINT a solver can price, not a reason to give up
+// (design/DESIGN-MPEE-SOLVER.md §7). Every case below therefore proves TWO
+// things: that the order actually moved, and that the answer did not.
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
+
+/// The v2 fixture: three tables whose TEXTUAL order is the bad one.
+///
+/// - `a(id PK, av)` — the big one, scanned if it is placed first;
+/// - `b(id PK, aref, y)` — pinned outright by `b.id = <const>`;
+/// - `c(id PK, cv)` — the LEFT-join target, deliberately missing rows so the
+///   NULL extension is exercised and not merely present.
+const V2_DDL: &[&str] = &[
+    "CREATE TABLE a (id INTEGER PRIMARY KEY, av INTEGER)",
+    "CREATE TABLE b (id INTEGER PRIMARY KEY, aref INTEGER, y INTEGER)",
+    "CREATE TABLE c (id INTEGER PRIMARY KEY, cv INTEGER)",
+    "CREATE TABLE k (kid INTEGER PRIMARY KEY, ref INTEGER)",
+];
+
+fn v2_inserts() -> Vec<String> {
+    let mut out = Vec::new();
+    for i in 1..=8 {
+        out.push(format!("INSERT INTO a (id, av) VALUES ({i}, {})", i * 10));
+        // b.y points at c ids 1..4 only, so half the LEFT joins miss.
+        out.push(format!("INSERT INTO b (id, aref, y) VALUES ({i}, {i}, {i})"));
+    }
+    for i in 1..=4 {
+        out.push(format!("INSERT INTO c (id, cv) VALUES ({i}, {})", i * 100));
+    }
+    // `k.ref` hits a.id ∈ {1,2,4} — and 4 twice, so a correlated EXISTS is not
+    // accidentally a one-to-one join.
+    for (kid, r) in [(1, 1), (2, 2), (3, 4), (4, 4), (5, 99)] {
+        out.push(format!("INSERT INTO k (kid, ref) VALUES ({kid}, {r})"));
+    }
+    out
+}
+
+fn v2_db() -> Tmp {
+    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let path = format!(
+        "{dir}/mpedb-mpee-v2-{}-{}.mpedb",
+        std::process::id(),
+        UNIQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        "[database]\npath = \"{path}\"\nsize_mb = 16\nmax_readers = 8\n\n\
+         [[table]]\nname = \"seed\"\nprimary_key = [\"id\"]\n\
+         [[table.column]]\nname = \"id\"\ntype = \"int64\"\n"
+    );
+    let db = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    for d in V2_DDL {
+        db.query(d, &[]).unwrap();
+    }
+    for s in v2_inserts() {
+        db.query(&s, &[]).unwrap();
+    }
+    Tmp { db, path }
+}
+
+/// The same schema, the same rows and the same query through the BUNDLED
+/// sqlite 3.45 (`sqlite_oracle`), rendered `|`-separated with `NULL` for null.
+fn sqlite_out(query: &str) -> Vec<Vec<String>> {
+    let mut script = String::new();
+    for d in V2_DDL {
+        script.push_str(d);
+        script.push_str(";\n");
+    }
+    for s in v2_inserts() {
+        script.push_str(&s);
+        script.push_str(";\n");
+    }
+    script.push_str(query);
+    script.push_str(";\n");
+    sqlite_oracle::script_stdout(&script, "NULL")
+        .lines()
+        .map(|l| l.split('|').map(str::to_string).collect())
+        .collect()
+}
+
+fn cell_matches(m: &Value, s: &str) -> bool {
+    match m {
+        Value::Null => s == "NULL",
+        Value::Int(i) => s.parse::<i64>().map(|y| y == *i).unwrap_or(false),
+        Value::Float(x) => s.parse::<f64>().map(|y| (x - y).abs() <= 1e-9).unwrap_or(false),
+        Value::Bool(b) => s == if *b { "1" } else { "0" },
+        Value::Text(t) => s == t,
+        other => panic!("unexpected value type: {other:?}"),
+    }
+}
+
+/// mpedb and sqlite must return the same rows, in the same order, for `query`.
+fn agree(db: &Database, query: &str) {
+    let m = rows(db, query);
+    let s = sqlite_out(query);
+    assert_eq!(m.len(), s.len(), "row count differs for `{query}`:\n mpedb {m:?}\n sqlite {s:?}");
+    for (mr, sr) in m.iter().zip(&s) {
+        assert_eq!(mr.len(), sr.len(), "arity differs for `{query}`: {mr:?} vs {sr:?}");
+        for (mv, sv) in mr.iter().zip(sr) {
+            assert!(cell_matches(mv, sv), "cell differs for `{query}`: {mv:?} vs {sv:?}");
+        }
+    }
+}
+
+fn join_order_line(db: &Database, sql: &str) -> String {
+    let plan = explain(db, sql);
+    plan.lines()
+        .find(|l| l.trim_start().starts_with("join order:"))
+        .unwrap_or_else(|| panic!("EXPLAIN has no join-order line for `{sql}`:\n{plan}"))
+        .trim()
+        .to_string()
+}
+
+// ---- refusal 1: the CORRELATED lifted subplan ----
+
+/// **The shape v1 got wrong.** `agg_filter.rs` caught a `count(*) FILTER
+/// (WHERE EXISTS (… k.ref = a.id))` over a join returning the wrong number,
+/// because a lifted correlated subplan's `outer_args` are base-row slots of the
+/// joined tuple in the TEXTUAL order and the reorder moved the columns out from
+/// under them. v1 refused to reorder whenever any correlated subplan existed;
+/// v2 remaps the args through the permutation instead.
+///
+/// The query is written `FROM a, b` so the solver DOES move it: `b.id = 3` pins
+/// `b` outright, and entering `a` from `b` is a PK probe, so the reversed order
+/// costs nothing while the written one scans `a`.
+#[test]
+fn a_correlated_filter_over_a_reordered_join_matches_sqlite() {
+    let db = v2_db();
+    const Q: &str = "SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM k WHERE k.ref = a.id)) \
+                     FROM a, b WHERE b.aref = a.id AND b.id = 3";
+    let line = join_order_line(&db, Q);
+    assert!(
+        line.starts_with("join order: b "),
+        "the solver must actually reorder this, or the test proves nothing: {line}"
+    );
+    agree(&db, Q);
+    // …and the whole family, reordered or not: a correlated EXISTS, a
+    // correlated IN, a correlated scalar, and the un-anchored form where every
+    // `a` row participates.
+    for q in [
+        "SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM k WHERE k.ref = a.id)) \
+         FROM a, b WHERE b.aref = a.id",
+        "SELECT count(*) FILTER (WHERE NOT EXISTS (SELECT 1 FROM k WHERE k.ref = a.id)) \
+         FROM a, b WHERE b.aref = a.id AND b.id = 3",
+        "SELECT count(*) FILTER (WHERE a.id IN (SELECT ref FROM k WHERE k.ref > b.y)) \
+         FROM a, b WHERE b.aref = a.id",
+        "SELECT a.id, b.y, (SELECT count(*) FROM k WHERE k.ref = a.id) \
+         FROM a, b WHERE b.aref = a.id ORDER BY a.id",
+        "SELECT a.id FROM a, b WHERE b.aref = a.id AND EXISTS \
+         (SELECT 1 FROM k WHERE k.ref = a.id AND k.kid < b.y) ORDER BY a.id",
+    ] {
+        agree(&db, q);
+    }
+}
+
+/// The remap has to survive the plan REGISTRY too — `prepare` → encode →
+/// decode → `validate` → `execute` re-checks every `outer_arg` against the
+/// (now reordered) base row, so a stale slot would surface as `Corrupt`.
+#[test]
+fn the_remapped_correlation_survives_the_plan_registry() {
+    let db = v2_db();
+    const Q: &str = "SELECT count(*) FILTER (WHERE EXISTS (SELECT 1 FROM k WHERE k.ref = a.id)) \
+                     FROM a, b WHERE b.aref = a.id AND b.id = 3";
+    let h = db.prepare(Q).expect("a reordered correlated plan must validate");
+    let prepared = match db.execute(&h, &[]).unwrap() {
+        ExecResult::Rows { rows, .. } => rows,
+        other => panic!("expected rows, got {other:?}"),
+    };
+    assert_eq!(prepared, rows(&db, Q), "prepare/execute differs from query");
+}
+
+// ---- refusal 2: LEFT JOIN as a precedence constraint ----
+
+/// A LEFT join is a BARRIER: its inner side stays exactly where it was written,
+/// and the INNER run in front of it is reordered freely. `(A ⋈ B) ⟕ C ≡
+/// (B ⋈ A) ⟕ C` — the run's row set is identical either way, so what the outer
+/// join preserves and NULL-extends cannot move.
+#[test]
+fn a_left_join_is_a_barrier_and_the_run_in_front_of_it_reorders() {
+    let db = v2_db();
+    const Q: &str = "SELECT a.id, b.y, c.cv FROM a, b LEFT JOIN c ON c.id = b.y \
+                     WHERE b.aref = a.id AND b.id = 3 ORDER BY a.id";
+    let line = join_order_line(&db, Q);
+    assert!(
+        line.starts_with("join order: b ") && line.contains("-> a ") && line.contains("-> c "),
+        "the preserved run must reorder to b, a while c stays last: {line}"
+    );
+    agree(&db, Q);
+}
+
+/// And the NULL extension itself is unchanged — including the rows where `c`
+/// has no match at all, which is the half a wrong barrier would silently drop.
+#[test]
+fn left_join_null_extension_survives_the_reorder() {
+    let db = v2_db();
+    for q in [
+        // every `b` participates, half of them missing their `c`
+        "SELECT a.id, c.cv FROM a, b LEFT JOIN c ON c.id = b.y WHERE b.aref = a.id ORDER BY a.id",
+        // the WHERE mentions the NULL-extended side: #65 keeps it in the
+        // joined filter, so it must not become a pushed-down restriction
+        "SELECT a.id, c.cv FROM a, b LEFT JOIN c ON c.id = b.y \
+         WHERE b.aref = a.id AND (c.cv IS NULL OR c.cv > 150) ORDER BY a.id",
+        // two barriers with a free run between them
+        "SELECT a.id, c.cv FROM b LEFT JOIN c ON c.id = b.y, a \
+         WHERE b.aref = a.id ORDER BY a.id",
+        // an ON that references the preserved side only
+        "SELECT a.id, b.y, c.cv FROM a, b LEFT JOIN c ON c.id = b.y AND b.y < 3 \
+         WHERE b.aref = a.id ORDER BY a.id",
+        // a barrier first, an inner run after it
+        "SELECT b.id, c.cv, a.av FROM b LEFT JOIN c ON c.id = b.y \
+         INNER JOIN a ON a.id = b.aref WHERE b.id > 2 ORDER BY b.id",
+    ] {
+        agree(&db, q);
+    }
+}
+
+/// FULL stays refused, and it is a NAMED refusal rather than an oversight: #65
+/// disables WHERE pushdown entirely when any FULL is in the chain, so the
+/// `INNER JOIN … ON p` ≡ `CROSS JOIN … WHERE p` move this rewrite is built on
+/// has no way back to a per-step ON there.
+#[test]
+fn a_full_join_still_keeps_the_written_order() {
+    let db = v2_db();
+    const Q: &str = "SELECT a.id, c.cv FROM a FULL JOIN c ON c.id = a.id ORDER BY a.id";
+    let line = join_order_line(&db, Q);
+    assert!(line.starts_with("join order: a "), "FULL must not be reordered: {line}");
+    agree(&db, Q);
+}
+
+// ---- refusal 3: residual placement is a cost, not a default ----
+
+/// #65 evaluates a conjunct at the step that places its LAST table, so *when* a
+/// filter runs is a consequence of the order. v1 had no term for it and fell
+/// back to the textual order whenever the first three terms tied; v2 charges
+/// each conjunct the position at which it becomes evaluable, so the table
+/// carrying the most restrictions goes first.
+///
+/// Here `a` carries three single-table conjuncts and `c` one, every join is on
+/// a NON-key column (so no step can ever be KNOWN and the worst-case term ties
+/// across every connected order), and the user wrote the bad end first.
+#[test]
+fn residual_placement_is_priced_and_moves_the_order() {
+    let db = v2_db();
+    const Q: &str = "SELECT count(*) FROM c, b, a \
+                     WHERE a.av = b.y AND b.aref = c.cv \
+                       AND a.av > 0 AND a.av < 1000 AND a.id <> 99 AND c.cv > 50";
+    let line = join_order_line(&db, Q);
+    assert!(
+        line.starts_with("join order: a "),
+        "the most-restricted table should be entered first: {line}"
+    );
+    agree(&db, Q);
+}
+
+/// **The barrier's measured win.** `join-17-4`'s shape with a LEFT JOIN hung
+/// off the end: ten chain tables written scrambled, then `LEFT JOIN t11`. v1
+/// saw a non-INNER join anywhere in the chain and refused the whole scope, so
+/// it kept the scrambled order. v2 treats `t11` as a barrier, reorders the
+/// INNER run in front of it, and the same query under the same budget ANSWERS.
+///
+/// Measured on this exact query, same database, same 200 k-cell budget:
+///
+/// ```text
+/// v1: join order: t1 [scan] -> t3 [cartesian] -> t5 [cartesian] -> t7 [cartesian]
+///                 -> t9 [cartesian] -> t2 [pk] -> … -> t11 [pk]  (4 cartesian steps)
+///     => runtime budget exceeded: 200010 live joined cells > limit 200000
+///        while evaluating nested-loop join with "t9"
+/// v2: join order: t1 [scan] -> t2 [pk] -> … -> t10 [pk] -> t11 [pk] (0 cartesian steps)
+///     => 1 row
+/// ```
+#[test]
+fn a_left_join_no_longer_costs_the_whole_scope_its_ordering() {
+    let db = open_chain(11, 200_000);
+    let mut from: Vec<String> = (1..=10).step_by(2).map(|k| format!("t{k}")).collect();
+    from.extend((2..=10).step_by(2).map(|k| format!("t{k}")));
+    let sql = format!(
+        "SELECT t1.a, t11.b FROM {} LEFT JOIN t11 ON t11.a = t10.b WHERE {}",
+        from.join(", "),
+        chain_where(10, 4)
+    );
+    let plan = explain(&db, &sql);
+    let line = plan
+        .lines()
+        .find(|l| l.trim_start().starts_with("join order:"))
+        .unwrap_or_else(|| panic!("no join-order line:\n{plan}"));
+    assert!(
+        line.ends_with("(MPEE: 0 cartesian steps)"),
+        "the run in front of the barrier must be walked, not crossed: {line}"
+    );
+    assert!(
+        line.trim().starts_with("join order: t1 ") && line.contains("t11 [pk] (MPEE:"),
+        "the barrier must stay LAST while the run reorders: {line}"
+    );
+    let r = rows(&db, &sql);
+    assert_eq!(r.len(), 1, "the anchored chain pins one tuple: {r:?}");
+    // b = a % 10 + 1, so walking back from a10 = 4 gives a1 = 5.
+    assert_eq!(r[0][0], Value::Int(5), "t1.a for the anchored chain");
 }

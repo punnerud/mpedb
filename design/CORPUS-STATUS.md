@@ -217,6 +217,16 @@ The 564 records still unsupported in `select5.test` are comma joins of 18-64
 tables, refused by the plan format's `MAX_JOINS = 16` — an arity cap, not an
 ordering problem. §4 below is kept for the diagnosis that led here.
 
+**#116, the same day — the solver's refusals become constraints.** A LEFT JOIN
+is now a barrier rather than a veto (the INNER run in front of it reorders), a
+correlated lifted subplan is remapped through the permutation rather than
+refused, and a residual conjunct's placement is priced instead of inherited from
+the text. FULL and RLS stay refused, each with a stated reason
+(DESIGN-MPEE-SOLVER.md §7). Both corpus reports — `select1-4` + `evidence/`
+(9,689 records, 4 wrong, the same four shim artifacts) and `select5.test`
+(872 / 1436, 0 wrong) — **diff byte-identical** against a v1 control rebuilt in
+the same worktree. Nothing in this file's numbers moves.
+
 ## 4. `select5.test` — not measurable inside the budget (CLOSED, see above)
 
 `select5.test` (1,436 records, the N-way comma-join battery) **aborts on an
