@@ -4,7 +4,22 @@
 //! precomputed footprint (design/DESIGN.md §7.3).
 
 use crate::ast::{self, BinOp};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+
+/// The catalog's transactionally-exact per-table row count, as the planner
+/// sees it: a closure, so the SQL crate keeps depending only on `mpedb-types`
+/// and a caller with no database (`mpedb_sql::prepare`) passes a zero source.
+///
+/// This is the ONLY statistic the planner reads, it reaches only the MPEE join
+/// solver ([`mpee`]), and it is consumed only through a magnitude bucket — see
+/// design/DESIGN-MPEE-SOLVER.md §2.1/§6 for why that quantization is what keeps
+/// content-hashed plan identity stable across commits.
+pub type RowCountFn<'a> = &'a dyn Fn(u32) -> u64;
+
+/// A row-count source for callers that have no catalog: every table unknown.
+/// The solver then still runs — its decisive term (cartesian-step count) is
+/// purely structural — but cannot rank tables by size.
+pub const NO_ROW_COUNTS: RowCountFn<'static> = &|_| 0;
 
 /// What a `plan_*` helper hands back: the statement plan, the inferred parameter
 /// types, the session-context keys it referenced (in reserved-slot order), and
@@ -49,6 +64,7 @@ mod derived;
 mod footprint;
 mod fts;
 mod join;
+mod mpee;
 mod recursive;
 mod select;
 mod subquery;
@@ -407,6 +423,7 @@ pub(crate) fn plan_statement(
     // every binder-construction site alongside `mode`, for the same reason: a
     // UDF call can appear at any nesting depth.
     host_udfs: &HostUdfSet,
+    row_count: RowCountFn<'_>,
 ) -> Result<CompiledPlan> {
     let mut consts: Vec<Value> = Vec::new();
     let txn = |p: PlanStmt| {
@@ -422,25 +439,25 @@ pub(crate) fn plan_statement(
         // A surviving derived table (`FROM (SELECT …) t` the Stage-B flattener
         // could not splice) is MATERIALIZED — legal only here, at the top level.
         ast::Stmt::Select(s) if s.from_derived.is_some() => {
-            derived::plan_derived_select(s, schema, n_params, catalog, mode, host_udfs, &mut consts)?
+            derived::plan_derived_select(s, schema, n_params, catalog, mode, host_udfs, row_count, &mut consts)?
         }
         ast::Stmt::Select(s) => {
-            plan_select(s, schema, n_params, catalog, mode, host_udfs, &mut consts, None)?
+            plan_select(s, schema, n_params, catalog, mode, host_udfs, row_count, &mut consts, None)?
         }
         ast::Stmt::Compound(c) => {
-            plan_compound(c, schema, n_params, catalog, mode, host_udfs, &mut consts)?
+            plan_compound(c, schema, n_params, catalog, mode, host_udfs, row_count, &mut consts)?
         }
         ast::Stmt::RecursiveCte(rc) => {
-            plan_recursive_cte(rc, schema, n_params, catalog, mode, host_udfs, &mut consts)?
+            plan_recursive_cte(rc, schema, n_params, catalog, mode, host_udfs, row_count, &mut consts)?
         }
         ast::Stmt::Insert(s) => {
-            plan_insert(s, schema, n_params, catalog, mode, host_udfs, &mut consts)?
+            plan_insert(s, schema, n_params, catalog, mode, host_udfs, row_count, &mut consts)?
         }
         ast::Stmt::Update(s) => {
-            plan_update(s, schema, n_params, catalog, mode, host_udfs, &mut consts)?
+            plan_update(s, schema, n_params, catalog, mode, host_udfs, row_count, &mut consts)?
         }
         ast::Stmt::Delete(s) => {
-            plan_delete(s, schema, n_params, catalog, mode, host_udfs, &mut consts)?
+            plan_delete(s, schema, n_params, catalog, mode, host_udfs, row_count, &mut consts)?
         }
     };
     // The 16-subplan ceiling bounds the WHOLE tree once nesting (#73 §3) can
@@ -797,6 +814,7 @@ fn plan_compound(
     catalog: &PolicyCatalog,
     mode: BareGroupBy,
     host_udfs: &HostUdfSet,
+    row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let mut arms: Vec<SelectPlan> = Vec::with_capacity(c.arms.len());
@@ -817,7 +835,7 @@ fn plan_compound(
         // dispatch (`exec_stmt_impl`), exactly as for a single SELECT.
         let arm_base = n_params + subplans.len() as u16;
         let (stmt, ptypes, ckeys, lkeys, otypes, arm_subs) =
-            plan_select(arm_ast, schema, arm_base, catalog, mode, host_udfs, consts, None)?;
+            plan_select(arm_ast, schema, arm_base, catalog, mode, host_udfs, row_count, consts, None)?;
         let PlanStmt::Select(sp) = stmt else {
             return Err(Error::Internal("plan_select produced a non-select".into()));
         };
@@ -980,6 +998,7 @@ fn plan_insert(
     catalog: &PolicyCatalog,
     mode: BareGroupBy,
     host_udfs: &HostUdfSet,
+    row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
@@ -1042,7 +1061,7 @@ fn plan_insert(
     let mut sel_subplans: Vec<SubPlan> = Vec::new();
     if let Some(sel_stmt) = &s.select {
         let (sp_stmt, sp_pt, sp_ctx, sp_list, _sp_agg, sp_sub) =
-            plan_select(sel_stmt, schema, n_params, catalog, mode, host_udfs, consts, None)?;
+            plan_select(sel_stmt, schema, n_params, catalog, mode, host_udfs, row_count, consts, None)?;
         let PlanStmt::Select(sp) = sp_stmt else {
             return Err(bind_err(
                 "INSERT … SELECT: a compound (UNION/EXCEPT/INTERSECT) source is not supported",
@@ -1220,6 +1239,7 @@ fn plan_update(
     catalog: &PolicyCatalog,
     mode: BareGroupBy,
     host_udfs: &HostUdfSet,
+    row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
@@ -1228,7 +1248,7 @@ fn plan_update(
     // `Param(slot)`, so everything below sees only a parameter.
     let (where_ast, subplans, slot_types) = lift_where(
         s.where_clause.as_ref(), table, &s.table, schema, n_params, catalog, mode, host_udfs,
-        consts, "UPDATE",
+        row_count, consts, "UPDATE",
     )?;
     let eff_params = n_params + subplans.len() as u16;
     let mut binder = Binder::new(table, eff_params, true);
@@ -1313,13 +1333,14 @@ fn lift_where(
     catalog: &PolicyCatalog,
     mode: BareGroupBy,
     host_udfs: &HostUdfSet,
+    row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
     op: &str,
 ) -> Result<(Option<ast::Expr>, Vec<SubPlan>, Vec<Ty>)> {
     match where_clause {
         Some(w) if subquery::expr_has_subquery(w) => {
             let (e, subs, tys) = subquery::lift_dml_where(
-                w, table, table_name, schema, n_params, catalog, mode, host_udfs, consts, op,
+                w, table, table_name, schema, n_params, catalog, mode, host_udfs, row_count, consts, op,
             )?;
             Ok((Some(e), subs, tys))
         }
@@ -1334,13 +1355,14 @@ fn plan_delete(
     catalog: &PolicyCatalog,
     mode: BareGroupBy,
     host_udfs: &HostUdfSet,
+    row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
     // Subqueries in the WHERE lift out FIRST (#97) — see `plan_update`.
     let (where_ast, subplans, slot_types) = lift_where(
         s.where_clause.as_ref(), table, &s.table, schema, n_params, catalog, mode, host_udfs,
-        consts, "DELETE",
+        row_count, consts, "DELETE",
     )?;
     let eff_params = n_params + subplans.len() as u16;
     let mut binder = Binder::new(table, eff_params, true);

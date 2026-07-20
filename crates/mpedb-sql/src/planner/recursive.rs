@@ -24,6 +24,7 @@ pub(super) fn plan_recursive_cte(
     catalog: &PolicyCatalog,
     mode: BareGroupBy,
     host_udfs: &HostUdfSet,
+    row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let name = rc.name.as_str();
@@ -32,7 +33,7 @@ pub(super) fn plan_recursive_cte(
     //    working table (a `FROM <name>` there resolves to a base table or errors
     //    as unknown). Its projection fixes the CTE's arity and column types.
     let (a_stmt, a_ptypes, a_ctx, _a_list, a_out, a_subs) =
-        plan_select(&rc.anchor, schema, n_params, catalog, mode, host_udfs, consts, None)?;
+        plan_select(&rc.anchor, schema, n_params, catalog, mode, host_udfs, row_count, consts, None)?;
     reject_unsupported_component(name, "anchor", &a_ctx, &a_subs)?;
     let anchor = into_select(a_stmt);
     if a_out.len() != rc.columns.len() {
@@ -61,7 +62,7 @@ pub(super) fn plan_recursive_cte(
     let cte_def = crate::plan::cte_working_table_def(name, &rc.columns, &col_types);
     let cte = CteRef { name, def: &cte_def };
     let (r_stmt, r_ptypes, r_ctx, _r_list, r_out, r_subs) =
-        plan_select(&rc.recursive, schema, n_params, catalog, mode, host_udfs, consts, Some(cte))?;
+        plan_select(&rc.recursive, schema, n_params, catalog, mode, host_udfs, row_count, consts, Some(cte))?;
     reject_unsupported_component(name, "recursive term", &r_ctx, &r_subs)?;
     let recursive = into_select(r_stmt);
     check_recursive_term(&recursive, name)?;
@@ -98,7 +99,7 @@ pub(super) fn plan_recursive_cte(
         }
     };
     let (o_stmt, o_ptypes, o_ctx, _o_list, o_out, o_subs) =
-        plan_select(outer_ast, schema, n_params, catalog, mode, host_udfs, consts, Some(cte))?;
+        plan_select(outer_ast, schema, n_params, catalog, mode, host_udfs, row_count, consts, Some(cte))?;
     reject_unsupported_component(name, "outer statement", &o_ctx, &o_subs)?;
     let outer = into_select(o_stmt);
 

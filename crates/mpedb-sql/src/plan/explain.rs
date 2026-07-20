@@ -250,6 +250,44 @@ impl CompiledPlan {
                     "  access: {}\n",
                     self.render_access(access, schema, *table)
                 ));
+                // #114: the MPEE solver's decision, read back off the plan —
+                // the order it chose, WHY each table sits where it does (the
+                // access class it was entered with), and how many steps still
+                // multiply by a whole table with CERTAINTY. That last count is
+                // the term the solver minimises second and the one that turns
+                // `select5.test`'s `join-17-4` from a refusal into an answer
+                // (design/DESIGN-MPEE-SOLVER.md §3).
+                if !joins.is_empty() {
+                    let class = |a: &AccessPath, on: Option<&ExprProgram>| -> &'static str {
+                        match a {
+                            AccessPath::PkPoint(_) => "pk",
+                            AccessPath::IndexPoint { .. } => "index",
+                            AccessPath::PkRange { .. } | AccessPath::IndexRange { .. } => "range",
+                            AccessPath::FtsScan { .. } => "fts",
+                            // A held FullScan whose whole residual ON is the
+                            // constant TRUE has no predicate linking it to
+                            // anything already read: a cartesian step.
+                            AccessPath::FullScan => match on {
+                                Some(p) if p.is_const_true() => "cartesian",
+                                _ => "scan",
+                            },
+                        }
+                    };
+                    let mut steps =
+                        vec![format!("{} [{}]", table_name(*table), class(access, None))];
+                    let mut cart = 0usize;
+                    for j in joins {
+                        let c = class(&j.access, Some(&j.on));
+                        cart += usize::from(c == "cartesian");
+                        steps.push(format!("{} [{}]", table_name(j.table), c));
+                    }
+                    out.push_str(&format!(
+                        "  join order: {} (MPEE: {} cartesian step{})\n",
+                        steps.join(" -> "),
+                        cart,
+                        if cart == 1 { "" } else { "s" }
+                    ));
+                }
                 if let Some(f) = filter {
                     // Over the OUTER row alone, so it uses the outer's namer.
                     out.push_str(&format!("  filter: {}\n", render_program(f, &single)));

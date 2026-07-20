@@ -103,6 +103,7 @@ pub(super) fn lift_subqueries<'a>(
     catalog: &'a PolicyCatalog,
     mode: BareGroupBy,
     host_udfs: &'a HostUdfSet,
+    row_count: RowCountFn<'a>,
     consts: &'a mut Vec<Value>,
 ) -> Result<Lifted> {
     // The OUTER scope, for correlation: the same `[table0 ‖ … ‖ tableN]`
@@ -117,6 +118,7 @@ pub(super) fn lift_subqueries<'a>(
         catalog,
         mode,
         host_udfs,
+        row_count,
         consts,
         outer_scope,
         subplans: Vec::new(),
@@ -240,6 +242,7 @@ pub(super) fn lift_dml_where<'a>(
     catalog: &'a PolicyCatalog,
     mode: BareGroupBy,
     host_udfs: &'a HostUdfSet,
+    row_count: RowCountFn<'a>,
     consts: &'a mut Vec<Value>,
     op: &str,
 ) -> Result<(ast::Expr, Vec<SubPlan>, Vec<Ty>)> {
@@ -249,6 +252,7 @@ pub(super) fn lift_dml_where<'a>(
         catalog,
         mode,
         host_udfs,
+        row_count,
         consts,
         outer_scope: Scope::single_named(target_name.to_string(), target),
         subplans: Vec::new(),
@@ -274,6 +278,10 @@ struct Lift<'a> {
     /// Host-registered scalar UDFs (design/DESIGN-UDF.md), carried so a subquery
     /// can call the same UDFs as the outer statement.
     host_udfs: &'a HostUdfSet,
+    /// Catalog row counts for the MPEE join solver, carried so a subquery
+    /// body's own join chain is solved with the same inputs as the outer
+    /// statement's (design/DESIGN-MPEE-SOLVER.md §5).
+    row_count: RowCountFn<'a>,
     consts: &'a mut Vec<Value>,
     outer_scope: Scope<'a>,
     subplans: Vec<SubPlan>,
@@ -420,7 +428,7 @@ impl Lift<'_> {
     /// per execute.
     fn plan_one_compound(&mut self, cs: &ast::CompoundStmt, kind: SubPlanKind) -> Result<u16> {
         let (stmt, _ptypes, ctx, _lists, out, subs) =
-            plan_compound(cs, self.schema, self.n_params, self.catalog, self.mode, self.host_udfs, self.consts)?;
+            plan_compound(cs, self.schema, self.n_params, self.catalog, self.mode, self.host_udfs, self.row_count, self.consts)?;
         if !ctx.is_empty() {
             return Err(bind_err(
                 "current_setting() inside a subquery is not supported yet",
@@ -536,7 +544,7 @@ impl Lift<'_> {
         // reserved-slot layouts would have to be reconciled across levels).
         let inner_n = self.n_params + outer_args.len() as u16;
         let (stmt, inner_ptypes, inner_ctx, _inner_lists, inner_out, inner_subs) =
-            plan_select(&rewritten, self.schema, inner_n, self.catalog, self.mode, self.host_udfs, self.consts, None)?;
+            plan_select(&rewritten, self.schema, inner_n, self.catalog, self.mode, self.host_udfs, self.row_count, self.consts, None)?;
         // #73 §3 stage 3: a nested subquery may correlate to its IMMEDIATE
         // parent (stage 2), to a MIDDLE scope, or to the OUTERMOST scope. A
         // reference to a non-immediate ancestor was captured above as a TRANSIT

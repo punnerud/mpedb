@@ -43,7 +43,7 @@ pub use plan::{
     PlanStmt, PolicyStamp, Projection, DerivedPlan, dual_def, RecursiveCtePlan, SelectPlan, SetOp, SortDir,
     SubBody, SubPlan, SubPlanKind, WindowFunc, WindowSpec, CTE_TABLE, DUAL_TABLE,
 };
-pub use planner::secondary_indexes;
+pub use planner::{secondary_indexes, RowCountFn, NO_ROW_COUNTS};
 pub use policy::{table_policy_hash, PolicyCatalog, TablePolicies};
 pub use view::ViewCatalog;
 
@@ -88,6 +88,27 @@ pub fn prepare(sql: &str, schema: &Schema) -> Result<CompiledPlan> {
     prepare_with_policies(sql, schema, &PolicyCatalog::empty())
 }
 
+/// Compile with the catalog's per-table row counts available to the MPEE join
+/// solver (design/DESIGN-MPEE-SOLVER.md). The plain [`prepare`] passes a zero
+/// source, which leaves the solver's structural term (cartesian-step
+/// avoidance) intact but blind to table sizes.
+pub fn prepare_with_row_counts(
+    sql: &str,
+    schema: &Schema,
+    row_count: RowCountFn<'_>,
+) -> Result<CompiledPlan> {
+    Ok(prepare_maybe_explain_with_views(
+        sql,
+        schema,
+        &PolicyCatalog::empty(),
+        &view::ViewCatalog::new(),
+        BareGroupBy::default(),
+        &HostUdfSet::default(),
+        row_count,
+    )?
+    .0)
+}
+
 /// Like [`prepare`], additionally reporting whether the statement was wrapped
 /// in `EXPLAIN` (the returned plan is always the inner statement's plan; the
 /// caller renders [`CompiledPlan::explain`] instead of executing).
@@ -119,6 +140,7 @@ pub fn prepare_maybe_explain_with_policies(
         &view::ViewCatalog::new(),
         BareGroupBy::default(),
         &HostUdfSet::default(),
+        NO_ROW_COUNTS,
     )
 }
 
@@ -139,6 +161,7 @@ pub fn prepare_maybe_explain_with_views(
     // (design/DESIGN-UDF.md). Empty for callers that register none — then
     // function resolution is exactly as before. Threaded alongside `compat`.
     host_udfs: &HostUdfSet,
+    row_count: RowCountFn<'_>,
 ) -> Result<(CompiledPlan, bool)> {
     // The HOST AGGREGATE registrations reach the PARSER, not just the binder:
     // `myagg(DISTINCT x) FILTER (WHERE …)` is aggregate grammar, and the branch
@@ -161,7 +184,8 @@ pub fn prepare_maybe_explain_with_views(
         let scope: view::ViewCatalog = ctes.into_iter().collect();
         view::inline_views_with_ctes(&mut stmt, views, &scope)?;
     }
-    let plan = planner::plan_statement(&stmt, schema, n_params, catalog, compat, host_udfs)?;
+    let plan =
+        planner::plan_statement(&stmt, schema, n_params, catalog, compat, host_udfs, row_count)?;
     Ok((plan, is_explain))
 }
 

@@ -25,6 +25,7 @@ pub(super) fn plan_derived_select(
     catalog: &PolicyCatalog,
     mode: BareGroupBy,
     host_udfs: &HostUdfSet,
+    row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let body_ast = s.from_derived.as_deref().expect("caller checked from_derived");
@@ -37,10 +38,10 @@ pub(super) fn plan_derived_select(
     // 1. The body, planned as a standalone statement.
     let (b_stmt, b_ptypes, b_ctx, _b_list, b_out, b_subs) = match body_ast {
         ast::SubqueryBody::Select(bs) => {
-            plan_select(bs, schema, n_params, catalog, mode, host_udfs, consts, None)?
+            plan_select(bs, schema, n_params, catalog, mode, host_udfs, row_count, consts, None)?
         }
         ast::SubqueryBody::Compound(bc) => {
-            plan_compound(bc, schema, n_params, catalog, mode, host_udfs, consts)?
+            plan_compound(bc, schema, n_params, catalog, mode, host_udfs, row_count, consts)?
         }
     };
     reject_context(&name, "derived-table body", &b_ctx)?;
@@ -103,7 +104,7 @@ pub(super) fn plan_derived_select(
         )));
     }
     let (o_stmt, o_ptypes, o_ctx, _o_list, o_out, o_subs) =
-        plan_select(&outer_ast, schema, n_params, catalog, mode, host_udfs, consts, Some(cte))?;
+        plan_select(&outer_ast, schema, n_params, catalog, mode, host_udfs, row_count, consts, Some(cte))?;
     reject_context(&name, "outer statement", &o_ctx)?;
     // Unreachable — `has_subquery` refused above — but a silent slot collision
     // would be worse than a redundant check: the outer numbers ITS lifts from
