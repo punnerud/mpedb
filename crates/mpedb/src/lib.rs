@@ -2632,7 +2632,7 @@ primary_key = ["id"]
         let other_schema = Schema::new(vec![TableDef {
             id: 0,
             name: "users".into(),
-            columns: vec![ColumnDef {
+            columns: vec![ColumnDef { decl: None,
                 name: "id".into(),
                 ty: ColumnType::Int64,
                 nullable: false,
@@ -2987,7 +2987,7 @@ primary_key = ["id"]
         let foreign_schema = Schema::new(vec![TableDef {
             id: 0,
             name: "users".into(),
-            columns: vec![ColumnDef {
+            columns: vec![ColumnDef { decl: None,
                 name: "id".into(),
                 ty: ColumnType::Int64,
                 nullable: false,
