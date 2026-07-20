@@ -465,6 +465,13 @@ pub(crate) enum WindowFunc {
     Ntile,
     PercentRank,
     CumeDist,
+    /// A HOST-registered WINDOW aggregate — sqlite's `create_window_function`
+    /// (`xStep`/`xFinal` PLUS `xValue`/`xInverse`). The name is resolved at
+    /// exec time against the connection's registry, exactly as a host
+    /// aggregate's is; the extra pair is what makes a MOVING frame computable,
+    /// which is why a plain `create_function` aggregate still cannot take an
+    /// OVER clause.
+    Host(String),
 }
 
 /// The `OVER ( [PARTITION BY …] [ORDER BY …] [frame] )` spec. `frame` is `None`

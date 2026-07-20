@@ -13,7 +13,7 @@
 
 use super::*;
 use mpedb_sql::{Frame, FrameBound, FrameMode, WindowFunc, WindowSpec};
-use mpedb_types::Accum;
+use mpedb_types::{Accum, HostAggState, HostAggs};
 use std::cmp::Ordering;
 
 /// Execute a windowed SELECT: gather the base rows in full, compute every window,
@@ -47,7 +47,7 @@ pub(super) fn exec_select_windowed(
         gather_rows(ctx, sp.table, &sp.access, sp.filter.as_ref(), plan, params, None)?
     };
 
-    compute_windows(&mut rows, &sp.windows, params)?;
+    compute_windows(&mut rows, &sp.windows, params, ctx.host_aggs())?;
 
     // Project over the extended rows `[base ‖ w0..wk]`. DISTINCT dedups the
     // projected tuples AFTER the window phase (the same key encoding the plain
@@ -102,6 +102,10 @@ pub(super) fn compute_windows(
     rows: &mut [Vec<Value>],
     windows: &[WindowSpec],
     params: &[Value],
+    // The connection's HOST window-aggregate registry, for
+    // `WindowFunc::Host` (design/DESIGN-UDF.md stage 4). `None` wherever no
+    // host registration can be in scope — the mechanism stays inert.
+    host_aggs: Option<&dyn HostAggs>,
 ) -> Result<()> {
     if rows.is_empty() || windows.is_empty() {
         return Ok(());
@@ -170,6 +174,7 @@ pub(super) fn compute_windows(
             &arg_vals,
             &default_vals,
             &dirs,
+            host_aggs,
         )?;
     }
     Ok(())
@@ -190,6 +195,7 @@ fn assign_window(
     arg_vals: &[Option<Value>],
     default_vals: &[Value],
     dirs: &[bool],
+    host_aggs: Option<&dyn HostAggs>,
 ) -> Result<()> {
     let slot = base_width + k;
     let has_order = !w.order_by.is_empty();
@@ -224,6 +230,8 @@ fn assign_window(
                 order_vals,
                 dirs,
                 has_order,
+                w.host.as_deref(),
+                host_aggs,
             )?;
             p = q;
             continue;
@@ -288,6 +296,21 @@ fn assign_window(
                         g = h;
                     }
                 }
+            }
+            // A HOST window aggregate under the DEFAULT frame: the same
+            // cumulative-through-the-peer-group rule as the built-in above,
+            // driven through the caller's xStep/xValue instead of `Accum`.
+            WindowFunc::Host => {
+                assign_host_default(
+                    slot,
+                    part,
+                    rows,
+                    arg_vals,
+                    &peers,
+                    has_order,
+                    w.host.as_deref(),
+                    host_aggs,
+                )?;
             }
             // lag/lead: frame-INDEPENDENT. A PHYSICAL row offset in window order
             // (not a peer-group hop) — the value `offset` rows before (lag) /
@@ -449,8 +472,17 @@ fn assign_framed(
     order_vals: &[Vec<Value>],
     dirs: &[bool],
     has_order: bool,
+    host: Option<&str>,
+    host_aggs: Option<&dyn HostAggs>,
 ) -> Result<()> {
     let len = part.len();
+    // A HOST window aggregate is the one function here that is NOT re-aggregated
+    // per row: it SLIDES (see `assign_host_framed`).
+    if matches!(func, WindowFunc::Host) {
+        return assign_host_framed(
+            slot, part, rows, frame, arg_vals, order_vals, dirs, has_order, host, host_aggs,
+        );
+    }
     // Peer-group structure is needed only for GROUPS/RANGE (they count / span
     // peer groups); ROWS is a purely physical offset and skips it.
     let (group_of, group_starts) = if matches!(frame.mode, FrameMode::Rows) {
@@ -501,6 +533,132 @@ fn assign_framed(
             _ => return Err(internal("explicit frame on an unsupported window function")),
         };
     }
+    Ok(())
+}
+
+/// Resolve a HOST window aggregate's name to a fresh accumulation state.
+fn new_host_state(
+    host: Option<&str>,
+    host_aggs: Option<&dyn HostAggs>,
+) -> Result<Box<dyn HostAggState>> {
+    let (Some(name), Some(reg)) = (host, host_aggs) else {
+        // The plan named one and the connection has no registry (or the plan
+        // carries no name at all) — a plan/registry mismatch, not a data error.
+        return Err(internal("host window aggregate is not registered on this connection"));
+    };
+    reg.create(name, 1)
+}
+
+/// Assign a HOST window aggregate's values under an EXPLICIT frame, by SLIDING.
+///
+/// This is the one place mpedb's window executor does not simply re-aggregate
+/// per row, and the reason is sqlite's contract rather than performance: a host
+/// window function is registered with `xStep`/`xFinal` **plus** `xValue` and
+/// `xInverse` precisely so the frame can move, and a consumer's callbacks are
+/// written expecting exactly that call sequence. Re-aggregating would never
+/// invoke `xInverse` and would call `xFinal` once per row — observably different
+/// for any implementation that counts its calls or holds state.
+///
+/// The slide is legal because every frame shape mpedb accepts is MONOTONE in
+/// window order: `lo` and `hi` are both non-decreasing as the current row
+/// advances. The loop keeps the half-open range `[cur_lo, cur_hi)` stepped into
+/// the state, extends it on the right with `step` and retracts it on the left
+/// with `inverse`. A non-monotone move would be a bug elsewhere; rather than
+/// trust that, it is detected and the state rebuilt from scratch — correct
+/// under any frame, at worst quadratic.
+///
+/// `xFinal` runs once per PARTITION, at the end, and its error is swallowed:
+/// sqlite does not propagate a finalizer failure out of `sqlite3_step`, and
+/// CPython's suite pins that (`test_win_exception_in_finalize`).
+#[allow(clippy::too_many_arguments)]
+fn assign_host_framed(
+    slot: usize,
+    part: &[usize],
+    rows: &mut [Vec<Value>],
+    frame: &Frame,
+    arg_vals: &[Option<Value>],
+    order_vals: &[Vec<Value>],
+    dirs: &[bool],
+    has_order: bool,
+    host: Option<&str>,
+    host_aggs: Option<&dyn HostAggs>,
+) -> Result<()> {
+    let len = part.len();
+    let (group_of, group_starts) = if matches!(frame.mode, FrameMode::Rows) {
+        (Vec::new(), Vec::new())
+    } else {
+        build_groups(part, order_vals, dirs, has_order)
+    };
+    let arg_at = |p: usize| arg_vals[part[p]].clone().unwrap_or(Value::Null);
+    let mut state = new_host_state(host, host_aggs)?;
+    let (mut cur_lo, mut cur_hi) = (0usize, 0usize);
+    for off in 0..len {
+        let (lo, hi) = frame_bounds(off, len, frame, &group_of, &group_starts);
+        if lo < cur_lo || hi < cur_hi {
+            // Not monotone: start this row's frame from an empty state.
+            state = new_host_state(host, host_aggs)?;
+            cur_lo = lo;
+            cur_hi = lo;
+        }
+        while cur_hi < hi {
+            state.step(&[arg_at(cur_hi)])?;
+            cur_hi += 1;
+        }
+        while cur_lo < lo {
+            state.inverse(&[arg_at(cur_lo)])?;
+            cur_lo += 1;
+        }
+        rows[part[off]][slot] = state.value()?;
+    }
+    let _ = state.finish();
+    Ok(())
+}
+
+/// Assign a HOST window aggregate's values under the DEFAULT frame: the whole
+/// partition when the window has no ORDER BY, else cumulative through the end of
+/// each peer group (`RANGE UNBOUNDED PRECEDING → CURRENT ROW`, the same rule the
+/// built-in aggregate window follows).
+///
+/// No `xInverse` here — the frame's left edge never moves — so this is `xStep`
+/// plus a per-group `xValue`, and one `xFinal` at the partition's end.
+#[allow(clippy::too_many_arguments)]
+fn assign_host_default(
+    slot: usize,
+    part: &[usize],
+    rows: &mut [Vec<Value>],
+    arg_vals: &[Option<Value>],
+    peers: &dyn Fn(usize, usize) -> bool,
+    has_order: bool,
+    host: Option<&str>,
+    host_aggs: Option<&dyn HostAggs>,
+) -> Result<()> {
+    let mut state = new_host_state(host, host_aggs)?;
+    if !has_order {
+        for &i in part {
+            state.step(&[arg_vals[i].clone().unwrap_or(Value::Null)])?;
+        }
+        let v = state.value()?;
+        for &i in part {
+            rows[i][slot] = v.clone();
+        }
+    } else {
+        let mut g = 0usize;
+        while g < part.len() {
+            let mut h = g + 1;
+            while h < part.len() && peers(part[h], part[g]) {
+                h += 1;
+            }
+            for &i in &part[g..h] {
+                state.step(&[arg_vals[i].clone().unwrap_or(Value::Null)])?;
+            }
+            let v = state.value()?;
+            for &i in &part[g..h] {
+                rows[i][slot] = v.clone();
+            }
+            g = h;
+        }
+    }
+    let _ = state.finish();
     Ok(())
 }
 

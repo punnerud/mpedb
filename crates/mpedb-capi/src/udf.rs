@@ -197,6 +197,12 @@ pub struct HostFn {
     pub x_func: *mut c_void,
     pub x_step: *mut c_void,
     pub x_final: *mut c_void,
+    /// The WINDOW half, for a `create_window_function` registration; NULL
+    /// otherwise. Kept for the same reason `x_step` is — a reinstall must not
+    /// silently DEMOTE a window aggregate to a plain one, which would turn
+    /// `OVER` from working into a refusal.
+    pub x_value: *mut c_void,
+    pub x_inverse: *mut c_void,
 }
 
 impl HostFn {
@@ -211,7 +217,16 @@ impl HostFn {
         if self.aggregate {
             let step: XStep = std::mem::transmute(self.x_step);
             let fin: XFinal = std::mem::transmute(self.x_final);
-            db.register_host_aggregate(&self.name, self.n_arg, make_agg_factory(step, fin, self.p_app));
+            let val: Option<XFinal> =
+                (!self.x_value.is_null()).then(|| std::mem::transmute(self.x_value));
+            let inv: Option<XStep> =
+                (!self.x_inverse.is_null()).then(|| std::mem::transmute(self.x_inverse));
+            let f = make_window_agg_factory(step, fin, val, inv, self.p_app);
+            if val.is_some() && inv.is_some() {
+                db.register_host_window_aggregate(&self.name, self.n_arg, f);
+            } else {
+                db.register_host_aggregate(&self.name, self.n_arg, f);
+            }
         } else if !self.x_func.is_null() {
             let f: XFunc = std::mem::transmute(self.x_func);
             db.register_host_function(&self.name, self.n_arg, make_scalar_closure(f, self.p_app));
@@ -289,6 +304,13 @@ pub type XFinal = unsafe extern "C" fn(*mut SqliteContext);
 struct XAggPtrs {
     x_step: XStep,
     x_final: XFinal,
+    /// WINDOW half (`sqlite3_create_window_function`): `xValue` reports the
+    /// current frame's result without consuming the context, `xInverse` undoes
+    /// one row that has left the frame. `None` for a plain
+    /// `create_function` aggregate, which is why such a name cannot take an
+    /// `OVER` clause at all.
+    x_value: Option<XFinal>,
+    x_inverse: Option<XStep>,
     p_app: *mut c_void,
 }
 unsafe impl Send for XAggPtrs {}
@@ -302,6 +324,16 @@ impl XAggPtrs {
     }
     unsafe fn finalize(&self, ctx: *mut SqliteContext) {
         (self.x_final)(ctx)
+    }
+    unsafe fn value(&self, ctx: *mut SqliteContext) {
+        if let Some(f) = self.x_value {
+            f(ctx)
+        }
+    }
+    unsafe fn invert(&self, ctx: *mut SqliteContext, argc: c_int, argv: *mut *mut SqliteValue) {
+        if let Some(f) = self.x_inverse {
+            f(ctx, argc, argv)
+        }
     }
     fn p_app(&self) -> *mut c_void {
         self.p_app
@@ -328,8 +360,16 @@ impl CAggState {
     }
 }
 
-impl mpedb::HostAggState for CAggState {
-    fn step(&mut self, args: &[Value]) -> DbResult<()> {
+impl CAggState {
+    /// Run one ROW-shaped callback (`xStep` or `xInverse`) over `args`, mapping
+    /// a `sqlite3_result_error` into an `Error`. Both take the same
+    /// `(ctx, argc, argv)` shape, so the marshalling lives here once.
+    fn row_call(
+        &mut self,
+        args: &[Value],
+        inverse: bool,
+        what: &str,
+    ) -> DbResult<()> {
         let mut values: Vec<SqliteValue> = args.iter().cloned().map(SqliteValue::new).collect();
         let mut argv: Vec<*mut SqliteValue> =
             values.iter_mut().map(|v| v as *mut SqliteValue).collect();
@@ -339,22 +379,64 @@ impl mpedb::HostAggState for CAggState {
         // three outlive the call. The callback writes only through the shim
         // result/value/aggregate-context accessors, which operate on them.
         unsafe {
-            ptrs.step(
-                &mut ctx as *mut SqliteContext,
-                args.len() as c_int,
-                argv.as_mut_ptr(),
-            );
+            let p = &mut ctx as *mut SqliteContext;
+            let n = args.len() as c_int;
+            if inverse {
+                ptrs.invert(p, n, argv.as_mut_ptr());
+            } else {
+                ptrs.step(p, n, argv.as_mut_ptr());
+            }
         }
         drop(argv);
         drop(values);
         match ctx.error {
             Some((code, msg)) => {
                 stash_udf_error(code, &msg);
-                Err(DbError::Unsupported(format!(
-                    "user aggregate raised: {msg}"
-                )))
+                Err(DbError::Unsupported(format!("user {what} raised: {msg}")))
             }
             None => Ok(()),
+        }
+    }
+}
+
+impl mpedb::HostAggState for CAggState {
+    fn step(&mut self, args: &[Value]) -> DbResult<()> {
+        self.row_call(args, false, "aggregate")
+    }
+
+    fn inverse(&mut self, args: &[Value]) -> DbResult<()> {
+        if self.ptrs.x_inverse.is_none() {
+            return Err(DbError::Unsupported(
+                "this aggregate has no xInverse and cannot be used as a window function".into(),
+            ));
+        }
+        self.row_call(args, true, "window aggregate inverse")
+    }
+
+    /// `xValue`: the current frame's result, WITHOUT freeing the aggregate
+    /// context — the accumulation keeps sliding afterwards, and `xFinal` still
+    /// runs once at the partition's end.
+    fn value(&mut self) -> DbResult<Value> {
+        if self.ptrs.x_value.is_none() {
+            return Err(DbError::Unsupported(
+                "this aggregate has no xValue and cannot be used as a window function".into(),
+            ));
+        }
+        let ptrs = self.ptrs;
+        let mut ctx = self.ctx();
+        // SAFETY: as `row_call`; `ctx.agg` points at `self.mem`, which outlives
+        // the call and is deliberately NOT freed here.
+        unsafe {
+            ptrs.value(&mut ctx as *mut SqliteContext);
+        }
+        match ctx.error {
+            Some((code, msg)) => {
+                stash_udf_error(code, &msg);
+                Err(DbError::Unsupported(format!(
+                    "user window aggregate raised: {msg}"
+                )))
+            }
+            None => Ok(ctx.result),
         }
     }
 
@@ -387,7 +469,20 @@ pub fn make_agg_factory(
     x_final: XFinal,
     p_app: *mut c_void,
 ) -> impl Fn() -> Box<dyn mpedb::HostAggState> + Send + Sync + 'static {
-    let ptrs = XAggPtrs { x_step, x_final, p_app };
+    make_window_agg_factory(x_step, x_final, None, None, p_app)
+}
+
+/// The same, for a `sqlite3_create_window_function` registration: `xValue` and
+/// `xInverse` ride along so the state can report a frame's value without being
+/// consumed and can retract a row that has left the frame.
+pub fn make_window_agg_factory(
+    x_step: XStep,
+    x_final: XFinal,
+    x_value: Option<XFinal>,
+    x_inverse: Option<XStep>,
+    p_app: *mut c_void,
+) -> impl Fn() -> Box<dyn mpedb::HostAggState> + Send + Sync + 'static {
+    let ptrs = XAggPtrs { x_step, x_final, x_value, x_inverse, p_app };
     move || -> Box<dyn mpedb::HostAggState> {
         Box::new(CAggState { ptrs, mem: AggMem::default() })
     }

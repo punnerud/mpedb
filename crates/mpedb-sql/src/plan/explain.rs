@@ -410,6 +410,13 @@ impl CompiledPlan {
                         WF::LastValue => format!("last_value({})", argp()),
                         WF::NthValue(n) => format!("nth_value({}, {n})", argp()),
                         WF::Ntile(n) => format!("ntile({n})"),
+                        // A host window aggregate: the NAME lives beside the
+                        // tag, so EXPLAIN shows what the caller wrote.
+                        WF::Host => format!(
+                            "{}({})",
+                            w.host.as_deref().unwrap_or("?"),
+                            argp()
+                        ),
                         WF::PercentRank => "percent_rank()".to_string(),
                         WF::CumeDist => "cume_dist()".to_string(),
                     };

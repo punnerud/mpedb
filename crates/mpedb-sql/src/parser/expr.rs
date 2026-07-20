@@ -766,21 +766,40 @@ impl<'a> Parser<'a> {
                         "FILTER (WHERE …) on a window aggregate (OVER …) is not supported",
                     ));
                 }
-                // A HOST aggregate has no window form: `xStep`/`xFinal` cannot be
-                // rewound over a moving frame, and sqlite itself requires the
-                // separate `create_window_function` (xValue/xInverse) for that —
-                // which the shim refuses. Refuse here rather than silently
-                // computing a whole-partition value.
-                let Some(f) = f_native else {
-                    return Err(self.err_here(format!(
-                        "{}() is a user-defined aggregate and cannot be used with OVER \
-                         (user-defined window functions are not supported)",
-                        target.name()
-                    )));
+                // A plain `xStep`/`xFinal` HOST aggregate still has no window
+                // form: it cannot be rewound over a moving frame. sqlite draws
+                // exactly the same line — a window registration is the separate
+                // `create_window_function`, which ALSO supplies `xValue` and
+                // `xInverse`. Only a name registered that way (`window_aggs`)
+                // takes an OVER clause; anything else is refused here rather
+                // than silently answered with a whole-partition value.
+                let func = match f_native {
+                    Some(f) => WindowFunc::Agg(f),
+                    None => {
+                        let hname = target.name().to_ascii_lowercase();
+                        if !self.window_aggs.contains(&hname) {
+                            return Err(self.err_here(format!(
+                                "{}() is a user-defined aggregate and cannot be used with \
+                                 OVER — a window function must be registered with the \
+                                 inverse/value pair (sqlite's create_window_function)",
+                                target.name()
+                            )));
+                        }
+                        // The sliding protocol feeds `xInverse` the SAME
+                        // arguments a row was stepped with, one row at a time,
+                        // so only the single-argument shape is expressible here.
+                        if arg.is_none() || !host_extra.is_empty() {
+                            return Err(self.err_here(format!(
+                                "{}() OVER (…) takes exactly one argument",
+                                target.name()
+                            )));
+                        }
+                        WindowFunc::Host(hname)
+                    }
                 };
                 let spec = self.window_over()?;
                 return Ok(Expr::Window {
-                    func: WindowFunc::Agg(f),
+                    func,
                     arg,
                     extra_args: Vec::new(),
                     distinct,
