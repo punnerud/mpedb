@@ -16,25 +16,63 @@ impl<'a> Parser<'a> {
     pub(super) fn insert_stmt(&mut self) -> Result<Stmt> {
         self.expect_kw(Kw::Insert, "INSERT")?;
         // sqlite's conflict-resolution prefix: INSERT OR {IGNORE | ABORT | FAIL
-        // | ROLLBACK | REPLACE}. IGNORE = skip conflicting rows; ABORT/FAIL/
-        // ROLLBACK = error (mpedb's default). REPLACE deletes every row the new
-        // one conflicts with (PK + each unique index) then inserts.
+        // | ROLLBACK | REPLACE}. The five differ only in what survives a
+        // conflict, so each is accepted ONLY where mpedb can honor it exactly:
+        //
+        // * IGNORE   — skip the conflicting row. `OnConflict::DoNothing`.
+        // * REPLACE  — delete every row the new one conflicts with, then
+        //              insert. `OnConflict::Replace`.
+        // * ABORT    — undo this statement's changes, keep the transaction.
+        //              mpedb statements are atomic, so this IS the default.
+        // * FAIL     — stop at the conflicting row and KEEP the rows already
+        //              inserted by this statement. Unexpressible: an mpedb
+        //              statement is all-or-nothing, so it is accepted only for
+        //              a single-row source (where FAIL == ABORT exactly) and
+        //              refused by name for a multi-row one — silently undoing
+        //              the prior rows would be a wrong answer.
+        // * ROLLBACK — abort the enclosing TRANSACTION. A statement cannot
+        //              reach the session that owns it, so this refuses by
+        //              name. (The C-API shim implements it at the layer that
+        //              does own the transaction: it runs the statement as
+        //              OR ABORT and rolls the connection back on a constraint
+        //              error — see `mpedb-capi`'s `rollback_on_conflict`.)
+        let mut fail_semantics = false;
         let or_conflict = if self.eat_kw(Kw::Or) {
             if self.eat_word("IGNORE") {
                 Some(OnConflict::DoNothing)
             } else if self.eat_word("REPLACE") {
                 Some(OnConflict::Replace)
-            } else if self.eat_word("ABORT") || self.eat_word("FAIL") || self.eat_word("ROLLBACK") {
+            } else if self.eat_word("ABORT") {
                 Some(OnConflict::Error)
+            } else if self.eat_word("FAIL") {
+                fail_semantics = true;
+                Some(OnConflict::Error)
+            } else if self.peek() == Some(&Tok::Kw(Kw::Rollback)) {
+                return Err(self.err_here(
+                    "INSERT OR ROLLBACK is not supported: a statement cannot abort the \
+                     transaction that contains it — use OR ABORT and ROLLBACK explicitly",
+                ));
             } else {
                 return Err(
-                    self.err_here("expected IGNORE, REPLACE, ABORT, FAIL, or ROLLBACK after OR")
+                    self.err_here("expected IGNORE, REPLACE, ABORT, or FAIL after OR")
                 );
             }
         } else {
             None
         };
-        self.insert_body(or_conflict)
+        let stmt = self.insert_body(or_conflict)?;
+        if fail_semantics {
+            if let Stmt::Insert(ins) = &stmt {
+                if ins.select.is_some() || ins.rows.len() > 1 {
+                    return Err(self.err_here(
+                        "INSERT OR FAIL over a multi-row source is not supported: mpedb \
+                         statements are atomic, so the rows inserted before the conflict \
+                         cannot be kept — use OR ABORT (undo all) or OR IGNORE (skip)",
+                    ));
+                }
+            }
+        }
+        Ok(stmt)
     }
 
     /// The `[…] INTO table [(cols)] {VALUES … | SELECT …} [ON CONFLICT …]

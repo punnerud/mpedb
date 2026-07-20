@@ -309,6 +309,25 @@ fn rollback_txn(c: &mut Sqlite3) {
 /// state. Transaction-control statements are intercepted; everything else is
 /// routed to the open `WriteSession` (if any) or the autocommit facade.
 fn exec_one(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome, DbError> {
+    // `INSERT OR ROLLBACK` is the one conflict action a statement cannot carry
+    // out on its own — it aborts the enclosing TRANSACTION, and the connection
+    // is what owns that. mpedb's parser refuses it by name; the shim runs it as
+    // `OR ABORT` and rolls the connection back itself when the conflict fires
+    // (sqlite's exact definition of the action). See `sql::rewrite_insert_or_rollback`.
+    let (or_rollback_sql, or_rollback) = sql::rewrite_insert_or_rollback(sqltext);
+    if or_rollback {
+        let res = exec_one_inner(c, &or_rollback_sql, params);
+        if let Err(e) = &res {
+            if valconv::error_codes(e).0 == SQLITE_CONSTRAINT {
+                rollback_txn(c);
+            }
+        }
+        return res;
+    }
+    exec_one_inner(c, sqltext, params)
+}
+
+fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome, DbError> {
     use sql::Kind;
     // sqlite's parser skips leading comments; mpedb's does not — strip them
     // here so `-- comment\nINSERT …` (a shape CPython's suite and iterdump
@@ -1307,7 +1326,11 @@ unsafe fn prepare_common(
         // The engine's parser does not skip leading comments (exec_one strips
         // them at execution) — validate the same stripped text it will run.
         let to_validate = sql::strip_leading_trivia(&scan.rewritten);
-        match catch_unwind(AssertUnwindSafe(|| c.db.prepare_detached(to_validate))) {
+        // `INSERT OR ROLLBACK` is executed as `OR ABORT` plus a connection
+        // rollback (see `exec_one`), so validate the text the engine will
+        // actually be handed — the engine's parser refuses ROLLBACK by name.
+        let (to_validate, _) = sql::rewrite_insert_or_rollback(to_validate);
+        match catch_unwind(AssertUnwindSafe(|| c.db.prepare_detached(&to_validate))) {
             Ok(Ok(_plan)) => {}
             Ok(Err(e)) => return c.set_db_error(&e),
             Err(_) => {

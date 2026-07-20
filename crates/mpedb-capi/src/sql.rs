@@ -103,6 +103,53 @@ pub fn strip_leading_trivia(sql: &str) -> &str {
     &sql[first..]
 }
 
+/// `INSERT OR ROLLBACK …` / `REPLACE`-style conflict prefix handling.
+///
+/// sqlite's five conflict actions differ only in what survives a constraint
+/// violation, and four of them are statement-local — mpedb's parser takes
+/// those (`IGNORE`, `REPLACE`, `ABORT`, and `FAIL` on a single-row source).
+/// `ROLLBACK` is the odd one out: it aborts the enclosing TRANSACTION, which
+/// no statement can reach, so mpedb's parser refuses it by name.
+///
+/// The shim is the layer that *does* own the transaction (`Sqlite3::txn`), so
+/// it implements `OR ROLLBACK` itself: the statement runs as `OR ABORT`, and a
+/// constraint failure rolls the connection's open transaction back before the
+/// error is returned. That is exactly sqlite's definition of the action.
+///
+/// Returns the rewritten text (`ROLLBACK` → `ABORT`, same byte length so every
+/// downstream offset is unchanged) and whether the prefix was present. Only a
+/// leading `INSERT OR ROLLBACK` is recognized — the conflict prefix has no
+/// other legal position.
+pub fn rewrite_insert_or_rollback(sql: &str) -> (std::borrow::Cow<'_, str>, bool) {
+    let head = strip_leading_trivia(sql).trim_start();
+    let off = sql.len() - head.len();
+    let mut end = 0usize;
+    let mut rest = head;
+    let mut consumed = 0usize;
+    // The prefix is exactly the first three words: INSERT, OR, ROLLBACK.
+    for expect in ["insert", "or", "rollback"] {
+        let trimmed = rest.trim_start();
+        consumed += rest.len() - trimmed.len();
+        let word: String = trimmed
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .flat_map(|c| c.to_lowercase())
+            .collect();
+        if word != expect {
+            return (std::borrow::Cow::Borrowed(sql), false);
+        }
+        consumed += word.len();
+        end = consumed;
+        rest = &trimmed[word.len()..];
+    }
+    let start = off + end - "rollback".len();
+    let mut out = String::with_capacity(sql.len());
+    out.push_str(&sql[..start]);
+    out.push_str("ABORT   "); // same width as "rollback": offsets are preserved
+    out.push_str(&sql[start + "rollback".len()..]);
+    (std::borrow::Cow::Owned(out), true)
+}
+
 /// Rewrite `zeroblob(<constant>)` calls to the equivalent blob LITERAL
 /// (`x'00…'`) in code regions, leaving strings/quoted-idents/comments untouched.
 ///
