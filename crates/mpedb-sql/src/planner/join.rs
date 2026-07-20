@@ -561,21 +561,25 @@ pub(super) fn plan_join_select<'s>(
         // returned one row where sqlite3/PG return two). junk = None: a sort
         // key that is not in the SELECT list is refused, because after the
         // dedup it is *which duplicate survived* that would decide the order.
-        let (keys, n_junk) = distinct_order_by(s, &full_scope, None)?;
+        let (keys, n_junk) = distinct_order_by(s, &full_scope, None, binder.host_colls())?;
         order_by = keys;
         order_over = OrderOver::Projection;
         order_junk = n_junk;
     } else if !s.order_by.is_empty() {
         // The "base row" of a join IS the joined row, and it is built in full
         // before the sort — so sorting it is the same operation, just wider.
+        let hcolls: Vec<String> = binder.host_colls().to_vec();
+        let hcolls = &hcolls[..];
         let mut keys = Vec::with_capacity(s.order_by.len());
         let mut all_cols = true;
         for (e, desc) in &s.order_by {
             // Peel an explicit `COLLATE`; the inner expression must be a bare
             // joined-row column for this fast path, and the collation rides the
             // sort tuple.
-            let (e, coll) = peel_collate(e)?;
-            let coll = coll.unwrap_or_else(|| declared_collation(e, &binder.scope));
+            let (e, coll) = peel_order_collate(e, hcolls)?;
+            let coll = coll.unwrap_or_else(|| {
+                mpedb_types::OrderColl::Native(declared_collation(e, &binder.scope))
+            });
             // Same PG rule as the single-table path: an output ALIAS wins
             // over an input column of the same name.
             if let ast::Expr::Col(n) = e {
@@ -804,13 +808,17 @@ fn join_order_by(
     namer: &dyn Fn(u16) -> String,
 ) -> Result<(OrderKeys, u16)> {
     let items = s.items.as_ref();
+    let hcolls: Vec<String> = binder.host_colls().to_vec();
+    let hcolls = &hcolls[..];
     let mut keys = Vec::with_capacity(s.order_by.len());
     let mut n_junk = 0u16;
     for (i, (e, desc)) in s.order_by.iter().enumerate() {
         // Peel an explicit `COLLATE`; the inner expression drives resolution
         // (output position or sort-only column), the collation rides the sort.
-        let (e, coll) = peel_collate(e)?;
-        let coll = coll.unwrap_or_else(|| declared_collation(e, &binder.scope));
+        let (e, coll) = peel_order_collate(e, hcolls)?;
+        let coll = coll.unwrap_or_else(|| {
+            mpedb_types::OrderColl::Native(declared_collation(e, &binder.scope))
+        });
         if let Some(items) = items {
             if let Some(pos) = ordinal(e, items.len())? {
                 keys.push((pos, *desc, coll));

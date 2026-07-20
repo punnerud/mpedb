@@ -1206,6 +1206,28 @@ system python: `PYTHONPATH=… python3 -m test test_sqlite3`, per-test results
 diffed via `--junit-xml`. Engine = `main` @ `acdf180` + the three capi commits
 below.
 
+### #112 wave 2 (2026-07-20): decltype verbatim, collations, N-ary aggregates
+
+Three buckets, measured on the same route at `main` @ `976a658`:
+
+| arm | run | pass | fail/err | skip |
+|---|---|---|---|---|
+| baseline at this head | 466 | **350** | 111 | 5 |
+| + bucket A (decltype verbatim) | 466 | **357** | 104 | 5 |
+| + buckets B (collations) + C (N-ary aggregates) | 466 | **369** | 92 | 5 |
+
+* **A — declared-type verbatim, +7.** The one SILENT divergence on the list is
+  closed: see E3(a) below. All 6 `DeclTypesTests` plus `DateTimeTests.
+  test_sqlite_date` (a `d date` column is `Any`, so its decltype was NULL and
+  the DATE converter never ran). Schema canonical bytes v7 → v8; the whole
+  workspace suite passes unchanged, and the only in-tree edits the bump forced
+  were three version-byte assertions.
+* **B — custom collations, +6.** See E6. The scope is deliberately partial and
+  the rest refuses by name.
+* **C — N-ary host aggregates, +6.** See E7.
+
+The ⚠️ divergence below is the one A closed; it is kept for the record.
+
 ### ⚠️ Silent divergences (no error, different behavior) — none in SQL answers, one in metadata
 
 No shim-only failure was a wrong SQL answer: every diverging test either
@@ -1319,10 +1341,12 @@ codes/messages, blob/backup surfaces).
 | E1 | **FIXED (#109, 2026-07-19)** | ~~Cross-process writer contention BLOCKS forever~~ → `Database::set_busy_timeout` + `Engine::begin_write_deadline` bound every facade writer-lock wait; the shim wires the knob at open (0), `sqlite3_busy_timeout`, and `PRAGMA busy_timeout`. `MultiprocessTests.test_ctx_mgr_rollback_if_commit_failed` passes UN-excluded (0.097 s); the suite no longer hangs. Two-process elapsed evidence in `crates/mpedb/tests/busy_timeout.rs` (timeout 300 ms → Busy at 300.1 ms; timeout 0 → 4.7 µs; SIGKILLed holder → waiter ACQUIRES via EOWNERDEAD adoption in 22.7 µs, never hangs). | |
 | E2 | **FIXED (2026-07-20)** | ~~Incremental blob I/O~~ → `sqlite3_blob_*` is real (`crates/mpedb-capi/src/blob.rs`; see the surface table above for the contract and the MVCC expiry mapping). `BlobTests` **35/38**; the 3 left are NOT blob failures — each one calls `update test set b='aaaa'` (text into a BLOB column) merely to provoke expiry, and dies on **E3**'s rigid typing before touching the handle. The same expiry drives correctly through a blob-typed UPDATE (`capi.rs::blob_handle_expires_when_its_row_changes`). | |
 | E3 | 14 | **Declared-type family.** (a) 6 × decltype-canonicalization (the ⚠️ divergence above — needs verbatim decl text in the schema); (b) 8 × bind rigidity where sqlite coerces: text→`timestamp` (CPython's own adapters bind datetime as an ISO STRING — `insert into t(x) values (?)` with `"2026-07-19 10:00:00"` into `x timestamp` is IntegrityError; stock stores it), int→`text`, blob→`text`. | `crates/…/scratchpad` repros in section text |
+| E2 | 38 | **Incremental blob I/O** (`sqlite3_blob_*` = mpedb #43). All of `BlobTests`; refusal is honest OperationalError now. | `con.blobopen("t", "b", 1)` |
+| E3 | ~~14~~ **7** | **Declared-type family.** (a) ~~6 × decltype-canonicalization~~ **CLOSED (#112 wave 2)**: `ColumnDef` carries `decl: Option<String>` — the declared text VERBATIM, sliced out of the CREATE TABLE source (canonical bytes v7→v8). `sqlite3_column_decltype` returns what the statement said, so `PARSE_DECLTYPES` converters fire. All 6 `DeclTypesTests` + `DateTimeTests.test_sqlite_date` flip. (b) STILL OPEN — 7 × bind rigidity where sqlite coerces: text→`timestamp` (CPython's own adapters bind datetime as an ISO STRING — `insert into t(x) values (?)` with `"2026-07-19 10:00:00"` into `x timestamp` is IntegrityError; stock stores it), int→`text`, blob→`text`. | `crates/…/scratchpad` repros in section text |
 | E4 | 9 | **Window functions** (`sqlite3_create_window_function`) — DESIGN-UDF stage 3b; clean refusal. | |
 | E5 | 8 | **Authorizer** (`sqlite3_set_authorizer` accepted, never invoked — would need compile-time callbacks). | |
-| E6 | 6 | **Custom collations** — DESIGN-UDF stage 3; clean refusal (and no longer a segfault). | `con.create_collation("x", f)` |
-| E7 | 6 | **Host AGGREGATES are single-argument** — the plan carries one arg per DESIGN-UDF stage 2; CPython registers 2-arg checktype aggregates. | `create_aggregate("f", 2, C)` then `select f(a, b) …` → "takes exactly one argument" |
+| E6 | ~~6~~ **0** | **Custom collations — CLOSED (#112 wave 2), with a NAMED boundary.** `sqlite3_create_collation[_v2]` registers a real comparator; `ORDER BY <expr> COLLATE <name>` sorts through it (plain table, compound, derived table, grouped, join — all differentially matched against stock). A host collation is a COMPARATOR, so it stops exactly where a KEY ENCODING starts: a column declared `COLLATE <host>`, a `GROUP BY`/`DISTINCT` fold, and a comparison's `COLLATE` all REFUSE with sqlite's own "no such collation sequence: <name>" rather than being answered under BINARY — an index built bytewise cannot answer a host-collated probe, and answering it anyway is the wrong-answer-with-no-error this refuses to be. Enforced structurally: those paths take a built-in `Collation`, which no registration can produce. Plans naming one are connection-local (the host-UDF no-publish rule). | `con.create_collation("x", f)` |
+| E7 | ~~6~~ **0** | **Host AGGREGATES are N-ary — CLOSED (#112 wave 2).** `AggCall` grows `extra_args` (PLAN_FORMAT 51) and the AST's `Expr::Agg` a trailing argument list; the parser takes the whole list for a HOST name only (every built-in still falls through to the `min(a,b)`/`max(a,b)` scalar rule, then to the one-argument error), the arity gate matches the CALL's count against the registration (exact or variadic `-1`), and the executor evaluates every argument over the same base row and hands `xStep` `[arg] ‖ extra_args`. `count(*)`'s row-shape stays exclusive to `count`. All 6 `AggregateTests.test_aggr_check_param*` flip. | `create_aggregate("f", 2, C)` then `select f(a, b) …` |
 | E8 | **FIXED (#109, 2026-07-19)** | ~~First-compile of a NEW statement text needs the writer lock~~ → under a busy policy, plan-registry publication is OPPORTUNISTIC (one immediate-deadline attempt; a held lock — including a same-thread sibling's — skips the insert and keeps the plan in the local cache, exactly like the host-UDF plan path). All 5 `TransactionTests.*_starts_transaction` tests pass; readers proceed under a writer. | |
 | E9 | 4 | **`ON CONFLICT` clause family**: `INSERT OR ROLLBACK` refused — the parser's own error message LISTS ROLLBACK as expected (`OR IGNORE` works), and the table-constraint form `unique(x) on conflict rollback` doesn't parse. | `INSERT OR ROLLBACK INTO t …` → "expected IGNORE, REPLACE, ABORT, FAIL, or ROLLBACK after OR" (sic) |
 | E10 | 5 | **iterdump surface**: 2 × AUTOINCREMENT (deliberate refusal), 1 × fts4 (deliberate — fts5 only), 1 × sqlite_master query form, 1 × un-root-caused "one statement at a time" in `test_table_dump`. | |

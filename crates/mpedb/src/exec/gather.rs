@@ -675,9 +675,10 @@ pub(super) fn gather_topk(
     filter: Option<&ExprProgram>,
     plan: &CompiledPlan,
     params: &[Value],
-    order_by: &[(u16, SortDir, Collation)],
+    order_by: &[(u16, SortDir, OrderColl)],
     keep: usize,
 ) -> Result<Vec<Vec<Value>>> {
+    check_order_colls(order_by, ctx.host_colls())?;
     match access {
         AccessPath::PkRange { lo, hi } => {
             match range_bounds(lo.as_ref(), hi.as_ref(), plan, params)? {
@@ -705,15 +706,41 @@ pub(super) fn gather_topk(
         | AccessPath::IndexRange { .. }
         | AccessPath::FtsScan { .. } => {
             let mut r = gather_rows(ctx, table, access, filter, plan, params, None)?;
-            sort_rows(&mut r, order_by);
+            sort_rows(&mut r, order_by, ctx.host_colls());
             r.truncate(keep);
             Ok(r)
         }
     }
 }
 
-pub(super) fn sort_rows(rows: &mut [Vec<Value>], order_by: &[(u16, SortDir, Collation)]) {
-    rows.sort_by(|a, b| cmp_rows(a, b, order_by));
+pub(super) fn sort_rows(
+    rows: &mut [Vec<Value>],
+    order_by: &[(u16, SortDir, OrderColl)],
+    colls: Option<&dyn HostColls>,
+) {
+    rows.sort_by(|a, b| cmp_rows(a, b, order_by, colls));
+}
+
+/// Every HOST collating sequence an `ORDER BY` names must be registered on the
+/// connection running the sort. Checked ONCE, before any comparison, because a
+/// `sort_by` comparator has nowhere to report a failure — and answering
+/// "peers", or falling back to BINARY, would return rows in a silently wrong
+/// order. sqlite's own message for the miss is reproduced verbatim, because
+/// consumers (CPython's `test_deregister_collation`) assert on it.
+pub(super) fn check_order_colls(
+    order_by: &[(u16, SortDir, OrderColl)],
+    colls: Option<&dyn HostColls>,
+) -> Result<()> {
+    for (_, _, c) in order_by {
+        if let Some(name) = c.host() {
+            if !colls.is_some_and(|t| t.has(name)) {
+                return Err(Error::Unsupported(format!(
+                    "no such collation sequence: {name}"
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Total sort order over two rows for an `ORDER BY` spec (column index,
@@ -730,9 +757,11 @@ pub(super) fn sort_rows(rows: &mut [Vec<Value>], order_by: &[(u16, SortDir, Coll
 pub(super) fn cmp_rows(
     a: &[Value],
     b: &[Value],
-    order_by: &[(u16, SortDir, Collation)],
+    order_by: &[(u16, SortDir, OrderColl)],
+    colls: Option<&dyn HostColls>,
 ) -> Ordering {
-    for &(col, dir, coll) in order_by {
+    for (col, dir, coll) in order_by {
+        let (col, dir) = (*col, *dir);
         let (Some(x), Some(y)) = (a.get(col as usize), b.get(col as usize)) else {
             continue;
         };
@@ -747,7 +776,7 @@ pub(super) fn cmp_rows(
             }
             (false, false) => {}
         }
-        let ord = cmp_order(x, y, coll);
+        let ord = cmp_order(x, y, coll, colls);
         if ord != Ordering::Equal {
             return if dir.desc { ord.reverse() } else { ord };
         }
@@ -757,7 +786,25 @@ pub(super) fn cmp_rows(
 
 /// Order two NON-NULL values (the NULL cases are settled by the caller's
 /// placement rule before this is reached).
-fn cmp_order(a: &Value, b: &Value, coll: Collation) -> Ordering {
+fn cmp_order(
+    a: &Value,
+    b: &Value,
+    coll: &OrderColl,
+    colls: Option<&dyn HostColls>,
+) -> Ordering {
+    // A HOST collating sequence orders TEXT against TEXT; every other pair is
+    // settled by storage class, exactly as sqlite does (the callback is only
+    // ever consulted for two text values). `check_order_colls` has already
+    // guaranteed the name resolves, so a miss here is unreachable.
+    let coll = match coll {
+        OrderColl::Native(c) => *c,
+        OrderColl::Host(name) => {
+            return match (a, b, colls) {
+                (Value::Text(x), Value::Text(y), Some(t)) => t.compare(name, x, y),
+                _ => cmp_order(a, b, &OrderColl::Native(Collation::Binary), None),
+            }
+        }
+    };
     // `sort_cmp`, not `sql_cmp`: an `any` column really can hold a number AND a
     // string, and sqlite orders those by storage class (NULL < numbers < text <
     // blob). `sql_cmp` refuses that pair, and turning the refusal into `Equal`

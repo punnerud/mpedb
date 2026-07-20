@@ -253,7 +253,7 @@ pub fn to_table_def(src: &PgTable) -> Result<TableDef> {
             ))
         })?;
         let is_pk = src.pk.contains(&i);
-        columns.push(ColumnDef {
+        columns.push(ColumnDef { decl: None,
             name: c.name.clone(),
             ty,
             nullable: !is_pk && !c.not_null,

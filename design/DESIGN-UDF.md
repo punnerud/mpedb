@@ -261,3 +261,58 @@ All of these refuse with `Unsupported("host function f() is not in scope for thi
 execution")` / the aggregate twin. That message used to be `Error::Internal`,
 which renders as **"internal error (bug in mpedb)"** — telling a user they hit an
 engine bug when they hit a documented boundary. It is `Unsupported` now.
+
+## Stage 3: host COLLATING SEQUENCES (`sqlite3_create_collation[_v2]`)
+
+A registered collation is a **comparator** — `(a: &str, b: &str) -> Ordering`,
+wrapping sqlite's `xCompare(pArg, nA, pA, nB, pB)` — kept in a per-connection
+registry beside the scalar and aggregate ones (`Database::register_host_collation`
+/ `unregister_host_collation`). Re-registering under a name REPLACES; a NULL
+`xCompare` deletes. `xDestroy` runs when an entry is replaced, deleted, or the
+connection closes, and — unlike `create_function_v2` — **never on a failed
+registration**, which is sqlite's documented asymmetry and the double-free that
+once took CPython's heap down 200 tests later.
+
+### The scope, and why it stops where it does
+
+A host collation orders `ORDER BY <expr> COLLATE <name>`. It reaches nothing
+else, because everything else built on a collation turns a value into **key
+bytes**:
+
+| position | what it needs | stage 3 |
+|---|---|---|
+| `ORDER BY … COLLATE <host>` | a comparator | **supported** |
+| a column's declared `COLLATE <host>` | the B+tree key encoding | refused |
+| `GROUP BY` / `DISTINCT` fold | a canonical fold (`Collation::fold_key`) | refused |
+| a comparison's `COLLATE` (rung 1) | an index-probe-compatible order | refused |
+
+An index (and every PRIMARY KEY) is a memcmp-ordered B+tree written under a
+BUILT-IN collation. A callback cannot produce sort bytes, so an index built
+under BINARY simply cannot answer a host-collated range — and answering it
+under BINARY anyway would be a **different row order with no error**, the exact
+failure mode this codebase refuses. Every refusal is sqlite's own wording,
+`no such collation sequence: <name>`.
+
+The boundary is enforced by TYPE, not by discipline. `Collation` (the three
+built-ins) still appears everywhere a key encoding is derived; only the plan's
+`ORDER BY` key list carries the new `OrderColl { Native(Collation), Host(String) }`
+(PLAN_FORMAT 52, tag 3 + name). There is no way to construct a host collation
+for a schema column, a keycode call, or a group-key fold, because those APIs
+take a `Collation` and no registration produces one.
+
+### Execution
+
+The name travels IN the plan (not a registry index), so the plan is
+self-describing and two connections cannot disagree about which callback a slot
+means. A plan whose `ORDER BY` names a host collation reports
+`contains_host_call()` and therefore inherits the **no-publish** rule: it stays
+in the compiling connection's local cache and never enters the shared registry.
+
+`TxnCtx::host_colls()` threads the snapshot to the sort, exactly as `host_fns`
+/`host_aggs` do. Every sort site calls `check_order_colls` FIRST — one pass that
+fails with "no such collation sequence" if any named collation is not in scope —
+because a `sort_by` comparator has nowhere to report an error, and a silent
+fallback there would be a wrong answer. Only after that does the comparator run,
+and only for a TEXT-vs-TEXT pair: every other pair is settled by storage class,
+as in sqlite. The planner's "ORDER BY is already satisfied by scan order"
+elision requires `Native(Binary)`, so a host collation blocks it by shape.

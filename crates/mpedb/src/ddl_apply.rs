@@ -248,6 +248,9 @@ pub(crate) fn table_def_from_spec(
                 other => other.clone(),
             };
             Ok(mpedb_types::ColumnDef {
+                // The declared text VERBATIM, so `sqlite3_column_decltype`
+                // answers what CREATE TABLE said, not the canonical name.
+                decl: c.decl.clone(),
                 name: c.name.clone(),
                 ty: c.ty,
                 // PK columns are implicitly NOT NULL, as in the config path.
@@ -301,7 +304,7 @@ pub(crate) fn table_def_from_spec(
         // Append the hidden rowid as the trailing column and make it the sole PK.
         // It IS a single-Int64-PK rowid alias, so the existing NULL→max(rowid)+1
         // auto-assign machinery (#85) drives it with no engine change.
-        columns.push(mpedb_types::ColumnDef {
+        columns.push(mpedb_types::ColumnDef { decl: None,
             name: "rowid".into(),
             ty: mpedb_types::ColumnType::Int64,
             nullable: false,
@@ -355,7 +358,7 @@ pub(crate) fn table_def_from_spec(
 pub(crate) fn virtual_table_def_from_spec(
     spec: mpedb_sql::CreateVirtualTableSpec,
 ) -> Result<mpedb_types::TableDef> {
-    let mkcol = |name: &str, ty, nullable| mpedb_types::ColumnDef {
+    let mkcol = |name: &str, ty, nullable| mpedb_types::ColumnDef { decl: None,
         name: name.to_string(),
         ty,
         nullable,
@@ -450,6 +453,7 @@ pub(crate) fn add_column_from_spec(
         Some(DefaultExpr::Const(fill.clone()))
     };
     let col = mpedb_types::ColumnDef {
+        decl: spec.decl.clone(),
         name: spec.name,
         ty: spec.ty,
         nullable: !spec.not_null,

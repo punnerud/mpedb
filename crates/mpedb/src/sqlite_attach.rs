@@ -97,6 +97,10 @@ fn any_col(name: &str, decl: &str, not_null: bool, default: Option<Value>) -> Co
         check: None,
         collation: mpedb_types::Collation::Binary,
         affinity: mpedb_types::Affinity::declared(decl),
+        // The BASE's declared text, verbatim out of `PRAGMA table_info` — an
+        // overlay must report the same `decltype` sqlite reports for the file
+        // it is overlaying, not a name derived from the affinity.
+        decl: (!decl.trim().is_empty()).then(|| decl.to_string()),
     }
 }
 
@@ -157,7 +161,7 @@ fn and_join(bodies: &[String]) -> Option<String> {
 }
 
 fn pk_col(name: &str, ty: ColumnType) -> ColumnDef {
-    ColumnDef {
+    ColumnDef { decl: None,
         name: name.to_string(),
         ty,
         nullable: false,

@@ -60,9 +60,10 @@ pub(super) fn expr_has_subquery(e: &ast::Expr) -> bool {
                 .any(|(c, r)| expr_has_subquery(c) || expr_has_subquery(r))
                 || els.as_deref().is_some_and(expr_has_subquery)
         }
-        E::Agg(_, arg, _, filter) => {
+        E::Agg(_, arg, _, filter, extra) => {
             arg.as_deref().is_some_and(expr_has_subquery)
                 || filter.as_deref().is_some_and(expr_has_subquery)
+                || extra.iter().any(expr_has_subquery)
         }
         // A subquery inside a window's arg/PARTITION/ORDER is not lifted in
         // stage 1 (the window planner binds those sub-expressions directly); one
@@ -372,7 +373,7 @@ impl Lift<'_> {
                     None => None,
                 },
             ),
-            E::Agg(f, arg, d, filter) => E::Agg(
+            E::Agg(f, arg, d, filter, extra) => E::Agg(
                 f.clone(),
                 match arg {
                     Some(a) => Some(Box::new(self.rewrite(a)?)),
@@ -385,6 +386,8 @@ impl Lift<'_> {
                     Some(a) => Some(Box::new(self.rewrite(a)?)),
                     None => None,
                 },
+                // …and so does one in a host aggregate's later arguments.
+                extra.iter().map(|x| self.rewrite(x)).collect::<Result<Vec<_>>>()?,
             ),
             // Windows are not descended into for subquery lifting (stage 1); a
             // subquery inside one reaches the binder's refusal unchanged.
@@ -863,7 +866,7 @@ impl<'a> Correlate<'a, '_> {
                     None => None,
                 },
             ),
-            E::Agg(f, arg, d, filter) => E::Agg(
+            E::Agg(f, arg, d, filter, extra) => E::Agg(
                 f.clone(),
                 match arg {
                     Some(a) => Some(Box::new(self.rewrite(a)?)),
@@ -876,6 +879,8 @@ impl<'a> Correlate<'a, '_> {
                     Some(a) => Some(Box::new(self.rewrite(a)?)),
                     None => None,
                 },
+                // …and so does one in a host aggregate's later arguments.
+                extra.iter().map(|x| self.rewrite(x)).collect::<Result<Vec<_>>>()?,
             ),
             // A window is not descended into for correlation rewriting (stage 1);
             // a window inside a subquery that references an enclosing row reaches
