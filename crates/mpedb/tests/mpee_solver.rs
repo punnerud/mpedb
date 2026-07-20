@@ -79,6 +79,14 @@ fn scrambled_sql(n: usize, anchor: i64) -> String {
     format!("SELECT t1.a FROM {} WHERE {}", from.join(", "), chain_where(n, anchor))
 }
 
+/// Is this process running the pre-#114 arm? Tests that assert a CHOSEN join
+/// order are assertions that the solver ran, so they are ON-arm tests by
+/// construction; the two gates that must hold in BOTH arms are the kill-switch
+/// test and `reordering_never_changes_the_answer`.
+fn mpee_off() -> bool {
+    std::env::var("MPEDB_NO_MPEE").as_deref() == Ok("1")
+}
+
 fn rows(db: &Database, sql: &str) -> Vec<Vec<Value>> {
     match db.query(sql, &[]) {
         Ok(ExecResult::Rows { rows, .. }) => rows,
@@ -110,6 +118,27 @@ fn explain(db: &Database, sql: &str) -> String {
 /// the linear side of it so it cannot regress silently.
 #[test]
 fn the_solved_order_holds_a_linear_number_of_cells() {
+    // Arm-aware, like the kill-switch test. With the solver OFF this shape's
+    // peak is the TEXTUAL order's, which grows by a factor of ten per table
+    // (n=4: 460, n=12: 13.4 M) — so running the ON formula there would fail
+    // with a bare budget error and read as a broken test rather than as the
+    // measurement it is. Pin the OFF number instead, at the one width where it
+    // is small enough to assert cheaply; that turns the confusing failure into
+    // the other half of the result.
+    if mpee_off() {
+        let db = open_chain(4, 460);
+        assert_eq!(rows(&db, &scrambled_sql(4, 4)).len(), 1, "textual n=4 fits in 460");
+        drop(db);
+        let db = open_chain(4, 459);
+        assert!(
+            matches!(
+                db.query(&scrambled_sql(4, 4), &[]),
+                Err(mpedb::Error::RuntimeBudget { kind: mpedb::BudgetKind::JoinCells, .. })
+            ),
+            "459 cells must NOT be enough for the textual order at n=4"
+        );
+        return;
+    }
     for n in [4usize, 6, 8, 10, 12] {
         let peak = (40 * n - 60) as u64;
         // Exactly `peak` succeeds…
@@ -644,7 +673,7 @@ fn the_mpee_kill_switch_selects_the_textual_order() {
         .lines()
         .find(|l| l.trim_start().starts_with("join order:"))
         .unwrap_or_else(|| panic!("EXPLAIN has no join-order line:\n{plan}"));
-    if std::env::var("MPEDB_NO_MPEE").as_deref() == Ok("1") {
+    if mpee_off() {
         // FROM is odds-then-evens, so the textual order cross-joins: t1,t3,...
         assert!(
             line.contains("t3 [cartesian]"),
