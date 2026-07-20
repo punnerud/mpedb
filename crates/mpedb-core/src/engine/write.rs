@@ -1713,6 +1713,11 @@ impl<'e> WriteTxn<'e> {
         self.freelist_root = self.meta.freelist_root;
         self.extent_map_root = self.meta.extent_map_root;
         self.schema_gen_bump = false;
+        // A DDL statement in the discarded round rebuilt this txn's captured
+        // bundle from its own uncommitted catalog pages
+        // (`reload_bundle_from_catalog`); those pages are gone now, so the view
+        // goes back to the engine's committed one.
+        self.bundle = self.eng.bundle();
         // Roots are a lazily-filled cache over the catalog tree, which the
         // restore above rewound; drop it so every entry reloads.
         self.table_roots.clear();
