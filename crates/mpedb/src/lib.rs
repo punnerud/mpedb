@@ -2042,7 +2042,7 @@ impl WriteSession<'_> {
             .schema()
             .tables
             .iter()
-            .position(|t| t.name == table)
+            .position(|t| !t.dead && mpedb_types::ident_eq(&t.name, table))
             .ok_or_else(|| Error::Config(format!("no such table: {table}")))?
             as u32;
         self.txn

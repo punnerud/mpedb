@@ -184,6 +184,20 @@ pub(crate) fn trigger_key(name: &str) -> Vec<u8> {
     k
 }
 
+/// The sys-key of the stored trigger `name` names, matched
+/// ASCII-case-insensitively — `DROP TRIGGER tr` finds `CREATE TRIGGER Tr`.
+/// The key keeps the DECLARED spelling, so only the matching folds; resolved
+/// inside the caller's write txn so the test and the write are atomic.
+fn resolve_trigger_key(w: &mut mpedb_core::WriteTxn<'_>, name: &str) -> Result<Option<Vec<u8>>> {
+    for (subkey, _) in w.sys_scan_range(TRIGGER_PREFIX, TRIGGER_PREFIX_END)? {
+        let Some(stored) = subkey.strip_prefix(TRIGGER_PREFIX) else { continue };
+        if mpedb_types::ident_eq(&String::from_utf8_lossy(stored), name) {
+            return Ok(Some(subkey));
+        }
+    }
+    Ok(None)
+}
+
 // ---------------------------------------------------------- compiled fire-set
 
 /// One compiled trigger ready to fire: the body statements (each plan's leading
@@ -394,7 +408,7 @@ impl Database {
 
         let key = trigger_key(&spec.name);
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
-        if matches!(w.sys_get(&key), Ok(Some(_))) {
+        if resolve_trigger_key(&mut w, &spec.name)?.is_some() {
             w.abort();
             if spec.if_not_exists {
                 return Ok(ExecResult::Affected(0));
@@ -433,9 +447,10 @@ impl Database {
 
     /// `DROP TRIGGER [IF EXISTS] <name>`.
     pub(crate) fn apply_drop_trigger(&self, name: &str, if_exists: bool) -> Result<ExecResult> {
-        let key = trigger_key(name);
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
-        if !matches!(w.sys_get(&key), Ok(Some(_))) {
+        let found = resolve_trigger_key(&mut w, name)?;
+        let key = found.clone().unwrap_or_else(|| trigger_key(name));
+        if found.is_none() {
             w.abort();
             if if_exists {
                 return Ok(ExecResult::Affected(0));

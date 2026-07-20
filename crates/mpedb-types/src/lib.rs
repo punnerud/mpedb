@@ -8,6 +8,7 @@ pub mod error;
 pub mod expr;
 pub mod footprint;
 pub mod fts;
+pub mod ident;
 pub mod keycode;
 pub mod policy;
 pub mod schema;
@@ -19,6 +20,7 @@ pub use config::{
     DEFAULT_MAX_JOIN_CELLS, DEFAULT_MAX_WORK_ROWS, MAX_DB_SIZE_MB,
 };
 pub use error::{BudgetKind, Error, Result};
+pub use ident::{fold_ident, ident_eq};
 pub mod agg;
 pub use agg::{Accum, HostAggState, HostAggs};
 pub use expr::{sqlite_now_string, CmpKind, ExprProgram, HostFns, Instr, ScalarFn};

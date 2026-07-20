@@ -18,8 +18,9 @@
 //!
 //! - Unqualified names resolve **main first, then the attach list in attach
 //!   order** (probes P1/P2/P2b). A CTE name shadows everything (P23).
-//! - Database names match **case-insensitively** (P14); table names keep
-//!   mpedb's case-sensitive dialect.
+//! - Database names match **case-insensitively** (P14), and so do table
+//!   names — every identifier folds ASCII case, sqlite's rule
+//!   (`mpedb_types::ident`).
 //! - `main.t` is always valid and means the primary file (P3).
 //! - An unknown qualifier is `no such table: nope.t` (P3b).
 //! - A 3-part column name `db.table.col` is valid exactly when that table
@@ -49,6 +50,13 @@ pub struct DbScope {
     pub main: HashSet<String>,
     /// `(db name, its table names)` in attach order.
     pub attached: Vec<(String, HashSet<String>)>,
+}
+
+/// Is `name` in this name set, ASCII-case-insensitively? The sets are
+/// `HashSet<String>` keyed on the DECLARED spelling (which is what gets
+/// reported back), so membership cannot be a hash probe.
+fn has_name(set: &HashSet<String>, name: &str) -> bool {
+    set.iter().any(|n| n.eq_ignore_ascii_case(name))
 }
 
 impl DbScope {
@@ -327,12 +335,16 @@ pub fn resolve_db_refs(sql: &str, scope: &DbScope) -> Result<DbResolution> {
                 }
             },
             None => {
-                if cte_names.contains(&r.name) || scope.main.contains(&r.name) {
+                // ASCII-case-insensitive, like every other identifier match:
+                // `main`'s own names and the CTE names are byte-keyed sets, so
+                // membership is a folded scan rather than a hash probe (both
+                // sets are small, and this runs once per table reference).
+                if has_name(&cte_names, &r.name) || has_name(&scope.main, &r.name) {
                     Target::Main
                 } else if let Some(m) = scope
                     .attached
                     .iter()
-                    .position(|(_, names)| names.contains(&r.name))
+                    .position(|(_, names)| has_name(names, &r.name))
                 {
                     Target::Attached(m)
                 } else {
@@ -392,7 +404,7 @@ pub fn resolve_db_refs(sql: &str, scope: &DbScope) -> Result<DbResolution> {
             }
             for (j, u) in resolved.iter().take(ai).map(|(j, u)| (*j, u)) {
                 let s = &refs[j];
-                if s.scope == r.scope && !s.has_alias && s.name == r.name {
+                if s.scope == r.scope && !s.has_alias && s.name.eq_ignore_ascii_case(&r.name) {
                     let same = match (t, u) {
                         (Target::Attached(a), Target::Attached(b)) => a == b,
                         _ => false,

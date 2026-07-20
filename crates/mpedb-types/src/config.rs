@@ -506,7 +506,7 @@ fn raw_to_config(
                 .map(|pk| {
                     columns
                         .iter()
-                        .position(|c| &c.name == pk)
+                        .position(|c| crate::ident_eq(&c.name, pk))
                         .map(|i| i as u16)
                         .ok_or_else(|| {
                             Error::Config(format!(
@@ -533,7 +533,7 @@ fn raw_to_config(
                         .map(|name| {
                             columns
                                 .iter()
-                                .position(|c| &c.name == name)
+                                .position(|c| crate::ident_eq(&c.name, name))
                                 .map(|i| i as u16)
                                 .ok_or_else(|| {
                                     Error::Config(format!(

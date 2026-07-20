@@ -15,12 +15,29 @@
 use crate::ast::{CompoundStmt, Expr, JoinClause, JoinKind, SelectStmt, Stmt, SubqueryBody};
 use crate::parser::parse_statement;
 use crate::plan::SetOp;
-use mpedb_types::{Error, Result};
+use mpedb_types::{fold_ident, ident_eq, Error, Result};
 use std::collections::{HashMap, HashSet};
 
 /// View name → its `SELECT` source text (re-parsed at reference time). The same
 /// shape backs a statement-scoped CTE scope (CTE name → CTE body text).
+///
+/// Keys are the name as DECLARED (`CREATE VIEW MiXeD` keys on `MiXeD`), because
+/// that is the spelling every consumer reports back. Lookups therefore cannot
+/// use `HashMap::get`, whose hashing is byte-exact — they go through
+/// [`catalog_get`] / [`catalog_has`], which fold ASCII case like every other
+/// identifier. Both catalogs are small (a handful of views; ≤ 32 CTEs), so the
+/// linear scan costs nothing on the compile path.
 pub type ViewCatalog = HashMap<String, String>;
+
+/// The body of the view/CTE named `name`, matched ASCII-case-insensitively.
+pub fn catalog_get<'a>(cat: &'a ViewCatalog, name: &str) -> Option<&'a String> {
+    cat.iter().find(|(k, _)| ident_eq(k, name)).map(|(_, v)| v)
+}
+
+/// Is there a view/CTE named `name` (ASCII-case-insensitively)?
+pub fn catalog_has(cat: &ViewCatalog, name: &str) -> bool {
+    catalog_get(cat, name).is_some()
+}
 
 const MAX_VIEW_DEPTH: usize = 16;
 
@@ -83,10 +100,10 @@ fn refuse_view_target(
     ctes: &ViewCatalog,
     op: &str,
 ) -> Result<()> {
-    if ctes.contains_key(table) {
+    if catalog_has(ctes, table) {
         return Err(bind_err(format!("cannot {op} a CTE (`{table}`)")));
     }
-    if views.contains_key(table) {
+    if catalog_has(views, table) {
         return Err(bind_err(format!("cannot {op} a view (`{table}`)")));
     }
     Ok(())
@@ -108,9 +125,12 @@ fn refuse_view_target(
 /// A body that fails to parse here is skipped, not refused: an UNUSED broken
 /// body stays a safe leniency, and a USED one is refused at flatten time.
 pub fn validate_cte_order(ctes: &[(String, String)]) -> Result<()> {
-    let all: HashSet<&str> = ctes.iter().map(|(n, _)| n.as_str()).collect();
+    // Keyed on the FOLDED name: `WITH c AS (…), C AS (…)` is one duplicate name,
+    // not two CTEs (sqlite: `duplicate WITH table name`). The sets are lookup
+    // keys only; the diagnostics below quote the names as written.
+    let all: HashSet<String> = ctes.iter().map(|(n, _)| fold_ident(n)).collect();
     // Names of the strictly-preceding CTEs — the only ones a body may reference.
-    let mut preceding: HashSet<&str> = HashSet::new();
+    let mut preceding: HashSet<String> = HashSet::new();
     for (name, body) in ctes {
         if let Ok((stmt, _explain, _n)) = parse_statement(body) {
             let mut refs = Vec::new();
@@ -124,7 +144,8 @@ pub fn validate_cte_order(ctes: &[(String, String)]) -> Result<()> {
                 _ => {}
             }
             for r in &refs {
-                if all.contains(r.as_str()) && !preceding.contains(r.as_str()) {
+                let rk = fold_ident(r);
+                if all.contains(&rk) && !preceding.contains(&rk) {
                     return Err(bind_err(format!(
                         "CTE `{name}` references `{r}`, which is not defined before \
                          it (self, forward, or cyclic CTE references are not supported)"
@@ -132,7 +153,7 @@ pub fn validate_cte_order(ctes: &[(String, String)]) -> Result<()> {
                 }
             }
         }
-        if !preceding.insert(name.as_str()) {
+        if !preceding.insert(fold_ident(name)) {
             return Err(bind_err(format!("duplicate CTE name `{name}` in WITH")));
         }
     }
@@ -156,9 +177,9 @@ fn flatten_select(
     // against, so folding them into a join is out of scope here.
     let outer_has_items = s.items.is_some();
     for j in &mut s.joins {
-        if ctes.contains_key(&j.table) {
+        if catalog_has(ctes, &j.table) {
             flatten_cte_join(j, views, ctes, depth, outer_has_items)?;
-        } else if views.contains_key(&j.table) {
+        } else if catalog_has(views, &j.table) {
             return Err(bind_err(format!(
                 "view `{}` used in a JOIN is not supported yet",
                 j.table
@@ -198,11 +219,11 @@ fn flatten_select(
     // A CTE reference shadows a same-named persistent view for this statement.
     // Splice it with the keep-alias machinery so `cte.col` / `FROM cte AS x`
     // (`x.col`) resolve — distinct from the view path below, which strips names.
-    if ctes.contains_key(&tname) {
+    if catalog_has(ctes, &tname) {
         return flatten_cte(s, &tname, views, ctes, depth);
     }
     // The main FROM: if it is a view, splice its body in (strip-name path).
-    let Some(view_src) = views.get(&tname) else {
+    let Some(view_src) = catalog_get(views, &tname) else {
         return Ok(());
     };
     if s.alias.is_some() {
@@ -247,7 +268,7 @@ fn flatten_cte(
     ctes: &ViewCatalog,
     depth: usize,
 ) -> Result<()> {
-    let cte_src = ctes.get(tname).expect("caller checked the CTE exists");
+    let cte_src = catalog_get(ctes, tname).expect("caller checked the CTE exists");
     // The name the outer query addresses the CTE by: an explicit `AS x`, else
     // the CTE name itself. Kept as the base's alias so qualified refs resolve.
     let ref_alias = s.alias.clone().unwrap_or_else(|| tname.to_string());
@@ -331,7 +352,7 @@ fn flatten_cte_join(
              supported yet"
         )));
     }
-    let cte_src = ctes.get(&tname).expect("caller checked the CTE exists");
+    let cte_src = catalog_get(ctes, &tname).expect("caller checked the CTE exists");
     // The name the outer query addresses the CTE by: an explicit `AS x`, else
     // the CTE name itself. Kept as the base's alias so qualified refs resolve.
     let ref_alias = j.alias.clone().unwrap_or_else(|| tname.clone());

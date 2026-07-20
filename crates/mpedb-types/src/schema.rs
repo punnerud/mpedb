@@ -1,5 +1,6 @@
 use crate::error::{Error, Result};
 use crate::expr::{ExprProgram, Instr};
+use crate::ident::{fold_ident, ident_eq};
 use crate::value::{read_value, write_value, Affinity, Collation, ColumnType, Value};
 use crate::{MAX_COLUMNS, MAX_TABLES};
 
@@ -434,8 +435,14 @@ impl TableDef {
         Ok(())
     }
 
+    /// Resolve a column NAME to its ordinal. ASCII-case-insensitive, sqlite's
+    /// rule and regardless of quoting ([`crate::ident`]) — this is THE column
+    /// chokepoint, so `SELECT ABC FROM t` finds the column declared `Abc`.
+    /// What comes back is an ordinal, never a name: callers that report a
+    /// column label read `columns[i].name`, i.e. the DECLARED spelling, which
+    /// is what sqlite reports too.
     pub fn column_index(&self, name: &str) -> Option<u16> {
-        self.columns.iter().position(|c| c.name == name).map(|i| i as u16)
+        self.columns.iter().position(|c| ident_eq(&c.name, name)).map(|i| i as u16)
     }
 
     pub fn pk_types(&self) -> Vec<ColumnType> {
@@ -797,7 +804,7 @@ impl Schema {
             .get_mut(table_id as usize)
             .filter(|t| t.id == table_id && !t.dead)
             .ok_or_else(|| Error::Schema(format!("no live table with id {table_id}")))?;
-        if slot.columns.iter().any(|c| c.name == col.name) {
+        if slot.columns.iter().any(|c| ident_eq(&c.name, &col.name)) {
             return Err(Error::Schema(format!(
                 "column `{}` already exists in table `{}`",
                 col.name, slot.name
@@ -824,7 +831,7 @@ impl Schema {
         let idx = slot
             .columns
             .iter()
-            .position(|c| c.name == column)
+            .position(|c| ident_eq(&c.name, column))
             .ok_or_else(|| Error::Schema(format!("no column `{column}` in table `{}`", slot.name)))?;
         let i = idx as u16;
         if slot.primary_key.contains(&i) {
@@ -891,7 +898,7 @@ impl Schema {
             .get_mut(table_id as usize)
             .filter(|t| t.id == table_id && !t.dead)
             .ok_or_else(|| Error::Schema(format!("no live table with id {table_id}")))?;
-        if slot.columns.iter().any(|c| c.name == new_name) {
+        if slot.columns.iter().any(|c| ident_eq(&c.name, new_name)) {
             return Err(Error::Schema(format!(
                 "column `{new_name}` already exists in table `{}`",
                 slot.name
@@ -914,7 +921,7 @@ impl Schema {
         let col = slot
             .columns
             .iter_mut()
-            .find(|c| c.name == column)
+            .find(|c| ident_eq(&c.name, column))
             .ok_or_else(|| {
                 Error::Schema(format!("no column `{column}` in table `{}`", slot.name))
             })?;
@@ -948,7 +955,12 @@ impl Schema {
         }
         // Duplicate LIVE names (dead slots have empty names, excluded). Set-
         // based, NOT windows(2): the vec is id-sorted, not name-sorted.
-        let mut names: Vec<&str> = self.tables.iter().filter(|t| !t.dead).map(|t| t.name.as_str()).collect();
+        // Compared ASCII-CASE-INSENSITIVELY: `t` and `T` are one name, so
+        // creating both is `duplicate table name`, exactly as sqlite says
+        // `table T already exists`. Sorting on the FOLDED key (the names
+        // themselves stay verbatim — folding is for lookup only).
+        let mut names: Vec<String> =
+            self.tables.iter().filter(|t| !t.dead).map(|t| fold_ident(&t.name)).collect();
         names.sort_unstable();
         if names.windows(2).any(|w| w[0] == w[1]) {
             return Err(Error::Schema("duplicate table name".into()));
@@ -991,7 +1003,12 @@ impl Schema {
                     t.name
                 )));
             }
-            let mut names: Vec<&str> = t.columns.iter().map(|c| c.name.as_str()).collect();
+            // Also ASCII-case-insensitive: sqlite refuses `CREATE TABLE t(a, A)`
+            // with `duplicate column name: A`, and it refuses it for the QUOTED
+            // spelling `("a", "A")` too — quoting buys distinct spellings, never
+            // distinct case. Folding lookups without folding THIS check would
+            // leave two columns that `column_index` cannot tell apart.
+            let mut names: Vec<String> = t.columns.iter().map(|c| fold_ident(&c.name)).collect();
             names.sort_unstable();
             if names.windows(2).any(|w| w[0] == w[1]) {
                 return Err(Error::Schema(format!("duplicate column in `{}`", t.name)));
@@ -1280,8 +1297,12 @@ impl Schema {
     /// search is wrong. Returns the table's stable `id`, which equals its
     /// position only while ids are dense (this window), but the id is the
     /// correct value to return regardless.
+    /// ASCII-case-insensitive, sqlite's rule and regardless of quoting
+    /// ([`crate::ident`]): this is THE table chokepoint, so `FROM T` finds the
+    /// table created as `t`. Dead (tombstoned) slots carry an empty name and so
+    /// never match a valid identifier.
     pub fn table_id(&self, name: &str) -> Option<u32> {
-        self.tables.iter().find(|t| t.name == name).map(|t| t.id)
+        self.tables.iter().find(|t| !t.dead && ident_eq(&t.name, name)).map(|t| t.id)
     }
 
     pub fn table(&self, id: u32) -> Option<&TableDef> {

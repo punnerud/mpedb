@@ -1,11 +1,20 @@
 //! SQL tokenizer. Produces byte-offset-annotated tokens; keywords are
-//! recognized case-insensitively, identifiers are case-sensitive.
+//! recognized case-insensitively.
+//!
+//! Identifiers are lexed VERBATIM — the tokenizer preserves the spelling and
+//! does not fold. Folding happens where names are COMPARED
+//! (`mpedb_types::ident`), because sqlite reports every name back in the
+//! spelling it was declared with; the token is the thing that carries that
+//! spelling. `Ident` vs `QuotedIdent` is kept only so the grammar can tell a
+//! bare word that might be a keyword from a quoted one that never is — NOT
+//! because quoting affects case (measured: it does not).
 
 use mpedb_types::{Error, Result};
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum Tok {
-    /// Bare identifier (case-sensitive, not a keyword).
+    /// Bare identifier (not a keyword). Spelled as written; comparisons
+    /// against it fold ASCII case (`mpedb_types::ident_eq`).
     Ident(String),
     /// Quoted identifier. Three spellings, all sqlite's and all folded to this
     /// one token so the grammar never has to care which was written:
@@ -578,7 +587,10 @@ mod tests {
     }
 
     #[test]
-    fn keywords_case_insensitive_identifiers_not() {
+    /// Keywords fold to a `Kw` token; identifiers keep their SPELLING (the
+    /// fold happens at comparison time, not here), and a quoted word is never
+    /// a keyword.
+    fn keywords_fold_identifier_spelling_is_preserved() {
         assert_eq!(
             toks("select SeLeCt_x FROM users"),
             vec![
