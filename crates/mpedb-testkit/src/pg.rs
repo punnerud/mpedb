@@ -171,7 +171,7 @@ impl PgCluster {
     /// separator and the literal `NULL` for SQL NULL — the exact row shape
     /// [`crate::diff`] parses for sqlite3.
     pub fn psql(&self) -> Command {
-        let mut cmd = Command::new("psql");
+        let mut cmd = Command::new(format!("{}/psql", pg_bin()));
         cmd.args(["-X", "-q", "-A", "-t", "-F", "|", "-P", "null=NULL"])
             .arg("-h")
             .arg(&self.sockdir)

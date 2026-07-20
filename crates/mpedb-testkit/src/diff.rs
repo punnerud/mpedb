@@ -193,8 +193,15 @@ pub fn run_differential_3way(
         }
         Err(e) => return Err(e),
     };
-    run_differential_impl(base_seed, programs, stmts_per_program, Some(&cluster))
-        .map(PgDiff::Ran)
+    // PG_UNAVAILABLE can also surface MID-RUN, not only at cluster start:
+    // measured on macOS with keg-only homebrew postgresql@16, initdb/pg_ctl
+    // resolve via pg_bin() and the cluster starts, but a later psql spawn
+    // fails — that must be the same LOUD skip, not a panic.
+    match run_differential_impl(base_seed, programs, stmts_per_program, Some(&cluster)) {
+        Ok(r) => Ok(PgDiff::Ran(r)),
+        Err(Failure(msg)) if msg.starts_with(PG_UNAVAILABLE) => Ok(PgDiff::Unavailable(msg)),
+        Err(e) => Err(e),
+    }
 }
 
 fn run_differential_impl(
