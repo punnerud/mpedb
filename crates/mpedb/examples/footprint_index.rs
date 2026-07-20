@@ -100,8 +100,8 @@ impl InvertedHash {
     /// their reads and writes, my reads against their writes.
     fn conflicts(&self, me: u32, f: &Footprint) -> bool {
         for t in f.tables_written.iter() {
-            for list in [self.readers.get(&t), self.writers.get(&t)] {
-                if let Some(v) = list {
+            for v in [self.readers.get(&t), self.writers.get(&t)].into_iter().flatten() {
+                {
                     if v.iter().any(|&o| o != me) {
                         return true;
                     }
@@ -249,8 +249,8 @@ fn bench_conflicts() {
                 let t0 = Instant::now();
                 for _ in 0..windows {
                     ih.refill(&w);
-                    for me in 0..n {
-                        black_box(ih.conflicts(me as u32, &w[me]));
+                    for (me, fp) in w.iter().enumerate() {
+                        black_box(ih.conflicts(me as u32, fp));
                     }
                 }
                 let inv_h = t0.elapsed().as_nanos() as f64 / (windows * n) as f64;
@@ -258,8 +258,8 @@ fn bench_conflicts() {
                 let t0 = Instant::now();
                 for _ in 0..windows {
                     iv.refill(&w);
-                    for me in 0..n {
-                        black_box(iv.conflicts(me as u32, &w[me]));
+                    for (me, fp) in w.iter().enumerate() {
+                        black_box(iv.conflicts(me as u32, fp));
                     }
                 }
                 let inv_v = t0.elapsed().as_nanos() as f64 / (windows * n) as f64;
