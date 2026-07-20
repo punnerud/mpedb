@@ -87,7 +87,7 @@ fn val(v: fmtx::Value) -> Value {
 /// where sqlite answers `1.5`/real — a wrong answer, and the reason this is no
 /// longer a blanket `Any` (DESIGN-SQLITE-BACKED §"Overlay schema" [R#17]).
 fn any_col(name: &str, decl: &str, not_null: bool, default: Option<Value>) -> ColumnDef {
-    ColumnDef {
+    ColumnDef { generated: None,
         name: name.to_string(),
         ty: ColumnType::Any,
         nullable: !not_null,
@@ -161,7 +161,7 @@ fn and_join(bodies: &[String]) -> Option<String> {
 }
 
 fn pk_col(name: &str, ty: ColumnType) -> ColumnDef {
-    ColumnDef { decl: None,
+    ColumnDef { generated: None, decl: None,
         name: name.to_string(),
         ty,
         nullable: false,

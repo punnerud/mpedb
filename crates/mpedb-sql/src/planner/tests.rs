@@ -4,7 +4,7 @@ use crate::prepare;
 use mpedb_types::{ColumnDef, DefaultExpr};
 
 fn col(name: &str, ty: ColumnType) -> ColumnDef {
-    ColumnDef { decl: None,
+    ColumnDef { generated: None, decl: None,
         name: name.into(),
         ty,
         nullable: true,
@@ -23,8 +23,8 @@ pub(crate) fn test_schema() -> Schema {
         id: 0,
         name: "users".into(),
         columns: vec![
-            ColumnDef { nullable: false, ..col("id", ColumnType::Int64) },
-            ColumnDef {
+            ColumnDef { generated: None, nullable: false, ..col("id", ColumnType::Int64) },
+            ColumnDef { generated: None,
                 nullable: false,
                 unique: true,
                 indexed: false,
@@ -33,7 +33,7 @@ pub(crate) fn test_schema() -> Schema {
             col("age", ColumnType::Int64),
             col("score", ColumnType::Float64),
             col("active", ColumnType::Bool),
-            ColumnDef {
+            ColumnDef { generated: None,
                 default: Some(DefaultExpr::Now),
                 ..col("created", ColumnType::Timestamp)
             },
@@ -48,9 +48,9 @@ pub(crate) fn test_schema() -> Schema {
         id: 0,
         name: "orders".into(),
         columns: vec![
-            ColumnDef { nullable: false, ..col("user_id", ColumnType::Int64) },
-            ColumnDef { nullable: false, ..col("item_no", ColumnType::Int64) },
-            ColumnDef { unique: true, ..col("sku", ColumnType::Text) },
+            ColumnDef { generated: None, nullable: false, ..col("user_id", ColumnType::Int64) },
+            ColumnDef { generated: None, nullable: false, ..col("item_no", ColumnType::Int64) },
+            ColumnDef { generated: None, unique: true, ..col("sku", ColumnType::Text) },
             col("note", ColumnType::Text),
         ],
         primary_key: vec![0, 1],
@@ -63,7 +63,7 @@ pub(crate) fn test_schema() -> Schema {
         id: 0,
         name: "events".into(),
         columns: vec![
-            ColumnDef {
+            ColumnDef { generated: None,
                 nullable: false,
                 default: Some(DefaultExpr::Now),
                 ..col("ts", ColumnType::Timestamp)
@@ -110,13 +110,13 @@ fn secondary_index_numbering() {
         id: 0,
         name: "t".into(),
         columns: vec![
-            ColumnDef {
+            ColumnDef { generated: None,
                 nullable: false,
                 unique: true,
                 indexed: false,
                 ..col("a", ColumnType::Int64)
             },
-            ColumnDef { nullable: false, ..col("b", ColumnType::Int64) },
+            ColumnDef { generated: None, nullable: false, ..col("b", ColumnType::Int64) },
         ],
         primary_key: vec![0, 1],
         indexes: vec![],

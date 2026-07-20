@@ -3575,7 +3575,7 @@ mod tests {
     use mpedb_types::ColumnDef;
 
     fn table() -> TableDef {
-        let col = |name: &str, ty: ColumnType, nullable: bool| ColumnDef { decl: None,
+        let col = |name: &str, ty: ColumnType, nullable: bool| ColumnDef { generated: None, decl: None,
             name: name.into(),
             ty,
             nullable,
@@ -3994,7 +3994,7 @@ mod tests {
         let b = TableDef {
             id: 0,
             name: "other".into(),
-            columns: vec![ColumnDef { decl: None,
+            columns: vec![ColumnDef { generated: None, decl: None,
                 name: "tag".into(),
                 ty: ColumnType::Text,
                 nullable: true,
@@ -4037,7 +4037,7 @@ mod tests {
         let b = TableDef {
             id: 0,
             name: "other".into(),
-            columns: vec![ColumnDef { decl: None,
+            columns: vec![ColumnDef { generated: None, decl: None,
                 name: "id".into(), // collides with a.id
                 ty: ColumnType::Int64,
                 nullable: false,
