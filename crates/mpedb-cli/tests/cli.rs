@@ -790,6 +790,79 @@ fn stress_unique() {
 /// side effect of #37/#39 — see the regression guard below), so EVERY failure
 /// here fails loudly again: a corruption signature in a crash wave is a
 /// crash/recovery regression, not a known flake.
+/// #78 `tier drain` end to end: seed a hot db, drain a predicate into a
+/// freshly created cold file, and prove the split + read-back through the
+/// CLI alone — counts on both sides, idempotent re-run, ATTACH union.
+#[test]
+fn tier_drain_cli_roundtrip() {
+    let td = TestDir::new("tier-drain");
+    let hot = td.path().join("hot.mpedb");
+    let cold = td.path().join("cold.mpedb");
+    let (hs, cs) = (hot.to_str().unwrap(), cold.to_str().unwrap());
+
+    assert_ok(&run(&[hs, "CREATE TABLE ev (id INTEGER PRIMARY KEY, grp INT NOT NULL, msg TEXT)"]));
+    for i in 0..30 {
+        assert_ok(&run(&[
+            hs,
+            &format!("INSERT INTO ev (id, grp, msg) VALUES ({i}, {}, 'm{i}')", i % 3),
+        ]));
+    }
+
+    let o = run(&[
+        "tier", "drain", hs, cs,
+        "--table", "ev", "--where", "grp = $1", "1",
+        "--batch", "4", "--size-mb", "16",
+    ]);
+    assert_ok(&o);
+    assert!(out_str(&o).contains("moved=10"), "stdout: {}", out_str(&o));
+
+    let count = |target: &str, sql: &str| {
+        let o = run(&[target, sql]);
+        assert_ok(&o);
+        out_str(&o).lines().last().unwrap().trim().to_owned()
+    };
+    assert_eq!(count(hs, "SELECT count(*) FROM ev"), "20");
+    assert_eq!(count(cs, "SELECT count(*) FROM ev"), "10");
+    assert_eq!(count(cs, "SELECT count(*) FROM ev WHERE grp = 1"), "10");
+
+    // Idempotent: nothing left matching, nothing moves, nothing breaks.
+    let o = run(&[
+        "tier", "drain", hs, cs, "--table", "ev", "--where", "grp = $1", "1",
+    ]);
+    assert_ok(&o);
+    assert!(out_str(&o).contains("moved=0"), "stdout: {}", out_str(&o));
+
+    // Read-back exactly as documented: ATTACH + cross-file UNION ALL (a repl
+    // script — the one-shot form runs a single statement).
+    let o = run_repl(
+        &[hs],
+        &format!(
+            "ATTACH DATABASE '{cs}' AS cold;\n\
+             SELECT id FROM ev UNION ALL SELECT id FROM cold.ev;\n.quit\n"
+        ),
+    );
+    assert_ok(&o);
+    let ids = out_str(&o)
+        .lines()
+        .filter(|l| l.trim().parse::<i64>().is_ok())
+        .count();
+    assert_eq!(ids, 30, "attach union stdout: {}", out_str(&o));
+}
+
+/// #78 SIGKILL fuzz on the drain protocol: the drainer dies at a random
+/// instant every wave; no row may be lost, duplicates must reconcile, and
+/// the final split must be exact (see `tier crash` in the CLI).
+#[test]
+fn tier_crash_injection() {
+    let td = TestDir::new("tier-crash");
+    let o = run(&[
+        "tier", "crash", "--dir", td.path().to_str().unwrap(), "--waves", "3",
+    ]);
+    assert_ok(&o);
+    let s = out_str(&o);
+    assert!(s.contains("no row lost, no divergence"), "stdout: {s}");
+}
+
 #[test]
 fn crash_injection() {
     let td = TestDir::new("crash");

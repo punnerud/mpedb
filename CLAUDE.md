@@ -37,7 +37,8 @@ every protocol there survived a 37-finding adversarial review, and the ordering 
   the plan executor in `exec/` (mod = TxnCtx + exec_stmt, gather, aggregate), and
   `ring_exec` (Phase-2 group-commit leader; active when durability = commit or wal).
 - `crates/mpedb-cli` — `mpedb` binary: repl/exec/prepare/call/dump/stress/crash/
-  powerloss/bench + `mirror` (import/export/pull/push/sync/switch/conflicts/resolve)
+  powerloss/bench + `tier` (drain hot→cold + SIGKILL harness, #78)
+  + `mirror` (import/export/pull/push/sync/switch/conflicts/resolve)
   and `mirror-collide` (SIGKILL fuzz: source writers + a mirror daemon killed at every
   instant → final drain must converge mpedb exactly to the source). stress/crash take
   `--durability commit|wal` to exercise the intent ring on real disk; `powerloss` is the

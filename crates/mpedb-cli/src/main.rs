@@ -24,6 +24,7 @@ mod render;
 mod openpath;
 mod repl;
 mod stress;
+mod tier;
 mod util;
 
 
@@ -73,6 +74,14 @@ usage: mpedb <command> [args]
   collide --dir <dir> [--writers N] [--total T] [--drop-rate R] [--jitter-us J]
           [--keyspace K] [--detached-pct P] [--durability M]  (writer-collision fuzz)
   powerloss --dir <dir> [--rounds N] [--workers W] [--durability wal|async]
+  tier    drain <hot> <cold.mpedb> --table T --where PRED [param ...]
+          [--batch N] [--size-mb M] [--durability D]
+          (move matching rows to a cold file; cold commits+verifies BEFORE hot
+           deletes, so a crash duplicates at worst — re-run the same drain to
+           reconcile. A missing <cold.mpedb> is created with the table's exact
+           definition. Read back: ATTACH '<cold>' AS cold; SELECT ... UNION ALL
+           SELECT ... FROM cold.<T>)
+          crash --dir <dir> --waves W [--batch N]   (SIGKILL fuzz on the drain)
   mirror-collide --dir <dir> [--mode pull|push] [--writers N] [--secs S]
           [--kill-ms M] [--keyspace K]
           (SIGKILL fuzz: pull = source writers vs. a killed pull daemon (source
@@ -127,6 +136,8 @@ fn dispatch(argv: &[String]) -> CliResult {
         "crash" => crash::run_parent(rest),
         "collide" => collide::run_parent(rest),
         "mirror" => mirror::run(rest),
+        "tier" => tier::run(rest),
+        "tier-crash-child" => tier::run_crash_child(rest),
         "open" => match rest.split_first() {
             Some((path, more)) => openpath::run(path, more),
             None => usage("open needs <config.toml|db.mpedb|sqlite.db>"),
