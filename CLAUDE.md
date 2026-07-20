@@ -52,8 +52,9 @@ every protocol there survived a 37-finding adversarial review, and the ordering 
   0 doubles as the "empty tree" sentinel.
 - Committed pages are immutable — `page_mut` only on pages allocated by the current
   write txn (COW). TestStore and WriteTxn both enforce this; violations are engine bugs.
-- Freelist entries are keyed (txn BE, chunk BE) with values ≤ 960 B so they stay inline;
-  the commit fixpoint depends on rewrites not changing tree topology.
+- Freelist entries are keyed by 11 bytes `(txn u64 BE ‖ kind u8 ‖ chunk u16 BE)` — kind 0
+  = page ids, kind 1 = extent runs (DESIGN-BLOBEXTENT §3.3) — with values ≤ 960 B so they
+  stay inline; the commit fixpoint depends on rewrites not changing tree topology.
 - Pages freed by commit T are reusable when T ≤ oldest-pinned bound (NOT strict < — the
   off-by-one causes an unbounded high-water leak; there is a regression test).
 - **`refill_reusable` is READ-ONLY**: it draws an entry's pages into the writer's pool

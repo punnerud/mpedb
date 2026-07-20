@@ -2,7 +2,14 @@
 
 An SQLite-inspired correctness battery for mpedb: a sqllogictest-format
 runner, a curated corpus of `.test` files, and a randomized differential
-tester against `/usr/bin/sqlite3` and (three-way) PostgreSQL 16.
+tester against the **bundled** sqlite and (three-way) PostgreSQL 16.
+
+The oracle is in-process: `rusqlite` with the `bundled` feature, the version
+pinned in `Cargo.toml`, so every machine differentials against the same
+library. It used to shell out to `/usr/bin/sqlite3` and inherit whatever the
+box had installed — a rendering change between 3.45 and 3.51 could then flip
+the differential on one machine and not another. PostgreSQL is still driven as
+a batch subprocess against a throwaway cluster.
 
 ```
 cargo test -p mpedb-testkit                       # everything (< 60 s)
@@ -21,8 +28,9 @@ SQLite's reliability comes from several test harnesses. Honestly accounted:
   original sqllogictest *corpus* needed a shim when this crate was written
   (it assumes `CREATE TABLE`, type-coercing storage, and hashed result
   blocks); it now runs end to end through
-  [`src/bin/sqlite_corpus.rs`](src/bin/sqlite_corpus.rs) — **99.885 % of
-  5,938,278 attempted records, zero wrong answers**, measured 2026-07-19.
+  [`src/bin/sqlite_corpus.rs`](src/bin/sqlite_corpus.rs) — **99.9765 % of
+  5,938,278 attempted records, zero wrong answers and zero error
+  mismatches**, measured 2026-07-20 at commit `b41b713`.
   Numbers, the ranked blocker table and the reproduce recipe live in
   [`design/CORPUS-STATUS.md`](../../design/CORPUS-STATUS.md).
 - **TH3** is proprietary. Its coverage-driven, anomaly-injecting approach is
@@ -86,9 +94,12 @@ swaps), `insert_atomicity` (failed multi-row statements leave nothing),
 Seeded xorshift generator (no `rand` dep; every failure reproducible from
 its seed) produces INSERT/UPDATE/DELETE/SELECT programs over a fixed schema
 `t(pk int64 PK, a int64, b float64, c text)`; the same program runs against
-mpedb and `/usr/bin/sqlite3` (one batch process, `.mode list`,
-`.nullvalue NULL`, `CREATE TABLE … STRICT` — STRICT is the *closest* sqlite
-gets to mpedb's rigid types, not a match; see below). Compared per statement: success/failure
+mpedb and the bundled sqlite (a fresh in-memory `rusqlite` connection,
+`CREATE TABLE … STRICT` — STRICT is the *closest* sqlite gets to mpedb's
+rigid types, not a match; see below). Rows are rendered to the same
+`NULL`-sentinel pipe line the shell's `.mode list` produced, through sqlite's
+own value-to-text conversion, so the comparison is byte-for-byte what it was
+under the subprocess oracle. Compared per statement: success/failure
 status, and full row output of every SELECT. Divergences are delta-minimized
 before reporting. The known semantic differences (float formatting, text
 collation/LIKE case, rowid aliasing of `INTEGER PRIMARY KEY`, division

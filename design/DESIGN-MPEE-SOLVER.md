@@ -111,9 +111,18 @@ Cost = (worst_log, cartesian, late_unconstrained, residual_late)
 
 1. **`worst_log`** — `0` if the step is KNOWN (full PK pinned, or a full-width
    UNIQUE index pinned, by constants or by columns of `S`), else `bucket(t)`.
-   The sum is the log₂ of the worst-case product — the same quantity
-   `crates/mpedb/src/risk.rs` already computes for the #74 budget, now used to
-   *choose* a plan instead of only to *warn* about one.
+   The sum is the log₂ of the worst-case product — the same *idea*
+   `crates/mpedb/src/risk.rs` computes for the #74 budget, now used to *choose*
+   a plan instead of only to *warn* about one.
+
+   ⚠ The same idea, **not** the same code and not the same quantity. `risk.rs`
+   walks a *decoded plan* and accumulates a saturating raw product of exact
+   catalog row counts, in rows, to compare against `max_work_rows`. `worst_log`
+   sums magnitude buckets (§2.1) over *candidate orders* that no plan exists for
+   yet, in log₂, purely to rank them against each other. Two independent
+   implementations in two different units, and they are meant to stay that way:
+   the solver runs before there is a plan to decode, and a ranking needs only
+   ordinality where a budget needs a number.
 
 2. **`cartesian`** — `1` when `i > 0` and **no** predicate connects `tᵢ` to any
    table in `S`. A cartesian step multiplies the intermediate by the whole
@@ -171,8 +180,11 @@ of the path and reaches `t38` last. The anchor's real contribution is that the
 whole 17-way join returns one row; the ordering win is structural.
 
 `crates/mpedb/tests/mpee_solver.rs::join_17_4_answers` pins exactly this: the
-join-order line must read `(MPEE: 0 cartesian steps)` with 16 `[pk]` positions,
-and the query must answer.
+join-order line must end `(0 cartesian steps)` and carry 16 `[pk]` positions,
+and the query must answer — one row. It deliberately does **not** pin the
+identity of the seed: the tuple is what the anchor determines, the *ordering*
+win is structural, and pinning `t27` by name would make an equally good tie-break
+look like a regression.
 
 ---
 
@@ -423,6 +435,11 @@ population v1 left to the text.
   it.
 - **the recursive-CTE working table** (`CTE_TABLE`) or a non-flattened derived
   table in the chain.
+- **`DUAL_TABLE`** — the synthetic one-row table a `FROM`-less SELECT binds
+  against. It has no rows to bucket and no PK to pin, so every cost term reads
+  0 and the solver would be free to move it anywhere; refusing keeps it where
+  the binder put it. Grouped with the eligibility refusals above, so it
+  surfaces as `Skip::Ineligible`.
 - **any RLS policy on any table in the chain.** This one is kept deliberately,
   and the argument is the overflow channel below: a reorder changes which pairs
   a predicate is evaluated over, mpedb **raises** on arithmetic overflow, and
@@ -431,7 +448,19 @@ population v1 left to the text.
   *raises* a policy-scoped query can produce — a much stronger claim than
   preserving the row set, and not one this solver can make. A named refusal is
   the honest answer.
-- **a scope with more than 17 tables**, which cannot occur (`MAX_JOINS = 16`).
+- **a scope with more than 17 tables**, which cannot occur (`MAX_JOINS = 16`) —
+  and, at the other end, fewer than two, since there is nothing to order
+  (`Skip::Size` covers both).
+- **a failed probe bind** (`Skip::Unbindable`). This one is not an eligibility
+  judgement at all: §8 step 1 binds each `ON` over its own left-deep prefix
+  scope, and if that fails the statement is very likely invalid. The solver
+  abandons **silently** rather than reporting, so the normal compile path
+  produces the real, well-worded error instead of a reorder-flavoured one. A
+  refusal that must not become a diagnostic.
+
+The four refusal outcomes are `Skip::{Size, Ineligible, Unbindable, NoGain}`
+(`planner/mpee.rs`); `NoGain` — nothing strictly better than what the user
+wrote — is the common one and not a limitation.
 
 One behavioural consequence is worth naming rather than discovering: mpedb's
 expressions **raise** on arithmetic overflow, and a reorder changes which pairs
@@ -477,11 +506,28 @@ The reorder happens at the **AST** level, before binding, following the pattern
 
 No new plan-byte field, no `PLAN_FORMAT` bump: the chosen order *is* the plan.
 
-`EXPLAIN` gains one line naming the order and why:
+`EXPLAIN` gains one line naming the order and the access class each position was
+entered with. As built (`plan/explain.rs`), for §3.1's `join-17-4`:
 
 ```
-  join order: t38, t61, t24, … (MPEE: 0 cartesian steps, 1 keyed probe, 16 scans)
+  join order: t27 [scan] -> t9 [pk] -> t56 [pk] -> … -> t38 [pk] (0 cartesian steps)
 ```
+
+Three things about that line, each deliberate:
+
+- **Arrow-separated, class per position** (`pk` | `index` | `range` | `fts` |
+  `scan` | `cartesian`), not a bare comma list — the *why* is the class, and it
+  is per position or it says nothing.
+- **Only the cartesian count is summarised.** An earlier draft of this doc
+  printed keyed-probe and scan counts too; they are redundant with the
+  per-position classes, and the cartesian count is the one term the reader
+  cannot recover by eye on a 17-way chain.
+- **No `(MPEE: …)` prefix** — removed at `36155ae`. The line is RECONSTRUCTED
+  post hoc from the finished plan by classifying each `AccessPath`; nothing in
+  the plan bytes records whether `mpee::reorder` ran or returned `Err(Skip::*)`.
+  A FULL JOIN chain the solver explicitly declines to look at (§7.2) would
+  otherwise print an attribution it had not earned. What the line states is
+  true of the plan either way.
 
 ---
 
