@@ -64,6 +64,16 @@ fn scan_code(sql: &str, mut f: impl FnMut(usize, u8)) {
 /// `(statement_including_no_semicolon, tail)` where `tail` is the remaining
 /// script (possibly empty). Trailing `;` is dropped from the statement.
 pub fn split_first(sql: &str) -> (&str, &str) {
+    // `CREATE TRIGGER … BEGIN <body> END` contains `;` INSIDE it — one per
+    // body statement. Splitting on the first one hands the caller a truncated
+    // statement and a tail, which is why `conn.execute("CREATE TRIGGER …")`
+    // used to answer "you can only execute one statement at a time": a
+    // consumer could not create a trigger through this API at all.
+    if let Some(end) = create_trigger_end(sql) {
+        let tail = sql[end..].trim_start();
+        let tail = tail.strip_prefix(';').unwrap_or(tail);
+        return (&sql[..end], tail);
+    }
     let mut cut = None;
     scan_code(sql, |i, c| {
         if cut.is_none() && c == b';' {
@@ -74,6 +84,66 @@ pub fn split_first(sql: &str) -> (&str, &str) {
         Some(i) => (&sql[..i], &sql[i + 1..]),
         None => (sql, ""),
     }
+}
+
+/// The alphanumeric words of `sql` OUTSIDE literals, quoted identifiers and
+/// comments, as `(start, end)` byte ranges.
+fn code_words(sql: &str) -> Vec<(usize, usize)> {
+    let mut words: Vec<(usize, usize)> = Vec::new();
+    let mut prev = usize::MAX;
+    scan_code(sql, |i, c| {
+        let is_word = c.is_ascii_alphanumeric() || c == b'_';
+        match words.last_mut() {
+            Some(last) if is_word && prev != usize::MAX && i == prev + 1 && last.1 == i => {
+                last.1 = i + 1
+            }
+            _ if is_word => words.push((i, i + 1)),
+            _ => {}
+        }
+        prev = i;
+    });
+    words
+}
+
+/// For a `CREATE [TEMP] TRIGGER … BEGIN <body> END`, the byte index just past
+/// the `END` that closes the body; `None` for any other statement.
+///
+/// `END` also closes a `CASE` expression, so the scan tracks depth: `CASE`
+/// opens, `END` closes, and the `END` that brings the depth back to zero is
+/// the trigger's. This is exactly the rule sqlite's own parser applies.
+fn create_trigger_end(sql: &str) -> Option<usize> {
+    let words = code_words(sql);
+    let w = |n: usize| words.get(n).map(|&(a, b)| &sql[a..b]);
+    if !w(0)?.eq_ignore_ascii_case("create") {
+        return None;
+    }
+    // `CREATE [TEMP|TEMPORARY] TRIGGER`.
+    let head = if w(1)?.eq_ignore_ascii_case("trigger") {
+        1
+    } else if w(1)?.eq_ignore_ascii_case("temp") || w(1)?.eq_ignore_ascii_case("temporary") {
+        if !w(2)?.eq_ignore_ascii_case("trigger") {
+            return None;
+        }
+        2
+    } else {
+        return None;
+    };
+    let begin = (head + 1..words.len()).find(|&i| w(i).unwrap().eq_ignore_ascii_case("begin"))?;
+    let mut depth = 1usize;
+    for &(a, b) in &words[begin + 1..] {
+        let word = &sql[a..b];
+        if word.eq_ignore_ascii_case("case") {
+            depth += 1;
+        } else if word.eq_ignore_ascii_case("end") {
+            depth -= 1;
+            if depth == 0 {
+                return Some(b);
+            }
+        }
+    }
+    // Unterminated body: leave it whole, so the parser reports the real error
+    // instead of the splitter inventing a truncation.
+    Some(sql.len())
 }
 
 /// True if the statement is empty once comments and whitespace are stripped —
@@ -618,6 +688,37 @@ mod tests {
         let (a, b) = split_first("SELECT ';'; SELECT 2");
         assert_eq!(a, "SELECT ';'");
         assert_eq!(b.trim(), "SELECT 2");
+    }
+
+    /// A `CREATE TRIGGER` body's `;`s are INSIDE the statement — splitting on
+    /// the first one made `conn.execute("CREATE TRIGGER …")` answer "you can
+    /// only execute one statement at a time", so a consumer could not create a
+    /// trigger through this API at all. `END` also closes a `CASE`, so the
+    /// scan has to count depth rather than stop at the first `END`.
+    #[test]
+    fn a_trigger_body_is_one_statement() {
+        let t = "CREATE TRIGGER tr UPDATE OF b ON t1 BEGIN \
+                 UPDATE t2 SET b = new.b WHERE a = old.a; END";
+        let src = format!("{t}; SELECT 1");
+        let (a, b) = split_first(&src);
+        assert_eq!(a, t);
+        assert_eq!(b.trim(), "SELECT 1");
+        // No trailing semicolon at all.
+        assert_eq!(split_first(t), (t, ""));
+        // Two body statements, and a CASE whose END is not the trigger's.
+        let t2 = "CREATE TEMP TRIGGER tr AFTER INSERT ON t BEGIN \
+                  UPDATE u SET v = CASE WHEN new.x > 0 THEN 1 ELSE 2 END; \
+                  DELETE FROM w; END";
+        let src2 = format!("{t2}; SELECT 2");
+        let (a, b) = split_first(&src2);
+        assert_eq!(a, t2);
+        assert_eq!(b.trim(), "SELECT 2");
+        // A `;` in a comment or a literal inside the body is still not a split.
+        let t3 = "CREATE TRIGGER tr BEFORE DELETE ON t BEGIN \
+                  INSERT INTO log VALUES ('a;b'); -- ; not here\n END";
+        assert_eq!(split_first(t3), (t3, ""));
+        // Not a trigger: the ordinary rule still applies.
+        assert_eq!(split_first("CREATE TABLE t (x); SELECT 1").0, "CREATE TABLE t (x)");
     }
 
     #[test]

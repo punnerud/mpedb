@@ -2971,3 +2971,34 @@ fn sqlite_master_evaluator_takes_the_iterdump_query_shape() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }
+
+/// A consumer could not create a TRIGGER through this API at all: the
+/// statement splitter cut the body at its first `;`, so `execute` reported
+/// "you can only execute one statement at a time". End to end, through
+/// prepare/step, including the trigger actually firing.
+#[test]
+fn a_trigger_can_be_created_and_fires() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t1 (a INTEGER PRIMARY KEY, b INTEGER)"), SQLITE_OK);
+        assert_eq!(exec(db, "CREATE TABLE t2 (a INTEGER PRIMARY KEY, b INTEGER)"), SQLITE_OK);
+
+        // No BEFORE/AFTER word: sqlite's documented default is BEFORE.
+        let ddl = "CREATE TRIGGER tr UPDATE OF b ON t1 \
+                   BEGIN UPDATE t2 SET b = new.b WHERE a = old.a; END;";
+        let s = cs(ddl);
+        let mut st: *mut Stmt = ptr::null_mut();
+        let mut tail: *const c_char = ptr::null();
+        assert_eq!(sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, &mut tail), SQLITE_OK);
+        // The whole trigger is ONE statement: nothing is left over.
+        assert!(tail.is_null() || CStr::from_ptr(tail).to_bytes().is_empty(), "tail must be empty");
+        assert_eq!(sqlite3_step(st), SQLITE_DONE);
+        assert_eq!(sqlite3_finalize(st), SQLITE_OK);
+
+        assert_eq!(exec(db, "INSERT INTO t2 (a, b) VALUES (1, 0)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t1 (a, b) VALUES (1, 0)"), SQLITE_OK);
+        assert_eq!(exec(db, "UPDATE t1 SET b = 42 WHERE a = 1"), SQLITE_OK);
+        assert_eq!(scalar_count(db, "SELECT b FROM t2 WHERE a = 1"), 42);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
