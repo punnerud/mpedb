@@ -34,8 +34,12 @@ LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS"
 # rebuild after `cargo clean`; do not expect it to help a fresh worktree.
 #
 # Set CARGO_INCREMENTAL=0 in the environment when you want hits.
-[build]
-rustc-wrapper = "sccache"
+#
+# NOT set here: an unconditional `rustc-wrapper` makes EVERY cargo command fail
+# on a machine without sccache installed (measured on the M3 — it broke the
+# whole run until worked around with RUSTC_WRAPPER=""). A build accelerator
+# must never be a hard dependency. Opt in per machine instead:
+#     export RUSTC_WRAPPER=sccache
 
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
