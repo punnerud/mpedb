@@ -46,6 +46,7 @@
 mod testdb;
 
 mod exec;
+mod multifile;
 mod policy_store;
 mod registry;
 pub mod risk;
@@ -435,6 +436,14 @@ pub struct Database {
     /// [`Database::set_busy_timeout`]; atomic so the shim's
     /// `sqlite3_busy_timeout` (any thread) needs no `&mut`.
     busy_timeout_ms: std::sync::atomic::AtomicI64,
+    /// Connection-local `ATTACH DATABASE` list (#51, sqlite compat) — never
+    /// persisted, never shared. See `multifile.rs`.
+    attached: RwLock<multifile::AttachState>,
+    /// Compiled cross-file plans (#51): connection-local like host-UDF plans
+    /// (their table ids only mean anything against THIS attach list), so they
+    /// live here and never touch the shared registry. Cleared on
+    /// ATTACH/DETACH; epoch- and schema-gen-checked at every execute.
+    cross_cache: RwLock<HashMap<PlanHash, Arc<multifile::CrossPlan>>>,
 }
 
 /// Compile every column CHECK source in `schema` into the engine's per-table /
@@ -512,6 +521,8 @@ impl Database {
             host_udfs: RwLock::new(HashMap::new()),
             host_aggs: RwLock::new(HashMap::new()),
             busy_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
+            attached: RwLock::new(Default::default()),
+            cross_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -562,6 +573,8 @@ impl Database {
             host_udfs: RwLock::new(HashMap::new()),
             host_aggs: RwLock::new(HashMap::new()),
             busy_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
+            attached: RwLock::new(Default::default()),
+            cross_cache: RwLock::new(HashMap::new()),
         })
     }
 
@@ -831,6 +844,27 @@ impl Database {
     /// Must NOT be called while a [`WriteSession`] from this handle is open
     /// on the same thread (see the crate-level locking rules).
     pub fn prepare(&self, sql: &str) -> Result<PlanHash> {
+        // #51: `main.` qualifiers strip; a cross-file statement compiles into
+        // the connection-local cross cache (like host-UDF plans, it is never
+        // published — its table ids only mean anything on this handle).
+        let routed;
+        let sql = match self.resolve_db_refs_hook(sql)? {
+            multifile::DbRoute::Passthrough => sql,
+            multifile::DbRoute::Main(s) => {
+                routed = s;
+                &routed
+            }
+            multifile::DbRoute::Cross { sql, tables } => {
+                let guard = self.attached.read().expect(POISON);
+                let (cp, _) = self.compile_cross(&guard, &sql, &tables)?;
+                let hash = cp.plan.hash();
+                self.cross_cache
+                    .write()
+                    .expect(POISON)
+                    .insert(hash, Arc::new(cp));
+                return Ok(hash);
+            }
+        };
         let plan = self.compile_maybe_explain(sql)?.0;
         self.warn_if_risky(&plan);
         let hash = plan.hash();
@@ -859,6 +893,12 @@ impl Database {
         hash: &PlanHash,
         params: &[Value],
     ) -> Result<ExecResult> {
+        // #51: a hash prepared from a cross-file statement lives in the
+        // connection-local cross cache and runs on the multi-file read path
+        // (epoch- and per-member-schema-gen-checked inside).
+        if let Some(res) = self.execute_cross_cached(session, hash, params)? {
+            return Ok(res);
+        }
         // Evict a plan whose catalog changed underneath it before serving it
         // from cache (a DROP / re-CREATE / ALTER since prepare). Cheap in the
         // common case: one `newest_meta` read, no clear.
@@ -884,6 +924,24 @@ impl Database {
         sql: &str,
         params: &[Value],
     ) -> Result<ExecResult> {
+        // sqlite-compat multi-database statements (#51): ATTACH/DETACH mutate
+        // the connection-local attach list; database-qualified names resolve
+        // before the parser (a `main.`-only statement continues below with
+        // the qualifier stripped; a cross-file SELECT runs on its own path).
+        if let Some(res) = self.attach_stmt_hook(sql)? {
+            return Ok(res);
+        }
+        let routed;
+        let sql = match self.resolve_db_refs_hook(sql)? {
+            multifile::DbRoute::Passthrough => sql,
+            multifile::DbRoute::Main(s) => {
+                routed = s;
+                &routed
+            }
+            multifile::DbRoute::Cross { sql, tables } => {
+                return self.query_cross(session, &sql, &tables, params)
+            }
+        };
         // RLS DDL (CREATE/DROP POLICY, ALTER TABLE … ROW LEVEL SECURITY) mutates
         // the catalog rather than compiling to a plan — apply it directly.
         if let Some(ddl) = mpedb_sql::parse_ddl(sql)? {
@@ -914,6 +972,24 @@ impl Database {
     /// load and (unlike `prepare`) does not need the "no open WriteSession"
     /// caveat.
     pub fn prepare_detached(&self, sql: &str) -> Result<DetachedPlan> {
+        // #51: a detached plan is client-borne bytes — a cross-file plan's
+        // merged table ids are meaningless outside this handle's attach list,
+        // so the combination refuses by name. `main.` qualifiers still strip.
+        let routed;
+        let sql = match self.resolve_db_refs_hook(sql)? {
+            multifile::DbRoute::Passthrough => sql,
+            multifile::DbRoute::Main(s) => {
+                routed = s;
+                &routed
+            }
+            multifile::DbRoute::Cross { .. } => {
+                return Err(Error::Unsupported(
+                    "cross-file statements cannot be prepared as detached \
+                     plans; use prepare()/execute() on this handle"
+                        .into(),
+                ))
+            }
+        };
         let plan = self.compile_maybe_explain(sql)?.0;
         Ok(DetachedPlan {
             hash: plan.hash(),
@@ -1573,6 +1649,31 @@ impl WriteSession<'_> {
         if self.poisoned {
             return Err(poisoned_err());
         }
+        // #51: the attach list is connection state, not transaction state —
+        // mutating it mid-transaction (or reading a second file from inside
+        // this write txn's snapshot) is refused by name in v1.
+        if mpedb_sql::parse_attach(sql)?.is_some() {
+            return Err(Error::Unsupported(
+                "ATTACH/DETACH inside an open transaction is not supported \
+                 (run it in autocommit)"
+                    .into(),
+            ));
+        }
+        let routed;
+        let sql = match self.db.resolve_db_refs_hook(sql)? {
+            multifile::DbRoute::Passthrough => sql,
+            multifile::DbRoute::Main(s) => {
+                routed = s;
+                &routed
+            }
+            multifile::DbRoute::Cross { .. } => {
+                return Err(Error::Unsupported(
+                    "cross-file SELECT inside an open write transaction is \
+                     not supported in v1 (run it in autocommit)"
+                        .into(),
+                ))
+            }
+        };
         // #95: DDL (CREATE/DROP/ALTER TABLE, CREATE INDEX) runs THROUGH this
         // session's transaction so the schema change lives in the txn's COW
         // catalog pages and commits/rolls back atomically with the session's
