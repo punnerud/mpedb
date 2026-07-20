@@ -76,8 +76,9 @@ pub use tier::TierReport;
 pub use workspace::{Workspace, WorkspaceTxn, WsPlan};
 
 pub use mpedb_types::{
-    BudgetKind, ColumnDef, ColumnType, Config, DbOptions, Durability, Error, HostAggState,
-    PlanHash, PolicyCmd, PolicyDef, Result, Schema, TableDef, Value, MAX_DB_SIZE_MB,
+    BudgetKind, ColumnDef, ColumnType, Config, DbOptions, Durability, Error, Footprint,
+    HostAggState, KeyAccess, KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema,
+    TableDef, TableSet, Value, MAX_DB_SIZE_MB,
 };
 
 use exec::{exec_stmt, ReadCtx};
@@ -942,6 +943,27 @@ impl Database {
         }
         let (plan, _explain) = self.compile_maybe_explain(sql)?;
         Ok(access::plan_access(&plan, &self.schema()))
+    }
+
+    /// The compiled plan's **identity and footprint**, without executing or
+    /// publishing anything: `(plan hash, what the statement touches)`.
+    ///
+    /// The footprint is the routing / *shape* key — the table sets, the index
+    /// bitmap and the key access a plan will use, all known before a single row
+    /// moves ([`ShardSet`] already routes on it). It is deliberately NOT an
+    /// identity: many distinct plans share one footprint, which is exactly what
+    /// makes it usable as an INDEX over plans with the hash as the final
+    /// discriminator. Compiles through the same path `prepare`/`execute` do, so
+    /// the pair is the one the executed statement will carry. DDL compiles to no
+    /// plan and yields `Unsupported` (use [`Database::access_report`] there).
+    pub fn plan_footprint(&self, sql: &str) -> Result<(PlanHash, Footprint)> {
+        if mpedb_sql::parse_ddl(sql)?.is_some() {
+            return Err(Error::Unsupported(
+                "DDL compiles to no plan and has no footprint".into(),
+            ));
+        }
+        let (plan, _explain) = self.compile_maybe_explain(sql)?;
+        Ok((plan.hash(), plan.footprint.clone()))
     }
 
     /// Compile `sql` against an EXPLICIT schema bundle — a [`WriteSession`]'s
