@@ -290,6 +290,32 @@ mask is 64 bits); beyond that is a named error.
 | — | `timestamp` | µs since epoch, UTC |
 | dynamic typing | `any` | opt-in per column (sqlite-affinity semantics, tagged per value); allowed in PRIMARY KEY / UNIQUE / secondary indexes, where the tree is keyed by STORAGE CLASS — see below |
 
+#### Two vocabularies: a TOML config is rigid, a `CREATE TABLE` is sqlite
+
+The table above is the **config** vocabulary (`type = "text"`), and it is
+rigid in the strongest sense: a value of the wrong type is refused, never
+converted. That is the product.
+
+A type name written in a **`CREATE TABLE`** is read with **sqlite's affinity
+rule** instead, because that is what the name means to whoever wrote it. Two
+consequences worth stating loudly (task #113):
+
+- `blob` and `timestamp` in DDL are the **per-value column**, not the rigid
+  `blob`/`timestamp` types. sqlite's BLOB affinity converts nothing — after
+  `UPDATE t SET b = 'aaaa'` on a `b blob` column, `typeof(b)` really is
+  `'text'` — and `timestamp` is NUMERIC affinity like `datetime`, which is the
+  only way an ISO string can land in it (SQL has no timestamp literal). `bool`
+  and `any` are the two carve-outs where mpedb's own name still wins.
+- an `int`/`real`/`text` column declared in DDL stays **rigid**, but it now
+  APPLIES sqlite's store affinity first: `'12'` into an `int` column stores the
+  integer `12`, `5` into a `varchar` stores `'5'` — and `'abc'` into an `int`
+  column is still refused, because sqlite keeps the text there and a rigid
+  `int64` cannot hold it. **Agree with sqlite or refuse; never differ.**
+
+The same names in a config are unaffected: `type = "text"` still refuses `5`,
+`type = "timestamp"` is still µs-since-epoch. The provenance is the column's
+declared DDL text (`ColumnDef::decl`).
+
 #### A typeless column as a key
 
 A `PRIMARY KEY`, `UNIQUE` or secondary index over an `any` column is keyed by
@@ -500,8 +526,13 @@ see [GUIDE.md](GUIDE.md) for the full list with examples:
    rule); sqlite silently takes the first row.
 3. `ORDER BY` must name something the query outputs; `ORDER BY 1 + 1` is
    refused (sqlite sorts by the constant, i.e. not at all).
-4. Text never converts *implicitly* to numbers (not in comparisons, arithmetic,
-   or storage) — but an *explicit* `CAST` follows sqlite's permissive affinity
-   rules and parses a leading numeric prefix (see the CAST row above).
+4. Text never converts *implicitly* to numbers in comparisons or arithmetic —
+   but an *explicit* `CAST` follows sqlite's permissive affinity rules and
+   parses a leading numeric prefix (see the CAST row above), and **storage**
+   into a `CREATE TABLE`-declared column applies sqlite's store affinity (see
+   *Two vocabularies* above). A config-declared column converts nothing.
+6. `||` refuses a blob or a float operand where sqlite renders both as text.
+   The blob half cannot be matched: sqlite's result is bytes that need not be
+   valid UTF-8, and mpedb's `text` is.
 5. Compound set-ops use sqlite's flat precedence; PostgreSQL binds INTERSECT
    tighter. Documented, matching sqlite here.

@@ -1695,7 +1695,10 @@ fn exec_stmt_rest(
             let converts = t.converts_on_store();
             let generates = t.has_generated();
             for (applied, mut row) in built_rows.into_iter().enumerate() {
-                if converts {
+                // The per-ROW guard matters as much as the per-table one now
+                // that a shim `text` column carries TEXT affinity (#113): most
+                // rows are already in their columns' classes and stay borrowed.
+                if converts && t.needs_store_affinity(&row) {
                     t.apply_store_affinity(row.to_mut());
                 }
                 // GENERATED ALWAYS AS (…): computed HERE, before anything else

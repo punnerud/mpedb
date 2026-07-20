@@ -2163,3 +2163,164 @@ but the shim's own parameter scanner
 (`sqlite3_bind_parameter_count`, `mpedb-capi`) still counts `$b` as a
 parameter and the statement fails with a binding-count error. Django's
 shape (`crafted_alia$.id`) does not hit it.
+
+## E3(b) CLOSED — rigid typing through the shim is sqlite's affinity now (#113, 2026-07-20)
+
+The largest single class in the CPython wave-4 remainder (9 tests, plus one
+Django pair). Route unchanged. Every number below is a BEFORE/AFTER pair
+measured on the same box against `main` @ **`b41b713`**, with a control build of
+that exact commit in a second worktree — no number is quoted from an earlier
+run.
+
+| suite | before (`b41b713`) | after |
+|---|---|---|
+| CPython `test_sqlite3` | **435 / 466** (26 bad, 5 skip) | **445 / 466** (16 bad, 5 skip) — +10, and the failure sets differ by exactly those 10 |
+| Django G1+G2 (the frozen 831) | **824 / 831** | **826 / 831** — `test_lefthand_power`, `test_righthand_power` |
+| Django `queries` / `backends` / `model_fields` (1 345) | 488/493, 308/324, 514/528 | **byte-identical failure sets** |
+| corpus `select1-4` + `evidence/` (9 689 records) | 9 489, 4 wrong | **byte-identical report**, incl. the 4 known `slt_lang_replace` artifacts |
+| `slt_files`, whole workspace suite, clippy `-D warnings` | green | green |
+
+Schema canonical bytes stay **v9**, `PLAN_FORMAT` stays **55**: `ColumnDef::decl`
+was already in v8 and is the only new input.
+
+### The three candidate designs, and the oracle evidence that picked one
+
+The trap in this family is that widening turns a clean refusal into a WRONG
+answer. Everything below was probed against the bundled sqlite BEFORE choosing,
+on VALUE *and* `typeof()`:
+
+```
+create table b(id integer primary key, b blob);
+update b set b='aaaa';   -- typeof(b)='text', b='aaaa', length(b)=4, hex(b)='61616161'
+insert into b values(2, 55);    -- typeof='integer'
+insert into b values(3, 2.5);   -- typeof='real'
+create table t(id integer primary key, x timestamp);
+insert into t values(2,'12');   -- typeof='integer', x=12
+insert into t values(3,'1.50'); -- typeof='real',    x=1.5
+create table s(id integer primary key, name text);
+insert into s values(2, 55);       -- typeof='text', name='55'
+insert into s values(3, x'4142');  -- typeof='blob'  (TEXT affinity does NOT convert a blob)
+create table i(id integer primary key, v int);
+'5'→integer 5   '5.0'→integer 5   'abc'→text   2.5→real 2.5   2.0→integer 2
+```
+
+* **(a) coerce at bind** (text literal → blob bytes) — **REJECTED, it is the
+  wrong answer.** sqlite's BLOB affinity applies NO conversion: after
+  `UPDATE t SET b='aaaa'` the column holds TEXT. Under (a) `typeof(b)` answers
+  `'blob'` where sqlite answers `'text'`, and `b = 'aaaa'` goes from TRUE to
+  FALSE. It agrees with sqlite on `length`/`hex` and disagrees on the two things
+  a consumer branches on.
+* **(b) the shim-declared column holds per-value types like `any`** — **CHOSEN,
+  but only where sqlite's affinity is genuinely not a storage class.** That is
+  BLOB affinity (converts nothing, holds every class) and NUMERIC affinity
+  (integer, real or string per value). Applying (b) to INTEGER/REAL/TEXT
+  affinity as well would have been faithful too — and catastrophic: an `any`
+  column is storable but the planner never PROBES one (`any_key.rs`), so every
+  `varchar(100)` primary key and every `bigint` index in Django would have
+  become a full scan. The blast radius is the reason (b) is scoped, not the
+  reason it loses.
+* **(c) stay rigid, document the deviation** — **REJECTED for `blob`/
+  `timestamp`, KEPT for the residue.** For INTEGER/REAL/TEXT affinity a third
+  way exists that (c) misses: apply the conversion and stay rigid about its
+  RESULT. `'12'` into an `int` column stores the integer 12 exactly as sqlite
+  does; `'abc'` is still refused, because sqlite keeps the text and a rigid
+  `int64` cannot. Agree or refuse, never differ — which is (c)'s guarantee
+  without (c)'s cost.
+
+### How provenance is determined
+
+`ColumnType::declared` is called from **exactly one place**, the `CREATE TABLE`
+type-name parser (`parser/ddl.rs::declared_type`); a TOML-config column goes
+through `ColumnType::parse` and never reaches it. So the type MAPPING is scoped
+structurally, with no new flag.
+
+The store-time CONVERSION needed a per-column bit, because a rigid `Text`
+column has to behave differently depending on where it came from. That bit is
+**`ColumnDef::decl.is_some()`** — the verbatim declared text, `Some` only for a
+column a `CREATE TABLE` spelled a type for, `None` for the config path, the
+synthetic catalog tables, and sqlite's typeless column (which converts nothing
+anyway). It is already in canonical bytes v8, so nothing was added to the
+format. `converts_on_store(ty, affinity, declared)` is the single gate; both
+`ColumnDef::converts_on_store` and `store_into` go through it.
+
+`SqliteAttach` needed no work: it already builds every column as
+`(Any, Affinity::declared(decl))`.
+
+### What changed, concretely
+
+| declared in a `CREATE TABLE` | was | is |
+|---|---|---|
+| `blob`, `longblob`, `cblob`, `bytes` | rigid `Blob` | `Any` + BLOB affinity (converts nothing) |
+| `timestamp` | rigid `Timestamp` | `Any` + NUMERIC affinity, like `date`/`datetime` |
+| `string` | rigid `Text` | `Any` + NUMERIC affinity (sqlite's rule for the name) |
+| `int`/`bigint`/…, `real`/`float`/…, `text`/`varchar`/… | rigid, refuses a mismatch | rigid, **applies** sqlite's affinity and refuses what the conversion left |
+| `bool`, `boolean`, `any` | unchanged | unchanged — the two deliberate carve-outs |
+
+`timestamp` deserves its own line: SQL has no timestamp literal and the C API no
+`sqlite3_bind_timestamp`, so a rigid `Timestamp` column built by `CREATE TABLE`
+was a column **no value reachable through this shim could be written to** — the
+old `capi.rs` test asserted exactly that, as a refusal. A config
+`type = "timestamp"` is untouched and still rigid.
+
+### ⚠️ A wrong answer found and fixed inside this change
+
+Stacking the planner's `coerce_const` on TOP of the store affinity stored
+`INSERT INTO t(v) VALUES ('-9223372036854775809')` into a `bigint` column as the
+**clamped i64 MIN**, where sqlite keeps the real `-9.22337203685478e+18`:
+`exact_float_as_int` accepts exactly ±2^63 and `sqlite3VdbeIntegerAffinity`
+(via `real_as_int`) does not. On a converting column the affinity is now the
+WHOLE rule and `coerce_const` does not run at all. Found by the differential
+battery below, before either suite ran.
+
+### Verification added
+
+* `crates/mpedb/tests/django_parse_gaps.rs` —
+  `declared_int_real_text_columns_convert_like_sqlite_or_refuse` drives the full
+  NUMERIC-affinity literal battery (44 values incl. the i64 extremes, `1e400`,
+  `'12abc'`, `'0x10'`, blobs, NULL) x `bigint` / `double precision` /
+  `varchar(10)` through the bundled oracle. The contract is *agree or refuse,
+  never differ*: on acceptance `typeof()` AND the text must equal sqlite's; on
+  refusal sqlite must have stored a class the rigid column cannot hold.
+  `a_declared_blob_column_is_sqlites_typeless_column` runs the same battery plus
+  the `UPDATE t SET b='aaaa'` shape (`typeof`, value, `length`, `hex`).
+  `a_rigid_column_refuses_what_sqlite_would_coerce` now carries the PROVENANCE
+  half: the identical types declared in a TOML config still refuse all three.
+* `crates/mpedb/tests/add_column_default.rs` —
+  `a_ddl_declared_column_applies_sqlites_store_affinity_to_its_default`, five
+  `ADD COLUMN … DEFAULT` shapes diffed value-and-`typeof` against sqlite.
+* `crates/mpedb/tests/numeric_params.rs` — the `SET i = <real expr>` pair: the
+  DDL column converts per row (matching sqlite) and refuses per row when the
+  real is not integral, while a config `type = "int64"` column keeps the
+  compile-time refusal.
+* `crates/mpedb-capi/tests/capi.rs` — the `timestamp` column now asserts per-row
+  `typeof` + `sqlite3_column_type` + the verbatim `TIMESTAMP` decltype.
+
+### The 10 CPython tests this closed
+
+`BlobTests.test_blob_get_item_error`, `test_blob_read_error_row_changed`,
+`test_blob_write_error_row_changed` (the three `UPDATE t SET b='aaaa'` expiry
+provocations); `DateTimeTests.test_sqlite_timestamp`,
+`test_date_time_sub_seconds`, `test_date_time_sub_seconds_floating_point`,
+`test_sql_timestamp`; `RegressionTests.test_type_map_usage`,
+`test_convert_timestamp_microsecond_padding`;
+`CursorTests.test_rowcount_executemany`.
+
+### The one E3(b) row NOT closed, and why it is not affinity
+
+`RegressionTests.test_error_msg_decode_error` —
+`select 'xxx' || ? || 'yyy'` with `bytes([250])` bound. No column is involved:
+this is `||`'s operand coercion, and the test asserts CPython raises
+*"Could not decode to UTF-8"*, i.e. that the RESULT is text which is not valid
+UTF-8. `Value::Text` is a Rust `String` and cannot hold that, so the refusal is
+structural rather than a missing conversion. **Deliberate deviation, recorded.**
+
+### Django's other numeric-strictness pair stays open, deliberately
+
+`LookupQueryingTests.test_annotate_greater_than_or_equal_float` /
+`test_annotate_less_than_float` (`year >= 1942.1` against an integer column)
+are **comparison** affinity, not store affinity — a different sqlite rule
+(`sqlite3IntFloatCompare` compares the classes exactly rather than converting
+either side). Rounding the parameter to satisfy the slot is precisely the wrong
+answer `coerce_params` refuses by name today, and an index probe on a rounded
+bound would return the wrong rows. Left refused; it needs mixed-class
+comparison, not this change.

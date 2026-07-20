@@ -837,7 +837,18 @@ impl<'a> Binder<'a> {
             }
         }
         let (b, ty) = self.bind_expr(e)?;
-        let (b, ty) = self.unify_param(b, ty, col.ty);
+        // A column that CONVERTS on store (task #113: a rigid `int`/`real`/
+        // `text` whose declaration came through `CREATE TABLE`, so it carries
+        // sqlite's affinity) must NOT pin a bare parameter to its rigid type:
+        // the whole point is that `SET name = ?` with an integer bound stores
+        // `'5'`. Leaving the slot untyped is what lets the value reach the
+        // store-time conversion; the engine then validates the CONVERTED value
+        // against the column, so nothing untyped is stored unchecked.
+        let (b, ty) = if col.converts_on_store() {
+            (b, ty)
+        } else {
+            self.unify_param(b, ty, col.ty)
+        };
         match ty {
             Some(t) if t == col.ty => Ok(b),
             // `any` is the loose-type escape (#23): every runtime-typed value
@@ -867,23 +878,35 @@ impl<'a> Binder<'a> {
             // `SET i = r` stays refused, because truncating a column of reals
             // would be a wrong answer rather than a wider one, and sqlite would
             // have stored the real itself in its typeless column.
-            Some(ColumnType::Float64) if col.ty == ColumnType::Int64 => match &b {
-                BExpr::Const(Value::Float(f)) => match exact_float_as_int(*f) {
-                    Some(i) => Ok(BExpr::Const(Value::Int(i))),
-                    None => Err(bind_err(format!(
-                        "cannot assign the float64 constant {f:e} to int64 column `{}` — \
-                         it is not exactly an integer in the int64 range, and mpedb's \
-                         rigid int64 cannot hold what sqlite would have stored",
+            // A DDL-declared `int` column is NOT handled here: it carries
+            // sqlite's INTEGER affinity, which is stricter at the i64 extremes
+            // than `exact_float_as_int` (`sqlite3VdbeIntegerAffinity` refuses
+            // exactly ±2^63, where this accepts the clamp), and applies it per
+            // value at STORE time — so it falls through to the converting arm
+            // below and `SET i = POWER(i, ?)` is allowed. This arm is the
+            // config-declared `type = "int64"`, where rigidity is the contract
+            // and there is no affinity to apply.
+            Some(ColumnType::Float64)
+                if col.ty == ColumnType::Int64 && !col.converts_on_store() =>
+            {
+                match &b {
+                    BExpr::Const(Value::Float(f)) => match exact_float_as_int(*f) {
+                        Some(i) => Ok(BExpr::Const(Value::Int(i))),
+                        None => Err(bind_err(format!(
+                            "cannot assign the float64 constant {f:e} to int64 column `{}` — \
+                             it is not exactly an integer in the int64 range, and mpedb's \
+                             rigid int64 cannot hold what sqlite would have stored",
+                            col.name
+                        ))),
+                    },
+                    _ => Err(bind_err(format!(
+                        "cannot assign float64 to column `{}` of type int64: only a \
+                         constant whose value is exactly an integer converts, because \
+                         that is the only case losslessness can be checked at compile time",
                         col.name
                     ))),
-                },
-                _ => Err(bind_err(format!(
-                    "cannot assign float64 to column `{}` of type int64: only a \
-                     constant whose value is exactly an integer converts, because \
-                     that is the only case losslessness can be checked at compile time",
-                    col.name
-                ))),
-            },
+                }
+            }
             // sqlite stores a boolean AS the integer 0/1, so assigning one to an
             // integer column is exactly `CAST(x AS INTEGER)` — lossless and
             // sqlite-identical. This is Django's `SET flag = (a = b)` shape.
@@ -910,6 +933,34 @@ impl<'a> Binder<'a> {
                     ))),
                 }
             }
+            // Everything else on a column that CONVERTS on store: sqlite's
+            // affinity runs on the way in and decides per value, so the static
+            // types disagreeing is not the answer — `SET name = 5` on a
+            // `name varchar(10)` stores `'5'`. A constant converts here and
+            // now (so a value the conversion cannot land inside the rigid type
+            // is still a clean BIND error, with the reason named); anything
+            // else converts at store time and the engine then validates the
+            // CONVERTED value against the column — a refusal, never a wrong
+            // value.
+            Some(t) if col.converts_on_store() => match b {
+                BExpr::Const(v) => {
+                    let v = col.store(v);
+                    if v.fits(col.ty) {
+                        Ok(BExpr::Const(v))
+                    } else {
+                        Err(bind_err(format!(
+                            "cannot assign {t} to column `{}` of type {}: sqlite's {} \
+                             affinity leaves this value a {}, which the column cannot \
+                             hold — sqlite would have stored it as one",
+                            col.name,
+                            col.ty,
+                            col.affinity.name(),
+                            v.type_name()
+                        )))
+                    }
+                }
+                other => Ok(other),
+            },
             Some(t) => Err(bind_err(format!(
                 "cannot assign {t} to column `{}` of type {}",
                 col.name, col.ty
