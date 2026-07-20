@@ -256,19 +256,20 @@ fn per_group_positions_stay_refused() {
         "a correlated subquery in an aggregate query is only supported where it is \
          evaluated PER ROW",
     );
-    // ANY subquery written inside HAVING is refused by the lift, before any of
-    // this. That is broader than the per-row rule strictly needs — `HAVING
-    // sum((SELECT …)) > 1` puts the correlated value in a per-ROW aggregate
-    // ARGUMENT, which the row loop could evaluate — but the lift does not
-    // descend into HAVING at all, so the refusal is uniform and named. Left as
-    // is: it is a refusal, never an answer.
+    // A CORRELATED subquery in HAVING is refused by the lift. An UNCORRELATED
+    // one is not — its slot is filled once, before dispatch, so HAVING reads an
+    // ordinary parameter (see `subquery_in_having.rs`). The refusal is broader
+    // than the per-row rule strictly needs — `HAVING sum((SELECT …)) > 1` puts
+    // the correlated value in a per-ROW aggregate ARGUMENT, which the row loop
+    // could evaluate — but the lift decides per subquery, not per position, so
+    // the refusal stays uniform and named.
     refuse(
         "SELECT a.dept, count(*) FROM a GROUP BY a.dept HAVING (SELECT count(*) FROM b WHERE b.k = a.g) > 0",
-        "a subquery in HAVING is not supported yet",
+        "a CORRELATED subquery in HAVING is not supported yet",
     );
     refuse(
         "SELECT a.dept FROM a GROUP BY a.dept HAVING sum((SELECT count(*) FROM b WHERE b.k = a.g)) > 1",
-        "a subquery in HAVING is not supported yet",
+        "a CORRELATED subquery in HAVING is not supported yet",
     );
     // The SAME subquery spelled out in both the select list and the GROUP BY
     // lifts TWICE, into two slots, so the item is not recognised as the key —
