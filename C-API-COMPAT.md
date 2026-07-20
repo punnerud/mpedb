@@ -38,8 +38,9 @@ or safe no-op, never a wrong answer):
   (see `open_v2`); the one module that matters, **FTS5, is native**, not a plugin.
 - **Hooks & authorizer** (`_commit_hook`/`_rollback_hook`/`_update_hook`/`_wal_hook`/
   `_set_authorizer`/`_trace_v2`/`_progress_handler`): safe no-ops.
-- **`sqlite3_config`, loadable extensions, serialize/backup internals, and
-  incremental blob I/O** beyond the listed set: out of scope.
+- **`sqlite3_config`, loadable extensions, and serialize/backup internals**
+  beyond the listed set: out of scope. (Incremental blob I/O is no longer on
+  this list — `sqlite3_blob_*` is implemented; see the table below.)
 
 So "100%" is the **consumer / DB-API surface**, not every symbol in the reference.
 The tables below list, by category, exactly what the shim implements.
@@ -179,7 +180,8 @@ against `_sqlite3.cpython-312` on Linux/x86-64 (Python 3.12).
 | `sqlite3_aggregate_context` | ✅ | First call of an aggregation with `nBytes > 0` allocates that many ZEROED bytes; every later call in the SAME aggregation (`xFinal` included) returns the SAME pointer; `nBytes <= 0` never allocates and returns NULL when the group was never stepped. Freed after `xFinal`. NULL inside a scalar callback, as sqlite does for that misuse |
 | `sqlite3_context_db_handle` | ❌ stub | Returns NULL |
 | Online-backup API (`sqlite3_backup_*`) | ❌ stub | `_init` → NULL (use `mpedb mirror`); the rest are inert |
-| Incremental blob (`sqlite3_blob_*`) | ❌ stub | `_open` → `SQLITE_ERROR`; will map onto mpedb's #43 incremental-blob API |
+| Incremental blob (`sqlite3_blob_*`) | ✅ | **Real** (`blob.rs`): `_open`/`_read`/`_write`/`_bytes`/`_reopen`/`_close`, contract probed off sqlite 3.45.1. Size FIXED at open (a write never grows the value; out-of-range I/O is `SQLITE_ERROR` "SQL logic error"); `SQLITE_READONLY` on a read-only handle; open refusals carry sqlite's exact text (`no such rowid: N`, `cannot open value of type integer`, `cannot open indexed column for writing`, `cannot open table without rowid: t`). **Expiry under MVCC**: mpedb has no b-tree cursor to invalidate, so the handle snapshots its row at open and each I/O re-reads and compares — row deleted or ANY column changed ⇒ `SQLITE_ABORT` ("query aborted"), permanently (even `_reopen` then aborts, as sqlite does). A blob write is a full-row UPDATE **guarded on the snapshot**, so read-patch-write is atomic in autocommit: a concurrent change becomes the expiry answer, never a lost update. Writes through a handle expire nothing, and same-row siblings on the connection are refreshed. Divergences, by name: a handle on ANOTHER connection sees the changed row and expires where sqlite would let it read the new bytes (inherent to snapshot-compare); a blob write that would leave a TEXT value invalid UTF-8 is refused (mpedb text is strictly UTF-8) rather than silently restyling the cell. `sqlite3_close` answers `SQLITE_BUSY` while a handle is open, and `sqlite3_close_v2` leaves sqlite's **zombie** connection — logically closed, kept alive so the outstanding handle keeps working, freed by the last `sqlite3_blob_close` (both probed) |
+| `zeroblob(N)` / `sqlite3_bind_zeroblob[64]` | ✅ | N zero bytes, MATERIALIZED (mpedb has no lazy zero-run representation — semantically identical), capped at sqlite's `SQLITE_MAX_LENGTH` 1e9 with `SQLITE_TOOBIG` "string or blob too big", which is also the memory guard. mpedb's binder refuses a function CALL in `INSERT … VALUES` position and never const-folds `BExpr::Call`, so the shim rewrites `zeroblob(<const>)` to the byte-identical blob literal in code regions (quote/comment aware, ≤ 16 MiB inline); the host UDF still backs non-constant and over-cap arguments. 19 value/`typeof`/`hex` cases diffed against stock 3.45.1: **0 divergences** |
 | `sqlite3_serialize` / `_deserialize` | ❌ stub | NULL / `SQLITE_ERROR` |
 | `sqlite3_create_module` (virtual tables) | ❌ | Not referenced by `_sqlite3`; FTS is native (design/DESIGN-FTS) |
 
@@ -1251,6 +1253,14 @@ on that by not freeing). Fixed + FFI-pinned
 | shim, first non-crashing run | 466 | 283 | 178 | 5 |
 | **shim, after the 3 commits** | 466 | **344** | **117** | 5 |
 | **shim, after #109 (busy timeout end-to-end)** | 466 | **350** | **111** | 5 |
+| shim, baseline re-derived at `c36097c` | 466 | 349 | 112 | 5 |
+| **shim, after incremental blob + zeroblob (E2/E11)** | 466 | **387** | **74** | 5 |
+
+The last two rows are one measurement pair, both taken at `c36097c` on the
+same machine and interpreter (the earlier rows are older heads — the baseline
+moves, so it was re-derived rather than quoted). **+38**: 35 of `BlobTests`
+plus the `zeroblob`-blocked remainder, including all of `ThreadTests`, whose
+`setUp` inserts a `zeroblob(1)`.
 
 The 117 counts one test the run must EXCLUDE because it deadlocks (worse
 than failing — see engine gap E1). The 5 baseline skips are sqlite-version
@@ -1307,7 +1317,7 @@ codes/messages, blob/backup surfaces).
 | # | Tests | Gap | Repro / note |
 |---|---|---|---|
 | E1 | **FIXED (#109, 2026-07-19)** | ~~Cross-process writer contention BLOCKS forever~~ → `Database::set_busy_timeout` + `Engine::begin_write_deadline` bound every facade writer-lock wait; the shim wires the knob at open (0), `sqlite3_busy_timeout`, and `PRAGMA busy_timeout`. `MultiprocessTests.test_ctx_mgr_rollback_if_commit_failed` passes UN-excluded (0.097 s); the suite no longer hangs. Two-process elapsed evidence in `crates/mpedb/tests/busy_timeout.rs` (timeout 300 ms → Busy at 300.1 ms; timeout 0 → 4.7 µs; SIGKILLed holder → waiter ACQUIRES via EOWNERDEAD adoption in 22.7 µs, never hangs). | |
-| E2 | 38 | **Incremental blob I/O** (`sqlite3_blob_*` = mpedb #43). All of `BlobTests`; refusal is honest OperationalError now. | `con.blobopen("t", "b", 1)` |
+| E2 | **FIXED (2026-07-20)** | ~~Incremental blob I/O~~ → `sqlite3_blob_*` is real (`crates/mpedb-capi/src/blob.rs`; see the surface table above for the contract and the MVCC expiry mapping). `BlobTests` **35/38**; the 3 left are NOT blob failures — each one calls `update test set b='aaaa'` (text into a BLOB column) merely to provoke expiry, and dies on **E3**'s rigid typing before touching the handle. The same expiry drives correctly through a blob-typed UPDATE (`capi.rs::blob_handle_expires_when_its_row_changes`). | |
 | E3 | 14 | **Declared-type family.** (a) 6 × decltype-canonicalization (the ⚠️ divergence above — needs verbatim decl text in the schema); (b) 8 × bind rigidity where sqlite coerces: text→`timestamp` (CPython's own adapters bind datetime as an ISO STRING — `insert into t(x) values (?)` with `"2026-07-19 10:00:00"` into `x timestamp` is IntegrityError; stock stores it), int→`text`, blob→`text`. | `crates/…/scratchpad` repros in section text |
 | E4 | 9 | **Window functions** (`sqlite3_create_window_function`) — DESIGN-UDF stage 3b; clean refusal. | |
 | E5 | 8 | **Authorizer** (`sqlite3_set_authorizer` accepted, never invoked — would need compile-time callbacks). | |
@@ -1316,7 +1326,7 @@ codes/messages, blob/backup surfaces).
 | E8 | **FIXED (#109, 2026-07-19)** | ~~First-compile of a NEW statement text needs the writer lock~~ → under a busy policy, plan-registry publication is OPPORTUNISTIC (one immediate-deadline attempt; a held lock — including a same-thread sibling's — skips the insert and keeps the plan in the local cache, exactly like the host-UDF plan path). All 5 `TransactionTests.*_starts_transaction` tests pass; readers proceed under a writer. | |
 | E9 | 4 | **`ON CONFLICT` clause family**: `INSERT OR ROLLBACK` refused — the parser's own error message LISTS ROLLBACK as expected (`OR IGNORE` works), and the table-constraint form `unique(x) on conflict rollback` doesn't parse. | `INSERT OR ROLLBACK INTO t …` → "expected IGNORE, REPLACE, ABORT, FAIL, or ROLLBACK after OR" (sic) |
 | E10 | 5 | **iterdump surface**: 2 × AUTOINCREMENT (deliberate refusal), 1 × fts4 (deliberate — fts5 only), 1 × sqlite_master query form, 1 × un-root-caused "one statement at a time" in `test_table_dump`. | |
-| E11 | 3 | **`zeroblob()`** absent. | `select zeroblob(100)` |
+| E11 | **FIXED (2026-07-20)** | ~~`zeroblob()` absent~~ → present in every position (see the surface table). It also unblocked `ThreadTests`, whose `setUp` inserts `zeroblob(1)`. | |
 | E12 | 1+1+1+1 | **Parser one-offs**: `==` (sqlite's alias for `=`); unquoted identifier bytes ≥ 0x80 (`select 1 as \xff`; the QUOTED form works); bare `current_timestamp` keyword; partial index `CREATE INDEX … WHERE`. | `select 1 where 1 == 1` → "expected an expression" |
 | E13 | 1 | **Unquoted table names are case-SENSITIVE** (`CREATE TABLE t` then `INSERT INTO T` fails; sqlite matches case-insensitively). One test here, but any consumer can trip it. | |
 | E14 | 1 | FROM-less SELECT can't resolve its own output alias in WHERE (`select 1 as a where a=?`). | |
