@@ -19,5 +19,23 @@ LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS"
 # Requires `mold` on PATH. If a machine lacks it, delete this block or set
 # CARGO_BUILD_RUSTFLAGS to override — everything else in this file is
 # platform-independent.
+# sccache: a compilation cache. MEASURED on this box, and the result is more
+# limited than the usual pitch, so here are the numbers rather than the hope:
+#
+#   same target dir, debug/ wiped:      27 cache hits, rebuild in 4 s
+#   a DIFFERENT target dir (the agent
+#   worktree case this was added for):  0 hits, 116 misses
+#
+# So it does NOT share across worktree paths here. It also needs
+# CARGO_INCREMENTAL=0 to cache at all (the dev profile's incremental mode is
+# non-cacheable), and sccache's own stats name the other exclusions: the
+# bundled sqlite C build is "unknown source language", proc-macro/dylib crates
+# are "crate-type". Kept because it is free on a miss and genuinely helps a
+# rebuild after `cargo clean`; do not expect it to help a fresh worktree.
+#
+# Set CARGO_INCREMENTAL=0 in the environment when you want hits.
+[build]
+rustc-wrapper = "sccache"
+
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=mold"]
