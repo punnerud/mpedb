@@ -201,6 +201,11 @@ const QUERIES: &[&str] = &[
     "SELECT a.k IN (SELECT b.ak FROM b) AS m, count(a.v) FROM a \
      WHERE a.id IN (SELECT b.id FROM b WHERE b.w < a.v) GROUP BY 1 ORDER BY 1",
     "SELECT a.k IN (SELECT b.ak FROM b WHERE b.w < a.v) AS m, count(*) FROM a GROUP BY 1 ORDER BY 1",
+    // An UNCORRELATED IN in HAVING: the slot is filled once, before dispatch,
+    // so the grouped predicate reads an ordinary parameter. (A CORRELATED one
+    // in the same position is still refused — see `documented_refusals`.)
+    "SELECT a.k, count(*) FROM a GROUP BY a.k \
+     HAVING a.k IN (SELECT b.ak FROM b WHERE b.w < 3) ORDER BY 1",
 ];
 
 fn agree(indexed: bool) {
@@ -250,8 +255,8 @@ fn documented_refusals() {
         assert!(e.contains(needle), "wrong refusal for `{sql}`: {e}");
     };
     refuse(
-        "SELECT count(*) FROM a GROUP BY a.k HAVING a.k IN (SELECT b.ak FROM b WHERE b.w < 3)",
-        "a subquery in HAVING is not supported yet",
+        "SELECT count(*) FROM a GROUP BY a.k HAVING a.k IN (SELECT b.ak FROM b WHERE b.w < a.v)",
+        "a CORRELATED subquery in HAVING is not supported yet",
     );
     refuse(
         "SELECT a.id FROM a JOIN b ON a.k IN (SELECT c.ak FROM b c WHERE c.w < a.v)",
