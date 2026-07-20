@@ -708,6 +708,39 @@ answers" measures.
 That last row is the licence for the whole thing. A join-order solver that
 changes one answer is not worth any speedup.
 
+**Memory, measured rather than asserted.** "It used to OOM" is a memory result,
+but a qualitative one; the numbers above are all wall clock. `MPEDB_NO_MPEE=1`
+puts both arms in one binary, so the memory case is now a paired A/B on one
+machine (Apple M3 Pro, `design/DESIGN-MPEE-SOLVER.md` §10.2 for method, spread
+and the full tables). The honest headline is not RSS but **peak live join
+cells** — `max_join_cells` trips on `live > budget`, so bisecting the budget
+recovers the peak *exactly*, and it is deterministic: a property of the engine,
+not of the machine, the allocator or the timer.
+
+| chain width | solver ON | solver OFF | |
+|---|---|---|---|
+| 4 tables | 100 cells | 460 | 4.6× |
+| 8 tables | 260 cells | 90,000 | 346× |
+| 12 tables | 420 cells | 13,400,000 | **31,905×** |
+| 17 tables (`join-17-4`) | 930 cells | > 64,000,000 (cap) | > 68,800× |
+| `select5.test`, peak RSS | **9.98 MB** | **4.92 GB** | **493×** |
+| `select4.test`, peak RSS | 626 MB | 3.23 GB | 5.2× |
+| ordinary 3-table join | 686 cells | 686 cells | **1.00× — no effect** |
+
+The solved order is `40n − 60` cells: **linear** in the width. The textual order
+gains **a factor of ten per table added**. Linear versus exponential is the
+result, and it is the largest single effect measured anywhere in this document.
+
+The last row is the negative result, and it is the one worth reading twice (§9):
+on the corpus-median shape — a filtered fact table joined to two dimensions by
+their primary keys — both arms pick the *same order*, hold the *same* 686 cells,
+and finish within each other's noise. This technique pays on adversarial shapes
+and is free on ordinary ones. It does not pay everywhere. The surprise was on
+the cost side: compile time is **non-monotone** in the chain width, peaking at
+2.26 ms for 12 tables and falling to 106 µs for 17, because `DP_FULL_MAX = 12`
+is where the exact DP hands over to extremal sampling. The solver plans a
+17-table join **21× faster** than a 12-table one.
+
 ### 4.9 The bug that became a constraint [I]
 
 Correlated subqueries are lifted *before* join dispatch, so their arguments name

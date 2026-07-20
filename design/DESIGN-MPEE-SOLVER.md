@@ -796,6 +796,142 @@ Also green: `cargo test --workspace`, `crates/mpedb-testkit/tests/slt_files.rs`
 (two EXPLAIN expectations gained the new `join order:` line), and
 `cargo clippy --workspace --all-targets -- -D warnings`.
 
+### 10.2 Memory — the paired A/B, one binary
+
+Everything above is wall clock. The memory case was an anecdote — "it used to
+OOM and now it doesn't" — until this section. That IS a memory result, but a
+qualitative one, and the whole structural claim of the solver is about memory:
+a bad order carries an intermediate that is the PRODUCT of everything placed so
+far, a good one carries one step's worth.
+
+Machine: **Apple M3 Pro** (11 cores, 36 GB), macOS, release build, commit
+`192ba29` plus the probe. Both arms are the **same binary** — `MPEDB_NO_MPEE=1`
+selects the pre-#114 textual order (§ the switch's own doc comment). Probe:
+`crates/mpedb/examples/mpee_memory.rs`. Shape: `open_chain(n)` — n tables of 10
+rows chained by PK equalities, FROM scrambled odds-then-evens, the only
+constant anchor written LAST.
+
+**The gate came first.** `mpee_solver.rs::the_mpee_kill_switch_selects_the_textual_order`
+passes in BOTH arms on this machine; without that, every number below would be
+worthless. So does `reordering_never_changes_the_answer`. The rest of that file
+is the solver's ACCEPTANCE suite, and 8 of its 16 tests necessarily FAIL with
+the solver off — asserting a chosen join order is asserting that the solver ran.
+"16/16 in both arms" would therefore be the wrong gate, and is not the one used:
+the two arm-agnostic tests are.
+
+#### Headline — peak live join cells, exact and deterministic
+
+`max_join_cells` counts the `Value` cells a join HOLDS and `charge` trips on
+`live > budget`, so **the smallest budget under which a statement completes IS
+its peak**. The probe recovers it exactly by bisection. It is a pure function
+of data and plan — not of the machine, the allocator or the timer — so unlike
+RSS it reproduces everywhere, which is why the ON column now lives in a test
+(`the_solved_order_holds_a_linear_number_of_cells`) rather than only here. Two
+independent passes returned identical numbers, and the `40n − 60` peak that test
+pins reproduces byte-for-byte on x86-64 Linux and on Apple Silicon — which is
+the determinism claim, checked rather than assumed.
+
+| shape | solver ON | solver OFF | ratio |
+|---|---|---|---|
+| chain, n=4 | **100** | 460 | 4.6× |
+| chain, n=6 | **180** | 6,800 | 37.8× |
+| chain, n=8 | **260** | 90,000 | 346× |
+| chain, n=10 | **340** | 1,120,000 | 3,294× |
+| chain, n=12 | **420** | 13,400,000 | **31,905×** |
+| chain, n=14 | **500** | **> 64,000,000** | > 128,000× |
+| `join-17-4`, 17 tables | **930** | **> 64,000,000** | > 68,800× |
+| ordinary 3-table join, 2,000 rows | 686 | 686 | **1.00× — no effect** |
+
+ON is exactly `40n − 60`: **linear** in the width. OFF gains **a factor of ten
+per table added**. Linear versus exponential is the result; every other number
+in this section is a consequence of it. The last two rows are **thresholds, not
+ratios** — their textual-order peak is above the probe's 64 M-cell cap (≈2.5 GB
+at the 40 B/cell calibration) and was not chased further. The two are different
+kinds of result and are not averaged together.
+
+Every row's answer digest is **identical across arms**. Reordering preserves
+the result set exactly; that is the licence for doing it at all.
+
+#### Corroboration — peak RSS
+
+`getrusage(RUSAGE_SELF).ru_maxrss`, **bytes** on Darwin (not KiB as on Linux).
+Arms interleaved inside one loop with the order flipped on odd reps so host
+drift cannot masquerade as an effect; 9 reps, p50. "marginal" subtracts the
+fixture floor — the same database built and populated with no join run,
+4.1–6.1 MB, arm-independent to within 0.4 %.
+
+| shape | ON p50 | OFF p50 | total | marginal | wall p50 |
+|---|---|---|---|---|---|
+| chain, n=6 | 4.72 MB | 4.90 MB | 1.0× | 1.3× | 85 µs → 428 µs |
+| chain, n=8 | 4.82 MB | 8.21 MB | 1.7× | 6.4× | 138 µs → 4.1 ms |
+| chain, n=10 | 5.00 MB | 48.74 MB | 9.8× | 63× | 0.50 ms → 39 ms |
+| chain, n=12 | 5.29 MB | **512.0 MB** | **96.7×** | **534×** | 2.5 ms → 406 ms |
+| ordinary 3-table | 6.62 MB | 6.57 MB | 1.0× | 0.9× | 103 µs → 93 µs |
+
+Run-to-run spread (max−min over 9 reps) is ≤ 2.4 % on every chain row and
+≤ 5.7 % on the ordinary join, so from n=8 up the effect swamps the noise by
+orders of magnitude. **At n=6 it does not**: 1.0× total sits inside the spread
+and only the marginal figure shows anything at all. Read n=6 as *no measurable
+effect*, not as 1.3×.
+
+**The real corpus files**, both arms under an identical explicit
+`--join-cells 64000000` so neither can run away:
+
+| | `select5.test` ON | OFF | `select4.test` ON | OFF |
+|---|---|---|---|---|
+| peak RSS | **9.98 MB** | **4.92 GB** — **493×** | 626.6 MB | **3.23 GB** — **5.2×** |
+| wall | 0.26 s | 41.3 s | 7.6 s | 94.8 s |
+| pass | 872 / 1436 | 868 / 1436 | **3857 / 3857** | **3857 / 3857** |
+| **wrong answers** | **0** | **0** | **0** | **0** |
+
+`select5`'s OFF arm loses four records — the `join-17-4` blocks, which exceed
+the shared cap and are re-attributed to `comma-join`. It loses records; it never
+gets one wrong. `select4` is the milder instance of the same shape and is a
+clean RATIO rather than a threshold: both arms answer all 3,857 records
+identically, at 5.2× the peak RSS and 12.5× the wall. Its 626 MB ON floor is
+largely the corpus runner's own retained data, so 5.2× understates the join's
+share — which is exactly why the synthetic chain, with its 4 MB floor measured
+separately, is the primary evidence and this is corroboration.
+
+#### Where the effect is ABSENT
+
+The ordinary 3-table join — a fact table filtered to a narrow range joined to
+two dimensions by their primary keys, the corpus-median shape — is **686 cells
+in both arms**, with the **same join order** in both, at 1.0× RSS and 0.9× wall
+(inside the noise, i.e. no difference). The solver neither saves nor costs
+anything there, because the textual order was already the one it would have
+chosen. This is a technique that pays on adversarial shapes and is free on
+ordinary ones. It does not pay everywhere, and this paragraph is what saying so
+looks like.
+
+#### The solver's own cost
+
+`mode=compile`, 200 DISTINCT statements per rep so the content-hashed plan
+cache never answers, p50 of 3 reps:
+
+| shape | ON | OFF | delta |
+|---|---|---|---|
+| ordinary 3-table | 63 µs | 60 µs | +5 % — inside the noise |
+| chain, n=6 | 33 µs | 20 µs | +13 µs |
+| `join-17-4`, 17 tables | **106 µs** | 57 µs | +49 µs |
+| chain, n=12 | **2.26 ms** | 36 µs | **+2.23 ms** |
+
+The sub-millisecond claim for the 17-table shape **holds on Apple Silicon**
+(106 µs). But the worst case in this family is **not the widest shape** —
+compile cost is NON-MONOTONE in the chain width and peaks exactly at
+`DP_FULL_MAX = 12`:
+
+| n | 4 | 6 | 8 | 9 | 10 | 11 | **12** | 13 | 14 | 16 | 17 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| p50, µs | 43 | 44 | 66 | 114 | 377 | 898 | **2,207** | **67** | 75 | 84 | 90 |
+
+Below the boundary the exact DP runs and roughly doubles per table added; at 13
+the extremal-sampling path (§4.1) takes over and the cost drops **33×**. Paid
+once per distinct statement because plans are content-hashed and cached — but a
+2.26 ms one-off sitting at exactly n=12, and a solver that plans 17 tables **21×
+faster** than it plans 12, is the one number here a reader would have guessed
+wrong.
+
 ## 11. Cross-references
 
 - [DESIGN-MPEE-OPT.md](DESIGN-MPEE-OPT.md) — §1.7 (cluster-first decomposition,

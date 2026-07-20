@@ -93,6 +93,48 @@ fn explain(db: &Database, sql: &str) -> String {
     }
 }
 
+/// **The memory claim, as an exact and machine-independent number.**
+///
+/// `max_join_cells` counts the `Value` cells a join HOLDS, and `charge` trips
+/// on `live > budget` — so the SMALLEST budget under which a statement
+/// completes is exactly its peak. That makes the peak assertable: it is a pure
+/// function of data and plan, not of the machine, the allocator or the timer.
+///
+/// Walked in path order the chain holds ONE STEP's worth at a time, so the peak
+/// is `40n - 60` — **linear in the width**. In the user's textual order the same
+/// query holds the PRODUCT of every table placed so far; measured on an M3 Pro
+/// with `MPEDB_NO_MPEE=1` (`examples/mpee_memory`, design/DESIGN-MPEE-SOLVER.md
+/// §10.2) that peak is 460 / 6,800 / 90,000 / 1,120,000 / 13,400,000 cells at
+/// n = 4 / 6 / 8 / 10 / 12 — a factor of ten per table added, against a constant
+/// 40 here. Linear versus exponential is the whole result, and this test pins
+/// the linear side of it so it cannot regress silently.
+#[test]
+fn the_solved_order_holds_a_linear_number_of_cells() {
+    for n in [4usize, 6, 8, 10, 12] {
+        let peak = (40 * n - 60) as u64;
+        // Exactly `peak` succeeds…
+        let db = open_chain(n, peak);
+        assert_eq!(
+            rows(&db, &scrambled_sql(n, 4)).len(),
+            1,
+            "n={n}: the solved order should fit in {peak} cells"
+        );
+        drop(db);
+        // …and one cell less does not, which is what makes `peak` the PEAK and
+        // not merely an upper bound that happens to hold.
+        let db = open_chain(n, peak - 1);
+        assert!(
+            matches!(
+                db.query(&scrambled_sql(n, 4), &[]),
+                Err(mpedb::Error::RuntimeBudget { kind: mpedb::BudgetKind::JoinCells, .. })
+            ),
+            "n={n}: {} cells must NOT be enough — otherwise the peak is lower \
+             than claimed and the formula is stale",
+            peak - 1
+        );
+    }
+}
+
 /// The acceptance proof, scaled down from `select5.test`'s `join-17-4`.
 ///
 /// 10 tables, FROM scrambled, the only anchor last. In the written order the
