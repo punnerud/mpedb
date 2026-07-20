@@ -217,8 +217,10 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
                 i += 1;
                 Tok::Dot
             }
+            // `==` is sqlite's accepted alias for `=` (one token, identical
+            // semantics — not a separate operator).
             b'=' => {
-                i += 1;
+                i += if b.get(i + 1) == Some(&b'=') { 2 } else { 1 };
                 Tok::Eq
             }
             b'+' => {
@@ -229,6 +231,16 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
             // before `->`, or `a ->> '$.x'` lexes as `a -> (> '$.x')` and the
             // SQL-text form silently becomes the JSON-text one.
             b'-' => match (b.get(i + 1), b.get(i + 2)) {
+                // `-- …` is a line comment ANYWHERE in the statement, not only
+                // at the front: it runs to the next newline (or end of input).
+                // Produces no token at all, so it is invisible to the parser.
+                (Some(b'-'), _) => {
+                    i += 2;
+                    while i < b.len() && b[i] != b'\n' {
+                        i += 1;
+                    }
+                    continue;
+                }
                 (Some(b'>'), Some(b'>')) => {
                     i += 3;
                     Tok::ArrowText
@@ -245,6 +257,17 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
             b'*' => {
                 i += 1;
                 Tok::Star
+            }
+            // `/* … */` block comment, anywhere. sqlite does NOT require the
+            // terminator: an unclosed `/*` comments out the rest of the input
+            // rather than being a syntax error, so neither does this.
+            b'/' if b.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                while i < b.len() && !(b[i] == b'*' && b.get(i + 1) == Some(&b'/')) {
+                    i += 1;
+                }
+                i = (i + 2).min(b.len());
+                continue;
             }
             b'/' => {
                 i += 1;
@@ -361,7 +384,13 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
                 i = next;
                 tok
             }
-            c if c.is_ascii_alphabetic() || c == b'_' => {
+            // An unquoted identifier. sqlite's `IdChar` counts every byte
+            // >= 0x80 as an identifier character (it does no Unicode
+            // classification at all), so `select 1 as café` lexes without
+            // quotes. The input is already valid UTF-8, and every
+            // continuation byte is >= 0x80, so the word slice below can only
+            // end on a char boundary.
+            c if c.is_ascii_alphabetic() || c == b'_' || c >= 0x80 => {
                 // Blob literal x'...' / X'...' (only when a quote follows).
                 if (c == b'x' || c == b'X') && b.get(i + 1) == Some(&b'\'') {
                     let (blob, next) = lex_blob(sql, i)?;
@@ -369,7 +398,9 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
                     Tok::Blob(blob)
                 } else {
                     let wstart = i;
-                    while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_') {
+                    while i < b.len()
+                        && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80)
+                    {
                         i += 1;
                     }
                     let word = &sql[wstart..i];
@@ -675,6 +706,61 @@ mod tests {
         for bad in ["\"\"", "``", "[]", "\"a", "`a", "[a"] {
             assert!(tokenize(bad).is_err(), "{bad} should not lex");
         }
+    }
+
+    /// Comments are skipped ANYWHERE, not only at the front of a statement:
+    /// `-- …` to end of line, `/* … */` inline, and an unterminated `/*` to
+    /// end of input (sqlite accepts that rather than erroring). A comment must
+    /// leave NO token behind — `select 7 -- c` used to lex as `7 - (-c)`.
+    #[test]
+    fn comments_are_skipped_everywhere() {
+        assert_eq!(toks("select 7 -- comment"), vec![Tok::Kw(Kw::Select), Tok::Int(7)]);
+        assert_eq!(
+            toks("select -- c\n 7"),
+            vec![Tok::Kw(Kw::Select), Tok::Int(7)]
+        );
+        assert_eq!(toks("7 /* c */ + 1"), vec![Tok::Int(7), Tok::Plus, Tok::Int(1)]);
+        assert_eq!(toks("7/*c*/+1"), vec![Tok::Int(7), Tok::Plus, Tok::Int(1)]);
+        assert_eq!(toks("7 /* unterminated"), vec![Tok::Int(7)]);
+        assert_eq!(toks("/* lead */ 7"), vec![Tok::Int(7)]);
+        // A comment marker INSIDE a string literal is text, not a comment.
+        assert_eq!(toks("'-- x'"), vec![Tok::Str("-- x".into())]);
+        assert_eq!(toks("'/* x */'"), vec![Tok::Str("/* x */".into())]);
+        // Subtraction still lexes: `a - -1` is two minuses, `a--1` is a comment.
+        assert_eq!(
+            toks("a - -1"),
+            vec![Tok::Ident("a".into()), Tok::Minus, Tok::Minus, Tok::Int(1)]
+        );
+        assert_eq!(toks("a--1"), vec![Tok::Ident("a".into())]);
+        // Division still lexes: `a / b` and `a /b`.
+        assert_eq!(
+            toks("a / b"),
+            vec![Tok::Ident("a".into()), Tok::Slash, Tok::Ident("b".into())]
+        );
+    }
+
+    /// `==` is sqlite's alias for `=`; an unquoted identifier may carry any
+    /// byte >= 0x80 (sqlite does no Unicode classification).
+    #[test]
+    fn eq_alias_and_high_byte_identifiers() {
+        assert_eq!(toks("a == 1"), vec![Tok::Ident("a".into()), Tok::Eq, Tok::Int(1)]);
+        assert_eq!(toks("a = 1"), vec![Tok::Ident("a".into()), Tok::Eq, Tok::Int(1)]);
+        assert_eq!(toks("café"), vec![Tok::Ident("café".into())]);
+        assert_eq!(toks("ÿ"), vec![Tok::Ident("ÿ".into())]);
+        assert_eq!(
+            toks("select 1 as αβ"),
+            vec![
+                Tok::Kw(Kw::Select),
+                Tok::Int(1),
+                Tok::Kw(Kw::As),
+                Tok::Ident("αβ".into())
+            ]
+        );
+        // A high byte does not swallow following ASCII punctuation.
+        assert_eq!(
+            toks("é.b"),
+            vec![Tok::Ident("é".into()), Tok::Dot, Tok::Ident("b".into())]
+        );
     }
 
     #[test]

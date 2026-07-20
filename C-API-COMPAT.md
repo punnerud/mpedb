@@ -169,7 +169,7 @@ against `_sqlite3.cpython-312` on Linux/x86-64 (Python 3.12).
 | `sqlite3_create_function[_v2]` (AGGREGATE: `xStep`/`xFinal`) | ✅ | Real dispatch (design/DESIGN-UDF.md stage 2). `xFunc == NULL` + both of `xStep`/`xFinal` registers an aggregate; half a pair is `SQLITE_MISUSE`; all-NULL deletes. The executor mints one accumulator per group, steps it per surviving row (after `WHERE`/policy/`FILTER`/DISTINCT) and finalizes at the group's end; an EMPTY group finalizes a fresh, never-stepped context (→ NULL, sqlite's rule). Unlike a built-in, a user aggregate is stepped for NULL arguments too — sqlite's behaviour, which Django relies on. The call shape is one argument. Same local-plan rule as a scalar. Verified against CPython's `create_aggregate` (`STDDEV_POP` bare / `GROUP BY` / empty / all-NULL: identical to stock sqlite) |
 | `sqlite3_create_window_function` | ❌ stub | Refuse with `SQLITE_ERROR` (destructor honored) — `xValue`/`xInverse` have no mpedb equivalent, and `myagg(x) OVER (…)` is refused at parse |
 | `sqlite3_create_collation_v2` | ❌ stub | Refuse with `SQLITE_ERROR` (destructor honored) — DESIGN-UDF stage 3 |
-| `sqlite3_set_authorizer` | ❌ stub | `SQLITE_OK`, callback never invoked (mpedb enforces its own RLS) |
+| `sqlite3_set_authorizer` | ✅ | **Real compile-time gate (#112 wave 3).** Every prepare (and every `sqlite3_exec` statement) shows its actions to the callback before the statement is accepted, driven by `mpedb::Database::access_report` — the compiled plan's footprint refined to COLUMNS, produced by the same compile the statement will run through, so an authorized statement and the executed one can never be two different plans. Codes raised: `SELECT`/`READ`/`INSERT`/`UPDATE`/`DELETE`/`TRANSACTION`/`SAVEPOINT`/`PRAGMA`/`CREATE_*`/`DROP_*`/`ALTER_TABLE`. `SQLITE_OK`/`SQLITE_DENY` are exact, with sqlite's two messages ("access to *t.c* is prohibited" for a denied column read, "not authorized" otherwise, both `SQLITE_AUTH`); an unknown verdict is "authorizer malfunction". **`SQLITE_IGNORE` refuses by name** — it means "read this column as NULL" and mpedb has no plan rewrite for that, so returning the real value would leak exactly what the callback hid. A statement with no sqlite action code (`CREATE`/`DROP POLICY`) or one that cannot be described is refused while an authorizer is registered (fail-closed). Column attribution is EXACT for a single-table statement; a join/compound/subquery widens to "every column of every table read" — over-reports, never under-reports. `crates/mpedb-capi/src/auth.rs`, `crates/mpedb/src/access.rs` |
 | `sqlite3_trace_v2` / `_progress_handler` | ❌ stub | Registration accepted, callback never fired |
 | `sqlite3_enable_load_extension` / `_load_extension` | ❌ stub | Enable is a no-op `SQLITE_OK`; load refuses with `SQLITE_ERROR` + errmsg |
 | `sqlite3_db_config` | ❌ stub | Fixed-arg shim (register-compatible with the common `(int,int*)` forms on SysV/x86-64); honors no toggles, returns `SQLITE_OK` |
@@ -1347,11 +1347,14 @@ codes/messages, blob/backup surfaces).
 | E5 | 8 | **Authorizer** (`sqlite3_set_authorizer` accepted, never invoked — would need compile-time callbacks). | |
 | E6 | ~~6~~ **0** | **Custom collations — CLOSED (#112 wave 2), with a NAMED boundary.** `sqlite3_create_collation[_v2]` registers a real comparator; `ORDER BY <expr> COLLATE <name>` sorts through it (plain table, compound, derived table, grouped, join — all differentially matched against stock). A host collation is a COMPARATOR, so it stops exactly where a KEY ENCODING starts: a column declared `COLLATE <host>`, a `GROUP BY`/`DISTINCT` fold, and a comparison's `COLLATE` all REFUSE with sqlite's own "no such collation sequence: <name>" rather than being answered under BINARY — an index built bytewise cannot answer a host-collated probe, and answering it anyway is the wrong-answer-with-no-error this refuses to be. Enforced structurally: those paths take a built-in `Collation`, which no registration can produce. Plans naming one are connection-local (the host-UDF no-publish rule). | `con.create_collation("x", f)` |
 | E7 | ~~6~~ **0** | **Host AGGREGATES are N-ary — CLOSED (#112 wave 2).** `AggCall` grows `extra_args` (PLAN_FORMAT 51) and the AST's `Expr::Agg` a trailing argument list; the parser takes the whole list for a HOST name only (every built-in still falls through to the `min(a,b)`/`max(a,b)` scalar rule, then to the one-argument error), the arity gate matches the CALL's count against the registration (exact or variadic `-1`), and the executor evaluates every argument over the same base row and hands `xStep` `[arg] ‖ extra_args`. `count(*)`'s row-shape stays exclusive to `count`. All 6 `AggregateTests.test_aggr_check_param*` flip. | `create_aggregate("f", 2, C)` then `select f(a, b) …` |
+| E5 | **FIXED (2026-07-20, #112 wave 3)** | ~~Authorizer~~ → real, driven by the plan's own access report (`crates/mpedb/src/access.rs` + `crates/mpedb-capi/src/auth.rs`; see the surface table row for the contract and the three refusals). All 8 tests pass. | |
+| E6 | 6 | **Custom collations** — DESIGN-UDF stage 3; clean refusal (and no longer a segfault). | `con.create_collation("x", f)` |
+| E7 | 6 | **Host AGGREGATES are single-argument** — the plan carries one arg per DESIGN-UDF stage 2; CPython registers 2-arg checktype aggregates. | `create_aggregate("f", 2, C)` then `select f(a, b) …` → "takes exactly one argument" |
 | E8 | **FIXED (#109, 2026-07-19)** | ~~First-compile of a NEW statement text needs the writer lock~~ → under a busy policy, plan-registry publication is OPPORTUNISTIC (one immediate-deadline attempt; a held lock — including a same-thread sibling's — skips the insert and keeps the plan in the local cache, exactly like the host-UDF plan path). All 5 `TransactionTests.*_starts_transaction` tests pass; readers proceed under a writer. | |
-| E9 | 4 | **`ON CONFLICT` clause family**: `INSERT OR ROLLBACK` refused — the parser's own error message LISTS ROLLBACK as expected (`OR IGNORE` works), and the table-constraint form `unique(x) on conflict rollback` doesn't parse. | `INSERT OR ROLLBACK INTO t …` → "expected IGNORE, REPLACE, ABORT, FAIL, or ROLLBACK after OR" (sic) |
-| E10 | 5 | **iterdump surface**: 2 × AUTOINCREMENT (deliberate refusal), 1 × fts4 (deliberate — fts5 only), 1 × sqlite_master query form, 1 × un-root-caused "one statement at a time" in `test_table_dump`. | |
+| E9 | **3 of 4 FIXED (2026-07-20)**, 1 by design | `INSERT OR ROLLBACK` works: mpedb's parser refuses it by name (a statement cannot abort the transaction containing it), and the SHIM — which owns the connection — runs it as `OR ABORT` and rolls back on a `SQLITE_CONSTRAINT` result. `OR FAIL` now refuses by name over a MULTI-row source (its "keep the earlier rows" semantics is unexpressible in an atomic statement) and is accepted for a single-row one, where FAIL == ABORT exactly. The per-constraint `… ON CONFLICT <action>` clause parses on column and table constraints; `ABORT` names mpedb's own behaviour and is accepted, the other four **refuse by name** — the schema carries no per-constraint action, and a swallowed `ON CONFLICT IGNORE` turns "skipped" into "raised". That refusal is the 1 remaining test (`test_on_conflict_rollback`); closing it needs the action in the schema. | `crates/mpedb/tests/insert_or.rs`, `capi.rs::insert_or_rollback_aborts_the_transaction_only_on_a_conflict` |
+| E10 | 4 (1 fixed) | **iterdump surface.** `test_unorderable_row` passes and `iterdump()` of a table-only database is byte-identical to stock. The other 4: 2 × AUTOINCREMENT + `sqlite_sequence` (deliberate refusal), 1 × fts4 (deliberate — fts5 only), and `test_table_dump`, which now gets as far as `CREATE TRIGGER` inside CPython's implicit transaction (mpedb refuses trigger/view DDL inside a transaction) and would then still diff, because the `sqlite_master.sql` column is RECONSTRUCTED from the schema, not the caller's original text. Verbatim DDL is the same engine gap as E3's verbatim decltypes. Index/view/trigger rows are absent from `sqlite_master` for the same reason (their names/DDL are not in the schema bundle the shim can see). | `capi.rs::sqlite_master_evaluator_takes_the_iterdump_query_shape` |
 | E11 | **FIXED (2026-07-20)** | ~~`zeroblob()` absent~~ → present in every position (see the surface table). It also unblocked `ThreadTests`, whose `setUp` inserts `zeroblob(1)`. | |
-| E12 | 1+1+1+1 | **Parser one-offs**: `==` (sqlite's alias for `=`); unquoted identifier bytes ≥ 0x80 (`select 1 as \xff`; the QUOTED form works); bare `current_timestamp` keyword; partial index `CREATE INDEX … WHERE`. | `select 1 where 1 == 1` → "expected an expression" |
+| E12 | 2 of 4 FIXED | `==` and unquoted identifier bytes ≥ 0x80 now lex (with them, comments ANYWHERE — the tokenizer had none at all, so `select 7 -- c` lexed as `7 - (-c)`). Left: bare `current_timestamp` (mpedb has no clock functions at all — no `datetime`/`date`/`current_*`; adding non-deterministic built-ins to content-hashed plans is a design question, not a parser fix) and the partial index `CREATE INDEX … WHERE`. | `crates/mpedb-sql/src/token.rs` tests |
 | E13 | 1 | **Unquoted table names are case-SENSITIVE** (`CREATE TABLE t` then `INSERT INTO T` fails; sqlite matches case-insensitively). One test here, but any consumer can trip it. | |
 | E14 | 1 | FROM-less SELECT can't resolve its own output alias in WHERE (`select 1 as a where a=?`). | |
 
@@ -1390,3 +1393,112 @@ baseline-passing suite. Verification: 2 new FFI tests in `tests/capi.rs`
 BUSY ≥ 200 ms; timeout 0 → immediate; a 5 s timeout ACQUIRES when the holder
 commits mid-wait) and same-thread-sibling immediate BUSY — plus the
 two-process + SIGKILL-holder suite in `crates/mpedb/tests/busy_timeout.rs`.
+
+### #112 wave 3 (2026-07-20): authorizer, conflict clauses, comments, introspection
+
+Four buckets, measured against the same interpreter and tarball as every row
+above. Baseline re-derived at this head before the first change (the blob work
+of wave 1 had just landed, and a sibling agent is moving in the same crate):
+
+| | run | pass | fail/error | skip |
+|---|---|---|---|---|
+| stock libsqlite3 3.45.1 (baseline) | 466 | **461** | 0 | 5 |
+| shim, baseline re-derived at `6125f97` | 466 | 388 | 73 | 5 |
+| **shim, after this wave** | 466 | **402** | **59** | 5 |
+
+**+14, zero regressions** (each step's failing set is a strict subset of the
+previous step's). 402/461 = 87.2 % of the baseline-passing suite.
+
+| bucket | tests | what happened |
+|---|---|---|
+| A — authorizer | **+8** | Built. See E5 and the surface table. |
+| C — conflict clauses | **+3** | Built (`INSERT OR ROLLBACK`), 1 refused by name (the per-constraint `ON CONFLICT ROLLBACK`). See E9. |
+| tokenizer one-offs | **+2** | `==`, high-byte identifiers, and comments at every position. See E12. |
+| B — iterdump | **+1** | `sqlite_master`/`table_info` fixed; the rest is verbatim DDL. See E10. |
+
+#### The `sqlite_master` decision
+
+The brief offered a choice: a real virtual `sqlite_master` in the shim, or a
+narrow iterdump. **Neither is what limits this.** The shim already had a
+`sqlite_master` mini-evaluator, and the two things actually blocking iterdump
+were (a) it could not parse CPython's query shape (multi-line `AND`, quoted
+identifiers, `IS [NOT] NULL`, `ORDER BY "name"`), and (b) it reported the
+HIDDEN implicit rowid (#94) as a real column in both `PRAGMA table_info` and
+the reconstructed DDL — so a dump replayed as a *different table*. Both are
+fixed, and a table-only `iterdump()` is now byte-identical to stock.
+
+Making it a *real virtual table* (arbitrary joins/subqueries against
+`sqlite_master`) would not have bought the remaining tests either: they need
+the `sql` column to be the caller's ORIGINAL `CREATE TABLE` text, and mpedb's
+schema stores resolved types and constraints, not bytes. That is engine work
+in the same family as E3's verbatim decltypes — one schema change would close
+both — and it is what the entry in E10 records. So: the general evaluator was
+hardened, the general fix was named, and no narrow iterdump special case was
+written.
+
+#### `Database::access_report` — the authorizer's engine half
+
+`crates/mpedb/src/access.rs`. Given a statement, what it touches at column
+granularity, without running it: `Select` / `Read{table,column}` /
+`Insert{table}` / `Update{table,column}` / `Delete{table}` / `Create`/`Drop`/
+`Alter` / `Transaction` / `Savepoint`. It compiles through the same path
+`prepare`/`execute` do (`WriteSession::access_report` uses the session's own
+uncommitted schema view, #95), so the authorized plan and the executed plan
+are the same plan. Not sqlite-specific — an audit log or a policy gate wants
+exactly this report.
+
+One approximation, stated in `AccessReport::exact_columns`: EXACT for a
+single-table statement, widened to "every column of every table read" for
+joins/compounds/recursive CTEs/derived tables/lifted subqueries, whose plan
+indices address a concatenated tuple. It over-reports and never
+under-reports, which is the only safe direction for a gate.
+
+Found while writing it: a grouped SELECT's projection indexes the GROUPED
+tuple `[keys ‖ aggs ‖ bare]`, so reading slot 0 as base column 0 named a
+column the statement never touches.
+
+#### Not a test, but a real hole: triggers were unreachable
+
+`conn.execute("CREATE TRIGGER … BEGIN … ; END")` answered "you can only
+execute one statement at a time" — the shim's statement splitter cut the body
+at its first `;`, so **no consumer could create a trigger through this API**,
+though mpedb has had them since DESIGN-TRIGGERS. `sql::split_first` now scans
+the body with `CASE`/`END` depth tracking (sqlite's own rule), and the parser
+takes sqlite's documented default of `BEFORE` when the timing word is omitted.
+End-to-end pinned in `capi.rs::a_trigger_can_be_created_and_fires`. It buys no
+CPython test — `test_table_dump` then hits the next wall (trigger/view DDL
+inside a transaction) and would still diff on verbatim DDL — but it closes a
+gap a consumer would hit on its first migration.
+
+#### Deliberately not attempted, with the reason
+
+* **`SQLITE_LIMIT_FUNCTION_ARG` enforcement** (1 test). Counting a call's
+  arguments from the SQL text means treating `VALUES (1,2)` and `IN (a,b)` as
+  calls unless a keyword guard is right — a wrong answer risk for one test
+  whose limit nobody but the test lowers. Still the documented divergence.
+* **`SQLITE_DBCONFIG_ENABLE_FKEY`** (1). The test verifies foreign keys are
+  actually ENFORCED after the toggle; mpedb parses and drops `REFERENCES`.
+  Echoing the flag would be the D10/D11 lie.
+* **Case-insensitive unquoted identifiers** (E13, 1). A resolution widening
+  with real ambiguity risk (mpedb permits `t` and `T` as two tables today),
+  and it lives in the binder another agent is in.
+* **Bare `current_timestamp`** (1). Needs a clock-function family that does
+  not exist; non-deterministic built-ins inside content-hashed plans is a
+  design decision, not a parser fix.
+* **Partial indexes, window functions, backup, serialize** — unchanged
+  positions above.
+
+#### Verification added
+
+* `crates/mpedb/tests/access_report.rs` (5) — exact vs widened columns, the
+  over-report direction, writes naming only assigned columns, DDL/transaction
+  description, and a session describing its own uncommitted DDL.
+* `crates/mpedb/tests/insert_or.rs` (+2) — the two unexpressible conflict
+  actions refusing by name, and the constraint clause accepting only ABORT.
+* `crates/mpedb-capi/tests/capi.rs` (+5, now 58) — the authorizer's action
+  stream for writes/DDL plus both DENY messages, IGNORE and malfunction and
+  clearing; `INSERT OR ROLLBACK` rolling back only on a conflict; interior
+  comments and `==` through the C API; the hidden rowid staying out of
+  introspection; the iterdump query shape; a trigger created and fired.
+* `crates/mpedb-sql/src/token.rs` (+2) and `crates/mpedb-capi/src/sql.rs`
+  (+1) unit tests for the lexer and the trigger-aware splitter.

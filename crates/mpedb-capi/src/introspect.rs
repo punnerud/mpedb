@@ -38,9 +38,22 @@ fn q(name: &str) -> String {
 }
 
 /// Reconstruct a `CREATE TABLE` statement for the `sql` column of sqlite_master.
+///
+/// The HIDDEN implicit rowid (#94) is elided — column AND primary key. It is
+/// not part of the statement the caller wrote, `SELECT *` does not expose it,
+/// and emitting it here makes the dump replay as a DIFFERENT table (one with
+/// an explicit `rowid` column and an explicit PK).
+///
+/// This is a RECONSTRUCTION from the live schema, not the caller's original
+/// text: mpedb's schema stores the resolved types and constraints, not the
+/// bytes of the `CREATE TABLE`. It round-trips semantically, but a consumer
+/// diffing it against what it wrote (CPython's `test_table_dump`) sees the
+/// canonical spelling. Carrying verbatim DDL is engine work — the same schema
+/// gap as verbatim decltypes (C-API-COMPAT.md E3).
 fn create_ddl(t: &mpedb::TableDef) -> String {
+    let hidden_pk = t.hidden_rowid_col();
     let mut cols: Vec<String> = t
-        .columns
+        .visible_columns()
         .iter()
         .map(|c| {
             let mut s = format!("{} {}", q(&c.name), type_name(c.ty));
@@ -53,7 +66,7 @@ fn create_ddl(t: &mpedb::TableDef) -> String {
             s.trim_end().to_string()
         })
         .collect();
-    if !t.primary_key.is_empty() {
+    if !t.primary_key.is_empty() && t.primary_key != [hidden_pk.unwrap_or(u16::MAX)] {
         let pk: Vec<String> = t
             .primary_key
             .iter()
@@ -132,8 +145,12 @@ pub fn pragma(
             let Some(t) = arg.as_deref().and_then(|a| find_table(schema, a)) else {
                 return Ok((cols_out, vec![]));
             };
+            // The implicit rowid (#94) is HIDDEN: `SELECT *` does not expose it
+            // and neither does sqlite's `table_info`. Listing it made every
+            // consumer that builds a column list from this pragma — iterdump's
+            // per-row INSERT among them — emit a column that does not exist.
             let rows = t
-                .columns
+                .visible_columns()
                 .iter()
                 .enumerate()
                 .map(|(i, c)| {
@@ -330,11 +347,25 @@ pub fn sqlite_master(
     if let Some(o) = &order_src {
         let ol = o.to_ascii_lowercase();
         let ol = ol.strip_prefix("by").map(str::trim_start).unwrap_or(ol.as_str());
-        if ol.starts_with("name") {
-            rows.sort_by(|a, b| a.name.cmp(&b.name));
-            if ol.contains("desc") {
-                rows.reverse();
-            }
+        let key = ol
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .trim_matches(|ch| ch == '"' || ch == '`' || ch == '[' || ch == ']')
+            .to_string();
+        if !MASTER_COLS.contains(&key.as_str()) {
+            return Err(unsupported());
+        }
+        let cell = |r: &MasterRow| match key.as_str() {
+            "type" => r.ty.to_string(),
+            "tbl_name" => r.tbl_name.clone(),
+            "rootpage" => "0".to_string(),
+            "sql" => r.sql.clone(),
+            _ => r.name.clone(),
+        };
+        rows.sort_by_key(&cell);
+        if ol.contains("desc") {
+            rows.reverse();
         }
     }
 
@@ -379,6 +410,10 @@ enum Pred {
     Ne(String, String),
     In(String, Vec<String>),
     Like(String, String, bool), // (col, pattern, negated)
+    /// `col IS NULL` / `col IS NOT NULL` / sqlite's `col NOTNULL` and the
+    /// bare `col NOT NULL` CPython's iterdump writes. `true` = negated
+    /// (matches non-NULL).
+    Null(String, bool),
     /// A clause-leading `NOT` (Django's introspection writes
     /// `AND NOT name='sqlite_sequence'`).
     Not(Box<Pred>),
@@ -390,6 +425,8 @@ impl Pred {
             "type" => r.ty.to_string(),
             "name" => r.name.clone(),
             "tbl_name" => r.tbl_name.clone(),
+            "rootpage" => "0".to_string(),
+            "sql" => r.sql.clone(),
             _ => String::new(),
         };
         match self {
@@ -397,6 +434,10 @@ impl Pred {
             Pred::Ne(c, v) => val(c) != *v,
             Pred::In(c, vs) => vs.iter().any(|v| *v == val(c)),
             Pred::Like(c, pat, neg) => like_match(&val(c), pat) != *neg,
+            // Only `sql` is ever NULL in sqlite's own catalog (an auto-index
+            // has none); every row this shim emits is a table, which always
+            // carries its reconstructed DDL.
+            Pred::Null(c, negated) => val(c).is_empty() != *negated,
             Pred::Not(inner) => !inner.matches(r),
         }
     }
@@ -449,13 +490,31 @@ fn parse_cmp(c: &str) -> Result<Pred, DbError> {
         return Err(unsupported());
     }
     let col_of = |c: &str| {
-        let t = c.trim().trim_matches('"').to_ascii_lowercase();
-        if ["type", "name", "tbl_name"].contains(&t.as_str()) {
+        let t = c
+            .trim()
+            .trim_matches(|ch| ch == '"' || ch == '`' || ch == '[' || ch == ']')
+            .to_ascii_lowercase();
+        if MASTER_COLS.contains(&t.as_str()) {
             Some(t)
         } else {
             None
         }
     };
+    // `col IS NOT NULL` / `col NOT NULL` / `col NOTNULL` / `col IS NULL`.
+    // Longest first: `is not null` must not be read as `is null`.
+    for (suffix, negated) in [
+        (" is not null", true),
+        (" not null", true),
+        (" notnull", true),
+        (" is null", false),
+        (" isnull", false),
+    ] {
+        let t = cl.trim_end();
+        if let Some(head) = t.strip_suffix(suffix) {
+            let col = col_of(&c[..head.len()]).ok_or_else(unsupported)?;
+            return Ok(Pred::Null(col, negated));
+        }
+    }
     if let Some(idx) = cl.find(" not like ") {
         let col = col_of(&c[..idx]).ok_or_else(unsupported)?;
         let pat = str_literal(&c[idx + 10..]).ok_or_else(unsupported)?;
@@ -483,17 +542,32 @@ fn parse_cmp(c: &str) -> Result<Pred, DbError> {
     }
 }
 
-/// Split on top-level ` AND ` (case-insensitive). No parenthesized-group support.
+/// Split on top-level `AND` (case-insensitive), as a WORD — any whitespace on
+/// either side, so a clause broken across lines (CPython's iterdump writes its
+/// query that way) splits like a single-spaced one. No parenthesized-group
+/// support.
 fn split_and(w: &str) -> Vec<String> {
     let lower = w.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    let word_edge = |i: usize| {
+        i == 0 || {
+            let c = b[i - 1];
+            !(c.is_ascii_alphanumeric() || c == b'_')
+        }
+    };
     let mut out = Vec::new();
     let mut start = 0;
     let mut i = 0;
-    let bytes = lower.as_bytes();
-    while i + 5 <= bytes.len() {
-        if &lower[i..i + 5] == " and " {
+    while i + 3 <= b.len() {
+        let after = b.get(i + 3).copied();
+        if &lower[i..i + 3] == "and"
+            && i > 0
+            && word_edge(i)
+            && b[i - 1].is_ascii_whitespace()
+            && after.is_some_and(|c| c.is_ascii_whitespace())
+        {
             out.push(w[start..i].to_string());
-            i += 5;
+            i += 3;
             start = i;
         } else {
             i += 1;

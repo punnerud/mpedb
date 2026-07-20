@@ -561,7 +561,9 @@ fn deep_nesting_is_a_parse_error_not_a_crash() {
         parse_expr_only(&nots),
         Err(Error::Parse { msg, .. }) if msg.contains("nested too deeply")
     ));
-    let negs = format!("{}1", "-".repeat(2000));
+    // Spaced, because `--` is a LINE COMMENT: `-----1` is not 5 unary
+    // minuses, it is a comment (sqlite lexes it the same way).
+    let negs = format!("{}1", "- ".repeat(2000));
     assert!(matches!(
         parse_expr_only(&negs),
         Err(Error::Parse { msg, .. }) if msg.contains("nested too deeply")
@@ -575,7 +577,7 @@ fn deep_nesting_is_a_parse_error_not_a_crash() {
     let parens = format!("{}a > 0{}", "(".repeat(d), ")".repeat(d));
     assert!(parse_expr_only(&parens).is_ok());
     assert!(parse_expr_only(&format!("{}a", "NOT ".repeat(d))).is_ok());
-    assert!(parse_expr_only(&format!("{}1", "-".repeat(d))).is_ok());
+    assert!(parse_expr_only(&format!("{}1", "- ".repeat(d))).is_ok());
 }
 
 /// Every construct that recurses is a stack-overflow vector, and each one
