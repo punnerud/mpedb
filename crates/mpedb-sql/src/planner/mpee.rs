@@ -258,7 +258,7 @@ impl<'a> Problem<'a> {
     ///   late, or probed rather than scanned);
     /// - the hub: the highest-degree node in the join graph.
     ///
-    /// See design/DESIGN-MPEE-SOLVER.md §4.2 for where the road analogy stops
+    /// See design/DESIGN-MPEE-SOLVER.md §4.1 for where the road analogy stops
     /// transferring — a left-deep order has a START but no END, so extremal
     /// sampling here degenerates to *seed selection plus hub identification*
     /// rather than bracketing a route.
