@@ -20,6 +20,8 @@ mod mirror;
 mod mirror_collide;
 mod powerloss;
 mod proc_cmd;
+mod queue;
+mod queue_collide;
 mod render;
 mod openpath;
 mod repl;
@@ -63,6 +65,9 @@ usage: mpedb <command> [args]
           get <target> <table> <pk> <out-file> [--col C]   / out of a blob column
           (column: the table's last blob column unless --col names one)
 
+  queue   init|enqueue|run|list ...         durable task queue: enqueue stored-
+          proc tasks, `queue run` drains due work and exits when idle (the
+          hibernating-service model — no daemon; see `queue`)
   <target> is a config.toml, or a .mpedb file directly (e.g. a mirror, which
   is config-free: its schema lives in the file).
   dump    <file.mpedb> [--data]             config-free schema/row dump
@@ -119,6 +124,8 @@ fn dispatch(argv: &[String]) -> CliResult {
         "prepare" => cmd_prepare(rest),
         "call" => cmd_call(rest),
         "proc" => proc_cmd::run(rest),
+        "queue" => queue::run(rest),
+        "queue-collide" => queue_collide::run_parent(rest),
         "repl" => repl::run(rest),
         "blob" => blob::run(rest),
         "dump" => dump::run(rest),
