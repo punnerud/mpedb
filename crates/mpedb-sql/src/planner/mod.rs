@@ -697,6 +697,12 @@ fn plan_on_conflict(
             .iter()
             .position(|c| c.name == *name)
             .ok_or_else(|| bind_err(format!("unknown column `{name}` in DO UPDATE SET")))?;
+        if table.columns[i].generated.is_some() {
+            binder.set_allow_excluded(false);
+            return Err(bind_err(format!(
+                "cannot UPDATE generated column `{name}`"
+            )));
+        }
         let (b, ty) = binder.bind_expr(e)?;
         if let Some(t) = ty {
             // Same rule as `bind_assign`: `any` accepts every typed value.
@@ -998,14 +1004,26 @@ fn plan_insert(
                 if cols.contains(&idx) {
                     return Err(bind_err(format!("duplicate column `{name}` in INSERT")));
                 }
+                // A generated column's value is the expression's, always.
+                // sqlite: "cannot INSERT into generated column".
+                if table.columns[idx as usize].generated.is_some() {
+                    return Err(bind_err(format!(
+                        "cannot INSERT into generated column `{name}`"
+                    )));
+                }
                 cols.push(idx);
             }
             cols
         }
-        // No column list: the VISIBLE columns, in order. A hidden implicit rowid
-        // (#94) is NOT listed — it falls through to `InsertSource::Default` below
-        // and the rowid-alias auto-assign (#85) fills it with `max(rowid)+1`.
-        None => (0..table.visible_column_count() as u16).collect(),
+        // No column list: the VISIBLE, non-GENERATED columns, in order. A hidden
+        // implicit rowid (#94) is NOT listed — it falls through to
+        // `InsertSource::Default` below and the rowid-alias auto-assign (#85)
+        // fills it with `max(rowid)+1`. A generated column is not listed either:
+        // sqlite's `INSERT INTO t VALUES (…)` counts only the non-generated
+        // columns, and the value is computed at write time.
+        None => (0..table.visible_column_count() as u16)
+            .filter(|&i| table.columns[i as usize].generated.is_none())
+            .collect(),
     };
     let mut slot_of_col: Vec<Option<usize>> = vec![None; table.columns.len()];
     for (slot, &col) in listed.iter().enumerate() {
@@ -1023,6 +1041,7 @@ fn plan_insert(
         if slot_of_col[ci].is_none()
             && !col.nullable
             && col.default.is_none()
+            && col.generated.is_none()
             && Some(ci as u16) != rowid_col
         {
             return Err(bind_err(format!(
@@ -1253,6 +1272,12 @@ fn plan_update(
         if table.is_pk_column(idx) {
             return Err(bind_err(format!(
                 "cannot update primary key column `{name}`"
+            )));
+        }
+        // sqlite: "cannot UPDATE generated column".
+        if table.columns[idx as usize].generated.is_some() {
+            return Err(bind_err(format!(
+                "cannot UPDATE generated column `{name}`"
             )));
         }
         if last_expr[idx as usize].is_none() {

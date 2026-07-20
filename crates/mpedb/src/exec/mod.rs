@@ -1644,14 +1644,36 @@ fn exec_stmt_rest(
             // by `converts_on_store` so a table with no such column never leaves
             // the borrowed zero-copy row (#40).
             let converts = t.converts_on_store();
+            let generates = t.has_generated();
             for (applied, mut row) in built_rows.into_iter().enumerate() {
                 if converts {
                     t.apply_store_affinity(row.to_mut());
+                }
+                // GENERATED ALWAYS AS (…): computed HERE, before anything else
+                // looks at the row — so RLS WITH CHECK, the BEFORE triggers, the
+                // OR REPLACE conflict probes, the index keys, CHECK/NOT NULL and
+                // RETURNING all see the value the engine will store. The rowid
+                // alias is resolved just below, so a generated column reading it
+                // is recomputed there.
+                if generates {
+                    if let Err(e) = t.apply_generated(row.to_mut(), &[]) {
+                        *partial = applied > 0;
+                        return Err(e);
+                    }
                 }
                 if let Some(rc) = rowid_col {
                     if row.get(rc as usize).is_some_and(|v| v.is_null()) {
                         let next = ctx.next_rowid(*table, rc)?;
                         row.to_mut()[rc as usize] = Value::Int(next);
+                        // The auto-assigned rowid is an input a generated column
+                        // may read (`b AS (id * 2)`), and it did not exist on the
+                        // pass above. Recompute — `apply_generated` is idempotent.
+                        if generates {
+                            if let Err(e) = t.apply_generated(row.to_mut(), &[]) {
+                                *partial = applied > 0;
+                                return Err(e);
+                            }
+                        }
                     }
                 }
                 // RLS WITH CHECK on the new row (before the engine's PK/unique
@@ -1857,8 +1879,16 @@ fn exec_stmt_rest(
                                     new_row[*c as usize] = v;
                                 }
                                 // DO UPDATE assigns into the column like any
-                                // other write, so the same store-time affinity.
+                                // other write, so the same store-time affinity —
+                                // and the generated columns are recomputed from
+                                // the post-image, exactly as on a plain UPDATE.
                                 t.apply_store_affinity(&mut new_row);
+                                if generates {
+                                    if let Err(e) = t.apply_generated(&mut new_row, &[]) {
+                                        *partial = applied > 0;
+                                        return Err(e);
+                                    }
+                                }
                                 if let Err(e) = ctx.update_by_pk(*table, &new_row) {
                                     *partial = applied > 0 || !precheck_failure(&e);
                                     return Err(hide_constraint_variant(
@@ -1927,6 +1957,13 @@ fn exec_stmt_rest(
                     // (sqlite applies it to `UPDATE … SET` too) — before the
                     // WITH CHECK, the triggers and RETURNING below see the row.
                     t.apply_store_affinity(&mut new_row);
+                    // Generated columns are recomputed from the POST-image: a
+                    // SET on one of their inputs changes them, which is why
+                    // `UPDATE … SET <generated> = …` is refused at bind time —
+                    // the expression is the only source of the value.
+                    if t.has_generated() {
+                        t.apply_generated(&mut new_row, &[])?;
+                    }
                     Ok(new_row)
                 })();
                 let new_row = match new_row {
