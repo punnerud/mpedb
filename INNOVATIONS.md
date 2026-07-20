@@ -1569,7 +1569,31 @@ everything: every page ever allocated *was* in the freelist, and the growth rate
 was **constant** while the tree grew 10× — so there was no feedback loop and tree
 depth was not the driver.
 
-### 9.6 Designed, partly built, or never wired
+### 9.6 The join solver does nothing on ordinary shapes
+
+The memory result in §4.8 is the largest single effect measured in this
+document — 31,905× fewer live join cells at 12 tables, linear against
+exponential. The same measurement says the effect is **zero** where most SQL
+lives.
+
+On the corpus-median join — a filtered fact table joined to two dimension
+tables by their primary keys — both arms choose the **same order**, hold the
+**same 686 cells**, and finish inside each other's run-to-run noise. At a
+4-table chain the RSS ratio is inside the spread too, and is reported as *no
+measurable effect* rather than as a small win.
+
+That is not a disappointment, it is the shape of the technique: a join-order
+solver earns its keep exactly where the textual order is pathological, and the
+textual order is pathological exactly when a human did not write it — generated
+SQL, an ORM's compound query, a test corpus built to be adversarial. Where a
+person wrote the FROM clause in the order they think about the data, they
+usually wrote a good order already.
+
+The corollary for anyone quoting §4.8: **the 19.6× and the 31,905× are
+adversarial-shape numbers.** They are real, they are reproduced, and they are
+not what a typical statement sees.
+
+### 9.7 Designed, partly built, or never wired
 
 Stated so nothing here reads as shipped:
 
@@ -1584,7 +1608,7 @@ Stated so nothing here reads as shipped:
 - **Cost-model ambition versus reality**: the cost catalog, per-consumer
   specialization and the auto-indexing advisor are all design.
 
-### 9.7 Deliberate deviations, kept
+### 9.8 Deliberate deviations, kept
 
 Not everything unfixed is a bug. Some positions are the honest answer:
 

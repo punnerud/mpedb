@@ -1660,6 +1660,85 @@ impl<'e> WriteTxn<'e> {
         }
     }
 
+    /// True iff the extent allocator (DESIGN-BLOBEXTENT) has not been touched
+    /// by this transaction. Extent state lives OUTSIDE every savepoint — no
+    /// `rollback_to`/`rollback_to_full` restores it — so a caller that must
+    /// undo a statement has to check this to know whether the undo is exact.
+    pub fn extents_untouched(&self) -> bool {
+        self.extent_map_root == self.meta.extent_map_root
+            && self.pending_map_edits.is_empty()
+            && self.freed_runs.is_empty()
+            && self.taken_runs.is_empty()
+            && self.extent_dirty.is_empty()
+            && self.allocated_runs.is_empty()
+            && self.run_pool.is_empty()
+            && self.extent_buf.is_empty()
+    }
+
+    /// True iff this transaction has not mutated anything yet: no page is
+    /// dirty and the extent allocator is untouched.
+    ///
+    /// The load-bearing consequence (design/DESIGN.md §5.3): a statement started
+    /// from a pristine transaction can only ever mutate pages it COW-allocated
+    /// itself, so restoring the root pointers with [`rollback_to`](Self::rollback_to)
+    /// undoes it EXACTLY — even a statement that failed half-way through. From
+    /// a non-pristine transaction that is no longer true (a page dirtied by an
+    /// earlier statement is mutated in place, and the page id never changes).
+    pub fn is_pristine(&self) -> bool {
+        self.dirty.is_empty() && self.extents_untouched()
+    }
+
+    /// Discard EVERYTHING this transaction has done and return it to its
+    /// just-begun state, **keeping the writer lock**.
+    ///
+    /// This is the batch leader's escape hatch (design/DESIGN.md §5.3): when an
+    /// intent fails after partially applying itself, no savepoint can undo it
+    /// (see [`savepoint_full`](Self::savepoint_full) for why), so the leader
+    /// throws the whole round away and replays it with that intent's outcome
+    /// pre-decided. Keeping the lock is the point — dropping and re-acquiring
+    /// it would let another process lead and execute the very intents this
+    /// leader is about to replay.
+    ///
+    /// Nothing committed is touched: by COW construction every page this txn
+    /// wrote was allocated by it, so this is a pure discard. `high_water` is
+    /// deliberately NOT rewound, for exactly the reason
+    /// [`rollback_to`](Self::rollback_to) does not rewind it: pages minted from
+    /// it belong to no committed freelist entry, so they go back to `reusable`
+    /// and the commit fixpoint records them as freed, keeping page accounting
+    /// exact.
+    pub fn restart(&mut self) {
+        debug_assert!(!self.finished);
+        debug_assert!(!self.in_freelist_op);
+        self.catalog_root = self.meta.catalog_root;
+        self.freelist_root = self.meta.freelist_root;
+        self.extent_map_root = self.meta.extent_map_root;
+        self.schema_gen_bump = false;
+        // Roots are a lazily-filled cache over the catalog tree, which the
+        // restore above rewound; drop it so every entry reloads.
+        self.table_roots.clear();
+        self.dirty.clear();
+        self.freed.clear();
+        self.taken.clear();
+        self.refill_cursor = None;
+        self.reusable.clear();
+        // ascending, so `reusable` stays sorted (binary-searched by the fixpoint)
+        for id in self.meta.high_water..self.high_water {
+            self.reusable.push(id);
+        }
+        self.run_pool.clear();
+        self.taken_runs.clear();
+        self.freed_runs.clear();
+        self.allocated_runs.clear();
+        self.pending_map_edits.clear();
+        self.extent_dirty.clear();
+        self.extent_buf.clear();
+        self.extent_buf_off = 0;
+        self.bound_recomputed = false;
+        self.written_tables = 0;
+        self.commit_point = None;
+        self.work = WorkMeter::new(self.eng.work_budget());
+    }
+
     /// A **full** savepoint for the SQL `SAVEPOINT` surface. It captures the
     /// accounting snapshot ([`savepoint`](Self::savepoint)) AND the CONTENTS of
     /// every page dirty at this instant, plus the few working-set scalars
