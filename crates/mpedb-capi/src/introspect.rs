@@ -63,6 +63,17 @@ fn create_ddl(t: &mpedb::TableDef) -> String {
             if c.unique {
                 s.push_str(" UNIQUE");
             }
+            // A GENERATED column MUST carry its clause: without it the replayed
+            // statement makes an ordinary column, and the dump's INSERTs — which
+            // take their column list from `table_info`, where a generated column
+            // is correctly absent — would then leave it permanently NULL.
+            if let Some(g) = &c.generated {
+                s.push_str(&format!(
+                    " GENERATED ALWAYS AS ({}) {}",
+                    g.expr,
+                    g.kind.keyword()
+                ));
+            }
             s.trim_end().to_string()
         })
         .collect();
@@ -140,8 +151,19 @@ pub fn pragma(
 ) -> Result<(Vec<String>, Vec<Vec<Value>>), DbError> {
     let (name, arg) = parse_pragma(sql);
     match name.to_ascii_lowercase().as_str() {
-        "table_info" | "table_xinfo" => {
-            let cols_out = cols(&["cid", "name", "type", "notnull", "dflt_value", "pk"]);
+        // `table_info` HIDES generated columns; `table_xinfo` lists them and
+        // adds the 7th `hidden` column (0 = ordinary, 2 = VIRTUAL generated,
+        // 3 = STORED generated). Sharing one arm made `table_xinfo` return
+        // `table_info`'s six columns, which is not a narrower answer — a caller
+        // that reads `hidden` off column 6 (Django's sqlite3 introspection
+        // does, to decide which fields are generated) reads past the end.
+        name_info @ ("table_info" | "table_xinfo") => {
+            let xinfo = name_info == "table_xinfo";
+            let mut names: Vec<&str> = vec!["cid", "name", "type", "notnull", "dflt_value", "pk"];
+            if xinfo {
+                names.push("hidden");
+            }
+            let cols_out = cols(&names);
             let Some(t) = arg.as_deref().and_then(|a| find_table(schema, a)) else {
                 return Ok((cols_out, vec![]));
             };
@@ -149,25 +171,40 @@ pub fn pragma(
             // and neither does sqlite's `table_info`. Listing it made every
             // consumer that builds a column list from this pragma — iterdump's
             // per-row INSERT among them — emit a column that does not exist.
+            // It is elided from `table_xinfo` too: sqlite's rowid is not a
+            // column of the table at all, so it has no `cid` there either.
             let rows = t
                 .visible_columns()
                 .iter()
                 .enumerate()
-                .map(|(i, c)| {
+                .filter(|(_, c)| xinfo || c.generated.is_none())
+                // `cid` RENUMBERS: sqlite's `table_info` numbers the columns it
+                // lists 0..n, so a table whose second column is generated has
+                // its third column at cid 1 there and cid 2 in `table_xinfo`.
+                // `pk` still needs the TRUE ordinal, which is why both are in
+                // scope here.
+                .enumerate()
+                .map(|(cid, (i, c))| {
                     let pk = t
                         .primary_key
                         .iter()
                         .position(|&p| p as usize == i)
                         .map(|p| (p + 1) as i64)
                         .unwrap_or(0);
-                    vec![
-                        Value::Int(i as i64),
+                    let mut row = vec![
+                        Value::Int(cid as i64),
                         Value::Text(c.name.clone()),
                         Value::Text(type_name(c.ty).to_string()),
                         Value::Int(if c.nullable { 0 } else { 1 }),
                         Value::Null, // dflt_value: not reconstructed
                         Value::Int(pk),
-                    ]
+                    ];
+                    if xinfo {
+                        row.push(Value::Int(
+                            c.generated.as_ref().map_or(0, |g| g.kind.xinfo_hidden()),
+                        ));
+                    }
+                    row
                 })
                 .collect();
             Ok((cols_out, rows))
