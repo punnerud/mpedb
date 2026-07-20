@@ -82,11 +82,17 @@ pub struct Table {
     /// column store NULL where sqlite stores the default — a wrong stored
     /// value. The caller decides what it can represent.
     pub defaults: Vec<Option<String>>,
-    /// Whether the table carries ANY `CHECK` (column-level or table-level).
-    /// mpedb cannot yet compile a base's CHECK, and silently not enforcing one
-    /// let an invalid row into the overlay that then failed the checkpoint on
-    /// an unrelated statement — so the caller refuses the table by name.
-    pub has_check: bool,
+    /// Per column: every column-level `CHECK (…)` body declared on it, as the
+    /// RAW text between the parens. Carried (not just flagged) so the caller
+    /// can COMPILE them: silently not enforcing a CHECK let an invalid row
+    /// into the overlay that then failed the checkpoint on an unrelated
+    /// statement, and refusing every checked table blocked real bases (Django
+    /// puts a CHECK on every PositiveIntegerField and JSONField). What the
+    /// caller cannot compile it refuses per table, by name.
+    pub col_checks: Vec<Vec<String>>,
+    /// Table-level `CHECK (…)` bodies (including `CONSTRAINT x CHECK (…)`),
+    /// in declaration order — same raw-text contract as `col_checks`.
+    pub table_checks: Vec<String>,
     /// Whether any column is `GENERATED ALWAYS AS`. Its value is computed, not
     /// stored, and mpedb has no expression to compute it with.
     pub has_generated: bool,
@@ -211,7 +217,8 @@ impl SqliteFile {
                 pk_order: parsed.pk_cols,
                 not_null: parsed.not_null,
                 defaults: parsed.defaults,
-                has_check: parsed.has_check,
+                col_checks: parsed.col_checks,
+                table_checks: parsed.table_checks,
                 has_generated: parsed.has_generated,
             });
             Ok(())
@@ -530,7 +537,8 @@ struct ParsedCreate {
     pk_cols: Vec<String>,
     not_null: Vec<bool>,
     defaults: Vec<Option<String>>,
-    has_check: bool,
+    col_checks: Vec<Vec<String>>,
+    table_checks: Vec<String>,
     has_generated: bool,
 }
 
@@ -601,7 +609,8 @@ fn parse_create_table(sql: &str) -> Option<ParsedCreate> {
     let mut ipk_column = None;
     let mut not_null = Vec::new();
     let mut defaults: Vec<Option<String>> = Vec::new();
-    let mut has_check = false;
+    let mut col_checks: Vec<Vec<String>> = Vec::new();
+    let mut table_checks: Vec<String> = Vec::new();
     let mut has_generated = false;
 
     for part in split_depth0(body) {
@@ -628,17 +637,13 @@ fn parse_create_table(sql: &str) -> Option<ParsedCreate> {
             }
             continue;
         }
-        if upper.starts_with("CHECK") {
-            has_check = true;
-            continue;
-        }
-        if upper.starts_with("CONSTRAINT") {
-            // `CONSTRAINT <name> CHECK (…)` is a CHECK under a name; the rest
-            // (UNIQUE / FOREIGN KEY / PRIMARY KEY) is already handled or
+        if upper.starts_with("CHECK") || upper.starts_with("CONSTRAINT") {
+            // A table-level `CHECK (…)`, possibly under a `CONSTRAINT <name>`.
+            // `check_bodies` only captures the group FOLLOWING the CHECK
+            // keyword, so a `CONSTRAINT nm UNIQUE (…)` / `FOREIGN KEY` under a
+            // name contributes nothing — those are already handled or
             // deliberately dropped.
-            if constraint_words(part).iter().any(|w| w == "CHECK") {
-                has_check = true;
-            }
+            table_checks.extend(check_bodies(part));
             continue;
         }
         if upper.starts_with("UNIQUE") || upper.starts_with("FOREIGN KEY") {
@@ -682,7 +687,6 @@ fn parse_create_table(sql: &str) -> Option<ParsedCreate> {
         for (k, w) in words.iter().enumerate() {
             match w.as_str() {
                 "NOT" if words.get(k + 1).map(String::as_str) == Some("NULL") => nn = true,
-                "CHECK" => has_check = true,
                 "GENERATED" => has_generated = true,
                 // Bare `AS` after the type is the short form of GENERATED.
                 "AS" => has_generated = true,
@@ -697,6 +701,7 @@ fn parse_create_table(sql: &str) -> Option<ParsedCreate> {
         decl_types.push(ty);
         not_null.push(nn);
         defaults.push(dflt);
+        col_checks.push(check_bodies(rest));
     }
     // `INTEGER PRIMARY KEY` detection above ran before knowing WITHOUT ROWID
     // (it trails the body); correct for it.
@@ -711,9 +716,84 @@ fn parse_create_table(sql: &str) -> Option<ParsedCreate> {
         pk_cols,
         not_null,
         defaults,
-        has_check,
+        col_checks,
+        table_checks,
         has_generated,
     })
+}
+
+/// The bodies of every `CHECK (…)` in a constraint tail or table-constraint
+/// part: the RAW text between the matching parens, in order. Walks exactly
+/// like [`constraint_words`] (words at paren depth 0, outside every quote
+/// form), capturing only the parenthesized group that FOLLOWS the `CHECK`
+/// keyword — so a `'CHECK'` string literal, a `DEFAULT (…)` group, or a
+/// `decimal(10,2)` type never contributes a body.
+fn check_bodies(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let b = s.as_bytes();
+    let mut i = 0usize;
+    let mut after_check = false;
+    while i < b.len() {
+        let c = b[i] as char;
+        match c {
+            '(' => {
+                let start = i + 1;
+                let mut depth = 1usize;
+                i += 1;
+                while i < b.len() && depth > 0 {
+                    match b[i] as char {
+                        '(' => depth += 1,
+                        ')' => depth -= 1,
+                        '\'' | '"' | '`' => {
+                            let q = b[i];
+                            i += 1;
+                            while i < b.len() && b[i] != q {
+                                i += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    i += 1;
+                }
+                if after_check {
+                    // `i` sits one past the closing paren (or at the end of a
+                    // malformed tail); clamp so truncation cannot panic.
+                    let end = i.saturating_sub(1).max(start).min(s.len());
+                    out.push(s[start..end].trim().to_string());
+                }
+                after_check = false;
+            }
+            '\'' | '"' | '`' => {
+                after_check = false;
+                let q = b[i];
+                i += 1;
+                while i < b.len() && b[i] != q {
+                    i += 1;
+                }
+                i += 1;
+            }
+            '[' => {
+                after_check = false;
+                while i < b.len() && b[i] != b']' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            _ if c.is_ascii_alphabetic() || c == '_' => {
+                let start = i;
+                while i < b.len() && ((b[i] as char).is_ascii_alphanumeric() || b[i] == b'_') {
+                    i += 1;
+                }
+                after_check = s[start..i].eq_ignore_ascii_case("CHECK");
+            }
+            _ if c.is_ascii_whitespace() => i += 1,
+            _ => {
+                after_check = false;
+                i += 1;
+            }
+        }
+    }
+    out
 }
 
 /// The bare, UPPERCASED words of a constraint tail, at paren depth 0 and

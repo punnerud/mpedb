@@ -235,3 +235,58 @@ fn reopen_after_checkpoint_survives_and_foreign_divergence_still_refuses() {
     let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));
     let _ = std::fs::remove_file(&p);
 }
+
+/// Task #102's checkpoint leg: a delta row that passed the compiled CHECK at
+/// INSERT time flows to the base, where sqlite RE-EVALUATES the CHECK on its
+/// own INSERT — so a compile-vs-sqlite semantic divergence would fail right
+/// here. The round trip succeeding, and the library then reading the rows
+/// back, is the evidence the two agree.
+#[test]
+fn check_constrained_rows_survive_the_checkpoint() {
+    let p = setup("chk-roundtrip");
+    {
+        let c = Connection::open(&p).unwrap();
+        c.execute_batch(
+            "CREATE TABLE t102 (id INTEGER PRIMARY KEY, age INTEGER CHECK (age >= 0), \
+               v TEXT, CONSTRAINT vshape CHECK (typeof(v) <> 'blob'));
+             INSERT INTO t102 VALUES (1, 10, 'base');",
+        )
+        .unwrap();
+    }
+
+    let mut ovl = SqliteOverlay::open(&p).unwrap();
+    ovl.query("INSERT INTO t102 (id, age, v) VALUES (2, 1, 'ok')", &[]).unwrap();
+    ovl.query("INSERT INTO t102 (id, age, v) VALUES (3, NULL, NULL)", &[]).unwrap();
+    ovl.query("UPDATE t102 SET age = 99 WHERE id = 1", &[]).unwrap();
+    // The row sqlite would reject never reaches the delta, so the checkpoint
+    // below pushes only base-acceptable rows.
+    ovl.query("INSERT INTO t102 (id, age) VALUES (4, -1)", &[]).unwrap_err();
+
+    let report = ovl.checkpoint().unwrap();
+    assert_eq!(report.upserts, 3, "two inserts + one update");
+
+    // The library is the witness: sqlite accepted every pushed row under its
+    // own CHECK evaluation, and holds exactly what the overlay held.
+    let lib = Connection::open(&p).unwrap();
+    let got: Vec<(i64, Option<i64>, Option<String>)> = lib
+        .prepare("SELECT id, age, v FROM t102 ORDER BY id")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(|x| x.unwrap())
+        .collect();
+    assert_eq!(
+        got,
+        vec![
+            (1, Some(99), Some("base".into())),
+            (2, Some(1), Some("ok".into())),
+            (3, None, None),
+        ]
+    );
+    // And the base still enforces for itself — the constraint text survived.
+    assert!(lib.execute("INSERT INTO t102 VALUES (5, -3, NULL)", []).is_err());
+    drop(lib);
+
+    let _ = std::fs::remove_file(format!("{}.overlay.mpedb", p.display()));
+    let _ = std::fs::remove_file(&p);
+}

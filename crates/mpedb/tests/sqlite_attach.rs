@@ -113,3 +113,37 @@ fn answers_match_the_library() {
 
     let _ = std::fs::remove_file(&p);
 }
+
+/// A base table with a CHECK constraint ATTACHES (task #102 — it used to be a
+/// blanket named refusal); only a CHECK mpedb genuinely cannot compile skips
+/// its table — PER TABLE, naming the function — while the rest stay attached.
+#[test]
+fn check_constraints_compile_or_skip_per_table() {
+    let p = std::env::temp_dir()
+        .join("mpedb-attach-tests")
+        .join(format!("at-chk-{}.db", std::process::id()));
+    std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+    let _ = std::fs::remove_file(&p);
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch(
+        "PRAGMA journal_mode = DELETE;
+         CREATE TABLE ok (id INTEGER PRIMARY KEY, age INTEGER CHECK (age >= 0),
+                          CONSTRAINT named CHECK (length('x') = 1));
+         CREATE TABLE bad (id INTEGER PRIMARY KEY, v TEXT CHECK (glob('a*', v)));
+         INSERT INTO ok VALUES (1, 30);",
+    )
+    .unwrap();
+    drop(c);
+
+    let at = SqliteAttach::open(&p).unwrap();
+    // `bad` is the ONLY skip, and the reason names the missing function.
+    assert_eq!(at.skipped().len(), 1, "{:?}", at.skipped());
+    assert_eq!(at.skipped()[0].0, "bad");
+    assert!(at.skipped()[0].1.contains("glob"), "{:?}", at.skipped()[0]);
+    assert!(at.skipped()[0].1.contains("CHECK"), "{:?}", at.skipped()[0]);
+    // `ok` is attached and queryable, its CHECK sources carried on the schema.
+    let got = rows(at.query("SELECT age FROM ok WHERE id = 1", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Int(30)]]);
+
+    let _ = std::fs::remove_file(&p);
+}
