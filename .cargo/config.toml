@@ -8,3 +8,16 @@
 # so this does not affect the shim.
 [env]
 LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS"
+
+# mold as the linker. This repo builds ~140 test binaries, each statically
+# linking the whole engine, so LINK time dominates an incremental rebuild.
+# MEASURED on the 2-core dev box: `cargo build -p mpedb --tests` after touching
+# mpedb-types went 114 s -> 67 s (1.7x). Verified afterwards: the workspace
+# suites pass and mpedb-capi's cdylib still links (it exports the sqlite3_*
+# symbols, which is the one link that could plausibly differ).
+#
+# Requires `mold` on PATH. If a machine lacks it, delete this block or set
+# CARGO_BUILD_RUSTFLAGS to override — everything else in this file is
+# platform-independent.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=mold"]
