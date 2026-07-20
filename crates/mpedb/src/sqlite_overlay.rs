@@ -871,6 +871,12 @@ impl TxnCtx for MergeCtx<'_> {
 
     fn insert_row(&mut self, table: u32, values: &[Value]) -> Result<()> {
         self.check_not_null(table, values)?;
+        // The base's CHECK constraints, enforced HERE for the same reason as
+        // NOT NULL above: the overlay file's own schema cannot carry them
+        // (tombstones — PK + NULLs — must always store), and sqlite would
+        // re-evaluate them when the delta reaches the base at checkpoint, so
+        // a row let in unchecked failed there on an unrelated statement.
+        self.at.check_row(table, values)?;
         // INSERT's uniqueness is over the MERGED view: a live base row
         // collides exactly as a live overlay row does; a tombstoned PK is
         // free again.
@@ -893,6 +899,8 @@ impl TxnCtx for MergeCtx<'_> {
 
     fn update_by_pk(&mut self, table: u32, new_values: &[Value]) -> Result<bool> {
         self.check_not_null(table, new_values)?;
+        // sqlite re-evaluates every CHECK against the NEW row on UPDATE too.
+        self.at.check_row(table, new_values)?;
         // The executor only calls this for rows it just read from the merged
         // view, so existence is established; materialize into the overlay.
         let pk = new_values[self.pk_idx[table as usize]].clone();
