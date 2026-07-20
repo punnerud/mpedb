@@ -172,6 +172,7 @@ fn quote_matches_sqlite_for_every_storage_class() {
 /// Count the significant digits in one sqlite float literal (`3.0e+17`,
 /// `0.000125`, `1.23456789012345678e+14`): the digits of the mantissa, leading
 /// zeros of a pure fraction excluded.
+#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), allow(dead_code))]
 fn sig_digits(s: &str) -> usize {
     let mantissa = s.split(['e', 'E']).next().unwrap_or("");
     let digits: String = mantissa.chars().filter(|c| c.is_ascii_digit()).collect();
@@ -194,6 +195,14 @@ fn sig_digits(s: &str) -> usize {
 /// MORE than 15 significant digits — which is exactly the case mpedb declines
 /// to guess (see `printf::quote_float`).
 #[test]
+// Calibration-build only: the sweep's premise is that mpedb and the bundled
+// sqlite hold the SAME f64 for each literal — measured false on arm64, where
+// sqlite's text->double conversion is not correctly rounded at extreme
+// exponents (no 80-bit long double): quote(1.5e301) answers
+// 1.500000000000000156e+301 there, and (14*1e300/7.0) = 2e300 evaluates TRUE
+// on macOS sqlite while false on Linux. Both directions of the premise fail,
+// so neither the answered nor the refused arm can be asserted off-calibration.
+#[cfg_attr(not(all(target_os = "linux", target_arch = "x86_64")), ignore = "sqlite text->f64 parse is arch-dependent at extreme exponents")]
 fn quote_float_sweep_is_exact_or_a_refusal_of_the_unportable_branch() {
     let (db, path) = mpedb_db();
     let mut answered = 0usize;
