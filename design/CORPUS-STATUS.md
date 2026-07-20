@@ -199,7 +199,25 @@ failed). They are downstream of item 6: the shim's `rowid_` turns `REPLACE`
 into either an arity error or a plain insert, so the following `SELECT` sees
 the un-replaced row. **Genuine wrong answers: 0.**
 
-## 4. `select5.test` — not measurable inside the budget
+## UPDATE 2026-07-20 (#114) — `select5.test` measurable, and 187x faster
+
+The MPEE join-order solver ([DESIGN-MPEE-SOLVER.md](DESIGN-MPEE-SOLVER.md))
+closes §4 below. `join-17-4` no longer materializes its way to an allocation
+failure: the solver walks the join graph instead of the FROM list, so 16 of the
+17 positions become PK probes.
+
+| | before (`f00856c`) | after |
+|---|---|---|
+| `select5.test` | 871 / 1436, **186.7 s** | **872 / 1436, 1.0 s** |
+| `join-17-4` (3 blocks isolated) | 2 / 3, one dies on OOM | **3 / 3**, md5-verified |
+| `select4.test` (the milder instance) | **447.2 s** | **22.8 s** |
+| `select1-4` + `evidence/` report | 9,489 / 9,689, 4 wrong | **byte-identical** |
+
+The 564 records still unsupported in `select5.test` are comma joins of 18-64
+tables, refused by the plan format's `MAX_JOINS = 16` — an arity cap, not an
+ordering problem. §4 below is kept for the diagnosis that led here.
+
+## 4. `select5.test` — not measurable inside the budget (CLOSED, see above)
 
 `select5.test` (1,436 records, the N-way comma-join battery) **aborts on an
 allocation failure** under the 3 GB virtual-memory cap. Isolated by
@@ -248,7 +266,7 @@ types) and are not counted as gaps.
 | 2 | **Subquery inside a compound SELECT arm** (and therefore views under `UNION`) | **520** | all of `index/view/*`'s remaining failures |
 | 3 | **Legacy `CREATE TRIGGER <n> {INSERT\|UPDATE\|DELETE} ON t`** (no timing keyword ⇒ BEFORE) | **23** | unblocks `slt_lang_createtrigger` / `droptrigger` end-to-end |
 | 4 | **`DROP INDEX [IF EXISTS] <name>`** | 2 direct | tiny by record count, but it is a *parse* error today, and it is what forces the runner's shim into item 2 — fixing it would also let the runner drop indexes with the table and retire 1,289 artifact failures |
-| 5 | **Join ordering + a runtime budget on join execution** | 1,436 (`select5.test`, currently unmeasurable) | today a 17-way comma join with a late constant anchor aborts the process on allocation failure instead of erroring |
+| 5 | ~~**Join ordering + a runtime budget on join execution**~~ **CLOSED 2026-07-20 (#114)** | 1,436 (`select5.test`, now measurable: 872 / 1436, 1.0 s) | was: a 17-way comma join with a late constant anchor aborted the process on allocation failure. The runtime budget landed with #74; the MPEE join-order solver (DESIGN-MPEE-SOLVER.md) landed with #114 and makes `join-17-4` answer. What remains in this file is an arity cap (`MAX_JOINS = 16`), not an ordering problem |
 
 Below the top 5, in corpus order: bit-shift operators, postfix `NOT NULL`,
 2-arg `group_concat`, `CREATE TEMP VIEW`, `x IN <table>`, and the two-`min`/`max`
