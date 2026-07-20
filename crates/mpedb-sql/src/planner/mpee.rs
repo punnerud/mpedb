@@ -645,6 +645,23 @@ impl<'a> Problem<'a> {
     }
 }
 
+/// `MPEDB_NO_MPEE=1` leaves every join chain in the user's textual order —
+/// the pre-#114 behaviour, in the SAME binary.
+///
+/// Without this, the only way to A/B the solver was to build the old planner in
+/// a second worktree, and two builds have already been the source of one false
+/// A/B in this repo (see `engine/commit.rs`). The switch exists so a claim
+/// about what the solver buys — wall clock, peak RSS, live join cells — is a
+/// paired measurement of one binary rather than a comparison of two.
+///
+/// `=1` and nothing else, so a script that spells "off" as `=0` cannot silently
+/// select the arm it meant to exclude.
+pub(super) fn disabled() -> bool {
+    static OFF: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("MPEDB_NO_MPEE").is_ok_and(|v| v == "1"));
+    *OFF
+}
+
 /// Why the chain was left alone, for the `MPEDB_EXPLAIN_MPEE` trace and for
 /// the unit tests. Never surfaced to users.
 #[derive(Debug, PartialEq, Eq)]

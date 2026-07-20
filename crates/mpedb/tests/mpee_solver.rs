@@ -585,3 +585,38 @@ fn a_left_join_no_longer_costs_the_whole_scope_its_ordering() {
     // b = a % 10 + 1, so walking back from a10 = 4 gives a1 = 5.
     assert_eq!(r[0][0], Value::Int(5), "t1.a for the anchored chain");
 }
+
+/// The A/B switch must actually select the pre-#114 arm, or every paired
+/// measurement taken with it is worthless. Asserted on the process's own env,
+/// so it runs in whichever arm the harness set.
+///
+/// This is the same discipline `MPEDB_MSYNC_PER_RUN` and `MPEDB_NO_SUBPLAN_MEMO`
+/// carry: a falsifiability switch nobody checks is a switch that can rot into a
+/// no-op, and then the A/B silently compares an arm against itself.
+#[test]
+fn the_mpee_kill_switch_selects_the_textual_order() {
+    let db = open_chain(6, 0);
+    let sql = scrambled_sql(6, 2);
+    let plan = explain(&db, &sql);
+    let line = plan
+        .lines()
+        .find(|l| l.trim_start().starts_with("join order:"))
+        .unwrap_or_else(|| panic!("EXPLAIN has no join-order line:\n{plan}"));
+    if std::env::var("MPEDB_NO_MPEE").as_deref() == Ok("1") {
+        // FROM is odds-then-evens, so the textual order cross-joins: t1,t3,...
+        assert!(
+            line.contains("t3 [cartesian]"),
+            "with the solver OFF the chain must stay in the user's textual \
+             order, cartesian steps and all: {line}"
+        );
+    } else {
+        assert!(
+            line.ends_with("(0 cartesian steps)"),
+            "with the solver ON the path must be walked: {line}"
+        );
+    }
+    // Either way the ANSWER is the same — that is the whole licence for
+    // reordering, and an A/B switch that changed it would be a bug in the
+    // switch, not a measurement knob.
+    assert_eq!(rows(&db, &sql).len(), 1, "the anchored chain pins one tuple");
+}
