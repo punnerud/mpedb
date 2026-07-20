@@ -92,8 +92,10 @@ aggregate, registered through the libsqlite3 C-API shim — CPython's own
 `sqlite3` module loads it via `LD_PRELOAD`), secondary/composite indexes the
 planner uses, and live multi-process DDL — verified against sqlite's own
 7.4M-record test corpus with **zero wrong answers**. Django's test suite runs
-against the shim: **83% of the measured labels pass and climbing**
-([`C-API-COMPAT.md`](C-API-COMPAT.md) tracks it run by run). What is still
+against the shim: **97.6% of the measured labels pass, with zero wrong
+answers** — every remaining failure is a named refusal
+([`C-API-COMPAT.md`](C-API-COMPAT.md) tracks it run by run, alongside
+CPython's own `test_sqlite3`). What is still
 missing is short — attached-database *writes* (`ATTACH` + cross-file SELECT
 work; writing through a second handle covers the rest) and loadable extensions (a
 non-goal) — each a clean error today, never a wrong answer. And on one axis
@@ -345,8 +347,8 @@ What does not pass is deliberate refusals with error messages
 | Loose typing per column: `type = "any"` | ✅ | refused in keys and `UNIQUE`; the mirror pre-flight refuses pushing it to PG |
 | **FROM-less `SELECT 3+5`** | ✅ | one synthetic row; WHERE filters it, aggregates see it (`SELECT count(*)` → 1), compound arms and subqueries may each be FROM-less |
 | Scalar subqueries `(SELECT …)`, `[NOT] EXISTS (…)` — uncorrelated AND correlated | ✅ | one output column; 0 rows → NULL; **>1 row errors** (PG's rule — sqlite silently takes the first); correlated references become inner-plan parameters, the `OuterCol` idea applied to a whole plan |
-| **Cross-FILE refs** | ❌ | planned (workspace read-joins) |
-| **Live DDL** (multi-process) | ✅ | `CREATE TABLE` (PK / `NOT NULL` / `UNIQUE`), `DROP TABLE [IF EXISTS]`, `ALTER … RENAME` (table or column), `ALTER … ADD COLUMN` (nullable, or `[NOT NULL] DEFAULT <const>`) / `DROP COLUMN`. Table ids are never reused (≤ 64 lifetime creates; `regenerate` resets) |
+| **Cross-FILE refs** (`ATTACH`) | ✅ | `ATTACH DATABASE 'f.mpedb' AS name`, then `main.t` / `other.u` qualification — joins, subqueries, aggregates and CTEs across files, each file pinned at its own snapshot per execution (sqlite's attached-WAL rule). Connection-local: never persisted, never published. Writes to an attached database are refused by name (open a handle on that file instead) |
+| **Live DDL** (multi-process) | ✅ | `CREATE TABLE` (PK / `NOT NULL` / `UNIQUE`), `DROP TABLE [IF EXISTS]`, `ALTER … RENAME` (table or column), `ALTER … ADD COLUMN` (nullable, or `[NOT NULL] DEFAULT <const>`) / `DROP COLUMN`. Table ids are never reused (≤ 4096 lifetime creates; `regenerate` resets) |
 | `ADD COLUMN … DEFAULT <const>` | ✅ | a constant default fills existing rows (and `NOT NULL DEFAULT <const>` is allowed) — differential-tested vs sqlite 3.45. `UNIQUE` / `PRIMARY KEY` on ADD, and `NOT NULL` *without* a non-NULL default, are refused — sqlite refuses these too (a non-constant default likewise). Type-mismatched default = clean error (rigid schema) |
 
 **Joins, and what they cost.** Joins are a left-deep chain of up to 16 tables,
