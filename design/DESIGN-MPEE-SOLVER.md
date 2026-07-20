@@ -526,7 +526,46 @@ Not built. Written down so that when it is, it does not reach for the plan bytes
 
 ---
 
-## 10. Cross-references
+## 10. Measured
+
+Release build, x86-64 Linux, the gregrahn sqllogictest corpus, runner
+`crates/mpedb-testkit/src/bin/sqlite_corpus.rs`, `ulimit -v 3000000`. "before" =
+`f00856c` built in a separate worktree; "after" = this branch. Same binary
+procedure both sides.
+
+**The acceptance test — `select5.test`'s `join-17-4`:**
+
+| | before | after |
+|---|---|---|
+| the failing variant (`FROM t9,t56,t53,t61,…`) | **out of memory: allocation failed while materializing a nested-loop join's intermediate rows** | **answers**, md5-verified against sqlite |
+| the three `join-17-4` blocks isolated | 2 / 3 pass, 7.8 s | **3 / 3 pass, 0.2 s** |
+| whole `select5.test` | 871 / 1436 pass, 0 wrong, **186.7 s** | **872 / 1436 pass, 0 wrong, 1.0 s** |
+
+The 564 records still unsupported in `select5.test` are comma joins of 18–64
+tables, refused by the plan format's `MAX_JOINS = 16` — unrelated to ordering.
+
+**Regression — `select1-4` + `evidence/` (9,689 records):**
+
+| | before | after |
+|---|---|---|
+| passed | 9,489 (98.9 %) | 9,489 (98.9 %) |
+| unsupported | 101 | 101 |
+| **wrong answers** | 4 | **4** — the same four `slt_lang_replace` shim artifacts (CORPUS-STATUS §3), byte-identical list |
+| error mismatches | 0 | 0 |
+| `select4.test` wall clock | **447.2 s** | **22.8 s** (19.6×) |
+
+The whole report body — per-file table, category attribution, the wrong list —
+diffs **byte-identical** except for the timings. `select4.test` is the milder
+instance of the same shape and is where the 19.6× comes from.
+
+There is **no join cell in `crates/mpedb-bench`** to compare against; the join
+battery above is the measurement.
+
+Also green: `cargo test --workspace`, `crates/mpedb-testkit/tests/slt_files.rs`
+(two EXPLAIN expectations gained the new `join order:` line), and
+`cargo clippy --workspace --all-targets -- -D warnings`.
+
+## 11. Cross-references
 
 - [DESIGN-MPEE-OPT.md](DESIGN-MPEE-OPT.md) — §1.7 (cluster-first decomposition,
   now implemented here against the query graph rather than the commit batch),
