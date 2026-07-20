@@ -19,6 +19,7 @@ mod line;
 mod mirror;
 mod mirror_collide;
 mod powerloss;
+mod powerloss_commit;
 mod proc_cmd;
 mod queue;
 mod queue_collide;
@@ -79,6 +80,13 @@ usage: mpedb <command> [args]
   collide --dir <dir> [--writers N] [--total T] [--drop-rate R] [--jitter-us J]
           [--keyspace K] [--detached-pct P] [--durability M]  (writer-collision fuzz)
   powerloss --dir <dir> [--rounds N] [--workers W] [--durability wal|async]
+  powerloss --dir <dir> --durability commit [--rounds N] [--commits C] [--cuts K]
+          [--size-mb M] [--extent-kb N] [--sabotage reorder|drop-data]
+          (a DIFFERENT fault shape: `commit` publishes in place, so power loss
+           drops an arbitrary SUBSET of dirty pages, not a tail. Captures the
+           engine's own msync/barrier/publish trace and replays it with cuts;
+           --sabotage rewrites the trace into a broken engine's and REQUIRES a
+           violation, so the injector cannot be silently vacuous)
   tier    drain <hot> <cold.mpedb> --table T --where PRED [param ...]
           [--batch N] [--size-mb M] [--durability D]
           (move matching rows to a cold file; cold commits+verifies BEFORE hot
@@ -160,6 +168,7 @@ fn dispatch(argv: &[String]) -> CliResult {
         "mirror-collide-daemon" => mirror_collide::run_daemon(rest),
         "mirror-collide-pdaemon" => mirror_collide::run_push_daemon(rest),
         "powerloss-child" => powerloss::run_child(rest),
+        "powerloss-commit-child" => powerloss_commit::run_child(rest),
         "help" | "--help" | "-h" => {
             println!("{USAGE}");
             Ok(())

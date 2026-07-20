@@ -903,6 +903,12 @@ impl Shm {
         stamped.slot = slot;
         let sum = xxhash_rust::xxh3::xxh3_64(&self.meta_checksum_input(slot, &stamped));
         self.atomic_u64(base + M_CHECKSUM).store(sum, Ordering::Release);
+        // #121 instrumentation: the commit boundary in the durability trace.
+        // The store, not a flush — every FLUSH before this one belongs to this
+        // commit's data class, which is exactly what §4.1 orders.
+        if crate::plsim::active() {
+            let _ = crate::plsim::record_publish(s.txn_id, slot);
+        }
         slot
     }
 
@@ -1275,6 +1281,14 @@ impl Shm {
         if rc != 0 {
             return Err(io_err("msync"));
         }
+        // #121 instrumentation, AFTER the syscall returned — "msync returned"
+        // is the durability edge the commit power-loss simulator's fault model
+        // is built on. Off unless MPEDB_COMMIT_SYNC_LOG is set (crate::plsim).
+        if crate::plsim::active() {
+            let end = (start + len).min(self.len);
+            let bytes = unsafe { std::slice::from_raw_parts(self.at(start), end - start) };
+            crate::plsim::record_flush(start as u64, bytes)?;
+        }
         Ok(())
     }
 
@@ -1302,6 +1316,12 @@ impl Shm {
             if crate::os::fdatasync(self.file.as_raw_fd()) != 0 {
                 return Err(io_err("F_FULLFSYNC after msync"));
             }
+        }
+        // #121 instrumentation: mark where the engine placed its ordering
+        // class break, on every platform (on Linux the call above compiles
+        // away, and the FLUSH events themselves are the durability edges).
+        if crate::plsim::active() {
+            crate::plsim::record_barrier()?;
         }
         Ok(())
     }

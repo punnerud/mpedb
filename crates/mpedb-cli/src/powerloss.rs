@@ -116,6 +116,20 @@ fn powerloss_blob(id: i64, seq: i64) -> Vec<u8> {
     fill_bytes(&mut rng, len as usize)
 }
 
+/// `--durability X` / `--durability=X`, read before the real parse.
+fn durability_flag(argv: &[String]) -> Option<String> {
+    let mut it = argv.iter();
+    while let Some(a) = it.next() {
+        if let Some(v) = a.strip_prefix("--durability=") {
+            return Some(v.to_owned());
+        }
+        if a == "--durability" {
+            return it.next().cloned();
+        }
+    }
+    None
+}
+
 fn read_u64_at(path: &Path, offset: u64) -> Result<u64, Failure> {
     let f = std::fs::File::open(path)?;
     let mut buf = [0u8; 8];
@@ -126,6 +140,14 @@ fn read_u64_at(path: &Path, offset: u64) -> Result<u64, Failure> {
 // ------------------------------------------------------------------- parent
 
 pub fn run_parent(argv: &[String]) -> CliResult {
+    // `commit` is a different fault SHAPE, not a different parameter: it
+    // publishes by mutating a mapped file in place, so its power-loss image is
+    // an arbitrary subset of dirty pages, never a truncated tail. It gets its
+    // own harness (#121). Sniff the flag before `args::parse`, whose flag set
+    // differs between the two arms.
+    if durability_flag(argv).as_deref() == Some("commit") {
+        return crate::powerloss_commit::run_parent(argv);
+    }
     let p = args::parse(argv, &["dir", "rounds", "workers", "durability", "extent-kb"], &[])?;
     let dir = PathBuf::from(p.require("dir")?);
     let rounds = p.u64_or("rounds", 20)?;
