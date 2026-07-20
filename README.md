@@ -651,6 +651,11 @@ the source — no operation lost or duplicated across the kills.
 
 ## Design docs
 
+[`INNOVATIONS.md`](INNOVATIONS.md) is the guided tour: what mpedb invented, what
+it borrowed and from where, what it moved out of another field into a database —
+and, at the same length, what was built, measured and rejected. Each technique
+states the problem before the mechanism, so no database background is assumed.
+
 The design documents are the load-bearing contracts — **read them before touching
 concurrency, lock, or commit-path code:**
 
