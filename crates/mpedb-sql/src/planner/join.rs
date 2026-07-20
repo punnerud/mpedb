@@ -199,25 +199,25 @@ pub(super) fn plan_join_select<'s>(
     slot_types: Vec<Ty>,
     cte: Option<CteRef<'s>>,
 ) -> Result<PlannedStmt> {
-    // A CORRELATED subplan was lifted BEFORE the join dispatch, and its
-    // `outer_args` are slots of the joined tuple in the TEXTUAL order — a
-    // reorder would leave them pointing at the wrong columns (measured: a
-    // silently wrong `count(*) FILTER (WHERE EXISTS (… c.ref = t.id))` over a
-    // join). Remapping them through the permutation is the obvious follow-up;
-    // v1 simply keeps the user's order whenever one exists.
-    let correlated = subplans.iter().any(|p| !p.outer_args.is_empty());
-    let solved = if correlated {
-        Err(super::mpee::Skip::Ineligible)
-    } else {
-        super::mpee::reorder(
-            s, schema, n_params, catalog, mode, host_udfs, &slot_types, cte, row_count,
-        )
-    };
+    // A CORRELATED subplan is lifted BEFORE the join dispatch, and its
+    // `outer_args` are slots of the joined tuple in the TEXTUAL order — v1
+    // refused to reorder at all whenever one existed, because leaving them
+    // pointing at the wrong columns is a silently wrong answer (measured:
+    // `count(*) FILTER (WHERE EXISTS (… c.ref = t.id))` over a join returned 1
+    // where sqlite returns 2). #116 makes it a CONSTRAINT instead: the solver
+    // reports the permutation as a slot map and the args are remapped through
+    // it (`Solved::remap`, design/DESIGN-MPEE-SOLVER.md §7).
+    let solved = super::mpee::reorder(
+        s, schema, n_params, catalog, mode, host_udfs, &slot_types, cte, row_count,
+    );
     match solved {
-        Ok(reordered) => plan_join_select_inner(
-            &reordered, schema, n_params, catalog, mode, host_udfs, row_count, consts, subplans,
-            slot_types, cte,
-        ),
+        Ok(sv) => {
+            let subplans = sv.remap(subplans);
+            plan_join_select_inner(
+                &sv.stmt, schema, n_params, catalog, mode, host_udfs, row_count, consts, subplans,
+                slot_types, cte,
+            )
+        }
         Err(_skip) => plan_join_select_inner(
             s, schema, n_params, catalog, mode, host_udfs, row_count, consts, subplans, slot_types,
             cte,
