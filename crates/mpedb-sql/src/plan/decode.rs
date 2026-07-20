@@ -495,11 +495,27 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                 t => return Err(corrupt(format!("bad derived-table body tag {t}"))),
             };
             let outer = decode_select(buf, pos)?;
+            // The BODY's own lifts (format 52) — the mirror of the encoder,
+            // decoded under the SAME `MAX_SUBPLANS` tree budget the
+            // statement-level list gets, so a forged count cannot balloon the
+            // forest here either.
+            let body_sub_base = r_u16(buf, pos)?;
+            let n_body_sub = r_u8(buf, pos)? as usize;
+            if n_body_sub > MAX_SUBPLANS {
+                return Err(corrupt("too many derived-table body subplans"));
+            }
+            let mut budget = MAX_SUBPLANS;
+            let mut body_subplans = Vec::with_capacity(n_body_sub.min(MAX_SUBPLANS));
+            for _ in 0..n_body_sub {
+                body_subplans.push(decode_subplan(buf, pos, &mut budget)?);
+            }
             Ok(PlanStmt::Derived(DerivedPlan {
                 name,
                 columns,
                 col_types,
                 body,
+                body_subplans,
+                body_sub_base,
                 outer,
             }))
         }

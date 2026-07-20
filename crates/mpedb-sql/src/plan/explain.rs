@@ -55,6 +55,14 @@ impl CompiledPlan {
                 }
                 out.push_str("outer:\n");
                 self.render_select(&dp.outer, schema, &mut out);
+                // The body's OWN lifts (format 52), rendered under the body
+                // they belong to rather than with the statement-level list
+                // below — which is empty for a derived plan precisely because
+                // these are not the outer's.
+                for (i, s) in dp.body_subplans.iter().enumerate() {
+                    let label = format!("body ${}", dp.body_sub_base as usize + i + 1);
+                    self.render_subplan(s, schema, &mut out, &label);
+                }
             }
             _other => self.render_rest(schema, &mut out),
         }

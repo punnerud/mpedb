@@ -102,8 +102,44 @@ pub(super) fn exec_derived(
     params: &[Value],
     dp: &mpedb_sql::DerivedPlan,
 ) -> Result<ExecResult> {
+    // The body OWNS its lifted subqueries (format 52): their result slots are
+    // filled HERE, while the body materialises, and the outer never sees them.
+    //
+    // The discipline is `exec_stmt_impl`'s, applied one level down — the
+    // UNCORRELATED lifts evaluate once, up front (so a `WHERE x = (SELECT
+    // max…)` inside the body resolves like any other parameter), and the
+    // CORRELATED ones are left to `exec_select_leveled`, which fills them per
+    // BODY row after the gather. That is what makes Django's
+    // `SELECT count(*) FROM (SELECT …, EXISTS(SELECT … WHERE i.x = t.y) AS f
+    // FROM t) s WHERE f` mean what it says: the EXISTS correlates to `t`'s row
+    // inside the body, and `f` is just a materialised column by the time the
+    // outer filters on it.
+    let base = dp.body_sub_base as usize;
+    let filled;
+    let params: &[Value] = if dp.body_subplans.iter().any(|s| s.outer_args.is_empty()) {
+        let mut buf = params.to_vec();
+        for (i, sub) in dp.body_subplans.iter().enumerate() {
+            if !sub.outer_args.is_empty() {
+                continue;
+            }
+            let inner = run_subplan(ctx, schema, plan, &buf[..base], sub)?;
+            buf[base + i] = subplan_value(inner, sub.kind)?;
+        }
+        filled = buf;
+        &filled
+    } else {
+        params
+    };
     let body_rows = match &dp.body {
-        mpedb_sql::SubBody::Select(sp) => select_rows(&mut *ctx, schema, plan, params, sp)?,
+        mpedb_sql::SubBody::Select(sp) => {
+            match exec_select_leveled(&mut *ctx, schema, plan, params, sp, base, &dp.body_subplans)?
+            {
+                ExecResult::Rows { rows, .. } => rows,
+                _ => return Err(internal("derived-table body produced no row set")),
+            }
+        }
+        // A compound body carries no lifts (planner refuses, validate
+        // re-refuses), so it runs exactly as before.
         mpedb_sql::SubBody::Compound(c) => {
             match exec_compound(&mut *ctx, schema, plan, params, c)? {
                 ExecResult::Rows { rows, .. } => rows,

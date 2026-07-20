@@ -200,13 +200,21 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
                 tables_read.union_with(&f.tables_read);
                 indexes_used |= f.indexes_used;
             }
-            Footprint {
+            let mut fp = Footprint {
                 tables_read,
                 tables_written: TableSet::new(),
                 indexes_used,
                 key_access: KeyAccess::Full,
                 read_only: true,
+            };
+            // The BODY's own lifts read tables too (format 52). Leaving them
+            // out would let `conflicts_with` call this statement independent of
+            // a writer to the correlated table — the same leak the
+            // statement-level `union_subplan_reads` closes.
+            for s in &dp.body_subplans {
+                union_subplan_reads(s, schema, &mut fp)?;
             }
+            fp
         }
         PlanStmt::Insert { table, rows, from_select, .. } => {
             let t = schema

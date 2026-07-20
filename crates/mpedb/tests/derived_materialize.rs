@@ -259,6 +259,98 @@ fn materialized_bodies_match_sqlite() {
 
 /// Shapes where BOTH engines must refuse (never a silent one-sided answer),
 /// plus mpedb-only refusals that must stay clean errors.
+/// Body-OWNED subplans (design/DESIGN-DERIVED-TABLES.md §5.5, PLAN_FORMAT 52).
+///
+/// The rank-1 Django shape is a body that PROJECTS a correlated `EXISTS` (or
+/// scalar subquery) under an alias, consumed by the outer query — the
+/// `.annotate(Exists(...))` + `.aggregate()`/`.filter()` pair. The `EXISTS`
+/// correlates to the BODY's row, so the fill has to happen while the body
+/// materialises; by the time the outer runs, the alias is just a column.
+///
+/// Every one is diffed cell-for-cell against the bundled oracle, including the
+/// shapes where a mis-filled slot would produce a plausible-but-wrong answer
+/// (all-true / all-false / first-row-repeated), which is why the fixtures have
+/// rows on both sides of every predicate.
+#[test]
+fn body_owned_subplans_match_sqlite() {
+    let d = db();
+    let queries = [
+        // ---- THE Django shape: correlated EXISTS projected, then filtered --
+        "SELECT count(*) FROM (SELECT t.id, EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS f \
+         FROM t) sub WHERE f",
+        "SELECT count(*) FROM (SELECT t.id, EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS f \
+         FROM t) sub WHERE NOT f",
+        "SELECT id, f FROM (SELECT t.id AS id, EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS f \
+         FROM t) sub ORDER BY id",
+        // …and the same with the EXISTS negated inside the body.
+        "SELECT count(*) FROM (SELECT t.id, NOT EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS f \
+         FROM t) sub WHERE f",
+        // ---- a correlated SCALAR subquery projected under an alias ---------
+        "SELECT id, m FROM (SELECT t.id AS id, (SELECT max(u.b) FROM u WHERE u.b = t.a) AS m \
+         FROM t) sub ORDER BY id",
+        "SELECT count(m) FROM (SELECT (SELECT max(u.b) FROM u WHERE u.b = t.a) AS m FROM t) sub",
+        "SELECT sum(m) FROM (SELECT (SELECT max(u.b) FROM u WHERE u.b = t.a) AS m FROM t) sub",
+        // ---- the body's lift in its own WHERE, correlated and not ----------
+        "SELECT count(*) FROM (SELECT a FROM t WHERE a IN (SELECT b FROM u) GROUP BY a) sub",
+        "SELECT * FROM (SELECT a FROM t WHERE a IN (SELECT b FROM u) GROUP BY a) sub ORDER BY a",
+        "SELECT count(*) FROM (SELECT t.id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.b = t.a)) sub",
+        "SELECT count(*) FROM (SELECT t.id FROM t WHERE t.a = (SELECT max(b) FROM u)) sub",
+        // ---- UNCORRELATED lift in the body: filled ONCE, before the body ---
+        "SELECT * FROM (SELECT a, (SELECT count(*) FROM u) AS n FROM t GROUP BY a) sub ORDER BY a",
+        // ---- both kinds in ONE body, so the two fill phases must not collide
+        "SELECT * FROM (SELECT t.id AS id, (SELECT count(*) FROM u) AS n, \
+         EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS f FROM t) sub ORDER BY id",
+        // ---- the body also aggregates/groups/distincts around its lift -----
+        "SELECT * FROM (SELECT DISTINCT EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS f FROM t) sub \
+         ORDER BY f",
+        "SELECT f, count(*) FROM (SELECT EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS f FROM t) sub \
+         GROUP BY f ORDER BY f",
+        // ---- a lift NESTED inside the body's own lift (#73 §3) -------------
+        "SELECT count(*) FROM (SELECT t.id FROM t WHERE t.a IN \
+         (SELECT b FROM u WHERE b = (SELECT max(b) FROM u))) sub",
+        // ---- the outer still aggregates/orders/limits over the result ------
+        "SELECT max(id) FROM (SELECT t.id AS id, EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS f \
+         FROM t) sub WHERE f",
+        "SELECT id FROM (SELECT t.id AS id, EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS f \
+         FROM t) sub WHERE f ORDER BY id DESC LIMIT 2",
+    ];
+    for q in queries {
+        check(&d, q);
+    }
+}
+
+/// A body-owned lift reserves a parameter slot, so the CALLER's parameter count
+/// must not move — the accounting bug this would otherwise be
+/// (`n_subplan_slots`) shows up as "expected 2 parameters, got 1".
+#[test]
+fn body_owned_subplans_do_not_shift_the_caller_parameter_count() {
+    let d = db();
+    let sql = "SELECT count(*) FROM (SELECT t.id, \
+               EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS f FROM t WHERE t.id > $1) sub WHERE f";
+    // Zero user params on one side of the reserved region, one on the other.
+    let rows = mpedb_rows(&d, "SELECT count(*) FROM (SELECT t.id, \
+        EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS f FROM t) sub WHERE f")
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let h = d.prepare(sql).unwrap();
+    // Expectations taken from the oracle, not by hand.
+    for (arg, want) in [(0i64, "4"), (3, "1"), (99, "0")] {
+        match d.execute(&h, &[Value::Int(arg)]).unwrap() {
+            ExecResult::Rows { rows, .. } => {
+                assert_eq!(render(rows[0][0].clone()), want, "for $1 = {arg}")
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
+    // Too few / too many parameters must still be caught, at the CALLER's
+    // arity — not at `n_params`, which the reserved slot inflated.
+    assert!(d.execute(&h, &[]).is_err(), "one user parameter is required");
+    assert!(
+        d.execute(&h, &[Value::Int(1), Value::Int(2)]).is_err(),
+        "only one user parameter exists"
+    );
+}
+
 #[test]
 fn refusals_and_error_parity() {
     let d = db();
@@ -268,16 +360,19 @@ fn refusals_and_error_parity() {
     // Re-referencing the derived alias as a join operand: sqlite "no such
     // table: d" — error parity.
     check(&d, "SELECT * FROM (SELECT a FROM t GROUP BY a) d JOIN d ON 1");
-    // mpedb-only stage-1 refusals (sqlite answers): must be clean errors.
-    // A subquery inside the body.
+    // A subquery inside the body used to be a stage-1 refusal; the body now
+    // OWNS its lifts (format 52, §5.5), so this ANSWERS and is diffed above in
+    // `body_owned_subplans_match_sqlite`. What is still refused is a lift in a
+    // COMPOUND body — its arms execute as a unit, with no per-row fill phase.
     let e = d
         .query(
-            "SELECT count(*) FROM (SELECT a FROM t WHERE a IN (SELECT b FROM u) GROUP BY a) sub",
+            "SELECT count(*) FROM (SELECT a FROM t WHERE a IN (SELECT b FROM u) \
+             UNION SELECT id FROM u) sub",
             &[],
         )
         .unwrap_err();
     assert!(
-        e.to_string().contains("subquery in the derived-table body"),
+        e.to_string().contains("compound derived-table body"),
         "unexpected refusal text: {e}"
     );
     // A subquery in the outer statement.
