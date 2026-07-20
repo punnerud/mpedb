@@ -85,13 +85,28 @@ is a format change, not an optimization, and the row codec (null bitmap + fixed 
 varlen) is already compact. The nearest existing analog is canonical plan bytes in
 the registry, which is about identity, not size.
 
-### 1.7 Hierarchical cluster-first decomposition with boundary re-polish → staged concept
+### 1.7 Hierarchical cluster-first decomposition with boundary re-polish → SHIPPED, against the QUERY graph (#114)
 
-Maps to future multi-table batch scheduling: partition a drained batch by disjoint
-table footprints (cluster-first), execute partitions with independent savepoint
-scopes, and handle cross-table intents at the boundary. Pointless until batches are
-large and multi-table; today's measured batches average ~6 intents. Retained as a
-concept only — no design written.
+Originally staged against multi-table **batch scheduling**: partition a drained
+batch by disjoint table footprints (cluster-first), execute partitions with
+independent savepoint scopes, handle cross-table intents at the boundary.
+
+**That was the wrong target, and §4 below is the measurement that says so:** the
+pages copied by one COW transaction are a property of the key *set*, not of the
+visit *order*, so nothing in the commit path is path-dependent and a
+decomposition there buys nothing. (Batches also still average ~6 intents.)
+
+The **query graph** is where it belongs — the cost of a left-deep plan depends on
+the order, not just the set. Shipped 2026-07-20 as the MPEE join solver: the DP
+expands only along the join graph's frontier, so a subgraph attached through few
+edges can only appear as a connected prefix and the enumerated state count follows
+the graph's decomposition instead of `2^n` (`join-17-4`'s 17-node path: 153 states
+instead of 131,072, and the DP is exact). The "collapse a roundabout to one
+abstract point" half is the recursion itself — a subquery / derived body /
+compound arm is already a bounded scope attached through a narrow interface
+(correlation args in, one result slot out), i.e. a collapsed node whose cost
+interface is the consumer-cap pruning below. Full design:
+[DESIGN-MPEE-SOLVER.md](DESIGN-MPEE-SOLVER.md) §1 and §4.
 
 ## 2. Three designs considered; judge's pick
 
@@ -226,6 +241,11 @@ it is revisited.
    Range path is untested by real load).
 5. **Cost broker for the planner** when joins/multi-index selection land: exact
    `row_count` + on-demand cardinality probes cached in the plan registry (§5).
+   **First half shipped 2026-07-20** — the MPEE join solver reads exact
+   `row_count` (as a magnitude bucket) and chooses the join order at every level
+   of the compile recursion; see [DESIGN-MPEE-SOLVER.md](DESIGN-MPEE-SOLVER.md).
+   The *cached probes* half — measured selectivity fed back per plan hash — is
+   §9 of that document, hooked but not built (#88).
 
 
 ## Cross-query sharing of optimization artifacts — and the privacy boundary

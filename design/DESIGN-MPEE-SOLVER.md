@@ -152,7 +152,11 @@ table.
 
 ## 4. Search: collapse, stream, cap
 
-`MAX_JOINS = 16` ⇒ n ≤ 17 tables per scope. 17! is not a search space.
+`MAX_JOINS = 16` ⇒ n ≤ 17 tables per scope (the solver's own ceiling,
+`MAX_SOLVE = 24`, sits above the format cap so the solver is never the thing
+that refuses a statement; `select5.test` carries comma joins up to **64** tables
+wide and those are declined here and refused by plan validation). 17! is not a
+search space.
 
 The solver is a **dynamic program over subsets**, processed level by level in
 increasing population count, with the state set *restricted by connectivity* —
@@ -167,10 +171,11 @@ which is the collapse and the streaming, implemented as one thing:
   - `n > 12`: expand only to tables **adjacent** to `S` in the join graph; if
     `S` has no unplaced neighbour (a disconnected graph, or a genuine cross
     join), fall back to every unplaced table for that state only.
-- **Cap**: `MAX_STATES = 20_000` live states. Exceeding it falls back to a
-  greedy pass using the identical scoring function. The cap and the threshold
-  are constants, not heuristics on the data, so the choice of algorithm is a
-  function of the *statement*, not of the catalog.
+- **Cap**: `MAX_STATES = 20_000` live states. Exceeding it falls back to an
+  extremal-seeded greedy pass using the identical scoring function (§4.2). The
+  cap and the threshold are constants, not heuristics on the data, so the choice
+  of algorithm is a function of the *statement*, never of the catalog — which is
+  what keeps two processes on the same algorithm as well as the same cost.
 
 **Why the connectivity restriction is the collapse.** A subgraph that attaches
 to the rest of the graph through only a few edges can only ever appear in a
@@ -187,7 +192,7 @@ state is dropped the moment a better cost for the same mask appears; the search
 is bounded by what survives, never by the full product. Nothing resembling an
 N×N matrix is materialized.
 
-### 4.2 Extremal sampling and progressive refinement — how far the road analogy carries
+### 4.1 Extremal sampling and progressive refinement — how far the road analogy carries
 
 Morten's search strategy from the route engine: *"ta helt sør, så helt nord, så
 helt vest og øst — sannsynligheten er stor for at den 4×4-matrisen finner
@@ -342,6 +347,15 @@ these holds. Each is a correctness boundary, not a shortcut:
   every conjunct at or after the step of its last referenced table — but v1
   declines to reason about it under reordering at all.
 - **a scope with more than 17 tables**, which cannot occur (`MAX_JOINS = 16`).
+
+One behavioural consequence is worth naming rather than discovering: mpedb's
+expressions **raise** on arithmetic overflow, and a reorder changes which pairs
+a predicate is evaluated over (an index nested loop never visits the pairs a
+scan would). A query that raised may therefore stop raising, or vice versa. This
+is inherent to join reordering in every engine that does it — the *row set* is
+unchanged, which is what "0 wrong" measures — and it is one more reason the
+reorder is refused wherever an RLS policy is in scope, since there a raise is an
+information channel and not just an error.
 
 Beyond eligibility, the solver does not yet consider: bushy (non-left-deep)
 plans; semi-join / hash-join alternatives; the cost of ORDER BY or GROUP BY

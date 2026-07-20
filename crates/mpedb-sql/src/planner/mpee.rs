@@ -91,6 +91,13 @@ const DP_FULL_MAX: usize = 12;
 /// what keeps the algorithm choice deterministic across processes.
 const MAX_STATES: usize = 20_000;
 
+/// Widest chain the solver will look at. Bounded by the `u32` state mask (31)
+/// and set above the plan format's own `MAX_JOINS = 16` (17 tables), so the
+/// solver never becomes the reason a statement is refused. `select5.test`
+/// carries comma joins up to 64 tables wide; those are refused by plan
+/// validation, and the solver simply declines to look at them.
+const MAX_SOLVE: usize = 24;
+
 /// One table position in the scope being solved.
 struct Node<'a> {
     def: &'a TableDef,
@@ -347,7 +354,14 @@ impl<'a> Problem<'a> {
                     best = Some((c, t));
                 }
             }
-            let (_, t) = best.expect("a non-empty candidate set");
+            // `cand` is non-empty by construction (it falls back to every
+            // unplaced table), but a solver must never be the thing that
+            // panics a query: bail to whatever order has been built plus the
+            // rest in textual order.
+            let Some((_, t)) = best else {
+                order.extend((0..self.n).filter(|t| placed & (1 << t) == 0));
+                return order;
+            };
             order.push(t);
             placed |= 1 << t;
         }
@@ -385,7 +399,11 @@ pub(super) fn reorder<'s>(
     row_count: RowCountFn<'_>,
 ) -> std::result::Result<ast::SelectStmt, Skip> {
     let n = s.joins.len() + 1;
-    if n < 2 || n > 32 {
+    // Masks are `u32`, so 31 is the hard ceiling; the plan format caps a chain
+    // at `MAX_JOINS = 16` joins (17 tables) anyway, and a wider one is refused
+    // downstream — solving it would be wasted work. `MAX_SOLVE` sits above the
+    // format cap so the solver is never the thing that refuses.
+    if !(2..=MAX_SOLVE).contains(&n) {
         return Err(Skip::Size);
     }
     // ---- eligibility (design/DESIGN-MPEE-SOLVER.md §7) ----
