@@ -716,6 +716,10 @@ fn base_checks_reject_exactly_what_sqlite_rejects() {
         // TEXT in the INTEGER-affinity column: sqlite orders text above every
         // number, so 'abc' >= 0 is TRUE — a pass, not a reject.
         "INSERT INTO d VALUES (10, 'abc', NULL, NULL, NULL, 1)",
+        // Text truthiness in CHECK (n): sqlite converts with a numeric-prefix
+        // parse, so 'x' is 0 (reject) and '7pigs' is 7 (pass).
+        "INSERT INTO d VALUES (11, 1, NULL, NULL, NULL, 'x')",
+        "INSERT INTO d VALUES (12, 1, NULL, NULL, NULL, '7pigs')",
         "UPDATE d SET a = -5 WHERE id = 1",
         "UPDATE d SET a = 0 WHERE id = 1",
         "UPDATE d SET t = 'lengthy' WHERE id = 1",
