@@ -56,7 +56,7 @@ The tables below list, by category, exactly what the shim implements.
 | `sqlite3_open` | ✅ | Always create+read/write. `:memory:`, `""` and `file::memory:` → an ephemeral file on `/dev/shm` (or the temp dir), removed on close |
 | `sqlite3_open_v2` | 🚧 | Honors `SQLITE_OPEN_CREATE` (a missing file without it → `SQLITE_CANTOPEN`) and `SQLITE_OPEN_MEMORY`; minimal `file:` URI parsing. A named **`zVfs`**: the built-in names (`unix*`/`win32*`/`memdb`, or NULL) denote ordinary file I/O and are honored; a **custom/unknown VFS is REFUSED** with `SQLITE_ERROR` + "no such vfs" — mpedb runs no sqlite VFS modules (it has its own storage engine, not sqlite's pager), and silently ignoring e.g. an encryption VFS would be unsafe. `SQLITE_OPEN_READONLY` is **not** enforced (opens read/write) |
 | `sqlite3_close` / `sqlite3_close_v2` | ✅ | Rolls back any open transaction, unmaps the engine, deletes the file if ephemeral. `NULL` → `SQLITE_OK`. Does not track/return `SQLITE_BUSY` for unfinalized statements |
-| `sqlite3_busy_timeout` | ✅ | **Honored end-to-end (#109).** The knob is mirrored into `Database::set_busy_timeout`, so the ENGINE's writer-lock wait itself is bounded: cross-process (or cross-thread) writer contention answers `SQLITE_BUSY` / "database is locked" *at the deadline* — measured 300 ms timeout → Busy at 300.1 ms — instead of blocking forever (was engine gap E1). Timeout 0 (default) = one immediate attempt, immediate BUSY, as sqlite. A sibling connection on the SAME thread is an unwinnable wait (the owner is the caller's thread), so it answers BUSY immediately rather than burning the timeout. On top of that, the shim still retries RETRYABLE contention errors (optimistic-mode `WriteConflict`, full reader table, evicted snapshot) with sqlite's own busy-handler backoff table; the engine's `Busy` is terminal for that loop (the timeout was already honored in full — no double wait). No `sqlite3_busy_handler` is exported (CPython never calls it; the timeout is the only mechanism) |
+| `sqlite3_busy_timeout` | ✅ | **Honored end-to-end (#109).** The knob is mirrored into `Database::set_busy_timeout`, so the ENGINE's writer-lock wait itself is bounded: cross-process (or cross-thread) writer contention answers `SQLITE_BUSY` / "database is locked" *at the deadline* — measured 300 ms timeout → Busy at 300.1 ms — instead of blocking forever (was engine gap E1). Timeout 0 (default) = one immediate attempt, immediate BUSY, as sqlite. A sibling connection on the SAME thread is an unwinnable wait (the owner is the caller's thread), so it answers BUSY immediately rather than burning the timeout. On top of that, the shim still retries RETRYABLE contention errors (optimistic-mode `WriteConflict`, full reader table, evicted snapshot) with sqlite's own busy-handler backoff table; the engine's `Busy` is terminal for that loop (the timeout was already honored in full — no double wait). No `sqlite3_busy_handler` is exported (CPython never calls it; the timeout is the only mechanism). **Price:** a deadline-carrying write never joins a group-commit batch — forfeit **F3** (#110), measured at 2.3–2.5× under four contended durable writers |
 Coverage note: the busy budget bounds every `Database` facade write entry; the sqlite-backed overlay (`SqliteOverlay`) still uses blocking acquisition — its lock discipline is sqlite's own file locks, a separate mechanism.
 
 ### prepare / step / exec
@@ -212,9 +212,12 @@ against `_sqlite3.cpython-312` on Linux/x86-64 (Python 3.12).
   type, a computed column reports `NULL` — so `sqlite3.PARSE_DECLTYPES` converts
   the same columns as under stock sqlite. (`PARSE_COLNAMES`, which reads a
   `[type]` hint from the column *label*, is orthogonal and works regardless.)
-- **Concurrency is better, not bug-for-bug.** mpedb has MVCC readers and
-  group-commit; a consumer expecting `SQLITE_BUSY` under contention gets progress
-  instead (compatible-or-better).
+- **Concurrency is better, not bug-for-bug — for READERS.** mpedb has MVCC
+  readers, so a reader never blocks and a consumer expecting `SQLITE_BUSY`
+  behind a writer gets progress instead (compatible-or-better). WRITERS through
+  the shim do not get mpedb's group commit: the busy policy that makes
+  `busy_timeout` real also keeps every write off the intent ring (forfeit
+  **F3**, #110), so contended shim writers serialize one `msync` apiece.
 - **`prepare` `nByte` is an upper bound.** A positive `nByte` bounds the text but
   the statement ends at the first NUL within it — CPython passes `strlen+1`, so
   the shim must not feed the trailing `\0` to the parser.
@@ -1359,6 +1362,20 @@ codes/messages, blob/backup surfaces).
 | E12 | 2 of 4 FIXED | `==` and unquoted identifier bytes ≥ 0x80 now lex (with them, comments ANYWHERE — the tokenizer had none at all, so `select 7 -- c` lexed as `7 - (-c)`). Left: bare `current_timestamp` (mpedb has no clock functions at all — no `datetime`/`date`/`current_*`; adding non-deterministic built-ins to content-hashed plans is a design question, not a parser fix) and the partial index `CREATE INDEX … WHERE`. | `crates/mpedb-sql/src/token.rs` tests |
 | E13 | 1 | **Unquoted table names are case-SENSITIVE** (`CREATE TABLE t` then `INSERT INTO T` fails; sqlite matches case-insensitively). One test here, but any consumer can trip it. | |
 | E14 | 1 | FROM-less SELECT can't resolve its own output alias in WHERE (`select 1 as a where a=?`). | |
+
+**Performance forfeits (F) — the shim is correct here, and slower than it
+could be. No test blocked; each one is a price paid for a compat promise:**
+
+| # | Forfeit | Price / status |
+|---|---|---|
+| F1 | **No streaming cursor.** `sqlite3_step` materializes the whole result set on the first step (mpedb names a result only by running it, and CPython builds `description` before stepping). | Memory proportional to the result, not to the window the caller reads. Intrinsic to the engine's synchronous execute; not a shim choice. |
+| F2 | **Plan-registry publication is opportunistic under a busy policy** (#109, gap E8). A first-compile that finds the writer lock held keeps the plan in the local cache and skips the shared `plan/<hash>` insert, so a SELECT never waits behind another process's write transaction. | Every process may pay its own compile for the same statement text. The deliberate trade that made all 5 `TransactionTests.*_starts_transaction` pass; readers proceed under a writer. |
+| F3 | **The busy policy forfeits group commit (#110).** The shim sets a busy policy on every connection (that is what makes `busy_timeout` real, E1), and `Database::run_write_plan` gates the Phase-2 intent ring on `deadline.is_none()` — so **no** write through the shim can join another leader's batch. It still leads and drains others' intents on acquire; it can never be a follower. | **Measured, `crates/mpedb-capi/tests/ring_forfeit.rs`** (`durability = commit`, /mnt/ext4, 250 rows/writer, 5 interleaved reps, median of the slowest writer). 1 writer: shim 157 vs ring 179 rows/s — indistinguishable, an uncontended write leads directly. 4 writers: shim **146** vs ring **366 rows/s** (second run: 161 vs 392) — a **2.3–2.5×** loss, and four shim writers deliver the aggregate throughput of *one*, because each pays its own `msync`. **NOT fixed, and deliberately so:** deleting `deadline.is_none()` reaches parity (146 → 383 rows/s) and reopens E1 — a 200 ms budget then returns `SQLITE_OK` after **1.4996 s** against a foreign 1.5 s transaction, because a published intent cannot be withdrawn. No budget threshold bounds that overshoot: it is the lock holder's transaction length, not batch latency. Closing it needs a `CLAIMED` slot state in `mpedb-core/src/ring.rs` (and the header word has no spare bits — `{pid:32 ‖ gen:30 ‖ state:2}` is exactly full). Full argument + protocol spec: `design/DESIGN-CAPI.md` §7. Guard: `ring_forfeit.rs::a_ring_enabled_shim_write_still_answers_busy_at_its_deadline`. |
+
+Note on reach: a shim-CREATED database is `durability = "none"` (`open_impl`'s
+seed config omits the key), and `ring_enabled` is false for it — so F3 bites
+only when the shim attaches a durable file made by another mpedb tool. The shim
+exposes no way to create one; that is a separate gap, not F3.
 
 **Deliberate refusals / documented divergences (win by refusing loudly):**
 backup (7 — `mpedb mirror` is the answer), serialize/deserialize (2),

@@ -101,3 +101,122 @@ the library."
 
 Phase 6+, after the SQL-parity sprint. This is the ABI half of the drop-in goal, and the answer to
 "can we run more of the tests" — yes, the ecosystem's, by matching the one interface they all speak.
+
+## 7. `busy_timeout` vs group commit — the forfeit, measured, and why it stays (#110)
+
+**The shape.** #109 made `sqlite3_busy_timeout` real end to end: the shim mirrors
+the knob into `Database::set_busy_timeout`, so the *engine's* writer-lock wait is
+bounded and cross-process contention answers `SQLITE_BUSY` at the deadline
+instead of blocking forever (compat gap E1). The shim installs that policy on
+every connection at open — sqlite's default is timeout 0, i.e. immediate BUSY,
+and a connection with no policy would block forever.
+
+But `Database::run_write_plan` gates Phase-2 group commit on
+
+```rust
+let use_ring = deadline.is_none() && ring_exec::ring_enabled(self) && …
+```
+
+so **a deadline-carrying write never publishes a ring intent**. Every write
+through the shim takes the direct writer-lock path. It still *leads* on acquire
+(it drains everyone else's intents, so mixed deployments stay live), but it can
+never be a *follower* — it can never share another leader's commit.
+
+**What it costs.** `crates/mpedb-capi/tests/ring_forfeit.rs` measures it: three
+paired arms, interleaved, over freshly seeded `durability = commit` files on
+/mnt/ext4 (250 rows/writer, 5 reps, median of the slowest writer).
+
+| writers | shim | facade + busy policy | facade, no policy (ring) |
+|---------|------|----------------------|--------------------------|
+| 1       | 157  | 149                  | 179 rows/s               |
+| 4       | 146  | 156                  | **366 rows/s**           |
+
+A second full run on the same box reproduces it: 177 / 182 / 169 rows/s at one
+writer, **161 / 167 / 392** at four. Uncontended, the three arms are
+indistinguishable — an uncontended write takes the `try_begin_write` fast path
+and leads directly; the ring is not on that path.
+Contended, the busy policy costs **2.3–2.5×**, and the shape of the loss is
+worse than the ratio suggests: *four shim writers deliver the aggregate
+throughput of one*. Each pays its own `msync`, so adding writers adds flushes,
+not throughput. #111 halved the flushes per durable commit (4.05 → 2.02
+`msync`s), which makes each forfeited batch membership worth relatively more,
+not less.
+
+**Why "just enable the ring" is unsound — and now measured, not argued.** Delete
+the `deadline.is_none()` term and the shim reaches parity (n=4: 146 → 383
+rows/s). It also breaks
+`ring_forfeit.rs::a_ring_enabled_shim_write_still_answers_busy_at_its_deadline`:
+against a foreign transaction holding the writer lock for 1.5 s, a write with a
+**200 ms** budget returns `SQLITE_OK` after **1.4996 s**. A published intent
+cannot be withdrawn — §5.3 pins a READY+stamped slot to its incarnation so the
+leader's collect → stage → post cannot be raced, and releasing from READY before
+the result is posted could COMMIT a phantom write after the caller was already
+answered `SQLITE_BUSY` — so at the deadline there is nothing to abandon, and the
+enqueued wait-or-lead loop makes no progress while the lock is held. That is
+gap E1 reopening.
+
+**Why a budget threshold does not rescue it either.** The tempting version is
+"ride the ring only when the remaining budget comfortably exceeds the expected
+batch latency". The measurement refutes it: the overshoot is not batch latency,
+it is *the length of whatever transaction currently holds the writer lock* —
+unbounded, unknowable at enqueue time, and independent of the caller's budget. A
+60 s budget looks safe against a 1.5 s hold and is not safe against a 90 s one,
+and nothing at the enqueue point can tell them apart. There is no defensible
+threshold, only a luckier one.
+
+**So the busy policy stays**, and the shim keeps forfeiting group commit. The
+statement in `run_write_plan`'s comment — "the group-commit amortization
+forgone is the busy-timeout caller's explicit trade" — is the shipped
+behaviour, now with a price tag on it.
+
+### 7.1 What would actually close it: claim-on-collect
+
+The forfeit is not intrinsic. It exists because the ring has no way to say *"a
+leader has taken responsibility for this intent"* — the enqueuer cannot
+distinguish "still only published" (safe to withdraw: nothing will execute)
+from "already collected" (must wait: the write is happening). Give it that
+distinction and the deadline becomes expressible:
+
+1. **`mpedb-core/src/ring.rs` — add `ST_CLAIMED` to the slot state machine.**
+   `collect_ready` becomes claim-on-collect: for each READY slot it CASes the
+   header word `(pid, gen, READY) → (pid, gen, CLAIMED)` and takes only the
+   slots whose CAS succeeded. `stage_result`/`post_done` are unchanged in shape
+   (they CAS the claimed word). `release` gains CLAIMED to its state list — an
+   owner can still pick a result up in the window before `post_done` flips the
+   header. `recover_orphans` treats CLAIMED exactly as it treats READY today
+   (stamp ≤ committed ⇒ post; stamp > committed ⇒ clear and re-execute), plus
+   the claimed-but-never-staged case: re-arm to READY. Only one leader exists at
+   a time and the recovering process holds the writer lock, so every CLAIMED
+   slot it sees is by construction orphaned.
+2. **New enqueuer primitive `try_withdraw(idx, owned) -> bool`**: CAS
+   `(pid, gen, READY) → (0, gen+1, EMPTY)`. Wins ⇒ no leader ever claimed it ⇒
+   the intent never executes ⇒ answering `Busy` is honest. Loses ⇒ a live leader
+   holds the writer lock and is committing this batch right now.
+3. **`crates/mpedb/src/lib.rs` — the gate drops `deadline.is_none()`**, and the
+   enqueued wait-or-lead loop gains one arm: at the deadline, `try_withdraw`;
+   on success return `Error::Busy`, on failure keep waiting.
+
+The resulting contract is honest and *bounded*: the busy budget bounds the time
+to **acquire the lock or withdraw the intent**; once a leader has claimed the
+intent the caller waits for that batch, which is bounded by one commit round
+(the leader holds the lock and is running — and if it dies, our own next
+`try_begin_write` recovers the orphan and drains us). That is a genuinely
+different guarantee from today's "the budget bounds the whole statement", and it
+is strictly better than sqlite, where a busy handler can also be beaten by an
+arbitrarily long lock hold.
+
+**Why this was not done here.** Two reasons, both about blast radius rather than
+difficulty:
+
+- **The header word has no spare bits.** It is `{pid: u32 ‖ gen: 30 ‖ state: 2}`
+  = exactly 64. All four state values are taken (EMPTY/RESERVED/READY/DONE), so
+  a fifth state costs a generation bit (30 → 29). The generation is the ABA
+  defence for slot reuse; narrowing it is a shared-memory wire-format change to
+  the structure §5.3's incarnation-safety argument is built on.
+- **It is commit-path work.** The claim CAS sits between "collect" and "execute"
+  in the exact sequence the 37-finding review hardened, and it adds a state that
+  crash recovery must handle in `recover_orphans` *and* `reclaim_dead`. That
+  earns a full adversarial review of §5.3's ordering, not a shim-side patch.
+
+Until then the guard test above is the tripwire: it is the one test that fails
+the moment someone tries the one-line version of this optimisation.
