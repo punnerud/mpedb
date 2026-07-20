@@ -43,7 +43,7 @@ pub use plan::{
     PlanStmt, PolicyStamp, Projection, DerivedPlan, dual_def, RecursiveCtePlan, SelectPlan, SetOp, SortDir,
     SubBody, SubPlan, SubPlanKind, WindowFunc, WindowSpec, CTE_TABLE, DUAL_TABLE,
 };
-pub use planner::{secondary_indexes, RowCountFn, NO_ROW_COUNTS};
+pub use planner::{row_prune, secondary_indexes, Mask, RowCountFn, RowPrune, NO_ROW_COUNTS};
 pub use policy::{table_policy_hash, PolicyCatalog, TablePolicies};
 pub use view::ViewCatalog;
 

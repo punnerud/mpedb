@@ -88,9 +88,16 @@ fn budget_fits_in_memory(cells: u64) -> bool {
     bound == u64::MAX || need <= bound / 4 * 3
 }
 
-/// Build one joined row of exactly `cap` values: `lead_nulls` NULLs (a FULL
-/// join's outer-side extension), then `head` and `tail`, then NULL-padding
-/// to `cap` (a LEFT/FULL join's inner-side extension).
+/// Build one joined row of exactly `cap` values.
+///
+/// `outer` lands at slot 0 and `inner` at `inner_at`, with NULL padding in
+/// between and after. Both sides may be SHORTER than the region they occupy:
+/// #125 narrows a held tuple to the slots a later stage can observe, and the
+/// dropped tail then reads as the NULL padding it already was for a LEFT
+/// join's unmatched inner side. Positions are therefore fixed by `inner_at`
+/// and `cap` — the plan's column indices are absolute in this tuple and
+/// nothing may shift them — which is also why the LEFT extension
+/// (`inner = &[]`) and the FULL sweep (`outer = &[]`) are this same call.
 ///
 /// Two regimes, chosen by the caller from the cell budget:
 ///
@@ -112,35 +119,144 @@ fn budget_fits_in_memory(cells: u64) -> bool {
 fn build_joined_row(
     fallible: bool,
     cap: usize,
-    lead_nulls: usize,
-    head: &[Value],
-    tail: &[Value],
+    outer: &[Value],
+    inner: &[Value],
+    inner_at: usize,
 ) -> Result<Vec<Value>> {
     let mut joined;
     if fallible {
         joined = Vec::new();
         joined.try_reserve_exact(cap).map_err(|_| join_oom())?;
-        joined.resize(lead_nulls, Value::Null);
-        for src in [head, tail] {
-            for v in src {
-                match v {
-                    Value::Null
-                    | Value::Int(_)
-                    | Value::Float(_)
-                    | Value::Bool(_)
-                    | Value::Timestamp(_) => joined.push(v.clone()),
-                    heap => joined.push(try_clone_value(heap)?),
-                }
-            }
-        }
+        push_clones(&mut joined, outer)?;
+        joined.resize(inner_at, Value::Null);
+        push_clones(&mut joined, inner)?;
     } else {
         joined = Vec::with_capacity(cap);
-        joined.resize(lead_nulls, Value::Null);
-        joined.extend_from_slice(head);
-        joined.extend_from_slice(tail);
+        joined.extend_from_slice(outer);
+        joined.resize(inner_at, Value::Null);
+        joined.extend_from_slice(inner);
     }
     joined.resize(cap, Value::Null);
     Ok(joined)
+}
+
+/// `extend_from_slice`, made fallible per value: only heap-carrying values take
+/// the outlined [`try_clone_value`] path, so a scalar row pays one predicted
+/// branch.
+#[inline(always)]
+fn push_clones(out: &mut Vec<Value>, src: &[Value]) -> Result<()> {
+    for v in src {
+        match v {
+            Value::Null
+            | Value::Int(_)
+            | Value::Float(_)
+            | Value::Bool(_)
+            | Value::Timestamp(_) => out.push(v.clone()),
+            heap => out.push(try_clone_value(heap)?),
+        }
+    }
+    Ok(())
+}
+
+/// Rebuild `row` carrying only what a later stage can observe (#125).
+///
+/// `mask` is in THIS row's own coordinates — a stage mask for an accumulated
+/// tuple, an inner mask for a held inner relation — and `trim` is how many
+/// leading slots to keep.
+///
+/// Slots at or above `trim` are DROPPED and holes below it become
+/// `Value::Null`. Truncating is the safer half of that pair and gets used
+/// wherever it can: a consumer this analysis missed reads out of bounds and
+/// `Instr::PushCol` answers with `Error::Internal`, where a NULLed hole would
+/// answer with a wrong value. The rebuild is a fresh exact-size `Vec` rather
+/// than `truncate`, which frees nothing — the capacity IS the memory this is
+/// trying not to hold.
+fn narrow_row(row: Vec<Value>, mask: &Mask, trim: usize, fallible: bool) -> Result<Vec<Value>> {
+    let trim = trim.min(row.len());
+    let mut out = Vec::new();
+    if fallible {
+        out.try_reserve_exact(trim).map_err(|_| join_oom())?;
+    } else {
+        out.reserve_exact(trim);
+    }
+    for (i, v) in row.into_iter().enumerate() {
+        if i >= trim {
+            break;
+        }
+        out.push(if mask.observes(i) { v } else { Value::Null });
+    }
+    Ok(out)
+}
+
+/// [`narrow_row`] over a whole materialized relation, in place. A no-op — not
+/// even a rebuild — when the mask keeps everything.
+pub(super) fn narrow_rows(rows: &mut Vec<Vec<Value>>, mask: &Mask) -> Result<()> {
+    if !mask.prunes() {
+        return Ok(());
+    }
+    let trim = mask.trim();
+    let mut out = Vec::new();
+    out.try_reserve_exact(rows.len()).map_err(|_| join_oom())?;
+    for row in std::mem::take(rows) {
+        out.push(narrow_row(row, mask, trim, true)?);
+    }
+    *rows = out;
+    Ok(())
+}
+
+/// [`gather_rows`] that narrows as it reads (#125).
+///
+/// Narrowing a relation the gather already materialized still pays for the
+/// wide version once — the peak is then the WIDE set, and every column pruning
+/// buys is invisible at the high-water mark. Measured: an aggregate over a
+/// six-column self-join went 753.4 -> 326.0 B/row that way, and the 326 was
+/// exactly the outer relation's own full-width gather.
+///
+/// So where the access path can be drawn in [`BatchScan`]-sized pieces, it is:
+/// each batch is narrowed and dropped before the next is read, and the wide
+/// relation never exists. That is the same machinery, the same rows, the same
+/// order and the same work-row charges as a single-pass gather — #123 §9.2
+/// argues that at length and `tests/agg_stream.rs::c_invariance` re-runs a
+/// whole differential battery at four batch sizes to keep it true.
+///
+/// Everything else (an index or FTS access, a write context, a mask that keeps
+/// everything) falls back to gather-then-narrow, which is the same answer at
+/// the old peak.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn gather_narrowed(
+    ctx: &mut dyn TxnCtx,
+    table: u32,
+    access: &AccessPath,
+    filter: Option<&ExprProgram>,
+    plan: &CompiledPlan,
+    params: &[Value],
+    t: &TableDef,
+    mask: &Mask,
+) -> Result<Vec<Vec<Value>>> {
+    if !mask.prunes() {
+        return gather_rows(ctx, table, access, filter, plan, params, None);
+    }
+    let width = t.columns.len();
+    if let Some(mut scan) = BatchScan::open(&*ctx, table, access, plan, params, t, width)? {
+        let trim = mask.trim();
+        let mut out = Vec::new();
+        loop {
+            // Draw a batch, narrow it, drop it. The batch is the only
+            // full-width residency that ever exists.
+            let batch = scan.next(ctx, filter, params)?;
+            if batch.is_empty() {
+                break;
+            }
+            out.try_reserve(batch.len()).map_err(|_| join_oom())?;
+            for row in batch {
+                out.push(narrow_row(row, mask, trim, true)?);
+            }
+        }
+        return Ok(out);
+    }
+    let mut rows = gather_rows(ctx, table, access, filter, plan, params, None)?;
+    narrow_rows(&mut rows, mask)?;
+    Ok(rows)
 }
 
 fn try_clone_value(v: &Value) -> Result<Value> {
@@ -282,6 +398,9 @@ pub(super) fn gather_joined(
     outer_policy: Option<&ExprProgram>,
     joins: &[Join],
     joined_filter: Option<&ExprProgram>,
+    // #125: which slots of the accumulated tuple a later stage can observe.
+    // `None` = carry everything, which is what every path did before.
+    prune: Option<&RowPrune>,
 ) -> Result<Vec<Vec<Value>>> {
     // Left-deep nested loop. Start with the outer's rows (its policy applies
     // through the access path), then fold in each join: gather that table's
@@ -289,19 +408,42 @@ pub(super) fn gather_joined(
     // it — and keep the pairs its ON accepts. Join `k`'s ON sees the row
     // accumulated so far, `[table0 ‖ … ‖ table_k]`, which is exactly the tuple
     // the planner bound and width-checked it against.
-    let mut acc =
-        gather_rows(ctx, outer_table, outer_access, outer_policy, plan, params, None)?;
+    let outer_def = table_def(schema, plan, outer_table)?;
+    let mut acc = match prune {
+        // The outer relation is held for the whole nested loop, so it is
+        // narrowed AS IT IS READ rather than after — see `gather_narrowed`.
+        Some(p) => gather_narrowed(
+            ctx,
+            outer_table,
+            outer_access,
+            outer_policy,
+            plan,
+            params,
+            &outer_def,
+            p.stage(0),
+        )?,
+        None => gather_rows(ctx, outer_table, outer_access, outer_policy, plan, params, None)?,
+    };
     let mut stack = Vec::new();
     // The width of the tuple accumulated BEFORE each join — what a FULL
     // join's unmatched-inner sweep NULL-extends on the left. Tracked from the
     // schema rather than read off `acc`, which may hold no rows.
-    let mut acc_width = table_def(schema, plan, outer_table)?.columns.len();
+    let mut acc_width = outer_def.columns.len();
     // Live-cell budget on what this join HOLDS ([`JoinCells`]): seeded with
     // the outer rows, charged per retained joined row, released when a stage
     // is superseded. The work-row charge below bounds the O(n·m) candidates
     // CONSIDERED; this bounds the product RETAINED — the one that eats
     // memory when a late constant anchor leaves every earlier step a cross
     // join (select5's `join-17-4`).
+    //
+    // **Charged on the LOGICAL width, before #125 narrows anything.** The
+    // budget is a deterministic tripwire whose trip point is a tested contract
+    // (`tests/runtime_budget.rs`, `tests/mpee_solver.rs`): which statements it
+    // refuses must not depend on how wide the executor happens to carry a row.
+    // Column pruning is a width optimisation that changes nothing observable,
+    // and *which queries are refused* is observable. So the counter keeps
+    // pricing the product the join logically forms; residency is now strictly
+    // below what it says.
     let mut cells = JoinCells::new(ctx.join_cells_budget());
     cells.charge((acc.len() * acc_width) as u64, || {
         format!("rows held by a join over \"{}\"", table_name(schema, outer_table))
@@ -322,8 +464,16 @@ pub(super) fn gather_joined(
     // Error::OutOfMemory), the deterministic trip point is unchanged, and a
     // healthy box still pays nothing. One probe per gather, not per row.
     let fallible = cells.budget == 0 || !budget_fits_in_memory(cells.budget);
-    for join in joins {
-        let inner_width = table_def(schema, plan, join.table)?.columns.len();
+    for (ji, join) in joins.iter().enumerate() {
+        let inner_def = table_def(schema, plan, join.table)?;
+        let inner_width = inner_def.columns.len();
+        let next_width = acc_width + inner_width;
+        // What THIS stage's retained rows must keep — `stage(ji + 1)`, the
+        // suffix union from here to the output. `None` whenever narrowing would
+        // rebuild each row into the row it already is, so a statement that reads
+        // everything pays nothing at all for this.
+        let narrow = prune.map(|p| p.stage(ji + 1)).filter(|m| m.prunes());
+        let next_trim = narrow.map_or(next_width, Mask::trim);
         let join_tbl = join.table; // for the #74 attribution closures
         // An access with no OuterCol parts is resolved once: read the inner
         // side once and hold it (the pre-#49 execution — keeping it is what
@@ -332,15 +482,33 @@ pub(super) fn gather_joined(
         let held: Option<Vec<Vec<Value>>> = if access_has_outer(&join.access) {
             None
         } else {
-            let h = gather_rows(
-                ctx,
-                join.table,
-                &join.access,
-                join.policy.as_ref(),
-                plan,
-                params,
-                None,
-            )?;
+            // The held inner side is resident for the whole outer loop — the
+            // 188.8 B/row `join_held` measures — so it is narrowed too, by its
+            // OWN mask: this narrowing happens BEFORE the ON runs against these
+            // rows, so it keeps what the ON reads as well as what survives to
+            // the output. The row ORDER is untouched, so a FULL join's
+            // `inner_matched` still indexes it.
+            let h = match prune {
+                Some(p) => gather_narrowed(
+                    ctx,
+                    join.table,
+                    &join.access,
+                    join.policy.as_ref(),
+                    plan,
+                    params,
+                    &inner_def,
+                    p.inner(ji),
+                )?,
+                None => gather_rows(
+                    ctx,
+                    join.table,
+                    &join.access,
+                    join.policy.as_ref(),
+                    plan,
+                    params,
+                    None,
+                )?,
+            };
             cells.charge((h.len() * inner_width) as u64, || {
                 format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
             })?;
@@ -373,7 +541,11 @@ pub(super) fn gather_joined(
                 ctx.charge_work(1, &|| {
                     format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
                 })?;
-                let joined = build_joined_row(fallible, a.len() + i.len(), 0, a, i)?;
+                // The candidate is built at FULL width: the ON was bound
+                // against the whole tuple `[outer ‖ inner]` and may read any
+                // slot of it. Only what SURVIVES is narrowed — the candidate
+                // itself is transient and never counted as held.
+                let joined = build_joined_row(fallible, next_width, a, i, acc_width)?;
                 if join.on.eval_filter_host(&mut stack, &joined, params, ctx.host_fns())? {
                     matched = true;
                     if let Some(m) = &mut inner_matched {
@@ -381,11 +553,14 @@ pub(super) fn gather_joined(
                     }
                     // The memory charge, per RETAINED row: candidates that the
                     // ON rejects were transient, but this one is now held.
-                    cells.charge(joined.len() as u64, || {
+                    cells.charge(next_width as u64, || {
                         format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
                     })?;
                     next.try_reserve(1).map_err(|_| join_oom())?;
-                    next.push(joined);
+                    next.push(match narrow {
+                        None => joined,
+                        Some(m) => narrow_row(joined, m, next_trim, fallible)?,
+                    });
                 }
             }
             // LEFT/FULL: no match → ONE row with the inner side NULL-extended.
@@ -394,12 +569,15 @@ pub(super) fn gather_joined(
             // inner row reads as ABSENT (the outer row survives,
             // NULL-extended, never carrying the hidden row's values).
             if !matched && matches!(join.kind, JoinKind::Left | JoinKind::Full) {
-                let joined = build_joined_row(fallible, a.len() + inner_width, 0, a, &[])?;
-                cells.charge(joined.len() as u64, || {
+                let joined = build_joined_row(fallible, next_width, a, &[], acc_width)?;
+                cells.charge(next_width as u64, || {
                     format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
                 })?;
                 next.try_reserve(1).map_err(|_| join_oom())?;
-                next.push(joined);
+                next.push(match narrow {
+                    None => joined,
+                    Some(m) => narrow_row(joined, m, next_trim, fallible)?,
+                });
             }
         }
         // FULL's other half: inner rows NO outer row matched, NULL-extended
@@ -408,13 +586,15 @@ pub(super) fn gather_joined(
         if let (Some(m), Some(h)) = (&inner_matched, &held) {
             for (ci, i) in h.iter().enumerate() {
                 if !m[ci] {
-                    let joined =
-                        build_joined_row(fallible, acc_width + i.len(), acc_width, &[], i)?;
-                    cells.charge(joined.len() as u64, || {
+                    let joined = build_joined_row(fallible, next_width, &[], i, acc_width)?;
+                    cells.charge(next_width as u64, || {
                         format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
                     })?;
                     next.try_reserve(1).map_err(|_| join_oom())?;
-                    next.push(joined);
+                    next.push(match narrow {
+                        None => joined,
+                        Some(m) => narrow_row(joined, m, next_trim, fallible)?,
+                    });
                 }
             }
         }

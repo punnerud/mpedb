@@ -591,3 +591,160 @@ The per-aggregate `DISTINCT` `BTreeSet`s are deliberately NOT charged: they are
 O(distinct arg values) per aggregate per group, charging them costs a branch per
 *value* rather than per group, and the measurement (§9.1: 60.9 B/row, down from
 362.9) shows the larger half of that shape's hold was the rows, which are gone.
+
+---
+
+## 10. Step 5, built: the output requirement constrains the width (#125)
+
+§9.3 listed two shapes that streaming left completely flat and said so with
+numbers: an aggregate over a JOIN at **753.4 B/row**, an aggregate under a
+correlated `FILTER` at **566.6**, before and after, unchanged. Both keep the
+materialising path, and the diagnosis §9.3 gave — "the join holds the product
+anyway" — was true but incomplete. The product it holds is *wide*, and nothing
+in the pipeline had ever been told which columns anything downstream reads.
+
+The solver prices what a statement must READ. It priced nothing about what the
+statement must PRODUCE. `SELECT count(*)` produces one integer; that fact is
+available at plan time and was being rediscovered nowhere.
+
+### 10.1 What was built
+
+`mpedb_sql::row_prune` (`planner/prune.rs`) computes, per stage of the row
+pipeline, the set of slots any later stage can observe. The pipeline is a
+left-deep nested loop — stage 0 is the outer base row, stage *k* is
+`[stage k-1 ‖ joins[k-1]'s table]` — and the masks are the SUFFIX UNION, walked
+backwards from the output:
+
+```text
+  mask[m]  = what the OUTPUT reads
+  mask[k]  = mask[k+1] ∩ this stage's width
+           ∪ join k's ON  ∩ this stage's width
+           ∪ join k's access path (its KeyPart::OuterCols)
+```
+
+Per stage and not once globally, because one global mask is materially weaker:
+a column only join 1's `ON` reads would then pin the FINAL tuple too, and
+`SELECT count(*)` over a join would retain a 4-wide row where it should retain
+an empty one. A third set, per join, describes the HELD inner relation — it is
+narrowed *before* the `ON` runs against it, so it keeps `mask[k+1]`'s inner half
+plus whatever that `ON` reads there.
+
+`exec/gather.rs` applies them. The important half is `gather_narrowed`:
+narrowing a relation the gather already materialised still pays for the wide
+version once, and the peak is then the wide set. So where the access path can
+be drawn in `BatchScan`-sized pieces — the machinery §5.1 already built — each
+batch is narrowed and dropped before the next is read, and the wide relation
+never exists. Measured: without that step the six-column self-join went
+753.4 → 326.0 B/row, and the 326.0 *was* the outer relation's own full-width
+gather.
+
+### 10.2 What it moved
+
+Same instrument as §1 and §9.1 (a live-bytes counter in a wrapping
+`GlobalAlloc`, peak by `fetch_max`), 1 000 → 16 000 rows, slope in bytes held
+per additional input row. Asserted in `tests/prune_width_mem.rs`; "before" is
+the same fixture with `row_prune` answering `None`.
+
+| shape | B/row before | B/row after | ratio |
+|---|---:|---:|---:|
+| `count(*)` over a six-column self-join | **753.4** | **112.8** | **6.68×** |
+| `count(*)` over a narrow join pair | 378.0 | 145.2 | 2.60× |
+| `sum(inner.k)` over the same join | 378.0 | 241.2 | 1.57× |
+| `count(*) FILTER (correlated EXISTS)` | 406.6 | 225.2 | 1.81× |
+| correlated `WHERE EXISTS` residual | 406.6 | 225.2 | 1.81× |
+| join projecting 2 of 5 slots | 378.0 | 346.0 | 1.09× |
+| fully projected join (the control) | 378.0 | 378.0 | 1.00× |
+
+753.4 is §9.1's own figure, reproduced to the decimal, which is what makes the
+first row a before/after and not two measurements.
+
+**There is a throughput gain too, and it is larger than the memory one is
+comfortable with.** `select4.test` — the corpus file the MPEE solver work
+(#114/#116) already singled out — runs in **13.8 s against 30.6 s**, on the same
+release build, same box, same 3 GB `ulimit -v`. Not holding the columns is
+cheaper than holding them, as it was for the streaming fold (§9.1).
+
+### 10.3 Where the technique stops, measured rather than assumed
+
+The last row of the table is the honest one. A join projecting two of five
+slots recovers **9%**, no more: the plan's column indices are ABSOLUTE in the
+joined tuple, so a dead slot *below* the highest observed one can only be NULLed
+out, not removed. Positional pruning frees the payload (text and blobs that are
+no longer carried) and the TAIL; compacting the middle would mean remapping
+every `PushCol`, every `Projection::Column`, every `GroupKey::Col`, every
+`order_by` index and every `KeyPart::OuterCol` — a plan rewrite, and a different
+change with a different risk profile.
+
+That is why the wins concentrate where the output requirement is *far* from the
+input width: `count(*)` observes nothing, so its trim is 0 and its product is a
+set of empty rows.
+
+### 10.4 What was deliberately NOT done
+
+**Dropping a column changes nothing observable. Dropping a JOIN, a `DISTINCT`
+or a `GROUP BY` changes which ROWS exist.** Those are rewrites; they can produce
+wrong answers; and they do not share a code path, a test file or a review with
+this one.
+
+Two are visible from here and are left on the table on purpose:
+
+1. **Join elimination.** A join to a table whose columns are entirely
+   unobservable — which `row_prune` now identifies for free, as
+   `inner[j].trim() == 0` and `stage[j+1]` no wider than `stage[j]` — can be
+   removed outright *if* it can neither multiply nor eliminate rows. That needs
+   a proven-unique inner key on the ON columns and, for an INNER join, a
+   NOT NULL foreign key guaranteeing a match. mpedb has UNIQUE indexes to prove
+   the first and no referential integrity at all to prove the second, so an
+   INNER join can only be dropped when the ON covers a unique index in full AND
+   the join is a LEFT join (where a miss NULL-extends rather than eliminating).
+   Real, sound, and a row-count change: separate task.
+2. **`DISTINCT` elimination** when the projection already contains a full unique
+   key. Same shape of argument, same reason it is not here.
+
+**The runtime budget deliberately did not move.** `max_join_cells` still prices
+the product the join LOGICALLY forms, not what it now holds. Which statements a
+database refuses is observable; a width optimisation that silently raised the
+ceiling would be an observable change dressed as an invisible one.
+`tests/prune_width.rs::the_join_budget_still_prices_the_logical_product` pins
+that: a 20-cell budget still refuses `count(*)` over a join whose retained rows
+are empty.
+
+**Windows are refused outright.** A windowed plan's projection indexes the
+extended tuple `[base ‖ w0..wk]`, and `compute_windows` reads the base row
+through side vectors this analysis does not model. `row_prune` answers `None`.
+
+### 10.5 How this is known to be safe
+
+The failure mode is exactly one: MISSING a consumer. Three things guard it.
+
+1. `row_prune` destructures `SelectPlan` **exhaustively by name**. A new plan
+   field is a compile error here. (`mpedb::access`'s report is the counterexample
+   in this repository: it destructures with `..`, silently drops `windows` and
+   `returning`, and still reports `exact_columns: true`.)
+2. Pruning **truncates** wherever it can and only NULLs interior holes. Above
+   the trim point a forgotten consumer reads out of bounds, and
+   `Instr::PushCol` answers with `Error::Internal` — a loud failure rather than
+   a plausible NULL.
+3. `tests/prune_width.rs` differentials every shape against the bundled sqlite
+   oracle on value AND `typeof()`, organised by consumer. It is fault-injected:
+   deleting any one of the five contributors (`ON` columns, `joined_filter`,
+   ORDER BY keys, correlated `outer_args`, the bare-column witness's primary
+   key) fails it.
+
+The primary key is the one base-row read no expression names — sqlite's
+bare-column witness picks a group's lowest-rowid row by reading it, with a
+silent `unwrap_or(Value::Null)` — and it is also the one that a PK-ORDERED scan
+hides, because then a group's first row IS its lowest-rowid row and the wrong
+rule agrees with the right one. It takes an index access to expose, and there
+the oracle cannot arbitrate: **sqlite 3.45 follows the SCAN there, not the
+rowid**, so mpedb's documented min-PK rule and sqlite's diverge the moment scan
+order stops being PK order. That divergence predates this work (verified with
+pruning disabled entirely) and is a bare-column question, not a width one;
+`the_bare_column_witness_does_not_depend_on_the_access_path` asserts mpedb's own
+rule instead.
+
+### 10.6 Corpus
+
+`select1-4` + `evidence/` (9 689 records), before and after: report body
+**byte-identical except for the per-file timings**. 9 489 passed, the same 4
+`slt_lang_replace` runner artifacts flagged wrong, 0 error mismatches.

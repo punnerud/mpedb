@@ -8,7 +8,7 @@ use mpedb_core::{ReadTxn, WriteTxn};
 use mpedb_sql::{
     AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, Join, JoinKind,
     CompoundPlan, GroupKey, OrderOver, PlanOnConflict, PlanStmt, Projection, RowMap, RowSide,
-    SelectPlan, SetOp, SortDir, SubBody, SubPlan,
+    Mask, RowPrune, SelectPlan, SetOp, SortDir, SubBody, SubPlan,
 };
 use mpedb_types::{
     exact_float_as_int, exact_int_as_float, keycode, Accum, Collation, DefaultExpr, Error,
@@ -1123,6 +1123,40 @@ fn exec_compound(
     Ok(ExecResult::Rows { columns, rows: acc })
 }
 
+/// **What the statement must PRODUCE, turned into a bound on what the pipeline
+/// carries** (#125).
+///
+/// The row pipeline for one SELECT is `[table0 ‖ table1 ‖ …]`, and every column
+/// of every table in it is materialized today whether or not anything
+/// downstream can see it — `SELECT count(*)` over a join holds the entire
+/// product to produce one integer. [`mpedb_sql::row_prune`] computes the slots
+/// a later stage can observe; `None` means every slot is observed and the
+/// executor's paths stay byte-for-byte what they were.
+///
+/// Two base-row reads go through no expression and so are passed in
+/// explicitly: the outer table's PRIMARY KEY (sqlite's bare-column witness
+/// picks a group's lowest-rowid row by reading it) and each correlated
+/// subplan's `outer_args` (filled per row by [`correlated_survivors`]).
+fn select_prune(
+    schema: &Schema,
+    plan: &CompiledPlan,
+    sp: &SelectPlan,
+    correlated: &[(usize, &SubPlan)],
+) -> Result<Option<RowPrune>> {
+    let t = table_def(schema, plan, sp.table)?;
+    // One width per stage of the pipeline: the outer table, then each join's.
+    let mut widths = Vec::with_capacity(sp.joins.len() + 1);
+    widths.push(t.columns.len());
+    for j in &sp.joins {
+        widths.push(table_def(schema, plan, j.table)?.columns.len());
+    }
+    let mut args: Vec<u16> = Vec::new();
+    for (_, s) in correlated {
+        args.extend_from_slice(&s.outer_args);
+    }
+    Ok(mpedb_sql::row_prune(sp, &widths, &t.primary_key, &args))
+}
+
 /// One SELECT — shared verbatim between a top-level SELECT and each compound
 /// arm, so the two can never drift.
 fn exec_select(
@@ -1195,6 +1229,12 @@ fn exec_select(
             let rows = if !joins.is_empty() {
                 // A join materializes: the sort, the dedup and the LIMIT all
                 // apply to JOINED rows, so none of them can bound the scan.
+                // #125: the join's product is the biggest thing this path
+                // holds, and the projection above it is usually a handful of
+                // columns. Computed only for a join — a single-table read
+                // materializes exactly one row set and pruning it would rebuild
+                // every row to save a slot the projection was about to read.
+                let prune = select_prune(schema, plan, sp, &[])?;
                 let mut r = gather_joined(
                     ctx,
                     plan,
@@ -1205,6 +1245,7 @@ fn exec_select(
                     filter.as_ref(),
                     joins,
                     joined_filter.as_ref(),
+                    prune.as_ref(),
                 )?;
                 // `OrderOver::BaseRow` means "the tuple the scan produced", and
                 // for a join that tuple IS the joined row — so the sort belongs
@@ -1406,6 +1447,11 @@ fn exec_select_with(
     if !windows.is_empty() {
         return Err(internal("windows in a correlated select plan"));
     }
+    // #125. Unlike the uncorrelated path this narrows the SINGLE-TABLE gather
+    // too: `correlated_survivors` keeps a per-row scratch beside every gathered
+    // row, so this shape holds the whole input at its widest and the columns
+    // the correlation actually names are typically one or two.
+    let prune = select_prune(schema, plan, sp, correlated)?;
     let mut rows = if !joins.is_empty() {
         gather_joined(
             ctx,
@@ -1417,9 +1463,25 @@ fn exec_select_with(
             filter.as_ref(),
             joins,
             joined_filter.as_ref(),
+            prune.as_ref(),
         )?
     } else {
-        gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?
+        match &prune {
+            Some(p) => {
+                let t = table_def(schema, plan, *table)?;
+                gather::gather_narrowed(
+                    ctx,
+                    *table,
+                    access,
+                    filter.as_ref(),
+                    plan,
+                    params,
+                    &t,
+                    p.stage(0),
+                )?
+            }
+            None => gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?,
+        }
     };
     if *order_over == OrderOver::BaseRow && !order_by.is_empty() {
         gather::check_order_colls(order_by, ctx.host_colls())?;
@@ -1505,6 +1567,11 @@ fn run_aggregate(
         .aggregate
         .as_ref()
         .ok_or_else(|| internal("aggregate dispatch on a non-aggregate plan"))?;
+    // #125: an aggregate is the shape whose output requirement is furthest from
+    // its input width — `count(*)` observes NO column at all. Only the
+    // MATERIALIZING paths inside `exec_aggregate` consult this; the streaming
+    // fold (#123) already holds only a batch.
+    let prune = select_prune(schema, plan, sp, correlated)?;
     exec_aggregate(
         ctx,
         plan,
@@ -1527,6 +1594,7 @@ fn run_aggregate(
         base,
         correlated,
         post_filter,
+        prune.as_ref(),
     )
 }
 
