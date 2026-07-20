@@ -1360,7 +1360,7 @@ codes/messages, blob/backup surfaces).
 | E10 | 4 (1 fixed) | **iterdump surface.** `test_unorderable_row` passes and `iterdump()` of a table-only database is byte-identical to stock. The other 4: 2 × AUTOINCREMENT + `sqlite_sequence` (deliberate refusal), 1 × fts4 (deliberate — fts5 only), and `test_table_dump`, which now gets as far as `CREATE TRIGGER` inside CPython's implicit transaction (mpedb refuses trigger/view DDL inside a transaction) and would then still diff, because the `sqlite_master.sql` column is RECONSTRUCTED from the schema, not the caller's original text. Verbatim DDL is the same engine gap as E3's verbatim decltypes. Index/view/trigger rows are absent from `sqlite_master` for the same reason (their names/DDL are not in the schema bundle the shim can see). | `capi.rs::sqlite_master_evaluator_takes_the_iterdump_query_shape` |
 | E11 | **FIXED (2026-07-20)** | ~~`zeroblob()` absent~~ → present in every position (see the surface table). It also unblocked `ThreadTests`, whose `setUp` inserts `zeroblob(1)`. | |
 | E12 | 2 of 4 FIXED | `==` and unquoted identifier bytes ≥ 0x80 now lex (with them, comments ANYWHERE — the tokenizer had none at all, so `select 7 -- c` lexed as `7 - (-c)`). Left: bare `current_timestamp` (mpedb has no clock functions at all — no `datetime`/`date`/`current_*`; adding non-deterministic built-ins to content-hashed plans is a design question, not a parser fix) and the partial index `CREATE INDEX … WHERE`. | `crates/mpedb-sql/src/token.rs` tests |
-| E13 | 1 | **Unquoted table names are case-SENSITIVE** (`CREATE TABLE t` then `INSERT INTO T` fails; sqlite matches case-insensitively). One test here, but any consumer can trip it. | |
+| E13 | **FIXED (2026-07-20)** | ~~Unquoted table names are case-SENSITIVE~~ → every identifier now folds ASCII case, sqlite's rule: tables, columns, aliases, CTE/view/trigger names, index columns, `USING`/`NATURAL`, and the dup checks (`CREATE TABLE t(a, A)` is refused, as sqlite refuses it). Measured against the bundled oracle, which corrected two guesses: **quoting does NOT protect case** (`"T"` == `t`; `t("a","A")` is a duplicate) and folding is **ASCII-ONLY** (`Æ`≠`æ`, `k`≠`K`(U+212A), `i`≠`İ` — a Unicode fold would have merged names sqlite keeps apart). Names are stored and reported in their DECLARED spelling, so `cursor.description` is unchanged. | `crates/mpedb/tests/ident_case.rs` (20 differential tests) |
 | E14 | 1 | FROM-less SELECT can't resolve its own output alias in WHERE (`select 1 as a where a=?`). | |
 
 **Performance forfeits (F) — the shim is correct here, and slower than it
@@ -1498,9 +1498,6 @@ gap a consumer would hit on its first migration.
 * **`SQLITE_DBCONFIG_ENABLE_FKEY`** (1). The test verifies foreign keys are
   actually ENFORCED after the toggle; mpedb parses and drops `REFERENCES`.
   Echoing the flag would be the D10/D11 lie.
-* **Case-insensitive unquoted identifiers** (E13, 1). A resolution widening
-  with real ambiguity risk (mpedb permits `t` and `T` as two tables today),
-  and it lives in the binder another agent is in.
 * **Bare `current_timestamp`** (1). Needs a clock-function family that does
   not exist; non-deterministic built-ins inside content-hashed plans is a
   design decision, not a parser fix.
@@ -1650,7 +1647,6 @@ lowers — so on every ordinary statement it does not run at all.
 | **E3(b) bind rigidity where sqlite coerces** | **9** | The single biggest bucket now. `x timestamp` / `b blob` / `name text` columns refuse a value sqlite's affinity rule would store: text→`timestamp` (4), text→`blob` (3, the `BlobTests` expiry provocations), int→`text` (1), blob→`text` (1). `ColumnType::from_declared` maps `timestamp`/`blob`/`text` to RIGID types because mpedb's own vocabulary wins over sqlite's affinity table — correct for a config-declared column, wrong for a `CREATE TABLE` arriving through a sqlite shim. The machinery already exists (`ColumnDef::affinity` + `store_affinity`, applied today only for `Numeric`); this is a mapping decision in `mpedb-types`, shared with the Django work, so it is RECORDED rather than taken here. | no — `mpedb-types` |
 | iterdump / `sqlite_master.sql` | 4 | Verbatim DDL text in the schema (2 are AUTOINCREMENT and fts4, deliberate refusals). Same engine gap as E3(a) was. | no |
 | serialize / deserialize | 2 | An in-memory image format. | — |
-| E13 case-insensitive unquoted identifiers | 1 | `create table t` then `INSERT INTO T`. Binder resolution, and `binder.rs` is another agent's file; the shim cannot do it at the text level without also lowercasing output ALIASES, which would change `cursor.description`. | no — `binder.rs` |
 | E14 FROM-less alias in WHERE | 1 | `select 1 as a where a=?`. Binder. | no — `binder.rs` |
 | `current_timestamp` (bare) | 1 | Three things at once now: the bare keyword, a function call in `INSERT … VALUES` position, and a TEXT value into a `timestamp` column (E3(b) again). | partly |
 | partial index (`CREATE INDEX … WHERE`) | 1 | mpedb has no partial indexes. | no |
@@ -2332,13 +2328,13 @@ helper reports as a failure rather than an error, two are metadata text.
 | `test_dbapi.SerializeTests.test_deserialize_corrupt_database` | `deserialize is not supported by mpedb`; the test uses `assertRaisesRegex("file is not a database")`, so a refusal scores as FAIL. | refusal |
 | `test_dump.DumpTests.test_dump_custom_row_factory` | iterdump emits `CREATE TABLE test(t);` where sqlite emits `CREATE TABLE "test" ("t");` — the shim's `sqlite_master` DDL text is not re-quoted. | metadata text |
 | `test_hooks.TraceCallbackTests.test_trace_too_much_expanded_sql` | the statement itself refuses (`unknown column a in table ``` for `select 1 as a where a=?` — an output alias referenced in WHERE), so the trace list is empty and the assertion on it fails. | refusal |
-| `test_transactions.AutocommitAttribute.test_autocommit_compat_ctx_mgr` | `unknown table T` after `CREATE TABLE t` — see the case-sensitivity gap below. | refusal |
+| `test_transactions.AutocommitAttribute.test_autocommit_compat_ctx_mgr` | ~~`unknown table T` after `CREATE TABLE t`~~ — **FIXED 2026-07-20**, see the case-sensitivity gap below. | ~~refusal~~ |
 | `test_userfunctions.FunctionTests.test_func_deterministic` | `create index t on test(t) where deterministic() is not null` → `SQL parse error … unexpected trailing input Kw(Where)`; partial indexes are not parsed. | refusal |
 
-#### New gap found here: identifiers are CASE-SENSITIVE
+#### New gap found here: identifiers are CASE-SENSITIVE — **CLOSED 2026-07-20**
 
-sqlite folds unquoted identifiers ASCII-case-insensitively; mpedb does not.
-Minimal repro through the shim:
+sqlite folds unquoted identifiers ASCII-case-insensitively; mpedb did not.
+Minimal repro through the shim (all three lines now work):
 
 ```python
 cx = sqlite3.connect(":memory:")
@@ -2347,11 +2343,42 @@ cx.execute("INSERT INTO T VALUES(1)")   # mpedb: bind error: unknown table `T`
 cx.execute("SELECT A FROM t")           # mpedb: unknown column `A` in table `t`
 ```
 
-It is a **refusal in every position tested — it cannot produce a wrong answer**,
-which is why neither the corpus (generated SQL is internally consistent in case)
-nor Django (the ORM quotes and cases consistently) has ever surfaced it. Not
-fixed here: case folding belongs in the binder's name resolution, not in the
-shim.
+It was a **refusal in every position tested — it could not produce a wrong
+answer**, which is why neither the corpus (generated SQL is internally
+consistent in case) nor Django (the ORM quotes and cases consistently) ever
+surfaced it. Fixed where it belonged: name RESOLUTION, not the shim —
+`mpedb_types::ident` (`fold_ident`/`ident_eq`) with `TableDef::column_index`
+and `Schema::table_id` as the two chokepoints, plus the view/CTE/trigger
+catalogs and the schema's duplicate-name checks.
+
+Three things the bundled oracle settled that memory would have got wrong:
+
+* **Quoting does NOT protect case.** `"T"`, `[T]`, `` `T` `` and bare `T` are
+  one name; `CREATE TABLE t("a" INT, "A" INT)` is `duplicate column name: A`.
+  Quoting buys spellings a bare word cannot have, never case sensitivity.
+* **Folding is ASCII-ONLY.** `Æ`/`æ`, `k`/U+212A KELVIN SIGN and `i`/`İ` stay
+  distinct. Rust's Unicode-aware `to_lowercase()` merges all three — that would
+  have been a silent wrong answer, not an error, and is asserted against in
+  `mpedb_types::ident`'s own tests.
+* **Reported names are the DECLARED spelling**, not the folded one and not the
+  query's: `SELECT ABC FROM T` on `CREATE TABLE MiXeD(Abc INT)` labels the
+  column `Abc`, so `cursor.description` is untouched.
+
+The one widening hazard that actually fired: ORDER BY resolves an output alias
+before a base column of the same name, the planner compares aliases EXACTLY, and
+folding column lookup made `SELECT a AS b FROM t ORDER BY B` silently sort by the
+base column `b` (measured `2,1` against sqlite's `1,2`) where it used to be a
+clean error. Neutralized in the parser
+(`parser::select::align_order_by_alias_case`) and pinned by
+`ident_case.rs::order_by_alias_outranks_base_column`.
+
+Residual, all **refusals** (never differing answers), all in
+`crates/mpedb-sql/src/planner/`, which was owned by another agent in this
+working tree: the `ON CONFLICT` target list, `DO UPDATE SET`, `RETURNING`, and
+the recursive-CTE name — four inline `c.name == *name` comparisons that should
+call `TableDef::column_index` / `ident_eq`. Pinned by
+`ident_case.rs::planner_owned_residuals_refuse_rather_than_differ`, which fails
+loudly when any of them starts working.
 
 #### The 21 ERRORs, bucketed
 

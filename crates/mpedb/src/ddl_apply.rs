@@ -64,7 +64,7 @@ impl Database {
         }
         let key = view_key(name);
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
-        let exists = matches!(w.sys_get(&key), Ok(Some(_)));
+        let exists = resolve_view_key(&mut w, name)?.is_some();
         if exists {
             w.abort();
             if if_not_exists {
@@ -91,9 +91,10 @@ impl Database {
 
     /// `DROP VIEW [IF EXISTS] <name>`.
     pub(crate) fn apply_drop_view(&self, name: &str, if_exists: bool) -> Result<ExecResult> {
-        let key = view_key(name);
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
-        let existed = matches!(w.sys_get(&key), Ok(Some(_)));
+        let found = resolve_view_key(&mut w, name)?;
+        let key = found.clone().unwrap_or_else(|| view_key(name));
+        let existed = found.is_some();
         if !existed {
             w.abort();
             if if_exists {
@@ -123,6 +124,23 @@ fn view_key(name: &str) -> Vec<u8> {
     let mut k = VIEW_PREFIX.to_vec();
     k.extend_from_slice(name.as_bytes());
     k
+}
+
+/// The sys-key of the stored view that `name` names, matched
+/// ASCII-case-insensitively — `DROP VIEW v` finds `CREATE VIEW V`.
+///
+/// The key keeps the DECLARED spelling (`view/V`), so the name a view reports
+/// back is the one it was created with; only the *matching* folds. Resolved
+/// from inside the caller's write txn, so the existence test and the
+/// put/delete that follows it are one atomic decision.
+fn resolve_view_key(w: &mut mpedb_core::WriteTxn<'_>, name: &str) -> Result<Option<Vec<u8>>> {
+    for (subkey, _) in w.sys_scan_range(VIEW_PREFIX, VIEW_PREFIX_END)? {
+        let Some(stored) = subkey.strip_prefix(VIEW_PREFIX) else { continue };
+        if mpedb_types::ident_eq(&String::from_utf8_lossy(stored), name) {
+            return Ok(Some(subkey));
+        }
+    }
+    Ok(None)
 }
 
 /// Type-check + coerce an `ADD COLUMN DEFAULT <const>` value against the
@@ -222,7 +240,7 @@ pub(crate) fn table_def_from_spec(
     let col_index = |name: &str| -> Result<u16> {
         spec.columns
             .iter()
-            .position(|c| c.name == name)
+            .position(|c| mpedb_types::ident_eq(&c.name, name))
             .map(|i| i as u16)
             .ok_or_else(|| {
                 Error::Bind(format!(
@@ -546,7 +564,7 @@ pub(crate) fn resolve_index_columns(
         .map(|name| {
             t.columns
                 .iter()
-                .position(|c| &c.name == name)
+                .position(|c| mpedb_types::ident_eq(&c.name, name))
                 .map(|i| i as u16)
                 .ok_or_else(|| {
                     Error::Bind(format!("CREATE INDEX on `{table}`: no column `{name}`"))

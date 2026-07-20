@@ -322,7 +322,7 @@ impl Database {
             let def = bundle
                 .tables
                 .iter()
-                .find(|t| !t.dead && &t.name == table)
+                .find(|t| !t.dead && mpedb_types::ident_eq(&t.name, table))
                 .ok_or_else(|| Error::Bind(format!("no such table: {db}.{table}")))?;
             let mangled_name = mpedb_sql::mangle_db_table(&member.name, table);
             if main_names.contains(&mangled_name) {

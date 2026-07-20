@@ -10,9 +10,54 @@
 
 use super::{Parser, MAX_COMPOUND_ARMS, MAX_ORDER_BY_ITEMS, MAX_SELECT_ITEMS};
 use crate::ast::{CompoundStmt, Expr, JoinClause, JoinKind, SelectStmt, Stmt};
-use crate::plan::SetOp;
+use crate::plan::{SetOp, SortDir};
 use crate::token::{Kw, Tok};
-use mpedb_types::{Result, Value};
+use mpedb_types::{ident_eq, Result, Value};
+
+/// Re-spell a bare ORDER BY key to the SELECT-item alias it names, when the two
+/// differ only in ASCII case.
+///
+/// ORDER BY is the ONE place where an output alias outranks a base column of
+/// the same name — `SELECT a AS b FROM t ORDER BY b` sorts by `a`, even though
+/// the table has its own `b` (measured; GROUP BY and HAVING do NOT do this, and
+/// resolve against the base columns). The planner implements that precedence by
+/// comparing the key against each item's alias, and it compares them EXACTLY.
+///
+/// That exactness was harmless while column lookup was exact too: `ORDER BY B`
+/// simply failed to resolve at all. Once column lookup folds ASCII case, the
+/// alias test misses, the key falls through to the base column, and the query
+/// silently sorts by the WRONG column — a refusal turned into a wrong answer,
+/// which is the specific hazard this whole change had to avoid. Normalizing the
+/// key's spelling here restores the precedence for every consumer of the AST at
+/// once (plain, joined, windowed and DISTINCT ORDER BY all share these fields).
+///
+/// Only a BARE identifier is rewritten. A qualified `t.B` or an expression
+/// `B+0` names the base column even when an alias `b` exists (both measured),
+/// and both are left alone — matching the planner's own `Expr::Col` guard.
+/// First match wins, as `position` does downstream: with `a AS x, b AS X`,
+/// `ORDER BY x` takes the first.
+///
+/// This rewrites the *sort key*, never a stored or reported name.
+fn align_order_by_alias_case(
+    items: &Option<Vec<(Expr, Option<String>)>>,
+    order_by: &mut [(Expr, SortDir)],
+) {
+    let Some(items) = items else { return };
+    for (key, _) in order_by.iter_mut() {
+        let Expr::Col(n) = key else { continue };
+        // An EXACT alias already resolves; only a case-differing one needs help.
+        if items.iter().any(|it| it.1.as_deref() == Some(n.as_str())) {
+            continue;
+        }
+        if let Some(alias) = items
+            .iter()
+            .filter_map(|it| it.1.as_deref())
+            .find(|a| ident_eq(a, n))
+        {
+            *n = alias.to_owned();
+        }
+    }
+}
 
 /// A FROM-less `SELECT <items>` — reads no table and evaluates its items over
 /// ONE synthetic row (the #67 DUAL sentinel). The building block a standalone
@@ -400,6 +445,7 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        align_order_by_alias_case(&items, &mut order_by);
         self.neg_limit_in_core = false;
         let limit = if self.eat_kw(Kw::Limit) {
             self.limit_int("LIMIT")?

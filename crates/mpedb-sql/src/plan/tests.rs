@@ -1081,11 +1081,24 @@ fn explain_is_informative() {
 fn projection_names_are_canonical() {
     let s = test_schema();
     let a = prepare("SELECT age+1 FROM users", &s).unwrap();
-    // Identifiers are case-sensitive: AGE does not exist.
-    assert!(matches!(
-        prepare("select AGE + 1 from users", &s),
-        Err(Error::Bind(_))
-    ));
+    // Identifiers now fold ASCII case, so `AGE` RESOLVES where it used to be a
+    // bind error. It also canonicalizes: mpedb renders a projection's display
+    // name from the compiled program, naming each slot with its DECLARED column
+    // name, so `AGE + 1` and `age + 1` are the SAME plan with the same label —
+    // one cache entry, not two.
+    //
+    // sqlite instead echoes the source text for a computed column (`SELECT
+    // Abc+1` is labelled `Abc+1`), so this label is a deliberate, PRE-EXISTING
+    // divergence, not one the case fold introduced: mpedb has no source printer
+    // and already normalizes the spacing (`age+1` → `age + 1`). For a BARE
+    // column reference the two agree exactly — both report the declared
+    // spelling (`SELECT ABC FROM t` → `Abc`).
+    let upper = prepare("select AGE + 1 from users", &s).unwrap();
+    assert_eq!(a, upper);
+    assert_eq!(
+        prepare("SELECT AGE FROM users", &s).unwrap(),
+        prepare("SELECT age FROM users", &s).unwrap()
+    );
     // Whitespace and keyword case do not affect the plan or the name.
     let b = prepare("select age\n  +\n1 from users", &s).unwrap();
     assert_eq!(a, b);

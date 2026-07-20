@@ -1291,7 +1291,7 @@ impl<'e> WriteTxn<'e> {
             table
                 .columns
                 .iter()
-                .position(|c| c.name == column)
+                .position(|c| mpedb_types::ident_eq(&c.name, column))
                 .ok_or_else(|| {
                     Error::Schema(format!("no column `{column}` in table id {table_id}"))
                 })?

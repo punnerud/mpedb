@@ -1410,10 +1410,9 @@ impl<'a> Binder<'a> {
                 // this path, only() asserts instead of guessing.
                 let t = self.scope.only();
                 let i = t
-                    .columns
-                    .iter()
-                    .position(|c| c.name == *name)
-                    .ok_or_else(|| bind_err(format!("unknown column `excluded.{name}`")))?;
+                    .column_index(name)
+                    .ok_or_else(|| bind_err(format!("unknown column `excluded.{name}`")))?
+                    as usize;
                 let n = t.columns.len();
                 Ok((BExpr::Col((n + i) as u16), Some(t.columns[i].ty)))
             }
