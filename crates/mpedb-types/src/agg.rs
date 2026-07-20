@@ -39,6 +39,34 @@ pub trait HostAggState {
     /// aggregate context is freed straight after), so it takes `Box<Self>` to
     /// stay object-safe.
     fn finish(self: Box<Self>) -> Result<Value>;
+
+    /// **Window protocol**, sqlite's `xInverse`: undo the contribution of one
+    /// row that has LEFT the frame. The arguments are the ones that row was
+    /// stepped with.
+    ///
+    /// A window aggregate over a moving frame is computed by SLIDING: as the
+    /// frame advances, rows entering it are `step`ped and rows leaving it are
+    /// `inverse`d, so each row's value costs O(1) instead of re-aggregating the
+    /// whole frame. That is only possible if the aggregate can subtract, which
+    /// is why sqlite makes it a separate registration (`create_window_function`)
+    /// rather than an extra method on every aggregate — and why the default here
+    /// REFUSES rather than silently doing nothing (which would compute a running
+    /// total for a frame the caller bounded).
+    fn inverse(&mut self, _args: &[Value]) -> Result<()> {
+        Err(Error::Unsupported(
+            "this aggregate has no inverse and cannot be used as a window function".into(),
+        ))
+    }
+
+    /// **Window protocol**, sqlite's `xValue`: the value for the CURRENT frame
+    /// without consuming the state — the same accumulation keeps sliding
+    /// afterwards. [`HostAggState::finish`] still runs once at the end of the
+    /// partition.
+    fn value(&mut self) -> Result<Value> {
+        Err(Error::Unsupported(
+            "this aggregate has no per-frame value and cannot be used as a window function".into(),
+        ))
+    }
 }
 
 /// Resolve a HOST-registered aggregate by name at exec time, mirroring

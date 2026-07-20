@@ -46,6 +46,7 @@
 mod testdb;
 
 mod access;
+pub mod backup;
 mod exec;
 mod multifile;
 mod policy_store;
@@ -191,6 +192,20 @@ impl mpedb_types::HostAggState for GuardedAggState {
         guard_panic(&format!("host aggregate {name}() finish"), move || {
             inner.finish()
         })
+    }
+    // The WINDOW half of the protocol gets the same panic boundary: `xInverse`
+    // and `xValue` are caller code on the same footing as `xStep`.
+    fn inverse(&mut self, args: &[Value]) -> Result<()> {
+        let name = &self.name;
+        let inner = &mut self.inner;
+        guard_panic(&format!("host aggregate {name}() inverse"), || {
+            inner.inverse(args)
+        })
+    }
+    fn value(&mut self) -> Result<Value> {
+        let name = &self.name;
+        let inner = &mut self.inner;
+        guard_panic(&format!("host aggregate {name}() value"), || inner.value())
     }
 }
 
@@ -458,6 +473,12 @@ pub struct Database {
     /// between groups or between concurrent executions. Same one-connection-only
     /// plan rule as the scalars.
     host_aggs: RwLock<HashMap<(String, i32), HostAggFactory>>,
+    /// The subset of `host_aggs` registered with the WINDOW protocol
+    /// (`register_host_window_aggregate`): states that also implement
+    /// `inverse`/`value`, and so may appear under an `OVER` clause. Names only —
+    /// the factory lives in `host_aggs` either way, and this is what the parser
+    /// consults to decide whether `f(x) OVER (…)` is even grammatical.
+    host_window_aggs: RwLock<std::collections::HashSet<String>>,
     /// Host-registered COLLATING SEQUENCES (`sqlite3_create_collation`,
     /// design/DESIGN-UDF.md stage 3), by NAME — a collation has no arity.
     ///
@@ -563,6 +584,7 @@ impl Database {
             bare_group_by: mpedb_types::BareGroupBy::default(),
             host_udfs: RwLock::new(HashMap::new()),
             host_aggs: RwLock::new(HashMap::new()),
+            host_window_aggs: RwLock::new(std::collections::HashSet::new()),
             host_colls: RwLock::new(HashMap::new()),
             busy_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
             attached: RwLock::new(Default::default()),
@@ -616,6 +638,7 @@ impl Database {
             bare_group_by,
             host_udfs: RwLock::new(HashMap::new()),
             host_aggs: RwLock::new(HashMap::new()),
+            host_window_aggs: RwLock::new(std::collections::HashSet::new()),
             host_colls: RwLock::new(HashMap::new()),
             busy_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
             attached: RwLock::new(Default::default()),
@@ -697,6 +720,32 @@ impl Database {
         self.cache.write().expect(POISON).clear();
     }
 
+    /// Register a host aggregate that ALSO carries sqlite's WINDOW protocol —
+    /// `create_window_function`, i.e. `xValue`/`xInverse` on top of
+    /// `xStep`/`xFinal` (design/DESIGN-UDF.md stage 4).
+    ///
+    /// It is a strictly stronger registration than
+    /// [`register_host_aggregate`]: the state can report a value WITHOUT being
+    /// consumed, and can undo a row it was stepped with. That pair is exactly
+    /// what a moving window frame needs, and it is why only a function
+    /// registered here may take an `OVER` clause — a plain aggregate under a
+    /// bounded frame would otherwise be answered with a running total, which is
+    /// a wrong answer rather than a refusal.
+    ///
+    /// The factory's states MUST override [`HostAggState::inverse`] and
+    /// [`HostAggState::value`]; the trait's defaults refuse, so a registration
+    /// that forgets one fails at the first row rather than silently.
+    pub fn register_host_window_aggregate<F>(&self, name: &str, n_arg: i32, factory: F)
+    where
+        F: Fn() -> Box<dyn mpedb_types::HostAggState> + Send + Sync + 'static,
+    {
+        self.host_window_aggs
+            .write()
+            .expect(POISON)
+            .insert(name.to_string());
+        self.register_host_aggregate(name, n_arg, factory);
+    }
+
     /// Register a host COLLATING SEQUENCE (`sqlite3_create_collation`,
     /// design/DESIGN-UDF.md stage 3): a comparator over two strings, usable as
     /// `ORDER BY <expr> COLLATE <name>`.
@@ -746,6 +795,11 @@ impl Database {
             .expect(POISON)
             .remove(&(name.to_string(), n_arg))
             .is_some();
+        // The window flag is per NAME, so it survives only while some arity of
+        // that name is still registered.
+        if removed && !self.host_aggs.read().expect(POISON).keys().any(|(n, _)| n == name) {
+            self.host_window_aggs.write().expect(POISON).remove(name);
+        }
         if removed {
             self.cache.write().expect(POISON).clear();
         }
@@ -762,6 +816,7 @@ impl Database {
         let c = self.host_colls.read().expect(POISON);
         let mut set = HostUdfSet::with_aggs(f.keys().cloned().collect(), a.keys().cloned().collect());
         set.set_colls(c.keys().cloned().collect());
+        set.set_window_aggs(self.host_window_aggs.read().expect(POISON).iter().cloned().collect());
         set
     }
 

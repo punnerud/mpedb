@@ -16,6 +16,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod auth;
+mod backup;
 mod blob;
 mod consts;
 mod introspect;
@@ -24,6 +25,7 @@ mod udf;
 mod valconv;
 
 pub use auth::{SQLITE_DENY, SQLITE_IGNORE};
+pub use backup::*;
 pub use blob::*;
 pub use consts::*;
 
@@ -121,6 +123,11 @@ pub struct Sqlite3 {
     /// extra compile happens at all.
     auth_cb: *mut c_void,
     auth_ctx: *mut c_void,
+    /// Outstanding `sqlite3_backup_*` handles whose DESTINATION is this
+    /// connection (`backup.rs`). Each is a live `Box<Sqlite3Backup>` holding a
+    /// back-pointer here; `sqlite3_close` refuses while any remain, exactly as
+    /// it does for open blob handles, so that pointer cannot dangle.
+    backups: Vec<*mut backup::Sqlite3Backup>,
 }
 
 /// sqlite 3.45's compile-time limit defaults — both the initial value and the
@@ -930,6 +937,41 @@ fn register_shim_builtins(db: &Database) {
     db.register_host_function("zeroblob", 1, |args: &[Value]| blob::zeroblob_value(args));
 }
 
+/// Is `lower` (already lowercased) the name of something this connection can
+/// CALL — a core scalar or aggregate?
+///
+/// Used ONLY by the `SQLITE_LIMIT_FUNCTION_ARG` gate (`sql::max_function_args`),
+/// where the question is "may I count the parenthesized list after this name as
+/// an argument list?". Being conservative here is free: an unrecognized name is
+/// simply not counted, and mpedb's binder still rejects a call to a function it
+/// does not have. Host registrations are checked separately, against the
+/// connection's own list.
+fn is_callable_name(lower: &str) -> bool {
+    const NAMES: &[&str] = &[
+        // core scalars
+        "abs", "changes", "char", "coalesce", "concat", "concat_ws", "format", "glob", "hex",
+        "iif", "ifnull", "instr", "last_insert_rowid", "length", "like", "likelihood", "likely",
+        "lower", "ltrim", "max", "min", "nullif", "octet_length", "printf", "quote", "random",
+        "randomblob", "replace", "round", "rtrim", "sign", "soundex", "substr", "substring",
+        "trim", "typeof", "unhex", "unicode", "unlikely", "upper", "zeroblob",
+        // date/time
+        "date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff",
+        // json
+        "json", "json_array", "json_array_length", "json_error_position", "json_extract",
+        "json_insert", "json_object", "json_patch", "json_quote", "json_remove", "json_replace",
+        "json_set", "json_type", "json_valid",
+        // math
+        "acos", "asin", "atan", "atan2", "ceil", "ceiling", "cos", "degrees", "exp", "floor",
+        "ln", "log", "log10", "log2", "mod", "pi", "pow", "power", "radians", "sin", "sqrt",
+        "tan", "trunc",
+        // aggregates + window functions
+        "avg", "count", "group_concat", "string_agg", "sum", "total", "cume_dist", "dense_rank",
+        "first_value", "last_value", "lead", "nth_value", "ntile", "percent_rank",
+        "rank", "row_number", "lag",
+    ];
+    NAMES.contains(&lower)
+}
+
 fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_int, String)> {
     // URI/`:memory:` recognition needs text; a non-UTF-8 name is a plain path.
     let filename = raw_name.and_then(|b| std::str::from_utf8(b).ok());
@@ -1047,6 +1089,7 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
         zombie: false,
         auth_cb: ptr::null_mut(),
         auth_ctx: ptr::null_mut(),
+        backups: Vec::new(),
     });
     c.clear_error();
     Ok(c)
@@ -1178,6 +1221,17 @@ pub unsafe extern "C" fn sqlite3_close_v2(db: *mut Sqlite3) -> c_int {
 unsafe fn close_common(db: *mut Sqlite3, v2: bool) -> c_int {
     if db.is_null() {
         return SQLITE_OK;
+    }
+    // An outstanding BACKUP holds a raw back-pointer to this connection and
+    // will write through it, so — unlike a blob handle — there is no zombie
+    // form that would keep it valid. sqlite reports the same BUSY here.
+    if !(*db).backups.is_empty() {
+        (*db).set_error(
+            SQLITE_BUSY,
+            SQLITE_BUSY,
+            "unable to close due to unfinalized statements or unfinished backups",
+        );
+        return SQLITE_BUSY;
     }
     if !(*db).blobs.is_empty() {
         if !v2 {
@@ -1394,6 +1448,28 @@ unsafe fn prepare_common(
     if scan.count > c.limits[SQLITE_LIMIT_VARIABLE_NUMBER as usize].max(0) as usize {
         c.set_error(SQLITE_ERROR, SQLITE_ERROR, "too many SQL variables");
         return SQLITE_ERROR;
+    }
+
+    // SQLITE_LIMIT_FUNCTION_ARG: sqlite refuses at parse when a CALL carries
+    // more arguments than the connection allows, with exactly this message.
+    // The count comes from the text (`sql::max_function_args`), so it is gated
+    // twice over: only below the compile-time default — nobody but a test ever
+    // lowers this — and only for names the connection can actually call.
+    let fn_arg_limit = c.limits[SQLITE_LIMIT_FUNCTION_ARG as usize].max(0) as usize;
+    if fn_arg_limit < DEFAULT_LIMITS[SQLITE_LIMIT_FUNCTION_ARG as usize] as usize {
+        let host: Vec<String> = c.host_fns.iter().map(|h| h.name.to_ascii_lowercase()).collect();
+        if let Some((name, args)) =
+            sql::max_function_args(first_zb, |n| is_callable_name(n) || host.iter().any(|h| h == n))
+        {
+            if args > fn_arg_limit {
+                c.set_error(
+                    SQLITE_ERROR,
+                    SQLITE_ERROR,
+                    &format!("too many arguments on function {name}"),
+                );
+                return SQLITE_ERROR;
+            }
+        }
     }
 
     // The authorizer sees every action this statement performs, BEFORE it is
@@ -2627,6 +2703,11 @@ unsafe fn create_function_impl(
         aggregate: is_agg,
         x_destroy,
         p_app: app,
+        x_func,
+        x_step,
+        x_final,
+        x_value: ptr::null_mut(),
+        x_inverse: ptr::null_mut(),
     });
     SQLITE_OK
 }
@@ -2660,24 +2741,124 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
     create_function_impl(db, name, n_arg, app, x_func, x_step, x_final, x_destroy)
 }
 
+/// `sqlite3_create_window_function(db, name, nArg, enc, pApp, xStep, xFinal,
+/// xValue, xInverse, xDestroy)` — a user-defined WINDOW aggregate
+/// (design/DESIGN-UDF.md stage 4).
+///
+/// This is a strictly stronger registration than `create_function`'s aggregate
+/// form, and that is the whole point: `xValue` reports the CURRENT frame's
+/// result without consuming the aggregate context, and `xInverse` retracts a row
+/// that has left the frame. With both, mpedb's window executor SLIDES the frame
+/// — stepping rows that enter, inverting rows that leave, calling `xValue` once
+/// per row and `xFinal` once per partition, which is the call sequence a
+/// consumer's callbacks are written for.
+///
+/// **Scope, and what is refused by name.** The registration is ONE argument
+/// (`nArg` 1 or the variadic `-1`) — the sliding protocol feeds `xInverse` the
+/// same single row's arguments `xStep` got — and a wider arity is accepted here
+/// but refused at the call site rather than silently mis-fed. `xStep`/`xFinal`
+/// are mandatory; `xValue`/`xInverse` missing makes it a plain aggregate
+/// registration, exactly as sqlite documents, so `OVER` then refuses by name.
+/// All-NULL callbacks DELETE the entry (sqlite's rule, and CPython's
+/// `create_window_function(name, n, None)`).
+///
+/// # Safety
+/// `db` must be a connection this shim opened; the callbacks must match sqlite's
+/// signatures and stay valid until the registration is replaced or the
+/// connection closes.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_window_function(
     db: *mut Sqlite3,
-    _name: *const c_char,
-    _n_arg: c_int,
+    name: *const c_char,
+    n_arg: c_int,
     _enc: c_int,
     app: *mut c_void,
-    _x_step: *mut c_void,
-    _x_final: *mut c_void,
-    _x_value: *mut c_void,
-    _x_inverse: *mut c_void,
+    x_step: *mut c_void,
+    x_final: *mut c_void,
+    x_value: *mut c_void,
+    x_inverse: *mut c_void,
     x_destroy: *mut c_void,
 ) -> c_int {
-    call_destroy(x_destroy, app);
-    if let Some(c) = conn(db) {
-        c.set_error(SQLITE_ERROR, SQLITE_ERROR, "user-defined window functions are not supported");
+    let Some(c) = conn(db) else {
+        call_destroy(x_destroy, app);
+        return SQLITE_MISUSE;
+    };
+    c.clear_error();
+    let Some(raw_name) = c_str_opt(name) else {
+        call_destroy(x_destroy, app);
+        c.set_error(
+            SQLITE_MISUSE,
+            SQLITE_MISUSE,
+            "create_window_function: NULL or non-UTF-8 function name",
+        );
+        return SQLITE_MISUSE;
+    };
+    if !(-1..=127).contains(&n_arg) {
+        call_destroy(x_destroy, app);
+        c.set_error(
+            SQLITE_MISUSE,
+            SQLITE_MISUSE,
+            "create_window_function: nArg must be between -1 and 127",
+        );
+        return SQLITE_MISUSE;
     }
-    SQLITE_ERROR
+    let fname = raw_name.to_ascii_lowercase();
+    let deleting = x_step.is_null() && x_final.is_null() && x_value.is_null() && x_inverse.is_null();
+    if !deleting && (x_step.is_null() || x_final.is_null()) {
+        call_destroy(x_destroy, app);
+        c.set_error(
+            SQLITE_MISUSE,
+            SQLITE_MISUSE,
+            "create_window_function: a window aggregate needs BOTH xStep and xFinal",
+        );
+        return SQLITE_MISUSE;
+    }
+    // A repeat registration REPLACES — run the previous entry's destructor and
+    // clear whichever registry it went into (see `create_function_impl`).
+    if let Some(i) = c
+        .host_fns
+        .iter()
+        .position(|h| h.name == fname && h.n_arg == n_arg)
+    {
+        let old = c.host_fns.remove(i);
+        if old.aggregate {
+            c.db.unregister_host_aggregate(&fname, n_arg);
+        } else {
+            c.db.unregister_host_function(&fname, n_arg);
+        }
+        old.destroy();
+    }
+    if deleting {
+        c.db.unregister_host_function(&fname, n_arg);
+        c.db.unregister_host_aggregate(&fname, n_arg);
+        call_destroy(x_destroy, app);
+        return SQLITE_OK;
+    }
+    let step: udf::XStep = std::mem::transmute(x_step);
+    let fin: udf::XFinal = std::mem::transmute(x_final);
+    let val: Option<udf::XFinal> = (!x_value.is_null()).then(|| std::mem::transmute(x_value));
+    let inv: Option<udf::XStep> = (!x_inverse.is_null()).then(|| std::mem::transmute(x_inverse));
+    let factory = udf::make_window_agg_factory(step, fin, val, inv, app);
+    // Only a COMPLETE window registration goes into the window registry; a
+    // half one is a plain aggregate, which `OVER` then refuses by name.
+    if val.is_some() && inv.is_some() {
+        c.db.register_host_window_aggregate(&fname, n_arg, factory);
+    } else {
+        c.db.register_host_aggregate(&fname, n_arg, factory);
+    }
+    c.host_fns.push(udf::HostFn {
+        name: fname,
+        n_arg,
+        aggregate: true,
+        x_destroy,
+        p_app: app,
+        x_func: ptr::null_mut(),
+        x_step,
+        x_final,
+        x_value,
+        x_inverse,
+    });
+    SQLITE_OK
 }
 
 /// `sqlite3_create_collation_v2(db, name, enc, pArg, xCompare, xDestroy)`
@@ -2746,6 +2927,7 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
         name: cname,
         x_destroy,
         p_app: arg,
+        x_compare,
     });
     if let Some(p) = previous {
         p.destroy();
@@ -2945,43 +3127,8 @@ pub unsafe extern "C" fn sqlite3_value_blob(v: *mut c_void) -> *const c_void {
     }
 }
 
-// ---- online backup (refused — use `mpedb mirror`) -------------------------
-
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_backup_init(
-    dst: *mut Sqlite3,
-    _dst_name: *const c_char,
-    _src: *mut Sqlite3,
-    _src_name: *const c_char,
-) -> *mut c_void {
-    // sqlite's contract: on failure the error code and message are left in the
-    // DESTINATION connection — CPython reads them there; without this it
-    // raised a bare SystemError ("returned NULL without setting an exception").
-    if let Some(c) = conn(dst) {
-        c.set_error(
-            SQLITE_ERROR,
-            SQLITE_ERROR,
-            "online backup is not supported by mpedb (use `mpedb mirror`)",
-        );
-    }
-    ptr::null_mut()
-}
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_backup_step(_b: *mut c_void, _n: c_int) -> c_int {
-    SQLITE_ERROR
-}
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_backup_finish(_b: *mut c_void) -> c_int {
-    SQLITE_OK
-}
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_backup_remaining(_b: *mut c_void) -> c_int {
-    0
-}
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_backup_pagecount(_b: *mut c_void) -> c_int {
-    0
-}
+// ---- online backup: REAL — see `backup.rs` (sqlite3_backup_init/step/
+// finish/remaining/pagecount) ---------------------------------------------
 
 // ---- incremental blob: REAL — see `blob.rs` (sqlite3_blob_open/read/write/
 // bytes/reopen/close + zeroblob/bind_zeroblob) ------------------------------

@@ -569,6 +569,18 @@ impl CompiledPlan {
                         if w.arg.is_none() && is_value {
                             return Err(corrupt("value window function requires an argument"));
                         }
+                        // Format 55: the host window aggregate's NAME and its
+                        // tag must agree in both directions, so a plan can
+                        // neither name a host function it does not call nor
+                        // call one it does not name.
+                        if matches!(w.func, WF::Host) != w.host.is_some() {
+                            return Err(corrupt(
+                                "window host name present without the host tag (or vice versa)",
+                            ));
+                        }
+                        if matches!(w.func, WF::Host) && w.arg.is_none() {
+                            return Err(corrupt("host window aggregate requires an argument"));
+                        }
                         if let WF::NthValue(n) = w.func {
                             if n < 1 {
                                 return Err(corrupt("nth_value n must be a positive integer"));
