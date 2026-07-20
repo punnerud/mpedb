@@ -204,9 +204,13 @@ pub(super) fn exec_aggregate(
     //     so it tracks the minimum PK per group and takes that row. The planner
     //     only emits this shape over a single INTEGER-PK table (`rowid_pick_ok`),
     //     where PK == sqlite's rowid, so the pick matches sqlite EXACTLY.
-    // The planner refuses the ≥2 min/max case (sqlite follows the LAST min/max — an
-    // order-dependent, undocumented pick), so a legitimately compiled plan never
-    // reaches here with it; a forged one falls into the safe min-PK branch below.
+    // In the ≥2 min/max case sqlite follows the LAST min/max — an order-dependent,
+    // undocumented pick the planner refuses, with ONE carve-out: when that last
+    // min/max has a non-NULL CONSTANT argument and no FILTER it only "improves"
+    // on the group's first row, so sqlite's pick IS the lowest-rowid row and the
+    // planner admits it under `rowid_pick_ok`. Such plans land in the min-PK
+    // branch below (`mm` is None for anything but exactly one min/max), which is
+    // exactly the right witness; a forged plan falls into the same safe branch.
     let has_bare = !agg.bare_cols.is_empty();
     // A HOST aggregate is never a min/max: `AggTarget::native()` is None for one,
     // so it can neither govern the witness nor be miscounted here.
