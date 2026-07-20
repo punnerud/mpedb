@@ -599,15 +599,6 @@ fn unrepresentable_constraints_are_refused_by_name() {
             "CREATE TABLE chk (id INTEGER PRIMARY KEY, v TEXT CHECK (glob('a*', v)))",
             "glob",
         ),
-        // `length()` pins its argument to text at compile time and an attached
-        // column is `Any` (a sqlite column can hold any type), so this CHECK
-        // does not compile TODAY — the refusal must say which function and why
-        // rather than hide the table silently.
-        (
-            "lenchk",
-            "CREATE TABLE chk (id INTEGER PRIMARY KEY, v TEXT CHECK (length(v) < 10))",
-            "length",
-        ),
         (
             "dyndefault",
             "CREATE TABLE chk (id INTEGER PRIMARY KEY, t TEXT DEFAULT CURRENT_TIMESTAMP)",
@@ -630,6 +621,23 @@ fn unrepresentable_constraints_are_refused_by_name() {
         assert!(msg.contains("chk"), "must name the table: {msg}");
         assert!(msg.contains(want), "must name the reason ({want}): {msg}");
     }
+    // `length()` over an attached column USED to be on that list: it pins its
+    // argument to text and an attached column is `Any`, which the binder
+    // refused at compile time. A dynamically typed argument now binds and is
+    // checked at the row, so the CHECK compiles and the table attaches — and
+    // the constraint is really enforced, per value.
+    let p = setup("lenchk");
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch("CREATE TABLE chk (id INTEGER PRIMARY KEY, v TEXT CHECK (length(v) < 10))")
+        .unwrap();
+    drop(c);
+    let mut ovl = SqliteOverlay::open(&p).unwrap();
+    ovl.query("INSERT INTO chk (id, v) VALUES (1, 'short')", &[]).unwrap();
+    let err = ovl
+        .query("INSERT INTO chk (id, v) VALUES (2, 'far too long to pass')", &[])
+        .unwrap_err();
+    assert!(format!("{err}").contains("CHECK"), "{err}");
+
     // A LITERAL default is representable and does not trip the refusal.
     let p = setup("litdefault");
     let c = Connection::open(&p).unwrap();
