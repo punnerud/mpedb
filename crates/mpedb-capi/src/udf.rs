@@ -36,7 +36,7 @@ pub fn take_last_udf_error() -> Option<(c_int, String)> {
     LAST_UDF_ERROR.with(|c| c.borrow_mut().take())
 }
 
-fn stash_udf_error(code: c_int, msg: &str) {
+pub(crate) fn stash_udf_error(code: c_int, msg: &str) {
     LAST_UDF_ERROR.with(|c| *c.borrow_mut() = Some((code, msg.to_string())));
 }
 

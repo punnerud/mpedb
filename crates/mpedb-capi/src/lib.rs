@@ -15,12 +15,14 @@
 //! unwinding across the C ABI (which is UB). No `unwrap` touches caller data.
 #![allow(clippy::missing_safety_doc)]
 
+mod blob;
 mod consts;
 mod introspect;
 mod sql;
 mod udf;
 mod valconv;
 
+pub use blob::*;
 pub use consts::*;
 
 use mpedb::{Config, Database, Error as DbError, ExecResult, Value, WriteSession};
@@ -98,6 +100,15 @@ pub struct Sqlite3 {
     /// `file:…?mode=ro` (or an open_v2 READONLY flag without READWRITE/CREATE):
     /// every non-read statement is refused with `SQLITE_READONLY`.
     readonly: bool,
+    /// Open incremental-blob handles (`sqlite3_blob_open`, `blob.rs`). Each
+    /// pointer is a live `Box<Sqlite3Blob>` removed by `sqlite3_blob_close`;
+    /// `sqlite3_close` refuses (`SQLITE_BUSY`) while any remain, so a handle's
+    /// back-pointer to this connection can never dangle.
+    blobs: Vec<*mut blob::Sqlite3Blob>,
+    /// `sqlite3_close_v2` was called while a blob handle was still open: the
+    /// connection is logically closed but kept alive for that handle, and is
+    /// freed by the last `sqlite3_blob_close` (sqlite's zombie connection).
+    zombie: bool,
 }
 
 /// sqlite 3.45's compile-time limit defaults — both the initial value and the
@@ -303,6 +314,11 @@ fn exec_one(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome,
     // here so `-- comment\nINSERT …` (a shape CPython's suite and iterdump
     // scripts use) reaches the engine as the statement it is.
     let sqltext = sql::strip_leading_trivia(sqltext);
+    // `zeroblob(<const>)` → the byte-identical blob literal, so it is accepted
+    // in INSERT-values position where mpedb refuses a function call (blob.rs).
+    // Idempotent: the step path already rewrote at prepare, leaving no call.
+    let rewritten_zb = sql::rewrite_zeroblob(sqltext);
+    let sqltext: &str = &rewritten_zb;
     match sql::classify(sqltext) {
         // PRAGMA and sqlite_master reads are answered by the shim's schema
         // introspection (mpedb has neither); they never reach the engine.
@@ -821,6 +837,11 @@ fn register_shim_builtins(db: &Database) {
     db.register_host_function("sqlite_compileoption_get", 1, |_args: &[Value]| {
         Ok(Value::Null)
     });
+    // `zeroblob(N)`: N zero bytes (sqlite core function; CPython's suite uses
+    // it to seed blob rows). mpedb has no lazy zero-run representation, so the
+    // blob is materialized — semantically identical; `blob::MAX_BLOB_LEN`
+    // guards the allocation with sqlite's own SQLITE_MAX_LENGTH refusal.
+    db.register_host_function("zeroblob", 1, |args: &[Value]| blob::zeroblob_value(args));
 }
 
 fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_int, String)> {
@@ -935,6 +956,8 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
         progress_ctx: ptr::null_mut(),
         limits: DEFAULT_LIMITS,
         readonly,
+        blobs: Vec::new(),
+        zombie: false,
     });
     c.clear_error();
     Ok(c)
@@ -1045,18 +1068,50 @@ unsafe fn open_common(filename: *const c_char, pp_db: *mut *mut Sqlite3, flags: 
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_close(db: *mut Sqlite3) -> c_int {
-    close_common(db)
+    close_common(db, false)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_close_v2(db: *mut Sqlite3) -> c_int {
-    close_common(db)
+    close_common(db, true)
 }
 
-unsafe fn close_common(db: *mut Sqlite3) -> c_int {
+/// Shared close. An open incremental-blob handle holds a back-pointer to the
+/// connection, so the connection cannot be freed under it — which is exactly
+/// the situation sqlite's two closes answer differently (both probed on
+/// 3.45.1):
+///
+/// * `sqlite3_close` → `SQLITE_BUSY`, connection untouched.
+/// * `sqlite3_close_v2` → `SQLITE_OK`, and the connection becomes a **zombie**:
+///   already logically closed, but kept alive so the outstanding blob handle
+///   stays usable; the real free happens when the last handle closes
+///   (`blob::reap_zombie`). This is what GC'd consumers rely on.
+unsafe fn close_common(db: *mut Sqlite3, v2: bool) -> c_int {
     if db.is_null() {
         return SQLITE_OK;
     }
+    if !(*db).blobs.is_empty() {
+        if !v2 {
+            (*db).set_error(
+                SQLITE_BUSY,
+                SQLITE_BUSY,
+                "unable to close due to unfinalized statements or unfinished backups",
+            );
+            return SQLITE_BUSY;
+        }
+        // Zombie: drop the write transaction now (the close is logically
+        // done), then wait for the last blob handle. Blob I/O on a zombie
+        // still reads/writes through the engine, as sqlite's does.
+        (*db).txn = None;
+        (*db).zombie = true;
+        return SQLITE_OK;
+    }
+    free_connection(db);
+    SQLITE_OK
+}
+
+/// Free the connection for real. Only ever called with no blob handles left.
+pub(crate) unsafe fn free_connection(db: *mut Sqlite3) {
     let mut boxed = Box::from_raw(db);
     // Drop any open transaction before the engine (borrow discipline).
     boxed.txn = None;
@@ -1077,7 +1132,6 @@ unsafe fn close_common(db: *mut Sqlite3) -> c_int {
     if remove {
         let _ = std::fs::remove_file(&path);
     }
-    SQLITE_OK
 }
 
 #[no_mangle]
@@ -1224,12 +1278,19 @@ unsafe fn prepare_common(
     // validation to step, exactly like the open-transaction case above.
     let skip_validation = skip_validation || c.db.has_attached_databases();
 
+    // `zeroblob(<const>)` → the equivalent blob literal FIRST, so both the
+    // prepare-time validation below and the stored `exec_sql` see a literal
+    // where mpedb's binder would otherwise refuse the function call (blob.rs).
+    // This never touches parameter tokens, so it composes with `scan_params`.
+    let zb = sql::rewrite_zeroblob(first);
+    let first_zb: &str = &zb;
+
     // Rewrite named/positional parameters to mpedb's numbered `$K` form so the
     // engine — which only speaks `?`/`$N` — sees `:name`/`@name`/`$name`/`?` as
     // the numbered placeholders sqlite assigned them. Everything downstream
     // (validation, execution) uses this rewritten text; the maps answer the
     // `bind_parameter_*` family.
-    let scan = sql::scan_params(first);
+    let scan = sql::scan_params(first_zb);
 
     // SQLITE_LIMIT_VARIABLE_NUMBER: sqlite refuses at parse when a statement
     // uses more parameters than the connection's limit allows, with exactly
@@ -2734,58 +2795,8 @@ pub unsafe extern "C" fn sqlite3_backup_pagecount(_b: *mut c_void) -> c_int {
     0
 }
 
-// ---- incremental blob (refused — maps to mpedb #43 later) -----------------
-
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_blob_open(
-    db: *mut Sqlite3,
-    _dbname: *const c_char,
-    _table: *const c_char,
-    _column: *const c_char,
-    _row: c_longlong,
-    _flags: c_int,
-    pp_blob: *mut *mut c_void,
-) -> c_int {
-    if !pp_blob.is_null() {
-        *pp_blob = ptr::null_mut();
-    }
-    // Set the refusal on the handle: consumers turn the handle's error state
-    // into their exception (CPython raised SystemError without it).
-    if let Some(c) = conn(db) {
-        c.set_error(
-            SQLITE_ERROR,
-            SQLITE_ERROR,
-            "incremental blob I/O is not supported by mpedb (mpedb #43)",
-        );
-    }
-    SQLITE_ERROR
-}
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_blob_close(_b: *mut c_void) -> c_int {
-    SQLITE_OK
-}
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_blob_bytes(_b: *mut c_void) -> c_int {
-    0
-}
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_blob_read(
-    _b: *mut c_void,
-    _out: *mut c_void,
-    _n: c_int,
-    _off: c_int,
-) -> c_int {
-    SQLITE_ERROR
-}
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_blob_write(
-    _b: *mut c_void,
-    _data: *const c_void,
-    _n: c_int,
-    _off: c_int,
-) -> c_int {
-    SQLITE_ERROR
-}
+// ---- incremental blob: REAL — see `blob.rs` (sqlite3_blob_open/read/write/
+// bytes/reopen/close + zeroblob/bind_zeroblob) ------------------------------
 
 // ---- serialize / deserialize (refused) ------------------------------------
 
