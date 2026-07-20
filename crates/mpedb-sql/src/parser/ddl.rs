@@ -780,7 +780,10 @@ impl<'a> Parser<'a> {
                 "INSTEAD OF triggers are not supported (they need updatable views)",
             ));
         } else {
-            return Err(self.err_here("expected BEFORE, AFTER, or INSTEAD OF"));
+            // sqlite's documented default when the timing word is omitted
+            // (`CREATE TRIGGER t UPDATE OF c ON tbl BEGIN … END`), and the
+            // shape CPython's own dump round-trip writes.
+            TriggerTiming::Before
         };
         let event = if self.eat_kw(Kw::Insert) {
             TriggerEvent::Insert
