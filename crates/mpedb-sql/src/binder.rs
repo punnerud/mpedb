@@ -697,6 +697,50 @@ impl<'a> Binder<'a> {
         (self.param_types, self.ctx_keys, self.ctx_list_keys)
     }
 
+    /// The reserved slot carrying the STATEMENT-START instant, as an ISO-8601
+    /// UTC time string — what a literal `'now'` in a date/time function binds
+    /// to (design note: `mpedb_types::expr::datetime`, module header).
+    ///
+    /// It rides the session-context reserved-slot machinery verbatim, under a
+    /// key no `current_setting()` may spell ([`crate::STATEMENT_INSTANT_KEY`],
+    /// refused by name in both context-binding arms). That buys the whole
+    /// mechanism for free — one slot per statement (so every `'now'` in one
+    /// statement agrees), sized into `n_params` by the existing accounting,
+    /// filled once per `execute()` by `resolve_params`, and encoded in the plan
+    /// as nothing more than a key name.
+    ///
+    /// Where session context is not allowed — a CHECK body, an index
+    /// expression, a DEFAULT — neither is `'now'`, and for the same reason: the
+    /// expression is stored as SOURCE and re-evaluated later, so an answer that
+    /// depends on WHEN it ran would silently change under it.
+    fn statement_instant(&mut self) -> Result<BExpr> {
+        if !self.allow_context {
+            return Err(bind_err(
+                "'now' is not allowed in this expression: it binds the statement instant, \
+                 and this expression is stored and re-evaluated later (a CHECK, a DEFAULT \
+                 or an index expression), where a time-dependent answer would silently \
+                 change under it",
+            ));
+        }
+        let key = crate::STATEMENT_INSTANT_KEY;
+        let pos = match self.ctx_keys.iter().position(|k| k == key) {
+            Some(p) => p,
+            None => {
+                let idx = self.n_user_params as usize + self.ctx_keys.len();
+                if idx >= u16::MAX as usize {
+                    return Err(bind_err("too many parameters (including reserved slots)"));
+                }
+                self.ctx_keys.push(key.to_string());
+                // Pinned TEXT: the slot always carries an ISO-8601 time string,
+                // so the planner's "every reserved slot must be type-inferable"
+                // guard is satisfied without any special case.
+                self.param_types.push(Some(ColumnType::Text));
+                self.ctx_keys.len() - 1
+            }
+        };
+        Ok(BExpr::Param(self.n_user_params + pos as u16))
+    }
+
     /// Bind a WHERE predicate: must type to bool (or NULL). A non-boolean is
     /// truthy-tested the way sqlite does — see [`Self::coerce_bool_ctx`].
     pub fn bind_predicate(&mut self, e: &ast::Expr) -> Result<BExpr> {
@@ -1081,6 +1125,12 @@ impl<'a> Binder<'a> {
                 if !self.allow_context {
                     return Err(bind_err("current_setting() is not allowed in this expression"));
                 }
+                if key == crate::STATEMENT_INSTANT_KEY {
+                    return Err(bind_err(format!(
+                        "`{key}` is a reserved slot name (it carries the statement instant \
+                         that a literal 'now' binds to) and cannot be read as a session setting"
+                    )));
+                }
                 // One reserved parameter per distinct key, appended after the
                 // caller params. The value is filled from the session at exec;
                 // the type is inferred exactly like a bare parameter (unified
@@ -1109,6 +1159,12 @@ impl<'a> Binder<'a> {
             ast::Expr::InContext(lhs, key, negated) => {
                 if !self.allow_context {
                     return Err(bind_err("current_setting() is not allowed in this expression"));
+                }
+                if key == crate::STATEMENT_INSTANT_KEY {
+                    return Err(bind_err(format!(
+                        "`{key}` is a reserved slot name (it carries the statement instant \
+                         that a literal 'now' binds to) and cannot be read as a session setting"
+                    )));
                 }
                 let (l, _lt) = self.bind_expr(lhs)?;
                 // The slot holds a LIST, which has no ColumnType — so it can
@@ -2128,6 +2184,13 @@ impl<'a> Binder<'a> {
             // and `strftime(FORMAT, TIME)`.
             "quote" => ScalarFn::Quote,
             "strftime" => ScalarFn::Strftime,
+            // The rest of sqlite's date/time family. All four share
+            // `strftime`'s time-string grammar and its refusals; the only
+            // difference is the fixed output format (and `julianday`'s REAL).
+            "date" => ScalarFn::Date,
+            "time" => ScalarFn::Time,
+            "datetime" => ScalarFn::DateTime,
+            "julianday" => ScalarFn::JulianDay,
             // Math (sqlite 3.45). `log` is base-10 with one argument and
             // log-base-b with two, so it dispatches on the argument count here —
             // `log10`/`log2` name the fixed-base forms directly.
@@ -2188,15 +2251,35 @@ impl<'a> Binder<'a> {
                      ltrim, rtrim, replace, instr, substr, substring, char, unicode, hex, \
                      typeof, abs, round, ceil, floor, trunc, sqrt, pow, sign, exp, ln, log, \
                      log10, log2, sin, cos, tan, asin, acos, atan, atan2, sinh, cosh, tanh, \
-                     radians, degrees, pi, mod, printf, format, quote, strftime, json, \
+                     radians, degrees, pi, mod, printf, format, quote, strftime, date, \
+                     time, datetime, julianday, json, \
                      json_valid, json_type, json_quote, json_array_length, json_extract, \
                      json_array, json_object, json_patch, json_remove, json_replace, \
                      json_set, json_insert, iif, coalesce, ifnull, nullif"
                 )));
             }
         };
+        // Which argument of this function is sqlite's TIMESTRING (the only
+        // position a `'now'` can occupy — every later argument is a modifier,
+        // and modifiers are refused wholesale).
+        let time_arg: Option<usize> = match f {
+            ScalarFn::Strftime => Some(1),
+            ScalarFn::Date | ScalarFn::Time | ScalarFn::DateTime | ScalarFn::JulianDay => Some(0),
+            _ => None,
+        };
         let mut bound = Vec::with_capacity(args.len());
-        for a in args {
+        for (i, a) in args.iter().enumerate() {
+            // A LITERAL `'now'` in the time-value position binds the
+            // STATEMENT-START instant: it is rewritten into the reserved
+            // instant slot, which the facade fills once per execute (sqlite's
+            // `iCurrentTime` rule — one instant per statement, so two `'now'`s
+            // in one statement read the SAME slot and agree). The plan itself
+            // carries only a parameter reference, so a content-hashed plan
+            // shared across processes can never carry a compile-time clock.
+            if time_arg == Some(i) && is_literal_now(a) {
+                bound.push((self.statement_instant()?, Some(ColumnType::Text)));
+                continue;
+            }
             bound.push(self.bind_expr(a)?);
         }
         let argc = u8::try_from(bound.len())
@@ -2279,6 +2362,13 @@ impl<'a> Binder<'a> {
                 &[Some(ColumnType::Text), Some(ColumnType::Text)],
                 Some(ColumnType::Text),
             ),
+            // date/time/datetime(TIMESTRING): text in, text out — same pin, and
+            // for the same reason (the Julian-day NUMBER form is a compile
+            // error, not a per-row surprise). julianday returns sqlite's REAL.
+            ScalarFn::Date | ScalarFn::Time | ScalarFn::DateTime => {
+                (&[Some(ColumnType::Text)], Some(ColumnType::Text))
+            }
+            ScalarFn::JulianDay => (&[Some(ColumnType::Text)], Some(ColumnType::Float64)),
             // char/printf and the scalar max/min are variadic and bound
             // specially above (never reached here); present only so this match
             // stays exhaustive over ScalarFn.
@@ -3046,6 +3136,19 @@ pub(crate) fn declared_collation(key: &ast::Expr, scope: &Scope) -> Collation {
     slot.map(|s| scope.column_collation(s)).unwrap_or(Collation::Binary)
 }
 
+/// Is this argument the LITERAL time string `'now'`?
+///
+/// sqlite's `isDate` compares case-insensitively after skipping leading
+/// whitespace, and its own tokenizer has already stripped the quotes — so
+/// `' NOW '` is `'now'` there and here. Only a bind-time literal qualifies: a
+/// column or parameter whose VALUE happens to be `now` cannot be rewritten into
+/// the statement-instant slot and stays refused at runtime (see
+/// `mpedb_types::expr::datetime`), because resolving it would need a clock read
+/// per row and would drift within one statement.
+fn is_literal_now(e: &ast::Expr) -> bool {
+    matches!(e, ast::Expr::Lit(Value::Text(s)) if s.trim().eq_ignore_ascii_case("now"))
+}
+
 /// Map one of the six comparison `BinOp`s to its collated-instruction kind.
 fn cmp_kind(op: BinOp) -> CmpKind {
     match op {
@@ -3085,8 +3188,24 @@ pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
         // fold path evaluates whole programs and has no business here.
         BExpr::Case(..) => false,
         BExpr::Coalesce(..) => false,
-        // Const-foldable in principle; not worth a special case, and folding
-        // would have to reproduce call_scalar's NULL rules here.
+        // NEVER folded, and one of the two reasons is load-bearing rather than
+        // an economy:
+        //
+        //  1. **Determinism (the gate).** A compiled plan is CONTENT-HASHED and
+        //     published to a registry SHARED ACROSS PROCESSES. Folding a call
+        //     whose arguments carry the statement instant would bake a
+        //     COMPILE-TIME clock reading into plan bytes that every later
+        //     process reuses — a wrong answer that outlives the process that
+        //     made it, in a shared file. [`Binder::statement_instant`] already
+        //     makes that structurally impossible (the instant is a `Param`, and
+        //     a `Param` is not a `Const`, so no `Call` reading it could ever
+        //     satisfy an all-const test), but the rule is stated HERE, at the
+        //     gate, so that a future "fold all-const calls" optimisation has to
+        //     read it before it can be written: **a call is foldable only if
+        //     every argument is a `Const`, which the statement instant can never
+        //     be.**
+        //  2. Economy: folding would have to reproduce `call_scalar`'s NULL
+        //     rules here, which is not worth a special case.
         BExpr::Call(..) => false,
         // Foldable in principle (`2 IN (1,2)` is TRUE), but deliberately not:
         // the fold path evaluates via ExprProgram over a const-only program, and
