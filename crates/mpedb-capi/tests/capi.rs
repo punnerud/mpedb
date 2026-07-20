@@ -2682,3 +2682,94 @@ fn bind_zeroblob_binds_zeros_and_caps() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }
+
+// ===========================================================================
+// `INSERT OR ROLLBACK` — the one conflict action that lives in the SHIM
+// (#112 wave 3, bucket C). mpedb's parser refuses it by name because a
+// statement cannot abort the transaction that contains it; the connection
+// can, so the shim runs the statement as `OR ABORT` and rolls back itself.
+// ===========================================================================
+
+/// The three corners CPython's suite does not reach:
+/// 1. a SUCCESSFUL `OR ROLLBACK` leaves the transaction alone;
+/// 2. a conflicting one discards work done EARLIER in the same transaction;
+/// 3. a NON-constraint failure of the same statement does not roll back —
+///    sqlite's action fires on conflict resolution, not on any error.
+#[test]
+fn insert_or_rollback_aborts_the_transaction_only_on_a_conflict() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT UNIQUE)"), SQLITE_OK);
+
+        // (1) No conflict: the row stands and so does the transaction.
+        assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (id, u) VALUES (1, 'a')"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT OR ROLLBACK INTO t (id, u) VALUES (2, 'b')"), SQLITE_OK);
+        assert_eq!(sqlite3_get_autocommit(db), 0, "still inside the transaction");
+        assert_eq!(exec(db, "COMMIT"), SQLITE_OK);
+        assert_eq!(scalar_count(db, "SELECT count(*) FROM t"), 2);
+
+        // (2) A conflict discards the whole transaction, including the row
+        // inserted by an EARLIER statement in it.
+        assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (id, u) VALUES (3, 'c')"), SQLITE_OK);
+        assert_eq!(
+            exec(db, "INSERT OR ROLLBACK INTO t (id, u) VALUES (4, 'a')"),
+            SQLITE_CONSTRAINT
+        );
+        assert_eq!(sqlite3_get_autocommit(db), 1, "the transaction is gone");
+        // Row 3 never happened; the pre-transaction rows are intact.
+        assert_eq!(scalar_count(db, "SELECT count(*) FROM t"), 2);
+
+        // (3) A type error is not a conflict: the transaction survives it,
+        // exactly as `OR ABORT` would.
+        assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (id, u) VALUES (5, 'e')"), SQLITE_OK);
+        assert_ne!(exec(db, "INSERT OR ROLLBACK INTO t (id, u) VALUES ('x', 'f')"), SQLITE_OK);
+        assert_eq!(sqlite3_get_autocommit(db), 0, "a non-conflict error keeps the transaction");
+        assert_eq!(exec(db, "COMMIT"), SQLITE_OK);
+        assert_eq!(scalar_count(db, "SELECT count(*) FROM t"), 3);
+
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+/// Comments are the parser's business now, at every position — not just the
+/// leading one the shim strips. A `;` or a parameter marker inside a comment
+/// must not be seen by the statement splitter or the bind-parameter scanner
+/// either, and `==` is `=`.
+#[test]
+fn interior_comments_and_eq_alias_reach_the_engine() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)"), SQLITE_OK);
+
+        assert_eq!(scalar_count(db, "SELECT v FROM t WHERE id == 1"), 10);
+        assert_eq!(scalar_count(db, "SELECT v FROM t -- trailing comment"), 10);
+        assert_eq!(scalar_count(db, "SELECT /* inline */ v FROM t WHERE id = 2"), 20);
+        // A `;` inside a comment is not a statement boundary.
+        assert_eq!(scalar_count(db, "SELECT v FROM t WHERE id = 1 -- ; SELECT 99"), 10);
+        // A `?` inside a comment is not a bound parameter.
+        let s = cs("SELECT v FROM t WHERE id = ? /* not a ? here */");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_bind_parameter_count(st), 1);
+        assert_eq!(sqlite3_bind_int(st, 1, 2), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_int64(st, 0), 20);
+        assert_eq!(sqlite3_finalize(st), SQLITE_OK);
+
+        // An unquoted identifier may carry bytes >= 0x80.
+        let s = cs("SELECT 1 AS \u{00ff}");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(
+            CStr::from_ptr(sqlite3_column_name(st, 0)).to_str().unwrap(),
+            "\u{00ff}"
+        );
+        assert_eq!(sqlite3_finalize(st), SQLITE_OK);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}

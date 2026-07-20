@@ -75,14 +75,82 @@ fn insert_or_ignore_keeps_existing_row() {
 fn insert_or_abort_fail_rollback_error_on_conflict() {
     let (db, path) = open();
     db.query("INSERT INTO t (id, v) VALUES (1, 10)", &[]).unwrap();
-    // ABORT/FAIL/ROLLBACK all mean "error on conflict" (mpedb's default).
-    for kw in ["ABORT", "FAIL", "ROLLBACK"] {
+    // ABORT is mpedb's default: the statement errors and undoes itself.
+    // FAIL means the same thing for a SINGLE-row source (there is no earlier
+    // row of this statement to keep), which is the only shape it is accepted in.
+    for kw in ["ABORT", "FAIL"] {
         assert!(
             db.query(&format!("INSERT OR {kw} INTO t (id, v) VALUES (1, 99)"), &[]).is_err(),
             "OR {kw} must error on a PK conflict"
         );
     }
     assert_eq!(scalar_i64(&db, "SELECT v FROM t WHERE id = 1"), 10);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The two conflict actions mpedb cannot express refuse BY NAME rather than
+/// being accepted as "error on conflict", which is what they used to do:
+///
+/// * `OR ROLLBACK` must abort the enclosing TRANSACTION, which a statement
+///   cannot reach (the C-API shim, which owns the connection, implements it).
+/// * `OR FAIL` over a MULTI-row source must keep the rows inserted before the
+///   conflicting one. mpedb statements are atomic, so it would silently undo
+///   them — a wrong answer, not a missing feature.
+#[test]
+fn unexpressible_conflict_actions_refuse_by_name() {
+    let (db, path) = open();
+    db.query("INSERT INTO t (id, v) VALUES (1, 10)", &[]).unwrap();
+
+    let e = db.query("INSERT OR ROLLBACK INTO t (id, v) VALUES (2, 20)", &[]).unwrap_err();
+    let msg = e.to_string();
+    assert!(msg.contains("OR ROLLBACK"), "{msg}");
+    assert!(msg.contains("cannot abort the transaction"), "{msg}");
+
+    // Multi-row VALUES and INSERT … SELECT are both multi-row sources.
+    for sql in [
+        "INSERT OR FAIL INTO t (id, v) VALUES (2, 20), (1, 99)",
+        "INSERT OR FAIL INTO t (id, v) SELECT id + 5, v FROM t",
+    ] {
+        let msg = db.query(sql, &[]).unwrap_err().to_string();
+        assert!(msg.contains("multi-row source"), "{sql}: {msg}");
+    }
+    // …and neither refusal wrote anything.
+    assert_eq!(scalar_i64(&db, "SELECT count(*) FROM t"), 1);
+
+    // A bare typo still names the four actions that ARE accepted.
+    let msg = db.query("INSERT OR NOPE INTO t (id, v) VALUES (2, 20)", &[]).unwrap_err().to_string();
+    assert!(msg.contains("expected IGNORE, REPLACE, ABORT, or FAIL"), "{msg}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// sqlite's per-constraint `ON CONFLICT <action>` clause. `ABORT` names
+/// mpedb's own behaviour and is accepted and dropped; the other four would
+/// change how a conflicting statement resolves and mpedb's schema carries no
+/// per-constraint action, so they refuse by name at CREATE TABLE instead of
+/// being parsed and ignored.
+#[test]
+fn constraint_conflict_clause_accepts_abort_and_refuses_the_rest() {
+    let (db, path) = open();
+    db.query("CREATE TABLE ok1 (x INTEGER, UNIQUE (x) ON CONFLICT ABORT)", &[]).unwrap();
+    db.query("CREATE TABLE ok2 (x INTEGER NOT NULL ON CONFLICT ABORT)", &[]).unwrap();
+    db.query("CREATE TABLE ok3 (x INTEGER PRIMARY KEY ON CONFLICT ABORT)", &[]).unwrap();
+    // The accepted clause really is inert: the constraint still fires.
+    db.query("INSERT INTO ok1 (x) VALUES (1)", &[]).unwrap();
+    assert!(db.query("INSERT INTO ok1 (x) VALUES (1)", &[]).is_err());
+
+    for (n, ddl) in [
+        "CREATE TABLE bad1 (x INTEGER, UNIQUE (x) ON CONFLICT ROLLBACK)",
+        "CREATE TABLE bad2 (x INTEGER UNIQUE ON CONFLICT IGNORE)",
+        "CREATE TABLE bad3 (x INTEGER NOT NULL ON CONFLICT REPLACE)",
+        "CREATE TABLE bad4 (x INTEGER PRIMARY KEY ON CONFLICT FAIL)",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let msg = db.query(ddl, &[]).unwrap_err().to_string();
+        assert!(msg.contains("ON CONFLICT"), "{n}: {msg}");
+        assert!(msg.contains("is not supported"), "{n}: {msg}");
+    }
     let _ = std::fs::remove_file(&path);
 }
 
