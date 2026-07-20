@@ -1,5 +1,15 @@
 use super::*;
 
+/// A/B escape hatch for #111: restore the historical one-msync-per-contiguous-
+/// run data barrier in `durability = commit`. Both arms therefore live in one
+/// binary, which is what BENCHMARKS.md's paired-arm method requires (two builds
+/// have been the source of at least one false A/B here already).
+fn msync_per_run() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("MPEDB_MSYNC_PER_RUN").is_ok());
+    *ON
+}
+
 impl<'e> WriteTxn<'e> {
     // ---------- commit / abort ----------
 
@@ -158,34 +168,77 @@ impl<'e> WriteTxn<'e> {
                 // covered by the same single barrier below. On Linux the
                 // barrier is a no-op and these range-msyncs ARE the pre-flip
                 // durability (DESIGN-BLOBEXTENT §4, review finding 1).
-                for &(start, npages) in &self.extent_dirty {
-                    self.eng.shm.msync_range_nobarrier(
-                        start as usize * PAGE_SIZE,
-                        npages as usize * PAGE_SIZE,
-                    )?;
-                }
-                let mut ids: Vec<u64> = self.dirty.iter().copied().collect();
-                ids.sort_unstable();
-                let mut i = 0;
-                while i < ids.len() {
-                    let start = ids[i];
-                    let mut end = start;
-                    while i + 1 < ids.len() && ids[i + 1] == end + 1 {
-                        i += 1;
-                        end = ids[i];
+                // ONE range-msync over the whole dirty SPAN, not one per
+                // contiguous run (#111). Both make exactly the same pages
+                // durable; the difference is the number of syscalls, and on
+                // Linux `msync(MS_SYNC)` IS `vfs_fsync_range` — every call ends
+                // in a jbd2/XFS-log commit plus a device cache flush. #41 took
+                // the *barrier* out of the per-run loop, which fixed macOS
+                // (where msync is cheap and `F_FULLFSYNC` is the flush) and did
+                // nothing at all for Linux (where `sync_barrier` compiles away
+                // and each run-msync is still a full flush). Measured on this
+                // host: an autocommit insert batch dirties ~3.7 pages in ~2.8
+                // RUNS, so `commit` paid ~3.8 device flushes where §4.1's floor
+                // is 2 (data, then meta).
+                //
+                // Widening the range costs nothing: writeback is driven by the
+                // page cache's DIRTY tag, so a span walks dirty pages, not
+                // pages. Measured (8 pages scattered over 32 MiB vs over
+                // 400 KiB): no difference beyond noise. What the span may sweep
+                // in that the run loop would not is (a) COW pages of an ABORTED
+                // txn — unreferenced garbage, harmless to write, and (b)
+                // nothing else: the writer lock is exclusive, readers never
+                // dirty pages, and the meta/lock/reader pages sit BELOW every
+                // data page id so the span can never reach them.
+                //
+                // Extent payload was pwritten, never mapped-stored, so it is
+                // NOT in `dirty` — its ranges are folded into the same span,
+                // in the same ordering class, covered by the same barrier
+                // (DESIGN-BLOBEXTENT §4, review finding 1).
+                //
+                // `MPEDB_MSYNC_PER_RUN=1` restores the historical per-run loop
+                // so both arms live in ONE binary for A/B measurement.
+                if msync_per_run() {
+                    for &(start, npages) in &self.extent_dirty {
+                        self.eng.shm.msync_range_nobarrier(
+                            start as usize * PAGE_SIZE,
+                            npages as usize * PAGE_SIZE,
+                        )?;
                     }
-                    // NO barrier per run: `F_FULLFSYNC` is per-fd, and every
-                    // run here is data, i.e. the same ordering class. One
-                    // barrier below covers them all. Barriering each run cost a
-                    // platter flush per CONTIGUOUS RUN — the sequential-insert
-                    // benchmark has one run and never showed it, but a random
-                    // update scatters the btree path and the freelist path, so
-                    // N=3-5 and this was 4-6 flushes per commit (#41).
-                    self.eng.shm.msync_range_nobarrier(
-                        start as usize * PAGE_SIZE,
-                        (end - start + 1) as usize * PAGE_SIZE,
-                    )?;
-                    i += 1;
+                    let mut ids: Vec<u64> = self.dirty.iter().copied().collect();
+                    ids.sort_unstable();
+                    let mut i = 0;
+                    while i < ids.len() {
+                        let start = ids[i];
+                        let mut end = start;
+                        while i + 1 < ids.len() && ids[i + 1] == end + 1 {
+                            i += 1;
+                            end = ids[i];
+                        }
+                        self.eng.shm.msync_range_nobarrier(
+                            start as usize * PAGE_SIZE,
+                            (end - start + 1) as usize * PAGE_SIZE,
+                        )?;
+                        i += 1;
+                    }
+                } else {
+                    let mut lo = u64::MAX;
+                    let mut hi = 0u64;
+                    for &(start, npages) in &self.extent_dirty {
+                        lo = lo.min(start);
+                        hi = hi.max(start + u64::from(npages.saturating_sub(1)));
+                    }
+                    for &id in &self.dirty {
+                        lo = lo.min(id);
+                        hi = hi.max(id);
+                    }
+                    if lo != u64::MAX {
+                        debug_assert!(lo >= 2, "dirty span must never reach the meta pages (0/1)");
+                        self.eng.shm.msync_range_nobarrier(
+                            lo as usize * PAGE_SIZE,
+                            (hi - lo + 1) as usize * PAGE_SIZE,
+                        )?;
+                    }
                 }
                 // ⚠ ORDERING: this barrier is what makes the data durable BEFORE
                 // the meta that will reference it (design/DESIGN.md §4.1). It cannot be
