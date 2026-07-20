@@ -22,6 +22,7 @@ mod sql;
 mod udf;
 mod valconv;
 
+pub use blob::*;
 pub use consts::*;
 
 use mpedb::{Config, Database, Error as DbError, ExecResult, Value, WriteSession};
