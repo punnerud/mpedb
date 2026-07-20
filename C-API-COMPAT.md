@@ -19,10 +19,11 @@ sqlite's C reference lists ~300 functions and ~250 constants. This shim exports
 the **~50 the drop-in consumer path actually calls** — Python's `sqlite3`, language
 bindings, common tools — validated end-to-end by a DB-API 2.0 battery that matches
 stock sqlite **23/23**, and measured against **CPython's own `test_sqlite3`
-suite** (the authoritative consumer test of that surface: 344 of the 461
-tests stock passes — see the section at the end; the suite hammers contract
-details — destructor rules, trace, limits, error codes — that "the ~50
-functions exist" does not capture, so it is the scope's honest yardstick).
+suite** (the authoritative consumer test of that surface: 450 of the 467
+tests stock passes, at HEAD on the M3 — see the section at the end; the suite
+hammers contract details — destructor rules, trace, limits, error codes — that
+"the ~50 functions exist" does not capture, so it is the scope's honest
+yardstick).
 It does *not* enumerate every symbol, because most are
 deliberate non-goals for an in-process, rigid-schema engine (each a clean refusal
 or safe no-op, never a wrong answer):
@@ -2165,11 +2166,12 @@ parameter and the statement fails with a binding-count error. Django's
 shape (`crafted_alia$.id`) does not hit it.
 
 
-> **Reading order note.** The consolidated M3 run below measured `b41b713`, which is
-> BEFORE E3(b) landed (`85b82da`). So its Django figure of 824/831 does not include
-> E3(b)'s +2 (`test_lefthand_power`/`test_righthand_power`) nor its CPython 435→445.
-> Do not read the two sections as one timeline: the M3 run is the last measurement on a
-> single commit, and E3(b) is the change that landed after it.
+> **Reading order note — SUPERSEDED.** The two sections that follow were measured at
+> *different* commits (the consolidated run 7 at `b41b713`; E3(b)'s before/after pair on
+> the Linux box against a control build of that same commit). Both are kept as history.
+> **The current headline is "AT HEAD — both suites, one machine, one commit" at the end
+> of this file**: `03ff5ea` on the Apple M3, Django **826/831** and CPython **450/474**,
+> which is run 7 + E3(b)'s deltas and nothing else.
 
 ## The consolidated measurement — Django run 7 + CPython, ONE commit (2026-07-20)
 
@@ -2540,3 +2542,169 @@ either side). Rounding the parameter to satisfy the slot is precisely the wrong
 answer `coerce_params` refuses by name today, and an index probe on a rounded
 bound would return the wrong rows. Left refused; it needs mixed-class
 comparison, not this change.
+
+## AT HEAD — both suites, one machine, one commit (2026-07-20)
+
+**This is the current headline.** The two sections above were taken at
+*different* commits — run 7 at `b41b713`, E3(b)'s before/after on the Linux box
+against a control build of that same commit — and nothing had ever been measured
+at `main`'s head. This run closes that: **one machine, one commit, both suites,
+both arms.**
+
+**Commit: `03ff5ea`** (`main`; `b41b713` + E3(b) + docs/tests/build-config).
+**Machine: Apple M3 Pro, macOS 26.6, arm64.** Release build
+(`cargo build --release -p mpedb-capi`, 13.9 s, no `RUSTC_WRAPPER` workaround
+needed — `4a8dde2` made sccache opt-in).
+**Interpreter: Homebrew CPython 3.12.12** for both suites (the Django venv is
+built on it), so the CPython denominator is the M3's own **474 tests / 7 skips**,
+not the fetched 3.12.3 tarball's 466/5.
+**Baseline: libsqlite3 3.53.1.** Django `5.2.17.dev20260714173342` @ `3e389b7`,
+`--parallel=1`, the frozen G1/G2 labels, the same workbench backend in both arms,
+stale `memorydb_*` deleted per arm.
+
+**The result is exactly run 7 + E3(b)'s deltas, and nothing else.** Every other
+commit in `b41b713..HEAD` is docs, tests, the `footprint_index` measurement
+example, or the build-config fix; every failing test id outside E3(b)'s reach is
+identical to run 7's, one for one.
+
+### Interposition proof — the shim really answered
+
+`run_suite.sh`'s self-check runs through the **same** wrapper chain as the
+measurement (`run_capped` + `arm_prefix` + `env DYLD_LIBRARY_PATH=… python`) and
+refuses to measure otherwise; the CPython arms were launched through the same
+`/usr/bin/env DYLD_LIBRARY_PATH=… python3.12` form and re-verified the same way:
+
+```
+interposition: stock=3.53.1 shim=3.45.0        (Django, both invocations)
+stock: 3.53.1   shim : 3.45.0                  (CPython, same chain)
+```
+
+Corroborated by the content of the logs: the shim arm's failures carry mpedb's
+own wording (`bind error: cannot compare with IN list: text and int64`,
+`type mismatch: parameter $1 is float64, statement requires int64`), which no
+libsqlite3 can emit. A shim arm that scores identically to stock is a broken
+harness, not a better engine — see the `DYLD_*`-stripping trap recorded below.
+
+### Django — stock vs shim at `03ff5ea`
+
+| label set | tests | stock | shim: FAIL / ERROR | shim score |
+|---|---|---|---|---|
+| G1 `basic lookup transactions ordering update delete` | 392 | OK (17 skipped) | 0 / 2 | 390 |
+| G2 `aggregation annotations expressions` | 439 | OK (5 skipped, 1 xfail) | 0 / 3 | 436 |
+| **A = G1+G2 (frozen)** | **831** | **831 / 831** | **0 / 5** | **826 / 831 (99.4 %)** |
+| B `queries` | 493 | OK (15 skipped, 2 xfail) | 0 / 5 | **488 / 493 (99.0 %)** |
+| C `backends` | 324 | 3F / 2E (Django's own sqlite expectations) | 5F / 11E — 16 outcomes, **10 unique** | **314 / 324** unique-rule (308 outcome-rule) |
+| E `model_fields` | 528 | OK (58 skipped) | 1F / 13E — 14 outcomes, **3 unique** | **514 / 528** outcome-rule (525 unique-rule) |
+
+* Comparable set (A + B + C, 1,648): **1,628**, vs run 7's 1,626 — **+2**, **98.8 %**.
+* Including `model_fields`: **2,136 / 2,176 by the outcome rule (98.2 %)**,
+  **2,153 / 2,176 by the unique-test rule (98.9 %)**.
+* **Wrong answers in the SQL surface: 0.**
+
+### ⚠️ The FAIL list, in full — still the 3 deliberate positions
+
+Django's shim arm produces **five** FAIL outcomes in `backends` and one in
+`model_fields`, but three of the five are **stock's too** (`test_autoincrement`,
+`test_sql_flush_allow_cascade`, `test_sql_flush_sequences_allow_cascade` — Django
+asserting its own sqlite backend's AUTOINCREMENT/sequence behaviour). The
+**shim-only** FAILs are exactly the three deliberate honesty positions, unchanged
+since run 3:
+
+| test | label | why it is deliberate |
+|---|---|---|
+| `SchemaTests.test_constraint_checks_disabled_atomic_allowed` | `backends` | D11 — `PRAGMA foreign_keys` is not honored |
+| `SchemaTests.test_disable_constraint_checking_failure_disallowed` | `backends` | D11, same position |
+| `TestAsPrimaryKeyTransactionTests.test_unsaved_fk` | `model_fields` | mpedb parses `REFERENCES` and discards it, so no FK violation is raised |
+
+Everything else across A + B + C + E is an **ERROR — a refusal**, never a wrong
+answer.
+
+### The 5 remaining A-errors, and the 5 in `queries`
+
+| error | tests |
+|---|---|
+| `parameter $N is float64, statement requires int64 (not an exact integer)` | `test_annotate_greater_than_or_equal_float`, `test_annotate_less_than_float` |
+| `a correlated subquery in an aggregate query is only supported where it is evaluated PER ROW` | `test_aggregation_subquery_annotation` |
+| `a CORRELATED subquery in HAVING is not supported yet` | `test_annotation_filter_with_subquery` |
+| `cannot compare with IN list: text and int64` | `test_expressions_not_introduce_sql_injection_via_untrusted_string_inclusion` |
+| `a derived table with a non-flattenable body is only supported in a statement's outermost FROM` | `test_qs_with_subcompound_qs`, `test_union_nested`, `test_distinct_ordered_sliced_subquery`, `test_distinct_ordered_sliced_subquery_aggregation` |
+| `INSERT values must be literals or parameters` | `test_bulk_insert` |
+
+Run 7's `cannot assign float64 to column of type int64` row is **gone** —
+that was `test_lefthand_power` / `test_righthand_power`, closed by E3(b).
+`backends`' 5 shim-only unique tests are unchanged: `test_get_primary_key_column`
+(7 outcomes) + `_pk_constraint` (DDL-in-SAVEPOINT), `test_init_command` (D10),
+and the D11 pair. `model_fields`' 3 are unchanged: `test_lookups_special_chars`
+(12 outcomes, the JSON-path-with-backslash refusal), `test_none_key_exclude`,
+`test_unsaved_fk`.
+
+### CPython `test_sqlite3` at the same commit
+
+| arm | run | pass | FAIL | ERROR | skip |
+|---|---|---|---|---|---|
+| stock libsqlite3 3.53.1 | 474 | **467** | 0 | 0 | 7 |
+| **shim @ `03ff5ea`** | 474 | **450** | **6** | **11** | 7 |
+| shim @ `b41b713` (run 7, same interpreter) | 474 | 440 | 6 | 21 | 7 |
+
+**450 / 467 = 96.4 %** of the baseline-passing suite. The 6 FAILs are **the same
+six test ids as run 7** (`test_backup.test_progress`,
+`test_dbapi.SerializeTests.test_deserialize_corrupt_database`,
+`test_dump.test_dump_custom_row_factory`,
+`test_hooks.TraceCallbackTests.test_trace_too_much_expanded_sql`,
+`test_transactions.AutocommitAttribute.test_autocommit_compat_ctx_mgr`,
+`test_userfunctions.FunctionTests.test_func_deterministic`), each already reduced
+above to a refusal or a metadata-text divergence — **none is a wrong SQL answer.**
+
+The 11 surviving ERRORs are run 7's 21 minus exactly the 10 E3(b) closed
+(verified test id by test id — all 10 now PASS):
+
+`test_backup.test_database_source_name` (`unknown database temp`),
+`test_backup.test_modifying_progress` (restart semantics),
+`test_dbapi.ConnectionTests.test_connection_config`,
+`test_dbapi.SerializeTests.test_serialize_deserialize`,
+`test_dump.test_dump_autoincrement`, `test_dump_autoincrement_create_new_db`,
+`test_dump.test_dump_virtual_tables` (fts4), `test_dump.test_table_dump`
+(`CREATE/DROP VIEW`), `test_regression.test_error_msg_decode_error` (the
+structural non-UTF-8 `||` deviation), `test_regression.test_on_conflict_rollback`,
+`test_types.CommonTableExpressionTests.test_cursor_description_cte_simple`.
+
+**The whole `timestamp`/`blob`/`text` parameter-class family is gone** — that was
+E3(b)'s 9-of-21, and it is the largest single class this suite has ever lost.
+
+### Every delta vs run 7, attributed
+
+| delta | attribution |
+|---|---|
+| Django A 824 → **826** (`test_lefthand_power`, `test_righthand_power`) | #113 E3(b), `b103cd7` — a DDL-declared `int` column applies sqlite's store affinity |
+| CPython 440 → **450**, ERROR 21 → 11 | the same change (`2352eea` + `b103cd7`); the 10 ids are E3(b)'s documented list |
+| `queries`, `backends`, `model_fields`, all stock arms | **byte-identical failing sets** to run 7 |
+
+Nothing else moved. E3(b)'s Linux-measured `+2` / `+10` reproduce **exactly** on
+Apple Silicon, and its Linux CPython figure (435 → 445 on 3.12.3's 466) is the
+same delta this run sees on 3.12.12's 474 (440 → 450) — the denominators differ,
+the change does not.
+
+### Two arm-asymmetric SKIPS, recorded for honesty
+
+Previously unrecorded, and **not** new at this commit (both causes are unchanged
+across the range). They do not affect the scores above, which are `ran − failed`,
+but they mean four-plus tests the stock arm *passes* are not actually exercised
+under the shim:
+
+* **`backends`, 4 tests** (`FkConstraintsTests`, 124 → 128 skips). The tests try
+  to violate a FK and `self.skipTest("This backend does not support integrity
+  checks.")` when no `IntegrityError` arrives. mpedb enforces no FK — the same
+  deliberate position as `test_unsaved_fk` — so they self-skip.
+* **`model_fields`, 1 test** (`test_lookups_special_chars_double_quotes`,
+  58 → 59 skips). Django skips it when `sqlite_version_info < (3, 47)`; the shim
+  reports **3.45.0**, so it is skipped rather than run.
+
+### Reproduction
+
+```
+WB_DJANGO=…/django WB_PY=…/venv/bin/python \
+  crates/mpedb-capi/workbench/djsuite/run_suite.sh                       # A (G1+G2)
+WB_GROUP_BASE=3 WB_LABEL_GROUPS=$'queries\nbackends\nmodel_fields' … run_suite.sh
+/usr/bin/env DYLD_LIBRARY_PATH=$WB_OUT/shim python3.12 -m test test_sqlite3 \
+  --junit-xml=shim.xml                                                   # CPython
+```
