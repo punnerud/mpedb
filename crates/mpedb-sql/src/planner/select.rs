@@ -285,6 +285,24 @@ pub(super) fn plan_select<'s>(
     // FullScan-only). `None` for every ordinary statement.
     cte: Option<CteRef<'s>>,
 ) -> Result<PlannedStmt> {
+    // A derived table the view-inline pass could not flatten is MATERIALIZED —
+    // but only at the top level (`plan_derived_select` intercepts it there). One
+    // surviving to THIS planner sits in a nested position; refuse it by name,
+    // never silently drop the source.
+    //
+    // FIRST, before any rewrite, and that is load-bearing: the RIGHT-join
+    // rewrite and the subquery lift both REBUILD the statement and cannot carry
+    // a `from_derived` through. Checked after either, a nested derived table in
+    // a select that also has a subquery lost its FROM source and fell through to
+    // the FROM-less DUAL path — one synthetic row instead of the body's rows, a
+    // WRONG ANSWER rather than a refusal.
+    if s.from_derived.is_some() {
+        return Err(bind_err(
+            "a derived table `FROM (SELECT …)` with a non-flattenable body is only \
+             supported in a statement's outermost FROM — not in a compound arm, a \
+             subquery body, an INSERT … SELECT source, or a recursive CTE component",
+        ));
+    }
     // RIGHT rewrites to a swapped LEFT before anything else looks at the
     // statement — the subquery lift's correlation scope and every stage
     // below must see the FINAL table order.
@@ -313,17 +331,6 @@ pub(super) fn plan_select<'s>(
     let eff_params = n_params + subplans.len() as u16;
     let correlated: Vec<bool> = subplans.iter().map(|p| !p.outer_args.is_empty()).collect();
 
-    // A derived table the view-inline pass could not flatten is MATERIALIZED —
-    // but only at the top level (`plan_derived_select` intercepts it there). One
-    // surviving to THIS planner sits in a nested position; refuse it by name,
-    // never silently drop the source.
-    if s.from_derived.is_some() {
-        return Err(bind_err(
-            "a derived table `FROM (SELECT …)` with a non-flattenable body is only \
-             supported in a statement's outermost FROM — not in a compound arm, a \
-             subquery body, an INSERT … SELECT source, or a recursive CTE component",
-        ));
-    }
     let (table_id, table) = match &s.table {
         Some(name) => resolve_table_cte(schema, cte, name)?,
         // FROM-less: the DUAL sentinel and a zero-column def. The whole plain

@@ -53,17 +53,19 @@ pub(super) fn plan_derived_select(
     };
     // The body OWNS its lifts (design/DESIGN-DERIVED-TABLES.md §5.5): they
     // correlate to the BODY's row, are filled while the body materialises, and
-    // the outer never sees them. A COMPOUND body is the one exception — its
-    // arms are executed as a unit with no per-row fill phase, exactly like a
-    // compound subquery body, so a lift there stays refused rather than
-    // reading an unfilled slot.
-    if !b_subs.is_empty() && body.as_select().is_none() {
-        return Err(bind_err(format!(
-            "derived table \"{name}\": a subquery inside a compound derived-table body is \
-             not supported yet"
-        )));
-    }
+    // the outer never sees them. A COMPOUND body owns them one level further
+    // down — per ARM (§5.6/format 56) — so `plan_compound` hands back an empty
+    // list there and the arms carry the lifts themselves. Either way the
+    // reserved region starts at `n_params`.
+    debug_assert!(b_subs.is_empty() || body.as_select().is_some());
     let body_sub_base = n_params;
+    // Reserved slots the BODY owns: its own lifts, or — for a compound body —
+    // its arms'.
+    let n_body_slots = b_subs.len() as u16
+        + match &body {
+            SubBody::Compound(c) => c.n_arm_slots(),
+            SubBody::Select(_) => 0,
+        };
 
     // 2. The synthetic working-table def: the body's output columns. Types come
     //    from the body's inferred output types; an output the body leaves
@@ -135,7 +137,7 @@ pub(super) fn plan_derived_select(
     //    outer's spans only the user prefix, and unifying pins the reserved
     //    slot types the body inferred.
     let n_total = n_params
-        .checked_add(b_subs.len() as u16)
+        .checked_add(n_body_slots)
         .ok_or_else(|| bind_err("too many parameters (including reserved slots)"))?;
     let param_types = unify_param_types(n_total, &[&b_ptypes, &o_ptypes])?;
     let plan = PlanStmt::Derived(crate::plan::DerivedPlan {

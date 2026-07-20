@@ -143,7 +143,12 @@ impl CompiledPlan {
             subplans.push(decode_subplan(bytes, &mut pos, &mut budget)?);
         }
         let footprint = Footprint::decode(bytes, &mut pos)?;
-        let stmt = decode_stmt(bytes, &mut pos)?;
+        // ONE tree budget for the WHOLE plan: statement-level lifts, a derived
+        // body's owned lifts (format 52) and a compound's arm-owned lifts
+        // (format 56) all draw from it, so moving lifts from the statement list
+        // onto a component can never buy a bigger forest than the flat format
+        // allowed.
+        let stmt = decode_stmt(bytes, &mut pos, &mut budget)?;
         if pos != bytes.len() {
             return Err(corrupt("trailing bytes in plan"));
         }
@@ -196,7 +201,7 @@ fn decode_subplan(buf: &[u8], pos: &mut usize, budget: &mut usize) -> Result<Sub
     // The body-discriminant byte (format 31): a plain SELECT or a whole compound.
     let body = match r_u8(buf, pos)? {
         SUBBODY_SELECT => SubBody::Select(decode_select(buf, pos)?),
-        SUBBODY_COMPOUND => SubBody::Compound(decode_compound(buf, pos)?),
+        SUBBODY_COMPOUND => SubBody::Compound(decode_compound(buf, pos, budget)?),
         t => return Err(corrupt(format!("bad subplan body tag {t}"))),
     };
     let n_children = r_u8(buf, pos)? as usize;
@@ -442,10 +447,10 @@ fn decode_on_conflict(buf: &[u8], pos: &mut usize) -> Result<PlanOnConflict> {
     })
 }
 
-fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
+fn decode_stmt(buf: &[u8], pos: &mut usize, budget: &mut usize) -> Result<PlanStmt> {
     match r_u8(buf, pos)? {
         STMT_SELECT => Ok(PlanStmt::Select(decode_select(buf, pos)?)),
-        STMT_COMPOUND => Ok(PlanStmt::Compound(decode_compound(buf, pos)?)),
+        STMT_COMPOUND => Ok(PlanStmt::Compound(decode_compound(buf, pos, budget)?)),
         STMT_RECURSIVE_CTE => {
             let name = r_str(buf, pos)?;
             let n_cols = r_u16(buf, pos)? as usize;
@@ -503,7 +508,7 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
             // outer statement (the mirror of the encoder).
             let body = match r_u8(buf, pos)? {
                 SUBBODY_SELECT => SubBody::Select(decode_select(buf, pos)?),
-                SUBBODY_COMPOUND => SubBody::Compound(decode_compound(buf, pos)?),
+                SUBBODY_COMPOUND => SubBody::Compound(decode_compound(buf, pos, budget)?),
                 t => return Err(corrupt(format!("bad derived-table body tag {t}"))),
             };
             let outer = decode_select(buf, pos)?;
@@ -516,10 +521,9 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
             if n_body_sub > MAX_SUBPLANS {
                 return Err(corrupt("too many derived-table body subplans"));
             }
-            let mut budget = MAX_SUBPLANS;
             let mut body_subplans = Vec::with_capacity(n_body_sub.min(MAX_SUBPLANS));
             for _ in 0..n_body_sub {
-                body_subplans.push(decode_subplan(buf, pos, &mut budget)?);
+                body_subplans.push(decode_subplan(buf, pos, budget)?);
             }
             Ok(PlanStmt::Derived(DerivedPlan {
                 name,
@@ -538,7 +542,7 @@ fn decode_stmt(buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
 /// A compound `SELECT … UNION/EXCEPT/INTERSECT …` body — the exact mirror of
 /// `encode_compound`, shared between a top-level compound statement and a
 /// compound subquery body (format 31).
-fn decode_compound(buf: &[u8], pos: &mut usize) -> Result<CompoundPlan> {
+fn decode_compound(buf: &[u8], pos: &mut usize, budget: &mut usize) -> Result<CompoundPlan> {
     let n_arms = r_u8(buf, pos)? as usize;
     if !(2..=MAX_COMPOUND_ARMS).contains(&n_arms) {
         return Err(corrupt("compound arm count out of range"));
@@ -566,7 +570,27 @@ fn decode_compound(buf: &[u8], pos: &mut usize) -> Result<CompoundPlan> {
     }
     let limit = decode_opt_u64(buf, pos)?;
     let offset = decode_opt_u64(buf, pos)?;
-    Ok(CompoundPlan { arms, ops, order_by, limit, offset })
+    // Format 56: the arms' OWNED lifts. Either NO list at all (a lift-free
+    // compound) or exactly one per arm; drawn from the plan-wide tree budget so
+    // the arm-ownership move cannot enlarge the DoS bound.
+    let arm_sub_base = r_u16(buf, pos)?;
+    let n_lists = r_u8(buf, pos)? as usize;
+    if n_lists != 0 && n_lists != n_arms {
+        return Err(corrupt("compound arm-subplan list count does not match arm count"));
+    }
+    let mut arm_subplans = Vec::with_capacity(n_lists);
+    for _ in 0..n_lists {
+        let n = r_u8(buf, pos)? as usize;
+        if n > MAX_SUBPLANS {
+            return Err(corrupt("too many subplans in one compound arm"));
+        }
+        let mut arm = Vec::with_capacity(n.min(MAX_SUBPLANS));
+        for _ in 0..n {
+            arm.push(decode_subplan(buf, pos, budget)?);
+        }
+        arm_subplans.push(arm);
+    }
+    Ok(CompoundPlan { arms, ops, order_by, limit, offset, arm_subplans, arm_sub_base })
 }
 
 /// A u32-length-prefixed UTF-8 string (the mirror of `w_str`), bounded at 1 MiB
