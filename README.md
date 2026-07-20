@@ -195,7 +195,17 @@ is locked".
   isolation boundary. That is the architectural answer to the single-writer cell
   above, and it is deliberate rather than a workaround.
 - **Durability modes** — `none`, `commit` (msync), `wal` (sequential log +
-  fdatasync, durable-on-ack), `async` (deferred coalesced fsync).
+  fdatasync, durable-on-ack), `async` (deferred coalesced fsync). A durable
+  commit costs exactly **two device flushes** — data, then meta — which is the
+  floor the ordering requires; the batch amortizes it across every writer in it.
+- **The join planner trades exponential memory for linear** — reordering a join
+  chain is normally sold as a speed optimization. The larger effect is what the
+  engine has to *hold*: on a 12-table chain the solved order peaks at **420 live
+  join cells against 13.4 million** (31,905×), and the solved peak is exactly
+  linear in width where the textual order gains a factor of ten per table. That
+  number is deterministic, so it lives in a test rather than a benchmark. It is
+  also **absent on ordinary shapes** — the corpus-median join is identical in
+  both arms. See [`INNOVATIONS.md`](INNOVATIONS.md) §4.
 - **Cooperative row-level security** — PostgreSQL-style `USING` / `WITH CHECK`
   policies keyed on a caller-set session context, injected transparently at plan
   time, with cache leak-proofing (a stale cached plan is re-validated against the
