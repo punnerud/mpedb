@@ -35,8 +35,49 @@
 //! stability property and not a safety one: plan bytes are content-hashed, so
 //! a different choice is a different hash by construction and the same hash
 //! can never name two plans.
+//!
+//! ## v2 (#116): constraints, not refusals
+//!
+//! v1 REFUSED to reorder wherever it could not prove commutativity outright.
+//! In vehicle routing the same situations are *constraints* — a time window, a
+//! forbidden turn — and a solver prices them and searches the feasible region
+//! rather than giving up. v2 converts three of v1's refusals
+//! (design/DESIGN-MPEE-SOLVER.md §7):
+//!
+//! - a **LEFT JOIN is a BARRIER**, not a veto. Its inner side keeps its exact
+//!   position, so the set of tables preceding it — and therefore what it
+//!   NULL-extends — is untouched; each maximal INNER run between barriers is
+//!   an independent sub-problem the same solver orders, because
+//!   `(A ⋈ B) ⟕ C ≡ (B ⋈ A) ⟕ C`. FULL still refuses: #65 disables predicate
+//!   pushdown entirely under FULL, so the ON→WHERE move the rewrite relies on
+//!   is not available there.
+//! - a **correlated lifted subplan** is REMAPPED, not refused. Its `outer_args`
+//!   are base-row slots of the joined tuple in the TEXTUAL order, so the
+//!   permutation's slot map is applied to them ([`Solved::slot_map`]).
+//! - a **residual conjunct's placement** is PRICED. #65 evaluates a conjunct at
+//!   the step that places its LAST table, so *when* a filter runs is a
+//!   consequence of the order — a choice, and therefore a cost term
+//!   (`Cost::residual_late`).
+//!
+//! RLS stays refused, deliberately: a reorder changes which pairs a predicate
+//! is evaluated over and mpedb RAISES on arithmetic overflow, so under a policy
+//! scope a raise is an information channel (§7).
+//!
+//! ## Ping-pong: the solver steers which cost input is bought (§9.5)
+//!
+//! Cost inputs are bought on DEMAND, never up front. `row_count` is read
+//! through a memoizing [`Cell`], and an UNBOUGHT table prices at `0` — a valid
+//! LOWER bound, because every cost term is monotone non-decreasing in a table's
+//! bucket. The solver therefore runs as branch-and-bound: propose an order
+//! under the optimistic bound, buy only the counts that proposal's cost
+//! actually depends on, re-solve. When a proposal's own cost is fully bought,
+//! its estimate is exact while every rejected candidate's estimate was a lower
+//! bound — so it is optimal over everything the search explored, and the rounds
+//! stop. That is Morten's *"valg av N kan gjøres med MPEE-styring"*: the solver
+//! picks which N to examine next instead of enumerating them all.
 
 use super::*;
+use std::cell::Cell;
 
 /// Coarse table-size input: `⌈log2⌉`-ish magnitude of a row count.
 ///
@@ -68,6 +109,16 @@ struct Cost {
     /// so it is charged once per remaining step — this is what pushes
     /// certainly-full scans to the end of the chain.
     late_unconstrained: u32,
+    /// **v2 (#116) — residual PLACEMENT priced.** #65 evaluates a conjunct at
+    /// the step that places its LAST table, so a conjunct's position is a
+    /// consequence of the order, not a fixed property of the text. Every
+    /// conjunct is charged the position at which it becomes evaluable: a filter
+    /// that runs at step 1 shrinks every stage after it, one that runs at step
+    /// 7 shrinks nothing. Purely structural — it reads no statistics — and it
+    /// sits LAST in the lexicographic order, so it can only break ties among
+    /// candidates the first three terms rate identically. That is exactly the
+    /// v1 population that fell back to "whatever the textual order said".
+    residual_late: u32,
 }
 
 impl Cost {
@@ -76,6 +127,7 @@ impl Cost {
             worst_log: self.worst_log.saturating_add(o.worst_log),
             cartesian: self.cartesian.saturating_add(o.cartesian),
             late_unconstrained: self.late_unconstrained.saturating_add(o.late_unconstrained),
+            residual_late: self.residual_late.saturating_add(o.residual_late),
         }
     }
 }
@@ -98,33 +150,92 @@ const MAX_STATES: usize = 20_000;
 /// validation, and the solver simply declines to look at them.
 const MAX_SOLVE: usize = 24;
 
+/// How many propose → probe → re-solve rounds the compile-time ping-pong runs
+/// before it gives up on being frugal, buys every cost input and solves once
+/// eagerly (design/DESIGN-MPEE-SOLVER.md §9.5). A function of the STATEMENT,
+/// never of the catalog, so the algorithm stays the same in every process.
+const PING_PONG_ROUNDS: usize = 3;
+
+/// What a magnitude that has not been bought yet is priced at (§9.5).
+///
+/// `magnitude(n) = 1` for a one-row table, so this is a genuine LOWER bound for
+/// every table that holds at least one row, and the branch-and-bound in
+/// [`Problem::solve`] is exact. The one exception is an EMPTY table
+/// (`magnitude(0) = 0`), where the bound is one too high and the search could
+/// in principle prune the true optimum — a query joining an empty table returns
+/// no rows and terminates immediately whatever the order, so what is at stake
+/// there is nothing. The row SET is never affected: reordering an INNER chain
+/// preserves it exactly.
+///
+/// `0` would be the unconditionally safe value, and it is also useless: with
+/// every unbought table at `0` the leading cost term is `0` for every candidate
+/// and the first round decides on tie-breakers alone — which then sends the
+/// solver off buying counts for an order it is about to discard. At `1` the
+/// leading term of an all-unbought round IS the count of un-probed steps, so
+/// the first proposal is the one whose cost the solver can most cheaply
+/// certify. That is what makes the ping-pong converge in two rounds instead of
+/// walking the chain.
+const UNBOUGHT: u32 = 1;
+
 /// One table position in the scope being solved.
 struct Node<'a> {
     def: &'a TableDef,
-    /// log2 magnitude of the table's row count.
-    bucket: u32,
+    /// log2 magnitude of the table's row count — **bought lazily** (§9.5). The
+    /// solver asks; only then does the cost side pay for the catalog read.
+    /// `None` prices as `0`, a valid lower bound, which is what makes the
+    /// branch-and-bound rounds in [`Problem::solve`] sound.
+    bucket: Cell<Option<u32>>,
     /// Equality pins on this table's columns: `(column index, mask of tables
     /// the pinning expression needs placed first)`. A constant pin has mask 0.
     pins: Vec<(usize, u32)>,
-    /// For every conjunct that mentions this table AND at least one other:
-    /// the mask of the OTHER tables it needs. Empty ⇒ this table is linked to
-    /// nothing and every step that introduces it is a cartesian product.
-    links: Vec<u32>,
-    /// A conjunct mentioning ONLY this table (a constant anchor, a LIKE, …).
-    /// It constrains the table wherever it is placed, so it never makes a step
-    /// cartesian, but — unless it produces a KNOWN access path — it bounds
-    /// nothing.
+    /// The FULL table mask of every conjunct that mentions this table. A
+    /// conjunct is resolved — evaluated, per #65 — at the step that places its
+    /// LAST table, i.e. when `mask & !(placed | 1<<t) == 0`. Multi-table
+    /// entries are what make a step non-cartesian; a `1<<t` entry is a
+    /// single-table filter, which constrains the table wherever it is placed
+    /// but (unless it yields a KNOWN access path) bounds nothing.
+    conj: Vec<u32>,
+    /// `conj` contains this table alone: a constant anchor, a LIKE, …
     self_filter: bool,
     /// Tables this one shares a conjunct with.
     adj: u32,
+    /// **v2 barrier (#116).** This table is the NULL-extended inner side of a
+    /// LEFT join: its position is FIXED, so the set of tables that precede it
+    /// — and therefore exactly what it preserves and what it NULL-extends — is
+    /// the one the user wrote. Everything between two barriers is a free INNER
+    /// run the solver orders as an independent sub-problem.
+    barrier: bool,
 }
 
 struct Problem<'a> {
     n: usize,
     nodes: Vec<Node<'a>>,
+    /// Table ids, parallel to `nodes` — the key the cost side is bought with.
+    ids: Vec<u32>,
+    row_count: RowCountFn<'a>,
+    /// How many `row_count` reads the solver actually paid for. The ping-pong
+    /// metric: `probes < n` is the search steering which N to examine.
+    probes: Cell<usize>,
 }
 
 impl<'a> Problem<'a> {
+    /// Buy one table's magnitude bucket, once (§9.5). Nothing else in the
+    /// solver ever calls `row_count`.
+    fn buy(&self, t: usize) {
+        if self.nodes[t].bucket.get().is_none() {
+            self.nodes[t].bucket.set(Some(magnitude((self.row_count)(self.ids[t]))));
+            self.probes.set(self.probes.get() + 1);
+        }
+    }
+
+    /// The magnitude the cost model currently believes. An unbought table
+    /// prices at [`UNBOUGHT`] — a LOWER bound on any non-empty table's
+    /// magnitude, never an invented estimate — which is what keeps every
+    /// intermediate round's cost admissible and the branch-and-bound sound.
+    fn bucket(&self, t: usize) -> u32 {
+        self.nodes[t].bucket.get().unwrap_or(UNBOUGHT)
+    }
+
     /// Is entering `t` with `placed` already done a KNOWN (single-row) step?
     /// Mirrors `extract_join_access`'s preference: full PK first, then a
     /// full-width UNIQUE index.
@@ -147,23 +258,35 @@ impl<'a> Problem<'a> {
     }
 
     /// The cost of putting `t` at position `pos` given the `placed` set.
+    ///
+    /// Depends only on `(placed, t, pos)` — never on the ORDER `placed` was
+    /// built in — which is what makes the subset DP in [`Self::dp`] correct.
     fn step(&self, placed: u32, t: usize, pos: usize) -> Cost {
         let node = &self.nodes[t];
         let known = self.known(placed, t);
-        let linked = node.links.iter().any(|&m| m & !placed == 0);
+        // Everything this table's conjuncts still need, once it is in.
+        let after = !(placed | (1 << t));
+        let linked = node.conj.iter().any(|&m| m.count_ones() > 1 && m & after == 0);
         let constrained = linked || node.self_filter || known;
+        // v2: every conjunct RESOLVED at this step is charged its position.
+        // Each conjunct is charged exactly once over a full order — at the step
+        // that places its last table — so this is a genuine sum over conjuncts.
+        let resolved = node.conj.iter().filter(|&&m| m & after == 0).count() as u32;
         Cost {
-            worst_log: if known { 0 } else { node.bucket },
+            worst_log: if known { 0 } else { self.bucket(t) },
             cartesian: u32::from(pos > 0 && !linked),
             late_unconstrained: if constrained { 0 } else { (self.n - pos) as u32 },
+            residual_late: resolved.saturating_mul(pos as u32),
         }
     }
 
-    fn order_cost(&self, order: &[usize]) -> Cost {
-        let mut placed = 0u32;
+    /// Cost of ordering the tables of one segment, given the fixed `prefix`
+    /// already placed before it and the position `base` the segment starts at.
+    fn order_cost(&self, prefix: u32, base: usize, order: &[usize]) -> Cost {
+        let mut placed = prefix;
         let mut cost = Cost::default();
-        for (pos, &t) in order.iter().enumerate() {
-            cost = cost.add(self.step(placed, t, pos));
+        for (i, &t) in order.iter().enumerate() {
+            cost = cost.add(self.step(placed, t, base + i));
             placed |= 1 << t;
         }
         cost
@@ -188,38 +311,45 @@ impl<'a> Problem<'a> {
     /// `BTreeMap` (not `HashMap`) because iteration order is part of the
     /// tie-breaking and must be byte-identical in every process.
     ///
-    /// `seeds` restricts which tables may occupy position 0 — the extremal
-    /// sampling of `extremes()`. `full & seeds` = every table = the exhaustive
-    /// search.
-    fn dp(&self, seeds: u32) -> Option<Vec<usize>> {
-        let full = (1u32 << self.n) - 1;
-        let mut levels: Vec<BTreeMap<u32, (Cost, u8)>> = vec![BTreeMap::new(); self.n];
+    /// `seeds` restricts which tables may occupy the segment's first position —
+    /// the extremal sampling of `extremes()`. `seeds = univ` = every table =
+    /// the exhaustive search.
+    ///
+    /// `prefix` is the (fixed) set already placed before this segment, `univ`
+    /// the segment's own tables and `base` the position its first table takes.
+    /// With no barrier in the chain this is `(0, full, 0)` and the whole thing
+    /// is v1's DP verbatim.
+    fn dp(&self, prefix: u32, univ: u32, base: usize, seeds: u32) -> Option<Vec<usize>> {
+        let m = univ.count_ones() as usize;
+        let mut levels: Vec<BTreeMap<u32, (Cost, u8)>> = vec![BTreeMap::new(); m];
         for t in 0..self.n {
-            if seeds & (1 << t) == 0 {
+            if seeds & univ & (1 << t) == 0 {
                 continue;
             }
-            levels[0].insert(1u32 << t, (self.step(0, t, 0), t as u8));
+            levels[0].insert(1u32 << t, (self.step(prefix, t, base), t as u8));
         }
-        for k in 0..self.n - 1 {
+        for k in 0..m - 1 {
             if levels[k].len() > MAX_STATES {
                 return None;
             }
             let cur = std::mem::take(&mut levels[k]);
             for (&mask, &(cost, _)) in &cur {
+                let placed = prefix | mask;
                 // Collapse + stream (design/DESIGN-MPEE-SOLVER.md §4): expand
                 // only along the join graph's frontier once the scope is too
                 // wide for exhaustive search. A subgraph attached through few
                 // edges can then only appear as a connected prefix, so the
                 // state count follows the graph's decomposition instead of 2^n.
-                let mut cand = if self.n <= DP_FULL_MAX { full & !mask } else { self.frontier(mask) };
+                let mut cand =
+                    if m <= DP_FULL_MAX { univ & !mask } else { self.frontier(placed) & univ };
                 if cand == 0 {
-                    cand = full & !mask;
+                    cand = univ & !mask;
                 }
                 for t in 0..self.n {
                     if cand & (1 << t) == 0 {
                         continue;
                     }
-                    let nc = cost.add(self.step(mask, t, k + 1));
+                    let nc = cost.add(self.step(placed, t, base + k + 1));
                     let nm = mask | (1 << t);
                     match levels[k + 1].get(&nm) {
                         // Strictly-better only: on a tie the first insertion
@@ -234,10 +364,10 @@ impl<'a> Problem<'a> {
             }
             levels[k] = cur;
         }
-        // Reconstruct backwards from the full set.
-        let mut order = vec![0usize; self.n];
-        let mut mask = full;
-        for k in (0..self.n).rev() {
+        // Reconstruct backwards from the full segment.
+        let mut order = vec![0usize; m];
+        let mut mask = univ;
+        for k in (0..m).rev() {
             let &(_, last) = levels[k].get(&mask)?;
             order[k] = last as usize;
             mask &= !(1u32 << last);
@@ -262,26 +392,40 @@ impl<'a> Problem<'a> {
     /// transferring — a left-deep order has a START but no END, so extremal
     /// sampling here degenerates to *seed selection plus hub identification*
     /// rather than bracketing a route.
-    fn extremes(&self) -> u32 {
+    fn extremes(&self, prefix: u32, univ: u32) -> u32 {
         let mut m = 0u32;
         for t in 0..self.n {
-            if self.known(0, t) {
+            if univ & (1 << t) != 0 && self.known(prefix, t) {
                 m |= 1 << t;
             }
         }
-        let by = |f: &dyn Fn(&Node) -> u32, max: bool| -> usize {
-            let mut best = 0usize;
-            for t in 1..self.n {
-                let (a, b) = (f(&self.nodes[t]), f(&self.nodes[best]));
-                if if max { a > b } else { a < b } {
-                    best = t;
+        // The size extremes read whatever magnitudes have been BOUGHT so far
+        // and nothing more (§9.5). In the first ping-pong round every bucket is
+        // still `0`, so the seeds are purely structural — the anchors and the
+        // hub; each later round sharpens them with the counts the previous
+        // round's decision turned out to depend on. Seed selection never buys.
+        let by = |f: &dyn Fn(usize) -> u32, max: bool| -> Option<usize> {
+            let mut best: Option<usize> = None;
+            for t in 0..self.n {
+                if univ & (1 << t) == 0 {
+                    continue;
+                }
+                match best {
+                    Some(b) if !(if max { f(t) > f(b) } else { f(t) < f(b) }) => {}
+                    _ => best = Some(t),
                 }
             }
             best
         };
-        m |= 1 << by(&|nd| nd.bucket, false);
-        m |= 1 << by(&|nd| nd.bucket, true);
-        m |= 1 << by(&|nd| nd.adj.count_ones(), true);
+        if let Some(t) = by(&|t| self.bucket(t), false) {
+            m |= 1 << t;
+        }
+        if let Some(t) = by(&|t| self.bucket(t), true) {
+            m |= 1 << t;
+        }
+        if let Some(t) = by(&|t| self.nodes[t].adj.count_ones(), true) {
+            m |= 1 << t;
+        }
         m
     }
 
@@ -295,26 +439,26 @@ impl<'a> Problem<'a> {
     /// converges this degenerates to the extremal-seeded greedy — still a
     /// *valid* plan, since ordering an INNER chain never changes the answer,
     /// only possibly a non-optimal one.
-    fn search(&self) -> Vec<usize> {
-        if self.n <= DP_FULL_MAX {
+    fn search(&self, prefix: u32, univ: u32, base: usize) -> Vec<usize> {
+        let m = univ.count_ones() as usize;
+        if m <= DP_FULL_MAX {
             // Small enough to be exhaustive: extremal sampling would only be a
             // way of not looking at everything, and here we can afford to.
-            if let Some(o) = self.dp((1u32 << self.n) - 1) {
+            if let Some(o) = self.dp(prefix, univ, base, univ) {
                 return o;
             }
         }
-        let full = (1u32 << self.n) - 1;
-        let ex = self.extremes();
+        let ex = self.extremes(prefix, univ);
         let mut best: Option<(Cost, Vec<usize>)> = None;
         let consider = |o: Vec<usize>, best: &mut Option<(Cost, Vec<usize>)>| {
-            let c = self.order_cost(&o);
+            let c = self.order_cost(prefix, base, &o);
             if best.as_ref().is_none_or(|(bc, _)| c < *bc) {
                 *best = Some((c, o));
             }
         };
-        for seeds in [ex, ex | self.frontier(ex), full] {
+        for seeds in [ex, ex | (self.frontier(prefix | ex) & univ), univ] {
             let before = best.as_ref().map(|(c, _)| *c);
-            if let Some(o) = self.dp(seeds) {
+            if let Some(o) = self.dp(prefix, univ, base, seeds) {
                 consider(o, &mut best);
             }
             // A round that did not move the decision ends the refinement —
@@ -325,31 +469,34 @@ impl<'a> Problem<'a> {
         }
         for t in 0..self.n {
             if ex & (1 << t) != 0 {
-                consider(self.greedy_from(t), &mut best);
+                consider(self.greedy_from(prefix, univ, base, t), &mut best);
             }
         }
-        best.map(|(_, o)| o).unwrap_or_else(|| self.greedy_from(0))
+        best.map(|(_, o)| o).unwrap_or_else(|| {
+            let seed = (0..self.n).find(|t| univ & (1 << t) != 0).unwrap_or(0);
+            self.greedy_from(prefix, univ, base, seed)
+        })
     }
 
     /// Greedy completion from a fixed seed: place tables one at a time, always
     /// taking the cheapest frontier candidate under the SAME scoring function.
     /// O(n^2), fully deterministic, and the guaranteed floor when every DP
     /// round blew the state cap.
-    fn greedy_from(&self, seed: usize) -> Vec<usize> {
-        let full = (1u32 << self.n) - 1;
-        let mut placed = 1u32 << seed;
+    fn greedy_from(&self, prefix: u32, univ: u32, base: usize, seed: usize) -> Vec<usize> {
+        let m = univ.count_ones() as usize;
+        let mut placed = prefix | (1u32 << seed);
         let mut order = vec![seed];
-        for pos in 1..self.n {
-            let mut cand = self.frontier(placed);
+        for i in 1..m {
+            let mut cand = self.frontier(placed) & univ;
             if cand == 0 {
-                cand = full & !placed;
+                cand = univ & !placed;
             }
             let mut best: Option<(Cost, usize)> = None;
             for t in 0..self.n {
                 if cand & (1 << t) == 0 {
                     continue;
                 }
-                let c = self.step(placed, t, pos);
+                let c = self.step(placed, t, base + i);
                 if best.is_none_or(|(bc, _)| c < bc) {
                     best = Some((c, t));
                 }
@@ -359,13 +506,140 @@ impl<'a> Problem<'a> {
             // panics a query: bail to whatever order has been built plus the
             // rest in textual order.
             let Some((_, t)) = best else {
-                order.extend((0..self.n).filter(|t| placed & (1 << t) == 0));
+                order.extend((0..self.n).filter(|t| univ & (1 << t) != 0 && placed & (1 << t) == 0));
                 return order;
             };
             order.push(t);
             placed |= 1 << t;
         }
         order
+    }
+
+    /// The chain, segment by segment. A BARRIER table (a LEFT join's inner
+    /// side) occupies its own textual position and nothing else moves across
+    /// it; each maximal run of free positions between two barriers is solved
+    /// as an independent sub-problem.
+    ///
+    /// Segment-local optimisation is GLOBALLY optimal here: a segment's
+    /// internal order cannot change the SET of tables any later segment sees
+    /// (only the order within its own position range), and `step`'s cost
+    /// depends on the placed SET, not on how it was built (§3). So the
+    /// segments do not interact and solving them left to right is exact.
+    fn solve_chain(&self) -> Vec<usize> {
+        let mut order: Vec<usize> = Vec::with_capacity(self.n);
+        let mut placed = 0u32;
+        let mut p = 0usize;
+        while p < self.n {
+            if self.nodes[p].barrier {
+                order.push(p);
+                placed |= 1 << p;
+                p += 1;
+                continue;
+            }
+            let mut univ = 0u32;
+            let base = p;
+            while p < self.n && !self.nodes[p].barrier {
+                univ |= 1 << p;
+                p += 1;
+            }
+            if univ.count_ones() == 1 {
+                order.push(base);
+                placed |= 1 << base;
+                continue;
+            }
+            for t in self.search(placed, univ, base) {
+                order.push(t);
+                placed |= 1 << t;
+            }
+        }
+        order
+    }
+
+    /// **Ping-pong (§9.5).** Propose under the optimistic (unbought = 0) bound,
+    /// buy only the counts the proposal's own cost depends on, re-solve. Stop
+    /// when the proposal is fully bought.
+    ///
+    /// Soundness: every cost term is monotone non-decreasing in a table's
+    /// bucket, so an unbought `0` makes every candidate's cost a LOWER bound.
+    /// When the winner `O` has all of its own contributors bought, `cost(O)` is
+    /// exact while every rejected candidate `P` satisfied
+    /// `cost_est(P) ≥ cost_est(O) = cost_true(O)` and `cost_true(P) ≥
+    /// cost_est(P)`. So `O` is optimal over everything the search explored —
+    /// the same guarantee the eager v1 gave, for fewer cost reads.
+    ///
+    /// Termination and compile-cost bound: each round that does not stop buys
+    /// at least one previously unbought count, and the rounds are capped at
+    /// [`PING_PONG_ROUNDS`]. A chain that has not settled by then buys
+    /// EVERYTHING and solves once more — which is exactly v1's eager solve, so
+    /// the fallback is bit-identical to the pre-#116 behaviour and the whole
+    /// mechanism is bounded at `PING_PONG_ROUNDS + 1` searches.
+    fn solve(&self) -> Vec<usize> {
+        let mut order = self.solve_chain();
+        for _ in 0..PING_PONG_ROUNDS {
+            // A position's bucket enters the cost only when the step is NOT
+            // KNOWN — a PK probe is one row by proof and never reads a count.
+            let owed = self.owed(&order);
+            if owed.is_empty() {
+                return order;
+            }
+            for t in owed {
+                self.buy(t);
+            }
+            order = self.solve_chain();
+        }
+        if self.owed(&order).is_empty() {
+            return order;
+        }
+        for t in 0..self.n {
+            self.buy(t);
+        }
+        self.solve_chain()
+    }
+
+    /// The tables whose magnitude this order's cost depends on and that have
+    /// not been paid for yet.
+    fn owed(&self, order: &[usize]) -> Vec<usize> {
+        let mut placed = 0u32;
+        let mut owed = Vec::new();
+        for &t in order {
+            if !self.known(placed, t) && self.nodes[t].bucket.get().is_none() {
+                owed.push(t);
+            }
+            placed |= 1 << t;
+        }
+        owed
+    }
+
+    /// Adopt `chosen` only if it is STRICTLY better than what the user wrote.
+    ///
+    /// The textual order's cost starts as a LOWER bound (its unbought tables
+    /// price at 0) and is refined ONE count at a time, stopping the instant the
+    /// comparison is decided. Buying can only raise the textual cost, so the
+    /// first `chosen < textual` that appears is final — and in a chain the
+    /// solver rescues, that happens after two or three counts rather than after
+    /// all of them. This is the branch-and-bound bound doing the steering: the
+    /// solver's current best decides which N is worth examining next.
+    ///
+    /// The comparison is against the OPTIMISTIC textual cost throughout, which
+    /// is what makes it sound: `chosen`'s own contributors are all bought by
+    /// [`Self::solve`], so `cost_true(chosen) = cost_est(chosen) <
+    /// cost_est(textual) ≤ cost_true(textual)`. Declining is always safe — it
+    /// keeps the order the user wrote.
+    fn beats_textual(&self, chosen: &[usize]) -> bool {
+        let textual: Vec<usize> = (0..self.n).collect();
+        for t in self.owed(&textual) {
+            if self.chain_cost(chosen) < self.chain_cost(&textual) {
+                return true;
+            }
+            self.buy(t);
+        }
+        self.chain_cost(chosen) < self.chain_cost(&textual)
+    }
+
+    /// The cost of the whole chain under a candidate order — the comparison
+    /// against the user's textual order.
+    fn chain_cost(&self, order: &[usize]) -> Cost {
+        self.order_cost(0, 0, order)
     }
 }
 
@@ -384,8 +658,37 @@ pub(super) enum Skip {
     NoGain,
 }
 
+/// What a successful solve produces.
+pub(super) struct Solved {
+    /// The rewritten statement, in the chosen order.
+    pub stmt: ast::SelectStmt,
+    /// **Old base-row slot → new base-row slot.** Subqueries are lifted BEFORE
+    /// the join dispatch, so a correlated subplan's `outer_args` name slots of
+    /// the joined tuple in the TEXTUAL order. Applying this map to them is what
+    /// turns v1's correlated-subplan REFUSAL into a constraint the solver
+    /// satisfies (design/DESIGN-MPEE-SOLVER.md §7, and the wrong answer
+    /// `crates/mpedb/tests/agg_filter.rs` caught during v1's development).
+    pub slot_map: Vec<u16>,
+}
+
+impl Solved {
+    /// Rewrite every lifted subplan's correlation args through the permutation.
+    /// Only the TOP level is ours: a nested lift's `outer_args` name slots of
+    /// ITS parent's row, which this reorder does not touch.
+    pub fn remap(&self, mut subplans: Vec<SubPlan>) -> Vec<SubPlan> {
+        for p in &mut subplans {
+            for a in &mut p.outer_args {
+                if let Some(&to) = self.slot_map.get(*a as usize) {
+                    *a = to;
+                }
+            }
+        }
+        subplans
+    }
+}
+
 /// Solve this scope's join order and, if a strictly better one exists, return
-/// the rewritten statement. `None` = keep the textual order verbatim.
+/// the rewritten statement. `Err` = keep the textual order verbatim.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn reorder<'s>(
     s: &ast::SelectStmt,
@@ -397,7 +700,7 @@ pub(super) fn reorder<'s>(
     slot_types: &[Ty],
     cte: Option<CteRef<'s>>,
     row_count: RowCountFn<'_>,
-) -> std::result::Result<ast::SelectStmt, Skip> {
+) -> std::result::Result<Solved, Skip> {
     let n = s.joins.len() + 1;
     // Masks are `u32`, so 31 is the hard ceiling; the plan format caps a chain
     // at `MAX_JOINS = 16` joins (17 tables) anyway, and a wider one is refused
@@ -410,9 +713,22 @@ pub(super) fn reorder<'s>(
     if s.from_derived.is_some() {
         return Err(Skip::Ineligible);
     }
-    for j in &s.joins {
-        if j.kind != ast::JoinKind::Inner || j.natural || !j.using.is_empty() {
+    // v2: LEFT is a CONSTRAINT, not a veto — position `k+1` becomes a barrier
+    // below. FULL still refuses: #65 disables WHERE pushdown entirely when any
+    // FULL is in the chain, so the `INNER JOIN … ON p` ≡ `CROSS JOIN … WHERE p`
+    // move this rewrite is built on has no way back to a per-step ON there.
+    // RIGHT was already rewritten to LEFT (or refused) before planning.
+    // USING / NATURAL still refuse: their desugar picks the LEFTMOST occurrence
+    // of a shared column as the coalesce representative, which a reorder moves.
+    let mut barrier = vec![false; n];
+    for (k, j) in s.joins.iter().enumerate() {
+        if j.natural || !j.using.is_empty() {
             return Err(Skip::Ineligible);
+        }
+        match j.kind {
+            ast::JoinKind::Inner => {}
+            ast::JoinKind::Left => barrier[k + 1] = true,
+            ast::JoinKind::Right | ast::JoinKind::Full => return Err(Skip::Ineligible),
         }
     }
     let outer_name = s.table.as_deref().ok_or(Skip::Ineligible)?;
@@ -460,16 +776,25 @@ pub(super) fn reorder<'s>(
     for (i, ty) in slot_types.iter().enumerate() {
         binder.pin_param(n_params + i as u16, *ty);
     }
-    let mut conjuncts: Vec<BExpr> = Vec::new();
+    // `owner` = `Some(k)` for a conjunct of a BARRIER (LEFT) join's ON, which
+    // stays attached to that join and therefore constrains ONLY its own
+    // NULL-extended table `k`; `None` for everything the rewrite moves into the
+    // WHERE, which #65 then places at the step of its last table.
+    let mut conjuncts: Vec<(BExpr, Option<usize>)> = Vec::new();
     for (k, j) in s.joins.iter().enumerate() {
         let scope = Scope::joined_named(named[..=k + 1].to_vec()).map_err(|_| Skip::Unbindable)?;
         binder = binder.rescope(scope);
         let on = binder.bind_predicate(&j.on).map_err(|_| Skip::Unbindable)?;
-        split_and(on, &mut conjuncts);
+        let mut split = Vec::new();
+        split_and(on, &mut split);
+        let owner = barrier[k + 1].then_some(k + 1);
+        conjuncts.extend(split.into_iter().map(|c| (c, owner)));
     }
     if let Some(w) = &s.where_clause {
         let w = binder.bind_predicate(w).map_err(|_| Skip::Unbindable)?;
-        split_and(w, &mut conjuncts);
+        let mut split = Vec::new();
+        split_and(w, &mut split);
+        conjuncts.extend(split.into_iter().map(|c| (c, None)));
     }
 
     // ---- build the problem ----
@@ -493,30 +818,79 @@ pub(super) fn reorder<'s>(
         Some(m)
     };
 
+    // A table's SEGMENT: barriers are singletons at their own textual position,
+    // and each maximal free run between two of them is one segment. Free tables
+    // never leave their segment, so the segment index alone decides which table
+    // of a conjunct is the LAST one placed — which is where #65 evaluates it.
+    let mut seg = vec![0usize; n];
+    {
+        let mut cur = 0usize;
+        for p in 0..n {
+            if barrier[p] {
+                if p > 0 {
+                    cur += 1;
+                }
+                seg[p] = cur;
+                cur += 1;
+            } else {
+                seg[p] = cur;
+            }
+        }
+    }
+    // Does this conjunct land in the gather at all? A conjunct whose LAST table
+    // is a LEFT join's inner side filters the already-NULL-extended row and
+    // stays in `joined_filter` (#65's rule, `planner/join.rs`), so it restricts
+    // no step and must not be priced as if it did.
+    let lands_on_barrier = |m: u32| -> bool {
+        let last = (0..n).filter(|&t| m & (1 << t) != 0).max_by_key(|&t| seg[t]);
+        last.is_some_and(|t| barrier[t])
+    };
+
     let mut nodes: Vec<Node> = defs
         .iter()
         .enumerate()
         .map(|(i, d)| Node {
             def: d,
-            bucket: magnitude(row_count(ids[i])),
+            // Lazily bought (§9.5) — the solver asks before the cost side pays.
+            bucket: Cell::new(None),
             pins: Vec::new(),
-            links: Vec::new(),
+            conj: Vec::new(),
             self_filter: false,
             adj: 0,
+            barrier: barrier[i],
         })
         .collect();
-    for c in &conjuncts {
+    for (c, owner) in &conjuncts {
         let Some(m) = mask_of(c) else { return Err(Skip::Unbindable) };
         if m == 0 {
             continue; // column-free: placed at the outer, orders nothing
         }
-        if m.count_ones() == 1 {
-            nodes[m.trailing_zeros() as usize].self_filter = true;
-        } else {
-            for (t, node) in nodes.iter_mut().enumerate() {
-                if m & (1 << t) != 0 {
-                    node.links.push(m & !(1 << t));
-                    node.adj |= m & !(1 << t);
+        // Adjacency is search GUIDANCE only (which states the frontier DP
+        // expands to), never a cost claim, so it is recorded for every conjunct.
+        for (t, node) in nodes.iter_mut().enumerate() {
+            if m & (1 << t) != 0 {
+                node.adj |= m & !(1 << t);
+            }
+        }
+        // Which table this conjunct is allowed to constrain.
+        //   - a barrier's own ON: only its NULL-extended table. Under a LEFT
+        //     join every preserved-side row survives whatever the ON says, so
+        //     crediting the preserved side with it would be a false constraint.
+        //   - a moved conjunct landing after a barrier: nothing at all.
+        //   - otherwise: every table it mentions, as v1 did.
+        let constrains: u32 = match owner {
+            Some(k) => m & (1 << k),
+            None if lands_on_barrier(m) => 0,
+            None => m,
+        };
+        if constrains == 0 {
+            continue;
+        }
+        for (t, node) in nodes.iter_mut().enumerate() {
+            if constrains & (1 << t) != 0 {
+                node.conj.push(m);
+                if m == 1 << t {
+                    node.self_filter = true;
                 }
             }
         }
@@ -528,6 +902,9 @@ pub(super) fn reorder<'s>(
         for (a, b) in [(&**l, &**r), (&**r, &**l)] {
             let BExpr::Col(slot) = a else { continue };
             let Some(t) = table_of(*slot) else { continue };
+            if constrains & (1 << t) == 0 {
+                continue;
+            }
             let col = *slot as usize - base[t];
             let ty = nodes[t].def.columns[col].ty;
             if ty == ColumnType::Any {
@@ -552,13 +929,25 @@ pub(super) fn reorder<'s>(
         }
     }
 
-    let p = Problem { n, nodes };
-    let chosen = p.search();
-    let textual: Vec<usize> = (0..n).collect();
-    if p.order_cost(&chosen) >= p.order_cost(&textual) {
+    let p = Problem { n, nodes, ids, row_count, probes: Cell::new(0) };
+    let chosen = p.solve();
+    if !p.beats_textual(&chosen) {
         return Err(Skip::NoGain);
     }
-    Ok(rewrite(s, &chosen, &named))
+    // Old base-row slot -> new one, for the lifted correlated subplans.
+    let mut new_base = vec![0usize; n];
+    let mut acc2 = 0usize;
+    for &t in &chosen {
+        new_base[t] = acc2;
+        acc2 += defs[t].columns.len();
+    }
+    let mut slot_map = vec![0u16; acc];
+    for (t, d) in defs.iter().enumerate() {
+        for c in 0..d.columns.len() {
+            slot_map[base[t] + c] = (new_base[t] + c) as u16;
+        }
+    }
+    Ok(Solved { stmt: rewrite(s, &chosen, &named, &barrier), slot_map })
 }
 
 /// Every column slot an expression reads (the set form of `max_col`).
@@ -612,10 +1001,16 @@ fn cols_of(e: &BExpr) -> Vec<u16> {
 /// exactly the index nested-loop candidate the ON used to be. `SELECT *` is
 /// pinned to the ORIGINAL table order first, so output column order never
 /// moves (the same trick `rewrite_right_join` uses).
+///
+/// A BARRIER position (a LEFT join) keeps its table, its kind and its ON
+/// verbatim — moving a LEFT join's ON into the WHERE would turn "does this row
+/// match" into "does this row survive", a different query. Everything else in
+/// the chain is an `INNER JOIN … ON true` whose predicate went to the WHERE.
 fn rewrite(
     s: &ast::SelectStmt,
     order: &[usize],
     named: &[(String, &TableDef)],
+    barrier: &[bool],
 ) -> ast::SelectStmt {
     let entry = |i: usize| -> (String, Option<String>) {
         if i == 0 {
@@ -647,7 +1042,11 @@ fn rewrite(
             Some(a) => ast::Expr::Binary(ast::BinOp::And, Box::new(a), Box::new(b)),
         })
     };
-    for j in &s.joins {
+    for (k, j) in s.joins.iter().enumerate() {
+        // A barrier's ON stays on its join; only INNER ONs move.
+        if barrier[k + 1] {
+            continue;
+        }
         if !matches!(&j.on, ast::Expr::Lit(Value::Bool(true))) {
             pred = and(pred, j.on.clone());
         }
@@ -659,16 +1058,17 @@ fn rewrite(
     let (table, alias) = entry(order[0]);
     let joins = order[1..]
         .iter()
-        .map(|&i| {
+        .enumerate()
+        .map(|(p, &i)| {
             let (t, a) = entry(i);
-            ast::JoinClause {
-                table: t,
-                alias: a,
-                kind: ast::JoinKind::Inner,
-                on: ast::Expr::Lit(Value::Bool(true)),
-                using: Vec::new(),
-                natural: false,
-            }
+            // `p + 1` is the emitted position; barriers were pinned to their
+            // textual position by the solver, so `i == p + 1` holds there.
+            let (kind, on) = if barrier[p + 1] {
+                (s.joins[i - 1].kind, s.joins[i - 1].on.clone())
+            } else {
+                (ast::JoinKind::Inner, ast::Expr::Lit(Value::Bool(true)))
+            };
+            ast::JoinClause { table: t, alias: a, kind, on, using: Vec::new(), natural: false }
         })
         .collect();
     ast::SelectStmt {
@@ -702,10 +1102,106 @@ mod tests {
 
     #[test]
     fn cost_orders_lexicographically() {
-        let a = Cost { worst_log: 10, cartesian: 0, late_unconstrained: 99 };
-        let b = Cost { worst_log: 11, cartesian: 0, late_unconstrained: 0 };
+        let a = Cost { worst_log: 10, cartesian: 0, late_unconstrained: 99, residual_late: 99 };
+        let b = Cost { worst_log: 11, cartesian: 0, late_unconstrained: 0, residual_late: 0 };
         assert!(a < b, "the worst-case product dominates");
-        let c = Cost { worst_log: 10, cartesian: 5, late_unconstrained: 0 };
+        let c = Cost { worst_log: 10, cartesian: 5, late_unconstrained: 0, residual_late: 0 };
         assert!(a < c, "with equal worst case, fewer cartesian steps win");
+        // v2: residual placement is the LAST word — it may only break ties the
+        // first three terms leave open, never overturn one of them.
+        let early = Cost { worst_log: 4, cartesian: 0, late_unconstrained: 0, residual_late: 3 };
+        let late = Cost { worst_log: 4, cartesian: 0, late_unconstrained: 0, residual_late: 9 };
+        assert!(early < late, "an equally-safe order that filters earlier wins");
+        let riskier = Cost { worst_log: 5, cartesian: 0, late_unconstrained: 0, residual_late: 0 };
+        assert!(late < riskier, "no amount of early filtering buys a worse worst case");
+    }
+
+    /// `n` tables `tK(a int64 PRIMARY KEY, b int64)` — the `select5` chain
+    /// shape, small enough to build without an engine.
+    fn chain_schema(n: usize) -> Schema {
+        let c = |name: &str, nullable: bool| mpedb_types::ColumnDef {
+            generated: None,
+            decl: None,
+            name: name.into(),
+            ty: ColumnType::Int64,
+            nullable,
+            unique: false,
+            indexed: false,
+            default: None,
+            check: None,
+            collation: mpedb_types::Collation::Binary,
+            affinity: mpedb_types::Affinity::implied_by(ColumnType::Int64),
+        };
+        let tables = (1..=n)
+            .map(|k| TableDef {
+                id: 0,
+                name: format!("t{k}"),
+                columns: vec![c("a", false), c("b", true)],
+                primary_key: vec![0],
+                indexes: vec![],
+                dead: false,
+                implicit_rowid: false,
+                kind: mpedb_types::TableKind::Standard,
+            })
+            .collect();
+        Schema::new(tables).unwrap()
+    }
+
+    /// Compile `sql` and report how many DISTINCT tables the compile actually
+    /// read a row count for.
+    fn probes(sql: &str, schema: &Schema, n: usize) -> usize {
+        let seen = std::cell::RefCell::new(std::collections::BTreeSet::new());
+        let f = |tid: u32| -> u64 {
+            seen.borrow_mut().insert(tid);
+            10
+        };
+        crate::prepare_with_row_counts(sql, schema, &f).expect("compiles");
+        let hit = seen.borrow().len();
+        assert!(hit <= n, "cannot probe more tables than the scope has");
+        hit
+    }
+
+    /// **The ping-pong, measured** (design/DESIGN-MPEE-SOLVER.md §9.5). The
+    /// scrambled chain with a late constant anchor is decided by STRUCTURE —
+    /// which order makes every step a PK probe — and a PK probe is one row by
+    /// proof, so its magnitude is never worth buying. v1 bought every table's
+    /// count before the search started; v2 lets the search say which ones it
+    /// needs, and the answer is a small constant instead of `n`.
+    #[test]
+    fn the_solver_buys_only_the_counts_its_decision_rests_on() {
+        for n in [6usize, 10, 17] {
+            let schema = chain_schema(n);
+            let from: Vec<String> = (1..=n)
+                .step_by(2)
+                .chain((2..=n).step_by(2))
+                .map(|k| format!("t{k}"))
+                .collect();
+            let mut w: Vec<String> =
+                (1..n).map(|k| format!("t{k}.b = t{}.a", k + 1)).collect();
+            w.push(format!("t{n}.a = 4"));
+            let sql =
+                format!("SELECT t1.a FROM {} WHERE {}", from.join(", "), w.join(" AND "));
+            // Measured: exactly ONE, at n = 6, 10 and 17 alike — the scan the
+            // chain starts from. Every other position is a PK probe, and a
+            // probe's cost is a proof, not a statistic.
+            assert_eq!(
+                probes(&sql, &schema, n),
+                1,
+                "an {n}-table chain decided by structure should cost ONE row count"
+            );
+        }
+    }
+
+    /// The corollary: a chain with NO keyed access anywhere is decided by size
+    /// alone, so the same mechanism pays for what it genuinely needs. This is
+    /// the honest other half of the measurement above — laziness is a property
+    /// of the QUESTION, not a trick that always wins.
+    #[test]
+    fn a_size_decided_chain_still_pays_for_its_sizes() {
+        let schema = chain_schema(4);
+        // Every conjunct joins two NON-key columns, so no step is ever KNOWN.
+        let sql = "SELECT t1.a FROM t1, t2, t3, t4 \
+                   WHERE t1.b = t2.b AND t2.b = t3.b AND t3.b = t4.b";
+        assert!(probes(sql, &schema, 4) >= 3, "a size decision must buy sizes");
     }
 }
