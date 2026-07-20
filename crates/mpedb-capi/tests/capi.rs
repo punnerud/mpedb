@@ -2773,3 +2773,127 @@ fn interior_comments_and_eq_alias_reach_the_engine() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }
+
+// ===========================================================================
+// `sqlite3_set_authorizer` — the compile-time access gate (#112 wave 3).
+// ===========================================================================
+
+use std::sync::Mutex as StdMutex;
+
+/// Every consultation this process's test authorizer saw, as
+/// `(action, arg1, arg2)`. One test at a time touches it.
+static AUTH_LOG: StdMutex<Vec<(c_int, String, String)>> = StdMutex::new(Vec::new());
+/// What the callback returns; `None` = SQLITE_OK.
+static AUTH_VERDICT: StdMutex<Option<(c_int, c_int)>> = StdMutex::new(None);
+
+unsafe extern "C" fn logging_auth(
+    _ctx: *mut c_void,
+    action: c_int,
+    a1: *const c_char,
+    a2: *const c_char,
+    _db: *const c_char,
+    _src: *const c_char,
+) -> c_int {
+    let s = |p: *const c_char| {
+        if p.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    };
+    AUTH_LOG.lock().unwrap().push((action, s(a1), s(a2)));
+    match *AUTH_VERDICT.lock().unwrap() {
+        Some((on, rc)) if on == action => rc,
+        _ => SQLITE_OK,
+    }
+}
+
+fn auth_reset(verdict: Option<(c_int, c_int)>) {
+    AUTH_LOG.lock().unwrap().clear();
+    *AUTH_VERDICT.lock().unwrap() = verdict;
+}
+
+fn auth_log() -> Vec<(c_int, String, String)> {
+    AUTH_LOG.lock().unwrap().clone()
+}
+
+unsafe fn set_auth(db: *mut Sqlite3) {
+    assert_eq!(
+        sqlite3_set_authorizer(db, logging_auth as *mut c_void, ptr::null_mut()),
+        SQLITE_OK
+    );
+}
+
+/// The action stream for the write statements CPython's own authorizer tests
+/// never reach, and the DENY message shape for each: a denied column read
+/// names the object ("access to t.c is prohibited"), everything else is
+/// sqlite's generic "not authorized". Both carry SQLITE_AUTH.
+#[test]
+fn authorizer_sees_writes_and_ddl_and_denies_with_sqlites_two_messages() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (id, a, b) VALUES (1, 2, 'x')"), SQLITE_OK);
+        set_auth(db);
+
+        // INSERT names its table; nothing is read.
+        auth_reset(None);
+        assert_eq!(exec(db, "INSERT INTO t (id, a, b) VALUES (2, 3, 'y')"), SQLITE_OK);
+        assert_eq!(auth_log(), [(18, "t".to_string(), String::new())]);
+
+        // UPDATE names the ASSIGNED column, and reads the ones it consults.
+        auth_reset(None);
+        assert_eq!(exec(db, "UPDATE t SET b = 'z' WHERE a = 3"), SQLITE_OK);
+        let log = auth_log();
+        assert!(log.contains(&(23, "t".into(), "b".into())), "{log:?}");
+        assert!(!log.contains(&(23, "t".into(), "a".into())), "a is read, not written: {log:?}");
+        assert!(log.contains(&(20, "t".into(), "a".into())), "{log:?}");
+
+        // DELETE names its table.
+        auth_reset(None);
+        assert_eq!(exec(db, "DELETE FROM t WHERE id = 2"), SQLITE_OK);
+        assert!(auth_log().contains(&(9, "t".into(), String::new())));
+
+        // DDL and transaction control are described too.
+        auth_reset(None);
+        assert_eq!(exec(db, "CREATE TABLE u (id INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(auth_log(), [(2, "u".to_string(), String::new())]);
+        auth_reset(None);
+        assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
+        assert_eq!(auth_log(), [(22, "BEGIN".to_string(), String::new())]);
+        assert_eq!(exec(db, "COMMIT"), SQLITE_OK);
+
+        // DENY on a column read: sqlite's object-naming message.
+        auth_reset(Some((20, SQLITE_DENY)));
+        assert_eq!(exec(db, "SELECT b FROM t"), SQLITE_AUTH);
+        assert_eq!(errmsg(db), "access to t.b is prohibited");
+
+        // DENY on anything else: the generic message.
+        auth_reset(Some((18, SQLITE_DENY)));
+        assert_eq!(exec(db, "INSERT INTO t (id) VALUES (9)"), SQLITE_AUTH);
+        assert_eq!(errmsg(db), "not authorized");
+        assert_eq!(scalar_count(db, "SELECT count(*) FROM t WHERE id = 9"), 0);
+
+        // A verdict outside {OK, DENY, IGNORE} is sqlite's malfunction.
+        auth_reset(Some((21, 42)));
+        assert_eq!(exec(db, "SELECT b FROM t"), SQLITE_ERROR);
+        assert_eq!(errmsg(db), "authorizer malfunction");
+
+        // SQLITE_IGNORE means "read this column as NULL"; mpedb has no plan
+        // rewrite for that, so it refuses rather than handing back the value
+        // the callback asked to hide.
+        auth_reset(Some((20, SQLITE_IGNORE)));
+        assert_eq!(exec(db, "SELECT b FROM t"), SQLITE_ERROR);
+        assert!(errmsg(db).contains("SQLITE_IGNORE"), "{}", errmsg(db));
+        assert!(errmsg(db).contains("NULL"), "{}", errmsg(db));
+
+        // Clearing restores the ungated connection, and the callback stops
+        // being consulted at all.
+        assert_eq!(sqlite3_set_authorizer(db, ptr::null_mut(), ptr::null_mut()), SQLITE_OK);
+        auth_reset(Some((20, SQLITE_DENY)));
+        assert_eq!(exec(db, "SELECT b FROM t"), SQLITE_OK);
+        assert!(auth_log().is_empty());
+
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
