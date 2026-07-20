@@ -591,13 +591,23 @@ fn not_null_and_default_survive_into_the_overlay() {
 #[test]
 fn unrepresentable_constraints_are_refused_by_name() {
     for (tag, ddl, want) in [
+        // A CHECK that COMPILES no longer refuses (see the enforcement tests);
+        // one using a sqlite function mpedb lacks still must — naming the
+        // function, so the caller knows exactly what to remove or wait for.
         (
-            "tblchk",
-            "CREATE TABLE chk (id INTEGER PRIMARY KEY, v TEXT, \
-               CONSTRAINT vchk CHECK (length(v) < 10))",
-            "CHECK",
+            "fnchk",
+            "CREATE TABLE chk (id INTEGER PRIMARY KEY, v TEXT CHECK (glob('a*', v)))",
+            "glob",
         ),
-        ("colchk", "CREATE TABLE chk (id INTEGER PRIMARY KEY, v INT CHECK (v > 0))", "CHECK"),
+        // `length()` pins its argument to text at compile time and an attached
+        // column is `Any` (a sqlite column can hold any type), so this CHECK
+        // does not compile TODAY — the refusal must say which function and why
+        // rather than hide the table silently.
+        (
+            "lenchk",
+            "CREATE TABLE chk (id INTEGER PRIMARY KEY, v TEXT CHECK (length(v) < 10))",
+            "length",
+        ),
         (
             "dyndefault",
             "CREATE TABLE chk (id INTEGER PRIMARY KEY, t TEXT DEFAULT CURRENT_TIMESTAMP)",
@@ -630,4 +640,150 @@ fn unrepresentable_constraints_are_refused_by_name() {
     ovl.query("INSERT INTO ok (id) VALUES (1)", &[]).unwrap();
     let got = rows(ovl.query("SELECT v, n FROM ok", &[]).unwrap());
     assert_eq!(got, vec![vec![Value::Text("z".into()), Value::Int(-1)]]);
+}
+
+/// Task #102's acceptance shape: a base whose table carries a CHECK now
+/// ATTACHES (it used to refuse by name), and the overlay's write path rejects
+/// exactly at INSERT/UPDATE time with sqlite's semantics — only FALSE rejects;
+/// TRUE and NULL pass — instead of letting the row in and failing the
+/// checkpoint later on an unrelated statement.
+#[test]
+fn base_checks_compile_and_enforce_at_insert() {
+    let p = setup("chk102");
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch("CREATE TABLE t102 (id INTEGER PRIMARY KEY, age INTEGER CHECK (age >= 0))")
+        .unwrap();
+    drop(c);
+
+    let mut ovl = SqliteOverlay::open(&p).unwrap();
+    let err = ovl.query("INSERT INTO t102 (id, age) VALUES (2, -1)", &[]).unwrap_err();
+    assert!(format!("{err}").contains("CHECK"), "{err}");
+    assert!(format!("{err}").contains("age >= 0"), "the error names the expression: {err}");
+    ovl.query("INSERT INTO t102 (id, age) VALUES (2, 1)", &[]).unwrap();
+    // NULL result = PASS (sqlite: only FALSE rejects).
+    ovl.query("INSERT INTO t102 (id, age) VALUES (3, NULL)", &[]).unwrap();
+    // UPDATE re-evaluates the CHECK against the NEW row.
+    let err = ovl.query("UPDATE t102 SET age = -5 WHERE id = 2", &[]).unwrap_err();
+    assert!(format!("{err}").contains("CHECK"), "{err}");
+    ovl.query("UPDATE t102 SET age = 7 WHERE id = 2", &[]).unwrap();
+    // DELETE writes a tombstone (PK + NULLs) — the CHECK must not block it.
+    ovl.query("DELETE FROM t102 WHERE id = 3", &[]).unwrap();
+    // The refused rows left nothing behind; the accepted update landed.
+    let got = rows(ovl.query("SELECT id, age FROM t102", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Int(2), Value::Int(7)]]);
+}
+
+/// The enforcement differential: the SAME write statements against the same
+/// CHECK-constrained schema, through the overlay on one file and through the
+/// sqlite library on a twin — accept/reject must match statement for
+/// statement, and the surviving rows must be identical. Covers multi-column
+/// CHECKs, quoted identifiers, `typeof()`/`json_valid()`, integer truthiness
+/// (`CHECK (n)`), NULL-passes, and sqlite's cross-type comparison (a text
+/// value in an INTEGER-affinity column compares greater than any number).
+///
+/// (`length()` is NOT here: it pins its argument to text at compile time, and
+/// an attached column is `Any`, so a base CHECK using it stays a per-table
+/// named refusal — see `unrepresentable_constraints_are_refused_by_name`.)
+#[test]
+fn base_checks_reject_exactly_what_sqlite_rejects() {
+    let ddl = "CREATE TABLE d (id INTEGER PRIMARY KEY, \
+                 a INTEGER CHECK (\"a\" >= 0), \
+                 b INTEGER, \
+                 t BLOB CHECK (typeof(t) <> 'text' OR t IS NULL), \
+                 j TEXT CHECK ((JSON_VALID(\"j\") OR \"j\" IS NULL)), \
+                 n INTEGER CHECK (n), \
+                 CHECK (a <= b OR b IS NULL))";
+    let p = setup("chkdiff");
+    let twin = setup("chkdiff-twin");
+    for f in [&p, &twin] {
+        let c = Connection::open(f).unwrap();
+        c.execute_batch(ddl).unwrap();
+        drop(c);
+    }
+
+    let mut ovl = SqliteOverlay::open(&p).unwrap();
+    let lib = Connection::open(&twin).unwrap();
+    for stmt in [
+        "INSERT INTO d VALUES (1, 1, 2, 5, '{\"x\": 1}', 5)",
+        "INSERT INTO d VALUES (2, -1, 2, 5, NULL, 5)",      // a >= 0 is FALSE
+        "INSERT INTO d VALUES (3, NULL, NULL, NULL, NULL, NULL)", // every CHECK is NULL: pass
+        "INSERT INTO d VALUES (4, 3, 1, NULL, NULL, 1)",    // a <= b is FALSE
+        "INSERT INTO d VALUES (5, 1, NULL, NULL, NULL, 1)", // b IS NULL arm: pass
+        "INSERT INTO d VALUES (6, 1, 2, 'txt', NULL, 1)",   // typeof(t) = 'text'
+        "INSERT INTO d VALUES (7, 1, 2, NULL, 'not json', 1)", // json_valid = 0
+        "INSERT INTO d VALUES (8, 1, 2, NULL, NULL, 0)",    // CHECK (n): 0 is falsy
+        "INSERT INTO d VALUES (9, 1, 2, NULL, NULL, 7)",    // CHECK (n): 7 is truthy
+        // TEXT in the INTEGER-affinity column: sqlite orders text above every
+        // number, so 'abc' >= 0 is TRUE — a pass, not a reject.
+        "INSERT INTO d VALUES (10, 'abc', NULL, NULL, NULL, 1)",
+        "UPDATE d SET a = -5 WHERE id = 1",
+        "UPDATE d SET a = 0 WHERE id = 1",
+        "UPDATE d SET t = 'lengthy' WHERE id = 1",
+        "DELETE FROM d WHERE id = 3",
+    ] {
+        let ours = ovl.query(stmt, &[]);
+        let theirs = lib.execute(stmt, []);
+        assert_eq!(
+            ours.is_ok(),
+            theirs.is_ok(),
+            "`{stmt}`: overlay {ours:?} vs sqlite {theirs:?}"
+        );
+    }
+    // Same survivors, cell for cell (quote() canonicalizes both sides).
+    let sel = "SELECT id, quote(a), quote(b), quote(t), quote(j), quote(n) FROM d ORDER BY id";
+    let ours: Vec<(i64, String, String, String, String, String)> = rows(ovl.query(sel, &[]).unwrap())
+        .into_iter()
+        .map(|r| {
+            let s = |v: &Value| match v {
+                Value::Text(s) => s.clone(),
+                other => panic!("quote() must answer text, got {other:?}"),
+            };
+            let id = match r[0] {
+                Value::Int(i) => i,
+                ref other => panic!("id must be int, got {other:?}"),
+            };
+            (id, s(&r[1]), s(&r[2]), s(&r[3]), s(&r[4]), s(&r[5]))
+        })
+        .collect();
+    let theirs: Vec<(i64, String, String, String, String, String)> = lib
+        .prepare(sel)
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })
+        .unwrap()
+        .map(|x| x.unwrap())
+        .collect();
+    assert_eq!(ours, theirs);
+}
+
+/// The blocker this task exists for: Django emits a CHECK on every
+/// PositiveIntegerField and JSONField (the exact wire shapes from
+/// C-API-COMPAT.md), so a real Django base must attach with those CHECKs LIVE.
+#[test]
+fn django_schema_attaches_with_live_checks() {
+    let p = setup("django-chk");
+    let c = Connection::open(&p).unwrap();
+    c.execute_batch(
+        "CREATE TABLE \"app_item\" (\
+           \"id\" integer NOT NULL PRIMARY KEY AUTOINCREMENT, \
+           \"age\" integer unsigned NOT NULL CHECK (\"age\" >= 0), \
+           \"data\" text NOT NULL CHECK ((JSON_VALID(\"data\") OR \"data\" IS NULL)))",
+    )
+    .unwrap();
+    drop(c);
+
+    let mut ovl = SqliteOverlay::open(&p).unwrap();
+    ovl.query("INSERT INTO app_item (id, age, data) VALUES (1, 30, '{\"k\": [1, 2]}')", &[])
+        .unwrap();
+    let err = ovl
+        .query("INSERT INTO app_item (id, age, data) VALUES (2, -1, '{}')", &[])
+        .unwrap_err();
+    assert!(format!("{err}").contains("CHECK"), "PositiveIntegerField: {err}");
+    let err = ovl
+        .query("INSERT INTO app_item (id, age, data) VALUES (2, 1, 'not json')", &[])
+        .unwrap_err();
+    assert!(format!("{err}").contains("CHECK"), "JSONField: {err}");
+    let got = rows(ovl.query("SELECT age, data FROM app_item", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Int(30), Value::Text("{\"k\": [1, 2]}".into())]]);
 }
