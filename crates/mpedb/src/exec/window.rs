@@ -75,7 +75,8 @@ pub(super) fn exec_select_windowed(
 
     // The outer ORDER BY runs over the projection (windows force it there).
     if !sp.order_by.is_empty() {
-        sort_rows(&mut out, &sp.order_by);
+        super::gather::check_order_colls(&sp.order_by, ctx.host_colls())?;
+        sort_rows(&mut out, &sp.order_by, ctx.host_colls());
     }
     // Sort-only junk columns are trailing; trim them after the sort.
     if sp.order_junk > 0 {

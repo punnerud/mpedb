@@ -142,7 +142,8 @@ pub use schema::{
     MAX_IDENTIFIER_LEN, MAX_INDEXES,
 };
 pub use value::{
-    exact_float_as_int, exact_int_as_float, Affinity, Collation, ColumnType, Value,
+    exact_float_as_int, exact_int_as_float, Affinity, Collation, ColumnType, HostColls, OrderColl,
+    Value,
 };
 
 /// Maximum number of tables (user + system) in one database — a **resource**

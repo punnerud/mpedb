@@ -399,8 +399,22 @@ pub(crate) enum Expr {
     /// The [`mpedb_types::AggTarget`] is the built-in aggregate, or — since
     /// design/DESIGN-UDF.md stage 2 — a HOST aggregate carried by name. The
     /// parser only produces the host form for a name the compiling connection
-    /// registered via `xStep`/`xFinal`, and only for a one-argument call.
-    Agg(mpedb_types::AggTarget, Option<Box<Expr>>, bool, Option<Box<Expr>>),
+    /// registered via `xStep`/`xFinal`.
+    ///
+    /// The trailing `Vec<Expr>` is the arguments AFTER the first, and is
+    /// non-empty ONLY for a host aggregate registered with arity > 1
+    /// (`create_aggregate("checkType", 2, C)` → `checkType('int', ?)`). Every
+    /// mpedb built-in takes exactly one argument, so it rides beside `arg`
+    /// rather than replacing it: every rule written about "the aggregate's
+    /// argument" (DISTINCT dedup, the min/max bare-column witness, `count(*)`'s
+    /// `None`) keeps meaning exactly what it meant.
+    Agg(
+        mpedb_types::AggTarget,
+        Option<Box<Expr>>,
+        bool,
+        Option<Box<Expr>>,
+        Vec<Expr>,
+    ),
     /// `<fn>(args) OVER (<spec>)` — a WINDOW function (design/DESIGN-WINDOW.md).
     ///
     /// Its own node (not [`Expr::Agg`]/[`Expr::Func`]) because it is neither a

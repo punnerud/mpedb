@@ -315,27 +315,29 @@ fn order_by_pk_prefix_elision() {
         PlanStmt::Select(SelectPlan { order_by, .. }) => order_by,
         other => panic!("{other:?}"),
     };
-    use mpedb_types::Collation::Binary;
+    // Every key here sorts under the BUILT-IN binary collation; a host
+    // collating sequence is the `OrderColl::Host` case, tested in `mpedb`.
+    let binary = mpedb_types::OrderColl::Native(mpedb_types::Collation::Binary);
     assert_eq!(order("SELECT * FROM users ORDER BY id"), vec![]);
     assert_eq!(order("SELECT * FROM users ORDER BY id ASC"), vec![]);
     assert_eq!(
         order("SELECT * FROM users ORDER BY id DESC"),
-        vec![(0u16, SortDir::dir(true), Binary)]
+        vec![(0u16, SortDir::dir(true), binary.clone())]
     );
     assert_eq!(
         order("SELECT * FROM users ORDER BY email"),
-        vec![(1u16, SortDir::dir(false), Binary)]
+        vec![(1u16, SortDir::dir(false), binary.clone())]
     );
     assert_eq!(order("SELECT * FROM orders ORDER BY user_id, item_no"), vec![]);
     assert_eq!(order("SELECT * FROM orders ORDER BY user_id"), vec![]);
     assert_eq!(
         order("SELECT * FROM orders ORDER BY item_no, user_id"),
-        vec![(1u16, SortDir::dir(false), Binary), (0, SortDir::dir(false), Binary)]
+        vec![(1u16, SortDir::dir(false), binary.clone()), (0, SortDir::dir(false), binary.clone())]
     );
     // Not elided over an index probe (index order != PK order).
     assert_eq!(
         order("SELECT * FROM users WHERE email = 'x' ORDER BY id"),
-        vec![(0u16, SortDir::dir(false), Binary)]
+        vec![(0u16, SortDir::dir(false), binary.clone())]
     );
     // An explicit NULL placement blocks the elision even on the PK. A PK column
     // cannot be NULL, so the two orders coincide — but the elision is allowed to
@@ -343,7 +345,7 @@ fn order_by_pk_prefix_elision() {
     // what a PK may hold.
     assert_eq!(
         order("SELECT * FROM users ORDER BY id NULLS LAST"),
-        vec![(0u16, SortDir::new(false, Some(false)), Binary)]
+        vec![(0u16, SortDir::new(false, Some(false)), binary.clone())]
     );
     // …and the DEFAULT placement, however it is spelled, still elides.
     assert_eq!(order("SELECT * FROM users ORDER BY id ASC NULLS FIRST"), vec![]);

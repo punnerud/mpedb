@@ -86,7 +86,7 @@ fn encode_compound(c: &CompoundPlan, buf: &mut Vec<u8>) {
     for (col, dir, coll) in &c.order_by {
         w_u16(buf, *col);
         buf.push(dir.to_byte());
-        buf.push(*coll as u8);
+        w_collation(buf, coll);
     }
     encode_opt_u64(c.limit, buf);
     encode_opt_u64(c.offset, buf);
@@ -333,6 +333,19 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
 
 /// A u32-length-prefixed UTF-8 string — the same convention projection names
 /// use (`encode_projection`).
+/// An ORDER-BY collating sequence (format 52). Tags 0..=2 are the built-ins,
+/// one byte, exactly as every earlier format wrote them; tag 3 introduces a
+/// HOST collation's name, and only a connection-local plan can carry one.
+fn w_collation(buf: &mut Vec<u8>, coll: &mpedb_types::OrderColl) {
+    match coll {
+        mpedb_types::OrderColl::Native(c) => buf.push(*c as u8),
+        mpedb_types::OrderColl::Host(name) => {
+            buf.push(3);
+            w_str(buf, name);
+        }
+    }
+}
+
 fn w_str(buf: &mut Vec<u8>, s: &str) {
     buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
     buf.extend_from_slice(s.as_bytes());
@@ -385,7 +398,7 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
             for (c, dir, coll) in order_by {
                 w_u16(buf, *c);
                 buf.push(dir.to_byte());
-                buf.push(*coll as u8);
+                w_collation(buf, coll);
             }
             encode_opt_u64(*limit, buf);
             encode_opt_u64(*offset, buf);
@@ -451,6 +464,13 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
                         // FILTER (WHERE …) (format 38): optional predicate over
                         // the base row, same optional-program framing as `arg`.
                         encode_opt_program(c.filter.as_ref(), buf);
+                        // Host-aggregate arguments after the first (format 51).
+                        // A zero count is one byte, so every native plan is
+                        // unchanged but for that byte.
+                        w_u16(buf, c.extra_args.len() as u16);
+                        for p in &c.extra_args {
+                            p.encode_into(buf);
+                        }
                     }
                     encode_opt_program(a.having.as_ref(), buf);
                     // sqlite bare columns (format 30): base-row indices carried

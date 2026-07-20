@@ -27,6 +27,9 @@ pub(super) fn distinct_order_by(
     // callers that must refuse (DISTINCT, and the grouped path, where the sort
     // key lives in the grouped tuple instead).
     mut junk: Option<(&mut Vec<Projection>, &mut Binder<'_>)>,
+    // HOST collating-sequence names in scope, so `ORDER BY x COLLATE mycoll`
+    // resolves. `&[]` for every caller with none registered.
+    hcolls: &[String],
 ) -> Result<(OrderKeys, u16)> {
     let Some(items) = s.items.as_ref() else {
         // `SELECT *`: the projection is the base row, column for column, so a
@@ -38,8 +41,9 @@ pub(super) fn distinct_order_by(
             // Peel an explicit `COLLATE` off the key so the resolution below
             // (ordinal / column / junk) sees the inner expression, and the
             // collation rides the sort tuple.
-            let (e, coll) = peel_collate(e)?;
-            let coll = coll.unwrap_or_else(|| declared_collation(e, scope));
+            let (e, coll) = peel_order_collate(e, hcolls)?;
+            let coll = coll
+                .unwrap_or_else(|| mpedb_types::OrderColl::Native(declared_collation(e, scope)));
             if let Some(pos) = ordinal(e, scope.width())? {
                 out.push((pos, *desc, coll));
                 continue;
@@ -70,8 +74,9 @@ pub(super) fn distinct_order_by(
     for (i, (key, desc)) in s.order_by.iter().enumerate() {
         // Peel an explicit `COLLATE`; the collation rides the sort tuple, the
         // inner expression drives resolution.
-        let (key, coll) = peel_collate(key)?;
-        let coll = coll.unwrap_or_else(|| declared_collation(key, scope));
+        let (key, coll) = peel_order_collate(key, hcolls)?;
+        let coll = coll
+            .unwrap_or_else(|| mpedb_types::OrderColl::Native(declared_collation(key, scope)));
         if let Some(pos) = ordinal(key, items.len())? {
             out.push((pos, *desc, coll));
             continue;
@@ -537,6 +542,9 @@ pub(super) fn plan_select<'s>(
     // That needs every key to be a plain column of this table AND no dedup in
     // between — under DISTINCT the sort must follow the dedup, so the base row
     // is not the tuple being ordered at all.
+    // The registered HOST collation names, snapshotted before the binder is
+    // borrowed mutably for the sort-only-column path below.
+    let hcolls: Vec<String> = binder.host_colls().to_vec();
     let mut base_keys = Vec::with_capacity(s.order_by.len());
     for (e, desc) in &s.order_by {
         if s.distinct {
@@ -544,8 +552,10 @@ pub(super) fn plan_select<'s>(
         }
         // Peel an explicit `COLLATE`; a bare `ORDER BY name COLLATE NOCASE` still
         // sorts the base row (the collation only changes the comparator).
-        let (e, coll) = peel_collate(e)?;
-        let coll = coll.unwrap_or_else(|| declared_collation(e, &binder.scope));
+        let (e, coll) = peel_order_collate(e, &hcolls)?;
+        let coll = coll.unwrap_or_else(|| {
+            mpedb_types::OrderColl::Native(declared_collation(e, &binder.scope))
+        });
         // An unqualified name matching a select-item ALIAS orders the OUTPUT
         // (the PostgreSQL rule) — never the base row, even when a table
         // column shares the name. Route it to the projection-sort path.
@@ -585,7 +595,7 @@ pub(super) fn plan_select<'s>(
         } else {
             Some((&mut projection, &mut binder))
         };
-        let (keys, n_junk) = distinct_order_by(s, &Scope::single(table), junk)?;
+        let (keys, n_junk) = distinct_order_by(s, &Scope::single(table), junk, &hcolls)?;
         (keys, OrderOver::Projection, n_junk)
     };
     // A PK-prefix ORDER BY, all ascending, over a PK-ordered access path is
@@ -616,7 +626,9 @@ pub(super) fn plan_select<'s>(
             .all(|(k, (c, dir, coll))| {
                 !dir.desc
                     && dir.default_nulls()
-                    && *coll == Collation::Binary
+                    // A HOST collation is never satisfied by scan order either —
+                    // `native()` is None for one, so this refuses it by shape.
+                    && coll.native() == Some(Collation::Binary)
                     && table.primary_key[k] == *c
             })
     {

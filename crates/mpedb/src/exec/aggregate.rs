@@ -28,11 +28,27 @@ impl Acc {
     /// Feed one row. `None` is `count(*)`'s "the row itself" — never produced for
     /// a host aggregate (the plan decoder rejects a host call with no argument).
     fn push(&mut self, v: Option<&Value>) -> Result<()> {
+        self.push_n(v, &[])
+    }
+
+    /// Feed one row, with a host aggregate's arguments AFTER the first.
+    /// `extra` is always empty for a built-in (mpedb has no multi-argument
+    /// native aggregate), and the DISTINCT dedup key stays the FIRST argument —
+    /// which is the only argument a DISTINCT call may have (the parser refuses
+    /// `f(DISTINCT a, b)`).
+    fn push_n(&mut self, v: Option<&Value>, extra: &[Value]) -> Result<()> {
         match self {
             Acc::Native(a) => a.push(v),
             Acc::Host { state, seen, coll } => {
+                let mut all: Vec<Value>;
                 let args = match v {
-                    Some(v) => std::slice::from_ref(v),
+                    Some(v) if extra.is_empty() => std::slice::from_ref(v),
+                    Some(v) => {
+                        all = Vec::with_capacity(1 + extra.len());
+                        all.push(v.clone());
+                        all.extend_from_slice(extra);
+                        &all[..]
+                    }
                     None => &[][..],
                 };
                 if let Some(seen) = seen {
@@ -73,9 +89,10 @@ fn new_accum(a: &AggCall, host: Option<&dyn HostAggs>, coll: Collation) -> Resul
             "host aggregate {name}() is not in scope for this execution"
         ))
     })?;
-    // The plan's shape IS the arity: a host call always carries its one argument
-    // (decode enforces it), so the registry lookup asks for exactly that.
-    let argc = a.arg.is_some() as i32;
+    // The plan's shape IS the arity: a host call always carries its first
+    // argument (decode enforces it) plus however many `extra_args` it was
+    // written with, so the registry lookup asks for exactly that count.
+    let argc = a.arg.is_some() as i32 + a.extra_args.len() as i32;
     Ok(Acc::Host {
         state: host.create(name, argc)?,
         seen: a.distinct.then(std::collections::BTreeSet::new),
@@ -133,7 +150,7 @@ pub(super) fn exec_aggregate(
     joined_filter: Option<&ExprProgram>,
     agg: &Aggregation,
     projection: &[Projection],
-    order_by: &[(u16, SortDir, Collation)],
+    order_by: &[(u16, SortDir, mpedb_types::OrderColl)],
     order_over: OrderOver,
     order_junk: u16,
     limit: Option<u64>,
@@ -323,7 +340,14 @@ pub(super) fn exec_aggregate(
                 None => entry.1[i].push(None)?,
                 Some(p) => {
                     let v = p.eval_host(row, row_params, ctx.host_fns())?;
-                    entry.1[i].push(Some(&v))?;
+                    // A host aggregate's arguments after the first, evaluated
+                    // over the same base row and in the same order. Empty for
+                    // every built-in, so this allocates nothing for them.
+                    let mut extra = Vec::with_capacity(call.extra_args.len());
+                    for p in &call.extra_args {
+                        extra.push(p.eval_host(row, row_params, ctx.host_fns())?);
+                    }
+                    entry.1[i].push_n(Some(&v), &extra)?;
                 }
             }
         }
@@ -461,7 +485,8 @@ pub(super) fn exec_aggregate(
     // Sort the GROUPED tuple only when the indices refer to it; otherwise the
     // sort waits for the projection below.
     if order_over == OrderOver::Grouped && !order_by.is_empty() {
-        sort_rows(&mut out, order_by);
+        super::gather::check_order_colls(order_by, ctx.host_colls())?;
+        sort_rows(&mut out, order_by, ctx.host_colls());
     }
 
     let skip = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
@@ -488,7 +513,8 @@ pub(super) fn exec_aggregate(
         projected.push(orow);
     }
     if order_over == OrderOver::Projection {
-        sort_rows(&mut projected, order_by);
+        super::gather::check_order_colls(order_by, ctx.host_colls())?;
+        sort_rows(&mut projected, order_by, ctx.host_colls());
     }
     // Sort-only columns come off after the sort, exactly as in the plain path —
     // `ORDER BY count(*) + 1` computes a column nobody asked to see.

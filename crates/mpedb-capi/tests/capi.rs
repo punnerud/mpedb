@@ -1011,6 +1011,13 @@ fn fnptr1(f: unsafe extern "C" fn(*mut c_void)) -> *mut c_void {
     f as *const () as *mut c_void
 }
 
+/// The same, for a collating sequence's `xCompare`.
+fn cmpptr(
+    f: unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int,
+) -> *mut c_void {
+    f as *const () as *mut c_void
+}
+
 /// A C aggregate registered through `sqlite3_create_function_v2`: bare, grouped,
 /// over an empty set, and with `pApp` visible in both callbacks.
 #[test]
@@ -1921,36 +1928,65 @@ unsafe extern "C" fn count_destroy(p: *mut c_void) {
     c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 }
 
-/// sqlite's documented contract: when `sqlite3_create_collation_v2` FAILS the
-/// destructor is NOT invoked (the caller frees its context — CPython's
-/// `create_collation` does exactly that), while a failing
-/// `sqlite3_create_window_function` DOES invoke it (and CPython relies on
-/// that by not freeing). Invoking it on the collation refusal was a
-/// double-free that corrupted CPython's heap and segfaulted test_sqlite3.
 #[test]
-fn collation_refusal_leaves_destructor_alone_window_refusal_runs_it() {
+fn collation_registration_orders_sorts_and_honors_the_destructor_contract() {
     use std::sync::atomic::{AtomicU32, Ordering};
     unsafe {
         let db = open_memory();
         let hits = AtomicU32::new(0);
         let app = &hits as *const AtomicU32 as *mut c_void;
 
+        // A registration SUCCEEDS and the destructor does NOT run (it runs when
+        // the entry is replaced/deleted/closed, not now).
         let name = cs("mycoll");
         let rc = sqlite3_create_collation_v2(
             db,
             name.as_ptr(),
             1, // SQLITE_UTF8
             app,
-            ptr::null_mut(),
+            cmpptr(reverse_cmp),
             fnptr1(count_destroy),
         );
-        assert_eq!(rc, SQLITE_ERROR, "custom collations are refused");
-        assert_eq!(
-            hits.load(Ordering::SeqCst),
-            0,
-            "collation destructor must NOT run on failure (double-free under CPython)"
-        );
+        assert_eq!(rc, SQLITE_OK, "custom collations are registered");
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "destructor does not run on success");
 
+        // …and it ORDERS: `reverse_cmp` reverses byte order.
+        assert_eq!(exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t VALUES (1,'a'),(2,'b'),(3,'c')"), SQLITE_OK);
+        assert_eq!(texts(db, "SELECT s FROM t ORDER BY s COLLATE mycoll"), ["c", "b", "a"]);
+        // A plain ORDER BY is untouched by the registration.
+        assert_eq!(texts(db, "SELECT s FROM t ORDER BY s"), ["a", "b", "c"]);
+
+        // Re-registering under the same name REPLACES and runs the OLD
+        // destructor (sqlite's rule; CPython's `test_collation_register_twice`).
+        let rc = sqlite3_create_collation_v2(
+            db,
+            name.as_ptr(),
+            1,
+            app,
+            cmpptr(forward_cmp),
+            ptr::null_mut(),
+        );
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "replaced entry's destructor ran");
+        assert_eq!(texts(db, "SELECT s FROM t ORDER BY s COLLATE mycoll"), ["a", "b", "c"]);
+
+        // A NULL xCompare DELETES it, and a statement naming it then fails with
+        // sqlite's exact wording — never a silent fallback to BINARY, which
+        // would be a different row ORDER with no error.
+        let rc =
+            sqlite3_create_collation_v2(db, name.as_ptr(), 1, ptr::null_mut(), ptr::null_mut(), ptr::null_mut());
+        assert_eq!(rc, SQLITE_OK);
+        let mut st: *mut Stmt = ptr::null_mut();
+        let sql = cs("SELECT s FROM t ORDER BY s COLLATE mycoll");
+        let rc = sqlite3_prepare_v2(db, sql.as_ptr(), -1, &mut st, ptr::null_mut());
+        let msg = CStr::from_ptr(sqlite3_errmsg(db)).to_string_lossy().into_owned();
+        assert_ne!(rc, SQLITE_OK, "a deregistered collation cannot be used");
+        assert_eq!(msg, "no such collation sequence: mycoll", "sqlite's exact wording");
+
+        // The window-function stub's destructor contract is the OPPOSITE and
+        // still holds: sqlite DOES invoke it on a failed registration, and
+        // CPython relies on that by not freeing.
         let wname = cs("mywin");
         let rc = sqlite3_create_window_function(
             db,
@@ -1967,11 +2003,58 @@ fn collation_refusal_leaves_destructor_alone_window_refusal_runs_it() {
         assert_eq!(rc, SQLITE_ERROR, "window functions are refused");
         assert_eq!(
             hits.load(Ordering::SeqCst),
-            1,
+            2,
             "window-function destructor MUST run on failure (CPython does not free otherwise)"
         );
         sqlite3_close(db);
     }
+}
+
+/// A collating sequence that reverses byte order, and its identity twin.
+/// sqlite passes BYTE runs that are not NUL-terminated, so both use the lengths.
+unsafe extern "C" fn reverse_cmp(
+    _app: *mut c_void,
+    na: c_int,
+    pa: *const c_void,
+    nb: c_int,
+    pb: *const c_void,
+) -> c_int {
+    -forward_cmp(_app, na, pa, nb, pb)
+}
+
+unsafe extern "C" fn forward_cmp(
+    _app: *mut c_void,
+    na: c_int,
+    pa: *const c_void,
+    nb: c_int,
+    pb: *const c_void,
+) -> c_int {
+    let a = std::slice::from_raw_parts(pa as *const u8, na as usize);
+    let b = std::slice::from_raw_parts(pb as *const u8, nb as usize);
+    match a.cmp(b) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+/// Every TEXT value of the single-column query `sql`, in row order.
+unsafe fn texts(db: *mut Sqlite3, sql: &str) -> Vec<String> {
+    let mut st: *mut Stmt = ptr::null_mut();
+    let s = cs(sql);
+    assert_eq!(
+        sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+        SQLITE_OK,
+        "prepare {sql}: {}",
+        CStr::from_ptr(sqlite3_errmsg(db)).to_string_lossy()
+    );
+    let mut out = Vec::new();
+    while sqlite3_step(st) == SQLITE_ROW {
+        let p = sqlite3_column_text(st, 0);
+        out.push(CStr::from_ptr(p as *const c_char).to_string_lossy().into_owned());
+    }
+    sqlite3_finalize(st);
+    out
 }
 
 // ---- CPython test_sqlite3 batch: trace, limits, trivia, ro, busy ----------

@@ -10,6 +10,14 @@ fn collate_suffix(coll: Collation) -> String {
     }
 }
 
+/// The same, for an ORDER BY key — which may name a HOST collation.
+fn order_collate_suffix(coll: &mpedb_types::OrderColl) -> String {
+    match coll {
+        mpedb_types::OrderColl::Native(c) => collate_suffix(*c),
+        h => format!(" COLLATE {}", h.name()),
+    }
+}
+
 /// EXPLAIN suffix for an ORDER BY key's NULL placement: empty when it is the
 /// one the direction implies (sqlite's default: first for ASC, last for DESC),
 /// so every sort written without a `NULLS` clause renders exactly as before.
@@ -129,7 +137,7 @@ impl CompiledPlan {
                     format!(
                         "output#{}{}{}{}",
                         i + 1,
-                        collate_suffix(*coll),
+                        order_collate_suffix(coll),
                         if dir.desc { " DESC" } else { " ASC" },
                         nulls_suffix(*dir)
                     )
@@ -426,7 +434,7 @@ impl CompiledPlan {
                             format!(
                                 "{}{}{}{}",
                                 sort_name(*c),
-                                collate_suffix(*coll),
+                                order_collate_suffix(coll),
                                 if dir.desc { " DESC" } else { " ASC" },
                                 nulls_suffix(*dir)
                             )

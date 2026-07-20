@@ -522,8 +522,14 @@ pub(super) fn plan_window_select(
     for (i, ((e, desc), (orig, _))) in rewritten_order.iter().zip(&s.order_by).enumerate() {
         // Collation comes from the original key text; peel both the original
         // (for ordinal/alias) and the lifted expr (for item match / junk).
+        // A WINDOW query's ORDER BY keeps the BUILT-IN collations only: a host
+        // collating sequence here would have to order a window PARTITION, and
+        // `peel_collate` refuses an unknown name by name ("no such collation
+        // sequence"), which is the honest answer rather than a silent BINARY.
         let (orig, coll) = peel_collate(orig)?;
-        let coll = coll.unwrap_or_else(|| declared_collation(orig, &name_scope));
+        let coll = mpedb_types::OrderColl::Native(
+            coll.unwrap_or_else(|| declared_collation(orig, &name_scope)),
+        );
         let (e, _) = peel_collate(e)?;
         // `ORDER BY 1` — an output ordinal.
         if let Some(pos) = ordinal(orig, n_items)? {

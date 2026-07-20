@@ -159,7 +159,7 @@ impl<'db> RowStream<'db> {
             let r = db.engine.begin_read()?;
             let mut partial = false;
             let res = {
-                let mut ctx = ReadCtx(&r, None, None);
+                let mut ctx = ReadCtx(&r, None, None, None);
                 exec::exec_stmt(&mut ctx, &schema, &plan, params, &mut partial)
             }?;
             r.finish()?; // SnapshotEvicted here invalidates the rows

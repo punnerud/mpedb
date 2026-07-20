@@ -241,28 +241,46 @@ fn reaches_subquery(e: &ast::Expr) -> bool {
 pub struct HostUdfSet {
     fns: Vec<(String, i32)>,
     aggs: Vec<(String, i32)>,
+    /// HOST collating-sequence names (`sqlite3_create_collation`). Names only:
+    /// a collation has no arity, and the comparator itself never leaves the
+    /// connection's registry — the plan carries the NAME and the executor
+    /// resolves it (design/DESIGN-UDF.md stage 3).
+    colls: Vec<String>,
 }
 
 impl HostUdfSet {
     /// Build from `(name, n_arg)` pairs; `n_arg == -1` is sqlite's variadic
     /// "any arity" registration.
     pub fn new(fns: Vec<(String, i32)>) -> HostUdfSet {
-        HostUdfSet { fns, aggs: Vec::new() }
+        HostUdfSet { fns, aggs: Vec::new(), colls: Vec::new() }
     }
 
     /// Build from the scalar AND aggregate registrations.
     pub fn with_aggs(fns: Vec<(String, i32)>, aggs: Vec<(String, i32)>) -> HostUdfSet {
-        HostUdfSet { fns, aggs }
+        HostUdfSet { fns, aggs, colls: Vec::new() }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.fns.is_empty() && self.aggs.is_empty()
+        self.fns.is_empty() && self.aggs.is_empty() && self.colls.is_empty()
     }
 
     /// The registered host AGGREGATE names, for the parser's grammar decision.
     /// Name-only on purpose: the parser must choose the aggregate branch BEFORE
     /// it has parsed the arguments, so arity is checked afterwards
     /// ([`host_agg_arity_ok`](Self::host_agg_arity_ok)).
+    /// The registered host COLLATION names, for the ORDER-BY peel. Empty for
+    /// every caller that registered none, so collation resolution is exactly as
+    /// before for them.
+    pub fn colls(&self) -> &[String] {
+        &self.colls
+    }
+
+    /// Replace the host COLLATION names (the shim registers them per
+    /// connection, alongside the scalar/aggregate registries).
+    pub fn set_colls(&mut self, colls: Vec<String>) {
+        self.colls = colls;
+    }
+
     pub fn agg_names(&self) -> Vec<String> {
         self.aggs.iter().map(|(n, _)| n.clone()).collect()
     }
@@ -628,6 +646,12 @@ impl<'a> Binder<'a> {
     /// Cheap: the set is a small `(name, arity)` vector cloned once per compile.
     pub fn set_host_udfs(&mut self, set: &HostUdfSet) {
         self.host_udfs = set.clone();
+    }
+
+    /// The HOST collating-sequence names in scope, for an ORDER BY key's
+    /// `COLLATE`. Empty for a connection that registered none.
+    pub(crate) fn host_colls(&self) -> &[String] {
+        self.host_udfs.colls()
     }
 
     /// Pin a parameter slot's type before binding — used for the reserved
@@ -1260,7 +1284,7 @@ impl<'a> Binder<'a> {
             // `WHERE count(*) > 1` is the classic: it reads naturally and is
             // meaningless (the filter runs per row, before any group exists).
             // SQL spells that HAVING, and saying so beats "unknown function".
-            ast::Expr::Agg(f, _, _, _) => Err(bind_err(format!(
+            ast::Expr::Agg(f, _, _, _, _) => Err(bind_err(format!(
                 "{}() is an aggregate and cannot be used here — aggregates are only \
                  allowed in a SELECT list or HAVING. A per-row filter is WHERE; a \
                  filter on a GROUPED result is HAVING.",
@@ -3002,6 +3026,42 @@ fn cast_result_type(aff: Affinity, src: Ty) -> Ty {
             None => return None,
         },
     })
+}
+
+/// Resolve an ORDER-BY collation NAME to a built-in, or — when the compiling
+/// connection registered one under that name — a HOST collation
+/// (design/DESIGN-UDF.md stage 3). An unknown name is still the clean bind
+/// error, so a typo is caught here rather than at sort time.
+///
+/// A built-in always wins, exactly as it does for a function name: no
+/// registration can redefine BINARY/NOCASE/RTRIM.
+pub(crate) fn resolve_order_collation(name: &str, host: &[String]) -> Result<mpedb_types::OrderColl> {
+    if let Some(c) = Collation::parse(name) {
+        return Ok(mpedb_types::OrderColl::Native(c));
+    }
+    if let Some(h) = host.iter().find(|h| h.eq_ignore_ascii_case(name)) {
+        return Ok(mpedb_types::OrderColl::Host(h.clone()));
+    }
+    Err(bind_err(format!("no such collation sequence: {name}")))
+}
+
+/// [`peel_collate`] for an ORDER BY key, where a HOST collation is legal.
+/// Chained `COLLATE`s resolve to the outermost, as there; the shadowed names
+/// are still validated (against the built-ins AND the host registrations).
+pub(crate) fn peel_order_collate<'a>(
+    e: &'a ast::Expr,
+    host: &[String],
+) -> Result<(&'a ast::Expr, Option<mpedb_types::OrderColl>)> {
+    let ast::Expr::Collate(inner, name) = e else {
+        return Ok((e, None));
+    };
+    let coll = resolve_order_collation(name, host)?;
+    let mut cur: &ast::Expr = inner;
+    while let ast::Expr::Collate(next, n) = cur {
+        resolve_order_collation(n, host)?;
+        cur = next;
+    }
+    Ok((cur, Some(coll)))
 }
 
 /// Resolve a collation NAME (as written after `COLLATE`) to a built-in, or a

@@ -415,6 +415,11 @@ impl CompiledPlan {
                         if let Some(p) = &c.filter {
                             self.check_program_width(p, base_width, ptypes)?;
                         }
+                        // Host-aggregate arguments after the first (format 51):
+                        // the same base row `arg` is evaluated over.
+                        for p in &c.extra_args {
+                            self.check_program_width(p, base_width, ptypes)?;
+                        }
                     }
                     // sqlite bare columns (format 30) extend the grouped tuple to
                     // `[keys ‖ aggs ‖ bare_cols]`. Each is a BASE-row column, so
