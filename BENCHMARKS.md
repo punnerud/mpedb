@@ -401,9 +401,12 @@ The composition is not the prize. The flush count is.
 
 ### Hypothesis 2: "msync of a mapped range is more expensive than append + fdatasync" — REFUTED as stated, but it led to the real bug
 
-A 5-arm probe on this box, all arms interleaved **inside one loop** so host drift
-cancels (`scratchpad/syncprobe.rs`, 64 MiB mapping, 1,200 iterations, p50 µs;
-the box was NOT idle, so read the ratios, not the absolutes):
+A 6-arm probe on this box, all arms interleaved **inside one loop** so host drift
+cancels — 64 MiB mapping, 1,200 iterations, p50 µs. Reproduce:
+
+```sh
+cargo run --release -p mpedb --example sync_cost -- /path/on/disk 600
+```
 
 | arm | ext4 p50 | xfs p50 |
 |---|--:|--:|
@@ -412,6 +415,10 @@ the box was NOT idle, so read the ratios, not the absolutes):
 | C **8 scattered 1-page msyncs** + meta msync | **15,280** | **15,846** |
 | D 1 msync of 8 *contiguous* pages + meta msync | 2,276 | 4,449 |
 | E `pwrite(32 KiB)` + `fdatasync` | 2,181 | 3,019 |
+| F 1 msync over the **span** of the 8 scattered + meta | 5,358 | 7,870 |
+
+(Re-run on an idle box with the in-repo example: A 1,993 · B 1,963 · C 14,393 ·
+D 2,405 · E 2,294 · F 5,287 — same shape, so the ratios are not a load artifact.)
 
 **A ≈ B.** msync of a mapped range and pwrite+fdatasync of a small record cost
 the same thing, because both are one device cache flush. `wal` is not cheaper
@@ -448,9 +455,9 @@ The §4.1 ordering is untouched: the span provably cannot reach the meta pages
 table), and the barrier stays exactly where it was.
 
 **Is a wide span free?** That is the obvious objection — a commit touching page
-10 and page 250,000 now msyncs a 1 GiB range. Measured directly
-(`scratchpad/spanprobe.rs`: 1 GiB mapping, 8 dirty pages spread evenly over the
-span, arms interleaved in one loop, p50 µs):
+10 and page 250,000 now msyncs a 1 GiB range. Measured directly (part 2 of
+`examples/sync_cost`: 1 GiB mapping, 8 dirty pages spread evenly over the span,
+arms interleaved in one loop, p50 µs):
 
 | span | ext4 | xfs |
 |--:|--:|--:|
