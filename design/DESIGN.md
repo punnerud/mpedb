@@ -366,7 +366,7 @@ known (§7.3), so a writer could touch those pages *before* taking the lock and 
 fault inside it — is sound and unimplemented; the only page-residency call in the engine
 is the opportunistic `madvise(MADV_HUGEPAGE)` of §9. Staged in
 design/DESIGN-MPEE-OPT.md §1.2a (and its §5 verdict), recorded as partly-built in
-INNOVATIONS.md §9.6.
+INNOVATIONS.md §9.7.
 
 ### 5.3 Phase 2 (BUILT): the intent ring — deterministic batch scheduling
      ("the request queue is an index")
@@ -852,7 +852,7 @@ index numbering + `KeyAccess` (Point with param/const slots | Range | Full) +
     scale study of the conflict relation — an example, not a code path.
   - **prefaulting before the writer lock** (§5.2) — designed, not built.
 
-  INNOVATIONS.md §9.6 states both gaps; this section is subordinate to it.
+  INNOVATIONS.md §9.7 states both gaps; this section is subordinate to it.
 
 ### 7.4 Expression IR
 
