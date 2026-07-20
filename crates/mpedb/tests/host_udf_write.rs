@@ -462,34 +462,42 @@ fn a_udf_that_reenters_the_database_errors_rather_than_deadlocking() {
     db.verify().expect("page accounting after a reentrant UDF");
 }
 
-// ------------------------------------------------ documented remaining limit
+// ------------------------------------------ expressions in INSERT VALUES ----
 
-/// `INSERT ... VALUES (<expression>)` takes only literals and parameters — for
-/// EVERY function, not just host UDFs. The refusal names that limit, and
-/// `INSERT ... SELECT` is the working form.
+/// `INSERT ... VALUES (<expression>)` is planned as `INSERT ... SELECT` (the
+/// same statement: a VALUES row is evaluated over no row, which is what a
+/// FROM-less SELECT is), so a function call there works — a native one and a
+/// HOST-registered one alike, on the write path.
 #[test]
-fn insert_values_expression_refusal_is_general() {
+fn insert_values_carries_an_expression_host_udf_included() {
     let (db, _g) = test_db("insert-values");
     register_plus1(&db);
-    let native = db
-        .query("INSERT INTO t (id, n) VALUES (1, abs(-5))", &[])
+    db.query("INSERT INTO t (id, n) VALUES (1, abs(-5))", &[])
+        .expect("a native function in VALUES");
+    db.query("INSERT INTO t (id, n) VALUES (2, plus1(4))", &[])
+        .expect("a host UDF in VALUES");
+    assert_eq!(
+        rows(db.query("SELECT id, n FROM t ORDER BY id", &[]).unwrap()),
+        vec![
+            vec![Value::Int(1), Value::Int(5)],
+            vec![Value::Int(2), Value::Int(5)]
+        ]
+    );
+    // A MULTI-row VALUES with an expression is still refused by name: it would
+    // need a `UNION ALL` source, which INSERT ... SELECT refuses.
+    let e = db
+        .query("INSERT INTO t (id, n) VALUES (3, 1), (4, plus1(4))", &[])
         .unwrap_err();
-    let host = db
-        .query("INSERT INTO t (id, n) VALUES (1, plus1(4))", &[])
-        .unwrap_err();
-    for e in [&native, &host] {
-        assert!(
-            matches!(e, Error::Bind(m) if m.contains("literals or parameters")),
-            "expected the general INSERT-VALUES limit, got {e:?}"
-        );
-    }
-    // the working form
-    db.query("INSERT INTO t (id, n) VALUES (1, 4)", &[]).unwrap();
-    db.query("INSERT INTO t (id, n) SELECT 2, plus1(n) FROM t WHERE id = 1", &[])
+    assert!(
+        matches!(&e, Error::Bind(m) if m.contains("literals or parameters")),
+        "expected the multi-row limit, got {e:?}"
+    );
+    // and the long-standing working form still works
+    db.query("INSERT INTO t (id, n) SELECT 5, plus1(n) FROM t WHERE id = 1", &[])
         .expect("INSERT ... SELECT carries expressions, UDFs included");
     assert_eq!(
-        rows(db.query("SELECT n FROM t WHERE id = 2", &[]).unwrap()),
-        vec![vec![Value::Int(5)]]
+        rows(db.query("SELECT n FROM t WHERE id = 5", &[]).unwrap()),
+        vec![vec![Value::Int(6)]]
     );
 }
 

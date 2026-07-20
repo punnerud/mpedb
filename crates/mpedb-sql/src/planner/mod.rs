@@ -908,6 +908,16 @@ fn plan_compound(
             for (j, (have, arm)) in out_types.iter_mut().zip(&otypes).enumerate() {
                 match (&have, arm) {
                     (None, Some(t)) => *have = Some(*t),
+                    // A DYNAMICALLY typed arm (`any` — a typeless column, a
+                    // host UDF, a per-row CASE) unifies with any concrete type
+                    // and the column stays `any`, exactly as an `any` operand
+                    // does in a comparison or a CASE arm. sqlite has no static
+                    // column type for a compound at all: every row keeps the
+                    // storage class its own arm produced, which is what `any`
+                    // says. Two DIFFERENT concrete types still refuse — there
+                    // the arms really do disagree about the value's type.
+                    (Some(ColumnType::Any), Some(_)) => {}
+                    (Some(_), Some(ColumnType::Any)) => *have = Some(ColumnType::Any),
                     (Some(a), Some(b)) if a != b => {
                         return Err(bind_err(format!(
                             "column {} of the compound is {a} in one arm and {b} in \
@@ -998,6 +1008,66 @@ fn plan_compound(
     ))
 }
 
+/// `INSERT … VALUES (<expression>)` → `INSERT … SELECT <expression>`, or
+/// `None` to leave the statement alone.
+///
+/// Only a SINGLE row is rewritten — a multi-row VALUES would need
+/// `UNION ALL`, which the INSERT … SELECT path refuses by name — and only when
+/// the row holds something the VALUES path cannot carry. That is decided by
+/// BINDING it: a bare parameter and anything that const-folds (`1 + 1`,
+/// `-24`) stay on the VALUES path with their existing constant coercion and
+/// NOT-NULL checks, so no statement that compiles today changes shape. A bind
+/// error here yields `None` too — the real path reports it, with its own
+/// message.
+fn values_as_select(
+    s: &ast::InsertStmt,
+    table: &mpedb_types::TableDef,
+    n_params: u16,
+    mode: BareGroupBy,
+    host_udfs: &HostUdfSet,
+) -> Option<ast::InsertStmt> {
+    if s.select.is_some() || s.rows.len() != 1 {
+        return None;
+    }
+    let row = &s.rows[0];
+    let mut probe = Binder::new(table, n_params, true);
+    probe.set_dialect(mode);
+    probe.set_host_udfs(host_udfs);
+    let needs_select = row.iter().any(|e| match probe.bind_expr(e) {
+        Ok((BExpr::Const(_), _)) | Ok((BExpr::Param(_), _)) => false,
+        Ok(_) => true,
+        // A subquery has no bound form OUTSIDE a SELECT — the binder refuses it
+        // by name — so a refusal is the signal too, for everything that is not
+        // already a literal or a bare parameter (which cannot fail to bind).
+        // The SELECT path then reports whatever the real error is.
+        Err(_) => !matches!(e, ast::Expr::Lit(_) | ast::Expr::Param(_)),
+    });
+    if !needs_select {
+        return None;
+    }
+    Some(ast::InsertStmt {
+        table: s.table.clone(),
+        columns: s.columns.clone(),
+        rows: Vec::new(),
+        select: Some(Box::new(ast::SelectStmt {
+            table: None,
+            from_derived: None,
+            alias: None,
+            joins: Vec::new(),
+            distinct: false,
+            items: Some(row.iter().map(|e| (e.clone(), None)).collect()),
+            where_clause: None,
+            group_by: Vec::new(),
+            having: None,
+            order_by: Vec::new(),
+            limit: None,
+            offset: None,
+        })),
+        on_conflict: s.on_conflict.clone(),
+        returning: s.returning.clone(),
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn plan_insert(
     s: &ast::InsertStmt,
@@ -1010,6 +1080,23 @@ fn plan_insert(
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
     let (table_id, table) = resolve_table(schema, &s.table)?;
+
+    // `VALUES (<expression>)` — a function call, a scalar subquery, arithmetic
+    // over one — is the same statement as `SELECT <expression>` with no FROM:
+    // sqlite evaluates a VALUES row exactly once, over no row, which is what a
+    // FROM-less SELECT already is here. Django writes it for every
+    // `RETURNING` insert of a database function (`STRFTIME(…)`, `LOWER(?)`).
+    // Rewritten rather than given its own `InsertSource` variant: the
+    // INSERT … SELECT path already evaluates, projects and RETURNs, and this
+    // needs no plan-format change. The trigger is a row that the VALUES path
+    // would REFUSE (nothing that folds to a constant or is a bare parameter
+    // moves), so every statement that compiles today keeps its exact plan.
+    if let Some(rewritten) = values_as_select(s, table, n_params, mode, host_udfs) {
+        return plan_insert(
+            &rewritten, schema, n_params, catalog, mode, host_udfs, row_count, consts,
+        );
+    }
+
     let mut binder = Binder::new(table, n_params, true);
     binder.set_dialect(mode);
     binder.set_host_udfs(host_udfs);
@@ -1235,6 +1322,26 @@ fn plan_insert(
         context_keys.sort();
         context_keys.dedup();
         list_keys.extend(sel_list);
+        // A source item that is a BARE parameter lands in exactly one column,
+        // so it takes that column's type — the same inference the VALUES path
+        // makes for `VALUES (?)`. Without it a `VALUES (LOWER(?), ?)` rewritten
+        // to a SELECT would leave the second parameter untyped, and a caller
+        // that relies on the declared type to convert (the C-API shim turns an
+        // `int` 0/1 into a `bool` when the plan says the column is one) would
+        // send the wrong storage class. Only fills a slot nothing else typed.
+        if let Some(sel) = &s.select {
+            if let Some(items) = &sel.items {
+                for (slot, (item, _)) in items.iter().enumerate() {
+                    let (Some(&col), ast::Expr::Param(i)) = (listed.get(slot), item) else {
+                        continue;
+                    };
+                    let i = *i as usize;
+                    if param_types.get(i).is_some_and(|t| t.is_none()) {
+                        param_types[i] = Some(table.columns[col as usize].ty);
+                    }
+                }
+            }
+        }
     }
     Ok((
         PlanStmt::Insert {

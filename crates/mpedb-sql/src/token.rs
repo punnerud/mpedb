@@ -398,8 +398,16 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
                     Tok::Blob(blob)
                 } else {
                     let wstart = i;
+                    // `$` CONTINUES an identifier (sqlite's `IdChar` includes
+                    // it): `crafted_alia$` is one name, which Django's alias
+                    // generator really emits. It cannot START one, so the `$n`
+                    // parameter sigil above is untouched — that branch is only
+                    // reached when `$` is a token's first byte.
                     while i < b.len()
-                        && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] >= 0x80)
+                        && (b[i].is_ascii_alphanumeric()
+                            || b[i] == b'_'
+                            || b[i] == b'$'
+                            || b[i] >= 0x80)
                     {
                         i += 1;
                     }

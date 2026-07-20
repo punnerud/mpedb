@@ -455,7 +455,17 @@ fn select_star_and_limits() {
     let (s, explain, _) = parse_statement("SELECT * FROM t").unwrap();
     assert!(!explain);
     assert!(matches!(s, Stmt::Select(SelectStmt { items: None, .. })));
-    assert!(parse_statement("SELECT * FROM t LIMIT -1").is_err());
+    // A NEGATIVE LIMIT is sqlite's "no limit" idiom, which the AST spells as
+    // the clause being absent (the differential is in mpedb's
+    // `django_parse_gaps::a_negative_limit_means_no_limit_like_sqlite`).
+    match parse_statement("SELECT * FROM t LIMIT -1").unwrap().0 {
+        Stmt::Select(s) => assert_eq!((s.limit, s.offset), (None, None)),
+        other => panic!("expected select, got {other:?}"),
+    }
+    match parse_statement("SELECT * FROM t LIMIT -1 OFFSET -2").unwrap().0 {
+        Stmt::Select(s) => assert_eq!((s.limit, s.offset), (None, Some(0))),
+        other => panic!("expected select, got {other:?}"),
+    }
     assert!(parse_statement("SELECT * FROM t LIMIT $1").is_err());
     assert!(parse_statement("SELECT *, a FROM t").is_err());
 }

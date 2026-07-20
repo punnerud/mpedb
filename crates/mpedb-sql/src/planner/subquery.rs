@@ -184,12 +184,25 @@ pub(super) fn lift_subqueries<'a>(
             .map(|e| lift.rewrite(e))
             .collect::<Result<_>>()?,
         having: match &s.having {
-            // HAVING runs over the grouped tuple inside the aggregate phase,
-            // where per-row slot filling cannot reach.
+            // HAVING runs over the GROUPED tuple, inside the aggregate phase,
+            // which no per-row slot fill reaches. An UNCORRELATED subquery does
+            // not need one: `exec_stmt_impl` fills every uncorrelated result
+            // slot once, before dispatch, for every statement kind — so by the
+            // time HAVING is evaluated the slot holds the answer, and the
+            // predicate sees an ordinary parameter. A CORRELATED one is refused
+            // by name: its slot would still be holding whatever the last base
+            // row put there, which is a wrong answer rather than a refusal.
             Some(h) if expr_has_subquery(h) => {
-                return Err(bind_err(
-                    "a subquery in HAVING is not supported yet",
-                ))
+                let before = lift.subplans.len();
+                let rewritten = lift.rewrite(h)?;
+                if lift.subplans[before..].iter().any(|p| !p.outer_args.is_empty()) {
+                    return Err(bind_err(
+                        "a CORRELATED subquery in HAVING is not supported yet — HAVING is \
+                         evaluated over the collapsed group, where no single row's \
+                         correlation applies",
+                    ));
+                }
+                Some(rewritten)
             }
             other => other.clone(),
         },
