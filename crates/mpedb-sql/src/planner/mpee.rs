@@ -513,10 +513,10 @@ pub(super) fn reorder<'s>(
         if m.count_ones() == 1 {
             nodes[m.trailing_zeros() as usize].self_filter = true;
         } else {
-            for t in 0..n {
+            for (t, node) in nodes.iter_mut().enumerate() {
                 if m & (1 << t) != 0 {
-                    nodes[t].links.push(m & !(1 << t));
-                    nodes[t].adj |= m & !(1 << t);
+                    node.links.push(m & !(1 << t));
+                    node.adj |= m & !(1 << t);
                 }
             }
         }

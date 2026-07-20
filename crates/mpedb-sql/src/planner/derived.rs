@@ -18,6 +18,7 @@ use super::*;
 /// `[user]` only. The body is planned with the alias NOT in scope, so a body
 /// that references an outer table (LATERAL) fails as an unknown table/column —
 /// the same error sqlite gives (sqlite has no LATERAL either).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn plan_derived_select(
     s: &ast::SelectStmt,
     schema: &Schema,

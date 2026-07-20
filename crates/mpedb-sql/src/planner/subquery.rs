@@ -96,6 +96,7 @@ fn stmt_scope<'s>(schema: &'s Schema, s: &ast::SelectStmt) -> Result<Scope<'s>> 
 /// subplan result slots are allocated at `n_params + i` (the binder is later
 /// created with `n_params + subplans.len()` slots, and context slots append
 /// after — the `[user ‖ sub ‖ context]` layout).
+#[allow(clippy::too_many_arguments)]
 pub(super) fn lift_subqueries<'a>(
     s: &ast::SelectStmt,
     schema: &'a Schema,

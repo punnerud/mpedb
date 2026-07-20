@@ -17,6 +17,7 @@ use super::*;
 /// Parameters are confined to the outer statement (the parser makes the body
 /// parameter-free); subqueries and `current_setting()` are refused in every
 /// component, keeping the parameter layout `[user]` only.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn plan_recursive_cte(
     rc: &ast::RecursiveCteStmt,
     schema: &Schema,
