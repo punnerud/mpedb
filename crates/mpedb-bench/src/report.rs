@@ -33,6 +33,14 @@ pub const HONESTY_NOTES: &[&str] = &[
      issues F_FULLFSYNC natively. Engines were caught skipping it at some point; \
      an unfixed engine posts commit-class numbers 20-165x too good and makes the honest \
      ones look slow. On Linux none of this applies.",
+    "mpedb appears TWICE in every commit-class table, and the `config` column is the \
+     difference. `durability=commit` is the mapped-page barrier — msync the dirty span, then \
+     msync the meta — which design/DESIGN.md §4.1 floors at two device flushes. \
+     `durability=wal` is log-based: one pwrite plus one fdatasync, one flush. SQLite (WAL) and \
+     PostgreSQL are BOTH log-based, so `wal` is the like-for-like comparand and `commit` is \
+     the cost of the default; a table with only the `commit` row compares mpedb's slowest \
+     durable mode against the other engines' fast ones. Both rows are durable-on-ack and both \
+     are reported.",
     "No cherry-picking: every cell is reported, including those mpedb loses.",
 ];
 

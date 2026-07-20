@@ -52,6 +52,10 @@ pub struct MpedbEngine {
     /// Directory holding the .mpedb file (tmpfs or disk).
     dir: PathBuf,
     durability: &'static str,
+    /// Pre-reserved file size. Configurable because a paired run holds SEVERAL
+    /// mpedb engines open at once and each one mmaps its whole file: four
+    /// 1 GiB arms do not fit under the 3 GB `ulimit -v` these runs use.
+    size_mb: u64,
     state: Option<State>,
 }
 
@@ -63,14 +67,23 @@ struct State {
 }
 
 impl MpedbEngine {
-    /// `durability` is `"none"` or `"commit"` (written into the file config).
+    /// `durability` is `"none"`, `"commit"`, `"wal"` or `"async"` (written
+    /// into the file config).
     pub fn new(dir: PathBuf, durability: &'static str) -> BResult<MpedbEngine> {
         std::fs::create_dir_all(&dir)?;
         Ok(MpedbEngine {
             dir,
             durability,
+            size_mb: SIZE_MB,
             state: None,
         })
+    }
+
+    /// Same, with an explicit pre-reserved file size (MiB).
+    pub fn new_sized(dir: PathBuf, durability: &'static str, size_mb: u64) -> BResult<MpedbEngine> {
+        let mut e = MpedbEngine::new(dir, durability)?;
+        e.size_mb = size_mb;
+        Ok(e)
     }
 
     fn db_path(&self) -> PathBuf {
@@ -89,7 +102,7 @@ impl Engine for MpedbEngine {
             r#"
 [database]
 path = "{}"
-size_mb = {SIZE_MB}
+size_mb = {}
 max_readers = 64
 durability = "{}"
 
@@ -112,6 +125,7 @@ primary_key = ["id"]
   type = "int64"
 "#,
             path.display(),
+            self.size_mb,
             self.durability
         );
         let db = Arc::new(Database::open_with_config(Config::from_toml_str(&toml)?)?);

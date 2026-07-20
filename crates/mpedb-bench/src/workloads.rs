@@ -192,6 +192,16 @@ pub fn measure_batched_insert(
     Ok(stats)
 }
 
+/// The `ContendedWrites` cell (4 threads x autocommit insert, fixed wall
+/// time), exposed for the paired durable head-to-head. Caller seeds first.
+pub fn measure_contended(engine: &dyn Engine, cfg: &RunCfg) -> BResult<LatStats> {
+    let (_, writes) = run_timed(engine, 4, 0, CONTENDED_BASE, cfg)?;
+    match writes {
+        Some(s) => Ok(s),
+        None => err("contended cell produced no write stats"),
+    }
+}
+
 #[derive(Clone, Copy)]
 enum PointKind {
     Insert,

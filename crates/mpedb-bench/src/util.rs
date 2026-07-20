@@ -108,6 +108,100 @@ pub fn fs_type(path: &Path) -> String {
     best.map_or_else(|| "?".into(), |(_, ty)| ty)
 }
 
+// ------------------------------------------------------- device flush counters
+
+/// Kernel-counted **device cache flush requests** for one block device, from
+/// the last two fields of `/proc/diskstats` (present since Linux 5.5).
+///
+/// This is the instrument that turns "engine A's durable commit is 1.8x
+/// engine B's" into a decomposition: how many barriers the commit costs, and
+/// how long each one takes. An `fdatasync` that also has to commit a
+/// filesystem journal transaction (an i_size change, an unwritten->written
+/// extent conversion) issues TWO device flushes, not one — and no
+/// engine-level timer can see the difference.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct FlushStat {
+    /// flush requests completed
+    pub ios: u64,
+    /// milliseconds spent flushing
+    pub ticks_ms: u64,
+}
+
+impl FlushStat {
+    pub fn since(self, before: FlushStat) -> FlushStat {
+        FlushStat {
+            ios: self.ios.saturating_sub(before.ios),
+            ticks_ms: self.ticks_ms.saturating_sub(before.ticks_ms),
+        }
+    }
+}
+
+/// `major:minor` of the block device holding `path`, or `None` where that
+/// cannot be determined (non-Linux, or a path on a virtual filesystem).
+#[cfg(target_os = "linux")]
+pub fn block_device_of(path: &Path) -> Option<(u32, u32)> {
+    use std::os::linux::fs::MetadataExt;
+    let dev = std::fs::metadata(path).ok()?.st_dev();
+    let (maj, min) = (libc::major(dev), libc::minor(dev));
+    (maj != 0).then_some((maj, min))
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn block_device_of(_path: &Path) -> Option<(u32, u32)> {
+    None
+}
+
+/// Read the flush counters for `(major, minor)`. `None` if /proc/diskstats is
+/// absent or the device is not listed.
+pub fn flush_stat(dev: (u32, u32)) -> Option<FlushStat> {
+    let stats = std::fs::read_to_string("/proc/diskstats").ok()?;
+    for line in stats.lines() {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        // major minor name + 17 counters; flush ios/ticks are the last two
+        if f.len() < 20 {
+            continue;
+        }
+        if f[0].parse::<u32>().ok() != Some(dev.0) || f[1].parse::<u32>().ok() != Some(dev.1) {
+            continue;
+        }
+        // The flush counters are the LAST two fields (taken positionally from
+        // the end, so a kernel that appends further counters cannot silently
+        // shift this onto the discard columns).
+        return Some(FlushStat {
+            ios: f[f.len() - 2].parse().ok()?,
+            ticks_ms: f[f.len() - 1].parse().ok()?,
+        });
+    }
+    None
+}
+
+/// Device name (`sdc`) for `(major, minor)`, for the report header.
+pub fn block_device_name(dev: (u32, u32)) -> Option<String> {
+    let stats = std::fs::read_to_string("/proc/diskstats").ok()?;
+    stats.lines().find_map(|line| {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        (f.len() >= 3
+            && f[0].parse::<u32>().ok() == Some(dev.0)
+            && f[1].parse::<u32>().ok() == Some(dev.1))
+        .then(|| f[2].to_string())
+    })
+}
+
+/// Median of a slice (mean of the two middle values for even lengths).
+pub fn median(v: &[f64]) -> f64 {
+    if v.is_empty() {
+        return 0.0;
+    }
+    let mut s = v.to_vec();
+    s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let n = s.len();
+    if n % 2 == 1 {
+        s[n / 2]
+    } else {
+        0.5 * (s[n / 2 - 1] + s[n / 2])
+    }
+}
+
 /// Read a `sysctl -n <name>` value (macOS; there is no /proc there).
 #[cfg(target_os = "macos")]
 fn sysctl(name: &str) -> Option<String> {
