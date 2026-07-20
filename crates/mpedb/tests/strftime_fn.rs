@@ -399,12 +399,24 @@ fn now_binds_the_statement_instant_and_nothing_else_does() {
     // is answerable because it has a per-statement slot, not because mpedb went
     // loose about time. A bare keyword and a DDL DEFAULT have no such slot —
     // a DEFAULT is stored as SOURCE and re-evaluated on every later insert.
-    let m = db
-        .query("SELECT current_timestamp", &[])
-        .map(|r| panic!("current_timestamp must not resolve, got {r:?}"))
-        .unwrap_err()
-        .to_string();
-    assert!(m.contains("unknown column `current_timestamp`"), "{m}");
+    // The three time KEYWORDS are the same call in sqlite's own definition
+    // (`datetime('now') = CURRENT_TIMESTAMP` is true there), so mpedb desugars
+    // them to it and they answer through the same per-statement slot.
+    for (kw, f) in [
+        ("current_timestamp", "datetime('now')"),
+        ("current_date", "date('now')"),
+        ("current_time", "time('now')"),
+    ] {
+        let r = db
+            .query(&format!("SELECT {kw} = {f}"), &[])
+            .unwrap_or_else(|e| panic!("{kw} must resolve: {e}"));
+        match r {
+            ExecResult::Rows { rows, .. } => {
+                assert_eq!(rows, vec![vec![Value::Bool(true)]], "{kw} must equal {f}")
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+    }
     assert!(db.query("SELECT now()", &[]).is_err(), "now() is not a function");
     assert!(
         db.query("SELECT current_timestamp()", &[]).is_err(),
