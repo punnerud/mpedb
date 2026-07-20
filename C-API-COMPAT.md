@@ -2875,7 +2875,14 @@ WB_GROUP_BASE=3 WB_LABEL_GROUPS=$'queries\nbackends\nmodel_fields' … run_suite
 
 ## AT HEAD — the shim-side CPython closures (2026-07-20, Linux box)
 
-**This supersedes the CPython half of the section above.** The M3 run measured
+⚠ **This does NOT supersede the section above — it is a different interpreter
+with a different denominator, and the two numbers must not be subtracted.** The
+M3 runs CPython 3.12.12 (474 tests, stock passes 467); this box runs 3.12.3 (467
+tests, stock passes 461). `450/474` and `447/467` are measurements of different
+suites. What this section supersedes is only the *engine's* CPython position at
+a newer commit; the headline number stays the M3's until the M3 re-measures.
+
+The M3 run measured
 `03ff5ea`; this one measures `b598052` (`main`) plus one shim-only change, and
 it is a *controlled* before/after: both arms were built from an **isolated git
 worktree with its own `CARGO_TARGET_DIR`**, because the shared `target/` on this
