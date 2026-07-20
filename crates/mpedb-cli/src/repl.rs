@@ -28,7 +28,7 @@ use crate::render::{print_result, schema_toml};
 use crate::util::{usage, CliResult};
 
 /// The dot-commands this repl answers to — also the Tab-completion set.
-const DOTS: &[&str] = &[".tables", ".schema", ".hash", ".verify", ".quit", ".exit"];
+const DOTS: &[&str] = &[".tables", ".schema", ".hash", ".verify", ".help", ".quit", ".exit"];
 
 pub fn run(argv: &[String]) -> CliResult {
     let [config_path] = argv else {
@@ -76,6 +76,9 @@ pub fn run_path(config_path: &str, pending: Option<PendingCreate>) -> CliResult 
     };
 
     names.borrow_mut().set_schema(&db.schema());
+    if input.prompts() {
+        println!("mpedb {} — .help for commands, .quit to exit", env!("CARGO_PKG_VERSION"));
+    }
     let mut session: Option<WriteSession<'_>> = None;
 
     loop {
@@ -175,6 +178,14 @@ fn pending_prelude(
             if matches!(dot.trim(), "quit" | "exit") {
                 return Ok(None);
             }
+            if dot.trim() == "help" {
+                println!(
+                    "{} does not exist yet — the first WRITE statement creates it.\n\
+                     Until then: read-only SQL runs on a scratch database,\n\
+                     .help shows this text, .quit / .exit leave without creating."
+                , create.path().display());
+                continue;
+            }
             eprintln!(
                 "error: {} does not exist yet — run a statement to create it",
                 create.path().display()
@@ -214,6 +225,17 @@ fn dot_command(cmd: &str, db: &Database, db_path: &Path, in_session: bool) {
                 }
             }
         }
+        "help" => {
+            println!(
+                "SQL statements run directly; begin/commit/rollback open a transaction.\n\
+                 .tables          table names + committed row counts\n\
+                 .schema          the live schema as config TOML\n\
+                 .hash <SQL>      compile <SQL>, publish, print the plan hash\n\
+                 .verify          page-accounting verifier (takes the writer lock)\n\
+                 .help            this list\n\
+                 .quit / .exit    leave"
+            );
+        }
         "verify" => {
             if in_session {
                 eprintln!("error: .verify needs the writer lock; not allowed inside a transaction");
@@ -224,7 +246,7 @@ fn dot_command(cmd: &str, db: &Database, db_path: &Path, in_session: bool) {
                 }
             }
         }
-        other => eprintln!("error: unknown command .{other} (try .tables .schema .hash .verify .quit)"),
+        other => eprintln!("error: unknown command .{other} (.help lists commands)"),
     }
 }
 
