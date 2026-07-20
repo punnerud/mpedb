@@ -246,7 +246,7 @@ pub(crate) fn table_def_from_spec(
                     // takes the column's store-time affinity FIRST — sqlite
                     // stores `DEFAULT '1.50'` on a NUMERIC column as the real
                     // 1.5, and reports `typeof()` accordingly.
-                    let v = mpedb_types::store_into(c.ty, c.affinity, v.clone());
+                    let v = mpedb_types::store_into(c.ty, c.affinity, c.decl.is_some(), v.clone());
                     let v = coerce_default(v, c.ty, &spec.name, &c.name)?;
                     if v.is_null() {
                         None
@@ -457,7 +457,7 @@ pub(crate) fn add_column_from_spec(
         // lands in every existing row, so it must be the value the column would
         // have held had the rows been inserted with it.
         Some(DefaultExpr::Const(v)) => coerce_default(
-            mpedb_types::store_into(spec.ty, spec.affinity, v),
+            mpedb_types::store_into(spec.ty, spec.affinity, spec.decl.is_some(), v),
             spec.ty,
             table,
             &spec.name,
