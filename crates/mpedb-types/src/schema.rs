@@ -781,6 +781,21 @@ impl Schema {
                 slot.name
             )));
         }
+        // A generated column's compiled program addresses its inputs by ORDINAL,
+        // and a drop shifts every ordinal after it — a program renumbered wrong
+        // reads a DIFFERENT column and silently stores a different value, which
+        // is the one failure mode this feature must not have. Renumbering the
+        // program is mechanical but the expression SOURCE text (see
+        // `with_renamed_column`) cannot follow, so the whole shape is refused.
+        // sqlite refuses the interesting half of this too ("error in table t
+        // after drop column"); mpedb refuses the rest rather than answer wrong.
+        if slot.has_generated() {
+            return Err(Error::Schema(format!(
+                "cannot drop a column of `{}`: it has a generated column whose \
+                 expression addresses its inputs by position, and a drop shifts them",
+                slot.name
+            )));
+        }
         slot.columns.remove(idx);
         // Renumber references to columns that shifted down (index > i → -1).
         let shift = |c: &mut u16| {
@@ -815,6 +830,20 @@ impl Schema {
         if slot.columns.iter().any(|c| c.name == new_name) {
             return Err(Error::Schema(format!(
                 "column `{new_name}` already exists in table `{}`",
+                slot.name
+            )));
+        }
+        // A generated column's EXPRESSION names its inputs in SOURCE text. The
+        // compiled program reads ordinals, so a rename would keep computing the
+        // right value — but the source (the DDL a dump replays, the text an
+        // error message quotes) would still name the old column, and a replayed
+        // dump would then fail. sqlite rewrites the text; mpedb has no
+        // expression printer, so it refuses by name instead of shipping a
+        // schema whose declared form and behaviour disagree.
+        if slot.has_generated() {
+            return Err(Error::Schema(format!(
+                "cannot rename a column of `{}`: it has a generated column, whose \
+                 expression names its inputs as text that mpedb cannot rewrite",
                 slot.name
             )));
         }
@@ -2213,5 +2242,180 @@ mod tests {
         evil.tables[0].implicit_rowid = true;
         let err = Schema::from_canonical_bytes(&evil.canonical_bytes()).unwrap_err();
         assert!(format!("{err}").contains("implicit_rowid"), "{err}");
+    }
+
+    // ------------------------------------------------ generated columns (v9)
+
+    /// A generated column survives the v9 wire — SOURCE, kind and COMPILED
+    /// PROGRAM — contributes to the hash, and truncation at every offset is
+    /// `Corrupt`, never a panic. The program is on the wire (unlike a CHECK,
+    /// which is source-only) precisely so a decoded schema can evaluate the
+    /// column with no SQL layer present.
+    #[test]
+    fn generated_column_round_trips_and_is_hostile_safe() {
+        use crate::expr::Instr;
+        let plain = |n: &str, ty| ColumnDef { generated: None, decl: None,
+            name: n.into(), ty, nullable: true, unique: false, indexed: false,
+            default: None, check: None, collation: Collation::Binary,
+            affinity: Affinity::implied_by(ty),
+        };
+        // g = a + a, over column 0.
+        let prog = ExprProgram::new(
+            vec![Instr::PushCol(0), Instr::PushCol(0), Instr::Add],
+            vec![],
+        )
+        .unwrap();
+        let mut g = plain("g", ColumnType::Int64);
+        g.generated = Some(GeneratedCol {
+            expr: "a + a".into(),
+            kind: GeneratedKind::Stored,
+            program: prog,
+        });
+        let s = Schema::new(vec![TableDef {
+            id: 0,
+            name: "t".into(),
+            columns: vec![
+                ColumnDef { nullable: false, ..plain("a", ColumnType::Int64) },
+                g,
+            ],
+            primary_key: vec![0],
+            indexes: vec![],
+            dead: false,
+            kind: TableKind::Standard,
+            implicit_rowid: false,
+        }])
+        .unwrap();
+
+        let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
+        assert_eq!(s, r, "the compiled program survives byte-for-byte");
+        assert_eq!(s.hash(), r.hash());
+        assert_eq!(s.canonical_bytes()[0], 9);
+
+        // It computes, in declaration order, through the decoded schema.
+        let mut row = vec![Value::Int(21), Value::Null];
+        r.tables[0].apply_generated(&mut row, &[]).unwrap();
+        assert_eq!(row[1], Value::Int(42));
+        assert!(r.tables[0].has_generated());
+
+        let bytes = s.canonical_bytes();
+        for i in 0..bytes.len() {
+            assert!(Schema::from_canonical_bytes(&bytes[..i]).is_err(), "offset {i}");
+        }
+    }
+
+    /// The rules that make one declaration-order pass sound. Each is checked on
+    /// a HOSTILE hand-built schema, i.e. on the decode path, not just at DDL.
+    #[test]
+    fn generated_column_validation_rules() {
+        use crate::expr::Instr;
+        let plain = |n: &str, ty| ColumnDef { generated: None, decl: None,
+            name: n.into(), ty, nullable: true, unique: false, indexed: false,
+            default: None, check: None, collation: Collation::Binary,
+            affinity: Affinity::implied_by(ty),
+        };
+        let gen_reading = |n: &str, col: u16, kind| {
+            let mut c = plain(n, ColumnType::Int64);
+            c.generated = Some(GeneratedCol {
+                expr: format!("col{col}"),
+                kind,
+                program: ExprProgram::new(vec![Instr::PushCol(col)], vec![]).unwrap(),
+            });
+            c
+        };
+        let build = |cols: Vec<ColumnDef>, pk: Vec<u16>| {
+            Schema::new(vec![TableDef {
+                id: 0,
+                name: "t".into(),
+                columns: cols,
+                primary_key: pk,
+                indexes: vec![],
+                dead: false,
+                kind: TableKind::Standard,
+                implicit_rowid: false,
+            }])
+        };
+        let a = || ColumnDef { nullable: false, ..plain("a", ColumnType::Int64) };
+
+        // Reading an EARLIER generated column is fine.
+        assert!(build(
+            vec![a(), gen_reading("g", 0, GeneratedKind::Stored), gen_reading("h", 1, GeneratedKind::Stored)],
+            vec![0]
+        )
+        .is_ok());
+
+        // Reading a LATER one, or ITSELF, is refused — the two shapes that
+        // would make a single declaration-order pass read a stale value.
+        for (cols, what) in [
+            (vec![a(), gen_reading("g", 2, GeneratedKind::Stored), gen_reading("h", 0, GeneratedKind::Stored)], "forward"),
+            (vec![a(), gen_reading("g", 1, GeneratedKind::Stored)], "self"),
+        ] {
+            let err = build(cols, vec![0]).unwrap_err();
+            assert!(
+                format!("{err}").contains("declared at or after it"),
+                "{what}: {err}"
+            );
+        }
+
+        // Out-of-range ordinal (a corrupt mapping) is refused, not a panic.
+        let err = build(vec![a(), gen_reading("g", 99, GeneratedKind::Virtual)], vec![0]).unwrap_err();
+        assert!(format!("{err}").contains("out of range"), "{err}");
+
+        // A parameter has nothing to bind to per row.
+        let mut p = plain("g", ColumnType::Int64);
+        p.generated = Some(GeneratedCol {
+            expr: "$1".into(),
+            kind: GeneratedKind::Virtual,
+            program: ExprProgram::new(vec![Instr::PushParam(0)], vec![]).unwrap(),
+        });
+        let err = build(vec![a(), p], vec![0]).unwrap_err();
+        assert!(format!("{err}").contains("references a parameter"), "{err}");
+
+        // PRIMARY KEY and DEFAULT are both refused on a generated column.
+        let err = build(vec![a(), ColumnDef { nullable: false, ..gen_reading("g", 0, GeneratedKind::Stored) }], vec![0, 1])
+            .unwrap_err();
+        assert!(format!("{err}").contains("PRIMARY KEY"), "{err}");
+        let mut d = gen_reading("g", 0, GeneratedKind::Stored);
+        d.default = Some(DefaultExpr::Const(Value::Int(1)));
+        let err = build(vec![a(), d], vec![0]).unwrap_err();
+        assert!(format!("{err}").contains("DEFAULT"), "{err}");
+    }
+
+    /// DROP COLUMN shifts ordinals and RENAME COLUMN invalidates the expression
+    /// TEXT; a generated column's program addresses inputs by position, so both
+    /// are refused on a table that has one. Narrower than sqlite, never wrong.
+    #[test]
+    fn drop_and_rename_column_refuse_on_a_generated_table() {
+        use crate::expr::Instr;
+        let plain = |n: &str, ty, nullable| ColumnDef { generated: None, decl: None,
+            name: n.into(), ty, nullable, unique: false, indexed: false,
+            default: None, check: None, collation: Collation::Binary,
+            affinity: Affinity::implied_by(ty),
+        };
+        let mut g = plain("g", ColumnType::Int64, true);
+        g.generated = Some(GeneratedCol {
+            expr: "a".into(),
+            kind: GeneratedKind::Stored,
+            program: ExprProgram::new(vec![Instr::PushCol(0)], vec![]).unwrap(),
+        });
+        let s = Schema::new(vec![TableDef {
+            id: 0,
+            name: "t".into(),
+            columns: vec![
+                plain("a", ColumnType::Int64, false),
+                plain("b", ColumnType::Int64, true),
+                g,
+            ],
+            primary_key: vec![0],
+            indexes: vec![],
+            dead: false,
+            kind: TableKind::Standard,
+            implicit_rowid: false,
+        }])
+        .unwrap();
+
+        let err = s.with_dropped_column(0, "b").unwrap_err();
+        assert!(format!("{err}").contains("by position"), "{err}");
+        let err = s.with_renamed_column(0, "a", "z").unwrap_err();
+        assert!(format!("{err}").contains("cannot rewrite"), "{err}");
     }
 }
