@@ -515,22 +515,26 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
                 )))
             }
         },
+        // sqlite's `roundFunc`, ported: the result is ALWAYS a REAL (even for
+        // an integer argument and even at digit count 0 — `round(7)` is `7.0`),
+        // the digit count clamps to `0..=30` (a NEGATIVE one rounds to whole
+        // units, it does not round to tens), and a non-zero digit count rounds
+        // through the DECIMAL rendering rather than by multiplying — `2.675` is
+        // really `2.67499999…`, so `round(2.675, 2)` is `2.67`, which
+        // multiply-round-divide gets wrong.
         ScalarFn::Round => {
             let digits = if args.len() == 2 { int(&args[1])? } else { 0 };
-            match &args[0] {
-                // Rounding an integer is the integer, at any digit count.
-                Value::Int(i) => Value::Int(*i),
-                Value::Float(x) => {
-                    let p = 10f64.powi(digits.clamp(-15, 15) as i32);
-                    Value::Float((x * p).round() / p)
-                }
-                other => {
-                    return Err(Error::TypeMismatch(format!(
-                        "round() expects a number, got {}",
-                        other.type_name()
-                    )))
-                }
-            }
+            let n = digits.clamp(0, 30) as usize;
+            let x = num(&args[0])?;
+            // Beyond 2^52 a double has no fractional part left to round.
+            let r = if !(-4503599627370496.0..=4503599627370496.0).contains(&x) {
+                x
+            } else if n == 0 {
+                (x + if x < 0.0 { -0.5 } else { 0.5 }) as i64 as f64
+            } else {
+                format!("{x:.n$}").parse::<f64>().unwrap_or(x)
+            };
+            Value::Float(r)
         }
         ScalarFn::Substr => {
             // sqlite/PostgreSQL agree here: 1-based, and a start below 1 counts

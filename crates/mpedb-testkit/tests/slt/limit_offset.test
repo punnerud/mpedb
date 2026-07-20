@@ -186,18 +186,34 @@ query I nosort
 SELECT id FROM t WHERE id > 100 LIMIT 5
 ----
 
-# LIMIT/OFFSET take non-negative integer literals only (no expressions,
-# no parameters, no negatives -- Phase 1 grammar).
-statement error non-negative integer
-SELECT id FROM t LIMIT -1
+# LIMIT/OFFSET take an integer literal only (no expressions, no parameters).
+# A NEGATIVE one is sqlite's "no limit" / "skip nothing" idiom -- the shape
+# Django emits for an open-ended slice.
+query I nosort
+SELECT id FROM t LIMIT -1 OFFSET 7
+----
+8
+9
+10
 
-statement error non-negative integer
+query I nosort
+SELECT id FROM t WHERE id < 4 LIMIT -1
+----
+1
+2
+3
+
+query I nosort
+SELECT id FROM t WHERE id < 4 OFFSET -3
+----
+1
+2
+3
+
+statement error integer literal
 SELECT id FROM t LIMIT 2.5
 
-statement error non-negative integer
-SELECT id FROM t OFFSET -3
-
-statement error non-negative integer
+statement error integer literal
 SELECT id FROM t LIMIT 'x'
 
 # The literal is consumed, then `+ 1` is trailing input.

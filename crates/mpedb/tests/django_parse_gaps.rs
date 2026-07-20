@@ -1011,3 +1011,276 @@ fn mixed_storage_classes_sort_in_sqlites_class_order() {
     assert_same(loose, "SELECT id FROM m ORDER BY v, id");
     assert_same(loose, "SELECT id FROM m ORDER BY v DESC, id");
 }
+
+// ------------------------------------------------- negative LIMIT/OFFSET ----
+
+/// sqlite reads a NEGATIVE `LIMIT` as "no limit" — the idiom Django emits for
+/// every open-ended slice `qs[5:]` (`LIMIT -1 OFFSET 5`), because SQL has no
+/// way to spell OFFSET without LIMIT. A negative `OFFSET` skips nothing.
+/// mpedb refused both with a parse error; now it answers sqlite's rows.
+#[test]
+fn a_negative_limit_means_no_limit_like_sqlite() {
+    let setup: &[&str] = &[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e')",
+    ];
+    // Django's own shape: an open-ended slice.
+    assert_same(setup, "SELECT id FROM t ORDER BY name ASC LIMIT -1 OFFSET 2");
+    assert_same(setup, "SELECT id FROM t ORDER BY id LIMIT -1");
+    assert_same(setup, "SELECT id FROM t ORDER BY id LIMIT -5");
+    // A negative OFFSET skips nothing; `-0` is plain zero, not "no bound".
+    assert_same(setup, "SELECT id FROM t ORDER BY id LIMIT 3 OFFSET -1");
+    assert_same(setup, "SELECT id FROM t ORDER BY id LIMIT -0");
+    // Inside a derived table and a subquery, where the bound drives planning.
+    assert_same(setup, "SELECT COUNT(*) FROM (SELECT id FROM t ORDER BY id LIMIT -1 OFFSET 3) s");
+    assert_same(setup, "SELECT id FROM t WHERE id IN (SELECT id FROM t LIMIT -1) ORDER BY id");
+    // A LIMIT still binds to the whole compound, so a negative one before a
+    // set operator is refused exactly as a positive one is (sqlite: "LIMIT
+    // clause should come after UNION not before").
+    let t = open();
+    for s in setup {
+        t.db.query(s, &[]).unwrap();
+    }
+    let e = t.db.query("SELECT id FROM t LIMIT -1 UNION SELECT id FROM t", &[]).unwrap_err();
+    assert!(format!("{e}").contains("apply to the whole compound"), "{e}");
+    assert!(sqlite_try(setup, "SELECT id FROM t LIMIT -1 UNION SELECT id FROM t").is_err());
+}
+
+// ------------------------------------------- expressions in INSERT VALUES ----
+
+/// `INSERT … VALUES (<expression>)`. sqlite evaluates a VALUES row over no
+/// row, which is the same thing a FROM-less `SELECT` is, and Django writes it
+/// for every `RETURNING` insert of a database function. mpedb refused
+/// ("INSERT values must be literals or parameters"); it now plans the row as
+/// `INSERT … SELECT` and answers sqlite's rows.
+#[test]
+fn an_expression_in_insert_values_agrees_with_sqlite() {
+    let setup: &[&str] = &[
+        "CREATE TABLE n (id INTEGER PRIMARY KEY, num INTEGER, v TEXT)",
+        "INSERT INTO n VALUES (1, 10, 'Aa'), (2, 20, 'Bb')",
+        "CREATE TABLE c (id INTEGER PRIMARY KEY, name TEXT, num INTEGER)",
+        // A function call, a scalar subquery, and arithmetic over one.
+        "INSERT INTO c (id, name) VALUES (1, LOWER('ABC'))",
+        "INSERT INTO c (id, num) VALUES (2, (SELECT MAX(num) FROM n))",
+        "INSERT INTO c (id, num) VALUES (3, (SELECT MAX(num) + 5 FROM n))",
+        "INSERT INTO c (id, name) VALUES (4, LOWER((SELECT v FROM n WHERE id = 2)))",
+    ];
+    assert_same(setup, "SELECT id, name, num FROM c ORDER BY id");
+    assert_same(setup, "SELECT id, typeof(name), typeof(num) FROM c ORDER BY id");
+    // RETURNING sees the computed value, not the expression.
+    assert_same(
+        &setup[..3],
+        "INSERT INTO c (id, name) VALUES (9, UPPER('xy')) RETURNING id, name",
+    );
+
+    // Still refused, and by name: a MULTI-row VALUES with an expression would
+    // need `UNION ALL`, which the INSERT … SELECT source refuses.
+    let t = open();
+    for s in &setup[..3] {
+        t.db.query(s, &[]).unwrap();
+    }
+    let e = t
+        .db
+        .query("INSERT INTO c (id, name) VALUES (7, 'x'), (8, LOWER('Y'))", &[])
+        .unwrap_err();
+    assert!(format!("{e}").contains("literals or parameters"), "{e}");
+}
+
+// ------------------------------------------------ the time keywords ---------
+
+/// `CURRENT_TIMESTAMP` / `CURRENT_DATE` / `CURRENT_TIME` in EXPRESSION
+/// position. sqlite defines each as the corresponding function of `'now'`, so
+/// mpedb desugars it there; the DDL `DEFAULT` position keeps its separate
+/// refusal (a stored default is a constant, not a per-row call).
+#[test]
+fn the_time_keywords_are_their_now_functions_like_sqlite() {
+    let setup: &[&str] = &["CREATE TABLE st (id INTEGER PRIMARY KEY, opening TEXT)"];
+    // Value-identical to the function form — sqlite's own definition, so the
+    // equality holds in both engines without reading a clock.
+    assert_same(
+        setup,
+        "SELECT current_timestamp = datetime('now'), current_date = date('now'), \
+         current_time = time('now')",
+    );
+    assert_same(
+        setup,
+        "SELECT length(CURRENT_TIMESTAMP), length(CURRENT_DATE), length(CURRENT_TIME)",
+    );
+    // Django's shape: parenthesized, inside COALESCE, over an empty aggregate.
+    assert_same(
+        setup,
+        "SELECT COALESCE(MAX(st.opening), (CURRENT_TIMESTAMP)) = datetime('now') FROM st WHERE 0 = 1",
+    );
+    // A QUOTED one is still a column name, as for every word with a meaning.
+    assert_same(
+        &["CREATE TABLE k (id INTEGER PRIMARY KEY, current_date TEXT)", "INSERT INTO k VALUES (1, 'x')"],
+        "SELECT \"current_date\" FROM k",
+    );
+}
+
+// ------------------------------------------------ `$` in an identifier ------
+
+/// sqlite's `IdChar` includes `$`, so `crafted_alia$` is one identifier —
+/// which Django's alias generator really emits. mpedb's parameter scanner ate
+/// it. `$` still cannot START a token, so `$1` is still a parameter.
+#[test]
+fn a_dollar_continues_an_identifier_like_sqlite() {
+    let setup: &[&str] = &[
+        "CREATE TABLE bk (id INTEGER PRIMARY KEY, name TEXT)",
+        "CREATE TABLE au (id INTEGER PRIMARY KEY)",
+        "INSERT INTO bk VALUES (1, 'x')",
+        "INSERT INTO au VALUES (1)",
+    ];
+    assert_same(
+        setup,
+        "SELECT bk.name, crafted_alia$.id FROM bk \
+         LEFT OUTER JOIN au crafted_alia$ ON (bk.id = crafted_alia$.id) ORDER BY bk.id",
+    );
+    assert_same(setup, "SELECT 1 AS a$b");
+}
+
+// ------------------------------------------------ compound arm typing -------
+
+/// A compound column that is DYNAMICALLY typed in one arm (`any` — a typeless
+/// column, a host UDF, a per-row CASE) and concrete in another. sqlite has no
+/// static column type for a compound at all: every row keeps its own arm's
+/// storage class, which is what `any` says. Two DIFFERENT concrete types still
+/// refuse.
+#[test]
+fn a_typeless_compound_arm_unifies_like_sqlite() {
+    let setup: &[&str] = &[
+        // `datetime` is NUMERIC affinity → a typeless (`any`) column.
+        "CREATE TABLE art (id INTEGER PRIMARY KEY, name TEXT, created datetime)",
+        "CREATE TABLE rn (id INTEGER PRIMARY KEY, name TEXT, ord INTEGER)",
+        "INSERT INTO art VALUES (1, 'a', '2010-01-01 00:00:00')",
+        "INSERT INTO rn VALUES (1, 'b', 3)",
+    ];
+    // Django's shape: an `any` column against a `text`-typed expression.
+    assert_same(
+        setup,
+        "SELECT art.name, art.created FROM art \
+         UNION SELECT rn.name, strftime('%Y-%m-%d', '1991-10-10') FROM rn ORDER BY 1",
+    );
+    assert_same(
+        setup,
+        "SELECT typeof(x) FROM (SELECT created AS x FROM art UNION ALL SELECT 'zz' FROM rn) ORDER BY 1",
+    );
+    // Two concrete types still refuse — there the arms really disagree.
+    let t = open();
+    for s in setup {
+        t.db.query(s, &[]).unwrap();
+    }
+    let e = t.db.query("SELECT name FROM art UNION SELECT ord FROM rn", &[]).unwrap_err();
+    assert!(format!("{e}").contains("in one arm and"), "{e}");
+}
+
+// ------------------------------------------- comparison affinity of a CAST --
+
+/// sqlite's comparison affinity applies when EITHER operand carries one, and a
+/// `CAST` carries its target's. Django writes `CAST(<agg> AS NUMERIC) > ?` for
+/// every `DecimalField` aggregate and binds the bound as TEXT, so without this
+/// the pair met as int-vs-text and was refused.
+#[test]
+fn a_cast_carries_comparison_affinity_like_sqlite() {
+    let setup: &[&str] = &[
+        "CREATE TABLE s (id INTEGER PRIMARY KEY, qty decimal(10,2))",
+        "INSERT INTO s VALUES (1, 3), (2, 4), (3, 9)",
+    ];
+    // NUMERIC affinity converts the text operand; without the CAST neither
+    // side carries an affinity and sqlite compares by storage class — the two
+    // answers DIFFER, which is exactly why the rule has to be the rule.
+    assert_same(setup, "SELECT CAST(SUM(qty) AS NUMERIC) > '0' FROM s");
+    assert_same(setup, "SELECT SUM(qty) > '0' FROM s");
+    assert_same(setup, "SELECT CAST(SUM(qty) AS NUMERIC) = '16' FROM s");
+    assert_same(setup, "SELECT CAST(SUM(qty) AS NUMERIC) < 'abc' FROM s");
+    assert_same(setup, "SELECT typeof(CAST(SUM(qty) AS NUMERIC)) FROM s");
+    // A CAST to TEXT carries TEXT affinity, which is NOT applied against a
+    // typeless operand (sqlite's rule: only numeric affinity crosses).
+    assert_same(setup, "SELECT CAST(qty AS TEXT) = '3' FROM s ORDER BY id");
+}
+
+// ------------------------------------------ uncorrelated subquery in HAVING --
+
+/// A subquery in `HAVING`. An UNCORRELATED one is filled once, before
+/// dispatch, so the grouped predicate reads an ordinary parameter; a
+/// CORRELATED one is still refused by name, because its slot would hold
+/// whatever the last base row put there.
+#[test]
+fn an_uncorrelated_subquery_in_having_agrees_with_sqlite() {
+    let setup: &[&str] = &[
+        "CREATE TABLE a (id INTEGER PRIMARY KEY, dept TEXT, g INTEGER)",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY, k INTEGER)",
+        "INSERT INTO a VALUES (1, 'x', 10), (2, 'x', 20), (3, 'y', 10)",
+        "INSERT INTO b VALUES (1, 10), (2, 10), (3, 30)",
+    ];
+    assert_same(
+        setup,
+        "SELECT a.dept, COUNT(*) FROM a GROUP BY a.dept \
+         HAVING COUNT(*) > (SELECT COUNT(*) FROM b WHERE b.k = 30) ORDER BY 1",
+    );
+    // Django's shape: an `IN (SELECT …)` inside an OR, over a joined group.
+    assert_same(
+        setup,
+        "SELECT a.dept, COUNT(*) FROM a GROUP BY a.dept \
+         HAVING (COUNT(*) > 5 OR a.dept IN (SELECT 'x' FROM b)) ORDER BY 1",
+    );
+    let t = open();
+    for s in setup {
+        t.db.query(s, &[]).unwrap();
+    }
+    let e = t
+        .db
+        .query(
+            "SELECT a.dept FROM a GROUP BY a.dept \
+             HAVING (SELECT COUNT(*) FROM b WHERE b.k = a.g) > 0",
+            &[],
+        )
+        .unwrap_err();
+    assert!(format!("{e}").contains("CORRELATED subquery in HAVING"), "{e}");
+}
+
+// ------------------------------------ a typeless argument to a scalar fn ----
+
+/// A DYNAMICALLY typed (`any`) argument to a built-in scalar. Its storage
+/// class is not known until the row is read, so the type check belongs at the
+/// row, not at compile time — Django's `CAST(FLOOR("price") AS NUMERIC)` over a
+/// `decimal` column was refused whole.
+///
+/// Admitting it is what exposed `round()`: sqlite's `round` ALWAYS answers a
+/// REAL, clamps a negative digit count to 0, and rounds through the decimal
+/// rendering. mpedb returned the integer unchanged, rounded to TENS on a
+/// negative count, and multiplied — three wrong answers, all fixed here and all
+/// checked on VALUE and `typeof()`.
+#[test]
+fn a_typeless_argument_to_a_numeric_function_agrees_with_sqlite() {
+    let setup: &[&str] = &[
+        // `decimal(10,2)` is NUMERIC affinity → typeless: row 1 stores a REAL,
+        // row 2 an INTEGER, so one column meets both classes.
+        "CREATE TABLE n (id INTEGER PRIMARY KEY, price decimal(10,2))",
+        "INSERT INTO n VALUES (1, 30.5), (2, 7), (3, NULL)",
+    ];
+    assert_same(
+        setup,
+        "SELECT id, abs(price), ceil(price), floor(price), trunc(price), round(price) \
+         FROM n ORDER BY id",
+    );
+    assert_same(
+        setup,
+        "SELECT id, typeof(abs(price)), typeof(ceil(price)), typeof(floor(price)), \
+         typeof(round(price)) FROM n ORDER BY id",
+    );
+    // Django's shape.
+    assert_same(setup, "SELECT id, (CAST(FLOOR(price) AS NUMERIC)) FROM n ORDER BY id");
+    assert_same(
+        setup,
+        "SELECT id, typeof(CAST(FLOOR(price) AS NUMERIC)) FROM n ORDER BY id",
+    );
+    // `round()` in its own right — the three corrections, on value and type.
+    assert_same(setup, "SELECT round(7), typeof(round(7)), round(7, 2), round(-7)");
+    assert_same(setup, "SELECT round(1234.5678, -2), round(1234.5678, 2), round(2.675, 2)");
+    assert_same(setup, "SELECT round(1.005, 2), round(123.456, 40), round(-2.5), round(2.5)");
+    // (`round(1e17)` agrees too, but this file's `render` prints a big float
+    // as Rust does and sqlite as `1.0e+17`, so it cannot be compared here.)
+    assert_same(setup, "SELECT typeof(round(1e17)), round(1e17) = 1e17");
+    assert_same(setup, "SELECT round(NULL), round(1.5, NULL), typeof(round(NULL))");
+}

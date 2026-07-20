@@ -196,6 +196,13 @@ struct Parser<'a> {
     /// Host aggregates that ALSO carry the window protocol (see
     /// `parse_statement_ctes`). A subset of `host_aggs` by name.
     window_aggs: Vec<String>,
+    /// The core just parsed by `select_core` carried a NEGATIVE `LIMIT`/`OFFSET`
+    /// — sqlite's "no limit" / "no skip" idiom, which the AST spells as the
+    /// clause being absent. `compound_chain` still has to reject it before a
+    /// set operator (`LIMIT` binds to the whole compound), and `Option::is_some`
+    /// can no longer see it. Written by every `select_core`, read immediately
+    /// after by `compound_chain` — nothing parses a core in between.
+    neg_limit_in_core: bool,
 }
 
 impl<'a> Parser<'a> {
@@ -210,6 +217,7 @@ impl<'a> Parser<'a> {
             depth: 0,
             host_aggs: Vec::new(),
             window_aggs: Vec::new(),
+            neg_limit_in_core: false,
             stack_base: {
                 let probe = 0u8;
                 &probe as *const u8 as usize

@@ -1997,3 +1997,169 @@ out of range. Blast radius, measured: one field on `ColumnDef`, 72 struct
 literals across 16 files (mechanical), 2 `CreateColumnSpec` literals. `PLAN_FORMAT`
 is **unchanged at 54** — a generated column is an ordinary schema column to the
 planner, and every plan-visible difference is a bind-time refusal, not a shape.
+
+---
+
+## Django's own test suite — run 6 (2026-07-20)
+
+Run 6 measures the two things that landed after run 5 and had never been
+scored against Django — **GENERATED columns** (#113, which took
+`model_fields` from unmeasurable to running) and the **MPEE N×N join-order
+solver** (#114, which must not change a single answer) — and then closes
+the top of run 5's ranked `mpedb-sql` gap list. Same Django
+(`5.2.17.dev20260714173342`, commit `3e389b7`), same CPython 3.12.3, same
+stock libsqlite3 3.45.1, `--parallel=1`, same frozen G1/G2 labels.
+
+**Both arms re-run from scratch at the run-6 head before any fix.**
+Interposition verified each time: `sqlite3.sqlite_version` reads `3.45.0`
+under `LD_PRELOAD` and `3.45.1` without it. No stale `memorydb_*` files
+existed in the checkout. `model_fields` is now a **permanent measured
+label**, so the coverage is five label sets, not four.
+
+### ⚠️ FAILs — the ERROR/FAIL split, at the top
+
+**A + B (831 + 493 = 1 324 tests): 17 failing outcomes, 17 unique tests,
+0 FAILs, 17 ERRORs.** Every one is a refusal. **The join reorder changed
+no answer**: the baseline sweep at the run-6 head, before any fix, had
+exactly the run-5 failure set (39 tests, all ERRORs) — a wrong answer from
+the new solver would have surfaced there as a FAIL and did not.
+
+**C (`backends`, 324): 2 shim-only FAILs**, the *deliberate* D11
+`PRAGMA foreign_keys` position, unchanged since run 3.
+
+**E (`model_fields`, 528): 1 FAIL** — `test_unsaved_fk`
+(`IntegrityError not raised`), the same D11 position: mpedb parses
+`REFERENCES` and discards it, so no FK violation is raised. Recorded, not
+fixed.
+
+### A — comparability: the SAME 9 labels, 831 tests
+
+| | stock 3.45.1 | shim run 4 | shim run 5 | **shim run 6** |
+|---|---|---|---|---|
+| G1 `basic lookup transactions ordering update delete` | 392 ran, 0 failed | 29 failed | 6 failed (0 F / 6 E) | **2 failed (0 F / 2 E)** |
+| G2 `aggregation annotations expressions` | 439 ran, 0 failed | 65 failed | 14 failed (0 F / 14 E) | **5 failed (0 F / 5 E)** |
+| **total** | **831/831 (100 %)** | 737/831 (88.7 %) | 811/831 (97.6 %) | **824/831 (99.2 %)** |
+| delta vs previous run | — | +47 | +74 | **+13** |
+
+Skip parity is exact (G1 17/17, G2 5/5, expected failures 1/1). Outcomes
+and unique tests coincide: 7 and 7.
+
+### B — `queries` (493)
+
+| | stock 3.45.1 | shim run 4 | shim run 5 | **shim run 6** |
+|---|---|---|---|---|
+| `queries` | 493 ran, 0 failed (15 skips, 2 xfail) | 459/493 (93.1 %) | 474/493 (96.1 %) | **483/493 (98.0 %)** |
+| delta | — | — | +15 | **+9** |
+
+### C — `backends` (324)
+
+Unchanged from run 5: 16 failing outcomes (5 F / 11 E), 10 unique failing
+tests, **5 shim-only** — DDL-in-SAVEPOINT 2 (engine), D10 1, D11 2.
+**314/324.** Nothing in this label was on the run-6 work list.
+
+### E — `model_fields` (528), now permanent
+
+| | tests | failing outcomes | unique shim-only tests | pass (outcome rule) |
+|---|---|---|---|---|
+| run 5 | *unmeasurable* — `migrate` died at `GENERATED ALWAYS AS` | — | — | — |
+| #113 | 528 | 15 (0 F / 15 E) | 4 | 513 |
+| **run 6** | 528 | **14 (1 F / 13 E)** | **3** | **514** |
+
+The 14 are: 12 outcomes of one test method × 3 hostile keys × 4 lookups
+(the deliberate JSON-path-with-backslash refusal), one
+`cannot compare int64 with text` (`test_none_key_exclude` — a JSON
+extraction compared against a bound number, the last member of the
+`any`-affinity family), and the D11 FK FAIL. `test_filter_with_expr`
+(`replace() argument 1 must be text, got any`) closed this run.
+
+### The seven fixes, and the sqlite rule each derives from
+
+Every one is in `mpedb-sql` or `mpedb-types` — **nothing landed in the
+shim this run** — and every one is pinned by a differential test against
+the **bundled** 3.45.0 oracle, on VALUE and `typeof()`.
+
+| # | Gap (run-5 rank / tests) | The sqlite rule | Where |
+|---|---|---|---|
+| 1 | `LIMIT -1` (rank 5, 4) | A negative `LIMIT` is NO limit; a negative `OFFSET` skips nothing. `-0` is plain zero. | `parser/select.rs` |
+| 2 | INSERT VALUES expressions (rank 4, 5) | A VALUES row is evaluated once over no row — the same statement as a FROM-less `SELECT`. Planned as `INSERT … SELECT`; **no plan-format change**. | `planner/mod.rs` |
+| 3 | `any`-affinity comparison (rank 2, 9) | `sqlite3ExprAffinity` gives a **CAST** its target's affinity, so `CAST(x AS NUMERIC) > '0'` applies NUMERIC to the text operand. Without the CAST neither side carries one and the classes compare raw — the two answers genuinely differ. | `binder.rs` |
+| 4 | `any` scalar arguments (rank 2) | A dynamically typed argument's class is known at the ROW, not at compile time. Narrower than sqlite (which coerces `length(123)`), but a refusal at the row, never a different value. | `binder.rs` |
+| 5 | Subquery in HAVING (rank 5, 4) | An UNCORRELATED subplan is filled once, before dispatch, so HAVING reads an ordinary parameter. A CORRELATED one is refused by name. | `planner/subquery.rs` |
+| 6 | Compound arm typing (rank 2) | sqlite has NO static column type for a compound: each row keeps its own arm's storage class. `any` ∪ concrete = `any`; two different concrete types still refuse. | `planner/mod.rs` |
+| 7 | One-offs (rank 7, 3) | `CURRENT_TIMESTAMP`/`_DATE`/`_TIME` ARE `datetime`/`date`/`time` of `'now'` (sqlite's own identity, so the desugar is exact); `$` is an `IdChar` and continues an identifier, it just cannot start one. | `parser/expr.rs`, `token.rs` |
+
+Plus one inference: a bare parameter in a **CASE result position** takes
+the assigned column's type, the same rule `SET c = ?` already follows.
+Django's `bulk_update` emits `SET c = CASE WHEN … THEN ? … END`, and
+without the pin the shim cannot convert its `int` 0/1 into the `bool` the
+column is.
+
+### ⚠️ Three wrong answers found and fixed: `round()`
+
+Admitting an `any` argument to the numeric scalars (#4 above) put
+`round()` on a differential path it had never been on, and it was wrong
+three ways — all pre-existing, none introduced by this run:
+
+| | mpedb was | sqlite 3.45 |
+|---|---|---|
+| `round(7)`, `round(7, 2)` | `7` **integer** | `7.0` **real** |
+| `round(1234.5678, -2)` | `1200.0` | `1235.0` |
+| `round(2.675, 2)` | `2.68` | `2.67` |
+
+sqlite's `roundFunc` always answers a REAL, clamps the digit count to
+`0..=30` (a negative one rounds to whole units, not to tens), and rounds
+through the DECIMAL rendering — `2.675` is really `2.67499…`, which
+multiply-round-divide gets wrong. Ported as written; the binder's result
+type for `round` moves out of the "same numeric out" group with it.
+
+A side effect in the sqlite-backed overlay: a base table carrying
+`CHECK (length(v) < 10)` used to be REFUSED at open (`length()` pinned its
+argument to text, an attached column is `Any`). It now attaches, and the
+constraint is enforced per value.
+
+### Coverage
+
+* 12 of Django's 219 labels: the frozen 9 (831) + `queries` (493) +
+  `backends` (324) + **`model_fields` (528)** = **2 176 tests measured**.
+* Over the run-5 comparable set (1 648): **1 621**, vs run 5's 1 599 —
+  **+22**, 98.4 %.
+* Including `model_fields`: **2 135 / 2 176 by the outcome rule (98.1 %)**,
+  **2 146 / 2 176 by the unique-test rule (98.6 %)**.
+* Wrong answers in the SQL surface: **0**. The only FAILs anywhere are the
+  three deliberate FK/PRAGMA-honesty positions (D11 ×2 in `backends`,
+  `test_unsaved_fk` in `model_fields`).
+* Still `--parallel=1`; no concurrency or multi-process behaviour measured.
+
+### What is left between here and 100 %, re-ranked
+
+| Rank | Tests | Work | Owner |
+|---|---|---|---|
+| 1 | 3 | **Compound correlation scope** — a reference out of a compound arm (`no table named V0 in this statement`), in a nested `EXISTS`/`INTERSECT` | `mpedb-sql` planner |
+| 1 | 3 | **A non-flattenable derived body in a nested position** (compound arm, subquery body) | `mpedb-sql` planner |
+| 3 | 2 | **A correlated subquery inside a compound SELECT** | `mpedb-sql` planner |
+| 3 | 2 | **DDL inside a SAVEPOINT** (`backends`) | engine (`apply_ddl`) |
+| 3 | 2 | **A non-integral `float64` parameter where `int64` is required** (`year >= 1942.1`) — sqlite compares numerically across classes | `mpedb` param check / binder |
+| 3 | 2 | **A float-valued expression assigned to an int column** (`SET i = POWER(i, ?)`) — sqlite's INTEGER affinity converts when lossless, which needs a checked runtime conversion (a new opcode, i.e. a PLAN_FORMAT bump) | `mpedb-types` expr + `binder.rs` |
+| 7 | 1 | A correlated subquery in an aggregate SELECT list over the collapsed group | `mpedb-sql` |
+| 7 | 1 | A correlated subquery in HAVING (now refused by name, was refused as a class) | `mpedb-sql` |
+| 7 | 1 | `cannot compare with IN list: text and int64` — class comparison in an IN list | `mpedb-sql` binder |
+| 7 | 1 | A multi-row `VALUES` with an expression (needs a `UNION ALL` INSERT source) | `mpedb-sql` |
+| 7 | 1 | `unknown column` in a derived-table projection (`SELECT "subquery"."c" FROM (…) subquery`) | `mpedb-sql` |
+| 7 | 1 | A JSON extraction compared against a bound number (`model_fields`) | `mpedb-sql` binder |
+| — | 12 | JSON path key containing a backslash — the documented deliberate refusal | (deliberately open) |
+| — | 3 | D10 `PRAGMA synchronous`, D11 `PRAGMA foreign_keys`, `test_unsaved_fk` — closing them means claiming durability and FK enforcement mpedb does not have | (deliberately open) |
+| — | 0 | The shim's `sqlite_master` mini-evaluator learning `WITH RECURSIVE` — removes adaptation D8 | `mpedb-capi` |
+| — | 0 | `AUTOINCREMENT` — removes adaptation D2 | `mpedb-sql` + a persisted rowid high-water |
+
+**The measured remainder is 15 tests in `mpedb-sql`, 2 in the engine, and
+15 deliberately open.** The planner's compound/derived-placement family
+(8 tests) is now the single largest block, and it is one coherent piece of
+work rather than a tail.
+
+### Known remaining shim-side one-off
+
+`SELECT 1 AS a$b` — the parser takes `a$b` as one identifier (correct),
+but the shim's own parameter scanner
+(`sqlite3_bind_parameter_count`, `mpedb-capi`) still counts `$b` as a
+parameter and the statement fails with a binding-count error. Django's
+shape (`crafted_alia$.id`) does not hit it.
