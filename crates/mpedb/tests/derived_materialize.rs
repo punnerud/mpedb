@@ -319,6 +319,64 @@ fn body_owned_subplans_match_sqlite() {
     }
 }
 
+/// The `C-API-COMPAT.md` run-4 category this closes, in Django's own wire
+/// shapes: "derived body has an aliased/renamed column" (7 statements) —
+/// every one of which "projects a correlated scalar/`EXISTS`/window under an
+/// alias and is consumed by an outer aggregate `FILTER`/argument".
+///
+/// `FILTER` and the aggregate ARGUMENT are the positions that made the old
+/// row's diagnosis ("a projection remap converts it into correlated subquery
+/// in an aggregate argument") true; with body ownership the correlation is
+/// resolved one level down and the outer sees a plain materialised column, so
+/// those positions are ordinary again. Diffed against the oracle.
+#[test]
+fn the_django_annotate_exists_then_aggregate_shapes_match_sqlite() {
+    let d = db();
+    for q in [
+        // .annotate(Exists(...)).aggregate(Count(...))
+        "SELECT count(*) FROM (SELECT t.id AS id, \
+         EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS has_thing FROM t) sub WHERE has_thing",
+        // …consumed by an aggregate FILTER instead of a WHERE.
+        "SELECT count(*) FILTER (WHERE has_thing) FROM (SELECT t.id AS id, \
+         EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS has_thing FROM t) sub",
+        "SELECT count(*) FILTER (WHERE NOT has_thing) FROM (SELECT t.id AS id, \
+         EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS has_thing FROM t) sub",
+        // …consumed as the aggregate ARGUMENT. (`sum()` of a BOOL is a
+        // separate, PRE-EXISTING refusal — arithmetic on mpedb's first-class
+        // bool is rigid, the documented boundary of the int/bool bridge — so
+        // the aggregate-argument position is exercised with `max`, which is
+        // class-ordered rather than arithmetic.)
+        "SELECT max(has_thing), max(id) FROM (SELECT t.id AS id, \
+         EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS has_thing FROM t) sub",
+        // …grouped BY the projected correlated value.
+        "SELECT has_thing, count(*) FROM (SELECT t.id AS id, \
+         EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS has_thing FROM t) sub \
+         GROUP BY has_thing ORDER BY has_thing",
+        // A correlated SCALAR annotation, same two consumers.
+        "SELECT count(*) FROM (SELECT t.id AS id, \
+         (SELECT count(*) FROM u WHERE u.b = t.a) AS n FROM t) sub WHERE n > 0",
+        "SELECT sum(n) FROM (SELECT (SELECT count(*) FROM u WHERE u.b = t.a) AS n FROM t) sub",
+        // The body ALSO DISTINCTs/joins around its lift — the combination the
+        // run-4 table filed under "JOIN"/"DISTINCT" and root-caused to the
+        // same thing.
+        "SELECT count(*) FROM (SELECT DISTINCT t.a AS a, \
+         EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS has_thing FROM t) sub WHERE has_thing",
+        "SELECT count(*) FROM (SELECT t.id AS id, \
+         EXISTS (SELECT 1 FROM u WHERE u.b = t.a) AS has_thing \
+         FROM t JOIN u ON u.id = t.id) sub WHERE has_thing",
+        // NOT here, and deliberately: a body that GROUPS and projects the
+        // correlated value without making it a key —
+        // `SELECT t.a, EXISTS(…) FROM t GROUP BY t.a` — is the "correlated
+        // subquery in a grouped SELECT-list expression that is not itself a
+        // GROUP BY key" straggler the run-4 table already names. That is a
+        // genuine per-GROUP hole (no single row's correlation applies to a
+        // collapsed group), refused by name, and body ownership neither
+        // creates nor closes it.
+    ] {
+        check(&d, q);
+    }
+}
+
 /// A body-owned lift reserves a parameter slot, so the CALLER's parameter count
 /// must not move — the accounting bug this would otherwise be
 /// (`n_subplan_slots`) shows up as "expected 2 parameters, got 1".

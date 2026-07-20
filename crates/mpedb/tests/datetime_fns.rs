@@ -209,6 +209,45 @@ fn date_time_datetime_julianday_match_sqlite_over_every_time_form() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// The statements the Django/backends gaps in `C-API-COMPAT.md`'s run-4 table
+/// name, VERBATIM. Each was a recorded refusal; each must now answer, with the
+/// shape stock sqlite gives.
+#[test]
+fn the_named_django_statements_answer() {
+    let (db, path) = mpedb_db();
+
+    // Gap 2 — `test_parameter_escaping` (EscapingChecks, EscapingChecksDebug).
+    // Was: `bind error: unknown function 'date()'`.
+    let s = one_text(&db, "SELECT strftime('%s', date('now'))");
+    let epoch: i64 = s.parse().unwrap_or_else(|e| panic!("not an epoch: {s:?} ({e})"));
+    // date('now') truncates to midnight UTC, so this is a whole number of days.
+    assert_eq!(epoch % 86_400, 0, "date('now') must be midnight UTC, got {epoch}");
+
+    // Gap 3 — `test_no_interpolation`. Was:
+    // `strftime(): unsupported time string "now"`.
+    let y = one_text(&db, "SELECT strftime('%Y', 'now')");
+    assert_eq!(y.len(), 4, "a four-digit year, got {y:?}");
+    assert!(y.chars().all(|c| c.is_ascii_digit()), "got {y:?}");
+
+    // The `date()` family gap in the D-list (`backends`). Was: `date()` unknown.
+    for sql in [
+        "SELECT date('now')",
+        "SELECT time('now')",
+        "SELECT datetime('now')",
+        "SELECT julianday('now')",
+    ] {
+        assert!(db.query(sql, &[]).is_ok(), "`{sql}` must answer");
+    }
+    // The two spellings agree with each other, which is the whole point of
+    // one instant per statement.
+    assert_eq!(
+        one_text(&db, "SELECT date('now') = strftime('%Y-%m-%d','now')"),
+        "1"
+    );
+
+    let _ = std::fs::remove_file(&path);
+}
+
 /// Contract 1: sqlite fixes `'now'` ONCE PER STATEMENT, so two `'now'`s in one
 /// statement are the SAME instant. Asserted at millisecond resolution (`%f`),
 /// which is the resolution sqlite's own `'now'` has — a per-call clock read
