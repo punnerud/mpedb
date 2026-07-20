@@ -73,3 +73,19 @@ to measure drop-in compatibility beyond mpedb's own tests. Results feed
   `backends` (a generated m2m name is 134 chars) moved to 255 in the same pass,
   along with the identifier CHARACTER set — a quoted name may now contain spaces
   and punctuation, as sqlite allows. `queries` and `backends` are measurable.
+
+## Findings (2026-07-20, Django run 5 — see C-API-COMPAT.md)
+
+- **811/831 on the frozen G1/G2 labels (97.6 %), `queries` 474/493, `backends`
+  314/324 — 1 599 of 1 648 measured tests (97.0 %), +91 over run 4.** Every one
+  of the 39 remaining G1/G2/`queries` failures is a REFUSAL; zero wrong answers
+  in the SQL surface. The only two shim-only FAILs anywhere are the deliberate
+  D11 `PRAGMA foreign_keys` position.
+- **The next wall is one parser feature, not a long tail:** `model_fields`
+  (528 tests) cannot be measured at all because `migrate` dies on
+  `GENERATED ALWAYS AS ("field") STORED`. That single gap outweighs the entire
+  remaining measured gap list.
+- Both surviving adaptations re-ablated: D2 (AUTOINCREMENT) still gates all
+  831; D8 (`_references_graph`) still costs ~147 G1 outcomes, now pinned only
+  by the shim's `sqlite_master` mini-evaluator refusing Django's recursive-CTE
+  shape (W3's second pin is gone).
