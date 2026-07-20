@@ -1103,6 +1103,23 @@ impl<'a> Parser<'a> {
                 if self.peek() == Some(&Tok::Dot) {
                     return self.dot_suffix(s);
                 }
+                // sqlite's three time keywords, in EXPRESSION position. Each is
+                // defined as the corresponding function of `'now'` in UTC — the
+                // equality `datetime('now') = CURRENT_TIMESTAMP` is sqlite's own
+                // — so desugaring is the exact answer, not an approximation, and
+                // it inherits the `'now'` support (#112 B) whole. A QUOTED
+                // "current_timestamp" is a column name, as for every other word
+                // with a meaning; the DDL `DEFAULT` position keeps its separate
+                // refusal (a stored default is a constant, not a per-row call).
+                let now_fn = match s.to_ascii_lowercase().as_str() {
+                    "current_timestamp" => Some("datetime"),
+                    "current_date" => Some("date"),
+                    "current_time" => Some("time"),
+                    _ => None,
+                };
+                if let Some(f) = now_fn {
+                    return Ok(Expr::Func(f.into(), vec![Expr::Lit(Value::Text("now".into()))]));
+                }
                 Ok(Expr::Col(s))
     }
 
