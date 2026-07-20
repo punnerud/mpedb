@@ -262,6 +262,14 @@ impl CompiledPlan {
                 // the term the solver minimises second and the one that turns
                 // `select5.test`'s `join-17-4` from a refusal into an answer
                 // (design/DESIGN-MPEE-SOLVER.md §3).
+                //
+                // This line is RECONSTRUCTED from the finished plan, not
+                // reported by the solver, and nothing in the plan bytes records
+                // whether `mpee::reorder` ran or returned `Err(Skip::*)`. So it
+                // must not be labelled as MPEE's doing: a FULL JOIN chain the
+                // solver explicitly declines to look at (`planner/mpee.rs`)
+                // would otherwise print an attribution it did not earn. What
+                // the line states is true of the plan either way.
                 if !joins.is_empty() {
                     let class = |a: &AccessPath, on: Option<&ExprProgram>| -> &'static str {
                         match a {
@@ -287,7 +295,7 @@ impl CompiledPlan {
                         steps.push(format!("{} [{}]", table_name(j.table), c));
                     }
                     out.push_str(&format!(
-                        "  join order: {} (MPEE: {} cartesian step{})\n",
+                        "  join order: {} ({} cartesian step{})\n",
                         steps.join(" -> "),
                         cart,
                         if cart == 1 { "" } else { "s" }

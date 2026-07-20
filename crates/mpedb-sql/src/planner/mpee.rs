@@ -182,8 +182,8 @@ struct Node<'a> {
     def: &'a TableDef,
     /// log2 magnitude of the table's row count — **bought lazily** (§9.5). The
     /// solver asks; only then does the cost side pay for the catalog read.
-    /// `None` prices as `0`, a valid lower bound, which is what makes the
-    /// branch-and-bound rounds in [`Problem::solve`] sound.
+    /// `None` prices as [`UNBOUGHT`], a genuine lower bound, which is what
+    /// makes the branch-and-bound rounds in [`Problem::solve`] sound.
     bucket: Cell<Option<u32>>,
     /// Equality pins on this table's columns: `(column index, mask of tables
     /// the pinning expression needs placed first)`. A constant pin has mask 0.
@@ -401,7 +401,8 @@ impl<'a> Problem<'a> {
         }
         // The size extremes read whatever magnitudes have been BOUGHT so far
         // and nothing more (§9.5). In the first ping-pong round every bucket is
-        // still `0`, so the seeds are purely structural — the anchors and the
+        // still at the flat [`UNBOUGHT`] floor, so the size extremes cannot
+        // separate anything and the seeds are purely structural — the anchors and the
         // hub; each later round sharpens them with the counts the previous
         // round's decision turned out to depend on. Seed selection never buys.
         let by = |f: &dyn Fn(usize) -> u32, max: bool| -> Option<usize> {
@@ -560,7 +561,8 @@ impl<'a> Problem<'a> {
     /// when the proposal is fully bought.
     ///
     /// Soundness: every cost term is monotone non-decreasing in a table's
-    /// bucket, so an unbought `0` makes every candidate's cost a LOWER bound.
+    /// bucket, so an unbought table priced at [`UNBOUGHT`] makes every
+    /// candidate's cost a LOWER bound.
     /// When the winner `O` has all of its own contributors bought, `cost(O)` is
     /// exact while every rejected candidate `P` satisfied
     /// `cost_est(P) ≥ cost_est(O) = cost_true(O)` and `cost_true(P) ≥
@@ -613,7 +615,7 @@ impl<'a> Problem<'a> {
     /// Adopt `chosen` only if it is STRICTLY better than what the user wrote.
     ///
     /// The textual order's cost starts as a LOWER bound (its unbought tables
-    /// price at 0) and is refined ONE count at a time, stopping the instant the
+    /// price at [`UNBOUGHT`]) and is refined ONE count at a time, stopping the instant the
     /// comparison is decided. Buying can only raise the textual cost, so the
     /// first `chosen < textual` that appears is final — and in a chain the
     /// solver rescues, that happens after two or three counts rather than after
