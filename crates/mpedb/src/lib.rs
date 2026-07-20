@@ -57,6 +57,7 @@ mod sqlite_attach;
 mod ddl_apply;
 mod sqlite_overlay;
 mod stream;
+mod tier;
 mod trigger;
 mod workspace;
 
@@ -68,6 +69,7 @@ pub use sqlite_overlay::{LockMode, ReconcilePolicy, ReconcileReport, SqliteOverl
 #[cfg(feature = "sqlite-checkpoint")]
 pub use sqlite_overlay::CheckpointReport;
 pub use stream::RowStream;
+pub use tier::TierReport;
 pub use workspace::{Workspace, WorkspaceTxn, WsPlan};
 
 pub use mpedb_types::{
