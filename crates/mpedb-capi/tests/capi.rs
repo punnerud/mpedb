@@ -1984,15 +1984,16 @@ fn collation_registration_orders_sorts_and_honors_the_destructor_contract() {
         assert_ne!(rc, SQLITE_OK, "a deregistered collation cannot be used");
         assert_eq!(msg, "no such collation sequence: mycoll", "sqlite's exact wording");
 
-        // The window-function stub's destructor contract is the OPPOSITE and
-        // still holds: sqlite DOES invoke it on a failed registration, and
-        // CPython relies on that by not freeing.
+        // The window-function registration's destructor contract, both ways:
+        // sqlite runs `xDestroy(pApp)` on a FAILED registration (CPython relies
+        // on that by not freeing), and also on the all-NULL DELETE form, which
+        // succeeds.
         let wname = cs("mywin");
         let rc = sqlite3_create_window_function(
             db,
             wname.as_ptr(),
-            1,
-            1, // SQLITE_UTF8
+            -2, // outside -1..=127
+            1,  // SQLITE_UTF8
             app,
             ptr::null_mut(),
             ptr::null_mut(),
@@ -2000,12 +2001,26 @@ fn collation_registration_orders_sorts_and_honors_the_destructor_contract() {
             ptr::null_mut(),
             fnptr1(count_destroy),
         );
-        assert_eq!(rc, SQLITE_ERROR, "window functions are refused");
+        assert_eq!(rc, SQLITE_MISUSE, "nArg outside -1..=127 is a misuse");
         assert_eq!(
             hits.load(Ordering::SeqCst),
             2,
             "window-function destructor MUST run on failure (CPython does not free otherwise)"
         );
+        let rc = sqlite3_create_window_function(
+            db,
+            wname.as_ptr(),
+            1,
+            1,
+            app,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            fnptr1(count_destroy),
+        );
+        assert_eq!(rc, SQLITE_OK, "all-NULL callbacks DELETE the entry");
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "...and still run the destructor");
         sqlite3_close(db);
     }
 }
@@ -3457,6 +3472,148 @@ fn function_arg_limit_counts_calls_and_nothing_else() {
 
         sqlite3_limit(db, SQLITE_LIMIT_FUNCTION_ARG, prior);
         assert_eq!(scalar_count(db, "SELECT max(a, b) FROM t WHERE a = 1"), 2);
+        sqlite3_close(db);
+    }
+}
+
+/// `sqlite3_create_window_function` — a user-defined WINDOW aggregate, end to
+/// end. The answers are sqlite's own worked example for the API, and the CALL
+/// SEQUENCE is asserted too: a moving frame must retract through `xInverse`
+/// rather than being re-aggregated, because that is what a consumer's callbacks
+/// are written for.
+#[test]
+fn a_host_window_function_slides_its_frame() {
+    use std::sync::atomic::{AtomicI64, Ordering as AtOrd};
+    // The accumulator lives in the aggregate context; the counters are process
+    // -wide because this is the only test that registers these callbacks.
+    static STEPS: AtomicI64 = AtomicI64::new(0);
+    static INVERSES: AtomicI64 = AtomicI64::new(0);
+    static VALUES: AtomicI64 = AtomicI64::new(0);
+    static FINALS: AtomicI64 = AtomicI64::new(0);
+
+    unsafe fn total(ctx: *mut c_void) -> *mut i64 {
+        sqlite3_aggregate_context(ctx, 8) as *mut i64
+    }
+    unsafe extern "C" fn w_step(ctx: *mut c_void, _argc: c_int, argv: *mut *mut c_void) {
+        STEPS.fetch_add(1, AtOrd::Relaxed);
+        *total(ctx) += sqlite3_value_int64(*argv);
+    }
+    unsafe extern "C" fn w_inverse(ctx: *mut c_void, _argc: c_int, argv: *mut *mut c_void) {
+        INVERSES.fetch_add(1, AtOrd::Relaxed);
+        *total(ctx) -= sqlite3_value_int64(*argv);
+    }
+    unsafe extern "C" fn w_value(ctx: *mut c_void) {
+        VALUES.fetch_add(1, AtOrd::Relaxed);
+        sqlite3_result_int64(ctx, *total(ctx));
+    }
+    unsafe extern "C" fn w_final(ctx: *mut c_void) {
+        FINALS.fetch_add(1, AtOrd::Relaxed);
+        sqlite3_result_int64(ctx, *total(ctx));
+    }
+
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)"), SQLITE_OK);
+        assert_eq!(
+            exec(db, "INSERT INTO t (x, y) VALUES (1,4),(2,5),(3,3),(4,8),(5,1)"),
+            SQLITE_OK
+        );
+        let name = cs("sumint");
+        assert_eq!(
+            sqlite3_create_window_function(
+                db,
+                name.as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                w_step as *mut c_void,
+                w_final as *mut c_void,
+                w_value as *mut c_void,
+                w_inverse as *mut c_void,
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+        let q = "SELECT sumint(y) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) \
+                 FROM t ORDER BY x";
+        assert_eq!(collect_text_col(db, q), ["9", "12", "16", "12", "9"]);
+        assert_eq!(STEPS.load(AtOrd::Relaxed), 5);
+        assert_eq!(INVERSES.load(AtOrd::Relaxed), 3, "the frame must SLIDE, not re-aggregate");
+        assert_eq!(VALUES.load(AtOrd::Relaxed), 5);
+        assert_eq!(FINALS.load(AtOrd::Relaxed), 1, "xFinal runs once per partition");
+
+        // All-NULL callbacks DELETE the registration (sqlite's rule), and the
+        // window query then refuses rather than answering.
+        assert_eq!(
+            sqlite3_create_window_function(
+                db,
+                name.as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+        let s = cs(q);
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_ERROR
+        );
+        sqlite3_close(db);
+    }
+}
+
+/// An aggregate registered through `create_function` (no xValue/xInverse) is
+/// still refused under `OVER` — by NAME, and naming what is missing. Answering
+/// it with a whole-partition value under a bounded frame would be a wrong
+/// answer, which is exactly what this refusal exists to prevent.
+#[test]
+fn a_plain_aggregate_is_still_refused_under_over() {
+    unsafe extern "C" fn a_step(ctx: *mut c_void, _argc: c_int, argv: *mut *mut c_void) {
+        let p = sqlite3_aggregate_context(ctx, 8) as *mut i64;
+        *p += sqlite3_value_int64(*argv);
+    }
+    unsafe extern "C" fn a_final(ctx: *mut c_void) {
+        let p = sqlite3_aggregate_context(ctx, 8) as *mut i64;
+        sqlite3_result_int64(ctx, if p.is_null() { 0 } else { *p });
+    }
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (x, y) VALUES (1,4),(2,5)"), SQLITE_OK);
+        let name = cs("plainsum");
+        assert_eq!(
+            sqlite3_create_function(
+                db,
+                name.as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                a_step as *mut c_void,
+                a_final as *mut c_void,
+            ),
+            SQLITE_OK
+        );
+        // Grouped: fine.
+        assert_eq!(scalar_count(db, "SELECT plainsum(y) FROM t"), 9);
+        let s = cs("SELECT plainsum(y) OVER (ORDER BY x) FROM t");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_ERROR
+        );
+        let msg = errmsg(db);
+        assert!(
+            msg.contains("create_window_function"),
+            "refusal must name the missing registration: {msg}"
+        );
         sqlite3_close(db);
     }
 }

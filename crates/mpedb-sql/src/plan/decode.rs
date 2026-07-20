@@ -807,6 +807,7 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
 /// (unknown ⇒ `Corrupt`, like `AggFn::from_tag`), and `distinct` is rejected
 /// (stage 1 does not support it, and neither does the planner that emits this).
 fn decode_window(buf: &[u8], pos: &mut usize) -> Result<WindowSpec> {
+    let mut host: Option<String> = None;
     let func = match r_u8(buf, pos)? {
         1 => WindowFunc::RowNumber,
         2 => WindowFunc::Rank,
@@ -843,6 +844,14 @@ fn decode_window(buf: &[u8], pos: &mut usize) -> Result<WindowSpec> {
         }
         11 => WindowFunc::PercentRank,
         12 => WindowFunc::CumeDist,
+        // Format 55: a HOST window aggregate — the tag is followed by its NAME.
+        13 => {
+            host = Some(r_str(buf, pos)?);
+            if host.as_deref().is_some_and(str::is_empty) {
+                return Err(corrupt("host window aggregate with an empty name"));
+            }
+            WindowFunc::Host
+        }
         t => return Err(corrupt(format!("bad window function tag {t}"))),
     };
     let arg = decode_opt_program(buf, pos)?;
@@ -879,6 +888,11 @@ fn decode_window(buf: &[u8], pos: &mut usize) -> Result<WindowSpec> {
     }
     if arg.is_none() && is_value {
         return Err(corrupt("value window function requires an argument"));
+    }
+    // A host window aggregate is the single-argument shape the sliding protocol
+    // can express (the same arguments go to `xStep` and `xInverse`).
+    if matches!(func, WindowFunc::Host) && arg.is_none() {
+        return Err(corrupt("host window aggregate requires an argument"));
     }
     if default.is_some() && !matches!(func, WindowFunc::Lag(_) | WindowFunc::Lead(_)) {
         return Err(corrupt("only lag/lead carry a default expression"));
@@ -921,6 +935,7 @@ fn decode_window(buf: &[u8], pos: &mut usize) -> Result<WindowSpec> {
         order_by,
         default,
         frame,
+        host,
     })
 }
 

@@ -2706,6 +2706,8 @@ unsafe fn create_function_impl(
         x_func,
         x_step,
         x_final,
+        x_value: ptr::null_mut(),
+        x_inverse: ptr::null_mut(),
     });
     SQLITE_OK
 }
@@ -2739,24 +2741,124 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
     create_function_impl(db, name, n_arg, app, x_func, x_step, x_final, x_destroy)
 }
 
+/// `sqlite3_create_window_function(db, name, nArg, enc, pApp, xStep, xFinal,
+/// xValue, xInverse, xDestroy)` — a user-defined WINDOW aggregate
+/// (design/DESIGN-UDF.md stage 4).
+///
+/// This is a strictly stronger registration than `create_function`'s aggregate
+/// form, and that is the whole point: `xValue` reports the CURRENT frame's
+/// result without consuming the aggregate context, and `xInverse` retracts a row
+/// that has left the frame. With both, mpedb's window executor SLIDES the frame
+/// — stepping rows that enter, inverting rows that leave, calling `xValue` once
+/// per row and `xFinal` once per partition, which is the call sequence a
+/// consumer's callbacks are written for.
+///
+/// **Scope, and what is refused by name.** The registration is ONE argument
+/// (`nArg` 1 or the variadic `-1`) — the sliding protocol feeds `xInverse` the
+/// same single row's arguments `xStep` got — and a wider arity is accepted here
+/// but refused at the call site rather than silently mis-fed. `xStep`/`xFinal`
+/// are mandatory; `xValue`/`xInverse` missing makes it a plain aggregate
+/// registration, exactly as sqlite documents, so `OVER` then refuses by name.
+/// All-NULL callbacks DELETE the entry (sqlite's rule, and CPython's
+/// `create_window_function(name, n, None)`).
+///
+/// # Safety
+/// `db` must be a connection this shim opened; the callbacks must match sqlite's
+/// signatures and stay valid until the registration is replaced or the
+/// connection closes.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_window_function(
     db: *mut Sqlite3,
-    _name: *const c_char,
-    _n_arg: c_int,
+    name: *const c_char,
+    n_arg: c_int,
     _enc: c_int,
     app: *mut c_void,
-    _x_step: *mut c_void,
-    _x_final: *mut c_void,
-    _x_value: *mut c_void,
-    _x_inverse: *mut c_void,
+    x_step: *mut c_void,
+    x_final: *mut c_void,
+    x_value: *mut c_void,
+    x_inverse: *mut c_void,
     x_destroy: *mut c_void,
 ) -> c_int {
-    call_destroy(x_destroy, app);
-    if let Some(c) = conn(db) {
-        c.set_error(SQLITE_ERROR, SQLITE_ERROR, "user-defined window functions are not supported");
+    let Some(c) = conn(db) else {
+        call_destroy(x_destroy, app);
+        return SQLITE_MISUSE;
+    };
+    c.clear_error();
+    let Some(raw_name) = c_str_opt(name) else {
+        call_destroy(x_destroy, app);
+        c.set_error(
+            SQLITE_MISUSE,
+            SQLITE_MISUSE,
+            "create_window_function: NULL or non-UTF-8 function name",
+        );
+        return SQLITE_MISUSE;
+    };
+    if !(-1..=127).contains(&n_arg) {
+        call_destroy(x_destroy, app);
+        c.set_error(
+            SQLITE_MISUSE,
+            SQLITE_MISUSE,
+            "create_window_function: nArg must be between -1 and 127",
+        );
+        return SQLITE_MISUSE;
     }
-    SQLITE_ERROR
+    let fname = raw_name.to_ascii_lowercase();
+    let deleting = x_step.is_null() && x_final.is_null() && x_value.is_null() && x_inverse.is_null();
+    if !deleting && (x_step.is_null() || x_final.is_null()) {
+        call_destroy(x_destroy, app);
+        c.set_error(
+            SQLITE_MISUSE,
+            SQLITE_MISUSE,
+            "create_window_function: a window aggregate needs BOTH xStep and xFinal",
+        );
+        return SQLITE_MISUSE;
+    }
+    // A repeat registration REPLACES — run the previous entry's destructor and
+    // clear whichever registry it went into (see `create_function_impl`).
+    if let Some(i) = c
+        .host_fns
+        .iter()
+        .position(|h| h.name == fname && h.n_arg == n_arg)
+    {
+        let old = c.host_fns.remove(i);
+        if old.aggregate {
+            c.db.unregister_host_aggregate(&fname, n_arg);
+        } else {
+            c.db.unregister_host_function(&fname, n_arg);
+        }
+        old.destroy();
+    }
+    if deleting {
+        c.db.unregister_host_function(&fname, n_arg);
+        c.db.unregister_host_aggregate(&fname, n_arg);
+        call_destroy(x_destroy, app);
+        return SQLITE_OK;
+    }
+    let step: udf::XStep = std::mem::transmute(x_step);
+    let fin: udf::XFinal = std::mem::transmute(x_final);
+    let val: Option<udf::XFinal> = (!x_value.is_null()).then(|| std::mem::transmute(x_value));
+    let inv: Option<udf::XStep> = (!x_inverse.is_null()).then(|| std::mem::transmute(x_inverse));
+    let factory = udf::make_window_agg_factory(step, fin, val, inv, app);
+    // Only a COMPLETE window registration goes into the window registry; a
+    // half one is a plain aggregate, which `OVER` then refuses by name.
+    if val.is_some() && inv.is_some() {
+        c.db.register_host_window_aggregate(&fname, n_arg, factory);
+    } else {
+        c.db.register_host_aggregate(&fname, n_arg, factory);
+    }
+    c.host_fns.push(udf::HostFn {
+        name: fname,
+        n_arg,
+        aggregate: true,
+        x_destroy,
+        p_app: app,
+        x_func: ptr::null_mut(),
+        x_step,
+        x_final,
+        x_value,
+        x_inverse,
+    });
+    SQLITE_OK
 }
 
 /// `sqlite3_create_collation_v2(db, name, enc, pArg, xCompare, xDestroy)`
