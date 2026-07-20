@@ -43,10 +43,25 @@ The sqlite3 C-API is hundreds of functions; a **core ~30 cover the overwhelming 
   integers). Extended codes where consumers rely on them.
 
 Out of scope (return `SQLITE_ERROR`/a clear "unsupported", documented): loadable extensions
-(`sqlite3_load_extension`), user-defined SQL functions/collations via C (`sqlite3_create_function/…`),
-VDBE/bytecode introspection, the online-backup API, virtual-table modules (`sqlite3_create_module` —
-FTS is native, §DESIGN-FTS). Incremental blob (`sqlite3_blob_open/read/write`) **maps onto mpedb's own
-#43 incremental blob API** rather than being stubbed.
+(`sqlite3_load_extension`), VDBE/bytecode introspection, virtual-table modules
+(`sqlite3_create_module` — FTS is native, §DESIGN-FTS). Incremental blob
+(`sqlite3_blob_open/read/write`) **maps onto mpedb's own #43 incremental blob API** rather than
+being stubbed.
+
+⚠ **Three things this list called out of scope have since shipped** — the ecosystem's own test
+suites demanded them, which is exactly §1's argument working:
+
+- **User-defined functions** (`crates/mpedb-capi/src/udf.rs`): `sqlite3_create_function[_v2]`
+  scalar and aggregate (`xStep`/`xFinal` over a real `sqlite3_aggregate_context`), plus
+  `sqlite3_create_window_function` — a genuine sliding window with `xValue`/`xInverse`, not an
+  aggregate re-run per frame; supplying only `xStep`/`xFinal` degrades to a plain aggregate.
+- **Collations**: `sqlite3_create_collation[_v2]`, including CPython's
+  `create_collation(name, None)` deletion form (`xCompare == NULL` removes the entry).
+- **The online-backup API** (`crates/mpedb-capi/src/backup.rs`): `sqlite3_backup_init/step/
+  finish/remaining/pagecount`, with the page counts mapped honestly onto mpedb's own unit of
+  copy rather than faked.
+
+Measured consequences and the remaining gap list live in `C-API-COMPAT.md`.
 
 ## 3. Lifecycle mapping
 

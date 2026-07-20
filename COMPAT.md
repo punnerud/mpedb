@@ -10,19 +10,20 @@ Two things make this page different from a typical compatibility list:
 
 1. **Every ✅ is measured, not remembered.** The `sqlite_corpus` runner
    (`crates/mpedb-testkit`) executes sqlite's own sqllogictest corpus
-   differentially against sqlite3. Measured 2026-07-19 over the **full 7.4M-record
-   corpus (621 of 622 files; 5,938,278 records attempted after the mysql/mssql-only
-   ones are skipped): 99.968% pass, with zero error mismatches and zero genuine
-   wrong answers** (the 4 flagged divergences are cascades from a preceding
-   unsupported statement, not answer bugs; 954,717 of the queries are checked
-   against sqlite's own md5 result hash). Put the other way: of everything
-   mpedb *accepts*, essentially 100% matches sqlite. Since that sweep the
-   compound-subquery refusal (520 records, the largest single item) closed —
-   measured to 100.0% on the 16 files holding all of them — leaving the
-   deliberate refusals at the timing-less legacy `CREATE TRIGGER` form and
-   `DROP INDEX` (25 records); the rest of the shortfall is artifacts of the
-   runner's synthetic-`rowid_` shim. The full ranked blocker table and the
-   hand-verified root causes are in
+   differentially against the bundled sqlite. Measured 2026-07-20 at commit
+   `b41b713` over the **full 7.4M-record corpus (621 of 622 files; 5,938,278
+   records attempted after the mysql/mssql-only ones are skipped): 5,936,882
+   pass = 99.9765%, with zero error mismatches and zero genuine wrong answers**
+   (the 4 flagged divergences are cascades from a preceding unsupported
+   statement, not answer bugs; 955,237 of the queries are checked against
+   sqlite's own md5 result hash). Put the other way: of everything mpedb
+   *accepts*, essentially 100% matches sqlite. Of the 1,392 records that do not
+   pass, **1,365 are artifacts of the runner's synthetic-`rowid_` shim and 27
+   are engine gaps** — the timing-less legacy `CREATE TRIGGER` form (23),
+   `DROP INDEX`/`REINDEX <name>` (2), and two deliberate `min()`/`max()` cast
+   cases. Discounting the artifacts, the engine's ceiling on this corpus is
+   99.99955%. The full ranked blocker table and the hand-verified root causes
+   are in
    [design/CORPUS-STATUS.md](design/CORPUS-STATUS.md). (`select5.test`'s
    17-way-join runaway, formerly an OOM abort, is now a clean
    `max_join_cells` budget refusal — every file is measurable.)
@@ -454,7 +455,7 @@ enough to fill the host disk — until the benchmark adapter supplied manual
 | mpedb → sqlite | ✅ `mpedb mirror export` | round-trips are verified (`mirror roundtrip`) |
 | live two-way sync with sqlite | ✅ `mirror sync` / daemon | SIGKILL-fuzzed to convergence (`mirror-collide`: writers + a daemon killed at every instant must still converge exactly) |
 | PostgreSQL ⇄ mpedb | ✅ `mirror` with a PG source/target | same machinery, `--source-config` DSN handling |
-| open an existing `.db` file | 🚧 | two ways today. **Sidecar (read-write)**: `mpedb data.db` works like `sqlite3 data.db` (repl or one-shot) — imports on first open, pulls incrementally on later ones, `mpedb checkpoint data.db` pushes writes back with mirror's conflict rules. **Native (read-only, zero import)**: `mpedb dump data.db` and `mpedb::SqliteAttach` read the sqlite file format directly — no sqlite library in the path, both b-tree layouts, differentially verified row-for-row against the real library; PK probes are b-tree seeks, writes are refused by name. The in-place delta overlay with lock modes is the designed next stage ([design/DESIGN-SQLITE-BACKED.md](design/DESIGN-SQLITE-BACKED.md), 20-finding review folded) |
+| open an existing `.db` file | ✅ | three ways, and the first is the default. **Delta overlay (read-write, zero import)**: `mpedb data.db` works like `sqlite3 data.db` (repl or one-shot) with only the CHANGES landing in `data.db.overlay.mpedb`; `mpedb checkpoint data.db` folds them into the base. Three lock modes against the base (`--mode locked\|optimistic\|offline`), a crash-recoverable checkpoint marker inside the base, read-merge over upserts + tombstones, and `--reconcile ours\|theirs` when the base moved under unpushed deltas ([design/DESIGN-SQLITE-BACKED.md](design/DESIGN-SQLITE-BACKED.md) §10, 20-finding review folded; WAL-mode bases are refused by header inspection). **Sidecar (`--mirror`)**: the older full-copy import with mirror's conflict rules — kept for migration and round-trip validation. **Native (`--direct`, read-only)**: `mpedb dump data.db` and `mpedb::SqliteAttach` read the sqlite file format directly — no sqlite library in the path, both b-tree layouts, differentially verified row-for-row against the real library; PK probes are b-tree seeks, writes are refused by name |
 
 ## Measured speed against sqlite
 

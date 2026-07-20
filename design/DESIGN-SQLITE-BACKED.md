@@ -2,10 +2,12 @@
 
 Status: **v0.2 — the 20-finding adversarial review of v0.1 is folded in**
 ([R#n] marks a finding's fix; the review grounded its CONFIRMED findings in
-sqlite.org/lockingv3, fileformat2, walformat, howtocorrupt, pragma). Still a
-design, not code — but the load-bearing mechanisms below are the reviewed
-ones, and building anything contradicting them re-opens a named finding.
-Task #69.
+sqlite.org/lockingv3, fileformat2, walformat, howtocorrupt, pragma).
+**v0 + v1 + v2 have SHIPPED (2026-07-17, #69) — see §10 for what is code and
+where it diverges from this text; only v3 remains.** The prose below is still
+written in the design's future tense; the load-bearing mechanisms are the
+reviewed ones, and building anything contradicting them re-opens a named
+finding. Task #69.
 
 The idea (Morten, 2026-07-17): work directly against a sqlite `.db` as the
 durable, canonical home — every sqlite tool can open it — while mpedb provides
@@ -306,3 +308,32 @@ kind (mirror's park store) rather than guessing a conversion.
 - **Q4**: the OPTIMISTIC bracket's real cost after the review's fixes
   (SETLK pair + journal check + 100-byte pread) — measure; if the µs claim
   doesn't survive, say the honest number in §2.
+
+## 10. v0–v2 shipped (2026-07-17, #69) — and the doc-vs-code drift
+
+**What shipped**: `crates/mpedb/src/sqlite_overlay.rs` (~1,290 lines) —
+`SqliteOverlay::open`/`open_with_mode`/`open_with`, all three §2 lock modes
+(`LockMode::{Locked, Optimistic, Offline}`), the §3 stamp, the §5 checkpoint
+including `recover_after_crashed_checkpoint` against the base-side marker
+table, the §6 read-merge over upserts + tombstones, and `reconcile` with
+per-PK `ConflictPolicy::{Ours, Theirs}`. Tests:
+`crates/mpedb/tests/sqlite_overlay.rs` (21) plus
+`crates/mpedb/tests/sqlite_checkpoint.rs`. v1's native page reader is
+`crates/mpedb-sqlitefmt` (no sqlite library in the read path); v0's full
+sidecar mirror is still there behind `--mirror`.
+
+**The drift, deliberate, follow the code:**
+
+- **The overlay is the DEFAULT, not an option.** `mpedb <file.db>` opens the
+  v2 delta overlay with zero import (`crates/mpedb-cli/src/openpath.rs`);
+  `--mirror`/`--sidecar` opts *back* into v0's full copy, `--direct` is the
+  read-only native reader. The module doc in `openpath.rs` still describes v0
+  as the flow — believe `main.rs`'s usage text and the argument parsing.
+- **The overlay file is `<file>.overlay.mpedb`**, not §1's `app.db.mpedb`
+  (that name belongs to the v0 sidecar, and both can exist beside one base).
+- **Checkpoint sits behind the `sqlite-checkpoint` feature**, since pushing
+  deltas back is the one path that links the sqlite library — which is also
+  why `mpedb-capi` cannot be a default workspace member (DESIGN.md §8).
+- Everything §8 lists as **v3 is still unbuilt**: sqlite index probes,
+  hot-row promotion, WAL-mode bases. WAL bases are refused by fact
+  (header bytes 18/19) exactly as §0 specifies, not by assumption.

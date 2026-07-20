@@ -5,9 +5,12 @@ deterministically, and a prepare-time **risk estimate** that flags a query as
 dangerous *before* it runs. It is the deterministic loop-counter that #75
 (recursive CTEs) will run under.
 
-No compiled-plan bytes change and `PLAN_FORMAT` stays **23**: layer 1 is a pure
-runtime/analysis pass that reads the already-decoded plan plus the catalog's
-exact row counts; nothing is persisted into plan bytes.
+No compiled-plan bytes change: layer 1 is a pure runtime/analysis pass that reads
+the already-decoded plan plus the catalog's exact row counts; nothing is persisted
+into plan bytes. `PLAN_FORMAT` was **23** when this was written and #74 did not
+move it — but it is **56** today, bumped many times since by work that *does*
+change plan bytes. Read the constant in `crates/mpedb-sql/src/plan/mod.rs`; the
+claim here is "this feature costs no bump", not a version pin.
 
 ## Why a count, never a clock
 

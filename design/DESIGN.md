@@ -149,6 +149,21 @@ fails its checksum and the other slot is used — the shadow-paging guarantee: *
 state is never modified in place, so a writer dying at any instruction leaves the
 previous commit fully intact.**
 
+⚠ **The durable-gate retry loop is load-bearing** (`shm.rs::newest_meta`). In
+`durability = commit`/`wal` a reader accepts only metas with `txn_id ≤ durable_txn`
+(§4.2, §5.4), and the commit path publishes the meta slot *before* it advances that gate:
+`write_meta_slot` → `msync_page` (milliseconds on real disk) → `durable_txn.fetch_max`.
+A reader that loads the gate, then lands in that window for two consecutive commits, can
+find **both** slots newer than the gate it holds and conclude
+`Corrupt("no valid meta page")` — a spurious hard error on a perfectly healthy file.
+So `newest_meta` re-loads the gate and retries, and gives up only when a *reloaded* gate
+yields the same failure (a gate that did not move admits nothing new, so the failure is
+genuine corruption). The loop is cheap to prove: replace it with a single
+`newest_meta_gated(durable_txn.load(Acquire))` and `cargo run -p mpedb-bench -- --only
+mpedb` reports spurious retries within seconds — measured 2026-07-15, 3 with it disabled
+against 0 as shipped on the same flags. `mpedb-bench`'s `SPURIOUS_CORRUPT_RETRIES`
+counter is the tripwire for that regression.
+
 ### 4.2 Lock area
 
 - `init_state: AtomicU32` — `0` empty, `1` formatting, `2` READY (§3).
@@ -227,7 +242,17 @@ struct ReaderSlot {
   their snapshot and cannot be swept; in a fixed-size file this eventually stalls
   writers with `DbFull` naming the culprit slot/pid. A configurable max-pin-age eviction
   (writer bumps the slot `seq`; the reader detects the theft via its generation on
-  release/next cursor validation and gets `SnapshotEvicted`) is the safety valve.
+  release/next cursor validation and gets `SnapshotEvicted`) is the intended safety valve
+  — **half built.** The *detection* half is shipped and load-bearing: `still_pinned()`,
+  revalidation every 256 cursor steps and again at finish, and the `SnapshotEvicted`
+  error, so a stolen slot can never yield silently-wrong rows. **Nothing evicts.** There
+  is no age policy and no writer that bumps a live slot's `seq`; the only thing that
+  frees an occupied slot is the liveness sweep, which requires the process to be *dead*.
+  So a live-but-stalled reader still ends in `DbFull` today (`engine/read.rs` marks the
+  eviction "(future)"). Everything downstream that reaches for the valve —
+  design/DESIGN-BLOBEXTENT.md §5's copy-out argument among them — must read it as
+  designed, not available. (That argument stands on its own: it refuses to hand
+  out raw borrows *so that* eviction can be added later without becoming UB.)
 
 ### 4.4 Pages, B+tree, rows
 
@@ -253,9 +278,15 @@ struct ReaderSlot {
 
 ### 4.5 Freelist & page reclamation
 
-- Freelist B+tree keyed by (txn_id that freed the pages, chunk#) → page-id list, written
-  strictly ascending. A page freed at `t` is reusable when `t <= oldest_pinned` bound
-  (§4.3). **Not `t <`**: pages freed BY commit `t` are referenced only by snapshots
+- Freelist B+tree keyed by an 11-byte `(txn_id that freed the pages: u64 BE ‖ kind: u8 ‖
+  chunk#: u16 BE)`. **`kind` 0 = a page-id list** (u64 LE ids, written strictly ascending
+  — `refill_reusable` validates the ordering rather than assuming it, and the commit
+  fixpoint binary-searches it); **`kind` 1 = extent runs** for the out-of-tree blob
+  allocator (`(start, npages)` runs, design/DESIGN-BLOBEXTENT.md §3.3/§6). Sorting the
+  kind *inside* the txn prefix keeps both classes of an epoch adjacent, so the single
+  refill cursor walks them in one ascending pass. A page freed at `t` is reusable when
+  `t <= oldest_pinned` bound (§4.3). **Not `t <`**: pages freed BY commit `t` are
+  referenced only by snapshots
   *older* than `t` — commit `t` is what replaced them — so a pin exactly at `t` cannot
   see them. This document said `<` until 2026-07-15; the code has always said `<=`, and
   the off-by-one leaks the high-water mark without bound. There is a regression test.
@@ -328,9 +359,14 @@ reader validates its slot generation; a mismatch means eviction → `SnapshotEvi
 ⚠ **Throughput expectations by mode** (2-core host, point writes):
 `none`/`async` → µs-scale commits, lock-bound (LMDB-like, 10⁵+/s with batching);
 `commit` → sync-bound, ≈ 1/msync-latency ≈ hundreds/s, fully serialized. The Phase 2
-group commit exists precisely to amortize the msync across a batch. Writers should
-prefault their footprint pages *before* taking the lock (plans make the footprint known,
-§7.3) so page faults never happen inside it.
+group commit exists precisely to amortize the msync across a batch.
+
+⚠ **Footprint prefaulting is staged, not built.** The idea — plans make the footprint
+known (§7.3), so a writer could touch those pages *before* taking the lock and never
+fault inside it — is sound and unimplemented; the only page-residency call in the engine
+is the opportunistic `madvise(MADV_HUGEPAGE)` of §9. Staged in
+design/DESIGN-MPEE-OPT.md §1.2a (and its §5 verdict), recorded as partly-built in
+INNOVATIONS.md §9.6.
 
 ### 5.3 Phase 2 (BUILT): the intent ring — deterministic batch scheduling
      ("the request queue is an index")
@@ -745,9 +781,20 @@ index numbering + `KeyAccess` (Point with param/const slots | Range | Full) +
   email = $1`, index-key deletes derived from current row values, multi-row inserts —
   all degrade to table/tree-level footprints (`Full`), and the Phase 2 scheduler treats
   those as conflicting with everything on that tree. Never overclaim precision.
-- Footprints feed: read-only routing (Phase 1), prefaulting before the writer lock
-  (§5.2), batch grouping and deterministic ordering (Phase 2) — the queue of prepared
-  requests functions as an index over imminent access.
+- **What footprints actually feed today**, separated from what they were designed to:
+  - **read-only routing** (Phase 1) — built, above.
+  - **deterministic batch ordering** (Phase 2) — built, but as the *key-locality* sort
+    of §5.3, not as conflict grouping. `Footprint::conflicts_with` exists and is unit-
+    tested, yet has **no production caller**: the leader sorts the drained batch by
+    (written table, materialized key bytes, slot idx) and executes all of it in one
+    transaction, so there is no group for a conflict relation to form. The locality
+    rationale itself was then measured and largely falsified (#111: on Linux `commit`
+    the data barrier is one span regardless of run count); the sort is retained for
+    deterministic linearization. `crates/mpedb/examples/footprint_index.rs` is the
+    scale study of the conflict relation — an example, not a code path.
+  - **prefaulting before the writer lock** (§5.2) — designed, not built.
+
+  INNOVATIONS.md §9.6 states both gaps; this section is subordinate to it.
 
 ### 7.4 Expression IR
 
@@ -757,21 +804,46 @@ a tight loop, no AST walking, checked arithmetic, full SQL 3VL.
 
 ## 8. Crate layout
 
+The five crates this document was written around (all ✅ since Phase 1):
+
 ```
 mpedb/                    workspace
 ├── crates/
 │   ├── mpedb-types/      values, schema+hash, config, keycode, expr IR, footprints  ✅
-│   ├── mpedb-core/       pagestore, COW B+tree, row codec                           ✅
-│   │                     shm engine: mapping, meta, locks, reader table, freelist,
-│   │                     txns, catalog, typed API                                   ⏳
-│   ├── mpedb-sql/        tokenizer→AST→binder→planner→plan ser/de+hash              ⏳
-│   ├── mpedb/            facade: Database, prepare/execute, plan registry           ⏳
-│   └── mpedb-cli/        REPL, bench, stress/crash child modes, dump                ⏳
+│   ├── mpedb-core/       pagestore, COW B+tree, row codec; shm engine: mapping,
+│   │                     meta, locks, reader table, ring, freelist, txns, catalog  ✅
+│   ├── mpedb-sql/        tokenizer→AST→binder→planner→plan ser/de+hash              ✅
+│   ├── mpedb/            facade: Database, prepare/execute, plan registry, exec,
+│   │                     ring_exec, sqlite overlay, tier                            ✅
+│   └── mpedb-cli/        REPL, bench, stress/crash/powerloss, dump, mirror, tier    ✅
 └── DESIGN.md
 ```
 
-Dependencies: `libc`, `blake3`, `xxhash-rust`, `serde`+`toml` (config only). No unsafe
-outside `mpedb-core`'s shm layer.
+The workspace has since grown to **13** members. The eight added since (only the
+last is covered elsewhere here, in §9):
+
+```
+│   ├── mpedb-sdk/        client-side plan cache: detached plans held per Session
+│   │                     instead of in the shared registry (§7.2)
+│   ├── mpedb-proc/       stored procedures — a Python/Rust subset compiled to a
+│   │                     sandboxed content-hashed IR, stored in the database
+│   ├── mpedb-mirror/     bidirectional CDC sync with sqlite/PostgreSQL (DESIGN-MIRROR)
+│   ├── mpedb-capi/       libsqlite3-compatible C shim (DESIGN-CAPI)
+│   ├── mpedb-sqlitefmt/  the sqlite file format read natively, no sqlite library
+│   │                     in the graph (DESIGN-SQLITE-BACKED §4)
+│   ├── mpedb-testkit/    sqllogictest runner, corpus, differential tester
+│   ├── mpedb-bench/      the head-to-head harness vs sqlite/PG (BENCHMARKS.md)
+│   └── mpedb-py/         PyO3 bindings (§9)
+```
+
+⚠ `mpedb-capi` is a workspace member but **not** a default member: it exports the
+`sqlite3_*` symbols and so cannot co-link the bundled sqlite that feature unification
+pulls in for `mpedb-cli`/`mpedb-bench`. Build and test it standalone with `-p
+mpedb-capi`; use `--workspace --exclude mpedb-capi` for whole-workspace commands.
+That is why `default-members` lists 12, not 13.
+
+Dependencies of the five core crates: `libc`, `blake3`, `xxhash-rust`, `serde`+`toml`
+(config only). No unsafe outside `mpedb-core`'s shm layer.
 
 ## 9. Python bindings (Phase 3 sketch)
 
@@ -790,10 +862,22 @@ huge pages (`huge=within_size`) or `MADV_COLLAPSE`; the engine calls
 1. Unit tests per module; model-based B+tree tests vs `BTreeMap` (done).
 2. Multi-process stress (`mpedb-cli stress`): invariants — bank-sum conservation across
    snapshots, UNIQUE under contention, snapshot stability.
-3. Crash injection: children SIGKILL themselves at env-selected kill-points in the
-   commit path; parent verifies integrity + invariants in a loop. Reader kills exercise
-   slot reclamation (incl. seq/pid_start paths); writer kills exercise EOWNERDEAD +
-   durable_txn recovery.
+3. Crash injection (`mpedb-cli crash`): each child arms a thread that sleeps a
+   **random 5–60 ms and then SIGKILLs itself** — armed *before* attach, so the kill
+   walks across the attach, prepare, registry-publication and commit windows as the
+   waves accumulate, rather than only the enumerated commit-path points this document
+   originally specified. Strictly stronger: it covers the attach/init window too, and
+   it cannot miss a kill point nobody thought to name. The parent verifies integrity +
+   invariants after every wave. Reader kills exercise slot reclamation (incl.
+   seq/pid_start paths); writer kills exercise EOWNERDEAD + durable_txn recovery.
+
+   ⚠ **A randomized window can hide the thing it tests.** On a fast machine one 5–60 ms
+   window churns enough COW pages to exhaust a small file, and the child then dies of
+   `DbFull` *before* its kill lands — the run looks green while testing nothing, because
+   an out-of-space abort masks the recovery path. The harness now counts those aborts
+   separately and fails loudly with the fix in the message (`crash --size_mb`, raised
+   further for `--blob-kb` runs). Worth stating as method, not just as a flag: a crash
+   harness must be able to prove that its crashes happened.
 4. **Page accounting invariant** after every commit (§4.5).
 5. Init-crash matrix: kill at every step of §3 (post-create, mid-fallocate, mid-format,
    pre-READY) → next attacher must recover; zero-size and short files must be adopted.

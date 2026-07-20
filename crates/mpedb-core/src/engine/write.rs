@@ -1631,14 +1631,20 @@ impl<'e> WriteTxn<'e> {
     /// freelist entry, so they are returned to `reusable` and the commit
     /// fixpoint records them as freed — page accounting stays exact.
     ///
-    /// `reusable` and `freelist_root` MUST be restored together: if
-    /// `refill_reusable` ran after the savepoint it pulled committed-freelist
-    /// pages into `reusable` AND deleted their freelist entry (advancing
-    /// `freelist_root`). Restoring `freelist_root` un-deletes that entry, so
-    /// those pages are back in the freelist; keeping them in `reusable` too
-    /// would list them twice at commit. Restoring `reusable` to the savepoint
-    /// snapshot drops exactly the refill-pulled pages while re-offering the
-    /// pages that were reusable before the savepoint.
+    /// `reusable`, `taken` and `refill_cursor` MUST be restored together —
+    /// they are the whole of what a post-savepoint `refill_reusable` changed.
+    /// Refill is READ-ONLY (design/DESIGN.md §4.5): it draws an entry's pages
+    /// into `reusable`, records the provenance in `taken`, advances
+    /// `refill_cursor` past the key — and LEAVES the entry in the tree. So
+    /// there is no tree edit to undo here; what must be undone is the private
+    /// bookkeeping. The entry still lists the drawn pages, so keeping them in
+    /// `reusable` would offer at commit pages the fixpoint also finds listed,
+    /// and a stale `taken` would have it strike out a consumption that the
+    /// rollback erased. Restoring the three to the snapshot drops exactly what
+    /// the refill added while re-offering the pages that were reusable before
+    /// the savepoint. (`freelist_root` is restored too, but defensively: only
+    /// the commit fixpoint moves it, and `rollback_to` refuses to run inside
+    /// one.)
     pub fn rollback_to(&mut self, sp: TxnSavepoint) {
         debug_assert!(!self.in_freelist_op);
         self.catalog_root = sp.catalog_root;
