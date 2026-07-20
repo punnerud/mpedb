@@ -188,9 +188,36 @@ pub struct HostFn {
     pub aggregate: bool,
     pub x_destroy: *mut c_void,
     pub p_app: *mut c_void,
+    /// The callbacks themselves, kept alongside the teardown state so a
+    /// registration can be RE-INSTALLED into a different `Database` — which is
+    /// what `sqlite3_backup_*` does to the destination connection when it
+    /// replaces its file (the closures live in the facade registry, so a
+    /// reopened database starts with none). `x_func` for a scalar,
+    /// `x_step`/`x_final` for an aggregate; the unused ones are NULL.
+    pub x_func: *mut c_void,
+    pub x_step: *mut c_void,
+    pub x_final: *mut c_void,
 }
 
 impl HostFn {
+    /// Install this registration into `db` (see the `x_func` field): used to
+    /// carry a connection's UDFs across a database the shim had to reopen.
+    ///
+    /// # Safety
+    /// The stored callback pointers must still be the caller's live functions —
+    /// true for as long as the connection is open, which is the only window in
+    /// which this is called.
+    pub unsafe fn reinstall(&self, db: &mpedb::Database) {
+        if self.aggregate {
+            let step: XStep = std::mem::transmute(self.x_step);
+            let fin: XFinal = std::mem::transmute(self.x_final);
+            db.register_host_aggregate(&self.name, self.n_arg, make_agg_factory(step, fin, self.p_app));
+        } else if !self.x_func.is_null() {
+            let f: XFunc = std::mem::transmute(self.x_func);
+            db.register_host_function(&self.name, self.n_arg, make_scalar_closure(f, self.p_app));
+        }
+    }
+
     /// Invoke the caller-supplied `xDestroy(pApp)` if present.
     pub unsafe fn destroy(&self) {
         if !self.x_destroy.is_null() {
@@ -395,9 +422,22 @@ pub struct HostColl {
     pub name: String,
     pub x_destroy: *mut c_void,
     pub p_app: *mut c_void,
+    /// The comparator, kept for the same reason [`HostFn::x_func`] is.
+    pub x_compare: *mut c_void,
 }
 
 impl HostColl {
+    /// Install this collation into `db`.
+    ///
+    /// # Safety
+    /// As [`HostFn::reinstall`].
+    pub unsafe fn reinstall(&self, db: &mpedb::Database) {
+        if !self.x_compare.is_null() {
+            let cmp: XCompare = std::mem::transmute(self.x_compare);
+            db.register_host_collation(&self.name, make_collation_closure(cmp, self.p_app));
+        }
+    }
+
     pub unsafe fn destroy(&self) {
         if !self.x_destroy.is_null() {
             let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(self.x_destroy);

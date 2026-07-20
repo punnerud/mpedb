@@ -2426,9 +2426,12 @@ fn refusal_stubs_set_handle_error() {
         let dst = open_memory();
         let src = open_memory();
         let main = cs("main");
-        assert!(sqlite3_backup_init(dst, main.as_ptr(), src, main.as_ptr()).is_null());
+        // The backup API is REAL now; what still refuses is a schema name mpedb
+        // has no equivalent for, and the refusal must land on the DESTINATION.
+        let temp = cs("temp");
+        assert!(sqlite3_backup_init(dst, main.as_ptr(), src, temp.as_ptr()).is_null());
         let msg = CStr::from_ptr(sqlite3_errmsg(dst)).to_string_lossy().into_owned();
-        assert!(msg.contains("backup"), "backup errmsg {msg:?}");
+        assert_eq!(msg, "unknown database temp", "backup errmsg {msg:?}");
 
         // Incremental blob I/O is REAL now (see the blob_* tests below); what
         // this asserts is only that a FAILING open still leaves its reason on
@@ -3260,4 +3263,160 @@ unsafe fn collect_col_text(db: *mut Sqlite3, sql: &str, n: i32) -> Vec<String> {
     }
     sqlite3_finalize(st);
     out
+}
+
+/// The online backup API, end to end: a consistent copy of the source lands in
+/// the destination, the destination's own contents are GONE (a backup replaces,
+/// it does not merge), and progress is reported in real pages.
+#[test]
+fn backup_copies_the_source_over_the_destination() {
+    unsafe {
+        let src = open_memory();
+        let dst = open_memory();
+        assert_eq!(exec(src, "CREATE TABLE foo (key INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec(src, "INSERT INTO foo (key) VALUES (3), (4)"), SQLITE_OK);
+        // The destination starts with a DIFFERENT schema, which must not survive.
+        assert_eq!(exec(dst, "CREATE TABLE gone (x INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec(dst, "INSERT INTO gone (x) VALUES (1)"), SQLITE_OK);
+
+        let main = cs("main");
+        let b = sqlite3_backup_init(dst, main.as_ptr(), src, main.as_ptr());
+        assert!(!b.is_null(), "backup_init: {}", errmsg(dst));
+        let total = sqlite3_backup_pagecount(b);
+        assert!(total > 0, "pagecount {total}");
+        assert_eq!(sqlite3_backup_remaining(b), total);
+        // Paced: one page at a time until DONE, and `remaining` walks down.
+        let mut steps = 0;
+        loop {
+            let rc = sqlite3_backup_step(b, 1);
+            steps += 1;
+            if rc == SQLITE_DONE {
+                break;
+            }
+            assert_eq!(rc, SQLITE_OK, "step {steps}: {}", errmsg(dst));
+            assert_eq!(sqlite3_backup_remaining(b), total - steps);
+        }
+        assert_eq!(steps, total, "one page per step");
+        assert_eq!(sqlite3_backup_remaining(b), 0);
+        assert_eq!(sqlite3_backup_finish(b), SQLITE_OK);
+
+        assert_eq!(collect_text_col(dst, "SELECT key FROM foo ORDER BY key"), ["3", "4"]);
+        // The destination's old table is gone, and the copy is WRITABLE (the
+        // image's volatile control state was voided, so the writer mutex and
+        // reader table were re-initialized on attach).
+        assert_eq!(exec(dst, "SELECT x FROM gone"), SQLITE_ERROR);
+        assert_eq!(exec(dst, "INSERT INTO foo (key) VALUES (5)"), SQLITE_OK);
+        assert_eq!(collect_text_col(dst, "SELECT key FROM foo ORDER BY key"), ["3", "4", "5"]);
+        // ...and the SOURCE is untouched by the write to its copy.
+        assert_eq!(collect_text_col(src, "SELECT key FROM foo ORDER BY key"), ["3", "4"]);
+
+        sqlite3_close(dst);
+        sqlite3_close(src);
+    }
+}
+
+/// A backup abandoned before `SQLITE_DONE` leaves the destination exactly as it
+/// was — the image is captured into a temporary file and only installed by the
+/// step that completes it.
+#[test]
+fn an_abandoned_backup_leaves_the_destination_alone() {
+    unsafe {
+        let src = open_memory();
+        let dst = open_memory();
+        assert_eq!(exec(src, "CREATE TABLE foo (key INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec(dst, "CREATE TABLE keep (x INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec(dst, "INSERT INTO keep (x) VALUES (1)"), SQLITE_OK);
+
+        let main = cs("main");
+        let b = sqlite3_backup_init(dst, main.as_ptr(), src, main.as_ptr());
+        assert!(!b.is_null());
+        assert_eq!(sqlite3_backup_step(b, 1), SQLITE_OK);
+        // A connection may not be closed with a backup outstanding.
+        assert_eq!(sqlite3_close(dst), SQLITE_BUSY);
+        assert_eq!(sqlite3_backup_finish(b), SQLITE_OK);
+
+        assert_eq!(collect_text_col(dst, "SELECT x FROM keep"), ["1"]);
+        sqlite3_close(dst);
+        sqlite3_close(src);
+    }
+}
+
+/// `sqlite3_backup_init` refuses — with the reason on the DESTINATION — every
+/// shape mpedb cannot honor, and a destination mid-transaction is one of them.
+#[test]
+fn backup_init_refuses_by_name() {
+    unsafe {
+        let src = open_memory();
+        let dst = open_memory();
+        let main = cs("main");
+        assert_eq!(exec(src, "CREATE TABLE t (a INTEGER PRIMARY KEY)"), SQLITE_OK);
+
+        // Same connection.
+        assert!(sqlite3_backup_init(dst, main.as_ptr(), dst, main.as_ptr()).is_null());
+        assert_eq!(errmsg(dst), "source and destination must be distinct");
+
+        // An ATTACHed / temp schema name mpedb has no equivalent for.
+        let other = cs("attached_db");
+        assert!(sqlite3_backup_init(dst, main.as_ptr(), src, other.as_ptr()).is_null());
+        assert_eq!(errmsg(dst), "unknown database attached_db");
+
+        // Destination mid-transaction: it is about to be REPLACED.
+        assert_eq!(exec(dst, "BEGIN"), SQLITE_OK);
+        assert!(sqlite3_backup_init(dst, main.as_ptr(), src, main.as_ptr()).is_null());
+        assert_eq!(errmsg(dst), "target is in transaction");
+        assert_eq!(exec(dst, "ROLLBACK"), SQLITE_OK);
+
+        // Source mid-transaction: it holds the writer lock the capture needs.
+        assert_eq!(exec(src, "BEGIN"), SQLITE_OK);
+        assert!(sqlite3_backup_init(dst, main.as_ptr(), src, main.as_ptr()).is_null());
+        assert_eq!(errmsg(dst), "source database is locked");
+        assert_eq!(exec(src, "ROLLBACK"), SQLITE_OK);
+
+        sqlite3_close(dst);
+        sqlite3_close(src);
+    }
+}
+
+/// A UDF registered on the DESTINATION survives a backup: the connection's
+/// database is reopened underneath it, and the registry is repopulated.
+#[test]
+fn a_backup_keeps_the_destinations_registered_functions() {
+    unsafe extern "C" fn plus_one(ctx: *mut c_void, _argc: c_int, argv: *mut *mut c_void) {
+        let v = *argv;
+        sqlite3_result_int64(ctx, sqlite3_value_int64(v) + 1);
+    }
+    unsafe {
+        let src = open_memory();
+        let dst = open_memory();
+        assert_eq!(exec(src, "CREATE TABLE foo (key INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec(src, "INSERT INTO foo (key) VALUES (1)"), SQLITE_OK);
+        let fname = cs("answer");
+        assert_eq!(
+            sqlite3_create_function(
+                dst,
+                fname.as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                plus_one as *mut c_void,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+
+        let main = cs("main");
+        let b = sqlite3_backup_init(dst, main.as_ptr(), src, main.as_ptr());
+        assert!(!b.is_null());
+        assert_eq!(sqlite3_backup_step(b, -1), SQLITE_DONE);
+        assert_eq!(sqlite3_backup_finish(b), SQLITE_OK);
+        // The copied source's row, through the DESTINATION's own UDF.
+        assert_eq!(scalar_count(dst, "SELECT answer(key) FROM foo"), 2);
+        // ...and zeroblob(), one of the shim's OWN builtins, is back too (a
+        // non-constant argument, so this is the registered host function and
+        // not the constant-folding rewrite in `sql::rewrite_zeroblob`).
+        assert_eq!(collect_text_col(dst, "SELECT typeof(zeroblob(key)) FROM foo"), ["blob"]);
+        sqlite3_close(dst);
+        sqlite3_close(src);
+    }
 }

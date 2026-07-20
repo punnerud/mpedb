@@ -16,6 +16,7 @@
 #![allow(clippy::missing_safety_doc)]
 
 mod auth;
+mod backup;
 mod blob;
 mod consts;
 mod introspect;
@@ -24,6 +25,7 @@ mod udf;
 mod valconv;
 
 pub use auth::{SQLITE_DENY, SQLITE_IGNORE};
+pub use backup::*;
 pub use blob::*;
 pub use consts::*;
 
@@ -121,6 +123,11 @@ pub struct Sqlite3 {
     /// extra compile happens at all.
     auth_cb: *mut c_void,
     auth_ctx: *mut c_void,
+    /// Outstanding `sqlite3_backup_*` handles whose DESTINATION is this
+    /// connection (`backup.rs`). Each is a live `Box<Sqlite3Backup>` holding a
+    /// back-pointer here; `sqlite3_close` refuses while any remain, exactly as
+    /// it does for open blob handles, so that pointer cannot dangle.
+    backups: Vec<*mut backup::Sqlite3Backup>,
 }
 
 /// sqlite 3.45's compile-time limit defaults — both the initial value and the
@@ -1047,6 +1054,7 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
         zombie: false,
         auth_cb: ptr::null_mut(),
         auth_ctx: ptr::null_mut(),
+        backups: Vec::new(),
     });
     c.clear_error();
     Ok(c)
@@ -1178,6 +1186,17 @@ pub unsafe extern "C" fn sqlite3_close_v2(db: *mut Sqlite3) -> c_int {
 unsafe fn close_common(db: *mut Sqlite3, v2: bool) -> c_int {
     if db.is_null() {
         return SQLITE_OK;
+    }
+    // An outstanding BACKUP holds a raw back-pointer to this connection and
+    // will write through it, so — unlike a blob handle — there is no zombie
+    // form that would keep it valid. sqlite reports the same BUSY here.
+    if !(*db).backups.is_empty() {
+        (*db).set_error(
+            SQLITE_BUSY,
+            SQLITE_BUSY,
+            "unable to close due to unfinalized statements or unfinished backups",
+        );
+        return SQLITE_BUSY;
     }
     if !(*db).blobs.is_empty() {
         if !v2 {
@@ -2627,6 +2646,9 @@ unsafe fn create_function_impl(
         aggregate: is_agg,
         x_destroy,
         p_app: app,
+        x_func,
+        x_step,
+        x_final,
     });
     SQLITE_OK
 }
@@ -2746,6 +2768,7 @@ pub unsafe extern "C" fn sqlite3_create_collation_v2(
         name: cname,
         x_destroy,
         p_app: arg,
+        x_compare,
     });
     if let Some(p) = previous {
         p.destroy();
@@ -2945,43 +2968,8 @@ pub unsafe extern "C" fn sqlite3_value_blob(v: *mut c_void) -> *const c_void {
     }
 }
 
-// ---- online backup (refused — use `mpedb mirror`) -------------------------
-
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_backup_init(
-    dst: *mut Sqlite3,
-    _dst_name: *const c_char,
-    _src: *mut Sqlite3,
-    _src_name: *const c_char,
-) -> *mut c_void {
-    // sqlite's contract: on failure the error code and message are left in the
-    // DESTINATION connection — CPython reads them there; without this it
-    // raised a bare SystemError ("returned NULL without setting an exception").
-    if let Some(c) = conn(dst) {
-        c.set_error(
-            SQLITE_ERROR,
-            SQLITE_ERROR,
-            "online backup is not supported by mpedb (use `mpedb mirror`)",
-        );
-    }
-    ptr::null_mut()
-}
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_backup_step(_b: *mut c_void, _n: c_int) -> c_int {
-    SQLITE_ERROR
-}
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_backup_finish(_b: *mut c_void) -> c_int {
-    SQLITE_OK
-}
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_backup_remaining(_b: *mut c_void) -> c_int {
-    0
-}
-#[no_mangle]
-pub unsafe extern "C" fn sqlite3_backup_pagecount(_b: *mut c_void) -> c_int {
-    0
-}
+// ---- online backup: REAL — see `backup.rs` (sqlite3_backup_init/step/
+// finish/remaining/pagecount) ---------------------------------------------
 
 // ---- incremental blob: REAL — see `blob.rs` (sqlite3_blob_open/read/write/
 // bytes/reopen/close + zeroblob/bind_zeroblob) ------------------------------

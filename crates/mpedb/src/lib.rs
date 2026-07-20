@@ -46,6 +46,7 @@
 mod testdb;
 
 mod access;
+pub mod backup;
 mod exec;
 mod multifile;
 mod policy_store;
