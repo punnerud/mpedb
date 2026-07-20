@@ -212,6 +212,41 @@ SCRIPT = [
     # GLOB had the same literal-only restriction; closed in the same style.
     ("SELECT 1 WHERE 'abcd' GLOB ?", ("ab*",)),
     ("SELECT 1 WHERE 'ABCD' GLOB ?", ("ab*",)),
+    # --- run 5: the date/time family (#112 B) -------------------------------
+    "SELECT date('2020-02-29 13:14:15'), time('2020-02-29 13:14:15')",
+    "SELECT datetime('2020-02-29 13:14:15'), julianday('2020-02-29 13:14:15')",
+    "SELECT date('1970-01-01'), julianday('1970-01-01'), datetime('1970-01-01')",
+    "SELECT date('2020-02-29'), time('2020-02-29'), datetime('2020-02-29')",
+    "SELECT typeof(julianday('2020-01-01')), typeof(date('2020-01-01'))",
+    "SELECT date(NULL), time(NULL), datetime(NULL), julianday(NULL)",
+    # `'now'` is a CLOCK read: its VALUE cannot be diffed, but its SHAPE, its
+    # self-consistency inside one statement and its agreement with the other
+    # members of the family can. Any of these differing is a real divergence.
+    "SELECT length(date('now')), length(time('now')), length(datetime('now'))",
+    "SELECT date('now') = date('now'), datetime('now') = datetime('now')",
+    "SELECT date('now') = substr(datetime('now'), 1, 10)",
+    "SELECT strftime('%Y-%m-%d', 'now') = date('now')",
+    "SELECT typeof(julianday('now')), julianday('now') > 2451545.0",
+    "SELECT strftime('%s', date('now')) = strftime('%s', date('now'))",
+    # --- run 5: derived-table materialization + aggregate over a group body --
+    "CREATE TABLE dt (id integer PRIMARY KEY, k text NOT NULL, v integer NOT NULL)",
+    "INSERT INTO dt VALUES (1,'a',1),(2,'a',2),(3,'b',5),(4,'c',7),(5,'b',5)",
+    "SELECT COUNT(*) FROM (SELECT k, SUM(v) AS s FROM dt GROUP BY k) u",
+    "SELECT AVG(s) FROM (SELECT k, SUM(v) AS s FROM dt GROUP BY k) u",
+    "SELECT MAX(s), MIN(s) FROM (SELECT k, SUM(v) AS s FROM dt GROUP BY k) u",
+    "SELECT u.k, u.s FROM (SELECT k, SUM(v) AS s FROM dt GROUP BY k) u ORDER BY u.k",
+    "SELECT COUNT(*) FROM (SELECT DISTINCT k FROM dt) u",
+    "SELECT SUM(c) FROM (SELECT k, COUNT(*) AS c FROM dt GROUP BY k HAVING COUNT(*) > 1) u",
+    "SELECT u.s FROM (SELECT k, SUM(v) AS s FROM dt GROUP BY k) u WHERE u.s > 2 ORDER BY u.s",
+    # A derived body whose column is RENAMED, and one that projects an
+    # expression — run 4's rank-2 family.
+    "SELECT z.n FROM (SELECT dt.id AS n FROM dt) z ORDER BY z.n",
+    "SELECT z.n FROM (SELECT dt.v * 2 AS n FROM dt WHERE dt.k = 'b') z ORDER BY z.n",
+    # --- run 5: tokenizer one-offs (`==`, comments at every position) --------
+    "SELECT 1 WHERE 1 == 1",
+    "SELECT 1 WHERE 'a' == 'a'",
+    "SELECT /* c */ 1 -- trailing\n",
+    "SELECT 1 -- comment\nWHERE 2 == 2",
 ]
 
 

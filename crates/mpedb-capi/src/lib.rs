@@ -350,6 +350,17 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
     // Idempotent: the step path already rewrote at prepare, leaving no call.
     let rewritten_zb = sql::rewrite_zeroblob(sqltext);
     let sqltext: &str = &rewritten_zb;
+    // `EXPLAIN QUERY PLAN <stmt>` → mpedb's own `EXPLAIN <stmt>`, reshaped by
+    // `eqp_outcome` below. The rewrite happens here rather than at prepare so
+    // `sqlite3_sql()` still reports the text the consumer wrote.
+    let eqp_rewritten;
+    let (sqltext, eqp) = match sql::explain_query_plan_body(sqltext) {
+        Some(body) => {
+            eqp_rewritten = format!("EXPLAIN {body}");
+            (eqp_rewritten.as_str(), true)
+        }
+        None => (sqltext, false),
+    };
     match sql::classify(sqltext) {
         // PRAGMA and sqlite_master reads are answered by the shim's schema
         // introspection (mpedb has neither); they never reach the engine.
@@ -392,7 +403,11 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             c.db.set_busy_timeout(Some(Duration::from_millis(c.busy_timeout_ms.max(0) as u64)));
             Ok(Outcome::Rows { columns, rows })
         }
-        Kind::Read if introspect::references_sqlite_master(sqltext) => {
+        // `EXPLAIN QUERY PLAN SELECT … FROM sqlite_master` is excluded: the
+        // mini-evaluator answers ROWS, not a plan, and mpedb has no such table
+        // to plan against — it refuses by name instead of answering the wrong
+        // shape.
+        Kind::Read if !eqp && introspect::references_sqlite_master(sqltext) => {
             let bundle = c.db.schema();
             let (columns, rows) = introspect::sqlite_master(&bundle, sqltext)?;
             Ok(Outcome::Rows { columns, rows })
@@ -450,9 +465,49 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             if let Some(rowid) = mpedb::take_last_insert_rowid() {
                 c.last_insert_rowid = rowid;
             }
-            Ok(to_outcome(res?))
+            let res = res?;
+            Ok(if eqp { eqp_outcome(res) } else { to_outcome(res) })
         }
     }
+}
+
+/// mpedb's plan text in sqlite's `EXPLAIN QUERY PLAN` shape: four columns
+/// `(id, parent, notused, detail)`, one row per line of the plan.
+///
+/// The `detail` strings are mpedb's own (`Select t`, `access: FullScan`, …),
+/// not sqlite's (`SCAN t`, `SEARCH t USING INDEX …`) — sqlite documents EQP
+/// output as human-facing and explicitly unstable between releases, so the
+/// honest answer here is a description of the plan mpedb will actually run.
+/// Indentation in mpedb's text nests the plan; it is preserved in `detail` and
+/// also expressed structurally, with an indented line's `parent` pointing at
+/// the nearest less-indented line above it, as sqlite's tree does.
+fn eqp_outcome(res: ExecResult) -> Outcome {
+    let ExecResult::Explain(text) = res else {
+        return to_outcome(res);
+    };
+    let columns = ["id", "parent", "notused", "detail"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    // (indent, id) of the lines still eligible to be a parent.
+    let mut stack: Vec<(usize, i64)> = Vec::new();
+    let mut rows = Vec::new();
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        let indent = line.len() - line.trim_start().len();
+        while stack.last().is_some_and(|&(i, _)| i >= indent) {
+            stack.pop();
+        }
+        let id = rows.len() as i64 + 1;
+        let parent = stack.last().map_or(0, |&(_, p)| p);
+        stack.push((indent, id));
+        rows.push(vec![
+            Value::Int(id),
+            Value::Int(parent),
+            Value::Int(0),
+            Value::Text(line.trim_end().to_string()),
+        ]);
+    }
+    Outcome::Rows { columns, rows }
 }
 
 fn to_outcome(res: ExecResult) -> Outcome {
@@ -1296,7 +1351,11 @@ unsafe fn prepare_common(
             | sql::Kind::Ddl
             | sql::Kind::Pragma
             | sql::Kind::Maintenance
-    ) || (matches!(kind, sql::Kind::Read) && introspect::references_sqlite_master(first));
+    ) || (matches!(kind, sql::Kind::Read) && introspect::references_sqlite_master(first))
+        // `EXPLAIN QUERY PLAN <stmt>` is rewritten to mpedb's `EXPLAIN <stmt>`
+        // on the execution path (so `sqlite3_sql()` keeps the consumer's text);
+        // `prepare_detached` would reject the un-rewritten form here.
+        || sql::explain_query_plan_body(first).is_some();
 
     // #95: with a transaction open, a compilable statement may reference a
     // table this session CREATED / ALTERed but has not committed — which

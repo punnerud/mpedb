@@ -3110,3 +3110,76 @@ fn a_trigger_can_be_created_and_fires() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }
+
+/// `EXPLAIN QUERY PLAN <stmt>` — sqlite's plan statement, which mpedb spells
+/// `EXPLAIN <stmt>`. Django's `QuerySet.explain()` and every sqlite tool emit
+/// the sqlite spelling, and it used to fail to parse ("expected a statement").
+/// The shape is sqlite's: four columns `(id, parent, notused, detail)`, at
+/// least one row, `detail` non-empty. The CONTENT is mpedb's own plan text —
+/// sqlite documents EQP output as human-facing and unstable — so this asserts
+/// the shape and that the plan names the table, not sqlite's wording.
+#[test]
+fn explain_query_plan_answers_in_sqlites_shape() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT NOT NULL)"), SQLITE_OK);
+        assert_eq!(exec(db, "CREATE TABLE u (id INTEGER PRIMARY KEY, tid INTEGER NOT NULL)"), SQLITE_OK);
+
+        let s = cs("EXPLAIN QUERY PLAN SELECT * FROM t WHERE name = 'x'");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_count(st), 4);
+        for (i, want) in ["id", "parent", "notused", "detail"].iter().enumerate() {
+            let p = sqlite3_column_name(st, i as c_int);
+            assert_eq!(CStr::from_ptr(p).to_str().unwrap(), *want);
+        }
+        // Row 1 is the root: id 1, parent 0, notused 0, and it names the table.
+        assert_eq!(sqlite3_column_int64(st, 0), 1);
+        assert_eq!(sqlite3_column_int64(st, 1), 0);
+        assert_eq!(sqlite3_column_int64(st, 2), 0);
+        let root = col_text(st, 3);
+        assert!(root.contains('t'), "root detail should name the plan: {root}");
+        // Every further row is a child of a row above it, never of itself.
+        let mut n = 1i64;
+        while sqlite3_step(st) == SQLITE_ROW {
+            n += 1;
+            let id = sqlite3_column_int64(st, 0);
+            let parent = sqlite3_column_int64(st, 1);
+            assert_eq!(id, n);
+            assert!(parent < id, "parent {parent} must precede id {id}");
+            assert!(!col_text(st, 3).is_empty());
+        }
+        assert!(n > 1, "a plan should describe more than one line");
+        assert_eq!(sqlite3_finalize(st), SQLITE_OK);
+
+        // Lowercase, and a join — the words are matched case-insensitively and
+        // the nesting produces a non-zero parent somewhere.
+        let sql = "explain query plan SELECT t.id FROM t LEFT OUTER JOIN u ON t.id = u.tid";
+        let s = cs(sql);
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        let mut nested = false;
+        let mut rows = 0;
+        while sqlite3_step(st) == SQLITE_ROW {
+            rows += 1;
+            nested |= sqlite3_column_int64(st, 1) != 0;
+        }
+        assert!(rows > 0 && nested, "join plan should nest: {rows} rows");
+        assert_eq!(sqlite3_finalize(st), SQLITE_OK);
+
+        // `EXPLAIN` alone is NOT taken: sqlite answers it with a VDBE opcode
+        // listing mpedb has no equivalent of, so it keeps mpedb's own
+        // single-column plan text rather than a fabricated opcode table.
+        let s = cs("EXPLAIN SELECT * FROM t");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_count(st), 1);
+        assert_eq!(sqlite3_finalize(st), SQLITE_OK);
+
+        // A statement that does not compile still reports the compile error.
+        assert_ne!(exec(db, "EXPLAIN QUERY PLAN SELECT * FROM nosuch"), SQLITE_OK);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
