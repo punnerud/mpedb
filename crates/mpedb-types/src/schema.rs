@@ -148,17 +148,63 @@ pub struct ColumnDef {
     pub generated: Option<GeneratedCol>,
 }
 
-/// The store-time conversion a column of this shape applies — the SINGLE place
-/// the gate lives, for callers that hold a `(type, affinity)` pair before a
-/// [`ColumnDef`] exists (the DDL path converting a `DEFAULT`).
+/// Does a column of this shape CONVERT a value on the way in (sqlite's
+/// store-time affinity) rather than type-check it as it stands? The SINGLE
+/// place the gate lives — [`ColumnDef::converts_on_store`] is this function
+/// with the fields filled in, and callers holding a `(type, affinity)` pair
+/// before a [`ColumnDef`] exists (the DDL path converting a `DEFAULT`) reach it
+/// through [`store_into`].
 ///
-/// The gate is the point: sqlite's affinity is applied ONLY to an `Any` column,
-/// the one that can hold whatever the conversion produces. On a rigid column
-/// mpedb REFUSES a mismatched value instead, so converting there would quietly
-/// make `TEXT DEFAULT 5` legal and undo the rigidity — which is exactly the bug
-/// a first cut of this shipped with.
-pub fn store_into(ty: ColumnType, affinity: Affinity, v: Value) -> Value {
-    if ty == ColumnType::Any && affinity != Affinity::Blob {
+/// `declared` is the PROVENANCE bit: true when the column's type came from
+/// `CREATE TABLE` text ([`ColumnDef::decl`] is `Some`), false for a
+/// config-declared column and for the synthetic catalog tables. It is what
+/// keeps the rigid schema rigid where rigidity is the product: `type = "text"`
+/// in a TOML config still REFUSES `5`, while `name text` in a shim
+/// `CREATE TABLE` stores `'5'` exactly as sqlite does (task #113).
+///
+/// Three outcomes:
+/// * BLOB affinity converts nothing, ever — sqlite's typeless column.
+/// * [`ColumnType::Any`] applies its affinity whatever the provenance: it can
+///   hold whatever the conversion produces, and the affinity is the only thing
+///   that says what the column does.
+/// * a RIGID `Int64`/`Float64`/`Text` applies it only when DECLARED, and the
+///   type check that follows still refuses whatever the conversion could not
+///   land inside the type (`'abc'` into an `int` column). Narrower than sqlite,
+///   never a different answer. `Bool`/`Timestamp`/`Blob` never convert: they
+///   exist only on the config path, where rigidity is the contract.
+pub fn converts_on_store(ty: ColumnType, affinity: Affinity, declared: bool) -> bool {
+    if affinity == Affinity::Blob {
+        return false;
+    }
+    match ty {
+        ColumnType::Any => true,
+        ColumnType::Int64 | ColumnType::Float64 | ColumnType::Text => declared,
+        ColumnType::Bool | ColumnType::Timestamp | ColumnType::Blob => false,
+    }
+}
+
+/// Can `affinity` change a value of this STORAGE CLASS at all? The per-value
+/// half of [`TableDef::needs_store_affinity`] — deliberately class-only, so it
+/// cannot drift from [`crate::expr::store_affinity`]'s actual rules by more
+/// than a wasted copy: every class the conversion can touch answers `true`.
+fn affinity_can_change(affinity: Affinity, v: &Value) -> bool {
+    match affinity {
+        // The typeless column converts nothing.
+        Affinity::Blob => false,
+        // Renders a number as text; a text/blob/bool/timestamp is left alone.
+        Affinity::Text => matches!(v, Value::Int(_) | Value::Float(_)),
+        // `applyNumericAffinity`: parses a fully-numeric string, and demotes a
+        // real to an integer when the round trip is lossless.
+        Affinity::Integer | Affinity::Numeric => matches!(v, Value::Text(_) | Value::Float(_)),
+        // The same, then promotes the integer back to a real — so a real is
+        // already fixed and only text/integers move.
+        Affinity::Real => matches!(v, Value::Text(_) | Value::Int(_)),
+    }
+}
+
+/// [`converts_on_store`] applied: the value as this column stores it.
+pub fn store_into(ty: ColumnType, affinity: Affinity, declared: bool, v: Value) -> Value {
+    if converts_on_store(ty, affinity, declared) {
         crate::expr::store_affinity(affinity, v)
     } else {
         v
@@ -167,16 +213,17 @@ pub fn store_into(ty: ColumnType, affinity: Affinity, v: Value) -> Value {
 
 impl ColumnDef {
     /// Whether a value is CONVERTED on the way into this column (sqlite's
-    /// store-time affinity) rather than type-checked as it stands.
-    ///
-    /// True only for an `Any` column with a converting affinity. `Any` is the
-    /// only column that can HOLD whatever a conversion produces; every rigid
-    /// column refuses a mismatched value instead, which is narrower than
-    /// sqlite but never a different answer, and converting there would silently
-    /// undo the rigidity this database exists for. `Blob` affinity — the
-    /// typeless column — converts nothing by definition.
+    /// store-time affinity) rather than type-checked as it stands — see the
+    /// free function [`converts_on_store`] for the rule and why `decl` is the
+    /// provenance bit that decides it.
     pub fn converts_on_store(&self) -> bool {
-        self.ty == ColumnType::Any && self.affinity != Affinity::Blob
+        converts_on_store(self.ty, self.affinity, self.decl.is_some())
+    }
+
+    /// The value as this column stores it: its store-time affinity applied
+    /// where [`ColumnDef::converts_on_store`] says it applies.
+    pub fn store(&self, v: Value) -> Value {
+        store_into(self.ty, self.affinity, self.decl.is_some(), v)
     }
 
     /// What `sqlite3_column_decltype` reports for this column: the VERBATIM
@@ -299,6 +346,23 @@ impl TableDef {
         self.columns.iter().any(|c| c.converts_on_store())
     }
 
+    /// Could [`TableDef::apply_store_affinity`] change THIS row — i.e. is any
+    /// value in a class its column's affinity actually converts?
+    ///
+    /// [`TableDef::converts_on_store`] is a property of the schema and, since
+    /// task #113, true of nearly every table built by `CREATE TABLE` (a `text`
+    /// column carries TEXT affinity). Taking the copy on that alone would cost
+    /// every insert into every shim table the zero-copy row (#40) — including
+    /// the 16 MiB blob writes that work exists for. This is the per-ROW guard:
+    /// a conservative class check (it may answer `true` where the conversion
+    /// turns out to be the identity, never `false` where it is not), so the
+    /// common case — values already in their column's class — stays borrowed.
+    pub fn needs_store_affinity(&self, row: &[Value]) -> bool {
+        row.iter()
+            .zip(&self.columns)
+            .any(|(v, c)| c.converts_on_store() && affinity_can_change(c.affinity, v))
+    }
+
     /// Apply each column's store-time affinity to a row about to be written —
     /// sqlite's rule that a value entering a NUMERIC-affinity column becomes an
     /// integer or a real when that is lossless, and stays as it was otherwise.
@@ -315,7 +379,7 @@ impl TableDef {
         for (v, c) in row.iter_mut().zip(&self.columns) {
             if c.converts_on_store() {
                 let old = std::mem::replace(v, Value::Null);
-                *v = store_into(c.ty, c.affinity, old);
+                *v = c.store(old);
             }
         }
     }
@@ -365,7 +429,7 @@ impl TableDef {
             } else {
                 v
             };
-            row[i] = store_into(c.ty, c.affinity, v);
+            row[i] = c.store(v);
         }
         Ok(())
     }

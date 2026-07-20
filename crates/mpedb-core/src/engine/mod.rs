@@ -1302,12 +1302,27 @@ impl Engine {
         }
         for (v, c) in values.iter().zip(&table.columns) {
             if !v.fits(c.ty) {
+                // The row has already been through the column's store-time
+                // affinity, so on a converting column (task #113) this value is
+                // what sqlite's conversion LEFT — naming that is the difference
+                // between "float64 vs int64" and "7.5 is not an integer, and
+                // sqlite would have kept the real".
+                let why = if c.converts_on_store() {
+                    format!(
+                        " (sqlite's {} affinity left it a {}, which this column cannot hold)",
+                        c.affinity.name(),
+                        v.type_name()
+                    )
+                } else {
+                    String::new()
+                };
                 return Err(Error::TypeMismatch(format!(
-                    "column `{}.{}` is {}, value is {}",
+                    "column `{}.{}` is {}, value is {}{}",
                     table.name,
                     c.name,
                     c.ty,
-                    v.type_name()
+                    v.type_name(),
+                    why
                 )));
             }
             if v.is_null() && !c.nullable {

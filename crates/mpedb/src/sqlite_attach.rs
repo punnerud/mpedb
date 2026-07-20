@@ -140,7 +140,7 @@ fn default_const(text: &str, affinity: mpedb_types::Affinity) -> std::result::Re
         // `CURRENT_TIMESTAMP`, `(expr)`, `x'…'`, anything else.
         return Err(());
     };
-    Ok(mpedb_types::store_into(ColumnType::Any, affinity, v))
+    Ok(mpedb_types::store_into(ColumnType::Any, affinity, true, v))
 }
 
 /// Combine several CHECK bodies into one source. A single body stays verbatim
