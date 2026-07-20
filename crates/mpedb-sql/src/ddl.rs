@@ -588,8 +588,11 @@ mod tests {
         let got: Vec<ColumnType> = s.columns.iter().map(|c| c.ty).collect();
         assert_eq!(
             got,
-            vec![Int64, Int64, Int64, Text, Text, Float64, Float64, Bool, Bool, Blob, Blob,
-                 Timestamp, Any]
+            // `string`/`bytes`/`timestamp` are NUMERIC affinity and `blob` is
+            // BLOB affinity, so all four are the per-value column (task #113);
+            // `bool`/`any` are the two carve-outs where mpedb's own name wins.
+            vec![Int64, Int64, Int64, Text, Any, Float64, Float64, Bool, Bool, Any, Any,
+                 Any, Any]
         );
     }
 
@@ -619,7 +622,7 @@ mod tests {
                 Any,     // decimal(10, 2)  → NUMERIC affinity
                 Any,     // datetime        → NUMERIC affinity
                 Any,     // date            → NUMERIC affinity
-                Blob,    // BLOB
+                Any,     // BLOB            → BLOB affinity converts nothing
                 Int64,   // "unsigned big int" (quoted words are type words)
                 Any,     // an unknown name is legal in sqlite and means NUMERIC
                 Any,     // no declared type at all

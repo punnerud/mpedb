@@ -212,7 +212,15 @@ fn inexact_conversions_are_refused_by_name() {
     // 1.5 into an int64 slot: sqlite compares `i > 1.5` exactly. Truncating to
     // 1 (or rounding to 2) would be a WRONG answer, so it is refused instead.
     refuses("SELECT id FROM t WHERE i > ?", &[Value::Float(1.5)], "not an exact integer");
-    refuses("INSERT INTO t (id, i) VALUES (9, ?)", &[Value::Float(7.5)], "not an exact integer");
+    // The INSERT half moved from the parameter check to the STORE check when
+    // `i` became a column carrying sqlite's INTEGER affinity (#113): the value
+    // is converted first and refused on what the conversion left, which is the
+    // same refusal with a sharper reason.
+    refuses(
+        "INSERT INTO t (id, i) VALUES (9, ?)",
+        &[Value::Float(7.5)],
+        "INTEGER affinity left it a float64",
+    );
 
     // Outside the i64 range — a different reason, named differently.
     refuses("SELECT id FROM t WHERE i > ?", &[Value::Float(1e300)], "outside the int64 range");
@@ -271,14 +279,55 @@ fn integral_float_constant_assigns_like_sqlite_strict() {
         .to_string();
     assert!(e.contains("not exactly an integer in the int64 range"), "{e}");
 
-    // Losslessness has to be CHECKABLE, so only a constant converts: a column
-    // of reals stays refused rather than truncated.
+    // A NON-constant float expression is where task #113 moved the line: this
+    // `i` is DDL-declared, so it carries sqlite's INTEGER affinity and applies
+    // it per value at store time — which is where losslessness finally becomes
+    // checkable. `SET i = <real>` therefore stores the integer when the real is
+    // exactly one (Django's `SET i = POWER(i, ?)` shape) …
+    t.db.query("UPDATE t SET i = r * 2 WHERE id = 2", &[]).unwrap();
+    assert_eq!(
+        rows_of(t.db.query("SELECT i, typeof(i) FROM t WHERE id = 2", &[]).unwrap()),
+        sqlite_rows(&["UPDATE t SET i = r * 2 WHERE id = 2"], "SELECT i, typeof(i) FROM t WHERE id = 2"),
+    );
+    // … and REFUSES, per row, when it is not — sqlite would have stored the
+    // real, which a rigid int64 cannot hold. Narrower, never different.
     let e = t
         .db
         .query("UPDATE t SET i = r WHERE id = 1", &[])
-        .expect_err("a float64 column must not truncate into an int64 column")
+        .expect_err("a non-integral float64 must not truncate into an int64 column")
+        .to_string();
+    assert!(e.contains("INTEGER affinity left it a float64"), "{e}");
+    // A CONFIG-declared `type = "int64"` column has no affinity to apply and
+    // keeps the compile-time refusal (`bind_assign`'s constant-only rule).
+    let cfg = config_int_db();
+    let e = cfg
+        .0
+        .query("UPDATE c SET i = r WHERE id = 1", &[])
+        .expect_err("a config int64 column stays rigid")
         .to_string();
     assert!(e.contains("only a constant whose value is exactly an integer converts"), "{e}");
+}
+
+/// A TOML-config table with the same shape as `DDL`, for the provenance half:
+/// `type = "int64"` never converts, whatever `INTEGER` does.
+fn config_int_db() -> (Database, String) {
+    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let path = format!(
+        "{dir}/mpedb-numparams-cfg-{}-{}.mpedb",
+        std::process::id(),
+        UNIQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        "[database]\npath = \"{path}\"\nsize_mb = 8\nmax_readers = 8\n\n\
+         [[table]]\nname = \"c\"\nprimary_key = [\"id\"]\n\
+         [[table.column]]\nname = \"id\"\ntype = \"int64\"\n\
+         [[table.column]]\nname = \"i\"\ntype = \"int64\"\nnullable = true\n\
+         [[table.column]]\nname = \"r\"\ntype = \"float64\"\nnullable = true\n"
+    );
+    let db = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    db.query("INSERT INTO c (id, i, r) VALUES (1, 5, 2.5)", &[]).unwrap();
+    (db, path)
 }
 
 // ---- nothing that already worked changed ---------------------------------

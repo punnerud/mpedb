@@ -414,7 +414,7 @@ impl<'e> WriteTxn<'e> {
         values: &'v [Value],
     ) -> std::borrow::Cow<'v, [Value]> {
         match self.bundle.schema.table(table_id) {
-            Some(t) if t.converts_on_store() => {
+            Some(t) if t.converts_on_store() && t.needs_store_affinity(values) => {
                 let mut owned = values.to_vec();
                 t.apply_store_affinity(&mut owned);
                 std::borrow::Cow::Owned(owned)

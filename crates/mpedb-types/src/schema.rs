@@ -183,6 +183,25 @@ pub fn converts_on_store(ty: ColumnType, affinity: Affinity, declared: bool) -> 
     }
 }
 
+/// Can `affinity` change a value of this STORAGE CLASS at all? The per-value
+/// half of [`TableDef::needs_store_affinity`] — deliberately class-only, so it
+/// cannot drift from [`crate::expr::store_affinity`]'s actual rules by more
+/// than a wasted copy: every class the conversion can touch answers `true`.
+fn affinity_can_change(affinity: Affinity, v: &Value) -> bool {
+    match affinity {
+        // The typeless column converts nothing.
+        Affinity::Blob => false,
+        // Renders a number as text; a text/blob/bool/timestamp is left alone.
+        Affinity::Text => matches!(v, Value::Int(_) | Value::Float(_)),
+        // `applyNumericAffinity`: parses a fully-numeric string, and demotes a
+        // real to an integer when the round trip is lossless.
+        Affinity::Integer | Affinity::Numeric => matches!(v, Value::Text(_) | Value::Float(_)),
+        // The same, then promotes the integer back to a real — so a real is
+        // already fixed and only text/integers move.
+        Affinity::Real => matches!(v, Value::Text(_) | Value::Int(_)),
+    }
+}
+
 /// [`converts_on_store`] applied: the value as this column stores it.
 pub fn store_into(ty: ColumnType, affinity: Affinity, declared: bool, v: Value) -> Value {
     if converts_on_store(ty, affinity, declared) {
@@ -325,6 +344,23 @@ impl TableDef {
     /// borrowing the caller's values when there is nothing to convert.
     pub fn converts_on_store(&self) -> bool {
         self.columns.iter().any(|c| c.converts_on_store())
+    }
+
+    /// Could [`TableDef::apply_store_affinity`] change THIS row — i.e. is any
+    /// value in a class its column's affinity actually converts?
+    ///
+    /// [`TableDef::converts_on_store`] is a property of the schema and, since
+    /// task #113, true of nearly every table built by `CREATE TABLE` (a `text`
+    /// column carries TEXT affinity). Taking the copy on that alone would cost
+    /// every insert into every shim table the zero-copy row (#40) — including
+    /// the 16 MiB blob writes that work exists for. This is the per-ROW guard:
+    /// a conservative class check (it may answer `true` where the conversion
+    /// turns out to be the identity, never `false` where it is not), so the
+    /// common case — values already in their column's class — stays borrowed.
+    pub fn needs_store_affinity(&self, row: &[Value]) -> bool {
+        row.iter()
+            .zip(&self.columns)
+            .any(|(v, c)| c.converts_on_store() && affinity_can_change(c.affinity, v))
     }
 
     /// Apply each column's store-time affinity to a row about to be written —
