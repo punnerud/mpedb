@@ -207,9 +207,13 @@ pub(super) fn plan_join_select<'s>(
     // where sqlite returns 2). #116 makes it a CONSTRAINT instead: the solver
     // reports the permutation as a slot map and the args are remapped through
     // it (`Solved::remap`, design/DESIGN-MPEE-SOLVER.md §7).
-    let solved = super::mpee::reorder(
-        s, schema, n_params, catalog, mode, host_udfs, &slot_types, cte, row_count,
-    );
+    let solved = if super::mpee::disabled() {
+        Err(super::mpee::Skip::Ineligible)
+    } else {
+        super::mpee::reorder(
+            s, schema, n_params, catalog, mode, host_udfs, &slot_types, cte, row_count,
+        )
+    };
     match solved {
         Ok(sv) => {
             let subplans = sv.remap(subplans);
