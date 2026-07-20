@@ -2600,18 +2600,36 @@ fn blob_reopen_moves_the_row_and_a_failure_kills_the_handle() {
     }
 }
 
-/// Closing a connection with a live blob handle would dangle the handle's
-/// back-pointer, so it is refused with SQLITE_BUSY until the handle is closed.
+/// The two closes differ when a blob handle is still open, and the shim
+/// follows sqlite on both (probed on 3.45.1): `sqlite3_close` refuses with
+/// SQLITE_BUSY, while `sqlite3_close_v2` succeeds and leaves a ZOMBIE — the
+/// connection stays alive for the handle, which keeps working, and is freed by
+/// the last `sqlite3_blob_close`.
 #[test]
-fn close_with_an_open_blob_handle_is_busy() {
+fn close_with_an_open_blob_handle_is_busy_but_close_v2_zombies() {
     unsafe {
         let db = open_memory();
         assert_eq!(exec(db, "create table t (a INTEGER PRIMARY KEY, b BLOB)"), SQLITE_OK);
         assert_eq!(exec(db, "insert into t values (1, x'0102')"), SQLITE_OK);
+
+        // v1: refused, and the connection is untouched — the handle and the
+        // connection both still work.
         let b = blob_open_ok(db, "t", "b", 1, 0);
         assert_eq!(sqlite3_close(db), SQLITE_BUSY);
+        assert_eq!(blob_read_vec(b, 2, 0), (SQLITE_OK, vec![0x01, 0x02]));
         assert_eq!(sqlite3_blob_close(b), SQLITE_OK);
-        assert_eq!(sqlite3_close(db), SQLITE_OK);
+
+        // v2 with a live handle: OK, and the handle keeps reading afterwards.
+        let b2 = blob_open_ok(db, "t", "b", 1, 0);
+        assert_eq!(sqlite3_close_v2(db), SQLITE_OK);
+        assert_eq!(
+            blob_read_vec(b2, 2, 0),
+            (SQLITE_OK, vec![0x01, 0x02]),
+            "a zombie connection still serves its outstanding blob handle"
+        );
+        // This free is the connection's too; ASAN/valgrind would catch a leak
+        // or a double free here.
+        assert_eq!(sqlite3_blob_close(b2), SQLITE_OK);
     }
 }
 
