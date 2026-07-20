@@ -14,11 +14,25 @@
 //! row-for-row, which is the statement that matters: the dynamic form is the
 //! same matcher, not a second implementation.
 
-use mpedb::{Config, Database, ExecResult, Value};
+//! Task #108 adds the OTHER half of the operator: in real sqlite `x REGEXP y`
+//! has no built-in meaning at all — it desugars to `regexp(y, x)` (pattern
+//! first) and errors unless the consumer registered that 2-argument function.
+//! When a host `regexp/2` IS registered (CPython/Django always do), the
+//! operator dispatches to it and the host dialect wins; the native matcher
+//! above remains as a documented EXTENSION for connections that registered
+//! none. The host-dispatch tests differential against the BUNDLED library
+//! (`sqlite_oracle::script_stdout_with` registers the same Rust closure as the
+//! oracle's `regexp()`), so only the native-dialect battery still needs the
+//! shell binary.
+
+use mpedb::{Config, Database, Error, ExecResult, Value};
 use std::io::Write;
 use std::ops::Deref;
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
 
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
@@ -354,5 +368,270 @@ fn dynamic_pattern_nulls_columns_and_refusals() {
             Value::Bool(want),
             "/{pat}/ against row {id}"
         );
+    }
+}
+
+// ================== host regexp() dispatch (task #108, W3 part 2) ==================
+
+/// The consumer dialect these tests register on BOTH engines: a `(?i)` prefix
+/// means case-insensitive, and the REST of the pattern is a LITERAL substring —
+/// no metacharacters at all. Deliberately divergent from the native NFA on
+/// patterns that are valid in both dialects (`a.c` here is the three characters
+/// `a.c`; the NFA reads `a<any>c`, `^a` here is the two characters `^a`; the
+/// NFA reads an anchor) — the exact wrongness mode W3 named: whenever the
+/// dialects diverge, the answer must come from the HOST.
+fn consumer_regexp(pattern: &str, text: &str) -> bool {
+    match pattern.strip_prefix("(?i)") {
+        Some(p) => text.to_lowercase().contains(&p.to_lowercase()),
+        None => text.contains(pattern),
+    }
+}
+
+/// Register `consumer_regexp` on the mpedb connection, with sqlite's UDF NULL
+/// convention (Django's `_sqlite_regexp` returns None on a NULL argument).
+fn register_consumer_regexp(db: &Database) {
+    db.register_host_function("regexp", 2, |args: &[Value]| match (&args[0], &args[1]) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Text(p), Value::Text(s)) => Ok(Value::Bool(consumer_regexp(p, s))),
+        (p, s) => Err(Error::TypeMismatch(format!(
+            "test regexp() wants (text pattern, text subject), got ({p:?}, {s:?}) — \
+             the operator's argument order is (pattern, text)"
+        ))),
+    });
+}
+
+/// The same query against the BUNDLED library with the same closure registered
+/// as its `regexp()` — the consumer contract `x REGEXP y` desugars into.
+fn oracle_rows_with_regexp(query: &str) -> Vec<Vec<String>> {
+    let mut script = String::from("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT);\n");
+    for stmt in insert_statements() {
+        script.push_str(&stmt);
+        script.push_str(";\n");
+    }
+    script.push_str(query);
+    script.push_str(";\n");
+    let out = sqlite_oracle::script_stdout_with(&script, "", |conn| {
+        use rusqlite::functions::FunctionFlags;
+        conn.create_scalar_function(
+            "regexp",
+            2,
+            FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+            |ctx| {
+                let p = ctx.get::<Option<String>>(0)?;
+                let s = ctx.get::<Option<String>>(1)?;
+                Ok(match (p, s) {
+                    (Some(p), Some(s)) => Some(consumer_regexp(&p, &s)),
+                    _ => None,
+                })
+            },
+        )
+        .expect("register regexp() on the oracle");
+    });
+    out.lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split('|').map(str::to_string).collect())
+        .collect()
+}
+
+/// With a host `regexp/2` registered, `x REGEXP y` IS that call — argument
+/// order `(pattern, text)`, host dialect beating the native NFA, `NOT REGEXP`
+/// as sqlite's 3VL NOT over the call's truthiness — differentially against the
+/// bundled library running the identical closure.
+#[test]
+fn host_regexp_dispatch_matches_bundled_sqlite() {
+    let d = db();
+    register_consumer_regexp(&d);
+
+    let queries = [
+        // Patterns VALID IN BOTH dialects with DIVERGENT answers — the W3
+        // mode. `a.c` (host: literal dot → row 5 only; NFA would say rows
+        // 1,3,4,5,8) and `^a` (host: literal caret → nothing; NFA: anchor).
+        "SELECT id, s REGEXP 'a.c' FROM t ORDER BY id",
+        "SELECT id, s REGEXP '^a' FROM t ORDER BY id",
+        "SELECT id FROM t WHERE s REGEXP 'a.c' ORDER BY id",
+        // The host-only surface: `(?i)…` — every Django `__iregex`.
+        "SELECT id, s REGEXP '(?i)ABC' FROM t ORDER BY id",
+        "SELECT id FROM t WHERE s REGEXP '(?i)fo' ORDER BY id",
+        // Plain hit through the host engine + the empty-string row (an
+        // argument swap would flip row 11: '' ⊆ 'bc' but 'bc' ⊄ '').
+        "SELECT id, s REGEXP 'bc' FROM t ORDER BY id",
+        // The COLUMN as the pattern — asymmetric on purpose: the host must
+        // receive (s, 'abc'), i.e. "is s a substring of 'abc'".
+        "SELECT id, 'abc' REGEXP s FROM t ORDER BY id",
+        // NOT REGEXP: 3VL NOT over the call (NULL row stays NULL), in the
+        // projection and as a predicate.
+        "SELECT id, s NOT REGEXP 'a.c' FROM t ORDER BY id",
+        "SELECT id FROM t WHERE s NOT REGEXP '(?i)b' ORDER BY id",
+        // Combined with other logic in a boolean position.
+        "SELECT id FROM t WHERE s REGEXP 'o' AND id > 6 ORDER BY id",
+    ];
+    for q in queries {
+        assert_eq!(mpedb_rows(&d, q), oracle_rows_with_regexp(q), "mismatch on `{q}`");
+    }
+
+    // The bound form Django actually emits: the pattern as a parameter takes
+    // the identical host path (the oracle sees the same pattern inline —
+    // sqlite makes no distinction).
+    let bound = |pat: &str| -> Vec<Vec<String>> {
+        match d
+            .query(
+                "SELECT id FROM t WHERE s REGEXP ? ORDER BY id",
+                &[Value::Text(pat.into())],
+            )
+            .unwrap()
+        {
+            ExecResult::Rows { rows, .. } => rows
+                .into_iter()
+                .map(|r| r.into_iter().map(render).collect())
+                .collect(),
+            other => panic!("{other:?}"),
+        }
+    };
+    for pat in ["(?i)ABC", "a.c", "bc", "(?i)FO"] {
+        let q = format!("SELECT id FROM t WHERE s REGEXP '{pat}' ORDER BY id");
+        assert_eq!(bound(pat), oracle_rows_with_regexp(&q), "bound /{pat}/ diverged");
+    }
+
+    // Direct 3VL pins (not only via rendering): a NULL subject propagates
+    // through the call and through NOT.
+    let one = |sql: &str| -> Value {
+        match d.query(sql, &[]).unwrap() {
+            ExecResult::Rows { rows, .. } => {
+                rows.into_iter().next().unwrap().into_iter().next().unwrap()
+            }
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(one("SELECT s REGEXP 'a' FROM t WHERE id = 12"), Value::Null);
+    assert_eq!(one("SELECT s NOT REGEXP 'a' FROM t WHERE id = 12"), Value::Null);
+
+    // Truthiness is the UDF-in-boolean-position rule, not `= 1`: re-register
+    // regexp() (replacement drops the plan cache) to return an occurrence
+    // COUNT — sqlite passes WHERE on any non-zero — and differential again.
+    d.register_host_function("regexp", 2, |args: &[Value]| match (&args[0], &args[1]) {
+        (Value::Null, _) | (_, Value::Null) => Ok(Value::Null),
+        (Value::Text(p), Value::Text(s)) => {
+            Ok(Value::Int(s.matches(p.as_str()).count() as i64))
+        }
+        _ => Err(Error::TypeMismatch("count regexp() wants text".into())),
+    });
+    let count_oracle = |query: &str| -> Vec<Vec<String>> {
+        let mut script = String::from("CREATE TABLE t (id INTEGER PRIMARY KEY, s TEXT);\n");
+        for stmt in insert_statements() {
+            script.push_str(&stmt);
+            script.push_str(";\n");
+        }
+        script.push_str(query);
+        script.push_str(";\n");
+        let out = sqlite_oracle::script_stdout_with(&script, "", |conn| {
+            use rusqlite::functions::FunctionFlags;
+            conn.create_scalar_function(
+                "regexp",
+                2,
+                FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+                |ctx| {
+                    let p = ctx.get::<Option<String>>(0)?;
+                    let s = ctx.get::<Option<String>>(1)?;
+                    Ok(match (p, s) {
+                        (Some(p), Some(s)) => Some(s.matches(p.as_str()).count() as i64),
+                        _ => None,
+                    })
+                },
+            )
+            .expect("register counting regexp() on the oracle");
+        });
+        out.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.split('|').map(str::to_string).collect())
+            .collect()
+    };
+    for q in [
+        // "hello world"/"foobar"/"foo bar" hold 2 o's: a `= 1` bridge would
+        // drop them, truthiness keeps them.
+        "SELECT id, s REGEXP 'o' FROM t ORDER BY id",
+        "SELECT id FROM t WHERE s REGEXP 'o' ORDER BY id",
+        "SELECT id FROM t WHERE s NOT REGEXP 'o' ORDER BY id",
+    ] {
+        assert_eq!(mpedb_rows(&d, q), count_oracle(q), "count-truthiness mismatch on `{q}`");
+    }
+}
+
+/// Precedence is LIVE, not a compile-time fork of the connection: without a
+/// registration the native NFA answers (mpedb's documented extension — plain
+/// sqlite would error `no such function: regexp`), registering flips the SAME
+/// query to the host meaning, unregistering flips it back. Each flip crosses
+/// the plan cache, so this also pins that registration changes invalidate
+/// cached REGEXP plans.
+#[test]
+fn host_registration_flips_the_operator_and_back() {
+    let d = db();
+    let q = "SELECT id FROM t WHERE s REGEXP 'a.c' ORDER BY id";
+    // Native NFA: `.` is any char, so rows 1,3,4,5,8.
+    let native: Vec<Vec<String>> = ["1", "3", "4", "5", "8"]
+        .iter()
+        .map(|id| vec![id.to_string()])
+        .collect();
+    // Host literal-substring dialect: only the actual "a.c" row.
+    let host: Vec<Vec<String>> = vec![vec!["5".to_string()]];
+
+    assert_eq!(mpedb_rows(&d, q), native, "pre-registration must be the native dialect");
+    register_consumer_regexp(&d);
+    assert_eq!(mpedb_rows(&d, q), host, "a registered regexp/2 must own the operator");
+    assert!(d.unregister_host_function("regexp", 2));
+    assert_eq!(mpedb_rows(&d, q), native, "unregistering must restore the native dialect");
+
+    // The W3 part-1 contract holds on each side of the flip: a pattern outside
+    // the native dialect is a NAMED error without a host regexp, and the
+    // host's answer with one.
+    let e = d
+        .query("SELECT id FROM t WHERE s REGEXP '(?i)fo' ORDER BY id", &[])
+        .expect_err("(?i) is not in the native dialect")
+        .to_string();
+    assert!(e.contains("not valid in mpedb's regexp dialect"), "{e}");
+    register_consumer_regexp(&d);
+    assert_eq!(
+        mpedb_rows(&d, "SELECT id FROM t WHERE s REGEXP '(?i)fo' ORDER BY id"),
+        vec![vec!["9".to_string()], vec!["10".to_string()]],
+        "with a host regexp the (?i) pattern must answer rows"
+    );
+}
+
+/// A REGEXP that compiled into a host call is connection-local: it must never
+/// reach the shared `plan/<hash>` registry, and a second handle (no UDFs) must
+/// fail CLOSED on the hash — `UnknownPlan`, never the native dialect's answer.
+/// The same SQL compiled WITHOUT a registration is an ordinary shareable plan,
+/// so the containment above is not vacuous.
+#[test]
+fn host_regexp_plans_stay_connection_local() {
+    let d = db();
+    register_consumer_regexp(&d);
+
+    let sql = "SELECT id FROM t WHERE s REGEXP ? ORDER BY id";
+    let h = d.prepare(sql).unwrap();
+    // The registering connection executes it from its local cache.
+    match d.execute(&h, &[Value::Text("(?i)ABC".into())]).unwrap() {
+        ExecResult::Rows { rows, .. } => assert_eq!(rows.len(), 2),
+        other => panic!("{other:?}"),
+    }
+
+    // A fresh handle onto the same file, no UDFs: the hash must not resolve.
+    let db2 = Database::open_from_file(std::path::Path::new(&d.path)).expect("second handle");
+    match db2.execute(&h, &[Value::Text("(?i)ABC".into())]) {
+        Err(Error::UnknownPlan(_)) => {}
+        other => panic!("host-REGEXP plan leaked into the shared registry: {other:?}"),
+    }
+    drop(db2);
+
+    // Without a host regexp the SAME text compiles to the native opcode and
+    // shares normally — the extension keeps its multi-process contract.
+    assert!(d.unregister_host_function("regexp", 2));
+    let h_native = d.prepare(sql).unwrap();
+    let db3 = Database::open_from_file(std::path::Path::new(&d.path)).expect("third handle");
+    match db3.execute(&h_native, &[Value::Text("^a.c$".into())]) {
+        // `^a.c$` in the NATIVE dialect: rows 1,3,4,5,8 (`.` = any char).
+        Ok(ExecResult::Rows { rows, .. }) => {
+            assert_eq!(rows.len(), 5, "native plan must be shared and answer");
+        }
+        other => panic!("a native REGEXP plan must still publish: {other:?}"),
     }
 }
