@@ -839,14 +839,23 @@ impl Database {
         self.gate_cache_on_schema()?;
         let catalog = self.load_policy_catalog()?;
         let views = self.load_view_catalog()?;
-        mpedb_sql::prepare_maybe_explain_with_views(
+        // #114: the MPEE join solver's only statistic — the catalog's exact
+        // per-table row count, read on one pinned snapshot and consumed by the
+        // planner as a magnitude bucket (design/DESIGN-MPEE-SOLVER.md §2.1).
+        // The read pin is held only for the compile, which happens once per
+        // statement; `execute(hash, params)` never comes near it.
+        let r = self.engine.begin_read()?;
+        let out = mpedb_sql::prepare_maybe_explain_with_views(
             sql,
             &self.schema(),
             &catalog,
             &views,
             self.bare_group_by,
             &self.host_udf_set(),
-        )
+            &|tid| r.row_count(tid).unwrap_or(0),
+        );
+        r.finish()?;
+        out
     }
 
     /// Per output column, the `decltype` to report through the C-API shim
@@ -895,14 +904,24 @@ impl Database {
     ) -> Result<(CompiledPlan, bool)> {
         let catalog = self.load_policy_catalog()?;
         let views = self.load_view_catalog()?;
-        mpedb_sql::prepare_maybe_explain_with_views(
+        // Row counts for the MPEE solver come off an independent read snapshot
+        // (the last COMMITTED state), not off this session's uncommitted write
+        // txn: they are cost hints quantized to a magnitude bucket, so the
+        // session's own in-flight row deltas can never move the chosen plan —
+        // which is what keeps an in-session compile and an ordinary compile of
+        // the same SQL landing on the same plan hash.
+        let r = self.engine.begin_read()?;
+        let out = mpedb_sql::prepare_maybe_explain_with_views(
             sql,
             schema,
             &catalog,
             &views,
             self.bare_group_by,
             &self.host_udf_set(),
-        )
+            &|tid| r.row_count(tid).unwrap_or(0),
+        );
+        r.finish()?;
+        out
     }
 
     /// Prepare-time worst-case **risk estimate** (#74 layer 1) for an

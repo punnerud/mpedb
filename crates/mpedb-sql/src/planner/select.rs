@@ -278,6 +278,7 @@ pub(super) fn plan_select<'s>(
     catalog: &PolicyCatalog,
     mode: BareGroupBy,
     host_udfs: &HostUdfSet,
+    row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
     // The recursive CTE working table in scope (`WITH RECURSIVE`), if any: a
     // `FROM <name>` matching it binds to the working table (id `CTE_TABLE`,
@@ -302,7 +303,7 @@ pub(super) fn plan_select<'s>(
     let (s, subplans, slot_types): (&ast::SelectStmt, Vec<SubPlan>, Vec<Ty>) =
         if subquery::has_subquery(s) {
             lifted =
-                subquery::lift_subqueries(s, schema, n_params, catalog, mode, host_udfs, consts)?;
+                subquery::lift_subqueries(s, schema, n_params, catalog, mode, host_udfs, row_count, consts)?;
             (&lifted.stmt, lifted.subplans, lifted.slot_types)
         } else {
             (s, Vec::new(), Vec::new())
@@ -338,7 +339,7 @@ pub(super) fn plan_select<'s>(
     };
     if !s.joins.is_empty() {
         return plan_join_select(
-            s, schema, n_params, catalog, mode, host_udfs, consts, subplans, slot_types, cte,
+            s, schema, n_params, catalog, mode, host_udfs, row_count, consts, subplans, slot_types, cte,
         );
     }
     // `SELECT *` over an implicit-rowid table (#94): expand to the VISIBLE columns

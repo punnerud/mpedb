@@ -102,6 +102,13 @@ pub fn compile_trigger_body(
             // A trigger body cannot call host UDFs (stage 1): it is compiled at
             // CREATE TRIGGER time, out of any connection's UDF scope.
             &crate::binder::HostUdfSet::default(),
+            // A trigger body is compiled once at CREATE TRIGGER time and its
+            // bytes are stored in the catalog, so it must NOT depend on the
+            // row counts of the moment — the plan would then differ from every
+            // later re-derivation of the same trigger. Zero source: the MPEE
+            // solver's structural term still applies, its size-ranking term
+            // does not (design/DESIGN-MPEE-SOLVER.md §6).
+            crate::planner::NO_ROW_COUNTS,
         )?;
         out.push((plan, map));
     }

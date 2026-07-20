@@ -7,6 +7,14 @@ live `CREATE INDEX` (#48), content-hashed plans, the MPEE cost broker (#12/#73).
 Hard constraint (Morten): stats maintenance + auto-indexing are cheap / background / opt-in — NEVER
 on the write hot path.**
 
+**Update 2026-07-20 (#114):** the *consumer* of all this now exists. MPEE is a
+real join-order solver ([DESIGN-MPEE-SOLVER.md](DESIGN-MPEE-SOLVER.md)), invoked
+at every level of the compile recursion, and it reads its cost inputs through a
+single seam (`RowCountFn`, consumed only as a magnitude bucket). Everything below
+plugs into that seam without changing the solver: §5's determinism argument is
+exactly the resolution the solver shipped with, and DESIGN-MPEE-SOLVER.md §9
+names the four measurements this catalog should persist first.
+
 ## 0. Beyond `row_count`
 
 MPEE prices plans today with exact `row_count` (transactionally exact, a real advantage). Richer, and

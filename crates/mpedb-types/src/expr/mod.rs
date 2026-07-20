@@ -381,6 +381,15 @@ pub struct ExprProgram {
 }
 
 impl ExprProgram {
+    /// Is this program the single constant `TRUE`? The shape a vacuous
+    /// predicate compiles to — a comma join's `ON true`, or an ON whose every
+    /// conjunct was consumed into an access path. EXPLAIN uses it to tell a
+    /// genuinely unconstrained (cartesian) join step apart from one whose
+    /// predicate merely stayed residual (design/DESIGN-MPEE-SOLVER.md §3).
+    pub fn is_const_true(&self) -> bool {
+        matches!(self.instrs[..], [Instr::PushConst(i)] if self.consts.get(i as usize) == Some(&Value::Bool(true)))
+    }
+
     /// Build a program, verifying stack discipline and const/index bounds.
     pub fn new(instrs: Vec<Instr>, consts: Vec<Value>) -> Result<ExprProgram> {
         let max_stack = codec::validate(&instrs, &consts)?;
