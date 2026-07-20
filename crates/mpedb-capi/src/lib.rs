@@ -105,6 +105,10 @@ pub struct Sqlite3 {
     /// `sqlite3_close` refuses (`SQLITE_BUSY`) while any remain, so a handle's
     /// back-pointer to this connection can never dangle.
     blobs: Vec<*mut blob::Sqlite3Blob>,
+    /// `sqlite3_close_v2` was called while a blob handle was still open: the
+    /// connection is logically closed but kept alive for that handle, and is
+    /// freed by the last `sqlite3_blob_close` (sqlite's zombie connection).
+    zombie: bool,
 }
 
 /// sqlite 3.45's compile-time limit defaults — both the initial value and the
@@ -953,6 +957,7 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
         limits: DEFAULT_LIMITS,
         readonly,
         blobs: Vec::new(),
+        zombie: false,
     });
     c.clear_error();
     Ok(c)
@@ -1063,30 +1068,50 @@ unsafe fn open_common(filename: *const c_char, pp_db: *mut *mut Sqlite3, flags: 
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_close(db: *mut Sqlite3) -> c_int {
-    close_common(db)
+    close_common(db, false)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_close_v2(db: *mut Sqlite3) -> c_int {
-    close_common(db)
+    close_common(db, true)
 }
 
-unsafe fn close_common(db: *mut Sqlite3) -> c_int {
+/// Shared close. An open incremental-blob handle holds a back-pointer to the
+/// connection, so the connection cannot be freed under it — which is exactly
+/// the situation sqlite's two closes answer differently (both probed on
+/// 3.45.1):
+///
+/// * `sqlite3_close` → `SQLITE_BUSY`, connection untouched.
+/// * `sqlite3_close_v2` → `SQLITE_OK`, and the connection becomes a **zombie**:
+///   already logically closed, but kept alive so the outstanding blob handle
+///   stays usable; the real free happens when the last handle closes
+///   (`blob::reap_zombie`). This is what GC'd consumers rely on.
+unsafe fn close_common(db: *mut Sqlite3, v2: bool) -> c_int {
     if db.is_null() {
         return SQLITE_OK;
     }
-    // An open incremental-blob handle holds a back-pointer to this connection;
-    // freeing it now would leave that dangling. sqlite's answer for a close
-    // with unfinished business is SQLITE_BUSY — consumers (CPython included)
-    // close their blob handles first.
     if !(*db).blobs.is_empty() {
-        (*db).set_error(
-            SQLITE_BUSY,
-            SQLITE_BUSY,
-            "unable to close due to unfinalized statements or unfinished backups",
-        );
-        return SQLITE_BUSY;
+        if !v2 {
+            (*db).set_error(
+                SQLITE_BUSY,
+                SQLITE_BUSY,
+                "unable to close due to unfinalized statements or unfinished backups",
+            );
+            return SQLITE_BUSY;
+        }
+        // Zombie: drop the write transaction now (the close is logically
+        // done), then wait for the last blob handle. Blob I/O on a zombie
+        // still reads/writes through the engine, as sqlite's does.
+        (*db).txn = None;
+        (*db).zombie = true;
+        return SQLITE_OK;
     }
+    free_connection(db);
+    SQLITE_OK
+}
+
+/// Free the connection for real. Only ever called with no blob handles left.
+pub(crate) unsafe fn free_connection(db: *mut Sqlite3) {
     let mut boxed = Box::from_raw(db);
     // Drop any open transaction before the engine (borrow discipline).
     boxed.txn = None;
@@ -1107,7 +1132,6 @@ unsafe fn close_common(db: *mut Sqlite3) -> c_int {
     if remove {
         let _ = std::fs::remove_file(&path);
     }
-    SQLITE_OK
 }
 
 #[no_mangle]

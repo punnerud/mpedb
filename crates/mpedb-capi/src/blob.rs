@@ -595,10 +595,16 @@ pub unsafe extern "C" fn sqlite3_blob_close(pb: *mut c_void) -> c_int {
     let Some(b) = blob(pb) else {
         return SQLITE_OK; // sqlite: closing a NULL handle is a harmless no-op
     };
-    if let Some(c) = conn(b.db) {
-        c.blobs.retain(|&p| p != pb as *mut Sqlite3Blob);
-    }
+    let db = b.db;
     drop(Box::from_raw(pb as *mut Sqlite3Blob));
+    if let Some(c) = conn(db) {
+        c.blobs.retain(|&p| p != pb as *mut Sqlite3Blob);
+        // The connection was `sqlite3_close_v2`'d while this handle was open
+        // and only stayed alive for it: this is the last one, so free it now.
+        if c.zombie && c.blobs.is_empty() {
+            crate::free_connection(db);
+        }
+    }
     SQLITE_OK
 }
 
