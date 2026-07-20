@@ -383,7 +383,7 @@ express — it costs conflict precision, never correctness."*
 
 **What it feeds today.** Read-only statements route to a snapshot and never touch
 the writer lock; the batch drain's deterministic sort key; multi-file routing.
-Conflict-based grouping is designed but has no production caller (§9.6), and
+Conflict-based grouping is designed but has no production caller (§9.7), and
 prefaulting is described in the design as a consumer but is **not implemented** —
 both stated here so the idea is credited as *partly built*.
 
