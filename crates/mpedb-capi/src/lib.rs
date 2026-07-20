@@ -937,6 +937,41 @@ fn register_shim_builtins(db: &Database) {
     db.register_host_function("zeroblob", 1, |args: &[Value]| blob::zeroblob_value(args));
 }
 
+/// Is `lower` (already lowercased) the name of something this connection can
+/// CALL — a core scalar or aggregate?
+///
+/// Used ONLY by the `SQLITE_LIMIT_FUNCTION_ARG` gate (`sql::max_function_args`),
+/// where the question is "may I count the parenthesized list after this name as
+/// an argument list?". Being conservative here is free: an unrecognized name is
+/// simply not counted, and mpedb's binder still rejects a call to a function it
+/// does not have. Host registrations are checked separately, against the
+/// connection's own list.
+fn is_callable_name(lower: &str) -> bool {
+    const NAMES: &[&str] = &[
+        // core scalars
+        "abs", "changes", "char", "coalesce", "concat", "concat_ws", "format", "glob", "hex",
+        "iif", "ifnull", "instr", "last_insert_rowid", "length", "like", "likelihood", "likely",
+        "lower", "ltrim", "max", "min", "nullif", "octet_length", "printf", "quote", "random",
+        "randomblob", "replace", "round", "rtrim", "sign", "soundex", "substr", "substring",
+        "trim", "typeof", "unhex", "unicode", "unlikely", "upper", "zeroblob",
+        // date/time
+        "date", "time", "datetime", "julianday", "unixepoch", "strftime", "timediff",
+        // json
+        "json", "json_array", "json_array_length", "json_error_position", "json_extract",
+        "json_insert", "json_object", "json_patch", "json_quote", "json_remove", "json_replace",
+        "json_set", "json_type", "json_valid",
+        // math
+        "acos", "asin", "atan", "atan2", "ceil", "ceiling", "cos", "degrees", "exp", "floor",
+        "ln", "log", "log10", "log2", "mod", "pi", "pow", "power", "radians", "sin", "sqrt",
+        "tan", "trunc",
+        // aggregates + window functions
+        "avg", "count", "group_concat", "string_agg", "sum", "total", "cume_dist", "dense_rank",
+        "first_value", "last_value", "lead", "nth_value", "ntile", "percent_rank",
+        "rank", "row_number", "lag",
+    ];
+    NAMES.contains(&lower)
+}
+
 fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_int, String)> {
     // URI/`:memory:` recognition needs text; a non-UTF-8 name is a plain path.
     let filename = raw_name.and_then(|b| std::str::from_utf8(b).ok());
@@ -1413,6 +1448,28 @@ unsafe fn prepare_common(
     if scan.count > c.limits[SQLITE_LIMIT_VARIABLE_NUMBER as usize].max(0) as usize {
         c.set_error(SQLITE_ERROR, SQLITE_ERROR, "too many SQL variables");
         return SQLITE_ERROR;
+    }
+
+    // SQLITE_LIMIT_FUNCTION_ARG: sqlite refuses at parse when a CALL carries
+    // more arguments than the connection allows, with exactly this message.
+    // The count comes from the text (`sql::max_function_args`), so it is gated
+    // twice over: only below the compile-time default — nobody but a test ever
+    // lowers this — and only for names the connection can actually call.
+    let fn_arg_limit = c.limits[SQLITE_LIMIT_FUNCTION_ARG as usize].max(0) as usize;
+    if fn_arg_limit < DEFAULT_LIMITS[SQLITE_LIMIT_FUNCTION_ARG as usize] as usize {
+        let host: Vec<String> = c.host_fns.iter().map(|h| h.name.to_ascii_lowercase()).collect();
+        if let Some((name, args)) =
+            sql::max_function_args(first_zb, |n| is_callable_name(n) || host.iter().any(|h| h == n))
+        {
+            if args > fn_arg_limit {
+                c.set_error(
+                    SQLITE_ERROR,
+                    SQLITE_ERROR,
+                    &format!("too many arguments on function {name}"),
+                );
+                return SQLITE_ERROR;
+            }
+        }
     }
 
     // The authorizer sees every action this statement performs, BEFORE it is
