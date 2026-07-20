@@ -372,6 +372,12 @@ impl Database {
             &views,
             self.bare_group_by,
             &self.host_udf_set(),
+            // A cross-file plan spans a MERGED schema whose table ids are
+            // synthetic and whose members are separate files; there is no one
+            // catalog to read counts from. The MPEE solver keeps its
+            // structural term (cartesian-step avoidance, which needs no
+            // statistics) and simply cannot rank the tables by size.
+            mpedb_sql::NO_ROW_COUNTS,
         )?;
         if !plan.footprint.read_only {
             // The resolver refuses writes by name before this point; keep the
