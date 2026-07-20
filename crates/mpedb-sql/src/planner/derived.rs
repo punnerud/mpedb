@@ -43,12 +43,25 @@ pub(super) fn plan_derived_select(
             plan_compound(bc, schema, n_params, catalog, mode, host_udfs, consts)?
         }
     };
-    reject_unsupported_component(&name, "derived-table body", &b_ctx, &b_subs)?;
+    reject_context(&name, "derived-table body", &b_ctx)?;
     let body = match b_stmt {
         PlanStmt::Select(sp) => SubBody::Select(sp),
         PlanStmt::Compound(c) => SubBody::Compound(c),
         _ => return Err(Error::Internal("body planning produced a non-select".into())),
     };
+    // The body OWNS its lifts (design/DESIGN-DERIVED-TABLES.md §5.5): they
+    // correlate to the BODY's row, are filled while the body materialises, and
+    // the outer never sees them. A COMPOUND body is the one exception — its
+    // arms are executed as a unit with no per-row fill phase, exactly like a
+    // compound subquery body, so a lift there stays refused rather than
+    // reading an unfilled slot.
+    if !b_subs.is_empty() && body.as_select().is_none() {
+        return Err(bind_err(format!(
+            "derived table \"{name}\": a subquery inside a compound derived-table body is \
+             not supported yet"
+        )));
+    }
+    let body_sub_base = n_params;
 
     // 2. The synthetic working-table def: the body's output columns. Types come
     //    from the body's inferred output types; an output the body leaves
@@ -91,7 +104,15 @@ pub(super) fn plan_derived_select(
     }
     let (o_stmt, o_ptypes, o_ctx, _o_list, o_out, o_subs) =
         plan_select(&outer_ast, schema, n_params, catalog, mode, host_udfs, consts, Some(cte))?;
-    reject_unsupported_component(&name, "outer statement", &o_ctx, &o_subs)?;
+    reject_context(&name, "outer statement", &o_ctx)?;
+    // Unreachable — `has_subquery` refused above — but a silent slot collision
+    // would be worse than a redundant check: the outer numbers ITS lifts from
+    // `n_params` too, which is exactly where the body's live.
+    if !o_subs.is_empty() {
+        return Err(bind_err(format!(
+            "derived table \"{name}\": a subquery in the outer statement is not supported yet"
+        )));
+    }
     let outer = into_select(o_stmt);
     // The materialized rows are read exactly once: the FROM position that
     // defines the alias (which the RIGHT-join rewrite may have moved into a
@@ -106,35 +127,45 @@ pub(super) fn plan_derived_select(
         )));
     }
 
-    // 4. One statement, one parameter table: unify the two components'.
-    let param_types = unify_param_types(n_params, &[&b_ptypes, &o_ptypes])?;
+    // 4. One statement, one parameter table. The layout is
+    //    `[user ‖ body subplans]`: `b_ptypes` already spans it (the body was
+    //    planned with `n_params` user slots and grew by its own lifts), the
+    //    outer's spans only the user prefix, and unifying pins the reserved
+    //    slot types the body inferred.
+    let n_total = n_params
+        .checked_add(b_subs.len() as u16)
+        .ok_or_else(|| bind_err("too many parameters (including reserved slots)"))?;
+    let param_types = unify_param_types(n_total, &[&b_ptypes, &o_ptypes])?;
     let plan = PlanStmt::Derived(crate::plan::DerivedPlan {
         name,
         columns,
         col_types,
         body,
+        body_subplans: b_subs,
+        body_sub_base,
         outer,
     });
     Ok((plan, param_types, Vec::new(), BTreeSet::new(), o_out, Vec::new()))
 }
 
-/// Stage 1 keeps the parameter layout `[user]` only (the recursive-CTE rule): a
-/// derived-table component may not lift subqueries or reference session
-/// context — both need the reserved-slot layout reconciled across components.
-fn reject_unsupported_component(
-    name: &str,
-    which: &str,
-    ctx: &[String],
-    subs: &[SubPlan],
-) -> Result<()> {
-    if !subs.is_empty() {
-        return Err(bind_err(format!(
-            "derived table \"{name}\": a subquery in the {which} is not supported yet"
-        )));
-    }
+/// Neither component may reference session context: `current_setting()` takes a
+/// reserved slot that would have to be reconciled ACROSS the two components,
+/// which stage 1 does not do (the recursive-CTE rule, unchanged). A literal
+/// `'now'` rides the same slot mechanism and is refused here for the same
+/// reason.
+///
+/// Lifted subqueries are NO LONGER refused in the body — the body OWNS them
+/// (see [`crate::plan::DerivedPlan`]); the outer's are refused at its own call
+/// site, where the reason (slot collision with the body's) is local.
+fn reject_context(name: &str, which: &str, ctx: &[String]) -> Result<()> {
     if !ctx.is_empty() {
+        let what = if ctx.iter().any(|k| k == crate::STATEMENT_INSTANT_KEY) {
+            "'now'"
+        } else {
+            "current_setting()"
+        };
         return Err(bind_err(format!(
-            "derived table \"{name}\": current_setting() in the {which} is not supported yet"
+            "derived table \"{name}\": {what} in the {which} is not supported yet"
         )));
     }
     Ok(())

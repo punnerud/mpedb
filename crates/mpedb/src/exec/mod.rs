@@ -772,7 +772,7 @@ fn exec_stmt_impl(
 }
 
 /// A subquery's rows, reduced to the VALUE its reserved slot carries.
-fn subplan_value(r: ExecResult, kind: mpedb_sql::SubPlanKind) -> Result<Value> {
+pub(super) fn subplan_value(r: ExecResult, kind: mpedb_sql::SubPlanKind) -> Result<Value> {
     use mpedb_sql::SubPlanKind as K;
     let ExecResult::Rows { rows, .. } = r else {
         return Err(internal("subplan produced no row set"));
@@ -836,7 +836,7 @@ fn subplan_value(r: ExecResult, kind: mpedb_sql::SubPlanKind) -> Result<Value> {
 ///
 /// This generalizes the flat two-level fill (`exec_stmt_impl` once + top per-row)
 /// into a recursion that bottoms out at the leaf case.
-fn run_subplan(
+pub(super) fn run_subplan(
     ctx: &mut dyn TxnCtx,
     schema: &Schema,
     plan: &CompiledPlan,
@@ -919,7 +919,7 @@ fn exec_select_top(
 /// parent is filled per parent row here, exactly as the top level fills its
 /// correlated subplans per outer row. Compound arms and leaf subplans instead
 /// go through the plain [`exec_select`], which never fills slots.
-fn exec_select_leveled(
+pub(super) fn exec_select_leveled(
     ctx: &mut dyn TxnCtx,
     schema: &Schema,
     plan: &CompiledPlan,

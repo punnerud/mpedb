@@ -445,7 +445,15 @@ pub(crate) fn plan_statement(
     // The 16-subplan ceiling bounds the WHOLE tree once nesting (#73 §3) can
     // grow it past one level — matching the recursive decoder's DoS budget, so a
     // plan `prepare` accepts is a plan `decode` accepts.
-    if total_subplans(&subplans) > 16 {
+    // A materialized derived table's BODY owns its lifts (they never join the
+    // statement-level list), so the DoS ceiling — and the footprint below —
+    // have to count them here or a body could smuggle an unbounded tree past
+    // both. Same 16, matching the recursive decoder's budget.
+    let body_subplans: &[SubPlan] = match &plan_stmt {
+        PlanStmt::Derived(dp) => &dp.body_subplans,
+        _ => &[],
+    };
+    if total_subplans(&subplans) + total_subplans(body_subplans) > 16 {
         return Err(bind_err(
             "too many subqueries in one statement (max 16, including nested)",
         ));
