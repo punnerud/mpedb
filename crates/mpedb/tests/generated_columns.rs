@@ -591,3 +591,79 @@ fn generated_columns_survive_a_reopen() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+// -------------------------------------------- the shapes Django actually runs
+
+/// Django's sqlite3 schema editor never ALTERs in place — it REMAKES the table:
+/// `CREATE TABLE new (…)`, `INSERT INTO new (cols) SELECT cols FROM old`, drop,
+/// rename. The generated column is absent from both column lists and must be
+/// computed from the copied inputs, per row.
+#[test]
+fn insert_select_recomputes_the_generated_column_per_row() {
+    assert_same(
+        &[
+            "CREATE TABLE old (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+            "INSERT INTO old VALUES (1, 10, 20)",
+            "INSERT INTO old VALUES (2, 3, 4)",
+            STORED,
+            "INSERT INTO t (id, a, b) SELECT id, a, b FROM old",
+        ],
+        "SELECT id, a, b, s FROM t ORDER BY id",
+    );
+}
+
+/// A bare `INSERT INTO t SELECT …` (no column list) must line the source up
+/// with the NON-generated columns only, exactly as a bare VALUES list does.
+#[test]
+fn insert_select_without_a_column_list_skips_the_generated_column() {
+    assert_same(
+        &[
+            "CREATE TABLE old (id INTEGER PRIMARY KEY, a INTEGER, b INTEGER)",
+            "INSERT INTO old VALUES (1, 10, 20)",
+            STORED,
+            "INSERT INTO t SELECT id, a, b FROM old",
+        ],
+        "SELECT id, a, b, s FROM t",
+    );
+}
+
+/// `RETURNING` projects the POST-image, so it must already carry the computed
+/// value — Django 4.2+ uses RETURNING for inserts on sqlite ≥ 3.35.
+#[test]
+fn returning_carries_the_computed_value() {
+    assert_same(
+        &[STORED],
+        "INSERT INTO t (id, a, b) VALUES (1, 6, 7) RETURNING id, a, b, s",
+    );
+}
+
+/// `ON CONFLICT … DO UPDATE` writes a post-image like any other UPDATE: the
+/// generated column follows the new inputs, not the old ones.
+#[test]
+fn upsert_do_update_recomputes_the_generated_column() {
+    assert_same(
+        &[
+            STORED,
+            "INSERT INTO t (id, a, b) VALUES (1, 1, 1)",
+            "INSERT INTO t (id, a, b) VALUES (1, 50, 60) \
+             ON CONFLICT (id) DO UPDATE SET a = excluded.a, b = excluded.b",
+        ],
+        "SELECT id, a, b, s FROM t",
+    );
+}
+
+/// `INSERT OR REPLACE` probes the UNIQUE indexes of the PROPOSED row before it
+/// writes; a generated column can carry one, so it must be computed before the
+/// probe rather than after.
+#[test]
+fn insert_or_replace_probes_a_unique_generated_index() {
+    assert_same(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, \
+             s INTEGER GENERATED ALWAYS AS (a * 2) STORED UNIQUE)",
+            "INSERT INTO t (id, a) VALUES (1, 5)",
+            "INSERT OR REPLACE INTO t (id, a) VALUES (2, 5)",
+        ],
+        "SELECT id, a, s FROM t ORDER BY id",
+    );
+}
