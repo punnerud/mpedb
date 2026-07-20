@@ -981,7 +981,25 @@ stock libsqlite3 3.45.1, `--parallel=1`; **both arms re-measured**, as every
 run since run 1's fake baseline demands. Four separate measurements (A–D),
 never one headline number.
 
-### ⚠️ One WRONG ANSWER (W3, open) — REGEXP silently matches nothing outside mpedb's dialect
+### ⚠️ One WRONG ANSWER (W3 — **CLOSED 2026-07-20**, task #108) — REGEXP silently matches nothing outside mpedb's dialect
+
+> **CLOSED in two parts.** Part 1 (`dbdb429`): a pattern outside the native
+> dialect is a NAMED error, never a silent no-match. Part 2 (task #108): the
+> honest fix below is BUILT — `x REGEXP y` dispatches to a registered host
+> `regexp/2` as `regexp(y, x)` (sqlite's contract, argument order included);
+> the native dialect only answers when NO host regexp exists, and is recorded
+> in COMPAT.md as an extension (stock sqlite errors `no such function:
+> regexp`). Host-REGEXP plans inherit the host-call containment (connection
+> -local, never published). Measured: the two probe lines below answer
+> `[(1,)]` in BOTH arms (the probe's pre/post diff moved exactly those two
+> lines and nothing else); the lookup label's 4 regex tests
+> (`test_regex`, `test_regex_backreferencing`, `test_regex_non_string`,
+> `test_regex_null`) all flip to PASS under the shim — `test_regex_non_string`
+> rode along because host dispatch does not pin the pattern's type (the UDF
+> str()s the int, as stock+Python does), closing run-4 gap 6 entirely.
+> CPython `test_sqlite3` per-test outcomes are unchanged (355/466 pass,
+> identical not-pass set). The section below is the run-4 record of the open
+> state.
 
 Bound REGEXP (#74 item 3) turned run 3's clean refusal into a **silent wrong
 answer** for every pattern outside mpedb's regexp dialect. Two Django tests
@@ -1144,7 +1162,7 @@ involvement. What that changed, measured:
 | Adaptation | Ablated result (shim) | Cost | Kept? |
 |---|---|---|---|
 | `data_types_suffix = {}` (D2, AUTOINCREMENT) | `WB_NO_D2`: migrate dies at the FIRST `CREATE TABLE`, 0 tests run | **all 831** | KEEP |
-| `_references_graph` (D8, `sqlite_master` recursive CTE) | `WB_NO_D8`: G1 68 F + 108 E (vs 29 outcomes), G2 unchanged; stock arm still 831/831. Driving error: `this sqlite_master query form is not supported by the mpedb C-API shim` ×80 — the shim's `sqlite_master` mini-evaluator refuses Django's exact CTE shape, and every TransactionTestCase teardown then cascades | **~147 outcomes in G1** | KEEP — and it is DOUBLY pinned: even if the mini-evaluator learned the shape, W3 would silently empty the `(?i)…` REGEXP recursive arm and return the seed table alone. Fix W3 first, then re-ablate. |
+| `_references_graph` (D8, `sqlite_master` recursive CTE) | `WB_NO_D8`: G1 68 F + 108 E (vs 29 outcomes), G2 unchanged; stock arm still 831/831. Driving error: `this sqlite_master query form is not supported by the mpedb C-API shim` ×80 — the shim's `sqlite_master` mini-evaluator refuses Django's exact CTE shape, and every TransactionTestCase teardown then cascades | **~147 outcomes in G1** | KEEP — and it was DOUBLY pinned: even if the mini-evaluator learned the shape, W3 would silently empty the `(?i)…` REGEXP recursive arm and return the seed table alone. W3 is now CLOSED (#108), so the second pin is gone — the mini-evaluator's CTE-shape refusal is the sole remaining blocker; re-ablate when that closes. |
 | D9 index dropper + `WB_SOFT_CREATE_INDEX` | removed for the whole run; migrate succeeds with real indexes everywhere (A, B, C) | **0** | **DELETED** |
 | `supports_foreign_keys = False` (D4b) | removed for the whole run; only visible change is 4 honest self-skips in `backends` | **0** | **DELETED** (again, this time in the file) |
 
@@ -1152,7 +1170,7 @@ involvement. What that changed, measured:
 
 | Rank | Tests | Gap | Minimal repro | Where |
 |---|---|---|---|---|
-| 0 | 2 | **W3 — REGEXP wrong answer** (top of this section) | `h REGEXP ?` bound `(?i)fo+` → `[]` | `mpedb-types` `expr/ops.rs` + host-UDF dispatch |
+| 0 | 2 | **W3 — REGEXP wrong answer** — **CLOSED 2026-07-20** (#108: named error `dbdb429`, then host `regexp/2` dispatch; see the W3 section note) | `h REGEXP ?` bound `(?i)fo+` → `[]` (now: stock's rows) | `mpedb-types` `expr/ops.rs` + host-UDF dispatch |
 | 1 | 28 | **LIKE pattern must be a literal** (ESCAPE now parses; Django binds every pattern) | `name LIKE ? ESCAPE '\'` bound `('A\_b',)` | `mpedb-sql` (same lift bound REGEXP got) |
 | 2 | 32 | **Derived-table / subquery-position restrictions** (each blocker named by `check_simple`) | `SELECT s.x FROM (SELECT a.x AS x FROM a JOIN b ON b.id = a.b_id GROUP BY a.x) s` | `mpedb-sql` planner |
 | 3 | 13 | **Compound (UNION/INTERSECT/EXCEPT) placement**: in a derived table, in a correlated subquery (scoping: `no table named V0`), arm-type `any`/`text` unification, subquery inside a compound | `SELECT COUNT(*) FROM (SELECT id FROM a UNION SELECT id FROM b) u` | `mpedb-sql` |
@@ -1162,7 +1180,7 @@ involvement. What that changed, measured:
 | 7 | 4 | **`LIMIT -1`** (sqlite's no-limit idiom) | `SELECT * FROM t LIMIT -1 OFFSET 5` | `mpedb-sql` parser |
 | 8 | 4 | **Residual param strictness**: non-integral float64 → int64 refusals | `WHERE int_col > ?` bound `1.5` | `mpedb-sql` |
 | 9 | 4 | `strftime('now')` 3 (BY DESIGN) + `date()` family (`backends`) | `SELECT date('now')` | `mpedb-sql` builtins |
-| 10 | 3 | `REGEXP requires text, got int64` 2 + CASE-into-bool-column 1 | `h REGEXP ?` bound `123` | `mpedb-sql` |
+| 10 | 3 | `REGEXP requires text, got int64` 2 (**CLOSED with W3**: host dispatch does not pin the pattern; the UDF str()s it) + CASE-into-bool-column 1 | `h REGEXP ?` bound `123` | `mpedb-sql` |
 | 11 | 4 | One-offs: `unknown column` 1, `$` in identifier 1, JSONField CASE mix 1, DDL-in-SAVEPOINT (`backends`) 2 | — | engine / `mpedb-sql` |
 
 ### Coverage

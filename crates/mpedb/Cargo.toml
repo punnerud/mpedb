@@ -14,7 +14,10 @@ leakstat = ["mpedb-core/leakstat"]
 sqlite-checkpoint = ["dep:rusqlite"]
 
 [dev-dependencies]
-rusqlite = { version = "0.31", features = ["bundled"] }
+# "functions" lets the differential oracle register a Rust closure as the
+# consumer's `regexp()` UDF — the contract behind sqlite's REGEXP operator
+# (tests/regexp.rs; the bare library has no regexp() of its own).
+rusqlite = { version = "0.31", features = ["bundled", "functions"] }
 
 [dependencies]
 # The join gather's budget_fits_in_memory rlimit probe. Already in the tree
