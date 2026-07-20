@@ -2790,3 +2790,323 @@ fn bind_zeroblob_binds_zeros_and_caps() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }
+
+// ===========================================================================
+// `INSERT OR ROLLBACK` — the one conflict action that lives in the SHIM
+// (#112 wave 3, bucket C). mpedb's parser refuses it by name because a
+// statement cannot abort the transaction that contains it; the connection
+// can, so the shim runs the statement as `OR ABORT` and rolls back itself.
+// ===========================================================================
+
+/// The three corners CPython's suite does not reach:
+/// 1. a SUCCESSFUL `OR ROLLBACK` leaves the transaction alone;
+/// 2. a conflicting one discards work done EARLIER in the same transaction;
+/// 3. a NON-constraint failure of the same statement does not roll back —
+///    sqlite's action fires on conflict resolution, not on any error.
+#[test]
+fn insert_or_rollback_aborts_the_transaction_only_on_a_conflict() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, u TEXT UNIQUE)"), SQLITE_OK);
+
+        // (1) No conflict: the row stands and so does the transaction.
+        assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (id, u) VALUES (1, 'a')"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT OR ROLLBACK INTO t (id, u) VALUES (2, 'b')"), SQLITE_OK);
+        assert_eq!(sqlite3_get_autocommit(db), 0, "still inside the transaction");
+        assert_eq!(exec(db, "COMMIT"), SQLITE_OK);
+        assert_eq!(scalar_count(db, "SELECT count(*) FROM t"), 2);
+
+        // (2) A conflict discards the whole transaction, including the row
+        // inserted by an EARLIER statement in it.
+        assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (id, u) VALUES (3, 'c')"), SQLITE_OK);
+        assert_eq!(
+            exec(db, "INSERT OR ROLLBACK INTO t (id, u) VALUES (4, 'a')"),
+            SQLITE_CONSTRAINT
+        );
+        assert_eq!(sqlite3_get_autocommit(db), 1, "the transaction is gone");
+        // Row 3 never happened; the pre-transaction rows are intact.
+        assert_eq!(scalar_count(db, "SELECT count(*) FROM t"), 2);
+
+        // (3) A type error is not a conflict: the transaction survives it,
+        // exactly as `OR ABORT` would.
+        assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (id, u) VALUES (5, 'e')"), SQLITE_OK);
+        assert_ne!(exec(db, "INSERT OR ROLLBACK INTO t (id, u) VALUES ('x', 'f')"), SQLITE_OK);
+        assert_eq!(sqlite3_get_autocommit(db), 0, "a non-conflict error keeps the transaction");
+        assert_eq!(exec(db, "COMMIT"), SQLITE_OK);
+        assert_eq!(scalar_count(db, "SELECT count(*) FROM t"), 3);
+
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+/// Comments are the parser's business now, at every position — not just the
+/// leading one the shim strips. A `;` or a parameter marker inside a comment
+/// must not be seen by the statement splitter or the bind-parameter scanner
+/// either, and `==` is `=`.
+#[test]
+fn interior_comments_and_eq_alias_reach_the_engine() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (id, v) VALUES (1, 10), (2, 20)"), SQLITE_OK);
+
+        assert_eq!(scalar_count(db, "SELECT v FROM t WHERE id == 1"), 10);
+        assert_eq!(scalar_count(db, "SELECT v FROM t -- trailing comment"), 10);
+        assert_eq!(scalar_count(db, "SELECT /* inline */ v FROM t WHERE id = 2"), 20);
+        // A `;` inside a comment is not a statement boundary.
+        assert_eq!(scalar_count(db, "SELECT v FROM t WHERE id = 1 -- ; SELECT 99"), 10);
+        // A `?` inside a comment is not a bound parameter.
+        let s = cs("SELECT v FROM t WHERE id = ? /* not a ? here */");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_bind_parameter_count(st), 1);
+        assert_eq!(sqlite3_bind_int(st, 1, 2), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(sqlite3_column_int64(st, 0), 20);
+        assert_eq!(sqlite3_finalize(st), SQLITE_OK);
+
+        // An unquoted identifier may carry bytes >= 0x80.
+        let s = cs("SELECT 1 AS \u{00ff}");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()), SQLITE_OK);
+        assert_eq!(sqlite3_step(st), SQLITE_ROW);
+        assert_eq!(
+            CStr::from_ptr(sqlite3_column_name(st, 0)).to_str().unwrap(),
+            "\u{00ff}"
+        );
+        assert_eq!(sqlite3_finalize(st), SQLITE_OK);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+// ===========================================================================
+// `sqlite3_set_authorizer` — the compile-time access gate (#112 wave 3).
+// ===========================================================================
+
+use std::sync::Mutex as StdMutex;
+
+/// Every consultation this process's test authorizer saw, as
+/// `(action, arg1, arg2)`. One test at a time touches it.
+static AUTH_LOG: StdMutex<Vec<(c_int, String, String)>> = StdMutex::new(Vec::new());
+/// What the callback returns; `None` = SQLITE_OK.
+static AUTH_VERDICT: StdMutex<Option<(c_int, c_int)>> = StdMutex::new(None);
+
+unsafe extern "C" fn logging_auth(
+    _ctx: *mut c_void,
+    action: c_int,
+    a1: *const c_char,
+    a2: *const c_char,
+    _db: *const c_char,
+    _src: *const c_char,
+) -> c_int {
+    let s = |p: *const c_char| {
+        if p.is_null() {
+            String::new()
+        } else {
+            CStr::from_ptr(p).to_string_lossy().into_owned()
+        }
+    };
+    AUTH_LOG.lock().unwrap().push((action, s(a1), s(a2)));
+    match *AUTH_VERDICT.lock().unwrap() {
+        Some((on, rc)) if on == action => rc,
+        _ => SQLITE_OK,
+    }
+}
+
+fn auth_reset(verdict: Option<(c_int, c_int)>) {
+    AUTH_LOG.lock().unwrap().clear();
+    *AUTH_VERDICT.lock().unwrap() = verdict;
+}
+
+fn auth_log() -> Vec<(c_int, String, String)> {
+    AUTH_LOG.lock().unwrap().clone()
+}
+
+unsafe fn set_auth(db: *mut Sqlite3) {
+    assert_eq!(
+        sqlite3_set_authorizer(db, logging_auth as *mut c_void, ptr::null_mut()),
+        SQLITE_OK
+    );
+}
+
+/// The action stream for the write statements CPython's own authorizer tests
+/// never reach, and the DENY message shape for each: a denied column read
+/// names the object ("access to t.c is prohibited"), everything else is
+/// sqlite's generic "not authorized". Both carry SQLITE_AUTH.
+#[test]
+fn authorizer_sees_writes_and_ddl_and_denies_with_sqlites_two_messages() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b TEXT)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (id, a, b) VALUES (1, 2, 'x')"), SQLITE_OK);
+        set_auth(db);
+
+        // INSERT names its table; nothing is read.
+        auth_reset(None);
+        assert_eq!(exec(db, "INSERT INTO t (id, a, b) VALUES (2, 3, 'y')"), SQLITE_OK);
+        assert_eq!(auth_log(), [(18, "t".to_string(), String::new())]);
+
+        // UPDATE names the ASSIGNED column, and reads the ones it consults.
+        auth_reset(None);
+        assert_eq!(exec(db, "UPDATE t SET b = 'z' WHERE a = 3"), SQLITE_OK);
+        let log = auth_log();
+        assert!(log.contains(&(23, "t".into(), "b".into())), "{log:?}");
+        assert!(!log.contains(&(23, "t".into(), "a".into())), "a is read, not written: {log:?}");
+        assert!(log.contains(&(20, "t".into(), "a".into())), "{log:?}");
+
+        // DELETE names its table.
+        auth_reset(None);
+        assert_eq!(exec(db, "DELETE FROM t WHERE id = 2"), SQLITE_OK);
+        assert!(auth_log().contains(&(9, "t".into(), String::new())));
+
+        // DDL and transaction control are described too.
+        auth_reset(None);
+        assert_eq!(exec(db, "CREATE TABLE u (id INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(auth_log(), [(2, "u".to_string(), String::new())]);
+        auth_reset(None);
+        assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
+        assert_eq!(auth_log(), [(22, "BEGIN".to_string(), String::new())]);
+        assert_eq!(exec(db, "COMMIT"), SQLITE_OK);
+
+        // DENY on a column read: sqlite's object-naming message.
+        auth_reset(Some((20, SQLITE_DENY)));
+        assert_eq!(exec(db, "SELECT b FROM t"), SQLITE_AUTH);
+        assert_eq!(errmsg(db), "access to t.b is prohibited");
+
+        // DENY on anything else: the generic message.
+        auth_reset(Some((18, SQLITE_DENY)));
+        assert_eq!(exec(db, "INSERT INTO t (id) VALUES (9)"), SQLITE_AUTH);
+        assert_eq!(errmsg(db), "not authorized");
+        assert_eq!(scalar_count(db, "SELECT count(*) FROM t WHERE id = 9"), 0);
+
+        // A verdict outside {OK, DENY, IGNORE} is sqlite's malfunction.
+        auth_reset(Some((21, 42)));
+        assert_eq!(exec(db, "SELECT b FROM t"), SQLITE_ERROR);
+        assert_eq!(errmsg(db), "authorizer malfunction");
+
+        // SQLITE_IGNORE means "read this column as NULL"; mpedb has no plan
+        // rewrite for that, so it refuses rather than handing back the value
+        // the callback asked to hide.
+        auth_reset(Some((20, SQLITE_IGNORE)));
+        assert_eq!(exec(db, "SELECT b FROM t"), SQLITE_ERROR);
+        assert!(errmsg(db).contains("SQLITE_IGNORE"), "{}", errmsg(db));
+        assert!(errmsg(db).contains("NULL"), "{}", errmsg(db));
+
+        // Clearing restores the ungated connection, and the callback stops
+        // being consulted at all.
+        assert_eq!(sqlite3_set_authorizer(db, ptr::null_mut(), ptr::null_mut()), SQLITE_OK);
+        auth_reset(Some((20, SQLITE_DENY)));
+        assert_eq!(exec(db, "SELECT b FROM t"), SQLITE_OK);
+        assert!(auth_log().is_empty());
+
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+/// The hidden implicit rowid (#94) must be invisible to INTROSPECTION, not
+/// just to `SELECT *`: `PRAGMA table_info` listed it and the reconstructed
+/// `sqlite_master.sql` declared it, so a consumer that rebuilds a schema or a
+/// column list from either (CPython's `iterdump`) got a column the caller
+/// never wrote — and a dump that replayed as a different table.
+#[test]
+fn introspection_hides_the_implicit_rowid() {
+    unsafe {
+        let db = open_memory();
+        // No PRIMARY KEY: the engine synthesizes a hidden rowid.
+        assert_eq!(exec(db, "CREATE TABLE \"alpha\" (\"one\")"), SQLITE_OK);
+        // With one: nothing is hidden and the PK is real.
+        assert_eq!(exec(db, "CREATE TABLE beta (id INTEGER PRIMARY KEY, v TEXT)"), SQLITE_OK);
+
+        // One row (cid 0) — the hidden rowid is not a seventh column.
+        assert_eq!(collect_text_col(db, "PRAGMA table_info(\"alpha\")"), ["0"]);
+        assert_eq!(collect_text_col(db, "PRAGMA table_info(beta)"), ["0", "1"]);
+
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'alpha'"),
+            ["CREATE TABLE \"alpha\" (\"one\")"]
+        );
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'beta'"),
+            ["CREATE TABLE \"beta\" (\"id\" INTEGER NOT NULL, \"v\" TEXT, PRIMARY KEY (\"id\"))"]
+        );
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+/// The `sqlite_master` mini-evaluator has to survive the shapes real
+/// consumers write, not just single-line ones: CPython's `iterdump` breaks its
+/// query across lines, quotes every identifier, uses `==`, and tests
+/// `"sql" NOT NULL`.
+#[test]
+fn sqlite_master_evaluator_takes_the_iterdump_query_shape() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE beta (id INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec(db, "CREATE TABLE alpha (id INTEGER PRIMARY KEY)"), SQLITE_OK);
+
+        let q = "
+        SELECT \"name\"
+        FROM \"sqlite_master\"
+            WHERE \"sql\" NOT NULL AND
+            \"type\" == 'table'
+            ORDER BY \"name\"
+        ";
+        assert_eq!(collect_text_col(db, q), ["alpha", "beta"]);
+        // Descending, and on a column other than `name`.
+        assert_eq!(
+            collect_text_col(db, "SELECT name FROM sqlite_master ORDER BY \"name\" DESC"),
+            ["beta", "alpha"]
+        );
+        // `IS NULL` is the other half of the NULL test, and matches nothing:
+        // every row this shim emits carries its DDL.
+        assert!(collect_text_col(db, "SELECT name FROM sqlite_master WHERE sql IS NULL").is_empty());
+        assert_eq!(
+            collect_text_col(db, "SELECT name FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")
+                .len(),
+            2
+        );
+        // A shape it cannot evaluate REFUSES rather than answering wrongly.
+        let s = cs("SELECT name FROM sqlite_master ORDER BY nosuchcol");
+        let mut st: *mut Stmt = ptr::null_mut();
+        let rc = sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut());
+        if rc == SQLITE_OK {
+            assert_ne!(sqlite3_step(st), SQLITE_ROW, "an unevaluable ORDER BY must not answer");
+            sqlite3_finalize(st);
+        }
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+/// A consumer could not create a TRIGGER through this API at all: the
+/// statement splitter cut the body at its first `;`, so `execute` reported
+/// "you can only execute one statement at a time". End to end, through
+/// prepare/step, including the trigger actually firing.
+#[test]
+fn a_trigger_can_be_created_and_fires() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t1 (a INTEGER PRIMARY KEY, b INTEGER)"), SQLITE_OK);
+        assert_eq!(exec(db, "CREATE TABLE t2 (a INTEGER PRIMARY KEY, b INTEGER)"), SQLITE_OK);
+
+        // No BEFORE/AFTER word: sqlite's documented default is BEFORE.
+        let ddl = "CREATE TRIGGER tr UPDATE OF b ON t1 \
+                   BEGIN UPDATE t2 SET b = new.b WHERE a = old.a; END;";
+        let s = cs(ddl);
+        let mut st: *mut Stmt = ptr::null_mut();
+        let mut tail: *const c_char = ptr::null();
+        assert_eq!(sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, &mut tail), SQLITE_OK);
+        // The whole trigger is ONE statement: nothing is left over.
+        assert!(tail.is_null() || CStr::from_ptr(tail).to_bytes().is_empty(), "tail must be empty");
+        assert_eq!(sqlite3_step(st), SQLITE_DONE);
+        assert_eq!(sqlite3_finalize(st), SQLITE_OK);
+
+        assert_eq!(exec(db, "INSERT INTO t2 (a, b) VALUES (1, 0)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t1 (a, b) VALUES (1, 0)"), SQLITE_OK);
+        assert_eq!(exec(db, "UPDATE t1 SET b = 42 WHERE a = 1"), SQLITE_OK);
+        assert_eq!(scalar_count(db, "SELECT b FROM t2 WHERE a = 1"), 42);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}

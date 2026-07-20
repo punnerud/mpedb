@@ -45,6 +45,7 @@
 #[cfg(test)]
 mod testdb;
 
+mod access;
 mod exec;
 mod multifile;
 mod policy_store;
@@ -61,6 +62,7 @@ mod tier;
 mod trigger;
 mod workspace;
 
+pub use access::{ddl_access, plan_access, Access, AccessReport, ObjectKind, TxnOp};
 pub use risk::{estimate_plan_risk, RiskEstimate};
 pub use session::Session;
 pub use shard::ShardSet;
@@ -857,6 +859,25 @@ impl Database {
     pub fn output_decltypes(&self, sql: &str) -> Result<Vec<Option<String>>> {
         let (plan, _explain) = self.compile_maybe_explain(sql)?;
         Ok(plan.output_decltypes(&self.schema()))
+    }
+
+    /// What `sql` would TOUCH, at column granularity, without running it: the
+    /// report an authorization layer, an audit log or a policy gate consults
+    /// before a statement is allowed through (see [`plan_access`]).
+    ///
+    /// Compiles through exactly the same path `prepare`/`execute` do — same
+    /// policies, views and host-UDF set — so an authorized statement and the
+    /// executed statement can never be two different plans. Any bind/plan error
+    /// surfaces here just as it would at prepare. Nothing is executed and no
+    /// plan is published.
+    pub fn access_report(&self, sql: &str) -> Result<AccessReport> {
+        // DDL compiles to no plan — the facade applies it against the catalog
+        // directly — so it is described by its parse, not by a footprint.
+        if let Some(ddl) = mpedb_sql::parse_ddl(sql)? {
+            return Ok(access::ddl_access(&ddl));
+        }
+        let (plan, _explain) = self.compile_maybe_explain(sql)?;
+        Ok(access::plan_access(&plan, &self.schema()))
     }
 
     /// Compile `sql` against an EXPLICIT schema bundle — a [`WriteSession`]'s
@@ -1753,6 +1774,19 @@ impl WriteSession<'_> {
     /// already holds the single writer lock (the ERRORCHECK mutex would turn
     /// that into an error). Prepare statements you want shared *before*
     /// opening the session.
+    /// [`Database::access_report`] against THIS session's schema view, so a
+    /// statement touching a table created earlier in the same uncommitted
+    /// transaction can still be described (#95). An authorization gate must be
+    /// able to describe every statement it lets through, including those.
+    pub fn access_report(&self, sql: &str) -> Result<AccessReport> {
+        if let Some(ddl) = mpedb_sql::parse_ddl(sql)? {
+            return Ok(access::ddl_access(&ddl));
+        }
+        let schema = self.txn.schema_bundle();
+        let (plan, _explain) = self.db.compile_maybe_explain_with_schema(sql, &schema)?;
+        Ok(access::plan_access(&plan, &schema))
+    }
+
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<ExecResult> {
         if self.poisoned {
             return Err(poisoned_err());

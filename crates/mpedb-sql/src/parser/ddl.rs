@@ -105,6 +105,54 @@ const AUTOINCREMENT_REFUSAL: &str =
      keyword); drop the keyword to use it";
 
 impl<'a> Parser<'a> {
+    /// sqlite's per-constraint conflict clause: `… ON CONFLICT {ROLLBACK |
+    /// ABORT | FAIL | IGNORE | REPLACE}`, which sets the DEFAULT resolution
+    /// used when a statement violates THIS constraint without its own
+    /// `INSERT OR …` prefix.
+    ///
+    /// mpedb's default is ABORT (statements are atomic and a violation errors),
+    /// so `ON CONFLICT ABORT` is accepted and dropped — it says exactly what
+    /// already happens. Every other action would change the outcome of a
+    /// conflicting statement (skip it, replace the row, keep a partial
+    /// statement, abort the transaction) and mpedb's schema carries no
+    /// per-constraint action to honor it with, so those refuse BY NAME rather
+    /// than being parsed and silently ignored — a swallowed `ON CONFLICT
+    /// IGNORE` turns "skipped" into "raised", which is a wrong answer.
+    ///
+    /// Returns without consuming anything when no `ON CONFLICT` follows.
+    fn conflict_clause(&mut self, what: &str) -> Result<()> {
+        // `ON`, `CONFLICT` and `ROLLBACK` are reserved keywords; the other four
+        // action words are plain identifiers.
+        if !(self.peek() == Some(&Tok::Kw(Kw::On))
+            && self.peek_at(1) == Some(&Tok::Kw(Kw::Conflict)))
+        {
+            return Ok(());
+        }
+        self.advance();
+        self.advance();
+        if self.eat_word("ABORT") {
+            return Ok(());
+        }
+        let action = match self.peek() {
+            Some(Tok::Kw(Kw::Rollback)) => "ROLLBACK",
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("FAIL") => "FAIL",
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("IGNORE") => "IGNORE",
+            Some(Tok::Ident(s)) if s.eq_ignore_ascii_case("REPLACE") => "REPLACE",
+            _ => {
+                return Err(self.err_here(
+                    "expected ROLLBACK, ABORT, FAIL, IGNORE or REPLACE after ON CONFLICT",
+                ))
+            }
+        };
+        Err(self.err_here(format!(
+            "`ON CONFLICT {action}` on {what} is not supported: mpedb's schema carries no \
+             per-constraint conflict action, and accepting it silently would resolve a \
+             conflict differently from what was written. `ON CONFLICT ABORT` (mpedb's \
+             behaviour) is accepted; otherwise write the action on the statement \
+             (`INSERT OR {action} …`)"
+        )))
+    }
+
     /// The current token as a lowercased identifier, if it is a bare Ident.
     fn peek_ident_ci(&self) -> Option<String> {
         match self.peek() {
@@ -429,10 +477,12 @@ impl<'a> Parser<'a> {
             if self.eat_kw(Kw::Not) {
                 self.expect_kw(Kw::Null, "NULL")?;
                 col.not_null = true;
+                self.conflict_clause("a NOT NULL constraint")?;
             } else if self.eat_kw(Kw::Null) {
                 col.not_null = false;
             } else if self.eat_word("UNIQUE") {
                 col.unique = true;
+                self.conflict_clause("a UNIQUE constraint")?;
             } else if self.eat_word("PRIMARY") {
                 self.expect_word("KEY")?;
                 // sqlite's `PRIMARY KEY [ASC|DESC] [AUTOINCREMENT]`. A
@@ -441,6 +491,7 @@ impl<'a> Parser<'a> {
                 // does with it.
                 let _ = self.eat_kw(Kw::Asc) || self.eat_kw(Kw::Desc);
                 col.pk = true;
+                self.conflict_clause("a PRIMARY KEY constraint")?;
                 if self.eat_word("AUTOINCREMENT") {
                     return Err(self.err_here(AUTOINCREMENT_REFUSAL));
                 }
@@ -511,8 +562,10 @@ impl<'a> Parser<'a> {
                     return Err(self.err_here("duplicate table-level PRIMARY KEY"));
                 }
                 table_pk = self.paren_ident_list()?;
+                self.conflict_clause("a PRIMARY KEY constraint")?;
             } else if self.eat_word("UNIQUE") {
                 uniques.push(self.paren_ident_list()?);
+                self.conflict_clause("a UNIQUE constraint")?;
             } else if self.eat_word("CHECK") {
                 checks.push(self.capture_paren_source()?);
             } else if self.eat_word("FOREIGN") {
@@ -756,7 +809,10 @@ impl<'a> Parser<'a> {
                 "INSTEAD OF triggers are not supported (they need updatable views)",
             ));
         } else {
-            return Err(self.err_here("expected BEFORE, AFTER, or INSTEAD OF"));
+            // sqlite's documented default when the timing word is omitted
+            // (`CREATE TRIGGER t UPDATE OF c ON tbl BEGIN … END`), and the
+            // shape CPython's own dump round-trip writes.
+            TriggerTiming::Before
         };
         let event = if self.eat_kw(Kw::Insert) {
             TriggerEvent::Insert
@@ -979,14 +1035,17 @@ impl<'a> Parser<'a> {
                 if self.eat_kw(Kw::Not) {
                     self.expect_kw(Kw::Null, "NULL")?;
                     col.not_null = true;
+                    self.conflict_clause("a NOT NULL constraint")?;
                 } else if self.eat_kw(Kw::Null) {
                     col.not_null = false;
                 } else if self.eat_word("UNIQUE") {
                     col.unique = true;
+                    self.conflict_clause("a UNIQUE constraint")?;
                 } else if self.eat_word("PRIMARY") {
                     self.expect_word("KEY")?;
                     let _ = self.eat_kw(Kw::Asc) || self.eat_kw(Kw::Desc);
                     col.pk = true;
+                    self.conflict_clause("a PRIMARY KEY constraint")?;
                     if self.eat_word("AUTOINCREMENT") {
                         return Err(self.err_here(AUTOINCREMENT_REFUSAL));
                     }

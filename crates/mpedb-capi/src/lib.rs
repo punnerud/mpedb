@@ -15,6 +15,7 @@
 //! unwinding across the C ABI (which is UB). No `unwrap` touches caller data.
 #![allow(clippy::missing_safety_doc)]
 
+mod auth;
 mod blob;
 mod consts;
 mod introspect;
@@ -22,6 +23,7 @@ mod sql;
 mod udf;
 mod valconv;
 
+pub use auth::{SQLITE_DENY, SQLITE_IGNORE};
 pub use blob::*;
 pub use consts::*;
 
@@ -114,6 +116,11 @@ pub struct Sqlite3 {
     /// connection is logically closed but kept alive for that handle, and is
     /// freed by the last `sqlite3_blob_close` (sqlite's zombie connection).
     zombie: bool,
+    /// `sqlite3_set_authorizer` registration (`auth.rs`): consulted at PREPARE
+    /// for every action the statement performs. NULL = no gate, and then no
+    /// extra compile happens at all.
+    auth_cb: *mut c_void,
+    auth_ctx: *mut c_void,
 }
 
 /// sqlite 3.45's compile-time limit defaults — both the initial value and the
@@ -314,6 +321,25 @@ fn rollback_txn(c: &mut Sqlite3) {
 /// state. Transaction-control statements are intercepted; everything else is
 /// routed to the open `WriteSession` (if any) or the autocommit facade.
 fn exec_one(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome, DbError> {
+    // `INSERT OR ROLLBACK` is the one conflict action a statement cannot carry
+    // out on its own — it aborts the enclosing TRANSACTION, and the connection
+    // is what owns that. mpedb's parser refuses it by name; the shim runs it as
+    // `OR ABORT` and rolls the connection back itself when the conflict fires
+    // (sqlite's exact definition of the action). See `sql::rewrite_insert_or_rollback`.
+    let (or_rollback_sql, or_rollback) = sql::rewrite_insert_or_rollback(sqltext);
+    if or_rollback {
+        let res = exec_one_inner(c, &or_rollback_sql, params);
+        if let Err(e) = &res {
+            if valconv::error_codes(e).0 == SQLITE_CONSTRAINT {
+                rollback_txn(c);
+            }
+        }
+        return res;
+    }
+    exec_one_inner(c, sqltext, params)
+}
+
+fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome, DbError> {
     use sql::Kind;
     // sqlite's parser skips leading comments; mpedb's does not — strip them
     // here so `-- comment\nINSERT …` (a shape CPython's suite and iterdump
@@ -964,6 +990,8 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
         readonly,
         blobs: Vec::new(),
         zombie: false,
+        auth_cb: ptr::null_mut(),
+        auth_ctx: ptr::null_mut(),
     });
     c.clear_error();
     Ok(c)
@@ -1309,6 +1337,16 @@ unsafe fn prepare_common(
         return SQLITE_ERROR;
     }
 
+    // The authorizer sees every action this statement performs, BEFORE it is
+    // accepted — sqlite consults it during prepare, and a DENY fails the
+    // prepare with SQLITE_AUTH. A no-op (and no extra compile) when none is
+    // registered. It runs on the parameter-rewritten text, which is what the
+    // engine compiles. See `auth.rs`.
+    if let Err((code, msg)) = auth::authorize(c, &scan.rewritten) {
+        c.set_error(code, code, &msg);
+        return code;
+    }
+
     // Validate compilable statements now (surface syntax/bind errors at
     // prepare, as sqlite does), WITHOUT executing or publishing a plan. Validate
     // the REWRITTEN text — mpedb's parser rejects a bare `:` — not the original.
@@ -1316,7 +1354,11 @@ unsafe fn prepare_common(
         // The engine's parser does not skip leading comments (exec_one strips
         // them at execution) — validate the same stripped text it will run.
         let to_validate = sql::strip_leading_trivia(&scan.rewritten);
-        match catch_unwind(AssertUnwindSafe(|| c.db.prepare_detached(to_validate))) {
+        // `INSERT OR ROLLBACK` is executed as `OR ABORT` plus a connection
+        // rollback (see `exec_one`), so validate the text the engine will
+        // actually be handed — the engine's parser refuses ROLLBACK by name.
+        let (to_validate, _) = sql::rewrite_insert_or_rollback(to_validate);
+        match catch_unwind(AssertUnwindSafe(|| c.db.prepare_detached(&to_validate))) {
             Ok(Ok(_plan)) => {}
             Ok(Err(e)) => return c.set_db_error(&e),
             Err(_) => {
@@ -1501,6 +1543,13 @@ pub unsafe extern "C" fn sqlite3_exec(
                 let p = Box::into_raw(tmp);
                 trace_stmt_begin(p);
                 drop(Box::from_raw(p));
+            }
+            // sqlite's exec PREPARES each statement, so the authorizer gates
+            // exec'd statements exactly as it gates the step path.
+            if let Err((code, msg)) = auth::authorize(c, first) {
+                c.set_error(code, code, &msg);
+                set_exec_errmsg(c, errmsg);
+                return code;
             }
             let outcome = catch_unwind(AssertUnwindSafe(|| exec_one(c, first, &[])));
             let outcome = match outcome {
@@ -2378,15 +2427,23 @@ pub unsafe extern "C" fn sqlite3_progress_handler(
     }
 }
 
-/// No authorization layer: accept every statement (a permissive no-op — mpedb
-/// enforces its own RLS/policies independently). Registration succeeds.
+/// Register (or, with a NULL callback, clear) the compile-time access gate.
+/// Every prepared statement's actions are then shown to `cb` before it is
+/// accepted — see `auth.rs` for the action set and the refusal rules.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_set_authorizer(
-    _db: *mut Sqlite3,
-    _cb: *mut c_void,
-    _ctx: *mut c_void,
+    db: *mut Sqlite3,
+    cb: *mut c_void,
+    ctx: *mut c_void,
 ) -> c_int {
-    SQLITE_OK
+    match conn(db) {
+        Some(c) => {
+            c.auth_cb = cb;
+            c.auth_ctx = if cb.is_null() { ptr::null_mut() } else { ctx };
+            SQLITE_OK
+        }
+        None => SQLITE_MISUSE,
+    }
 }
 
 // ---- user-defined functions (scalar + aggregate) / collations (refused) ----
