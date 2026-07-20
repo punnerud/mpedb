@@ -86,7 +86,7 @@ mode    = 0o660
 
 **The hot path stays per-member and hash-addressed.** `WsPlan` carries `{alias, hash}` so `ws.execute` knows the member without re-parsing; each member keeps its own content-hashed registry (`plan/<hash>`), and hash domains never need to be globally unique because the alias disambiguates.
 
-**Cross-member JOIN is out of scope.** The binder binds one `&TableDef`; the router handles single-alias statements only. That is the honest scaling story: more files, not a wider footprint word.
+**Cross-member JOIN through the Workspace router is out of scope** — the router handles single-alias statements only, and the honest scaling story stays: more files, not a wider footprint word. **Cross-file READ-joins shipped separately (#51)** at the `Database` layer as sqlite-compat `ATTACH DATABASE` + `SELECT … FROM main.t JOIN other.u`: connection-local attach list, a token-level resolver (`mpedb-sql/src/dbref.rs`), a throwaway merged schema whose ids a side map translates to (member, local-id), and one independent `ReadTxn` pin per involved file. Cross plans are connection-local (never published — no plan-format or footprint change), reads are per-file-consistent only, and writes/DDL touching an attached member refuse by name. See COMPAT.md's ATTACH row.
 
 ### 1.4 File permissions — born-restrictive, TOCTOU-safe, `-wal` covered
 

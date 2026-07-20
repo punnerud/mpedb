@@ -68,7 +68,7 @@ fn create_ddl(t: &mpedb::TableDef) -> String {
 // ------------------------------------------------------------------ PRAGMA
 
 /// Parse `PRAGMA <name>[(<arg>)] | <name> = <value>` into `(name, arg)`.
-fn parse_pragma(sql: &str) -> (String, Option<String>) {
+pub(crate) fn parse_pragma(sql: &str) -> (String, Option<String>) {
     // Drop the leading `pragma` keyword.
     let rest = sql.trim_start();
     let rest = &rest[rest.find(char::is_whitespace).unwrap_or(rest.len())..];
