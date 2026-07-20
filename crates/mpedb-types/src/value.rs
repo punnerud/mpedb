@@ -63,64 +63,66 @@ impl ColumnType {
     /// A **declared SQL type name** (whatever a `CREATE TABLE` wrote) → the
     /// rigid column type it becomes.
     ///
-    /// [`ColumnType::parse`] covers mpedb's own config vocabulary; this covers
-    /// everything else, which is to say sqlite's — `varchar(100)`, `bigint`,
-    /// `datetime`, `integer unsigned`, `double precision`, `decimal(10,2)`. The
-    /// rule is two steps, deliberately in this order:
+    /// [`ColumnType::parse`] covers mpedb's own config vocabulary — the RIGID
+    /// side of the product, unchanged. This covers a name arriving through
+    /// **`CREATE TABLE`**, where sqlite's affinity rule is the authority:
+    /// `varchar(100)`, `bigint`, `datetime`, `integer unsigned`, `double
+    /// precision`, `decimal(10,2)`, `blob`, `timestamp`.
     ///
-    /// 1. mpedb's own name wins ([`ColumnType::parse`] on the lowercased name).
-    ///    This is what keeps `bool`/`boolean` a real [`ColumnType::Bool`] and
-    ///    `timestamp` a real [`ColumnType::Timestamp`] — both of which sqlite's
-    ///    affinity rule flattens to NUMERIC only because sqlite has no such
-    ///    types to flatten *to*. It is also what makes this change purely
-    ///    widening: every name mpedb already accepted still means exactly what
-    ///    it meant.
-    /// 2. Otherwise sqlite's affinity rule ([`Affinity::from_type_name`]) — the
-    ///    SAME algorithm `CAST(x AS …)` uses (#83). One vocabulary, one table:
+    /// The rule is sqlite's affinity ([`Affinity::from_type_name`], the SAME
+    /// algorithm `CAST(x AS …)` uses, #83) with exactly two names carved out —
+    /// see below. One vocabulary, one table:
     ///
     ///    | affinity | example declarations                            | column type |
     ///    |----------|-------------------------------------------------|-------------|
     ///    | INTEGER  | `bigint`, `smallint`, `int(8)`, `integer unsigned` | `Int64`  |
     ///    | REAL     | `double precision`, `float`, `real`             | `Float64`   |
     ///    | TEXT     | `varchar(100)`, `char(1)`, `clob`, `text`       | `Text`      |
-    ///    | BLOB     | `blob`, `longblob`                              | `Blob`      |
-    ///    | NUMERIC  | `decimal(10,2)`, `datetime`, `date`, `numeric`, `varbinary` | `Any` |
+    ///    | BLOB     | `blob`, `longblob`, `cblob`                      | **`Any`**   |
+    ///    | NUMERIC  | `decimal(10,2)`, `datetime`, `date`, `timestamp`, `numeric`, `varbinary` | `Any` |
     ///
-    /// NUMERIC becomes [`ColumnType::Any`] because it is the one affinity that
-    /// is not a single storage class: sqlite stores an integer, a real OR a
-    /// string in such a column depending on the value, so `Any` — mpedb's
-    /// per-value column — is the only faithful target. That is also what lets
-    /// `date`/`datetime` (NUMERIC affinity, but written as ISO *strings* by
-    /// every ORM) hold their strings.
+    /// **NUMERIC and BLOB both become [`ColumnType::Any`]**, for the same
+    /// reason and with opposite conversion rules (which is why the affinity
+    /// must be carried alongside — [`ColumnType::declared`]): neither is a
+    /// single storage class. A NUMERIC column holds an integer, a real OR a
+    /// string depending on the value; a BLOB-affinity column converts NOTHING
+    /// and holds whatever class was handed to it. `UPDATE t SET b='aaaa'` on a
+    /// `b blob` column stores the four bytes as **TEXT** in sqlite —
+    /// `typeof(b)` really is `'text'` — so a rigid `Blob` column is not a
+    /// narrower sqlite, it is a different one (task #113).
     ///
-    /// The other four are rigid, which is narrower than sqlite: sqlite converts
-    /// per its affinity at store time and keeps the value in whatever class
-    /// survives, where mpedb refuses a value of the wrong type. That is a clean
-    /// refusal, never a different answer — and it is the same rigidity a
-    /// config-declared `type = "int64"` column has always had.
+    /// INTEGER/REAL/TEXT stay RIGID, which is narrower than sqlite: the
+    /// column's affinity is APPLIED on the way in (`'12'` → `12` in an
+    /// `int` column, `55` → `'55'` in a `varchar`, exactly sqlite), and a value
+    /// the conversion cannot land inside the rigid type is REFUSED where sqlite
+    /// would have kept the original class. That is a clean refusal, never a
+    /// different answer. See [`crate::schema::ColumnDef::converts_on_store`].
+    ///
+    /// The two carve-outs, both names sqlite's rule sends to the default
+    /// NUMERIC and mpedb spells for a type sqlite cannot express:
+    /// * `bool`/`boolean` → [`ColumnType::Bool`]. Every consumer that writes
+    ///   one writes `sqlite3_bind_int` 0/1, which the int/bool bridge converts
+    ///   exactly, so the rigid type receives the values it is handed.
+    /// * `any` → [`ColumnType::Any`] with BLOB affinity: mpedb's own escape
+    ///   hatch has always meant *verbatim*, and NUMERIC would convert.
+    ///
+    /// `timestamp` used to be a third carve-out and is NOT one any more: SQL has
+    /// no timestamp literal and the C API has no `sqlite3_bind_timestamp`, so a
+    /// rigid `Timestamp` column created by `CREATE TABLE` was a column no SQL
+    /// value could be written to — every consumer (CPython's `PARSE_DECLTYPES`
+    /// above all) sends an ISO *string*, which sqlite stores. A config-declared
+    /// `type = "timestamp"` is untouched: it goes through [`ColumnType::parse`].
     ///
     /// An EMPTY name is `Any`, not the `Numeric` this rule returns for a `CAST`:
     /// a column with NO declared type is sqlite's no-affinity column, which
-    /// converts nothing — exactly `Any`.
+    /// converts nothing — exactly `Any` + BLOB affinity.
     ///
-    /// **This function alone loses the NUMERIC/no-type distinction** — both land
-    /// on `Any`, and sqlite treats them OPPOSITELY at store time. Use
-    /// [`ColumnType::declared`], which returns the [`Affinity`] alongside.
+    /// **This function alone loses the NUMERIC/no-conversion distinction** —
+    /// `decimal(10,2)`, `blob` and no type at all all land on `Any`, and sqlite
+    /// treats them OPPOSITELY at store time. Use [`ColumnType::declared`], which
+    /// returns the [`Affinity`] alongside.
     pub fn from_declared(name: &str) -> ColumnType {
-        let lower = name.trim().to_ascii_lowercase();
-        if lower.is_empty() {
-            return ColumnType::Any;
-        }
-        if let Some(t) = ColumnType::parse(&lower) {
-            return t;
-        }
-        match Affinity::from_type_name(&lower) {
-            Affinity::Integer => ColumnType::Int64,
-            Affinity::Real => ColumnType::Float64,
-            Affinity::Text => ColumnType::Text,
-            Affinity::Blob => ColumnType::Blob,
-            Affinity::Numeric => ColumnType::Any,
-        }
+        ColumnType::declared(name).0
     }
 
     /// A **declared SQL type name** → the pair a column definition needs: the
@@ -138,37 +140,40 @@ impl ColumnType {
     ///
     /// so `Any` alone cannot say which one a column is. The affinity says.
     ///
-    /// The rule, in the same order as [`ColumnType::from_declared`]:
+    /// The rule:
     /// 1. an EMPTY name is sqlite's no-affinity column → (`Any`, `Blob`);
-    /// 2. one of mpedb's OWN config words (`int64`, `bool`, `any`, …) keeps its
-    ///    meaning — including `any`, which has always meant *verbatim* here, so
-    ///    it stays `Blob`. d45ad77's promise that no name already accepted
-    ///    changes meaning covers the affinity too;
-    /// 3. otherwise sqlite's affinity of the name, which is `Numeric` exactly
-    ///    when [`ColumnType::from_declared`] chose `Any`.
+    /// 2. the two carve-outs named in [`ColumnType::from_declared`] —
+    ///    `bool`/`boolean` and `any`;
+    /// 3. otherwise sqlite's affinity of the name, mapped to the storage type
+    ///    that can hold what that affinity produces.
     ///
-    /// For every rigid type the affinity is [`Affinity::implied_by`] its
-    /// storage type — mpedb REFUSES a mismatched value there rather than
-    /// converting it (a narrowing, never a different answer), so recording
-    /// anything else would be recording a rule that is not applied.
+    /// For the three RIGID affinities (INTEGER/REAL/TEXT) the affinity recorded
+    /// is the real sqlite one, and it IS applied on the way in — the conversion
+    /// runs first and the rigid type then refuses whatever it could not land
+    /// inside. `Affinity::implied_by` agrees with sqlite's rule on all three by
+    /// construction, so the field never contradicts `ty`.
     pub fn declared(name: &str) -> (ColumnType, Affinity) {
         let lower = name.trim().to_ascii_lowercase();
         if lower.is_empty() {
             return (ColumnType::Any, Affinity::Blob);
         }
-        if let Some(t) = ColumnType::parse(&lower) {
-            return (t, Affinity::implied_by(t));
+        // The two carve-outs (see `from_declared`): a name whose sqlite
+        // affinity is the default NUMERIC and which mpedb spells for a type
+        // sqlite has no way to express.
+        match lower.as_str() {
+            "bool" | "boolean" => return (ColumnType::Bool, Affinity::implied_by(ColumnType::Bool)),
+            "any" => return (ColumnType::Any, Affinity::Blob),
+            _ => {}
         }
-        let ty = ColumnType::from_declared(&lower);
-        let aff = match Affinity::declared(&lower) {
-            Affinity::Numeric => Affinity::Numeric,
-            // The other four affinities each map onto a RIGID mpedb type, which
-            // enforces rather than converts — so the affinity that column
-            // actually has is the one its type implies, and they agree here by
-            // construction.
-            _ => Affinity::implied_by(ty),
-        };
-        (ty, aff)
+        match Affinity::declared(&lower) {
+            Affinity::Integer => (ColumnType::Int64, Affinity::Integer),
+            Affinity::Real => (ColumnType::Float64, Affinity::Real),
+            Affinity::Text => (ColumnType::Text, Affinity::Text),
+            // sqlite's BLOB (historically NONE) affinity converts nothing and
+            // holds every class — the typeless column, which is `Any`.
+            Affinity::Blob => (ColumnType::Any, Affinity::Blob),
+            Affinity::Numeric => (ColumnType::Any, Affinity::Numeric),
+        }
     }
 
     pub fn name(self) -> &'static str {
@@ -973,16 +978,22 @@ mod tests {
     #[test]
     fn declared_type_names_map_by_affinity() {
         for (decl, want) in [
-            // mpedb's own vocabulary keeps its meaning (step 1).
+            // mpedb's own vocabulary, where sqlite's affinity rule agrees.
             ("int64", ColumnType::Int64),
             ("INTEGER", ColumnType::Int64),
             ("real", ColumnType::Float64),
+            ("text", ColumnType::Text),
+            // The two carve-outs.
             ("bool", ColumnType::Bool),
             ("BOOLEAN", ColumnType::Bool),
-            ("timestamp", ColumnType::Timestamp),
-            ("text", ColumnType::Text),
-            ("blob", ColumnType::Blob),
             ("any", ColumnType::Any),
+            // …and the names where sqlite's rule now wins (task #113): a
+            // BLOB-affinity column converts nothing and a `timestamp` is
+            // NUMERIC, so both are the per-value column.
+            ("timestamp", ColumnType::Any),
+            ("blob", ColumnType::Any),
+            ("bytes", ColumnType::Any),
+            ("string", ColumnType::Any),
             // INTEGER affinity (step 2).
             ("bigint", ColumnType::Int64),
             ("smallint", ColumnType::Int64),
@@ -1004,8 +1015,10 @@ mod tests {
             ("nchar(55)", ColumnType::Text),
             ("clob", ColumnType::Text),
             ("native character(70)", ColumnType::Text),
-            // BLOB affinity — only a name literally containing `blob`.
-            ("longblob", ColumnType::Blob),
+            // BLOB affinity — only a name literally containing `blob`; the
+            // typeless column, which converts nothing.
+            ("longblob", ColumnType::Any),
+            ("cblob", ColumnType::Any),
             // NUMERIC affinity → the per-value column. (`varbinary` really is
             // NUMERIC in sqlite: the BLOB rule is a `blob` substring, nothing
             // else.)
@@ -1023,15 +1036,28 @@ mod tests {
         }
     }
 
-    /// `from_declared` must never NARROW an existing config name: whatever
-    /// `parse` accepts, `from_declared` agrees with.
+    /// The DDL path and the CONFIG path are deliberately different vocabularies
+    /// (task #113). `parse` is the rigid product; `from_declared` is sqlite.
+    /// They agree everywhere sqlite's affinity rule agrees, and the exact set
+    /// where they differ is pinned here so a future widening cannot soften a
+    /// config-declared column by accident.
     #[test]
-    fn from_declared_agrees_with_parse_on_every_config_name() {
+    fn from_declared_differs_from_parse_only_on_the_named_sqlite_affinity_words() {
         for name in [
             "int64", "int", "integer", "float64", "float", "real", "double", "bool", "boolean",
-            "text", "string", "blob", "bytes", "timestamp", "any",
+            "text", "any",
         ] {
-            assert_eq!(ColumnType::from_declared(name), ColumnType::parse(name).unwrap());
+            assert_eq!(
+                ColumnType::from_declared(name),
+                ColumnType::parse(name).unwrap(),
+                "`{name}` must mean the same thing in a config and in a CREATE TABLE"
+            );
+        }
+        // sqlite's rule wins for these: BLOB affinity converts nothing and is
+        // per-value; `timestamp`/`string`/`bytes` are NUMERIC affinity.
+        for name in ["blob", "bytes", "timestamp", "string"] {
+            assert_eq!(ColumnType::from_declared(name), ColumnType::Any, "`{name}`");
+            assert_ne!(ColumnType::parse(name).unwrap(), ColumnType::Any, "`{name}`");
         }
     }
 
@@ -1064,23 +1090,31 @@ mod affinity_tests {
         // same storage type.
         assert_eq!(ColumnType::declared(""), (ColumnType::Any, Affinity::Blob));
         assert_eq!(ColumnType::declared("  "), (ColumnType::Any, Affinity::Blob));
-        // mpedb's own words keep their meaning, `any` included (verbatim).
+        // The carve-outs, plus a name sqlite's rule already agrees with.
         assert_eq!(ColumnType::declared("any"), (ColumnType::Any, Affinity::Blob));
-        assert_eq!(ColumnType::declared("int64"), (ColumnType::Int64, Affinity::Integer));
         assert_eq!(ColumnType::declared("bool"), (ColumnType::Bool, Affinity::Integer));
+        assert_eq!(ColumnType::declared("int64"), (ColumnType::Int64, Affinity::Integer));
+        // `timestamp` is NUMERIC affinity like `datetime` (#113) — SQL has no
+        // timestamp literal, so a rigid one here was unwritable.
         assert_eq!(
             ColumnType::declared("timestamp"),
-            (ColumnType::Timestamp, Affinity::Integer)
+            (ColumnType::Any, Affinity::Numeric)
         );
-        // The rigid four: the affinity is always the one the type implies.
+        // BLOB affinity is the THIRD behaviour under `Any`: converts nothing,
+        // and unlike the no-type column it is a name a consumer wrote.
+        for n in ["blob", "longblob", "cblob"] {
+            assert_eq!(ColumnType::declared(n), (ColumnType::Any, Affinity::Blob), "{n}");
+        }
+        // The rigid three: the affinity is sqlite's, and it agrees with the one
+        // the type implies.
         for (n, t) in [
             ("bigint", ColumnType::Int64),
             ("double precision", ColumnType::Float64),
             ("varchar(100)", ColumnType::Text),
-            ("blob", ColumnType::Blob),
         ] {
             let (ty, aff) = ColumnType::declared(n);
             assert_eq!((ty, aff), (t, Affinity::implied_by(t)), "{n}");
+            assert_eq!(aff, Affinity::from_type_name(n), "{n}");
         }
     }
 
