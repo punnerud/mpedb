@@ -180,12 +180,13 @@ SCRIPT = [
     ("SELECT 1 WHERE 'abcd' REGEXP ?", ("bc",)),
     ("SELECT 1 WHERE 'abcd' REGEXP ?", ("^bc",)),
     ("SELECT 1 WHERE 'ABCD' REGEXP ?", ("bc",)),
-    # W3 (open): mpedb's engine intercepts REGEXP with its own dialect instead
-    # of calling the consumer's registered regexp() UDF, and a pattern outside
-    # that dialect MATCHES NOTHING instead of erroring. Inline flags and
-    # backreferences are valid Python/PCRE patterns that Django relies on
-    # (`__iregex` prepends `(?i)`), so these two lines are silent wrong answers
-    # until the engine dispatches REGEXP to a registered host UDF.
+    # W3 (CLOSED 2026-07-20, #108): mpedb's engine used to intercept REGEXP
+    # with its own dialect instead of calling the consumer's registered
+    # regexp() UDF, and a pattern outside that dialect matched NOTHING —
+    # inline flags and backreferences are valid Python/PCRE patterns Django
+    # relies on (`__iregex` prepends `(?i)`), so these two lines were silent
+    # wrong answers. The operator now dispatches to the registered host UDF
+    # (sqlite's contract), so both lines answer [(1,)] in both arms.
     ("SELECT 1 WHERE 'hey-Foo' REGEXP ?", ("(?i)fo+",)),
     ("SELECT 1 WHERE 'barfoobaz' REGEXP ?", (r"b(.).*b\1",)),
     "SELECT 1 WHERE 'a%b' LIKE 'a\\%b' ESCAPE '\\'",

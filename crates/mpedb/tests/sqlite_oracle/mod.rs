@@ -41,8 +41,11 @@
 //!
 //! NOT covered: the `regexp()` function, which lives in the sqlite SHELL
 //! (ext/misc/regexp.c compiled into the CLI), not in the library —
-//! `regexp.rs` therefore still drives the real CLI and is the one deliberate
-//! exemption.
+//! `regexp.rs`'s NATIVE-dialect battery therefore still drives the real CLI
+//! and is the one deliberate exemption. Its HOST-dispatch tests (task #108)
+//! are NOT exempt: they register the same Rust closure as `regexp()` on both
+//! engines via [`script_stdout_with`], so the operator's dispatch semantics
+//! differential through the bundled library like everything else.
 
 #![allow(dead_code)] // each test binary uses the subset it needs
 
@@ -105,15 +108,54 @@ pub fn script_stdout_headers(script: &str, nullvalue: &str) -> String {
     }
 }
 
+/// Like [`script_stdout`], but hands the freshly opened oracle connection to
+/// `setup` before the script runs — for registering host UDFs on it
+/// (`rusqlite::Connection::create_scalar_function`), which is exactly the
+/// consumer contract behind sqlite's `x REGEXP y`: the operator is pure sugar
+/// for the consumer's registered `regexp(pattern, text)`, and the bare LIBRARY
+/// has no `regexp()` of its own (it lives in the shell, `ext/misc/regexp.c`).
+/// With the same closure registered on both engines, REGEXP dispatch is
+/// differential-testable through the bundled library like everything else.
+pub fn script_stdout_with(
+    script: &str,
+    nullvalue: &str,
+    setup: impl FnOnce(&Connection),
+) -> String {
+    let conn = open_oracle();
+    setup(&conn);
+    match run_on(&conn, script, nullvalue, false, false) {
+        Ok(out) => out,
+        Err(e) => panic!(
+            "bundled sqlite ({}) failed: {e}\nscript:\n{script}",
+            version()
+        ),
+    }
+}
+
 fn run_script(script: &str, nullvalue: &str, lenient: bool) -> Result<String, String> {
     run(script, nullvalue, lenient, false)
 }
 
-fn run(script: &str, nullvalue: &str, lenient: bool, headers: bool) -> Result<String, String> {
+fn open_oracle() -> Connection {
     let conn = Connection::open_in_memory().expect("open in-memory bundled sqlite");
     // Stock-sqlite default (see module docs); the bundled build flips it.
     conn.pragma_update(None, "foreign_keys", false)
         .expect("PRAGMA foreign_keys = OFF");
+    conn
+}
+
+fn run(script: &str, nullvalue: &str, lenient: bool, headers: bool) -> Result<String, String> {
+    let conn = open_oracle();
+    run_on(&conn, script, nullvalue, lenient, headers)
+}
+
+fn run_on(
+    conn: &Connection,
+    script: &str,
+    nullvalue: &str,
+    lenient: bool,
+    headers: bool,
+) -> Result<String, String> {
     // sqlite's own REAL→TEXT conversion — the same code path the CLI's
     // sqlite3_column_text output goes through.
     let mut caster = conn
@@ -121,7 +163,7 @@ fn run(script: &str, nullvalue: &str, lenient: bool, headers: bool) -> Result<St
         .expect("prepare the REAL→TEXT caster");
 
     let mut out = String::new();
-    let mut batch = rusqlite::Batch::new(&conn, script);
+    let mut batch = rusqlite::Batch::new(conn, script);
     loop {
         let mut stmt = match batch.next() {
             Ok(Some(stmt)) => stmt,

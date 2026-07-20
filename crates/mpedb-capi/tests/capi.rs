@@ -839,6 +839,125 @@ fn create_function_scalar_dispatch() {
     }
 }
 
+/// Read one UDF argument as UTF-8 text via `sqlite3_value_text`/`_bytes`.
+unsafe fn value_string(v: *mut c_void) -> String {
+    let p = sqlite3_value_text(v);
+    let n = sqlite3_value_bytes(v);
+    String::from_utf8_lossy(std::slice::from_raw_parts(p, n as usize)).into_owned()
+}
+
+/// The consumer's `regexp(pattern, text)` for the operator-dispatch test —
+/// a stand-in for Django's `_sqlite_regexp`: a NULL argument yields NULL,
+/// a `(?i)` prefix means case-insensitive, and the rest of the pattern is a
+/// LITERAL substring (no metacharacters). The argument order is sqlite's for
+/// the operator: `x REGEXP y` = `regexp(y, x)`, pattern FIRST.
+unsafe extern "C" fn udf_regexp(ctx: *mut c_void, argc: c_int, argv: *mut *mut c_void) {
+    assert_eq!(argc, 2);
+    if sqlite3_value_type(*argv) == SQLITE_NULL
+        || sqlite3_value_type(*argv.offset(1)) == SQLITE_NULL
+    {
+        sqlite3_result_null(ctx);
+        return;
+    }
+    let pattern = value_string(*argv);
+    let subject = value_string(*argv.offset(1));
+    let hit = match pattern.strip_prefix("(?i)") {
+        Some(p) => subject.to_lowercase().contains(&p.to_lowercase()),
+        None => subject.contains(&pattern),
+    };
+    sqlite3_result_int64(ctx, hit as i64);
+}
+
+/// `x REGEXP y` has NO built-in meaning in real sqlite: it desugars to
+/// `regexp(y, x)` and works only through the consumer's registered function.
+/// The shim must dispatch the operator to the connection's `create_function`
+/// `regexp/2` the same way — argument order included — which is what makes
+/// Django's `__regex`/`__iregex` (always a bound, `(?i)`-prefixed pattern)
+/// answer rows instead of tripping mpedb's native dialect (W3).
+#[test]
+fn regexp_operator_dispatches_to_registered_udf() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(
+            exec(db, "CREATE TABLE t (id INTEGER PRIMARY KEY, h TEXT)"),
+            SQLITE_OK
+        );
+        assert_eq!(
+            exec(
+                db,
+                "INSERT INTO t (id, h) VALUES (1,'hey-Foo'),(2,'foo'),(3,'bar'),(4,NULL)"
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(
+            sqlite3_create_function(
+                db,
+                cs("regexp").as_ptr(),
+                2,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                fnptr(udf_regexp),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+
+        // The `__iregex` shape: the pattern BOUND, `(?i)`-prefixed. Stock
+        // sqlite + this udf answers rows 1 and 2 ('hey-Foo', 'foo'); the
+        // native dialect would have refused the pattern.
+        let mut q: *mut Stmt = ptr::null_mut();
+        let qs = cs("SELECT id FROM t WHERE h REGEXP ? ORDER BY id");
+        assert_eq!(
+            sqlite3_prepare_v2(db, qs.as_ptr(), -1, &mut q, ptr::null_mut()),
+            SQLITE_OK
+        );
+        let pat = cs("(?i)fo");
+        assert_eq!(
+            sqlite3_bind_text(q, 1, pat.as_ptr(), -1, sqlite_transient()),
+            SQLITE_OK
+        );
+        let mut got = Vec::new();
+        while sqlite3_step(q) == SQLITE_ROW {
+            got.push(sqlite3_column_int64(q, 0));
+        }
+        assert_eq!(got, vec![1, 2], "host regexp must own the operator");
+        sqlite3_finalize(q);
+
+        // Argument order / precedence probe: `.` is LITERAL in this udf's
+        // dialect, so 'o.' matches nothing — the native NFA (o + any char)
+        // would have answered 2. And NOT REGEXP is 3VL: the NULL row passes
+        // neither predicate.
+        assert_eq!(scalar_count(db, "SELECT count(*) FROM t WHERE h REGEXP 'o.'"), 0);
+        assert_eq!(
+            scalar_count(db, "SELECT count(*) FROM t WHERE h NOT REGEXP '(?i)fo'"),
+            1,
+            "only 'bar'; the NULL row is NULL under NOT too"
+        );
+
+        // In the projection the raw UDF result flows out (this udf returns
+        // ints), and the NULL row propagates NULL.
+        let mut p: *mut Stmt = ptr::null_mut();
+        let ps = cs("SELECT h REGEXP '(?i)FOO' FROM t ORDER BY id");
+        assert_eq!(
+            sqlite3_prepare_v2(db, ps.as_ptr(), -1, &mut p, ptr::null_mut()),
+            SQLITE_OK
+        );
+        let mut vals = Vec::new();
+        while sqlite3_step(p) == SQLITE_ROW {
+            vals.push(if sqlite3_column_type(p, 0) == SQLITE_NULL {
+                None
+            } else {
+                Some(sqlite3_column_int64(p, 0))
+            });
+        }
+        assert_eq!(vals, vec![Some(1), Some(1), Some(0), None]);
+        sqlite3_finalize(p);
+
+        sqlite3_close(db);
+    }
+}
+
 // ---- host AGGREGATE UDFs (design/DESIGN-UDF.md stage 2) --------------------
 
 /// The struct `mysum`'s `xStep`/`xFinal` keep in the aggregate context. Zeroed
