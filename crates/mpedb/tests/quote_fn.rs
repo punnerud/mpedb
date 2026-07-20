@@ -230,6 +230,20 @@ fn quote_float_sweep_is_exact_or_a_refusal_of_the_unportable_branch() {
                     refused += 1;
                     let msg = e.to_string();
                     assert!(msg.contains("15 significant digits"), "message: {msg}");
+                    // The strict converse — "a refusal implies the LOCAL
+                    // rendering needs >15 digits" — is only sound on the
+                    // build the refusal set was calibrated against. The whole
+                    // reason these reals are refused is that sqlite's
+                    // rendering of them is BUILD-DEPENDENT, and that cannot
+                    // be judged from one machine: measured, the same double
+                    // renders as `2.0e+300` (bundled 3.45.0/arm64),
+                    // `1.999999999999999807e+300` (3.45.1/x86_64) and
+                    // `1.999999999999999315e+300` (3.51/arm64). A refusal
+                    // that looks over-conservative locally may be exactly
+                    // right globally — so the strict check runs only where
+                    // it was calibrated; elsewhere a refusal is accepted
+                    // (a refusal is never a wrong answer).
+                    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
                     assert!(
                         sig_digits(w) > 15,
                         "mpedb refused quote({v:?}) but sqlite's `{w}` needs only {} digits — \
