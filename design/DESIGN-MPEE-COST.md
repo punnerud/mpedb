@@ -15,6 +15,17 @@ plugs into that seam without changing the solver: §5's determinism argument is
 exactly the resolution the solver shipped with, and DESIGN-MPEE-SOLVER.md §9
 names the four measurements this catalog should persist first.
 
+**Update 2026-07-20 (#117) — the key is the PLAN HASH, measured.**
+[FOOTPRINT-INDEX-MEASURED.md](FOOTPRINT-INDEX-MEASURED.md) censused the real corpus:
+94,689 compiled statements → **81,036 distinct plans → 119 distinct footprints → 22
+distinct table sets** (681 plans/footprint, 3,683 plans/table set; the footprint refines the
+table set 5.41×). So a shape key pools plenty — but the plans it pools have wildly unlike
+costs: the across-plan spread inside one footprint bucket is 20–52× the irreducible
+within-plan spread, and the worst/best plan in a bucket differs by a median **217×**. **Key
+§1's catalog on the plan hash; use the footprint only as a coarse index (which plans touch
+table T) and for invalidation.** The same measurement returns don't-build verdicts for a
+footprint conflict index, for memoized routing, and for delta-compressing `TableSet`.
+
 ## 0. Beyond `row_count`
 
 MPEE prices plans today with exact `row_count` (transactionally exact, a real advantage). Richer, and
