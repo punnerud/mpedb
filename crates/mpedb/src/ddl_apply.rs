@@ -14,17 +14,30 @@ use super::*;
 
 /// Sys-keyspace prefix for a stored view: `view/<name>` → its SELECT source.
 pub(crate) const VIEW_PREFIX: &[u8] = b"view/";
+/// Exclusive upper bound for a `sys_scan_range` over the whole view family:
+/// `/` is 0x2f, so 0x30 is the first subkey past every `view/…` entry (#124).
+pub(crate) const VIEW_PREFIX_END: &[u8] = b"view0";
 
 impl Database {
     /// Load every stored view (`view/<name>` → SELECT source) into a catalog.
     /// Cheap when there are none. Cached by the facade behind the schema-gen
     /// gate — views change only on a DDL commit, which bumps `schema_gen`.
+    ///
+    /// **Prefix-bounded, never a whole-keyspace scan (#124).** This runs on
+    /// EVERY compile, and the sys keyspace it shares is where the plan registry
+    /// lives — up to `MAX_REGISTRY_PLANS` records carrying full SQL text plus an
+    /// encoded plan blob each. Scanning the whole region and filtering made
+    /// compilation cost O(bytes ever registered): 297 B held and 0.24 µs per
+    /// previously-registered plan, i.e. a 1.2 MB / 1.0 ms compile on a database
+    /// with a full registry, for a statement that touches none of it.
     pub(crate) fn load_view_catalog(&self) -> Result<mpedb_sql::ViewCatalog> {
         let mut cat = mpedb_sql::ViewCatalog::new();
         let r = self.engine.begin_read()?;
-        let scan = r.sys_scan();
+        let scan = r.sys_scan_range(VIEW_PREFIX, VIEW_PREFIX_END);
         r.finish()?;
         for (subkey, value) in scan? {
+            // The range is already `view/…`-only; strip_prefix stays as the
+            // authority on the bound rather than trusting it.
             if let Some(name) = subkey.strip_prefix(VIEW_PREFIX) {
                 let name = String::from_utf8_lossy(name).into_owned();
                 let src = String::from_utf8_lossy(&value).into_owned();

@@ -354,12 +354,18 @@ fn open(rows: usize) -> Tmp {
 /// DISTINCT statement text (the literals differ), so every chunk **published a
 /// distinct plan to the shared registry** — 200 plans of ~74 KB each for a
 /// 100 k-row load, because a 500-row literal `VALUES` plan carries 3000
-/// constants. `compile_maybe_explain` then does two full `sys_scan`s (policies
+/// constants. `compile_maybe_explain` then did two full `sys_scan`s (policies
 /// and views), and the registry lives in that same sys keyspace — so every
 /// later compile materialised all 14.9 MB of them. It looked exactly like
 /// "compiling a PK point lookup costs 149 bytes per row of the table", which is
 /// false. `WriteSession::query` compiles into the local cache and never
 /// publishes, so the registry stays empty and the shapes measure themselves.
+///
+/// **That scan is gone (#124: those loads are prefix-bounded now, and
+/// publication reads a counter instead of ranking the registry), so the loader
+/// choice no longer changes any number here.** It stays a `WriteSession`
+/// anyway: it is faster, and a fixture that cannot contaminate the measurement
+/// is worth more than one that merely does not today.
 /// (The underlying effect is real and is measured on its own by the `registry`
 /// shape — it is just not proportional to table rows.)
 fn load_chunks(db: &Database, rows: usize, mut sql: impl FnMut(usize, usize) -> String) {
@@ -486,11 +492,12 @@ fn fixture(shape: &str, rows: usize) -> (Tmp, String) {
         "blob_streamed" => String::new(),
         // Not a query shape — a property of COMPILATION. Publish `rows`
         // distinct plans to the shared registry, then measure what compiling
-        // ONE trivial statement costs afterwards. `compile_maybe_explain` runs
-        // two full `sys_scan`s and the registry lives in the sys keyspace, so
-        // the answer is O(bytes ever registered) and is paid by every
-        // `Database::query` and every `prepare` for the life of the file.
-        // Run it with `MEM_VIA=compile`.
+        // ONE trivial statement costs afterwards. This used to be O(bytes ever
+        // registered) — 297 B held and 0.24 µs per previously-registered plan —
+        // because `compile_maybe_explain` ran two full `sys_scan`s and the
+        // registry lives in that keyspace. #124 made both loads prefix-bounded;
+        // this shape now reads ~3.1 KB at rows=4096, flat in `rows`. See
+        // `examples/registry_cost` for the sweep. Run it with `MEM_VIA=compile`.
         "registry" => {
             for k in 0..rows {
                 t.db.prepare(&format!("SELECT id FROM src WHERE id = {k}")).unwrap();
@@ -538,10 +545,17 @@ fn main() {
     // **Prepare outside the window, then measure `execute(hash, params)`** —
     // the documented hot path, "zero parsing". This is not a nicety: the first
     // draft measured `Database::query(sql, …)`, which recompiles the SQL and
-    // re-`register`s the plan on every call, and that path is itself O(table).
-    // A bare `WHERE id = 1` PK point lookup measured **149 bytes per row of the
-    // whole table** through `query` and ~0 through `execute`. Left in, it would
-    // have put a false linear floor under every shape in this file.
+    // re-`register`s the plan on every call. A bare `WHERE id = 1` PK point
+    // lookup measured **149 bytes per row of the whole table** through `query`
+    // and ~0 through `execute`. Left in, it would have put a false linear floor
+    // under every shape in this file.
+    //
+    // The slope was never O(table): it was O(registry), because this file's own
+    // loader published one plan per 500-row chunk (see `load_chunks`) and
+    // compilation scanned the whole sys keyspace. #124 removed the scan and the
+    // slope with it. `execute(hash, params)` is still what belongs in the
+    // window — it is the documented hot path — but that is now a statement
+    // about which API is being profiled, not a workaround.
     let streamed_blob = shape == "blob_streamed";
     let hash = if streamed_blob {
         // No SQL: `insert_streaming` is a typed engine call, not a plan.

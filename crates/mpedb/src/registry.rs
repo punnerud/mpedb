@@ -22,6 +22,14 @@ use mpedb_sql::CompiledPlan;
 use mpedb_types::{Error, PlanHash, Result, Schema};
 
 pub(crate) const PLAN_PREFIX: &[u8] = b"plan/";
+/// Exclusive upper bound for a `sys_scan_range` over the whole plan family:
+/// `/` is 0x2f, so 0x30 is the first subkey past every `plan/…` entry.
+pub(crate) const PLAN_PREFIX_END: &[u8] = b"plan0";
+
+/// Sys subkey of the registry's entry counter (u64 LE) — see [`make_room`].
+/// Deliberately OUTSIDE `[plan/, plan0)`: `n` (0x6e) sorts above `0` (0x30), so
+/// the family walk never sees it and eviction can never delete it.
+pub(crate) const PLAN_COUNT_KEY: &[u8] = b"plancount";
 
 /// Registry capacity: at most this many plans are kept in the database.
 pub(crate) const MAX_REGISTRY_PLANS: usize = 4096;
@@ -135,11 +143,16 @@ pub(crate) fn insert_plan(
             return Ok(false); // already published with identical content
         }
     }
-    if existing.is_none() {
-        evict_if_full(txn)?;
-    }
     let record = encode_record(sql, blob, txn.meta.txn_id + 1);
+    if existing.is_some() {
+        // Overwrite in place: the entry count does not move, so neither the
+        // eviction check nor the counter has anything to do.
+        txn.sys_put(&subkey, &record)?;
+        return Ok(true);
+    }
+    let live = make_room(txn)?;
     txn.sys_put(&subkey, &record)?;
+    txn.sys_put(PLAN_COUNT_KEY, &(live + 1).to_le_bytes())?;
     Ok(true)
 }
 
@@ -159,9 +172,65 @@ pub(crate) fn insert_plan(
 /// caller heals with a re-`prepare`. Eviction must therefore tolerate
 /// entries whose `last_used_txn` was never bumped after insertion (they sort
 /// by insert time, which is always valid).
-fn evict_if_full(txn: &mut WriteTxn<'_>) -> Result<()> {
+/// Make room for one more entry and return the live `plan/` count the caller's
+/// insert will add to.
+///
+/// **The counter is what keeps `prepare` off the O(registry) path (#124).**
+/// Ranking every entry costs one full walk of the plan family — measured at
+/// 1.2 MB held and ~540 µs on a full 4096-entry registry — and it used to run
+/// on the publication of EVERY statement text never seen before. `plancount`
+/// turns the common case into one 8-byte read: below the cap there is nothing
+/// to rank, so there is nothing to read but the count.
+///
+/// **What invalidates it: nothing, because it is not a cache.** It is a derived
+/// aggregate written in the SAME COW commit as the insert or the eviction that
+/// moves it, so it flips atomically with them and a crash or an abort takes
+/// both or neither. `insert_plan` and this function are the only writers of a
+/// `plan/…` key in the codebase (`sys_record_put`'s namespace keys are
+/// `<ns>\0<key>` and provably cannot collide — there is a regression test).
+///
+/// **It is still treated as untrusted shared memory.** Absent, malformed, or
+/// at/above the cap all fall through to the authoritative walk, which recounts
+/// from the tree and returns the truth — so a counter that reads HIGH self-heals
+/// on its next use. A counter forced LOW by a hostile write only delays
+/// eviction, and eviction is hygiene, not correctness: the cap bounds registry
+/// bytes, and anyone able to forge the counter can forge plan records outright.
+fn make_room(txn: &mut WriteTxn<'_>) -> Result<u64> {
+    if let Some(n) = txn
+        .sys_get(PLAN_COUNT_KEY)?
+        .and_then(|v| <[u8; 8]>::try_from(v.as_slice()).ok())
+        .map(u64::from_le_bytes)
+    {
+        if n < MAX_REGISTRY_PLANS as u64 {
+            return Ok(n);
+        }
+    }
+    evict_if_full(txn)
+}
+
+/// Registry hygiene: when the registry holds `MAX_REGISTRY_PLANS` or more
+/// entries, drop the `EVICT_BATCH` oldest by `last_used_txn` (malformed
+/// records sort first). Returns the live entry count afterwards.
+///
+/// Recency tradeoff (reviewed): `last_used_txn` starts at insert time and is
+/// refreshed ONLY when a `WriteSession` loads the plan from the registry on
+/// a local-cache miss (a ride-along write on its already-open transaction).
+/// Read-only loads via `Database::execute` deliberately do NOT bump it —
+/// doing so would take the global writer lock on a read path, making
+/// cold-cache SELECTs block behind live writers (see
+/// `Database::cached_or_load`). Consequently a plan used exclusively by
+/// readers keeps its insert-time stamp forever and may be evicted despite
+/// recent use; that is accepted, because eviction is only hygiene and the
+/// caller heals with a re-`prepare`. Eviction must therefore tolerate
+/// entries whose `last_used_txn` was never bumped after insertion (they sort
+/// by insert time, which is always valid).
+///
+/// This is the one place that genuinely must enumerate the registry, and it is
+/// bounded to the `plan/` family rather than the whole sys keyspace. Reached
+/// once per `EVICT_BATCH` inserts in the steady state — see [`make_room`].
+fn evict_if_full(txn: &mut WriteTxn<'_>) -> Result<u64> {
     let mut plans: Vec<(Vec<u8>, u64)> = txn
-        .sys_scan()?
+        .sys_scan_range(PLAN_PREFIX, PLAN_PREFIX_END)?
         .into_iter()
         .filter(|(k, _)| k.starts_with(PLAN_PREFIX))
         .map(|(k, v)| {
@@ -170,13 +239,16 @@ fn evict_if_full(txn: &mut WriteTxn<'_>) -> Result<()> {
         })
         .collect();
     if plans.len() < MAX_REGISTRY_PLANS {
-        return Ok(());
+        return Ok(plans.len() as u64);
     }
     plans.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let mut live = plans.len() as u64;
     for (subkey, _) in plans.into_iter().take(EVICT_BATCH) {
-        txn.sys_delete(&subkey)?;
+        if txn.sys_delete(&subkey)? {
+            live -= 1;
+        }
     }
-    Ok(())
+    Ok(live)
 }
 
 #[cfg(test)]
@@ -194,6 +266,22 @@ mod tests {
         let patched = patched_last_used(&rec, 99).unwrap();
         assert_eq!(parse_record(&patched).unwrap().last_used_txn, 99);
         assert_eq!(parse_record(&patched).unwrap().blob, b"blobby");
+    }
+
+    /// #124: the family bound and the counter's placement outside it are the
+    /// two byte facts the O(1) publish path rests on — a `plancount` that fell
+    /// inside `[plan/, plan0)` would be walked by eviction and then DELETED as
+    /// the oldest "malformed record" (they sort first), silently un-capping the
+    /// registry.
+    #[test]
+    fn plan_family_bound_excludes_the_counter_and_covers_every_hash() {
+        for b in [0u8, 1, 0x2f, 0x30, 0x7f, 0xfe, 0xff] {
+            let k = plan_subkey(&PlanHash([b; 32]));
+            assert!(k.as_slice() >= PLAN_PREFIX, "{b:#x} below the family");
+            assert!(k.as_slice() < PLAN_PREFIX_END, "{b:#x} above the family");
+        }
+        assert!(PLAN_COUNT_KEY >= PLAN_PREFIX_END);
+        assert!(!PLAN_COUNT_KEY.starts_with(PLAN_PREFIX));
     }
 
     #[test]

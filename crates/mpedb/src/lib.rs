@@ -1441,15 +1441,21 @@ impl Database {
 
     /// All records in namespace `ns`, as `(key, value)` pairs in key order,
     /// with the namespace prefix stripped. Read transaction only.
+    ///
+    /// Prefix-bounded (#124): keys are `<ns>\0<key>`, so `[<ns>\0, <ns>\x01)`
+    /// is exactly this namespace — no neighbouring family (least of all the
+    /// plan registry, which shares this keyspace) is ever materialised.
     pub fn sys_record_scan(&self, ns: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         check_sys_ns(ns)?;
         let mut prefix = Vec::with_capacity(ns.len() + 1);
         prefix.extend_from_slice(ns.as_bytes());
         prefix.push(0);
+        let mut end = prefix.clone();
+        *end.last_mut().expect("non-empty") = 1;
         let r = self.engine.begin_read()?;
-        let all = r.sys_scan()?;
+        let all = r.sys_scan_range(&prefix, &end);
         r.finish()?;
-        Ok(all
+        Ok(all?
             .into_iter()
             .filter(|(k, _)| k.starts_with(&prefix))
             .map(|(k, v)| (k[prefix.len()..].to_vec(), v))
@@ -3109,6 +3115,58 @@ primary_key = ["id"]
         let db2 = Database::open_with_config(cfg).unwrap();
         assert!(db2.execute(&h, &params![1]).is_ok());
         db2.verify().unwrap();
+    }
+
+    /// #124: publication reads a `plancount` record instead of ranking the whole
+    /// registry, so the counter's failure modes are the fix's risk surface. A
+    /// counter that reads HIGH (here: forged to the cap, with three plans
+    /// present) must fall through to the authoritative walk, evict nothing, and
+    /// leave the truth behind — otherwise one bad 8-byte record would evict a
+    /// live registry on every insert, forever.
+    #[test]
+    fn a_forged_plan_counter_self_heals_and_evicts_nothing() {
+        let (cfg, path) = test_config("plancount", 8);
+        let _guard = FileGuard(path);
+        let db = Database::open_with_config(cfg).unwrap();
+        let hashes: Vec<PlanHash> = (0..3)
+            .map(|i| db.prepare(&format!("SELECT * FROM users WHERE id = {i}")).unwrap())
+            .collect();
+
+        let count = |db: &Database| -> u64 {
+            let r = db.engine.begin_read().unwrap();
+            let n = u64::from_le_bytes(
+                r.sys_get(registry::PLAN_COUNT_KEY).unwrap().unwrap().try_into().unwrap(),
+            );
+            r.finish().unwrap();
+            n
+        };
+        assert_eq!(count(&db), 3);
+
+        // Forge it to the cap, then publish one more plan.
+        let mut w = db.engine.begin_write().unwrap();
+        w.sys_put(
+            registry::PLAN_COUNT_KEY,
+            &(registry::MAX_REGISTRY_PLANS as u64).to_le_bytes(),
+        )
+        .unwrap();
+        w.commit().unwrap();
+        let fourth = db.prepare("SELECT * FROM users WHERE id = 99").unwrap();
+
+        // Recounted from the tree: 3 live + the new one, nothing evicted.
+        assert_eq!(count(&db), 4);
+        let r = db.engine.begin_read().unwrap();
+        for h in hashes.iter().chain(std::iter::once(&fourth)) {
+            assert!(r.sys_get(&plan_subkey(h)).unwrap().is_some(), "{h:?} evicted");
+        }
+        r.finish().unwrap();
+
+        // A malformed counter takes the same authoritative path.
+        let mut w = db.engine.begin_write().unwrap();
+        w.sys_put(registry::PLAN_COUNT_KEY, b"nope").unwrap();
+        w.commit().unwrap();
+        db.prepare("SELECT * FROM users WHERE id = 100").unwrap();
+        assert_eq!(count(&db), 5);
+        db.verify().unwrap();
     }
 
     #[test] // ~10 s in debug: fills the 4096-entry registry once

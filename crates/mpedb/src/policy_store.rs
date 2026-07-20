@@ -16,6 +16,17 @@ const POL_PREFIX: &[u8] = b"pol/";
 const RLSEN_PREFIX: &[u8] = b"rlsen/";
 const POLEP_PREFIX: &[u8] = b"polep/";
 
+/// Exclusive upper bounds for the three RLS families (#124). `/` is 0x2f, so
+/// 0x30 is the first subkey past every `<prefix>/…` entry.
+///
+/// `pol/`'s bound does NOT swallow `polep/`: `polep…` compares as `pol` then
+/// `e` (0x65) > `0` (0x30), so it sorts strictly above `pol0`. The three ranges
+/// are disjoint, which is what makes the sum of three bounded walks equivalent
+/// to the one whole-keyspace scan this replaced.
+const POL_PREFIX_END: &[u8] = b"pol0";
+const RLSEN_PREFIX_END: &[u8] = b"rlsen0";
+const POLEP_PREFIX_END: &[u8] = b"polep0";
+
 fn with_table_id(prefix: &[u8], table_id: u32) -> Vec<u8> {
     let mut k = Vec::with_capacity(prefix.len() + 4);
     k.extend_from_slice(prefix);
@@ -189,30 +200,49 @@ impl Database {
     /// Load every table's RLS state into a [`PolicyCatalog`] for the planner.
     /// Read on a pinned snapshot so the policy set is consistent with the schema
     /// the plan is compiled against.
+    ///
+    /// **Three prefix-bounded walks, not one whole-keyspace scan (#124).** This
+    /// runs on every compile, and it shares the sys keyspace with the plan
+    /// registry (`plan/<hash>` → SQL text + encoded blob, up to
+    /// `MAX_REGISTRY_PLANS` of them). Materialising all of that to find the
+    /// `pol*`/`rlsen*` records made compile cost O(bytes ever registered)
+    /// instead of O(policies): measured at 297 B held and 0.24 µs per
+    /// previously-registered plan, so a full registry cost ~1.2 MB and ~1.0 ms
+    /// on every `query()` and every `prepare()`, forever.
     pub(crate) fn load_policy_catalog(&self) -> Result<PolicyCatalog> {
         let mut cat = PolicyCatalog::empty();
         let mut per_table: std::collections::HashMap<u32, TablePolicies> =
             std::collections::HashMap::new();
         let r = self.engine.begin_read()?;
-        let scan = r.sys_scan();
+        type Fams = (Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, Vec<u8>)>, Vec<(Vec<u8>, Vec<u8>)>);
+        let scan: Result<Fams> = (|| {
+            Ok((
+                r.sys_scan_range(POL_PREFIX, POL_PREFIX_END)?,
+                r.sys_scan_range(RLSEN_PREFIX, RLSEN_PREFIX_END)?,
+                r.sys_scan_range(POLEP_PREFIX, POLEP_PREFIX_END)?,
+            ))
+        })();
         r.finish()?;
-        for (subkey, value) in scan? {
+        let (pols, rlsen, polep) = scan?;
+        for (subkey, value) in pols {
             if let Some(rest) = subkey.strip_prefix(POL_PREFIX) {
                 if let Some((table_id, name)) = parse_pol_key(rest) {
                     let def = PolicyDef::decode_value(name, &value)?;
                     per_table.entry(table_id).or_default().policies.push(def);
                 }
-            } else if let Some(rest) = subkey.strip_prefix(RLSEN_PREFIX) {
-                if let Some(table_id) = table_id_of(rest) {
-                    let flags = value.first().copied().unwrap_or(0);
-                    let tp = per_table.entry(table_id).or_default();
-                    tp.rls_enabled = flags & 0b01 != 0;
-                    tp.force = flags & 0b10 != 0;
-                }
-            } else if let Some(rest) = subkey.strip_prefix(POLEP_PREFIX) {
-                if let Some(table_id) = table_id_of(rest) {
-                    per_table.entry(table_id).or_default().epoch = epoch_of(&value);
-                }
+            }
+        }
+        for (subkey, value) in rlsen {
+            if let Some(table_id) = subkey.strip_prefix(RLSEN_PREFIX).and_then(table_id_of) {
+                let flags = value.first().copied().unwrap_or(0);
+                let tp = per_table.entry(table_id).or_default();
+                tp.rls_enabled = flags & 0b01 != 0;
+                tp.force = flags & 0b10 != 0;
+            }
+        }
+        for (subkey, value) in polep {
+            if let Some(table_id) = subkey.strip_prefix(POLEP_PREFIX).and_then(table_id_of) {
+                per_table.entry(table_id).or_default().epoch = epoch_of(&value);
             }
         }
         for (table_id, tp) in per_table {
@@ -250,45 +280,87 @@ fn epoch_of(value: &[u8]) -> u64 {
     value.try_into().map(u64::from_le_bytes).unwrap_or(0)
 }
 
-/// Build one table's live RLS state from a full sys-keyspace scan (slow path of
-/// staleness validation, only reached when the epoch moved).
-fn one_table_from_scan(scan: &[(Vec<u8>, Vec<u8>)], table_id: u32) -> Result<TablePolicies> {
+/// The sys-keyspace read surface shared by a pinned read snapshot and an open
+/// write transaction (which needs `&mut`), so the per-table policy load is
+/// written once for both validation paths.
+pub(crate) trait SysRead {
+    fn get(&mut self, subkey: &[u8]) -> Result<Option<Vec<u8>>>;
+    fn range(&mut self, lo: &[u8], hi: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+}
+
+impl SysRead for &mpedb_core::ReadTxn<'_> {
+    fn get(&mut self, subkey: &[u8]) -> Result<Option<Vec<u8>>> {
+        (**self).sys_get(subkey)
+    }
+    fn range(&mut self, lo: &[u8], hi: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        (**self).sys_scan_range(lo, hi)
+    }
+}
+
+impl SysRead for &mut mpedb_core::WriteTxn<'_> {
+    fn get(&mut self, subkey: &[u8]) -> Result<Option<Vec<u8>>> {
+        (**self).sys_get(subkey)
+    }
+    fn range(&mut self, lo: &[u8], hi: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        (**self).sys_scan_range(lo, hi)
+    }
+}
+
+/// Build ONE table's live RLS state (slow path of staleness validation, only
+/// reached when the epoch moved).
+///
+/// #124: this used to filter a whole sys-keyspace scan for the one table it
+/// wanted, which put the plan registry's bytes on the execute path too. All
+/// three families are keyed by `<prefix><table_id BE4>`, so the table's
+/// policies are a single prefix range (`pol/<id>/…`) and its flags/epoch are
+/// two point gets — O(that table's policies) instead of O(sys keyspace).
+fn one_table_live<R: SysRead>(r: &mut R, table_id: u32) -> Result<TablePolicies> {
     let mut tp = TablePolicies::default();
-    for (subkey, value) in scan {
-        if let Some(rest) = subkey.strip_prefix(POL_PREFIX) {
-            if let Some((tid, name)) = parse_pol_key(rest) {
-                if tid == table_id {
-                    tp.policies.push(PolicyDef::decode_value(name, value)?);
-                }
-            }
-        } else if let Some(rest) = subkey.strip_prefix(RLSEN_PREFIX) {
-            if table_id_of(rest) == Some(table_id) {
-                let flags = value.first().copied().unwrap_or(0);
-                tp.rls_enabled = flags & 0b01 != 0;
-                tp.force = flags & 0b10 != 0;
-            }
-        } else if let Some(rest) = subkey.strip_prefix(POLEP_PREFIX) {
-            if table_id_of(rest) == Some(table_id) {
-                tp.epoch = epoch_of(value);
+
+    // `pol/<id>/…`: the trailing `/` is part of the stored key, so bumping it
+    // to `0` bounds this table's policies and cannot reach table id+1 (whose
+    // keys start with different BE4 bytes anyway).
+    let lo = pol_family_lo(table_id);
+    let mut hi = lo.clone();
+    *hi.last_mut().expect("non-empty") = b'0';
+    for (subkey, value) in r.range(&lo, &hi)? {
+        if let Some((tid, name)) = subkey.strip_prefix(POL_PREFIX).and_then(parse_pol_key) {
+            if tid == table_id {
+                tp.policies.push(PolicyDef::decode_value(name, &value)?);
             }
         }
+    }
+    if let Some(v) = r.get(&with_table_id(RLSEN_PREFIX, table_id))? {
+        let flags = v.first().copied().unwrap_or(0);
+        tp.rls_enabled = flags & 0b01 != 0;
+        tp.force = flags & 0b10 != 0;
+    }
+    if let Some(v) = r.get(&with_table_id(POLEP_PREFIX, table_id))? {
+        tp.epoch = epoch_of(&v);
     }
     Ok(tp)
 }
 
+/// `pol/<table_id BE4>/` — the inclusive lower bound of one table's policies.
+fn pol_family_lo(table_id: u32) -> Vec<u8> {
+    let mut k = with_table_id(POL_PREFIX, table_id);
+    k.push(b'/');
+    k
+}
+
 /// Decide whether one stamped table is stale relative to `live_epoch` (already
 /// read from the executing pin). Fast path: epochs equal ⇒ current. Slow path:
-/// the epoch moved, so recompute that table's live policy content hash from
-/// `scan` and compare — a no-op edit still matches, a real edit is stale.
-fn is_stale(
+/// the epoch moved, so recompute that table's live policy content hash off `r`
+/// and compare — a no-op edit still matches, a real edit is stale.
+fn is_stale<R: SysRead>(
     stamp: &mpedb_sql::PolicyStamp,
     live_epoch: u64,
-    scan: &[(Vec<u8>, Vec<u8>)],
+    r: &mut R,
 ) -> Result<bool> {
     if live_epoch == stamp.epoch {
         return Ok(false);
     }
-    let tp = one_table_from_scan(scan, stamp.table)?;
+    let tp = one_table_live(r, stamp.table)?;
     Ok(mpedb_sql::table_policy_hash(Some(&tp)) != stamp.hash)
 }
 
@@ -322,7 +394,7 @@ impl Database {
             if live_epoch == stamp.epoch {
                 continue;
             }
-            if is_stale(stamp, live_epoch, &r.sys_scan()?)? {
+            if is_stale(stamp, live_epoch, &mut &*r)? {
                 self.evict(hash);
                 return Err(Error::PlanInvalidated);
             }
@@ -345,7 +417,7 @@ impl Database {
             if live_epoch == stamp.epoch {
                 continue;
             }
-            if is_stale(stamp, live_epoch, &w.sys_scan()?)? {
+            if is_stale(stamp, live_epoch, &mut &mut *w)? {
                 self.evict(hash);
                 return Err(Error::PlanInvalidated);
             }
@@ -358,6 +430,44 @@ impl Database {
 mod tests {
     use crate::{Database, ExecResult, PolicyCmd, PolicyDef, Session};
     use mpedb_types::{Config, Error as E, Value};
+
+    /// #124: the compile path replaced one whole-keyspace scan with three
+    /// prefix-bounded walks, which is only equivalent if the three ranges are
+    /// disjoint and each covers its own family for EVERY table id. The trap is
+    /// `pol/` vs `polep/`: a naive `[pol/, pol0)` reading of the shorter prefix
+    /// would have to swallow `polep/…` for the old code to be wrong — it does
+    /// not, because `e` (0x65) sorts above `0` (0x30).
+    #[test]
+    fn rls_prefix_ranges_are_disjoint_and_total() {
+        use super::*;
+        let fams: [(&[u8], &[u8]); 3] = [
+            (POL_PREFIX, POL_PREFIX_END),
+            (RLSEN_PREFIX, RLSEN_PREFIX_END),
+            (POLEP_PREFIX, POLEP_PREFIX_END),
+        ];
+        for id in [0u32, 1, 0x2f30_2f30, u32::MAX] {
+            let keys: Vec<Vec<u8>> = vec![
+                pol_subkey(id, ""),
+                pol_subkey(id, "\u{7f}zzz"),
+                with_table_id(RLSEN_PREFIX, id),
+                with_table_id(POLEP_PREFIX, id),
+            ];
+            for k in &keys {
+                let owner = fams
+                    .iter()
+                    .filter(|(lo, hi)| k.as_slice() >= *lo && k.as_slice() < *hi)
+                    .count();
+                assert_eq!(owner, 1, "key {k:?} must land in exactly one range");
+            }
+            // ...and the one-table bound used by staleness validation is a
+            // strict subset of the whole-family one.
+            let lo = pol_family_lo(id);
+            let mut hi = lo.clone();
+            *hi.last_mut().unwrap() = b'0';
+            assert!(lo.as_slice() >= POL_PREFIX && hi.as_slice() <= POL_PREFIX_END);
+            assert!(pol_subkey(id, "a") >= lo && pol_subkey(id, "a") < hi);
+        }
+    }
 
     fn db(tag: &str) -> crate::testdb::TestDb {
         let path =
