@@ -94,7 +94,8 @@ planner uses, and live multi-process DDL — verified against sqlite's own
 7.4M-record test corpus with **zero wrong answers**. Django's test suite runs
 against the shim: **83% of the measured labels pass and climbing**
 ([`C-API-COMPAT.md`](C-API-COMPAT.md) tracks it run by run). What is still
-missing is short — `ATTACH` (cross-file, planned) and loadable extensions (a
+missing is short — attached-database *writes* (`ATTACH` + cross-file SELECT
+work; writing through a second handle covers the rest) and loadable extensions (a
 non-goal) — each a clean error today, never a wrong answer. And on one axis
 mpedb goes *past* sqlite: its own
 `.mpedb` WAL gives PostgreSQL-style **concurrent multi-process writes** (MVCC
