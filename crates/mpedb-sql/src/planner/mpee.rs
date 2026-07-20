@@ -66,9 +66,9 @@
 //! ## Ping-pong: the solver steers which cost input is bought (§9.5)
 //!
 //! Cost inputs are bought on DEMAND, never up front. `row_count` is read
-//! through a memoizing [`Cell`], and an UNBOUGHT table prices at `0` — a valid
-//! LOWER bound, because every cost term is monotone non-decreasing in a table's
-//! bucket. The solver therefore runs as branch-and-bound: propose an order
+//! through a memoizing [`Cell`], and an unbought table prices at [`UNBOUGHT`]
+//! — a valid LOWER bound, because every cost term is monotone non-decreasing in
+//! a table's bucket. The solver therefore runs as branch-and-bound: propose an order
 //! under the optimistic bound, buy only the counts that proposal's cost
 //! actually depends on, re-solve. When a proposal's own cost is fully bought,
 //! its estimate is exact while every rejected candidate's estimate was a lower
@@ -555,7 +555,7 @@ impl<'a> Problem<'a> {
         order
     }
 
-    /// **Ping-pong (§9.5).** Propose under the optimistic (unbought = 0) bound,
+    /// **Ping-pong (§9.5).** Propose under the optimistic [`UNBOUGHT`] bound,
     /// buy only the counts the proposal's own cost depends on, re-solve. Stop
     /// when the proposal is fully bought.
     ///
