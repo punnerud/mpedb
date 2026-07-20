@@ -1123,7 +1123,48 @@ under the shim because mpedb enforces no foreign keys, and one is gated on a
 sqlite version the shim does not claim. They do not change the scores, but they
 mean a handful of tests the reference passes are not actually exercised.
 
-### 6.7 Smaller standing rules
+### 6.7 A cost that scales with the substrate is invisible to the obvious metric [I]
+
+Not a technique so much as a failure mode worth naming, because it cost this
+project a wrong number before anyone knew the cost existed.
+
+Compiling a statement was **O(bytes ever registered in the shared key space)** —
+two full scans, 297 bytes held and 0.24 µs per plan that had ever been
+published. Not per plan *live*: the registry evicts at 4,096 entries, and
+eviction dropped the cost by exactly the 6 % it dropped entries, which is what
+proved the cost was over the *substrate* and not over the working set.
+
+Nothing pointed at it, and here is why. Every per-operation benchmark measures
+one operation against an empty or fresh database, where the term is zero. Every
+correctness test does the same. The cost only appears in a database with
+*history*, and by then it looks like the database being "slower when full",
+which is a thing databases are expected to be.
+
+**It then corrupted an unrelated measurement.** A memory probe reported a bare
+primary-key point lookup holding *149 bytes per row of the whole table*, which
+is an absurd shape for a point lookup and was accepted anyway because the number
+came out of an instrument. Through `execute(hash, params)` the same lookup holds
+**618 bytes flat**. The 149 B/row was this scan, and it entered the report as a
+property of the lookup.
+
+Two rules fall out, and they generalise past this instance:
+
+- **A per-operation benchmark cannot see a per-substrate cost.** If a cost is
+  shared, vary the *substrate* — here, registry size at 0 / 1k / 4k /
+  post-eviction — and the post-eviction point is the one that distinguishes
+  "grows with what is live" from "grows with what has ever existed". A ratchet
+  and a working-set cost look identical until you shrink the working set.
+- **A slope that is absurd for the operation is a slope from somewhere else.**
+  149 bytes per row of a table a point lookup never reads is not a surprising
+  result about point lookups; it is an instrument reading through to something
+  it did not mean to include. The reflex should be to doubt the attribution
+  before publishing the number, not after.
+
+The fix itself is not interesting — prefix-bounded ranges over a B+tree, which
+is [T] and gets no credit here. What the entry records is that the cost was
+structurally invisible to every instrument pointed at it.
+
+### 6.8 Smaller standing rules
 
 - **Truncation at every offset** [T, under-practised]. Every decoder is fed its
   own valid output truncated at *every* byte offset, asserting a clean corruption
