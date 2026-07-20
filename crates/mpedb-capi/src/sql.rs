@@ -173,6 +173,35 @@ pub fn strip_leading_trivia(sql: &str) -> &str {
     &sql[first..]
 }
 
+/// `EXPLAIN QUERY PLAN <stmt>` — sqlite's plan-description statement. mpedb
+/// spells the same request `EXPLAIN <stmt>` and answers with its own plan text,
+/// so the shim strips the `QUERY PLAN` words and reshapes the answer into
+/// sqlite's four-column `(id, parent, notused, detail)` result.
+///
+/// Returns the `<stmt>` body, or `None` when this is not an `EXPLAIN QUERY
+/// PLAN`. A bare `EXPLAIN <stmt>` is NOT taken here: sqlite answers that with a
+/// VDBE opcode listing, which mpedb has no equivalent of — it stays mpedb's own
+/// single-column plan text rather than a fabricated opcode table.
+pub fn explain_query_plan_body(sql: &str) -> Option<&str> {
+    let mut rest = strip_leading_trivia(sql).trim_start();
+    for word in ["explain", "query", "plan"] {
+        let n = rest
+            .char_indices()
+            .take_while(|(_, c)| c.is_ascii_alphabetic())
+            .count();
+        if !rest[..n].eq_ignore_ascii_case(word) {
+            return None;
+        }
+        rest = &rest[n..];
+        // The words must be separated: `EXPLAINQUERY` is one identifier.
+        if !rest.starts_with(|c: char| c.is_ascii_whitespace()) {
+            return None;
+        }
+        rest = rest.trim_start();
+    }
+    Some(rest)
+}
+
 /// `INSERT OR ROLLBACK …` / `REPLACE`-style conflict prefix handling.
 ///
 /// sqlite's five conflict actions differ only in what survives a constraint
