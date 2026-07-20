@@ -653,4 +653,74 @@ mod tests {
         assert_eq!(classify("pragma table_info(t)"), Kind::Pragma);
         assert_eq!(classify("SELCT typo"), Kind::Other);
     }
+
+    /// The zeroblob rewrite must fire ONLY in code position: a `zeroblob(...)`
+    /// spelled inside a string literal, a quoted identifier or a comment is
+    /// data or prose, and rewriting it would corrupt the statement. It must
+    /// also respect identifier boundaries (`myzeroblob(3)` is a user function).
+    #[test]
+    fn zeroblob_rewrite_only_touches_code_position() {
+        // Code position: rewritten to the byte-identical blob literal.
+        assert_eq!(rewrite_zeroblob("select zeroblob(2)"), "select x'0000'");
+        assert_eq!(rewrite_zeroblob("insert into t values (zeroblob(1))"), "insert into t values (x'00')");
+        // Case-insensitive, whitespace-tolerant, and repeated.
+        assert_eq!(rewrite_zeroblob("select ZeroBlob( 1 ), zeroblob(2)"), "select x'00', x'0000'");
+        // sqlite's argument coercions: NULL/negative/non-numeric text are empty,
+        // a numeric-prefix string and a float truncate toward zero.
+        for (sql, want) in [
+            ("select zeroblob(0)", "select x''"),
+            ("select zeroblob(-5)", "select x''"),
+            ("select zeroblob(NULL)", "select x''"),
+            ("select zeroblob('x')", "select x''"),
+            ("select zeroblob('2')", "select x'0000'"),
+            ("select zeroblob(2.9)", "select x'0000'"),
+        ] {
+            assert_eq!(rewrite_zeroblob(sql), want, "{sql}");
+        }
+
+        // NOT code position — every one must come back byte-identical.
+        for sql in [
+            "select 'zeroblob(5) in a string'",
+            "select \"zeroblob(5)\" from t",
+            "select `zeroblob(5)` from t",
+            "select [zeroblob(5)] from t",
+            "select 1 -- zeroblob(5) in a line comment",
+            "select /* zeroblob(5) in a block comment */ 1",
+            "update t set s = 'zeroblob(9)' where x = 1",
+        ] {
+            assert_eq!(rewrite_zeroblob(sql), sql, "must not rewrite: {sql}");
+        }
+
+        // Identifier boundaries and shapes the rewrite must decline, leaving
+        // them for the host UDF (a non-constant argument) or the parser.
+        for sql in [
+            "select myzeroblob(3)",
+            "select zeroblobx(3)",
+            "select zeroblob_(3)",
+            "select zeroblob(1+1)",
+            "select zeroblob($1)",
+            "select zeroblob(a)",
+            "select zeroblob()",
+            "select zeroblob",
+        ] {
+            assert_eq!(rewrite_zeroblob(sql), sql, "must decline: {sql}");
+        }
+
+        // A statement with no zeroblob at all is returned borrowed, untouched.
+        assert!(matches!(
+            rewrite_zeroblob("select * from t where a = 1"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// The rewrite runs BEFORE `scan_params`, so it must never disturb
+    /// parameter numbering around it.
+    #[test]
+    fn zeroblob_rewrite_preserves_parameter_numbering() {
+        let sql = "insert into t (a, b, c) values (?, zeroblob(2), ?)";
+        let rewritten = rewrite_zeroblob(sql);
+        let scan = scan_params(&rewritten);
+        assert_eq!(scan.rewritten, "insert into t (a, b, c) values ($1, x'0000', $2)");
+        assert_eq!(scan.count, 2);
+    }
 }
