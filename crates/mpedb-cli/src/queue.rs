@@ -79,7 +79,10 @@ usage: mpedb queue <subcommand>
 
 <target> is a config.toml or a .mpedb file. Tasks are stored procedures
 (`mpedb proc define`); args are CLI literals (int/float/text/null/0x…/ISO
-timestamp). The runner is Model A of design/DESIGN-SERVICE.md: no daemon —
+timestamp). Run `queue init` BEFORE defining procs: any CREATE TABLE
+(including the lazy one on first enqueue) invalidates the plans embedded in
+already-defined write procs (\"built against a different schema\").
+The runner is Model A of design/DESIGN-SERVICE.md: no daemon —
 invoke it from cron/systemd/by hand; overlapping runners claim disjoint
 tasks and a SIGKILLed runner's claims are reclaimed after the lease.";
 
