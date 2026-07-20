@@ -1,5 +1,117 @@
 # Corpus status — measured sqllogictest compatibility
 
+## UPDATE 2026-07-20 — the consolidated sweep: ONE commit, all three suites
+
+Every headline number in this repo had been measured at a different commit
+(corpus before the `round()` fixes, Django at `983be4c`, CPython in a worktree
+predating two merges). This section, and the Django/CPython sections of
+`C-API-COMPAT.md` dated the same day, are **one measurement at one commit**.
+
+**Commit: `b41b713`** ("compound arms own their lifts, PLAN_FORMAT 56") plus
+`d1fc41c`, a test-only portability fix in `mpedb-capi` that touches no engine
+code. **Machine: Apple M3 Pro, 11 cores, 36 GB, macOS 26.6, arm64** — the first
+full corpus sweep taken on Apple Silicon. Release build.
+
+Runner and procedure unchanged: `crates/mpedb-testkit/src/bin/sqlite_corpus.rs`,
+621 of 622 files (`select5.test` still out of the headline, §4/§UPDATE-#114) in
+78 chunks of 8, `--samples-all`. macOS has no `ulimit -v` and no
+`timeout(1)`, so the per-chunk cap is `perl -e 'alarm 900; exec @ARGV'`; nothing
+in the sweep came near it.
+
+### Headline
+
+| metric | Linux baseline | **M3 @ `b41b713`** | delta |
+|---|---|---|---|
+| files measured | 621 / 622 | **621 / 622** | — |
+| records seen | 7,419,202 | **7,419,202** | — |
+| skipped (`onlyif mysql`/`mssql`) | 1,480,924 | **1,480,924** | — |
+| **attempted** | **5,938,278** | **5,938,278** | **identical** |
+| **passed** | 5,936,879 | **5,936,882 — 99.9765 %** | **+3** |
+| ├ statements | 208,746 | 208,748 | +2 |
+| └ queries | 5,728,133 | 5,728,134 | +1 |
+| queries md5-verified | 955,237 | **955,237** | — |
+| **genuine wrong answers** | 0 (4 flagged) | **0 (the same 4 flagged)** | — |
+| **error mismatches** | **0** | **0** | — |
+| refused / unsupported | 1,395 | **1,392** | −3 |
+
+The denominator is **exactly** the baseline's, so the runner did not move the
+goalposts.
+
+### The +3 is a RUNNER fix, not an engine fix — proved with a control
+
+A second sweep was run on the **same machine, same corpus, same procedure** at
+`7ed1c3a` (the M3's head before this task synced it, an ancestor of `b41b713`).
+It reproduces the Linux baseline byte-for-byte:
+
+| | attempted | passed | wrong | errmis |
+|---|---|---|---|---|
+| control @ `7ed1c3a` (M3) | 5,938,278 | **5,936,879** | 4 | 0 |
+| Linux baseline (quoted) | 5,938,278 | **5,936,879** | 4 | 0 |
+| **head @ `b41b713`** (M3) | 5,938,278 | **5,936,882** | 4 | 0 |
+
+Diffing the two sweeps per file, **exactly two files move**:
+
+```
+in1.test          216 records   58 -> 60   (+2)
+slt_good_12.test 12706 records 10009 -> 10010 (+1)
+```
+
+`git log 7ed1c3a..b41b713 -- crates/mpedb-testkit/src/bin/sqlite_corpus.rs`
+returns exactly one commit — `b851d62` *"corpus runner: `rowid_` rides the
+engine's rowid-alias auto-assign, not a shim counter"* — and those three records
+are precisely §1 item 7, the `INSERT … SELECT` / `rowid_` collision that failed
+as `PRIMARY KEY violation in t4n`. **Verdict: measurement artifact (a runner
+fix). The engine's corpus behaviour is unchanged between the two commits.**
+
+MPEE v2 (join reorder), the compound-arm ownership rewrite (PLAN_FORMAT 56),
+GENERATED columns and the `round()` fixes all landed in that range and moved
+**zero** corpus records — and, more importantly, produced **no new wrong
+answer**: the wrong count stays at 4 and the error-mismatch count at 0.
+
+### The 4 flagged wrongs are still the same 4
+
+All four in `evidence/slt_lang_replace.test`, all four carrying the runner's own
+cascade note, all four downstream of §1 item 6 (the shim's `rowid_` turning
+`REPLACE` into an arity error). Unchanged from §3.
+
+### Primary attribution now (sum = 1,392)
+
+| category | records | class |
+|---|---|---|
+| `shim-index-accumulation` | 1,289 | runner artifact |
+| `shim-star-arity` | 72 | runner artifact |
+| `trigger-ddl` (legacy `CREATE TRIGGER` without a timing keyword) | 23 | engine gap |
+| `insert-or/replace` | 4 | runner artifact |
+| `index-ddl` (`DROP INDEX` / `REINDEX <name>`) | 2 | engine gap |
+| `cast` (two-or-more `min()`/`max()` under a bare `GROUP BY`) | 2 | engine gap, deliberate |
+
+**1,365 runner artifacts, 27 engine gaps.** With the artifacts discounted the
+engine's ceiling on this corpus is **99.99955 %**. The subquery-in-compound
+family (§6 rank 2, 520 records) reads **0** here, and `subquery` now appears
+only as the 72-record co-occurrence of `shim-star-arity`.
+
+### Reproducing on macOS
+
+```
+find ~/sqllogictest/test -name '*.test' | sort | grep -v '/select5\.test$' > flist-621
+split -l 8 flist-621 ck_
+for c in ck_*; do
+  perl -e 'alarm 900; exec @ARGV' target/release/sqlite_corpus --samples-all $(cat $c) > out_$c.log 2>&1
+done
+```
+
+Two portability notes for anyone repeating this off Linux. `.cargo/config.toml`
+sets `rustc-wrapper = "sccache"` unconditionally, so **every cargo command fails
+with `could not execute process sccache` on a box that lacks it** (the `mold`
+block above it carries an explicit escape hatch; the sccache block does not).
+Work around with `RUSTC_WRAPPER=""`. And `cargo build --release --workspace`
+fails on macOS in `mpedb-py` — the pyo3 cdylib links without
+`-undefined dynamic_lookup`, so every `Py*` symbol is undefined. Neither is an
+engine problem and neither is fixed here; both are recorded.
+
+
+---
+
 ## UPDATE 2026-07-19 (night) — blocker #3 CLOSED: subquery-in-compound (520 → 0)
 
 Measured on `worktree-agent-a92241e663ca8262a` (PLAN_FORMAT 49: materialized

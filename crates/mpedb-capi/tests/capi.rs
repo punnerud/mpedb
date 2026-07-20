@@ -7,6 +7,20 @@ use std::ffi::{c_char, c_void, CStr, CString};
 use std::os::raw::c_int;
 use std::ptr;
 
+/// A writable scratch directory: `/dev/shm` where it exists (mpedb's natural
+/// habitat on Linux), the platform temp dir otherwise (macOS has no `/dev/shm`).
+/// Same fallback `attach_ffi.rs` and the shim itself already use.
+fn scratch_dir() -> String {
+    if std::path::Path::new("/dev/shm").is_dir() {
+        "/dev/shm".to_string()
+    } else {
+        std::env::temp_dir()
+            .to_string_lossy()
+            .trim_end_matches('/')
+            .to_string()
+    }
+}
+
 fn cs(s: &str) -> CString {
     CString::new(s).unwrap()
 }
@@ -538,7 +552,7 @@ fn prepare_tail_and_multi_exec() {
 #[test]
 fn file_backed_persists_across_reopen() {
     unsafe {
-        let path = format!("/dev/shm/mpedb-capi-persist-{}.mpedb", std::process::id());
+        let path = format!("{}/mpedb-capi-persist-{}.mpedb", scratch_dir(), std::process::id());
         let _ = std::fs::remove_file(&path);
         let cpath = cs(&path);
 
@@ -570,7 +584,7 @@ fn file_backed_persists_across_reopen() {
 #[test]
 fn open_v2_no_create_flag_fails_for_missing_file() {
     unsafe {
-        let path = format!("/dev/shm/mpedb-capi-missing-{}.mpedb", std::process::id());
+        let path = format!("{}/mpedb-capi-missing-{}.mpedb", scratch_dir(), std::process::id());
         let _ = std::fs::remove_file(&path);
         let cpath = cs(&path);
         let mut db: *mut Sqlite3 = ptr::null_mut();
@@ -1506,7 +1520,7 @@ fn file_uri_size_mb_reserves_requested_geometry() {
         // fallocates it): the file is created at exactly that size, and a
         // request SMALLER than the shim's 64 MiB file default is honored too —
         // mpedb does NOT always take "several MB" more than asked.
-        let path = format!("/dev/shm/mpedb-capi-size-{}.mpedb", std::process::id());
+        let path = format!("{}/mpedb-capi-size-{}.mpedb", scratch_dir(), std::process::id());
         let _ = std::fs::remove_file(&path);
         let uri = cs(&format!("file:{path}?size_mb=8"));
         let mut db: *mut Sqlite3 = ptr::null_mut();
