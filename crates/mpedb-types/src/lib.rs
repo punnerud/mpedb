@@ -138,7 +138,8 @@ pub use footprint::{Footprint, KeyAccess, KeyBound, KeyPart, PlanHash, TableSet}
 pub use fts::{Doclist, Tokenizer};
 pub use policy::{PolicyCmd, PolicyDef};
 pub use schema::{
-    store_into, ColumnDef, DefaultExpr, IndexDef, Schema, TableDef, TableKind,
+    store_into, ColumnDef, DefaultExpr, GeneratedCol, GeneratedKind, IndexDef, Schema, TableDef,
+    TableKind,
     MAX_IDENTIFIER_LEN, MAX_INDEXES,
 };
 pub use value::{

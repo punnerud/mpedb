@@ -446,6 +446,32 @@ impl<'a> Parser<'a> {
         self.parse_add_column_default()
     }
 
+    /// The tail of a generated-column clause, positioned at the `AS`:
+    /// `AS ( <expr> ) [STORED | VIRTUAL]`.
+    ///
+    /// The expression is captured as SOURCE (like `CHECK`) — the parser has no
+    /// column list to bind against — and the storage word defaults to `VIRTUAL`
+    /// when absent, which is sqlite's default. Only ONE of the two words may
+    /// appear: `STORED VIRTUAL` is a syntax error in sqlite and here.
+    fn parse_generated_tail(&mut self) -> Result<(String, mpedb_types::GeneratedKind)> {
+        self.expect_kw(Kw::As, "AS")?;
+        if self.peek() != Some(&Tok::LParen) {
+            return Err(self.err_here(
+                "a generated column's expression must be parenthesized: `AS ( <expr> )`",
+            ));
+        }
+        let src = self.capture_paren_source()?;
+        // VIRTUAL is sqlite's default when neither word is written, so the
+        // explicit `VIRTUAL` and the absent one deliberately land in one arm.
+        let kind = if self.eat_word("STORED") {
+            mpedb_types::GeneratedKind::Stored
+        } else {
+            let _ = self.eat_word("VIRTUAL");
+            mpedb_types::GeneratedKind::Virtual
+        };
+        Ok((src, kind))
+    }
+
     /// One `<name> [type] [constraint…]` column definition inside CREATE TABLE.
     fn parse_column_def(&mut self) -> Result<crate::ddl::CreateColumnSpec> {
         let cname = self.ident("column name")?;
@@ -463,6 +489,7 @@ impl<'a> Parser<'a> {
             default: None,
             check: None,
             collation: Collation::Binary,
+            generated: None,
         };
         loop {
             // A per-column constraint may carry a `CONSTRAINT <name>` prefix.
@@ -516,12 +543,49 @@ impl<'a> Parser<'a> {
                 });
             } else if self.eat_word("REFERENCES") {
                 self.skip_references_clause()?;
+            } else if self.eat_word("GENERATED") {
+                // `GENERATED ALWAYS AS (…)`. The two words are one token pair in
+                // sqlite's grammar — `GENERATED` alone is absorbed into the
+                // declared TYPE there, which `declared_type`'s stop set makes
+                // unreachable here, so a lone `GENERATED` is a clean error.
+                self.expect_word("ALWAYS")?;
+                if col.generated.is_some() {
+                    return Err(self.err_here(format!(
+                        "column `{}` is declared generated more than once",
+                        col.name
+                    )));
+                }
+                col.generated = Some(self.parse_generated_tail()?);
+            } else if matches!(self.peek(), Some(Tok::Kw(Kw::As))) {
+                // The short spelling: `<col> <type> AS (<expr>) [STORED|VIRTUAL]`.
+                if col.generated.is_some() {
+                    return Err(self.err_here(format!(
+                        "column `{}` is declared generated more than once",
+                        col.name
+                    )));
+                }
+                col.generated = Some(self.parse_generated_tail()?);
             } else if let Some(n) = named {
                 return Err(
                     self.err_here(format!("expected a column constraint after `CONSTRAINT {n}`"))
                 );
             } else {
                 break;
+            }
+        }
+        // sqlite refuses both of these at CREATE TABLE, by name.
+        if col.generated.is_some() {
+            if col.default.is_some() {
+                return Err(self.err_here(format!(
+                    "cannot use DEFAULT on generated column `{}`",
+                    col.name
+                )));
+            }
+            if col.pk {
+                return Err(self.err_here(format!(
+                    "generated column `{}` cannot be part of the PRIMARY KEY",
+                    col.name
+                )));
             }
         }
         Ok(col)
@@ -1030,6 +1094,7 @@ impl<'a> Parser<'a> {
                 default: None,
                 check: None,
                 collation: Collation::Binary,
+                generated: None,
             };
             loop {
                 if self.eat_kw(Kw::Not) {
@@ -1072,8 +1137,27 @@ impl<'a> Parser<'a> {
                     // Parsed and dropped, exactly as in CREATE TABLE and
                     // exactly as sqlite does under `foreign_keys = OFF`.
                     self.skip_references_clause()?;
+                } else if self.eat_word("GENERATED") {
+                    self.expect_word("ALWAYS")?;
+                    col.generated = Some(self.parse_generated_tail()?);
+                } else if matches!(self.peek(), Some(Tok::Kw(Kw::As))) {
+                    col.generated = Some(self.parse_generated_tail()?);
                 } else {
                     break;
+                }
+            }
+            if col.generated.is_some() {
+                if col.default.is_some() {
+                    return Err(self.err_here(format!(
+                        "cannot use DEFAULT on generated column `{}`",
+                        col.name
+                    )));
+                }
+                if col.pk {
+                    return Err(self.err_here(format!(
+                        "generated column `{}` cannot be part of the PRIMARY KEY",
+                        col.name
+                    )));
                 }
             }
             return Ok(DdlStmt::AlterAddColumn { table, column: col });

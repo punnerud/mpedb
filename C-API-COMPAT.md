@@ -1757,3 +1757,88 @@ deliberately open).
 `mpedb-sql` plus 2 in the engine.** Nothing is left in the shim except the two
 honesty positions and the D8 evaluator, whose value is adaptation removal
 rather than score.
+
+---
+
+## `model_fields` unblocked — GENERATED columns (2026-07-20, #113)
+
+Run 5's rank-1 item is closed. `GENERATED ALWAYS AS (<expr>) [STORED|VIRTUAL]`
+now parses, compiles, and is computed on every write path, so the
+`model_fields` label — 528 tests, more than the entire remaining gap list
+combined — went from **unmeasurable** to **running**.
+
+| | tests | pass | fail | skip |
+|---|---|---|---|---|
+| `model_fields`, shim | 528 | **513** | 15 | 59 |
+| `model_fields`, stock | 528 | 528 | 0 | 59 |
+| `model_fields.test_generatedfield`, shim | 47 | **47** | 0 | 0 |
+
+The frozen G1/G2 groups are unchanged at **811/831** — the `table_info` /
+`table_xinfo` split below touched every table in the project and moved no
+score.
+
+### The 15, all pre-existing gap classes — no new class, no wrong answer
+
+| n | class | note |
+|---|---|---|
+| 12 | JSON path key containing a backslash | one test method × 3 hostile keys × 4 lookups; the documented deliberate refusal (sqlite compares a path key against the *decoded* label but takes the path key verbatim; that asymmetry is not reproduced) |
+| 2 | `any`-affinity comparison/arithmetic | `cannot compare int64 with text`, `replace() argument 1 must be text, got any` — run 5's rank-2 class, unchanged |
+| 1 | FK not enforced | `test_unsaved_fk` expects an `IntegrityError`; the deliberate D11 position |
+
+### What was built, and the one thing that was cut
+
+**Both** modes ship. `STORED` alone would NOT have unblocked the label:
+`tests/model_fields/models.py` declares six `db_persist=False` models whose
+`required_db_features = {"supports_virtual_generated_columns"}` is satisfied
+(the shim reports sqlite 3.45.0), so Django creates them at migrate and a
+refusal would have killed the label exactly as the missing parser did.
+
+mpedb **materializes both kinds into the row**; the STORED/VIRTUAL tag is
+declared metadata that only `PRAGMA table_xinfo.hidden` and the
+`ALTER TABLE ADD COLUMN` rule read. This is a storage divergence, never a value
+one — a generated expression may reference only same-row columns and must be
+deterministic, so write-time and read-time evaluation cannot disagree. What it
+costs is the row bytes sqlite would not spend on a VIRTUAL column.
+
+Deliberate narrowings, each a refusal by name and each pinned in
+`crates/mpedb/tests/generated_columns.rs`:
+
+- a generated column may not read a generated column declared **at or after**
+  it (sqlite resolves forward references). This is what makes mpedb's single
+  declaration-order evaluation pass provably correct and makes a dependency
+  cycle unrepresentable rather than detected;
+- a generated expression may not call a **host-registered UDF** — the compiled
+  program lives in the schema and every writer must be able to evaluate it;
+- `ALTER TABLE … DROP COLUMN` / `RENAME COLUMN` are refused on a table that has
+  a generated column: the program addresses inputs by ordinal (a drop shifts
+  them) and the expression names them as text (a rename invalidates it), and
+  mpedb has no expression printer to rewrite the source.
+
+### Shim surface
+
+`PRAGMA table_info` and `PRAGMA table_xinfo` shared one arm, so `table_xinfo`
+returned `table_info`'s six columns. That is not a narrower answer: Django's
+sqlite3 `get_table_description` unpacks **seven** values from it and filters on
+`hidden`, so every table in the project would have raised. They are now split —
+`table_info` hides generated columns and renumbers `cid` over the ones it emits
+(sqlite numbers the rows, not the table's columns); `table_xinfo` lists them all
+at their true ordinals with `hidden` ∈ {0, 2, 3}. The reconstructed
+`sqlite_master.sql` carries the `GENERATED ALWAYS AS (…)` clause, so a dump
+replays as the same table instead of one with an ordinary column that the dump's
+`INSERT`s — built from `table_info`, where a generated column is correctly
+absent — would never fill.
+
+### Schema format
+
+Canonical bytes **v8 → v9**. Unlike `CHECK` (source text, recompiled into a side
+table on every bundle rebuild), a generated column carries its **compiled
+program** on the wire. A generated value must be computed by the plan executor,
+the engine's typed row API, and `ADD COLUMN`'s backfill, and several of those
+hold a `&TableDef` and nothing else; threading a side table to all of them is how
+a path gets forgotten and silently writes NULL — a wrong answer, not a refusal.
+`Schema::validate` re-checks the program's column ordinals, parameter-freedom and
+acyclicity on the DECODE path, so a hostile mapping cannot make evaluation read
+out of range. Blast radius, measured: one field on `ColumnDef`, 72 struct
+literals across 16 files (mechanical), 2 `CreateColumnSpec` literals. `PLAN_FORMAT`
+is **unchanged at 54** — a generated column is an ordinary schema column to the
+planner, and every plan-visible difference is a bind-time refusal, not a shape.
