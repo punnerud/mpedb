@@ -232,8 +232,26 @@ SELECT id FROM t1 WHERE b = (SELECT max(b) FROM t1 WHERE c > (SELECT avg(c) FROM
 ----
 4
 
-statement error HAVING is not supported yet
+# An UNCORRELATED subquery in HAVING is supported: its slot is filled once,
+# before dispatch, so the grouped predicate reads an ordinary parameter. Both
+# results verified against sqlite 3.45 (min(b) is 10, so nothing survives the
+# first; count(*) over `b > 100` is 0, so every group survives the second).
+query II nosort
 SELECT b, count(*) FROM t1 GROUP BY b HAVING count(*) > (SELECT min(b) FROM t1)
+----
+
+query I nosort
+SELECT b FROM t1 GROUP BY b HAVING count(*) > (SELECT count(*) FROM t1 WHERE b > 100) ORDER BY b
+----
+10
+20
+30
+40
+
+# A CORRELATED one in the same position stays refused: its slot would still
+# hold whatever the last base row put there.
+statement error CORRELATED subquery in HAVING
+SELECT b, count(*) FROM t1 GROUP BY b HAVING count(*) > (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b)
 
 # An UNCORRELATED subquery inside a compound ARM is now supported (format-49
 # window): each arm's lifts take the reserved slots after the preceding arms',
