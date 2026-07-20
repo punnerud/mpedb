@@ -286,6 +286,35 @@ pub fn compile_check(expr_src: &str, table: &TableDef) -> Result<ExprProgram> {
     binder::compile_program(&bound)
 }
 
+/// Compile a `GENERATED ALWAYS AS (<expr>)` body against the finished table,
+/// coerced to the generated column's declared type.
+///
+/// The same shape as [`compile_check`] with one extra step: the result goes
+/// through `bind_assign`, so `a + b` into an `INTEGER` column and `lower(name)`
+/// into a `TEXT` one are both type-checked at DDL time rather than failing per
+/// row. Aggregates, subqueries and window functions are refused by the binder —
+/// which is what sqlite refuses too ("misuse of aggregate", "subqueries
+/// prohibited in generated columns") — and parameters are refused here, since a
+/// generated expression is evaluated per row with no statement to bind from.
+///
+/// The program is stored in the schema and re-validated by `Schema::validate`
+/// (column bounds, no forward reference to another generated column), so a
+/// caller cannot smuggle a cyclic or out-of-range expression past this.
+pub fn compile_generated(expr_src: &str, table: &TableDef, col: usize) -> Result<ExprProgram> {
+    let (expr, n_params) = parser::parse_expr_only(expr_src)?;
+    if n_params > 0 {
+        return Err(Error::Bind(
+            "parameters are not allowed in a generated column expression".into(),
+        ));
+    }
+    let target = table.columns.get(col).ok_or_else(|| {
+        Error::Bind(format!("generated column index {col} out of range"))
+    })?;
+    let mut binder = binder::Binder::new(table, 0, false);
+    let bound = binder.bind_assign(&expr, target)?;
+    binder::compile_program(&bound)
+}
+
 #[cfg(test)]
 mod route_tests {
     use super::split_db_alias;

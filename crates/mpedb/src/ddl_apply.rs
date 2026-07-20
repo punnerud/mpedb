@@ -218,6 +218,16 @@ pub(crate) fn table_def_from_spec(
                 ))
             })
     };
+    // The generated-column sources, by ordinal. Held aside until the TableDef is
+    // finished — a generated expression is bound against the whole column list,
+    // which does not exist yet here. Ordinals stay valid because the hidden
+    // rowid, when there is one, is appended LAST.
+    let generated: Vec<(usize, (String, mpedb_types::GeneratedKind))> = spec
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(i, c)| c.generated.clone().map(|g| (i, g)))
+        .collect();
     // Visible columns first (declaration order, ordinals `0..n-1`); the uniques
     // and any explicit PK resolve against these, so appending the hidden rowid
     // last never shifts a referenced ordinal.
@@ -247,7 +257,7 @@ pub(crate) fn table_def_from_spec(
                 // The column-default parser only ever emits a Const literal.
                 other => other.clone(),
             };
-            Ok(mpedb_types::ColumnDef {
+            Ok(mpedb_types::ColumnDef { generated: None,
                 // The declared text VERBATIM, so `sqlite3_column_decltype`
                 // answers what CREATE TABLE said, not the canonical name.
                 decl: c.decl.clone(),
@@ -304,7 +314,7 @@ pub(crate) fn table_def_from_spec(
         // Append the hidden rowid as the trailing column and make it the sole PK.
         // It IS a single-Int64-PK rowid alias, so the existing NULL→max(rowid)+1
         // auto-assign machinery (#85) drives it with no engine change.
-        columns.push(mpedb_types::ColumnDef { decl: None,
+        columns.push(mpedb_types::ColumnDef { generated: None, decl: None,
             name: "rowid".into(),
             ty: mpedb_types::ColumnType::Int64,
             nullable: false,
@@ -322,7 +332,7 @@ pub(crate) fn table_def_from_spec(
             .map(|n| col_index(n))
             .collect::<Result<Vec<u16>>>()?
     };
-    let def = mpedb_types::TableDef {
+    let mut def = mpedb_types::TableDef {
         id: 0, // assigned by Schema::with_added_table (lowest free)
         name: spec.name,
         columns,
@@ -332,6 +342,30 @@ pub(crate) fn table_def_from_spec(
         implicit_rowid,
         kind: mpedb_types::TableKind::Standard,
     };
+    // GENERATED ALWAYS AS (…): compile each expression against the FINISHED
+    // table and store the PROGRAM on the column (unlike CHECK, whose source is
+    // recompiled into a side table on every bundle rebuild — see `GeneratedCol`
+    // for why a generated column carries its compiled form instead). Every
+    // program is compiled before any is installed, so `Schema::validate`'s
+    // forward-reference rule sees the complete picture and a generated column
+    // that reads a later generated column fails the CREATE TABLE.
+    let gen_srcs: Vec<(usize, String, mpedb_types::GeneratedKind)> = generated
+        .into_iter()
+        .map(|(i, (src, kind))| (i, src, kind))
+        .collect();
+    let mut compiled = Vec::with_capacity(gen_srcs.len());
+    for (i, src, kind) in &gen_srcs {
+        let program = mpedb_sql::compile_generated(src, &def, *i).map_err(|e| {
+            Error::Bind(format!(
+                "CREATE TABLE {}: generated column `{}` failed to compile: {e}",
+                def.name, def.columns[*i].name
+            ))
+        })?;
+        compiled.push((*i, mpedb_types::GeneratedCol { expr: src.clone(), kind: *kind, program }));
+    }
+    for (i, g) in compiled {
+        def.columns[i].generated = Some(g);
+    }
     // Compile every CHECK against the FINISHED table before the DDL commits: an
     // expression naming a missing column, using a parameter, or not typing to
     // bool must fail the CREATE TABLE, not sit in the catalog as a constraint
@@ -358,7 +392,7 @@ pub(crate) fn table_def_from_spec(
 pub(crate) fn virtual_table_def_from_spec(
     spec: mpedb_sql::CreateVirtualTableSpec,
 ) -> Result<mpedb_types::TableDef> {
-    let mkcol = |name: &str, ty, nullable| mpedb_types::ColumnDef { decl: None,
+    let mkcol = |name: &str, ty, nullable| mpedb_types::ColumnDef { generated: None, decl: None,
         name: name.to_string(),
         ty,
         nullable,
@@ -404,10 +438,11 @@ pub(crate) fn virtual_table_def_from_spec(
 /// existing row (`Value::Null` when there is no default). Shared by the
 /// autocommit facade and an in-transaction session (#95).
 pub(crate) fn add_column_from_spec(
-    table: &str,
+    def: &mpedb_types::TableDef,
     spec: mpedb_sql::CreateColumnSpec,
 ) -> Result<(mpedb_types::ColumnDef, Value)> {
     use mpedb_types::DefaultExpr;
+    let table = def.name.as_str();
     if spec.unique || spec.pk {
         return Err(Error::Bind(format!(
             "ALTER TABLE {table} ADD COLUMN {}: UNIQUE / PRIMARY KEY on ADD is not \
@@ -452,7 +487,7 @@ pub(crate) fn add_column_from_spec(
     } else {
         Some(DefaultExpr::Const(fill.clone()))
     };
-    let col = mpedb_types::ColumnDef {
+    let mut col = mpedb_types::ColumnDef { generated: None,
         decl: spec.decl.clone(),
         name: spec.name,
         ty: spec.ty,
@@ -466,6 +501,23 @@ pub(crate) fn add_column_from_spec(
         collation: spec.collation,
         affinity: spec.affinity,
     };
+    // `ADD COLUMN … AS (<expr>)`: compile against the WIDENED table, since the
+    // expression's own column is the last one. The engine backfills every
+    // existing row by evaluating it (and refuses STORED once the table has rows,
+    // as sqlite does).
+    if let Some((src, kind)) = spec.generated {
+        let mut widened = def.clone();
+        widened.columns.push(col.clone());
+        let at = widened.columns.len() - 1;
+        let program = mpedb_sql::compile_generated(&src, &widened, at).map_err(|e| {
+            Error::Bind(format!(
+                "ALTER TABLE {table} ADD COLUMN {}: generated expression failed to \
+                 compile: {e}",
+                col.name
+            ))
+        })?;
+        col.generated = Some(mpedb_types::GeneratedCol { expr: src, kind, program });
+    }
     Ok((col, fill))
 }
 
@@ -629,14 +681,14 @@ impl Database {
         table: &str,
         spec: mpedb_sql::CreateColumnSpec,
     ) -> Result<ExecResult> {
-        let (col, fill) = add_column_from_spec(table, spec)?;
         self.engine.refresh_schema_if_stale()?;
-        let id = self
-            .engine
-            .schema()
+        let bundle = self.engine.schema();
+        let (id, def) = bundle
             .schema
             .table_id(table)
+            .and_then(|id| bundle.schema.table(id).map(|t| (id, t)))
             .ok_or_else(|| Error::Bind(format!("ALTER TABLE: no such table `{table}`")))?;
+        let (col, fill) = add_column_from_spec(def, spec)?;
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
         match w.alter_add_column(id, col, fill) {
             Ok(()) => w.commit()?,

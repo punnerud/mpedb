@@ -309,7 +309,7 @@ fn synthetic_window_table(win_types: &[(ColumnType, bool)]) -> TableDef {
     let columns = win_types
         .iter()
         .enumerate()
-        .map(|(k, &(ty, nullable))| mpedb_types::ColumnDef { decl: None,
+        .map(|(k, &(ty, nullable))| mpedb_types::ColumnDef { generated: None, decl: None,
             name: format!("__w{k}"),
             ty,
             nullable,

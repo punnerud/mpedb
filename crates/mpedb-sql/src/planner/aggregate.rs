@@ -254,7 +254,7 @@ fn synthetic_grouped_table(
     let mut out: Vec<mpedb_types::ColumnDef> =
         Vec::with_capacity(key_types.len() + aggs.len() + bare.len());
     for (k, &ty) in key_types.iter().enumerate() {
-        out.push(mpedb_types::ColumnDef { decl: None,
+        out.push(mpedb_types::ColumnDef { generated: None, decl: None,
             name: format!("__g{k}"),
             ty,
             nullable: true, // a group key can be NULL; NULLs group together
@@ -278,7 +278,7 @@ fn synthetic_grouped_table(
             // to the argument's type would reject `stddev_pop(int_col) / 2.0`.
             None => ColumnType::Any,
         };
-        out.push(mpedb_types::ColumnDef { decl: None,
+        out.push(mpedb_types::ColumnDef { generated: None, decl: None,
             name: format!("__g{}", key_types.len() + i),
             ty,
             // COUNT and TOTAL are never NULL (0 / 0.0 over an empty group);
@@ -302,7 +302,7 @@ fn synthetic_grouped_table(
     // the base column. Always nullable — a bare column is carried from a witness
     // row that may hold NULL, and an empty group yields NULL.
     for (j, (_, ty)) in bare.iter().enumerate() {
-        out.push(mpedb_types::ColumnDef { decl: None,
+        out.push(mpedb_types::ColumnDef { generated: None, decl: None,
             name: format!("__b{j}"),
             ty: *ty,
             nullable: true,

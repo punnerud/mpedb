@@ -2290,8 +2290,12 @@ impl WriteSession<'_> {
                 self.txn.alter_rename_column(id, &column, &new_name)?;
             }
             DdlStmt::AlterAddColumn { table, column } => {
-                let (col, fill) = crate::ddl_apply::add_column_from_spec(&table, column)?;
                 let id = resolve(&table)?;
+                let def = schema
+                    .schema
+                    .table(id)
+                    .ok_or_else(|| Error::Bind(format!("ALTER TABLE: no such table `{table}`")))?;
+                let (col, fill) = crate::ddl_apply::add_column_from_spec(def, column)?;
                 self.txn.alter_add_column(id, col, fill)?;
             }
             DdlStmt::AlterDropColumn { table, column } => {
@@ -2903,7 +2907,7 @@ primary_key = ["id"]
         let other_schema = Schema::new(vec![TableDef {
             id: 0,
             name: "users".into(),
-            columns: vec![ColumnDef { decl: None,
+            columns: vec![ColumnDef { generated: None, decl: None,
                 name: "id".into(),
                 ty: ColumnType::Int64,
                 nullable: false,
@@ -3258,7 +3262,7 @@ primary_key = ["id"]
         let foreign_schema = Schema::new(vec![TableDef {
             id: 0,
             name: "users".into(),
-            columns: vec![ColumnDef { decl: None,
+            columns: vec![ColumnDef { generated: None, decl: None,
                 name: "id".into(),
                 ty: ColumnType::Int64,
                 nullable: false,

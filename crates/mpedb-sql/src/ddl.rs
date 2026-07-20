@@ -52,6 +52,13 @@ pub struct CreateColumnSpec {
     /// Several `CHECK`s on one column are folded into one `AND` conjunction —
     /// which is what several CHECKs mean anyway.
     pub check: Option<String>,
+    /// `[GENERATED ALWAYS] AS (<expr>) [STORED|VIRTUAL]` — the expression as
+    /// SOURCE text plus the declared storage mode, for the same reason `check`
+    /// is source here: the parser has no column list to bind against yet. The
+    /// facade compiles it against the finished table (`compile_generated`)
+    /// before the DDL commits. `VIRTUAL` is the default when neither word
+    /// follows, matching sqlite.
+    pub generated: Option<(String, mpedb_types::GeneratedKind)>,
 }
 
 /// `CREATE TABLE <name> (col TYPE [cons…], …[, PRIMARY KEY (a, b)]

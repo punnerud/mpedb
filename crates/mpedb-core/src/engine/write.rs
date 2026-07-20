@@ -277,7 +277,8 @@ impl<'e> WriteTxn<'e> {
         // The streamed column is always TEXT or BLOB (`row` refuses to stream
         // anything else), and neither is a column that converts — but the
         // row's OTHER columns can be, so the same rule applies here.
-        let values = self.with_store_affinity(table_id, values);
+        let affined = self.with_store_affinity(table_id, values);
+        let values = self.with_generated(table_id, &affined)?;
         let values = &values[..];
         self.eng.validate_row_in(&self.bundle, table_id, values)?;
         if self.eng.table_is_fts(table_id) {
@@ -422,9 +423,37 @@ impl<'e> WriteTxn<'e> {
         }
     }
 
+    /// Compute every GENERATED column of `values` (design: `apply_generated`).
+    ///
+    /// The same backstop shape as [`with_store_affinity`](Self::with_store_affinity)
+    /// and for the same reason: the SQL layer computes generated values so
+    /// RETURNING, the triggers and the uniqueness pre-checks all see the row the
+    /// engine will write, but this is the choke point every write entry point
+    /// shares, so a caller reaching the typed row API directly (the mirror
+    /// importer, an SDK) cannot store a stale or NULL generated value. The
+    /// computation is idempotent — it recomputes from the same inputs — so doing
+    /// it twice costs a copy and changes nothing.
+    ///
+    /// Borrows unless the table actually has a generated column.
+    fn with_generated<'v>(
+        &self,
+        table_id: u32,
+        values: &'v [Value],
+    ) -> Result<std::borrow::Cow<'v, [Value]>> {
+        match self.bundle.schema.table(table_id) {
+            Some(t) if t.has_generated() => {
+                let mut owned = values.to_vec();
+                t.apply_generated(&mut owned, &[])?;
+                Ok(std::borrow::Cow::Owned(owned))
+            }
+            _ => Ok(std::borrow::Cow::Borrowed(values)),
+        }
+    }
+
     pub fn insert_row(&mut self, table_id: u32, values: &[Value]) -> Result<()> {
         self.check_write_blocked(table_id)?;
-        let values = self.with_store_affinity(table_id, values);
+        let affined = self.with_store_affinity(table_id, values);
+        let values = self.with_generated(table_id, &affined)?;
         let values = &values[..];
         let __t = std::time::Instant::now();
         self.eng.validate_row_in(&self.bundle, table_id, values)?;
@@ -646,7 +675,8 @@ impl<'e> WriteTxn<'e> {
     /// (enforced; the SQL layer rejects PK updates at bind time too).
     pub fn update_by_pk(&mut self, table_id: u32, new_values: &[Value]) -> Result<bool> {
         self.check_write_blocked(table_id)?;
-        let new_values = self.with_store_affinity(table_id, new_values);
+        let affined = self.with_store_affinity(table_id, new_values);
+        let new_values = self.with_generated(table_id, &affined)?;
         let new_values = &new_values[..];
         self.eng.validate_row_in(&self.bundle, table_id, new_values)?;
         let table = self
@@ -1192,12 +1222,35 @@ impl<'e> WriteTxn<'e> {
         // the new column set to `fill`. Collect fully before mutating so the
         // cursor's read borrow is released before the write pass.
         let (root, count) = self.tree_root(table_id, 0)?;
+        // A GENERATED column is not filled with a constant — every existing row
+        // gets the expression's value for THAT row, computed against the widened
+        // table. sqlite refuses `ADD COLUMN … STORED` outright once the table has
+        // rows (it would have to rewrite them); mirror that refusal so the two
+        // engines answer the same, even though mpedb's rewrite could do it.
+        let gen_def = col.generated.as_ref().map(|_| {
+            new_schema
+                .table(table_id)
+                .expect("widened table exists")
+                .clone()
+        });
+        if let (Some(g), true) = (col.generated.as_ref(), count > 0) {
+            if g.kind == mpedb_types::GeneratedKind::Stored {
+                return Err(Error::Schema(
+                    "cannot add a STORED generated column to a table that already has rows \
+                     (sqlite refuses this too); add it as VIRTUAL, or recreate the table"
+                        .into(),
+                ));
+            }
+        }
         let mut rewritten: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
         {
             let mut c = btree::cursor(self, root, None, None)?;
             while let Some((k, v)) = c.next(self)? {
                 let mut vals = row::decode_row(&v, &old_types)?;
                 vals.push(fill.clone());
+                if let Some(t) = &gen_def {
+                    t.apply_generated(&mut vals, &[])?;
+                }
                 let payload = row::encode_row(&vals, &new_types)?;
                 rewritten.push((k.to_vec(), payload));
             }
