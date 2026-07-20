@@ -50,7 +50,7 @@ use crate::plan::{
     render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, Frame,
     FrameBound, FrameMode, InsertSource, CompoundPlan, GroupKey, Join, JoinKind, OrderOver,
     PlanOnConflict, PlanStmt, PolicyStamp, Projection, RecursiveCtePlan, SelectPlan, SubBody,
-    SubPlan, SubPlanKind, WindowSpec, CTE_TABLE,
+    SubPlan, SubPlanKind, WindowSpec, CTE_TABLE, MAX_PLAN_SUBPLANS,
 };
 #[allow(unused_imports)]
 use crate::plan::{FtsQuery, FtsTerm};
@@ -330,7 +330,40 @@ fn bind_err(msg: impl Into<String>) -> Error {
 /// Count every subplan in the tree — the top-level lifts plus, recursively,
 /// each subplan's own nested lifts (#73 §3).
 fn total_subplans(subs: &[SubPlan]) -> usize {
-    subs.iter().map(|s| 1 + total_subplans(&s.subplans)).sum()
+    subs.iter()
+        .map(|s| {
+            1 + total_subplans(&s.subplans)
+                + match &s.body {
+                    // A compound body's arms own their lifts (format 56); they
+                    // are part of THIS plan's tree and count against the same
+                    // ceiling the decoder enforces.
+                    SubBody::Compound(c) => compound_subplan_total(c),
+                    SubBody::Select(_) => 0,
+                }
+        })
+        .sum()
+}
+
+/// Every lift a compound's arms own, transitively.
+fn compound_subplan_total(c: &CompoundPlan) -> usize {
+    c.arm_subplans.iter().map(|a| total_subplans(a)).sum()
+}
+
+/// Lifts a statement's COMPONENTS own (never on the statement-level list): a
+/// materialized derived table's body (format 52) and a compound's arms
+/// (format 56), at every depth.
+fn owned_subplan_total(stmt: &PlanStmt) -> usize {
+    match stmt {
+        PlanStmt::Compound(c) => compound_subplan_total(c),
+        PlanStmt::Derived(dp) => {
+            total_subplans(&dp.body_subplans)
+                + match &dp.body {
+                    SubBody::Compound(c) => compound_subplan_total(c),
+                    SubBody::Select(_) => 0,
+                }
+        }
+        _ => 0,
+    }
 }
 
 /// A CORRELATED subplan slot is filled per outer row AFTER the gather, so the
@@ -467,11 +500,12 @@ pub(crate) fn plan_statement(
     // statement-level list), so the DoS ceiling — and the footprint below —
     // have to count them here or a body could smuggle an unbounded tree past
     // both. Same 16, matching the recursive decoder's budget.
-    let body_subplans: &[SubPlan] = match &plan_stmt {
-        PlanStmt::Derived(dp) => &dp.body_subplans,
-        _ => &[],
-    };
-    if total_subplans(&subplans) + total_subplans(body_subplans) > 16 {
+    // Every OWNED list counts too: a derived body's (format 52) and every
+    // compound arm's (format 56). They never join the statement-level list, so
+    // a component could otherwise smuggle an unbounded tree past both the DoS
+    // ceiling and the footprint. Same 16, matching the recursive decoder's
+    // budget.
+    if owned_subplan_total(&plan_stmt) + total_subplans(&subplans) > 16 {
         return Err(bind_err(
             "too many subqueries in one statement (max 16, including nested)",
         ));
@@ -521,14 +555,25 @@ pub(crate) fn plan_statement(
     ) {
         match &s.body {
             SubBody::Select(sp) => select_tables(sp, out),
-            SubBody::Compound(c) => {
-                for arm in &c.arms {
-                    select_tables(arm, out);
-                }
-            }
+            SubBody::Compound(c) => stamp_compound_tables(c, select_tables, out),
         }
         for c in &s.subplans {
             stamp_subplan_tables(c, select_tables, out);
+        }
+    }
+    // A compound's arms AND the lifts those arms own (format 56).
+    fn stamp_compound_tables(
+        c: &CompoundPlan,
+        select_tables: &impl Fn(&SelectPlan, &mut Vec<u32>),
+        out: &mut Vec<u32>,
+    ) {
+        for arm in &c.arms {
+            select_tables(arm, out);
+        }
+        for arm in &c.arm_subplans {
+            for s in arm {
+                stamp_subplan_tables(s, select_tables, out);
+            }
         }
     }
     let mut stamped: Vec<u32> = Vec::new();
@@ -538,9 +583,7 @@ pub(crate) fn plan_statement(
     match &plan_stmt {
         PlanStmt::Select(sp) => select_tables(sp, &mut stamped),
         PlanStmt::Compound(c) => {
-            for arm in &c.arms {
-                select_tables(arm, &mut stamped);
-            }
+            stamp_compound_tables(c, &select_tables, &mut stamped);
             // Arms often read the same table; one stamp per table suffices.
             stamped.sort_unstable();
             stamped.dedup();
@@ -558,11 +601,12 @@ pub(crate) fn plan_statement(
         PlanStmt::Derived(dp) => {
             match &dp.body {
                 SubBody::Select(sp) => select_tables(sp, &mut stamped),
-                SubBody::Compound(c) => {
-                    for arm in &c.arms {
-                        select_tables(arm, &mut stamped);
-                    }
-                }
+                SubBody::Compound(c) => stamp_compound_tables(c, &select_tables, &mut stamped),
+            }
+            // The BODY's own lifts read tables too (format 52) — missing their
+            // stamp would let the plan keep serving a since-tightened table.
+            for s in &dp.body_subplans {
+                stamp_subplan_tables(s, &select_tables, &mut stamped);
             }
             select_tables(&dp.outer, &mut stamped);
         }
@@ -829,35 +873,40 @@ fn plan_compound(
     let mut context_keys: Vec<String> = Vec::new();
     let mut list_keys: BTreeSet<String> = BTreeSet::new();
     let mut out_types: Vec<Option<ColumnType>> = Vec::new();
-    let mut subplans: Vec<SubPlan> = Vec::new();
+    // Each arm OWNS its lifts (format 56). See `CompoundPlan::arm_subplans`.
+    let mut arm_subplans: Vec<Vec<SubPlan>> = Vec::with_capacity(c.arms.len());
+    let mut n_slots: u16 = 0;
 
     for (k, arm_ast) in c.arms.iter().enumerate() {
         // Arm-local subplans take the reserved slots AFTER those of the arms
         // before them: planning arm `k` with the accumulated count as its
         // parameter base numbers its `Param` references against the FINAL
-        // statement layout `[user ‖ arm0 subs ‖ arm1 subs ‖ …]` by
+        // statement layout `[level params ‖ arm0 subs ‖ arm1 subs ‖ …]` by
         // construction — the cross-arm slot coordination the old refusal
-        // asked for, with no post-hoc remap to get wrong. The executor needs
-        // no change at all: uncorrelated slots are filled once, BEFORE
-        // dispatch (`exec_stmt_impl`), exactly as for a single SELECT.
-        let arm_base = n_params + subplans.len() as u16;
+        // asked for, with no post-hoc remap to get wrong.
+        let arm_base = n_params + n_slots;
         let (stmt, ptypes, ckeys, lkeys, otypes, arm_subs) =
             plan_select(arm_ast, schema, arm_base, catalog, mode, host_udfs, row_count, consts, None)?;
         let PlanStmt::Select(sp) = stmt else {
             return Err(Error::Internal("plan_select produced a non-select".into()));
         };
-        // A CORRELATED arm subplan needs a per-row fill phase, which the arm
-        // executor (`exec_select`, deliberately fill-free) does not have —
-        // refuse it, never read the unfilled hole. (`split_correlated` routes
-        // correlated conjuncts to `post_filter`, so a refused arm can carry
-        // neither.)
-        if arm_subs.iter().any(|s| !s.outer_args.is_empty()) {
+        // A CORRELATED arm subplan used to be refused here — the arm executor
+        // (`exec_select`) has no per-row fill phase, so its slot would have been
+        // an unfilled hole. It is no longer HOISTED to the statement: the arm
+        // OWNS it, and `exec_compound` runs the arm through
+        // `exec_select_leveled` — the identical discipline `exec_derived` runs
+        // for a body-owned lift, and the top level for its own. So a correlated
+        // lift is filled per ARM row, which is the only row it can name, and
+        // the arm may carry the matching `post_filter`.
+        n_slots = n_slots
+            .checked_add(arm_subs.len() as u16)
+            .ok_or_else(|| bind_err("too many subqueries in one compound SELECT"))?;
+        if n_slots as usize > MAX_PLAN_SUBPLANS {
             return Err(bind_err(
-                "a correlated subquery inside a compound SELECT is not supported yet",
+                "too many subqueries in one compound SELECT (max 16 across all arms)",
             ));
         }
-        debug_assert!(sp.post_filter.is_none(), "uncorrelated arm with a post-filter");
-        subplans.extend(arm_subs);
+        arm_subplans.push(arm_subs);
         // Context slots are appended AFTER the user params, so two arms
         // binding different key sets would give the same slot index two
         // meanings. Identical key lists (the common case: same policy on the
@@ -985,11 +1034,23 @@ fn plan_compound(
     // but each arm numbered its own context slots right after ITS reserved
     // region — with per-arm subplan offsets in play the positions no longer
     // agree across arms. Refuse the combination rather than misnumber a slot.
-    if !subplans.is_empty() && !context_keys.is_empty() {
+    if n_slots != 0 && !context_keys.is_empty() {
         return Err(bind_err(
             "current_setting() and a subquery together in a compound SELECT are \
              not supported yet",
         ));
+    }
+    // Canonical shape: a lift-free compound carries NO per-arm lists at all, so
+    // its bytes (and therefore its plan hash) are what they were before an arm
+    // could own anything.
+    if n_slots == 0 {
+        arm_subplans.clear();
+    }
+    // The parameter table must SPAN the whole reserved region even when the last
+    // arm lifted nothing (its `ptypes` then stop short of the layout's end):
+    // `n_params` is taken from this vector's length one level up.
+    if param_types.len() < (n_params + n_slots) as usize {
+        param_types.resize((n_params + n_slots) as usize, None);
     }
     let ops = c.ops.clone();
     Ok((
@@ -999,12 +1060,16 @@ fn plan_compound(
             order_by,
             limit: c.limit,
             offset: c.offset,
+            arm_subplans,
+            arm_sub_base: n_params,
         }),
         param_types,
         context_keys,
         list_keys,
         out_types,
-        subplans,
+        // The arms OWN their lifts — the statement-level list stays EMPTY
+        // (validate-enforced), exactly as it does for a derived table.
+        Vec::new(),
     ))
 }
 

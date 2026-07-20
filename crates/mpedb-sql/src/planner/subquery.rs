@@ -127,7 +127,8 @@ pub(super) fn lift_subqueries<'a>(
     };
     let stmt = ast::SelectStmt {
         table: s.table.clone(),
-        from_derived: None,
+        // Carried for the same reason `Correlate::rewrite_select` carries it.
+        from_derived: s.from_derived.clone(),
         alias: s.alias.clone(),
         joins: s
             .joins
@@ -434,33 +435,73 @@ impl Lift<'_> {
     }
 
     /// Plan one lifted subquery whose body is a whole compound (#56/format 31).
-    /// A compound subquery body is UNCORRELATED: each arm binds only the outer's
-    /// user params, and an outer-column reference inside an arm resolves to
-    /// nothing and errors as an unknown column (a correlated compound subquery is
-    /// not supported yet — a clean refusal, never a wrong answer). So it is
-    /// planned standalone, exactly like a top-level compound, and evaluated ONCE
-    /// per execute.
+    ///
+    /// **Correlation (format 56).** A compound body used to be UNCORRELATED by
+    /// construction: its arms were planned standalone, so an outer-column
+    /// reference inside an arm resolved to nothing and errored as
+    /// `no table named V0 in this statement`. It now correlates exactly as a
+    /// plain-SELECT body does, and for the same reason the arm-owned lift works:
+    /// the correlation region belongs to the SUBPLAN, not to the compound. Every
+    /// arm is rewritten by ONE shared [`Correlate`] — one arg list, deduped by
+    /// outer slot, so two arms naming the same outer column share a slot — and
+    /// the compound is then planned over the param space
+    /// `[user ‖ correlation args]`. At exec the whole compound is run per outer
+    /// row by the ordinary correlated fill, with the region ALREADY filled, so
+    /// each arm reads it as a plain parameter and nothing inside the compound
+    /// needs a per-row phase of its own.
+    ///
+    /// Each arm's `inner_scope` replaces the previous one while the shared
+    /// `outer_args` accumulate: a name an arm binds itself is that arm's, and
+    /// only a name no arm binds yet the OUTER scope does becomes a correlation.
     fn plan_one_compound(&mut self, cs: &ast::CompoundStmt, kind: SubPlanKind) -> Result<u16> {
-        let (stmt, _ptypes, ctx, _lists, out, subs) =
-            plan_compound(cs, self.schema, self.n_params, self.catalog, self.mode, self.host_udfs, self.row_count, self.consts)?;
+        let mut corr = Correlate {
+            schema: self.schema,
+            // Replaced per arm below; a compound has no FROM of its own.
+            inner_scope: Scope::joined_named(Vec::new())?,
+            nested: Vec::new(),
+            outer_scope: &self.outer_scope,
+            n_params: self.n_params,
+            outer_args: Vec::new(),
+            arg_types: Vec::new(),
+        };
+        let mut rewritten = cs.clone();
+        for arm in &mut rewritten.arms {
+            corr.inner_scope = stmt_scope(self.schema, arm)?;
+            *arm = corr.rewrite_select(arm)?;
+        }
+        let outer_args = corr.outer_args;
+        let arg_types = corr.arg_types;
+        let inner_n = self.n_params + outer_args.len() as u16;
+        let (stmt, inner_ptypes, ctx, _lists, out, subs) =
+            plan_compound(&rewritten, self.schema, inner_n, self.catalog, self.mode, self.host_udfs, self.row_count, self.consts)?;
         if !ctx.is_empty() {
             return Err(bind_err(
                 "current_setting() inside a subquery is not supported yet",
             ));
         }
-        // A top-level compound may now carry (uncorrelated) arm subplans, but a
-        // compound in a SUBQUERY position may not: its arms' slots were numbered
-        // against THIS statement's user params and would collide with the outer
-        // lift's own reserved slots. Refuse by name — the format-31 subplan
-        // shape (no nested lifts under a compound body) is unchanged.
+        // The arms OWN their lifts (format 56), so `plan_compound` hands back an
+        // EMPTY statement-level list — there is nothing here that could collide
+        // with this lift's own reserved slots.
         if !subs.is_empty() {
-            return Err(bind_err(
-                "a subquery inside a compound subquery body is not supported yet",
-            ));
+            return Err(Error::Internal("compound arms did not own their lifts".into()));
         }
         let PlanStmt::Compound(mut cp) = stmt else {
             return Err(Error::Internal("compound body planned to a non-compound".into()));
         };
+        // The inner binder saw each correlation slot in real use — a type it
+        // pinned must MATCH the outer column feeding the slot (the same check
+        // the select path makes).
+        for (j, &want) in arg_types.iter().enumerate() {
+            let slot = self.n_params as usize + j;
+            if let Some(Some(t)) = inner_ptypes.get(slot) {
+                if *t != want {
+                    return Err(bind_err(format!(
+                        "correlated reference is {want} in the outer query but used as {t} \
+                         inside the subquery"
+                    )));
+                }
+            }
+        }
         // A scalar/IN subquery must output exactly one column; EXISTS ignores it.
         if kind != SubPlanKind::Exists && out.len() != 1 {
             return Err(bind_err(match kind {
@@ -489,12 +530,15 @@ impl Lift<'_> {
         let slot = self.n_params + self.subplans.len() as u16;
         self.subplans.push(SubPlan {
             body: SubBody::Compound(cp),
-            outer_args: Vec::new(),
+            outer_args,
             kind,
+            // The ARMS own the compound's lifts, not this subplan (format 56):
+            // `SubPlan::subplans` are filled per row of a SELECT body, which a
+            // compound body is not.
             subplans: Vec::new(),
-            // Uncorrelated, no nested lifts ⇒ the reserved region begins right
-            // after the user params (mirrors the select path's `inner_n`).
-            sub_base: self.n_params,
+            // `[user ‖ correlation]`, and the arms' own reserved slots start
+            // right after — mirrors the select path's `inner_n`.
+            sub_base: inner_n,
             slot_type: ty,
         });
         self.slot_types.push(ty);
@@ -705,7 +749,11 @@ impl<'a> Correlate<'a, '_> {
     fn rewrite_select(&mut self, s: &ast::SelectStmt) -> Result<ast::SelectStmt> {
         Ok(ast::SelectStmt {
             table: s.table.clone(),
-            from_derived: None,
+            // CARRIED, not dropped: a derived FROM source in a nested position
+            // is refused by `plan_select`, and it can only refuse what still
+            // reaches it. Dropping it turned the statement FROM-less, which is
+            // a wrong answer (one synthetic row) rather than a refusal.
+            from_derived: s.from_derived.clone(),
             alias: s.alias.clone(),
             joins: s
                 .joins
@@ -762,14 +810,22 @@ impl<'a> Correlate<'a, '_> {
     }
 
     /// Descend into a nested subquery BODY. A plain `SELECT` is descended into
-    /// for transit correlations (as above); a compound body (#56/format 31) is
-    /// UNCORRELATED and carries no reference to an enclosing row, so there is
-    /// nothing to capture — it is left verbatim, and the compound is lifted one
-    /// level down by that level's own `plan_one_compound`.
+    /// for transit correlations (as above); a compound body (format 56) may now
+    /// correlate too, so EACH ARM is descended into on its own — an arm binds
+    /// its own tables, and a reference it makes to THIS subquery's parent is a
+    /// transit correlation of this level exactly as one from a select body is.
+    /// The rewritten body is then lifted one level down by that level's own
+    /// `plan_one_compound`, which resolves what is left against ITS outer scope.
     fn descend_body(&mut self, inner: &ast::SubqueryBody) -> Result<ast::SubqueryBody> {
         Ok(match inner {
             ast::SubqueryBody::Select(sel) => ast::SubqueryBody::Select(self.descend(sel)?),
-            ast::SubqueryBody::Compound(cs) => ast::SubqueryBody::Compound(cs.clone()),
+            ast::SubqueryBody::Compound(cs) => {
+                let mut out = cs.clone();
+                for arm in &mut out.arms {
+                    *arm = self.descend(arm)?;
+                }
+                ast::SubqueryBody::Compound(out)
+            }
         })
     }
 

@@ -124,8 +124,28 @@ fn union_subplan_reads(s: &SubPlan, schema: &Schema, fp: &mut Footprint) -> Resu
         fp.tables_read.union_with(&sf.tables_read);
         fp.indexes_used |= sf.indexes_used;
     }
+    // A compound body's arms OWN their lifts (format 56); those read tables
+    // too, and leaving them out is the same `conflicts_with` leak the
+    // statement-level walk closes.
+    if let SubBody::Compound(c) = &s.body {
+        union_compound_arm_reads(c, schema, fp)?;
+    }
     for c in &s.subplans {
         union_subplan_reads(c, schema, fp)?;
+    }
+    Ok(())
+}
+
+/// Union the reads of every lift a compound's ARMS own (format 56).
+fn union_compound_arm_reads(
+    c: &crate::plan::CompoundPlan,
+    schema: &Schema,
+    fp: &mut Footprint,
+) -> Result<()> {
+    for arm in &c.arm_subplans {
+        for s in arm {
+            union_subplan_reads(s, schema, fp)?;
+        }
     }
     Ok(())
 }
@@ -157,13 +177,15 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
                 tables_read.union_with(&f.tables_read);
                 indexes_used |= f.indexes_used;
             }
-            Footprint {
+            let mut fp = Footprint {
                 tables_read,
                 tables_written: TableSet::new(),
                 indexes_used,
                 key_access: KeyAccess::Full,
                 read_only: true,
-            }
+            };
+            union_compound_arm_reads(c, schema, &mut fp)?;
+            fp
         }
         // A recursive CTE reads the UNION of what its anchor, recursive term and
         // outer statement read (the working table itself sets no bit —
@@ -213,6 +235,10 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
             // statement-level `union_subplan_reads` closes.
             for s in &dp.body_subplans {
                 union_subplan_reads(s, schema, &mut fp)?;
+            }
+            // …and so does a COMPOUND body's per-arm list (format 56).
+            if let SubBody::Compound(c) = &dp.body {
+                union_compound_arm_reads(c, schema, &mut fp)?;
             }
             fp
         }

@@ -218,10 +218,10 @@ the layout (`base + len == n_params`, no context slots) and derives the
 correlation row from the BODY's `[table0 ‖ … ‖ tableN]` — the one place a
 forged `outer_arg` would otherwise read the wrong column.
 
-**Still refused, by name:** lifts in a COMPOUND body (its arms execute as a
-unit with no per-row fill phase — the same rule a compound *subquery* body
-follows), and lifts in the OUTER statement (they would number their slots from
-the same base the body's occupy).
+**Still refused, by name:** lifts in the OUTER statement (they would number
+their slots from the same base the body's occupy). Lifts in a COMPOUND body
+were refused one stage longer — closed by §5.6, which pushes the same ownership
+one level further down, to the ARM.
 
 **Accounting.** A body-owned lift reserves a parameter slot exactly as a
 statement-level one does, so `CompiledPlan::n_subplan_slots()` counts both and
@@ -232,3 +232,98 @@ likewise count the body's tree.
 Simple aliased projection/filter bodies still take the Stage-B flatten (better
 plans: index access paths); materialization is the fallback, so every
 previously-answered shape plans exactly as before.
+
+## 5.6 ARM-owned compound lifts, and a correlated compound body (2026-07-20, PLAN_FORMAT 56)
+
+§5.5's move transferred. Three refusals fell to it, and they are one refusal:
+
+```sql
+-- (1) a correlated subquery INSIDE a compound arm
+SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.b = t.a) UNION SELECT id FROM u
+-- (2) a compound SUBQUERY BODY whose arms reach OUT
+SELECT id FROM t WHERE EXISTS (SELECT 1 FROM u WHERE u.b = t.a UNION SELECT 1 FROM u WHERE u.id = t.id)
+-- (3) a lift inside a COMPOUND derived-table body
+SELECT count(*) FROM (SELECT a FROM t WHERE a IN (SELECT b FROM u) UNION SELECT id FROM u) s
+```
+
+**The same argument as §5.5, one level down.** A compound has no outer row *at
+all*: `exec_compound` runs each arm over its own rows and combines the
+projected sets. So a lift HOISTED onto the enclosing statement (which is what
+format 49 did with an arm's lifts) can only be filled once, before dispatch —
+which is fine for an uncorrelated lift and *meaningless* for a correlated one.
+That is why the correlated case was refused, and it is the identical shape as
+"the derived body's outer row is a materialised `CTE_TABLE` row with no base
+columns".
+
+**Ownership.** `CompoundPlan` carries `arm_subplans: Vec<Vec<SubPlan>>` and one
+`arm_sub_base: u16`; arm `k`'s lifts occupy `arm_base(k) + i`, with
+`arm_base(k) = arm_sub_base + Σ_{j<k} |arm_subplans[j]|` — the layout
+`[level params ‖ arm0 ‖ arm1 ‖ …]` each arm was already numbered against at
+plan time, now stored instead of derived. `exec_compound_arm` runs *exactly the
+discipline `exec_derived` runs one level up*: fill the arm's uncorrelated lifts
+once, then `exec_select_leveled(base = arm_base(k), subplans = arm_lifts(k))`
+so the correlated ones are filled per ARM row after the arm's own gather. The
+statement-level `subplans` list is consequently EMPTY for a compound, and
+`validate` enforces that — the same rule a derived plan follows.
+
+**(2) is the correlation region, not ownership.** A compound *subquery body*
+correlates the way a plain-SELECT body always has: one shared `Correlate` walks
+every arm (its `inner_scope` swapped per arm, its `outer_args` accumulating and
+deduped by outer slot), the compound is planned over `[user ‖ correlation]`, and
+the whole compound is executed per outer row with the region ALREADY filled. So
+each arm reads it as an ordinary parameter and nothing inside the compound needs
+a per-row phase of its own. `Correlate::descend_body` descends into a nested
+compound's arms too, so a transit correlation (§3.3 of DESIGN-SUBQUERY-NEXT)
+crossing a compound is captured like any other.
+
+**Shared as CODE, not copied.** `exec_select_leveled`, `run_subplan`,
+`subplan_value`, `check_slot_discipline`/`check_correlated_slots`,
+`validate_subplan_rec` and `select_row_types` are the same functions the
+statement level and the derived body use. Two rules are *stronger* here than a
+naive per-arm copy would be:
+
+- the gather-side slot discipline runs over the WHOLE arm-lift region for EVERY
+  arm — a slot owned by *another* arm is just as unfilled during this arm's
+  gather, so reading one across arms is exactly as illegal as reading one's own;
+- the executor rebuilds the parameter buffer from the level's params for each
+  arm, so another arm's reserved slots are NULL rather than stale.
+
+`validate_compound` additionally pins `arm_sub_base` to the caller's parameter
+level (statement `n_user_params`, a subplan's `sub_base`, a derived body's
+`body_sub_base`), types every arm slot from the lift's own `slot_type`, and
+bounds each arm's list at `MAX_SUBPLANS` — so a forged blob cannot buy a weaker
+check by moving its lifts onto an arm, and cannot point an arm's fill at live
+user slots.
+
+**Accounting.** Arm-owned lifts reserve parameter slots exactly as
+statement-level ones do: `CompiledPlan::n_subplan_slots()` counts them (through
+a compound statement, and through a compound derived-table body), the planner
+refuses more than 16 across all arms, decode and validate draw every subplan
+anywhere in the plan from ONE `MAX_SUBPLANS` tree budget, and both the footprint
+and the RLS policy stamps walk the arms' trees. (The stamp walk also picked up
+a §5.5 omission on the way: a derived BODY's own lifts were never stamped.)
+
+**Still refused, by name:** `current_setting()` together with a subquery in one
+compound (the context slots sit after the reserved region and no longer line up
+across arms), and a derived table in a nested position — see §5.7.
+
+## 5.7 What a derived table in a NESTED position still needs
+
+`SELECT count(*) FROM (SELECT … FROM (SELECT DISTINCT … LIMIT 3) i …) o`, a
+derived table inside a compound ARM, and one inside a lifted subquery's body all
+still refuse by name ("only supported in a statement's outermost FROM"). §5.1
+gave two reasons for making the derived table a STATEMENT node; §5.6 retires the
+second of them ("makes a derived source representable in positions whose slot
+layout is exactly what `plan_compound` refuses today" — it refuses nothing of
+the sort any more). What is left is the first: `FromSource = Base | Derived`
+touches every `SelectPlan` consumer.
+
+The ownership move points at the shape: a SELECT should OWN its derived source
+(`SelectPlan.derived: Option<Box<DerivedSource>>`, the body + its owned lifts,
+read through `CTE_TABLE`), because a derived table belongs to the query that
+reads it and to nothing else — exactly as an arm's lift belongs to the arm and a
+body's lift to the body. That covers all three nested positions at once (a
+compound arm, a derived body and a subquery body are each a `SelectPlan`) and
+retires `PlanStmt::Derived`; the sharp edge is that `validate_select`'s
+`CTE_TABLE` resolution currently comes from the STATEMENT node and would have to
+come from the level being validated. Not attempted here.

@@ -265,10 +265,37 @@ SELECT (SELECT max(b) FROM t1) FROM t1 UNION SELECT b FROM t1
 30
 40
 
-# A CORRELATED subquery in an arm stays refused (the arm executor has no
-# per-row fill phase).
-statement error compound SELECT is not supported yet
+# A CORRELATED subquery in an arm is ANSWERED as of format 56: the ARM OWNS the
+# lift, so `exec_compound_arm` fills it per ARM row through the same
+# `exec_select_leveled` the top level and a derived body use. The arm's row is
+# the only row such a correlation can name — a compound has no outer row — which
+# is why hoisting it onto the statement could never fill it. Cross-checked
+# against the bundled sqlite 3.45 in crates/mpedb/tests/compound_subquery.rs.
+query I rowsort
 SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM u WHERE u.v = t1.b) UNION SELECT id FROM t1
+----
+1
+2
+3
+4
+
+# …and the form where the correlation actually restricts the answer: only
+# t1.b = 20 has a matching u row, so the left arm contributes id 2 alone.
+query I rowsort
+SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM u WHERE u.v = t1.b) UNION SELECT id FROM t1 WHERE id > 3
+----
+2
+4
+
+# A compound SUBQUERY BODY whose arms reach OUT to the enclosing row — the
+# `no table named V0 in this statement` refusal, closed by the same format. The
+# correlation region belongs to the SUBPLAN and is filled once per outer row
+# BEFORE the compound runs, so each arm reads it as an ordinary parameter.
+query I rowsort
+SELECT id FROM t1 WHERE EXISTS (SELECT 1 FROM u WHERE u.v = t1.b UNION SELECT 1 FROM u WHERE u.id = t1.id)
+----
+1
+2
 
 statement error ON condition is not supported yet
 SELECT t1.id FROM t1 JOIN u ON t1.b = (SELECT max(v) FROM u)
