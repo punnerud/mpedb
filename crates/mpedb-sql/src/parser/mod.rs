@@ -93,7 +93,7 @@ pub(crate) const MAX_SET_ITEMS: usize = 1024;
 /// `EXPLAIN`, and the number of parameters ($n gives max n; `?` are numbered
 /// left-to-right in statement order).
 pub(crate) fn parse_statement(sql: &str) -> Result<(Stmt, bool, u16)> {
-    let (stmt, is_explain, n_params, ctes) = parse_statement_ctes(sql, &[])?;
+    let (stmt, is_explain, n_params, ctes) = parse_statement_ctes(sql, &[], &[])?;
     if !ctes.is_empty() {
         return Err(Error::Bind(
             "WITH (common table expressions) is only handled by the top-level \
@@ -117,10 +117,15 @@ pub(crate) fn parse_statement_ctes(
     // HOST aggregate `(name, n_arg)` registrations (design/DESIGN-UDF.md stage
     // 2); `&[]` for every caller that has none.
     host_aggs: &[(String, i32)],
+    // The subset of `host_aggs` registered with sqlite's WINDOW protocol
+    // (`create_window_function`: xValue + xInverse as well as xStep/xFinal).
+    // Only these may take an OVER clause; `&[]` for every caller with none.
+    window_aggs: &[String],
 ) -> Result<(Stmt, bool, u16, CteDefs)> {
     let toks = tokenize(sql)?;
     let mut p = Parser::new(sql, toks);
     p.host_aggs = host_aggs.to_vec();
+    p.window_aggs = window_aggs.to_vec();
     let is_explain = if p.eat_kw(Kw::Explain) {
         if p.peek_kw(Kw::Explain) {
             return Err(p.err_here("EXPLAIN cannot be nested"));
@@ -188,6 +193,9 @@ struct Parser<'a> {
     /// is made before the argument list is read. Empty for every caller that
     /// registered none, so the grammar is bit-for-bit unchanged for them.
     host_aggs: Vec<(String, i32)>,
+    /// Host aggregates that ALSO carry the window protocol (see
+    /// `parse_statement_ctes`). A subset of `host_aggs` by name.
+    window_aggs: Vec<String>,
 }
 
 impl<'a> Parser<'a> {
@@ -201,6 +209,7 @@ impl<'a> Parser<'a> {
             max_params: 0,
             depth: 0,
             host_aggs: Vec::new(),
+            window_aggs: Vec::new(),
             stack_base: {
                 let probe = 0u8;
                 &probe as *const u8 as usize

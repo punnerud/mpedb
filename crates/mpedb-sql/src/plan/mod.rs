@@ -435,7 +435,17 @@ const MAX_JOINS: usize = 16;
 //     NOTE (worktree, 2026-07-19): rebased onto main at 49 (derived-table
 //     materialization); this takes 50 by instruction — expr opcode tags 56..60
 //     — and the numbers are reconciled at merge.
-const PLAN_FORMAT: u8 = 54;
+// 55: HOST WINDOW AGGREGATES (sqlite's `create_window_function`). A thirteenth
+//     window-function tag introduces a host window aggregate, followed by its
+//     NAME as a length-prefixed string; the twelve built-in tags carry nothing
+//     new and every pre-existing window encodes byte-for-byte as in format 54.
+//     A host WINDOW aggregate is a strictly stronger registration than a host
+//     grouped aggregate — it also supplies `xValue`/`xInverse`, which is what
+//     lets a MOVING frame slide instead of re-aggregating — so the plan-level
+//     name is resolved against a separate registry, and a plain
+//     `create_function` aggregate still cannot appear here. Like every other
+//     host reference such a plan is connection-local (`contains_host_call`).
+const PLAN_FORMAT: u8 = 55;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -911,6 +921,12 @@ pub struct WindowSpec {
     /// and `first_value`/`last_value`/`nth_value` windows — the only functions
     /// whose result depends on it; the planner refuses one on any other function.
     pub frame: Option<Frame>,
+    /// The HOST window aggregate's name (format 55). `Some` exactly when `func`
+    /// is [`WindowFunc::Host`], and `None` for every built-in — which is what
+    /// keeps the plan bytes of every pre-existing window shape unchanged. Like
+    /// every other host reference the plan carries the NAME, never the callback,
+    /// and `contains_host_call` keeps such a plan out of the shared registry.
+    pub host: Option<String>,
 }
 
 /// An explicit window frame (format 36): a unit (`ROWS`/`RANGE`/`GROUPS`) plus a
@@ -1003,6 +1019,7 @@ impl Frame {
         if !matches!(
             func,
             WindowFunc::Agg(_)
+                | WindowFunc::Host
                 | WindowFunc::FirstValue
                 | WindowFunc::LastValue
                 | WindowFunc::NthValue(_)
@@ -1088,6 +1105,12 @@ pub enum WindowFunc {
     /// `cume_dist()` — `(rows whose ORDER BY value is ≤ the current row's, peers
     /// included) / rows_in_partition`. `Float64`, never NULL, no argument.
     CumeDist,
+    /// A HOST-registered window aggregate — sqlite's `create_window_function`
+    /// (`xStep`/`xFinal` PLUS `xValue`/`xInverse`). The NAME rides in
+    /// [`WindowSpec::host`] rather than here, so this enum stays `Copy` and the
+    /// twelve built-in shapes encode byte-for-byte as they always did. Result
+    /// type is `Any`: the callback decides per row.
+    Host,
 }
 
 impl WindowFunc {
@@ -1108,6 +1131,7 @@ impl WindowFunc {
             WindowFunc::Ntile(_) => 10,
             WindowFunc::PercentRank => 11,
             WindowFunc::CumeDist => 12,
+            WindowFunc::Host => 13,
         }
     }
 }
@@ -1828,7 +1852,10 @@ fn select_has_host_call(sp: &SelectPlan) -> bool {
         // the same reason a host function call is (design/DESIGN-UDF.md stage 3).
         || sp.order_by.iter().any(|(_, _, c)| c.host().is_some())
         || sp.windows.iter().any(|w| {
-            opt_prog_host_call(&w.arg)
+            // The window function ITSELF may be host-registered (format 55),
+            // not just its sub-expressions — same one-connection-only rule.
+            w.host.is_some()
+                || opt_prog_host_call(&w.arg)
                 || w.partition_by.iter().any(ExprProgram::has_host_call)
                 || w.order_by.iter().any(|(p, _)| p.has_host_call())
                 || opt_prog_host_call(&w.default)

@@ -30,9 +30,10 @@ or safe no-op, never a wrong answer):
 - **UDF registration is REAL — scalar AND aggregate** (`sqlite3_create_function
   [_v2]`, design/DESIGN-UDF.md stages 1 + 2): the callbacks are stored per
   connection and SQL that calls the function dispatches to them, including a real
-  `sqlite3_aggregate_context`. `_create_window_function` (`xValue`/`xInverse`) and
-  `_create_collation*` still refuse cleanly (invoking the caller's
-  `xDestroy(pApp)`, so CPython does not leak the wrapped callable) — stage 3.
+  `sqlite3_aggregate_context`. `_create_collation*` (stage 3) and
+  `_create_window_function` (stage 4 — `xValue`/`xInverse`, a real SLIDING
+  frame) are real too; the remaining refusals invoke the caller's
+  `xDestroy(pApp)`, so CPython does not leak the wrapped callable.
 - **VFS / virtual-table module ABI** (`sqlite3_vfs_*`, `sqlite3_create_module*`):
   mpedb has its own storage engine, not sqlite's pager — a named VFS is refused
   (see `open_v2`); the one module that matters, **FTS5, is native**, not a plugin.
@@ -167,7 +168,7 @@ against `_sqlite3.cpython-312` on Linux/x86-64 (Python 3.12).
 |---|---|---|
 | `sqlite3_create_function` / `_create_function_v2` (SCALAR) | ✅ | Real dispatch (design/DESIGN-UDF.md stage 1). The `xFunc` is stored per connection and a SQL call to that name invokes it with the evaluated arguments. `nArg = -1` is variadic; re-registering the same `(name, nArg)` replaces (running the old `xDestroy`); `xFunc == NULL` deletes. Names are matched case-insensitively. A plan containing a host call is compiled/executed LOCALLY and never published to the shared plan registry (it is valid only for the connection that registered the function) |
 | `sqlite3_create_function[_v2]` (AGGREGATE: `xStep`/`xFinal`) | ✅ | Real dispatch (design/DESIGN-UDF.md stage 2). `xFunc == NULL` + both of `xStep`/`xFinal` registers an aggregate; half a pair is `SQLITE_MISUSE`; all-NULL deletes. The executor mints one accumulator per group, steps it per surviving row (after `WHERE`/policy/`FILTER`/DISTINCT) and finalizes at the group's end; an EMPTY group finalizes a fresh, never-stepped context (→ NULL, sqlite's rule). Unlike a built-in, a user aggregate is stepped for NULL arguments too — sqlite's behaviour, which Django relies on. The call shape is one argument. Same local-plan rule as a scalar. Verified against CPython's `create_aggregate` (`STDDEV_POP` bare / `GROUP BY` / empty / all-NULL: identical to stock sqlite) |
-| `sqlite3_create_window_function` | ❌ stub | Refuse with `SQLITE_ERROR` (destructor honored) — `xValue`/`xInverse` have no mpedb equivalent, and `myagg(x) OVER (…)` is refused at parse |
+| `sqlite3_create_window_function` (`xStep`/`xFinal`/`xValue`/`xInverse`) | ✅ | **Real** (design/DESIGN-UDF.md stage 4, PLAN_FORMAT 55). A registration carrying all four callbacks becomes a WINDOW aggregate: `myagg(x) OVER (…)` compiles, and the executor SLIDES the frame — `xStep` for each row entering, `xInverse` for each row leaving, `xValue` once per row, `xFinal` once per PARTITION. That is the call sequence, not just the answers: re-aggregating per row would never invoke `xInverse` and would call `xFinal` N times, which a counting implementation can see. Legal because every frame shape mpedb accepts is monotone in window order; a non-monotone move rebuilds the state rather than trusting it. Errors out of `xStep`/`xValue`/`xInverse` fail the statement; an error out of `xFinal` does NOT (sqlite does not propagate a finalizer failure out of `sqlite3_step`). **Scope**: ONE argument (the sliding protocol feeds `xInverse` the same row's arguments `xStep` got); `xStep`+`xFinal` without the pair is a plain aggregate, and `OVER` then refuses BY NAME naming the missing registration rather than answering a bounded frame with a whole-partition value. All-NULL callbacks delete the entry; `nArg` outside `-1..=127` or a half `xStep`/`xFinal` pair is `SQLITE_MISUSE` with the destructor honored |
 | `sqlite3_create_collation_v2` | ❌ stub | Refuse with `SQLITE_ERROR` (destructor honored) — DESIGN-UDF stage 3 |
 | `sqlite3_set_authorizer` | ✅ | **Real compile-time gate (#112 wave 3).** Every prepare (and every `sqlite3_exec` statement) shows its actions to the callback before the statement is accepted, driven by `mpedb::Database::access_report` — the compiled plan's footprint refined to COLUMNS, produced by the same compile the statement will run through, so an authorized statement and the executed one can never be two different plans. Codes raised: `SELECT`/`READ`/`INSERT`/`UPDATE`/`DELETE`/`TRANSACTION`/`SAVEPOINT`/`PRAGMA`/`CREATE_*`/`DROP_*`/`ALTER_TABLE`. `SQLITE_OK`/`SQLITE_DENY` are exact, with sqlite's two messages ("access to *t.c* is prohibited" for a denied column read, "not authorized" otherwise, both `SQLITE_AUTH`); an unknown verdict is "authorizer malfunction". **`SQLITE_IGNORE` refuses by name** — it means "read this column as NULL" and mpedb has no plan rewrite for that, so returning the real value would leak exactly what the callback hid. A statement with no sqlite action code (`CREATE`/`DROP POLICY`) or one that cannot be described is refused while an authorizer is registered (fail-closed). Column attribution is EXACT for a single-table statement; a join/compound/subquery widens to "every column of every table read" — over-reports, never under-reports. `crates/mpedb-capi/src/auth.rs`, `crates/mpedb/src/access.rs` |
 | `sqlite3_trace_v2` / `_progress_handler` | ❌ stub | Registration accepted, callback never fired |
@@ -179,7 +180,7 @@ against `_sqlite3.cpython-312` on Linux/x86-64 (Python 3.12).
 | `sqlite3_user_data` | ✅ | Returns the registration's `pApp` |
 | `sqlite3_aggregate_context` | ✅ | First call of an aggregation with `nBytes > 0` allocates that many ZEROED bytes; every later call in the SAME aggregation (`xFinal` included) returns the SAME pointer; `nBytes <= 0` never allocates and returns NULL when the group was never stepped. Freed after `xFinal`. NULL inside a scalar callback, as sqlite does for that misuse |
 | `sqlite3_context_db_handle` | ❌ stub | Returns NULL |
-| Online-backup API (`sqlite3_backup_*`) | ❌ stub | `_init` → NULL (use `mpedb mirror`); the rest are inert |
+| Online-backup API (`sqlite3_backup_*`) | ✅ | **Real** (`backup.rs` + `mpedb::backup`). An mpedb database is ONE self-describing file and mpedb has one writer at a time, so a consistent copy is exactly the file's bytes taken under the writer lock. The copy VOIDS its boot id, which is the signal the engine's own post-attach recovery watches for — the first attach re-initializes the writer mutex and clears the reader table, so the image is a fresh incarnation rather than one holding the backing-up process's lock and the source's reader pins. The destination's `Database` is reopened over the installed file and its host functions/collations re-installed, so a backup is invisible to the caller's UDFs; `sqlite3_close` answers `SQLITE_BUSY` while a backup is outstanding. **The one deliberate difference**: sqlite copies incrementally under a read lock and RESTARTS if the source is written mid-copy; mpedb captures one instant at `_init`, so nothing can invalidate the image and `step(n)` paces the progress REPORT rather than the capture — a write to the source mid-backup is not in the copy, and the number of steps is over MPEDB's page count (an mpedb file pre-reserves its pages), not sqlite's. Abandoning a backup before `SQLITE_DONE` leaves the destination untouched. Refused BY NAME: a `temp`/ATTACHed schema name (`unknown database <name>`), a destination mid-transaction or with open blob handles, a read-only destination |
 | Incremental blob (`sqlite3_blob_*`) | ✅ | **Real** (`blob.rs`): `_open`/`_read`/`_write`/`_bytes`/`_reopen`/`_close`, contract probed off sqlite 3.45.1. Size FIXED at open (a write never grows the value; out-of-range I/O is `SQLITE_ERROR` "SQL logic error"); `SQLITE_READONLY` on a read-only handle; open refusals carry sqlite's exact text (`no such rowid: N`, `cannot open value of type integer`, `cannot open indexed column for writing`, `cannot open table without rowid: t`). **Expiry under MVCC**: mpedb has no b-tree cursor to invalidate, so the handle snapshots its row at open and each I/O re-reads and compares — row deleted or ANY column changed ⇒ `SQLITE_ABORT` ("query aborted"), permanently (even `_reopen` then aborts, as sqlite does). A blob write is a full-row UPDATE **guarded on the snapshot**, so read-patch-write is atomic in autocommit: a concurrent change becomes the expiry answer, never a lost update. Writes through a handle expire nothing, and same-row siblings on the connection are refreshed. Divergences, by name: a handle on ANOTHER connection sees the changed row and expires where sqlite would let it read the new bytes (inherent to snapshot-compare); a blob write that would leave a TEXT value invalid UTF-8 is refused (mpedb text is strictly UTF-8) rather than silently restyling the cell. `sqlite3_close` answers `SQLITE_BUSY` while a handle is open, and `sqlite3_close_v2` leaves sqlite's **zombie** connection — logically closed, kept alive so the outstanding handle keeps working, freed by the last `sqlite3_blob_close` (both probed) |
 | `zeroblob(N)` / `sqlite3_bind_zeroblob[64]` | ✅ | N zero bytes, MATERIALIZED (mpedb has no lazy zero-run representation — semantically identical), capped at sqlite's `SQLITE_MAX_LENGTH` 1e9 with `SQLITE_TOOBIG` "string or blob too big", which is also the memory guard. mpedb's binder refuses a function CALL in `INSERT … VALUES` position and never const-folds `BExpr::Call`, so the shim rewrites `zeroblob(<const>)` to the byte-identical blob literal in code regions (quote/comment aware, ≤ 16 MiB inline); the host UDF still backs non-constant and over-cap arguments. 19 value/`typeof`/`hex` cases diffed against stock 3.45.1: **0 divergences** |
 | `sqlite3_serialize` / `_deserialize` | ❌ stub | NULL / `SQLITE_ERROR` |
@@ -1343,7 +1344,7 @@ codes/messages, blob/backup surfaces).
 | E3 | 14 | **Declared-type family.** (a) 6 × decltype-canonicalization (the ⚠️ divergence above — needs verbatim decl text in the schema); (b) 8 × bind rigidity where sqlite coerces: text→`timestamp` (CPython's own adapters bind datetime as an ISO STRING — `insert into t(x) values (?)` with `"2026-07-19 10:00:00"` into `x timestamp` is IntegrityError; stock stores it), int→`text`, blob→`text`. | `crates/…/scratchpad` repros in section text |
 | E2 | 38 | **Incremental blob I/O** (`sqlite3_blob_*` = mpedb #43). All of `BlobTests`; refusal is honest OperationalError now. | `con.blobopen("t", "b", 1)` |
 | E3 | ~~14~~ **7** | **Declared-type family.** (a) ~~6 × decltype-canonicalization~~ **CLOSED (#112 wave 2)**: `ColumnDef` carries `decl: Option<String>` — the declared text VERBATIM, sliced out of the CREATE TABLE source (canonical bytes v7→v8). `sqlite3_column_decltype` returns what the statement said, so `PARSE_DECLTYPES` converters fire. All 6 `DeclTypesTests` + `DateTimeTests.test_sqlite_date` flip. (b) STILL OPEN — 7 × bind rigidity where sqlite coerces: text→`timestamp` (CPython's own adapters bind datetime as an ISO STRING — `insert into t(x) values (?)` with `"2026-07-19 10:00:00"` into `x timestamp` is IntegrityError; stock stores it), int→`text`, blob→`text`. | `crates/…/scratchpad` repros in section text |
-| E4 | 9 | **Window functions** (`sqlite3_create_window_function`) — DESIGN-UDF stage 3b; clean refusal. | |
+| E4 | **FIXED (2026-07-20, #112 wave 4)** | ~~Window functions~~ → `sqlite3_create_window_function` is real (DESIGN-UDF stage 4, PLAN_FORMAT 55; see the surface table row for the sliding protocol and the named scope). All 9 `WindowFunctionTests` pass. | `crates/mpedb/tests/host_window_agg.rs`, `capi.rs::a_host_window_function_slides_its_frame` |
 | E5 | 8 | **Authorizer** (`sqlite3_set_authorizer` accepted, never invoked — would need compile-time callbacks). | |
 | E6 | ~~6~~ **0** | **Custom collations — CLOSED (#112 wave 2), with a NAMED boundary.** `sqlite3_create_collation[_v2]` registers a real comparator; `ORDER BY <expr> COLLATE <name>` sorts through it (plain table, compound, derived table, grouped, join — all differentially matched against stock). A host collation is a COMPARATOR, so it stops exactly where a KEY ENCODING starts: a column declared `COLLATE <host>`, a `GROUP BY`/`DISTINCT` fold, and a comparison's `COLLATE` all REFUSE with sqlite's own "no such collation sequence: <name>" rather than being answered under BINARY — an index built bytewise cannot answer a host-collated probe, and answering it anyway is the wrong-answer-with-no-error this refuses to be. Enforced structurally: those paths take a built-in `Collation`, which no registration can produce. Plans naming one are connection-local (the host-UDF no-publish rule). | `con.create_collation("x", f)` |
 | E7 | ~~6~~ **0** | **Host AGGREGATES are N-ary — CLOSED (#112 wave 2).** `AggCall` grows `extra_args` (PLAN_FORMAT 51) and the AST's `Expr::Agg` a trailing argument list; the parser takes the whole list for a HOST name only (every built-in still falls through to the `min(a,b)`/`max(a,b)` scalar rule, then to the one-argument error), the arity gate matches the CALL's count against the registration (exact or variadic `-1`), and the executor evaluates every argument over the same base row and hands `xStep` `[arg] ‖ extra_args`. `count(*)`'s row-shape stays exclusive to `count`. All 6 `AggregateTests.test_aggr_check_param*` flip. | `create_aggregate("f", 2, C)` then `select f(a, b) …` |
@@ -1502,6 +1503,160 @@ gap a consumer would hit on its first migration.
   introspection; the iterdump query shape; a trigger created and fired.
 * `crates/mpedb-sql/src/token.rs` (+2) and `crates/mpedb-capi/src/sql.rs`
   (+1) unit tests for the lexer and the trigger-aware splitter.
+
+### #112 wave 4 (2026-07-20): window functions, the backup API, the function-arg limit
+
+Same interpreter, same tarball, same route as every row above. The baseline was
+**re-derived at this head first** — wave 3 quoted 402, but the decltype,
+collation and N-ary-aggregate work landed after that measurement and the head
+had moved on again:
+
+| | run | pass | fail/error | skip |
+|---|---|---|---|---|
+| stock libsqlite3 3.45.1 (baseline) | 466 | **461** | 0 | 5 |
+| shim, baseline re-derived at `2fe36f7` | 466 | 426 | 35 | 5 |
+| + the FUNCTION_ARG limit + the backup API | 466 | 431 | 30 | 5 |
+| **shim, after this wave** | 466 | **440** | **21** | 5 |
+
+**+14, zero regressions** (each step's failing set is a strict subset of the
+previous step's). 440/461 = **95.4 %** of the baseline-passing suite.
+
+| bucket | tests | what happened |
+|---|---|---|
+| A — window functions | **+9** | Built. The gap was NOT frame spellings — see below. |
+| B — the backup API | **+4** of 7 | Built; 3 refused/diverge by name. |
+| C — `SQLITE_LIMIT_FUNCTION_ARG` | **+1** | Built, with the wrong-answer risk closed structurally. |
+
+#### A — the triage that changed the bucket
+
+The brief expected a frame-spelling gap ("`RANGE` vs `ROWS`? named windows?
+`FILTER`?"). It is none of those. All 9 tests are `WindowFunctionTests`, and all
+9 died in `setUp`, on `con.create_window_function("sumint", 1, WindowSumInt)` —
+mpedb's SQL window functions were never the problem. The gap was
+**`sqlite3_create_window_function`**: user-defined window AGGREGATES.
+
+And the gap could not be closed by re-aggregating each frame with the existing
+`xStep`/`xFinal` pair, because these tests assert the CALL SEQUENCE, not the
+answers: `test_win_missing_method` requires `'inverse' method not defined` to be
+raised, and `test_win_exception_in_method` patches `value` and `inverse` and
+requires each to surface. A re-aggregation would never call either. So the real
+protocol was built:
+
+* `HostAggState` grows `inverse` (undo a row that left the frame) and `value`
+  (the current frame's result WITHOUT consuming the state), both defaulting to a
+  refusal — silently doing nothing would compute a running total for a frame the
+  caller bounded.
+* `Database::register_host_window_aggregate` is a separate, strictly stronger
+  registration, exactly as sqlite makes it. A plain `create_function` aggregate
+  under `OVER` still refuses **by name**, naming the missing registration.
+* `exec/window.rs` gains the only non-re-aggregating path in the window
+  executor: it SLIDES. Legal because every frame shape mpedb accepts is monotone
+  in window order (`lo` and `hi` both non-decreasing); a non-monotone move is
+  detected and the state rebuilt rather than trusted.
+* PLAN_FORMAT 54 → 55: a thirteenth window-function tag introduces a host window
+  aggregate followed by its NAME. Every built-in window encodes byte-for-byte as
+  before, and such a plan reports `contains_host_call`, so it never reaches the
+  shared registry — pinned by a second connection to the same file, which runs
+  the built-in plan and cannot find the host one.
+
+**Engine-side, and flagged as the brief asked.** This is the one bucket that
+could not live in `crates/mpedb-capi`. The diff touches `mpedb-types/agg.rs`
+(two defaulted trait methods), `mpedb-sql` (`ast.rs`, `parser/{mod,expr}.rs`,
+`planner/window.rs`, `plan/{mod,encode,decode,validate,explain}.rs`),
+`mpedb/src/{lib.rs, exec/window.rs}` and the shim. `binder.rs` is touched ONLY
+additively — `HostUdfSet` gains a `window_aggs` name list with a getter and a
+setter, nothing existing is re-shaped — because another agent owns that file.
+`planner/window.rs` is the only file under `planner/` that changes.
+
+#### B — the backup decision, and the sqlite behaviour actually verified
+
+The refusal ("use `mpedb mirror`") was wrong, for the reason the brief
+suspected: a `.mpedb` is one self-describing file and mpedb has exactly one
+writer at a time, so "a consistent copy" is not an approximation — it is the
+file's bytes taken while the writer lock is held.
+
+**What sqlite guarantees mid-backup, checked rather than assumed**: it copies
+pages incrementally under a READ lock and **restarts the whole backup** if the
+source is written. `test_modifying_progress` pins exactly that — its progress
+callback inserts into the source and then asserts the new row is IN the copy,
+with the journal `[1, 1, 0]` (three steps for a two-page database, the extra one
+being the restart).
+
+mpedb captures one instant at `_init` instead, so nothing can invalidate the
+image and there is nothing to restart. That is a stronger consistency contract
+and a weaker liveness one, and it is stated in the module docs rather than
+papered over. `step(-1)` alone would have bought the same four tests, but
+`step(n)` is implemented as real page accounting so `pages=` is not a lie.
+
+The subtle part is not the copy. **Three regions of a copied file are RUNTIME
+state, not data**: the writer mutex, the reader table and the boot id. Copied
+verbatim, the new file holds a mutex recorded as locked by the process doing the
+backup (a deadlock) and a reader table full of the SOURCE's pins (an unbounded
+high-water leak). The image therefore ZEROES the boot id — which is precisely
+the signal `post_attach`'s reboot branch watches for, so the first attach
+re-initializes the mutex and clears the reader table. No new recovery code and
+no new invariant; the copy simply looks like a file last touched before a
+reboot, which is the truth about its volatile state.
+
+The other half is shim-side: the destination's open `Database` must be swapped
+for the copy, which empties the facade's function registry. `HostFn`/`HostColl`
+now carry their callback pointers and re-install themselves, so a backup is
+invisible to the destination's UDFs and collations.
+
+`BackupTests` 8/15 → 12/15. The three that stay red, by name:
+
+* `test_progress` — asserts `len(journal) == 2` with `pages=1`, i.e. that the
+  source database is exactly TWO pages. That is sqlite's file layout; an mpedb
+  file pre-reserves its geometry.
+* `test_modifying_progress` — asserts the restart semantics above.
+* `test_database_source_name` — needs `temp` and ATTACHed schema names. mpedb
+  has one schema per file, so every other name is refused with sqlite's own
+  `unknown database <name>` rather than answered with the wrong database.
+
+#### C — `SQLITE_LIMIT_FUNCTION_ARG`, and why it is safe now
+
+Wave 3 recorded this as deliberately not attempted, because counting a call's
+arguments from SQL text treats `VALUES (1,2)`, `IN (a,b)` and
+`CREATE TABLE t(a,b)` as calls. Two guards make that structurally impossible
+rather than merely unlikely: **only a name the connection can actually CALL** (a
+built-in or a host registration) is counted, and a preceding
+`INTO`/`TABLE`/`FROM`/`JOIN`/`UPDATE` disqualifies the one residual shape (a
+table named like a function). The whole check is additionally gated on the limit
+being BELOW sqlite's compile-time default of 127 — which nobody but a test
+lowers — so on every ordinary statement it does not run at all.
+
+#### The remaining 21, and what each needs
+
+| class | tests | what it needs | mine? |
+|---|---|---|---|
+| **E3(b) bind rigidity where sqlite coerces** | **9** | The single biggest bucket now. `x timestamp` / `b blob` / `name text` columns refuse a value sqlite's affinity rule would store: text→`timestamp` (4), text→`blob` (3, the `BlobTests` expiry provocations), int→`text` (1), blob→`text` (1). `ColumnType::from_declared` maps `timestamp`/`blob`/`text` to RIGID types because mpedb's own vocabulary wins over sqlite's affinity table — correct for a config-declared column, wrong for a `CREATE TABLE` arriving through a sqlite shim. The machinery already exists (`ColumnDef::affinity` + `store_affinity`, applied today only for `Numeric`); this is a mapping decision in `mpedb-types`, shared with the Django work, so it is RECORDED rather than taken here. | no — `mpedb-types` |
+| iterdump / `sqlite_master.sql` | 4 | Verbatim DDL text in the schema (2 are AUTOINCREMENT and fts4, deliberate refusals). Same engine gap as E3(a) was. | no |
+| serialize / deserialize | 2 | An in-memory image format. | — |
+| E13 case-insensitive unquoted identifiers | 1 | `create table t` then `INSERT INTO T`. Binder resolution, and `binder.rs` is another agent's file; the shim cannot do it at the text level without also lowercasing output ALIASES, which would change `cursor.description`. | no — `binder.rs` |
+| E14 FROM-less alias in WHERE | 1 | `select 1 as a where a=?`. Binder. | no — `binder.rs` |
+| `current_timestamp` (bare) | 1 | Three things at once now: the bare keyword, a function call in `INSERT … VALUES` position, and a TEXT value into a `timestamp` column (E3(b) again). | partly |
+| partial index (`CREATE INDEX … WHERE`) | 1 | mpedb has no partial indexes. | no |
+| `DBCONFIG_ENABLE_FKEY` | 1 | The test verifies foreign keys are actually ENFORCED after the toggle; mpedb parses and drops `REFERENCES`. Echoing the flag would be the D10/D11 lie. Stays refused. | — |
+| per-constraint `ON CONFLICT ROLLBACK` | 1 | The action must live in the schema (E9). | no |
+| backup page layout / restart | 2 | Named above. | — |
+| CTE with a FROM-less computed body | 1 | `with one as (select 1) select * from one`. | no |
+
+#### Verification added
+
+* `crates/mpedb/tests/host_window_agg.rs` (6) — the sliding answers for a moving
+  ROWS frame, the default frame, and PARTITION BY; the CALL SEQUENCE (`inverse`
+  really invoked, one `finish` per partition); a plain host aggregate refused
+  under `OVER`; errors propagating from `step`/`value`/`inverse` but NOT from
+  `finish`; and a host window plan staying out of the shared registry, proved
+  against a second connection to the same file.
+* `crates/mpedb-capi/tests/capi.rs` (+6, now 67) — the backup copying the source
+  over the destination (with the destination's old table gone and the copy
+  WRITABLE, which is the boot-id argument); an abandoned backup leaving the
+  destination alone and `sqlite3_close` refusing meanwhile; every `_init`
+  refusal by name; a UDF surviving a backup; the FUNCTION_ARG limit refusing
+  `max(a,b)` while still accepting a VALUES tuple, an IN list, a column list on a
+  table NAMED `max`, and commas inside a string literal; `create_window_function`
+  end to end with its call counts, plus the plain-aggregate refusal.
 
 ## Django's own test suite — run 5 (2026-07-20)
 

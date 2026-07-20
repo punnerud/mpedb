@@ -1984,15 +1984,16 @@ fn collation_registration_orders_sorts_and_honors_the_destructor_contract() {
         assert_ne!(rc, SQLITE_OK, "a deregistered collation cannot be used");
         assert_eq!(msg, "no such collation sequence: mycoll", "sqlite's exact wording");
 
-        // The window-function stub's destructor contract is the OPPOSITE and
-        // still holds: sqlite DOES invoke it on a failed registration, and
-        // CPython relies on that by not freeing.
+        // The window-function registration's destructor contract, both ways:
+        // sqlite runs `xDestroy(pApp)` on a FAILED registration (CPython relies
+        // on that by not freeing), and also on the all-NULL DELETE form, which
+        // succeeds.
         let wname = cs("mywin");
         let rc = sqlite3_create_window_function(
             db,
             wname.as_ptr(),
-            1,
-            1, // SQLITE_UTF8
+            -2, // outside -1..=127
+            1,  // SQLITE_UTF8
             app,
             ptr::null_mut(),
             ptr::null_mut(),
@@ -2000,12 +2001,26 @@ fn collation_registration_orders_sorts_and_honors_the_destructor_contract() {
             ptr::null_mut(),
             fnptr1(count_destroy),
         );
-        assert_eq!(rc, SQLITE_ERROR, "window functions are refused");
+        assert_eq!(rc, SQLITE_MISUSE, "nArg outside -1..=127 is a misuse");
         assert_eq!(
             hits.load(Ordering::SeqCst),
             2,
             "window-function destructor MUST run on failure (CPython does not free otherwise)"
         );
+        let rc = sqlite3_create_window_function(
+            db,
+            wname.as_ptr(),
+            1,
+            1,
+            app,
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            fnptr1(count_destroy),
+        );
+        assert_eq!(rc, SQLITE_OK, "all-NULL callbacks DELETE the entry");
+        assert_eq!(hits.load(Ordering::SeqCst), 3, "...and still run the destructor");
         sqlite3_close(db);
     }
 }
@@ -2426,9 +2441,12 @@ fn refusal_stubs_set_handle_error() {
         let dst = open_memory();
         let src = open_memory();
         let main = cs("main");
-        assert!(sqlite3_backup_init(dst, main.as_ptr(), src, main.as_ptr()).is_null());
+        // The backup API is REAL now; what still refuses is a schema name mpedb
+        // has no equivalent for, and the refusal must land on the DESTINATION.
+        let temp = cs("temp");
+        assert!(sqlite3_backup_init(dst, main.as_ptr(), src, temp.as_ptr()).is_null());
         let msg = CStr::from_ptr(sqlite3_errmsg(dst)).to_string_lossy().into_owned();
-        assert!(msg.contains("backup"), "backup errmsg {msg:?}");
+        assert_eq!(msg, "unknown database temp", "backup errmsg {msg:?}");
 
         // Incremental blob I/O is REAL now (see the blob_* tests below); what
         // this asserts is only that a FAILING open still leaves its reason on
@@ -3260,4 +3278,342 @@ unsafe fn collect_col_text(db: *mut Sqlite3, sql: &str, n: i32) -> Vec<String> {
     }
     sqlite3_finalize(st);
     out
+}
+
+/// The online backup API, end to end: a consistent copy of the source lands in
+/// the destination, the destination's own contents are GONE (a backup replaces,
+/// it does not merge), and progress is reported in real pages.
+#[test]
+fn backup_copies_the_source_over_the_destination() {
+    unsafe {
+        let src = open_memory();
+        let dst = open_memory();
+        assert_eq!(exec(src, "CREATE TABLE foo (key INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec(src, "INSERT INTO foo (key) VALUES (3), (4)"), SQLITE_OK);
+        // The destination starts with a DIFFERENT schema, which must not survive.
+        assert_eq!(exec(dst, "CREATE TABLE gone (x INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec(dst, "INSERT INTO gone (x) VALUES (1)"), SQLITE_OK);
+
+        let main = cs("main");
+        let b = sqlite3_backup_init(dst, main.as_ptr(), src, main.as_ptr());
+        assert!(!b.is_null(), "backup_init: {}", errmsg(dst));
+        let total = sqlite3_backup_pagecount(b);
+        assert!(total > 0, "pagecount {total}");
+        assert_eq!(sqlite3_backup_remaining(b), total);
+        // Paced: one page at a time until DONE, and `remaining` walks down.
+        let mut steps = 0;
+        loop {
+            let rc = sqlite3_backup_step(b, 1);
+            steps += 1;
+            if rc == SQLITE_DONE {
+                break;
+            }
+            assert_eq!(rc, SQLITE_OK, "step {steps}: {}", errmsg(dst));
+            assert_eq!(sqlite3_backup_remaining(b), total - steps);
+        }
+        assert_eq!(steps, total, "one page per step");
+        assert_eq!(sqlite3_backup_remaining(b), 0);
+        assert_eq!(sqlite3_backup_finish(b), SQLITE_OK);
+
+        assert_eq!(collect_text_col(dst, "SELECT key FROM foo ORDER BY key"), ["3", "4"]);
+        // The destination's old table is gone, and the copy is WRITABLE (the
+        // image's volatile control state was voided, so the writer mutex and
+        // reader table were re-initialized on attach).
+        assert_eq!(exec(dst, "SELECT x FROM gone"), SQLITE_ERROR);
+        assert_eq!(exec(dst, "INSERT INTO foo (key) VALUES (5)"), SQLITE_OK);
+        assert_eq!(collect_text_col(dst, "SELECT key FROM foo ORDER BY key"), ["3", "4", "5"]);
+        // ...and the SOURCE is untouched by the write to its copy.
+        assert_eq!(collect_text_col(src, "SELECT key FROM foo ORDER BY key"), ["3", "4"]);
+
+        sqlite3_close(dst);
+        sqlite3_close(src);
+    }
+}
+
+/// A backup abandoned before `SQLITE_DONE` leaves the destination exactly as it
+/// was — the image is captured into a temporary file and only installed by the
+/// step that completes it.
+#[test]
+fn an_abandoned_backup_leaves_the_destination_alone() {
+    unsafe {
+        let src = open_memory();
+        let dst = open_memory();
+        assert_eq!(exec(src, "CREATE TABLE foo (key INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec(dst, "CREATE TABLE keep (x INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec(dst, "INSERT INTO keep (x) VALUES (1)"), SQLITE_OK);
+
+        let main = cs("main");
+        let b = sqlite3_backup_init(dst, main.as_ptr(), src, main.as_ptr());
+        assert!(!b.is_null());
+        assert_eq!(sqlite3_backup_step(b, 1), SQLITE_OK);
+        // A connection may not be closed with a backup outstanding.
+        assert_eq!(sqlite3_close(dst), SQLITE_BUSY);
+        assert_eq!(sqlite3_backup_finish(b), SQLITE_OK);
+
+        assert_eq!(collect_text_col(dst, "SELECT x FROM keep"), ["1"]);
+        sqlite3_close(dst);
+        sqlite3_close(src);
+    }
+}
+
+/// `sqlite3_backup_init` refuses — with the reason on the DESTINATION — every
+/// shape mpedb cannot honor, and a destination mid-transaction is one of them.
+#[test]
+fn backup_init_refuses_by_name() {
+    unsafe {
+        let src = open_memory();
+        let dst = open_memory();
+        let main = cs("main");
+        assert_eq!(exec(src, "CREATE TABLE t (a INTEGER PRIMARY KEY)"), SQLITE_OK);
+
+        // Same connection.
+        assert!(sqlite3_backup_init(dst, main.as_ptr(), dst, main.as_ptr()).is_null());
+        assert_eq!(errmsg(dst), "source and destination must be distinct");
+
+        // An ATTACHed / temp schema name mpedb has no equivalent for.
+        let other = cs("attached_db");
+        assert!(sqlite3_backup_init(dst, main.as_ptr(), src, other.as_ptr()).is_null());
+        assert_eq!(errmsg(dst), "unknown database attached_db");
+
+        // Destination mid-transaction: it is about to be REPLACED.
+        assert_eq!(exec(dst, "BEGIN"), SQLITE_OK);
+        assert!(sqlite3_backup_init(dst, main.as_ptr(), src, main.as_ptr()).is_null());
+        assert_eq!(errmsg(dst), "target is in transaction");
+        assert_eq!(exec(dst, "ROLLBACK"), SQLITE_OK);
+
+        // Source mid-transaction: it holds the writer lock the capture needs.
+        assert_eq!(exec(src, "BEGIN"), SQLITE_OK);
+        assert!(sqlite3_backup_init(dst, main.as_ptr(), src, main.as_ptr()).is_null());
+        assert_eq!(errmsg(dst), "source database is locked");
+        assert_eq!(exec(src, "ROLLBACK"), SQLITE_OK);
+
+        sqlite3_close(dst);
+        sqlite3_close(src);
+    }
+}
+
+/// A UDF registered on the DESTINATION survives a backup: the connection's
+/// database is reopened underneath it, and the registry is repopulated.
+#[test]
+fn a_backup_keeps_the_destinations_registered_functions() {
+    unsafe extern "C" fn plus_one(ctx: *mut c_void, _argc: c_int, argv: *mut *mut c_void) {
+        let v = *argv;
+        sqlite3_result_int64(ctx, sqlite3_value_int64(v) + 1);
+    }
+    unsafe {
+        let src = open_memory();
+        let dst = open_memory();
+        assert_eq!(exec(src, "CREATE TABLE foo (key INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec(src, "INSERT INTO foo (key) VALUES (1)"), SQLITE_OK);
+        let fname = cs("answer");
+        assert_eq!(
+            sqlite3_create_function(
+                dst,
+                fname.as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                plus_one as *mut c_void,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+
+        let main = cs("main");
+        let b = sqlite3_backup_init(dst, main.as_ptr(), src, main.as_ptr());
+        assert!(!b.is_null());
+        assert_eq!(sqlite3_backup_step(b, -1), SQLITE_DONE);
+        assert_eq!(sqlite3_backup_finish(b), SQLITE_OK);
+        // The copied source's row, through the DESTINATION's own UDF.
+        assert_eq!(scalar_count(dst, "SELECT answer(key) FROM foo"), 2);
+        // ...and zeroblob(), one of the shim's OWN builtins, is back too (a
+        // non-constant argument, so this is the registered host function and
+        // not the constant-folding rewrite in `sql::rewrite_zeroblob`).
+        assert_eq!(collect_text_col(dst, "SELECT typeof(zeroblob(key)) FROM foo"), ["blob"]);
+        sqlite3_close(dst);
+        sqlite3_close(src);
+    }
+}
+
+/// `SQLITE_LIMIT_FUNCTION_ARG` is enforced at prepare, with sqlite's message —
+/// and, because the count is read out of the SQL TEXT, the guards that keep it
+/// from mistaking a column list or an `IN`/`VALUES` list for a call.
+#[test]
+fn function_arg_limit_counts_calls_and_nothing_else() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (a, b, c) VALUES (1, 2, 3)"), SQLITE_OK);
+        // Default limit: nothing is counted at all.
+        assert_eq!(scalar_count(db, "SELECT max(a, b, c) FROM t"), 3);
+
+        let prior = sqlite3_limit(db, SQLITE_LIMIT_FUNCTION_ARG, 1);
+        assert_eq!(prior, 127, "sqlite's compile-time default");
+        // One argument is fine; two is not.
+        assert_eq!(scalar_count(db, "SELECT abs(-1) FROM t"), 1);
+        let s = cs("SELECT max(a, b) FROM t");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_ERROR
+        );
+        assert_eq!(errmsg(db), "too many arguments on function max");
+
+        // NOT calls, even under the lowered limit: a VALUES tuple, an IN list,
+        // a column list on a table whose NAME is a function's, and commas
+        // inside a string literal.
+        assert_eq!(exec(db, "INSERT INTO t (a, b, c) VALUES (4, 5, 6)"), SQLITE_OK);
+        assert_eq!(scalar_count(db, "SELECT count(*) FROM t WHERE a IN (1, 4)"), 2);
+        assert_eq!(exec(db, "CREATE TABLE max (x INTEGER PRIMARY KEY, y INTEGER)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO max (x, y) VALUES (1, 2)"), SQLITE_OK);
+        // Commas inside a string literal are invisible to the scan.
+        assert_eq!(scalar_count(db, "SELECT length('a,b,c') FROM t WHERE a = 1"), 5);
+
+        sqlite3_limit(db, SQLITE_LIMIT_FUNCTION_ARG, prior);
+        assert_eq!(scalar_count(db, "SELECT max(a, b) FROM t WHERE a = 1"), 2);
+        sqlite3_close(db);
+    }
+}
+
+/// `sqlite3_create_window_function` — a user-defined WINDOW aggregate, end to
+/// end. The answers are sqlite's own worked example for the API, and the CALL
+/// SEQUENCE is asserted too: a moving frame must retract through `xInverse`
+/// rather than being re-aggregated, because that is what a consumer's callbacks
+/// are written for.
+#[test]
+fn a_host_window_function_slides_its_frame() {
+    use std::sync::atomic::{AtomicI64, Ordering as AtOrd};
+    // The accumulator lives in the aggregate context; the counters are process
+    // -wide because this is the only test that registers these callbacks.
+    static STEPS: AtomicI64 = AtomicI64::new(0);
+    static INVERSES: AtomicI64 = AtomicI64::new(0);
+    static VALUES: AtomicI64 = AtomicI64::new(0);
+    static FINALS: AtomicI64 = AtomicI64::new(0);
+
+    unsafe fn total(ctx: *mut c_void) -> *mut i64 {
+        sqlite3_aggregate_context(ctx, 8) as *mut i64
+    }
+    unsafe extern "C" fn w_step(ctx: *mut c_void, _argc: c_int, argv: *mut *mut c_void) {
+        STEPS.fetch_add(1, AtOrd::Relaxed);
+        *total(ctx) += sqlite3_value_int64(*argv);
+    }
+    unsafe extern "C" fn w_inverse(ctx: *mut c_void, _argc: c_int, argv: *mut *mut c_void) {
+        INVERSES.fetch_add(1, AtOrd::Relaxed);
+        *total(ctx) -= sqlite3_value_int64(*argv);
+    }
+    unsafe extern "C" fn w_value(ctx: *mut c_void) {
+        VALUES.fetch_add(1, AtOrd::Relaxed);
+        sqlite3_result_int64(ctx, *total(ctx));
+    }
+    unsafe extern "C" fn w_final(ctx: *mut c_void) {
+        FINALS.fetch_add(1, AtOrd::Relaxed);
+        sqlite3_result_int64(ctx, *total(ctx));
+    }
+
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)"), SQLITE_OK);
+        assert_eq!(
+            exec(db, "INSERT INTO t (x, y) VALUES (1,4),(2,5),(3,3),(4,8),(5,1)"),
+            SQLITE_OK
+        );
+        let name = cs("sumint");
+        assert_eq!(
+            sqlite3_create_window_function(
+                db,
+                name.as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                w_step as *mut c_void,
+                w_final as *mut c_void,
+                w_value as *mut c_void,
+                w_inverse as *mut c_void,
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+        let q = "SELECT sumint(y) OVER (ORDER BY x ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) \
+                 FROM t ORDER BY x";
+        assert_eq!(collect_text_col(db, q), ["9", "12", "16", "12", "9"]);
+        assert_eq!(STEPS.load(AtOrd::Relaxed), 5);
+        assert_eq!(INVERSES.load(AtOrd::Relaxed), 3, "the frame must SLIDE, not re-aggregate");
+        assert_eq!(VALUES.load(AtOrd::Relaxed), 5);
+        assert_eq!(FINALS.load(AtOrd::Relaxed), 1, "xFinal runs once per partition");
+
+        // All-NULL callbacks DELETE the registration (sqlite's rule), and the
+        // window query then refuses rather than answering.
+        assert_eq!(
+            sqlite3_create_window_function(
+                db,
+                name.as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            ),
+            SQLITE_OK
+        );
+        let s = cs(q);
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_ERROR
+        );
+        sqlite3_close(db);
+    }
+}
+
+/// An aggregate registered through `create_function` (no xValue/xInverse) is
+/// still refused under `OVER` — by NAME, and naming what is missing. Answering
+/// it with a whole-partition value under a bounded frame would be a wrong
+/// answer, which is exactly what this refusal exists to prevent.
+#[test]
+fn a_plain_aggregate_is_still_refused_under_over() {
+    unsafe extern "C" fn a_step(ctx: *mut c_void, _argc: c_int, argv: *mut *mut c_void) {
+        let p = sqlite3_aggregate_context(ctx, 8) as *mut i64;
+        *p += sqlite3_value_int64(*argv);
+    }
+    unsafe extern "C" fn a_final(ctx: *mut c_void) {
+        let p = sqlite3_aggregate_context(ctx, 8) as *mut i64;
+        sqlite3_result_int64(ctx, if p.is_null() { 0 } else { *p });
+    }
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (x INTEGER PRIMARY KEY, y INTEGER)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (x, y) VALUES (1,4),(2,5)"), SQLITE_OK);
+        let name = cs("plainsum");
+        assert_eq!(
+            sqlite3_create_function(
+                db,
+                name.as_ptr(),
+                1,
+                SQLITE_UTF8,
+                ptr::null_mut(),
+                ptr::null_mut(),
+                a_step as *mut c_void,
+                a_final as *mut c_void,
+            ),
+            SQLITE_OK
+        );
+        // Grouped: fine.
+        assert_eq!(scalar_count(db, "SELECT plainsum(y) FROM t"), 9);
+        let s = cs("SELECT plainsum(y) OVER (ORDER BY x) FROM t");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_ERROR
+        );
+        let msg = errmsg(db);
+        assert!(
+            msg.contains("create_window_function"),
+            "refusal must name the missing registration: {msg}"
+        );
+        sqlite3_close(db);
+    }
 }

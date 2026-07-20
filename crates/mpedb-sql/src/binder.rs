@@ -246,18 +246,23 @@ pub struct HostUdfSet {
     /// connection's registry — the plan carries the NAME and the executor
     /// resolves it (design/DESIGN-UDF.md stage 3).
     colls: Vec<String>,
+    /// Host aggregates registered with sqlite's WINDOW protocol
+    /// (`create_window_function` — `xValue`/`xInverse` on top of
+    /// `xStep`/`xFinal`). A NAME subset of `aggs`: an entry here is also in
+    /// `aggs`, and only an entry here may take an `OVER` clause.
+    window_aggs: Vec<String>,
 }
 
 impl HostUdfSet {
     /// Build from `(name, n_arg)` pairs; `n_arg == -1` is sqlite's variadic
     /// "any arity" registration.
     pub fn new(fns: Vec<(String, i32)>) -> HostUdfSet {
-        HostUdfSet { fns, aggs: Vec::new(), colls: Vec::new() }
+        HostUdfSet { fns, ..Default::default() }
     }
 
     /// Build from the scalar AND aggregate registrations.
     pub fn with_aggs(fns: Vec<(String, i32)>, aggs: Vec<(String, i32)>) -> HostUdfSet {
-        HostUdfSet { fns, aggs, colls: Vec::new() }
+        HostUdfSet { fns, aggs, ..Default::default() }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -279,6 +284,17 @@ impl HostUdfSet {
     /// connection, alongside the scalar/aggregate registries).
     pub fn set_colls(&mut self, colls: Vec<String>) {
         self.colls = colls;
+    }
+
+    /// The host aggregates that may be used as WINDOW functions.
+    pub fn window_aggs(&self) -> &[String] {
+        &self.window_aggs
+    }
+
+    /// Replace the window-capable subset (the shim registers these per
+    /// connection alongside the plain aggregates).
+    pub fn set_window_aggs(&mut self, names: Vec<String>) {
+        self.window_aggs = names;
     }
 
     pub fn agg_names(&self) -> Vec<String> {

@@ -233,6 +233,11 @@ fn resolve_window_func(
         // is 1.0 everywhere (matching sqlite, and deterministic).
         ast::WindowFunc::PercentRank => (P::PercentRank, None, ColumnType::Float64, false),
         ast::WindowFunc::CumeDist => (P::CumeDist, None, ColumnType::Float64, false),
+        // A HOST window aggregate (`create_window_function`). Its result is
+        // whatever the callback returns, per row — the same dynamic typing a
+        // host scalar or a grouped host aggregate has — so `Any`, nullable.
+        // The NAME rides in `WindowSpec::host`, set by the caller from the AST.
+        ast::WindowFunc::Host(_) => (P::Host, None, ColumnType::Any, true),
     })
 }
 
@@ -352,6 +357,7 @@ fn window_item_name(e: &ast::Expr) -> String {
             ast::WindowFunc::Ntile => "ntile()".to_string(),
             ast::WindowFunc::PercentRank => "percent_rank()".to_string(),
             ast::WindowFunc::CumeDist => "cume_dist()".to_string(),
+            ast::WindowFunc::Host(n) => format!("{n}()"),
         },
         _ => "?column?".to_string(),
     }
@@ -464,6 +470,10 @@ pub(super) fn plan_window_select(
         };
         win_types.push((ty, nullable));
         windows.push(WindowSpec {
+            host: match &spec.func {
+                ast::WindowFunc::Host(n) => Some(n.clone()),
+                _ => None,
+            },
             func,
             arg: arg_prog,
             distinct: false,
