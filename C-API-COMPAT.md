@@ -1502,3 +1502,258 @@ gap a consumer would hit on its first migration.
   introspection; the iterdump query shape; a trigger created and fired.
 * `crates/mpedb-sql/src/token.rs` (+2) and `crates/mpedb-capi/src/sql.rs`
   (+1) unit tests for the lexer and the trigger-aware splitter.
+
+## Django's own test suite — run 5 (2026-07-20)
+
+Run 5 scores the whole 100 %-campaign wave that landed after run 4 and was
+never measured against Django: REGEXP host-UDF dispatch (#108), bound
+LIKE/GLOB patterns, derived-body-owned subplans, the
+`date`/`time`/`datetime`/`julianday` family and literal `'now'` (#112 B),
+derived-table materialization, verbatim decltype, host collations, N-ary host
+aggregates, incremental blob I/O, `zeroblob`, the authorizer,
+`INSERT OR ROLLBACK`, iterdump, SQL comments in the tokenizer, `==`,
+`CREATE TRIGGER` through the C API, `busy_timeout` (#109), and CHECK
+compilation at attach (#102). Same Django (`5.2.17.dev20260714173342`, commit
+`3e389b7`), same CPython 3.12.3, same stock libsqlite3 3.45.1, `--parallel=1`.
+
+**Both arms re-run from scratch.** Interposition verified before measuring:
+`sqlite3.sqlite_version` reads `3.45.0` under `LD_PRELOAD` (the shim's own
+string) and `3.45.1` without it. No stale `memorydb_*` files existed in the
+checkout. Four measurements (A–D), never one headline number.
+
+### ⚠️ FAILs — the ERROR/FAIL split, at the top
+
+**A + B (831 + 493 = 1 324 tests): 39 failing outcomes, 39 unique tests,
+0 FAILs, 39 ERRORs.** Every single one is a refusal. That is the first run
+since run 3 with no wrong answer in the SQL surface — W3 (run 4's REGEXP
+divergence) is closed and nothing replaced it.
+
+**C (`backends`, 324): 2 shim-only FAILs**, both the *deliberate* D11
+position, unchanged since the run-3 triage:
+
+```python
+c.execute("PRAGMA foreign_keys = ON")
+c.execute("PRAGMA foreign_keys").fetchone()   # stock (1,)   mpedb (0,)
+```
+
+`backends.sqlite.tests.SchemaTests.test_constraint_checks_disabled_atomic_allowed`
+(`AssertionError: False is not true`) and `test_disable_constraint_checking_failure_disallowed`
+(`NotSupportedError not raised`). mpedb parses `REFERENCES` and discards it,
+so answering `1` would promise a consumer that its FK violations get caught.
+`0` is both the truth and sqlite's own default. **Recorded, not fixed** — the
+same reasoning that keeps D10 (`PRAGMA synchronous`) honest.
+
+> **Correction to run 4's split.** Run 4 reported "the only 2 FAILs among run
+> 4's 1 648 measured tests". Its own surviving `backends` log
+> (`/tmp/wb-django-suite/shim_backends2.txt`) shows `failures=5`: 3 shared
+> with stock and these same 2 shim-only D11 FAILs. Run 4 therefore had **4**
+> shim-only FAILs (W3's 2 + D11's 2), not 2. Run 5 has 2, and they are the
+> two nobody intends to close.
+
+### A — comparability: the SAME 9 labels, 831 tests
+
+| | stock 3.45.1 | shim run 3 | shim run 4 | **shim run 5** |
+|---|---|---|---|---|
+| G1 `basic lookup transactions ordering update delete` | 392 ran, 0 failed | 42 failed | 29 failed (2 F / 27 E) | **6 failed (0 F / 6 E)** |
+| G2 `aggregation annotations expressions` | 439 ran, 0 failed | 99 failed | 65 failed (0 F / 65 E) | **14 failed (0 F / 14 E)** |
+| **total** | **831/831 (100 %)** | 690/831 (83.0 %) | 737/831 (88.7 %) | **811/831 (97.6 %)** |
+| delta vs previous run | — | — | +47 | **+74** |
+
+Skip parity is exact (G1 17/17, G2 5/5, expected failures 1/1), so no
+adjustment applies. Outcomes and unique tests coincide here: 20 outcomes,
+20 tests.
+
+**Which run-4 gaps closed, by test movement (run-4 rank → run-5 weight):**
+
+| Run-4 gap (weight) | Run-5 weight | Verdict |
+|---|---|---|
+| 0. W3 — REGEXP wrong answer (2 FAILs) | **0** ✅ | CLOSED (#108). All four `lookup` regex tests pass; the probe's two W3 lines answer stock's rows in both arms. |
+| 1. LIKE pattern must be a literal (28) | **0** ✅ | CLOSED. Bound patterns, `ESCAPE`, `NOT LIKE`, NULL patterns and bound `GLOB` all answer byte-identically to stock in the probe. The run-4 rank 1 is gone entirely. |
+| 2. Derived-table / subquery-position restrictions (32) | **6** | LARGELY CLOSED (−26): derived-body-owned subplans + derived-table materialization took the aliased/renamed-column and `SELECT <agg> FROM (<grouping body>)` families. What is left is HAVING (2), the collapsed-group correlation (1), `subquery not supported in this position` (1), one non-flattenable DISTINCT/sliced body (1), one derived projection `unknown column` (1). |
+| 3. Compound (UNION/INTERSECT/EXCEPT) placement (13) | **9** | Slightly closed; now the joint rank 1. |
+| 4. Affinity comparison/arithmetic half (14) | **9** | Slightly closed (the `coalesce`/`CASE` mixes are gone); the `any`-comparison core is untouched. |
+| 5. `EXPLAIN QUERY PLAN` (1 test, 6 outcomes) | **0** ✅ | CLOSED **in the shim, this run** (`8ac3686`) — see "The one shim-side fix" below. |
+| 6. INSERT VALUES with expressions (5) | **5** | Unchanged. |
+| 7. `LIMIT -1` (4) | **4** | Unchanged. |
+| 8. Residual param strictness (4) | **4** | Unchanged. |
+| 9. `strftime('now')` + `date()`/`time()`/`datetime()`/`julianday()` (4) | **0** ✅ | CLOSED (#112 B). `backends`' `test_parameter_escaping` (×2 classes) and `test_no_interpolation` all pass. |
+| 10. `REGEXP requires text, got int64` (2) + CASE-into-bool (1) | **1** | The REGEXP pair closed with W3 (host dispatch does not pin the pattern's type). CASE-into-bool remains. |
+| 11. One-offs (4) | **4** | Unchanged: `unknown column` 1, `$` in identifier 1, DDL-in-SAVEPOINT (`backends`) 2. The JSONField CASE mix closed. |
+
+### B — `queries` (493)
+
+| | stock 3.45.1 | shim run 4 | **shim run 5** |
+|---|---|---|---|
+| `queries` | 493 ran, 0 failed (15 skips, 2 xfail) | 34 failed (0 F / 34 E) → 459/493 (93.1 %) | **19 failed (0 F / 19 E) → 474/493 (96.1 %)** |
+| delta | — | — | **+15** |
+
+Measured twice: 25 failing outcomes (20 tests) at the run-5 head, then **19
+outcomes (19 tests)** after the `EXPLAIN QUERY PLAN` fix below — `test_explain`
+alone was 6 subtest outcomes. Outcomes and unique tests now coincide.
+
+### C — `backends` (324)
+
+| | stock 3.45.1 | shim run 4 (re-derived from its log) | **shim run 5** |
+|---|---|---|---|
+| failing outcomes | 5 (3 F / 2 E) | 24 (5 F / 19 E) | **16 (5 F / 11 E)** |
+| unique failing tests | 5 | 14 | **10** |
+| **shim-only unique tests** | — | **9** | **5** |
+| pass (unique-test rule) | 319/324 | 310/324 | **314/324** |
+
+> **Accounting note.** Run 4's section reported `backends` as "12 failed →
+> 312/324 (5 shared + 7 shim-only)". Neither figure reproduces from its own
+> log, which records `failures=5, errors=19`. The table above re-derives run 4
+> from that log with the same script used for run 5, so the two columns are
+> comparable. `test_get_primary_key_column` is one test with 7 subtest
+> outcomes, which is where most of the outcome/test spread lives.
+
+The 5 shim-only tests:
+
+| Tests | Gap | Where |
+|---|---|---|
+| 2 | `unsupported: DDL inside a SAVEPOINT is not supported by mpedb` (`test_get_primary_key_column` ×7 outcomes, `test_get_primary_key_column_pk_constraint`) | **engine** (`crates/mpedb` `apply_ddl`) |
+| 1 | D10 `PRAGMA synchronous` round-trip (`test_init_command`, `TypeError: 'NoneType' object is not subscriptable`) | shim, deliberately not fixed |
+| 2 | D11 `PRAGMA foreign_keys` echo — the two FAILs above | shim, deliberately not fixed |
+
+Closed since run 4: `test_parameter_escaping` ×2 and `test_no_interpolation`
+(the `date()` / `strftime('now')` family), plus `test_regexp_function` ×5
+outcomes. Skips 128 vs stock's 124 — the 4 FK self-skips, unchanged.
+
+### D — JSONField and new-coverage probing
+
+`supports_json_field` is ON in both arms with no workbench involvement
+(Django's own `SELECT JSON('{"a": "b"}')` probe succeeds through the shim), so
+both gated models are created during `migrate` and their tests are scored
+inside G2's 439 — where the failure count fell 65 → 14. Run 4's
+`test_update_jsonfield_case_when_key_is_null` (`cannot mix CASE result types`)
+now **passes**; no JSON-specific failure remains in the frozen set.
+
+**New coverage attempted and blocked: `model_fields` (528 tests).** It cannot
+be measured at all — `migrate` dies at the first generated column:
+
+```sql
+CREATE TABLE t ("field" char(32) NOT NULL,
+                "field_copy" char(32) GENERATED ALWAYS AS ("field") STORED)
+-- SQL parse error at byte 147: expected )
+```
+
+**`mpedb-sql`, recorded not fixed.** This is now the single largest known
+Django blocker by tests: one parser feature stands between here and 528 tests
+of new coverage, more than the whole remaining gap list below.
+
+### The one shim-side fix this run — `EXPLAIN QUERY PLAN` (`8ac3686`)
+
+Of the 44 shim-only failures across A + B + C, **exactly one lived inside
+`crates/mpedb-capi/`**; everything else is `mpedb-sql` or engine work. sqlite's
+`EXPLAIN QUERY PLAN <stmt>` is how every ORM and tool asks for a plan — Django's
+`QuerySet.explain()` emits it — and mpedb spells the same request
+`EXPLAIN <stmt>`. The shim now strips the `QUERY PLAN` words on the *execution*
+path (so `sqlite3_sql()` still returns the consumer's own text) and reshapes
+mpedb's plan into sqlite's `(id, parent, notused, detail)` result, one row per
+plan line, with an indented line's `parent` pointing at the nearest
+less-indented line above it so the plan tree survives.
+
+The `detail` strings are mpedb's own wording (`Select t`, `access: FullScan`,
+`left join u (nested loop, …)`), not sqlite's `SCAN`/`SEARCH` phrasing. sqlite
+documents EQP output as human-facing and explicitly unstable between releases,
+so describing the plan mpedb will actually run is the honest answer, and the
+alternative on offer was the current parse error. **Bare `EXPLAIN` is
+deliberately NOT taken**: sqlite answers it with a VDBE opcode listing mpedb
+has no equivalent of, and fabricating opcodes would be a claim about an
+execution model that does not exist — it keeps mpedb's own single-column plan
+text. `EXPLAIN QUERY PLAN SELECT … FROM sqlite_master` refuses by name rather
+than returning the mini-evaluator's rows in a plan's shape.
+
+Verified: `crates/mpedb-capi/tests/capi.rs::explain_query_plan_answers_in_sqlites_shape`
+(+1, now 59) — the four column names, the root row, every child's parent
+preceding it, a nesting join plan, lowercase keywords, bare `EXPLAIN`
+unchanged, and a non-compiling body still reporting its compile error.
+
+### The answer probe — zero wrong answers
+
+`djsuite/probe_answers.py` was extended with the run-5 surfaces: the whole
+`date`/`time`/`datetime`/`julianday` family (including the NULL row and the
+`'now'` forms, diffed by *shape and self-consistency* since the value is a
+clock read — `length(date('now'))`, `date('now') = date('now')`,
+`date('now') = substr(datetime('now'),1,10)`,
+`strftime('%Y-%m-%d','now') = date('now')`), derived-table materialization
+over a grouping body (COUNT/AVG/MAX/MIN over `(… GROUP BY …)`, DISTINCT
+bodies, HAVING bodies, renamed and expression-projected bodies), and the
+tokenizer one-offs (`==`, comments at every position).
+
+**Every added line answers byte-identically to stock.** The whole probe diff
+is 6 hunks, all of them refusals or the documented cascade of one:
+`cannot compare int64 with text`, two `parameter … requires int64`, one
+`cannot arithmetic on bool and int64`, the correlated-DELETE refusal (whose
+two following SELECTs then differ *because the DELETE did not happen* — a
+cascade, not a divergence), the `'5' | '2'` bitwise-on-text refusal, and the
+build-dependent BLOB LIKE pattern. The run-4 REGEXP and bound-LIKE/GLOB blocks
+now match line for line.
+
+### Workbench adaptations — re-measured, not assumed
+
+| Adaptation | Ablated result (shim) | Cost | Kept? |
+|---|---|---|---|
+| `data_types_suffix = {}` (D2, AUTOINCREMENT) | `WB_NO_D2=1`: `migrate` dies at the FIRST `CREATE TABLE` with mpedb's named AUTOINCREMENT refusal; **0 tests run**, no `Ran` line at all | **all 831** | KEEP |
+| `_references_graph` (D8, `sqlite_master` recursive CTE) | `WB_NO_D8=1`: G1 66 F + 87 E = **153 outcomes** (vs 6); G2 unchanged at 14. Driving error: `this sqlite_master query form is not supported by the mpedb C-API shim` ×**80**, then every `TransactionTestCase` teardown cascades | **147 outcomes in G1** | KEEP |
+
+D8's second pin is confirmed gone: W3 is closed, so the `(?i)…` REGEXP arm of
+Django's recursive CTE would now evaluate correctly — **the shim's
+`sqlite_master` mini-evaluator refusing the CTE shape is the sole remaining
+blocker.** It was NOT attempted here: making the mini-evaluator answer a
+self-joining `WITH RECURSIVE` is a query evaluator, not a small clearly-correct
+fix, and it unblocks **0 tests** (the adaptation applies to both arms) — its
+value is removing the last non-trivial adaptation, not moving the score.
+Re-ablate when it closes.
+
+D9 and D4b stay deleted (run 4); nothing regressed that would need them back.
+
+### Re-ranked MPEdb-only gaps (A + B: 39 tests, 39 outcomes, all ERRORs)
+
+| Rank | Tests | Root cause | Minimal repro | Where |
+|---|---|---|---|---|
+| 1 | 9 | **Compound (UNION/INTERSECT/EXCEPT) placement.** Four faces: a correlated reference out of a compound arm (`no table named V0 in this statement`) 3; a compound body inside a derived table (`a derived table with a non-flattenable body is only supported in a statement's outermost FROM`) 2; arm-type unification `any` vs `text` 2; a correlated subquery *inside* a compound SELECT 2 | `SELECT COUNT(*) FROM (SELECT id FROM a EXCEPT SELECT * FROM (SELECT id FROM a INTERSECT SELECT id FROM a WHERE num > ?)) s` | `mpedb-sql` planner |
+| 1 | 9 | **`any`-affinity comparison / arithmetic.** `cannot compare int64 with text` 6 (a `decimal(10,2)` or `CAST(… AS NUMERIC)` column compared against a bound number), `floor() expects a number, got any` 1, `cannot compare with IN list: text and int64` 1, `column X is bool, value is int64` 1 | `SELECT … HAVING (CAST((qty_target - CAST(SUM(qty_available) AS NUMERIC)) AS NUMERIC)) < ?` | `mpedb-sql` binder |
+| 3 | 5 | **INSERT VALUES must be literals or parameters** — Django writes expressions there for `RETURNING` inserts | `INSERT INTO c (name) VALUES (LOWER(?)) RETURNING c.id`; also `VALUES (?, (SELECT MAX(n)+? FROM c …))` and `VALUES (STRFTIME('%Y-%m-%d %H:%M:%f','NOW'))` | `mpedb-sql` |
+| 4 | 4 | **`LIMIT -1`** — sqlite's "no limit" idiom, which Django emits for every open-ended slice `qs[5:]` | `SELECT * FROM t ORDER BY name ASC LIMIT -1 OFFSET 5` | `mpedb-sql` parser |
+| 4 | 4 | **Subquery position.** In HAVING 2, a correlated subquery evaluated over the collapsed group 1, `a subquery is not supported in this position` 1 | `SELECT … GROUP BY … HAVING (COUNT(x) > ? OR id IN (SELECT …))` | `mpedb-sql` binder |
+| 4 | 4 | **Numeric strictness.** A non-integral `float64` parameter where `int64` is required 2; a float-valued expression assigned to an `int` column 2 | `UPDATE n SET the_integer = POWER(n.the_integer, ?)` → `cannot assign float64 to column of type int64` | `mpedb-sql` |
+| 7 | 3 | **One-offs.** `unknown column X in table X` on `COALESCE(MAX(col), CURRENT_TIMESTAMP)` 1; `$` inside a quoted identifier (`crafted_alia$`) refused by the parameter scanner 1; `unknown column` in a derived-table projection 1 | `SELECT COALESCE(MAX(t.opening), (CURRENT_TIMESTAMP)) FROM t WHERE 0 = 1` | `mpedb-sql` |
+| 8 | 1 | **Non-flattenable derived body (non-compound)**: `DISTINCT … ORDER BY … LIMIT` inside another derived table | `SELECT COUNT(*) FROM (SELECT s.* FROM (SELECT DISTINCT a, b FROM t ORDER BY b LIMIT 3) s) s2` | `mpedb-sql` planner |
+
+Plus `backends`: DDL-in-SAVEPOINT 2 (engine), D10 1 and D11 2 (shim,
+deliberately open).
+
+### Coverage
+
+* 11 of Django's 219 labels: the frozen 9 (831) + `queries` (493) +
+  `backends` (324) = **1 648 tests measured, shim passes 1 599** (A 811 +
+  B 474 + C 314) — **97.0 %**, vs run 4's 1 508/1 648 (91.5 %) over the same
+  tests. **+91.**
+* Wrong answers: **2**, both the deliberate D11 `PRAGMA foreign_keys` position.
+  Zero in the SQL surface; every one of the 39 A+B failures is a refusal.
+* A 12th label (`model_fields`, 528) was attempted and is blocked entirely by
+  generated columns.
+* Still `--parallel=1`; no concurrency or multi-process behaviour measured.
+
+### What is left between here and 100 %, ranked by tests unblocked
+
+| Rank | Tests | Work | Owner |
+|---|---|---|---|
+| 1 | **528** | `GENERATED ALWAYS AS (…) STORED/VIRTUAL` — unblocks the whole `model_fields` label, currently unmeasurable | `mpedb-sql` parser (+ engine for STORED) |
+| 2 | 9 | Compound placement: correlated scoping across arms, compound bodies in derived tables, arm-type unification | `mpedb-sql` planner |
+| 2 | 9 | The `any`-affinity comparison/arithmetic half | `mpedb-sql` binder |
+| 4 | 5 | INSERT VALUES expressions | `mpedb-sql` |
+| 5 | 4 | `LIMIT -1` — a parser one-liner, the cheapest 4 tests on this list | `mpedb-sql` parser |
+| 5 | 4 | Subquery in HAVING / over a collapsed group | `mpedb-sql` binder |
+| 5 | 4 | Numeric strictness (non-integral float param, float→int assignment) | `mpedb-sql` |
+| 8 | 4 | One-offs + the non-compound non-flattenable derived body | `mpedb-sql` |
+| 9 | 2 | DDL inside a SAVEPOINT | engine (`apply_ddl` + savepoint schema snapshot) |
+| — | 0 | The shim's `sqlite_master` mini-evaluator learning `WITH RECURSIVE` — removes adaptation D8 (a 147-outcome dependency), unblocks no test | `mpedb-capi` |
+| — | 0 | `AUTOINCREMENT` — removes adaptation D2, which gates all 831 | `mpedb-sql` + a persisted rowid high-water |
+| — | 3 | D10 `PRAGMA synchronous`, D11 `PRAGMA foreign_keys` — **not** on the path to 100 %: closing them means claiming durability and FK enforcement mpedb does not have | (deliberately open) |
+
+**The whole measured remainder outside `model_fields` is 39 tests in
+`mpedb-sql` plus 2 in the engine.** Nothing is left in the shim except the two
+honesty positions and the D8 evaluator, whose value is adaptation removal
+rather than score.
