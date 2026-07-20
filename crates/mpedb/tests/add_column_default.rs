@@ -249,11 +249,18 @@ fn refusals_match_sqlite() {
 
 #[test]
 fn type_mismatched_default_is_a_clean_error() {
-    // The rigid-schema divergence: a default whose type does not match the
-    // column is a clean error (sqlite's loose typing would store it instead).
+    // A default whose type does not match the column, after the column's OWN
+    // store-time affinity has had its go (task #113): a DDL-declared column
+    // carries sqlite's affinity, so `TEXT DEFAULT 5` really does store the
+    // text `'5'` here, exactly as sqlite does — the refusals below are the
+    // ones where sqlite's conversion does not land inside the rigid type and
+    // sqlite would have kept the original class.
     let (db, path) = fresh_mpedb("type-mismatch");
+    // `'nope'` numerifies to nothing, so it stays text and an int column
+    // refuses it; sqlite stores the text. Narrower, never different.
     assert!(db.query("ALTER TABLE t ADD COLUMN c INT DEFAULT 'nope'", &[]).is_err());
-    assert!(db.query("ALTER TABLE t ADD COLUMN c TEXT DEFAULT 5", &[]).is_err());
+    // `bool` is mpedb's own type, not one of sqlite's affinities, and never
+    // converts.
     assert!(db.query("ALTER TABLE t ADD COLUMN c BOOL DEFAULT 'x'", &[]).is_err());
     // The table is untouched: the column was never added.
     assert!(db.query("SELECT c FROM t", &[]).is_err());
@@ -263,6 +270,35 @@ fn type_mismatched_default_is_a_clean_error() {
         mpedb_select(&db, "SELECT c FROM t ORDER BY id"),
         vec![vec![Cell::Int(3)], vec![Cell::Int(3)]]
     );
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Task #113, the other half: where sqlite's store affinity DOES land inside
+/// the rigid type, a DDL-declared column converts exactly as sqlite does — the
+/// value AND its `typeof()`, both sides, on the same statements.
+#[test]
+fn a_ddl_declared_column_applies_sqlites_store_affinity_to_its_default() {
+    let (db, path) = fresh_mpedb("aff-default");
+    let conn = fresh_sqlite();
+    for alter in [
+        // TEXT affinity renders a number.
+        "ALTER TABLE t ADD COLUMN s TEXT DEFAULT 5",
+        "ALTER TABLE t ADD COLUMN s2 VARCHAR(10) DEFAULT 1.5",
+        // INTEGER affinity parses a fully-numeric string, and takes a real
+        // only when the round trip is lossless.
+        "ALTER TABLE t ADD COLUMN i INT DEFAULT '12'",
+        "ALTER TABLE t ADD COLUMN i2 BIGINT DEFAULT 9.0",
+        // REAL affinity floats an integer.
+        "ALTER TABLE t ADD COLUMN r REAL DEFAULT 7",
+    ] {
+        db.query(alter, &[]).unwrap();
+        conn.execute(alter, []).unwrap();
+    }
+    let sel = "SELECT s, s2, i, i2, r FROM t ORDER BY id";
+    assert_eq!(mpedb_select(&db, sel), sqlite_select(&conn, sel));
+    let tys = "SELECT typeof(s), typeof(s2), typeof(i), typeof(i2), typeof(r) FROM t ORDER BY id";
+    assert_eq!(mpedb_select(&db, tys), sqlite_select(&conn, tys));
     db.verify().unwrap();
     let _ = std::fs::remove_file(&path);
 }

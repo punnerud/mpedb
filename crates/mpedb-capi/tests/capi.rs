@@ -1778,13 +1778,46 @@ fn typeof_reports_only_sqlite_storage_classes_and_agrees_with_column_type() {
         );
         assert_eq!(sqlite3_finalize(st), SQLITE_OK);
 
-        // `timestamp` is declarable but unreachable: a clean, named refusal —
-        // never a value of a class sqlite has no name for.
+        // A DDL-declared `timestamp` is sqlite's NUMERIC affinity (task #113):
+        // the per-value column, exactly like `date`/`datetime`. It used to be a
+        // rigid ColumnType::Timestamp, which no value reachable through this
+        // shim could fill — every consumer sends an integer or an ISO string,
+        // and both were refused. `typeof` now answers a class sqlite HAS a name
+        // for, per value, and `PARSE_DECLTYPES` still sees `TIMESTAMP` because
+        // the decltype is the verbatim declared text.
         assert_eq!(
             exec(db, "CREATE TABLE ts (id integer PRIMARY KEY, t timestamp)"),
             SQLITE_OK
         );
-        assert_ne!(exec(db, "INSERT INTO ts VALUES (1, 1720000000000000)"), SQLITE_OK);
+        assert_eq!(
+            exec(
+                db,
+                "INSERT INTO ts VALUES (1, 1720000000000000), (2, '2004-02-14 07:15:00')"
+            ),
+            SQLITE_OK
+        );
+        let s = cs("SELECT typeof(t), t FROM ts ORDER BY id");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_OK
+        );
+        let mut got = Vec::new();
+        while sqlite3_step(st) == SQLITE_ROW {
+            got.push((col_text(st, 0), sqlite3_column_type(st, 1)));
+        }
+        assert_eq!(
+            got,
+            vec![
+                ("integer".into(), SQLITE_INTEGER),
+                ("text".to_string(), SQLITE_TEXT),
+            ]
+        );
+        assert_eq!(
+            CStr::from_ptr(sqlite3_column_decltype(st, 1)).to_string_lossy(),
+            "timestamp"
+        );
+        assert_eq!(sqlite3_finalize(st), SQLITE_OK);
 
         sqlite3_close(db);
     }

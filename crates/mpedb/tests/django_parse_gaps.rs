@@ -600,23 +600,23 @@ fn named_column_constraints_still_constrain() {
 
 /// The rigid half of the mapping, stated as a REFUSAL and pinned as such.
 ///
-/// sqlite converts at store time and keeps whatever survives: text `'abc'` into
-/// an `integer` column stays text. mpedb's `integer` column is rigid and refuses
-/// it. That is narrower than sqlite, never a different answer — and it is the
-/// same rigidity a config-declared `type = "int64"` column has always had.
+/// A DDL-declared column APPLIES sqlite's store affinity (#113,
+/// `declared_int_real_text_columns_convert_like_sqlite_or_refuse` above), so
+/// what is left here is the residue the conversion cannot land inside the rigid
+/// type: text `'abc'` into an `integer` column stays text in sqlite, and mpedb
+/// refuses it. Narrower than sqlite, never a different answer — and a
+/// CONFIG-declared `type = "int64"` / `type = "text"` column refuses BOTH,
+/// because there rigidity is the contract and no affinity is applied at all.
 #[test]
 fn a_rigid_column_refuses_what_sqlite_would_coerce() {
     let t = open();
     t.db.query("CREATE TABLE r (id integer PRIMARY KEY, n bigint, s varchar(10))", &[])
         .unwrap();
-    for bad in [
-        "INSERT INTO r (id, n) VALUES (1, 'abc')",
-        "INSERT INTO r (id, s) VALUES (2, 5)",
-    ] {
-        assert!(t.db.query(bad, &[]).is_err(), "must refuse, not coerce: {bad}");
-    }
-    // sqlite accepts both — this is the documented narrowing, asserted so it
-    // cannot silently become a coercion later.
+    // The conversion runs and leaves a text: an int column cannot hold it.
+    assert!(t.db.query("INSERT INTO r (id, n) VALUES (1, 'abc')", &[]).is_err());
+    // …while the value sqlite's TEXT affinity DOES convert now agrees with it.
+    t.db.query("INSERT INTO r (id, s) VALUES (2, 5)", &[]).unwrap();
+    // sqlite accepts both — the narrowing is the first row only.
     assert_eq!(
         sqlite_state(
             &[
@@ -631,6 +631,37 @@ fn a_rigid_column_refuses_what_sqlite_would_coerce() {
             vec!["null".to_string(), "text".to_string()],
         ]
     );
+    assert_eq!(
+        mpedb_rows(&t.db, "SELECT typeof(s), s FROM r WHERE id = 2"),
+        vec![vec!["text".to_string(), "5".to_string()]]
+    );
+
+    // The PROVENANCE half: the identical types declared in a TOML config keep
+    // the rigid refusal, because that is what a rigid schema is for.
+    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let path = format!(
+        "{dir}/mpedb-djgaps-cfg-{}-{}.mpedb",
+        std::process::id(),
+        UNIQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let _ = std::fs::remove_file(&path);
+    let toml = format!(
+        "[database]\npath = \"{path}\"\nsize_mb = 8\nmax_readers = 8\n\n\
+         [[table]]\nname = \"c\"\nprimary_key = [\"id\"]\n\
+         [[table.column]]\nname = \"id\"\ntype = \"int64\"\n\
+         [[table.column]]\nname = \"n\"\ntype = \"int64\"\nnullable = true\n\
+         [[table.column]]\nname = \"s\"\ntype = \"text\"\nnullable = true\n"
+    );
+    let cfg = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    for bad in [
+        "INSERT INTO c (id, n) VALUES (1, 'abc')",
+        "INSERT INTO c (id, s) VALUES (2, 5)",
+        "INSERT INTO c (id, n) VALUES (3, '12')",
+    ] {
+        assert!(cfg.query(bad, &[]).is_err(), "a config column must stay rigid: {bad}");
+    }
+    drop(cfg);
+    let _ = std::fs::remove_file(&path);
 }
 
 /// Two Django run-2 gap rows — "`FILTER (WHERE …)` parse: `expected )`" (3 tests)
@@ -839,50 +870,68 @@ fn a_typeless_column_still_stores_verbatim_like_sqlite() {
     assert_eq!(m, vec![vec!["real".to_string(), "text".to_string()]]);
 }
 
-/// The other three affinities are RIGID columns in mpedb, and rigid means the
-/// value is refused rather than converted. Pinned as a refusal so it can never
-/// quietly become a coercion — and asserted against what sqlite would have
-/// stored, so the narrowing stays visible.
+/// The INTEGER / REAL / TEXT affinities on a **DDL-declared** column: mpedb
+/// APPLIES the conversion (task #113) and stays rigid about the result, so the
+/// contract is *agree or refuse, never differ*. Driven over the same value
+/// battery as the NUMERIC case, against the bundled oracle:
+///
+/// * whenever mpedb accepts the value, its `typeof()` AND its text must equal
+///   sqlite's — that is the wrong-answer guard;
+/// * whenever mpedb refuses, sqlite must have stored a value OUTSIDE the rigid
+///   column's own storage class — that is the proof the refusal is the stated
+///   narrowing and not a missing conversion.
 #[test]
-fn text_integer_real_blob_affinities_still_refuse_rather_than_convert() {
-    let t = open();
-    t.db.query(
-        "CREATE TABLE r (id integer PRIMARY KEY, i bigint, f double precision, \
-         s varchar(10), b blob)",
-        &[],
-    )
-    .unwrap();
-    for bad in [
-        "INSERT INTO r (id, i) VALUES (1, '1.50')",
-        "INSERT INTO r (id, f) VALUES (2, '1.50')",
-        "INSERT INTO r (id, s) VALUES (3, 1.5)",
-        "INSERT INTO r (id, b) VALUES (4, '1.50')",
-    ] {
-        assert!(t.db.query(bad, &[]).is_err(), "must refuse, not coerce: {bad}");
+fn declared_int_real_text_columns_convert_like_sqlite_or_refuse() {
+    for (decl, rigid_class) in
+        [("bigint", "integer"), ("double precision", "real"), ("varchar(10)", "text")]
+    {
+        for lit in numeric_affinity_cases() {
+            let create = format!("CREATE TABLE t (id INTEGER PRIMARY KEY, v {decl})");
+            let insert = format!("INSERT INTO t (id, v) VALUES (1, {lit})");
+            let setup: &[&str] = &[&create, &insert];
+            let query = "SELECT typeof(v), CAST(v AS TEXT) FROM t";
+            let want = sqlite_state(setup, query);
+            let t = open();
+            let mut refused = false;
+            for s in setup {
+                if t.db.query(s, &[]).is_err() {
+                    refused = true;
+                    break;
+                }
+            }
+            if refused {
+                // A refusal is only honest if sqlite kept the value in a class
+                // this rigid column cannot hold. NULL is always holdable, so a
+                // refusal there would be a bug.
+                let got = &want[0][0];
+                assert_ne!(got, rigid_class, "{decl} refused {lit}, but sqlite stored a {got}");
+                assert_ne!(got, "null", "{decl} refused {lit}, which sqlite stored as NULL");
+            } else {
+                assert_eq!(mpedb_rows(&t.db, query), want, "{decl} / {lit}");
+            }
+        }
     }
-    // What sqlite does with those same four, recorded so the gap is a stated
-    // narrowing rather than an assumption.
-    assert_eq!(
-        sqlite_state(
-            &[
-                "CREATE TABLE r (id integer PRIMARY KEY, i bigint, f double precision, \
-                 s varchar(10), b blob)",
-                "INSERT INTO r (id, i) VALUES (1, '1.50')",
-                "INSERT INTO r (id, f) VALUES (2, '1.50')",
-                "INSERT INTO r (id, s) VALUES (3, 1.5)",
-                "INSERT INTO r (id, b) VALUES (4, '1.50')",
-            ],
-            "SELECT typeof(i), typeof(f), typeof(s), typeof(b) FROM r ORDER BY id",
-        ),
-        vec![
-            vec!["real", "null", "null", "null"],
-            vec!["null", "real", "null", "null"],
-            vec!["null", "null", "text", "null"],
-            vec!["null", "null", "null", "text"],
-        ]
-        .into_iter()
-        .map(|r| r.into_iter().map(str::to_string).collect::<Vec<_>>())
-        .collect::<Vec<_>>()
+}
+
+/// A DDL-declared `blob` is sqlite's BLOB affinity: it converts NOTHING and
+/// holds every class per value, which is why #113 made it the typeless column
+/// rather than a rigid `Blob`. `UPDATE t SET b='aaaa'` really does leave
+/// `typeof(b) = 'text'` — the shape three of CPython's `BlobTests` use.
+#[test]
+fn a_declared_blob_column_is_sqlites_typeless_column() {
+    for lit in numeric_affinity_cases() {
+        let create = "CREATE TABLE t (id INTEGER PRIMARY KEY, b blob)".to_string();
+        let insert = format!("INSERT INTO t (id, b) VALUES (1, {lit})");
+        let setup: &[&str] = &[&create, &insert];
+        assert_same(setup, "SELECT typeof(b), CAST(b AS TEXT) FROM t");
+    }
+    assert_same(
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, b blob)",
+            "INSERT INTO t (id, b) VALUES (1, x'0102')",
+            "UPDATE t SET b = 'aaaa' WHERE id = 1",
+        ],
+        "SELECT typeof(b), b, length(b), hex(b) FROM t",
     );
 }
 

@@ -766,8 +766,13 @@ fn plan_on_conflict(
         }
         let (b, ty) = binder.bind_expr(e)?;
         if let Some(t) = ty {
-            // Same rule as `bind_assign`: `any` accepts every typed value.
-            if t != table.columns[i].ty && table.columns[i].ty != ColumnType::Any {
+            // Same rule as `bind_assign`: `any` accepts every typed value, and
+            // so does a column that converts on store (#113) — the conversion
+            // runs at write time and the engine validates its result.
+            if t != table.columns[i].ty
+                && table.columns[i].ty != ColumnType::Any
+                && !table.columns[i].converts_on_store()
+            {
                 binder.set_allow_excluded(false);
                 return Err(bind_err(format!(
                     "cannot assign {t} to column `{name}` of type {}",
@@ -1282,7 +1287,25 @@ fn plan_insert(
                             InsertSource::Default
                         }
                         BExpr::Const(v) => {
-                            let v = coerce_const(v, col.ty, binder.sqlite_dialect());
+                            // On a column that CONVERTS on store (#113) sqlite's
+                            // affinity is the WHOLE rule, and `coerce_const`
+                            // must not run on top of it: its float→int step is
+                            // looser than `sqlite3VdbeIntegerAffinity`, and
+                            // stacking the two stored `'-9223372036854775809'`
+                            // as the clamped i64 MIN where sqlite keeps the
+                            // real. A boolean is folded to its integer first,
+                            // because sqlite has no boolean storage class for
+                            // an affinity to see.
+                            let v = if col.converts_on_store() {
+                                col.store(match v {
+                                    Value::Bool(b) if binder.sqlite_dialect() => {
+                                        Value::Int(b as i64)
+                                    }
+                                    other => other,
+                                })
+                            } else {
+                                coerce_const(v, col.ty, binder.sqlite_dialect())
+                            };
                             if v.is_null() && !col.nullable {
                                 return Err(bind_err(format!(
                                     "cannot insert NULL into NOT NULL column `{}`",
@@ -1312,16 +1335,24 @@ fn plan_insert(
                             InsertSource::Const(push_plan_const(consts, v)?)
                         }
                         BExpr::Param(i) => {
-                            match binder.param_types[i as usize] {
-                                None => binder.param_types[i as usize] = Some(col.ty),
-                                Some(t) if t == col.ty => {}
-                                Some(t) => {
-                                    return Err(bind_err(format!(
-                                        "parameter ${} already inferred as {t}, but column `{}` is {}",
-                                        i + 1,
-                                        col.name,
-                                        col.ty
-                                    )))
+                            // A column that CONVERTS on store pins nothing: the
+                            // bound value goes through sqlite's store affinity
+                            // and is validated AFTER conversion, which is the
+                            // whole point (`INSERT INTO t(name) VALUES (?)`
+                            // with an integer bound stores `'1'`). See
+                            // `ColumnDef::converts_on_store`.
+                            if !col.converts_on_store() {
+                                match binder.param_types[i as usize] {
+                                    None => binder.param_types[i as usize] = Some(col.ty),
+                                    Some(t) if t == col.ty => {}
+                                    Some(t) => {
+                                        return Err(bind_err(format!(
+                                            "parameter ${} already inferred as {t}, but column `{}` is {}",
+                                            i + 1,
+                                            col.name,
+                                            col.ty
+                                        )))
+                                    }
                                 }
                             }
                             InsertSource::Param(i)
