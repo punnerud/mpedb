@@ -303,10 +303,12 @@ fn exec_own(
 ) -> Result<ExecResult> {
     let tables = db.host_tables(plan);
     let host: Option<&dyn mpedb_types::HostFns> =
-        tables.as_ref().map(|(f, _)| f as &dyn mpedb_types::HostFns);
+        tables.as_ref().map(|(f, _, _)| f as &dyn mpedb_types::HostFns);
     let aggs: Option<&dyn mpedb_types::HostAggs> =
-        tables.as_ref().map(|(_, a)| a as &dyn mpedb_types::HostAggs);
-    let mut ctx = WriteCtx::new(txn, host, aggs);
+        tables.as_ref().map(|(_, a, _)| a as &dyn mpedb_types::HostAggs);
+    let colls: Option<&dyn mpedb_types::HostColls> =
+        tables.as_ref().map(|(_, _, c)| c as &dyn mpedb_types::HostColls);
+    let mut ctx = WriteCtx::new(txn, host, aggs, colls);
     exec_stmt_triggered(&mut ctx, &db.schema(), plan, params, partial, triggers, 0)
 }
 
@@ -976,7 +978,7 @@ mod tests {
 
     /// Tables `a` (id 0) and `b` (id 1), each `(id int64 PK, v int64 NULL)`.
     fn test_schema() -> Schema {
-        let col = |name: &str, nullable: bool| ColumnDef {
+        let col = |name: &str, nullable: bool| ColumnDef { decl: None,
             name: name.into(),
             ty: ColumnType::Int64,
             nullable,

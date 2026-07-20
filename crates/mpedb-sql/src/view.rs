@@ -501,9 +501,12 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
         Expr::InParamSlot(a, _, _) | Expr::InContext(a, _, _) => rename_qualifier(a, from, to),
         // Both the aggregate ARGUMENT and its `FILTER (WHERE …)` may name the
         // derived alias — rename inside each.
-        Expr::Agg(_, arg, _, filter) => {
+        Expr::Agg(_, arg, _, filter, extra) => {
             if let Some(a) = arg {
                 rename_qualifier(a, from, to);
+            }
+            for x in extra {
+                rename_qualifier(x, from, to);
             }
             if let Some(f) = filter {
                 rename_qualifier(f, from, to);
@@ -600,9 +603,12 @@ fn flatten_expr(
             }
             Ok(())
         }
-        Expr::Agg(_, arg, _, filter) => {
+        Expr::Agg(_, arg, _, filter, extra) => {
             if let Some(a) = arg {
                 flatten_expr(a, views, ctes, depth)?;
+            }
+            for x in extra {
+                flatten_expr(x, views, ctes, depth)?;
             }
             if let Some(f) = filter {
                 flatten_expr(f, views, ctes, depth)?;
@@ -697,9 +703,12 @@ fn collect_expr_sources(e: &Expr, out: &mut Vec<String>) {
             }
         }
         Expr::InParamSlot(a, _, _) | Expr::InContext(a, _, _) => collect_expr_sources(a, out),
-        Expr::Agg(_, arg, _, filter) => {
+        Expr::Agg(_, arg, _, filter, extra) => {
             if let Some(a) = arg {
                 collect_expr_sources(a, out);
+            }
+            for x in extra {
+                collect_expr_sources(x, out);
             }
             if let Some(f) = filter {
                 collect_expr_sources(f, out);

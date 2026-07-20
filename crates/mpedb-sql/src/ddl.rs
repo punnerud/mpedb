@@ -24,6 +24,11 @@ pub struct CreateColumnSpec {
     /// treats them OPPOSITELY on store — the first converts `'1.50'` to the
     /// real `1.5`, the second keeps the text. See [`ColumnType::declared`].
     pub affinity: mpedb_types::Affinity,
+    /// The declared type text VERBATIM, as the statement spelled it (`float`,
+    /// `number(5)`, `unsigned big int`), or `None` for a column declared with
+    /// no type at all. Neither `ty` nor `affinity` can reconstruct it, and it
+    /// is what `sqlite3_column_decltype` is defined to return.
+    pub decl: Option<String>,
     pub not_null: bool,
     pub unique: bool,
     pub pk: bool,

@@ -227,7 +227,18 @@ impl<'a> Parser<'a> {
     /// converts `'1.50'` to `1.5` on store) from no type at all (BLOB affinity —
     /// stores it verbatim). Both are `Any` columns; sqlite treats them
     /// oppositely.
-    fn declared_type(&mut self) -> Result<(mpedb_types::ColumnType, mpedb_types::Affinity)> {
+    ///
+    /// The third element is the declared text **verbatim**, sliced out of the
+    /// source between the first type token and whatever follows it. `ty` and
+    /// `affinity` are both lossy about the name (`float` → `Float64` whose
+    /// canonical spelling is `REAL`; every unknown name → `(Any, Numeric)`),
+    /// and `sqlite3_column_decltype` is defined as the text — a consumer that
+    /// keys converters off it (CPython's `PARSE_DECLTYPES`) gets a different
+    /// VALUE, with no error, when the canonical name is reported instead.
+    fn declared_type(
+        &mut self,
+    ) -> Result<(mpedb_types::ColumnType, mpedb_types::Affinity, Option<String>)> {
+        let start = self.toks.get(self.pos).map(|t| t.pos).unwrap_or(0);
         let mut words: Vec<String> = Vec::new();
         loop {
             match self.peek() {
@@ -250,8 +261,12 @@ impl<'a> Parser<'a> {
         }
         if words.is_empty() {
             // The typeless column: sqlite's BLOB (historically NONE) affinity,
-            // which converts nothing.
-            return Ok((mpedb_types::ColumnType::Any, mpedb_types::Affinity::Blob));
+            // which converts nothing. No text ⇒ no decltype (sqlite's NULL).
+            return Ok((
+                mpedb_types::ColumnType::Any,
+                mpedb_types::Affinity::Blob,
+                None,
+            ));
         }
         // Optional `( n )` / `( n , m )` size — consumed and discarded.
         if self.peek() == Some(&Tok::LParen) {
@@ -268,7 +283,20 @@ impl<'a> Parser<'a> {
             }
             self.expect(&Tok::RParen, "`)` after a column type size")?;
         }
-        Ok(mpedb_types::ColumnType::declared(&words.join(" ")))
+        // The verbatim span: from the first type token to the start of whatever
+        // token follows (end of source if none), trimmed of the trailing gap.
+        // Slicing the SOURCE rather than re-rendering the tokens is what keeps
+        // case, spacing and the size suffix exactly as written, which is what
+        // `sqlite3_column_decltype` promises.
+        let end = self
+            .toks
+            .get(self.pos)
+            .map(|t| t.pos)
+            .unwrap_or(self.src.len());
+        let text = self.src.get(start..end).unwrap_or("").trim();
+        let (ty, aff) = mpedb_types::ColumnType::declared(&words.join(" "));
+        let decl = (!text.is_empty()).then(|| text.to_string());
+        Ok((ty, aff, decl))
     }
 
     /// The tail of a `REFERENCES <table> [(col, …)] [ON …|MATCH …|[NOT]
@@ -375,11 +403,12 @@ impl<'a> Parser<'a> {
         let cname = self.ident("column name")?;
         // sqlite's full declared-type grammar (`varchar(100)`,
         // `double precision`, an unknown name, or none at all).
-        let (ty, affinity) = self.declared_type()?;
+        let (ty, affinity, decl) = self.declared_type()?;
         let mut col = crate::ddl::CreateColumnSpec {
             name: cname,
             ty,
             affinity,
+            decl,
             not_null: false,
             unique: false,
             pk: false,
@@ -933,11 +962,12 @@ impl<'a> Parser<'a> {
             // must not mean one thing in a CREATE and another in an ADD. Zero
             // type words is the typeless column (`ALTER TABLE t ADD COLUMN c`)
             // → Any, matching sqlite's no-affinity column.
-            let (ty, affinity) = self.declared_type()?;
+            let (ty, affinity, decl) = self.declared_type()?;
             let mut col = crate::ddl::CreateColumnSpec {
                 name: cname,
                 ty,
                 affinity,
+                decl,
                 not_null: false,
                 unique: false,
                 pk: false,

@@ -131,7 +131,7 @@ mod tests {
             "  padded  ",
             "back\\slash",
         ];
-        let col = |n: &str| ColumnDef {
+        let col = |n: &str| ColumnDef { decl: None,
             name: n.into(),
             ty: ColumnType::Int64,
             nullable: false,

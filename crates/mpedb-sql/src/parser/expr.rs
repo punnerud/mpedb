@@ -564,12 +564,10 @@ impl<'a> Parser<'a> {
     /// Is `name` a HOST-registered aggregate (design/DESIGN-UDF.md stage 2)?
     ///
     /// Name-only, because the grammar branch is chosen before the arguments are
-    /// read. **The supported call shape is exactly one argument**: the AST's
-    /// `Expr::Agg` carries a single optional argument (`count(*)`'s `None` or one
-    /// expression), so a registration with any other arity is refused HERE, with
-    /// a message naming the arity, rather than silently binding a call the
-    /// executor could not feed. A `-1` (variadic) registration is accepted and
-    /// called with its one argument.
+    /// read; the ARITY is checked afterwards against the actual argument count
+    /// (`check_host_agg_arity`), so a 2-ary or variadic registration is called
+    /// with as many arguments as it was written with. `count(*)`'s "the row
+    /// itself" shape stays exclusive to `count`.
     fn host_agg_target(&mut self, name: &str) -> Option<mpedb_types::AggTarget> {
         let lname = name.to_ascii_lowercase();
         self.host_aggs
@@ -578,9 +576,8 @@ impl<'a> Parser<'a> {
             .then_some(mpedb_types::AggTarget::Host(lname))
     }
 
-    /// Post-parse arity gate for a host aggregate: the call shape is fixed at one
-    /// argument (see [`host_agg_target`](Self::host_agg_target)), so a
-    /// registration for a different arity cannot be called at all.
+    /// Post-parse arity gate for a host aggregate: the CALL's argument count
+    /// must match a registration for this name (exact, or a variadic `-1`).
     fn check_host_agg_arity(&self, name: &str, argc: usize) -> Result<()> {
         if self.host_aggs.iter().any(|(n, a)| n == name && (*a == argc as i32 || *a == -1)) {
             return Ok(());
@@ -592,8 +589,8 @@ impl<'a> Parser<'a> {
             .map(|(_, a)| a.to_string())
             .collect();
         Err(self.err_here(format!(
-            "{name}() is a user-defined aggregate registered for {} argument(s); \
-             only a single-argument call is supported",
+            "{name}() is a user-defined aggregate registered for {} argument(s), \
+             not {argc}",
             arities.join("/")
         )))
     }
@@ -642,6 +639,11 @@ impl<'a> Parser<'a> {
         };
         if let Some(target) = target {
             let f_native = target.native();
+            // Arguments AFTER the first. Non-empty only for a HOST aggregate
+            // registered with arity > 1 — sqlite's `create_aggregate(name, N,
+            // cls)` is an N-ary contract and CPython's own suite registers 2-ary
+            // and variadic ones. Every built-in leaves this empty.
+            let mut host_extra: Vec<Expr> = Vec::new();
             let (arg, distinct): (Option<Box<Expr>>, bool) = if self.eat(&Tok::Star) {
                 self.expect(&Tok::RParen, "`)` closing count(*)")?;
                 if f_native != Some(mpedb_types::AggFn::Count) {
@@ -669,7 +671,22 @@ impl<'a> Parser<'a> {
                     )));
                 }
                 let arg = self.expr()?;
-                if self.peek() == Some(&Tok::Comma) {
+                // A comma after the first argument of a HOST aggregate opens the
+                // rest of ITS argument list. Only a host name takes this branch:
+                // a built-in still falls through to the `min(a,b)`/`max(a,b)`
+                // scalar rule and then to the one-argument error, so no built-in
+                // grammar changes. `DISTINCT` is excluded — sqlite has no
+                // multi-argument DISTINCT aggregate, and the dedup key here is
+                // the single argument.
+                let host_nary = self.peek() == Some(&Tok::Comma)
+                    && target.host().is_some()
+                    && !distinct;
+                if host_nary {
+                    while self.eat(&Tok::Comma) {
+                        host_extra.push(self.expr()?);
+                    }
+                    self.expect(&Tok::RParen, "`)` closing the argument list")?;
+                } else if self.peek() == Some(&Tok::Comma) {
                     // `max(a, b)` / `min(a, b)` are sqlite's SCALAR forms — a
                     // different C function from the aggregates of the same name
                     // (`minmaxFunc` vs `minmaxStep`), routed here on ARITY, which
@@ -713,12 +730,13 @@ impl<'a> Parser<'a> {
                         "{}() takes exactly one argument",
                         target.name()
                     )));
+                } else {
+                    self.expect(&Tok::RParen, "`)` closing the argument list")?;
                 }
-                self.expect(&Tok::RParen, "`)` closing the argument list")?;
                 (Some(Box::new(arg)), distinct)
             };
             if let Some(hname) = target.host() {
-                self.check_host_agg_arity(hname, arg.is_some() as usize)?;
+                self.check_host_agg_arity(hname, arg.is_some() as usize + host_extra.len())?;
             }
             // An OPTIONAL trailing `FILTER (WHERE <cond>)` (sqlite 3.30+/PG):
             // the aggregate accumulates only the rows where `cond` is TRUE. In
@@ -769,7 +787,7 @@ impl<'a> Parser<'a> {
                     spec,
                 });
             }
-            return Ok(Expr::Agg(target, arg, distinct, filter));
+            return Ok(Expr::Agg(target, arg, distinct, filter, host_extra));
         }
         let mut args = Vec::new();
         if self.peek() != Some(&Tok::RParen) {

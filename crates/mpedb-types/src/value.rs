@@ -594,6 +594,87 @@ impl Collation {
     }
 }
 
+/// The collating sequence an `ORDER BY` key is compared under: one of the three
+/// BUILT-IN [`Collation`]s, or a HOST collation registered by the connection
+/// through `sqlite3_create_collation` (design/DESIGN-UDF.md stage 3).
+///
+/// It is a separate type from [`Collation`], and deliberately reaches only ONE
+/// place in the plan — the `ORDER BY` key list. That is the honest scope, and
+/// the type system is what enforces it:
+///
+/// * A host collation is a **comparator**, not an encoding. Every other user of
+///   `Collation` in this crate turns a value into KEY BYTES — the B+tree key
+///   encoding, the GROUP BY / DISTINCT fold ([`Collation::fold_key`]), a
+///   column's declared collation in the schema. A callback cannot produce a
+///   sort key, so a host collation cannot appear there, and because those APIs
+///   still take `Collation`, one cannot be constructed for them at all.
+/// * An index built under BINARY cannot answer a host-collated range, so the
+///   planner's ORDER-BY-satisfied-by-scan-order elision requires
+///   `Native(Binary)` and a host collation blocks it by construction.
+///
+/// What that leaves is exactly what sqlite's own `create_collation` tests ask
+/// for: `ORDER BY <expr> COLLATE <name>` sorted through the callback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OrderColl {
+    Native(Collation),
+    /// A host collation, carried BY NAME (not by registry index): the plan is
+    /// self-describing, so two connections cannot disagree about which callback
+    /// slot 3 is. Such a plan never enters the shared registry — the same
+    /// one-connection-only rule host functions and aggregates already have.
+    Host(String),
+}
+
+impl Default for OrderColl {
+    fn default() -> Self {
+        OrderColl::Native(Collation::Binary)
+    }
+}
+
+impl OrderColl {
+    /// The host collation's name, or `None` for a built-in.
+    pub fn host(&self) -> Option<&str> {
+        match self {
+            OrderColl::Native(_) => None,
+            OrderColl::Host(n) => Some(n.as_str()),
+        }
+    }
+
+    /// The built-in this key sorts under, or `None` for a host collation.
+    pub fn native(&self) -> Option<Collation> {
+        match self {
+            OrderColl::Native(c) => Some(*c),
+            OrderColl::Host(_) => None,
+        }
+    }
+
+    /// The name as written after `COLLATE`, for EXPLAIN and error messages.
+    pub fn name(&self) -> &str {
+        match self {
+            OrderColl::Native(c) => c.name(),
+            OrderColl::Host(n) => n.as_str(),
+        }
+    }
+}
+
+/// Resolve a HOST collation's comparator at execution time, mirroring
+/// [`HostFns`](crate::HostFns) for scalars and [`HostAggs`](crate::HostAggs) for
+/// aggregates. `None` is threaded wherever no host collation can be in scope, so
+/// the mechanism stays inert for every plan that names none.
+pub trait HostColls {
+    /// Is a collating sequence registered under `name`? Checked ONCE, before a
+    /// sort starts, so the comparator itself cannot fail mid-`sort_by` (where
+    /// there is nowhere to report an error and "peers" would silently return
+    /// rows in the wrong order). An unregistered name is sqlite's
+    /// "no such collation sequence: <name>".
+    fn has(&self, name: &str) -> bool;
+
+    /// Order two TEXT values under `name`. Text only: sqlite applies a
+    /// collating sequence to a text-vs-text comparison and settles every other
+    /// pair by storage class first, which is what [`Value::sort_cmp`] already
+    /// does. Only ever called for a name [`has`](Self::has) accepted.
+    fn compare(&self, name: &str, a: &str, b: &str) -> Ordering;
+}
+
 /// sqlite NOCASE: fold each ASCII uppercase byte to lowercase and compare the
 /// folded byte streams, breaking a tie on length. Bytes outside `A'..='Z'`
 /// (including all non-ASCII UTF-8 continuation bytes) are compared unchanged —

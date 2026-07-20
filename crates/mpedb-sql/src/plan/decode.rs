@@ -16,9 +16,21 @@ fn take<'a>(buf: &'a [u8], pos: &mut usize, n: usize) -> Result<&'a [u8]> {
     Ok(s)
 }
 
-/// Decode an ORDER-BY collation tag byte, rejecting an unknown value.
-fn r_collation(buf: &[u8], pos: &mut usize) -> Result<Collation> {
-    Collation::from_tag(r_u8(buf, pos)?).ok_or_else(|| corrupt("bad collation tag"))
+/// Decode an ORDER-BY collating sequence: tags 0..=2 are the built-ins,
+/// exactly as before format 52; tag 3 introduces a HOST collation's name.
+fn r_collation(buf: &[u8], pos: &mut usize) -> Result<OrderColl> {
+    match r_u8(buf, pos)? {
+        3 => {
+            let name = r_str(buf, pos)?;
+            if name.is_empty() {
+                return Err(corrupt("host collation with an empty name"));
+            }
+            Ok(OrderColl::Host(name))
+        }
+        t => Collation::from_tag(t)
+            .map(OrderColl::Native)
+            .ok_or_else(|| corrupt("bad collation tag")),
+    }
 }
 
 fn r_u8(buf: &[u8], pos: &mut usize) -> Result<u8> {
@@ -715,11 +727,29 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                         // FILTER (WHERE …) (format 38): optional predicate over
                         // the base row; `validate` re-checks its width and params.
                         let filter = decode_opt_program(buf, pos)?;
+                        // Host-aggregate arguments after the first (format 51).
+                        // Only a host call may carry them: a built-in aggregate
+                        // takes exactly one argument and the executor would have
+                        // nowhere to put a second.
+                        let n_extra = r_u16(buf, pos)? as usize;
+                        if n_extra > MAX_COLUMNS {
+                            return Err(corrupt("too many host aggregate arguments"));
+                        }
+                        if n_extra > 0 && f.host().is_none() {
+                            return Err(corrupt(
+                                "built-in aggregate with more than one argument",
+                            ));
+                        }
+                        let mut extra_args = Vec::with_capacity(n_extra.min(MAX_COLUMNS));
+                        for _ in 0..n_extra {
+                            extra_args.push(ExprProgram::decode(buf, pos)?);
+                        }
                         aggs.push(AggCall {
                             func: f,
                             arg,
                             distinct,
                             filter,
+                            extra_args,
                         });
                     }
                     let having = decode_opt_program(buf, pos)?;

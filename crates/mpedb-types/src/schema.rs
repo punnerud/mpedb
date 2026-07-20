@@ -56,6 +56,24 @@ pub struct ColumnDef {
     /// truth. Set from the declared type name by [`ColumnType::declared`].
     /// Participates in the schema hash (canonical bytes v7).
     pub affinity: Affinity,
+    /// The column's declared type text, **verbatim as `CREATE TABLE` spelled
+    /// it** (`float`, `unsigned big int`, `number(5)`, `cblob`) — not a
+    /// vocabulary, just the bytes.
+    ///
+    /// It exists because `ty` + `affinity` are LOSSY about the name: every
+    /// unrecognized name folds into `(Any, Numeric)`, and `float` folds into
+    /// `Float64` whose canonical spelling is `REAL`. That loss is invisible in
+    /// SQL but not to a consumer: `sqlite3_column_decltype` is *defined* as the
+    /// declared text, and CPython's `PARSE_DECLTYPES` looks its converter up
+    /// under exactly that string — so reporting the canonical name silently
+    /// skips the converter and hands back a different VALUE with no error.
+    ///
+    /// `None` = no declared type at all (`CREATE TABLE t(a)`, sqlite's NULL
+    /// decltype), or a schema built without DDL text (the TOML config path,
+    /// synthetic catalog tables), where [`ColumnType::decltype_name`] remains
+    /// the answer. Read it through [`ColumnDef::decltype`], never directly.
+    /// Participates in the schema hash (canonical bytes v8).
+    pub decl: Option<String>,
 }
 
 /// The store-time conversion a column of this shape applies — the SINGLE place
@@ -87,6 +105,16 @@ impl ColumnDef {
     /// typeless column — converts nothing by definition.
     pub fn converts_on_store(&self) -> bool {
         self.ty == ColumnType::Any && self.affinity != Affinity::Blob
+    }
+
+    /// What `sqlite3_column_decltype` reports for this column: the VERBATIM
+    /// declared text where the schema has it, else the canonical spelling of
+    /// the storage type, else `None` (sqlite's NULL) for a typeless column.
+    pub fn decltype(&self) -> Option<&str> {
+        match &self.decl {
+            Some(d) => Some(d.as_str()),
+            None => self.ty.decltype_name(),
+        }
     }
 }
 
@@ -991,7 +1019,7 @@ impl Schema {
     /// and decode reconstructs the in-memory convenience flags from it.
     pub fn canonical_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(256);
-        buf.push(7u8); // schema encoding version (v7: ColumnDef.affinity)
+        buf.push(8u8); // schema encoding version (v8: ColumnDef.decl)
         buf.extend_from_slice(&(self.tables.len() as u32).to_le_bytes());
         for t in &self.tables {
             buf.extend_from_slice(&t.id.to_le_bytes());
@@ -1021,6 +1049,16 @@ impl Schema {
                 // `ty` implies except on an `Any` column, where `Numeric` vs
                 // `Blob` is the store-time-conversion bit `ty` cannot carry.
                 buf.push(c.affinity as u8);
+                // Verbatim declared-type text (v8). Absent (0) for the config
+                // path and synthetic tables, where the canonical name is the
+                // answer — a plain schema's bytes grow by one zero per column.
+                match &c.decl {
+                    None => buf.push(0),
+                    Some(d) => {
+                        buf.push(1);
+                        write_str(&mut buf, d);
+                    }
+                }
                 match &c.default {
                     None => buf.push(0),
                     Some(DefaultExpr::Const(v)) => {
@@ -1062,9 +1100,9 @@ impl Schema {
         let mut pos = 0usize;
         let version = *buf.get(pos).ok_or_else(err)?;
         pos += 1;
-        if version != 7 {
+        if version != 8 {
             return Err(Error::Corrupt(format!(
-                "unknown schema version {version} (v1..v6 predate canonical-bytes v7 — \
+                "unknown schema version {version} (v1..v7 predate canonical-bytes v8 — \
                  regenerate or re-import)"
             )));
         }
@@ -1127,6 +1165,18 @@ impl Schema {
                 let affinity = Affinity::from_tag(*buf.get(pos).ok_or_else(err)?)
                     .ok_or_else(|| Error::Corrupt("bad column affinity tag".into()))?;
                 pos += 1;
+                // Verbatim declared-type text (v8).
+                let decl = match *buf.get(pos).ok_or_else(err)? {
+                    0 => {
+                        pos += 1;
+                        None
+                    }
+                    1 => {
+                        pos += 1;
+                        Some(read_str(buf, &mut pos)?)
+                    }
+                    _ => return Err(Error::Corrupt("bad column decl tag".into())),
+                };
                 let default = match *buf.get(pos).ok_or_else(err)? {
                     0 => {
                         pos += 1;
@@ -1163,6 +1213,7 @@ impl Schema {
                     check,
                     collation,
                     affinity,
+                    decl,
                 });
             }
             let npk = read_u16(buf, &mut pos)? as usize;
@@ -1281,7 +1332,7 @@ mod tests {
             id: 0,
             name: "users".into(),
             columns: vec![
-                ColumnDef {
+                ColumnDef { decl: None,
                     name: "id".into(),
                     ty: ColumnType::Int64,
                     nullable: false,
@@ -1291,7 +1342,7 @@ mod tests {
                     check: None, collation: Collation::Binary,
                     affinity: Affinity::implied_by(ColumnType::Int64),
                 },
-                ColumnDef {
+                ColumnDef { decl: None,
                     name: "email".into(),
                     ty: ColumnType::Text,
                     nullable: false,
@@ -1301,7 +1352,7 @@ mod tests {
                     check: None, collation: Collation::Binary,
                     affinity: Affinity::implied_by(ColumnType::Text),
                 },
-                ColumnDef {
+                ColumnDef { decl: None,
                     name: "age".into(),
                     ty: ColumnType::Int64,
                     nullable: true,
@@ -1337,7 +1388,7 @@ mod tests {
                     .map(|n| TableDef {
                         id: 0,
                         name: n.to_string(),
-                        columns: vec![ColumnDef {
+                        columns: vec![ColumnDef { decl: None,
                             name: "id".into(),
                             ty: ColumnType::Int64,
                             nullable: false,
@@ -1365,7 +1416,7 @@ mod tests {
         let bad = Schema::new(vec![TableDef {
             id: 0,
             name: "t".into(),
-            columns: vec![ColumnDef {
+            columns: vec![ColumnDef { decl: None,
                 name: "id".into(),
                 ty: ColumnType::Int64,
                 nullable: true,
@@ -1384,7 +1435,7 @@ mod tests {
         let bad = Schema::new(vec![TableDef {
             id: 0,
             name: "__mpedb_plans".into(),
-            columns: vec![ColumnDef {
+            columns: vec![ColumnDef { decl: None,
                 name: "id".into(),
                 ty: ColumnType::Int64,
                 nullable: false,
@@ -1411,7 +1462,7 @@ mod tests {
     /// what keeps every positional engine cache correct until DROP's audit).
     #[test]
     fn ids_are_dense_explicit_and_survive_the_wire() {
-        let col = |n: &str| ColumnDef { name: n.into(), ty: ColumnType::Int64,
+        let col = |n: &str| ColumnDef { decl: None, name: n.into(), ty: ColumnType::Int64,
                 affinity: Affinity::implied_by(ColumnType::Int64),
             nullable: false, unique: false, indexed: false, default: None, check: None, collation: Collation::Binary };
         let tbl = |n: &str| TableDef { id: 0, name: n.into(), columns: vec![col("id")],
@@ -1441,13 +1492,13 @@ mod tests {
             id: 0,
             name: "t".into(),
             columns: vec![
-                ColumnDef { name: "id".into(), ty: ColumnType::Int64, nullable: false,
+                ColumnDef { decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
                         affinity: Affinity::implied_by(ColumnType::Int64),
                     unique: true, indexed: true, default: None, check: None, collation: Collation::Binary },
-                ColumnDef { name: "a".into(), ty: ColumnType::Int64, nullable: true,
+                ColumnDef { decl: None, name: "a".into(), ty: ColumnType::Int64, nullable: true,
                         affinity: Affinity::implied_by(ColumnType::Int64),
                     unique: true, indexed: true, default: None, check: None, collation: Collation::Binary },
-                ColumnDef { name: "b".into(), ty: ColumnType::Text, nullable: true,
+                ColumnDef { decl: None, name: "b".into(), ty: ColumnType::Text, nullable: true,
                         affinity: Affinity::implied_by(ColumnType::Text),
                     unique: false, indexed: true, default: None, check: None, collation: Collation::Binary },
             ],
@@ -1480,14 +1531,14 @@ mod tests {
 
     #[test]
     fn hostile_bytes_refuse_cleanly() {
-        let col = |n: &str, ty| ColumnDef { name: n.into(), ty, nullable: true,
+        let col = |n: &str, ty| ColumnDef { decl: None, name: n.into(), ty, nullable: true,
                 affinity: Affinity::implied_by(ty),
             unique: false, indexed: false, default: None, check: None, collation: Collation::Binary };
         let base = Schema::new(vec![TableDef {
             id: 0,
             name: "t".into(),
             columns: vec![
-                ColumnDef { name: "id".into(), ty: ColumnType::Int64, nullable: false,
+                ColumnDef { decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
                         affinity: Affinity::implied_by(ColumnType::Int64),
                     unique: false, indexed: false, default: None, check: None, collation: Collation::Binary },
                 col("v", ColumnType::Any),
@@ -1533,7 +1584,7 @@ mod tests {
     }
 
     fn tbl(n: &str) -> TableDef {
-        let col = |n: &str| ColumnDef {
+        let col = |n: &str| ColumnDef { decl: None,
             name: n.into(), ty: ColumnType::Int64, nullable: false,
             unique: false, indexed: false, default: None, check: None, collation: Collation::Binary,
             affinity: Affinity::implied_by(ColumnType::Int64),
@@ -1632,13 +1683,13 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r, "dead slot + ids survive the wire byte-for-byte");
         assert_eq!(s.hash(), r.hash());
-        // The version byte is 7.
-        assert_eq!(s.canonical_bytes()[0], 7);
-        // A v6 file refuses cleanly (no misread of the new affinity byte).
-        let mut v6 = s.canonical_bytes();
-        v6[0] = 6;
-        let err = Schema::from_canonical_bytes(&v6).unwrap_err();
-        assert!(format!("{err}").contains("unknown schema version 6"), "{err}");
+        // The version byte is 8.
+        assert_eq!(s.canonical_bytes()[0], 8);
+        // A v7 file refuses cleanly (no misread of the new decl-text byte).
+        let mut v7 = s.canonical_bytes();
+        v7[0] = 7;
+        let err = Schema::from_canonical_bytes(&v7).unwrap_err();
+        assert!(format!("{err}").contains("unknown schema version 7"), "{err}");
     }
 
     #[test]
@@ -1685,12 +1736,12 @@ mod tests {
     /// survives, and the helpers report the right visible set.
     #[test]
     fn implicit_rowid_round_trips_and_helpers() {
-        let col = |n: &str, ty| ColumnDef {
+        let col = |n: &str, ty| ColumnDef { decl: None,
             name: n.into(), ty, nullable: true, unique: false, indexed: false,
             default: None, check: None, collation: Collation::Binary,
             affinity: Affinity::implied_by(ty),
         };
-        let rowid = ColumnDef {
+        let rowid = ColumnDef { decl: None,
             name: "rowid".into(), ty: ColumnType::Int64, nullable: false,
             unique: false, indexed: false, default: None, check: None, collation: Collation::Binary,
             affinity: Affinity::implied_by(ColumnType::Int64),
@@ -1723,7 +1774,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 7);
+        assert_eq!(s.canonical_bytes()[0], 8);
 
         // Truncation at every offset is Corrupt, never a panic.
         let bytes = s.canonical_bytes();
@@ -1732,17 +1783,87 @@ mod tests {
         }
     }
 
+    /// The VERBATIM declared-type text survives the v8 wire byte-for-byte, is
+    /// what `decltype()` reports (canonical name only where there is no text),
+    /// contributes to the hash, and truncation at every offset is Corrupt.
+    #[test]
+    fn column_decl_text_round_trips_and_is_hostile_safe() {
+        let col = |n: &str, ty, decl: Option<&str>| ColumnDef {
+            name: n.into(),
+            ty,
+            nullable: true,
+            unique: false,
+            indexed: false,
+            default: None,
+            check: None,
+            collation: Collation::Binary,
+            affinity: Affinity::implied_by(ty),
+            decl: decl.map(str::to_string),
+        };
+        let s = Schema::new(vec![TableDef {
+            id: 0,
+            name: "t".into(),
+            columns: vec![
+                ColumnDef { nullable: false, ..col("id", ColumnType::Int64, Some("INTEGER")) },
+                // `float` is the case the canonical name loses: mpedb stores
+                // Float64, whose canonical spelling is REAL.
+                col("f", ColumnType::Float64, Some("float")),
+                // No declared type at all: sqlite reports NULL, and so must this.
+                col("n", ColumnType::Any, None),
+                // An unknown name is legal in sqlite and IS the decltype.
+                col("x", ColumnType::Any, Some("number(5)")),
+            ],
+            primary_key: vec![0],
+            indexes: vec![],
+            dead: false,
+            kind: TableKind::Standard,
+            implicit_rowid: false,
+        }])
+        .unwrap();
+        let c = &s.tables[0].columns;
+        assert_eq!(c[1].decltype(), Some("float"), "verbatim, not REAL");
+        assert_eq!(c[2].decltype(), None, "no declared type ⇒ sqlite's NULL");
+        assert_eq!(c[3].decltype(), Some("number(5)"));
+        // A column with no text falls back to the canonical name.
+        let mut plain = s.clone();
+        plain.tables[0].columns[1].decl = None;
+        assert_eq!(plain.tables[0].columns[1].decltype(), Some("REAL"));
+
+        let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
+        assert_eq!(s, r);
+        assert_eq!(s.hash(), r.hash());
+        assert_eq!(s.canonical_bytes()[0], 8);
+        // The text is part of the schema identity: `f float` and `f REAL` are
+        // the same storage and DIFFERENT schemas, because a consumer keying
+        // converters off the decltype sees two different columns.
+        assert_ne!(s.hash(), plain.hash());
+
+        let bytes = s.canonical_bytes();
+        for i in 0..bytes.len() {
+            assert!(Schema::from_canonical_bytes(&bytes[..i]).is_err(), "offset {i}");
+        }
+        // A hostile blob with an out-of-range decl tag refuses cleanly. Column
+        // `n` encodes as `<len> "n" <ty> <flags> <collation> <affinity> <decl>`.
+        let mut evil = bytes.clone();
+        let np = evil.windows(5).position(|w| w == b"\x01\x00\x00\x00n").unwrap();
+        let decl_at = np + 5 + 1 /*ty*/ + 1 /*flags*/ + 1 /*collation*/ + 1 /*affinity*/;
+        assert_eq!(evil[decl_at], 0, "located the decl tag byte");
+        evil[decl_at] = 0x7f;
+        let err = Schema::from_canonical_bytes(&evil).unwrap_err();
+        assert!(format!("{err}").contains("decl"), "{err}");
+    }
+
     /// A DECLARED column collation (`COLLATE NOCASE`) survives the v6 wire
     /// byte-for-byte, contributes to the hash, and truncation at every offset is
     /// Corrupt — the roundtrip/truncation contract extended to the new field.
     #[test]
     fn column_collation_round_trips_and_is_hostile_safe() {
-        let col = |n: &str, ty, coll| ColumnDef {
+        let col = |n: &str, ty, coll| ColumnDef { decl: None,
             name: n.into(), ty, nullable: true, unique: false, indexed: false,
             default: None, check: None, collation: coll,
             affinity: Affinity::implied_by(ty),
         };
-        let id = ColumnDef {
+        let id = ColumnDef { decl: None,
             name: "id".into(), ty: ColumnType::Int64, nullable: false, unique: false,
             indexed: false, default: None, check: None, collation: Collation::Binary,
             affinity: Affinity::implied_by(ColumnType::Int64),
@@ -1770,7 +1891,7 @@ mod tests {
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);
         assert_eq!(s.hash(), r.hash());
-        assert_eq!(s.canonical_bytes()[0], 7);
+        assert_eq!(s.canonical_bytes()[0], 8);
 
         // The collation changes the hash: a BINARY `name` is a different schema.
         let mut plain = s.clone();
@@ -1805,11 +1926,11 @@ mod tests {
                 id: 0,
                 name: "t".into(),
                 columns: vec![
-                    ColumnDef { name: "id".into(), ty: ColumnType::Int64, nullable: false,
+                    ColumnDef { decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
                         unique: false, indexed: false, default: None, check: None,
                             affinity: Affinity::implied_by(ColumnType::Int64),
                         collation: Collation::Binary },
-                    ColumnDef { name: "name".into(), ty: ColumnType::Text, nullable: true,
+                    ColumnDef { decl: None, name: "name".into(), ty: ColumnType::Text, nullable: true,
                         unique, indexed: !unique, default: None, check: None,
                             affinity: Affinity::implied_by(ColumnType::Text),
                         collation: Collation::NoCase },
@@ -1830,7 +1951,7 @@ mod tests {
         assert!(Schema::new(vec![TableDef {
             id: 0,
             name: "t".into(),
-            columns: vec![ColumnDef { name: "k".into(), ty: ColumnType::Text, nullable: false,
+            columns: vec![ColumnDef { decl: None, name: "k".into(), ty: ColumnType::Text, nullable: false,
                 unique: false, indexed: false, default: None, check: None,
                     affinity: Affinity::implied_by(ColumnType::Text),
                 collation: Collation::NoCase }],
@@ -1847,11 +1968,11 @@ mod tests {
             id: 0,
             name: "t".into(),
             columns: vec![
-                ColumnDef { name: "id".into(), ty: ColumnType::Int64, nullable: false,
+                ColumnDef { decl: None, name: "id".into(), ty: ColumnType::Int64, nullable: false,
                     unique: false, indexed: false, default: None, check: None,
                         affinity: Affinity::implied_by(ColumnType::Int64),
                     collation: Collation::Binary },
-                ColumnDef { name: "n".into(), ty: ColumnType::Int64, nullable: true,
+                ColumnDef { decl: None, name: "n".into(), ty: ColumnType::Int64, nullable: true,
                     unique: false, indexed: false, default: None, check: None,
                         affinity: Affinity::implied_by(ColumnType::Int64),
                     collation: Collation::NoCase },

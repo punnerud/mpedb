@@ -59,7 +59,7 @@ fn lift_aggs(
     // Per aggregate: `(func, arg, distinct, filter)`. The last element is the
     // optional `FILTER (WHERE …)` predicate AST, kept in the dedup key so two
     // otherwise-identical aggregates with DIFFERENT filters stay separate slots.
-    aggs: &mut Vec<(mpedb_types::AggTarget, Option<ast::Expr>, bool, Option<ast::Expr>)>,
+    aggs: &mut Vec<AggSpec>,
     // sqlite bare columns: `(base-row slot, type)`, deduped by slot. A bare
     // column becomes `__b{j}` where `j` is its index here; the planner resolves
     // those names against the extended grouped tuple `[keys ‖ aggs ‖ bare]`.
@@ -67,7 +67,7 @@ fn lift_aggs(
 ) -> Result<ast::Expr> {
     use ast::Expr as E;
     let rec = |x: &ast::Expr,
-               aggs: &mut Vec<(mpedb_types::AggTarget, Option<ast::Expr>, bool, Option<ast::Expr>)>,
+               aggs: &mut Vec<AggSpec>,
                bare: &mut Vec<(u16, ColumnType)>| lift_aggs(x, keys, scope, mode, aggs, bare);
     let group_by = keys.asts;
     // A selected/ordered expression that IS a group key — `SELECT a+1 …
@@ -78,10 +78,17 @@ fn lift_aggs(
         return Ok(E::Col(format!("__g{pos}")));
     }
     Ok(match e {
-        E::Agg(f, arg, distinct, filter) => {
+        E::Agg(f, arg, distinct, filter, extra) => {
             // The FILTER predicate rides in the dedup key: `count(*) FILTER
-            // (WHERE a)` and `count(*) FILTER (WHERE b)` are two aggregates.
-            let spec = (f.clone(), arg.as_deref().cloned(), *distinct, filter.as_deref().cloned());
+            // (WHERE a)` and `count(*) FILTER (WHERE b)` are two aggregates. So
+            // do the EXTRA arguments — `f(a, b)` and `f(a, c)` are two calls.
+            let spec = (
+                f.clone(),
+                arg.as_deref().cloned(),
+                *distinct,
+                filter.as_deref().cloned(),
+                extra.clone(),
+            );
             // Reuse an identical aggregate rather than adding a slot: `SELECT
             // count(*) ... ORDER BY count(*)` is one aggregate named twice, and
             // lifting it twice would accumulate it twice.
@@ -219,6 +226,18 @@ struct GroupKeys<'a> {
     cols: &'a [Option<u16>],
 }
 
+/// One aggregate CALL, as lifted out of the SELECT list / HAVING / ORDER BY
+/// before anything is bound: `(target, first argument, DISTINCT, FILTER,
+/// arguments after the first)`. The tuple IS the dedup key — two calls that
+/// agree on all five are one slot in the grouped tuple.
+type AggSpec = (
+    mpedb_types::AggTarget,
+    Option<ast::Expr>,
+    bool,
+    Option<ast::Expr>,
+    Vec<ast::Expr>,
+);
+
 fn synthetic_grouped_table(
     // One type per GROUP BY key — a plain column's declared type, or the
     // bound type of a computed key (`GROUP BY a + 1`).
@@ -226,7 +245,7 @@ fn synthetic_grouped_table(
     // One collation per GROUP BY key — a bare column's declared collation, so an
     // `ORDER BY <grouped-key>` over this synthetic tuple inherits it.
     key_collations: &[Collation],
-    aggs: &[(mpedb_types::AggTarget, Option<ast::Expr>, bool, Option<ast::Expr>)],
+    aggs: &[AggSpec],
     agg_types: &[Option<ColumnType>],
     // sqlite bare columns `(base slot, type)`: the tuple's tail
     // `[keys ‖ aggs ‖ bare]`, named `__b{j}`. Empty in postgres mode.
@@ -235,7 +254,7 @@ fn synthetic_grouped_table(
     let mut out: Vec<mpedb_types::ColumnDef> =
         Vec::with_capacity(key_types.len() + aggs.len() + bare.len());
     for (k, &ty) in key_types.iter().enumerate() {
-        out.push(mpedb_types::ColumnDef {
+        out.push(mpedb_types::ColumnDef { decl: None,
             name: format!("__g{k}"),
             ty,
             nullable: true, // a group key can be NULL; NULLs group together
@@ -247,7 +266,7 @@ fn synthetic_grouped_table(
             affinity: mpedb_types::Affinity::implied_by(ty),
         });
     }
-    for (i, (f, _, _, _)) in aggs.iter().enumerate() {
+    for (i, (f, _, _, _, _)) in aggs.iter().enumerate() {
         let ty = match f.native() {
             Some(mpedb_types::AggFn::Count) => ColumnType::Int64,
             Some(mpedb_types::AggFn::Avg | mpedb_types::AggFn::Total) => ColumnType::Float64,
@@ -259,7 +278,7 @@ fn synthetic_grouped_table(
             // to the argument's type would reject `stddev_pop(int_col) / 2.0`.
             None => ColumnType::Any,
         };
-        out.push(mpedb_types::ColumnDef {
+        out.push(mpedb_types::ColumnDef { decl: None,
             name: format!("__g{}", key_types.len() + i),
             ty,
             // COUNT and TOTAL are never NULL (0 / 0.0 over an empty group);
@@ -283,7 +302,7 @@ fn synthetic_grouped_table(
     // the base column. Always nullable — a bare column is carried from a witness
     // row that may hold NULL, and an empty group yields NULL.
     for (j, (_, ty)) in bare.iter().enumerate() {
-        out.push(mpedb_types::ColumnDef {
+        out.push(mpedb_types::ColumnDef { decl: None,
             name: format!("__b{j}"),
             ty: *ty,
             nullable: true,
@@ -420,7 +439,7 @@ pub(super) fn plan_aggregate_select(
     //    gets a slot in the grouped tuple's tail; whether it SURVIVES is decided
     //    after folding (step 5). In postgres mode `lift_aggs` refuses instead.
     let keys = GroupKeys { asts: &key_asts, cols: &key_cols };
-    let mut agg_specs: Vec<(mpedb_types::AggTarget, Option<ast::Expr>, bool, Option<ast::Expr>)> =
+    let mut agg_specs: Vec<AggSpec> =
         Vec::new();
     let mut bare: Vec<(u16, ColumnType)> = Vec::new();
     let mut rewritten = Vec::with_capacity(items.len());
@@ -459,7 +478,7 @@ pub(super) fn plan_aggregate_select(
     // it pins the bare-column witness to the lowest-rowid row (see
     // `decide_bare_cols`).
     let mut minmax_const = Vec::with_capacity(agg_specs.len());
-    for (f, arg, distinct, filt) in &agg_specs {
+    for (f, arg, distinct, filt, extra) in &agg_specs {
         let mut const_nonnull = false;
         let (arg_prog, ty, distinct) = match arg {
             None => (None, Some(ColumnType::Int64), false),
@@ -469,6 +488,14 @@ pub(super) fn plan_aggregate_select(
                 (Some(compile_program(&b)?), ty, *distinct)
             }
         };
+        // The arguments AFTER the first (host aggregates only), bound over the
+        // SAME base row as `arg` and in SOURCE order, so a parameter in argument
+        // 2 registers after one in argument 1.
+        let mut extra_args = Vec::with_capacity(extra.len());
+        for x in extra {
+            let (b, _) = binder.bind_expr(x)?;
+            extra_args.push(compile_program(&b)?);
+        }
         minmax_const.push(
             const_nonnull
                 && filt.is_none()
@@ -490,6 +517,7 @@ pub(super) fn plan_aggregate_select(
             arg: arg_prog,
             distinct,
             filter,
+            extra_args,
         });
     }
 
@@ -622,7 +650,7 @@ pub(super) fn plan_aggregate_select(
         let minmax_ix: Vec<usize> = agg_specs
             .iter()
             .enumerate()
-            .filter(|(_, (f, _, _, _))| {
+            .filter(|(_, (f, _, _, _, _))| {
                 matches!(f.native(), Some(mpedb_types::AggFn::Min | mpedb_types::AggFn::Max))
             })
             .map(|(i, _)| i)
@@ -674,7 +702,7 @@ pub(super) fn plan_aggregate_select(
         // key must repeat a select item — an aggregate it names dedups into its
         // SELECT-list slot, so no `order_refs` divergence can arise either.
         let bare_cols = decide_bare_cols(&projection, &having, &[], &[])?;
-        let (order_by, _) = distinct_order_by(s, base_scope, None)?;
+        let (order_by, _) = distinct_order_by(s, base_scope, None, binder.host_colls())?;
         let (param_types, context_keys, list_keys) = binder.into_parts();
         return Ok((
             PlanStmt::Select(SelectPlan {
@@ -706,16 +734,20 @@ pub(super) fn plan_aggregate_select(
             subplans,
         ));
     }
+    let base_hcolls: Vec<String> = binder.host_colls().to_vec();
+    let base_hcolls = &base_hcolls[..];
     let mut grouped_keys = Vec::with_capacity(rewritten_order.len());
     for (e, desc) in &rewritten_order {
         // The lift preserved any COLLATE (`ORDER BY name COLLATE NOCASE` in a
         // GROUP BY query); peel it so the inner resolves to a grouped-tuple
         // column and the collation rides the sort.
-        let (e, coll) = peel_collate(e)?;
+        let (e, coll) = peel_order_collate(e, base_hcolls)?;
         // The lifted key names a grouped-tuple column (`__gN`); its declared
         // collation was carried onto that synthetic column, so an `ORDER BY name`
         // over a NOCASE group key sorts case-insensitively.
-        let coll = coll.unwrap_or_else(|| declared_collation(e, &binder.scope));
+        let coll = coll.unwrap_or_else(|| {
+            mpedb_types::OrderColl::Native(declared_collation(e, &binder.scope))
+        });
         match binder.bind_expr(e)? {
             (BExpr::Col(i), _) => grouped_keys.push((i, *desc, coll)),
             // Not a bare column of the grouped tuple. Stop: the keys must all
@@ -733,8 +765,10 @@ pub(super) fn plan_aggregate_select(
             // Collation comes from the ORIGINAL key text; peel both the original
             // (for the ordinal test) and the lifted expr (for the item match /
             // junk column).
-            let (orig, coll) = peel_collate(orig)?;
-            let coll = coll.unwrap_or_else(|| declared_collation(orig, base_scope));
+            let (orig, coll) = peel_order_collate(orig, base_hcolls)?;
+            let coll = coll.unwrap_or_else(|| {
+                mpedb_types::OrderColl::Native(declared_collation(orig, base_scope))
+            });
             let (e, _) = peel_collate(e)?;
             // An ordinal or a repeat of a selected item needs no new column.
             if let Some(pos) = ordinal(orig, items.len())? {
@@ -824,8 +858,8 @@ fn agg_item_name(e: &ast::Expr) -> String {
     match e {
         ast::Expr::Col(c) => c.clone(),
         ast::Expr::Qualified(_, c) => c.clone(),
-        ast::Expr::Agg(f, None, _, _) => format!("{}(*)", f.name()),
-        ast::Expr::Agg(f, Some(a), distinct, _) => format!(
+        ast::Expr::Agg(f, None, _, _, _) => format!("{}(*)", f.name()),
+        ast::Expr::Agg(f, Some(a), distinct, _, _) => format!(
             "{}({}{})",
             f.name(),
             if *distinct { "DISTINCT " } else { "" },

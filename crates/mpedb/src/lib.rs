@@ -192,6 +192,33 @@ impl mpedb_types::HostAggState for GuardedAggState {
     }
 }
 
+/// One registered collating sequence: `(a, b) -> Ordering` over two strings.
+type HostCollCmp = Arc<dyn Fn(&str, &str) -> std::cmp::Ordering + Send + Sync>;
+
+/// The collating sequences ONE execution sees — snapshotted from the registry
+/// under the same gate as [`HostFnTable`]/[`HostAggTable`], so a re-registration
+/// mid-statement cannot change the order half-way through a sort.
+pub(crate) struct HostCollTable {
+    colls: Vec<(String, HostCollCmp)>,
+}
+
+impl mpedb_types::HostColls for HostCollTable {
+    fn has(&self, name: &str) -> bool {
+        self.colls.iter().any(|(n, _)| n == name)
+    }
+    fn compare(&self, name: &str, a: &str, b: &str) -> std::cmp::Ordering {
+        match self.colls.iter().find(|(n, _)| n == name) {
+            // A panicking comparator cannot be allowed to unwind through
+            // `sort_by` (which would leave the slice in an unspecified state);
+            // treat it as "peers", the same containment `guard_panic` gives the
+            // UDF paths, and let the sort finish.
+            Some((_, f)) => std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(a, b)))
+                .unwrap_or(std::cmp::Ordering::Equal),
+            None => std::cmp::Ordering::Equal,
+        }
+    }
+}
+
 impl mpedb_types::HostAggs for HostAggTable {
     fn create(&self, name: &str, argc: i32) -> Result<Box<dyn mpedb_types::HostAggState>> {
         let f = self
@@ -429,6 +456,18 @@ pub struct Database {
     /// between groups or between concurrent executions. Same one-connection-only
     /// plan rule as the scalars.
     host_aggs: RwLock<HashMap<(String, i32), HostAggFactory>>,
+    /// Host-registered COLLATING SEQUENCES (`sqlite3_create_collation`,
+    /// design/DESIGN-UDF.md stage 3), by NAME — a collation has no arity.
+    ///
+    /// Scope, deliberately narrow: a host collation is a COMPARATOR, so it can
+    /// order an `ORDER BY … COLLATE <name>` and nothing else. It never reaches
+    /// a KEY ENCODING — not a B+tree key, not a GROUP BY / DISTINCT fold, not a
+    /// column's declared `COLLATE` — because an index built under BINARY cannot
+    /// answer a host-collated probe, and a callback cannot produce sort bytes.
+    /// The type system enforces it: everything else takes a built-in
+    /// [`Collation`](mpedb_types::Collation), which no registration can produce.
+    /// Same one-connection-only plan rule as the scalars and aggregates.
+    host_colls: RwLock<HashMap<String, HostCollCmp>>,
     /// Writer-contention busy timeout in milliseconds (#109); `-1` = block
     /// indefinitely (the native default — mpedb's historical behavior). When
     /// `>= 0`, every facade path that takes the single writer lock bounds its
@@ -522,6 +561,7 @@ impl Database {
             bare_group_by: mpedb_types::BareGroupBy::default(),
             host_udfs: RwLock::new(HashMap::new()),
             host_aggs: RwLock::new(HashMap::new()),
+            host_colls: RwLock::new(HashMap::new()),
             busy_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
             attached: RwLock::new(Default::default()),
             cross_cache: RwLock::new(HashMap::new()),
@@ -574,6 +614,7 @@ impl Database {
             bare_group_by,
             host_udfs: RwLock::new(HashMap::new()),
             host_aggs: RwLock::new(HashMap::new()),
+            host_colls: RwLock::new(HashMap::new()),
             busy_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
             attached: RwLock::new(Default::default()),
             cross_cache: RwLock::new(HashMap::new()),
@@ -654,6 +695,46 @@ impl Database {
         self.cache.write().expect(POISON).clear();
     }
 
+    /// Register a host COLLATING SEQUENCE (`sqlite3_create_collation`,
+    /// design/DESIGN-UDF.md stage 3): a comparator over two strings, usable as
+    /// `ORDER BY <expr> COLLATE <name>`.
+    ///
+    /// **What it can and cannot do.** It can order a sort. It cannot change a
+    /// KEY: an index (or PRIMARY KEY) is stored in memcmp order under a
+    /// built-in collation, and a callback cannot produce sort bytes, so a
+    /// host-collated index probe, a host-collated `GROUP BY`/`DISTINCT` fold,
+    /// and a host collation on a column's declared `COLLATE` are all refused by
+    /// name ("no such collation sequence") rather than answered under BINARY.
+    /// The refusals are structural — those APIs take a built-in
+    /// [`Collation`](mpedb_types::Collation), which no registration produces.
+    ///
+    /// A built-in name (BINARY/NOCASE/RTRIM) can never be shadowed. Registering
+    /// again under the same name REPLACES the comparator (sqlite's rule) and
+    /// drops this connection's local plan cache, so the next compile sees it.
+    pub fn register_host_collation<F>(&self, name: &str, cmp: F)
+    where
+        F: Fn(&str, &str) -> std::cmp::Ordering + Send + Sync + 'static,
+    {
+        self.host_colls
+            .write()
+            .expect(POISON)
+            .insert(name.to_string(), Arc::new(cmp));
+        self.cache.write().expect(POISON).clear();
+    }
+
+    /// Remove a host collation registered with [`register_host_collation`]
+    /// (sqlite's `create_collation(name, None)`). Returns whether one was
+    /// present. A plan that already named it then fails with sqlite's
+    /// "no such collation sequence: <name>" at execution — never a silent
+    /// fallback to BINARY, which would be a different row ORDER with no error.
+    pub fn unregister_host_collation(&self, name: &str) -> bool {
+        let removed = self.host_colls.write().expect(POISON).remove(name).is_some();
+        if removed {
+            self.cache.write().expect(POISON).clear();
+        }
+        removed
+    }
+
     /// Remove a host aggregate registered with [`register_host_aggregate`].
     /// Returns whether an entry was present. Drops the local plan cache.
     pub fn unregister_host_aggregate(&self, name: &str, n_arg: i32) -> bool {
@@ -676,7 +757,10 @@ impl Database {
     fn host_udf_set(&self) -> HostUdfSet {
         let f = self.host_udfs.read().expect(POISON);
         let a = self.host_aggs.read().expect(POISON);
-        HostUdfSet::with_aggs(f.keys().cloned().collect(), a.keys().cloned().collect())
+        let c = self.host_colls.read().expect(POISON);
+        let mut set = HostUdfSet::with_aggs(f.keys().cloned().collect(), a.keys().cloned().collect());
+        set.set_colls(c.keys().cloned().collect());
+        set
     }
 
     /// Snapshot the registry's closures for one execution (see [`HostFnTable`]).
@@ -684,6 +768,14 @@ impl Database {
         let g = self.host_udfs.read().expect(POISON);
         HostFnTable {
             fns: g.iter().map(|((n, a), f)| (n.clone(), *a, f.clone())).collect(),
+        }
+    }
+
+    /// Snapshot the collating sequences for one execution (see [`HostCollTable`]).
+    fn host_coll_table(&self) -> HostCollTable {
+        let g = self.host_colls.read().expect(POISON);
+        HostCollTable {
+            colls: g.iter().map(|(n, f)| (n.clone(), f.clone())).collect(),
         }
     }
 
@@ -704,9 +796,13 @@ impl Database {
     /// locks entirely off the hot path of every ordinary statement: a database
     /// with no UDFs registered, or a statement that calls none, does exactly what
     /// it did before.
-    pub(crate) fn host_tables(&self, plan: &CompiledPlan) -> Option<(HostFnTable, HostAggTable)> {
-        plan.contains_host_call()
-            .then(|| (self.host_fn_table(), self.host_agg_table()))
+    pub(crate) fn host_tables(
+        &self,
+        plan: &CompiledPlan,
+    ) -> Option<(HostFnTable, HostAggTable, HostCollTable)> {
+        plan.contains_host_call().then(|| {
+            (self.host_fn_table(), self.host_agg_table(), self.host_coll_table())
+        })
     }
 
     /// Compile `sql` with this database's RLS policies injected (loaded from the
@@ -1392,16 +1488,18 @@ impl Database {
             // aggregate reports `contains_host_call` too.
             let tables = self.host_tables(plan);
             let host: Option<&dyn mpedb_types::HostFns> =
-                tables.as_ref().map(|(f, _)| f as &dyn mpedb_types::HostFns);
+                tables.as_ref().map(|(f, _, _)| f as &dyn mpedb_types::HostFns);
             let host_aggs: Option<&dyn mpedb_types::HostAggs> =
-                tables.as_ref().map(|(_, a)| a as &dyn mpedb_types::HostAggs);
+                tables.as_ref().map(|(_, a, _)| a as &dyn mpedb_types::HostAggs);
+            let host_colls: Option<&dyn mpedb_types::HostColls> =
+                tables.as_ref().map(|(_, _, c)| c as &dyn mpedb_types::HostColls);
             let r = self.engine.begin_read()?;
             // Staleness check UNDER THE SAME PIN that scans the rows (§4.3):
             // a policy edit that landed since compile invalidates the plan.
             // On error `r` drops here, releasing the reader slot.
             self.validate_policy_read(hash, plan, &r)?;
             let res = {
-                let mut ctx = ReadCtx(&r, host, host_aggs);
+                let mut ctx = ReadCtx(&r, host, host_aggs, host_colls);
                 exec_stmt(&mut ctx, &self.schema(), plan, params, &mut partial)
             };
             match res {
@@ -1963,10 +2061,12 @@ impl WriteSession<'_> {
         // before.
         let tables = self.db.host_tables(plan);
         let host: Option<&dyn mpedb_types::HostFns> =
-            tables.as_ref().map(|(f, _)| f as &dyn mpedb_types::HostFns);
+            tables.as_ref().map(|(f, _, _)| f as &dyn mpedb_types::HostFns);
         let aggs: Option<&dyn mpedb_types::HostAggs> =
-            tables.as_ref().map(|(_, a)| a as &dyn mpedb_types::HostAggs);
-        let mut ctx = exec::WriteCtx::new(&mut self.txn, host, aggs);
+            tables.as_ref().map(|(_, a, _)| a as &dyn mpedb_types::HostAggs);
+        let colls: Option<&dyn mpedb_types::HostColls> =
+            tables.as_ref().map(|(_, _, c)| c as &dyn mpedb_types::HostColls);
+        let mut ctx = exec::WriteCtx::new(&mut self.txn, host, aggs, colls);
         let res = exec::exec_stmt_triggered(
             &mut ctx,
             &schema,
@@ -2573,6 +2673,48 @@ primary_key = ["id"]
         assert!(matches!(db2.execute(&hash, &[]), Err(Error::UnknownPlan(_))));
         assert_eq!(ints(db.execute(&hash, &[]).unwrap()), vec![10_000]);
 
+        // MULTI-ARGUMENT host aggregates (PLAN_FORMAT 51): sqlite's
+        // `create_aggregate(name, N, cls)` is an N-ary contract, and CPython's
+        // own suite registers 2-ary and variadic ones. `xStep` gets the WHOLE
+        // argument list, in source order.
+        /// Sums `a * b` over the group, and reports how many arguments each
+        /// step was handed — so a dropped or reordered argument is visible.
+        #[derive(Default)]
+        struct Dot {
+            total: i64,
+            argc: usize,
+        }
+        impl mpedb_types::HostAggState for Dot {
+            fn step(&mut self, args: &[Value]) -> Result<()> {
+                self.argc = args.len();
+                let n = |v: &Value| match v {
+                    Value::Int(x) => *x,
+                    _ => 0,
+                };
+                self.total += args.iter().map(n).product::<i64>();
+                Ok(())
+            }
+            fn finish(self: Box<Self>) -> Result<Value> {
+                Ok(Value::Int(self.total * 10 + self.argc as i64))
+            }
+        }
+        db.register_host_aggregate("dot", 2, || Box::<Dot>::default());
+        // 1*1 + 2*2 + 3*3 + 4*4 = 30, two arguments per step.
+        assert_eq!(ints(db.query("SELECT dot(id, id) FROM users", &[]).unwrap()), vec![302]);
+        // Arguments are positional and evaluated over the same base row.
+        assert_eq!(ints(db.query("SELECT dot(id, 2) FROM users", &[]).unwrap()), vec![202]);
+        // Wrong arity is a clean compile error, not a call with a missing slot.
+        assert!(db.query("SELECT dot(id) FROM users", &[]).is_err());
+        assert!(db.query("SELECT dot(id, id, id) FROM users", &[]).is_err());
+        // A variadic (`-1`) registration takes whatever it is written with.
+        db.register_host_aggregate("dotv", -1, || Box::<Dot>::default());
+        assert_eq!(ints(db.query("SELECT dotv(id, id, id) FROM users", &[]).unwrap()), vec![1003]);
+        // The no-publish gate covers a multi-argument call too: the plan names a
+        // host aggregate, so it stays in THIS connection's cache.
+        let h2 = db.prepare("SELECT dot(id, id) FROM users").unwrap();
+        assert!(matches!(db2.execute(&h2, &[]), Err(Error::UnknownPlan(_))));
+        assert_eq!(ints(db.execute(&h2, &[]).unwrap()), vec![302]);
+
         // A built-in name can never be shadowed by a registration.
         db.register_host_aggregate("sum", 1, || Box::<MySum>::default());
         assert_eq!(ints(db.query("SELECT sum(id) FROM users", &[]).unwrap()), vec![10]);
@@ -2580,6 +2722,101 @@ primary_key = ["id"]
         // Unregister → unknown again.
         assert!(db.unregister_host_aggregate("mysum", 1));
         assert!(db.query("SELECT mysum(id) FROM users", &[]).is_err());
+    }
+
+    /// Host COLLATING SEQUENCES (design/DESIGN-UDF.md stage 3) and — just as
+    /// load-bearing — the boundary of what they may do.
+    ///
+    /// A registered collation is a COMPARATOR, so it orders `ORDER BY … COLLATE
+    /// <name>`. It cannot change a KEY ENCODING, so a host collation on a
+    /// column's declared `COLLATE`, or as a `GROUP BY`/`DISTINCT` fold, refuses
+    /// by name rather than being answered under BINARY. The refusals are what
+    /// keep this from being a wrong answer with no error.
+    #[test]
+    fn host_collation_orders_sorts_and_refuses_every_key_position() {
+        let (cfg, path) = test_config("host-coll", 8);
+        let _g = FileGuard(path);
+        let db = Database::open_with_config(cfg).unwrap();
+
+        let texts = |r: ExecResult| -> Vec<String> {
+            let ExecResult::Rows { rows, .. } = r else { panic!("want rows") };
+            rows.iter()
+                .map(|row| match &row[0] {
+                    Value::Text(s) => s.clone(),
+                    v => panic!("want text, got {v:?}"),
+                })
+                .collect()
+        };
+
+        db.query(
+            "INSERT INTO users (id, email) VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+            &[],
+        )
+        .unwrap();
+
+        // Unregistered → a clean bind error naming the collation, never BINARY.
+        let err = db
+            .query("SELECT email FROM users ORDER BY email COLLATE rev", &[])
+            .unwrap_err();
+        assert!(format!("{err}").contains("no such collation sequence: rev"), "{err}");
+
+        db.register_host_collation("rev", |a, b| b.cmp(a));
+        assert_eq!(
+            texts(db.query("SELECT email FROM users ORDER BY email COLLATE rev", &[]).unwrap()),
+            ["c", "b", "a"]
+        );
+        // A plain ORDER BY is untouched by the registration.
+        assert_eq!(
+            texts(db.query("SELECT email FROM users ORDER BY email", &[]).unwrap()),
+            ["a", "b", "c"]
+        );
+        // Re-registering REPLACES (sqlite's rule).
+        db.register_host_collation("rev", |a, b| a.cmp(b));
+        assert_eq!(
+            texts(db.query("SELECT email FROM users ORDER BY email COLLATE rev", &[]).unwrap()),
+            ["a", "b", "c"]
+        );
+        // A built-in can never be shadowed.
+        db.register_host_collation("nocase", |a, b| b.cmp(a));
+        assert_eq!(
+            texts(db.query("SELECT email FROM users ORDER BY email COLLATE NOCASE", &[]).unwrap()),
+            ["a", "b", "c"]
+        );
+
+        // THE BOUNDARY. Each of these would need the collation to decide KEY
+        // BYTES, which a callback cannot produce — so each refuses by name.
+        for sql in [
+            // A comparison's collation (rung 1) — no sort, a predicate.
+            "SELECT email FROM users WHERE email = 'a' COLLATE rev",
+            // A GROUP BY fold.
+            "SELECT email FROM users GROUP BY email COLLATE rev",
+        ] {
+            let err = db.query(sql, &[]).unwrap_err();
+            assert!(
+                format!("{err}").contains("no such collation sequence: rev"),
+                "{sql}: {err}"
+            );
+        }
+        // …and a column DECLARED under it: the index/PK encoding is bytewise.
+        let err = db
+            .query("CREATE TABLE c (id INTEGER PRIMARY KEY, s TEXT COLLATE rev)", &[])
+            .unwrap_err();
+        assert!(format!("{err}").contains("no such collation sequence: rev"), "{err}");
+
+        // A plan naming a host collation is CONNECTION-LOCAL, exactly like one
+        // naming a host function: a fresh handle to the same file cannot run it.
+        let hash = db.prepare("SELECT email FROM users ORDER BY email COLLATE rev").unwrap();
+        let db2 = Database::open_from_file(_g.0.as_path()).unwrap();
+        assert!(matches!(db2.execute(&hash, &[]), Err(Error::UnknownPlan(_))));
+        assert_eq!(texts(db.execute(&hash, &[]).unwrap()), ["a", "b", "c"]);
+
+        // Deregistering makes an EXISTING plan fail by name — never a silent
+        // fallback to BINARY, which would be a different order with no error.
+        assert!(db.unregister_host_collation("rev"));
+        let err = db
+            .query("SELECT email FROM users ORDER BY email COLLATE rev", &[])
+            .unwrap_err();
+        assert!(format!("{err}").contains("no such collation sequence: rev"), "{err}");
     }
 
     struct FileGuard(PathBuf);
@@ -2632,7 +2869,7 @@ primary_key = ["id"]
         let other_schema = Schema::new(vec![TableDef {
             id: 0,
             name: "users".into(),
-            columns: vec![ColumnDef {
+            columns: vec![ColumnDef { decl: None,
                 name: "id".into(),
                 ty: ColumnType::Int64,
                 nullable: false,
@@ -2987,7 +3224,7 @@ primary_key = ["id"]
         let foreign_schema = Schema::new(vec![TableDef {
             id: 0,
             name: "users".into(),
-            columns: vec![ColumnDef {
+            columns: vec![ColumnDef { decl: None,
                 name: "id".into(),
                 ty: ColumnType::Int64,
                 nullable: false,
