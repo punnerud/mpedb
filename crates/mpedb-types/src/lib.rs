@@ -21,7 +21,7 @@ pub use config::{
 pub use error::{BudgetKind, Error, Result};
 pub mod agg;
 pub use agg::{Accum, HostAggState, HostAggs};
-pub use expr::{CmpKind, ExprProgram, HostFns, Instr, ScalarFn};
+pub use expr::{sqlite_now_string, CmpKind, ExprProgram, HostFns, Instr, ScalarFn};
 
 /// The aggregate functions.
 ///

@@ -106,6 +106,16 @@ pub(crate) fn resolve_params_timed<'a>(
     r
 }
 
+/// Microseconds since the Unix epoch. The single clock read behind a literal
+/// `'now'`; a clock before the epoch stores 0 rather than panicking, matching
+/// `exec::now_micros`.
+fn now_micros() -> i64 {
+    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_micros()).unwrap_or(i64::MAX),
+        Err(_) => 0,
+    }
+}
+
 pub(crate) fn resolve_params<'a>(
     plan: &CompiledPlan,
     user_params: &'a [Value],
@@ -136,7 +146,22 @@ pub(crate) fn resolve_params<'a>(
     // context slots; the EXECUTOR fills them (uncorrelated: once up front,
     // correlated: per outer row) — here they are holes.
     full.resize(n_user + n_sub, Value::Null);
+    // The statement-start instant, read at most ONCE per execute — sqlite's
+    // `iCurrentTime` rule. Every literal `'now'` in the statement compiled to a
+    // reference to this one slot, so they all see this one value; the next
+    // execute of the same plan reads the clock again and sees a later one.
+    let mut instant: Option<Value> = None;
     for (p, key) in plan.context_keys.iter().enumerate() {
+        // The ONE reserved key the caller neither supplies nor can name (the
+        // binder refuses it in `current_setting()`): it carries the instant a
+        // literal `'now'` binds to, as the ISO-8601 UTC string the date/time
+        // functions parse. Filled from the clock, never from the session.
+        if key == mpedb_sql::STATEMENT_INSTANT_KEY {
+            let v = instant
+                .get_or_insert_with(|| Value::Text(mpedb_types::sqlite_now_string(now_micros())));
+            full.push(v.clone());
+            continue;
+        }
         let value = session.get(key).ok_or_else(|| {
             Error::Bind(format!(
                 "session context '{key}' is required by the statement but is not set"

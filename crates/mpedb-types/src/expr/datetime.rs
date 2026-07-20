@@ -1,5 +1,35 @@
-//! `strftime(FORMAT, TIMESTRING)` — a line-for-line port of sqlite 3.45's
-//! `strftimeFunc` over the subset of its time-string grammar that mpedb accepts.
+//! sqlite 3.45's date/time functions — `strftime(FORMAT, TIMESTRING)`,
+//! `date(X)`, `time(X)`, `datetime(X)` and `julianday(X)` — a line-for-line
+//! port of `strftimeFunc`/`dateFunc`/`timeFunc`/`datetimeFunc`/`juliandayFunc`
+//! over the subset of sqlite's time-string grammar that mpedb accepts. All five
+//! share ONE parser and ONE set of refusals, exactly as sqlite shares `isDate`.
+//!
+//! # `'now'` — how a deterministic engine says it
+//!
+//! sqlite fixes `'now'` ONCE PER STATEMENT (`iCurrentTime`), so two
+//! `date('now')` in one statement agree and the same statement run twice does
+//! not. mpedb reproduces that WITHOUT giving this module a clock: the BINDER
+//! recognises a LITERAL `'now'` in the time-value position and rewrites it into
+//! a reserved parameter slot, which the facade fills once per `execute()` with
+//! the statement-start instant rendered as `YYYY-MM-DD HH:MM:SS.SSS` UTC
+//! ([`sqlite_now_string`]). So:
+//!
+//! * the compiled plan carries a PARAMETER REFERENCE, never a timestamp — plan
+//!   bytes stay a deterministic function of the SQL, which is what makes the
+//!   content-hashed, cross-process plan registry sound;
+//! * the instant is runtime state, filled once per statement, so every `'now'`
+//!   in one statement reads the same slot and therefore the same value;
+//! * const-folding can never bake a clock, because a `Param` is not a constant
+//!   (and the binder's fold gate says so explicitly);
+//! * this module still sees only an ordinary ISO-8601 string, so `'now'` needs
+//!   no special case here at all.
+//!
+//! A `'now'` that is NOT a bind-time literal — a column or parameter whose
+//! VALUE happens to be the text `now` — stays REFUSED by name below: resolving
+//! it would need a clock inside `eval`, which would drift within one statement.
+//!
+//! Time zone: `'now'` is UTC, exactly as in sqlite (only the `'localtime'`
+//! modifier shifts it, and the whole modifier language is refused).
 //!
 //! # What is supported
 //!
@@ -26,11 +56,16 @@
 //! than sqlite for `'now'`, for a Julian-day number, or for a modifier. So
 //! every input this module does not reproduce is an ERROR that names it:
 //!
-//! * modifiers (`strftime(f, t, '+1 day')`) — sqlite's modifier language is a
-//!   large surface (`start of month`, `weekday N`, `unixepoch`, `localtime`,
-//!   `subsec`, …) and `localtime` is not even deterministic;
-//! * `'now'` (non-deterministic), `'unixepoch'`-style numeric time values and
-//!   the bare Julian-day number form (`strftime('%Y', 2455352.5)`);
+//! * modifiers (`strftime(f, t, '+1 day')`, `date(t, 'start of month')`) —
+//!   sqlite's modifier language is a large surface (`±N days/months/years`,
+//!   `start of day/month/year`, `weekday N`, `unixepoch`, `julianday`, `auto`,
+//!   `localtime`, `utc`, `subsec`, `ceiling`, `floor`), `localtime`/`utc` are
+//!   not even deterministic (they read the host time zone), and NOTHING in the
+//!   Django or CPython surfaces mpedb targets emits one — so the whole language
+//!   is refused BY NAME rather than partially implemented;
+//! * a RUNTIME `'now'` (see above — the bind-time literal is supported),
+//!   `'unixepoch'`-style numeric time values and the bare Julian-day number
+//!   form (`strftime('%Y', 2455352.5)`);
 //! * anything else that is not one of the ISO-8601 forms above, including the
 //!   out-of-range component values sqlite itself rejects (`2010-13-01`);
 //! * an unknown format specifier, and a trailing bare `%`.
@@ -344,54 +379,147 @@ fn parse_yyyy_mm_dd(b: &[u8], p: &mut Dt) -> bool {
 }
 
 /// The refusal text for a time string mpedb will not interpret. Deliberately
-/// an ERROR rather than sqlite's NULL: sqlite ANSWERS for `'now'`, for a
-/// Julian-day number and for a modifier, so returning NULL there would be a
-/// silently different answer rather than a refusal.
+/// an ERROR rather than sqlite's NULL: sqlite ANSWERS for a Julian-day number
+/// and for a modifier, so returning NULL there would be a silently different
+/// answer rather than a refusal.
 ///
-/// **`'now'` is refused for a reason of its own** (task #74 item 4 —
-/// re-examined and REFUSED BY DESIGN), and the reason is worth stating where
-/// the refusal is, so it does not have to be re-derived:
+/// **A RUNTIME `'now'` keeps a reason of its own.** The bind-time literal is
+/// supported (see the module header: it is rewritten into the statement-instant
+/// parameter). A `'now'` that only turns out to be `'now'` when a row is read
+/// cannot take that path, and resolving it here would mean:
 ///
-/// * mpedb has NO non-deterministic expression today — `CURRENT_TIMESTAMP` /
-///   `CURRENT_DATE` / `CURRENT_TIME` are refused by name in DDL as well, and
-///   there is no `current_timestamp()` function. `'now'` would be the first.
-/// * Compiled plans are CONTENT-HASHED and published to a registry SHARED
-///   ACROSS PROCESSES (`plan/<hash>` in the catalog's sys-keyspace). A
-///   `strftime('%Y','now')` has all-constant arguments; `fold` happens not to
-///   fold `Call` today, but its own comment says the node is "const-foldable in
-///   principle", and the day that gap closes the plan bytes would carry a
-///   COMPILE-TIME timestamp that every later process reuses. That is a wrong
-///   answer that outlives the process that made it, in a shared file.
-/// * sqlite fixes `'now'` ONCE PER STATEMENT (`iCurrentTime`), so
-///   `SELECT strftime('%s','now') FROM big_table` gives one value on every row.
-///   Reproducing that needs a statement-start instant threaded through every
-///   `ExprProgram::eval` call site (filters, projections, CHECK bodies, index
-///   expressions, triggers). Reading the clock inside `eval` instead would
-///   drift WITHIN one statement — a different wrong answer, and a syscall in
-///   the per-row hot path. `mpedb-types` has no clock dependency by design.
-/// * A CHECK body containing `'now'` would pass at INSERT and fail on any later
-///   re-validation (CHECKs are stored as SOURCE and recompiled at attach), and
-///   the mirror's convergence criterion — replay must reproduce the source
-///   EXACTLY — has no meaning for a statement whose answer depends on when it
-///   ran.
-/// * It would not even close the shape Django uses: `'now'` is only useful with
-///   the modifier language (`'now','start of day'`), which stays refused.
+/// * a clock read INSIDE `eval`, which would drift WITHIN one statement —
+///   `SELECT date(c) FROM big_table` would answer differently per row, where
+///   sqlite fixes one `iCurrentTime` for the whole statement. A different wrong
+///   answer, plus a syscall in the per-row hot path;
+/// * a clock dependency in `mpedb-types`, which has none by design.
+///
+/// A CHECK body or an index expression is refused for the same reason one level
+/// up (the binder has no statement-instant slot there): a CHECK containing
+/// `'now'` would pass at INSERT and fail on any later re-validation (CHECKs are
+/// stored as SOURCE and recompiled at attach), and the mirror's convergence
+/// criterion — replay must reproduce the source EXACTLY — has no meaning for a
+/// predicate whose answer depends on when it ran.
 fn unsupported_time(z: &str) -> Error {
     let shown: String = z.chars().take(64).collect();
     let why = if z.trim().eq_ignore_ascii_case("now") {
-        " ('now' in particular: mpedb has no non-deterministic expression, and compiled \
-         plans are content-hashed and shared across processes, so a clock read here \
-         could outlive the statement that made it)"
+        " (a 'now' that is not a bind-time LITERAL in the time-value position cannot be \
+         resolved: the statement instant is bound once per execute, and reading a clock \
+         per row would drift within one statement)"
     } else {
         ""
     };
     Error::TypeMismatch(format!(
-        "strftime(): unsupported time string {shown:?}; mpedb accepts only the ISO-8601 forms \
+        "unsupported time string {shown:?}; mpedb accepts only the ISO-8601 forms \
          'YYYY-MM-DD', 'YYYY-MM-DD[ T]HH:MM[:SS[.SSS]]' and 'HH:MM[:SS[.SSS]]', each with an \
-         optional 'Z' or '+HH:MM'/'-HH:MM' suffix. sqlite's 'now', its Julian-day and \
-         unix-epoch number forms and its modifier language are refused rather than \
-         guessed{why}"
+         optional 'Z' or '+HH:MM'/'-HH:MM' suffix, plus the literal 'now'. sqlite's \
+         Julian-day and unix-epoch number forms and its modifier language are refused \
+         rather than guessed{why}"
     ))
+}
+
+/// The refusal for sqlite's modifier language, shared by all five functions so
+/// the wording (and the list of what is refused) cannot drift.
+fn unsupported_modifiers(name: &str, n: usize) -> Error {
+    Error::TypeMismatch(format!(
+        "{name}(): modifiers are not supported ({n} given); sqlite's modifier language \
+         ('+1 day', '-3 months', 'start of month', 'start of day', 'weekday 0', \
+         'unixepoch', 'julianday', 'auto', 'localtime', 'utc', 'subsec', 'ceiling', \
+         'floor') is refused rather than partially implemented — 'localtime'/'utc' are \
+         not even deterministic, and nothing in the surfaces mpedb targets emits one"
+    ))
+}
+
+/// Unix microseconds → the ISO-8601 UTC time string `YYYY-MM-DD HH:MM:SS.SSS`
+/// that the binder's statement-instant parameter carries for a literal `'now'`.
+///
+/// MILLISECOND precision on purpose: sqlite's own `'now'` is a millisecond
+/// Julian day (`sqlite3OsCurrentTimeInt64`), and this string is immediately
+/// re-parsed by [`parse_date_or_time`], whose `(s*1000.0 + 0.5) as i64` recovers
+/// those milliseconds EXACTLY. Rendering more digits would only add rounding
+/// noise sqlite does not have.
+///
+/// Out-of-range instants (a clock before year 1 or past 9999) are CLAMPED to the
+/// representable ends rather than wrapping: the value is then rejected by the
+/// parser as an out-of-range time string — an error, never a wrong answer.
+pub fn sqlite_now_string(unix_micros: i64) -> String {
+    // Julian-day milliseconds of the Unix epoch: 2440587.5 days.
+    const UNIX_EPOCH_JD_MS: i64 = 210_866_760_000_000;
+    let ms = unix_micros.div_euclid(1000);
+    let ijd = ms.saturating_add(UNIX_EPOCH_JD_MS).clamp(0, MAX_JD_MS);
+    let mut x = Dt::new();
+    x.ijd = ijd;
+    x.valid_jd = true;
+    x.compute_ymd();
+    x.compute_hms();
+    let milli = (x.s * 1000.0 + 0.5) as i64 % 1000;
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        x.y, x.mo, x.d, x.h, x.mi, x.s as i32, milli
+    )
+}
+
+/// sqlite's `dateFunc`/`datetimeFunc` YEAR rendering — and it is NOT `%04d`.
+///
+/// The two functions write the four year digits BY HAND into a buffer whose
+/// slot 0 is a `'-'`, then return the buffer from index `Y<0 ? 0 : 1`. So a BC
+/// year keeps all four digits and gains a sign: `date('-0500-03-04')` is
+/// `-0500-03-04`. `strftime('%Y', …)` of the same date is `-500`, because THAT
+/// one really is `%04d` and C's width includes the sign.
+///
+/// Reproduced rather than smoothed over: the two spellings differ in sqlite, so
+/// making them agree here would be a wrong answer for one of them. (The parser
+/// caps `|Y|` at 4713, so the four digits never overflow.)
+fn date_year(y: i32) -> String {
+    let a = y.unsigned_abs() % 10_000;
+    let sign = if y < 0 { "-" } else { "" };
+    format!("{sign}{a:04}")
+}
+
+/// `date(X)` / `time(X)` / `datetime(X)` / `julianday(X)` — sqlite's
+/// `dateFunc`/`timeFunc`/`datetimeFunc`/`juliandayFunc`.
+///
+/// All four share [`parse_date_or_time`] with [`sqlite_strftime`], so the time
+/// grammar and its refusals can never drift between them. The OUTPUT is written
+/// exactly as each sqlite function writes it — see [`date_year`] for the one
+/// place where that is deliberately not the `strftime` spelling. `julianday` is
+/// the one that returns a REAL.
+pub(super) fn sqlite_date_family(f: super::ScalarFn, args: &[Value]) -> Result<Value> {
+    use super::ScalarFn as F;
+    let name = f.name();
+    if args.len() > 1 {
+        return Err(unsupported_modifiers(name, args.len() - 1));
+    }
+    let z = match &args[0] {
+        Value::Text(s) => s.as_str(),
+        other => {
+            return Err(Error::TypeMismatch(format!(
+                "{name}() time value must be text, got {} — sqlite would read a number as a \
+                 Julian day, a form mpedb does not support",
+                other.type_name()
+            )))
+        }
+    };
+    let mut x = parse_date_or_time(z)?;
+    x.compute_jd();
+    x.compute_ymd();
+    x.compute_hms();
+    Ok(match f {
+        F::Date => Value::Text(format!("{}-{:02}-{:02}", date_year(x.y), x.mo, x.d)),
+        F::Time => Value::Text(format!("{:02}:{:02}:{:02}", x.h, x.mi, x.s as i32)),
+        F::DateTime => Value::Text(format!(
+            "{}-{:02}-{:02} {:02}:{:02}:{:02}",
+            date_year(x.y),
+            x.mo,
+            x.d,
+            x.h,
+            x.mi,
+            x.s as i32
+        )),
+        // sqlite: `sqlite3_result_double(context, x.iJD/86400000.0)`.
+        F::JulianDay => Value::Float(x.ijd as f64 / 86_400_000.0),
+        _ => return Err(Error::Internal("not a date-family function".into())),
+    })
 }
 
 /// sqlite's `isDate` for the one-argument (no-modifier) case.
@@ -427,12 +555,7 @@ fn printf1(fmt: &str, v: f64) -> Result<String> {
 
 pub(super) fn sqlite_strftime(args: &[Value]) -> Result<Value> {
     if args.len() > 2 {
-        return Err(Error::TypeMismatch(format!(
-            "strftime(): modifiers are not supported ({} given); sqlite's modifier language \
-             ('+1 day', 'start of month', 'weekday 0', 'unixepoch', 'localtime', 'utc', \
-             'subsec', …) is refused rather than partially implemented",
-            args.len() - 2
-        )));
+        return Err(unsupported_modifiers("strftime", args.len() - 2));
     }
     let fmt = match &args[0] {
         Value::Text(s) => s.as_str(),

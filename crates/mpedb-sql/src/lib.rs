@@ -47,6 +47,23 @@ pub use planner::secondary_indexes;
 pub use policy::{table_policy_hash, PolicyCatalog, TablePolicies};
 pub use view::ViewCatalog;
 
+/// The reserved session-context key that carries the STATEMENT-START instant —
+/// what a literal `'now'` in `date()`/`time()`/`datetime()`/`julianday()`/
+/// `strftime()` binds to.
+///
+/// It is a context key so that the whole reserved-slot mechanism (sizing into
+/// `n_params`, plan encoding, one fill per `execute()`) applies unchanged; the
+/// facade recognises this ONE key by name and fills it from the clock instead of
+/// from the `Session`, and the binder refuses it in `current_setting()` so a
+/// caller can neither read it nor shadow it. The leading `@` keeps it outside
+/// the identifier-shaped names real settings use.
+///
+/// One slot per statement is the whole determinism argument: every `'now'` in a
+/// statement compiles to a reference to THIS slot, so they all read the same
+/// value (sqlite's `iCurrentTime` rule), while the plan bytes carry only a
+/// parameter index and never a clock reading.
+pub const STATEMENT_INSTANT_KEY: &str = "@statement_instant";
+
 /// Parse a row-level-security DDL statement, or `None` if `sql` is ordinary
 /// DML/query text (design/DESIGN-MULTIDB.md §3.1). The facade calls this before
 /// compiling, and applies any DDL against the catalog directly.

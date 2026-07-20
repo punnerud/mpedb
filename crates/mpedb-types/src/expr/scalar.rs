@@ -172,6 +172,21 @@ pub enum ScalarFn {
     /// silently call the wrong function.
     Max2 = 60,
     Min2 = 61,
+    /// `date(TIMESTRING)` — sqlite's `dateFunc`: the ISO date `YYYY-MM-DD` of
+    /// the parsed instant. Exactly `strftime('%Y-%m-%d', X)` (sqlite formats it
+    /// with the same `"%04d-%02d-%02d"`), so it rides the same time-string
+    /// grammar and the same refusals. See [`super::datetime`].
+    Date = 62,
+    /// `time(TIMESTRING)` — sqlite's `timeFunc`: `HH:MM:SS`, the whole-second
+    /// truncation of the parsed h/m/s (so `'…:56.999'` is `56`, and the
+    /// unnormalised `'2020-01-01 24:00'` really does print `24:00:00`).
+    Time = 63,
+    /// `datetime(TIMESTRING)` — sqlite's `datetimeFunc`: `YYYY-MM-DD HH:MM:SS`.
+    DateTime = 64,
+    /// `julianday(TIMESTRING)` — sqlite's `juliandayFunc`: the Julian day as a
+    /// REAL (`iJD/86400000.0`). The one member of the family that returns a
+    /// number rather than text.
+    JulianDay = 65,
 }
 
 impl ScalarFn {
@@ -237,6 +252,10 @@ impl ScalarFn {
             58 => ScalarFn::JsonInsert,
             60 => ScalarFn::Max2,
             61 => ScalarFn::Min2,
+            62 => ScalarFn::Date,
+            63 => ScalarFn::Time,
+            64 => ScalarFn::DateTime,
+            65 => ScalarFn::JulianDay,
             other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
         })
     }
@@ -252,6 +271,13 @@ impl ScalarFn {
             // accepts the arity so the refusal can NAME the modifiers rather
             // than report a bare arity mismatch (see `call_scalar`).
             ScalarFn::Strftime => argc >= 2,
+            // The `date`/`time`/`datetime`/`julianday` family is
+            // `(TIMESTRING, modifier…)` in sqlite. Same reason as strftime: the
+            // arity is ACCEPTED so `call_scalar` can refuse the modifier
+            // language BY NAME rather than report a bare arity mismatch.
+            ScalarFn::Date | ScalarFn::Time | ScalarFn::DateTime | ScalarFn::JulianDay => {
+                argc >= 1
+            }
             ScalarFn::Round | ScalarFn::Trim | ScalarFn::Ltrim | ScalarFn::Rtrim => {
                 argc == 1 || argc == 2
             }
@@ -363,6 +389,10 @@ impl ScalarFn {
             ScalarFn::JsonInsert => "json_insert",
             ScalarFn::Max2 => "max",
             ScalarFn::Min2 => "min",
+            ScalarFn::Date => "date",
+            ScalarFn::Time => "time",
+            ScalarFn::DateTime => "datetime",
+            ScalarFn::JulianDay => "julianday",
         }
     }
 }
@@ -698,6 +728,15 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
         // strftime(FORMAT, TIMESTRING): sqlite's time formatter over the ISO-8601
         // time strings, restricted to the specifiers mpedb reproduces exactly.
         ScalarFn::Strftime => super::datetime::sqlite_strftime(args)?,
+        // date/time/datetime/julianday: sqlite's `dateFunc`/`timeFunc`/
+        // `datetimeFunc`/`juliandayFunc` over the SAME time-string grammar
+        // strftime uses, so the whole family shares one parser and one set of
+        // refusals. A literal `'now'` was rewritten by the binder into the
+        // statement-instant parameter, so it arrives here as an ordinary
+        // ISO-8601 string (design note in [`super::datetime`]).
+        ScalarFn::Date | ScalarFn::Time | ScalarFn::DateTime | ScalarFn::JulianDay => {
+            super::datetime::sqlite_date_family(f, args)?
+        }
         // --- JSON readers. These DO null-propagate (verified: a NULL document
         // or a NULL path yields NULL), so they sit under the gate.
         ScalarFn::Json => json::json(args)?,

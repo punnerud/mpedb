@@ -384,7 +384,24 @@ const MAX_JOINS: usize = 16;
 //     NOTE (worktree, 2026-07-19): rebased onto main at 49 (derived-table
 //     materialization); this takes 50 by instruction — expr opcode tags 56..60
 //     — and the numbers are reconciled at merge.
-const PLAN_FORMAT: u8 = 50;
+// 51: the rest of sqlite's date/time family — `date(X)`, `time(X)`,
+//     `datetime(X)`, `julianday(X)` — as four additive `ScalarFn` tags 62..65
+//     (60/61 were the scalar max/min at format 49), plus a literal `'now'` in
+//     any of the five functions' TIMESTRING position.
+//
+//     `'now'` costs NO new opcode and NO new plan field: the binder rewrites the
+//     literal into the reserved session-context slot
+//     [`crate::STATEMENT_INSTANT_KEY`], which the facade fills once per
+//     `execute()` with the statement-start instant as an ISO-8601 UTC string.
+//     So a `'now'` plan differs from any other plan only by carrying one more
+//     context key — already-encoded structure — and the plan bytes can never
+//     contain a clock reading. Two `'now'`s in one statement resolve to the SAME
+//     slot and therefore agree (sqlite's `iCurrentTime` rule); two executes fill
+//     it twice and differ.
+//
+//     Additive on the wire: an unknown `ScalarFn` tag is already a decode error,
+//     and no format-50 plan can carry one.
+const PLAN_FORMAT: u8 = 51;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -719,6 +736,7 @@ impl CompiledPlan {
     pub fn subplan_base(&self) -> u16 {
         self.n_params - self.context_keys.len() as u16 - self.subplans.len() as u16
     }
+
 }
 
 /// One SELECT, compiled. Extracted from the `PlanStmt::Select` variant so a

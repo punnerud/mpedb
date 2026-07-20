@@ -25,6 +25,7 @@ mod jump_tests;
 #[cfg(test)]
 mod tests;
 
+pub use datetime::sqlite_now_string;
 pub use scalar::ScalarFn;
 
 use ops::{
