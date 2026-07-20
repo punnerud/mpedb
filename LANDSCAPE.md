@@ -10,23 +10,23 @@ is desk research from repos, docs and headers. Vendor blog numbers are labelled
 as such. Items that could not be reached are marked UNVERIFIED rather than
 guessed.
 
-> **The vector / RAG / search half is still being surveyed** and will be added as
-> §7. mpedb has no vector index, so for most of that category the honest verdict
-> is "not a competitor, a possible direction" — which is worth stating rather
-> than blurring.
+mpedb has no vector index, so for most of §7 the honest verdict is **"not a
+competitor, a possible direction"** rather than a feature-matrix row.
 
 ---
 
 ## 1. The finding
 
-**Of roughly fifty engines examined, the number of actively-maintained
-open-source databases that let several unrelated OS processes hold concurrent
-write transactions against one shared file, with no daemon, is two.**
+**Of roughly a hundred engines examined across both halves, the number of
+actively-maintained open-source databases that let several unrelated OS
+processes hold concurrent write transactions against one shared file, with no
+daemon, is three** — and the third arrives by a completely different route.
 
 | | project | note |
 |---|---|---|
 | live | **YottaDB** | daemonless, shared-memory, OCC. 88 stars — and it runs the US Veterans Affairs' VistA and core banking. Star counts are useless here. |
 | live | **Firebird** Classic/SuperClassic | *"each database may be opened by multiple processes (including local ones for embedded access)"*, arbitrated by a shared-memory lock table. |
+| live | **Lance** | optimistic concurrency over put-if-not-exists manifests with per-operation conflict rules. Not shared memory — but genuine multi-writer, on a local filesystem, with no daemon. |
 | frozen | Berkeley DB (Transactional Data Store) | genuinely multi-process, AGPL since 2013, last release 2020. |
 
 Multi-process **attach** with exactly one writer — architecturally mpedb's
@@ -203,7 +203,108 @@ another benchmark program."*
 
 ## 7. Vector, RAG and search
 
-*Survey in progress; this section will be added when it lands.*
+**The hypothesis I went in with was that this category has essentially no
+crash-safety story. It is wrong for search and right for vectors**, and the
+split is the useful part.
+
+**Refuting it outright**: Lucene (`MockDirectoryWrapper.crash()` — *"simulates a
+crash of OS or machine by overwriting unsynced files"* — plus a documented
+physical mains-power-cut rig: **80 power cycles, zero corruption**, with an
+fsync-disabled control run that *did* corrupt). Xapian (*"the database should
+always be left in a valid state… even if the power is cut unexpectedly"*).
+Vespa (*"Writes are guaranteed to be synced to durable storage prior to sending
+a successful response"*). Elasticsearch and OpenSearch (`durability: request`
+**by default** — fsync before ack). ParadeDB, which moved its Tantivy index into
+Postgres block storage specifically to get WAL and MVCC, and runs its stress
+suite under **Antithesis**. Manticore, whose binlog entries are checksummed so a
+corrupt record halts replay rather than injecting garbage.
+
+**Confirming it**: every ANN *library* — FAISS, hnswlib, Annoy, ScaNN, Voyager —
+plus Chroma, Vald and Sonic. `Annoy::save()` opens with **`unlink(filename)`**:
+the previous good index is deleted before the new one is written. hnswlib's
+`saveIndex()` has no magic number, no version, no checksum, no rename, no fsync.
+These are not databases and were never trying to be — but they are what half the
+"vector databases" are built on.
+
+### The differentiator is not crash safety
+
+**It is multi-process writers, and only one project competes.** Every vector
+server is single-writer-per-index; every library is single-writer-per-index. The
+exception is **Lance**, which gets there by optimistic concurrency over
+put-if-not-exists / rename-if-not-exists manifests, with per-operation conflict
+rules and rebase — a completely different route, and it works on a local
+filesystem. It is the entry that needs the most careful answer if mpedb ever
+writes a "why not just use X" section.
+
+So the claim to make is narrow and defensible: **crash-safe under SIGKILL *and*
+multiple writer processes on one mapped file.** The first half has plenty of
+company. The second half has essentially none.
+
+### If mpedb ever grows a vector index, the design is already decided
+
+**Copy sqlite-vec's storage decision without reservation.** Everything —
+including its new DiskANN graph — lives in ordinary SQLite shadow tables, so
+durability, atomicity and rollback are inherited entirely. There is no bespoke
+durability path to get wrong. Put the vector index in ordinary mpedb trees and
+you inherit COW, MVCC, group commit, multi-process writers and SIGKILL survival
+for free.
+
+**Copy pgvector's visibility model.** It does *not* make the HNSW graph
+MVCC-correct. Aborted transactions' entries physically remain until VACUUM;
+every scan re-checks visibility against the heap. That converts "keep an
+approximate graph transactionally consistent" (very hard) into "keep it
+conservatively over-inclusive" (easy). The index is an accelerator over
+candidate row ids, never an authority.
+
+**Do not copy pgvector's post-index filtering.** *"With approximate indexes,
+filtering is applied after the index is scanned. If a condition matches 10% of
+rows, with HNSW and the default `hnsw.ef_search` of 40, only 4 rows will match
+on average."* Their `iterative_scan` is a retrofit. mpedb owns the planner and
+the footprint — push the predicate into traversal from day one.
+
+**And look hard at DiskANN3 before writing any graph code.** microsoft/DiskANN
+is now *"a composable library"* whose premise is that the host database supplies
+storage: implement the `DataProvider` trait and it uses your store for vectors
+and adjacency lists. Shipped examples include a KV store and *"a Bf-tree
+provider as an illustration of how to connect to a B-tree in your database."*
+That is mpedb's shape exactly, and it also solves HNSW's delete problem —
+`RepairGraph`-style full scans are where pgvector bleeds both cost and
+corruption bugs (0.8.3, 0.8.2 and 0.3.1 all shipped index-corruption fixes).
+
+### Two findings worth keeping
+
+**Weaviate deliberately removed fsync from its HNSW commit log**, and documented
+why: *"the index is rebuilt from the object store on any unclean shutdown…
+Per-batch fsync was the dominant contributor to the ~15-30% import time
+regression on slow disks."* Their object store is the system of record; the
+index is an explicitly derived cache. That is an honest trade, and it is the
+opposite of what their marketing implies.
+
+**Chroma's is not honest.** The index directory is overwritten **in place** every
+~1000 records — no fsync, no temp-file-plus-rename — while the sqlite watermark
+is a separate write with no spanning transaction. A kill inside `index.save()`
+can leave the index partially overwritten with the previous good copy already
+destroyed. Recovery is "delete the index and replay the WAL" — except WAL
+auto-purge has been on by default since v0.5.6, which their own cookbook admits
+*"makes it hard or impossible to restore Chroma."* The docs say *"Chroma durably
+persists each collection to disk."*
+
+**And nobody is watching.** Jepsen has never analysed a single vector database —
+not Qdrant, Milvus, Weaviate, Chroma, Vespa, Vald, Infinity or Lance. The only
+search analysis is Elasticsearch 1.5.0 from 2015, never redone, and Elastic's
+own resiliency page still lists Jepsen testing as work in progress.
+
+### The uncomfortable comparison
+
+**Xapian.** ~875 stars on a mirror, one maintainer for 25 years, and it has a
+better durability contract than most of this document: one writer and many
+readers enforced by `fcntl` locks — *"if a writer exits without being given a
+chance to clean up… any fcntl() locks held will be automatically released by the
+operating system so **stale locks can't happen**"* — plus a stated power-loss
+guarantee. It publishes no performance marketing at all, so there is no vendor
+number to discount. It will have better retrieval quality than mpedb's FTS for a
+long time, and a comparable durability posture. It is the fairest comparison
+available and the least flattering.
 
 ---
 
@@ -232,6 +333,13 @@ learning from.
 | Neo4j | native graph traversal: index-free adjacency, multi-hop patterns a relational plan would butcher |
 | sanakirja | O(1)-ish forkable tables — branchy versioned data models that mpedb's single-lineage MVCC cannot express |
 | Realm | shipped cross-process MVCC to hundreds of millions of phones, with inter-process change notifications |
+| Lucene | 25 years of IR correctness under randomized adversarial testing — and a physical power-cut rig |
+| Xapian | probabilistic relevance with 25 years of craft, `fcntl` locks the kernel releases on death, and no performance marketing at all |
+| Tantivy | Lucene-class inverted index in a linkable Rust crate — the engine to benchmark mpedb's FTS against |
+| ParadeDB | the correct answer to "how do you put a Lucene-shaped index inside a transactional engine", plus Antithesis |
+| Lance | multi-writer without a daemon, columnar+vector in one format, time travel |
+| DiskANN3 | a composable ANN library whose premise is that the *host database* supplies the storage |
+| pgvector | vectors that participate in real SQL, with index pages under the host's WAL |
 
 ---
 
