@@ -279,6 +279,25 @@ pub(crate) trait TxnCtx {
     fn join_cells_budget(&self) -> u64 {
         0
     }
+    /// Does [`scan_rows_capped`](Self::scan_rows_capped) STOP PULLING at the
+    /// cap — i.e. is this context's scan a real cursor rather than a
+    /// materialize-then-truncate?
+    ///
+    /// The distinction is what makes a **resumable batched scan**
+    /// ([`gather::BatchScan`], #123 §5.1) worth doing. A cursor context answers
+    /// a `cap = C` scan in O(C); the default `TxnCtx::scan_rows_capped`
+    /// materializes the whole range and only then truncates, so batching over
+    /// it would be O(n) PER BATCH — quadratic, and holding exactly what the
+    /// batching exists to avoid. So the default is `false` and every context
+    /// that has not proven otherwise keeps the single-pass materializing path
+    /// it has today, with byte-identical results either way.
+    ///
+    /// Only [`ReadCtx`] overrides it: its `scan_rows_capped` breaks out of a
+    /// live `RowCursor`, and its scans are keyed by the same memcmp PK the
+    /// resume bound is encoded with.
+    fn scans_incrementally(&self) -> bool {
+        false
+    }
 }
 
 impl TxnCtx for WriteTxn<'_> {
@@ -542,6 +561,12 @@ impl TxnCtx for ReadCtx<'_, '_> {
             }
         }
         Ok(kept)
+    }
+    // A real B+tree cursor: the `scan_rows_capped` above stops pulling the
+    // moment the cap is reached, which is the precondition a resumable
+    // batched scan needs (see the trait default).
+    fn scans_incrementally(&self) -> bool {
+        true
     }
     fn scan_rows_topk(
         &mut self,

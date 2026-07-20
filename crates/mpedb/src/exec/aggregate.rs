@@ -120,175 +120,141 @@ fn arg_collation(a: &AggCall, base_colls: &[Collation]) -> Collation {
     }
 }
 
-/// `GROUP BY` / aggregates / `HAVING`.
+/// The bare-column witness row a group carries (sqlite's "bare columns", see
+/// [`exec_aggregate`]), in one of two shapes chosen by the aggregate set.
+enum Witness {
+    // #87: `extreme` is the running min/max (None until the first non-NULL
+    // arg); `bare` is the extremum row's values for `agg.bare_cols`.
+    MinMax { extreme: Option<Value>, bare: Vec<Value> },
+    // sqlite's arbitrary pick: `pk` is the encoded PK of the lowest-rowid row
+    // seen so far (empty = no row yet); `bare` is that row's bare values.
+    MinRowid { pk: Vec<u8>, bare: Vec<Value> },
+}
+
+/// One group's state: `[group key values]`, one accumulator per aggregate, and
+/// the optional bare-column witness. O(1) in the number of INPUT rows — which
+/// is the whole point of #123 §5.1.
+type Group = (Vec<Value>, Vec<Acc>, Option<Witness>);
+
+/// The fold: everything an aggregate holds between rows.
 ///
-/// **The first line is the invariant.** DESIGN-MULTIDB §4: aggregation must
-/// consume rows only AFTER the merged `(WHERE ∧ effective-policy)` predicate.
-/// `gather_rows` applies exactly that — the access path plus `filter`, which is
-/// where the planner AND-folded the policy — so accumulating over its output
-/// satisfies §4 by construction. Reading the raw scan instead would make
-/// `count(*)` report rows the caller cannot see, and a count leaks existence
-/// whether or not the rows come back. §4 calls it "a natural mistake, since some
-/// policy conjuncts land in the residual"; the only defence is to never hold the
-/// unfiltered stream, which is why there is no cursor here.
-///
-/// The other trap: **LIMIT applies to GROUPS, not rows.** The non-aggregate path
-/// bounds `gather_rows` by offset+limit, which would be silently wrong here —
-/// `LIMIT 1` on a grouped query means one group, not one input row. So this
-/// gathers unbounded and bounds at the end.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn exec_aggregate(
-    ctx: &mut dyn TxnCtx,
-    plan: &CompiledPlan,
-    params: &[Value],
-    schema: &Schema,
-    t: &TableDef,
+/// **This is the single row-processing body**, deliberately. #123 §6 names "a
+/// second code path per shape" as the real cost of streaming — `stream.rs`
+/// exists because of the first one, and `tests/stream_correctness.rs` exists
+/// because that path silently returned wrong answers. So the streaming input
+/// and the materializing input differ ONLY in where the rows come from; both
+/// call [`Folder::push`], one row at a time, in scan order. There is no second
+/// implementation of grouping, of the FILTER clause, or of the witness rule to
+/// drift.
+struct Folder<'a> {
+    agg: &'a Aggregation,
+    t: &'a TableDef,
+    schema: &'a Schema,
     table: u32,
-    access: &AccessPath,
-    filter: Option<&ExprProgram>,
-    joins: &[Join],
-    joined_filter: Option<&ExprProgram>,
-    agg: &Aggregation,
-    projection: &[Projection],
-    order_by: &[(u16, SortDir, mpedb_types::OrderColl)],
-    order_over: OrderOver,
-    order_junk: u16,
-    limit: Option<u64>,
-    offset: Option<u64>,
-    distinct: bool,
-    // First reserved result slot of THIS level (`subplan_base` at the top,
-    // `sub.sub_base` for a nested aggregate subplan) — where the per-row
-    // correlated fill writes. Unused when `correlated` is empty and
-    // `post_filter` is `None`.
-    base: usize,
-    // #73 §1: the correlated subplans (per-row filled) and the correlated WHERE
-    // residual. Empty/`None` for a plain aggregate, which behaves exactly as
-    // before.
-    correlated: &[(usize, &SubPlan)],
-    post_filter: Option<&ExprProgram>,
-) -> Result<ExecResult> {
-    // Unbounded on purpose: see the LIMIT note above. Over a join the row being
-    // aggregated is the JOINED row — same rule, wider row.
-    let rows = match joins.is_empty() {
-        true => gather_rows(ctx, table, access, filter, plan, params, None)?,
-        false => {
-            gather_joined(ctx, plan, params, schema, table, access, filter, joins, joined_filter)?
-        }
-    };
+    base_colls: Vec<Collation>,
+    group_collations: Vec<Collation>,
+    has_bare: bool,
+    /// The single min/max aggregate that governs the bare-column witness, if
+    /// the aggregate set has exactly one (see [`exec_aggregate`]).
+    mm: Option<(&'a AggCall, mpedb_types::AggFn)>,
+    /// Groups, keyed by the memcmp-ordered keycode of the group columns — so
+    /// they come out in a deterministic (and sqlite-matching) order for free.
+    groups: std::collections::BTreeMap<Vec<u8>, Group>,
+    /// #123 §4.3: the input is no longer held, but the GROUP MAP is, and it is
+    /// O(distinct keys) — no chunk size makes it smaller. So it takes the
+    /// tripwire the join's intermediate product already has, on the same
+    /// `[runtime] max_join_cells` knob. Charged once per group created, which
+    /// is why an unbounded `GROUP BY` is *governed* rather than silently
+    /// growing until the OOM killer arrives.
+    cells: super::gather::JoinCells,
+}
 
-    // #73 §1: aggregate over a correlated filter. Fill each correlated slot per
-    // gathered row and apply the correlated WHERE residual BEFORE grouping, so
-    // accumulation still consumes only the full `(WHERE ∧ policy)` set
-    // (DESIGN-MULTIDB §4 — the same ordering the plain gather guarantees). The
-    // shared `correlated_survivors` keeps this byte-identical to the
-    // non-aggregate correlated path, memo included.
-    //
-    // Each survivor keeps its SCRATCH — the `[user ‖ subplan results]` vector
-    // with this row's correlated slots filled. The row loop below evaluates the
-    // PER-ROW programs (`FILTER (WHERE …)`, an aggregate argument, a computed
-    // GROUP BY key) against that scratch, not against `params`: `params` still
-    // holds NULL in every correlated slot, and a filter that reads one would
-    // evaluate to NULL and — 3VL — DROP the row rather than test it. That is the
-    // wrong answer `count(*) FILTER (WHERE EXISTS (…correlated…))` used to give,
-    // 0 for both the positive and the negated form. The GROUPED programs (HAVING,
-    // the projection, ORDER BY) still read `params`: they run over a collapsed
-    // group, where no single row's correlation applies, and both the planner
-    // (`reject_correlated_in_aggregate`) and validate refuse a correlated slot
-    // there.
-    let (rows, scratches): (Vec<Vec<Value>>, Option<Vec<Vec<Value>>>) =
-        if correlated.is_empty() && post_filter.is_none() {
-            (rows, None)
-        } else {
-            let survivors =
-                correlated_survivors(ctx, schema, plan, params, base, rows, correlated, post_filter)?;
-            let mut kept = Vec::with_capacity(survivors.len());
-            let mut scratch = Vec::with_capacity(survivors.len());
-            for (row, s) in survivors {
-                kept.push(row);
-                scratch.push(s);
+impl<'a> Folder<'a> {
+    fn new(
+        ctx: &dyn TxnCtx,
+        schema: &'a Schema,
+        plan: &CompiledPlan,
+        t: &'a TableDef,
+        table: u32,
+        joins: &[Join],
+        agg: &'a Aggregation,
+    ) -> Folder<'a> {
+        // sqlite "bare columns" (COMPAT.md): each group also carries the values
+        // of `agg.bare_cols` from a WITNESS row. Which row is sqlite's — and so
+        // mpedb's — is inferable from the aggregate set (no plan byte, so
+        // PLAN_FORMAT stays put):
+        //   * EXACTLY ONE min()/max() (even alongside count/sum/avg) → that
+        //     extremum's row, sqlite's documented rule (#87, verified:
+        //     `min(x), count(*)` follows the min);
+        //   * ZERO min()/max() → sqlite's "arbitrary" pick, which is
+        //     deterministic: the group's LOWEST-ROWID row. mpedb identifies a
+        //     single-table row by its PK, so it tracks the minimum PK per group
+        //     and takes that row. The planner only emits this shape over a
+        //     single INTEGER-PK table (`rowid_pick_ok`), where PK == sqlite's
+        //     rowid, so the pick matches sqlite EXACTLY.
+        // In the ≥2 min/max case sqlite follows the LAST min/max — an
+        // order-dependent, undocumented pick the planner refuses, with ONE
+        // carve-out: when that last min/max has a non-NULL CONSTANT argument and
+        // no FILTER it only "improves" on the group's first row, so sqlite's pick
+        // IS the lowest-rowid row and the planner admits it under
+        // `rowid_pick_ok`. Such plans land in the min-PK branch below (`mm` is
+        // None for anything but exactly one min/max), which is exactly the right
+        // witness; a forged plan falls into the same safe branch.
+        //
+        // A HOST aggregate is never a min/max: `AggTarget::native()` is None for
+        // one, so it can neither govern the witness nor be miscounted here.
+        let mm: Option<(&AggCall, mpedb_types::AggFn)> = {
+            let mut it = agg.aggs.iter().filter_map(|c| match c.func.native() {
+                Some(f @ (mpedb_types::AggFn::Min | mpedb_types::AggFn::Max)) => Some((c, f)),
+                _ => None,
+            });
+            match (it.next(), it.next()) {
+                // Exactly one min/max → its witness row governs the bare columns.
+                (Some(c), None) => Some(c),
+                // Zero (→ lowest rowid) or two-plus (planner-refused) → min-PK.
+                _ => None,
             }
-            (kept, Some(scratch))
         };
-
-    // sqlite "bare columns" (COMPAT.md): each group also carries the values of
-    // `agg.bare_cols` from a WITNESS row. Which row is sqlite's — and so mpedb's —
-    // is inferable from the aggregate set (no plan byte, so PLAN_FORMAT stays 30):
-    //   * EXACTLY ONE min()/max() (even alongside count/sum/avg) → that extremum's
-    //     row, sqlite's documented rule (#87, verified: `min(x), count(*)` follows
-    //     the min);
-    //   * ZERO min()/max() → sqlite's "arbitrary" pick, which is deterministic: the
-    //     group's LOWEST-ROWID row. mpedb identifies a single-table row by its PK,
-    //     so it tracks the minimum PK per group and takes that row. The planner
-    //     only emits this shape over a single INTEGER-PK table (`rowid_pick_ok`),
-    //     where PK == sqlite's rowid, so the pick matches sqlite EXACTLY.
-    // In the ≥2 min/max case sqlite follows the LAST min/max — an order-dependent,
-    // undocumented pick the planner refuses, with ONE carve-out: when that last
-    // min/max has a non-NULL CONSTANT argument and no FILTER it only "improves"
-    // on the group's first row, so sqlite's pick IS the lowest-rowid row and the
-    // planner admits it under `rowid_pick_ok`. Such plans land in the min-PK
-    // branch below (`mm` is None for anything but exactly one min/max), which is
-    // exactly the right witness; a forged plan falls into the same safe branch.
-    let has_bare = !agg.bare_cols.is_empty();
-    // A HOST aggregate is never a min/max: `AggTarget::native()` is None for one,
-    // so it can neither govern the witness nor be miscounted here.
-    let mm: Option<(&AggCall, mpedb_types::AggFn)> = {
-        let mut it = agg.aggs.iter().filter_map(|c| match c.func.native() {
-            Some(f @ (mpedb_types::AggFn::Min | mpedb_types::AggFn::Max)) => Some((c, f)),
-            _ => None,
-        });
-        match (it.next(), it.next()) {
-            // Exactly one min/max → its witness row governs the bare columns.
-            (Some(c), None) => Some(c),
-            // Zero (→ lowest rowid) or two-plus (planner-refused) → min-PK path.
-            _ => None,
+        // The collation each GROUP BY key groups under: a bare NOCASE/RTRIM
+        // column collapses case-/space-variants into ONE group (sqlite parity);
+        // a computed key is BINARY. Folded before encoding, so `'abc'` and
+        // `'ABC'` (NOCASE) hash to the same bucket — the equality half of the
+        // column's declared collation.
+        let base_colls = super::base_row_collations(schema, plan, table, joins);
+        let group_collations: Vec<Collation> = agg
+            .group_by
+            .iter()
+            .map(|k| match k {
+                GroupKey::Col(c) => {
+                    base_colls.get(*c as usize).copied().unwrap_or(Collation::Binary)
+                }
+                GroupKey::Expr(_) => Collation::Binary,
+            })
+            .collect();
+        Folder {
+            agg,
+            t,
+            schema,
+            table,
+            has_bare: !agg.bare_cols.is_empty(),
+            base_colls,
+            group_collations,
+            mm,
+            groups: Default::default(),
+            cells: super::gather::JoinCells::new(ctx.join_cells_budget()),
         }
-    };
-
-    // Group. The key is the memcmp-ordered keycode of the group columns, so
-    // groups come out in a deterministic order for free and NULL keys group
-    // together (SQL treats NULLs as one group in GROUP BY, unlike `=`).
-    //
-    // The optional third element is the bare-column witness, in one of two shapes
-    // (chosen by `mm`): the min/max extremum row, or the lowest-rowid row.
-    enum Witness {
-        // #87: `extreme` is the running min/max (None until the first non-NULL
-        // arg); `bare` is the extremum row's values for `agg.bare_cols`.
-        MinMax { extreme: Option<Value>, bare: Vec<Value> },
-        // sqlite's arbitrary pick: `pk` is the encoded PK of the lowest-rowid row
-        // seen so far (empty = no row yet); `bare` is that row's bare values.
-        MinRowid { pk: Vec<u8>, bare: Vec<Value> },
     }
-    // The collation each GROUP BY key groups under: a bare NOCASE/RTRIM column
-    // collapses case-/space-variants into ONE group (sqlite parity); a computed
-    // key is BINARY. Folded before encoding, so `'abc'` and `'ABC'` (NOCASE) hash
-    // to the same bucket — the equality half of the column's declared collation.
-    let base_colls = super::base_row_collations(schema, plan, table, joins);
-    let group_collations: Vec<Collation> = agg
-        .group_by
-        .iter()
-        .map(|k| match k {
-            GroupKey::Col(c) => base_colls.get(*c as usize).copied().unwrap_or(Collation::Binary),
-            GroupKey::Expr(_) => Collation::Binary,
-        })
-        .collect();
-    type Group = (Vec<Value>, Vec<Acc>, Option<Witness>);
-    let mut groups: std::collections::BTreeMap<Vec<u8>, Group> = Default::default();
-    // Bound once: the factory table for host aggregates is read per GROUP (one
-    // fresh accumulator each), and both this and `ctx.host_fns()` are shared
-    // reborrows of the same context.
-    let host_aggs = ctx.host_aggs();
-    for (ri, row) in rows.iter().enumerate() {
-        // The parameter vector for THIS row's per-row programs: the correlated
-        // scratch when this plan has correlated subplans, otherwise `params`
-        // itself (no clone, no correlated slot to fill). The two agree on every
-        // user and uncorrelated-subplan slot — the scratch is a copy of `params`
-        // with only the correlated slots overwritten — so this is a no-op except
-        // exactly where a correlated slot is read.
-        let row_params: &[Value] = match &scratches {
-            Some(s) => &s[ri],
-            None => params,
-        };
-        let key_vals: Vec<Value> = agg
+
+    /// Fold ONE base row into the group state.
+    ///
+    /// `row_params` is the parameter vector for this row's per-row programs:
+    /// the correlated scratch when the plan has correlated subplans, otherwise
+    /// `params` itself. `ctx` is borrowed SHARED — the fold reads host UDF /
+    /// aggregate registries and nothing else, which is exactly what lets the
+    /// caller alternate between pulling a batch (`&mut ctx`) and folding it.
+    fn push(&mut self, ctx: &dyn TxnCtx, row: &[Value], row_params: &[Value]) -> Result<()> {
+        let key_vals: Vec<Value> = self
+            .agg
             .group_by
             .iter()
             .map(|k| match k {
@@ -301,29 +267,45 @@ pub(super) fn exec_aggregate(
         // over a typeless column `1` and `1.0` are ONE group and the text `'1'`
         // another. Its byte order is also sqlite's class order, so this
         // `BTreeMap` still iterates groups the way sqlite emits them.
-        let key = keycode::encode_group_key(&key_vals, &group_collations);
+        let key = keycode::encode_group_key(&key_vals, &self.group_collations);
         // Not `or_insert_with`: minting a HOST accumulator can FAIL (an
         // out-of-scope or unregistered aggregate), and a closure cannot carry
         // that error out.
-        let entry = match groups.entry(key) {
+        let entry = match self.groups.entry(key) {
             std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::btree_map::Entry::Vacant(e) => {
-                let witness = if !has_bare {
+                let witness = if !self.has_bare {
                     None
-                } else if mm.is_some() {
+                } else if self.mm.is_some() {
                     Some(Witness::MinMax { extreme: None, bare: Vec::new() })
                 } else {
                     Some(Witness::MinRowid { pk: Vec::new(), bare: Vec::new() })
                 };
-                let accs = agg
+                let accs = self
+                    .agg
                     .aggs
                     .iter()
-                    .map(|c| new_accum(c, host_aggs, arg_collation(c, &base_colls)))
+                    // The factory table for host aggregates is consulted per
+                    // GROUP (one fresh accumulator each), not per row.
+                    .map(|c| new_accum(c, ctx.host_aggs(), arg_collation(c, &self.base_colls)))
                     .collect::<Result<Vec<Acc>>>()?;
+                // One group's resident cells: its key tuple, its accumulators,
+                // and its witness row. Charged before the group exists, so an
+                // unbounded GROUP BY trips the knob instead of the OOM killer.
+                let (schema, table) = (self.schema, self.table);
+                self.cells.charge(
+                    (key_vals.len() + accs.len() + self.agg.bare_cols.len()) as u64,
+                    || {
+                        format!(
+                            "the group map of an aggregate over \"{}\"",
+                            super::table_name(schema, table)
+                        )
+                    },
+                )?;
                 e.insert((key_vals, accs, witness))
             }
         };
-        for (i, call) in agg.aggs.iter().enumerate() {
+        for (i, call) in self.agg.aggs.iter().enumerate() {
             // `agg(x) FILTER (WHERE cond)`: this row feeds THIS aggregate only
             // when `cond` is TRUE over the base row (3VL — NULL/FALSE skip). The
             // filter is per-aggregate, so two aggregates in one SELECT can have
@@ -354,7 +336,8 @@ pub(super) fn exec_aggregate(
         // Update the bare-column witness, reproducing sqlite's rule EXACTLY.
         if let Some(w) = entry.2.as_mut() {
             let capture = || -> Vec<Value> {
-                agg.bare_cols
+                self.agg
+                    .bare_cols
                     .iter()
                     .map(|&c| row.get(c as usize).cloned().unwrap_or(Value::Null))
                     .collect()
@@ -368,7 +351,7 @@ pub(super) fn exec_aggregate(
                 // against sqlite 3.45.
                 Witness::MinMax { extreme, bare } => {
                     let (mm, mm_fn) =
-                        mm.expect("MinMax witness implies a single min/max aggregate");
+                        self.mm.expect("MinMax witness implies a single min/max aggregate");
                     // A FILTER on the governing min/max restricts BOTH the
                     // extremum AND the witness row to the rows it accepts
                     // (verified vs sqlite 3.45: the bare column follows the
@@ -418,7 +401,8 @@ pub(super) fn exec_aggregate(
                 // sqlite even when the scan is NOT PK-ordered (an index or
                 // descending-range access path).
                 Witness::MinRowid { pk, bare } => {
-                    let pk_vals: Vec<Value> = t
+                    let pk_vals: Vec<Value> = self
+                        .t
                         .primary_key
                         .iter()
                         .map(|&c| row.get(c as usize).cloned().unwrap_or(Value::Null))
@@ -431,7 +415,185 @@ pub(super) fn exec_aggregate(
                 }
             }
         }
+        Ok(())
     }
+}
+
+/// `GROUP BY` / aggregates / `HAVING`.
+///
+/// **The first line is the invariant.** DESIGN-MULTIDB §4: aggregation must
+/// consume rows only AFTER the merged `(WHERE ∧ effective-policy)` predicate.
+/// `gather_rows` applies exactly that — the access path plus `filter`, which is
+/// where the planner AND-folded the policy — so accumulating over its output
+/// satisfies §4 by construction. Reading the raw scan instead would make
+/// `count(*)` report rows the caller cannot see, and a count leaks existence
+/// whether or not the rows come back. §4 calls it "a natural mistake, since some
+/// policy conjuncts land in the residual"; the only defence is to never hold the
+/// unfiltered stream. **The streaming path below obeys the same rule for the
+/// same reason**: `BatchScan` pushes `filter` down into the scan, so the fold
+/// never sees a row the merged predicate rejected.
+///
+/// The other trap: **LIMIT applies to GROUPS, not rows.** The non-aggregate path
+/// bounds `gather_rows` by offset+limit, which would be silently wrong here —
+/// `LIMIT 1` on a grouped query means one group, not one input row. So this
+/// consumes the whole input and bounds at the end.
+///
+/// # Memory (#123 §5.1)
+///
+/// **An aggregate is a fold**, so its state is O(groups) and never O(rows).
+/// This used to gather the entire input first and say so ("Unbounded on
+/// purpose"): `SELECT count(*)` over 160 000 rows held 50.8 MB to produce one
+/// integer, the worst held-to-answer ratio in the whole measurement
+/// (design/DESIGN-STREAM-EXEC.md §2.1). It now drains the input in
+/// [`BatchScan`]-sized batches and folds each batch into the accumulators
+/// before drawing the next, so a bounded-group aggregate holds kilobytes
+/// regardless of table size — asserted, not benchmarked, in
+/// `tests/agg_stream.rs`.
+///
+/// Four shapes keep the materializing path, and each is a shape where it buys
+/// nothing:
+///
+/// - **an aggregate over a JOIN** — the joined tuple stream is the join's
+///   accumulated product, which `gather_joined` holds anyway (its own
+///   `max_join_cells` budget governs it);
+/// - **a correlated subplan or a correlated WHERE residual** — those run
+///   `correlated_survivors` over the gathered set, keeping a per-row scratch
+///   beside each row;
+/// - **a non-PK-ordered access path** (index / FTS / point), which has no
+///   resume key until #48;
+/// - **a context whose `scan_rows_capped` materializes anyway** (every write
+///   context) — see [`TxnCtx::scans_incrementally`].
+///
+/// What is left holding memory afterwards is exactly what a fold cannot shed:
+/// the group map (O(distinct keys), now charged against `max_join_cells`), the
+/// per-aggregate `DISTINCT` sets (O(distinct arg values) per aggregate per
+/// group), and the grouped output. `count(DISTINCT x)` therefore still holds
+/// its dedup set — but it no longer holds the ROWS as well, which was the
+/// larger half.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn exec_aggregate(
+    ctx: &mut dyn TxnCtx,
+    plan: &CompiledPlan,
+    params: &[Value],
+    schema: &Schema,
+    t: &TableDef,
+    table: u32,
+    access: &AccessPath,
+    filter: Option<&ExprProgram>,
+    joins: &[Join],
+    joined_filter: Option<&ExprProgram>,
+    agg: &Aggregation,
+    projection: &[Projection],
+    order_by: &[(u16, SortDir, mpedb_types::OrderColl)],
+    order_over: OrderOver,
+    order_junk: u16,
+    limit: Option<u64>,
+    offset: Option<u64>,
+    distinct: bool,
+    // First reserved result slot of THIS level (`subplan_base` at the top,
+    // `sub.sub_base` for a nested aggregate subplan) — where the per-row
+    // correlated fill writes. Unused when `correlated` is empty and
+    // `post_filter` is `None`.
+    base: usize,
+    // #73 §1: the correlated subplans (per-row filled) and the correlated WHERE
+    // residual. Empty/`None` for a plain aggregate, which behaves exactly as
+    // before.
+    correlated: &[(usize, &SubPlan)],
+    post_filter: Option<&ExprProgram>,
+) -> Result<ExecResult> {
+    let mut folder = Folder::new(&*ctx, schema, plan, t, table, joins, agg);
+
+    // The base row's width in cells: what one batch of the streaming drain
+    // holds, and the divisor that sizes it.
+    let width = t.columns.len();
+    // STREAMING FOLD (#123 §5.1). Only for the shapes where the input is a
+    // plain PK-ordered scan of one table with no correlated machinery — see the
+    // doc comment's list. `BatchScan::open` answers `None` for everything else,
+    // and the materializing path below is then EXACTLY the code that ran
+    // before, feeding the same `Folder::push`.
+    let streamed = if joins.is_empty() && correlated.is_empty() && post_filter.is_none() {
+        match gather::BatchScan::open(&*ctx, table, access, plan, params, t, width)? {
+            Some(mut scan) => {
+                loop {
+                    // Draw a batch (`&mut ctx`), fold it (`&ctx`), drop it. The
+                    // batch is the only input residency that ever exists.
+                    let batch = scan.next(ctx, filter, params)?;
+                    if batch.is_empty() {
+                        break;
+                    }
+                    for row in &batch {
+                        folder.push(&*ctx, row, params)?;
+                    }
+                }
+                true
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
+
+    if !streamed {
+        // Unbounded on purpose: see the LIMIT note above. Over a join the row
+        // being aggregated is the JOINED row — same rule, wider row.
+        let rows = match joins.is_empty() {
+            true => gather_rows(ctx, table, access, filter, plan, params, None)?,
+            false => gather_joined(
+                ctx, plan, params, schema, table, access, filter, joins, joined_filter,
+            )?,
+        };
+
+        // #73 §1: aggregate over a correlated filter. Fill each correlated slot per
+        // gathered row and apply the correlated WHERE residual BEFORE grouping, so
+        // accumulation still consumes only the full `(WHERE ∧ policy)` set
+        // (DESIGN-MULTIDB §4 — the same ordering the plain gather guarantees). The
+        // shared `correlated_survivors` keeps this byte-identical to the
+        // non-aggregate correlated path, memo included.
+        //
+        // Each survivor keeps its SCRATCH — the `[user ‖ subplan results]` vector
+        // with this row's correlated slots filled. `Folder::push` evaluates the
+        // PER-ROW programs (`FILTER (WHERE …)`, an aggregate argument, a computed
+        // GROUP BY key) against that scratch, not against `params`: `params` still
+        // holds NULL in every correlated slot, and a filter that reads one would
+        // evaluate to NULL and — 3VL — DROP the row rather than test it. That is the
+        // wrong answer `count(*) FILTER (WHERE EXISTS (…correlated…))` used to give,
+        // 0 for both the positive and the negated form. The GROUPED programs (HAVING,
+        // the projection, ORDER BY) still read `params`: they run over a collapsed
+        // group, where no single row's correlation applies, and both the planner
+        // (`reject_correlated_in_aggregate`) and validate refuse a correlated slot
+        // there.
+        let (rows, scratches): (Vec<Vec<Value>>, Option<Vec<Vec<Value>>>) =
+            if correlated.is_empty() && post_filter.is_none() {
+                (rows, None)
+            } else {
+                let survivors = correlated_survivors(
+                    ctx, schema, plan, params, base, rows, correlated, post_filter,
+                )?;
+                let mut kept = Vec::with_capacity(survivors.len());
+                let mut scratch = Vec::with_capacity(survivors.len());
+                for (row, s) in survivors {
+                    kept.push(row);
+                    scratch.push(s);
+                }
+                (kept, Some(scratch))
+            };
+
+        for (ri, row) in rows.iter().enumerate() {
+            // The parameter vector for THIS row's per-row programs: the correlated
+            // scratch when this plan has correlated subplans, otherwise `params`
+            // itself (no clone, no correlated slot to fill). The two agree on every
+            // user and uncorrelated-subplan slot — the scratch is a copy of `params`
+            // with only the correlated slots overwritten — so this is a no-op except
+            // exactly where a correlated slot is read.
+            let row_params: &[Value] = match &scratches {
+                Some(s) => &s[ri],
+                None => params,
+            };
+            folder.push(&*ctx, row, row_params)?;
+        }
+    }
+
+    let Folder { groups, base_colls, .. } = folder;
 
     // `SELECT count(*) FROM t` over an EMPTY table must return one row (0), not
     // zero rows — there is one group when there is nothing to group by. With a
@@ -445,7 +607,7 @@ pub(super) fn exec_aggregate(
         let accs = agg
             .aggs
             .iter()
-            .map(|c| new_accum(c, host_aggs, arg_collation(c, &base_colls)))
+            .map(|c| new_accum(c, ctx.host_aggs(), arg_collation(c, &base_colls)))
             .collect::<Result<Vec<Acc>>>()?;
         let mut tuple: Vec<Value> =
             accs.into_iter().map(Acc::finish).collect::<Result<_>>()?;

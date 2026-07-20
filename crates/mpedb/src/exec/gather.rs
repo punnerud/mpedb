@@ -10,20 +10,25 @@ use super::*;
 /// work-row default. Deterministic — a pure function of data and plan — so
 /// the trip point is reproducible on every machine. `budget == 0` is the
 /// unlimited sentinel.
-struct JoinCells {
+///
+/// Shared with the streaming aggregate (#123 §4.3), where the input is no
+/// longer held at all but the GROUP MAP still is: an aggregate's irreducible
+/// state is O(groups), no chunk size makes it smaller, and the same counter
+/// with the same knob is what bounds it.
+pub(super) struct JoinCells {
     budget: u64,
     live: u64,
 }
 
 impl JoinCells {
-    fn new(budget: u64) -> JoinCells {
+    pub(super) fn new(budget: u64) -> JoinCells {
         JoinCells { budget, live: 0 }
     }
 
     /// Charge `n` newly held cells; [`Error::RuntimeBudget`] once the live
     /// total crosses the budget. `which` is evaluated only on the error path.
     #[inline]
-    fn charge(&mut self, n: u64, which: impl FnOnce() -> String) -> Result<()> {
+    pub(super) fn charge(&mut self, n: u64, which: impl FnOnce() -> String) -> Result<()> {
         self.live = self.live.saturating_add(n);
         if self.budget != 0 && self.live > self.budget {
             return Err(Error::RuntimeBudget {
@@ -597,6 +602,192 @@ pub(super) fn gather_rows(
         rows = kept;
     }
     Ok(rows)
+}
+
+/// Rows drawn per B+tree visit by a [`BatchScan`] — the same constant
+/// `stream.rs::BATCH` uses, and for the same reason: small enough that the
+/// working set is trivial, large enough that the per-batch tree re-descent
+/// amortizes to noise (`stream_query` measures FASTER than the materializing
+/// path at 160 k rows, design/DESIGN-STREAM-EXEC.md §6).
+///
+/// **Deliberately not budget-derived.** DESIGN-STREAM-EXEC §4.2 proposes
+/// `C = clamp(1, budget_cells / (W·S), 65536)`, which is right for a stage
+/// whose throughput improves with a bigger chunk. A FOLD is not such a stage:
+/// its hold is O(groups) whichever way the input arrives, so every cell above
+/// the re-descent amortization point buys nothing but peak. With the default
+/// `max_join_cells = 268 435 456` that formula clamps to 65 536 rows ≈ 20 MB
+/// held for `SELECT count(*)`, against 61.8 KB for the same scan through
+/// `stream_query`. The budget is still consulted — as a DIVISOR below, so a
+/// deliberately tiny budget still shrinks the batch, and as the §4.3 tripwire
+/// on the group map, which is the state a chunk size genuinely cannot move.
+const FOLD_BATCH: usize = 256;
+
+/// `MPEDB_FOLD_BATCH=<n>` forces the fold's batch size, for A/B measurement
+/// and for the C-invariance suite (`MPEDB_NO_SUBPLAN_MEMO` is the precedent).
+///
+/// It exists because the budget cannot serve as the knob here: `max_join_cells`
+/// is ALSO the group-map tripwire (§4.3), so setting it low enough to force a
+/// one-row batch refuses the statement instead of chunking it, and the
+/// invariant that needs testing — "same rows, same order, same errors, for
+/// every C" (§4.2) — is then untestable at the interesting values of C. Read
+/// once per process; `0` or unparseable means "no override".
+fn batch_override() -> Option<usize> {
+    static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *OVERRIDE.get_or_init(|| {
+        std::env::var("MPEDB_FOLD_BATCH")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+    })
+}
+
+/// Batch size for a fold over rows `width` cells wide under `budget` live
+/// cells (`0` = unlimited): at most [`FOLD_BATCH`], at least one row (a
+/// budget too small to hold a single row must still make progress — it is not
+/// a new refusal), and proportional to the budget in between.
+fn fold_batch(budget: u64, width: usize) -> usize {
+    if let Some(n) = batch_override() {
+        return n;
+    }
+    if budget == 0 {
+        return FOLD_BATCH;
+    }
+    let w = width.max(1) as u64;
+    (budget / w).clamp(1, FOLD_BATCH as u64) as usize
+}
+
+/// A resumable, PK-ordered, batched scan: the streaming half of #123 §5.1.
+///
+/// Each [`next`](BatchScan::next) draws at most `batch` FILTERED rows and
+/// remembers where to resume — the last row's encoded PK, exclusive, which is
+/// exactly the B+tree key it is stored under. The caller folds the batch and
+/// drops it, so peak hold is O(batch) instead of O(matched rows). This is the
+/// same resume-by-encoded-PK loop `stream.rs::refill` runs, lifted so the
+/// aggregate can share it.
+///
+/// **Not observable.** The rows, their order, the residual filter applied to
+/// them and the #74 work-row charges are identical to a single-pass
+/// `gather_rows` — the work meter charges once per row visited inside
+/// `RowCursor::next`, and re-descending the tree visits each row exactly once
+/// either way. `batch` is config-derived and a statement's result may not
+/// depend on config; `tests/agg_stream.rs` asserts that twice — the whole
+/// differential battery re-run at `MPEDB_FOLD_BATCH ∈ {1, 2, 7, 256}`, and the
+/// same battery answered identically under
+/// `max_join_cells ∈ {0, 512, 4096, 268 435 456}`.
+pub(super) struct BatchScan {
+    table: u32,
+    /// Lower bound of the NEXT batch, resumed strictly after the last row
+    /// handed out.
+    lo: Option<RawBound>,
+    hi: Option<RawBound>,
+    /// Which base-row slots make up the PK, in key order.
+    pk_cols: Vec<usize>,
+    /// On-disk key specs for those columns. NOT `encode_key`: a collated key
+    /// column folds its text and a typeless (`any`) one keys by storage class,
+    /// so a raw encoding would resume at a byte string the tree never stores.
+    pk_specs: Vec<keycode::KeySpec>,
+    batch: usize,
+    done: bool,
+}
+
+impl BatchScan {
+    /// Open a batched scan over `access`, or `Ok(None)` when this shape cannot
+    /// be streamed and the caller must take its materializing path:
+    ///
+    /// - the context's `scan_rows_capped` is a materialize-then-truncate
+    ///   (`!scans_incrementally`) — batching it would be quadratic;
+    /// - the access path is not PK-ordered. `PkPoint` needs no streaming (one
+    ///   row); `IndexPoint`/`IndexRange`/`FtsScan` resolve through a set of
+    ///   rowids or an index tree, and a streaming index cursor is deferred to
+    ///   #48 (design/DESIGN-STREAM-EXEC.md §7.1);
+    /// - the "table" is the DUAL or working-table sentinel, which has no
+    ///   B+tree and no PK to resume from.
+    pub(super) fn open(
+        ctx: &dyn TxnCtx,
+        table: u32,
+        access: &AccessPath,
+        plan: &CompiledPlan,
+        params: &[Value],
+        t: &TableDef,
+        width: usize,
+    ) -> Result<Option<BatchScan>> {
+        if !ctx.scans_incrementally()
+            || table == mpedb_sql::DUAL_TABLE
+            || table == mpedb_sql::CTE_TABLE
+            || t.primary_key.is_empty()
+        {
+            return Ok(None);
+        }
+        let (lo, hi, empty) = match access {
+            AccessPath::FullScan => (None, None, false),
+            AccessPath::PkRange { lo, hi } => {
+                match range_bounds(lo.as_ref(), hi.as_ref(), plan, params)? {
+                    // A NULL bound makes the range predicate UNKNOWN for every
+                    // row: a valid scan that is born exhausted, NOT a refusal
+                    // to stream (which would re-materialize for nothing).
+                    None => (None, None, true),
+                    Some((l, h)) => (l, h, false),
+                }
+            }
+            AccessPath::PkPoint(_)
+            | AccessPath::IndexPoint { .. }
+            | AccessPath::IndexRange { .. }
+            | AccessPath::FtsScan { .. } => return Ok(None),
+        };
+        let mut pk_cols = Vec::with_capacity(t.primary_key.len());
+        let mut pk_specs = Vec::with_capacity(t.primary_key.len());
+        for &i in &t.primary_key {
+            let c = t
+                .columns
+                .get(i as usize)
+                .ok_or_else(|| internal("PK column out of range"))?;
+            pk_cols.push(i as usize);
+            pk_specs.push(keycode::KeySpec::for_column(c.ty, c.collation));
+        }
+        Ok(Some(BatchScan {
+            table,
+            lo,
+            hi,
+            pk_cols,
+            pk_specs,
+            batch: fold_batch(ctx.join_cells_budget(), width),
+            done: empty,
+        }))
+    }
+
+    /// The next batch of at most `self.batch` filtered rows; empty when the
+    /// scan is exhausted.
+    pub(super) fn next(
+        &mut self,
+        ctx: &mut dyn TxnCtx,
+        filter: Option<&ExprProgram>,
+        params: &[Value],
+    ) -> Result<Vec<Vec<Value>>> {
+        if self.done {
+            return Ok(Vec::new());
+        }
+        let rows = ctx.scan_rows_capped(
+            self.table,
+            self.lo.as_ref().map(|(k, inc)| (k.as_slice(), *inc)),
+            self.hi.as_ref().map(|(k, inc)| (k.as_slice(), *inc)),
+            filter.map(|f| (f, params)),
+            Some(self.batch),
+        )?;
+        // Short of the cap means the cursor ran out, not that the filter got
+        // picky: `scan_rows_capped` counts KEPT rows and keeps pulling past
+        // rejected ones, so it only returns early when the range is done.
+        if rows.len() < self.batch {
+            self.done = true;
+            return Ok(rows);
+        }
+        let last = rows.last().ok_or_else(|| internal("non-empty batch"))?;
+        let mut pk = Vec::with_capacity(self.pk_cols.len());
+        for &c in &self.pk_cols {
+            pk.push(last.get(c).cloned().ok_or_else(|| internal("PK column"))?);
+        }
+        self.lo = Some((keycode::encode_key_spec(&pk, &self.pk_specs), false));
+        Ok(rows)
+    }
 }
 
 pub(crate) type RawBound = (Vec<u8>, bool);
