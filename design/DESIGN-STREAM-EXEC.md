@@ -467,3 +467,127 @@ design would fix hold **50.8 MB (aggregate) and 57.1 MB (INSERT … SELECT)**
 today, and would hold **tens of kilobytes**. The shapes it would not fix hold
 **168 MB (`agg_many`), 78 MB (`window`) and 55 MB (`select_sorted`)** today and
 would still hold most of that.
+
+---
+
+## 9. Step 4, built: the streaming aggregate (measured)
+
+§5.1 shipped. `exec/aggregate.rs` no longer gathers its input for the shapes
+that are a fold over a PK-ordered scan: `gather::BatchScan` drains the scan in
+batches and `Folder::push` folds each batch into the accumulators before the
+next is drawn. One row-processing body serves both the streaming and the
+materialising input, so the §6 cost ("a second code path per shape") was not
+paid — there is no second implementation of grouping, of `FILTER`, or of the
+bare-column witness to drift.
+
+### 9.1 What it moved
+
+Same harness as §1 (`examples/mem_shapes.rs`, `MEM_VIA=execute`, 160 000 rows,
+`ulimit -v 3000000`, scratch on `/mnt/xfs`). `B/row` is the 40 k→160 k slope.
+
+| shape | held before | held after | ratio | B/row before | B/row after | ms before | ms after |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `count` `SELECT count(*)` | 50 822 265 | **79 526** | **639×** | 317.8 | **0.002** | 87.7 | **59.8** |
+| `agg_few` GROUP BY, 10 groups | 50 826 866 | **84 110** | **604×** | 317.8 | **0.003** | 145.0 | **84.7** |
+| `agg_many` GROUP BY, n groups | 167 875 402 | 117 132 646 | 1.43× | 1049.2 | 732.1 | 352.2 | **307.2** |
+
+The 79.5 KB that remains is *flat*: 79 012 at 10 k, 79 245 at 40 k, 79 526 at
+160 k. It is the read's fixed cost, not a per-row residue — the same order as
+`stream_query`'s 61.8 KB, which is the endpoint §8 named.
+
+Four more shapes, measured at 1 000 → 16 000 rows in `tests/agg_stream_mem.rs`
+(before = the same test against HEAD~):
+
+| shape | B/row before | B/row after | |
+|---|---:|---:|---|
+| `count(DISTINCT a)`, n distinct | 362.9 | **60.9** | 6.0× — the rows go, the dedup set stays |
+| `GROUP BY g10 ORDER BY count(*)` | 302.0 | **0.03** | ORDER BY over the GROUPED tuple is O(groups) |
+| `count(*)` over a join | 753.4 | 753.4 | unchanged, by design (§9.3) |
+| `count(*) FILTER (correlated EXISTS)` | 566.6 | 566.6 | unchanged, by design (§9.3) |
+
+**§4.4's predictions held.** It said `count`/`agg_few` recover ~100% and
+`agg_many` ~30%; the measured recovery for `agg_many` is **30.2%**
+(1049.2 → 732.1 B/row), which is the input's own residency and nothing else.
+
+**There is no throughput penalty; there is a throughput gain.** §6 predicted
+the per-batch re-descent would amortise "to noise" and offered `stream_query`
+being faster as the only evidence. It is faster here too, on all three shapes,
+by 13–42%. The likely reason is the one §6 did not name: the materialising path
+allocated and held ~50 MB, and not doing that is worth more than a tree
+re-descent per 256 rows costs.
+
+### 9.2 Three things the design got wrong
+
+1. **§4.2's chunk formula is wrong for a fold.** `C = clamp(1, budget/(W·S),
+   65 536)` is right for a stage whose throughput improves with a bigger chunk.
+   A fold is not one: its hold is O(groups) however the input arrives, so every
+   cell above the re-descent amortisation point buys nothing but peak. With the
+   default `max_join_cells = 268 435 456` that formula clamps to `C_MAX`,
+   i.e. 65 536 rows ≈ **20 MB** held for `SELECT count(*)` — 250× worse than the
+   79 KB actually delivered. The implementation keeps the budget as a *divisor*
+   (a small budget still shrinks the batch) but caps at `FOLD_BATCH = 256`, the
+   same constant `stream.rs` uses.
+
+2. **§4.2's `C`-invariance suite is untestable through `max_join_cells`.**
+   The same knob is both the divisor and the §4.3 group-map tripwire, so every
+   budget low enough to force `C = 1` *refuses* the grouped statements instead
+   of chunking them. The two roles are only jointly satisfiable in a narrow
+   band. `MPEDB_FOLD_BATCH=<n>` (read once per process, `MPEDB_NO_SUBPLAN_MEMO`
+   is the precedent) forces the batch size independently, and
+   `tests/agg_stream.rs::c_invariance` re-runs the whole differential battery
+   under `C ∈ {1, 2, 7, 256}` — each against the bundled oracle, which is a
+   stronger claim than "the four agree with each other".
+
+   Fault-injected to prove the battery is not vacuous: changing the
+   "short batch means the cursor is exhausted" test from `<` to `<=` (so the
+   scan stops after one batch) fails on the first query, `count(*)` returning 7
+   against the oracle's 24. Making the resume bound INCLUSIVE instead hangs —
+   the batch re-reads its own last row forever — which is detection, but of the
+   worse kind; it is the one fault mode in this code that is not a wrong answer.
+
+3. **§7 lists five prerequisites without saying which shape needs which. The
+   aggregate needs none of them.** Not §7.2's row sink (an aggregate's output is
+   already O(groups)), not §7.4's footprint assertion (read-only, no Halloween
+   exposure), not §7.1's index cursor (those access paths simply keep the
+   materialising path). Reading §7 as a gate on §5.1 would have blocked the
+   cheapest item in the document behind the most expensive one.
+
+### 9.3 What still materialises, and why that is not a hedge
+
+`BatchScan::open` answers `None` — and the aggregate takes its previous path,
+byte for byte — for four cases. Each was measured (§9.1) rather than assumed:
+
+- **an aggregate over a JOIN.** The tuple being folded is the join's
+  accumulated product, which `gather_joined` holds anyway and which its own
+  `max_join_cells` tripwire already governs. 753.4 B/row before and after.
+- **a correlated subplan or a correlated WHERE residual** (#73 §1). Those run
+  `correlated_survivors` over the gathered set and keep a per-row scratch
+  beside each row; folding them would need the scratch stream, not just the row
+  stream. 566.6 B/row before and after.
+- **a non-PK-ordered access path** — `IndexPoint`/`IndexRange`/`FtsScan` have no
+  resume key until #48 (§7.1); `PkPoint` is one row.
+- **every WRITE context.** `TxnCtx::scans_incrementally` is `false` unless the
+  context's `scan_rows_capped` is a real cursor that stops at the cap, and only
+  `ReadCtx`'s is. Batching a materialise-then-truncate would be O(n) *per
+  batch*. So `SELECT count(*)` inside a `WriteSession` is unchanged. §7.3 named
+  the missing `WriteTxn` read cursor as blocking §5.2; it caps §5.1 too, and
+  that is the single largest remaining piece of this shape.
+
+### 9.4 The budget's second role, wired
+
+§4.3 said the budget stops being only a tripwire on the input and becomes a
+tripwire on the *irreducible* state. That is now true for the aggregate: the
+group map is charged `1 key + 1 accumulator + 1 bare column` per cell per group
+against `max_join_cells`, once per group created, with the attribution string
+`the group map of an aggregate over "<table>"`. Before this change an unbounded
+`GROUP BY` was governed by nothing at all. The distinction §4.3 asked for is
+visible in the message: a user who raises the knob after a group-map trip is
+doing the right thing, and `tests/agg_stream.rs::group_map_is_governed_by_the_budget`
+asserts that the *same* budget that refuses 24 groups runs a scalar aggregate
+over the same 24 input rows — which is the whole change of meaning in one
+assertion.
+
+The per-aggregate `DISTINCT` `BTreeSet`s are deliberately NOT charged: they are
+O(distinct arg values) per aggregate per group, charging them costs a branch per
+*value* rather than per group, and the measurement (§9.1: 60.9 B/row, down from
+362.9) shows the larger half of that shape's hold was the rows, which are gone.
