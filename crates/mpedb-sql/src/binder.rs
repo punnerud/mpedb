@@ -800,6 +800,26 @@ impl<'a> Binder<'a> {
     /// parameter to the column type, apply the Int64 -> Float64 coercion,
     /// reject cross-type and statically-NULL-into-NOT-NULL assignments.
     pub fn bind_assign(&mut self, e: &ast::Expr, col: &ColumnDef) -> Result<BExpr> {
+        // A bare parameter in a CASE's RESULT position lands in this column
+        // and nowhere else, so it takes the column's type — the same inference
+        // `SET c = ?` already makes one level up. Without it a `SET c = CASE
+        // WHEN … THEN ? … END` (Django's bulk_update shape) leaves every arm
+        // untyped, and a caller that relies on the declared type to convert
+        // (the C-API shim turns an `int` 0/1 into a `bool` when the plan says
+        // the column is one) sends the wrong storage class. Conditions are NOT
+        // touched — they are booleans about other columns, not values of this
+        // one — and an already-typed slot is left alone, so a parameter used in
+        // two places keeps its first meaning and the conflict is still caught.
+        if let ast::Expr::Case(arms, else_) = e {
+            let results = arms.iter().map(|(_, r)| r).chain(else_.iter().map(|b| b.as_ref()));
+            for r in results {
+                if let ast::Expr::Param(i) = r {
+                    if self.param_types[*i as usize].is_none() {
+                        self.pin_param(*i, Some(col.ty));
+                    }
+                }
+            }
+        }
         let (b, ty) = self.bind_expr(e)?;
         let (b, ty) = self.unify_param(b, ty, col.ty);
         match ty {
@@ -1889,13 +1909,18 @@ impl<'a> Binder<'a> {
     ///
     /// Two gates, both deliberate:
     ///
-    /// - the unified type must be `Any`. Only a dynamically typed comparison
-    ///   can meet two storage classes at runtime; every rigid one was already
-    ///   pinned by the binder and must stay byte-identical.
-    /// - one operand must be a bare `any` COLUMN. That is the case this exists
-    ///   for, and it keeps the rule from silently rewriting an
+    /// - the unified type must be `Any` or UNKNOWN. Only a comparison that is
+    ///   not statically pinned can meet two storage classes at runtime; every
+    ///   rigid one was already pinned by the binder and must stay
+    ///   byte-identical. Unknown is the `CAST(? AS NUMERIC) = ?` shape, where
+    ///   NUMERIC pins neither side — Django's `DecimalField` filter.
+    /// - one operand must CARRY an affinity — a bare `any` COLUMN, or a `CAST`
+    ///   (`CAST(x AS NUMERIC) > ?`, which Django writes for every `DecimalField`
+    ///   aggregate) — and NEITHER may be a bare column of a concrete type. The
+    ///   second half is what keeps the rule from silently rewriting an
     ///   `<indexed column> = <host UDF>` comparison — correct either way, but it
-    ///   would lose the index probe (`ClassCmp` is never an access path).
+    ///   would lose the index probe (`ClassCmp` is never an access path). A CAST
+    ///   is never an index probe itself, so admitting it costs no access path.
     ///
     /// Everything outside those gates keeps today's behavior, which is the only
     /// reason this can be landed without auditing every comparison in the
@@ -1904,16 +1929,23 @@ impl<'a> Binder<'a> {
     /// rule exists to avoid (`price < '40.0'` would say "every number is
     /// smaller than a text" where sqlite compares against 40.0).
     fn class_cmp_affinity(&self, unified: Ty, l: &BExpr, r: &BExpr) -> Option<Affinity> {
-        if unified != Some(ColumnType::Any) {
+        if !matches!(unified, Some(ColumnType::Any) | None) {
             return None;
         }
-        let is_any_col = |e: &BExpr| match e {
-            BExpr::Col(i) => {
-                self.scope.column_shape(*i).is_some_and(|(t, _)| t == ColumnType::Any)
-            }
-            _ => false,
+        let col_ty = |e: &BExpr| match e {
+            BExpr::Col(i) => self.scope.column_shape(*i).map(|(t, _)| t),
+            _ => None,
         };
-        if !is_any_col(l) && !is_any_col(r) {
+        let is_any_col = |e: &BExpr| col_ty(e) == Some(ColumnType::Any);
+        let is_typed_col = |e: &BExpr| col_ty(e).is_some_and(|t| t != ColumnType::Any);
+        let is_cast = |e: &BExpr| matches!(e, BExpr::Cast(..));
+        // A bare `any` column admits the rule on its own (unchanged). A CAST
+        // admits it only when the OTHER side is not a bare concrete column,
+        // which is the shape whose index probe must survive.
+        let admit = is_any_col(l)
+            || is_any_col(r)
+            || ((is_cast(l) || is_cast(r)) && !is_typed_col(l) && !is_typed_col(r));
+        if !admit {
             return None;
         }
         let aff_of = |e: &BExpr| match e {
@@ -2423,7 +2455,16 @@ impl<'a> Binder<'a> {
                 Some(w) => {
                     let (e, t) = self.unify_param(e, t, w);
                     if let Some(t) = t {
-                        if t != w {
+                        // A DYNAMICALLY typed argument (`any` — a typeless
+                        // column, a host UDF, a per-row CASE) passes: its class
+                        // is not known until the row is read, and the runtime
+                        // implementation checks the value it actually gets.
+                        // That is narrower than sqlite (which coerces
+                        // `length(123)` to 3) but the narrowing is a refusal at
+                        // the row, never a different value — and refusing at
+                        // COMPILE time refused the whole query for values that
+                        // are of the right class every time.
+                        if t != w && t != ColumnType::Any {
                             return Err(bind_err(format!(
                                 "{name}() argument {} must be {w}, got {t}",
                                 i + 1
@@ -2436,15 +2477,29 @@ impl<'a> Binder<'a> {
             }
         }
         let ret = match f {
-            ScalarFn::Abs
-            | ScalarFn::Round
-            | ScalarFn::Ceil
-            | ScalarFn::Floor
-            | ScalarFn::Trunc => {
-                // Numeric in, same numeric out. The type is the argument's.
+            // `round()` is sqlite's one numeric function that does NOT keep the
+            // argument's type: it always answers a REAL (`round(7)` is `7.0`).
+            ScalarFn::Round => match self.static_type(&out[0]) {
+                Some(ColumnType::Int64)
+                | Some(ColumnType::Float64)
+                | Some(ColumnType::Any)
+                | None => Some(ColumnType::Float64),
+                Some(other) => {
+                    return Err(bind_err(format!("{name}() expects a number, got {other}")))
+                }
+            },
+            ScalarFn::Abs | ScalarFn::Ceil | ScalarFn::Floor | ScalarFn::Trunc => {
+                // Numeric in, same numeric out. The type is the argument's —
+                // and a DYNAMICALLY typed argument (`any`) keeps `any`: the
+                // runtime already preserves int-ness per value (sqlite's
+                // `floor(7)` is the integer 7, `floor(7.5)` the real 7.0), and
+                // refuses a non-number at the row it meets one.
                 let t = self.static_type(&out[0]);
                 match t {
-                    Some(ColumnType::Int64) | Some(ColumnType::Float64) | None => t,
+                    Some(ColumnType::Int64)
+                    | Some(ColumnType::Float64)
+                    | Some(ColumnType::Any)
+                    | None => t,
                     Some(other) => {
                         return Err(bind_err(format!("{name}() expects a number, got {other}")))
                     }
@@ -2453,7 +2508,10 @@ impl<'a> Binder<'a> {
             // hex accepts text or blob (like the runtime); reject anything else
             // at COMPILE time rather than at the first row.
             ScalarFn::Hex => match self.static_type(&out[0]) {
-                Some(ColumnType::Text) | Some(ColumnType::Blob) | None => Some(ColumnType::Text),
+                Some(ColumnType::Text)
+                | Some(ColumnType::Blob)
+                | Some(ColumnType::Any)
+                | None => Some(ColumnType::Text),
                 Some(other) => {
                     return Err(bind_err(format!("hex() expects text or blob, got {other}")))
                 }
