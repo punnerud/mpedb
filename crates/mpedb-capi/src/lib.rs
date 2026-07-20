@@ -307,6 +307,36 @@ fn exec_one(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome,
         // PRAGMA and sqlite_master reads are answered by the shim's schema
         // introspection (mpedb has neither); they never reach the engine.
         Kind::Pragma => {
+            // #51: `PRAGMA database_list` needs the connection's attach list,
+            // which introspect (schema-only) cannot see — answer it here.
+            // Shape derived from sqlite (probe P9): seq 0 = main (path, or ''
+            // for an in-memory database), attached start at seq 2 (1 is
+            // temp's reserved slot, which mpedb does not have).
+            if introspect::parse_pragma(sqltext)
+                .0
+                .eq_ignore_ascii_case("database_list")
+            {
+                let main_file = match c.backing {
+                    Backing::File => c.path.to_string_lossy().into_owned(),
+                    _ => String::new(),
+                };
+                let mut rows = vec![vec![
+                    Value::Int(0),
+                    Value::Text("main".into()),
+                    Value::Text(main_file),
+                ]];
+                for (i, (name, path)) in c.db.attached_databases().into_iter().enumerate() {
+                    rows.push(vec![
+                        Value::Int(i as i64 + 2),
+                        Value::Text(name),
+                        Value::Text(path.to_string_lossy().into_owned()),
+                    ]);
+                }
+                return Ok(Outcome::Rows {
+                    columns: vec!["seq".into(), "name".into(), "file".into()],
+                    rows,
+                });
+            }
             let bundle = c.db.schema();
             let (columns, rows) = introspect::pragma(&bundle, sqltext, &mut c.busy_timeout_ms)?;
             // `PRAGMA busy_timeout = N` may have moved the knob — mirror it
@@ -1187,6 +1217,12 @@ unsafe fn prepare_common(
     // sqlite3 opens an implicit transaction on the first DML, so a later CREATE
     // and every statement touching the new table land here).
     let skip_validation = skip_validation || c.txn.is_some();
+
+    // #51: with databases ATTACHed, statement names resolve against the
+    // connection's attach list on the execution path (`Database::query`);
+    // `prepare_detached` refuses cross-file statements by design. Defer
+    // validation to step, exactly like the open-transaction case above.
+    let skip_validation = skip_validation || c.db.has_attached_databases();
 
     // Rewrite named/positional parameters to mpedb's numbered `$K` form so the
     // engine — which only speaks `?`/`$N` — sees `:name`/`@name`/`$name`/`?` as

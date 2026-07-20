@@ -387,6 +387,11 @@ pub fn classify(sql: &str) -> Kind {
         // left to `Other`, so it validates-and-refuses at prepare like any
         // unsupported statement.
         "create" | "drop" | "alter" => Kind::Ddl,
+        // ATTACH/DETACH (#51) mutate the connection's attach list — like DDL
+        // they never compile to a plan, so `prepare_detached` cannot validate
+        // them; classify with Ddl to defer them to execution, where
+        // `Database::query` intercepts and applies them.
+        "attach" | "detach" => Kind::Ddl,
         // Storage maintenance with nothing to maintain: mpedb reclaims pages
         // through its freelist (no fragmenting pager to VACUUM) and its
         // planner keeps no ANALYZE statistics. Consumers run these as routine
