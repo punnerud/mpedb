@@ -16,7 +16,10 @@
 //!   sqlite).
 //! - **Synthetic PK**: corpus tables have no PK and allow duplicate rows;
 //!   every table gets a hidden `rowid_ int64` PK. Every `INSERT ... VALUES`
-//!   is rewritten to inject a per-table counter (multi-row VALUES handled).
+//!   without a column list is rewritten to name the declared columns, so the
+//!   PK is omitted and the engine's rowid-alias auto-assign (max+1, sqlite's
+//!   own rule) numbers the rows — a shim-side counter cannot stay in sync
+//!   once a passthrough `INSERT ... SELECT` copies real rowids past it.
 //! - **`SELECT *` rewrite**: a select list of exactly `*` (or `alias.*`) is
 //!   expanded to the declared column list (single table, or an INNER JOIN
 //!   chain), so the synthetic column never leaks into results.
@@ -410,7 +413,6 @@ struct TableInfo {
     /// Normalized column signature for re-create comparison.
     signature: String,
     exists: bool,
-    next_rowid: i64,
     poisoned: bool,
 }
 
@@ -520,7 +522,6 @@ fn parse_create_table(sql: &str) -> Option<TableInfo> {
         cols,
         signature,
         exists: false,
-        next_rowid: 1,
         poisoned: false,
     })
 }
@@ -669,9 +670,16 @@ impl Shim {
         }
     }
 
-    /// `INSERT INTO t [(cols)] VALUES (..),(..)` → inject the synthetic
-    /// `rowid_` counter into the column list and every tuple.
-    fn shim_insert(&mut self, sql: &str, toks: &[Tok]) -> PreparedSql {
+    /// `INSERT INTO t VALUES (..),(..)` → name the declared columns so the
+    /// synthetic `rowid_` PK is OMITTED and the engine's rowid-alias
+    /// auto-assign (max(rowid)+1 per row, sqlite's own non-AUTOINCREMENT rule)
+    /// numbers the rows. The shim used to simulate rowids with a per-table
+    /// counter, but a passthrough `INSERT … SELECT` copies REAL rowids the
+    /// counter never saw — the next VALUES insert then collided on the PK
+    /// (in1.test t4n/t7n). Statements that already name a column list cannot
+    /// name `rowid_` (`parse_create_table` refuses tables that use the name),
+    /// so they pass through and auto-assign the same way.
+    fn shim_insert(&self, sql: &str, toks: &[Tok]) -> PreparedSql {
         if toks.len() < 4 || toks[1].up != "INTO" || !toks[2].is_word {
             return PreparedSql::Run(sql.to_string());
         }
@@ -679,98 +687,18 @@ impl Shim {
         let Some(idx) = self.find(&table_raw) else {
             return PreparedSql::Run(sql.to_string());
         };
-        let mut j = 3;
-        let mut col_list: Option<String> = None;
-        if toks[j].up == "(" {
-            let open_depth = toks[j].depth;
-            let open = j;
-            j += 1;
-            while j < toks.len() && !(toks[j].up == ")" && toks[j].depth == open_depth) {
-                j += 1;
-            }
-            if j >= toks.len() {
-                return PreparedSql::Run(sql.to_string());
-            }
-            col_list = Some(sql[toks[open].end..toks[j].start].to_string());
-            j += 1;
-        }
-        if j >= toks.len() || toks[j].up != "VALUES" {
-            return PreparedSql::Run(sql.to_string()); // INSERT ... SELECT etc.
-        }
-        let values_text = &sql[toks[j].end..];
-        let Some(tuples) = split_tuples(values_text) else {
+        if toks[3].up != "VALUES" {
+            // Explicit column list, INSERT … SELECT, DEFAULT VALUES, …
             return PreparedSql::Run(sql.to_string());
-        };
-        let cols = match col_list {
-            Some(c) => c,
-            None => self.tables[idx]
-                .cols
-                .iter()
-                .map(|(n, _)| n.clone())
-                .collect::<Vec<_>>()
-                .join(", "),
-        };
-        let mut out = format!("INSERT INTO {table_raw} (rowid_, {cols}) VALUES ");
-        for (k, tup) in tuples.iter().enumerate() {
-            let rid = self.tables[idx].next_rowid;
-            self.tables[idx].next_rowid += 1;
-            if k > 0 {
-                out.push_str(", ");
-            }
-            let _ = write!(out, "({rid}, {tup})");
         }
-        PreparedSql::Run(out)
-    }
-}
-
-/// Split `(a,b),(c,d)` into top-level tuple bodies (string-aware).
-fn split_tuples(text: &str) -> Option<Vec<String>> {
-    let b = text.as_bytes();
-    let mut tuples = Vec::new();
-    let mut i = 0;
-    loop {
-        while i < b.len() && (b[i].is_ascii_whitespace() || b[i] == b',') {
-            i += 1;
-        }
-        if i >= b.len() {
-            break;
-        }
-        if b[i] != b'(' {
-            return None;
-        }
-        let start = i + 1;
-        let mut depth = 1;
-        i += 1;
-        while i < b.len() && depth > 0 {
-            match b[i] {
-                b'\'' => {
-                    i += 1;
-                    while i < b.len() {
-                        if b[i] == b'\'' {
-                            if i + 1 < b.len() && b[i + 1] == b'\'' {
-                                i += 2;
-                                continue;
-                            }
-                            break;
-                        }
-                        i += 1;
-                    }
-                }
-                b'(' => depth += 1,
-                b')' => depth -= 1,
-                _ => {}
-            }
-            i += 1;
-        }
-        if depth != 0 {
-            return None;
-        }
-        tuples.push(text[start..i - 1].to_string());
-    }
-    if tuples.is_empty() {
-        None
-    } else {
-        Some(tuples)
+        let values_text = &sql[toks[3].end..];
+        let cols = self.tables[idx]
+            .cols
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect::<Vec<_>>()
+            .join(", ");
+        PreparedSql::Run(format!("INSERT INTO {table_raw} ({cols}) VALUES{values_text}"))
     }
 }
 
