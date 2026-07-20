@@ -995,6 +995,42 @@ impl<'a> Binder<'a> {
                 Ok((e, Some(ColumnType::Bool)))
             }
             ast::Expr::Regexp(lhs, pat, negated) => {
+                // In real sqlite the operator has NO built-in meaning: `x
+                // REGEXP y` desugars to `regexp(y, x)` — PATTERN FIRST — and
+                // errors unless the consumer registered that 2-argument
+                // function (CPython/Django always register one with Python
+                // `re` semantics). So when THIS connection has a host
+                // `regexp/2`, the operator IS that call and the host dialect
+                // must win over mpedb's native matcher below: the two dialects
+                // diverge on patterns valid in both, and `(?i)…`/backreference
+                // patterns (every Django `__iregex`) exist only in the host's
+                // (wrong answer W3). With no registration the native NFA stays
+                // — a documented mpedb EXTENSION (COMPAT.md); plain sqlite
+                // would error `no such function: regexp`.
+                if self.host_udfs.resolves("regexp", 2) {
+                    // No type pinning on either operand: a host UDF receives
+                    // whatever the expressions yield, exactly as the explicit
+                    // `regexp(y, x)` call binds (the generic HostCall arm).
+                    let (l, _) = self.bind_expr(lhs)?;
+                    let (p, _) = self.bind_expr(pat)?;
+                    let call = BExpr::HostCall {
+                        name: "regexp".to_string(),
+                        args: vec![p, l],
+                    };
+                    // Un-negated, the raw UDF result flows out (`Any`) — a
+                    // boolean position truthy-tests it via `coerce_bool_ctx`,
+                    // exactly how sqlite treats a UDF standing in a WHERE.
+                    // `NOT REGEXP` is NOT over that truthiness: `Instr::Not`
+                    // truthy-tests its operand (`truthy3` =
+                    // sqlite3VdbeBooleanValue) with 3VL NULL propagation, so
+                    // the negated form types Bool. Never folded: a host call
+                    // has no compile-time value.
+                    return Ok(if *negated {
+                        (maybe_not(call, true), Some(ColumnType::Bool))
+                    } else {
+                        (call, Some(ColumnType::Any))
+                    });
+                }
                 // Both operands are text and the result is Bool. `NOT REGEXP`
                 // is a real `Not` over the 3VL result (via `maybe_not`) — NOT of
                 // NULL is NULL, so a NULL operand still yields NULL as SQL
