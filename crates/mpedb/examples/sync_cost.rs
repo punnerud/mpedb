@@ -52,12 +52,17 @@
 //! Usage: `cargo run --release -p mpedb --example sync_cost -- <dir> [iters]`
 //! Writes two scratch files in `<dir>` and removes them. Run on an idle box.
 
+#[cfg(target_os = "linux")]
 use std::os::unix::io::AsRawFd;
 
+#[cfg(target_os = "linux")]
 const PAGE: usize = 4096;
+#[cfg(target_os = "linux")]
 const MAP_LEN: usize = 64 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const SPAN_LEN: usize = 1024 * 1024 * 1024;
 
+#[cfg(target_os = "linux")]
 fn map_file(path: &str, len: usize) -> (std::fs::File, *mut u8) {
     let f = std::fs::OpenOptions::new()
         .read(true)
@@ -90,6 +95,7 @@ fn map_file(path: &str, len: usize) -> (std::fs::File, *mut u8) {
 }
 
 #[inline]
+#[cfg(target_os = "linux")]
 fn msync_at(map: *mut u8, page: usize, npages: usize) {
     let rc = unsafe {
         libc::msync(
@@ -102,10 +108,12 @@ fn msync_at(map: *mut u8, page: usize, npages: usize) {
 }
 
 #[inline]
+#[cfg(target_os = "linux")]
 fn dirty(map: *mut u8, page: usize, tag: u8) {
     unsafe { *map.add(page * PAGE + 32) = tag };
 }
 
+#[cfg(target_os = "linux")]
 fn report(name: &str, mut d: Vec<u128>) {
     d.sort_unstable();
     let n = d.len();
@@ -117,6 +125,7 @@ fn report(name: &str, mut d: Vec<u128>) {
     );
 }
 
+#[cfg(target_os = "linux")]
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     let dir = args.get(1).cloned().unwrap_or_else(|| ".".into());
@@ -253,4 +262,13 @@ fn main() {
         report(&format!("span {:>6} MiB", w * PAGE / (1024 * 1024)), res);
     }
     let _ = std::fs::remove_file(&spath);
+}
+
+/// `libc::fallocate` is Linux-only, and part 2 measures a Linux-specific claim
+/// (that `msync` span WIDTH is free because writeback is DIRTY-tag driven — it
+/// is not, on Darwin). Stub rather than port: a probe that answers a different
+/// question on another platform is worse than no probe.
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!("sync_cost is Linux-only (fallocate + DIRTY-tag writeback semantics)");
 }
