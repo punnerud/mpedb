@@ -1495,9 +1495,17 @@ impl Database {
         // leads and drains everyone else's intents, so ring deployments stay
         // live. (The group-commit amortization forgone is the busy-timeout
         // caller's explicit trade.)
+        //
+        // Nor does a write carrying `RETURNING`: its result is Rows, and a
+        // ring result slot holds only an affected count (§5.3) — a foreign
+        // leader executing the intent would have nowhere to post the rows
+        // (`execute_prepared` refuses with "write plan returned rows").
+        // Direct-path it: the owner executes its own statement and keeps the
+        // full result, and still leads + drains others' intents on acquire.
         let use_ring = deadline.is_none()
             && ring_exec::ring_enabled(self)
-            && !plan.contains_host_call();
+            && !plan.contains_host_call()
+            && !plan.has_returning();
         let ring = self.engine.ring();
         let enqueued = if use_ring {
             hash.and_then(|h| {
