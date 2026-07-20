@@ -737,13 +737,10 @@ impl OverlaySession {
                             h.schema().tables.iter().map(|t| t.name.clone()).collect();
                         for name in tables {
                             let quoted = name.replace('"', "\"\"");
-                            let count = match self
-                                .handle()
-                                .map_err(Failure::from)
-                                .and_then(|h| {
-                                    h.query(&format!("SELECT count(*) FROM \"{quoted}\""), &[])
-                                        .map_err(Failure::from)
-                                }) {
+                            let count = match self.handle().and_then(|h| {
+                                h.query(&format!("SELECT count(*) FROM \"{quoted}\""), &[])
+                                    .map_err(Failure::from)
+                            }) {
                                 Ok(mpedb::ExecResult::Rows { rows, .. }) => rows
                                     .first()
                                     .and_then(|r| r.first())
