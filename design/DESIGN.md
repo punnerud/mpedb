@@ -164,6 +164,96 @@ mpedb` reports spurious retries within seconds — measured 2026-07-15, 3 with i
 against 0 as shipped on the same flags. `mpedb-bench`'s `SPURIOUS_CORRUPT_RETRIES`
 counter is the tripwire for that regression.
 
+### 4.1a Power-loss simulation for `durability = commit` (#121)
+
+§4.1 above is an *argument*. Until #121 nothing tried to falsify it: `mpedb powerloss`
+covered only the WAL-class modes, and the `crash` harness SIGKILLs processes, which does
+not model a device losing page-cache content at all. `mpedb powerloss --durability
+commit` is the missing half, and because a simulator with a wrong fault model produces
+confident false assurance, its model is stated here rather than left in the code.
+
+**The shape is different from the WAL one.** `wal` appends, so power loss is a truncated
+*tail* and a random byte-offset `set_len` models it exactly. `commit` publishes by
+mutating a mapped file **in place**, so power loss is *an arbitrary subset of the dirty
+pages never reaching the platter*. Not a suffix; not expressible by truncation. The
+property under attack is the one this section exists to guarantee:
+
+> **No `meta_T` is checksum-valid on the platter while pointing at COW pages that were
+> never written.**
+
+**Where the ordering comes from.** The harness does not encode "data before meta". It
+captures the engine's own durability trace from inside the engine (`mpedb_core::plsim`,
+armed by `MPEDB_COMMIT_SYNC_LOG`, off otherwise): every `msync(MS_SYNC)` return, every
+`sync_barrier` return, every `write_meta_slot`, with the page bytes as of that instant
+(delta-coded against a per-page shadow, or the deliberately whole-live-region span of
+#111 would put megabytes per commit in the log). It then replays that trace over the
+pre-workload file image and cuts it. **This is the one decision that keeps the harness
+from being circular**: a simulator that *decides* the flushes are ordered and then checks
+that they are would pass on an engine with them reversed. Here the trace moves when the
+code moves.
+
+**What is assumed about hardware, and nothing else:**
+
+1. *A returned `msync(MS_SYNC)` is a durability edge* — its pages are on the platter and
+   stay there. Exactly true on Linux (`msync(MS_SYNC)` is `vfs_fsync_range`, ending in a
+   device flush; `sync_barrier` compiles away). On Darwin the edge is the `F_FULLFSYNC`
+   in `sync_barrier`, i.e. strictly later — but the commit path always runs a barrier
+   between the data flush and the meta store, so the class break lands in the same place
+   on both, and the Linux reading is the one *more permissive to the engine*.
+2. *An un-flushed store may or may not be on the platter.* The in-flight flush lands as
+   an arbitrary subset of its pages, possibly torn; stores after the cut are modelled as
+   absent. Modelling spontaneous writeback as absent is sound **here specifically**
+   because every un-flushed page in `commit` mode is a COW page unreachable from any
+   durable meta — landing early can only add unreferenced garbage. That is a property of
+   shadow paging, not a general licence.
+3. *Torn writes at 512-byte sector granularity, plus sub-sector scribbles on the meta.*
+   All per-commit meta fields live in bytes 64..120, inside sector 0, so a sector-atomic
+   device leaves a meta page wholly-new or wholly-old and the checksum-fallback path
+   would never run. The harsher byte-level tearing is deliberate: the meta checksum
+   exists to survive a device that does not keep the sector promise, and testing only
+   the promise would be testing the assumption instead of the code.
+4. *Extent/blob payload is in the same ordering class as mapped pages.* It is `pwrite`n
+   rather than mapped-stored, but `write(2)` and `MAP_SHARED` share one page cache and
+   the commit path folds the extent ranges into the same pre-barrier span
+   (DESIGN-BLOBEXTENT §4). The trace therefore captures extent bytes with no special
+   case; `--extent-kb` picks which side of the threshold the workload's blobs fall on.
+
+**Ordering is not decidable from the trace shape** — worth recording, because the first
+draft of the harness thought it was and reported a §4.1 violation against healthy code.
+A correct engine emits `… PUBLISH(T) FLUSH(meta_T) BARRIER FLUSH(data_{T+1}) …`, and one
+that published before flushing emits `… PUBLISH(T) FLUSH(meta_T) BARRIER FLUSH(data_T)
+…`: the same shape. What differs is which commit's meta *references* the pages in that
+flush, which the trace does not carry. So the property is falsified the only way it can
+be — cut between the meta flush and the data flush, reopen, and see whether the database
+survives. The static audit is therefore restricted to two structural facts (every
+published slot is flushed; a barrier precedes every publish that had data).
+
+**What each cut asserts.** The workload records a digest of the whole logical database
+after every commit and stamps the commit number into the trace. For a cut with `n_floor`
+= the last commit acknowledged strictly before it: reopening must succeed (one slot
+always holds a durable commit); page accounting must verify; the workload invariants must
+hold; and the recovered digest must be **exactly** `digest[n_floor]` when the cut is at or
+before the in-flight commit's meta flush and that flush lost everything, or one of
+`digest[n_floor]` / `digest[n_floor+1]` otherwise. A state that satisfies every invariant
+but matches no committed state is a failure — that is what a half-landed commit looks
+like.
+
+**Non-vacuity.** `--sabotage reorder|drop-data` rewrites the captured trace into the one
+a broken engine would have produced and *requires* a violation, exiting non-zero if it
+finds none — so "the injector never fails" and "the injector never ran" stay
+distinguishable (INNOVATIONS.md §6.4). Measured 2026-07-20: `reorder` caught 16 of 40
+cuts (same on the `MPEDB_MSYNC_PER_RUN=1` arm), `drop-data` 30 of 30. The stronger check
+was run once against a throwaway build with `commit_inner`'s meta publish + `msync_page`
+genuinely moved ahead of the data span msync: 8 of 13 cuts broke, including the exact
+`recovered a state that is NEITHER commit N nor commit N+1` verdict — which proves the
+whole chain (instrumentation, capture, replay, verification) is live, not just the trace
+rewriter. Restored code, same day: 720 cuts over three arms (span barrier; per-run
+barrier; blobs above and below the extent threshold), 640 pages dropped, 0 findings.
+
+**Out of scope, deliberately:** concurrency. One writer process per round, so the trace
+is a total order. Multi-process interleaving belongs to the SIGKILL harnesses (`crash`,
+`stress`, `powerloss --durability wal`); this one is about the device.
+
 ### 4.2 Lock area
 
 - `init_state: AtomicU32` — `0` empty, `1` formatting, `2` READY (§3).

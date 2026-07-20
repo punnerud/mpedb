@@ -11,6 +11,7 @@ pub mod cdc;
 pub mod engine;
 mod os;
 pub mod pagestore;
+pub mod plsim;
 pub mod ring;
 pub mod row;
 pub mod shm;
