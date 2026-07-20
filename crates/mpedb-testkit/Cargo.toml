@@ -7,6 +7,11 @@ license.workspace = true
 
 [dependencies]
 mpedb = { workspace = true }
+# The index-candidate census (task #118) reads the COMPILED plan — access path
+# plus residual `ExprProgram` — not the SQL text, because the planner consumes
+# the equality conjuncts that matter out of the filter.
+mpedb-sql = { workspace = true }
+mpedb-types = { workspace = true }
 # The differential oracle: the SAME pinned sqlite on every machine, compiled
 # in. Bumping this version is the deliberate, reviewable way the oracle moves.
 rusqlite = { version = "0.31", features = ["bundled"] }
