@@ -6,7 +6,34 @@
 use mpedb::{LockMode, ReconcilePolicy, SqliteOverlay, Value};
 use rusqlite::Connection;
 
-fn setup(tag: &str) -> std::path::PathBuf {
+/// The base .db plus its overlay siblings, REMOVED on drop. The overlay file
+/// alone is 64 MB, and before this guard every test run left a full set
+/// behind — measured twice at 23-25 GB of /tmp, enough to fill / and fail
+/// unrelated workspace runs with ENOSPC.
+struct OvlPaths(std::path::PathBuf);
+
+impl std::ops::Deref for OvlPaths {
+    type Target = std::path::Path;
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for OvlPaths {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for OvlPaths {
+    fn drop(&mut self) {
+        for suffix in ["", ".overlay.mpedb", ".overlay.probe", "-journal", "-wal"] {
+            let _ = std::fs::remove_file(format!("{}{}", self.0.display(), suffix));
+        }
+    }
+}
+
+fn setup(tag: &str) -> OvlPaths {
     let p = std::env::temp_dir()
         .join("mpedb-overlay-tests")
         .join(format!("ovl-{tag}-{}.db", std::process::id()));
@@ -28,7 +55,7 @@ fn setup(tag: &str) -> std::path::PathBuf {
         .unwrap();
     }
     drop(c);
-    p
+    OvlPaths(p)
 }
 
 fn rows(r: mpedb::ExecResult) -> Vec<Vec<Value>> {
@@ -160,9 +187,11 @@ fn deltas_survive_reopen_and_divergence_is_refused() {
 
 #[test]
 fn text_pk_without_rowid_merges_like_any_other_shape() {
-    let p = std::env::temp_dir()
-        .join("mpedb-overlay-tests")
-        .join(format!("ovl-textpk-{}.db", std::process::id()));
+    let p = OvlPaths(
+        std::env::temp_dir()
+            .join("mpedb-overlay-tests")
+            .join(format!("ovl-textpk-{}.db", std::process::id())),
+    );
     std::fs::create_dir_all(p.parent().unwrap()).unwrap();
     for suffix in ["", ".overlay.mpedb", ".overlay.probe"] {
         let _ = std::fs::remove_file(format!("{}{}", p.display(), suffix));
