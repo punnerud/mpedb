@@ -1,9 +1,11 @@
 # DESIGN-SYNC-TIERING — cold-data tiering + drain-and-read-back between `.mpedb` files
 
-**Status: design (2026-07-18). Forward-looking (Phase 6+), sequenced AFTER the SQL-parity sprint.
-Built on the existing mirror (bidirectional CDC + type-provenance), extents/blobs (#50), and the
-HTTP-range/FrozenDb direction (#22). Pairs with [DESIGN-SERVICE.md](DESIGN-SERVICE.md): the drainer
-is a scheduled service task, read-back is a callout.**
+**Status: design (2026-07-18); v1 row-drain SHIPPED 2026-07-20 (#78) — see §8 for what shipped
+and where the code deliberately diverges from this doc. Forward-looking (Phase 6+), sequenced
+AFTER the SQL-parity sprint. Built on the existing mirror (bidirectional CDC + type-provenance),
+extents/blobs (#50), and the HTTP-range/FrozenDb direction (#22). Pairs with
+[DESIGN-SERVICE.md](DESIGN-SERVICE.md): the drainer is a scheduled service task, read-back is a
+callout.**
 
 ## 0. The problem
 
@@ -96,3 +98,47 @@ The expensive server gets its disk back without changing application code.
    config surface.
 4. Multi-process drainer election + the mirror-collide-style SIGKILL fuzz proving
    "hot+cold converge, no unit lost, no double-charge" — commit-path-class review before it ships.
+
+## 8. v1 shipped (2026-07-20, #78) — and the doc-vs-code drift
+
+**What shipped**: `Database::tier_drain`/`tier_create_cold` (`crates/mpedb/src/tier.rs`) and
+`mpedb tier drain <hot> <cold.mpedb> --table T --where PRED [param ...]` + the `mpedb tier crash`
+SIGKILL harness (`crates/mpedb-cli/src/tier.rs`). One-shot, batched (`--batch`, hot writer lock
+held per batch = the §5 drainer election), predicate-driven row drain into a local cold `.mpedb`
+seeded with the hot table's exact definition. Per batch: SELECT under the hot writer lock → copy
+into cold → **cold COMMITS** → every copied row is **re-read from a fresh cold snapshot and
+compared bit-exactly** (floats by bit pattern) → only then delete-from-hot commits (§2's
+push-verify-reclaim ordering, verbatim). SIGKILL anywhere ⇒ every row is in hot, cold, or both —
+never neither; the harness proves it (40/40 waves, duplicates-at-kill always exactly one batch,
+every re-drain converged).
+
+**Where the code diverges from this doc — deliberate, follow the code:**
+
+- **Read-back rides `ATTACH` (#51), not stubs.** This doc predates the shipped cross-file read
+  path (`multifile.rs`). v1's documented read-back is
+  `ATTACH '<cold>' AS cold; SELECT … UNION ALL SELECT … FROM cold.t` — per-file-consistent
+  snapshots, exactly #51's contract. §3's transparent stub/`reference` resolution (and any
+  union VIEW over hot+cold) is v2+; v1 refuses nothing silently — the union is an explicit query.
+- **Staging reordered**: §7 puts blob-extent `reference` mode first; v1 shipped step 3's ROW
+  `drain` core first, because ATTACH read-back made it the smallest correct vertical slice.
+  Extent tiering, remote cold stores, re-warm, `[tiering]` config, and the background drainer
+  remain unshipped.
+- **Transport is the typed row plane, not the mirror.** §2's CDC/provenance transport applies to
+  the remote store (v2). For a local sibling file, direct typed writes + the post-commit
+  bit-exact read-back give the same "verified landed before reclaim" guarantee without hashing.
+- **"Idempotent re-drain" is sharpened by a refusal**: a cold row under the same PK with
+  IDENTICAL content is reconciled (delete-from-hot only); with DIFFERENT content the drain
+  errors and touches NOTHING — after a crashed drain, hot may have re-used the PK, and without
+  content-hash lineage (§6) "overwrite cold" would destroy the archive while "keep cold" would
+  destroy the live row. Fail loud is the only markerless answer; no on-disk marker format was
+  added in v1.
+- **Crash model**: the protocol is SIGKILL-safe at any durability (commits live in the shared
+  mmap). POWER-loss safety of the handoff additionally needs the cold handle at
+  `durability = commit|wal` — the CLI creates cold files with `commit` by default. A SIGKILL
+  during cold-file CREATION can leave a torn (never-READY) file that opens as `Corrupt`;
+  nothing has left hot at that point — delete it and re-run.
+- **v1 refusals (by name)**: FTS tables, RLS policies on either side (the typed plane runs
+  below policies, like the mirror applier), hot DELETE / cold INSERT triggers on the table,
+  and any hot/cold table-definition drift. Hot-side CDC capture stays ON for the drain's
+  deletes: a mirror of the hot file keeps converging to the hot file, by the mirror's own
+  contract.
