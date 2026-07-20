@@ -6,6 +6,13 @@ was built.** This is the results half of the harness committed in `2c21c26`
 footprint_index`). It is the empirical input to [DESIGN-MPEE-COST.md](DESIGN-MPEE-COST.md)
 (#88) — read §1 before designing the cost catalog's key.
 
+**Sibling measurement (#118):** [DESIGN-WORKLOAD-INDEXES.md](DESIGN-WORKLOAD-INDEXES.md) §3
+extends this harness with `sqlite_corpus --index-census`, which asks the other question of the
+same statement stream — *how many distinct (table, key column set, predicate) INDEX candidates
+does it generate?* Answer: **112 whole-table candidates over 99,279 statements**, ≤ 23 per
+table, 32 covering 94 % of occurrences. §1's statement-width histogram is why: narrow statements
+make a narrow candidate space, and candidate generation is an enumeration rather than a search.
+
 ## 0. What was run
 
 - **Census**: `sqlite_corpus --footprint-census=<tsv>` over 14 real sqllogictest files

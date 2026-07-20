@@ -30,11 +30,14 @@ those plans a candidate index set is derivable mechanically (§4), and the measu
 the set is **small** (§3) — small enough to enumerate and cost exhaustively, not search.
 An index is identified by **what it is** (§2) — a content hash over the table name, the key
 column names, their collations, and the predicate — so an app upgrade that still implies an
-index finds it already built. Partial indexes (§5) are the feature that makes the derived
-set worth having, because the derived predicates are mostly `IS NULL`-shaped and index a
-small slice. The whole thing runs **ahead of time from a test-suite run** (§6 mode A), with
-adaptive refinement (§6 mode B) attached to #88's per-plan-hash cost history, and every build
-is background and droppable (§7). Nothing here reaches the write hot path.
+index finds it already built. Partial indexes (§5) are designed, and the honest measured
+verdict is narrower than the pitch: **42 % of the candidate set carries a predicate but only
+3.3 % of occurrences do, and every predicate the corpus produced is an `IS NULL` shape** —
+which is a statement about sqllogictest (no soft-delete, no status enum, no tenant key) far more
+than about applications, so §3.3 names the one missing measurement rather than extrapolating.
+The whole thing runs **ahead of time from a test-suite run** (§6 mode A), with adaptive
+refinement (§6 mode B) attached to #88's per-plan-hash cost history, and every build is
+background and droppable (§7). Nothing here reaches the write hot path.
 
 Six things mpedb cannot do today are named as **prerequisites** (§10), not designed around.
 
@@ -241,7 +244,114 @@ direction. So **three families** are counted:
 | **Pnull** | `col IS NULL` / `col IS NOT NULL` on non-key columns | the class that **survives** an ORM: Django emits `IS NULL` as literal text, never as a bound parameter |
 | **Plit** | Pnull + `col = <const>` / `col IN (<consts>)` | the **upper bound**: in this corpus every literal is inline, so a real parameterized app reaches this only for genuine constants (enums, booleans, tenant sentinels) |
 
-<!-- MEASURED-BLOCK -->
+### 3.1 What was run
+
+`sqlite_corpus --index-census=<tsv>` over 14 real sqllogictest files —
+`index/{between,commute,delete,in,orderby,orderby_nosort,random,view}/1000/slt_good_0.test`,
+`random/{aggregates,expr,groupby,select}/slt_good_0.test`, `evidence/slt_lang_update.test`,
+`select1.test` (corpus root `/home/morten/sqllogictest/test`). **115,612 records, 103,564
+passing, 0 wrong**, 44 s wall. **Run twice; every count below reproduced exactly.** Nothing in
+the engine, the commit path or the plan format changed.
+
+(#117's run used the same 14 directories but did not record which size level per `index/` dir;
+this run pins `1000` for all eight, so the totals differ slightly from its 94,689. Every
+conclusion below is a ratio inside this run.)
+
+### 3.2 The counts
+
+| | |
+|---|---|
+| statements compiled | **99,279** |
+| uncompilable in the prepare-only pass (views, DDL-dependent surface) | 1,452 |
+| skipped — join / compound / recursive / derived / INSERT / txn control | 31,969 |
+| single-table but pinning **no** column (bare scans, aggregates) | 45,215 |
+| filter too opaque to split into conjuncts (CASE / COALESCE jumps) | **0** |
+| **statements yielding a candidate** | **22,095** |
+
+Access path of those statements: `PkPoint` 0, `PkRange` 0, `IndexPoint` 1,693, `IndexRange`
+10,747, **`FullScan` 54,870**. (No PK access at all: sqllogictest tables declare no PRIMARY KEY,
+so mpedb synthesizes the hidden rowid (#94) and nothing filters on it.) Of the candidate-bearing
+statements, **12,465 are already served** by an existing index or PK prefix and **9,630 are
+novel**. Key-width histogram: **1 = 20,189, 2 = 1,820, 3 = 86** — narrow, exactly as #117's
+table-width histogram predicts.
+
+**The distinct-candidate counts, which is the number #118 asked for:**
+
+| family | distinct candidates | of which **partial** | distinct predicates | occurrences under a partial |
+|---|---|---|---|---|
+| **W** (table, key cols) | **112** | 0 | — | — |
+| **Pnull** (+ `IS [NOT] NULL`) | **188** | **79 (42.0 %)** | **5** | 727 (3.3 %) |
+| **Plit** (+ `= const` / `IN`) | **188** | **79 (42.0 %)** | **5** | 727 (3.3 %) |
+
+Concentration (W): the top 8 candidates cover **50.8 %** of occurrences, the top 32 cover
+**94.2 %**. Per table: 6 tables carry candidates, the largest carrying **23**. Comparison
+right-hand sides: **15,411 constant, 0 parameter**.
+
+### 3.3 Reading it — four findings
+
+**(1) The search space is an enumeration, not a search.** 99,279 statements collapse to **112**
+whole-table candidates, at most 23 per table, and 32 of them cover 94 % of all occurrences. That
+is small enough to cost *exhaustively* — every candidate against every plan — with no pruning
+heuristic, no greedy selection, and no risk of missing the good one. And it grows **linearly in
+tables**, not combinatorially, because the key width is 1–3 (#117's statement width is 1–3 for
+the same reason): the candidate space of a 200-table Django schema is on the order of a few
+thousand, still an enumeration. This is the finding that makes the whole idea tractable.
+
+**(2) `Plit` ≡ `Pnull`, exactly — the count is parameterization-robust.** Admitting literal
+equalities as partial predicates added **zero** candidates and **zero** occurrences. The reason
+is a rule in the generator, and it is the right rule to make explicit:
+
+> **An equality atom becomes a KEY column, never a predicate.** A predicate is what is left over
+> that *cannot* be a key column. `WHERE status = 'active'` is better served by an index *keyed*
+> on `status` (which serves every value of `status`) than by an index *restricted* to
+> `status = 'active'` (which serves one).
+
+This matters far beyond tidiness. The census is over a corpus that is 100 % unparameterized
+(15,411 constant right-hand sides, **0** parameters), and the obvious worry was that its inline
+literals would manufacture a partial-index candidate per literal and inflate the count into
+garbage. They did not — because every literal equality was consumed as a key column instead. So
+the candidate count above is the number a *parameterized* application would produce too, and it
+is quotable at a real workload. The surviving predicates are exactly the class that survives an
+ORM: all five are `IS NULL` shapes.
+
+**(3) In *this* corpus partial indexes are a footnote — and this corpus cannot answer the
+question.** 42 % of the candidate *set* carries a predicate, but those candidates account for
+only **3.3 %** of occurrences, and all five distinct predicates are `col IS NULL`. That is not
+evidence against partial indexes; it is evidence that sqllogictest cannot exhibit the pattern.
+Its schema is `tab0..tab4(col0..col4)` of random numerics with NULLs sprinkled in — there is no
+soft-delete column, no status enum, no tenant key, no `deleted_at`. The Django shapes that
+motivate §5 are structurally absent from the input.
+
+> **So the measurement bounds the candidate space (that result transfers) and does NOT settle
+> whether partial indexes are the main event or a footnote in an application workload (that
+> result does not transfer).** What would settle it is a captured Django statement stream. There
+> is none on this machine and none in this repo — the `crates/mpedb-capi/workbench/` harness runs
+> Django's suite under the C-API shim and emits **test-failure diffs, not SQL**. Capturing one
+> (a statement log from a workbench run) is the cheapest next measurement and it is small; it is
+> named here rather than guessed at.
+
+What the corpus *does* establish about §5 is the mechanism: the predicates it produced are
+`IS NULL` conjunctions, i.e. exactly the atom vocabulary §5.2 canonicalizes and §5.5's v1
+implication test decides — including one two-atom conjunction (`col1 IS NULL AND col4 IS NULL`),
+so multi-atom predicates are real even here.
+
+**(4) The workload is nowhere near index-served, so the advisor has room.** 54,870 full scans
+against 12,440 index accesses, and 9,630 of the 22,095 candidate-bearing statements have no
+index covering their candidate — this despite the `index/` corpus files creating indexes
+explicitly. An advisor run over this stream would have real work to do.
+
+### 3.4 What the census does not measure
+
+- **Joins.** 31,969 statements were skipped as not single-table; a join's `joined_filter`
+  indexes the concatenated tuple, and attributing its conjuncts back to base columns is a
+  separate (and easy, but unwritten) mapping. #117 measured the fan as 1–3 tables, so this is a
+  bounded gap, but the inner side of an index nested-loop is exactly where an FK index pays and
+  it is not counted here.
+- **Frequency.** Occurrences are corpus occurrences, not production frequency (§1.1, P5).
+- **Parameterized predicates.** Zero in this corpus, so §5.5's parameter limit and P6's reach
+  are untested by measurement.
+- **Selectivity.** No candidate's member fraction `m` was measured; §8's cost model is
+  unexercised.
 
 ---
 
@@ -741,3 +851,12 @@ Three candidates were checked; none of them lands, and the reasons are worth rec
 
 The real limits are P6 (parameterized predicates) and P5 (no frequency history) — both of which
 narrow the feature rather than invalidate it.
+
+**The one open risk, stated plainly.** The *partial*-index half of the pitch rests on a class of
+predicate this corpus cannot exhibit (§3.3), and the measurement that would confirm it — a
+captured Django statement stream — does not exist yet. If that capture comes back showing that
+an ORM's selective predicates are overwhelmingly **bound parameters** rather than literal text,
+then partial indexes are unreachable without **P6**, and P6 moves from "v2 nicety" to "the
+feature". The candidate-space result (§3.3 finding 1) and the identity rule (§2) are unaffected
+either way — they are what make the *whole-table* derivation work, and that half is measured.
+**Capture the stream before building P1.**
