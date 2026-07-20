@@ -7,7 +7,7 @@
 //! then every specifier sqlite 3.45 has is swept individually.
 //!
 //! The refusals are asserted directly, by message: sqlite answers NULL for a
-//! time string it cannot parse, so an unsupported FORM (`'now'`, a Julian-day
+//! time string it cannot parse, so an unsupported FORM (a Julian-day
 //! number, a modifier) must not be allowed to fall into that same NULL — it
 //! would be indistinguishable from sqlite's own NULL while actually being a
 //! different answer. Every such input is a named error instead.
@@ -300,7 +300,6 @@ fn strftime_refuses_by_name_what_it_cannot_reproduce() {
 
     // --- unsupported time strings, named --------------------------------
     for sql in [
-        "SELECT strftime('%Y', 'now')",
         "SELECT strftime('%Y', '2455352.5')",
         "SELECT strftime('%Y', 'garbage')",
         "SELECT strftime('%Y', '')",
@@ -371,47 +370,46 @@ fn strftime_refuses_by_name_what_it_cannot_reproduce() {
 ///  * It would not close the shape Django actually uses: `'now'` is only useful
 ///    with the modifier language (`'now','start of day'`), which stays refused.
 #[test]
-fn now_is_refused_by_design_and_says_why() {
+fn now_binds_the_statement_instant_and_nothing_else_does() {
     let (db, path) = mpedb_db();
 
-    // The refusal names `'now'` AND the reason, so the next reader does not
-    // have to re-derive the argument above.
-    let m = db
-        .query("SELECT strftime('%Y', 'now')", &[])
-        .map(|r| panic!("'now' must be refused, got {r:?}"))
-        .unwrap_err()
-        .to_string();
-    assert!(m.contains("unsupported time string"), "{m}");
-    assert!(m.contains("\"now\""), "{m}");
-    assert!(m.contains("non-deterministic"), "{m}");
-    assert!(m.contains("content-hashed"), "{m}");
-
-    // Case and whitespace variants take the same path — sqlite accepts them all
-    // (`'NOW'`, `' now '`), so none may fall through to a different message or,
-    // worse, to a value.
-    for t in ["'NOW'", "'Now'", "' now '", "'now '"] {
-        let m = db
-            .query(&format!("SELECT strftime('%Y', {t})"), &[])
-            .map(|r| panic!("{t} must be refused, got {r:?}"))
-            .unwrap_err()
-            .to_string();
-        assert!(m.contains("unsupported time string"), "{t}: {m}");
+    // `'now'` USED to be refused here. It is now bound to the statement-start
+    // instant through a reserved parameter slot, so the plan carries a
+    // parameter reference and never a clock reading — the determinism argument
+    // the old refusal made is preserved, not abandoned. The behavioural
+    // contracts (one instant per statement, a fresh one per execute, UTC) live
+    // in `datetime_fns.rs`; what is pinned HERE is that the whole family
+    // ANSWERS, in every spelling sqlite accepts.
+    for t in ["'now'", "'NOW'", "'Now'", "' now '", "'now '"] {
+        for f in [
+            format!("strftime('%Y', {t})"),
+            format!("date({t})"),
+            format!("time({t})"),
+            format!("datetime({t})"),
+            format!("julianday({t})"),
+        ] {
+            assert!(
+                db.query(&format!("SELECT {f}"), &[]).is_ok(),
+                "{f} must answer: sqlite accepts every case/whitespace spelling of 'now'"
+            );
+        }
     }
 
-    // The neighbouring refusals that make this one consistent rather than
-    // arbitrary: mpedb has no non-deterministic expression ANYWHERE.
+    // The neighbouring refusals are UNCHANGED, and that is the point: `'now'`
+    // is answerable because it has a per-statement slot, not because mpedb went
+    // loose about time. A bare keyword and a DDL DEFAULT have no such slot —
+    // a DEFAULT is stored as SOURCE and re-evaluated on every later insert.
     let m = db
         .query("SELECT current_timestamp", &[])
         .map(|r| panic!("current_timestamp must not resolve, got {r:?}"))
         .unwrap_err()
         .to_string();
     assert!(m.contains("unknown column `current_timestamp`"), "{m}");
-    for f in ["current_timestamp()", "now()", "datetime('now')", "date('now')", "time('now')"] {
-        assert!(
-            db.query(&format!("SELECT {f}"), &[]).is_err(),
-            "{f} must not resolve to a value"
-        );
-    }
+    assert!(db.query("SELECT now()", &[]).is_err(), "now() is not a function");
+    assert!(
+        db.query("SELECT current_timestamp()", &[]).is_err(),
+        "current_timestamp() is not a function"
+    );
     for kw in ["CURRENT_TIMESTAMP", "CURRENT_DATE", "CURRENT_TIME"] {
         let m = db
             .query(&format!("CREATE TABLE nowtest_{kw} (a INT PRIMARY KEY, b TEXT DEFAULT {kw})"), &[])
@@ -421,8 +419,7 @@ fn now_is_refused_by_design_and_says_why() {
         assert!(m.contains(kw), "{kw}: {m}");
     }
 
-    // And the deterministic time strings still work, so this is a refusal of
-    // non-determinism and not of `strftime`.
+    // And the deterministic time strings still work.
     assert!(db.query("SELECT strftime('%Y-%m-%d', '2020-01-02')", &[]).is_ok());
 
     let _ = std::fs::remove_file(&path);
