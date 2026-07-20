@@ -185,6 +185,15 @@ pub fn sqlite_shaped_message(e: &DbError) -> Option<String> {
         }
         DbError::NotNullViolation { .. } => Some(format!("NOT NULL constraint failed: {raw}")),
         DbError::Busy => Some("database is locked".to_string()),
+        // "no such collation sequence: <name>" is sqlite's own wording and
+        // consumers assert on it EXACTLY (CPython's `test_deregister_collation`
+        // compares `str(exc)`), so the engine's `bind error: ` / `unsupported: `
+        // prefix has to come off. The message itself is already sqlite's.
+        DbError::Bind(m) | DbError::Unsupported(m)
+            if m.starts_with("no such collation sequence: ") =>
+        {
+            Some(m.clone())
+        }
         e if is_writer_lock_reentry(e) => Some("database is locked".to_string()),
         _ => None,
     }

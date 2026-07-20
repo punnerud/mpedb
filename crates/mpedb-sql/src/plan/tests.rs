@@ -1004,9 +1004,9 @@ fn oversized_counts_in_plan_bytes_are_rejected() {
     match &mut evil.stmt {
         PlanStmt::Select(SelectPlan { order_by, .. }) => {
             assert!(!order_by.is_empty());
-            let item = order_by[0];
+            let item = order_by[0].clone();
             while order_by.len() <= crate::parser::MAX_ORDER_BY_ITEMS {
-                order_by.push(item);
+                order_by.push(item.clone());
             }
         }
         _ => unreachable!(),

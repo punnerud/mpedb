@@ -6,7 +6,7 @@
 
 use crate::planner;
 use mpedb_types::value::{read_value, write_value};
-use mpedb_types::{AggFn, AggTarget, Collation,
+use mpedb_types::{AggFn, AggTarget, Collation, OrderColl,
     ColumnType, Error, ExprProgram, Footprint, Instr, KeyBound, KeyPart, PlanHash, Result, Schema,
     TableDef, Value, FORMAT_VERSION, MAX_COLUMNS,
 };
@@ -381,10 +381,29 @@ const MAX_JOINS: usize = 16;
 //     the sqlite-dialect CAST bridge on coercible operands is unchanged, and
 //     a reader one format back hits the unknown opcode in the expr decoder
 //     and rejects the blob as corrupt rather than misreading it.
+// 51: MULTI-ARGUMENT host aggregates (design/DESIGN-UDF.md stage 2, second half).
+//     Each `AggCall` grows a trailing `u16` count followed by that many argument
+//     programs — the arguments AFTER the first. Every built-in aggregate takes
+//     exactly one argument, so a native plan grows by exactly one zero `u16`
+//     and nothing else; decode REFUSES a non-zero count on a non-host aggregate
+//     (there is nowhere for a second argument to go). sqlite's
+//     `create_aggregate(name, N, cls)` is an N-ary contract and CPython's own
+//     suite registers 2-ary and variadic ones. Same connection-local rule as 40.
+// 52: HOST COLLATING SEQUENCES in `ORDER BY` (design/DESIGN-UDF.md stage 3). The
+//     order-key collation byte becomes a discriminated tag: 0..=2 are the
+//     built-in `Collation`s exactly as before, and **3** — never a valid
+//     `Collation` tag — introduces a host collation followed by its NAME. Every
+//     plan that uses only built-ins encodes byte-for-byte as in format 51. The
+//     name rides IN the plan rather than a registry index, so the blob is
+//     self-describing; a plan carrying one is connection-local (it reports
+//     `contains_host_call`) and never reaches the shared registry. A host
+//     collation appears ONLY here — a key encoding, a column's declared
+//     `COLLATE`, and a GROUP BY/DISTINCT fold all still take a built-in
+//     `Collation`, which no registration can produce.
 //     NOTE (worktree, 2026-07-19): rebased onto main at 49 (derived-table
 //     materialization); this takes 50 by instruction — expr opcode tags 56..60
 //     — and the numbers are reconciled at merge.
-const PLAN_FORMAT: u8 = 50;
+const PLAN_FORMAT: u8 = 52;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -760,10 +779,10 @@ pub struct SelectPlan {
     pub projection: Vec<Projection>,
     /// (column index, descending, collation). Empty = scan order. The index is
     /// into the tuple named by `order_over` — never assume the base row. The
-    /// [`Collation`] is [`Collation::Binary`] unless an explicit `COLLATE` was
+    /// [`OrderColl`] is `Native(Binary)` unless an explicit `COLLATE` was
     /// written on the ORDER BY term (`ORDER BY name COLLATE NOCASE`); it governs
     /// text ordering at sort time and is ignored for non-text keys.
-    pub order_by: Vec<(u16, SortDir, Collation)>,
+    pub order_by: Vec<(u16, SortDir, OrderColl)>,
     /// Which tuple `order_by` indexes, and therefore where in the pipeline
     /// the sort runs. Explicit rather than inferred from `distinct` /
     /// `aggregate`, because it is a decision the planner makes and the
@@ -1081,9 +1100,9 @@ pub struct CompoundPlan {
     pub arms: Vec<SelectPlan>,
     pub ops: Vec<SetOp>,
     /// (output column index, descending, collation) over the compound OUTPUT
-    /// tuple. Collation is [`Collation::Binary`] unless an explicit `COLLATE` was
+    /// tuple. Collation is `Native(Binary)` unless an explicit `COLLATE` was
     /// written on the compound ORDER BY term.
-    pub order_by: Vec<(u16, SortDir, Collation)>,
+    pub order_by: Vec<(u16, SortDir, OrderColl)>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
 }
@@ -1359,6 +1378,16 @@ pub struct AggCall {
     /// aggregate filters independently; for `DISTINCT` the filter runs FIRST and
     /// the survivors are then deduped.
     pub filter: Option<ExprProgram>,
+    /// A HOST aggregate's arguments AFTER the first (format 51). Empty for every
+    /// built-in — mpedb has no multi-argument native aggregate — and for a
+    /// 1-ary host registration, so every plan compiled before this rode the
+    /// same bytes. Each is evaluated over the SAME base row as `arg`, and the
+    /// executor hands `xStep` the whole list: `[arg] ‖ extra_args`.
+    ///
+    /// `arg` is still the FIRST argument rather than `extra_args[0]` so the
+    /// rules written about "the aggregate's argument" — the DISTINCT dedup key,
+    /// `count(*)`'s `None`, the min/max witness — keep their single subject.
+    pub extra_args: Vec<ExprProgram>,
 }
 
 /// The compiled `ON CONFLICT` action.
@@ -1700,9 +1729,14 @@ fn select_has_host_call(sp: &SelectPlan) -> bool {
                     c.func.host().is_some()
                         || opt_prog_host_call(&c.arg)
                         || opt_prog_host_call(&c.filter)
+                        || c.extra_args.iter().any(ExprProgram::has_host_call)
                 })
                 || opt_prog_host_call(&a.having)
         })
+        // A HOST collating sequence is resolved through the connection's
+        // registry at sort time, so a plan naming one is connection-local for
+        // the same reason a host function call is (design/DESIGN-UDF.md stage 3).
+        || sp.order_by.iter().any(|(_, _, c)| c.host().is_some())
         || sp.windows.iter().any(|w| {
             opt_prog_host_call(&w.arg)
                 || w.partition_by.iter().any(ExprProgram::has_host_call)
@@ -1713,6 +1747,10 @@ fn select_has_host_call(sp: &SelectPlan) -> bool {
 
 fn compound_has_host_call(c: &CompoundPlan) -> bool {
     c.arms.iter().any(select_has_host_call)
+        // The compound's OWN `ORDER BY` may name a host collating sequence —
+        // and it is the only one the arms cannot carry, since the trailing
+        // ORDER BY belongs to the whole compound.
+        || c.order_by.iter().any(|(_, _, coll)| coll.host().is_some())
 }
 
 fn subbody_has_host_call(b: &SubBody) -> bool {

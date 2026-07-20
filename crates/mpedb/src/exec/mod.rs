@@ -12,6 +12,7 @@ use mpedb_sql::{
 };
 use mpedb_types::{
     exact_float_as_int, exact_int_as_float, keycode, Accum, Collation, DefaultExpr, Error,
+    HostColls, OrderColl,
     ExprProgram, HostFns, KeyBound, KeyPart, Result, Schema, TableDef, Value,
 };
 use std::cmp::Ordering;
@@ -124,6 +125,14 @@ pub(crate) trait TxnCtx {
     fn host_aggs(&self) -> Option<&dyn mpedb_types::HostAggs> {
         None
     }
+    /// Host-registered COLLATING SEQUENCES in scope for this execution
+    /// (design/DESIGN-UDF.md stage 3), or `None`. Same scope rule as
+    /// [`host_fns`](Self::host_fns); a plan whose ORDER BY names one is
+    /// connection-local, so every other context refuses it by name rather than
+    /// sorting under a collation it does not have.
+    fn host_colls(&self) -> Option<&dyn HostColls> {
+        None
+    }
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>>;
     fn get_by_index(&mut self, table: u32, index_no: u32, values: &[Value])
         -> Result<Option<Vec<Value>>>;
@@ -194,9 +203,10 @@ pub(crate) trait TxnCtx {
         lo: Option<(&[u8], bool)>,
         hi: Option<(&[u8], bool)>,
         filter: Option<(&ExprProgram, &[Value])>,
-        order_by: &[(u16, SortDir, Collation)],
+        order_by: &[(u16, SortDir, OrderColl)],
         keep: usize,
     ) -> Result<Vec<Vec<Value>>> {
+        gather::check_order_colls(order_by, self.host_colls())?;
         let rows = self.scan_rows_raw(table, lo, hi)?;
         let host = self.host_fns();
         let mut kept = Vec::new();
@@ -210,7 +220,7 @@ pub(crate) trait TxnCtx {
                 kept.push(row);
             }
         }
-        sort_rows(&mut kept, order_by);
+        sort_rows(&mut kept, order_by, self.host_colls());
         kept.truncate(keep);
         Ok(kept)
     }
@@ -352,6 +362,10 @@ pub(crate) struct WriteCtx<'a, 'e> {
     pub txn: &'a mut WriteTxn<'e>,
     pub host: Option<&'a dyn HostFns>,
     pub aggs: Option<&'a dyn mpedb_types::HostAggs>,
+    /// Host COLLATING SEQUENCES in scope for this write (stage 3), so an
+    /// `ORDER BY … COLLATE mycoll` inside DML (`INSERT … SELECT`, `RETURNING`)
+    /// sorts through the same callbacks a read would.
+    pub colls: Option<&'a dyn HostColls>,
 }
 
 impl<'a, 'e> WriteCtx<'a, 'e> {
@@ -359,8 +373,9 @@ impl<'a, 'e> WriteCtx<'a, 'e> {
         txn: &'a mut WriteTxn<'e>,
         host: Option<&'a dyn HostFns>,
         aggs: Option<&'a dyn mpedb_types::HostAggs>,
+        colls: Option<&'a dyn HostColls>,
     ) -> WriteCtx<'a, 'e> {
-        WriteCtx { txn, host, aggs }
+        WriteCtx { txn, host, aggs, colls }
     }
 }
 
@@ -370,6 +385,9 @@ impl TxnCtx for WriteCtx<'_, '_> {
     }
     fn host_aggs(&self) -> Option<&dyn mpedb_types::HostAggs> {
         self.aggs
+    }
+    fn host_colls(&self) -> Option<&dyn HostColls> {
+        self.colls
     }
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
         WriteTxn::get_by_pk(self.txn, table, pk)
@@ -441,6 +459,9 @@ pub(crate) struct ReadCtx<'t, 'e>(
     /// Host-registered AGGREGATE factories in scope for this read (stage 2),
     /// gated by the same `contains_host_call` test as the scalars above.
     pub Option<&'t dyn mpedb_types::HostAggs>,
+    /// Host-registered COLLATING SEQUENCES in scope for this read (stage 3),
+    /// gated by the same `contains_host_call` test as the two above.
+    pub Option<&'t dyn HostColls>,
 );
 
 impl TxnCtx for ReadCtx<'_, '_> {
@@ -449,6 +470,9 @@ impl TxnCtx for ReadCtx<'_, '_> {
     }
     fn host_aggs(&self) -> Option<&dyn mpedb_types::HostAggs> {
         self.2
+    }
+    fn host_colls(&self) -> Option<&dyn HostColls> {
+        self.3
     }
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
         self.0.get_by_pk(table, pk)
@@ -525,9 +549,10 @@ impl TxnCtx for ReadCtx<'_, '_> {
         lo: Option<(&[u8], bool)>,
         hi: Option<(&[u8], bool)>,
         filter: Option<(&ExprProgram, &[Value])>,
-        order_by: &[(u16, SortDir, Collation)],
+        order_by: &[(u16, SortDir, OrderColl)],
         keep: usize,
     ) -> Result<Vec<Vec<Value>>> {
+        gather::check_order_colls(order_by, self.host_colls())?;
         if keep == 0 {
             return Ok(Vec::new());
         }
@@ -551,7 +576,7 @@ impl TxnCtx for ReadCtx<'_, '_> {
             if !ok {
                 continue;
             }
-            let cand = Ranked { row, order_by, seq };
+            let cand = Ranked { row, order_by, colls: self.3, seq };
             seq += 1;
             if heap.len() < keep {
                 heap.push(cand);
@@ -587,7 +612,10 @@ impl TxnCtx for ReadCtx<'_, '_> {
 /// is the row that sorts *last*.
 struct Ranked<'a> {
     row: Vec<Value>,
-    order_by: &'a [(u16, SortDir, Collation)],
+    order_by: &'a [(u16, SortDir, OrderColl)],
+    /// The connection's HOST collating sequences, so a `COLLATE mycoll` key
+    /// orders through the callback here exactly as it does in `sort_rows`.
+    colls: Option<&'a dyn HostColls>,
     seq: u64,
 }
 
@@ -596,7 +624,7 @@ impl Ord for Ranked<'_> {
         // Primary: the ORDER BY spec. Secondary: scan sequence ASCENDING
         // regardless of the ORDER BY direction — a stable sort keeps equal
         // keys in original (scan) order, so the tiebreak is never reversed.
-        cmp_rows(&self.row, &other.row, self.order_by).then(self.seq.cmp(&other.seq))
+        cmp_rows(&self.row, &other.row, self.order_by, self.colls).then(self.seq.cmp(&other.seq))
     }
 }
 impl PartialOrd for Ranked<'_> {
@@ -1011,7 +1039,8 @@ fn exec_compound(
         acc = apply_set_op(acc, rows, *op);
     }
     if !c.order_by.is_empty() {
-        sort_rows(&mut acc, &c.order_by);
+        gather::check_order_colls(&c.order_by, ctx.host_colls())?;
+        sort_rows(&mut acc, &c.order_by, ctx.host_colls());
     }
     let skip = c.offset.unwrap_or(0).min(usize::MAX as u64) as usize;
     let take = c.limit.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
@@ -1108,7 +1137,9 @@ fn exec_select(
                 // HERE, before the projection narrows it. Sorting the projected
                 // rows instead would index the wrong tuple.
                 if *order_over == OrderOver::BaseRow && !order_by.is_empty() {
-                    sort_rows(&mut r, order_by);
+                    gather::check_order_colls(order_by, ctx.host_colls())?;
+                    gather::check_order_colls(order_by, ctx.host_colls())?;
+                sort_rows(&mut r, order_by, ctx.host_colls());
                 }
                 r
             } else if *order_over != OrderOver::BaseRow {
@@ -1126,7 +1157,8 @@ fn exec_select(
             } else {
                 // ORDER BY with no LIMIT: must materialize and sort in full.
                 let mut r = gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?;
-                sort_rows(&mut r, order_by);
+                gather::check_order_colls(order_by, ctx.host_colls())?;
+                sort_rows(&mut r, order_by, ctx.host_colls());
                 r
             };
             let skip = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
@@ -1179,7 +1211,9 @@ fn exec_select(
                 out.push(orow);
             }
             if *order_over != OrderOver::BaseRow {
-                sort_rows(&mut out, order_by);
+                gather::check_order_colls(order_by, ctx.host_colls())?;
+                gather::check_order_colls(order_by, ctx.host_colls())?;
+        sort_rows(&mut out, order_by, ctx.host_colls());
                 // Sort-only columns come off AFTER the sort and before the
                 // caller sees anything. They are always trailing, so the trim
                 // is a truncate — and it must reach `columns` below too, or the
@@ -1314,7 +1348,8 @@ fn exec_select_with(
         gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?
     };
     if *order_over == OrderOver::BaseRow && !order_by.is_empty() {
-        sort_rows(&mut rows, order_by);
+        gather::check_order_colls(order_by, ctx.host_colls())?;
+        sort_rows(&mut rows, order_by, ctx.host_colls());
     }
 
     // Fill every correlated slot per row and apply the post-filter, keeping each
@@ -1354,7 +1389,8 @@ fn exec_select_with(
         out.push(orow);
     }
     if *order_over != OrderOver::BaseRow {
-        sort_rows(&mut out, order_by);
+        gather::check_order_colls(order_by, ctx.host_colls())?;
+        sort_rows(&mut out, order_by, ctx.host_colls());
         if *order_junk > 0 {
             let keep = projection.len() - *order_junk as usize;
             for row in &mut out {

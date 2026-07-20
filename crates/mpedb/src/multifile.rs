@@ -42,7 +42,7 @@ use mpedb_core::ReadTxn;
 use mpedb_sql::{
     AttachStmt, CompiledPlan, DbResolution, DbScope, PlanHash, PolicyCatalog, SortDir,
 };
-use mpedb_types::{Collation, Error, ExprProgram, HostFns, Result, Schema, TableDef, Value};
+use mpedb_types::{Error, ExprProgram, HostFns, Result, Schema, TableDef, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -463,9 +463,11 @@ impl Database {
         // Host UDFs (main's registry) for a plan that calls one.
         let tables_host = self.host_tables(&cp.plan);
         let host: Option<&dyn HostFns> =
-            tables_host.as_ref().map(|(f, _)| f as &dyn HostFns);
+            tables_host.as_ref().map(|(f, _, _)| f as &dyn HostFns);
         let host_aggs: Option<&dyn mpedb_types::HostAggs> =
-            tables_host.as_ref().map(|(_, a)| a as &dyn mpedb_types::HostAggs);
+            tables_host.as_ref().map(|(_, a, _)| a as &dyn mpedb_types::HostAggs);
+        let host_colls: Option<&dyn mpedb_types::HostColls> =
+            tables_host.as_ref().map(|(_, _, c)| c as &dyn mpedb_types::HostColls);
 
         // Pin main, then each member, checking schema staleness UNDER the pin
         // that will scan (a member's live DDL invalidates, never misreads).
@@ -484,9 +486,9 @@ impl Database {
         let mut partial = false;
         let res = {
             let mut ctxs: Vec<ReadCtx<'_, '_>> = Vec::with_capacity(1 + member_txns.len());
-            ctxs.push(ReadCtx(&main_txn, host, host_aggs));
+            ctxs.push(ReadCtx(&main_txn, host, host_aggs, host_colls));
             for t in &member_txns {
-                ctxs.push(ReadCtx(t, None, None));
+                ctxs.push(ReadCtx(t, None, None, None));
             }
             let mut multi = MultiCtx {
                 ctxs,
@@ -532,6 +534,9 @@ impl TxnCtx for MultiCtx<'_, '_> {
     }
     fn host_aggs(&self) -> Option<&dyn mpedb_types::HostAggs> {
         self.ctxs[0].host_aggs()
+    }
+    fn host_colls(&self) -> Option<&dyn mpedb_types::HostColls> {
+        self.ctxs[0].host_colls()
     }
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
         let (m, local) = self.slot(table);
@@ -591,7 +596,7 @@ impl TxnCtx for MultiCtx<'_, '_> {
         lo: Option<(&[u8], bool)>,
         hi: Option<(&[u8], bool)>,
         filter: Option<(&ExprProgram, &[Value])>,
-        order_by: &[(u16, SortDir, Collation)],
+        order_by: &[(u16, SortDir, mpedb_types::OrderColl)],
         keep: usize,
     ) -> Result<Vec<Vec<Value>>> {
         let (m, local) = self.slot(table);

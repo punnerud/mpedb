@@ -439,7 +439,8 @@ fn order_by_takes_an_aggregate_not_just_a_name() {
                         mpedb_types::AggTarget::Native(mpedb_types::AggFn::Count),
                         None,
                         false,
-                        None
+                        None,
+                        Vec::new()
                     ),
                     SortDir::dir(true)
                 )]

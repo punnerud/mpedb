@@ -23,13 +23,14 @@ type PlannedStmt = (
     Vec<SubPlan>,
 );
 use crate::binder::{
-    compile_program, declared_collation, peel_collate, BExpr, Binder, HostUdfSet, Scope, Ty,
+    compile_program, declared_collation, peel_collate, peel_order_collate, BExpr, Binder,
+    HostUdfSet, Scope, Ty,
 };
 
 /// Resolved ORDER BY keys: `(column index into the sorted tuple, direction +
 /// NULL placement, collation)`. The collation is [`Collation::Binary`] for a
 /// plain `ORDER BY`.
-pub(crate) type OrderKeys = Vec<(u16, crate::plan::SortDir, Collation)>;
+pub(crate) type OrderKeys = Vec<(u16, crate::plan::SortDir, mpedb_types::OrderColl)>;
 use crate::plan::{
     render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, Frame,
     FrameBound, FrameMode, InsertSource, CompoundPlan, GroupKey, Join, JoinKind, OrderOver,
@@ -912,7 +913,7 @@ fn plan_compound(
     for (e, dir) in &c.order_by {
         // Peel an explicit `COLLATE` off the term; the inner expression resolves
         // to an output column/ordinal as before, and the collation rides the sort.
-        let (e, coll) = peel_collate(e)?;
+        let (e, coll) = peel_order_collate(e, host_udfs.colls())?;
         let coll = coll.unwrap_or_default();
         if let Some(pos) = select::ordinal(e, arity)? {
             order_by.push((pos, *dir, coll));

@@ -75,6 +75,11 @@ pub struct Sqlite3 {
     /// deleted, or the connection closes — CPython wraps a Python callable in
     /// `pApp` and would otherwise leak it.
     host_fns: Vec<udf::HostFn>,
+    /// Registered COLLATING SEQUENCES (`sqlite3_create_collation_v2`), tracked
+    /// for the same reason as `host_fns`: sqlite runs the caller's `xDestroy`
+    /// when an entry is replaced, deleted, or the connection closes, and
+    /// CPython wraps a Python callable in `pApp`.
+    host_colls: Vec<udf::HostColl>,
     /// `sqlite3_trace_v2` registration: event mask + `xCallback` + `pCtx`. The
     /// only event the shim emits is `SQLITE_TRACE_STMT`, fired as a statement
     /// begins running (see `trace_stmt_begin`); other mask bits are accepted
@@ -928,6 +933,7 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
         total_changes: 0,
         last_insert_rowid: 0,
         host_fns: Vec::new(),
+        host_colls: Vec::new(),
         trace_mask: 0,
         trace_cb: ptr::null_mut(),
         trace_ctx: ptr::null_mut(),
@@ -1063,6 +1069,9 @@ unsafe fn close_common(db: *mut Sqlite3) -> c_int {
     // Run each registered UDF's `xDestroy(pApp)` — sqlite's contract on close,
     // and what keeps CPython from leaking the wrapped Python callables.
     for h in std::mem::take(&mut boxed.host_fns) {
+        h.destroy();
+    }
+    for h in std::mem::take(&mut boxed.host_colls) {
         h.destroy();
     }
     let path = boxed.path.clone();
@@ -2494,26 +2503,89 @@ pub unsafe extern "C" fn sqlite3_create_window_function(
     SQLITE_ERROR
 }
 
+/// `sqlite3_create_collation_v2(db, name, enc, pArg, xCompare, xDestroy)`
+/// (design/DESIGN-UDF.md stage 3).
+///
+/// **Honest scope.** A registered collation is a COMPARATOR, and mpedb uses it
+/// where a comparator is all that is needed: `ORDER BY <expr> COLLATE <name>`.
+/// It cannot re-order an INDEX — an mpedb index (and every PRIMARY KEY) is a
+/// B+tree in memcmp order under a BUILT-IN collation, and no callback can
+/// produce sort bytes — so a host collation on a column's declared `COLLATE`,
+/// or as the fold of a `GROUP BY`/`DISTINCT` key, is REFUSED by name
+/// ("no such collation sequence") rather than answered under BINARY. The engine
+/// enforces that structurally: those paths take a built-in `Collation`, which no
+/// registration can construct.
+///
+/// `xCompare == NULL` DELETES the entry (CPython's `create_collation(name,
+/// None)`); a statement that already named it then fails with sqlite's
+/// "no such collation sequence: <name>" rather than silently sorting BINARY.
+/// The encoding argument is accepted and ignored: mpedb text is UTF-8, which is
+/// what `SQLITE_UTF8` asks for, and CPython only ever passes that.
+///
+/// On FAILURE `xDestroy` is NOT called — unlike `create_function_v2`, sqlite
+/// documents the collation destructor as not running on a failed registration,
+/// and CPython frees `pArg` itself on a non-OK return. Calling it here was a
+/// double-free that corrupted the interpreter's heap.
 #[no_mangle]
 pub unsafe extern "C" fn sqlite3_create_collation_v2(
     db: *mut Sqlite3,
-    _name: *const c_char,
+    name: *const c_char,
     _enc: c_int,
     arg: *mut c_void,
-    _x_compare: *mut c_void,
+    x_compare: *mut c_void,
     x_destroy: *mut c_void,
 ) -> c_int {
-    // Do NOT invoke x_destroy: sqlite's documented contract is that the
-    // destructor is NOT called when sqlite3_create_collation_v2() fails, and
-    // CPython's create_collation frees its callback context itself on a
-    // non-OK return ("the destructor callback is _not_ called if
-    // sqlite3_create_collation_v2() fails" — Modules/_sqlite/connection.c).
-    // Calling it here was a double-free that corrupted CPython's heap.
-    let _ = (x_destroy, arg);
-    if let Some(c) = conn(db) {
-        c.set_error(SQLITE_ERROR, SQLITE_ERROR, "user-defined collations are not supported");
+    let Some(c) = conn(db) else { return SQLITE_MISUSE };
+    c.clear_error();
+    let Some(raw_name) = c_str_opt(name) else {
+        c.set_error(
+            SQLITE_MISUSE,
+            SQLITE_MISUSE,
+            "create_collation: NULL or non-UTF-8 collation name",
+        );
+        return SQLITE_MISUSE;
+    };
+    let cname = raw_name.to_string();
+    // A repeat registration REPLACES (sqlite's rule, and CPython's
+    // `test_collation_register_twice` asserts the LAST one wins): run the
+    // previous entry's destructor once the new one is in.
+    let previous = c
+        .host_colls
+        .iter()
+        .position(|h| h.name == cname)
+        .map(|i| c.host_colls.remove(i));
+    if x_compare.is_null() {
+        c.db.unregister_host_collation(&cname);
+        if let Some(p) = previous {
+            p.destroy();
+        }
+        call_destroy(x_destroy, arg);
+        return SQLITE_OK;
     }
-    SQLITE_ERROR
+    let cmp: udf::XCompare = std::mem::transmute(x_compare);
+    c.db
+        .register_host_collation(&cname, udf::make_collation_closure(cmp, arg));
+    c.host_colls.push(udf::HostColl {
+        name: cname,
+        x_destroy,
+        p_app: arg,
+    });
+    if let Some(p) = previous {
+        p.destroy();
+    }
+    SQLITE_OK
+}
+
+/// `sqlite3_create_collation` — the same, without a destructor.
+#[no_mangle]
+pub unsafe extern "C" fn sqlite3_create_collation(
+    db: *mut Sqlite3,
+    name: *const c_char,
+    enc: c_int,
+    arg: *mut c_void,
+    x_compare: *mut c_void,
+) -> c_int {
+    sqlite3_create_collation_v2(db, name, enc, arg, x_compare, ptr::null_mut())
 }
 
 // ---- UDF-callback accessors (design/DESIGN-UDF.md §1) ----------------------

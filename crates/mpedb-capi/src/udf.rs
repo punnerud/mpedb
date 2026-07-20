@@ -380,3 +380,72 @@ pub unsafe fn copy_result_bytes(p: *const c_char, n: c_int) -> Vec<u8> {
     };
     std::slice::from_raw_parts(p as *const u8, len).to_vec()
 }
+
+/// The C collating-sequence callback: `int(*)(void*, int, const void*, int,
+/// const void*)` — `(pArg, nA, pA, nB, pB)`, negative/zero/positive like
+/// `strcmp`.
+pub type XCompare =
+    unsafe extern "C" fn(*mut c_void, c_int, *const c_void, c_int, *const c_void) -> c_int;
+
+/// A registered collating sequence's identity + teardown state, tracked on the
+/// connection so the caller's `xDestroy(pApp)` runs when the entry is replaced,
+/// deleted, or the connection closes (CPython wraps a Python callable in
+/// `pApp`).
+pub struct HostColl {
+    pub name: String,
+    pub x_destroy: *mut c_void,
+    pub p_app: *mut c_void,
+}
+
+impl HostColl {
+    pub unsafe fn destroy(&self) {
+        if !self.x_destroy.is_null() {
+            let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(self.x_destroy);
+            f(self.p_app);
+        }
+    }
+}
+
+/// `xCompare` + `pApp`, wrapped for the facade's `Send + Sync` closure bound.
+/// Sound for the same reason `XFuncPtrs` is: a sqlite connection is
+/// single-threaded per the C-API contract, and the comparator only ever runs on
+/// the thread executing the statement.
+struct XCmpPtrs {
+    x_compare: XCompare,
+    p_app: *mut c_void,
+}
+unsafe impl Send for XCmpPtrs {}
+unsafe impl Sync for XCmpPtrs {}
+
+impl XCmpPtrs {
+    /// Call the C comparator with two UTF-8 byte runs. Lengths are BYTE counts,
+    /// as sqlite passes them; the pointers are the string bodies and are NOT
+    /// NUL-terminated (sqlite's contract — a collation must use the length).
+    unsafe fn invoke(&self, a: &str, b: &str) -> c_int {
+        (self.x_compare)(
+            self.p_app,
+            a.len() as c_int,
+            a.as_ptr() as *const c_void,
+            b.len() as c_int,
+            b.as_ptr() as *const c_void,
+        )
+    }
+}
+
+/// Build the comparator the facade registers for an `xCompare`/`pApp` pair.
+/// Only the SIGN of the callback's return is meaningful (sqlite's contract, and
+/// what lets CPython's `test_collation_returns_large_integer` — which returns
+/// ±2³² — order correctly).
+pub fn make_collation_closure(
+    x_compare: XCompare,
+    p_app: *mut c_void,
+) -> impl Fn(&str, &str) -> std::cmp::Ordering + Send + Sync + 'static {
+    let ptrs = XCmpPtrs { x_compare, p_app };
+    move |a: &str, b: &str| {
+        // SAFETY: the pointers came from a `create_collation` registration on
+        // this connection and are alive until the entry is replaced/deleted (at
+        // which point the facade registration is dropped first).
+        let r = unsafe { ptrs.invoke(a, b) };
+        r.cmp(&0)
+    }
+}

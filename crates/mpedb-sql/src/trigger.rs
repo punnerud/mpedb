@@ -329,9 +329,12 @@ fn rewrite_row_in_expr(e: &mut Expr, scope: &RowScope, map: &mut RowMap) -> Resu
         | Expr::Collate(a, _) => rewrite_row_in_expr(a, scope, map),
         // An aggregate's argument AND its `FILTER (WHERE …)` both read the row;
         // rewrite `new`/`old` references in each.
-        Expr::Agg(_, arg, _, filter) => {
+        Expr::Agg(_, arg, _, filter, extra) => {
             if let Some(a) = arg {
                 rewrite_row_in_expr(a, scope, map)?;
+            }
+            for x in extra {
+                rewrite_row_in_expr(x, scope, map)?;
             }
             if let Some(f) = filter {
                 rewrite_row_in_expr(f, scope, map)?;

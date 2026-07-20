@@ -223,6 +223,9 @@ impl TxnCtx for WorkingTableCtx<'_, '_> {
     fn host_aggs(&self) -> Option<&dyn mpedb_types::HostAggs> {
         self.inner.host_aggs()
     }
+    fn host_colls(&self) -> Option<&dyn mpedb_types::HostColls> {
+        self.inner.host_colls()
+    }
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
         if table == CTE_TABLE {
             return Err(Self::keyed_bug());
@@ -308,7 +311,7 @@ impl TxnCtx for WorkingTableCtx<'_, '_> {
         lo: Option<(&[u8], bool)>,
         hi: Option<(&[u8], bool)>,
         filter: Option<(&ExprProgram, &[Value])>,
-        order_by: &[(u16, SortDir, Collation)],
+        order_by: &[(u16, SortDir, mpedb_types::OrderColl)],
         keep: usize,
     ) -> Result<Vec<Vec<Value>>> {
         if table == CTE_TABLE {
@@ -323,7 +326,8 @@ impl TxnCtx for WorkingTableCtx<'_, '_> {
                     kept.push(row.clone());
                 }
             }
-            sort_rows(&mut kept, order_by);
+            gather::check_order_colls(order_by, self.inner.host_colls())?;
+            sort_rows(&mut kept, order_by, self.inner.host_colls());
             kept.truncate(keep);
             return Ok(kept);
         }
