@@ -416,7 +416,8 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
         // shape.
         Kind::Read if !eqp && introspect::references_sqlite_master(sqltext) => {
             let bundle = c.db.schema();
-            let (columns, rows) = introspect::sqlite_master(&bundle, sqltext)?;
+            let verbatim = sqlite_master_records(c, &bundle);
+            let (columns, rows) = introspect::sqlite_master(&bundle, sqltext, &verbatim)?;
             Ok(Outcome::Rows { columns, rows })
         }
         Kind::Begin => {
@@ -457,11 +458,23 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
         // DML, so a `CREATE TABLE` after an `INSERT` (and every `executescript`)
         // lands here with `c.txn` set.
         _ => {
+            // A `CREATE`/`DROP TABLE`'s own text, to be filed under the table's
+            // name once it succeeds (`sqlite_master.sql`). Resolved BEFORE
+            // execution because a DROP's target is gone afterwards.
+            let ddl_target = introspect::table_ddl_target(sqltext).map(|(create, name, at)| {
+                let exact = introspect::exact_table_name(&c.db.schema(), &name);
+                (create, exact.unwrap_or(name), at)
+            });
             let res = if let Some(s) = c.txn.as_mut() {
                 s.query(sqltext, params)
             } else {
                 c.db.query(sqltext, params)
             };
+            if res.is_ok() {
+                if let Some((create, name, at)) = ddl_target {
+                    record_table_ddl(c, sqltext, create, &name, at);
+                }
+            }
             // Drain the rowid the engine recorded for this statement (facade
             // hook) BEFORE propagating any error, so sqlite3_last_insert_rowid
             // reflects the last row an INSERT actually wrote — even when a
@@ -474,6 +487,93 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             }
             let res = res?;
             Ok(if eqp { eqp_outcome(res) } else { to_outcome(res) })
+        }
+    }
+}
+
+/// The verbatim-DDL records (`introspect::ddl_record`) for every table
+/// `sqlite_master` is about to report, keyed by table name.
+///
+/// Read through the OPEN transaction when there is one, so records written in
+/// it are visible to it; through the facade otherwise. A missing or unreadable
+/// record is simply absent — `sqlite_master` then falls back to reconstructing
+/// the `CREATE TABLE`, which is what it did before any of this existed.
+///
+/// ONE scan, not one lookup per table: a consumer with hundreds of tables
+/// (Django's suite has them) queries `sqlite_master` repeatedly, and a read
+/// transaction per table per query is quadratic for no reason. `0xff` bounds
+/// the scan above every key: keys are table names, and no valid UTF-8 byte
+/// sequence starts with `0xff`.
+fn sqlite_master_records(c: &mut Sqlite3, schema: &mpedb::Schema) -> HashMap<String, Vec<u8>> {
+    let ns = introspect::DDL_NS;
+    let all = match c.txn.as_mut() {
+        Some(s) => s.sys_record_scan_range(ns, &[], &[0xff]).unwrap_or_default(),
+        None => c.db.sys_record_scan(ns).unwrap_or_default(),
+    };
+    let wanted: std::collections::HashSet<String> =
+        introspect::master_table_names(schema).into_iter().collect();
+    all.into_iter()
+        .filter_map(|(k, v)| String::from_utf8(k).ok().map(|k| (k, v)))
+        .filter(|(k, _)| wanted.contains(k))
+        .collect()
+}
+
+/// File (or forget) a table's own `CREATE TABLE` text after the statement
+/// succeeded, so `sqlite_master.sql` can hand back what the caller wrote.
+///
+/// Best-effort by design: the record is a *fidelity* improvement, never a
+/// correctness dependency, so a failed write is swallowed — the reconstruction
+/// remains the answer. Writes ride the open transaction when there is one, so
+/// the text commits and rolls back atomically with the DDL itself.
+///
+/// **Only autocommit `CREATE TABLE`s are recorded.** Fingerprinting the shape
+/// needs the table the statement just made, and the facade exposes no
+/// session-scoped schema view (`Database::schema()` is the committed one), so
+/// inside an open transaction there is nothing to resolve against — and
+/// pairing a live table's fingerprint with a text that might have been rolled
+/// back to a savepoint is exactly the "almost right `CREATE TABLE`" that
+/// replays as a different table. Those tables keep the reconstruction.
+/// Closing this needs `WriteSession::schema()` from the engine.
+fn record_table_ddl(c: &mut Sqlite3, sqltext: &str, create: bool, name: &str, name_at: usize) {
+    if c.readonly {
+        return;
+    }
+    let value = if create {
+        // Re-resolve against the schema the statement just produced: the table
+        // may have been named with different case/quoting than it is stored
+        // under, and `ddl_record` fingerprints the shape as created.
+        let schema = c.db.schema();
+        let Some(exact) = introspect::exact_table_name(&schema, name) else {
+            return;
+        };
+        let Some(t) = introspect::table_by_exact_name(&schema, &exact) else {
+            return;
+        };
+        let verbatim = introspect::ddl_verbatim(sqltext, name_at);
+        if verbatim.is_empty() {
+            return;
+        }
+        Some((exact, introspect::ddl_record(t, &verbatim)))
+    } else {
+        None
+    };
+    match value {
+        Some((exact, rec)) => {
+            let (ns, key) = introspect::ddl_key(&exact);
+            let _ = match c.txn.as_mut() {
+                Some(s) => s.sys_record_put(ns, &key, &rec),
+                None => c.db.sys_record_put(ns, &key, &rec),
+            };
+        }
+        // DROP: forget the text. The facade has no delete outside a session, so
+        // autocommit writes an EMPTY record instead — a tombstone, since
+        // `master_sql` only trusts a record that carries a fingerprint.
+        None => {
+            let (ns, key) = introspect::ddl_key(name);
+            let _ = match c.txn.as_mut() {
+                Some(s) => s.sys_record_delete(ns, &key).map(|_| ()),
+                None => c.db.sys_record_put(ns, &key, &[]),
+            };
         }
     }
 }
@@ -970,6 +1070,31 @@ fn is_callable_name(lower: &str) -> bool {
         "rank", "row_number", "lag",
     ];
     NAMES.contains(&lower)
+}
+
+/// A brand-new, EMPTY database in its own throwaway file, plus that path so the
+/// caller can unlink it. Same geometry and bootstrap table as any `:memory:`
+/// connection, so it is indistinguishable from one that never had a statement
+/// run against it.
+///
+/// Used by `backup.rs` to answer a backup of the `temp` schema: mpedb has no
+/// temp database, and refuses every statement that would put anything in one
+/// (`CREATE TEMP TABLE`/`VIEW`/`TRIGGER` all fail to parse), so mpedb's temp
+/// schema is provably EMPTY — an empty image is the exact answer, not an
+/// approximation of one.
+pub(crate) fn open_blank_database() -> Result<(Database, PathBuf), String> {
+    let path = ephemeral_path();
+    let _ = std::fs::remove_file(&path);
+    let mut cfg =
+        Config::from_toml_str(&seed_toml(&path, 16)).map_err(|e| format!("config error: {e}"))?;
+    cfg.options.path = path.clone();
+    match Database::open_with_config(cfg) {
+        Ok(db) => Ok((db, path)),
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            Err(format!("cannot create `{}`: {e}", path.display()))
+        }
+    }
 }
 
 fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_int, String)> {
@@ -3151,13 +3276,43 @@ pub unsafe extern "C" fn sqlite3_serialize(
 pub unsafe extern "C" fn sqlite3_deserialize(
     db: *mut Sqlite3,
     _schema: *const c_char,
-    _data: *mut c_uchar,
-    _sz: c_longlong,
+    data: *mut c_uchar,
+    sz: c_longlong,
     _sz_buf: c_longlong,
     _flags: c_uint,
 ) -> c_int {
+    // Two different refusals, because there are two different truths.
+    //
+    // If the buffer is not a database image at all, mpedb can say so with
+    // sqlite's own words and code — `SQLITE_NOTADB` / "file is not a database"
+    // — and that is not a claim to have implemented anything: those bytes are
+    // not a database, which is exactly what sqlite reports for them (CPython's
+    // `test_deserialize_corrupt_database` asserts that message). If it IS a
+    // plausible image, the honest answer is the gap itself: mpedb has no way
+    // to adopt a foreign page image into an open connection.
+    if !is_database_image(data, sz) {
+        if let Some(c) = conn(db) {
+            c.set_error(SQLITE_NOTADB, SQLITE_NOTADB, "file is not a database");
+        }
+        return SQLITE_NOTADB;
+    }
     if let Some(c) = conn(db) {
         c.set_error(SQLITE_ERROR, SQLITE_ERROR, "deserialize is not supported by mpedb");
     }
     SQLITE_ERROR
+}
+
+/// Could `data[..sz]` be a database image? Only a header test — enough to tell
+/// "these bytes are not a database" from "mpedb cannot adopt this database".
+///
+/// mpedb writes its magic at offset 0 of page 0 (`mpedb_core::shm`'s `MAGIC`,
+/// `MPEDB` + a format digit). The prefix rather than all 8 bytes, so a future
+/// format revision still reads as *a* database rather than as garbage — the
+/// refusal that follows is the same either way, only the wording differs.
+unsafe fn is_database_image(data: *const c_uchar, sz: c_longlong) -> bool {
+    const PREFIX: &[u8] = b"MPEDB";
+    if data.is_null() || sz < PREFIX.len() as c_longlong {
+        return false;
+    }
+    std::slice::from_raw_parts(data, PREFIX.len()) == PREFIX
 }

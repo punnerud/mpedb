@@ -42,6 +42,13 @@
 //!
 //! Everything else — when the destination becomes visible, what a partial
 //! backup leaves behind, where errors are reported — matches.
+//!
+//! # Schema names
+//!
+//! `main` is mpedb's file. `temp` is accepted **as a source** and copies an
+//! EMPTY database, which is exact rather than approximate: mpedb refuses every
+//! statement that could put anything in a temp schema, so there is none to
+//! lose (`is_temp`). Everything else — an ATTACHed name — is refused by name.
 
 use crate::consts::*;
 use crate::{conn, register_shim_builtins, Sqlite3};
@@ -65,15 +72,29 @@ pub struct Sqlite3Backup {
 }
 
 /// Resolve a schema name argument. sqlite names the source/destination schema
-/// (`"main"`, `"temp"`, an ATTACHed name); mpedb has exactly one — the file —
-/// so `main` (and the empty/NULL spelling CPython never sends) is the only name
-/// that resolves, and every other one is refused BY NAME rather than silently
-/// backing up the wrong database.
+/// (`"main"`, `"temp"`, an ATTACHed name); mpedb's file is `main`, and that
+/// (with the empty/NULL spelling CPython never sends) is the only name that
+/// resolves to it. An ATTACHed name is refused BY NAME rather than silently
+/// backing up the wrong database; `temp` is handled separately below.
 unsafe fn is_main(name: *const c_char) -> bool {
     match crate::c_str_opt(name) {
         None => true,
         Some(s) => s.is_empty() || s.eq_ignore_ascii_case("main"),
     }
+}
+
+/// Is this the `temp` schema? Every sqlite connection has one, always — so
+/// `backup(..., name='temp')` is not an error there, and must not be one here.
+///
+/// mpedb has no temp database and REFUSES every statement that would put
+/// something in one: `CREATE TEMP TABLE`/`VIEW`/`TRIGGER`/`INDEX` all fail to
+/// parse. So mpedb's temp schema is not "unknown", it is provably **empty**,
+/// and the exact copy of it is an empty database — which is what
+/// `crate::open_blank_database` produces. That is an *agreement* with sqlite
+/// (an empty temp backs up to an empty database), not a widening: there is no
+/// state a caller could have put in temp for this to lose.
+unsafe fn is_temp(name: *const c_char) -> bool {
+    crate::c_str_opt(name).is_some_and(|s| s.eq_ignore_ascii_case("temp"))
 }
 
 unsafe fn schema_name(name: *const c_char) -> String {
@@ -107,9 +128,18 @@ pub unsafe extern "C" fn sqlite3_backup_init(
         return fail(d, SQLITE_ERROR, "source and destination must be distinct".into());
     }
     if !is_main(dst_name) {
-        return fail(d, SQLITE_ERROR, format!("unknown database {}", schema_name(dst_name)));
+        // `temp` exists but is not a place mpedb can be written INTO: there is
+        // no temp schema to serve the copy back out of afterwards, so accepting
+        // it would silently discard the backup. Refused with the reason.
+        let msg = if is_temp(dst_name) {
+            "cannot back up INTO temp: mpedb has no temp database".to_string()
+        } else {
+            format!("unknown database {}", schema_name(dst_name))
+        };
+        return fail(d, SQLITE_ERROR, msg);
     }
-    if !is_main(src_name) {
+    let src_temp = is_temp(src_name);
+    if !is_main(src_name) && !src_temp {
         return fail(d, SQLITE_ERROR, format!("unknown database {}", schema_name(src_name)));
     }
     if d.readonly {
@@ -126,7 +156,27 @@ pub unsafe extern "C" fn sqlite3_backup_init(
     let dest_path = d.path.clone();
     // Borrow the source only for the capture: `conn` hands out a &mut, and the
     // destination borrow above is still live.
-    let capture = {
+    let capture = if src_temp {
+        // The source is `temp`, which is empty by construction (`is_temp`):
+        // capture a blank database instead of the source connection's file.
+        // The source connection is still validated, because sqlite validates it
+        // too — a closed or mid-write source is an error whatever the schema.
+        let Some(s) = conn(src) else {
+            return fail(d, SQLITE_ERROR, "source is not an open database".into());
+        };
+        if s.txn.is_some() {
+            return fail(d, SQLITE_BUSY, "source database is locked".into());
+        }
+        match crate::open_blank_database() {
+            Ok((blank, path)) => {
+                let img = blank.backup_capture(&dest_path);
+                drop(blank);
+                let _ = std::fs::remove_file(&path);
+                img
+            }
+            Err(e) => return fail(d, SQLITE_ERROR, format!("backup failed: {e}")),
+        }
+    } else {
         let Some(s) = conn(src) else {
             return fail(d, SQLITE_ERROR, "source is not an open database".into());
         };

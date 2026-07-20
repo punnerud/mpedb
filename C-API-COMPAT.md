@@ -1357,7 +1357,7 @@ codes/messages, blob/backup surfaces).
 | E7 | 6 | **Host AGGREGATES are single-argument** — the plan carries one arg per DESIGN-UDF stage 2; CPython registers 2-arg checktype aggregates. | `create_aggregate("f", 2, C)` then `select f(a, b) …` → "takes exactly one argument" |
 | E8 | **FIXED (#109, 2026-07-19)** | ~~First-compile of a NEW statement text needs the writer lock~~ → under a busy policy, plan-registry publication is OPPORTUNISTIC (one immediate-deadline attempt; a held lock — including a same-thread sibling's — skips the insert and keeps the plan in the local cache, exactly like the host-UDF plan path). All 5 `TransactionTests.*_starts_transaction` tests pass; readers proceed under a writer. | |
 | E9 | **3 of 4 FIXED (2026-07-20)**, 1 by design | `INSERT OR ROLLBACK` works: mpedb's parser refuses it by name (a statement cannot abort the transaction containing it), and the SHIM — which owns the connection — runs it as `OR ABORT` and rolls back on a `SQLITE_CONSTRAINT` result. `OR FAIL` now refuses by name over a MULTI-row source (its "keep the earlier rows" semantics is unexpressible in an atomic statement) and is accepted for a single-row one, where FAIL == ABORT exactly. The per-constraint `… ON CONFLICT <action>` clause parses on column and table constraints; `ABORT` names mpedb's own behaviour and is accepted, the other four **refuse by name** — the schema carries no per-constraint action, and a swallowed `ON CONFLICT IGNORE` turns "skipped" into "raised". That refusal is the 1 remaining test (`test_on_conflict_rollback`); closing it needs the action in the schema. | `crates/mpedb/tests/insert_or.rs`, `capi.rs::insert_or_rollback_aborts_the_transaction_only_on_a_conflict` |
-| E10 | 4 (1 fixed) | **iterdump surface.** `test_unorderable_row` passes and `iterdump()` of a table-only database is byte-identical to stock. The other 4: 2 × AUTOINCREMENT + `sqlite_sequence` (deliberate refusal), 1 × fts4 (deliberate — fts5 only), and `test_table_dump`, which now gets as far as `CREATE TRIGGER` inside CPython's implicit transaction (mpedb refuses trigger/view DDL inside a transaction) and would then still diff, because the `sqlite_master.sql` column is RECONSTRUCTED from the schema, not the caller's original text. Verbatim DDL is the same engine gap as E3's verbatim decltypes. Index/view/trigger rows are absent from `sqlite_master` for the same reason (their names/DDL are not in the schema bundle the shim can see). | `capi.rs::sqlite_master_evaluator_takes_the_iterdump_query_shape` |
+| E10 | 3 (2 fixed) | **iterdump surface.** `test_unorderable_row` passes, and since 2026-07-20 the `sqlite_master.sql` column is the caller's OWN `CREATE TABLE` text, not a reconstruction: `iterdump()` is now byte-identical to stock over the shapes in `dumptext.py` (bare, quoted, doubled-quote identifiers, generated columns, odd spacing, trailing comment). ~~Verbatim DDL is an engine gap~~ — it is a shim record in the catalog sys-keyspace (`introspect::DDL_NS`), fingerprinted so a shape change falls back to the reconstruction. The remaining 3: 2 × AUTOINCREMENT + `sqlite_sequence` (deliberate refusal), 1 × fts4 (deliberate — fts5 only). `test_table_dump` is still blocked one layer earlier — mpedb refuses trigger/view DDL inside a transaction, and CPython has one open by then. Index/view/trigger ROWS are still absent from `sqlite_master`: the same record could carry them, but it would change what Django's `get_constraints` reads and that is not measurable inside this task. | `capi.rs::sqlite_master_returns_the_verbatim_create_table` |
 | E11 | **FIXED (2026-07-20)** | ~~`zeroblob()` absent~~ → present in every position (see the surface table). It also unblocked `ThreadTests`, whose `setUp` inserts `zeroblob(1)`. | |
 | E12 | 2 of 4 FIXED | `==` and unquoted identifier bytes ≥ 0x80 now lex (with them, comments ANYWHERE — the tokenizer had none at all, so `select 7 -- c` lexed as `7 - (-c)`). Left: bare `current_timestamp` (mpedb has no clock functions at all — no `datetime`/`date`/`current_*`; adding non-deterministic built-ins to content-hashed plans is a design question, not a parser fix) and the partial index `CREATE INDEX … WHERE`. | `crates/mpedb-sql/src/token.rs` tests |
 | E13 | **FIXED (2026-07-20)** | ~~Unquoted table names are case-SENSITIVE~~ → every identifier now folds ASCII case, sqlite's rule: tables, columns, aliases, CTE/view/trigger names, index columns, `USING`/`NATURAL`, and the dup checks (`CREATE TABLE t(a, A)` is refused, as sqlite refuses it). Measured against the bundled oracle, which corrected two guesses: **quoting does NOT protect case** (`"T"` == `t`; `t("a","A")` is a duplicate) and folding is **ASCII-ONLY** (`Æ`≠`æ`, `k`≠`K`(U+212A), `i`≠`İ` — a Unicode fold would have merged names sqlite keeps apart). Names are stored and reported in their DECLARED spelling, so `cursor.description` is unchanged. | `crates/mpedb/tests/ident_case.rs` (20 differential tests) |
@@ -2186,6 +2186,12 @@ shape (`crafted_alia$.id`) does not hit it.
 > of this file**: `d83c21d` on the Apple M3, Django A **826/831**, `queries`
 > **490/493** and CPython **450/474** — the `03ff5ea` run plus `f27f2b6`'s +2 in
 > `queries` and nothing else.
+>
+> **For CPython only, the last section of this file supersedes it**: "AT HEAD —
+> the shim-side CPython closures", a controlled before/after on the Linux box at
+> `b598052` in an isolated worktree, closing `test_deserialize_corrupt_database`
+> and (on a 3.12.12 interpreter) `test_dump_custom_row_factory`. Django is
+> unchanged and unmeasured there.
 
 ## The consolidated measurement — Django run 7 + CPython, ONE commit (2026-07-20)
 
@@ -2864,3 +2870,197 @@ WB_GROUP_BASE=3 WB_LABEL_GROUPS=$'queries\nbackends\nmodel_fields' … run_suite
 /usr/bin/env DYLD_LIBRARY_PATH=$WB_OUT/shim python3.12 -m test test_sqlite3 \
   --junit-xml=shim.xml                                                   # CPython
 ```
+
+---
+
+## AT HEAD — the shim-side CPython closures (2026-07-20, Linux box)
+
+**This supersedes the CPython half of the section above.** The M3 run measured
+`03ff5ea`; this one measures `b598052` (`main`) plus one shim-only change, and
+it is a *controlled* before/after: both arms were built from an **isolated git
+worktree with its own `CARGO_TARGET_DIR`**, because the shared `target/` on this
+box is rebuilt by other agents from their own in-progress trees. An earlier
+attempt without that isolation credited this change with a test that was
+actually closed by `b598052`'s identifier-case fix (E13) landing between the two
+runs — recorded here because it is exactly the class of mistake the
+interposition self-check does not catch.
+
+**Machine: the Linux dev box** (2 cores, 7 GB), **CPython 3.12.3**, baseline
+**libsqlite3 3.45.1**. Denominator is CPython 3.12.3's `test_sqlite3` with
+3.12.12's `test_dump.py` dropped in — its only difference from 3.12.3's is
+`test_dump_custom_row_factory`, so the file can be swapped wholesale.
+
+### Interposition proof
+
+```
+interposition  stock: 3.45.1
+interposition  shim : 3.45.0
+```
+
+Both arms are the same `python3.12 -m test test_sqlite3 -v`, differing only in
+`LD_PRELOAD`. Corroborated by content: the shim arm's failures carry mpedb's own
+wording (`SQL parse error at byte 53: AUTOINCREMENT is not supported — mpedb
+keeps no persisted rowid high-water counter …`, `unsupported: CREATE/DROP VIEW,
+POLICY or TRIGGER … are not supported inside a transaction`), which no
+libsqlite3 emits.
+
+### The numbers
+
+| arm | ran | pass | FAIL | ERROR | skip |
+|---|---|---|---|---|---|
+| stock libsqlite3 3.45.1 | 467 | 461 | 0 | 1 | 5 |
+| shim @ `b598052` | 467 | **446** | 4 | 12 | 5 |
+| **shim + this change** | 467 | **447** | **3** | 12 | 5 |
+
+**The single failing-id difference between the two shim arms is
+`test_deserialize_corrupt_database`.** Every other id is identical, one for one.
+
+**Stock's 1 ERROR is `test_dump_custom_row_factory`, and it is an interpreter
+artifact, not a library one:** 3.12.3's `Lib/sqlite3/dump.py` predates the
+gh-118221 row-factory fix, so the test errors under *stock libsqlite3 too*
+(`no such table: name`). It is therefore **unrunnable on this box in either
+arm**, and the thing it asserts — the DDL text `iterdump()` emits — is measured
+directly instead, differentially, below. On the M3's 3.12.12 interpreter (the
+474-test denominator of the section above) it is a real test and this change is
+what closes it.
+
+### Closed here (shim-side, no engine change)
+
+| test | was | now |
+|---|---|---|
+| `test_dbapi.SerializeTests.test_deserialize_corrupt_database` | FAIL — `deserialize is not supported by mpedb` vs the asserted `file is not a database` | **pass** |
+| `test_dump.DumpTests.test_dump_custom_row_factory` | the `sqlite_master.sql` text was a reconstruction | **the text now matches stock byte for byte** (unrunnable here; see above) |
+
+**1. Verbatim `CREATE TABLE` text (`introspect::DDL_NS`).** The shim files the
+caller's own statement in the catalog's sys-keyspace when a `CREATE TABLE`
+succeeds, and `sqlite_master.sql` hands it back. Three things make this an
+*agreement* rather than a widening:
+
+* It is stored **with a fingerprint** — the reconstruction as it stood at
+  record time. `sqlite_master` re-derives `create_ddl` from the live table and
+  uses the recorded text only when the two still agree. An `ALTER TABLE ADD`/
+  `DROP`/`RENAME COLUMN`, or a `RENAME TO` that moves the table off the key,
+  falls straight back to the reconstruction. An *almost* right `CREATE TABLE`
+  replays as a DIFFERENT table, which is worse than a canonical one.
+* It reproduces **sqlite's actual rule**, which is not "the raw bytes":
+  `sqlite3EndTable` builds `"CREATE TABLE " + <text from the NAME token>`.
+  Verified against 3.45, and four of the five cases were not guessable —
+  `create table t3(a)` → `CREATE TABLE t3(a)` (head uppercased),
+  `CREATE  TABLE  t2 ( a )` → `CREATE TABLE t2 ( a )` (head re-spaced, tail
+  kept), `CREATE TABLE IF NOT EXISTS t4(a)` → `CREATE TABLE t4(a)`,
+  `CREATE TABLE main.t5(a)` → `CREATE TABLE t5(a)`, and
+  `CREATE TABLE t9(a) -- c` → `CREATE TABLE t9(a)` (the text ends at the last
+  TOKEN, so a `;` inside a string literal is not a terminator).
+* It still **elides the hidden implicit rowid** (#94) — trivially, since the
+  caller never wrote one; and the reconstruction path, which had to elide it
+  deliberately, is still exercised by the fallback test.
+
+Differential evidence, since the CPython test cannot run here — six DDL shapes,
+`list(cx.iterdump())` under stock and under the shim:
+
+```
+$ diff dt_stock.txt dt_shim.txt && echo IDENTICAL
+IDENTICAL
+```
+
+(before this change the shim answered `CREATE TABLE "test" ("t");` where stock
+answers `CREATE TABLE test(t);`.)
+
+**Recorded gap:** only **autocommit** `CREATE TABLE`s are recorded. The
+fingerprint needs the table the statement just made, and the facade exposes no
+session-scoped schema view (`Database::schema()` is the committed one), so
+inside an open transaction there is nothing to resolve against — and pairing a
+live table's fingerprint with text that a savepoint might have rolled back is
+precisely the almost-right statement above. Those tables keep the
+reconstruction, which is what they had before. **Engine ask: `WriteSession::schema()`.**
+
+**2. `sqlite3_deserialize` tells its two refusals apart.** Bytes that are not a
+database image now get sqlite's own `SQLITE_NOTADB` / `file is not a database`;
+a plausible mpedb image still gets `deserialize is not supported by mpedb`. The
+first is not a claim to have implemented anything — those bytes *are* not a
+database, which is exactly what sqlite reports about them — and the gap is
+still stated where the gap is what is true.
+
+**3. `backup(..., name='temp')` succeeds, copying an EMPTY database.** Every
+sqlite connection has a temp schema, so refusing it with `unknown database
+temp` was simply wrong. mpedb refuses every statement that could put anything
+in one (`CREATE TEMP TABLE`/`VIEW`/`TRIGGER`/`INDEX` all fail to parse), so its
+temp schema is provably empty and an empty image is the exact copy of it, not
+an approximation. Differentially identical to stock (same success, same empty
+resulting schema, same `unknown database non-existing` for a bogus name).
+`temp` as a *destination* is still refused, now with the real reason
+(`cannot back up INTO temp: mpedb has no temp database`) instead of the wrong
+one. **This closes no test**: `test_backup.test_database_source_name` goes on
+to `ATTACH DATABASE ':memory:' AS attached_db` + `CREATE TABLE attached_db.foo`,
+and both are engine-side (below).
+
+### Engine-side, with what each one needs
+
+| test(s) | the wall | the ask |
+|---|---|---|
+| `test_backup.test_database_source_name` | `ATTACH ':memory:'` is refused (`multifile.rs`), and `CREATE TABLE attached_db.foo` does not parse (`SQL parse error at byte 24: expected (`) | a schema-qualified name in `CREATE TABLE`, and an ATTACH target that can be an anonymous in-memory database |
+| `test_dump.test_dump_autoincrement`, `…_create_new_db` | `AUTOINCREMENT is not supported` — deliberate, `parser/ddl.rs` | none; the position is documented and the tests also need `sqlite_sequence` |
+| `test_dump.test_table_dump` | `CREATE/DROP VIEW, POLICY or TRIGGER … are not supported inside a transaction` (`mpedb/src/lib.rs`) — CPython has an implicit transaction open by then | view/trigger DDL that can ride a `WriteSession`. Even then the test needs `sqlite_master` rows for triggers and views, which is shim work on top |
+| `test_regression.test_on_conflict_rollback` | `ON CONFLICT ROLLBACK` on a UNIQUE constraint is refused by the parser | a per-constraint conflict action in the schema; the shim already owns the connection-level rollback (`rewrite_insert_or_rollback`) and could drive it if the clause parsed |
+| `test_types.test_cursor_description_cte_simple` | `with one as (select 1) select * from one` — a FROM-less CTE body with a computed projection cannot be flattened | planner |
+| `test_hooks.test_trace_too_much_expanded_sql` | `select 1 as a where a=?` — an output alias in `WHERE` (E14) | binder |
+| `test_userfunctions.test_func_deterministic` | `CREATE INDEX … WHERE` — partial indexes are not parsed | parser + index |
+| `test_dbapi.ConnectionTests.test_connection_config` | needs `SQLITE_DBCONFIG_ENABLE_FKEY` to actually ENFORCE foreign keys | FK enforcement (D11). Echoing the flag without enforcing is the D10/D11 lie |
+| `test_regression.test_error_msg_decode_error` | `'xxx' \|\| ?` with a non-UTF-8 blob parameter | structural: `Value::Text` is a Rust `String`, so mpedb cannot produce the invalid-UTF-8 text the test decodes |
+
+### Judged out of scope, with the reason
+
+* **`test_dump.test_dump_virtual_tables` (fts4).** The refusal is already the
+  right answer and already precise (it names fts4 and says why). Accepting
+  fts4 would not close the test either: it asserts sqlite's fts3/4 **shadow
+  table layout** (`test_content`, `test_segdir`, `test_segments`, `test_stat`,
+  `test_docsize`) round-tripping through `PRAGMA writable_schema` and
+  `INSERT INTO sqlite_master`. That is fts4's on-disk decomposition, a
+  documented non-goal.
+* **`test_dbapi.SerializeTests.test_serialize_deserialize`.** `serialize()`'s
+  contract is *the content of the database file*, and consumers treat the
+  result as an interchangeable sqlite image. Returning mpedb pages under that
+  name would be a **differ**, not an agreement — the exact thing the rule
+  forbids — and the round trip the test performs would then pass while the
+  bytes lie about what they are. The refusal stays.
+* **`test_backup.test_progress` / `test_modifying_progress`.** Both encode
+  *sqlite's page count*: `pages=1` must take exactly 2 steps on a 2-page
+  database, and a write during the copy must be picked up by a restart. mpedb
+  pre-reserves its file, so its page count is the geometry (4096), and its
+  capture is one instant under the writer lock with nothing to restart. Both
+  deviations are stated in `backup.rs`'s module doc and neither can be made to
+  agree without lying about the copy.
+* **`sqlite_master` rows for indexes, views and triggers.** The verbatim record
+  added here could carry them, and a dump that loses indexes replays into a
+  different schema, so this is a real gap. It is left because it changes what
+  Django's `get_constraints` reads (`SELECT sql, type FROM sqlite_master WHERE
+  tbl_name = %s AND type IN ('table','index')`), and re-measuring Django's
+  2,176 tests was not possible inside this task. Recorded, not taken.
+
+### Two engine findings surfaced while measuring
+
+* **`ALTER TABLE … ADD COLUMN` is broken on a hidden-rowid table** (#94):
+  `CREATE TABLE "alpha" ("one")` then `ALTER TABLE "alpha" ADD COLUMN two TEXT`
+  → `schema error: table 'alpha' has implicit_rowid set but its last column is
+  not a NOT-NULL Int64 'rowid' sole primary key`. The new column is appended
+  *after* the hidden rowid. Tables with an explicit PK alter fine.
+* **The schema the shim introspects is refreshed lazily.** A `sqlite_master` or
+  `PRAGMA table_info` query issued immediately after a `COMMIT` that created a
+  table does not see it; the next statement makes it visible. Pre-existing and
+  orthogonal to anything here, but it is why
+  `sqlite_master_returns_the_verbatim_create_table` runs an `INSERT` before its
+  post-commit assertion.
+
+### Reproduction
+
+```
+git worktree add /mnt/xfs/capi-wt --detach HEAD
+CARGO_TARGET_DIR=/mnt/xfs/capi-wt-target cargo build --release -p mpedb-capi
+crates/mpedb-capi/workbench/../../../…/run_wt.sh wt-before   # baseline arm
+# copy crates/mpedb-capi/{src,tests} in, rebuild, then:
+run_wt.sh wt-after ; diff wt-before/ids.txt wt-after/ids.txt
+```
+
+where `run_wt.sh` is `LD_PRELOAD=$SO PYTHONPATH=$LIB python3.12 -m test
+test_sqlite3 -v` against the stock arm of the same command, with
+`ulimit -v 3000000` and `/dev/shm/mpedb-*` cleaned between arms.
