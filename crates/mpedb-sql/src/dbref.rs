@@ -505,10 +505,7 @@ fn collect_cte_names(toks: &[SpTok], head: usize) -> HashSet<String> {
     if toks.get(i).is_some_and(|t| is_word(&t.tok, "RECURSIVE")) {
         i += 1;
     }
-    loop {
-        let Some(name) = toks.get(i).and_then(|t| ident_of(&t.tok)) else {
-            break;
-        };
+    while let Some(name) = toks.get(i).and_then(|t| ident_of(&t.tok)) {
         names.insert(name.to_string());
         i += 1;
         // Optional column list.
@@ -748,9 +745,7 @@ fn three_part_edits(
 ) -> Result<()> {
     let mut in_ref = vec![false; toks.len()];
     for r in refs {
-        for k in r.start..=r.name_idx {
-            in_ref[k] = true;
-        }
+        in_ref[r.start..=r.name_idx].fill(true);
     }
     let mut i = 0;
     while i + 4 < toks.len() {

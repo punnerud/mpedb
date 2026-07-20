@@ -268,6 +268,16 @@ fn differential_cross_file_selects() {
         "SELECT x + y FROM other.u WHERE y IS NOT NULL ORDER BY x",
         // third-db bare name (only in third)
         "SELECT note FROM w ORDER BY k",
+        // unaliased row-name qualifier (probe P5c: `u.` works for other.u)
+        "SELECT u.y FROM other.u WHERE u.x = 2",
+        // derived table over an attached table
+        "SELECT q.y FROM (SELECT x, y FROM other.u) q WHERE q.x >= 2 ORDER BY q.x",
+        // CTE body reading an attached table
+        "WITH c AS (SELECT x, y FROM other.u) SELECT c.y FROM c WHERE c.x = 2",
+        // UNION ALL keeps duplicates across files
+        "SELECT y FROM other.u WHERE y IS NOT NULL UNION ALL SELECT val FROM s ORDER BY 1",
+        // LEFT JOIN anti-join shape
+        "SELECT t.a FROM t LEFT JOIN other.u u ON u.x = t.a WHERE u.x IS NULL ORDER BY t.a",
     ] {
         assert_same(&f, sql);
     }
