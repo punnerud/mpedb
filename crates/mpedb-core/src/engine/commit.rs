@@ -6,8 +6,46 @@ use super::*;
 /// have been the source of at least one false A/B here already).
 fn msync_per_run() -> bool {
     static ON: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("MPEDB_MSYNC_PER_RUN").is_ok());
+        std::sync::LazyLock::new(|| std::env::var("MPEDB_MSYNC_PER_RUN").is_ok_and(|v| v == "1"));
     *ON
+}
+
+/// `MPEDB_MSYNC_SPAN=1` forces the span arm on a platform where it is NOT the
+/// default (i.e. not Linux), so the pair stays measurable everywhere. Presence
+/// alone is not enough — `=0` must mean off, or a benchmark script that spells
+/// "disabled" that way silently selects the arm it meant to exclude.
+fn msync_span_forced() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("MPEDB_MSYNC_SPAN").is_ok_and(|v| v == "1"));
+    *ON
+}
+
+/// Is the one-span data barrier the right shape on THIS platform?
+///
+/// **Linux only, and the asymmetry is the whole point.** `msync(MS_SYNC)` on
+/// Linux IS `vfs_fsync_range`, so N runs cost N device flushes and collapsing
+/// them to one span is worth 41–63 %. On Darwin `msync` is `vm_object_sync`
+/// over the range — it costs RANGE WIDTH, not dirty-page count — and the device
+/// flush is the separate `F_FULLFSYNC` in `sync_barrier`. There the per-run loop
+/// is ALREADY at §4.1's two-flush floor, and a span is a pure loss that scales
+/// with the file: measured on an M3 Pro / APFS, a 1 GiB span costs 2,403 µs
+/// against 312 µs for 4 MiB, and end-to-end durable inserts went **+10 % at
+/// 300 MiB of live data and +63 % at 1.2 GiB**.
+///
+/// That number is not a corner case. `strace` on Linux shows the span is
+/// typically the WHOLE live data region (329 MiB on a 3 GiB file) on nearly
+/// every commit, because the allocator hands out the lowest reusable pages
+/// while the hot btree leaf sits near the high-water mark. On Linux that is
+/// free; on Darwin it is the bill.
+///
+/// #41 was the same mistake mirrored: a barrier removed from this loop, correct
+/// on macOS, a no-op on Linux, never re-measured on Linux. A durability change
+/// must be measured on every platform it compiles for.
+fn span_data_barrier() -> bool {
+    if msync_per_run() {
+        return false;
+    }
+    cfg!(target_os = "linux") || msync_span_forced()
 }
 
 impl<'e> WriteTxn<'e> {
@@ -175,10 +213,12 @@ impl<'e> WriteTxn<'e> {
                 // RUNS, so `commit` paid ~3.8 device flushes where §4.1's floor
                 // is 2 (data, then meta).
                 //
-                // Widening the range costs nothing: writeback is driven by the
-                // page cache's DIRTY tag, so a span walks dirty pages, not
-                // pages. Measured (8 pages scattered over 32 MiB vs over
-                // 400 KiB): no difference beyond noise. What the span may sweep
+                // Widening the range costs nothing ON LINUX: writeback is
+                // driven by the page cache's DIRTY tag, so a span walks dirty
+                // pages, not pages. Measured (8 pages scattered over 32 MiB vs
+                // over 400 KiB): no difference beyond noise. That is a LINUX
+                // statement and nothing more — see `span_data_barrier` for why
+                // Darwin gets the per-run loop instead. What the span may sweep
                 // in that the run loop would not is (a) COW pages of an ABORTED
                 // txn — unreferenced garbage, harmless to write, and (b)
                 // nothing else: the writer lock is exclusive, readers never
@@ -191,8 +231,9 @@ impl<'e> WriteTxn<'e> {
                 // (DESIGN-BLOBEXTENT §4, review finding 1).
                 //
                 // `MPEDB_MSYNC_PER_RUN=1` restores the historical per-run loop
-                // so both arms live in ONE binary for A/B measurement.
-                if msync_per_run() {
+                // and `MPEDB_MSYNC_SPAN=1` forces the span where it is not the
+                // default, so both arms live in ONE binary on EVERY platform.
+                if !span_data_barrier() {
                     for &(start, npages) in &self.extent_dirty {
                         self.eng.shm.msync_range_nobarrier(
                             start as usize * PAGE_SIZE,
@@ -227,7 +268,14 @@ impl<'e> WriteTxn<'e> {
                         hi = hi.max(id);
                     }
                     if lo != u64::MAX {
-                        debug_assert!(lo >= 2, "dirty span must never reach the meta pages (0/1)");
+                        // Not `lo >= 2`: that admits the lock page, the reader
+                        // table and the whole intent ring, so it would not fire
+                        // on the corruption class it exists to catch.
+                        debug_assert!(
+                            lo >= self.eng.shm.data_start,
+                            "dirty span must stay in the data region (>= {}), got {lo}",
+                            self.eng.shm.data_start
+                        );
                         self.eng.shm.msync_range_nobarrier(
                             lo as usize * PAGE_SIZE,
                             (hi - lo + 1) as usize * PAGE_SIZE,

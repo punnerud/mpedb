@@ -466,9 +466,34 @@ arms interleaved in one loop, p50 µs):
 | 512 MiB | 2,963 | 5,583 |
 | **1,023 MiB** | **2,990** | **5,497** |
 
-**256× wider costs nothing** — flat from 64 MiB to 1 GiB on both filesystems.
-(The 4 MiB arm being the *slowest* is the tell that this is not a range scan at
-all.) So the span carries no hidden cost, which is what the change bets on.
+**256× wider costs nothing ON LINUX** — flat from 64 MiB to 1 GiB on both
+filesystems. (The 4 MiB arm being the *slowest* is the tell that this is not a
+range scan at all. Caveat on that tell: the part-2 arms run in fixed ascending
+width order within an iteration, which is a plausible alternative explanation;
+it does not affect the flat 64 MiB → 1 GiB result.) So on Linux the span carries
+no hidden cost, which is what the change bets on.
+
+⚠ **And that bet is Linux-only — this section was very nearly the same mistake
+it diagnoses.** On Darwin `msync` is `vm_object_sync` over the range: it costs
+range WIDTH, and the device flush is the separate `F_FULLFSYNC`. Measured on an
+M3 Pro / APFS, same probe, msync only:
+
+| span | 4 MiB | 64 MiB | 512 MiB | 1,023 MiB |
+|---|--:|--:|--:|--:|
+| Darwin | 312 µs | 493 µs | 1,544 µs | **2,403 µs** |
+
+End-to-end, 300 durable autocommit inserts per arm, paired: the span is **+10 %
+slower at ~300 MiB of live data and +63 % at ~1.2 GiB**, and it scales, because
+`strace` shows the span is typically the WHOLE live data region on nearly every
+commit — the allocator hands out the lowest reusable pages while the hot btree
+leaf sits near the high-water mark. On macOS the per-run loop was ALREADY at
+§4.1's two-flush floor, so the span is pure loss there.
+
+**The data barrier is therefore `cfg`-gated: one span on Linux, per-run
+elsewhere**, with `MPEDB_MSYNC_PER_RUN=1` / `MPEDB_MSYNC_SPAN=1` keeping both
+arms measurable on both. Found by the commit-path review, not by the suite —
+nothing in `cargo test` or the crash harness detects a platform-specific
+slowdown.
 
 **Paired arms, one binary, alternating, `examples/mp_writes` on ext4,
 `durability = commit`. Two independent sessions**, because this file's own rule

@@ -358,7 +358,9 @@ sketch, both review/stress-hardened:
   free choice of linearization within one meta flip — slot order was already arbitrary
   w.r.t. arrival (enqueue scans from a pid-randomized offset) — chosen so adjacent-key
   mutations share COW root-to-leaf paths: fewer pages copied per batch, fewer/shorter
-  msync runs. `MPEDB_NO_BATCH_ROUTING=1` (alias `MPEDB_RING_NO_SORT=1`) restores slot
+  msync runs (a rationale #111 made moot for `commit` on Linux, where the data
+  barrier is now ONE span regardless of run count — the sort is retained for
+  deterministic batch linearization, per DESIGN-MPEE-OPT §5). `MPEDB_NO_BATCH_ROUTING=1` (alias `MPEDB_RING_NO_SORT=1`) restores slot
   order for A/B; `MPEDB_RING_STATS=1` prints per-batch page/run/timing lines. Each
   intent executes under a **statement savepoint** (`WriteTxn::savepoint`/`rollback_to` —
   COW makes these nearly free), so one failing intent errors alone while the batch
@@ -409,12 +411,12 @@ sketch, both review/stress-hardened:
 - **`wal`** (BUILT): same durability guarantee as `commit` — a commit is acknowledged
   only after it is power-loss-durable, and readers gate on `durable_txn` identically —
   at a fraction of the cost: one sequential append + ONE `fdatasync` per commit (per
-  BATCH under the intent ring) instead of `commit`'s scattered COW-page msyncs plus a
+  BATCH under the intent ring) instead of `commit`'s data-span msync plus a
   meta-page msync. Full protocol below.
 
 #### 5.4.1 WAL mode (`durability = wal`)
 
-**Motivation (measured).** `commit` msyncs every dirty COW page run plus the meta page
+**Motivation (measured).** `commit` msyncs the dirty data plus the meta page
 per commit: 485–1,122 durable ops/s on this host's disk vs SQLite-WAL 1,492–1,647 and
 PostgreSQL 2,182–4,588 (`crates/mpedb-bench/RESULTS.md`). A sequential log turns the
 per-commit disk work into one contiguous write + one flush, and the intent ring
@@ -494,7 +496,7 @@ to a commit that was never acknowledged.
 **Group commit.** The intent ring engages for `wal` exactly as for `commit`
 (`ring_enabled`): a contended batch costs one record and one `fdatasync` total, and the
 batch size self-clocks with media latency (§5.3). This is where the log shines — the
-fdatasync is both cheaper than `commit`'s scattered msyncs and amortized N ways.
+fdatasync is both cheaper than `commit`'s two-flush floor and amortized N ways.
 
 **EOWNERDEAD recovery** (§5.2 step 1, wal variant): make the mutex consistent, refresh
 `durable_txn` from the newest valid mapping meta, proceed. The `commit`-mode meta-page
@@ -580,6 +582,7 @@ ratios were stable):
 
 Per-batch instrumentation (`MPEDB_RING_STATS`, mixed): commit mode averaged 6.8
 intents / 4.4 dirty pages / **3.2 msync runs + 1 meta msync** per batch at 3,487 µs
+(pre-#111; the data barrier is now one span on Linux, so that row reads 1 + 1)
 commit cost; wal averaged 7.1 intents / 4.6 pages / **1 fdatasync** at 1,345 µs —
 batches/s rose 280 → 709. The 3× target was approached but not met on this
 contended host (2.65× median, 2.8× best); in absolute terms wal-mode durable DML
