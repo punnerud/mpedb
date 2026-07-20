@@ -3420,3 +3420,43 @@ fn a_backup_keeps_the_destinations_registered_functions() {
         sqlite3_close(src);
     }
 }
+
+/// `SQLITE_LIMIT_FUNCTION_ARG` is enforced at prepare, with sqlite's message —
+/// and, because the count is read out of the SQL TEXT, the guards that keep it
+/// from mistaking a column list or an `IN`/`VALUES` list for a call.
+#[test]
+fn function_arg_limit_counts_calls_and_nothing_else() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE t (a INTEGER PRIMARY KEY, b INTEGER, c INTEGER)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO t (a, b, c) VALUES (1, 2, 3)"), SQLITE_OK);
+        // Default limit: nothing is counted at all.
+        assert_eq!(scalar_count(db, "SELECT max(a, b, c) FROM t"), 3);
+
+        let prior = sqlite3_limit(db, SQLITE_LIMIT_FUNCTION_ARG, 1);
+        assert_eq!(prior, 127, "sqlite's compile-time default");
+        // One argument is fine; two is not.
+        assert_eq!(scalar_count(db, "SELECT abs(-1) FROM t"), 1);
+        let s = cs("SELECT max(a, b) FROM t");
+        let mut st: *mut Stmt = ptr::null_mut();
+        assert_eq!(
+            sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+            SQLITE_ERROR
+        );
+        assert_eq!(errmsg(db), "too many arguments on function max");
+
+        // NOT calls, even under the lowered limit: a VALUES tuple, an IN list,
+        // a column list on a table whose NAME is a function's, and commas
+        // inside a string literal.
+        assert_eq!(exec(db, "INSERT INTO t (a, b, c) VALUES (4, 5, 6)"), SQLITE_OK);
+        assert_eq!(scalar_count(db, "SELECT count(*) FROM t WHERE a IN (1, 4)"), 2);
+        assert_eq!(exec(db, "CREATE TABLE max (x INTEGER PRIMARY KEY, y INTEGER)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO max (x, y) VALUES (1, 2)"), SQLITE_OK);
+        // Commas inside a string literal are invisible to the scan.
+        assert_eq!(scalar_count(db, "SELECT length('a,b,c') FROM t WHERE a = 1"), 5);
+
+        sqlite3_limit(db, SQLITE_LIMIT_FUNCTION_ARG, prior);
+        assert_eq!(scalar_count(db, "SELECT max(a, b) FROM t WHERE a = 1"), 2);
+        sqlite3_close(db);
+    }
+}

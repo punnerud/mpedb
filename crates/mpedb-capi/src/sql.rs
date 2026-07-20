@@ -588,6 +588,100 @@ pub fn scan_params(sql: &str) -> ParamScan {
     }
 }
 
+/// The widest argument count of any FUNCTION CALL in `sql`, with the name that
+/// carried it — `None` when the statement calls no function this shim can
+/// recognize.
+///
+/// This exists for one job: `SQLITE_LIMIT_FUNCTION_ARG`, which sqlite enforces
+/// in its parser ("too many arguments on function <name>"). The shim has no
+/// parse tree at that point, so it counts from the text — and the danger of
+/// counting from text is calling something a function that is not one:
+/// `VALUES (1,2)`, `IN (a,b)` and `CREATE TABLE t(a,b)` all read as
+/// `<name>(<list>)`. Two guards make that structurally impossible rather than
+/// merely unlikely:
+///
+/// 1. **`known` decides.** Only a name the connection can actually CALL — a
+///    built-in or a registered host function/aggregate — is counted. `values`,
+///    `in`, a table name and a column list are not functions, so they are never
+///    counted, whatever they look like.
+/// 2. **A preceding `INTO`/`TABLE`/`FROM`/`JOIN`/`UPDATE` disqualifies.** That
+///    covers the one residual shape — a TABLE named like a function
+///    (`insert into max(a,b) …`).
+///
+/// Nesting and strings fall out of the scan: commas are counted only at the
+/// call's own paren depth, and `scan_code` never reports a byte inside a string,
+/// a quoted identifier or a comment, so `f('a,b')` is one argument.
+pub fn max_function_args(sql: &str, known: impl Fn(&str) -> bool) -> Option<(String, usize)> {
+    // Code bytes only, in order: strings/comments are already gone.
+    let mut code: Vec<(usize, u8)> = Vec::new();
+    scan_code(sql, |i, c| code.push((i, c)));
+    let mut worst: Option<(String, usize)> = None;
+    let mut prev_word: Option<String> = None;
+    let mut k = 0usize;
+    while k < code.len() {
+        let (off, c) = code[k];
+        if !(c.is_ascii_alphabetic() || c == b'_') {
+            k += 1;
+            continue;
+        }
+        // One identifier run: contiguous in the ORIGINAL text, so a comment
+        // cannot glue two names into one.
+        let start = k;
+        let mut end = k + 1;
+        while end < code.len()
+            && code[end].0 == code[end - 1].0 + 1
+            && (code[end].1.is_ascii_alphanumeric() || code[end].1 == b'_')
+        {
+            end += 1;
+        }
+        let name: String = code[start..end].iter().map(|&(_, b)| b as char).collect();
+        let lower = name.to_ascii_lowercase();
+        k = end;
+        let _ = off;
+        // The next code byte, whitespace skipped, decides whether this is a call.
+        let mut j = k;
+        while j < code.len() && code[j].1.is_ascii_whitespace() {
+            j += 1;
+        }
+        let opens = j < code.len() && code[j].1 == b'(';
+        let after_name_kw = matches!(
+            prev_word.as_deref(),
+            Some("into") | Some("table") | Some("from") | Some("join") | Some("update")
+        );
+        prev_word = Some(lower.clone());
+        if !opens || after_name_kw || !known(&lower) {
+            continue;
+        }
+        // Count arguments: 0 for `f()`, otherwise 1 + commas at depth 1.
+        let mut depth = 0i32;
+        let mut commas = 0usize;
+        let mut empty = true;
+        let mut p = j;
+        while p < code.len() {
+            match code[p].1 {
+                b'(' => depth += 1,
+                b')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                b',' if depth == 1 => commas += 1,
+                b if !b.is_ascii_whitespace() => empty = false,
+                _ => {}
+            }
+            p += 1;
+        }
+        let args = if empty { 0 } else { commas + 1 };
+        if worst.as_ref().is_none_or(|(_, w)| args > *w) {
+            worst = Some((name, args));
+        }
+        k = j + 1;
+        prev_word = None;
+    }
+    worst
+}
+
 /// `sqlite3_complete`: true if `sql` forms one or more complete statements —
 /// i.e. the last non-blank, non-comment code character is a `;`. Empty or
 /// comment-only input is not complete.
