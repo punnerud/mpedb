@@ -2490,10 +2490,12 @@ fn refusal_stubs_set_handle_error() {
         let main = cs("main");
         // The backup API is REAL now; what still refuses is a schema name mpedb
         // has no equivalent for, and the refusal must land on the DESTINATION.
-        let temp = cs("temp");
-        assert!(sqlite3_backup_init(dst, main.as_ptr(), src, temp.as_ptr()).is_null());
+        // (`temp` is no longer one of those — see
+        // `backup_of_the_temp_schema_is_an_empty_database`.)
+        let other = cs("attached_db");
+        assert!(sqlite3_backup_init(dst, main.as_ptr(), src, other.as_ptr()).is_null());
         let msg = CStr::from_ptr(sqlite3_errmsg(dst)).to_string_lossy().into_owned();
-        assert_eq!(msg, "unknown database temp", "backup errmsg {msg:?}");
+        assert_eq!(msg, "unknown database attached_db", "backup errmsg {msg:?}");
 
         // Incremental blob I/O is REAL now (see the blob_* tests below); what
         // this asserts is only that a FAILING open still leaves its reason on
@@ -3089,13 +3091,106 @@ fn introspection_hides_the_implicit_rowid() {
         assert_eq!(collect_text_col(db, "PRAGMA table_info(\"alpha\")"), ["0"]);
         assert_eq!(collect_text_col(db, "PRAGMA table_info(beta)"), ["0", "1"]);
 
+        // Both come back as the caller wrote them (the verbatim record), which
+        // is what sqlite hands back and never mentions a rowid either.
         assert_eq!(
             collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'alpha'"),
             ["CREATE TABLE \"alpha\" (\"one\")"]
         );
         assert_eq!(
             collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'beta'"),
-            ["CREATE TABLE \"beta\" (\"id\" INTEGER NOT NULL, \"v\" TEXT, PRIMARY KEY (\"id\"))"]
+            ["CREATE TABLE beta (id INTEGER PRIMARY KEY, v TEXT)"]
+        );
+
+        // A RENAME moves the table off the name its recorded text is filed
+        // under, so the answer falls back to the RECONSTRUCTION — and that is
+        // the path this test is really about: it must still elide the hidden
+        // rowid, column AND primary key.
+        assert_eq!(exec(db, "ALTER TABLE \"alpha\" RENAME TO alpha2"), SQLITE_OK);
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'alpha2'"),
+            ["CREATE TABLE \"alpha2\" (\"one\")"]
+        );
+        assert_eq!(collect_text_col(db, "PRAGMA table_info(alpha2)"), ["0"]);
+        // Same for a shape change under an unchanged name: `beta` grows a
+        // column, and the recorded text no longer describes it.
+        assert_eq!(exec(db, "ALTER TABLE beta ADD COLUMN w TEXT"), SQLITE_OK);
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'beta'"),
+            ["CREATE TABLE \"beta\" (\"id\" INTEGER NOT NULL, \"v\" TEXT, \"w\" TEXT, PRIMARY KEY (\"id\"))"]
+        );
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+/// `sqlite_master.sql` is the caller's OWN `CREATE TABLE`, byte for byte —
+/// sqlite stores the statement text, and consumers diff against it (CPython's
+/// `test_dump_custom_row_factory` asserts `iterdump()` re-emits
+/// `CREATE TABLE test(t);` exactly). mpedb's catalog keeps the resolved schema
+/// rather than the bytes, so the shim files the text in the catalog's
+/// sys-keyspace and hands it back — but ONLY while it still describes this
+/// exact shape, because an almost-right `CREATE TABLE` replays as a DIFFERENT
+/// table.
+#[test]
+fn sqlite_master_returns_the_verbatim_create_table() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE test(t);"), SQLITE_OK);
+        // The trailing `;` is not part of what sqlite stores.
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'test'"),
+            ["CREATE TABLE test(t)"]
+        );
+
+        // sqlite does NOT store the raw bytes: it rebuilds the head as the
+        // literal `CREATE TABLE ` and keeps the text from the NAME token on.
+        // So the head is uppercased and re-spaced while the tail is verbatim,
+        // and a trailing comment (not a token) is dropped. All four verified
+        // against sqlite 3.45 — see `introspect::ddl_verbatim`.
+        assert_eq!(
+            exec(db, "-- lead\n  create   table   spaced ( a  int ) ; -- trail"),
+            SQLITE_OK
+        );
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'spaced'"),
+            ["CREATE TABLE spaced ( a  int )"]
+        );
+        // A `;` inside a string literal is not a terminator, and the text runs
+        // to the last real token past it.
+        assert_eq!(exec(db, "CREATE TABLE semi (a TEXT DEFAULT 'x;y')"), SQLITE_OK);
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'semi'"),
+            ["CREATE TABLE semi (a TEXT DEFAULT 'x;y')"]
+        );
+
+        // A DROP forgets the text: a table recreated by some other route (or
+        // in another process) must not inherit the old spelling.
+        assert_eq!(exec(db, "DROP TABLE test"), SQLITE_OK);
+        assert_eq!(exec(db, "CREATE TABLE \"test\" (\"t\")"), SQLITE_OK);
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'test'"),
+            ["CREATE TABLE \"test\" (\"t\")"]
+        );
+
+        // A `CREATE TABLE` inside an open transaction is NOT recorded — the
+        // facade exposes no session-scoped schema view, so the shim cannot
+        // resolve the new table (or fingerprint its shape) until the commit
+        // lands. It falls back to the reconstruction, which is what this
+        // answered before verbatim text existed: fidelity is lost, never
+        // correctness. `sqlite_master` cannot see the table before COMMIT
+        // either, for the same reason.
+        //
+        // NB the extra INSERT: the schema the shim introspects is the
+        // COMMITTED one and it refreshes when the next statement runs, so a
+        // `sqlite_master` query issued immediately after `COMMIT` does not see
+        // the table yet. That is pre-existing and orthogonal to the text.
+        assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
+        assert_eq!(exec(db, "CREATE TABLE intxn (a int NOT NULL, b TEXT)"), SQLITE_OK);
+        assert_eq!(exec(db, "COMMIT"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO intxn VALUES (1, 'x')"), SQLITE_OK);
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'intxn'"),
+            ["CREATE TABLE \"intxn\" (\"a\" INTEGER NOT NULL, \"b\" TEXT)"]
         );
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
@@ -3417,10 +3512,17 @@ fn backup_init_refuses_by_name() {
         assert!(sqlite3_backup_init(dst, main.as_ptr(), dst, main.as_ptr()).is_null());
         assert_eq!(errmsg(dst), "source and destination must be distinct");
 
-        // An ATTACHed / temp schema name mpedb has no equivalent for.
+        // An ATTACHed schema name mpedb has no equivalent for.
         let other = cs("attached_db");
         assert!(sqlite3_backup_init(dst, main.as_ptr(), src, other.as_ptr()).is_null());
         assert_eq!(errmsg(dst), "unknown database attached_db");
+
+        // `temp` as a DESTINATION: it exists, but there would be nothing to
+        // read the copy back out of, so it is refused with the real reason
+        // rather than the wrong one ("unknown database").
+        let temp = cs("temp");
+        assert!(sqlite3_backup_init(dst, temp.as_ptr(), src, main.as_ptr()).is_null());
+        assert_eq!(errmsg(dst), "cannot back up INTO temp: mpedb has no temp database");
 
         // Destination mid-transaction: it is about to be REPLACED.
         assert_eq!(exec(dst, "BEGIN"), SQLITE_OK);
@@ -3436,6 +3538,74 @@ fn backup_init_refuses_by_name() {
 
         sqlite3_close(dst);
         sqlite3_close(src);
+    }
+}
+
+/// Every sqlite connection has a `temp` schema, so `backup(name='temp')` is
+/// never an error there — CPython's `test_backup.test_database_source_name`
+/// asserts exactly that. mpedb refuses every statement that could put anything
+/// in a temp schema, so its temp is provably EMPTY, and the copy of an empty
+/// database is what the destination must end up as: the backup SUCCEEDS and
+/// replaces the destination with a blank database.
+#[test]
+fn backup_of_the_temp_schema_is_an_empty_database() {
+    unsafe {
+        let src = open_memory();
+        let dst = open_memory();
+        // Both connections carry real tables; neither may end up in the copy.
+        assert_eq!(exec(src, "CREATE TABLE insrc (a INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec(dst, "CREATE TABLE indst (a INTEGER PRIMARY KEY)"), SQLITE_OK);
+        // Nothing can be put in temp in the first place — the premise.
+        assert_eq!(exec(src, "CREATE TEMP TABLE tt (a INTEGER)"), SQLITE_ERROR);
+
+        let (main, temp) = (cs("main"), cs("temp"));
+        let b = sqlite3_backup_init(dst, main.as_ptr(), src, temp.as_ptr());
+        assert!(!b.is_null(), "backup_init: {}", errmsg(dst));
+        assert_eq!(sqlite3_backup_step(b, -1), SQLITE_DONE);
+        assert_eq!(sqlite3_backup_finish(b), SQLITE_OK);
+
+        // Empty: the destination's own table is gone and the source's never
+        // arrived. The copy is a working database, not a husk.
+        assert!(collect_text_col(dst, "SELECT name FROM sqlite_master").is_empty());
+        assert_eq!(exec(dst, "SELECT a FROM indst"), SQLITE_ERROR);
+        assert_eq!(exec(dst, "SELECT a FROM insrc"), SQLITE_ERROR);
+        assert_eq!(exec(dst, "CREATE TABLE fresh (a INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec(dst, "INSERT INTO fresh (a) VALUES (1)"), SQLITE_OK);
+        assert_eq!(collect_text_col(dst, "SELECT a FROM fresh"), ["1"]);
+        // The source is untouched.
+        assert_eq!(collect_text_col(src, "SELECT name FROM sqlite_master"), ["insrc"]);
+
+        sqlite3_close(dst);
+        sqlite3_close(src);
+    }
+}
+
+/// `sqlite3_deserialize` refuses, but with the RIGHT refusal: bytes that are
+/// not a database image get sqlite's own `SQLITE_NOTADB` / "file is not a
+/// database" (CPython's `test_deserialize_corrupt_database` asserts that
+/// message), because that statement is simply true of them. A plausible image
+/// gets the actual gap instead — mpedb cannot adopt a page image into an open
+/// connection.
+#[test]
+fn deserialize_separates_not_a_database_from_not_supported() {
+    unsafe {
+        let db = open_memory();
+        let mut junk = *b"\0\x01\x03";
+        assert_eq!(
+            sqlite3_deserialize(db, ptr::null(), junk.as_mut_ptr(), 3, 3, 0),
+            SQLITE_NOTADB
+        );
+        assert_eq!(errmsg(db), "file is not a database");
+        // Empty and NULL buffers are not databases either.
+        assert_eq!(sqlite3_deserialize(db, ptr::null(), ptr::null_mut(), 0, 0, 0), SQLITE_NOTADB);
+
+        let mut img = *b"MPEDB1\0\0rest of a database image";
+        assert_eq!(
+            sqlite3_deserialize(db, ptr::null(), img.as_mut_ptr(), img.len() as _, img.len() as _, 0),
+            SQLITE_ERROR
+        );
+        assert_eq!(errmsg(db), "deserialize is not supported by mpedb");
+        sqlite3_close(db);
     }
 }
 
