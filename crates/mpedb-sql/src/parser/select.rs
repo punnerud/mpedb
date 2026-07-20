@@ -164,7 +164,11 @@ impl<'a> Parser<'a> {
             // ORDER BY / LIMIT bind to the WHOLE compound and can therefore
             // only follow the LAST arm — sqlite and PG both reject this shape.
             let prev = arms.last().expect("at least one arm");
-            if !prev.order_by.is_empty() || prev.limit.is_some() || prev.offset.is_some() {
+            if !prev.order_by.is_empty()
+                || prev.limit.is_some()
+                || prev.offset.is_some()
+                || self.neg_limit_in_core
+            {
                 return Err(self.err_here(
                     "ORDER BY / LIMIT / OFFSET apply to the whole compound — move them                      after the last SELECT",
                 ));
@@ -396,13 +400,16 @@ impl<'a> Parser<'a> {
                 }
             }
         }
+        self.neg_limit_in_core = false;
         let limit = if self.eat_kw(Kw::Limit) {
-            Some(self.nonneg_int("LIMIT")?)
+            self.limit_int("LIMIT")?
         } else {
             None
         };
         let offset = if self.eat_kw(Kw::Offset) {
-            Some(self.nonneg_int("OFFSET")?)
+            // A negative OFFSET skips nothing (sqlite clamps it to 0), which
+            // `Some(0)` says exactly.
+            Some(self.limit_int("OFFSET")?.unwrap_or(0))
         } else {
             None
         };
@@ -583,13 +590,27 @@ impl<'a> Parser<'a> {
         Ok(cols)
     }
 
-    fn nonneg_int(&mut self, what: &str) -> Result<u64> {
+    /// A `LIMIT` / `OFFSET` value. An integer literal, optionally signed:
+    /// sqlite reads a NEGATIVE `LIMIT` as "no limit" and a negative `OFFSET`
+    /// as "skip nothing" (`LIMIT -1 OFFSET 5` on five rows yields rows 3..5),
+    /// and Django emits `LIMIT -1` for every open-ended slice `qs[5:]`.
+    /// `Ok(None)` is that no-bound answer; the caller decides what absence
+    /// means for its clause. A negative value is remembered in
+    /// `neg_limit_in_core` so `compound_chain` can still reject a `LIMIT`
+    /// before a set operator, which absence alone no longer shows.
+    fn limit_int(&mut self, what: &str) -> Result<Option<u64>> {
+        let neg = self.eat(&Tok::Minus);
         match self.peek() {
             Some(&Tok::Int(v)) if v >= 0 => {
                 self.pos += 1;
-                Ok(v as u64)
+                if neg {
+                    self.neg_limit_in_core = true;
+                    // `-0` is zero, not "no bound".
+                    return Ok((v == 0).then_some(0));
+                }
+                Ok(Some(v as u64))
             }
-            _ => Err(self.err_here(format!("{what} requires a non-negative integer literal"))),
+            _ => Err(self.err_here(format!("{what} requires an integer literal"))),
         }
     }
 }
