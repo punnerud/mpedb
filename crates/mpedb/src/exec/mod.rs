@@ -1016,6 +1016,51 @@ fn apply_set_op(acc: Vec<Vec<Value>>, right: Vec<Vec<Value>>, op: SetOp) -> Vec<
     }
 }
 
+/// Execute compound ARM `k`, with the lifts that arm OWNS (format 56) filled
+/// the way every other level fills its own: the UNCORRELATED ones once, up
+/// front, and the CORRELATED ones per ARM row by [`exec_select_leveled`].
+///
+/// This is `exec_stmt_impl`'s discipline and `exec_derived`'s, applied to an
+/// arm — the ownership move, not a new mechanism. An arm's correlated lift
+/// names the ARM's row, which is the only row it CAN name: a compound has no
+/// outer row of its own, which is exactly why hoisting these onto the statement
+/// could never fill them.
+///
+/// The buffer is rebuilt from `params` for every arm, so another arm's reserved
+/// slots are NULL rather than stale here — a forged cross-arm read (which
+/// `validate_compound` rejects) can then only see NULL, never another row's
+/// correlated value.
+fn exec_compound_arm(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    c: &CompoundPlan,
+    k: usize,
+) -> Result<ExecResult> {
+    let arm = c.arms.get(k).ok_or_else(|| internal("compound arm out of range"))?;
+    let lifts = c.arm_lifts(k);
+    if lifts.is_empty() && c.n_arm_slots() == 0 {
+        return exec_select(ctx, schema, plan, params, arm);
+    }
+    let base = c.arm_base(k) as usize;
+    let mut buf = params.to_vec();
+    buf.resize(
+        buf.len().max(c.arm_sub_base as usize + c.n_arm_slots() as usize),
+        Value::Null,
+    );
+    for (i, sub) in lifts.iter().enumerate() {
+        if !sub.outer_args.is_empty() {
+            continue;
+        }
+        // `[level params ‖ preceding arms' slots]` — width EXACTLY this arm's
+        // `sub_base`, which is what `run_subplan` extends from.
+        let inner = run_subplan(ctx, schema, plan, &buf[..base], sub)?;
+        buf[base + i] = subplan_value(inner, sub.kind)?;
+    }
+    exec_select_leveled(ctx, schema, plan, &buf, arm, base, lifts)
+}
+
 fn exec_compound(
     ctx: &mut dyn TxnCtx,
     schema: &Schema,
@@ -1026,14 +1071,17 @@ fn exec_compound(
     // Arms carry no ORDER BY/LIMIT of their own (validate enforces it), so
     // each arm materializes exactly its projected rows. The FIRST arm names
     // the output — sqlite's and PG's rule.
-    let mut arms = c.arms.iter();
-    let first = arms.next().ok_or_else(|| internal("compound with no arms"))?;
-    let ExecResult::Rows { columns, rows } = exec_select(ctx, schema, plan, params, first)? else {
+    if c.arms.is_empty() {
+        return Err(internal("compound with no arms"));
+    }
+    let ExecResult::Rows { columns, rows } = exec_compound_arm(ctx, schema, plan, params, c, 0)?
+    else {
         return Err(internal("compound arm produced no rows"));
     };
     let mut acc = rows;
-    for (arm, op) in arms.zip(&c.ops) {
-        let ExecResult::Rows { rows, .. } = exec_select(ctx, schema, plan, params, arm)? else {
+    for (k, op) in c.ops.iter().enumerate() {
+        let ExecResult::Rows { rows, .. } = exec_compound_arm(ctx, schema, plan, params, c, k + 1)?
+        else {
             return Err(internal("compound arm produced no rows"));
         };
         acc = apply_set_op(acc, rows, *op);
@@ -1109,11 +1157,12 @@ fn exec_select(
                 })
             };
             if aggregate.is_some() {
-                // Plain aggregate: no correlated subplans and no post-filter (a
-                // correlated aggregate is routed straight to `run_aggregate`
-                // from `exec_select_leveled`, never through here — compound arms
-                // cannot carry either, and a correlated nested aggregate goes via
-                // `run_subplan`). `base` is unused with an empty correlated set.
+                // Plain aggregate: no correlated subplans and no post-filter.
+                // This function is the fill-free LEAF — every level that owns
+                // correlated lifts (the statement, a derived body, a compound
+                // ARM, a nested subplan) routes to `run_aggregate` from
+                // `exec_select_leveled` with ITS own base. `base` is unused with
+                // an empty correlated set.
                 return run_aggregate(
                     ctx, schema, plan, params, sp, plan.subplan_base() as usize, &[], None,
                 );
@@ -1499,12 +1548,12 @@ fn correlated_survivors(
     // #74: attribute this driver to the (first) correlated subquery's inner
     // table. The inner subplan's own scans additionally charge through the scan
     // layer, so an N-outer × M-inner correlated bomb is counted as ~N·M. A
-    // correlated subplan always has a plain SELECT body (a compound body is
-    // uncorrelated), so `as_select` is `Some`.
-    let corr_table = correlated
-        .first()
-        .and_then(|(_, s)| s.body.as_select())
-        .map(|sp| sp.table);
+    // correlated body may be a plain SELECT or (format 56) a whole compound —
+    // then the first arm names it; either way the charge must not be skipped.
+    let corr_table = correlated.first().and_then(|(_, s)| match &s.body {
+        SubBody::Select(sp) => Some(sp.table),
+        SubBody::Compound(c) => c.arms.first().map(|a| a.table),
+    });
     let mut out = Vec::new();
     for row in rows {
         // One work-row per outer row this correlated subquery re-evaluates over.

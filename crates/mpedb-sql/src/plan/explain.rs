@@ -136,6 +136,11 @@ impl CompiledPlan {
                 });
             }
             self.render_select(arm, schema, out);
+            // The lifts this ARM owns (format 56), rendered under it.
+            for (i, sub) in c.arm_lifts(k).iter().enumerate() {
+                let label = format!("arm{} ${}", k + 1, c.arm_base(k) as usize + i + 1);
+                self.render_subplan(sub, schema, out, &label);
+            }
         }
         if !c.order_by.is_empty() {
             let items: Vec<String> = c

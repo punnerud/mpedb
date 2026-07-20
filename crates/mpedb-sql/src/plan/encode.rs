@@ -90,6 +90,17 @@ fn encode_compound(c: &CompoundPlan, buf: &mut Vec<u8>) {
     }
     encode_opt_u64(c.limit, buf);
     encode_opt_u64(c.offset, buf);
+    // Format 56: the arms' OWNED lifts. `0` arm-lift lists is the shape every
+    // compound had before, so a lift-free compound grows by exactly the base
+    // `u16` and one zero byte.
+    w_u16(buf, c.arm_sub_base);
+    buf.push(c.arm_subplans.len() as u8);
+    for arm in &c.arm_subplans {
+        buf.push(arm.len() as u8);
+        for s in arm {
+            encode_subplan(s, buf);
+        }
+    }
 }
 
 fn w_u16(buf: &mut Vec<u8>, v: u16) {
