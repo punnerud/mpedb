@@ -5,7 +5,10 @@
 //! inside its own transaction — N writes, one meta flip, one msync. Each
 //! intent runs under a statement savepoint, so one failing intent rolls back
 //! alone and the rest of the batch commits (per-intent errors travel back
-//! through the slot).
+//! through the slot). When the savepoint cannot undo the failure exactly —
+//! a statement that applied part of itself in place on a page an earlier
+//! batch member had already dirtied — the leader restarts the whole round
+//! with that member's error pre-decided (`undo_is_exact`; DESIGN.md §5.3).
 //!
 //! Correctness contract (see `ring.rs`): results + `committed_in_txn` stamps
 //! are staged BEFORE the flip; posting/waking happens after. A leader dying
@@ -42,7 +45,8 @@
 //!   point ops commute. The one observable difference: a Point write and an
 //!   OVERLAPPING Range/Full write in the same batch may swap relative order —
 //!   both are valid serializations of causally concurrent statements.
-//! - Per-intent savepoints capture state at each intent's own start, so
+//! - Per-intent savepoints (plus the round restart for the failures a
+//!   savepoint cannot undo) capture state at each intent's own start, so
 //!   failure isolation is order-independent; recovery (`recover_orphans`)
 //!   is keyed by slot idx + stamp, never by execution order — an uncommitted
 //!   batch re-executes under the next leader with the same deterministic rule.
@@ -313,18 +317,43 @@ fn exec_own(
 }
 
 /// Execute one prepared foreign intent inside the leader's transaction.
+///
+/// `partial` is the executor's statement-atomicity out-flag, propagated to the
+/// caller because the leader's per-intent undo depends on it (§5.3): a failure
+/// with `*partial == true` may have mutated pages an earlier intent in this
+/// same batch already made dirty, and `WriteTxn::rollback_to` cannot undo those.
 fn execute_prepared(
     db: &Database,
     txn: &mut WriteTxn<'_>,
     plan: &CompiledPlan,
     params: &[Value],
     triggers: &TriggerSet,
+    partial: &mut bool,
 ) -> Result<u64> {
-    let mut partial = false;
-    match exec_stmt_triggered(txn, &db.schema(), plan, params, &mut partial, triggers, 0)? {
+    match exec_stmt_triggered(txn, &db.schema(), plan, params, partial, triggers, 0)? {
         ExecResult::Affected(n) => Ok(n),
         _ => Err(Error::Internal("write plan returned rows".into())),
     }
+}
+
+/// Can the cheap per-statement savepoint undo this failure EXACTLY?
+///
+/// `rollback_to` restores root pointers and page accounting. That is exact for
+/// everything a statement COW-allocated (the restore drops those pages), but it
+/// cannot undo an in-place mutation of a page that was ALREADY dirty when the
+/// savepoint was taken — the page id does not change, so the restored root
+/// points at the same, already-mutated page. Nor does any savepoint cover the
+/// extent allocator. So the undo is exact iff either:
+///
+/// * the statement applied nothing at all (`!partial` — the executor's
+///   contract is that this never under-reports), or
+/// * the transaction was pristine when the statement began AND the statement
+///   did not touch extents, in which case every page it wrote it also
+///   allocated.
+///
+/// When neither holds the round is torn and the leader must `restart` (§5.3).
+fn undo_is_exact(txn: &WriteTxn<'_>, partial: bool, pristine_before: bool) -> bool {
+    !partial || (pristine_before && txn.extents_untouched())
 }
 
 /// Leader round: drain all READY intents into `txn` (one savepoint each),
@@ -890,43 +919,87 @@ pub(crate) fn lead_and_execute(
         0
     };
 
-    let mut staged = Vec::with_capacity(batch.len());
-    for p in &batch {
-        match &p.prepared {
-            Ok((plan, params)) => {
+    // §5.3 statement atomicity across a batch. A member whose failure TORE the
+    // transaction (see `undo_is_exact`) cannot be undone in place, so the leader
+    // throws the whole round away (`txn.restart()` — the writer lock is kept, so
+    // no other process can steal these intents) and replays it with that
+    // member's outcome PRE-DECIDED: on the replay it is not executed, its error
+    // is staged verbatim, and the batch commits around it exactly as §5.3
+    // promises. The replay re-runs its predecessors against the same committed
+    // snapshot in the same order, so it reproduces the state in which that error
+    // was raised — the error stays the right answer.
+    //
+    // Termination: every restart pre-decides one member that was not pre-decided
+    // before, and a pre-decided member never executes again, so the round runs
+    // at most `batch.len() + 1` times. The happy path pays NOTHING: one bool
+    // read per member.
+    let mut predecided: Vec<Option<(u32, Vec<u8>)>> = vec![None; batch.len()];
+    let mut own_predecided: Option<Error> = None;
+    let mut staged;
+    let mut own_result: Option<Result<ExecResult>>;
+    'round: loop {
+        staged = Vec::with_capacity(batch.len());
+        for (i, p) in batch.iter().enumerate() {
+            if let Some((code, msg)) = &predecided[i] {
+                // torn on an earlier attempt: staged, never re-executed
+                ring.stage_result(p.intent.idx, 0, *code, msg, next_txn);
+                staged.push((p.intent.idx, p.intent.word));
+                continue;
+            }
+            match &p.prepared {
+                Ok((plan, params)) => {
+                    let pristine = txn.is_pristine();
+                    let sp = txn.savepoint();
+                    let mut partial = false;
+                    match execute_prepared(db, &mut txn, plan, params, &triggers, &mut partial) {
+                        Ok(affected) => ring.stage_result(p.intent.idx, affected, 0, &[], next_txn),
+                        Err(e) => {
+                            let (code, msg) = encode_error(&e);
+                            if !undo_is_exact(&txn, partial, pristine) {
+                                predecided[i] = Some((code, msg));
+                                txn.restart();
+                                continue 'round;
+                            }
+                            txn.rollback_to(sp);
+                            ring.stage_result(p.intent.idx, 0, code, &msg, next_txn);
+                        }
+                    }
+                }
+                // plan load / param decode failed before touching the
+                // transaction: stage the error directly (the old in-loop path
+                // rolled back an untouched savepoint — same state, same error)
+                Err(e) => {
+                    let (code, msg) = encode_error(e);
+                    ring.stage_result(p.intent.idx, 0, code, &msg, next_txn);
+                }
+            }
+            staged.push((p.intent.idx, p.intent.word));
+        }
+
+        // the caller's own statement, savepointed like any other batch member
+        own_result = None;
+        if let Some((plan, params)) = own {
+            if let Some(e) = own_predecided.take() {
+                own_result = Some(Err(e));
+            } else {
+                let pristine = txn.is_pristine();
                 let sp = txn.savepoint();
-                match execute_prepared(db, &mut txn, plan, params, &triggers) {
-                    Ok(affected) => ring.stage_result(p.intent.idx, affected, 0, &[], next_txn),
+                let mut partial = false;
+                match exec_own(db, &mut txn, plan, params, &triggers, &mut partial) {
+                    Ok(out) => own_result = Some(Ok(out)),
                     Err(e) => {
+                        if !undo_is_exact(&txn, partial, pristine) {
+                            own_predecided = Some(e);
+                            txn.restart();
+                            continue 'round;
+                        }
                         txn.rollback_to(sp);
-                        let (code, msg) = encode_error(&e);
-                        ring.stage_result(p.intent.idx, 0, code, &msg, next_txn);
+                        own_result = Some(Err(e));
                     }
                 }
             }
-            // plan load / param decode failed before touching the
-            // transaction: stage the error directly (the old in-loop path
-            // rolled back an untouched savepoint — same state, same error)
-            Err(e) => {
-                let (code, msg) = encode_error(e);
-                ring.stage_result(p.intent.idx, 0, code, &msg, next_txn);
-            }
         }
-        staged.push((p.intent.idx, p.intent.word));
-    }
-
-    // the caller's own statement, savepointed like any other batch member
-    let mut own_result: Option<Result<ExecResult>> = None;
-    if let Some((plan, params)) = own {
-        let sp = txn.savepoint();
-        let mut partial = false;
-        match exec_own(db, &mut txn, plan, params, &triggers, &mut partial) {
-            Ok(out) => own_result = Some(Ok(out)),
-            Err(e) => {
-                txn.rollback_to(sp);
-                own_result = Some(Err(e));
-            }
-        }
+        break;
     }
 
     if staged.is_empty() && matches!(own_result, Some(Err(_)) | None) {

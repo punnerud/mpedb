@@ -400,7 +400,65 @@ sketch, both review/stress-hardened:
   order for A/B; `MPEDB_RING_STATS=1` prints per-batch page/run/timing lines. Each
   intent executes under a **statement savepoint** (`WriteTxn::savepoint`/`rollback_to` —
   COW makes these nearly free), so one failing intent errors alone while the batch
-  commits around it; then ONE meta flip and (durable mode) ONE msync for the whole batch.
+  commits around it (⚠ **the savepoint alone does not buy that** — see the
+  per-intent atomicity argument below); then ONE meta flip and (durable mode)
+  ONE msync for the whole batch.
+
+- **Per-intent atomicity: why the cheap savepoint is not sufficient, and what is.**
+  `rollback_to` restores root pointers plus page accounting. It undoes exactly the
+  pages the statement COW-*allocated*: the root restore drops them and they return
+  to `reusable`. It does **not** undo an in-place mutation of a page that was
+  already dirty when the savepoint was taken — the page id never changes, so the
+  restored root points at the same, already-mutated page. Inside a batch that case
+  is ordinary, not exotic: the key-locality sort deliberately makes adjacent-key
+  intents share root-to-leaf paths, so intent k+1 routinely writes in place into a
+  leaf intent k COWed. A statement failing part-way through (multi-row INSERT whose
+  last row violates a constraint; UPDATE/DELETE tripping one mid-loop; a failing
+  trigger body) then left its earlier rows in that leaf and **the batch committed
+  them while its caller got the error** — statement atomicity silently lost, but
+  only under the ring, only when contended, and only for a member that was not the
+  batch's first mutator. (Reproduced deterministically in
+  `crates/mpedb/tests/ring_stmt_atomicity.rs`; both arms of the leader round — the
+  drained foreign intents and the leader's own statement — had it.)
+  The rule that restores the promise:
+
+  1. The executor already computes a precise `partial` out-flag per statement
+     (`exec/mod.rs`; contract: *may* have applied part of its effects, never
+     under-reports). The leader now reads it.
+  2. The cheap undo is **exact** iff `!partial`, or the transaction was
+     *pristine* when the statement began (`WriteTxn::is_pristine` — nothing dirty
+     and the extent allocator untouched) and the statement touched no extent. From
+     a pristine transaction every page a statement writes it also allocated, so the
+     root restore is a complete undo even for a torn statement; extent state is
+     excluded because it lives outside every savepoint (`savepoint_full` refuses
+     across it for the same reason).
+  3. Otherwise the round is **torn**. The leader calls `WriteTxn::restart()` —
+     discard everything this transaction did and return it to its just-begun state
+     **while keeping the writer lock** — and replays the round with that member's
+     error *pre-decided*: on the replay it is not executed, its error is staged
+     verbatim, and the batch commits around it. Releasing the lock instead is not
+     an option: another process would lead and execute the very intents about to be
+     replayed, double-applying them.
+
+  Why the replayed error is still the right answer: the replay runs the member's
+  predecessors against the same committed snapshot in the same drain order, so it
+  reproduces exactly the state in which the error was raised. Why it terminates:
+  every restart pre-decides one member that was not pre-decided before, and a
+  pre-decided member never executes again, so a round runs at most `len(batch)+1`
+  times. Why it is free: on the happy path the whole rule is one bool read per
+  member — no page-image capture, so the ring keeps the flush amortization that is
+  its entire point. (`savepoint_full` per intent was the obvious alternative and was
+  rejected on cost: it copies the *whole* dirty set, which grows through the batch,
+  so a batch of N intents pays ~N²/2 page images — megabytes of memcpy per batch,
+  spent on every intent to insure against a rare failure. Restricting what may ride
+  the ring was rejected as unsound: `partial` can be set for a *single-row* write
+  too, e.g. `DbFull` mid-split, so no statement class is safely exempt and the
+  restriction could not be derived from the property.)
+
+  ⚠ The exclusion list in `run_write_plan` (busy deadline, `RETURNING`, host UDFs)
+  is **not** a safety net for this: none of its three reasons is about partial
+  effects, and multi-row DML rides the ring today. Do not weaken the rule above on
+  the assumption that only single-row-effect plans reach the leader.
 - **Incarnation-safe posting** (a stress-caught TOCTOU class): results are posted
   *under the writer lock*, result-store happens BEFORE the READY→DONE transition, owners
   release from READY or DONE, and recovery never touches DONE slots. Invariant: a READY
