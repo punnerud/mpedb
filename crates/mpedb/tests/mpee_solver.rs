@@ -540,3 +540,48 @@ fn residual_placement_is_priced_and_moves_the_order() {
     );
     agree(&db, Q);
 }
+
+/// **The barrier's measured win.** `join-17-4`'s shape with a LEFT JOIN hung
+/// off the end: ten chain tables written scrambled, then `LEFT JOIN t11`. v1
+/// saw a non-INNER join anywhere in the chain and refused the whole scope, so
+/// it kept the scrambled order. v2 treats `t11` as a barrier, reorders the
+/// INNER run in front of it, and the same query under the same budget ANSWERS.
+///
+/// Measured on this exact query, same database, same 200 k-cell budget:
+///
+/// ```text
+/// v1: join order: t1 [scan] -> t3 [cartesian] -> t5 [cartesian] -> t7 [cartesian]
+///                 -> t9 [cartesian] -> t2 [pk] -> … -> t11 [pk]  (4 cartesian steps)
+///     => runtime budget exceeded: 200010 live joined cells > limit 200000
+///        while evaluating nested-loop join with "t9"
+/// v2: join order: t1 [scan] -> t2 [pk] -> … -> t10 [pk] -> t11 [pk] (0 cartesian steps)
+///     => 1 row
+/// ```
+#[test]
+fn a_left_join_no_longer_costs_the_whole_scope_its_ordering() {
+    let db = open_chain(11, 200_000);
+    let mut from: Vec<String> = (1..=10).step_by(2).map(|k| format!("t{k}")).collect();
+    from.extend((2..=10).step_by(2).map(|k| format!("t{k}")));
+    let sql = format!(
+        "SELECT t1.a, t11.b FROM {} LEFT JOIN t11 ON t11.a = t10.b WHERE {}",
+        from.join(", "),
+        chain_where(10, 4)
+    );
+    let plan = explain(&db, &sql);
+    let line = plan
+        .lines()
+        .find(|l| l.trim_start().starts_with("join order:"))
+        .unwrap_or_else(|| panic!("no join-order line:\n{plan}"));
+    assert!(
+        line.ends_with("(MPEE: 0 cartesian steps)"),
+        "the run in front of the barrier must be walked, not crossed: {line}"
+    );
+    assert!(
+        line.trim().starts_with("join order: t1 ") && line.contains("t11 [pk] (MPEE:"),
+        "the barrier must stay LAST while the run reorders: {line}"
+    );
+    let r = rows(&db, &sql);
+    assert_eq!(r.len(), 1, "the anchored chain pins one tuple: {r:?}");
+    // b = a % 10 + 1, so walking back from a10 = 4 gives a1 = 5.
+    assert_eq!(r[0][0], Value::Int(5), "t1.a for the anchored chain");
+}
