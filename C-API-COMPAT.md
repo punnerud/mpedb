@@ -2167,16 +2167,18 @@ shape (`crafted_alia$.id`) does not hit it.
 ## E3(b) CLOSED — rigid typing through the shim is sqlite's affinity now (#113, 2026-07-20)
 
 The largest single class in the CPython wave-4 remainder (9 tests, plus one
-Django pair). Route unchanged: `main` @ `983be4c`, both suites re-measured
-before AND after in the same worktree, with a control build of the base commit
-for every number below.
+Django pair). Route unchanged. Every number below is a BEFORE/AFTER pair
+measured on the same box against `main` @ **`b41b713`**, with a control build of
+that exact commit in a second worktree — no number is quoted from an earlier
+run.
 
-| suite | before | after |
+| suite | before (`b41b713`) | after |
 |---|---|---|
-| CPython `test_sqlite3` | **435 / 466** (26 bad, 5 skip) | **445 / 466** (16 bad, 5 skip) |
-| Django G1+G2 (the frozen 831) | **824 / 831** | **826 / 831** |
-| Django `queries` / `backends` / `model_fields` | 483/493, 308/324, 514/528 | **byte-identical failure sets** |
-| corpus `select1-4` + `evidence/` (9 689 records) | 9 489, 4 wrong | **byte-identical**, incl. the 4 known `slt_lang_replace` artifacts |
+| CPython `test_sqlite3` | **435 / 466** (26 bad, 5 skip) | **445 / 466** (16 bad, 5 skip) — +10, and the failure sets differ by exactly those 10 |
+| Django G1+G2 (the frozen 831) | **824 / 831** | **826 / 831** — `test_lefthand_power`, `test_righthand_power` |
+| Django `queries` / `backends` / `model_fields` (1 345) | 488/493, 308/324, 514/528 | **byte-identical failure sets** |
+| corpus `select1-4` + `evidence/` (9 689 records) | 9 489, 4 wrong | **byte-identical report**, incl. the 4 known `slt_lang_replace` artifacts |
+| `slt_files`, whole workspace suite, clippy `-D warnings` | green | green |
 
 Schema canonical bytes stay **v9**, `PLAN_FORMAT` stays **55**: `ColumnDef::decl`
 was already in v8 and is the only new input.
