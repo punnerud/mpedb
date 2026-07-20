@@ -2897,3 +2897,77 @@ fn authorizer_sees_writes_and_ddl_and_denies_with_sqlites_two_messages() {
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }
 }
+
+/// The hidden implicit rowid (#94) must be invisible to INTROSPECTION, not
+/// just to `SELECT *`: `PRAGMA table_info` listed it and the reconstructed
+/// `sqlite_master.sql` declared it, so a consumer that rebuilds a schema or a
+/// column list from either (CPython's `iterdump`) got a column the caller
+/// never wrote — and a dump that replayed as a different table.
+#[test]
+fn introspection_hides_the_implicit_rowid() {
+    unsafe {
+        let db = open_memory();
+        // No PRIMARY KEY: the engine synthesizes a hidden rowid.
+        assert_eq!(exec(db, "CREATE TABLE \"alpha\" (\"one\")"), SQLITE_OK);
+        // With one: nothing is hidden and the PK is real.
+        assert_eq!(exec(db, "CREATE TABLE beta (id INTEGER PRIMARY KEY, v TEXT)"), SQLITE_OK);
+
+        // One row (cid 0) — the hidden rowid is not a seventh column.
+        assert_eq!(collect_text_col(db, "PRAGMA table_info(\"alpha\")"), ["0"]);
+        assert_eq!(collect_text_col(db, "PRAGMA table_info(beta)"), ["0", "1"]);
+
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'alpha'"),
+            ["CREATE TABLE \"alpha\" (\"one\")"]
+        );
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'beta'"),
+            ["CREATE TABLE \"beta\" (\"id\" INTEGER NOT NULL, \"v\" TEXT, PRIMARY KEY (\"id\"))"]
+        );
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+/// The `sqlite_master` mini-evaluator has to survive the shapes real
+/// consumers write, not just single-line ones: CPython's `iterdump` breaks its
+/// query across lines, quotes every identifier, uses `==`, and tests
+/// `"sql" NOT NULL`.
+#[test]
+fn sqlite_master_evaluator_takes_the_iterdump_query_shape() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(exec(db, "CREATE TABLE beta (id INTEGER PRIMARY KEY)"), SQLITE_OK);
+        assert_eq!(exec(db, "CREATE TABLE alpha (id INTEGER PRIMARY KEY)"), SQLITE_OK);
+
+        let q = "
+        SELECT \"name\"
+        FROM \"sqlite_master\"
+            WHERE \"sql\" NOT NULL AND
+            \"type\" == 'table'
+            ORDER BY \"name\"
+        ";
+        assert_eq!(collect_text_col(db, q), ["alpha", "beta"]);
+        // Descending, and on a column other than `name`.
+        assert_eq!(
+            collect_text_col(db, "SELECT name FROM sqlite_master ORDER BY \"name\" DESC"),
+            ["beta", "alpha"]
+        );
+        // `IS NULL` is the other half of the NULL test, and matches nothing:
+        // every row this shim emits carries its DDL.
+        assert!(collect_text_col(db, "SELECT name FROM sqlite_master WHERE sql IS NULL").is_empty());
+        assert_eq!(
+            collect_text_col(db, "SELECT name FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name")
+                .len(),
+            2
+        );
+        // A shape it cannot evaluate REFUSES rather than answering wrongly.
+        let s = cs("SELECT name FROM sqlite_master ORDER BY nosuchcol");
+        let mut st: *mut Stmt = ptr::null_mut();
+        let rc = sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut());
+        if rc == SQLITE_OK {
+            assert_ne!(sqlite3_step(st), SQLITE_ROW, "an unevaluable ORDER BY must not answer");
+            sqlite3_finalize(st);
+        }
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
