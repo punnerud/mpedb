@@ -136,17 +136,32 @@ correct — the cost of a set is independent of the order the set was built in.
 
 17 tables `tN(aN INTEGER PRIMARY KEY, bN, xN)`, 10 rows each, 16 equi-join
 conjuncts and one constant anchor `a38 = 9` written as the 16th of 17 conjuncts.
-The join graph is a **tree** (17 nodes, 16 edges) — in fact a path.
+Every conjunct has the shape `aP = bQ`: one side is a PRIMARY KEY, the other is
+not. The join graph is a **tree** — in fact a **path** — and it is *directed for
+free*: entering `tP` from `tQ` is a PK probe (KNOWN, 1 row), entering `tQ` from
+`tP` goes through the non-key `bQ` (BOUNDED, `row_count`).
 
-| order | `worst_log` | `cartesian` | verdict |
+The variant that used to die (`FROM t9,t56,t53,t61,t54,t1,t27,t4,t38,…`):
+
+| order | `worst_log` | `cartesian` | what it does |
 |---|---|---|---|
-| textual (`t9, t56, t53, …`) | 64 | **15** | 15 steps multiply by a full table with certainty |
-| solver (`t38` first, then along the tree) | 64 | **0** | every step is linked; the anchor pins one row |
+| textual | **32** (8 positions un-probed × bucket 4) | **6** | six steps have no predicate linking them to anything already read; the intermediate reaches 10⁷ rows × 51 columns |
+| solver | **4** (one scan, then nothing) | **0** | starts at `t27` — the one end of the path whose own PK is pinned by nobody — and walks it; all 16 following steps are PK probes |
 
-The worst-case product is *the same* — a non-unique equality is BOUNDED, not
-KNOWN, so no order can prove a smaller bound. Term 1 ties; **term 2 decides**,
-and it decides on structure alone. That is the whole robustness argument in one
-table.
+Term 1 decides this one outright: 2⁴ against 2³². (Term 2 is what decides when
+the equalities are *non-unique* on both sides, so no order can prove a smaller
+bound and the worst cases tie — the case §2's UNKNOWN class describes, and the
+reason the structural term exists at all.)
+
+Note what the solver did NOT need: the anchor. `a38 = 9` makes `t38` KNOWN with
+nothing placed, so it is one of the extremal seeds (§4.1) and it is what the
+first refinement round finds — but the winning order starts at the *other* end
+of the path and reaches `t38` last. The anchor's real contribution is that the
+whole 17-way join returns one row; the ordering win is structural.
+
+`crates/mpedb/tests/mpee_solver.rs::join_17_4_answers` pins exactly this: the
+join-order line must read `(MPEE: 0 cartesian steps)` with 16 `[pk]` positions,
+and the query must answer.
 
 ---
 

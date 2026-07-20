@@ -207,3 +207,76 @@ fn outer_join_chains_keep_the_written_order() {
         "a LEFT chain keeps the written order:\n{plan}"
     );
 }
+
+// ===================== the real `select5.test` shape =====================
+
+/// The 17 tables `select5.test`'s `join-17-4` names, and the exact join graph
+/// it builds: a PATH, whose 16 equi-join conjuncts each pin one side's PK, plus
+/// a single constant anchor `a38 = 9` written as the 16th of 17 conjuncts.
+const J17: [u32; 17] = [1, 4, 6, 9, 10, 14, 24, 25, 27, 38, 47, 53, 54, 56, 58, 61, 63];
+
+/// The failing variant verbatim (`select5.test` line ~5418): the FROM list
+/// order that made mpedb materialize ~11 GB and die on an allocation failure.
+const J17_SQL: &str = "SELECT x24,x6,x53,x1,x54,x61,x58,x63,x56,x47,x27,x38,x4,x25,x9,x14,x10 \
+     FROM t9,t56,t53,t61,t54,t1,t27,t4,t38,t14,t63,t10,t25,t24,t47,t58,t6 \
+     WHERE b61=a38 AND a54=b6 AND a9=b14 AND b53=a14 AND a1=b4 AND b10=a25 \
+     AND a53=b63 AND a10=b9 AND b25=a6 AND b27=a47 AND b1=a58 AND a24=b54 \
+     AND a63=b58 AND a61=b24 AND b47=a56 AND a38=9 AND b56=a4";
+
+fn open_j17() -> Tmp {
+    let dir = if std::path::Path::new("/dev/shm").is_dir() { "/dev/shm" } else { "/tmp" };
+    let path = format!(
+        "{dir}/mpedb-j17-{}-{}.mpedb",
+        std::process::id(),
+        UNIQ.fetch_add(1, Ordering::Relaxed)
+    );
+    let _ = std::fs::remove_file(&path);
+    // The DEFAULT join-cells budget, deliberately: this shape is exactly what
+    // that budget exists to catch, and the point is that it no longer has to.
+    let mut toml =
+        format!("[database]\npath = \"{path}\"\nsize_mb = 64\nmax_readers = 8\n\n[runtime]\n");
+    for t in J17 {
+        toml.push_str(&format!(
+            "\n[[table]]\nname = \"t{t}\"\nprimary_key = [\"a{t}\"]\n\
+             \x20 [[table.column]]\n  name = \"a{t}\"\n  type = \"int64\"\n\
+             \x20 [[table.column]]\n  name = \"b{t}\"\n  type = \"int64\"\n\
+             \x20 [[table.column]]\n  name = \"x{t}\"\n  type = \"text\"\n"
+        ));
+    }
+    let db = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    for t in J17 {
+        let vals: Vec<String> =
+            (1..=10).map(|i| format!("({i}, {}, 'table t{t} row {i}')", i % 10 + 1)).collect();
+        db.query(
+            &format!("INSERT INTO t{t} (a{t}, b{t}, x{t}) VALUES {}", vals.join(", ")),
+            &[],
+        )
+        .unwrap();
+    }
+    Tmp { db, path }
+}
+
+/// `join-17-4` itself. Written order: six steps have no predicate linking them
+/// to anything already read, so the intermediate reaches 10^7 rows of 51
+/// columns and the statement dies. Solved: the path is walked end to end, every
+/// step is a PK probe, and it ANSWERS.
+#[test]
+fn join_17_4_answers() {
+    let db = open_j17();
+    let plan = explain(&db, J17_SQL);
+    let line = plan
+        .lines()
+        .find(|l| l.trim_start().starts_with("join order:"))
+        .unwrap_or_else(|| panic!("no join-order line:\n{plan}"));
+    assert!(
+        line.ends_with("(MPEE: 0 cartesian steps)"),
+        "every one of the 16 steps must be linked: {line}"
+    );
+    assert_eq!(
+        line.matches("[pk]").count(),
+        16,
+        "16 of the 17 positions are PK probes: {line}"
+    );
+    let r = rows(&db, J17_SQL);
+    assert_eq!(r.len(), 1, "the anchored path pins one tuple: {} rows", r.len());
+}

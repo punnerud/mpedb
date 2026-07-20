@@ -807,6 +807,7 @@ fn render_expr_name(e: &ast::Expr) -> String {
 /// sqlite-style cross-arm coercion; `CAST` one side instead), one shared
 /// parameter table — and resolve the compound-level ORDER BY against the
 /// first arm's output.
+#[allow(clippy::too_many_arguments)]
 fn plan_compound(
     c: &ast::CompoundStmt,
     schema: &Schema,
@@ -991,6 +992,7 @@ fn plan_compound(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_insert(
     s: &ast::InsertStmt,
     schema: &Schema,
@@ -1232,6 +1234,7 @@ fn plan_insert(
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_update(
     s: &ast::UpdateStmt,
     schema: &Schema,
@@ -1348,6 +1351,7 @@ fn lift_where(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn plan_delete(
     s: &ast::DeleteStmt,
     schema: &Schema,
