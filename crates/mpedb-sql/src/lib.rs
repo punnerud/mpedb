@@ -18,6 +18,7 @@
 
 mod ast;
 mod binder;
+mod dbref;
 mod ddl;
 mod parser;
 mod plan;
@@ -28,6 +29,9 @@ mod trigger;
 mod view;
 
 pub use binder::HostUdfSet;
+pub use dbref::{
+    mangle as mangle_db_table, parse_attach, resolve_db_refs, AttachStmt, DbResolution, DbScope,
+};
 pub use ddl::{
     CreateColumnSpec, CreatePolicySpec, CreateTableSpec, CreateTriggerSpec, CreateVirtualTableSpec,
     DdlStmt, RlsAction, TriggerEvent, TriggerTiming,
