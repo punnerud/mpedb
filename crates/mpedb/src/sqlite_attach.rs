@@ -39,6 +39,12 @@ enum PkKind {
 struct Attached {
     src: fmtx::Table,
     pk: PkKind,
+    /// Per DERIVED column: the compiled program for its CHECK source (the
+    /// base's DDL text, compiled by the same `compile_check` the native
+    /// `CREATE TABLE … CHECK (…)` path uses). Evaluated by the overlay's
+    /// write path — a table whose CHECK does not compile never gets here (it
+    /// is a named skip).
+    checks: Vec<Option<mpedb_types::ExprProgram>>,
 }
 
 pub struct SqliteAttach {
@@ -133,6 +139,23 @@ fn default_const(text: &str, affinity: mpedb_types::Affinity) -> std::result::Re
     Ok(mpedb_types::store_into(ColumnType::Any, affinity, v))
 }
 
+/// Combine several CHECK bodies into one source. A single body stays verbatim
+/// (so the error text shows exactly what the base declared); several become
+/// `(a) AND (b)`, which rejects exactly the rows the separate checks reject
+/// (3VL: the AND is FALSE iff some operand is FALSE, and only FALSE rejects).
+fn and_join(bodies: &[String]) -> Option<String> {
+    match bodies {
+        [] => None,
+        [one] => Some(one.clone()),
+        many => Some(
+            many.iter()
+                .map(|b| format!("({b})"))
+                .collect::<Vec<_>>()
+                .join(" AND "),
+        ),
+    }
+}
+
 fn pk_col(name: &str, ty: ColumnType) -> ColumnDef {
     ColumnDef {
         name: name.to_string(),
@@ -191,14 +214,9 @@ impl SqliteAttach {
             // error surfacing on a later, unrelated statement — and a dropped
             // NOT NULL/DEFAULT changed what a row STORES. A table nobody can
             // see is a clean refusal; a table that answers differently is not.
-            if t.has_check {
-                skipped.push((
-                    t.name.clone(),
-                    "CHECK constraint (mpedb cannot compile a base's CHECK, and not                      enforcing it would let in a row the base itself rejects)"
-                        .into(),
-                ));
-                continue;
-            }
+            // (CHECKs are no longer a blanket refusal: they are COMPILED below,
+            // and only one that does not compile skips the table — by name,
+            // naming what failed.)
             if t.has_generated {
                 skipped.push((
                     t.name.clone(),
@@ -242,7 +260,7 @@ impl SqliteAttach {
                     col_defaults.get(i).cloned().flatten(),
                 )
             };
-            let (pk, def) = if let Some(ipk) = t.ipk_column {
+            let (pk, mut def) = if let Some(ipk) = t.ipk_column {
                 let cols = t
                     .columns
                     .iter()
@@ -336,8 +354,49 @@ impl SqliteAttach {
                     },
                 )
             };
+            // The base's CHECK constraints, carried onto the DERIVED columns
+            // (declared index == derived index in every served shape; the
+            // synthetic rowid trails). A column-level CHECK lands on its
+            // column; table-level ones ride column 0 — placement is cosmetic
+            // (the error names the column), because a program binds against
+            // the WHOLE table either way. Several checks AND-combine, which is
+            // reject-equivalent under 3VL: the conjunction is FALSE exactly
+            // when some conjunct is FALSE, and only FALSE rejects.
+            for (i, bodies) in t.col_checks.iter().enumerate() {
+                let mut bodies = bodies.clone();
+                if i == 0 {
+                    bodies.extend(t.table_checks.iter().cloned());
+                }
+                def.columns[i].check = and_join(&bodies);
+            }
+            // Compile NOW, with the exact compiler the native `CREATE TABLE …
+            // CHECK (…)` path uses. One CHECK that does not compile (a sqlite
+            // function mpedb lacks, say) takes THIS table out of the attach —
+            // per table, naming what failed — because attaching it unenforced
+            // would let in a row the base itself rejects.
+            let mut checks = Vec::with_capacity(def.columns.len());
+            let mut bad_check = None;
+            for c in &def.columns {
+                checks.push(match &c.check {
+                    None => None,
+                    Some(src) => match mpedb_sql::compile_check(src, &def) {
+                        Ok(p) => Some(p),
+                        Err(e) => {
+                            bad_check = Some(format!(
+                                "CHECK on `{}` (`{src}`) does not compile: {e}",
+                                c.name
+                            ));
+                            break;
+                        }
+                    },
+                });
+            }
+            if let Some(why) = bad_check {
+                skipped.push((t.name.clone(), why));
+                continue;
+            }
             defs.push(def);
-            tables.push(Attached { src: t, pk });
+            tables.push(Attached { src: t, pk, checks });
         }
         // When EVERY table was skipped, `Schema::new` would report the generic
         // "schema defines no live tables" — true, but it hides the reasons the
@@ -593,6 +652,44 @@ impl SqliteAttach {
     /// Point lookup straight against the BASE — the overlay's fall-through.
     pub(crate) fn base_get_by_pk(&self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
         SqliteCtx { at: self }.get_by_pk(table, pk)
+    }
+
+    /// Evaluate the base's compiled CHECK programs against a full-arity row —
+    /// the overlay's write path calls this so the delta rejects exactly what
+    /// the base's own sqlite would reject at checkpoint time. sqlite (and
+    /// mpedb's native path, `validate_row_in`) reject only on FALSE: TRUE and
+    /// NULL both pass.
+    pub(crate) fn check_row(&self, table: u32, values: &[Value]) -> Result<()> {
+        let a = self
+            .tables
+            .get(table as usize)
+            .ok_or_else(|| Error::Internal("table id out of range".into()))?;
+        let def = self
+            .schema
+            .table(table)
+            .ok_or_else(|| Error::Internal("table id out of range".into()))?;
+        let mut stack = Vec::new();
+        for (ci, prog) in a.checks.iter().enumerate() {
+            let Some(p) = prog else { continue };
+            match p.eval_with_stack(&mut stack, values, &[])? {
+                Value::Bool(false) => {
+                    let c = &def.columns[ci];
+                    return Err(Error::CheckViolation {
+                        table: def.name.clone(),
+                        column: c.name.clone(),
+                        expr: c.check.clone().unwrap_or_default(),
+                    });
+                }
+                Value::Bool(true) | Value::Null => {}
+                v => {
+                    return Err(Error::TypeMismatch(format!(
+                        "CHECK evaluated to {}, expected bool",
+                        v.type_name()
+                    )))
+                }
+            }
+        }
+        Ok(())
     }
 
     /// PK-ordered base scan with keycode bounds — the overlay merge's right-
