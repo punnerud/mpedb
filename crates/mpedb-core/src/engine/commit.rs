@@ -162,12 +162,6 @@ impl<'e> WriteTxn<'e> {
         };
         match self.eng.shm.durability {
             Durability::Commit => {
-                // Extent payload was pwritten, never mapped-stored, so it is
-                // NOT in `dirty` — its ranges are tracked explicitly and
-                // synced here, in the same ordering class as the COW pages,
-                // covered by the same single barrier below. On Linux the
-                // barrier is a no-op and these range-msyncs ARE the pre-flip
-                // durability (DESIGN-BLOBEXTENT §4, review finding 1).
                 // ONE range-msync over the whole dirty SPAN, not one per
                 // contiguous run (#111). Both make exactly the same pages
                 // durable; the difference is the number of syscalls, and on
