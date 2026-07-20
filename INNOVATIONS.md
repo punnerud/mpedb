@@ -289,30 +289,6 @@ refusing to let marketing language attach to it is the contribution.
 Measured, single client on ext4: `wal` ≈ 2.2–2.7k inserts/s (durable on ack),
 `async` ≈ 22–32k, batched `wal` ≈ 100k rows/s.
 
-### 2.5 Two flushes, not `runs+1` [I]
-
-**Problem.** On Linux, `msync(MS_SYNC)` *is* `fsync` on that range — it is a
-device flush, not a memory operation. A commit path that loops "one `msync` per
-contiguous dirty run" therefore issues `runs + 1` device flushes where the design
-floor is 2. The bug survived because an earlier fix removed a barrier from that
-loop: correct on macOS, a no-op on Linux, and nobody re-measured on Linux.
-
-**Mechanism.** One `msync` over the `[min, max]` span of the dirty set, plus the
-meta flush. Span *width* is free — 4 MiB to 1023 MiB over a 1 GiB mapping
-measures flat on ext4 and xfs, because writeback is driven by the dirty tag, not
-the range; the 4 MiB arm is the *slowest*, which is the tell.
-
-**Evidence.** 4.05 → 2.02 `msync`s per durable commit (`strace`). Commits per
-`msync` under 4 contended writers: 0.73 → 1.34. Throughput +41.5 % (1 writer)
-and +55.7 % (4 writers) on a loaded box, +45.0 % / +63.3 % idle; the
-non-durable class is the control at 0.994×.
-
-**The diagnosis that was wrong is the interesting part.** The hypothesis was that
-group commit was not forming. It was: 2.82 independent transactions per batch at
-4 writers. What was broken was the *flush count per group*. And a paired probe
-showed `msync` and `fdatasync` cost the same — one device flush — so the
-write-ahead log is not cheaper *per* flush, it is cheaper because it issues one.
-
 ---
 
 ## 3. Plans as content-addressed objects
@@ -740,20 +716,6 @@ the cost side: compile time is **non-monotone** in the chain width, peaking at
 2.26 ms for 12 tables and falling to 106 µs for 17, because `DP_FULL_MAX = 12`
 is where the exact DP hands over to extremal sampling. The solver plans a
 17-table join **21× faster** than a 12-table one.
-
-### 4.9 The bug that became a constraint [I]
-
-Correlated subqueries are lifted *before* join dispatch, so their arguments name
-row slots in **textual** order — and a reorder left them pointing at the wrong
-columns. This was a genuine wrong answer during development: an aggregate with a
-correlated filter returned 1 where sqlite returns 2. Version 1 responded by
-refusing the whole scope; version 2 **applies the permutation** to them, with the
-registry's decode path re-validating every argument so a stale slot surfaces as
-corruption rather than as an answer.
-
-The pattern is the point: a wrong answer found in development became first a
-refusal, then a priced constraint. Both are better than a silent wrong answer,
-and the ordering between them is a roadmap.
 
 ---
 
