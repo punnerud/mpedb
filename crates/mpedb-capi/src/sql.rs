@@ -197,7 +197,7 @@ fn parse_zeroblob_arg(b: &[u8], mut i: usize) -> Option<(usize, i64)> {
         loop {
             match b.get(i) {
                 None => return None,
-                Some(&q) if q == b'\'' => {
+                Some(b'\'') => {
                     if b.get(i + 1) == Some(&b'\'') {
                         s.push(b'\'');
                         i += 2;
