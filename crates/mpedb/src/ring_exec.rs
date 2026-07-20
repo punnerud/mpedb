@@ -976,7 +976,7 @@ mod tests {
 
     /// Tables `a` (id 0) and `b` (id 1), each `(id int64 PK, v int64 NULL)`.
     fn test_schema() -> Schema {
-        let col = |name: &str, nullable: bool| ColumnDef {
+        let col = |name: &str, nullable: bool| ColumnDef { decl: None,
             name: name.into(),
             ty: ColumnType::Int64,
             nullable,

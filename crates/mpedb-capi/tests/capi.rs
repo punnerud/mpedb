@@ -1562,6 +1562,31 @@ fn column_decltype_reports_base_column_types_null_for_expressions() {
         assert_eq!(decl("SELECT id + 1, name FROM t", 0), None);
         assert_eq!(decl("SELECT id + 1, name FROM t", 1).as_deref(), Some("TEXT"));
 
+        // VERBATIM declared text, not the canonical name — sqlite's contract,
+        // and what CPython's `PARSE_DECLTYPES` keys its converters off. Before
+        // this, `f float` reported `REAL`, no converter fired, and the caller
+        // got the RAW value with no error: a wrong answer with no error.
+        assert_eq!(
+            exec(
+                db,
+                "CREATE TABLE d (id INTEGER PRIMARY KEY, f float, b bool, \
+                 u unicode, foo foo, n2 number(5), bare)"
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(decl("SELECT f FROM d", 0).as_deref(), Some("float"));
+        assert_eq!(decl("SELECT b FROM d", 0).as_deref(), Some("bool"));
+        assert_eq!(decl("SELECT u FROM d", 0).as_deref(), Some("unicode"));
+        // An unrecognized type name is legal in sqlite and IS the decltype.
+        assert_eq!(decl("SELECT foo FROM d", 0).as_deref(), Some("foo"));
+        // The size suffix rides along verbatim (CPython cuts at `(` itself).
+        assert_eq!(decl("SELECT n2 FROM d", 0).as_deref(), Some("number(5)"));
+        // No declared type at all ⇒ sqlite's NULL.
+        assert_eq!(decl("SELECT bare FROM d", 0), None);
+        // Case is preserved exactly as written.
+        assert_eq!(exec(db, "CREATE TABLE c (id INTEGER PRIMARY KEY, v VarChar(10))"), SQLITE_OK);
+        assert_eq!(decl("SELECT v FROM c", 0).as_deref(), Some("VarChar(10)"));
+
         sqlite3_close(db);
     }
 }

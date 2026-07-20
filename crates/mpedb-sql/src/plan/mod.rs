@@ -1203,7 +1203,7 @@ pub(crate) fn cte_working_table_def(
         columns: columns
             .iter()
             .zip(col_types)
-            .map(|(name, &ty)| mpedb_types::ColumnDef {
+            .map(|(name, &ty)| mpedb_types::ColumnDef { decl: None,
                 name: name.clone(),
                 ty,
                 nullable: true,
@@ -1599,7 +1599,7 @@ impl CompiledPlan {
                 Projection::Column(n) => table
                     .columns
                     .get(*n as usize)
-                    .and_then(|c| c.ty.decltype_name().map(str::to_string)),
+                    .and_then(|c| c.decltype().map(str::to_string)),
                 Projection::Expr { .. } => None,
             })
             .collect()
