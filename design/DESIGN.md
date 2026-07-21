@@ -409,13 +409,31 @@ struct ReaderSlot {
   frees every page back and it looks untouched again — otherwise the reconcile pass sees
   a key it wrote that the plan no longer claims and deletes it, with its pages listed
   nowhere. The page-accounting verifier catches this as `page N leaked`.
-- **Termination**: each pass can only add pages freed by COWing the ≤ height-bounded
-  freelist path itself, the sets grow monotonically, and allocation switches to
-  `high_water` (which frees nothing) once the reclaimable pool is consumed — so the loop
-  is bounded by O(tree height) passes. **The `high_water` fallback IS the termination
-  argument**, which is why refill must stay blocked during the fixpoint (`in_freelist_op`)
-  even though it is now read-only: a refill inside the loop would let the pool grow on
-  the fly, and the "monotone, bounded" argument no longer closes.
+- **Termination**: a monotone-lattice argument. During the fixpoint `reusable` only
+  drains (alloc pops it; refill is blocked; **`free()` inters every fixpoint-time free
+  in `freed` instead of recycling it into `reusable`** — the routing in
+  `engine/freelist.rs::free`), `freed` only grows (COWed-away pages and structurally
+  freed nodes, never re-allocated this txn), and allocation switches to `high_water`
+  (which frees nothing and moves no set) once the reclaimable pool is consumed — a pass
+  whose application only draws high-water leaves the next plan identical, so the loop
+  closes. **The `high_water` fallback IS the termination argument**, which is why refill
+  must stay blocked during the fixpoint (`in_freelist_op`) even though it is now
+  read-only: a refill inside the loop would let the pool grow on the fly, and the
+  "monotone, bounded" argument no longer closes. The free-routing clause is equally
+  load-bearing, and it is what makes the argument hold under the private `:memory:`
+  in-place mode (`adopt_inplace`) as well as under pure COW: adoption keeps `freed`
+  empty (no COW alloc+free) and makes every structurally freed node a *dirty* page, so
+  without the routing a fixpoint-time free would land in `reusable` — the pool the
+  fixpoint allocates from — and the plan degenerates into a period-2 cycle (LMDB's
+  circularity at its purest: one leftover page is consumed to become the tree node that
+  records it, the next pass deletes the now-empty record, which frees the node back into
+  the pool, forever — the 2026-07-21 "freelist fixpoint did not converge" regression on
+  delete-heavy `:memory:` databases). Pure COW never exposed the cycle only because its
+  structural frees were of committed pages (→ `freed`) and `freed` was never empty at
+  entry (the catalog writeback COWs ≥ 1 committed page); the routing makes the
+  precondition explicit instead of accidental. Cost: a page freed inside the fixpoint
+  has its reuse deferred to the next txn (it is listed under this commit's id) — a few
+  pages at most, and none of the #37 refill regime.
 - **Page accounting invariant** (tested by the crash suite): pages reachable from the
   committed meta ⊎ pages listed in the freelist ⊎ [high_water, page_count) partition the
   data region after every commit.

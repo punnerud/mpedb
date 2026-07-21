@@ -85,7 +85,7 @@ impl PageStore for WriteTxn<'_> {
     }
 
     fn free(&mut self, id: u64) -> Result<()> {
-        if self.dirty.remove(&id) {
+        if self.dirty.remove(&id) && !self.in_freelist_op {
             // allocated this txn: immediately reusable, invisible to readers.
             // Sorted insert — `reusable` is kept ordered so `freelist_plan` can
             // test membership by binary search instead of building a HashSet
@@ -95,6 +95,28 @@ impl PageStore for WriteTxn<'_> {
             }
             return Ok(());
         }
+        // §4.5 TERMINATION (design/DESIGN.md): while the commit fixpoint runs
+        // (`in_freelist_op`), EVERY free — dirty or committed — is interred in
+        // `freed`, never recycled into `reusable`. The fixpoint's argument is a
+        // monotone lattice: `reusable` only drains (alloc pops it; refill is
+        // blocked), `freed` only grows, so a page once consumed never returns
+        // and a page once freed never leaves — the plan settles.
+        //
+        // Recycling a fixpoint-time free into `reusable` closes LMDB's
+        // circularity as a period-2 CYCLE instead: with `freed` empty, one
+        // leftover page P makes the plan write an own-set entry {P}; applying
+        // it allocates P as the tree node that stores it, so the next plan is
+        // "delete the entry"; the delete empties that leaf and frees P back
+        // into `reusable`; the plan is {P} again — forever, into the 64-pass
+        // cap. Pure COW never exposed this: structural frees during the
+        // fixpoint were of committed pages (→ `freed`), and `freed` was never
+        // empty at entry (the catalog writeback COWs at least one committed
+        // page). The `:memory:` in-place mode (`adopt_inplace`) voids both —
+        // adoption keeps `freed` empty and makes every structurally-freed page
+        // dirty — which is how this line's absence refused delete-heavy
+        // commits ("freelist fixpoint did not converge"). Interring costs at
+        // most a few pages' reuse deferred to the next txn (they are listed
+        // under this commit's id); it does not touch the #37 refill regime.
         if !self.freed.insert(id) {
             return Err(Error::Internal(format!("double free of page {id}")));
         }
