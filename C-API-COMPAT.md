@@ -19,8 +19,8 @@ sqlite's C reference lists ~300 functions and ~250 constants. This shim exports
 the **~50 the drop-in consumer path actually calls** — Python's `sqlite3`, language
 bindings, common tools — validated end-to-end by a DB-API 2.0 battery that matches
 stock sqlite **23/23**, and measured against **CPython's own `test_sqlite3`
-suite** (the authoritative consumer test of that surface: **458 of the 467**
-tests stock passes, at HEAD on the M3 — see AT HEAD (4); the suite
+suite** (the authoritative consumer test of that surface: **459 of the 467**
+tests stock passes, at HEAD on the M3 — see AT HEAD (5); the suite
 hammers contract details — destructor rules, trace, limits, error codes — that
 "the ~50 functions exist" does not capture, so it is the scope's honest
 yardstick).
@@ -2180,9 +2180,10 @@ shape (`crafted_alia$.id`) does not hit it.
 
 
 > **Reading order note — SUPERSEDED.** Sections below are kept as history.
-> **The current headline is "AT HEAD (4) — re-measured at `bf1207e`" at the end
-> of this file**: Apple M3, CPython **458/467** of stock-passing; Django A
-> **831/831** and `queries` **493/493** (zero wrong-answer FAILs).
+> **The current headline is "AT HEAD (5) — re-measured at `a48ec1c`" at the end
+> of this file**: Apple M3, CPython **459/467** of stock-passing (zero *unexpected*
+> failures — residual ids are deliberate non-goals); Django A **831/831** and
+> `queries` **493/493**.
 
 ## The consolidated measurement — Django run 7 + CPython, ONE commit (2026-07-20)
 
@@ -3227,3 +3228,54 @@ WB_DJANGO=~/django-workbench/django WB_PY=~/django-workbench/venv/bin/python \
   crates/mpedb-capi/workbench/djsuite/run_suite.sh
 WB_GROUP_BASE=3 WB_LABEL_GROUPS=$'queries' WB_OUT=…/django-queries … run_suite.sh
 ```
+
+---
+
+## AT HEAD (5) — re-measured at `a48ec1c` (2026-07-21)
+
+**This is the current headline.** Commit `a48ec1c` (PRAGMA `table_info`
+unquote of `""` + mid-txn WriteSession schema for iterdump) on top of
+`bf1207e` and the post-`c4d1a90` SQL/ATTACH chain.
+
+**Machine: Apple M3 Pro, macOS, arm64.** Release `mpedb-capi` in
+`~/mpedb-measure` (rsync of Linux `main` @ `a48ec1c`).
+**Interpreter: Homebrew CPython 3.12.12** — 474 tests, 7 skips; stock
+**3.53.1** passes **467**.
+**Interposition:** `stock=3.53.1` · `shim=3.45.0`.
+
+### CPython `test_sqlite3`
+
+| arm | run | pass | FAIL | ERROR | skip |
+|---|---|---|---|---|---|
+| stock libsqlite3 3.53.1 | 474 | **467** | 0 | 0 | 7 |
+| **shim @ `a48ec1c`** | 474 | **459** | **1** | **7** | 7 |
+
+**459 / 467 = 98.3 %** of the baseline-passing suite (was **458/467** at `bf1207e`).
+
+#### Residual FAIL + ERROR — **all deliberate non-goals / stated divergences**
+
+| id | class |
+|---|---|
+| `test_backup.BackupTests.test_progress` | FAIL — pagecount ≈73 (mpedb high_water), not sqlite's 2 pages |
+| `test_backup…test_modifying_progress` | ERROR — no mid-backup restart (one-shot capture) |
+| `test_dbapi…test_connection_config` | ERROR — FK `DBCONFIG` not enforced (D11 honesty) |
+| `test_dbapi…test_serialize_deserialize` | ERROR — serialize as sqlite image is a non-goal |
+| `test_dump…test_dump_autoincrement` ×2 | ERROR — AUTOINCREMENT deliberate |
+| `test_dump…test_dump_virtual_tables` | ERROR — fts4 non-goal (fts5 only) |
+| `test_regression…test_error_msg_decode_error` | ERROR — non-UTF-8 `Value::Text` structural |
+
+**Closed vs `bf1207e`:** `test_dump.test_table_dump` (PRAGMA quote unescaping +
+mid-txn `table_info` + trigger-before-view master order).
+
+**Wrong SQL answers: 0.** **Unexpected residual set: empty.**
+
+### Django frozen A + `queries` (re-confirmed same commit)
+
+| label set | tests | shim |
+|---|---|---|
+| G1 | 392 | **OK** (skipped=17) |
+| G2 | 439 | **OK** (skipped=5, xfail=1) |
+| **A = G1+G2** | **831** | **831 / 831 (100 %)** |
+| B `queries` | 493 | **493 / 493 (100 %)** (skipped=15, xfail=2) |
+
+**Wrong SQL answers: 0.**
