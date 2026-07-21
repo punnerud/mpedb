@@ -1360,10 +1360,12 @@ fn plan_insert(
                             }
                             InsertSource::Param(i)
                         }
-                        _ => {
-                            return Err(bind_err(
-                                "INSERT values must be literals or parameters",
-                            ))
+                        // Expression cell (Django bulk_create Now(), arithmetic,
+                        // scalar subquery in VALUES, multi-row with mixed
+                        // literals). Evaluated over the dual row at insert time.
+                        other => {
+                            let program = compile_program(&other)?;
+                            InsertSource::Expr(program)
                         }
                     }
                 }
@@ -1698,8 +1700,9 @@ fn as_atom(e: &BExpr) -> Option<Atom> {
 }
 
 /// `col <cmp> atom` (either operand order; op flipped when reversed).
+/// Also matches [`BExpr::ClassCmp`] (inequality with free params) so a
+/// `pk >= $1` bound still becomes a PkRange after the float-param compare fix.
 fn as_col_cmp(e: &BExpr) -> Option<(u16, BinOp, Atom)> {
-    let BExpr::Binary(op, l, r) = e else { return None };
     let flipped = |op: BinOp| match op {
         BinOp::Lt => BinOp::Gt,
         BinOp::Le => BinOp::Ge,
@@ -1707,9 +1710,14 @@ fn as_col_cmp(e: &BExpr) -> Option<(u16, BinOp, Atom)> {
         BinOp::Ge => BinOp::Le,
         other => other,
     };
-    match (l.as_ref(), r.as_ref()) {
-        (BExpr::Col(c), rhs) => as_atom(rhs).map(|a| (*c, *op, a)),
-        (lhs, BExpr::Col(c)) => as_atom(lhs).map(|a| (*c, flipped(*op), a)),
+    let (op, l, r) = match e {
+        BExpr::Binary(op, l, r) => (*op, l.as_ref(), r.as_ref()),
+        BExpr::ClassCmp(op, l, r, _, _) => (*op, l.as_ref(), r.as_ref()),
+        _ => return None,
+    };
+    match (l, r) {
+        (BExpr::Col(c), rhs) => as_atom(rhs).map(|a| (*c, op, a)),
+        (lhs, BExpr::Col(c)) => as_atom(lhs).map(|a| (*c, flipped(op), a)),
         _ => None,
     }
 }

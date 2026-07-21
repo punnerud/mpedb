@@ -1626,13 +1626,15 @@ impl<'a> Binder<'a> {
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 let (l, lt, r, rt) = self.bridge_bool_int(l, lt, r, rt)?;
-                // Comparison unifies without pinning a bare param from a pure
-                // literal/expression. sqlite has no parameter types: `1 = ?`
-                // with a text bind is a storage-class comparison (Eq → FALSE),
-                // not a type error. Pinning still happens from a COLUMN (or
-                // CAST) so `WHERE id = ?` keeps its rigid int64 slot. See
-                // `unify_compare_operands` / `class_cmp_affinity`.
-                let (l, r, unified) = self.unify_compare_operands(l, lt, r, rt)?;
+                // Equality pins from columns so `WHERE id = ?` stays Binary and
+                // remains a PkPoint/IndexPoint. Inequality leaves the param free
+                // (ClassCmp+Numeric) so `year >= 1942.1` is exact numeric compare.
+                let is_eq = matches!(op, BinOp::Eq | BinOp::Ne);
+                let (l, r, unified) = if is_eq {
+                    self.unify_compare_eq(l, lt, r, rt)?
+                } else {
+                    self.unify_compare_operands(l, lt, r, rt)?
+                };
                 // sqlite's collation precedence, in order: an explicit `COLLATE`
                 // on the LEFT operand, else on the RIGHT; else the LEFT operand's
                 // COLUMN collation (rung 2), else the RIGHT column's; else BINARY.
@@ -1652,9 +1654,10 @@ impl<'a> Binder<'a> {
                     .or_else(|| col_coll(&l))
                     .or_else(|| col_coll(&r))
                     .unwrap_or_default();
-                // Comparison affinity + storage-class order, for a comparison
-                // that touches a TYPELESS column. See `class_cmp_affinity`.
-                let node = match self.class_cmp_affinity(unified, &l, &r) {
+                // Comparison affinity + storage-class order. Equality against a
+                // typed column deliberately does NOT take ClassCmp (keeps the
+                // Binary probe). See `class_cmp_affinity`.
+                let node = match self.class_cmp_affinity(unified, &l, &r, is_eq) {
                     Some(aff) => BExpr::ClassCmp(op, Box::new(l), Box::new(r), coll, aff),
                     None if coll == Collation::Binary => {
                         BExpr::Binary(op, Box::new(l), Box::new(r))
@@ -1947,12 +1950,10 @@ impl<'a> Binder<'a> {
         self.unify_types(l, lt, r, rt, verb)
     }
 
-    /// Comparison-only unify: pin a bare param ONLY from a COLUMN or CAST.
-    ///
-    /// A pure literal/expression carries no sqlite affinity, so `1 = ?` with a
-    /// text bind is a class-order comparison (Eq → FALSE), never a type error.
-    /// Pinning from a column keeps `WHERE id = ?` on a rigid int64 slot.
-    fn unify_compare_operands(
+    /// Equality: pin bare params from COLUMN or CAST so `WHERE id = ?` is a
+    /// Binary probe (PkPoint). Text/float binds that are not exact for the
+    /// column type still refuse at coerce_params (or convert when exact).
+    fn unify_compare_eq(
         &mut self,
         l: BExpr,
         lt: Ty,
@@ -1962,6 +1963,34 @@ impl<'a> Binder<'a> {
         let pin_source = |e: &BExpr, t: Ty| -> Option<ColumnType> {
             match (e, t) {
                 (BExpr::Col(_), Some(t)) if t != ColumnType::Any => Some(t),
+                (BExpr::Cast(_, _), Some(t)) => Some(t),
+                _ => None,
+            }
+        };
+        let (l, lt) = match pin_source(&r, rt) {
+            Some(t) => self.unify_param(l, lt, t),
+            None => (l, lt),
+        };
+        let (r, rt) = match pin_source(&l, lt) {
+            Some(t) => self.unify_param(r, rt, t),
+            None => (r, rt),
+        };
+        self.unify_types(l, lt, r, rt, "compare")
+    }
+
+    /// Inequality: never pin a bare param from a COLUMN.
+    ///
+    /// `year >= ?` with a float bind (Django annotate) must compare numerically.
+    /// ClassCmp+Numeric does that; Binary+int pin would refuse 1942.1.
+    fn unify_compare_operands(
+        &mut self,
+        l: BExpr,
+        lt: Ty,
+        r: BExpr,
+        rt: Ty,
+    ) -> Result<(BExpr, BExpr, Ty)> {
+        let pin_source = |e: &BExpr, t: Ty| -> Option<ColumnType> {
+            match (e, t) {
                 (BExpr::Cast(_, _), Some(t)) => Some(t),
                 _ => None,
             }
@@ -2041,7 +2070,30 @@ impl<'a> Binder<'a> {
     /// and ordering by class WITHOUT the affinity is the wrong answer this
     /// rule exists to avoid (`price < '40.0'` would say "every number is
     /// smaller than a text" where sqlite compares against 40.0).
-    fn class_cmp_affinity(&self, unified: Ty, l: &BExpr, r: &BExpr) -> Option<Affinity> {
+    fn class_cmp_affinity(
+        &self,
+        unified: Ty,
+        l: &BExpr,
+        r: &BExpr,
+        is_eq: bool,
+    ) -> Option<Affinity> {
+        let is_param = |e: &BExpr| matches!(e, BExpr::Param(_));
+        let is_col = |e: &BExpr| matches!(e, BExpr::Col(_));
+        // Column vs bare param for INEQUALITY only: ClassCmp+Numeric so a float
+        // bind against an INTEGER column is exact (Django annotate). Equality
+        // keeps Binary so access extraction can still form PkPoint/IndexPoint.
+        if !is_eq && ((is_param(l) && is_col(r)) || (is_param(r) && is_col(l))) {
+            let col_e = if is_col(l) { l } else { r };
+            if let BExpr::Col(i) = col_e {
+                if let Some((_, aff)) = self.scope.column_shape(*i) {
+                    let numeric = matches!(
+                        aff,
+                        Affinity::Integer | Affinity::Real | Affinity::Numeric
+                    );
+                    return Some(if numeric { Affinity::Numeric } else { aff });
+                }
+            }
+        }
         if !matches!(unified, Some(ColumnType::Any) | None) {
             // A concrete unified type normally means both sides already agree
             // and a plain Binary comparison is correct. The one exception is a
@@ -2049,8 +2101,6 @@ impl<'a> Binder<'a> {
             // the concrete side's type, but at runtime the bound value may be
             // any class — emit ClassCmp (no affinity) so `1 = ?` with a text
             // bind answers FALSE rather than "cannot compare".
-            let is_param = |e: &BExpr| matches!(e, BExpr::Param(_));
-            let is_col = |e: &BExpr| matches!(e, BExpr::Col(_));
             if !((is_param(l) || is_param(r)) && !is_col(l) && !is_col(r)) {
                 return None;
             }
@@ -2064,7 +2114,6 @@ impl<'a> Binder<'a> {
         let is_any_col = |e: &BExpr| col_ty(e) == Some(ColumnType::Any);
         let is_typed_col = |e: &BExpr| col_ty(e).is_some_and(|t| t != ColumnType::Any);
         let is_cast = |e: &BExpr| matches!(e, BExpr::Cast(..));
-        let is_param = |e: &BExpr| matches!(e, BExpr::Param(_));
         // A bare `any` column admits the rule on its own (unchanged). A CAST
         // admits it only when the OTHER side is not a bare concrete column,
         // which is the shape whose index probe must survive. A bare PARAM
@@ -3081,7 +3130,7 @@ impl<'a> Binder<'a> {
         )))
     }
 
-    fn unify_many(&mut self, operands: Vec<(BExpr, Ty)>, verb: &str) -> Result<(Vec<BExpr>, Ty)> {
+    fn unify_many(&mut self, operands: Vec<(BExpr, Ty)>, _verb: &str) -> Result<(Vec<BExpr>, Ty)> {
         // A dynamically-typed operand (`any` — a mixed CASE/COALESCE arm, a
         // host UDF result, a typeless column) unifies with the whole set the
         // way it unifies with one operand in `unify_operands`: nothing is
@@ -3108,7 +3157,11 @@ impl<'a> Binder<'a> {
                 Some(prev) if prev == t => prev,
                 Some(ColumnType::Int64) if t == ColumnType::Float64 => ColumnType::Float64,
                 Some(ColumnType::Float64) if t == ColumnType::Int64 => ColumnType::Float64,
-                Some(prev) => return Err(bind_err(format!("cannot {verb}: {prev} and {t}"))),
+                // Mixed non-numeric classes (text vs int64, …): settle to `any`
+                // so membership runs at runtime under class order / numeric
+                // compare (sqlite). Django's injection probe is
+                // `name IN (num_chairs + '…')` — text probe, int expression.
+                Some(_) => ColumnType::Any,
             });
         }
         let Some(target) = target else {

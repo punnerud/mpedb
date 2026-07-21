@@ -256,6 +256,7 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
                     .map(|&c| match rows[0].get(c as usize) {
                         Some(InsertSource::Param(i)) => Some(KeyPart::Param(*i)),
                         Some(InsertSource::Const(i)) => Some(KeyPart::Const(*i)),
+                        Some(InsertSource::Expr(_)) => None,
                         _ => None,
                     })
                     .collect();

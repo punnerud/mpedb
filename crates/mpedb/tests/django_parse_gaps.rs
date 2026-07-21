@@ -1122,17 +1122,34 @@ fn an_expression_in_insert_values_agrees_with_sqlite() {
         "INSERT INTO c (id, name) VALUES (9, UPPER('xy')) RETURNING id, name",
     );
 
-    // Still refused, and by name: a MULTI-row VALUES with an expression would
-    // need `UNION ALL`, which the INSERT … SELECT source refuses.
+    // Multi-row VALUES with an expression (PLAN_FORMAT 57): each cell that is
+    // not a bare literal/param is a dual-row program. Django bulk_create.
     let t = open();
     for s in &setup[..3] {
         t.db.query(s, &[]).unwrap();
     }
-    let e = t
+    t.db
+        .query(
+            "INSERT INTO c (id, name) VALUES (7, 'x'), (8, LOWER('Y'))",
+            &[],
+        )
+        .unwrap();
+    let res = t
         .db
-        .query("INSERT INTO c (id, name) VALUES (7, 'x'), (8, LOWER('Y'))", &[])
-        .unwrap_err();
-    assert!(format!("{e}").contains("literals or parameters"), "{e}");
+        .query("SELECT id, name FROM c WHERE id IN (7, 8) ORDER BY id", &[])
+        .unwrap();
+    match res {
+        ExecResult::Rows { rows, .. } => {
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Value::Int(7), Value::Text("x".into())],
+                    vec![Value::Int(8), Value::Text("y".into())],
+                ]
+            );
+        }
+        other => panic!("{other:?}"),
+    }
 }
 
 // ------------------------------------------------ the time keywords ---------

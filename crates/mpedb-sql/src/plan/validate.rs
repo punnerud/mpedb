@@ -862,6 +862,11 @@ impl CompiledPlan {
                     for (ci, src) in row.iter().enumerate() {
                         let col = &t.columns[ci];
                         match src {
+                            InsertSource::Expr(prog) => {
+                                // Dual-row (width 0): no base columns, only
+                                // constants / params / builtins.
+                                self.check_program_width(prog, 0, ptypes)?;
+                            }
                             InsertSource::Param(i) => {
                                 if *i >= self.n_params {
                                     return Err(corrupt("param index out of range"));
@@ -1398,8 +1403,13 @@ impl CompiledPlan {
                 let Some(pt) = ptypes.get(*i as usize) else {
                     return Err(corrupt("key param out of range"));
                 };
-                if *pt != Some(ty) {
-                    return Err(corrupt("key param type mismatch"));
+                // None is allowed: inequality ClassCmp leaves the param free so
+                // a float bind against an int key still compares (Numeric
+                // affinity at residual time). A pinned type must still match.
+                if let Some(t) = pt {
+                    if *t != ty {
+                        return Err(corrupt("key param type mismatch"));
+                    }
                 }
             }
             KeyPart::Const(i) => {

@@ -219,11 +219,20 @@ pub(super) fn in_items_3vl(probe: &Value, items: &[Value]) -> Result<Value> {
             saw_null = true;
             continue;
         }
-        // Type mismatches inside the list are the caller's error, not a silent
-        // non-match: `org_id IN (list-of-text)` must not quietly deny every row.
-        match probe.sql_cmp(it)? {
-            Some(std::cmp::Ordering::Equal) => return Ok(Value::Bool(true)),
-            _ => continue,
+        // Prefer sql_cmp (same-class / numeric). A cross-class pair is a
+        // non-match under sqlite's storage-class order (not a type error) —
+        // `name IN (num_chairs + 0)` is FALSE for a text name, never a refusal.
+        match probe.sql_cmp(it) {
+            Ok(Some(std::cmp::Ordering::Equal)) => return Ok(Value::Bool(true)),
+            Ok(_) => continue,
+            Err(_) => {
+                // Cross-class: only Equal if sort_cmp says so (it almost never
+                // will for different ranks).
+                match probe.sort_cmp(it, Collation::Binary) {
+                    Some(std::cmp::Ordering::Equal) => return Ok(Value::Bool(true)),
+                    _ => continue,
+                }
+            }
         }
     }
     Ok(if saw_null { Value::Null } else { Value::Bool(false) })
@@ -249,9 +258,13 @@ pub(super) fn in_items_3vl_collated(
             saw_null = true;
             continue;
         }
-        match probe.sql_cmp_collated(it, coll)? {
-            Some(std::cmp::Ordering::Equal) => return Ok(Value::Bool(true)),
-            _ => continue,
+        match probe.sql_cmp_collated(it, coll) {
+            Ok(Some(std::cmp::Ordering::Equal)) => return Ok(Value::Bool(true)),
+            Ok(_) => continue,
+            Err(_) => match probe.sort_cmp(it, coll) {
+                Some(std::cmp::Ordering::Equal) => return Ok(Value::Bool(true)),
+                _ => continue,
+            },
         }
     }
     Ok(if saw_null { Value::Null } else { Value::Bool(false) })

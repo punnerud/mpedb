@@ -604,6 +604,7 @@ impl CompiledPlan {
                                 InsertSource::Param(i) => format!("${}", i + 1),
                                 InsertSource::Const(i) => self.render_const(*i),
                                 InsertSource::Default => "DEFAULT".into(),
+                                InsertSource::Expr(_) => "<expr>".into(),
                             };
                             format!("{} = {v}", name(c as u16))
                         })

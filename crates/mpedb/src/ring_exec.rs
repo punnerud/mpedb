@@ -592,6 +592,9 @@ fn optimistic_prep_inner(
                         },
                         None => return Prep::Fallback,
                     },
+                    // Expression cells need the dual-row eval path; fall back
+                    // to the ordinary writer rather than re-implement it here.
+                    InsertSource::Expr(_) => return Prep::Fallback,
                 };
                 values.push(v);
             }

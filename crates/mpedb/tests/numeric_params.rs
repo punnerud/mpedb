@@ -1,16 +1,12 @@
-//! Task #74 item 1 — **rigid numeric parameter typing**.
+//! Task #74 item 1 — **numeric parameters vs sqlite affinity**.
 //!
 //! sqlite has no parameter types: `sqlite3_bind_int64(1)` against
 //! `WHERE real_col > ?` is compared numerically, and `sqlite3_bind_double(1.0)`
-//! into an INTEGER column is stored as the integer 1 by INTEGER affinity. mpedb
-//! infers a type per parameter slot, so the DRIVER's choice of bind function —
-//! which for Django/CPython follows the Python value's type, not the column's —
-//! decided whether the statement ran at all.
-//!
-//! The fix bridges at BIND (`coerce_params`), exactly like the pre-existing
-//! int↔bool bridge, and **only when the round trip is exact**. The inexact
-//! cases stay refused BY NAME, which is the point: rounding a parameter before
-//! a comparison would be a wrong answer, not a wider one.
+//! into an INTEGER column is stored as the integer 1 by INTEGER affinity.
+//! Comparison uses ClassCmp + Numeric affinity so a float bind against an
+//! INTEGER column (`year >= 1942.1`, Django annotate) is exact numeric
+//! comparison, never truncated. Assignment still refuses an inexact float
+//! into an int column BY NAME (store-time INTEGER affinity).
 //!
 //! Every "mpedb now accepts it" case is checked against the real `sqlite3`
 //! binary; every "mpedb still refuses" case asserts the reason is named.
@@ -209,47 +205,47 @@ fn null_parameters_still_bind_to_either_slot() {
 
 #[test]
 fn inexact_conversions_are_refused_by_name() {
-    // 1.5 into an int64 slot: sqlite compares `i > 1.5` exactly. Truncating to
-    // 1 (or rounding to 2) would be a WRONG answer, so it is refused instead.
-    refuses("SELECT id FROM t WHERE i > ?", &[Value::Float(1.5)], "not an exact integer");
-    // The INSERT half moved from the parameter check to the STORE check when
-    // `i` became a column carrying sqlite's INTEGER affinity (#113): the value
-    // is converted first and refused on what the conversion left, which is the
-    // same refusal with a sharper reason.
+    // Comparison: float bind vs INTEGER column is numeric (sqlite), not refused.
+    // Truncating the param would be a wrong answer — ClassCmp+Numeric keeps it.
+    same_as_sqlite(
+        "SELECT id FROM t WHERE i > ? ORDER BY id",
+        &[Value::Float(1.5)],
+        "SELECT id FROM t WHERE i > 1.5 ORDER BY id",
+    );
+    // Django annotate shape: year >= 1942.1.
+    same_as_sqlite(
+        "SELECT id FROM t WHERE i >= ? ORDER BY id",
+        &[Value::Float(5.1)],
+        "SELECT id FROM t WHERE i >= 5.1 ORDER BY id",
+    );
+    // The INSERT half: store-time INTEGER affinity refuses a non-integral float.
     refuses(
         "INSERT INTO t (id, i) VALUES (9, ?)",
         &[Value::Float(7.5)],
         "INTEGER affinity left it a float64",
     );
 
-    // Outside the i64 range — a different reason, named differently.
-    refuses("SELECT id FROM t WHERE i > ?", &[Value::Float(1e300)], "outside the int64 range");
-    refuses("SELECT id FROM t WHERE i > ?", &[Value::Float(f64::NAN)], "not an exact integer");
-    refuses("SELECT id FROM t WHERE i > ?", &[Value::Float(f64::INFINITY)], "not an exact integer");
+    // Extreme floats still compare (sqlite); NaN/inf stay reals under Numeric.
+    same_as_sqlite(
+        "SELECT id FROM t WHERE i > ? ORDER BY id",
+        &[Value::Float(1e300)],
+        "SELECT id FROM t WHERE i > 1e300 ORDER BY id",
+    );
 
-    // An integer too large to be an f64 exactly. sqlite compares an integer
-    // against a real EXACTLY (`sqlite3IntFloatCompare`), so widening the
-    // parameter first could flip the `>`.
-    refuses(
-        "SELECT id FROM t WHERE r > ?",
-        &[Value::Int(i64::MAX)],
-        "too large to convert to float64",
-    );
-    refuses(
-        "SELECT id FROM t WHERE r > ?",
-        &[Value::Int(i64::MIN + 1)],
-        "too large to convert to float64",
-    );
-    // …but the boundary values that ARE exact still go through: i64::MIN is
-    // exactly -2^63, and every value up to 2^53 is exact.
+    // Int bind vs REAL column: ClassCmp+Numeric compares without coercing the
+    // parameter to f64 first (sqlite's exact int/real compare).
     let t = open();
-    for n in [0i64, 1, -1, 1 << 52, 1 << 53, -(1 << 53), 1 << 62, i64::MIN] {
+    for n in [0i64, 1, -1, 1 << 52, 1 << 53, -(1 << 53), 1 << 62, i64::MIN, i64::MAX, i64::MIN + 1] {
         t.db.query("SELECT id FROM t WHERE r > ?", &[Value::Int(n)])
-            .unwrap_or_else(|e| panic!("{n} should bridge exactly: {e}"));
+            .unwrap_or_else(|e| panic!("{n} should compare: {e}"));
     }
-    // 2^53 + 1 is the first integer an f64 cannot hold.
+    // 2^53 + 1 also compares without a float bridge.
+    t.db
+        .query("SELECT id FROM t WHERE r > ?", &[Value::Int((1i64 << 53) + 1)])
+        .unwrap();
+    // Keep a refuse probe that still hits the float64 slot pin: CAST forces it.
     refuses(
-        "SELECT id FROM t WHERE r > ?",
+        "SELECT id FROM t WHERE CAST(r AS REAL) > ?",
         &[Value::Int((1i64 << 53) + 1)],
         "too large to convert to float64",
     );
@@ -344,12 +340,17 @@ fn the_bool_bridge_and_exact_matches_are_unchanged() {
         rows_of(t.db.query("SELECT id FROM t WHERE r = ?", &[Value::Float(2.5)]).unwrap()),
         vec![vec!["1".to_string()]]
     );
-    // A text parameter in a numeric slot is still a plain, unqualified refusal
-    // — the message the Python SDK matches on must not have grown a suffix.
+    // Text bind vs INTEGER column: full integer text converts (`'5'` → 5).
+    same_as_sqlite(
+        "SELECT id FROM t WHERE i = ? ORDER BY id",
+        &[Value::Text("5".into())],
+        "SELECT id FROM t WHERE i = 5 ORDER BY id",
+    );
+    // Non-numeric text cannot fill an int equality slot (pinned for PkPoint).
     let e = t
         .db
-        .query("SELECT id FROM t WHERE i = ?", &[Value::Text("5".into())])
-        .expect_err("text must not bridge")
+        .query("SELECT id FROM t WHERE i = ?", &[Value::Text("x".into())])
+        .expect_err("non-numeric text must not fill int equality")
         .to_string();
-    assert!(e.ends_with("parameter $1 is text, statement requires int64"), "{e}");
+    assert!(e.contains("text") && e.contains("int64"), "{e}");
 }

@@ -2532,6 +2532,10 @@ fn build_insert_row_impl<'a>(
                     None => Value::Null, // plan-validated: column is nullable
                 }
             }
+            InsertSource::Expr(prog) => {
+                // Dual row: empty tuple. Program carries its own const pool.
+                prog.eval(&[], params)?
+            }
         });
     }
     Ok(std::borrow::Cow::Owned(row))
@@ -2620,6 +2624,19 @@ pub(crate) fn coerce_params<'a>(
             (Value::Float(f), mpedb_types::ColumnType::Int64) => {
                 exact_float_as_int(*f).map(Value::Int)
             }
+            // sqlite affinity: a full integer/float text against an int/real slot
+            // converts (Django and CPython often bind numbers as text).
+            (Value::Text(s), mpedb_types::ColumnType::Int64) => s
+                .trim()
+                .parse::<i64>()
+                .ok()
+                .map(Value::Int),
+            (Value::Text(s), mpedb_types::ColumnType::Float64) => s
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite())
+                .map(Value::Float),
             _ => None,
         };
         match bridged {
