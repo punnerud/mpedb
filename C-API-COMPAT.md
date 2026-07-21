@@ -19,8 +19,8 @@ sqlite's C reference lists ~300 functions and ~250 constants. This shim exports
 the **~50 the drop-in consumer path actually calls** — Python's `sqlite3`, language
 bindings, common tools — validated end-to-end by a DB-API 2.0 battery that matches
 stock sqlite **23/23**, and measured against **CPython's own `test_sqlite3`
-suite** (the authoritative consumer test of that surface: 450 of the 467
-tests stock passes, at HEAD on the M3 — see the section at the end; the suite
+suite** (the authoritative consumer test of that surface: **458 of the 467**
+tests stock passes, at HEAD on the M3 — see AT HEAD (4); the suite
 hammers contract details — destructor rules, trace, limits, error codes — that
 "the ~50 functions exist" does not capture, so it is the scope's honest
 yardstick).
@@ -2179,13 +2179,10 @@ parameter and the statement fails with a binding-count error. Django's
 shape (`crafted_alia$.id`) does not hit it.
 
 
-> **Reading order note — SUPERSEDED.** The two sections that follow were measured at
-> *different* commits (the consolidated run 7 at `b41b713`; E3(b)'s before/after pair on
-> the Linux box against a control build of that same commit). Both are kept as history.
-> **The current headline is "AT HEAD (3) — re-measured at `c4d1a90`" at the end
-> of this file**: Apple M3, CPython **457/467** of stock-passing; Django A
-> **826/831** and `queries` **490/493** (same failing sets as `d83c21d`, zero
-> wrong-answer FAILs). Linux CPython corroboration: **451/461**.
+> **Reading order note — SUPERSEDED.** Sections below are kept as history.
+> **The current headline is "AT HEAD (4) — re-measured at `bf1207e`" at the end
+> of this file**: Apple M3, CPython **458/467** of stock-passing; Django A
+> **831/831** and `queries` **493/493** (zero wrong-answer FAILs).
 
 ## The consolidated measurement — Django run 7 + CPython, ONE commit (2026-07-20)
 
@@ -3148,3 +3145,85 @@ multi-row VALUES with expression ×1).
 
 **Wrong SQL answers: 0.** P1 / CTE / alias / ON CONFLICT ROLLBACK moved no
 Django test either way.
+
+---
+
+## AT HEAD (4) — re-measured at `bf1207e` (2026-07-21)
+
+**This is the current headline.** Commit `bf1207e` (verbatim VIEW/TRIGGER DDL,
+mid-txn `sqlite_master`, soft-coerce text→int/float, backup high_water progress)
+plus the post-`c4d1a90` chain: correlated HAVING/SELECT scratch (`37622a6`),
+projection collapse (`63ddef6`), nested derived (`be65938`), ATTACH `:memory:`
++ pure-attached write (`fd3c455`/`e80e737`), INSERT VALUES expressions
+(`21cd819`), VIEW/TRIGGER in WriteSession (`03af536`).
+
+**Machine: Apple M3 Pro, macOS, arm64.** Release `mpedb-capi` built in
+`~/mpedb-measure` (rsync of Linux `main` @ `bf1207e`, no dirty local tree).
+**Interpreter: Homebrew CPython 3.12.12** — 474 tests, 7 skips; stock libsqlite3
+**3.53.1** passes **467**.
+**Django:** `~/django-workbench` (5.2.x), workbench `run_suite.sh`, `WB_ARM=shim`.
+**Interposition proof:**
+
+```
+interposition  stock: 3.53.1
+interposition  shim : 3.45.0
+```
+
+### CPython `test_sqlite3`
+
+| arm | run | pass | FAIL | ERROR | skip |
+|---|---|---|---|---|---|
+| stock libsqlite3 3.53.1 | 474 | **467** | 0 | 0 | 7 |
+| **shim @ `bf1207e`** | 474 | **458** | **2** | **7** | 7 |
+
+**458 / 467 = 98.1 %** of the baseline-passing suite (was **457/467** at `c4d1a90`).
+
+#### The 2 FAIL + 7 ERROR
+
+| id | class | notes vs `c4d1a90` |
+|---|---|---|
+| `test_backup.BackupTests.test_progress` | FAIL — `73 != 2` | still residual; high_water (~73) not sqlite's 2 pages |
+| `test_dump.DumpTests.test_table_dump` | FAIL — DDL/views/triggers OK; one INSERT line empties `VALUES()` for `"quoted""table"` | **was ERROR** (VIEW/TRIGGER in txn); now runs, residual is iterdump row encoding for a doubled-quote table name |
+| `test_backup…test_modifying_progress` | ERROR — restart semantics | unchanged (mid-backup write not in snapshot) |
+| `test_dbapi…test_connection_config` | ERROR — FK config / D11 | unchanged |
+| `test_dbapi…test_serialize_deserialize` | ERROR — serialize non-goal | unchanged |
+| `test_dump…test_dump_autoincrement` ×2 | ERROR — AUTOINCREMENT | deliberate |
+| `test_dump…test_dump_virtual_tables` | ERROR — fts4 | deliberate |
+| `test_regression…test_error_msg_decode_error` | ERROR — non-UTF-8 blob in `\|\|` | structural |
+
+**Closed vs `c4d1a90`:** `test_backup.test_database_source_name` (ATTACH `:memory:` +
+attached write). Net **+1** pass; `test_table_dump` reclassified ERROR→FAIL.
+
+**Wrong SQL answers: 0.**
+
+### Django frozen A + `queries`
+
+| label set | tests | stock | shim | vs `c4d1a90` |
+|---|---|---|---|---|
+| G1 | 392 | OK | **OK** (skipped=17) | was 390/392 |
+| G2 | 439 | OK | **OK** (skipped=5, xfail=1) | was 436/439 |
+| **A = G1+G2** | **831** | **831/831** | **831 / 831 (100 %)** | **+5** |
+| B `queries` | 493 | OK | **OK** (skipped=15, xfail=2) — **493 / 493 (100 %)** | **+3** |
+
+Wall-clock (M3, in-process SHM): G1 0.70 s, G2 0.24 s, queries 0.48 s. Logs under
+`~/mpedb-measure-results/django-{A,queries}/` on the M3.
+
+**Wrong SQL answers: 0.** The previous eight ERRORs (float→int ×2, correlated
+aggregate/HAVING ×2, IN-list injection ×1, nested derived ×2, bulk INSERT VALUES
+×1) are all gone.
+
+### Reproduction (M3)
+
+```
+# tree: rsync of main @ bf1207e → ~/mpedb-measure ; CARGO_TARGET_DIR=~/mpedb-measure-target
+cargo build --release -p mpedb-capi
+SHIM=~/mpedb-measure-results/shim
+mkdir -p $SHIM
+ln -sf ~/mpedb-measure-target/release/libmpedb_sqlite3.dylib $SHIM/libsqlite3.dylib
+/usr/bin/env DYLD_LIBRARY_PATH=$SHIM /opt/homebrew/bin/python3.12 -m test test_sqlite3 -v
+
+WB_DJANGO=~/django-workbench/django WB_PY=~/django-workbench/venv/bin/python \
+  WB_OUT=~/mpedb-measure-results/django-A WB_ARM=shim \
+  crates/mpedb-capi/workbench/djsuite/run_suite.sh
+WB_GROUP_BASE=3 WB_LABEL_GROUPS=$'queries' WB_OUT=…/django-queries … run_suite.sh
+```
