@@ -1928,13 +1928,12 @@ impl WriteSession<'_> {
                         .into(),
                 ))
             }
-            multifile::DbRoute::AttachedOnly { .. } => {
-                return Err(Error::Unsupported(
-                    "writes to an attached database inside an open write \
-                     transaction on main are not supported in v1 (run them \
-                     in autocommit)"
-                        .into(),
-                ))
+            // Pure attached-only work goes to the member handle, not this
+            // session's COW. That is correct: the attached file is a separate
+            // engine, and CPython (implicit main txn) still does
+            // `ATTACH ':memory:'; CREATE TABLE attached.foo` mid-transaction.
+            multifile::DbRoute::AttachedOnly { db, sql } => {
+                return self.db.query_attached_only(&db, &sql, params);
             }
         };
         // #95: DDL (CREATE/DROP/ALTER TABLE, CREATE INDEX) runs THROUGH this
