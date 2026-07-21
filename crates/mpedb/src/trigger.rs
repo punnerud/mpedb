@@ -475,6 +475,170 @@ impl Database {
     }
 }
 
+/// `CREATE TRIGGER` on an open write txn (WriteSession path — no nested commit).
+pub(crate) fn create_trigger_on_txn(
+    w: &mut WriteTxn<'_>,
+    db: &Database,
+    spec: mpedb_sql::CreateTriggerSpec,
+) -> Result<()> {
+    let bundle = w.schema_bundle();
+    let table_id = bundle.schema.table_id(&spec.table).ok_or_else(|| {
+        Error::Bind(format!("CREATE TRIGGER: no such table `{}`", spec.table))
+    })?;
+    let table = bundle
+        .schema
+        .table(table_id)
+        .expect("table_id resolved")
+        .clone();
+
+    let timing = match spec.timing {
+        mpedb_sql::TriggerTiming::Before => TrgTiming::Before,
+        mpedb_sql::TriggerTiming::After => TrgTiming::After,
+    };
+    let (event, allow_new, allow_old, update_of) = match &spec.event {
+        mpedb_sql::TriggerEvent::Insert => (TrgEvent::Insert, true, false, Vec::new()),
+        mpedb_sql::TriggerEvent::Update { of } => {
+            let mut cols = Vec::with_capacity(of.len());
+            for name in of {
+                let idx = table.column_index(name).ok_or_else(|| {
+                    Error::Bind(format!(
+                        "CREATE TRIGGER: UPDATE OF: no such column `{name}` on table `{}`",
+                        spec.table
+                    ))
+                })?;
+                cols.push(idx);
+            }
+            (TrgEvent::Update, true, true, cols)
+        }
+        mpedb_sql::TriggerEvent::Delete => (TrgEvent::Delete, false, true, Vec::new()),
+    };
+
+    let _ = mpedb_sql::compile_trigger_body(
+        &spec.body_sql,
+        &table,
+        &bundle.schema,
+        allow_new,
+        allow_old,
+    )?;
+    if let Some(when_src) = &spec.when_src {
+        let _ = mpedb_sql::compile_trigger_when(when_src, &table, allow_new, allow_old)?;
+    }
+    // Silence unused: db is available for future cache hooks; schema_gen bump
+    // invalidates the trigger cache on commit.
+    let _ = db;
+
+    let key = trigger_key(&spec.name);
+    if resolve_trigger_key(w, &spec.name)?.is_some() {
+        if spec.if_not_exists {
+            return Ok(());
+        }
+        return Err(Error::Bind(format!(
+            "CREATE TRIGGER: trigger `{}` already exists",
+            spec.name
+        )));
+    }
+    let record = StoredTrigger {
+        name: spec.name.clone(),
+        table_id,
+        timing,
+        event,
+        update_of,
+        when_src: spec.when_src.clone(),
+        body_sql: spec.body_sql.clone(),
+    }
+    .encode();
+    w.sys_put(&key, &record)?;
+    w.bump_schema_gen();
+    Ok(())
+}
+
+/// `DROP TRIGGER` on an open write txn.
+pub(crate) fn drop_trigger_on_txn(
+    w: &mut WriteTxn<'_>,
+    name: &str,
+    if_exists: bool,
+) -> Result<()> {
+    let found = resolve_trigger_key(w, name)?;
+    let key = found.clone().unwrap_or_else(|| trigger_key(name));
+    if found.is_none() {
+        if if_exists {
+            return Ok(());
+        }
+        return Err(Error::Bind(format!("DROP TRIGGER: no such trigger `{name}`")));
+    }
+    w.sys_delete(&key)?;
+    w.bump_schema_gen();
+    Ok(())
+}
+
+/// Every stored trigger as `(name, tbl_name, create_sql)` for `sqlite_master`
+/// / iterdump. `create_sql` is reconstructed from the catalog record so a dump
+/// can re-create the trigger (verbatim storage is a separate C-API path).
+impl Database {
+    pub fn list_triggers(&self) -> Result<Vec<(String, String, String)>> {
+        let r = self.engine.begin_read()?;
+        let scan = r.sys_scan_range(TRIGGER_PREFIX, TRIGGER_PREFIX_END);
+        let bundle = self.engine.schema();
+        r.finish()?;
+        let mut out = Vec::new();
+        for (subkey, value) in scan? {
+            if !subkey.starts_with(TRIGGER_PREFIX) {
+                continue;
+            }
+            let Ok(st) = StoredTrigger::decode(&value) else {
+                continue;
+            };
+            let (tbl, col_names) = match bundle.schema.table(st.table_id) {
+                Some(t) => (
+                    t.name.clone(),
+                    t.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+                ),
+                None => (format!("table_{}", st.table_id), Vec::new()),
+            };
+            let sql = reconstruct_create_trigger(&st, &tbl, &col_names);
+            out.push((st.name, tbl, sql));
+        }
+        Ok(out)
+    }
+}
+
+fn reconstruct_create_trigger(st: &StoredTrigger, table: &str, col_names: &[String]) -> String {
+    let timing = match st.timing {
+        TrgTiming::Before => "BEFORE",
+        TrgTiming::After => "AFTER",
+    };
+    let event = match st.event {
+        TrgEvent::Insert => "INSERT".to_string(),
+        TrgEvent::Delete => "DELETE".to_string(),
+        TrgEvent::Update => {
+            if st.update_of.is_empty() {
+                "UPDATE".to_string()
+            } else {
+                let cols: Vec<&str> = st
+                    .update_of
+                    .iter()
+                    .filter_map(|&i| col_names.get(i as usize).map(|s| s.as_str()))
+                    .collect();
+                if cols.is_empty() {
+                    "UPDATE".to_string()
+                } else {
+                    format!("UPDATE OF {}", cols.join(", "))
+                }
+            }
+        }
+    };
+    let when = st
+        .when_src
+        .as_ref()
+        .map(|w| format!(" WHEN {w}"))
+        .unwrap_or_default();
+    // Body is stored without the BEGIN/END wrapper the parser strips.
+    format!(
+        "CREATE TRIGGER \"{}\" {timing} {event} ON \"{table}\"{when} BEGIN {} END",
+        st.name, st.body_sql
+    )
+}
+
 /// Delete every trigger record targeting `table_id`, inside the caller's write
 /// txn — the `DROP TABLE` cascade (DESIGN-TRIGGERS §3.1). A dropped table's
 /// triggers are dead; removing them keeps the catalog clean.

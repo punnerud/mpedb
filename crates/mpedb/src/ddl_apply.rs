@@ -32,19 +32,27 @@ impl Database {
     /// with a full registry, for a statement that touches none of it.
     pub(crate) fn load_view_catalog(&self) -> Result<mpedb_sql::ViewCatalog> {
         let mut cat = mpedb_sql::ViewCatalog::new();
+        for (name, src) in self.list_views()? {
+            cat.insert(name, src);
+        }
+        Ok(cat)
+    }
+
+    /// Every stored view as `(name, select_source)` — used by the C-API
+    /// `sqlite_master` dump and by [`load_view_catalog`].
+    pub fn list_views(&self) -> Result<Vec<(String, String)>> {
+        let mut out = Vec::new();
         let r = self.engine.begin_read()?;
         let scan = r.sys_scan_range(VIEW_PREFIX, VIEW_PREFIX_END);
         r.finish()?;
         for (subkey, value) in scan? {
-            // The range is already `view/…`-only; strip_prefix stays as the
-            // authority on the bound rather than trusting it.
             if let Some(name) = subkey.strip_prefix(VIEW_PREFIX) {
                 let name = String::from_utf8_lossy(name).into_owned();
                 let src = String::from_utf8_lossy(&value).into_owned();
-                cat.insert(name, src);
+                out.push((name, src));
             }
         }
-        Ok(cat)
+        Ok(out)
     }
 
     /// `CREATE VIEW [IF NOT EXISTS] <name> AS <select>`. Stores the SELECT
@@ -121,9 +129,30 @@ impl Database {
 }
 
 fn view_key(name: &str) -> Vec<u8> {
+    view_key_public(name)
+}
+
+/// Sys-key for a stored view — shared by autocommit and in-txn CREATE VIEW.
+pub(crate) fn view_key_public(name: &str) -> Vec<u8> {
     let mut k = VIEW_PREFIX.to_vec();
     k.extend_from_slice(name.as_bytes());
     k
+}
+
+/// Does a view named `name` exist on this write txn (ASCII-case-insensitive)?
+pub(crate) fn view_exists_on_txn(
+    w: &mut mpedb_core::WriteTxn,
+    name: &str,
+) -> Result<bool> {
+    Ok(resolve_view_key(w, name)?.is_some())
+}
+
+/// The sys-key of an existing view, if any (ASCII-case-insensitive).
+pub(crate) fn resolve_view_key_on_txn(
+    w: &mut mpedb_core::WriteTxn,
+    name: &str,
+) -> Result<Option<Vec<u8>>> {
+    resolve_view_key(w, name)
 }
 
 /// The sys-key of the stored view that `name` names, matched

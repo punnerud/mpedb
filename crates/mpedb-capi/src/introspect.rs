@@ -623,10 +623,15 @@ fn master_cell(r: &MasterRow, col: &str) -> Value {
 /// `verbatim` is the caller's own `CREATE TABLE` text per table name, as far as
 /// the shim recorded it (see `ddl_record`); a table with no usable record gets
 /// the canonical reconstruction instead.
+///
+/// `views` / `triggers` are `(name, create_sql)` / `(name, tbl_name, create_sql)`
+/// from the engine catalog so iterdump can re-emit them.
 pub fn sqlite_master(
     schema: &mpedb::Schema,
     sql: &str,
     verbatim: &std::collections::HashMap<String, Vec<u8>>,
+    views: &[(String, String)],
+    triggers: &[(String, String, String)],
 ) -> Result<(Vec<String>, Vec<Vec<Value>>), DbError> {
     let lower = sql.to_ascii_lowercase();
     let sel = lower
@@ -647,7 +652,8 @@ pub fn sqlite_master(
     let where_src = where_at.map(|w| sql[w + 5..where_end].trim().to_string());
     let order_src = order_at.map(|o| sql[o + 5..].trim().to_string());
 
-    // Build the full candidate set (user tables only, for now).
+    // User tables, then views, then triggers — sqlite's sqlite_master order
+    // for iterdump is type-grouped but ORDER BY name is what consumers use.
     let mut rows: Vec<MasterRow> = user_tables(schema)
         .iter()
         .map(|t| MasterRow {
@@ -657,6 +663,23 @@ pub fn sqlite_master(
             sql: master_sql(t, verbatim.get(&t.name)),
         })
         .collect();
+    for (name, select_sql) in views {
+        let create = format!("CREATE VIEW \"{name}\" AS {select_sql}");
+        rows.push(MasterRow {
+            ty: "view",
+            name: name.clone(),
+            tbl_name: name.clone(),
+            sql: create,
+        });
+    }
+    for (name, tbl, create_sql) in triggers {
+        rows.push(MasterRow {
+            ty: "trigger",
+            name: name.clone(),
+            tbl_name: tbl.clone(),
+            sql: create_sql.clone(),
+        });
+    }
 
     // WHERE.
     if let Some(w) = &where_src {
