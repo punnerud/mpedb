@@ -2852,28 +2852,34 @@ pub(crate) fn coerce_params<'a>(
                 exact_float_as_int(*f).map(Value::Int)
             }
             // sqlite affinity: a full integer/float text against an int/real slot
-            // converts (Django and CPython often bind numbers as text). A text
-            // that is NOT a number becomes 0 under CAST AS INTEGER (sqlite),
-            // not a type error — so `num_chairs + ?` with an injection string
-            // evaluates rather than aborting (Django's expression-injection
-            // test expects an empty result, not IntegrityError).
+            // converts (Django and CPython often bind numbers as text).
+            //
+            // ⚠ A NON-numeric text must NOT become 0 here. `CAST('abc' AS
+            // INTEGER)` is 0 in sqlite, but BINDING A PARAMETER IS NOT A CAST,
+            // and the two disagree exactly where it matters: sqlite evaluates
+            // `id = 'abc'` by comparing storage classes (integer sorts below
+            // text) and answers FALSE for every row, whereas coercing to 0
+            // makes it MATCH a row whose id is 0. That is a wrong answer, not
+            // a lenient one — and it is the distinction E3(b) settled: apply
+            // the conversion and stay rigid about its RESULT. Returning None
+            // falls through to a named type error, which is narrower than
+            // sqlite and never different from it.
+            //
+            // The arithmetic case (`num_chairs + ?`, where sqlite really does
+            // coerce to 0) is a genuine gap, but it cannot be decided here:
+            // `coerce_params` sees the slot, not whether the parameter is used
+            // in arithmetic or in a comparison. Closing it needs the use site,
+            // not a blanket rule. See C-API-COMPAT.md's named refusal for
+            // `test_expressions_not_introduce_sql_injection_via_untrusted_string_inclusion`.
             (Value::Text(s), mpedb_types::ColumnType::Int64) => {
-                let t = s.trim();
-                Some(match t.parse::<i64>() {
-                    Ok(n) => Value::Int(n),
-                    Err(_) => match t.parse::<f64>() {
-                        Ok(f) if f.is_finite() => Value::Int(f.trunc() as i64),
-                        _ => Value::Int(0),
-                    },
-                })
+                s.trim().parse::<i64>().ok().map(Value::Int)
             }
-            (Value::Text(s), mpedb_types::ColumnType::Float64) => {
-                let t = s.trim();
-                Some(match t.parse::<f64>() {
-                    Ok(f) if f.is_finite() => Value::Float(f),
-                    _ => Value::Float(0.0),
-                })
-            }
+            (Value::Text(s), mpedb_types::ColumnType::Float64) => s
+                .trim()
+                .parse::<f64>()
+                .ok()
+                .filter(|f| f.is_finite())
+                .map(Value::Float),
             _ => None,
         };
         match bridged {
