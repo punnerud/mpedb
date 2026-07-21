@@ -304,11 +304,21 @@ fn a_bare_parameter_binds_as_int64() {
         mpedb_rows(&t.db, "SELECT ? | 1", &[Value::Null]),
         vec![vec!["NULL".to_string()]]
     );
-    // A text parameter in that slot is refused like any other type mismatch.
+    // A FULL-integer text bridges into the int64 slot — 21cd819's position,
+    // asserted differentially in numeric_params.rs and probed against the
+    // bundled oracle: sqlite answers (3, Integer) for `SELECT '3' | 1`.
+    // (This block asserted a refusal until then; the assertion was the one
+    // site that missed the stance change.)
+    assert_eq!(
+        mpedb_rows(&t.db, "SELECT ? | 1", &[Value::Text("3".into())]),
+        vec![vec!["3".to_string()]]
+    );
+    // NON-numeric text stays refused — narrower than sqlite (which coerces to
+    // 0 there), never different: fc088d6's line, and the E3(b) rule.
     let e = t
         .db
-        .query("SELECT ? | 1", &[Value::Text("3".into())])
-        .expect_err("text must not bind to a bitwise operand")
+        .query("SELECT ? | 1", &[Value::Text("abc".into())])
+        .expect_err("non-numeric text must not bind to a bitwise operand")
         .to_string();
     assert!(e.contains("statement requires int64"), "{e}");
 }

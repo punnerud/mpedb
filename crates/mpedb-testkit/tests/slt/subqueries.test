@@ -218,12 +218,16 @@ SELECT count(*) FROM t1 WHERE (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b) >=
 # ---- refusals say what and why -----------------------------------------------------------
 
 # A correlated subquery in an aggregate query is admitted in every PER-ROW
-# position (#97): the WHERE, a GROUP BY key, an aggregate argument, an
-# aggregate's FILTER. It is refused in the two PER-GROUP ones — HAVING, and a
-# SELECT-list expression (here) that is not itself a GROUP BY key — which run
-# after the collapse, where no single row's correlation applies.
-statement error evaluated PER ROW
+# position (#97), and since 37622a6 also in BOTH per-group positions —
+# SELECT-list (here) and HAVING (below): the correlation binds to the group's
+# FIRST-ROW scratch, which is sqlite's answer (differential matrix in
+# agg_correlated_perrow.rs). This block asserted the pre-37622a6 refusal; the
+# oracle answers 4|0 here, and so do we.
+query II nosort
 SELECT count(*), (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b) FROM t1
+----
+4
+0
 
 # Uncorrelated nested subqueries are now supported (#73 §3 stage 1) — the inner
 # `(SELECT avg(c) …)` does not reference the middle scope. Result matches sqlite.
@@ -248,10 +252,15 @@ SELECT b FROM t1 GROUP BY b HAVING count(*) > (SELECT count(*) FROM t1 WHERE b >
 30
 40
 
-# A CORRELATED one in the same position stays refused: its slot would still
-# hold whatever the last base row put there.
-statement error CORRELATED subquery in HAVING
+# A CORRELATED one in the same position is admitted since 37622a6, binding to
+# the group's first-row scratch like the SELECT-list case above. Only b=10
+# survives: its group counts 1 against a correlated sub of 0; every later
+# group's sub grows past its count. Oracle-probed on this exact query: 10|1.
+query II nosort
 SELECT b, count(*) FROM t1 GROUP BY b HAVING count(*) > (SELECT count(*) FROM t1 AS x WHERE x.b < t1.b)
+----
+10
+1
 
 # An UNCORRELATED subquery inside a compound ARM is now supported (format-49
 # window): each arm's lifts take the reserved slots after the preceding arms',
