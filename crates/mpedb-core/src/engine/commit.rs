@@ -113,11 +113,31 @@ impl<'e> WriteTxn<'e> {
         //
         // The circularity is LMDB's: these writes themselves allocate and free
         // pages, changing what should have been written. So iterate to a
-        // fixpoint. Termination (unchanged by the read-only refill, which frees
-        // nothing): each pass can only add pages freed by COWing the
-        // height-bounded freelist path, the sets grow monotonically, and once
-        // `reusable` is consumed allocation falls back to `high_water`, which
-        // frees nothing — so the loop is bounded by O(tree height).
+        // fixpoint. Termination (§4.5) is a monotone-lattice argument, and it
+        // must hold for BOTH page disciplines — pure COW and the `:memory:`
+        // in-place mode (`adopt_inplace`):
+        //
+        //   - `reusable` only DRAINS: alloc pops it, refill is blocked
+        //     (`in_freelist_op`), and — load-bearing — `free()` inters every
+        //     fixpoint-time free in `freed` instead of recycling it here (see
+        //     the §4.5 comment in `free()`). A page once consumed never comes
+        //     back.
+        //   - `freed` only GROWS: COWed-away pages (COW mode) and structurally
+        //     freed nodes (either mode) are interred and never re-allocated
+        //     this txn. A page once freed never leaves.
+        //   - Once `reusable` is dry, allocation falls back to `high_water`,
+        //     which frees nothing and moves no set — a pass that only draws
+        //     high-water leaves the plan identical, and the loop closes.
+        //
+        // Under in-place adoption the passes free almost nothing (adoption
+        // replaces COW's alloc+free with a dirty-bit), which is FINE — fewer
+        // set movements, faster settling. What is NOT fine, and what the
+        // `free()` routing exists to prevent, is a fixpoint-time free feeding
+        // the pool the fixpoint allocates from: that turns the plan into a
+        // period-2 oscillation (one leftover page is consumed to record
+        // itself, then freed by unrecording itself) and hits the 64-pass cap
+        // below. The cap stays as the bug detector: with the lattice intact,
+        // real convergence is 2–4 passes.
         let mut written: Vec<([u8; 11], Vec<u64>)> = Vec::new();
         let mut iterations = 0;
         // The whole fixpoint mutates the freelist tree: block refill so no
