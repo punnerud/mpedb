@@ -371,3 +371,40 @@ fn refusals() {
     db.verify().unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+/// A FROM-less CTE body is a constant row — collapse onto the dual path.
+/// CPython's `test_cursor_description_cte_simple` is exactly
+/// `WITH one AS (SELECT 1) SELECT * FROM one` and needs the column name `"1"`.
+#[test]
+fn fromless_cte_body_is_a_constant_row() {
+    let (db, path) = open();
+    // No user tables required.
+    let res = db.query("WITH one AS (SELECT 1) SELECT * FROM one", &[]).unwrap();
+    match res {
+        ExecResult::Rows { rows, columns, .. } => {
+            assert_eq!(columns, vec!["1".to_string()]);
+            assert_eq!(rows, vec![vec![Value::Int(1)]]);
+        }
+        other => panic!("expected rows, got {other:?}"),
+    }
+    // Aliased projection: outer can name the column.
+    let res = db
+        .query("WITH one AS (SELECT 1 AS a, 2 AS b) SELECT a, b FROM one", &[])
+        .unwrap();
+    assert_eq!(
+        rows(res),
+        vec![vec![Value::Int(1), Value::Int(2)]]
+    );
+    // Outer WHERE over an aliased body column.
+    let got = scalar_i64(
+        &db,
+        "WITH one AS (SELECT 7 AS x) SELECT x FROM one WHERE x = 7",
+    );
+    assert_eq!(got, 7);
+    // Aggregate body still refused (cardinality change, not a constant row).
+    assert!(db
+        .query("WITH c AS (SELECT count(*) AS n) SELECT * FROM c", &[])
+        .is_err());
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
+}

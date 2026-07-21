@@ -202,6 +202,166 @@ pub fn explain_query_plan_body(sql: &str) -> Option<&str> {
     Some(rest)
 }
 
+/// Per-constraint `… ON CONFLICT ROLLBACK` on a CREATE TABLE clause.
+///
+/// Same ownership story as [`rewrite_insert_or_rollback`]: mpedb's schema
+/// carries no per-constraint conflict action (ACCEPT would silently mean
+/// ABORT — a wrong answer), so the engine refuses `ON CONFLICT ROLLBACK` by
+/// name. The shim owns the connection's transaction, so it rewrites every
+/// such clause to `ON CONFLICT ABORT` (same width — offsets preserved) and
+/// returns whether any rewrite happened. The caller records the CREATE's
+/// table name and, on a later `SQLITE_CONSTRAINT`, rolls the transaction
+/// back — sqlite's definition of the action.
+///
+/// Only the spelling `ON CONFLICT ROLLBACK` is rewritten (quote/comment
+/// aware). `IGNORE`/`REPLACE`/`FAIL` stay refused by the engine.
+pub fn rewrite_on_conflict_rollback(sql: &str) -> (std::borrow::Cow<'_, str>, bool) {
+    // Mark every code-region byte (not inside a string/quoted-ident/comment).
+    let mut is_code = vec![false; sql.len()];
+    scan_code(sql, |i, _| {
+        if i < is_code.len() {
+            is_code[i] = true;
+        }
+    });
+    let lower = sql.to_ascii_lowercase();
+    let lb = lower.as_bytes();
+    let mut hits: Vec<usize> = Vec::new(); // byte offset of 'r' in rollback
+    let mut i = 0;
+    while i + 2 <= lb.len() {
+        if !is_code[i] {
+            i += 1;
+            continue;
+        }
+        // Word-boundary "on"
+        if &lb[i..i + 2] == b"on"
+            && (i == 0 || !lb[i - 1].is_ascii_alphanumeric())
+            && (i + 2 == lb.len() || !lb[i + 2].is_ascii_alphanumeric())
+        {
+            let mut j = i + 2;
+            while j < lb.len() && is_code[j] && lb[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j + 8 <= lb.len()
+                && is_code[j]
+                && &lb[j..j + 8] == b"conflict"
+                && (j + 8 == lb.len() || !lb[j + 8].is_ascii_alphanumeric())
+            {
+                let mut k = j + 8;
+                while k < lb.len() && is_code[k] && lb[k].is_ascii_whitespace() {
+                    k += 1;
+                }
+                if k + 8 <= lb.len()
+                    && is_code[k]
+                    && &lb[k..k + 8] == b"rollback"
+                    && (k + 8 == lb.len() || !lb[k + 8].is_ascii_alphanumeric())
+                {
+                    hits.push(k);
+                    i = k + 8;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    if hits.is_empty() {
+        return (std::borrow::Cow::Borrowed(sql), false);
+    }
+    let mut out = sql.to_string();
+    for &at in hits.iter().rev() {
+        // "rollback" and "ABORT   " are both 8 bytes.
+        out.replace_range(at..at + 8, "ABORT   ");
+    }
+    (std::borrow::Cow::Owned(out), true)
+}
+
+/// Table name of a leading `CREATE TABLE [IF NOT EXISTS] <name>` statement,
+/// or `None` when the text is not that shape. Used with
+/// [`rewrite_on_conflict_rollback`] to remember which tables carry a
+/// ROLLBACK conflict action on this connection.
+pub fn create_table_name(sql: &str) -> Option<String> {
+    let head = strip_leading_trivia(sql).trim_start();
+    let mut rest = head;
+    // CREATE TABLE [IF NOT EXISTS] name
+    for expect in ["create", "table"] {
+        let trimmed = rest.trim_start();
+        let word: String = trimmed
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .flat_map(|c| c.to_lowercase())
+            .collect();
+        if word != expect {
+            return None;
+        }
+        rest = &trimmed[word.len()..];
+    }
+    rest = rest.trim_start();
+    // Optional IF NOT EXISTS
+    {
+        let t = rest;
+        let w1: String = t
+            .chars()
+            .take_while(|c| c.is_ascii_alphabetic())
+            .flat_map(|c| c.to_lowercase())
+            .collect();
+        if w1 == "if" {
+            let mut r = &t[w1.len()..];
+            r = r.trim_start();
+            let w2: String = r
+                .chars()
+                .take_while(|c| c.is_ascii_alphabetic())
+                .flat_map(|c| c.to_lowercase())
+                .collect();
+            if w2 == "not" {
+                r = &r[w2.len()..];
+                r = r.trim_start();
+                let w3: String = r
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphabetic())
+                    .flat_map(|c| c.to_lowercase())
+                    .collect();
+                if w3 == "exists" {
+                    rest = r[w3.len()..].trim_start();
+                }
+            }
+        }
+    }
+    // name: bare, "quoted", [bracket], `tick`
+    let bytes = rest.as_bytes();
+    if bytes.is_empty() {
+        return None;
+    }
+    let (name, _) = match bytes[0] {
+        b'"' | b'`' => {
+            let q = bytes[0];
+            let end = rest[1..].find(q as char)? + 1;
+            (rest[1..end].to_string(), end + 1)
+        }
+        b'[' => {
+            let end = rest.find(']')?;
+            (rest[1..end].to_string(), end + 1)
+        }
+        _ => {
+            let end = rest
+                .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                .unwrap_or(rest.len());
+            if end == 0 {
+                return None;
+            }
+            (rest[..end].to_string(), end)
+        }
+    };
+    // Drop a schema qualifier `main.t` → `t` (sqlite's create-table text rule).
+    let name = name
+        .rsplit_once('.')
+        .map(|(_, n)| n.to_string())
+        .unwrap_or(name);
+    if name.is_empty() {
+        None
+    } else {
+        Some(name)
+    }
+}
+
 /// `INSERT OR ROLLBACK …` / `REPLACE`-style conflict prefix handling.
 ///
 /// sqlite's five conflict actions differ only in what survives a constraint

@@ -282,6 +282,13 @@ fn flatten_cte(
     };
     // The body itself may reference a view or another CTE.
     flatten_select(&mut body, views, ctes, depth + 1)?;
+    // FROM-less body (`WITH one AS (SELECT 1) SELECT * FROM one`): there is no
+    // base table to splice onto. Collapse the outer onto the dual select that
+    // the body already is — CPython's `test_cursor_description_cte_simple`
+    // and every constant-row CTE. A table-backed body keeps the keep-alias path.
+    if body.table.is_none() {
+        return flatten_cte_fromless(s, tname, body, &ref_alias);
+    }
     check_simple(&body, tname)?;
 
     // The body exposes its columns under its own source name (its inner alias
@@ -322,6 +329,225 @@ fn flatten_cte(
         // sources; the base carries every column the body exposed.
     }
     Ok(())
+}
+
+/// Collapse `FROM <fromless-cte>` onto the dual SELECT the body already is.
+///
+/// A FROM-less CTE body (`SELECT 1`, `SELECT 1 AS a, 2 AS b`) is one synthetic
+/// row with a projection — exactly what the dual path already plans. There is
+/// no base table to keep-alias onto, so the outer becomes the body: table
+/// cleared, items installed (or outer items rewritten against the body's
+/// aliases), WHERE clauses merged. Joins against a constant-row CTE are
+/// refused rather than answered with a silent cross product of the wrong shape.
+fn flatten_cte_fromless(
+    s: &mut SelectStmt,
+    tname: &str,
+    mut body: SelectStmt,
+    ref_alias: &str,
+) -> Result<()> {
+    // Same residual grammar as `check_simple`, minus the FROM-less + computed
+    // projection bans (those are the whole point of this path).
+    let mut bad: Vec<&str> = Vec::new();
+    if !body.joins.is_empty() {
+        bad.push("a JOIN");
+    }
+    if body.distinct {
+        bad.push("DISTINCT");
+    }
+    if !body.group_by.is_empty() || body.having.is_some() {
+        bad.push("GROUP BY/HAVING");
+    }
+    if !body.order_by.is_empty() {
+        bad.push("ORDER BY");
+    }
+    if body.limit.is_some() || body.offset.is_some() {
+        bad.push("LIMIT/OFFSET");
+    }
+    if let Some(items) = &body.items {
+        if items.iter().any(|(e, _)| expr_aggregates(e)) {
+            bad.push("an aggregate");
+        }
+    } else {
+        return Err(bind_err(format!(
+            "CTE `{tname}` body is `SELECT *` without a FROM clause — no columns"
+        )));
+    }
+    if !bad.is_empty() {
+        return Err(bind_err(format!(
+            "`{tname}` uses a FROM-less body + {}, which is not supported yet \
+             (only a constant-row projection is flattenable)",
+            bad.join(" + ")
+        )));
+    }
+    if !s.joins.is_empty() {
+        return Err(bind_err(format!(
+            "a FROM-less CTE (`{tname}`) cannot appear in a JOIN yet"
+        )));
+    }
+
+    let body_items = body.items.take().expect("checked above");
+    // Map exposed name → expression, for rewriting outer projections / WHERE
+    // that name the CTE's columns (`SELECT x FROM one` after `SELECT 1 AS x`).
+    // Unaliased items use the same display name the dual planner would give
+    // them (`1`, `1+1`, …) so `SELECT "1" FROM one` also resolves.
+    let mut by_name: HashMap<String, Expr> = HashMap::new();
+    for (e, alias) in &body_items {
+        let name = alias
+            .clone()
+            .unwrap_or_else(|| fromless_item_name(e));
+        // First wins — a duplicate alias in the body is a later bind error on
+        // the dual path, not something to paper over here.
+        by_name.entry(fold_ident(&name)).or_insert_with(|| e.clone());
+    }
+
+    if s.items.is_none() {
+        // `SELECT * FROM cte` → the body's own projection (and its aliases).
+        s.items = Some(body_items);
+    } else {
+        // Rewrite outer items against the body's exposed names.
+        for (e, _) in s.items.as_mut().expect("is_some") {
+            rewrite_cte_cols(e, &by_name, tname, ref_alias)?;
+        }
+    }
+    if let Some(w) = &mut s.where_clause {
+        rewrite_cte_cols(w, &by_name, tname, ref_alias)?;
+    }
+    // Body WHERE (if any) is already over dual/aliases; merge as-is. Outer
+    // WHERE was rewritten above to the same expressions.
+    s.where_clause = merge_where(body.where_clause.take(), s.where_clause.take());
+    s.table = None;
+    s.alias = None;
+    Ok(())
+}
+
+/// Display name of an unaliased FROM-less projection item — matches what the
+/// dual planner puts in `cursor.description` (`1`, `1+1`, a bare col name, …).
+fn fromless_item_name(e: &Expr) -> String {
+    match e {
+        Expr::Lit(v) => match v {
+            mpedb_types::Value::Int(i) => i.to_string(),
+            mpedb_types::Value::Float(f) => {
+                // Same short form the dual planner's program render uses for
+                // whole-number floats: keep a trailing `.0` only when needed.
+                let s = f.to_string();
+                s
+            }
+            mpedb_types::Value::Text(t) => t.clone(),
+            mpedb_types::Value::Null => "NULL".into(),
+            mpedb_types::Value::Bool(b) => if *b { "1" } else { "0" }.into(),
+            other => format!("{other:?}"),
+        },
+        Expr::Col(n) => n.clone(),
+        // Fall back to a stable placeholder; callers that need the exact dual
+        // name go through an explicit alias.
+        _ => "?column?".into(),
+    }
+}
+
+/// Replace `Col(name)` / `Qualified(cte|alias, name)` with the CTE body's
+/// expression for that name. Unknown names stay so the binder reports them.
+fn rewrite_cte_cols(
+    e: &mut Expr,
+    by_name: &HashMap<String, Expr>,
+    tname: &str,
+    ref_alias: &str,
+) -> Result<()> {
+    match e {
+        Expr::Col(n) => {
+            if let Some(repl) = by_name.get(&fold_ident(n)) {
+                *e = repl.clone();
+            }
+            Ok(())
+        }
+        Expr::Qualified(q, n) => {
+            if ident_eq(q, tname) || ident_eq(q, ref_alias) {
+                if let Some(repl) = by_name.get(&fold_ident(n)) {
+                    *e = repl.clone();
+                    return Ok(());
+                }
+            }
+            // Recurse into children only when we did not replace the node.
+            Ok(())
+        }
+        Expr::Unary(_, a) | Expr::IsNull(a, _) | Expr::Cast(a, _) | Expr::Collate(a, _) => {
+            rewrite_cte_cols(a, by_name, tname, ref_alias)
+        }
+        Expr::Binary(_, a, b)
+        | Expr::Like(a, b, _)
+        | Expr::Match(a, b)
+        | Expr::IsDistinct(a, b, _)
+        | Expr::Glob(a, b, _)
+        | Expr::Regexp(a, b, _) => {
+            rewrite_cte_cols(a, by_name, tname, ref_alias)?;
+            rewrite_cte_cols(b, by_name, tname, ref_alias)
+        }
+        Expr::InList(a, list, _) => {
+            rewrite_cte_cols(a, by_name, tname, ref_alias)?;
+            for item in list {
+                rewrite_cte_cols(item, by_name, tname, ref_alias)?;
+            }
+            Ok(())
+        }
+        Expr::InParamSlot(a, _, _) | Expr::InContext(a, _, _) => {
+            rewrite_cte_cols(a, by_name, tname, ref_alias)
+        }
+        Expr::InSubquery(a, _, _) => rewrite_cte_cols(a, by_name, tname, ref_alias),
+        Expr::Case(arms, else_) => {
+            for (c, r) in arms {
+                rewrite_cte_cols(c, by_name, tname, ref_alias)?;
+                rewrite_cte_cols(r, by_name, tname, ref_alias)?;
+            }
+            if let Some(x) = else_ {
+                rewrite_cte_cols(x, by_name, tname, ref_alias)?;
+            }
+            Ok(())
+        }
+        Expr::Coalesce(items) | Expr::Func(_, items) | Expr::RowValue(items) => {
+            for item in items {
+                rewrite_cte_cols(item, by_name, tname, ref_alias)?;
+            }
+            Ok(())
+        }
+        Expr::Agg(_, arg, _, filter, extra) => {
+            if let Some(a) = arg {
+                rewrite_cte_cols(a, by_name, tname, ref_alias)?;
+            }
+            for x in extra {
+                rewrite_cte_cols(x, by_name, tname, ref_alias)?;
+            }
+            if let Some(f) = filter {
+                rewrite_cte_cols(f, by_name, tname, ref_alias)?;
+            }
+            Ok(())
+        }
+        Expr::Window {
+            arg,
+            extra_args,
+            spec,
+            ..
+        } => {
+            if let Some(a) = arg {
+                rewrite_cte_cols(a, by_name, tname, ref_alias)?;
+            }
+            for x in extra_args {
+                rewrite_cte_cols(x, by_name, tname, ref_alias)?;
+            }
+            // Partition/order keys may name the CTE's columns too.
+            for e in &mut spec.partition_by {
+                rewrite_cte_cols(e, by_name, tname, ref_alias)?;
+            }
+            for (e, _) in &mut spec.order_by {
+                rewrite_cte_cols(e, by_name, tname, ref_alias)?;
+            }
+            Ok(())
+        }
+        Expr::Lit(_)
+        | Expr::Param(_)
+        | Expr::ContextRef(_)
+        | Expr::Excluded(_)
+        | Expr::Subquery(_)
+        | Expr::Exists(_, _) => Ok(()),
+    }
 }
 
 /// Splice a CTE named in a JOIN operand (`… JOIN c ON p`) onto its base table,
