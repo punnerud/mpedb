@@ -128,6 +128,13 @@ pub struct Sqlite3 {
     /// back-pointer here; `sqlite3_close` refuses while any remain, exactly as
     /// it does for open blob handles, so that pointer cannot dangle.
     backups: Vec<*mut backup::Sqlite3Backup>,
+    /// Tables whose `CREATE TABLE` carried `ON CONFLICT ROLLBACK` on a
+    /// constraint (rewritten to ABORT for the engine — see
+    /// `sql::rewrite_on_conflict_rollback`). A UNIQUE/PK constraint failure
+    /// naming one of these rolls the connection's transaction back, which is
+    /// sqlite's definition of the action and what CPython's
+    /// `test_on_conflict_rollback` asserts.
+    unique_rollback_tables: std::collections::HashSet<String>,
 }
 
 /// sqlite 3.45's compile-time limit defaults — both the initial value and the
@@ -343,7 +350,47 @@ fn exec_one(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome,
         }
         return res;
     }
-    exec_one_inner(c, sqltext, params)
+    // Per-constraint `ON CONFLICT ROLLBACK` on CREATE TABLE: same ownership
+    // story. Rewrite the clause to ABORT for the engine, remember the table,
+    // and on a later UNIQUE failure against it roll the transaction back.
+    let (create_sql, had_oc_rb) = sql::rewrite_on_conflict_rollback(sqltext);
+    let create_name = if had_oc_rb {
+        sql::create_table_name(&create_sql)
+    } else {
+        None
+    };
+    let res = if had_oc_rb {
+        exec_one_inner(c, &create_sql, params)
+    } else {
+        exec_one_inner(c, sqltext, params)
+    };
+    match &res {
+        Ok(_) => {
+            if let Some(name) = create_name {
+                // Keys are folded: identifier case is insignificant (E13).
+                c.unique_rollback_tables
+                    .insert(name.to_ascii_lowercase());
+            }
+        }
+        Err(e) if valconv::error_codes(e).0 == SQLITE_CONSTRAINT => {
+            if !c.unique_rollback_tables.is_empty() {
+                // Engine wording is `UNIQUE violation: <table> (…)` or a PK
+                // form; match any recorded table name as a whole word so a
+                // short name cannot spuriously hit a longer one.
+                let msg = format!("{e}");
+                let hit = c.unique_rollback_tables.iter().any(|t| {
+                    msg.to_ascii_lowercase()
+                        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_')
+                        .any(|w| w == t.as_str())
+                });
+                if hit {
+                    rollback_txn(c);
+                }
+            }
+        }
+        Err(_) => {}
+    }
+    res
 }
 
 fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome, DbError> {
@@ -1215,6 +1262,7 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
         auth_cb: ptr::null_mut(),
         auth_ctx: ptr::null_mut(),
         backups: Vec::new(),
+        unique_rollback_tables: std::collections::HashSet::new(),
     });
     c.clear_error();
     Ok(c)
@@ -1614,10 +1662,12 @@ unsafe fn prepare_common(
         // The engine's parser does not skip leading comments (exec_one strips
         // them at execution) — validate the same stripped text it will run.
         let to_validate = sql::strip_leading_trivia(&scan.rewritten);
-        // `INSERT OR ROLLBACK` is executed as `OR ABORT` plus a connection
-        // rollback (see `exec_one`), so validate the text the engine will
-        // actually be handed — the engine's parser refuses ROLLBACK by name.
+        // `INSERT OR ROLLBACK` and CREATE … `ON CONFLICT ROLLBACK` are executed
+        // as ABORT plus a connection rollback (see `exec_one`), so validate the
+        // text the engine will actually be handed — the engine's parser refuses
+        // ROLLBACK by name.
         let (to_validate, _) = sql::rewrite_insert_or_rollback(to_validate);
+        let (to_validate, _) = sql::rewrite_on_conflict_rollback(&to_validate);
         match catch_unwind(AssertUnwindSafe(|| c.db.prepare_detached(&to_validate))) {
             Ok(Ok(_plan)) => {}
             Ok(Err(e)) => return c.set_db_error(&e),

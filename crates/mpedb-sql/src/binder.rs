@@ -1626,7 +1626,13 @@ impl<'a> Binder<'a> {
             }
             BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 let (l, lt, r, rt) = self.bridge_bool_int(l, lt, r, rt)?;
-                let (l, r, unified) = self.unify_operands(l, lt, r, rt, "compare")?;
+                // Comparison unifies without pinning a bare param from a pure
+                // literal/expression. sqlite has no parameter types: `1 = ?`
+                // with a text bind is a storage-class comparison (Eq → FALSE),
+                // not a type error. Pinning still happens from a COLUMN (or
+                // CAST) so `WHERE id = ?` keeps its rigid int64 slot. See
+                // `unify_compare_operands` / `class_cmp_affinity`.
+                let (l, r, unified) = self.unify_compare_operands(l, lt, r, rt)?;
                 // sqlite's collation precedence, in order: an explicit `COLLATE`
                 // on the LEFT operand, else on the RIGHT; else the LEFT operand's
                 // COLUMN collation (rung 2), else the RIGHT column's; else BINARY.
@@ -1938,6 +1944,47 @@ impl<'a> Binder<'a> {
             Some(t) => self.unify_param(r, rt, t),
             None => (r, rt),
         };
+        self.unify_types(l, lt, r, rt, verb)
+    }
+
+    /// Comparison-only unify: pin a bare param ONLY from a COLUMN or CAST.
+    ///
+    /// A pure literal/expression carries no sqlite affinity, so `1 = ?` with a
+    /// text bind is a class-order comparison (Eq → FALSE), never a type error.
+    /// Pinning from a column keeps `WHERE id = ?` on a rigid int64 slot.
+    fn unify_compare_operands(
+        &mut self,
+        l: BExpr,
+        lt: Ty,
+        r: BExpr,
+        rt: Ty,
+    ) -> Result<(BExpr, BExpr, Ty)> {
+        let pin_source = |e: &BExpr, t: Ty| -> Option<ColumnType> {
+            match (e, t) {
+                (BExpr::Col(_), Some(t)) if t != ColumnType::Any => Some(t),
+                (BExpr::Cast(_, _), Some(t)) => Some(t),
+                _ => None,
+            }
+        };
+        let (l, lt) = match pin_source(&r, rt) {
+            Some(t) => self.unify_param(l, lt, t),
+            None => (l, lt),
+        };
+        let (r, rt) = match pin_source(&l, lt) {
+            Some(t) => self.unify_param(r, rt, t),
+            None => (r, rt),
+        };
+        self.unify_types(l, lt, r, rt, "compare")
+    }
+
+    fn unify_types(
+        &self,
+        l: BExpr,
+        lt: Ty,
+        r: BExpr,
+        rt: Ty,
+        verb: &str,
+    ) -> Result<(BExpr, BExpr, Ty)> {
         match (lt, rt) {
             (Some(a), Some(b)) if a == b => Ok((l, r, Some(a))),
             (Some(ColumnType::Int64), Some(ColumnType::Float64)) => {
@@ -1996,7 +2043,19 @@ impl<'a> Binder<'a> {
     /// smaller than a text" where sqlite compares against 40.0).
     fn class_cmp_affinity(&self, unified: Ty, l: &BExpr, r: &BExpr) -> Option<Affinity> {
         if !matches!(unified, Some(ColumnType::Any) | None) {
-            return None;
+            // A concrete unified type normally means both sides already agree
+            // and a plain Binary comparison is correct. The one exception is a
+            // bare PARAM left untyped against a literal/expression: unified is
+            // the concrete side's type, but at runtime the bound value may be
+            // any class — emit ClassCmp (no affinity) so `1 = ?` with a text
+            // bind answers FALSE rather than "cannot compare".
+            let is_param = |e: &BExpr| matches!(e, BExpr::Param(_));
+            let is_col = |e: &BExpr| matches!(e, BExpr::Col(_));
+            if !((is_param(l) || is_param(r)) && !is_col(l) && !is_col(r)) {
+                return None;
+            }
+            // Fall through with admit via the param path below; `aff_of` for a
+            // const/param pair is (None, None) → Blob (no conversion).
         }
         let col_ty = |e: &BExpr| match e {
             BExpr::Col(i) => self.scope.column_shape(*i).map(|(t, _)| t),
@@ -2005,12 +2064,16 @@ impl<'a> Binder<'a> {
         let is_any_col = |e: &BExpr| col_ty(e) == Some(ColumnType::Any);
         let is_typed_col = |e: &BExpr| col_ty(e).is_some_and(|t| t != ColumnType::Any);
         let is_cast = |e: &BExpr| matches!(e, BExpr::Cast(..));
+        let is_param = |e: &BExpr| matches!(e, BExpr::Param(_));
         // A bare `any` column admits the rule on its own (unchanged). A CAST
         // admits it only when the OTHER side is not a bare concrete column,
-        // which is the shape whose index probe must survive.
+        // which is the shape whose index probe must survive. A bare PARAM
+        // against a non-column (literal / expression) is the same rule: no
+        // affinity, class-order at runtime (CPython `select 1 as a where a=?`).
         let admit = is_any_col(l)
             || is_any_col(r)
-            || ((is_cast(l) || is_cast(r)) && !is_typed_col(l) && !is_typed_col(r));
+            || ((is_cast(l) || is_cast(r)) && !is_typed_col(l) && !is_typed_col(r))
+            || ((is_param(l) || is_param(r)) && !is_typed_col(l) && !is_typed_col(r));
         if !admit {
             return None;
         }

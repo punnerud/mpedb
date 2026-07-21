@@ -383,10 +383,19 @@ pub(super) fn plan_select<'s>(
     } else {
         None
     };
-    let where_ast: Option<ast::Expr> = match &fts {
+    let mut where_ast: Option<ast::Expr> = match &fts {
         Some((_, residual)) => residual.clone(),
         None => s.where_clause.clone(),
     };
+    // SQLite lets a SELECT-list alias appear in WHERE when no base column has
+    // that name (`SELECT 1 AS a WHERE a = ?`, `SELECT a+1 AS c FROM t WHERE c = 2`).
+    // Real columns always win over aliases (measured). Inline the alias's
+    // expression so the ordinary binder sees only scope columns / params —
+    // never invent a synthetic column. An aggregate alias surfaces as sqlite's
+    // "misuse of aggregate" at bind time, which is the correct refusal.
+    if let (Some(w), Some(items)) = (where_ast.as_mut(), s.items.as_ref()) {
+        rewrite_where_select_aliases(w, items, &binder.scope);
+    }
     let bound_where = where_ast
         .as_ref()
         .map(|e| binder.bind_predicate(e))
@@ -668,4 +677,126 @@ pub(super) fn plan_select<'s>(
         out_types,
         subplans,
     ))
+}
+
+/// Inline SELECT-list aliases referenced from WHERE (sqlite's rule).
+///
+/// A bare name in WHERE that is NOT a column of any table in `scope` but IS an
+/// explicit `AS`-alias of a SELECT item is replaced by that item's expression.
+/// Column names always win — `SELECT a+1 AS b FROM t(a,b) WHERE b = 10` filters
+/// on the column, not the alias (measured against sqlite 3.45).
+fn rewrite_where_select_aliases(
+    e: &mut ast::Expr,
+    items: &[(ast::Expr, Option<String>)],
+    scope: &Scope<'_>,
+) {
+    // Build alias → expression once. Only EXPLICIT aliases count: an unaliased
+    // `SELECT 1+1` is not addressable as `"1+1"` in WHERE (measured).
+    let mut aliases: Vec<(&str, &ast::Expr)> = Vec::new();
+    for (expr, alias) in items {
+        if let Some(a) = alias.as_deref() {
+            aliases.push((a, expr));
+        }
+    }
+    if aliases.is_empty() {
+        return;
+    }
+    rewrite_where_aliases_rec(e, &aliases, scope);
+}
+
+fn rewrite_where_aliases_rec(
+    e: &mut ast::Expr,
+    aliases: &[(&str, &ast::Expr)],
+    scope: &Scope<'_>,
+) {
+    // Children first so a replaced node is not re-walked as a Col.
+    match e {
+        ast::Expr::Unary(_, a)
+        | ast::Expr::IsNull(a, _)
+        | ast::Expr::Cast(a, _)
+        | ast::Expr::Collate(a, _)
+        | ast::Expr::InParamSlot(a, _, _)
+        | ast::Expr::InContext(a, _, _)
+        | ast::Expr::InSubquery(a, _, _) => rewrite_where_aliases_rec(a, aliases, scope),
+        ast::Expr::Binary(_, a, b)
+        | ast::Expr::Like(a, b, _)
+        | ast::Expr::Match(a, b)
+        | ast::Expr::IsDistinct(a, b, _)
+        | ast::Expr::Glob(a, b, _)
+        | ast::Expr::Regexp(a, b, _) => {
+            rewrite_where_aliases_rec(a, aliases, scope);
+            rewrite_where_aliases_rec(b, aliases, scope);
+        }
+        ast::Expr::InList(a, list, _) => {
+            rewrite_where_aliases_rec(a, aliases, scope);
+            for item in list {
+                rewrite_where_aliases_rec(item, aliases, scope);
+            }
+        }
+        ast::Expr::Case(arms, else_) => {
+            for (c, r) in arms {
+                rewrite_where_aliases_rec(c, aliases, scope);
+                rewrite_where_aliases_rec(r, aliases, scope);
+            }
+            if let Some(x) = else_ {
+                rewrite_where_aliases_rec(x, aliases, scope);
+            }
+        }
+        ast::Expr::Coalesce(items) | ast::Expr::Func(_, items) | ast::Expr::RowValue(items) => {
+            for item in items {
+                rewrite_where_aliases_rec(item, aliases, scope);
+            }
+        }
+        ast::Expr::Agg(_, arg, _, filter, extra) => {
+            if let Some(a) = arg {
+                rewrite_where_aliases_rec(a, aliases, scope);
+            }
+            for x in extra {
+                rewrite_where_aliases_rec(x, aliases, scope);
+            }
+            if let Some(f) = filter {
+                rewrite_where_aliases_rec(f, aliases, scope);
+            }
+        }
+        ast::Expr::Window {
+            arg,
+            extra_args,
+            spec,
+            ..
+        } => {
+            if let Some(a) = arg {
+                rewrite_where_aliases_rec(a, aliases, scope);
+            }
+            for x in extra_args {
+                rewrite_where_aliases_rec(x, aliases, scope);
+            }
+            for p in &mut spec.partition_by {
+                rewrite_where_aliases_rec(p, aliases, scope);
+            }
+            for (o, _) in &mut spec.order_by {
+                rewrite_where_aliases_rec(o, aliases, scope);
+            }
+        }
+        ast::Expr::Col(_)
+        | ast::Expr::Qualified(..)
+        | ast::Expr::Lit(_)
+        | ast::Expr::Param(_)
+        | ast::Expr::ContextRef(_)
+        | ast::Expr::Excluded(_)
+        | ast::Expr::Subquery(_)
+        | ast::Expr::Exists(_, _) => {}
+    }
+    // After children: rewrite this node if it is a bare alias name.
+    if let ast::Expr::Col(name) = e {
+        // A real column always wins — do not substitute.
+        if scope.resolve(name).is_ok() {
+            return;
+        }
+        if let Some((_, expr)) = aliases
+            .iter()
+            .find(|(a, _)| mpedb_types::ident_eq(a, name))
+        {
+            *e = (*expr).clone();
+        }
+    }
 }

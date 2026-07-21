@@ -216,3 +216,28 @@ query I nosort
 SELECT CASE WHEN 3 IN (1, 2, 3) THEN 1 ELSE 0 END
 ----
 1
+
+# SELECT-list aliases are visible in WHERE when no base column has the name
+# (sqlite's rule). CPython's test_trace_too_much_expanded_sql uses
+# `select 1 as a where a=?`.
+query I nosort
+SELECT 1 AS a WHERE a = 1
+----
+1
+
+query I nosort
+SELECT 1 AS a WHERE a = 0
+----
+
+query I nosort
+SELECT 1 + 1 AS x WHERE x = 2
+----
+2
+
+# A real column always wins over an alias of the same name
+# (filter uses column a=10, projection is a+1 → 11; if the alias won it
+# would require a+1=10 and return no row).
+query I nosort
+SELECT a + 1 AS a FROM t WHERE a = 10
+----
+11
