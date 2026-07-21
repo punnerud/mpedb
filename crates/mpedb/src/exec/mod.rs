@@ -1064,26 +1064,35 @@ fn exec_compound_arm(
     k: usize,
 ) -> Result<ExecResult> {
     let arm = c.arms.get(k).ok_or_else(|| internal("compound arm out of range"))?;
-    let lifts = c.arm_lifts(k);
-    if lifts.is_empty() && c.n_arm_slots() == 0 {
-        return exec_select(ctx, schema, plan, params, arm);
-    }
-    let base = c.arm_base(k) as usize;
-    let mut buf = params.to_vec();
-    buf.resize(
-        buf.len().max(c.arm_sub_base as usize + c.n_arm_slots() as usize),
-        Value::Null,
-    );
-    for (i, sub) in lifts.iter().enumerate() {
-        if !sub.outer_args.is_empty() {
-            continue;
+    match arm {
+        mpedb_sql::CompoundArm::Derived(dp) => {
+            // Nested derived as a compound arm: materialise body, scan outer.
+            // Body slots live at dp.body_sub_base in the shared param buffer.
+            recursive::exec_derived(ctx, schema, plan, params, dp)
         }
-        // `[level params ‖ preceding arms' slots]` — width EXACTLY this arm's
-        // `sub_base`, which is what `run_subplan` extends from.
-        let inner = run_subplan(ctx, schema, plan, &buf[..base], sub)?;
-        buf[base + i] = subplan_value(inner, sub.kind)?;
+        mpedb_sql::CompoundArm::Select(sp) => {
+            let lifts = c.arm_lifts(k);
+            if lifts.is_empty() && c.n_arm_slots() == 0 {
+                return exec_select(ctx, schema, plan, params, sp);
+            }
+            let base = c.arm_base(k) as usize;
+            let mut buf = params.to_vec();
+            buf.resize(
+                buf.len()
+                    .max(c.arm_sub_base as usize + c.n_arm_slots() as usize)
+                    .max(params.len()),
+                Value::Null,
+            );
+            for (i, sub) in lifts.iter().enumerate() {
+                if !sub.outer_args.is_empty() {
+                    continue;
+                }
+                let inner = run_subplan(ctx, schema, plan, &buf[..base], sub)?;
+                buf[base + i] = subplan_value(inner, sub.kind)?;
+            }
+            exec_select_leveled(ctx, schema, plan, &buf, sp, base, lifts)
+        }
     }
-    exec_select_leveled(ctx, schema, plan, &buf, arm, base, lifts)
 }
 
 fn exec_compound(
@@ -1645,7 +1654,7 @@ fn correlated_survivors(
     // then the first arm names it; either way the charge must not be skipped.
     let corr_table = correlated.first().and_then(|(_, s)| match &s.body {
         SubBody::Select(sp) => Some(sp.table),
-        SubBody::Compound(c) => c.arms.first().map(|a| a.table),
+        SubBody::Compound(c) => c.arms.first().map(|a| a.output_select().table),
     });
     let mut out = Vec::new();
     for row in rows {
@@ -2677,6 +2686,23 @@ pub(crate) fn coerce_params<'a>(
 }
 
 
+// Active nested-derived working table while `exec_derived` runs an outer scan
+// whose statement node is NOT itself `PlanStmt::Derived` (format 58 compound
+// arms). Single-threaded per execute; cleared on the way out.
+thread_local! {
+    static ACTIVE_WORKING_TABLE: std::cell::RefCell<Option<TableDef>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn with_working_table_def<R>(def: TableDef, f: impl FnOnce() -> R) -> R {
+    ACTIVE_WORKING_TABLE.with(|c| {
+        let prev = c.replace(Some(def));
+        let out = f();
+        c.replace(prev);
+        out
+    })
+}
+
 fn table_def<'a>(
     schema: &'a Schema,
     plan: &'a CompiledPlan,
@@ -2689,10 +2715,14 @@ fn table_def<'a>(
     if table == mpedb_sql::DUAL_TABLE {
         return Ok(Cow::Borrowed(mpedb_sql::dual_def()));
     }
-    // The working table resolves to the synthetic def carried by THIS plan's
-    // node — `RecursiveCte` or `Derived`, the only two meanings `CTE_TABLE` has
-    // here. Owned (built from the plan's columns/types): no schema entry.
+    // The working table resolves to the synthetic def of the active derived /
+    // recursive CTE. Nested Derived compound arms (format 58) install theirs
+    // via [`with_working_table_def`] for the outer scan; top-level
+    // PlanStmt::Derived / RecursiveCte carry theirs on the statement node.
     if table == mpedb_sql::CTE_TABLE {
+        if let Some(def) = ACTIVE_WORKING_TABLE.with(|c| c.borrow().clone()) {
+            return Ok(Cow::Owned(def));
+        }
         return match &plan.stmt {
             PlanStmt::RecursiveCte(rc) => Ok(Cow::Owned(rc.cte_def())),
             PlanStmt::Derived(dp) => Ok(Cow::Owned(dp.derived_def())),

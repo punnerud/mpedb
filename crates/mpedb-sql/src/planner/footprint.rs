@@ -115,14 +115,17 @@ pub(crate) fn compute_footprint(
 fn union_subplan_reads(s: &SubPlan, schema: &Schema, fp: &mut Footprint) -> Result<()> {
     // A compound body reads the union of what its arms read (#56, format 31); a
     // plain select body reads itself.
-    let arms: &[SelectPlan] = match &s.body {
-        SubBody::Select(sp) => std::slice::from_ref(sp),
-        SubBody::Compound(c) => &c.arms,
-    };
-    for arm in arms {
-        let sf = select_footprint(arm, schema)?;
-        fp.tables_read.union_with(&sf.tables_read);
-        fp.indexes_used |= sf.indexes_used;
+    match &s.body {
+        SubBody::Select(sp) => {
+            let sf = select_footprint(sp, schema)?;
+            fp.tables_read.union_with(&sf.tables_read);
+            fp.indexes_used |= sf.indexes_used;
+        }
+        SubBody::Compound(c) => {
+            for arm in &c.arms {
+                union_compound_arm_footprint(arm, schema, fp)?;
+            }
+        }
     }
     // A compound body's arms OWN their lifts (format 56); those read tables
     // too, and leaving them out is the same `conflicts_with` leak the
@@ -136,7 +139,8 @@ fn union_subplan_reads(s: &SubPlan, schema: &Schema, fp: &mut Footprint) -> Resu
     Ok(())
 }
 
-/// Union the reads of every lift a compound's ARMS own (format 56).
+/// Union the reads of every lift a compound's ARMS own (format 56) and of any
+/// nested Derived arm bodies (format 58).
 fn union_compound_arm_reads(
     c: &crate::plan::CompoundPlan,
     schema: &Schema,
@@ -145,6 +149,67 @@ fn union_compound_arm_reads(
     for arm in &c.arm_subplans {
         for s in arm {
             union_subplan_reads(s, schema, fp)?;
+        }
+    }
+    for arm in &c.arms {
+        if let crate::plan::CompoundArm::Derived(dp) = arm {
+            // Body + outer tables of the nested derived (Select lifts already
+            // walked above when present on arm_subplans).
+            match &dp.body {
+                SubBody::Select(sp) => {
+                    let sf = select_footprint(sp, schema)?;
+                    fp.tables_read.union_with(&sf.tables_read);
+                    fp.indexes_used |= sf.indexes_used;
+                }
+                SubBody::Compound(inner) => {
+                    for a in &inner.arms {
+                        union_compound_arm_footprint(a, schema, fp)?;
+                    }
+                    union_compound_arm_reads(inner, schema, fp)?;
+                }
+            }
+            let of = select_footprint(&dp.outer, schema)?;
+            fp.tables_read.union_with(&of.tables_read);
+            fp.indexes_used |= of.indexes_used;
+            for s in &dp.body_subplans {
+                union_subplan_reads(s, schema, fp)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn union_compound_arm_footprint(
+    arm: &crate::plan::CompoundArm,
+    schema: &Schema,
+    fp: &mut Footprint,
+) -> Result<()> {
+    match arm {
+        crate::plan::CompoundArm::Select(sp) => {
+            let sf = select_footprint(sp, schema)?;
+            fp.tables_read.union_with(&sf.tables_read);
+            fp.indexes_used |= sf.indexes_used;
+        }
+        crate::plan::CompoundArm::Derived(dp) => {
+            match &dp.body {
+                SubBody::Select(sp) => {
+                    let sf = select_footprint(sp, schema)?;
+                    fp.tables_read.union_with(&sf.tables_read);
+                    fp.indexes_used |= sf.indexes_used;
+                }
+                SubBody::Compound(c) => {
+                    for a in &c.arms {
+                        union_compound_arm_footprint(a, schema, fp)?;
+                    }
+                    union_compound_arm_reads(c, schema, fp)?;
+                }
+            }
+            let of = select_footprint(&dp.outer, schema)?;
+            fp.tables_read.union_with(&of.tables_read);
+            fp.indexes_used |= of.indexes_used;
+            for s in &dp.body_subplans {
+                union_subplan_reads(s, schema, fp)?;
+            }
         }
     }
     Ok(())
@@ -170,20 +235,16 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
         // per-STATEMENT and names ONE key space — with several arms Full is
         // the only honest claim (same argument as the join case below).
         PlanStmt::Compound(c) => {
-            let mut tables_read = TableSet::new();
-            let mut indexes_used = 0u64;
-            for arm in &c.arms {
-                let f = select_footprint(arm, schema)?;
-                tables_read.union_with(&f.tables_read);
-                indexes_used |= f.indexes_used;
-            }
             let mut fp = Footprint {
-                tables_read,
+                tables_read: TableSet::new(),
                 tables_written: TableSet::new(),
-                indexes_used,
+                indexes_used: 0,
                 key_access: KeyAccess::Full,
                 read_only: true,
             };
+            for arm in &c.arms {
+                union_compound_arm_footprint(arm, schema, &mut fp)?;
+            }
             union_compound_arm_reads(c, schema, &mut fp)?;
             fp
         }
@@ -211,24 +272,31 @@ fn compute_stmt_footprint(stmt: &PlanStmt, schema: &Schema) -> Result<Footprint>
         // and outer statement read — the working table itself sets no bit,
         // exactly as in a recursive CTE. Read-only, several key spaces ⇒ Full.
         PlanStmt::Derived(dp) => {
-            let mut tables_read = TableSet::new();
-            let mut indexes_used = 0u64;
-            let body_arms: &[SelectPlan] = match &dp.body {
-                SubBody::Select(sp) => std::slice::from_ref(sp),
-                SubBody::Compound(c) => &c.arms,
-            };
-            for sp in body_arms.iter().chain(std::iter::once(&dp.outer)) {
-                let f = select_footprint(sp, schema)?;
-                tables_read.union_with(&f.tables_read);
-                indexes_used |= f.indexes_used;
-            }
             let mut fp = Footprint {
-                tables_read,
+                tables_read: TableSet::new(),
                 tables_written: TableSet::new(),
-                indexes_used,
+                indexes_used: 0,
                 key_access: KeyAccess::Full,
                 read_only: true,
             };
+            match &dp.body {
+                SubBody::Select(sp) => {
+                    let f = select_footprint(sp, schema)?;
+                    fp.tables_read.union_with(&f.tables_read);
+                    fp.indexes_used |= f.indexes_used;
+                }
+                SubBody::Compound(c) => {
+                    for arm in &c.arms {
+                        union_compound_arm_footprint(arm, schema, &mut fp)?;
+                    }
+                    union_compound_arm_reads(c, schema, &mut fp)?;
+                }
+            }
+            {
+                let f = select_footprint(&dp.outer, schema)?;
+                fp.tables_read.union_with(&f.tables_read);
+                fp.indexes_used |= f.indexes_used;
+            }
             // The BODY's own lifts read tables too (format 52). Leaving them
             // out would let `conflicts_with` call this statement independent of
             // a writer to the correlated table — the same leak the

@@ -511,7 +511,21 @@ pub(crate) fn plan_statement(
         out: &mut Vec<u32>,
     ) {
         for arm in &c.arms {
-            select_tables(arm, out);
+            match arm {
+                crate::plan::CompoundArm::Select(sp) => select_tables(sp, out),
+                crate::plan::CompoundArm::Derived(dp) => {
+                    match &dp.body {
+                        SubBody::Select(sp) => select_tables(sp, out),
+                        SubBody::Compound(inner) => {
+                            stamp_compound_tables(inner, select_tables, out)
+                        }
+                    }
+                    select_tables(&dp.outer, out);
+                    for s in &dp.body_subplans {
+                        stamp_subplan_tables(s, select_tables, out);
+                    }
+                }
+            }
         }
         for arm in &c.arm_subplans {
             for s in arm {
@@ -816,12 +830,13 @@ fn plan_compound(
     row_count: RowCountFn<'_>,
     consts: &mut Vec<Value>,
 ) -> Result<PlannedStmt> {
-    let mut arms: Vec<SelectPlan> = Vec::with_capacity(c.arms.len());
+    let mut arms: Vec<crate::plan::CompoundArm> = Vec::with_capacity(c.arms.len());
     let mut param_types: Vec<Option<ColumnType>> = Vec::new();
     let mut context_keys: Vec<String> = Vec::new();
     let mut list_keys: BTreeSet<String> = BTreeSet::new();
     let mut out_types: Vec<Option<ColumnType>> = Vec::new();
     // Each arm OWNS its lifts (format 56). See `CompoundPlan::arm_subplans`.
+    // A Derived arm owns lifts inside the DerivedPlan; its list entry is empty.
     let mut arm_subplans: Vec<Vec<SubPlan>> = Vec::with_capacity(c.arms.len());
     let mut n_slots: u16 = 0;
 
@@ -833,11 +848,67 @@ fn plan_compound(
         // construction — the cross-arm slot coordination the old refusal
         // asked for, with no post-hoc remap to get wrong.
         let arm_base = n_params + n_slots;
-        let (stmt, ptypes, ckeys, lkeys, otypes, arm_subs) =
-            plan_select(arm_ast, schema, arm_base, catalog, mode, host_udfs, row_count, consts, None)?;
-        let PlanStmt::Select(sp) = stmt else {
-            return Err(Error::Internal("plan_select produced a non-select".into()));
-        };
+        // Nested `SELECT … FROM (<non-flat body>)` as a compound arm: materialise
+        // via DerivedPlan (format 58). The passthrough/splice rewrite already
+        // removed identity wrappers; what remains here cannot be flattened.
+        let (arm, ptypes, ckeys, lkeys, otypes, arm_subs, extra_slots) =
+            if arm_ast.from_derived.is_some() {
+                let (stmt, ptypes, ckeys, lkeys, otypes, _subs) = derived::plan_derived_select(
+                    arm_ast, schema, arm_base, catalog, mode, host_udfs, row_count, consts,
+                )?;
+                let crate::plan::PlanStmt::Derived(dp) = stmt else {
+                    return Err(Error::Internal(
+                        "plan_derived_select produced a non-derived".into(),
+                    ));
+                };
+                // Compound arms may not carry their own ORDER BY/LIMIT — the
+                // compound owns those. A derived outer that still has them is a
+                // non-passthrough wrapper we correctly refuse to splice.
+                if !dp.outer.order_by.is_empty()
+                    || dp.outer.order_junk != 0
+                    || dp.outer.limit.is_some()
+                    || dp.outer.offset.is_some()
+                {
+                    return Err(bind_err(
+                        "a derived table with ORDER BY/LIMIT as a compound arm is \
+                         not supported — the compound's own ORDER BY/LIMIT binds \
+                         the whole chain",
+                    ));
+                }
+                let body_slots = dp.body_subplans.len() as u16
+                    + match &dp.body {
+                        SubBody::Compound(inner) => {
+                            inner.n_arm_slots() + inner.n_derived_body_slots()
+                        }
+                        SubBody::Select(_) => 0,
+                    };
+                (
+                    crate::plan::CompoundArm::Derived(dp),
+                    ptypes,
+                    ckeys,
+                    lkeys,
+                    otypes,
+                    Vec::new(),
+                    body_slots,
+                )
+            } else {
+                let (stmt, ptypes, ckeys, lkeys, otypes, arm_subs) = plan_select(
+                    arm_ast, schema, arm_base, catalog, mode, host_udfs, row_count, consts, None,
+                )?;
+                let PlanStmt::Select(sp) = stmt else {
+                    return Err(Error::Internal("plan_select produced a non-select".into()));
+                };
+                let n = arm_subs.len() as u16;
+                (
+                    crate::plan::CompoundArm::Select(sp),
+                    ptypes,
+                    ckeys,
+                    lkeys,
+                    otypes,
+                    arm_subs,
+                    n,
+                )
+            };
         // A CORRELATED arm subplan used to be refused here — the arm executor
         // (`exec_select`) has no per-row fill phase, so its slot would have been
         // an unfilled hole. It is no longer HOISTED to the statement: the arm
@@ -847,7 +918,7 @@ fn plan_compound(
         // lift is filled per ARM row, which is the only row it can name, and
         // the arm may carry the matching `post_filter`.
         n_slots = n_slots
-            .checked_add(arm_subs.len() as u16)
+            .checked_add(extra_slots)
             .ok_or_else(|| bind_err("too many subqueries in one compound SELECT"))?;
         if n_slots as usize > MAX_PLAN_SUBPLANS {
             return Err(bind_err(
@@ -855,6 +926,7 @@ fn plan_compound(
             ));
         }
         arm_subplans.push(arm_subs);
+        arms.push(arm);
         // Context slots are appended AFTER the user params, so two arms
         // binding different key sets would give the same slot index two
         // meanings. Identical key lists (the common case: same policy on the
@@ -926,7 +998,6 @@ fn plan_compound(
                 }
             }
         }
-        arms.push(sp);
     }
 
     // The compound-level ORDER BY names the OUTPUT: an ordinal, a first-arm
@@ -965,7 +1036,7 @@ fn plan_compound(
             ));
         };
         let pos = (0..arity).find(|&j| {
-            out_name(&arms[0], j).is_some_and(|nm| nm.eq_ignore_ascii_case(n))
+            out_name(arms[0].output_select(), j).is_some_and(|nm| nm.eq_ignore_ascii_case(n))
         });
         match pos {
             Some(j) => order_by.push((j as u16, *dir, coll)),

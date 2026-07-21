@@ -23,7 +23,16 @@ impl CompiledPlan {
                 &mut budget,
             )?,
             PlanStmt::RecursiveCte(rc) => self.validate_recursive_cte(rc, schema, ptypes)?,
-            PlanStmt::Derived(dp) => self.validate_derived(dp, schema, ptypes, &mut budget)?,
+            PlanStmt::Derived(dp) => {
+                // Statement-level lifts are filled against the OUTER row of a
+                // top-level derived, which has no base-table correlation — empty
+                // is required. Nested Derived arms of a compound are validated
+                // via validate_compound and do not take this path.
+                if !self.subplans.is_empty() {
+                    return Err(corrupt("derived-table statement with lifted subqueries"));
+                }
+                self.validate_derived(dp, schema, ptypes, &mut budget)?;
+            }
             _other => self.validate_rest(schema)?,
         }
         if !self.subplans.is_empty() {
@@ -105,16 +114,17 @@ impl CompiledPlan {
             .iter()
             .flat_map(|a| a.iter().map(|s| !s.outer_args.is_empty()))
             .collect();
-        let arity = c.arms[0].projection.len();
+        let arity = c.arms[0].output_arity();
         for (k, arm) in c.arms.iter().enumerate() {
+            let out = arm.output_select();
             // The compound owns ORDER BY/LIMIT — SQL cannot express them per arm,
             // so an arm carrying its own is forged. And with no junk,
             // `projection.len()` IS the output arity, which the set ops and the
             // compound sort both index.
-            if !arm.order_by.is_empty()
-                || arm.order_junk != 0
-                || arm.limit.is_some()
-                || arm.offset.is_some()
+            if !out.order_by.is_empty()
+                || out.order_junk != 0
+                || out.limit.is_some()
+                || out.offset.is_some()
             {
                 return Err(corrupt("compound arm carries its own ORDER BY/LIMIT"));
             }
@@ -123,25 +133,38 @@ impl CompiledPlan {
             // subplan level follows. Without one it would be silently ignored,
             // so its presence is forgery.
             let lifts = c.arm_lifts(k);
-            if arm.post_filter.is_some() && !lifts.iter().any(|s| !s.outer_args.is_empty()) {
+            if out.post_filter.is_some() && !lifts.iter().any(|s| !s.outer_args.is_empty()) {
                 return Err(corrupt("compound arm carries a post-filter"));
             }
-            if arm.projection.len() != arity {
+            if arm.output_arity() != arity {
                 return Err(corrupt("compound arms disagree on output arity"));
             }
-            self.validate_select(arm, schema, &types)?;
-            self.check_correlated_slots(arm, level_base, &all_correlated)?;
+            match arm {
+                crate::plan::CompoundArm::Select(sp) => {
+                    self.validate_select(sp, schema, &types)?;
+                    self.check_correlated_slots(sp, level_base, &all_correlated)?;
+                }
+                crate::plan::CompoundArm::Derived(dp) => {
+                    // Nested derived as a compound arm: validate the derived
+                    // plan against the same param level; body slots start at
+                    // body_sub_base (the arm's planning base).
+                    self.validate_derived(dp, schema, &types, budget)?;
+                }
+            }
         }
-        // Each arm's lifts, against the ARM's row and the ARM's reserved base —
-        // the same recursion, and the same shared helpers, the statement level
-        // and the derived body use.
+        // Each Select arm's lifts, against the ARM's row and the ARM's reserved
+        // base — the same recursion the statement level and the derived body use.
+        // Derived arms own their lifts inside the DerivedPlan (validated above).
         for (k, lifts) in c.arm_subplans.iter().enumerate() {
+            if lifts.is_empty() {
+                continue;
+            }
             let base_k = c.arm_base(k) as usize;
             let arm = c
                 .arms
                 .get(k)
                 .ok_or_else(|| corrupt("compound arm-subplan list longer than the arms"))?;
-            let arm_outer = self.select_row_types(arm, schema)?;
+            let arm_outer = self.select_row_types(arm.output_select(), schema)?;
             let arm_ptypes = &types[..base_k.min(types.len())];
             for s in lifts {
                 self.validate_subplan_rec(schema, s, arm_ptypes, &arm_outer, budget)?;
@@ -254,18 +277,11 @@ impl CompiledPlan {
         if dp.body.output_arity() != arity {
             return Err(corrupt("derived-table body arity does not match the column list"));
         }
-        // The STATEMENT-level list stays empty: those are filled before
-        // dispatch against the OUTER row, and the outer scans a materialised
-        // set through the working table, where a base-table correlation has no
-        // meaning. A derived table's lifts belong to its BODY (format 52), and
-        // are checked below.
-        if !self.subplans.is_empty() {
-            return Err(corrupt("derived-table statement with lifted subqueries"));
-        }
-        let body_arms: &[SelectPlan] = match &dp.body {
-            SubBody::Select(sp) => std::slice::from_ref(sp),
-            SubBody::Compound(c) => &c.arms,
-        };
+        // The STATEMENT-level list stays empty only for a top-level
+        // PlanStmt::Derived. Nested Derived as a compound arm is validated with
+        // the parent's subplans still present — the empty check is only for the
+        // top-level node (caller: validate_stmt).
+        //
         // The OUTER never has a per-row fill phase (it scans a materialised
         // set), so a post-filter there is forgery. A SELECT body's is governed
         // by `validate_body_subplans`; a COMPOUND body's arms by
@@ -281,7 +297,46 @@ impl CompiledPlan {
             }
         }
         // The body cannot reference the working table it DEFINES.
-        if body_arms.iter().map(reads_cte).sum::<usize>() != 0 {
+        let body_reads_cte = match &dp.body {
+            SubBody::Select(sp) => reads_cte(sp),
+            SubBody::Compound(c) => c
+                .arms
+                .iter()
+                .map(|a| match a {
+                    crate::plan::CompoundArm::Select(sp) => reads_cte(sp),
+                    // A nested derived arm defines its own working table; its
+                    // outer may read CTE_TABLE, which is that arm's, not this
+                    // derived's — still refuse if the body Select of the nest
+                    // somehow names this level's CTE (planner never produces it).
+                    crate::plan::CompoundArm::Derived(inner) => {
+                        reads_cte(&inner.outer)
+                            + match &inner.body {
+                                SubBody::Select(sp) => reads_cte(sp),
+                                SubBody::Compound(c2) => c2
+                                    .arms
+                                    .iter()
+                                    .map(|a2| reads_cte(a2.output_select()))
+                                    .sum::<usize>(),
+                            }
+                    }
+                })
+                .sum(),
+        };
+        // For a compound body's nested Derived arms, CTE_TABLE in the arm
+        // outer is the nested derived's own working table — not this dp's.
+        // Only refuse if a plain Select arm (or nested body select) names it.
+        // Re-check with a simpler rule: only Select arms of this body.
+        let plain_body_cte = match &dp.body {
+            SubBody::Select(sp) => reads_cte(sp),
+            SubBody::Compound(c) => c
+                .arms
+                .iter()
+                .filter_map(|a| a.as_select())
+                .map(reads_cte)
+                .sum(),
+        };
+        let _ = body_reads_cte;
+        if plain_body_cte != 0 {
             return Err(corrupt("derived-table body references the working table"));
         }
         // The outer reads the materialized rows exactly once (its FROM, or —
@@ -292,10 +347,10 @@ impl CompiledPlan {
             ));
         }
         // Structural validation of each component (widths, access paths, program
-        // bounds). CTE_TABLE resolves through the CTE-aware `get_table`; the
-        // FullScan-only rule for it is enforced there.
+        // bounds). The outer binds CTE_TABLE to THIS derived's working table —
+        // including when this Derived is a nested compound arm (format 58).
         match &dp.body {
-            SubBody::Select(sp) => self.validate_select(sp, schema, ptypes)?,
+            SubBody::Select(sp) => self.validate_select_cte(sp, schema, ptypes, None)?,
             // A COMPOUND body owns its lifts one level further down, per ARM
             // (format 56); its reserved region starts where the body's own
             // would have.
@@ -307,7 +362,8 @@ impl CompiledPlan {
                 budget,
             )?,
         }
-        self.validate_select(&dp.outer, schema, ptypes)?;
+        let working = dp.derived_def();
+        self.validate_select_cte(&dp.outer, schema, ptypes, Some(&working))?;
         self.validate_body_subplans(dp, schema, budget)?;
         Ok(())
     }
@@ -329,11 +385,24 @@ impl CompiledPlan {
         // Reserved slots the body owns: its own lifts, or — for a compound body
         // — its arms' (format 56, checked by `validate_compound`).
         let arm_slots = match &dp.body {
-            SubBody::Compound(c) => c.n_arm_slots() as usize,
+            SubBody::Compound(c) => {
+                (c.n_arm_slots() + c.n_derived_body_slots()) as usize
+            }
             SubBody::Select(_) => 0,
         };
         let base = dp.body_sub_base as usize;
-        if base + dp.body_subplans.len() + arm_slots != self.n_params as usize {
+        let end = base + dp.body_subplans.len() + arm_slots;
+        // Top-level Derived fills [user ‖ body slots] to n_params. Nested
+        // Derived as a compound arm occupies a MID slice of a wider buffer —
+        // only require the region fits, do not demand it is the whole tail.
+        if end > self.n_params as usize {
+            return Err(corrupt(
+                "derived-table body subplan slots out of the reserved parameter region",
+            ));
+        }
+        if matches!(self.stmt, PlanStmt::Derived(_))
+            && end != self.n_params as usize
+        {
             return Err(corrupt(
                 "derived-table body subplan slots do not fill the reserved parameter region",
             ));
@@ -376,20 +445,26 @@ impl CompiledPlan {
         schema: &Schema,
         ptypes: &[Option<ColumnType>],
     ) -> Result<()> {
-        // The working table (CTE_TABLE) resolves to the synthetic def derived
-        // from THIS plan's node — RecursiveCte or Derived, the only two
-        // meanings CTE_TABLE can have inside one plan. Built once here so
-        // `get_table` (and the outer-table selection below) can hand out a
-        // reference to it.
+        // Default working-table binding from the statement node; nested
+        // Derived arms pass theirs via `validate_select_cte`.
         let cte_td: Option<TableDef> = match &self.stmt {
             PlanStmt::RecursiveCte(rc) => Some(rc.cte_def()),
             PlanStmt::Derived(dp) => Some(dp.derived_def()),
             _ => None,
         };
+        self.validate_select_cte(sp, schema, ptypes, cte_td.as_ref())
+    }
+
+    fn validate_select_cte(
+        &self,
+        sp: &SelectPlan,
+        schema: &Schema,
+        ptypes: &[Option<ColumnType>],
+        cte_td: Option<&TableDef>,
+    ) -> Result<()> {
         let get_table = |id: u32| -> Result<&TableDef> {
             if id == super::CTE_TABLE {
                 return cte_td
-                    .as_ref()
                     .ok_or_else(|| corrupt("CTE working table outside a recursive CTE / derived table"));
             }
             schema

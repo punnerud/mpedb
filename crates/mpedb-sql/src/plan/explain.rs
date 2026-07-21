@@ -135,8 +135,18 @@ impl CompiledPlan {
                     SetOp::Intersect => "INTERSECT\n",
                 });
             }
-            self.render_select(arm, schema, out);
-            // The lifts this ARM owns (format 56), rendered under it.
+            match arm {
+                crate::plan::CompoundArm::Select(sp) => self.render_select(sp, schema, out),
+                crate::plan::CompoundArm::Derived(dp) => {
+                    out.push_str(&format!("  arm{} derived \"{}\"\n", k + 1, dp.name));
+                    match &dp.body {
+                        SubBody::Select(sp) => self.render_select(sp, schema, out),
+                        SubBody::Compound(inner) => self.render_compound(inner, schema, out),
+                    }
+                    self.render_select(&dp.outer, schema, out);
+                }
+            }
+            // The lifts this Select ARM owns (format 56), rendered under it.
             for (i, sub) in c.arm_lifts(k).iter().enumerate() {
                 let label = format!("arm{} ${}", k + 1, c.arm_base(k) as usize + i + 1);
                 self.render_subplan(sub, schema, out, &label);

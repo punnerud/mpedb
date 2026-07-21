@@ -226,35 +226,31 @@ fn passthrough_compound_arm_matches_sqlite() {
     d.verify().unwrap();
 }
 
-/// The splice is DECLINED where it would not be an identity. sqlite answers all
-/// of these; mpedb refuses. Narrower is allowed, different is not — so these
-/// assert the refusal, and `refused_narrower` re-checks that sqlite still
-/// answers so the case cannot quietly rot.
+/// Non-associative / non-spliceable nests that used to refuse are now answered
+/// by materialising the nested derived arm (PLAN_FORMAT 58). Differential vs
+/// sqlite — never a wrong answer, never a silent identity rewrite.
 #[test]
-fn non_associative_arm_nesting_still_refuses() {
+fn non_associative_arm_nesting_matches_sqlite() {
     let d = db();
-    let nested = "only supported in a statement's outermost FROM";
     for q in [
         // EXCEPT is not associative: `A \ (B \ C)` ≠ `(A \ B) \ C`.
-        "SELECT id FROM t EXCEPT SELECT * FROM (SELECT id FROM t EXCEPT SELECT id FROM u)",
+        "SELECT id FROM t EXCEPT SELECT * FROM (SELECT id FROM t EXCEPT SELECT id FROM u) ORDER BY 1",
         // Django's `test_qs_with_subcompound_qs`: `A EXCEPT (B INTERSECT C)`.
         "SELECT count(*) FROM (SELECT id FROM t EXCEPT SELECT * FROM (SELECT id FROM t INTERSECT SELECT id FROM u WHERE b > 10)) sub",
-        // A MIXED chain: `A ∪ (B ⊎ C)` dedups C's duplicates, `(A ∪ B) ⊎ C` does not.
-        "SELECT id FROM t UNION SELECT * FROM (SELECT id FROM u UNION ALL SELECT id FROM u)",
-        "SELECT id FROM t UNION ALL SELECT * FROM (SELECT id FROM u UNION SELECT id FROM u)",
-        "SELECT id FROM t INTERSECT SELECT * FROM (SELECT id FROM u UNION SELECT id FROM t)",
-        // A body with its OWN ORDER BY / LIMIT / OFFSET: spliced out, they
-        // would become the whole compound's.
-        "SELECT id FROM t UNION SELECT * FROM (SELECT id FROM u ORDER BY id LIMIT 1)",
-        "SELECT id FROM t UNION SELECT * FROM (SELECT id FROM u LIMIT 1 OFFSET 1)",
-        "SELECT id FROM t UNION SELECT * FROM (SELECT id FROM u UNION SELECT id FROM t LIMIT 2)",
-        // A wrapper that is NOT a pass-through — it projects, filters or
-        // dedups, so the body is a real nested derived table.
-        "SELECT id FROM t UNION SELECT x FROM (SELECT a AS x FROM t GROUP BY a) w",
-        "SELECT id FROM t UNION SELECT * FROM (SELECT a FROM t GROUP BY a) w WHERE a > 10",
-        "SELECT id FROM t UNION SELECT DISTINCT * FROM (SELECT a FROM t GROUP BY a) w",
+        // A MIXED chain: `A ∪ (B ⊎ C)` vs `(A ∪ B) ⊎ C`.
+        "SELECT id FROM t UNION SELECT * FROM (SELECT id FROM u UNION ALL SELECT id FROM u) ORDER BY 1",
+        "SELECT id FROM t UNION ALL SELECT * FROM (SELECT id FROM u UNION SELECT id FROM u) ORDER BY 1",
+        "SELECT id FROM t INTERSECT SELECT * FROM (SELECT id FROM u UNION SELECT id FROM t) ORDER BY 1",
+        // Nested derived with its own ORDER BY / LIMIT on the body (not the arm wrapper).
+        "SELECT id FROM t UNION SELECT * FROM (SELECT id FROM u ORDER BY id LIMIT 1) ORDER BY 1",
+        "SELECT id FROM t UNION SELECT * FROM (SELECT id FROM u LIMIT 1 OFFSET 1) ORDER BY 1",
+        "SELECT id FROM t UNION SELECT * FROM (SELECT id FROM u UNION SELECT id FROM t LIMIT 2) ORDER BY 1",
+        // Non-passthrough wrappers: real nested derived (project / filter / DISTINCT).
+        "SELECT id FROM t UNION SELECT x FROM (SELECT a AS x FROM t GROUP BY a) w ORDER BY 1",
+        "SELECT id FROM t UNION SELECT * FROM (SELECT a FROM t GROUP BY a) w WHERE a > 10 ORDER BY 1",
+        "SELECT id FROM t UNION SELECT DISTINCT * FROM (SELECT a FROM t GROUP BY a) w ORDER BY 1",
     ] {
-        refused_narrower(&d, q, nested);
+        same(&d, q);
     }
     d.verify().unwrap();
 }
@@ -382,19 +378,18 @@ fn projection_passthrough_subquery_body_matches_sqlite() {
     d.verify().unwrap();
 }
 
-/// Django `test_qs_with_subcompound_qs`: `A EXCEPT (B INTERSECT C)` still needs
-/// a nested compound arm (set identity rewrites cannot flatten into a
-/// left-associative chain). Stays refused by name until compound arms can own
-/// a nested compound / derived source.
+/// Django `test_qs_with_subcompound_qs`: nested set-op derived arm materialises
+/// (format 58). Answers match sqlite, including the parentheses that
+/// left-associative splice would get wrong.
 #[test]
-fn except_intersect_nest_still_refuses() {
+fn except_intersect_nest_matches_sqlite() {
     let d = db();
-    let nested = "only supported in a statement's outermost FROM";
     for q in [
         "SELECT count(*) FROM (SELECT id FROM t EXCEPT SELECT * FROM (SELECT id FROM t INTERSECT SELECT id FROM u WHERE b > 10)) sub",
         "SELECT id FROM t EXCEPT SELECT * FROM (SELECT id FROM t INTERSECT SELECT id FROM u) ORDER BY 1",
+        "SELECT id FROM t EXCEPT SELECT * FROM (SELECT id FROM u INTERSECT SELECT id FROM t WHERE a IS NOT NULL) ORDER BY 1",
     ] {
-        refused_narrower(&d, q, nested);
+        same(&d, q);
     }
     d.verify().unwrap();
 }

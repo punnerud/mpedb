@@ -46,10 +46,22 @@ impl RiskEstimate {
         fn sel(sp: &SelectPlan) -> bool {
             !sp.joins.is_empty()
         }
+        fn arm_sel(a: &mpedb_sql::CompoundArm) -> bool {
+            match a {
+                mpedb_sql::CompoundArm::Select(sp) => sel(sp),
+                mpedb_sql::CompoundArm::Derived(dp) => {
+                    sel(&dp.outer)
+                        || match &dp.body {
+                            mpedb_sql::SubBody::Select(sp) => sel(sp),
+                            mpedb_sql::SubBody::Compound(c) => c.arms.iter().any(arm_sel),
+                        }
+                }
+            }
+        }
         let subs_correlated = |subs: &[SubPlan]| subs.iter().any(|s| !s.outer_args.is_empty());
         match &plan.stmt {
             PlanStmt::Select(sp) => sel(sp) || subs_correlated(&plan.subplans),
-            PlanStmt::Compound(c) => c.arms.iter().any(sel) || subs_correlated(&plan.subplans),
+            PlanStmt::Compound(c) => c.arms.iter().any(arm_sel) || subs_correlated(&plan.subplans),
             PlanStmt::Insert { from_select, .. } => {
                 from_select.as_ref().is_some_and(|s| sel(&s.plan)) || subs_correlated(&plan.subplans)
             }
@@ -62,7 +74,7 @@ impl RiskEstimate {
             PlanStmt::Derived(dp) => {
                 let body_joins = match &dp.body {
                     mpedb_sql::SubBody::Select(sp) => sel(sp),
-                    mpedb_sql::SubBody::Compound(c) => c.arms.iter().any(sel),
+                    mpedb_sql::SubBody::Compound(c) => c.arms.iter().any(arm_sel),
                 };
                 body_joins || sel(&dp.outer) || subs_correlated(&plan.subplans)
             }
@@ -215,7 +227,18 @@ fn estimate_compound(
     let mut total: u64 = 0;
     let mut best: Option<Acc> = None;
     for arm in &c.arms {
-        let a = estimate_select(arm, subplans, schema, rc);
+        let a = match arm {
+            mpedb_sql::CompoundArm::Select(sp) => estimate_select(sp, subplans, schema, rc),
+            mpedb_sql::CompoundArm::Derived(dp) => {
+                // Body work dominates; outer is a scan of the materialised set.
+                let body = estimate_body(&dp.body, &dp.body_subplans, schema, rc);
+                let outer = estimate_select(&dp.outer, &[], schema, rc);
+                let mut acc = body;
+                acc.rows = acc.rows.saturating_add(outer.rows);
+                acc.consider(outer.label_rows, || outer.label.clone());
+                acc
+            }
+        };
         total = total.saturating_add(a.rows);
         best = Some(match best {
             Some(b) if b.label_rows >= a.label_rows => b,

@@ -170,7 +170,11 @@ pub(super) fn exec_derived(
         }
     }
     let mut wctx = WorkingTableCtx { inner: ctx, rows: &body_rows };
-    exec_select(&mut wctx, schema, plan, params, &dp.outer)
+    // Install this derived's working-table def for `table_def(CTE_TABLE)` while
+    // the outer scans — required when the statement node is a Compound with a
+    // nested Derived arm (format 58), not PlanStmt::Derived itself.
+    let def = dp.derived_def();
+    super::with_working_table_def(def, || exec_select(&mut wctx, schema, plan, params, &dp.outer))
 }
 
 /// Run one recursive-CTE component and return just its projected rows.
