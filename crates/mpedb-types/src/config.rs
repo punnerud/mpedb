@@ -9,6 +9,95 @@ use crate::value::{Affinity, Collation, ColumnType, Value};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+/// How the database is backed. Chosen by `database.path` spelling.
+///
+/// | path | kind | multi-process attach |
+/// |---|---|---|
+/// | `":memory:"` | [`StorageKind::PrivateMemory`] | **no** (default in-memory) |
+/// | `":memory:shared:<name>"` | [`StorageKind::SharedMemory`] | **yes** (tmpfs file) |
+/// | any filesystem path | [`StorageKind::File`] | **yes** |
+///
+/// LLM / tooling: prefer `":memory:"` for single-process tests and harnesses;
+/// use `":memory:shared:foo"` when two OS processes must share one RAM-backed
+/// DB (same schema seed / size_mb / max_readers on every attach). Ordinary
+/// paths remain the production multi-process model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StorageKind {
+    /// Process-private: memfd / unlinked temp. Not attachable by path.
+    PrivateMemory,
+    /// Named RAM-backed multi-process DB under `/dev/shm` (or temp dir).
+    SharedMemory,
+    /// Ordinary filesystem `.mpedb` file.
+    File,
+}
+
+impl StorageKind {
+    /// Whether a second OS process can attach by opening the same config path.
+    pub fn multi_process_attach(self) -> bool {
+        !matches!(self, StorageKind::PrivateMemory)
+    }
+
+    /// Short, stable hint for tools/LLMs (also returned from
+    /// [`crate` facade helpers on `Database`]).
+    pub fn multi_process_hint(self) -> &'static str {
+        match self {
+            StorageKind::PrivateMemory => {
+                "private in-memory (:memory:) — not multi-process; for shared RAM use \
+                 path = \":memory:shared:<name>\" (same name in every process) or a \
+                 filesystem path"
+            }
+            StorageKind::SharedMemory => {
+                "shared in-memory (:memory:shared:<name>) — multi-process attach OK via \
+                 the same path spelling; backing lives under /dev/shm when available"
+            }
+            StorageKind::File => {
+                "file-backed — multi-process attach OK; every process opens the same path"
+            }
+        }
+    }
+}
+
+/// Classify and optionally rewrite `database.path` for open.
+///
+/// * `":memory:"` → left as-is (private memfd).
+/// * `":memory:shared:NAME"` → resolved to `/dev/shm/mpedb-shared-NAME.mpedb`
+///   (or `$TMPDIR/...` if `/dev/shm` is missing).
+/// * anything else → unchanged filesystem path.
+pub fn resolve_storage_path(path: &std::path::Path) -> Result<(PathBuf, StorageKind)> {
+    let s = path.as_os_str().to_string_lossy();
+    if s == ":memory:" {
+        return Ok((PathBuf::from(":memory:"), StorageKind::PrivateMemory));
+    }
+    if let Some(name) = s.strip_prefix(":memory:shared:") {
+        validate_shared_memory_name(name)?;
+        let base = if std::path::Path::new("/dev/shm").is_dir() {
+            PathBuf::from("/dev/shm")
+        } else {
+            std::env::temp_dir()
+        };
+        let resolved = base.join(format!("mpedb-shared-{name}.mpedb"));
+        return Ok((resolved, StorageKind::SharedMemory));
+    }
+    Ok((path.to_path_buf(), StorageKind::File))
+}
+
+fn validate_shared_memory_name(name: &str) -> Result<()> {
+    if name.is_empty() || name.len() > 64 {
+        return Err(Error::Config(
+            "path = \":memory:shared:<name>\": name must be 1..=64 characters".into(),
+        ));
+    }
+    if !name
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(Error::Config(
+            "path = \":memory:shared:<name>\": name must be [A-Za-z0-9_-]+ only".into(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
     /// Never msync; crash-safe against process death, not against power loss
@@ -425,6 +514,16 @@ fn raw_to_config(
         if db.path.is_empty() {
             return Err(Error::Config("database.path must be set".into()));
         }
+        // Storage path dialects (see [`StorageKind`]):
+        //   ":memory:"              — process-private (default in-memory)
+        //   ":memory:shared:<name>" — multi-process RAM via /dev/shm (or temp)
+        //   any other path          — ordinary file DB
+        let is_private_memory = db.path == ":memory:";
+        let is_shared_memory = db.path.starts_with(":memory:shared:");
+        if is_shared_memory {
+            let name = &db.path[":memory:shared:".len()..];
+            validate_shared_memory_name(name)?;
+        }
         if db.size_mb < 1 || db.size_mb > MAX_DB_SIZE_MB {
             return Err(Error::Config(format!(
                 "database.size_mb must be in 1..={MAX_DB_SIZE_MB}"
@@ -451,6 +550,15 @@ fn raw_to_config(
                 )))
             }
         };
+        // Process-private in-memory DBs have no durable companion file.
+        if is_private_memory && durability != Durability::None {
+            return Err(Error::Config(
+                "path = \":memory:\" requires durability = none (or omit durability). \
+                 For multi-process RAM sharing use path = \":memory:shared:<name>\" \
+                 (tmpfs file under /dev/shm) instead."
+                    .into(),
+            ));
+        }
         let concurrency = match db.concurrency.as_deref() {
             None | Some("serial") => Concurrency::Serial,
             Some("optimistic") => Concurrency::Optimistic,

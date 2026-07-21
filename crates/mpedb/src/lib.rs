@@ -276,6 +276,47 @@ pub enum ExecResult {
     Explain(String),
 }
 
+/// A prepared point-select handle (SQLite `sqlite3_stmt` analogue for reads).
+///
+/// Holds the compiled plan and, when eligible, precomputed PkPoint projection
+/// metadata so each [`Database::execute_prepared_select`] skips plan-cache
+/// lookup and column-name rebuild. Create with [`Database::prepare_select`].
+///
+/// Invalidated after schema DDL that bumps `schema_gen` — re-prepare.
+#[derive(Clone)]
+pub struct PreparedSelect {
+    hash: PlanHash,
+    plan: std::sync::Arc<CompiledPlan>,
+    /// Precomputed micro-exec shape; `None` → general select path.
+    pk_hot: Option<exec::PkPointHot>,
+    /// Schema generation observed at prepare; execute re-checks.
+    schema_gen: u64,
+}
+
+impl PreparedSelect {
+    /// Content hash of the underlying plan (same as [`Database::prepare`]).
+    pub fn hash(&self) -> &PlanHash {
+        &self.hash
+    }
+
+    /// Whether this handle uses the PkPoint micro-executor (point lookup).
+    pub fn is_pk_point_hot(&self) -> bool {
+        self.pk_hot.is_some()
+    }
+}
+
+/// Thread-local last plan-cache hit: repeated `execute(same_hash)` skips the
+/// `RwLock` on the process plan map (sqlite keeps the VDBE on the stmt).
+struct TlsPlanHit {
+    hash: PlanHash,
+    plan: std::sync::Arc<CompiledPlan>,
+    cache_gen: u64,
+}
+
+std::thread_local! {
+    static TLS_PLAN: std::cell::RefCell<Option<TlsPlanHit>> = const { std::cell::RefCell::new(None) };
+}
+
 /// A blob source over any `std::io::Read` with a known length: the bridge from
 /// a file, socket, or stream to `WriteSession::insert_streaming`. The engine
 /// pulls a page at a time, so the reader's bytes are never all resident.
@@ -444,8 +485,11 @@ pub struct Database {
     /// id-reuse safe.
     cache_gen: std::sync::atomic::AtomicU64,
     /// The database file path this handle attached (for `Workspace` dup-file
-    /// detection and diagnostics).
+    /// detection and diagnostics). For `:memory:shared:X` this is the
+    /// *resolved* tmpfs path; for private `:memory:` it stays `":memory:"`.
     path: std::path::PathBuf,
+    /// How this handle was opened — drives multi-process attach hints.
+    storage: mpedb_types::StorageKind,
     /// The compiled trigger set (DESIGN-TRIGGERS), gated on `schema_gen` exactly
     /// like the plan cache: `(gen, set)`, rebuilt only when a `CREATE`/`DROP
     /// TRIGGER` (here or in another process) moves the gen. `None` = not yet
@@ -509,6 +553,10 @@ pub struct Database {
     /// live here and never touch the shared registry. Cleared on
     /// ATTACH/DETACH; epoch- and schema-gen-checked at every execute.
     cross_cache: RwLock<HashMap<PlanHash, Arc<multifile::CrossPlan>>>,
+    /// `true` once any cross plan has been cached; lets
+    /// [`execute`](Self::execute) skip the cross-cache `RwLock` on the common
+    /// single-file path (prepare+bind SELECT hot path).
+    cross_cache_live: std::sync::atomic::AtomicBool,
 }
 
 /// Compile every column CHECK source in `schema` into the engine's per-table /
@@ -573,6 +621,7 @@ impl Database {
             cache_gen: std::sync::atomic::AtomicU64::new(0),
             trigger_cache: RwLock::new(None),
             path: path.to_path_buf(),
+            storage: mpedb_types::StorageKind::File,
             // No config, so no §6.3 assertions — consistent with this
             // constructor's contract (it also skips CHECK programs): a
             // config-free attach enforces what the FILE carries, and
@@ -590,15 +639,30 @@ impl Database {
             busy_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
             attached: RwLock::new(Default::default()),
             cross_cache: RwLock::new(HashMap::new()),
+            cross_cache_live: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
-    /// Open (or create) the database described by an already-parsed config.
-    /// Compiles every column CHECK expression against its table and hands the
-    /// programs to the engine, so constraint enforcement is identical in
-    /// every attached process — then installs the compiler itself, so the SAME
-    /// happens for every later schema the engine loads from the catalog.
-    pub fn open_with_config(config: Config) -> Result<Database> {
+    /// Open a **process-private in-memory** database (config `path = ":memory:"`).
+    ///
+    /// Equivalent to [`open_with_config`](Self::open_with_config) after forcing
+    /// `path` to `":memory:"` and `durability` to `none`. Backing is a lazy
+    /// memfd / unlinked temp (see `Shm::open_memory`) — no multi-process attach.
+    ///
+    /// For **multi-process RAM sharing**, use
+    /// `path = ":memory:shared:<name>"` instead (same name in every process);
+    /// see [`StorageKind`](mpedb_types::StorageKind) and
+    /// [`Database::multi_process_hint`].
+    pub fn open_in_memory(mut config: Config) -> Result<Database> {
+        config.options.path = std::path::PathBuf::from(":memory:");
+        config.options.durability = mpedb_types::Durability::None;
+        Database::open_with_config(config)
+    }
+
+    pub fn open_with_config(mut config: Config) -> Result<Database> {
+        // Resolve `:memory:` / `:memory:shared:name` before the engine opens.
+        let (resolved, storage) = mpedb_types::resolve_storage_path(&config.options.path)?;
+        config.options.path = resolved;
         let checks = compile_schema_checks(&config.schema)?;
         let path = config.options.path.clone();
         let bare_group_by = config.options.bare_group_by;
@@ -635,6 +699,7 @@ impl Database {
             cache_gen: std::sync::atomic::AtomicU64::new(0),
             trigger_cache: RwLock::new(None),
             path,
+            storage,
             require_policy,
             bare_group_by,
             host_udfs: RwLock::new(HashMap::new()),
@@ -644,7 +709,29 @@ impl Database {
             busy_timeout_ms: std::sync::atomic::AtomicI64::new(-1),
             attached: RwLock::new(Default::default()),
             cross_cache: RwLock::new(HashMap::new()),
+            cross_cache_live: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// How this handle is backed ([`mpedb_types::StorageKind`]).
+    pub fn storage_kind(&self) -> mpedb_types::StorageKind {
+        self.storage
+    }
+
+    /// Whether another OS process can attach by opening the same path/config.
+    pub fn multi_process_attach_ok(&self) -> bool {
+        self.storage.multi_process_attach()
+    }
+
+    /// Stable English hint for tools/LLMs: how multi-process attach works for
+    /// this handle, or how to switch modes if it does not.
+    pub fn multi_process_hint(&self) -> &'static str {
+        self.storage.multi_process_hint()
+    }
+
+    /// Resolved path this handle attached (for shared memory, the tmpfs path).
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     /// The CURRENT schema (Arc'd bundle; derefs to [`Schema`]). DDL may swap
@@ -659,11 +746,6 @@ impl Database {
     /// is visible on the next query without an intervening prepare.
     pub fn refresh_schema_if_stale(&self) -> Result<()> {
         self.engine.refresh_schema_if_stale()
-    }
-
-    /// The database file path this handle attached.
-    pub fn path(&self) -> &std::path::Path {
-        &self.path
     }
 
     /// Register a HOST scalar UDF on this connection (the C-API
@@ -1085,6 +1167,8 @@ impl Database {
                     .write()
                     .expect(POISON)
                     .insert(hash, Arc::new(cp));
+                self.cross_cache_live
+                    .store(true, std::sync::atomic::Ordering::Relaxed);
                 return Ok(hash);
             }
             multifile::DbRoute::AttachedOnly { db, sql } => {
@@ -1127,16 +1211,100 @@ impl Database {
         // #51: a hash prepared from a cross-file statement lives in the
         // connection-local cross cache and runs on the multi-file read path
         // (epoch- and per-member-schema-gen-checked inside).
-        if let Some(res) = self.execute_cross_cached(session, hash, params)? {
-            return Ok(res);
+        // Most connections never ATTACH; skip the cross-cache lock entirely.
+        if self
+            .cross_cache_live
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            if let Some(res) = self.execute_cross_cached(session, hash, params)? {
+                return Ok(res);
+            }
         }
         // Evict a plan whose catalog changed underneath it before serving it
         // from cache (a DROP / re-CREATE / ALTER since prepare). Cheap in the
         // common case: one `newest_meta` read, no clear.
         self.gate_cache_on_schema()?;
-        let plan = self.cached_or_load(hash)?;
+        let plan = self.cached_or_load_tls(hash)?;
         let full = session::resolve_params_timed(&plan, params, session)?;
         self.run_plan(Some(hash), &plan, &full)
+    }
+
+    /// Prepare a reusable SELECT handle (sqlite `sqlite3_stmt` analogue).
+    ///
+    /// For `SELECT … FROM t WHERE pk = $1` this captures the PkPoint micro-exec
+    /// metadata once. Prefer [`execute_prepared_select`](Self::execute_prepared_select)
+    /// over [`execute`](Self::execute) on the hot path.
+    pub fn prepare_select(&self, sql: &str) -> Result<PreparedSelect> {
+        let hash = self.prepare(sql)?;
+        self.gate_cache_on_schema()?;
+        let plan = self.cached_or_load_tls(&hash)?;
+        let schema_gen = self.engine.schema().schema_gen;
+        let pk_hot = match &plan.stmt {
+            mpedb_sql::PlanStmt::Select(sp) => {
+                exec::try_build_pk_point_hot(&self.schema(), &plan, sp)?
+            }
+            _ => {
+                return Err(Error::Unsupported(
+                    "prepare_select requires a SELECT statement".into(),
+                ));
+            }
+        };
+        Ok(PreparedSelect {
+            hash,
+            plan,
+            pk_hot,
+            schema_gen,
+        })
+    }
+
+    /// Execute a [`PreparedSelect`] — skips plan-registry lookup; uses the
+    /// precomputed PkPoint path when available.
+    pub fn execute_prepared_select(
+        &self,
+        stmt: &PreparedSelect,
+        params: &[Value],
+    ) -> Result<ExecResult> {
+        self.execute_prepared_select_ctx(&Session::empty(), stmt, params)
+    }
+
+    /// [`execute_prepared_select`](Self::execute_prepared_select) with session context.
+    pub fn execute_prepared_select_ctx(
+        &self,
+        session: &Session,
+        stmt: &PreparedSelect,
+        params: &[Value],
+    ) -> Result<ExecResult> {
+        self.gate_cache_on_schema()?;
+        let gen = self.engine.schema().schema_gen;
+        if gen != stmt.schema_gen {
+            return Err(Error::PlanInvalidated);
+        }
+        let full = session::resolve_params_timed(&stmt.plan, params, session)?;
+        if let Some(ref hot) = stmt.pk_hot {
+            // Fast path: no host UDFs on pure column projection; skip host table build.
+            if !stmt.plan.footprint.read_only {
+                return Err(Error::Internal(
+                    "PreparedSelect with write footprint".into(),
+                ));
+            }
+            let r = self.engine.begin_read()?;
+            self.validate_policy_read(Some(&stmt.hash), &stmt.plan, &r)?;
+            let res = {
+                let mut ctx = exec::ReadCtx(&r, None, None, None);
+                // coerce still needed for Text→Int etc.
+                let coerced = exec::coerce_params(&stmt.plan, &full)?;
+                exec::exec_pk_point_hot(&mut ctx, &stmt.plan, &coerced, hot)
+            };
+            match res {
+                Ok(out) => {
+                    r.finish()?;
+                    Ok(out)
+                }
+                Err(e) => Err(e),
+            }
+        } else {
+            self.run_plan(Some(&stmt.hash), &stmt.plan, &full)
+        }
     }
 
     /// One-shot prepare + execute. `EXPLAIN <stmt>` returns
@@ -1190,6 +1358,63 @@ impl Database {
         let plan = self.register(hash, plan, sql)?;
         let full = session::resolve_params_timed(&plan, params, session)?;
         self.run_plan(Some(&hash), &plan, &full)
+    }
+
+    /// One-shot compile + execute **without** publishing to the plan registry
+    /// and **without** the detached encode/decode re-validation round-trip.
+    ///
+    /// Use this for harnesses that fire each SQL text approximately once
+    /// (sqllogictest corpus, ad-hoc tooling). Compared to
+    /// [`prepare_detached`](Self::prepare_detached) +
+    /// [`execute_detached`](Self::execute_detached) it skips `encode` →
+    /// `decode` → schema re-check on every statement (those exist for
+    /// untrusted client-borne blobs, not same-process one-shots). Compared to
+    /// [`query`](Self::query) it never takes the writer lock to insert a plan
+    /// into the shared registry.
+    ///
+    /// DML still autocommits via the writer lock as usual; plans run with no
+    /// registry hash so they are not enqueued on the intent ring (same as
+    /// detached DML). Correctness is identical to a successful
+    /// prepare_detached+execute_detached for well-formed SQL.
+    pub fn query_once(&self, sql: &str, params: &[Value]) -> Result<ExecResult> {
+        self.query_once_ctx(&Session::empty(), sql, params)
+    }
+
+    /// [`query_once`](Self::query_once) with a [`Session`] for `current_setting()`.
+    pub fn query_once_ctx(
+        &self,
+        session: &Session,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecResult> {
+        if let Some(res) = self.attach_stmt_hook(sql)? {
+            return Ok(res);
+        }
+        let routed;
+        let sql = match self.resolve_db_refs_hook(sql)? {
+            multifile::DbRoute::Passthrough => sql,
+            multifile::DbRoute::Main(s) => {
+                routed = s;
+                &routed
+            }
+            multifile::DbRoute::Cross { sql, tables } => {
+                return self.query_cross(session, &sql, &tables, params)
+            }
+            multifile::DbRoute::AttachedOnly { db, sql } => {
+                return self.query_attached_only(&db, &sql, params);
+            }
+        };
+        if let Some(ddl) = mpedb_sql::parse_ddl(sql)? {
+            return self.apply_ddl(ddl);
+        }
+        let (plan, is_explain) = self.compile_maybe_explain(sql)?;
+        if is_explain {
+            return Ok(ExecResult::Explain(plan.explain(&self.schema())));
+        }
+        self.warn_if_risky(&plan);
+        let full = session::resolve_params_timed(&plan, params, session)?;
+        // `None` hash: no intent-ring enqueue (same as execute_detached).
+        self.run_plan(None, &plan, &full)
     }
 
     // ---------------- detached (client-borne) plans ----------------
@@ -1587,6 +1812,32 @@ impl Database {
             .write()
             .expect(POISON)
             .insert(*hash, plan.clone());
+        Ok(plan)
+    }
+
+    /// [`cached_or_load`](Self::cached_or_load) plus a thread-local one-entry
+    /// cache for the common "same plan, many times" pattern. Invalidated when
+    /// [`cache_gen`](Self::cache) moves (DDL).
+    fn cached_or_load_tls(&self, hash: &PlanHash) -> Result<Arc<CompiledPlan>> {
+        let gen = self.cache_gen.load(std::sync::atomic::Ordering::Relaxed);
+        let hit = TLS_PLAN.with(|c| {
+            let g = c.borrow();
+            match g.as_ref() {
+                Some(h) if h.hash == *hash && h.cache_gen == gen => Some(h.plan.clone()),
+                _ => None,
+            }
+        });
+        if let Some(p) = hit {
+            return Ok(p);
+        }
+        let plan = self.cached_or_load(hash)?;
+        TLS_PLAN.with(|c| {
+            *c.borrow_mut() = Some(TlsPlanHit {
+                hash: *hash,
+                plan: plan.clone(),
+                cache_gen: gen,
+            });
+        });
         Ok(plan)
     }
 

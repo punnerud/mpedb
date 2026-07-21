@@ -44,6 +44,13 @@ pub trait PageStore {
     fn free(&mut self, id: u64) -> Result<()>;
     fn is_dirty(&self, id: u64) -> bool;
 
+    /// Mark a committed page dirty for in-place mutation without COW.
+    /// Returns `true` if adopted (caller may `page_mut`); `false` to force full
+    /// COW. Default always returns `false`.
+    fn adopt_inplace(&mut self, _id: u64) -> Result<bool> {
+        Ok(false)
+    }
+
     // ---- extents (DESIGN-BLOBEXTENT) ----
     //
     // A store that can place large payloads OUTSIDE the page tree implements
@@ -68,8 +75,15 @@ pub trait PageStore {
 
 /// Copy-on-write: dirty pages are modified in place; committed pages are
 /// copied to a fresh dirty page and the original is scheduled for freeing.
+///
+/// If the store reports in-place mutation is safe ([`PageStore::adopt_inplace`]),
+/// the page is marked dirty without copy/free — private `:memory:` with no
+/// concurrent reader pins (sqlite-style uncontended write).
 pub fn cow<S: PageStore + ?Sized>(store: &mut S, id: u64) -> Result<u64> {
     if store.is_dirty(id) {
+        return Ok(id);
+    }
+    if store.adopt_inplace(id)? {
         return Ok(id);
     }
     let new_id = store.alloc()?;

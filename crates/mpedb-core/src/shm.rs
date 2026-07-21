@@ -11,11 +11,53 @@
 //! exclusively by the writer holding the lock).
 
 use mpedb_types::{Durability, Error, FilePerms, Result, PAGE_SIZE};
+use std::cell::UnsafeCell;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
+
+/// Anonymous process-private file for [`Shm::open_memory`]: Linux `memfd_create`
+/// (never hits a path); elsewhere create+unlink a temp file so the fd has no
+/// directory entry.
+fn memory_backing_file() -> Result<File> {
+    #[cfg(target_os = "linux")]
+    {
+        // MFD_CLOEXEC = 1
+        let fd = unsafe {
+            libc::syscall(
+                libc::SYS_memfd_create,
+                b"mpedb\0".as_ptr() as *const libc::c_char,
+                1u32,
+            )
+        };
+        if fd < 0 {
+            return Err(io_err("memfd_create"));
+        }
+        Ok(unsafe { File::from_raw_fd(fd as RawFd) })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "mpedb-mem-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        let _ = std::fs::remove_file(&path); // unlink; fd keeps the inode
+        Ok(file)
+    }
+}
 
 pub const FORMAT_VERSION: u32 = 4; // v4: schema_gen in the meta snapshot (#47 DDL)
                                    //     (DESIGN-BLOBEXTENT §3.4); WAL3 trailer.
@@ -540,6 +582,18 @@ pub struct MetaSnapshot {
     pub schema_gen: u64,
 }
 
+/// Free marker for [`Shm::priv_pins`] (private in-memory reader pins).
+const PRIV_PIN_FREE: u64 = u64::MAX;
+/// Capacity of the process-local private pin table (`:memory:` only).
+const PRIV_PIN_SLOTS: usize = 64;
+
+// Nesting depth of exclusive in-place write on this thread. Non-zero means
+// claim_and_pin_private must not spin on exclusive_write (avoids deadlock when
+// the writer itself opens a nested read for triggers/catalog).
+std::thread_local! {
+    static EXCLUSIVE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 pub struct Shm {
     map: *mut u8,
     len: usize,
@@ -554,6 +608,26 @@ pub struct Shm {
     pub recovered: bool,
     /// The append-only log; Some iff durability = wal.
     wal: Option<WalFile>,
+    /// Process-private in-memory DB (`path = ":memory:"`): no multi-process
+    /// attach. Reader pins use [`Self::priv_pins`] instead of the mapped
+    /// multi-process reader table (cheaper: no CAS claim scan / SeqCst pin
+    /// recheck). Multi-thread same-process still safe via the pin array.
+    pub is_private: bool,
+    /// Process-local pins for `is_private`: each entry is `PRIV_PIN_FREE` or a
+    /// pinned `txn_id`. Index is returned as `ReadTxn.slot`.
+    priv_pins: [AtomicU64; PRIV_PIN_SLOTS],
+    /// Active index (0|1) into [`Self::priv_meta`] for private DBs. Readers
+    /// Acquire-load this, then copy the snapshot — no dual-page xxh3.
+    priv_meta_active: AtomicU64,
+    /// Double-buffered published meta for `is_private`. Writer fills the
+    /// inactive slot under the writer lock, then Release-stores the active
+    /// index. Same-process only; Sync via exclusive writer + Acquire/Release.
+    priv_meta: [UnsafeCell<MetaSnapshot>; 2],
+    /// Private `:memory:` only: a write txn holds exclusive mutability (no
+    /// *foreign* reader pins) and may mutate committed pages in place.
+    /// Other threads spin while this is set; the owning thread may nest
+    /// `begin_read` (trigger/catalog) via TLS depth. Cleared on writer unlock.
+    exclusive_write: AtomicU64, // 0 = off, 1 = on
     /// macOS-only: the crash-safe writer lock (sidecar flock + ERRORCHECK
     /// mutex). Linux uses the robust pthread mutex in the mapped lock area.
     #[cfg(not(target_os = "linux"))]
@@ -862,6 +936,11 @@ impl Shm {
     /// that a power failure could still erase (identical gate semantics in
     /// both durable modes; wal advances the watermark after its fdatasync).
     pub fn newest_meta(&self) -> Result<MetaSnapshot> {
+        // Private in-memory: process-local double buffer (no mapped dual-slot
+        // xxh3). Seeded at format and updated in every write_meta_slot.
+        if self.is_private {
+            return Ok(self.load_priv_meta());
+        }
         if !matches!(self.durability, Durability::Commit | Durability::Wal) {
             return self.newest_meta_gated(u64::MAX);
         }
@@ -947,6 +1026,11 @@ impl Shm {
         stamped.slot = slot;
         let sum = xxhash_rust::xxh3::xxh3_64(&self.meta_checksum_input(slot, &stamped));
         self.atomic_u64(base + M_CHECKSUM).store(sum, Ordering::Release);
+        // Private path: also publish into the process-local double buffer so
+        // `newest_meta` / pin skips dual-slot xxh3. Same stamped body.
+        if self.is_private {
+            self.publish_priv_meta(&stamped);
+        }
         // #121 instrumentation: the commit boundary in the durability trace.
         // The store, not a flush — every FLUSH before this one belongs to this
         // commit's data class, which is exactly what §4.1 orders.
@@ -954,6 +1038,28 @@ impl Shm {
             let _ = crate::plsim::record_publish(s.txn_id, slot);
         }
         slot
+    }
+
+    /// Copy the process-local published meta (`is_private` only).
+    #[inline]
+    fn load_priv_meta(&self) -> MetaSnapshot {
+        let i = self.priv_meta_active.load(Ordering::Acquire) as usize & 1;
+        // SAFETY: writer only mutates the inactive buffer, then Release-stores
+        // the active index. We loaded the index with Acquire, so this buffer
+        // is immutable until the next flip (and that flip targets the other).
+        unsafe { *self.priv_meta[i].get() }
+    }
+
+    /// Publish under the writer lock into the inactive private meta buffer.
+    #[inline]
+    fn publish_priv_meta(&self, s: &MetaSnapshot) {
+        let cur = self.priv_meta_active.load(Ordering::Relaxed) as usize & 1;
+        let next = 1 - cur;
+        // SAFETY: exclusive writer; readers only observe the active buffer.
+        unsafe {
+            *self.priv_meta[next].get() = *s;
+        }
+        self.priv_meta_active.store(next as u64, Ordering::Release);
     }
 
     // ---------- lock area ----------
@@ -1865,7 +1971,15 @@ impl Shm {
     /// Claim a reader slot and pin the current snapshot (design/DESIGN.md §4.3 pin
     /// protocol, with the paired-SeqCst-fence fix). Returns (slot index,
     /// owned word value, pinned meta).
+    ///
+    /// Private in-memory DBs use a process-local pin table (no multi-process
+    /// claim CAS / SeqCst recheck): no other process can attach, so the
+    /// cross-process store-buffering race cannot arise. Same-process
+    /// multi-thread is still covered by the private pin array.
     pub fn claim_and_pin(&self) -> Result<(u32, u64, MetaSnapshot)> {
+        if self.is_private {
+            return self.claim_and_pin_private();
+        }
         let pid = std::process::id();
         let (idx, word) = match self.claim_slot(pid) {
             Some(x) => x,
@@ -1900,6 +2014,102 @@ impl Shm {
                     return Err(e);
                 }
             }
+        }
+    }
+
+    /// Process-private pin: one `newest_meta`, CAS into `priv_pins`. `word` is
+    /// returned as 0 so [`Self::release_slot`] / [`Self::slot_still_owned`]
+    /// branch on `is_private`.
+    ///
+    /// When [`Self::exclusive_write`] is set (in-place private writer), *other*
+    /// threads spin until it clears. The owning thread nests freely (TLS depth)
+    /// so `trigger_set` / catalog reloads under the write lock do not deadlock.
+    fn claim_and_pin_private(&self) -> Result<(u32, u64, MetaSnapshot)> {
+        let mut spins = 0u32;
+        loop {
+            // Foreign exclusive writer: wait. Nested owner: pass through.
+            while self.exclusive_write.load(Ordering::Acquire) != 0
+                && EXCLUSIVE_DEPTH.with(|d| d.get()) == 0
+            {
+                spins = spins.wrapping_add(1);
+                if spins > 4_000_000 {
+                    std::thread::yield_now();
+                    spins = 0;
+                } else {
+                    std::hint::spin_loop();
+                }
+            }
+            let meta = self.newest_meta()?;
+            for i in 0..PRIV_PIN_SLOTS {
+                if self.priv_pins[i]
+                    .compare_exchange(
+                        PRIV_PIN_FREE,
+                        meta.txn_id,
+                        Ordering::AcqRel,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok()
+                {
+                    // Foreign exclusive started after our CAS — drop and retry.
+                    if self.exclusive_write.load(Ordering::Acquire) != 0
+                        && EXCLUSIVE_DEPTH.with(|d| d.get()) == 0
+                    {
+                        self.priv_pins[i].store(PRIV_PIN_FREE, Ordering::Release);
+                        break;
+                    }
+                    return Ok((i as u32, 0, meta));
+                }
+            }
+            if spins > 256 {
+                return Err(Error::ReadersFull);
+            }
+            spins = spins.wrapping_add(1);
+            std::hint::spin_loop();
+        }
+    }
+
+    /// True if any process-local private pin is held.
+    #[inline]
+    pub fn any_private_pin(&self) -> bool {
+        for i in 0..PRIV_PIN_SLOTS {
+            if self.priv_pins[i].load(Ordering::Acquire) != PRIV_PIN_FREE {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Try to enter exclusive in-place write mode (`is_private` only).
+    ///
+    /// Protocol: set the flag first (blocks foreign pins), then scan. If any
+    /// pin already exists, clear the flag and return false (caller uses COW).
+    /// Nested `begin_read` on this thread is allowed via TLS depth.
+    pub fn try_begin_exclusive_write(&self) -> bool {
+        if !self.is_private {
+            return false;
+        }
+        self.exclusive_write.store(1, Ordering::Release);
+        fence(Ordering::SeqCst);
+        if self.any_private_pin() {
+            self.exclusive_write.store(0, Ordering::Release);
+            return false;
+        }
+        EXCLUSIVE_DEPTH.with(|d| d.set(d.get().saturating_add(1)));
+        true
+    }
+
+    /// End exclusive in-place mode (always safe; no-op if not exclusive).
+    #[inline]
+    pub fn end_exclusive_write(&self) {
+        EXCLUSIVE_DEPTH.with(|d| {
+            let n = d.get();
+            if n > 0 {
+                d.set(n - 1);
+            }
+        });
+        // Only clear the global flag when this thread has no nested exclusive.
+        if EXCLUSIVE_DEPTH.with(|d| d.get()) == 0 {
+            self.exclusive_write.store(0, Ordering::Release);
         }
     }
 
@@ -1963,6 +2173,15 @@ impl Shm {
     /// Release an owned slot. Fails with `SnapshotEvicted` semantics (returns
     /// false) if the generation no longer matches (eviction / theft).
     pub fn release_slot(&self, idx: u32, owned_word: u64) -> bool {
+        if self.is_private {
+            // Private pin: `owned_word` unused; free if still occupied.
+            if (idx as usize) >= PRIV_PIN_SLOTS {
+                return false;
+            }
+            // Any non-FREE value means we still own it (eviction not used for private).
+            let prev = self.priv_pins[idx as usize].swap(PRIV_PIN_FREE, Ordering::AcqRel);
+            return prev != PRIV_PIN_FREE;
+        }
         let (_, seq) = Self::unpack(owned_word);
         self.slot_word(idx)
             .compare_exchange(
@@ -1976,7 +2195,13 @@ impl Shm {
 
     /// Verify an owned slot is still ours (long scans call this periodically).
     pub fn slot_still_owned(&self, idx: u32, owned_word: u64) -> bool {
-        self.slot_word(idx).load(Ordering::Acquire) == owned_word
+        if self.is_private {
+            // Private pins: no multi-process eviction; free marker means released.
+            (idx as usize) < PRIV_PIN_SLOTS
+                && self.priv_pins[idx as usize].load(Ordering::Acquire) != PRIV_PIN_FREE
+        } else {
+            self.slot_word(idx).load(Ordering::Acquire) == owned_word
+        }
     }
 
     /// Free slots whose owning process is provably gone. Safe to run from any
@@ -2019,18 +2244,30 @@ impl Shm {
     /// count as pinning it — they can never pin older). Publishes the result
     /// monotonically into the cache and returns it.
     pub fn compute_oldest_pinned(&self, current_txn: u64) -> u64 {
-        // pairs with the readers' pin-protocol SC fence
-        fence(Ordering::SeqCst);
         let mut oldest = current_txn;
-        for idx in 0..self.max_readers {
-            let w = self.slot_word(idx).load(Ordering::Acquire);
-            let (pid, _) = Self::unpack(w);
-            if pid == 0 {
-                continue;
+        if self.is_private {
+            // Process-private pins: scan the local array. No SeqCst fence —
+            // writers and readers share one address space; AcqRel on the pin
+            // cells already orders pin stores vs this load.
+            for i in 0..PRIV_PIN_SLOTS {
+                let t = self.priv_pins[i].load(Ordering::Acquire);
+                if t != PRIV_PIN_FREE {
+                    oldest = oldest.min(t);
+                }
             }
-            let t = self.slot_txn(idx).load(Ordering::Acquire);
-            let effective = if t == u64::MAX { current_txn } else { t };
-            oldest = oldest.min(effective);
+        } else {
+            // pairs with the readers' pin-protocol SC fence
+            fence(Ordering::SeqCst);
+            for idx in 0..self.max_readers {
+                let w = self.slot_word(idx).load(Ordering::Acquire);
+                let (pid, _) = Self::unpack(w);
+                if pid == 0 {
+                    continue;
+                }
+                let t = self.slot_txn(idx).load(Ordering::Acquire);
+                let effective = if t == u64::MAX { current_txn } else { t };
+                oldest = oldest.min(effective);
+            }
         }
         self.oldest_pinned_cache().fetch_max(oldest, Ordering::AcqRel);
         oldest
@@ -2111,6 +2348,52 @@ impl Shm {
 
     // ---------- open / create ----------
 
+    /// True for the process-private in-memory database path (`":memory:"`).
+    /// Not multi-process attachable (no filesystem name).
+    pub fn is_memory_path(path: &Path) -> bool {
+        path.as_os_str() == ":memory:"
+    }
+
+    /// Process-private in-memory database: backing is a memfd (Linux) or an
+    /// unlinked temp file (elsewhere), **`ftruncate` only** — no `fallocate`,
+    /// no pre-zero. Pages are demand-faulted on first write (true lazy RAM).
+    ///
+    /// Durability must be [`Durability::None`]: there is no durable path and no
+    /// WAL companion. Multi-process attach by path is impossible (and not a
+    /// goal); each open is a fresh empty DB.
+    pub fn open_memory(
+        size_bytes: u64,
+        max_readers: u32,
+        durability: Durability,
+        schema_hash: &[u8; 32],
+    ) -> Result<Shm> {
+        if durability != Durability::None {
+            return Err(Error::Config(
+                "in-memory database (path = \":memory:\") requires durability = none".into(),
+            ));
+        }
+        let size = (size_bytes / PAGE_SIZE as u64) * PAGE_SIZE as u64;
+        let page_count = size / PAGE_SIZE as u64;
+        let min_pages = data_start_page(max_readers) + 8;
+        if page_count < min_pages {
+            return Err(Error::Config(format!(
+                "size_mb too small for in-memory db: need at least {min_pages} pages"
+            )));
+        }
+        let file = memory_backing_file()?;
+        if unsafe { libc::ftruncate(file.as_raw_fd(), size as i64) } != 0 {
+            return Err(io_err("ftruncate (in-memory size)"));
+        }
+        // Synthetic path for macOS .wlock sidecar only; never used as a real
+        // multi-process attach name. Linux ignores it in `map`.
+        let pseudo = Path::new(":memory:");
+        let mut shm = Self::map(&file, size, max_readers, durability, pseudo)?;
+        shm.is_private = true;
+        shm.format(page_count, max_readers, durability, schema_hash)?;
+        shm.post_attach(schema_hash)?;
+        Ok(shm)
+    }
+
     pub fn open(
         path: &Path,
         size_bytes: u64,
@@ -2119,6 +2402,9 @@ impl Shm {
         schema_hash: &[u8; 32],
         perms: &FilePerms,
     ) -> Result<Shm> {
+        if Self::is_memory_path(path) {
+            return Self::open_memory(size_bytes, max_readers, durability, schema_hash);
+        }
         let size = (size_bytes / PAGE_SIZE as u64) * PAGE_SIZE as u64;
         let page_count = size / PAGE_SIZE as u64;
         let min_pages = data_start_page(max_readers) + 8;
@@ -2341,6 +2627,30 @@ impl Shm {
             })?,
             recovered: false,
             wal: None,
+            is_private: false,
+            priv_pins: std::array::from_fn(|_| AtomicU64::new(PRIV_PIN_FREE)),
+            priv_meta_active: AtomicU64::new(0),
+            exclusive_write: AtomicU64::new(0),
+            priv_meta: [
+                UnsafeCell::new(MetaSnapshot {
+                    slot: 0,
+                    txn_id: 0,
+                    catalog_root: 0,
+                    freelist_root: 0,
+                    high_water: 0,
+                    extent_map_root: 0,
+                    schema_gen: 0,
+                }),
+                UnsafeCell::new(MetaSnapshot {
+                    slot: 0,
+                    txn_id: 0,
+                    catalog_root: 0,
+                    freelist_root: 0,
+                    high_water: 0,
+                    extent_map_root: 0,
+                    schema_gen: 0,
+                }),
+            ],
             #[cfg(not(target_os = "linux"))]
             wl,
         })
@@ -2815,6 +3125,30 @@ mod tests {
         assert!(shm.release_slot(i1, w1));
         assert!(shm.release_slot(i2, w2));
         std::fs::remove_file(&p).unwrap();
+    }
+
+    #[test]
+    fn private_memory_pin_table() {
+        let zero = [0u8; 32];
+        let shm = Shm::open_memory(8 << 20, 8, Durability::None, &zero).unwrap();
+        assert!(shm.is_private);
+        let (idx, word, meta) = shm.claim_and_pin().unwrap();
+        assert_eq!(word, 0);
+        assert_eq!(meta.txn_id, 0);
+        assert!(shm.slot_still_owned(idx, word));
+        assert_eq!(shm.compute_oldest_pinned(5), 0);
+        assert!(shm.release_slot(idx, word));
+        assert!(!shm.slot_still_owned(idx, word));
+        assert!(!shm.release_slot(idx, word), "double release must fail");
+        assert_eq!(shm.compute_oldest_pinned(5), 5);
+
+        let (i1, w1, _) = shm.claim_and_pin().unwrap();
+        let (i2, w2, _) = shm.claim_and_pin().unwrap();
+        assert_ne!(i1, i2);
+        assert_eq!(shm.compute_oldest_pinned(9), 0);
+        assert!(shm.release_slot(i1, w1));
+        assert!(shm.release_slot(i2, w2));
+        assert_eq!(shm.compute_oldest_pinned(9), 9);
     }
 
     #[test]

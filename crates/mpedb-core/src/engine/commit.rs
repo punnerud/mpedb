@@ -395,7 +395,10 @@ impl<'e> WriteTxn<'e> {
             // durable and acknowledged would be a lie.
             let _ = self.eng.shm.wal_maybe_checkpoint();
         }
+        // Commit wins: discard undo images (published meta now owns the dirtied pages).
+        self.inplace_undo.clear();
         self.finished = true;
+        self.eng.shm.end_exclusive_write();
         self.eng.shm.writer_unlock();
         Ok(())
     }
@@ -403,15 +406,32 @@ impl<'e> WriteTxn<'e> {
     /// Discard everything. COW means committed state was never touched; pages
     /// taken from high_water simply stay above the committed watermark, and
     /// freelist consumption was only recorded in dirty pages now dropped.
+    ///
+    /// With `in_place`, restore pre-mutation images from `inplace_undo` first.
     pub fn abort(mut self) {
+        self.restore_inplace_undo();
         self.finished = true;
+        self.eng.shm.end_exclusive_write();
         self.eng.shm.writer_unlock();
+    }
+}
+
+impl WriteTxn<'_> {
+    /// Put exclusive in-place pages back to their pre-txn bytes (abort path).
+    fn restore_inplace_undo(&mut self) {
+        for (id, bytes) in self.inplace_undo.drain() {
+            if let Ok(p) = self.eng.shm.page_mut_unchecked(id) {
+                p.copy_from_slice(&bytes[..]);
+            }
+        }
     }
 }
 
 impl Drop for WriteTxn<'_> {
     fn drop(&mut self) {
         if !self.finished {
+            self.restore_inplace_undo();
+            self.eng.shm.end_exclusive_write();
             self.eng.shm.writer_unlock();
         }
     }

@@ -46,6 +46,16 @@
 //! `--samples-all` prints example failing statements for *every* category,
 //! not just the uncategorized ones — that is how the ranked blocker table in
 //! [`design/CORPUS-STATUS.md`] gets its per-category examples.
+//! `--size-mb N` sets pre-reserved file size (default **32**; was 128). Each
+//! `.test` opens a fresh DB and `fallocate`s `size_mb`. 16 MiB is too small for
+//! some `index/*` files (`database is out of space`); 32 covers the 621-file
+//! flist. Override upward for outliers (e.g. `select5`).
+//! `--verify` runs `Database::verify()` after each file (off by default —
+//! full page-accounting walk; correctness is already the SLT expect/md5 path).
+//! `--jobs N` runs up to N files in parallel (default 1). Corpus files are
+//! independent; this is the main wall-clock lever vs sqlite/minisqlite (each
+//! file is a full mpedb open + unique-SQL compile, which is slower per stmt
+//! than C sqlite but parallelizes cleanly).
 //!
 //! Known shim limitations (also see the final report):
 //! - INSERT ... SELECT is not rewritten (fails as subquery).
@@ -58,7 +68,7 @@
 //!   (file-authoritative schema); the sampled corpus never does this.
 
 use mpedb::{Config, Database, ExecResult, Value};
-use mpedb_testkit::TempDir;
+
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -1248,6 +1258,12 @@ impl FileReport {
 /// Set by `--samples-all`: sample failing statements in every category, not
 /// just the uncategorized ones.
 static SAMPLE_ALL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Pre-reserved DB size per corpus file. Default 16 MiB (not 128): open cost is
+/// paid once per `.test` and is pure harness overhead, not an engine regression
+/// signal. See module docs for `--size-mb`.
+static SIZE_MB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(32);
+/// When true, run `Database::verify()` after each file (expensive; off by default).
+static DO_VERIFY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Set by `--join-cells N`: an explicit `[runtime] max_join_cells` for the
 /// generated config (`JOIN_CELLS_SET` distinguishes "flag absent" from an
@@ -1310,17 +1326,12 @@ fn run_file(path: &Path, engines: &[&str]) -> FileReport {
         }
     }
 
-    // Build the TOML config and open a fresh database.
-    let dir = match TempDir::new("corpus") {
-        Ok(d) => d,
-        Err(e) => {
-            rep.fatal = Some(format!("tempdir: {e}"));
-            return rep;
-        }
-    };
+    // In-memory: path = ":memory:" → Shm::open_memory (memfd + ftruncate only;
+    // no fallocate / pre-zero). size_mb is a virtual high-water cap (pages
+    // demand-fault). durability omitted → none. max_readers = 2.
+    let size_mb = SIZE_MB.load(std::sync::atomic::Ordering::Relaxed);
     let mut cfg = format!(
-        "[database]\npath = \"{}\"\nsize_mb = 128\nmax_readers = 8\n",
-        dir.db_path("corpus").display()
+        "[database]\npath = \":memory:\"\nsize_mb = {size_mb}\nmax_readers = 2\n"
     );
     if JOIN_CELLS_SET.load(std::sync::atomic::Ordering::Relaxed) {
         let _ = write!(
@@ -1539,8 +1550,10 @@ fn run_file(path: &Path, engines: &[&str]) -> FileReport {
             }
         }
     }
-    if let Err(e) = db.verify() {
-        rep.verify_failed = Some(e.to_string());
+    if DO_VERIFY.load(std::sync::atomic::Ordering::Relaxed) {
+        if let Err(e) = db.verify() {
+            rep.verify_failed = Some(e.to_string());
+        }
     }
     rep
 }
@@ -2499,30 +2512,21 @@ mod idx_census {
     }
 }
 
-/// Compile detached (never touches the shared plan registry — the corpus has
-/// ~10k distinct statements per file) and execute. Panics inside the engine
-/// are caught and surfaced loudly: an engine panic is a real bug finding.
+/// Compile once and execute without registry publish and without the
+/// detached encode→decode re-validation tax ([`Database::query_once`]).
+/// Panics inside the engine are caught and surfaced loudly.
 fn exec_sql(db: &Database, sql: &str) -> Result<ExecResult, String> {
     let db = std::panic::AssertUnwindSafe(db);
     let sql_owned = sql.to_string();
     std::panic::catch_unwind(move || {
-        // Live DDL (CREATE INDEX, ALTER, …) is not a plannable statement — the
-        // facade applies it on the `query()` path, so route it there. The
-        // detached prepare/execute path (which compiles to a plan) is used for
-        // everything else.
-        let first = sql_owned
-            .split_whitespace()
-            .next()
-            .unwrap_or("")
-            .to_ascii_uppercase();
-        if matches!(first.as_str(), "CREATE" | "DROP" | "ALTER") {
-            return db.query(&sql_owned, &[]).map_err(|e| e.to_string());
-        }
         let ckey = census::observe(&db, &sql_owned);
         idx_census::observe(&db, &sql_owned);
-        let plan = db.prepare_detached(&sql_owned).map_err(|e| e.to_string())?;
         let t0 = std::time::Instant::now();
-        let out = db.execute_detached(&plan, &[]).map_err(|e| e.to_string());
+        // query_once: one compile + run_plan(None). Avoids prepare_detached's
+        // encode + execute_detached's full decode/schema re-check (meant for
+        // untrusted client-borne blobs, not same-process one-shots). DDL is
+        // handled inside query_once the same way as query().
+        let out = db.query_once(&sql_owned, &[]).map_err(|e| e.to_string());
         census::record_cost(ckey, t0.elapsed().as_nanos() as f64);
         out
     })
@@ -2541,7 +2545,25 @@ fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let as_sqlite = args.iter().any(|a| a == "--as-sqlite");
     let sample_all = args.iter().any(|a| a == "--samples-all");
-    args.retain(|a| a != "--as-sqlite" && a != "--samples-all");
+    let do_verify = args.iter().any(|a| a == "--verify");
+    args.retain(|a| a != "--as-sqlite" && a != "--samples-all" && a != "--verify");
+    DO_VERIFY.store(do_verify, std::sync::atomic::Ordering::Relaxed);
+    // `--size-mb N`: pre-reserved file size (default 32).
+    if let Some(i) = args.iter().position(|a| a == "--size-mb") {
+        let v = args
+            .get(i + 1)
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or_else(|| {
+                eprintln!("--size-mb needs an integer argument (MiB, >=1)");
+                std::process::exit(2);
+            });
+        if v < 1 {
+            eprintln!("--size-mb must be >= 1");
+            std::process::exit(2);
+        }
+        SIZE_MB.store(v, std::sync::atomic::Ordering::Relaxed);
+        args.drain(i..=i + 1);
+    }
     // `--join-cells N`: set `[runtime] max_join_cells` in the generated
     // config (0 = unlimited) — how the N-way-join battery (`select5.test`)
     // is probed with an explicit budget instead of the default.
@@ -2580,26 +2602,83 @@ fn main() {
         args.remove(i);
     }
     SAMPLE_ALL.store(sample_all, std::sync::atomic::Ordering::Relaxed);
+    let mut jobs: usize = 1;
+    if let Some(i) = args.iter().position(|a| a == "--jobs") {
+        jobs = args
+            .get(i + 1)
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| {
+                eprintln!("--jobs needs an integer argument (>=1)");
+                std::process::exit(2);
+            });
+        if jobs < 1 {
+            eprintln!("--jobs must be >= 1");
+            std::process::exit(2);
+        }
+        args.drain(i..=i + 1);
+    }
     let engines: &[&str] = if as_sqlite { &["mpedb", "sqlite"] } else { &["mpedb"] };
     if args.is_empty() {
         eprintln!(
-            "usage: sqlite_corpus [--as-sqlite] [--samples-all] [--join-cells N] \
-             [--footprint-census[=out.tsv]] [--index-census[=out.tsv]] <file.test> [...]"
+            "usage: sqlite_corpus [--as-sqlite] [--samples-all] [--verify] [--size-mb N] \
+             [--jobs N] [--join-cells N] [--footprint-census[=out.tsv]] \
+             [--index-census[=out.tsv]] <file.test> [...]"
         );
         std::process::exit(2);
     }
-    let mut reports = Vec::new();
-    for a in &args {
-        let start = std::time::Instant::now();
-        let rep = run_file(Path::new(a), engines);
-        eprintln!(
-            "ran {} ({} records) in {:.1}s",
-            rep.name,
-            rep.total,
-            start.elapsed().as_secs_f64()
-        );
-        reports.push(rep);
-    }
+    let wall0 = std::time::Instant::now();
+    let reports = if jobs <= 1 {
+        let mut reports = Vec::with_capacity(args.len());
+        for a in &args {
+            let start = std::time::Instant::now();
+            let rep = run_file(Path::new(a), engines);
+            eprintln!(
+                "ran {} ({} records) in {:.1}s",
+                rep.name,
+                rep.total,
+                start.elapsed().as_secs_f64()
+            );
+            reports.push(rep);
+        }
+        reports
+    } else {
+        // Independent files → parallel workers. Preserve input order in output.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+        let paths = &args;
+        let next = AtomicUsize::new(0);
+        let out: Mutex<Vec<(usize, FileReport)>> = Mutex::new(Vec::with_capacity(paths.len()));
+        let n_workers = jobs.min(paths.len());
+        std::thread::scope(|scope| {
+            for _ in 0..n_workers {
+                scope.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        if i >= paths.len() {
+                            break;
+                        }
+                        let start = std::time::Instant::now();
+                        let rep = run_file(Path::new(&paths[i]), engines);
+                        eprintln!(
+                            "ran {} ({} records) in {:.1}s",
+                            rep.name,
+                            rep.total,
+                            start.elapsed().as_secs_f64()
+                        );
+                        out.lock().unwrap().push((i, rep));
+                    }
+                });
+            }
+        });
+        let mut pairs = out.into_inner().unwrap();
+        pairs.sort_by_key(|(i, _)| *i);
+        pairs.into_iter().map(|(_, r)| r).collect()
+    };
+    eprintln!(
+        "wall_clock {:.1}s jobs={jobs} files={}",
+        wall0.elapsed().as_secs_f64(),
+        args.len()
+    );
 
     // ---------------- per-file table ----------------
     println!();

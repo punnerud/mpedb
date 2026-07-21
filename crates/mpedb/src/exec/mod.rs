@@ -134,6 +134,30 @@ pub(crate) trait TxnCtx {
         None
     }
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>>;
+    /// Decode only the listed column ordinals from a PK hit (projection order).
+    /// Default: full row then project — override when the store can decode
+    /// individual columns without materializing the rest.
+    fn get_by_pk_cols(
+        &mut self,
+        table: u32,
+        pk: &[Value],
+        cols: &[u16],
+    ) -> Result<Option<Vec<Value>>> {
+        match self.get_by_pk(table, pk)? {
+            None => Ok(None),
+            Some(row) => {
+                let mut out = Vec::with_capacity(cols.len());
+                for &c in cols {
+                    out.push(
+                        row.get(c as usize)
+                            .cloned()
+                            .ok_or_else(|| internal("projection column"))?,
+                    );
+                }
+                Ok(Some(out))
+            }
+        }
+    }
     fn get_by_index(&mut self, table: u32, index_no: u32, values: &[Value])
         -> Result<Option<Vec<Value>>>;
     /// Every row matching an index equality — N rows for a non-unique index,
@@ -304,6 +328,14 @@ impl TxnCtx for WriteTxn<'_> {
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
         WriteTxn::get_by_pk(self, table, pk)
     }
+    fn get_by_pk_cols(
+        &mut self,
+        table: u32,
+        pk: &[Value],
+        cols: &[u16],
+    ) -> Result<Option<Vec<Value>>> {
+        WriteTxn::get_by_pk_cols(self, table, pk, cols)
+    }
     fn get_by_index(
         &mut self,
         table: u32,
@@ -411,6 +443,14 @@ impl TxnCtx for WriteCtx<'_, '_> {
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
         WriteTxn::get_by_pk(self.txn, table, pk)
     }
+    fn get_by_pk_cols(
+        &mut self,
+        table: u32,
+        pk: &[Value],
+        cols: &[u16],
+    ) -> Result<Option<Vec<Value>>> {
+        WriteTxn::get_by_pk_cols(self.txn, table, pk, cols)
+    }
     fn get_by_index(
         &mut self,
         table: u32,
@@ -495,6 +535,14 @@ impl TxnCtx for ReadCtx<'_, '_> {
     }
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>> {
         self.0.get_by_pk(table, pk)
+    }
+    fn get_by_pk_cols(
+        &mut self,
+        table: u32,
+        pk: &[Value],
+        cols: &[u16],
+    ) -> Result<Option<Vec<Value>>> {
+        self.0.get_by_pk_cols(table, pk, cols)
     }
     fn get_by_index(
         &mut self,
@@ -1181,6 +1229,13 @@ fn exec_select(
     if !sp.windows.is_empty() {
         return window::exec_select_windowed(ctx, schema, plan, params, sp);
     }
+    // Micro-executor: single-table PK point probe with column-only projection.
+    // The generic path materializes gather → project → sort/limit machinery;
+    // for `SELECT cols FROM t WHERE pk = $1` that is pure overhead (~half of
+    // prepare+bind SELECT wall time). Same result as the general path.
+    if let Some(out) = try_exec_pk_point_hot(ctx, schema, plan, params, sp)? {
+        return Ok(out);
+    }
     let SelectPlan {
         table,
         access,
@@ -1354,6 +1409,169 @@ fn exec_select(
             Ok(ExecResult::Rows { columns, rows: out })
         }
     }
+}
+
+/// Precomputed shape for the PkPoint micro-executor. Built once at
+/// [`crate::PreparedSelect`] prepare (or on first execute) so the hot path
+/// never rebuilds column names or projection ordinals — SQLite's stmt keeps
+/// the same state on the `sqlite3_stmt`.
+#[derive(Debug, Clone)]
+pub(crate) struct PkPointHot {
+    pub table: u32,
+    pub col_idxs: Vec<u16>,
+    pub columns: std::sync::Arc<[String]>,
+}
+
+/// Hot path for the common point lookup:
+/// `SELECT c1, c2, … FROM t WHERE pk0 = $a [AND pk1 = $b …]`
+///
+/// Shape (all required — anything else falls through to the general SELECT):
+/// - single table, no join / residual filter / post_filter / aggregate /
+///   DISTINCT / ORDER BY / windows / dual
+/// - `AccessPath::PkPoint` with only `Param`/`Const` parts (no OuterCol)
+/// - projection is only base columns (no Expr)
+/// - `offset` is 0 or absent; `limit` is absent or ≥ 1 (PkPoint yields ≤ 1 row)
+///
+/// Correctness: same `get_by_pk` + column projection the gather path uses;
+/// column names match [`select_output_columns`].
+fn try_exec_pk_point_hot(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    sp: &SelectPlan,
+) -> Result<Option<ExecResult>> {
+    let Some(hot) = try_build_pk_point_hot(schema, plan, sp)? else {
+        return Ok(None);
+    };
+    Ok(Some(exec_pk_point_hot(ctx, plan, params, &hot)?))
+}
+
+/// Build [`PkPointHot`] if `sp` is eligible; `Ok(None)` means use the general
+/// SELECT path (not an error).
+pub(crate) fn try_build_pk_point_hot(
+    schema: &Schema,
+    plan: &CompiledPlan,
+    sp: &SelectPlan,
+) -> Result<Option<PkPointHot>> {
+    if sp.table == mpedb_sql::DUAL_TABLE
+        || !sp.joins.is_empty()
+        || sp.filter.is_some()
+        || sp.joined_filter.is_some()
+        || sp.post_filter.is_some()
+        || sp.aggregate.is_some()
+        || sp.distinct
+        || !sp.windows.is_empty()
+        || !sp.order_by.is_empty()
+        || sp.order_junk != 0
+        || sp.offset.unwrap_or(0) != 0
+        || matches!(sp.limit, Some(0))
+    {
+        return Ok(None);
+    }
+    let AccessPath::PkPoint(parts) = &sp.access else {
+        return Ok(None);
+    };
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    for p in parts {
+        match p {
+            KeyPart::Param(_) | KeyPart::Const(_) => {}
+            KeyPart::OuterCol(_) => return Ok(None),
+        }
+    }
+    for p in &sp.projection {
+        if !matches!(p, Projection::Column(_)) {
+            return Ok(None);
+        }
+    }
+    let mut col_idxs = Vec::with_capacity(sp.projection.len());
+    for p in &sp.projection {
+        let Projection::Column(i) = p else {
+            unreachable!("filtered above");
+        };
+        col_idxs.push(*i);
+    }
+    let columns = pk_point_output_columns(schema, plan, sp)?;
+    Ok(Some(PkPointHot {
+        table: sp.table,
+        col_idxs,
+        columns: std::sync::Arc::from(columns),
+    }))
+}
+
+/// Run the PkPoint micro-executor with precomputed column metadata.
+pub(crate) fn exec_pk_point_hot(
+    ctx: &mut dyn TxnCtx,
+    plan: &CompiledPlan,
+    params: &[Value],
+    hot: &PkPointHot,
+) -> Result<ExecResult> {
+    let PlanStmt::Select(sp) = &plan.stmt else {
+        return Err(internal("pk-point hot needs a Select plan"));
+    };
+    let AccessPath::PkPoint(parts) = &sp.access else {
+        return Err(internal("pk-point hot needs PkPoint access"));
+    };
+
+    // Resolve PK. Common case: one Param — borrow the caller's Value, no clone.
+    let owned_pk: Vec<Value>;
+    let pk: &[Value] = if parts.len() == 1 {
+        match &parts[0] {
+            KeyPart::Param(i) => {
+                let Some(v) = params.get(*i as usize) else {
+                    return Err(internal("key param"));
+                };
+                std::slice::from_ref(v)
+            }
+            KeyPart::Const(i) => {
+                let Some(v) = plan.consts.get(*i as usize) else {
+                    return Err(internal("key const"));
+                };
+                std::slice::from_ref(v)
+            }
+            KeyPart::OuterCol(_) => return Err(internal("outer-col in pk-point hot")),
+        }
+    } else {
+        owned_pk = parts
+            .iter()
+            .map(|p| gather::resolve_part(p, plan, params))
+            .collect::<Result<Vec<_>>>()?;
+        &owned_pk
+    };
+
+    let projected = ctx.get_by_pk_cols(hot.table, pk, &hot.col_idxs)?;
+    // One Arc clone + one Vec from Arc — cheaper than rebuilding names from schema.
+    let columns: Vec<String> = hot.columns.iter().cloned().collect();
+    let rows = match projected {
+        None => Vec::new(),
+        Some(row) => vec![row],
+    };
+    Ok(ExecResult::Rows { columns, rows })
+}
+
+/// Column names for the PkPoint hot path: single-table, column projections only.
+/// Same naming as [`select_output_columns`] for that shape, without join logic.
+fn pk_point_output_columns(
+    schema: &Schema,
+    plan: &CompiledPlan,
+    sp: &SelectPlan,
+) -> Result<Vec<String>> {
+    let t = table_def(schema, plan, sp.table)?;
+    let mut cols = Vec::with_capacity(sp.projection.len());
+    for p in &sp.projection {
+        let Projection::Column(i) = p else {
+            return Err(internal("pk-point hot projection"));
+        };
+        let name = t
+            .columns
+            .get(*i as usize)
+            .map(|c| c.name.clone())
+            .ok_or_else(|| internal("projection column name"))?;
+        cols.push(name);
+    }
+    Ok(cols)
 }
 
 /// Output column names of one SELECT. A joined slot past the outer's width

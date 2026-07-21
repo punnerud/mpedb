@@ -330,6 +330,32 @@ fn freelist_key(txn: u64, kind: u8, chunk: u16) -> [u8; 11] {
     k
 }
 
+/// Encode a point-probe key. A single plain `Int` PK is 9 bytes and fits in
+/// `stack` (no heap); every other shape uses `heap` via [`keycode::encode_key_spec`].
+/// Used by PK lookups on the prepare+bind SELECT hot path.
+pub(super) fn encode_probe_key<'a>(
+    values: &[Value],
+    specs: &[keycode::KeySpec],
+    stack: &'a mut [u8; 9],
+    heap: &'a mut Vec<u8>,
+) -> &'a [u8] {
+    if values.len() == 1
+        && matches!(values[0], Value::Int(_))
+        && specs.first().map_or(true, |s| s.is_plain())
+    {
+        let Value::Int(x) = &values[0] else {
+            unreachable!("matched Int above");
+        };
+        // keycode: TAG_PRESENT (0x01) ‖ (x as u64 ^ signbit) BE — identical to
+        // encode_value for Int under a plain KeySpec.
+        stack[0] = 0x01;
+        stack[1..9].copy_from_slice(&((*x as u64) ^ (1u64 << 63)).to_be_bytes());
+        return &stack[..9];
+    }
+    *heap = keycode::encode_key_spec(values, specs);
+    heap.as_slice()
+}
+
 /// Secondary unique index columns for a table, per the shared numbering
 /// convention (design/DESIGN.md §4.4): index 0 = PK tree; unique columns in
 /// declaration order get 1, 2, …; a column that is by itself the whole PK is
@@ -1205,6 +1231,9 @@ impl Engine {
                 return Err(e);
             }
         }
+        // Private :memory: with no reader pins → in-place leaf mutation (no
+        // COW freelist tax). Exclusive flag blocks new pins for the txn life.
+        let in_place = self.shm.try_begin_exclusive_write();
         Ok(WriteTxn {
             eng: self,
             bundle: self.bundle(),
@@ -1238,6 +1267,8 @@ impl Engine {
             capture_cfg: None,
             reserved_alloc: false,
             work: WorkMeter::new(self.work_budget),
+            in_place,
+            inplace_undo: HashMap::new(),
         })
     }
 

@@ -151,6 +151,13 @@ pub struct WriteTxn<'e> {
     /// the SQL executor charges the same meter via [`WriteTxn::charge_work`] for
     /// DML that runs a correlated subquery or a nested-loop join.
     pub(super) work: WorkMeter,
+    /// Private `:memory:` with no concurrent pins: COW adopts pages in place
+    /// (no freelist free of the old image). Cleared with exclusive_write on
+    /// commit/abort.
+    pub(super) in_place: bool,
+    /// Pre-mutation images for [`Self::in_place`] pages — restored on abort so
+    /// a failed autocommit cannot leave half-written committed pages.
+    pub(super) inplace_undo: HashMap<u64, Box<[u8; PAGE_SIZE]>>,
 }
 
 impl<'e> WriteTxn<'e> {
@@ -713,14 +720,50 @@ impl<'e> WriteTxn<'e> {
     }
 
     pub fn get_by_pk(&mut self, table_id: u32, pk_values: &[Value]) -> Result<Option<Vec<Value>>> {
-        let key = keycode::encode_key_spec(pk_values, self.bundle.pk_coll(table_id));
+        let mut stack = [0u8; 9];
+        let mut heap = Vec::new();
+        let key = super::encode_probe_key(
+            pk_values,
+            self.bundle.pk_coll(table_id),
+            &mut stack,
+            &mut heap,
+        );
         let (root, _) = self.tree_root(table_id, 0)?;
-        match btree::get(self, root, &key)? {
+        match btree::get(self, root, key)? {
             None => Ok(None),
             Some(bytes) => Ok(Some(row::decode_row(
                 &bytes,
                 &self.bundle.col_types[table_id as usize],
             )?)),
+        }
+    }
+
+    /// See [`ReadTxn::get_by_pk_cols`](super::ReadTxn::get_by_pk_cols).
+    pub fn get_by_pk_cols(
+        &mut self,
+        table_id: u32,
+        pk_values: &[Value],
+        cols: &[u16],
+    ) -> Result<Option<Vec<Value>>> {
+        let mut stack = [0u8; 9];
+        let mut heap = Vec::new();
+        let key = super::encode_probe_key(
+            pk_values,
+            self.bundle.pk_coll(table_id),
+            &mut stack,
+            &mut heap,
+        );
+        let (root, _) = self.tree_root(table_id, 0)?;
+        match btree::get(self, root, key)? {
+            None => Ok(None),
+            Some(bytes) => {
+                let types = &self.bundle.col_types[table_id as usize];
+                let mut out = Vec::with_capacity(cols.len());
+                for &c in cols {
+                    out.push(row::decode_column(&bytes, types, c as usize)?);
+                }
+                Ok(Some(out))
+            }
         }
     }
 
