@@ -501,7 +501,13 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
         Kind::Read if !eqp && introspect::references_sqlite_master(sqltext) => {
             let bundle = c.db.schema();
             let verbatim = sqlite_master_records(c, &bundle);
-            let (columns, rows) = introspect::sqlite_master(&bundle, sqltext, &verbatim)?;
+            let views = c.db.list_views().unwrap_or_default();
+            // list_views returns (name, select_src); map to select sources only
+            // for the catalog, and rebuild CREATE VIEW in sqlite_master.
+            let views: Vec<(String, String)> = views;
+            let triggers = c.db.list_triggers().unwrap_or_default();
+            let (columns, rows) =
+                introspect::sqlite_master(&bundle, sqltext, &verbatim, &views, &triggers)?;
             Ok(Outcome::Rows { columns, rows })
         }
         Kind::Begin => {

@@ -2297,8 +2297,8 @@ impl WriteSession<'_> {
     /// undo is itself impossible (a large-blob extent write in the DDL), the
     /// session is poisoned instead (sound: commit then refuses).
     ///
-    /// DDL that lives in a separate store or needs its own transaction (VIEW /
-    /// POLICY / TRIGGER, RLS) is refused inside a session with a clear error;
+    /// VIEW and TRIGGER DDL ride this session's txn (sys-keyspace + schema_gen
+    /// in the same COW commit as DML). POLICY / RLS still refuse in-session.
     /// `ANALYZE` / `REINDEX` are accepted no-ops.
     fn apply_ddl(&mut self, ddl: mpedb_sql::DdlStmt) -> Result<ExecResult> {
         use mpedb_sql::DdlStmt;
@@ -2445,20 +2445,33 @@ impl WriteSession<'_> {
                 self.txn
                     .create_index(id, cols, unique, where_clause)?;
             }
-            // These live in a separate store or open their own transaction, so
-            // they cannot ride this session's txn. Refuse cleanly (out of scope
-            // for #95); run them in autocommit.
-            DdlStmt::CreateView { .. }
-            | DdlStmt::DropView { .. }
-            | DdlStmt::CreatePolicy(_)
+            // VIEW / TRIGGER ride this session's txn (sys-keyspace + schema_gen
+            // bump) so CPython's implicit transaction + iterdump can CREATE them
+            // before COMMIT. POLICY / RLS still open their own catalog path and
+            // stay out-of-txn for now.
+            DdlStmt::CreateView {
+                name,
+                select_sql,
+                if_not_exists,
+            } => {
+                self.create_view_in_txn(&name, &select_sql, if_not_exists)?;
+            }
+            DdlStmt::DropView { name, if_exists } => {
+                self.drop_view_in_txn(&name, if_exists)?;
+            }
+            DdlStmt::CreateTrigger(spec) => {
+                self.create_trigger_in_txn(spec)?;
+            }
+            DdlStmt::DropTrigger { name, if_exists } => {
+                self.drop_trigger_in_txn(&name, if_exists)?;
+            }
+            DdlStmt::CreatePolicy(_)
             | DdlStmt::DropPolicy { .. }
-            | DdlStmt::AlterRls { .. }
-            | DdlStmt::CreateTrigger(_)
-            | DdlStmt::DropTrigger { .. } => {
+            | DdlStmt::AlterRls { .. } => {
                 return Err(Error::Unsupported(
-                    "CREATE/DROP VIEW, POLICY or TRIGGER and ALTER … ROW LEVEL \
-                     SECURITY are not supported inside a transaction; run them in \
-                     autocommit (outside BEGIN/COMMIT)"
+                    "CREATE/DROP POLICY and ALTER … ROW LEVEL SECURITY are not \
+                     supported inside a transaction; run them in autocommit \
+                     (outside BEGIN/COMMIT)"
                         .into(),
                 ));
             }
@@ -2466,6 +2479,56 @@ impl WriteSession<'_> {
             DdlStmt::Analyze { .. } | DdlStmt::Reindex { .. } => {}
         }
         Ok(ExecResult::Affected(0))
+    }
+
+    /// `CREATE VIEW` on this session's open write txn (no nested commit).
+    fn create_view_in_txn(
+        &mut self,
+        name: &str,
+        select_sql: &str,
+        if_not_exists: bool,
+    ) -> Result<()> {
+        let schema = self.txn.schema_bundle();
+        if schema.schema.table_id(name).is_some() {
+            return Err(Error::Bind(format!(
+                "CREATE VIEW: `{name}` is already a table"
+            )));
+        }
+        let key = crate::ddl_apply::view_key_public(name);
+        if crate::ddl_apply::view_exists_on_txn(&mut self.txn, name)? {
+            if if_not_exists {
+                return Ok(());
+            }
+            return Err(Error::Bind(format!(
+                "CREATE VIEW: view `{name}` already exists"
+            )));
+        }
+        self.txn.sys_put(&key, select_sql.as_bytes())?;
+        self.txn.bump_schema_gen();
+        Ok(())
+    }
+
+    fn drop_view_in_txn(&mut self, name: &str, if_exists: bool) -> Result<()> {
+        let key = match crate::ddl_apply::resolve_view_key_on_txn(&mut self.txn, name)? {
+            Some(k) => k,
+            None => {
+                if if_exists {
+                    return Ok(());
+                }
+                return Err(Error::Bind(format!("DROP VIEW: no such view `{name}`")));
+            }
+        };
+        self.txn.sys_delete(&key)?;
+        self.txn.bump_schema_gen();
+        Ok(())
+    }
+
+    fn create_trigger_in_txn(&mut self, spec: mpedb_sql::CreateTriggerSpec) -> Result<()> {
+        crate::trigger::create_trigger_on_txn(&mut self.txn, &self.db, spec)
+    }
+
+    fn drop_trigger_in_txn(&mut self, name: &str, if_exists: bool) -> Result<()> {
+        crate::trigger::drop_trigger_on_txn(&mut self.txn, name, if_exists)
     }
 }
 
