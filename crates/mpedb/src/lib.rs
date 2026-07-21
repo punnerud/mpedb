@@ -2404,7 +2404,13 @@ impl WriteSession<'_> {
                 let id = resolve(&table)?;
                 self.txn.alter_drop_column(id, &column)?;
             }
-            DdlStmt::CreateIndex { table, columns, unique, .. } => {
+            DdlStmt::CreateIndex {
+                table,
+                columns,
+                unique,
+                where_clause,
+                ..
+            } => {
                 let id = schema
                     .schema
                     .table_id(&table)
@@ -2412,10 +2418,13 @@ impl WriteSession<'_> {
                 let t = schema.schema.table(id).expect("table_id resolved");
                 let cols = crate::ddl_apply::resolve_index_columns(t, &table, &columns)?;
                 // Idempotent by shape: an identical index already present is a no-op.
-                if t.indexes.iter().any(|ix| ix.columns == cols && ix.unique == unique) {
+                if t.indexes.iter().any(|ix| {
+                    ix.columns == cols && ix.unique == unique && ix.predicate == where_clause
+                }) {
                     return Ok(ExecResult::Affected(0));
                 }
-                self.txn.create_index(id, cols, unique)?;
+                self.txn
+                    .create_index(id, cols, unique, where_clause)?;
             }
             // These live in a separate store or open their own transaction, so
             // they cannot ride this session's txn. Refuse cleanly (out of scope

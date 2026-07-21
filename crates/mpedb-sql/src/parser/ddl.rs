@@ -1007,7 +1007,42 @@ impl<'a> Parser<'a> {
             let _ = self.eat_kw(Kw::Asc) || self.eat_kw(Kw::Desc);
         }
         self.expect(&Tok::RParen, ")")?;
-        Ok(DdlStmt::CreateIndex { name, table, columns, unique, if_not_exists })
+        // Optional partial-index predicate (P1). Capture the source text so the
+        // schema can store it; the expression is validated by parsing it.
+        let where_clause = if self.eat_kw(Kw::Where) {
+            let start = self.here();
+            let _pred = self.expr()?;
+            // Refuse parameters in the predicate until P6 (Guarded access).
+            // A bare `WHERE c = $1` cannot be proven at plan time.
+            let end = self.here();
+            let src = self
+                .src
+                .get(start..end)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if src.is_empty() {
+                return Err(self.err_here("empty WHERE clause on CREATE INDEX"));
+            }
+            // Parameter tokens in the predicate: refuse by name (P6).
+            if src.contains('$') || src.contains('?') {
+                return Err(self.err_here(
+                    "a parameterized partial-index predicate is not supported yet \
+                     (P6: AccessPath::Guarded); use a literal predicate",
+                ));
+            }
+            Some(src)
+        } else {
+            None
+        };
+        Ok(DdlStmt::CreateIndex {
+            name,
+            table,
+            columns,
+            unique,
+            if_not_exists,
+            where_clause,
+        })
     }
 
     fn parse_drop_table(&mut self) -> Result<DdlStmt> {

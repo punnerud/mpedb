@@ -338,6 +338,7 @@ pub(crate) fn table_def_from_spec(
                     .map(|n| col_index(n))
                     .collect::<Result<Vec<u16>>>()?,
                 unique: true,
+                predicate: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -769,6 +770,7 @@ impl Database {
         table: &str,
         columns: &[String],
         unique: bool,
+        predicate: Option<String>,
     ) -> Result<ExecResult> {
         self.engine.refresh_schema_if_stale()?;
         let bundle = self.engine.schema();
@@ -779,11 +781,13 @@ impl Database {
         let t = bundle.schema.table(id).expect("table_id resolved");
         let cols = resolve_index_columns(t, table, columns)?;
         // Idempotent by shape: an identical index already present is a no-op.
-        if t.indexes.iter().any(|ix| ix.columns == cols && ix.unique == unique) {
+        if t.indexes.iter().any(|ix| {
+            ix.columns == cols && ix.unique == unique && ix.predicate == predicate
+        }) {
             return Ok(ExecResult::Affected(0));
         }
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
-        match w.create_index(id, cols, unique) {
+        match w.create_index(id, cols, unique, predicate) {
             Ok(()) => w.commit()?,
             Err(e) => {
                 w.abort();
@@ -826,8 +830,14 @@ impl Database {
             DdlStmt::AlterDropColumn { table, column } => {
                 return self.apply_alter_drop_column(&table, &column);
             }
-            DdlStmt::CreateIndex { table, columns, unique, .. } => {
-                return self.apply_create_index(&table, &columns, unique);
+            DdlStmt::CreateIndex {
+                table,
+                columns,
+                unique,
+                where_clause,
+                ..
+            } => {
+                return self.apply_create_index(&table, &columns, unique, where_clause);
             }
             DdlStmt::CreateView { name, select_sql, if_not_exists } => {
                 return self.apply_create_view(&name, &select_sql, if_not_exists);

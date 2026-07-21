@@ -189,6 +189,9 @@ pub enum DdlStmt {
         columns: Vec<String>,
         unique: bool,
         if_not_exists: bool,
+        /// Partial-index predicate source (`WHERE …`), or `None` for a
+        /// whole-table index (P1 / DESIGN-WORKLOAD-INDEXES).
+        where_clause: Option<String>,
     },
     /// `CREATE VIEW [IF NOT EXISTS] <name> AS <select>` (#73). The SELECT is
     /// captured as source text and re-parsed + flattened into referencing
@@ -404,6 +407,7 @@ mod tests {
                 columns: vec!["a".into()],
                 unique: false,
                 if_not_exists: false,
+                where_clause: None,
             }
         );
         // UNIQUE, IF NOT EXISTS, composite, and per-column ASC/DESC (ignored).
@@ -417,8 +421,24 @@ mod tests {
                 columns: vec!["a".into(), "b".into(), "c".into()],
                 unique: true,
                 if_not_exists: true,
+                where_clause: None,
             }
         );
+        // Partial index (P1): WHERE is captured as source text.
+        let p = parse_ddl("CREATE INDEX ix ON t (a) WHERE a IS NOT NULL")
+            .unwrap()
+            .unwrap();
+        match p {
+            DdlStmt::CreateIndex {
+                where_clause: Some(w),
+                columns,
+                ..
+            } => {
+                assert_eq!(columns, vec!["a".to_string()]);
+                assert!(w.to_ascii_uppercase().contains("IS NOT NULL"), "{w}");
+            }
+            other => panic!("expected partial CreateIndex, got {other:?}"),
+        }
     }
 
     #[test]
