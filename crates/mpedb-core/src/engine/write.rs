@@ -455,17 +455,17 @@ impl<'e> WriteTxn<'e> {
         let affined = self.with_store_affinity(table_id, values);
         let values = self.with_generated(table_id, &affined)?;
         let values = &values[..];
+        #[cfg(feature = "leakstat")]
         let __t = std::time::Instant::now();
         self.eng.validate_row_in(&self.bundle, table_id, values)?;
+        #[cfg(feature = "leakstat")]
         leakstat::add(&leakstat::INS_NS_VALIDATE, __t.elapsed().as_nanos() as u64);
-        let table = self
-            .bundle
-            .schema
-            .table(table_id)
-            .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
-        let tname = table.name.clone();
-        let sec = self.bundle.sec_indexes[table_id as usize].clone();
-        let sec_coll = self.bundle.sec_specs[table_id as usize].clone();
+        // Do NOT clone `sec_indexes` / `sec_specs` / `sec_unique` here: they are
+        // stable for the life of the bundle, and cloning them on every insert
+        // was pure hot-path tax (bench users table has one UNIQUE secondary).
+        // Index the tables by `i` and re-borrow between mut engine calls.
+        let tid = table_id as usize;
+        let n_sec = self.bundle.sec_indexes[tid].len();
         let key = self.eng.pk_key_in(&self.bundle, table_id, values)?;
         // #42: for a row that will SPILL, hand btree the parts instead of a
         // buffer. `encode_row` materialises the whole row — a large blob included
@@ -480,8 +480,9 @@ impl<'e> WriteTxn<'e> {
         // therefore take EXACTLY the old code path — no regression by
         // construction rather than by measurement, which matters here because
         // this box cannot resolve a few percent without ~50 paired runs.
+        #[cfg(feature = "leakstat")]
         let __t = std::time::Instant::now();
-        let types = &self.bundle.col_types[table_id as usize];
+        let types = &self.bundle.col_types[tid];
         let encoded_len = row::encoded_len(values, types);
         let spills = encoded_len > btree::MAX_INLINE_VAL;
         // DESIGN-BLOBEXTENT §4: a row whose payload exceeds the threshold is
@@ -503,28 +504,49 @@ impl<'e> WriteTxn<'e> {
                 .collect(),
             None => Vec::new(),
         };
+        #[cfg(feature = "leakstat")]
         leakstat::add(&leakstat::INS_NS_ENCODE, __t.elapsed().as_nanos() as u64);
 
-        // UNIQUE pre-check on secondary indexes before mutating anything, so
-        // a violation aborts with zero side effects on the dirty state. Only
-        // UNIQUE indexes are checked — a plain `indexed` column allows dups.
-        let sec_unique = self.bundle.sec_unique[table_id as usize].clone();
-        for (i, cols) in sec.iter().enumerate() {
-            if !sec_unique[i] {
-                continue;
-            }
-            // A unique key is the values alone; any-NULL means no entry and
-            // no conflict (SQL: UNIQUE permits multiple NULLs).
-            let Some(ikey) = index_row_key(true, cols, values, &[], &sec_coll[i]) else {
-                continue;
-            };
-            let ino = (i + 1) as u32;
-            let (iroot, _) = self.tree_root(table_id, ino)?;
-            if btree::get(self, iroot, &ikey)?.is_some() {
-                return Err(Error::UniqueViolation {
-                    table: tname,
-                    constraint: index_constraint_name(self.eng, table_id, cols),
-                });
+        // UNIQUE pre-check: only required on the extent path, where a payload
+        // pwrite + map edit would otherwise land before a secondary UNIQUE
+        // collision is known (caller may continue the txn after UniqueViolation,
+        // so orphan map edits would commit an unreferenced extent).
+        //
+        // For the common inline path we skip the pre-check get: secondary
+        // `InsertOnly` reports `existed` and we undo the PK (+ earlier
+        // secondaries) so the dirty set is clean. That saves one btree walk
+        // per UNIQUE secondary on the success path (bench users table: email).
+        if as_extent {
+            for i in 0..n_sec {
+                if !self.bundle.sec_unique[tid][i] {
+                    continue;
+                }
+                // A unique key is the values alone; any-NULL means no entry and
+                // no conflict (SQL: UNIQUE permits multiple NULLs).
+                let Some(ikey) = index_row_key(
+                    true,
+                    &self.bundle.sec_indexes[tid][i],
+                    values,
+                    &[],
+                    &self.bundle.sec_specs[tid][i],
+                ) else {
+                    continue;
+                };
+                let ino = (i + 1) as u32;
+                let (iroot, _) = self.tree_root(table_id, ino)?;
+                if btree::get(self, iroot, &ikey)?.is_some() {
+                    let tname = self
+                        .bundle
+                        .schema
+                        .table(table_id)
+                        .map(|t| t.name.clone())
+                        .unwrap_or_default();
+                    let cols = &self.bundle.sec_indexes[tid][i];
+                    return Err(Error::UniqueViolation {
+                        table: tname,
+                        constraint: index_constraint_name(self.eng, table_id, cols),
+                    });
+                }
             }
         }
 
@@ -536,11 +558,17 @@ impl<'e> WriteTxn<'e> {
         // EXPECTED failures must come first: a caller may legally continue
         // the txn after a PK/UNIQUE violation, and an already-recorded map
         // edit would then commit an extent nothing references. So the PK is
-        // probed here (UNIQUE was pre-checked above), before any payload
-        // byte or bookkeeping exists.
+        // probed here (UNIQUE was pre-checked above for extent), before any
+        // payload byte or bookkeeping exists.
         let extent_ref = if as_extent {
             let (root_probe, _) = self.tree_root(table_id, 0)?;
             if btree::get(self, root_probe, &key)?.is_some() {
+                let tname = self
+                    .bundle
+                    .schema
+                    .table(table_id)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default();
                 return Err(Error::PrimaryKeyViolation { table: tname });
             }
             let total_len = encoded_len as u64;
@@ -571,36 +599,116 @@ impl<'e> WriteTxn<'e> {
         };
 
         let (root, count) = self.tree_root(table_id, 0)?;
+        #[cfg(feature = "leakstat")]
         let __t = std::time::Instant::now();
         let out = btree::insert(self, root, &key, &mut payload, InsertMode::InsertOnly)?;
+        #[cfg(feature = "leakstat")]
         leakstat::add(&leakstat::INS_NS_BTREE, __t.elapsed().as_nanos() as u64);
         if out.existed {
+            let tname = self
+                .bundle
+                .schema
+                .table(table_id)
+                .map(|t| t.name.clone())
+                .unwrap_or_default();
             return Err(Error::PrimaryKeyViolation { table: tname });
         }
         self.set_tree_root(table_id, 0, out.new_root, count + 1);
 
-        for (i, cols) in sec.iter().enumerate() {
+        // Secondary indexes installed so far (positions into sec_indexes), for
+        // undo if a later UNIQUE collision rolls the row back.
+        let mut installed: Vec<u32> = Vec::new();
+        for i in 0..n_sec {
             // UNIQUE: key is the values alone (values→pk). Non-unique: the
             // values may repeat, so the key is `(values ‖ pk)` — unique by
             // construction. Any-NULL ⇒ no entry (membership rule). Both
             // store the pk as the payload so a lookup fetches the row.
-            let Some(ikey) = index_row_key(sec_unique[i], cols, values, &key, &sec_coll[i]) else {
+            let unique = self.bundle.sec_unique[tid][i];
+            let Some(ikey) = index_row_key(
+                unique,
+                &self.bundle.sec_indexes[tid][i],
+                values,
+                &key,
+                &self.bundle.sec_specs[tid][i],
+            ) else {
                 continue;
             };
             let ino = (i + 1) as u32;
             let (iroot, icount) = self.tree_root(table_id, ino)?;
             let out = btree::insert(self, iroot, &ikey, &mut btree::Payload::Flat(&key), InsertMode::InsertOnly)?;
             if out.existed {
-                // pre-check passed (unique) / composite is unique (non-unique),
-                // so a collision is engine inconsistency.
+                if unique && !as_extent {
+                    // Undo PK + earlier secondaries so the txn is clean for a
+                    // caller that continues after UniqueViolation.
+                    self.undo_partial_insert(table_id, &key, values, &installed)?;
+                    let tname = self
+                        .bundle
+                        .schema
+                        .table(table_id)
+                        .map(|t| t.name.clone())
+                        .unwrap_or_default();
+                    let cols = &self.bundle.sec_indexes[tid][i];
+                    return Err(Error::UniqueViolation {
+                        table: tname,
+                        constraint: index_constraint_name(self.eng, table_id, cols),
+                    });
+                }
+                // Extent path pre-checked UNIQUE; non-unique composite is
+                // unique by construction — collision is engine inconsistency.
                 return Err(Error::Internal("secondary index collision within txn".into()));
             }
             self.set_tree_root(table_id, ino, out.new_root, icount + 1);
+            installed.push(i as u32);
         }
         // FTS inverted-index maintenance rides the same txn (design/DESIGN-FTS.md
         // §1): a no-op unless `table_id` is an FTS table.
         self.fts_maybe_index(table_id, values, true)?;
         self.capture_dirty(table_id, &key, DirtyOp::Upsert)?;
+        Ok(())
+    }
+
+    /// Roll back a PK row + the secondary index entries listed in `installed`
+    /// (positions into `sec_indexes`) after a mid-insert UNIQUE collision on
+    /// the inline path. Does not touch FTS or the CDC dirty set — those only
+    /// run after all indexes land.
+    fn undo_partial_insert(
+        &mut self,
+        table_id: u32,
+        pk_key: &[u8],
+        values: &[Value],
+        installed: &[u32],
+    ) -> Result<()> {
+        let tid = table_id as usize;
+        for &i in installed.iter().rev() {
+            let i = i as usize;
+            let unique = self.bundle.sec_unique[tid][i];
+            let Some(ikey) = index_row_key(
+                unique,
+                &self.bundle.sec_indexes[tid][i],
+                values,
+                pk_key,
+                &self.bundle.sec_specs[tid][i],
+            ) else {
+                continue;
+            };
+            let ino = (i + 1) as u32;
+            let (iroot, icount) = self.tree_root(table_id, ino)?;
+            let out = btree::delete(self, iroot, &ikey)?;
+            if !out.existed {
+                return Err(Error::Internal(
+                    "undo_partial_insert: missing secondary just installed".into(),
+                ));
+            }
+            self.set_tree_root(table_id, ino, out.new_root, icount.saturating_sub(1));
+        }
+        let (root, count) = self.tree_root(table_id, 0)?;
+        let out = btree::delete(self, root, pk_key)?;
+        if !out.existed {
+            return Err(Error::Internal(
+                "undo_partial_insert: missing PK just installed".into(),
+            ));
+        }
+        self.set_tree_root(table_id, 0, out.new_root, count.saturating_sub(1));
         Ok(())
     }
 
@@ -642,19 +750,24 @@ impl<'e> WriteTxn<'e> {
         let key = keycode::encode_key_spec(pk_values, self.bundle.pk_coll(table_id));
         let (root, count) = self.tree_root(table_id, 0)?;
         // fetch old row first: index maintenance needs its column values
-        let sec_unique = self.bundle.sec_unique[table_id as usize].clone();
+        let tid = table_id as usize;
+        let n_sec = self.bundle.sec_indexes[tid].len();
         let Some(old_bytes) = btree::get(self, root, &key)? else {
             return Ok(false);
         };
-        let old = row::decode_row(&old_bytes, &self.bundle.col_types[table_id as usize])?;
+        let old = row::decode_row(&old_bytes, &self.bundle.col_types[tid])?;
         let out = btree::delete(self, root, &key)?;
         debug_assert!(out.existed);
         self.set_tree_root(table_id, 0, out.new_root, count - 1);
 
-        let sec = self.bundle.sec_indexes[table_id as usize].clone();
-        let sec_coll = self.bundle.sec_specs[table_id as usize].clone();
-        for (i, cols) in sec.iter().enumerate() {
-            let Some(ikey) = index_row_key(sec_unique[i], cols, &old, &key, &sec_coll[i]) else {
+        for i in 0..n_sec {
+            let Some(ikey) = index_row_key(
+                self.bundle.sec_unique[tid][i],
+                &self.bundle.sec_indexes[tid][i],
+                &old,
+                &key,
+                &self.bundle.sec_specs[tid][i],
+            ) else {
                 continue;
             };
             let ino = (i + 1) as u32;
@@ -679,52 +792,63 @@ impl<'e> WriteTxn<'e> {
         let new_values = self.with_generated(table_id, &affined)?;
         let new_values = &new_values[..];
         self.eng.validate_row_in(&self.bundle, table_id, new_values)?;
-        let table = self
-            .bundle
-            .schema
-            .table(table_id)
-            .ok_or_else(|| Error::Internal(format!("no table id {table_id}")))?;
-        let tname = table.name.clone();
+        let tid = table_id as usize;
+        let n_sec = self.bundle.sec_indexes[tid].len();
         let key = self.eng.pk_key_in(&self.bundle, table_id, new_values)?;
         let (root, count) = self.tree_root(table_id, 0)?;
         let Some(old_bytes) = btree::get(self, root, &key)? else {
             return Ok(false);
         };
-        let old = row::decode_row(&old_bytes, &self.bundle.col_types[table_id as usize])?;
+        let old = row::decode_row(&old_bytes, &self.bundle.col_types[tid])?;
 
-        let sec = self.bundle.sec_indexes[table_id as usize].clone();
-        let sec_unique = self.bundle.sec_unique[table_id as usize].clone();
-        let sec_coll = self.bundle.sec_specs[table_id as usize].clone();
         // pre-check UNIQUE conflicts for changed unique-indexed columns
-        for (i, cols) in sec.iter().enumerate() {
-            if !sec_unique[i] {
+        for i in 0..n_sec {
+            if !self.bundle.sec_unique[tid][i] {
                 continue;
             }
             // "changed" is measured AS THE INDEX SEES IT: under a collated index
             // `'Bob' → 'bob'` folds to the same key, so it is NOT a change — else
             // the pre-check below would find the row's OWN entry and raise a
             // phantom self-conflict.
+            let cols = &self.bundle.sec_indexes[tid][i];
             let changed = cols.iter().enumerate().any(|(j, &c)| {
-                !index_value_equal(&old[c as usize], &new_values[c as usize], sec_coll[i][j])
+                !index_value_equal(
+                    &old[c as usize],
+                    &new_values[c as usize],
+                    self.bundle.sec_specs[tid][i][j],
+                )
             });
             if !changed {
                 continue;
             }
             // Any-NULL in the NEW values ⇒ no entry ⇒ nothing to conflict.
-            let Some(ikey) = index_row_key(true, cols, new_values, &[], &sec_coll[i]) else {
+            let Some(ikey) = index_row_key(
+                true,
+                cols,
+                new_values,
+                &[],
+                &self.bundle.sec_specs[tid][i],
+            ) else {
                 continue;
             };
             let ino = (i + 1) as u32;
             let (iroot, _) = self.tree_root(table_id, ino)?;
             if btree::get(self, iroot, &ikey)?.is_some() {
+                let tname = self
+                    .bundle
+                    .schema
+                    .table(table_id)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_default();
+                let cols = &self.bundle.sec_indexes[tid][i];
                 return Err(Error::UniqueViolation {
-                    table: tname.clone(),
+                    table: tname,
                     constraint: index_constraint_name(self.eng, table_id, cols),
                 });
             }
         }
 
-        let payload = row::encode_row(new_values, &self.bundle.col_types[table_id as usize])?;
+        let payload = row::encode_row(new_values, &self.bundle.col_types[tid])?;
         // The threshold applies to updates exactly as to inserts; the upsert
         // frees the OLD value's chain/run through `free_old_val` either way.
         let extent_ref = if self.eng.extent_threshold.is_some_and(|t| payload.len() > t) {
@@ -748,15 +872,21 @@ impl<'e> WriteTxn<'e> {
         let out = btree::insert(self, root, &key, &mut up, InsertMode::Upsert)?;
         self.set_tree_root(table_id, 0, out.new_root, count);
 
-        for (i, cols) in sec.iter().enumerate() {
+        for i in 0..n_sec {
+            let cols = &self.bundle.sec_indexes[tid][i];
             let changed = cols.iter().enumerate().any(|(j, &c)| {
-                !index_value_equal(&old[c as usize], &new_values[c as usize], sec_coll[i][j])
+                !index_value_equal(
+                    &old[c as usize],
+                    &new_values[c as usize],
+                    self.bundle.sec_specs[tid][i][j],
+                )
             });
             if !changed {
                 continue;
             }
-            let okey = index_row_key(sec_unique[i], cols, &old, &key, &sec_coll[i]);
-            let nkey = index_row_key(sec_unique[i], cols, new_values, &key, &sec_coll[i]);
+            let unique = self.bundle.sec_unique[tid][i];
+            let okey = index_row_key(unique, cols, &old, &key, &self.bundle.sec_specs[tid][i]);
+            let nkey = index_row_key(unique, cols, new_values, &key, &self.bundle.sec_specs[tid][i]);
             let ino = (i + 1) as u32;
             let (mut iroot, mut icount) = self.tree_root(table_id, ino)?;
             if let Some(okey) = okey {

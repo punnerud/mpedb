@@ -39,7 +39,7 @@ pub use sqlite_adapter::SqliteAdapter;
 
 pub use adapter::{Cursor, NetOp, NetOpKind, PullBatch, SourceAdapter};
 pub use apply::{apply_batch, ApplyStats};
-pub use export::{diff_sqlite_data, export_sqlite, ExportReport};
+pub use export::{diff_sqlite_data, export_sqlite, load_sqlite_provenance, ExportReport};
 pub use import::{import_sqlite, ImportOptions, ImportReport};
 pub use pg_adapter::PgAdapter;
 pub use pg_export::{export_pg, PgExportOptions, PgExportReport};

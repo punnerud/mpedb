@@ -169,7 +169,11 @@ pub enum SourceKind {
 }
 
 impl SourceKind {
-    fn from_tag(t: u8) -> Result<SourceKind> {
+    /// Decode the single-byte tag used in `mir/cfg` and the SQLite provenance
+    /// sidecar (`_mpedb_mirror_meta`). Public so export/import can round-trip
+    /// multi-hop chains (PG → mpedb → SQLite → mpedb → PG) without re-deriving
+    /// types from the intermediate dialect's affinities.
+    pub fn from_tag(t: u8) -> Result<SourceKind> {
         match t {
             1 => Ok(SourceKind::Sqlite),
             2 => Ok(SourceKind::Postgres),

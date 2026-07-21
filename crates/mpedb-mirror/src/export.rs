@@ -5,6 +5,20 @@
 //!
 //! Reopens the `.mpedb` config-free (the file is schema-authoritative), so it
 //! works on any mirror file without a TOML config.
+//!
+//! ## Multi-hop provenance (PG ↔ SQLite via mpedb)
+//!
+//! mpedb's six types collapse dialect detail (`int4` vs `int8`, `varchar(20)`
+//! vs `text`). [`crate::state::TableMap`] on the `.mpedb` file records what the
+//! **origin** dialect said. A naive SQLite export would drop that record, so a
+//! later re-import would re-tag the mirror as `SourceKind::Sqlite` and a
+//! subsequent PostgreSQL export would only emit widened generics — the history
+//! that lets "lost" types reverse is gone.
+//!
+//! This module therefore writes a small `_mpedb_*` sidecar into the SQLite
+//! file (filtered out of user-table introspection / diffs) carrying
+//! `source_kind` + per-table `TableMap` blobs. Import restores them so
+//! `PG → mpedb → SQLite → mpedb → PG` can recreate the original PG DDL.
 
 use std::path::Path;
 
@@ -12,6 +26,11 @@ use mpedb_core::Engine;
 use mpedb_types::{ColumnType, Error, Result, Schema, Value};
 use rusqlite::types::Value as SqlVal;
 use rusqlite::Connection;
+
+use crate::state::{self, MirrorConfig, SourceKind, TableMap};
+
+/// SQLite sidecar table holding origin provenance for multi-hop export/import.
+pub const SQLITE_PROVENANCE_META: &str = "_mpedb_mirror_meta";
 
 /// Per-table row count of an export.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -84,6 +103,29 @@ pub fn export_sqlite(mpedb_path: &Path, dest: &Path) -> Result<ExportReport> {
     let r = eng.begin_read()?;
     let schema: Schema = r.stored_schema()?;
 
+    // Origin provenance (if this file is a mirror): carried into the SQLite
+    // sidecar so a later re-import can restore SourceKind + TableMaps.
+    let cfg_blob = r.sys_get(&state::sys_subkey(state::KEY_CFG))?;
+    let cfg = cfg_blob
+        .as_deref()
+        .map(MirrorConfig::decode)
+        .transpose()?;
+    let mut maps: Vec<(String, TableMap)> = Vec::new();
+    if let Some(ref c) = cfg {
+        for &tid in &c.scope {
+            if let Some(raw) = r.sys_get(&state::sys_subkey(&state::map_key(tid)))? {
+                let m = TableMap::decode(&raw)?;
+                // Key by current mpedb table name (stable for re-import match).
+                let tname = schema
+                    .tables
+                    .get(tid as usize)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| m.source_name.clone());
+                maps.push((tname, m));
+            }
+        }
+    }
+
     let mut conn = Connection::open(dest)
         .map_err(|e| Error::Config(format!("create sqlite `{}`: {e}", dest.display())))?;
 
@@ -92,7 +134,9 @@ pub fn export_sqlite(mpedb_path: &Path, dest: &Path) -> Result<ExportReport> {
         .transaction()
         .map_err(|e| Error::Config(format!("sqlite txn: {e}")))?;
     for (table_id, t) in schema.tables.iter().enumerate() {
-        // CREATE TABLE with reverse-mapped types + NOT NULL + PK + UNIQUE
+        // CREATE TABLE with reverse-mapped types + NOT NULL + PK + UNIQUE.
+        // Data-path types stay the generic sqlite affinities (safe for any
+        // origin); dialect detail lives only in the provenance sidecar.
         let mut col_defs = Vec::new();
         for c in &t.columns {
             let mut def = format!("{} {}", q(&c.name), sqlite_type(c.ty));
@@ -139,10 +183,97 @@ pub fn export_sqlite(mpedb_path: &Path, dest: &Path) -> Result<ExportReport> {
             rows: n,
         });
     }
+
+    if let Some(c) = cfg {
+        write_sqlite_provenance(&tx, c.source_kind, &maps)?;
+    }
+
     tx.commit()
         .map_err(|e| Error::Config(format!("sqlite commit: {e}")))?;
     r.finish()?;
     Ok(report)
+}
+
+/// Persist origin `SourceKind` + per-table [`TableMap`] into the SQLite sidecar.
+/// Keys: `source_kind` (1 byte), `map:<table_name>` (TableMap encode).
+fn write_sqlite_provenance(
+    tx: &rusqlite::Transaction<'_>,
+    kind: SourceKind,
+    maps: &[(String, TableMap)],
+) -> Result<()> {
+    tx.execute(
+        &format!(
+            "CREATE TABLE {} (key TEXT PRIMARY KEY NOT NULL, value BLOB NOT NULL)",
+            q(SQLITE_PROVENANCE_META)
+        ),
+        [],
+    )
+    .map_err(|e| Error::Config(format!("create provenance sidecar: {e}")))?;
+    tx.execute(
+        &format!(
+            "INSERT INTO {} (key, value) VALUES ('source_kind', ?1)",
+            q(SQLITE_PROVENANCE_META)
+        ),
+        rusqlite::params![vec![kind as u8]],
+    )
+    .map_err(|e| Error::Config(format!("provenance source_kind: {e}")))?;
+    for (tname, m) in maps {
+        let key = format!("map:{tname}");
+        tx.execute(
+            &format!(
+                "INSERT INTO {} (key, value) VALUES (?1, ?2)",
+                q(SQLITE_PROVENANCE_META)
+            ),
+            rusqlite::params![key, m.encode()],
+        )
+        .map_err(|e| Error::Config(format!("provenance map `{tname}`: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Load multi-hop provenance from a SQLite file, if the sidecar is present.
+/// Returns `(SourceKind, table_name → TableMap)`.
+pub fn load_sqlite_provenance(
+    conn: &Connection,
+) -> Result<Option<(SourceKind, Vec<(String, TableMap)>)>> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT 1 FROM pragma_table_list WHERE name = ?1",
+            [SQLITE_PROVENANCE_META],
+            |_| Ok(true),
+        )
+        .unwrap_or(false);
+    if !exists {
+        return Ok(None);
+    }
+    let mut kind: Option<SourceKind> = None;
+    let mut maps = Vec::new();
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT key, value FROM {}",
+            q(SQLITE_PROVENANCE_META)
+        ))
+        .map_err(|e| Error::Config(format!("read provenance: {e}")))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
+        })
+        .map_err(|e| Error::Config(format!("read provenance: {e}")))?;
+    for row in rows {
+        let (key, val) = row.map_err(|e| Error::Config(format!("read provenance: {e}")))?;
+        if key == "source_kind" {
+            let tag = *val
+                .first()
+                .ok_or_else(|| Error::Corrupt("empty source_kind in sqlite provenance".into()))?;
+            kind = Some(SourceKind::from_tag(tag)?);
+        } else if let Some(tname) = key.strip_prefix("map:") {
+            maps.push((tname.to_string(), TableMap::decode(&val)?));
+        }
+    }
+    let kind = kind.ok_or_else(|| {
+        Error::Corrupt("sqlite provenance sidecar missing source_kind".into())
+    })?;
+    Ok(Some((kind, maps)))
 }
 
 /// Compare the DATA of two sqlite databases table-by-table, row-by-row in PK
@@ -288,6 +419,54 @@ mod tests {
         assert_eq!(tables.len(), 2);
 
         for p in [orig_path, mpedb_path, rt_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn export_embeds_origin_provenance_for_multi_hop() {
+        // SQLite → mpedb (records SourceKind::Sqlite + maps) → SQLite export
+        // must carry the sidecar so re-import restores origin kind.
+        let orig_path = tmp("prov-orig", "db");
+        let orig = Connection::open(&orig_path).unwrap();
+        orig.execute_batch(
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, email VARCHAR(64) NOT NULL UNIQUE);
+             INSERT INTO t VALUES (1, 'a@x.no');",
+        )
+        .unwrap();
+        drop(orig);
+        let mpedb_path = tmp("prov-mid", "mpedb");
+        {
+            let mut src = Connection::open(&orig_path).unwrap();
+            let _ = import_sqlite(&mut src, &mpedb_path, &ImportOptions::default()).unwrap();
+        }
+        let out_path = tmp("prov-out", "db");
+        export_sqlite(&mpedb_path, &out_path).unwrap();
+        let out = Connection::open(&out_path).unwrap();
+        let loaded = load_sqlite_provenance(&out).unwrap().expect("sidecar present");
+        assert_eq!(loaded.0, crate::state::SourceKind::Sqlite);
+        assert!(
+            loaded.1.iter().any(|(n, m)| n == "t"
+                && m.columns.iter().any(|c| c.source_type.to_ascii_uppercase().contains("VARCHAR"))),
+            "VARCHAR declared type must survive in provenance: {:?}",
+            loaded.1
+        );
+        // re-import keeps SourceKind and map
+        let mpedb2 = tmp("prov-mid2", "mpedb");
+        {
+            let mut src = Connection::open(&out_path).unwrap();
+            let _ = import_sqlite(&mut src, &mpedb2, &ImportOptions::default()).unwrap();
+        }
+        let eng = mpedb_core::Engine::open_from_file(&mpedb2).unwrap();
+        let r = eng.begin_read().unwrap();
+        let cfg = crate::state::MirrorConfig::decode(
+            &r.sys_get(&crate::state::sys_subkey(crate::state::KEY_CFG))
+                .unwrap()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(cfg.source_kind, crate::state::SourceKind::Sqlite);
+        for p in [orig_path, mpedb_path, out_path, mpedb2] {
             let _ = std::fs::remove_file(p);
         }
     }

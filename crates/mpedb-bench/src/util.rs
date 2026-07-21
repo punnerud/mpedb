@@ -11,6 +11,17 @@ pub fn err<T>(msg: impl Into<String>) -> BResult<T> {
     Err(msg.into().into())
 }
 
+/// `--only` filter: empty means all; otherwise comma-separated substrings
+/// (`mpedb,sqlite` matches either). Used by the primary matrix and the
+/// durable-on-ack control group so mpedb↔sqlite can interleave without PG.
+pub fn only_matches(key: &str, only: &Option<String>) -> bool {
+    only.as_ref().is_none_or(|f| {
+        f.split(',')
+            .map(str::trim)
+            .any(|part| !part.is_empty() && key.contains(part))
+    })
+}
+
 // ---------------------------------------------------------------------- rng
 
 /// xorshift64* — deterministic for a given seed, no external crate.
