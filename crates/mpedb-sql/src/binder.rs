@@ -2101,7 +2101,7 @@ impl<'a> Binder<'a> {
             // the concrete side's type, but at runtime the bound value may be
             // any class — emit ClassCmp (no affinity) so `1 = ?` with a text
             // bind answers FALSE rather than "cannot compare".
-            if !((is_param(l) || is_param(r)) && !is_col(l) && !is_col(r)) {
+            if (!is_param(l) && !is_param(r)) || is_col(l) || is_col(r) {
                 return None;
             }
             // Fall through with admit via the param path below; `aff_of` for a

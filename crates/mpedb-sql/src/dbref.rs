@@ -555,10 +555,11 @@ fn resolve_ddl(
     }
     let first = attached_ms[0];
     if attached_ms.iter().any(|m| *m != first) {
-        return Err(Error::Unsupported(format!(
+        return Err(Error::Unsupported(
             "DDL on an attached database is not supported in v1: \
              statement spans more than one attached database"
-        )));
+                .into(),
+        ));
     }
     Ok(DbResolution::AttachedOnly {
         db: scope.attached[first].0.clone(),

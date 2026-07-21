@@ -404,8 +404,11 @@ fn flatten_cte_fromless(
         // `SELECT * FROM cte` → the body's own projection (and its aliases).
         s.items = Some(body_items);
     } else {
-        // Rewrite outer items against the body's exposed names.
-        for (e, _) in s.items.as_mut().expect("is_some") {
+        // Rewrite outer items against the body's exposed names. The `else`
+        // arm is unreachable — the branch above owns the `None` case — but a
+        // let-else says so without an `expect` the compiler cannot check.
+        let Some(items) = s.items.as_mut() else { return Ok(()) };
+        for (e, _) in items {
             rewrite_cte_cols(e, &by_name, tname, ref_alias)?;
         }
     }
@@ -429,8 +432,7 @@ fn fromless_item_name(e: &Expr) -> String {
             mpedb_types::Value::Float(f) => {
                 // Same short form the dual planner's program render uses for
                 // whole-number floats: keep a trailing `.0` only when needed.
-                let s = f.to_string();
-                s
+                f.to_string()
             }
             mpedb_types::Value::Text(t) => t.clone(),
             mpedb_types::Value::Null => "NULL".into(),
