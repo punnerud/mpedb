@@ -486,7 +486,19 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
                     rows,
                 });
             }
-            let bundle = c.db.schema();
+            // Prefer the open WriteSession's schema so a mid-transaction
+            // `CREATE TABLE` is visible to `PRAGMA table_info` (CPython's
+            // default isolation starts a txn on the first INSERT, then
+            // `iterdump` runs `table_info` before COMMIT — without this the
+            // dump emits `VALUES()` with no columns). Outside a txn, refresh
+            // so a just-committed CREATE is not stale.
+            let bundle = match c.txn.as_ref() {
+                Some(s) => s.schema(),
+                None => {
+                    let _ = c.db.refresh_schema_if_stale();
+                    c.db.schema()
+                }
+            };
             let (columns, rows) = introspect::pragma(&bundle, sqltext, &mut c.busy_timeout_ms)?;
             // `PRAGMA busy_timeout = N` may have moved the knob — mirror it
             // into the engine's writer-lock deadline (#109), same as
