@@ -237,27 +237,32 @@ API: string-SQL per call (no prepare) — **unfavorable vs mpedb/SQLite prepared
 
 **Interpretation:** minisqlite is a serious SQLite clone. It **lacks a prepare hot path** and **multi-process**. M3 durable batch is fsync-bound (~5k rows/s FULL); Linux batch looks stronger relative to stock SQLite on that host. Micro is **not** control-group-identical to mpedb-bench.
 
-### 5.4 Fair in-memory prepare+bind (Linux, 2026-07-21)
+### 5.4 Fair in-memory prepare+bind (Linux + M3, `7fb0d53`, 2026-07-21)
 
-Same host, same `users(id PK, name, age)` schema, n=50k. mpedb `path = ":memory:"` (private memfd, durability=none); minisqlite/sqlite3 `open_in_memory()`. Source: `imem-bench-linux-pkhot2.log`.
+Same schema `users(id PK, name, age)`, n=50k, batch=100. mpedb `path = ":memory:"` (private memfd / unlinked temp, durability=none); minisqlite/sqlite3 `open_in_memory()`. Harness: external `imem_bench` (not in-tree).
 
-| Cell | **mpedb** | minisqlite | **sqlite3** | mpedb vs sqlite3 |
-|---|---:|---:|---:|---|
-| prepare+bind **SELECT** | **1.50 M ops/s** (0.7 µs) | N/A (no prepare) | **2.48 M** (0.4 µs) | ~0.60× (still behind) |
-| prepare+bind **INSERT** (autocommit) | 270 k (3.7 µs) | N/A | **1.05 M** (1.0 µs) | ~0.26× |
-| batch-100 prepare INSERT | **842 k rows/s** | 225 k (string) | 645 k (string) | **wins** vs string-SQL batch |
-| string SELECT (re-parse each) | 181 k | 273 k | 474 k | loses (parse tax) |
+| Cell | **Linux** mpedb | Linux sqlite3 | **M3** mpedb | M3 sqlite3 | mpedb/sqlite (L · M3) |
+|---|---:|---:|---:|---:|---|
+| prepare+bind **SELECT** (`execute(hash)`) | 1.34 M (0.7 µs) | 2.51 M (0.4 µs) | 1.94 M (0.5 µs) | 3.77 M (0.3 µs) | 0.53× · 0.51× |
+| **PreparedSelect** (sqlite-stmt analogue) | **1.78 M** (0.6 µs) | = bind above | **2.55 M** (0.4 µs) | = bind above | **0.71× · 0.68×** |
+| prepare+bind **INSERT** (autocommit) | **460 k** (2.2 µs) | 1.16 M (0.9 µs) | **564 k** (1.8 µs) | 1.51 M (0.7 µs) | 0.40× · 0.37× |
+| batch-100 prepare INSERT | **891 k rows/s** | 634 k (string) | **1.57 M** | 1.24 M (string) | **wins · wins** |
+| string SELECT (re-parse) | 182 k | 468 k | 281 k | 932 k | loses (parse tax) |
+| string INSERT (re-parse) | 150 k | 476 k | 192 k | 835 k | loses |
+| minisqlite prepare | **N/A** | | **N/A** | | no prepare API |
 
-**What closed most of the SELECT gap this round** (baseline before work ~463 k ops/s):
+**Linux before this hot-path work** (same harness, earlier same day): prepare+bind SELECT **463 k**, INSERT **269 k** → SELECT ~**3.8×** via PreparedSelect, INSERT ~**1.7×**.
 
-1. Private-memory reader pins (no multiproc CAS / SeqCst recheck)
-2. Process-local meta double-buffer (no dual-page xxh3 on every pin)
-3. **PkPoint micro-executor** — `SELECT cols FROM t WHERE pk = $1` skips the full gather/project pipeline
-4. Stack Int-PK key encode + column-projected `get_by_pk_cols` (no unused-column decode)
-5. Skip cross-file cache lock when no ATTACH
+**What closed the gap:**
 
-**Honest residual:** still ~1.65× behind stock SQLite on prepared point SELECT. Remaining cost is mostly facade (plan Arc/cache) + btree get + `Text` materialization into `Value` — not plan choice. Autocommit INSERT stays behind because every write is COW + freelist fixpoint + catalog write-back (batch amortizes that and **beats** SQLite string batch).
+1. Private-memory reader pins + process-local meta double-buffer  
+2. PkPoint micro-executor + stack Int-PK encode + projected `get_by_pk_cols`  
+3. **`PreparedSelect`** + TLS last-plan cache  
+4. Private exclusive **in-place** leaf mutation when no concurrent pins (undo buffer for abort)
 
+**Honest residual:** PreparedSelect is still ~0.7× stock SQLite (owned `Value`/`String` + pin per call vs VDBE registers). Autocommit INSERT ~0.4× (catalog/freelist/undo vs pure in-place B-tree). **Batch amortizes commit and beats sqlite string-batch on both hosts.** Prefer `prepare_select` + `execute_prepared_select` for reads and multi-row `WriteSession` for writes.
+
+Sources: `~/mpedb-measure-results/imem-bench-linux-post-push.log`, `imem-bench-m3-7fb0d53.log`. Plan notes: [design/notes/SELECT-HOTPATH-PLAN.md](design/notes/SELECT-HOTPATH-PLAN.md).
 ---
 
 ## 6. Architecture (brief)
