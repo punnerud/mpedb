@@ -42,13 +42,29 @@ impl PageStore for WriteTxn<'_> {
 
     fn page_mut(&mut self, id: u64) -> Result<&mut [u8]> {
         // COW discipline enforced in production, not just tests: committed
-        // pages are immutable while readers may hold snapshots.
+        // pages are immutable while readers may hold snapshots — unless
+        // `in_place` (private exclusive write; no concurrent pins).
         if !self.dirty.contains(&id) {
             return Err(Error::Internal(format!(
                 "page_mut on non-dirty page {id} (COW violation)"
             )));
         }
         self.eng.shm.page_mut_unchecked(id)
+    }
+
+    fn adopt_inplace(&mut self, id: u64) -> Result<bool> {
+        if !self.in_place {
+            return Ok(false);
+        }
+        // Snapshot once for abort restore, then mark dirty.
+        if !self.dirty.contains(&id) {
+            let page = self.eng.shm.page(id)?;
+            let mut buf = Box::new([0u8; PAGE_SIZE]);
+            buf.copy_from_slice(page);
+            self.inplace_undo.insert(id, buf);
+            self.dirty.insert(id);
+        }
+        Ok(true)
     }
 
     fn alloc(&mut self) -> Result<u64> {

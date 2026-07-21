@@ -97,13 +97,22 @@ pub(crate) fn resolve_params_timed<'a>(
     user_params: &'a [mpedb_types::Value],
     session: &Session,
 ) -> mpedb_types::Result<std::borrow::Cow<'a, [mpedb_types::Value]>> {
-    let t = std::time::Instant::now();
-    let r = resolve_params(plan, user_params, session);
-    mpedb_core::engine::leakstat::add(
-        &mpedb_core::engine::leakstat::EXEC_NS_RESOLVE,
-        t.elapsed().as_nanos() as u64,
-    );
-    r
+    // Only time when the leakstat feature is on — Instant::now on every
+    // execute was measurable on the prepare+bind SELECT hot path (~tens of ns).
+    #[cfg(feature = "leakstat")]
+    {
+        let t = std::time::Instant::now();
+        let r = resolve_params(plan, user_params, session);
+        mpedb_core::engine::leakstat::add(
+            &mpedb_core::engine::leakstat::EXEC_NS_RESOLVE,
+            t.elapsed().as_nanos() as u64,
+        );
+        r
+    }
+    #[cfg(not(feature = "leakstat"))]
+    {
+        resolve_params(plan, user_params, session)
+    }
 }
 
 /// Microseconds since the Unix epoch. The single clock read behind a literal

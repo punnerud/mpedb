@@ -25,7 +25,7 @@
 | CPython / Django | **N/A** | 459/467 · A 831/831 · q 493/493 | stock baseline |
 | Multi-process writers | ✗ | ✓ | single writer + WAL readers |
 | Own unit suite | 5605/0 (M3 + Linux) | `cargo test --workspace` | — (TCL/TH3 not this doc) |
-| **sqllogictest** 7.4M | 99.999882 % (4 wrong); ~187 s Linux | 99.9749 % raw Linux (~353 s); 0 genuine wrong after shim (CORPUS-STATUS) | 99.999933 % (3 wrong); ~70 s Linux |
+| **sqllogictest** 7.4M | 99.999882 % (4 wrong); ~187 s Linux / ~86 s M3 | 99.974859 % raw; ~318 s Linux / ~153 s M3 | 99.999933 % (3 wrong); ~70 s Linux |
 | mpedb-bench speed cells | **N/A** (no adapter) | measured (RESULTS) | measured (RESULTS) |
 | minisqlite micro (not CG) | §5.3 | — | — |
 
@@ -89,11 +89,11 @@ minisqlite suite makeup (for scale): ~2964 facade `conformance_*.rs` tests (SQL 
 | Harness (this round) | same SLT parser + MD5 + I/R/T rendering; engines answer as `sqlite` in `skipif`/`onlyif` |
 | stock SQLite | rusqlite **bundled 3.45.0** (`sqlite_corpus`) — Linux |
 | minisqlite | `minisqlite_corpus` — **M3 + Linux** (identical totals) |
-| mpedb | `mpedb-testkit` `sqlite_corpus --as-sqlite --samples-all` + schema shim — **Linux re-measure 2026-07-21** (same 621 file list); prior M3 headline in [CORPUS-STATUS](design/CORPUS-STATUS.md) |
+| mpedb | `mpedb-testkit` `sqlite_corpus --as-sqlite` + schema shim; **size_mb=32** (default after harness tweak; 16 OOM’d some files) |
 
 **Headline (same 621 files, same flist):**
 
-| metric | **stock SQLite 3.45** (Linux) | **minisqlite** (M3 ≡ Linux) | **mpedb** (Linux, this run) |
+| metric | **stock SQLite 3.45** (Linux) | **minisqlite** (M3 ≡ Linux) | **mpedb** (Linux ≡ M3, size_mb=32) |
 |---|---:|---:|---:|
 | records seen | 7 419 277 | 7 419 277 | 7 419 277 |
 | skipped | 1 480 834 | 1 480 834 | 1 480 834 |
@@ -101,12 +101,12 @@ minisqlite suite makeup (for scale): ~2964 facade `conformance_*.rs` tests (SQL 
 | **passed** | 5 938 439 — 99.999933 % | 5 938 436 — 99.999882 % | 5 936 950 — 99.974859 % |
 | ├ statements | 210 082 | 210 080 | 208 759 |
 | └ queries | 5 728 357 | 5 728 356 | 5 728 191 |
-| wrong answers | 3 | 4 | 7 (runner flags; see CORPUS-STATUS for genuine vs shim) |
+| wrong answers | 3 | 4 | 7 (runner flags; CORPUS-STATUS for genuine vs shim) |
 | error mismatches | 0 | 2 | 0 |
 | refused / unsupported | 0 | 0 | 1 486 (mostly shim) |
-| **wall clock** | **~70 s** (Linux) | **~86 s** M3 · **~187 s** Linux | **~353 s** (Linux, ~5.9 min) |
+| **wall clock** | **~70 s** (Linux) | **~86 s** M3 · **~187 s** Linux | **~153 s** M3 · **~318 s** Linux |
 
-Prior mpedb M3 sweep (CORPUS-STATUS @ `b41b713`, slightly different skip accounting): 5 936 882 / 5 938 278 = 99.9765 %, **0 genuine wrong** after shim discount. This Linux re-run uses the **same flist + `--as-sqlite`** as the minisqlite/sqlite harness for wall-clock parity; raw pass% stays shim-dominated, not “worse logic than minisqlite.”
+mpedb pass counts **identical** Linux↔M3 at size_mb=32. Wall-clock is still dominated by per-statement `prepare_detached` (not open size: 16 vs 32 vs 128 almost same speed; 16 was wrong for capacity). Prior CORPUS-STATUS M3: 0 genuine wrong after shim discount.
 
 **Shared residual (harness / extreme floats):** stock SQLite and minisqlite both miss the same 3 `evidence/slt_lang_aggfunc.test` cases — `sum`/`total` on extreme i64 rendered with `%.3f` vs corpus text (`…5808` vs `…6000`). That is **not** a minisqlite-only bug.
 
@@ -237,6 +237,27 @@ API: string-SQL per call (no prepare) — **unfavorable vs mpedb/SQLite prepared
 
 **Interpretation:** minisqlite is a serious SQLite clone. It **lacks a prepare hot path** and **multi-process**. M3 durable batch is fsync-bound (~5k rows/s FULL); Linux batch looks stronger relative to stock SQLite on that host. Micro is **not** control-group-identical to mpedb-bench.
 
+### 5.4 Fair in-memory prepare+bind (Linux, 2026-07-21)
+
+Same host, same `users(id PK, name, age)` schema, n=50k. mpedb `path = ":memory:"` (private memfd, durability=none); minisqlite/sqlite3 `open_in_memory()`. Source: `imem-bench-linux-pkhot2.log`.
+
+| Cell | **mpedb** | minisqlite | **sqlite3** | mpedb vs sqlite3 |
+|---|---:|---:|---:|---|
+| prepare+bind **SELECT** | **1.50 M ops/s** (0.7 µs) | N/A (no prepare) | **2.48 M** (0.4 µs) | ~0.60× (still behind) |
+| prepare+bind **INSERT** (autocommit) | 270 k (3.7 µs) | N/A | **1.05 M** (1.0 µs) | ~0.26× |
+| batch-100 prepare INSERT | **842 k rows/s** | 225 k (string) | 645 k (string) | **wins** vs string-SQL batch |
+| string SELECT (re-parse each) | 181 k | 273 k | 474 k | loses (parse tax) |
+
+**What closed most of the SELECT gap this round** (baseline before work ~463 k ops/s):
+
+1. Private-memory reader pins (no multiproc CAS / SeqCst recheck)
+2. Process-local meta double-buffer (no dual-page xxh3 on every pin)
+3. **PkPoint micro-executor** — `SELECT cols FROM t WHERE pk = $1` skips the full gather/project pipeline
+4. Stack Int-PK key encode + column-projected `get_by_pk_cols` (no unused-column decode)
+5. Skip cross-file cache lock when no ATTACH
+
+**Honest residual:** still ~1.65× behind stock SQLite on prepared point SELECT. Remaining cost is mostly facade (plan Arc/cache) + btree get + `Text` materialization into `Value` — not plan choice. Autocommit INSERT stays behind because every write is COW + freelist fixpoint + catalog write-back (batch amortizes that and **beats** SQLite string batch).
+
 ---
 
 ## 6. Architecture (brief)
@@ -313,7 +334,8 @@ find ~/sqllogictest/test -name '*.test' | sort | grep -v '/select5\.test$' > fli
 - `~/mpedb-measure-results/minisqlite-test-linux.log` — unit 5605/0
 - `~/mpedb-measure-results/minisqlite-corpus-linux.log` — same residual as M3 (~187 s)
 - `~/mpedb-measure-results/sqlite-corpus-linux.log` — stock SQLite 3.45.0 same 621-file corpus (~70 s)
-- `~/mpedb-measure-results/mpedb-corpus-linux.log` — mpedb same flist, `--as-sqlite` (**~353 s** wall)
+- `~/mpedb-measure-results/mpedb-corpus-linux-v3.log` — mpedb size_mb=32 (**~318 s** wall)
+- `~/mpedb-measure-results/mpedb-corpus-m3-v3.log` — mpedb size_mb=32 (**~153 s** wall)
 - `~/mpedb-measure-results/minisqlite-bench-linux.log`
 - `~/mpedb-measure-results/minisqlite-micro-linux.log`
 

@@ -221,6 +221,8 @@ impl Database {
                 guard.epoch += 1;
                 drop(guard);
                 self.cross_cache.write().expect(POISON).clear();
+                self.cross_cache_live
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 Ok(ExecResult::Affected(0))
             }
             AttachStmt::Detach { name } => {
@@ -234,6 +236,8 @@ impl Database {
                         guard.epoch += 1;
                         drop(guard);
                         self.cross_cache.write().expect(POISON).clear();
+                        self.cross_cache_live
+                            .store(false, std::sync::atomic::Ordering::Relaxed);
                         if member.ephemeral {
                             let path = member.db.path().to_path_buf();
                             drop(member);

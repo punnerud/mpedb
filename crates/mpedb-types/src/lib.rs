@@ -15,9 +15,9 @@ pub mod schema;
 pub mod value;
 
 pub use config::{
-    BareGroupBy, Concurrency, Config, DbOptions, Durability, FilePerms, WorkspaceConfig,
-    WorkspaceMember,
-    DEFAULT_MAX_JOIN_CELLS, DEFAULT_MAX_WORK_ROWS, MAX_DB_SIZE_MB,
+    resolve_storage_path, BareGroupBy, Concurrency, Config, DbOptions, Durability, FilePerms,
+    StorageKind, WorkspaceConfig, WorkspaceMember, DEFAULT_MAX_JOIN_CELLS, DEFAULT_MAX_WORK_ROWS,
+    MAX_DB_SIZE_MB,
 };
 pub use error::{BudgetKind, Error, Result};
 pub use ident::{fold_ident, ident_eq};
