@@ -13,6 +13,8 @@
 
 **SQLite / PostgreSQL / mpedb mpedb-bench numbers:** reused from `crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md` and `RESULTS-linux-amd-epyc-milan-2c.md` (not re-run)
 
+**Update (2026-07-21 evening):** §10 re-runs the corpus + `:memory:` micro on both hosts at pinned commits — and documents an mpedb `:memory:` correctness regression at `e9acc83` found by that run. §1–§9 numbers below are the earlier same-day baseline, kept unchanged.
+
 ---
 
 ## 1. Short conclusion
@@ -349,3 +351,103 @@ find ~/sqllogictest/test -name '*.test' | sort | grep -v '/select5\.test$' > fli
 **mpedb RESULTS (reused):**
 - `crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md`
 - `crates/mpedb-bench/RESULTS-linux-amd-epyc-milan-2c.md`
+---
+
+## 10. Re-run 2026-07-21 evening — all three engines, both hosts, pinned commits
+
+**Pins (stated for every number below):** mpedb **`e9acc83`** (main, both hosts, rsync-verified on M3) · minisqlite **`4a5c134`** (`main`, both hosts) · stock SQLite **3.45.0** (rusqlite `0.31` bundled, same lockfile both hosts). Same 621-file flist and the same 16-chunk split as §3.2/§9.2 (chunk lists byte-identical to `minisqlite-flist-621`). Sequential, one engine at a time, nothing else on the box; Linux runs under `ulimit -v 3000000`. Two runs per engine per host; both reported, never averaged.
+
+### 10.1 Headline first: an mpedb correctness regression at `e9acc83`, found by this run
+
+The mpedb corpus run at `e9acc83` is **not byte-consistent with the §3.2 baseline** — identically on both hosts (deterministic, r1 ≡ r2 ≡ Linux ≡ M3):
+
+| aggregate | baseline (§3.2, `214bd48`+WIP) | `e9acc83` |
+|---|---:|---:|
+| passed | 5 936 950 (99.974859 %) | 5 924 507 (99.765326 %) |
+| statements passed | 208 759 | 205 413 |
+| unsupported/refused | 1 486 | 4 975 |
+| runner-flagged wrong | 7 | **8 960** |
+
+**Root cause (bisected):** `INSERT INTO tabN SELECT * FROM tab0` fails with
+`internal error (bug in mpedb): freelist fixpoint did not converge` (commit.rs §4.5 iteration cap) on delete-heavy `:memory:` databases. Every one of the 164 sampled wrong answers carries the runner's cascade note — the "wrong" queries read tables left empty by the refused INSERTs; the corpus flags ~8 960 of them.
+
+- **Repro:** `sqlite_corpus --as-sqlite --size-mb 32 --samples-all ~/sqllogictest/test/index/delete/100/slt_good_0.test` → 145 × fixpoint refusals, 773 cascade wrongs, single process, single file.
+- **Bisect:** `7fb0d53` (perf: `:memory:` fast path, PreparedSelect, **private in-place writes**) reproduces byte-identically; its parent window does not (the §3.2 baseline ran the same day's pre-in-place tree). Disabling only `Shm::try_begin_exclusive_write` (one line) on top of `e9acc83` → **0 fixpoint errors, 0 wrongs** on the repro file and a full corpus run byte-consistent with baseline (§10.2). Culprit is the **in-place exclusive-write path**, not PreparedSelect/TLS/PkPoint.
+- **Blast radius:** `try_begin_exclusive_write` requires `is_private` — **only private `:memory:` databases** are exposed; file databases never take the in-place path. Failure mode is a refused commit (txn error), not corruption; abort/undo held in every observed case.
+- **Mechanism (hypothesis, unverified):** in-place adoption dirties committed pages without the alloc/free the §4.5 termination argument counts on; under freelist churn (DELETE-heavy files) the fixpoint's plan keeps moving until the 64-iteration cap. The fix belongs in commit-path review (DESIGN.md §4.5) — e.g. forcing pure COW while `in_freelist_op` — and is **not attempted here**.
+
+Consequence for this document: the `e9acc83` mpedb corpus wall-clocks in §10.2 are printed for the record but **struck as invalid** — a timing from a run that got answers wrong is worthless. The valid mpedb corpus timing this round is the probe row (`e9acc83` + the one-line in-place disable), which is pass-rate-byte-identical to baseline.
+
+### 10.2 Corpus wall clock (621 files, 5 938 443 attempted records)
+
+Same-host pairs only; never compare a Linux number to an M3 number.
+
+**Linux (AMD EPYC-Milan 2c):**
+
+| engine | commit | r1 | r2 | passed | flagged wrong |
+|---|---|---:|---:|---:|---:|
+| stock SQLite 3.45.0 | rusqlite bundled | **69.5 s** | **67.6 s** | 5 938 439 (99.999933 %) | 3 |
+| minisqlite | `4a5c134` | **153.2 s** | **153.0 s** | 5 938 436 (99.999882 %) | 4 (+2 errmis) |
+| mpedb | `e9acc83` | ~~262.4 s~~ | ~~263.0 s~~ | ~~5 924 507~~ **invalid** (§10.1) | ~~8 960~~ |
+| mpedb | `e9acc83` + in-place off (probe) | **258.9 s** | **262.8 s** | 5 936 950 (99.974859 %) | 7 (0 genuine) |
+
+**M3 (Apple M3 Pro 11c):**
+
+| engine | commit | r1 | r2 | passed | flagged wrong |
+|---|---|---:|---:|---:|---:|
+| stock SQLite 3.45.0 | rusqlite bundled | **41.6 s** | **41.8 s** | 5 938 439 (99.999933 %) | 3 |
+| minisqlite | `4a5c134` | **85.2 s** | **84.9 s** | 5 938 436 (99.999882 %) | 4 (+2 errmis) |
+| mpedb | `e9acc83` | ~~145.4 s~~ | ~~144.9 s~~ | ~~5 924 507~~ **invalid** (§10.1) | ~~8 960~~ |
+| mpedb | `e9acc83` + in-place off (probe) | **146.9 s** | **146.7 s** | 5 936 950 (99.974859 %) | 7 (0 genuine) |
+
+Correctness notes:
+- sqlite and minisqlite aggregates are **byte-identical to §3.2** on both hosts and across both runs (same 3/4 wrongs, same 2 minisqlite errmis, same shared `slt_lang_aggfunc` float-rendering residual).
+- The probe rows match baseline pass counts exactly; one record migrated failure category (unsupported 1486→1485, errmis 0→1), identical on both hosts: `slt_lang_reindex.test:40` — `REINDEX tXiX`. mpedb now *accepts* REINDEX (baseline refused all REINDEX as index-ddl) but does not error on an unknown index name, where sqlite does. A one-record follow-up gap, not noise.
+- minisqlite on Linux measured 153 s vs ~187 s in §3.2 with the **same binary** (built 13:31); the §3.2 number was taken on a busier box. Prefer this round's paired numbers.
+
+### 10.3 Movement vs the ~318 s / ~153 s baseline, attributed
+
+mpedb corpus (valid probe rows): Linux 317.5 → **258.9/262.8 s** (−~18 %), M3 ~153 → **146.9/146.7 s** (−~4 %). The named suspects `dac2ada` (streaming aggregate), `6683dd0` (column pruning) and `e277644` (registry scan) are **already inside the §3.2 baseline** (all predate `214bd48`); they explain none of this movement. The whole delta sits in `214bd48..e9acc83`, i.e. essentially `7fb0d53` minus the broken in-place path:
+
+1. the runner's per-statement path went `prepare_detached`/`execute_detached` → `query_once` (skips the canonical-bytes encode + fully re-validating decode per statement; ~210 k statements, ~100 k distinct compiles). Partly a **harness** change — but it makes the comparison *more* apples-to-apples, since the sqlite/minisqlite runners never paid an encode/decode tax;
+2. PkPoint micro-executor, TLS last-plan cache, PreparedSelect (engine, `7fb0d53`).
+
+The in-place write path contributed nothing valid here (its corpus effect at `e9acc83` is the §10.1 regression).
+
+The asymmetry (−18 % on the 2-core EPYC, −4 % on the M3) says the per-statement encode/decode tax was mostly a slow-x86 cost; §3.2's "dominated by per-statement `prepare_detached`" held for Linux, much less for M3.
+
+### 10.4 `:memory:` micro (imem_bench, §5.4 harness byte-identical on both hosts, n=50k, batch=100)
+
+All numbers `e9acc83` (mpedb) / `4a5c134` (minisqlite) / bundled 3.45.0 (sqlite3); r1 / r2 per host.
+
+**Linux:**
+
+| cell | mpedb | minisqlite | sqlite3 |
+|---|---:|---:|---:|
+| string INSERT | 153 k / 109 k | 213 k / 178 k | 477 k / 392 k |
+| prepare+bind INSERT | 471 k / 444 k | N/A | 959 k / 937 k |
+| string SELECT | 181 k / 186 k | 277 k / 266 k | 481 k / 468 k |
+| prepare+bind SELECT | 1.401 M / 1.400 M | N/A | 2.518 M / 2.561 M |
+| **PreparedSelect** | **1.653 M / 1.810 M** | N/A | = bind |
+| batch-100 INSERT rows/s | **951 k / 941 k** | 233 k / 220 k | 656 k / 655 k |
+
+**M3:**
+
+| cell | mpedb | minisqlite | sqlite3 |
+|---|---:|---:|---:|
+| string INSERT | 183 k / 195 k | 328 k / 323 k | 799 k / 797 k |
+| prepare+bind INSERT | 524 k / 520 k | N/A | 1.447 M / 1.436 M |
+| string SELECT | 270 k / 268 k | 423 k / 426 k | 913 k / 909 k |
+| prepare+bind SELECT | 1.851 M / 1.781 M | N/A | 3.738 M / 3.726 M |
+| **PreparedSelect** | **2.375 M / 2.289 M** | N/A | = bind |
+| batch-100 INSERT rows/s | **1.545 M / 1.569 M** | 352 k / 344 k | 1.227 M / 1.233 M |
+
+vs §5.4 (`7fb0d53`, same harness): mpedb PreparedSelect eased ~5–8 % (1.78→1.65/1.81 M Linux, 2.55→2.38/2.29 M M3) and prepare+bind INSERT ~4–8 % (M3 564→524/520 k) — consistent with `cc77c88`'s TLS-cache `conn_id` identity check (a deliberate containment fix on the hot path). Ratios to sqlite3 are unchanged in shape: PreparedSelect ~0.6–0.7×, autocommit INSERT ~0.4×, batch-100 **wins on both hosts** (Linux 951/941 k vs 656/655 k; M3 1.55/1.57 M vs 1.23 M). sqlite3's own prepare+bind INSERT also measured lower than §5.4 on Linux (959/937 k vs 1.157 M — same binary pin; box-day variance cuts both ways).
+
+**Caveat:** the mpedb INSERT-side cells ride the private in-place write path — the same code carrying the §10.1 fixpoint bug (sequential-insert workloads don't trip it). Re-measure after the fix; the fix may cost part of the 274 k→470 k autocommit gain.
+
+### 10.5 Artifacts (this round)
+
+Linux `~/mpedb-measure-results/`: `sqlite-corpus-linux-e9-r{1,2}.log`, `minisqlite-corpus-linux-e9-r{1,2}.log`, `mpedb-corpus-linux-e9-r{1,2}.log` (invalid, kept as the regression record), `mpedb-corpus-linux-e9-noinplace-r{1,2}.log`, `imem-bench-linux-e9acc83-r{1,2}.log`.
+M3 `~/mpedb-measure-results/`: same names with `m3`; plus `flist-621-m3` / `m3ck_*` (chunk split, byte-order-identical to the Linux lists).
+Repro/probe: worktree `e9acc83` + one-line `try_begin_exclusive_write` disable (not committed anywhere; reproduce with the §10.1 repro line).
