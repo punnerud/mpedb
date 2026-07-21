@@ -92,8 +92,9 @@ aggregate, registered through the libsqlite3 C-API shim — CPython's own
 `sqlite3` module loads it via `LD_PRELOAD`), secondary/composite indexes
 (including partial `CREATE INDEX … WHERE`, stored P1), and live multi-process
 DDL — verified against sqlite's own 7.4M-record test corpus with **zero wrong
-answers**. CPython's `test_sqlite3` under the shim is **97.9% of stock-passing
-on M3** (457/467); remaining failures are documented deliberate refusals
+answers**. CPython's `test_sqlite3` under the shim is **98.1% of stock-passing
+on M3** (458/467); Django frozen A and `queries` are **831/831** and **493/493**.
+Remaining CPython failures are documented deliberate refusals
 ([`C-API-COMPAT.md`](C-API-COMPAT.md)). Django measured labels stay high-90s with
 zero wrong answers. What is still missing is short — attached-database *writes*
 (`ATTACH` + cross-file SELECT work), loadable extensions (non-goal), and a few
