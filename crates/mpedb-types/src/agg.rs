@@ -139,6 +139,17 @@ impl Accum {
         }
     }
 
+    /// Fold `k` rows into a `COUNT(*)` accumulation at once — exactly `k`
+    /// argument-less [`push`](Accum::push)es, which is how the executor's
+    /// key-counting fast path injects a count it obtained without
+    /// materializing the rows. Meaningful only for a bare, non-DISTINCT
+    /// `count(*)`; the caller guards that shape, and the debug assert keeps
+    /// it honest.
+    pub fn add_rows(&mut self, k: u64) {
+        debug_assert!(matches!(self.func, AggFn::Count) && self.seen.is_none());
+        self.n += k;
+    }
+
     /// Feed one row's value. `None` means `COUNT(*)` — there is no argument, so
     /// the row itself is the input and NULL cannot arise.
     pub fn push(&mut self, v: Option<&Value>) -> Result<()> {

@@ -322,6 +322,48 @@ pub(crate) trait TxnCtx {
     fn scans_incrementally(&self) -> bool {
         false
     }
+    /// One batch of a resumable, DECODE-PRUNED scan — the scan-level half of
+    /// #125: up to `cap` KEPT rows, each decoded only at the `keep`-true
+    /// ordinals and truncated to `keep.len()` slots (holes read as NULL, the
+    /// exact shape `gather::narrow_row` produces), plus the raw storage key
+    /// of the last kept row when the cap was reached — the next batch's
+    /// resume bound, obtained without re-encoding a PK.
+    ///
+    /// **`keep` must cover every column `filter` reads**: unlike
+    /// [`scan_rows_capped`](Self::scan_rows_capped), the residual runs over
+    /// the pruned row here. [`gather::scan_keep`] builds exactly that mask.
+    ///
+    /// Meaningful only where [`scans_incrementally`](Self::scans_incrementally)
+    /// answers true — [`gather::BatchScan`], the sole caller, never opens
+    /// elsewhere — so the default is a refusal, not a fallback.
+    fn scan_rows_pruned(
+        &mut self,
+        table: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+        filter: Option<(&ExprProgram, &[Value])>,
+        cap: usize,
+        keep: Option<&[bool]>,
+    ) -> Result<PrunedBatch> {
+        let _ = (table, lo, hi, filter, cap, keep);
+        Err(internal("decode-pruned scan on a non-incremental context"))
+    }
+    /// `count(*)` over a raw-bounded PK range without materializing a row, or
+    /// `Ok(None)` when this context has no such fast path and the caller must
+    /// fold the scan. The #74 work charges of the counting context must be
+    /// EXACTLY the drain-scan's — same total, same trip point, same label —
+    /// because the budget is a deterministic, test-pinned contract and this
+    /// is an optimization, not a discount ([`mpedb_core::WorkMeter`]'s
+    /// `charge_many` states the same rule from the meter's side).
+    fn count_rows_range(
+        &mut self,
+        table: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<Option<u64>> {
+        let _ = (table, lo, hi);
+        Ok(None)
+    }
 }
 
 impl TxnCtx for WriteTxn<'_> {
@@ -507,6 +549,11 @@ impl TxnCtx for WriteCtx<'_, '_> {
     }
 }
 
+/// One pruned batch ([`TxnCtx::scan_rows_pruned`]): the kept rows and, when
+/// the cap was reached, the raw storage key of the last kept row — the
+/// resume bound of the next batch.
+pub(crate) type PrunedBatch = (Vec<Vec<Value>>, Option<Vec<u8>>);
+
 /// Adapter over a pinned read snapshot.
 pub(crate) struct ReadCtx<'t, 'e>(
     pub &'t ReadTxn<'e>,
@@ -615,6 +662,46 @@ impl TxnCtx for ReadCtx<'_, '_> {
     // batched scan needs (see the trait default).
     fn scans_incrementally(&self) -> bool {
         true
+    }
+    fn scan_rows_pruned(
+        &mut self,
+        table: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+        filter: Option<(&ExprProgram, &[Value])>,
+        cap: usize,
+        keep: Option<&[bool]>,
+    ) -> Result<PrunedBatch> {
+        let host = self.1;
+        let mut cursor = self.0.scan_raw(table, lo, hi)?;
+        let mut kept = Vec::new();
+        let mut stack = Vec::new();
+        // The raw key of the row most recently yielded, written into a
+        // reused buffer — when the loop breaks at the cap this holds the last
+        // KEPT row's key, which is the batch's resume bound.
+        let mut key_buf = Vec::new();
+        while let Some(row) = cursor.next_masked(keep, Some(&mut key_buf))? {
+            let ok = match filter {
+                Some((f, params)) => f.eval_filter_host(&mut stack, &row, params, host)?,
+                None => true,
+            };
+            if ok {
+                kept.push(row);
+                if kept.len() >= cap {
+                    return Ok((kept, Some(std::mem::take(&mut key_buf))));
+                }
+            }
+        }
+        // Exhausted short of the cap: no resume needed, and none is claimed.
+        Ok((kept, None))
+    }
+    fn count_rows_range(
+        &mut self,
+        table: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<Option<u64>> {
+        self.0.count_range(table, lo, hi).map(Some)
     }
     fn scan_rows_topk(
         &mut self,
@@ -1802,9 +1889,10 @@ fn run_aggregate(
         .as_ref()
         .ok_or_else(|| internal("aggregate dispatch on a non-aggregate plan"))?;
     // #125: an aggregate is the shape whose output requirement is furthest from
-    // its input width — `count(*)` observes NO column at all. Only the
-    // MATERIALIZING paths inside `exec_aggregate` consult this; the streaming
-    // fold (#123) already holds only a batch.
+    // its input width — `count(*)` observes NO column at all. The
+    // materializing paths inside `exec_aggregate` narrow what they hold with
+    // this, and the streaming fold (#123) pushes it into the SCAN so an
+    // unobserved column is never even decoded (`gather::scan_keep`).
     let prune = select_prune(schema, plan, sp, correlated)?;
     exec_aggregate(
         ctx,

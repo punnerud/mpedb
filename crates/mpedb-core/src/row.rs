@@ -328,9 +328,104 @@ pub fn decode_column(buf: &[u8], types: &[ColumnType], col: usize) -> Result<Val
 
 /// Decode the whole row.
 pub fn decode_row(buf: &[u8], types: &[ColumnType]) -> Result<Vec<Value>> {
-    (0..types.len())
-        .map(|i| decode_column(buf, types, i))
-        .collect()
+    decode_row_masked(buf, types, None)
+}
+
+/// [`decode_row`] with decode-time column pruning — the scan-level half of
+/// #125's width analysis. `keep[i]` false yields `Value::Null` WITHOUT
+/// touching the column's bytes, and the row is truncated to `keep.len()`
+/// slots (so a `count(*)`'s all-false mask decodes an EMPTY row and the only
+/// work left is the walk itself). `None` keeps every column: byte-identical
+/// to the per-column path, differential-pinned by `roundtrip_mixed_row`.
+///
+/// One pass on purpose. The per-column [`decode_column`] recomputes its
+/// offset by summing `types[..col]` and the fixed-section end by summing ALL
+/// of `types` — O(ncols²) per row, measured at 170 of the 293 ns/row a
+/// `SELECT count(*)` fold cost (examples/agg_prof.rs). Here the offset is
+/// carried forward and the fixed end computed once.
+pub fn decode_row_masked(
+    buf: &[u8],
+    types: &[ColumnType],
+    keep: Option<&[bool]>,
+) -> Result<Vec<Value>> {
+    let err = || Error::Corrupt("truncated row".into());
+    let n_out = keep.map_or(types.len(), |k| k.len().min(types.len()));
+    let nbm = bitmap_len(types.len());
+    // Needed only by varlen columns, but O(ncols) once per row is noise —
+    // and a masked decode with no varlen column never reads past the head.
+    let fixed_end = nbm + types.iter().map(|&t| fixed_width(t)).sum::<usize>();
+    let mut out = Vec::with_capacity(n_out);
+    let mut off = nbm;
+    for (i, &ty) in types.iter().enumerate().take(n_out) {
+        let w = fixed_width(ty);
+        if keep.is_some_and(|k| !k[i]) {
+            out.push(Value::Null);
+            off += w;
+            continue;
+        }
+        let bm_byte = *buf.get(i / 8).ok_or_else(err)?;
+        if bm_byte & (1 << (i % 8)) != 0 {
+            out.push(Value::Null);
+            off += w;
+            continue;
+        }
+        // An `any` column's tag says what THIS value is — the same resolution
+        // `decode_column` performs, including the zeroed-slot refusal.
+        let (vty, voff) = if ty == ColumnType::Any {
+            let tag = *buf.get(off).ok_or_else(err)?;
+            let t = ColumnType::from_tag(tag)
+                .filter(|t| *t != ColumnType::Any)
+                .ok_or_else(|| {
+                    Error::Corrupt(format!("invalid `any` value tag {tag:#x} in row"))
+                })?;
+            (t, off + 1)
+        } else {
+            (ty, off)
+        };
+        out.push(match vty {
+            ColumnType::Any => {
+                return Err(Error::Internal("`any` tag resolved to `any`".into()))
+            }
+            ColumnType::Bool => match *buf.get(voff).ok_or_else(err)? {
+                0 => Value::Bool(false),
+                1 => Value::Bool(true),
+                _ => return Err(Error::Corrupt("invalid bool in row".into())),
+            },
+            ColumnType::Int64 | ColumnType::Timestamp => {
+                let raw = buf.get(voff..voff + 8).ok_or_else(err)?;
+                let x = i64::from_le_bytes(raw.try_into().unwrap());
+                if vty == ColumnType::Int64 {
+                    Value::Int(x)
+                } else {
+                    Value::Timestamp(x)
+                }
+            }
+            ColumnType::Float64 => {
+                let raw = buf.get(voff..voff + 8).ok_or_else(err)?;
+                Value::Float(f64::from_bits(u64::from_le_bytes(raw.try_into().unwrap())))
+            }
+            ColumnType::Text | ColumnType::Blob => {
+                let raw = buf.get(voff..voff + 8).ok_or_else(err)?;
+                let var_off = u32::from_le_bytes(raw[0..4].try_into().unwrap()) as usize;
+                let len = u32::from_le_bytes(raw[4..8].try_into().unwrap()) as usize;
+                let start = fixed_end.checked_add(var_off).ok_or_else(err)?;
+                let bytes = buf
+                    .get(start..start.checked_add(len).ok_or_else(err)?)
+                    .ok_or_else(err)?;
+                if vty == ColumnType::Text {
+                    Value::Text(
+                        std::str::from_utf8(bytes)
+                            .map_err(|_| Error::Corrupt("invalid utf-8 in row".into()))?
+                            .to_owned(),
+                    )
+                } else {
+                    Value::Blob(bytes.to_vec())
+                }
+            }
+        });
+        off += w;
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

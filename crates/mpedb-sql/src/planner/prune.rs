@@ -70,10 +70,11 @@
 //!
 //! And two that ARE in the set although no expression names them:
 //!
-//! - the **primary key of the outer table**, whenever the plan aggregates:
-//!   sqlite's bare-column witness picks a group's lowest-rowid row and reads
-//!   the PK off the base row to do it (`exec/aggregate.rs`, `Witness::MinRowid`),
-//!   with a silent `unwrap_or(Value::Null)`.
+//! - the **primary key of the outer table**, whenever the plan aggregates
+//!   WITH bare columns: sqlite's bare-column witness picks a group's
+//!   lowest-rowid row and reads the PK off the base row to do it
+//!   (`exec/aggregate.rs`, `Witness::MinRowid`), with a silent
+//!   `unwrap_or(Value::Null)`. No bare columns, no witness, no PK read.
 //! - each correlated subplan's `outer_args`, which name base-row slots filled
 //!   per row by `correlated_survivors`.
 
@@ -207,8 +208,9 @@ fn access_outer_cols(a: &AccessPath, keep: &mut [bool]) {
 /// - `widths[0]` is the outer table's column count and `widths[j + 1]` is
 ///   `joins[j]`'s table's — so `widths.len() == joins.len() + 1`.
 /// - `outer_pk` is the outer table's primary-key column indices — pinned
-///   whenever the plan aggregates, because sqlite's bare-column witness reads
-///   them off the base row without going through an expression.
+///   whenever the plan aggregates with BARE COLUMNS, because sqlite's
+///   bare-column witness reads them off the base row without going through
+///   an expression (and is built only when there are bare columns to carry).
 /// - `correlated_args` is the union of this level's correlated subplans'
 ///   `outer_args`: base-row slots the per-row correlation fill reads.
 ///
@@ -314,9 +316,14 @@ pub fn row_prune(
         }
         // The bare-column witness: with no min/max to govern it the executor
         // picks the group's lowest-rowid row, reading the PK straight off the
-        // base row. It is the one base-row read no expression names.
-        for &c in outer_pk {
-            set(&mut out, c);
+        // base row. It is the one base-row read no expression names — and it
+        // exists ONLY when there are bare columns to witness
+        // (`exec/aggregate.rs` builds no `Witness` otherwise), so a plain
+        // `count(*)`/`sum(a)` keeps a genuinely empty/one-column row.
+        if !agg.bare_cols.is_empty() {
+            for &c in outer_pk {
+                set(&mut out, c);
+            }
         }
     }
     // ORDER BY over the base/joined tuple — the only `order_over` whose indices

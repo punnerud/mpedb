@@ -201,6 +201,38 @@ impl WorkMeter {
         Ok(())
     }
 
+    /// Charge `n` work-rows AT ONCE — the leaf-wholesale form the `count(*)`
+    /// fast path uses — with the per-row loop's exact trip semantics: the
+    /// refusal fires at the same point and reports the same `used` (the first
+    /// charge past the budget, `budget + 1`) as `n` calls of [`charge`] with
+    /// `1` would have. The budget is a deterministic, test-pinned contract
+    /// (design/DESIGN-RUNTIME-BUDGET.md); batching the arithmetic must not
+    /// move it by a row.
+    #[inline]
+    pub fn charge_many(&self, n: u64, which: impl FnOnce() -> String) -> Result<()> {
+        if self.budget == 0 {
+            self.used.fetch_add(n, AtomicOrdering::Relaxed);
+            return Ok(());
+        }
+        let prev = self.used.load(AtomicOrdering::Relaxed);
+        let used = prev.saturating_add(n);
+        if used > self.budget {
+            // Land the counter where the per-row loop stops: its first charge
+            // past the budget. (`prev` can only exceed that if an unlimited
+            // meter was mixed in, which one execution never does.)
+            let stop = self.budget.saturating_add(1).max(prev);
+            self.used.store(stop, AtomicOrdering::Relaxed);
+            return Err(Error::RuntimeBudget {
+                kind: mpedb_types::BudgetKind::WorkRows,
+                limit: self.budget,
+                used: stop,
+                which: which(),
+            });
+        }
+        self.used.store(used, AtomicOrdering::Relaxed);
+        Ok(())
+    }
+
     /// Work-rows charged so far this execution.
     pub fn used(&self) -> u64 {
         self.used.load(AtomicOrdering::Relaxed)
