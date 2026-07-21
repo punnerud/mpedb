@@ -186,6 +186,10 @@ pub struct HostFn {
     /// to know which one it came from — getting this wrong would leave a stale
     /// registration behind under the same `(name, n_arg)`.
     pub aggregate: bool,
+    /// `SQLITE_DETERMINISTIC` was set on registration. Partial-index WHERE
+    /// clauses refuse non-deterministic host functions (sqlite 3.15+ rule;
+    /// CPython's `test_func_deterministic` / `test_func_non_deterministic`).
+    pub deterministic: bool,
     pub x_destroy: *mut c_void,
     pub p_app: *mut c_void,
     /// The callbacks themselves, kept alongside the teardown state so a

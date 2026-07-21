@@ -825,7 +825,7 @@ task.
 
 | # | prerequisite | blocks | today |
 |---|---|---|---|
-| **P1** | `IndexDef.predicate` field + canonical-bytes **v10** + `CREATE INDEX … WHERE` in the parser | all of §5 | `IndexDef` is `{columns, unique}`; a trailing `WHERE` is a parse error |
+| **P1** | `IndexDef.predicate` field + canonical-bytes **v10** + `CREATE INDEX … WHERE` in the parser | all of §5 | **SHIPPED (storage + parse):** predicate text on `IndexDef`, v10 wire, CREATE accepts `WHERE`; planner skips partials for access; UNIQUE partial refused until membership eval; non-deterministic UDF gate on C-API |
 | **P2** | an index **state bit** (`Building`/`Ready`) that the planner honours | any background build (§7); `access.rs:102` picks an index the instant it appears | no state field exists; the planner cannot be told to skip one |
 | **P3** | **`DROP INDEX`** | the "drop the unused" half of the advisor, and therefore auto-create (§7) | does not exist; `DROP INDEX x` errors *"expected `POLICY`"*. **Positional `index_no` is the landmine**: removing element *k* renumbers every later index and silently repoints every catalog key and every persisted `AccessPath::IndexPoint`. §2's `IndexId` is what makes a tombstoning DROP safe |
 | **P4** | a **chunked, resumable** index build | §7 | `create_index` materializes every entry in one in-memory `Vec` and holds the writer lock throughout (`write.rs:1362-1372`) |

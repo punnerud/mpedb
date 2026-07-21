@@ -1333,11 +1333,33 @@ impl<'e> WriteTxn<'e> {
     /// `key → pk`. A UNIQUE index whose build hits a duplicate aborts with a
     /// violation (nothing is published). One commit; the new tree's catalog
     /// root is persisted by the commit's table-root write-back.
-    pub fn create_index(&mut self, table_id: u32, columns: Vec<u16>, unique: bool) -> Result<()> {
+    pub fn create_index(
+        &mut self,
+        table_id: u32,
+        columns: Vec<u16>,
+        unique: bool,
+        predicate: Option<String>,
+    ) -> Result<()> {
         let bundle = Arc::clone(&self.bundle);
+        // A UNIQUE partial index needs membership evaluation on every write
+        // (otherwise rows outside the predicate would spuriously collide).
+        // Non-unique partials may build a full index and still answer correctly
+        // because the planner never picks a partial for access (P1 shipping).
+        if unique && predicate.is_some() {
+            return Err(Error::Unsupported(
+                "UNIQUE INDEX … WHERE is not supported yet — a partial unique \
+                 index needs membership evaluation on every write (P1 partial \
+                 build); use a non-unique partial or a whole-table UNIQUE"
+                    .into(),
+            ));
+        }
         let new_schema = bundle.schema.with_added_index(
             table_id,
-            mpedb_types::IndexDef { columns: columns.clone(), unique },
+            mpedb_types::IndexDef {
+                columns: columns.clone(),
+                unique,
+                predicate,
+            },
         )?;
         let (tname, new_ino, idx_coll) = {
             let table = bundle

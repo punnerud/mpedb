@@ -103,6 +103,13 @@ pub(super) fn extract_access(
             if pos >= 63 {
                 break;
             }
+            // Partial indexes (P1): membership is not yet proven from the
+            // query residual, so never pick one for access — FullScan stays
+            // correct. P6 (Guarded) is what makes parameterized partials
+            // usable; implication for literal predicates is the next step.
+            if ix.predicate.is_some() {
+                continue;
+            }
             let pins = cover(ix);
             if pins.is_empty() {
                 continue;
@@ -191,6 +198,9 @@ pub(super) fn extract_access(
     for (pos, ix) in table.indexes.iter().enumerate() {
         if pos >= 63 {
             break; // beyond the footprint bitmap — never chosen
+        }
+        if ix.predicate.is_some() {
+            continue; // partial: see IndexPoint loop above
         }
         // Phase-1 rule (same as PkRange): range over the FIRST index column
         // only — its encoding is a key prefix, so this serves composite

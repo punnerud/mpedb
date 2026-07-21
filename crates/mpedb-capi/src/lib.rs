@@ -331,10 +331,47 @@ fn rollback_txn(c: &mut Sqlite3) {
     }
 }
 
+/// sqlite 3.15+: a partial-index WHERE may not name a non-deterministic
+/// function. CPython's `test_func_non_deterministic` asserts the refusal;
+/// `test_func_deterministic` asserts the allow path.
+fn nondeterministic_in_partial_index(c: &Sqlite3, sql: &str) -> Option<String> {
+    let lower = sql.to_ascii_lowercase();
+    // Cheap shape gate: CREATE … INDEX … WHERE
+    if !(lower.contains("create") && lower.contains("index") && lower.contains("where")) {
+        return None;
+    }
+    // Host UDFs registered without SQLITE_DETERMINISTIC.
+    for h in &c.host_fns {
+        if h.aggregate || h.deterministic {
+            continue;
+        }
+        let needle = format!("{}(", h.name);
+        if lower.contains(&needle) {
+            return Some(format!(
+                "non-deterministic functions prohibited in index expressions: `{}`",
+                h.name
+            ));
+        }
+    }
+    // Built-ins sqlite also refuses in index expressions.
+    for name in ["random", "randomblob"] {
+        let needle = format!("{name}(");
+        if lower.contains(&needle) {
+            return Some(format!(
+                "non-deterministic functions prohibited in index expressions: `{name}`"
+            ));
+        }
+    }
+    None
+}
+
 /// Run one statement against the connection, honoring the current transaction
 /// state. Transaction-control statements are intercepted; everything else is
 /// routed to the open `WriteSession` (if any) or the autocommit facade.
 fn exec_one(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Outcome, DbError> {
+    if let Some(msg) = nondeterministic_in_partial_index(c, sqltext) {
+        return Err(DbError::Bind(msg));
+    }
     // `INSERT OR ROLLBACK` is the one conflict action a statement cannot carry
     // out on its own — it aborts the enclosing TRANSACTION, and the connection
     // is what owns that. mpedb's parser refuses it by name; the shim runs it as
@@ -1668,6 +1705,10 @@ unsafe fn prepare_common(
         // ROLLBACK by name.
         let (to_validate, _) = sql::rewrite_insert_or_rollback(to_validate);
         let (to_validate, _) = sql::rewrite_on_conflict_rollback(&to_validate);
+        if let Some(msg) = nondeterministic_in_partial_index(c, &to_validate) {
+            c.set_error(SQLITE_ERROR, SQLITE_ERROR, &msg);
+            return SQLITE_ERROR;
+        }
         match catch_unwind(AssertUnwindSafe(|| c.db.prepare_detached(&to_validate))) {
             Ok(Ok(_plan)) => {}
             Ok(Err(e)) => return c.set_db_error(&e),
@@ -2782,6 +2823,7 @@ unsafe fn create_function_impl(
     db: *mut Sqlite3,
     name: *const c_char,
     n_arg: c_int,
+    e_text_rep: c_int,
     app: *mut c_void,
     x_func: *mut c_void,
     x_step: *mut c_void,
@@ -2876,6 +2918,7 @@ unsafe fn create_function_impl(
         name: fname,
         n_arg,
         aggregate: is_agg,
+        deterministic: (e_text_rep & SQLITE_DETERMINISTIC) != 0,
         x_destroy,
         p_app: app,
         x_func,
@@ -2892,13 +2935,23 @@ pub unsafe extern "C" fn sqlite3_create_function(
     db: *mut Sqlite3,
     name: *const c_char,
     n_arg: c_int,
-    _enc: c_int,
+    enc: c_int,
     app: *mut c_void,
     x_func: *mut c_void,
     x_step: *mut c_void,
     x_final: *mut c_void,
 ) -> c_int {
-    create_function_impl(db, name, n_arg, app, x_func, x_step, x_final, ptr::null_mut())
+    create_function_impl(
+        db,
+        name,
+        n_arg,
+        enc,
+        app,
+        x_func,
+        x_step,
+        x_final,
+        ptr::null_mut(),
+    )
 }
 
 #[no_mangle]
@@ -2906,14 +2959,14 @@ pub unsafe extern "C" fn sqlite3_create_function_v2(
     db: *mut Sqlite3,
     name: *const c_char,
     n_arg: c_int,
-    _enc: c_int,
+    enc: c_int,
     app: *mut c_void,
     x_func: *mut c_void,
     x_step: *mut c_void,
     x_final: *mut c_void,
     x_destroy: *mut c_void,
 ) -> c_int {
-    create_function_impl(db, name, n_arg, app, x_func, x_step, x_final, x_destroy)
+    create_function_impl(db, name, n_arg, enc, app, x_func, x_step, x_final, x_destroy)
 }
 
 /// `sqlite3_create_window_function(db, name, nArg, enc, pApp, xStep, xFinal,
@@ -3025,6 +3078,7 @@ pub unsafe extern "C" fn sqlite3_create_window_function(
         name: fname,
         n_arg,
         aggregate: true,
+        deterministic: false,
         x_destroy,
         p_app: app,
         x_func: ptr::null_mut(),

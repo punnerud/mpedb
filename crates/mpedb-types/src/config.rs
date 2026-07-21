@@ -543,7 +543,7 @@ fn raw_to_config(
                                 })
                         })
                         .collect::<Result<Vec<u16>>>()?;
-                    Ok(crate::schema::IndexDef { columns: cols, unique: ix.unique })
+                    Ok(crate::schema::IndexDef { columns: cols, unique: ix.unique, predicate: None })
                 })
                 .collect::<Result<Vec<_>>>()?;
             tables.push(TableDef {

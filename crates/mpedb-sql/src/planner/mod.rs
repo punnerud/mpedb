@@ -309,7 +309,7 @@ pub(crate) fn conflict_probe_opt(table: &TableDef, target: &[u16]) -> Option<Con
     let mut want: Vec<u16> = target.to_vec();
     want.sort_unstable();
     let ino = table.indexes.iter().position(|ix| {
-        if !ix.unique || ix.columns.len() != want.len() {
+        if !ix.unique || ix.columns.len() != want.len() || ix.predicate.is_some() {
             return false;
         }
         let mut cols = ix.columns.clone();
