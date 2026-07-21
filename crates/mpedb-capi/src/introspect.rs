@@ -91,9 +91,9 @@ fn create_ddl(t: &mpedb::TableDef) -> String {
 
 // ------------------------------------------- verbatim CREATE TABLE text (#118)
 
-/// System-record namespace holding the shim's verbatim `CREATE TABLE` text,
-/// keyed by the table's exact name. Written by `lib::record_table_ddl` when a
-/// `CREATE TABLE` succeeds; read back below.
+/// System-record namespace holding the shim's verbatim `CREATE …` text,
+/// keyed by the object's exact name. Written by `lib::record_object_ddl` when a
+/// `CREATE TABLE`/`VIEW`/`TRIGGER` succeeds; read back below.
 ///
 /// **Why store it at all.** sqlite's `sqlite_master.sql` is the caller's own
 /// statement, byte for byte, and consumers diff against it: CPython's
@@ -146,12 +146,6 @@ fn master_sql(t: &mpedb::TableDef, rec: Option<&Vec<u8>>) -> String {
     }
 }
 
-/// The exact names of the tables `sqlite_master` will report — the keys
-/// `lib::sqlite_master_records` must look up before answering a query.
-pub(crate) fn master_table_names(schema: &mpedb::Schema) -> Vec<String> {
-    user_tables(schema).iter().map(|t| t.name.clone()).collect()
-}
-
 /// The name a table is STORED under, given any spelling of it. Records are
 /// keyed by the stored name so `sqlite_master` can look them up by the name it
 /// reports, whatever case the `CREATE` used.
@@ -167,7 +161,25 @@ pub(crate) fn table_by_exact_name<'a>(
     user_tables(schema).into_iter().find(|t| t.name == name)
 }
 
-/// The text sqlite would store in `sqlite_master.sql` for this `CREATE TABLE`.
+/// Which catalog object a DDL statement creates or drops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum DdlKind {
+    Table,
+    View,
+    Trigger,
+}
+
+impl DdlKind {
+    fn head(self) -> &'static str {
+        match self {
+            DdlKind::Table => "CREATE TABLE ",
+            DdlKind::View => "CREATE VIEW ",
+            DdlKind::Trigger => "CREATE TRIGGER ",
+        }
+    }
+}
+
+/// The text sqlite would store in `sqlite_master.sql` for a CREATE.
 ///
 /// **Not the raw bytes** — sqlite reconstructs the head and keeps only the
 /// tail. `sqlite3EndTable` builds `"CREATE %s %.*s"` from the *name token*
@@ -183,15 +195,16 @@ pub(crate) fn table_by_exact_name<'a>(
 /// | `CREATE TABLE main.t5(a)` | `CREATE TABLE t5(a)` — the qualifier is GONE |
 /// | `CREATE TABLE t9(a) -- c` | `CREATE TABLE t9(a)` — the tail ends at the last TOKEN |
 ///
-/// `name_at` is the byte offset of the name token within the
-/// trivia-stripped statement, as `table_ddl_target` reports it.
-pub(crate) fn ddl_verbatim(sql: &str, name_at: usize) -> String {
+/// The same rule applies to `VIEW` and `TRIGGER` (CPython `test_table_dump`
+/// asserts the caller's spelling of both). `name_at` is the byte offset of
+/// the name token within the trivia-stripped statement.
+pub(crate) fn ddl_verbatim(sql: &str, name_at: usize, kind: DdlKind) -> String {
     let s = crate::sql::strip_leading_trivia(sql);
     let end = stmt_text_end(s);
     if name_at >= end || !s.is_char_boundary(name_at) || !s.is_char_boundary(end) {
         return String::new();
     }
-    format!("CREATE TABLE {}", &s[name_at..end])
+    format!("{}{}", kind.head(), &s[name_at..end])
 }
 
 /// The byte offset just past the LAST token of `s` — where sqlite's stored
@@ -250,15 +263,13 @@ fn stmt_text_end(s: &str) -> usize {
     end
 }
 
-/// The table a `CREATE TABLE` / `DROP TABLE` statement names, if it is one:
-/// `(is_create, name, byte offset of the name token)`.
+/// The object a `CREATE`/`DROP` `TABLE`/`VIEW`/`TRIGGER` names, if it is one:
+/// `(kind, is_create, name, byte offset of the name token)`.
 ///
-/// Handles `CREATE [TEMP|TEMPORARY] TABLE [IF NOT EXISTS] [schema.]name` and
-/// `DROP TABLE [IF EXISTS] [schema.]name`, with the name in any of sqlite's
-/// quotings. Anything else (a view, an index, a trigger, a VIRTUAL table, an
-/// `ALTER`) → `None`, because only ordinary tables have a reconstruction to
-/// fingerprint the recorded text against.
-pub(crate) fn table_ddl_target(sql: &str) -> Option<(bool, String, usize)> {
+/// Handles `CREATE [TEMP|TEMPORARY] {TABLE|VIEW|TRIGGER} [IF NOT EXISTS]
+/// [schema.]name` and the matching `DROP … [IF EXISTS]`, with the name in any
+/// of sqlite's quotings. A `VIRTUAL TABLE`, index, or `ALTER` → `None`.
+pub(crate) fn schema_ddl_target(sql: &str) -> Option<(DdlKind, bool, String, usize)> {
     let mut w = DdlWords::new(crate::sql::strip_leading_trivia(sql));
     let create = match w.word()?.0.to_ascii_lowercase().as_str() {
         "create" => true,
@@ -269,9 +280,16 @@ pub(crate) fn table_ddl_target(sql: &str) -> Option<(bool, String, usize)> {
     if create && (kw == "temp" || kw == "temporary") {
         kw = w.word()?.0.to_ascii_lowercase();
     }
-    if kw != "table" {
+    // `CREATE VIRTUAL TABLE` is not an ordinary table (and has no reconstruction).
+    if create && kw == "virtual" {
         return None;
     }
+    let kind = match kw.as_str() {
+        "table" => DdlKind::Table,
+        "view" => DdlKind::View,
+        "trigger" => DdlKind::Trigger,
+        _ => return None,
+    };
     // `IF NOT EXISTS` / `IF EXISTS`.
     let (mut name, mut at) = w.word()?;
     if name.eq_ignore_ascii_case("if") {
@@ -290,7 +308,29 @@ pub(crate) fn table_ddl_target(sql: &str) -> Option<(bool, String, usize)> {
         let _ = w.word(); // the '.' itself
         (name, at) = w.word()?;
     }
-    Some((create, name, at))
+    Some((kind, create, name, at))
+}
+
+/// A view/trigger verbatim record: no shape fingerprint (there is no
+/// reconstruction that could stale the same way as `ALTER TABLE`). Value is
+/// `b"\0" ‖ verbatim` so it still round-trips through the table reader as
+/// "empty fingerprint → always use the text".
+pub(crate) fn object_ddl_record(verbatim: &str) -> Vec<u8> {
+    let mut v = Vec::with_capacity(1 + verbatim.len());
+    v.push(0);
+    v.extend_from_slice(verbatim.as_bytes());
+    v
+}
+
+/// The `sql` text from a view/trigger verbatim record, if present.
+pub(crate) fn object_ddl_text(rec: Option<&Vec<u8>>) -> Option<String> {
+    let rec = rec?;
+    let cut = rec.iter().position(|&b| b == 0)?;
+    // Empty fingerprint (views/triggers) or a matching one: use the tail.
+    match std::str::from_utf8(&rec[cut + 1..]) {
+        Ok(s) if !s.is_empty() => Some(s.to_string()),
+        _ => None,
+    }
 }
 
 /// A minimal word/identifier reader over the head of a DDL statement. Only ever
@@ -664,7 +704,11 @@ pub fn sqlite_master(
         })
         .collect();
     for (name, select_sql) in views {
-        let create = format!("CREATE VIEW \"{name}\" AS {select_sql}");
+        // Prefer the caller's own CREATE VIEW text when the shim recorded it
+        // (CPython `test_table_dump` asserts spelling); fall back to a
+        // reconstruction from the stored select body.
+        let create = object_ddl_text(verbatim.get(name))
+            .unwrap_or_else(|| format!("CREATE VIEW \"{name}\" AS {select_sql}"));
         rows.push(MasterRow {
             ty: "view",
             name: name.clone(),
@@ -673,11 +717,12 @@ pub fn sqlite_master(
         });
     }
     for (name, tbl, create_sql) in triggers {
+        let sql = object_ddl_text(verbatim.get(name)).unwrap_or_else(|| create_sql.clone());
         rows.push(MasterRow {
             ty: "trigger",
             name: name.clone(),
             tbl_name: tbl.clone(),
-            sql: create_sql.clone(),
+            sql,
         });
     }
 

@@ -499,13 +499,29 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
         // to plan against — it refuses by name instead of answering the wrong
         // shape.
         Kind::Read if !eqp && introspect::references_sqlite_master(sqltext) => {
-            let bundle = c.db.schema();
+            // Prefer the open txn's schema so uncommitted CREATE TABLE/VIEW/
+            // TRIGGER from this session appear in iterdump mid-transaction.
+            // Outside a txn, refresh first: a just-committed CREATE bumps
+            // schema_gen, and `Database::schema()` alone does not reload.
+            let bundle = match c.txn.as_ref() {
+                Some(s) => s.schema(),
+                None => {
+                    let _ = c.db.refresh_schema_if_stale();
+                    c.db.schema()
+                }
+            };
             let verbatim = sqlite_master_records(c, &bundle);
-            let views = c.db.list_views().unwrap_or_default();
-            // list_views returns (name, select_src); map to select sources only
-            // for the catalog, and rebuild CREATE VIEW in sqlite_master.
-            let views: Vec<(String, String)> = views;
-            let triggers = c.db.list_triggers().unwrap_or_default();
+            // Prefer txn-visible catalog (uncommitted CREATE VIEW/TRIGGER).
+            let (views, triggers) = match c.txn.as_mut() {
+                Some(s) => (
+                    s.list_views().unwrap_or_default(),
+                    s.list_triggers().unwrap_or_default(),
+                ),
+                None => (
+                    c.db.list_views().unwrap_or_default(),
+                    c.db.list_triggers().unwrap_or_default(),
+                ),
+            };
             let (columns, rows) =
                 introspect::sqlite_master(&bundle, sqltext, &verbatim, &views, &triggers)?;
             Ok(Outcome::Rows { columns, rows })
@@ -548,21 +564,18 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
         // DML, so a `CREATE TABLE` after an `INSERT` (and every `executescript`)
         // lands here with `c.txn` set.
         _ => {
-            // A `CREATE`/`DROP TABLE`'s own text, to be filed under the table's
-            // name once it succeeds (`sqlite_master.sql`). Resolved BEFORE
-            // execution because a DROP's target is gone afterwards.
-            let ddl_target = introspect::table_ddl_target(sqltext).map(|(create, name, at)| {
-                let exact = introspect::exact_table_name(&c.db.schema(), &name);
-                (create, exact.unwrap_or(name), at)
-            });
+            // A `CREATE`/`DROP` TABLE/VIEW/TRIGGER's own text, filed under the
+            // object's name once it succeeds (`sqlite_master.sql`). Resolved
+            // BEFORE execution because a DROP's target is gone afterwards.
+            let ddl_target = introspect::schema_ddl_target(sqltext);
             let res = if let Some(s) = c.txn.as_mut() {
                 s.query(sqltext, params)
             } else {
                 c.db.query(sqltext, params)
             };
             if res.is_ok() {
-                if let Some((create, name, at)) = ddl_target {
-                    record_table_ddl(c, sqltext, create, &name, at);
+                if let Some((kind, create, name, at)) = ddl_target {
+                    record_object_ddl(c, sqltext, kind, create, &name, at);
                 }
             }
             // Drain the rowid the engine recorded for this statement (facade
@@ -581,34 +594,38 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
     }
 }
 
-/// The verbatim-DDL records (`introspect::ddl_record`) for every table
-/// `sqlite_master` is about to report, keyed by table name.
+/// The verbatim-DDL records for every catalog object `sqlite_master` may
+/// report (tables, views, triggers), keyed by object name.
 ///
 /// Read through the OPEN transaction when there is one, so records written in
 /// it are visible to it; through the facade otherwise. A missing or unreadable
 /// record is simply absent — `sqlite_master` then falls back to reconstructing
-/// the `CREATE TABLE`, which is what it did before any of this existed.
+/// the `CREATE …` text, which is what it did before any of this existed.
 ///
-/// ONE scan, not one lookup per table: a consumer with hundreds of tables
+/// ONE scan, not one lookup per object: a consumer with hundreds of tables
 /// (Django's suite has them) queries `sqlite_master` repeatedly, and a read
-/// transaction per table per query is quadratic for no reason. `0xff` bounds
-/// the scan above every key: keys are table names, and no valid UTF-8 byte
+/// transaction per object per query is quadratic for no reason. `0xff` bounds
+/// the scan above every key: keys are object names, and no valid UTF-8 byte
 /// sequence starts with `0xff`.
-fn sqlite_master_records(c: &mut Sqlite3, schema: &mpedb::Schema) -> HashMap<String, Vec<u8>> {
+fn sqlite_master_records(c: &mut Sqlite3, _schema: &mpedb::Schema) -> HashMap<String, Vec<u8>> {
     let ns = introspect::DDL_NS;
     let all = match c.txn.as_mut() {
         Some(s) => s.sys_record_scan_range(ns, &[], &[0xff]).unwrap_or_default(),
         None => c.db.sys_record_scan(ns).unwrap_or_default(),
     };
-    let wanted: std::collections::HashSet<String> =
-        introspect::master_table_names(schema).into_iter().collect();
+    // Keep every non-empty record. Stale keys (dropped objects) are harmless:
+    // only names that still appear in the live catalog are consulted.
     all.into_iter()
-        .filter_map(|(k, v)| String::from_utf8(k).ok().map(|k| (k, v)))
-        .filter(|(k, _)| wanted.contains(k))
+        .filter_map(|(k, v)| {
+            if v.is_empty() {
+                return None;
+            }
+            String::from_utf8(k).ok().map(|k| (k, v))
+        })
         .collect()
 }
 
-/// File (or forget) a table's own `CREATE TABLE` text after the statement
+/// File (or forget) a catalog object's own `CREATE …` text after the statement
 /// succeeded, so `sqlite_master.sql` can hand back what the caller wrote.
 ///
 /// Best-effort by design: the record is a *fidelity* improvement, never a
@@ -616,34 +633,53 @@ fn sqlite_master_records(c: &mut Sqlite3, schema: &mpedb::Schema) -> HashMap<Str
 /// remains the answer. Writes ride the open transaction when there is one, so
 /// the text commits and rolls back atomically with the DDL itself.
 ///
-/// **Only autocommit `CREATE TABLE`s are recorded.** Fingerprinting the shape
-/// needs the table the statement just made, and the facade exposes no
-/// session-scoped schema view (`Database::schema()` is the committed one), so
-/// inside an open transaction there is nothing to resolve against — and
-/// pairing a live table's fingerprint with a text that might have been rolled
-/// back to a savepoint is exactly the "almost right `CREATE TABLE`" that
-/// replays as a different table. Those tables keep the reconstruction.
-/// Closing this needs `WriteSession::schema()` from the engine.
-fn record_table_ddl(c: &mut Sqlite3, sqltext: &str, create: bool, name: &str, name_at: usize) {
+/// Tables are fingerprinted against the live schema (including uncommitted
+/// DDL via [`WriteSession::schema`]) so an `ALTER` that changes the shape
+/// falls back to reconstruction. Views and triggers have no equivalent
+/// fingerprint; their text is stored as-is until DROP.
+fn record_object_ddl(
+    c: &mut Sqlite3,
+    sqltext: &str,
+    kind: introspect::DdlKind,
+    create: bool,
+    name: &str,
+    name_at: usize,
+) {
     if c.readonly {
         return;
     }
     let value = if create {
-        // Re-resolve against the schema the statement just produced: the table
-        // may have been named with different case/quoting than it is stored
-        // under, and `ddl_record` fingerprints the shape as created.
-        let schema = c.db.schema();
-        let Some(exact) = introspect::exact_table_name(&schema, name) else {
-            return;
-        };
-        let Some(t) = introspect::table_by_exact_name(&schema, &exact) else {
-            return;
-        };
-        let verbatim = introspect::ddl_verbatim(sqltext, name_at);
+        let verbatim = introspect::ddl_verbatim(sqltext, name_at, kind);
         if verbatim.is_empty() {
             return;
         }
-        Some((exact, introspect::ddl_record(t, &verbatim)))
+        match kind {
+            introspect::DdlKind::Table => {
+                // Re-resolve against the schema the statement just produced —
+                // the open WriteSession's bundle when in a txn, else the
+                // committed facade schema. Fingerprint + verbatim ride the
+                // same txn.
+                let schema = match c.txn.as_ref() {
+                    Some(s) => s.schema(),
+                    None => c.db.schema(),
+                };
+                let Some(exact) = introspect::exact_table_name(&schema, name) else {
+                    return;
+                };
+                let Some(t) = introspect::table_by_exact_name(&schema, &exact) else {
+                    return;
+                };
+                Some((exact, introspect::ddl_record(t, &verbatim)))
+            }
+            introspect::DdlKind::View | introspect::DdlKind::Trigger => {
+                // Name as written (unquoted). Catalog resolution is case-
+                // insensitive on the way in; sqlite_master reports the stored
+                // name from list_views/list_triggers, so also store under the
+                // live name when we can resolve it.
+                let exact = resolve_object_name(c, kind, name).unwrap_or_else(|| name.to_string());
+                Some((exact, introspect::object_ddl_record(&verbatim)))
+            }
+        }
     } else {
         None
     };
@@ -659,11 +695,49 @@ fn record_table_ddl(c: &mut Sqlite3, sqltext: &str, create: bool, name: &str, na
         // autocommit writes an EMPTY record instead — a tombstone, since
         // `master_sql` only trusts a record that carries a fingerprint.
         None => {
-            let (ns, key) = introspect::ddl_key(name);
+            let exact = resolve_object_name(c, kind, name).unwrap_or_else(|| name.to_string());
+            let (ns, key) = introspect::ddl_key(&exact);
             let _ = match c.txn.as_mut() {
                 Some(s) => s.sys_record_delete(ns, &key).map(|_| ()),
                 None => c.db.sys_record_put(ns, &key, &[]),
             };
+        }
+    }
+}
+
+/// Resolve a view/trigger name to the catalog's stored spelling (case fold).
+fn resolve_object_name(
+    c: &mut Sqlite3,
+    kind: introspect::DdlKind,
+    name: &str,
+) -> Option<String> {
+    match kind {
+        introspect::DdlKind::Table => {
+            let schema = match c.txn.as_ref() {
+                Some(s) => s.schema(),
+                None => c.db.schema(),
+            };
+            introspect::exact_table_name(&schema, name)
+        }
+        introspect::DdlKind::View => {
+            let views = match c.txn.as_mut() {
+                Some(s) => s.list_views().unwrap_or_default(),
+                None => c.db.list_views().unwrap_or_default(),
+            };
+            views
+                .into_iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(name))
+                .map(|(n, _)| n)
+        }
+        introspect::DdlKind::Trigger => {
+            let triggers = match c.txn.as_mut() {
+                Some(s) => s.list_triggers().unwrap_or_default(),
+                None => c.db.list_triggers().unwrap_or_default(),
+            };
+            triggers
+                .into_iter()
+                .find(|(n, _, _)| n.eq_ignore_ascii_case(name))
+                .map(|(n, _, _)| n)
         }
     }
 }
@@ -1085,8 +1159,10 @@ fn ephemeral_path() -> PathBuf {
 fn seed_toml(path: &std::path::Path, size_mb: u64) -> String {
     // Escape for a TOML basic string.
     let p = path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    // Modest max_readers keeps the reader-table pages (and thus high_water for
+    // a nearly empty :memory: DB) small — backup progress paces over that.
     format!(
-        "[database]\npath = \"{p}\"\nsize_mb = {size_mb}\nmax_readers = 1024\n\n\
+        "[database]\npath = \"{p}\"\nsize_mb = {size_mb}\nmax_readers = 32\n\n\
          [[table]]\nname = \"{SEED_TABLE}\"\nprimary_key = [\"id\"]\n\n  \
          [[table.column]]\n  name = \"id\"\n  type = \"int64\"\n"
     )
@@ -1202,8 +1278,12 @@ fn open_impl(raw_name: Option<&[u8]>, flags: c_int) -> Result<Box<Sqlite3>, (c_i
     // NEW file; an existing one keeps the geometry it was created with.
     let req = requested_size_mb(filename);
     let (path, kind, size_mb) = match target {
-        Target::Ephemeral => (ephemeral_path(), Backing::Ephemeral, req.unwrap_or(16)),
-        Target::NamedMemory(p) => (p, Backing::NamedMemory, req.unwrap_or(16)),
+        // Ephemeral / named-memory: small default (1 MiB, not 16). CPython's
+        // backup progress test uses pages=1 and expects a tiny step count; a
+        // 16 MiB fallocate made 4096 progress callbacks. Callers that need
+        // more set `file:…?size_mb=N`.
+        Target::Ephemeral => (ephemeral_path(), Backing::Ephemeral, req.unwrap_or(1)),
+        Target::NamedMemory(p) => (p, Backing::NamedMemory, req.unwrap_or(1)),
         Target::File(p) => (p, Backing::File, req.unwrap_or(64)),
     };
 
