@@ -193,14 +193,39 @@ pub(super) fn in_list_3vl(probe: &Value, list: &Value) -> Result<Value> {
             )))
         }
     };
-    in_items_3vl(probe, items)
+    // A BOUND list against a typed probe: a cross-class element is the caller's
+    // error, not "no rows". See [`CrossClass::Refuse`].
+    in_items_3vl(probe, items, CrossClass::Refuse)
+}
+
+/// What a cross-STORAGE-CLASS pair inside an IN list means. The 3VL rules above
+/// are identical for both — only the type discipline differs, and it differs
+/// because the two opcodes get their items from different worlds.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum CrossClass {
+    /// sqlite's rule: `=` compares STORAGE CLASSES, so a text probe never
+    /// equals an integer element and the answer is a clean FALSE. This is the
+    /// world [`Instr::InList`](super::Instr::InList) lives in — its items are
+    /// SQL expressions evaluated per row, exactly what `ClassCmp` governs for
+    /// binary comparison. Django's injection probe `name IN (num_chairs + 0)`
+    /// must answer "no rows", not "cannot compare".
+    NonMatch,
+    /// The caller's error. This is the world
+    /// [`Instr::InParam`](super::Instr::InParam) lives in: its items arrive as
+    /// a LIST BOUND TO A SLOT by the host (a session-context policy list), and
+    /// a text list probed against an int column is a bind mistake. Answering
+    /// FALSE there would be indistinguishable from "this tenant owns nothing",
+    /// which is why it must be an error — see the regression test
+    /// `in_list_type_mismatch_is_an_error_not_a_silent_deny`.
+    Refuse,
 }
 
 /// The 3VL core, over items from anywhere. Shared by [`Instr::InParam`] (items
 /// from a param-bound list) and [`Instr::InList`] (items from the stack) so the
 /// two forms cannot drift apart on the NULL rules above — which decide whether
-/// a policy admits a row.
-pub(super) fn in_items_3vl(probe: &Value, items: &[Value]) -> Result<Value> {
+/// a policy admits a row. They diverge on ONE axis only, spelled out in
+/// [`CrossClass`]: what a text-vs-integer pair means.
+pub(super) fn in_items_3vl(probe: &Value, items: &[Value], cross: CrossClass) -> Result<Value> {
     // `x IN ()` — membership in the EMPTY set — is FALSE for any `x`, NULL
     // included: nothing is a member of nothing (SQL 3VL). This MUST precede the
     // null-probe short-circuit below, or `NULL IN (<empty subquery>)` wrongly
@@ -219,20 +244,17 @@ pub(super) fn in_items_3vl(probe: &Value, items: &[Value]) -> Result<Value> {
             saw_null = true;
             continue;
         }
-        // Prefer sql_cmp (same-class / numeric). A cross-class pair is a
-        // non-match under sqlite's storage-class order (not a type error) —
-        // `name IN (num_chairs + 0)` is FALSE for a text name, never a refusal.
+        // sql_cmp decides same-class and int/float pairs. It REFUSES a
+        // cross-class pair; what that refusal means is the caller's call.
         match probe.sql_cmp(it) {
             Ok(Some(std::cmp::Ordering::Equal)) => return Ok(Value::Bool(true)),
             Ok(_) => continue,
-            Err(_) => {
-                // Cross-class: only Equal if sort_cmp says so (it almost never
-                // will for different ranks).
-                match probe.sort_cmp(it, Collation::Binary) {
-                    Some(std::cmp::Ordering::Equal) => return Ok(Value::Bool(true)),
-                    _ => continue,
-                }
-            }
+            Err(e) => match cross {
+                // Different storage classes never compare Equal under sqlite's
+                // class order, so this is a non-match — no `sort_cmp` needed.
+                CrossClass::NonMatch => continue,
+                CrossClass::Refuse => return Err(e),
+            },
         }
     }
     Ok(if saw_null { Value::Null } else { Value::Bool(false) })
@@ -241,6 +263,10 @@ pub(super) fn in_items_3vl(probe: &Value, items: &[Value]) -> Result<Value> {
 /// The 3VL core for `x COLLATE <coll> IN (…)` — identical to [`in_items_3vl`]
 /// except text membership is decided under an explicit collation. Every NULL /
 /// empty-set rule above is preserved verbatim; only the equality test changes.
+///
+/// Its only caller is [`Instr::InListColl`](super::Instr::InListColl) — a
+/// `COLLATE` can only be written on a literal IN list — so it is fixed at
+/// [`CrossClass::NonMatch`]; there is no collated `InParam` form.
 pub(super) fn in_items_3vl_collated(
     probe: &Value,
     items: &[Value],
@@ -261,10 +287,8 @@ pub(super) fn in_items_3vl_collated(
         match probe.sql_cmp_collated(it, coll) {
             Ok(Some(std::cmp::Ordering::Equal)) => return Ok(Value::Bool(true)),
             Ok(_) => continue,
-            Err(_) => match probe.sort_cmp(it, coll) {
-                Some(std::cmp::Ordering::Equal) => return Ok(Value::Bool(true)),
-                _ => continue,
-            },
+            // Cross-class under sqlite's class order: never Equal, so non-match.
+            Err(_) => continue,
         }
     }
     Ok(if saw_null { Value::Null } else { Value::Bool(false) })

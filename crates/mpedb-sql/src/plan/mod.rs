@@ -705,9 +705,15 @@ impl SubBody {
     /// The caller-visible output arity of this body — a scalar/IN subplan must
     /// output exactly one column. A `Select`'s ORDER BY junk is not output; a
     /// compound's arms carry no junk (its `arms[0]` names the output).
+    /// `saturating_sub`, not `-`: this runs on a plan that is still being
+    /// VALIDATED. `validate_select` rejects `order_junk >= projection.len()`,
+    /// but the compound checks call this first, so a bit-flipped plan reaches
+    /// here with junk > projection — a debug panic and a wrapped-around
+    /// arity in release. Saturating to 0 keeps it a value; validate then
+    /// rejects the plan for the reason it is actually corrupt.
     pub fn output_arity(&self) -> usize {
         match self {
-            SubBody::Select(sp) => sp.projection.len() - sp.order_junk as usize,
+            SubBody::Select(sp) => sp.projection.len().saturating_sub(sp.order_junk as usize),
             SubBody::Compound(c) => c.arms.first().map_or(0, |a| a.output_arity()),
         }
     }
@@ -1226,9 +1232,12 @@ impl CompoundArm {
         }
     }
 
+    /// Saturating for the same reason as [`SubBody::output_arity`] — validate
+    /// calls this before `validate_select` has had a chance to reject the junk
+    /// count, so it must not panic on a forged plan.
     pub fn output_arity(&self) -> usize {
         let sp = self.output_select();
-        sp.projection.len() - sp.order_junk as usize
+        sp.projection.len().saturating_sub(sp.order_junk as usize)
     }
 
     pub fn as_select(&self) -> Option<&SelectPlan> {

@@ -231,11 +231,13 @@ fn write_sqlite_provenance(
     Ok(())
 }
 
+/// Multi-hop provenance as it comes off a SQLite sidecar: the origin kind plus
+/// one `TableMap` per table name, in file order.
+pub type SqliteProvenance = (SourceKind, Vec<(String, TableMap)>);
+
 /// Load multi-hop provenance from a SQLite file, if the sidecar is present.
 /// Returns `(SourceKind, table_name → TableMap)`.
-pub fn load_sqlite_provenance(
-    conn: &Connection,
-) -> Result<Option<(SourceKind, Vec<(String, TableMap)>)>> {
+pub fn load_sqlite_provenance(conn: &Connection) -> Result<Option<SqliteProvenance>> {
     let exists: bool = conn
         .query_row(
             "SELECT 1 FROM pragma_table_list WHERE name = ?1",

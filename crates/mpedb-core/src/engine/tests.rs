@@ -394,12 +394,15 @@ primary_key = ["id"]
 fn wal_cleanup(cfg: &Config) {
     let _ = std::fs::remove_file(&cfg.options.path);
     let _ = std::fs::remove_file(crate::shm::wal_path(&cfg.options.path));
-    // Drop the shared test dir once the last file is gone — remove_dir
-    // only succeeds on an empty directory, so concurrent tests keep it
-    // alive and only the final teardown actually removes it.
-    if let Some(dir) = cfg.options.path.parent() {
-        let _ = std::fs::remove_dir(dir);
-    }
+    // The shared test dir is deliberately NOT removed. "remove_dir only
+    // succeeds on an empty directory, so concurrent tests keep it alive" does
+    // not hold: a sibling wal test is momentarily between its own
+    // `create_dir_all` and the `Engine::open` that first creates its file, so
+    // the directory IS empty while that test still needs it — and this
+    // teardown then deletes the parent out from under it, surfacing as
+    // `Io(NotFound)` from `Engine::open`. It is a scratch directory holding
+    // nothing between runs; leaving the empty shell costs nothing and is the
+    // only race-free option that does not serialize the tests.
 }
 
 /// Regress the mapping to a plausible post-power-loss state: stale lock

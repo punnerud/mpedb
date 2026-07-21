@@ -1377,6 +1377,24 @@ fn plan_insert(
                         // literals). Evaluated over the dual row at insert time.
                         other => {
                             let program = compile_program(&other)?;
+                            // A HOST-registered UDF cannot be one of these
+                            // cells. A single-row `VALUES (…)` is planned as
+                            // `INSERT … SELECT`, whose executor carries the
+                            // connection's host table; a multi-row VALUES cell
+                            // is instead a dual-row program evaluated inside
+                            // `build_insert_row`, which has no host scope — so
+                            // it would compile here and only fail at execute
+                            // with "host function …() is not in scope". Refuse
+                            // it where the caller can still see why.
+                            if program.has_host_call() {
+                                return Err(bind_err(
+                                    "INSERT values must be literals or parameters, or an \
+                                     expression of built-in functions: a host-registered \
+                                     function is connection-local and cannot be evaluated \
+                                     in a multi-row VALUES cell — use INSERT … SELECT"
+                                        .to_string(),
+                                ));
+                            }
                             InsertSource::Expr(program)
                         }
                     }
