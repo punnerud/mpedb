@@ -89,19 +89,18 @@ function set (`json`, `json_extract`, `->`/`->>`, …), bitwise operators,
 `printf`/`quote`/`strftime`, sqlite's type affinity, truthiness and permissive
 `CAST`, rowid-alias `INTEGER PRIMARY KEY`, user-defined functions (scalar and
 aggregate, registered through the libsqlite3 C-API shim — CPython's own
-`sqlite3` module loads it via `LD_PRELOAD`), secondary/composite indexes the
-planner uses, and live multi-process DDL — verified against sqlite's own
-7.4M-record test corpus with **zero wrong answers**. Django's test suite runs
-against the shim: **97.6% of the measured labels pass, with zero wrong
-answers** — every remaining failure is a named refusal
-([`C-API-COMPAT.md`](C-API-COMPAT.md) tracks it run by run, alongside
-CPython's own `test_sqlite3`). What is still
-missing is short — attached-database *writes* (`ATTACH` + cross-file SELECT
-work; writing through a second handle covers the rest) and loadable extensions (a
-non-goal) — each a clean error today, never a wrong answer. And on one axis
-mpedb goes *past* sqlite: its own
-`.mpedb` WAL gives PostgreSQL-style **concurrent multi-process writes** (MVCC
-snapshots, lock-free readers) where sqlite serializes every writer. See
+`sqlite3` module loads it via `LD_PRELOAD`), secondary/composite indexes
+(including partial `CREATE INDEX … WHERE`, stored P1), and live multi-process
+DDL — verified against sqlite's own 7.4M-record test corpus with **zero wrong
+answers**. CPython's `test_sqlite3` under the shim is **97.9% of stock-passing
+on M3** (457/467); remaining failures are documented deliberate refusals
+([`C-API-COMPAT.md`](C-API-COMPAT.md)). Django measured labels stay high-90s with
+zero wrong answers. What is still missing is short — attached-database *writes*
+(`ATTACH` + cross-file SELECT work), loadable extensions (non-goal), and a few
+honesty refusals (AUTOINCREMENT, fts4 layout, serialize-as-sqlite-image) — each
+a clean error, never a wrong answer. And on one axis mpedb goes *past* sqlite:
+its own `.mpedb` WAL gives PostgreSQL-style **concurrent multi-process writes**
+(MVCC snapshots, lock-free readers) where sqlite serializes every writer. See
 [SQL support](#sql-support) for the exact surface, measured against the binary.
 
 This cuts both ways, and honestly so: hardening mpedb against real sqlite3
