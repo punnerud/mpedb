@@ -3279,3 +3279,9 @@ mid-txn `table_info` + trigger-before-view master order).
 | B `queries` | 493 | **493 / 493 (100 %)** (skipped=15, xfail=2) |
 
 **Wrong SQL answers: 0.**
+
+### Re-confirmed at goal HEAD (modularized capi tests, same residual set)
+
+Same M3 interposition after splitting `tests/capi.rs` → `capi_{basic,ext,more}.rs`
+(each <2000 lines). CPython **459/467**, residual ids unchanged (1 FAIL + 7 ERROR,
+all deliberate). Django A **831/831**, `queries` **493/493**.
