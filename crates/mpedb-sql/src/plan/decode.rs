@@ -504,39 +504,69 @@ fn decode_stmt(buf: &[u8], pos: &mut usize, budget: &mut usize) -> Result<PlanSt
                     corrupt(format!("bad derived-table column type tag {tag}"))
                 })?);
             }
-            // The body under the format-31 body-discriminant byte, then the
-            // outer statement (the mirror of the encoder).
-            let body = match r_u8(buf, pos)? {
-                SUBBODY_SELECT => SubBody::Select(decode_select(buf, pos)?),
-                SUBBODY_COMPOUND => SubBody::Compound(decode_compound(buf, pos, budget)?),
-                t => return Err(corrupt(format!("bad derived-table body tag {t}"))),
-            };
-            let outer = decode_select(buf, pos)?;
-            // The BODY's own lifts (format 52) — the mirror of the encoder,
-            // decoded under the SAME `MAX_SUBPLANS` tree budget the
-            // statement-level list gets, so a forged count cannot balloon the
-            // forest here either.
-            let body_sub_base = r_u16(buf, pos)?;
-            let n_body_sub = r_u8(buf, pos)? as usize;
-            if n_body_sub > MAX_SUBPLANS {
-                return Err(corrupt("too many derived-table body subplans"));
-            }
-            let mut body_subplans = Vec::with_capacity(n_body_sub.min(MAX_SUBPLANS));
-            for _ in 0..n_body_sub {
-                body_subplans.push(decode_subplan(buf, pos, budget)?);
-            }
-            Ok(PlanStmt::Derived(DerivedPlan {
-                name,
-                columns,
-                col_types,
-                body,
-                body_subplans,
-                body_sub_base,
-                outer,
-            }))
+            Ok(PlanStmt::Derived(decode_derived_plan_tail(
+                name, columns, col_types, buf, pos, budget,
+            )?))
         }
         other => decode_stmt_rest(other, buf, pos),
     }
+}
+
+/// Decode a [`DerivedPlan`] (format 58 compound arm, or the tail of STMT_DERIVED).
+fn decode_derived_plan(
+    buf: &[u8],
+    pos: &mut usize,
+    budget: &mut usize,
+) -> Result<DerivedPlan> {
+    let name = r_str(buf, pos)?;
+    let n_cols = r_u16(buf, pos)? as usize;
+    if n_cols == 0 || n_cols > crate::parser::MAX_SELECT_ITEMS {
+        return Err(corrupt("derived-table column count out of range"));
+    }
+    let mut columns = Vec::with_capacity(n_cols);
+    let mut col_types = Vec::with_capacity(n_cols);
+    for _ in 0..n_cols {
+        columns.push(r_str(buf, pos)?);
+        let tag = r_u8(buf, pos)?;
+        col_types.push(ColumnType::from_tag(tag).ok_or_else(|| {
+            corrupt(format!("bad derived-table column type tag {tag}"))
+        })?);
+    }
+    decode_derived_plan_tail(name, columns, col_types, buf, pos, budget)
+}
+
+fn decode_derived_plan_tail(
+    name: String,
+    columns: Vec<String>,
+    col_types: Vec<ColumnType>,
+    buf: &[u8],
+    pos: &mut usize,
+    budget: &mut usize,
+) -> Result<DerivedPlan> {
+    let body = match r_u8(buf, pos)? {
+        SUBBODY_SELECT => SubBody::Select(decode_select(buf, pos)?),
+        SUBBODY_COMPOUND => SubBody::Compound(decode_compound(buf, pos, budget)?),
+        t => return Err(corrupt(format!("bad derived-table body tag {t}"))),
+    };
+    let outer = decode_select(buf, pos)?;
+    let body_sub_base = r_u16(buf, pos)?;
+    let n_body_sub = r_u8(buf, pos)? as usize;
+    if n_body_sub > MAX_SUBPLANS {
+        return Err(corrupt("too many derived-table body subplans"));
+    }
+    let mut body_subplans = Vec::with_capacity(n_body_sub.min(MAX_SUBPLANS));
+    for _ in 0..n_body_sub {
+        body_subplans.push(decode_subplan(buf, pos, budget)?);
+    }
+    Ok(DerivedPlan {
+        name,
+        columns,
+        col_types,
+        body,
+        body_subplans,
+        body_sub_base,
+        outer,
+    })
 }
 
 /// A compound `SELECT … UNION/EXCEPT/INTERSECT …` body — the exact mirror of
@@ -554,7 +584,15 @@ fn decode_compound(buf: &[u8], pos: &mut usize, budget: &mut usize) -> Result<Co
     }
     let mut arms = Vec::with_capacity(n_arms);
     for _ in 0..n_arms {
-        arms.push(decode_select(buf, pos)?);
+        // Format 58: tag 0 = Select, tag 1 = Derived.
+        let tag = r_u8(buf, pos)?;
+        match tag {
+            0 => arms.push(crate::plan::CompoundArm::Select(decode_select(buf, pos)?)),
+            1 => arms.push(crate::plan::CompoundArm::Derived(decode_derived_plan(
+                buf, pos, budget,
+            )?)),
+            _ => return Err(corrupt(format!("bad compound arm tag {tag}"))),
+        }
     }
     let n_order = r_u16(buf, pos)? as usize;
     if n_order > crate::parser::MAX_ORDER_BY_ITEMS {

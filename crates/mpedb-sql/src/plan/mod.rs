@@ -461,7 +461,11 @@ const MAX_JOINS: usize = 16;
 //     subquery inside a compound arm), a lift inside a COMPOUND derived-table
 //     body, and — with the correlation scope of `plan_one_compound` — a
 //     compound SUBQUERY body whose arms reference the enclosing row.
-const PLAN_FORMAT: u8 = 57;
+// Format 58: a compound arm may be a materialised nested derived table
+// (`SELECT * FROM (non-flattenable body)` as an arm — Django
+// `A EXCEPT (B INTERSECT C)`). Each arm is tagged Select/Derived; Derived
+// reuses the DerivedPlan layout already on the wire for PlanStmt::Derived.
+const PLAN_FORMAT: u8 = 58;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -704,7 +708,7 @@ impl SubBody {
     pub fn output_arity(&self) -> usize {
         match self {
             SubBody::Select(sp) => sp.projection.len() - sp.order_junk as usize,
-            SubBody::Compound(c) => c.arms.first().map_or(0, |a| a.projection.len()),
+            SubBody::Compound(c) => c.arms.first().map_or(0, |a| a.output_arity()),
         }
     }
 
@@ -825,11 +829,11 @@ impl CompiledPlan {
                 PlanStmt::Derived(dp) => {
                     dp.body_subplans.len() as u16
                         + match &dp.body {
-                            SubBody::Compound(c) => c.n_arm_slots(),
+                            SubBody::Compound(c) => c.n_arm_slots() + c.n_derived_body_slots(),
                             SubBody::Select(_) => 0,
                         }
                 }
-                PlanStmt::Compound(c) => c.n_arm_slots(),
+                PlanStmt::Compound(c) => c.n_arm_slots() + c.n_derived_body_slots(),
                 _ => 0,
             }
     }
@@ -1201,6 +1205,40 @@ impl SetOp {
     }
 }
 
+/// One arm of a compound SELECT (PLAN_FORMAT 58). A plain [`SelectPlan`], or a
+/// materialised nested derived table when the arm is
+/// `SELECT … FROM (<non-flattenable body>)` — the shape sqlite/Django write for
+/// a parenthesized set-op nest that cannot be spliced left-associatively.
+#[derive(Debug, Clone, PartialEq)]
+#[allow(clippy::large_enum_variant)]
+pub enum CompoundArm {
+    Select(SelectPlan),
+    Derived(DerivedPlan),
+}
+
+impl CompoundArm {
+    /// The Select that produces this arm's output columns (the outer of a
+    /// Derived arm). Used for arity/ORDER BY validation and EXPLAIN.
+    pub fn output_select(&self) -> &SelectPlan {
+        match self {
+            CompoundArm::Select(sp) => sp,
+            CompoundArm::Derived(dp) => &dp.outer,
+        }
+    }
+
+    pub fn output_arity(&self) -> usize {
+        let sp = self.output_select();
+        sp.projection.len() - sp.order_junk as usize
+    }
+
+    pub fn as_select(&self) -> Option<&SelectPlan> {
+        match self {
+            CompoundArm::Select(sp) => Some(sp),
+            CompoundArm::Derived(_) => None,
+        }
+    }
+}
+
 /// A compound SELECT: `arm[0] op[0] arm[1] op[1] arm[2] …`, evaluated
 /// left-associatively, then the compound-level ORDER BY / LIMIT / OFFSET.
 ///
@@ -1213,7 +1251,7 @@ impl SetOp {
 ///   arm without parentheses (unsupported).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompoundPlan {
-    pub arms: Vec<SelectPlan>,
+    pub arms: Vec<CompoundArm>,
     pub ops: Vec<SetOp>,
     /// (output column index, descending, collation) over the compound OUTPUT
     /// tuple. Collation is `Native(Binary)` unless an explicit `COLLATE` was
@@ -1223,7 +1261,8 @@ pub struct CompoundPlan {
     pub offset: Option<u64>,
     /// Per-arm OWNED lifted subqueries (format 56). EMPTY when no arm lifts
     /// anything (every compound before format 56); otherwise EXACTLY one entry
-    /// per arm, in arm order.
+    /// per arm, in arm order. A [`CompoundArm::Derived`] arm owns its lifts
+    /// inside the [`DerivedPlan`] and contributes an empty list here.
     ///
     /// An arm's lift belongs to the ARM, not to the enclosing statement — the
     /// same ownership move a derived table's body made (§5.5). A compound has
@@ -1236,17 +1275,38 @@ pub struct CompoundPlan {
     /// `arm_base(k) = arm_sub_base + Σ_{j<k} arm_subplans[j].len()` — the
     /// layout `[level params ‖ arm0 lifts ‖ arm1 lifts ‖ …]`, which is what
     /// lets each arm number its `Param` references against the FINAL layout at
-    /// plan time with no post-hoc remap.
+    /// plan time with no post-hoc remap. Nested Derived arm body slots are
+    /// numbered into the same buffer via the DerivedPlan's own `body_sub_base`
+    /// (set to the arm's base at plan time).
     pub arm_sub_base: u16,
 }
 
 impl CompoundPlan {
-    /// Total reserved slots the arms' lifts occupy.
+    /// Total reserved slots the arms' Select-owned lifts occupy (format 56 lists).
     pub fn n_arm_slots(&self) -> u16 {
         self.arm_subplans.iter().map(|a| a.len() as u16).sum()
     }
 
-    /// First reserved slot of arm `k`'s own lifts.
+    /// Reserved slots owned by nested [`CompoundArm::Derived`] bodies (and any
+    /// compound arms nested inside those bodies). Not counted in
+    /// [`n_arm_slots`]; both contribute to the statement's reserved width.
+    pub fn n_derived_body_slots(&self) -> u16 {
+        self.arms
+            .iter()
+            .map(|a| match a {
+                CompoundArm::Select(_) => 0,
+                CompoundArm::Derived(dp) => {
+                    dp.body_subplans.len() as u16
+                        + match &dp.body {
+                            SubBody::Compound(c) => c.n_arm_slots() + c.n_derived_body_slots(),
+                            SubBody::Select(_) => 0,
+                        }
+                }
+            })
+            .sum()
+    }
+
+    /// First reserved slot of arm `k`'s own Select lifts.
     pub fn arm_base(&self, k: usize) -> u16 {
         self.arm_sub_base
             + self.arm_subplans[..k.min(self.arm_subplans.len())]
@@ -1255,7 +1315,8 @@ impl CompoundPlan {
                 .sum::<u16>()
     }
 
-    /// Arm `k`'s own lifts (empty when the compound lifts nothing).
+    /// Arm `k`'s own Select lifts (empty when the compound lifts nothing, or
+    /// when arm `k` is a Derived that owns its lifts internally).
     pub fn arm_lifts(&self, k: usize) -> &[SubPlan] {
         self.arm_subplans.get(k).map_or(&[], |v| v.as_slice())
     }
@@ -1943,7 +2004,20 @@ fn select_has_host_call(sp: &SelectPlan) -> bool {
 }
 
 fn compound_has_host_call(c: &CompoundPlan) -> bool {
-    c.arms.iter().any(select_has_host_call)
+    c.arms.iter().any(|a| match a {
+        CompoundArm::Select(sp) => select_has_host_call(sp),
+        CompoundArm::Derived(dp) => {
+            select_has_host_call(&dp.outer)
+                || match &dp.body {
+                    SubBody::Select(sp) => select_has_host_call(sp),
+                    SubBody::Compound(inner) => compound_has_host_call(inner),
+                }
+                || dp.body_subplans.iter().any(|s| match &s.body {
+                    SubBody::Select(sp) => select_has_host_call(sp),
+                    SubBody::Compound(inner) => compound_has_host_call(inner),
+                })
+        }
+    })
         // The compound's OWN `ORDER BY` may name a host collating sequence —
         // and it is the only one the arms cannot carry, since the trailing
         // ORDER BY belongs to the whole compound.

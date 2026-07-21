@@ -189,7 +189,7 @@ fn body_output_names(body: &SubBody, schema: &Schema) -> Vec<String> {
         SubBody::Select(sp) => (sp, sp.order_junk as usize),
         // Compound arms carry no junk (validate enforces it); arm 0 names the
         // output.
-        SubBody::Compound(c) => (&c.arms[0], 0),
+        SubBody::Compound(c) => (c.arms[0].output_select(), 0),
     };
     let name_slot = |slot: usize| -> String {
         let mut i = slot;

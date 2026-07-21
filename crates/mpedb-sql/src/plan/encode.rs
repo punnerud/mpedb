@@ -69,6 +69,33 @@ fn encode_subplan(s: &SubPlan, buf: &mut Vec<u8>) {
 /// The body of a `Compound` after its context (the statement tag or the subplan
 /// body-discriminant) — shared verbatim between a top-level compound statement
 /// and a compound subquery body, so the two encodings can never drift.
+/// Shared by `PlanStmt::Derived` and `CompoundArm::Derived` so the two layouts
+/// cannot drift (format 58).
+fn encode_derived_plan(dp: &crate::plan::DerivedPlan, buf: &mut Vec<u8>) {
+    w_str(buf, &dp.name);
+    w_u16(buf, dp.columns.len() as u16);
+    for (name, ty) in dp.columns.iter().zip(&dp.col_types) {
+        w_str(buf, name);
+        buf.push(*ty as u8);
+    }
+    match &dp.body {
+        SubBody::Select(sp) => {
+            buf.push(SUBBODY_SELECT);
+            encode_select(sp, buf);
+        }
+        SubBody::Compound(c) => {
+            buf.push(SUBBODY_COMPOUND);
+            encode_compound(c, buf);
+        }
+    }
+    encode_select(&dp.outer, buf);
+    w_u16(buf, dp.body_sub_base);
+    buf.push(dp.body_subplans.len() as u8);
+    for s in &dp.body_subplans {
+        encode_subplan(s, buf);
+    }
+}
+
 fn encode_compound(c: &CompoundPlan, buf: &mut Vec<u8>) {
     buf.push(c.arms.len() as u8);
     for op in &c.ops {
@@ -79,8 +106,18 @@ fn encode_compound(c: &CompoundPlan, buf: &mut Vec<u8>) {
             SetOp::Intersect => 3,
         });
     }
+    // Format 58: each arm is tagged Select(0) / Derived(1).
     for arm in &c.arms {
-        encode_select(arm, buf);
+        match arm {
+            crate::plan::CompoundArm::Select(sp) => {
+                buf.push(0u8);
+                encode_select(sp, buf);
+            }
+            crate::plan::CompoundArm::Derived(dp) => {
+                buf.push(1u8);
+                encode_derived_plan(dp, buf);
+            }
+        }
     }
     w_u16(buf, c.order_by.len() as u16);
     for (col, dir, coll) in &c.order_by {
@@ -317,35 +354,7 @@ fn encode_stmt(stmt: &PlanStmt, buf: &mut Vec<u8>) {
         }
         PlanStmt::Derived(dp) => {
             buf.push(STMT_DERIVED);
-            w_str(buf, &dp.name);
-            // The body's output columns paired with their types (equal length).
-            w_u16(buf, dp.columns.len() as u16);
-            for (name, ty) in dp.columns.iter().zip(&dp.col_types) {
-                w_str(buf, name);
-                buf.push(*ty as u8);
-            }
-            // The body under the format-31 body-discriminant byte, then the
-            // outer statement — mirroring `encode_subplan`'s body framing.
-            match &dp.body {
-                SubBody::Select(sp) => {
-                    buf.push(SUBBODY_SELECT);
-                    encode_select(sp, buf);
-                }
-                SubBody::Compound(c) => {
-                    buf.push(SUBBODY_COMPOUND);
-                    encode_compound(c, buf);
-                }
-            }
-            encode_select(&dp.outer, buf);
-            // The BODY's own lifts (format 52), after both components so a
-            // format-51 prefix reads identically up to here — the tail is
-            // what the format byte gates. Framed exactly like the
-            // statement-level list: base, COUNT, then each subplan.
-            w_u16(buf, dp.body_sub_base);
-            buf.push(dp.body_subplans.len() as u8);
-            for s in &dp.body_subplans {
-                encode_subplan(s, buf);
-            }
+            encode_derived_plan(dp, buf);
         }
         _other => encode_stmt_rest(stmt, buf),
     }
