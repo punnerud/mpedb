@@ -342,6 +342,8 @@ find ~/sqllogictest/test -name '*.test' | sort | grep -v '/select5\.test$' > fli
 - `~/mpedb-measure-results/mpedb-corpus-linux-v3.log` — mpedb size_mb=32 (**~318 s** wall)
 - `~/mpedb-measure-results/mpedb-corpus-m3-v3.log` — mpedb size_mb=32 (**~153 s** wall)
 - `~/mpedb-measure-results/minisqlite-bench-linux.log`
+- `~/mpedb-measure-results/imem-bench-linux-post-push.log` — fair `:memory:` micro @ `7fb0d53` (§5.4)
+- `~/mpedb-measure-results/imem-bench-m3-7fb0d53.log` — same harness on M3
 - `~/mpedb-measure-results/minisqlite-micro-linux.log`
 
 **mpedb RESULTS (reused):**
