@@ -1592,6 +1592,26 @@ impl Cursor {
         &mut self,
         store: &S,
     ) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        let mut scratch = Vec::new();
+        self.next_with(store, &mut scratch, |k, v| Ok((k.to_vec(), v.to_vec())))
+    }
+
+    /// [`next`](Cursor::next), with the cell handed to `f` BORROWED — the key
+    /// from the leaf page, and the value from the page too when it is inline
+    /// (the common row). No allocation and no copy happen on that path, which
+    /// is the point: the two `to_vec`s were ~17 ns of every scanned row
+    /// (examples/agg_prof.rs), spent on bytes the row decoder immediately
+    /// re-copied from. An overflow/extent value is assembled into `scratch`
+    /// (reusable across calls) and handed borrowed from there.
+    ///
+    /// The cursor advances only when `f` succeeds, exactly as [`next`] only
+    /// advanced once `read_leaf_val` had.
+    pub fn next_with<S: PageStore + ?Sized, R>(
+        &mut self,
+        store: &S,
+        scratch: &mut Vec<u8>,
+        f: impl FnOnce(&[u8], &[u8]) -> Result<R>,
+    ) -> Result<Option<R>> {
         loop {
             if self.done {
                 return Ok(None);
@@ -1612,50 +1632,126 @@ impl Cursor {
                             return Ok(None);
                         }
                     }
-                    let key = key.to_vec();
-                    let val = read_leaf_val(store, val)?;
+                    let r = match val {
+                        LeafVal::Inline(v) => f(key, v)?,
+                        other => {
+                            *scratch = read_leaf_val(store, other)?;
+                            f(key, scratch)?
+                        }
+                    };
                     self.leaf = Some((leaf_id, pos + 1));
-                    return Ok(Some((key, val)));
+                    return Ok(Some(r));
                 }
                 self.leaf = None;
             }
-            // climb until a branch has an unvisited child, then descend
-            loop {
-                match self.stack.pop() {
-                    None => {
-                        self.done = true;
-                        return Ok(None);
-                    }
-                    Some((branch_id, next_idx)) => {
-                        let p = store.page(branch_id)?;
-                        if next_idx <= nkeys(p) {
-                            self.stack.push((branch_id, next_idx + 1));
-                            let mut id = branch_child(p, next_idx)?;
-                            let mut found_leaf = false;
-                            for _ in 0..64 {
-                                let q = store.page(id)?;
-                                check_node(q)?;
-                                match kind(q) {
-                                    KIND_BRANCH => {
-                                        self.stack.push((id, 1));
-                                        id = branch_child(q, 0)?;
-                                    }
-                                    KIND_LEAF => {
-                                        found_leaf = true;
-                                        break;
-                                    }
-                                    _ => return Err(corrupt("bad page kind in scan")),
+            self.climb(store)?;
+        }
+    }
+
+    /// Climb until a branch has an unvisited child, then descend to that
+    /// child's leftmost leaf (`self.leaf`); `self.done` when the stack
+    /// empties. The between-leaves step both scan forms share.
+    fn climb<S: PageStore + ?Sized>(&mut self, store: &S) -> Result<()> {
+        loop {
+            match self.stack.pop() {
+                None => {
+                    self.done = true;
+                    return Ok(());
+                }
+                Some((branch_id, next_idx)) => {
+                    let p = store.page(branch_id)?;
+                    if next_idx <= nkeys(p) {
+                        self.stack.push((branch_id, next_idx + 1));
+                        let mut id = branch_child(p, next_idx)?;
+                        let mut found_leaf = false;
+                        for _ in 0..64 {
+                            let q = store.page(id)?;
+                            check_node(q)?;
+                            match kind(q) {
+                                KIND_BRANCH => {
+                                    self.stack.push((id, 1));
+                                    id = branch_child(q, 0)?;
                                 }
+                                KIND_LEAF => {
+                                    found_leaf = true;
+                                    break;
+                                }
+                                _ => return Err(corrupt("bad page kind in scan")),
                             }
-                            if !found_leaf {
-                                return Err(corrupt("tree too deep (cycle?)"));
-                            }
-                            self.leaf = Some((id, 0));
-                            break;
                         }
+                        if !found_leaf {
+                            return Err(corrupt("tree too deep (cycle?)"));
+                        }
+                        self.leaf = Some((id, 0));
+                        return Ok(());
                     }
                 }
             }
+        }
+    }
+
+    /// The `count(*)` fast path: how many rows a [`next`](Cursor::next) loop
+    /// would have yielded from the CURRENT leaf, without parsing a cell of it
+    /// unless the upper bound might cut the leaf short — then advance past the
+    /// leaf. `None` when the scan is exhausted (a `Some(0)` boundary count is
+    /// possible and simply precedes it).
+    ///
+    /// Keys are in tree order, so one comparison against the leaf's LAST key
+    /// answers for the whole leaf: within the bound ⇒ every earlier cell is
+    /// too, and the tail counts wholesale. Only the single boundary leaf pays
+    /// per-cell work, with the exact over-bound predicate `next` applies.
+    pub fn next_leaf_count<S: PageStore + ?Sized>(
+        &mut self,
+        store: &S,
+    ) -> Result<Option<u64>> {
+        loop {
+            if self.done {
+                return Ok(None);
+            }
+            let Some((leaf_id, pos)) = self.leaf else {
+                self.climb(store)?;
+                continue;
+            };
+            let p = store.page(leaf_id)?;
+            check_node(p)?;
+            let n = nkeys(p);
+            if pos >= n {
+                self.leaf = None;
+                continue;
+            }
+            let whole = match &self.hi {
+                None => true,
+                Some((hk, inc)) => {
+                    let (last, _) = leaf_cell(p, n - 1)?;
+                    match last.cmp(hk.as_slice()) {
+                        Ordering::Less => true,
+                        Ordering::Equal => *inc,
+                        Ordering::Greater => false,
+                    }
+                }
+            };
+            if whole {
+                self.leaf = None;
+                return Ok(Some((n - pos) as u64));
+            }
+            // The boundary leaf: count cells until the bound cuts off. Keys
+            // after this leaf are larger still, so the scan ends here.
+            let (hk, inc) = self.hi.as_ref().expect("bounded: !whole");
+            let mut count = 0u64;
+            for i in pos..n {
+                let (key, _) = leaf_cell(p, i)?;
+                let over = match key.cmp(hk.as_slice()) {
+                    Ordering::Less => false,
+                    Ordering::Equal => !*inc,
+                    Ordering::Greater => true,
+                };
+                if over {
+                    break;
+                }
+                count += 1;
+            }
+            self.done = true;
+            return Ok(Some(count));
         }
     }
 }

@@ -313,6 +313,7 @@ impl ReadTxn<'_> {
             cursor,
             table_id,
             steps: 0,
+            scratch: Vec::new(),
         })
     }
 
@@ -331,7 +332,39 @@ impl ReadTxn<'_> {
             cursor,
             table_id,
             steps: 0,
+            scratch: Vec::new(),
         })
+    }
+
+    /// `count(*)` over a raw-bounded PK range without touching a row: leaves
+    /// are counted wholesale via [`btree::Cursor::next_leaf_count`], so only
+    /// the boundary leaf pays per-cell work and no value is read or decoded.
+    ///
+    /// **The #74 charges are the drain-scan's, exactly**: the same total (one
+    /// per row the equivalent `RowCursor` loop would have yielded), the same
+    /// label, and — via [`WorkMeter::charge_many`]'s trip contract — the same
+    /// `used` in a `RuntimeBudget` refusal. The budget is a tested contract;
+    /// this path is faster, never cheaper.
+    pub fn count_range(
+        &self,
+        table_id: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<u64> {
+        let root = self.tree_root(table_id, 0)?;
+        let mut cursor = btree::cursor(self, root, lo, hi)?;
+        let mut n = 0u64;
+        while let Some(k) = cursor.next_leaf_count(self)? {
+            // Once per leaf, the pin revalidation a row cursor does every 256
+            // rows — eviction surfaces as an error, never as a wrong count.
+            if !self.still_pinned() {
+                return Err(Error::SnapshotEvicted);
+            }
+            self.work
+                .charge_many(k, || scan_label(&self.bundle.schema, table_id))?;
+            n += k;
+        }
+        Ok(n)
     }
 
     /// Read a system record (reserved catalog keyspace).
@@ -401,29 +434,57 @@ pub struct RowCursor<'t, 'e> {
     cursor: btree::Cursor,
     table_id: u32,
     steps: u32,
+    /// Reused assembly buffer for overflow/extent values — the inline common
+    /// case borrows straight from the page and never touches it.
+    scratch: Vec<u8>,
 }
 
 impl RowCursor<'_, '_> {
     // fallible + streaming, so deliberately not std::iter::Iterator
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Vec<Value>>> {
+        self.next_masked(None, None)
+    }
+
+    /// [`next`](RowCursor::next) with decode-time column pruning and the
+    /// row's raw storage key on the side.
+    ///
+    /// `keep[i]` false yields `Value::Null` without decoding slot `i`, and the
+    /// row is truncated to `keep.len()` slots — [`row::decode_row_masked`]'s
+    /// contract, threaded from #125's observable-column analysis so a fold
+    /// that reads two columns decodes two columns. `None` is the full row,
+    /// byte-identical to what [`next`] always produced.
+    ///
+    /// `key_out`, when given, is overwritten (`clear` + extend) with the
+    /// yielded row's ENCODED KEY — the exact bytes the row is stored under,
+    /// which is what a resumable batched scan needs for its next lower bound.
+    /// Handing it out here costs a bounded memcpy into a caller-reused buffer;
+    /// re-deriving it from the decoded row costs a key ENCODE per batch and
+    /// requires the PK columns to survive the mask, which for `count(*)` they
+    /// would otherwise not.
+    pub fn next_masked(
+        &mut self,
+        keep: Option<&[bool]>,
+        key_out: Option<&mut Vec<u8>>,
+    ) -> Result<Option<Vec<Value>>> {
         self.steps += 1;
         if self.steps.is_multiple_of(256) && !self.txn.still_pinned() {
             return Err(Error::SnapshotEvicted);
         }
-        match self.cursor.next(self.txn)? {
-            None => Ok(None),
-            Some((_k, v)) => {
-                // #74: one work-row per row this scan yields. Charged AFTER the
-                // cursor produced a row, so an empty/exhausted scan costs nothing.
-                self.txn
-                    .charge_work(1, || scan_label(&self.txn.bundle.schema, self.table_id))?;
-                Ok(Some(row::decode_row(
-                    &v,
-                    &self.txn.bundle.col_types[self.table_id as usize],
-                )?))
+        let txn = self.txn;
+        let table_id = self.table_id;
+        let types = &txn.bundle.col_types[table_id as usize];
+        // #74: one work-row per row this scan yields, charged once the cursor
+        // has produced a row (an empty/exhausted scan costs nothing) and
+        // BEFORE the decode, the order the two-step form always had.
+        self.cursor.next_with(txn, &mut self.scratch, |k, v| {
+            txn.charge_work(1, || scan_label(&txn.bundle.schema, table_id))?;
+            if let Some(out) = key_out {
+                out.clear();
+                out.extend_from_slice(k);
             }
-        }
+            row::decode_row_masked(v, types, keep)
+        })
     }
 }
 

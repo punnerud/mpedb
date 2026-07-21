@@ -204,6 +204,37 @@ pub(super) fn narrow_rows(rows: &mut Vec<Vec<Value>>, mask: &Mask) -> Result<()>
     Ok(())
 }
 
+/// The DECODE-level keep-vector for a batched scan (#125's scan half): the
+/// stage mask's observable slots, WIDENED by every column the residual
+/// `filter` reads — the residual runs over the pruned row inside
+/// `scan_rows_pruned`, unlike the materializing gathers, where it sees full
+/// width — then trimmed of its dead tail. `None` when nothing would be
+/// pruned, so the caller can tell "decode everything" apart at a glance.
+pub(super) fn scan_keep(
+    mask: &Mask,
+    filter: Option<&ExprProgram>,
+    width: usize,
+) -> Option<Vec<bool>> {
+    let mut keep: Vec<bool> = (0..width).map(|i| mask.observes(i)).collect();
+    if let Some(f) = filter {
+        // `PushCol` is the IR's only column read — the same single-opcode
+        // fact `mpedb_sql::row_prune` leans on.
+        for instr in &f.instrs {
+            if let mpedb_types::Instr::PushCol(i) = instr {
+                if let Some(s) = keep.get_mut(*i as usize) {
+                    *s = true;
+                }
+            }
+        }
+    }
+    let trim = keep.iter().rposition(|k| *k).map_or(0, |p| p + 1);
+    keep.truncate(trim);
+    if keep.len() == width && keep.iter().all(|k| *k) {
+        return None;
+    }
+    Some(keep)
+}
+
 /// [`gather_rows`] that narrows as it reads (#125).
 ///
 /// Narrowing a relation the gather already materialized still pays for the
@@ -213,11 +244,13 @@ pub(super) fn narrow_rows(rows: &mut Vec<Vec<Value>>, mask: &Mask) -> Result<()>
 /// exactly the outer relation's own full-width gather.
 ///
 /// So where the access path can be drawn in [`BatchScan`]-sized pieces, it is:
-/// each batch is narrowed and dropped before the next is read, and the wide
-/// relation never exists. That is the same machinery, the same rows, the same
-/// order and the same work-row charges as a single-pass gather — #123 §9.2
-/// argues that at length and `tests/agg_stream.rs::c_invariance` re-runs a
-/// whole differential battery at four batch sizes to keep it true.
+/// each batch arrives ALREADY PRUNED — the scan decodes only the observed
+/// columns (plus what the residual filter reads, which a per-batch
+/// [`narrow_row`] pass then drops again) — and the wide relation never
+/// exists, not even one row of it. Same rows, same order, same work-row
+/// charges as a single-pass gather — #123 §9.2 argues that at length and
+/// `tests/agg_stream.rs::c_invariance` re-runs a whole differential battery
+/// at four batch sizes to keep it true.
 ///
 /// Everything else (an index or FTS access, a write context, a mask that keeps
 /// everything) falls back to gather-then-narrow, which is the same answer at
@@ -237,19 +270,32 @@ pub(super) fn gather_narrowed(
         return gather_rows(ctx, table, access, filter, plan, params, None);
     }
     let width = t.columns.len();
-    if let Some(mut scan) = BatchScan::open(&*ctx, table, access, plan, params, t, width)? {
+    let keep = scan_keep(mask, filter, width);
+    if let Some(mut scan) =
+        BatchScan::open(&*ctx, table, access, plan, params, t, width, keep.clone())?
+    {
         let trim = mask.trim();
+        // Does the scan mask keep anything the TARGET mask drops (a
+        // filter-only column, per `scan_keep`'s widening)? Only then does the
+        // batch still need the narrowing pass.
+        let renarrow = keep
+            .as_deref()
+            .is_none_or(|k| k.iter().enumerate().any(|(i, on)| *on && !mask.observes(i)));
         let mut out = Vec::new();
         loop {
-            // Draw a batch, narrow it, drop it. The batch is the only
-            // full-width residency that ever exists.
+            // Draw a pruned batch, re-narrow it if the filter widened it,
+            // drop it. The batch is the only extra residency that ever exists.
             let batch = scan.next(ctx, filter, params)?;
             if batch.is_empty() {
                 break;
             }
             out.try_reserve(batch.len()).map_err(|_| join_oom())?;
             for row in batch {
-                out.push(narrow_row(row, mask, trim, true)?);
+                out.push(if renarrow {
+                    narrow_row(row, mask, trim, true)?
+                } else {
+                    row
+                });
             }
         }
         return Ok(out);
@@ -857,15 +903,12 @@ fn fold_batch(budget: u64, width: usize) -> usize {
 pub(super) struct BatchScan {
     table: u32,
     /// Lower bound of the NEXT batch, resumed strictly after the last row
-    /// handed out.
+    /// handed out — the raw storage key `scan_rows_pruned` hands back, so no
+    /// re-encoding and no requirement that the PK survive the column mask.
     lo: Option<RawBound>,
     hi: Option<RawBound>,
-    /// Which base-row slots make up the PK, in key order.
-    pk_cols: Vec<usize>,
-    /// On-disk key specs for those columns. NOT `encode_key`: a collated key
-    /// column folds its text and a typeless (`any`) one keys by storage class,
-    /// so a raw encoding would resume at a byte string the tree never stores.
-    pk_specs: Vec<keycode::KeySpec>,
+    /// Decode-time column mask ([`scan_keep`]): `None` decodes full rows.
+    keep: Option<Vec<bool>>,
     batch: usize,
     done: bool,
 }
@@ -882,6 +925,11 @@ impl BatchScan {
     ///   #48 (design/DESIGN-STREAM-EXEC.md §7.1);
     /// - the "table" is the DUAL or working-table sentinel, which has no
     ///   B+tree and no PK to resume from.
+    ///
+    /// `keep` is the decode-time column mask the batches are drawn under
+    /// ([`scan_keep`] — it must already cover what `filter` reads); `None`
+    /// decodes full rows, which is byte-identical to the pre-#125 scan.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn open(
         ctx: &dyn TxnCtx,
         table: u32,
@@ -890,6 +938,7 @@ impl BatchScan {
         params: &[Value],
         t: &TableDef,
         width: usize,
+        keep: Option<Vec<bool>>,
     ) -> Result<Option<BatchScan>> {
         if !ctx.scans_incrementally()
             || table == mpedb_sql::DUAL_TABLE
@@ -914,22 +963,11 @@ impl BatchScan {
             | AccessPath::IndexRange { .. }
             | AccessPath::FtsScan { .. } => return Ok(None),
         };
-        let mut pk_cols = Vec::with_capacity(t.primary_key.len());
-        let mut pk_specs = Vec::with_capacity(t.primary_key.len());
-        for &i in &t.primary_key {
-            let c = t
-                .columns
-                .get(i as usize)
-                .ok_or_else(|| internal("PK column out of range"))?;
-            pk_cols.push(i as usize);
-            pk_specs.push(keycode::KeySpec::for_column(c.ty, c.collation));
-        }
         Ok(Some(BatchScan {
             table,
             lo,
             hi,
-            pk_cols,
-            pk_specs,
+            keep,
             batch: fold_batch(ctx.join_cells_budget(), width),
             done: empty,
         }))
@@ -946,26 +984,25 @@ impl BatchScan {
         if self.done {
             return Ok(Vec::new());
         }
-        let rows = ctx.scan_rows_capped(
+        let (rows, resume) = ctx.scan_rows_pruned(
             self.table,
             self.lo.as_ref().map(|(k, inc)| (k.as_slice(), *inc)),
             self.hi.as_ref().map(|(k, inc)| (k.as_slice(), *inc)),
             filter.map(|f| (f, params)),
-            Some(self.batch),
+            self.batch,
+            self.keep.as_deref(),
         )?;
         // Short of the cap means the cursor ran out, not that the filter got
-        // picky: `scan_rows_capped` counts KEPT rows and keeps pulling past
+        // picky: `scan_rows_pruned` counts KEPT rows and keeps pulling past
         // rejected ones, so it only returns early when the range is done.
         if rows.len() < self.batch {
             self.done = true;
             return Ok(rows);
         }
-        let last = rows.last().ok_or_else(|| internal("non-empty batch"))?;
-        let mut pk = Vec::with_capacity(self.pk_cols.len());
-        for &c in &self.pk_cols {
-            pk.push(last.get(c).cloned().ok_or_else(|| internal("PK column"))?);
-        }
-        self.lo = Some((keycode::encode_key_spec(&pk, &self.pk_specs), false));
+        // At the cap the scan hands back the last kept row's raw key: resume
+        // strictly after it.
+        let key = resume.ok_or_else(|| internal("capped batch without a resume key"))?;
+        self.lo = Some((key, false));
         Ok(rows)
     }
 }

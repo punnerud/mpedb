@@ -158,3 +158,69 @@ Same data, same statements, bundled sqlite, one thread (1 M rows, file):
   onto E-cores; a userInteractive hint might lift the 4-thread cells toward 3.9×).
 - B+tree-structural splitting — the probe splits on dense ids; skew (sparse PKs, hot
   ranges) is exactly what morsel stealing is for, but it was not provoked.
+
+## 7. UPDATE 2026-07-21 — the §3/§5 per-row constant: measured and cut
+
+The "per-row cost FIRST" order was executed before any parallel executor work.
+`examples/agg_prof.rs` (Linux dev box, 2 cores, 1M rows, min-of-5; the same
+fixture as `par_ceiling`) attributes the serial fold's ~293 ns/row for
+`count(*)`, then cuts the verified items. sqlite = bundled 3.45 via rusqlite,
+serial, same data, same box.
+
+Attribution at `31cb87c` (count(*) shape, 293.5 ns/row total): full-row decode
+170.3 (its two per-row allocs — `Vec<Value>` spine + one text `String` — plus an
+O(ncols²) offset recompute in `decode_column`-per-column), B+tree cursor walk
+~74 (of which the per-row `key.to_vec` + inline-value `to_vec` pair ≈ 17),
+executor fold ~47, work meter 2.0. Batch re-descent was measured NOISE:
+`MPEDB_FOLD_BATCH` 256→1024 moved sum by 7 ns/row, →4096 by nothing, so
+`FOLD_BATCH` stays 256 and the memory contract stays untouched.
+
+What was cut, cumulative (ns/row, 1M rows):
+
+```text
+  shape                31cb87c   after   sqlite   change
+  count(*)               293.5     0.7      0.3   leaf-wholesale key counting
+  sum(a)                 347.1   150.7     30.3   1-column decode, borrowed cells
+  GROUP BY 10 (c+s)      401.5   190.6    207.5   mpedb now BEATS serial sqlite
+  GROUP BY 10k (c+s)     488.8   264.3    208.2   1.27x from parity
+  RowCursor full drain   246.5   134.9      —     every full-row scan rides this
+  decode_row (5 cols)    170.3    83.9      —     one-pass offsets
+```
+
+The cuts, in order of size:
+
+1. **Decode only what the fold observes.** #125's `RowPrune::stage(0)` is now
+   pushed INTO the scan (`TxnCtx::scan_rows_pruned` → `RowCursor::next_masked`
+   → `row::decode_row_masked`): group keys, aggregate args + their FILTERs and
+   the residual's own columns decode; everything else is `Null` without
+   touching bytes. `count(*)` decodes an EMPTY row. The witness PK is pinned
+   only when bare columns exist (the witness otherwise never reads it).
+2. **`count(*)`-only + no residual = key counting.** `ReadTxn::count_range`
+   counts leaf cells wholesale (`btree::Cursor::next_leaf_count`; only the
+   hi-boundary leaf pays per-cell work) — sqlite's own count optimization.
+   The #74 charges are the drain-scan's EXACTLY (`WorkMeter::charge_many`
+   lands the refusal at `budget + 1`, same total, same label): faster, never
+   cheaper.
+3. **Borrowed cells.** `btree::Cursor::next_with` hands key+inline value
+   borrowed from the page; the row decodes straight out of it, and the resume
+   bound is the raw storage key (no per-batch PK re-encode). Kills 2
+   allocs/row for every scan, not just aggregates.
+4. **One-pass `decode_row`** (the O(ncols²) offset recompute hoisted).
+5. **Fold hot path:** reused eval stack + group-key encode buffer (a hot
+   group costs one encode + one map probe), bare-`PushCol` aggregate args
+   read by reference (no interpreter, no clone). A `get_mut`/insert split was
+   tried and REVERTED: two probes on a 10k-group BTreeMap cost more than the
+   one small key alloc `entry()` needs.
+
+Refused: answering `count(*)` from the catalog's O(1) `row_count` — it charges
+0 work-rows where the scan charges N, which moves the #74 refusal point, and
+the budget is a tested contract. The remaining `sum` gap vs sqlite (~5x) is
+the row pipeline itself: a `Vec<Value>` per row plus the cursor walk, against
+sqlite's decode-in-VDBE record format — cursor/fold fusion territory, not
+constant-shaving.
+
+Gates: `tests/agg_stream.rs` (incl. `MPEDB_FOLD_BATCH ∈ {1,2,7,256}`
+invariance), `tests/agg_stream_mem.rs` slopes, `tests/prune_width.rs`,
+`tests/runtime_budget.rs`, full `cargo test --workspace` ×3, clippy clean, and
+the `select1-4` + `evidence/` corpus report byte-identical (9,489/9,689, the
+same 4 flagged) vs a `31cb87c` build on the same box.

@@ -164,6 +164,23 @@ struct Folder<'a> {
     /// Groups, keyed by the memcmp-ordered keycode of the group columns — so
     /// they come out in a deterministic (and sqlite-matching) order for free.
     groups: std::collections::BTreeMap<Vec<u8>, Group>,
+    /// Reused expression-eval stack: one live fold evaluates its per-row
+    /// programs thousands of times, and `eval_host`'s fresh stack was a
+    /// measurable slice of the per-row constant (examples/agg_prof.rs).
+    stack: Vec<Value>,
+    /// Reused group-key encode buffer — the per-row `Vec<u8>` the BTreeMap is
+    /// probed with; an OWNED copy is cloned off it only when a new group is
+    /// born.
+    key_buf: Vec<u8>,
+    /// Computed `GroupKey::Expr` values for the CURRENT row, stashed during
+    /// encoding so a new group can take them without re-evaluating.
+    expr_keys: Vec<Value>,
+    /// Per aggregate: `Some(c)` when its argument program is the single
+    /// instruction `PushCol(c)` — `sum(a)`, `min(x)`, the overwhelmingly
+    /// common shapes — so the fold reads the column BY REFERENCE instead of
+    /// running the interpreter and cloning the value per row. `None` runs the
+    /// program exactly as before.
+    fast_args: Vec<Option<u16>>,
     /// #123 §4.3: the input is no longer held, but the GROUP MAP is, and it is
     /// O(distinct keys) — no chunk size makes it smaller. So it takes the
     /// tripwire the join's intermediate product already has, on the same
@@ -244,7 +261,18 @@ impl<'a> Folder<'a> {
             base_colls,
             group_collations,
             mm,
+            fast_args: agg
+                .aggs
+                .iter()
+                .map(|c| match c.arg.as_ref().map(|p| p.instrs.as_slice()) {
+                    Some([mpedb_types::Instr::PushCol(i)]) => Some(*i),
+                    _ => None,
+                })
+                .collect(),
             groups: Default::default(),
+            stack: Vec::new(),
+            key_buf: Vec::new(),
+            expr_keys: Vec::new(),
             cells: super::gather::JoinCells::new(ctx.join_cells_budget()),
         }
     }
@@ -257,27 +285,58 @@ impl<'a> Folder<'a> {
     /// aggregate registries and nothing else, which is exactly what lets the
     /// caller alternate between pulling a batch (`&mut ctx`) and folding it.
     fn push(&mut self, ctx: &dyn TxnCtx, row: &[Value], row_params: &[Value]) -> Result<()> {
-        let key_vals: Vec<Value> = self
-            .agg
-            .group_by
-            .iter()
-            .map(|k| match k {
-                GroupKey::Col(c) => Ok(row.get(*c as usize).cloned().unwrap_or(Value::Null)),
-                // A computed key — `GROUP BY a+1` — evaluated over the base row.
-                GroupKey::Expr(p) => p.eval_host(row, row_params, ctx.host_fns()),
-            })
-            .collect::<Result<_>>()?;
+        let host = ctx.host_fns();
         // The grouping key is sqlite's storage-class key, NOT the on-disk one:
         // over a typeless column `1` and `1.0` are ONE group and the text `'1'`
         // another. Its byte order is also sqlite's class order, so this
         // `BTreeMap` still iterates groups the way sqlite emits them.
-        let key = keycode::encode_group_key(&key_vals, &self.group_collations);
+        //
+        // Encoded STRAIGHT off the row into a reused buffer — the per-row
+        // `Vec<Value>` of cloned key values only ever fed this encoder, so a
+        // hot group now costs one encode and one map probe, no allocation.
+        // `GroupKey::Expr` values are computed once and stashed for the
+        // new-group path below.
+        self.key_buf.clear();
+        self.expr_keys.clear();
+        for (i, k) in self.agg.group_by.iter().enumerate() {
+            let coll =
+                self.group_collations.get(i).copied().unwrap_or(Collation::Binary);
+            match k {
+                GroupKey::Col(c) => keycode::encode_group_value(
+                    &mut self.key_buf,
+                    row.get(*c as usize).unwrap_or(&Value::Null),
+                    coll,
+                ),
+                // A computed key — `GROUP BY a+1` — evaluated over the base row.
+                GroupKey::Expr(p) => {
+                    let v = p.eval_with_stack_host(&mut self.stack, row, row_params, host)?;
+                    keycode::encode_group_value(&mut self.key_buf, &v, coll);
+                    self.expr_keys.push(v);
+                }
+            }
+        }
         // Not `or_insert_with`: minting a HOST accumulator can FAIL (an
         // out-of-scope or unregistered aggregate), and a closure cannot carry
-        // that error out.
-        let entry = match self.groups.entry(key) {
+        // that error out. ONE probe per row — a `get_mut`-then-insert split
+        // was measurably slower on a 10k-group map — at the price of cloning
+        // the (small, often empty) encoded key per row; `BTreeMap` has no
+        // borrowed-key entry API to avoid that with.
+        let entry = match self.groups.entry(self.key_buf.clone()) {
             std::collections::btree_map::Entry::Occupied(e) => e.into_mut(),
             std::collections::btree_map::Entry::Vacant(e) => {
+                // Materialize the key tuple this group owns: column keys
+                // cloned off the row, computed keys taken from the stash.
+                let mut expr_it = self.expr_keys.drain(..);
+                let key_vals: Vec<Value> = self
+                    .agg
+                    .group_by
+                    .iter()
+                    .map(|k| match k {
+                        GroupKey::Col(c) => row.get(*c as usize).cloned().unwrap_or(Value::Null),
+                        GroupKey::Expr(_) => expr_it.next().unwrap_or(Value::Null),
+                    })
+                    .collect();
+                drop(expr_it);
                 let witness = if !self.has_bare {
                     None
                 } else if self.mm.is_some() {
@@ -323,22 +382,30 @@ impl<'a> Folder<'a> {
             // different filters (or none). For DISTINCT this runs BEFORE the
             // dedupe inside `Accum` — filter first, then dedupe.
             if let Some(f) = &call.filter {
-                if !f.eval_filter_host(&mut Vec::new(), row, row_params, ctx.host_fns())? {
+                if !f.eval_filter_host(&mut self.stack, row, row_params, host)? {
                     continue;
                 }
             }
-            match &call.arg {
+            match (&call.arg, self.fast_args[i]) {
                 // count(*): the ROW is the input, so nothing is evaluated and
                 // NULL cannot arise.
-                None => entry.1[i].push(None)?,
-                Some(p) => {
-                    let v = p.eval_host(row, row_params, ctx.host_fns())?;
+                (None, _) => entry.1[i].push(None)?,
+                // A bare-column argument, read by reference — same value, same
+                // out-of-bounds refusal, no interpreter and no clone.
+                (Some(_), Some(c)) if call.extra_args.is_empty() => {
+                    let v = row.get(c as usize).ok_or_else(|| {
+                        Error::Internal(format!("column index {c} out of row bounds"))
+                    })?;
+                    entry.1[i].push(Some(v))?;
+                }
+                (Some(p), _) => {
+                    let v = p.eval_with_stack_host(&mut self.stack, row, row_params, host)?;
                     // A host aggregate's arguments after the first, evaluated
                     // over the same base row and in the same order. Empty for
                     // every built-in, so this allocates nothing for them.
                     let mut extra = Vec::with_capacity(call.extra_args.len());
                     for p in &call.extra_args {
-                        extra.push(p.eval_host(row, row_params, ctx.host_fns())?);
+                        extra.push(p.eval_with_stack_host(&mut self.stack, row, row_params, host)?);
                     }
                     entry.1[i].push_n(Some(&v), &extra)?;
                 }
@@ -375,7 +442,7 @@ impl<'a> Folder<'a> {
                     // captured every row, so the last row wins as documented).
                     let passes = match &mm.filter {
                         Some(fp) => {
-                            fp.eval_filter_host(&mut Vec::new(), row, row_params, ctx.host_fns())?
+                            fp.eval_filter_host(&mut self.stack, row, row_params, host)?
                         }
                         None => true,
                     };
@@ -385,7 +452,9 @@ impl<'a> Folder<'a> {
                         }
                     } else {
                         let v = match &mm.arg {
-                            Some(p) => p.eval_host(row, row_params, ctx.host_fns())?,
+                            Some(p) => {
+                                p.eval_with_stack_host(&mut self.stack, row, row_params, host)?
+                            }
                             None => Value::Null,
                         };
                         match extreme {
@@ -428,6 +497,77 @@ impl<'a> Folder<'a> {
         }
         Ok(())
     }
+}
+
+/// The `count(*)`-only fast path (#126): `Some(n)` when every aggregate is a
+/// bare `count(*)` and the input is a FILTERLESS streaming-shape scan, so the
+/// row count IS the key count of the range and the context may count
+/// leaf-wholesale ([`TxnCtx::count_rows_range`]) without materializing a row.
+/// `None` falls through to the fold, which stays the semantics of record.
+///
+/// The guards, each load-bearing:
+/// - **no residual `filter`** — DESIGN-MULTIDB §4: the residual is where the
+///   planner AND-folded the row policy, and a policy-bearing scan must test
+///   every row;
+/// - **every aggregate is `count(*)`** with no argument, DISTINCT, FILTER or
+///   host extra args — anything else needs column values;
+/// - **no GROUP BY, no bare columns** — grouping and the witness need values;
+/// - the same streaming-shape checks as [`gather::BatchScan::open`] (an
+///   incremental context, a real table, a FullScan/PkRange access).
+///
+/// The #74 charges are the drain-scan's exactly (`ReadTxn::count_range`), so
+/// the budget contract does not move by a row.
+#[allow(clippy::too_many_arguments)]
+fn try_count_only(
+    ctx: &mut dyn TxnCtx,
+    table: u32,
+    access: &AccessPath,
+    plan: &CompiledPlan,
+    params: &[Value],
+    t: &TableDef,
+    filter: Option<&ExprProgram>,
+    agg: &Aggregation,
+) -> Result<Option<u64>> {
+    let plain_count = |c: &AggCall| {
+        c.arg.is_none()
+            && !c.distinct
+            && c.filter.is_none()
+            && c.extra_args.is_empty()
+            && c.func.native() == Some(mpedb_types::AggFn::Count)
+    };
+    if filter.is_some()
+        || !agg.group_by.is_empty()
+        || !agg.bare_cols.is_empty()
+        || agg.aggs.is_empty()
+        || !agg.aggs.iter().all(plain_count)
+        || !ctx.scans_incrementally()
+        || table == mpedb_sql::DUAL_TABLE
+        || table == mpedb_sql::CTE_TABLE
+        || t.primary_key.is_empty()
+    {
+        return Ok(None);
+    }
+    let (lo, hi) = match access {
+        AccessPath::FullScan => (None, None),
+        AccessPath::PkRange { lo, hi } => {
+            match gather::range_bounds(lo.as_ref(), hi.as_ref(), plan, params)? {
+                // A NULL bound makes the range predicate UNKNOWN for every
+                // row: zero rows, counted here exactly as the born-exhausted
+                // scan would have.
+                None => return Ok(Some(0)),
+                Some((l, h)) => (l, h),
+            }
+        }
+        AccessPath::PkPoint(_)
+        | AccessPath::IndexPoint { .. }
+        | AccessPath::IndexRange { .. }
+        | AccessPath::FtsScan { .. } => return Ok(None),
+    };
+    ctx.count_rows_range(
+        table,
+        lo.as_ref().map(|(k, inc)| (k.as_slice(), *inc)),
+        hi.as_ref().map(|(k, inc)| (k.as_slice(), *inc)),
+    )
 }
 
 /// `GROUP BY` / aggregates / `HAVING`.
@@ -526,22 +666,53 @@ pub(super) fn exec_aggregate(
     // and the materializing path below is then EXACTLY the code that ran
     // before, feeding the same `Folder::push`.
     let streamed = if joins.is_empty() && correlated.is_empty() && post_filter.is_none() {
-        match gather::BatchScan::open(&*ctx, table, access, plan, params, t, width)? {
-            Some(mut scan) => {
-                loop {
-                    // Draw a batch (`&mut ctx`), fold it (`&ctx`), drop it. The
-                    // batch is the only input residency that ever exists.
-                    let batch = scan.next(ctx, filter, params)?;
-                    if batch.is_empty() {
-                        break;
+        if let Some(n) = try_count_only(ctx, table, access, plan, params, t, filter, agg)? {
+            // `count(*)`-only over a filterless scan: the engine counted KEYS
+            // leaf-wholesale and no row was ever materialized. Inject the one
+            // group the fold would have built — same group key (empty), same
+            // accumulators, same group-map cell charge — and let the shared
+            // finish code below do everything observable.
+            folder.cells.charge(agg.aggs.len() as u64, || {
+                format!(
+                    "the group map of an aggregate over \"{}\"",
+                    super::table_name(schema, table)
+                )
+            })?;
+            let accs = agg
+                .aggs
+                .iter()
+                .map(|_| {
+                    let mut a = Accum::new(mpedb_types::AggFn::Count);
+                    a.add_rows(n);
+                    Acc::Native(a)
+                })
+                .collect();
+            folder.groups.insert(Vec::new(), (Vec::new(), accs, None, None));
+            true
+        } else {
+            // #125's scan half: the fold observes `prune.stage(0)` (group
+            // keys, aggregate arguments and their FILTERs, the witness PK) and
+            // the residual reads its own columns — everything else is never
+            // DECODED. `scan_keep` is that union; `None` keeps the scan
+            // byte-identical to the unpruned one.
+            let keep = prune.and_then(|p| gather::scan_keep(p.stage(0), filter, width));
+            match gather::BatchScan::open(&*ctx, table, access, plan, params, t, width, keep)? {
+                Some(mut scan) => {
+                    loop {
+                        // Draw a batch (`&mut ctx`), fold it (`&ctx`), drop it.
+                        // The batch is the only input residency that ever exists.
+                        let batch = scan.next(ctx, filter, params)?;
+                        if batch.is_empty() {
+                            break;
+                        }
+                        for row in &batch {
+                            folder.push(&*ctx, row, params)?;
+                        }
                     }
-                    for row in &batch {
-                        folder.push(&*ctx, row, params)?;
-                    }
+                    true
                 }
-                true
+                None => false,
             }
-            None => false,
         }
     } else {
         false
