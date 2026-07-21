@@ -2182,16 +2182,11 @@ shape (`crafted_alia$.id`) does not hit it.
 > **Reading order note — SUPERSEDED.** The two sections that follow were measured at
 > *different* commits (the consolidated run 7 at `b41b713`; E3(b)'s before/after pair on
 > the Linux box against a control build of that same commit). Both are kept as history.
-> **The current headline is "AT HEAD (2) — re-measured at `d83c21d`" at the end
-> of this file**: `d83c21d` on the Apple M3, Django A **826/831**, `queries`
-> **490/493** and CPython **450/474** — the `03ff5ea` run plus `f27f2b6`'s +2 in
-> `queries` and nothing else.
->
-> **For CPython only, the last section of this file supersedes it**: "AT HEAD —
-> the shim-side CPython closures", a controlled before/after on the Linux box at
-> `b598052` in an isolated worktree, closing `test_deserialize_corrupt_database`
-> and (on a 3.12.12 interpreter) `test_dump_custom_row_factory`. Django is
-> unchanged and unmeasured there.
+> **The current headline is "AT HEAD (3) — re-measured at `c4d1a90`" at the end
+> of this file**: Apple M3, CPython **457/467** of stock-passing (474 ran, 7
+> skips); the remaining 1 FAIL + 9 ERROR are the documented deliberate set.
+> Linux box corroboration: **451/461**. Django A/B last measured at `d83c21d`
+> (826/831 + 490/493) — not re-run in this pass.
 
 ## The consolidated measurement — Django run 7 + CPython, ONE commit (2026-07-20)
 
@@ -2762,10 +2757,7 @@ WB_GROUP_BASE=3 WB_LABEL_GROUPS=$'queries\nbackends\nmodel_fields' … run_suite
 
 ## AT HEAD (2) — re-measured at `d83c21d` (2026-07-20)
 
-**This is the current headline.** It re-runs the section above at `main`s head
-## AT HEAD (2) — re-measured at `d83c21d` (2026-07-20)
-
-**This is the current headline.** It re-runs the section above at `main`'s head
+**Superseded by AT HEAD (3) for CPython.** Historical re-measure at `main`'s head
 after a batch of work landed: `f27f2b6` (the pass-through derived-table wrapper),
 `dac2ada` (the streaming aggregate), `e277644` (the registry/compile fix) and the
 two commit-path changes `d54d6ae` + `0bcb94e` (#119, statement atomicity across a
@@ -3071,3 +3063,69 @@ run_wt.sh wt-after ; diff wt-before/ids.txt wt-after/ids.txt
 where `run_wt.sh` is `LD_PRELOAD=$SO PYTHONPATH=$LIB python3.12 -m test
 test_sqlite3 -v` against the stock arm of the same command, with
 `ulimit -v 3000000` and `/dev/shm/mpedb-*` cleaned between arms.
+
+---
+
+## AT HEAD (3) — re-measured at `c4d1a90` (2026-07-21)
+
+**This is the current headline for CPython.** Commit `c4d1a90` (P1 partial
+indexes + prior closes: FROM-less CTE, WHERE aliases, ON CONFLICT ROLLBACK).
+
+**Machine: Apple M3 Pro, macOS, arm64.** Release `mpedb-capi`.
+**Interpreter: Homebrew CPython 3.12.12** — 474 tests, 7 skips; stock libsqlite3
+**3.53.1** passes **467**.
+**Interposition:** directory of `libsqlite3{,.0}.dylib` → `libmpedb_sqlite3.dylib`,
+`/usr/bin/env DYLD_LIBRARY_PATH=… python3.12` (dyld leaf-name rule).
+
+```
+interposition  stock: 3.53.1
+interposition  shim : 3.45.0
+```
+
+### CPython `test_sqlite3`
+
+| arm | run | pass | FAIL | ERROR | skip |
+|---|---|---|---|---|---|
+| stock libsqlite3 3.53.1 | 474 | **467** | 0 | 0 | 7 |
+| **shim @ `c4d1a90`** | 474 | **457** | **1** | **9** | 7 |
+
+**457 / 467 = 97.9 %** of the baseline-passing suite (was 450/467 at `d83c21d`).
+
+#### The 1 FAIL + 9 ERROR (all deliberate / out-of-scope)
+
+| id | class |
+|---|---|
+| `test_backup.BackupTests.test_progress` | FAIL — page-count accounting (documented) |
+| `test_backup…test_modifying_progress` | ERROR — restart semantics (documented) |
+| `test_backup…test_database_source_name` | ERROR — ATTACH `:memory:` refused |
+| `test_dbapi…test_connection_config` | ERROR — FK flag / D11 honesty |
+| `test_dbapi…test_serialize_deserialize` | ERROR — serialize image non-goal |
+| `test_dump…test_dump_autoincrement` ×2 | ERROR — AUTOINCREMENT deliberate |
+| `test_dump…test_dump_virtual_tables` | ERROR — fts4 non-goal |
+| `test_dump…test_table_dump` | ERROR — VIEW/TRIGGER in txn |
+| `test_regression…test_error_msg_decode_error` | ERROR — non-UTF-8 `Value::Text` structural |
+
+**Closed since `d83c21d` / Linux 447:** FROM-less CTE description, WHERE alias +
+class-order param compare, ON CONFLICT ROLLBACK, partial-index deterministic UDF
+(P1), deserialize corrupt / dump custom row factory (already on main).
+
+**Wrong SQL answers: 0.**
+
+### Linux box corroboration (same commit, CPython 3.12.3)
+
+| arm | run | pass | FAIL | ERROR | skip |
+|---|---|---|---|---|---|
+| stock 3.45.1 | 466 | 461 | 0 | 0 | 5 |
+| shim @ `c4d1a90` | 466 | **451** | **1** | **9** | 5 |
+
+**451 / 461 = 97.8 %.** Failing id set matches M3 modulo interpreter-only tests.
+
+### Reproduction (M3)
+
+```
+cargo build --release -p mpedb-capi
+SHIM=…/release; mkdir -p $SHIM/lib
+ln -sf $SHIM/libmpedb_sqlite3.dylib $SHIM/lib/libsqlite3.dylib
+/usr/bin/env DYLD_LIBRARY_PATH=$SHIM/lib python3.12 -m test test_sqlite3 \
+  --junit-xml=shim.xml
+```
