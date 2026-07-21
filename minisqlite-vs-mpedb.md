@@ -3,9 +3,13 @@
 **Date:** 2026-07-21  
 **minisqlite:** [github.com/cursor/minisqlite](https://github.com/cursor/minisqlite) @ `main`  
 **mpedb:** this workspace @ `4926536`  
-**Machines:**
-- **M3 (earlier):** Apple M3 Pro, 11 cores, macOS 26.6 — prior minisqlite unit/micro notes
-- **Linux (this round):** AMD EPYC-Milan 2 cores, Linux 6.8 — unit tests, **official sqllogictest**, cargo bench, micro  
+**Machines (minisqlite tests run on both):**
+- **M3:** Apple M3 Pro, 11 cores, macOS 26.6 (Darwin 25.6.0) — unit, **sqllogictest**, cargo bench, micro
+- **Linux:** AMD EPYC-Milan 2 cores, Linux 6.8 — unit, **sqllogictest**, cargo bench, micro  
+
+**What is comparable without a C-API:** official **sqllogictest** corpus (SQL text in → results out).  
+**What needs a C-API / host binding** (mpedb only here): CPython `test_sqlite3`, Django, SQLite TCL, TH3.  
+**Own unit suites** are per-engine (cannot score minisqlite’s 5605 tests on mpedb or vice versa).
 
 **SQLite / PostgreSQL / mpedb mpedb-bench numbers:** reused from `crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md` and `RESULTS-linux-amd-epyc-milan-2c.md` (not re-run)
 
@@ -13,17 +17,19 @@
 
 ## 1. Short conclusion
 
-| | **minisqlite** | **mpedb** |
-|---|---|---|
-| Goal | Faithful SQLite reimplementation in Rust | Serverless file DB with **better concurrency** + rigid schema + modern features |
-| On-disk format | **Full SQLite format 3** (read + write real `.db` / WAL) | Own format (+ overlay read of SQLite via attach/mirror) |
-| C-API / drop-in | **No** | **Yes** (`mpedb-capi` / `libmpedb_sqlite3`) |
-| CPython / Django | **Cannot be interposed** | CPython **459/467**, Django A **831/831**, queries **493/493** |
-| Multi-process writers | **No** (in-process only; no OS locks) | **Yes** (SHM, MVCC, multi-process writers) |
-| Own test suite (release) | **5605 passed, 0 failed** (M3 + Linux) | Large own suite + testkit corpus |
-| SQLite **sqllogictest** 7.4M | **Run on Linux (this round):** 99.9999% of attempted, **4 wrong / 2 errmis / 1 engine error** | **Run** (mpedb-testkit): 99.9765% attempted, **0 genuine wrong answers** after shim accounting — see [CORPUS-STATUS.md](design/CORPUS-STATUS.md) |
-| Speed | Strong SQL engine; no prepare; own bench scales to 1M rows | **Ahead** of SQLite/PG on primary mpedb-bench cells; ahead of minisqlite on prepared/none-class select |
+| | **minisqlite** | **mpedb** | **stock SQLite 3.45** |
+|---|---|---|---|
+| Goal | Faithful SQLite reimplementation in Rust | Serverless file DB with **better concurrency** + rigid schema + modern features | Reference engine |
+| On-disk format | **Full SQLite format 3** | Own format (+ SQLite attach/mirror) | format 3 |
+| C-API / drop-in | **No** | **Yes** (`libmpedb_sqlite3`) | Full |
+| CPython / Django | **N/A** (no C-API) | **459/467** · A **831/831** · queries **493/493** | stock baseline |
+| Multi-process writers | **No** | **Yes** | Single writer + WAL readers |
+| Own unit suite | **5605/0** (M3 + Linux) | `cargo test --workspace` | SQLite’s own (C/TCL; not this doc) |
+| **sqllogictest** 7.4M (no C-API) | **99.999882 %** attempted (4 wrong / 2 errmis / 1 err) | **99.9765 %** + 0 genuine wrong after shim ([CORPUS-STATUS](design/CORPUS-STATUS.md)) | **99.999933 %** (3 wrong / 0 errmis / 1 err) — same harness |
+| Speed | Strong; no prepare | **Ahead** on primary mpedb-bench cells | Reference in RESULTS |
 
+**Choose minisqlite** if you want *“SQLite, but in Rust”* with byte-compatible files and a pure facade.  
+**Choose mpedb** if you need C-API/Python/Django, multi-process writers, or stricter schema + mirror/RLS.
 **Choose minisqlite** if you want *“SQLite, but in Rust”* with byte-compatible files and a pure facade.  
 **Choose mpedb** if you need C-API/Python/Django, multi-process writers, or stricter schema + mirror/RLS.
 
@@ -45,87 +51,81 @@
 
 ---
 
-## 3. Coverage: tests and corpus
+## 3. Coverage: portable vs C-API suites
 
-### 3.1 minisqlite unit suite
+### 3.0 Which suites apply to whom
 
-| Host | Command | Result |
+| Suite | Needs C-API? | stock SQLite | minisqlite | mpedb | PostgreSQL |
+|---|---|---|---|---|---|
+| Own unit / integration suite | No (per engine) | C/TCL suite (not re-run here) | **5605/0** | `cargo test --workspace` | `make check` (not re-run) |
+| Official **sqllogictest** corpus | **No** — pure SQL | **measured** §3.2 | **measured** §3.2 | **measured** ([CORPUS-STATUS](design/CORPUS-STATUS.md)) | dialect-bound; not this corpus |
+| CPython `test_sqlite3` | **Yes** | stock | **N/A** | **459/467** | N/A |
+| Django frozen A / `queries` | **Yes** | via pysqlite | **N/A** | **831/831** · **493/493** | Django PG backend (not this doc) |
+| SQLite TCL / TH3 | Yes / proprietary | yes | **N/A** | **N/A** | N/A |
+
+### 3.1 Own unit suites (not cross-engine)
+
+These are **implementation tests**, not a shared scoreboard. minisqlite’s 5605 tests call its Rust facade (and crate internals); they cannot be pointed at mpedb or libsqlite3 without a rewrite. mpedb’s suite likewise.
+
+| Engine | Command | Result |
 |---|---|---|
-| M3 (earlier) | `cargo test --workspace --release` | **5605 passed, 0 failed** |
-| Linux EPYC 2c (this round) | same | **5605 passed, 0 failed** |
+| **minisqlite** M3 | `cargo test --workspace --release` | **5605 passed, 0 failed** (`minisqlite-test-m3.log`) |
+| **minisqlite** Linux | same | **5605 passed, 0 failed** (`minisqlite-test-linux.log`) |
+| **mpedb** | `cargo test --workspace` | continuous CI / local (this tree) |
+| **stock SQLite** | TCL suite / TH3 | not re-run in this document |
 
-```text
-cargo test --workspace --release
-→ passed=5605  failed=0
-#[test] markers in tree: ~5650 (README: 5650 / ~90 s)
-```
+minisqlite suite makeup (for scale): ~2964 facade `conformance_*.rs` tests (SQL vs sqlite.org-transcribed expects) + format/durability fixtures + per-crate unit tests + seams.
 
-- **~110** `conformance_*.rs` files: expected values **transcribed from sqlite.org docs**, not from the engine itself (methodology to avoid circular testing).
-- **Format/durability:** hand-built byte fixtures from the file-format spec; hot-journal / torn WAL.
-- **Architecture/seams:** `seams.rs` pins crate boundaries.
-- **Not possible without a C-API:**
-  - CPython `test_sqlite3` (no LD_PRELOAD/DYLD interpose)
-  - Django
-  - SQLite **TCL** suite (API-bound to `sqlite3` C interface)
-
-### 3.2 Official SQLite **sqllogictest** corpus against minisqlite (this round)
-
-minisqlite’s README notes that differential testing against real SQLite is *outside* their repo. We ran the public corpus ourselves.
+### 3.2 Official **sqllogictest** corpus (no C-API — fair multi-engine)
 
 | Field | Value |
 |---|---|
 | Corpus | [grahn/sqllogictest](https://github.com/grahn/sqllogictest) `test/**/*.test` |
-| Files | **621 / 622** (`select5.test` excluded — same exclusion as mpedb [CORPUS-STATUS.md](design/CORPUS-STATUS.md)) |
-| Runner | external `minisqlite_corpus` (answers as engine `sqlite` in `skipif`/`onlyif`; MD5 hash blocks; canonical I/R/T rendering) |
-| Host | Linux AMD EPYC-Milan 2c, 2026-07-21 |
-| Wall clock | **~187 s** end-to-end |
+| Files | **621 / 622** (`select5.test` excluded — same as mpedb [CORPUS-STATUS.md](design/CORPUS-STATUS.md)) |
+| Harness (this round) | same SLT parser + MD5 + I/R/T rendering; engines answer as `sqlite` in `skipif`/`onlyif` |
+| stock SQLite | rusqlite **bundled 3.45.0** (`sqlite_corpus`) — Linux |
+| minisqlite | `minisqlite_corpus` — **M3 + Linux** (identical totals) |
+| mpedb | `mpedb-testkit` `sqlite_corpus` + schema shim — M3 @ `b41b713` |
 
-**Headline:**
+**Headline (same 621 files):**
 
-| metric | minisqlite (Linux, this round) | mpedb (CORPUS-STATUS @ `b41b713`, M3) |
-|---|---:|---:|
-| records seen | **7 419 277** | 7 419 202 |
-| skipped (`onlyif` mysql/mssql, etc.) | **1 480 834** | 1 480 924 |
-| **attempted** | **5 938 443** | 5 938 278 |
-| **passed** | **5 938 436 — 99.999882 %** | 5 936 882 — 99.9765 % |
-| ├ statements | 210 080 | 208 748 |
-| └ queries | 5 728 356 | 5 728 134 |
-| queries md5-verified | **955 236** | 955 237 |
-| **wrong answers** | **4** | 0 genuine (4 flagged cascade / shim) |
-| **error mismatches** | **2** | **0** |
-| engine errors (expected ok) | **1** | counted under refused/unsupported (shim) |
-| refused / unsupported | n/a (native CREATE TABLE) | 1 392 (mostly runner artifacts) |
+| metric | **stock SQLite 3.45** (Linux) | **minisqlite** (M3 ≡ Linux) | **mpedb** (CORPUS-STATUS M3) |
+|---|---:|---:|---:|
+| records seen | **7 419 277** | **7 419 277** | 7 419 202 |
+| skipped | **1 480 834** | **1 480 834** | 1 480 924 |
+| **attempted** | **5 938 443** | **5 938 443** | 5 938 278 |
+| **passed** | **5 938 439 — 99.999933 %** | **5 938 436 — 99.999882 %** | 5 936 882 — 99.9765 % |
+| ├ statements | 210 082 | 210 080 | 208 748 |
+| └ queries | 5 728 357 | 5 728 356 | 5 728 134 |
+| md5-verified queries | **955 237** | **955 236** | 955 237 |
+| **wrong answers** | **3** | **4** | 0 genuine (4 flagged cascade/shim) |
+| **error mismatches** | **0** | **2** | **0** |
+| engine errors (expected ok) | **1** | **1** | in refused/unsupported |
+| refused / unsupported | 0 | 0 | 1 392 (mostly shim) |
+| wall clock | **~70 s** (Linux) | **~86 s** M3 · **~187 s** Linux | longer (shim + mpedb paths) |
 
-**minisqlite residual (all 7 failures):**
+**Shared residual (harness / extreme floats):** stock SQLite and minisqlite both miss the same 3 `evidence/slt_lang_aggfunc.test` cases — `sum`/`total` on extreme i64 rendered with `%.3f` vs corpus text (`…5808` vs `…6000`). That is **not** a minisqlite-only bug.
 
-| file | kind | notes |
-|---|---|---|
-| `evidence/slt_lang_aggfunc.test` | 3 wrong + 1 engine error | `sum`/`total` on extreme i64 values: float `%.3f` rounding vs SQLite text (`-9223372036854775808` vs `…6000`); one `sum(x)` raises *integer overflow* where the corpus expects a Real |
-| `random/…/slt_good_121.test` | 1 wrong | `SELECT DISTINCT *` cross join — 81 values, MD5 mismatch (ordering/distinct surface) |
-| errmis ×2 | expected-error vs success | same aggregate edge area (sampled with wrongs) |
+**minisqlite-only extras vs stock SQLite (same harness):**
 
-**Interpretation:** minisqlite is extremely close to stock SQLite on the portable logic corpus — better raw pass% than mpedb because it has native `CREATE TABLE`/permissive types and needs **no** mpedb schema shim. mpedb’s published corpus story is different: **zero genuine wrong answers** after categorizing shim artifacts, with a small set of deliberate engine gaps (see CORPUS-STATUS). Neither number is a substitute for the other.
-
-TH3 (proprietary) and the TCL suite were **not** run (no license / no C-API).
-
-### 3.3 mpedb (documented / prior measurement)
-
-| Suite | Status |
+| delta | detail |
 |---|---|
-| CPython `test_sqlite3` under shim | **459/467** pass (~98.3% of stock-passing); residual: progress + non-goals (serialize, AUTOINCREMENT×2, fts4, …) — see [C-API-COMPAT.md](C-API-COMPAT.md) |
-| Django frozen A | **831/831** |
-| Django `queries` | **493/493** |
-| SQLite sqllogictest corpus | **7.4M records**, zero wrong answers after shim accounting ([CORPUS-STATUS.md](design/CORPUS-STATUS.md)) |
-| Own engine/SQL/unit | `cargo test --workspace` (continuous) |
+| +1 wrong | `random/…/slt_good_121.test` — `SELECT DISTINCT *` cross join, 81 values, MD5 mismatch |
+| +2 errmis | expected-error vs success in the same aggregate edge area |
+| same 1 engine error | `sum(x)` integer overflow where corpus expects a Real (also fails on stock with this harness path) |
 
-### 3.4 C-API (direct)
+**mpedb:** lower raw pass% mainly from **schema shim** (no free `CREATE TABLE` in the seed model) and a small set of engine gaps; after discounting runner artifacts, CORPUS-STATUS reports **zero genuine wrong answers**. Not directly comparable to the native-DDL harness used for minisqlite/sqlite3.
 
-| | minisqlite | mpedb |
-|---|---|---|
-| `libsqlite3` ABI | ❌ | ✅ `libmpedb_sqlite3.{so,dylib}` |
-| Python `sqlite3` module | ❌ | ✅ interpose |
-| Django ORM | ❌ | ✅ (measured A + queries) |
-| Result codes / prepare / bind | N/A (Rust-only) | ✅ for drop-in subset |
+**PostgreSQL:** the public sqllogictest corpus is SQLite-dialect; we do **not** claim a PG score here (mpedb uses a separate 3-way differential generator for PG, not this corpus).
+
+### 3.3 C-API host suites (mpedb only)
+
+| Suite | minisqlite | mpedb | stock SQLite |
+|---|---|---|---|
+| CPython `test_sqlite3` | **N/A** (no C-API) | **459/467** (~98.3% of stock-passing); residual progress + non-goals — [C-API-COMPAT.md](C-API-COMPAT.md) | 467/467 stock |
+| Django frozen A | **N/A** | **831/831** | via pysqlite |
+| Django `queries` | **N/A** | **493/493** | via pysqlite |
+| `libsqlite3` ABI | ❌ | ✅ `libmpedb_sqlite3.{so,dylib}` | full |
 
 ---
 
@@ -167,7 +167,23 @@ median **mpedb 29 748** > **SQLite 28 540** > **PG 13 600** (6/7 per-run w
 
 ## 5. Speed — minisqlite measured
 
-### 5.1 Own `cargo bench` — Linux EPYC 2c (this round)
+### 5.1 Own `cargo bench` — M3 (2026-07-21 re-run, through 1M)
+
+Source: `~/mpedb-measure-results/minisqlite-bench-m3.log`
+
+```text
+scalability (wall-clock ms / peak heap KiB), sizes [1000, 10000, 100000, 1000000]
+workload                              1000             10000            100000           1000000
+point_lookup_indexed            0.6ms/123K       0.0ms/4554K      0.1ms/11886K     0.7ms/119426K
+range_scan                      0.1ms/125K       0.1ms/4555K      0.8ms/11881K     7.4ms/119364K
+equi_join                       0.4ms/558K       2.9ms/6960K     27.9ms/33122K   278.1ms/322757K
+group_by                        0.3ms/129K       1.5ms/4559K     15.1ms/11885K   152.4ms/119368K
+correlated_subquery             1.8ms/132K      17.9ms/4562K    178.8ms/11889K  1775.8ms/119372K
+
+durability round-trip (commit survives reopen, rollback leaves no trace): ok
+```
+
+### 5.2 Own `cargo bench` — Linux EPYC 2c
 
 Source: `~/mpedb-measure-results/minisqlite-bench-linux.log`
 
@@ -184,44 +200,29 @@ durability round-trip (commit survives reopen, rollback leaves no trace): ok
 process peak RSS: 367664 KiB
 ```
 
-### 5.2 Own `cargo bench` — M3 (earlier, sizes through 100k)
-
-Source: `~/mpedb-measure-results/minisqlite-bench.log`
-
-```text
-scalability (wall-clock ms / peak heap KiB), sizes [1000, 10000, 100000]
-workload                              1000             10000            100000
-point_lookup_indexed            0.6ms/…          0.0ms/…           0.1ms/…
-range_scan                      0.1ms            0.1ms             0.8ms
-equi_join                       0.4ms            3.0ms            29.9ms
-group_by                        0.2ms            1.6ms            15.9ms
-correlated_subquery             1.9ms           19.2ms           189.5ms
-durability round-trip: ok
-```
-
-This is **scalability / plan-shape**, not the same cells as mpedb-bench (no shared harness).
+This is **scalability / plan-shape**, not the same cells as mpedb-bench (no shared harness). M3 is ~3–4× faster than the 2-core Linux host on the large sizes (as expected).
 
 ### 5.3 Microbench (same logical schema as mpedb-bench `users` table)
 
 API: string-SQL per call (no prepare) — **unfavorable vs mpedb/SQLite prepared path**.
 
-**Linux EPYC 2c (this round)** — `~/mpedb-measure-results/minisqlite-micro-linux.log`:
-
-| Cell | minisqlite (Linux) | mpedb (RESULTS Linux) | SQLite (RESULTS Linux) | Note |
-|---|---:|---:|---:|---|
-| In-memory point-insert | ~83 k ops/s (n=50k) | ~187 k (none) | ~42 k (none) | String-SQL; tree grows with n |
-| Disk point-select (WAL) | ~160 k ops/s (n=20k) | ~437 k (none) | ~81 k (none) | mpedb ahead (hash-plan + SHM) |
-| Disk WAL batch 100/commit FULL | ~22 k rows/s (n=10k) | ~28 k durable | ~12 k durable | mini competitive on this host; still re-parse each INSERT |
-
-**M3 (earlier)** — `~/mpedb-measure-results/minisqlite-micro.log`:
+**M3 (2026-07-21 re-run)** — `minisqlite-micro-m3.log`:
 
 | Cell | minisqlite (M3) | mpedb (RESULTS M3) | SQLite (RESULTS M3) |
 |---|---:|---:|---:|
-| In-memory point-insert | ~176 k ops/s | ~233 k (none tmpfs) | ~117 k |
-| Disk point-select | ~200 k ops/s | ~1.26 M (none) | ~326 k |
-| Disk WAL batch 100/commit | ~6.8 k rows/s | ~28 k durable | ~27 k durable |
+| In-memory point-insert | **~262 k** ops/s (n=50k) | ~233 k (none tmpfs) | ~117 k |
+| Disk point-select (WAL) | **~235 k** ops/s (n=20k) | ~1.26 M (none) | ~326 k |
+| Disk WAL batch 100/commit FULL | **~5.0 k** rows/s (n=10k) | ~28 k durable | ~27 k durable |
 
-**Interpretation:** minisqlite is a serious SQLite clone. It **lacks a prepare hot path** and **multi-process**. On Linux batch-disk FULL it lands between stock SQLite and mpedb in this micro; on M3 durable batch it lagged both. Micro is **not** control-group-identical to mpedb-bench.
+**Linux EPYC 2c** — `minisqlite-micro-linux.log`:
+
+| Cell | minisqlite (Linux) | mpedb (RESULTS Linux) | SQLite (RESULTS Linux) |
+|---|---:|---:|---:|
+| In-memory point-insert | ~83 k ops/s (n=50k) | ~187 k (none) | ~42 k (none) |
+| Disk point-select (WAL) | ~160 k ops/s (n=20k) | ~437 k (none) | ~81 k (none) |
+| Disk WAL batch 100/commit FULL | ~22 k rows/s (n=10k) | ~28 k durable | ~12 k durable |
+
+**Interpretation:** minisqlite is a serious SQLite clone. It **lacks a prepare hot path** and **multi-process**. M3 durable batch is fsync-bound (~5k rows/s FULL); Linux batch looks stronger relative to stock SQLite on that host. Micro is **not** control-group-identical to mpedb-bench.
 
 ---
 
@@ -241,11 +242,13 @@ API: string-SQL per call (no prepare) — **unfavorable vs mpedb/SQLite prepared
 ## 7. What was *not* done this round
 
 - Re-bench of mpedb/SQLite/PostgreSQL (used committed RESULTS + existing M3 multi-run).
-- CPython/Django against minisqlite (impossible without C-API).
+- CPython/Django against minisqlite (impossible without C-API) — correctly **N/A**, not a fail.
+- Porting minisqlite’s 5605 Rust unit tests onto mpedb/sqlite3/PG (wrong tool; use sqllogictest for shared SQL).
 - SQLite TCL suite / TH3 (C-API / proprietary).
+- Full sqllogictest on **PostgreSQL** (dialect mismatch).
 - Shared mpedb-bench adapter for minisqlite (API too small: no prepare).
 - DuckDB / rest of LANDSCAPE.
-- `select5.test` (excluded for both engines; very large / historically out of headline).
+- `select5.test` (excluded for all engines in this headline).
 
 ---
 
@@ -287,16 +290,18 @@ find ~/sqllogictest/test -name '*.test' | sort | grep -v '/select5\.test$' > fli
 
 ### 9.3 Artifacts
 
-**Linux measure-host (this round):**
-- `~/mpedb-measure-results/minisqlite-test-linux.log` — unit suite (5605/0)
-- `~/mpedb-measure-results/minisqlite-corpus-linux.log` — full 621-file sqllogictest
-- `~/mpedb-measure-results/minisqlite-bench-linux.log` — cargo bench through 1M
-- `~/mpedb-measure-results/minisqlite-micro-linux.log` — micro insert/select/batch
+**M3 (2026-07-21, complete — no leftover processes):**
+- `~/mpedb-measure-results/minisqlite-test-m3.log` — unit **5605/0**
+- `~/mpedb-measure-results/minisqlite-corpus-m3.log` — 621-file sqllogictest, `DONE 2026-07-21T15:43:24+02:00` (~86 s)
+- `~/mpedb-measure-results/minisqlite-bench-m3.log` — cargo bench through 1M
+- `~/mpedb-measure-results/minisqlite-micro-m3.log` — micro insert/select/batch
 
-**M3 measure-host (earlier):**
-- `~/mpedb-measure-results/minisqlite-test.log`
-- `~/mpedb-measure-results/minisqlite-micro.log`
-- `~/mpedb-measure-results/minisqlite-bench.log`
+**Linux (same day):**
+- `~/mpedb-measure-results/minisqlite-test-linux.log` — unit 5605/0
+- `~/mpedb-measure-results/minisqlite-corpus-linux.log` — same residual as M3
+- `~/mpedb-measure-results/sqlite-corpus-linux.log` — stock SQLite 3.45.0 same 621-file corpus
+- `~/mpedb-measure-results/minisqlite-bench-linux.log`
+- `~/mpedb-measure-results/minisqlite-micro-linux.log`
 
 **mpedb RESULTS (reused):**
 - `crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md`
