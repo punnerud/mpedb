@@ -159,9 +159,30 @@ pub fn import_sqlite(
     tx.rollback()
         .map_err(|e| Error::Config(format!("sqlite snapshot release: {e}")))?;
 
-    // 4. publish mirror config + epoch, and enable CDC capture (final commit)
-    let maps = sqlite_table_maps(&src_tables, &schema);
-    publish_mirror_state(&db, &schema, state::SourceKind::Sqlite, &maps)?;
+    // 4. publish mirror config + epoch, and enable CDC capture (final commit).
+    // Multi-hop: if this SQLite file was itself an mpedb export (carries the
+    // `_mpedb_mirror_meta` sidecar), restore the *origin* SourceKind + TableMaps
+    // so PG → mpedb → SQLite → mpedb → PG can still recreate the original PG DDL.
+    // Without the sidecar, this is a first-hop sqlite import (SourceKind::Sqlite).
+    let (source_kind, maps) = match crate::export::load_sqlite_provenance(src)? {
+        Some((kind, side_maps)) => {
+            let mut out = sqlite_table_maps(&src_tables, &schema);
+            // Overlay sidecar maps by mpedb/sqlite table name so origin types
+            // win over freshly sniffed affinities.
+            for (tname, sm) in side_maps {
+                if let Some(tid) = schema.tables.iter().position(|t| t.name == tname) {
+                    if let Some(slot) = out.iter_mut().find(|(id, _)| *id == tid as u32) {
+                        slot.1 = sm;
+                    } else {
+                        out.push((tid as u32, sm));
+                    }
+                }
+            }
+            (kind, out)
+        }
+        None => (state::SourceKind::Sqlite, sqlite_table_maps(&src_tables, &schema)),
+    };
+    publish_mirror_state(&db, &schema, source_kind, &maps)?;
 
     Ok((db, report))
 }

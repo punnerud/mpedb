@@ -165,7 +165,20 @@ pub fn measure_batched_insert(
     cfg: &RunCfg,
     batch: i64,
 ) -> BResult<LatStats> {
-    let mut next = INSERT_BASE;
+    measure_batched_insert_from(conn, cfg, batch, INSERT_BASE)
+}
+
+/// Same as [`measure_batched_insert`], but starts ids at `id_base` so multi-rep
+/// durable cells can seed once and re-measure without a full reset (avoids
+/// re-seeding 50k rows — and an extra fsync storm — between every interleaved
+/// arm, which was dominating host noise on M3).
+pub fn measure_batched_insert_from(
+    conn: &mut dyn Conn,
+    cfg: &RunCfg,
+    batch: i64,
+    id_base: i64,
+) -> BResult<LatStats> {
+    let mut next = id_base;
     let calib_start = Instant::now();
     let calib_dur = Duration::from_secs_f64(cfg.calib_s);
     let mut calib_batches = 0u64;

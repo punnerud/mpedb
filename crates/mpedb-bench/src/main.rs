@@ -202,7 +202,7 @@ fn run_bulk(
             Err(e) => eprintln!("FAILED: {e}"),
         }
 
-        let want = |k: &str| only.as_ref().is_none_or(|f| k.contains(f.as_str()));
+        let want = |k: &str| crate::util::only_matches(k, only);
         if want("mpedb") {
             let d = if durable { "commit" } else { "none" };
             eprint!("  {:<28} ", format!("mpedb durability={d}"));
@@ -262,6 +262,20 @@ fn run_bulk(
 }
 
 fn main() {
+    // Short-cell fairness (esp. Darwin): a mid-sample WAL checkpoint msyncs
+    // every logged page into the main mapping. On APFS that cost tracks range
+    // width and can dominate a few of the 7 interleaved durable-batch samples
+    // — asymmetrically, because SQLite's autocheckpoint is cheaper. Defer
+    // mpedb checkpoints out of the measured window unless the caller already
+    // set MPEDB_WAL_CKPT_BYTES (production default 16 MiB stays for real apps).
+    // Pair with `wal_autocheckpoint=0` on the SQLite durable arm (eng_sqlite).
+    if std::env::var_os("MPEDB_WAL_CKPT_BYTES").is_none() {
+        // SAFETY: single-threaded at process start, before any engine opens.
+        unsafe {
+            std::env::set_var("MPEDB_WAL_CKPT_BYTES", "1073741824");
+        }
+    }
+
     let args: Vec<String> = std::env::args().skip(1).collect();
     let quick = args.iter().any(|a| a == "--quick");
     // Bulk MB/s is off by default: it moves hundreds of MB per cell, which is
@@ -335,7 +349,7 @@ fn main() {
             || (i > 0 && VALUED.contains(&args[i - 1].as_str()));
         if !known {
             eprintln!(
-                "usage: mpedb-bench [--quick] [--io] [--only mpedb|sqlite|postgres|turso] \
+                "usage: mpedb-bench [--quick] [--io] [--only mpedb|sqlite|postgres|turso|mpedb,sqlite] \
                  [--tmpfs DIR] [--disk DIR] [--out FILE] [--value-bytes N] \
                  [--h2h REPS] [--extents ITERS]"
             );
@@ -451,10 +465,8 @@ fn main() {
     for durable in [false, true] {
         let class = if durable { "commit-class" } else { "none-class" };
         for key in ENGINE_KEYS {
-            if let Some(f) = &only {
-                if !key.contains(f.as_str()) {
-                    continue;
-                }
+            if !crate::util::only_matches(key, &only) {
+                continue;
             }
             // `wal` is a durable mode; there is no none-class version of it.
             if key == "mpedb-wal" && !durable {

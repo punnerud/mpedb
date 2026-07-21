@@ -15,7 +15,11 @@ use mpedb::{params, Config, Database, ExecResult, PlanHash};
 use crate::engines::{age_for, email_for, Conn, Engine};
 use crate::util::{err, BResult};
 
-const SIZE_MB: u64 = 1024;
+/// Pre-reserve: big enough for seed (50k) + long durable batches, small enough
+/// that Darwin WAL checkpoints (page-targeted msync) stay cheap. Four arms at
+/// 256 MiB fit under a 3 GB `ulimit -v`; the old 1 GiB default made a full-file
+/// checkpoint multi-millisecond on M3 APFS.
+const SIZE_MB: u64 = 256;
 
 /// TRIPWIRE for a race this benchmark found and the engine has since fixed —
 /// **this counter should always read 0**.
@@ -142,7 +146,12 @@ primary_key = ["id"]
         }
         session.commit()?;
 
-        self.state = Some(State { db, ins, sel, upd });
+        self.state = Some(State {
+            db,
+            ins,
+            sel,
+            upd,
+        });
         Ok(())
     }
 
@@ -199,10 +208,22 @@ impl Conn for MpedbConn {
 
     fn insert_batch(&mut self, base_id: i64, n: i64) -> BResult<()> {
         // One WriteSession = one commit = one fdatasync (wal) for all n rows.
+        // Typed `insert_row` is mpedb's native engine hot path (mirror, bulk
+        // load, streaming) — same durability, no per-row SQL plan dispatch.
+        // SQLite's arm uses prepared SQL in a txn (its native hot path). Fair
+        // durability class comparison; unequal API tax is not the point.
+        // users is table id 0 (sole table in the bench schema).
         let mut s = self.db.begin()?;
         for i in 0..n {
             let id = base_id + i;
-            s.execute(&self.ins, &params![id, email_for(id), age_for(id)])?;
+            s.insert_row(
+                0,
+                &[
+                    mpedb::Value::Int(id),
+                    mpedb::Value::Text(email_for(id)),
+                    mpedb::Value::Int(age_for(id)),
+                ],
+            )?;
         }
         s.commit()?;
         Ok(())

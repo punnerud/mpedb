@@ -234,6 +234,14 @@ fn wal_full_pages() -> bool {
     *F
 }
 
+/// A/B knob (`MPEDB_WAL_CKPT_FULL=1`): force the whole-mapping msync arm of
+/// `wal_checkpoint_if` even on Darwin (where the default is page-targeted).
+fn wal_ckpt_full_msync() -> bool {
+    static F: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var("MPEDB_WAL_CKPT_FULL").is_ok_and(|v| v == "1"));
+    *F
+}
+
 /// Checkpoint threshold, env-overridable for tests and simulations
 /// (`MPEDB_WAL_CKPT_BYTES`); read once per process.
 pub fn wal_ckpt_threshold() -> u64 {
@@ -322,30 +330,67 @@ pub fn encode_wal_record(
     extent_map_root: u64,
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(WAL_RECORD_FIXED + pages.len() * 256);
+    encode_wal_record_into(
+        &mut buf,
+        offset,
+        txn_id,
+        pages.iter().map(|&(id, img)| (id, img)),
+        catalog_root,
+        freelist_root,
+        high_water,
+        extent_map_root,
+    );
+    buf
+}
+
+/// Append one page image to a WAL record body (id + FULL/SPLIT payload).
+fn append_wal_page_img(buf: &mut Vec<u8>, id: u64, img: &[u8]) {
+    debug_assert_eq!(img.len(), PAGE_SIZE);
+    buf.extend_from_slice(&id.to_le_bytes());
+    let (prefix_end, suffix_start) = crate::btree::used_span(img);
+    // SPLIT beats FULL only when the elided gap saves more than its 4-byte
+    // header overhead (id+enc are common to both); otherwise store FULL.
+    // MPEDB_WAL_FULL_PAGES forces FULL for A/B measurement.
+    if img.len() == PAGE_SIZE
+        && suffix_start.saturating_sub(prefix_end) > 4
+        && !wal_full_pages()
+    {
+        buf.push(WAL_ENC_SPLIT);
+        buf.extend_from_slice(&(prefix_end as u16).to_le_bytes());
+        buf.extend_from_slice(&(suffix_start as u16).to_le_bytes());
+        buf.extend_from_slice(&img[..prefix_end]);
+        buf.extend_from_slice(&img[suffix_start..]);
+    } else {
+        buf.push(WAL_ENC_FULL);
+        buf.extend_from_slice(img);
+    }
+}
+
+/// Encode a WAL record into `buf` (cleared first). Reused by the hot commit
+/// path so each durable ack does not allocate a fresh multi-page buffer.
+fn encode_wal_record_into<'a, I>(
+    buf: &mut Vec<u8>,
+    offset: u64,
+    txn_id: u64,
+    pages: I,
+    catalog_root: u64,
+    freelist_root: u64,
+    high_water: u64,
+    extent_map_root: u64,
+) where
+    I: IntoIterator<Item = (u64, &'a [u8])>,
+    I::IntoIter: ExactSizeIterator,
+{
+    let pages = pages.into_iter();
+    let n = pages.len();
+    buf.clear();
+    buf.reserve(WAL_RECORD_FIXED + n * 256);
     buf.extend_from_slice(&WAL_MAGIC.to_le_bytes());
     buf.extend_from_slice(&txn_id.to_le_bytes());
-    buf.extend_from_slice(&(pages.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&(n as u32).to_le_bytes());
     buf.extend_from_slice(&0u32.to_le_bytes()); // rec_len placeholder (byte 16)
-    for &(id, img) in pages {
-        debug_assert_eq!(img.len(), PAGE_SIZE);
-        buf.extend_from_slice(&id.to_le_bytes());
-        let (prefix_end, suffix_start) = crate::btree::used_span(img);
-        // SPLIT beats FULL only when the elided gap saves more than its 4-byte
-        // header overhead (id+enc are common to both); otherwise store FULL.
-        // MPEDB_WAL_FULL_PAGES forces FULL for A/B measurement.
-        if img.len() == PAGE_SIZE
-            && suffix_start.saturating_sub(prefix_end) > 4
-            && !wal_full_pages()
-        {
-            buf.push(WAL_ENC_SPLIT);
-            buf.extend_from_slice(&(prefix_end as u16).to_le_bytes());
-            buf.extend_from_slice(&(suffix_start as u16).to_le_bytes());
-            buf.extend_from_slice(&img[..prefix_end]);
-            buf.extend_from_slice(&img[suffix_start..]);
-        } else {
-            buf.push(WAL_ENC_FULL);
-            buf.extend_from_slice(img);
-        }
+    for (id, img) in pages {
+        append_wal_page_img(buf, id, img);
     }
     buf.extend_from_slice(&catalog_root.to_le_bytes());
     buf.extend_from_slice(&freelist_root.to_le_bytes());
@@ -355,9 +400,8 @@ pub fn encode_wal_record(
     // the checksum preimage so a torn/altered length cannot validate.
     let rec_len = (buf.len() + 8) as u32;
     buf[16..20].copy_from_slice(&rec_len.to_le_bytes());
-    let sum = wal_checksum(offset, &buf);
+    let sum = wal_checksum(offset, buf);
     buf.extend_from_slice(&sum.to_le_bytes());
-    buf
 }
 
 /// Decode + verify the record starting at byte 0 of `buf`, which sits at file
@@ -1418,26 +1462,43 @@ impl Shm {
     pub fn wal_commit(&self, dirty_sorted: &[u64], snap: &MetaSnapshot) -> Result<()> {
         let wal = self.wal_file()?;
         let off = self.wal_len().load(Ordering::Acquire);
-        let mut pages = Vec::with_capacity(dirty_sorted.len());
-        for &id in dirty_sorted {
-            pages.push((id, self.page(id)?));
+        // Reuse a thread-local encode buffer: writer lock is exclusive per
+        // process, so there is no concurrent wal_commit on this thread, and
+        // avoiding a fresh multi-page allocation per durable ack is free
+        // correctness-wise (buffer is only live until write_all_at returns).
+        thread_local! {
+            static ENC: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        let buf = encode_wal_record(
-            off,
-            snap.txn_id,
-            &pages,
-            snap.catalog_root,
-            snap.freelist_root,
-            snap.high_water,
-            snap.extent_map_root,
-        );
-        self.wal_ensure_alloc(off + buf.len() as u64)?;
-        wal.file.write_all_at(&buf, off)?;
-        if crate::os::fdatasync(wal.file.as_raw_fd()) != 0 {
-            return Err(io_err("fdatasync(wal)"));
-        }
-        self.wal_len().store(off + buf.len() as u64, Ordering::Release);
-        Ok(())
+        ENC.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            // Build page list without a second heap Vec of slices: encode
+            // header with count, then append each image from the mmap.
+            buf.clear();
+            buf.reserve(WAL_RECORD_FIXED + dirty_sorted.len() * 256);
+            buf.extend_from_slice(&WAL_MAGIC.to_le_bytes());
+            buf.extend_from_slice(&snap.txn_id.to_le_bytes());
+            buf.extend_from_slice(&(dirty_sorted.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes()); // rec_len placeholder
+            for &id in dirty_sorted {
+                let img = self.page(id)?;
+                append_wal_page_img(&mut buf, id, img);
+            }
+            buf.extend_from_slice(&snap.catalog_root.to_le_bytes());
+            buf.extend_from_slice(&snap.freelist_root.to_le_bytes());
+            buf.extend_from_slice(&snap.high_water.to_le_bytes());
+            buf.extend_from_slice(&snap.extent_map_root.to_le_bytes());
+            let rec_len = (buf.len() + 8) as u32;
+            buf[16..20].copy_from_slice(&rec_len.to_le_bytes());
+            let sum = wal_checksum(off, &buf);
+            buf.extend_from_slice(&sum.to_le_bytes());
+            self.wal_ensure_alloc(off + buf.len() as u64)?;
+            wal.file.write_all_at(&buf, off)?;
+            if crate::os::fdatasync(wal.file.as_raw_fd()) != 0 {
+                return Err(io_err("fdatasync(wal)"));
+            }
+            self.wal_len().store(off + buf.len() as u64, Ordering::Release);
+            Ok(())
+        })
     }
 
     /// Append one commit record WITHOUT fdatasync (`durability = async`,
@@ -1452,23 +1513,36 @@ impl Shm {
     pub fn wal_append_async(&self, dirty_sorted: &[u64], snap: &MetaSnapshot) -> Result<()> {
         let wal = self.wal_file()?;
         let off = self.wal_appended().load(Ordering::Acquire);
-        let mut pages = Vec::with_capacity(dirty_sorted.len());
-        for &id in dirty_sorted {
-            pages.push((id, self.page(id)?));
+        // Same thread-local encode buffer as `wal_commit` (writer lock exclusive).
+        thread_local! {
+            static ENC: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
         }
-        let buf = encode_wal_record(
-            off,
-            snap.txn_id,
-            &pages,
-            snap.catalog_root,
-            snap.freelist_root,
-            snap.high_water,
-            snap.extent_map_root,
-        );
-        self.wal_ensure_alloc(off + buf.len() as u64)?;
-        wal.file.write_all_at(&buf, off)?;
-        self.wal_appended().store(off + buf.len() as u64, Ordering::Release);
-        Ok(())
+        ENC.with(|cell| {
+            let mut buf = cell.borrow_mut();
+            buf.clear();
+            buf.reserve(WAL_RECORD_FIXED + dirty_sorted.len() * 256);
+            buf.extend_from_slice(&WAL_MAGIC.to_le_bytes());
+            buf.extend_from_slice(&snap.txn_id.to_le_bytes());
+            buf.extend_from_slice(&(dirty_sorted.len() as u32).to_le_bytes());
+            buf.extend_from_slice(&0u32.to_le_bytes());
+            for &id in dirty_sorted {
+                let img = self.page(id)?;
+                append_wal_page_img(&mut buf, id, img);
+            }
+            buf.extend_from_slice(&snap.catalog_root.to_le_bytes());
+            buf.extend_from_slice(&snap.freelist_root.to_le_bytes());
+            buf.extend_from_slice(&snap.high_water.to_le_bytes());
+            buf.extend_from_slice(&snap.extent_map_root.to_le_bytes());
+            let rec_len = (buf.len() + 8) as u32;
+            buf[16..20].copy_from_slice(&rec_len.to_le_bytes());
+            let sum = wal_checksum(off, &buf);
+            buf.extend_from_slice(&sum.to_le_bytes());
+            self.wal_ensure_alloc(off + buf.len() as u64)?;
+            wal.file.write_all_at(&buf, off)?;
+            self.wal_appended()
+                .store(off + buf.len() as u64, Ordering::Release);
+            Ok(())
+        })
     }
 
     /// The deferred flush (`durability = async`, §5.4.2): fdatasync the log up
@@ -1504,10 +1578,17 @@ impl Shm {
 
     /// Checkpoint if `wal_len - wal_ckpt >= threshold` (§5.4 wal):
     ///
-    /// 1. `msync` the WHOLE mapping (MS_SYNC): every commit ≤ the current
-    ///    meta — data pages and both meta slots — is now durable in the main
-    ///    file, so no log record below the current `wal_len` is needed for
-    ///    recovery any more.
+    /// 1. Make every page image in the log prefix durable in the main file
+    ///    (plus both meta slots). On Linux `msync(MS_SYNC)` is dirty-tag
+    ///    driven, so a whole-mapping call is fine and cheap. On Darwin
+    ///    `msync` costs the RANGE WIDTH, so a 1 GiB whole-file call costs
+    ///    milliseconds even when only a few dozen pages are dirty — measured
+    ///    M3 Pro: 2.4 ms for 1 GiB vs ~0.3 ms for 4 MiB. There we msync only
+    ///    the page ids that appear in WAL records `[ckpt, target)` (plus
+    ///    meta A/B): those are exactly the pages COW commits dirtied since
+    ///    the last checkpoint, so the main file then contains every commit
+    ///    the log could recover. `MPEDB_WAL_CKPT_FULL=1` restores the
+    ///    whole-mapping arm on every platform for A/B.
     /// 2. Advance `wal_ckpt = wal_len` and msync the lock page, so the new
     ///    checkpoint offset is durable BEFORE any log bytes below it are
     ///    reclaimed (a reboot recovery scans from the on-disk `wal_ckpt`;
@@ -1544,7 +1625,19 @@ impl Shm {
         if target.saturating_sub(ckpt) < threshold {
             return Ok(());
         }
-        self.msync_range(0, self.len)?; // 1. main file catches up to the log
+        // 1. main file catches up to the log
+        if wal_ckpt_full_msync() || cfg!(target_os = "linux") {
+            self.msync_range(0, self.len)?;
+        } else {
+            self.wal_msync_logged_pages(ckpt, target)?;
+            // Both meta slots may have been published by post-ckpt commits
+            // (write_meta_slot stores into the mmap without an msync in wal
+            // mode). Recovery does not trust metas, but a post-checkpoint
+            // crash that loses only the meta pages would force a WAL replay
+            // we just declared redundant — msync them explicitly.
+            self.msync_page(META_PAGE_A)?;
+            self.msync_page(META_PAGE_B)?;
+        }
         if self.durability == Durability::Async {
             self.wal_len().fetch_max(target, Ordering::AcqRel);
         }
@@ -1554,6 +1647,70 @@ impl Shm {
         // 3. best-effort space reclaim; failure (exotic fs / macOS) only means
         // the space is not reclaimed — correctness is unaffected.
         crate::os::punch_hole(wal.file.as_raw_fd(), 0, target as i64);
+        Ok(())
+    }
+
+    /// msync every data page image in WAL records `[from, to)`. Used by the
+    /// Darwin checkpoint arm so a multi-hundred-MiB mapping does not pay for
+    /// a full-file `msync` when only the logged pages changed.
+    fn wal_msync_logged_pages(&self, from: u64, to: u64) -> Result<()> {
+        if to <= from {
+            return Ok(());
+        }
+        let wal = self.wal_file()?;
+        let mut off = from;
+        let mut header = [0u8; WAL_HDR_LEN];
+        let mut buf: Vec<u8> = Vec::new();
+        let mut ids: Vec<u64> = Vec::new();
+        while off < to {
+            if read_full_at(&wal.file, &mut header, off)? < header.len() {
+                break;
+            }
+            let n_pages = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
+            let rec_len = u32::from_le_bytes(header[16..20].try_into().unwrap()) as usize;
+            if u32::from_le_bytes(header[0..4].try_into().unwrap()) != WAL_MAGIC
+                || n_pages as u64 > self.page_count
+                || rec_len < WAL_RECORD_FIXED
+                || rec_len > WAL_RECORD_FIXED + n_pages * WAL_PAGE_ENTRY
+            {
+                break;
+            }
+            buf.clear();
+            buf.resize(rec_len, 0);
+            if read_full_at(&wal.file, &mut buf, off)? < rec_len {
+                break;
+            }
+            let Some(rec) = decode_wal_record(&buf, off, self.page_count) else {
+                break;
+            };
+            for (id, _) in &rec.pages {
+                if *id >= self.data_start {
+                    ids.push(*id);
+                }
+            }
+            off += rec.len;
+            if off > to {
+                break;
+            }
+        }
+        ids.sort_unstable();
+        ids.dedup();
+        // Coalesce contiguous page ids into range msyncs (Darwin still pays
+        // range width, so tight runs matter; gaps skip clean pages).
+        let mut i = 0;
+        while i < ids.len() {
+            let start = ids[i];
+            let mut end = start;
+            while i + 1 < ids.len() && ids[i + 1] == end + 1 {
+                i += 1;
+                end = ids[i];
+            }
+            self.msync_range(
+                start as usize * PAGE_SIZE,
+                (end - start + 1) as usize * PAGE_SIZE,
+            )?;
+            i += 1;
+        }
         Ok(())
     }
 

@@ -61,8 +61,10 @@ impl<'e> WriteTxn<'e> {
     /// slot can never be picked up, released, and re-used while a stale
     /// poster still holds a reference to its previous incarnation.
     pub fn commit_with<F: FnOnce()>(self, after_flip: F) -> Result<()> {
+        #[cfg(feature = "leakstat")]
         let __commit_t = std::time::Instant::now();
         let __r = self.commit_inner(after_flip);
+        #[cfg(feature = "leakstat")]
         leakstat::add(&leakstat::INS_NS_COMMIT, __commit_t.elapsed().as_nanos() as u64);
         __r
     }

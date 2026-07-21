@@ -19,7 +19,7 @@ use std::time::Duration;
 use rusqlite::Connection;
 
 use crate::engines::{age_for, email_for, Conn, Engine};
-use crate::util::{BResult, BoxErr};
+use crate::util::{err, BResult, BoxErr};
 
 #[derive(Clone, Copy)]
 // The `*Class` suffix is intentional — each variant names a durability class.
@@ -55,6 +55,13 @@ pub struct SqliteEngine {
 fn fullfsync_on_apple(conn: &Connection) -> BResult<()> {
     if cfg!(target_vendor = "apple") {
         conn.pragma_update(None, "fullfsync", true)?;
+        // Tripwire: a silent no-op leaves durable-on-ack cells comparing a real
+        // mpedb F_FULLFSYNC against plain fsync (cache-only) SQLite — which
+        // looked like a 30% SQLite "win" until verified with pragma readback.
+        let on: i64 = conn.pragma_query_value(None, "fullfsync", |r| r.get(0))?;
+        if on == 0 {
+            return err("PRAGMA fullfsync=ON did not stick (Apple durable-on-ack)");
+        }
     }
     Ok(())
 }
@@ -81,6 +88,10 @@ impl SqliteEngine {
                 conn.pragma_update(None, "journal_mode", "WAL")?;
                 conn.pragma_update(None, "synchronous", "FULL")?;
                 fullfsync_on_apple(&conn)?;
+                // Defer autocheckpoint out of short calibrated cells — pairs
+                // with mpedb-bench's elevated MPEDB_WAL_CKPT_BYTES so neither
+                // engine pays a maintenance sync mid-sample (see main.rs).
+                conn.pragma_update(None, "wal_autocheckpoint", 0)?;
             }
             SqliteMode::NormalClass => {
                 conn.pragma_update(None, "journal_mode", "WAL")?;
