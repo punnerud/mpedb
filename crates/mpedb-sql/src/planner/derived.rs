@@ -96,6 +96,7 @@ pub(super) fn plan_derived_select(
         order_by: s.order_by.clone(),
         limit: s.limit,
         offset: s.offset,
+    drop_trailing: 0,
     };
     // Refuse an outer-statement subquery BEFORE planning: the lift builds its
     // correlation scope from the schema alone (it cannot see the working

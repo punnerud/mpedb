@@ -199,6 +199,7 @@ pub(super) fn lift_subqueries<'a>(
             .collect::<Result<_>>()?,
         limit: s.limit,
         offset: s.offset,
+        drop_trailing: s.drop_trailing,
     };
     Ok(Lifted {
         stmt,
@@ -774,6 +775,7 @@ impl<'a> Correlate<'a, '_> {
                 .collect::<Result<_>>()?,
             limit: s.limit,
             offset: s.offset,
+            drop_trailing: s.drop_trailing,
         })
     }
 

@@ -171,6 +171,7 @@ pub(super) fn rewrite_right_join<'s>(
         order_by: s.order_by.clone(),
         limit: s.limit,
         offset: s.offset,
+        drop_trailing: s.drop_trailing,
     }))
 }
 
@@ -621,7 +622,12 @@ fn plan_join_select_inner<'s>(
         let (keys, n_junk) = distinct_order_by(s, &full_scope, None, binder.host_colls())?;
         order_by = keys;
         order_over = OrderOver::Projection;
-        order_junk = n_junk;
+        order_junk = n_junk.saturating_add(s.drop_trailing);
+    } else if s.drop_trailing > 0 && s.order_by.is_empty() {
+        // Projection-passthrough collapse left trailing columns with no
+        // ORDER BY — still need the Projection route so order_junk applies.
+        order_over = OrderOver::Projection;
+        order_junk = s.drop_trailing;
     } else if !s.order_by.is_empty() {
         // The "base row" of a join IS the joined row, and it is built in full
         // before the sort — so sorting it is the same operation, just wider.
@@ -655,14 +661,14 @@ fn plan_join_select_inner<'s>(
                 }
             }
         }
-        if all_cols {
+        if all_cols && s.drop_trailing == 0 {
             order_by = keys;
         } else {
             let (keys, n_junk) =
                 join_order_by(s, &full_scope, &mut projection, &mut binder, &namer)?;
             order_by = keys;
             order_over = OrderOver::Projection;
-            order_junk = n_junk;
+            order_junk = n_junk.saturating_add(s.drop_trailing);
         }
     }
 

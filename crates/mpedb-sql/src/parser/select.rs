@@ -76,6 +76,7 @@ fn from_less_select(items: Vec<(Expr, Option<String>)>) -> SelectStmt {
         order_by: Vec::new(),
         limit: None,
         offset: None,
+    drop_trailing: 0,
     }
 }
 
@@ -472,6 +473,7 @@ impl<'a> Parser<'a> {
             order_by,
             limit,
             offset,
+        drop_trailing: 0,
         })
     }
 

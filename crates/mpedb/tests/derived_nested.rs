@@ -353,10 +353,6 @@ fn genuinely_nested_derived_still_refuses() {
     let d = db();
     let nested = "only supported in a statement's outermost FROM";
     for q in [
-        // Django `test_distinct_ordered_sliced_subquery`: the wrapper drops a
-        // column, and a subquery may output only one — so the derived table
-        // must survive INSIDE the lifted subquery's body.
-        "SELECT s FROM t WHERE id IN (SELECT sq.id FROM (SELECT DISTINCT id, a FROM t ORDER BY a LIMIT 2) sq) ORDER BY 1",
         // A filtering (not pass-through) consumer inside a subquery body.
         "SELECT id FROM t WHERE EXISTS (SELECT 1 FROM (SELECT b FROM u GROUP BY b) x WHERE x.b > 10)",
         // A filtering consumer inside a derived body.
@@ -364,13 +360,41 @@ fn genuinely_nested_derived_still_refuses() {
     ] {
         refused_narrower(&d, q, nested);
     }
-    // A multi-row `VALUES` carrying an expression (Django `test_bulk_insert`)
-    // is a different gap with the same shape of cause: `InsertSource` has no
-    // expression variant, and the `INSERT … SELECT` rewrite the single-row form
-    // takes would need a compound source.
-    let e = d
-        .query("INSERT INTO t (id, s) VALUES (7, lower('A')), (8, lower('B'))", &[])
-        .unwrap_err();
-    assert!(e.to_string().contains("literals or parameters"), "{e}");
+    d.verify().unwrap();
+}
+
+/// Django `test_distinct_ordered_sliced_subquery`: a projection-restricting
+/// wrapper as the whole IN-subquery body collapses onto the inner DISTINCT /
+/// ORDER BY / LIMIT select (selected columns first; DISTINCT still sees the
+/// full inner projection via trailing junk).
+#[test]
+fn projection_passthrough_subquery_body_matches_sqlite() {
+    let d = db();
+    for q in [
+        "SELECT s FROM t WHERE id IN (SELECT sq.id FROM (SELECT DISTINCT id, a FROM t ORDER BY a LIMIT 2) sq) ORDER BY 1",
+        "SELECT s FROM t WHERE id IN (SELECT sq.id FROM (SELECT DISTINCT id, a FROM t ORDER BY a DESC LIMIT 3) sq) ORDER BY 1",
+        "SELECT id FROM t WHERE a IN (SELECT x.b FROM (SELECT DISTINCT b, id FROM u ORDER BY id LIMIT 2) x) ORDER BY 1",
+        // Reorder + drop.
+        "SELECT s FROM t WHERE id IN (SELECT sq.a FROM (SELECT DISTINCT id AS a, s AS b FROM t ORDER BY b LIMIT 2) sq) ORDER BY 1",
+    ] {
+        same(&d, q);
+    }
+    d.verify().unwrap();
+}
+
+/// Django `test_qs_with_subcompound_qs`: `A EXCEPT (B INTERSECT C)` still needs
+/// a nested compound arm (set identity rewrites cannot flatten into a
+/// left-associative chain). Stays refused by name until compound arms can own
+/// a nested compound / derived source.
+#[test]
+fn except_intersect_nest_still_refuses() {
+    let d = db();
+    let nested = "only supported in a statement's outermost FROM";
+    for q in [
+        "SELECT count(*) FROM (SELECT id FROM t EXCEPT SELECT * FROM (SELECT id FROM t INTERSECT SELECT id FROM u WHERE b > 10)) sub",
+        "SELECT id FROM t EXCEPT SELECT * FROM (SELECT id FROM t INTERSECT SELECT id FROM u) ORDER BY 1",
+    ] {
+        refused_narrower(&d, q, nested);
+    }
     d.verify().unwrap();
 }

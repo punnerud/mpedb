@@ -1075,6 +1075,7 @@ fn values_as_select(
             order_by: Vec::new(),
             limit: None,
             offset: None,
+        drop_trailing: 0,
         })),
         on_conflict: s.on_conflict.clone(),
         returning: s.returning.clone(),
