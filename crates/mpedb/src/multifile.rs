@@ -30,11 +30,13 @@
 //! untouched — no PLAN_FORMAT bump. `prepare` keeps them in a private
 //! `cross_cache`; ATTACH/DETACH bumps the attach epoch and drops it.
 //!
-//! **v1 is read-only cross-file.** Writes/DDL touching an attached database,
-//! cross-file statements inside an open [`WriteSession`], RLS policies on any
-//! involved member, ATTACHing a file that does not exist (sqlite would create
-//! it), `:memory:`, and bound-parameter ATTACH paths are all refused BY NAME
-//! — never answered differently from sqlite.
+//! **Cross-file reads** are the main path. **Pure attached-only writes/DDL**
+//! (every table in the statement lives on one attached member) forward to that
+//! member's handle — including `ATTACH ':memory:'` + schema-qualified
+//! `CREATE`/`INSERT` (CPython `test_database_source_name`). **Mixed**
+//! main+attached writes, cross-file statements inside an open [`WriteSession`],
+//! RLS policies on any involved member, ATTACHing a missing file, and
+//! bound-parameter ATTACH paths are refused BY NAME.
 
 use crate::exec::{exec_stmt, ReadCtx, TxnCtx};
 use crate::{Database, ExecResult, Session, POISON};
@@ -42,9 +44,38 @@ use mpedb_core::ReadTxn;
 use mpedb_sql::{
     AttachStmt, CompiledPlan, DbResolution, DbScope, PlanHash, PolicyCatalog, SortDir,
 };
-use mpedb_types::{Error, ExprProgram, HostFns, Result, Schema, TableDef, Value};
+use mpedb_types::{Config, Error, ExprProgram, HostFns, Result, Schema, TableDef, Value};
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+
+static ATTACH_EPHEMERAL_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// `ATTACH ':memory:'` — a fresh empty mpedb file on `/dev/shm` (or temp),
+/// unlinked on DETACH. Seed is a one-column dummy table the live DDL path can
+/// grow past; CPython's backup of the attached schema only needs tables the
+/// test creates.
+fn open_ephemeral_attach() -> Result<Database> {
+    let dir = if std::path::Path::new("/dev/shm").is_dir() {
+        std::path::PathBuf::from("/dev/shm")
+    } else {
+        std::env::temp_dir()
+    };
+    let seq = ATTACH_EPHEMERAL_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!(
+        "mpedb-attach-mem-{}-{}.mpedb",
+        std::process::id(),
+        seq
+    ));
+    let _ = std::fs::remove_file(&path);
+    let p = path.to_string_lossy().replace('\\', "\\\\").replace('"', "\\\"");
+    let toml = format!(
+        "[database]\npath = \"{p}\"\nsize_mb = 16\nmax_readers = 32\n\n\
+         [[table]]\nname = \"attach_seed\"\nprimary_key = [\"id\"]\n\n\
+           [[table.column]]\n  name = \"id\"\n  type = \"int64\"\n"
+    );
+    Database::open_with_config(Config::from_toml_str(&toml)?)
+}
 
 /// sqlite's default `SQLITE_MAX_ATTACHED`.
 const MAX_ATTACHED: usize = 10;
@@ -53,6 +84,8 @@ const MAX_ATTACHED: usize = 10;
 pub(crate) struct AttachedMember {
     pub name: String,
     pub db: Database,
+    /// Created by `ATTACH ':memory:'` — unlink the backing file on DETACH.
+    pub ephemeral: bool,
 }
 
 /// The connection-local attach list. `epoch` bumps on every ATTACH/DETACH so
@@ -65,7 +98,7 @@ pub(crate) struct AttachState {
 }
 
 impl AttachState {
-    fn find(&self, name: &str) -> Option<usize> {
+    pub(crate) fn find(&self, name: &str) -> Option<usize> {
         self.members
             .iter()
             .position(|m| m.name.eq_ignore_ascii_case(name))
@@ -100,6 +133,11 @@ pub(crate) enum DbRoute {
     Cross {
         sql: String,
         tables: Vec<(String, String)>,
+    },
+    /// A pure write/DDL on exactly one attached member — run on that handle.
+    AttachedOnly {
+        db: String,
+        sql: String,
     },
 }
 
@@ -143,10 +181,10 @@ impl Database {
                     // sqlite: `database main is already in use`.
                     return Err(Error::Bind(format!("database {name} is already in use")));
                 }
-                if path == ":memory:" || path.starts_with("file:") {
+                if path.starts_with("file:") && path != "file::memory:" {
                     return Err(Error::Unsupported(
-                        "ATTACH of ':memory:'/URI databases is not supported; \
-                         attach an existing .mpedb file by path"
+                        "ATTACH of URI databases is not supported; \
+                         attach an existing .mpedb file by path, or ':memory:'"
                             .into(),
                     ));
                 }
@@ -160,16 +198,26 @@ impl Database {
                         "too many attached databases - max 10".into(),
                     ));
                 }
-                let p = std::path::Path::new(&path);
-                if !p.exists() {
-                    return Err(Error::Unsupported(format!(
-                        "cannot ATTACH `{path}`: file does not exist (mpedb v1 \
-                         does not create databases on ATTACH; open it once with \
-                         a config first)"
-                    )));
-                }
-                let db = Database::open_from_file(p)?;
-                guard.members.push(AttachedMember { name, db });
+                let (db, ephemeral) = if path == ":memory:" || path == "file::memory:" || path.is_empty()
+                {
+                    let db = open_ephemeral_attach()?;
+                    (db, true)
+                } else {
+                    let p = std::path::Path::new(&path);
+                    if !p.exists() {
+                        return Err(Error::Unsupported(format!(
+                            "cannot ATTACH `{path}`: file does not exist (mpedb v1 \
+                             does not create databases on ATTACH; open it once with \
+                             a config first)"
+                        )));
+                    }
+                    (Database::open_from_file(p)?, false)
+                };
+                guard.members.push(AttachedMember {
+                    name,
+                    db,
+                    ephemeral,
+                });
                 guard.epoch += 1;
                 drop(guard);
                 self.cross_cache.write().expect(POISON).clear();
@@ -182,10 +230,16 @@ impl Database {
                 let mut guard = self.attached.write().expect(POISON);
                 match guard.find(&name) {
                     Some(i) => {
-                        guard.members.remove(i);
+                        let member = guard.members.remove(i);
                         guard.epoch += 1;
                         drop(guard);
                         self.cross_cache.write().expect(POISON).clear();
+                        if member.ephemeral {
+                            let path = member.db.path().to_path_buf();
+                            drop(member);
+                            let _ = std::fs::remove_file(&path);
+                            let _ = std::fs::remove_file(format!("{}-wal", path.display()));
+                        }
                         Ok(ExecResult::Affected(0))
                     }
                     None => Err(Error::Bind(format!("no such database: {name}"))),
@@ -217,7 +271,24 @@ impl Database {
                 }
             }
             DbResolution::Cross { sql, tables } => Ok(DbRoute::Cross { sql, tables }),
+            DbResolution::AttachedOnly { db, sql } => Ok(DbRoute::AttachedOnly { db, sql }),
         }
+    }
+
+    /// Run a pure attached-only statement on the named member.
+    pub(crate) fn query_attached_only(
+        &self,
+        db: &str,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<ExecResult> {
+        let guard = self.attached.read().expect(POISON);
+        let i = guard
+            .find(db)
+            .ok_or_else(|| Error::Bind(format!("no such database: {db}")))?;
+        // Clone Arc? Database is not Arc - we need to call query while holding
+        // the read lock. Database::query takes &self, so this is fine.
+        guard.members[i].db.query(sql, params)
     }
 
     fn build_scope(&self, guard: &AttachState) -> Result<DbScope> {

@@ -82,6 +82,14 @@ pub enum DbResolution {
         sql: String,
         tables: Vec<(String, String)>,
     },
+    /// A write or DDL that touches exactly one attached database and nothing
+    /// on main: strip the schema qualifier and run the statement on that
+    /// member's own handle (CPython `ATTACH ':memory:'` + `CREATE/INSERT`
+    /// on the attached schema). Cross-file writes still refuse.
+    AttachedOnly {
+        db: String,
+        sql: String,
+    },
 }
 
 /// A parsed `ATTACH` / `DETACH` statement (sqlite grammar:
@@ -360,18 +368,50 @@ pub fn resolve_db_refs(sql: &str, scope: &DbScope) -> Result<DbResolution> {
         .any(|(_, t)| matches!(t, Target::Attached(_)));
 
     if class == StmtClass::Write {
-        if let Some((i, Target::Attached(m))) = resolved
+        let attached_ms: Vec<usize> = resolved
             .iter()
-            .find(|(_, t)| matches!(t, Target::Attached(_)))
-        {
-            let r = &refs[*i];
-            let db = &scope.attached[*m].0;
-            return Err(Error::Unsupported(format!(
-                "cross-file writes are not supported in v1: table `{}` is in \
-                 attached database `{db}` (write through a handle opened on \
-                 that file instead)",
-                r.name
-            )));
+            .filter_map(|(_, t)| match t {
+                Target::Attached(m) => Some(*m),
+                _ => None,
+            })
+            .collect();
+        let any_main = resolved
+            .iter()
+            .any(|(_, t)| matches!(t, Target::Main | Target::Unknown));
+        if !attached_ms.is_empty() {
+            let first = attached_ms[0];
+            let pure = !any_main && attached_ms.iter().all(|m| *m == first);
+            if !pure {
+                let r = &refs[resolved
+                    .iter()
+                    .find(|(_, t)| matches!(t, Target::Attached(_)))
+                    .map(|(i, _)| *i)
+                    .unwrap_or(0)];
+                let db = &scope.attached[first].0;
+                return Err(Error::Unsupported(format!(
+                    "cross-file writes are not supported in v1: table `{}` is in \
+                     attached database `{db}` (write through a handle opened on \
+                     that file instead)",
+                    r.name
+                )));
+            }
+            // Pure single-attached write: strip the schema qualifier and
+            // forward to that member's handle.
+            let mut edits = Vec::new();
+            for r in &refs {
+                if r.db.is_some() {
+                    edits.push(Edit {
+                        start: toks[r.start].pos,
+                        end: end_of(r.name_idx),
+                        text: format!("{} ", quote_ident(&r.name)),
+                    });
+                }
+            }
+            three_part_edits(&toks, scope, &refs, end_of, &mut edits)?;
+            return Ok(DbResolution::AttachedOnly {
+                db: scope.attached[first].0.clone(),
+                sql: apply_edits(sql, edits),
+            });
         }
         // No attached reference: strip `main.` qualifiers and pass through.
         let mut edits = Vec::new();
@@ -468,7 +508,8 @@ pub fn resolve_db_refs(sql: &str, scope: &DbScope) -> Result<DbResolution> {
     }
 }
 
-/// DDL: strip `main.` on any dotted name; refuse an attached qualifier.
+/// DDL: strip `main.` on any dotted name; a pure single-attached qualifier
+/// strips and forwards (`CREATE TABLE attached.foo`); mixed/cross still refuse.
 fn resolve_ddl(
     sql: &str,
     scope: &DbScope,
@@ -476,6 +517,7 @@ fn resolve_ddl(
     end_of: impl Fn(usize) -> usize,
 ) -> Result<DbResolution> {
     let mut edits = Vec::new();
+    let mut attached_ms: Vec<usize> = Vec::new();
     let mut i = 0;
     while i + 2 < toks.len() {
         let trip = (
@@ -495,16 +537,33 @@ fn resolve_ddl(
                 continue;
             }
             if let Some(m) = scope.find_db(db) {
-                return Err(Error::Unsupported(format!(
-                    "DDL on an attached database is not supported in v1: \
-                     `{}.{name}` is in attached database `{}`",
-                    db, scope.attached[m].0
-                )));
+                attached_ms.push(m);
+                let name = name.to_string();
+                edits.push(Edit {
+                    start: toks[i].pos,
+                    end: end_of(i + 2),
+                    text: format!("{} ", quote_ident(&name)),
+                });
+                i += 3;
+                continue;
             }
         }
         i += 1;
     }
-    Ok(DbResolution::MainOnly(apply_edits(sql, edits)))
+    if attached_ms.is_empty() {
+        return Ok(DbResolution::MainOnly(apply_edits(sql, edits)));
+    }
+    let first = attached_ms[0];
+    if attached_ms.iter().any(|m| *m != first) {
+        return Err(Error::Unsupported(format!(
+            "DDL on an attached database is not supported in v1: \
+             statement spans more than one attached database"
+        )));
+    }
+    Ok(DbResolution::AttachedOnly {
+        db: scope.attached[first].0.clone(),
+        sql: apply_edits(sql, edits),
+    })
 }
 
 /// Collect `WITH [RECURSIVE] name [(cols)] AS ( … ) [, name …]` names.
@@ -832,6 +891,9 @@ mod tests {
         match resolve_db_refs(sql, &scope()).unwrap() {
             DbResolution::Cross { sql, tables } => (sql, tables),
             DbResolution::MainOnly(s) => panic!("expected Cross, got MainOnly({s})"),
+            DbResolution::AttachedOnly { db, sql } => {
+                panic!("expected Cross, got AttachedOnly({db}, {sql})")
+            }
         }
     }
 
@@ -839,6 +901,9 @@ mod tests {
         match resolve_db_refs(sql, &scope()).unwrap() {
             DbResolution::MainOnly(s) => s,
             DbResolution::Cross { sql, .. } => panic!("expected MainOnly, got Cross({sql})"),
+            DbResolution::AttachedOnly { db, sql } => {
+                panic!("expected MainOnly, got AttachedOnly({db}, {sql})")
+            }
         }
     }
 
@@ -902,13 +967,26 @@ mod tests {
     }
 
     #[test]
-    fn writes_to_attached_refused_by_name() {
+    fn pure_attached_writes_forward() {
         for sql in [
             "INSERT INTO other.u (x) VALUES (1)",
             "UPDATE other.u SET y = 1",
             "DELETE FROM other.u",
-            // bare name resolving to attached
+            // bare name resolving to attached only
             "INSERT INTO u (x) VALUES (1)",
+        ] {
+            match resolve_db_refs(sql, &scope()).unwrap() {
+                DbResolution::AttachedOnly { db, .. } => {
+                    assert_eq!(db, "other");
+                }
+                other => panic!("{sql} → {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_writes_to_attached_refused_by_name() {
+        for sql in [
             // main write reading attached
             "INSERT INTO t SELECT x, 'a' FROM other.u",
             "UPDATE t SET tag = 'x' WHERE a IN (SELECT x FROM other.u)",
@@ -935,11 +1013,18 @@ mod tests {
     }
 
     #[test]
-    fn ddl_on_attached_refused_main_strips() {
-        let e = resolve_db_refs("CREATE TABLE other.w (q INT)", &scope()).unwrap_err();
-        assert!(e.to_string().contains("DDL on an attached database"), "{e}");
-        let e = resolve_db_refs("DROP TABLE third.u", &scope()).unwrap_err();
-        assert!(e.to_string().contains("DDL on an attached database"), "{e}");
+    fn ddl_on_attached_forwards_main_strips() {
+        match resolve_db_refs("CREATE TABLE other.w (q INT)", &scope()).unwrap() {
+            DbResolution::AttachedOnly { db, sql } => {
+                assert_eq!(db, "other");
+                assert!(sql.contains("CREATE TABLE") && sql.contains("w"), "{sql}");
+            }
+            other => panic!("{other:?}"),
+        }
+        match resolve_db_refs("DROP TABLE third.u", &scope()).unwrap() {
+            DbResolution::AttachedOnly { db, .. } => assert_eq!(db, "third"),
+            other => panic!("{other:?}"),
+        }
         assert_eq!(
             main_only("DROP TABLE main.t"),
             "DROP TABLE \"t\" "

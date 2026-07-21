@@ -1079,6 +1079,14 @@ impl Database {
                     .insert(hash, Arc::new(cp));
                 return Ok(hash);
             }
+            multifile::DbRoute::AttachedOnly { db, sql } => {
+                // Prepare on the member handle so execute-by-hash stays local.
+                let guard = self.attached.read().expect(POISON);
+                let i = guard
+                    .find(&db)
+                    .ok_or_else(|| mpedb_types::Error::Bind(format!("no such database: {db}")))?;
+                return guard.members[i].db.prepare(&sql);
+            }
         };
         let plan = self.compile_maybe_explain(sql)?.0;
         self.warn_if_risky(&plan);
@@ -1156,6 +1164,9 @@ impl Database {
             multifile::DbRoute::Cross { sql, tables } => {
                 return self.query_cross(session, &sql, &tables, params)
             }
+            multifile::DbRoute::AttachedOnly { db, sql } => {
+                return self.query_attached_only(&db, &sql, params);
+            }
         };
         // RLS DDL (CREATE/DROP POLICY, ALTER TABLE … ROW LEVEL SECURITY) mutates
         // the catalog rather than compiling to a plan — apply it directly.
@@ -1197,7 +1208,7 @@ impl Database {
                 routed = s;
                 &routed
             }
-            multifile::DbRoute::Cross { .. } => {
+            multifile::DbRoute::Cross { .. } | multifile::DbRoute::AttachedOnly { .. } => {
                 return Err(Error::Unsupported(
                     "cross-file statements cannot be prepared as detached \
                      plans; use prepare()/execute() on this handle"
@@ -1914,6 +1925,14 @@ impl WriteSession<'_> {
                 return Err(Error::Unsupported(
                     "cross-file SELECT inside an open write transaction is \
                      not supported in v1 (run it in autocommit)"
+                        .into(),
+                ))
+            }
+            multifile::DbRoute::AttachedOnly { .. } => {
+                return Err(Error::Unsupported(
+                    "writes to an attached database inside an open write \
+                     transaction on main are not supported in v1 (run them \
+                     in autocommit)"
                         .into(),
                 ))
             }
