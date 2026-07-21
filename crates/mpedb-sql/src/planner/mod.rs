@@ -369,78 +369,18 @@ fn owned_subplan_total(stmt: &PlanStmt) -> usize {
     }
 }
 
-/// A CORRELATED subplan slot is filled per outer row AFTER the gather, so the
-/// programs allowed to read it are the ones that still run PER ROW: the WHERE —
-/// which the correlated split routes into `post_filter` — and an aggregate's
-/// `FILTER (WHERE …)`, which the aggregate loop evaluates row by row against that
-/// row's filled scratch. In an aggregate query the group keys, aggregate
-/// arguments, HAVING and the grouped projection all run over collapsed groups,
-/// where "which row's correlation?" has no answer, so a correlated slot in any
-/// of them is refused (#73 §1.2c).
-///
-/// `AggCall::filter` is therefore DELIBERATELY absent from the checks below, and
-/// from validate's mirror of them. Adding it back is a wrong answer, not a
-/// tightening: a rejected-at-runtime filter reads NULL from the unfilled slot and
-/// 3VL DROPS the row, so `count(*) FILTER (WHERE EXISTS (…))` and its negation
-/// both returned 0.
-///
-/// This mirrors `validate`'s gather-side slot discipline and is enforced HERE
-/// as well because a freshly compiled plan is executed WITHOUT a decode
-/// round-trip (validate only runs when a plan is loaded from the registry), so
-/// leaning on validate alone would let the direct query path misanswer instead
-/// of refuse. `sub_base` is the first reserved subplan slot (the user param
-/// count at plan time); `correlated[i]` flags whether slot `sub_base + i` is
-/// correlated.
+/// Hook for aggregate + correlated-slot discipline. All positions are legal
+/// now: per-row (WHERE → `post_filter`, GROUP BY key, aggregate arg, FILTER)
+/// fill via `row_params`; per-group (HAVING, non-key SELECT-list) use the
+/// group's first base-row param scratch (sqlite bare-column convention; Django
+/// OuterRef on a group key is constant within the group). Kept so a future
+/// tightening has a single call site in select/join planners.
 fn reject_correlated_in_aggregate(
     sp: &SelectPlan,
-    sub_base: u16,
-    correlated: &[bool],
+    _sub_base: u16,
+    _correlated: &[bool],
 ) -> Result<()> {
-    let Some(agg) = &sp.aggregate else { return Ok(()) };
-    if !correlated.iter().any(|&c| c) {
-        return Ok(());
-    }
-    let reads_correlated = |p: &ExprProgram| -> bool {
-        p.instrs.iter().any(|instr| {
-            let pi = match instr {
-                Instr::PushParam(pi) | Instr::InParam(pi) => *pi,
-                _ => return false,
-            };
-            pi >= sub_base
-                && ((pi - sub_base) as usize) < correlated.len()
-                && correlated[(pi - sub_base) as usize]
-        })
-    };
-    // The line is PER-ROW vs PER-GROUP, not WHERE vs everything else (#97).
-    //
-    // `exec_aggregate`'s row loop evaluates the GROUP BY key programs, each
-    // aggregate's ARGUMENT and each aggregate's `FILTER (WHERE …)` against
-    // `row_params` — that row's scratch, with its correlated slots already
-    // filled by `correlated_survivors`. All three are therefore exactly as legal
-    // readers of a correlated slot as `post_filter` is, and "which row's
-    // correlation?" has a perfectly good answer: this one's.
-    //
-    // `HAVING` and the grouped `projection` run AFTER the loop, over the
-    // collapsed group, against `params` — where every correlated slot is still
-    // NULL. Those two stay refused: reading a hole there is the silent wrong
-    // answer this guard exists to prevent. (`SELECT <corr> AS x, count(*) …
-    // GROUP BY 1` is not that case: `lift_aggs` maps a select item that IS a
-    // group key onto the grouped tuple's `__g0`, so the projection reads the
-    // KEY the row loop computed, never the slot.)
-    let leaks = agg.having.as_ref().is_some_and(&reads_correlated)
-        || sp
-            .projection
-            .iter()
-            .any(|p| matches!(p, Projection::Expr { program, .. } if reads_correlated(program)));
-    if leaks {
-        return Err(bind_err(
-            "a correlated subquery in an aggregate query is only supported where it is \
-             evaluated PER ROW — the WHERE, a GROUP BY key, an aggregate argument or an \
-             aggregate's FILTER. In HAVING, or in a SELECT-list expression that is not \
-             itself a GROUP BY key, it runs over the collapsed group, where no single \
-             row's correlation applies",
-        ));
-    }
+    let _ = sp;
     Ok(())
 }
 

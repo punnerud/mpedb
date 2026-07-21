@@ -1153,7 +1153,7 @@ impl CompiledPlan {
                 gather_ok(p)?;
             }
         }
-        if let Some(agg) = &sp.aggregate {
+        if let Some(_agg) = &sp.aggregate {
             // NOT `agg.group_by`, NOT `a.arg`, NOT `a.filter` (#97). All three
             // are evaluated PER ROW inside `exec_aggregate`'s row loop, after
             // the per-row correlated fill, against THAT row's scratch parameter
@@ -1164,17 +1164,11 @@ impl CompiledPlan {
             // `params`, read NULL, and DROP the row — a wrong answer for both
             // `EXISTS` and `NOT EXISTS`.)
             //
-            // HAVING and the grouped PROJECTION are the per-GROUP programs: they
-            // run after the loop, against `params`, where every correlated slot
-            // is still an unfilled hole. Those two stay gather-side.
-            if let Some(h) = &agg.having {
-                gather_ok(h)?;
-            }
-            for p in &sp.projection {
-                if let Projection::Expr { program, .. } = p {
-                    gather_ok(program)?;
-                }
-            }
+            // HAVING and the grouped PROJECTION also read correlated slots now:
+            // the executor keeps the first base-row param scratch per group and
+            // evaluates those programs against it (Django OuterRef on a group
+            // key; matches sqlite bare-column pick). No gather-side refusal.
+            let _ = _agg;
         }
         Ok(())
     }

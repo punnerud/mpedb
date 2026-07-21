@@ -131,10 +131,14 @@ enum Witness {
     MinRowid { pk: Vec<u8>, bare: Vec<Value> },
 }
 
-/// One group's state: `[group key values]`, one accumulator per aggregate, and
-/// the optional bare-column witness. O(1) in the number of INPUT rows — which
-/// is the whole point of #123 §5.1.
-type Group = (Vec<Value>, Vec<Acc>, Option<Witness>);
+/// One group's state: `[group key values]`, one accumulator per aggregate,
+/// the optional bare-column witness, and the **first** per-row param scratch
+/// seen for this group (correlated slots filled). HAVING and a SELECT-list
+/// expression that is not a group key evaluate against that scratch so a
+/// correlated subquery keyed by the group (Django `OuterRef("pk")`) is correct.
+/// When correlation varies inside the group, the first row wins — matching
+/// sqlite's bare-column pick under PK/scan order. O(1) in input rows (#123 §5.1).
+type Group = (Vec<Value>, Vec<Acc>, Option<Witness>, Option<Vec<Value>>);
 
 /// The fold: everything an aggregate holds between rows.
 ///
@@ -302,9 +306,16 @@ impl<'a> Folder<'a> {
                         )
                     },
                 )?;
-                e.insert((key_vals, accs, witness))
+                e.insert((key_vals, accs, witness, None))
             }
         };
+        // First-row correlation scratch for this group (sqlite bare-column
+        // convention). Django OuterRef on a group key is constant within the
+        // group, so first vs last is the same; when correlation varies, this
+        // matches sqlite's pick under PK/scan order.
+        if entry.3.is_none() {
+            entry.3 = Some(row_params.to_vec());
+        }
         for (i, call) in self.agg.aggs.iter().enumerate() {
             // `agg(x) FILTER (WHERE cond)`: this row feeds THIS aggregate only
             // when `cond` is TRUE over the base row (3VL — NULL/FALSE skip). The
@@ -572,10 +583,8 @@ pub(super) fn exec_aggregate(
         // evaluate to NULL and — 3VL — DROP the row rather than test it. That is the
         // wrong answer `count(*) FILTER (WHERE EXISTS (…correlated…))` used to give,
         // 0 for both the positive and the negated form. The GROUPED programs (HAVING,
-        // the projection, ORDER BY) still read `params`: they run over a collapsed
-        // group, where no single row's correlation applies, and both the planner
-        // (`reject_correlated_in_aggregate`) and validate refuse a correlated slot
-        // there.
+        // non-key projection) read the group's first-row scratch after collapse
+        // (sqlite bare-column convention; Django OuterRef on a group key).
         let (rows, scratches): (Vec<Vec<Value>>, Option<Vec<Vec<Value>>>) =
             if correlated.is_empty() && post_filter.is_none() {
                 (rows, None)
@@ -609,10 +618,11 @@ pub(super) fn exec_aggregate(
 
     let Folder { groups, base_colls, .. } = folder;
 
+    // (grouped tuple, first-row param scratch for correlated HAVING/projection)
+    let mut out: Vec<(Vec<Value>, Option<Vec<Value>>)> = Vec::new();
     // `SELECT count(*) FROM t` over an EMPTY table must return one row (0), not
     // zero rows — there is one group when there is nothing to group by. With a
     // GROUP BY, an empty input means no groups at all.
-    let mut out: Vec<Vec<Value>> = Vec::new();
     if groups.is_empty() && agg.group_by.is_empty() {
         // An EMPTY group still FINISHES a fresh accumulator — for a host
         // aggregate that is `xFinal` on a never-stepped (NULL) aggregate
@@ -628,9 +638,9 @@ pub(super) fn exec_aggregate(
         // No rows means no witness row, so a bare column is NULL — sqlite:
         // `SELECT name, max(x) FROM empty` yields one row `(NULL, NULL)`.
         tuple.resize(tuple.len() + agg.bare_cols.len(), Value::Null);
-        out.push(tuple);
+        out.push((tuple, None));
     }
-    for (_, (keys, accs, witness)) in groups {
+    for (_, (keys, accs, witness, scratch)) in groups {
         let mut tuple = keys;
         for a in accs {
             tuple.push(a.finish()?);
@@ -643,33 +653,36 @@ pub(super) fn exec_aggregate(
             };
             tuple.extend(bare);
         }
-        out.push(tuple);
+        out.push((tuple, scratch));
     }
 
     // HAVING — over the GROUPED tuple, which is why it can see aggregates and
-    // WHERE cannot.
+    // WHERE cannot. Correlated slots come from the group's first base-row scratch.
     if let Some(h) = &agg.having {
         let mut keep = Vec::with_capacity(out.len());
-        for tuple in out {
-            if h.eval_filter_host(&mut Vec::new(), &tuple, params, ctx.host_fns())? {
-                keep.push(tuple);
+        for (tuple, scratch) in out {
+            let eval_params: &[Value] = scratch.as_deref().unwrap_or(params);
+            if h.eval_filter_host(&mut Vec::new(), &tuple, eval_params, ctx.host_fns())? {
+                keep.push((tuple, scratch));
             }
         }
         out = keep;
     }
 
     // Sort the GROUPED tuple only when the indices refer to it; otherwise the
-    // sort waits for the projection below.
+    // sort waits for the projection below. Scratches stay zipped with tuples.
     if order_over == OrderOver::Grouped && !order_by.is_empty() {
         super::gather::check_order_colls(order_by, ctx.host_colls())?;
-        sort_rows(&mut out, order_by, ctx.host_colls());
+        let colls = ctx.host_colls();
+        out.sort_by(|(a, _), (b, _)| super::gather::cmp_rows(a, b, order_by, colls));
     }
 
     let skip = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
     let take = limit.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
     let mut projected = Vec::new();
     let mut seen = std::collections::HashSet::new();
-    for tuple in out {
+    for (tuple, scratch) in out {
+        let eval_params: &[Value] = scratch.as_deref().unwrap_or(params);
         let mut orow = Vec::with_capacity(projection.len());
         for p in projection {
             orow.push(match p {
@@ -677,7 +690,9 @@ pub(super) fn exec_aggregate(
                     .get(*i as usize)
                     .cloned()
                     .ok_or_else(|| internal("grouped projection column"))?,
-                Projection::Expr { program, .. } => program.eval_host(&tuple, params, ctx.host_fns())?,
+                Projection::Expr { program, .. } => {
+                    program.eval_host(&tuple, eval_params, ctx.host_fns())?
+                }
             });
         }
         // `SELECT DISTINCT dept, count(*) … GROUP BY dept` — the groups are
