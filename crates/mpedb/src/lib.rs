@@ -653,6 +653,14 @@ impl Database {
         self.engine.schema()
     }
 
+    /// Reload the schema bundle if a DDL commit (this process or another)
+    /// bumped `schema_gen`. The C-API's `sqlite_master` path calls this before
+    /// answering outside a write session, so a just-committed `CREATE TABLE`
+    /// is visible on the next query without an intervening prepare.
+    pub fn refresh_schema_if_stale(&self) -> Result<()> {
+        self.engine.refresh_schema_if_stale()
+    }
+
     /// The database file path this handle attached.
     pub fn path(&self) -> &std::path::Path {
         &self.path
@@ -1867,6 +1875,22 @@ fn poisoned_err() -> Error {
 }
 
 impl WriteSession<'_> {
+    /// Schema as seen by this open write txn (includes uncommitted DDL).
+    pub fn schema(&self) -> std::sync::Arc<mpedb_core::engine::SchemaBundle> {
+        self.txn.schema_bundle()
+    }
+
+    /// Views visible in this txn (committed + uncommitted `CREATE VIEW`).
+    pub fn list_views(&mut self) -> Result<Vec<(String, String)>> {
+        crate::ddl_apply::list_views_on_txn(&mut self.txn)
+    }
+
+    /// Triggers visible in this txn (committed + uncommitted `CREATE TRIGGER`).
+    pub fn list_triggers(&mut self) -> Result<Vec<(String, String, String)>> {
+        let bundle = self.txn.schema_bundle();
+        crate::trigger::list_triggers_on_txn(&mut self.txn, &bundle)
+    }
+
     /// Execute a prepared plan inside this transaction. Plans are resolved
     /// from the local cache or read from the registry *through this
     /// transaction* (no extra locking; the session already holds the writer
@@ -2122,14 +2146,42 @@ impl WriteSession<'_> {
     /// Scan namespaced system records whose key is in `[lo, hi)`, prefix-bounded
     /// (the mirror's dirty-set / park scans). Keys returned with the namespace
     /// prefix stripped.
+    ///
+    /// `lo` may be empty (start of the namespace). A whole-namespace scan is
+    /// `lo = []`, `hi = [0xff]` — the exclusive end is the next namespace
+    /// (`<ns>\x01`), matching [`Database::sys_record_scan`]. An empty `lo` used
+    /// to fail `sys_record_subkey`'s 1..=N key rule; that made in-txn
+    /// `sqlite_master` lose every autocommit verbatim-DDL record (CPython
+    /// `test_table_dump`).
     pub fn sys_record_scan_range(
         &mut self,
         ns: &str,
         lo: &[u8],
         hi: &[u8],
     ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let klo = sys_record_subkey(ns, lo)?;
-        let khi = sys_record_subkey(ns, hi)?;
+        check_sys_ns(ns)?;
+        if lo.len() > SYS_RECORD_MAX_KEY || hi.len() > SYS_RECORD_MAX_KEY {
+            return Err(Error::Unsupported(format!(
+                "system record key must be ≤{SYS_RECORD_MAX_KEY} bytes"
+            )));
+        }
+        let mut klo = Vec::with_capacity(ns.len() + 1 + lo.len());
+        klo.extend_from_slice(ns.as_bytes());
+        klo.push(0);
+        klo.extend_from_slice(lo);
+        // Exclusive end: for a whole-namespace probe use `<ns>\x01` (same as
+        // `Database::sys_record_scan`); otherwise `<ns>\0‖hi`.
+        let khi = if lo.is_empty() && hi == [0xff] {
+            let mut e = ns.as_bytes().to_vec();
+            e.push(1);
+            e
+        } else {
+            let mut k = Vec::with_capacity(ns.len() + 1 + hi.len());
+            k.extend_from_slice(ns.as_bytes());
+            k.push(0);
+            k.extend_from_slice(hi);
+            k
+        };
         let strip = ns.len() + 1;
         Ok(self
             .txn

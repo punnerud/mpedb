@@ -77,28 +77,34 @@ impl Database {
         // Best-effort clean-up of a leftover from an interrupted backup: the
         // name is deterministic, so a crashed run must not block this one.
         let _ = std::fs::remove_file(&tmp);
-        {
-            // The writer lock, held across the whole read. Dropping the session
-            // without committing is a rollback of nothing.
+        // high_water: pages that actually hold content. File length is the
+        // fallocated pre-reserve (often MiB of empty pages); pacing progress
+        // over that makes a 2-row `:memory:` DB report thousands of steps
+        // (CPython `test_progress` expects ~2). Progress is paced over content
+        // pages; install still copies the whole file (empty pages included).
+        let content_pages = {
             let _writer = self.begin()?;
+            // `leak_counters` is the public (txn_id, high_water, …) probe.
+            let hw = self.engine.leak_counters().map(|c| c.1).unwrap_or(1).max(1);
             std::fs::copy(&src, &tmp).map_err(Error::Io)?;
-        }
+            hw
+        };
         // Void the volatile control state (module docs): the first attach to
         // the copy re-initializes the writer mutex and the reader table.
         void_boot_id(&tmp)?;
-        let len = std::fs::metadata(&tmp).map_err(Error::Io)?.len();
+        let file_pages = std::fs::metadata(&tmp).map_err(Error::Io)?.len() / PAGE_SIZE as u64;
         Ok(BackupImage {
             tmp,
             dest: dest.to_path_buf(),
-            page_count: len / PAGE_SIZE as u64,
+            page_count: content_pages.min(file_pages.max(1)).max(1),
             done: 0,
         })
     }
 }
 
 impl BackupImage {
-    /// Total pages in the image — the source's file geometry, which is what an
-    /// mpedb database's "page count" means (pages are pre-reserved at create).
+    /// Total pages reported for progress pacing — content high-water, not the
+    /// full fallocated file (see [`Database::backup_capture`]).
     pub fn page_count(&self) -> u64 {
         self.page_count
     }

@@ -3172,25 +3172,59 @@ fn sqlite_master_returns_the_verbatim_create_table() {
             ["CREATE TABLE \"test\" (\"t\")"]
         );
 
-        // A `CREATE TABLE` inside an open transaction is NOT recorded — the
-        // facade exposes no session-scoped schema view, so the shim cannot
-        // resolve the new table (or fingerprint its shape) until the commit
-        // lands. It falls back to the reconstruction, which is what this
-        // answered before verbatim text existed: fidelity is lost, never
-        // correctness. `sqlite_master` cannot see the table before COMMIT
-        // either, for the same reason.
-        //
-        // NB the extra INSERT: the schema the shim introspects is the
-        // COMMITTED one and it refreshes when the next statement runs, so a
-        // `sqlite_master` query issued immediately after `COMMIT` does not see
-        // the table yet. That is pre-existing and orthogonal to the text.
+        // A `CREATE TABLE` inside an open transaction IS recorded: the shim
+        // fingerprints against the WriteSession schema and the sys-record
+        // rides the same txn (CPython `test_table_dump` / iterdump mid-session).
         assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
         assert_eq!(exec(db, "CREATE TABLE intxn (a int NOT NULL, b TEXT)"), SQLITE_OK);
-        assert_eq!(exec(db, "COMMIT"), SQLITE_OK);
-        assert_eq!(exec(db, "INSERT INTO intxn VALUES (1, 'x')"), SQLITE_OK);
+        // Visible mid-transaction with the caller's own text.
         assert_eq!(
             collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'intxn'"),
-            ["CREATE TABLE \"intxn\" (\"a\" INTEGER NOT NULL, \"b\" TEXT)"]
+            ["CREATE TABLE intxn (a int NOT NULL, b TEXT)"]
+        );
+        assert_eq!(exec(db, "COMMIT"), SQLITE_OK);
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'intxn'"),
+            ["CREATE TABLE intxn (a int NOT NULL, b TEXT)"]
+        );
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+/// VIEW/TRIGGER `sqlite_master.sql` is also the caller's own text (CPython
+/// `test_table_dump` asserts spelling of both, not a reconstruction).
+#[test]
+fn sqlite_master_returns_verbatim_create_view_and_trigger() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(
+            exec(db, "CREATE TABLE t1(id integer primary key, t1_i1 integer, i2 integer)"),
+            SQLITE_OK
+        );
+        assert_eq!(
+            exec(db, "CREATE TABLE t2(id integer primary key, t2_i1 integer, t2_i2 integer)"),
+            SQLITE_OK
+        );
+        assert_eq!(
+            exec(
+                db,
+                "CREATE TRIGGER trigger_1 update of t1_i1 on t1 begin \
+                 update t2 set t2_i1 = new.t1_i1 where t2_i1 = old.t1_i1; end;"
+            ),
+            SQLITE_OK
+        );
+        assert_eq!(
+            exec(db, "CREATE VIEW v1 as select * from t1 left join t2 using (id);"),
+            SQLITE_OK
+        );
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'v1'"),
+            ["CREATE VIEW v1 as select * from t1 left join t2 using (id)"]
+        );
+        assert_eq!(
+            collect_text_col(db, "SELECT sql FROM sqlite_master WHERE name = 'trigger_1'"),
+            ["CREATE TRIGGER trigger_1 update of t1_i1 on t1 begin \
+              update t2 set t2_i1 = new.t1_i1 where t2_i1 = old.t1_i1; end"]
         );
         assert_eq!(sqlite3_close(db), SQLITE_OK);
     }

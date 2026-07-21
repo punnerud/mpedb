@@ -580,26 +580,42 @@ impl Database {
         let scan = r.sys_scan_range(TRIGGER_PREFIX, TRIGGER_PREFIX_END);
         let bundle = self.engine.schema();
         r.finish()?;
-        let mut out = Vec::new();
-        for (subkey, value) in scan? {
-            if !subkey.starts_with(TRIGGER_PREFIX) {
-                continue;
-            }
-            let Ok(st) = StoredTrigger::decode(&value) else {
-                continue;
-            };
-            let (tbl, col_names) = match bundle.schema.table(st.table_id) {
-                Some(t) => (
-                    t.name.clone(),
-                    t.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
-                ),
-                None => (format!("table_{}", st.table_id), Vec::new()),
-            };
-            let sql = reconstruct_create_trigger(&st, &tbl, &col_names);
-            out.push((st.name, tbl, sql));
-        }
-        Ok(out)
+        triggers_from_scan(scan?, &bundle.schema)
     }
+}
+
+/// Triggers visible through an open write txn (mid-transaction iterdump).
+pub(crate) fn list_triggers_on_txn(
+    w: &mut WriteTxn<'_>,
+    bundle: &mpedb_core::engine::SchemaBundle,
+) -> Result<Vec<(String, String, String)>> {
+    let scan = w.sys_scan_range(TRIGGER_PREFIX, TRIGGER_PREFIX_END)?;
+    triggers_from_scan(scan, &bundle.schema)
+}
+
+fn triggers_from_scan(
+    scan: Vec<(Vec<u8>, Vec<u8>)>,
+    schema: &mpedb_types::Schema,
+) -> Result<Vec<(String, String, String)>> {
+    let mut out = Vec::new();
+    for (subkey, value) in scan {
+        if !subkey.starts_with(TRIGGER_PREFIX) {
+            continue;
+        }
+        let Ok(st) = StoredTrigger::decode(&value) else {
+            continue;
+        };
+        let (tbl, col_names) = match schema.table(st.table_id) {
+            Some(t) => (
+                t.name.clone(),
+                t.columns.iter().map(|c| c.name.clone()).collect::<Vec<_>>(),
+            ),
+            None => (format!("table_{}", st.table_id), Vec::new()),
+        };
+        let sql = reconstruct_create_trigger(&st, &tbl, &col_names);
+        out.push((st.name, tbl, sql));
+    }
+    Ok(out)
 }
 
 fn reconstruct_create_trigger(st: &StoredTrigger, table: &str, col_names: &[String]) -> String {

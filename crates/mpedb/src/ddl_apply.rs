@@ -147,6 +147,21 @@ pub(crate) fn view_exists_on_txn(
     Ok(resolve_view_key(w, name)?.is_some())
 }
 
+/// Every view visible through this write txn (for mid-transaction iterdump).
+pub(crate) fn list_views_on_txn(
+    w: &mut mpedb_core::WriteTxn,
+) -> Result<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    for (subkey, value) in w.sys_scan_range(VIEW_PREFIX, VIEW_PREFIX_END)? {
+        if let Some(name) = subkey.strip_prefix(VIEW_PREFIX) {
+            let name = String::from_utf8_lossy(name).into_owned();
+            let src = String::from_utf8_lossy(&value).into_owned();
+            out.push((name, src));
+        }
+    }
+    Ok(out)
+}
+
 /// The sys-key of an existing view, if any (ASCII-case-insensitive).
 pub(crate) fn resolve_view_key_on_txn(
     w: &mut mpedb_core::WriteTxn,
