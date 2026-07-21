@@ -13,6 +13,23 @@ durability classes, all latency percentiles) live in its own file.
 | Apple M3 Pro, 11 cores, 36 GiB, macOS 26.6 | mpedb, SQLite, PostgreSQL 16, Turso 0.7 | [`RESULTS-macos-apple-m3-pro-11c.md`](crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md) |
 | Raspberry Pi 3 B+, armv7l (32-bit), 921 MiB, Linux 6.1 | **mpedb only** | no results file — see below |
 
+### Latest primary-cell re-measure (2026-07-21)
+
+Linux **volume-backed** control group: `--tmpfs /dev/shm` + `--disk /mnt/xfs`
+(xfs). **Primary none-class cells all win** vs SQLite and PostgreSQL (ops/s):
+
+| cell | mpedb | SQLite | PostgreSQL |
+|---|---:|---:|---:|
+| point-insert | ~172k | ~42k | ~15k |
+| point-select | ~444k | ~82k | ~21k |
+| point-update | ~197k | ~48k | ~12k |
+| contended-writes | ~140k | ~36k | ~37k |
+
+Batched durable-on-ack (WriteSession 100/commit, `durability=wal`) also beats
+both on the same volume. Attribution: existing MPEE-aligned path (content-hashed
+`execute(hash)`, streaming LIMIT / `scan_rows_capped` per DESIGN-MPEE-OPT). Full
+tables in the RESULTS file above.
+
 Turso (the Rust SQLite rewrite) joined the field 2026-07-17; its adapter's
 honesty decisions and a compatibility-parity comparison live in
 [design/TURSO.md](design/TURSO.md).

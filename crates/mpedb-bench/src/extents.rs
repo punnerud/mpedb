@@ -70,11 +70,24 @@ struct Log {
 }
 
 fn preallocate(f: &File, off: u64, len: u64) -> BResult<()> {
-    let rc = unsafe { libc::fallocate(f.as_raw_fd(), 0, off as i64, len as i64) };
-    if rc != 0 {
-        return err(format!("fallocate: {}", std::io::Error::last_os_error()));
+    // Linux: real fallocate. Apple has no fallocate(2); reserve with fcntl
+    // F_PREALLOCATE when available, else write zeros (still a valid arm for
+    // the layout probe — the point is "space exists before append").
+    #[cfg(target_os = "linux")]
+    {
+        let rc = unsafe { libc::fallocate(f.as_raw_fd(), 0, off as i64, len as i64) };
+        if rc != 0 {
+            return err(format!("fallocate: {}", std::io::Error::last_os_error()));
+        }
+        return Ok(());
     }
-    Ok(())
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = f;
+        // Grow via zero-fill; macOS fcntl F_PREALLOCATE is optional and
+        // filesystem-dependent — zeros are portable and match the prezero arm.
+        write_zeros(f, off, off + len)
+    }
 }
 
 fn write_zeros(f: &File, from: u64, to: u64) -> BResult<()> {
@@ -90,7 +103,19 @@ fn write_zeros(f: &File, from: u64, to: u64) -> BResult<()> {
 
 fn sync(f: &File, data_only: bool) -> BResult<()> {
     let rc = if data_only {
-        unsafe { libc::fdatasync(f.as_raw_fd()) }
+        // fdatasync is Linux; on Apple fcntl F_FULLFSYNC is the durable path
+        // and ordinary fsync is what the extents probe needs for "data-only"
+        // comparison against fsync (metadata). Use fsync on both when
+        // fdatasync is missing — the recycled-fsync arm still differs by
+        // asking for full fsync explicitly below.
+        #[cfg(target_os = "linux")]
+        {
+            unsafe { libc::fdatasync(f.as_raw_fd()) }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            unsafe { libc::fsync(f.as_raw_fd()) }
+        }
     } else {
         unsafe { libc::fsync(f.as_raw_fd()) }
     };
