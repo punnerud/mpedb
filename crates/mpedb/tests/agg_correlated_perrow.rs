@@ -18,10 +18,10 @@
 //! `lift_aggs` maps the select item onto the grouped tuple's `__g0`, so the
 //! projection reads the KEY the row loop computed, never the slot.
 //!
-//! What STAYS refused, and why it must: `HAVING`, and a SELECT-list expression
-//! that is NOT itself a group key. Both run after the collapse, against `params`,
-//! where a correlated slot is still NULL — reading one there is a silent wrong
-//! answer, not a missing feature.
+//! Per-GROUP positions (`HAVING`, a SELECT-list expression that is NOT a group
+//! key) also run: the executor keeps the **first** base-row param scratch per
+//! group (sqlite bare-column convention) and evaluates those programs against
+//! it. Django `OuterRef` on a group key is constant within the group.
 //!
 //! Every query is differential against the `sqlite3` CLI (3.45.1), run with and
 //! without an index on the correlated column: an access-path change must not
@@ -197,11 +197,32 @@ const QUERIES: &[&str] = &[
     "SELECT a.dept, count(*) FILTER (WHERE EXISTS (SELECT 1 FROM b WHERE b.k = a.g)), sum((SELECT count(*) FROM b WHERE b.k = a.g)) FROM a GROUP BY a.dept ORDER BY 1",
     // --- a JOINed base row ---------------------------------------------------
     "SELECT a.dept, sum((SELECT count(*) FROM b WHERE b.k = a.g)) FROM a LEFT JOIN b ON a.g = b.k GROUP BY a.dept ORDER BY 1",
+    // --- per-GROUP positions (first-row scratch; Django OuterRef / bare col) --
+    // Grouped SELECT-list that is NOT itself a key — first row per dept.
+    "SELECT a.dept, count(*), (SELECT count(*) FROM b WHERE b.k = a.g) FROM a GROUP BY a.dept ORDER BY 1",
+    // Correlated HAVING (predicate over the first-row fill).
+    "SELECT a.dept, count(*) FROM a GROUP BY a.dept HAVING (SELECT count(*) FROM b WHERE b.k = a.g) > 0 ORDER BY 1",
+    // Correlated value inside a per-row aggregate arg, then filtered in HAVING.
+    "SELECT a.dept FROM a GROUP BY a.dept HAVING sum((SELECT count(*) FROM b WHERE b.k = a.g)) > 1 ORDER BY 1",
+    // Same subquery in SELECT and GROUP BY (two lifts; both filled per row).
+    "SELECT (SELECT count(*) FROM b WHERE b.k = a.g), count(*) FROM a \
+     GROUP BY (SELECT count(*) FROM b WHERE b.k = a.g) ORDER BY 1",
 ];
+
+/// Scalar aggregate with a bare correlated SELECT-list: one group, correlation
+/// varies across every base row. The pick is the first input row — sqlite's is
+/// scan-order dependent (PK vs covering index on `a.g` flips NULL-first), so
+/// this is only differential-tested without the index.
+const BARE_SCALAR_ORDER_DEPENDENT: &str =
+    "SELECT count(*), (SELECT count(*) FROM b WHERE b.k = a.g) FROM a";
 
 fn agree(indexed: bool) {
     let (db, path) = mpedb_open(indexed);
-    for q in QUERIES {
+    let mut qs: Vec<&str> = QUERIES.to_vec();
+    if !indexed {
+        qs.push(BARE_SCALAR_ORDER_DEPENDENT);
+    }
+    for q in qs {
         let mine = mpedb_rows(&db, q);
         let theirs = sqlite_rows(q, indexed);
         let ok = mine.len() == theirs.len()
@@ -231,55 +252,37 @@ fn per_row_correlated_aggregate_matches_sqlite() {
     std::env::remove_var("MPEDB_NO_SUBPLAN_MEMO");
 }
 
-/// The per-GROUP positions stay refused, each by name. These run after the
-/// collapse, against `params`, where every correlated slot is still NULL — so
-/// admitting them would not be a feature, it would be a silent wrong answer.
+/// Per-GROUP positions (HAVING / non-key SELECT-list) match sqlite via the
+/// first-row param scratch. Kept as a named test so the Django OuterRef shape
+/// is the regression surface, not only the matrix above.
 #[test]
-fn per_group_positions_stay_refused() {
-    let (db, path) = mpedb_open(false);
-    let refuse = |sql: &str, needle: &str| {
-        let e = db
-            .prepare_detached(sql)
-            .expect_err(&format!("expected a refusal for `{sql}`"))
-            .to_string();
-        assert!(e.contains(needle), "wrong refusal for `{sql}`: {e}");
-    };
-    // A correlated subquery in the SELECT list of an aggregate query that is
-    // NOT a GROUP BY key: the projection runs over the collapsed group.
-    refuse(
-        "SELECT count(*), (SELECT count(*) FROM b WHERE b.k = a.g) FROM a",
-        "a correlated subquery in an aggregate query is only supported where it is \
-         evaluated PER ROW",
-    );
-    refuse(
-        "SELECT a.dept, count(*), (SELECT count(*) FROM b WHERE b.k = a.g) FROM a GROUP BY a.dept",
-        "a correlated subquery in an aggregate query is only supported where it is \
-         evaluated PER ROW",
-    );
-    // A CORRELATED subquery in HAVING is refused by the lift. An UNCORRELATED
-    // one is not — its slot is filled once, before dispatch, so HAVING reads an
-    // ordinary parameter (see `subquery_in_having.rs`). The refusal is broader
-    // than the per-row rule strictly needs — `HAVING sum((SELECT …)) > 1` puts
-    // the correlated value in a per-ROW aggregate ARGUMENT, which the row loop
-    // could evaluate — but the lift decides per subquery, not per position, so
-    // the refusal stays uniform and named.
-    refuse(
-        "SELECT a.dept, count(*) FROM a GROUP BY a.dept HAVING (SELECT count(*) FROM b WHERE b.k = a.g) > 0",
-        "a CORRELATED subquery in HAVING is not supported yet",
-    );
-    refuse(
-        "SELECT a.dept FROM a GROUP BY a.dept HAVING sum((SELECT count(*) FROM b WHERE b.k = a.g)) > 1",
-        "a CORRELATED subquery in HAVING is not supported yet",
-    );
-    // The SAME subquery spelled out in both the select list and the GROUP BY
-    // lifts TWICE, into two slots, so the item is not recognised as the key —
-    // a clean refusal. (`GROUP BY 1`, above, takes the matching path.)
-    refuse(
-        "SELECT (SELECT count(*) FROM b WHERE b.k = a.g), count(*) FROM a \
-         GROUP BY (SELECT count(*) FROM b WHERE b.k = a.g)",
-        "a correlated subquery in an aggregate query is only supported where it is \
-         evaluated PER ROW",
-    );
-    drop(db);
-    let _ = std::fs::remove_file(&path);
+fn per_group_correlated_matches_sqlite() {
+    for indexed in [false, true] {
+        let (db, path) = mpedb_open(indexed);
+        let mut qs = vec![
+            "SELECT a.dept, count(*), (SELECT count(*) FROM b WHERE b.k = a.g) FROM a GROUP BY a.dept ORDER BY 1",
+            "SELECT a.dept, count(*) FROM a GROUP BY a.dept HAVING (SELECT count(*) FROM b WHERE b.k = a.g) > 0 ORDER BY 1",
+            "SELECT a.dept FROM a GROUP BY a.dept HAVING sum((SELECT count(*) FROM b WHERE b.k = a.g)) > 1 ORDER BY 1",
+            "SELECT (SELECT count(*) FROM b WHERE b.k = a.g), count(*) FROM a \
+             GROUP BY (SELECT count(*) FROM b WHERE b.k = a.g) ORDER BY 1",
+        ];
+        // Bare scalar is scan-order dependent in sqlite; only PK order agrees.
+        if !indexed {
+            qs.push(BARE_SCALAR_ORDER_DEPENDENT);
+        }
+        for q in qs {
+            let mine = mpedb_rows(&db, q);
+            let theirs = sqlite_rows(q, indexed);
+            let ok = mine.len() == theirs.len()
+                && mine.iter().zip(&theirs).all(|(m, s)| {
+                    m.len() == s.len() && m.iter().zip(s).all(|(x, y)| cell_eq(x, y))
+                });
+            assert!(
+                ok,
+                "\n  query : {q}\n  indexed: {indexed}\n  mpedb : {mine:?}\n  sqlite: {theirs:?}"
+            );
+        }
+        drop(db);
+        let _ = std::fs::remove_file(&path);
+    }
 }

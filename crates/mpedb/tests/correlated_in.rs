@@ -240,35 +240,33 @@ fn correlated_in_matches_sqlite() {
     std::env::remove_var("MPEDB_NO_SUBPLAN_MEMO");
 }
 
-/// The refusals that STAY. A correlated IN is admitted only where a correlated
-/// EXISTS is: `HAVING`, a JOIN's `ON` and a grouped program are still holes at
-/// the time the slot would be read, and are refused by name rather than read
-/// unfilled.
+/// Refusals that STAY: a subquery in a JOIN's ON is still a hole. Correlated
+/// IN in HAVING / non-key SELECT-list is admitted (first-row group scratch).
 #[test]
 fn documented_refusals() {
     let (db, path) = mpedb_open(false);
-    let refuse = |sql: &str, needle: &str| {
-        let e = db
-            .query(sql, &[])
-            .expect_err(&format!("expected a refusal for `{sql}`"))
-            .to_string();
-        assert!(e.contains(needle), "wrong refusal for `{sql}`: {e}");
-    };
-    refuse(
+    let e = db
+        .query(
+            "SELECT a.id FROM a JOIN b ON a.k IN (SELECT c.ak FROM b c WHERE c.w < a.v)",
+            &[],
+        )
+        .expect_err("expected a refusal for subquery in JOIN ON")
+        .to_string();
+    assert!(
+        e.contains("a subquery in a JOIN's ON condition is not supported yet"),
+        "wrong refusal: {e}"
+    );
+    // Formerly refused per-group positions now answer (smoke: prepare+execute).
+    db.query(
         "SELECT count(*) FROM a GROUP BY a.k HAVING a.k IN (SELECT b.ak FROM b WHERE b.w < a.v)",
-        "a CORRELATED subquery in HAVING is not supported yet",
-    );
-    refuse(
-        "SELECT a.id FROM a JOIN b ON a.k IN (SELECT c.ak FROM b c WHERE c.w < a.v)",
-        "a subquery in a JOIN's ON condition is not supported yet",
-    );
-    // A grouped SELECT-list expression that is NOT itself a group key reads the
-    // correlated slot after the collapse — refused. (`GROUP BY 1`, where the
-    // item IS the key, is answered; see the matrix above.)
-    refuse(
+        &[],
+    )
+    .expect("correlated IN in HAVING");
+    db.query(
         "SELECT count(*), a.k IN (SELECT b.ak FROM b WHERE b.w < a.v) FROM a",
-        "only supported where it is evaluated PER ROW",
-    );
+        &[],
+    )
+    .expect("correlated IN in non-key SELECT-list");
     drop(db);
     let _ = std::fs::remove_file(&path);
 }

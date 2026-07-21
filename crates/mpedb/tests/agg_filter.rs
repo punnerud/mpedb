@@ -313,9 +313,8 @@ fn correlated_subquery_in_filter_matches_sqlite_3_45() {
              GROUP BY t.g ORDER BY t.g"
         ),
         // ---- HAVING alongside a correlated FILTER ---------------------------
-        // The HAVING itself carries no subquery (one in HAVING is refused
-        // separately, see `correlated_subquery_outside_filter_is_refused`); this
-        // checks the grouped stage still reads `params` and prunes correctly.
+        // The HAVING itself carries no subquery; this checks the grouped stage
+        // still prunes correctly next to a per-row correlated FILTER.
         format!(
             "SELECT g, count(*) FILTER (WHERE {EX}) FROM t GROUP BY g \
              HAVING count(*) > 1 ORDER BY g"
@@ -348,47 +347,33 @@ fn correlated_filter_survives_the_plan_registry() {
     }
 }
 
-/// The refusal boundary that STAYS, as #97 redrew it: PER-ROW vs PER-GROUP.
-/// `FILTER (WHERE …)`, a GROUP BY key and an aggregate ARGUMENT all run inside
-/// the row loop against that row's filled scratch, so a correlated subquery is
-/// admitted in each (`agg_correlated_perrow.rs` pins them against sqlite). A
-/// grouped SELECT-list expression that is not itself a group key, and HAVING,
-/// run over a collapsed group and are still refused — CLEANLY, with a message
-/// that says why. A refusal beats a wrong answer; what must never happen is the
-/// third thing, silently dropping rows.
+/// Per-GROUP positions (non-key SELECT-list) are answered via the first base-row
+/// param scratch — smoke that they prepare, validate, and return rows. Full
+/// differential matrix lives in `agg_correlated_perrow.rs`.
 #[test]
-fn correlated_subquery_outside_filter_is_refused() {
+fn correlated_subquery_in_aggregate_select_list_is_answered() {
     let d = db();
     for sql in [
-        // in the SELECT list of an aggregate query, NOT as a group key
+        // SELECT list of a scalar aggregate (first base row's fill).
         "SELECT count(*), (SELECT count(*) FROM c WHERE c.ref = t.id) FROM t".to_string(),
-        // …and the grouped form of the same thing
+        // Grouped form — first row per group.
         "SELECT t.g, count(*), (SELECT count(*) FROM c WHERE c.ref = t.id) FROM t GROUP BY t.g"
             .to_string(),
-        // the SAME subquery spelled out in both the select list and the GROUP
-        // BY lifts TWICE, into two slots, so the item is not recognised as the
-        // key and the projection would read an unfilled hole.
+        // Same subquery in SELECT and GROUP BY (two lifts).
         "SELECT EXISTS (SELECT 1 FROM c WHERE c.ref = t.id), count(*) FROM t \
          GROUP BY EXISTS (SELECT 1 FROM c WHERE c.ref = t.id)"
             .to_string(),
     ] {
-        let err = d
+        let _ = d
             .query(&sql, &[])
-            .expect_err(&format!("must be refused, not answered: {sql}"));
-        assert!(
-            matches!(err, mpedb::Error::Bind(_)),
-            "must be a clean bind-time refusal, got {err:?} for `{sql}`"
-        );
+            .unwrap_or_else(|e| panic!("must be answered, not refused: {sql}: {e}"));
     }
 }
 
 /// A CORRELATED `IN (SELECT …)` inside `FILTER (WHERE …)` — refused until #97
 /// ("rewrite as EXISTS"), now ANSWERED, so it is checked the way every other
-/// case here is: differentially against sqlite. `FILTER` is the one aggregate
-/// clause evaluated PER ROW, against that row's filled correlation scratch, so
-/// it is exactly as legal a reader of a correlated slot as a `post_filter` is —
-/// the SELECT list, an aggregate ARGUMENT, GROUP BY and HAVING stay refused
-/// above because they run over a collapsed group.
+/// case here is: differentially against sqlite. `FILTER` is a per-row aggregate
+/// clause against that row's filled correlation scratch.
 #[test]
 fn correlated_in_inside_filter_matches_sqlite() {
     let d = db();

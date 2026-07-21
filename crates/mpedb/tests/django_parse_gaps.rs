@@ -1290,19 +1290,12 @@ fn an_uncorrelated_subquery_in_having_agrees_with_sqlite() {
         "SELECT a.dept, COUNT(*) FROM a GROUP BY a.dept \
          HAVING (COUNT(*) > 5 OR a.dept IN (SELECT 'x' FROM b)) ORDER BY 1",
     );
-    let t = open();
-    for s in setup {
-        t.db.query(s, &[]).unwrap();
-    }
-    let e = t
-        .db
-        .query(
-            "SELECT a.dept FROM a GROUP BY a.dept \
-             HAVING (SELECT COUNT(*) FROM b WHERE b.k = a.g) > 0",
-            &[],
-        )
-        .unwrap_err();
-    assert!(format!("{e}").contains("CORRELATED subquery in HAVING"), "{e}");
+    // Correlated HAVING: first-row scratch per group (Django OuterRef).
+    assert_same(
+        setup,
+        "SELECT a.dept FROM a GROUP BY a.dept \
+         HAVING (SELECT COUNT(*) FROM b WHERE b.k = a.g) > 0 ORDER BY 1",
+    );
 }
 
 // ------------------------------------ a typeless argument to a scalar fn ----

@@ -185,21 +185,17 @@ fn aggregate_over_correlated_exists_matches_sqlite() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// The refusal boundary that STAYS, as #97 redrew it: PER-ROW vs PER-GROUP, not
-/// "WHERE vs everything else". A `GROUP BY` key, an aggregate ARGUMENT and an
-/// aggregate's `FILTER` are all evaluated in `exec_aggregate`'s ROW loop against
-/// that row's filled scratch, so a correlated slot is meaningful in each (see
-/// `agg_correlated_perrow.rs`, which pins them against sqlite). `HAVING` and a
-/// grouped SELECT-list expression that is NOT itself a group key run after the
-/// collapse, against `params`, where the slot is still NULL — those stay refused.
+/// Correlated slots are legal in every aggregate position now: per-row (arg /
+/// FILTER / GROUP BY key / WHERE) and per-group (HAVING / non-key SELECT-list
+/// via the first base-row scratch). See `agg_correlated_perrow.rs` for the
+/// full differential matrix against sqlite.
 #[test]
-fn correlated_slot_outside_where_is_refused() {
+fn correlated_in_aggregate_select_list_is_answered() {
     let (db, path) = open();
     seed(&db);
 
-    // An aggregate ARGUMENT is now a PER-ROW position and is answered. Pinned
-    // here so this test still owns the boundary it names: `a.g` = 10 → 2, 20 →
-    // 1, 30/40 → 0, over ids 1..6 ⇒ 2+1+2+0+0+2 = 7 (sqlite3 3.45: 7).
+    // An aggregate ARGUMENT is a PER-ROW position: `a.g` = 10 → 2, 20 → 1,
+    // 30/40 → 0, over ids 1..6 ⇒ 2+1+2+0+0+2 = 7 (sqlite3 3.45: 7).
     assert_eq!(
         one_int(
             db.query("SELECT sum((SELECT count(*) FROM b WHERE b.k = a.g)) FROM a", &[])
@@ -208,22 +204,21 @@ fn correlated_slot_outside_where_is_refused() {
         7
     );
 
-    // The correlated subquery sits in the SELECT list of an aggregate query
-    // (a non-grouped, non-aggregated projection over the grouped tuple). Refuse.
-    let err = db
-        .query(
-            "SELECT count(*), (SELECT count(*) FROM b WHERE b.k = a.g) FROM a",
-            &[],
-        )
-        .unwrap_err();
-    let msg = err.to_string();
-    assert!(
-        msg.contains("correlated") && msg.contains("PER ROW"),
-        "unexpected error for correlated subquery in an aggregate SELECT list: {msg}"
+    // Non-key SELECT-list of a scalar aggregate: first base row's fill (id=1,
+    // g=10 → count 2). Matches sqlite under PK scan order.
+    assert_eq!(
+        rows(
+            db.query(
+                "SELECT count(*), (SELECT count(*) FROM b WHERE b.k = a.g) FROM a",
+                &[],
+            )
+            .unwrap()
+        ),
+        vec![vec![Value::Int(6), Value::Int(2)]]
     );
 
     // A NON-aggregate query may still read a correlated scalar subquery in its
-    // projection — the boundary is aggregate-only, not a blanket ban.
+    // projection.
     let got = rows(
         db.query(
             "SELECT id, (SELECT count(*) FROM b WHERE b.k = a.g) FROM a ORDER BY id",
