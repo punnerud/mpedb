@@ -150,9 +150,18 @@ fn attach_cross_select_through_the_c_abi() {
         assert_eq!(sqlite3_step(pl), SQLITE_DONE);
         assert_eq!(sqlite3_finalize(pl), SQLITE_OK);
 
-        // The v1 refusal, on the wire: a write to the attached db errors
-        // with a clean message and writes nothing.
-        assert_eq!(exec(db, "INSERT INTO other.u (x, y) VALUES (9, 9)"), SQLITE_ERROR);
+        // Pure attached-only write is forwarded to the member handle.
+        assert_eq!(
+            exec(db, "INSERT INTO other.u (x, y) VALUES (9, 9)"),
+            SQLITE_OK,
+            "pure attached write: {}",
+            errmsg(db)
+        );
+        // Mixed main+attached write still refuses.
+        assert_eq!(
+            exec(db, "INSERT INTO t SELECT x FROM other.u"),
+            SQLITE_ERROR
+        );
         assert!(
             errmsg(db).contains("cross-file writes"),
             "refusal message: {}",

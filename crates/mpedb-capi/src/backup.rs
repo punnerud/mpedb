@@ -139,9 +139,8 @@ pub unsafe extern "C" fn sqlite3_backup_init(
         return fail(d, SQLITE_ERROR, msg);
     }
     let src_temp = is_temp(src_name);
-    if !is_main(src_name) && !src_temp {
-        return fail(d, SQLITE_ERROR, format!("unknown database {}", schema_name(src_name)));
-    }
+    let src_schema = schema_name(src_name);
+    let src_is_main = is_main(src_name);
     if d.readonly {
         return fail(d, SQLITE_READONLY, "attempt to write a readonly database".into());
     }
@@ -176,7 +175,7 @@ pub unsafe extern "C" fn sqlite3_backup_init(
             }
             Err(e) => return fail(d, SQLITE_ERROR, format!("backup failed: {e}")),
         }
-    } else {
+    } else if src_is_main {
         let Some(s) = conn(src) else {
             return fail(d, SQLITE_ERROR, "source is not an open database".into());
         };
@@ -186,6 +185,30 @@ pub unsafe extern "C" fn sqlite3_backup_init(
             return fail(d, SQLITE_BUSY, "source database is locked".into());
         }
         s.db.backup_capture(&dest_path)
+    } else {
+        // An ATTACHed schema name: capture that member's file (CPython
+        // `test_database_source_name` backs up `attached_db` after ATTACH).
+        let Some(s) = conn(src) else {
+            return fail(d, SQLITE_ERROR, "source is not an open database".into());
+        };
+        if s.txn.is_some() {
+            return fail(d, SQLITE_BUSY, "source database is locked".into());
+        }
+        let members = s.db.attached_databases();
+        let Some((_, path)) = members
+            .iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(&src_schema))
+        else {
+            return fail(
+                d,
+                SQLITE_ERROR,
+                format!("unknown database {src_schema}"),
+            );
+        };
+        match mpedb::Database::open_from_file(path) {
+            Ok(attached) => attached.backup_capture(&dest_path),
+            Err(e) => return fail(d, SQLITE_ERROR, format!("backup failed: {e}")),
+        }
     };
     let image = match capture {
         Ok(i) => i,

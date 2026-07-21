@@ -433,28 +433,29 @@ fn member_ddl_invalidates_cached_cross_plans() {
 #[test]
 fn writes_and_ddl_to_attached_refuse_by_name() {
     let f = fix("refuse", false);
-    for (sql, needle) in [
-        ("INSERT INTO other.u (x, y) VALUES (100, 1)", "cross-file writes"),
-        ("UPDATE other.u SET y = 0 WHERE x = 1", "cross-file writes"),
-        ("DELETE FROM other.u", "cross-file writes"),
-        // bare name resolving to an attached table
-        ("INSERT INTO u (x, y) VALUES (100, 1)", "cross-file writes"),
-        // main write READING an attached table
-        (
-            "INSERT INTO s (id, val) SELECT x, y FROM other.u",
-            "cross-file writes",
-        ),
-        ("CREATE TABLE other.w2 (q INT)", "DDL on an attached database"),
-        ("DROP TABLE other.u", "DDL on an attached database"),
-        ("CREATE INDEX other.i ON u (y)", "DDL on an attached database"),
-    ] {
-        let e = f.query(sql, &[]).unwrap_err();
-        assert!(
-            e.to_string().contains(needle),
-            "`{sql}` should refuse with `{needle}`, got: {e}"
-        );
-    }
-    // Nothing above wrote anything.
+    // Mixed main+attached write still refuses by name.
+    let e = f
+        .query("INSERT INTO s (id, val) SELECT x, y FROM other.u", &[])
+        .unwrap_err();
+    assert!(
+        e.to_string().contains("cross-file writes"),
+        "mixed write should refuse, got: {e}"
+    );
+    // Pure attached-only DML/DDL is forwarded to the member handle.
+    f.query("INSERT INTO other.u (x, y) VALUES (100, 1)", &[])
+        .unwrap();
+    f.query("UPDATE other.u SET y = 0 WHERE x = 100", &[])
+        .unwrap();
+    f.query("DELETE FROM other.u WHERE x = 100", &[])
+        .unwrap();
+    f.query("CREATE TABLE other.w2 (q INT PRIMARY KEY)", &[])
+        .unwrap();
+    f.query("INSERT INTO other.w2 (q) VALUES (7)", &[]).unwrap();
+    assert_eq!(
+        mpedb_rows(&f, "SELECT q FROM other.w2"),
+        vec![vec![Value::Int(7)]]
+    );
+    // Original other.u still has its seed rows (insert/delete of 100 cancelled).
     assert_eq!(
         mpedb_rows(&f, "SELECT count(*) FROM other.u"),
         vec![vec![Value::Int(4)]]
@@ -471,14 +472,13 @@ fn writes_and_ddl_to_attached_refuse_by_name() {
 }
 
 #[test]
-fn attach_shapes_refused_by_name() {
+fn attach_memory_and_shapes() {
     let f = fix("shapes", false);
     for (sql, needle) in [
         (
             "ATTACH '/nonexistent/nowhere.mpedb' AS ghost".to_string(),
             "does not exist",
         ),
-        ("ATTACH ':memory:' AS mem".to_string(), ":memory:"),
         ("ATTACH ? AS pdb".to_string(), "bound parameter"),
     ] {
         let e = f.query(&sql, &[]).unwrap_err();
@@ -487,6 +487,23 @@ fn attach_shapes_refused_by_name() {
             "`{sql}` should refuse with `{needle}`, got: {e}"
         );
     }
+    // CPython test_database_source_name: ATTACH ':memory:' + schema-qualified
+    // CREATE/INSERT, then the attached schema is a real independent file.
+    f.query("ATTACH DATABASE ':memory:' AS attached_db", &[])
+        .unwrap();
+    // CPython spelling: no PRIMARY KEY (implicit rowid).
+    f.query("CREATE TABLE attached_db.foo (key INTEGER)", &[])
+        .unwrap();
+    f.query(
+        "INSERT INTO attached_db.foo (key) VALUES (3), (4)",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        mpedb_rows(&f, "SELECT key FROM attached_db.foo ORDER BY key"),
+        vec![vec![Value::Int(3)], vec![Value::Int(4)]]
+    );
+    f.query("DETACH DATABASE attached_db", &[]).unwrap();
 }
 
 #[test]
