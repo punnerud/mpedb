@@ -1444,7 +1444,7 @@ fn try_exec_pk_point_hot(
     let Some(hot) = try_build_pk_point_hot(schema, plan, sp)? else {
         return Ok(None);
     };
-    Ok(Some(exec_pk_point_hot(ctx, plan, params, &hot)?))
+    Ok(Some(exec_pk_point_hot(ctx, plan, params, sp, &hot)?))
 }
 
 /// Build [`PkPointHot`] if `sp` is eligible; `Ok(None)` means use the general
@@ -1502,15 +1502,22 @@ pub(crate) fn try_build_pk_point_hot(
 }
 
 /// Run the PkPoint micro-executor with precomputed column metadata.
+///
+/// `sp` is the SelectPlan `hot` was built from, and it is NOT always
+/// `plan.stmt`: `exec_select_impl` runs compound arms and lifted subplans
+/// through this same path, and for those the top-level `plan.stmt` is a
+/// `Compound` — or an `Insert` whose VALUES carry a scalar subquery — while the
+/// eligible PkPoint select is nested inside it. Re-deriving `sp` from
+/// `plan.stmt` here is what made `SELECT a FROM t WHERE id = 1 UNION …` fail
+/// with "pk-point hot needs a Select plan". `plan` is still needed, for its
+/// const pool and table ids.
 pub(crate) fn exec_pk_point_hot(
     ctx: &mut dyn TxnCtx,
     plan: &CompiledPlan,
     params: &[Value],
+    sp: &SelectPlan,
     hot: &PkPointHot,
 ) -> Result<ExecResult> {
-    let PlanStmt::Select(sp) = &plan.stmt else {
-        return Err(internal("pk-point hot needs a Select plan"));
-    };
     let AccessPath::PkPoint(parts) = &sp.access else {
         return Err(internal("pk-point hot needs PkPoint access"));
     };

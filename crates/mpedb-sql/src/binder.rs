@@ -3136,8 +3136,9 @@ impl<'a> Binder<'a> {
         // way it unifies with one operand in `unify_operands`: nothing is
         // coerced, and the settled type is `any`. The runtime handles the
         // actual pairs — an IN membership runs each element through `sql_cmp`
-        // (numeric comparison crosses int/float; a cross-CLASS pair is a
-        // clean refusal, never a silent non-match). A bare parameter adopts
+        // (numeric comparison crosses int/float; a cross-CLASS pair is
+        // sqlite's clean FALSE for a literal `IN (…)` list, and a refusal
+        // for a host-BOUND list — see `ops::CrossClass`). A bare param adopts
         // `any` (= any value accepted), exactly as it did before this rule
         // when EVERY operand was `any`.
         if operands.iter().any(|(_, t)| *t == Some(ColumnType::Any)) {

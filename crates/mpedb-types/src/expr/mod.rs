@@ -30,7 +30,7 @@ pub use scalar::ScalarFn;
 
 use ops::{
     bit_i64, bitwise, escape_char, glob_match, in_items_3vl, in_items_3vl_collated, in_list_3vl,
-    like_match, like_match_cs, regexp_match,
+    like_match, like_match_cs, regexp_match, CrossClass,
 };
 use scalar::call_scalar;
 
@@ -757,7 +757,9 @@ impl ExprProgram {
                     let at = stack.len() - n as usize;
                     let items: Vec<Value> = stack.split_off(at);
                     let probe = stack.pop().expect("validated");
-                    stack.push(in_items_3vl(&probe, &items)?);
+                    // Items are SQL expressions evaluated per row, so a
+                    // cross-class pair is sqlite's clean FALSE, not a refusal.
+                    stack.push(in_items_3vl(&probe, &items, CrossClass::NonMatch)?);
                 }
                 Instr::JumpIfNotTrue(t) => {
                     // Jump on FALSE *and* on NULL: an unknown WHEN must not be

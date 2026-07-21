@@ -28,7 +28,7 @@ fn memory_backing_file() -> Result<File> {
         let fd = unsafe {
             libc::syscall(
                 libc::SYS_memfd_create,
-                b"mpedb\0".as_ptr() as *const libc::c_char,
+                c"mpedb".as_ptr(),
                 1u32,
             )
         };
@@ -410,6 +410,11 @@ fn append_wal_page_img(buf: &mut Vec<u8>, id: u64, img: &[u8]) {
 
 /// Encode a WAL record into `buf` (cleared first). Reused by the hot commit
 /// path so each durable ack does not allocate a fresh multi-page buffer.
+///
+/// The eight arguments ARE the WAL record's fields (design/DESIGN.md §5): bundling
+/// them into a struct would only move the same list one line up, and this is
+/// commit-path code whose shape is load-bearing.
+#[allow(clippy::too_many_arguments)]
 fn encode_wal_record_into<'a, I>(
     buf: &mut Vec<u8>,
     offset: u64,

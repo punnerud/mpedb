@@ -341,7 +341,7 @@ pub(super) fn encode_probe_key<'a>(
 ) -> &'a [u8] {
     if values.len() == 1
         && matches!(values[0], Value::Int(_))
-        && specs.first().map_or(true, |s| s.is_plain())
+        && specs.first().is_none_or(|s| s.is_plain())
     {
         let Value::Int(x) = &values[0] else {
             unreachable!("matched Int above");

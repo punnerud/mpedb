@@ -79,7 +79,9 @@ fn preallocate(f: &File, off: u64, len: u64) -> BResult<()> {
         if rc != 0 {
             return err(format!("fallocate: {}", std::io::Error::last_os_error()));
         }
-        return Ok(());
+        // Tail of the function on Linux — the `not(linux)` block below is
+        // cfg'd out here, so this block IS the last expression.
+        Ok(())
     }
     #[cfg(not(target_os = "linux"))]
     {

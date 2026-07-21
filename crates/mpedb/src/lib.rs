@@ -308,6 +308,11 @@ impl PreparedSelect {
 /// Thread-local last plan-cache hit: repeated `execute(same_hash)` skips the
 /// `RwLock` on the process plan map (sqlite keeps the VDBE on the stmt).
 struct TlsPlanHit {
+    /// Which `Database` handle put this here. A `PlanHash` identifies the plan
+    /// TEXT, not the connection it is legal on, and the cache is thread-wide —
+    /// so without this a second handle on the same thread reads the first
+    /// handle's plan. See `Database::conn_id`.
+    conn_id: u64,
     hash: PlanHash,
     plan: std::sync::Arc<CompiledPlan>,
     cache_gen: u64,
@@ -315,6 +320,13 @@ struct TlsPlanHit {
 
 std::thread_local! {
     static TLS_PLAN: std::cell::RefCell<Option<TlsPlanHit>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Hands out the process-unique [`Database::conn_id`]. Wrapping is not a
+/// concern: at one handle per nanosecond a `u64` lasts ~584 years.
+fn next_conn_id() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// A blob source over any `std::io::Read` with a known length: the bridge from
@@ -484,6 +496,15 @@ pub struct Database {
     /// compilation, so this gate — not the compile-path refresh — is what makes
     /// id-reuse safe.
     cache_gen: std::sync::atomic::AtomicU64,
+    /// Process-unique identity for THIS handle, so the thread-local one-entry
+    /// plan cache ([`TLS_PLAN`]) cannot serve one connection's plan to another.
+    /// `cache_gen` alone is not enough: it starts at 0 on every handle, so two
+    /// `Database`s open on the same thread collide on `(hash, 0)` — which let a
+    /// host-UDF plan (deliberately connection-LOCAL, never published to the
+    /// shared registry) be executed by a second handle that had never compiled
+    /// it, and made a "fresh handle, cold cache" load silently skip the
+    /// registry. Both are containment breaks, not just stale reads.
+    conn_id: u64,
     /// The database file path this handle attached (for `Workspace` dup-file
     /// detection and diagnostics). For `:memory:shared:X` this is the
     /// *resolved* tmpfs path; for private `:memory:` it stays `":memory:"`.
@@ -619,6 +640,7 @@ impl Database {
             engine,
             cache: RwLock::new(HashMap::new()),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
+            conn_id: next_conn_id(),
             trigger_cache: RwLock::new(None),
             path: path.to_path_buf(),
             storage: mpedb_types::StorageKind::File,
@@ -697,6 +719,7 @@ impl Database {
             engine,
             cache: RwLock::new(HashMap::new()),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
+            conn_id: next_conn_id(),
             trigger_cache: RwLock::new(None),
             path,
             storage,
@@ -1281,6 +1304,12 @@ impl Database {
         }
         let full = session::resolve_params_timed(&stmt.plan, params, session)?;
         if let Some(ref hot) = stmt.pk_hot {
+            // `pk_hot` is Some only when `prepare_select` saw a top-level
+            // Select, so this destructure cannot fail; it is how the hot path
+            // gets the very SelectPlan the shape was validated against.
+            let mpedb_sql::PlanStmt::Select(sp) = &stmt.plan.stmt else {
+                return Err(Error::Internal("PreparedSelect is not a Select".into()));
+            };
             // Fast path: no host UDFs on pure column projection; skip host table build.
             if !stmt.plan.footprint.read_only {
                 return Err(Error::Internal(
@@ -1293,7 +1322,7 @@ impl Database {
                 let mut ctx = exec::ReadCtx(&r, None, None, None);
                 // coerce still needed for Text→Int etc.
                 let coerced = exec::coerce_params(&stmt.plan, &full)?;
-                exec::exec_pk_point_hot(&mut ctx, &stmt.plan, &coerced, hot)
+                exec::exec_pk_point_hot(&mut ctx, &stmt.plan, &coerced, sp, hot)
             };
             match res {
                 Ok(out) => {
@@ -1823,7 +1852,9 @@ impl Database {
         let hit = TLS_PLAN.with(|c| {
             let g = c.borrow();
             match g.as_ref() {
-                Some(h) if h.hash == *hash && h.cache_gen == gen => Some(h.plan.clone()),
+                Some(h) if h.conn_id == self.conn_id && h.hash == *hash && h.cache_gen == gen => {
+                    Some(h.plan.clone())
+                }
                 _ => None,
             }
         });
@@ -1833,6 +1864,7 @@ impl Database {
         let plan = self.cached_or_load(hash)?;
         TLS_PLAN.with(|c| {
             *c.borrow_mut() = Some(TlsPlanHit {
+                conn_id: self.conn_id,
                 hash: *hash,
                 plan: plan.clone(),
                 cache_gen: gen,
@@ -2826,7 +2858,7 @@ impl WriteSession<'_> {
     }
 
     fn create_trigger_in_txn(&mut self, spec: mpedb_sql::CreateTriggerSpec) -> Result<()> {
-        crate::trigger::create_trigger_on_txn(&mut self.txn, &self.db, spec)
+        crate::trigger::create_trigger_on_txn(&mut self.txn, self.db, spec)
     }
 
     fn drop_trigger_in_txn(&mut self, name: &str, if_exists: bool) -> Result<()> {
