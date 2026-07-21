@@ -2183,10 +2183,9 @@ shape (`crafted_alia$.id`) does not hit it.
 > *different* commits (the consolidated run 7 at `b41b713`; E3(b)'s before/after pair on
 > the Linux box against a control build of that same commit). Both are kept as history.
 > **The current headline is "AT HEAD (3) — re-measured at `c4d1a90`" at the end
-> of this file**: Apple M3, CPython **457/467** of stock-passing (474 ran, 7
-> skips); the remaining 1 FAIL + 9 ERROR are the documented deliberate set.
-> Linux box corroboration: **451/461**. Django A/B last measured at `d83c21d`
-> (826/831 + 490/493) — not re-run in this pass.
+> of this file**: Apple M3, CPython **457/467** of stock-passing; Django A
+> **826/831** and `queries` **490/493** (same failing sets as `d83c21d`, zero
+> wrong-answer FAILs). Linux CPython corroboration: **451/461**.
 
 ## The consolidated measurement — Django run 7 + CPython, ONE commit (2026-07-20)
 
@@ -3129,3 +3128,23 @@ ln -sf $SHIM/libmpedb_sqlite3.dylib $SHIM/lib/libsqlite3.dylib
 /usr/bin/env DYLD_LIBRARY_PATH=$SHIM/lib python3.12 -m test test_sqlite3 \
   --junit-xml=shim.xml
 ```
+
+### Django frozen A + `queries` at the same commit (`c4d1a90`, M3)
+
+Same machine, same interposition proof (`stock=3.53.1 shim=3.45.0`), workbench
+`run_suite.sh`, Django under `~/django-workbench`.
+
+| label set | tests | stock | shim FAIL / ERROR | shim score | vs `d83c21d` |
+|---|---|---|---|---|---|
+| G1 | 392 | OK | 0 / 2 | 390 | = |
+| G2 | 439 | OK | 0 / 3 | 436 | = |
+| **A = G1+G2** | **831** | **831/831** | **0 / 5** | **826 / 831 (99.4 %)** | **=** |
+| B `queries` | 493 | OK | 0 / 3 | **490 / 493 (99.4 %)** | **=** |
+
+All eight failures are **ERRORs (refusals)**, not wrong answers — identical
+classes to AT HEAD (2) (float→int strictness ×2, correlated subquery in
+aggregate/HAVING ×2, IN list class ×1, nested non-flattenable derived ×2,
+multi-row VALUES with expression ×1).
+
+**Wrong SQL answers: 0.** P1 / CTE / alias / ON CONFLICT ROLLBACK moved no
+Django test either way.
