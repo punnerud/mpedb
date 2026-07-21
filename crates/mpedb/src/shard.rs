@@ -124,6 +124,12 @@ impl ShardSet {
                                 "cannot shard-route an INSERT whose primary key uses DEFAULT".into(),
                             ))
                         }
+                        InsertSource::Expr(_) => {
+                            return Err(Error::Unsupported(
+                                "cannot shard-route an INSERT whose primary key is an expression"
+                                    .into(),
+                            ))
+                        }
                     };
                     hash_value(&mut h, v);
                 }

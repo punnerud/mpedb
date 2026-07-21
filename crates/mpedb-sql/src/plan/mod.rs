@@ -461,7 +461,7 @@ const MAX_JOINS: usize = 16;
 //     subquery inside a compound arm), a lift inside a COMPOUND derived-table
 //     body, and — with the correlation scope of `plan_one_compound` — a
 //     compound SUBQUERY body whose arms reference the enclosing row.
-const PLAN_FORMAT: u8 = 56;
+const PLAN_FORMAT: u8 = 57;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -1630,12 +1630,18 @@ pub enum ConflictProbe {
 /// Where an inserted column value comes from. `Default` means "use the
 /// column's DEFAULT"; the executor resolves it to the declared default or,
 /// for a nullable column without one, to NULL.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Expr` (PLAN_FORMAT 57) is a dual-row program for a VALUES cell that is not
+/// a bare literal/parameter — Django bulk_create with `DEFAULT Now()` /
+/// `datetime('now')`, `INSERT … VALUES (1+1)`, etc.
+#[derive(Debug, Clone, PartialEq)]
 pub enum InsertSource {
     Param(u16),
     /// Index into [`CompiledPlan::consts`].
     Const(u16),
     Default,
+    /// Evaluate over the empty dual row at insert time (no outer columns).
+    Expr(mpedb_types::ExprProgram),
 }
 
 /// `INSERT INTO t [(cols)] SELECT …` source (COMPAT). The source query produces
@@ -1778,6 +1784,7 @@ const PROJ_EXPR: u8 = 1;
 const SRC_PARAM: u8 = 0;
 const SRC_CONST: u8 = 1;
 const SRC_DEFAULT: u8 = 2;
+const SRC_EXPR: u8 = 3;
 
 const OC_ERROR: u8 = 0;
 const OC_DO_NOTHING: u8 = 1;

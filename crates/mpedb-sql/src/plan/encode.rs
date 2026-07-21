@@ -614,6 +614,10 @@ fn encode_stmt_rest(stmt: &PlanStmt, buf: &mut Vec<u8>) {
                             w_u16(buf, *i);
                         }
                         InsertSource::Default => buf.push(SRC_DEFAULT),
+                        InsertSource::Expr(prog) => {
+                            buf.push(SRC_EXPR);
+                            prog.encode_into(buf);
+                        }
                     }
                 }
             }

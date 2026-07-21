@@ -1013,6 +1013,7 @@ fn decode_stmt_rest(tag: u8, buf: &[u8], pos: &mut usize) -> Result<PlanStmt> {
                         SRC_PARAM => InsertSource::Param(r_u16(buf, pos)?),
                         SRC_CONST => InsertSource::Const(r_u16(buf, pos)?),
                         SRC_DEFAULT => InsertSource::Default,
+                        SRC_EXPR => InsertSource::Expr(ExprProgram::decode(buf, pos)?),
                         t => return Err(corrupt(format!("bad insert source tag {t}"))),
                     });
                 }
