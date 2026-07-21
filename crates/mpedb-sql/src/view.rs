@@ -1112,11 +1112,92 @@ fn flatten_body(
     // non-flattenable body) stand in a subquery position, where a derived
     // table itself is still refused by name.
     collapse_passthrough(body);
+    // `IN (SELECT sq.a FROM (<non-flat X>) sq)` — the body IS a projection
+    // passthrough. Collapse onto X with selected columns first and the rest as
+    // drop_trailing junk so DISTINCT/ORDER BY still see them.
+    if let SubqueryBody::Select(s) = body {
+        let _ = collapse_self_projection_passthrough(s);
+    }
     if let SubqueryBody::Compound(c) = body {
         splice_passthrough_arms(c);
     }
     Ok(())
 }
+
+/// `SELECT sq.a, sq.b FROM (<X>) sq` as a whole SelectStmt (typically a
+/// subquery body): replace with `<X>` projecting selected columns first and
+/// any remaining X columns trailing (`drop_trailing`), so DISTINCT / ORDER BY
+/// still see the full original projection while the output width is the
+/// wrapper's. Declined when X is not a Select or any selected name is missing.
+fn collapse_self_projection_passthrough(s: &mut SelectStmt) -> bool {
+    let Some(sel) = projection_passthrough(s) else {
+        return false;
+    };
+    let Some(body) = s.from_derived.take() else {
+        return false;
+    };
+    let SubqueryBody::Select(mut x) = *body else {
+        s.from_derived = Some(body);
+        return false;
+    };
+    let Some(xnames) = body_output_names(&SubqueryBody::Select(x.clone())) else {
+        s.from_derived = Some(Box::new(SubqueryBody::Select(x)));
+        return false;
+    };
+    if !sel
+        .iter()
+        .all(|n| xnames.iter().any(|x| x.eq_ignore_ascii_case(n)))
+    {
+        s.from_derived = Some(Box::new(SubqueryBody::Select(x)));
+        return false;
+    }
+    let Some(x_items) = x.items.take() else {
+        s.from_derived = Some(Box::new(SubqueryBody::Select(x)));
+        return false;
+    };
+    // Pair each X item with its output name (same rule as body_output_names).
+    let named: Vec<(String, (Expr, Option<String>))> = xnames
+        .into_iter()
+        .zip(x_items)
+        .collect();
+    let mut used = vec![false; named.len()];
+    let mut new_items: Vec<(Expr, Option<String>)> = Vec::with_capacity(named.len());
+    for n in &sel {
+        let i = named
+            .iter()
+            .position(|(xn, _)| xn.eq_ignore_ascii_case(n))
+            .expect("checked above");
+        used[i] = true;
+        let (e, _) = named[i].1.clone();
+        // Surface under the selected short name so outer refs and IN arity
+        // see one column named as the wrapper projected.
+        new_items.push((e, Some(n.clone())));
+    }
+    for (i, (_n, item)) in named.into_iter().enumerate() {
+        if !used[i] {
+            new_items.push(item);
+        }
+    }
+    let drop_trailing = (new_items.len() - sel.len()) as u16;
+    *s = SelectStmt {
+        table: x.table.take(),
+        from_derived: x.from_derived.take(),
+        alias: x.alias.take(),
+        joins: std::mem::take(&mut x.joins),
+        distinct: x.distinct,
+        items: Some(new_items),
+        where_clause: x.where_clause.take(),
+        group_by: std::mem::take(&mut x.group_by),
+        having: x.having.take(),
+        order_by: std::mem::take(&mut x.order_by),
+        limit: x.limit,
+        offset: x.offset,
+        drop_trailing,
+    };
+    true
+}
+
+
 
 /// Recurse into any subquery body carried by an expression.
 fn flatten_expr(

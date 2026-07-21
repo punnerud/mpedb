@@ -518,6 +518,7 @@ impl<'a> Parser<'a> {
                     order_by: Vec::new(),
                     limit: None,
                     offset: None,
+                drop_trailing: 0,
                 };
                 return Ok(Expr::InSubquery(
                     Box::new(e),

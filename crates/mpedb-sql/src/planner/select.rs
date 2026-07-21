@@ -600,6 +600,7 @@ pub(super) fn plan_select<'s>(
     }
     let (mut order_by, order_over, order_junk) = if base_keys.len() == s.order_by.len()
         && !s.distinct
+        && s.drop_trailing == 0
     {
         (base_keys, OrderOver::BaseRow, 0)
     } else {
@@ -613,7 +614,14 @@ pub(super) fn plan_select<'s>(
             Some((&mut projection, &mut binder))
         };
         let (keys, n_junk) = distinct_order_by(s, &Scope::single(table), junk, &hcolls)?;
-        (keys, OrderOver::Projection, n_junk)
+        // `drop_trailing` is set by the view-layer projection-passthrough
+        // collapse: trailing SELECT items exist only for DISTINCT / ORDER BY
+        // and must not leave the plan as output columns.
+        (
+            keys,
+            OrderOver::Projection,
+            n_junk.saturating_add(s.drop_trailing),
+        )
     };
     // A PK-prefix ORDER BY, all ascending, over a PK-ordered access path is
     // already satisfied by scan order: drop the sort. Not under DISTINCT — the

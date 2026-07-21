@@ -98,6 +98,12 @@ pub(crate) struct SelectStmt {
     pub order_by: Vec<(Expr, SortDir)>,
     pub limit: Option<u64>,
     pub offset: Option<u64>,
+    /// Trailing projection items that exist only so DISTINCT / ORDER BY still
+    /// see them after a projection-passthrough collapse pushed hidden columns
+    /// onto this select (`view::collapse_self_projection_passthrough`). Added
+    /// to `SelectPlan::order_junk` at plan time so the executor drops them
+    /// after the sort. Always 0 from the parser.
+    pub drop_trailing: u16,
 }
 
 /// A compound SELECT. `arms[0] ops[0] arms[1] …`, left-associative (sqlite's
