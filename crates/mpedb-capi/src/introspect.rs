@@ -432,14 +432,30 @@ pub(crate) fn parse_pragma(sql: &str) -> (String, Option<String>) {
     (name, arg)
 }
 
+/// Strip one layer of sqlite quoting from a PRAGMA argument and undo the
+/// delimiter's escape (a doubled quote). Bare identifiers are returned as-is.
+///
+/// CPython's `iterdump` builds `PRAGMA table_info("quoted""table")` for a table
+/// whose stored name is `quoted"table`. Stripping the outer quotes without
+/// collapsing `""` → `"` left `quoted""table`, which matches nothing and made
+/// `table_info` return zero columns — so the dump emitted `VALUES()` with no
+/// `quote(col)` terms (`test_table_dump`).
 fn unquote(s: &str) -> String {
     let s = s.trim();
     let b = s.as_bytes();
-    if b.len() >= 2 {
-        let (f, l) = (b[0], b[b.len() - 1]);
-        if (f == b'\'' && l == b'\'') || (f == b'"' && l == b'"') || (f == b'[' && l == b']') {
-            return s[1..s.len() - 1].to_string();
-        }
+    if b.len() < 2 {
+        return s.to_string();
+    }
+    let (f, l) = (b[0], b[b.len() - 1]);
+    if f == b'[' && l == b']' {
+        // Bracket quoting has no escape; `]` ends the name.
+        return s[1..s.len() - 1].to_string();
+    }
+    if (f == b'\'' && l == b'\'') || (f == b'"' && l == b'"') || (f == b'`' && l == b'`') {
+        let inner = &s[1..s.len() - 1];
+        let delim = f as char;
+        // `""` / `''` / ```` inside is one literal delimiter.
+        return inner.replace(&format!("{delim}{delim}"), &delim.to_string());
     }
     s.to_string()
 }
@@ -692,8 +708,11 @@ pub fn sqlite_master(
     let where_src = where_at.map(|w| sql[w + 5..where_end].trim().to_string());
     let order_src = order_at.map(|o| sql[o + 5..].trim().to_string());
 
-    // User tables, then views, then triggers — sqlite's sqlite_master order
-    // for iterdump is type-grouped but ORDER BY name is what consumers use.
+    // User tables, then triggers, then views. CPython's `iterdump` second pass
+    // is `WHERE type IN ('index','trigger','view')` with NO ORDER BY, so the
+    // row order is the catalog's insertion order — tables first (already
+    // emitted above), then objects as created. Emitting views before triggers
+    // inverted CPython `test_table_dump` (trigger created, then view).
     let mut rows: Vec<MasterRow> = user_tables(schema)
         .iter()
         .map(|t| MasterRow {
@@ -703,6 +722,15 @@ pub fn sqlite_master(
             sql: master_sql(t, verbatim.get(&t.name)),
         })
         .collect();
+    for (name, tbl, create_sql) in triggers {
+        let sql = object_ddl_text(verbatim.get(name)).unwrap_or_else(|| create_sql.clone());
+        rows.push(MasterRow {
+            ty: "trigger",
+            name: name.clone(),
+            tbl_name: tbl.clone(),
+            sql,
+        });
+    }
     for (name, select_sql) in views {
         // Prefer the caller's own CREATE VIEW text when the shim recorded it
         // (CPython `test_table_dump` asserts spelling); fall back to a
@@ -714,15 +742,6 @@ pub fn sqlite_master(
             name: name.clone(),
             tbl_name: name.clone(),
             sql: create,
-        });
-    }
-    for (name, tbl, create_sql) in triggers {
-        let sql = object_ddl_text(verbatim.get(name)).unwrap_or_else(|| create_sql.clone());
-        rows.push(MasterRow {
-            ty: "trigger",
-            name: name.clone(),
-            tbl_name: tbl.clone(),
-            sql,
         });
     }
 

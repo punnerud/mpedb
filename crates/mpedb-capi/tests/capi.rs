@@ -3230,6 +3230,53 @@ fn sqlite_master_returns_verbatim_create_view_and_trigger() {
     }
 }
 
+/// CPython `test_table_dump` / `iterdump`: (1) `PRAGMA table_info("quoted""table")`
+/// must un-escape doubled quotes; (2) mid-transaction `CREATE TABLE` (Python's
+/// default isolation starts a txn on INSERT) must still answer `table_info`
+/// from the open WriteSession so the dump does not emit bare `VALUES()`.
+#[test]
+fn table_info_unescapes_quotes_and_sees_mid_txn_creates() {
+    unsafe {
+        let db = open_memory();
+        assert_eq!(
+            exec(db, r#"CREATE TABLE "quoted""table"("quoted""field" text)"#),
+            SQLITE_OK
+        );
+        assert_eq!(
+            collect_pragma_col_names(db, r#""quoted""table""#),
+            [r#"quoted"field"#],
+            "doubled quotes in table_info arg must resolve"
+        );
+        // Mid-txn create after an INSERT (mirrors CPython isolation).
+        assert_eq!(exec(db, "CREATE TABLE seed(x)"), SQLITE_OK);
+        assert_eq!(exec(db, "INSERT INTO seed VALUES (1)"), SQLITE_OK);
+        assert_eq!(exec(db, "CREATE TABLE later(y TEXT)"), SQLITE_OK);
+        let cols = collect_pragma_col_names(db, "later");
+        assert_eq!(cols, ["y"], "mid-txn table_info saw {cols:?}");
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+    }
+}
+
+/// Column names from `PRAGMA table_info(<arg>)` (column index 1).
+unsafe fn collect_pragma_col_names(db: *mut Sqlite3, table_arg: &str) -> Vec<String> {
+    let s = cs(&format!("PRAGMA table_info({table_arg})"));
+    let mut st: *mut Stmt = ptr::null_mut();
+    assert_eq!(
+        sqlite3_prepare_v2(db, s.as_ptr(), -1, &mut st, ptr::null_mut()),
+        SQLITE_OK,
+        "prepare table_info({table_arg})"
+    );
+    let mut out = Vec::new();
+    while sqlite3_step(st) == SQLITE_ROW {
+        let p = sqlite3_column_text(st, 1);
+        if !p.is_null() {
+            out.push(CStr::from_ptr(p as *const c_char).to_str().unwrap().to_string());
+        }
+    }
+    sqlite3_finalize(st);
+    out
+}
+
 /// The `sqlite_master` mini-evaluator has to survive the shapes real
 /// consumers write, not just single-line ones: CPython's `iterdump` breaks its
 /// query across lines, quotes every identifier, uses `==`, and tests
