@@ -9,12 +9,26 @@
 pub mod btree;
 pub mod cdc;
 pub mod engine;
+// Kept PRIVATE: several of these take raw pointers, and clippy's
+// `not_unsafe_ptr_arg_deref` (rightly) only tolerates that behind a private
+// module. The facade needs exactly one of them, re-exported below.
 mod os;
+
+/// Wall-clock microseconds since the Unix epoch — see [`os::wall_clock_micros`].
+///
+/// Re-exported so the SQL facade reads the SAME clock the engine does. That
+/// matters on `wasm32`, where `SystemTime::now()` panics and the real time has
+/// to come from a host import: two clock sources would mean the engine and the
+/// executor could disagree about what `'now'` is.
+pub use os::wall_clock_micros;
 pub mod pagestore;
 pub mod plsim;
 pub mod ring;
 pub mod row;
 pub mod shm;
+/// The `wasm32` OS emulation for the process-private (`:memory:`) path. Empty
+/// on every native target; read its header for why each stub is sound.
+pub mod wasmcompat;
 
 /// The platform's **real** durability barrier — the one an acked durable commit
 /// waits on: `fdatasync` on Linux, `fcntl(F_FULLFSYNC)` on macOS (where plain
@@ -28,7 +42,16 @@ pub mod shm;
 ///
 /// # Safety
 /// `fd` must be a valid open file descriptor.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn durability_barrier(fd: std::os::unix::io::RawFd) -> libc::c_int {
+    os::fdatasync(fd)
+}
+
+/// wasm32: there is no fd and no durability class to make a promise about — the
+/// browser build refuses anything but `Durability::None`. Kept only so the
+/// symbol exists; it barriers nothing because nothing is at risk.
+#[cfg(target_arch = "wasm32")]
+pub fn durability_barrier(fd: crate::wasmcompat::RawFd) -> core::ffi::c_int {
     os::fdatasync(fd)
 }
 

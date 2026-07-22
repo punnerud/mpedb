@@ -813,6 +813,11 @@ pub trait BlobSource {
     /// `Some` promises the file's contents at offsets `0..len()` ARE the
     /// stream (`next_into`'s cursor and this view must agree — the engine
     /// uses exactly one of them per insert).
+    ///
+    /// Absent on wasm32: there is no fd to hand over, and the extent path
+    /// that would use it is off by default there anyway
+    /// (`default_extent_threshold` yields `None` off linux/macos).
+    #[cfg(not(target_arch = "wasm32"))]
     fn as_file(&self) -> Option<&std::fs::File> {
         None
     }

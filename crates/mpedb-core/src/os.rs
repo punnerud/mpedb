@@ -17,7 +17,19 @@
 //! guards only a live DB file unlink+recreate, which the Linux path also leaves
 //! unguarded, so it is deferred to keep the platforms symmetric.
 
+//! ## wasm32 is the single-process degenerate case
+//!
+//! A browser tab has no filesystem, no second process and no durability
+//! (`Shm::open_memory` refuses anything but `Durability::None`). Every
+//! primitive below therefore has a third arm that is a no-op or a constant,
+//! and `crate::wasmcompat` documents why each is sound. The `unix` arms are
+//! narrowed to `all(unix, …)` purely so wasm can take that third arm — the
+//! Linux and macOS code paths are unchanged.
+
+#[cfg(not(target_arch = "wasm32"))]
 use std::os::unix::io::RawFd;
+#[cfg(target_arch = "wasm32")]
+use crate::wasmcompat::{libc, RawFd};
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
@@ -27,11 +39,17 @@ use std::time::Duration;
 /// acked commit). Slower than `fsync`, but that is the price of real durability.
 /// Falls back to `fsync` only when the filesystem rejects F_FULLFSYNC (ENOTSUP).
 pub fn fdatasync(fd: RawFd) -> libc::c_int {
+    // wasm32: nothing has been promised durable, and there is no device.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = fd;
+        0
+    }
     #[cfg(target_os = "linux")]
     {
         unsafe { libc::fdatasync(fd) }
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         let rc = unsafe { libc::fcntl(fd, libc::F_FULLFSYNC) };
         if rc == -1 {
@@ -56,6 +74,12 @@ pub fn sync_granularity() -> usize {
     if cached != 0 {
         return cached;
     }
+    // wasm32 has no `sysconf`; a wasm page is 64 KiB but nothing here is a real
+    // mapping, and `msync` is a no-op, so the alignment only has to be a
+    // multiple of the engine's logical PAGE_SIZE.
+    #[cfg(target_arch = "wasm32")]
+    let g: isize = 4096;
+    #[cfg(not(target_arch = "wasm32"))]
     let g = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
     let g = if g > 0 { g as usize } else { 4096 };
     CACHE.store(g, Ordering::Relaxed);
@@ -67,6 +91,13 @@ pub fn sync_granularity() -> usize {
 /// (bench-grade): grow the file with `ftruncate` (may leave a sparse hole; fine
 /// while disk space is available). Never shrinks.
 pub fn preallocate(fd: RawFd, offset: i64, len: i64) -> libc::c_int {
+    // wasm32: `ftruncate` already zero-fills the whole reserve up front, so
+    // every byte is backed. There is no lazy hole and no SIGBUS to avoid.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (fd, offset, len);
+        0
+    }
     #[cfg(target_os = "linux")]
     {
         let rc = unsafe { libc::fallocate(fd, 0, offset, len) };
@@ -88,7 +119,7 @@ pub fn preallocate(fd: RawFd, offset: i64, len: i64) -> libc::c_int {
         }
         rc
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         let want = offset + len;
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -128,6 +159,8 @@ pub fn prewrite_zeros(fd: RawFd, len: u64) -> libc::c_int {
     0
 }
 
+// Also the wasm32 arm: the buffer is born zeroed, so there is no
+// unwritten→written extent conversion to pay down.
 #[cfg(not(target_os = "linux"))]
 pub fn prewrite_zeros(_fd: RawFd, _len: u64) -> libc::c_int {
     0
@@ -145,6 +178,7 @@ pub fn punch_hole(fd: RawFd, offset: i64, len: i64) {
             len,
         );
     }
+    // Non-linux (macOS and wasm32): no hole punching; space is not reclaimed.
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (fd, offset, len);
@@ -157,6 +191,7 @@ pub fn madvise_hugepage(ptr: *mut libc::c_void, len: usize) {
     unsafe {
         libc::madvise(ptr, len, libc::MADV_HUGEPAGE);
     }
+    // Non-linux (macOS and wasm32): no huge-page advice.
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (ptr, len);
@@ -204,10 +239,18 @@ pub fn futex_wait(word: &AtomicU32, expected: u32, timeout: Duration) {
             &ts,
         );
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         let _ = (word, expected);
         std::thread::sleep(timeout.min(Duration::from_micros(200)));
+    }
+    // wasm32: single-threaded. No other thread can ever post the wake this
+    // would wait for, so a wait that returned late would be a pure hang;
+    // returning immediately makes the caller re-check state, which is the
+    // documented contract.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (word, expected, timeout);
     }
 }
 
@@ -217,6 +260,7 @@ pub fn futex_wake_all(word: &AtomicU32) {
     unsafe {
         libc::syscall(libc::SYS_futex, word.as_ptr(), libc::FUTEX_WAKE, i32::MAX);
     }
+    // Non-linux (macOS: waiters poll; wasm32: there are no waiters).
     #[cfg(not(target_os = "linux"))]
     {
         let _ = word;
@@ -232,10 +276,83 @@ pub fn futex_wake_all(word: &AtomicU32) {
 // tri-state DIRTY word (the "recovered" signal) on top. This struct provides
 // ONLY the exclusion primitives.
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 pub use macos_lock::WriterLock;
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(target_arch = "wasm32")]
+pub use wasm_lock::WriterLock;
+
+/// The wasm32 writer lock. `shm.rs` takes the same non-Linux route macOS does
+/// (a `WriterLock` object plus the shared tri-state DIRTY word) — but with one
+/// thread and one process, exclusion collapses to a flag.
+///
+/// The flag is not a formality: it preserves the ERRORCHECK behaviour the
+/// native lock has. A nested write transaction is a re-entrant acquire, and
+/// native answers that with `EDEADLK` rather than deadlocking. So does this —
+/// the SAME `Error::Internal("writer lock re-entered …")` the macOS path
+/// returns — which is what the task means by "assert non-reentrancy rather
+/// than lock". Owner death needs no recovery here: the only owner is us, and
+/// if we are gone so is the entire heap the database lived in.
+#[cfg(target_arch = "wasm32")]
+mod wasm_lock {
+    use mpedb_types::{Error, Result};
+    use std::cell::Cell;
+    use std::rc::Rc;
+
+    thread_local! {
+        /// One flag per process. There is exactly one database mapping in a
+        /// module instance, and no path that opens a second concurrently.
+        static HELD: Rc<Cell<bool>> = Rc::new(Cell::new(false));
+    }
+
+    pub struct WriterLock {
+        held: Rc<Cell<bool>>,
+    }
+
+    // Single-threaded by construction: `wasm32-unknown-unknown` has no
+    // threads, so nothing can observe this from another thread. `Shm` is
+    // declared Send+Sync for the native multi-process case and that
+    // declaration must keep compiling here.
+    unsafe impl Send for WriterLock {}
+    unsafe impl Sync for WriterLock {}
+
+    impl WriterLock {
+        /// No sidecar file exists (or could); the path is accepted and ignored.
+        pub fn open(_path: &std::path::Path) -> Result<WriterLock> {
+            Ok(WriterLock {
+                held: HELD.with(|h| h.clone()),
+            })
+        }
+
+        pub fn lock(&self) -> Result<()> {
+            if self.held.replace(true) {
+                return Err(Error::Internal(
+                    "writer lock re-entered by its owner (nested write transaction)".into(),
+                ));
+            }
+            Ok(())
+        }
+
+        pub fn trylock(&self) -> Result<Option<()>> {
+            if self.held.replace(true) {
+                // Single-threaded: "already held" can only be US, so this is
+                // re-entrancy, not contention. Reporting EBUSY-style `None`
+                // would send the caller into a retry loop that can never win.
+                self.held.set(true);
+                return Err(Error::Internal(
+                    "writer lock re-entered by its owner (nested write transaction)".into(),
+                ));
+            }
+            Ok(Some(()))
+        }
+
+        pub fn release_exclusion(&self) {
+            self.held.set(false);
+        }
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
 mod macos_lock {
     use mpedb_types::{Error, Result};
     use std::collections::HashMap;
@@ -399,6 +516,13 @@ mod macos_lock {
 /// `/proc/<pid>/stat` field 22. macOS: `proc_pidinfo(PROC_PIDTBSDINFO)` start
 /// instant. Returns `None` if the pid is gone (caller treats that as dead).
 pub fn proc_start_time(pid: u32) -> Option<u64> {
+    // wasm32: one process, born with the module instance. Any pid other than
+    // ours is debris that cannot exist, and ours has a single fixed
+    // incarnation — there is no `exec` to start a second one.
+    #[cfg(target_arch = "wasm32")]
+    {
+        (pid == crate::wasmcompat::MY_PID).then_some(1)
+    }
     #[cfg(target_os = "linux")]
     {
         let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
@@ -406,7 +530,7 @@ pub fn proc_start_time(pid: u32) -> Option<u64> {
         let rest = &stat[stat.rfind(')')? + 2..];
         rest.split_ascii_whitespace().nth(19)?.parse().ok()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         // Real per-process start stamp via libproc — `kinfo_proc`/`sysctl` is not
         // exposed by libc here, but `proc_pidinfo` is. PROC_PIDTBSDINFO fills
@@ -438,6 +562,13 @@ pub fn proc_start_time(pid: u32) -> Option<u64> {
 /// PID-namespace identity (Linux: `/proc/self/ns/pid` inode). macOS has no PID
 /// namespaces → a fixed constant (boot recovery relies on [`boot_id`] instead).
 pub fn pid_namespace_id() -> Option<u64> {
+    // wasm32: no namespaces. A fixed non-zero id, which is all the check needs
+    // (it only ever compares against what a PREVIOUS attach recorded, and the
+    // only previous attach is in this same module instance).
+    #[cfg(target_arch = "wasm32")]
+    {
+        Some(1)
+    }
     #[cfg(target_os = "linux")]
     {
         let l = std::fs::read_link("/proc/self/ns/pid").ok()?;
@@ -445,7 +576,7 @@ pub fn pid_namespace_id() -> Option<u64> {
         let inner = s.strip_prefix("pid:[")?.strip_suffix(']')?.to_owned();
         inner.parse().ok()
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         Some(1)
     }
@@ -455,6 +586,14 @@ pub fn pid_namespace_id() -> Option<u64> {
 /// robust-mutex/reader-table recovery. Linux: `/proc/sys/kernel/random/boot_id`.
 /// macOS: `sysctl(KERN_BOOTTIME)` (the boot instant).
 pub fn boot_id() -> Option<[u8; 16]> {
+    // wasm32: "boot" is the module instantiation, and the database is created
+    // fresh inside it — memory cannot outlive the boot that made it, so the
+    // stale-across-reboot hazard this guards is unreachable. A fixed non-zero
+    // value (zero would trigger spurious boot recovery, see `shm::boot_id`).
+    #[cfg(target_arch = "wasm32")]
+    {
+        Some(*b"mpedb-wasm-inst\0")
+    }
     #[cfg(target_os = "linux")]
     {
         let s = std::fs::read_to_string("/proc/sys/kernel/random/boot_id").ok()?;
@@ -468,7 +607,7 @@ pub fn boot_id() -> Option<[u8; 16]> {
         }
         Some(out)
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         let mut mib = [libc::CTL_KERN, libc::KERN_BOOTTIME];
         let mut tv: libc::timeval = unsafe { std::mem::zeroed() };
@@ -490,5 +629,59 @@ pub fn boot_id() -> Option<[u8; 16]> {
         out[0..8].copy_from_slice(&(tv.tv_sec as u64).to_le_bytes());
         out[8..16].copy_from_slice(&(tv.tv_usec as u64).to_le_bytes());
         Some(out)
+    }
+}
+
+/// This process's id.
+///
+/// Native: `std::process::id()`. **wasm32: a constant, because
+/// `std::process::id()` PANICS there** — `wasm32-unknown-unknown` has no
+/// process concept, and std's stub aborts rather than inventing one. A tab is
+/// a single process, so the constant is not a placeholder: it is the complete
+/// truth about how many processes can touch this database.
+pub fn process_id() -> u32 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        crate::wasmcompat::MY_PID
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::process::id()
+    }
+}
+
+/// Wall-clock microseconds since the Unix epoch — the single clock read behind
+/// a literal `'now'` and a `DEFAULT now`.
+///
+/// Native: `SystemTime::now()`. **wasm32: a HOST import**, because
+/// `SystemTime::now()` panics on `wasm32-unknown-unknown` — std has no clock
+/// there and aborts rather than inventing one.
+///
+/// It is imported rather than stubbed to zero on purpose. Returning 0 would
+/// make `date('now')` answer `1970-01-01` — a wrong answer, not a refusal, and
+/// this engine's rule is *agree or refuse, never differ*. The embedder supplies
+/// the browser's own clock (`Date.now()`), so `'now'` is genuinely now.
+///
+/// A clock before the epoch yields 0 rather than a negative surprise, matching
+/// the native helpers this replaces.
+pub fn wall_clock_micros() -> i64 {
+    #[cfg(target_arch = "wasm32")]
+    {
+        // Milliseconds as f64 (what `Date.now()` returns) rather than an i64:
+        // an i64 across the wasm boundary is a JS BigInt, and this needs no
+        // sub-millisecond resolution that would justify the friction.
+        let ms = unsafe { crate::wasmcompat::mpedb_host_now_ms() };
+        if ms.is_finite() && ms > 0.0 {
+            (ms * 1000.0) as i64
+        } else {
+            0
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| i64::try_from(d.as_micros()).unwrap_or(i64::MAX))
+            .unwrap_or(0)
     }
 }

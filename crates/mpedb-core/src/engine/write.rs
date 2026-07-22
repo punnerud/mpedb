@@ -350,7 +350,14 @@ impl<'e> WriteTxn<'e> {
             // progress (EXDEV, EOPNOTSUPP, short file) falls through to the
             // pwrite loop FROM the copied offset via pread — never through
             // `next_into`, whose cursor did not move.
-            if let Some(f) = src.as_file() {
+            // wasm32: no file-backed source can exist, so the kernel-copy
+            // fast path is statically absent and every insert takes the
+            // `next_into` loop below.
+            #[cfg(target_arch = "wasm32")]
+            let fast: Option<&crate::wasmcompat::File> = None;
+            #[cfg(not(target_arch = "wasm32"))]
+            let fast = src.as_file();
+            if let Some(f) = fast {
                 let copied = self
                     .eng
                     .shm
@@ -358,6 +365,9 @@ impl<'e> WriteTxn<'e> {
                 off += copied;
                 remaining -= copied as usize;
                 if remaining > 0 {
+                    // wasm32: `read_exact_at` is an inherent method on the
+                    // wasmcompat File, so no extension trait to import.
+                    #[cfg(not(target_arch = "wasm32"))]
                     use std::os::unix::fs::FileExt;
                     let mut buf = vec![0u8; PAGE_SIZE.min(64 * 1024)];
                     let mut src_off = copied;

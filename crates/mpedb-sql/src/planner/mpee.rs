@@ -664,9 +664,14 @@ impl<'a> Problem<'a> {
 /// `=1` and nothing else, so a script that spells "off" as `=0` cannot silently
 /// select the arm it meant to exclude.
 pub(super) fn disabled() -> bool {
-    static OFF: std::sync::LazyLock<bool> =
-        std::sync::LazyLock::new(|| std::env::var("MPEDB_NO_MPEE").is_ok_and(|v| v == "1"));
-    *OFF
+    match crate::planner::mpee_override() {
+        Some(off) => off,
+        None => {
+            static OFF: std::sync::LazyLock<bool> =
+                std::sync::LazyLock::new(|| std::env::var("MPEDB_NO_MPEE").is_ok_and(|v| v == "1"));
+            *OFF
+        }
+    }
 }
 
 /// Why the chain was left alone, for the `MPEDB_EXPLAIN_MPEE` trace and for

@@ -329,10 +329,7 @@ fn sys_key(subkey: &[u8]) -> Vec<u8> {
 /// (used only by the off-by-default newest-wins conflict policy). A clock before
 /// the epoch yields 0 rather than a negative surprise.
 fn now_micros() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_micros() as i64)
-        .unwrap_or(0)
+    crate::os::wall_clock_micros()
 }
 
 /// Freelist entry kinds (the byte between txn and chunk in the key).
