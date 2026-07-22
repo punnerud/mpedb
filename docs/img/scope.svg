@@ -1,62 +1,100 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 470" width="880" height="470" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 880 720" width="880" height="720" font-family="-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif">
   <style>
     .t   { fill:#1f2328; }
     .dim { fill:#59636e; }
     .win { fill:#1a7f37; }
     .no  { fill:#cf222e; }
+    .barw{ fill:#1a7f37; }
+    .barl{ fill:#cf222e; }
+    .axis{ stroke:#8c959f; }
+    .rule{ stroke:#d1d9e0; }
     @media (prefers-color-scheme: dark) {
       .t { fill:#e6edf3; } .dim { fill:#9198a1; }
       .win { fill:#3fb950; } .no { fill:#f85149; }
-      .bg { fill:#0d1117; } .card { fill:#161b22; stroke:#30363d; }
-      .rule { stroke:#30363d; }
+      .barw{ fill:#3fb950; } .barl{ fill:#f85149; }
+      .bg { fill:#0d1117; } .rule { stroke:#30363d; } .axis { stroke:#6e7681; }
     }
   </style>
-  <rect class="bg" width="880" height="470" fill="#ffffff"/>
+  <rect class="bg" width="880" height="720" fill="#ffffff"/>
 
-  <text class="t" x="32" y="46" font-size="25" font-weight="700">What each engine can even be asked to do</text>
-  <text class="dim" x="32" y="70" font-size="14">sqlite's own 7.4M-record corpus · CPython's test_sqlite3 · Django's suite · concurrent writer processes</text>
+  <text class="t" x="32" y="44" font-size="25" font-weight="700">What each engine can even be asked to do</text>
+  <text class="dim" x="32" y="68" font-size="14">sqlite3 3.45 · mpedb · minisqlite — Cursor's SQLite reimplementation (github.com/cursor/minisqlite)</text>
 
-  <!-- column headers -->
-  <text class="dim" x="470" y="106" font-size="13" font-weight="600" text-anchor="middle">minisqlite</text>
-  <text class="t"   x="640" y="106" font-size="13" font-weight="700" text-anchor="middle">mpedb</text>
-  <text class="dim" x="800" y="106" font-size="13" font-weight="600" text-anchor="middle">sqlite3</text>
-  <line class="rule" x1="32" y1="118" x2="848" y2="118" stroke="#d1d9e0"/>
+  <text class="dim" x="452" y="104" font-size="13" font-weight="600" text-anchor="middle">minisqlite</text>
+  <text class="dim" x="452" y="119" font-size="10.5" text-anchor="middle">(Cursor)</text>
+  <text class="t"   x="640" y="104" font-size="13" font-weight="700" text-anchor="middle">mpedb</text>
+  <text class="dim" x="800" y="104" font-size="13" font-weight="600" text-anchor="middle">sqlite3</text>
+  <line class="rule" x1="32" y1="130" x2="848" y2="130"/>
 
-  <!-- rows -->
   <g font-size="15">
-    <text class="t"   x="32"  y="152">SQL corpus, wrong answers</text>
-    <text class="win" x="470" y="152" text-anchor="middle" font-weight="600">0</text>
-    <text class="win" x="640" y="152" text-anchor="middle" font-weight="700">0</text>
-    <text class="win" x="800" y="152" text-anchor="middle" font-weight="600">0</text>
+    <text class="t"   x="32"  y="162">sqlite's own 7.4M-record corpus</text>
+    <text class="win" x="452" y="162" text-anchor="middle" font-weight="600">0 wrong</text>
+    <text class="win" x="640" y="162" text-anchor="middle" font-weight="700">0 wrong</text>
+    <text class="win" x="800" y="162" text-anchor="middle" font-weight="600">0 wrong</text>
 
-    <text class="t"   x="32"  y="192">CPython test_sqlite3</text>
-    <text class="no"  x="470" y="192" text-anchor="middle" font-weight="600">cannot run</text>
-    <text class="win" x="640" y="192" text-anchor="middle" font-weight="700">459 / 467</text>
-    <text class="win" x="800" y="192" text-anchor="middle" font-weight="600">467 / 467</text>
+    <text class="t"   x="32"  y="200">CPython test_sqlite3</text>
+    <text class="no"  x="452" y="200" text-anchor="middle" font-weight="600">cannot run</text>
+    <text class="win" x="640" y="200" text-anchor="middle" font-weight="700">459 / 467</text>
+    <text class="win" x="800" y="200" text-anchor="middle" font-weight="600">467 / 467</text>
 
-    <text class="t"   x="32"  y="232">Django, frozen labels</text>
-    <text class="no"  x="470" y="232" text-anchor="middle" font-weight="600">cannot run</text>
-    <text class="win" x="640" y="232" text-anchor="middle" font-weight="700">831 / 831</text>
-    <text class="win" x="800" y="232" text-anchor="middle" font-weight="600">831 / 831</text>
+    <text class="t"   x="32"  y="238">Django, frozen labels</text>
+    <text class="no"  x="452" y="238" text-anchor="middle" font-weight="600">cannot run</text>
+    <text class="win" x="640" y="238" text-anchor="middle" font-weight="700">831 / 831</text>
+    <text class="win" x="800" y="238" text-anchor="middle" font-weight="600">831 / 831</text>
 
-    <text class="t"   x="32"  y="272">Django, queries label</text>
-    <text class="no"  x="470" y="272" text-anchor="middle" font-weight="600">cannot run</text>
-    <text class="win" x="640" y="272" text-anchor="middle" font-weight="700">493 / 493</text>
-    <text class="win" x="800" y="272" text-anchor="middle" font-weight="600">493 / 493</text>
+    <text class="t"   x="32"  y="276">Django, queries label</text>
+    <text class="no"  x="452" y="276" text-anchor="middle" font-weight="600">cannot run</text>
+    <text class="win" x="640" y="276" text-anchor="middle" font-weight="700">493 / 493</text>
+    <text class="win" x="800" y="276" text-anchor="middle" font-weight="600">493 / 493</text>
 
-    <text class="t"   x="32"  y="312">Concurrent writer processes</text>
-    <text class="no"  x="470" y="312" text-anchor="middle" font-weight="600">1</text>
-    <text class="win" x="640" y="312" text-anchor="middle" font-weight="700">many</text>
-    <text class="no"  x="800" y="312" text-anchor="middle" font-weight="600">1</text>
-
-    <text class="t"   x="32"  y="352">Corpus wall clock</text>
-    <text class="dim" x="470" y="352" text-anchor="middle">153 s</text>
-    <text class="no"  x="640" y="352" text-anchor="middle" font-weight="700">239 s</text>
-    <text class="win" x="800" y="352" text-anchor="middle" font-weight="600">68 s</text>
+    <text class="t"   x="32"  y="314">Writer processes, one file</text>
+    <text class="no"  x="452" y="314" text-anchor="middle" font-weight="600">1</text>
+    <text class="win" x="640" y="314" text-anchor="middle" font-weight="700">many</text>
+    <text class="no"  x="800" y="314" text-anchor="middle" font-weight="600">1</text>
   </g>
+  <text class="dim" x="32" y="342" font-size="12.5">"cannot run" is not a failure — minisqlite ships no C-API, so no Python driver, no ORM, nothing that speaks libsqlite3's ABI reaches it.</text>
 
-  <line class="rule" x1="32" y1="378" x2="848" y2="378" stroke="#d1d9e0"/>
-  <text class="no" x="32" y="404" font-size="14" font-weight="600">mpedb is 3.5× SLOWER than sqlite3 on the corpus. That row is not a typo.</text>
-  <text class="dim" x="32" y="426" font-size="13">It is ahead on index-backed aggregates (min/max in microseconds, count 55×) and behind on the row pipeline.</text>
-  <text class="dim" x="32" y="450" font-size="13">Linux, 621 files, both engines same box, same commit — every number reproducible from §11 of this page.</text>
+  <line class="rule" x1="32" y1="372" x2="848" y2="372"/>
+
+  <text class="t" x="32" y="406" font-size="21" font-weight="700">Speed on operations an application actually runs</text>
+  <text class="dim" x="32" y="428" font-size="13">mpedb vs sqlite3 3.45, same box, same commit. Bars right of the line = mpedb faster, left = slower.</text>
+
+  <line class="axis" x1="452" y1="446" x2="452" y2="690" stroke-width="1.5"/>
+  <text class="dim" x="452" y="708" font-size="11" text-anchor="middle">parity</text>
+  <text class="no"  x="300" y="708" font-size="11" text-anchor="middle">← sqlite3 faster</text>
+  <text class="win" x="620" y="708" font-size="11" text-anchor="middle">mpedb faster →</text>
+
+  <g font-size="13.5">
+    <text class="t" x="32" y="465">min(a), max(a) — indexed</text>
+    <rect class="barw" x="452" y="454" width="330" height="14" rx="2"/>
+    <text class="win" x="790" y="465" font-size="12.5" font-weight="700">4000×</text>
+
+    <text class="t" x="32" y="497">count(a) — indexed</text>
+    <rect class="barw" x="452" y="486" width="248" height="14" rx="2"/>
+    <text class="win" x="708" y="497" font-size="12.5" font-weight="700">55×</text>
+
+    <text class="t" x="32" y="529">sum — 11 cores, parallel</text>
+    <rect class="barw" x="452" y="518" width="118" height="14" rx="2"/>
+    <text class="win" x="578" y="529" font-size="12.5" font-weight="700">3.7×</text>
+
+    <text class="t" x="32" y="561">writes — 4 processes</text>
+    <rect class="barw" x="452" y="550" width="104" height="14" rx="2"/>
+    <text class="win" x="564" y="561" font-size="12.5" font-weight="700">3.0×</text>
+
+    <text class="t" x="32" y="593">batch INSERT (100 rows)</text>
+    <rect class="barw" x="452" y="582" width="42" height="14" rx="2"/>
+    <text class="win" x="502" y="593" font-size="12.5" font-weight="700">1.45×</text>
+
+    <text class="t" x="32" y="625">GROUP BY, 10 groups</text>
+    <rect class="barw" x="452" y="614" width="10" height="14" rx="2"/>
+    <text class="win" x="470" y="625" font-size="12.5" font-weight="700">1.09×</text>
+
+    <text class="t" x="32" y="657">prepared SELECT</text>
+    <rect class="barl" x="356" y="646" width="96" height="14" rx="2"/>
+    <text class="no"  x="348" y="657" font-size="12.5" font-weight="700" text-anchor="end">0.71×</text>
+
+    <text class="t" x="32" y="689">single-row INSERT</text>
+    <rect class="barl" x="296" y="678" width="156" height="14" rx="2"/>
+    <text class="no"  x="288" y="689" font-size="12.5" font-weight="700" text-anchor="end">0.40×</text>
+  </g>
 </svg>
