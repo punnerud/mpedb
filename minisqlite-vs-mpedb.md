@@ -1,5 +1,41 @@
 # minisqlite vs mpedb (incl. SQLite3 / PostgreSQL)
 
+## Two SQL engines, one weekend, and the boring number nobody publishes
+
+![What each engine can be asked to do](docs/img/scope.svg)
+
+**mpedb runs Django and CPython's own `sqlite3` test suite. minisqlite cannot be
+asked to.** Not "fails" — *cannot be asked*: it ships no C-API, so no Python
+driver, no ORM, no `LD_PRELOAD`, nothing that speaks libsqlite3's ABI can reach
+it. mpedb ships one, and through it Django's frozen labels pass **831/831** and
+`queries` **493/493**, with CPython's suite at **459/467** — every remaining
+failure a documented refusal, none a wrong answer.
+
+Both engines answer sqlite's own **7.4-million-record** corpus with **zero wrong
+answers**. That is the bar, and both clear it.
+
+**And here is the row a launch post would leave out: mpedb is 3.5× SLOWER than
+sqlite3 on that corpus** — 239 s against 68 s, same box, same commit, same files.
+minisqlite sits between us at 153 s. We are ahead where an index can answer the
+question (`min`/`max` in microseconds instead of 162 ms, `count(a)` 55× faster)
+and behind on the per-row pipeline, because mpedb validates every decoded row
+where sqlite memcpy's a record. That is a design choice with a bill, and the bill
+is on this page.
+
+One thing mpedb does that neither of the others can: **several OS processes
+writing the same file at once**. In a survey of ~100 actively-maintained
+open-source engines, three allow it ([`LANDSCAPE.md`](LANDSCAPE.md)).
+
+*Cost, since it is being discussed: mpedb — engine, SQL front end, C-API shim,
+mirror, CLI — was built inside a Claude Max 20× subscription, under half of it
+used. Compare that against whatever a competing effort reports, and note which
+one includes a C-API.*
+
+**Everything above is reproducible from this page** — §11 for the corpus timings,
+[`C-API-COMPAT.md`](C-API-COMPAT.md) for the suite runs test-by-test.
+
+---
+
 **Date:** 2026-07-21  
 **minisqlite:** [github.com/cursor/minisqlite](https://github.com/cursor/minisqlite) @ `main`  
 **mpedb:** this workspace @ `4926536`  
