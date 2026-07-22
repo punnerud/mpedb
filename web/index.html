@@ -64,13 +64,21 @@
 
     <main>
       <section class="panel">
-        <h2>SQL<button class="h2btn" id="toexamples" type="button">Examples ▾</button></h2>
+        <h2>
+          <span class="seg" role="tablist">
+            <button class="segbtn" id="tosql" type="button" role="tab" aria-selected="true">SQL</button>
+            <button class="segbtn" id="todata" type="button" role="tab" aria-selected="false">Data</button>
+          </span>
+          <button class="h2btn" id="toexamples" type="button">Examples ▾</button>
+        </h2>
         <div class="editor">
           <textarea id="sql" spellcheck="false" autocapitalize="off" autocorrect="off"
             aria-label="SQL to run">SELECT count(*) FROM orders</textarea>
           <div class="editorbar">
             <button class="run" id="run" type="button" disabled>Run</button>
             <button class="ghost" id="reset" type="button">Reset database</button>
+            <button class="ghost" id="loadcsv" type="button">Load CSV…</button>
+            <input type="file" id="csvfile" accept=".csv,.tsv,.txt,text/csv,text/tab-separated-values" multiple hidden>
             <span class="hint">⌘/Ctrl + Enter to run · one statement at a time</span>
             <span class="spacer"></span>
             <span class="hint" id="dbstate"></span>
@@ -78,6 +86,7 @@
         </div>
         <div class="status" id="status"></div>
         <div id="refused"></div>
+        <div class="datapane" id="data" hidden></div>
       </section>
 
       <section class="panel" id="out" style="margin-top:18px" hidden>
@@ -102,6 +111,14 @@
 
       <div class="loading" id="loading">Loading the engine…</div>
     </main>
+  </div>
+
+  <div class="dropzone" id="dropzone" hidden>
+    <div class="dropbox">
+      <b>Drop CSV files</b>
+      <span>Each file becomes a table in the live database, and the examples
+      become queries over <em>your</em> columns.</span>
+    </div>
   </div>
 
   <dialog class="exdlg" id="exdlg" aria-label="Examples">

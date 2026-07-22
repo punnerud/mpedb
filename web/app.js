@@ -5,6 +5,7 @@
 // types, and no panel is filled in from a guess when the engine did not answer.
 
 import { Mpedb } from "./mpedb.js";
+import { parseCsv, planTable, toSql, examplesFor } from "./csv.js";
 
 const $ = (id) => document.getElementById(id);
 
@@ -19,6 +20,9 @@ const $ = (id) => document.getElementById(id);
 // has quietly started accepting.
 
 let EXAMPLES = [];
+// The engine's own list, kept so a reset can put it back after a CSV import
+// has replaced it with queries over the visitor's columns.
+let DEMO_EXAMPLES = [];
 
 // ---------------------------------------------------------------------------
 // Boot
@@ -27,6 +31,7 @@ let EXAMPLES = [];
 let db = null;
 let lastResult = null;
 let activeTab = "rows";
+let TABLES = [];
 
 async function boot() {
   wireTheme();
@@ -44,7 +49,8 @@ async function boot() {
   const v = db.version();
   $("build").textContent = `mpedb ${v.version} · plan format ${v.plan_format}`;
 
-  EXAMPLES = db.examples().groups;
+  DEMO_EXAMPLES = db.examples().groups;
+  EXAMPLES = DEMO_EXAMPLES;
   buildExamples();
 
   const open = openDemo();
@@ -55,7 +61,12 @@ async function boot() {
   $("run").addEventListener("click", runCurrent);
   $("reset").addEventListener("click", () => {
     if (openDemo()) setStatus("Database reset — 500 rows, freshly created.");
+    // A reset destroys imported tables, so the examples that queried them
+    // would be buttons pointing at nothing. Put the engine's own list back.
+    if (EXAMPLES !== DEMO_EXAMPLES) { EXAMPLES = DEMO_EXAMPLES; buildExamples(); }
+    if (mode === "data") buildData();
   });
+  wireCsv();
   // The catalogue is a sidebar on wide screens and sits below the editor on
   // narrow ones, where scrolling to it means losing the editor off the top.
   // The button opens the same list as a small modal that scrolls inside itself
@@ -68,6 +79,11 @@ async function boot() {
   $("exdlg").addEventListener("click", (e) => {
     if (e.target === $("exdlg")) $("exdlg").close();
   });
+  // SQL and Data are two views of the same panel. Data exists because the demo
+  // is only interesting if you can see what you are querying — the schema panel
+  // lists columns, this shows the actual rows in every table.
+  $("tosql").addEventListener("click", () => setMode("sql"));
+  $("todata").addEventListener("click", () => setMode("data"));
   $("sql").addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); runCurrent(); }
   });
@@ -89,10 +105,169 @@ function openDemo() {
       `<b>The demo database could not be created.</b><br><span class="mono">${esc(res.error)}</span>`;
     return null;
   }
+  TABLES = res.tables.map((t) => t.name);
   renderSchema(res.tables);
   $("seedsql").textContent = res.seed_sql;
   $("dbstate").textContent = `demo db built in ${ms.toFixed(0)} ms`;
   return res;
+}
+
+// ---------------------------------------------------------------------------
+// CSV import
+// ---------------------------------------------------------------------------
+
+function wireCsv() {
+  $("loadcsv").addEventListener("click", () => $("csvfile").click());
+  $("csvfile").addEventListener("change", (e) => {
+    importFiles(e.target.files);
+    e.target.value = "";  // so the same file can be picked twice
+  });
+
+  // Drag events fire for every element entered and left, so a plain
+  // enter/leave pair flickers over child nodes. Counting depth is the standard
+  // fix: the overlay goes away only when the last enter has been matched.
+  let depth = 0;
+  const isFiles = (e) => Array.from(e.dataTransfer?.types || []).includes("Files");
+  window.addEventListener("dragenter", (e) => {
+    if (!isFiles(e)) return;
+    e.preventDefault();
+    if (++depth === 1) $("dropzone").hidden = false;
+  });
+  window.addEventListener("dragover", (e) => { if (isFiles(e)) e.preventDefault(); });
+  window.addEventListener("dragleave", (e) => {
+    if (!isFiles(e)) return;
+    if (--depth <= 0) { depth = 0; $("dropzone").hidden = true; }
+  });
+  window.addEventListener("drop", (e) => {
+    if (!isFiles(e)) return;
+    e.preventDefault();
+    depth = 0;
+    $("dropzone").hidden = true;
+    importFiles(e.dataTransfer.files);
+  });
+}
+
+async function importFiles(fileList) {
+  const files = Array.from(fileList || []);
+  if (!files.length) return;
+
+  const made = [];
+  const failed = [];
+  const t0 = performance.now();
+
+  for (const f of files) {
+    let plan;
+    try {
+      plan = planTable(f.name, parseCsv(await f.text()));
+    } catch (e) {
+      failed.push(`${f.name}: ${String(e.message || e)}`);
+      continue;
+    }
+    // The engine decides. Every statement's error is shown as the engine
+    // wrote it — an import that half-succeeds says so rather than pretending.
+    let bad = null;
+    for (const sql of toSql(plan)) {
+      const res = db.run(sql);
+      if (!res.ok) { bad = `${res.error} — while running: ${sql.slice(0, 120)}`; break; }
+    }
+    if (bad) failed.push(`${f.name}: ${bad}`);
+    else made.push(plan);
+  }
+
+  const ms = performance.now() - t0;
+
+  if (made.length) {
+    // Imported data replaces the catalogue: the demo's examples are about the
+    // demo's tables, and leaving them would hand the visitor buttons that
+    // query rows they did not bring.
+    EXAMPLES = made.map(examplesFor);
+    buildExamples();
+    refreshSchema();
+    $("sql").value = `SELECT * FROM ${made[0].table} LIMIT 100`;
+    setMode("data");
+  }
+
+  const parts = made.map(
+    (p) =>
+      `<code>${esc(p.table)}</code> — ${p.rows.length} row${p.rows.length === 1 ? "" : "s"}, ` +
+      `${p.columns.length} column${p.columns.length === 1 ? "" : "s"}` +
+      `${p.truncated ? ` (first ${p.rows.length} of ${p.truncated})` : ""}` +
+      `${p.hasHeader ? "" : ", no header row — columns named c1…"}`
+  );
+  setStatus(
+    (made.length
+      ? `Imported in <span class="timing">${ms.toFixed(0)} ms</span>: ${parts.join(" · ")}. ` +
+        `The examples now query your tables; <strong>Reset database</strong> brings the demo back.`
+      : "") +
+      (failed.length
+        ? `${made.length ? "<br>" : ""}<span class="t-null">Not imported:</span> ` +
+          failed.map((f) => esc(f)).join("<br>")
+        : "")
+  );
+}
+
+// The schema panel must show what the engine holds, not what the importer
+// believes it created — so ask the engine.
+function refreshSchema() {
+  const res = db.schema();
+  if (!res.ok) return;
+  TABLES = res.tables.map((t) => t.name);
+  renderSchema(res.tables);
+}
+
+// ---------------------------------------------------------------------------
+// SQL / Data
+// ---------------------------------------------------------------------------
+
+let mode = "sql";
+
+function setMode(next) {
+  mode = next;
+  const data = next === "data";
+  $("tosql").setAttribute("aria-selected", String(!data));
+  $("todata").setAttribute("aria-selected", String(data));
+  // The editor and the result tabs are one view, the table browser the other.
+  // Nothing is destroyed by switching — the last result is still there when you
+  // come back. The status line stays in both: it is where a CSV import reports.
+  $("refused").hidden = data;
+  document.querySelector(".editor").hidden = data;
+  $("out").hidden = data || !lastResult || !lastResult.ok;
+  $("data").hidden = !data;
+  // Always rebuilt on entry: a statement you ran a moment ago may have changed
+  // rows, and a browser showing a stale table would be lying about the engine.
+  if (data) buildData();
+}
+
+function buildData() {
+  const N = 200;
+  $("data").innerHTML =
+    `<p class="explainer">Every table in the live database, straight from the engine — ` +
+    `each is a <code>SELECT * FROM …</code> run just now, capped at ${N} rows and scrolling ` +
+    `in its own box. Anything you INSERT or UPDATE shows up here immediately; ` +
+    `<strong>Reset database</strong> puts it back.</p>` +
+    TABLES.map((t) => {
+      const res = db.run(`SELECT * FROM ${t} LIMIT ${N}`);
+      if (!res.ok || !res.result || res.result.kind !== "rows") {
+        return `<div class="dtbl"><h4>${esc(t)}</h4>` +
+          `<p class="rowcount">${esc(res.error || "no rows returned")}</p></div>`;
+      }
+      const n = tableCount(t);
+      const shown = res.result.rows.length;
+      const more = n !== null && n > shown ? ` — showing the first ${shown}` : "";
+      return (
+        `<div class="dtbl"><h4>${esc(t)}` +
+        `<span class="dn">${n === null ? shown : n} row${(n ?? shown) === 1 ? "" : "s"}${more}</span></h4>` +
+        `<div class="dscroll">${rowsTableHtml(res.result)}</div></div>`
+      );
+    }).join("");
+}
+
+// count(*) is its own statement rather than rows.length, because the LIMIT
+// above means the row array is not the answer to "how big is this table".
+function tableCount(t) {
+  const res = db.run(`SELECT count(*) FROM ${t}`);
+  if (!res.ok || !res.result || res.result.kind !== "rows" || !res.result.rows.length) return null;
+  return res.result.rows[0][0]?.v ?? null;
 }
 
 // ---------------------------------------------------------------------------
@@ -222,22 +397,28 @@ function rowsHtml(r) {
       `Columns: ${r.columns.map((c) => `<code>${esc(c)}</code>`).join(", ")}.</p>`
     );
   }
-  // Column type is taken from the first row's actual value tag — the engine's
-  // answer, not a declared type.
-  const tys = r.columns.map((_, i) => r.rows[0][i]?.t ?? "");
-  const head = r.columns
-    .map((c, i) => `<th>${esc(c)}<span class="ty">${esc(tys[i])}</span></th>`)
-    .join("");
   const MAX = 300;
-  const body = r.rows
-    .slice(0, MAX)
-    .map((row) => `<tr>${row.map(cellHtml).join("")}</tr>`)
-    .join("");
   const more =
     r.rows.length > MAX
       ? `<p class="rowcount">Showing the first ${MAX} of ${r.rows.length} rows — the engine returned all of them.</p>`
       : `<p class="rowcount">${r.rows.length} row${r.rows.length === 1 ? "" : "s"}.</p>`;
-  return `<div class="tablewrap"><table class="rows"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>${more}`;
+  return `${rowsTableHtml(r, MAX)}${more}`;
+}
+
+// The table itself, with no surrounding prose — shared by the result pane and
+// the Data browser so the two never render a value differently.
+function rowsTableHtml(r, max = 300) {
+  // Column type is taken from the first row's actual value tag — the engine's
+  // answer, not a declared type.
+  const tys = r.columns.map((_, i) => r.rows[0]?.[i]?.t ?? "");
+  const head = r.columns
+    .map((c, i) => `<th>${esc(c)}<span class="ty">${esc(tys[i])}</span></th>`)
+    .join("");
+  const body = r.rows
+    .slice(0, max)
+    .map((row) => `<tr>${row.map(cellHtml).join("")}</tr>`)
+    .join("");
+  return `<div class="tablewrap"><table class="rows"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>`;
 }
 
 function cellHtml(v) {

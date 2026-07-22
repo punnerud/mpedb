@@ -184,6 +184,57 @@ header.top .meta { color: var(--fg-faint); font-size: 12px; font-family: var(--m
   text-transform: none; color: var(--fg-faint);
 }
 
+/* ---------- CSV drop zone ---------- */
+
+/* Covers the viewport only while a drag is in flight — a permanent drop target
+   would be a box the visitor has to look past on every visit. */
+.dropzone {
+  position: fixed; inset: 0; z-index: 50;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(0,0,0,0.45); backdrop-filter: blur(2px);
+}
+.dropbox {
+  pointer-events: none;
+  max-width: 420px; padding: 28px 32px; text-align: center;
+  background: var(--bg-panel); color: var(--fg);
+  border: 2px dashed var(--accent); border-radius: 10px;
+}
+.dropbox b { display: block; font-size: 17px; margin-bottom: 8px; }
+.dropbox span { font-size: 13px; color: var(--fg-dim); }
+
+/* ---------- SQL / Data switch ---------- */
+
+.seg { display: inline-flex; gap: 2px; }
+.segbtn {
+  cursor: pointer; background: none; border: 0; padding: 0 2px;
+  font-family: inherit; font-size: 12px; font-weight: 660;
+  text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--fg-faint); border-bottom: 2px solid transparent;
+  line-height: 1.6;
+}
+.segbtn + .segbtn { margin-left: 12px; }
+.segbtn:hover { color: var(--fg-dim); }
+/* The selected view is the only one in full contrast — the panel title and the
+   switch are the same object, so one of them must read as the heading. */
+.segbtn[aria-selected="true"] { color: var(--fg); border-bottom-color: var(--accent); }
+
+.datapane { padding: 12px 14px 16px; }
+.dtbl { margin-top: 16px; }
+.dtbl:first-of-type { margin-top: 10px; }
+.dtbl > h4 {
+  margin: 0 0 6px; font-size: 13px; font-family: var(--mono); color: var(--fg);
+  display: flex; align-items: baseline; gap: 8px;
+}
+.dtbl .dn {
+  margin-left: auto; font-family: inherit; font-size: 11px; font-weight: 400;
+  color: var(--fg-faint);
+}
+/* Each table scrolls in its own box, so five tables are five short panes
+   rather than one page you scroll for a minute. */
+.dscroll { max-height: 300px; overflow: auto; border: 1px solid var(--rule); border-radius: 5px; }
+.dscroll .tablewrap { border: 0; border-radius: 0; }
+.dscroll table.rows thead th { position: sticky; top: 0; z-index: 1; background: var(--bg-sunken); }
+
 /* ---------- examples modal ---------- */
 
 /* Deliberately small: a catalogue you scroll INSIDE, never a takeover. The

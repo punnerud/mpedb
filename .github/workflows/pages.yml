@@ -77,7 +77,10 @@ jobs:
       - name: assemble the site
         run: |
           mkdir -p _site
-          cp web/index.html web/style.css web/app.js web/mpedb.js _site/
+          # A glob, not a list: app.js is an ES module that imports its
+          # siblings, and a file left out of a hand-written list does not
+          # degrade — the import 404s and the whole page is dead.
+          cp web/*.html web/*.css web/*.js _site/
           cp target/wasm32-unknown-unknown/release/mpedb_wasm.wasm _site/mpedb.wasm
           # Pages serves what it is given; no build step, no bundler, no CDN.
           # `.nojekyll` stops Jekyll from eating files, which it does silently.
@@ -90,8 +93,13 @@ jobs:
       - name: sanity-check the artifact
         run: |
           test -s _site/mpedb.wasm || { echo "mpedb.wasm missing or empty"; exit 1; }
-          for f in index.html style.css app.js mpedb.js; do
+          for f in index.html style.css app.js mpedb.js csv.js; do
             test -s "_site/$f" || { echo "$f missing or empty"; exit 1; }
+          done
+          # Every module app.js imports must have been copied. Checks the
+          # relationship rather than a remembered list.
+          for m in $(grep -o 'from "\./[a-z0-9_.-]*\.js"' _site/app.js | sed 's/.*\.\///; s/"//'); do
+            test -s "_site/$m" || { echo "app.js imports $m, which is not in the site"; exit 1; }
           done
           grep -q 'mpedb.wasm' _site/mpedb.js || { echo "glue does not reference the module"; exit 1; }
 
