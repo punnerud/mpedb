@@ -25,8 +25,9 @@ blocker.
 ## 1. Ecosystem parity (P7 residual)
 
 Measured at `03ff5ea`/`d83c21d` on the M3, `C-API-COMPAT.md` is the live sheet.
-Django **826/831 + 490/493 + 314/324 + 514/528**, CPython **450/474** (Linux
-runner: 447/467 — different interpreter, different denominator, do not subtract).
+Django **826/831 + 490/493 + 314/324 + 514/528**, CPython **450/474** on the M3 (this Linux runner scores **458/466** at
+`858dbb5` on CPython 3.12.3 — different interpreter, different denominator, do
+not subtract).
 
 - [ ] **Derived-table placement** — `test_qs_with_subcompound_qs`,
       `test_distinct_ordered_sliced_subquery`. Both need `exec/`:
@@ -44,9 +45,19 @@ runner: 447/467 — different interpreter, different denominator, do not subtrac
       `UNIQUE … WHERE` and parameterized predicates.
 - [ ] **DDL inside SAVEPOINT** (2 `backends` tests) — engine.
 - [ ] **Output alias referenced in WHERE** (CPython trace test) — binder.
-- [ ] Smaller shim items: `ON CONFLICT ROLLBACK`, `deserialize`,
-      `sqlite_master` rows for indexes/views/triggers (a dump that loses
-      indexes replays into a different schema).
+- [x] `sqlite_master` rows for indexes (`ce0caf7`) — views and triggers were
+      already there. Same commit fixed two bugs found on the way: `sqlite_master`
+      **refused every bound parameter**, so Django's `get_constraints` (which
+      reaches the catalog only via `WHERE type='table' and name=%s`) raised on
+      every table rather than reading anything; and the `CREATE TABLE`
+      reconstruction **invented a `UNIQUE` constraint** for any column carrying a
+      separately-created unique index.
+- [x] `ON CONFLICT ROLLBACK` — already closed at `c4d1a90`; this entry was stale.
+- [ ] `deserialize` — decide scope rather than half-implementing.
+- [ ] **`UNIQUE INDEX … WHERE` in `WriteTxn::create_index`** — refused, and it
+      blocks Django's `backends` and `introspection` labels at `migrate`, so
+      **those two labels have never run on either arm**. Unblocking them is worth
+      more than it looks: it converts two unmeasured labels into measured ones.
 
 **Will not be closed, and the ceiling should say so.** `PRAGMA foreign_keys`
 ×2 + `test_unsaved_fk` (mpedb parses `REFERENCES` and discards it),
@@ -131,13 +142,19 @@ did not.** Every item here was found by running something, not by a failing test
       8 of 11 differential tests failed pre-fix.
 - [x] Non-numeric bound parameter coerced to 0 (`fc088d6`) — a refusal widened
       into a wrong answer to make one Django test pass.
-- [ ] **`ALTER TABLE … ADD COLUMN` on an implicit-rowid table** — appends after
-      the hidden rowid and fails the schema validator. Both halves are things
-      ORMs do constantly; migrations are impossible on exactly the tables the
-      shim creates by default.
-- [ ] **Shim introspection is stale** — `sqlite_master` does not see a table
-      until the statement *after* the COMMIT that created it. Read-your-own-
-      writes at the metadata level; ORMs depend on it.
+- [ ] **`ALTER TABLE … ADD COLUMN` on an implicit-rowid table** — confirmed
+      ENGINE-side, two sites, both the same shape: `Schema::with_added_column`
+      (`mpedb-types/src/schema.rs`) pushes past the trailing hidden rowid that
+      `validate`'s `implicit_rowid` arm requires to be last — insert at
+      `len() - 1` and bump the `primary_key` entry; and
+      `WriteTxn::alter_add_column` (`mpedb-core/src/engine/write.rs`) must
+      `insert` at the same position in the row rewrite, or every row is
+      re-encoded with the new column where the rowid belongs. Migrations are
+      impossible on exactly the tables the shim creates by default.
+- [x] **Shim introspection staleness** — the SQL surface was already fixed by
+      `a48ec1c`; the note outlived it. What survived was `sqlite3_blob_open`,
+      which bypasses SQL entirely, and the blob WRITE path where the stale
+      bundle disabled the handle's expiry detector. Both fixed in `ce0caf7`.
 - [ ] **`access_report` over-claims** — reports `exact_columns: true` while
       `..`-destructuring silently drops `windows`, `returning`, `with_check`,
       `ON CONFLICT DO UPDATE`. It is the C-API authorizer's input.
