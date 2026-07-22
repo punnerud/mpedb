@@ -335,6 +335,15 @@ button.ghost {
   font-family: var(--sans);
 }
 button.ghost:hover { border-color: var(--accent); color: var(--accent); }
+/* The only way in on a phone: there is no drag-and-drop on a touch screen, so
+   this button is not a convenience there, it is the feature. */
+button.ghost.upload { border-color: var(--accent); color: var(--accent); }
+@media (max-width: 700px) {
+  /* A keyboard shortcut is not advice a phone can take, and it was pushing the
+     upload button onto its own line. */
+  .editorbar .keyhint { display: none; }
+  button.ghost.upload { margin-left: auto; }
+}
 .editorbar .hint { color: var(--fg-faint); font-size: 12px; }
 .editorbar .spacer { flex: 1 1 auto; }
 
