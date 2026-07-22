@@ -30,7 +30,11 @@ members = [
 # than unwise. Build and test it with:
 #     cargo test --manifest-path crates/mpedb-capi/Cargo.toml
 # (or `cd crates/mpedb-capi && cargo test`), where mpedb compiles WITHOUT sqlite.
-exclude = ["crates/mpedb-capi"]
+# mpedb-olapbench is excluded for a different reason than mpedb-capi: it links a
+# bundled DuckDB, whose C++ amalgamation is a multi-minute compile. As a member
+# it would put that in front of every `cargo test --workspace` and every CI run,
+# to build a benchmark nobody is running at the time.
+exclude = ["crates/mpedb-capi", "crates/mpedb-olapbench"]
 
 [workspace.package]
 version = "0.1.0"

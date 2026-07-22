@@ -30,6 +30,14 @@ both on the same volume. Attribution: existing MPEE-aligned path (content-hashed
 `execute(hash)`, streaming LIMIT / `scan_rows_capped` per DESIGN-MPEE-OPT). Full
 tables in the RESULTS file above.
 
+**Analytics is measured separately**, against DuckDB with SQLite as the control
+group: [BENCHMARKS-OLAP.md](BENCHMARKS-OLAP.md). Two findings there are mpedb's
+own rather than "row store versus column store" — `count(*)` counts the widest
+tree instead of the narrowest (17× behind SQLite), and MPEE's worst-case cost
+model cannot see a star schema's dimension filter (7.6–12× behind SQLite). The
+extremum goes the other way: `min/max` over an index is 252× faster than DuckDB
+and 7,675× faster than SQLite.
+
 Turso (the Rust SQLite rewrite) joined the field 2026-07-17; its adapter's
 honesty decisions and a compatibility-parity comparison live in
 [design/TURSO.md](design/TURSO.md).

@@ -1,0 +1,23 @@
+[package]
+name = "mpedb-olapbench"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+# Its OWN workspace, like mpedb-capi and for the same class of reason: this
+# crate links a bundled DuckDB (a large C++ amalgamation) and a bundled SQLite.
+# As a workspace member it would put a multi-minute C++ compile in front of
+# every `cargo test --workspace` and every CI run, to build a benchmark nobody
+# is running at the time.
+[workspace]
+
+[dependencies]
+mpedb = { path = "../mpedb" }
+mpedb-types = { path = "../mpedb-types" }
+duckdb = { version = "1", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+[profile.release]
+opt-level = 3
+debug = false

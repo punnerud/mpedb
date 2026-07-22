@@ -4,6 +4,8 @@ Cargo.lock
 __pycache__/
 .venv/
 .claude/
-# mpedb-capi is its own workspace (parent `exclude`s it), so it gets its own
-# target dir rather than sharing the root one.
+# Crates the parent workspace `exclude`s get their own target dir rather than
+# sharing the root one. `/target` only anchors at the repo root, so each needs
+# its own line — a missed one gets a build tree staged by `git add -A`.
 crates/mpedb-capi/target/
+crates/mpedb-olapbench/target/
