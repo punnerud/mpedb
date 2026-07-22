@@ -1,0 +1,65 @@
+# Linux — the primary gate. Runs on every push to main and every PR: this is the
+# platform that catches ~all regressions, and it is the cheap one.
+#
+# The full engine, including the multi-process stress/crash tests (they need only
+# a shared-memory scratch dir, which the runner provides). PostgreSQL-dependent
+# mirror tests, soaks and benchmarks are #[ignore]d and deliberately not run.
+#
+# Exit codes are checked by construction — this repo has committed with clippy red
+# because a local pipeline swallowed one.
+name: Linux
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  # A superseded PR run is wasted runner time. A push to main is NOT cancelled:
+  # when CI goes red we want to know WHICH commit did it.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      # Print the toolchain LOUDLY: CI tracks stable, dev boxes lag, and a clippy
+      # lint that exists in one and not the other reads as "CI is flaky" when it
+      # is really "your box is a release behind" (byte_char_slices, new in 1.97,
+      # against a 1.96 dev box).
+      - name: toolchain
+        run: rustc --version && cargo --version && cargo clippy --version && sqlite3 --version
+      # mold is a build ACCELERATOR, opted into here rather than committed in
+      # `.cargo/config.toml`: a committed `-fuse-ld=mold` is a hard dependency, and
+      # it broke this workflow — the runners have no mold, so every link died with
+      # `collect2: fatal error: cannot find 'ld'` before a test ran.
+      - name: mold (link accelerator, optional)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq mold || true
+          if command -v mold >/dev/null; then
+            echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+            echo "mold enabled: $(mold --version)"
+          else
+            echo "mold unavailable — building with the default linker"
+          fi
+      - name: test
+        run: cargo test --workspace
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      # mpedb-capi is its OWN workspace: it exports sqlite3_* and cannot co-link the
+      # bundled sqlite the parent's feature unification pulls in (rust-lld refuses
+      # the duplicate symbols outright). Built by manifest path, where mpedb
+      # compiles without the sqlite feature at all.
+      - name: capi (its own workspace)
+        run: |
+          cargo test --manifest-path crates/mpedb-capi/Cargo.toml
+          cargo clippy --manifest-path crates/mpedb-capi/Cargo.toml --all-targets -- -D warnings

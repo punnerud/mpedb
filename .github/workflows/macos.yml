@@ -1,0 +1,41 @@
+# macOS — nightly and on demand, not per merge.
+#
+# NOT redundant with Linux: the writer lock is a different construction here
+# (FLD-2 — a sidecar flock plus a process-private errorcheck mutex plus a shared
+# DIRTY word, because macOS has no robust mutex), `sync_barrier` means something
+# else, and `msync` costs range width instead of being a device flush. Three
+# platform asymmetries have already been found by measuring both.
+#
+# Nightly rather than per-merge because those properties do not appear and
+# disappear between two merges an hour apart — and this repo lands many merges a
+# day. `workflow_dispatch` is how you check a platform fix without waiting.
+name: macOS
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: toolchain
+        run: rustc --version && cargo --version && cargo clippy --version && sqlite3 --version
+      # mpedb-py is excluded here only: its PyO3 cdylib needs
+      # `-undefined dynamic_lookup` at link time, build-config debt unrelated to
+      # the engine (TODO.md's macOS test-path items). Linux builds it, so the
+      # crate stays covered.
+      - name: test
+        run: cargo test --workspace --exclude mpedb-py
+      - name: clippy
+        run: cargo clippy --workspace --exclude mpedb-py --all-targets -- -D warnings
+      - name: capi (its own workspace)
+        run: |
+          cargo test --manifest-path crates/mpedb-capi/Cargo.toml
+          cargo clippy --manifest-path crates/mpedb-capi/Cargo.toml --all-targets -- -D warnings

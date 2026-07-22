@@ -1,6 +1,16 @@
 # MPEdb
 
+[![Linux](https://github.com/punnerud/mpedb/actions/workflows/linux.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/linux.yml)
+[![macOS](https://github.com/punnerud/mpedb/actions/workflows/macos.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/macos.yml)
+[![Windows](https://github.com/punnerud/mpedb/actions/workflows/windows.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/windows.yml)
+
 **An embedded, multi-process, shared-memory database in Rust.**
+
+Linux and macOS run the whole engine and its multi-process crash tests; Windows
+runs the portable crates — the type system and the SQL front end — because the
+engine is Unix-only by construction (mmap, flock, robust `PROCESS_SHARED`
+mutexes, `/proc` reader identity). macOS and Windows run nightly, Linux on every
+change.
 
 MPEdb combines three things that normally don't come together:
 
