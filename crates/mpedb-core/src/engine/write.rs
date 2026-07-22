@@ -1387,9 +1387,17 @@ impl<'e> WriteTxn<'e> {
         let bundle = Arc::clone(&self.bundle);
         let new_schema = bundle.schema.with_added_column(table_id, col.clone())?;
         let old_types = bundle.col_types[table_id as usize].clone();
-        // New column list = old ++ [new type]; the added column is trailing.
+        // Where the new column lands. Normally trailing — but an implicit-rowid
+        // table (#94) keeps its synthetic `rowid` LAST (`Schema::validate`
+        // enforces it), so `with_added_column` inserts before it and so must the
+        // row rewrite. Inserting at the wrong index would re-encode every row
+        // with the new column where the rowid belongs.
+        let implicit_rowid = new_schema
+            .table(table_id)
+            .is_some_and(|t| t.implicit_rowid);
+        let at = if implicit_rowid { old_types.len() - 1 } else { old_types.len() };
         let mut new_types = old_types.clone();
-        new_types.push(col.ty);
+        new_types.insert(at, col.ty);
 
         // Pass 1: read every row (decode with OLD types) and re-encode it with
         // the new column set to `fill`. Collect fully before mutating so the
@@ -1420,7 +1428,7 @@ impl<'e> WriteTxn<'e> {
             let mut c = btree::cursor(self, root, None, None)?;
             while let Some((k, v)) = c.next(self)? {
                 let mut vals = row::decode_row(&v, &old_types)?;
-                vals.push(fill.clone());
+                vals.insert(at, fill.clone());
                 if let Some(t) = &gen_def {
                     t.apply_generated(&mut vals, &[])?;
                 }

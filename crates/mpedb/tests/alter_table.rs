@@ -329,3 +329,36 @@ fn rename_persists_and_second_process_sees_it() {
     }
     let _ = std::fs::remove_file(&path);
 }
+
+/// `ADD COLUMN` on an IMPLICIT-ROWID table — the shape the C-API shim creates by
+/// default (`CREATE TABLE` with no declared primary key, #94).
+///
+/// The synthetic `rowid` column must stay LAST and sole PK (`Schema::validate`
+/// enforces it), so the new column is inserted BEFORE it, in both the schema and
+/// the row rewrite. Appending past the rowid produced a schema that failed its
+/// own validator — "table has implicit_rowid set but its last column is not a
+/// NOT-NULL Int64 `rowid` sole primary key" — which made migrations impossible
+/// on exactly the tables the shim produces. Found by measurement, not by a test.
+#[test]
+fn add_column_on_an_implicit_rowid_table_keeps_the_rowid_last() {
+    let (cfg, path) = config("implicit-rowid-add");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query("CREATE TABLE alpha (a int64, b text)", &[]).unwrap();
+    db.query("INSERT INTO alpha (a, b) VALUES (1, 'x')", &[]).unwrap();
+    // The failing step: this used to fail the schema validator outright.
+    db.query("ALTER TABLE alpha ADD COLUMN c int64", &[]).unwrap();
+    db.query("INSERT INTO alpha (a, b, c) VALUES (2, 'y', 7)", &[]).unwrap();
+    // The pre-existing row reads back with its old values intact and NULL for
+    // the new column — not the rowid shifted into `c`'s slot.
+    let got = rows(db.query("SELECT a, b, c FROM alpha ORDER BY a", &[]).unwrap());
+    assert_eq!(
+        got,
+        vec![
+            vec![Value::Int(1), Value::Text("x".into()), Value::Null],
+            vec![Value::Int(2), Value::Text("y".into()), Value::Int(7)],
+        ],
+        "old row keeps its values, new column is NULL, rowid never leaks into c"
+    );
+    drop(db);
+    let _ = std::fs::remove_file(&path);
+}
