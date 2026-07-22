@@ -56,14 +56,17 @@ async function boot() {
   $("reset").addEventListener("click", () => {
     if (openDemo()) setStatus("Database reset — 500 rows, freshly created.");
   });
-  // The example catalogue is a sidebar on wide screens and sits BELOW the
-  // editor on narrow ones, so "where are the examples" has two different
-  // answers. This button gives one: open every group and scroll the list into
-  // view, wherever it happens to be.
-  $("toexamples").addEventListener("click", () => {
-    const host = $("examples");
-    for (const d of host.querySelectorAll("details.exgroup")) d.setAttribute("open", "");
-    host.scrollIntoView({ behavior: "smooth", block: "start" });
+  // The catalogue is a sidebar on wide screens and sits below the editor on
+  // narrow ones, where scrolling to it means losing the editor off the top.
+  // The button opens the same list as a small modal that scrolls inside itself
+  // instead: never taller than 70% of the viewport, and Escape, the backdrop
+  // or the ✕ all close it.
+  $("toexamples").addEventListener("click", () => $("exdlg").showModal());
+  $("exdlgx").addEventListener("click", () => $("exdlg").close());
+  // A <dialog> backdrop is not a child, so a click that lands on the element
+  // itself (rather than on its content) came from outside the box.
+  $("exdlg").addEventListener("click", (e) => {
+    if (e.target === $("exdlg")) $("exdlg").close();
   });
   $("sql").addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); runCurrent(); }
@@ -316,37 +319,46 @@ function planHtml(res) {
 // ---------------------------------------------------------------------------
 
 function buildExamples() {
-  const host = $("examples");
-  // Each group is a <details>: the first is open so the page lands on something
-  // runnable, the rest are collapsed so the whole list is scannable at a glance
-  // rather than a column the visitor has to scroll past.
-  host.innerHTML = EXAMPLES.map(
-    (g, gi) =>
-      `<details class="exgroup"${gi === 0 ? " open" : ""}>` +
-      `<summary>${esc(g.name)}<span class="count">${g.items.length}</span></summary>` +
-      g.items
-        .map(
-          (it, i) =>
-            `<button class="ex${it.refuses ? " refusal" : ""}" type="button" ` +
-            `data-g="${gi}" data-i="${i}">${esc(it.label)}` +
-            `<span class="why">${esc(it.why)}</span></button>`
-        )
-        .join("") +
-      `</details>`
-  ).join("");
+  // Two hosts show the same catalogue: the sidebar, and the modal the Examples
+  // button opens. They are rendered from one source and wired by delegation, so
+  // there is no second copy of the click logic to drift.
+  for (const host of [$("examples"), $("exdlgbody")]) {
+    // Each group is a <details>: the first is open so the page lands on
+    // something runnable, the rest collapsed so the whole list is scannable at
+    // a glance rather than a column the visitor has to scroll past.
+    host.innerHTML = EXAMPLES.map(
+      (g, gi) =>
+        `<details class="exgroup"${gi === 0 ? " open" : ""}>` +
+        `<summary>${esc(g.name)}<span class="count">${g.items.length}</span></summary>` +
+        g.items
+          .map(
+            (it, i) =>
+              `<button class="ex${it.refuses ? " refusal" : ""}" type="button" ` +
+              `data-g="${gi}" data-i="${i}">${esc(it.label)}` +
+              `<span class="why">${esc(it.why)}</span></button>`
+          )
+          .join("") +
+        `</details>`
+    ).join("");
 
-  for (const b of host.querySelectorAll("button.ex")) {
-    b.addEventListener("click", () => {
-      const it = EXAMPLES[Number(b.dataset.g)].items[Number(b.dataset.i)];
+    host.addEventListener("click", (e) => {
+      const b = e.target.closest("button.ex");
+      if (!b) return;
+      const gi = Number(b.dataset.g), i = Number(b.dataset.i);
+      const it = EXAMPLES[gi].items[i];
       b.closest("details.exgroup")?.setAttribute("open", "");
       $("sql").value = it.sql;
-      for (const o of host.querySelectorAll("button.ex")) o.removeAttribute("aria-current");
-      b.setAttribute("aria-current", "true");
+      // The selection is marked in both hosts, so opening the modal after
+      // clicking in the sidebar (or the reverse) shows where you are.
+      for (const o of document.querySelectorAll("button.ex")) o.removeAttribute("aria-current");
+      for (const o of document.querySelectorAll(`button.ex[data-g="${gi}"][data-i="${i}"]`)) {
+        o.setAttribute("aria-current", "true");
+      }
       activeTab = "rows";
       runCurrent();
-      // On narrow screens the editor sits ABOVE the list (see the <=900px
-      // media query), so a click down in the catalogue needs to bring the
-      // editor and its results back into view.
+      // Running is the point of picking an example, so get out of the way and
+      // put the editor and its results back on screen.
+      if ($("exdlg").open) $("exdlg").close();
       if (window.matchMedia("(max-width: 900px)").matches) {
         $("sql").scrollIntoView({ behavior: "smooth", block: "start" });
       }
