@@ -14,7 +14,12 @@ use mpedb_types::{Durability, Error, FilePerms, Result, PAGE_SIZE};
 use std::cell::UnsafeCell;
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
-use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::io::{AsRawFd, RawFd};
+// `FromRawFd` is used only by the Linux `memfd_create` arm of
+// `memory_backing_file` — importing it unconditionally is an unused import
+// everywhere else, which `-D warnings` rejects (found by the first macOS CI run).
+#[cfg(target_os = "linux")]
+use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 
