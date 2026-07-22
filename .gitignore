@@ -4,3 +4,6 @@ Cargo.lock
 __pycache__/
 .venv/
 .claude/
+# mpedb-capi is its own workspace (parent `exclude`s it), so it gets its own
+# target dir rather than sharing the root one.
+crates/mpedb-capi/target/
