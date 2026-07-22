@@ -34,23 +34,26 @@
     and there is no server.</p>
   </section>
 
-  <section class="cannot">
-    <h2>What this page cannot show you</h2>
-    <p>The engine here is real, but the browser build is the process-private
-    <code>:memory:</code> path — so <strong>multi-process writers</strong>, mpedb's
-    headline property, are not on display. Two tabs are two WebAssembly instances
-    with separate byte arrays. Not impossible, just not built:
-    <code>SharedArrayBuffer</code> and <code>Atomics</code> give real futex and CAS
-    primitives; what is missing is owner-death detection, and inventing a third
-    lock construction for a demo is not something we would do quietly
+  <details class="cannot">
+    <summary>Real engine, but no multi-process writers here — why <span class="chev">▸</span></summary>
+    <div class="cannot-body">
+    <p>The browser build is the process-private <code>:memory:</code> path, so
+    mpedb's headline property — several OS processes writing one file, any of
+    them killable mid-commit — is not on display. Two tabs are two WebAssembly
+    instances with separate byte arrays.</p>
+    <p><b>Not impossible, just not built.</b> <code>SharedArrayBuffer</code> and
+    <code>Atomics</code> give real futex and CAS primitives; what is missing is
+    owner-death detection, and inventing a third lock construction for a demo is
+    not something we would do quietly
     (<a href="https://github.com/punnerud/mpedb/blob/main/design/DESIGN-WASM-MULTIWRITER.md">sketch</a>).</p>
-    <p>Absent for the same reason: durability classes, crash recovery, real files,
-    and the C-API shim. Those numbers live in
+    <p>Absent for the same reason: durability classes, crash recovery, real
+    files, and the C-API shim — those numbers live in
     <a href="https://github.com/punnerud/mpedb/blob/main/minisqlite-vs-mpedb.md">the
-    engine comparison</a>. Everything you <em>can</em> click here is genuine — the SQL
-    semantics, the plans and their hashes, the footprints, the MPEE join
+    engine comparison</a>. Everything you <em>can</em> click here is genuine: the
+    SQL semantics, the plans and their hashes, the footprints, the MPEE join
     reordering, and every refusal.</p>
-  </section>
+    </div>
+  </details>
 
   <div class="grid">
 
