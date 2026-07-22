@@ -499,7 +499,9 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
                     c.db.schema()
                 }
             };
-            let (columns, rows) = introspect::pragma(&bundle, sqltext, &mut c.busy_timeout_ms)?;
+            let idx = sqlite_index_records(c);
+            let (columns, rows) =
+                introspect::pragma(&bundle, sqltext, &mut c.busy_timeout_ms, &idx)?;
             // `PRAGMA busy_timeout = N` may have moved the knob — mirror it
             // into the engine's writer-lock deadline (#109), same as
             // `sqlite3_busy_timeout`. Unconditional: an atomic store, cheap.
@@ -523,6 +525,7 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
                 }
             };
             let verbatim = sqlite_master_records(c, &bundle);
+            let idx = sqlite_index_records(c);
             // Prefer txn-visible catalog (uncommitted CREATE VIEW/TRIGGER).
             let (views, triggers) = match c.txn.as_mut() {
                 Some(s) => (
@@ -534,8 +537,9 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
                     c.db.list_triggers().unwrap_or_default(),
                 ),
             };
-            let (columns, rows) =
-                introspect::sqlite_master(&bundle, sqltext, &verbatim, &views, &triggers)?;
+            let (columns, rows) = introspect::sqlite_master(
+                &bundle, sqltext, params, &verbatim, &idx, &views, &triggers,
+            )?;
             Ok(Outcome::Rows { columns, rows })
         }
         Kind::Begin => {
@@ -580,14 +584,26 @@ fn exec_one_inner(c: &mut Sqlite3, sqltext: &str, params: &[Value]) -> Result<Ou
             // object's name once it succeeds (`sqlite_master.sql`). Resolved
             // BEFORE execution because a DROP's target is gone afterwards.
             let ddl_target = introspect::schema_ddl_target(sqltext);
+            // For a `CREATE INDEX`, how many indexes the target table had
+            // BEFORE the statement ran — the only way to tell afterwards which
+            // `IndexDef` it appended, since mpedb's schema does not name them.
+            let idx_before = ddl_target.as_ref().and_then(|d| match d {
+                introspect::DdlTarget {
+                    kind: introspect::DdlKind::Index { .. },
+                    create: true,
+                    on_table: Some(t),
+                    ..
+                } => table_index_count(c, t),
+                _ => None,
+            });
             let res = if let Some(s) = c.txn.as_mut() {
                 s.query(sqltext, params)
             } else {
                 c.db.query(sqltext, params)
             };
             if res.is_ok() {
-                if let Some((kind, create, name, at)) = ddl_target {
-                    record_object_ddl(c, sqltext, kind, create, &name, at);
+                if let Some(t) = &ddl_target {
+                    record_object_ddl(c, sqltext, t, idx_before);
                 }
             }
             // Drain the rowid the engine recorded for this statement (facade
@@ -637,6 +653,32 @@ fn sqlite_master_records(c: &mut Sqlite3, _schema: &mpedb::Schema) -> HashMap<St
         .collect()
 }
 
+/// The shim's `CREATE INDEX` records, folded into the shape-keyed map
+/// `introspect` resolves an `IndexDef`'s name through (`introspect::IDX_NS`).
+///
+/// Same one-scan discipline as [`sqlite_master_records`], and the same
+/// transaction rule: through the OPEN session when there is one, so an index
+/// created in an uncommitted transaction can still be named.
+fn sqlite_index_records(c: &mut Sqlite3) -> introspect::IndexRecords {
+    let ns = introspect::IDX_NS;
+    let all = match c.txn.as_mut() {
+        Some(s) => s.sys_record_scan_range(ns, &[], &[0xff]).unwrap_or_default(),
+        None => c.db.sys_record_scan(ns).unwrap_or_default(),
+    };
+    introspect::index_records(all)
+}
+
+/// How many secondary indexes `table` has right now — the "before" half of the
+/// `CREATE INDEX` fingerprint capture (see [`record_object_ddl`]).
+fn table_index_count(c: &Sqlite3, table: &str) -> Option<usize> {
+    let schema = match c.txn.as_ref() {
+        Some(s) => s.schema(),
+        None => c.db.schema(),
+    };
+    let exact = introspect::exact_table_name(&schema, table)?;
+    introspect::table_by_exact_name(&schema, &exact).map(|t| t.indexes.len())
+}
+
 /// File (or forget) a catalog object's own `CREATE …` text after the statement
 /// succeeded, so `sqlite_master.sql` can hand back what the caller wrote.
 ///
@@ -652,16 +694,56 @@ fn sqlite_master_records(c: &mut Sqlite3, _schema: &mpedb::Schema) -> HashMap<St
 fn record_object_ddl(
     c: &mut Sqlite3,
     sqltext: &str,
-    kind: introspect::DdlKind,
-    create: bool,
-    name: &str,
-    name_at: usize,
+    target: &introspect::DdlTarget,
+    idx_before: Option<usize>,
 ) {
     if c.readonly {
         return;
     }
+    // The `CREATE TABLE` fingerprint is computed with the index records in
+    // hand, exactly as `sqlite_master` recomputes it — a fingerprint taken
+    // under a different rule would never match itself again.
+    let idx = sqlite_index_records(c);
+    let (kind, create, name) = (target.kind, target.create, target.name.as_str());
+    // `CREATE INDEX` files in its OWN namespace, keyed by the index name, with
+    // the shape of the `IndexDef` the statement just appended as the
+    // fingerprint. Which `IndexDef` that is comes from the count taken BEFORE
+    // execution: mpedb appends exactly one, and treats a duplicate shape as a
+    // no-op (in which case nothing was appended and there is nothing to record).
+    if let introspect::DdlKind::Index { .. } = kind {
+        if !create {
+            forget_index_record(c, name);
+            return;
+        }
+        let verbatim = introspect::ddl_verbatim(sqltext, target.name_at, kind);
+        let (Some(table), Some(before), false) =
+            (target.on_table.as_deref(), idx_before, verbatim.is_empty())
+        else {
+            return;
+        };
+        let schema = match c.txn.as_ref() {
+            Some(s) => s.schema(),
+            None => c.db.schema(),
+        };
+        let Some(fp) = introspect::exact_table_name(&schema, table)
+            .and_then(|e| introspect::table_by_exact_name(&schema, &e).map(|t| (t, e)))
+            .and_then(|(t, _)| {
+                (t.indexes.len() == before + 1)
+                    .then(|| introspect::index_fingerprint_of(t, before))
+            })
+            .flatten()
+        else {
+            return;
+        };
+        let rec = introspect::index_record(&fp, &verbatim);
+        let _ = match c.txn.as_mut() {
+            Some(s) => s.sys_record_put(introspect::IDX_NS, name.as_bytes(), &rec),
+            None => c.db.sys_record_put(introspect::IDX_NS, name.as_bytes(), &rec),
+        };
+        return;
+    }
     let value = if create {
-        let verbatim = introspect::ddl_verbatim(sqltext, name_at, kind);
+        let verbatim = introspect::ddl_verbatim(sqltext, target.name_at, kind);
         if verbatim.is_empty() {
             return;
         }
@@ -681,9 +763,9 @@ fn record_object_ddl(
                 let Some(t) = introspect::table_by_exact_name(&schema, &exact) else {
                     return;
                 };
-                Some((exact, introspect::ddl_record(t, &verbatim)))
+                Some((exact, introspect::ddl_record(t, &idx, &verbatim)))
             }
-            introspect::DdlKind::View | introspect::DdlKind::Trigger => {
+            _ => {
                 // Name as written (unquoted). Catalog resolution is case-
                 // insensitive on the way in; sqlite_master reports the stored
                 // name from list_views/list_triggers, so also store under the
@@ -713,7 +795,43 @@ fn record_object_ddl(
                 Some(s) => s.sys_record_delete(ns, &key).map(|_| ()),
                 None => c.db.sys_record_put(ns, &key, &[]),
             };
+            // A DROPPED TABLE takes its index names with it. Without this, a
+            // re-CREATEd table of the same name and shape would inherit the old
+            // table's index records — a name (and a `CREATE INDEX` text) for an
+            // index nobody created, which is exactly the "almost right metadata"
+            // failure the fingerprint exists to prevent.
+            if kind == introspect::DdlKind::Table {
+                forget_table_index_records(c, &exact);
+            }
         }
+    }
+}
+
+/// Tombstone one index record by name.
+fn forget_index_record(c: &mut Sqlite3, name: &str) {
+    let _ = match c.txn.as_mut() {
+        Some(s) => s.sys_record_delete(introspect::IDX_NS, name.as_bytes()).map(|_| ()),
+        None => c.db.sys_record_put(introspect::IDX_NS, name.as_bytes(), &[]),
+    };
+}
+
+/// Tombstone every index record whose fingerprint names `table`.
+fn forget_table_index_records(c: &mut Sqlite3, table: &str) {
+    let ns = introspect::IDX_NS;
+    let all = match c.txn.as_mut() {
+        Some(s) => s.sys_record_scan_range(ns, &[], &[0xff]).unwrap_or_default(),
+        None => c.db.sys_record_scan(ns).unwrap_or_default(),
+    };
+    for (k, v) in all {
+        let owns = introspect::index_record_fingerprint(&v)
+            .is_some_and(|fp| introspect::fingerprint_table(fp) == table);
+        if !owns {
+            continue;
+        }
+        let _ = match c.txn.as_mut() {
+            Some(s) => s.sys_record_delete(ns, &k).map(|_| ()),
+            None => c.db.sys_record_put(ns, &k, &[]),
+        };
     }
 }
 
@@ -751,6 +869,10 @@ fn resolve_object_name(
                 .find(|(n, _, _)| n.eq_ignore_ascii_case(name))
                 .map(|(n, _, _)| n)
         }
+        // An index has no catalog entry to fold a name against: mpedb's
+        // `IndexDef` carries no name at all, so the record's key IS the name
+        // the caller wrote. Handled entirely in `record_object_ddl`.
+        introspect::DdlKind::Index { .. } => None,
     }
 }
 
