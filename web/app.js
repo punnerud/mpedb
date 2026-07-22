@@ -308,9 +308,13 @@ function planHtml(res) {
 
 function buildExamples() {
   const host = $("examples");
+  // Each group is a <details>: the first is open so the page lands on something
+  // runnable, the rest are collapsed so the whole list is scannable at a glance
+  // rather than a column the visitor has to scroll past.
   host.innerHTML = EXAMPLES.map(
     (g, gi) =>
-      `<div class="exgroup"><h3>${esc(g.name)}</h3>` +
+      `<details class="exgroup"${gi === 0 ? " open" : ""}>` +
+      `<summary>${esc(g.name)}<span class="count">${g.items.length}</span></summary>` +
       g.items
         .map(
           (it, i) =>
@@ -319,12 +323,13 @@ function buildExamples() {
             `<span class="why">${esc(it.why)}</span></button>`
         )
         .join("") +
-      `</div>`
+      `</details>`
   ).join("");
 
   for (const b of host.querySelectorAll("button.ex")) {
     b.addEventListener("click", () => {
       const it = EXAMPLES[Number(b.dataset.g)].items[Number(b.dataset.i)];
+      b.closest("details.exgroup")?.setAttribute("open", "");
       $("sql").value = it.sql;
       for (const o of host.querySelectorAll("button.ex")) o.removeAttribute("aria-current");
       b.setAttribute("aria-current", "true");
