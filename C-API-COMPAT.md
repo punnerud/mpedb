@@ -3473,3 +3473,62 @@ without a PK becomes, `#94`) then `ALTER TABLE alpha ADD COLUMN c TEXT` →
 ``schema error: table `alpha` has implicit_rowid set but its last column is not
 a NOT-NULL Int64 `rowid` sole primary key``. Blast radius: migrations are
 impossible on exactly the tables the shim creates by default.
+---
+
+## Residual audit — four `TODO.md` §1 rows re-checked against the tree (2026-07-22)
+
+This section corrects the sheet, it does not re-measure it. Every residual table
+above is dated to the run that produced it, and four of the rows those runs
+attributed to the planner/binder were **fixed afterwards without a re-measure**.
+Checked at `858dbb5` by running the shapes, not by reading the tables.
+
+| sheet row (error string) | attributed test | actual status at `858dbb5` |
+|---|---|---|
+| `INSERT values must be literals or parameters` | `test_bulk_insert` | **CLOSED in `21cd819`** — `InsertSource::Expr`, PLAN_FORMAT 57, `build_insert_row_impl` included. Only a HOST UDF in a multi-row cell still refuses, by name |
+| `unknown column a in table ...` (`select 1 as a where a=?`) | `test_hooks.test_trace_too_much_expanded_sql` (E14) | **CLOSED in `9e4878b`** — `rewrite_where_select_aliases` |
+| `a correlated subquery in an aggregate query is only supported where it is evaluated PER ROW` | `test_aggregation_subquery_annotation` | **CLOSED in `37622a6`** — the string no longer exists in the tree |
+| `a CORRELATED subquery in HAVING is not supported yet` | `test_annotation_filter_with_subquery` | **CLOSED in `37622a6`** — same |
+
+### The oracle evidence, per row
+
+Bundled sqlite 3.45 (`crates/mpedb/tests/sqlite_oracle`), value **and**
+`typeof()`, mpedb rendered the way the oracle renders sqlite:
+
+```
+-- multi-row VALUES carrying expressions, with RETURNING
+INSERT INTO t(id,n,s) VALUES (1, 1+1, lower('AB')), (2, abs(-3), substr('hello',2,3));
+SELECT id, n, typeof(n), s, typeof(s) FROM t ORDER BY id;
+   both: 1|2|integer|ab|text   2|3|integer|ell|text
+
+-- output alias in WHERE (the rule, not just the CPython statement)
+SELECT 1 AS a WHERE a = ?                     both: 1
+SELECT y AS x FROM t WHERE x = 10             both: (empty)   <- the COLUMN wins
+SELECT y AS x FROM t WHERE x = 1              both: 10
+SELECT 5 AS z, 6 AS z FROM t WHERE z = 6      both: (empty)   <- first alias wins
+SELECT y AS z FROM t WHERE Z = 10             both: 10        <- case-insensitive
+SELECT y AS z FROM t AS q WHERE q.z = 10      both: error     <- unqualified only
+SELECT count(*) AS c FROM t WHERE c > 0       both: error     <- aggregate alias
+
+-- correlated subquery in a grouped SELECT list, and in HAVING
+SELECT p.id, (SELECT b2.pubdate FROM book b2 WHERE b2.pub_id = p.id
+              ORDER BY b2.pubdate DESC LIMIT 1) AS latest,
+       COUNT(b.id) AS c, typeof(COUNT(b.id))
+  FROM pub p LEFT JOIN book b ON p.id = b.pub_id GROUP BY p.id ORDER BY p.id;
+   both: 1|2021-01-01|2|integer  2|2022-02-02|2|integer  3|2018-03-03|1|integer
+
+SELECT p.name, COUNT(b.id) AS total FROM pub p LEFT JOIN book b ON p.id = b.pub_id
+ GROUP BY p.id, p.name
+HAVING COUNT(b.id) = (SELECT COUNT(b2.id) FROM book b2
+                       WHERE b2.pages > 400 AND b2.pub_id = p.id);
+   both: B|2
+```
+
+### What this does and does not license
+
+It does **not** license moving the Django/CPython headline numbers: those come
+from running the suites, and no suite was run here. It licenses striking the
+four rows from the *gap list*, which is what `TODO.md` §1 now does. The next
+full interposition run is what turns them into score.
+
+**The lesson for this sheet:** a residual table is a photograph. When a row
+quotes an error string, `grep` the tree for that string before believing it.

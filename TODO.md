@@ -35,16 +35,36 @@ not subtract).
       `SelectPlan.derived` per `DESIGN-DERIVED-TABLES` §5.7. The cheap
       alternative was checked and does not work (subplan slots fill before
       `exec_derived` runs).
-- [ ] **`InsertSource::Expr`** — multi-row `VALUES` carrying an expression
-      (`test_bulk_insert`). Plan-format + ~10 lines in `build_insert_row_impl`.
-- [ ] **Correlated subquery in an aggregate query / in HAVING** — the oldest
-      surviving family; per-group positions landed (`37622a6`), these did not.
-- [ ] **Partial-index access** — `IndexDef.predicate` is stored (P1, canonical
-      bytes v10); the planner does not yet *pick* a partial, so `SELECT` stays
-      correct via FullScan. Needs the implication check. Also blocks
-      `UNIQUE … WHERE` and parameterized predicates.
+- [x] **`InsertSource::Expr`** — multi-row `VALUES` carrying an expression
+      (`test_bulk_insert`). **Already shipped in `21cd819`** (PLAN_FORMAT 57):
+      plan/binder/validate/explain/footprint *and* the `build_insert_row_impl`
+      arm. This list was written from a stale `C-API-COMPAT.md` row; re-verified
+      2026-07-22 against the bundled sqlite 3.45 on VALUE **and** `typeof()`.
+      The only surviving refusal is a HOST-registered UDF in a multi-row cell
+      (no connection scope there — `INSERT … SELECT` is the route), by name.
+- [x] **Correlated subquery in an aggregate query / in HAVING** — **already
+      shipped in `37622a6`**; the two error strings this row quoted are gone
+      from the tree. Re-verified 2026-07-22: a correlated scalar subquery in a
+      grouped SELECT list (with and without a LEFT JOIN) and a correlated
+      subquery in `HAVING` are byte-identical to sqlite 3.45, `typeof()`
+      included. Coverage lives in `tests/agg_correlated{,_perrow}.rs`.
+- [x] **Partial-index access** — the §5.5 implication test, v1 (rows 1–3 of the
+      entailment lattice: exact atom match plus the `IS NOT NULL` weakenings),
+      in `planner/partial.rs`. Range subsumption and parameterized predicates
+      are refused by name; `UNIQUE … WHERE` is still refused at CREATE, because
+      that one needs **engine-side membership** (`index_row_key`), which is a
+      `mpedb-core` change and not landed. Until it is, a partial index is built
+      FULL — a superset of its members, which every §5.5-approved probe reads
+      correctly, since the query's own conjuncts are either the probe's key
+      parts or its residual.
 - [ ] **DDL inside SAVEPOINT** (2 `backends` tests) — engine.
-- [ ] **Output alias referenced in WHERE** (CPython trace test) — binder.
+- [x] **Output alias referenced in WHERE** (CPython trace test) — **already
+      shipped in `9e4878b`** (`planner/select.rs::rewrite_where_select_aliases`,
+      SLT coverage in `slt/fromless.test`). Re-verified 2026-07-22 against the
+      oracle on the shapes that decide the rule: a base column always beats an
+      alias (`SELECT y AS x FROM t WHERE x = 10` filters the COLUMN), the first
+      of two same-named aliases wins, matching is case-insensitive, a qualified
+      `q.z` never resolves, and an aggregate alias raises rather than resolving.
 - [x] `sqlite_master` rows for indexes (`ce0caf7`) — views and triggers were
       already there. Same commit fixed two bugs found on the way: `sqlite_master`
       **refused every bound parameter**, so Django's `get_constraints` (which
@@ -58,6 +78,16 @@ not subtract).
       blocks Django's `backends` and `introspection` labels at `migrate`, so
       **those two labels have never run on either arm**. Unblocking them is worth
       more than it looks: it converts two unmeasured labels into measured ones.
+      **The planner half is now done** — the §5.5 implication test ships, so a
+      partial index that a query provably implies IS picked for access. What
+      still blocks `UNIQUE … WHERE` is only the ENGINE half: membership
+      evaluation in `index_row_key`, so a non-member cannot collide.
+
+> **Read this list against the tree, not against `C-API-COMPAT.md`.** Four of
+> the rows above were open in the compat sheet and closed in the code — the
+> sheet's residual tables are dated per measurement run and go stale the moment
+> a fix lands without a re-measure. When a row here quotes an error string, the
+> cheapest check is `grep` for that string first.
 
 **Will not be closed, and the ceiling should say so.** `PRAGMA foreign_keys`
 ×2 + `test_unsaved_fk` (mpedb parses `REFERENCES` and discards it),
