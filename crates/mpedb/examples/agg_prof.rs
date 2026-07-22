@@ -192,6 +192,13 @@ fn main() {
     for (name, sql) in [
         ("sql:count  SELECT count(*)", "SELECT count(*) FROM src"),
         ("sql:sum    SELECT sum(a)", "SELECT sum(a) FROM src"),
+        // `g10`/`gk` are UNINDEXED, so these are the BASE-TABLE fold — the
+        // ~140 ns/row floor the decode-to-accumulator fusion targets. `a`
+        // above rides the format-59 index tree and measures that path.
+        ("sql:sumb   SELECT sum(g10) [base]", "SELECT sum(g10) FROM src"),
+        ("sql:avgb   SELECT avg(g10) [base]", "SELECT avg(g10) FROM src"),
+        ("sql:mmb    min(gk), max(gk) [base]", "SELECT min(gk), max(gk) FROM src"),
+        ("sql:mixb   count(*), sum(g10) [base]", "SELECT count(*), sum(g10) FROM src"),
         ("sql:cnta   SELECT count(a)", "SELECT count(a) FROM src"),
         ("sql:avg    SELECT avg(a)", "SELECT avg(a) FROM src"),
         ("sql:minmax SELECT min(a), max(a)", "SELECT min(a), max(a) FROM src"),
@@ -297,6 +304,8 @@ fn main() {
         for (name, sql) in [
             ("sqlite:count", "SELECT count(*) FROM src"),
             ("sqlite:sum", "SELECT sum(a) FROM src"),
+            ("sqlite:sumb", "SELECT sum(g10) FROM src"),
+            ("sqlite:mmb", "SELECT min(gk), max(gk) FROM src"),
             ("sqlite:cnta", "SELECT count(a) FROM src"),
             ("sqlite:avg", "SELECT avg(a) FROM src"),
             ("sqlite:minmax", "SELECT min(a), max(a) FROM src"),

@@ -404,6 +404,24 @@ pub(crate) trait TxnCtx {
         let _ = (table, index_no, max);
         Err(internal("index boundary probe on an unsupported context"))
     }
+    /// Fold ONE decoded column of every row in a raw-bounded PK range into
+    /// `f`, in scan (PK) order, without materializing a row — the
+    /// decode-to-accumulator fusion of the ungrouped single-column aggregate
+    /// (`ReadTxn::fold_range_column`). `Ok(false)` when this context has no
+    /// spine-free path; the caller then runs the batched fold, which stays
+    /// the semantics of record. Only the pinned-snapshot read context answers
+    /// `true`, and its #74 charges are EXACTLY the drain-scan's.
+    fn fold_rows_column(
+        &mut self,
+        table: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+        col: u16,
+        f: &mut dyn FnMut(&Value) -> Result<()>,
+    ) -> Result<bool> {
+        let _ = (table, lo, hi, col, f);
+        Ok(false)
+    }
 }
 
 impl TxnCtx for WriteTxn<'_> {
@@ -766,6 +784,17 @@ impl TxnCtx for ReadCtx<'_, '_> {
         max: bool,
     ) -> Result<Option<Vec<Value>>> {
         self.0.index_boundary_row(table, index_no, max)
+    }
+    fn fold_rows_column(
+        &mut self,
+        table: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+        col: u16,
+        f: &mut dyn FnMut(&Value) -> Result<()>,
+    ) -> Result<bool> {
+        self.0.fold_range_column(table, lo, hi, col, f)?;
+        Ok(true)
     }
     fn scan_rows_topk(
         &mut self,

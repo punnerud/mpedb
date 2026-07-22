@@ -453,6 +453,51 @@ impl ReadTxn<'_> {
         }
     }
 
+    /// Fold ONE decoded column of every row in a raw-bounded PK range, in scan
+    /// (PK) order, without materializing a row: the column is decoded straight
+    /// off the borrowed leaf cell (overflow values assembled into a reused
+    /// scratch) and handed to `f` by reference. This is the spine-free input
+    /// of an ungrouped single-column aggregate fold — the per-row `Vec<Value>`
+    /// a `RowCursor` drain allocates was the dominant slice of that fold's
+    /// ~130 ns/row (examples/agg_prof.rs), and a `sum(a)` never needed it.
+    ///
+    /// **#74 charges: one work-row per row, charged BEFORE the decode** — the
+    /// same total, order, and label as the equivalent [`RowCursor`] drain, and
+    /// therefore the same `RuntimeBudget` trip point: this path is faster,
+    /// never cheaper. Pin revalidation every 256 rows, as every scan does.
+    pub fn fold_range_column(
+        &self,
+        table_id: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+        col: u16,
+        f: &mut dyn FnMut(&Value) -> Result<()>,
+    ) -> Result<()> {
+        let types = self
+            .bundle
+            .col_types
+            .get(table_id as usize)
+            .ok_or_else(|| Error::Internal("table id out of range".into()))?;
+        let root = self.tree_root(table_id, 0)?;
+        let mut c = btree::cursor(self, root, lo, hi)?;
+        let mut steps = 0u32;
+        let mut scratch = Vec::new();
+        loop {
+            let stepped = c.next_with(self, &mut scratch, |_k, v| {
+                self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
+                let val = row::decode_column(v, types, col as usize)?;
+                f(&val)
+            })?;
+            if stepped.is_none() {
+                return Ok(());
+            }
+            steps += 1;
+            if steps.is_multiple_of(256) && !self.still_pinned() {
+                return Err(Error::SnapshotEvicted);
+            }
+        }
+    }
+
     /// The ROW behind an index tree's boundary entry: `max = false` → the
     /// tree's first entry, `max = true` → the first entry of the MAXIMAL
     /// leading-value run — i.e. the row `min(col)` / `max(col)` name, O(log n).

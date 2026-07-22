@@ -684,6 +684,126 @@ fn try_agg_index(
     Ok(Some(accs.into_iter().map(Acc::Native).collect()))
 }
 
+/// The DECODE-TO-ACCUMULATOR fusion: `Some(accs)` — one FINISHED set of
+/// accumulators for the statement's single group — when the statement is an
+/// ungrouped fold of ONE bare base column (plus any number of `count(*)`)
+/// over a filterless streaming scan, so the observed column can be decoded
+/// straight off the borrowed leaf cell into the accumulators
+/// ([`TxnCtx::fold_rows_column`]) — no per-row `Vec<Value>` spine, no batch,
+/// no group-map probe. `None` falls through to the batched fold, which stays
+/// the semantics of record.
+///
+/// This is a pure input-plumbing change: the values folded, their order
+/// (PK scan order — `group_concat`'s output and min/max tie-breaking depend
+/// on it), the [`Accum`] rules (NULL-skip, DISTINCT dedup, format-60
+/// collation, overflow raises), and the #74 charges (one work-row per row,
+/// the drain-scan's total and trip point) are all identical to the batched
+/// fold's. `examples/agg_prof.rs` is the receipt: the batched base-table
+/// `sum` paid ~128 ns/row, one spine allocation per row of it.
+///
+/// The guards, each load-bearing:
+/// - **no residual `filter`** — its program reads arbitrary columns of a row
+///   this path never builds (and DESIGN-MULTIDB §4's policy conjuncts land
+///   there);
+/// - **no GROUP BY, no bare columns** — grouping keys and the witness read
+///   the row too;
+/// - **every aggregate is native, unfiltered, and reads the SAME bare
+///   column** — or is `count(*)`, which observes only the row's existence;
+///   a computed argument needs the interpreter and therefore the row;
+/// - **the same streaming-shape checks as [`try_count_only`]** (an
+///   incremental context, a real table, FullScan/PkRange access), plus the
+///   context capability itself (`Ok(false)` → batched fold).
+#[allow(clippy::too_many_arguments)] // the same plumbing set try_count_only carries
+fn try_fused_fold(
+    ctx: &mut dyn TxnCtx,
+    table: u32,
+    access: &AccessPath,
+    plan: &CompiledPlan,
+    params: &[Value],
+    t: &TableDef,
+    filter: Option<&ExprProgram>,
+    agg: &Aggregation,
+) -> Result<Option<Vec<Acc>>> {
+    if filter.is_some()
+        || !agg.group_by.is_empty()
+        || !agg.bare_cols.is_empty()
+        || agg.aggs.is_empty()
+        || !ctx.scans_incrementally()
+        || table == mpedb_sql::DUAL_TABLE
+        || table == mpedb_sql::CTE_TABLE
+        || t.primary_key.is_empty()
+    {
+        return Ok(None);
+    }
+    // ONE observed column across every call; `count(*)` observes none.
+    let mut col: Option<u16> = None;
+    for c in &agg.aggs {
+        if c.filter.is_some() || !c.extra_args.is_empty() || c.func.native().is_none() {
+            return Ok(None);
+        }
+        match c.arg.as_ref().map(|p| p.instrs.as_slice()) {
+            None => {} // count(*): the row itself is the input
+            Some([mpedb_types::Instr::PushCol(i)]) => match col {
+                None => col = Some(*i),
+                Some(j) if j == *i => {}
+                Some(_) => return Ok(None), // two different columns: one decode no longer feeds all
+            },
+            Some(_) => return Ok(None), // computed argument: needs the interpreter
+        }
+    }
+    let Some(col) = col else {
+        return Ok(None); // all count(*): try_count_only's leaf-wholesale territory
+    };
+    if col as usize >= t.columns.len() {
+        return Ok(None); // forged plan: the fold's own bounds refusal handles it
+    }
+    let (lo, hi) = match access {
+        AccessPath::FullScan => (None, None),
+        AccessPath::PkRange { lo, hi } => {
+            match gather::range_bounds(lo.as_ref(), hi.as_ref(), plan, params)? {
+                // A NULL bound: UNKNOWN for every row, zero rows — the
+                // never-pushed accumulators below finish to the empty-fold
+                // answers (count 0, everything else NULL), no scan, no charge,
+                // exactly the born-exhausted drain.
+                None => {
+                    let accs = agg
+                        .aggs
+                        .iter()
+                        .map(|c| new_accum(c, ctx.host_aggs()))
+                        .collect::<Result<Vec<Acc>>>()?;
+                    return Ok(Some(accs));
+                }
+                Some((l, h)) => (l, h),
+            }
+        }
+        AccessPath::PkPoint(_)
+        | AccessPath::IndexPoint { .. }
+        | AccessPath::IndexRange { .. }
+        | AccessPath::FtsScan { .. } => return Ok(None),
+    };
+    let mut accs = agg
+        .aggs
+        .iter()
+        .map(|c| new_accum(c, ctx.host_aggs()))
+        .collect::<Result<Vec<Acc>>>()?;
+    // `count(*)` (arg None) is fed the ROW (`push(None)`); everything else the
+    // decoded column value, by reference — min/max clone only on a keep.
+    let has_arg: Vec<bool> = agg.aggs.iter().map(|c| c.arg.is_some()).collect();
+    let supported = ctx.fold_rows_column(
+        table,
+        lo.as_ref().map(|(k, inc)| (k.as_slice(), *inc)),
+        hi.as_ref().map(|(k, inc)| (k.as_slice(), *inc)),
+        col,
+        &mut |v| {
+            for (a, has) in accs.iter_mut().zip(&has_arg) {
+                a.push(if *has { Some(v) } else { None })?;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(supported.then_some(accs))
+}
+
 /// `GROUP BY` / aggregates / `HAVING`.
 ///
 /// **The first line is the invariant.** DESIGN-MULTIDB §4: aggregation must
@@ -815,6 +935,23 @@ pub(super) fn exec_aggregate(
                     Acc::Native(a)
                 })
                 .collect();
+            folder.groups.insert(Vec::new(), (Vec::new(), accs, None, None));
+            true
+        } else if let Some(accs) =
+            try_fused_fold(ctx, table, access, plan, params, t, filter, agg)?
+        {
+            // Decode-to-accumulator fusion: the observed column was folded
+            // straight off the leaf cells and no base row was ever built.
+            // Inject the one group the fold would have produced — same (empty)
+            // key, same group-map cell charge — and let the shared finish code
+            // below do everything observable (HAVING, projection, ORDER BY,
+            // LIMIT).
+            folder.cells.charge(agg.aggs.len() as u64, || {
+                format!(
+                    "the group map of an aggregate over \"{}\"",
+                    super::table_name(schema, table)
+                )
+            })?;
             folder.groups.insert(Vec::new(), (Vec::new(), accs, None, None));
             true
         } else {
