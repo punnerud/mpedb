@@ -1032,7 +1032,10 @@ fn refs_correlated(b: &BExpr, sub_base: u16, correlated: &[bool]) -> bool {
                 .as_deref()
                 .is_some_and(|e| refs_correlated(e, sub_base, correlated))
         }
-        BExpr::Call(_, xs) | BExpr::Coalesce(xs) | BExpr::HostCall { args: xs, .. } => {
+        BExpr::Call(_, xs)
+        | BExpr::CallColl(_, xs, _)
+        | BExpr::Coalesce(xs)
+        | BExpr::HostCall { args: xs, .. } => {
             xs.iter().any(|x| refs_correlated(x, sub_base, correlated))
         }
     }

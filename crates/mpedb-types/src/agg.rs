@@ -97,22 +97,32 @@ pub struct Accum {
     /// proportional to the group's distinct values, so a plain `sum(x)` must
     /// not pay for it.
     seen: Option<BTreeSet<Vec<u8>>>,
-    /// The collating sequence the DISTINCT dedup folds TEXT under — the
-    /// argument column's declared one, so `count(DISTINCT name)` over a NOCASE
-    /// column counts 'abc' and 'ABC' once, as sqlite does. `Binary` (no
-    /// folding) for every other aggregate and every non-text argument.
+    /// The collating sequence of the ARGUMENT — its explicit `COLLATE`, else
+    /// the declared collation of the column it names, else `Binary`. It drives
+    /// BOTH collation-sensitive accumulations, exactly as in sqlite: the
+    /// DISTINCT dedup folds TEXT under it (`count(DISTINCT name)` over a
+    /// NOCASE column counts 'abc' and 'ABC' once), and MIN/MAX compare under
+    /// it (a NOCASE column holding 'a','B' answers `min='a'`, where BINARY
+    /// would answer 'B' — a live wrong answer until this field reached the
+    /// compare; differential-tested in `tests/agg_collate.rs`).
     coll: crate::Collation,
 }
 
 impl Accum {
     pub fn new(func: AggFn) -> Accum {
+        Accum::new_collated(func, crate::Collation::Binary)
+    }
+
+    /// An accumulator whose argument carries a collating sequence — see the
+    /// `coll` field. `new` is the `Binary` shorthand.
+    pub fn new_collated(func: AggFn, coll: crate::Collation) -> Accum {
         Accum {
             func,
             n: 0,
             acc: None,
             fsum: 0.0,
             seen: None,
-            coll: crate::Collation::Binary,
+            coll,
         }
     }
 
@@ -134,8 +144,7 @@ impl Accum {
     pub fn new_distinct_collated(func: AggFn, coll: crate::Collation) -> Accum {
         Accum {
             seen: Some(BTreeSet::new()),
-            coll,
-            ..Accum::new(func)
+            ..Accum::new_collated(func, coll)
         }
     }
 
@@ -253,9 +262,12 @@ impl Accum {
                 // keeps the incumbent rather than silently replacing it. The same
                 // rule drives the executor's bare-column witness, so the two can
                 // never disagree about which value (or row) an extremum picks.
+                // Compared under the ARGUMENT's collation (`self.coll`) — the
+                // strict-beat rule then makes a collation-equal pair keep the
+                // FIRST value seen, sqlite's tie answer.
                 let keep = match &self.acc {
                     None => true,
-                    Some(a) => self.func.min_max_prefers(a, v)?,
+                    Some(a) => self.func.min_max_prefers(a, v, self.coll)?,
                 };
                 if keep {
                     self.acc = Some(v.clone());

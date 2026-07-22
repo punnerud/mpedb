@@ -75,13 +75,19 @@ impl Acc {
 /// needs the connection's factory table, so this is where a plan naming one
 /// executed OUT of scope (the write path, the streaming/overlay read paths)
 /// surfaces a clean error instead of a wrong answer.
-fn new_accum(a: &AggCall, host: Option<&dyn HostAggs>, coll: Collation) -> Result<Acc> {
+///
+/// `a.coll` — the ARGUMENT's collating sequence, binder-computed (format 60) —
+/// reaches both collation-sensitive accumulations: the DISTINCT dedup fold and
+/// the MIN/MAX compare (`tests/agg_collate.rs`; under BINARY a NOCASE column
+/// holding 'a','B' answered `min='B'`, a live wrong answer).
+fn new_accum(a: &AggCall, host: Option<&dyn HostAggs>) -> Result<Acc> {
+    let coll = a.coll;
     let Some(name) = a.func.host() else {
         let f = a.func.native().ok_or_else(|| internal("aggregate with no target"))?;
         return Ok(Acc::Native(if a.distinct {
             Accum::new_distinct_collated(f, coll)
         } else {
-            Accum::new(f)
+            Accum::new_collated(f, coll)
         }));
     };
     let host = host.ok_or_else(|| {
@@ -98,26 +104,6 @@ fn new_accum(a: &AggCall, host: Option<&dyn HostAggs>, coll: Collation) -> Resul
         seen: a.distinct.then(std::collections::BTreeSet::new),
         coll,
     })
-}
-
-/// The collation an `f(DISTINCT x)` dedup folds TEXT under: the DECLARED
-/// collation of the column `x` names, sqlite's rung-2 rule and exactly what
-/// `SELECT DISTINCT` already applies through `output_collations`.
-///
-/// Only a BARE column reference carries one — `count(DISTINCT lower(name))`
-/// dedups an expression's result, which has no column and therefore BINARY,
-/// as in sqlite. The argument program for a bare column is the single
-/// instruction `PushCol(i)`, so that is the shape matched.
-fn arg_collation(a: &AggCall, base_colls: &[Collation]) -> Collation {
-    if !a.distinct {
-        return Collation::Binary;
-    }
-    match a.arg.as_ref().map(|p| p.instrs.as_slice()) {
-        Some([mpedb_types::Instr::PushCol(i)]) => {
-            base_colls.get(*i as usize).copied().unwrap_or(Collation::Binary)
-        }
-        _ => Collation::Binary,
-    }
 }
 
 /// The bare-column witness row a group carries (sqlite's "bare columns", see
@@ -155,7 +141,6 @@ struct Folder<'a> {
     t: &'a TableDef,
     schema: &'a Schema,
     table: u32,
-    base_colls: Vec<Collation>,
     group_collations: Vec<Collation>,
     has_bare: bool,
     /// The single min/max aggregate that governs the bare-column witness, if
@@ -258,7 +243,6 @@ impl<'a> Folder<'a> {
             schema,
             table,
             has_bare: !agg.bare_cols.is_empty(),
-            base_colls,
             group_collations,
             mm,
             fast_args: agg
@@ -350,7 +334,7 @@ impl<'a> Folder<'a> {
                     .iter()
                     // The factory table for host aggregates is consulted per
                     // GROUP (one fresh accumulator each), not per row.
-                    .map(|c| new_accum(c, ctx.host_aggs(), arg_collation(c, &self.base_colls)))
+                    .map(|c| new_accum(c, ctx.host_aggs()))
                     .collect::<Result<Vec<Acc>>>()?;
                 // One group's resident cells: its key tuple, its accumulators,
                 // and its witness row. Charged before the group exists, so an
@@ -465,7 +449,10 @@ impl<'a> Folder<'a> {
                                 }
                             }
                             Some(e) => {
-                                if !v.is_null() && mm_fn.min_max_prefers(e, &v)? {
+                                // The ARGUMENT's collation (format 60): the
+                                // witness follows the same extremum the
+                                // accumulator keeps, tie rule included.
+                                if !v.is_null() && mm_fn.min_max_prefers(e, &v, mm.coll)? {
                                     *extreme = Some(v);
                                     *bare = capture();
                                 }
@@ -928,7 +915,7 @@ pub(super) fn exec_aggregate(
         }
     }
 
-    let Folder { groups, base_colls, .. } = folder;
+    let Folder { groups, .. } = folder;
 
     // (grouped tuple, first-row param scratch for correlated HAVING/projection)
     let mut out: Vec<(Vec<Value>, Option<Vec<Value>>)> = Vec::new();
@@ -943,7 +930,7 @@ pub(super) fn exec_aggregate(
         let accs = agg
             .aggs
             .iter()
-            .map(|c| new_accum(c, ctx.host_aggs(), arg_collation(c, &base_colls)))
+            .map(|c| new_accum(c, ctx.host_aggs()))
             .collect::<Result<Vec<Acc>>>()?;
         let mut tuple: Vec<Value> =
             accs.into_iter().map(Acc::finish).collect::<Result<_>>()?;

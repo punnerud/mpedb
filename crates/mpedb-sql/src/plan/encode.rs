@@ -483,6 +483,8 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
                             }
                         }
                         buf.push(c.distinct as u8);
+                        // The argument's collating sequence (format 60).
+                        buf.push(c.coll as u8);
                         match &c.arg {
                             None => buf.push(0),
                             Some(p) => {

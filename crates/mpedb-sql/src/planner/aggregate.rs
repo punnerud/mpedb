@@ -480,10 +480,20 @@ pub(super) fn plan_aggregate_select(
     let mut minmax_const = Vec::with_capacity(agg_specs.len());
     for (f, arg, distinct, filt, extra) in &agg_specs {
         let mut const_nonnull = false;
+        // The argument's collating sequence (format 60): a TOP-LEVEL explicit
+        // `COLLATE` is peeled and wins (rung 1 — `min(x COLLATE NOCASE)`, which
+        // used to be refused here); else a bare column's declared collation
+        // (rung 2); else Binary — an expression argument (`min(x||'')`) carries
+        // none, exactly sqlite's `sqlite3ExprCollSeq` answer (probed, 3.45.0).
+        // A `COLLATE` nested DEEPER stays refused by `bind_expr` rather than
+        // silently dropped, as everywhere else.
+        let mut coll = Collation::Binary;
         let (arg_prog, ty, distinct) = match arg {
             None => (None, Some(ColumnType::Int64), false),
             Some(a) => {
-                let (b, ty) = binder.bind_expr(a)?;
+                let (inner, explicit) = peel_collate(a)?;
+                coll = explicit.unwrap_or_else(|| declared_collation(inner, &binder.scope));
+                let (b, ty) = binder.bind_expr(inner)?;
                 const_nonnull = matches!(&b, BExpr::Const(v) if !v.is_null());
                 (Some(compile_program(&b)?), ty, *distinct)
             }
@@ -518,6 +528,7 @@ pub(super) fn plan_aggregate_select(
             distinct,
             filter,
             extra_args,
+            coll,
         });
     }
 

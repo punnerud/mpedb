@@ -472,7 +472,13 @@ const MAX_JOINS: usize = 16;
 //     may fold from the index tree on that column, and `count(*)` from any
 //     all-NOT-NULL index; `agg_servable_by_index` is the closed admission
 //     rule, enforced by planner AND validate.
-const PLAN_FORMAT: u8 = 59;
+//
+// v60: `AggCall` carries the collating sequence of its argument (`coll`), and
+//     `Instr::CallColl` (opcode 61) is the scalar min()/max() call under a
+//     collation — sqlite compares min/max (aggregate AND scalar) under the
+//     argument's collation, which a BINARY-only compare answered wrongly on
+//     any NOCASE/RTRIM column (tests/agg_collate.rs).
+const PLAN_FORMAT: u8 = 60;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -1687,8 +1693,14 @@ pub fn agg_servable_by_index(
         F::Sum | F::Avg | F::Total => {
             matches!(col.ty, ColumnType::Int64 | ColumnType::Float64)
         }
+        // The ARGUMENT's collation (format 60) must be the tree's fold — the
+        // boundary probe finds the extremum by KEY order, which is the fold's
+        // comparison only when the two agree. Both stay BINARY here: a NOCASE
+        // tree still folds text the probe cannot compare for the fold.
         F::Min | F::Max => {
-            col.ty != ColumnType::Any && col.collation == mpedb_types::Collation::Binary
+            col.ty != ColumnType::Any
+                && call.coll == mpedb_types::Collation::Binary
+                && col.collation == mpedb_types::Collation::Binary
         }
         F::GroupConcat => false, // concat order = scan order; the index would reorder it
     }
@@ -1735,6 +1747,14 @@ pub struct AggCall {
     /// rules written about "the aggregate's argument" — the DISTINCT dedup key,
     /// `count(*)`'s `None`, the min/max witness — keep their single subject.
     pub extra_args: Vec<ExprProgram>,
+    /// The collating sequence of the ARGUMENT (format 60): the explicit
+    /// `COLLATE` peeled off it, else the declared collation of the bare column
+    /// it names, else `Binary` (an expression argument carries none — sqlite's
+    /// `sqlite3ExprCollSeq` rule, probed against the bundled 3.45.0). It drives
+    /// every collation-sensitive accumulation of this call: the MIN/MAX compare
+    /// (and therefore the bare-column witness the extremum row carries) and the
+    /// DISTINCT dedup fold. `Binary` for `count(*)`.
+    pub coll: Collation,
 }
 
 /// The compiled `ON CONFLICT` action.
