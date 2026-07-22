@@ -8,10 +8,35 @@
 # (they need only a shared-memory scratch dir, which the runners provide).
 name: CI
 
+# WHAT RUNS WHEN, and why it is not "everything, every merge":
+#
+#   push to main / PR  →  Linux only. The fast primary gate. Many merges land
+#                         in a day and each full matrix is three runners; the
+#                         platform that catches ~all regressions is enough per
+#                         commit.
+#   nightly 03:00 UTC  →  the full matrix: Linux + macOS + the Windows portable
+#                         core. Platform asymmetries (the FLD-2 lock, msync
+#                         semantics, range-width costs) are real but they do not
+#                         appear and disappear between two merges an hour apart.
+#   manual             →  `workflow_dispatch` runs the full matrix on demand,
+#                         which is how you check a platform fix without waiting
+#                         for the night.
+#
+# Scheduled runs only fire on the default branch, which is what we want.
 on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+# Many merges a day: a superseded PR run is wasted runner time, so cancel it.
+# A push to main is NOT cancelled — when CI goes red we want to know WHICH
+# commit did it, and cancelling intermediate runs destroys exactly that.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,8 +52,11 @@ jobs:
   test:
     strategy:
       fail-fast: false
+      # macOS only on the nightly / manual run — see the schedule note above.
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        os: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
+                && fromJSON('["ubuntu-latest", "macos-latest"]')
+                || fromJSON('["ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -94,6 +122,11 @@ jobs:
   # front end and the type system must not silently acquire a platform
   # dependency. It is a real gate on a real subset — it fails the build.
   windows-portable-core:
+    # Nightly and on demand only. It is a REAL gate when it runs (a red here
+    # fails the run), just not one paid for on every merge — and while the
+    # engine has no Windows port, this subset is the only thing that could go
+    # green there anyway.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
