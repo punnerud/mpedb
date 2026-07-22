@@ -76,7 +76,7 @@ fn schema_toml(path: &str, size_mb: usize) -> String {
          [[table.column]]\nname = \"id\"\ntype = \"int64\"\n\
          [[table.column]]\nname = \"g10\"\ntype = \"int64\"\n\
          [[table.column]]\nname = \"gk\"\ntype = \"int64\"\n\
-         [[table.column]]\nname = \"a\"\ntype = \"int64\"\n\
+         [[table.column]]\nname = \"a\"\ntype = \"int64\"\nnullable = false\nindexed = true\n\
          [[table.column]]\nname = \"t\"\ntype = \"text\"\n"
     )
 }
@@ -192,6 +192,9 @@ fn main() {
     for (name, sql) in [
         ("sql:count  SELECT count(*)", "SELECT count(*) FROM src"),
         ("sql:sum    SELECT sum(a)", "SELECT sum(a) FROM src"),
+        ("sql:cnta   SELECT count(a)", "SELECT count(a) FROM src"),
+        ("sql:avg    SELECT avg(a)", "SELECT avg(a) FROM src"),
+        ("sql:minmax SELECT min(a), max(a)", "SELECT min(a), max(a) FROM src"),
         ("sql:g10    GROUP BY g10", "SELECT g10, count(*), sum(a) FROM src GROUP BY g10"),
         ("sql:g10k   GROUP BY gk", "SELECT gk, count(*), sum(a) FROM src GROUP BY gk"),
     ] {
@@ -270,7 +273,7 @@ fn main() {
         let sq = rusqlite::Connection::open_in_memory().unwrap();
         sq.execute_batch(
             "CREATE TABLE src (id INTEGER PRIMARY KEY, g10 INTEGER, gk INTEGER, \
-             a INTEGER, t TEXT)",
+             a INTEGER NOT NULL, t TEXT); CREATE INDEX i_a ON src (a);",
         )
         .unwrap();
         {
@@ -294,6 +297,9 @@ fn main() {
         for (name, sql) in [
             ("sqlite:count", "SELECT count(*) FROM src"),
             ("sqlite:sum", "SELECT sum(a) FROM src"),
+            ("sqlite:cnta", "SELECT count(a) FROM src"),
+            ("sqlite:avg", "SELECT avg(a) FROM src"),
+            ("sqlite:minmax", "SELECT min(a), max(a) FROM src"),
             ("sqlite:g10", "SELECT g10, count(*), sum(a) FROM src GROUP BY g10"),
             ("sqlite:g10k", "SELECT gk, count(*), sum(a) FROM src GROUP BY gk"),
         ] {
@@ -302,8 +308,9 @@ fn main() {
                 let mut sqrows = st.query([]).unwrap();
                 let mut n = 0i64;
                 while let Some(r) = sqrows.next().unwrap() {
-                    let c0: i64 = r.get(0).unwrap();
-                    std::hint::black_box(c0);
+                    // Generic read: avg() answers REAL where the rest are INTEGER.
+                    let c0: rusqlite::types::Value = r.get(0).unwrap();
+                    std::hint::black_box(&c0);
                     n += 1;
                 }
                 std::hint::black_box(n);

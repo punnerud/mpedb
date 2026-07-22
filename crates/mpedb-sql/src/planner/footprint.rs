@@ -50,6 +50,12 @@ fn select_footprint(sp: &SelectPlan, schema: &Schema) -> Result<Footprint> {
     let SelectPlan { table, access, joins, .. } = sp;
     Ok({
         let (key_access, mut indexes_used) = access_key_and_indexes(access);
+        // Aggregate-over-index-tree (format 59): the fold/probe reads that
+        // index tree (and min/max re-fetch rows through the PK tree), so both
+        // bits are claimed — exactly as an IndexPoint would.
+        if let Some(ix) = sp.aggregate.as_ref().and_then(|a| a.over_index) {
+            indexes_used |= 1 | (1u64 << ix.min(63));
+        }
         // ONE ENTRY PER TABLE READ. A join that claimed only the outer would
         // under-claim `tables_read`, and `conflicts_with` is a set intersection
         // — so a writer to the inner table would not be seen to conflict with

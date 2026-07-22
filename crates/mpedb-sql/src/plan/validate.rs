@@ -665,6 +665,47 @@ impl CompiledPlan {
                             return Err(corrupt("bare column out of the base row"));
                         }
                     }
+                    // Aggregate-over-index-tree (format 59): re-prove the whole
+                    // admission against the live schema, so a forged/stale plan
+                    // fails closed instead of folding the wrong tree. Shape
+                    // first (single filterless group over one plain table),
+                    // then `agg_servable_by_index` — the same closed rule the
+                    // planner chose by.
+                    if let Some(ix_no) = a.over_index {
+                        if !joins.is_empty()
+                            || !matches!(sp.access, AccessPath::FullScan)
+                            || filter.is_some()
+                            || sp.post_filter.is_some()
+                            || !a.group_by.is_empty()
+                            || !a.bare_cols.is_empty()
+                            || a.aggs.is_empty()
+                        {
+                            return Err(corrupt(
+                                "aggregate-over-index on a shape it cannot serve",
+                            ));
+                        }
+                        if t.kind != mpedb_types::TableKind::Standard {
+                            return Err(corrupt("aggregate-over-index on a non-standard table"));
+                        }
+                        let ix = ix_no
+                            .checked_sub(1)
+                            .and_then(|k| t.indexes.get(k as usize))
+                            .ok_or_else(|| corrupt("aggregate-over-index names no index"))?;
+                        if ix_no > 63 || ix.predicate.is_some() {
+                            return Err(corrupt(
+                                "aggregate-over-index on a partial or out-of-bitmap index",
+                            ));
+                        }
+                        if !a
+                            .aggs
+                            .iter()
+                            .all(|c| super::agg_servable_by_index(t, ix, c))
+                        {
+                            return Err(corrupt(
+                                "aggregate-over-index with an aggregate the index cannot serve",
+                            ));
+                        }
+                    }
                     let out_width = a.group_by.len() + a.aggs.len() + a.bare_cols.len();
                     if out_width == 0 {
                         return Err(corrupt("aggregation with no groups and no aggregates"));
