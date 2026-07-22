@@ -567,6 +567,36 @@ The test, over the §5.2 canonical form:
    The range subsumption rows are a v2 with a differential test per row, because an off-by-one
    there is a wrong answer, not a slow query.
 
+> **SHIPPED 2026-07-22** — `crates/mpedb-sql/src/planner/partial.rs`, wired into
+> `extract_access`'s IndexPoint and IndexRange loops. Rows 1–3 exactly as written above.
+> Three deviations from this section, all in the narrowing direction:
+>
+> - **The predicate is re-parsed and re-bound, not stored canonical.** `IndexDef.predicate`
+>   is the source `String` (`c4d1a90`, canonical bytes v10), not the §5.2 atom form, so the
+>   probe parses + binds it against the table and canonicalizes then. Plan-time only, and only
+>   for a table that actually has a partial index whose columns the query covers.
+> - **Structural `Value` equality, not collated equality.** §5.5 says compare under the column's
+>   collation; v1 compares derived `PartialEq`. That can only *decline* (`'Bob'` vs `'bob'` under
+>   `NOCASE`), never over-claim, because both atoms name the same column of the same table — so
+>   identical `(column, op, value)` triples are the identical predicate whatever the collation is.
+>   Collated entailment is v2, with the `IndexId` collation identity §2.2 already provides.
+> - **`ClassCmp` / `CollateCmp` are not canonicalized at all.** They carry an affinity and a
+>   collation the atom does not record; admitting them is what would make structural equality
+>   unsound. A typeless-column or explicit-`COLLATE` predicate therefore makes its index
+>   unusable, and such a conjunct is not evidence.
+>
+> Two sites that were choosing an index with **no** partial guard were closed with the same
+> commit: `extract_join_access` (the nested-loop inner probe — it is handed only the ON
+> equalities, so the WHERE that would prove membership is out of scope; it refuses partials
+> outright, as `agg_index_choice` already did) and the MPEE solver's `known()`.
+>
+> **Still open, and it is the engine's half:** membership is not evaluated on write
+> (`engine::index_row_key` ignores `predicate`), so a partial index is currently built FULL.
+> Every §5.5-approved probe reads a full tree correctly — it is a superset of the members, and
+> the query's own conjuncts are either the probe's key parts or its residual — but the write tax
+> and the space win of §5.3/§5.4 are not there yet, and `UNIQUE … WHERE` stays refused at CREATE
+> until they are.
+
 **The parameter problem, and it is the real limit.** `WHERE status = $1` does **not** imply
 `WHERE status = 'active'` — the compiler does not know `$1`. In a Django workload most selective
 equalities are bound parameters, and only the NULL-shaped predicates arrive as literal text.
