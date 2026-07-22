@@ -140,6 +140,43 @@ fn build_joined_row(
     Ok(joined)
 }
 
+/// [`build_joined_row`] into an EXISTING buffer, reusing its allocation.
+///
+/// The inner candidate loop evaluates the ON over `[outer ‖ inner]` and, for a
+/// selective join, DISCARDS most candidates. Building a fresh `Vec` per
+/// candidate — the pre-`4471128` join path — allocated and freed one heap
+/// buffer per considered pair, the dominant cost in the `gather_joined`
+/// profile (malloc/free + drop chains). Filling a reused buffer instead pays
+/// one allocation across a run of rejected candidates; a KEPT candidate
+/// `mem::take`s the buffer (moved, never cloned — exactly the old cost), so
+/// this is strictly ≤ the old allocation count in every case: a cross join
+/// where every candidate is kept reallocates each time as before, a selective
+/// join shares one buffer across its rejects.
+#[inline]
+fn fill_joined_row(
+    buf: &mut Vec<Value>,
+    fallible: bool,
+    cap: usize,
+    outer: &[Value],
+    inner: &[Value],
+    inner_at: usize,
+) -> Result<()> {
+    buf.clear();
+    if fallible {
+        buf.try_reserve(cap).map_err(|_| join_oom())?;
+        push_clones(buf, outer)?;
+        buf.resize(inner_at, Value::Null);
+        push_clones(buf, inner)?;
+    } else {
+        buf.reserve(cap);
+        buf.extend_from_slice(outer);
+        buf.resize(inner_at, Value::Null);
+        buf.extend_from_slice(inner);
+    }
+    buf.resize(cap, Value::Null);
+    Ok(())
+}
+
 /// `extend_from_slice`, made fallible per value: only heap-carrying values take
 /// the outlined [`try_clone_value`] path, so a scalar row pays one predicted
 /// branch.
@@ -569,6 +606,11 @@ pub(super) fn gather_joined(
             None
         };
         let mut next = Vec::new();
+        // One candidate buffer reused across the whole nested loop: a rejected
+        // pair leaves it filled for the next `fill_joined_row`; a kept pair
+        // `mem::take`s it (moved into `next`, no clone) and the next fill
+        // reallocates. See `fill_joined_row`.
+        let mut cand: Vec<Value> = Vec::new();
         for a in &acc {
             let fetched;
             let candidates: &[Vec<Value>] = match &held {
@@ -591,8 +633,8 @@ pub(super) fn gather_joined(
                 // against the whole tuple `[outer ‖ inner]` and may read any
                 // slot of it. Only what SURVIVES is narrowed — the candidate
                 // itself is transient and never counted as held.
-                let joined = build_joined_row(fallible, next_width, a, i, acc_width)?;
-                if join.on.eval_filter_host(&mut stack, &joined, params, ctx.host_fns())? {
+                fill_joined_row(&mut cand, fallible, next_width, a, i, acc_width)?;
+                if join.on.eval_filter_host(&mut stack, &cand, params, ctx.host_fns())? {
                     matched = true;
                     if let Some(m) = &mut inner_matched {
                         m[ci] = true;
@@ -603,6 +645,10 @@ pub(super) fn gather_joined(
                         format!("nested-loop join with \"{}\"", table_name(schema, join_tbl))
                     })?;
                     next.try_reserve(1).map_err(|_| join_oom())?;
+                    // Kept: MOVE the buffer out (no clone); `cand` is empty for
+                    // the next fill, which reallocates — exactly the old
+                    // per-kept-row allocation.
+                    let joined = std::mem::take(&mut cand);
                     next.push(match narrow {
                         None => joined,
                         Some(m) => narrow_row(joined, m, next_trim, fallible)?,
