@@ -3,6 +3,15 @@
 [![Linux](https://github.com/punnerud/mpedb/actions/workflows/linux.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/linux.yml)
 [![macOS](https://github.com/punnerud/mpedb/actions/workflows/macos.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/macos.yml)
 [![Windows](https://github.com/punnerud/mpedb/actions/workflows/windows.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/windows.yml)
+[![Pages](https://github.com/punnerud/mpedb/actions/workflows/pages.yml/badge.svg?branch=main)](https://github.com/punnerud/mpedb/actions/workflows/pages.yml)
+
+> **[Run mpedb in your browser →](https://punnerud.github.io/mpedb/)** — the
+> **real engine** compiled to `wasm32`, not a simulation: write SQL against a
+> live in-memory database and see the plan, its content hash, the precomputed
+> footprint, and the MPEE join reordering next to your results — including the
+> refusals sqlite would have coerced. The page is explicit about the one thing
+> it cannot show you: multi-process writers (see
+> [DESIGN-WASM-MULTIWRITER.md](design/DESIGN-WASM-MULTIWRITER.md)).
 
 **An embedded, multi-process, shared-memory database in Rust.**
 

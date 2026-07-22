@@ -1,0 +1,110 @@
+# The browser playground → GitHub Pages.
+#
+# Deliberately NOT folded into linux.yml/macos.yml/windows.yml: those are
+# correctness gates that must run on every change, this is a publish step. It
+# is also path-filtered, because this repo lands many merges a day and a Pages
+# deploy per merge is wasted runner time — a commit that touches neither the
+# site, the wasm crate, nor the crates it compiles cannot change what is
+# published.
+#
+# The correctness of what this deploys is NOT checked here. `cargo test
+# --workspace` on Linux runs `crates/mpedb-wasm/tests/examples.rs`, which
+# executes every example query on the page against a native database and
+# asserts each still does what its button claims. This workflow only builds and
+# uploads.
+name: Pages
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'web/**'
+      - 'crates/mpedb-wasm/**'
+      - 'crates/mpedb/**'
+      - 'crates/mpedb-core/**'
+      - 'crates/mpedb-sql/**'
+      - 'crates/mpedb-types/**'
+      - 'crates/mpedb-sqlitefmt/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deploy at a time. A superseded build is wasted, but an IN-FLIGHT deploy
+# must finish rather than leave the site half-published.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+
+      - name: toolchain
+        run: rustc --version && cargo --version
+
+      - name: wasm32 target
+        run: rustup target add wasm32-unknown-unknown
+
+      - name: build the engine for wasm32
+        run: cargo build -p mpedb-wasm --target wasm32-unknown-unknown --release
+
+      # A size ACCELERATOR, opted into the same way linux.yml opts into mold:
+      # if binaryen is unavailable the site still ships, just larger. A
+      # committed hard dependency on a tool the runner may not have is how the
+      # engine's own workflow once broke.
+      - name: wasm-opt (size, optional)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq binaryen || true
+          SRC=target/wasm32-unknown-unknown/release/mpedb_wasm.wasm
+          if command -v wasm-opt >/dev/null; then
+            wasm-opt -O2 "$SRC" -o /tmp/mpedb.opt.wasm
+            echo "wasm-opt: $(stat -c%s "$SRC") -> $(stat -c%s /tmp/mpedb.opt.wasm) bytes"
+            mv /tmp/mpedb.opt.wasm "$SRC"
+          else
+            echo "wasm-opt unavailable — shipping the unoptimised module ($(stat -c%s "$SRC") bytes)"
+          fi
+
+      - name: assemble the site
+        run: |
+          mkdir -p _site
+          cp web/index.html web/style.css web/app.js web/mpedb.js _site/
+          cp target/wasm32-unknown-unknown/release/mpedb_wasm.wasm _site/mpedb.wasm
+          # Pages serves what it is given; no build step, no bundler, no CDN.
+          # `.nojekyll` stops Jekyll from eating files, which it does silently.
+          touch _site/.nojekyll
+          echo "site contents:" && ls -l _site
+          echo "wasm gzips to $(gzip -9 -c _site/mpedb.wasm | wc -c) bytes"
+
+      # Fail loudly rather than publishing a page whose engine is missing:
+      # a 404 on mpedb.wasm renders as a broken playground with no clue why.
+      - name: sanity-check the artifact
+        run: |
+          test -s _site/mpedb.wasm || { echo "mpedb.wasm missing or empty"; exit 1; }
+          for f in index.html style.css app.js mpedb.js; do
+            test -s "_site/$f" || { echo "$f missing or empty"; exit 1; }
+          done
+          grep -q 'mpedb.wasm' _site/mpedb.js || { echo "glue does not reference the module"; exit 1; }
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
