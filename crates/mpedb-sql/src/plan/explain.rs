@@ -1122,6 +1122,17 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
                     }
                 }
             }
+            // The collated scalar min()/max() (format 60). The collation is an
+            // inference from a column argument, not something anyone wrote, so
+            // the call renders exactly as the plain form does.
+            Instr::CallColl(f, argc, _) => {
+                let mut args: Vec<String> = (0..argc).map(|_| pop(&mut st).s).collect();
+                args.reverse();
+                Item {
+                    s: format!("{}({})", f.name(), args.join(", ")),
+                    atom: true,
+                }
+            }
             // A host-registered scalar UDF `name(a, b)` — the name lives in the
             // const pool; pop `argc` arguments (never the fallback's fixed two).
             Instr::HostCall(name_idx, argc) => {

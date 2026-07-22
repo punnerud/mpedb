@@ -769,6 +769,9 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                             1 => true,
                             t => return Err(corrupt(format!("bad aggregate distinct tag {t}"))),
                         };
+                        // The argument's collating sequence (format 60).
+                        let coll = Collation::from_tag(r_u8(buf, pos)?)
+                            .ok_or_else(|| corrupt("bad aggregate collation tag"))?;
                         let arg = match r_u8(buf, pos)? {
                             0 => None,
                             1 => Some(ExprProgram::decode(buf, pos)?),
@@ -812,6 +815,7 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                             distinct,
                             filter,
                             extra_args,
+                            coll,
                         });
                     }
                     let having = decode_opt_program(buf, pos)?;

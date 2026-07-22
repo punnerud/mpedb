@@ -52,7 +52,23 @@ pub(super) fn exec_select_windowed(
         gather_rows(ctx, sp.table, &sp.access, sp.filter.as_ref(), plan, params, None)?
     };
 
-    compute_windows(&mut rows, &sp.windows, params, ctx.host_aggs())?;
+    // The collating sequence of each window's ARGUMENT — the declared collation
+    // of the bare column it names (`min(x) OVER (…)` on a NOCASE column folds
+    // NOCASE, as sqlite's minmaxStep does; probed against the bundled 3.45.0).
+    // A computed argument carries none, and an explicit COLLATE in argument
+    // position is refused at bind, so the PushCol shape is the whole rule.
+    let base_colls = base_row_collations(schema, plan, sp.table, &sp.joins);
+    let arg_colls: Vec<Collation> = sp
+        .windows
+        .iter()
+        .map(|w| match w.arg.as_ref().map(|p| p.instrs.as_slice()) {
+            Some([mpedb_types::Instr::PushCol(i)]) => {
+                base_colls.get(*i as usize).copied().unwrap_or(Collation::Binary)
+            }
+            _ => Collation::Binary,
+        })
+        .collect();
+    compute_windows(&mut rows, &sp.windows, &arg_colls, params, ctx.host_aggs())?;
 
     // Project over the extended rows `[base ‖ w0..wk]`. DISTINCT dedups the
     // projected tuples AFTER the window phase (the same key encoding the plain
@@ -106,6 +122,10 @@ pub(super) fn exec_select_windowed(
 pub(super) fn compute_windows(
     rows: &mut [Vec<Value>],
     windows: &[WindowSpec],
+    // Per window: the argument's collating sequence (see `exec_select_windowed`),
+    // read only by a `WindowFunc::Agg` min/max. May be shorter than `windows`
+    // (defensive): missing entries are Binary.
+    arg_colls: &[Collation],
     params: &[Value],
     // The connection's HOST window-aggregate registry, for
     // `WindowFunc::Host` (design/DESIGN-UDF.md stage 4). `None` wherever no
@@ -174,6 +194,7 @@ pub(super) fn compute_windows(
             &idx,
             rows,
             w,
+            arg_colls.get(k).copied().unwrap_or(Collation::Binary),
             &part_key,
             &order_vals,
             &arg_vals,
@@ -195,6 +216,9 @@ fn assign_window(
     idx: &[usize],
     rows: &mut [Vec<Value>],
     w: &WindowSpec,
+    // The argument's collating sequence — the min/max compare (and the DISTINCT
+    // dedup, had windows allowed one) of a `WindowFunc::Agg` accumulator.
+    coll: Collation,
     part_key: &[Vec<u8>],
     order_vals: &[Vec<Value>],
     arg_vals: &[Option<Value>],
@@ -230,6 +254,7 @@ fn assign_window(
                 part,
                 rows,
                 w.func,
+                coll,
                 frame,
                 arg_vals,
                 order_vals,
@@ -273,7 +298,7 @@ fn assign_window(
             // SAME value: the running total THROUGH THE END of that group. With
             // no ORDER BY the whole partition is one group.
             WindowFunc::Agg(f) => {
-                let mut acc = Accum::new(f);
+                let mut acc = Accum::new_collated(f, coll);
                 if !has_order {
                     for &i in part {
                         push_arg(&mut acc, &arg_vals[i])?;
@@ -472,6 +497,8 @@ fn assign_framed(
     part: &[usize],
     rows: &mut [Vec<Value>],
     func: WindowFunc,
+    // The argument's collating sequence, for a min/max aggregate over the frame.
+    coll: Collation,
     frame: &Frame,
     arg_vals: &[Option<Value>],
     order_vals: &[Vec<Value>],
@@ -500,7 +527,7 @@ fn assign_framed(
         let target = part[off];
         rows[target][slot] = match func {
             WindowFunc::Agg(f) => {
-                let mut acc = Accum::new(f);
+                let mut acc = Accum::new_collated(f, coll);
                 for &i in &part[lo..hi] {
                     push_arg(&mut acc, &arg_vals[i])?;
                 }

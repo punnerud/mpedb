@@ -81,12 +81,25 @@ impl AggFn {
     /// bare column takes its value from). An incomparable pair keeps the
     /// incumbent (`Ordering::None` ⇒ `false`), so on a tie the FIRST occurrence
     /// wins — matching sqlite. Meaningless (and always `false`) for non-min/max.
-    pub fn min_max_prefers(self, incumbent: &Value, candidate: &Value) -> Result<bool> {
+    ///
+    /// `coll` is the collating sequence OF THE ARGUMENT (sqlite `minmaxStep`
+    /// compares under `sqlite3ExprCollSeq` of the argument expression): the
+    /// explicit `COLLATE`, else the declared collation of the column the
+    /// argument names, else BINARY. Probed against the bundled 3.45.0: a NOCASE
+    /// column holding `'a','B'` answers `min='a'`, and a collation-equal pair
+    /// (`'a'` vs `'A'`) keeps the FIRST scan row — the strict-beat rule above.
+    pub fn min_max_prefers(
+        self,
+        incumbent: &Value,
+        candidate: &Value,
+        coll: crate::Collation,
+    ) -> Result<bool> {
         // `sort_cmp`: MIN/MAX over an `any` column meets mixed storage classes,
         // and sqlite's extremum is taken in its class order (a number always
         // beats a string to MIN). Comparing stored values only, so no
-        // comparison affinity is involved.
-        let ord = incumbent.sort_cmp(candidate, crate::Collation::Binary);
+        // comparison affinity is involved; the collation folds TEXT–TEXT pairs
+        // and nothing else.
+        let ord = incumbent.sort_cmp(candidate, coll);
         Ok(matches!(
             (self, ord),
             (AggFn::Min, Some(std::cmp::Ordering::Greater))

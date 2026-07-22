@@ -72,6 +72,8 @@ const OP_LIKE_CS_DYN: u8 = 57;
 const OP_LIKE_DYN_ESC: u8 = 58;
 const OP_LIKE_CS_DYN_ESC: u8 = 59;
 const OP_GLOB_DYN: u8 = 60;
+// The collated scalar-call twin (min()/max() under a column's collation).
+const OP_CALL_COLL: u8 = 61;
 
 impl ExprProgram {
     /// Deterministic serialization (part of plan blobs and plan hashing).
@@ -142,6 +144,12 @@ impl ExprProgram {
                     buf.push(OP_CALL);
                     buf.push(f as u8);
                     buf.push(argc);
+                }
+                Instr::CallColl(f, argc, coll) => {
+                    buf.push(OP_CALL_COLL);
+                    buf.push(f as u8);
+                    buf.push(argc);
+                    buf.push(coll as u8);
                 }
                 Instr::InParam(x) => {
                     buf.push(OP_IN_PARAM);
@@ -276,6 +284,15 @@ impl ExprProgram {
                     let argc = *buf.get(*pos + 1).ok_or_else(err)?;
                     *pos += 2;
                     Instr::Call(ScalarFn::from_tag(f)?, argc)
+                }
+                OP_CALL_COLL => {
+                    let f = *buf.get(*pos).ok_or_else(err)?;
+                    let argc = *buf.get(*pos + 1).ok_or_else(err)?;
+                    let c = *buf.get(*pos + 2).ok_or_else(err)?;
+                    *pos += 3;
+                    let coll = Collation::from_tag(c)
+                        .ok_or_else(|| Error::Corrupt("bad collation tag".into()))?;
+                    Instr::CallColl(ScalarFn::from_tag(f)?, argc, coll)
                 }
                 OP_EQ => Instr::Eq,
                 OP_NE => Instr::Ne,
@@ -508,7 +525,7 @@ pub(super) fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                     Instr::Pop => (1, 0),
                     // Arity is checked HERE, once per program, so eval can index
                     // the args without re-checking per row.
-                    Instr::Call(f, argc) => {
+                    Instr::Call(f, argc) | Instr::CallColl(f, argc, _) => {
                         if !f.arity_ok(argc) {
                             return Err(Error::Corrupt(format!(
                                 "{}() called with {argc} argument(s)",

@@ -32,7 +32,7 @@ use ops::{
     bit_i64, bitwise, escape_char, glob_match, in_items_3vl, in_items_3vl_collated, in_list_3vl,
     like_match, like_match_cs, regexp_match, CrossClass,
 };
-use scalar::call_scalar;
+use scalar::{call_scalar, call_scalar_collated};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
@@ -154,6 +154,14 @@ pub enum Instr {
     /// Call a scalar function over the top `argc` values (leftmost deepest),
     /// replacing them with one result.
     Call(ScalarFn, u8),
+    /// [`Instr::Call`] under a collating sequence — the collated twin the
+    /// binder emits ONLY for the scalar `max(a,b,…)`/`min(a,b,…)` when the
+    /// first argument (left to right) that DEFINES a collating sequence
+    /// defines a non-`Binary` one (sqlite's `SQLITE_FUNC_NEEDCOLL` rule; a
+    /// bare column defines its declared collation, and BINARY counts as
+    /// defined, so `max(bincol, nocasecol)` stays a plain [`Instr::Call`]).
+    /// Every other function ignores its collation and never gets this opcode.
+    CallColl(ScalarFn, u8, Collation),
     /// A comparison under an explicit collating sequence (task: COLLATE). Pops
     /// two values and pushes the 3VL verdict, exactly like the plain
     /// [`Instr::Eq`]..[`Instr::Ge`] family, but TEXT operands are ordered by
@@ -790,6 +798,11 @@ impl ExprProgram {
                     let at = stack.len() - argc as usize;
                     let args: Vec<Value> = stack.split_off(at);
                     stack.push(call_scalar(f, &args)?);
+                }
+                Instr::CallColl(f, argc, coll) => {
+                    let at = stack.len() - argc as usize;
+                    let args: Vec<Value> = stack.split_off(at);
+                    stack.push(call_scalar_collated(f, &args, coll)?);
                 }
                 Instr::CmpColl(kind, coll) => {
                     let b = stack.pop().expect("validated");

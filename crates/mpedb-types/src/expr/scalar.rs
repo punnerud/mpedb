@@ -405,6 +405,13 @@ impl ScalarFn {
 /// null-tolerant functions (`coalesce`, `nullif`) are NOT here — they are
 /// compiled to control flow instead, precisely because they must NOT propagate.
 pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
+    call_scalar_collated(f, args, Collation::Binary)
+}
+
+/// [`call_scalar`] under a collating sequence — reaches only the scalar
+/// `max()`/`min()`, the two NEEDCOLL functions ([`Instr::CallColl`]); every
+/// other function ignores `coll` entirely.
+pub(super) fn call_scalar_collated(f: ScalarFn, args: &[Value], coll: Collation) -> Result<Value> {
     // `typeof` is the one scalar here that must SEE a NULL rather than
     // propagate it: `typeof(NULL)` is the text `'null'`, not NULL. So it runs
     // ahead of the null gate every function below relies on.
@@ -754,7 +761,7 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
         // UNCHANGED (`sqlite3_result_value(context, argv[iBest])`), so the
         // result keeps that argument's type — `max(3, 2.5)` is the integer 3.
         // The null gate above already covers "any NULL argument yields NULL".
-        ScalarFn::Max2 | ScalarFn::Min2 => min_max_scalar(f, args)?,
+        ScalarFn::Max2 | ScalarFn::Min2 => min_max_scalar(f, args, coll)?,
         // Handled ahead of the null gate above; unreachable here.
         ScalarFn::Typeof => unreachable!("typeof is dispatched before the null gate"),
         ScalarFn::Printf => unreachable!("printf is dispatched before the null gate"),
@@ -797,11 +804,11 @@ pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
 /// (mpedb's own `Bool`/`Timestamp` against a different class, reachable only
 /// through an `any` value). That is an error rather than an arbitrary winner:
 /// sqlite has no such pair, so there is no answer of sqlite's to reproduce.
-fn min_max_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
+fn min_max_scalar(f: ScalarFn, args: &[Value], coll: Collation) -> Result<Value> {
     let want_max = matches!(f, ScalarFn::Max2);
     let mut best = 0usize;
     for i in 1..args.len() {
-        let Some(ord) = args[best].sort_cmp(&args[i], Collation::Binary) else {
+        let Some(ord) = args[best].sort_cmp(&args[i], coll) else {
             return Err(Error::TypeMismatch(format!(
                 "{}() cannot order {} against {}",
                 f.name(),

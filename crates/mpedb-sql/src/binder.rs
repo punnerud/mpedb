@@ -76,6 +76,13 @@ pub(crate) enum BExpr {
     Case(Vec<(BExpr, BExpr)>, Option<Box<BExpr>>),
     /// A built-in scalar function over already-typed arguments.
     Call(ScalarFn, Vec<BExpr>),
+    /// The scalar `max(a,b,…)`/`min(a,b,…)` under a non-BINARY collating
+    /// sequence — sqlite's `SQLITE_FUNC_NEEDCOLL` rule: the first argument
+    /// (left to right) that DEFINES a collation supplies it, and a bare column
+    /// defines its declared one (BINARY counts as defined, so
+    /// `max(bincol, nocasecol)` compares BINARY and stays a plain `Call`).
+    /// Compiles to [`Instr::CallColl`](mpedb_types::expr).
+    CallColl(ScalarFn, Vec<BExpr>, Collation),
     /// `coalesce(a, b, …)` — compiled to control flow, not a call, so later
     /// arguments are never evaluated once an earlier one is non-NULL.
     Coalesce(Vec<BExpr>),
@@ -1533,6 +1540,25 @@ impl<'a> Binder<'a> {
         }
     }
 
+    /// Does this argument expression DEFINE a collating sequence, and which
+    /// (sqlite `sqlite3ExprCollSeq`, as the scalar min/max NEEDCOLL search
+    /// asks it)? A bare column defines its DECLARED collation — `Some(Binary)`
+    /// for an undeclared one, which is a real answer that STOPS the
+    /// left-to-right search (probed: `max(bincol, 'B' COLLATE NOCASE)` compares
+    /// BINARY on 3.45.0). CAST is descended through, as sqlite does. Everything
+    /// else — a literal, a computed expression — defines none. An explicit
+    /// `COLLATE` in argument position is refused by `bind_expr` before this
+    /// could matter, never silently dropped.
+    fn defining_collation(&self, e: &ast::Expr) -> Option<Collation> {
+        match e {
+            ast::Expr::Col(_) | ast::Expr::Qualified(..) => {
+                Some(declared_collation(e, &self.scope))
+            }
+            ast::Expr::Cast(inner, _) => self.defining_collation(inner),
+            _ => None,
+        }
+    }
+
     fn bind_binary(&mut self, op: BinOp, l: &ast::Expr, r: &ast::Expr) -> Result<(BExpr, Ty)> {
         // COLLATE is honored on comparison operands only. Peel a top-level
         // COLLATE off each side HERE, before binding, so the inner expression
@@ -2390,6 +2416,20 @@ impl<'a> Binder<'a> {
                 })
                 .collect();
             let f = if name == "max" { ScalarFn::Max2 } else { ScalarFn::Min2 };
+            // NEEDCOLL (probed against the bundled 3.45.0): the comparison runs
+            // under the collation of the first argument, left to right, that
+            // DEFINES one — a bare column (its declared collation; a plain
+            // BINARY column defines BINARY and STOPS the search), descending
+            // through CAST as sqlite's `sqlite3ExprCollSeq` does. Literals and
+            // computed arguments define none. Binary keeps the plain opcode,
+            // so uncollated plans are byte-identical.
+            let coll = args
+                .iter()
+                .find_map(|a| self.defining_collation(a))
+                .unwrap_or(Collation::Binary);
+            if coll != Collation::Binary {
+                return Ok((BExpr::CallColl(f, out, coll), ret));
+            }
             return Ok((BExpr::Call(f, out), ret));
         }
         let f = match name {
@@ -3046,6 +3086,9 @@ impl<'a> Binder<'a> {
                 a,
             ) => self.static_type(&a[0]),
             BExpr::Call(_, _) => Some(ColumnType::Text),
+            // Only the scalar min/max carry a collation, and only when a TEXT
+            // column argument supplied it — typed like the plain-Call fallback.
+            BExpr::CallColl(..) => Some(ColumnType::Text),
             BExpr::IsDistinct(..) => Some(ColumnType::Bool),
             _ => None,
         }
@@ -3507,7 +3550,7 @@ pub(crate) fn fold(e: BExpr) -> Result<BExpr> {
         //     be.**
         //  2. Economy: folding would have to reproduce `call_scalar`'s NULL
         //     rules here, which is not worth a special case.
-        BExpr::Call(..) => false,
+        BExpr::Call(..) | BExpr::CallColl(..) => false,
         // Foldable in principle (`2 IN (1,2)` is TRUE), but deliberately not:
         // the fold path evaluates via ExprProgram over a const-only program, and
         // an all-const IN list is not worth a special case. It stays a runtime
@@ -3709,6 +3752,12 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 emit(a, instrs, consts)?;
             }
             instrs.push(Instr::Call(*f, args.len() as u8));
+        }
+        BExpr::CallColl(f, args, coll) => {
+            for a in args {
+                emit(a, instrs, consts)?;
+            }
+            instrs.push(Instr::CallColl(*f, args.len() as u8, *coll));
         }
         BExpr::Coalesce(args) => {
             // Lazily: evaluate an argument, and if it is non-NULL jump to the
