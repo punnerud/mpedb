@@ -1,0 +1,40 @@
+# Windows — the portable crates only, and deliberately not the workspace.
+#
+# The ENGINE is Unix-only BY CONSTRUCTION, not by neglect: MAP_SHARED mmap,
+# flock/fcntl locks, robust PROCESS_SHARED pthread mutexes, `/proc/<pid>/stat`
+# start-time reader identity, msync/fdatasync ordering. 18 files use libc or
+# `std::os::unix` and there is not one `cfg(windows)` in the tree. A Windows port
+# is a real project, not a CI switch; a job that "tries the workspace" would fail
+# on line one forever and teach nothing.
+#
+# What IS portable is large and load-bearing: `mpedb-types` (values, schema +
+# canonical bytes + blake3, memcmp key encoding, the expression IR with SQL 3VL,
+# plan footprints) and `mpedb-sql` (tokenizer → AST → binder → planner → plan
+# encode/decode/validate). Zero Unix dependencies, no dependency on mpedb-core,
+# ~320 tests.
+#
+# So this guards one property worth guarding — the SQL front end and the type
+# system must not silently acquire a platform dependency — and it is a REAL gate
+# on that subset: a red here fails the run.
+name: Windows
+
+on:
+  schedule:
+    - cron: '0 3 * * *'
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  windows-portable-core:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: toolchain
+        run: rustc --version; cargo --version; cargo clippy --version
+      - name: test the portable crates
+        run: cargo test -p mpedb-types -p mpedb-sql
+      - name: clippy the portable crates
+        run: cargo clippy -p mpedb-types -p mpedb-sql --all-targets -- -D warnings
