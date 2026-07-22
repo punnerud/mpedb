@@ -1019,6 +1019,44 @@ impl BatchScan {
         }))
     }
 
+    /// A [`BatchScan`] over ONE MORSEL of an already-resolved PK range — the
+    /// parallel fold's worker input (`exec/parallel.rs`). The caller resolved
+    /// the plan's bounds once ([`range_bounds`]) and cut them at structural
+    /// partition keys; each worker then drains its contiguous piece with
+    /// exactly the serial scan's batching, masking, filtering and #74 charges
+    /// — the same rows the serial scan would hand this piece, in the same
+    /// order, through the same code.
+    pub(super) fn open_partition(
+        ctx: &dyn TxnCtx,
+        table: u32,
+        lo: Option<RawBound>,
+        hi: Option<RawBound>,
+        width: usize,
+        keep: Option<Vec<bool>>,
+    ) -> BatchScan {
+        BatchScan {
+            table,
+            lo,
+            hi,
+            keep,
+            batch: fold_batch(ctx.join_cells_budget(), width),
+            done: false,
+        }
+    }
+
+    /// Has this scan run out of rows? (Set by the batch that came up short.)
+    pub(super) fn exhausted(&self) -> bool {
+        self.done
+    }
+
+    /// The UNVISITED remainder of this scan: the bounds a fresh scan would
+    /// need to fold exactly the rows this one has not handed out yet. Only
+    /// meaningful while `!exhausted()`; that is precisely when the adaptive
+    /// fold hands its tail to the morsel queue.
+    pub(super) fn remainder(&self) -> (Option<RawBound>, Option<RawBound>) {
+        (self.lo.clone(), self.hi.clone())
+    }
+
     /// The next batch of at most `self.batch` filtered rows; empty when the
     /// scan is exhausted.
     pub(super) fn next(

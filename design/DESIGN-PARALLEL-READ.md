@@ -1,7 +1,8 @@
 # DESIGN-PARALLEL-READ — intra-query read parallelism: the substrate ceiling, measured
 
-**Status: measurement + scoped design, 2026-07-21. Verdict: BUILD — read-only, cost-gated,
-nothing else.** The numbers half is `crates/mpedb/examples/par_ceiling.rs`, run on the M3
+**Status: BUILT (adaptive morsel scheduling for the order-independent aggregate fold,
+2026-07-22 — §9). The verdict was: BUILD — read-only, cost-gated, nothing else; §8 then
+replaced the cost gate with runtime scheduling and §9 measures the result.** The numbers half is `crates/mpedb/examples/par_ceiling.rs`, run on the M3
 (Apple M3 Pro, 5 P-cores + 6 E-cores, 36 GB) at commit `66a0010`. Nothing here changed the
 engine; every measurement went through today's public API. Method model:
 [FOOTPRINT-INDEX-MEASURED.md](FOOTPRINT-INDEX-MEASURED.md).
@@ -284,3 +285,197 @@ serial path — gets faster; the aggregate combine is then the free case.
 guarantees: key-ordered morsels assembled in key order (byte-identical output),
 work-meter summed deterministically at merge, a raise surfaced from the earliest
 morsel, parallel OFF under RLS (join-reorder precedent) and OFF with LIMIT (v1).
+
+## 9. BUILT 2026-07-22 — the adaptive fold, measured on both hosts
+
+`exec/parallel.rs` (the scheduler) + `mpedb_sql::parallel_fold_shape` (the single
+STATIC gate, which EXPLAIN prints) + `btree::partition_keys` /
+`ReadTxn::partition_range` (structural morsel cuts) + `[runtime]
+max_query_threads` (`0` = auto `min(cores, 8)`, on by default; `1` = serial).
+
+### 9.1 The shape of the decision — no gate, no estimate
+
+The calling thread is worker 0 and folds the statement's lowest key range
+immediately, through the ordinary serial code. A scan that ends inside
+`PROBE_ROWS` (32 768, `MPEDB_PAR_PROBE_ROWS` overrides) engages **nothing**: no
+thread, no structural cut, no reader census, no `available_parallelism` call.
+Only a scan that outlives the probe hands its REMAINING key range to a morsel
+queue — cut at B+tree separators, ~4 morsels per worker — spawns helpers, and
+keeps pulling morsels itself.
+
+Engagement therefore requires: the static shape gate ∧ a pinned-snapshot read
+context ∧ `max_query_threads ≠ 1` ∧ the probe outlived ∧ the tree offering ≥ 1
+cut inside the remainder ∧ helper budget available. **No row estimate appears
+anywhere**, which is the point: the estimate is worst exactly on the UNKNOWN
+selectivity class, and by the time a thread is spawned there are 32 768 rows of
+evidence instead. `par_adaptive.rs` asserts both halves at the shipped setting —
+a 4 000-row scan engages nothing; a 52 768-row scan engages and answers
+identically; a short PK RANGE over a long table engages nothing.
+
+The probe is measured on rows VISITED (the #74 meter's own delta), not rows
+kept, so a selective residual cannot hide a long scan.
+
+### 9.2 Scope: the order-independent fold, ungrouped
+
+Admitted (each because its morsel-merge is proven order-identical, values, ties,
+spellings and raises alike): `count(*)`/`count(x)`, `min`/`max` over a bare
+non-`any` column, `sum` over a bare `int64` column, any per-aggregate `FILTER`,
+any host-free residual, over `FullScan` and `PkRange`.
+
+Refused, with the reason: **GROUP BY** (v1 scope — per-worker maps and their
+shared cell budget are a separate step; the machinery generalizes), **float
+`sum`, `avg`, `total`** (f64 accumulation is non-associative — partitioned low
+bits would differ from the serial oracle), **`group_concat`** (order IS the
+answer), **DISTINCT** (dedup sets span morsels), **host aggregates** (opaque
+state), **bare-column witnesses** (the all-NULL / all-filtered corners track the
+LATEST row), **`any`-typed min/max arguments** (`sort_cmp` calls Bool/Timestamp
+peers of another class — incomparability breaks first-beat associativity),
+**host-called per-row programs**, **joins/windows/correlated subplans**,
+**index and point access paths**. Also refused: bare `count(*)` over a filterless
+range, which `try_count_only` already answers leaf-wholesale at 0.4–2.6 ns/row —
+there is nothing there to parallelize.
+
+### 9.3 Integer `sum`: the exact prefix monoid, not a raise-frequency change
+
+The task allowed a deliberate divergence (parallel completes where serial
+raises, under the §7.2 join-reorder precedent, with an RLS carve-out). **It was
+not needed and was not taken.** Probing the bundled oracle first: sqlite 3.45
+raises "integer overflow" on `[MAX, 1, -2]` although the total fits, and
+completes on the same multiset as `[1, -2, MAX]` — the raise is
+order-dependent, and mpedb's serial `Accum` has the same rule (raise iff SOME
+true prefix leaves i64). Carrying `(Σ, max-prefix, min-prefix)` in i128 per
+morsel reproduces that predicate exactly under ordered concatenation
+(`maxp = max(A.maxp, A.Σ + B.maxp)`), for the same three words a bare total
+would cost. So the parallel fold raises **iff** the serial fold raises, no
+divergence exists, and no RLS carve-out is needed. `par_fold.rs` carries all
+four probes, including the one that refutes per-morsel i64 accumulation (a
+suffix whose LOCAL sum overflows while every TRUE prefix fits must complete).
+
+The leader's probe prefix is an ordinary serial `Accum`; it seeds the monoid
+through `Accum::int_sum_prefix`, which is sound precisely because that prefix
+COMPLETED — its own prefixes provably never escaped i64.
+
+### 9.4 Execution contract
+
+Workers share the statement's own `ReadTxn` through scoped threads: same
+`txn_id`, same meta, **zero extra reader slots** (the design's §4.3 alternative,
+N slots pinned to one txn, is unnecessary — sharing is both cheaper and a
+structural guarantee rather than a protocol one). Each worker drains its morsel
+through the SERIAL row body itself (`BatchScan` + the one `Folder`, or the fused
+`fold_range_column` loop) — no second row-processing implementation. Morsels
+merge by index, i.e. in key order, into the leader's prefix.
+
+Any mid-flight error — budget trip, per-row raise, eviction, a defensive
+invariant break — rewinds the meter to the pre-hand-off checkpoint and returns
+"not handed off"; the caller's own scan then keeps folding the remainder
+**serially, from exactly where it stood**, into accumulators it never gave up.
+The statement therefore charges the serial total in the serial order and trips at
+the serial row: `runtime_budget.rs`'s "same `used` every run" contract holds
+under threads, and `par_fold.rs` asserts parallel-vs-serial refusal equality
+directly. The one error returned from the parallel side is the integer-sum
+overflow, on the strength of §9.3's proof.
+
+Peak input residency during an engaged fold is O(workers × batch) rows rather
+than O(batch) — each worker holds one `BatchScan` batch (the fused body holds
+none). Still kilobytes, and still O(1) in table size, which is what
+DESIGN-STREAM-EXEC §5.1 promises; `agg_stream_mem.rs`'s slopes are unmoved
+because its fixtures are below the probe.
+
+**Fan-out is budgeted** (§8's mpedb-specific point): helpers are bounded by the
+knob, by free cores, by this process's in-flight helpers, and by the file's
+reader census — other live pins are other requests, possibly other PROCESSES.
+A helper that sees another engagement denied budget finishes its morsel and
+yields. Correctness never depends on a helper running: the leader drains the
+queue.
+
+### 9.5 The measured wall: the work meter's cache line
+
+The #74 meter is one atomic cell, and a per-row read-modify-write on it from N
+cores is a hard scaling limit — not a constant factor. Measured on the M3, 1 M
+rows, `count(*) … WHERE` (the general row body):
+
+```text
+  meter charging   4 threads    11 threads
+  per row            40.4          61.0    ns/row   (serial: 70.4)
+  batched (64)       25.2          17.1    ns/row
+```
+
+Per-row charging caps the 11-core speedup at 1.15×; batching it (worker-only —
+it may fold up to 63 rows past a serial abort point, which is legal exactly
+because any error abandons to a serial re-run) restores 4.6×. `RowCursor::
+batch_charges` / `FoldOpts::worker` carry the rule and the reason.
+
+A second measurement trap, recorded so it is not re-hit: `examples/agg_prof.rs`
+counts allocations through a global allocator with two shared atomic counters.
+Invisible on one thread, they dominate on eleven — they made the allocating
+body look unparallelizable (0.64× at 8 threads) when what could not be
+parallelized was the instrument. `MPEDB_PROF_ALLOC_COUNT=0` turns them off;
+every number below is measured with them off.
+
+### 9.6 Numbers
+
+ns/row, min-of-5 (1 M) / min-of-3 (4 M), warm, `durability = "none"`, the
+`agg_prof` fixture. `[base]` = the unindexed columns, i.e. the table fold;
+`WHERE` = the general row body under a residual. Engagement was asserted per
+cell by the harness (`[par n/n]`).
+
+**M3 Pro, 11 cores, `max_query_threads = 11`:**
+
+| shape | 1 M serial | 1 M par | × | 4 M serial | 4 M par | × |
+|---|---|---|---|---|---|---|
+| `sum(g10)` (fused) | 28.6 | 5.2 | **5.5** | 30.3 | 4.7 | **6.4** |
+| `min(gk), max(gk)` (fused) | 34.1 | 6.7 | **5.1** | 35.9 | 6.1 | **5.9** |
+| `count(*), sum(g10)` (fused) | 30.7 | 5.7 | **5.4** | 32.5 | 5.1 | **6.4** |
+| `sum(g10) … WHERE` | 81.0 | 16.6 | **4.9** | 83.1 | 14.2 | **5.9** |
+| `count(*) … WHERE` | 72.7 | 14.4 | **5.0** | 75.0 | 12.8 | **5.9** |
+| `min/max(gk) … WHERE` | 87.9 | 17.8 | **4.9** | 89.5 | 15.1 | **5.9** |
+
+§1's hand-partitioned ceiling on this machine was 5.4–6.6× at 1 M and 6.2–6.8×
+at 4 M. The executor-integrated fold reaches **90–95 % of it** while adding no
+reader slot, no second row body, and no answer change — the missing few percent
+is the serial probe prefix (3.3 % of 1 M, 0.8 % of 4 M) plus the merge.
+
+At 11 threads mpedb's parallel fold also passes bundled serial sqlite on these
+shapes for the first time: `sum` 5.2 vs 19.3 ns/row, `min/max` 6.7 vs 29.5.
+
+**Linux dev box, 2 cores (1 helper), `max_query_threads = 0` (auto):**
+
+| shape | 1 M serial | 1 M par | × | 4 M serial | 4 M par | × |
+|---|---|---|---|---|---|---|
+| `sum(g10)` (fused) | 63.2 | 40.9 | **1.55** | 61.8 | 39.3 | **1.57** |
+| `min(gk), max(gk)` (fused) | 68.4 | 53.6 | **1.28** | 67.8 | 52.1 | **1.30** |
+| `count(*), sum(g10)` (fused) | 68.0 | 44.4 | **1.53** | 66.2 | 43.9 | **1.51** |
+| `sum(g10) … WHERE` | 166.3 | 119.4 | **1.39** | 169.9 | 120.0 | **1.42** |
+| `count(*) … WHERE` | 146.0 | 115.8 | **1.26** | 161.9 | 111.8 | **1.45** |
+| `min/max(gk) … WHERE` | 172.9 | 133.3 | **1.30** | 167.9 | 132.7 | **1.27** |
+
+Two cores buy one helper, so ~1.8× is the ceiling and 1.26–1.57× is what
+scheduling, the probe prefix and the merge leave of it.
+
+**The 10 k-row latency check — the whole point of adaptive scheduling.** At
+10 000 rows (below the probe) the harness reports `[par 0/9]` on every shape,
+both hosts: the parallel-enabled handle engages nothing and runs the serial code
+path. Timings are equal within noise on both boxes (M3 33.1→19.8 and
+84.2→73.6 ns/row; Linux 48.1→46.6 and 148.6→142.8 — the parallel handle
+measured marginally FASTER, i.e. noise at 0.2–1.6 ms durations). There is no
+small-query tax to trade against, which is what a compile-time gate would have
+had to predict its way out of.
+
+### 9.7 Gates
+
+`par_fold.rs` (12 differentials against the bundled 3.45 oracle AND serial
+mpedb, incl. the four overflow probes, budget-refusal determinism, NOCASE tie
+spellings, snapshot identity under a concurrent writer, thread-count
+invariance at {2,3,5,8}) + `par_adaptive.rs` (4, the adaptive claims at shipped
+settings); `agg_stream`, `agg_collate`, `agg_over_index`, `agg_stream_mem`,
+`prune_width`, `runtime_budget`, `mpee_solver` green; `cargo test --workspace
+--no-fail-fast` green (166 binaries, 0 failures); clippy `-D warnings` clean.
+
+**Corpus: byte-identical.** `select1-4` + `evidence/` reproduces §7's
+9,489 / 9,689 with the same 4 flagged; the full 621-file sweep (7,419,202
+records, 5,936,882 passed, 0 genuine wrong, 1,391 refused) `diff`s **byte for
+byte** against the same sweep from a `bc45e69` control build on the same box,
+same corpus copy, same file list. (That control was necessary: the stored
+`mpedb-corpus-bd420e8-r1.log` counts 75 more records than this box's corpus
+copy yields, a difference the base build reproduces exactly and this change does
+not touch.)

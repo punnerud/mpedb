@@ -433,6 +433,22 @@ impl CompiledPlan {
                     if let Some(h) = &a.having {
                         out.push_str(&format!("  having: {}\n", render_program(h, &name)));
                     }
+                    // The parallel fold states exactly what it knows and no
+                    // more (post-`36155ae`: never claim an attribution that
+                    // did not happen). ELIGIBILITY is static and decided here,
+                    // by the same predicate the executor uses; ENGAGEMENT is a
+                    // runtime decision the data makes — this statement's own
+                    // scan is what discovers whether there is a tail worth
+                    // splitting — so no worker count is claimed, and none is
+                    // knowable at plan time.
+                    if super::parallel_fold_shape(sp, schema) {
+                        out.push_str(
+                            "  parallel fold: eligible — if this scan proves long at run time, \
+                             its remaining key range is split across worker threads (same \
+                             snapshot, same answer); short scans finish serially and engage \
+                             nothing\n",
+                        );
+                    }
                 }
                 // Window functions run over the base row, so their sub-programs
                 // use the base namer. Shows the phase EXPLAIN otherwise hides.

@@ -1,5 +1,51 @@
 use super::*;
 
+/// How a [`ReadTxn::fold_range_column`] run ended.
+pub enum FoldStop {
+    /// The bounded range was drained to its end.
+    Exhausted,
+    /// The row cap was reached: the raw storage key of the LAST row folded.
+    /// The remainder of the range is `(key, hi)`, exclusive of `key` — a valid
+    /// lower bound for a fresh fold, which is how the adaptive parallel fold
+    /// hands its tail to the morsel queue.
+    Stopped(Vec<u8>),
+}
+
+/// Knobs of one [`ReadTxn::fold_range_column`] run. Neither affects WHICH rows
+/// are folded, their order, or the values handed to the accumulator.
+#[derive(Clone, Copy)]
+pub struct FoldOpts {
+    /// Stop after this many rows and hand back the resume key. `None` drains
+    /// the range.
+    pub cap: Option<u64>,
+    /// Charge the #74 meter in batches of this many rows (`1` = per row,
+    /// before the decode, the serial contract). A batch > 1 may fold up to
+    /// `batch - 1` rows past the point the serial loop would have refused, so
+    /// it is legal ONLY where an error abandons the whole attempt to a serial
+    /// re-run that owns the authentic outcome — i.e. inside a parallel worker.
+    pub charge_batch: u32,
+}
+
+impl FoldOpts {
+    /// Every serial caller: drain the range, charge per row.
+    pub const SERIAL: FoldOpts = FoldOpts { cap: None, charge_batch: 1 };
+
+    /// A parallel worker's: drain its morsel, charging the statement's shared
+    /// meter in batches. The batching is a measured necessity, not a
+    /// micro-optimization — a per-row atomic RMW on one contended cache line
+    /// eats most of a two-core fold's gain.
+    pub const fn worker() -> FoldOpts {
+        FoldOpts { cap: None, charge_batch: 64 }
+    }
+
+    /// The adaptive scheduler's leader probe: serial charging (its rows ARE
+    /// the statement's first rows, and any error it raises is the serial one),
+    /// stopping after `cap` rows.
+    pub const fn probe(cap: u64) -> FoldOpts {
+        FoldOpts { cap: Some(cap), charge_batch: 1 }
+    }
+}
+
 // ---------------------------------------------------------------- ReadTxn
 
 pub struct ReadTxn<'e> {
@@ -67,6 +113,50 @@ impl ReadTxn<'_> {
     /// product.
     pub fn join_cells_budget(&self) -> u64 {
         self.eng.join_cells_budget()
+    }
+
+    /// The parallel-fold worker ceiling this engine was opened with (`0` =
+    /// auto, `1` = serial) — see `[runtime] max_query_threads`.
+    pub fn max_query_threads(&self) -> u32 {
+        self.eng.max_query_threads()
+    }
+
+    /// Reader slots occupied on this file right now, this transaction's own
+    /// included — the parallel fold's politeness signal (a greedy analytical
+    /// query must not commandeer the cores other PROCESSES' requests want).
+    pub fn live_readers(&self) -> u32 {
+        self.eng.live_readers()
+    }
+
+    /// Checkpoint of the work meter, for [`work_rewind`](Self::work_rewind).
+    pub fn work_checkpoint(&self) -> u64 {
+        self.work.used()
+    }
+
+    /// Rewind the work meter to a [`work_checkpoint`](Self::work_checkpoint)
+    /// — **parallel-fold fallback plumbing only** ([`WorkMeter::rewind`]): the
+    /// abandoned attempt's rows are re-read and re-charged by the serial
+    /// re-run, so the statement's trip point stays the serial contract's.
+    pub fn work_rewind(&self, to: u64) {
+        self.work.rewind(to);
+    }
+
+    /// Cut the PK range `(lo, hi)` of `table_id` into up to `want` contiguous
+    /// pieces at the B+tree's own separator keys — the adaptive parallel
+    /// fold's morsel boundaries ([`crate::btree::partition_keys`]). The cuts
+    /// are strictly inside the bounds, ascending, and possibly fewer than
+    /// asked (an empty answer means "this range has no structure to cut at",
+    /// and the caller keeps it whole). Deterministic for this snapshot; a
+    /// structural descent, so no work-row charge — like any other probe.
+    pub fn partition_range(
+        &self,
+        table_id: u32,
+        lo: Option<&[u8]>,
+        hi: Option<&[u8]>,
+        want: usize,
+    ) -> Result<Vec<Vec<u8>>> {
+        let root = self.tree_root(table_id, 0)?;
+        btree::partition_keys(self, root, lo, hi, want)
     }
 
     pub fn finish(mut self) -> Result<()> {
@@ -314,6 +404,8 @@ impl ReadTxn<'_> {
             table_id,
             steps: 0,
             scratch: Vec::new(),
+            charge_batch: 1,
+            pending: 0,
         })
     }
 
@@ -333,6 +425,8 @@ impl ReadTxn<'_> {
             table_id,
             steps: 0,
             scratch: Vec::new(),
+            charge_batch: 1,
+            pending: 0,
         })
     }
 
@@ -465,14 +559,21 @@ impl ReadTxn<'_> {
     /// same total, order, and label as the equivalent [`RowCursor`] drain, and
     /// therefore the same `RuntimeBudget` trip point: this path is faster,
     /// never cheaper. Pin revalidation every 256 rows, as every scan does.
+    ///
+    /// `opts` is [`FoldOpts::SERIAL`] for every serial caller — per-row
+    /// charging, no cap, byte-identical to the pre-#131 fold. A parallel
+    /// worker passes [`FoldOpts::worker`] (see there), and the adaptive
+    /// scheduler's leader passes a `cap` so a long range can be handed off
+    /// mid-flight ([`FoldStop::Stopped`]).
     pub fn fold_range_column(
         &self,
         table_id: u32,
         lo: Option<(&[u8], bool)>,
         hi: Option<(&[u8], bool)>,
         col: u16,
+        opts: FoldOpts,
         f: &mut dyn FnMut(&Value) -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<FoldStop> {
         let types = self
             .bundle
             .col_types
@@ -481,19 +582,53 @@ impl ReadTxn<'_> {
         let root = self.tree_root(table_id, 0)?;
         let mut c = btree::cursor(self, root, lo, hi)?;
         let mut steps = 0u32;
+        let mut pending = 0u32;
+        let mut rows = 0u64;
         let mut scratch = Vec::new();
+        let mut last_key: Vec<u8> = Vec::new();
+        let charge_batch = opts.charge_batch.max(1);
         loop {
-            let stepped = c.next_with(self, &mut scratch, |_k, v| {
-                self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
+            // The resume key is copied for the row that will REACH the cap and
+            // for no other: the copy is what §7 removed from this loop, and a
+            // capped fold must not put it back on every row.
+            let want_key = opts.cap.is_some_and(|c| rows + 1 >= c);
+            let stepped = c.next_with(self, &mut scratch, |k, v| {
+                if want_key {
+                    last_key.clear();
+                    last_key.extend_from_slice(k);
+                }
+                if charge_batch == 1 {
+                    self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
+                }
                 let val = row::decode_column(v, types, col as usize)?;
                 f(&val)
             })?;
             if stepped.is_none() {
-                return Ok(());
+                if pending > 0 {
+                    self.work
+                        .charge_many(pending as u64, || scan_label(&self.bundle.schema, table_id))?;
+                }
+                return Ok(FoldStop::Exhausted);
+            }
+            rows += 1;
+            if charge_batch > 1 {
+                pending += 1;
+                if pending == charge_batch {
+                    self.work
+                        .charge_many(pending as u64, || scan_label(&self.bundle.schema, table_id))?;
+                    pending = 0;
+                }
             }
             steps += 1;
             if steps.is_multiple_of(256) && !self.still_pinned() {
                 return Err(Error::SnapshotEvicted);
+            }
+            if opts.cap.is_some_and(|c| rows >= c) {
+                if pending > 0 {
+                    self.work
+                        .charge_many(pending as u64, || scan_label(&self.bundle.schema, table_id))?;
+                }
+                return Ok(FoldStop::Stopped(std::mem::take(&mut last_key)));
             }
         }
     }
@@ -666,9 +801,45 @@ pub struct RowCursor<'t, 'e> {
     /// Reused assembly buffer for overflow/extent values — the inline common
     /// case borrows straight from the page and never touches it.
     scratch: Vec<u8>,
+    /// #74 charges per meter update: `1` (the default) charges every row
+    /// before its decode — the serial contract. A PARALLEL worker sets a
+    /// batch ([`batch_charges`](RowCursor::batch_charges)).
+    charge_batch: u32,
+    /// Rows folded since the last meter update (`charge_batch > 1` only).
+    pending: u32,
 }
 
 impl RowCursor<'_, '_> {
+    /// Charge the #74 meter every `n` rows instead of every row, and hand the
+    /// caller responsibility for [`flush_charges`](RowCursor::flush_charges).
+    ///
+    /// **Legal only inside a parallel fold worker.** Batching lets up to
+    /// `n - 1` rows be yielded past the point the serial loop would have
+    /// refused, so it may only be used where an error abandons the whole
+    /// attempt to a serial re-run that owns the authentic outcome. Its reason
+    /// to exist is measured: the workers of one statement share ONE atomic
+    /// meter cell, and a per-row read-modify-write on it made an 11-core fold
+    /// 1.4× SLOWER than serial (`examples/agg_prof.rs`, `sql:cntw` and its
+    /// two siblings all plateauing at exactly the same ns/row — the signature
+    /// of a fully serialized cache line). The total charged is unchanged.
+    pub fn batch_charges(&mut self, n: u32) {
+        self.charge_batch = n.max(1);
+    }
+
+    /// Charge the rows folded since the last meter update. Must be called
+    /// before dropping a cursor that [`batch_charges`](RowCursor::batch_charges)
+    /// was set on — including on the early exit of a capped scan — or those
+    /// rows go uncharged.
+    pub fn flush_charges(&mut self) -> Result<()> {
+        if self.pending == 0 {
+            return Ok(());
+        }
+        let n = std::mem::take(&mut self.pending) as u64;
+        let txn = self.txn;
+        let table_id = self.table_id;
+        txn.work
+            .charge_many(n, || scan_label(&txn.bundle.schema, table_id))
+    }
     // fallible + streaming, so deliberately not std::iter::Iterator
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Vec<Value>>> {
@@ -703,17 +874,30 @@ impl RowCursor<'_, '_> {
         let txn = self.txn;
         let table_id = self.table_id;
         let types = &txn.bundle.col_types[table_id as usize];
+        let per_row = self.charge_batch <= 1;
         // #74: one work-row per row this scan yields, charged once the cursor
         // has produced a row (an empty/exhausted scan costs nothing) and
         // BEFORE the decode, the order the two-step form always had.
-        self.cursor.next_with(txn, &mut self.scratch, |k, v| {
-            txn.charge_work(1, || scan_label(&txn.bundle.schema, table_id))?;
+        let mut yielded = false;
+        let row = self.cursor.next_with(txn, &mut self.scratch, |k, v| {
+            if per_row {
+                txn.charge_work(1, || scan_label(&txn.bundle.schema, table_id))?;
+            } else {
+                yielded = true;
+            }
             if let Some(out) = key_out {
                 out.clear();
                 out.extend_from_slice(k);
             }
             row::decode_row_masked(v, types, keep)
-        })
+        })?;
+        if yielded {
+            self.pending += 1;
+            if self.pending >= self.charge_batch {
+                self.flush_charges()?;
+            }
+        }
+        Ok(row)
     }
 }
 

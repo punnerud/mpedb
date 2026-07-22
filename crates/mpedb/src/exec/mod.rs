@@ -4,7 +4,7 @@
 
 use crate::trigger::{CompiledTrigger, TriggerSet};
 use crate::ExecResult;
-use mpedb_core::{ReadTxn, WriteTxn};
+use mpedb_core::{FoldOpts, FoldStop, ReadTxn, WriteTxn};
 use mpedb_sql::{
     AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, Join, JoinKind,
     CompoundPlan, GroupKey, OrderOver, PlanOnConflict, PlanStmt, Projection, RowMap, RowSide,
@@ -49,10 +49,15 @@ pub fn take_last_insert_rowid() -> Option<i64> {
 mod aggregate;
 mod fts;
 mod gather;
+mod parallel;
 mod recursive;
 mod window;
 
 pub(crate) use gather::{range_bounds, resolve_part, RawBound};
+/// See [`crate::parallel_folds_engaged`].
+pub(crate) fn parallel_folds_engaged() -> u64 {
+    parallel::ENGAGED.load(std::sync::atomic::Ordering::Relaxed)
+}
 use aggregate::exec_aggregate;
 use gather::{cmp_rows, gather_joined, gather_rows, gather_topk, sort_rows};
 
@@ -131,6 +136,15 @@ pub(crate) trait TxnCtx {
     /// connection-local, so every other context refuses it by name rather than
     /// sorting under a collation it does not have.
     fn host_colls(&self) -> Option<&dyn HostColls> {
+        None
+    }
+    /// The pinned snapshot under this context, when this context IS a plain
+    /// snapshot read — the parallel fold's precondition (`exec/parallel.rs`).
+    /// Its workers share the returned transaction's pin, meter and page
+    /// access, so only a context that is nothing BUT a `ReadTxn` may answer.
+    /// Everything else (write contexts, overlay and streaming reads, the
+    /// sqlite-backed contexts) keeps the `None` default and folds serially.
+    fn snapshot_txn(&self) -> Option<&ReadTxn<'_>> {
         None
     }
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>>;
@@ -417,10 +431,11 @@ pub(crate) trait TxnCtx {
         lo: Option<(&[u8], bool)>,
         hi: Option<(&[u8], bool)>,
         col: u16,
+        opts: FoldOpts,
         f: &mut dyn FnMut(&Value) -> Result<()>,
-    ) -> Result<bool> {
-        let _ = (table, lo, hi, col, f);
-        Ok(false)
+    ) -> Result<Option<FoldStop>> {
+        let _ = (table, lo, hi, col, opts, f);
+        Ok(None)
     }
 }
 
@@ -612,6 +627,20 @@ impl TxnCtx for WriteCtx<'_, '_> {
 /// resume bound of the next batch.
 pub(crate) type PrunedBatch = (Vec<Vec<Value>>, Option<Vec<u8>>);
 
+/// How a [`ReadCtx`]'s scans charge the #74 work meter.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChargeMode {
+    /// One work-row per row, charged before its decode — the serial contract,
+    /// and every context's answer but a parallel fold worker's.
+    PerRow,
+    /// In batches — see [`mpedb_core::RowCursor::batch_charges`]. The workers
+    /// of one statement share ONE atomic meter cell, and a per-row
+    /// read-modify-write on it measured 1.4× SLOWER than serial on 11 cores.
+    /// Sound only because a worker's every error abandons the attempt to a
+    /// serial re-run that owns the authentic refusal.
+    Batched,
+}
+
 /// Adapter over a pinned read snapshot.
 pub(crate) struct ReadCtx<'t, 'e>(
     pub &'t ReadTxn<'e>,
@@ -626,9 +655,15 @@ pub(crate) struct ReadCtx<'t, 'e>(
     /// Host-registered COLLATING SEQUENCES in scope for this read (stage 3),
     /// gated by the same `contains_host_call` test as the two above.
     pub Option<&'t dyn HostColls>,
+    /// #74 charging discipline — [`ChargeMode::PerRow`] everywhere but inside
+    /// a parallel fold worker.
+    pub ChargeMode,
 );
 
 impl TxnCtx for ReadCtx<'_, '_> {
+    fn snapshot_txn(&self) -> Option<&ReadTxn<'_>> {
+        Some(self.0)
+    }
     fn host_fns(&self) -> Option<&dyn HostFns> {
         self.1
     }
@@ -738,6 +773,9 @@ impl TxnCtx for ReadCtx<'_, '_> {
         // reused buffer — when the loop breaks at the cap this holds the last
         // KEPT row's key, which is the batch's resume bound.
         let mut key_buf = Vec::new();
+        if self.4 == ChargeMode::Batched {
+            cursor.batch_charges(64);
+        }
         while let Some(row) = cursor.next_masked(keep, Some(&mut key_buf))? {
             let ok = match filter {
                 Some((f, params)) => f.eval_filter_host(&mut stack, &row, params, host)?,
@@ -746,10 +784,14 @@ impl TxnCtx for ReadCtx<'_, '_> {
             if ok {
                 kept.push(row);
                 if kept.len() >= cap {
+                    // A batching cursor is abandoned here, mid-range: its
+                    // unflushed rows must reach the meter before it dies.
+                    cursor.flush_charges()?;
                     return Ok((kept, Some(std::mem::take(&mut key_buf))));
                 }
             }
         }
+        cursor.flush_charges()?;
         // Exhausted short of the cap: no resume needed, and none is claimed.
         Ok((kept, None))
     }
@@ -791,10 +833,10 @@ impl TxnCtx for ReadCtx<'_, '_> {
         lo: Option<(&[u8], bool)>,
         hi: Option<(&[u8], bool)>,
         col: u16,
+        opts: FoldOpts,
         f: &mut dyn FnMut(&Value) -> Result<()>,
-    ) -> Result<bool> {
-        self.0.fold_range_column(table, lo, hi, col, f)?;
-        Ok(true)
+    ) -> Result<Option<FoldStop>> {
+        self.0.fold_range_column(table, lo, hi, col, opts, f).map(Some)
     }
     fn scan_rows_topk(
         &mut self,
@@ -1987,6 +2029,13 @@ fn run_aggregate(
     // this, and the streaming fold (#123) pushes it into the SCAN so an
     // unobserved column is never even decoded (`gather::scan_keep`).
     let prune = select_prune(schema, plan, sp, correlated)?;
+    // The parallel fold's shape gate — decided HERE, where the whole
+    // SelectPlan is in hand, by the same predicate EXPLAIN prints. The
+    // correlated machinery must also be absent: a correlated aggregate's
+    // per-row scratch is exactly what the workers do not carry.
+    let parallel_shape = correlated.is_empty()
+        && post_filter.is_none()
+        && mpedb_sql::parallel_fold_shape(sp, schema);
     exec_aggregate(
         ctx,
         plan,
@@ -2010,6 +2059,7 @@ fn run_aggregate(
         correlated,
         post_filter,
         prune.as_ref(),
+        parallel_shape,
     )
 }
 
