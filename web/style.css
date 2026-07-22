@@ -146,7 +146,16 @@ header.top .meta { color: var(--fg-faint); font-size: 12px; font-family: var(--m
 /* ---------- layout ---------- */
 
 .grid { display: grid; grid-template-columns: 268px minmax(0, 1fr); gap: 22px; }
-@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+@media (max-width: 900px) {
+  .grid { grid-template-columns: 1fr; }
+  /* Stacked, the aside comes first in DOM order and pushed the editor below the
+     fold — the visitor met a list of examples before the thing they run. Put the
+     editor and results first; the catalogue reads fine underneath. */
+  .grid > main { order: -1; }
+  /* Not sticky when stacked: a sticky element in a single column just eats
+     viewport as you scroll past it. */
+  .examples { position: static; max-height: none; }
+}
 
 .panel {
   background: var(--bg-panel);

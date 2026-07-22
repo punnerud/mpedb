@@ -335,7 +335,9 @@ function buildExamples() {
       b.setAttribute("aria-current", "true");
       activeTab = "rows";
       runCurrent();
-      // On narrow screens the editor is below the list; bring it into view.
+      // On narrow screens the editor sits ABOVE the list (see the <=900px
+      // media query), so a click down in the catalogue needs to bring the
+      // editor and its results back into view.
       if (window.matchMedia("(max-width: 900px)").matches) {
         $("sql").scrollIntoView({ behavior: "smooth", block: "start" });
       }
