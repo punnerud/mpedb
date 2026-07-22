@@ -94,7 +94,7 @@ beats scanning, and descending beats skipping.
 simply tighter. It is still 219× off DuckDB, which is what vectorised
 aggregation buys.
 
-### Loss 1: `count(*)` counts the wrong tree — 17× slower than SQLite
+### Loss 1: `count(*)` counts the widest tree — 17× slower than SQLite
 
 The plans, verbatim:
 
@@ -112,15 +112,32 @@ reading a cell count out of the header of about 8,000 leaf pages. mpedb counts
 the **PK tree**, whose entries are whole seven-column rows — perhaps 50 to a
 leaf, so around 40,000 pages for the same answer.
 
-mpedb has the machinery: `agg_index_choice` exists precisely to pick the
-fewest-column index that serves the aggregate set, and `count_index_entries`
-counts leaves wholesale without reading a key. For `count(*)` **every** index
-serves. The plan above shows it did not engage, and the cheapest-first ordering
-in `try_agg_index` is the suspect: the PK-range wholesale count wins before the
-narrowest-tree choice is considered. Choosing the widest available tree is
-exactly backwards for a count.
+**But mpedb cannot simply copy that, and the reason is a correctness rule, not
+an oversight.** mpedb follows the SQL membership rule: a row with a NULL in any
+indexed column has *no index entry* (`engine/mod.rs:426`). So an index's entry
+count is **not** the table's row count in general — it is the count of rows with
+no NULL in that index's columns. SQLite stores NULLs in its indexes, so for it
+the two are always equal and the shortcut is unconditional. For mpedb it is
+available only when every column of the index is declared `NOT NULL`.
 
-This is a fix, not a redesign.
+The code today does not take it at all: `try_agg_index` explicitly declines
+every all-`count(*)` query (`aggregate.rs:989`, *"try_count_only's leaf-wholesale
+territory"*) and hands it to `try_count_only`, which counts the **PK range**.
+That is leaf-wholesale, and correct, and over the widest tree in the table.
+
+So the fix is narrower than "pick the narrowest index" and has a guard:
+
+> when every aggregate is a bare `count(*)` over an unfiltered scan, and some
+> secondary index has **all** its columns `NOT NULL`, count the narrowest such
+> index instead of the PK tree.
+
+The benchmark's own schema does not declare any column `NOT NULL`, so on this
+dataset today's behaviour is the only *correct* one available — part of this
+17× is the schema, not the engine. A real star schema declares its keys NOT
+NULL, and the re-measure after the fix has to declare them to mean anything.
+Recorded that way rather than as a clean defect, because a "fast" count that
+silently skipped NULL-bearing rows would be the exact failure this benchmark
+exists to catch.
 
 ### Loss 2: the star schema defeats worst-case costing — 7.6–12× slower than SQLite
 
