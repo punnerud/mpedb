@@ -8,6 +8,9 @@ use mpedb::{Database, ExecResult, Value};
 use mpedb_sql::AccessPath;
 use mpedb_types::Config;
 
+#[path = "sqlite_oracle/mod.rs"]
+mod sqlite_oracle;
+
 /// `/dev/shm` when present (fast tmpfs, mpedb's habitat), else the platform
 /// temp dir — keeps the scratch path portable to macOS, where `/dev/shm` does
 /// not exist (#66).
@@ -284,4 +287,113 @@ primary_key = ["id"]
             vec![Value::Int(1), Value::Int(4)],
         ]
     );
+}
+
+// ------------------------------------- prefix probes and the NULL suffix --
+
+/// A COMPOSITE index probed by a PREFIX loses every row whose uncovered
+/// index columns are NULL — those rows have no entry at all (membership is
+/// "no indexed column of this row is NULL"). Measured wrong answer before the
+/// fix: `INDEX (a, b)` with `WHERE a = 5` answered `{1}` where sqlite 3.45
+/// answers `{1, 2}`.
+///
+/// The rule the planner now takes — a prefix of length `k` is probeable only
+/// when `columns[k..]` are all NOT NULL — is the one
+/// `plan::agg_servable_by_index` had all along; the access paths simply never
+/// got it. Differentialled against the BUNDLED sqlite, which indexes NULLs and
+/// therefore never had the problem.
+#[test]
+fn a_prefix_probe_never_hides_rows_with_a_null_in_the_uncovered_suffix() {
+    let path = scratch_path(format!(
+        "mpedb-composite-nullsuffix-{}.mpedb",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&path);
+    let db = Database::open_with_config(
+        Config::from_toml_str(&format!(
+            "[database]\npath = \"{path}\"\nsize_mb = 8\n\
+             [[table]]\nname = \"seed\"\nprimary_key = [\"id\"]\n  \
+             [[table.column]]\n  name = \"id\"\n  type = \"int64\""
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // `b` nullable, `c` NOT NULL — one index of each shape over the same data.
+    const DDL: &[&str] = &[
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, a INT, b INT, c INT NOT NULL)",
+        "CREATE INDEX ix_ab ON t (a, b)",
+        "CREATE INDEX ix_ac ON t (a, c)",
+    ];
+    const DATA: &str =
+        "INSERT INTO t (id, a, b, c) VALUES (1,5,1,1),(2,5,NULL,2),(3,6,2,3),(4,NULL,9,4)";
+    for d in DDL {
+        db.query(d, &[]).unwrap();
+    }
+    db.query(DATA, &[]).unwrap();
+
+    let want = |sql: &str| -> Vec<String> {
+        let mut script = String::new();
+        for d in DDL {
+            script.push_str(d);
+            script.push(';');
+        }
+        script.push_str(DATA);
+        script.push(';');
+        script.push_str(sql);
+        script.push(';');
+        sqlite_oracle::script_stdout(&script, "")
+            .lines()
+            .map(|l| l.trim_end().to_string())
+            .collect()
+    };
+    let got = |sql: &str| -> Vec<String> {
+        rows(db.query(sql, &[]).unwrap())
+            .iter()
+            .map(|r| {
+                r.iter()
+                    .map(|v| match v {
+                        Value::Null => String::new(),
+                        Value::Int(i) => i.to_string(),
+                        other => format!("{other:?}"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("|")
+            })
+            .collect()
+    };
+    let plan = |sql: &str| -> String {
+        match db.query(&format!("EXPLAIN {sql}"), &[]).unwrap() {
+            ExecResult::Explain(t) => t,
+            other => panic!("{other:?}"),
+        }
+    };
+
+    // The two shapes a prefix probe takes, and the join probe.
+    for sql in [
+        "SELECT id FROM t WHERE a = 5 ORDER BY id",
+        "SELECT id FROM t WHERE a > 4 ORDER BY id",
+        "SELECT count(*) FROM t WHERE a = 5",
+    ] {
+        assert_eq!(got(sql), want(sql), "answer differs from sqlite for `{sql}`");
+    }
+
+    // `ix_ac`'s suffix is NOT NULL, so the prefix probe stays available — the
+    // fix narrows exactly the lossy case and nothing else. (`ix_ab` is index 1
+    // and is skipped; `ix_ac` is index 2.)
+    let p = plan("SELECT id FROM t WHERE a = 5 ORDER BY id");
+    assert!(
+        p.contains("via index 2"),
+        "the NOT NULL-suffix composite must still be probeable:\n{p}"
+    );
+
+    // Full-width coverage of the NULLABLE composite is always sound: the
+    // pinning equality itself proves every indexed column non-NULL.
+    let sql = "SELECT id FROM t WHERE a = 5 AND b = 1";
+    let p = plan(sql);
+    assert!(p.contains("via index 1"), "full width must use ix_ab:\n{p}");
+    assert_eq!(got(sql), want(sql));
+
+    db.verify().unwrap();
+    let _ = std::fs::remove_file(&path);
 }

@@ -53,6 +53,30 @@ pub(super) fn extract_access(
     // which node the binder happened to choose.
     let typeless = |col: u16| table.columns[col as usize].ty == ColumnType::Any;
 
+    // Index MEMBERSHIP is "no indexed column of this row is NULL" (one rule,
+    // `engine::index_row_key`). For a SINGLE-column index that is free: a
+    // conjunct that pins the column (`a = 5`, `a > 5`) is 3VL-NULL on a NULL
+    // `a`, so no row the probe should have returned is missing.
+    //
+    // A COMPOSITE index covered only to a PREFIX is a different claim, and the
+    // one this guard exists for: `INDEX (a, b)` probed by `a = 5` returns the
+    // entries with `a = 5` — which excludes every row whose `b` is NULL, and
+    // those rows DO satisfy `a = 5`. Measured against sqlite 3.45: mpedb
+    // answered `{1}` where sqlite answers `{1, 2}`. Fewer rows than exist.
+    //
+    // So a prefix of length `k` may be probed only when every column from `k`
+    // on is declared NOT NULL — then membership IS "the pinned columns are
+    // non-NULL", which the pinning conjuncts already guarantee. Full-width
+    // coverage is the `k == columns.len()` case and always passes. This is the
+    // same rule `plan::agg_servable_by_index` states for the aggregate-over-
+    // index path ("…and the trailing columns NOT NULL"); the access paths were
+    // simply never given it.
+    let suffix_not_null = |ix: &mpedb_types::IndexDef, k: usize| -> bool {
+        ix.columns[k.min(ix.columns.len())..]
+            .iter()
+            .all(|&c| !table.columns[c as usize].nullable)
+    };
+
     // 1. Every PK column pinned by equality -> PkPoint.
     let pins: Vec<Option<(usize, BinOp, Atom)>> = table
         .primary_key
@@ -104,7 +128,9 @@ pub(super) fn extract_access(
                 break;
             }
             let pins = cover(ix);
-            if pins.is_empty() {
+            // An UNCOVERED nullable column past the pinned prefix makes the
+            // probe lossy — see `suffix_not_null`.
+            if pins.is_empty() || !suffix_not_null(ix, pins.len()) {
                 continue;
             }
             // Partial index: usable only if the query predicate ENTAILS the
@@ -207,10 +233,13 @@ pub(super) fn extract_access(
         }
         // Phase-1 rule (same as PkRange): range over the FIRST index column
         // only — its encoding is a key prefix, so this serves composite
-        // indexes unchanged.
+        // indexes unchanged. That makes the bound a coverage of exactly ONE
+        // column, so the same NOT-NULL suffix rule the point probe takes
+        // applies with k = 1 (`suffix_not_null` above): a nullable second
+        // column would put rows the range covers outside the tree.
         let col = ix.columns[0];
-        if unbounded(col) {
-            continue; // collated or typeless: never a raw range bound (above)
+        if unbounded(col) || !suffix_not_null(ix, 1) {
+            continue; // collated / typeless / lossy composite: residual filter
         }
         let mut lo = None;
         let mut hi = None;

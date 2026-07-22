@@ -1040,7 +1040,18 @@ fn extract_join_access(
                     None => break,
                 }
             }
-            if parts.is_empty() {
+            // A prefix probe of a COMPOSITE index skips every row whose
+            // uncovered index columns are NULL, because those rows have no
+            // entry at all (membership = "no indexed column is NULL"). Sound
+            // only when the uncovered suffix is declared NOT NULL — the same
+            // rule `extract_access` and `plan::agg_servable_by_index` take,
+            // and the same measured wrong answer (`INDEX (a, b)` probed by
+            // `a = o.k` lost every row with a NULL `b`).
+            if parts.is_empty()
+                || !ix.columns[parts.len()..]
+                    .iter()
+                    .all(|&c| !inner.columns[c as usize].nullable)
+            {
                 continue;
             }
             let full_unique = ix.unique && parts.len() == ix.columns.len();
