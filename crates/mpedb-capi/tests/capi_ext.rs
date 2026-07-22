@@ -1992,3 +1992,69 @@ fn a_trigger_can_be_created_and_fires() {
     }
 }
 
+
+/// Read-your-own-writes at the METADATA level: every introspection surface sees
+/// a table the previous statement committed, with nothing in between — on the
+/// connection that created it AND on a sibling connection to the same file.
+///
+/// `Database::schema()` hands back this process's cached bundle, which a DDL
+/// commit does not touch; only `schema_gen` in the flipping meta moves. Every
+/// surface here therefore has to consult it. The SQL paths do that through the
+/// facade's own `gate_cache_on_schema`; `sqlite_master`/`PRAGMA` do it in
+/// `exec_one_inner`; `sqlite3_blob_open` bypasses SQL entirely and used to
+/// answer `no such table` for a table that demonstrably existed, until some
+/// other statement on the handle happened to reload the bundle.
+#[test]
+fn introspection_sees_what_the_previous_statement_committed() {
+    unsafe {
+        // Same connection, no intervening statement.
+        let db = open_memory();
+        assert_eq!(exec(db, "BEGIN"), SQLITE_OK);
+        assert_eq!(exec(db, "CREATE TABLE fresh (a INTEGER, s TEXT)"), SQLITE_OK, "{}", errmsg(db));
+        assert_eq!(exec(db, "COMMIT"), SQLITE_OK, "{}", errmsg(db));
+        assert_eq!(
+            collect_text_col(db, "SELECT name FROM sqlite_master WHERE type='table'"),
+            ["fresh"]
+        );
+        assert_eq!(collect_text_col(db, "PRAGMA table_info(fresh)"), ["0", "1"]);
+        assert_eq!(sqlite3_close(db), SQLITE_OK);
+
+        // Two connections on one file: B has never seen the table.
+        let path = format!("{}/mpedb-capi-fresh-{}.db", scratch_dir(), std::process::id());
+        let _ = std::fs::remove_file(&path);
+        let mut a: *mut Sqlite3 = ptr::null_mut();
+        let mut b: *mut Sqlite3 = ptr::null_mut();
+        let p = cs(&path);
+        assert_eq!(sqlite3_open(p.as_ptr(), &mut a), SQLITE_OK);
+        assert_eq!(sqlite3_open(p.as_ptr(), &mut b), SQLITE_OK);
+        assert_eq!(exec(a, "CREATE TABLE seed (x INTEGER)"), SQLITE_OK, "{}", errmsg(a));
+        // B's FIRST look already sees it.
+        assert_eq!(collect_text_col(b, "SELECT name FROM sqlite_master"), ["seed"]);
+
+        // Incremental blob I/O on a table+row B has never touched.
+        assert_eq!(
+            exec(a, "CREATE TABLE bl (id INTEGER PRIMARY KEY, d BLOB)"),
+            SQLITE_OK,
+            "{}",
+            errmsg(a)
+        );
+        assert_eq!(exec(a, "INSERT INTO bl VALUES (1, x'0011223344')"), SQLITE_OK, "{}", errmsg(a));
+        let mut blob: *mut c_void = ptr::null_mut();
+        let (m, t, col) = (cs("main"), cs("bl"), cs("d"));
+        assert_eq!(
+            sqlite3_blob_open(b, m.as_ptr(), t.as_ptr(), col.as_ptr(), 1, 0, &mut blob),
+            SQLITE_OK,
+            "blob_open on a sibling connection: {}",
+            errmsg(b)
+        );
+        assert_eq!(sqlite3_blob_bytes(blob), 5);
+        let (rc, bytes) = blob_read_vec(blob, 5, 0);
+        assert_eq!(rc, SQLITE_OK);
+        assert_eq!(bytes, vec![0x00, 0x11, 0x22, 0x33, 0x44]);
+        assert_eq!(sqlite3_blob_close(blob), SQLITE_OK);
+
+        assert_eq!(sqlite3_close(a), SQLITE_OK);
+        assert_eq!(sqlite3_close(b), SQLITE_OK);
+        let _ = std::fs::remove_file(&path);
+    }
+}

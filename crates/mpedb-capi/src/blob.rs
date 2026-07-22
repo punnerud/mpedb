@@ -199,6 +199,15 @@ fn blob_open_impl(
         }
         return Err((SQLITE_ERROR, format!("no such table: {dbname}.{table_arg}")));
     }
+    // Read-your-own-writes at the METADATA level: `Database::schema()` hands
+    // back this process's cached bundle, which a `CREATE TABLE` committed by
+    // another connection (or another process) does not touch — only the meta's
+    // `schema_gen` moves. Without this refresh, `sqlite3_blob_open` answered
+    // `no such table` for a table that demonstrably exists, and kept answering
+    // it until some *other* statement on this handle happened to compile and
+    // reload the bundle. Every SQL path already refreshes (the facade's
+    // `gate_cache_on_schema`); blob I/O bypasses SQL, so it must do it itself.
+    let _ = c.db.refresh_schema_if_stale();
     let bundle = c.db.schema();
     let Some(tid) = resolve(
         bundle
@@ -433,6 +442,10 @@ fn blob_write_impl(
         Addr::AliasPk(pk) => sql.push_str(&format!("{} = $2", quote_ident(pk))),
         Addr::HiddenRowid(sp) => sql.push_str(&format!("{sp} = $2")),
     }
+    // Same refresh as `blob_open_impl`: this is the handle's EXPIRY detector
+    // (a column count that no longer matches the snapshot means DDL moved the
+    // table), and a detector reading a stale bundle cannot detect anything.
+    let _ = c.db.refresh_schema_if_stale();
     let bundle = c.db.schema();
     let names: Vec<String> = bundle
         .table(bundle.table_id(&b.table).unwrap_or(u32::MAX))
