@@ -28,6 +28,20 @@ use std::sync::atomic::{AtomicU64, Ordering};
 #[path = "sqlite_oracle/mod.rs"]
 mod sqlite_oracle;
 
+
+/// Scratch directory for a throwaway test database: tmpfs where it exists
+/// (Linux `/dev/shm` — the whole suite's convention, and much faster), the
+/// platform temp dir otherwise. macOS has no `/dev/shm`, and hardcoding it
+/// failed the entire file there with `Io(NotFound)` the first time CI ran on
+/// macOS.
+fn scratch_dir() -> String {
+    if std::path::Path::new("/dev/shm").is_dir() {
+        "/dev/shm".to_string()
+    } else {
+        std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_string()
+    }
+}
+
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 fn open_db(path: &str) -> Database {
@@ -62,7 +76,8 @@ fn render(v: Value) -> String {
 /// Run `setup` + `queries` on BOTH engines and require identical output.
 fn diff(setup: &[&str], queries: &[&str]) {
     let path = format!(
-        "/dev/shm/mpedb-agg-coll-{}-{}.mpedb",
+        "{}/mpedb-agg-coll-{}-{}.mpedb",
+        scratch_dir(),
         std::process::id(),
         UNIQ.fetch_add(1, Ordering::Relaxed)
     );

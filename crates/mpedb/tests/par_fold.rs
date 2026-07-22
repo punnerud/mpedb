@@ -24,6 +24,20 @@ use std::sync::Once;
 #[path = "sqlite_oracle/mod.rs"]
 mod sqlite_oracle;
 
+
+/// Scratch directory for a throwaway test database: tmpfs where it exists
+/// (Linux `/dev/shm` — the whole suite's convention, and much faster), the
+/// platform temp dir otherwise. macOS has no `/dev/shm`, and hardcoding it
+/// failed the entire file there with `Io(NotFound)` the first time CI ran on
+/// macOS.
+fn scratch_dir() -> String {
+    if std::path::Path::new("/dev/shm").is_dir() {
+        "/dev/shm".to_string()
+    } else {
+        std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_string()
+    }
+}
+
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 static ENV: Once = Once::new();
 
@@ -94,7 +108,8 @@ fn open(path: &str, threads: u32, extra_runtime: &str) -> Database {
 
 fn tmp(tag: &str) -> String {
     format!(
-        "/dev/shm/mpedb-{tag}-{}-{}.mpedb",
+        "{}/mpedb-{tag}-{}-{}.mpedb",
+        scratch_dir(),
         std::process::id(),
         UNIQ.fetch_add(1, Ordering::Relaxed)
     )
