@@ -114,7 +114,7 @@ mod debug_tests;
 #[cfg(test)]
 mod tests;
 
-pub use read::{ReadTxn, RowCursor};
+pub use read::{FoldOpts, FoldStop, ReadTxn, RowCursor};
 pub use write::{TxnSavepoint, TxnSavepointFull, WriteTxn};
 use write::DirtySet;
 
@@ -236,6 +236,22 @@ impl WorkMeter {
     /// Work-rows charged so far this execution.
     pub fn used(&self) -> u64 {
         self.used.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Rewind the counter to a checkpoint taken with [`used`](Self::used) —
+    /// **parallel-fold fallback plumbing only**
+    /// (design/DESIGN-PARALLEL-READ.md §8). When the adaptive fold abandons
+    /// mid-flight and the statement re-runs serially, the serial run must
+    /// charge from the point the statement had reached BEFORE the attempt, or
+    /// the retry would double-charge the same rows and trip a budget the
+    /// serial statement honors. Never a way to un-spend work the statement
+    /// keeps: the abandoned attempt's rows are re-read and re-charged by the
+    /// serial re-run, so the trip point stays the serial contract's.
+    ///
+    /// Called only after every worker has been joined, so the store races
+    /// nothing.
+    pub fn rewind(&self, to: u64) {
+        self.used.store(to, AtomicOrdering::Relaxed);
     }
 
     /// The configured budget (`0` = unlimited).
@@ -585,6 +601,10 @@ pub struct Engine {
     /// executor's nested-loop join reads it via the txn and bounds the
     /// `Value` cells its intermediate product holds. `0` = unlimited.
     join_cells_budget: u64,
+    /// Worker-thread ceiling for the adaptive parallel aggregate fold
+    /// (`[runtime] max_query_threads`): `0` = auto (`min(cores, 8)`), `1` =
+    /// serial. See design/DESIGN-PARALLEL-READ.md §8.
+    query_threads: u32,
     /// Installed by the facade; recompiles CHECK programs whenever a bundle is
     /// (re)built from the catalog. `None` until then — and forever for the
     /// core's own tests, which declare no CHECKs.
@@ -637,6 +657,7 @@ impl Engine {
             extent_threshold: None,
             work_budget: config.options.max_work_rows,
             join_cells_budget: config.options.max_join_cells,
+            query_threads: config.options.max_query_threads,
             check_compiler: std::sync::RwLock::new(None),
         };
         engine.bootstrap_catalog()?;
@@ -836,6 +857,7 @@ impl Engine {
             // verify pass legitimately scans whole tables).
             work_budget: 0,
             join_cells_budget: 0,
+            query_threads: 1, // tooling handle: always serial
             // Read-only tooling: no SQL layer to install a compiler, and no
             // writes for a CHECK to guard.
             check_compiler: std::sync::RwLock::new(None),
@@ -854,6 +876,20 @@ impl Engine {
     /// it per cell its intermediate product holds.
     pub fn join_cells_budget(&self) -> u64 {
         self.join_cells_budget
+    }
+
+    /// The parallel-fold worker ceiling this engine was opened with (`0` =
+    /// auto, `1` = serial) — raw, not yet resolved against the core count or
+    /// the concurrency budget; `exec/parallel.rs` resolves it per engagement.
+    pub fn max_query_threads(&self) -> u32 {
+        self.query_threads
+    }
+
+    /// How many reader slots on this file are occupied right now (this
+    /// process's own included) — the parallel fold's politeness signal, see
+    /// [`crate::shm::Shm::live_readers`].
+    pub fn live_readers(&self) -> u32 {
+        self.shm.live_readers()
     }
 
     /// The write-path concurrency discipline this engine was opened with

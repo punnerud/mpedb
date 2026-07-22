@@ -277,6 +277,75 @@ impl Accum {
         Ok(())
     }
 
+    /// Fold ANOTHER accumulation of the same aggregate into this one, where
+    /// `other` accumulated the values of a scan segment that comes STRICTLY
+    /// AFTER every value this one saw — the merge step of the adaptive
+    /// parallel fold (design/DESIGN-PARALLEL-READ.md §8). Only the
+    /// order-independent-by-proof aggregates merge:
+    ///
+    /// - **COUNT**: `n₁ + n₂` — addition is the fold, order never mattered.
+    /// - **MIN/MAX**: push `other`'s extremum through the SAME strict-beat
+    ///   rule a row takes ([`AggFn::min_max_prefers`]). Each side's extremum
+    ///   is the first-strict-beat witness of its own contiguous segment, so
+    ///   keeping this side on a tie keeps the first occurrence of the whole
+    ///   concatenation — the serial answer, spelling included. `other.acc ==
+    ///   None` (an empty or all-NULL segment) contributes nothing, exactly as
+    ///   its rows did. Sound only because the compared domain is totally
+    ///   ordered — the caller must not hand this mixed-class (`any`-typed)
+    ///   values whose classes [`Value::sort_cmp`] calls peers (Bool/Timestamp
+    ///   against another class): an incomparable pair breaks the first-beat
+    ///   associativity argument, which is why the parallel gate refuses `any`
+    ///   columns rather than reasoning about their contents.
+    ///
+    /// Everything else — SUM/AVG/TOTAL (running numeric state whose raise or
+    /// low bits are order-dependent; integer `sum` merges through the
+    /// executor's i128 prefix monoid instead), `group_concat` (order IS the
+    /// answer), any DISTINCT accumulation (the dedup sets span partitions) —
+    /// refuses: the parallel executor must never have produced them, so an
+    /// arrival here is a bug surfacing, not a case to handle.
+    pub fn merge_ordered(&mut self, other: Accum) -> Result<()> {
+        if self.func != other.func || self.seen.is_some() || other.seen.is_some() {
+            return Err(Error::Internal(
+                "merge_ordered: mismatched or DISTINCT accumulators".into(),
+            ));
+        }
+        match self.func {
+            AggFn::Count => {
+                self.n += other.n;
+                Ok(())
+            }
+            AggFn::Min | AggFn::Max => match other.acc {
+                Some(v) => self.push(Some(&v)),
+                None => Ok(()),
+            },
+            _ => Err(Error::Internal(format!(
+                "merge_ordered: {}() is order-dependent and never merges",
+                self.func.name()
+            ))),
+        }
+    }
+
+    /// This accumulation as an integer-`sum` PREFIX, for the parallel fold's
+    /// merge: `(values folded, running total)` when this is a non-DISTINCT
+    /// `sum` whose state is integer (or empty), `None` otherwise.
+    ///
+    /// The caller seeds its i128 prefix monoid with the pair. That is sound
+    /// because this accumulation COMPLETED: `Accum`'s `checked_add` raises the
+    /// moment a running total leaves i64 range, so a returned total is proof
+    /// that no prefix of these values ever escaped — and the only prefixes of
+    /// the whole scan that can still escape are the ones extending past this
+    /// segment, which the monoid computes from the total alone.
+    pub fn int_sum_prefix(&self) -> Option<(u64, i64)> {
+        if self.func != AggFn::Sum || self.seen.is_some() {
+            return None;
+        }
+        match &self.acc {
+            None => Some((self.n, 0)),
+            Some(Value::Int(i)) => Some((self.n, *i)),
+            Some(_) => None, // a float total: order-dependent, never parallel
+        }
+    }
+
     /// The group's result.
     pub fn finish(self) -> Value {
         match self.func {
@@ -401,6 +470,80 @@ mod tests {
         a.push(Some(&Value::Int(i64::MAX))).unwrap();
         let r = a.push(Some(&Value::Int(1)));
         assert!(matches!(r, Err(Error::ArithmeticOverflow)), "got {r:?}");
+    }
+
+    /// merge_ordered(A, B) over a contiguous split must equal the serial fold
+    /// of the concatenation — for EVERY split point, which is the whole claim
+    /// the parallel fold's merge stands on.
+    #[test]
+    fn merge_ordered_equals_serial_fold_at_every_split() {
+        let vals: Vec<Option<Value>> = vec![
+            Some(Value::Int(5)),
+            Some(Value::Null),
+            Some(Value::Int(-3)),
+            Some(Value::Int(5)),
+            None, // count(*) row
+            Some(Value::Int(9)),
+        ];
+        for f in [AggFn::Count, AggFn::Min, AggFn::Max] {
+            let serial = run(f, &vals);
+            for cut in 0..=vals.len() {
+                let mut a = Accum::new(f);
+                for v in &vals[..cut] {
+                    a.push(v.as_ref()).unwrap();
+                }
+                let mut b = Accum::new(f);
+                for v in &vals[cut..] {
+                    b.push(v.as_ref()).unwrap();
+                }
+                a.merge_ordered(b).unwrap();
+                assert_eq!(a.finish(), serial, "{f:?} split at {cut}");
+            }
+        }
+    }
+
+    /// The min/max TIE keeps the FIRST segment's witness — the serial
+    /// first-strict-beat rule. Collation makes ties visible: under NOCASE 'a'
+    /// and 'A' are equal, and the spelling that survives must be the earlier
+    /// segment's, whichever worker produced it.
+    #[test]
+    fn merge_ordered_min_tie_keeps_the_first_segments_spelling() {
+        let mut a = Accum::new_collated(AggFn::Min, crate::Collation::NoCase);
+        a.push(Some(&Value::Text("A".into()))).unwrap();
+        let mut b = Accum::new_collated(AggFn::Min, crate::Collation::NoCase);
+        b.push(Some(&Value::Text("a".into()))).unwrap();
+        a.merge_ordered(b).unwrap();
+        assert_eq!(a.finish(), Value::Text("A".into()));
+    }
+
+    /// Order-dependent accumulations refuse to merge — a SUM arriving here is
+    /// a parallel-executor bug surfacing, not a case.
+    #[test]
+    fn merge_ordered_refuses_sum_and_distinct() {
+        let mut a = Accum::new(AggFn::Sum);
+        assert!(a.merge_ordered(Accum::new(AggFn::Sum)).is_err());
+        let mut d = Accum::new_distinct(AggFn::Count);
+        assert!(d.merge_ordered(Accum::new_distinct(AggFn::Count)).is_err());
+        let mut c = Accum::new(AggFn::Count);
+        assert!(c.merge_ordered(Accum::new(AggFn::Max)).is_err(), "mismatched funcs");
+    }
+
+    /// The integer-sum prefix hand-off: a completed `sum` reports `(values,
+    /// total)`, a float one reports nothing (its merge is order-dependent),
+    /// and a DISTINCT or non-sum accumulator is not a prefix at all.
+    #[test]
+    fn int_sum_prefix_reports_only_completed_integer_sums() {
+        let mut a = Accum::new(AggFn::Sum);
+        assert_eq!(a.int_sum_prefix(), Some((0, 0)), "empty sum is the 0 prefix");
+        a.push(Some(&Value::Int(7))).unwrap();
+        a.push(Some(&Value::Null)).unwrap();
+        a.push(Some(&Value::Int(-2))).unwrap();
+        assert_eq!(a.int_sum_prefix(), Some((2, 5)));
+        let mut f = Accum::new(AggFn::Sum);
+        f.push(Some(&Value::Float(1.5))).unwrap();
+        assert_eq!(f.int_sum_prefix(), None);
+        assert_eq!(Accum::new(AggFn::Count).int_sum_prefix(), None);
+        assert_eq!(Accum::new_distinct(AggFn::Sum).int_sum_prefix(), None);
     }
 
     fn run_distinct(f: AggFn, vals: &[Option<Value>]) -> Value {

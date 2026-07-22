@@ -2209,6 +2209,29 @@ impl Shm {
         }
     }
 
+    /// How many reader slots are occupied right now — an INSTANTANEOUS,
+    /// advisory census of concurrent read transactions on this file, across
+    /// every attached process.
+    ///
+    /// Used as the parallel fold's politeness signal
+    /// (design/DESIGN-PARALLEL-READ.md §8: "a greedy query must not starve the
+    /// OTHER PROCESSES sharing the file"). Deliberately racy and deliberately
+    /// unsynchronized — it steers a scheduling choice, never an answer, and a
+    /// stale count can only mean one worker more or fewer. One pass of
+    /// `max_readers` relaxed loads, paid once per engagement, never per row.
+    pub fn live_readers(&self) -> u32 {
+        if self.is_private {
+            return self
+                .priv_pins
+                .iter()
+                .filter(|p| p.load(Ordering::Relaxed) != PRIV_PIN_FREE)
+                .count() as u32;
+        }
+        (0..self.max_readers)
+            .filter(|&idx| Self::unpack(self.slot_word(idx).load(Ordering::Relaxed)).0 != 0)
+            .count() as u32
+    }
+
     /// Free slots whose owning process is provably gone. Safe to run from any
     /// process at any time: every free is a generation-CAS of the exact word
     /// observed dead, so racing a re-claim is harmless.

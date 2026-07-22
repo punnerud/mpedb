@@ -38,7 +38,7 @@
 //! RLS policies on any involved member, ATTACHing a missing file, and
 //! bound-parameter ATTACH paths are refused BY NAME.
 
-use crate::exec::{exec_stmt, ReadCtx, TxnCtx};
+use crate::exec::{exec_stmt, ChargeMode, ReadCtx, TxnCtx};
 use crate::{Database, ExecResult, Session, POISON};
 use mpedb_core::ReadTxn;
 use mpedb_sql::{
@@ -567,9 +567,9 @@ impl Database {
         let mut partial = false;
         let res = {
             let mut ctxs: Vec<ReadCtx<'_, '_>> = Vec::with_capacity(1 + member_txns.len());
-            ctxs.push(ReadCtx(&main_txn, host, host_aggs, host_colls));
+            ctxs.push(ReadCtx(&main_txn, host, host_aggs, host_colls, ChargeMode::PerRow));
             for t in &member_txns {
-                ctxs.push(ReadCtx(t, None, None, None));
+                ctxs.push(ReadCtx(t, None, None, None, ChargeMode::PerRow));
             }
             let mut multi = MultiCtx {
                 ctxs,

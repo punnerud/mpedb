@@ -33,7 +33,7 @@ use mpedb_sqlitefmt::lock::{hot_journal, BracketOutcome, ReadBracket, SharedLock
 use mpedb_sqlitefmt::stamp::{settle_and_read, BaseStamp};
 use mpedb_types::{ColumnType, Config, Error, Result, Schema, Value};
 
-use crate::exec::{exec_stmt, ReadCtx, TxnCtx};
+use crate::exec::{exec_stmt, ChargeMode, ReadCtx, TxnCtx};
 use crate::sqlite_attach::SqliteAttach;
 use crate::{Database, ExecResult};
 
@@ -600,7 +600,7 @@ impl SqliteOverlay {
         if plan.footprint.read_only {
             let r = self.db.engine.begin_read()?;
             let result = {
-                let mut octx = ReadCtx(&r, None, None, None);
+                let mut octx = ReadCtx(&r, None, None, None, ChargeMode::PerRow);
                 let mut ctx = MergeCtx {
                     ovl: &mut octx,
                     at: &self.attach,
@@ -971,7 +971,7 @@ fn snapshot_deltas(db: &Database, n_tables: usize) -> Result<Vec<Vec<Vec<Value>>
     let r = db.engine.begin_read()?;
     let mut out = Vec::with_capacity(n_tables);
     let res = {
-        let mut ctx = ReadCtx(&r, None, None, None);
+        let mut ctx = ReadCtx(&r, None, None, None, ChargeMode::PerRow);
         (0..n_tables).try_for_each(|ti| {
             out.push(TxnCtx::scan_rows_raw(&mut ctx, ti as u32, None, None)?);
             Ok(())

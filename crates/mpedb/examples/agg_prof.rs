@@ -40,24 +40,37 @@ struct Counting;
 
 static ALLOCS: AtomicUsize = AtomicUsize::new(0);
 static ABYTES: AtomicUsize = AtomicUsize::new(0);
+/// **The counters are themselves a shared resource.** Two contended atomic
+/// RMWs per allocation are invisible on one thread and dominate on eleven —
+/// they would make an allocating fold look like it cannot be parallelized when
+/// what cannot be parallelized is the instrument. `MPEDB_PROF_ALLOC_COUNT=0`
+/// turns them off (the allocs/row column then reads 0.00) so a multi-threaded
+/// shape can be timed honestly. Default on: the serial attribution work that
+/// built this probe reads that column.
+static COUNTING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+#[inline(always)]
+fn count(n: usize) {
+    if COUNTING.load(Relaxed) {
+        ALLOCS.fetch_add(1, Relaxed);
+        ABYTES.fetch_add(n, Relaxed);
+    }
+}
 
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
-        ABYTES.fetch_add(l.size(), Relaxed);
+        count(l.size());
         unsafe { System.alloc(l) }
     }
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
-        ABYTES.fetch_add(l.size(), Relaxed);
+        count(l.size());
         unsafe { System.alloc_zeroed(l) }
     }
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
         unsafe { System.dealloc(p, l) }
     }
     unsafe fn realloc(&self, p: *mut u8, l: Layout, new: usize) -> *mut u8 {
-        ALLOCS.fetch_add(1, Relaxed);
-        ABYTES.fetch_add(new, Relaxed);
+        count(new);
         unsafe { System.realloc(p, l, new) }
     }
 }
@@ -67,11 +80,22 @@ static ALLOC: Counting = Counting;
 
 // ----------------------------------------------------------------- fixture
 
+/// `[runtime] max_query_threads` for this run: `MPEDB_PROF_THREADS=1` is the
+/// SERIAL control the adaptive parallel fold is measured against; unset (0) is
+/// the shipped auto setting (design/DESIGN-PARALLEL-READ.md §8).
+fn threads() -> u32 {
+    std::env::var("MPEDB_PROF_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 fn schema_toml(path: &str, size_mb: usize) -> String {
+    let threads = threads();
     format!(
         "[database]\npath = \"{path}\"\nsize_mb = {size_mb}\nmax_readers = 32\n\
          durability = \"none\"\n\n\
-         [runtime]\nmax_work_rows = 0\nmax_join_cells = 0\n\n\
+         [runtime]\nmax_work_rows = 0\nmax_join_cells = 0\nmax_query_threads = {threads}\n\n\
          [[table]]\nname = \"src\"\nprimary_key = [\"id\"]\n\
          [[table.column]]\nname = \"id\"\ntype = \"int64\"\n\
          [[table.column]]\nname = \"g10\"\ntype = \"int64\"\n\
@@ -172,7 +196,7 @@ fn measure(rows: usize, reps: usize, mut f: impl FnMut()) -> M {
 
 fn report(name: &str, m: &M) {
     println!(
-        "{name:<44} {:>9.1} ns/row {:>7.2} allocs/row {:>9.1} ms",
+        "{name:<58} {:>9.1} ns/row {:>7.2} allocs/row {:>9.1} ms",
         m.ns_per_row, m.allocs_per_row, m.ms
     );
 }
@@ -182,13 +206,22 @@ fn main() {
     let rows: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(1_000_000);
     let reps: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(3);
 
+    if std::env::var("MPEDB_PROF_ALLOC_COUNT").is_ok_and(|v| v.trim() == "0") {
+        COUNTING.store(false, Relaxed);
+    }
     let (db, path) = open_fixture(rows);
-    println!("== agg_prof: {rows} rows, min of {reps} ==");
+    println!(
+        "== agg_prof: {rows} rows, min of {reps}, max_query_threads = {} ==",
+        threads()
+    );
     if let Ok(n) = std::env::var("MPEDB_FOLD_BATCH") {
         println!("   (MPEDB_FOLD_BATCH={n})");
     }
 
     // ---- the SQL shapes -------------------------------------------------
+    // Did the adaptive parallel fold engage while answering each shape? A
+    // measurement of "parallel" that never engaged is a measurement of serial;
+    // the counter is the only thing that distinguishes them (by design).
     for (name, sql) in [
         ("sql:count  SELECT count(*)", "SELECT count(*) FROM src"),
         ("sql:sum    SELECT sum(a)", "SELECT sum(a) FROM src"),
@@ -202,15 +235,22 @@ fn main() {
         ("sql:cnta   SELECT count(a)", "SELECT count(a) FROM src"),
         ("sql:avg    SELECT avg(a)", "SELECT avg(a) FROM src"),
         ("sql:minmax SELECT min(a), max(a)", "SELECT min(a), max(a) FROM src"),
+        // The general row body (a residual filter): the fold the workers run
+        // through `BatchScan` + `Folder`, not the fused decode loop.
+        ("sql:sumw   sum(g10) WHERE [base]", "SELECT sum(g10) FROM src WHERE gk <> 7"),
+        ("sql:cntw   count(*) WHERE [base]", "SELECT count(*) FROM src WHERE g10 <> 3"),
+        ("sql:mmw    min/max(gk) WHERE [base]", "SELECT min(gk), max(gk) FROM src WHERE g10 > 0"),
         ("sql:g10    GROUP BY g10", "SELECT g10, count(*), sum(a) FROM src GROUP BY g10"),
         ("sql:g10k   GROUP BY gk", "SELECT gk, count(*), sum(a) FROM src GROUP BY gk"),
     ] {
+        let before = mpedb::parallel_folds_engaged();
         let m = measure(rows, reps, || {
             let r = db.query(sql, &[]).unwrap();
             let ExecResult::Rows { rows: out, .. } = r else { panic!() };
             std::hint::black_box(&out);
         });
-        report(name, &m);
+        let engaged = mpedb::parallel_folds_engaged() - before;
+        report(&format!("{name} [par {engaged}/{reps}]"), &m);
     }
 
     // ---- raw cursor drain (no SQL executor) -----------------------------

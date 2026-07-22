@@ -64,6 +64,17 @@ mod trigger;
 mod workspace;
 
 pub use access::{ddl_access, plan_access, Access, AccessReport, ObjectKind, TxnOp};
+
+/// Process-wide count of statements whose ADAPTIVE PARALLEL aggregate fold
+/// engaged — i.e. a scan proved long enough at run time that its remaining key
+/// range was handed to worker threads (`exec/parallel.rs`). A diagnostic and
+/// test observable, deliberately the ONLY one: the parallel fold is proven to
+/// change nothing else observable (values, ties, raises, budget refusal
+/// points), so the invariance batteries use this to assert that the path they
+/// exercise really ran. Monotone; never reset.
+pub fn parallel_folds_engaged() -> u64 {
+    exec::parallel_folds_engaged()
+}
 pub use risk::{estimate_plan_risk, RiskEstimate};
 pub use session::Session;
 pub use shard::ShardSet;
@@ -81,7 +92,7 @@ pub use mpedb_types::{
     TableDef, TableSet, Value, MAX_DB_SIZE_MB,
 };
 
-use exec::{exec_stmt, ReadCtx};
+use exec::{exec_stmt, ChargeMode, ReadCtx};
 pub use exec::take_last_insert_rowid;
 use mpedb_core::{CheckPrograms, Engine, WriteTxn};
 use mpedb_sql::{CompiledPlan, HostUdfSet, PlanStmt};
@@ -1319,7 +1330,7 @@ impl Database {
             let r = self.engine.begin_read()?;
             self.validate_policy_read(Some(&stmt.hash), &stmt.plan, &r)?;
             let res = {
-                let mut ctx = exec::ReadCtx(&r, None, None, None);
+                let mut ctx = exec::ReadCtx(&r, None, None, None, ChargeMode::PerRow);
                 // coerce still needed for Text→Int etc.
                 let coerced = exec::coerce_params(&stmt.plan, &full)?;
                 exec::exec_pk_point_hot(&mut ctx, &stmt.plan, &coerced, sp, hot)
@@ -1924,7 +1935,7 @@ impl Database {
             // On error `r` drops here, releasing the reader slot.
             self.validate_policy_read(hash, plan, &r)?;
             let res = {
-                let mut ctx = ReadCtx(&r, host, host_aggs, host_colls);
+                let mut ctx = ReadCtx(&r, host, host_aggs, host_colls, ChargeMode::PerRow);
                 exec_stmt(&mut ctx, &self.schema(), plan, params, &mut partial)
             };
             match res {

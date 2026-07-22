@@ -34,6 +34,7 @@ pub fn durability_barrier(fd: std::os::unix::io::RawFd) -> libc::c_int {
 
 pub use cdc::{CaptureConfig, DirtyEntry, DirtyOp};
 pub use engine::{
-    CheckPrograms, Engine, ReadTxn, RowCursor, TxnSavepoint, TxnSavepointFull, WorkMeter, WriteTxn,
+    CheckPrograms, Engine, FoldOpts, FoldStop, ReadTxn, RowCursor, TxnSavepoint, TxnSavepointFull,
+    WorkMeter, WriteTxn,
 };
 pub use ring::{IntentRing, PendingIntent, RingResult, RING_PARAMS_CAP};

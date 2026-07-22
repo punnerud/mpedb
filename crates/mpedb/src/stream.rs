@@ -30,7 +30,7 @@
 //! so they are safe to hold across `prepare`/`query` calls on the same
 //! thread (unlike a `WriteSession`).
 
-use crate::exec::{coerce_params, range_bounds, RawBound, ReadCtx};
+use crate::exec::{coerce_params, range_bounds, ChargeMode, RawBound, ReadCtx};
 use crate::{exec, Database, ExecResult};
 use mpedb_core::ReadTxn;
 use mpedb_sql::{AccessPath, CompiledPlan, PlanStmt, Projection, SelectPlan};
@@ -159,7 +159,7 @@ impl<'db> RowStream<'db> {
             let r = db.engine.begin_read()?;
             let mut partial = false;
             let res = {
-                let mut ctx = ReadCtx(&r, None, None, None);
+                let mut ctx = ReadCtx(&r, None, None, None, ChargeMode::PerRow);
                 exec::exec_stmt(&mut ctx, &schema, &plan, params, &mut partial)
             }?;
             r.finish()?; // SnapshotEvicted here invalidates the rows
