@@ -77,9 +77,9 @@
           <div class="editorbar">
             <button class="run" id="run" type="button" disabled>Run</button>
             <button class="ghost" id="reset" type="button">Reset database</button>
-            <button class="ghost" id="loadcsv" type="button">Load CSV…</button>
-            <input type="file" id="csvfile" accept=".csv,.tsv,.txt,text/csv,text/tab-separated-values" multiple hidden>
-            <span class="hint">⌘/Ctrl + Enter to run · one statement at a time</span>
+            <button class="ghost upload" id="loadcsv" type="button">⬆ Upload CSV</button>
+            <input type="file" id="csvfile" accept=".csv,.tsv,.tab,.txt,text/csv,text/plain,text/tab-separated-values" multiple hidden>
+            <span class="hint keyhint">⌘/Ctrl + Enter to run · one statement at a time</span>
             <span class="spacer"></span>
             <span class="hint" id="dbstate"></span>
           </div>
