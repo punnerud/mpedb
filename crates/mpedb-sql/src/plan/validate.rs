@@ -696,13 +696,9 @@ impl CompiledPlan {
                                 "aggregate-over-index on a partial or out-of-bitmap index",
                             ));
                         }
-                        if !a
-                            .aggs
-                            .iter()
-                            .all(|c| super::agg_servable_by_index(t, ix, c))
-                        {
+                        if !super::agg_set_servable_by_index(t, ix, &a.aggs) {
                             return Err(corrupt(
-                                "aggregate-over-index with an aggregate the index cannot serve",
+                                "aggregate-over-index with an aggregate set the index cannot serve",
                             ));
                         }
                     }

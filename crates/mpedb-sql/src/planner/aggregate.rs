@@ -940,7 +940,7 @@ fn agg_index_choice(
         if ix.predicate.is_some() {
             continue; // partial: membership is not "every non-NULL row"
         }
-        if !aggs.iter().all(|c| crate::plan::agg_servable_by_index(t, ix, c)) {
+        if !crate::plan::agg_set_servable_by_index(t, ix, aggs) {
             continue;
         }
         let better = match best {

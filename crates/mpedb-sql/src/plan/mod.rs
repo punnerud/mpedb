@@ -1693,17 +1693,50 @@ pub fn agg_servable_by_index(
         F::Sum | F::Avg | F::Total => {
             matches!(col.ty, ColumnType::Int64 | ColumnType::Float64)
         }
-        // The ARGUMENT's collation (format 60) must be the tree's fold — the
+        // The argument's collation (format 60) must BE the tree's fold: the
         // boundary probe finds the extremum by KEY order, which is the fold's
-        // comparison only when the two agree. Both stay BINARY here: a NOCASE
-        // tree still folds text the probe cannot compare for the fold.
-        F::Min | F::Max => {
-            col.ty != ColumnType::Any
-                && call.coll == mpedb_types::Collation::Binary
-                && col.collation == mpedb_types::Collation::Binary
-        }
+        // comparison exactly when the two collations agree — a NOCASE tree
+        // serves `min(nc)` (the fold compares NOCASE since format 60) but not
+        // `min(nc COLLATE BINARY)`. A typeless (`any`) column stays refused:
+        // its class-keyed image is not the fold's comparison for text.
+        F::Min | F::Max => col.ty != ColumnType::Any && call.coll == col.collation,
         F::GroupConcat => false, // concat order = scan order; the index would reorder it
     }
+}
+
+/// The SET-level admission for aggregate-over-index: every call individually
+/// servable ([`agg_servable_by_index`]) PLUS the collated-lead mix guard.
+///
+/// A tree whose leading key column folds text (non-BINARY collation) stores
+/// FOLDED keys, so the executor's mixed "index-tree scan" mode — which decodes
+/// each leading value once and feeds every accumulator — would hand a min/max
+/// a folded spelling (`'b'` for a stored `'B'`) that may match no row. Such a
+/// tree may serve an all-`count` set (membership only, no key decoded) or an
+/// all-min/max set (boundary probes, the value re-fetched FROM THE ROW), and
+/// nothing mixed. Shared by the planner (which chooses) and `validate` (which
+/// re-proves against the live schema), so the two cannot drift.
+pub fn agg_set_servable_by_index(
+    t: &mpedb_types::TableDef,
+    ix: &mpedb_types::IndexDef,
+    aggs: &[AggCall],
+) -> bool {
+    use mpedb_types::AggFn as F;
+    if !aggs.iter().all(|c| agg_servable_by_index(t, ix, c)) {
+        return false;
+    }
+    let lead_coll = ix
+        .columns
+        .first()
+        .and_then(|&c| t.columns.get(c as usize))
+        .map(|c| c.collation)
+        .unwrap_or(mpedb_types::Collation::Binary);
+    if lead_coll == mpedb_types::Collation::Binary {
+        return true;
+    }
+    aggs.iter().all(|c| c.func.native() == Some(F::Count))
+        || aggs
+            .iter()
+            .all(|c| matches!(c.func.native(), Some(F::Min | F::Max)))
 }
 
 /// One GROUP BY key (#56). `GROUP BY a` is a base-row column; `GROUP BY a+1`
