@@ -16,9 +16,16 @@ LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS"
 # suites pass and mpedb-capi's cdylib still links (it exports the sqlite3_*
 # symbols, which is the one link that could plausibly differ).
 #
-# Requires `mold` on PATH. If a machine lacks it, delete this block or set
-# CARGO_BUILD_RUSTFLAGS to override — everything else in this file is
-# platform-independent.
+# NOT SET HERE, for the same reason `rustc-wrapper` is not (see below): a
+# committed `-fuse-ld=mold` is a HARD DEPENDENCY on mold, and it broke CI —
+# GitHub's ubuntu runners have no mold, so every link failed with
+# `collect2: fatal error: cannot find 'ld'` before a single test ran. A build
+# accelerator must never be a hard dependency. Opt in per machine instead:
+#
+#     export RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+#
+# or put the `[target.x86_64-unknown-linux-gnu]` block in
+# `~/.cargo/config.toml`, which is per-machine and never committed.
 # sccache: a compilation cache. MEASURED on this box, and the result is more
 # limited than the usual pitch, so here are the numbers rather than the hope:
 #
@@ -40,6 +47,3 @@ LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS"
 # whole run until worked around with RUSTC_WRAPPER=""). A build accelerator
 # must never be a hard dependency. Opt in per machine instead:
 #     export RUSTC_WRAPPER=sccache
-
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
