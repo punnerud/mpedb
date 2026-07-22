@@ -419,7 +419,17 @@ impl ReadTxn<'_> {
         index_no: u32,
         f: &mut dyn FnMut(Value) -> Result<()>,
     ) -> Result<()> {
-        let (ty, _) = self.index_leading_plain(table_id, index_no)?;
+        let (ty, spec) = self.index_leading(table_id, index_no)?;
+        if !spec.is_plain() {
+            // A collated key stores FOLDED text and a class-keyed (`any`)
+            // column stores the canonical class image — neither is the row's
+            // value, so decoding would feed the fold a spelling that may match
+            // no row. The planner's set-level admission never emits this; a
+            // forged plan fails closed here.
+            return Err(Error::Unsupported(
+                "index-tree aggregate over a collated or typeless key column".into(),
+            ));
+        }
         let iroot = self.tree_root(table_id, index_no)?;
         let mut c = btree::cursor(self, iroot, None, None)?;
         let mut steps = 0u32;
@@ -465,7 +475,20 @@ impl ReadTxn<'_> {
         index_no: u32,
         max: bool,
     ) -> Result<Option<Vec<Value>>> {
-        let (ty, _) = self.index_leading_plain(table_id, index_no)?;
+        let (ty, spec) = self.index_leading(table_id, index_no)?;
+        if spec.class {
+            // A class-keyed (`any`) column's key image is not the fold's text
+            // comparison; the planner refuses it (`ty != Any`) and so does the
+            // engine. A COLLATED key is admitted: the run's fold-equality IS
+            // the argument's collation-equality (format 60 makes the fold
+            // compare under it), the run orders by ascending pk (both key
+            // layouts), and the value is re-fetched from the ROW — so the
+            // probe returns exactly the fold's first-strict-beat witness,
+            // spelling included.
+            return Err(Error::Unsupported(
+                "index-tree aggregate over a typeless key column".into(),
+            ));
+        }
         let iroot = self.tree_root(table_id, index_no)?;
         let entry = if !max {
             btree::cursor(self, iroot, None, None)?.next(self)?
@@ -496,11 +519,13 @@ impl ReadTxn<'_> {
         }
     }
 
-    /// The leading column's `(type, ordinal)` for a PLAIN-keyed index — the
-    /// precondition of decoding a value straight out of the key bytes. Errors
-    /// for a collated or class-keyed leading column (the planner never emits
-    /// such a plan; a forged one fails closed here).
-    fn index_leading_plain(&self, table_id: u32, index_no: u32) -> Result<(ColumnType, u16)> {
+    /// The leading column's `(type, key spec)` for a secondary index — what a
+    /// key-reading aggregate access must know before touching the tree. Each
+    /// caller enforces its own precondition on the spec: [`Self::fold_index_leading`]
+    /// requires a PLAIN key (the decoded bytes must BE the row's value);
+    /// [`Self::index_boundary_row`] admits a collated one (it re-fetches the
+    /// value from the row) and refuses only a class-keyed (`any`) column.
+    fn index_leading(&self, table_id: u32, index_no: u32) -> Result<(ColumnType, keycode::KeySpec)> {
         let k = index_no
             .checked_sub(1)
             .ok_or_else(|| Error::Internal("index aggregate over the PK tree".into()))?;
@@ -519,16 +544,11 @@ impl ReadTxn<'_> {
             .first()
             .copied()
             .unwrap_or_default();
-        if !spec.is_plain() {
-            return Err(Error::Unsupported(
-                "index-tree aggregate over a collated or typeless key column".into(),
-            ));
-        }
         let ty = self.bundle.col_types[table_id as usize]
             .get(lead as usize)
             .copied()
             .ok_or_else(|| Error::Corrupt("index column out of the row".into()))?;
-        Ok((ty, lead))
+        Ok((ty, spec))
     }
 
     /// Read a system record (reserved catalog keyspace).

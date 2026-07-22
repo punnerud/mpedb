@@ -12,9 +12,16 @@
 //! created on both sides — so where sqlite itself rides a covering index (its
 //! own version of this optimization), the fold orders agree too. The shapes
 //! the planner must REFUSE (residual WHERE, GROUP BY, DISTINCT, FILTER,
-//! NOCASE min/max, nullable trailing composite columns) are pinned twice:
-//! EXPLAIN must not claim the index, and the fallback fold must still answer
-//! exactly what sqlite answers — agree or refuse, never differ.
+//! min/max MIXED with a value fold on a collated tree, nullable trailing
+//! composite columns) are pinned twice: EXPLAIN must not claim the index, and
+//! the fallback fold must still answer exactly what sqlite answers — agree or
+//! refuse, never differ. A pure min/max set over a NOCASE/RTRIM tree is
+//! ADMITTED since format 60 (the fold compares under the argument's
+//! collation, so the tree's fold-order IS the comparison; the boundary probe
+//! re-fetches the row and takes the run's first entry — the fold's
+//! first-strict-beat witness). The one place sqlite disagrees with ITSELF —
+//! max ties via its own index optimization — is pinned in
+//! `nocase_max_tie_matches_the_scan_not_sqlites_index`.
 
 use mpedb::{Config, Database, Error, ExecResult, Value};
 use std::ops::Deref;
@@ -69,9 +76,9 @@ fn open(tag: &str, max_work_rows: u64) -> Tmp {
 
 /// The shared DDL — run VERBATIM on both engines. `t1` is the single-column
 /// battery: nullable indexed `a`/`f`/`s`, a NOT NULL indexed `nn` (the only
-/// `count(*)`-eligible tree), a NOCASE `nc` (min/max must refuse), a UNIQUE
-/// index on `u` (the `values → pk` key layout), and an unindexed `b` for
-/// residual/grouping shapes.
+/// `count(*)`-eligible tree), a NOCASE `nc` (pure min/max and count ride the
+/// collated tree; a MIX must not), a UNIQUE index on `u` (the `values → pk`
+/// key layout), and an unindexed `b` for residual/grouping shapes.
 const DDL: &[&str] = &[
     "CREATE TABLE t1 (id INTEGER PRIMARY KEY, a INTEGER, f REAL, s TEXT, \
      nn INTEGER NOT NULL, nc TEXT COLLATE NOCASE, u INTEGER, b INTEGER)",
@@ -207,9 +214,19 @@ fn admission_and_explain_honesty() {
     // UNIQUE index (`values → pk` layout) serves the same paths.
     assert_via_index(&d, "SELECT min(u), max(u) FROM t1", true, "index 6 (u)");
 
+    // NOCASE min/max: the collated tree probes fine since format 60 — the
+    // fold compares under the argument's collation, which IS the tree's fold.
+    assert_via_index(&d, "SELECT min(nc), max(nc) FROM t1", true, "index 5 (nc)");
+
     // Refusals — each falls back to the row fold and says nothing false.
     for refused in [
-        "SELECT min(nc) FROM t1",                    // NOCASE: tree orders folded text
+        // A MIX on the collated tree would decode FOLDED keys for the value
+        // fold — min/max would see 'alpha' where the row holds 'Alpha'. The
+        // set-level admission refuses; count alone and min/max alone ride.
+        "SELECT min(nc), count(nc) FROM t1",
+        // The argument's collation must BE the tree's fold.
+        "SELECT min(nc COLLATE BINARY) FROM t1",
+        "SELECT min(s COLLATE NOCASE) FROM t1",
         "SELECT sum(a) FROM t1 WHERE b > 0",         // residual filter
         "SELECT sum(a) FROM t1 WHERE a > 0",         // consumed by IndexRange access, not FullScan
         "SELECT b, sum(a) FROM t1 GROUP BY b",       // grouping needs row values
@@ -252,13 +269,17 @@ fn differential_battery_matches_sqlite() {
             "SELECT max(a) FROM t1 HAVING max(a) > 0",
             "SELECT min(a) FROM t1 HAVING min(a) > 0",
             "SELECT sum(a) FROM t1 LIMIT 1",
-            // Refused shapes must agree through the fold as well. (NOT here:
-            // `min(nc)`/`max(nc)` — the PRE-EXISTING row fold compares min/max
-            // under BINARY where sqlite uses the argument's NOCASE collation,
-            // a table-path gap this task neither created nor widened; the
-            // refusal keeps the index path from inheriting it, and
-            // `nocase_minmax_is_refused_not_worsened` pins fold self-consistency.)
+            // NOCASE min/max via the collated tree (format 60): the fold now
+            // compares under the argument's collation, so the probe and the
+            // oracle agree on this seed (its min run's first entry is the
+            // lowest rowid, its max run is a singleton — the one shape where
+            // sqlite's own index path disagrees with its scan path, max ties,
+            // is pinned in `nocase_max_tie_matches_the_scan_not_sqlites_index`).
+            "SELECT min(nc), max(nc) FROM t1",
+            "SELECT min(nc), max(nc), typeof(min(nc)) FROM t1",
+            // Refused shapes must agree through the fold as well.
             "SELECT min(a), max(f) FROM t1",
+            "SELECT min(nc), count(nc) FROM t1",
             "SELECT sum(a) FROM t1 WHERE b > 0",
             "SELECT count(DISTINCT a) FROM t1",
         ],
@@ -429,25 +450,130 @@ fn neg_zero_is_internally_consistent() {
     assert_eq!(sv.to_bits(), 0.0f64.to_bits());
 }
 
-/// NOCASE min/max: the index is REFUSED (the tree orders folded text; the
-/// fold's comparison is binary — riding it could return a different row's
-/// text). The pre-existing fold gap vs sqlite (binary vs argument-collation
-/// comparison) is NOT this task's to fix; what this pins is that the read
-/// path stays the FOLD (self-consistent with a write-session run) and the
-/// membership-only `count(nc)` still rides the tree correctly.
+/// NOCASE min/max via the tree (lifted at format 60): the probed answer must
+/// BE the fold's answer, spelling and witness included — pinned by running the
+/// same query through a write session, whose materializing path cannot ride
+/// the index. `count(nc)` (membership only) rides too and agrees.
 #[test]
-fn nocase_minmax_is_refused_not_worsened() {
+fn nocase_minmax_rides_the_tree_and_matches_the_fold() {
     let d = open("nocase", 0);
     run_ddl(&d, DDL);
     run_ddl(&d, SEED);
-    assert_via_index(&d, "SELECT min(nc), max(nc) FROM t1", false, "");
+    assert_via_index(&d, "SELECT min(nc), max(nc) FROM t1", true, "index 5 (nc)");
     let read = rows(d.query("SELECT min(nc), max(nc), count(nc) FROM t1", &[]).unwrap());
     let mut w = d.begin().unwrap();
     let fold = rows(w.query("SELECT min(nc), max(nc), count(nc) FROM t1", &[]).unwrap());
     w.rollback();
-    assert_eq!(read, fold, "read path must be the same fold, not a collated tree");
-    // count over the collated tree IS admissible (membership only) and agrees.
+    assert_eq!(read, fold, "the probe must return the fold's exact answer");
     cross_check(&d, DDL, SEED, &["SELECT count(nc) FROM t1"]);
+}
+
+/// **sqlite disagrees with itself on max ties, and mpedb sides with the scan.**
+///
+/// Probed on the bundled 3.45.0: a NOCASE column holding `'B'` (rowid 1) then
+/// `'b'` (rowid 2) answers `max(x) = 'B'` from a table scan (`minmaxStep`
+/// replaces only on a STRICT beat, so the first row of the collation-equal run
+/// wins) but `'b'` from its own min/max-via-index optimization (which takes
+/// the LAST index entry — the highest rowid of the maximal run). `min` ties
+/// agree on both of sqlite's paths.
+///
+/// mpedb has ONE answer for both paths: the fold's. The boundary probe seeks
+/// the FIRST entry of the maximal run — both key layouts order a fold-equal
+/// run by ascending pk, so that entry is the lowest-pk tie, exactly the row
+/// the PK-ordered fold keeps. This test pins all three: mpedb-with-index ==
+/// mpedb's fold == the oracle's NO-INDEX answer, and documents (by asserting
+/// it) that the oracle's WITH-index answer is the diverging one.
+#[test]
+fn nocase_max_tie_matches_the_scan_not_sqlites_index() {
+    let ddl: &[&str] = &[
+        "CREATE TABLE mt (id INTEGER PRIMARY KEY, x TEXT COLLATE NOCASE)",
+        "CREATE INDEX mt_x ON mt (x)",
+    ];
+    let seed: &[&str] = &[
+        "INSERT INTO mt VALUES (1, 'B')",
+        "INSERT INTO mt VALUES (2, 'b')",
+        "INSERT INTO mt VALUES (3, 'a')",
+        "INSERT INTO mt VALUES (4, 'A')",
+    ];
+    let d = open("maxtie", 0);
+    run_ddl(&d, ddl);
+    run_ddl(&d, seed);
+    assert_via_index(&d, "SELECT min(x), max(x) FROM mt", true, "index 1 (x)");
+
+    // mpedb, via the tree.
+    let probed = rows(d.query("SELECT min(x), max(x) FROM mt", &[]).unwrap());
+    // mpedb, via the row fold (write sessions materialize — never the tree).
+    let mut w = d.begin().unwrap();
+    let folded = rows(w.query("SELECT min(x), max(x) FROM mt", &[]).unwrap());
+    w.rollback();
+    assert_eq!(probed, folded, "probe and fold must be ONE answer");
+    assert_eq!(
+        probed,
+        vec![vec![Value::Text("a".into()), Value::Text("B".into())]],
+        "first scan row of each collation-equal run"
+    );
+
+    // A lone max(x) rides the tree on mpedb too, and must give the same 'B'.
+    let lone = rows(d.query("SELECT max(x) FROM mt", &[]).unwrap());
+    assert_eq!(lone, vec![vec![Value::Text("B".into())]]);
+
+    // The oracle WITHOUT the index: the scan answers mpedb matches.
+    let script_no_index = "CREATE TABLE mt (id INTEGER PRIMARY KEY, x TEXT COLLATE NOCASE);\n\
+         INSERT INTO mt VALUES (1, 'B');\nINSERT INTO mt VALUES (2, 'b');\n\
+         INSERT INTO mt VALUES (3, 'a');\nINSERT INTO mt VALUES (4, 'A');\n\
+         SELECT min(x), max(x) FROM mt;\nSELECT max(x) FROM mt;\n";
+    assert_eq!(sqlite_oracle::script_stdout(script_no_index, "NULL"), "a|B\nB\n");
+
+    // The oracle WITH the index. `min(x), max(x)` in ONE statement is not
+    // sqlite's minmax-optimization shape — it table-scans and agrees. A LONE
+    // `max(x)` takes sqlite's index optimization, which returns the HIGHEST
+    // rowid of the maximal run: 'b', diverging from its own scan's 'B'.
+    // mpedb sides with the scan on both shapes. Pinned so a future oracle
+    // bump that changes this is NOTICED rather than silently re-opening the
+    // question.
+    let script_index = "CREATE TABLE mt (id INTEGER PRIMARY KEY, x TEXT COLLATE NOCASE);\n\
+         CREATE INDEX mt_x ON mt (x);\n\
+         INSERT INTO mt VALUES (1, 'B');\nINSERT INTO mt VALUES (2, 'b');\n\
+         INSERT INTO mt VALUES (3, 'a');\nINSERT INTO mt VALUES (4, 'A');\n\
+         SELECT min(x), max(x) FROM mt;\nSELECT max(x) FROM mt;\n";
+    assert_eq!(sqlite_oracle::script_stdout(script_index, "NULL"), "a|B\nb\n");
+}
+
+/// RTRIM trees ride the same probes: ties are trailing-space variants, the
+/// first-of-run entry is the lowest-pk (= first-scan) spelling, and the value
+/// comes back from the ROW — padded exactly as stored.
+#[test]
+fn rtrim_minmax_rides_the_tree() {
+    let ddl: &[&str] = &[
+        "CREATE TABLE rt (id INTEGER PRIMARY KEY, c TEXT COLLATE RTRIM)",
+        "CREATE INDEX rt_c ON rt (c)",
+    ];
+    let seed: &[&str] = &[
+        "INSERT INTO rt VALUES (1, 'x')",
+        "INSERT INTO rt VALUES (2, 'x  ')",
+        "INSERT INTO rt VALUES (3, 'a ')",
+        "INSERT INTO rt VALUES (4, 'a')",
+    ];
+    let d = open("rtrim", 0);
+    run_ddl(&d, ddl);
+    run_ddl(&d, seed);
+    assert_via_index(&d, "SELECT min(c), max(c) FROM rt", true, "index 1 (c)");
+    let q = "SELECT min(c), max(c), length(min(c)), length(max(c)) FROM rt";
+    let probed = rows(d.query(q, &[]).unwrap());
+    let mut w = d.begin().unwrap();
+    let folded = rows(w.query(q, &[]).unwrap());
+    w.rollback();
+    assert_eq!(probed, folded, "probe and fold must be ONE answer");
+    // First scan row of each run: min = 'a ' (id 3, len 2), max = 'x' (id 1, len 1).
+    assert_eq!(
+        probed,
+        vec![vec![
+            Value::Text("a ".into()),
+            Value::Text("x".into()),
+            Value::Int(2),
+            Value::Int(1),
+        ]]
+    );
 }
 
 // -------------------------------------------------------------- work meter
