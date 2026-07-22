@@ -54,6 +54,12 @@ export class Mpedb {
     return this._take(this.exports.mpedb_open());
   }
 
+  // The live schema. Distinct from what `open()` returned, because CSV import
+  // creates tables after the open.
+  schema() {
+    return this._take(this.exports.mpedb_schema());
+  }
+
   version() {
     return this._take(this.exports.mpedb_version());
   }

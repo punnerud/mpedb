@@ -154,6 +154,24 @@ pub unsafe extern "C" fn mpedb_run(ptr: *const u8, len: usize) -> *mut u8 {
     }))
 }
 
+/// The live schema, after whatever DDL has run since the database was opened.
+///
+/// `mpedb_open` already returns this, but a CSV import creates tables *after*
+/// the open, and the page's schema panel must keep showing what the engine
+/// holds rather than what the importer believes it created.
+#[no_mangle]
+pub extern "C" fn mpedb_schema() -> *mut u8 {
+    ret(DB.with(|d| match d.borrow().as_ref() {
+        Some(db) => {
+            let mut s = String::from("{\"ok\":true,\"tables\":");
+            schema_json(&mut s, db);
+            s.push('}');
+            s
+        }
+        None => err_json("no database is open"),
+    }))
+}
+
 /// The playground's example queries, from [`examples::GROUPS`] — the same list
 /// `tests/examples.rs` asserts against, so a button cannot claim something the
 /// engine no longer does.
