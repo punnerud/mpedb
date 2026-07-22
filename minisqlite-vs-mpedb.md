@@ -452,3 +452,48 @@ vs §5.4 (`7fb0d53`, same harness): mpedb PreparedSelect eased ~5–8 % (1.78→
 Linux `~/mpedb-measure-results/`: `sqlite-corpus-linux-e9-r{1,2}.log`, `minisqlite-corpus-linux-e9-r{1,2}.log`, `mpedb-corpus-linux-e9-r{1,2}.log` (invalid, kept as the regression record), `mpedb-corpus-linux-e9-noinplace-r{1,2}.log`, `imem-bench-linux-e9acc83-r{1,2}.log`.
 M3 `~/mpedb-measure-results/`: same names with `m3`; plus `flist-621-m3` / `m3ck_*` (chunk split, byte-order-identical to the Linux lists).
 Repro/probe: worktree `e9acc83` + one-line `try_begin_exclusive_write` disable (not committed anywhere; reproduce with the §10.1 repro line).
+
+## 11. Update 2026-07-22 — mpedb at HEAD: the first valid post-fix number, and it dropped
+
+§10's mpedb corpus row was struck invalid (the §10.1 `:memory:` fixpoint
+regression). That bug was fixed at `31cb87c` (§4.5 fixpoint-time frees are
+interred, never recycled), and a window of aggregate/join perf work landed on
+top of it. This is the first full-corpus timing since — **valid (in-place path
+ON and fixed) and faster than the §10 probe.**
+
+**Linux (2 cores, `ulimit -v 3000000`, box idle, 621-file flist, min-of-2):**
+
+| engine | commit | run 1 | run 2 | passed | wrong |
+|---|---|---|---|---|---|
+| stock SQLite 3.45.0 | rusqlite bundled | 69.5 s | 67.6 s | 5 938 439 | 3 — §10, unchanged |
+| minisqlite | `4a5c134` | 153.2 s | 153.0 s | 5 938 436 | 4 — §10, unchanged |
+| **mpedb** | **`bd420e8`** | **241.7 s** | **239.2 s** | **5 936 950 (100.0 % of attempted)** | **7 (0 genuine)** |
+
+SQLite and minisqlite are **frozen versions** (SQLite 3.45.0; minisqlite
+`4a5c134`) — their engine code has not changed since §10, so their numbers are
+carried unchanged rather than re-measured this sub-round (the external runners
+they need are not in this tree). mpedb's number is a fresh paired measurement on
+the same idle box.
+
+**Movement, mpedb only:** §10's valid probe (`e9acc83` + one-line in-place
+disable) was 258.9 / 262.8 s; HEAD is **239.2 / 241.7 s** — **~7.4 % faster at
+the min**, with identical correctness (5 936 950 passed, 0 genuine wrong, the 7
+flagged are the known `slt_lang_replace`/`rowid_` shim artifacts) and the
+in-place write path now ON and correct rather than disabled. Peak RSS 345 MB.
+
+Attribution: `31cb87c` restored correctness; the drop is the aggregate/join hot
+paths — `407e63b`+`4471128` (decode-to-accumulator fold fusion, borrowed cells),
+`4e67ef0` (min/max boundary probes + index-tree aggregate scans), `d16c666`
+(join candidate-buffer reuse, ~9 % on select4 alone).
+
+**Standing ratios:** mpedb / SQLite ≈ **3.5×** (was ~3.9×), mpedb / minisqlite
+≈ **1.56×** (was ~1.72×). The honest framing is unchanged: closing the corpus
+gap is a **serial per-row-constant** game, not a parallelism one — the corpus's
+per-statement sizes are far below the ~50–100 k-row threshold where §8's
+parallelism engages, so parallelism will not move this benchmark. The residual
+is the row pipeline: mpedb validates every decoded row where SQLite memcpy's a
+VDBE record. Cursor/fold fusion is the next lever; the parallelism in
+`DESIGN-PARALLEL-READ.md` is for large single analytical queries, a different
+axis SQLite has no answer to at all.
+
+Artifacts: `~/mpedb-measure-results/mpedb-corpus-bd420e8-r{1,2}.{log,time}`.
