@@ -24,6 +24,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: toolchain
         run: rustc --version && cargo --version && sqlite3 --version
+      # mold is a build ACCELERATOR, opted into here rather than committed in
+      # `.cargo/config.toml`: a committed `-fuse-ld=mold` is a hard dependency,
+      # and it broke this workflow — the runners have no mold, so every link
+      # died with `collect2: fatal error: cannot find 'ld'` before a test ran.
+      # Installed and enabled explicitly, so a runner without it still builds.
+      - name: mold (link accelerator, optional)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq mold || true
+          if command -v mold >/dev/null; then
+            echo "RUSTFLAGS=-C link-arg=-fuse-ld=mold" >> "$GITHUB_ENV"
+            echo "mold enabled: $(mold --version)"
+          else
+            echo "mold unavailable — building with the default linker"
+          fi
       - name: test
         run: cargo test --workspace --exclude mpedb-capi
       - name: clippy
