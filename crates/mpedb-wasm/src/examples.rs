@@ -223,6 +223,26 @@ GROUP BY country",
                 sql: "SELECT k, v FROM playground ORDER BY k",
                 expect: Runs,
             },
+            Example {
+                label: "make your own table",
+                why: "real DDL -- then INSERT into it and query it back",
+                sql: "\
+-- DDL is applied to the catalog rather than compiled into a plan, so this
+-- statement has no plan hash and no footprint -- the Plan tab says so
+-- instead of inventing them. Run this, then:
+--
+--   INSERT INTO notes (id, body) VALUES (1, 'made in the browser');
+--   SELECT * FROM notes;
+--   DROP TABLE notes;
+--
+-- Reset database puts everything back.
+CREATE TABLE notes (
+  id   INTEGER PRIMARY KEY,
+  body TEXT    NOT NULL,
+  tag  TEXT    CHECK (tag <> '')
+)",
+                expect: Runs,
+            },
         ],
     },
 ];
