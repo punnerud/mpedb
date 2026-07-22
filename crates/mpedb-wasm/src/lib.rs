@@ -207,13 +207,23 @@ fn run_one(db: &Database, sql: &str) -> String {
         return err_json("empty statement");
     }
 
-    // Compile FIRST, and separately from execution, so the page can show the
-    // plan even for a statement that then fails at run time — and so a
-    // compile-time refusal (a type error, an unknown column) is reported as
-    // exactly that. `prepare_detached` runs the same `compile_maybe_explain`
-    // that `prepare`/`execute` use, so this IS the plan that runs.
+    // Compile separately from executing, so the page can show the plan even
+    // for a statement that then fails at run time, and so a compile-time
+    // refusal is reported as exactly that. `prepare_detached` runs the same
+    // `compile_maybe_explain` that `prepare`/`execute` use, so when it
+    // succeeds this IS the plan that runs.
+    //
+    // A compile failure is NOT reported straight to the user, because it does
+    // not always mean the statement is bad: **DDL has no plan at all**.
+    // `CREATE TABLE` / `DROP TABLE` / `CREATE INDEX` are applied by the facade
+    // as catalog mutations through a different path, and `prepare_detached`
+    // rejects them with a parse error. Returning that error would tell a
+    // visitor the engine cannot do something it demonstrably can — the demo
+    // misrepresenting the product, which is the one failure mode that matters
+    // here. So the statement is always executed, and the compile error is only
+    // surfaced if execution ALSO refuses it.
     let mut out = String::from("{\"ok\":true");
-    match db.prepare_detached(trimmed) {
+    let compile_err = match db.prepare_detached(trimmed) {
         Ok(det) => {
             out.push_str(",\"plan_hash\":");
             push_str(&mut out, &det.hash.to_string());
@@ -228,28 +238,38 @@ fn run_one(db: &Database, sql: &str) -> String {
             }
             out.push_str(",\"mpee\":");
             mpee_json(&mut out, db, trimmed);
+            None
         }
-        Err(e) => {
-            // A statement that does not compile has no plan to show. Report
-            // the engine's message and stop — never invent a plan.
-            return err_json(&e.to_string());
-        }
-    }
+        // No plan panels: there is no plan. Saying so is the honest rendering
+        // for DDL, and never invents one.
+        Err(e) => Some(e),
+    };
 
     match db.query(trimmed, &[]) {
         Ok(res) => {
             out.push_str(",\"result\":");
             result_json(&mut out, res);
+            if compile_err.is_some() {
+                // Ran, but carries no compiled plan — DDL. Tell the page why
+                // the plan panels are missing rather than leaving a gap.
+                out.push_str(",\"no_plan\":\"this statement is applied directly to the \
+                              catalog and has no compiled plan\"");
+            }
             out.push('}');
             out
         }
-        // Compiled but refused at execution: a CHECK violation, a type
-        // mismatch, a UNIQUE conflict. This is the interesting case for the
-        // demo, and the message is the engine's own, unedited.
-        Err(e) => {
+        // Refused. If it never compiled, that is the earlier and more precise
+        // message, so prefer it. Either way the text is the engine's own.
+        Err(exec_err) => {
+            let (msg, stage) = match compile_err {
+                Some(c) => (c.to_string(), "compile"),
+                None => (exec_err.to_string(), "execute"),
+            };
             let mut s = String::from("{\"ok\":false,\"error\":");
-            push_str(&mut s, &e.to_string());
-            s.push_str(",\"stage\":\"execute\"}");
+            push_str(&mut s, &msg);
+            s.push_str(",\"stage\":\"");
+            s.push_str(stage);
+            s.push_str("\"}");
             s
         }
     }

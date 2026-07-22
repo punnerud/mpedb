@@ -29,11 +29,11 @@ fn every_example_does_what_its_button_says() {
     let mut failures = Vec::new();
     for g in GROUPS {
         for ex in g.items {
-            // The page compiles first (for the plan panels) and then executes,
-            // so a refusal at EITHER stage is a refusal.
-            let outcome = db
-                .prepare_detached(ex.sql)
-                .and_then(|_| db.query(ex.sql, &[]));
+            // Mirror `run_one`: the page compiles for the plan panels but
+            // lets EXECUTION decide the outcome, because DDL has no plan and
+            // a failed `prepare_detached` there is not a refusal.
+            let _plan = db.prepare_detached(ex.sql);
+            let outcome = db.query(ex.sql, &[]);
             match (ex.expect, &outcome) {
                 (Expect::Runs, Err(e)) => {
                     failures.push(format!("[{}] `{}` should run, but: {e}", g.name, ex.label))
@@ -47,6 +47,27 @@ fn every_example_does_what_its_button_says() {
         }
     }
     assert!(failures.is_empty(), "playground examples drifted:\n  {}", failures.join("\n  "));
+}
+
+/// DDL runs through the page's path but has no compiled plan. Both halves
+/// matter: if `query` stopped accepting it the demo would break, and if
+/// `prepare_detached` started accepting it the page would grow plan panels
+/// for something that has no plan.
+#[test]
+fn ddl_executes_but_has_no_plan() {
+    let (db, _) = mpedb_wasm::demo::create().expect("demo database");
+    let ddl = "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT NOT NULL)";
+    assert!(db.prepare_detached(ddl).is_err(), "DDL is not a compiled plan");
+    assert!(db.query(ddl, &[]).is_ok(), "DDL must still execute");
+    assert!(
+        db.query("INSERT INTO notes (id, body) VALUES (1, 'x')", &[]).is_ok(),
+        "a table created at run time must be usable"
+    );
+    assert!(db.query("DROP TABLE notes", &[]).is_ok());
+    assert!(
+        db.query("SELECT * FROM notes", &[]).is_err(),
+        "the dropped table must be gone"
+    );
 }
 
 /// The "same plan, different spelling" example makes a specific claim. Pin it.

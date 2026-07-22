@@ -138,6 +138,7 @@ function render(res, ms) {
 
   const tabs = [];
   tabs.push({ id: "rows", label: resultTabLabel(res.result) });
+  if (res.no_plan) tabs.push({ id: "noplan", label: "Plan" });
   if (res.explain) tabs.push({ id: "explain", label: "EXPLAIN" });
   if (res.footprint) tabs.push({ id: "footprint", label: "Footprint" });
   if (res.mpee && res.mpee.applies) {
@@ -172,6 +173,13 @@ function resultTabLabel(r) {
 function paneHtml(tab, res) {
   switch (tab) {
     case "rows": return rowsHtml(res.result);
+    case "noplan":
+      return (
+        `<p class="explainer">This statement has <strong>no compiled plan</strong>: ` +
+        `${esc(res.no_plan)}. DDL changes the catalog rather than being compiled into ` +
+        `a content-hashed plan, so there is no hash, no footprint and no join order to ` +
+        `show — and the page shows nothing rather than inventing them.</p>`
+      );
     case "explain":
       return (
         `<p class="explainer">The engine's own <code>EXPLAIN</code> rendering of the plan ` +
