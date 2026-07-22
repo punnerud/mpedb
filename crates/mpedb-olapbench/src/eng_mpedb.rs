@@ -204,6 +204,19 @@ impl Mpedb {
         }
 
         let load_s = t0.elapsed().as_secs_f64();
+
+        // Stage A: persist per-index NDV so MPEE can see the star. Explicit,
+        // post-load, and timed separately — a real deployment runs it after
+        // bulk loads exactly like this, and hiding its cost inside the load
+        // number would overstate the engine.
+        let t1 = Instant::now();
+        let stats = db.analyze()?;
+        eprintln!(
+            "  analyze: {} indexes in {:.2} s",
+            stats.len(),
+            t1.elapsed().as_secs_f64()
+        );
+
         Ok((Mpedb { db, path }, load_s))
     }
 
