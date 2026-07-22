@@ -166,6 +166,21 @@ header.top .meta { color: var(--fg-faint); font-size: 12px; font-family: var(--m
   margin: 0; padding: 10px 14px; font-size: 12px; font-weight: 660;
   text-transform: uppercase; letter-spacing: 0.05em; color: var(--fg-dim);
   border-bottom: 1px solid var(--rule);
+  display: flex; align-items: center; gap: 10px;
+}
+/* A quiet action in a panel header: readable, but never louder than Run. */
+.h2btn {
+  margin-left: auto; cursor: pointer;
+  background: none; border: 1px solid var(--rule); border-radius: 4px;
+  color: var(--fg-dim); font-family: inherit; font-size: 10.5px; font-weight: 660;
+  text-transform: uppercase; letter-spacing: 0.05em;
+  padding: 2px 7px; line-height: 1.5;
+}
+.h2btn:hover { color: var(--fg); border-color: var(--fg-faint); }
+/* Tells the visitor the rows below are collapsible without adding a control. */
+.h2hint {
+  margin-left: auto; font-size: 10px; font-weight: 400; letter-spacing: 0;
+  text-transform: none; color: var(--fg-faint);
 }
 
 /* ---------- examples column ---------- */

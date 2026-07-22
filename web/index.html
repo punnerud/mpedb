@@ -58,20 +58,19 @@
   <div class="grid">
 
     <aside class="panel examples">
-      <h2>Examples</h2>
+      <h2>Examples<span class="h2hint">click a group to open</span></h2>
       <div id="examples"></div>
     </aside>
 
     <main>
       <section class="panel">
-        <h2>SQL</h2>
+        <h2>SQL<button class="h2btn" id="toexamples" type="button">Examples ▾</button></h2>
         <div class="editor">
           <textarea id="sql" spellcheck="false" autocapitalize="off" autocorrect="off"
             aria-label="SQL to run">SELECT count(*) FROM orders</textarea>
           <div class="editorbar">
             <button class="run" id="run" type="button" disabled>Run</button>
             <button class="ghost" id="reset" type="button">Reset database</button>
-            <button class="ghost" id="toexamples" type="button">Examples</button>
             <span class="hint">⌘/Ctrl + Enter to run · one statement at a time</span>
             <span class="spacer"></span>
             <span class="hint" id="dbstate"></span>
