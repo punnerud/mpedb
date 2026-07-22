@@ -570,6 +570,133 @@ fn try_count_only(
     )
 }
 
+/// The aggregate-over-index-tree path (format 59): `Some(accs)` — one FINISHED
+/// set of accumulators for the statement's single group — when the plan
+/// carries `over_index` and this context can serve it; `None` falls back to
+/// the row fold, which stays the semantics of record.
+///
+/// Sound by the membership rule: a row with ANY NULL indexed column has no
+/// entry, and the value aggregates skip NULLs — the tree omits exactly the
+/// rows the fold would have ignored. `count(*)` is only planned onto an
+/// all-NOT-NULL index (entry count == row count). Three modes, cheapest first:
+///
+/// - **wholesale count** — every aggregate is `count(*)` or `count(lead)`:
+///   the entry count IS each answer; no key is ever read.
+/// - **boundary probes** — every aggregate is `min(lead)`/`max(lead)`:
+///   O(log n) per distinct extremum; the value is re-fetched from the ROW
+///   (bit-exact — a stored `-0.0` whose key image is canonicalized comes back
+///   signed), and "first entry of the run" reproduces the fold's
+///   first-strict-beat tie rule. An empty tree probes to `None` and the
+///   never-pushed accumulator finishes to NULL, exactly the fold's answer.
+/// - **index-tree scan** — mixes with `sum`/`avg`/`total`: every decoded
+///   leading value feeds the SAME [`Accum`] the row fold uses, so overflow
+///   (`sum` int64 — a raise in both engines), avg's divide-by-non-NULL-count
+///   and the empty-input NULLs cannot drift. Fold order is KEY order, not PK
+///   order — the same order sqlite folds in when it picks the same index, and
+///   the only way a partial `sum` overflow can differ from the table fold
+///   (documented, differential-tested). Float keys decode to the canonical
+///   member of their slot (`-0.0` → `0.0`, one NaN image) — equal under every
+///   SQL comparison to what the row holds.
+///
+/// #74 charges are the engine methods' — per entry visited (scan/count), one
+/// per probed row — deterministic per snapshot and documented there. For
+/// `count(*)` the charge equals the table drain's exactly (entry count ==
+/// row count on an all-NOT-NULL index).
+fn try_agg_index(
+    ctx: &mut dyn TxnCtx,
+    table: u32,
+    agg: &Aggregation,
+    filter: Option<&ExprProgram>,
+) -> Result<Option<Vec<Acc>>> {
+    let Some(ix) = agg.over_index else {
+        return Ok(None);
+    };
+    if !ctx.agg_over_index_supported() {
+        return Ok(None); // row-fold fallback: same answer, one semantics
+    }
+    // Shape re-guards (validate enforces these against the schema already;
+    // re-checking here costs nothing and keeps this path locally provable).
+    if filter.is_some() || !agg.group_by.is_empty() || !agg.bare_cols.is_empty()
+        || agg.aggs.is_empty()
+    {
+        return Ok(None);
+    }
+    use mpedb_types::AggFn as F;
+    let native: Vec<F> = agg
+        .aggs
+        .iter()
+        .filter_map(|c| c.func.native())
+        .collect();
+    if native.len() != agg.aggs.len() {
+        return Ok(None); // a host aggregate never rides the index
+    }
+    // Mode 1: every aggregate is a count — `count(*)` or `count(lead)`, both
+    // of which the entry count answers (the planner admitted them onto this
+    // tree under exactly that rule).
+    if native.iter().all(|f| *f == F::Count) {
+        let n = ctx.count_index_entries(table, ix)?;
+        let accs = agg
+            .aggs
+            .iter()
+            .map(|_| {
+                let mut a = Accum::new(F::Count);
+                a.add_rows(n);
+                Acc::Native(a)
+            })
+            .collect();
+        return Ok(Some(accs));
+    }
+    // Mode 2: min/max only — boundary probes, one per distinct direction.
+    if native.iter().all(|f| matches!(f, F::Min | F::Max)) {
+        let mut min_row: Option<Option<Vec<Value>>> = None; // memoized probes
+        let mut max_row: Option<Option<Vec<Value>>> = None;
+        let mut accs = Vec::with_capacity(agg.aggs.len());
+        for (call, f) in agg.aggs.iter().zip(&native) {
+            let row = match f {
+                F::Min => {
+                    if min_row.is_none() {
+                        min_row = Some(ctx.index_boundary_row(table, ix, false)?);
+                    }
+                    min_row.as_ref().expect("just filled")
+                }
+                _ => {
+                    if max_row.is_none() {
+                        max_row = Some(ctx.index_boundary_row(table, ix, true)?);
+                    }
+                    max_row.as_ref().expect("just filled")
+                }
+            };
+            let mut a = Accum::new(*f);
+            if let Some(row) = row {
+                // The argument is the bare leading column (the admission
+                // rule); read it off the probed row and push ONCE — a
+                // one-value min/max finishes to that value, an empty tree
+                // pushes nothing and finishes to NULL.
+                let col = match call.arg.as_ref().map(|p| p.instrs.as_slice()) {
+                    Some([mpedb_types::Instr::PushCol(c)]) => *c as usize,
+                    _ => return Ok(None), // forged plan: fall back to the fold
+                };
+                let v = row.get(col).cloned().unwrap_or(Value::Null);
+                a.push(Some(&v))?;
+            }
+            accs.push(Acc::Native(a));
+        }
+        return Ok(Some(accs));
+    }
+    // Mode 3: the index-tree scan. Every decoded leading value feeds every
+    // accumulator — `count(lead)` counts it, `sum`/`avg`/`total` accumulate,
+    // a mixed-in `min`/`max` takes the running extremum (same result as the
+    // probe, already paid for by the scan).
+    let mut accs: Vec<Accum> = native.iter().map(|f| Accum::new(*f)).collect();
+    ctx.fold_index_leading(table, ix, &mut |v| {
+        for a in &mut accs {
+            a.push(Some(&v))?;
+        }
+        Ok(())
+    })?;
+    Ok(Some(accs.into_iter().map(Acc::Native).collect()))
+}
+
 /// `GROUP BY` / aggregates / `HAVING`.
 ///
 /// **The first line is the invariant.** DESIGN-MULTIDB §4: aggregation must
@@ -666,7 +793,21 @@ pub(super) fn exec_aggregate(
     // and the materializing path below is then EXACTLY the code that ran
     // before, feeding the same `Folder::push`.
     let streamed = if joins.is_empty() && correlated.is_empty() && post_filter.is_none() {
-        if let Some(n) = try_count_only(ctx, table, access, plan, params, t, filter, agg)? {
+        if let Some(accs) = try_agg_index(ctx, table, agg, filter)? {
+            // Aggregate-over-index-tree (format 59): the tree answered and no
+            // base row was ever materialized. Inject the one group the fold
+            // would have built — same (empty) key, same group-map cell charge —
+            // and let the shared finish code below do everything observable
+            // (HAVING, projection, ORDER BY, LIMIT).
+            folder.cells.charge(agg.aggs.len() as u64, || {
+                format!(
+                    "the group map of an aggregate over \"{}\"",
+                    super::table_name(schema, table)
+                )
+            })?;
+            folder.groups.insert(Vec::new(), (Vec::new(), accs, None, None));
+            true
+        } else if let Some(n) = try_count_only(ctx, table, access, plan, params, t, filter, agg)? {
             // `count(*)`-only over a filterless scan: the engine counted KEYS
             // leaf-wholesale and no row was ever materialized. Inject the one
             // group the fold would have built — same group key (empty), same

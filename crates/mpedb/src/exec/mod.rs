@@ -364,6 +364,46 @@ pub(crate) trait TxnCtx {
         let _ = (table, lo, hi);
         Ok(None)
     }
+    /// Can this context serve an aggregate-over-index-tree plan (format 59) —
+    /// count entries wholesale, fold leading key values, probe boundary rows?
+    /// Default `false`: every non-snapshot context (write transactions, the
+    /// sqlite-backed overlays, mirrors) keeps the row fold, which remains the
+    /// semantics of record — the plan's `over_index` is then an access
+    /// decision those contexts decline, not an obligation.
+    fn agg_over_index_supported(&self) -> bool {
+        false
+    }
+    /// Entry count of a secondary index tree, leaf-wholesale (#74 charges one
+    /// work-row per entry — see `ReadTxn::count_index_entries`). Only called
+    /// where [`agg_over_index_supported`](Self::agg_over_index_supported) is
+    /// true; the default is therefore a refusal, not a fallback.
+    fn count_index_entries(&mut self, table: u32, index_no: u32) -> Result<u64> {
+        let _ = (table, index_no);
+        Err(internal("index-entry count on an unsupported context"))
+    }
+    /// Visit every entry's decoded LEADING key value in key order (#74: one
+    /// work-row per entry). Same support gate as above.
+    fn fold_index_leading(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        f: &mut dyn FnMut(Value) -> Result<()>,
+    ) -> Result<()> {
+        let _ = (table, index_no, f);
+        Err(internal("index-leading fold on an unsupported context"))
+    }
+    /// The row behind the index tree's min (`max = false`) or max boundary
+    /// entry, `None` for an empty tree (#74: one work-row per found row).
+    /// Same support gate as above.
+    fn index_boundary_row(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        max: bool,
+    ) -> Result<Option<Vec<Value>>> {
+        let _ = (table, index_no, max);
+        Err(internal("index boundary probe on an unsupported context"))
+    }
 }
 
 impl TxnCtx for WriteTxn<'_> {
@@ -702,6 +742,30 @@ impl TxnCtx for ReadCtx<'_, '_> {
         hi: Option<(&[u8], bool)>,
     ) -> Result<Option<u64>> {
         self.0.count_range(table, lo, hi).map(Some)
+    }
+    // The pinned-snapshot context is the one that owns real index trees, so it
+    // is the one that serves the aggregate-over-index paths (format 59).
+    fn agg_over_index_supported(&self) -> bool {
+        true
+    }
+    fn count_index_entries(&mut self, table: u32, index_no: u32) -> Result<u64> {
+        self.0.count_index_entries(table, index_no)
+    }
+    fn fold_index_leading(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        f: &mut dyn FnMut(Value) -> Result<()>,
+    ) -> Result<()> {
+        self.0.fold_index_leading(table, index_no, f)
+    }
+    fn index_boundary_row(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        max: bool,
+    ) -> Result<Option<Vec<Value>>> {
+        self.0.index_boundary_row(table, index_no, max)
     }
     fn scan_rows_topk(
         &mut self,

@@ -509,6 +509,10 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
                     for c in &a.bare_cols {
                         w_u16(buf, *c);
                     }
+                    // Aggregate-over-index-tree (format 59): the chosen index
+                    // number, 0 = none. Never 0 when Some — index 0 is the PK
+                    // tree, whose count fast path needs no plan byte.
+                    buf.extend_from_slice(&a.over_index.unwrap_or(0).to_le_bytes());
                 }
             }
             // Window functions (format 24): a trailing list after the aggregate

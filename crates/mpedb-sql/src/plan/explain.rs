@@ -404,6 +404,32 @@ impl CompiledPlan {
                     }
                     let calls: Vec<String> = grouped.as_ref().unwrap()[a.group_by.len()..].to_vec();
                     out.push_str(&format!("  aggregate: {}\n", calls.join(", ")));
+                    // Aggregate-over-index-tree (format 59). Honest about the
+                    // fallback: a non-snapshot context (a write transaction)
+                    // folds the base rows instead — same answer, so the claim
+                    // here is the ACCESS DECISION, not a promise of the probe.
+                    if let Some(ix) = a.over_index {
+                        let cols: Vec<String> = schema
+                            .table(*table)
+                            .and_then(|t| t.indexes.get(ix as usize - 1))
+                            .map(|d| d.columns.iter().map(|&c| col_namer(*table)(c)).collect())
+                            .unwrap_or_default();
+                        out.push_str(&format!(
+                            "  aggregate via index {ix} ({}) — index-tree {} instead of the \
+                             table scan; row fold on write contexts\n",
+                            cols.join(", "),
+                            if a.aggs.iter().all(|c| {
+                                matches!(
+                                    c.func.native(),
+                                    Some(mpedb_types::AggFn::Min | mpedb_types::AggFn::Max)
+                                )
+                            }) {
+                                "boundary probe, O(log n)"
+                            } else {
+                                "scan (narrow entries, NULL-skip free)"
+                            }
+                        ));
+                    }
                     if let Some(h) = &a.having {
                         out.push_str(&format!("  having: {}\n", render_program(h, &name)));
                     }

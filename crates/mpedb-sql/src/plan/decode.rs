@@ -827,11 +827,19 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                     for _ in 0..n {
                         bare_cols.push(r_u16(buf, pos)?);
                     }
+                    // Aggregate-over-index-tree (format 59): 0 = none. The
+                    // admission rule and the shape guards are re-checked in
+                    // `validate` against the live schema.
+                    let over_index = match r_u32(buf, pos)? {
+                        0 => None,
+                        ix => Some(ix),
+                    };
                     Some(Aggregation {
                         group_by,
                         aggs,
                         having,
                         bare_cols,
+                        over_index,
                     })
                 }
                 t => return Err(corrupt(format!("bad aggregate tag {t}"))),

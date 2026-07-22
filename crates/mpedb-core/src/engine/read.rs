@@ -367,6 +367,170 @@ impl ReadTxn<'_> {
         Ok(n)
     }
 
+    /// Number of ENTRIES in a secondary index tree, counted leaf-wholesale
+    /// ([`btree::Cursor::next_leaf_count`]) — no key or value is ever read.
+    /// The membership rule (a row with ANY NULL indexed column has no entry)
+    /// makes this `count(col)` for a single-column index, and `count(*)` when
+    /// every indexed column is schema-NOT-NULL — the planner's admission rule.
+    ///
+    /// **#74 charges: one work-row per entry**, `charge_many`'s trip contract.
+    /// For an all-NOT-NULL index the entry count IS the row count, so the
+    /// charge equals the drain-scan's / [`count_range`](Self::count_range)'s
+    /// exactly; for a nullable indexed column it is the non-NULL count — fewer
+    /// rows than a table drain, but exactly the rows this access VISITS, and
+    /// deterministic for a given snapshot.
+    pub fn count_index_entries(&self, table_id: u32, index_no: u32) -> Result<u64> {
+        let iroot = self.tree_root(table_id, index_no)?;
+        let mut cursor = btree::cursor(self, iroot, None, None)?;
+        let mut n = 0u64;
+        while let Some(k) = cursor.next_leaf_count(self)? {
+            if !self.still_pinned() {
+                return Err(Error::SnapshotEvicted);
+            }
+            self.work
+                .charge_many(k, || scan_label(&self.bundle.schema, table_id))?;
+            n += k;
+        }
+        Ok(n)
+    }
+
+    /// Visit the FIRST key column of every entry of a secondary index tree, in
+    /// key order, decoded from the keycode bytes — the input stream of an
+    /// index-tree aggregate fold (`sum(a)`/`avg(a)` over the index on `a`).
+    /// The entries a row with a NULL indexed column never got are exactly the
+    /// rows those aggregates skip, so the NULL-skip is free here.
+    ///
+    /// Only a PLAIN-keyed leading column is decodable: a collated key stores
+    /// the FOLDED text and a class-keyed (`any`) column stores the canonical
+    /// class image, neither of which is the row's value — the planner refuses
+    /// those, and this method re-refuses rather than hand back folded bytes.
+    /// Float caveat (documented at the call site): keycode canonicalizes
+    /// `-0.0` to `0.0` and NaN to one image, so a decoded float is the
+    /// canonical member of its key slot, which every SQL comparison calls
+    /// equal to the stored one.
+    ///
+    /// **#74 charges: one work-row per entry visited**, charged BEFORE the
+    /// decode — the same order and label a row scan uses. The total is the
+    /// index's entry count (= the non-NULL count of the leading column when
+    /// the trailing columns are NOT NULL), deterministic for a snapshot.
+    pub fn fold_index_leading(
+        &self,
+        table_id: u32,
+        index_no: u32,
+        f: &mut dyn FnMut(Value) -> Result<()>,
+    ) -> Result<()> {
+        let (ty, _) = self.index_leading_plain(table_id, index_no)?;
+        let iroot = self.tree_root(table_id, index_no)?;
+        let mut c = btree::cursor(self, iroot, None, None)?;
+        let mut steps = 0u32;
+        let mut scratch = Vec::new();
+        loop {
+            // Borrowed-cell iteration (`next_with`): the key is decoded
+            // straight off the leaf page — the per-entry key+value heap
+            // copies of the owning `next` were the scan's dominant constant.
+            let stepped = c.next_with(self, &mut scratch, |k, _pk| {
+                self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
+                let mut pos = 0usize;
+                f(keycode::decode_value(k, &mut pos, ty)?)
+            })?;
+            if stepped.is_none() {
+                return Ok(());
+            }
+            steps += 1;
+            if steps.is_multiple_of(256) && !self.still_pinned() {
+                return Err(Error::SnapshotEvicted);
+            }
+        }
+    }
+
+    /// The ROW behind an index tree's boundary entry: `max = false` → the
+    /// tree's first entry, `max = true` → the first entry of the MAXIMAL
+    /// leading-value run — i.e. the row `min(col)` / `max(col)` name, O(log n).
+    /// `None` for an empty tree (an empty or all-NULL column: the aggregate's
+    /// answer is NULL). The value is re-fetched FROM THE ROW, not decoded from
+    /// the key, so a stored `-0.0` (whose key image is canonicalized) comes
+    /// back bit-exact; and "first entry of the run" reproduces the fold's
+    /// first-strict-beat tie rule — both key layouts (`values → pk` unique,
+    /// `(values ‖ pk) → pk` non-unique) sort equal values by ascending pk, so
+    /// the first entry is the lowest-pk tie, exactly the row a PK-ordered
+    /// table fold would have kept.
+    ///
+    /// **#74 charges: one work-row when a row is found, none for an empty
+    /// tree** — the single entry this access yields; deterministic, and
+    /// documented as the probe's charge (an O(log n) probe has no equivalent
+    /// drain to mirror).
+    pub fn index_boundary_row(
+        &self,
+        table_id: u32,
+        index_no: u32,
+        max: bool,
+    ) -> Result<Option<Vec<Value>>> {
+        let (ty, _) = self.index_leading_plain(table_id, index_no)?;
+        let iroot = self.tree_root(table_id, index_no)?;
+        let entry = if !max {
+            btree::cursor(self, iroot, None, None)?.next(self)?
+        } else {
+            match btree::max_key(self, iroot)? {
+                None => None,
+                Some(mk) => {
+                    // The maximal leading VALUE's encoded prefix: decode it once
+                    // to learn its byte length, then seek the run's first entry.
+                    let mut pos = 0usize;
+                    let _ = keycode::decode_value(&mk, &mut pos, ty)?;
+                    let prefix = &mk[..pos];
+                    btree::cursor(self, iroot, Some((prefix, true)), None)?.next(self)?
+                }
+            }
+        };
+        let Some((_k, pk_bytes)) = entry else {
+            return Ok(None);
+        };
+        self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
+        let root = self.tree_root(table_id, 0)?;
+        match btree::get(self, root, &pk_bytes)? {
+            None => Err(Error::Corrupt("index entry points at a missing row".into())),
+            Some(bytes) => Ok(Some(row::decode_row(
+                &bytes,
+                &self.bundle.col_types[table_id as usize],
+            )?)),
+        }
+    }
+
+    /// The leading column's `(type, ordinal)` for a PLAIN-keyed index — the
+    /// precondition of decoding a value straight out of the key bytes. Errors
+    /// for a collated or class-keyed leading column (the planner never emits
+    /// such a plan; a forged one fails closed here).
+    fn index_leading_plain(&self, table_id: u32, index_no: u32) -> Result<(ColumnType, u16)> {
+        let k = index_no
+            .checked_sub(1)
+            .ok_or_else(|| Error::Internal("index aggregate over the PK tree".into()))?;
+        let cols = self
+            .bundle
+            .sec_indexes
+            .get(table_id as usize)
+            .and_then(|v| v.get(k as usize))
+            .ok_or_else(|| Error::Internal("index number out of range".into()))?;
+        let &lead = cols
+            .first()
+            .ok_or_else(|| Error::Corrupt("index with no columns".into()))?;
+        let spec = self
+            .bundle
+            .index_coll(table_id, index_no)
+            .first()
+            .copied()
+            .unwrap_or_default();
+        if !spec.is_plain() {
+            return Err(Error::Unsupported(
+                "index-tree aggregate over a collated or typeless key column".into(),
+            ));
+        }
+        let ty = self.bundle.col_types[table_id as usize]
+            .get(lead as usize)
+            .copied()
+            .ok_or_else(|| Error::Corrupt("index column out of the row".into()))?;
+        Ok((ty, lead))
+    }
+
     /// Read a system record (reserved catalog keyspace).
     pub fn sys_get(&self, subkey: &[u8]) -> Result<Option<Vec<u8>>> {
         btree::get(self, self.meta.catalog_root, &sys_key(subkey))

@@ -465,7 +465,14 @@ const MAX_JOINS: usize = 16;
 // (`SELECT * FROM (non-flattenable body)` as an arm — Django
 // `A EXCEPT (B INTERSECT C)`). Each arm is tagged Select/Derived; Derived
 // reuses the DerivedPlan layout already on the wire for PlanStmt::Derived.
-const PLAN_FORMAT: u8 = 58;
+// Format 59: [`Aggregation`] grows `over_index` (one u32 after `bare_cols`;
+//     0 = absent) — the aggregate-over-index-tree access decision. The index
+//     membership rule (a row with ANY NULL indexed column has no entry)
+//     coincides with the aggregates' NULL-skip, so a single-column aggregate
+//     may fold from the index tree on that column, and `count(*)` from any
+//     all-NOT-NULL index; `agg_servable_by_index` is the closed admission
+//     rule, enforced by planner AND validate.
+const PLAN_FORMAT: u8 = 59;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -1602,6 +1609,89 @@ pub struct Aggregation {
     /// a bare column that is neither folded away nor min/max-determined is
     /// REFUSED, never represented here.
     pub bare_cols: Vec<u16>,
+    /// Aggregate-over-index-tree (format 59): `Some(index_no)` when this
+    /// single-group, filterless aggregate folds from secondary index tree
+    /// `index_no` (1-based; never 0) instead of the base table. Sound BY
+    /// CONSTRUCTION: the index membership rule — a row with ANY NULL indexed
+    /// column has no entry — omits exactly the rows `sum(a)`/`avg(a)`/
+    /// `min(a)`/`max(a)`/`count(a)` ignore, and `count(*)` (which counts NULL
+    /// rows too) is only admitted onto an index whose EVERY column is
+    /// schema-NOT-NULL. [`agg_servable_by_index`] is the closed admission
+    /// rule; planner and validate both enforce it, plus the shape guards
+    /// (FullScan access, no residual filter, no joins, no GROUP BY, no bare
+    /// columns, no post-filter). The executor honors it on snapshot-read
+    /// contexts and falls back to the row fold elsewhere (same answer, one
+    /// semantics of record).
+    pub over_index: Option<u32>,
+}
+
+/// May aggregate `call` be served by index `ix` of table `t` (the
+/// aggregate-over-index-tree admission rule, format 59)? The SINGLE source for
+/// planner and validate, so the producer and the re-validator cannot drift.
+///
+/// - `count(*)` (no argument): every indexed column must be schema-NOT-NULL,
+///   so the entry count IS the row count.
+/// - `f(col)` for native `count`/`sum`/`avg`/`total`/`min`/`max`: the argument
+///   must be the bare LEADING index column and every NON-leading column
+///   schema-NOT-NULL (otherwise a row with `col` non-NULL but a trailing
+///   column NULL would be missing from the tree — the membership rule would
+///   overshoot the aggregate's NULL-skip).
+/// - `sum`/`avg`/`total` decode the value from the KEY, so the leading column
+///   must be plain-keyed numeric (`int64`/`float64` — exact keycode round-trip
+///   modulo the canonical float image, which every SQL comparison calls equal).
+/// - `min`/`max` re-fetch the boundary ROW, so any type serves EXCEPT a
+///   non-BINARY collation (the tree orders folded text; the fold's
+///   `min_max_prefers` orders raw bytes — agree or refuse, never differ) and
+///   `any` (class-keyed; refused with the same reasoning, v1).
+/// - DISTINCT, FILTER, host aggregates, extra args, `group_concat`: refused —
+///   they need dedup, other columns, callbacks, or scan-order-dependent
+///   results the index order would silently change.
+pub fn agg_servable_by_index(
+    t: &mpedb_types::TableDef,
+    ix: &mpedb_types::IndexDef,
+    call: &AggCall,
+) -> bool {
+    use mpedb_types::AggFn as F;
+    if call.distinct || call.filter.is_some() || !call.extra_args.is_empty() {
+        return false;
+    }
+    let Some(f) = call.func.native() else {
+        return false; // host aggregate: a live callback, never an index fold
+    };
+    let not_null = |c: u16| {
+        t.columns
+            .get(c as usize)
+            .is_some_and(|col| !col.nullable)
+    };
+    let Some(arg) = &call.arg else {
+        // count(*): counts NULL rows too, so the tree must omit nothing.
+        return f == F::Count && !ix.columns.is_empty() && ix.columns.iter().all(|&c| not_null(c));
+    };
+    // The argument must be the bare leading index column…
+    let lead = match ix.columns.first() {
+        Some(&c) => c,
+        None => return false,
+    };
+    if arg.instrs.as_slice() != [mpedb_types::Instr::PushCol(lead)] {
+        return false;
+    }
+    // …and the trailing columns NOT NULL, so membership == "arg is non-NULL".
+    if !ix.columns[1..].iter().all(|&c| not_null(c)) {
+        return false;
+    }
+    let Some(col) = t.columns.get(lead as usize) else {
+        return false;
+    };
+    match f {
+        F::Count => true, // membership only — no value is ever decoded
+        F::Sum | F::Avg | F::Total => {
+            matches!(col.ty, ColumnType::Int64 | ColumnType::Float64)
+        }
+        F::Min | F::Max => {
+            col.ty != ColumnType::Any && col.collation == mpedb_types::Collation::Binary
+        }
+        F::GroupConcat => false, // concat order = scan order; the index would reorder it
+    }
 }
 
 /// One GROUP BY key (#56). `GROUP BY a` is a base-row column; `GROUP BY a+1`

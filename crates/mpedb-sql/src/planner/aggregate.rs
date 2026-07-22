@@ -702,6 +702,12 @@ pub(super) fn plan_aggregate_select(
         // key must repeat a select item — an aggregate it names dedups into its
         // SELECT-list slot, so no `order_refs` divergence can arise either.
         let bare_cols = decide_bare_cols(&projection, &having, &[], &[])?;
+        let over_index = joins.is_empty().then(|| {
+            agg_index_choice(
+                base_scope.only(), &access, &filter, &joins, &post_filter, &subplans,
+                &aggs, &bare_cols, &group_by,
+            )
+        }).flatten();
         let (order_by, _) = distinct_order_by(s, base_scope, None, binder.host_colls())?;
         let (param_types, context_keys, list_keys) = binder.into_parts();
         return Ok((
@@ -724,6 +730,7 @@ pub(super) fn plan_aggregate_select(
                     aggs,
                     having,
                     bare_cols,
+                    over_index,
                 }),
                 windows: Vec::new(),
             }),
@@ -821,6 +828,15 @@ pub(super) fn plan_aggregate_select(
     };
     let bare_cols = decide_bare_cols(&projection, &having, &grouped_order, &order_refs)?;
 
+    // Aggregate-over-index-tree (format 59): decided LAST, when every input to
+    // the shape guards (bare_cols included) is known.
+    let over_index = joins.is_empty().then(|| {
+        agg_index_choice(
+            base_scope.only(), &access, &filter, &joins, &post_filter, &subplans,
+            &aggs, &bare_cols, &group_by,
+        )
+    }).flatten();
+
     let (param_types, context_keys, list_keys) = binder.into_parts();
     Ok((
         PlanStmt::Select(SelectPlan {
@@ -842,6 +858,7 @@ pub(super) fn plan_aggregate_select(
                 aggs,
                 having,
                 bare_cols,
+                over_index,
             }),
             windows: Vec::new(),
         }),
@@ -851,6 +868,79 @@ pub(super) fn plan_aggregate_select(
         out_types,
         subplans,
     ))
+}
+
+/// The aggregate-over-index-tree access decision (format 59): the index whose
+/// tree can serve EVERY aggregate of this single-group statement, or `None`.
+///
+/// The semantic key: the index membership rule (a row with ANY NULL indexed
+/// column has no entry) coincides with the aggregates' NULL-skip, so the tree
+/// omits exactly the rows `sum(a)`/`avg(a)`/`min(a)`/`max(a)`/`count(a)`
+/// ignore. `count(*)` counts NULL rows too, so it only rides an index whose
+/// every column is schema-NOT-NULL. `agg_servable_by_index` is that rule.
+///
+/// Shape guards, each load-bearing:
+/// - **FullScan + no residual** — the residual is where the planner AND-folds
+///   the row policy and unabsorbed WHERE conjuncts; the index carries columns
+///   a residual may not, and a policy-bearing scan must test every row
+///   (DESIGN-MULTIDB §4). NO-residual only; anything else falls back.
+/// - **no GROUP BY, no bare columns, no joins** — grouping and the witness
+///   need row values the tree does not hold.
+/// - **no correlated subplans / post-filter** — those run in the materializing
+///   executor branch; claiming an index the execution would not use is the
+///   EXPLAIN dishonesty the post-36155ae rule forbids.
+/// - **one table, standard kind, whole (non-partial) index inside the 64-bit
+///   footprint bitmap** — same limits as every other index access.
+///
+/// Among the indexes that serve every aggregate, the FEWEST-column one wins
+/// (narrowest entries ⇒ fewest pages; the only size fact the schema states
+/// without statistics), ties to the lowest index_no — deterministic.
+#[allow(clippy::too_many_arguments)] // the guard list IS the signature, as for plan_aggregate_select
+fn agg_index_choice(
+    t: &TableDef,
+    access: &AccessPath,
+    filter: &Option<ExprProgram>,
+    joins: &[Join],
+    post_filter: &Option<ExprProgram>,
+    subplans: &[SubPlan],
+    aggs: &[AggCall],
+    bare_cols: &[u16],
+    group_by: &[GroupKey],
+) -> Option<u32> {
+    if !matches!(access, AccessPath::FullScan)
+        || filter.is_some()
+        || !joins.is_empty()
+        || post_filter.is_some()
+        || !group_by.is_empty()
+        || !bare_cols.is_empty()
+        || aggs.is_empty()
+        || t.kind != mpedb_types::TableKind::Standard
+        // A correlated lift is filled per outer row, which routes execution
+        // down the materializing branch — the index claim would be a lie.
+        || subplans.iter().any(|s| !s.outer_args.is_empty())
+    {
+        return None;
+    }
+    let mut best: Option<(usize, usize)> = None; // (columns, position)
+    for (pos, ix) in t.indexes.iter().enumerate() {
+        if pos >= 63 {
+            break; // beyond the footprint bitmap — never chosen
+        }
+        if ix.predicate.is_some() {
+            continue; // partial: membership is not "every non-NULL row"
+        }
+        if !aggs.iter().all(|c| crate::plan::agg_servable_by_index(t, ix, c)) {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some((bcols, _)) => ix.columns.len() < bcols,
+        };
+        if better {
+            best = Some((ix.columns.len(), pos));
+        }
+    }
+    best.map(|(_, pos)| (pos + 1) as u32)
 }
 
 /// The output column name for one item of an aggregate SELECT list.
