@@ -56,6 +56,15 @@ async function boot() {
   $("reset").addEventListener("click", () => {
     if (openDemo()) setStatus("Database reset — 500 rows, freshly created.");
   });
+  // The example catalogue is a sidebar on wide screens and sits BELOW the
+  // editor on narrow ones, so "where are the examples" has two different
+  // answers. This button gives one: open every group and scroll the list into
+  // view, wherever it happens to be.
+  $("toexamples").addEventListener("click", () => {
+    const host = $("examples");
+    for (const d of host.querySelectorAll("details.exgroup")) d.setAttribute("open", "");
+    host.scrollIntoView({ behavior: "smooth", block: "start" });
+  });
   $("sql").addEventListener("keydown", (e) => {
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); runCurrent(); }
   });
