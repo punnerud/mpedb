@@ -1,8 +1,8 @@
 [package]
 name = "mpedb-capi"
-version.workspace = true
-edition.workspace = true
-license.workspace = true
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
 publish = false
 description = "libsqlite3-compatible C-API shim backed by mpedb (ABI-level drop-in)"
 
@@ -14,6 +14,12 @@ description = "libsqlite3-compatible C-API shim backed by mpedb (ABI-level drop-
 name = "mpedb_sqlite3"
 crate-type = ["cdylib", "rlib"]
 
+# Its own workspace (the parent `exclude`s it): the shim exports sqlite3_* and
+# cannot be linked in the same build as the bundled sqlite3 that the parent's
+# feature unification pulls in. Deps are explicit rather than inherited for that
+# reason; `mpedb` is the same path-dependency source either way.
+[workspace]
+
 [dependencies]
-mpedb = { workspace = true }
-libc = { workspace = true }
+mpedb = { path = "../mpedb" }
+libc = "0.2"

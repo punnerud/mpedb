@@ -10,7 +10,10 @@ every protocol there survived a 37-finding adversarial review, and the ordering 
 
 ## Commands
 
-- Build/test all: `cargo test --workspace`
+- Build/test all: `cargo test --workspace` (mpedb-capi is its OWN workspace —
+  it exports `sqlite3_*` and cannot co-link the bundled sqlite the parent's
+  feature unification pulls in; test it with
+  `cargo test --manifest-path crates/mpedb-capi/Cargo.toml`)
 - One crate: `cargo test -p mpedb-core` (also: mpedb-types, mpedb-sql, mpedb, mpedb-cli)
 - Lint (keep clean): `cargo clippy --workspace --all-targets -- -D warnings`
 - Slow/instrumented tests are `#[ignore]`d: `cargo test -p mpedb-core -- --ignored`

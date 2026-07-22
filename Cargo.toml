@@ -10,22 +10,26 @@ members = [
     "crates/mpedb-mirror",
     "crates/mpedb-cli",
     "crates/mpedb-py",
-    "crates/mpedb-capi",
     "crates/mpedb-testkit",
     "crates/mpedb-bench",
     "crates/mpedb-sqlitefmt",
 ]
 # mpedb-capi (the libsqlite3-compatible C-API shim) EXPORTS the sqlite3_* symbols,
 # so it cannot co-link the bundled sqlite3 that workspace feature-unification pulls
-# in (mpedb-cli/-bench enable mpedb/sqlite-checkpoint → rusqlite "bundled"). It is a
-# member for shared deps, but excluded from the default set: build/test it standalone
-# with `-p mpedb-capi` (mpedb then compiles WITHOUT sqlite), and use
-# `--workspace --exclude mpedb-capi` for whole-workspace commands.
-default-members = [
-    "crates/mpedb-types", "crates/mpedb-core", "crates/mpedb-sql", "crates/mpedb",
-    "crates/mpedb-sdk", "crates/mpedb-proc", "crates/mpedb-mirror", "crates/mpedb-cli",
-    "crates/mpedb-py", "crates/mpedb-testkit", "crates/mpedb-bench", "crates/mpedb-sqlitefmt",
-]
+# in (mpedb-cli/-bench enable mpedb/sqlite-checkpoint → rusqlite "bundled"). Its
+# cdylib AND its test binaries both hit that collision.
+#
+# It used to be a member excluded from `default-members`, which made plain
+# `cargo test` safe and left `cargo test --workspace` as a trap: GNU ld tolerated
+# the duplicate symbols, rust-lld (the new default) refuses them, so the natural
+# command failed with `duplicate symbol: sqlite3_result_error` for anyone on a
+# recent toolchain. A trap avoided by discipline is a trap.
+#
+# It is now EXCLUDED — its own workspace, so the collision is unreachable rather
+# than unwise. Build and test it with:
+#     cargo test --manifest-path crates/mpedb-capi/Cargo.toml
+# (or `cd crates/mpedb-capi && cargo test`), where mpedb compiles WITHOUT sqlite.
+exclude = ["crates/mpedb-capi"]
 
 [workspace.package]
 version = "0.1.0"
