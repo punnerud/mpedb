@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mpedb playground — the engine, running in your browser</title>
+<meta name="description" content="Run SQL against a real mpedb instance compiled to WebAssembly: plans, footprints, MPEE join reordering, and the refusals that are the point.">
+<link rel="stylesheet" href="./style.css">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='26' font-size='26'>🗄️</text></svg>">
+</head>
+<body>
+
+<header class="top">
+  <div class="inner">
+    <h1>mp<span class="db">edb</span> playground</h1>
+    <span class="tag">the real engine, compiled to <code>wasm32</code></span>
+    <span class="spacer"></span>
+    <span class="meta" id="build">loading…</span>
+    <button class="themebtn" id="theme" type="button">theme</button>
+  </div>
+</header>
+
+<div class="wrap">
+
+  <section class="hero">
+    <p><strong>This is not a simulation.</strong> The COW B+tree, MVCC snapshots, the
+    freelist commit fixpoint, rigid type and <code>CHECK</code> validation, the MPEE
+    join solver and content-hashed plans are all the same Rust code that runs
+    natively — compiled to WebAssembly. Only the <em>kernel</em> is emulated:
+    <code>mmap</code> is a byte array, <code>msync</code> is a no-op, and the writer
+    lock is a flag, because a browser tab is one process with one thread and no
+    durability.</p>
+    <p>Everything below runs locally in this tab. Nothing is sent anywhere,
+    and there is no server.</p>
+  </section>
+
+  <section class="cannot">
+    <h2>What this page cannot show you</h2>
+    <p>mpedb's headline property is <strong>multi-process concurrency: several
+    OS processes writing the same file at once, any of which may be
+    <code>SIGKILL</code>ed mid-commit without corrupting it.</strong> You are not
+    seeing that here, and it cannot be faked in a browser.</p>
+    <p><b>Why not:</b> the <code>:memory:</code> path this page runs is process-private
+    by construction — which is exactly why it ports so cleanly. Two browser tabs
+    are two WebAssembly instances with two separate byte arrays; they share
+    nothing, so there is no second writer to show.</p>
+    <p><b>It is not impossible, just not built yet.</b>
+    <code>SharedArrayBuffer</code> plus Web Workers would give several independent
+    contexts writing the same bytes, and <code>Atomics.wait</code>/<code>notify</code>
+    and <code>Atomics.compareExchange</code> are genuine futex and CAS primitives —
+    enough for the reader-pin protocol and the writer wait queue. The missing
+    piece is <b>owner-death detection</b>: the browser has no robust mutex, no
+    <code>EOWNERDEAD</code>, and no <code>flock</code> the kernel releases when a holder
+    dies. That is the mechanism the whole crash-safety argument rests on, and
+    it would need a third lock construction with its own design review before
+    this page could claim consistency under a killed writer. Sketched in
+    <a href="https://github.com/punnerud/mpedb/blob/main/design/DESIGN-WASM-MULTIWRITER.md">DESIGN-WASM-MULTIWRITER.md</a>;
+    deliberately not improvised into a demo.</p>
+    <p>Also absent here, for the same reason: <b>durability classes</b>
+    (<code>commit</code>/<code>wal</code>/<code>async</code> — the in-memory build refuses anything
+    but <code>none</code>, so no group commit and no intent ring), <b>crash
+    recovery</b> and the power-loss simulation, <b>opening a real
+    <code>.db</code>/<code>.mpedb</code> file</b> (there is no filesystem), and the
+    <b>libsqlite3-compatible C-API shim</b>. Those are measured and tested
+    natively — see the
+    <a href="https://github.com/punnerud/mpedb#readme">README</a> and
+    <a href="https://github.com/punnerud/mpedb/blob/main/minisqlite-vs-mpedb.md">the
+    engine comparison</a>, where the multi-writer and durability numbers live.</p>
+    <p>What <em>is</em> genuine on this page: the SQL semantics, the query results,
+    the plans and their content hashes, the precomputed footprints, the MPEE join
+    reordering, and every refusal.</p>
+  </section>
+
+  <div class="grid">
+
+    <aside class="panel examples">
+      <h2>Examples</h2>
+      <div id="examples"></div>
+    </aside>
+
+    <main>
+      <section class="panel">
+        <h2>SQL</h2>
+        <div class="editor">
+          <textarea id="sql" spellcheck="false" autocapitalize="off" autocorrect="off"
+            aria-label="SQL to run">SELECT count(*) FROM orders</textarea>
+          <div class="editorbar">
+            <button class="run" id="run" type="button" disabled>Run</button>
+            <button class="ghost" id="reset" type="button">Reset database</button>
+            <span class="hint">⌘/Ctrl + Enter to run · one statement at a time</span>
+            <span class="spacer"></span>
+            <span class="hint" id="dbstate"></span>
+          </div>
+        </div>
+        <div class="status" id="status"></div>
+        <div id="refused"></div>
+      </section>
+
+      <section class="panel" id="out" style="margin-top:18px" hidden>
+        <div class="tabs" id="tabs"></div>
+        <div id="panes"></div>
+      </section>
+
+      <section class="panel" id="schemapanel" style="margin-top:18px">
+        <h2>Schema &amp; seed data</h2>
+        <div class="tabpane">
+          <p class="explainer">The <code>playground</code> table comes from the TOML
+          <strong>seed schema</strong> — the config a native <code>.mpedb</code> file is
+          born from, whose hash is frozen forever. Everything else was created by
+          real <code>CREATE TABLE</code> executed at load, so the <strong>live</strong>
+          schema has grown past the seed. Below is the exact script that built the
+          database you are querying.</p>
+          <div class="schema" id="schema"></div>
+          <p style="margin:16px 0 6px"><button class="ghost" id="showseed" type="button">Show the full seed script</button></p>
+          <pre class="plan" id="seedsql" hidden></pre>
+        </div>
+      </section>
+
+      <div class="loading" id="loading">Loading the engine…</div>
+    </main>
+  </div>
+
+  <footer class="foot">
+    <p>mpedb — an embedded, multi-process, shared-memory database in Rust.
+    <a href="https://github.com/punnerud/mpedb">Source on GitHub</a>.
+    This page is built from the same commit as the engine it runs; it ships no
+    CDN assets and works offline.</p>
+  </footer>
+</div>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>

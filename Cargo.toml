@@ -13,6 +13,7 @@ members = [
     "crates/mpedb-testkit",
     "crates/mpedb-bench",
     "crates/mpedb-sqlitefmt",
+    "crates/mpedb-wasm",
 ]
 # mpedb-capi (the libsqlite3-compatible C-API shim) EXPORTS the sqlite3_* symbols,
 # so it cannot co-link the bundled sqlite3 that workspace feature-unification pulls

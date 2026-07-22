@@ -1,0 +1,18 @@
+[package]
+name = "mpedb-wasm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The mpedb browser playground: the real engine, compiled to wasm32"
+
+# A hand-rolled C ABI rather than wasm-bindgen. The glue this needs is ~40
+# lines of JS (pass a UTF-8 buffer in, get a length-prefixed JSON buffer out),
+# and avoiding wasm-bindgen means CI needs no version-locked companion CLI —
+# `cargo build --target wasm32-unknown-unknown` is the whole build.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+mpedb = { workspace = true }
+mpedb-types = { workspace = true }
+mpedb-sql = { workspace = true }
