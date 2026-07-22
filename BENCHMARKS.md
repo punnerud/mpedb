@@ -36,7 +36,9 @@ own rather than "row store versus column store" — `count(*)` counts the PK tre
 rather than a narrow index (17× behind SQLite, though partly a schema artefact:
 mpedb excludes NULL-bearing rows from indexes, so the shortcut needs NOT NULL
 columns), and MPEE's worst-case cost
-model cannot see a star schema's dimension filter (7.6–12× behind SQLite). The
+model could not see a star schema's dimension filter (7.6–12× behind SQLite —
+**fixed the same day** by the per-index NDV cost input, `2f4c7b7`: 5.9×
+recovered, now 1.7–2.1×). The
 extremum goes the other way: `min/max` over an index is 252× faster than DuckDB
 and 7,675× faster than SQLite.
 
