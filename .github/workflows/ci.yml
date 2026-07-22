@@ -5,7 +5,7 @@
 #
 # PostgreSQL-dependent mirror tests, soaks, and benchmarks are #[ignore]d and
 # deliberately not run here; the multi-process stress/crash tests DO run
-# (they need only /dev/shm, which the ubuntu runners provide).
+# (they need only a shared-memory scratch dir, which the runners provide).
 name: CI
 
 on:
@@ -17,8 +17,19 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # Linux and macOS both run the FULL engine. macOS is not redundant: the
+  # writer lock is a different construction there (FLD-2 — a sidecar flock plus
+  # a process-private errorcheck mutex plus a shared DIRTY word, because macOS
+  # has no robust mutex), `sync_barrier` means something different, and `msync`
+  # costs range width instead of being a device flush. Three platform
+  # asymmetries have already been found by measuring both, so the second row of
+  # this matrix earns its runtime.
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -30,6 +41,7 @@ jobs:
       # died with `collect2: fatal error: cannot find 'ld'` before a test ran.
       # Installed and enabled explicitly, so a runner without it still builds.
       - name: mold (link accelerator, optional)
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -qq && sudo apt-get install -y -qq mold || true
           if command -v mold >/dev/null; then
@@ -38,13 +50,57 @@ jobs:
           else
             echo "mold unavailable — building with the default linker"
           fi
+      # mpedb-py is excluded on macOS only: its PyO3 cdylib needs
+      # `-undefined dynamic_lookup` at link time, which is build-config debt
+      # unrelated to the engine (the macOS test-path items in TODO.md). Linux
+      # builds it, so the crate stays covered.
       - name: test
-        run: cargo test --workspace --exclude mpedb-capi
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            cargo test --workspace --exclude mpedb-capi --exclude mpedb-py
+          else
+            cargo test --workspace --exclude mpedb-capi
+          fi
       - name: clippy
-        run: cargo clippy --workspace --exclude mpedb-capi --all-targets -- -D warnings
+        run: |
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            cargo clippy --workspace --exclude mpedb-capi --exclude mpedb-py --all-targets -- -D warnings
+          else
+            cargo clippy --workspace --exclude mpedb-capi --all-targets -- -D warnings
+          fi
       # mpedb-capi is the libsqlite3-compatible shim: it EXPORTS sqlite3_* and so
       # cannot co-link the bundled sqlite3 that workspace feature-unification pulls
       # in via mpedb-cli/-bench (mpedb/sqlite-checkpoint → rusqlite "bundled" →
       # duplicate symbols). Built standalone, where mpedb has no sqlite feature.
       - name: capi (standalone — avoids bundled-sqlite symbol collision)
         run: cargo test -p mpedb-capi && cargo clippy -p mpedb-capi --all-targets -- -D warnings
+
+  # Windows, first time — and deliberately NOT the whole workspace.
+  #
+  # The ENGINE is Unix-only by construction, not by neglect: MAP_SHARED mmap,
+  # flock/fcntl locks, robust PROCESS_SHARED pthread mutexes, `/proc/<pid>/stat`
+  # start-time reader identity, msync/fdatasync ordering. 18 files use libc or
+  # `std::os::unix`, and there is not one `cfg(windows)` in the tree. A Windows
+  # port is a real project, not a CI switch; a job that "tries the workspace"
+  # would fail on line one forever and teach nothing.
+  #
+  # What IS portable is large and load-bearing: `mpedb-types` (values, schema +
+  # canonical bytes + blake3 hash, memcmp key encoding, the expression IR with
+  # SQL 3VL, plan footprints) and `mpedb-sql` (tokenizer → AST → binder →
+  # planner → plan encode/decode/validate). Both have zero Unix dependencies and
+  # neither depends on `mpedb-core`.
+  #
+  # So this job guards exactly one property, and it is worth guarding: the SQL
+  # front end and the type system must not silently acquire a platform
+  # dependency. It is a real gate on a real subset — it fails the build.
+  windows-portable-core:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: toolchain
+        run: rustc --version; cargo --version
+      - name: test the portable crates
+        run: cargo test -p mpedb-types -p mpedb-sql
+      - name: clippy the portable crates
+        run: cargo clippy -p mpedb-types -p mpedb-sql --all-targets -- -D warnings
