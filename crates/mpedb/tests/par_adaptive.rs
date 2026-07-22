@@ -16,6 +16,20 @@
 use mpedb::{Config, Database, ExecResult, Value};
 use std::sync::atomic::{AtomicU64, Ordering};
 
+
+/// Scratch directory for a throwaway test database: tmpfs where it exists
+/// (Linux `/dev/shm` — the whole suite's convention, and much faster), the
+/// platform temp dir otherwise. macOS has no `/dev/shm`, and hardcoding it
+/// failed the entire file there with `Io(NotFound)` the first time CI ran on
+/// macOS.
+fn scratch_dir() -> String {
+    if std::path::Path::new("/dev/shm").is_dir() {
+        "/dev/shm".to_string()
+    } else {
+        std::env::temp_dir().to_string_lossy().trim_end_matches('/').to_string()
+    }
+}
+
 static UNIQ: AtomicU64 = AtomicU64::new(0);
 
 /// The engagement counter is process-global and these tests assert deltas on
@@ -68,7 +82,8 @@ impl Drop for Fixture {
 
 fn fixture(rows: u64, threads: u32) -> Fixture {
     let path = format!(
-        "/dev/shm/mpedb-paradapt-{}-{}.mpedb",
+        "{}/mpedb-paradapt-{}-{}.mpedb",
+        scratch_dir(),
         std::process::id(),
         UNIQ.fetch_add(1, Ordering::Relaxed)
     );
