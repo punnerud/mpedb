@@ -65,6 +65,7 @@ mod footprint;
 mod fts;
 mod join;
 mod mpee;
+mod partial;
 mod prune;
 mod recursive;
 mod select;
