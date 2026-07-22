@@ -137,7 +137,10 @@
 //! reads. That is a width problem, not a streaming one.
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+// Only the Linux `RssPoller` (which reads /proc/self/status) uses AtomicBool.
+#[cfg(target_os = "linux")]
+use std::sync::atomic::AtomicBool;
 
 use mpedb::{Config, Database, ExecResult, Value};
 
