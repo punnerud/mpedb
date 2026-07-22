@@ -120,18 +120,26 @@ header.top .meta { color: var(--fg-faint); font-size: 12px; font-family: var(--m
 /* ---------- the honesty box (deliberately not a footnote) ---------- */
 
 .cannot {
-  border: 1px solid var(--warn-rule);
-  background: var(--warn-bg);
-  color: var(--warn-fg);
+  margin: 10px 0 18px;
+  padding: 0;
+  border: 1px solid var(--rule);
   border-radius: 6px;
-  padding: 14px 16px;
-  margin: 18px 0 26px;
+  background: transparent;
 }
-.cannot h2 {
-  margin: 0 0 8px; font-size: 14px; font-weight: 680; letter-spacing: 0.01em;
-  text-transform: uppercase;
+.cannot > summary {
+  cursor: pointer;
+  padding: 7px 12px;
+  font-size: 12.5px;
+  color: var(--fg-dim);
+  list-style: none;
+  user-select: none;
 }
-.cannot p, .cannot li { margin: 6px 0; font-size: 14px; }
+.cannot > summary::-webkit-details-marker { display: none; }
+.cannot > summary:hover { color: var(--fg); }
+.cannot .chev { display: inline-block; transition: transform .15s; font-size: 10px; }
+.cannot[open] .chev { transform: rotate(90deg); }
+.cannot-body { padding: 0 12px 10px; }
+.cannot p, .cannot li { margin: 6px 0; font-size: 13.5px; }
 .cannot ul { margin: 8px 0 4px; padding-left: 20px; }
 .cannot a { color: inherit; text-decoration: underline; }
 
