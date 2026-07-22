@@ -12,6 +12,11 @@ engine is Unix-only by construction (mmap, flock, robust `PROCESS_SHARED`
 mutexes, `/proc` reader identity). macOS and Windows run nightly, Linux on every
 change.
 
+> **[mpedb vs sqlite3 vs Cursor's minisqlite →](minisqlite-vs-mpedb.md)** — what
+> each engine can even be asked to do, and speed on operations an application
+> actually runs. Both directions plotted: 4000× ahead on indexed `min`/`max`,
+> 0.40× on a single-row INSERT.
+
 MPEdb combines three things that normally don't come together:
 
 - **sqlite's operational model** — no server; processes `mmap` a shared file and
