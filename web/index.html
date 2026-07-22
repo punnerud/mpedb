@@ -36,38 +36,19 @@
 
   <section class="cannot">
     <h2>What this page cannot show you</h2>
-    <p>mpedb's headline property is <strong>multi-process concurrency: several
-    OS processes writing the same file at once, any of which may be
-    <code>SIGKILL</code>ed mid-commit without corrupting it.</strong> You are not
-    seeing that here, and it cannot be faked in a browser.</p>
-    <p><b>Why not:</b> the <code>:memory:</code> path this page runs is process-private
-    by construction — which is exactly why it ports so cleanly. Two browser tabs
-    are two WebAssembly instances with two separate byte arrays; they share
-    nothing, so there is no second writer to show.</p>
-    <p><b>It is not impossible, just not built yet.</b>
-    <code>SharedArrayBuffer</code> plus Web Workers would give several independent
-    contexts writing the same bytes, and <code>Atomics.wait</code>/<code>notify</code>
-    and <code>Atomics.compareExchange</code> are genuine futex and CAS primitives —
-    enough for the reader-pin protocol and the writer wait queue. The missing
-    piece is <b>owner-death detection</b>: the browser has no robust mutex, no
-    <code>EOWNERDEAD</code>, and no <code>flock</code> the kernel releases when a holder
-    dies. That is the mechanism the whole crash-safety argument rests on, and
-    it would need a third lock construction with its own design review before
-    this page could claim consistency under a killed writer. Sketched in
-    <a href="https://github.com/punnerud/mpedb/blob/main/design/DESIGN-WASM-MULTIWRITER.md">DESIGN-WASM-MULTIWRITER.md</a>;
-    deliberately not improvised into a demo.</p>
-    <p>Also absent here, for the same reason: <b>durability classes</b>
-    (<code>commit</code>/<code>wal</code>/<code>async</code> — the in-memory build refuses anything
-    but <code>none</code>, so no group commit and no intent ring), <b>crash
-    recovery</b> and the power-loss simulation, <b>opening a real
-    <code>.db</code>/<code>.mpedb</code> file</b> (there is no filesystem), and the
-    <b>libsqlite3-compatible C-API shim</b>. Those are measured and tested
-    natively — see the
-    <a href="https://github.com/punnerud/mpedb#readme">README</a> and
+    <p>The engine here is real, but the browser build is the process-private
+    <code>:memory:</code> path — so <strong>multi-process writers</strong>, mpedb's
+    headline property, are not on display. Two tabs are two WebAssembly instances
+    with separate byte arrays. Not impossible, just not built:
+    <code>SharedArrayBuffer</code> and <code>Atomics</code> give real futex and CAS
+    primitives; what is missing is owner-death detection, and inventing a third
+    lock construction for a demo is not something we would do quietly
+    (<a href="https://github.com/punnerud/mpedb/blob/main/design/DESIGN-WASM-MULTIWRITER.md">sketch</a>).</p>
+    <p>Absent for the same reason: durability classes, crash recovery, real files,
+    and the C-API shim. Those numbers live in
     <a href="https://github.com/punnerud/mpedb/blob/main/minisqlite-vs-mpedb.md">the
-    engine comparison</a>, where the multi-writer and durability numbers live.</p>
-    <p>What <em>is</em> genuine on this page: the SQL semantics, the query results,
-    the plans and their content hashes, the precomputed footprints, the MPEE join
+    engine comparison</a>. Everything you <em>can</em> click here is genuine — the SQL
+    semantics, the plans and their hashes, the footprints, the MPEE join
     reordering, and every refusal.</p>
   </section>
 
