@@ -148,13 +148,11 @@ header.top .meta { color: var(--fg-faint); font-size: 12px; font-family: var(--m
 .grid { display: grid; grid-template-columns: 268px minmax(0, 1fr); gap: 22px; }
 @media (max-width: 900px) {
   .grid { grid-template-columns: 1fr; }
-  /* Stacked, the aside comes first in DOM order and pushed the editor below the
-     fold — the visitor met a list of examples before the thing they run. Put the
-     editor and results first; the catalogue reads fine underneath. */
-  .grid > main { order: -1; }
-  /* Not sticky when stacked: a sticky element in a single column just eats
-     viewport as you scroll past it. */
-  .examples { position: static; max-height: none; }
+  /* Stacked, the catalogue is a long column the visitor must scroll past to
+     reach anything else — it was pushing the editor below the fold before, and
+     merely reordering left it in the way. On a phone the Examples button in the
+     SQL header is the way in, and it opens the modal instead. */
+  .examples { display: none; }
 }
 
 .panel {
@@ -177,10 +175,49 @@ header.top .meta { color: var(--fg-faint); font-size: 12px; font-family: var(--m
   padding: 2px 7px; line-height: 1.5;
 }
 .h2btn:hover { color: var(--fg); border-color: var(--fg-faint); }
+/* Wide screens have the catalogue permanently in the sidebar; the button (and
+   the modal behind it) exist for the narrow layout, where it is hidden. */
+@media (min-width: 901px) { .h2btn { display: none; } }
 /* Tells the visitor the rows below are collapsible without adding a control. */
 .h2hint {
   margin-left: auto; font-size: 10px; font-weight: 400; letter-spacing: 0;
   text-transform: none; color: var(--fg-faint);
+}
+
+/* ---------- examples modal ---------- */
+
+/* Deliberately small: a catalogue you scroll INSIDE, never a takeover. The
+   backdrop keeps the page visible behind it so it reads as a drawer. */
+.exdlg {
+  width: min(520px, 94vw); max-height: min(70vh, 620px);
+  padding: 0; border: 1px solid var(--rule); border-radius: 8px;
+  background: var(--bg-panel); color: var(--fg);
+  box-shadow: 0 12px 40px rgba(0,0,0,0.28);
+  overflow: hidden;
+}
+.exdlg::backdrop { background: rgba(0,0,0,0.42); }
+.exdlg-head {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 11px 12px 11px 14px; border-bottom: 1px solid var(--rule);
+  font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em;
+  color: var(--fg-dim);
+}
+.exdlg-hint { font-size: 10px; text-transform: none; letter-spacing: 0; color: var(--fg-faint); }
+.exdlg-x {
+  margin-left: auto; cursor: pointer; background: none; border: 0;
+  color: var(--fg-dim); font-size: 15px; line-height: 1; padding: 0 2px;
+}
+.exdlg-x:hover { color: var(--fg); }
+/* The one scroll region on the page that is not the page itself. */
+.exdlg-body { overflow-y: auto; max-height: calc(min(70vh, 620px) - 42px); padding: 4px 0 8px; }
+
+@media (max-width: 900px) {
+  /* A bottom sheet: the thumb is at the bottom of a phone, and so is the box. */
+  .exdlg {
+    width: 100vw; max-width: 100vw; max-height: 62vh;
+    margin: auto auto 0; border-radius: 10px 10px 0 0; border-bottom: 0;
+  }
+  .exdlg-body { max-height: calc(62vh - 42px); }
 }
 
 /* ---------- examples column ---------- */
