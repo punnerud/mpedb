@@ -185,6 +185,13 @@ struct Node<'a> {
     /// `None` prices as [`UNBOUGHT`], a genuine lower bound, which is what
     /// makes the branch-and-bound rounds in [`Problem::solve`] sound.
     bucket: Cell<Option<u32>>,
+    /// Per secondary index (position i = index_no i+1): the NDV bucket from
+    /// the cost source, filled by the SAME purchase as `bucket` so the two are
+    /// never inconsistent. Unbought ⇒ no discount, which keeps the unbought
+    /// price of [`UNBOUGHT`] a lower bound exactly as before (an NDV discount
+    /// only ever LOWERS a bought cost, and the unbought price is already the
+    /// floor).
+    ndv: std::cell::OnceCell<Vec<Option<u32>>>,
     /// Equality pins on this table's columns: `(column index, mask of tables
     /// the pinning expression needs placed first)`. A constant pin has mask 0.
     pins: Vec<(usize, u32)>,
@@ -223,7 +230,17 @@ impl<'a> Problem<'a> {
     /// solver ever calls `row_count`.
     fn buy(&self, t: usize) {
         if self.nodes[t].bucket.get().is_none() {
-            self.nodes[t].bucket.set(Some(magnitude((self.row_count)(self.ids[t]))));
+            let node = &self.nodes[t];
+            node.bucket.set(Some(magnitude((self.row_count.row_count)(self.ids[t]))));
+            // One purchase buys the table's whole statistics row: the count
+            // and every index's NDV bucket. Splitting them would let the two
+            // disagree mid-solve, and an NDV read is the same cheap catalog
+            // get the count is.
+            let _ = node.ndv.set(
+                (0..node.def.indexes.len().min(63))
+                    .map(|i| (self.row_count.index_ndv_bucket)(self.ids[t], i as u32 + 1))
+                    .collect(),
+            );
             self.probes.set(self.probes.get() + 1);
         }
     }
@@ -264,6 +281,41 @@ impl<'a> Problem<'a> {
         })
     }
 
+    /// The NDV discount for entering `t` with `placed` done (stage A of
+    /// design/DESIGN-MPEE-GENERAL.md §4): the largest NDV bucket over `t`'s
+    /// non-partial indexes whose EVERY column is equality-pinned by constants,
+    /// params, or placed tables. An equality on such an index cannot match
+    /// more than its largest key group, so `bucket(rows) − bucket(ndv)` is
+    /// still a worst-case-shaped bound — exact for uniform keys, optimistic
+    /// only under skew, and log2 granularity absorbs skew up to 2× per bucket
+    /// (the caveat is DESIGN-MPEE-GENERAL §8). Zero when the table's stats
+    /// are unbought (the UNBOUGHT floor is already the lower bound) or the
+    /// index was never analyzed.
+    fn ndv_discount(&self, placed: u32, t: usize) -> u32 {
+        let node = &self.nodes[t];
+        let Some(ndv) = node.ndv.get() else { return 0 };
+        let pinned = |col: u16| {
+            node.pins
+                .iter()
+                .any(|&(c, need)| c == col as usize && need & !placed == 0)
+        };
+        node.def
+            .indexes
+            .iter()
+            .take(63)
+            .zip(ndv)
+            .filter(|(ix, _)| {
+                // Partial: entry count covers members only, and membership is
+                // not establishable here — the same refusal known() makes.
+                ix.predicate.is_none()
+                    && !ix.columns.is_empty()
+                    && ix.columns.iter().all(|&c| pinned(c))
+            })
+            .filter_map(|(_, b)| *b)
+            .max()
+            .unwrap_or(0)
+    }
+
     /// The cost of putting `t` at position `pos` given the `placed` set.
     ///
     /// Depends only on `(placed, t, pos)` — never on the ORDER `placed` was
@@ -280,7 +332,16 @@ impl<'a> Problem<'a> {
         // that places its last table — so this is a genuine sum over conjuncts.
         let resolved = node.conj.iter().filter(|&&m| m & after == 0).count() as u32;
         Cost {
-            worst_log: if known { 0 } else { self.bucket(t) },
+            // A fully-pinned analyzed index tightens the worst case without
+            // changing its nature: floored at 1 so a discount can never claim
+            // the KNOWN (single-row) certainty only known() may grant.
+            worst_log: if known {
+                0
+            } else {
+                let b = self.bucket(t);
+                let d = self.ndv_discount(placed, t);
+                if d == 0 || b == 0 { b } else { b.saturating_sub(d).max(1) }
+            },
             cartesian: u32::from(pos > 0 && !linked),
             late_unconstrained: if constrained { 0 } else { (self.n - pos) as u32 },
             residual_late: resolved.saturating_mul(pos as u32),
@@ -884,6 +945,7 @@ pub(super) fn reorder<'s>(
             def: d,
             // Lazily bought (§9.5) — the solver asks before the cost side pays.
             bucket: Cell::new(None),
+            ndv: std::cell::OnceCell::new(),
             pins: Vec::new(),
             conj: Vec::new(),
             self_filter: false,
@@ -1189,7 +1251,8 @@ mod tests {
             seen.borrow_mut().insert(tid);
             10
         };
-        crate::prepare_with_row_counts(sql, schema, &f).expect("compiles");
+        let cs = crate::CostSource { row_count: &f, index_ndv_bucket: &|_, _| None };
+        crate::prepare_with_row_counts(sql, schema, &cs).expect("compiles");
         let hit = seen.borrow().len();
         assert!(hit <= n, "cannot probe more tables than the scope has");
         hit
@@ -1224,6 +1287,100 @@ mod tests {
                 "an {n}-table chain decided by structure should cost ONE row count"
             );
         }
+    }
+
+    /// **Stage A (design/DESIGN-MPEE-GENERAL.md §4): the NDV discount flips a
+    /// star schema to dimension-first.** The measured failure this encodes
+    /// (BENCHMARKS-OLAP.md): without per-index NDV, driving the 2M-row fact
+    /// table and probing the dimension prices at bucket(2M) = 21, while
+    /// dimension-first prices at bucket(5k) + bucket(2M) = 34 — so the solver
+    /// scanned the fact table and discarded 89% of it after the join. With
+    /// NDV, the dimension's filtered entry prices at bucket(5k) − bucket(8)
+    /// and the fact's indexed join equality at bucket(2M) − bucket(5k):
+    /// 9 + 8 = 17 < 21, and the dimension drives. Same query, same schema,
+    /// same solver — the only change is which statistics exist, which is the
+    /// whole claim of the CostSource seam.
+    #[test]
+    fn ndv_flips_a_star_to_dimension_first() {
+        let c = |name: &str, ty: ColumnType, indexed: bool| mpedb_types::ColumnDef {
+            generated: None,
+            decl: None,
+            name: name.into(),
+            ty,
+            nullable: true,
+            unique: false,
+            indexed,
+            default: None,
+            check: None,
+            collation: mpedb_types::Collation::Binary,
+            affinity: mpedb_types::Affinity::implied_by(ty),
+        };
+        let key = |name: &str| mpedb_types::ColumnDef {
+            nullable: false,
+            ..c(name, ColumnType::Int64, false)
+        };
+        let schema = Schema::new(vec![
+            TableDef {
+                id: 0,
+                name: "fact".into(),
+                columns: vec![
+                    key("id"),
+                    c("product_id", ColumnType::Int64, true),
+                    c("amount", ColumnType::Float64, false),
+                ],
+                primary_key: vec![0],
+                indexes: vec![],
+                dead: false,
+                implicit_rowid: false,
+                kind: mpedb_types::TableKind::Standard,
+            },
+            TableDef {
+                id: 0,
+                name: "product".into(),
+                columns: vec![key("id"), c("category", ColumnType::Text, true)],
+                primary_key: vec![0],
+                indexes: vec![],
+                dead: false,
+                implicit_rowid: false,
+                kind: mpedb_types::TableKind::Standard,
+            },
+        ])
+        .unwrap();
+        let sql = "SELECT f.amount FROM fact f, product p                    WHERE f.product_id = p.id AND p.category = 'tools'";
+        let rows = |tid: u32| -> u64 { if tid == 0 { 2_000_000 } else { 5_000 } };
+
+        // Unanalyzed: byte-identical to pre-stage-A behavior — fact drives.
+        let blind = crate::CostSource { row_count: &rows, index_ndv_bucket: &|_, _| None };
+        let plan = crate::prepare_with_row_counts(sql, &schema, &blind).unwrap();
+        assert!(
+            plan.explain(&schema).contains("join order: fact"),
+            "without NDV the worst case is all that exists, and the fact drives"
+        );
+
+        // Analyzed: category NDV 8 (bucket 4), fact.product_id NDV 5000
+        // (bucket 13) — the dimension drives.
+        let ndv = |tid: u32, ixno: u32| -> Option<u32> {
+            match (tid, ixno) {
+                (0, 1) => Some(13), // fact.product_id
+                (1, 1) => Some(4),  // product.category
+                _ => None,
+            }
+        };
+        let seen = crate::CostSource { row_count: &rows, index_ndv_bucket: &ndv };
+        let plan = crate::prepare_with_row_counts(sql, &schema, &seen).unwrap();
+        let explain = plan.explain(&schema);
+        assert!(
+            explain.contains("join order: product"),
+            "with NDV the dimension must drive; got:
+{explain}"
+        );
+        // And the fact must be entered through its join-key index, not scanned
+        // — the access path the discount priced must be the one emitted.
+        assert!(
+            explain.contains("IndexPoint") || explain.contains("index"),
+            "the fact side must be an index probe; got:
+{explain}"
+        );
     }
 
     /// The corollary: a chain with NO keyed access anywhere is decided by size

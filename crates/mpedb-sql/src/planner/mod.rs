@@ -6,20 +6,37 @@
 use crate::ast::{self, BinOp};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The catalog's transactionally-exact per-table row count, as the planner
-/// sees it: a closure, so the SQL crate keeps depending only on `mpedb-types`
-/// and a caller with no database (`mpedb_sql::prepare`) passes a zero source.
+/// The statistics the planner reads, as closures — so the SQL crate keeps
+/// depending only on `mpedb-types`, and a caller with no database
+/// (`mpedb_sql::prepare`) passes a zero source.
 ///
-/// This is the ONLY statistic the planner reads, it reaches only the MPEE join
-/// solver ([`mpee`]), and it is consumed only through a magnitude bucket — see
-/// design/DESIGN-MPEE-SOLVER.md §2.1/§6 for why that quantization is what keeps
-/// content-hashed plan identity stable across commits.
-pub type RowCountFn<'a> = &'a dyn Fn(u32) -> u64;
+/// This is the `CostSource` widening design/DESIGN-MPEE-SOLVER.md §9.0 names
+/// (design/DESIGN-MPEE-GENERAL.md §3 rule 1): every statistic reaches only the
+/// MPEE join solver ([`mpee`]), and every one is consumed as a coarse log2
+/// bucket — see DESIGN-MPEE-SOLVER.md §2.1/§6 for why that quantization is what
+/// keeps content-hashed plan identity stable across commits.
+pub struct CostSource<'a> {
+    /// The catalog's transactionally-exact per-table row count.
+    pub row_count: &'a dyn Fn(u32) -> u64,
+    /// log2 magnitude bucket of the distinct-key count of `(table_id,
+    /// index_no)`'s full key, from the last `ANALYZE`-style pass — `None` when
+    /// never analyzed (or stale), which prices exactly as before the pass
+    /// existed. `index_no` is engine numbering: 0 = PK tree, secondary =
+    /// position + 1. Deterministic between analyze runs by construction: the
+    /// value is a stored record, not a live estimate.
+    pub index_ndv_bucket: &'a dyn Fn(u32, u32) -> Option<u32>,
+}
 
-/// A row-count source for callers that have no catalog: every table unknown.
+/// How the cost source is threaded through the planner. The alias (rather than
+/// `&CostSource` at ~20 call sites) is what let the seam widen from a bare
+/// row-count closure without touching a signature.
+pub type RowCountFn<'a> = &'a CostSource<'a>;
+
+/// A cost source for callers that have no catalog: every table unknown.
 /// The solver then still runs — its decisive term (cartesian-step count) is
 /// purely structural — but cannot rank tables by size.
-pub const NO_ROW_COUNTS: RowCountFn<'static> = &|_| 0;
+pub const NO_ROW_COUNTS: RowCountFn<'static> =
+    &CostSource { row_count: &|_| 0, index_ndv_bucket: &|_, _| None };
 
 /// What a `plan_*` helper hands back: the statement plan, the inferred parameter
 /// types, the session-context keys it referenced (in reserved-slot order), and
