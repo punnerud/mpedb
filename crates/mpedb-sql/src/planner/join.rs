@@ -1019,6 +1019,16 @@ fn extract_join_access(
             if pos >= 63 {
                 break;
             }
+            // A PARTIAL index is never the inner probe of a nested loop.
+            // The evidence a §5.5 implication test would need is the OUTER
+            // statement's WHERE restricted to this table, which this function
+            // does not see — it is handed only the ON equalities. Declining
+            // costs an inner full scan; guessing costs rows that exist.
+            // (design/DESIGN-WORKLOAD-INDEXES.md §5.5; the same refusal
+            // `agg_index_choice` makes.)
+            if ix.predicate.is_some() {
+                continue;
+            }
             let mut cis = Vec::new();
             let mut parts = Vec::new();
             for &col in &ix.columns {

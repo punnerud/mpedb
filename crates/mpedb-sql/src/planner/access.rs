@@ -103,15 +103,17 @@ pub(super) fn extract_access(
             if pos >= 63 {
                 break;
             }
-            // Partial indexes (P1): membership is not yet proven from the
-            // query residual, so never pick one for access — FullScan stays
-            // correct. P6 (Guarded) is what makes parameterized partials
-            // usable; implication for literal predicates is the next step.
-            if ix.predicate.is_some() {
-                continue;
-            }
             let pins = cover(ix);
             if pins.is_empty() {
+                continue;
+            }
+            // Partial index: usable only if the query predicate ENTAILS the
+            // index predicate (§5.5) — otherwise the probe would miss rows
+            // that exist. Checked after `cover` so a whole-table statement
+            // never pays the predicate parse. `q` is the WHOLE conjunct list,
+            // consumed parts included: a pinned equality still constrains the
+            // rows the probe returns, so it is legitimate evidence.
+            if ix.predicate.is_some() && !super::partial::index_usable(table, ix, &conjuncts) {
                 continue;
             }
             let full_unique = ix.unique && pins.len() == ix.columns.len();
@@ -199,8 +201,9 @@ pub(super) fn extract_access(
         if pos >= 63 {
             break; // beyond the footprint bitmap — never chosen
         }
-        if ix.predicate.is_some() {
-            continue; // partial: see IndexPoint loop above
+        // Partial: same §5.5 implication test as the IndexPoint loop above.
+        if ix.predicate.is_some() && !super::partial::index_usable(table, ix, &conjuncts) {
+            continue;
         }
         // Phase-1 rule (same as PkRange): range over the FIRST index column
         // only — its encoding is a key prefix, so this serves composite

@@ -250,11 +250,18 @@ impl<'a> Problem<'a> {
         if !pk.is_empty() && pk.iter().all(|&c| pinned(c)) {
             return true;
         }
-        node.def
-            .indexes
-            .iter()
-            .take(63)
-            .any(|ix| ix.unique && !ix.columns.is_empty() && ix.columns.iter().all(|&c| pinned(c)))
+        node.def.indexes.iter().take(63).any(|ix| {
+            // A PARTIAL unique index does not determine at most one row of the
+            // TABLE — only of its members — and `extract_join_access` will not
+            // pick one anyway, so it must not make a table look "known" here
+            // either (the cost model must describe the access the planner
+            // actually emits). CREATE INDEX refuses UNIQUE … WHERE today, so
+            // this changes no plan; it keeps the two in step when it stops.
+            ix.unique
+                && ix.predicate.is_none()
+                && !ix.columns.is_empty()
+                && ix.columns.iter().all(|&c| pinned(c))
+        })
     }
 
     /// The cost of putting `t` at position `pos` given the `placed` set.
