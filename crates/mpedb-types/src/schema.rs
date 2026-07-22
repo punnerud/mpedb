@@ -820,7 +820,25 @@ impl Schema {
                 col.name, slot.name
             )));
         }
-        slot.columns.push(col);
+        // An implicit-rowid table (#94: a `CREATE TABLE` with no declared PK,
+        // which is what the C-API shim produces by default) carries a synthetic
+        // trailing `rowid` column, and `validate` REQUIRES it to stay last and
+        // sole PK. Appending past it produced a schema that fails its own
+        // validator — so a migration was impossible on exactly the tables the
+        // shim creates. Insert BEFORE the rowid instead and shift the PK index,
+        // which keeps both the invariant and the user-visible column order
+        // (`SELECT *` hides the rowid, so the new column is still last).
+        if slot.implicit_rowid {
+            let at = slot.columns.len() - 1;
+            slot.columns.insert(at, col);
+            for k in &mut slot.primary_key {
+                if *k as usize >= at {
+                    *k += 1;
+                }
+            }
+        } else {
+            slot.columns.push(col);
+        }
         let schema = Schema { tables };
         schema.validate()?;
         Ok(schema)
