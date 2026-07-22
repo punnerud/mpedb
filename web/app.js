@@ -123,26 +123,26 @@ function wireCsv() {
     e.target.value = "";  // so the same file can be picked twice
   });
 
-  // Drag events fire for every element entered and left, so a plain
-  // enter/leave pair flickers over child nodes. Counting depth is the standard
-  // fix: the overlay goes away only when the last enter has been matched.
-  let depth = 0;
+  // `dragover` fires repeatedly while a drag is over the window — the spec runs
+  // the model at least every 350 ms — so a heartbeat is a more reliable signal
+  // than pairing dragenter with dragleave, which flickers across child nodes
+  // and is simply never delivered when the drag ends outside the window. Show
+  // on the beat, hide when it stops: the strip cannot get stuck.
+  let beat = 0;
   const isFiles = (e) => Array.from(e.dataTransfer?.types || []).includes("Files");
-  window.addEventListener("dragenter", (e) => {
+  const hide = () => { clearTimeout(beat); beat = 0; $("dropzone").hidden = true; };
+  window.addEventListener("dragover", (e) => {
     if (!isFiles(e)) return;
-    e.preventDefault();
-    if (++depth === 1) $("dropzone").hidden = false;
+    e.preventDefault();  // without this the browser navigates to the file
+    $("dropzone").hidden = false;
+    clearTimeout(beat);
+    beat = setTimeout(hide, 700);
   });
-  window.addEventListener("dragover", (e) => { if (isFiles(e)) e.preventDefault(); });
-  window.addEventListener("dragleave", (e) => {
-    if (!isFiles(e)) return;
-    if (--depth <= 0) { depth = 0; $("dropzone").hidden = true; }
-  });
+  window.addEventListener("dragend", hide);
   window.addEventListener("drop", (e) => {
     if (!isFiles(e)) return;
     e.preventDefault();
-    depth = 0;
-    $("dropzone").hidden = true;
+    hide();
     importFiles(e.dataTransfer.files);
   });
 }

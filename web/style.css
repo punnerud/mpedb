@@ -186,21 +186,24 @@ header.top .meta { color: var(--fg-faint); font-size: 12px; font-family: var(--m
 
 /* ---------- CSV drop zone ---------- */
 
-/* Covers the viewport only while a drag is in flight — a permanent drop target
-   would be a box the visitor has to look past on every visit. */
+/* A strip at the top, never a takeover: the drop target is the whole window, so
+   the indicator does not need to be — and an overlay across the viewport hides
+   the thing the visitor is dragging onto. `pointer-events: none` throughout, so
+   this can never swallow a click or a drop even if it is somehow left visible. */
 .dropzone {
-  position: fixed; inset: 0; z-index: 50;
-  display: flex; align-items: center; justify-content: center;
-  background: rgba(0,0,0,0.45); backdrop-filter: blur(2px);
-}
-.dropbox {
+  position: fixed; top: 0; left: 0; right: 0; z-index: 50;
   pointer-events: none;
-  max-width: 420px; padding: 28px 32px; text-align: center;
+  display: flex; align-items: baseline; justify-content: center; gap: 10px;
+  padding: 9px 14px;
   background: var(--bg-panel); color: var(--fg);
-  border: 2px dashed var(--accent); border-radius: 10px;
+  border-bottom: 2px dashed var(--accent);
+  box-shadow: 0 4px 14px rgba(0,0,0,0.16);
 }
-.dropbox b { display: block; font-size: 17px; margin-bottom: 8px; }
-.dropbox span { font-size: 13px; color: var(--fg-dim); }
+.dropzone b { font-size: 13.5px; }
+.dropzone span { font-size: 12px; color: var(--fg-dim); }
+@media (max-width: 560px) {
+  .dropzone { flex-direction: column; align-items: center; gap: 2px; text-align: center; }
+}
 
 /* ---------- SQL / Data switch ---------- */
 
