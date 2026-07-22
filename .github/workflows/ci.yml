@@ -90,23 +90,27 @@ jobs:
       - name: test
         run: |
           if [ "${{ runner.os }}" = "macOS" ]; then
-            cargo test --workspace --exclude mpedb-capi --exclude mpedb-py
+            cargo test --workspace --exclude mpedb-py
           else
-            cargo test --workspace --exclude mpedb-capi
+            cargo test --workspace
           fi
       - name: clippy
         run: |
           if [ "${{ runner.os }}" = "macOS" ]; then
-            cargo clippy --workspace --exclude mpedb-capi --exclude mpedb-py --all-targets -- -D warnings
+            cargo clippy --workspace --exclude mpedb-py --all-targets -- -D warnings
           else
-            cargo clippy --workspace --exclude mpedb-capi --all-targets -- -D warnings
+            cargo clippy --workspace --all-targets -- -D warnings
           fi
       # mpedb-capi is the libsqlite3-compatible shim: it EXPORTS sqlite3_* and so
-      # cannot co-link the bundled sqlite3 that workspace feature-unification pulls
-      # in via mpedb-cli/-bench (mpedb/sqlite-checkpoint → rusqlite "bundled" →
-      # duplicate symbols). Built standalone, where mpedb has no sqlite feature.
-      - name: capi (standalone — avoids bundled-sqlite symbol collision)
-        run: cargo test -p mpedb-capi && cargo clippy -p mpedb-capi --all-targets -- -D warnings
+      # cannot co-link the bundled sqlite3 that the parent workspace's feature
+      # unification pulls in (mpedb/sqlite-checkpoint → rusqlite "bundled" →
+      # duplicate symbols, which rust-lld refuses outright). It is therefore its
+      # OWN workspace, `exclude`d by the parent, and built by manifest path —
+      # where mpedb compiles without the sqlite feature at all.
+      - name: capi (its own workspace — the symbol collision is unreachable)
+        run: |
+          cargo test --manifest-path crates/mpedb-capi/Cargo.toml
+          cargo clippy --manifest-path crates/mpedb-capi/Cargo.toml --all-targets -- -D warnings
 
   # Windows, first time — and deliberately NOT the whole workspace.
   #
