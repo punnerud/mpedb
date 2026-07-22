@@ -119,10 +119,7 @@ pub(crate) fn resolve_params_timed<'a>(
 /// `'now'`; a clock before the epoch stores 0 rather than panicking, matching
 /// `exec::now_micros`.
 fn now_micros() -> i64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => i64::try_from(d.as_micros()).unwrap_or(i64::MAX),
-        Err(_) => 0,
-    }
+    mpedb_core::wall_clock_micros()
 }
 
 pub(crate) fn resolve_params<'a>(

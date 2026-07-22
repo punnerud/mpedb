@@ -68,6 +68,17 @@ fn join_oom() -> Error {
 fn budget_fits_in_memory(cells: u64) -> bool {
     let need = cells.saturating_mul(40);
     let mut bound = u64::MAX;
+    // wasm32 has no `getrlimit`, but it does have a HARD address-space
+    // ceiling that plays the same role: a 32-bit wasm memory can never exceed
+    // 4 GiB. Using it keeps this function doing what it says — comparing the
+    // need against the address space — rather than falling back to
+    // "unbounded", which would be the one wrong answer in the one environment
+    // whose address space is smallest.
+    #[cfg(target_arch = "wasm32")]
+    {
+        bound = bound.min(4 << 30);
+    }
+    #[cfg(not(target_arch = "wasm32"))]
     unsafe {
         let mut rl: libc::rlimit = std::mem::zeroed();
         if libc::getrlimit(libc::RLIMIT_AS, &mut rl) == 0 && rl.rlim_cur != libc::RLIM_INFINITY {

@@ -107,7 +107,7 @@ pub fn ring_debug(msg: std::fmt::Arguments<'_>) {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
-    let line = format!("{t} [{}] {msg}\n", std::process::id());
+    let line = format!("{t} [{}] {msg}\n", crate::os::process_id());
     let _ = std::io::stderr().write_all(line.as_bytes());
 }
 
@@ -187,7 +187,7 @@ impl<'a> IntentRing<'a> {
         if params.len() > RING_PARAMS_CAP {
             return None;
         }
-        let pid = std::process::id();
+        let pid = crate::os::process_id();
         // randomized scan start decorrelates concurrent enqueuers
         let start = pid.wrapping_mul(2654435761) % RING_SLOTS;
         for i in 0..RING_SLOTS {
@@ -431,9 +431,21 @@ impl<'a> IntentRing<'a> {
             if state != ST_RESERVED && state != ST_DONE {
                 continue;
             }
-            let kill_failed = unsafe { libc::kill(pid as i32, 0) } != 0;
-            let dead = kill_failed
-                && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+            // wasm32: the intent ring only exists for durability commit|wal,
+            // which the private path refuses outright — so this loop never
+            // sees an occupied slot there. `crate::wasmcompat::kill` still
+            // answers honestly (every pid but ours is gone) via its own errno,
+            // because wasm has no OS errno for `last_os_error` to read.
+            #[cfg(target_arch = "wasm32")]
+            let dead = {
+                let kill_failed = unsafe { crate::wasmcompat::libc::kill(pid as i32, 0) } != 0;
+                kill_failed && crate::wasmcompat::errno() == crate::wasmcompat::libc::ESRCH
+            };
+            #[cfg(not(target_arch = "wasm32"))]
+            let dead = {
+                let kill_failed = unsafe { libc::kill(pid as i32, 0) } != 0;
+                kill_failed && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+            };
             if !dead {
                 continue;
             }

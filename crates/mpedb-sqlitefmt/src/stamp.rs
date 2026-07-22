@@ -45,9 +45,22 @@ pub struct BaseStamp {
     pub wal: Option<([u8; 8], u64)>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn read_at(path: &Path, off: u64, buf: &mut [u8]) -> std::io::Result<()> {
     use std::os::unix::fs::FileExt;
     std::fs::File::open(path)?.read_exact_at(buf, off)
+}
+
+/// wasm32: `File::open` cannot succeed (no filesystem), so this only ever
+/// returns the same failure the native path would on a missing base. Kept as
+/// a distinct arm because `read_exact_at` is a unix extension trait.
+#[cfg(target_arch = "wasm32")]
+fn read_at(path: &Path, _off: u64, _buf: &mut [u8]) -> std::io::Result<()> {
+    std::fs::File::open(path)?;
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no positional reads in the wasm32 build",
+    ))
 }
 
 impl BaseStamp {

@@ -3209,8 +3209,7 @@ fn table_def<'a>(
 
 /// Microseconds since the Unix epoch, captured once per execute() call.
 fn now_micros() -> i64 {
-    match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
-        Ok(d) => i64::try_from(d.as_micros()).unwrap_or(i64::MAX),
-        Err(_) => 0, // clock before the epoch: store 0 rather than panic
-    }
+    // Via `crate::os` so the wasm32 build reads the HOST's clock; a direct
+    // `SystemTime::now()` panics there. See `os::wall_clock_micros`.
+    mpedb_core::wall_clock_micros()
 }

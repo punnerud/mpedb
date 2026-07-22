@@ -374,8 +374,12 @@ impl<R: std::io::Read> mpedb_core::btree::BlobSource for ReaderBlobSource<R> {
 /// (#50). The two views agree by construction: both start at offset 0 over
 /// the same bytes, and the engine uses exactly one of them per insert.
 pub struct FileBlobSource {
+    // wasm32 reads neither: `next_into` there is the unreachable arm (no
+    // filesystem means no `File` to construct this from in the first place).
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     file: std::fs::File,
     len: usize,
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     pos: u64,
 }
 
@@ -390,11 +394,26 @@ impl mpedb_core::btree::BlobSource for FileBlobSource {
         self.len
     }
     fn next_into(&mut self, buf: &mut [u8]) -> Result<()> {
-        use std::os::unix::fs::FileExt;
-        self.file.read_exact_at(buf, self.pos)?;
-        self.pos += buf.len() as u64;
-        Ok(())
+        // wasm32: unreachable — a `std::fs::File` cannot be opened there, so
+        // no `FileBlobSource` can be constructed in the first place. The arm
+        // exists only because `read_exact_at` is a unix extension trait.
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = buf;
+            return Err(mpedb_types::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "file blob sources need a filesystem; the wasm32 build has none",
+            )));
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use std::os::unix::fs::FileExt;
+            self.file.read_exact_at(buf, self.pos)?;
+            self.pos += buf.len() as u64;
+            Ok(())
+        }
     }
+    #[cfg(not(target_arch = "wasm32"))]
     fn as_file(&self) -> Option<&std::fs::File> {
         Some(&self.file)
     }

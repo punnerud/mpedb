@@ -1832,3 +1832,42 @@ fn rebuild_residual(conjuncts: Vec<BExpr>, consumed: &[bool]) -> Option<BExpr> {
         BExpr::Binary(BinOp::And, Box::new(acc), Box::new(c))
     }))
 }
+
+// ---- the MPEE A/B switch, for callers that have no environment -------------
+
+/// Tri-state override of the `MPEDB_NO_MPEE` environment switch:
+/// 0 = unset (consult the environment), 1 = force the solver ON,
+/// 2 = force it OFF.
+static MPEE_OVERRIDE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+/// `Some(true)` = solver forced off, `Some(false)` = forced on, `None` = defer
+/// to `MPEDB_NO_MPEE`.
+pub(crate) fn mpee_override() -> Option<bool> {
+    match MPEE_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
+/// Force the MPEE join solver on or off for subsequent compilations, or hand
+/// control back to `MPEDB_NO_MPEE` with `None`.
+///
+/// The environment variable exists so a claim about what the solver buys is a
+/// paired measurement of ONE binary (see `mpee::disabled`). That argument is
+/// unchanged here — this is the same switch, reachable from a process that has
+/// no environment to set. The browser playground is the motivating case: it
+/// renders the user's textual join order beside the solver's chosen one, which
+/// means compiling the same SQL both ways in one address space.
+///
+/// **Process-global and not synchronized with in-flight compilation.** It is
+/// meant for a single-threaded A/B (compile, read, compile, read), not for
+/// per-statement control in a threaded program.
+pub fn set_mpee_enabled(on: Option<bool>) {
+    let v = match on {
+        None => 0,
+        Some(true) => 1,
+        Some(false) => 2,
+    };
+    MPEE_OVERRIDE.store(v, std::sync::atomic::Ordering::Relaxed);
+}

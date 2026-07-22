@@ -12,9 +12,19 @@
 
 use mpedb_types::{Durability, Error, FilePerms, Result, PAGE_SIZE};
 use std::cell::UnsafeCell;
+#[cfg(not(target_arch = "wasm32"))]
 use std::fs::{File, OpenOptions};
+#[cfg(not(target_arch = "wasm32"))]
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
+#[cfg(not(target_arch = "wasm32"))]
 use std::os::unix::io::{AsRawFd, RawFd};
+// wasm32 has no filesystem and no fds. `crate::wasmcompat` supplies the same
+// names over a process-private byte buffer — including a `libc` module that
+// SHADOWS the real crate for this file, so every `libc::…` call site below is
+// compiled unchanged rather than forked per platform. Its header documents why
+// each emulated call is sound in a single-threaded browser tab.
+#[cfg(target_arch = "wasm32")]
+use crate::wasmcompat::{libc, File, OpenOptions, RawFd};
 // `FromRawFd` is used only by the Linux `memfd_create` arm of
 // `memory_backing_file` — importing it unconditionally is an unused import
 // everywhere else, which `-D warnings` rejects (found by the first macOS CI run).
@@ -27,7 +37,14 @@ use std::sync::atomic::{fence, AtomicU32, AtomicU64, Ordering};
 /// (never hits a path); elsewhere create+unlink a temp file so the fd has no
 /// directory entry.
 fn memory_backing_file() -> Result<File> {
-    #[cfg(target_os = "linux")]
+    // wasm32: no fds, no temp dir — the anonymous buffer IS the backing store.
+    // This is the ONLY `Shm` entry point a browser build can reach; every
+    // file-backed one fails at `OpenOptions::open` (crate::wasmcompat).
+    #[cfg(target_arch = "wasm32")]
+    {
+        crate::wasmcompat::File::anonymous().map_err(Error::Io)
+    }
+    #[cfg(all(target_os = "linux", not(target_arch = "wasm32")))]
     {
         // MFD_CLOEXEC = 1
         let fd = unsafe {
@@ -42,12 +59,12 @@ fn memory_backing_file() -> Result<File> {
         }
         Ok(unsafe { File::from_raw_fd(fd as RawFd) })
     }
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(all(not(target_os = "linux"), not(target_arch = "wasm32")))]
     {
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
             "mpedb-mem-{}-{}",
-            std::process::id(),
+            crate::os::process_id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
@@ -545,6 +562,16 @@ pub fn decode_wal_record(buf: &[u8], offset: u64, page_count: u64) -> Option<Wal
 /// log itself is as durable as what it records. No-op when unset. Test-only
 /// by construction (one env lookup, cached).
 pub fn extent_sync_log(ranges: &[(u64, u32)]) -> Result<()> {
+    // wasm32: no env to read the opt-in from and no file to append to. The
+    // native body is unreachable rather than stubbed — this log records a
+    // durability barrier, and the private path promises no durability at all.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = ranges;
+        return Ok(());
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
     use std::io::Write;
     use std::sync::OnceLock;
     static LOG: OnceLock<Option<std::path::PathBuf>> = OnceLock::new();
@@ -567,6 +594,7 @@ pub fn extent_sync_log(ranges: &[(u64, u32)]) -> Result<()> {
         return Err(io_err("fdatasync(extent sync log)"));
     }
     Ok(())
+    }
 }
 
 /// Per-process handle on the WAL file. `alloc` caches the preallocated
@@ -694,6 +722,7 @@ fn apply_file_perms(fd: RawFd, perms: &FilePerms) -> Result<()> {
 /// Resolve a user (`is_user`) or group name to a numeric id. A purely-numeric
 /// string is taken as the id directly; otherwise it is looked up via
 /// `getpwnam_r`/`getgrnam_r` (thread-safe, buffer-growing on ERANGE).
+#[cfg(not(target_arch = "wasm32"))]
 fn resolve_id(name: &str, is_user: bool) -> Result<u32> {
     if let Ok(n) = name.parse::<u32>() {
         return Ok(n);
@@ -731,6 +760,22 @@ fn resolve_id(name: &str, is_user: bool) -> Result<u32> {
         }
         return Ok(id);
     }
+}
+
+/// wasm32: there is no user/group database to resolve against. A numeric id
+/// still parses; a NAME cannot be resolved, and inventing one would silently
+/// misapply an isolation boundary — so it is refused. Unreachable in practice:
+/// the only reachable path here is `:memory:`, which owns no file to chown.
+#[cfg(target_arch = "wasm32")]
+fn resolve_id(name: &str, is_user: bool) -> Result<u32> {
+    if let Ok(n) = name.parse::<u32>() {
+        return Ok(n);
+    }
+    let kind = if is_user { "user" } else { "group" };
+    Err(Error::Config(format!(
+        "cannot resolve {kind} name `{name}`: the wasm32 build has no user database \
+         (use a numeric id)"
+    )))
 }
 
 /// Overwrite `[from, to)` with literal zeros (1 MiB chunks). Used when
@@ -1363,6 +1408,8 @@ impl Shm {
     /// without faulting mapping pages, and a later `msync` of the same range
     /// makes them durable exactly like mapping stores.
     pub fn file_write_at(&self, buf: &[u8], offset: u64) -> Result<()> {
+        // wasm32: `write_all_at` is inherent on the wasmcompat File.
+        #[cfg(not(target_arch = "wasm32"))]
         use std::os::unix::fs::FileExt;
         self.file
             .write_all_at(buf, offset)
@@ -1383,7 +1430,7 @@ impl Shm {
     /// the vkind=3 format window (the other is body alignment).
     pub fn file_copy_range_from(
         &self,
-        src: &std::fs::File,
+        src: &File,
         src_off: u64,
         dst_off: u64,
         len: u64,
@@ -1472,6 +1519,9 @@ impl Shm {
     pub fn sync_barrier(&self) -> Result<()> {
         #[cfg(not(target_os = "linux"))]
         {
+            // wasm32: `as_raw_fd` is inherent on the wasmcompat File, and
+            // `fdatasync` there is the documented no-op (nothing is durable).
+            #[cfg(not(target_arch = "wasm32"))]
             use std::os::unix::io::AsRawFd;
             if crate::os::fdatasync(self.file.as_raw_fd()) != 0 {
                 return Err(io_err("F_FULLFSYNC after msync"));
@@ -1990,7 +2040,7 @@ impl Shm {
         if self.is_private {
             return self.claim_and_pin_private();
         }
-        let pid = std::process::id();
+        let pid = crate::os::process_id();
         let (idx, word) = match self.claim_slot(pid) {
             Some(x) => x,
             None => {
@@ -2139,7 +2189,7 @@ impl Shm {
         // randomized start offset decorrelates claim scans across processes
         // and across threads within one process
         let salt = CLAIM_SALT.fetch_add(1, Ordering::Relaxed);
-        let start = std::process::id()
+        let start = crate::os::process_id()
             .wrapping_mul(2654435761)
             .wrapping_add(salt.wrapping_mul(40503))
             % n;
@@ -2655,7 +2705,7 @@ impl Shm {
             max_readers,
             durability,
             data_start: data_start_page(max_readers),
-            my_pid_start: proc_start_time(std::process::id()).ok_or_else(|| {
+            my_pid_start: proc_start_time(crate::os::process_id()).ok_or_else(|| {
                 Error::Config("cannot read this process's start time for identity".into())
             })?,
             recovered: false,

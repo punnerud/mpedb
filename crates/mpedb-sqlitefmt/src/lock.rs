@@ -18,7 +18,18 @@
 //! ([`SharedLock::ofd`]) — callers doing in-process sqlite work must then
 //! run the drop/re-take dance the design specifies.
 
+//! ## wasm32
+//!
+//! There is no filesystem in a browser, so every entry point below fails at
+//! its opening `File::open(base)` before any lock primitive runs — a sqlite
+//! base file cannot exist to be locked. The primitives are therefore stubbed
+//! as *unreachable but honest*: if one were ever reached it reports that the
+//! lock could not be taken, never that it was. Silently "succeeding" at a
+//! lock against a foreign sqlite writer is the one answer that would be
+//! dangerous, and it is the one answer this cannot give.
+
 use std::fs::File;
+#[cfg(not(target_arch = "wasm32"))]
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
@@ -27,10 +38,41 @@ use std::path::Path;
 /// on macOS (the consts are already `c_short`) — which is why clippy on macOS
 /// flags the inline spelling as `unnecessary_cast`. One allowed cast here, and
 /// every use site stays cast-free on both platforms.
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::unnecessary_cast)]
 const RDLCK: i16 = libc::F_RDLCK as i16;
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::unnecessary_cast)]
 const UNLCK: i16 = libc::F_UNLCK as i16;
+
+#[cfg(target_arch = "wasm32")]
+const RDLCK: i16 = 0;
+#[cfg(target_arch = "wasm32")]
+const UNLCK: i16 = 2;
+
+/// The lock-command triple's type, `libc::c_int` natively.
+#[cfg(target_arch = "wasm32")]
+type LockCmd = i32;
+#[cfg(not(target_arch = "wasm32"))]
+type LockCmd = libc::c_int;
+
+/// The fd a lock op targets. wasm32 has no fds; unreachable (see module doc).
+#[cfg(not(target_arch = "wasm32"))]
+fn fd_of(f: &File) -> i32 {
+    f.as_raw_fd()
+}
+#[cfg(target_arch = "wasm32")]
+fn fd_of(_f: &File) -> i32 {
+    -1
+}
+
+#[cfg(target_arch = "wasm32")]
+fn no_locks<T>() -> Result<T> {
+    Err(Error::Io(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "no byte-range locks in the wasm32 build (there is no sqlite base file to lock)",
+    )))
+}
 
 use crate::{Error, Result};
 
@@ -39,6 +81,7 @@ const RESERVED_BYTE: i64 = PENDING_BYTE + 1;
 const SHARED_FIRST: i64 = PENDING_BYTE + 2;
 const SHARED_SIZE: i64 = 510;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn flock(ty: i16, start: i64, len: i64) -> libc::flock {
     // Zeroed base: l_whence = SEEK_SET (0), l_pid filled by the kernel.
     let mut f: libc::flock = unsafe { std::mem::zeroed() };
@@ -50,6 +93,12 @@ fn flock(ty: i16, start: i64, len: i64) -> libc::flock {
 
 /// Try a non-blocking lock op; `Ok(true)` = acquired, `Ok(false)` = someone
 /// conflicting holds it.
+#[cfg(target_arch = "wasm32")]
+fn setlk(_fd: i32, _cmd: LockCmd, _ty: i16, _start: i64, _len: i64) -> Result<bool> {
+    no_locks()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn setlk(fd: i32, cmd: libc::c_int, ty: i16, start: i64, len: i64) -> Result<bool> {
     let mut f = flock(ty, start, len);
     let r = unsafe { libc::fcntl(fd, cmd, &mut f) };
@@ -65,6 +114,12 @@ fn setlk(fd: i32, cmd: libc::c_int, ty: i16, start: i64, len: i64) -> Result<boo
 
 /// Would a `ty` lock on `[start, start+len)` be granted right now? (F_GETLK
 /// probe — takes nothing.)
+#[cfg(target_arch = "wasm32")]
+fn getlk_free(_fd: i32, _cmd: LockCmd, _ty: i16, _start: i64, _len: i64) -> Result<bool> {
+    no_locks()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn getlk_free(fd: i32, cmd_getlk: libc::c_int, ty: i16, start: i64, len: i64) -> Result<bool> {
     let mut f = flock(ty, start, len);
     let r = unsafe { libc::fcntl(fd, cmd_getlk, &mut f) };
@@ -75,7 +130,13 @@ fn getlk_free(fd: i32, cmd_getlk: libc::c_int, ty: i16, start: i64, len: i64) ->
 }
 
 /// (SETLK cmd, GETLK cmd, is_ofd) — OFD probed once per process.
-fn lock_cmds() -> (libc::c_int, libc::c_int, bool) {
+fn lock_cmds() -> (LockCmd, LockCmd, bool) {
+    // wasm32: no fcntl commands exist; `false` (not OFD) is the conservative
+    // report, and no caller gets this far anyway.
+    #[cfg(target_arch = "wasm32")]
+    {
+        (0, 0, false)
+    }
     #[cfg(target_os = "linux")]
     {
         (libc::F_OFD_SETLK, libc::F_OFD_GETLK, true)
@@ -87,7 +148,7 @@ fn lock_cmds() -> (libc::c_int, libc::c_int, bool) {
         // against a second description's write attempt.
         (libc::F_OFD_SETLK, libc::F_OFD_GETLK, true)
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     {
         // Other unixes: classic locks; callers must run the [R#5]
         // drop/re-take dance around in-process sqlite use.
@@ -112,7 +173,7 @@ impl SharedLock {
     /// SHARED range. `Ok(None)` = busy right now.
     pub fn acquire(base: &Path) -> Result<Option<SharedLock>> {
         let file = File::options().read(true).write(true).open(base)?;
-        let fd = file.as_raw_fd();
+        let fd = fd_of(&file);
         let (setlk_cmd, getlk_cmd, ofd) = lock_cmds();
         // sqlite's sequence: a reader first proves PENDING is free.
         if !getlk_free(fd, getlk_cmd, RDLCK, PENDING_BYTE, 1)? {
@@ -136,7 +197,7 @@ impl SharedLock {
     /// so only a writer conflicts, and a writer holds RESERVED from its
     /// first dirtied page through COMMIT (and PENDING through EXCLUSIVE).
     pub fn writer_active(&self) -> Result<bool> {
-        let fd = self.file.as_raw_fd();
+        let fd = fd_of(&self.file);
         let (_, getlk_cmd, _) = lock_cmds();
         Ok(
             !getlk_free(fd, getlk_cmd, RDLCK, RESERVED_BYTE, 1)?
@@ -150,7 +211,7 @@ impl Drop for SharedLock {
         let (setlk_cmd, _, _) = lock_cmds();
         // Best-effort explicit unlock; closing the fd releases it anyway.
         let _ = setlk(
-            self.file.as_raw_fd(),
+            fd_of(&self.file),
             setlk_cmd,
             UNLCK,
             SHARED_FIRST,
@@ -162,7 +223,7 @@ impl Drop for SharedLock {
 /// Standalone writer probe without holding anything (opens its own fd).
 pub fn writer_active(base: &Path) -> Result<bool> {
     let file = File::options().read(true).write(true).open(base)?;
-    let fd = file.as_raw_fd();
+    let fd = fd_of(&file);
     let (_, getlk_cmd, _) = lock_cmds();
     Ok(!getlk_free(fd, getlk_cmd, RDLCK, RESERVED_BYTE, 1)?
         || !getlk_free(fd, getlk_cmd, RDLCK, PENDING_BYTE, 1)?)
