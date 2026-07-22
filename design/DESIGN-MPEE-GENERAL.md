@@ -190,8 +190,11 @@ Committed plan, each stage green (`cargo test --workspace`, clippy `-D
 warnings`) before the next; measured results are appended to this doc per stage.
 
 - **A — `CostSource` seam + per-index NDV bucket.** The star-schema fix.
-  Proven by olapbench `join-star-*` (plans must show dimension-first entry;
-  kill-switch A/B stays green).
+  **SHIPPED + MEASURED 2026-07-22 (`2f4c7b7`):** `join-star-2` 1198 → 203 ms,
+  `join-star-4` 1325 → 336, `join-bad-order` 1099 → 196 on the M3 2M-row star —
+  5.9× recovered, plans read `product [index] -> fact [index]`, every engine
+  still agrees, `analyze()` cost 0.18 s for nine indexes. The predicted pricing
+  from §4 (17 vs 21) is the pricing observed.
 - **B — `count(*)` narrow tree, NOT-NULL-guarded.** `try_agg_index` declines
   all-count queries today (`aggregate.rs:989`); the guard is the NULL-membership
   rule (`engine/mod.rs:426`). Benchmark schema gains NOT NULL keys; regression
