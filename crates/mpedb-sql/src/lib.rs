@@ -45,7 +45,8 @@ pub use plan::{
     WindowSpec, CTE_TABLE, DUAL_TABLE,
 };
 pub use planner::{
-    row_prune, secondary_indexes, set_mpee_enabled, Mask, RowCountFn, RowPrune, NO_ROW_COUNTS,
+    row_prune, secondary_indexes, set_mpee_enabled, CostSource, Mask, RowCountFn, RowPrune,
+    NO_ROW_COUNTS,
 };
 pub use policy::{table_policy_hash, PolicyCatalog, TablePolicies};
 pub use view::ViewCatalog;

@@ -58,6 +58,7 @@ mod shard;
 mod sqlite_attach;
 mod ddl_apply;
 mod sqlite_overlay;
+pub mod stats;
 mod stream;
 mod tier;
 mod trigger;
@@ -1044,14 +1045,25 @@ impl Database {
         // The read pin is held only for the compile, which happens once per
         // statement; `execute(hash, params)` never comes near it.
         let r = self.engine.begin_read()?;
+        let bundle = self.schema();
+        let cost = mpedb_sql::CostSource {
+            row_count: &|tid| r.row_count(tid).unwrap_or(0),
+            // Stage A (DESIGN-MPEE-GENERAL): the per-index NDV bucket from the
+            // last analyze() pass, read off the SAME snapshot as the row
+            // counts. Absent/stale records read as None, which prices exactly
+            // as before the pass existed.
+            index_ndv_bucket: &|tid, ixno| {
+                ndv_bucket_from(&r, bundle.schema_gen, tid, ixno)
+            },
+        };
         let out = mpedb_sql::prepare_maybe_explain_with_views(
             sql,
-            &self.schema(),
+            &bundle,
             &catalog,
             &views,
             self.bare_group_by,
             &self.host_udf_set(),
-            &|tid| r.row_count(tid).unwrap_or(0),
+            &cost,
         );
         r.finish()?;
         out
@@ -1131,6 +1143,10 @@ impl Database {
         // which is what keeps an in-session compile and an ordinary compile of
         // the same SQL landing on the same plan hash.
         let r = self.engine.begin_read()?;
+        let cost = mpedb_sql::CostSource {
+            row_count: &|tid| r.row_count(tid).unwrap_or(0),
+            index_ndv_bucket: &|tid, ixno| ndv_bucket_from(&r, schema.schema_gen, tid, ixno),
+        };
         let out = mpedb_sql::prepare_maybe_explain_with_views(
             sql,
             schema,
@@ -1138,7 +1154,7 @@ impl Database {
             &views,
             self.bare_group_by,
             &self.host_udf_set(),
-            &|tid| r.row_count(tid).unwrap_or(0),
+            &cost,
         );
         r.finish()?;
         out
@@ -2164,6 +2180,22 @@ fn check_sys_ns(ns: &str) -> Result<()> {
         )));
     }
     Ok(())
+}
+
+/// Read one index's NDV bucket for the planner's `CostSource` — a single
+/// sys-keyspace get on the compile's own snapshot. Every failure mode
+/// (no record, stale generation, corrupt bytes) is `None`: a stats record is
+/// advisory, and a prepare must never fail because of one.
+fn ndv_bucket_from(
+    r: &mpedb_core::engine::ReadTxn<'_>,
+    schema_gen: u64,
+    table_id: u32,
+    index_no: u32,
+) -> Option<u32> {
+    let subkey = sys_record_subkey(stats::NS, &stats::record_key(table_id, index_no)).ok()?;
+    let bytes = r.sys_get(&subkey).ok().flatten()?;
+    let ndv = stats::decode_record(&bytes, schema_gen)?;
+    (ndv > 0).then(|| stats::bucket(ndv))
 }
 
 fn sys_record_subkey(ns: &str, key: &[u8]) -> Result<Vec<u8>> {
