@@ -61,8 +61,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      # Print the toolchain LOUDLY: CI tracks stable, dev boxes lag, and a
+      # clippy lint that exists in one and not the other reads as "CI is
+      # flaky" when it is really "your box is a release behind". This job has
+      # already failed exactly that way (`byte_char_slices`, new in 1.97,
+      # against a 1.96 dev box).
       - name: toolchain
-        run: rustc --version && cargo --version && sqlite3 --version
+        run: rustc --version && cargo --version && cargo clippy --version && sqlite3 --version
       # mold is a build ACCELERATOR, opted into here rather than committed in
       # `.cargo/config.toml`: a committed `-fuse-ld=mold` is a hard dependency,
       # and it broke this workflow — the runners have no mold, so every link

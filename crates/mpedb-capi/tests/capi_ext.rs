@@ -1526,7 +1526,7 @@ fn blob_write_refuses_to_break_a_text_value() {
         assert_eq!(exec(db, "insert into t values (1, 'hello')"), SQLITE_OK);
         let h = blob_open_ok(db, "t", "c", 1, 1);
         // ASCII in, ASCII out: fine.
-        let ok = [b'H'];
+        let ok = *b"H";
         assert_eq!(sqlite3_blob_write(h, ok.as_ptr() as *const c_void, 1, 0), SQLITE_OK);
         // A lone continuation byte is not valid UTF-8: refused, value intact.
         let bad = [0xFFu8];
