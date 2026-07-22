@@ -52,9 +52,13 @@ Milliseconds, median of 5 plus an untimed warm-up.
 | `count-filtered` | precompute | 0.165 | 0.365 | 0.007 | 2.2× faster | 24× slower |
 | `group-small` | group by | 262.5 | 1.2 | 698.9 | 219× slower | **2.7× faster** |
 | `group-large` | group by | 389.0 | 8.1 | 937.2 | 48× slower | **2.4× faster** |
-| `join-star-2` | join order | 1198.0 | 1.9 | 110.3 | 630× slower | **11× slower** |
-| `join-star-4` | join order | 1325.0 | 3.8 | 173.8 | 349× slower | **7.6× slower** |
-| `join-bad-order` | join order | 1098.5 | 2.7 | 90.1 | 401× slower | 12× slower |
+| `join-star-2` | join order | ~~1198.0~~ **203.2** | 1.9 | 116.5 | 106× slower | 1.7× slower |
+| `join-star-4` | join order | ~~1325.0~~ **336.3** | 3.9 | 182.7 | 86× slower | 1.8× slower |
+| `join-bad-order` | join order | ~~1098.5~~ **196.1** | 2.7 | 95.0 | 71× slower | 2.1× slower |
+
+The struck-through join numbers are the same build without statistics; the bold
+ones are after `Database::analyze()` (0.18 s for all nine indexes) — the stage-A
+fix described under Loss 2, re-measured 2026-07-22 evening.
 
 Prepared and parameterised, 20,000 executions, total milliseconds:
 
@@ -139,7 +143,19 @@ Recorded that way rather than as a clean defect, because a "fast" count that
 silently skipped NULL-bearing rows would be the exact failure this benchmark
 exists to catch.
 
-### Loss 2: the star schema defeats worst-case costing — 7.6–12× slower than SQLite
+### Loss 2, FIXED the same day: per-index NDV flips the star — 5.9× recovered
+
+**Re-measure after commit `2f4c7b7`** (CostSource seam + NDV bucket +
+`Database::analyze()`): `join-star-2` 1198 → 203 ms, `join-star-4` 1325 → 336,
+`join-bad-order` 1099 → 196. The plans now read
+`product [index] -> fact [index]` — the dimension drives and the fact is entered
+through its join-key index, which is exactly SQLite's plan. Every row still
+agrees. The residual 1.7–2.1× against SQLite is per-probe execution cost, not
+plan choice, and belongs to the same family as the prepared-point gap below.
+
+The paragraphs that follow are the original analysis of the loss, kept because
+the mechanism — and why the fix is a cost *input*, not a solver change — is the
+finding.
 
 ```
 mpedb:   join order: fact [scan] -> product [pk]
