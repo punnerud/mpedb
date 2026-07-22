@@ -3026,12 +3026,10 @@ and both are engine-side (below).
   capture is one instant under the writer lock with nothing to restart. Both
   deviations are stated in `backup.rs`'s module doc and neither can be made to
   agree without lying about the copy.
-* **`sqlite_master` rows for indexes, views and triggers.** The verbatim record
-  added here could carry them, and a dump that loses indexes replays into a
-  different schema, so this is a real gap. It is left because it changes what
-  Django's `get_constraints` reads (`SELECT sql, type FROM sqlite_master WHERE
-  tbl_name = %s AND type IN ('table','index')`), and re-measuring Django's
-  2,176 tests was not possible inside this task. Recorded, not taken.
+* ~~**`sqlite_master` rows for indexes, views and triggers.**~~ **TAKEN — see
+  AT HEAD (6).** Views and triggers were already there; INDEX rows landed with
+  the shim's own `CREATE INDEX` record set, and Django's `get_constraints` was
+  re-measured (it did not merely change — it was RAISING before).
 
 ### Two engine findings surfaced while measuring
 
@@ -3039,13 +3037,12 @@ and both are engine-side (below).
   `CREATE TABLE "alpha" ("one")` then `ALTER TABLE "alpha" ADD COLUMN two TEXT`
   → `schema error: table 'alpha' has implicit_rowid set but its last column is
   not a NOT-NULL Int64 'rowid' sole primary key`. The new column is appended
-  *after* the hidden rowid. Tables with an explicit PK alter fine.
-* **The schema the shim introspects is refreshed lazily.** A `sqlite_master` or
-  `PRAGMA table_info` query issued immediately after a `COMMIT` that created a
-  table does not see it; the next statement makes it visible. Pre-existing and
-  orthogonal to anything here, but it is why
-  `sqlite_master_returns_the_verbatim_create_table` runs an `INSERT` before its
-  post-commit assertion.
+  *after* the hidden rowid. Tables with an explicit PK alter fine. **Still open
+  — the two sites are named in AT HEAD (6); both are engine, neither is shim.**
+* ~~**The schema the shim introspects is refreshed lazily.**~~ **FIXED for
+  SQL-surface introspection by `a48ec1c`** (this note outlived the fix). What
+  survived it — and is fixed in AT HEAD (6) — is the same staleness in
+  `sqlite3_blob_open`, which bypasses SQL entirely.
 
 ### Reproduction
 
@@ -3285,3 +3282,194 @@ mid-txn `table_info` + trigger-before-view master order).
 Same M3 interposition after splitting `tests/capi.rs` → `capi_{basic,ext,more}.rs`
 (each <2000 lines). CPython **459/467**, residual ids unchanged (1 FAIL + 7 ERROR,
 all deliberate). Django A **831/831**, `queries` **493/493**.
+
+---
+
+## AT HEAD (6) — `#119`, re-measured on Linux at `858dbb5` + this branch (2026-07-22)
+
+Two bugs found by measurement and one gap taken, all inside `crates/mpedb-capi/`.
+**Machine: the Linux dev box, x86-64.** Stock CPython **3.12.3**,
+`PYTHONPATH=/mnt/xfs/cpython-tests/lib python3.12 -m test test_sqlite3 -v`,
+`ulimit -v 3000000`, `/dev/shm/mpedb-*` cleaned per arm.
+
+**Interposition, proved (not assumed):**
+
+| probe | stock | shim |
+|---|---|---|
+| `sqlite3.sqlite_version` | `3.45.1` | **`3.45.0`** |
+| `SELECT * FROM nosuchtable` | `no such table: nosuchtable` | **``bind error: unknown table `nosuchtable` ``** |
+| `PRAGMA foreign_keys` after `= ON` | `1` | **`0`** (D11 honesty) |
+
+### CPython `test_sqlite3` — no delta, and that is the correct result
+
+| arm | run | pass | FAIL | ERROR | skip |
+|---|---|---|---|---|---|
+| stock libsqlite3 3.45.1 | 466 | **466** | 0 | 0 | 5 |
+| shim @ `858dbb5` (**before**) | 466 | **458** | 1 | 7 | 5 |
+| shim @ this branch (**after**) | 466 | **458** | 1 | 7 | 5 |
+
+`diff before/ids.txt after/ids.txt` is **empty** — same eight ids, all in the
+already-documented deliberate set (`test_progress`, `test_modifying_progress`,
+`test_connection_config`, `test_serialize_deserialize`, `test_dump_autoincrement`
+×2, `test_dump_virtual_tables`, `test_error_msg_decode_error`). Nothing here is
+reachable from CPython's suite: its iterdump tests create no indexes and it
+never binds a parameter into a `sqlite_master` query. **Zero closes, zero
+regressions** — the honest number, stated rather than rounded.
+
+*(The 440/466 in the older Linux sections is stale: `858dbb5` already scores
+458/466 on this runner before any change in this branch.)*
+
+### Django — the suites that DO reach the changed code
+
+| label set | tests | shim before | shim after |
+|---|---|---|---|
+| G1 `basic lookup transactions ordering update delete` | 392 | OK (skip 17) | OK (skip 17) |
+| G2 `aggregation annotations expressions` | 439 | 438 (1 error) | 438 (1 error) |
+| **A = G1+G2** | **831** | **830** | **830** |
+
+Identical id-for-id (the one error is
+`expressions…test_expressions_not_introduce_sql_injection_via_untrusted_string_inclusion`,
+present on both arms of this Linux runner; the M3 sheet above records 831/831,
+so this is a runner difference, not a regression).
+
+**`backends` and `introspection` could NOT be measured**, and the reason is not
+this branch: on both arms Django's `migrate` for those labels dies at
+`UNIQUE INDEX … WHERE is not supported yet` before a single test runs. That is
+an engine gap (`WriteTxn::create_index`), identical before and after. Stated
+plainly rather than reported as a pass.
+
+So `get_constraints` was measured **directly** instead, through Django's own
+`connection.introspection` against a file database:
+
+```
+stock       t -> [('ix_c', ('c',), False, True, False), ('ux_b', ('b',), True, True, False)]
+            u -> [('__primary__', ('a',), False, False, True), ('__unnamed_constraint_1__', ('b',), True, False, False)]
+shim BEFORE t -> RAISED OperationalError: unsupported: this sqlite_master query form is not supported…
+            u -> RAISED OperationalError: unsupported: this sqlite_master query form is not supported…
+shim AFTER  (byte-identical to stock, both tables)
+```
+
+The earlier note feared this change would "change what Django's
+`get_constraints` reads". It did not change it — **it made it exist.** Every
+call raised before, because Django reaches `sqlite_master` only through bound
+parameters and the shim's mini-evaluator read literals or refused.
+
+And `iterdump`, which is the whole point of the `sqlite_master` gap:
+
+```
+stock  / shim AFTER          shim BEFORE
+CREATE TABLE t (a integer, b text, c text);   CREATE TABLE "t" ("a" INTEGER, "b" TEXT UNIQUE, "c" TEXT);
+INSERT INTO "t" VALUES(1,'x','y');            INSERT INTO "t" VALUES(1,'x','y');
+CREATE TABLE u (a text PRIMARY KEY, b text UNIQUE);   CREATE TABLE u (…);
+CREATE UNIQUE INDEX ux_b ON t(b);             — gone —
+CREATE INDEX ix_c ON t(c);                    — gone —
+```
+
+The "before" column is the failure the gap describes, **twice**: the dump loses
+both indexes, *and* it turns column `b` into a `UNIQUE` constraint it never had
+— a table that replays as a different table. After: byte-identical to stock.
+
+### What changed
+
+**1. `sqlite3_blob_open` read a stale schema (bug).** `Database::schema()` hands
+back this process's cached bundle; a DDL commit moves only `schema_gen` in the
+flipping meta. Every SQL path refreshes through the facade's
+`gate_cache_on_schema`, and `sqlite_master`/`PRAGMA` got their refresh in
+`a48ec1c` — blob I/O bypasses SQL and got neither. A sibling connection's
+`blob_open` on a demonstrably existing table answered `no such table: main.bl`
+until some other statement happened to reload the bundle. The blob WRITE path
+had the same read, where it is the handle's *expiry detector* — a detector
+reading a stale bundle cannot detect anything. Both now call
+`refresh_schema_if_stale`. Regression test:
+`introspection_sees_what_the_previous_statement_committed`.
+
+**2. `sqlite_master` refused every bound parameter (bug).** `WHERE name = ?`
+became `WHERE name = $1` after `scan_params`, and the operand reader looked for
+a `'literal'`. Every predicate form now accepts a `$N` operand, and a NULL bind
+yields `Pred::Never` rather than a string compare (SQL 3VL: `col = NULL` is
+never true). Regression test:
+`sqlite_master_where_accepts_a_bound_parameter`.
+
+**3. INDEX rows in `sqlite_master`, and a real `PRAGMA index_list`/`index_info`.**
+mpedb's `IndexDef` carries columns, the UNIQUE bit and the partial predicate and
+**no name** — the engine never needed one (`index_no` = position + 1, and there
+is no `DROP INDEX`). So the shim records `name → (shape fingerprint, verbatim
+CREATE INDEX)` in the catalog sys-keyspace (`introspect::IDX_NS`), the same
+mechanism `#118` already used for `CREATE TABLE` text: it rides the DDL's own
+write transaction and every process sees it. The fingerprint is by column
+NAMES, so an unrelated `ALTER TABLE … DROP COLUMN` (which renumbers ordinals)
+does not orphan it; `DROP TABLE` sweeps the table's index records so a
+re-created table cannot inherit a name nobody gave it.
+
+Everything textual was probed against the bundled 3.45.0 oracle, and two rules
+were **not** guessable:
+
+| written | sqlite stores |
+|---|---|
+| `create   table   spaced ( a  int ) ;` | `CREATE TABLE spaced ( a  int )` |
+| `create index   ixs   on spaced ( a )   ;  -- trail` | `CREATE INDEX ixs   on spaced ( a )   ` — **three trailing spaces** |
+| `CREATE INDEX ix9 ON t9(a) /* mid */ ;` | `CREATE INDEX ix9 ON t9(a) /* mid */ ` — **comment kept** |
+| `create unique index u on t(a)` | `CREATE UNIQUE INDEX u on t(a)` |
+
+`sqlite3EndTable` measures to the closing `)`; `sqlite3CreateIndex` measures to
+the last token and then drops one `;`, so an index keeps the trivia a table
+loses. `PRAGMA index_list` reports **newest first** (probed), `origin` is
+`c`/`u`/`pk`, `partial` is the predicate bit, and a constraint index is
+`sqlite_autoindex_<t>_<k>` with a **NULL** `sql` — the NULL is load-bearing, it
+is what Django's `if not sql: continue` reads.
+
+**4. The reconstruction stopped inventing a `UNIQUE` constraint.** mpedb's
+canonical-bytes decode rebuilds `ColumnDef::unique` from the index list ("a
+single-column index marks its column"), so after `CREATE UNIQUE INDEX ux ON
+t(a)` the flag is set on a column the caller declared plain — and `create_ddl`
+echoed it. `create_ddl` now suppresses a column-level `UNIQUE` for any unique
+index the shim holds a `CREATE UNIQUE INDEX` record for. This is the second half
+of the iterdump diff above, and it also means a `CREATE UNIQUE INDEX` no longer
+destroys the table's own verbatim text by moving its shape fingerprint.
+
+### Divergences accepted, and named
+
+* **`sqlite_autoindex_<t>_<k>` numbering can differ** when a table-level
+  `PRIMARY KEY (b)` is written BEFORE a `UNIQUE (a)` on an earlier column: the
+  shim orders constraint indexes by first-column ordinal, because mpedb's
+  schema does not record constraint declaration order. Both engines emit a
+  synthetic name with a NULL `sql` there, and the shim is internally consistent
+  across `index_list`/`index_info`/`sqlite_master`, which is what consumers
+  depend on. Verified equal to sqlite on PK-first, PK-in-the-middle,
+  PK-after-a-table-UNIQUE and `INTEGER PRIMARY KEY` (no index at all).
+* **`sqlite_master` row order is per-table**, not global creation order: table,
+  then its indexes, then all triggers, then all views. mpedb's schema records no
+  global creation order. It agrees with sqlite whenever indexes are created with
+  their table (every ORM migration) and replays correctly regardless.
+* **`PRAGMA index_xinfo` is still not answered** (empty result, as before). Its
+  extra columns are `desc`, `coll` and `key` — and mpedb's parser *silently
+  eats* `ASC`/`DESC` in `CREATE INDEX` (`parser/ddl.rs`), so the shim would have
+  to report `desc=0` for an index the caller wrote `DESC` on. That is a differ,
+  not an agreement. Django uses `index_info`, not `index_xinfo`.
+* **A `CREATE INDEX` whose record is missing** (created by the CLI, by a peer
+  that predates this, or by a non-shim writer) is reported as a constraint
+  index: `sqlite_autoindex_*`, NULL `sql`. Degrading to "unnamed" is the
+  honest fallback; inventing a name is not.
+
+### Engine work this branch could not do, with the precise site
+
+**`ALTER TABLE … ADD COLUMN` on an implicit-rowid table** (`TODO.md` §3). Not a
+shim bug — the shim never sees the column list. Two sites, both engine:
+
+1. **`crates/mpedb-types/src/schema.rs`, `Schema::with_added_column`** —
+   `slot.columns.push(col)` appends AFTER the trailing hidden rowid, and
+   `Schema::validate` (same file, the `implicit_rowid` arm) requires the LAST
+   column to be the NOT-NULL Int64 `rowid` sole PK. The fix is to insert at
+   `columns.len() - 1` when `implicit_rowid`, and to bump the `primary_key`
+   entry (which is `[last]`) by one.
+2. **`crates/mpedb-core/src/engine/write.rs`, `WriteTxn::alter_add_column`** —
+   the row rewrite does `vals.push(fill)` and `new_types.push(col.ty)`. Both
+   must `insert` at the same position, or every existing row is re-encoded with
+   the new column where the rowid belongs.
+
+Reproduced through the C-API in two statements:
+`CREATE TABLE alpha (a INTEGER, b TEXT)` (which is what a shim `CREATE TABLE`
+without a PK becomes, `#94`) then `ALTER TABLE alpha ADD COLUMN c TEXT` →
+``schema error: table `alpha` has implicit_rowid set but its last column is not
+a NOT-NULL Int64 `rowid` sole primary key``. Blast radius: migrations are
+impossible on exactly the tables the shim creates by default.
