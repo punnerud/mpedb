@@ -103,6 +103,25 @@ jobs:
           done
           grep -q 'mpedb.wasm' _site/mpedb.js || { echo "glue does not reference the module"; exit 1; }
 
+      # Pages sets a ten-minute max-age, and a visitor who reloads inside that
+      # window gets the old stylesheet with the new HTML — which reads as "the
+      # fix was not deployed" and has cost real debugging twice. Stamping the
+      # commit into every asset URL makes each deploy a different URL, so the
+      # cache can never serve a mismatched pair. Runs AFTER the sanity check,
+      # whose import-walk matches the unstamped names.
+      - name: stamp assets with the commit
+        run: |
+          REV="${GITHUB_SHA:0:8}"
+          sed -i "s|\(href=\"\./style\.css\)\"|\1?v=$REV\"|; s|\(src=\"\./app\.js\)\"|\1?v=$REV\"|" _site/index.html
+          sed -i "s|\(from \"\./[a-z0-9_-]*\.js\)\"|\1?v=$REV\"|g" _site/app.js
+          sed -i "s|\(\./mpedb\.wasm\)\"|\1?v=$REV\"|g" _site/app.js
+          grep -o 'v='"$REV" _site/index.html _site/app.js | sort | uniq -c
+          # A stamp that silently matched nothing would reintroduce the bug it
+          # exists to prevent.
+          grep -q "style.css?v=$REV" _site/index.html || { echo "stylesheet not stamped"; exit 1; }
+          grep -q "app.js?v=$REV" _site/index.html || { echo "app.js not stamped"; exit 1; }
+          grep -q "csv.js?v=$REV" _site/app.js || { echo "modules not stamped"; exit 1; }
+
       - uses: actions/upload-pages-artifact@v3
         with:
           path: _site
