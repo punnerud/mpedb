@@ -224,3 +224,63 @@ invariance), `tests/agg_stream_mem.rs` slopes, `tests/prune_width.rs`,
 `tests/runtime_budget.rs`, full `cargo test --workspace` ×3, clippy clean, and
 the `select1-4` + `evidence/` corpus report byte-identical (9,489/9,689, the
 same 4 flagged) vs a `31cb87c` build on the same box.
+
+## 8. UPDATE 2026-07-21 — schedule ADAPTIVELY, not on a compile-time gate
+
+§4's up-front gate ("parallel iff estimated rows ≥ threshold") is a
+*prediction*, and it predicts exactly the quantity MPEE refuses to guess: the
+UNKNOWN selectivity class (`LIKE '%x%'`, `f(col) > 0`, a bound-parameter range).
+A gate that mispredicts either eats the full serial cost on a query it called
+small, or pays the 0.56×-at-10k thread-startup tax on one it called big. Both
+misses hurt, and the estimate is worst exactly where it matters.
+
+**Replace the gate with runtime scheduling. The calling thread is worker 0.**
+It begins draining morsel 0 (the lowest key range) immediately — zero added
+latency, serial speed. The remaining key-ordered morsels go into a
+work-stealing queue. A *small* query is finished by worker 0 before any helper
+engages; a *big* one has its tail stolen. **The data decides, at run time, with
+no estimate.** Helpers only ever do work worker 0 would have done anyway
+(morsels are disjoint), so there is no wasted work and nothing to cancel.
+
+Why NOT the alternative — run serial and parallel independently and race, first
+to finish wins: it burns 2× CPU to one winner and must cancel the loser. In a
+single-process engine (DuckDB) idle cores are free; **mpedb's whole
+differentiator is many processes on one file**, so a racing query steals cores
+from the other processes' requests. Racing is wrong for this architecture; the
+worker-0 morsel model is not (helpers engage only when there is a queued morsel
+AND a free core).
+
+**The one cost unique to mpedb: fan-out width must be budgeted.** DuckDB never
+thinks about this; we must. A greedy analytical query must not monopolise
+reader slots and cores that concurrent *processes* want. Bound the helper count
+by (free cores, available reader slots, a concurrency budget) and let a helper
+yield back the instant contention appears. The footprint's role here is
+UPSTREAM and STATIC — it proves the op is read-only and gives the disjoint key
+ranges to cut (am-I-allowed + where), never the dynamic keep-going signal, which
+is runtime feedback (morsels/s, queue depth).
+
+**Assembly and combine, by result shape:**
+- **Order-independent aggregates** (`count`, `min`, `max`, `i128`-summed
+  integer `sum`): each worker holds a partial accumulator; merge is one scalar
+  reduction — genuinely near-free, and zero-copy (shared mmap source, no row
+  materialised — the §7 fusion).
+- **Row-producing queries:** worker 0's output (lowest key range) is emitted
+  first and can stream immediately; a helper that finishes a LATER partition
+  must BUFFER until earlier ones are emitted, because byte-identity with
+  sqlite binds output to key (= scan) order. So "first streams, others fill the
+  remainder" is right, but into an *ordered* buffer. The assembly spine is a
+  pointer concat (cheap); the row *bodies* were still built per worker — that is
+  the §7 per-row constant, paid in parallel, not removed by zero-copy. Only for
+  aggregates does the combine reduce to a scalar merge.
+
+Zero-copy between cores is real but bounded in what it buys: intra-query
+parallelism is THREADS in one process sharing the address space, so all workers
+read the same pages with no duplication (this is why §1 scaled to 6.8×). It
+makes the SOURCE free and the assembly SPINE free; it does not remove per-worker
+row construction. Cut the per-row constant first (§7) and every worker — and the
+serial path — gets faster; the aggregate combine is then the free case.
+
+**Semantics unchanged from §3** — adaptive scheduling removes the gate, not the
+guarantees: key-ordered morsels assembled in key order (byte-identical output),
+work-meter summed deterministically at merge, a raise surfaced from the earliest
+morsel, parallel OFF under RLS (join-reorder precedent) and OFF with LIMIT (v1).
