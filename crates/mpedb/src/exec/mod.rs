@@ -1501,6 +1501,13 @@ fn exec_select(
                     l.saturating_add(o)
                 })
             };
+            // Exact kNN (stage D, design/DESIGN-MPEE-GENERAL.md §3): `ORDER BY
+            // vec_l2(col, $q) LIMIT k` over one table selects under a k-sized
+            // heap with per-dimension early abandonment, instead of computing
+            // every full distance and sorting every row.
+            if let Some(out) = try_exec_knn(ctx, schema, plan, params, sp)? {
+                return Ok(out);
+            }
             if aggregate.is_some() {
                 // Plain aggregate: no correlated subplans and no post-filter.
                 // This function is the fill-free LEAF — every level that owns
@@ -1631,6 +1638,237 @@ fn exec_select(
             Ok(ExecResult::Rows { columns, rows: out })
         }
     }
+}
+
+/// Exact kNN under a bounded heap with early abandonment — `Some` when the
+/// plan is `SELECT … FROM t [WHERE …] ORDER BY vec_l2(col, <query>) LIMIT k`
+/// (single table, single ascending sort key, the key a projection expression
+/// of exactly that shape), `None` otherwise.
+///
+/// The abandonment is the monotone-bound argument of DESIGN-MPEE-GENERAL §3
+/// made concrete: squared-difference terms are non-negative, so the partial
+/// sum is a lower bound on the full distance, and a candidate is dropped the
+/// moment its partial sum exceeds the current k-th best. **Exactness and
+/// errors are both preserved:** the SHAPE of every row's blob is validated
+/// before any summing (a malformed embedding raises exactly as the generic
+/// projection would), only the arithmetic is skipped — and the skipped
+/// arithmetic could only have grown the sum further. Ordering matches the
+/// generic path's stable sort bit-exactly: candidates compare by
+/// `(distance², scan order)`, and `sqrt` is monotone, so the selected set and
+/// its order are the ones the full sort would produce.
+///
+/// NULL keys (a NULL embedding or a NULL query) sort BEFORE every real
+/// distance — ascending storage-class order, sqlite's rule — and are kept in
+/// scan order, exactly as `sort_rows` would place them.
+fn try_exec_knn(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    plan: &CompiledPlan,
+    params: &[Value],
+    sp: &SelectPlan,
+) -> Result<Option<ExecResult>> {
+    use mpedb_types::{Instr, ScalarFn};
+    let SelectPlan {
+        table,
+        access,
+        joins,
+        filter,
+        projection,
+        order_by,
+        limit,
+        offset,
+        distinct,
+        order_over,
+        order_junk,
+        ..
+    } = sp;
+
+    // Shape gates — anything unproven falls back to the generic path, which
+    // is the semantics of record.
+    if !joins.is_empty()
+        || *distinct
+        || *order_over == OrderOver::BaseRow
+        || order_by.len() != 1
+        || *table == mpedb_sql::DUAL_TABLE
+        || *table == mpedb_sql::CTE_TABLE
+    {
+        return Ok(None);
+    }
+    let (key_col, dir, coll) = (&order_by[0].0, order_by[0].1, &order_by[0].2);
+    if dir != SortDir::ASC || !matches!(coll, OrderColl::Native(_)) {
+        return Ok(None);
+    }
+    let Some(limit) = limit else { return Ok(None) };
+    let Some(Projection::Expr { program, .. }) = projection.get(*key_col as usize) else {
+        return Ok(None);
+    };
+    // vec_l2 is symmetric, so both argument orders qualify.
+    let (emb_col, query) = match program.instrs.as_slice() {
+        [Instr::PushCol(c), Instr::PushParam(p), Instr::Call(ScalarFn::VecL2, 2)] => {
+            (*c, params.get(*p as usize))
+        }
+        [Instr::PushParam(p), Instr::PushCol(c), Instr::Call(ScalarFn::VecL2, 2)] => {
+            (*c, params.get(*p as usize))
+        }
+        [Instr::PushCol(c), Instr::PushConst(ci), Instr::Call(ScalarFn::VecL2, 2)] => {
+            (*c, program.consts.get(*ci as usize))
+        }
+        [Instr::PushConst(ci), Instr::PushCol(c), Instr::Call(ScalarFn::VecL2, 2)] => {
+            (*c, program.consts.get(*ci as usize))
+        }
+        _ => return Ok(None),
+    };
+    // The query vector, validated ONCE. NULL or malformed → generic path, so
+    // the NULL-key ordering and the canonical refusal message both come from
+    // the code that owns them.
+    let Some(Value::Blob(qb)) = query else { return Ok(None) };
+    if qb.len() % 4 != 0 {
+        return Ok(None);
+    }
+    let q: Vec<f64> = qb
+        .chunks_exact(4)
+        .map(|c| f64::from(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
+        .collect();
+
+    let keep = {
+        let l = (*limit).min(usize::MAX as u64) as usize;
+        let o = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
+        l.saturating_add(o)
+    };
+
+    // The scan: same gather, same charges, same filter as the generic path.
+    let rows = gather_rows(ctx, *table, access, filter.as_ref(), plan, params, None)?;
+
+    // NULL keys sort first (kept in scan order, capped at `keep`); real
+    // distances go through the max-heap of the k best (d², seq) pairs.
+    struct Cand {
+        d2: f64,
+        seq: usize,
+        row: Vec<Value>,
+    }
+    impl PartialEq for Cand {
+        fn eq(&self, other: &Self) -> bool {
+            self.d2 == other.d2 && self.seq == other.seq
+        }
+    }
+    impl Eq for Cand {}
+    impl PartialOrd for Cand {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    impl Ord for Cand {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.d2.total_cmp(&other.d2).then(self.seq.cmp(&other.seq))
+        }
+    }
+    let mut nulls: Vec<Vec<Value>> = Vec::new();
+    let mut heap: BinaryHeap<Cand> = BinaryHeap::with_capacity(keep + 1);
+    for (seq, row) in rows.into_iter().enumerate() {
+        let emb = row.get(emb_col as usize);
+        let eb = match emb {
+            Some(Value::Null) => {
+                if nulls.len() < keep {
+                    nulls.push(row);
+                }
+                continue;
+            }
+            Some(Value::Blob(b)) => b,
+            // Not a blob: the canonical refusal, from the canonical code.
+            Some(other) => {
+                return Err(Error::TypeMismatch(format!(
+                    "vec_l2() argument 1 must be a blob of little-endian f32, got {}",
+                    other.type_name()
+                )))
+            }
+            None => return Err(Error::Corrupt("kNN embedding column out of range".into())),
+        };
+        // Shape validation is NEVER abandoned — a malformed row must raise
+        // here exactly as the generic projection would have raised.
+        if eb.len() % 4 != 0 {
+            return Err(Error::TypeMismatch(format!(
+                "vec_l2() argument 1: blob length {} is not a multiple of 4",
+                eb.len()
+            )));
+        }
+        if eb.len() / 4 != q.len() {
+            return Err(Error::TypeMismatch(format!(
+                "vec_l2(): dimension mismatch ({} vs {})",
+                eb.len() / 4,
+                q.len()
+            )));
+        }
+        let bound = if heap.len() == keep {
+            match heap.peek() {
+                Some(worst) => worst.d2,
+                None => f64::INFINITY,
+            }
+        } else {
+            f64::INFINITY
+        };
+        let mut d2 = 0.0f64;
+        let mut abandoned = false;
+        for (chunk, qv) in eb.chunks_exact(4).zip(&q) {
+            let x = f64::from(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+            let d = x - qv;
+            d2 += d * d;
+            // The partial sum only grows: past the current k-th best, the
+            // remaining dimensions cannot un-lose.
+            if d2 > bound {
+                abandoned = true;
+                break;
+            }
+        }
+        if abandoned || (heap.len() == keep && keep > 0 && d2 >= bound) {
+            // `>=`: an exact tie keeps the EARLIER row — the stable sort's
+            // answer, since this row's seq is the largest so far.
+            continue;
+        }
+        if keep == 0 {
+            break;
+        }
+        heap.push(Cand { d2, seq, row });
+        if heap.len() > keep {
+            heap.pop();
+        }
+    }
+
+    // NULLs first (scan order), then ascending distance — `sort_rows`' order.
+    let mut chosen = nulls;
+    let mut ranked: Vec<Cand> = heap.into_vec();
+    ranked.sort();
+    chosen.extend(ranked.into_iter().map(|c| c.row));
+    chosen.truncate(keep);
+
+    // The generic tail: project, trim sort-only columns, skip/take.
+    let mut out = Vec::with_capacity(chosen.len());
+    for row in &chosen {
+        let mut orow = Vec::with_capacity(projection.len());
+        for p in projection {
+            orow.push(match p {
+                Projection::Column(i) => row
+                    .get(*i as usize)
+                    .cloned()
+                    .ok_or_else(|| internal("projection column"))?,
+                Projection::Expr { program, .. } => {
+                    program.eval_host(row, params, ctx.host_fns())?
+                }
+            });
+        }
+        out.push(orow);
+    }
+    if *order_junk > 0 {
+        let width = projection.len() - *order_junk as usize;
+        for row in &mut out {
+            row.truncate(width);
+        }
+    }
+    let skip = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
+    let take = (*limit).min(usize::MAX as u64) as usize;
+    let out: Vec<Vec<Value>> = out.into_iter().skip(skip).take(take).collect();
+
+    let columns = select_output_columns(schema, plan, sp)?;
+    Ok(Some(ExecResult::Rows { columns, rows: out }))
 }
 
 /// Precomputed shape for the PkPoint micro-executor. Built once at

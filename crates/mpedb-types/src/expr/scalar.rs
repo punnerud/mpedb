@@ -187,6 +187,20 @@ pub enum ScalarFn {
     /// REAL (`iJD/86400000.0`). The one member of the family that returns a
     /// number rather than text.
     JulianDay = 65,
+    /// `vec_l2(a, b)` — Euclidean distance between two embeddings stored as
+    /// BLOBs of little-endian f32 (stage D, design/DESIGN-MPEE-GENERAL.md).
+    /// Not a sqlite function: sqlite has no vector surface, so these two have
+    /// no oracle and are specified here instead — NULL-propagating like every
+    /// scalar, and STRICT about shape: a blob whose length is not a multiple
+    /// of 4, or two blobs of different lengths, is a runtime refusal
+    /// ([`Error::TypeMismatch`]), never a guess. A wrong dimensionality is a
+    /// wrong QUESTION, and answering it would be the widening trap.
+    VecL2 = 66,
+    /// `vec_cosine(a, b)` — cosine DISTANCE (1 − cosine similarity) between
+    /// two f32-LE blob embeddings. Same shape rules as [`ScalarFn::VecL2`].
+    /// A zero-magnitude vector has no direction, so its cosine distance is
+    /// NULL (the SQL answer to an undefined quantity), not an error.
+    VecCosine = 67,
 }
 
 impl ScalarFn {
@@ -256,6 +270,8 @@ impl ScalarFn {
             63 => ScalarFn::Time,
             64 => ScalarFn::DateTime,
             65 => ScalarFn::JulianDay,
+            66 => ScalarFn::VecL2,
+            67 => ScalarFn::VecCosine,
             other => return Err(Error::Corrupt(format!("unknown scalar function {other}"))),
         })
     }
@@ -283,7 +299,7 @@ impl ScalarFn {
             }
             ScalarFn::Sqrt | ScalarFn::Sign | ScalarFn::Ceil | ScalarFn::Floor => argc == 1,
             ScalarFn::Substr => argc == 2 || argc == 3,
-            ScalarFn::Instr | ScalarFn::Pow => argc == 2,
+            ScalarFn::Instr | ScalarFn::Pow | ScalarFn::VecL2 | ScalarFn::VecCosine => argc == 2,
             ScalarFn::Replace => argc == 3,
             // char() is variadic: 0..=255 code points (the u8 argc caps it).
             ScalarFn::Char => true,
@@ -393,6 +409,8 @@ impl ScalarFn {
             ScalarFn::Time => "time",
             ScalarFn::DateTime => "datetime",
             ScalarFn::JulianDay => "julianday",
+            ScalarFn::VecL2 => "vec_l2",
+            ScalarFn::VecCosine => "vec_cosine",
         }
     }
 }
@@ -404,6 +422,30 @@ impl ScalarFn {
 /// without looking at the others. That is the SQL rule, and it is why the
 /// null-tolerant functions (`coalesce`, `nullif`) are NOT here — they are
 /// compiled to control flow instead, precisely because they must NOT propagate.
+/// Decode one `vec_*` argument: a BLOB of little-endian f32, refused by name
+/// and position when it is anything else. The length rule (a multiple of 4)
+/// is the shape rule, not a formatting nicety — accepting a truncated blob
+/// would silently drop dimensions.
+fn vec_arg(f: ScalarFn, pos: u8, v: &Value) -> Result<Vec<f32>> {
+    let Value::Blob(b) = v else {
+        return Err(Error::TypeMismatch(format!(
+            "{}() argument {pos} must be a blob of little-endian f32, got {}",
+            f.name(),
+            v.type_name()
+        )));
+    };
+    if b.len() % 4 != 0 {
+        return Err(Error::TypeMismatch(format!(
+            "{}() argument {pos}: blob length {} is not a multiple of 4",
+            f.name(),
+            b.len()
+        )));
+    }
+    Ok(b.chunks_exact(4)
+        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .collect())
+}
+
 pub(super) fn call_scalar(f: ScalarFn, args: &[Value]) -> Result<Value> {
     call_scalar_collated(f, args, Collation::Binary)
 }
@@ -747,6 +789,51 @@ pub(super) fn call_scalar_collated(f: ScalarFn, args: &[Value], coll: Collation)
         // ISO-8601 string (design note in [`super::datetime`]).
         ScalarFn::Date | ScalarFn::Time | ScalarFn::DateTime | ScalarFn::JulianDay => {
             super::datetime::sqlite_date_family(f, args)?
+        }
+        ScalarFn::VecL2 | ScalarFn::VecCosine => {
+            let (a, b) = (vec_arg(f, 1, &args[0])?, vec_arg(f, 2, &args[1])?);
+            if a.len() != b.len() {
+                return Err(Error::TypeMismatch(format!(
+                    "{}(): dimension mismatch ({} vs {})",
+                    f.name(),
+                    a.len(),
+                    b.len()
+                )));
+            }
+            match f {
+                ScalarFn::VecL2 => {
+                    // f64 accumulation over f32 inputs: every product is exact
+                    // in f64, so the sum's error is the unavoidable rounding
+                    // of addition alone — and the SAME accumulation order the
+                    // executor's early-abandoning fold uses, so the two paths
+                    // cannot disagree on a distance.
+                    let d2: f64 = a
+                        .iter()
+                        .zip(&b)
+                        .map(|(x, y)| {
+                            let d = f64::from(*x) - f64::from(*y);
+                            d * d
+                        })
+                        .sum();
+                    Value::Float(d2.sqrt())
+                }
+                _ => {
+                    let (mut dot, mut na, mut nb) = (0f64, 0f64, 0f64);
+                    for (x, y) in a.iter().zip(&b) {
+                        let (x, y) = (f64::from(*x), f64::from(*y));
+                        dot += x * y;
+                        na += x * x;
+                        nb += y * y;
+                    }
+                    if na == 0.0 || nb == 0.0 {
+                        // A zero vector has no direction: the quantity is
+                        // undefined, and SQL's word for undefined is NULL.
+                        Value::Null
+                    } else {
+                        Value::Float(1.0 - dot / (na.sqrt() * nb.sqrt()))
+                    }
+                }
+            }
         }
         // --- JSON readers. These DO null-propagate (verified: a NULL document
         // or a NULL path yields NULL), so they sit under the gate.

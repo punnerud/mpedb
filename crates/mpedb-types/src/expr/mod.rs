@@ -24,6 +24,8 @@ mod in_list_tests;
 mod jump_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod vec_tests;
 
 pub use datetime::sqlite_now_string;
 pub use scalar::ScalarFn;
