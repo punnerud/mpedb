@@ -31,3 +31,7 @@ mpedb-sql = { workspace = true }
 # The advisor's index identity is the #118 §2.2 content hash — the same blake3
 # the schema hash already uses one crate down.
 blake3 = { workspace = true }
+# The stored-SQL-function pipeline (stage M2): compile at create_function,
+# interpret at call — database-free by construction (the crate depends only
+# on mpedb-types).
+mpedb-spell = { workspace = true }

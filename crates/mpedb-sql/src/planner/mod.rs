@@ -1818,7 +1818,8 @@ fn max_col(e: &BExpr) -> Option<u16> {
             BExpr::Coalesce(args)
             | BExpr::Call(_, args)
             | BExpr::CallColl(_, args, _)
-            | BExpr::HostCall { args, .. } => {
+            | BExpr::HostCall { args, .. }
+            | BExpr::SpellCall { args, .. } => {
                 stack.extend(args.iter())
             }
             BExpr::Const(_) | BExpr::Param(_) => {}

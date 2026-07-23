@@ -65,6 +65,9 @@ usage: mpedb <command> [args]
                                            workload model — DESIGN-MODEL-LANG.md)
   model set <target> <model.toml>          store the workload model
   model show <target>                      print the stored model
+  fn define <target> <file.py|file.rs>     store a PySpell SQL function
+  fn drop <target> <name>                  drop a stored function
+  fn list <target>                         list stored functions
   call    <target> <hash> [param ...]      execute a prepared plan by hash
   proc    define|call|list ...              stored procedures (see `proc`)
   repl    <target>                          interactive session (stdin)
@@ -146,6 +149,7 @@ fn dispatch(argv: &[String]) -> CliResult {
         "prepare" => cmd_prepare(rest),
         "advise" => cmd_advise(rest),
         "model" => cmd_model(rest),
+        "fn" => cmd_fn(rest),
         "call" => cmd_call(rest),
         "proc" => proc_cmd::run(rest),
         "queue" => queue::run(rest),
@@ -249,6 +253,46 @@ fn cmd_model(args: &[String]) -> CliResult {
             Ok(())
         }
         _ => usage("model needs: set <target> <model.toml> | show <target>"),
+    }
+}
+
+/// `mpedb fn define <target> <file.py|file.rs> | drop <target> <name> |
+/// list <target>` — stored SQL functions (stage M2): PySpell compiled at
+/// define time, stored content-addressed in the file, callable from any
+/// attached process's SQL.
+fn cmd_fn(args: &[String]) -> CliResult {
+    use mpedb::spellfn::SpellLang;
+    match args {
+        [sub, config, file] if sub == "define" => {
+            let lang = if file.ends_with(".rs") { SpellLang::Rust } else { SpellLang::Python };
+            let src = std::fs::read_to_string(file)
+                .map_err(|e| Failure::Runtime(format!("reading {file}: {e}")))?;
+            let db = crate::util::open_target(config)?;
+            let (name, hash) = db.create_function(lang, &src)?;
+            println!("function {name} stored as {hash}");
+            Ok(())
+        }
+        [sub, config, name] if sub == "drop" => {
+            let db = crate::util::open_target(config)?;
+            if db.drop_function(name)? {
+                println!("function {name} dropped");
+            } else {
+                println!("no function named {name}");
+            }
+            Ok(())
+        }
+        [sub, config] if sub == "list" => {
+            let db = crate::util::open_target(config)?;
+            let fns = db.list_functions()?;
+            if fns.is_empty() {
+                println!("no stored functions");
+            }
+            for f in fns {
+                println!("{}/{}  {}", f.name, f.argc, f.hash_hex);
+            }
+            Ok(())
+        }
+        _ => usage("fn needs: define <target> <file.py|rs> | drop <target> <name> | list <target>"),
     }
 }
 

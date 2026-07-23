@@ -708,6 +708,7 @@ pub mod testutil {
     }
 
     impl MockBridge {
+        #[allow(clippy::new_without_default)] // widened from pub(crate) by the M2 split
         pub fn new() -> MockBridge {
             MockBridge {
                 rows: vec![],

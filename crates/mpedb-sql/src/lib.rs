@@ -28,7 +28,7 @@ mod token;
 mod trigger;
 mod view;
 
-pub use binder::HostUdfSet;
+pub use binder::{HostUdfSet, SpellFnSet};
 pub use dbref::{
     mangle as mangle_db_table, parse_attach, resolve_db_refs, AttachStmt, DbResolution, DbScope,
 };
