@@ -18,12 +18,16 @@ pub struct Sqlite {
 const DDL: &str = "
 PRAGMA journal_mode=OFF;
 PRAGMA synchronous=OFF;
-CREATE TABLE customer (id INTEGER PRIMARY KEY, name TEXT, nation_segment TEXT, age INTEGER);
-CREATE TABLE product  (id INTEGER PRIMARY KEY, name TEXT, category TEXT, price REAL);
-CREATE TABLE store    (id INTEGER PRIMARY KEY, name TEXT, nation TEXT);
-CREATE TABLE day      (id INTEGER PRIMARY KEY, year INTEGER, month INTEGER, dom INTEGER);
-CREATE TABLE fact     (id INTEGER PRIMARY KEY, day_id INTEGER, customer_id INTEGER,
-                       product_id INTEGER, store_id INTEGER, qty INTEGER, amount REAL);
+CREATE TABLE customer (id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                       nation_segment TEXT NOT NULL, age INTEGER NOT NULL);
+CREATE TABLE product  (id INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                       category TEXT NOT NULL, price REAL NOT NULL);
+CREATE TABLE store    (id INTEGER PRIMARY KEY, name TEXT NOT NULL, nation TEXT NOT NULL);
+CREATE TABLE day      (id INTEGER PRIMARY KEY, year INTEGER NOT NULL,
+                       month INTEGER NOT NULL, dom INTEGER NOT NULL);
+CREATE TABLE fact     (id INTEGER PRIMARY KEY, day_id INTEGER NOT NULL,
+                       customer_id INTEGER NOT NULL, product_id INTEGER NOT NULL,
+                       store_id INTEGER NOT NULL, qty INTEGER NOT NULL, amount REAL NOT NULL);
 ";
 
 const INDEXES: &str = "

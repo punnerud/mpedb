@@ -19,12 +19,15 @@ pub struct Duck {
 }
 
 const DDL: &str = "
-CREATE TABLE customer (id BIGINT, name VARCHAR, nation_segment VARCHAR, age BIGINT);
-CREATE TABLE product  (id BIGINT, name VARCHAR, category VARCHAR, price DOUBLE);
-CREATE TABLE store    (id BIGINT, name VARCHAR, nation VARCHAR);
-CREATE TABLE day      (id BIGINT, year BIGINT, month BIGINT, dom BIGINT);
-CREATE TABLE fact     (id BIGINT, day_id BIGINT, customer_id BIGINT, product_id BIGINT,
-                       store_id BIGINT, qty BIGINT, amount DOUBLE);
+CREATE TABLE customer (id BIGINT, name VARCHAR NOT NULL, nation_segment VARCHAR NOT NULL,
+                       age BIGINT NOT NULL);
+CREATE TABLE product  (id BIGINT, name VARCHAR NOT NULL, category VARCHAR NOT NULL,
+                       price DOUBLE NOT NULL);
+CREATE TABLE store    (id BIGINT, name VARCHAR NOT NULL, nation VARCHAR NOT NULL);
+CREATE TABLE day      (id BIGINT, year BIGINT NOT NULL, month BIGINT NOT NULL, dom BIGINT NOT NULL);
+CREATE TABLE fact     (id BIGINT, day_id BIGINT NOT NULL, customer_id BIGINT NOT NULL,
+                       product_id BIGINT NOT NULL, store_id BIGINT NOT NULL,
+                       qty BIGINT NOT NULL, amount DOUBLE NOT NULL);
 ";
 
 impl Duck {
