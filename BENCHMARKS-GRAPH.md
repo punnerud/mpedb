@@ -38,33 +38,65 @@ per-probe execution cost (the same one the OLAP bench measured against SQLite).
 
 ## Results
 
-Milliseconds; cold = first run after load, warm = median of 5.
+Milliseconds; cold = first run after load, warm = median of 5. Third run,
+2026-07-23, after the depth sweep found and closed two holes (below). Note on
+Neo4j's columns: by this run its JVM had been serving benchmarks for a while,
+so its cold numbers are far better than a fresh process shows (the first-ever
+run measured 151 ms cold for `degree`; a warm JVM answers the same cold query
+in 3).
 
 | workload | mpedb cold | mpedb warm | neo4j cold | neo4j warm | warm verdict |
 |---|---:|---:|---:|---:|---|
-| `degree` | 4.9 | 2.2 | 151.2 | 2.8 | **mpedb 1.3×** |
-| `hop2` | 25.7 | 8.0 | 133.4 | 15.3 | **mpedb 1.9×** |
-| `hop3` | 73.0 | 25.0 | 119.8 | 15.5 | neo4j 1.6× |
-| `reach4` | 160.1 | 109.2 | 129.8 | 26.7 | neo4j 4.1× |
-| `tri-hub` | 63.4 | 19.8 | 72.6 | 2.7 | neo4j 7.3× |
-| `tri-global` | 4005.9 | 3992.7 | 461.4 | 298.7 | neo4j 13.4× |
+| `degree` | 4.9 | 2.6 | 3.0 | 1.6 | neo4j 1.7× |
+| `hop2` | 23.0 | 7.6 | 6.5 | 3.7 | neo4j 2.0× |
+| `hop3` | 39.5 | 25.1 | 39.6 | 15.1 | neo4j 1.7× |
+| `reach4` | 113.7 | 95.2 | 69.2 | 27.9 | neo4j 3.4× |
+| `reach5` | 223.9 | 168.7 | 86.5 | 36.7 | neo4j 4.6× |
+| `reach6` | 237.8 | 188.0 | 84.5 | 38.3 | neo4j 4.9× |
+| `reach7` | 240.7 | 184.2 | 87.0 | 39.5 | neo4j 4.7× |
+| `reach8` | 243.1 | 185.2 | 88.0 | 38.7 | neo4j 4.8× |
+| `tri-hub` | 36.4 | 10.8 | 3.6 | 1.9 | neo4j 5.6× |
+| `tri-global` | 1449.1 | 1401.3 | 344.0 | 301.1 | neo4j 4.7× |
+
+## The two holes the sweep found, and their fixes
+
+**The depth sweep (reach 4→8) exposed a linear blow-up.** First measurement:
+mpedb 109 → 270 → 450 → 636 → **833 ms** while Neo4j sat flat at ~38 —
+because `UNION` dedups `(node, depth)` PAIRS, a node found at depth 3 was
+"new" again at depth 4, and every level re-expanded the whole reached set.
+The fix (`f0b842d`) reuses the depth-guard proof the risk estimator already
+owns as an execution optimization: when the counter is provably a monotone
+guard, read nowhere else, and the outer statement provably cannot observe
+multiplicity or the counter, the fixpoint dedups the working set on the
+non-counter columns — each node expands once, at minimal depth. After:
+**188/184/185 ms flat**. The curve now bends where Neo4j's bends; the
+remaining ~4.8× is the same constant per-probe cost as every other row here.
+Soundness is pinned differentially against sqlite from both sides — the gated
+shapes at every k on a cyclic graph, and five near-misses (`count(*)`, the
+counter projected, `count(DISTINCT d)`, an outer filter on `d`, `sum`) that
+must decline and do.
+
+**`tri-global` was paying an avg-degree row fetch + filter per probe.** The
+triangle's closing edge pins BOTH columns (`c.src = b.dst AND c.dst = a.src`);
+a `(src, dst)` composite index turns that into one tree point probe — schema
+tuning through the existing #55 machinery, no engine change. 3,993 →
+**1,401 ms** (2.9×), gap to Neo4j from 13.4× to 4.7×.
 
 ## Reading it
 
-**The crossover is at hop 3, and it is the honest headline.** One or two index
-probes out from a node, the edge table wins: `degree` is an index range count,
-`hop2` one self-join, and the HTTP round-trip is a bigger share of Neo4j's
-2.8 ms than the traversal is. From three hops on, the native representation
-takes over — Neo4j follows stored adjacency pointers where mpedb re-descends a
-B+tree per expansion step, and by `tri-global` (a full 3-cycle sweep: 250k
-scan × two probe levels) that per-probe tax compounds to 13.4×.
+**After both fixes, every row is the same story: a constant per-probe factor.**
+1.7–2× on point expansions, 3.4–4.9× on traversals and triangles — Neo4j
+follows stored adjacency pointers where mpedb re-descends a B+tree per
+expansion step, and that is the whole residual. No row is shaped differently
+from the others any more; the two workload-specific pathologies (the linear
+depth blow-up, the unindexed closing edge) are gone.
 
 **This is the same finding as the OLAP bench, wearing a different workload.**
 The join *orders* are right (MPEE + stage-A NDV statistics); what costs is the
 per-probe execution price. The two benches now bracket it from both sides:
-SQLite brackets it at 1.7–2.1× on star joins, Neo4j at 1.6–13× on traversals,
-and any future work on the probe path (batch descent, sorted-run probing)
-pays off in both columns at once.
+SQLite brackets it at 1.7–2.1× on star joins, Neo4j at 1.7–4.9× on
+traversals, and any future work on the probe path (batch descent, sorted-run
+probing) pays off in both columns at once.
 
 **Neo4j's cold column is its own finding.** First-run Cypher pays compilation
 and page-cache warm-up: 151 ms for a `degree` that answers warm in 2.8. mpedb's
@@ -72,13 +104,12 @@ cold runs pay plan compilation measured in single-digit ms — content-hashed
 plans are compiled once and the hot path never parses. On a workload of
 *unrepeated* queries, every Neo4j number above is its cold column.
 
-**The recursive CTE holds up better than expected.** `reach4` — semi-naive
-fixpoint over a working table, no graph machinery at all — lands 4.1× behind a
-native traversal engine on its home question. The prepare-time risk estimator
-also stopped crying wolf on this shape: a depth guard the engine can *prove*
-monotone (`d` carried as `d+1`, guarded `d < 4`) now bounds the estimate
-statically instead of reporting the halting-problem default
-(`risk.rs`, tested in `tests/risk_depth_guard.rs`).
+**One proof, two consumers.** The depth-guard proof (`d` carried as `d+1`,
+guarded `d < k`, anchor constant) now serves both the prepare-time risk
+estimate — which stopped reporting the halting-problem default on provably
+bounded recursions (`risk.rs`, `tests/risk_depth_guard.rs`) — and the
+converged-frontier execution optimization above. They share one function, so
+they can never disagree about what "provably bounded" means.
 
 ## What each workload is
 
