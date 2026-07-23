@@ -39,7 +39,7 @@ pub(super) fn contains_window(e: &ast::Expr) -> bool {
         }
         E::Agg(..) | E::Subquery(_) | E::Exists(..) => false,
         E::Lit(_) | E::Param(_) | E::Col(_) | E::ContextRef(_) | E::Excluded(_)
-        | E::Qualified(..) => false,
+        | E::Qualified(..) | E::Raise(..) => false,
     }
 }
 
@@ -136,7 +136,7 @@ fn lift_windows(e: &ast::Expr, specs: &mut Vec<WindowCollect>) -> Result<ast::Ex
         // it for that refusal rather than lifting it here.
         other @ (E::Agg(..) | E::Subquery(_) | E::Exists(..)) => other.clone(),
         other @ (E::Lit(_) | E::Param(_) | E::Col(_) | E::ContextRef(_) | E::Excluded(_)
-        | E::Qualified(..)) => other.clone(),
+        | E::Qualified(..) | E::Raise(..)) => other.clone(),
     })
 }
 

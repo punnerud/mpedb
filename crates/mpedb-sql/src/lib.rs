@@ -37,7 +37,10 @@ pub use ddl::{
     CreateColumnSpec, CreatePolicySpec, CreateTableSpec, CreateTriggerSpec, CreateVirtualTableSpec,
     DdlStmt, RlsAction, TriggerBodySpec, TriggerEvent, TriggerTiming,
 };
-pub use trigger::{compile_trigger_arg, compile_trigger_body, compile_trigger_when, RowMap, RowSide};
+pub use trigger::{
+    compile_trigger_arg, compile_trigger_body, compile_trigger_when, RowMap, RowSide,
+    TriggerRaise, TriggerStmt,
+};
 pub use plan::{
     AccessPath, AggCall, Aggregation, CompiledPlan, CompoundArm, CompoundPlan, ConflictProbe, Frame,
     FrameBound, FrameMode, FtsQuery, FtsTerm, GroupKey, InsertSource, Join, JoinKind, OrderOver,

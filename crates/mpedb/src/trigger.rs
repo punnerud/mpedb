@@ -19,7 +19,10 @@
 //! `EXECUTE PROCEDURE p(args…)` bodies: a stored PySpell procedure, pinned by
 //! content hash at `CREATE` ([`StoredBody::Proc`]), fired per row on the same
 //! txn through the executor's `CtxBridge` — a failing procedure vetoes the
-//! write, which is the validation-trigger capability `RAISE` will formalize.
+//! write. `RAISE` completes stage 3's veto: `SELECT RAISE(ABORT,'msg')
+//! [WHERE …]` aborts the statement with the user's message and
+//! `SELECT RAISE(IGNORE) [WHERE …]` silently skips the row
+//! ([`FireOutcome::SkipRow`]); `FAIL`/`ROLLBACK` are named refusals.
 //! `INSTEAD OF` and `FOR EACH STATEMENT` remain named refusals at `CREATE`.
 
 use super::*;
@@ -261,10 +264,20 @@ fn resolve_trigger_key(w: &mut mpedb_core::WriteTxn<'_>, name: &str) -> Result<O
 /// A compiled trigger body: in-SQL statements, or a PySpell procedure dispatch
 /// (DESIGN-TRIGGERS §5).
 pub(crate) enum TriggerBody {
-    /// Body statements in declaration order, each with its own `NEW`/`OLD`
-    /// row-slot map (DESIGN-TRIGGERS stage 3 multi-statement bodies).
-    Sql(Vec<(CompiledPlan, RowMap)>),
+    /// Body statements in declaration order (DESIGN-TRIGGERS stage 3
+    /// multi-statement bodies): DML with its own `NEW`/`OLD` row-slot map, or
+    /// a `RAISE` veto statement.
+    Sql(Vec<mpedb_sql::TriggerStmt>),
     Spell(SpellTriggerBody),
+}
+
+/// What a fired trigger set decided about the current row (DESIGN-TRIGGERS
+/// §4.3): proceed normally, or — `RAISE(IGNORE)` — silently skip the row's
+/// operation and all remaining trigger work for it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum FireOutcome {
+    Proceed,
+    SkipRow,
 }
 
 /// An `EXECUTE PROCEDURE` body, resolved at catalog build (gen-gated, so a DDL

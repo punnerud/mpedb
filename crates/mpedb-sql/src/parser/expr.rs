@@ -1186,6 +1186,15 @@ impl<'a> Parser<'a> {
                     self.expect(&Tok::RParen, "`)`")?;
                     return Ok(Expr::ContextRef(key));
                 }
+                // `RAISE(IGNORE)` / `RAISE(ABORT|FAIL|ROLLBACK, 'msg')` — the
+                // action words are keywords/identifiers, not expressions, so
+                // this cannot ride the generic argument parser. Recognized only
+                // as a bare identifier followed by `(` (a quoted "raise" stays
+                // a column). Legal only in a trigger body; the binder refuses
+                // it everywhere else (sqlite's containment rule).
+                if s.eq_ignore_ascii_case("raise") && self.peek() == Some(&Tok::LParen) {
+                    return self.raise_suffix();
+                }
                 if self.peek() == Some(&Tok::LParen) {
                     return self.call_suffix(s);
                 }
@@ -1260,6 +1269,37 @@ impl<'a> Parser<'a> {
             )));
         }
         Ok(Expr::Qualified(qualifier, col))
+    }
+
+    /// Parse the tail of `RAISE(` — the action word (`ROLLBACK` is a keyword
+    /// token; the other three are plain identifiers) and, for every action but
+    /// `IGNORE`, a comma and a string-literal message (sqlite's grammar).
+    #[inline(never)]
+    fn raise_suffix(&mut self) -> Result<Expr> {
+        use crate::ast::RaiseKind;
+        self.expect(&Tok::LParen, "`(` after RAISE")?;
+        let kind = if self.eat(&Tok::Kw(Kw::Rollback)) {
+            RaiseKind::Rollback
+        } else if self.eat_word("ABORT") {
+            RaiseKind::Abort
+        } else if self.eat_word("FAIL") {
+            RaiseKind::Fail
+        } else if self.eat_word("IGNORE") {
+            RaiseKind::Ignore
+        } else {
+            return Err(self.err_here("RAISE takes IGNORE, ABORT, FAIL or ROLLBACK"));
+        };
+        let msg = if kind == RaiseKind::Ignore {
+            String::new()
+        } else {
+            self.expect(&Tok::Comma, "`,` before the RAISE message")?;
+            match self.advance() {
+                Some(Tok::Str(m)) => m,
+                _ => return Err(self.err_here("RAISE message must be a string literal")),
+            }
+        };
+        self.expect(&Tok::RParen, "`)` after RAISE")?;
+        Ok(Expr::Raise(kind, msg))
     }
 
     fn primary(&mut self) -> Result<Expr> {

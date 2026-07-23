@@ -132,6 +132,9 @@ pub fn error_codes(e: &DbError) -> (c_int, c_int) {
         DbError::UniqueViolation { .. } => (SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_UNIQUE),
         DbError::NotNullViolation { .. } => (SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_NOTNULL),
         DbError::CheckViolation { .. } => (SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_CHECK),
+        // A trigger body's RAISE(ABORT, 'msg') — sqlite's SQLITE_CONSTRAINT_TRIGGER,
+        // message = the raise text verbatim (Display already is).
+        DbError::Raise(_) => (SQLITE_CONSTRAINT, SQLITE_CONSTRAINT_TRIGGER),
         DbError::PolicyViolation { .. } | DbError::WriteRejected { .. } => {
             (SQLITE_CONSTRAINT, SQLITE_CONSTRAINT)
         }

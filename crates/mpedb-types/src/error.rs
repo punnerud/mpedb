@@ -65,6 +65,10 @@ pub enum Error {
         expr: String,
     },
     /// A row with the same primary key already exists.
+    /// `RAISE(ABORT, 'msg')` fired in a trigger body (DESIGN-TRIGGERS §4.3):
+    /// the statement aborts and unwinds atomically. The payload is the raise
+    /// message VERBATIM — sqlite reports exactly the user's text.
+    Raise(String),
     PrimaryKeyViolation {
         table: String,
     },
@@ -188,6 +192,7 @@ impl fmt::Display for Error {
             Error::CheckViolation { table, column, expr } => {
                 write!(f, "CHECK violation: {table}.{column} failed `{expr}`")
             }
+            Error::Raise(m) => write!(f, "{m}"),
             Error::PrimaryKeyViolation { table } => {
                 write!(f, "PRIMARY KEY violation in {table}")
             }

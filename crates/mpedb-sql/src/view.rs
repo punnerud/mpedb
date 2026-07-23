@@ -547,6 +547,7 @@ fn rewrite_cte_cols(
         | Expr::Param(_)
         | Expr::ContextRef(_)
         | Expr::Excluded(_)
+        | Expr::Raise(..)
         | Expr::Subquery(_)
         | Expr::Exists(_, _) => Ok(()),
     }
@@ -955,7 +956,8 @@ fn expr_mentions(e: &Expr, hidden: &[String]) -> bool {
         Expr::Lit(_)
         | Expr::Param(_)
         | Expr::ContextRef(_)
-        | Expr::Excluded(_) => false,
+        | Expr::Excluded(_)
+        | Expr::Raise(..) => false,
     }
 }
 
@@ -1093,7 +1095,8 @@ fn rename_qualifier(e: &mut Expr, from: &str, to: &str) {
         | Expr::Param(_)
         | Expr::Col(_)
         | Expr::ContextRef(_)
-        | Expr::Excluded(_) => {}
+        | Expr::Excluded(_)
+        | Expr::Raise(..) => {}
     }
 }
 
@@ -1465,7 +1468,8 @@ fn expr_aggregates(e: &Expr) -> bool {
         | Expr::Col(_)
         | Expr::Qualified(..)
         | Expr::ContextRef(_)
-        | Expr::Excluded(_) => false,
+        | Expr::Excluded(_)
+        | Expr::Raise(..) => false,
     }
 }
 
