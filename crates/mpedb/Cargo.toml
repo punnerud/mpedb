@@ -28,3 +28,6 @@ mpedb-sqlitefmt = { path = "../mpedb-sqlitefmt" }
 mpedb-types = { workspace = true }
 mpedb-core = { workspace = true }
 mpedb-sql = { workspace = true }
+# The advisor's index identity is the #118 §2.2 content hash — the same blake3
+# the schema hash already uses one crate down.
+blake3 = { workspace = true }
