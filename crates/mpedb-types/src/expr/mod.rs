@@ -935,6 +935,28 @@ impl ExprProgram {
         Ok(stack.pop().expect("validated: exactly one result"))
     }
 
+    /// Every column ordinal this program reads, ascending and deduplicated.
+    ///
+    /// [`Instr::PushCol`] is the ONLY instruction that touches the row (every
+    /// other operand reaches the stack through a parameter or a constant — the
+    /// eval loop has exactly one `cols.get`), so this set is COMPLETE: a caller
+    /// may decode these ordinals and nothing else and still evaluate the
+    /// program exactly. That is what lets a filtered aggregate fold decode two
+    /// columns of a wide row instead of materializing all of it.
+    pub fn read_columns(&self) -> Vec<u16> {
+        let mut v: Vec<u16> = self
+            .instrs
+            .iter()
+            .filter_map(|i| match i {
+                Instr::PushCol(c) => Some(*c),
+                _ => None,
+            })
+            .collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    }
+
     /// Evaluate as a WHERE/CHECK predicate: passes only on exactly TRUE.
     pub fn eval_filter(
         &self,
