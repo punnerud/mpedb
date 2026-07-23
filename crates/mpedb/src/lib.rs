@@ -59,6 +59,7 @@ mod sqlite_attach;
 mod ddl_apply;
 mod sqlite_overlay;
 pub mod advisor;
+pub mod spellfn;
 pub mod model;
 pub mod stats;
 mod stream;
@@ -105,7 +106,7 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, RwLock};
 
-const POISON: &str = "plan cache lock poisoned";
+pub(crate) const POISON: &str = "plan cache lock poisoned";
 
 /// A host-registered scalar UDF closure (the C-API `create_function` path,
 /// design/DESIGN-UDF.md): it receives the already-evaluated argument `Value`s
@@ -120,6 +121,11 @@ pub type HostScalarFn = Arc<dyn Fn(&[Value]) -> Result<Value> + Send + Sync>;
 /// linear name/arity lookup per call is negligible.
 pub(crate) struct HostFnTable {
     fns: Vec<(String, i32, HostScalarFn)>,
+    /// Stored-function IR by content hash (stage M2) — the CURRENT catalog,
+    /// resolved once per spell-bearing statement. A hash the table lacks
+    /// (a redefinition raced between compile and execute) refuses cleanly;
+    /// the gen-gated re-prepare fixes the next call.
+    spells: Vec<([u8; 32], std::sync::Arc<mpedb_spell::ir::Proc>)>,
 }
 
 /// Run arbitrary CALLER code and turn a panic into an error instead of letting
@@ -169,6 +175,23 @@ impl mpedb_types::HostFns for HostFnTable {
                 Error::Unsupported(format!("host function {name}/{argc} is not registered"))
             })?;
         guard_panic(&format!("host function {name}/{argc}"), || f(args))
+    }
+
+    fn call_spell(&self, hash: &[u8; 32], args: &[Value]) -> Result<Value> {
+        let proc = self
+            .spells
+            .iter()
+            .find(|(h, _)| h == hash)
+            .map(|(_, p)| p)
+            .ok_or_else(|| {
+                Error::Unsupported(
+                    "stored function was redefined or dropped since this plan compiled —                      re-prepare the statement"
+                        .into(),
+                )
+            })?;
+        // No guard_panic: a spell is OUR interpreter over validated IR, not
+        // caller code — a panic there is an engine bug and should say so.
+        crate::spellfn::call_spell_fn(proc, args)
     }
 }
 
@@ -521,6 +544,11 @@ impl DetachedPlan {
 pub struct Database {
     engine: Engine,
     cache: RwLock<HashMap<PlanHash, Arc<CompiledPlan>>>,
+    /// Decoded stored-function IR by content hash (stage M2). Hash-keyed and
+    /// immutable by construction, so it never needs invalidation — a
+    /// redefinition is a NEW hash, and the old entry just stops being asked
+    /// for once the gen-gated re-prepare lands.
+    spell_cache: RwLock<HashMap<[u8; 32], Arc<mpedb_spell::ir::Proc>>>,
     /// The schema generation this process's plan cache was built against. A DDL
     /// commit (here or in another process) bumps the meta `schema_gen`; on the
     /// next statement `gate_cache_on_schema` observes the mismatch and drops the
@@ -673,6 +701,7 @@ impl Database {
         Ok(Database {
             engine,
             cache: RwLock::new(HashMap::new()),
+            spell_cache: RwLock::new(HashMap::new()),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
             conn_id: next_conn_id(),
             trigger_cache: RwLock::new(None),
@@ -752,6 +781,7 @@ impl Database {
         Ok(Database {
             engine,
             cache: RwLock::new(HashMap::new()),
+            spell_cache: RwLock::new(HashMap::new()),
             cache_gen: std::sync::atomic::AtomicU64::new(0),
             conn_id: next_conn_id(),
             trigger_cache: RwLock::new(None),
@@ -969,10 +999,19 @@ impl Database {
     }
 
     /// Snapshot the registry's closures for one execution (see [`HostFnTable`]).
-    fn host_fn_table(&self) -> HostFnTable {
+    fn host_fn_table(&self, plan: &CompiledPlan) -> HostFnTable {
         let g = self.host_udfs.read().expect(POISON);
         HostFnTable {
             fns: g.iter().map(|((n, a), f)| (n.clone(), *a, f.clone())).collect(),
+            // Loaded only for a spell-bearing plan; an error loading the
+            // catalog degrades to an empty table, and the call site then
+            // refuses by hash with the re-prepare message — fail closed,
+            // never fail open.
+            spells: if plan.contains_spell_call() {
+                self.spell_table().unwrap_or_default()
+            } else {
+                Vec::new()
+            },
         }
     }
 
@@ -1005,8 +1044,10 @@ impl Database {
         &self,
         plan: &CompiledPlan,
     ) -> Option<(HostFnTable, HostAggTable, HostCollTable)> {
-        plan.contains_host_call().then(|| {
-            (self.host_fn_table(), self.host_agg_table(), self.host_coll_table())
+        // Spell-bearing plans need the table too (their gate is the same
+        // seam); a plan with neither keeps the registry locks off its path.
+        (plan.contains_host_call() || plan.contains_spell_call()).then(|| {
+            (self.host_fn_table(plan), self.host_agg_table(), self.host_coll_table())
         })
     }
 
@@ -1059,13 +1100,18 @@ impl Database {
                 ndv_bucket_from(&r, bundle.schema_gen, tid, ixno)
             },
         };
+        // The function catalogs for this compile: connection-local host UDFs
+        // plus the FILE's stored functions, read off the same snapshot as the
+        // cost inputs (stage M2).
+        let mut udfs = self.host_udf_set();
+        udfs.spells = self.load_spell_fns(&r)?;
         let out = mpedb_sql::prepare_maybe_explain_with_views(
             sql,
             &bundle,
             &catalog,
             &views,
             self.bare_group_by,
-            &self.host_udf_set(),
+            &udfs,
             &cost,
         );
         r.finish()?;
@@ -1150,13 +1196,15 @@ impl Database {
             row_count: &|tid| r.row_count(tid).unwrap_or(0),
             index_ndv_bucket: &|tid, ixno| ndv_bucket_from(&r, schema.schema_gen, tid, ixno),
         };
+        let mut udfs = self.host_udf_set();
+        udfs.spells = self.load_spell_fns(&r)?;
         let out = mpedb_sql::prepare_maybe_explain_with_views(
             sql,
             schema,
             &catalog,
             &views,
             self.bare_group_by,
-            &self.host_udf_set(),
+            &udfs,
             &cost,
         );
         r.finish()?;
@@ -2201,7 +2249,7 @@ fn ndv_bucket_from(
     (ndv > 0).then(|| stats::bucket(ndv))
 }
 
-fn sys_record_subkey(ns: &str, key: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn sys_record_subkey(ns: &str, key: &[u8]) -> Result<Vec<u8>> {
     check_sys_ns(ns)?;
     if key.is_empty() || key.len() > SYS_RECORD_MAX_KEY {
         return Err(Error::Unsupported(format!(

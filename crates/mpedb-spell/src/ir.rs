@@ -246,6 +246,16 @@ impl Proc {
         self.has_exec
     }
 
+    /// Any database operation at all — query, exec, or cursor. A stored SQL
+    /// FUNCTION (stage M2) must have none; this is the load-time re-check
+    /// behind `create_function`'s define-time refusal.
+    pub fn has_db_ops(&self) -> bool {
+        self.instrs
+            .iter()
+            .any(|op| matches!(op, Op::DbQuery(_) | Op::DbExec(_) | Op::CursorOpen(_)))
+            || !self.plans.is_empty()
+    }
+
     /// Canonical serialization; the blob stored in the database and the
     /// preimage of [`Proc::hash`].
     pub fn encode(&self) -> Vec<u8> {

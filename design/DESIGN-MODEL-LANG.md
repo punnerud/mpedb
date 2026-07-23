@@ -104,6 +104,16 @@ The model is the noun the operator sugar refers to.
   exists for the cost/analyze layer.
 - **`mpedb advise <target> --model <file|stored>`.**
 
+**M2 landed 2026-07-23: stored SQL functions.** `Database::create_function` /
+`mpedb fn define` compiles a PySpell body (full procedure subset — loops) to
+content-hashed IR in the sys-keyspace (`func/` name bindings + `funch/`
+content-addressed blobs, schema_gen-gated like views), and the binder resolves
+the name into `Instr::SpellCall(hash)` — so a plan calling one is
+deterministic across every attached process and rides the shared plan
+registry, the exact shareability host UDFs are denied. Execution runs under a
+fixed instruction budget with no database bridge (SQL-in-function refused at
+define, re-checked at load against forged blobs).
+
 **Next rungs (designed, not built):** archetype → MPEE cost presets and
 `analyze()` cadence; roles → operator-sugar resolution (M3); the PySpell
 cost-policy hook reads the model as one of its inputs (M5) — the model is the

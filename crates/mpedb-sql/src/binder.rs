@@ -120,6 +120,9 @@ pub(crate) enum BExpr {
     /// have. Compiles to [`Instr::HostCall`], which stores the NAME (const pool)
     /// + arity, never the closure.
     HostCall { name: String, args: Vec<BExpr> },
+    /// A stored PySpell function call: the definition's content hash rides the
+    /// const pool ([`Instr::SpellCall`]); dynamically typed like a host UDF.
+    SpellCall { hash: [u8; 32], args: Vec<BExpr> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -244,9 +247,43 @@ fn reaches_subquery(e: &ast::Expr) -> bool {
 /// before it reads the argument list. The two namespaces are checked in the
 /// order native aggregate → host aggregate → native scalar → host scalar, so a
 /// name registered as both an aggregate and a scalar is read as the aggregate.
+/// The STORED function catalog visible to this compile (stage M2): name →
+/// (content hash, arity). Loaded by the facade from the sys-keyspace at
+/// prepare time, exactly as views are; empty for callers with no database.
+/// Unlike [`HostUdfSet`], these definitions live in the FILE — a plan calling
+/// one carries the hash, stays deterministic across processes, and may enter
+/// the shared registry.
+#[derive(Debug, Clone, Default)]
+pub struct SpellFnSet {
+    fns: Vec<(String, [u8; 32], u16)>,
+}
+
+impl SpellFnSet {
+    pub fn insert(&mut self, name: String, hash: [u8; 32], argc: u16) {
+        self.fns.retain(|(n, _, _)| n != &name);
+        self.fns.push((name, hash, argc));
+    }
+    pub fn is_empty(&self) -> bool {
+        self.fns.is_empty()
+    }
+    /// The registered (hash, arity) for `name`, case-insensitive like every
+    /// SQL function name.
+    pub fn resolve(&self, name: &str) -> Option<([u8; 32], u16)> {
+        self.fns
+            .iter()
+            .find(|(n, _, _)| n.eq_ignore_ascii_case(name))
+            .map(|(_, h, a)| (*h, *a))
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HostUdfSet {
     fns: Vec<(String, i32)>,
+    /// STORED PySpell functions ([`SpellFnSet`]) — carried here because this
+    /// struct is "the function catalogs visible to this compile" and is
+    /// already threaded to every binder; a stored function is one more
+    /// namespace in that resolution order (native → stored → host).
+    pub spells: SpellFnSet,
     aggs: Vec<(String, i32)>,
     /// HOST collating-sequence names (`sqlite3_create_collation`). Names only:
     /// a collation has no arity, and the comparator itself never leaves the
@@ -670,6 +707,7 @@ impl<'a> Binder<'a> {
     pub fn set_host_udfs(&mut self, set: &HostUdfSet) {
         self.host_udfs = set.clone();
     }
+
 
     /// The HOST collating-sequence names in scope, for an ORDER BY key's
     /// `COLLATE`. Empty for a connection that registered none.
@@ -2508,6 +2546,27 @@ impl<'a> Binder<'a> {
             // pinning) and grade the result to `Any`. A name matching neither is
             // the unchanged "unknown function" error.
             other => {
+                // Stored functions resolve BEFORE host UDFs: a definition in
+                // the FILE outranks a per-connection closure, and the order is
+                // load-bearing — the stored plan is shareable, the host plan
+                // is not, and two connections must not disagree about which
+                // one a name means.
+                if let Some((hash, argc)) = self.host_udfs.spells.resolve(other) {
+                    if args.len() != argc as usize {
+                        return Err(bind_err(format!(
+                            "{other}() takes {argc} argument(s), got {}",
+                            args.len()
+                        )));
+                    }
+                    let mut bound = Vec::with_capacity(args.len());
+                    for a in args {
+                        bound.push(self.bind_expr(a)?.0);
+                    }
+                    return Ok((
+                        BExpr::SpellCall { hash, args: bound },
+                        Some(ColumnType::Any),
+                    ));
+                }
                 if self.host_udfs.resolves(other, args.len()) {
                     if u16::try_from(args.len()).is_err() {
                         return Err(bind_err(format!(
@@ -3855,6 +3914,16 @@ fn emit(e: &BExpr, instrs: &mut Vec<Instr>, consts: &mut Vec<Value>) -> Result<(
                 emit(a, instrs, consts)?;
             }
             instrs.push(Instr::HostCall(name_idx, args.len() as u16));
+        }
+        BExpr::SpellCall { hash, args } => {
+            // The content HASH rides the const pool as a 32-byte blob — the
+            // definition is in the file, so the hash IS the function, and the
+            // decode-side validator re-proves the shape.
+            let hash_idx = push_const(consts, Value::Blob(hash.to_vec()))?;
+            for a in args {
+                emit(a, instrs, consts)?;
+            }
+            instrs.push(Instr::SpellCall(hash_idx, args.len() as u16));
         }
     }
     Ok(())

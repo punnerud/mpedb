@@ -478,7 +478,7 @@ const MAX_JOINS: usize = 16;
 //     collation — sqlite compares min/max (aggregate AND scalar) under the
 //     argument's collation, which a BINARY-only compare answered wrongly on
 //     any NOCASE/RTRIM column (tests/agg_collate.rs).
-const PLAN_FORMAT: u8 = 60;
+const PLAN_FORMAT: u8 = 61;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -2182,6 +2182,18 @@ impl CompiledPlan {
         stmt_has_host_call(&self.stmt) || self.subplans.iter().any(subplan_has_host_call)
     }
 
+    /// Does any expression anywhere in this plan call a STORED function
+    /// ([`Instr::SpellCall`])? Unlike a host call this does NOT bar registry
+    /// publication — the definition lives in the file — it decides whether an
+    /// execution needs the spell table in scope. The walk mirrors the host
+    /// walker's structure but checks only PROGRAMS: spells exist solely as
+    /// scalar calls (no spell aggregates/collations/windows). If a future
+    /// plan node is added to one walker and missed here, the failure mode is
+    /// a clean runtime "not in scope" refusal, never a wrong answer.
+    pub fn contains_spell_call(&self) -> bool {
+        stmt_has_spell_call(&self.stmt) || self.subplans.iter().any(subplan_has_spell_call)
+    }
+
     /// True when this WRITE statement carries a `RETURNING` clause, i.e. its
     /// result is `Rows`, not `Affected`. Such a plan must never be enqueued
     /// on the intent ring: a ring result slot carries only an affected count
@@ -2332,6 +2344,107 @@ fn stmt_has_host_call(stmt: &PlanStmt) -> bool {
         | PlanStmt::Savepoint(_)
         | PlanStmt::Release(_)
         | PlanStmt::RollbackTo(_) => false,
+    }
+}
+
+fn opt_prog_spell_call(p: &Option<ExprProgram>) -> bool {
+    p.as_ref().is_some_and(ExprProgram::has_spell_call)
+}
+
+fn projection_spell_call(proj: &[Projection]) -> bool {
+    proj.iter().any(|p| match p {
+        Projection::Column(_) => false,
+        Projection::Expr { program, .. } => program.has_spell_call(),
+    })
+}
+
+fn select_has_spell_call(sp: &SelectPlan) -> bool {
+    opt_prog_spell_call(&sp.filter)
+        || opt_prog_spell_call(&sp.joined_filter)
+        || opt_prog_spell_call(&sp.post_filter)
+        || sp
+            .joins
+            .iter()
+            .any(|j| j.on.has_spell_call() || j.policy.as_ref().is_some_and(ExprProgram::has_spell_call))
+        || projection_spell_call(&sp.projection)
+        || sp.aggregate.as_ref().is_some_and(|a| {
+            a.group_by.iter().any(|k| matches!(k, GroupKey::Expr(p) if p.has_spell_call()))
+                || a.aggs.iter().any(|c| {
+                    opt_prog_spell_call(&c.arg)
+                        || opt_prog_spell_call(&c.filter)
+                        || c.extra_args.iter().any(ExprProgram::has_spell_call)
+                })
+                || opt_prog_spell_call(&a.having)
+        })
+        || sp.windows.iter().any(|w| {
+            opt_prog_spell_call(&w.arg)
+                || w.partition_by.iter().any(ExprProgram::has_spell_call)
+                || w.order_by.iter().any(|(p, _)| p.has_spell_call())
+                || opt_prog_spell_call(&w.default)
+        })
+}
+
+fn compound_has_spell_call(c: &CompoundPlan) -> bool {
+    c.arms.iter().any(|a| match a {
+        CompoundArm::Select(sp) => select_has_spell_call(sp),
+        CompoundArm::Derived(dp) => {
+            select_has_spell_call(&dp.outer)
+                || subbody_has_spell_call(&dp.body)
+                || dp.body_subplans.iter().any(subplan_has_spell_call)
+        }
+    })
+}
+
+fn subbody_has_spell_call(b: &SubBody) -> bool {
+    match b {
+        SubBody::Select(sp) => select_has_spell_call(sp),
+        SubBody::Compound(c) => compound_has_spell_call(c),
+    }
+}
+
+fn subplan_has_spell_call(s: &SubPlan) -> bool {
+    subbody_has_spell_call(&s.body) || s.subplans.iter().any(subplan_has_spell_call)
+}
+
+fn stmt_has_spell_call(stmt: &PlanStmt) -> bool {
+    match stmt {
+        PlanStmt::Select(sp) => select_has_spell_call(sp),
+        PlanStmt::Compound(c) => compound_has_spell_call(c),
+        PlanStmt::RecursiveCte(rc) => {
+            select_has_spell_call(&rc.anchor)
+                || select_has_spell_call(&rc.recursive)
+                || select_has_spell_call(&rc.outer)
+        }
+        PlanStmt::Derived(dp) => {
+            subbody_has_spell_call(&dp.body)
+                || select_has_spell_call(&dp.outer)
+                || dp.body_subplans.iter().any(subplan_has_spell_call)
+        }
+        PlanStmt::Insert { from_select, with_check, on_conflict, returning, .. } => {
+            from_select.as_ref().is_some_and(|s| select_has_spell_call(&s.plan))
+                || opt_prog_spell_call(with_check)
+                || returning.as_ref().is_some_and(|r| projection_spell_call(r))
+                || match on_conflict {
+                    PlanOnConflict::Error | PlanOnConflict::DoNothing | PlanOnConflict::Replace => {
+                        false
+                    }
+                    PlanOnConflict::DoUpdate { set, filter, .. } => {
+                        set.iter().any(|(_, p)| p.has_spell_call())
+                            || opt_prog_spell_call(filter)
+                    }
+                }
+        }
+        PlanStmt::Update { filter, set, with_check, returning, .. } => {
+            opt_prog_spell_call(filter)
+                || set.iter().any(|(_, p)| p.has_spell_call())
+                || opt_prog_spell_call(with_check)
+                || returning.as_ref().is_some_and(|r| projection_spell_call(r))
+        }
+        PlanStmt::Delete { filter, returning, .. } => {
+            opt_prog_spell_call(filter)
+                || returning.as_ref().is_some_and(|r| projection_spell_call(r))
+        }
+        _ => false,
     }
 }
 

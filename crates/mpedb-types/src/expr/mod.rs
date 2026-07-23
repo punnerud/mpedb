@@ -190,6 +190,14 @@ pub enum Instr {
     /// a host call, a CHECK constraint, a test) this opcode is unreachable, so
     /// the change is behavior-neutral for every existing plan.
     HostCall(u16, u16),
+    /// Call a STORED PySpell function (stage M2, design/DESIGN-MODEL-LANG.md
+    /// program): pops `argc` args, pushes the one result. The u16 indexes the
+    /// const pool at a 32-byte [`Value::Blob`] holding the function's CONTENT
+    /// HASH — not a name. That is the whole difference from [`Instr::HostCall`]:
+    /// the definition lives in the database file, schema_gen-gated, so a plan
+    /// carrying the hash is deterministic across every attached process and
+    /// MAY enter the shared registry (a host closure may not).
+    SpellCall(u16, u16),
     /// **Comparison affinity**: apply `Affinity` to the top of the stack, in
     /// place. sqlite's `OP_Affinity`/`applyAffinity`, the same conversion a
     /// value gets on its way INTO a column ([`store_affinity`]) — which is why
@@ -325,6 +333,19 @@ pub trait HostFns {
     /// name at compile time, but a registration can change between compile and
     /// execute.
     fn call(&self, name: &str, args: &[Value]) -> Result<Value>;
+
+    /// Invoke a STORED PySpell function by content hash
+    /// ([`Instr::SpellCall`]). Defaulted to a refusal so every existing
+    /// implementor (and every context that cannot reach the function catalog)
+    /// stays correct by doing nothing: the facade overrides this with its
+    /// gen-gated compiled-spell cache.
+    fn call_spell(&self, hash: &[u8; 32], args: &[Value]) -> Result<Value> {
+        let _ = args;
+        Err(Error::Unsupported(format!(
+            "stored function {} is not in scope for this execution",
+            hash.iter().take(6).map(|b| format!("{b:02x}")).collect::<String>()
+        )))
+    }
 }
 
 /// Which of the six SQL comparison operators a collated [`Instr::CmpColl`]
@@ -420,6 +441,14 @@ impl ExprProgram {
     /// plan is valid only for the connection that registered the function.
     pub fn has_host_call(&self) -> bool {
         self.instrs.iter().any(|i| matches!(i, Instr::HostCall(..)))
+    }
+
+    /// Does this program call a STORED function ([`Instr::SpellCall`])? The
+    /// opposite gate from [`has_host_call`](Self::has_host_call): a spell plan
+    /// MAY be shared (the definition is in the file), but its execution needs
+    /// the spell table in scope.
+    pub fn has_spell_call(&self) -> bool {
+        self.instrs.iter().any(|i| matches!(i, Instr::SpellCall(..)))
     }
 
     /// Evaluate against a decoded row and statement parameters. No host UDFs in
@@ -877,6 +906,29 @@ impl ExprProgram {
                         ))
                     })?;
                     stack.push(host.call(name, &args)?);
+                }
+                Instr::SpellCall(hash_idx, argc) => {
+                    // The hash lives in the const pool; validate proved the
+                    // index in range AND the const a 32-byte blob, so a
+                    // hostile blob fails decode, not eval.
+                    let hash: &[u8; 32] = match &self.consts[hash_idx as usize] {
+                        Value::Blob(b) => b.as_slice().try_into().map_err(|_| {
+                            Error::Corrupt("spell-call hash constant is not 32 bytes".into())
+                        })?,
+                        _ => {
+                            return Err(Error::Corrupt(
+                                "spell-call hash constant is not a blob".into(),
+                            ))
+                        }
+                    };
+                    let at = stack.len() - argc as usize;
+                    let args: Vec<Value> = stack.split_off(at);
+                    let host = host.ok_or_else(|| {
+                        Error::Unsupported(
+                            "stored function is not in scope for this execution".into(),
+                        )
+                    })?;
+                    stack.push(host.call_spell(hash, &args)?);
                 }
             }
         }

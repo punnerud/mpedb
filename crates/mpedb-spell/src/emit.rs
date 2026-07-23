@@ -83,6 +83,7 @@ pub struct LoopCtx {
 }
 
 impl FuncBuilder {
+    #[allow(clippy::new_without_default)] // widened from pub(crate) by the M2 split
     pub fn new() -> FuncBuilder {
         FuncBuilder {
             instrs: Vec::new(),

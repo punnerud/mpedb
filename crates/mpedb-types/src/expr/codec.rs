@@ -74,6 +74,7 @@ const OP_LIKE_CS_DYN_ESC: u8 = 59;
 const OP_GLOB_DYN: u8 = 60;
 // The collated scalar-call twin (min()/max() under a column's collation).
 const OP_CALL_COLL: u8 = 61;
+const OP_SPELL_CALL: u8 = 62;
 
 impl ExprProgram {
     /// Deterministic serialization (part of plan blobs and plan hashing).
@@ -219,6 +220,11 @@ impl ExprProgram {
                 Instr::HostCall(name_idx, argc) => {
                     buf.push(OP_HOST_CALL);
                     buf.extend_from_slice(&name_idx.to_le_bytes());
+                    buf.extend_from_slice(&argc.to_le_bytes());
+                }
+                Instr::SpellCall(hash_idx, argc) => {
+                    buf.push(OP_SPELL_CALL);
+                    buf.extend_from_slice(&hash_idx.to_le_bytes());
                     buf.extend_from_slice(&argc.to_le_bytes());
                 }
             }
@@ -374,6 +380,11 @@ impl ExprProgram {
                     let name_idx = read_u16_arg()?;
                     let argc = read_u16_arg()?;
                     Instr::HostCall(name_idx, argc)
+                }
+                OP_SPELL_CALL => {
+                    let hash_idx = read_u16_arg()?;
+                    let argc = read_u16_arg()?;
+                    Instr::SpellCall(hash_idx, argc)
                 }
                 _ => return Err(Error::Corrupt(format!("invalid opcode {op}"))),
             });
@@ -543,6 +554,20 @@ pub(super) fn validate(instrs: &[Instr], consts: &[Value]) -> Result<usize> {
                             return Err(Error::Corrupt(
                                 "host-call name index out of range".into(),
                             ));
+                        }
+                        (argc as usize, 1)
+                    }
+                    // A stored-function call: the const must BE a 32-byte
+                    // hash, checked once here so eval reads it unguarded and a
+                    // forged plan fails decode, never execution.
+                    Instr::SpellCall(hash_idx, argc) => {
+                        match consts.get(hash_idx as usize) {
+                            Some(Value::Blob(b)) if b.len() == 32 => {}
+                            _ => {
+                                return Err(Error::Corrupt(
+                                    "spell-call constant is not a 32-byte hash".into(),
+                                ))
+                            }
                         }
                         (argc as usize, 1)
                     }
