@@ -59,6 +59,7 @@ mod sqlite_attach;
 mod ddl_apply;
 mod sqlite_overlay;
 pub mod advisor;
+pub mod model;
 pub mod stats;
 mod stream;
 mod tier;
@@ -88,6 +89,7 @@ pub use stream::RowStream;
 pub use tier::TierReport;
 pub use workspace::{Workspace, WorkspaceTxn, WsPlan};
 
+pub use mpedb_types::model::WorkloadModel;
 pub use mpedb_types::{
     BudgetKind, ColumnDef, ColumnType, Config, DbOptions, Durability, Error, Footprint,
     HostAggState, KeyAccess, KeyBound, KeyPart, PlanHash, PolicyCmd, PolicyDef, Result, Schema,

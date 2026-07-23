@@ -1,0 +1,8 @@
+# The routing workload (stage M4), declared at archetype level until the
+# routing schema lands — the model still tells the engine what this database
+# is FOR, which is more than most databases ever get told.
+
+[model]
+name = "routing"
+archetype = "routing"
+description = "stops/vehicles/jobs + a travel matrix feeding a sequencing solver (MPEE)"

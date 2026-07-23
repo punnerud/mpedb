@@ -61,7 +61,10 @@ usage: mpedb <command> [args]
   exec    <target> <SQL> [param ...]       run one statement
   prepare <target> <SQL>                   compile + publish, print plan hash
   advise <target> [statements.sql]         recommend indexes from the workload
-                                           (registry, or a ;-separated file)
+         [--model <file|stored>]           (registry, a ;-separated file, or a
+                                           workload model — DESIGN-MODEL-LANG.md)
+  model set <target> <model.toml>          store the workload model
+  model show <target>                      print the stored model
   call    <target> <hash> [param ...]      execute a prepared plan by hash
   proc    define|call|list ...              stored procedures (see `proc`)
   repl    <target>                          interactive session (stdin)
@@ -142,6 +145,7 @@ fn dispatch(argv: &[String]) -> CliResult {
         "exec" => cmd_exec(rest),
         "prepare" => cmd_prepare(rest),
         "advise" => cmd_advise(rest),
+        "model" => cmd_model(rest),
         "call" => cmd_call(rest),
         "proc" => proc_cmd::run(rest),
         "queue" => queue::run(rest),
@@ -217,15 +221,69 @@ fn cmd_prepare(args: &[String]) -> CliResult {
     Ok(())
 }
 
-/// `mpedb advise <target> [statements.sql]` — the #118 workload-index
-/// advisor, recommend-only. With no statements file the workload is the
-/// plan registry: everything this database has ever compiled.
+/// `mpedb model set <target> <model.toml> | show <target>` — the stored
+/// workload model (design/DESIGN-MODEL-LANG.md): what this database is FOR,
+/// at whatever resolution the author has, shared by every attached process.
+fn cmd_model(args: &[String]) -> CliResult {
+    match args {
+        [sub, config, file] if sub == "set" => {
+            let text = std::fs::read_to_string(file)
+                .map_err(|e| Failure::Runtime(format!("reading {file}: {e}")))?;
+            let db = crate::util::open_target(config)?;
+            db.set_model(&text)?;
+            let m = db.model()?.expect("just stored");
+            println!(
+                "model stored: archetype {}, {} table shape(s), {} statement(s)",
+                m.archetype.map(|a| a.name()).unwrap_or("(none)"),
+                m.tables.len(),
+                m.statements.len()
+            );
+            Ok(())
+        }
+        [sub, config] if sub == "show" => {
+            let db = crate::util::open_target(config)?;
+            match db.model_source()? {
+                Some(src) => println!("{src}"),
+                None => println!("no model stored — see design/DESIGN-MODEL-LANG.md"),
+            }
+            Ok(())
+        }
+        _ => usage("model needs: set <target> <model.toml> | show <target>"),
+    }
+}
+
+/// `mpedb advise <target> [statements.sql | --model <model.toml|stored>]` —
+/// the #118 workload-index advisor, recommend-only. With no source the
+/// workload is the plan registry: everything this database has ever compiled.
 fn cmd_advise(args: &[String]) -> CliResult {
     use mpedb::advisor::WorkloadSource;
     let (config, source) = match args {
-        [config] => (config, WorkloadSource::Registry),
-        [config, file] => {
-            let text = std::fs::read_to_string(file)
+        [config] => (config, None),
+        [config, flag, spec] if flag == "--model" => (config, Some((true, spec.clone()))),
+        [config, file] => (config, Some((false, file.clone()))),
+        _ => {
+            return usage(
+                "advise needs <config.toml|db.mpedb> [statements.sql | --model <file|stored>]",
+            )
+        }
+    };
+    let db = crate::util::open_target(config)?;
+    let source = match source {
+        None => WorkloadSource::Registry,
+        Some((true, spec)) => {
+            let model = if spec == "stored" {
+                db.model()?.ok_or_else(|| {
+                    Failure::Runtime("no model stored — `mpedb model set` first".into())
+                })?
+            } else {
+                let text = std::fs::read_to_string(&spec)
+                    .map_err(|e| Failure::Runtime(format!("reading {spec}: {e}")))?;
+                mpedb::WorkloadModel::from_toml_str(&text)?
+            };
+            WorkloadSource::Model(model)
+        }
+        Some((false, file)) => {
+            let text = std::fs::read_to_string(&file)
                 .map_err(|e| Failure::Runtime(format!("reading {file}: {e}")))?;
             let stmts: Vec<String> = text
                 .split(';')
@@ -233,11 +291,9 @@ fn cmd_advise(args: &[String]) -> CliResult {
                 .filter(|s| !s.is_empty())
                 .map(str::to_string)
                 .collect();
-            (config, WorkloadSource::Statements(stmts))
+            WorkloadSource::Statements(stmts)
         }
-        _ => return usage("advise needs <config.toml|db.mpedb> [statements.sql]"),
     };
-    let db = crate::util::open_target(config)?;
     let rep = db.recommend_indexes(source)?;
     println!(
         "workload: {} compiled, {} uncompilable, {} shapes without a single-table          candidate, {} opaque filters, {} no-key, {} already served",

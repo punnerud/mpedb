@@ -1,0 +1,22 @@
+# The vecbench workload (BENCHMARKS-VECTOR.md) as a model: embeddings under
+# kNN, usually behind a category filter — RAG inside a database.
+
+[model]
+name = "rag"
+archetype = "vector-rag"
+description = "100k x 128-dim f32 embeddings; filtered exact kNN, category equality"
+
+[[model.table]]
+name = "v"
+role = "embedding"
+read_write = "read-heavy"
+
+  [[model.table.access]]
+  kind = "knn"
+  columns = ["emb"]
+  weight = 1.0
+
+  [[model.table.access]]
+  kind = "filter-eq"
+  columns = ["cat"]
+  weight = 0.8
