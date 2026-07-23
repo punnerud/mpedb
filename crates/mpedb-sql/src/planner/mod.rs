@@ -82,6 +82,7 @@ mod footprint;
 mod fts;
 mod join;
 mod mpee;
+pub mod sequence;
 mod partial;
 mod prune;
 mod recursive;

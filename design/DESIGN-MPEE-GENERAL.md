@@ -332,8 +332,15 @@ cost** (open TSP), and the honest frame is the one vecbench established:
   NUMBER (fraction of the N×N matrix ever materialized), which is the claim
   both engines actually share.
 
-Not built in this stage; the design is here so the harness
-(`crates/mpedb-seqbench`, the vecbench pattern) starts from a settled frame.
+**Built and measured 2026-07-23** ([BENCHMARKS-ROUTING.md](../BENCHMARKS-ROUTING.md)):
+the kernel's `(subset, last)` mode is `mpedb_sql::sequence` (Held-Karp, exact
+to N = 18, brute-force-differential-tested, DECLINES past the cap), the
+harness is `crates/mpedb-routebench`, and the instances are brooom's bundled
+real-map San Francisco set. The result: brooom finds the exact optimum on
+every checkable sub-instance (gap +0.00% at N = 9…18 on real asymmetric OSRM
+durations) — measured optimality, which only an exact ground truth can grant —
+while exact answers in 0.2–42 ms against the heuristic's 0.6–2.3 s. The
+crossover rule falls out: N ≤ 18 solve exactly, N > 18 heuristic, knowingly.
 
 ## 10. What failure looks like (so we notice)
 

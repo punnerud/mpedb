@@ -29,6 +29,7 @@ mod trigger;
 mod view;
 
 pub use binder::{HostUdfSet, OpSet, SpellFnSet};
+pub use planner::sequence;
 pub use dbref::{
     mangle as mangle_db_table, parse_attach, resolve_db_refs, AttachStmt, DbResolution, DbScope,
 };
