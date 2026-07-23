@@ -42,24 +42,36 @@ is in the load table rather than hidden.
 
 Milliseconds, median of 5 plus an untimed warm-up.
 
-| query | probes | mpedb | duckdb | sqlite | mpedb vs duckdb | mpedb vs sqlite |
-|---|---|---:|---:|---:|---:|---:|
-| `scan-sum` | scan | 41.2 | 0.479 | 34.8 | 86× slower | 1.2× slower |
-| `scan-filter-sum` | scan | **126.0** | 0.744 | 60.9 | 169× slower | 2.1× slower |
-| `scan-range-sum` | scan | **184.2** | 0.660 | 250.1 | 279× slower | **1.4× faster** |
-| `scan-multi-agg` | scan | 173.4 | 0.843 | 93.3 | 206× slower | 1.9× slower |
-| `count-star` | precompute | ~~3.0~~ **1.5** | 0.215 | 0.141 | 7.2× slower | 10.6× slower |
-| `min-max-indexed` | precompute | **0.008** | 1.9 | 59.9 | **252× faster** | **7,488× faster** |
-| `count-filtered` | precompute | 0.151 | 0.367 | 0.007 | **2.4× faster** | 22× slower |
-| `group-small` | group by | 251.1 | 1.2 | 685.9 | 212× slower | **2.7× faster** |
-| `group-large` | group by | 365.5 | 7.9 | 911.9 | 46× slower | **2.5× faster** |
-| `join-star-2` | join order | ~~1198.0~~ **194.3** | 1.9 | 110.4 | 104× slower | 1.8× slower |
-| `join-star-4` | join order | ~~1325.0~~ **257.0** | 3.6 | 173.7 | 72× slower | 1.5× slower |
-| `join-bad-order` | join order | ~~1098.5~~ **139.7** | 2.8 | 89.6 | 50× slower | 1.6× slower |
+Consolidated at HEAD (`4643aeb`, M3 Pro, 2M-row fact) — a clean snapshot
+after all of stage A/B and the day's four executor changes (covering reads,
+filtered fused fold, selectivity-priced ranges, hash join):
 
-Struck-through numbers are the original 2026-07-22 run; the table is the
-2026-07-23 re-measure after **stage A** (per-index NDV statistics —
-`Database::analyze()`, 0.17 s for nine indexes) and **stage B** (the schema
+| query | probes | mpedb | duckdb | sqlite | mpedb vs duckdb | **mpedb vs sqlite** |
+|---|---|---:|---:|---:|---:|---:|
+| `scan-sum` | scan | 42.4 | 0.491 | 37.3 | 86× slower | 1.1× slower |
+| `scan-filter-sum` | scan | 130.6 | 0.752 | 60.2 | 174× slower | 2.2× slower |
+| `scan-range-sum` | scan | 184.2 | 0.627 | 251.1 | 294× slower | **1.4× faster** |
+| `scan-multi-agg` | scan | 169.9 | 0.867 | 94.3 | 196× slower | 1.8× slower |
+| `count-star` | precompute | 1.4 | 0.206 | 0.164 | 7× slower | 9× slower |
+| `min-max-indexed` | precompute | 0.009 | 1.9 | 57.6 | **211× faster** | **6,400× faster** |
+| `count-filtered` | precompute | 0.153 | 0.340 | 0.007 | **2.2× faster** | 22× slower |
+| `group-small` | group by | 252.6 | 1.2 | 689.7 | 211× slower | **2.7× faster** |
+| `group-large` | group by | 367.0 | 7.9 | 910.2 | 46× slower | **2.5× faster** |
+| `join-star-2` | join order | 193.6 | 1.9 | 110.5 | 102× slower | 1.8× slower |
+| `join-star-4` | join order | 257.9 | 3.8 | 173.1 | 68× slower | 1.5× slower |
+| `join-bad-order` | join order | 140.4 | 2.6 | 88.8 | 54× slower | 1.6× slower |
+
+**The mpedb-vs-SQLite column is the one to read** — same storage class (both
+row stores), so it measures the ENGINE, where DuckDB's column measures the
+STORAGE MODEL. Against SQLite, mpedb WINS four cells (range scan, min/max,
+both group-bys — the last two by 2.5-2.7×) and trails the rest by 1.1-2.2×,
+with `count-*`'s larger ratios sitting on sub-millisecond absolutes. The
+50-290× behind DuckDB is the row-store-vs-column-store gap, which is what
+design/DESIGN-COLUMNAR.md addresses.
+
+The earlier incremental history: the original 2026-07-22 run had the star
+joins at ~1200-1325 ms (before **stage A**, per-index NDV statistics —
+`Database::analyze()`) and **stage B** (the schema
 declares NOT NULL, below). Same binary lineage, same machine, same data.
 
 Prepared and parameterised, 20,000 executions, total milliseconds:
