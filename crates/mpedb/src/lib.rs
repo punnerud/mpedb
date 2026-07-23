@@ -65,6 +65,16 @@ mod workspace;
 
 pub use access::{ddl_access, plan_access, Access, AccessReport, ObjectKind, TxnOp};
 pub use risk::{estimate_plan_risk, RiskEstimate};
+
+/// Process-wide count of statements whose PARTITIONED PARALLEL aggregate fold
+/// engaged (worker threads actually spawned — `exec/parallel.rs`). A
+/// diagnostic/test observable, deliberately the only one: the parallel fold is
+/// proven to change nothing else observable (values, ties, raises, budget
+/// refusals), so the invariance batteries use this to assert the path they
+/// exercise really ran. Monotone; never reset.
+pub fn parallel_folds_engaged() -> u64 {
+    exec::parallel_folds_engaged()
+}
 pub use session::Session;
 pub use shard::ShardSet;
 pub use sqlite_attach::SqliteAttach;

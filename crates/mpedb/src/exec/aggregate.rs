@@ -9,8 +9,12 @@ use mpedb_types::{HostAggState, HostAggs};
 /// every row, NULLs included, and lets `xStep` decide — Django's `StdDevPop`
 /// depends on it. DISTINCT and `FILTER (WHERE …)` are applied identically to
 /// both: the filter by the caller before `push`, the dedup here.
-enum Acc {
+pub(super) enum Acc {
     Native(Accum),
+    /// The parallel fold's integer-sum accumulator (`exec/parallel.rs`):
+    /// minted ONLY by a parallel worker, for a `sum` whose argument the gate
+    /// proved to be a bare `int64` column. Never appears on any serial path.
+    ParSum(ParSum),
     Host {
         state: Box<dyn HostAggState>,
         /// `f(DISTINCT x)`: values already stepped in this group, keyed by their
@@ -27,7 +31,7 @@ enum Acc {
 impl Acc {
     /// Feed one row. `None` is `count(*)`'s "the row itself" — never produced for
     /// a host aggregate (the plan decoder rejects a host call with no argument).
-    fn push(&mut self, v: Option<&Value>) -> Result<()> {
+    pub(super) fn push(&mut self, v: Option<&Value>) -> Result<()> {
         self.push_n(v, &[])
     }
 
@@ -39,6 +43,17 @@ impl Acc {
     fn push_n(&mut self, v: Option<&Value>, extra: &[Value]) -> Result<()> {
         match self {
             Acc::Native(a) => a.push(v),
+            Acc::ParSum(s) => {
+                // The gate admitted a bare int64 column, so anything else here
+                // is a broken invariant: refuse, and the coordinator abandons
+                // the attempt — the serial re-run then produces the authentic
+                // outcome (including the authentic error text, if any).
+                match v {
+                    Some(Value::Null) => Ok(()), // the NULL-skip, as in Accum
+                    Some(Value::Int(i)) => s.push(*i),
+                    _ => Err(internal("parallel sum met a non-int64 input")),
+                }
+            }
             Acc::Host { state, seen, coll } => {
                 let mut all: Vec<Value>;
                 let args = match v {
@@ -64,10 +79,177 @@ impl Acc {
     fn finish(self) -> Result<Value> {
         match self {
             Acc::Native(a) => Ok(a.finish()),
+            Acc::ParSum(s) => s.finish(),
             // sqlite frees the aggregate context right after `xFinal`; consuming
             // the boxed state here is that free.
             Acc::Host { state, .. } => state.finish(),
         }
+    }
+
+    /// Merge a LATER contiguous partition's accumulation into this one — the
+    /// parallel fold's combine step ([`Accum::merge_ordered`] for the native
+    /// pair; the [`ParSum`] monoid for integer sum/avg). A host accumulator
+    /// has no merge (opaque state) and the gate never parallelizes one, so a
+    /// mismatch is a bug surfacing; the coordinator answers every error here
+    /// by abandoning to the serial re-run.
+    pub(super) fn merge_ordered(&mut self, other: Acc) -> Result<()> {
+        match (self, other) {
+            (Acc::Native(a), Acc::Native(b)) => a.merge_ordered(b),
+            (Acc::ParSum(a), Acc::ParSum(b)) => a.merge(b),
+            _ => Err(internal("parallel merge: mismatched accumulator shapes")),
+        }
+    }
+
+    /// An `avg` accumulation whose merged state left the bit-equality window
+    /// ([`ParSum::exact_window`]) — the coordinator abandons on any of these.
+    pub(super) fn avg_escaped(&self) -> bool {
+        matches!(self, Acc::ParSum(s) if s.avg_escaped())
+    }
+}
+
+/// The `Send` image of an [`Acc`], for the parallel worker→coordinator
+/// hand-off: exactly the two accumulator shapes the gate can produce. `Acc`
+/// itself must not cross threads — a HOST accumulator's boxed state carries
+/// no `Send` bound (it may wrap a C callback's context) — so the conversion
+/// REFUSING a host accumulator is the invariant check, not a code path: the
+/// coordinator answers it by abandoning to the serial re-run.
+pub(super) enum SendAcc {
+    Native(Accum),
+    ParSum(ParSum),
+}
+
+impl SendAcc {
+    /// Worker side: surrender an [`Acc`] into its `Send` image.
+    pub(super) fn demote(acc: Acc) -> Result<SendAcc> {
+        match acc {
+            Acc::Native(a) => Ok(SendAcc::Native(a)),
+            Acc::ParSum(s) => Ok(SendAcc::ParSum(s)),
+            Acc::Host { .. } => Err(internal("a host aggregate reached the parallel fold")),
+        }
+    }
+
+    /// Coordinator side: back to the [`Acc`] the shared finish code consumes.
+    pub(super) fn promote(self) -> Acc {
+        match self {
+            SendAcc::Native(a) => Acc::Native(a),
+            SendAcc::ParSum(s) => Acc::ParSum(s),
+        }
+    }
+}
+
+/// One group as a parallel worker hands it over: key tuple, accumulators,
+/// first-row scratch. The bare-column witness slot is absent BY TYPE — the
+/// gate refuses witness-carrying shapes, and dropping the slot here means a
+/// worker cannot smuggle one past the merge.
+pub(super) type SendGroup = (Vec<Value>, Vec<SendAcc>, Option<Vec<Value>>);
+
+/// Per-partition integer-`sum` state: the i128 prefix-sum monoid
+/// `(Σ, max prefix, min prefix)` over one CONTIGUOUS segment of the scan.
+///
+/// **Why this reproduces the serial raise exactly.** The serial fold
+/// accumulates in i64 and raises at the first step whose result leaves i64
+/// range; by induction, it raises iff SOME true (mathematical) prefix sum of
+/// the scanned values lies outside `[i64::MIN, i64::MAX]`. Those prefix
+/// extremes compose over concatenation: for segments A ‖ B, `max-prefix =
+/// max(A.maxp, A.Σ + B.maxp)` (and dually for min), because every prefix of
+/// the concatenation is either a prefix of A or all of A plus a prefix of B.
+/// Partitions are contiguous, merged in key order, so the composed extremes
+/// are the serial scan's — raise iff the serial fold raises, same error
+/// ([`Error::ArithmeticOverflow`] is payload-free), and when no prefix
+/// escapes, the total itself is a prefix, fits i64, and IS the serial answer.
+/// i128 cannot overflow on the way: |Σ| ≤ rows × 2⁶³, and no reachable file
+/// holds 2⁶⁴ rows — the checked ops are pure defense.
+#[derive(Debug, Default)]
+pub(super) struct ParSum {
+    /// Non-NULL values folded (the SUM-is-NULL-over-empty rule needs it).
+    n: u64,
+    sum: i128,
+    maxp: i128,
+    minp: i128,
+    /// This accumulation serves `avg`, not `sum` — see [`ParSum::finish`].
+    avg: bool,
+    /// Some folded term's magnitude exceeded 2⁵³ ([`ParSum::exact_window`]).
+    big_term: bool,
+}
+
+/// |x| ≤ 2⁵³: the window in which an f64 holds an integer EXACTLY.
+const F64_EXACT: i128 = 1 << 53;
+
+impl ParSum {
+    pub(super) fn new(avg: bool) -> ParSum {
+        ParSum { avg, ..ParSum::default() }
+    }
+
+    fn push(&mut self, i: i64) -> Result<()> {
+        self.n += 1;
+        self.sum = self
+            .sum
+            .checked_add(i as i128)
+            .ok_or_else(|| internal("i128 sum overflow"))?;
+        self.maxp = self.maxp.max(self.sum);
+        self.minp = self.minp.min(self.sum);
+        self.big_term |= i.unsigned_abs() > F64_EXACT as u64;
+        Ok(())
+    }
+
+    /// Combine with the segment that comes STRICTLY AFTER this one.
+    fn merge(&mut self, o: ParSum) -> Result<()> {
+        let off = |p: i128| self.sum.checked_add(p);
+        self.maxp = self
+            .maxp
+            .max(off(o.maxp).ok_or_else(|| internal("i128 sum overflow"))?);
+        self.minp = self
+            .minp
+            .min(off(o.minp).ok_or_else(|| internal("i128 sum overflow"))?);
+        self.sum = off(o.sum).ok_or_else(|| internal("i128 sum overflow"))?;
+        self.n += o.n;
+        self.big_term |= o.big_term;
+        Ok(())
+    }
+
+    /// **The `avg` bit-equality window.** Serial `avg` divides `fsum` — an
+    /// f64 accumulated in SCAN ORDER — so a merged i128 total reproduces it
+    /// bit for bit exactly when every serial f64 step was EXACT: each term
+    /// converts exactly (|xᵢ| ≤ 2⁵³) and each running total is an integer of
+    /// magnitude ≤ 2⁵³ (the monoid's own prefix extremes, by induction: an
+    /// exact + an exact with an in-window integer result rounds to itself).
+    /// Inside the window `fsum == Σ` and `Σ/n` is the serial division
+    /// verbatim (and the bundled sqlite's: compensated summation of exact
+    /// steps carries zero compensation). Outside it, no proof exists — the
+    /// COORDINATOR must abandon to serial BEFORE the map is adopted; the
+    /// serial re-run then owns the order-dependent low bits (and the serial
+    /// i64 raise, which cannot fire inside the window at all: 2⁵³ ≪ 2⁶³).
+    pub(super) fn exact_window(&self) -> bool {
+        !self.big_term && self.maxp <= F64_EXACT && self.minp >= -F64_EXACT
+    }
+
+    /// True when this is an `avg` whose merged state left the provable
+    /// window — the coordinator's abandon predicate.
+    pub(super) fn avg_escaped(&self) -> bool {
+        self.avg && !self.exact_window()
+    }
+
+    /// The serial fold's answer. `sum`: NULL over no values, the i64 total
+    /// when no prefix ever left i64 range, and the serial fold's raise
+    /// otherwise — running in the shared finish code, BEFORE `HAVING`/LIMIT
+    /// can drop the group, exactly where the serial raise (mid-scan) also
+    /// precedes them. `avg`: the in-window exact division (the coordinator
+    /// abandoned any escaped state before adoption; finding one here is a
+    /// bug surfacing, not an outcome to invent).
+    fn finish(self) -> Result<Value> {
+        if self.n == 0 {
+            return Ok(Value::Null);
+        }
+        if self.avg {
+            if !self.exact_window() {
+                return Err(internal("an escaped parallel avg survived the merge"));
+            }
+            return Ok(Value::Float(self.sum as f64 / self.n as f64));
+        }
+        if self.maxp > i64::MAX as i128 || self.minp < i64::MIN as i128 {
+            return Err(Error::ArithmeticOverflow);
+        }
+        Ok(Value::Int(self.sum as i64))
     }
 }
 
@@ -81,6 +263,24 @@ impl Acc {
 /// the MIN/MAX compare (`tests/agg_collate.rs`; under BINARY a NOCASE column
 /// holding 'a','B' answered `min='B'`, a live wrong answer).
 fn new_accum(a: &AggCall, host: Option<&dyn HostAggs>) -> Result<Acc> {
+    mint_accum(a, host, false)
+}
+
+/// [`new_accum`] with the parallel worker's twist: under `par_sum`, a native
+/// `sum` mints the [`ParSum`] segment monoid (the gate proved its argument a
+/// bare int64 column). Every other aggregate accumulates exactly as serial.
+pub(super) fn mint_accum(
+    a: &AggCall,
+    host: Option<&dyn HostAggs>,
+    par_sum: bool,
+) -> Result<Acc> {
+    if par_sum && !a.distinct {
+        match a.func.native() {
+            Some(mpedb_types::AggFn::Sum) => return Ok(Acc::ParSum(ParSum::new(false))),
+            Some(mpedb_types::AggFn::Avg) => return Ok(Acc::ParSum(ParSum::new(true))),
+            _ => {}
+        }
+    }
     let coll = a.coll;
     let Some(name) = a.func.host() else {
         let f = a.func.native().ok_or_else(|| internal("aggregate with no target"))?;
@@ -108,7 +308,7 @@ fn new_accum(a: &AggCall, host: Option<&dyn HostAggs>) -> Result<Acc> {
 
 /// The bare-column witness row a group carries (sqlite's "bare columns", see
 /// [`exec_aggregate`]), in one of two shapes chosen by the aggregate set.
-enum Witness {
+pub(super) enum Witness {
     // #87: `extreme` is the running min/max (None until the first non-NULL
     // arg); `bare` is the extremum row's values for `agg.bare_cols`.
     MinMax { extreme: Option<Value>, bare: Vec<Value> },
@@ -124,7 +324,7 @@ enum Witness {
 /// correlated subquery keyed by the group (Django `OuterRef("pk")`) is correct.
 /// When correlation varies inside the group, the first row wins — matching
 /// sqlite's bare-column pick under PK/scan order. O(1) in input rows (#123 §5.1).
-type Group = (Vec<Value>, Vec<Acc>, Option<Witness>, Option<Vec<Value>>);
+pub(super) type Group = (Vec<Value>, Vec<Acc>, Option<Witness>, Option<Vec<Value>>);
 
 /// The fold: everything an aggregate holds between rows.
 ///
@@ -136,7 +336,7 @@ type Group = (Vec<Value>, Vec<Acc>, Option<Witness>, Option<Vec<Value>>);
 /// call [`Folder::push`], one row at a time, in scan order. There is no second
 /// implementation of grouping, of the FILTER clause, or of the witness rule to
 /// drift.
-struct Folder<'a> {
+pub(super) struct Folder<'a> {
     agg: &'a Aggregation,
     t: &'a TableDef,
     schema: &'a Schema,
@@ -173,10 +373,16 @@ struct Folder<'a> {
     /// is why an unbounded `GROUP BY` is *governed* rather than silently
     /// growing until the OOM killer arrives.
     cells: super::gather::JoinCells,
+    /// Set only by a PARALLEL worker ([`Folder::parallelize`]): `sum` mints
+    /// the [`ParSum`] segment monoid instead of [`Accum`]'s i64 running
+    /// total, whose partition-local raise would be wrong in both directions
+    /// without the incoming offset. Everything else accumulates exactly as
+    /// serial — a worker's segment IS a serial fold of that segment.
+    par_sum: bool,
 }
 
 impl<'a> Folder<'a> {
-    fn new(
+    pub(super) fn new(
         ctx: &dyn TxnCtx,
         schema: &'a Schema,
         plan: &CompiledPlan,
@@ -258,7 +464,23 @@ impl<'a> Folder<'a> {
             key_buf: Vec::new(),
             expr_keys: Vec::new(),
             cells: super::gather::JoinCells::new(ctx.join_cells_budget()),
+            par_sum: false,
         }
+    }
+
+    /// Turn this folder into a PARALLEL worker's: group-map cells charge the
+    /// statement-wide shared counter (`cells` — one budget, N maps), and
+    /// integer `sum` mints the [`ParSum`] segment monoid. Called only by
+    /// `exec/parallel.rs`, before the first row.
+    pub(super) fn parallelize(&mut self, cells: super::gather::JoinCells) {
+        debug_assert!(self.groups.is_empty());
+        self.cells = cells;
+        self.par_sum = true;
+    }
+
+    /// Surrender the group map (the worker's result, handed to the merge).
+    pub(super) fn into_groups(self) -> std::collections::BTreeMap<Vec<u8>, Group> {
+        self.groups
     }
 
     /// Fold ONE base row into the group state.
@@ -268,7 +490,12 @@ impl<'a> Folder<'a> {
     /// `params` itself. `ctx` is borrowed SHARED — the fold reads host UDF /
     /// aggregate registries and nothing else, which is exactly what lets the
     /// caller alternate between pulling a batch (`&mut ctx`) and folding it.
-    fn push(&mut self, ctx: &dyn TxnCtx, row: &[Value], row_params: &[Value]) -> Result<()> {
+    pub(super) fn push(
+        &mut self,
+        ctx: &dyn TxnCtx,
+        row: &[Value],
+        row_params: &[Value],
+    ) -> Result<()> {
         let host = ctx.host_fns();
         // The grouping key is sqlite's storage-class key, NOT the on-disk one:
         // over a typeless column `1` and `1.0` are ONE group and the text `'1'`
@@ -328,13 +555,14 @@ impl<'a> Folder<'a> {
                 } else {
                     Some(Witness::MinRowid { pk: Vec::new(), bare: Vec::new() })
                 };
+                let par_sum = self.par_sum;
                 let accs = self
                     .agg
                     .aggs
                     .iter()
                     // The factory table for host aggregates is consulted per
                     // GROUP (one fresh accumulator each), not per row.
-                    .map(|c| new_accum(c, ctx.host_aggs()))
+                    .map(|c| mint_accum(c, ctx.host_aggs(), par_sum))
                     .collect::<Result<Vec<Acc>>>()?;
                 // One group's resident cells: its key tuple, its accumulators,
                 // and its witness row. Charged before the group exists, so an
@@ -888,6 +1116,9 @@ pub(super) fn exec_aggregate(
     // #125: which slots of the gathered tuple this aggregate can observe.
     // `count(*)` observes none of them, so its input is folded from EMPTY rows.
     prune: Option<&RowPrune>,
+    // The parallel fold's shape gate (`mpedb_sql::parallel_fold_shape`),
+    // computed by `run_aggregate` where the whole SelectPlan is in hand.
+    parallel_shape: bool,
 ) -> Result<ExecResult> {
     let mut folder = Folder::new(&*ctx, schema, plan, t, table, joins, agg);
 
@@ -936,6 +1167,23 @@ pub(super) fn exec_aggregate(
                 })
                 .collect();
             folder.groups.insert(Vec::new(), (Vec::new(), accs, None, None));
+            true
+        } else if let Some(groups) = super::parallel::try_parallel_fold(
+            &*ctx, plan, params, schema, t, table, access, filter, agg, prune,
+            parallel_shape, width,
+        )? {
+            // The PARTITIONED fold (exec/parallel.rs): workers already ran
+            // the row body (or the fused decode loop) per contiguous piece
+            // and the merge combined them under the proven per-aggregate
+            // rules — the map adopted here is the serial fold's, byte for
+            // byte, and the shared finish code below does everything
+            // observable (finish raises included: an integer-sum overflow
+            // surfaces from `Acc::finish` exactly where the serial fold's
+            // mid-scan raise would have, before HAVING/LIMIT can drop the
+            // group). Group-map cells were charged worker-side against the
+            // statement-wide shared counter; a trip there abandoned the
+            // attempt, so reaching this arm means the budget held.
+            folder.groups = groups;
             true
         } else if let Some(accs) =
             try_fused_fold(ctx, table, access, plan, params, t, filter, agg)?

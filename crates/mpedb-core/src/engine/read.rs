@@ -69,6 +69,59 @@ impl ReadTxn<'_> {
         self.eng.join_cells_budget()
     }
 
+    /// The parallel-fold worker ceiling this engine was opened with (`0` =
+    /// auto, `1` = serial) — see `[runtime] max_query_threads`.
+    pub fn max_query_threads(&self) -> u32 {
+        self.eng.max_query_threads()
+    }
+
+    /// Checkpoint of the work meter, for [`work_rewind`](Self::work_rewind).
+    pub fn work_checkpoint(&self) -> u64 {
+        self.work.used()
+    }
+
+    /// Rewind the work meter to a [`work_checkpoint`](Self::work_checkpoint)
+    /// — **parallel-fold fallback plumbing only** ([`WorkMeter::rewind`]):
+    /// the abandoned attempt's rows are re-read and re-charged by the serial
+    /// re-run, so the statement's trip point stays the serial contract's.
+    pub fn work_rewind(&self, to: u64) {
+        self.work.rewind(to);
+    }
+
+    /// Split the PK range `(lo, hi)` of `table_id` into up to `want`
+    /// contiguous pieces along the B+tree's own structure, plus a coarse
+    /// row-count estimate for the range — the partitioned parallel fold's
+    /// split ([`crate::btree::partition_keys`]). Returns `(cut keys, est
+    /// rows)`; the cuts are strictly inside the bounds, ascending, possibly
+    /// fewer than asked. Deterministic for this snapshot, no work-row charge
+    /// (a structural descent, like any probe's).
+    pub fn partition_range(
+        &self,
+        table_id: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+        want: usize,
+    ) -> Result<(Vec<Vec<u8>>, u64)> {
+        let root = self.tree_root(table_id, 0)?;
+        let pk = btree::partition_keys(
+            self,
+            root,
+            lo.map(|(k, _)| k),
+            hi.map(|(k, _)| k),
+            want,
+        )?;
+        let rows = self.row_count(table_id)?;
+        // The estimate: the exact catalog row count, scaled by the fraction
+        // of root subtrees the range touches. Coarse (subtree fill varies
+        // ~2×) but deterministic, and only ever a GATE — never an answer.
+        let est = match (lo, hi) {
+            (None, None) => rows,
+            _ if pk.root_children == 0 => rows,
+            _ => rows * pk.root_in_range as u64 / pk.root_children as u64,
+        };
+        Ok((pk.points, est))
+    }
+
     pub fn finish(mut self) -> Result<()> {
         self.released = true;
         if self.eng.shm.release_slot(self.slot, self.word) {
@@ -461,10 +514,16 @@ impl ReadTxn<'_> {
     /// a `RowCursor` drain allocates was the dominant slice of that fold's
     /// ~130 ns/row (examples/agg_prof.rs), and a `sum(a)` never needed it.
     ///
-    /// **#74 charges: one work-row per row, charged BEFORE the decode** — the
-    /// same total, order, and label as the equivalent [`RowCursor`] drain, and
-    /// therefore the same `RuntimeBudget` trip point: this path is faster,
-    /// never cheaper. Pin revalidation every 256 rows, as every scan does.
+    /// **#74 charges: one work-row per row, batched through
+    /// [`WorkMeter::charge_many`] every 64 rows** (remainder flushed at the
+    /// end) — the same total and label as the equivalent [`RowCursor`] drain,
+    /// and the same `RuntimeBudget` payload on a trip (`charge_many` lands
+    /// `used` at `budget + 1`, exactly where the per-row loop stops). The
+    /// batching exists for the PARALLEL fold: its workers charge the
+    /// statement's ONE atomic meter from sibling cores, and a per-row RMW on
+    /// that shared line was measured eating most of a 2-thread `sum`'s gain;
+    /// at most 63 rows are folded past the serial abort point, into
+    /// accumulators the error then discards — nothing observable moves.
     pub fn fold_range_column(
         &self,
         table_id: u32,
@@ -473,6 +532,7 @@ impl ReadTxn<'_> {
         col: u16,
         f: &mut dyn FnMut(&Value) -> Result<()>,
     ) -> Result<()> {
+        const CHARGE_BATCH: u32 = 64;
         let types = self
             .bundle
             .col_types
@@ -481,15 +541,27 @@ impl ReadTxn<'_> {
         let root = self.tree_root(table_id, 0)?;
         let mut c = btree::cursor(self, root, lo, hi)?;
         let mut steps = 0u32;
+        let mut pending = 0u32;
         let mut scratch = Vec::new();
         loop {
             let stepped = c.next_with(self, &mut scratch, |_k, v| {
-                self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
                 let val = row::decode_column(v, types, col as usize)?;
                 f(&val)
             })?;
             if stepped.is_none() {
+                if pending > 0 {
+                    self.work.charge_many(pending as u64, || {
+                        scan_label(&self.bundle.schema, table_id)
+                    })?;
+                }
                 return Ok(());
+            }
+            pending += 1;
+            if pending == CHARGE_BATCH {
+                self.work.charge_many(pending as u64, || {
+                    scan_label(&self.bundle.schema, table_id)
+                })?;
+                pending = 0;
             }
             steps += 1;
             if steps.is_multiple_of(256) && !self.still_pinned() {

@@ -244,6 +244,13 @@ pub struct DbOptions {
     /// machine with overcommit may OOM-kill first — the deterministic cap is
     /// the reliable guard). Absent in config ⇒ [`DEFAULT_MAX_JOIN_CELLS`].
     pub max_join_cells: u64,
+    /// Worker-thread ceiling for the intra-statement parallel aggregate fold
+    /// (design/DESIGN-PARALLEL-READ.md; the partitioned-fold executor). `0` =
+    /// AUTO: `min(available cores, 8)`, resolved at execute time. `1` = serial
+    /// always. A per-process execution option like `durability` — the answer
+    /// (values AND errors) is proven identical at every thread count, so this
+    /// knob is observable only as wall time. Absent in config ⇒ `0` (auto).
+    pub max_query_threads: u32,
     /// Names of tables declared `require_policy = true` (DESIGN-MULTIDB §6.3).
     /// A prepare touching one of these fails closed unless RLS is enabled AND a
     /// policy governs the command being compiled — the answer to "one forgotten
@@ -316,6 +323,10 @@ struct RawRuntime {
     /// Absent ⇒ [`DEFAULT_MAX_JOIN_CELLS`].
     #[serde(default)]
     max_join_cells: Option<u64>,
+    /// Worker-thread ceiling for the parallel aggregate fold; `0` = auto
+    /// (`min(cores, 8)`), `1` = serial. Absent ⇒ `0`.
+    #[serde(default)]
+    max_query_threads: Option<u32>,
 }
 
 /// The resolved `[runtime]` limits (#74), one value per knob.
@@ -323,6 +334,7 @@ struct RawRuntime {
 struct RuntimeLimits {
     max_work_rows: u64,
     max_join_cells: u64,
+    max_query_threads: u32,
 }
 
 impl RawRuntime {
@@ -334,6 +346,7 @@ impl RawRuntime {
             max_join_cells: this
                 .and_then(|r| r.max_join_cells)
                 .unwrap_or(DEFAULT_MAX_JOIN_CELLS),
+            max_query_threads: this.and_then(|r| r.max_query_threads).unwrap_or(0),
         }
     }
 }
@@ -690,6 +703,7 @@ fn raw_to_config(
                 },
                 max_work_rows: runtime.max_work_rows,
                 max_join_cells: runtime.max_join_cells,
+                max_query_threads: runtime.max_query_threads,
                 require_policy,
                 bare_group_by,
             },

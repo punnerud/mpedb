@@ -1756,11 +1756,197 @@ impl Cursor {
     }
 }
 
+// ---------- structural range partitioning (the parallel fold's split) ----------
+
+/// What [`partition_keys`] learned about a tree's shape inside one key range.
+pub struct PartitionKeys {
+    /// Separator keys strictly inside `(lo, hi)`, ascending — cutting the
+    /// range at these yields contiguous, non-overlapping, collectively
+    /// exhaustive sub-ranges that follow the tree's own subtree boundaries.
+    /// May hold FEWER than `want - 1` entries (a small or narrow range), and
+    /// is empty for a leaf-only or empty tree.
+    pub points: Vec<Vec<u8>>,
+    /// Of the root's children, how many subtend keys intersecting `(lo, hi)`
+    /// — the numerator of a coarse in-range row fraction.
+    pub root_in_range: usize,
+    /// The root's total child count (the denominator). `0` when the root is a
+    /// leaf or the tree is empty, in which case no fraction is claimed.
+    pub root_children: usize,
+}
+
+/// Split the key range `(lo, hi)` into up to `want` contiguous pieces along
+/// the tree's OWN structure, for the partitioned parallel fold
+/// (design/DESIGN-PARALLEL-READ.md §4.2).
+///
+/// The points are separator keys read from branch levels, walking one level
+/// deeper only while a level holds fewer than `want - 1` in-range separators
+/// (bounded by a node-visit cap, so a pathological `want` cannot turn this
+/// into a tree scan). Separators at one level subtend subtrees of similar
+/// leaf counts, so the pieces are balanced to within the B+tree fill factor
+/// (2×) — deterministic for a given snapshot (a pure function of the tree's
+/// pages), machine-independent, and free of any row visit: nothing here
+/// charges the work meter, exactly like any other descent.
+///
+/// Bounds are RAW encoded keys; inclusivity is irrelevant here (a separator
+/// equal to a bound would only mint an empty piece, and an empty piece folds
+/// to the identity). The caller may cut anywhere between the points too —
+/// they are hints of structure, not the only valid split.
+pub fn partition_keys<S: PageStore + ?Sized>(
+    store: &S,
+    root: u64,
+    lo: Option<&[u8]>,
+    hi: Option<&[u8]>,
+    want: usize,
+) -> Result<PartitionKeys> {
+    /// Visiting more nodes than this stops the descent with whatever the
+    /// current level yielded: 8 workers need 7 points, and a level of 256
+    /// branches holds thousands — the cap only ever bites on degenerate asks.
+    const NODE_CAP: usize = 256;
+    let mut out = PartitionKeys { points: Vec::new(), root_in_range: 0, root_children: 0 };
+    if root == 0 || want < 2 {
+        return Ok(out);
+    }
+    let in_range =
+        |k: &[u8]| lo.is_none_or(|l| k > l) && hi.is_none_or(|h| k < h);
+    let mut frontier = vec![root];
+    for depth in 0..64 {
+        let mut seps: Vec<Vec<u8>> = Vec::new();
+        let mut next: Vec<u64> = Vec::new();
+        let mut leaf_level = false;
+        for &id in &frontier {
+            let p = store.page(id)?;
+            check_node(p)?;
+            if kind(p) != KIND_BRANCH {
+                leaf_level = true;
+                break;
+            }
+            let n = nkeys(p);
+            // Child `i` covers keys in [sep_{i-1}, sep_i) within this node
+            // (open at both ends of the node). It intersects `(lo, hi)` iff
+            // its upper separator clears `lo` and its lower clears `hi`.
+            for i in 0..=n {
+                let above_lo = match (lo, i < n) {
+                    (Some(l), true) => branch_cell(p, i)?.0 > l,
+                    _ => true, // no lower bound, or the rightmost child
+                };
+                let below_hi = match (hi, i > 0) {
+                    (Some(h), true) => branch_cell(p, i - 1)?.0 < h,
+                    _ => true, // no upper bound, or the leftmost child
+                };
+                if above_lo && below_hi {
+                    next.push(branch_child(p, i)?);
+                }
+                if i < n {
+                    let (k, _) = branch_cell(p, i)?;
+                    if in_range(k) {
+                        seps.push(k.to_vec());
+                    }
+                }
+            }
+            if depth == 0 {
+                out.root_children = n + 1;
+                out.root_in_range = next.len();
+            }
+        }
+        if leaf_level {
+            break; // the previous level's points stand
+        }
+        // Concatenated per-node separators are ascending across the frontier:
+        // sibling subtrees are ordered, and each node's separators sit
+        // strictly inside its subtree's key span.
+        if !seps.is_empty() {
+            out.points = seps;
+        }
+        if out.points.len() >= want - 1 || next.len() > NODE_CAP || next.is_empty() {
+            break;
+        }
+        frontier = next;
+    }
+    // Thin an over-dense level to `want - 1` evenly spaced points, keeping
+    // the arithmetic integer-only so every machine picks the same cuts.
+    if out.points.len() > want - 1 {
+        let s = out.points.len();
+        let picked: Vec<Vec<u8>> = (1..want)
+            .map(|i| out.points[i * s / want].clone())
+            .collect();
+        out.points = picked;
+        out.points.dedup();
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::pagestore::test_store::TestStore;
     use std::collections::BTreeMap;
+
+    /// [`partition_keys`] cuts must be strictly inside the bounds, ascending,
+    /// and every key of the tree must land in exactly one resulting piece —
+    /// for full-range and bounded asks alike, at several tree sizes (leaf-only
+    /// through multi-level).
+    #[test]
+    fn partition_keys_cut_the_range_exactly() {
+        for n in [0u64, 5, 300, 5000] {
+            let mut store = TestStore::new();
+            let mut root = 0u64;
+            let mut keys: Vec<Vec<u8>> = Vec::new();
+            for i in 0..n {
+                let k = format!("key{i:06}").into_bytes();
+                let out =
+                    insert(&mut store, root, &k, &mut Payload::Flat(b"v"), InsertMode::Upsert)
+                        .unwrap();
+                root = out.new_root;
+                keys.push(k);
+            }
+            keys.sort();
+            for (lo, hi) in [
+                (None, None),
+                (Some(&b"key000100"[..]), Some(&b"key004500"[..])),
+                (Some(&b"key004999"[..]), None),
+            ] {
+                for want in [2usize, 3, 8] {
+                    let pk = partition_keys(&store, root, lo, hi, want).unwrap();
+                    // Strictly inside, strictly ascending.
+                    for w in pk.points.windows(2) {
+                        assert!(w[0] < w[1], "points must ascend");
+                    }
+                    for p in &pk.points {
+                        assert!(lo.is_none_or(|l| p.as_slice() > l), "point ≤ lo");
+                        assert!(hi.is_none_or(|h| p.as_slice() < h), "point ≥ hi");
+                    }
+                    // Every in-range key lands in EXACTLY one piece: cutting a
+                    // sorted key list at the points is a partition of it.
+                    let in_range: Vec<&Vec<u8>> = keys
+                        .iter()
+                        .filter(|k| {
+                            lo.is_none_or(|l| k.as_slice() > l)
+                                && hi.is_none_or(|h| k.as_slice() < h)
+                        })
+                        .collect();
+                    // The executor's pieces: [orig-lo, p1) ‖ [p1, p2) ‖ … ‖
+                    // [p_last, orig-hi) — later pieces take their cut
+                    // INCLUSIVE (a separator may equal a live key).
+                    let mut covered = 0usize;
+                    let mut cur_lo: Option<Vec<u8>> = None; // None = piece 0
+                    let mut cuts = pk.points.clone();
+                    cuts.push(Vec::new()); // sentinel: the last piece runs to hi
+                    for (i, cut) in cuts.iter().enumerate() {
+                        let last = i == cuts.len() - 1;
+                        covered += in_range
+                            .iter()
+                            .filter(|k| {
+                                cur_lo.as_ref().is_none_or(|l| k.as_slice() >= l.as_slice())
+                                    && (last || k.as_slice() < cut.as_slice())
+                            })
+                            .count();
+                        cur_lo = Some(cut.clone());
+                    }
+                    assert_eq!(covered, in_range.len(), "n={n} want={want}");
+                }
+            }
+        }
+    }
 
     /// Extents through the tree, differentially against a model — with the
     /// OWNERSHIP ledger as the real assertion: after every simulated commit,

@@ -433,6 +433,20 @@ impl CompiledPlan {
                     if let Some(h) = &a.having {
                         out.push_str(&format!("  having: {}\n", render_program(h, &name)));
                     }
+                    // The parallel fold states its gate honestly: shape
+                    // eligibility is decided here (the single predicate the
+                    // executor also uses), but ENGAGEMENT is an execute-time
+                    // decision — a pinned-snapshot context, an estimated
+                    // input above the threshold, and `max_query_threads > 1`.
+                    // The answer is proven identical either way, so the claim
+                    // is about wall time only.
+                    if super::parallel_fold_shape(sp, schema) {
+                        out.push_str(
+                            "  parallel fold: eligible — partitioned across worker \
+                             threads when the estimated input exceeds ~100k rows \
+                             (snapshot reads only; [runtime] max_query_threads)\n",
+                        );
+                    }
                 }
                 // Window functions run over the base row, so their sub-programs
                 // use the base namer. Shows the phase EXPLAIN otherwise hides.

@@ -49,10 +49,15 @@ pub fn take_last_insert_rowid() -> Option<i64> {
 mod aggregate;
 mod fts;
 mod gather;
+mod parallel;
 mod recursive;
 mod window;
 
 pub(crate) use gather::{range_bounds, resolve_part, RawBound};
+/// See [`crate::parallel_folds_engaged`].
+pub(crate) fn parallel_folds_engaged() -> u64 {
+    parallel::ENGAGED.load(std::sync::atomic::Ordering::Relaxed)
+}
 use aggregate::exec_aggregate;
 use gather::{cmp_rows, gather_joined, gather_rows, gather_topk, sort_rows};
 
@@ -131,6 +136,15 @@ pub(crate) trait TxnCtx {
     /// connection-local, so every other context refuses it by name rather than
     /// sorting under a collation it does not have.
     fn host_colls(&self) -> Option<&dyn HostColls> {
+        None
+    }
+    /// The pinned snapshot under this context, when this context IS a plain
+    /// snapshot read — the parallel fold's precondition (`exec/parallel.rs`):
+    /// its workers share the returned txn's pin, meter and page access, so
+    /// only a context that is nothing BUT a `ReadTxn` may answer. Everything
+    /// else (write contexts, overlay/streaming reads) keeps the `None`
+    /// default and folds serially, as today.
+    fn snapshot_txn(&self) -> Option<&ReadTxn<'_>> {
         None
     }
     fn get_by_pk(&mut self, table: u32, pk: &[Value]) -> Result<Option<Vec<Value>>>;
@@ -629,6 +643,9 @@ pub(crate) struct ReadCtx<'t, 'e>(
 );
 
 impl TxnCtx for ReadCtx<'_, '_> {
+    fn snapshot_txn(&self) -> Option<&ReadTxn<'_>> {
+        Some(self.0)
+    }
     fn host_fns(&self) -> Option<&dyn HostFns> {
         self.1
     }
@@ -1987,6 +2004,13 @@ fn run_aggregate(
     // this, and the streaming fold (#123) pushes it into the SCAN so an
     // unobserved column is never even decoded (`gather::scan_keep`).
     let prune = select_prune(schema, plan, sp, correlated)?;
+    // The parallel fold's shape gate — decided HERE, where the whole
+    // SelectPlan is in hand, by the same predicate EXPLAIN prints. The
+    // correlated machinery must also be absent: a correlated aggregate's
+    // per-row scratch is exactly what the workers do not carry.
+    let parallel_shape = correlated.is_empty()
+        && post_filter.is_none()
+        && mpedb_sql::parallel_fold_shape(sp, schema);
     exec_aggregate(
         ctx,
         plan,
@@ -2010,6 +2034,7 @@ fn run_aggregate(
         correlated,
         post_filter,
         prune.as_ref(),
+        parallel_shape,
     )
 }
 

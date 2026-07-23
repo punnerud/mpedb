@@ -238,6 +238,18 @@ impl WorkMeter {
         self.used.load(AtomicOrdering::Relaxed)
     }
 
+    /// Rewind the counter to a checkpoint taken with [`used`](Self::used) —
+    /// **parallel-fold fallback plumbing only** (design/DESIGN-PARALLEL-READ.md).
+    /// When the partitioned fold abandons mid-flight and re-runs serially, the
+    /// serial run must charge from the point the statement had reached BEFORE
+    /// the attempt, or the retry would double-charge the same rows and trip a
+    /// budget the serial statement honors. Never a way to un-spend work the
+    /// statement keeps: the abandoned attempt's rows are re-read and re-charged
+    /// by the serial re-run, so the trip point stays the serial contract's.
+    pub fn rewind(&self, to: u64) {
+        self.used.store(to, AtomicOrdering::Relaxed);
+    }
+
     /// The configured budget (`0` = unlimited).
     pub fn budget(&self) -> u64 {
         self.budget
@@ -585,6 +597,9 @@ pub struct Engine {
     /// executor's nested-loop join reads it via the txn and bounds the
     /// `Value` cells its intermediate product holds. `0` = unlimited.
     join_cells_budget: u64,
+    /// Worker-thread ceiling for the partitioned parallel fold (`[runtime]
+    /// max_query_threads`): `0` = auto (`min(cores, 8)`), `1` = serial.
+    query_threads: u32,
     /// Installed by the facade; recompiles CHECK programs whenever a bundle is
     /// (re)built from the catalog. `None` until then — and forever for the
     /// core's own tests, which declare no CHECKs.
@@ -637,6 +652,7 @@ impl Engine {
             extent_threshold: None,
             work_budget: config.options.max_work_rows,
             join_cells_budget: config.options.max_join_cells,
+            query_threads: config.options.max_query_threads,
             check_compiler: std::sync::RwLock::new(None),
         };
         engine.bootstrap_catalog()?;
@@ -836,6 +852,7 @@ impl Engine {
             // verify pass legitimately scans whole tables).
             work_budget: 0,
             join_cells_budget: 0,
+            query_threads: 1, // tooling handle: always serial
             // Read-only tooling: no SQL layer to install a compiler, and no
             // writes for a CHECK to guard.
             check_compiler: std::sync::RwLock::new(None),
@@ -854,6 +871,13 @@ impl Engine {
     /// it per cell its intermediate product holds.
     pub fn join_cells_budget(&self) -> u64 {
         self.join_cells_budget
+    }
+
+    /// The parallel-fold worker ceiling this engine was opened with
+    /// (`0` = auto, `1` = serial) — raw, not yet resolved against the core
+    /// count; the executor resolves the auto sentinel at the gate.
+    pub fn max_query_threads(&self) -> u32 {
+        self.query_threads
     }
 
     /// The write-path concurrency discipline this engine was opened with

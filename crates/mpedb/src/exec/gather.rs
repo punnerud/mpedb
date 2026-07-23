@@ -18,18 +18,39 @@ use super::*;
 pub(super) struct JoinCells {
     budget: u64,
     live: u64,
+    /// Set only by the PARALLEL fold's workers: the live total is then the
+    /// SHARED sum across every worker's group map, so the tripwire fires on
+    /// the statement's true residency — N per-worker maps must not turn one
+    /// budget into N. A trip here is never surfaced as this error: the
+    /// parallel attempt abandons and the serial re-run re-decides against the
+    /// same budget with the serial map, deterministically. `None` (every
+    /// serial path) is byte-identical to the pre-parallel accounting.
+    shared: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl JoinCells {
     pub(super) fn new(budget: u64) -> JoinCells {
-        JoinCells { budget, live: 0 }
+        JoinCells { budget, live: 0, shared: None }
+    }
+
+    /// A worker's view of the statement-wide shared cell count (see `shared`).
+    pub(super) fn new_shared(
+        budget: u64,
+        counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> JoinCells {
+        JoinCells { budget, live: 0, shared: Some(counter) }
     }
 
     /// Charge `n` newly held cells; [`Error::RuntimeBudget`] once the live
     /// total crosses the budget. `which` is evaluated only on the error path.
     #[inline]
     pub(super) fn charge(&mut self, n: u64, which: impl FnOnce() -> String) -> Result<()> {
-        self.live = self.live.saturating_add(n);
+        self.live = match &self.shared {
+            None => self.live.saturating_add(n),
+            Some(c) => c
+                .fetch_add(n, std::sync::atomic::Ordering::Relaxed)
+                .saturating_add(n),
+        };
         if self.budget != 0 && self.live > self.budget {
             return Err(Error::RuntimeBudget {
                 kind: mpedb_types::BudgetKind::JoinCells,
@@ -971,6 +992,31 @@ impl BatchScan {
             batch: fold_batch(ctx.join_cells_budget(), width),
             done: empty,
         }))
+    }
+
+    /// A [`BatchScan`] over ONE PARTITION of an already-resolved PK range —
+    /// the parallel fold's worker input (`exec/parallel.rs`). The caller has
+    /// resolved the plan's bounds once ([`range_bounds`]) and cut them at
+    /// structural partition keys; each worker then drains its contiguous
+    /// piece with exactly the serial scan's batching, masking, filtering and
+    /// #74 charges — the same rows the serial scan would hand this piece,
+    /// in the same order.
+    pub(super) fn open_partition(
+        ctx: &dyn TxnCtx,
+        table: u32,
+        lo: Option<RawBound>,
+        hi: Option<RawBound>,
+        width: usize,
+        keep: Option<Vec<bool>>,
+    ) -> BatchScan {
+        BatchScan {
+            table,
+            lo,
+            hi,
+            keep,
+            batch: fold_batch(ctx.join_cells_budget(), width),
+            done: false,
+        }
     }
 
     /// The next batch of at most `self.batch` filtered rows; empty when the

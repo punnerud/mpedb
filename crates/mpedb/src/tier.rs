@@ -126,6 +126,7 @@ impl Database {
                 extent_threshold: default_extent_threshold(),
                 max_work_rows: DEFAULT_MAX_WORK_ROWS,
                 max_join_cells: DEFAULT_MAX_JOIN_CELLS,
+                max_query_threads: 0,
                 require_policy: Default::default(),
                 bare_group_by: Default::default(),
                 perms: FilePerms {

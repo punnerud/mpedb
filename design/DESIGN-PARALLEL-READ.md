@@ -1,7 +1,7 @@
 # DESIGN-PARALLEL-READ — intra-query read parallelism: the substrate ceiling, measured
 
-**Status: measurement + scoped design, 2026-07-21. Verdict: BUILD — read-only, cost-gated,
-nothing else.** The numbers half is `crates/mpedb/examples/par_ceiling.rs`, run on the M3
+**Status: BUILT (partitioned parallel aggregate fold, 2026-07-22 — §8). Verdict was: BUILD
+— read-only, cost-gated, nothing else.** The numbers half is `crates/mpedb/examples/par_ceiling.rs`, run on the M3
 (Apple M3 Pro, 5 P-cores + 6 E-cores, 36 GB) at commit `66a0010`. Nothing here changed the
 engine; every measurement went through today's public API. Method model:
 [FOOTPRINT-INDEX-MEASURED.md](FOOTPRINT-INDEX-MEASURED.md).
@@ -224,3 +224,72 @@ invariance), `tests/agg_stream_mem.rs` slopes, `tests/prune_width.rs`,
 `tests/runtime_budget.rs`, full `cargo test --workspace` ×3, clippy clean, and
 the `select1-4` + `evidence/` corpus report byte-identical (9,489/9,689, the
 same 4 flagged) vs a `31cb87c` build on the same box.
+
+## 8. BUILT 2026-07-22 — the partitioned parallel fold, scoped by order-dependence
+
+`exec/parallel.rs` + `mpedb_sql::parallel_fold_shape` (the single gate, EXPLAIN prints it)
++ `btree::partition_keys` / `ReadTxn::partition_range` (structural cuts) + `[runtime]
+max_query_threads` (0 = auto `min(cores, 8)`, on by default; 1 = serial). Engagement:
+snapshot read context ∧ shape gate ∧ est input ≥ 100k rows (`MPEDB_PAR_MIN_ROWS`
+overrides for the batteries) ∧ ≥ 1 in-range tree cut.
+
+**The semantic trap this section §4 did not cover — order-dependent aggregates — decided
+the scope.** A parallel fold changes the order values meet the accumulator, and mpedb's
+doctrine is bit-exact against a serial-order oracle:
+
+- **Integer `sum` raises on INTERMEDIATE overflow, order-dependently.** Probed on the
+  bundled 3.45.0: `[MAX, 1, -2]` raises "integer overflow" though the total fits; the
+  same multiset as `[1, -2, MAX]` completes. Serial mpedb (`Accum`, i64 `checked_add`)
+  raises iff SOME true prefix sum leaves i64 range. The parallel fold reproduces that
+  raise EXACTLY: per contiguous partition an i128 monoid `(Σ, max-prefix, min-prefix)`
+  (`ParSum`), composed in key order (`maxp = max(A.maxp, A.Σ + B.maxp)`); every prefix of
+  the concatenation is a prefix of A or all-of-A-plus-a-prefix-of-B, i128 cannot overflow
+  at any reachable row count, so raise-iff-serial-raises holds in BOTH directions — no
+  §7.2-style raise divergence exists, so no RLS carve-out is needed. (The weaker
+  raise-iff-the-TOTAL-escapes design — mathematically-exact map-reduce semantics, which
+  would complete some statements serial raises — was considered and NOT needed; the exact
+  monoid costs the same three words. If completion-on-intermediate-overflow is ever
+  wanted, it is a deliberate SERIAL semantics change first, or it diverges from the
+  oracle on the probe above.) A per-partition i64 fold is wrong in both directions and
+  `par_fold.rs` carries the refuting probe (a suffix whose LOCAL sum overflows while
+  every true prefix fits must complete).
+- **Integer `avg`** parallelizes inside the f64-exactness window, checked at the merge:
+  serial avg divides `fsum` (f64, scan order), which equals the exact i128 total iff
+  every term and every prefix stays within ±2⁵³ — the monoid already carries the prefix
+  extremes, a `big_term` bit covers the terms. Inside: `Σ/n` is bit-identical to serial
+  (and to sqlite's compensated sum, whose compensation is zero on exact steps). Outside:
+  the coordinator ABANDONS to serial before adoption (cost ≤ 1/k extra, rare — needs
+  ~9·10¹⁵ accumulated magnitude), and serial's order-dependent low bits and i64 raise
+  stand untouched.
+- **Float `sum`/`avg`, `total`**: f64 accumulation is non-associative — partitioned low
+  bits would differ from the serial-order oracle. Refused, permanently, per doctrine.
+- **`group_concat`** (order IS the answer), **DISTINCT** (dedup sets span partitions),
+  **host aggregates** (opaque state), **bare-column witnesses** (the all-NULL/
+  all-filtered corners track the LATEST row; the witness carries no merge state),
+  **`any`-typed min/max args** (Bool/Timestamp against another class are `sort_cmp`
+  peers — incomparability breaks first-beat associativity): refused.
+- **Proven in**: `count(*)`/`count(x)` (addition), `min`/`max` over bare non-`any`
+  columns (total order per class; ordered merge reproduces the serial first-strict-beat
+  witness, spelling included — `Accum::merge_ordered` lives beside the fold rules),
+  GROUP BY structure over all of the above (per-worker maps merged per group in
+  partition order; first partition's key spelling = serial first row's).
+
+**Execution contract** (why every observable is serial-identical): workers share the
+statement's own `ReadTxn` — same pin, same snapshot, ZERO extra reader slots — via
+scoped threads bounded by the leader's borrow; each worker drains a contiguous piece cut
+at B+tree separators through the SERIAL row body itself (`BatchScan` + `Folder`, or the
+fused `fold_range_column` loop) — no second row-processing implementation; workers
+charge the statement's own atomic `WorkMeter` (completed fold = exactly the serial
+total); and ANY mid-flight error — work/cells budget trip (cells are a SHARED counter
+across worker maps, so N maps cannot turn one budget into N), per-row program raise,
+eviction — rewinds the meter and falls through to the serial paths, which then own the
+authentic outcome (same deterministic `used`, same error text, same raise-vs-budget
+precedence). The one merge-time error, integer-sum overflow, is returned directly on the
+strength of the proof. Consequence: thread count is observable as wall time ONLY
+(`par_fold.rs::thread_count_is_unobservable`), and the sole deliberate observable is
+`mpedb::parallel_folds_engaged()`, which the batteries use to prove the path ran.
+
+Gates run: `par_fold.rs` (16 differentials incl. the four overflow probes, budget
+determinism vs serial, NOCASE tie spellings, snapshot-under-writes), full workspace,
+clippy `-D warnings`, corpus byte-identical (§8.1), agg_stream/collate/over_index/
+stream_mem/runtime_budget green. Numbers on THIS box (2 cores): §8.1.

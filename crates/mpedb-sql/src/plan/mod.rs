@@ -1739,6 +1739,116 @@ pub fn agg_set_servable_by_index(
             .all(|c| matches!(c.func.native(), Some(F::Min | F::Max)))
 }
 
+/// May this SELECT's aggregate fold be PARTITIONED across worker threads
+/// (design/DESIGN-PARALLEL-READ.md — the parallel fold's shape gate)? The
+/// SINGLE source for the executor's attempt and EXPLAIN's claim, so the two
+/// cannot drift. Static shape only; the executor additionally requires a
+/// pinned-snapshot read context, no correlated machinery in scope, and an
+/// estimated input above the engagement threshold.
+///
+/// Everything admitted here is admitted BECAUSE its partition-merge is proven
+/// order-identical to the serial fold — values, ties, spellings, raises:
+///
+/// - **count(\*) / count(x)** — addition; the NULL-skip is per-row.
+/// - **min / max over a bare non-`any` column** — the strict-beat compare is
+///   a TOTAL order within every rigid column class ([`Value::sort_cmp`]:
+///   floats by IEEE total order, text under its collation), so merging
+///   segment extrema in key order reproduces the serial first-strict-beat
+///   witness exactly. An `any` column can hold Bool/Timestamp beside another
+///   class — `sort_cmp` calls those peers, incomparability breaks the
+///   first-beat associativity argument, and the shape is refused rather than
+///   reasoned about. A computed argument's per-row class is not schema-pinned
+///   → refused (serial, as today).
+/// - **sum over a bare `int64` column** — folded per segment as an i128
+///   prefix-sum monoid `(Σ, max-prefix, min-prefix)`; the serial i64 fold
+///   raises iff SOME true prefix sum leaves i64 range, that predicate
+///   composes exactly across ordered contiguous segments, and i128 cannot
+///   itself overflow at any reachable row count. The raise — sqlite raises on
+///   INTERMEDIATE overflow even when the total fits, probed on the bundled
+///   3.45.0: `[MAX, 1, -2]` errors while the same multiset as `[1, -2, MAX]`
+///   completes — therefore fires iff the serial fold's does, same error.
+///   (A weaker raise-iff-the-TOTAL-escapes design, which would complete some
+///   statements serial raises under the §7.2 reorder precedent, was NOT
+///   needed: the exact monoid costs the same three i128 words.)
+/// - **avg over a bare `int64` column** — the same monoid, admitted at the
+///   MERGE only inside the f64-exactness window (every term and every prefix
+///   within ±2⁵³), where the serial `fsum`-in-scan-order division is exact
+///   and therefore equals `Σ/n` bit for bit; outside the window the
+///   coordinator abandons to the serial fold, whose order-dependent low bits
+///   (and i64 raise) then stand untouched.
+/// - **GROUP BY** over the above (bare or computed keys) — per-worker maps
+///   merged per group in segment order; group keys collapse under the same
+///   collation-folded encoding, and the first segment's key spelling wins,
+///   which IS the serial first-row spelling.
+///
+/// Refused, and why (the honest list — these change ANSWERS, not speed):
+/// float `sum`/`avg`, every `total` (f64 accumulation is non-associative:
+/// partitioned low bits would differ from the serial — i.e. the oracle's —
+/// answer, and the doctrine is bit-exact), `group_concat` (order IS the
+/// answer), DISTINCT (dedup sets span partitions), host aggregates (opaque
+/// state, no merge), bare columns (the witness rule's all-NULL/all-filtered
+/// corners track the LATEST row — merging needs state the witness doesn't
+/// carry; serial until it does), any host-called per-row program (a host fn
+/// is not known thread-safe), index/point access paths, joins, windows.
+pub fn parallel_fold_shape(p: &SelectPlan, schema: &mpedb_types::Schema) -> bool {
+    use mpedb_types::AggFn as F;
+    let Some(agg) = &p.aggregate else {
+        return false;
+    };
+    let Some(t) = schema.table(p.table) else {
+        return false;
+    };
+    if !p.joins.is_empty()
+        || p.post_filter.is_some()
+        || !p.windows.is_empty()
+        || agg.over_index.is_some()
+        || !agg.bare_cols.is_empty()
+        || agg.aggs.is_empty()
+        || p.table == DUAL_TABLE
+        || p.table == CTE_TABLE
+        || t.primary_key.is_empty()
+        || !matches!(p.access, AccessPath::FullScan | AccessPath::PkRange { .. })
+    {
+        return false;
+    }
+    // Per-row programs must be host-free: workers run without the host
+    // registries in scope, and a host callback is not known thread-safe.
+    // (HAVING and the projection run at finish, on the calling thread, with
+    // the full context — they are free to call hosts.)
+    let host_free = |prog: &Option<ExprProgram>| {
+        prog.as_ref().is_none_or(|f| !f.has_host_call())
+    };
+    if !host_free(&p.filter) {
+        return false;
+    }
+    if !agg.group_by.iter().all(|k| match k {
+        GroupKey::Col(_) => true,
+        GroupKey::Expr(e) => !e.has_host_call(),
+    }) {
+        return false;
+    }
+    // The bare-column argument a call reads, when it is exactly that shape.
+    let bare_col = |c: &AggCall| match c.arg.as_ref().map(|p| p.instrs.as_slice()) {
+        Some([mpedb_types::Instr::PushCol(i)]) => t.columns.get(*i as usize),
+        _ => None,
+    };
+    agg.aggs.iter().all(|c| {
+        if c.distinct || !c.extra_args.is_empty() || !host_free(&c.filter) {
+            return false;
+        }
+        match c.func.native() {
+            Some(F::Count) => host_free(&c.arg),
+            Some(F::Min | F::Max) => {
+                bare_col(c).is_some_and(|col| col.ty != mpedb_types::ColumnType::Any)
+            }
+            Some(F::Sum | F::Avg) => {
+                bare_col(c).is_some_and(|col| col.ty == mpedb_types::ColumnType::Int64)
+            }
+            _ => false, // total/group_concat/host: order-dependent or opaque
+        }
+    })
+}
+
 /// One GROUP BY key (#56). `GROUP BY a` is a base-row column; `GROUP BY a+1`
 /// is a computed key — sqlite and PostgreSQL both allow it, and the grouped
 /// tuple `[keys ‖ aggs]` carries the computed value like any other key.
