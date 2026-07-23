@@ -1,0 +1,13 @@
+[package]
+name = "mpedb-vecbench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# Same dependency argument as mpedb-graphbench: JSON over HTTP to 127.0.0.1
+# needs a few hundred lines of std, not a TLS stack. qdrant.rs is a trimmed
+# sibling of graphbench's neo4j.rs (same HTTP/1.0 + minimal-JSON approach);
+# they stay separate files because the protocols share nothing but transport.
+[dependencies]
+mpedb = { workspace = true }
