@@ -1077,6 +1077,43 @@ fn try_fused_fold(
             _ => ctx.fold_rows_column(table, lo, hi, col, opts, &mut push),
         }
     };
+    // COLUMN SEGMENTS (design/DESIGN-COLUMNAR.md stage 1). A whole-table
+    // aggregate over a segmentable column can read the column's own contiguous
+    // storage instead of pulling every row out of the PK tree for one field.
+    // Same values, same PK order, same accumulators — so the answer is
+    // bit-identical, float sums included — only the source is cheaper.
+    //
+    // Restricted to the unfiltered FULL scan: a predicate needs the zone-map
+    // block-skipping path (stage 2), and a bounded range needs the block/PK
+    // mapping the watermark work introduces (stage 5). Anything else declines
+    // and the row fold runs, exactly as before.
+    if filter.is_none() && matches!(access, AccessPath::FullScan) {
+        if let Some(snap) = ctx.snapshot_txn() {
+            let ty = t.columns[col as usize].ty;
+            let mut probe = accs;
+            let fed = {
+                let mut push = |v: &Value| {
+                    for (a, has) in probe.iter_mut().zip(&has_arg) {
+                        a.push(if *has { Some(v) } else { None })?;
+                    }
+                    Ok(())
+                };
+                crate::colseg::feed_from_segments(snap, table, col, ty, &mut push)?
+            };
+            if fed {
+                return Ok(Some(probe));
+            }
+            // Declined: rebuild the accumulators, since a partial feed is not
+            // possible (`feed_from_segments` pushes nothing unless every block
+            // checked out) but `push` may have been handed to it either way.
+            accs = agg
+                .aggs
+                .iter()
+                .map(|c| new_accum(c, ctx.host_aggs()))
+                .collect::<Result<Vec<Acc>>>()?;
+        }
+    }
+
     let Some(stop) = fold_into(ctx, &mut accs, lo.as_ref(), hi.as_ref(), opts)? else {
         return Ok(None); // this context has no spine-free fold: the batched one runs
     };
