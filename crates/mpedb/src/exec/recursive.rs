@@ -38,16 +38,44 @@ pub(super) fn exec_recursive_cte(
     let mut result: Vec<Vec<Value>> = Vec::with_capacity(anchor_rows.len());
     let mut seen: HashSet<Vec<u8>> = HashSet::new();
     let mut queue: Vec<Vec<Value>> = Vec::new();
-    for row in anchor_rows {
-        if rc.union_all || seen.insert(keycode::encode_group_key(&row, &[])) {
-            queue.push(row.clone());
-            result.push(row);
-        }
-    }
 
     // The outer LIMIT bounds the iteration only when the outer statement passes
     // rows through 1:1 (§2) — that is what makes an infinite generator finite.
     let iter_cap = outer_iteration_cap(&rc.outer);
+
+    // Converged-frontier reachability (the graph bench's depth-sweep finding:
+    // reach-k grew LINEARLY in k after the frontier saturated, because UNION
+    // dedups (node, depth) PAIRS and every level re-expanded the whole
+    // reached set). When the counter column is provably a monotone depth
+    // guard AND the outer statement provably cannot observe it, the fixpoint
+    // may dedup the working set on the remaining columns — a node is expanded
+    // once, at its minimal depth, and the reachable SET is unchanged: an
+    // expansion from a smaller counter reaches at least as far under the same
+    // guard. `None` = the proof declined; behaviour is bit-for-bit yesterday's.
+    let frontier = frontier_dedup(rc);
+    // The dedup key: the whole row for plain UNION, the row MINUS the counter
+    // column under the converged-frontier proof (strictly stronger, so the
+    // whole-row set is subsumed).
+    let dedup_key = |row: &[Value]| -> Vec<u8> {
+        match frontier {
+            Some(k) => {
+                let rest: Vec<Value> = row
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != k as usize)
+                    .map(|(_, v)| v.clone())
+                    .collect();
+                keycode::encode_group_key(&rest, &[])
+            }
+            None => keycode::encode_group_key(row, &[]),
+        }
+    };
+    for row in anchor_rows {
+        if rc.union_all || seen.insert(dedup_key(&row)) {
+            queue.push(row.clone());
+            result.push(row);
+        }
+    }
 
     // 2. Semi-naive fixpoint.
     while !queue.is_empty() {
@@ -72,7 +100,7 @@ pub(super) fn exec_recursive_cte(
         }
         let mut next: Vec<Vec<Value>> = Vec::new();
         for row in step_rows {
-            if rc.union_all || seen.insert(keycode::encode_group_key(&row, &[])) {
+            if rc.union_all || seen.insert(dedup_key(&row)) {
                 next.push(row.clone());
                 result.push(row);
             }
@@ -83,6 +111,113 @@ pub(super) fn exec_recursive_cte(
     // 3. Outer statement over the full result.
     let mut wctx = WorkingTableCtx { inner: ctx, rows: &result };
     exec_select(&mut wctx, schema, plan, params, &rc.outer)
+}
+
+/// The converged-frontier proof: `Some(counter_col)` when deduping the
+/// working set on every column EXCEPT the counter is unobservable, `None`
+/// otherwise (and the fixpoint stays exactly as it was).
+///
+/// Three obligations, each checked against the compiled plan:
+///
+/// 1. **The counter is a proven monotone depth guard** —
+///    [`crate::risk::cte_depth_guard`], the same proof the risk estimate uses:
+///    anchor constant, carried as `k + s` (s ≥ 1), guarded `k < C` as the
+///    recursive term's ENTIRE base residual. Monotonicity is what makes the
+///    dropped row's expansions a subset of the kept row's: a smaller counter
+///    passes every guard a larger one passes.
+/// 2. **The recursive term reads the counter NOWHERE else** — not in another
+///    projection column, not in a join's ON or access-path key, not in the
+///    joined filter. Otherwise an expansion's VALUE could depend on the
+///    counter, and the kept row's expansions would differ from the dropped
+///    row's.
+/// 3. **The outer statement cannot observe the difference.** Dropping
+///    higher-counter duplicates changes row MULTIPLICITY and the counter's
+///    surviving values, so the outer must be invariant to both: a plain scan
+///    of the CTE with (a) `SELECT DISTINCT` over non-counter columns, or (b)
+///    aggregates that are multiplicity-invariant and counter-blind —
+///    `count(DISTINCT non-counter)`, `min`/`max` of a non-counter column.
+///    `count(*)` is NOT invariant (it counts the rows this optimization
+///    removes) and declines, which the differential suite pins.
+fn frontier_dedup(rc: &RecursiveCtePlan) -> Option<u16> {
+    use mpedb_sql::Projection;
+    use mpedb_types::{AggFn, Instr, KeyPart};
+
+    if rc.union_all {
+        return None; // a bag's multiplicity is always observable
+    }
+    let k = crate::risk::cte_depth_guard(rc)?.col;
+
+    let reads = |p: &ExprProgram| p.instrs.iter().any(|i| matches!(i, Instr::PushCol(c) if *c == k));
+    let part_reads = |parts: &[KeyPart]| {
+        parts.iter().any(|p| matches!(p, KeyPart::OuterCol(c) if *c == k))
+    };
+    let access_reads = |a: &AccessPath| match a {
+        AccessPath::PkPoint(parts) => part_reads(parts),
+        AccessPath::IndexPoint { parts, .. } => part_reads(parts),
+        AccessPath::PkRange { lo, hi } => [lo, hi].iter().any(|b| {
+            b.as_ref().is_some_and(|kb| part_reads(&kb.parts))
+        }),
+        AccessPath::IndexRange { lo, hi, .. } => [lo, hi].iter().any(|b| {
+            b.as_ref().is_some_and(|kb| part_reads(&kb.parts))
+        }),
+        AccessPath::FullScan | AccessPath::FtsScan { .. } => false,
+    };
+
+    // 2. Counter dead in the recursive term outside guard + own transit.
+    let t = &rc.recursive;
+    for (j, p) in t.projection.iter().enumerate() {
+        if j == k as usize {
+            continue; // the transit itself, proven by cte_depth_guard
+        }
+        match p {
+            Projection::Column(c) if *c == k => return None,
+            Projection::Expr { program, .. } if reads(program) => return None,
+            _ => {}
+        }
+    }
+    if t.joined_filter.as_ref().is_some_and(&reads) {
+        return None;
+    }
+    for j in &t.joins {
+        if reads(&j.on) || access_reads(&j.access) {
+            return None;
+        }
+    }
+
+    // 3. Outer observability.
+    let o = &rc.outer;
+    if o.table != CTE_TABLE
+        || !o.joins.is_empty()
+        || o.joined_filter.is_some()
+        || o.filter.as_ref().is_some_and(&reads)
+    {
+        return None;
+    }
+    let ok = match &o.aggregate {
+        Some(agg) => {
+            agg.group_by.is_empty()
+                && agg.bare_cols.is_empty()
+                && !agg.aggs.is_empty()
+                && agg.aggs.iter().all(|c| {
+                    c.filter.is_none()
+                        && c.extra_args.is_empty()
+                        && c.arg.as_ref().is_some_and(|p| !reads(p))
+                        && match c.func.native() {
+                            Some(AggFn::Count) => c.distinct,
+                            Some(AggFn::Min | AggFn::Max) => true,
+                            _ => false,
+                        }
+                })
+        }
+        None => {
+            o.distinct
+                && o.projection.iter().all(|p| match p {
+                    Projection::Column(c) => *c != k,
+                    Projection::Expr { program, .. } => !reads(program),
+                })
+        }
+    };
+    ok.then_some(k)
 }
 
 /// Execute a MATERIALIZED derived table (design/DESIGN-DERIVED-TABLES.md §5):

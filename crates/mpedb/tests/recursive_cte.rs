@@ -124,11 +124,20 @@ fn mpedb_rows(db: &Database, sql: &str) -> Vec<Vec<String>> {
 /// Run schema + data + one query through the `sqlite3` CLI and parse its default
 /// list-mode output (rows preserved in order, cells `|`-separated).
 fn sqlite_rows(query: &str) -> Vec<Vec<String>> {
+    sqlite_rows_with(query, "")
+}
+
+/// Same oracle, with extra setup statements after the shared seed.
+fn sqlite_rows_with(query: &str, extra: &str) -> Vec<Vec<String>> {
     let mut script = String::from(CREATE_SQLITE);
     script.push('\n');
     for stmt in insert_statements() {
         script.push_str(&stmt);
         script.push_str(";\n");
+    }
+    if !extra.is_empty() {
+        script.push_str(extra);
+        script.push('\n');
     }
     script.push_str(query);
     script.push_str(";\n");
@@ -339,5 +348,84 @@ fn illegal_recursive_ctes_are_refused_cleanly() {
             msg.to_lowercase().contains(needle),
             "refusal for `{sql}` should mention `{needle}`, got: {msg}"
         );
+    }
+}
+
+// ---- converged-frontier reachability (stage C follow-up) --------------------
+//
+// The graph bench's depth sweep found reach-k growing LINEARLY in k after the
+// frontier saturated: UNION dedups (node, depth) PAIRS, so every level
+// re-expanded the whole reached set. The fixpoint now dedups on the
+// non-counter columns when (1) the counter is a proven monotone depth guard,
+// (2) the recursive term reads it nowhere else, and (3) the outer statement
+// provably cannot observe multiplicity or the counter — and these tests pin
+// BOTH sides of that gate against sqlite, which never had the problem.
+
+#[test]
+fn depth_bounded_reachability_matches_sqlite_at_every_k() {
+    let d = db();
+    // A graph WITH a cycle (5→1 added at runtime), so min-depth dedup is
+    // exercised on re-reached nodes, at every k the graph bench sweeps.
+    d.query("INSERT INTO edges (src, dst) VALUES (5, 1)", &[]).unwrap();
+    let sqlite_extra = "INSERT INTO edges VALUES (5, 1);";
+    for k in 1..=8 {
+        for q in [
+            // The gated shape: count(DISTINCT node) — multiplicity-invariant.
+            format!(
+                "WITH RECURSIVE r(node, d) AS (SELECT 1, 0 UNION \
+                 SELECT e.dst, r.d + 1 FROM r JOIN edges e ON e.src = r.node WHERE r.d < {k}) \
+                 SELECT count(DISTINCT node) FROM r"
+            ),
+            // DISTINCT projection of the non-counter column: also gated.
+            format!(
+                "WITH RECURSIVE r(node, d) AS (SELECT 1, 0 UNION \
+                 SELECT e.dst, r.d + 1 FROM r JOIN edges e ON e.src = r.node WHERE r.d < {k}) \
+                 SELECT DISTINCT node FROM r ORDER BY node"
+            ),
+            // min/max of the non-counter column: multiplicity-invariant, gated.
+            format!(
+                "WITH RECURSIVE r(node, d) AS (SELECT 1, 0 UNION \
+                 SELECT e.dst, r.d + 1 FROM r JOIN edges e ON e.src = r.node WHERE r.d < {k}) \
+                 SELECT min(node), max(node) FROM r"
+            ),
+        ] {
+            let got = mpedb_rows(&d, &q);
+            let want = sqlite_rows_with(&q, sqlite_extra);
+            assert_eq!(got, want, "k={k}, mismatch on `{q}`");
+        }
+    }
+}
+
+#[test]
+fn observers_of_multiplicity_or_the_counter_stay_ungated() {
+    let d = db();
+    d.query("INSERT INTO edges (src, dst) VALUES (5, 1)", &[]).unwrap();
+    let sqlite_extra = "INSERT INTO edges VALUES (5, 1);";
+    for q in [
+        // count(*) counts (node, depth) PAIRS — the rows the optimization
+        // would have removed. It must decline, and match sqlite's pair count.
+        "WITH RECURSIVE r(node, d) AS (SELECT 1, 0 UNION \
+         SELECT e.dst, r.d + 1 FROM r JOIN edges e ON e.src = r.node WHERE r.d < 4) \
+         SELECT count(*) FROM r",
+        // The counter itself is projected: observable, must decline.
+        "WITH RECURSIVE r(node, d) AS (SELECT 1, 0 UNION \
+         SELECT e.dst, r.d + 1 FROM r JOIN edges e ON e.src = r.node WHERE r.d < 4) \
+         SELECT node, d FROM r ORDER BY d, node",
+        // count(DISTINCT d): distinct, but ON the counter — must decline.
+        "WITH RECURSIVE r(node, d) AS (SELECT 1, 0 UNION \
+         SELECT e.dst, r.d + 1 FROM r JOIN edges e ON e.src = r.node WHERE r.d < 4) \
+         SELECT count(DISTINCT d) FROM r",
+        // A filter on the counter in the outer: observable, must decline.
+        "WITH RECURSIVE r(node, d) AS (SELECT 1, 0 UNION \
+         SELECT e.dst, r.d + 1 FROM r JOIN edges e ON e.src = r.node WHERE r.d < 4) \
+         SELECT count(DISTINCT node) FROM r WHERE d = 2",
+        // sum(node): multiplicity-sensitive — must decline.
+        "WITH RECURSIVE r(node, d) AS (SELECT 1, 0 UNION \
+         SELECT e.dst, r.d + 1 FROM r JOIN edges e ON e.src = r.node WHERE r.d < 4) \
+         SELECT sum(node) FROM r",
+    ] {
+        let got = mpedb_rows(&d, q);
+        let want = sqlite_rows_with(q, sqlite_extra);
+        assert_eq!(got, want, "mismatch on `{q}`");
     }
 }

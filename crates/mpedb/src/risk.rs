@@ -183,12 +183,27 @@ fn card_access(access: &AccessPath, table: u32, schema: &Schema, rc: &dyn Fn(u32
 /// each level can multiply by the whole join in the worst case. On a real
 /// graph this still saturates (honestly: the worst case IS astronomical); on
 /// a generator (no joins, fanout 1) it is exact.
-fn depth_guard_bound(
-    rc: &mpedb_sql::RecursiveCtePlan,
-    subplans: &[SubPlan],
-    schema: &Schema,
-    row_count: &dyn Fn(u32) -> u64,
-) -> Option<Acc> {
+/// The proven pieces of a monotone depth guard — shared by the risk estimate
+/// and, since the graph bench found the depth sweep's linear blow-up, by the
+/// executor's converged-frontier optimization (`exec/recursive.rs`), so the
+/// two can never disagree about what "provably bounded" means.
+pub(crate) struct DepthGuard {
+    /// The counter's CTE column.
+    pub col: u16,
+    /// `col < limit` (or `<=` when `inclusive`).
+    pub limit: i64,
+    pub inclusive: bool,
+    /// Carried as `col + step`, `step >= 1`.
+    pub step: i64,
+    /// The anchor's constant start value.
+    pub start: i64,
+}
+
+/// Prove the depth-guard shape against the compiled plan, or decline.
+/// Deliberately narrow (v1): the CTE must be the recursive term's BASE table,
+/// and the guard must be the ENTIRE base-row residual. See `depth_guard_bound`
+/// for what the proof buys the risk estimate.
+pub(crate) fn cte_depth_guard(rc: &mpedb_sql::RecursiveCtePlan) -> Option<DepthGuard> {
     use mpedb_types::Instr as I;
 
     if rc.recursive.table != mpedb_sql::CTE_TABLE {
@@ -251,6 +266,16 @@ fn depth_guard_bound(
         }
         Projection::Column(_) => return None,
     };
+    Some(DepthGuard { col: k, limit, inclusive, step, start })
+}
+
+fn depth_guard_bound(
+    rc: &mpedb_sql::RecursiveCtePlan,
+    subplans: &[SubPlan],
+    schema: &Schema,
+    row_count: &dyn Fn(u32) -> u64,
+) -> Option<Acc> {
+    let DepthGuard { limit, inclusive, step, start, .. } = cte_depth_guard(rc)?;
 
     // Iterations: expansions happen only while k satisfies the guard.
     let room = (limit as i128) - (start as i128) + i128::from(inclusive);
