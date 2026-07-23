@@ -204,10 +204,14 @@ warnings`) before the next; measured results are appended to this doc per stage.
   3.0 → 1.5 ms. The residual 10.6× against SQLite is the per-leaf walk — both
   engines now count narrow trees; answering from interior-node subtree counts
   would be a page-format change and is deliberately not planned.
-- **C — graph vs Neo4j.** `crates/mpedb-graphbench`, std-only HTTP to the tx
-  endpoint; k-hop / bounded reachability / closure / triangles, same-answer
-  checked. Plus the `risk.rs` depth-guard fix: a provably monotone
-  `carried < const` guard prices as bounded instead of `u64::MAX` "unbounded".
+- **C — graph vs Neo4j.** **SHIPPED + MEASURED 2026-07-23 (`600ece0`,
+  [BENCHMARKS-GRAPH.md](../BENCHMARKS-GRAPH.md)):** six workloads, all
+  same-answer. The crossover is at hop 3 — the edge table wins ≤ 2 probes deep
+  (degree 1.3×, hop2 1.9×), the native adjacency representation wins beyond
+  (hop3 1.6×, reach4 4.1×, tri-global 13.4×). Same per-probe cost the OLAP
+  bench brackets against SQLite, measured from the other side. The risk fix
+  landed with all three proof-decline cases tested: no guard, and a guard on a
+  column carried unchanged, still price as the honest unbounded.
 - **D — vector: exact kNN + Qdrant.** BLOB f32 embeddings, `vec_l2`/`vec_cosine`
   scalars with strict shape refusal, early-abandonment scan, MPEE-priced filter
   placement (reusing A's NDV), recall@k reported next to latency.
