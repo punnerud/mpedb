@@ -45,7 +45,7 @@ Milliseconds, median of 5 plus an untimed warm-up.
 | query | probes | mpedb | duckdb | sqlite | mpedb vs duckdb | mpedb vs sqlite |
 |---|---|---:|---:|---:|---:|---:|
 | `scan-sum` | scan | 41.2 | 0.479 | 34.8 | 86× slower | 1.2× slower |
-| `scan-filter-sum` | scan | 172.3 | 0.759 | 59.6 | 227× slower | 2.9× slower |
+| `scan-filter-sum` | scan | **126.0** | 0.744 | 60.9 | 169× slower | 2.1× slower |
 | `scan-multi-agg` | scan | 173.4 | 0.843 | 93.3 | 206× slower | 1.9× slower |
 | `count-star` | precompute | ~~3.0~~ **1.5** | 0.215 | 0.141 | 7.2× slower | 10.6× slower |
 | `min-max-indexed` | precompute | **0.008** | 1.9 | 59.9 | **252× faster** | **7,488× faster** |
@@ -220,10 +220,38 @@ deterministic as today's `row_count`: bucket the index's distinct-key count in
 log2, the same way table row counts are bucketed, so the estimate cannot move
 until the data doubles.
 
-**Re-verified 2026-07-23** (mpedb `944ca6b`, DuckDB and SQLite unchanged, same
-M3): `count-star` holds at **1.5 ms** (the NOT NULL schema fix), `min-max-indexed`
-at 0.009 ms (210× ahead of DuckDB), `count-filtered` 2.2× ahead, and the scan
-and group cells reproduce their gap — every row still agrees.
+## What moved, and what a graph-shaped win did NOT move
+
+**Re-verified 2026-07-23** (DuckDB and SQLite unchanged, same M3): `count-star`
+holds at **1.5 ms** (the NOT NULL schema fix), `min-max-indexed` at 0.009 ms,
+`count-filtered` 2.1× ahead, and the group and join cells reproduce — every row
+still agrees.
+
+**`scan-filter-sum` improved 172.3 → 126.0 ms** (`dca70b1`): a filtered
+aggregate used to abandon the fused fold the moment a `WHERE` existed and fall
+back to the generic gather — one `Vec<Value>` and a whole-row decode per row,
+two million times. It now carries the predicate: `Instr::PushCol` is the only
+instruction that reads the row, so the program's read set is COMPLETE, and the
+fold decodes exactly the predicate's columns plus the aggregate's into one
+reused buffer. Against SQLite — the row-store control group, which is the
+comparison this cell can actually be judged by — that closes 2.9× to **2.1×**.
+
+**The covering-index win that halved the graph bench did nothing here, and the
+reason is the point.** That optimization rebuilds a row from an index ENTRY,
+which requires the index's columns plus the primary key to be ALL of the
+table's columns — true of an edge table `(id PK, src, dst)` under a
+`(src, dst)` index, false of a six-column fact table under single-column
+indexes. It is a junction-table win, not an analytics win, and measuring it
+here was how that got established rather than assumed.
+
+**Two levers this measurement exposed, neither taken yet.** (1) A range
+predicate over an *indexed* column routes to the index-range path, which
+fetches a row per entry: on a 2M-row table a `>=` matching ~30 % of rows costs
+742 ms where a plain scan with the same predicate costs 215 — the chooser takes
+the index on shape, without pricing selectivity. (2) The residual on every scan
+and group cell is per-row executor cost — a `Vec<Value>`, an expression program
+per projection — the same constant the graph page's remaining 2.9× is made of.
+That one is shared, and it is the honest next target.
 
 ## What the extension layer adds here
 
