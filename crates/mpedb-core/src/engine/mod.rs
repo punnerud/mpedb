@@ -1413,7 +1413,7 @@ impl Engine {
             recovered,
             finished: false,
             written_tables: 0,
-            mutated_tables: std::collections::HashSet::new(),
+            mutated_tables: std::collections::BTreeSet::new(),
             commit_point: None,
             capture_enabled: true,
             capture_cfg: None,

@@ -67,6 +67,7 @@ pub mod stats;
 mod stream;
 mod tier;
 mod backtest;
+pub mod colseg;
 mod derived;
 mod trigger;
 mod workspace;

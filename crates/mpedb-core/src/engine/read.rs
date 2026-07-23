@@ -187,6 +187,29 @@ impl ReadTxn<'_> {
     /// both look "unchanged". Heuristics like `(row_count, root_page)` cannot
     /// promise that — a delete+insert restores the count, and the freelist can
     /// hand a later commit a root page id equal to a freed earlier one.
+    ///
+    /// **An `Err` is NOT generation zero.** A caller that writes
+    /// `mod_gen(t).unwrap_or(0)` reintroduces the wrong answer this exists to
+    /// prevent: a dropped table's entry is unlinked, so the call errors, and a
+    /// segment stamped 0 by a legacy 16-byte entry would then match and be
+    /// read as fresh. Every consumer must treat `Err` as "no reusable
+    /// artifact" (see `colseg::feed_from_segments`).
+    ///
+    /// **Comparable only within one file lineage, on one snapshot.** The
+    /// generation counts commits to THIS file's PK tree. `mirror regenerate`
+    /// and restore rebuild a file and renumber tables by name, so generations
+    /// restart and an id can mean a different table; a sqlite-backed overlay
+    /// can change what a read answers entirely outside this commit path. An
+    /// artifact must therefore be read from the SAME snapshot that supplied
+    /// the generation — which is also what makes it correct under crash
+    /// rollback and `durability = async`, since the catalog root publishes
+    /// both atomically.
+    ///
+    /// **What bumps, measured:** row inserts/updates/deletes, `ADD COLUMN`,
+    /// `DROP COLUMN`, `CREATE INDEX` (an over-bump; fail-safe). `RENAME
+    /// COLUMN` does NOT bump — safe only because segments are keyed by column
+    /// ORDINAL and `DROP COLUMN`, which renumbers the survivors, does bump.
+    /// That chain is the argument; changing either half breaks the other.
     pub fn mod_gen(&self, table_id: u32) -> Result<u64> {
         catalog_entry(self, self.meta.catalog_root, table_id, 0).map(|(_, _, g)| g)
     }

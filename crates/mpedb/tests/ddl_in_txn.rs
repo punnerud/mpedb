@@ -299,3 +299,42 @@ fn ddl_before_savepoint_then_rollback_to_keeps_table() {
     assert_eq!(one_i64(db.query("SELECT count(*) FROM t", &[]).unwrap()), 1);
     db.verify().unwrap();
 }
+
+/// Mutating a table's rows and then DROPPING it in the SAME transaction must
+/// commit. A per-table generation bump that outlived the drop made the commit
+/// look up a catalog entry the drop had just unlinked and report the database
+/// CORRUPT — a legal statement pair turned into SQLITE_CORRUPT through the C
+/// API (found by review of the mod_gen commit, DESIGN-COLUMNAR §6).
+#[test]
+fn mutating_then_dropping_a_table_in_one_txn_commits() {
+    let (cfg, _g) = config("drop-after-write");
+    let db = Database::open_with_config(cfg).unwrap();
+    db.query("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", &[]).unwrap();
+    db.query("INSERT INTO t (id, v) VALUES (1, 1)", &[]).unwrap();
+
+    for (i, stmts) in [
+        vec!["INSERT INTO t (id, v) VALUES (2, 2)", "DROP TABLE t"],
+        vec!["DELETE FROM t", "DROP TABLE t"],
+        vec!["UPDATE t SET v = 9", "DROP TABLE t"],
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if i > 0 {
+            db.query("CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)", &[]).unwrap();
+            db.query("INSERT INTO t (id, v) VALUES (1, 1)", &[]).unwrap();
+        }
+        let mut s = db.begin().unwrap();
+        for q in &stmts {
+            s.query(q, &[]).unwrap_or_else(|e| panic!("`{q}`: {e}"));
+        }
+        s.commit().unwrap_or_else(|e| panic!("commit after {stmts:?}: {e}"));
+    }
+
+    // And the same shape with the table CREATED in the very same txn.
+    let mut s = db.begin().unwrap();
+    s.query("CREATE TABLE u (id INTEGER PRIMARY KEY)", &[]).unwrap();
+    s.query("INSERT INTO u (id) VALUES (1)", &[]).unwrap();
+    s.query("DROP TABLE u", &[]).unwrap();
+    s.commit().unwrap();
+}

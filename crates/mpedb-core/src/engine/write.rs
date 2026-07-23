@@ -143,7 +143,7 @@ pub struct WriteTxn<'e> {
     /// was in fact still valid — slower, never wrong — while under-bumping
     /// would publish a stale segment as fresh. The asymmetry decides the
     /// design: this set only ever grows until the txn ends.
-    pub(super) mutated_tables: std::collections::HashSet<u32>,
+    pub(super) mutated_tables: std::collections::BTreeSet<u32>,
     /// Set by the optimistic blind-apply path to record a precise
     /// (table, key_hash) point footprint at commit instead of a table-level
     /// one. `None` for every other path.
@@ -1332,6 +1332,14 @@ impl<'e> WriteTxn<'e> {
             self.catalog_root = out.new_root;
             self.table_roots.remove(&(table_id, ino));
         }
+        // A dropped table has no generation left to publish, and its directory
+        // entry is gone: leaving it in `mutated_tables` would make the commit's
+        // bump loop look up a key this loop just deleted and report the
+        // database CORRUPT for a perfectly legal `INSERT …; DROP TABLE …` in
+        // one transaction (found in review, reproducible through the C API as
+        // SQLITE_CORRUPT). Row mutations before the drop are unobservable
+        // afterwards — the rows are gone with the table.
+        self.mutated_tables.remove(&table_id);
 
         // 4. Publish the tombstoned schema.
         let bytes = new_schema.canonical_bytes();

@@ -73,8 +73,15 @@ impl<'e> WriteTxn<'e> {
         let new_txn = self.meta.txn_id + 1;
 
         // 1. write back catalog entries (may COW catalog pages → more frees)
-        let entries: Vec<((u32, u32), (u64, u64))> =
+        // SORTED, deliberately. Widening a directory value 16 → 24 bytes on
+        // its first rewrite can split a catalog leaf, and a split's outcome
+        // depends on insertion order — which `HashMap` iteration makes
+        // per-process random. Sorting keeps a commit's catalog shape a
+        // function of its contents alone, so the byte-identical corpus runs
+        // stay byte-identical (review finding F4).
+        let mut entries: Vec<((u32, u32), (u64, u64))> =
             self.table_roots.iter().map(|(&k, &v)| (k, v)).collect();
+        entries.sort_unstable_by_key(|&(k, _)| k);
 
         // Every table this txn MUTATED must publish a bumped `mod_gen`
         // (design/DESIGN-COLUMNAR.md §6). The bump lands in the PK-tree entry
@@ -84,7 +91,6 @@ impl<'e> WriteTxn<'e> {
         // invariant local — a missed bump would publish a stale columnar
         // segment as fresh, which is a wrong answer.
         let mutated: Vec<u32> = self.mutated_tables.iter().copied().collect();
-        let mut entries = entries;
         for &tid in &mutated {
             if !self.table_roots.contains_key(&(tid, 0)) {
                 let e = self.tree_root(tid, 0)?;
