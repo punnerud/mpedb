@@ -13,22 +13,32 @@ durability classes, all latency percentiles) live in its own file.
 | Apple M3 Pro, 11 cores, 36 GiB, macOS 26.6 | mpedb, SQLite, PostgreSQL 16, Turso 0.7 | [`RESULTS-macos-apple-m3-pro-11c.md`](crates/mpedb-bench/RESULTS-macos-apple-m3-pro-11c.md) |
 | Raspberry Pi 3 B+, armv7l (32-bit), 921 MiB, Linux 6.1 | **mpedb only** | no results file — see below |
 
-### Latest primary-cell re-measure (2026-07-21)
+### Latest primary-cell re-measure (2026-07-23, both hosts re-run)
 
 Linux **volume-backed** control group: `--tmpfs /dev/shm` + `--disk /mnt/xfs`
-(xfs). **Primary none-class cells all win** vs SQLite and PostgreSQL (ops/s):
+(xfs). **Primary none-class cells all win** vs SQLite and PostgreSQL (ops/s,
+2026-07-21 → 2026-07-23 in parentheses where it moved more than run noise):
 
-| cell | mpedb | SQLite | PostgreSQL |
-|---|---:|---:|---:|
-| point-insert | ~172k | ~42k | ~15k |
-| point-select | ~444k | ~82k | ~21k |
-| point-update | ~197k | ~48k | ~12k |
-| contended-writes | ~140k | ~36k | ~37k |
+| cell | mpedb | SQLite | PostgreSQL | Turso |
+|---|---:|---:|---:|---:|
+| point-insert | 179,409 | 41,301 | 13,808 | 38,080 |
+| point-select | **490,310** (437k → 490k) | 79,619 | 21,119 | 113,796 |
+| point-update | 195,688 | 46,208 | 11,982 | 42,523 |
+| contended-writes | 135,229 | 33,880 | 33,327 | 24,321 |
 
 Batched durable-on-ack (WriteSession 100/commit, `durability=wal`) also beats
 both on the same volume. Attribution: existing MPEE-aligned path (content-hashed
 `execute(hash)`, streaming LIMIT / `scan_rows_capped` per DESIGN-MPEE-OPT). Full
 tables in the RESULTS file above.
+
+**What the re-run says.** Every engine on both hosts reproduces its 2026-07-21
+cell within ±5 % — SQLite, PostgreSQL and Turso are the control group and they
+did not move — with ONE exception: mpedb's **point-select rose 12 % on Linux
+(437k → 490k) and 56 % on the M3 (1.26M → 1.98M ops/s)** while the same three
+control engines held flat on the same hosts, so it is an engine change and not
+machine state. It is **not attributed** to a specific commit here: a bisect over
+the 07-21…07-23 window is what would earn that claim, and this page does not
+make claims it has not measured.
 
 **Routing is measured separately** — real San Francisco road durations, the
 kernel's exact `(subset, last)` mode as ground truth vs the original MPEE

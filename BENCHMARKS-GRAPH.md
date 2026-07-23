@@ -111,6 +111,12 @@ bounded recursions (`risk.rs`, `tests/risk_depth_guard.rs`) — and the
 converged-frontier execution optimization above. They share one function, so
 they can never disagree about what "provably bounded" means.
 
+**Re-verified 2026-07-23** (mpedb `944ca6b`, Neo4j 5.26, same M3): every cell
+lands within a few percent of the table above on BOTH sides — mpedb warm
+`reach8` 185.2 → 198.0 ms against Neo4j's 38.7 → 39.3, `tri-global` 1401 → 1440
+against 301 → 316 — so the ratios and the hop-3 crossover are unchanged, and
+every row still agrees.
+
 ## The operator arm: the sugar is free, and it locks the fast shape
 
 Re-run 2026-07-23 with a third arm: the same questions in the `:op:` operator
