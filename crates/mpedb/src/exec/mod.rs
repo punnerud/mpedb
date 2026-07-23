@@ -438,6 +438,29 @@ pub(crate) trait TxnCtx {
         let _ = (table, lo, hi, col, opts, f);
         Ok(None)
     }
+
+    /// [`fold_rows_column`](Self::fold_rows_column) with a PREDICATE: decode
+    /// `need` (the filter's columns plus the aggregate's, from
+    /// `ExprProgram::read_columns`) into one reused buffer, evaluate the
+    /// filter, and fold `col` only for rows that pass — so a filtered
+    /// aggregate over a wide table decodes two columns per row instead of
+    /// materializing the whole row. `Ok(None)` = this context has no such
+    /// path, and the caller runs the ordinary gather.
+    #[allow(clippy::too_many_arguments)]
+    fn fold_rows_column_filtered(
+        &mut self,
+        table: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+        need: &[u16],
+        col: u16,
+        filter: (&ExprProgram, &[Value]),
+        opts: FoldOpts,
+        f: &mut dyn FnMut(&Value) -> Result<()>,
+    ) -> Result<Option<FoldStop>> {
+        let _ = (table, lo, hi, need, col, filter, opts, f);
+        Ok(None)
+    }
 }
 
 impl TxnCtx for WriteTxn<'_> {
@@ -838,6 +861,30 @@ impl TxnCtx for ReadCtx<'_, '_> {
         f: &mut dyn FnMut(&Value) -> Result<()>,
     ) -> Result<Option<FoldStop>> {
         self.0.fold_range_column(table, lo, hi, col, opts, f).map(Some)
+    }
+
+    fn fold_rows_column_filtered(
+        &mut self,
+        table: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+        need: &[u16],
+        col: u16,
+        filter: (&ExprProgram, &[Value]),
+        opts: FoldOpts,
+        f: &mut dyn FnMut(&Value) -> Result<()>,
+    ) -> Result<Option<FoldStop>> {
+        let host = self.1;
+        let (prog, params) = filter;
+        let mut stack = Vec::new();
+        self.0
+            .fold_range_columns(table, lo, hi, need, opts, &mut |buf| {
+                if prog.eval_filter_host(&mut stack, buf, params, host)? {
+                    f(&buf[col as usize])?;
+                }
+                Ok(())
+            })
+            .map(Some)
     }
     fn scan_rows_topk(
         &mut self,

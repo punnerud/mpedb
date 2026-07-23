@@ -578,6 +578,75 @@ impl ReadTxn<'_> {
     /// worker passes [`FoldOpts::worker`] (see there), and the adaptive
     /// scheduler's leader passes a `cap` so a long range can be handed off
     /// mid-flight ([`FoldStop::Stopped`]).
+    /// Like [`fold_range_column`](Self::fold_range_column) but decodes a SET of
+    /// columns into one REUSED full-width buffer and hands the buffer to the
+    /// callback — the shape a filtered aggregate needs: decode the predicate's
+    /// columns and the aggregate's column, evaluate, fold, and never
+    /// materialize the row.
+    ///
+    /// Only the ordinals in `cols` are written; every other slot stays
+    /// `Value::Null` for the whole scan. That is sound exactly because the
+    /// caller derived `cols` from [`ExprProgram::read_columns`], which is
+    /// complete — a program cannot read a slot the caller did not fill.
+    pub fn fold_range_columns(
+        &self,
+        table_id: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+        cols: &[u16],
+        opts: FoldOpts,
+        f: &mut dyn FnMut(&[Value]) -> Result<()>,
+    ) -> Result<FoldStop> {
+        let types = self
+            .bundle
+            .col_types
+            .get(table_id as usize)
+            .ok_or_else(|| Error::Internal("table id out of range".into()))?;
+        if cols.iter().any(|&c| c as usize >= types.len()) {
+            return Err(Error::Internal("fold column out of row bounds".into()));
+        }
+        let root = self.tree_root(table_id, 0)?;
+        let mut c = btree::cursor(self, root, lo, hi)?;
+        let mut scratch = Vec::new();
+        let mut buf = vec![Value::Null; types.len()];
+        let mut steps = 0u32;
+        let mut pending = 0u32;
+        let mut rows = 0u64;
+        let charge_batch = opts.charge_batch.max(1);
+        loop {
+            let stepped = c.next_with(self, &mut scratch, |_k, v| {
+                if charge_batch == 1 {
+                    self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
+                }
+                for &col in cols {
+                    buf[col as usize] = row::decode_column(v, types, col as usize)?;
+                }
+                f(&buf)
+            })?;
+            if stepped.is_none() {
+                if pending > 0 {
+                    self.work
+                        .charge_many(pending as u64, || scan_label(&self.bundle.schema, table_id))?;
+                }
+                return Ok(FoldStop::Exhausted);
+            }
+            rows += 1;
+            if charge_batch > 1 {
+                pending += 1;
+                if pending == charge_batch {
+                    self.work
+                        .charge_many(pending as u64, || scan_label(&self.bundle.schema, table_id))?;
+                    pending = 0;
+                }
+            }
+            steps += 1;
+            if steps.is_multiple_of(256) && !self.still_pinned() {
+                return Err(Error::SnapshotEvicted);
+            }
+            let _ = rows;
+        }
+    }
+
     pub fn fold_range_column(
         &self,
         table_id: u32,

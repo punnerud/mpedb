@@ -958,8 +958,7 @@ fn try_fused_fold(
     agg: &Aggregation,
     par: Option<&super::parallel::ParPlan>,
 ) -> Result<Option<Vec<Acc>>> {
-    if filter.is_some()
-        || !agg.group_by.is_empty()
+    if !agg.group_by.is_empty()
         || !agg.bare_cols.is_empty()
         || agg.aggs.is_empty()
         || !ctx.scans_incrementally()
@@ -1032,24 +1031,51 @@ fn try_fused_fold(
         Some(p) => mpedb_core::FoldOpts::probe(p.probe_cap()),
         None => mpedb_core::FoldOpts::SERIAL,
     };
+    // With a WHERE, the fold decodes the predicate's columns alongside the
+    // aggregate's and evaluates it per row — still nothing materialized. The
+    // read set is `ExprProgram::read_columns`, which is COMPLETE (`PushCol` is
+    // the only column reader), so decoding exactly `need` evaluates the
+    // predicate exactly.
+    //
+    // Only when the fold would have been SERIAL anyway (`par` is `None`): the
+    // parallel hand-off passes a RANGE to worker threads that fold in the
+    // engine, and the engine cannot evaluate a predicate that lives up here.
+    // A parallel-eligible filtered aggregate therefore keeps its existing
+    // path rather than trading threads for a cheaper per-row decode — the
+    // `par_fold` suite pins exactly that.
+    let need: Option<Vec<u16>> = match (filter, par) {
+        (Some(f), None) => {
+            let mut v = f.read_columns();
+            if !v.contains(&col) {
+                v.push(col);
+                v.sort_unstable();
+            }
+            Some(v)
+        }
+        _ => None,
+    };
+    if filter.is_some() && need.is_none() {
+        return Ok(None); // parallel-eligible with a predicate: not ours
+    }
     let fold_into = |ctx: &mut dyn TxnCtx,
                          accs: &mut Vec<Acc>,
                          lo: Option<&RawBound>,
                          hi: Option<&RawBound>,
                          opts: mpedb_core::FoldOpts| {
-        ctx.fold_rows_column(
-            table,
-            lo.map(|(k, inc)| (k.as_slice(), *inc)),
-            hi.map(|(k, inc)| (k.as_slice(), *inc)),
-            col,
-            opts,
-            &mut |v| {
-                for (a, has) in accs.iter_mut().zip(&has_arg) {
-                    a.push(if *has { Some(v) } else { None })?;
-                }
-                Ok(())
-            },
-        )
+        let lo = lo.map(|(k, inc)| (k.as_slice(), *inc));
+        let hi = hi.map(|(k, inc)| (k.as_slice(), *inc));
+        let mut push = |v: &Value| {
+            for (a, has) in accs.iter_mut().zip(&has_arg) {
+                a.push(if *has { Some(v) } else { None })?;
+            }
+            Ok(())
+        };
+        match (filter, &need) {
+            (Some(f), Some(need)) => ctx.fold_rows_column_filtered(
+                table, lo, hi, need, col, (f, params), opts, &mut push,
+            ),
+            _ => ctx.fold_rows_column(table, lo, hi, col, opts, &mut push),
+        }
     };
     let Some(stop) = fold_into(ctx, &mut accs, lo.as_ref(), hi.as_ref(), opts)? else {
         return Ok(None); // this context has no spine-free fold: the batched one runs
