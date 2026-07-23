@@ -372,6 +372,72 @@ is now an index-identity FINGERPRINT (table name ‖ column names, the #118
 names-not-ordinals rule in miniature): stats survive unrelated changes and die
 exactly when `(table_id, index_no)` could mean a different index.
 
+## 9.4 Measured 2026-07-23: what MPEE can still fix, and what it cannot
+
+Three optimizations landed this day (covering index reads `8eeec0d`, filtered
+fused fold `dca70b1`, selectivity-priced index range `daacf20`). What they left
+behind was then MEASURED rather than guessed, and the split matters because it
+says which residual belongs to the solver and which does not.
+
+**The graph frontier, instrumented per level** (reach-8, 250k rows produced
+through 8 levels, 2-core Linux, 251 ms total):
+
+| level | queue in | rows out | `select_rows` |
+|---:|---:|---:|---:|
+| 1 | 1 | 1,123 | 0.6 ms |
+| 2 | 1,113 | 5,657 | 4.0 ms |
+| 3 | 5,237 | 26,084 | 18.5 ms |
+| 4 | 17,708 | 87,961 | 61.9 ms |
+| 5 | 21,378 | 105,863 | 77.6 ms |
+| 6 | 3,984 | 20,069 | 17.1 ms |
+| 7 | 196 | 994 | 1.1 ms |
+| 8 | 7 | 38 | 0.1 ms |
+
+**181 of 251 ms — 72 % — is inside the join**, and only 28 % is the fixpoint's
+own bookkeeping (dedup, clones, accumulation). Confirmed from the other side:
+making the dedup allocation-free bought 3 %, which is the useful part of that
+result — it proved where the time is NOT.
+
+**The plan is already the right plan.** The recursive term drives from the
+frontier and probes `edge` through the covering `(src, dst)` index; there is no
+better ORDER and no better ACCESS PATH to choose. The residual is ~0.73 µs per
+produced row spent materializing it: `scan_by_index` allocates a `Vec<Value>`
+per inner row, the join builds the joined tuple, the projection allocates the
+output row — three allocations to carry two integers.
+
+### What that means for the solver
+
+**MPEE cannot price its way out of this one.** A cost model chooses among the
+strategies that EXIST, and mpedb has exactly one join strategy: the nested
+loop, index-driven when the inner side has a usable index and held otherwise
+(`plan/mod.rs`, `JoinStep`). When the shape is already optimal, a better cost
+model changes nothing — which is precisely the case here.
+
+**The generic lever is therefore a new STRATEGY for it to choose, not a better
+price for the old one.** A hash join is the one the measurements keep pointing
+at, from two unrelated directions:
+
+- the graph frontier at levels 4–5 probes `edge` 17k–21k times per level, each
+  a fresh descent, where ONE ordered pass over the index and a hash probe per
+  frontier node would touch each entry once;
+- the OLAP star (`join-star-2`, 192 ms against SQLite's 111) drives 2M fact
+  rows against a 20k-row dimension — the textbook hash-join shape, and the one
+  DuckDB answers in 1.8 ms.
+
+Its price is exactly the kind MPEE already computes: build ≈ |inner|, probe ≈
+|outer| × 1 lookup, against nested-loop ≈ |outer| × (descent + fetch), with the
+existing `max_join_cells` budget bounding what the build side may hold. That is
+a strategy the solver picks BETWEEN, so the win generalizes to every shape with
+a big outer and a small inner instead of being special-cased per workload.
+
+**What stays outside the solver either way:** the per-row `Vec<Value>`. A hash
+join reduces how MANY rows are materialized, not what one costs; closing the
+last constant needs a streaming pipeline where a join step hands values to the
+next operator without building a row. That is an executor-architecture change,
+it is what both the Neo4j residual (2.9×) and the DuckDB scan residual are made
+of, and it should be designed as its own document rather than inferred from a
+benchmark.
+
 ## 10. What failure looks like (so we notice)
 
 - A CostSource input that moves a plan hash on unchanged data — violates rule 2;
