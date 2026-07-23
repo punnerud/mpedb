@@ -1,12 +1,33 @@
 # DESIGN-TRIGGERS — `CREATE TRIGGER`, in-SQL and PySpell (design-forarbeid)
 
-**Status: design only. No code written.** This is the design document oppgave
-"triggers" requires before implementation + adversarial review, in the same
-discipline as DESIGN-DDL.md and DESIGN-VIEW.md. Triggers are a **large** feature
-touching the parser, binder, plan/catalog storage, the execute hot path, and the
-PySpell (`mpedb-proc`) interpreter. The plan below is staged so each increment
-ships, is testable in isolation, and refuses the not-yet-supported rest cleanly
-rather than answering wrongly.
+**Status: IMPLEMENTED through stage 5** (2026-07-23). Stages 0–4 shipped as
+designed (`crates/mpedb/src/trigger.rs`, `crates/mpedb-sql/src/trigger.rs`,
+fire points in `crates/mpedb/src/exec/mod.rs`); stage 5 (`EXECUTE PROCEDURE`
+PySpell bodies, the `CtxBridge`) and the `RAISE` veto shipped 2026-07-23.
+Deviations from the plan, all deliberate:
+
+- **The procedure is pinned by CONTENT HASH at `CREATE TRIGGER`** (§5.1
+  said name): procedure re-definition does not bump `schema_gen`, so a name
+  binding could diverge between attached processes; the hash cannot (the
+  `proch/<hash>` blob is immutable). Re-CREATE the trigger to rebind.
+- **`RAISE(FAIL)` is refused** alongside `ROLLBACK` (§4.3 planned FAIL):
+  keep-earlier-rows-of-the-statement semantics contradict mpedb's atomic
+  statements; refusing beats mis-honouring. `ABORT` carries the user's
+  message verbatim (`Error::Raise`, C shim → `SQLITE_CONSTRAINT_TRIGGER`);
+  `IGNORE` is `FireOutcome::SkipRow` with sqlite's abandonment scope.
+- **No `recursive_triggers` knob yet** (§4.4): the hard depth cap
+  (`MAX_TRIGGER_DEPTH = 32`) is the only recursion guard; same-table
+  re-firing is allowed under it. The knob remains open work.
+- A spell body's embedded plans are pre-resolved at catalog build; failures
+  POISON that one trigger (fire-time error naming the repair), never the
+  catalog. A body plan invalidated by DDL re-prepares from the registry's
+  stored SQL — the view model, applied to procedures.
+
+The original design rationale follows, kept for the review trail. Triggers
+touch the parser, binder, plan/catalog storage, the execute hot path, and the
+PySpell (`mpedb-spell`/`mpedb-proc`) interpreter. The plan below is staged so
+each increment ships, is testable in isolation, and refuses the
+not-yet-supported rest cleanly rather than answering wrongly.
 
 COMPAT.md today: `CREATE TRIGGER | ❌ | planned both as in-SQL triggers and as
 PySpell/ETL-layer code`. This document is what makes that entry buildable.
