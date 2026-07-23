@@ -267,7 +267,26 @@ fn cmd_model(args: &[String]) -> CliResult {
             }
             Ok(())
         }
-        _ => usage("model needs: set <target> <model.toml> | show <target>"),
+        [sub, config] if sub == "sync-derived" => {
+            let db = crate::util::open_target(config)?;
+            let r = db.sync_model_derived()?;
+            for n in &r.installed {
+                println!("installed {n}");
+            }
+            for n in &r.kept {
+                println!("kept {n}");
+            }
+            for n in &r.dropped {
+                println!("dropped {n}");
+            }
+            if r.installed.is_empty() && r.kept.is_empty() && r.dropped.is_empty() {
+                println!("model declares no derived structures");
+            }
+            Ok(())
+        }
+        _ => usage(
+            "model needs: set <target> <model.toml> | show <target> | sync-derived <target>",
+        ),
     }
 }
 

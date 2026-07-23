@@ -25,6 +25,7 @@ pub struct WorkloadModel {
     pub archetype: Option<Archetype>,
     pub description: Option<String>,
     pub tables: Vec<TableModel>,
+    pub derived: Vec<DerivedModel>,
     pub statements: Vec<StatementModel>,
 }
 
@@ -158,6 +159,39 @@ const KINDS: [(&str, AccessKind); 7] = [
     ("knn", AccessKind::Knn),
 ];
 
+/// A model-declared DERIVED structure (DESIGN-MODEL-LANG §3, the maintenance
+/// rung): a table the ENGINE builds and keeps current via generated triggers
+/// on the source table's writes. Declared, not hand-wired: the engine can
+/// regenerate the maintenance when the declaration changes and drop it when
+/// the model stops claiming it (`Database::sync_model_derived`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DerivedModel {
+    /// The derived TABLE's name (created and owned by the engine).
+    pub name: String,
+    pub kind: DerivedKind,
+    /// The source table whose writes maintain this structure.
+    pub source: String,
+    /// `counter` only: the single grouping column (v1).
+    pub group_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DerivedKind {
+    /// `(dst, src)`-keyed mirror of an edge table — backward traversal
+    /// ("who points at X") becomes a primary-key range scan. Endpoints come
+    /// from the source's `traverse` access declaration, the same convention
+    /// `:->:` installs from.
+    ReverseEdge,
+    /// Row counts per `group_by` key, upsert-maintained (`n` may rest at 0
+    /// after deletes — a count, not a membership set).
+    Counter,
+}
+
+const DERIVED_KINDS: [(&str, DerivedKind); 2] = [
+    ("reverse-edge", DerivedKind::ReverseEdge),
+    ("counter", DerivedKind::Counter),
+];
+
 /// Level 2: an exact statement with an observed/estimated frequency.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StatementModel {
@@ -185,6 +219,8 @@ struct RawModel {
     description: Option<String>,
     #[serde(default, rename = "table")]
     tables: Vec<RawTable>,
+    #[serde(default, rename = "derived")]
+    derived: Vec<RawDerived>,
     #[serde(default, rename = "statement")]
     statements: Vec<RawStatement>,
 }
@@ -206,6 +242,16 @@ struct RawAccess {
     #[serde(default)]
     columns: Vec<String>,
     weight: Option<f64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDerived {
+    name: String,
+    kind: String,
+    source: String,
+    #[serde(default)]
+    group_by: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -283,6 +329,39 @@ impl WorkloadModel {
             tables.push(TableModel { name: t.name, role, read_write, access });
         }
 
+        let mut derived = Vec::with_capacity(m.derived.len());
+        for d in m.derived {
+            let kind = lookup("derived kind", &DERIVED_KINDS, &d.kind)?;
+            if d.name.eq_ignore_ascii_case(&d.source) {
+                return Err(Error::Unsupported(format!(
+                    "derived `{}` cannot derive from itself",
+                    d.name
+                )));
+            }
+            match kind {
+                DerivedKind::Counter if d.group_by.len() != 1 => {
+                    return Err(Error::Unsupported(format!(
+                        "derived counter `{}` needs exactly one group_by column (v1)",
+                        d.name
+                    )));
+                }
+                DerivedKind::ReverseEdge if !d.group_by.is_empty() => {
+                    return Err(Error::Unsupported(format!(
+                        "derived reverse-edge `{}` takes no group_by — its columns \
+                         come from the source's traverse declaration",
+                        d.name
+                    )));
+                }
+                _ => {}
+            }
+            derived.push(DerivedModel {
+                name: d.name,
+                kind,
+                source: d.source,
+                group_by: d.group_by,
+            });
+        }
+
         let statements = m
             .statements
             .into_iter()
@@ -298,9 +377,10 @@ impl WorkloadModel {
                 archetype,
                 description: m.description,
                 tables,
+                derived,
                 statements,
             };
-            if model.statements.is_empty() {
+            if model.statements.is_empty() && model.derived.is_empty() {
                 return Err(Error::Unsupported(
                     "empty model: declare an archetype, tables, or statements".into(),
                 ));
@@ -313,6 +393,7 @@ impl WorkloadModel {
             archetype,
             description: m.description,
             tables,
+            derived,
             statements,
         })
     }

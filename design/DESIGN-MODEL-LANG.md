@@ -125,20 +125,36 @@ cost-policy hook reads the model as one of its inputs (M5) — the model is the
 top of the cost-input ladder, statistics are the bottom, and both flow through
 the same CostSource seam.
 
-**The maintenance rung (user, mid-M1): model-declared DERIVED structures.**
-The graph the graph bench hand-built (an edge table with src/dst indexes and
-a composite) could instead be *declared*: a future `[[model.derived]]` block
-names a structure ("edge table derived from orders.customer → orders.referrer",
-"closure cache to depth 4"), and the ENGINE generates the maintenance — 
-PySpell trigger bodies fired on writes to the source tables, so the derived
-data is built and kept current inside mpedb rather than by application code.
-The declaration stays in the model because a declaration is more robust and
-more generic than hand-written triggers: the engine can regenerate the
-maintenance when the schema moves, price it (a derived structure is a write
-tax the advisor can weigh, exactly like an index), and drop it when the model
-no longer claims it. Blocked on DESIGN-TRIGGERS landing (design-only today);
-the model language reserves the concept now so M3's operators and this rung
-refer to the same nouns.
+**The maintenance rung: model-declared DERIVED structures — SHIPPED.**
+`[[model.derived]]` declares a table the ENGINE builds and keeps current with
+GENERATED triggers on the source table's writes (`Database::
+sync_model_derived` / `mpedb model sync-derived`):
+
+```toml
+[[model.derived]]
+name = "edge_rev"        # the engine-owned derived table
+kind = "reverse-edge"    # (dst, src) mirror; endpoints from the source's
+source = "edge"          #   traverse declaration (the :->: convention);
+                         #   the pair must be UNIQUE on the source
+
+[[model.derived]]
+name = "out_deg"
+kind = "counter"         # rows per key, upsert-maintained (n may rest at 0)
+source = "edge"
+group_by = ["src"]
+```
+
+Sync is the whole contract: missing → installed (table + triggers + backfill
+in ONE write txn, so no writer slips between them), declaration changed
+(stored fingerprint) → regenerated, unclaimed → dropped, triggers and table
+both — only ever tables the engine installed (`drvtab/` markers). NULL
+discipline mirrors index membership: a source row with a NULL in any
+relevant column has no entry (`WHEN … IS NOT NULL` gates; the UPDATE
+direction is two triggers because a body statement carries no gate of its
+own). The generated triggers are ordinary catalog triggers — visible in
+`mpedb trigger list`, backtestable, priced by the same write tax the advisor
+will weigh. Verified by recomputation: `crates/mpedb/tests/model_derived.rs`
+holds derived content equal to a fresh scan after every write mix.
 
 ## 4. The presets are the benches
 
