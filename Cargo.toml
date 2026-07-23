@@ -5,6 +5,7 @@ members = [
     "crates/mpedb-core",
     "crates/mpedb-sql",
     "crates/mpedb",
+    "crates/mpedb-graphbench",
     "crates/mpedb-sdk",
     "crates/mpedb-proc",
     "crates/mpedb-mirror",

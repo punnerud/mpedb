@@ -12,7 +12,9 @@
 //! and the catalog counts. The caller relates the estimate to `max_work_rows`
 //! and can warn (or, via [`RiskEstimate::exceeds`], refuse) at prepare time.
 
-use mpedb_sql::{AccessPath, CompiledPlan, CompoundPlan, PlanStmt, SelectPlan, SubBody, SubPlan};
+use mpedb_sql::{
+    AccessPath, CompiledPlan, CompoundPlan, PlanStmt, Projection, SelectPlan, SubBody, SubPlan,
+};
 use mpedb_types::Schema;
 
 /// A prepare-time worst-case estimate of the work one execution may do.
@@ -160,6 +162,123 @@ fn card_access(access: &AccessPath, table: u32, schema: &Schema, rc: &dyn Fn(u32
 /// Estimate one SELECT together with `subplans` — this level's lift list (the
 /// statement's own `plan.subplans` at the top; a nested subplan's `sub.subplans`
 /// in recursion). Returns the dominant product term and its attribution.
+/// A static iteration bound for a depth-guarded recursive CTE, or `None`.
+///
+/// The proof obligation, every piece checked against the compiled plan (never
+/// the SQL): some CTE column `k` starts at an integer constant in the anchor,
+/// is carried as exactly `k + s` (integer `s ≥ 1`) by the recursive term, and
+/// the recursive term's WHOLE residual filter is exactly `k < C` / `k ≤ C`
+/// against an integer constant. Then no row with `k` beyond the guard is ever
+/// expanded, and the iteration count is `ceil((C − c0)/s)` (+1 for `≤`) — the
+/// same monotone-accumulator argument as the solver's UNBOUGHT bound
+/// (DESIGN-MPEE-GENERAL §3), applied to depth instead of cost.
+///
+/// Deliberately narrow (v1): the CTE must be the recursive term's BASE table
+/// (after MPEE the join solver may have put a real table first — that shape
+/// declines), and the guard must be the ENTIRE residual, not one conjunct of
+/// it. Declining is free: the estimate falls back to today's "unbounded".
+///
+/// The bound itself stays worst-case: `anchor_rows × (L+1) × fanout^L`, where
+/// fanout is the product of the recursive term's joined-table row counts —
+/// each level can multiply by the whole join in the worst case. On a real
+/// graph this still saturates (honestly: the worst case IS astronomical); on
+/// a generator (no joins, fanout 1) it is exact.
+fn depth_guard_bound(
+    rc: &mpedb_sql::RecursiveCtePlan,
+    subplans: &[SubPlan],
+    schema: &Schema,
+    row_count: &dyn Fn(u32) -> u64,
+) -> Option<Acc> {
+    use mpedb_types::Instr as I;
+
+    if rc.recursive.table != mpedb_sql::CTE_TABLE {
+        return None;
+    }
+    // The guard: the whole base-row residual is `col(k) < C` (either operand
+    // order). The filter runs over the CTE row, so col k IS CTE column k.
+    let filter = rc.recursive.filter.as_ref()?;
+    // Indexing rather than slice patterns: `Instr` is small and Copy, and
+    // by-value reads keep the shape checks free of binding-mode subtleties.
+    let int_const = |prog: &mpedb_types::ExprProgram, ci: u16| -> Option<i64> {
+        match prog.consts.get(ci as usize) {
+            Some(mpedb_types::Value::Int(v)) => Some(*v),
+            _ => None,
+        }
+    };
+    let fi = filter.instrs.as_slice();
+    if fi.len() != 3 {
+        return None;
+    }
+    let (k, limit, inclusive) = match (fi[0], fi[1], fi[2]) {
+        (I::PushCol(k), I::PushConst(ci), I::Lt) => (k, int_const(filter, ci)?, false),
+        (I::PushCol(k), I::PushConst(ci), I::Le) => (k, int_const(filter, ci)?, true),
+        (I::PushConst(ci), I::PushCol(k), I::Gt) => (k, int_const(filter, ci)?, false),
+        (I::PushConst(ci), I::PushCol(k), I::Ge) => (k, int_const(filter, ci)?, true),
+        _ => return None,
+    };
+    if k as usize >= rc.columns.len() {
+        return None;
+    }
+    // The transit: the recursive term carries column k as `k + s`, s ≥ 1.
+    let step = match rc.recursive.projection.get(k as usize)? {
+        Projection::Expr { program, .. } => {
+            let pi = program.instrs.as_slice();
+            if pi.len() != 3 {
+                return None;
+            }
+            match (pi[0], pi[1], pi[2]) {
+                (I::PushCol(c), I::PushConst(ci), I::Add) if c == k => int_const(program, ci)?,
+                (I::PushConst(ci), I::PushCol(c), I::Add) if c == k => int_const(program, ci)?,
+                _ => return None,
+            }
+        }
+        Projection::Column(_) => return None, // carried unchanged: never terminates
+    };
+    if step < 1 {
+        return None;
+    }
+    // The start: the anchor's column k is an integer constant.
+    let start = match rc.anchor.projection.get(k as usize)? {
+        Projection::Expr { program, .. } => {
+            let pi = program.instrs.as_slice();
+            if pi.len() != 1 {
+                return None;
+            }
+            match pi[0] {
+                I::PushConst(ci) => int_const(program, ci)?,
+                _ => return None,
+            }
+        }
+        Projection::Column(_) => return None,
+    };
+
+    // Iterations: expansions happen only while k satisfies the guard.
+    let room = (limit as i128) - (start as i128) + i128::from(inclusive);
+    let levels: u64 = if room <= 0 {
+        0
+    } else {
+        ((room + (step as i128) - 1) / (step as i128)).min(u64::MAX as i128) as u64
+    };
+
+    let anchor_rows = estimate_select(&rc.anchor, subplans, schema, row_count).rows;
+    let fanout = rc
+        .recursive
+        .joins
+        .iter()
+        .fold(1u64, |p, j| p.saturating_mul(card_access(&j.access, j.table, schema, row_count)));
+    let per_level_sum = levels.saturating_add(1);
+    let bound = anchor_rows
+        .saturating_mul(per_level_sum)
+        .saturating_mul(fanout.saturating_pow(levels.min(u32::MAX as u64) as u32));
+    Some(Acc::new(
+        bound,
+        format!(
+            "recursive CTE \"{}\" bounded by its depth guard (≤ {levels} iterations)",
+            rc.name
+        ),
+    ))
+}
+
 fn estimate_select(
     sp: &SelectPlan,
     subplans: &[SubPlan],
@@ -300,10 +419,18 @@ pub fn estimate_plan_risk(
                 let bound = lim.saturating_add(rc.outer.offset.unwrap_or(0));
                 Acc::new(bound, format!("recursive CTE \"{}\" bounded by outer LIMIT", rc.name))
             }
-            None => Acc::new(
-                u64::MAX,
-                format!("recursive CTE \"{}\" (unbounded — no outer LIMIT)", rc.name),
-            ),
+            // Stage C of design/DESIGN-MPEE-GENERAL.md: a provably monotone
+            // depth guard bounds the iteration count statically, so the
+            // classic generator (`SELECT x+1 FROM c WHERE x < 20`) stops
+            // reporting as a probable runaway. Anything the proof cannot
+            // establish keeps today's honest u64::MAX.
+            None => match depth_guard_bound(rc, &plan.subplans, schema, row_count) {
+                Some(acc) => acc,
+                None => Acc::new(
+                    u64::MAX,
+                    format!("recursive CTE \"{}\" (unbounded — no outer LIMIT)", rc.name),
+                ),
+            },
         },
         // A materialized derived table: the body runs once (its own estimate)
         // and the outer scans the materialized set — whose cardinality is the

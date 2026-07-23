@@ -1,0 +1,13 @@
+[package]
+name = "mpedb-graphbench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+# No HTTP or JSON dependency on purpose: this talks JSON over HTTP/1.0 to a
+# Neo4j on 127.0.0.1, and the two things it needs — post a statement, read
+# back rows — are a few hundred lines of std (src/neo4j.rs). A TLS stack in
+# the workspace to reach localhost would be a poor trade.
+[dependencies]
+mpedb = { workspace = true }
