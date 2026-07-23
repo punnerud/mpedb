@@ -46,6 +46,7 @@ Milliseconds, median of 5 plus an untimed warm-up.
 |---|---|---:|---:|---:|---:|---:|
 | `scan-sum` | scan | 41.2 | 0.479 | 34.8 | 86× slower | 1.2× slower |
 | `scan-filter-sum` | scan | **126.0** | 0.744 | 60.9 | 169× slower | 2.1× slower |
+| `scan-range-sum` | scan | **184.2** | 0.660 | 250.1 | 279× slower | **1.4× faster** |
 | `scan-multi-agg` | scan | 173.4 | 0.843 | 93.3 | 206× slower | 1.9× slower |
 | `count-star` | precompute | ~~3.0~~ **1.5** | 0.215 | 0.141 | 7.2× slower | 10.6× slower |
 | `min-max-indexed` | precompute | **0.008** | 1.9 | 59.9 | **252× faster** | **7,488× faster** |
@@ -244,14 +245,29 @@ table's columns — true of an edge table `(id PK, src, dst)` under a
 indexes. It is a junction-table win, not an analytics win, and measuring it
 here was how that got established rather than assumed.
 
-**Two levers this measurement exposed, neither taken yet.** (1) A range
-predicate over an *indexed* column routes to the index-range path, which
-fetches a row per entry: on a 2M-row table a `>=` matching ~30 % of rows costs
-742 ms where a plain scan with the same predicate costs 215 — the chooser takes
-the index on shape, without pricing selectivity. (2) The residual on every scan
-and group cell is per-row executor cost — a `Vec<Value>`, an expression program
-per projection — the same constant the graph page's remaining 2.9× is made of.
-That one is shared, and it is the honest next target.
+**An index range now prices its own selectivity** (`daacf20`). It used to be
+taken on SHAPE — a range predicate over an indexed column got the index, at any
+selectivity — and that path fetches ONE ROW PER ENTRY, a PK-tree descent and a
+row decode each. With no histograms the fraction cannot be predicted, so the
+engine measures it: walk the range's KEYS (no descent, no decode) and stop the
+moment the count passes `rows / 8`; under the line fetch per entry as before,
+over it scan and keep the rows the index would have held, by rebuilding each
+row's index key and testing it against the same raw bounds. The switch point is
+measured — ~1.24 µs per matched row fetched against ~0.11 µs per row scanned,
+level near 1/11 of the table — and deliberately conservative, so a selective
+range cannot regress (measured unchanged at 1 % and at 0.07 %).
+
+`scan-range-sum` is the cell that shape deserved, added with the fix so it is
+measured rather than asserted: **410.9 → 184.2 ms**, which turns a 1.7× loss to
+SQLite into a **1.4× win**. This was invisible on this page until the cell
+existed, which is the argument for adding it.
+
+**The residual on every scan, group and join cell is per-row executor cost** —
+a `Vec<Value>`, an expression program per projection — the same constant the
+graph page's remaining 2.9× is made of. That one is shared, and it is the
+honest next target. A second, narrower hole is measured and open: the index
+range does not push a `LIMIT` down, so `… WHERE day_id >= 1000 LIMIT 5` pays
+for the whole range (612 ms on the 2M-row table) instead of stopping at five.
 
 ## What the extension layer adds here
 
