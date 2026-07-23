@@ -9,12 +9,10 @@ description = "PySpell-style stored procedures for mpedb: host-side parsing, san
 mpedb = { workspace = true }
 mpedb-sql = { workspace = true }
 mpedb-types = { workspace = true }
+# The compile/interpret bottom half, split out (M2) so the facade can run
+# stored SQL functions: frontends + IR + interpreter live there.
+mpedb-spell = { workspace = true }
 blake3 = { workspace = true }
-# Frontend parsers: host-side ONLY (define time). The runtime never sees
-# source text, only validated IR. These deps exist in this crate alone.
-rustpython-parser = { version = "0.4", default-features = false, features = ["num-bigint"] }
-syn = { version = "2", features = ["full"] }
-proc-macro2 = { version = "1", features = ["span-locations"] }
 
 [dev-dependencies]
 # Tests forge hostile/stale registry records through a second engine

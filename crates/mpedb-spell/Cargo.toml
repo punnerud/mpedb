@@ -1,0 +1,20 @@
+[package]
+name = "mpedb-spell"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The PySpell layer: Python/Rust subsets compiled host-side to sandboxed, content-hashed, budgeted IR"
+
+# Split out of mpedb-proc (stage M2, design/DESIGN-MODEL-LANG.md program) so
+# the FACADE can evaluate stored SQL functions without a dependency cycle:
+# this crate depends only on mpedb-types; mpedb-proc keeps the Database
+# bridges (define/link/call) on top. The interpreter runs against `DbBridge`,
+# so nothing here ever needs a database.
+[dependencies]
+mpedb-types = { workspace = true }
+blake3 = { workspace = true }
+# Frontend parsers: host-side ONLY (define time). The runtime never sees
+# source text, only validated IR.
+rustpython-parser = { version = "0.4", default-features = false, features = ["num-bigint"] }
+syn = { version = "2", features = ["full"] }
+proc-macro2 = { version = "1", features = ["span-locations"] }

@@ -88,22 +88,12 @@
 //! println!("new balance: {v}");
 //! ```
 
-mod emit;
 mod engine;
-mod hash;
-mod interp;
-mod ir;
-mod py;
-mod rs;
 
 pub use engine::{Lang, ProcEngine, ProcInfo, NS_PROC, NS_PROC_HASH};
-pub use hash::ProcHash;
-pub use interp::{Budget, ProcValue};
+pub use mpedb_spell::{Budget, ProcHash, ProcValue};
 
 // Re-exported for callers that match on errors / build params.
 pub use mpedb::{Error, Result, Value};
 
-#[cfg(test)]
-mod parity_tests;
-#[cfg(test)]
-mod reject_tests;
+

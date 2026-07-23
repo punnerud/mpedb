@@ -45,7 +45,7 @@ use syn::spanned::Spanned;
 
 const LANG: &str = "rs";
 
-pub(crate) fn compile(src: &str) -> Result<Skeleton> {
+pub fn compile(src: &str) -> Result<Skeleton> {
     let file: syn::File = syn::parse_str(src).map_err(|e| {
         let lc = e.span().start();
         cerr(LANG, lc.line, lc.column, format!("syntax error: {e}"))
