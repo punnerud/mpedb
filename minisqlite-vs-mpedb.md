@@ -534,3 +534,73 @@ VDBE record. Cursor/fold fusion is the next lever; the parallelism in
 axis SQLite has no answer to at all.
 
 Artifacts: `~/mpedb-measure-results/mpedb-corpus-bd420e8-r{1,2}.{log,time}`.
+
+---
+
+## 12. Re-run 2026-07-23 — all three engines, both hosts, one chunk split
+
+Pins: mpedb **`944ca6b`** · minisqlite **`4a5c134`** (unchanged from §10 on
+purpose — a held control group is what makes mpedb's movement attributable) ·
+stock SQLite **3.45.0** (rusqlite 0.31 bundled). Same 621-file list as §3.2,
+split into 78 chunks of 8 for every engine and both hosts; Linux chunks under
+`ulimit -v 3000000`. Sequential, one engine at a time.
+
+### 12.1 Correctness — identical on both architectures
+
+| engine | attempted | passed | pass rate | wrong | error mismatches |
+|---|---:|---:|---:|---:|---:|
+| stock SQLite 3.45.0 | 5 938 443 | 5 938 439 | **99.999933 %** | 3 | 0 |
+| minisqlite `4a5c134` | 5 938 443 | 5 938 436 | **99.999882 %** | 4 | 2 |
+| mpedb `944ca6b` | 5 938 278 | 5 936 882 | **99.976492 %** | 4 | 1 |
+
+Every row above is **byte-identical between the x86-64 Linux box and the ARM64
+M3** — the same determinism §10 relied on to bisect, re-confirmed across
+architectures. minisqlite and SQLite land on their §3.2/§10 numbers to the
+sixth decimal, which is what licenses reading mpedb's row as movement rather
+than weather.
+
+**mpedb versus its own §3.2 baseline** (99.974859 %, 7 flagged wrong, 1 486
+unsupported): pass rate **up** to 99.976492 %, flagged wrong **down 7 → 4**,
+unsupported **down to 1 391**. The four remaining are the known
+`evidence/slt_lang_replace.test` runner artifacts (CORPUS-STATUS §3), unchanged.
+The `e9acc83` in-place regression (8 960 wrong) stays closed.
+
+### 12.2 One new error mismatch, and it is ours
+
+mpedb shows **1 error mismatch** where the §3.2 baseline had 0, in
+`evidence/slt_lang_reindex.test`:
+
+```
+statement error
+REINDEX tXiX          -- an index that does not exist
+```
+
+SQLite refuses (*"unable to identify the object to be reindexed"*); mpedb
+accepts it as a no-op. `REINDEX` is an accepted no-op here by design (indexes
+are maintained eagerly, so there is nothing to rebuild) — but accepting it for
+a name that identifies **nothing** is silent acceptance of a typo, the failure
+direction this project does not tolerate.
+
+The honest fix is not one line: mpedb keeps **no index-name registry**
+(`CREATE INDEX`'s name is discarded — indexes are positional `index_no`), so it
+cannot today tell "an index I do not track by name" from "a name that means
+nothing". Erroring on every non-table name would refuse legitimate
+`REINDEX <index-name>` that SQLite accepts — trading a silent accept for a
+false refusal, and breaking drop-in migrations that emit it. A name registry
+would close this **and** the `DROP INDEX` gap (CORPUS-STATUS's remaining "2")
+in one move. Recorded here, not guessed at.
+
+### 12.3 Wall clock (78 chunks, includes per-chunk process startup)
+
+| engine | Linux (2 cores) | M3 Pro |
+|---|---:|---:|
+| stock SQLite 3.45.0 | 69 s | 44 s |
+| minisqlite `4a5c134` | 155 s | 88 s |
+| mpedb `944ca6b` | 270 s | 145 s |
+
+Ratios: mpedb / SQLite ≈ **3.9× / 3.3×**, mpedb / minisqlite ≈ **1.74× / 1.65×**.
+Not directly comparable to §10/§11's wall clocks — those ran 16 chunks, these 78,
+so startup is paid nearly five times as often — which is exactly why the
+correctness table above, and not this one, carries the conclusion.
+
+Artifacts: `~/mpedb-measure-results/rerun-20260723/corpus-{mpedb,minisqlite,sqlite}-{linux,m3}.log`.

@@ -220,6 +220,11 @@ deterministic as today's `row_count`: bucket the index's distinct-key count in
 log2, the same way table row counts are bucketed, so the estimate cannot move
 until the data doubles.
 
+**Re-verified 2026-07-23** (mpedb `944ca6b`, DuckDB and SQLite unchanged, same
+M3): `count-star` holds at **1.5 ms** (the NOT NULL schema fix), `min-max-indexed`
+at 0.009 ms (210× ahead of DuckDB), `count-filtered` 2.2× ahead, and the scan
+and group cells reproduce their gap — every row still agrees.
+
 ## What the extension layer adds here
 
 Deliberately NOT operator sugar: the star queries read naturally as SQL, and a

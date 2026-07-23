@@ -65,6 +65,15 @@ NULL embeddings, OFFSET paging and the raise-on-malformed-row behaviour to the
 generic path's exactly. The mechanism is DESIGN-MPEE-GENERAL §3's monotone
 lower bound, applied per dimension instead of per table.
 
+**Re-verified 2026-07-23** (mpedb `944ca6b`, same Qdrant, same M3): exact
+unfiltered 17.9 → 17.7 ms, the generic-sort A/B arm 52.3 → 51.8 (abandonment
+still 2.9×), filtered exact 5.6 ms against Qdrant's 75.2 → 76.1 — the 13×
+filtered inversion reproduces. One difference worth stating: Qdrant's
+unfiltered recall@10 came back **1.000** this run against 0.992 before, on a
+collection rebuilt from scratch by the harness; HNSW recall is
+construction-order dependent, so treat 0.992–1.000 as its band on this data
+rather than either number as the figure.
+
 ## The operator spelling is provably free
 
 `mpedb op install-model` (the rag model's `embedding` role) installs `:~:`,
