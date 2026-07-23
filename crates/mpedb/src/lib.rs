@@ -2299,6 +2299,13 @@ struct NamedSavepoint {
 
 // ------------------------------------------------ system-record key helpers
 
+/// Stored-PROCEDURE namespaces (name-keyed and hash-keyed blobs). Owned here so
+/// the trigger catalog (`EXECUTE PROCEDURE` bodies pin a `proch/<hash>` blob)
+/// and `mpedb-proc`'s engine agree on one spelling; `mpedb-proc` re-exports
+/// them.
+pub const NS_PROC: &str = "proc";
+pub const NS_PROC_HASH: &str = "proch";
+
 const SYS_RECORD_MAX_NS: usize = 64;
 const SYS_RECORD_MAX_KEY: usize = 1024;
 const SYS_RECORD_MAX_VALUE: usize = 1 << 20;

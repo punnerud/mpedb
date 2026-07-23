@@ -127,14 +127,28 @@ pub enum TriggerEvent {
     Delete,
 }
 
+/// A trigger's body as parsed (DESIGN-TRIGGERS §1): either an in-SQL statement
+/// list or a PySpell procedure dispatch (stage 5). Both are captured as SOURCE
+/// text and compiled by the facade at apply/load time.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TriggerBodySpec {
+    /// `BEGIN <stmt>; … END` — one or more `;`-separated INSERT/UPDATE/DELETE
+    /// statements, split and compiled at apply/load time.
+    Sql(String),
+    /// `EXECUTE PROCEDURE <name>(<arg>, …)` — dispatch to a stored PySpell
+    /// procedure. Each argument is captured as source (an expression over
+    /// `NEW.<col>` / `OLD.<col>` / constants), compiled at apply time.
+    Proc { name: String, arg_srcs: Vec<String> },
+}
+
 /// `CREATE TRIGGER [IF NOT EXISTS] <name> {BEFORE|AFTER}
 ///    {INSERT|UPDATE [OF cols]|DELETE} ON <table> [FOR EACH ROW]
-///    [WHEN (<cond>)] BEGIN <stmt>; END` (DESIGN-TRIGGERS §1-2).
+///    [WHEN (<cond>)] {BEGIN <stmt>; END | EXECUTE PROCEDURE p(args…)}`
+/// (DESIGN-TRIGGERS §1-2).
 ///
-/// The `WHEN` predicate and the `BEGIN … END` body are captured as SOURCE text
-/// (like `CREATE VIEW`'s SELECT and a policy predicate), re-compiled against the
-/// live schema at catalog-load time. `EXECUTE PROCEDURE` (PySpell) bodies are a
-/// named parse refusal until DESIGN-TRIGGERS stage 5, so the body is always SQL.
+/// The `WHEN` predicate and the body are captured as SOURCE text (like `CREATE
+/// VIEW`'s SELECT and a policy predicate), re-compiled against the live schema
+/// at catalog-load time.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CreateTriggerSpec {
     pub name: String,
@@ -143,9 +157,7 @@ pub struct CreateTriggerSpec {
     pub table: String,
     /// Captured `WHEN (…)` predicate source, if any.
     pub when_src: Option<String>,
-    /// Captured `BEGIN … END` body source — one or more `;`-separated
-    /// INSERT/UPDATE/DELETE statements, split and compiled at apply/load time.
-    pub body_sql: String,
+    pub body: TriggerBodySpec,
     pub if_not_exists: bool,
 }
 
@@ -457,7 +469,10 @@ mod tests {
                 assert_eq!(s.table, "orders");
                 assert!(s.when_src.is_none());
                 assert!(!s.if_not_exists);
-                assert_eq!(s.body_sql, "INSERT INTO audit (oid) VALUES (NEW.id)");
+                assert_eq!(
+                    s.body,
+                    TriggerBodySpec::Sql("INSERT INTO audit (oid) VALUES (NEW.id)".into())
+                );
             }
             other => panic!("expected CreateTrigger, got {other:?}"),
         }
@@ -477,8 +492,11 @@ mod tests {
                 assert_eq!(s.when_src.as_deref(), Some("NEW.total > 100"));
                 // The CASE … END inside the body must NOT end the BEGIN … END capture.
                 assert_eq!(
-                    s.body_sql,
-                    "INSERT INTO big (v) VALUES (CASE WHEN NEW.total > 200 THEN 2 ELSE 1 END)"
+                    s.body,
+                    TriggerBodySpec::Sql(
+                        "INSERT INTO big (v) VALUES (CASE WHEN NEW.total > 200 THEN 2 ELSE 1 END)"
+                            .into()
+                    )
                 );
             }
             other => panic!("expected CreateTrigger, got {other:?}"),
@@ -516,8 +534,48 @@ mod tests {
             "CREATE TRIGGER t AFTER INSERT ON o FOR EACH STATEMENT BEGIN DELETE FROM x; END"
         )
         .is_err());
-        assert!(parse_ddl("CREATE TRIGGER t AFTER INSERT ON o EXECUTE PROCEDURE p(NEW.id)").is_err());
         assert!(parse_ddl("CREATE TRIGGER t AFTER INSERT ON o BEGIN INSERT INTO x VALUES (1)").is_err()); // no END
+    }
+
+    #[test]
+    fn trigger_execute_procedure_parses_with_arg_sources() {
+        // Stage 5: the PySpell body form. Argument SOURCES are captured at
+        // top-level commas only — the comma inside coalesce() must not split.
+        match parse_ddl(
+            "CREATE TRIGGER t AFTER UPDATE ON o \
+             EXECUTE PROCEDURE enrich(NEW.id, coalesce(OLD.tag, 'none'), 42)",
+        )
+        .unwrap()
+        .unwrap()
+        {
+            DdlStmt::CreateTrigger(s) => match s.body {
+                TriggerBodySpec::Proc { name, arg_srcs } => {
+                    assert_eq!(name, "enrich");
+                    assert_eq!(
+                        arg_srcs,
+                        vec!["NEW.id", "coalesce(OLD.tag, 'none')", "42"]
+                    );
+                }
+                other => panic!("expected Proc body, got {other:?}"),
+            },
+            other => panic!("expected CreateTrigger, got {other:?}"),
+        }
+        // Zero-argument call and refusals: empty fragment, unterminated list.
+        match parse_ddl("CREATE TRIGGER t AFTER DELETE ON o EXECUTE PROCEDURE hook()")
+            .unwrap()
+            .unwrap()
+        {
+            DdlStmt::CreateTrigger(s) => {
+                assert_eq!(
+                    s.body,
+                    TriggerBodySpec::Proc { name: "hook".into(), arg_srcs: vec![] }
+                );
+            }
+            other => panic!("expected CreateTrigger, got {other:?}"),
+        }
+        assert!(parse_ddl("CREATE TRIGGER t AFTER INSERT ON o EXECUTE PROCEDURE p(NEW.id,)").is_err());
+        assert!(parse_ddl("CREATE TRIGGER t AFTER INSERT ON o EXECUTE PROCEDURE p(NEW.id").is_err());
+        assert!(parse_ddl("CREATE TRIGGER t AFTER INSERT ON o EXECUTE PROCEDURE p").is_err());
     }
 
     #[test]

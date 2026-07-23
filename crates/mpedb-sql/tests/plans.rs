@@ -475,3 +475,22 @@ fn quoted_identifiers() {
     assert_eq!(a, b);
     assert_eq!(a.hash(), b.hash());
 }
+
+/// An `INSERT … VALUES ((SELECT …)), …` plan carries statement-level
+/// uncorrelated subplans. The decode validator refused that shape while the
+/// planner produced it — so the plan ran fine from the compiling process's
+/// local cache but was unloadable from the shared registry (`UnknownPlan` in
+/// every other process, and for the trigger catalog's by-hash resolution).
+#[test]
+fn insert_with_scalar_subquery_round_trips() {
+    let s = schema();
+    let plan = prepare(
+        "INSERT INTO users (id, email) VALUES ((SELECT coalesce(max(id), 0) + 1 FROM users), $1)",
+        &s,
+    )
+    .unwrap();
+    assert!(!plan.subplans.is_empty(), "the shape under test carries subplans");
+    let blob = plan.encode();
+    let p2 = CompiledPlan::decode(&blob, &s).expect("registry decode must accept what prepare emits");
+    assert_eq!(p2.hash(), plan.hash());
+}
