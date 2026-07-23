@@ -111,6 +111,32 @@ bounded recursions (`risk.rs`, `tests/risk_depth_guard.rs`) — and the
 converged-frontier execution optimization above. They share one function, so
 they can never disagree about what "provably bounded" means.
 
+## The operator arm: the sugar is free, and it locks the fast shape
+
+Re-run 2026-07-23 with a third arm: the same questions in the `:op:` operator
+language (SQL-EXTENSIONS.md), defined by the bench itself — the model's roles
+install `:->:`, and the bench adds `:deg: n`, `:reach4:`…`:reach8: n`
+(statement operators), and `:tri:`.
+
+| workload | mpedb SQL warm | mpedb `:op:` warm |
+|---|---:|---:|
+| `degree` | 2.6 | 1.4 |
+| `reach4` | 94.0 | 93.5 |
+| `reach6` | 183.7 | 183.1 |
+| `reach8` | 186.3 | 184.3 |
+| `tri-global` | 1,395.7 | 1,480.4 |
+
+Every operator-arm answer equals the SQL arm's (asserted, not assumed), and
+the times are identical within run noise — the macro expands at COMPILE time,
+so the executed plan is the same plan. The real gain is not speed but
+**shape-locking**: `:reachK: n` GENERATES the converged-frontier CTE — the
+`count(DISTINCT node)` form the depth-guard optimization can prove — so a
+user of the sugar cannot accidentally write the `count(*)` variant that
+re-expands the reached set every level (the 833 ms hole the first sweep
+found). The language is where the fast pattern lives now, not the user's
+memory. (`:deg:`'s 1.4 vs 2.6 ms is a scalar-subquery plan reaching the index
+count path — same answer, slightly different shape; noted for honesty.)
+
 ## What each workload is
 
 - **`degree`** — hub out-degree.
