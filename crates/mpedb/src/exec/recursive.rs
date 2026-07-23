@@ -56,22 +56,35 @@ pub(super) fn exec_recursive_cte(
     // The dedup key: the whole row for plain UNION, the row MINUS the counter
     // column under the converged-frontier proof (strictly stronger, so the
     // whole-row set is subsumed).
-    let dedup_key = |row: &[Value]| -> Vec<u8> {
-        match frontier {
-            Some(k) => {
-                let rest: Vec<Value> = row
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| *i != k as usize)
-                    .map(|(_, v)| v.clone())
-                    .collect();
-                keycode::encode_group_key(&rest, &[])
+    // Built into ONE reused buffer and only cloned onto the heap when the row
+    // is actually NEW: a fixpoint produces far more rows than it keeps (the
+    // graph bench's reach-8 produces ~250k and keeps ~50k), and an allocation
+    // per PRODUCED row was most of what the dedup cost. `HashSet<Vec<u8>>`
+    // probes by `&[u8]` (`Vec<u8>: Borrow<[u8]>`), so the miss path allocates
+    // nothing at all.
+    let mut key_buf: Vec<u8> = Vec::with_capacity(32);
+    let dedup_key = |buf: &mut Vec<u8>, row: &[Value]| {
+        buf.clear();
+        for (i, v) in row.iter().enumerate() {
+            if frontier == Some(i as u16) {
+                continue;
             }
-            None => keycode::encode_group_key(row, &[]),
+            keycode::encode_group_value(buf, v, mpedb_types::Collation::Binary);
         }
     };
+    let accept = |seen: &mut HashSet<Vec<u8>>, buf: &mut Vec<u8>, row: &[Value]| -> bool {
+        if rc.union_all {
+            return true;
+        }
+        dedup_key(buf, row);
+        if seen.contains(buf.as_slice()) {
+            return false;
+        }
+        seen.insert(buf.clone());
+        true
+    };
     for row in anchor_rows {
-        if rc.union_all || seen.insert(dedup_key(&row)) {
+        if accept(&mut seen, &mut key_buf, &row) {
             queue.push(row.clone());
             result.push(row);
         }
@@ -100,7 +113,7 @@ pub(super) fn exec_recursive_cte(
         }
         let mut next: Vec<Vec<Value>> = Vec::new();
         for row in step_rows {
-            if rc.union_all || seen.insert(dedup_key(&row)) {
+            if accept(&mut seen, &mut key_buf, &row) {
                 next.push(row.clone());
                 result.push(row);
             }
