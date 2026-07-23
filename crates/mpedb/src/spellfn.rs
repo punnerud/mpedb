@@ -246,32 +246,12 @@ impl crate::Database {
         let names = self.scan_func_records(&r)?;
         let mut out = Vec::with_capacity(names.len());
         for (_name, hash, _argc) in names {
-            if let Some(p) = self.spell_cache.read().expect(crate::POISON).get(&hash) {
-                out.push((hash, p.clone()));
-                continue;
+            // A name bound to a missing blob refuses at call time (the table
+            // simply lacks the hash); a present blob is hash-verified and
+            // db-op-checked in load_proc_by_hash.
+            if let Some(proc) = self.load_proc_by_hash(&r, &hash)? {
+                out.push((hash, proc));
             }
-            let blob_key = crate::sys_record_subkey(NS_FUNC_HASH, &hash)?;
-            let Some(blob) = r.sys_get(&blob_key)? else {
-                // A name bound to a missing blob: refuse at call time (the
-                // table simply lacks the hash), never invent a function.
-                continue;
-            };
-            if *blake3::hash(&blob).as_bytes() != hash {
-                return Err(Error::Corrupt("stored function blob does not match its hash".into()));
-            }
-            let proc = Arc::new(Proc::decode(&blob)?);
-            if proc.has_db_ops() {
-                // A forged blob smuggling SQL ops past create_function's
-                // refusal: fail closed at load, before any call runs.
-                return Err(Error::Corrupt(
-                    "stored function blob contains database operations".into(),
-                ));
-            }
-            self.spell_cache
-                .write()
-                .expect(crate::POISON)
-                .insert(hash, proc.clone());
-            out.push((hash, proc));
         }
         r.finish()?;
         Ok(out)

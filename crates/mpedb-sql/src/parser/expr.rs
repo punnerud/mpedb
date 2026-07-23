@@ -178,7 +178,41 @@ impl<'a> Parser<'a> {
     }
 
     fn cmp_expr(&mut self) -> Result<Expr> {
+        // The byte where the LEFT operand's source begins — captured before
+        // parsing so a custom infix/postfix operator can hand the operand's
+        // TEXT to its macro (stage M3). Free when no `:sym:` follows.
+        let left_start = self.cur_byte();
         let mut e = self.bit_expr()?;
+        // Custom operators sit at comparison precedence, like MATCH: one
+        // application, no chaining (`a :x: b :x: c` refuses — parenthesize).
+        if let Some(Tok::CustomOp(sym)) = self.peek().cloned() {
+            let fixity = self.op_fixity(&sym)?;
+            if fixity & 2 != 0 {
+                let left_text = self.src[left_start..self.cur_byte()].trim().to_string();
+                self.pos += 1; // the operator token
+                let operands: Vec<String> = if fixity & 1 != 0 {
+                    let r_start = self.cur_byte();
+                    let _right = self.bit_expr()?;
+                    let right_text = self.src[r_start..self.cur_byte()].trim().to_string();
+                    vec![left_text, right_text]
+                } else {
+                    vec![left_text]
+                };
+                e = self.expand_custom_op(&sym, &operands)?;
+                if matches!(self.peek(), Some(Tok::CustomOp(_))) {
+                    return Err(self.err_here(
+                        "custom operators do not chain — parenthesize the first application",
+                    ));
+                }
+                return Ok(e);
+            }
+            // fixity without a LEFT operand in left-operand position: the
+            // prefix/niladic forms belong in the unary tier, so a stray one
+            // here is a real syntax error.
+            return Err(self.err_here(format!(
+                ":{sym}: does not take a left operand — write it before its operand instead"
+            )));
+        }
         let mut seen_cmp = false;
         loop {
             if self.eat_kw(Kw::Is) {
@@ -391,6 +425,25 @@ impl<'a> Parser<'a> {
             let e = self.unary_expr();
             self.exit_expr();
             e
+        } else if let Some(Tok::CustomOp(sym)) = self.peek().cloned() {
+            // Prefix (01) and niladic (00) custom operators live where unary
+            // minus does; infix/postfix forms reached from HERE mean the
+            // operator had no left operand — refuse by name.
+            let fixity = self.op_fixity(&sym)?;
+            if fixity & 2 != 0 {
+                return Err(self.err_here(format!(
+                    ":{sym}: takes a left operand — write `<expr> :{sym}:`"
+                )));
+            }
+            self.pos += 1;
+            let operands: Vec<String> = if fixity & 1 != 0 {
+                let r_start = self.cur_byte();
+                let _right = self.unary_expr()?;
+                vec![self.src[r_start..self.cur_byte()].trim().to_string()]
+            } else {
+                Vec::new()
+            };
+            self.expand_custom_op(&sym, &operands)
         } else {
             self.collate_expr()
         }

@@ -260,6 +260,11 @@ is locked".
 
 ## Using it
 
+**[SQL-EXTENSIONS.md](SQL-EXTENSIONS.md)** — SQL is user-extensible: stored
+PySpell functions (shared across processes, unlike C-API UDFs) and `:sym:`
+custom operator macros, both living in the database file and resolved by the
+workload model's roles.
+
 **[GUIDE.md](GUIDE.md)** is the practical guide: quickstart, the schema config,
 queries, transactions, upsert, joins, durability, a side-by-side for people
 coming from sqlite3, and migrating a real sqlite3 database. Every Rust snippet

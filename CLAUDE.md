@@ -8,6 +8,11 @@ zero parsing). **Read design/DESIGN.md before touching concurrency, lock, or com
 every protocol there survived a 37-finding adversarial review, and the ordering rules
 (fences, meta publication, slot generation-CAS) are load-bearing.**
 
+SQL is user-extensible via stored PySpell functions and `:sym:` operator
+macros — SQL-EXTENSIONS.md is the contract; `mpedb fn list` / `mpedb op list`
+show what a given database defines. The workload model (design/
+DESIGN-MODEL-LANG.md, `mpedb model show`) declares what a database is FOR.
+
 ## Commands
 
 - Build/test all: `cargo test --workspace` (mpedb-capi is its OWN workspace —

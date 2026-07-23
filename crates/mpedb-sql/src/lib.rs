@@ -28,7 +28,7 @@ mod token;
 mod trigger;
 mod view;
 
-pub use binder::{HostUdfSet, SpellFnSet};
+pub use binder::{HostUdfSet, OpSet, SpellFnSet};
 pub use dbref::{
     mangle as mangle_db_table, parse_attach, resolve_db_refs, AttachStmt, DbResolution, DbScope,
 };
@@ -172,7 +172,7 @@ pub fn prepare_maybe_explain_with_views(
     // has to be chosen before the argument list is read (design/DESIGN-UDF.md
     // stage 2). Host SCALARS still resolve in the binder, unchanged.
     let (mut stmt, is_explain, n_params, ctes) =
-        parser::parse_statement_ctes(sql, host_udfs.aggs(), host_udfs.window_aggs())?;
+        parser::parse_statement_ctes(sql, host_udfs.aggs(), host_udfs.window_aggs(), &host_udfs.ops)?;
     // A `WITH` CTE is a statement-scoped named view. Pass the CTE bodies to
     // `inline_views` in a SECOND catalog kept distinct from the persistent views,
     // so a `FROM cte` reference is spliced by the keep-alias machinery (`cte.col`
