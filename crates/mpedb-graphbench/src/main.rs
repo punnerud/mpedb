@@ -72,7 +72,7 @@ fn workloads() -> Vec<Workload> {
     // not carry parameters (a documented refusal), and one rule for all six
     // beats two mechanisms.
     let h = HOT;
-    vec![
+    let mut out = vec![
         Workload {
             name: "degree",
             about: "out-degree of the hub — one index range count",
@@ -101,21 +101,7 @@ fn workloads() -> Vec<Workload> {
                 "MATCH (:N {{id: {h}}})-[:E]->()-[:E]->()-[:E]->(b) RETURN count(DISTINCT b.id)"
             ),
         },
-        Workload {
-            name: "reach4",
-            about: "distinct nodes within 4 hops (start included) — the \
-                    depth-guarded recursive CTE against Cypher [*0..4]",
-            sql: format!(
-                "WITH RECURSIVE r(node, d) AS (\
-                   SELECT {h}, 0 \
-                   UNION \
-                   SELECT e.dst, r.d + 1 FROM r JOIN edge e ON e.src = r.node WHERE r.d < 4\
-                 ) SELECT count(DISTINCT node) FROM r"
-            ),
-            cypher: format!(
-                "MATCH (:N {{id: {h}}})-[:E*0..4]->(b) RETURN count(DISTINCT b.id)"
-            ),
-        },
+
         Workload {
             name: "tri-hub",
             about: "directed triangles through the hub — a 3-cycle join anchored one end",
@@ -135,7 +121,35 @@ fn workloads() -> Vec<Workload> {
                 .to_string(),
             cypher: "MATCH (x)-[:E]->(y)-[:E]->(z)-[:E]->(x) RETURN count(*)".to_string(),
         },
-    ]
+    ];
+    // The depth sweep, k = 4..8: hunting for where each engine's curve bends.
+    // mpedb's semi-naive fixpoint grows ~linearly in (levels × frontier);
+    // Cypher's [*0..k] is trail-shaped, and whether its planner's
+    // distinct-aware pruning holds the line at depth is exactly what the
+    // sweep exists to observe rather than assume.
+    for k in 4..=8u32 {
+        out.insert(
+            3 + (k as usize - 4),
+            Workload {
+                name: Box::leak(format!("reach{k}").into_boxed_str()),
+                about: Box::leak(
+                    format!("distinct nodes within {k} hops — depth-guarded CTE vs [*0..{k}]")
+                        .into_boxed_str(),
+                ),
+                sql: format!(
+                    "WITH RECURSIVE r(node, d) AS (\
+                       SELECT {h}, 0 \
+                       UNION \
+                       SELECT e.dst, r.d + 1 FROM r JOIN edge e ON e.src = r.node WHERE r.d < {k}\
+                     ) SELECT count(DISTINCT node) FROM r"
+                ),
+                cypher: format!(
+                    "MATCH (:N {{id: {h}}})-[:E*0..{k}]->(b) RETURN count(DISTINCT b.id)"
+                ),
+            },
+        );
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +184,13 @@ primary_key = ["id"]
   type = "int64"
   nullable = false
   indexed = true
+
+  # The triangle probe pins BOTH columns (c.src = b.dst AND c.dst = a.src);
+  # with this composite that lookup is one tree point probe instead of an
+  # avg-degree row fetch + filter. Schema tuning, same as every engine here
+  # gets (Neo4j's adjacency IS this, natively).
+  [[table.index]]
+  columns = ["src", "dst"]
 "#,
         path.display()
     );
@@ -271,6 +292,11 @@ fn run_side(
     let t0 = Instant::now();
     let answer = f()?;
     let cold_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    // A 15-second cold run IS the measurement — repeating it four more times
+    // buys a decimal place on a number whose story is its magnitude.
+    if cold_ms > 15_000.0 {
+        return Ok(Cell { cold_ms, warm_ms: cold_ms, answer });
+    }
     let mut ms = Vec::with_capacity(reps);
     for _ in 0..reps {
         let t = Instant::now();
