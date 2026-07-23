@@ -93,7 +93,8 @@ pub(crate) const MAX_SET_ITEMS: usize = 1024;
 /// `EXPLAIN`, and the number of parameters ($n gives max n; `?` are numbered
 /// left-to-right in statement order).
 pub(crate) fn parse_statement(sql: &str) -> Result<(Stmt, bool, u16)> {
-    let (stmt, is_explain, n_params, ctes) = parse_statement_ctes(sql, &[], &[])?;
+    let (stmt, is_explain, n_params, ctes) =
+        parse_statement_ctes(sql, &[], &[], &crate::binder::OpSet::default())?;
     if !ctes.is_empty() {
         return Err(Error::Bind(
             "WITH (common table expressions) is only handled by the top-level \
@@ -121,11 +122,15 @@ pub(crate) fn parse_statement_ctes(
     // (`create_window_function`: xValue + xInverse as well as xStep/xFinal).
     // Only these may take an OVER clause; `&[]` for every caller with none.
     window_aggs: &[String],
+    // Custom operators (stage M3, SQL-EXTENSIONS.md); default for callers
+    // with none — a `:sym:` token then refuses by name.
+    ops: &crate::binder::OpSet,
 ) -> Result<(Stmt, bool, u16, CteDefs)> {
     let toks = tokenize(sql)?;
     let mut p = Parser::new(sql, toks);
     p.host_aggs = host_aggs.to_vec();
     p.window_aggs = window_aggs.to_vec();
+    p.ops = ops.clone();
     let is_explain = if p.eat_kw(Kw::Explain) {
         if p.peek_kw(Kw::Explain) {
             return Err(p.err_here("EXPLAIN cannot be nested"));
@@ -196,6 +201,14 @@ struct Parser<'a> {
     /// Host aggregates that ALSO carry the window protocol (see
     /// `parse_statement_ctes`). A subset of `host_aggs` by name.
     window_aggs: Vec<String>,
+    /// Custom-operator catalog (stage M3): fixity map + the macro expander.
+    /// Empty for callers with no database — a `:sym:` token then refuses by
+    /// name. Owned (cloned once per parse) so fragment sub-parsers share it.
+    ops: crate::binder::OpSet,
+    /// Macro-expansion nesting depth: an operator whose expansion reaches
+    /// another operator recurses here; the cap turns a self-expanding
+    /// definition into a deterministic refusal instead of a stack overflow.
+    op_depth: u8,
     /// The core just parsed by `select_core` carried a NEGATIVE `LIMIT`/`OFFSET`
     /// — sqlite's "no limit" / "no skip" idiom, which the AST spells as the
     /// clause being absent. `compound_chain` still has to reject it before a
@@ -217,6 +230,8 @@ impl<'a> Parser<'a> {
             depth: 0,
             host_aggs: Vec::new(),
             window_aggs: Vec::new(),
+            ops: crate::binder::OpSet::default(),
+            op_depth: 0,
             neg_limit_in_core: false,
             stack_base: {
                 let probe = 0u8;
@@ -251,6 +266,72 @@ impl<'a> Parser<'a> {
             .get(self.pos)
             .map(|t| t.pos)
             .unwrap_or(self.src.len())
+    }
+
+    /// The byte offset of the CURRENT token's first character (end of input
+    /// when exhausted) — the seam operand-text capture cuts on.
+    fn cur_byte(&self) -> usize {
+        self.toks.get(self.pos).map(|t| t.pos).unwrap_or(self.src.len())
+    }
+
+    /// Fixity of a custom operator, or the discoverable refusal.
+    fn op_fixity(&self, sym: &str) -> Result<u8> {
+        self.ops.fixity(sym).ok_or_else(|| {
+            self.err_here(format!(
+                "unknown operator :{sym}: — see SQL-EXTENSIONS.md, or `mpedb op list`"
+            ))
+        })
+    }
+
+    /// Run a custom operator's macro over its operands' SOURCE TEXT and parse
+    /// the expansion in place (stage M3). The expansion is an ordinary
+    /// expression: every bind rule applies to it afterwards, so a macro
+    /// cannot smuggle anything past a refusal. Parameter numbering carries
+    /// through the sub-parse (an operand containing `$1`/`?` keeps its slot),
+    /// and the depth cap turns a self-expanding operator into a deterministic
+    /// refusal instead of a stack overflow.
+    fn expand_custom_op(&mut self, sym: &str, operands: &[String]) -> Result<Expr> {
+        if self.op_depth >= 8 {
+            return Err(Error::Parse {
+                pos: self.cur_byte(),
+                msg: format!(
+                    ":{sym}: expansion is nested more than 8 levels deep —                      an operator must not expand into itself"
+                ),
+            });
+        }
+        let refs: Vec<&str> = operands.iter().map(String::as_str).collect();
+        let fragment = self.ops.expand(sym, &refs)?;
+        let toks = crate::token::tokenize(&fragment).map_err(|e| {
+            Error::Parse {
+                pos: self.cur_byte(),
+                msg: format!(":{sym}: expanded to text that does not lex: {e}"),
+            }
+        })?;
+        let mut sub = Parser::new(&fragment, toks);
+        sub.ops = self.ops.clone();
+        sub.op_depth = self.op_depth + 1;
+        sub.host_aggs = self.host_aggs.clone();
+        sub.window_aggs = self.window_aggs.clone();
+        sub.style = self.style;
+        sub.next_question = self.next_question;
+        sub.max_params = self.max_params;
+        let e = sub.expr().map_err(|err| Error::Parse {
+            pos: self.cur_byte(),
+            msg: format!(":{sym}: expanded to `{fragment}`, which does not parse: {err}"),
+        })?;
+        if sub.pos != sub.toks.len() {
+            return Err(Error::Parse {
+                pos: self.cur_byte(),
+                msg: format!(
+                    ":{sym}: expanded to `{fragment}`, which has trailing tokens                      after the expression"
+                ),
+            });
+        }
+        // Parameter numbering flows back so the statement's count is right.
+        self.style = sub.style;
+        self.next_question = sub.next_question;
+        self.max_params = self.max_params.max(sub.max_params);
+        Ok(e)
     }
 
     fn err_here(&self, msg: impl Into<String>) -> Error {

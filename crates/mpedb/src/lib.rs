@@ -59,6 +59,7 @@ mod sqlite_attach;
 mod ddl_apply;
 mod sqlite_overlay;
 pub mod advisor;
+pub mod opdef;
 pub mod spellfn;
 pub mod model;
 pub mod stats;
@@ -1105,6 +1106,7 @@ impl Database {
         // cost inputs (stage M2).
         let mut udfs = self.host_udf_set();
         udfs.spells = self.load_spell_fns(&r)?;
+        udfs.ops = self.load_ops(&r)?;
         let out = mpedb_sql::prepare_maybe_explain_with_views(
             sql,
             &bundle,
@@ -1198,6 +1200,7 @@ impl Database {
         };
         let mut udfs = self.host_udf_set();
         udfs.spells = self.load_spell_fns(&r)?;
+        udfs.ops = self.load_ops(&r)?;
         let out = mpedb_sql::prepare_maybe_explain_with_views(
             sql,
             schema,

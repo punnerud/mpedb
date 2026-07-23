@@ -85,7 +85,7 @@ fn a_spell_is_indistinguishable_from_the_sql_it_mirrors() {
     let h = d.prepare("SELECT affine(a) FROM t WHERE id = $1").unwrap();
     let d2 = Database::open_from_file(std::path::Path::new(&path)).unwrap();
     let got = rows(d2.execute(&h, &[Value::Int(7)]).unwrap());
-    assert_eq!(got, vec![vec![Value::Int((7 * 3 - 20) * 2 + 1)]]);
+    assert_eq!(got, vec![vec![Value::Int(3)]]); // (7*3-20)*2+1
 
     // Wrong arity is a bind refusal naming the arity.
     let e = d.query("SELECT affine(1, 2)", &[]).unwrap_err();

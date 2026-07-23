@@ -276,6 +276,54 @@ impl SpellFnSet {
     }
 }
 
+/// The custom-operator catalog visible to this compile (stage M3,
+/// SQL-EXTENSIONS.md): symbol → fixity bits, plus the EXPANDER — a callback
+/// the facade backs with the operator's stored PySpell macro. The parser
+/// consults fixity to know WHERE a `:sym:` token parses, captures the operand
+/// SOURCE TEXT, and splices the expansion's parse in place; the binder then
+/// binds the expansion like any hand-written expression, so a macro cannot
+/// smuggle anything past a refusal.
+/// The macro callback: `(symbol, operand source texts) → SQL fragment`.
+pub type OpExpander = std::sync::Arc<dyn Fn(&str, &[&str]) -> Result<String> + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub struct OpSet {
+    /// `(symbol, fixity)`; fixity bits: 2 = takes a LEFT operand, 1 = RIGHT.
+    /// So 3 = infix, 2 = postfix, 1 = prefix, 0 = niladic.
+    defs: Vec<(String, u8)>,
+    expander: Option<OpExpander>,
+}
+
+impl std::fmt::Debug for OpSet {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OpSet").field("defs", &self.defs).finish_non_exhaustive()
+    }
+}
+
+impl OpSet {
+    pub fn insert(&mut self, symbol: String, fixity: u8) {
+        self.defs.retain(|(s, _)| s != &symbol);
+        self.defs.push((symbol, fixity));
+    }
+    pub fn set_expander(&mut self, f: OpExpander) {
+        self.expander = Some(f);
+    }
+    pub fn is_empty(&self) -> bool {
+        self.defs.is_empty()
+    }
+    pub(crate) fn fixity(&self, symbol: &str) -> Option<u8> {
+        self.defs.iter().find(|(s, _)| s == symbol).map(|(_, f)| *f)
+    }
+    pub(crate) fn expand(&self, symbol: &str, operands: &[&str]) -> Result<String> {
+        let f = self.expander.as_ref().ok_or_else(|| {
+            Error::Unsupported(format!(
+                "operator :{symbol}: cannot expand in this context (no catalog)"
+            ))
+        })?;
+        f(symbol, operands)
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct HostUdfSet {
     fns: Vec<(String, i32)>,
@@ -284,6 +332,9 @@ pub struct HostUdfSet {
     /// already threaded to every binder; a stored function is one more
     /// namespace in that resolution order (native → stored → host).
     pub spells: SpellFnSet,
+    /// Custom operators ([`OpSet`]) — same reasoning: the parser needs their
+    /// fixity and the expander, and this struct already reaches it.
+    pub ops: OpSet,
     aggs: Vec<(String, i32)>,
     /// HOST collating-sequence names (`sqlite3_create_collation`). Names only:
     /// a collation has no arity, and the comparator itself never leaves the

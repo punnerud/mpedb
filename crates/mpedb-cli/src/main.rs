@@ -68,6 +68,8 @@ usage: mpedb <command> [args]
   fn define <target> <file.py|file.rs>     store a PySpell SQL function
   fn drop <target> <name>                  drop a stored function
   fn list <target>                         list stored functions
+  op define <target> <sym> <fixity> <f.py> define a custom :sym: operator
+  op drop|list|install-model <target> ...  manage custom operators
   call    <target> <hash> [param ...]      execute a prepared plan by hash
   proc    define|call|list ...              stored procedures (see `proc`)
   repl    <target>                          interactive session (stdin)
@@ -150,6 +152,7 @@ fn dispatch(argv: &[String]) -> CliResult {
         "advise" => cmd_advise(rest),
         "model" => cmd_model(rest),
         "fn" => cmd_fn(rest),
+        "op" => cmd_op(rest),
         "call" => cmd_call(rest),
         "proc" => proc_cmd::run(rest),
         "queue" => queue::run(rest),
@@ -293,6 +296,71 @@ fn cmd_fn(args: &[String]) -> CliResult {
             Ok(())
         }
         _ => usage("fn needs: define <target> <file.py|rs> | drop <target> <name> | list <target>"),
+    }
+}
+
+/// `mpedb op define <target> <sym> <infix|postfix|prefix|niladic> <file.py|rs> [doc]
+/// | drop <target> <sym> | list <target> | install-model <target>` — custom
+/// `:sym:` operators (stage M3, SQL-EXTENSIONS.md).
+fn cmd_op(args: &[String]) -> CliResult {
+    use mpedb::opdef::OpFixity;
+    use mpedb::spellfn::SpellLang;
+    let fixity_of = |s: &str| -> Result<OpFixity, Failure> {
+        Ok(match s {
+            "infix" | "11" => OpFixity::Infix,
+            "postfix" | "10" => OpFixity::Postfix,
+            "prefix" | "01" => OpFixity::Prefix,
+            "niladic" | "00" => OpFixity::Niladic,
+            other => {
+                return Err(Failure::Usage(format!(
+                    "unknown fixity `{other}` — infix (11), postfix (10), prefix (01), niladic (00)"
+                )))
+            }
+        })
+    };
+    match args {
+        [sub, config, sym, fixity, file, doc @ ..] if sub == "define" => {
+            let fixity = fixity_of(fixity)?;
+            let lang = if file.ends_with(".rs") { SpellLang::Rust } else { SpellLang::Python };
+            let src = std::fs::read_to_string(file)
+                .map_err(|e| Failure::Runtime(format!("reading {file}: {e}")))?;
+            let db = crate::util::open_target(config)?;
+            let hash = db.create_operator(sym, fixity, lang, &src, &doc.join(" "))?;
+            println!("operator :{sym}: ({}) stored as {hash}", fixity.name());
+            Ok(())
+        }
+        [sub, config, sym] if sub == "drop" => {
+            let db = crate::util::open_target(config)?;
+            if db.drop_operator(sym)? {
+                println!("operator :{sym}: dropped");
+            } else {
+                println!("no operator :{sym}:");
+            }
+            Ok(())
+        }
+        [sub, config] if sub == "list" => {
+            let db = crate::util::open_target(config)?;
+            let ops = db.list_operators()?;
+            if ops.is_empty() {
+                println!("no custom operators — see SQL-EXTENSIONS.md");
+            }
+            for o in ops {
+                println!(":{}:  {:<8} {}  {}", o.symbol, o.fixity.name(), &o.spell_hash_hex[..12], o.doc);
+            }
+            Ok(())
+        }
+        [sub, config] if sub == "install-model" => {
+            let db = crate::util::open_target(config)?;
+            let installed = db.install_model_operators()?;
+            println!(
+                "installed from the model: {}",
+                installed.iter().map(|s| format!(":{s}:")).collect::<Vec<_>>().join(", ")
+            );
+            Ok(())
+        }
+        _ => usage(
+            "op needs: define <target> <sym> <fixity> <file.py|rs> [doc] | drop <target> <sym>              | list <target> | install-model <target>",
+        ),
     }
 }
 

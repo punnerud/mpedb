@@ -46,6 +46,13 @@ pub(crate) enum Tok {
     /// `->>` — sqlite's JSON operator returning the selected node as a SQL
     /// value. Lexed BEFORE `->`; see the `-` arm of the scanner.
     ArrowText,
+    /// `:sym:` — a USER-DEFINED operator (stage M3, SQL-EXTENSIONS.md),
+    /// self-delimited by colons so it lexes in one scan with no maximal-munch
+    /// interaction with anything (`:` begins nothing else in this grammar —
+    /// mpedb's parameters are `$n`/`?`, never `:name`). Carries the symbol
+    /// between the colons; the PARSER decides what it means from the operator
+    /// catalog, and an undefined one refuses by name there.
+    CustomOp(String),
     Star,
     Slash,
     Percent,
@@ -239,6 +246,32 @@ pub(crate) fn tokenize(sql: &str) -> Result<Vec<SpTok>> {
             // `-` also opens the two JSON operators. `->>` MUST be tested
             // before `->`, or `a ->> '$.x'` lexes as `a -> (> '$.x')` and the
             // SQL-text form silently becomes the JSON-text one.
+            b':' => {
+                // `:sym:` — scan to the closing colon. Bounded and strict:
+                // an unterminated or empty or whitespace-carrying symbol is a
+                // lex error naming the doc, never a silent reinterpretation.
+                let mut j = i + 1;
+                while j < b.len() && b[j] != b':' && j - i <= 17 {
+                    if b[j].is_ascii_whitespace() {
+                        return Err(perr(
+                            start,
+                            "`:` begins a custom operator (`:sym:`), which cannot                              contain whitespace — see SQL-EXTENSIONS.md",
+                        ));
+                    }
+                    j += 1;
+                }
+                if j >= b.len() || b[j] != b':' || j == i + 1 {
+                    return Err(perr(
+                        start,
+                        "`:` begins a custom operator and needs a closing `:`                          (`:sym:`, at most 16 characters) — see SQL-EXTENSIONS.md",
+                    ));
+                }
+                let sym = std::str::from_utf8(&b[i + 1..j])
+                    .map_err(|_| perr(start, "custom operator symbol is not UTF-8"))?
+                    .to_string();
+                i = j + 1;
+                Tok::CustomOp(sym)
+            }
             b'-' => match (b.get(i + 1), b.get(i + 2)) {
                 // `-- …` is a line comment ANYWHERE in the statement, not only
                 // at the front: it runs to the next newline (or end of input).

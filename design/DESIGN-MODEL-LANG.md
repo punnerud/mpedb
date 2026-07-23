@@ -104,6 +104,11 @@ The model is the noun the operator sugar refers to.
   exists for the cost/analyze layer.
 - **`mpedb advise <target> --model <file|stored>`.**
 
+**M3 landed 2026-07-23: `:sym:` custom operators** (SQL-EXTENSIONS.md) — the
+role declarations became load-bearing: `mpedb op install-model` derives `:->:`
+from `role = "edge"` + a two-column traverse declaration and `:~:` from
+`role = "embedding"` + knn. The model is the noun; the operator is the verb.
+
 **M2 landed 2026-07-23: stored SQL functions.** `Database::create_function` /
 `mpedb fn define` compiles a PySpell body (full procedure subset — loops) to
 content-hashed IR in the sys-keyspace (`func/` name bindings + `funch/`
