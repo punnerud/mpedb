@@ -36,9 +36,16 @@ cell within ±5 % — SQLite, PostgreSQL and Turso are the control group and the
 did not move — with ONE exception: mpedb's **point-select rose 12 % on Linux
 (437k → 490k) and 56 % on the M3 (1.26M → 1.98M ops/s)** while the same three
 control engines held flat on the same hosts, so it is an engine change and not
-machine state. It is **not attributed** to a specific commit here: a bisect over
-the 07-21…07-23 window is what would earn that claim, and this page does not
-make claims it has not measured.
+machine state. **Bisected** (M3, `git bisect run`, quick-mode point-select as the
+predicate): the jump is `7fb0d53` *"perf: :memory: fast path, PreparedSelect,
+private in-place writes"* — 1.74M ops/s at its parent, 2.28M at it, the rest
+of the window flat and HEAD at 2.42M. It landed 2026-07-21 at 17:39, hours
+AFTER that day's RESULTS were generated (at `4926536`), which is why the gain
+shows up now: today's re-run is simply the first measurement taken after it.
+The benchmark harness was NOT touched by that commit (its adapter still calls
+`execute(hash)`, not the new `PreparedSelect` API), so the gain is engine-side
+— the plan-cache and parameter-resolution work on the `execute` path, not a
+changed measurement.
 
 **Routing is measured separately** — real San Francisco road durations, the
 kernel's exact `(subset, last)` mode as ground truth vs the original MPEE

@@ -38,8 +38,9 @@ per-probe execution cost (the same one the OLAP bench measured against SQLite).
 
 ## Results
 
-Milliseconds; cold = first run after load, warm = median of 5. Third run,
-2026-07-23, after the depth sweep found and closed two holes (below). Note on
+Milliseconds; cold = first run after load, warm = median of 5. Fourth run,
+2026-07-23, after covering index reads (`8eeec0d`, below) — the depth sweep's
+two holes were closed in the third. Note on
 Neo4j's columns: by this run its JVM had been serving benchmarks for a while,
 so its cold numbers are far better than a fresh process shows (the first-ever
 run measured 151 ms cold for `degree`; a warm JVM answers the same cold query
@@ -47,16 +48,16 @@ in 3).
 
 | workload | mpedb cold | mpedb warm | neo4j cold | neo4j warm | warm verdict |
 |---|---:|---:|---:|---:|---|
-| `degree` | 4.9 | 2.6 | 3.0 | 1.6 | neo4j 1.7× |
-| `hop2` | 23.0 | 7.6 | 6.5 | 3.7 | neo4j 2.0× |
-| `hop3` | 39.5 | 25.1 | 39.6 | 15.1 | neo4j 1.7× |
-| `reach4` | 113.7 | 95.2 | 69.2 | 27.9 | neo4j 3.4× |
-| `reach5` | 223.9 | 168.7 | 86.5 | 36.7 | neo4j 4.6× |
-| `reach6` | 237.8 | 188.0 | 84.5 | 38.3 | neo4j 4.9× |
-| `reach7` | 240.7 | 184.2 | 87.0 | 39.5 | neo4j 4.7× |
-| `reach8` | 243.1 | 185.2 | 88.0 | 38.7 | neo4j 4.8× |
-| `tri-hub` | 36.4 | 10.8 | 3.6 | 1.9 | neo4j 5.6× |
-| `tri-global` | 1449.1 | 1401.3 | 344.0 | 301.1 | neo4j 4.7× |
+| `degree` | 2.3 | **1.0** | 1.0 | 1.1 | **mpedb 1.1×** |
+| `hop2` | 14.6 | 6.0 | 5.1 | 3.0 | neo4j 2.0× |
+| `hop3` | 26.6 | 14.2 | 23.5 | 11.7 | neo4j 1.2× |
+| `reach4` | 70.1 | 56.7 | 74.1 | 24.1 | neo4j 2.3× |
+| `reach5` | 151.6 | 103.7 | 92.6 | 36.3 | neo4j 2.9× |
+| `reach6` | 163.3 | 111.5 | 88.1 | 38.5 | neo4j 2.9× |
+| `reach7` | 161.2 | 106.8 | 88.4 | 38.5 | neo4j 2.8× |
+| `reach8` | 165.7 | 112.9 | 88.0 | 38.3 | neo4j 2.9× |
+| `tri-hub` | 28.1 | 8.6 | 2.7 | 1.4 | neo4j 6.0× |
+| `tri-global` | 1087.2 | 1059.7 | 355.2 | 314.4 | neo4j 3.4× |
 
 ## The two holes the sweep found, and their fixes
 
@@ -111,11 +112,44 @@ bounded recursions (`risk.rs`, `tests/risk_depth_guard.rs`) — and the
 converged-frontier execution optimization above. They share one function, so
 they can never disagree about what "provably bounded" means.
 
-**Re-verified 2026-07-23** (mpedb `944ca6b`, Neo4j 5.26, same M3): every cell
-lands within a few percent of the table above on BOTH sides — mpedb warm
-`reach8` 185.2 → 198.0 ms against Neo4j's 38.7 → 39.3, `tri-global` 1401 → 1440
-against 301 → 316 — so the ratios and the hop-3 crossover are unchanged, and
-every row still agrees.
+## What moved the numbers: covering index reads (`8eeec0d`)
+
+The table above is the **fourth** run, and the first after the frontier stopped
+paying for a lookup it did not need. A secondary-index entry already carries
+its indexed columns (in the key) and the row's primary key; when those are ALL
+of the table's columns — exactly the `(id PK, src, dst)` edge table under its
+`(src, dst)` composite — the row can be rebuilt from the entry, and the
+per-row descent into the PK tree disappears. The planner's index choosers gain
+one tie-break (same pinned prefix → the covering index wins); the engine
+decodes the row from the entry and never fetches. Nothing else changed: same
+plans otherwise, same access paths, same membership, same answers, and the
+full 621-file sqllogictest corpus is byte-identical to the run before it.
+
+What that bought, against the third run's numbers:
+
+| workload | warm before | warm after | vs Neo4j before → after |
+|---|---:|---:|---|
+| `degree` | 2.6 | **1.0** | neo4j 1.7× → **mpedb 1.1× faster** |
+| `hop3` | 25.1 | 14.2 | neo4j 1.7× → 1.2× |
+| `reach4` | 95.2 | 56.7 | neo4j 3.4× → 2.3× |
+| `reach8` | 185.2 | 112.9 | neo4j 4.8× → 2.9× |
+| `tri-global` | 1401.3 | 1059.7 | neo4j 4.7× → 3.4× |
+
+The recursive frontier is where it lands hardest, because that workload IS a
+per-produced-row index probe: 250k rows expanded, 250k PK descents, all of them
+now gone. `tri-hub` is unmoved (8.6 vs 10.8, run noise) — its inner probe pins
+BOTH composite columns, so it was already a point lookup that fetched one row.
+
+**The remaining gap is not the fetch.** At `reach8` mpedb is 2.9× behind native
+adjacency, and the residual is per-row executor cost — a `Vec<Value>` per
+produced row, an expression program per projection, a dedup key encoded per
+row — against Neo4j dereferencing a pointer. That is the same per-probe
+constant the OLAP page brackets against SQLite, measured from a third side.
+
+**Re-verified 2026-07-23** (mpedb `944ca6b`, before the covering change): every
+cell landed within a few percent of the third run on BOTH sides — mpedb warm
+`reach8` 185.2 → 198.0 ms against Neo4j's 38.7 → 39.3 — so the improvement
+above is the code, not the weather.
 
 ## The operator arm: the sugar is free, and it locks the fast shape
 
