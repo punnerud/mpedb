@@ -439,6 +439,20 @@ pub(crate) trait TxnCtx {
         Ok(None)
     }
 
+    /// Selectivity-priced index range: `Ok(None)` = this context has no such
+    /// path (or the shape declines) and the caller runs the plain range scan.
+    /// Only the pinned-snapshot read context answers.
+    fn scan_by_index_range_adaptive(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<Option<Vec<Vec<Value>>>> {
+        let _ = (table, index_no, lo, hi);
+        Ok(None)
+    }
+
     /// [`fold_rows_column`](Self::fold_rows_column) with a PREDICATE: decode
     /// `need` (the filter's columns plus the aggregate's, from
     /// `ExprProgram::read_columns`) into one reused buffer, evaluate the
@@ -851,6 +865,16 @@ impl TxnCtx for ReadCtx<'_, '_> {
     ) -> Result<Option<Vec<Value>>> {
         self.0.index_boundary_row(table, index_no, max)
     }
+    fn scan_by_index_range_adaptive(
+        &mut self,
+        table: u32,
+        index_no: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<Option<Vec<Vec<Value>>>> {
+        self.0.scan_by_index_range_adaptive(table, index_no, lo, hi)
+    }
+
     fn fold_rows_column(
         &mut self,
         table: u32,
