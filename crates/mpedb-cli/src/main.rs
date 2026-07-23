@@ -70,7 +70,12 @@ usage: mpedb <command> [args]
   fn list <target>                         list stored functions
   op define <target> <sym> <fixity> <f.py> define a custom :sym: operator
   op drop|list|install-model <target> ...  manage custom operators
-  tune set <target> name=value | show      stored cost-calculator switches
+  tune set <target> name=value | show      stored engine switches (ndv_discount,
+                                           recursive_triggers) — coherent everywhere
+  trigger backtest <target> <name|SQL> [n]  replay a trigger (stored, or a full
+                                           CREATE TRIGGER dry-run) over current
+                                           rows, ALWAYS rolled back: what would
+                                           it have done? | trigger list <target>
   cost-policy set <target> <f.py> | drop   the programmable cost adjustment
   stats <target>                           what the engine believes (rows/NDV)
   call    <target> <hash> [param ...]      execute a prepared plan by hash
@@ -157,6 +162,7 @@ fn dispatch(argv: &[String]) -> CliResult {
         "fn" => cmd_fn(rest),
         "op" => cmd_op(rest),
         "tune" => cmd_tune(rest),
+        "trigger" => cmd_trigger(rest),
         "cost-policy" => cmd_cost_policy(rest),
         "stats" => cmd_stats(rest),
         "call" => cmd_call(rest),
@@ -313,16 +319,55 @@ fn cmd_tune(args: &[String]) -> CliResult {
         [sub, config, assignment] if sub == "set" => {
             let db = crate::util::open_target(config)?;
             let t = db.set_tunable(assignment)?;
-            println!("tunables: ndv_discount={}", t.ndv_discount);
+            println!(
+                "tunables: ndv_discount={} recursive_triggers={}",
+                t.ndv_discount, t.recursive_triggers
+            );
             Ok(())
         }
         [sub, config] if sub == "show" => {
             let db = crate::util::open_target(config)?;
             let t = db.tunables()?;
             println!("ndv_discount={}", t.ndv_discount);
+            println!("recursive_triggers={}", t.recursive_triggers);
             Ok(())
         }
         _ => usage("tune needs: set <target> name=value | show <target>"),
+    }
+}
+
+/// `mpedb trigger backtest <target> <name|CREATE TRIGGER …> [limit]` — replay
+/// a trigger (stored, or a not-yet-created CREATE TRIGGER statement) against
+/// the current rows in an always-rolled-back transaction and report what it
+/// would have done; `list` shows the stored triggers.
+fn cmd_trigger(args: &[String]) -> CliResult {
+    match args {
+        [sub, config, what, rest @ ..] if sub == "backtest" && rest.len() <= 1 => {
+            let limit = match rest {
+                [l] => l
+                    .parse::<u64>()
+                    .map_err(|_| Failure::Runtime(format!("limit must be a number, got `{l}`")))?,
+                _ => 0,
+            };
+            let db = crate::util::open_target(config)?;
+            let report = db.backtest_trigger(what, limit)?;
+            println!("{report}");
+            Ok(())
+        }
+        [sub, config] if sub == "list" => {
+            let db = crate::util::open_target(config)?;
+            let trgs = db.list_triggers()?;
+            if trgs.is_empty() {
+                println!("no triggers");
+            }
+            for (name, table, sql) in trgs {
+                println!("{name} ON {table}: {sql}");
+            }
+            Ok(())
+        }
+        _ => usage(
+            "trigger needs: backtest <target> <name|'CREATE TRIGGER …'> [limit] | list <target>",
+        ),
     }
 }
 

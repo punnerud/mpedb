@@ -326,6 +326,11 @@ pub(crate) struct TriggerSet {
     pub after_insert: HashMap<u32, Vec<CompiledTrigger>>,
     pub after_update: HashMap<u32, Vec<CompiledTrigger>>,
     pub after_delete: HashMap<u32, Vec<CompiledTrigger>>,
+    /// The `recursive_triggers` tunable at build time (gen-gated with the
+    /// rest, so `tune set` flips it coherently everywhere): OFF = a trigger
+    /// that is already ACTIVE in this cascade is not re-entered (sqlite's
+    /// default), ON = full recursion under the depth cap + work meter.
+    pub recursive: bool,
 }
 
 impl TriggerSet {
@@ -339,6 +344,7 @@ impl TriggerSet {
             after_insert: HashMap::new(),
             after_update: HashMap::new(),
             after_delete: HashMap::new(),
+            recursive: false,
         }
     }
 }
@@ -392,6 +398,59 @@ fn build_stored_body(
     }
 }
 
+/// Resolve a parsed `CREATE TRIGGER` spec against `schema` into the storable
+/// record, compile-checking everything checkable at define time: the target
+/// table, `UPDATE OF` column names, the body (SQL compiles; a procedure
+/// resolves + arity-checks + pins by hash), and the `WHEN` predicate. Shared
+/// by the autocommit and in-txn DDL routes and by the backtest's dry-run.
+pub(crate) fn build_stored_trigger(
+    spec: &mpedb_sql::CreateTriggerSpec,
+    schema: &mpedb_types::Schema,
+    load_proc_blob: &mut dyn FnMut(&str) -> Result<Option<Vec<u8>>>,
+) -> Result<StoredTrigger> {
+    let table_id = schema
+        .table_id(&spec.table)
+        .ok_or_else(|| Error::Bind(format!("CREATE TRIGGER: no such table `{}`", spec.table)))?;
+    let table = schema.table(table_id).expect("table_id resolved");
+    let timing = match spec.timing {
+        mpedb_sql::TriggerTiming::Before => TrgTiming::Before,
+        mpedb_sql::TriggerTiming::After => TrgTiming::After,
+    };
+    // Map the event, derive `NEW`/`OLD` availability (DESIGN-TRIGGERS §1),
+    // and resolve any `UPDATE OF <cols>` names to column indices — a define-
+    // time error if a named column does not exist.
+    let (event, allow_new, allow_old, update_of) = match &spec.event {
+        mpedb_sql::TriggerEvent::Insert => (TrgEvent::Insert, true, false, Vec::new()),
+        mpedb_sql::TriggerEvent::Update { of } => {
+            let mut cols = Vec::with_capacity(of.len());
+            for name in of {
+                let idx = table.column_index(name).ok_or_else(|| {
+                    Error::Bind(format!(
+                        "CREATE TRIGGER: UPDATE OF: no such column `{name}` on table `{}`",
+                        spec.table
+                    ))
+                })?;
+                cols.push(idx);
+            }
+            (TrgEvent::Update, true, true, cols)
+        }
+        mpedb_sql::TriggerEvent::Delete => (TrgEvent::Delete, false, true, Vec::new()),
+    };
+    let body = build_stored_body(&spec.body, table, schema, allow_new, allow_old, load_proc_blob)?;
+    if let Some(when_src) = &spec.when_src {
+        let _ = mpedb_sql::compile_trigger_when(when_src, table, allow_new, allow_old)?;
+    }
+    Ok(StoredTrigger {
+        name: spec.name.clone(),
+        table_id,
+        timing,
+        event,
+        update_of,
+        when_src: spec.when_src.clone(),
+        body,
+    })
+}
+
 impl Database {
     /// Scan `trigger/*`, decode each record, compile the fireable ones against
     /// the live schema. Skips triggers whose target table was dropped (their
@@ -404,43 +463,14 @@ impl Database {
         let scan = r.sys_scan_range(TRIGGER_PREFIX, TRIGGER_PREFIX_END);
         r.finish()?;
         let mut set = TriggerSet::empty();
+        set.recursive = self.tunables()?.recursive_triggers;
         for (subkey, value) in scan? {
             if !subkey.starts_with(TRIGGER_PREFIX) {
                 continue;
             }
             let st = StoredTrigger::decode(&value)?;
-            // Row-binding availability by event (DESIGN-TRIGGERS §1).
-            let (allow_new, allow_old) = match st.event {
-                TrgEvent::Insert => (true, false),
-                TrgEvent::Update => (true, true),
-                TrgEvent::Delete => (false, true),
-            };
-            let table = match schema.table(st.table_id) {
-                Some(t) if !t.dead => t,
-                _ => continue, // target dropped: orphan record, never fires
-            };
-            let body = match &st.body {
-                StoredBody::Sql(sql) => TriggerBody::Sql(mpedb_sql::compile_trigger_body(
-                    sql, table, schema, allow_new, allow_old,
-                )?),
-                StoredBody::Proc { name, hash, arg_srcs } => {
-                    let mut args = Vec::with_capacity(arg_srcs.len());
-                    for src in arg_srcs {
-                        args.push(mpedb_sql::compile_trigger_arg(
-                            src, table, allow_new, allow_old,
-                        )?);
-                    }
-                    TriggerBody::Spell(SpellTriggerBody {
-                        args,
-                        ready: self.resolve_spell_body(name, hash),
-                    })
-                }
-            };
-            let when = match &st.when_src {
-                Some(src) => Some(mpedb_sql::compile_trigger_when(
-                    src, table, allow_new, allow_old,
-                )?),
-                None => None,
+            let Some(compiled) = self.compile_stored_trigger(&st, schema)? else {
+                continue; // target dropped: orphan record, never fires
             };
             // The (timing, event) bucket this trigger fires from.
             let bucket = match (st.timing, st.event) {
@@ -451,12 +481,7 @@ impl Database {
                 (TrgTiming::After, TrgEvent::Update) => &mut set.after_update,
                 (TrgTiming::After, TrgEvent::Delete) => &mut set.after_delete,
             };
-            bucket.entry(st.table_id).or_default().push(CompiledTrigger {
-                name: st.name,
-                body,
-                update_of: st.update_of,
-                when,
-            });
+            bucket.entry(st.table_id).or_default().push(compiled);
         }
         // Stable, deterministic fire order per table. Creation order is not
         // tracked in v1, so name order stands in for it (documented).
@@ -473,6 +498,55 @@ impl Database {
             }
         }
         Ok(set)
+    }
+
+    /// Compile one stored trigger against the live schema into its fireable
+    /// form. `None` when the target table was dropped (an orphan record —
+    /// harmless, never fires). Shared by the catalog build and the backtest.
+    pub(crate) fn compile_stored_trigger(
+        &self,
+        st: &StoredTrigger,
+        schema: &mpedb_types::Schema,
+    ) -> Result<Option<CompiledTrigger>> {
+        // Row-binding availability by event (DESIGN-TRIGGERS §1).
+        let (allow_new, allow_old) = match st.event {
+            TrgEvent::Insert => (true, false),
+            TrgEvent::Update => (true, true),
+            TrgEvent::Delete => (false, true),
+        };
+        let table = match schema.table(st.table_id) {
+            Some(t) if !t.dead => t,
+            _ => return Ok(None),
+        };
+        let body = match &st.body {
+            StoredBody::Sql(sql) => TriggerBody::Sql(mpedb_sql::compile_trigger_body(
+                sql, table, schema, allow_new, allow_old,
+            )?),
+            StoredBody::Proc { name, hash, arg_srcs } => {
+                let mut args = Vec::with_capacity(arg_srcs.len());
+                for src in arg_srcs {
+                    args.push(mpedb_sql::compile_trigger_arg(
+                        src, table, allow_new, allow_old,
+                    )?);
+                }
+                TriggerBody::Spell(SpellTriggerBody {
+                    args,
+                    ready: self.resolve_spell_body(name, hash),
+                })
+            }
+        };
+        let when = match &st.when_src {
+            Some(src) => Some(mpedb_sql::compile_trigger_when(
+                src, table, allow_new, allow_old,
+            )?),
+            None => None,
+        };
+        Ok(Some(CompiledTrigger {
+            name: st.name.clone(),
+            body,
+            update_of: st.update_of.clone(),
+            when,
+        }))
     }
 
     /// Resolve an `EXECUTE PROCEDURE` body to fire-readiness: load the PINNED
@@ -628,52 +702,11 @@ impl Database {
     ) -> Result<ExecResult> {
         self.engine.refresh_schema_if_stale()?;
         let bundle = self.engine.schema();
-        let table_id = bundle.schema.table_id(&spec.table).ok_or_else(|| {
-            Error::Bind(format!("CREATE TRIGGER: no such table `{}`", spec.table))
+        // Compile-check at define time so a broken trigger is rejected at
+        // CREATE, not discovered at fire time (DESIGN-TRIGGERS §3.1).
+        let record = build_stored_trigger(&spec, &bundle.schema, &mut |name| {
+            self.sys_record_get(crate::NS_PROC, name.as_bytes())
         })?;
-        let table = bundle.schema.table(table_id).expect("table_id resolved");
-
-        // Timing: BEFORE and AFTER both fire (DESIGN-TRIGGERS stage 3). `NEW`
-        // stays read-only either way (no mutation syntax), so BEFORE runs its
-        // DML body before the row mutation but cannot rewrite the row.
-        let timing = match spec.timing {
-            mpedb_sql::TriggerTiming::Before => TrgTiming::Before,
-            mpedb_sql::TriggerTiming::After => TrgTiming::After,
-        };
-        // Map the event, derive `NEW`/`OLD` availability (DESIGN-TRIGGERS §1),
-        // and resolve any `UPDATE OF <cols>` names to column indices — a define-
-        // time error if a named column does not exist.
-        let (event, allow_new, allow_old, update_of) = match &spec.event {
-            mpedb_sql::TriggerEvent::Insert => (TrgEvent::Insert, true, false, Vec::new()),
-            mpedb_sql::TriggerEvent::Update { of } => {
-                let mut cols = Vec::with_capacity(of.len());
-                for name in of {
-                    let idx = table.column_index(name).ok_or_else(|| {
-                        Error::Bind(format!(
-                            "CREATE TRIGGER: UPDATE OF: no such column `{name}` on table `{}`",
-                            spec.table
-                        ))
-                    })?;
-                    cols.push(idx);
-                }
-                (TrgEvent::Update, true, true, cols)
-            }
-            mpedb_sql::TriggerEvent::Delete => (TrgEvent::Delete, false, true, Vec::new()),
-        };
-
-        // Compile-check at define time so a broken trigger is rejected at CREATE,
-        // not discovered at fire time (DESIGN-TRIGGERS §3.1).
-        let stored_body = build_stored_body(
-            &spec.body,
-            table,
-            &bundle.schema,
-            allow_new,
-            allow_old,
-            &mut |name| self.sys_record_get(crate::NS_PROC, name.as_bytes()),
-        )?;
-        if let Some(when_src) = &spec.when_src {
-            let _ = mpedb_sql::compile_trigger_when(when_src, table, allow_new, allow_old)?;
-        }
 
         let key = trigger_key(&spec.name);
         let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
@@ -687,16 +720,7 @@ impl Database {
                 spec.name
             )));
         }
-        let record = StoredTrigger {
-            name: spec.name.clone(),
-            table_id,
-            timing,
-            event,
-            update_of,
-            when_src: spec.when_src.clone(),
-            body: stored_body,
-        }
-        .encode();
+        let record = record.encode();
         let res = (|| {
             w.sys_put(&key, &record)?;
             w.bump_schema_gen();
@@ -751,43 +775,9 @@ pub(crate) fn create_trigger_on_txn(
     spec: mpedb_sql::CreateTriggerSpec,
 ) -> Result<()> {
     let bundle = w.schema_bundle();
-    let table_id = bundle.schema.table_id(&spec.table).ok_or_else(|| {
-        Error::Bind(format!("CREATE TRIGGER: no such table `{}`", spec.table))
-    })?;
-    let table = bundle
-        .schema
-        .table(table_id)
-        .expect("table_id resolved")
-        .clone();
-
-    let timing = match spec.timing {
-        mpedb_sql::TriggerTiming::Before => TrgTiming::Before,
-        mpedb_sql::TriggerTiming::After => TrgTiming::After,
-    };
-    let (event, allow_new, allow_old, update_of) = match &spec.event {
-        mpedb_sql::TriggerEvent::Insert => (TrgEvent::Insert, true, false, Vec::new()),
-        mpedb_sql::TriggerEvent::Update { of } => {
-            let mut cols = Vec::with_capacity(of.len());
-            for name in of {
-                let idx = table.column_index(name).ok_or_else(|| {
-                    Error::Bind(format!(
-                        "CREATE TRIGGER: UPDATE OF: no such column `{name}` on table `{}`",
-                        spec.table
-                    ))
-                })?;
-                cols.push(idx);
-            }
-            (TrgEvent::Update, true, true, cols)
-        }
-        mpedb_sql::TriggerEvent::Delete => (TrgEvent::Delete, false, true, Vec::new()),
-    };
-
-    let stored_body = build_stored_body(
-        &spec.body,
-        &table,
+    let record = build_stored_trigger(
+        &spec,
         &bundle.schema,
-        allow_new,
-        allow_old,
         // Resolve the procedure through THIS txn, so a procedure defined
         // earlier in the same uncommitted transaction is visible.
         &mut |name| {
@@ -795,9 +785,6 @@ pub(crate) fn create_trigger_on_txn(
             w.sys_get(&k)
         },
     )?;
-    if let Some(when_src) = &spec.when_src {
-        let _ = mpedb_sql::compile_trigger_when(when_src, &table, allow_new, allow_old)?;
-    }
     // Silence unused: db is available for future cache hooks; schema_gen bump
     // invalidates the trigger cache on commit.
     let _ = db;
@@ -812,16 +799,7 @@ pub(crate) fn create_trigger_on_txn(
             spec.name
         )));
     }
-    let record = StoredTrigger {
-        name: spec.name.clone(),
-        table_id,
-        timing,
-        event,
-        update_of,
-        when_src: spec.when_src.clone(),
-        body: stored_body,
-    }
-    .encode();
+    let record = record.encode();
     w.sys_put(&key, &record)?;
     w.bump_schema_gen();
     Ok(())
