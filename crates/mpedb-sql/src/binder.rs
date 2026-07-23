@@ -2465,6 +2465,12 @@ impl<'a> Binder<'a> {
             "time" => ScalarFn::Time,
             "datetime" => ScalarFn::DateTime,
             "julianday" => ScalarFn::JulianDay,
+            // Vector distance over f32-LE blob embeddings (stage D,
+            // design/DESIGN-MPEE-GENERAL.md). No sqlite counterpart — the
+            // differential oracle has nothing to say here, so the runtime's
+            // own shape refusals are the specification.
+            "vec_l2" => ScalarFn::VecL2,
+            "vec_cosine" => ScalarFn::VecCosine,
             // Math (sqlite 3.45). `log` is base-10 with one argument and
             // log-base-b with two, so it dispatches on the argument count here —
             // `log10`/`log2` name the fixed-base forms directly.
@@ -2578,6 +2584,8 @@ impl<'a> Binder<'a> {
             // they are checked below rather than pinned to one.
             ScalarFn::Abs | ScalarFn::Round | ScalarFn::Ceil | ScalarFn::Floor
             | ScalarFn::Trunc => (&[], None),
+            // Checked below (blob-or-any per argument, Float64 out).
+            ScalarFn::VecL2 | ScalarFn::VecCosine => (&[], Some(ColumnType::Float64)),
             ScalarFn::Substr => (
                 &[Some(ColumnType::Text), Some(ColumnType::Int64), Some(ColumnType::Int64)],
                 Some(ColumnType::Text),
@@ -2722,6 +2730,24 @@ impl<'a> Binder<'a> {
                         return Err(bind_err(format!("{name}() expects a number, got {other}")))
                     }
                 }
+            }
+            // Both arguments must be blobs (or dynamically typed); anything
+            // else is refused at COMPILE time. The runtime still owns the
+            // shape rules the type system cannot see (f32 alignment, equal
+            // dimensionality).
+            ScalarFn::VecL2 | ScalarFn::VecCosine => {
+                for (i, arg) in out.iter().enumerate().take(2) {
+                    match self.static_type(arg) {
+                        Some(ColumnType::Blob) | Some(ColumnType::Any) | None => {}
+                        Some(other) => {
+                            return Err(bind_err(format!(
+                                "{name}() argument {} must be a blob embedding, got {other}",
+                                i + 1
+                            )))
+                        }
+                    }
+                }
+                Some(ColumnType::Float64)
             }
             // hex accepts text or blob (like the runtime); reject anything else
             // at COMPILE time rather than at the first row.
