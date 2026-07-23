@@ -342,6 +342,36 @@ durations) — measured optimality, which only an exact ground truth can grant �
 while exact answers in 0.2–42 ms against the heuristic's 0.6–2.3 s. The
 crossover rule falls out: N ≤ 18 solve exactly, N > 18 heuristic, knowingly.
 
+## 9.3 The cost layer, stored (stage M5, SHIPPED 2026-07-23)
+
+The plan drafted a `[mpee]` config section; what shipped is strictly better on
+the axis that matters, and answers the user's requirement directly ("cost
+analysis and adjustment must not be locked to config"): **the whole cost layer
+is stored state in the file**, coherent across processes by construction and
+schema-gen-gated so every change re-prepares everywhere.
+
+- **Tunables** (`mpedb tune set ndv_discount=false`): named switches on the
+  calculator, v1 shipping the stage-A NDV channel. Proven by the star flip
+  moving on BOTH handles when either sets it.
+- **The cost-policy spell** (`mpedb cost-policy set policy.py`): a stored
+  PySpell `def policy(kind, table, index_no, bucket, rows_bucket, archetype)`
+  running at prepare inside the CostSource seam — statistics AND the model's
+  level-0 claim in, the bucket to use out. Programmable adjustment with the
+  same determinism as a switch: stored, content-hashed, budgeted, identical
+  in every process. A policy that cannot run fails the prepare by name (a
+  probe call per compile); a per-input error degrades that one decision to
+  no-discount, deterministically.
+- **The read side** (`mpedb stats`): rows, buckets, NDV/analyze state per
+  index — what the engine believes, as API + CLI. (SQL-queryable `mpedb_stats`
+  waits for the synthetic-table seam with `mpedb_operators`.)
+
+One real bug fell out and is worth the ink: stats records were guarded by the
+schema GENERATION, and the generation also bumps for every cost-layer change —
+so setting a tunable killed every NDV record until the next analyze. The guard
+is now an index-identity FINGERPRINT (table name ‖ column names, the #118
+names-not-ordinals rule in miniature): stats survive unrelated changes and die
+exactly when `(table_id, index_no)` could mean a different index.
+
 ## 10. What failure looks like (so we notice)
 
 - A CostSource input that moves a plan hash on unchanged data — violates rule 2;

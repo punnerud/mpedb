@@ -59,6 +59,7 @@ mod sqlite_attach;
 mod ddl_apply;
 mod sqlite_overlay;
 pub mod advisor;
+pub mod costlayer;
 pub mod opdef;
 pub mod spellfn;
 pub mod model;
@@ -1091,14 +1092,56 @@ impl Database {
         // statement; `execute(hash, params)` never comes near it.
         let r = self.engine.begin_read()?;
         let bundle = self.schema();
+        // Stage M5: the stored cost layer — tunables, the policy spell, and
+        // the model's archetype — read off the SAME snapshot as every other
+        // cost input, so all attached processes price identically.
+        let tune = self.tunables()?;
+        let policy = self.load_cost_policy(&r)?;
+        if let Some(p) = &policy {
+            // The probe: a policy that cannot even run fails the PREPARE with
+            // its own name. Per-input errors after this degrade that one
+            // decision to no-discount — deterministically, since every
+            // process runs the same spell on the same inputs.
+            costlayer::apply_policy(p, "probe", "", 0, 1, 1, "")?;
+        }
+        let archetype: String = self
+            .model()?
+            .and_then(|m| m.archetype)
+            .map(|a| a.name().to_string())
+            .unwrap_or_default();
+        let schema_for_cost = bundle.clone();
         let cost = mpedb_sql::CostSource {
             row_count: &|tid| r.row_count(tid).unwrap_or(0),
-            // Stage A (DESIGN-MPEE-GENERAL): the per-index NDV bucket from the
-            // last analyze() pass, read off the SAME snapshot as the row
-            // counts. Absent/stale records read as None, which prices exactly
-            // as before the pass existed.
+            // Stage A's per-index NDV bucket, now behind the M5 layer: the
+            // `ndv_discount` tunable can switch the channel off, and the
+            // policy spell — if one is stored — adjusts every bucket it sees.
             index_ndv_bucket: &|tid, ixno| {
-                ndv_bucket_from(&r, bundle.schema_gen, tid, ixno)
+                if !tune.ndv_discount {
+                    return None;
+                }
+                let base = ndv_bucket_from(&r, &bundle.schema, tid, ixno)?;
+                match &policy {
+                    None => Some(base),
+                    Some(p) => {
+                        let table = schema_for_cost
+                            .schema
+                            .tables
+                            .get(tid as usize)
+                            .map(|t| t.name.as_str())
+                            .unwrap_or("");
+                        let rows_bucket = stats::bucket(r.row_count(tid).unwrap_or(0));
+                        // Per-input errors degrade THIS decision to
+                        // no-discount — deterministically (same spell, same
+                        // inputs, every process); the probe above already
+                        // failed the prepare for a policy that cannot run.
+                        match costlayer::apply_policy(
+                            p, "ndv", table, ixno, base, rows_bucket, &archetype,
+                        ) {
+                            Ok(b) => (b > 0).then_some(b),
+                            Err(_) => None,
+                        }
+                    }
+                }
             },
         };
         // The function catalogs for this compile: connection-local host UDFs
@@ -1194,9 +1237,42 @@ impl Database {
         // which is what keeps an in-session compile and an ordinary compile of
         // the same SQL landing on the same plan hash.
         let r = self.engine.begin_read()?;
+        let tune = self.tunables()?;
+        let policy = self.load_cost_policy(&r)?;
+        if let Some(p) = &policy {
+            costlayer::apply_policy(p, "probe", "", 0, 1, 1, "")?;
+        }
+        let archetype: String = self
+            .model()?
+            .and_then(|m| m.archetype)
+            .map(|a| a.name().to_string())
+            .unwrap_or_default();
         let cost = mpedb_sql::CostSource {
             row_count: &|tid| r.row_count(tid).unwrap_or(0),
-            index_ndv_bucket: &|tid, ixno| ndv_bucket_from(&r, schema.schema_gen, tid, ixno),
+            index_ndv_bucket: &|tid, ixno| {
+                if !tune.ndv_discount {
+                    return None;
+                }
+                let base = ndv_bucket_from(&r, &schema.schema, tid, ixno)?;
+                match &policy {
+                    None => Some(base),
+                    Some(p) => {
+                        let table = schema
+                            .schema
+                            .tables
+                            .get(tid as usize)
+                            .map(|t| t.name.as_str())
+                            .unwrap_or("");
+                        let rows_bucket = stats::bucket(r.row_count(tid).unwrap_or(0));
+                        match costlayer::apply_policy(
+                            p, "ndv", table, ixno, base, rows_bucket, &archetype,
+                        ) {
+                            Ok(b) => (b > 0).then_some(b),
+                            Err(_) => None,
+                        }
+                    }
+                }
+            },
         };
         let mut udfs = self.host_udf_set();
         udfs.spells = self.load_spell_fns(&r)?;
@@ -2240,15 +2316,25 @@ fn check_sys_ns(ns: &str) -> Result<()> {
 /// sys-keyspace get on the compile's own snapshot. Every failure mode
 /// (no record, stale generation, corrupt bytes) is `None`: a stats record is
 /// advisory, and a prepare must never fail because of one.
-fn ndv_bucket_from(
+pub(crate) fn ndv_bucket_from(
     r: &mpedb_core::engine::ReadTxn<'_>,
-    schema_gen: u64,
+    schema: &Schema,
     table_id: u32,
     index_no: u32,
 ) -> Option<u32> {
+    // The record is pinned to the index's IDENTITY (names), not the schema
+    // generation — see stats.rs's module doc for the bug the difference fixed.
+    let t = schema.tables.iter().find(|t| t.id == table_id && !t.dead)?;
+    let ix = t.indexes.get((index_no.checked_sub(1)?) as usize)?;
+    let cols: Vec<&str> = ix
+        .columns
+        .iter()
+        .filter_map(|&c| t.columns.get(c as usize).map(|col| col.name.as_str()))
+        .collect();
+    let fp = stats::index_fingerprint(&t.name, &cols);
     let subkey = sys_record_subkey(stats::NS, &stats::record_key(table_id, index_no)).ok()?;
     let bytes = r.sys_get(&subkey).ok().flatten()?;
-    let ndv = stats::decode_record(&bytes, schema_gen)?;
+    let ndv = stats::decode_record(&bytes, &fp)?;
     (ndv > 0).then(|| stats::bucket(ndv))
 }
 
