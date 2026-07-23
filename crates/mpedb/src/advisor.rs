@@ -32,6 +32,10 @@ pub enum WorkloadSource {
     /// An explicit statement list (an offline log, a migration's queries…),
     /// compiled against the CURRENT live schema.
     Statements(Vec<String>),
+    /// A workload model (design/DESIGN-MODEL-LANG.md): level-1 shapes are
+    /// synthesized into the statement forms this extraction understands, and
+    /// level-2 statements pass through — each carrying its declared weight.
+    Model(mpedb_types::model::WorkloadModel),
 }
 
 /// One recommended index.
@@ -86,15 +90,20 @@ impl crate::Database {
         // candidate key = (table id, key ordinals) → (count, example sql)
         let mut cands: BTreeMap<(u32, Vec<u16>), (u64, String)> = BTreeMap::new();
 
-        let mut fold_plan = |sql: &str, plan: &CompiledPlan, rep: &mut AdviceReport| {
+        // `weight` is the statement's declared execution count (1 unless a
+        // model says otherwise) — candidates accumulate weights, not lines.
+        let mut fold_plan = |sql: &str, plan: &CompiledPlan, weight: u64, rep: &mut AdviceReport| {
             rep.compiled += 1;
             match &plan.stmt {
                 PlanStmt::Select(sp) => {
-                    fold_select(schema, plan, sp, sql, &mut cands, rep);
+                    fold_select(schema, plan, sp, sql, weight, &mut cands, rep);
                 }
                 PlanStmt::Update { table, access, filter, .. }
                 | PlanStmt::Delete { table, access, filter, .. } => {
-                    fold_shape(schema, plan, *table, access, filter.as_ref(), &[], sql, &mut cands, rep);
+                    fold_shape(
+                        schema, plan, *table, access, filter.as_ref(), &[], sql, weight,
+                        &mut cands, rep,
+                    );
                 }
                 _ => rep.skipped_shape += 1,
             }
@@ -117,7 +126,7 @@ impl crate::Database {
                     // before a DDL simply fails validation and is skipped —
                     // stale advice is worse than less advice.
                     match CompiledPlan::decode(rec.blob, schema) {
-                        Ok(plan) => fold_plan(rec.sql, &plan, &mut rep),
+                        Ok(plan) => fold_plan(rec.sql, &plan, 1, &mut rep),
                         Err(_) => rep.uncompilable += 1,
                     }
                 }
@@ -125,7 +134,15 @@ impl crate::Database {
             WorkloadSource::Statements(stmts) => {
                 for sql in &stmts {
                     match mpedb_sql::prepare(sql, schema) {
-                        Ok(plan) => fold_plan(sql, &plan, &mut rep),
+                        Ok(plan) => fold_plan(sql, &plan, 1, &mut rep),
+                        Err(_) => rep.uncompilable += 1,
+                    }
+                }
+            }
+            WorkloadSource::Model(model) => {
+                for st in crate::model::synthesize_statements(&model, schema) {
+                    match mpedb_sql::prepare(&st.sql, schema) {
+                        Ok(plan) => fold_plan(&st.sql, &plan, st.weight, &mut rep),
                         Err(_) => rep.uncompilable += 1,
                     }
                 }
@@ -188,6 +205,7 @@ fn fold_select(
     plan: &CompiledPlan,
     sp: &SelectPlan,
     sql: &str,
+    weight: u64,
     cands: &mut BTreeMap<(u32, Vec<u16>), (u64, String)>,
     rep: &mut AdviceReport,
 ) {
@@ -201,7 +219,9 @@ fn fold_select(
     } else {
         Vec::new()
     };
-    fold_shape(schema, plan, sp.table, &sp.access, sp.filter.as_ref(), &order, sql, cands, rep);
+    fold_shape(
+        schema, plan, sp.table, &sp.access, sp.filter.as_ref(), &order, sql, weight, cands, rep,
+    );
 }
 
 /// The census's `fold`, engine-side: access-pinned columns + residual
@@ -215,6 +235,7 @@ fn fold_shape(
     filter: Option<&ExprProgram>,
     order: &[u16],
     sql: &str,
+    weight: u64,
     cands: &mut BTreeMap<(u32, Vec<u16>), (u64, String)>,
     rep: &mut AdviceReport,
 ) {
@@ -310,7 +331,7 @@ fn fold_shape(
     }
 
     let entry = cands.entry((table, key)).or_insert_with(|| (0, sql.to_string()));
-    entry.0 += 1;
+    entry.0 += weight.max(1);
 }
 
 /// The §2.2 identity: names + collation, never ordinals, never statistics.

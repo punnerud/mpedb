@@ -1,0 +1,74 @@
+# The olapbench workload (BENCHMARKS-OLAP.md), as a model. This file IS the
+# claim "this application is a star schema" made machine-readable — the same
+# information the bench encodes in Rust, at the resolution a Django model has.
+
+[model]
+name = "star-olap"
+archetype = "star-olap"
+description = "2M-row fact joined to four dimensions; scan-aggregate reads, batch loads"
+
+[[model.table]]
+name = "fact"
+role = "fact"
+read_write = "read-heavy"
+
+  [[model.table.access]]
+  kind = "join-key"
+  columns = ["product_id"]
+  weight = 1.0
+
+  [[model.table.access]]
+  kind = "join-key"
+  columns = ["customer_id"]
+  weight = 1.0
+
+  [[model.table.access]]
+  kind = "join-key"
+  columns = ["day_id"]
+  weight = 0.6
+
+  [[model.table.access]]
+  kind = "join-key"
+  columns = ["store_id"]
+  weight = 0.6
+
+  [[model.table.access]]
+  kind = "filter-range"
+  columns = ["amount"]
+  weight = 0.4
+
+[[model.table]]
+name = "product"
+role = "dimension"
+
+  [[model.table.access]]
+  kind = "filter-eq"
+  columns = ["category"]
+  weight = 1.0
+
+[[model.table]]
+name = "store"
+role = "dimension"
+
+  [[model.table.access]]
+  kind = "filter-eq"
+  columns = ["nation"]
+  weight = 0.5
+
+[[model.table]]
+name = "day"
+role = "dimension"
+
+  [[model.table.access]]
+  kind = "filter-eq"
+  columns = ["year"]
+  weight = 0.5
+
+[[model.table]]
+name = "customer"
+role = "dimension"
+
+  [[model.table.access]]
+  kind = "filter-eq"
+  columns = ["nation_segment"]
+  weight = 0.3

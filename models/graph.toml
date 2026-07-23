@@ -1,0 +1,22 @@
+# The graphbench workload (BENCHMARKS-GRAPH.md) as a model: one edge table,
+# walked from the source side, closed via (src, dst).
+
+[model]
+name = "graph"
+archetype = "graph-traversal"
+description = "250k directed edges, hub-skewed; k-hop expansion, bounded reachability, triangles"
+
+[[model.table]]
+name = "edge"
+role = "edge"
+read_write = "read-heavy"
+
+  [[model.table.access]]
+  kind = "traverse"
+  columns = ["src"]
+  weight = 1.0
+
+  [[model.table.access]]
+  kind = "filter-eq"
+  columns = ["src", "dst"]
+  weight = 0.4

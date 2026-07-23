@@ -1,0 +1,9 @@
+# The vaguest useful model — the exact example the language exists for:
+# "this is ordinary sqlite3 usage, not a graph database." Nothing else is
+# claimed, and that is still information: no traversal machinery, no vector
+# statistics, index advice from the registry rather than declared shapes.
+
+[model]
+name = "sqlite3-general"
+archetype = "sqlite3-general"
+description = "ordinary embedded sqlite3-style usage; the workload is whatever the plan registry accumulates"
