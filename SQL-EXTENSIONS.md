@@ -50,10 +50,33 @@ sugar and expansion produce **identical plan hashes**.
 | `10` | postfix | `a :op:` | `def m(left):` |
 | `01` | prefix | `:op: a` | `def m(right):` |
 | `00` | niladic | `:op:` | `def m():` |
+| `100` | statement | `:op: <anything…>` | `def m(rest):` |
 
-Operators sit at comparison precedence, apply once (no chaining —
+Expression operators sit at comparison precedence, apply once (no chaining —
 parenthesize), and expansion nests at most 8 levels (a self-expanding
 operator refuses deterministically).
+
+**The statement bit (`100`) is a language front.** A statement operator must
+be the FIRST token; its macro receives the ENTIRE remaining source as one raw
+string and returns a complete statement. In principle you define one
+`:graph:` operator and build your own graph language behind it — and because
+the expansion re-enters the same pipeline, that language's output may itself
+use further `:op:` forms:
+
+```python
+def graphlang(rest):
+    if rest == "count":
+        return "SELECT count(*) FROM edge"
+    return "SELECT id FROM orders WHERE id :->: (" + rest + ") ORDER BY id"
+```
+
+```sql
+:graph: count        -- the language's own vocabulary
+:graph: 3            -- expands THROUGH the inner :->: operator
+```
+
+A statement operator in expression position refuses by name, and an
+expression operator cannot begin a statement — the two spaces stay disjoint.
 
 ### The founding example
 

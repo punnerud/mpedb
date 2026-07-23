@@ -131,33 +131,88 @@ pub(crate) fn parse_statement_ctes(
     p.host_aggs = host_aggs.to_vec();
     p.window_aggs = window_aggs.to_vec();
     p.ops = ops.clone();
-    let is_explain = if p.eat_kw(Kw::Explain) {
-        if p.peek_kw(Kw::Explain) {
-            return Err(p.err_here("EXPLAIN cannot be nested"));
+    p.statement_tail()
+}
+
+impl<'a> Parser<'a> {
+    /// The whole statement pipeline after catalog setup: EXPLAIN, statement
+    /// operators, WITH RECURSIVE, CTE prefix, the statement itself. A method
+    /// (not a free function) so a STATEMENT OPERATOR's expansion re-enters it
+    /// on a sub-parser with the same catalogs and a bumped depth.
+    fn statement_tail(&mut self) -> Result<(Stmt, bool, u16, CteDefs)> {
+    let is_explain = if self.eat_kw(Kw::Explain) {
+        if self.peek_kw(Kw::Explain) {
+            return Err(self.err_here("EXPLAIN cannot be nested"));
         }
         true
     } else {
         false
     };
+    // A STATEMENT operator (fixity bit 4, SQL-EXTENSIONS.md): `:graph: <rest>`
+    // swallows the remainder of the source as ONE raw operand and its macro
+    // returns a complete statement — a user-defined sub-LANGUAGE fronting SQL.
+    // The expansion re-enters this same pipeline (operator catalog included,
+    // depth-capped), so a language's output may itself use `:op:` forms.
+    if let Some(Tok::CustomOp(sym)) = self.peek().cloned() {
+        let fixity = self.op_fixity(&sym)?;
+        if fixity != 4 {
+            return Err(self.err_here(format!(
+                ":{sym}: is an expression operator and cannot begin a statement —                  see SQL-EXTENSIONS.md"
+            )));
+        }
+        self.pos += 1;
+        let rest = self.src[self.cur_byte()..].trim();
+        // Consume the raw tail: the macro owns its own syntax from here.
+        self.pos = self.toks.len();
+        let fragment = self.ops.expand(&sym, &[rest])?;
+        if self.op_depth >= 8 {
+            return Err(Error::Parse {
+                pos: 0,
+                msg: format!(":{sym}: statement expansion is nested more than 8 levels deep"),
+            });
+        }
+        let toks = crate::token::tokenize(&fragment).map_err(|e| Error::Parse {
+            pos: 0,
+            msg: format!(":{sym}: expanded to text that does not lex: {e}"),
+        })?;
+        let mut sub = Parser::new(&fragment, toks);
+        sub.ops = self.ops.clone();
+        sub.op_depth = self.op_depth + 1;
+        sub.host_aggs = self.host_aggs.clone();
+        sub.window_aggs = self.window_aggs.clone();
+        sub.style = self.style;
+        sub.next_question = self.next_question;
+        sub.max_params = self.max_params;
+        let (stmt, inner_explain, _n, ctes) = sub.statement_tail().map_err(|e| Error::Parse {
+            pos: 0,
+            msg: format!(":{sym}: expanded to a statement that does not parse: {e}"),
+        })?;
+        self.next_question = sub.next_question;
+        self.max_params = self.max_params.max(sub.max_params);
+        let n_params = self.n_params()?;
+        return Ok((stmt, is_explain || inner_explain, n_params, ctes));
+    }
     // `WITH RECURSIVE …` is a wholly different mechanism from a non-recursive
     // `WITH` (a fixpoint, not bind-time flattening), so it is parsed here into a
     // single `Stmt::RecursiveCte` rather than a `(name, body)` CTE list.
-    let is_recursive_with = matches!(p.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("WITH"))
-        && matches!(p.peek_at(1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("RECURSIVE"));
+    let is_recursive_with = matches!(self.peek(), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("WITH"))
+        && matches!(self.peek_at(1), Some(Tok::Ident(w)) if w.eq_ignore_ascii_case("RECURSIVE"));
     if is_recursive_with {
-        let stmt = p.recursive_cte_stmt()?;
-        p.eat(&Tok::Semicolon);
-        p.expect_eof()?;
-        let n_params = p.n_params()?;
+        let stmt = self.recursive_cte_stmt()?;
+        self.eat(&Tok::Semicolon);
+        self.expect_eof()?;
+        let n_params = self.n_params()?;
         return Ok((stmt, is_explain, n_params, Vec::new()));
     }
-    let ctes = p.with_prefix()?;
-    let stmt = p.statement()?;
-    p.eat(&Tok::Semicolon);
-    p.expect_eof()?;
-    let n_params = p.n_params()?;
+    let ctes = self.with_prefix()?;
+    let stmt = self.statement()?;
+    self.eat(&Tok::Semicolon);
+    self.expect_eof()?;
+    let n_params = self.n_params()?;
     Ok((stmt, is_explain, n_params, ctes))
+    }
 }
+
 
 /// Parse exactly one expression (used for CHECK constraints). Returns the
 /// expression and the number of parameters referenced.
