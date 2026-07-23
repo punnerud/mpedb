@@ -234,7 +234,108 @@ warnings`) before the next; measured results are appended to this doc per stage.
   counts everything it skipped — no silent caps. Auto-create stays blocked on
   P2/P3/P5, restated not built.
 
-## 8. What failure looks like (so we notice)
+## 8. The probe path: batch descent and the MPEE split (stages B–D's residual)
+
+After stages A–D every measured gap is the same number wearing three costumes:
+a **constant per-probe factor** — SQLite brackets it at 1.7–2.1× on star
+joins, Neo4j at 1.7–4.9× on traversals, and the exact kNN scan pays it per
+row. One residual, three benches; work on it pays in all three columns at
+once. Two moves, in order:
+
+1. **Batch descent (sorted-run probing), serial first.** An index nested loop
+   probes the inner tree once per outer row, in outer order — random descents.
+   Sorting each morsel's probe keys first makes consecutive descents share
+   their upper-tree path (the leaf-locality argument B+trees exist for), and
+   an entire sorted run can be resolved in one leaf walk when keys are dense.
+   No concurrency, no snapshot questions — measurable on `join-star-*`,
+   `reach-k` (each fixpoint level is a batch of probes by construction: the
+   frontier IS a sorted-deduped key set), and `tri-global`, before any
+   parallelism is spent.
+
+2. **The MPEE split: morsel-parallel probing.** Original MPEE never hands a
+   worker "half the stops" — it streams work in morsels against one shared
+   cost oracle. mpedb already has exactly this machinery for order-independent
+   folds: DESIGN-PARALLEL-READ §8's adaptive morsel scheduler (a scan that
+   proves long at run time splits its REMAINING key range across workers on
+   the same snapshot — same answer, engaged only when worth it). The
+   generalization is to let a morsel carry **probe work, not just scan work**:
+   partition the outer rows, each worker runs batch descent against the shared
+   snapshot, results merge under the same order restored discipline the
+   parallel fold already has. Candidates, cheapest first:
+   - **parallel exact kNN** — embarrassingly parallel (per-worker abandoning
+     heap over a key sub-range, merge k best at the end; the bound even
+     TIGHTENS during merge). The adaptive scheduler fits unchanged;
+   - **parallel fixpoint levels** — each reach-k level's frontier expansion is
+     an independent batch of probes;
+   - **parallel join morsels** — the general case, and the one that needs the
+     most care with the work meter (#74 charges must stay deterministic:
+     charge per morsel result, merge in morsel order — the discipline
+     par_fold already established).
+
+   The kill-switch rule applies as everywhere: serial remains the semantics of
+   record, parallel must produce bit-identical results, and the scheduler
+   engages only past a proven-long threshold.
+
+## 9. The generic solver, and benchmarking against the original MPEE
+
+The ask this section answers: one solving engine for OLAP, OLTP, vector and
+graph workloads, built on the streaming-N×N discipline, with **everything —
+memory, time, quantities — as cost dimensions fed to the kernel**.
+
+### 9.1 What "generic" already means here, measured
+
+The kernel's three contracts (§3) now have measured consumers in every domain
+this document set out to cover:
+
+| contract | join order | count/agg | graph | vector | index synthesis |
+|---|---|---|---|---|---|
+| monotone dimensions | worst_log lower bounds (§9.5 solver) | — | depth guard ⇒ frontier bound | partial-distance abandonment, 2.9× | additive coverage counts |
+| streaming purchase | UNBOUGHT ping-pong (1 probe on a 17-chain) | — | — | heap bound tightens as bought | registry scanned, not sampled |
+| feasibility → O(1) probes | `known()` | NOT-NULL admission | guard proof, 2 consumers | shape checks before summing | served-by-prefix filter |
+
+The missing piece is not a new idea; it is **naming the dimensions**. Original
+MPEE declares `{name, transit, monotonicity}` accumulators (fuel, load, time)
+and prunes on their bounds. mpedb's equivalents exist but are implicit:
+*rows* (worst_log), *bytes* (the columnar argument, §5), *memory* (the
+morsel/heap budgets — `max_join_cells` is literally a memory dimension with a
+hard bound), *wall time* (the #74 work meter is its deterministic proxy),
+*recall* (the exact/approx axis vecbench measures). A future `CostSource`
+entry is one more accumulator with a monotonicity declaration — that is the
+whole registration contract, and §3's rules are its validity conditions.
+
+### 9.2 The honest benchmark against github.com/punnerud/mpee
+
+The two engines share contracts, not objectives: brooom minimizes an
+**additive pairwise** path cost with a metaheuristic (HGS/local search, 50k
+stops); mpedb's port minimizes a **lexicographic worst-case** join cost
+exactly (≤ 17 tables, subset DP whose step cost is order-independent given
+the placed SET — deliberately a *stronger* property than routing's, which
+needs last-element state). Running either on the other's native objective
+unmodified would be the category error the vector bench refused.
+
+The honest shared instance class is **path sequencing with additive pairwise
+cost** (open TSP), and the honest frame is the one vecbench established:
+**exact as ground truth, heuristic scored by gap and time.**
+
+- mpedb's kernel grows a `(subset, last)` DP mode — Held-Karp, exact to
+  N ≈ 20, the natural extension of the existing subset DP (`mpee.rs` already
+  owns the placed-set recursion; the mode adds last-element state and an
+  additive step cost read through the same CostSource seam).
+- brooom runs CPU-only (`--no-default-features` — verified to build clean,
+  17 s on the dev box) on the same instances, deadline-matched.
+- Small N (10–20): exact optimum known ⇒ brooom's **gap-to-optimum** and
+  time-to-within-x% are measurable, not guessed. Large N (1k–50k): exact
+  declines honestly; brooom's regime, reported as such — the crossover chart
+  is the deliverable, exactly like the vector bench's exact/approx pair.
+- Purchase counts on both sides: brooom's streamed matrix entries vs the
+  kernel's bought cost inputs — the streaming-N×N discipline compared as a
+  NUMBER (fraction of the N×N matrix ever materialized), which is the claim
+  both engines actually share.
+
+Not built in this stage; the design is here so the harness
+(`crates/mpedb-seqbench`, the vecbench pattern) starts from a settled frame.
+
+## 10. What failure looks like (so we notice)
 
 - A CostSource input that moves a plan hash on unchanged data — violates rule 2;
   the regression is a flapping hash in the registry, and the existing
