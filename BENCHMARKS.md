@@ -30,6 +30,14 @@ both on the same volume. Attribution: existing MPEE-aligned path (content-hashed
 `execute(hash)`, streaming LIMIT / `scan_rows_capped` per DESIGN-MPEE-OPT). Full
 tables in the RESULTS file above.
 
+**Vector search is measured separately**, exact against Qdrant's approximate
+HNSW with recall@10 scored against mpedb's own ground truth:
+[BENCHMARKS-VECTOR.md](BENCHMARKS-VECTOR.md). Unfiltered, the vector index
+wins the expected trade (3.6 ms @ 0.992 vs 17.9 @ 1.000 exact); **filtered,
+the result inverts 13×** — predicate-first exact search beats the graph
+traversal fighting its filter. Early abandonment bought 2.9× with answers
+bit-identical.
+
 **Graph workloads are measured separately**, against Neo4j 5.26 with an edge
 table and recursive CTEs — no graph machinery at all:
 [BENCHMARKS-GRAPH.md](BENCHMARKS-GRAPH.md). The crossover is at hop 3: the edge

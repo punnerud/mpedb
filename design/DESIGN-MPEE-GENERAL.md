@@ -204,17 +204,26 @@ warnings`) before the next; measured results are appended to this doc per stage.
   3.0 → 1.5 ms. The residual 10.6× against SQLite is the per-leaf walk — both
   engines now count narrow trees; answering from interior-node subtree counts
   would be a page-format change and is deliberately not planned.
-- **C — graph vs Neo4j.** **SHIPPED + MEASURED 2026-07-23 (`600ece0`,
-  [BENCHMARKS-GRAPH.md](../BENCHMARKS-GRAPH.md)):** six workloads, all
-  same-answer. The crossover is at hop 3 — the edge table wins ≤ 2 probes deep
-  (degree 1.3×, hop2 1.9×), the native adjacency representation wins beyond
-  (hop3 1.6×, reach4 4.1×, tri-global 13.4×). Same per-probe cost the OLAP
-  bench brackets against SQLite, measured from the other side. The risk fix
-  landed with all three proof-decline cases tested: no guard, and a guard on a
-  column carried unchanged, still price as the honest unbounded.
-- **D — vector: exact kNN + Qdrant.** BLOB f32 embeddings, `vec_l2`/`vec_cosine`
-  scalars with strict shape refusal, early-abandonment scan, MPEE-priced filter
-  placement (reusing A's NDV), recall@k reported next to latency.
+- **C — graph vs Neo4j.** **SHIPPED + MEASURED 2026-07-23** (`600ece0`, then
+  the depth sweep `a53d427`/`f0b842d`; [BENCHMARKS-GRAPH.md](../BENCHMARKS-GRAPH.md)).
+  The sweep found the hole: reach-k grew LINEARLY in k (UNION dedups
+  (node, depth) pairs → every level re-expanded the reached set; 833 ms at
+  k=8 vs Neo4j's flat 38). Closed by **converged-frontier dedup** — the
+  depth-guard proof reused as an execution optimization, one shared function
+  with the risk estimate, observability-gated and differentially pinned
+  against sqlite from both sides. After: 185 ms flat, every row a constant
+  1.7–4.9× per-probe factor. tri-global 3,993 → 1,401 via a (src,dst)
+  composite (#55 machinery, schema only). The §3 monotonicity contract now has
+  a THIRD consumer.
+- **D — vector: exact kNN + Qdrant.** **SHIPPED + MEASURED 2026-07-23**
+  (`03626bc`, [BENCHMARKS-VECTOR.md](../BENCHMARKS-VECTOR.md)). Early
+  abandonment bought **2.9×** (52.3 → 17.9 ms median on 100k × 128d), measured
+  as an in-binary A/B, answers bit-identical. Unfiltered: Qdrant HNSW 3.6 ms @
+  0.992 recall vs exact 17.9 @ 1.000 — the expected trade. **Filtered
+  (1/8 selectivity), the result inverts 13×**: filter-before-heap 5.6 ms exact
+  vs Qdrant's payload-filtered 75.2 — the pgvector post-filtering problem
+  LANDSCAPE.md described, now measured. `ORDER BY <expr> LIMIT k` needed no
+  new SQL surface (the sort-only column machinery already existed).
 - **E — #118 advisor, recommend-only.** `recommend_indexes(WorkloadSource)`
   as specified in WORKLOAD-INDEXES §4, costed through the A seam. Auto-create
   stays blocked on P2/P3/P5, restated not built.
