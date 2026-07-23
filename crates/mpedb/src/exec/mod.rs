@@ -439,6 +439,13 @@ pub(crate) trait TxnCtx {
         Ok(None)
     }
 
+    /// How many rows does this table hold? `Ok(None)` = this context cannot
+    /// say cheaply, and the caller must not depend on knowing.
+    fn row_count(&mut self, table: u32) -> Result<Option<u64>> {
+        let _ = table;
+        Ok(None)
+    }
+
     /// Selectivity-priced index range: `Ok(None)` = this context has no such
     /// path (or the shape declines) and the caller runs the plain range scan.
     /// Only the pinned-snapshot read context answers.
@@ -873,6 +880,10 @@ impl TxnCtx for ReadCtx<'_, '_> {
         hi: Option<(&[u8], bool)>,
     ) -> Result<Option<Vec<Vec<Value>>>> {
         self.0.scan_by_index_range_adaptive(table, index_no, lo, hi)
+    }
+
+    fn row_count(&mut self, table: u32) -> Result<Option<u64>> {
+        self.0.row_count(table).map(Some)
     }
 
     fn fold_rows_column(

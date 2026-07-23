@@ -1,4 +1,6 @@
 use super::*;
+use mpedb_types::Instr;
+use std::collections::HashMap;
 
 /// Live-cell accounting for a nested-loop join's materialized intermediate
 /// product (the #74 budget's memory-proportional twin, `[runtime]
@@ -23,6 +25,14 @@ pub(super) struct JoinCells {
 impl JoinCells {
     pub(super) fn new(budget: u64) -> JoinCells {
         JoinCells { budget, live: 0 }
+    }
+
+    /// Would charging `n` more cells stay inside the budget? Asked BEFORE
+    /// choosing to hold a side that the plan did not ask to be held: a
+    /// strategy switch must never turn a query that worked into a budget
+    /// error, so the switch declines instead.
+    pub(super) fn fits(&self, n: u64) -> bool {
+        self.budget == 0 || self.live.saturating_add(n) <= self.budget
     }
 
     /// Charge `n` newly held cells; [`Error::RuntimeBudget`] once the live
@@ -608,6 +618,56 @@ pub(super) fn gather_joined(
             })?;
             Some(h)
         };
+        // Filled by the strategy switch below when it hashes the inner side
+        // BEFORE narrowing (the key column may not survive the mask).
+        let mut prebuilt_hash: Option<HashProbe> = None;
+        // HASH-JOIN STRATEGY SWITCH (design/DESIGN-MPEE-GENERAL §9.4). The plan
+        // says index nested loop: one descent into the inner side per OUTER
+        // row. When the outer side is large that is the wrong trade — reading
+        // the inner ONCE and hashing it costs |inner| and then answers each
+        // outer row with a lookup. The planner cannot make this call (it does
+        // not know how many rows the outer side will actually produce); the
+        // executor does, because `acc` is already in its hands.
+        //
+        // Taken only where a full scan of the inner is EQUIVALENT to the
+        // per-row probe: the `ON` is exactly one column equality, the access
+        // is a single-part `IndexPoint` keyed by that outer column, and the
+        // index is a non-partial single-column index over the inner column the
+        // equality names — so the probe's row set is "inner.col = outer.col"
+        // and nothing else, which is precisely what the hash reproduces. The
+        // inner side's RLS policy rides along on the scan exactly as the held
+        // path already applies it.
+        let held = match &held {
+            Some(_) => held,
+            None if hash_switch_wins(ctx, schema, join, &join.on, acc_width, acc.len(), &cells)? => {
+                let mut rows = gather_rows(
+                    ctx,
+                    join.table,
+                    &AccessPath::FullScan,
+                    join.policy.as_ref(),
+                    plan,
+                    params,
+                    None,
+                )?;
+                // Built at FULL width and narrowed AFTER: the join key comes
+                // from the ACCESS path, so the #125 mask — which keeps what
+                // later stages read — is free to drop the very column the hash
+                // is built on. The keys are copied into the map first, so the
+                // held rows can then be narrowed exactly as the ordinary held
+                // side is, and the resident cost is the same as that path's.
+                let key_col = join_hash_key(schema, join, &join.on, acc_width).map(|(_, i)| i);
+                let map = key_col.map(|icol| build_hash_index(&rows, icol));
+                if let Some(p) = prune {
+                    narrow_rows(&mut rows, p.inner(ji))?;
+                }
+                cells.charge((rows.len() * inner_width) as u64, || {
+                    format!("hash join with \"{}\"", table_name(schema, join_tbl))
+                })?;
+                prebuilt_hash = map.map(|m| (join_hash_key(schema, join, &join.on, acc_width).expect("just built").0, m));
+                Some(rows)
+            }
+            None => None,
+        };
         // FULL: which held inner rows matched at least one outer row.
         // validate pinned FULL to a single, held (FullScan) join, so `held`
         // is always Some when this is.
@@ -616,12 +676,35 @@ pub(super) fn gather_joined(
         } else {
             None
         };
+        // HASH JOIN over the HELD inner side. A held inner is read once and
+        // then paired against EVERY outer row — O(n·m) `ON` evaluations. When
+        // the `ON` IS a plain column equality, the same answer comes from
+        // hashing the inner side once on its key and probing per outer row.
+        //
+        // Answer-preserving by construction, not by argument: the `ON` still
+        // runs on every candidate the probe yields, so 3VL, raises and any
+        // residual stay exactly as they were — the hash only skips candidates
+        // the equality would have rejected, and a rejected equality can never
+        // make the `ON` TRUE (`FALSE AND …` and `NULL AND …` are both
+        // not-TRUE). NULL keys are in no bucket and probe nothing, which is
+        // what `x = y` means when either side is NULL. Bucket contents keep
+        // held order, so the surviving rows come out in the same order the
+        // linear scan produced them.
+        let hash_probe: Option<HashProbe> = match (&held, prebuilt_hash) {
+            (_, Some(h)) => Some(h),
+            (Some(rows), None) if rows.len() >= HASH_JOIN_MIN_HELD => {
+                join_hash_key(schema, join, &join.on, acc_width)
+                    .map(|(ocol, icol)| (ocol, build_hash_index(rows, icol)))
+            }
+            _ => None,
+        };
         let mut next = Vec::new();
         // One candidate buffer reused across the whole nested loop: a rejected
         // pair leaves it filled for the next `fill_joined_row`; a kept pair
         // `mem::take`s it (moved into `next`, no clone) and the next fill
         // reallocates. See `fill_joined_row`.
         let mut cand: Vec<Value> = Vec::new();
+        let mut probe_key: Vec<u8> = Vec::with_capacity(16);
         for a in &acc {
             let fetched;
             let candidates: &[Vec<Value>] = match &held {
@@ -631,8 +714,23 @@ pub(super) fn gather_joined(
                     &fetched
                 }
             };
+            // With a hash, only this outer row's bucket is considered.
+            let bucket: Option<&[usize]> = match &hash_probe {
+                Some((ocol, map)) => Some(match a.get(*ocol as usize) {
+                    Some(v) if !v.is_null() => {
+                        probe_key.clear();
+                        keycode::encode_group_value(&mut probe_key, v, Collation::Binary);
+                        map.get(&probe_key).map_or(&[][..], |b| b.as_slice())
+                    }
+                    _ => &[][..],
+                }),
+                None => None,
+            };
             let mut matched = false;
-            for (ci, i) in candidates.iter().enumerate() {
+            let n_cand = bucket.map_or(candidates.len(), |b| b.len());
+            for k in 0..n_cand {
+                let ci = bucket.map_or(k, |b| b[k]);
+                let i = &candidates[ci];
                 // #74: one work-row per inner candidate considered. This is the
                 // O(n·m) cost of a cross join — a held inner side is read once
                 // (charged m by the scan layer) but paired against every outer
@@ -1340,4 +1438,158 @@ fn cmp_order(
         // Bool/Timestamp against another class): peers, as before.
         None => Ordering::Equal,
     }
+}
+
+/// Below this many held inner rows the linear scan is already cheap and the
+/// hash build would be pure overhead. Deliberately low: the pairing cost the
+/// hash removes is O(outer × held), so it pays back almost immediately.
+const HASH_JOIN_MIN_HELD: usize = 8;
+
+/// The join key a hash probe would stand in for: `(outer column, inner column)`.
+///
+/// Two places carry it, and both are read. When the inner side has a usable
+/// index the planner PUSHES the equality into the access path
+/// (`PkPoint(id = fact.product_id)`) and the `ON` is left as the residual —
+/// that is the index-nested-loop shape. When it does not, the equality stays
+/// in the `ON` and the inner side is held. Either way the pair is the same
+/// fact about the join.
+///
+/// Declines on a non-`Binary` key column: the hash key is encoded `Binary`,
+/// and a folded comparison would put rows the operator calls equal into
+/// different buckets.
+fn join_hash_key(schema: &Schema, join: &Join, on: &ExprProgram, acc_width: usize) -> Option<(u16, u16)> {
+    let t = schema.table(join.table)?;
+    let plain = |c: u16| -> bool {
+        t.columns
+            .get(c as usize)
+            .is_some_and(|col| col.collation == Collation::Binary)
+    };
+    let from_access = match &join.access {
+        AccessPath::PkPoint(parts) => match (parts.as_slice(), t.primary_key.as_slice()) {
+            ([KeyPart::OuterCol(o)], [pk]) => Some((*o, *pk)),
+            _ => None,
+        },
+        AccessPath::IndexPoint { index_no, parts } if *index_no >= 1 => {
+            match (parts.as_slice(), t.indexes.get(*index_no as usize - 1)) {
+                // A COMPOSITE index probed on its first column alone returns
+                // "col0 = key, anything else" — which a hash on col0
+                // reproduces exactly, PROVIDED no row is missing from the
+                // index for want of a non-NULL suffix (index membership: a
+                // NULL in any indexed column means no entry at all). The
+                // planner only pins a prefix when the suffix is declared NOT
+                // NULL; this re-checks it rather than trusting it.
+                ([KeyPart::OuterCol(o)], Some(ix))
+                    if ix.predicate.is_none()
+                        && !ix.columns.is_empty()
+                        && ix.columns[1..].iter().all(|&c| {
+                            t.columns.get(c as usize).is_some_and(|col| !col.nullable)
+                        }) =>
+                {
+                    Some((*o, ix.columns[0]))
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    };
+    from_access
+        .or_else(|| equi_join_cols(on, acc_width))
+        .filter(|(_, icol)| plain(*icol))
+}
+
+/// The `(outer column, inner column)` an `ON` equates, when the whole `ON` IS
+/// one plain column equality — the shape a hash probe can stand in for.
+///
+/// Deliberately narrow. Only `[PushCol, PushCol, Eq]` qualifies: plain
+/// [`Instr::Eq`], never the collated (`CmpColl`) or typeless (`CmpClass`)
+/// comparison, because the hash key is encoded `Binary` and a folded or
+/// class-ordered comparison would bucket rows the operator considers equal
+/// into different buckets. Anything else returns `None` and the join stays a
+/// linear scan — the answer is the same either way, only the cost differs.
+///
+/// Column indices are over the joined tuple `[outer ‖ inner]`, so a slot below
+/// `acc_width` is the outer row's and one at or above it is the inner's; the
+/// two must land on opposite sides for the equality to be a JOIN key at all.
+fn equi_join_cols(on: &ExprProgram, acc_width: usize) -> Option<(u16, u16)> {
+    let [Instr::PushCol(p), Instr::PushCol(q), Instr::Eq] = on.instrs.as_slice() else {
+        return None;
+    };
+    let (p, q) = (*p as usize, *q as usize);
+    if p < acc_width && q >= acc_width {
+        Some((p as u16, (q - acc_width) as u16))
+    } else if q < acc_width && p >= acc_width {
+        Some((q as u16, (p - acc_width) as u16))
+    } else {
+        None
+    }
+}
+
+/// Is the outer side big enough that reading the inner ONCE and hashing it
+/// beats one index descent per outer row?
+///
+/// Measured (2-core Linux): an index probe carrying its row fetch costs
+/// ~0.7 µs, a scanned-and-hashed inner row ~0.3 µs to build and ~0.05 µs to
+/// probe — so the two are level near `inner = 2.2 × outer`, and the switch
+/// takes the conservative half of that. Below `HASH_SWITCH_MIN_OUTER` outer
+/// rows the nested loop is cheap in absolute terms and a full inner scan
+/// cannot pay for itself, so the plan keeps its path.
+///
+/// Declines whenever the full scan would not be EQUIVALENT to the probe (see
+/// the call site) or would not fit the join-cells budget — a strategy switch
+/// must never turn a query that worked into a budget error.
+fn hash_switch_wins(
+    ctx: &mut dyn TxnCtx,
+    schema: &Schema,
+    join: &Join,
+    on: &ExprProgram,
+    acc_width: usize,
+    outer_rows: usize,
+    cells: &JoinCells,
+) -> Result<bool> {
+    const HASH_SWITCH_MIN_OUTER: usize = 256;
+    /// A hash join hashes the SMALL side, and "small" here is ABSOLUTE, not
+    /// relative to the outer: the switch holds the build side resident, while
+    /// the #125 memory contract (`prune_width_mem`) is that the pipeline's
+    /// held bytes do NOT scale with the input. A build side that grows with
+    /// the query's input breaks that contract however favourable its ratio to
+    /// the outer looks, so the line is a fixed cell count — a dimension table
+    /// passes it, a self-join on a growing table does not.
+    const HASH_SWITCH_MAX_CELLS: u64 = 65_536;
+    if outer_rows < HASH_SWITCH_MIN_OUTER || join.kind != JoinKind::Inner {
+        return Ok(false);
+    }
+    if join_hash_key(schema, join, on, acc_width).is_none() {
+        return Ok(false);
+    }
+    let Some(t) = schema.table(join.table) else { return Ok(false) };
+    let Some(inner_rows) = ctx.row_count(join.table)? else {
+        return Ok(false);
+    };
+    if inner_rows > 2 * outer_rows as u64 {
+        return Ok(false); // the build would cost more than the probes it saves
+    }
+    let build_cells = inner_rows.saturating_mul(t.columns.len() as u64);
+    Ok(build_cells <= HASH_SWITCH_MAX_CELLS && cells.fits(build_cells))
+}
+
+/// A built hash probe: the OUTER column to key by, and key → held indices.
+type HashProbe = (u16, HashMap<Vec<u8>, Vec<usize>>);
+
+/// Bucket held inner rows by their join-key column: key → held indices, in
+/// held order (so the rows a probe yields come out exactly as the linear scan
+/// would have produced them). A NULL key is in no bucket, which is what
+/// `x = y` means when either side is NULL.
+fn build_hash_index(rows: &[Vec<Value>], icol: u16) -> HashMap<Vec<u8>, Vec<usize>> {
+    let mut map: HashMap<Vec<u8>, Vec<usize>> = HashMap::new();
+    let mut key = Vec::with_capacity(16);
+    for (ci, row) in rows.iter().enumerate() {
+        let Some(v) = row.get(icol as usize) else { continue };
+        if v.is_null() {
+            continue;
+        }
+        key.clear();
+        keycode::encode_group_value(&mut key, v, Collation::Binary);
+        map.entry(key.clone()).or_default().push(ci);
+    }
+    map
 }
