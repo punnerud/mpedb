@@ -1078,6 +1078,12 @@ impl<'a> Binder<'a> {
     /// Bind an expression bottom-up; returns the folded expression + type.
     pub fn bind_expr(&mut self, e: &ast::Expr) -> Result<(BExpr, Ty)> {
         match e {
+            // RAISE never binds: inside a trigger body the trigger compiler
+            // intercepts it before binding, so reaching here means any other
+            // position — sqlite's own containment message.
+            ast::Expr::Raise(..) => {
+                Err(bind_err("RAISE() may only be used within a trigger-program"))
+            }
             ast::Expr::Lit(v) => Ok((BExpr::Const(v.clone()), v.column_type())),
             ast::Expr::Param(i) => {
                 if !self.allow_params {

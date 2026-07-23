@@ -2544,11 +2544,16 @@ fn exec_stmt_rest(
                 // written (DESIGN-TRIGGERS §4.1), NEW = the row about to be
                 // inserted (read-only). A failing body may already have written
                 // to other tables on the shared txn, so it poisons the statement.
-                if let Err(e) =
-                    fire_insert(ctx, schema, &triggers.before_insert, *table, &row, triggers, depth)
+                match fire_insert(ctx, schema, &triggers.before_insert, *table, &row, triggers, depth)
                 {
-                    *partial = true;
-                    return Err(e);
+                    Ok(crate::trigger::FireOutcome::Proceed) => {}
+                    // RAISE(IGNORE): skip this row's insert and all its
+                    // remaining trigger work, silently (sqlite semantics).
+                    Ok(crate::trigger::FireOutcome::SkipRow) => continue,
+                    Err(e) => {
+                        *partial = true;
+                        return Err(e);
+                    }
                 }
                 // INSERT OR REPLACE: delete every existing row the proposed row
                 // would collide with — on the PK AND on each secondary UNIQUE
@@ -2612,6 +2617,8 @@ fn exec_stmt_rest(
                         // written, on the SAME txn (DESIGN-TRIGGERS §4.1/§4.3). A
                         // failing trigger poisons the statement: the row landed and
                         // the body may have written before it raised.
+                        // A SkipRow here only abandons remaining trigger work —
+                        // the row is already written and stays counted.
                         if let Err(e) =
                             fire_insert(ctx, schema, &triggers.after_insert, *table, &row, triggers, depth)
                         {
@@ -2841,7 +2848,7 @@ fn exec_stmt_rest(
                 // BEFORE UPDATE FOR EACH ROW triggers fire before the row is
                 // rewritten (DESIGN-TRIGGERS §4.1): NEW = the post-image (read-
                 // only), OLD = the pre-image. A failing body poisons the statement.
-                if let Err(e) = fire_update(
+                match fire_update(
                     ctx,
                     schema,
                     &triggers.before_update,
@@ -2852,8 +2859,13 @@ fn exec_stmt_rest(
                     triggers,
                     depth,
                 ) {
-                    *partial = true;
-                    return Err(e);
+                    Ok(crate::trigger::FireOutcome::Proceed) => {}
+                    // RAISE(IGNORE): leave the row as it was, silently.
+                    Ok(crate::trigger::FireOutcome::SkipRow) => continue,
+                    Err(e) => {
+                        *partial = true;
+                        return Err(e);
+                    }
                 }
                 match ctx.update_by_pk(*table, &new_row) {
                     Ok(true) => {
@@ -2868,6 +2880,8 @@ fn exec_stmt_rest(
                         // post-image, OLD = the pre-image. A failing trigger
                         // poisons the statement — the row changed and the body may
                         // have written before it raised.
+                        // SkipRow here only abandons remaining trigger work —
+                        // the row is already rewritten and stays counted.
                         if let Err(e) = fire_update(
                             ctx,
                             schema,
@@ -2927,11 +2941,15 @@ fn exec_stmt_rest(
                 // BEFORE DELETE FOR EACH ROW triggers fire before the row is
                 // removed (DESIGN-TRIGGERS §4.1): only OLD is available. A failing
                 // body poisons the statement.
-                if let Err(e) =
-                    fire_delete(ctx, schema, &triggers.before_delete, *table, old, triggers, depth)
+                match fire_delete(ctx, schema, &triggers.before_delete, *table, old, triggers, depth)
                 {
-                    *partial = true;
-                    return Err(e);
+                    Ok(crate::trigger::FireOutcome::Proceed) => {}
+                    // RAISE(IGNORE): keep the row, silently.
+                    Ok(crate::trigger::FireOutcome::SkipRow) => continue,
+                    Err(e) => {
+                        *partial = true;
+                        return Err(e);
+                    }
                 }
                 match ctx.delete_by_pk(*table, &pk) {
                     Ok(true) => {
@@ -2944,6 +2962,8 @@ fn exec_stmt_rest(
                         // AFTER DELETE FOR EACH ROW triggers fire on the deleted
                         // row, on the SAME txn (DESIGN-TRIGGERS §4.1): only OLD is
                         // available. A failing trigger poisons the statement.
+                        // SkipRow here only abandons remaining trigger work —
+                        // the row is already gone and stays counted.
                         if let Err(e) =
                             fire_delete(ctx, schema, &triggers.after_delete, *table, old, triggers, depth)
                         {
@@ -2994,10 +3014,10 @@ fn fire_insert(
     new_row: &[Value],
     triggers: &TriggerSet,
     depth: u32,
-) -> Result<()> {
+) -> Result<crate::trigger::FireOutcome> {
     match bucket.get(&table) {
         Some(trigs) => fire_row_triggers(ctx, schema, trigs, Some(new_row), None, &[], triggers, depth),
-        None => Ok(()),
+        None => Ok(crate::trigger::FireOutcome::Proceed),
     }
 }
 
@@ -3017,12 +3037,12 @@ fn fire_update(
     changed: &[u16],
     triggers: &TriggerSet,
     depth: u32,
-) -> Result<()> {
+) -> Result<crate::trigger::FireOutcome> {
     match bucket.get(&table) {
         Some(trigs) => {
             fire_row_triggers(ctx, schema, trigs, Some(new_row), Some(old_row), changed, triggers, depth)
         }
-        None => Ok(()),
+        None => Ok(crate::trigger::FireOutcome::Proceed),
     }
 }
 
@@ -3036,10 +3056,10 @@ fn fire_delete(
     old_row: &[Value],
     triggers: &TriggerSet,
     depth: u32,
-) -> Result<()> {
+) -> Result<crate::trigger::FireOutcome> {
     match bucket.get(&table) {
         Some(trigs) => fire_row_triggers(ctx, schema, trigs, None, Some(old_row), &[], triggers, depth),
-        None => Ok(()),
+        None => Ok(crate::trigger::FireOutcome::Proceed),
     }
 }
 
@@ -3063,9 +3083,9 @@ fn fire_row_triggers(
     changed: &[u16],
     triggers: &TriggerSet,
     depth: u32,
-) -> Result<()> {
+) -> Result<crate::trigger::FireOutcome> {
     if trigs.is_empty() {
-        return Ok(());
+        return Ok(crate::trigger::FireOutcome::Proceed);
     }
     if depth + 1 > MAX_TRIGGER_DEPTH {
         return Err(Error::Unsupported(format!(
@@ -3103,18 +3123,44 @@ fn fire_row_triggers(
         match &trig.body {
             // Multi-statement body: each statement runs in order on the same txn.
             crate::trigger::TriggerBody::Sql(stmts) => {
-                for (body_plan, body_map) in stmts {
-                    let body_params = pick(body_map)?;
-                    let mut inner_partial = false;
-                    exec_stmt_triggered(
-                        ctx,
-                        schema,
-                        body_plan,
-                        &body_params,
-                        &mut inner_partial,
-                        triggers,
-                        depth + 1,
-                    )?;
+                for stmt in stmts {
+                    match stmt {
+                        mpedb_sql::TriggerStmt::Dml(body_plan, body_map) => {
+                            let body_params = pick(body_map)?;
+                            let mut inner_partial = false;
+                            exec_stmt_triggered(
+                                ctx,
+                                schema,
+                                body_plan,
+                                &body_params,
+                                &mut inner_partial,
+                                triggers,
+                                depth + 1,
+                            )?;
+                        }
+                        // `SELECT RAISE(…) [WHERE …]` (DESIGN-TRIGGERS §4.3):
+                        // the gate is 3VL like WHEN — only TRUE raises.
+                        mpedb_sql::TriggerStmt::Raise { kind, msg, gate } => {
+                            if let Some((prog, gate_map)) = gate {
+                                let gp = pick(gate_map)?;
+                                let mut stack = Vec::new();
+                                if !prog.eval_filter(&mut stack, &[], &gp)? {
+                                    continue;
+                                }
+                            }
+                            match kind {
+                                mpedb_sql::TriggerRaise::Abort => {
+                                    return Err(Error::Raise(msg.clone()));
+                                }
+                                // sqlite: IGNORE abandons the remainder of THIS
+                                // trigger program, the row operation, and every
+                                // subsequent trigger program for the row.
+                                mpedb_sql::TriggerRaise::Ignore => {
+                                    return Ok(crate::trigger::FireOutcome::SkipRow);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             // PySpell body (DESIGN-TRIGGERS §5): evaluate the argument
@@ -3148,7 +3194,7 @@ fn fire_row_triggers(
             }
         }
     }
-    Ok(())
+    Ok(crate::trigger::FireOutcome::Proceed)
 }
 
 /// [`DbBridge`](mpedb_spell::interp::DbBridge) over the LIVE transaction a

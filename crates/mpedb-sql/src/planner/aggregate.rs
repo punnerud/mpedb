@@ -31,7 +31,7 @@ pub(super) fn contains_agg(e: &ast::Expr) -> bool {
         // what keeps `sum(x) OVER (…)` from being read as a plain aggregate.
         E::Window { .. } => false,
         E::Lit(_) | E::Param(_) | E::Col(_) | E::ContextRef(_) | E::Excluded(_)
-        | E::Qualified(..) => false,
+        | E::Qualified(..) | E::Raise(..) => false,
     }
 }
 
@@ -206,7 +206,9 @@ fn lift_aggs(
         // (windows + aggregate is rejected at routing); if one reaches here it
         // passes through to the binder's clear refusal rather than being lifted.
         other @ E::Window { .. } => other.clone(),
-        other @ (E::Lit(_) | E::Param(_) | E::ContextRef(_) | E::Excluded(_)) => other.clone(),
+        other @ (E::Lit(_) | E::Param(_) | E::ContextRef(_) | E::Excluded(_) | E::Raise(..)) => {
+            other.clone()
+        }
     })
 }
 

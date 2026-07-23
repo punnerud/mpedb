@@ -52,21 +52,46 @@ fn trg_err(msg: impl Into<String>) -> Error {
     Error::Bind(msg.into())
 }
 
+/// Which `RAISE` actions survive compilation (DESIGN-TRIGGERS §4.3). `FAIL`
+/// (keep the statement's earlier row effects) has no honest mapping onto
+/// mpedb's atomic statements, and `ROLLBACK`'s scope under an interactive
+/// `WriteSession` is deliberately unpinned — both are named refusals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TriggerRaise {
+    /// Abort the triggering statement: everything it did unwinds atomically.
+    Abort,
+    /// Silently skip THIS row's operation and all its remaining trigger work.
+    Ignore,
+}
+
+/// One compiled trigger-body statement: DML, or the standalone
+/// `SELECT RAISE(...) [WHERE <cond>]` veto idiom (sqlite's validation-trigger
+/// shape — the WHERE gate references `NEW`/`OLD` like a `WHEN`).
+pub enum TriggerStmt {
+    Dml(Box<crate::CompiledPlan>, RowMap),
+    Raise {
+        kind: TriggerRaise,
+        msg: String,
+        gate: Option<(ExprProgram, RowMap)>,
+    },
+}
+
 /// Compile a trigger's `BEGIN <stmt>; … END` body against `target` — the table
 /// the trigger fires on. `allow_new`/`allow_old` gate the `NEW`/`OLD`
 /// pseudo-relations per the event (DESIGN-TRIGGERS §1). The body may hold a
-/// SEQUENCE of INSERT/UPDATE/DELETE statements (DESIGN-TRIGGERS stage 3), fired
-/// in order on the same txn; each compiles to its own plan and row-slot map (body
+/// SEQUENCE of statements (DESIGN-TRIGGERS stage 3) — INSERT/UPDATE/DELETE,
+/// plus the `SELECT RAISE(…) [WHERE …]` veto form — fired in order on the same
+/// txn; each DML statement compiles to its own plan and row-slot map (body
 /// parameter slot `i` of statement `n` is filled from `map[n][i].0`'s image,
-/// column `map[n][i].1`, at fire time). Returns one `(plan, map)` per statement,
-/// in body order.
+/// column `map[n][i].1`, at fire time). Returns one [`TriggerStmt`] per
+/// statement, in body order.
 pub fn compile_trigger_body(
     body_sql: &str,
     target: &TableDef,
     schema: &Schema,
     allow_new: bool,
     allow_old: bool,
-) -> Result<Vec<(crate::CompiledPlan, RowMap)>> {
+) -> Result<Vec<TriggerStmt>> {
     let stmt_srcs = split_body_statements(body_sql)?;
     if stmt_srcs.is_empty() {
         return Err(trg_err("a trigger body must contain at least one statement"));
@@ -88,6 +113,10 @@ pub fn compile_trigger_body(
             return Err(trg_err("WITH (CTE) is not supported in a trigger body yet"));
         }
         let scope = RowScope { target, allow_new, allow_old };
+        if let Some(raise) = compile_raise_stmt(&stmt, &scope)? {
+            out.push(raise);
+            continue;
+        }
         let mut map: RowMap = Vec::new();
         rewrite_row_in_stmt(&mut stmt, &scope, &mut map)?;
         // The GROUP BY dialect is irrelevant here: a trigger body is DML and
@@ -110,9 +139,63 @@ pub fn compile_trigger_body(
             // does not (design/DESIGN-MPEE-SOLVER.md §6).
             crate::planner::NO_ROW_COUNTS,
         )?;
-        out.push((plan, map));
+        out.push(TriggerStmt::Dml(Box::new(plan), map));
     }
     Ok(out)
+}
+
+/// Recognize `SELECT RAISE(<action>[, 'msg']) [WHERE <cond>]` — sqlite's veto
+/// idiom — and compile it. `Ok(None)` = not that shape (the caller compiles it
+/// as DML or refuses). A matching shape with `FAIL`/`ROLLBACK` is a NAMED
+/// refusal here, not a fall-through.
+fn compile_raise_stmt(stmt: &Stmt, scope: &RowScope) -> Result<Option<TriggerStmt>> {
+    let Stmt::Select(sel) = stmt else { return Ok(None) };
+    if sel.table.is_some()
+        || sel.from_derived.is_some()
+        || !sel.joins.is_empty()
+        || sel.distinct
+        || !sel.group_by.is_empty()
+        || sel.having.is_some()
+        || !sel.order_by.is_empty()
+        || sel.limit.is_some()
+        || sel.offset.is_some()
+    {
+        return Ok(None);
+    }
+    let Some(items) = &sel.items else { return Ok(None) };
+    let [(Expr::Raise(kind, msg), _)] = items.as_slice() else {
+        return Ok(None);
+    };
+    let kind = match kind {
+        ast::RaiseKind::Abort => TriggerRaise::Abort,
+        ast::RaiseKind::Ignore => TriggerRaise::Ignore,
+        ast::RaiseKind::Fail => {
+            return Err(trg_err(
+                "RAISE(FAIL) is not supported — its keep-earlier-rows semantics                  contradict mpedb's atomic statements; use RAISE(ABORT, …)",
+            ))
+        }
+        ast::RaiseKind::Rollback => {
+            return Err(trg_err(
+                "RAISE(ROLLBACK) is not supported until its WriteSession scope                  is pinned (DESIGN-TRIGGERS §9); use RAISE(ABORT, …)",
+            ))
+        }
+    };
+    let gate = match &sel.where_clause {
+        Some(w) => {
+            let mut w = w.clone();
+            let mut map: RowMap = Vec::new();
+            rewrite_row_in_expr(&mut w, scope, &mut map)?;
+            let mut b = Binder::new(dual_def(), map.len() as u16, true);
+            let bound = b.bind_predicate(&w)?;
+            Some((binder::compile_program(&bound)?, map))
+        }
+        None => None,
+    };
+    Ok(Some(TriggerStmt::Raise {
+        kind,
+        msg: msg.clone(),
+        gate,
+    }))
 }
 
 /// Split a trigger's `BEGIN … END` body source into its top-level statements at
@@ -242,7 +325,8 @@ fn rewrite_row_in_stmt(s: &mut Stmt, scope: &RowScope, map: &mut RowMap) -> Resu
             rewrite_row_in_returning(&mut d.returning, scope, map)
         }
         _ => Err(trg_err(
-            "a trigger body must be a single INSERT, UPDATE, or DELETE statement",
+            "a trigger body statement must be an INSERT, UPDATE, or DELETE — \
+             or the `SELECT RAISE(...) [WHERE <cond>]` veto form",
         )),
     }
 }
@@ -358,6 +442,12 @@ fn rewrite_row_in_expr(e: &mut Expr, scope: &RowScope, map: &mut RowMap) -> Resu
         )),
         Expr::ContextRef(_) | Expr::InContext(..) => Err(trg_err(
             "current_setting() is not supported in a trigger body/WHEN yet",
+        )),
+        // A RAISE that reaches this walker is NESTED inside a body statement's
+        // expressions (or a WHEN/argument) — only the standalone statement form
+        // is supported, so fail closed with the shape that is.
+        Expr::Raise(..) => Err(trg_err(
+            "RAISE is only supported as its own `SELECT RAISE(...) [WHERE <cond>]`              statement in a trigger body",
         )),
         Expr::Lit(_) | Expr::Col(_) | Expr::Excluded(_) => Ok(()),
         Expr::Unary(_, a)

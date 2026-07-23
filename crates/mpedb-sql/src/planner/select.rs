@@ -792,7 +792,8 @@ fn rewrite_where_aliases_rec(
         | ast::Expr::ContextRef(_)
         | ast::Expr::Excluded(_)
         | ast::Expr::Subquery(_)
-        | ast::Expr::Exists(_, _) => {}
+        | ast::Expr::Exists(_, _)
+        | ast::Expr::Raise(..) => {}
     }
     // After children: rewrite this node if it is a bare alias name.
     if let ast::Expr::Col(name) = e {

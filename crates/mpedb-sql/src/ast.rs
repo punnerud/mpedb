@@ -50,6 +50,16 @@ pub(crate) struct RecursiveCteStmt {
     pub outer: Box<Stmt>,
 }
 
+/// The four `RAISE` actions, as parsed. Which are honoured is the trigger
+/// compiler's decision (`FAIL`/`ROLLBACK` are named refusals there).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RaiseKind {
+    Abort,
+    Fail,
+    Ignore,
+    Rollback,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SelectStmt {
     /// `None` = FROM-less (`SELECT 3+5`): the statement reads no table and
@@ -376,6 +386,11 @@ pub(crate) enum Expr {
     /// they must NOT propagate NULL, so the binder compiles them to control
     /// flow instead of a call.
     Func(String, Vec<Expr>),
+    /// `RAISE(IGNORE)` / `RAISE(ABORT|FAIL|ROLLBACK, 'msg')` — legal ONLY in a
+    /// trigger body (DESIGN-TRIGGERS §4.3), where the trigger compiler
+    /// intercepts it BEFORE binding; the binder refuses it everywhere else
+    /// with sqlite's own message. The message is empty for `IGNORE`.
+    Raise(RaiseKind, String),
     /// `coalesce(a, b, …)` — first non-NULL argument, evaluated lazily.
     Coalesce(Vec<Expr>),
     /// `excluded.<col>` — the proposed row inside `ON CONFLICT DO UPDATE`.

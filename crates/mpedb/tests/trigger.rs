@@ -5,12 +5,15 @@
 //! sqlite 3.45: an AFTER INSERT audit trigger, an AFTER UPDATE trigger logging
 //! OLD+NEW, an AFTER DELETE trigger logging OLD, WHEN-gated ones (over OLD and
 //! NEW), INSERT … SELECT bodies, a multi-statement AFTER INSERT body, an
-//! `UPDATE OF <col>` trigger that fires/does-not-fire on the SET target, and a
-//! BEFORE INSERT trigger that observes the pre-mutation table state — all
-//! producing exactly the rows sqlite does. Also covers DROP TRIGGER, IF NOT
-//! EXISTS / IF EXISTS, persistence across reopen, the recursion-depth guard, and
-//! the named refusals (INSTEAD OF / FOR EACH STATEMENT / EXECUTE PROCEDURE /
-//! OLD in INSERT / NEW in DELETE).
+//! `UPDATE OF <col>` trigger that fires/does-not-fire on the SET target, a
+//! BEFORE INSERT trigger that observes the pre-mutation table state, and the
+//! `RAISE` veto forms (ABORT with the verbatim message; IGNORE per row in
+//! BEFORE and mid-program in AFTER) — all producing exactly the rows sqlite
+//! does. Also covers DROP TRIGGER, IF NOT EXISTS / IF EXISTS, persistence
+//! across reopen, the recursion-depth guard, and the named refusals (INSTEAD
+//! OF / FOR EACH STATEMENT / RAISE(FAIL|ROLLBACK) / OLD in INSERT / NEW in
+//! DELETE). `EXECUTE PROCEDURE` bodies are tested in
+//! `crates/mpedb-proc/tests/trigger_proc.rs` (they need ProcEngine).
 
 use mpedb::{Config, Database, ExecResult, Value};
 use std::path::{Path, PathBuf};
@@ -447,4 +450,149 @@ fn before_insert_sees_pre_image_matches_sqlite() {
         ],
         "SELECT id, oid, note FROM audit ORDER BY id",
     );
+}
+
+// ---------------------------------------------------------------- RAISE (§4.3)
+
+/// Apply a script where SOME statements are EXPECTED to fail (RAISE(ABORT)
+/// vetoes) — mirrors the sqlite CLI's lenient mode, which prints the error and
+/// carries on.
+fn apply_lenient(db: &Database, stmts: &[&str]) {
+    for s in stmts {
+        let _ = db.query(s, &[]);
+    }
+}
+
+fn cross_check_lenient(name: &str, setup: &[&str], final_query: &str) {
+    let (db, _p) = open(name);
+    apply_lenient(&db, setup);
+    let got = mpedb_rows(&db, final_query);
+    let mut script = String::new();
+    for s in setup {
+        script.push_str(s);
+        script.push_str(";\n");
+    }
+    script.push_str(final_query);
+    script.push_str(";\n");
+    let want: Vec<Vec<String>> = sqlite_oracle::script_stdout_lenient(&script, "")
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.split('|').map(str::to_string).collect())
+        .collect();
+    assert_eq!(got, want, "mpedb vs sqlite disagree on `{final_query}`");
+    assert!(!got.is_empty(), "expected some rows");
+}
+
+#[test]
+fn raise_abort_vetoes_the_write_matching_sqlite() {
+    let setup = &[
+        "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)",
+        "CREATE TRIGGER floor_chk BEFORE INSERT ON orders FOR EACH ROW \
+         BEGIN SELECT RAISE(ABORT, 'total too small') WHERE NEW.total < 100; END",
+        "INSERT INTO orders (id, total) VALUES (1, 50)",
+        "INSERT INTO orders (id, total) VALUES (2, 150)",
+        "INSERT INTO orders (id, total) VALUES (3, 250)",
+    ];
+    cross_check_lenient("rabort", setup, "SELECT id, total FROM orders ORDER BY id");
+
+    // The error IS the raise message, verbatim (sqlite reports the user text).
+    let (db, _p) = open("rabort-msg");
+    apply(&db, &setup[..2]);
+    let e = db
+        .query("INSERT INTO orders (id, total) VALUES (9, 5)", &[])
+        .unwrap_err();
+    assert_eq!(e.to_string(), "total too small");
+}
+
+#[test]
+fn raise_ignore_skips_only_the_gated_rows_matching_sqlite() {
+    // A multi-row INSERT: sqlite skips exactly the vetoed rows and keeps the
+    // rest — RAISE(IGNORE) is per ROW, not per statement.
+    cross_check_lenient(
+        "rignore",
+        &[
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)",
+            "CREATE TRIGGER skip_small BEFORE INSERT ON orders FOR EACH ROW \
+             BEGIN SELECT RAISE(IGNORE) WHERE NEW.total < 100; END",
+            "INSERT INTO orders (id, total) VALUES (1, 50), (2, 150), (3, 25), (4, 250)",
+        ],
+        "SELECT id, total FROM orders ORDER BY id",
+    );
+}
+
+#[test]
+fn raise_ignore_before_update_and_delete_keep_the_row_matching_sqlite() {
+    cross_check_lenient(
+        "rignore-ud",
+        &[
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)",
+            "INSERT INTO orders (id, total) VALUES (1, 100), (2, 200)",
+            // Rows may never shrink, and row 1 is undeletable — silently.
+            "CREATE TRIGGER no_shrink BEFORE UPDATE ON orders FOR EACH ROW \
+             BEGIN SELECT RAISE(IGNORE) WHERE NEW.total < OLD.total; END",
+            "CREATE TRIGGER keep_one BEFORE DELETE ON orders FOR EACH ROW \
+             BEGIN SELECT RAISE(IGNORE) WHERE OLD.id = 1; END",
+            "UPDATE orders SET total = 50 WHERE id = 1",
+            "UPDATE orders SET total = 500 WHERE id = 2",
+            "DELETE FROM orders",
+        ],
+        "SELECT id, total FROM orders ORDER BY id",
+    );
+}
+
+#[test]
+fn raise_ignore_in_after_abandons_remaining_trigger_work_matching_sqlite() {
+    // The row stays (it is already written); the trigger program stops at the
+    // RAISE — log 'pre' lands, 'post' never does.
+    cross_check_lenient(
+        "rignore-after",
+        &[
+            "CREATE TABLE orders (id INTEGER PRIMARY KEY, total INTEGER)",
+            "CREATE TABLE audit (id INTEGER PRIMARY KEY, note TEXT)",
+            "CREATE TRIGGER a AFTER INSERT ON orders FOR EACH ROW BEGIN \
+             INSERT INTO audit (id, note) VALUES (NEW.id * 10, 'pre'); \
+             SELECT RAISE(IGNORE) WHERE NEW.total > 100; \
+             INSERT INTO audit (id, note) VALUES (NEW.id * 10 + 1, 'post'); END",
+            "INSERT INTO orders (id, total) VALUES (1, 50)",
+            "INSERT INTO orders (id, total) VALUES (2, 150)",
+        ],
+        "SELECT id, note FROM audit ORDER BY id",
+    );
+}
+
+#[test]
+fn raise_containment_and_named_refusals() {
+    let (db, _p) = open("raise-refuse");
+    // Outside a trigger body: sqlite's own containment message.
+    let e = db.query("SELECT RAISE(ABORT, 'x')", &[]).unwrap_err();
+    assert!(
+        e.to_string().contains("may only be used within a trigger-program"),
+        "{e}"
+    );
+    apply(&db, &["CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)"]);
+    // FAIL and ROLLBACK: named refusals at CREATE, pointing at ABORT.
+    for kind in ["FAIL", "ROLLBACK"] {
+        let e = db
+            .query(
+                &format!(
+                    "CREATE TRIGGER r BEFORE INSERT ON t \
+                     BEGIN SELECT RAISE({kind}, 'x'); END"
+                ),
+                &[],
+            )
+            .unwrap_err();
+        assert!(e.to_string().contains("RAISE(ABORT"), "{kind}: {e}");
+    }
+    // Nested RAISE (not the standalone statement form): named refusal.
+    let e = db
+        .query(
+            "CREATE TRIGGER r BEFORE INSERT ON t \
+             BEGIN INSERT INTO t (id, v) VALUES (1, RAISE(ABORT, 'x')); END",
+            &[],
+        )
+        .unwrap_err();
+    assert!(e.to_string().contains("standalone") || e.to_string().contains("its own"), "{e}");
+    // The parser's grammar refusals.
+    assert!(db.query("SELECT RAISE(NONSENSE)", &[]).is_err());
+    assert!(db.query("SELECT RAISE(ABORT)", &[]).is_err());
 }
