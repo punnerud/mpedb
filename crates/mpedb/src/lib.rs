@@ -66,9 +66,11 @@ pub mod model;
 pub mod stats;
 mod stream;
 mod tier;
+mod backtest;
 mod trigger;
 mod workspace;
 
+pub use backtest::TriggerBacktest;
 pub use access::{ddl_access, plan_access, Access, AccessReport, ObjectKind, TxnOp};
 
 /// Process-wide count of statements whose ADAPTIVE PARALLEL aggregate fold

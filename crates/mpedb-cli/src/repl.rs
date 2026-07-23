@@ -136,7 +136,20 @@ pub fn run_path(config_path: &str, pending: Option<PendingCreate>) -> CliResult 
                 None => db.query(stmt, &[]),
             };
             match res {
-                Ok(r) => print_result(&r),
+                Ok(r) => {
+                    print_result(&r);
+                    // Recommend the backtest right where a trigger goes live:
+                    // it replays the trigger over the existing rows in an
+                    // always-rolled-back txn and reports what it would do.
+                    let head = stmt.trim_start().get(..14).unwrap_or("");
+                    if head.eq_ignore_ascii_case("create trigger") && input.prompts() {
+                        eprintln!(
+                            "tip: `mpedb trigger backtest <db> <name>` replays this \
+                             trigger over the current rows (always rolled back) and \
+                             reports what it would have done"
+                        );
+                    }
+                }
                 Err(e) => eprintln!("error: {e}"),
             }
             // DDL moves the schema under the completer; refresh the snapshot

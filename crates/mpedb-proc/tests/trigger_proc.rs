@@ -412,3 +412,47 @@ fn create_in_write_session_resolves_and_fires_after_commit() {
     db.query("INSERT INTO accounts (id, balance) VALUES (2, 2)", &[]).unwrap();
     assert_eq!(audit_rows(&db), vec![(2, "s".into())]);
 }
+
+/// Backtest over a PROCEDURE body: the dry-run replays the spell through the
+/// CtxBridge per row, vetoes roll back to their savepoints, and the whole
+/// replay commits nothing.
+#[test]
+fn backtest_replays_a_procedure_trigger_without_committing() {
+    let (cfg, _g) = test_config("backtest");
+    let db = Database::open_with_config(cfg).unwrap();
+    let engine = ProcEngine::new(&db);
+    engine
+        .define(
+            r#"
+def vet(v):
+    db.execute("INSERT INTO audit (seq, oid, tag) VALUES ((SELECT coalesce(max(seq), 0) + 1 FROM audit), $1, 'seen')", [v])
+    if v < 0:
+        return 1 // 0
+    return 0
+"#,
+            Lang::Python,
+        )
+        .unwrap();
+    for (id, bal) in [(1i64, 10i64), (2, -5), (3, 7), (4, -1)] {
+        db.query(
+            &format!("INSERT INTO accounts (id, balance) VALUES ({id}, {bal})"),
+            &[],
+        )
+        .unwrap();
+    }
+    // Dry-run the not-yet-created trigger over the 4 existing rows.
+    let r = db
+        .backtest_trigger(
+            "CREATE TRIGGER chk BEFORE INSERT ON accounts EXECUTE PROCEDURE vet(NEW.balance)",
+            0,
+        )
+        .unwrap();
+    assert_eq!((r.fired, r.vetoed), (2, 2));
+    assert!(r.veto_examples[0].contains("division"), "{:?}", r.veto_examples);
+    // Only the two NON-vetoing rows' audit writes survive to the net count
+    // (the vetoed rows rolled back to their savepoints) — and then the whole
+    // replay was aborted: the real audit table is untouched.
+    assert_eq!(r.net_rows, vec![("audit".to_string(), 2)]);
+    assert!(audit_rows(&db).is_empty());
+    assert!(db.list_triggers().unwrap().is_empty());
+}

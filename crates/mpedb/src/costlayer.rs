@@ -41,24 +41,41 @@ pub const NS_TUNE: &str = "tune";
 pub const NS_COST_POLICY: &str = "costpolicy";
 const KEY: &[u8] = b"current";
 
-/// The cost calculator's named switches. Strict parse: an unknown name is a
-/// typo describing a different calculator, and refuses with the known set.
+/// The engine's named switches — cost-calculator knobs and behavioural ones
+/// that must be COHERENT across attached processes (a per-connection setting
+/// would let the same statement have different effects in different
+/// processes). Strict parse: an unknown name is a typo describing a different
+/// engine, and refuses with the known set.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Tunables {
     /// Stage A's per-index distinct-key discount
     /// (`bucket(rows) − bucket(ndv)` on fully-pinned non-partial indexes).
     pub ndv_discount: bool,
+    /// DESIGN-TRIGGERS §4.4: may a trigger's cascade re-enter a trigger that
+    /// is already active? Default OFF (sqlite's default): while trigger T
+    /// runs, T does not fire again — direct or via a cycle — which is what
+    /// stops the classic `AFTER INSERT ON t … INSERT INTO t` runaway without
+    /// an error. ON restores full recursion under the depth cap and the work
+    /// meter.
+    pub recursive_triggers: bool,
 }
 
 impl Default for Tunables {
     fn default() -> Self {
-        Tunables { ndv_discount: true }
+        Tunables {
+            ndv_discount: true,
+            recursive_triggers: false,
+        }
     }
 }
 
 impl Tunables {
     fn encode(&self) -> Vec<u8> {
-        format!("ndv_discount={}\n", self.ndv_discount).into_bytes()
+        format!(
+            "ndv_discount={}\nrecursive_triggers={}\n",
+            self.ndv_discount, self.recursive_triggers
+        )
+        .into_bytes()
     }
 
     fn decode(bytes: &[u8]) -> Result<Tunables> {
@@ -68,21 +85,24 @@ impl Tunables {
             if line.is_empty() {
                 continue;
             }
+            let parse_bool = |name: &str, v: &str| -> Result<bool> {
+                match v {
+                    "true" => Ok(true),
+                    "false" => Ok(false),
+                    other => Err(Error::Corrupt(format!(
+                        "tunable {name} has non-boolean value `{other}`"
+                    ))),
+                }
+            };
             match line.split_once('=') {
-                Some(("ndv_discount", v)) => {
-                    t.ndv_discount = match v {
-                        "true" => true,
-                        "false" => false,
-                        other => {
-                            return Err(Error::Corrupt(format!(
-                                "tunable ndv_discount has non-boolean value `{other}`"
-                            )))
-                        }
-                    };
+                Some(("ndv_discount", v)) => t.ndv_discount = parse_bool("ndv_discount", v)?,
+                Some(("recursive_triggers", v)) => {
+                    t.recursive_triggers = parse_bool("recursive_triggers", v)?
                 }
                 _ => {
                     return Err(Error::Corrupt(format!(
-                        "unknown tunable line `{line}` — known: ndv_discount"
+                        "unknown tunable line `{line}` — known: ndv_discount, \
+                         recursive_triggers"
                     )))
                 }
             }
@@ -91,21 +111,27 @@ impl Tunables {
     }
 
     pub fn parse_assignment(&mut self, assignment: &str) -> Result<()> {
+        let parse_bool = |name: &str, v: &str| -> Result<bool> {
+            match v {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                other => Err(Error::Unsupported(format!(
+                    "{name} takes true|false, got `{other}`"
+                ))),
+            }
+        };
         match assignment.split_once('=') {
             Some(("ndv_discount", v)) => {
-                self.ndv_discount = match v {
-                    "true" => true,
-                    "false" => false,
-                    other => {
-                        return Err(Error::Unsupported(format!(
-                            "ndv_discount takes true|false, got `{other}`"
-                        )))
-                    }
-                };
+                self.ndv_discount = parse_bool("ndv_discount", v)?;
+                Ok(())
+            }
+            Some(("recursive_triggers", v)) => {
+                self.recursive_triggers = parse_bool("recursive_triggers", v)?;
                 Ok(())
             }
             _ => Err(Error::Unsupported(format!(
-                "unknown tunable `{assignment}` — known: ndv_discount=true|false"
+                "unknown tunable `{assignment}` — known: ndv_discount=true|false, \
+                 recursive_triggers=true|false"
             ))),
         }
     }

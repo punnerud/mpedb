@@ -227,20 +227,55 @@ fn trigger_survives_reopen() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// `recursive_triggers` default OFF — sqlite's default, differentially: a
+/// self-cascading trigger fires ONCE per outer row (the active trigger is not
+/// re-entered), so the insert succeeds with exactly the rows sqlite produces.
 #[test]
-fn recursion_depth_guard_aborts_and_rolls_back() {
-    let (db, _p) = open("recur");
+fn recursive_triggers_off_by_default_matches_sqlite() {
+    let setup = &[
+        "CREATE TABLE chain (id INTEGER PRIMARY KEY)",
+        "CREATE TRIGGER selfref AFTER INSERT ON chain FOR EACH ROW \
+         BEGIN INSERT INTO chain (id) SELECT id + 1 FROM chain WHERE id = NEW.id; END",
+        "INSERT INTO chain (id) VALUES (1)",
+    ];
+    cross_check_full("recur-off", setup, "SELECT id FROM chain ORDER BY id");
+}
+
+/// An INDIRECT cycle (A's body writes b, B's body writes back into a) is
+/// suppressed by the same active-trigger rule — differentially against
+/// sqlite's default.
+#[test]
+fn recursive_triggers_off_suppresses_indirect_cycles_matching_sqlite() {
+    let setup = &[
+        "CREATE TABLE a (id INTEGER PRIMARY KEY)",
+        "CREATE TABLE b (id INTEGER PRIMARY KEY)",
+        "CREATE TRIGGER t_a AFTER INSERT ON a FOR EACH ROW \
+         BEGIN INSERT INTO b (id) VALUES (NEW.id + 100); END",
+        "CREATE TRIGGER t_b AFTER INSERT ON b FOR EACH ROW \
+         BEGIN INSERT INTO a (id) VALUES (NEW.id + 100); END",
+        "INSERT INTO a (id) VALUES (1)",
+    ];
+    // a gets {1, 201} (t_b fires once), b gets {101}: the SECOND t_a
+    // activation — for a=201, while t_a is still active — is suppressed.
+    cross_check_full("recur-cycle", setup, "SELECT 'a', id FROM a UNION ALL SELECT 'b', id FROM b ORDER BY 1, 2");
+}
+
+/// `tune set recursive_triggers=true` restores full recursion, guarded by the
+/// depth cap; the aborted cascade rolls back atomically. sqlite with
+/// `PRAGMA recursive_triggers=ON` errors the same way (its own depth limit),
+/// leaving the same empty table — asserted against the oracle.
+#[test]
+fn recursive_triggers_on_hits_the_depth_guard_and_rolls_back() {
+    let (db, _p) = open("recur-on");
     apply(
         &db,
         &[
             "CREATE TABLE chain (id INTEGER PRIMARY KEY)",
-            // Each insert fires the trigger, which inserts the NEXT id (read back
-            // from the row just written): an unbounded self-cascade of distinct
-            // keys, guarded only by the depth cap.
             "CREATE TRIGGER selfref AFTER INSERT ON chain FOR EACH ROW \
              BEGIN INSERT INTO chain (id) SELECT id + 1 FROM chain WHERE id = NEW.id; END",
         ],
     );
+    db.set_tunable("recursive_triggers=true").unwrap();
     let err = db.query("INSERT INTO chain (id) VALUES (1)", &[]).unwrap_err();
     assert!(
         format!("{err}").contains("recursion too deep"),
@@ -248,6 +283,27 @@ fn recursion_depth_guard_aborts_and_rolls_back() {
     );
     // The whole autocommit statement (and its cascade) rolled back.
     assert_eq!(mpedb_rows(&db, "SELECT count(*) FROM chain"), vec![vec!["0"]]);
+
+    // sqlite agrees on the observable outcome: error, empty table.
+    let want: Vec<Vec<String>> = sqlite_oracle::script_stdout_lenient(
+        "CREATE TABLE chain (id INTEGER PRIMARY KEY);\n\
+         CREATE TRIGGER selfref AFTER INSERT ON chain FOR EACH ROW \
+         BEGIN INSERT INTO chain (id) SELECT id + 1 FROM chain WHERE id = NEW.id; END;\n\
+         PRAGMA recursive_triggers=ON;\n\
+         INSERT INTO chain (id) VALUES (1);\n\
+         SELECT count(*) FROM chain;\n",
+        "",
+    )
+    .lines()
+    .filter(|l| !l.is_empty())
+    .map(|l| l.split('|').map(str::to_string).collect())
+    .collect();
+    assert_eq!(want, vec![vec!["0".to_string()]]);
+
+    // And back off: the very next statement is suppressed again (gen-gated).
+    db.set_tunable("recursive_triggers=false").unwrap();
+    db.query("INSERT INTO chain (id) VALUES (1)", &[]).unwrap();
+    assert_eq!(mpedb_rows(&db, "SELECT count(*) FROM chain"), vec![vec!["2"]]);
 }
 
 #[test]
@@ -595,4 +651,57 @@ fn raise_containment_and_named_refusals() {
     // The parser's grammar refusals.
     assert!(db.query("SELECT RAISE(NONSENSE)", &[]).is_err());
     assert!(db.query("SELECT RAISE(ABORT)", &[]).is_err());
+}
+
+/// The #74 work meter charges one row per (trigger, row) fire: a WIDE
+/// statement — one INSERT carrying more rows than the configured budget, each
+/// firing a trigger — trips `RuntimeBudget` at a fixed count naming the
+/// trigger, instead of the cascade's cost being invisible to the meter. (DEEP
+/// cascades are the depth cap's job; execution is depth-first, so recursion
+/// meets that guard before any width accumulates.) Same statement, same trip,
+/// twice.
+#[test]
+fn cascade_width_trips_the_work_meter_deterministically() {
+    let path = fresh_path("workmeter");
+    let toml = format!(
+        r#"
+[database]
+path = "{}"
+size_mb = 16
+max_readers = 16
+
+[runtime]
+max_work_rows = 200
+
+[[table]]
+name = "seed"
+primary_key = ["id"]
+
+  [[table.column]]
+  name = "id"
+  type = "int64"
+"#,
+        path.display()
+    );
+    let db = Database::open_with_config(Config::from_toml_str(&toml).unwrap()).unwrap();
+    apply(
+        &db,
+        &[
+            "CREATE TABLE t (id INTEGER PRIMARY KEY)",
+            "CREATE TABLE audit (id INTEGER PRIMARY KEY)",
+            "CREATE TRIGGER a AFTER INSERT ON t FOR EACH ROW \
+             BEGIN INSERT INTO audit (id) VALUES (NEW.id); END",
+        ],
+    );
+    let values: Vec<String> = (1..=300).map(|i| format!("({i})")).collect();
+    let wide = format!("INSERT INTO t (id) VALUES {}", values.join(", "));
+    let e1 = db.query(&wide, &[]).unwrap_err().to_string();
+    let e2 = db.query(&wide, &[]).unwrap_err().to_string();
+    assert!(e1.contains("work"), "expected the work meter, got: {e1}");
+    assert!(e1.contains("trigger \"a\""), "the meter names the trigger: {e1}");
+    assert_eq!(e1, e2, "the trip point is deterministic");
+    // The aborted statement left nothing behind.
+    assert_eq!(mpedb_rows(&db, "SELECT count(*) FROM t"), vec![vec!["0"]]);
+    assert_eq!(mpedb_rows(&db, "SELECT count(*) FROM audit"), vec![vec!["0"]]);
+    let _ = std::fs::remove_file(&path);
 }

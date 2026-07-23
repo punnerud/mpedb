@@ -3074,7 +3074,7 @@ fn fire_delete(
 /// txn at `depth + 1` — never through the facade, so the writer lock and intent
 /// ring are never re-entered. A hard depth cap bounds any cascade.
 #[allow(clippy::too_many_arguments)]
-fn fire_row_triggers(
+pub(crate) fn fire_row_triggers(
     ctx: &mut dyn TxnCtx,
     schema: &Schema,
     trigs: &[CompiledTrigger],
@@ -3113,6 +3113,14 @@ fn fire_row_triggers(
         if !trig.update_of.is_empty() && !trig.update_of.iter().any(|c| changed.contains(c)) {
             continue;
         }
+        // `recursive_triggers` OFF (the default, sqlite's): a trigger that is
+        // already ACTIVE in this cascade — its body is what (directly or via a
+        // cycle) caused this fire — is not re-entered. This is what quietly
+        // stops `AFTER INSERT ON t … INSERT INTO t` after one round instead of
+        // erroring at the depth cap.
+        if !triggers.recursive && trigger_is_active(&trig.name) {
+            continue;
+        }
         if let Some((prog, when_map)) = &trig.when {
             let wp = pick(when_map)?;
             let mut stack = Vec::new();
@@ -3120,6 +3128,12 @@ fn fire_row_triggers(
                 continue;
             }
         }
+        // The #74 work meter charges one row per (trigger, row) FIRE: the
+        // depth cap bounds how DEEP a cascade goes, this bounds how WIDE —
+        // an exponential fan-out trips `RuntimeBudget` at a fixed, repeatable
+        // count instead of running 2^depth statements.
+        ctx.charge_work(1, &|| format!("trigger \"{}\"", trig.name))?;
+        let _active = ActiveTrigger::enter(&trig.name);
         match &trig.body {
             // Multi-statement body: each statement runs in order on the same txn.
             crate::trigger::TriggerBody::Sql(stmts) => {
@@ -3195,6 +3209,40 @@ fn fire_row_triggers(
         }
     }
     Ok(crate::trigger::FireOutcome::Proceed)
+}
+
+std::thread_local! {
+    /// Names of the triggers whose bodies are executing on THIS thread's
+    /// statement cascade, innermost last. A statement executes synchronously
+    /// on one thread and nested fires recurse on the same one, so a
+    /// thread-local stack IS the cascade's activation record — no signature
+    /// threading through `exec_stmt_triggered`'s many callers.
+    static ACTIVE_TRIGGERS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn trigger_is_active(name: &str) -> bool {
+    ACTIVE_TRIGGERS.with(|a| a.borrow().iter().any(|n| n == name))
+}
+
+/// RAII activation record: pushed around a trigger's body execution, popped on
+/// drop — including the `?`-unwind paths, so an aborting body can never leave
+/// its name stuck "active" for the session's next statement.
+struct ActiveTrigger;
+
+impl ActiveTrigger {
+    fn enter(name: &str) -> ActiveTrigger {
+        ACTIVE_TRIGGERS.with(|a| a.borrow_mut().push(name.to_string()));
+        ActiveTrigger
+    }
+}
+
+impl Drop for ActiveTrigger {
+    fn drop(&mut self) {
+        ACTIVE_TRIGGERS.with(|a| {
+            a.borrow_mut().pop();
+        });
+    }
 }
 
 /// [`DbBridge`](mpedb_spell::interp::DbBridge) over the LIVE transaction a
