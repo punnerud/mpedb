@@ -15,10 +15,12 @@
 //! `NEW.<col>` (post-image) and `OLD.<col>` (pre-image) per event. `UPDATE OF
 //! <cols>` gates firing on one of the named columns appearing in the UPDATE's
 //! SET list (sqlite semantics). `BEFORE` runs its body before the row mutation;
-//! `NEW` is read-only (no `NEW.col := …` mutation syntax exists), and `RAISE`
-//! is not expressible in the DML-only body grammar, so BEFORE cannot veto a
-//! write yet. `INSTEAD OF`, `FOR EACH STATEMENT`, and `EXECUTE PROCEDURE` are
-//! named refusals at `CREATE`.
+//! `NEW` is read-only (no `NEW.col := …` mutation syntax exists). Stage 5 adds
+//! `EXECUTE PROCEDURE p(args…)` bodies: a stored PySpell procedure, pinned by
+//! content hash at `CREATE` ([`StoredBody::Proc`]), fired per row on the same
+//! txn through the executor's `CtxBridge` — a failing procedure vetoes the
+//! write, which is the validation-trigger capability `RAISE` will formalize.
+//! `INSTEAD OF` and `FOR EACH STATEMENT` remain named refusals at `CREATE`.
 
 use super::*;
 use mpedb_core::WriteTxn;
@@ -37,7 +39,21 @@ const TRG_MAGIC: &[u8; 4] = b"MTRG";
 const TRIGGER_FORMAT: u16 = 1;
 
 const BODY_TAG_SQL: u8 = 0;
-// tag 1 (Proc / PySpell body) is reserved for DESIGN-TRIGGERS stage 5.
+/// A PySpell procedure body (DESIGN-TRIGGERS stage 5): the tag reserved since
+/// stage 0. Uses the same TRIGGER_FORMAT — a stage-3 reader meets tag 1 as
+/// `Corrupt`, which the no-backward-compat standing rule accepts.
+const BODY_TAG_PROC: u8 = 1;
+
+/// Per-fire budget for a PySpell trigger body (DESIGN-TRIGGERS §5.2). Applies
+/// to EACH fired row: the interpreter's instruction/db-call/row meters are the
+/// runaway guard on the spell side (the trigger depth cap still bounds any SQL
+/// the procedure issues). Deterministic: the same statement trips at the same
+/// count in every process.
+pub(crate) const TRIGGER_BUDGET: mpedb_spell::interp::Budget = mpedb_spell::interp::Budget {
+    instrs: 250_000,
+    db_calls: 256,
+    rows: 1_000_000,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum TrgTiming {
@@ -50,6 +66,25 @@ pub(crate) enum TrgEvent {
     Insert,
     Update,
     Delete,
+}
+
+/// A stored trigger's body (DESIGN-TRIGGERS §3.3).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum StoredBody {
+    /// In-SQL statement list, as captured source.
+    Sql(String),
+    /// `EXECUTE PROCEDURE` dispatch. The procedure is PINNED BY CONTENT HASH,
+    /// resolved from its name at `CREATE TRIGGER`: procedure re-definition does
+    /// not bump `schema_gen`, so a name binding could go stale differently in
+    /// different processes — the hash cannot (the `proch/<hash>` blob is
+    /// immutable). Re-defining the procedure therefore does NOT re-target the
+    /// trigger; re-CREATE the trigger to bind the new version. `name` is kept
+    /// for display/reconstruction; `arg_srcs` are compiled at catalog load.
+    Proc {
+        name: String,
+        hash: [u8; 32],
+        arg_srcs: Vec<String>,
+    },
 }
 
 /// A decoded `trigger/<name>` catalog record.
@@ -65,12 +100,12 @@ pub(crate) struct StoredTrigger {
     /// stability; UPDATE triggers do not yet fire.
     pub update_of: Vec<u16>,
     pub when_src: Option<String>,
-    pub body_sql: String,
+    pub body: StoredBody,
 }
 
 impl StoredTrigger {
     pub(crate) fn encode(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(32 + self.name.len() + self.body_sql.len());
+        let mut b = Vec::with_capacity(64 + self.name.len());
         b.extend_from_slice(TRG_MAGIC);
         b.extend_from_slice(&TRIGGER_FORMAT.to_le_bytes());
         b.extend_from_slice(&self.table_id.to_le_bytes());
@@ -95,8 +130,21 @@ impl StoredTrigger {
             }
             None => b.push(0),
         }
-        b.push(BODY_TAG_SQL);
-        put_str(&mut b, &self.body_sql);
+        match &self.body {
+            StoredBody::Sql(sql) => {
+                b.push(BODY_TAG_SQL);
+                put_str(&mut b, sql);
+            }
+            StoredBody::Proc { name, hash, arg_srcs } => {
+                b.push(BODY_TAG_PROC);
+                put_str(&mut b, name);
+                b.extend_from_slice(hash);
+                b.extend_from_slice(&(arg_srcs.len() as u16).to_le_bytes());
+                for a in arg_srcs {
+                    put_str(&mut b, a);
+                }
+            }
+        }
         b
     }
 
@@ -136,8 +184,18 @@ impl StoredTrigger {
             1 => Some(take_str(bytes, &mut p)?),
             t => return Err(Error::Corrupt(format!("trigger record: bad when tag {t}"))),
         };
-        let body_sql = match take(bytes, &mut p, 1)?[0] {
-            BODY_TAG_SQL => take_str(bytes, &mut p)?,
+        let body = match take(bytes, &mut p, 1)?[0] {
+            BODY_TAG_SQL => StoredBody::Sql(take_str(bytes, &mut p)?),
+            BODY_TAG_PROC => {
+                let pname = take_str(bytes, &mut p)?;
+                let hash: [u8; 32] = take(bytes, &mut p, 32)?.try_into().unwrap();
+                let argc = u16::from_le_bytes(take(bytes, &mut p, 2)?.try_into().unwrap()) as usize;
+                let mut arg_srcs = Vec::with_capacity(argc.min(256));
+                for _ in 0..argc {
+                    arg_srcs.push(take_str(bytes, &mut p)?);
+                }
+                StoredBody::Proc { name: pname, hash, arg_srcs }
+            }
             t => return Err(Error::Corrupt(format!("trigger record: unknown body tag {t}"))),
         };
         if p != bytes.len() {
@@ -150,7 +208,7 @@ impl StoredTrigger {
             event,
             update_of,
             when_src,
-            body_sql,
+            body,
         })
     }
 }
@@ -200,16 +258,42 @@ fn resolve_trigger_key(w: &mut mpedb_core::WriteTxn<'_>, name: &str) -> Result<O
 
 // ---------------------------------------------------------- compiled fire-set
 
-/// One compiled trigger ready to fire: the body statements (each plan's leading
-/// parameters are the `NEW`/`OLD` columns named by its row-slot map, run in body
-/// order on the same txn), an optional `WHEN` guard (its own program over its own
+/// A compiled trigger body: in-SQL statements, or a PySpell procedure dispatch
+/// (DESIGN-TRIGGERS §5).
+pub(crate) enum TriggerBody {
+    /// Body statements in declaration order, each with its own `NEW`/`OLD`
+    /// row-slot map (DESIGN-TRIGGERS stage 3 multi-statement bodies).
+    Sql(Vec<(CompiledPlan, RowMap)>),
+    Spell(SpellTriggerBody),
+}
+
+/// An `EXECUTE PROCEDURE` body, resolved at catalog build (gen-gated, so a DDL
+/// commit anywhere rebuilds it). A resolution failure does NOT fail the build —
+/// it poisons THIS body (`ready = Err(msg)`), so only statements that would
+/// fire this trigger error, with a message naming the trigger; every other
+/// table's DML is untouched.
+pub(crate) struct SpellTriggerBody {
+    /// Positional argument programs over the `NEW`/`OLD` images, in call order.
+    pub args: Vec<(ExprProgram, RowMap)>,
+    pub ready: std::result::Result<SpellReady, String>,
+}
+
+/// The resolved, fire-ready spell: the pinned procedure and EVERY embedded
+/// plan pre-resolved by hash — fire time needs no registry, no `Database`, no
+/// re-preparation (DESIGN-TRIGGERS §5.2: no SQL is ever parsed at fire time).
+pub(crate) struct SpellReady {
+    pub proc: Arc<mpedb_spell::ir::Proc>,
+    pub plans: HashMap<[u8; 32], Arc<CompiledPlan>>,
+}
+
+/// One compiled trigger ready to fire: the body (SQL statements whose leading
+/// parameters are the `NEW`/`OLD` columns named by their row-slot maps, or a
+/// PySpell dispatch), an optional `WHEN` guard (its own program over its own
 /// row-slot map), and the `UPDATE OF` column set. See DESIGN-TRIGGERS §3.4 and
 /// `mpedb_sql::compile_trigger_body`.
 pub(crate) struct CompiledTrigger {
     pub name: String,
-    /// Body statements in declaration order, each with its own `NEW`/`OLD`
-    /// row-slot map (DESIGN-TRIGGERS stage 3 multi-statement bodies).
-    pub body: Vec<(CompiledPlan, RowMap)>,
+    pub body: TriggerBody,
     /// `UPDATE OF a, b` column indices (empty = any column). UPDATE-event
     /// triggers only: a fire is gated on one of these columns appearing in the
     /// UPDATE's SET list (sqlite semantics — the SET target list, not whether the
@@ -246,6 +330,55 @@ impl TriggerSet {
     }
 }
 
+/// Build the stored body from the parsed spec, compile-checking everything
+/// checkable at `CREATE TRIGGER` (define-time loudness, DESIGN-TRIGGERS §3.1):
+/// an SQL body must compile; an `EXECUTE PROCEDURE` body must name a stored
+/// procedure (looked up through `load_proc_blob`, so both the autocommit and
+/// the in-txn DDL route resolve on their own snapshot), the argument count
+/// must match the procedure's declared arity, and each argument source must
+/// compile in the trigger's `NEW`/`OLD` scope. The procedure is pinned by
+/// content hash here (see [`StoredBody::Proc`]).
+fn build_stored_body(
+    body: &mpedb_sql::TriggerBodySpec,
+    table: &mpedb_types::TableDef,
+    schema: &mpedb_types::Schema,
+    allow_new: bool,
+    allow_old: bool,
+    load_proc_blob: &mut dyn FnMut(&str) -> Result<Option<Vec<u8>>>,
+) -> Result<StoredBody> {
+    match body {
+        mpedb_sql::TriggerBodySpec::Sql(sql) => {
+            let _ = mpedb_sql::compile_trigger_body(sql, table, schema, allow_new, allow_old)?;
+            Ok(StoredBody::Sql(sql.clone()))
+        }
+        mpedb_sql::TriggerBodySpec::Proc { name, arg_srcs } => {
+            let blob = load_proc_blob(name)?.ok_or_else(|| {
+                Error::Bind(format!(
+                    "CREATE TRIGGER: no stored procedure `{name}` — define it first \
+                     (`mpedb proc define`)"
+                ))
+            })?;
+            let proc = mpedb_spell::ir::Proc::decode(&blob)?;
+            if proc.argc as usize != arg_srcs.len() {
+                return Err(Error::Bind(format!(
+                    "CREATE TRIGGER: procedure `{name}` takes {} argument(s), \
+                     the trigger passes {}",
+                    proc.argc,
+                    arg_srcs.len()
+                )));
+            }
+            for src in arg_srcs {
+                let _ = mpedb_sql::compile_trigger_arg(src, table, allow_new, allow_old)?;
+            }
+            Ok(StoredBody::Proc {
+                name: name.clone(),
+                hash: *blake3::hash(&blob).as_bytes(),
+                arg_srcs: arg_srcs.clone(),
+            })
+        }
+    }
+}
+
 impl Database {
     /// Scan `trigger/*`, decode each record, compile the fireable ones against
     /// the live schema. Skips triggers whose target table was dropped (their
@@ -273,8 +406,23 @@ impl Database {
                 Some(t) if !t.dead => t,
                 _ => continue, // target dropped: orphan record, never fires
             };
-            let body =
-                mpedb_sql::compile_trigger_body(&st.body_sql, table, schema, allow_new, allow_old)?;
+            let body = match &st.body {
+                StoredBody::Sql(sql) => TriggerBody::Sql(mpedb_sql::compile_trigger_body(
+                    sql, table, schema, allow_new, allow_old,
+                )?),
+                StoredBody::Proc { name, hash, arg_srcs } => {
+                    let mut args = Vec::with_capacity(arg_srcs.len());
+                    for src in arg_srcs {
+                        args.push(mpedb_sql::compile_trigger_arg(
+                            src, table, allow_new, allow_old,
+                        )?);
+                    }
+                    TriggerBody::Spell(SpellTriggerBody {
+                        args,
+                        ready: self.resolve_spell_body(name, hash),
+                    })
+                }
+            };
             let when = match &st.when_src {
                 Some(src) => Some(mpedb_sql::compile_trigger_when(
                     src, table, allow_new, allow_old,
@@ -312,6 +460,113 @@ impl Database {
             }
         }
         Ok(set)
+    }
+
+    /// Resolve an `EXECUTE PROCEDURE` body to fire-readiness: load the PINNED
+    /// procedure blob by content hash and pre-resolve every embedded plan.
+    /// Failures return `Err(message)` — the poisoned-body containment: only
+    /// firing statements see the error, and the message says how to repair.
+    fn resolve_spell_body(
+        &self,
+        name: &str,
+        hash: &[u8; 32],
+    ) -> std::result::Result<SpellReady, String> {
+        let proc = self
+            .load_trigger_proc(hash)
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| {
+                format!(
+                    "trigger procedure `{name}` (hash {}) is no longer stored — \
+                     re-define the procedure and re-create the trigger",
+                    mpedb_spell::hash::ProcHash(*hash)
+                )
+            })?;
+        let mut plans = HashMap::with_capacity(proc.plans.len());
+        for pr in &proc.plans {
+            let plan = self.resolve_spell_plan(&pr.hash).map_err(|e| {
+                format!(
+                    "trigger procedure `{name}`: embedded statement (plan {}) \
+                     cannot be resolved: {e} — re-define the procedure and \
+                     re-create the trigger",
+                    pr.hash
+                )
+            })?;
+            // A trigger fires with no session: `current_setting()` context in
+            // an embedded statement has nowhere to resolve from. Refuse at
+            // build so the gap is a named poison, not a fire-time surprise.
+            if let Some(key) = plan
+                .context_keys
+                .iter()
+                .find(|k| k.as_str() != mpedb_sql::STATEMENT_INSTANT_KEY)
+            {
+                return Err(format!(
+                    "trigger procedure `{name}`: embedded statement uses \
+                     current_setting('{key}'), which needs a session and is \
+                     not available inside a trigger"
+                ));
+            }
+            plans.insert(pr.hash.0, plan);
+        }
+        Ok(SpellReady { proc, plans })
+    }
+
+    /// Load a stored PROCEDURE blob by content hash (`proch/<hash>`), blake3-
+    /// verified, cached in the shared spell cache (hash-keyed ⇒ immutable ⇒
+    /// never stale). Unlike [`Database::load_proc_by_hash`] (the stored-
+    /// FUNCTION loader) this permits database operations — running SQL is the
+    /// point of a trigger procedure.
+    fn load_trigger_proc(
+        &self,
+        hash: &[u8; 32],
+    ) -> Result<Option<Arc<mpedb_spell::ir::Proc>>> {
+        if let Some(p) = self.spell_cache.read().expect(POISON).get(hash) {
+            return Ok(Some(p.clone()));
+        }
+        let blob_key = crate::sys_record_subkey(crate::NS_PROC_HASH, hash)?;
+        let r = self.engine.begin_read()?;
+        let blob = r.sys_get(&blob_key);
+        r.finish()?;
+        let Some(blob) = blob? else {
+            return Ok(None);
+        };
+        if *blake3::hash(&blob).as_bytes() != *hash {
+            return Err(Error::Corrupt(
+                "stored procedure blob does not match its hash".into(),
+            ));
+        }
+        let proc = Arc::new(mpedb_spell::ir::Proc::decode(&blob)?);
+        self.spell_cache
+            .write()
+            .expect(POISON)
+            .insert(*hash, proc.clone());
+        Ok(Some(proc))
+    }
+
+    /// Resolve one embedded plan hash: the shared cache/registry first; on
+    /// `PlanInvalidated` (the blob predates a schema change) re-prepare from
+    /// the registry record's stored SQL against the LIVE schema — the same
+    /// re-derivation a view body gets, so a trigger procedure survives every
+    /// schema change its statements still bind under.
+    fn resolve_spell_plan(&self, hash: &mpedb_types::PlanHash) -> Result<Arc<CompiledPlan>> {
+        match self.cached_or_load_tls(hash) {
+            Ok(p) => Ok(p),
+            Err(Error::PlanInvalidated) => {
+                let subkey = crate::registry::plan_subkey(hash);
+                let r = self.engine.begin_read()?;
+                let record = r.sys_get(&subkey);
+                r.finish()?;
+                let Some(record) = record? else {
+                    return Err(Error::UnknownPlan(*hash));
+                };
+                let sql = crate::registry::parse_record(&record)
+                    .ok_or(Error::UnknownPlan(*hash))?
+                    .sql
+                    .to_owned();
+                let (plan, _explain) = self.compile_maybe_explain(&sql)?;
+                Ok(Arc::new(plan))
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The current [`TriggerSet`], rebuilt only when a DDL commit moved
@@ -395,12 +650,13 @@ impl Database {
 
         // Compile-check at define time so a broken trigger is rejected at CREATE,
         // not discovered at fire time (DESIGN-TRIGGERS §3.1).
-        let _ = mpedb_sql::compile_trigger_body(
-            &spec.body_sql,
+        let stored_body = build_stored_body(
+            &spec.body,
             table,
             &bundle.schema,
             allow_new,
             allow_old,
+            &mut |name| self.sys_record_get(crate::NS_PROC, name.as_bytes()),
         )?;
         if let Some(when_src) = &spec.when_src {
             let _ = mpedb_sql::compile_trigger_when(when_src, table, allow_new, allow_old)?;
@@ -425,7 +681,7 @@ impl Database {
             event,
             update_of,
             when_src: spec.when_src.clone(),
-            body_sql: spec.body_sql.clone(),
+            body: stored_body,
         }
         .encode();
         let res = (|| {
@@ -513,12 +769,18 @@ pub(crate) fn create_trigger_on_txn(
         mpedb_sql::TriggerEvent::Delete => (TrgEvent::Delete, false, true, Vec::new()),
     };
 
-    let _ = mpedb_sql::compile_trigger_body(
-        &spec.body_sql,
+    let stored_body = build_stored_body(
+        &spec.body,
         &table,
         &bundle.schema,
         allow_new,
         allow_old,
+        // Resolve the procedure through THIS txn, so a procedure defined
+        // earlier in the same uncommitted transaction is visible.
+        &mut |name| {
+            let k = crate::sys_record_subkey(crate::NS_PROC, name.as_bytes())?;
+            w.sys_get(&k)
+        },
     )?;
     if let Some(when_src) = &spec.when_src {
         let _ = mpedb_sql::compile_trigger_when(when_src, &table, allow_new, allow_old)?;
@@ -544,7 +806,7 @@ pub(crate) fn create_trigger_on_txn(
         event,
         update_of,
         when_src: spec.when_src.clone(),
-        body_sql: spec.body_sql.clone(),
+        body: stored_body,
     }
     .encode();
     w.sys_put(&key, &record)?;
@@ -648,11 +910,19 @@ fn reconstruct_create_trigger(st: &StoredTrigger, table: &str, col_names: &[Stri
         .as_ref()
         .map(|w| format!(" WHEN {w}"))
         .unwrap_or_default();
-    // Body is stored without the BEGIN/END wrapper the parser strips.
-    format!(
-        "CREATE TRIGGER \"{}\" {timing} {event} ON \"{table}\"{when} BEGIN {} END",
-        st.name, st.body_sql
-    )
+    match &st.body {
+        // Body is stored without the BEGIN/END wrapper the parser strips.
+        StoredBody::Sql(sql) => format!(
+            "CREATE TRIGGER \"{}\" {timing} {event} ON \"{table}\"{when} BEGIN {sql} END",
+            st.name
+        ),
+        StoredBody::Proc { name, arg_srcs, .. } => format!(
+            "CREATE TRIGGER \"{}\" {timing} {event} ON \"{table}\"{when} \
+             EXECUTE PROCEDURE {name}({})",
+            st.name,
+            arg_srcs.join(", ")
+        ),
+    }
 }
 
 /// Delete every trigger record targeting `table_id`, inside the caller's write
@@ -685,7 +955,23 @@ mod tests {
             event: TrgEvent::Insert,
             update_of: vec![1, 4],
             when_src: Some("NEW.total > 100".into()),
-            body_sql: "INSERT INTO audit (oid) VALUES (NEW.id)".into(),
+            body: StoredBody::Sql("INSERT INTO audit (oid) VALUES (NEW.id)".into()),
+        }
+    }
+
+    fn sample_proc() -> StoredTrigger {
+        StoredTrigger {
+            name: "enrich_upd".into(),
+            table_id: 7,
+            timing: TrgTiming::Before,
+            event: TrgEvent::Update,
+            update_of: Vec::new(),
+            when_src: None,
+            body: StoredBody::Proc {
+                name: "enrich".into(),
+                hash: [0xAB; 32],
+                arg_srcs: vec!["NEW.id".into(), "coalesce(OLD.tag, 'none')".into()],
+            },
         }
     }
 
@@ -700,22 +986,35 @@ mod tests {
             ..sample()
         };
         assert_eq!(StoredTrigger::decode(&t2.encode()).unwrap(), t2);
+        // The stage-5 procedure body, including a zero-argument call.
+        let t3 = sample_proc();
+        assert_eq!(StoredTrigger::decode(&t3.encode()).unwrap(), t3);
+        let t4 = StoredTrigger {
+            body: StoredBody::Proc {
+                name: "hook".into(),
+                hash: [1; 32],
+                arg_srcs: Vec::new(),
+            },
+            ..sample_proc()
+        };
+        assert_eq!(StoredTrigger::decode(&t4.encode()).unwrap(), t4);
     }
 
     #[test]
     fn decode_is_corrupt_never_panic_at_every_truncation() {
-        let bytes = sample().encode();
-        for n in 0..bytes.len() {
-            // Every prefix shorter than the whole must be Corrupt, not a panic.
-            assert!(
-                StoredTrigger::decode(&bytes[..n]).is_err(),
-                "prefix of len {n} decoded"
-            );
+        for bytes in [sample().encode(), sample_proc().encode()] {
+            for n in 0..bytes.len() {
+                // Every prefix shorter than the whole must be Corrupt, not a panic.
+                assert!(
+                    StoredTrigger::decode(&bytes[..n]).is_err(),
+                    "prefix of len {n} decoded"
+                );
+            }
+            // Trailing garbage is rejected too.
+            let mut extra = bytes.clone();
+            extra.push(0);
+            assert!(StoredTrigger::decode(&extra).is_err());
         }
-        // Trailing garbage is rejected too.
-        let mut extra = bytes.clone();
-        extra.push(0);
-        assert!(StoredTrigger::decode(&extra).is_err());
     }
 
     #[test]

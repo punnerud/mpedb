@@ -1087,20 +1087,26 @@ impl CompiledPlan {
     /// before access resolution and are legal everywhere.
     fn validate_subplans(&self, schema: &Schema, budget: &mut usize) -> Result<()> {
         // A SELECT owns an outer ROW that a subplan may correlate to. An
-        // UPDATE/DELETE (#97) does not: `exec_stmt_impl` fills its reserved
+        // INSERT/UPDATE/DELETE does not: `exec_stmt_impl` fills its reserved
         // slots ONCE before dispatch and the write path has no per-row fill
         // phase at all, so a correlated slot there would be an unfilled hole.
         // Requiring every top-level subplan uncorrelated makes the whole
         // gather-side slot discipline vacuous — there is no correlated slot to
         // leak into `access`/`filter` — so it is checked here instead of via
-        // `check_slot_discipline`, which needs a `SelectPlan`. (An INSERT's
-        // subplans belong to its source SELECT, whose param space is merged
-        // rather than reserved; that shape stays refused.)
+        // `check_slot_discipline`, which needs a `SelectPlan`. (An INSERT …
+        // SELECT source's own subplans merge into that SELECT's param space;
+        // the statement-level list here holds subplans from the VALUES
+        // expressions and the ON CONFLICT SET/filter — refusing it refused
+        // decoding every `INSERT … VALUES ((SELECT …)), …` plan the planner
+        // happily produces, which made such plans unloadable from the shared
+        // registry: works in-process from the local cache, `UnknownPlan` from
+        // every other process. The regression test is
+        // `insert_with_scalar_subquery_round_trips`.)
         let outer = match &self.stmt {
             PlanStmt::Select(outer) => Some(outer),
-            PlanStmt::Update { .. } | PlanStmt::Delete { .. } => {
+            PlanStmt::Insert { .. } | PlanStmt::Update { .. } | PlanStmt::Delete { .. } => {
                 if self.subplans.iter().any(|s| !s.outer_args.is_empty()) {
-                    return Err(corrupt("correlated subplan on an UPDATE/DELETE"));
+                    return Err(corrupt("correlated subplan on a write statement"));
                 }
                 None
             }

@@ -172,6 +172,36 @@ pub fn compile_trigger_when(
     Ok((program, map))
 }
 
+/// Compile one `EXECUTE PROCEDURE p(<arg>, …)` argument SOURCE against `target`
+/// (DESIGN-TRIGGERS §5.1): an expression over `NEW.<col>` / `OLD.<col>` /
+/// constants, compiled to a scalar program whose parameters are the referenced
+/// row columns (same slot machinery as the `WHEN` predicate — the executor
+/// fills them from the row images and evaluates to the procedure's positional
+/// argument value). Same refusals as `WHEN`: no subqueries, no bare columns,
+/// no query parameters, no `current_setting()`.
+pub fn compile_trigger_arg(
+    arg_src: &str,
+    target: &TableDef,
+    allow_new: bool,
+    allow_old: bool,
+) -> Result<(ExprProgram, RowMap)> {
+    let (mut expr, n_params) = parser::parse_expr_only(arg_src)?;
+    if n_params > 0 {
+        return Err(trg_err(
+            "query parameters ($1 / ?) are not allowed in a trigger procedure argument",
+        ));
+    }
+    let scope = RowScope { target, allow_new, allow_old };
+    let mut map: RowMap = Vec::new();
+    rewrite_row_in_expr(&mut expr, &scope, &mut map)?;
+    // Bind against the zero-column dual table (as `WHEN` does) so a surviving
+    // bare column fails to resolve; the rewritten row slots bind as params.
+    let mut b = Binder::new(dual_def(), map.len() as u16, true);
+    let (bound, _ty) = b.bind_expr(&expr)?;
+    let program = binder::compile_program(&bound)?;
+    Ok((program, map))
+}
+
 /// Rewrite `NEW.<col>` / `OLD.<col>` into reserved parameters over a whole body
 /// statement.
 fn rewrite_row_in_stmt(s: &mut Stmt, scope: &RowScope, map: &mut RowMap) -> Result<()> {

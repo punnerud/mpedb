@@ -57,10 +57,9 @@ use mpedb_sql::PlanStmt;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
-/// Namespace for name-keyed proc blobs.
-pub const NS_PROC: &str = "proc";
-/// Namespace for hash-keyed proc blobs.
-pub const NS_PROC_HASH: &str = "proch";
+// The proc namespaces are owned by `mpedb` (the trigger catalog reads them
+// too); re-exported here so existing `mpedb_proc::NS_PROC` users are unmoved.
+pub use mpedb::{NS_PROC, NS_PROC_HASH};
 
 const POISON: &str = "proc cache lock poisoned";
 
@@ -206,10 +205,15 @@ impl<'db> ProcEngine<'db> {
                     ))
                 }
             };
-            if plan.n_params as usize != call.argc as usize {
+            // Count what the CALLER supplies — `n_params` also counts the
+            // reserved subplan/context tail (a scalar subquery, a literal
+            // `'now'`), which the executor fills itself; requiring arguments
+            // for those refused every proc whose SQL held a subquery.
+            if plan.n_user_params() as usize != call.argc as usize {
                 return Err(at(format!(
                     "SQL takes {} parameter(s) but {} argument(s) were passed",
-                    plan.n_params, call.argc
+                    plan.n_user_params(),
+                    call.argc
                 )));
             }
             // Publish through the facade (shared registry) — the runtime

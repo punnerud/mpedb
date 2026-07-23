@@ -16,6 +16,7 @@ use mpedb_types::{
     ExprProgram, HostFns, KeyBound, KeyPart, Result, Schema, TableDef, Value,
 };
 use std::cmp::Ordering;
+use std::sync::Arc;
 use std::collections::BinaryHeap;
 
 std::thread_local! {
@@ -3099,22 +3100,181 @@ fn fire_row_triggers(
                 continue;
             }
         }
-        // Multi-statement body: each statement runs in order on the same txn.
-        for (body_plan, body_map) in &trig.body {
-            let body_params = pick(body_map)?;
-            let mut inner_partial = false;
-            exec_stmt_triggered(
-                ctx,
-                schema,
-                body_plan,
-                &body_params,
-                &mut inner_partial,
-                triggers,
-                depth + 1,
-            )?;
+        match &trig.body {
+            // Multi-statement body: each statement runs in order on the same txn.
+            crate::trigger::TriggerBody::Sql(stmts) => {
+                for (body_plan, body_map) in stmts {
+                    let body_params = pick(body_map)?;
+                    let mut inner_partial = false;
+                    exec_stmt_triggered(
+                        ctx,
+                        schema,
+                        body_plan,
+                        &body_params,
+                        &mut inner_partial,
+                        triggers,
+                        depth + 1,
+                    )?;
+                }
+            }
+            // PySpell body (DESIGN-TRIGGERS §5): evaluate the argument
+            // programs over the row images, then run the pinned procedure's IR
+            // on THIS ctx through the bridge — its embedded statements recurse
+            // like an SQL body's, never through the facade.
+            crate::trigger::TriggerBody::Spell(sb) => {
+                let ready = sb.ready.as_ref().map_err(|m| {
+                    Error::Unsupported(format!("trigger `{}`: {m}", trig.name))
+                })?;
+                let mut args = Vec::with_capacity(sb.args.len());
+                let mut stack = Vec::new();
+                for (prog, arg_map) in &sb.args {
+                    let slots = pick(arg_map)?;
+                    args.push(prog.eval_with_stack(&mut stack, &[], &slots)?);
+                }
+                let mut bridge = CtxBridge {
+                    ctx,
+                    schema,
+                    plans: &ready.plans,
+                    triggers,
+                    depth,
+                    streams: Vec::new(),
+                };
+                mpedb_spell::interp::run(
+                    &ready.proc,
+                    &args,
+                    &mut bridge,
+                    crate::trigger::TRIGGER_BUDGET,
+                )?;
+            }
         }
     }
     Ok(())
+}
+
+/// [`DbBridge`](mpedb_spell::interp::DbBridge) over the LIVE transaction a
+/// trigger fires inside (DESIGN-TRIGGERS §5.2): each embedded statement was
+/// pre-resolved by hash at catalog build, and runs here by recursing on the
+/// same `ctx` at `depth + 1` — the procedure sees the triggering statement's
+/// uncommitted writes and unwinds with it, and its own DML fires nested
+/// triggers under the same depth cap. Cursors materialize their result on
+/// open (the k-row streaming path needs a reader slot a held write txn cannot
+/// nest), which preserves semantics exactly — the interpreter's row budget
+/// still meters consumption.
+struct CtxBridge<'a> {
+    ctx: &'a mut dyn TxnCtx,
+    schema: &'a Schema,
+    plans: &'a std::collections::HashMap<[u8; 32], Arc<CompiledPlan>>,
+    triggers: &'a TriggerSet,
+    depth: u32,
+    streams: Vec<Option<std::vec::IntoIter<Vec<Value>>>>,
+}
+
+impl CtxBridge<'_> {
+    fn run_plan(
+        &mut self,
+        plan_ref: &mpedb_spell::ir::PlanRef,
+        params: &[Value],
+    ) -> Result<ExecResult> {
+        let plan = self.plans.get(&plan_ref.hash.0).ok_or_else(|| {
+            internal("trigger procedure references an unresolved plan (catalog-build bug)")
+        })?;
+        // Rebuild the full parameter buffer the way `session::resolve_params`
+        // does, minus the session: user params, NULL holes for subplan slots
+        // (the executor fills them), and the statement instant for a literal
+        // `'now'`. Any other context key was refused at catalog build.
+        let n_ctx = plan.context_keys.len();
+        let n_sub = plan.n_subplan_slots() as usize;
+        let n_user = plan.n_params as usize - n_ctx - n_sub;
+        if params.len() != n_user {
+            return Err(Error::WrongParamCount {
+                expected: n_user,
+                got: params.len(),
+            });
+        }
+        let plan = plan.clone();
+        let mut full = Vec::with_capacity(plan.n_params as usize);
+        full.extend_from_slice(params);
+        full.resize(n_user + n_sub, Value::Null);
+        for key in &plan.context_keys {
+            if key == mpedb_sql::STATEMENT_INSTANT_KEY {
+                full.push(Value::Text(mpedb_types::sqlite_now_string(now_micros())));
+            } else {
+                return Err(Error::Unsupported(format!(
+                    "current_setting('{key}') needs a session and is not \
+                     available inside a trigger"
+                )));
+            }
+        }
+        let mut inner_partial = false;
+        exec_stmt_triggered(
+            self.ctx,
+            self.schema,
+            &plan,
+            &full,
+            &mut inner_partial,
+            self.triggers,
+            self.depth + 1,
+        )
+    }
+}
+
+impl mpedb_spell::interp::DbBridge for CtxBridge<'_> {
+    fn query(
+        &mut self,
+        plan: &mpedb_spell::ir::PlanRef,
+        params: &[Value],
+    ) -> Result<Vec<Vec<Value>>> {
+        match self.run_plan(plan, params)? {
+            ExecResult::Rows { rows, .. } => Ok(rows),
+            other => Err(internal(&format!(
+                "trigger procedure query returned {other:?} (validator bug)"
+            ))),
+        }
+    }
+
+    fn exec(&mut self, plan: &mpedb_spell::ir::PlanRef, params: &[Value]) -> Result<u64> {
+        match self.run_plan(plan, params)? {
+            ExecResult::Affected(n) => Ok(n),
+            // RETURNING inside a procedure's exec: row count is the answer.
+            ExecResult::Rows { rows, .. } => Ok(rows.len() as u64),
+            other => Err(internal(&format!(
+                "trigger procedure exec returned {other:?} (validator bug)"
+            ))),
+        }
+    }
+
+    fn cursor_open(
+        &mut self,
+        plan: &mpedb_spell::ir::PlanRef,
+        params: &[Value],
+    ) -> Result<u32> {
+        let rows = self.query(plan, params)?;
+        let slot = self
+            .streams
+            .iter()
+            .position(|s| s.is_none())
+            .unwrap_or(self.streams.len());
+        if slot == self.streams.len() {
+            self.streams.push(None);
+        }
+        self.streams[slot] = Some(rows.into_iter());
+        Ok(slot as u32)
+    }
+
+    fn cursor_advance(&mut self, stream: u32) -> Result<Option<Vec<Value>>> {
+        let slot = self
+            .streams
+            .get_mut(stream as usize)
+            .ok_or_else(|| internal("trigger procedure advanced an unknown cursor"))?;
+        let Some(it) = slot else {
+            return Ok(None);
+        };
+        let row = it.next();
+        if row.is_none() {
+            *slot = None;
+        }
+        Ok(row)
+    }
 }
 
 /// Project one written row through a `RETURNING` clause.

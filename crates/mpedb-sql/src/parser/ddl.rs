@@ -9,7 +9,8 @@
 
 use super::Parser;
 use crate::ddl::{
-    CreatePolicySpec, CreateTriggerSpec, DdlStmt, RlsAction, TriggerEvent, TriggerTiming,
+    CreatePolicySpec, CreateTriggerSpec, DdlStmt, RlsAction, TriggerBodySpec, TriggerEvent,
+    TriggerTiming,
 };
 use crate::token::{tokenize, Kw, Tok};
 use mpedb_types::{Collation, DefaultExpr, PolicyCmd, Result, Value};
@@ -850,10 +851,11 @@ impl<'a> Parser<'a> {
     /// `CREATE TRIGGER [IF NOT EXISTS] <name> {BEFORE|AFTER}
     ///    {INSERT|UPDATE [OF cols]|DELETE} ON <table> [FOR EACH ROW]
     ///    [WHEN (<cond>)] BEGIN <stmt>; END` (DESIGN-TRIGGERS §2). The `WHEN`
-    /// predicate and the `BEGIN … END` body are captured as source text and
+    /// predicate and the body (`BEGIN … END` SQL, or `EXECUTE PROCEDURE
+    /// p(args…)` — stage 5, PySpell) are captured as source text and
     /// re-compiled by the facade at apply/load time — exactly like a view's
-    /// SELECT and a policy predicate. `INSTEAD OF`, `FOR EACH STATEMENT` and
-    /// `EXECUTE PROCEDURE` are named refusals (later stages / PySpell).
+    /// SELECT and a policy predicate. `INSTEAD OF` and `FOR EACH STATEMENT`
+    /// are named refusals.
     fn parse_create_trigger(&mut self) -> Result<DdlStmt> {
         let if_not_exists = if self.eat_word("IF") {
             self.expect_kw(Kw::Not, "NOT")?;
@@ -917,15 +919,18 @@ impl<'a> Parser<'a> {
         } else {
             None
         };
-        // Body: `BEGIN <stmt>; … END` (SQL). `EXECUTE PROCEDURE` (PySpell) is a
-        // named refusal until DESIGN-TRIGGERS stage 5.
-        let body_sql = if self.eat_word("EXECUTE") {
-            let _ = self.eat_word("PROCEDURE");
-            return Err(self.err_here(
-                "EXECUTE PROCEDURE (PySpell) trigger bodies are not supported yet",
-            ));
+        // Body: `BEGIN <stmt>; … END` (SQL) or `EXECUTE PROCEDURE p(args…)`
+        // (PySpell, DESIGN-TRIGGERS stage 5).
+        let body = if self.eat_word("EXECUTE") {
+            self.expect_word("PROCEDURE")?;
+            let proc_name = self.ident("procedure name")?;
+            let arg_srcs = self.capture_call_arg_sources()?;
+            TriggerBodySpec::Proc {
+                name: proc_name,
+                arg_srcs,
+            }
         } else if self.eat_kw(Kw::Begin) {
-            self.capture_begin_end_source()?
+            TriggerBodySpec::Sql(self.capture_begin_end_source()?)
         } else {
             return Err(
                 self.err_here("expected BEGIN … END (or EXECUTE PROCEDURE) for the trigger body")
@@ -937,7 +942,7 @@ impl<'a> Parser<'a> {
             event,
             table,
             when_src,
-            body_sql,
+            body,
             if_not_exists,
         }))
     }
@@ -974,6 +979,46 @@ impl<'a> Parser<'a> {
             return Err(self.err_here("trigger body must contain a statement"));
         }
         Ok(src)
+    }
+
+    /// Capture the comma-separated argument SOURCES of an `EXECUTE PROCEDURE
+    /// p(arg, …)` call: consume `( … )`, splitting at top-level commas only (a
+    /// comma inside nested parens — a function call in an argument — does not
+    /// split). Each fragment is compiled by the facade in the trigger's
+    /// `NEW`/`OLD` scope at apply time. `p()` yields an empty list.
+    fn capture_call_arg_sources(&mut self) -> Result<Vec<String>> {
+        self.expect(&Tok::LParen, "`(` after the procedure name")?;
+        let mut args = Vec::new();
+        let mut start = self.here();
+        let mut depth = 0usize;
+        loop {
+            let here = self.here();
+            match self.advance() {
+                Some(Tok::LParen) => depth += 1,
+                Some(Tok::RParen) => {
+                    if depth == 0 {
+                        let frag = self.src.get(start..here).unwrap_or("").trim();
+                        if !frag.is_empty() {
+                            args.push(frag.to_string());
+                        } else if !args.is_empty() {
+                            return Err(self.err_here("empty procedure argument"));
+                        }
+                        return Ok(args);
+                    }
+                    depth -= 1;
+                }
+                Some(Tok::Comma) if depth == 0 => {
+                    let frag = self.src.get(start..here).unwrap_or("").trim();
+                    if frag.is_empty() {
+                        return Err(self.err_here("empty procedure argument"));
+                    }
+                    args.push(frag.to_string());
+                    start = self.here();
+                }
+                Some(_) => {}
+                None => return Err(self.err_here("unterminated procedure argument list")),
+            }
+        }
     }
 
     fn parse_drop_trigger(&mut self) -> Result<DdlStmt> {
