@@ -30,6 +30,13 @@ both on the same volume. Attribution: existing MPEE-aligned path (content-hashed
 `execute(hash)`, streaming LIMIT / `scan_rows_capped` per DESIGN-MPEE-OPT). Full
 tables in the RESULTS file above.
 
+**Graph workloads are measured separately**, against Neo4j 5.26 with an edge
+table and recursive CTEs — no graph machinery at all:
+[BENCHMARKS-GRAPH.md](BENCHMARKS-GRAPH.md). The crossover is at hop 3: the edge
+table wins one and two probes out, native adjacency wins deeper traversals
+(up to 13× on a global triangle sweep). Same per-probe execution cost the OLAP
+page brackets against SQLite, measured from the other side.
+
 **Analytics is measured separately**, against DuckDB with SQLite as the control
 group: [BENCHMARKS-OLAP.md](BENCHMARKS-OLAP.md). Two findings there are mpedb's
 own rather than "row store versus column store" — `count(*)` counted the PK tree
