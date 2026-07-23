@@ -11,20 +11,37 @@
 //! before this module existed.
 //!
 //! Record: key `table_id u32 BE ‖ index_no u32 BE`, value
-//! `version u8 ‖ schema_gen u64 LE ‖ ndv u64 LE`. The schema generation guards
-//! against DDL renumbering indexes out from under a stored record (DROP will
-//! reuse index numbers): a mismatched generation reads as "never analyzed",
-//! which mis-prices nothing — it only forfeits the discount until the next
-//! analyze. Coarser than keying on index identity (#118's content hash), and
-//! deliberately so: a stats record is a cost hint, and the failure mode of a
-//! stale hint must be a worse plan ranking, never a wrong answer.
+//! `version u8 ‖ fingerprint 32B ‖ ndv u64 LE`. The fingerprint —
+//! `blake3(table name ‖ index column names)` — guards against DDL renumbering
+//! an index out from under a stored record (DROP reuses index numbers): a
+//! mismatch reads as "never analyzed", which mis-prices nothing. It is a
+//! FINGERPRINT and not the schema generation on purpose: the generation also
+//! bumps for every cost-layer change (tunables, policies, stored functions),
+//! and gen-guarded stats died on every one of those — the cost_layer test
+//! caught exactly that. A stats record is a cost hint; its staleness rule
+//! must track the INDEX'S identity, nothing else.
 
 use mpedb_types::{Error, Result, TableKind, Value};
 
 /// Namespace in the sys-record keyspace.
 pub const NS: &str = "stats";
 
-const VERSION: u8 = 1;
+const VERSION: u8 = 2;
+
+/// The identity a record is pinned to: the table's NAME and the index's
+/// column NAMES (the #118 names-not-ordinals rule, in miniature). Survives
+/// unrelated DDL and every cost-layer change; changes exactly when the slot
+/// `(table_id, index_no)` could mean a different index.
+pub fn index_fingerprint(table: &str, columns: &[&str]) -> [u8; 32] {
+    let mut b: Vec<u8> = Vec::with_capacity(table.len() + 16);
+    b.extend_from_slice(table.as_bytes());
+    b.push(0);
+    for c in columns {
+        b.extend_from_slice(c.as_bytes());
+        b.push(1);
+    }
+    *blake3::hash(&b).as_bytes()
+}
 
 pub fn record_key(table_id: u32, index_no: u32) -> [u8; 8] {
     let mut k = [0u8; 8];
@@ -33,26 +50,25 @@ pub fn record_key(table_id: u32, index_no: u32) -> [u8; 8] {
     k
 }
 
-pub fn encode_record(schema_gen: u64, ndv: u64) -> [u8; 17] {
-    let mut v = [0u8; 17];
+pub fn encode_record(fingerprint: &[u8; 32], ndv: u64) -> [u8; 41] {
+    let mut v = [0u8; 41];
     v[0] = VERSION;
-    v[1..9].copy_from_slice(&schema_gen.to_le_bytes());
-    v[9..].copy_from_slice(&ndv.to_le_bytes());
+    v[1..33].copy_from_slice(fingerprint);
+    v[33..].copy_from_slice(&ndv.to_le_bytes());
     v
 }
 
 /// Decode a stats record; `None` for any mismatch (wrong version, wrong
-/// generation, truncated) — a stats record is advisory, so corrupt or stale
+/// fingerprint, truncated) — a stats record is advisory, so corrupt or stale
 /// reads degrade to "never analyzed" rather than erroring a prepare.
-pub fn decode_record(bytes: &[u8], schema_gen: u64) -> Option<u64> {
-    if bytes.len() != 17 || bytes[0] != VERSION {
+pub fn decode_record(bytes: &[u8], fingerprint: &[u8; 32]) -> Option<u64> {
+    if bytes.len() != 41 || bytes[0] != VERSION {
         return None;
     }
-    let gen = u64::from_le_bytes(bytes[1..9].try_into().ok()?);
-    if gen != schema_gen {
+    if &bytes[1..33] != fingerprint {
         return None;
     }
-    Some(u64::from_le_bytes(bytes[9..].try_into().ok()?))
+    Some(u64::from_le_bytes(bytes[33..].try_into().ok()?))
 }
 
 /// `bucket(n) = 64 − leading_zeros(n)` — the same quantization the solver
@@ -143,10 +159,22 @@ impl crate::Database {
         // all, so a reader never sees half an analyze.
         let mut s = self.begin()?;
         for st in &stats {
+            let t = bundle
+                .schema
+                .tables
+                .iter()
+                .find(|t| t.id == st.table_id)
+                .expect("just scanned");
+            let ix = &t.indexes[(st.index_no - 1) as usize];
+            let cols: Vec<&str> = ix
+                .columns
+                .iter()
+                .map(|&c| t.columns[c as usize].name.as_str())
+                .collect();
             s.sys_record_put(
                 NS,
                 &record_key(st.table_id, st.index_no),
-                &encode_record(bundle.schema_gen, st.ndv),
+                &encode_record(&index_fingerprint(&t.name, &cols), st.ndv),
             )?;
         }
         s.commit()?;

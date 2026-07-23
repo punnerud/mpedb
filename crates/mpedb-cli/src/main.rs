@@ -70,6 +70,9 @@ usage: mpedb <command> [args]
   fn list <target>                         list stored functions
   op define <target> <sym> <fixity> <f.py> define a custom :sym: operator
   op drop|list|install-model <target> ...  manage custom operators
+  tune set <target> name=value | show      stored cost-calculator switches
+  cost-policy set <target> <f.py> | drop   the programmable cost adjustment
+  stats <target>                           what the engine believes (rows/NDV)
   call    <target> <hash> [param ...]      execute a prepared plan by hash
   proc    define|call|list ...              stored procedures (see `proc`)
   repl    <target>                          interactive session (stdin)
@@ -153,6 +156,9 @@ fn dispatch(argv: &[String]) -> CliResult {
         "model" => cmd_model(rest),
         "fn" => cmd_fn(rest),
         "op" => cmd_op(rest),
+        "tune" => cmd_tune(rest),
+        "cost-policy" => cmd_cost_policy(rest),
+        "stats" => cmd_stats(rest),
         "call" => cmd_call(rest),
         "proc" => proc_cmd::run(rest),
         "queue" => queue::run(rest),
@@ -297,6 +303,82 @@ fn cmd_fn(args: &[String]) -> CliResult {
         }
         _ => usage("fn needs: define <target> <file.py|rs> | drop <target> <name> | list <target>"),
     }
+}
+
+/// `mpedb tune set <target> name=value | show <target>` — the cost
+/// calculator's stored switches (stage M5). Stored IN the file so every
+/// attached process prices identically; changes bump the schema generation.
+fn cmd_tune(args: &[String]) -> CliResult {
+    match args {
+        [sub, config, assignment] if sub == "set" => {
+            let db = crate::util::open_target(config)?;
+            let t = db.set_tunable(assignment)?;
+            println!("tunables: ndv_discount={}", t.ndv_discount);
+            Ok(())
+        }
+        [sub, config] if sub == "show" => {
+            let db = crate::util::open_target(config)?;
+            let t = db.tunables()?;
+            println!("ndv_discount={}", t.ndv_discount);
+            Ok(())
+        }
+        _ => usage("tune needs: set <target> name=value | show <target>"),
+    }
+}
+
+/// `mpedb cost-policy set <target> <file.py|rs> | drop <target>` — the
+/// PROGRAMMABLE cost adjustment (stage M5): a stored PySpell
+/// `def policy(kind, table, index_no, bucket, rows_bucket, archetype):`
+/// running at prepare inside the cost seam, identical in every process.
+fn cmd_cost_policy(args: &[String]) -> CliResult {
+    use mpedb::spellfn::SpellLang;
+    match args {
+        [sub, config, file] if sub == "set" => {
+            let lang = if file.ends_with(".rs") { SpellLang::Rust } else { SpellLang::Python };
+            let src = std::fs::read_to_string(file)
+                .map_err(|e| Failure::Runtime(format!("reading {file}: {e}")))?;
+            let db = crate::util::open_target(config)?;
+            let hash = db.set_cost_policy(lang, &src)?;
+            println!("cost policy stored as {hash}");
+            Ok(())
+        }
+        [sub, config] if sub == "drop" => {
+            let db = crate::util::open_target(config)?;
+            if db.drop_cost_policy()? {
+                println!("cost policy dropped");
+            } else {
+                println!("no cost policy set");
+            }
+            Ok(())
+        }
+        _ => usage("cost-policy needs: set <target> <file.py|rs> | drop <target>"),
+    }
+}
+
+/// `mpedb stats <target>` — the READ side of the cost layer: what the engine
+/// believes (rows, buckets, NDV/analyze state) per index.
+fn cmd_stats(args: &[String]) -> CliResult {
+    let [config] = args else { return usage("stats needs <config.toml|db.mpedb>") };
+    let db = crate::util::open_target(config)?;
+    let lines = db.stats_report()?;
+    if lines.is_empty() {
+        println!("no secondary indexes — nothing to report");
+        return Ok(());
+    }
+    println!("{:<28} {:>4} {:>12} {:>6} {:>6}", "index", "no", "rows", "2^", "ndv2^");
+    for l in lines {
+        println!(
+            "{:<28} {:>4} {:>12} {:>6} {:>6}",
+            format!("{}({})", l.table, l.columns.join(",")),
+            l.index_no,
+            l.rows,
+            l.rows_bucket,
+            l.ndv_bucket.map(|b| b.to_string()).unwrap_or_else(|| "—".into())
+        );
+    }
+    println!("
+`ndv2^ = —` means analyze() has not run (or DDL made it stale): `mpedb exec <t> 'ANALYZE'`-equivalent is `Database::analyze()`.");
+    Ok(())
 }
 
 /// `mpedb op define <target> <sym> <infix|postfix|prefix|niladic> <file.py|rs> [doc]

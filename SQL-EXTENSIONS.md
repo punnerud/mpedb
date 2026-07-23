@@ -33,6 +33,17 @@ mpedb exec app.toml 'SELECT double(amount) FROM orders'
 - Execution is budgeted: a runaway body is a deterministic error at the same
   instruction count everywhere.
 
+## The cost layer (tune / cost-policy / stats)
+
+The cost calculator itself is adjustable, and the adjustments live in the
+file too: `mpedb tune set <target> ndv_discount=false` (stored switches),
+`mpedb cost-policy set <target> policy.py` (a stored PySpell
+`def policy(kind, table, index_no, bucket, rows_bucket, archetype):` that
+adjusts every pricing decision — it sees statistics and the workload model's
+archetype), and `mpedb stats <target>` (what the engine believes: rows, NDV,
+analyze state). All schema-generation-gated: a change re-prices every attached
+process's next statement.
+
 ## Custom operators — `:sym:`
 
 An operator is a **compile-time macro over operand source text**. The parser
