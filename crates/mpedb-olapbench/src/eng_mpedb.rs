@@ -21,7 +21,11 @@ pub struct Mpedb {
     pub path: PathBuf,
 }
 
-/// The whole star, as the seed schema. mpedb is file-authoritative: the config
+/// The whole star, as the seed schema. Every generated column is populated on
+/// every row, and the schema SAYS so: NOT NULL is what admits `count(*)` onto
+/// an index tree at all (an index omits NULL-bearing rows, so its entry count
+/// equals the row count only when the schema proves no such row can exist) —
+/// the stage-B guard of design/DESIGN-MPEE-GENERAL.md. mpedb is file-authoritative: the config
 /// that creates the file also freezes its hash, so the schema lives here rather
 /// than in a pile of `CREATE TABLE`s.
 fn config_toml(path: &Path, size_mb: u64) -> String {
@@ -42,25 +46,31 @@ primary_key = ["id"]
   [[table.column]]
   name = "day_id"
   type = "int64"
+  nullable = false
   indexed = true
   [[table.column]]
   name = "customer_id"
   type = "int64"
+  nullable = false
   indexed = true
   [[table.column]]
   name = "product_id"
   type = "int64"
+  nullable = false
   indexed = true
   [[table.column]]
   name = "store_id"
   type = "int64"
+  nullable = false
   indexed = true
   [[table.column]]
   name = "qty"
   type = "int64"
+  nullable = false
   [[table.column]]
   name = "amount"
   type = "float64"
+  nullable = false
   indexed = true
 
 [[table]]
@@ -72,13 +82,16 @@ primary_key = ["id"]
   [[table.column]]
   name = "name"
   type = "text"
+  nullable = false
   [[table.column]]
   name = "nation_segment"
   type = "text"
+  nullable = false
   indexed = true
   [[table.column]]
   name = "age"
   type = "int64"
+  nullable = false
 
 [[table]]
 name = "product"
@@ -89,13 +102,16 @@ primary_key = ["id"]
   [[table.column]]
   name = "name"
   type = "text"
+  nullable = false
   [[table.column]]
   name = "category"
   type = "text"
+  nullable = false
   indexed = true
   [[table.column]]
   name = "price"
   type = "float64"
+  nullable = false
 
 [[table]]
 name = "store"
@@ -106,9 +122,11 @@ primary_key = ["id"]
   [[table.column]]
   name = "name"
   type = "text"
+  nullable = false
   [[table.column]]
   name = "nation"
   type = "text"
+  nullable = false
   indexed = true
 
 [[table]]
@@ -120,13 +138,16 @@ primary_key = ["id"]
   [[table.column]]
   name = "year"
   type = "int64"
+  nullable = false
   indexed = true
   [[table.column]]
   name = "month"
   type = "int64"
+  nullable = false
   [[table.column]]
   name = "dom"
   type = "int64"
+  nullable = false
 "#,
         path = path.display(),
         size_mb = size_mb
