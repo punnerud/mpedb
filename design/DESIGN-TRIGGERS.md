@@ -15,9 +15,21 @@ Deviations from the plan, all deliberate:
   statements; refusing beats mis-honouring. `ABORT` carries the user's
   message verbatim (`Error::Raise`, C shim → `SQLITE_CONSTRAINT_TRIGGER`);
   `IGNORE` is `FireOutcome::SkipRow` with sqlite's abandonment scope.
-- **No `recursive_triggers` knob yet** (§4.4): the hard depth cap
-  (`MAX_TRIGGER_DEPTH = 32`) is the only recursion guard; same-table
-  re-firing is allowed under it. The knob remains open work.
+- **`recursive_triggers` shipped as a STORED tunable** (§4.4 planned a
+  config option): `tune set recursive_triggers=true|false`, default false =
+  sqlite's default. Stored-not-config because cascade behaviour decides what
+  a statement DOES — attached processes must agree, and the tunables record
+  + gen bump is that machinery. OFF suppresses re-entering an ACTIVE trigger
+  (sqlite's rule — covers A→B→A cycles), differential-tested; ON is full
+  recursion under the depth cap (`MAX_TRIGGER_DEPTH = 32`). The #74 work
+  meter additionally charges one row per (trigger, row) fire, so cascade
+  WIDTH trips `RuntimeBudget` deterministically.
+- **Backtest** (beyond the plan): `Database::backtest_trigger` /
+  `mpedb trigger backtest` replays a trigger — stored or a dry-run
+  `CREATE TRIGGER` statement — over the target table's current rows on an
+  always-aborted txn and reports fired / WHEN-skipped / ignored / vetoed
+  counts and net per-table row effects. No row history exists, so the data
+  as it stands is the corpus; UPDATE replays state the identity assumption.
 - A spell body's embedded plans are pre-resolved at catalog build; failures
   POISON that one trigger (fire-time error naming the repair), never the
   catalog. A body plan invalidated by DDL re-prepares from the registry's
