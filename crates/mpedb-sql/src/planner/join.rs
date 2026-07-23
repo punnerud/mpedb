@@ -1014,7 +1014,10 @@ fn extract_join_access(
         // #55: an index qualifies when its FULL column prefix is pinned by
         // the join equalities (k = 1 is the single-column case). Full-width
         // unique first (at most one row per outer), then longest prefix.
-        let mut best: Option<(usize, Vec<usize>, Vec<KeyPart>, bool)> = None;
+        /// (index position, consumed conjunct indices, key parts,
+        /// full-width-unique, covers-the-row).
+        type InnerIx = (usize, Vec<usize>, Vec<KeyPart>, bool, bool);
+        let mut best: Option<InnerIx> = None;
         for (pos, ix) in inner.indexes.iter().enumerate() {
             if pos >= 63 {
                 break;
@@ -1055,18 +1058,26 @@ fn extract_join_access(
                 continue;
             }
             let full_unique = ix.unique && parts.len() == ix.columns.len();
+            // Tie-break on COVERAGE (the same rule `access.rs` applies): when
+            // two indexes pin the same prefix, the one whose entry carries the
+            // whole row wins — the executor rebuilds each inner row from the
+            // index entry instead of descending the PK tree per row, which is
+            // exactly the per-probe cost an index nested-loop pays most of.
+            let cov = super::access::index_covers_row(inner, ix);
             let better = match &best {
                 None => true,
-                Some((_, _, bparts, bfull)) => {
+                Some((_, _, bparts, bfull, bcov)) => {
                     (full_unique && !bfull)
-                        || (full_unique == *bfull && parts.len() > bparts.len())
+                        || (full_unique == *bfull
+                            && (parts.len() > bparts.len()
+                                || (parts.len() == bparts.len() && cov && !bcov)))
                 }
             };
             if better {
-                best = Some((pos, cis, parts, full_unique));
+                best = Some((pos, cis, parts, full_unique, cov));
             }
         }
-        if let Some((pos, cis, parts, _)) = best {
+        if let Some((pos, cis, parts, _, _)) = best {
             for ci in cis {
                 consumed[ci] = true;
             }

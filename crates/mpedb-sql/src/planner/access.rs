@@ -120,8 +120,17 @@ pub(super) fn extract_access(
             }
             pins
         };
-        // (index position, covering pins, full-width-unique)
-        type Candidate = (usize, Vec<(usize, Atom)>, bool);
+        // Does this index's entry carry the WHOLE row — its own columns plus
+        // the primary key, with nothing typeless and no collated key column?
+        // Then the executor rebuilds each row from the entry and never
+        // descends the PK tree (`SchemaBundle::covering`, mpedb-core). It is a
+        // TIE-BREAK only: an index that pins a longer prefix still wins, since
+        // fewer candidate rows beats a cheaper fetch per row. Used to choose
+        // between indexes that pin the SAME prefix — where the wide one is
+        // strictly better on the read side and identical on membership.
+        let covers_row = |ix: &mpedb_types::IndexDef| -> bool { index_covers_row(table, ix) };
+        // (index position, covering pins, full-width-unique, covers-the-row)
+        type Candidate = (usize, Vec<(usize, Atom)>, bool, bool);
         let mut best: Option<Candidate> = None;
         for (pos, ix) in table.indexes.iter().enumerate() {
             if pos >= 63 {
@@ -143,18 +152,22 @@ pub(super) fn extract_access(
                 continue;
             }
             let full_unique = ix.unique && pins.len() == ix.columns.len();
+            let cov = covers_row(ix);
             let better = match &best {
                 None => true,
-                Some((_, bpins, bfull)) => {
+                Some((_, bpins, bfull, bcov)) => {
                     (full_unique && !bfull)
-                        || (full_unique == *bfull && pins.len() > bpins.len())
+                        || (full_unique == *bfull
+                            && (pins.len() > bpins.len()
+                                // Same prefix pinned: the covering entry wins.
+                                || (pins.len() == bpins.len() && cov && !bcov)))
                 }
             };
             if better {
-                best = Some((pos, pins, full_unique));
+                best = Some((pos, pins, full_unique, cov));
             }
         }
-        if let Some((pos, pins, _)) = best {
+        if let Some((pos, pins, _, _)) = best {
             let mut parts = Vec::with_capacity(pins.len());
             for (i, atom) in pins {
                 consumed[i] = true;
@@ -273,4 +286,37 @@ pub(super) fn extract_access(
     // 4. Full scan; the whole predicate stays as the filter.
     let residual = rebuild_residual(conjuncts, &consumed);
     Ok((AccessPath::FullScan, residual))
+}
+
+/// Does this index's ENTRY carry the whole row — its own key columns plus the
+/// primary key the entry stores anyway? Then the executor rebuilds each row
+/// from the entry and never descends the PK tree per row
+/// (`SchemaBundle::covering`, mpedb-core, which re-checks this independently
+/// and simply falls back to the fetch when it disagrees).
+///
+/// Declines on anything the key cannot round-trip: a typeless (`Any`) column,
+/// whose key form is class-encoded, and any non-`Binary` collation, whose
+/// stored key is FOLDED — the original value is not in there to recover.
+pub(super) fn index_covers_row(table: &TableDef, ix: &mpedb_types::IndexDef) -> bool {
+    if ix
+        .columns
+        .iter()
+        .chain(table.primary_key.iter())
+        .any(|&c| {
+            table.columns.get(c as usize).is_none_or(|col| {
+                col.ty == ColumnType::Any || col.collation != Collation::Binary
+            })
+        })
+    {
+        return false;
+    }
+    let mut seen = vec![false; table.columns.len()];
+    for &c in ix.columns.iter().chain(table.primary_key.iter()) {
+        let i = c as usize;
+        if seen[i] {
+            return false; // a column twice: the engine declines too
+        }
+        seen[i] = true;
+    }
+    seen.iter().all(|&b| b)
 }
