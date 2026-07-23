@@ -65,6 +65,15 @@ NULL embeddings, OFFSET paging and the raise-on-malformed-row behaviour to the
 generic path's exactly. The mechanism is DESIGN-MPEE-GENERAL §3's monotone
 lower bound, applied per dimension instead of per table.
 
+## The operator spelling is provably free
+
+`mpedb op install-model` (the rag model's `embedding` role) installs `:~:`,
+and `ORDER BY emb :~: $q LIMIT 10` compiles to the **identical plan hash** as
+the `vec_l2(emb, $q)` spelling — asserted in the harness, reproduced in the
+2026-07-23 re-run (which also reproduced the headline: filtered exact 5.5 ms
+vs Qdrant's 75.9). The macro expands at compile time; the hash proves the
+sugar costs nothing by construction, not measured-to-be-close.
+
 ## What is deliberately absent
 
 - **An approximate index in mpedb.** The storage position is decided

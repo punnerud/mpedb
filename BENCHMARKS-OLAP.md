@@ -220,6 +220,16 @@ deterministic as today's `row_count`: bucket the index's distinct-key count in
 log2, the same way table row counts are bucketed, so the estimate cannot move
 until the data doubles.
 
+## What the extension layer adds here
+
+Deliberately NOT operator sugar: the star queries read naturally as SQL, and a
+macro would rename them, not speed them. OLAP's lever in the extension layer
+is the **cost layer** (stage M5): `mpedb tune set ndv_discount=…` and the
+stored cost-policy spell move the stage-A star flip coherently across every
+attached process (tested in `crates/mpedb/tests/cost_layer.rs`), and
+`mpedb stats` shows the row/NDV buckets these plans price by. Where graph and
+vector got a language, OLAP got a pricing console — each domain's actual gap.
+
 ## What this does not measure
 
 - **Concurrency.** Single client throughout. mpedb's multi-process writers, its
