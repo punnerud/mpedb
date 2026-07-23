@@ -65,6 +65,9 @@ struct Workload {
     about: &'static str,
     sql: String,
     cypher: String,
+    /// The same question in the `:op:` operator language (SQL-EXTENSIONS.md),
+    /// where one is defined — the arm that proves the sugar is free.
+    op: Option<String>,
 }
 
 fn workloads() -> Vec<Workload> {
@@ -78,6 +81,7 @@ fn workloads() -> Vec<Workload> {
             about: "out-degree of the hub — one index range count",
             sql: format!("SELECT count(*) FROM edge WHERE src = {h}"),
             cypher: format!("MATCH (:N {{id: {h}}})-[:E]->() RETURN count(*)"),
+            op: Some(format!("SELECT :deg: {h}")),
         },
         Workload {
             name: "hop2",
@@ -89,6 +93,7 @@ fn workloads() -> Vec<Workload> {
             cypher: format!(
                 "MATCH (:N {{id: {h}}})-[:E]->()-[:E]->(b) RETURN count(DISTINCT b.id)"
             ),
+            op: None,
         },
         Workload {
             name: "hop3",
@@ -100,6 +105,7 @@ fn workloads() -> Vec<Workload> {
             cypher: format!(
                 "MATCH (:N {{id: {h}}})-[:E]->()-[:E]->()-[:E]->(b) RETURN count(DISTINCT b.id)"
             ),
+            op: None,
         },
 
         Workload {
@@ -112,6 +118,7 @@ fn workloads() -> Vec<Workload> {
             cypher: format!(
                 "MATCH (a:N {{id: {h}}})-[:E]->()-[:E]->()-[:E]->(a) RETURN count(*)"
             ),
+            op: None,
         },
         Workload {
             name: "tri-global",
@@ -120,6 +127,7 @@ fn workloads() -> Vec<Workload> {
                   WHERE b.src = a.dst AND c.src = b.dst AND c.dst = a.src"
                 .to_string(),
             cypher: "MATCH (x)-[:E]->(y)-[:E]->(z)-[:E]->(x) RETURN count(*)".to_string(),
+            op: Some(":tri:".to_string()),
         },
     ];
     // The depth sweep, k = 4..8: hunting for where each engine's curve bends.
@@ -146,6 +154,7 @@ fn workloads() -> Vec<Workload> {
                 cypher: format!(
                     "MATCH (:N {{id: {h}}})-[:E*0..{k}]->(b) RETURN count(DISTINCT b.id)"
                 ),
+                op: Some(format!(":reach{k}: {h}")),
             },
         );
     }
@@ -211,6 +220,40 @@ primary_key = ["id"]
     let t1 = Instant::now();
     db.analyze()?;
     eprintln!("  mpedb analyze in {:.2} s", t1.elapsed().as_secs_f64());
+
+    // The operator language (SQL-EXTENSIONS.md): the model's roles install
+    // `:->:`, and the bench defines its own mini vocabulary on top. The
+    // reach operators are the interesting ones — they GENERATE the
+    // converged-frontier CTE shape, so a user of the sugar cannot write the
+    // slow (count(*)-observable) variant by accident.
+    db.set_model(include_str!("../../../models/graph.toml"))?;
+    db.install_model_operators()?;
+    db.create_operator(
+        "deg",
+        mpedb::opdef::OpFixity::Prefix,
+        mpedb::spellfn::SpellLang::Python,
+        "def deg(r):\n    return \"(SELECT count(*) FROM edge WHERE src = (\" + r + \"))\"\n",
+        ":deg: n — out-degree of node n",
+    )?;
+    for k in 4..=8u32 {
+        let body = format!(
+            "def reach(rest):\n    return \"WITH RECURSIVE r(node, d) AS (SELECT \" + rest + \", 0              UNION SELECT e.dst, r.d + 1 FROM r JOIN edge e ON e.src = r.node WHERE r.d < {k})              SELECT count(DISTINCT node) FROM r\"\n"
+        );
+        db.create_operator(
+            &format!("reach{k}"),
+            mpedb::opdef::OpFixity::Statement,
+            mpedb::spellfn::SpellLang::Python,
+            &body,
+            &format!(":reach{k}: n — distinct nodes within {k} hops of n (always the fast CTE shape)"),
+        )?;
+    }
+    db.create_operator(
+        "tri",
+        mpedb::opdef::OpFixity::Statement,
+        mpedb::spellfn::SpellLang::Python,
+        "def tri(rest):\n    return \"SELECT count(*) FROM edge a, edge b, edge c          WHERE b.src = a.dst AND c.src = b.dst AND c.dst = a.src\"\n",
+        ":tri: — every directed 3-cycle",
+    )?;
     Ok((db, load))
 }
 
@@ -352,12 +395,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     println!("## Workloads\n");
     println!("Milliseconds; cold = first run, warm = median of {reps}.\n");
-    println!("| workload | mpedb cold | mpedb warm | neo4j cold | neo4j warm | warm ratio | agree |");
-    println!("|---|---:|---:|---:|---:|---:|---|");
+    println!("| workload | mpedb cold | mpedb warm | :op: warm | neo4j cold | neo4j warm | warm ratio | agree |");
+    println!("|---|---:|---:|---:|---:|---:|---:|---|");
 
     let mut notes = Vec::new();
     for w in workloads() {
         let m = run_side(reps, || mpedb_rows(&db, &w.sql));
+        // The operator arm: the SAME question through the `:op:` language.
+        // Its answer must equal the SQL arm's — the sugar may cost nothing
+        // and change nothing.
+        let op_arm = w.op.as_ref().map(|op_sql| run_side(reps, || mpedb_rows(&db, op_sql)));
+        if let (Some(Ok(o)), Ok(mm)) = (&op_arm, &m) {
+            if o.answer != mm.answer {
+                notes.push(format!(
+                    "- `{}` OPERATOR ARM DISAGREES with the SQL arm — sugar must be free.",
+                    w.name
+                ));
+            }
+        }
         let n = run_side(reps, || neo.rows(&w.cypher, "{}").map_err(|e| e.into()));
 
         let (magree, answer) = match (&m, &n) {
@@ -379,11 +434,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             _ => "—".into(),
         };
+        let op_cell = match &op_arm {
+            None => "—".to_string(),
+            Some(Ok(c)) => format!("{:.1}", c.warm_ms),
+            Some(Err(_)) => "refused".to_string(),
+        };
         println!(
-            "| `{}` | {} | {} | {} | {} | {} | {} |",
+            "| `{}` | {} | {} | {} | {} | {} | {} | {} |",
             w.name,
             fmt(&m, |c| c.cold_ms),
             fmt(&m, |c| c.warm_ms),
+            op_cell,
             fmt(&n, |c| c.cold_ms),
             fmt(&n, |c| c.warm_ms),
             ratio,
