@@ -57,6 +57,15 @@ pub const QUERIES: &[Query] = &[
                 measures filter throughput, not selectivity handling.",
     },
     Query {
+        name: "scan-range-sum",
+        probes: Probes::Scan,
+        sql: "SELECT sum(amount) FROM fact WHERE day_id >= 1000",
+        about: "A range over an INDEXED column that matches about a third of \
+                the table — the shape where taking the index is the wrong \
+                answer, because it fetches a row per entry. mpedb prices the \
+                range's selectivity and scans instead when it is too wide.",
+    },
+    Query {
         name: "scan-multi-agg",
         probes: Probes::Scan,
         sql: "SELECT count(*), sum(qty), sum(amount), avg(amount) FROM fact",
