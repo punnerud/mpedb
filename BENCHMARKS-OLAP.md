@@ -44,21 +44,22 @@ Milliseconds, median of 5 plus an untimed warm-up.
 
 | query | probes | mpedb | duckdb | sqlite | mpedb vs duckdb | mpedb vs sqlite |
 |---|---|---:|---:|---:|---:|---:|
-| `scan-sum` | scan | 44.3 | 0.485 | 35.8 | 91× slower | 1.2× slower |
-| `scan-filter-sum` | scan | 181.8 | 0.697 | 63.3 | 261× slower | 2.9× slower |
-| `scan-multi-agg` | scan | 177.7 | 0.938 | 97.7 | 190× slower | 1.8× slower |
-| `count-star` | precompute | 3.0 | 0.218 | 0.180 | 14× slower | **17× slower** |
-| `min-max-indexed` | precompute | **0.008** | 1.9 | 61.4 | **252× faster** | **7,675× faster** |
-| `count-filtered` | precompute | 0.165 | 0.365 | 0.007 | 2.2× faster | 24× slower |
-| `group-small` | group by | 262.5 | 1.2 | 698.9 | 219× slower | **2.7× faster** |
-| `group-large` | group by | 389.0 | 8.1 | 937.2 | 48× slower | **2.4× faster** |
-| `join-star-2` | join order | ~~1198.0~~ **203.2** | 1.9 | 116.5 | 106× slower | 1.7× slower |
-| `join-star-4` | join order | ~~1325.0~~ **336.3** | 3.9 | 182.7 | 86× slower | 1.8× slower |
-| `join-bad-order` | join order | ~~1098.5~~ **196.1** | 2.7 | 95.0 | 71× slower | 2.1× slower |
+| `scan-sum` | scan | 41.2 | 0.479 | 34.8 | 86× slower | 1.2× slower |
+| `scan-filter-sum` | scan | 172.3 | 0.759 | 59.6 | 227× slower | 2.9× slower |
+| `scan-multi-agg` | scan | 173.4 | 0.843 | 93.3 | 206× slower | 1.9× slower |
+| `count-star` | precompute | ~~3.0~~ **1.5** | 0.215 | 0.141 | 7.2× slower | 10.6× slower |
+| `min-max-indexed` | precompute | **0.008** | 1.9 | 59.9 | **252× faster** | **7,488× faster** |
+| `count-filtered` | precompute | 0.151 | 0.367 | 0.007 | **2.4× faster** | 22× slower |
+| `group-small` | group by | 251.1 | 1.2 | 685.9 | 212× slower | **2.7× faster** |
+| `group-large` | group by | 365.5 | 7.9 | 911.9 | 46× slower | **2.5× faster** |
+| `join-star-2` | join order | ~~1198.0~~ **194.3** | 1.9 | 110.4 | 104× slower | 1.8× slower |
+| `join-star-4` | join order | ~~1325.0~~ **319.9** | 3.8 | 172.8 | 85× slower | 1.9× slower |
+| `join-bad-order` | join order | ~~1098.5~~ **185.9** | 2.7 | 89.6 | 69× slower | 2.1× slower |
 
-The struck-through join numbers are the same build without statistics; the bold
-ones are after `Database::analyze()` (0.18 s for all nine indexes) — the stage-A
-fix described under Loss 2, re-measured 2026-07-22 evening.
+Struck-through numbers are the original 2026-07-22 run; the table is the
+2026-07-23 re-measure after **stage A** (per-index NDV statistics —
+`Database::analyze()`, 0.17 s for nine indexes) and **stage B** (the schema
+declares NOT NULL, below). Same binary lineage, same machine, same data.
 
 Prepared and parameterised, 20,000 executions, total milliseconds:
 
@@ -98,7 +99,24 @@ beats scanning, and descending beats skipping.
 simply tighter. It is still 219× off DuckDB, which is what vectorised
 aggregation buys.
 
-### Loss 1: `count(*)` counts the widest tree — 17× slower than SQLite
+### Loss 1, closed by a schema line — and a second correction
+
+**Re-measured 2026-07-23:** 3.0 → **1.5 ms** once the benchmark schema declares
+its columns NOT NULL. The plan now reads *"aggregate via index 1 — index-tree
+scan (narrow entries, NULL-skip free)"*.
+
+This finding now carries two corrections, and the second is worth stating as
+plainly as the first. Yesterday's text claimed the narrow-tree machinery "does
+not take it at all", citing a decline at `aggregate.rs:989`. That line is in
+`try_fused_fold` — a different helper. The truth: the machinery **exists, is
+tested** (`agg_over_index.rs` asserts `count(*)` rides the narrowest
+all-NOT-NULL tree, PLAN_FORMAT 59), and did not engage here because this
+benchmark's own schema declared nothing NOT NULL — under which the PK-range
+count was the only correct behaviour available, exactly as the first correction
+suspected. The 17× was 100% schema, 0% engine.
+
+The original analysis of the mechanism follows, kept for the part that remains
+true and load-bearing: WHY NOT NULL is the admission guard.
 
 The plans, verbatim:
 

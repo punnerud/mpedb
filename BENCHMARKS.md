@@ -32,10 +32,10 @@ tables in the RESULTS file above.
 
 **Analytics is measured separately**, against DuckDB with SQLite as the control
 group: [BENCHMARKS-OLAP.md](BENCHMARKS-OLAP.md). Two findings there are mpedb's
-own rather than "row store versus column store" — `count(*)` counts the PK tree
-rather than a narrow index (17× behind SQLite, though partly a schema artefact:
-mpedb excludes NULL-bearing rows from indexes, so the shortcut needs NOT NULL
-columns), and MPEE's worst-case cost
+own rather than "row store versus column store" — `count(*)` counted the PK tree
+because the benchmark schema declared nothing NOT NULL — the narrow-tree path
+existed and was tested all along, and engages once the schema says what the
+data already was (3.0 → 1.5 ms, 2026-07-23), and MPEE's worst-case cost
 model could not see a star schema's dimension filter (7.6–12× behind SQLite —
 **fixed the same day** by the per-index NDV cost input, `2f4c7b7`: 5.9×
 recovered, now 1.7–2.1×). The

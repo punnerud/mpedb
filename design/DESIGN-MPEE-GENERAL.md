@@ -195,10 +195,15 @@ warnings`) before the next; measured results are appended to this doc per stage.
   5.9× recovered, plans read `product [index] -> fact [index]`, every engine
   still agrees, `analyze()` cost 0.18 s for nine indexes. The predicted pricing
   from §4 (17 vs 21) is the pricing observed.
-- **B — `count(*)` narrow tree, NOT-NULL-guarded.** `try_agg_index` declines
-  all-count queries today (`aggregate.rs:989`); the guard is the NULL-membership
-  rule (`engine/mod.rs:426`). Benchmark schema gains NOT NULL keys; regression
-  test proves NULL-bearing rows still count correctly.
+- **B — `count(*)` narrow tree, NOT-NULL-guarded.** **CLOSED 2026-07-23 — the
+  engine half already existed** (PLAN_FORMAT 59; `agg_over_index.rs` asserts the
+  narrowest all-NOT-NULL tree serves `count(*)`, and the `aggregate.rs:989`
+  decline this plan cited is `try_fused_fold`, a different helper). What was
+  missing was the SCHEMA: the benchmark declared nothing NOT NULL, so no
+  index's entry count provably equalled the row count. With NOT NULL declared:
+  3.0 → 1.5 ms. The residual 10.6× against SQLite is the per-leaf walk — both
+  engines now count narrow trees; answering from interior-node subtree counts
+  would be a page-format change and is deliberately not planned.
 - **C — graph vs Neo4j.** `crates/mpedb-graphbench`, std-only HTTP to the tx
   endpoint; k-hop / bounded reachability / closure / triangles, same-answer
   checked. Plus the `risk.rs` depth-guard fix: a provably monotone
