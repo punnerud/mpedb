@@ -30,6 +30,12 @@ both on the same volume. Attribution: existing MPEE-aligned path (content-hashed
 `execute(hash)`, streaming LIMIT / `scan_rows_capped` per DESIGN-MPEE-OPT). Full
 tables in the RESULTS file above.
 
+**Routing is measured separately** — real San Francisco road durations, the
+kernel's exact `(subset, last)` mode as ground truth vs the original MPEE
+solver (brooom): [BENCHMARKS-ROUTING.md](BENCHMARKS-ROUTING.md). brooom finds
+the exact optimum on every checkable sub-instance (gap +0.00%, N = 9…18);
+exact answers in milliseconds where available and declines past its cap.
+
 **Vector search is measured separately**, exact against Qdrant's approximate
 HNSW with recall@10 scored against mpedb's own ground truth:
 [BENCHMARKS-VECTOR.md](BENCHMARKS-VECTOR.md). Unfiltered, the vector index

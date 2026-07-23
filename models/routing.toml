@@ -5,4 +5,27 @@
 [model]
 name = "routing"
 archetype = "routing"
-description = "stops/vehicles/jobs + a travel matrix feeding a sequencing solver (MPEE)"
+description = "stops + a travel-time matrix feeding a sequencing solver (the kernel's Held-Karp mode / brooom)"
+
+[[model.table]]
+name = "stops"
+role = "generic"
+
+  [[model.table.access]]
+  kind = "point"
+  weight = 0.5
+
+[[model.table]]
+name = "matrix"
+role = "generic"
+read_write = "read-heavy"
+
+  [[model.table.access]]
+  kind = "filter-eq"
+  columns = ["src"]
+  weight = 1.0
+
+  [[model.table.access]]
+  kind = "order-by"
+  columns = ["secs"]
+  weight = 0.5

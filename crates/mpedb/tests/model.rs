@@ -136,13 +136,15 @@ fn store_validate_and_share_across_handles() {
         .unwrap_err();
     assert!(e.to_string().contains("colour"), "{e}");
 
-    // The other presets parse; the archetype-only ones carry no table claims
-    // and therefore validate against ANY schema — the founding example.
+    // The other presets parse; the archetype-only one carries no table claims
+    // and therefore validates against ANY schema — the founding example. The
+    // rest validate against THEIR benches' schemas (graphbench, vecbench,
+    // routebench), which is where set_model runs for them.
     d.set_model(include_str!("../../../models/sqlite3-general.toml")).unwrap();
-    d.set_model(include_str!("../../../models/routing.toml")).unwrap();
     for preset in [
         include_str!("../../../models/graph.toml"),
         include_str!("../../../models/rag.toml"),
+        include_str!("../../../models/routing.toml"),
     ] {
         WorkloadModel::from_toml_str(preset).unwrap();
     }
