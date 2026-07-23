@@ -41,6 +41,13 @@ pub enum OpFixity {
     /// `:op:` — 00: no operand input; still code that expands to an
     /// expression, and useful for exactly that.
     Niladic,
+    /// `:op: <anything…>` at STATEMENT position — bit 4 (100): the macro
+    /// receives the ENTIRE remaining source as one raw operand and returns a
+    /// complete statement. A user-defined sub-language fronting SQL: in
+    /// principle one `:graph:` operator, and the graph language behind it —
+    /// whose output may itself use further `::` forms (the expansion re-enters
+    /// the same pipeline, depth-capped).
+    Statement,
 }
 
 impl OpFixity {
@@ -50,6 +57,7 @@ impl OpFixity {
             OpFixity::Postfix => 2,
             OpFixity::Prefix => 1,
             OpFixity::Niladic => 0,
+            OpFixity::Statement => 4,
         }
     }
     pub fn from_bits(b: u8) -> Option<OpFixity> {
@@ -58,11 +66,16 @@ impl OpFixity {
             2 => OpFixity::Postfix,
             1 => OpFixity::Prefix,
             0 => OpFixity::Niladic,
+            4 => OpFixity::Statement,
             _ => return None,
         })
     }
     pub fn operand_count(self) -> u16 {
-        (self.bits() & 1) as u16 + ((self.bits() >> 1) & 1) as u16
+        match self {
+            // The whole remaining source, as one raw operand.
+            OpFixity::Statement => 1,
+            _ => (self.bits() & 1) as u16 + ((self.bits() >> 1) & 1) as u16,
+        }
     }
     pub fn name(self) -> &'static str {
         match self {
@@ -70,6 +83,7 @@ impl OpFixity {
             OpFixity::Postfix => "postfix",
             OpFixity::Prefix => "prefix",
             OpFixity::Niladic => "niladic",
+            OpFixity::Statement => "statement",
         }
     }
 }

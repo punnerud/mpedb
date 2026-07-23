@@ -184,34 +184,12 @@ impl<'a> Parser<'a> {
         let left_start = self.cur_byte();
         let mut e = self.bit_expr()?;
         // Custom operators sit at comparison precedence, like MATCH: one
-        // application, no chaining (`a :x: b :x: c` refuses — parenthesize).
-        if let Some(Tok::CustomOp(sym)) = self.peek().cloned() {
-            let fixity = self.op_fixity(&sym)?;
-            if fixity & 2 != 0 {
-                let left_text = self.src[left_start..self.cur_byte()].trim().to_string();
-                self.pos += 1; // the operator token
-                let operands: Vec<String> = if fixity & 1 != 0 {
-                    let r_start = self.cur_byte();
-                    let _right = self.bit_expr()?;
-                    let right_text = self.src[r_start..self.cur_byte()].trim().to_string();
-                    vec![left_text, right_text]
-                } else {
-                    vec![left_text]
-                };
-                e = self.expand_custom_op(&sym, &operands)?;
-                if matches!(self.peek(), Some(Tok::CustomOp(_))) {
-                    return Err(self.err_here(
-                        "custom operators do not chain — parenthesize the first application",
-                    ));
-                }
-                return Ok(e);
-            }
-            // fixity without a LEFT operand in left-operand position: the
-            // prefix/niladic forms belong in the unary tier, so a stray one
-            // here is a real syntax error.
-            return Err(self.err_here(format!(
-                ":{sym}: does not take a left operand — write it before its operand instead"
-            )));
+        // application, no chaining. The cheap `matches!` gate keeps the COLD
+        // path's locals out of this frame — cmp_expr is on the recursive
+        // spine, and its frame size is paid at every nesting level (the
+        // parser's stack-byte budget measures exactly that).
+        if matches!(self.peek(), Some(Tok::CustomOp(_))) {
+            return self.custom_infix_or_postfix(left_start);
         }
         let mut seen_cmp = false;
         loop {
@@ -425,28 +403,81 @@ impl<'a> Parser<'a> {
             let e = self.unary_expr();
             self.exit_expr();
             e
-        } else if let Some(Tok::CustomOp(sym)) = self.peek().cloned() {
-            // Prefix (01) and niladic (00) custom operators live where unary
-            // minus does; infix/postfix forms reached from HERE mean the
-            // operator had no left operand — refuse by name.
-            let fixity = self.op_fixity(&sym)?;
-            if fixity & 2 != 0 {
-                return Err(self.err_here(format!(
-                    ":{sym}: takes a left operand — write `<expr> :{sym}:`"
-                )));
-            }
-            self.pos += 1;
-            let operands: Vec<String> = if fixity & 1 != 0 {
-                let r_start = self.cur_byte();
-                let _right = self.unary_expr()?;
-                vec![self.src[r_start..self.cur_byte()].trim().to_string()]
-            } else {
-                Vec::new()
-            };
-            self.expand_custom_op(&sym, &operands)
+        } else if matches!(self.peek(), Some(Tok::CustomOp(_))) {
+            // Same cold-path rule as cmp_expr: unary_expr is on the recursive
+            // spine too.
+            self.custom_prefix_or_niladic()
         } else {
             self.collate_expr()
         }
+    }
+
+    /// The infix (11) / postfix (10) application — COLD: called only when a
+    /// `:sym:` token is actually present, so its owned locals never weigh on
+    /// the recursive spine's frames.
+    #[inline(never)]
+    fn custom_infix_or_postfix(&mut self, left_start: usize) -> Result<Expr> {
+        let Some(Tok::CustomOp(sym)) = self.peek().cloned() else {
+            return Err(self.err_here("expected a custom operator"));
+        };
+        let fixity = self.op_fixity(&sym)?;
+        if fixity == 4 {
+            return Err(self.err_here(format!(
+                ":{sym}: is a STATEMENT operator — it must begin the statement"
+            )));
+        }
+        if fixity & 2 == 0 {
+            // Prefix/niladic forms belong in the unary tier; reaching one in
+            // left-operand position is a real syntax error.
+            return Err(self.err_here(format!(
+                ":{sym}: does not take a left operand — write it before its operand instead"
+            )));
+        }
+        let left_text = self.src[left_start..self.cur_byte()].trim().to_string();
+        self.pos += 1; // the operator token
+        let operands: Vec<String> = if fixity & 1 != 0 {
+            let r_start = self.cur_byte();
+            let _right = self.bit_expr()?;
+            let right_text = self.src[r_start..self.cur_byte()].trim().to_string();
+            vec![left_text, right_text]
+        } else {
+            vec![left_text]
+        };
+        let e = self.expand_custom_op(&sym, &operands)?;
+        if matches!(self.peek(), Some(Tok::CustomOp(_))) {
+            return Err(self.err_here(
+                "custom operators do not chain — parenthesize the first application",
+            ));
+        }
+        Ok(e)
+    }
+
+    /// The prefix (01) / niladic (00) application — COLD, same rule.
+    #[inline(never)]
+    fn custom_prefix_or_niladic(&mut self) -> Result<Expr> {
+        let Some(Tok::CustomOp(sym)) = self.peek().cloned() else {
+            return Err(self.err_here("expected a custom operator"));
+        };
+        let fixity = self.op_fixity(&sym)?;
+        if fixity == 4 {
+            return Err(self.err_here(format!(
+                ":{sym}: is a STATEMENT operator — it must begin the statement"
+            )));
+        }
+        if fixity & 2 != 0 {
+            return Err(self.err_here(format!(
+                ":{sym}: takes a left operand — write `<expr> :{sym}:`"
+            )));
+        }
+        self.pos += 1;
+        let operands: Vec<String> = if fixity & 1 != 0 {
+            let r_start = self.cur_byte();
+            let _right = self.unary_expr()?;
+            vec![self.src[r_start..self.cur_byte()].trim().to_string()]
+        } else {
+            Vec::new()
+        };
+        self.expand_custom_op(&sym, &operands)
     }
 
     /// `<primary> [COLLATE <name>]*` — the postfix collation operator (task:

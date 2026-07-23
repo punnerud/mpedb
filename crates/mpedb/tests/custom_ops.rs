@@ -238,3 +238,55 @@ fn self_expansion_trips_the_depth_cap_deterministically() {
     assert!(e1.contains("8 levels"), "{e1}");
     let _ = std::fs::remove_file(&path);
 }
+
+#[test]
+fn a_statement_operator_fronts_its_own_language() {
+    let (d, path) = db("lang");
+    let mut s = d.begin().unwrap();
+    for (i, (a, b)) in [(1i64, 2i64), (2, 3)].iter().enumerate() {
+        s.query(
+            "INSERT INTO edge (eid, src, dst) VALUES ($1, $2, $3)",
+            &[Value::Int(i as i64), Value::Int(*a), Value::Int(*b)],
+        )
+        .unwrap();
+    }
+    s.query("INSERT INTO orders (id, t, amount) VALUES (1,'a',0),(2,'b',0),(3,'c',0)", &[])
+        .unwrap();
+    s.commit().unwrap();
+
+    // The inner expression operator the language's output uses — the
+    // "`::` inside it, further" part of the ask.
+    d.create_operator(
+        "->", OpFixity::Infix, SpellLang::Python,
+        "def edge_step(l, r):\n    return \"EXISTS (SELECT 1 FROM edge WHERE edge.src = (\" + l + \") AND edge.dst = (\" + r + \"))\"\n",
+        "edge exists",
+    ).unwrap();
+
+    // The STATEMENT operator (fixity bit 4 = 100): swallows the whole rest of
+    // the source and returns a complete statement. One :graph: token, and a
+    // graph language behind it.
+    d.create_operator(
+        "graph", OpFixity::Statement, SpellLang::Python,
+        "def graphlang(rest):\n\
+         \x20   if rest == \"count\":\n\
+         \x20       return \"SELECT count(*) FROM edge\"\n\
+         \x20   return \"SELECT id FROM orders WHERE id :->: (\" + rest + \") ORDER BY id\"\n",
+        "a tiny graph language: `count`, or `reachable-to <expr>`",
+    ).unwrap();
+
+    // The language's own vocabulary…
+    let got = rows(d.query(":graph: count", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Int(2)]]);
+    // …and an expansion that itself uses the inner `:->:` operator.
+    let got = rows(d.query(":graph: 3", &[]).unwrap());
+    assert_eq!(got, vec![vec![Value::Int(2)]], "order 2 has an edge to 3");
+
+    // A statement operator in expression position refuses by name…
+    let e = d.query("SELECT :graph:", &[]).unwrap_err();
+    assert!(e.to_string().contains("STATEMENT operator"), "{e}");
+    // …and an expression operator cannot begin a statement.
+    let e = d.query(":->: 3", &[]).unwrap_err();
+    assert!(e.to_string().contains("expression operator"), "{e}");
+
+    let _ = std::fs::remove_file(&path);
+}

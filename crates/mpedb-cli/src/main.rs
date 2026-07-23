@@ -311,9 +311,10 @@ fn cmd_op(args: &[String]) -> CliResult {
             "postfix" | "10" => OpFixity::Postfix,
             "prefix" | "01" => OpFixity::Prefix,
             "niladic" | "00" => OpFixity::Niladic,
+            "statement" | "100" => OpFixity::Statement,
             other => {
                 return Err(Failure::Usage(format!(
-                    "unknown fixity `{other}` — infix (11), postfix (10), prefix (01), niladic (00)"
+                    "unknown fixity `{other}` — infix (11), postfix (10), prefix (01), niladic (00), statement (100)"
                 )))
             }
         })
