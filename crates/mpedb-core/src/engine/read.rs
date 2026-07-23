@@ -336,6 +336,9 @@ impl ReadTxn<'_> {
         let iroot = self.tree_root(table_id, index_no)?;
         let root = self.tree_root(table_id, 0)?;
         let types = &self.bundle.col_types[table_id as usize];
+        // COVERING read: when the entry already carries every column, rebuild
+        // the row from it and skip the per-row PK-tree descent entirely.
+        let cov = self.bundle.covering(table_id, index_no);
         let mut out = Vec::new();
         let mut c = btree::cursor(self, iroot, Some((&prefix[..], true)), None)?;
         while let Some((k, pk_bytes)) = c.next(self)? {
@@ -343,6 +346,10 @@ impl ReadTxn<'_> {
                 break; // past every (value, *) entry
             }
             self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
+            if let Some(cov) = &cov {
+                out.push(cov.row(&k, &pk_bytes)?);
+                continue;
+            }
             match btree::get(self, root, &pk_bytes)? {
                 Some(bytes) => out.push(row::decode_row(&bytes, types)?),
                 None => {
@@ -368,10 +375,16 @@ impl ReadTxn<'_> {
         let iroot = self.tree_root(table_id, index_no)?;
         let root = self.tree_root(table_id, 0)?;
         let types = &self.bundle.col_types[table_id as usize];
+        // COVERING read — see `scan_by_index`.
+        let cov = self.bundle.covering(table_id, index_no);
         let mut out = Vec::new();
         let mut c = btree::cursor(self, iroot, lo, hi)?;
         while let Some((_k, pk_bytes)) = c.next(self)? {
             self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
+            if let Some(cov) = &cov {
+                out.push(cov.row(&_k, &pk_bytes)?);
+                continue;
+            }
             match btree::get(self, root, &pk_bytes)? {
                 Some(bytes) => out.push(row::decode_row(&bytes, types)?),
                 None => {

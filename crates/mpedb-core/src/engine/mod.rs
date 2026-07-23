@@ -452,6 +452,42 @@ pub type CheckPrograms = Vec<Vec<Option<ExprProgram>>>;
 /// table came from the config or from DDL.
 pub type CheckCompiler = dyn Fn(&Schema) -> Result<CheckPrograms> + Send + Sync;
 
+/// How to rebuild a whole row from one secondary-index ENTRY
+/// ([`SchemaBundle::covering`]): which columns the key carries, which the
+/// primary key carries, and where each lands in the row.
+pub struct Covering {
+    /// `(column ordinal, type)` for the index's key columns, in key order.
+    idx: Vec<(u16, ColumnType)>,
+    /// `(column ordinal, type)` for the primary-key columns, in key order.
+    pk: Vec<(u16, ColumnType)>,
+    /// A unique index keys by the values alone and carries the pk in the tree
+    /// VALUE; a non-unique one appends the pk to the key (`index_row_key`).
+    unique: bool,
+    ncols: usize,
+}
+
+impl Covering {
+    /// Rebuild the row from one entry. `key` is the B+tree key, `pk_bytes` the
+    /// stored value (the encoded primary key, in both layouts).
+    pub fn row(&self, key: &[u8], pk_bytes: &[u8]) -> Result<Vec<mpedb_types::Value>> {
+        let mut row = vec![mpedb_types::Value::Null; self.ncols];
+        let mut pos = 0usize;
+        for &(col, ty) in &self.idx {
+            row[col as usize] = keycode::decode_value(key, &mut pos, ty)?;
+        }
+        // The pk comes from the key SUFFIX (non-unique) or the value (unique);
+        // both are `encode_key_spec(pk_values, …)` byte-for-byte.
+        let (buf, mut ppos) = if self.unique { (pk_bytes, 0usize) } else { (key, pos) };
+        for &(col, ty) in &self.pk {
+            row[col as usize] = keycode::decode_value(buf, &mut ppos, ty)?;
+        }
+        if ppos != buf.len() {
+            return Err(Error::Corrupt("covering index entry: trailing key bytes".into()));
+        }
+        Ok(row)
+    }
+}
+
 /// The schema plus every per-table cache derived from it, immutable as a
 /// unit (#47): transactions capture ONE `Arc<SchemaBundle>` at begin, so a
 /// txn sees one schema version even while DDL swaps the engine's current
@@ -553,6 +589,53 @@ impl SchemaBundle {
     /// every key column of the table is plain, so the caller uses the bytewise
     /// encoder. `encode_key_spec(v, &[])` == `encode_key(v)`.
     #[inline]
+    /// A COVERING read plan for secondary index `index_no`, or `None` when the
+    /// entry cannot rebuild the row.
+    ///
+    /// A secondary entry already carries every indexed column (in its key) and
+    /// the row's primary key (key suffix for a non-unique index, tree value for
+    /// a unique one). When those together are ALL of the table's columns, the
+    /// row can be decoded from the entry — no descent into the PK tree, no row
+    /// decode. Same rows, same order, same membership: this changes only HOW
+    /// the row is produced, so no plan, no access path and no caller changes.
+    ///
+    /// Declines (fail-closed) unless every piece round-trips exactly:
+    /// - any COLLATED key column — a NOCASE/RTRIM index stores the FOLDED key,
+    ///   so the original value is not in there to recover (`any_key_special`);
+    /// - any `ColumnType::Any` column — its key form is class-encoded and a
+    ///   decode would have to guess the class back onto a typeless column;
+    /// - a table whose columns are not exactly (index ∪ pk).
+    pub fn covering(&self, table_id: u32, index_no: u32) -> Option<Covering> {
+        if index_no == 0 || self.any_key_special.get(table_id as usize).copied().unwrap_or(false) {
+            return None;
+        }
+        let t = table_id as usize;
+        let idx_cols = self.sec_indexes.get(t)?.get(index_no as usize - 1)?;
+        let unique = *self.sec_unique.get(t)?.get(index_no as usize - 1)?;
+        let table = self.schema.table(table_id)?;
+        let types = self.col_types.get(t)?;
+        let pk_cols = &table.primary_key;
+        // Every column present exactly once across (index ‖ pk), and none of
+        // them typeless.
+        let mut seen = vec![false; types.len()];
+        for &c in idx_cols.iter().chain(pk_cols.iter()) {
+            let i = c as usize;
+            if i >= types.len() || types[i] == mpedb_types::ColumnType::Any || seen[i] {
+                return None;
+            }
+            seen[i] = true;
+        }
+        if !seen.iter().all(|&b| b) {
+            return None;
+        }
+        Some(Covering {
+            idx: idx_cols.iter().map(|&c| (c, types[c as usize])).collect(),
+            pk: pk_cols.iter().map(|&c| (c, types[c as usize])).collect(),
+            unique,
+            ncols: types.len(),
+        })
+    }
+
     pub fn pk_coll(&self, table_id: u32) -> &[KeySpec] {
         let t = table_id as usize;
         if self.any_key_special.get(t).copied().unwrap_or(false) {
