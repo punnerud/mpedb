@@ -360,6 +360,138 @@ impl ReadTxn<'_> {
         Ok(out)
     }
 
+    /// How many rows must a table hold before an index range is worth pricing
+    /// at all? Below this the whole table fits in a handful of pages and the
+    /// fetch path cannot lose enough to pay for the counting walk.
+    const ADAPTIVE_MIN_ROWS: u64 = 4096;
+    /// The switch point, as a divisor of the table's row count: a range that
+    /// matches MORE than `rows / 8` is served by a scan instead of by
+    /// per-entry fetches.
+    ///
+    /// Measured (2M-row fact table, 2-core Linux): the index-range path costs
+    /// ~1.24 µs per matched row (a PK-tree descent and a row decode EACH),
+    /// against ~0.11 µs per row for a sequential scan carrying the predicate —
+    /// a ratio of ~11, so the two are level near 1/11 of the table and the
+    /// scan is clearly ahead by 1/8. Deliberately conservative: below the
+    /// switch the index keeps the work, so a selective range never regresses.
+    const ADAPTIVE_DIVISOR: u64 = 8;
+
+    /// [`scan_by_index_range`](Self::scan_by_index_range) that prices its own
+    /// SELECTIVITY instead of assuming it.
+    ///
+    /// The index-range access fetches one row per entry — a descent into the
+    /// PK tree and a row decode each — which beats a scan only while the range
+    /// stays small. The planner cannot know the fraction (no histograms), so
+    /// this measures it: walk the range's KEYS (no descent, no decode) and
+    /// stop the moment the count passes `rows / 8`. Under the line, fetch per
+    /// entry exactly as before. Over it, scan the table and keep the rows the
+    /// index WOULD have held — by rebuilding each row's index key and testing
+    /// it against the same raw bounds, so membership is identical by
+    /// construction, NULLs included (a NULL indexed column has no entry).
+    ///
+    /// The counting walk is bounded by `rows / 8` steps, so it is cheap when
+    /// the range is selective (it walks the whole small range) and cheap when
+    /// it is not (it stops early). Rows come back in PK order rather than
+    /// index order on the scan side; nothing may rely on that, and nothing
+    /// does — mpedb never elides a sort over an index access
+    /// (`planner/select.rs`, guard proven by differential test).
+    ///
+    /// Declines to the plain path (returning `None`) for anything it cannot
+    /// price exactly: a multi-column index, a collated key, a typeless column,
+    /// or a table too small to bother.
+    pub fn scan_by_index_range_adaptive(
+        &self,
+        table_id: u32,
+        index_no: u32,
+        lo: Option<(&[u8], bool)>,
+        hi: Option<(&[u8], bool)>,
+    ) -> Result<Option<Vec<Vec<Value>>>> {
+        let t = table_id as usize;
+        if index_no == 0 || self.bundle.any_key_special.get(t).copied().unwrap_or(false) {
+            return Ok(None);
+        }
+        let Some(cols) = self.bundle.sec_indexes.get(t).and_then(|v| v.get(index_no as usize - 1))
+        else {
+            return Ok(None);
+        };
+        let [col] = cols[..] else { return Ok(None) };
+        let types = self
+            .bundle
+            .col_types
+            .get(t)
+            .ok_or_else(|| Error::Internal("table id out of range".into()))?;
+        if types.get(col as usize).is_none_or(|ty| *ty == mpedb_types::ColumnType::Any) {
+            return Ok(None);
+        }
+        let rows = self.row_count(table_id)?;
+        if rows < Self::ADAPTIVE_MIN_ROWS {
+            return Ok(None);
+        }
+        let limit = rows / Self::ADAPTIVE_DIVISOR;
+
+        // Count the range's entries, stopping one past the switch point.
+        let iroot = self.tree_root(table_id, index_no)?;
+        let mut c = btree::cursor(self, iroot, lo, hi)?;
+        let mut seen = 0u64;
+        let mut scratch = Vec::new();
+        while seen <= limit {
+            if c.next_with(self, &mut scratch, |_, _| Ok(()))?.is_none() {
+                return Ok(None); // the whole range fits under the line: fetch it
+            }
+            seen += 1;
+        }
+
+        // Over the line: scan, and keep exactly the rows the index holds.
+        let unique = self
+            .bundle
+            .sec_unique
+            .get(t)
+            .and_then(|v| v.get(index_no as usize - 1))
+            .copied()
+            .unwrap_or(false);
+        let root = self.tree_root(table_id, 0)?;
+        let mut out = Vec::new();
+        let mut probe: Vec<u8> = Vec::with_capacity(32);
+        let mut c = btree::cursor(self, root, None, None)?;
+        let mut scratch = Vec::new();
+        while c
+            .next_with(self, &mut scratch, |k, v| {
+                self.charge_work(1, || scan_label(&self.bundle.schema, table_id))?;
+                let row = row::decode_row(v, types)?;
+                let val = &row[col as usize];
+                if val.is_null() {
+                    return Ok(()); // no index entry: the range never held it
+                }
+                probe.clear();
+                keycode::encode_value(&mut probe, val);
+                if !unique {
+                    probe.extend_from_slice(k); // the entry's pk suffix
+                }
+                let pass_lo = match lo {
+                    Some((b, inc)) => {
+                        let c = probe.as_slice().cmp(b);
+                        c == std::cmp::Ordering::Greater
+                            || (inc && c == std::cmp::Ordering::Equal)
+                    }
+                    None => true,
+                };
+                let pass_hi = match hi {
+                    Some((b, inc)) => {
+                        let c = probe.as_slice().cmp(b);
+                        c == std::cmp::Ordering::Less || (inc && c == std::cmp::Ordering::Equal)
+                    }
+                    None => true,
+                };
+                if pass_lo && pass_hi {
+                    out.push(row);
+                }
+                Ok(())
+            })?
+            .is_some()
+        {}
+        Ok(Some(out))
+    }
+
     /// Rows whose indexed value falls in the raw-encoded bound range — the
     /// `IndexRange` access. Bounds use the composite-PK prefix construction
     /// (`enc(v)` / `enc(v) ++ 0xFF`), which is exactly right over both the

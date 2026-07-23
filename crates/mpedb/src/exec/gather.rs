@@ -848,12 +848,33 @@ pub(super) fn gather_rows(
                 // works over the index tree: both the unique (`value`) and the
                 // non-unique (`value ‖ pk`) key layouts start with the encoded
                 // value, and `prefix_hi` clears every continuation.
-                Some((lo_k, hi_k)) => ctx.scan_by_index_range(
-                    table,
-                    *index_no,
-                    lo_k.as_ref().map(|(k, inc)| (k.as_slice(), *inc)),
-                    hi_k.as_ref().map(|(k, inc)| (k.as_slice(), *inc)),
-                )?,
+                Some((lo_k, hi_k)) => {
+                    let lo_b = lo_k.as_ref().map(|(k, inc)| (k.as_slice(), *inc));
+                    let hi_b = hi_k.as_ref().map(|(k, inc)| (k.as_slice(), *inc));
+                    // An index range fetches ONE ROW PER ENTRY, which beats a
+                    // scan only while the range stays small. The planner cannot
+                    // know the fraction (no histograms), so the engine prices
+                    // it: `scan_by_index_range_adaptive` counts the range's
+                    // KEYS up to the switch point and scans the table instead
+                    // when the range is too wide to be worth a descent per row.
+                    //
+                    // Held back under a `cap`: this path does not push the
+                    // LIMIT down (it materializes the range and the caller
+                    // truncates — a measured hole, `SELECT … WHERE day_id >=
+                    // 1000 LIMIT 5` costs the whole range), and switching the
+                    // access path under a LIMIT would also change WHICH rows a
+                    // LIMIT with no ORDER BY returns. Both belong to the
+                    // pushdown fix, not to this one.
+                    match cap.is_none().then(|| {
+                        ctx.scan_by_index_range_adaptive(table, *index_no, lo_b, hi_b)
+                    }) {
+                        Some(r) => match r? {
+                            Some(rows) => rows,
+                            None => ctx.scan_by_index_range(table, *index_no, lo_b, hi_b)?,
+                        },
+                        None => ctx.scan_by_index_range(table, *index_no, lo_b, hi_b)?,
+                    }
+                }
             }
         }
         AccessPath::FullScan => {
