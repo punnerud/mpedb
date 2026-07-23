@@ -54,8 +54,8 @@ Milliseconds, median of 5 plus an untimed warm-up.
 | `group-small` | group by | 251.1 | 1.2 | 685.9 | 212× slower | **2.7× faster** |
 | `group-large` | group by | 365.5 | 7.9 | 911.9 | 46× slower | **2.5× faster** |
 | `join-star-2` | join order | ~~1198.0~~ **194.3** | 1.9 | 110.4 | 104× slower | 1.8× slower |
-| `join-star-4` | join order | ~~1325.0~~ **319.9** | 3.8 | 172.8 | 85× slower | 1.9× slower |
-| `join-bad-order` | join order | ~~1098.5~~ **185.9** | 2.7 | 89.6 | 69× slower | 2.1× slower |
+| `join-star-4` | join order | ~~1325.0~~ **257.0** | 3.6 | 173.7 | 72× slower | 1.5× slower |
+| `join-bad-order` | join order | ~~1098.5~~ **139.7** | 2.8 | 89.6 | 50× slower | 1.6× slower |
 
 Struck-through numbers are the original 2026-07-22 run; the table is the
 2026-07-23 re-measure after **stage A** (per-index NDV statistics —
@@ -261,6 +261,20 @@ range cannot regress (measured unchanged at 1 % and at 0.07 %).
 measured rather than asserted: **410.9 → 184.2 ms**, which turns a 1.7× loss to
 SQLite into a **1.4× win**. This was invisible on this page until the cell
 existed, which is the argument for adding it.
+
+**A hash join, chosen by the executor** (`6cb6f9a`). mpedb had exactly one
+join strategy — the nested loop, index-driven when the inner side has an index
+and held otherwise — and a cost model can only choose among the strategies
+that exist, which is why §9.4 concluded the generic lever was a new strategy
+rather than a better price. An index-driven inner costs one descent per OUTER
+row, and the planner cannot price that because it does not know how many rows
+the outer will produce; the executor does, so when the outer is large and the
+inner is small it reads the inner once, hashes it, and probes. `join-star-4`
+319.9 → **257.0 ms** and `join-bad-order` 185.9 → **139.7**, closing those to
+1.5× and 1.6× of SQLite. The build side is capped in ABSOLUTE cells, not
+relative to the outer: the switch holds it resident, and the memory contract
+is that held bytes do not scale with the input — a dimension table passes that
+line, a self-join on a growing table does not.
 
 **The residual on every scan, group and join cell is per-row executor cost** —
 a `Vec<Value>`, an expression program per projection — the same constant the
