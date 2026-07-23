@@ -43,7 +43,7 @@ use std::collections::HashMap;
 
 const LANG: &str = "py";
 
-pub(crate) fn compile(src: &str) -> Result<Skeleton> {
+pub fn compile(src: &str) -> Result<Skeleton> {
     let module = parse(src, Mode::Module, "<proc>").map_err(|e| {
         let (l, c) = line_col(src, e.offset.to_usize());
         cerr(LANG, l, c, format!("syntax error: {}", e.error))

@@ -47,11 +47,11 @@
 //! All plans are prepared and published at define time; `call` never parses
 //! SQL and never calls `prepare` — the facade locking rules hold trivially.
 
-use crate::emit::{cerr, CallKind, Skeleton};
-use crate::hash::ProcHash;
-use crate::interp::{self, Budget, DbBridge, ProcValue};
-use crate::ir::{PlanKind, PlanRef, Proc};
-use crate::{py, rs};
+use mpedb_spell::emit::{cerr, CallKind, Skeleton};
+use mpedb_spell::hash::ProcHash;
+use mpedb_spell::interp::{self, Budget, DbBridge, ProcValue};
+use mpedb_spell::ir::{PlanKind, PlanRef, Proc};
+use mpedb_spell::{py, rs};
 use mpedb::{Database, Error, ExecResult, Result, Value, WriteSession};
 use mpedb_sql::PlanStmt;
 use std::collections::HashMap;

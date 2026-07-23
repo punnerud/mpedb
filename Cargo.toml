@@ -8,6 +8,7 @@ members = [
     "crates/mpedb-graphbench",
     "crates/mpedb-vecbench",
     "crates/mpedb-sdk",
+    "crates/mpedb-spell",
     "crates/mpedb-proc",
     "crates/mpedb-mirror",
     "crates/mpedb-cli",
@@ -48,6 +49,7 @@ mpedb-types = { path = "crates/mpedb-types" }
 mpedb-core = { path = "crates/mpedb-core" }
 mpedb-sql = { path = "crates/mpedb-sql" }
 mpedb = { path = "crates/mpedb" }
+mpedb-spell = { path = "crates/mpedb-spell" }
 mpedb-proc = { path = "crates/mpedb-proc" }
 mpedb-mirror = { path = "crates/mpedb-mirror" }
 libc = "0.2"

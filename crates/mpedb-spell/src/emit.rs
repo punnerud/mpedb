@@ -9,7 +9,7 @@ use mpedb_types::{Error, Result, Value};
 
 /// Call form an embedded SQL string was collected from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum CallKind {
+pub enum CallKind {
     /// `db.query(...)` — must compile to a read-only SELECT plan.
     Query,
     /// `db.execute(...)` — must compile to a DML plan.
@@ -24,7 +24,7 @@ pub(crate) enum CallKind {
 /// argument expressions passed, and the source line/column (for define-time
 /// errors when the SQL fails to compile against the live schema).
 #[derive(Debug, Clone)]
-pub(crate) struct SqlCall {
+pub struct SqlCall {
     pub sql: String,
     pub kind: CallKind,
     pub argc: u8,
@@ -35,7 +35,7 @@ pub(crate) struct SqlCall {
 /// Frontend output: everything but the plan hashes (which only exist after
 /// the engine prepares the collected SQL against a live schema).
 #[derive(Debug)]
-pub(crate) struct Skeleton {
+pub struct Skeleton {
     pub name: String,
     pub argc: u16,
     pub nlocals: u16,
@@ -48,7 +48,7 @@ pub(crate) struct Skeleton {
 /// Compile error helper: all frontend rejections funnel through here so the
 /// message shape stays uniform. Uses `Error::Unsupported` (the crate cannot
 /// add error variants to `mpedb-types`); messages carry line/column.
-pub(crate) fn cerr(lang: &str, line: usize, col: usize, msg: impl AsRef<str>) -> Error {
+pub fn cerr(lang: &str, line: usize, col: usize, msg: impl AsRef<str>) -> Error {
     Error::Unsupported(format!(
         "proc({lang}) compile error at line {line}, column {col}: {}",
         msg.as_ref()
@@ -56,7 +56,7 @@ pub(crate) fn cerr(lang: &str, line: usize, col: usize, msg: impl AsRef<str>) ->
 }
 
 /// 1-based line and 0-based column of a byte offset in `src`.
-pub(crate) fn line_col(src: &str, pos: usize) -> (usize, usize) {
+pub fn line_col(src: &str, pos: usize) -> (usize, usize) {
     let pos = pos.min(src.len());
     let before = &src[..pos];
     let line = before.bytes().filter(|&b| b == b'\n').count() + 1;
@@ -66,7 +66,7 @@ pub(crate) fn line_col(src: &str, pos: usize) -> (usize, usize) {
     (line, col)
 }
 
-pub(crate) struct FuncBuilder {
+pub struct FuncBuilder {
     pub instrs: Vec<Op>,
     pub consts: Vec<Value>,
     pub calls: Vec<SqlCall>,
@@ -75,7 +75,7 @@ pub(crate) struct FuncBuilder {
     loops: Vec<LoopCtx>,
 }
 
-pub(crate) struct LoopCtx {
+pub struct LoopCtx {
     /// Jump target of `continue` (the condition re-check).
     pub start: u32,
     /// `break` jumps recorded here, patched to the loop end.

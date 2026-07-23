@@ -55,7 +55,7 @@ impl Default for Budget {
 /// Most cursors open at once per call (slots are recycled when a cursor is
 /// exhausted). Each open cursor pins one engine reader slot, so this stays
 /// far below any sane `max_readers`.
-pub(crate) const MAX_CURSORS: usize = 16;
+pub const MAX_CURSORS: usize = 16;
 
 /// Runtime value: a scalar [`Value`], a proc-runtime-only container, or an
 /// opaque cursor handle. A handle names a slot in the interpreter's cursor
@@ -63,7 +63,7 @@ pub(crate) const MAX_CURSORS: usize = 16;
 /// cursor (the slot was closed and possibly recycled) is detected and
 /// rejected, never aliased.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum PValue {
+pub enum PValue {
     Scalar(Value),
     List(Rc<Vec<PValue>>),
     Tuple(Rc<Vec<PValue>>),
@@ -147,7 +147,7 @@ fn to_proc_value(v: PValue) -> Result<ProcValue> {
 /// read path implements them for real — IR validation guarantees a proc
 /// with `DbExec` never contains `CursorOpen` (v1 rule), so the write
 /// bridge's implementations are unreachable-by-construction guards.
-pub(crate) trait DbBridge {
+pub trait DbBridge {
     fn query(&mut self, plan: &PlanRef, params: &[Value]) -> Result<Vec<Vec<Value>>>;
     fn exec(&mut self, plan: &PlanRef, params: &[Value]) -> Result<u64>;
     fn cursor_open(&mut self, plan: &PlanRef, params: &[Value]) -> Result<u32>;
@@ -162,21 +162,21 @@ fn type_err(msg: impl Into<String>) -> Error {
     Error::TypeMismatch(format!("proc runtime: {}", msg.into()))
 }
 
-pub(crate) fn budget_instr_err(limit: u64) -> Error {
+pub fn budget_instr_err(limit: u64) -> Error {
     Error::Unsupported(format!(
         "proc budget: instruction budget exhausted (limit {limit}); \
          the procedure was aborted and any writes rolled back"
     ))
 }
 
-pub(crate) fn budget_db_err(limit: u64) -> Error {
+pub fn budget_db_err(limit: u64) -> Error {
     Error::Unsupported(format!(
         "proc budget: db-call budget exhausted (limit {limit}); \
          the procedure was aborted and any writes rolled back"
     ))
 }
 
-pub(crate) fn budget_rows_err(limit: u64) -> Error {
+pub fn budget_rows_err(limit: u64) -> Error {
     Error::Unsupported(format!(
         "proc budget: cursor row budget exhausted (limit {limit}); \
          the procedure was aborted"
@@ -409,7 +409,7 @@ struct CurSlot {
 /// Run a validated procedure. `args` were checked against `proc.argc` by
 /// the caller; locals beyond the parameters start *unassigned* (reading one
 /// before a store errors, mirroring Python's UnboundLocalError).
-pub(crate) fn run(
+pub fn run(
     proc: &Proc,
     args: &[Value],
     bridge: &mut dyn DbBridge,
@@ -692,13 +692,13 @@ fn pop_cursor(stack: &mut Vec<PValue>, cursors: &[CurSlot]) -> Result<usize> {
 }
 
 #[cfg(test)]
-pub(crate) mod testutil {
+pub mod testutil {
     use super::*;
     use std::collections::VecDeque;
 
     /// Bridge for interpreter-only tests: no database, canned responses.
     /// Cursors stream the same canned `rows`, one row per advance.
-    pub(crate) struct MockBridge {
+    pub struct MockBridge {
         pub rows: Vec<Vec<Value>>,
         pub affected: u64,
         pub queries: usize,
@@ -708,7 +708,7 @@ pub(crate) mod testutil {
     }
 
     impl MockBridge {
-        pub(crate) fn new() -> MockBridge {
+        pub fn new() -> MockBridge {
             MockBridge {
                 rows: vec![],
                 affected: 1,
@@ -720,7 +720,7 @@ pub(crate) mod testutil {
         }
 
         /// Streams still open (an exhausted stream must have been freed).
-        pub(crate) fn live_streams(&self) -> usize {
+        pub fn live_streams(&self) -> usize {
             self.streams.iter().filter(|s| s.is_some()).count()
         }
     }
