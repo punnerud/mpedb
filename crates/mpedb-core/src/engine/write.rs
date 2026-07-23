@@ -132,6 +132,18 @@ pub struct WriteTxn<'e> {
     /// `set_tree_root`). Recorded into the committed-footprint ring at commit
     /// in optimistic mode; unused (and free) in serial mode.
     pub(super) written_tables: u64,
+    /// Tables whose ROWS this transaction mutated — the exact set, unlike
+    /// [`Self::written_tables`], which folds mod 64 and would therefore MISS a
+    /// table with id ≥ 64. A missed table would leave a stale columnar segment
+    /// readable, which is a wrong answer, so this one cannot be lossy
+    /// (design/DESIGN-COLUMNAR.md §6).
+    ///
+    /// **Monotonic within the transaction: a savepoint rollback does NOT
+    /// shrink it.** Over-bumping a generation only invalidates a segment that
+    /// was in fact still valid — slower, never wrong — while under-bumping
+    /// would publish a stale segment as fresh. The asymmetry decides the
+    /// design: this set only ever grows until the txn ends.
+    pub(super) mutated_tables: std::collections::HashSet<u32>,
     /// Set by the optimistic blind-apply path to record a precise
     /// (table, key_hash) point footprint at commit instead of a table-level
     /// one. `None` for every other path.
@@ -165,9 +177,9 @@ impl<'e> WriteTxn<'e> {
         if let Some(&e) = self.table_roots.get(&(table_id, index_no)) {
             return Ok(e);
         }
-        let e = catalog_entry(self, self.catalog_root, table_id, index_no)?;
-        self.table_roots.insert((table_id, index_no), e);
-        Ok(e)
+        let (root, count, _gen) = catalog_entry(self, self.catalog_root, table_id, index_no)?;
+        self.table_roots.insert((table_id, index_no), (root, count));
+        Ok((root, count))
     }
 
     pub(super) fn set_tree_root(&mut self, table_id: u32, index_no: u32, root: u64, count: u64) {
@@ -176,6 +188,10 @@ impl<'e> WriteTxn<'e> {
         // a real conflict is never missed; aliasing only ever costs an extra
         // optimistic re-validation.
         self.written_tables |= 1u64 << (table_id & 63);
+        // The exact, non-lossy twin of the bitmap above — see `mutated_tables`.
+        // This is the single choke-point every row mutation funnels through,
+        // which is what makes the set complete.
+        self.mutated_tables.insert(table_id);
         self.table_roots.insert((table_id, index_no), (root, count));
     }
 
@@ -1953,6 +1969,7 @@ impl<'e> WriteTxn<'e> {
         self.extent_buf_off = 0;
         self.bound_recomputed = false;
         self.written_tables = 0;
+        self.mutated_tables.clear();
         self.commit_point = None;
         self.work = WorkMeter::new(self.eng.work_budget());
     }

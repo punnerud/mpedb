@@ -75,16 +75,58 @@ impl<'e> WriteTxn<'e> {
         // 1. write back catalog entries (may COW catalog pages → more frees)
         let entries: Vec<((u32, u32), (u64, u64))> =
             self.table_roots.iter().map(|(&k, &v)| (k, v)).collect();
+
+        // Every table this txn MUTATED must publish a bumped `mod_gen`
+        // (design/DESIGN-COLUMNAR.md §6). The bump lands in the PK-tree entry
+        // (`index_no 0`), so make sure that entry is in the writeback set:
+        // every row mutation moves the PK tree and therefore already put it
+        // there, but loading it here rather than assuming that keeps the
+        // invariant local — a missed bump would publish a stale columnar
+        // segment as fresh, which is a wrong answer.
+        let mutated: Vec<u32> = self.mutated_tables.iter().copied().collect();
+        let mut entries = entries;
+        for &tid in &mutated {
+            if !self.table_roots.contains_key(&(tid, 0)) {
+                let e = self.tree_root(tid, 0)?;
+                entries.push(((tid, 0), e));
+            }
+        }
+
+        // Read each PK entry's CURRENT generation before any of this loop's
+        // inserts move the catalog root, so the base is the committed value
+        // and not something this loop just wrote. A table with no committed
+        // entry yet (CREATE TABLE in this txn) starts at 0.
+        let mut next_gen: std::collections::HashMap<u32, u64> =
+            std::collections::HashMap::new();
+        for &((tid, ino), _) in &entries {
+            if ino != 0 {
+                continue;
+            }
+            let base = catalog_entry(&self, self.catalog_root, tid, 0)
+                .map(|(_, _, g)| g)
+                .unwrap_or(0);
+            next_gen.insert(tid, base + u64::from(self.mutated_tables.contains(&tid)));
+        }
+
         for ((tid, ino), (root, cnt)) in entries {
-            let mut val = [0u8; 16];
+            // The PK entry carries the generation (24 bytes); a secondary
+            // index entry has no meaningful one and stays 16.
+            let mut val = [0u8; 24];
             val[0..8].copy_from_slice(&root.to_le_bytes());
             val[8..16].copy_from_slice(&cnt.to_le_bytes());
+            let val: &[u8] = match next_gen.get(&tid) {
+                Some(&g) if ino == 0 => {
+                    val[16..24].copy_from_slice(&g.to_le_bytes());
+                    &val[..24]
+                }
+                _ => &val[..16],
+            };
             let cat_root = self.catalog_root;
             let out = btree::insert(
                 &mut self,
                 cat_root,
                 &cat_tree_key(tid, ino),
-                &mut btree::Payload::Flat(&val),
+                &mut btree::Payload::Flat(val),
                 InsertMode::Upsert,
             )?;
             self.catalog_root = out.new_root;

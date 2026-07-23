@@ -1100,7 +1100,10 @@ impl Engine {
             )?;
             let mut roots = Vec::new();
             while let Some((_k, v)) = c.next(&txn)? {
-                if v.len() == 16 {
+                // 16 or 24 — the PK entry carries a trailing `mod_gen`
+                // (`catalog_entry`). Length-filtering on 16 alone would skip
+                // every PK tree and report its pages as leaked.
+                if v.len() == 16 || v.len() == 24 {
                     roots.push(u64::from_le_bytes(v[0..8].try_into().unwrap()));
                 }
             }
@@ -1125,7 +1128,7 @@ impl Engine {
                 )?;
                 let mut roots2 = Vec::new();
                 while let Some((_k, v)) = c.next(&txn)? {
-                    if v.len() == 16 {
+                    if v.len() == 16 || v.len() == 24 {
                         roots2.push(u64::from_le_bytes(v[0..8].try_into().unwrap()));
                     }
                 }
@@ -1410,6 +1413,7 @@ impl Engine {
             recovered,
             finished: false,
             written_tables: 0,
+            mutated_tables: std::collections::HashSet::new(),
             commit_point: None,
             capture_enabled: true,
             capture_cfg: None,
@@ -1537,23 +1541,42 @@ impl Engine {
     }
 }
 
+/// One `(table, index)` directory entry: `(tree root, row count, mod_gen)`.
+///
+/// **16 or 24 bytes.** The entry was `root ‖ count` (16) before the per-table
+/// data-modification generation existed (design/DESIGN-COLUMNAR.md §6); it is
+/// `root ‖ count ‖ mod_gen` (24) now, and only the PK-tree entry (`index_no
+/// 0`) carries a meaningful generation — a secondary index's third field is
+/// written but never read. A legacy 16-byte entry reads as `mod_gen = 0` and
+/// is rewritten at 24 on its table's next commit, so an existing file keeps
+/// working and gains the counter without a migration pass.
+///
+/// `mod_gen` is what makes a columnar segment's reuse test EXACT: a segment
+/// stamped with generation `g` may be read only while the table still reports
+/// `g`. Any committed write bumps it, so a stale segment can never be
+/// mistaken for a fresh one (§6).
 fn catalog_entry<S: PageStore + ?Sized>(
     store: &S,
     catalog_root: u64,
     table_id: u32,
     index_no: u32,
-) -> Result<(u64, u64)> {
+) -> Result<(u64, u64, u64)> {
     let bytes = btree::get(store, catalog_root, &cat_tree_key(table_id, index_no))?
         .ok_or_else(|| {
             Error::Corrupt(format!(
                 "missing catalog entry for table {table_id} index {index_no}"
             ))
         })?;
-    if bytes.len() != 16 {
+    if bytes.len() != 16 && bytes.len() != 24 {
         return Err(Error::Corrupt("bad catalog entry size".into()));
     }
     Ok((
         u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
         u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+        if bytes.len() == 24 {
+            u64::from_le_bytes(bytes[16..24].try_into().unwrap())
+        } else {
+            0
+        },
     ))
 }

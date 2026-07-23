@@ -169,11 +169,26 @@ impl ReadTxn<'_> {
     }
 
     fn tree_root(&self, table_id: u32, index_no: u32) -> Result<u64> {
-        catalog_entry(self, self.meta.catalog_root, table_id, index_no).map(|(r, _)| r)
+        catalog_entry(self, self.meta.catalog_root, table_id, index_no).map(|(r, _, _)| r)
     }
 
     pub fn row_count(&self, table_id: u32) -> Result<u64> {
-        catalog_entry(self, self.meta.catalog_root, table_id, 0).map(|(_, c)| c)
+        catalog_entry(self, self.meta.catalog_root, table_id, 0).map(|(_, c, _)| c)
+    }
+
+    /// The table's data-modification generation on THIS snapshot
+    /// (design/DESIGN-COLUMNAR.md §6): a monotonic counter bumped once per
+    /// committed write transaction that mutated the table's rows.
+    ///
+    /// It is the exact staleness test a regenerable read-side artifact needs.
+    /// A columnar segment stamped with generation `g` is readable only while
+    /// this still returns `g`; any write since bumps it, and a bumped counter
+    /// never returns to a prior value, so two different table states can never
+    /// both look "unchanged". Heuristics like `(row_count, root_page)` cannot
+    /// promise that — a delete+insert restores the count, and the freelist can
+    /// hand a later commit a root page id equal to a freed earlier one.
+    pub fn mod_gen(&self, table_id: u32) -> Result<u64> {
+        catalog_entry(self, self.meta.catalog_root, table_id, 0).map(|(_, _, g)| g)
     }
 
     /// Open one `text`/`blob` column of one row for CHUNKED reading — the
