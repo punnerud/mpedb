@@ -60,6 +60,8 @@ usage: mpedb <command> [args]
 
   exec    <target> <SQL> [param ...]       run one statement
   prepare <target> <SQL>                   compile + publish, print plan hash
+  advise <target> [statements.sql]         recommend indexes from the workload
+                                           (registry, or a ;-separated file)
   call    <target> <hash> [param ...]      execute a prepared plan by hash
   proc    define|call|list ...              stored procedures (see `proc`)
   repl    <target>                          interactive session (stdin)
@@ -139,6 +141,7 @@ fn dispatch(argv: &[String]) -> CliResult {
     match cmd.as_str() {
         "exec" => cmd_exec(rest),
         "prepare" => cmd_prepare(rest),
+        "advise" => cmd_advise(rest),
         "call" => cmd_call(rest),
         "proc" => proc_cmd::run(rest),
         "queue" => queue::run(rest),
@@ -211,6 +214,53 @@ fn cmd_prepare(args: &[String]) -> CliResult {
     let db = crate::util::open_target(config)?;
     let hash = db.prepare(sql)?;
     println!("{hash}");
+    Ok(())
+}
+
+/// `mpedb advise <target> [statements.sql]` — the #118 workload-index
+/// advisor, recommend-only. With no statements file the workload is the
+/// plan registry: everything this database has ever compiled.
+fn cmd_advise(args: &[String]) -> CliResult {
+    use mpedb::advisor::WorkloadSource;
+    let (config, source) = match args {
+        [config] => (config, WorkloadSource::Registry),
+        [config, file] => {
+            let text = std::fs::read_to_string(file)
+                .map_err(|e| Failure::Runtime(format!("reading {file}: {e}")))?;
+            let stmts: Vec<String> = text
+                .split(';')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+            (config, WorkloadSource::Statements(stmts))
+        }
+        _ => return usage("advise needs <config.toml|db.mpedb> [statements.sql]"),
+    };
+    let db = crate::util::open_target(config)?;
+    let rep = db.recommend_indexes(source)?;
+    println!(
+        "workload: {} compiled, {} uncompilable, {} shapes without a single-table          candidate, {} opaque filters, {} no-key, {} already served",
+        rep.compiled, rep.uncompilable, rep.skipped_shape, rep.opaque_filter, rep.no_key,
+        rep.served
+    );
+    if rep.advices.is_empty() {
+        println!("no index recommendations.");
+        return Ok(());
+    }
+    println!();
+    println!("{:<40} {:>10} {:>6}  id", "candidate", "statements", "rows");
+    for a in &rep.advices {
+        println!(
+            "{:<40} {:>10} {:>6}  {}…",
+            format!("{}({})", a.table, a.columns.join(", ")),
+            a.statements,
+            format!("2^{}", a.rows_bucket),
+            &a.index_id[..12]
+        );
+    }
+    println!();
+    println!("recommend-only: auto-create stays blocked on #118's P2 (index state               bit), P3 (DROP INDEX), P5 (execution counts).");
     Ok(())
 }
 

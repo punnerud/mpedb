@@ -58,6 +58,7 @@ mod shard;
 mod sqlite_attach;
 mod ddl_apply;
 mod sqlite_overlay;
+pub mod advisor;
 pub mod stats;
 mod stream;
 mod tier;

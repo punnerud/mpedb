@@ -224,9 +224,15 @@ warnings`) before the next; measured results are appended to this doc per stage.
   vs Qdrant's payload-filtered 75.2 — the pgvector post-filtering problem
   LANDSCAPE.md described, now measured. `ORDER BY <expr> LIMIT k` needed no
   new SQL surface (the sort-only column machinery already existed).
-- **E — #118 advisor, recommend-only.** `recommend_indexes(WorkloadSource)`
-  as specified in WORKLOAD-INDEXES §4, costed through the A seam. Auto-create
-  stays blocked on P2/P3/P5, restated not built.
+- **E — #118 advisor, recommend-only.** **SHIPPED 2026-07-23.**
+  `Database::recommend_indexes(WorkloadSource::{Registry, Statements})` +
+  `mpedb advise <target> [statements.sql]`. The candidate extraction is the
+  `--index-census` harness's measured rules carried into the engine verbatim
+  (equalities sorted-canonical, one range column, ORDER BY tail, opaque-filter
+  refusal on jumps, served-by-prefix filter), identity is the §2.2 content
+  hash, ranking is statements-desc then the stage-A row bucket, and the report
+  counts everything it skipped — no silent caps. Auto-create stays blocked on
+  P2/P3/P5, restated not built.
 
 ## 8. What failure looks like (so we notice)
 
