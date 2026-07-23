@@ -126,6 +126,10 @@ primary_key = ["id"]
     }
     let load = t0.elapsed().as_secs_f64();
     db.analyze()?;
+    // The rag model's role installs `:~:` — `emb :~: $q` IS vec_l2, by
+    // macro expansion; the sugar arm below proves it at the plan-hash level.
+    db.set_model(include_str!("../../../models/rag.toml"))?;
+    db.install_model_operators()?;
     Ok((db, load))
 }
 
@@ -230,6 +234,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Prepared once; executed per query with a fresh parameter — the
     // content-hashed hot path.
     let knn = db.prepare(&format!("SELECT id FROM v ORDER BY vec_l2(emb, $1) LIMIT {K}"))?;
+    // The operator-language spelling. The macro expands to vec_l2, the parens
+    // produce no AST nodes, so the PLAN HASHES must collide — the sugar is
+    // provably free, not measured-to-be-close.
+    let knn_sugar = db.prepare(&format!("SELECT id FROM v ORDER BY emb :~: $1 LIMIT {K}"))?;
+    let sugar_free = knn_sugar == knn;
     // The same question in a shape the heap path declines (second sort key):
     // the generic full-compute-and-sort arm of the A/B.
     let knn_generic =
@@ -347,6 +356,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         l_generic.median_ms / l_fast.median_ms,
         l_generic.median_ms,
         l_fast.median_ms
+    );
+    println!();
+    println!(
+        "Operator sugar: `ORDER BY emb :~: $q LIMIT {K}` compiles to {} plan hash as \
+         the vec_l2 spelling — the `:op:` layer costs nothing here by construction.",
+        if sugar_free { "the IDENTICAL" } else { "a DIFFERENT (!)" }
     );
     Ok(())
 }
