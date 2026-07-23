@@ -1415,3 +1415,96 @@ primary_key = ["id"]
     drop(eng);
     let _ = std::fs::remove_file(&path);
 }
+
+// ---------------------------------------------------- mod_gen (DESIGN-COLUMNAR §6)
+
+fn gen_of(eng: &Engine, table: u32) -> u64 {
+    let r = eng.begin_read().unwrap();
+    let g = r.mod_gen(table).unwrap();
+    r.finish().unwrap();
+    g
+}
+
+/// The coherence contract a columnar segment's reuse rests on: every committed
+/// write to a table bumps its generation, a read does not, and the counter
+/// only ever moves forward. A missed bump would publish a stale segment as
+/// fresh — a wrong answer — so this is the test that guards that.
+#[test]
+fn mod_gen_bumps_on_write_and_never_on_read() {
+    let cfg = test_config("modgen", 8);
+    let eng = open(&cfg);
+
+    let g0 = gen_of(&eng, 0);
+
+    // A pure READ must not move it: `tree_root` inserts into `table_roots`
+    // even on reads, so a bump driven by that map instead of by
+    // `set_tree_root` would spuriously invalidate every segment.
+    {
+        let r = eng.begin_read().unwrap();
+        let _ = r.get_by_pk(0, &[Value::Int(1)]).unwrap();
+        r.finish().unwrap();
+    }
+    {
+        let mut w = eng.begin_write().unwrap();
+        let _ = w.get_by_pk(0, &[Value::Int(1)]).unwrap();
+        w.commit().unwrap();
+    }
+    assert_eq!(gen_of(&eng, 0), g0, "a read-only txn must not bump");
+
+    // Each committed MUTATION bumps, strictly forward.
+    let mut prev = g0;
+    for (i, op) in ["insert", "update", "delete"].iter().enumerate() {
+        let mut w = eng.begin_write().unwrap();
+        match *op {
+            "insert" => {
+                w.insert_row(0, &user(100 + i as i64, "m@x.no", Some(1))).unwrap();
+            }
+            "update" => {
+                w.update_by_pk(0, &user(100, "m2@x.no", Some(2))).unwrap();
+            }
+            _ => {
+                w.delete_by_pk(0, &[Value::Int(100)]).unwrap();
+            }
+        }
+        w.commit().unwrap();
+        let g = gen_of(&eng, 0);
+        assert!(g > prev, "{op} must bump the generation ({prev} -> {g})");
+        prev = g;
+    }
+
+    // An ABORTED write leaves it where it was — nothing was published.
+    let mut w = eng.begin_write().unwrap();
+    w.insert_row(0, &user(200, "abort@x.no", Some(3))).unwrap();
+    w.abort();
+    assert_eq!(gen_of(&eng, 0), prev, "an aborted txn publishes no bump");
+
+    // It survives reopen: the counter lives in the catalog, not in memory.
+    drop(eng);
+    let eng = open(&cfg);
+    assert_eq!(gen_of(&eng, 0), prev, "the generation is durable");
+    eng.verify_page_accounting().unwrap();
+}
+
+/// A savepoint rollback may leave the table in the set (the set is monotonic
+/// within a txn), so the generation can bump for a txn whose net row effect
+/// was nothing. That direction is FAIL-SAFE — it invalidates a segment that
+/// was still valid, costing a rebuild — while the opposite would be a wrong
+/// answer. Pinned so the asymmetry is a decision, not an accident.
+#[test]
+fn mod_gen_over_bumps_rather_than_under_bumps() {
+    let cfg = test_config("modgen-sp", 8);
+    let eng = open(&cfg);
+    let g0 = gen_of(&eng, 0);
+
+    let mut w = eng.begin_write().unwrap();
+    let sp = w.savepoint();
+    w.insert_row(0, &user(1, "sp@x.no", Some(1))).unwrap();
+    w.rollback_to(sp);
+    w.commit().unwrap();
+
+    assert!(
+        gen_of(&eng, 0) >= g0,
+        "the generation never moves backwards"
+    );
+    eng.verify_page_accounting().unwrap();
+}
