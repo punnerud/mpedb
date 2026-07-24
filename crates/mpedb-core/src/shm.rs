@@ -61,14 +61,22 @@ fn memory_backing_file() -> Result<File> {
     }
     #[cfg(all(not(target_os = "linux"), not(target_arch = "wasm32")))]
     {
+        // pid + timestamp is NOT unique: two `:memory:` opens on two threads
+        // of one process can land on the same clock tick (macOS quantizes
+        // SystemTime), and `create_new` then fails AlreadyExists. The atomic
+        // counter is what actually disambiguates within a process; pid covers
+        // across processes, the timestamp covers a recycled pid racing a
+        // crash-orphaned name in the unlink window below.
+        static MEM_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
-            "mpedb-mem-{}-{}",
+            "mpedb-mem-{}-{}-{}",
             crate::os::process_id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_nanos())
-                .unwrap_or(0)
+                .unwrap_or(0),
+            MEM_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         let file = OpenOptions::new()
             .read(true)
