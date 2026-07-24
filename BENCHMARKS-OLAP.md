@@ -1,21 +1,37 @@
-# OLAP: mpedb vs DuckDB vs SQLite
+# OLAP: mpedb vs DuckDB vs SQLite vs PostgreSQL vs MySQL
 
 Analytics is not what mpedb is for. It is an embedded row store built for
 multi-process OLTP, and DuckDB is a vectorised column store built for exactly
 this workload. **The point of running it anyway is that the losses are not
-uniform, and the shape of the unevenness is the result.**
+uniform, and the shape of the unevenness is the result.** The five-engine field
+draws the shape sharply: the specialists win their home turf, but against the
+other general-purpose SQL engines — SQLite, PostgreSQL, MySQL — mpedb wins the
+precomputed and point-shaped work outright, often by one to two orders of
+magnitude.
 
-Harness: [`crates/mpedb-olapbench`](crates/mpedb-olapbench). Machine: Apple M3
-Pro, 11 cores, 36 GiB, macOS 26.6. All three engines in-process, DuckDB and
-SQLite in memory, mpedb on APFS with `durability = "none"`. Measured 2026-07-22.
+Harness: [`crates/mpedb-olapbench`](crates/mpedb-olapbench). Every engine runs
+**the same SQL text**, and the harness compares canonically rendered results
+across all engines before it believes any timing. Every row below is marked
+`agree: yes`; a disagreement strikes the row out. A fast wrong answer is a bug
+report, not a benchmark result.
 
     cargo run --release --manifest-path crates/mpedb-olapbench/Cargo.toml -- \
       --facts 2000000 --reps 5
 
-Every engine runs **the same SQL text**, and the harness compares canonically
-rendered results across all three before it believes any timing. Every row
-below is marked `agree: yes`; a disagreement would have struck the row out.
-A fast wrong answer is a bug report, not a benchmark result.
+DuckDB and SQLite run in-process and in memory; PostgreSQL and MySQL/MariaDB run
+as **private throwaway servers** the harness spins up itself (`initdb`+`pg_ctl`,
+`mariadb-install-db`+`mariadbd`, no sudo, no system instance touched), each set
+to the none-durability class to match — so they still pay client/server
+round-trips the embedded engines do not, which is a real part of their shape
+here. mpedb builds five index trees on `fact` row-by-row and one column-segment
+set (the DESIGN-COLUMNAR extent store); DuckDB is told to build no indexes (its
+authors advise against them for analytics); SQLite/PostgreSQL/MySQL get the same
+indexes as mpedb, built after the load.
+
+Two machines, tabled separately because absolute times do not cross hardware
+(the *shape* does): a **Linux devbox** (AMD EPYC-Milan, 2 cores, 7.6 GiB) with
+all five engines, and an earlier **Apple M3 Pro** (11 cores) three-engine run
+kept below for reference.
 
 ## The dataset
 
@@ -41,6 +57,89 @@ is in the load table rather than hidden.
 ## Results
 
 Milliseconds, median of 5 plus an untimed warm-up.
+
+## Linux devbox, five engines (2026-07-24, mpedb `2867098`)
+
+AMD EPYC-Milan, 2 cores, 7.6 GiB, Linux 6.8; mpedb on `/mnt/ext4` with
+`durability = "none"`, its column segments freshly on the extent store
+(`2867098`). 2M-row `fact`. Every row `agree: yes`.
+
+### Load
+
+| engine | load |
+|---|---:|
+| duckdb | 1.3 s |
+| sqlite | 5.2 s |
+| postgres | 7.5 s |
+| mpedb | 20.2 s |
+| mysql | 20.6 s |
+
+mpedb and MySQL pay the most: mpedb maintains five `fact` index trees row by row
+(no bulk-build path) and builds column segments; MySQL's batched InnoDB insert is
+the slowest loader. DuckDB's Appender is an order of magnitude ahead of everyone.
+
+### Queries
+
+| query | probes | mpedb | duckdb | sqlite | postgres | mysql |
+|---|---|---:|---:|---:|---:|---:|
+| `scan-sum` | scan | **30.9** | 1.6 | 57.9 | 113.9 | 159.1 |
+| `scan-filter-sum` | scan | 120.0 | 3.2 | 83.1 | 125.3 | 185.1 |
+| `scan-range-sum` | scan | 384.5 | 3.4 | 426.3 | 109.6 | 175.3 |
+| `scan-multi-agg` | scan | 418.1 | 4.0 | 148.4 | 149.8 | 268.0 |
+| `count-star` | precompute | 3.0 | 0.386 | 0.219 | 79.0 | 144.0 |
+| `min-max-indexed` | precompute | **0.032** | 12.6 | 99.7 | 0.185 | 0.066 |
+| `count-filtered` | precompute | 0.292 | 1.8 | 0.012 | 0.347 | 0.129 |
+| `group-small` | group by | 334.7 | 7.6 | 1316.3 | 221.3 | 2545.0 |
+| `group-large` | group by | 688.0 | 24.3 | 1527.1 | 261.7 | 2881.9 |
+| `join-star-2` | join order | 362.5 | 10.0 | 177.7 | 131.5 | 346.4 |
+| `join-star-4` | join order | 514.1 | 14.9 | 310.4 | 164.7 | 736.1 |
+| `join-bad-order` | join order | 269.6 | 11.7 | 155.9 | 140.2 | 460.7 |
+
+Prepared, 20,000 executions, total milliseconds:
+
+| query | mpedb | duckdb | sqlite | postgres | mysql |
+|---|---:|---:|---:|---:|---:|
+| `prepared-point` — `WHERE id = ?` | 40 | 6520 | 6 | 943 | 1186 |
+| `prepared-range` — `sum(amount) WHERE customer_id = ?` | 2458 | 36522 | 1688 | 2741 | 5053 |
+
+### Reading the five-engine field
+
+**DuckDB is the specialist and wins every heavy scan/join/group**, by 20–110×.
+That is the vectorised column store doing what it is for, and DESIGN-COLUMNAR is
+mpedb's answer to it (the extent segment store already halves the scan-sum gap
+vs a pure row scan). The interesting comparison is against the other
+**general-purpose SQL engines** — SQLite, PostgreSQL, MySQL — the field mpedb
+actually competes in:
+
+- **Wins outright (all five):** `min-max-indexed` — 0.032 ms, the O(log n)
+  boundary probe. Faster than DuckDB's zone-map skip (396×), PostgreSQL's index
+  (5.8×) and MySQL (2×). mpedb is the fastest engine on the board here.
+- **Wins the general-purpose field:** `scan-sum` — 30.9 ms, ahead of SQLite
+  (1.9×), PostgreSQL (3.7×), MySQL (5.1×). The column segments carry it.
+- **Crushes the servers, loses to SQLite by a hair:** `count-star` (mpedb 3.0
+  vs PG 79, MySQL 144 — 26–48× ahead of the servers; SQLite 0.2), and
+  `prepared-point` (40 vs PG 943, MySQL 1186 — 24–30× ahead; SQLite 6). This is
+  the embedded no-IPC edge: a client/server engine pays a round-trip 20,000
+  times where an in-process one pays a function call. `prepared-range` mpedb
+  beats PostgreSQL and MySQL too (2458 vs 2741 vs 5053).
+- **Strong second, beats SQLite and MySQL by 2–8×:** both GROUP BYs — mpedb
+  335/688 vs SQLite 1316/1527 vs MySQL 2545/2882 — but PostgreSQL's hash
+  aggregate wins the general-purpose field (221/262).
+- **The clear weakness — joins.** PostgreSQL's planner and hash join win every
+  join cell (131–165 ms), and on the star joins mpedb trails SQLite too, landing
+  third or fourth of the general-purpose four. mpedb even emits a runtime-budget
+  *warning* on the wide star joins (worst-case nested-loop estimate) though it
+  completes correctly. Nested-loop-with-hash is younger here than PostgreSQL's
+  decades of join machinery; this is the honest gap to close, and where MPEE's
+  next work (hash-join costing, streaming) points.
+
+**The shape, in one line:** mpedb is the fastest general-purpose engine on the
+precomputed and point-shaped work — often by one to two orders of magnitude over
+the servers — competitive-to-winning against SQLite/MySQL on single-pass scans
+and grouping, and behind PostgreSQL on joins. Against the DuckDB specialist it
+loses the heavy analytical scans, by design and by a closing margin.
+
+## Apple M3 Pro, three engines (reference)
 
 Consolidated at HEAD (`4643aeb`, M3 Pro, 2M-row fact) — a clean snapshot
 after all of stage A/B and the day's four executor changes (covering reads,

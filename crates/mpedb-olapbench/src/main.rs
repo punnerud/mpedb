@@ -21,6 +21,8 @@
 mod cell;
 mod eng_duckdb;
 mod eng_mpedb;
+mod eng_mysql;
+mod eng_postgres;
 mod eng_sqlite;
 mod queries;
 mod schema;
@@ -100,7 +102,7 @@ fn main() -> Res<()> {
         }
     }
 
-    println!("# OLAP head-to-head: mpedb vs DuckDB vs SQLite\n");
+    println!("# OLAP head-to-head: mpedb vs DuckDB vs SQLite vs PostgreSQL vs MySQL\n");
     println!("- fact rows: {facts}");
     println!(
         "- dimensions: customer {}, product {}, store {}, day {}",
@@ -116,12 +118,17 @@ fn main() -> Res<()> {
     );
     println!();
 
+    std::fs::create_dir_all(&dir)?;
     eprintln!("loading mpedb…");
     let (mpedb, mpedb_load) = eng_mpedb::Mpedb::load(&dir, facts)?;
     eprintln!("loading duckdb…");
     let (duck, duck_load) = eng_duckdb::Duck::load(facts)?;
     eprintln!("loading sqlite…");
     let (sqlite, sqlite_load) = eng_sqlite::Sqlite::load(facts)?;
+    eprintln!("loading postgres…");
+    let (pg, pg_load) = eng_postgres::Postgres::load(facts, &dir)?;
+    eprintln!("loading mysql (mariadb)…");
+    let (my, my_load) = eng_mysql::Mysql::load(facts, &dir)?;
     eprintln!("running queries…");
 
     println!("## Load\n");
@@ -134,12 +141,18 @@ fn main() -> Res<()> {
     );
     println!("| duckdb | {duck_load:.1} s | in-memory, Appender, no indexes (its authors advise against them here) |");
     println!("| sqlite | {sqlite_load:.1} s | in-memory, same indexes as mpedb, built after the rows |");
+    println!(
+        "| postgres | {pg_load:.1} s | private throwaway cluster on disk, COPY load, same indexes, then ANALYZE |"
+    );
+    println!(
+        "| mysql | {my_load:.1} s | private throwaway MariaDB, batched INSERT, same indexes, then ANALYZE |"
+    );
     println!();
 
     println!("## Queries\n");
     println!("Times are milliseconds, median of {reps}.\n");
-    println!("| query | probes | mpedb | duckdb | sqlite | mpedb vs duckdb | agree |");
-    println!("|---|---|---:|---:|---:|---:|---|");
+    println!("| query | probes | mpedb | duckdb | sqlite | postgres | mysql | mpedb vs duckdb | agree |");
+    println!("|---|---|---:|---:|---:|---:|---:|---:|---|");
 
     let mut notes: Vec<String> = Vec::new();
 
@@ -150,16 +163,14 @@ fn main() -> Res<()> {
         let m = time_it(reps, || mpedb.run(q.sql));
         let d = time_it(reps, || duck.run(q.sql));
         let s = time_it(reps, || sqlite.run(q.sql));
+        let p = time_it(reps, || pg.run(q.sql));
+        let y = time_it(reps, || my.run(q.sql));
+
+        let engines = [("mpedb", &m), ("duckdb", &d), ("sqlite", &s), ("postgres", &p), ("mysql", &y)];
 
         // Agreement is established BEFORE any ratio is printed.
-        let answers: Vec<&String> = [
-            m.as_ref().ok().map(|(_, a)| a),
-            d.as_ref().ok().map(|(_, a)| a),
-            s.as_ref().ok().map(|(_, a)| a),
-        ]
-        .into_iter()
-        .flatten()
-        .collect();
+        let answers: Vec<&String> =
+            engines.iter().filter_map(|(_, r)| r.as_ref().ok().map(|(_, a)| a)).collect();
         let agree = answers.windows(2).all(|w| w[0] == w[1]);
 
         let ratio = match (&m, &d) {
@@ -175,17 +186,19 @@ fn main() -> Res<()> {
         };
 
         println!(
-            "| `{}` | {:?} | {} | {} | {} | {} | {} |",
+            "| `{}` | {:?} | {} | {} | {} | {} | {} | {} | {} |",
             q.name,
             q.probes,
             cell_ms(&m),
             cell_ms(&d),
             cell_ms(&s),
+            cell_ms(&p),
+            cell_ms(&y),
             ratio,
             if agree { "yes" } else { "**NO**" }
         );
 
-        for (name, r) in [("mpedb", &m), ("duckdb", &d), ("sqlite", &s)] {
+        for (name, r) in engines.iter() {
             if let Err(e) = r {
                 notes.push(format!("- `{}` refused by {name}: {e}", q.name));
             }
@@ -196,7 +209,7 @@ fn main() -> Res<()> {
                  until that is explained; a fast wrong answer is a bug report, not a result.",
                 q.name
             ));
-            for (name, r) in [("mpedb", &m), ("duckdb", &d), ("sqlite", &s)] {
+            for (name, r) in engines.iter() {
                 if let Ok((_, a)) = r {
                     let head: String = a.lines().take(3).collect::<Vec<_>>().join(" ⏎ ");
                     notes.push(format!("  - {name}: `{head}`"));
@@ -227,6 +240,8 @@ fn main() -> Res<()> {
             ("mpedb", mpedb.explain(q.sql)),
             ("sqlite", sqlite.explain(q.sql)),
             ("duckdb", duck.explain(q.sql)),
+            ("postgres", pg.explain(q.sql)),
+            ("mysql", my.explain(q.sql)),
         ] {
             println!("{engine}:");
             println!("```");
@@ -245,13 +260,15 @@ fn main() -> Res<()> {
          executed many times with different parameters. mpedb runs `execute(hash, params)` \
          against a content-hashed plan — no parsing, no planning, no lookup by SQL text.\n"
     );
-    println!("| query | iterations | mpedb | duckdb | sqlite | mpedb vs duckdb |");
-    println!("|---|---:|---:|---:|---:|---:|");
+    println!("| query | iterations | mpedb | duckdb | sqlite | postgres | mysql | mpedb vs duckdb |");
+    println!("|---|---:|---:|---:|---:|---:|---:|---:|");
     const ITERS: i64 = 20_000;
     for q in QUERIES.iter().filter(|q| q.probes == Probes::Prepared) {
         let mp = prepared_mpedb(&mpedb, q.sql, ITERS, facts);
         let dp = prepared_duck(&duck, q.sql, ITERS, facts);
         let sp = prepared_sqlite(&sqlite, q.sql, ITERS, facts);
+        let pp = pg.prepared_ms(q.sql, ITERS, facts);
+        let yp = my.prepared_ms(q.sql, ITERS, facts);
         let fmt = |r: &Res<f64>| match r {
             Ok(ms) => format!("{ms:.0}"),
             Err(_) => "refused".into(),
@@ -268,13 +285,15 @@ fn main() -> Res<()> {
             _ => "—".into(),
         };
         println!(
-            "| `{}` | {ITERS} | {} | {} | {} | {ratio} |",
+            "| `{}` | {ITERS} | {} | {} | {} | {} | {} | {ratio} |",
             q.name,
             fmt(&mp),
             fmt(&dp),
-            fmt(&sp)
+            fmt(&sp),
+            fmt(&pp),
+            fmt(&yp)
         );
-        for (name, r) in [("mpedb", &mp), ("duckdb", &dp), ("sqlite", &sp)] {
+        for (name, r) in [("mpedb", &mp), ("duckdb", &dp), ("sqlite", &sp), ("postgres", &pp), ("mysql", &yp)] {
             if let Err(e) = r {
                 notes.push(format!("- prepared `{}` on {name}: {e}", q.name));
             }
