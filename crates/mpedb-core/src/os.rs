@@ -48,7 +48,8 @@ use libc::{
 };
 
 /// `ftruncate` with a 64-bit length on every platform (LFS on 32-bit glibc).
-/// The shm layer calls this instead of `libc::ftruncate` directly.
+/// The shm layer calls this instead of `libc::ftruncate` directly — including
+/// on wasm32, where it lands on the `wasmcompat` buffer-resize shim.
 #[cfg(all(unix, not(target_arch = "wasm32")))]
 pub fn ftruncate_len(fd: RawFd, len: u64) -> libc::c_int {
     #[cfg(target_os = "linux")]
@@ -62,6 +63,13 @@ pub fn ftruncate_len(fd: RawFd, len: u64) -> libc::c_int {
 }
 #[cfg(target_arch = "wasm32")]
 use crate::wasmcompat::{libc, RawFd};
+
+/// The wasm32 arm of [`ftruncate_len`]: `off_t` is already 64-bit in the
+/// buffer shim, so this is the plain resize.
+#[cfg(target_arch = "wasm32")]
+pub fn ftruncate_len(fd: RawFd, len: u64) -> libc::c_int {
+    unsafe { libc::ftruncate(fd, len as libc::off_t) }
+}
 use std::sync::atomic::AtomicU32;
 use std::time::Duration;
 
