@@ -210,6 +210,21 @@ fn convert_params(params: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<Value>> {
     Ok(out)
 }
 
+/// The sqlite3-compat variant of [`convert_params`]: stdlib sqlite3 binds
+/// Python `True`/`False` as the integers 1/0 (sqlite has no bool storage
+/// class), and real code compares them against INTEGER columns — diskcache's
+/// `raw = ?` is exactly that. The native `mpedb.Database` API keeps
+/// `Value::Bool` for declared bool columns; only the drop-in surface flattens.
+fn convert_params_sqlite3(params: Option<&Bound<'_, PyAny>>) -> PyResult<Vec<Value>> {
+    Ok(convert_params(params)?
+        .into_iter()
+        .map(|v| match v {
+            Value::Bool(b) => Value::Int(i64::from(b)),
+            other => other,
+        })
+        .collect())
+}
+
 fn parse_hash(plan_hash: &str) -> PyResult<PlanHash> {
     plan_hash.parse::<PlanHash>().map_err(|_| {
         ProgrammingError::new_err(format!(
@@ -701,6 +716,25 @@ enum Backend {
     Overlay(Arc<Mutex<Option<mpedb::SqliteOverlay>>>, PathBuf),
 }
 
+impl Backend {
+    /// `PRAGMA page_count`, answered honestly: the real backing bytes on
+    /// disk (base + overlay sidecar for a `.db`), in 4096-byte pages —
+    /// diskcache's `volume()` destructures this and steers its culling by it.
+    /// `:memory:` (no file) answers 1.
+    fn page_count(&self) -> i64 {
+        let len = |p: &std::path::Path| std::fs::metadata(p).map(|m| m.len()).unwrap_or(0);
+        let bytes = match self {
+            Backend::Native(db) => len(db.path()),
+            Backend::Overlay(_, base) => {
+                let mut side = base.as_os_str().to_owned();
+                side.push(".overlay.mpedb");
+                len(base) + len(std::path::Path::new(&side))
+            }
+        };
+        bytes.div_ceil(4096).max(1) as i64
+    }
+}
+
 #[pyclass(name = "Connection", module = "mpedb")]
 struct PyConnection {
     backend: Backend,
@@ -883,6 +917,9 @@ impl PyCursor {
         } else {
             match name_part.as_str() {
                 "page_size" => Some(4096),
+                // The real backing bytes in 4096-byte pages (the caller drops
+                // its connection borrow before exec_pragma — safe to borrow).
+                "page_count" => Some(self.conn.borrow(py).backend.page_count()),
                 "cache_size" => Some(-2000),
                 "synchronous" => Some(2),
                 "foreign_keys" => Some(0),
@@ -972,7 +1009,7 @@ impl PyCursor {
         params: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<()> {
         let sql = sql.to_string();
-        let vals = convert_params(params)?;
+        let vals = convert_params_sqlite3(params)?;
         let mut conn = self.conn.borrow_mut(py);
         if conn.closed {
             return Err(closed_err());

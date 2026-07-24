@@ -31,19 +31,31 @@ jobs:
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # Linux wheels: x86-64 plus the two ARM shapes the engine is actually
+  # crash-tested on (aarch64 and 32-bit armv7 — the Raspberry Pi pair).
+  # No Windows wheel: the engine is POSIX at its core (mmap, the FLD-2 flock
+  # writer lock, robust shared-memory mutexes, /proc start-time identity) —
+  # a Windows port is an engine project (#97 territory), not a CI matrix entry.
   wheel-linux:
     needs: test
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        target: [x86_64, aarch64, armv7]
     steps:
       - uses: actions/checkout@v4
+      # Cross wheels build inside QEMU-emulated manylinux containers.
+      - uses: docker/setup-qemu-action@v3
+        if: matrix.target != 'x86_64'
       - uses: PyO3/maturin-action@v1
         with:
           command: build
+          target: ${{ matrix.target }}
           args: --release -o dist --manifest-path crates/mpedb-py/Cargo.toml
           manylinux: auto
       - uses: actions/upload-artifact@v4
         with:
-          name: wheel-linux
+          name: wheel-linux-${{ matrix.target }}
           path: dist
 
   wheel-macos:

@@ -15,6 +15,34 @@
 
 **An embedded, multi-process, shared-memory database in Rust.**
 
+## Install
+
+**Python** — a drop-in `sqlite3` replacement, published to
+[PyPI](https://pypi.org/project/mpedb/) automatically whenever the full test
+suite is green on `main` (Linux x86-64/aarch64/armv7 + macOS arm64 wheels,
+CPython 3.12+):
+
+```sh
+pip install mpedb
+```
+
+```python
+import mpedb as sqlite3   # existing sqlite3 code runs unchanged
+```
+
+`connect("app.db")` reads your existing sqlite file and keeps it in sync;
+`connect("app.mpedb")` is the native engine. Details:
+[crates/mpedb-py](crates/mpedb-py/README.md).
+
+**CLI** — the `mpedb` binary (REPL, dump, stress/crash harnesses, benchmarks,
+sqlite mirror/checkpoint) installs straight from this repo with a Rust
+toolchain:
+
+```sh
+cargo install --git https://github.com/punnerud/mpedb mpedb-cli
+mpedb data.db     # opens an existing sqlite .db directly
+```
+
 Linux and macOS run the whole engine and its multi-process crash tests; Windows
 runs the portable crates — the type system and the SQL front end — because the
 engine is Unix-only by construction (mmap, flock, robust `PROCESS_SHARED`

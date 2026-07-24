@@ -12,7 +12,7 @@ box, so only NEW failures count.
 | suite | stdlib baseline | mpedb 0.1.1 | first blocker |
 |---|---|---|---|
 | sqlitedict (89 tests) | 89 pass | 2 pass | `PRAGMA journal_mode` refused at connection bootstrap |
-| diskcache core (185) | 185 pass | 4 pass → **19 pass (0.1.2)** | tier 1 fixed the bootstrap; remainder is dominated by parameterized `LIMIT ?` (46 tests — engine SQL surface, 0.2) |
+| diskcache core (87 in test_core.py) | 87 pass | 4 → 19 (0.1.2) → **67 pass (0.1.3)** | 0.1.3 shipped the four measured blockers: engine `LIMIT ?` (PLAN_FORMAT 62), `PRAGMA page_count`, bool-as-int binding, overlay subquery param staging + `rowid` alias on INTEGER-PK tables; remainder = DQS double-quote leniency (#132) and per-test details below |
 | CPython test_sqlite3 (424 run) | — | 76 pass / 32 fail / 310 error | two missing `SQLITE_*` constants import-blocked 7 of 10 files |
 
 Reference: the C-API shim (a different artifact — the real `_sqlite3` C module
@@ -26,6 +26,25 @@ already worked in statement replays (parameterized CRUD, REPLACE / OR IGNORE,
 aggregates, and on the `.db` overlay even triggers and partial indexes).
 
 ## 0.2 roadmap, ranked by measured leverage
+
+### 0.1.3 — the measured next tier (diskcache 19 → 67 of 87)
+Shipped: **engine `LIMIT ?`/`OFFSET ?`** (PLAN_FORMAT 62 — LimitVal Lit/Param,
+compile-time int64 typing of the slot, one executor resolve with sqlite's
+differentially-confirmed evaluation order: LIMIT first, exact 0 short-circuits
+before OFFSET, negative LIMIT = unbounded, negative OFFSET = 0, NULL = loud
+"datatype mismatch"); `PRAGMA page_count` answered from real backing bytes;
+Python `bool` binds as 1/0 on the compat surface (stdlib semantics); the
+overlay path now runs the same parameter staging as every other execution
+path (subquery-lifted statements — `WHERE rowid IN (SELECT … LIMIT ?)` —
+failed with a wrong-parameter-count before); and `rowid`/`_rowid_`/`oid`
+resolve to a declared single int64 PK (sqlite's INTEGER PRIMARY KEY alias,
+oracle-checked; TEXT/composite PKs keep refusing like WITHOUT ROWID).
+
+Remaining 20, bucketed: **#133 overlay secondary-UNIQUE conflict misses the
+base after reopen (WRONG ANSWER — `INSERT OR REPLACE` duplicates; tops the
+0.2 list)**, ~5; #132 DQS double-quote leniency (`WHERE key = "misses"`), ~5;
+`PRAGMA integrity_check`/`VACUUM` acceptance; volume()-vs-preallocated-file
+expectations; checkpoint-while-open (`database is locked`) in two tests.
 
 ### Tier 1 — SHIPPED in 0.1.2 (the bootstrap ritual)
 Delivered: PRAGMA accept-and-answer (set + read; page_size/journal_mode/… answer,
