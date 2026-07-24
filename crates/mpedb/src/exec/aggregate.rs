@@ -1089,6 +1089,32 @@ fn try_fused_fold(
     // and the row fold runs, exactly as before.
     if matches!(access, AccessPath::FullScan) {
         if let Some(snap) = ctx.snapshot_txn() {
+            // VECTORIZED sum (DESIGN-COLUMNAR §7.2): a single, unfiltered
+            // `sum(<bare float column>)` reads the packed segment in a tight f64
+            // loop — no `Value` boxed, no closure crossed per row — where the
+            // general fold decodes and pushes each value. Bit-identical (same
+            // floats, same order into one running total) and it declines to the
+            // ordinary segment/row fold for anything it cannot take (NULLs,
+            // appends above a watermark, a non-raw-f64 encoding). This is the
+            // step that closes the scalar-vs-vectorized gap on the hot shape.
+            if filter.is_none()
+                && agg.aggs.len() == 1
+                && !agg.aggs[0].distinct
+                && agg.aggs[0].filter.is_none()
+                && matches!(
+                    agg.aggs[0].func,
+                    mpedb_types::AggTarget::Native(mpedb_types::AggFn::Sum)
+                )
+                && t.columns[col as usize].ty == mpedb_types::ColumnType::Float64
+            {
+                if let Some((total, n)) =
+                    crate::colseg::sum_f64_whole_table(snap, table, col)?
+                {
+                    return Ok(Some(vec![Acc::Native(mpedb_types::Accum::from_float_sum(
+                        total, n,
+                    ))]));
+                }
+            }
             let ty = t.columns[col as usize].ty;
             // With a predicate, the zone maps decide each block before it is
             // read (stage 2): a block whose [min,max] excludes the predicate is
