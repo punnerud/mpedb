@@ -901,19 +901,19 @@ impl PyCursor {
         self.description = None;
         if !is_set {
             if let Some(v) = answer {
-                self.description = Some(describe(py, &[name_part.clone()])?);
+                self.description = Some(describe(py, std::slice::from_ref(&name_part))?);
                 let row = (v,).into_pyobject(py)?.into_any().unbind();
                 self.rows = vec![row];
             } else if name_part == "journal_mode" {
                 // The one TEXT-valued pragma real code reads (sqlitedict sets
                 // then trusts it): answer with the honest equivalent.
-                self.description = Some(describe(py, &[name_part.clone()])?);
+                self.description = Some(describe(py, std::slice::from_ref(&name_part))?);
                 let row = ("wal",).into_pyobject(py)?.into_any().unbind();
                 self.rows = vec![row];
             }
         } else if name_part == "journal_mode" {
             // sqlite returns the RESULTING mode from a journal_mode SET.
-            self.description = Some(describe(py, &[name_part.clone()])?);
+            self.description = Some(describe(py, std::slice::from_ref(&name_part))?);
             let row = ("wal",).into_pyobject(py)?.into_any().unbind();
             self.rows = vec![row];
         }
