@@ -8,11 +8,11 @@
 //! `select_core` and `eat_all_quantifier` are `pub(super)` so the statement
 //! dispatch, the DML grammar and the expression grammar can reach them.
 
-use super::{Parser, MAX_COMPOUND_ARMS, MAX_ORDER_BY_ITEMS, MAX_SELECT_ITEMS};
+use super::{ParamStyle, Parser, MAX_COMPOUND_ARMS, MAX_ORDER_BY_ITEMS, MAX_SELECT_ITEMS};
 use crate::ast::{CompoundStmt, Expr, JoinClause, JoinKind, SelectStmt, Stmt};
-use crate::plan::{SetOp, SortDir};
+use crate::plan::{LimitVal, SetOp, SortDir};
 use crate::token::{Kw, Tok};
-use mpedb_types::{ident_eq, Result, Value};
+use mpedb_types::{ident_eq, Error, Result, Value};
 
 /// Re-spell a bare ORDER BY key to the SELECT-item alias it names, when the two
 /// differ only in ASCII case.
@@ -456,7 +456,7 @@ impl<'a> Parser<'a> {
         let offset = if self.eat_kw(Kw::Offset) {
             // A negative OFFSET skips nothing (sqlite clamps it to 0), which
             // `Some(0)` says exactly.
-            Some(self.limit_int("OFFSET")?.unwrap_or(0))
+            Some(self.limit_int("OFFSET")?.unwrap_or(LimitVal::Lit(0)))
         } else {
             None
         };
@@ -646,19 +646,44 @@ impl<'a> Parser<'a> {
     /// means for its clause. A negative value is remembered in
     /// `neg_limit_in_core` so `compound_chain` can still reject a `LIMIT`
     /// before a set operator, which absence alone no longer shows.
-    fn limit_int(&mut self, what: &str) -> Result<Option<u64>> {
+    fn limit_int(&mut self, what: &str) -> Result<Option<LimitVal>> {
         let neg = self.eat(&Tok::Minus);
+        let pos = self.here();
         match self.peek() {
             Some(&Tok::Int(v)) if v >= 0 => {
                 self.pos += 1;
                 if neg {
                     self.neg_limit_in_core = true;
                     // `-0` is zero, not "no bound".
-                    return Ok((v == 0).then_some(0));
+                    return Ok((v == 0).then_some(LimitVal::Lit(0)));
                 }
-                Ok(Some(v as u64))
+                Ok(Some(LimitVal::Lit(v as u64)))
             }
-            _ => Err(self.err_here(format!("{what} requires an integer literal"))),
+            // `LIMIT ?` / `LIMIT $n`: the bound arrives at execute time. Same
+            // parameter bookkeeping as an expression-position param (style
+            // consistency, `?` auto-numbering, the u16 encoding ceiling); a
+            // sign prefix is refused — a parameter's sign folds at execution.
+            Some(&Tok::DollarParam(i)) if !neg => {
+                self.pos += 1;
+                self.param_style(ParamStyle::Dollar, pos)?;
+                self.max_params = self.max_params.max(i as u32 + 1);
+                Ok(Some(LimitVal::Param(i)))
+            }
+            Some(&Tok::Question) if !neg => {
+                self.pos += 1;
+                self.param_style(ParamStyle::Question, pos)?;
+                let i = self.next_question;
+                if i >= u16::MAX as u32 {
+                    return Err(Error::Parse {
+                        pos,
+                        msg: "too many `?` parameters (max 65535)".into(),
+                    });
+                }
+                self.next_question += 1;
+                self.max_params = self.max_params.max(i + 1);
+                Ok(Some(LimitVal::Param(i as u16)))
+            }
+            _ => Err(self.err_here(format!("{what} requires an integer literal or parameter"))),
         }
     }
 }

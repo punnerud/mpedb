@@ -6,6 +6,11 @@ fn sample_sqls() -> Vec<&'static str> {
     vec![
         "SELECT * FROM users WHERE id = $1",
         "SELECT id, email, age + 1 FROM users WHERE age > 18 AND score < 2.5 ORDER BY email DESC LIMIT 10 OFFSET 5",
+        // Format 62: PARAMETERIZED bounds (limit tag 2) through roundtrip,
+        // truncation-at-every-offset and the bit-flip fuzz — a literal-only
+        // corpus never emits the tag.
+        "SELECT id FROM users WHERE age > $1 ORDER BY id LIMIT $2 OFFSET $3",
+        "SELECT id FROM users UNION SELECT user_id FROM orders ORDER BY 1 LIMIT $1",
         "SELECT * FROM users WHERE id > 1 AND id <= $1",
         "SELECT * FROM users WHERE email = 'a@b' AND active",
         "SELECT * FROM orders WHERE user_id = 1 AND item_no = 2",

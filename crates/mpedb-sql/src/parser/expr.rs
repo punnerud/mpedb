@@ -1410,7 +1410,7 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn param_style(&mut self, style: ParamStyle, pos: usize) -> Result<()> {
+    pub(super) fn param_style(&mut self, style: ParamStyle, pos: usize) -> Result<()> {
         if self.style == ParamStyle::Unset {
             self.style = style;
         } else if self.style != style {

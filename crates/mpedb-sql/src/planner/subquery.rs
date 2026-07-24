@@ -13,6 +13,7 @@
 //! is what lets `WHERE id = (SELECT max(id) …)` still be a PK point probe.
 
 use super::*;
+use crate::plan::LimitVal;
 
 /// Everything `lift_subqueries` learned about one statement.
 pub(super) struct Lifted {
@@ -505,7 +506,14 @@ impl Lift<'_> {
             SubPlanKind::List => None,
         };
         if let Some(cap) = cap {
-            cp.limit = Some(cp.limit.map_or(cap, |l| l.min(cap)));
+            // A parameterized LIMIT cannot fold with the consumer cap at plan
+            // time — keep the parameter (correctness beats the cap, which is
+            // only an optimization: the consumer stops reading anyway).
+            cp.limit = Some(match cp.limit {
+                None => LimitVal::Lit(cap),
+                Some(LimitVal::Lit(l)) => LimitVal::Lit(l.min(cap)),
+                Some(p @ LimitVal::Param(_)) => p,
+            });
         }
         let ty = match kind {
             SubPlanKind::Exists => Some(ColumnType::Bool),
@@ -572,7 +580,14 @@ impl Lift<'_> {
             SubPlanKind::List => None,
         };
         let inner_limit = match consumer_cap {
-            Some(cap) => Some(inner.limit.map_or(cap, |l| l.min(cap))),
+            // A parameterized inner LIMIT cannot fold with the consumer cap at
+            // plan time — keep the parameter (correctness) and forgo the cap
+            // (it was an optimization; the consumer stops reading anyway).
+            Some(cap) => Some(match inner.limit {
+                None => LimitVal::Lit(cap),
+                Some(LimitVal::Lit(l)) => LimitVal::Lit(l.min(cap)),
+                Some(p @ LimitVal::Param(_)) => p,
+            }),
             None => inner.limit,
         };
         // Rewrite every correlation-bearing clause (descending into nested

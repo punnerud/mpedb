@@ -227,13 +227,18 @@ fn decode_opt_program(buf: &[u8], pos: &mut usize) -> Result<Option<ExprProgram>
     }
 }
 
-fn decode_opt_u64(buf: &[u8], pos: &mut usize) -> Result<Option<u64>> {
+/// Format 62 mirror of `encode_opt_limit`. The parameter index is
+/// range-checked against `n_params` in validate (where every other param
+/// reference is checked), not here.
+fn decode_opt_limit(buf: &[u8], pos: &mut usize) -> Result<Option<LimitVal>> {
     match r_u8(buf, pos)? {
         0 => Ok(None),
-        1 => Ok(Some(r_u64(buf, pos)?)),
-        t => Err(corrupt(format!("bad optional-u64 tag {t}"))),
+        1 => Ok(Some(LimitVal::Lit(r_u64(buf, pos)?))),
+        2 => Ok(Some(LimitVal::Param(r_u16(buf, pos)?))),
+        t => Err(corrupt(format!("bad limit tag {t}"))),
     }
 }
+
 
 fn decode_part(buf: &[u8], pos: &mut usize) -> Result<KeyPart> {
     let tag = r_u8(buf, pos)?;
@@ -606,8 +611,8 @@ fn decode_compound(buf: &[u8], pos: &mut usize, budget: &mut usize) -> Result<Co
         let coll = r_collation(buf, pos)?;
         order_by.push((c, dir, coll));
     }
-    let limit = decode_opt_u64(buf, pos)?;
-    let offset = decode_opt_u64(buf, pos)?;
+    let limit = decode_opt_limit(buf, pos)?;
+    let offset = decode_opt_limit(buf, pos)?;
     // Format 56: the arms' OWNED lifts. Either NO list at all (a lift-free
     // compound) or exactly one per arm; drawn from the plan-wide tree budget so
     // the arm-ownership move cannot enlarge the DoS bound.
@@ -693,8 +698,8 @@ fn decode_select(buf: &[u8], pos: &mut usize) -> Result<SelectPlan> {
                 let coll = r_collation(buf, pos)?;
                 order_by.push((c, dir, coll));
             }
-            let limit = decode_opt_u64(buf, pos)?;
-            let offset = decode_opt_u64(buf, pos)?;
+            let limit = decode_opt_limit(buf, pos)?;
+            let offset = decode_opt_limit(buf, pos)?;
             let njoins = r_u16(buf, pos)? as usize;
             if njoins > MAX_JOINS {
                 return Err(corrupt("too many joins in plan"));

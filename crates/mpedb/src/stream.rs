@@ -127,6 +127,7 @@ impl<'db> RowStream<'db> {
             .map(|&i| keycode::KeySpec::for_column(tdef.columns[i as usize].ty, tdef.columns[i as usize].collation))
             .collect();
 
+        let lo_resolved = crate::exec::resolve_limit_offset(*limit, *offset, params)?;
         let mut stream = RowStream {
             txn: None,
             plan: plan.clone(),
@@ -138,8 +139,10 @@ impl<'db> RowStream<'db> {
             pk_specs,
             lo: None,
             hi: None,
-            skip: offset.unwrap_or(0).min(usize::MAX as u64) as usize,
-            take: limit.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize),
+            skip: lo_resolved.1.min(usize::MAX as u64) as usize,
+            take: lo_resolved
+                .0
+                .map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize),
         };
 
         // Sorting plans and point accesses cannot / need not stream: run the

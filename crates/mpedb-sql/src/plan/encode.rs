@@ -125,8 +125,8 @@ fn encode_compound(c: &CompoundPlan, buf: &mut Vec<u8>) {
         buf.push(dir.to_byte());
         w_collation(buf, coll);
     }
-    encode_opt_u64(c.limit, buf);
-    encode_opt_u64(c.offset, buf);
+    encode_opt_limit(c.limit, buf);
+    encode_opt_limit(c.offset, buf);
     // Format 56: the arms' OWNED lifts. `0` arm-lift lists is the shape every
     // compound had before, so a lift-free compound grows by exactly the base
     // `u16` and one zero byte.
@@ -154,15 +154,22 @@ fn encode_opt_program(p: Option<&ExprProgram>, buf: &mut Vec<u8>) {
     }
 }
 
-fn encode_opt_u64(v: Option<u64>, buf: &mut Vec<u8>) {
+/// Format 62: a LIMIT/OFFSET bound. Tag 0 = absent, 1 = integer literal
+/// (u64 LE), 2 = parameter (u16 LE index — validated against `n_params`).
+fn encode_opt_limit(v: Option<LimitVal>, buf: &mut Vec<u8>) {
     match v {
         None => buf.push(0),
-        Some(v) => {
+        Some(LimitVal::Lit(n)) => {
             buf.push(1);
-            buf.extend_from_slice(&v.to_le_bytes());
+            buf.extend_from_slice(&n.to_le_bytes());
+        }
+        Some(LimitVal::Param(i)) => {
+            buf.push(2);
+            buf.extend_from_slice(&i.to_le_bytes());
         }
     }
 }
+
 
 fn encode_part(p: &KeyPart, buf: &mut Vec<u8>) {
     match p {
@@ -429,8 +436,8 @@ fn encode_select(sp: &SelectPlan, buf: &mut Vec<u8>) {
                 buf.push(dir.to_byte());
                 w_collation(buf, coll);
             }
-            encode_opt_u64(*limit, buf);
-            encode_opt_u64(*offset, buf);
+            encode_opt_limit(*limit, buf);
+            encode_opt_limit(*offset, buf);
             // A COUNT of joins where v6 wrote a single optional-join tag
             // (PLAN_FORMAT 7). `joined_filter` follows the chain, once, over the
             // full joined row.

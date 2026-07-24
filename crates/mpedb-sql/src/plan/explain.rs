@@ -169,10 +169,10 @@ impl CompiledPlan {
             out.push_str(&format!("order by: {}\n", items.join(", ")));
         }
         if let Some(n) = c.limit {
-            out.push_str(&format!("limit: {n}\n"));
+            out.push_str(&format!("limit: {}\n", limit_str(n)));
         }
         if let Some(n) = c.offset {
-            out.push_str(&format!("offset: {n}\n"));
+            out.push_str(&format!("offset: {}\n", limit_str(n)));
         }
     }
 
@@ -561,10 +561,10 @@ impl CompiledPlan {
                     out.push_str(&format!("  order by: {}\n", items.join(", ")));
                 }
                 if let Some(n) = limit {
-                    out.push_str(&format!("  limit: {n}\n"));
+                    out.push_str(&format!("  limit: {}\n", limit_str(*n)));
                 }
                 if let Some(n) = offset {
-                    out.push_str(&format!("  offset: {n}\n"));
+                    out.push_str(&format!("  offset: {}\n", limit_str(*n)));
                 }
             }
         }
@@ -1258,4 +1258,13 @@ pub(crate) fn render_program(p: &ExprProgram, col: &dyn Fn(u16) -> String) -> St
         st.push(item);
     }
     pop(&mut st).s
+}
+
+/// A LIMIT/OFFSET bound for display: the literal value, or `$n` (1-indexed,
+/// the same convention as every other parameter site in EXPLAIN).
+fn limit_str(v: LimitVal) -> String {
+    match v {
+        LimitVal::Lit(n) => n.to_string(),
+        LimitVal::Param(i) => format!("${}", i + 1),
+    }
 }

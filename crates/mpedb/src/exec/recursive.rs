@@ -41,7 +41,7 @@ pub(super) fn exec_recursive_cte(
 
     // The outer LIMIT bounds the iteration only when the outer statement passes
     // rows through 1:1 (§2) — that is what makes an infinite generator finite.
-    let iter_cap = outer_iteration_cap(&rc.outer);
+    let iter_cap = outer_iteration_cap(&rc.outer, params)?;
 
     // Converged-frontier reachability (the graph bench's depth-sweep finding:
     // reach-k grew LINEARLY in k after the frontier saturated, because UNION
@@ -343,18 +343,23 @@ fn select_rows(
 /// through 1:1 — no join, aggregate, DISTINCT, window or ORDER BY (any of which
 /// changes cardinality or needs the whole result, so the fixpoint must complete
 /// or the #74 budget must catch a runaway). `None` = no early stop.
-fn outer_iteration_cap(outer: &mpedb_sql::SelectPlan) -> Option<usize> {
+fn outer_iteration_cap(
+    outer: &mpedb_sql::SelectPlan,
+    params: &[Value],
+) -> Result<Option<usize>> {
     if !outer.joins.is_empty()
         || outer.aggregate.is_some()
         || outer.distinct
         || !outer.windows.is_empty()
         || !outer.order_by.is_empty()
     {
-        return None;
+        return Ok(None);
     }
-    let limit = outer.limit?;
-    let offset = outer.offset.unwrap_or(0);
-    Some(limit.saturating_add(offset).min(usize::MAX as u64) as usize)
+    // A parameterized bound resolves against THIS execution's params; a
+    // negative LIMIT value means no bound — and therefore no cap.
+    let (l, offset) = super::resolve_limit_offset(outer.limit, outer.offset, params)?;
+    let Some(limit) = l else { return Ok(None) };
+    Ok(Some(limit.saturating_add(offset).min(usize::MAX as u64) as usize))
 }
 
 /// How many output rows the (pass-through) outer statement would currently

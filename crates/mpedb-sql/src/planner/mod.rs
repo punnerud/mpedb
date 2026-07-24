@@ -76,9 +76,9 @@ use crate::binder::{
 pub(crate) type OrderKeys = Vec<(u16, crate::plan::SortDir, mpedb_types::OrderColl)>;
 use crate::plan::{
     render_program, AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, Frame,
-    FrameBound, FrameMode, InsertSource, CompoundPlan, GroupKey, Join, JoinKind, OrderOver,
+    CompoundArm, DerivedPlan, FrameBound, FrameMode, InsertSource, CompoundPlan, GroupKey, Join, JoinKind, OrderOver,
     PlanOnConflict, PlanStmt, PolicyStamp, Projection, RecursiveCtePlan, SelectPlan, SubBody,
-    SubPlan, SubPlanKind, WindowSpec, CTE_TABLE, MAX_PLAN_SUBPLANS,
+    LimitVal, SubPlan, SubPlanKind, WindowSpec, CTE_TABLE, MAX_PLAN_SUBPLANS,
 };
 #[allow(unused_imports)]
 use crate::plan::{FtsQuery, FtsTerm};
@@ -414,6 +414,94 @@ fn reject_correlated_in_aggregate(
     Ok(())
 }
 
+
+/// Every `LIMIT ?` / `OFFSET ?` parameter in the compiled tree types as
+/// int64 — registered HERE, at the one chokepoint every statement passes,
+/// instead of in each planning path. The binder never sees LIMIT (it flows
+/// parser → planner as data, not as an expression), so this is its
+/// `unify_param`: an untyped slot becomes int64, an int64 slot is confirmed,
+/// and any other type is a loud conflict (`$n` can name one parameter twice).
+fn register_limit_params(
+    stmt: &PlanStmt,
+    subplans: &[SubPlan],
+    ptypes: &mut [Option<ColumnType>],
+) -> Result<()> {
+    fn one(v: Option<LimitVal>, ptypes: &mut [Option<ColumnType>]) -> Result<()> {
+        let Some(LimitVal::Param(i)) = v else { return Ok(()) };
+        match ptypes.get(i as usize) {
+            Some(None) => ptypes[i as usize] = Some(ColumnType::Int64),
+            Some(Some(ColumnType::Int64)) => {}
+            Some(Some(other)) => {
+                return Err(bind_err(format!(
+                    "parameter ${} is used both as {other:?} and as a \
+                     LIMIT/OFFSET value (an integer)",
+                    i + 1
+                )))
+            }
+            // Parser bookkeeping caps every LIMIT param below n_user_params;
+            // an index past the table is a planner bug, not user error.
+            None => return Err(bind_err(format!("LIMIT parameter ${} out of range", i + 1))),
+        }
+        Ok(())
+    }
+    fn sel(sp: &SelectPlan, ptypes: &mut [Option<ColumnType>]) -> Result<()> {
+        one(sp.limit, ptypes)?;
+        one(sp.offset, ptypes)
+    }
+    fn comp(cp: &CompoundPlan, ptypes: &mut [Option<ColumnType>]) -> Result<()> {
+        one(cp.limit, ptypes)?;
+        one(cp.offset, ptypes)?;
+        for arm in &cp.arms {
+            match arm {
+                CompoundArm::Select(sp) => sel(sp, ptypes)?,
+                CompoundArm::Derived(dp) => derived(dp, ptypes)?,
+            }
+        }
+        for list in &cp.arm_subplans {
+            for sub in list {
+                subplan(sub, ptypes)?;
+            }
+        }
+        Ok(())
+    }
+    fn derived(dp: &DerivedPlan, ptypes: &mut [Option<ColumnType>]) -> Result<()> {
+        match &dp.body {
+            SubBody::Select(ref sp) => sel(sp, ptypes)?,
+            SubBody::Compound(ref cp) => comp(cp, ptypes)?,
+        }
+        for sub in &dp.body_subplans {
+            subplan(sub, ptypes)?;
+        }
+        sel(&dp.outer, ptypes)
+    }
+    fn subplan(sub: &SubPlan, ptypes: &mut [Option<ColumnType>]) -> Result<()> {
+        match &sub.body {
+            SubBody::Select(sp) => sel(sp, ptypes)?,
+            SubBody::Compound(cp) => comp(cp, ptypes)?,
+        }
+        for child in &sub.subplans {
+            subplan(child, ptypes)?;
+        }
+        Ok(())
+    }
+    match stmt {
+        PlanStmt::Select(sp) => sel(sp, ptypes)?,
+        PlanStmt::Compound(cp) => comp(cp, ptypes)?,
+        PlanStmt::Derived(dp) => derived(dp, ptypes)?,
+        PlanStmt::RecursiveCte(rc) => {
+            sel(&rc.anchor, ptypes)?;
+            sel(&rc.recursive, ptypes)?;
+            sel(&rc.outer, ptypes)?;
+        }
+        PlanStmt::Insert { from_select: Some(fs), .. } => sel(&fs.plan, ptypes)?,
+        _ => {}
+    }
+    for sub in subplans {
+        subplan(sub, ptypes)?;
+    }
+    Ok(())
+}
+
 /// Bind and plan one parsed statement into a [`CompiledPlan`].
 pub(crate) fn plan_statement(
     stmt: &ast::Stmt,
@@ -466,6 +554,8 @@ pub(crate) fn plan_statement(
             plan_delete(s, schema, n_params, catalog, mode, host_udfs, row_count, &mut consts)?
         }
     };
+    let mut param_types = param_types;
+    register_limit_params(&plan_stmt, &subplans, &mut param_types)?;
     // The 16-subplan ceiling bounds the WHOLE tree once nesting (#73 §3) can
     // grow it past one level — matching the recursive decoder's DoS budget, so a
     // plan `prepare` accepts is a plan `decode` accepts.

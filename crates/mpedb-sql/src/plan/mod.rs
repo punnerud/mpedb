@@ -478,7 +478,7 @@ const MAX_JOINS: usize = 16;
 //     collation — sqlite compares min/max (aggregate AND scalar) under the
 //     argument's collation, which a BINARY-only compare answered wrongly on
 //     any NOCASE/RTRIM column (tests/agg_collate.rs).
-const PLAN_FORMAT: u8 = 61;
+const PLAN_FORMAT: u8 = 62;
 
 /// The table id a FROM-less SELECT carries (`SELECT 3+5`): no table at all.
 /// The executor yields ONE synthetic zero-column row; the footprint sets no
@@ -914,8 +914,8 @@ pub struct SelectPlan {
     /// decoder must bounds-check against the right width — inferring it
     /// twice is how the two come to disagree.
     pub order_over: OrderOver,
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
+    pub limit: Option<LimitVal>,
+    pub offset: Option<LimitVal>,
     /// Grouping, applied **after** `filter`. `None` = no aggregation.
     pub aggregate: Option<Aggregation>,
     /// Trailing `projection` entries that exist ONLY to be sorted by, and
@@ -1204,6 +1204,17 @@ const MAX_WINDOWS: usize = 64;
 /// precedence — sqlite's rule, and the one the sqllogictest corpus' expected
 /// results are computed under. (PostgreSQL instead gives INTERSECT higher
 /// precedence; a mixed chain ported from PG may need restructuring.)
+/// A `LIMIT`/`OFFSET` bound: an integer literal, or a PARAMETER whose value
+/// arrives at execute time (`LIMIT ?` — what every pager emits). A negative
+/// LITERAL folds at parse (sqlite: negative LIMIT = no bound, negative OFFSET
+/// = skip nothing); a parameter's sign folds at execution against the bound
+/// value, in the executor's one resolve function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitVal {
+    Lit(u64),
+    Param(u16),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SetOp {
     Union,
@@ -1279,8 +1290,8 @@ pub struct CompoundPlan {
     /// tuple. Collation is `Native(Binary)` unless an explicit `COLLATE` was
     /// written on the compound ORDER BY term.
     pub order_by: Vec<(u16, SortDir, OrderColl)>,
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
+    pub limit: Option<LimitVal>,
+    pub offset: Option<LimitVal>,
     /// Per-arm OWNED lifted subqueries (format 56). EMPTY when no arm lifts
     /// anything (every compound before format 56); otherwise EXACTLY one entry
     /// per arm, in arm order. A [`CompoundArm::Derived`] arm owns its lifts

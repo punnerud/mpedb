@@ -78,6 +78,8 @@ impl CompiledPlan {
         if c.ops.len() != c.arms.len() - 1 {
             return Err(corrupt("compound op count does not match arm count"));
         }
+        validate_limit(c.limit, ptypes, "compound LIMIT")?;
+        validate_limit(c.offset, ptypes, "compound OFFSET")?;
         // The arms' OWNED lifts (format 56). Either no list at all, or exactly
         // one per arm, based where this level's parameters end.
         if !c.arm_subplans.is_empty() && c.arm_subplans.len() != c.arms.len() {
@@ -462,6 +464,8 @@ impl CompiledPlan {
         ptypes: &[Option<ColumnType>],
         cte_td: Option<&TableDef>,
     ) -> Result<()> {
+        validate_limit(sp.limit, ptypes, "LIMIT")?;
+        validate_limit(sp.offset, ptypes, "OFFSET")?;
         let get_table = |id: u32| -> Result<&TableDef> {
             if id == super::CTE_TABLE {
                 return cte_td
@@ -1630,6 +1634,26 @@ impl CompiledPlan {
             }
         }
     }
+}
+
+/// Format 62: a `LIMIT ?`/`OFFSET ?` parameter must name a real slot, and the
+/// compiler types that slot int64 — a decoded plan claiming otherwise is
+/// corrupt, exactly like an out-of-range `Instr::PushParam`.
+fn validate_limit(
+    v: Option<LimitVal>,
+    ptypes: &[Option<ColumnType>],
+    what: &str,
+) -> Result<()> {
+    if let Some(LimitVal::Param(i)) = v {
+        match ptypes.get(i as usize) {
+            None => return Err(corrupt(format!("{what} parameter {i} out of range"))),
+            Some(Some(ColumnType::Int64)) => {}
+            Some(_) => {
+                return Err(corrupt(format!("{what} parameter {i} is not typed int64")))
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Recursively check a compiled FTS query: non-empty terms, in-range column

@@ -1290,8 +1290,8 @@ pub(super) fn exec_aggregate(
     order_by: &[(u16, SortDir, mpedb_types::OrderColl)],
     order_over: OrderOver,
     order_junk: u16,
-    limit: Option<u64>,
-    offset: Option<u64>,
+    limit: Option<mpedb_sql::LimitVal>,
+    offset: Option<mpedb_sql::LimitVal>,
     distinct: bool,
     // First reserved result slot of THIS level (`subplan_base` at the top,
     // `sub.sub_base` for a nested aggregate subplan) — where the per-row
@@ -1625,8 +1625,9 @@ pub(super) fn exec_aggregate(
         out.sort_by(|(a, _), (b, _)| super::gather::cmp_rows(a, b, order_by, colls));
     }
 
-    let skip = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
-    let take = limit.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
+    let (l, o) = super::resolve_limit_offset(limit, offset, params)?;
+    let skip = o.min(usize::MAX as u64) as usize;
+    let take = l.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
     let mut projected = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for (tuple, scratch) in out {

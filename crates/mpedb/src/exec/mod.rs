@@ -8,7 +8,7 @@ use mpedb_core::{FoldOpts, FoldStop, ReadTxn, WriteTxn};
 use mpedb_sql::{
     AccessPath, AggCall, Aggregation, CompiledPlan, ConflictProbe, InsertSource, Join, JoinKind,
     CompoundPlan, GroupKey, OrderOver, PlanOnConflict, PlanStmt, Projection, RowMap, RowSide,
-    Mask, RowPrune, SelectPlan, SetOp, SortDir, SubBody, SubPlan,
+    LimitVal, Mask, RowPrune, SelectPlan, SetOp, SortDir, SubBody, SubPlan,
 };
 use mpedb_types::{
     exact_float_as_int, exact_int_as_float, keycode, Accum, Collation, DefaultExpr, Error,
@@ -938,7 +938,11 @@ impl TxnCtx for ReadCtx<'_, '_> {
         // top is the *worst* kept row, so a newcomer that sorts before it
         // evicts it. Never more than `keep` rows are held, regardless of how
         // many the scan yields.
-        let mut heap: BinaryHeap<Ranked<'_>> = BinaryHeap::with_capacity(keep + 1);
+        // `keep` is runtime data (`LIMIT ?` binds it): it caps what the heap
+        // HOLDS, never what gets preallocated — `LIMIT ?` bound to i64::MAX
+        // must not size a 9e18-slot allocation (capacity overflow = panic).
+        let mut heap: BinaryHeap<Ranked<'_>> =
+            BinaryHeap::with_capacity(keep.saturating_add(1).min(65_536));
         let host = self.1;
         let mut cursor = self.0.scan_raw(table, lo, hi)?;
         let mut stack = Vec::new();
@@ -1028,6 +1032,60 @@ fn table_name(schema: &Schema, id: u32) -> String {
         .table(id)
         .map(|t| t.name.clone())
         .unwrap_or_else(|| format!("table #{id}"))
+}
+
+
+/// Resolve a LIMIT bound for THIS execution (format 62): a literal passes
+/// through; a parameter reads its bound value. sqlite semantics for the
+/// resolved integer (differentially confirmed against the bundled oracle):
+/// a negative LIMIT means no bound, and NULL is refused loudly ("datatype
+/// mismatch"). The compiler typed the slot int64, so any other value shape
+/// was already rejected by the execute-time parameter type check.
+pub(crate) fn resolve_limit(v: Option<LimitVal>, params: &[Value]) -> Result<Option<u64>> {
+    match v {
+        None => Ok(None),
+        Some(LimitVal::Lit(n)) => Ok(Some(n)),
+        Some(LimitVal::Param(i)) => match params.get(i as usize) {
+            Some(Value::Int(n)) if *n < 0 => Ok(None),
+            Some(Value::Int(n)) => Ok(Some(*n as u64)),
+            Some(Value::Null) => Err(Error::Bind(
+                "datatype mismatch: LIMIT/OFFSET parameter is NULL".into(),
+            )),
+            _ => Err(internal("LIMIT parameter slot is not an integer")),
+        },
+    }
+}
+
+/// The paired form, carrying sqlite's EVALUATION ORDER: LIMIT resolves
+/// first, and an exact 0 short-circuits the statement before OFFSET is even
+/// looked at — `LIMIT 0 OFFSET NULL` is an empty result, not a datatype
+/// error (differentially pinned in mpedb-testkit/tests/limit_param.rs).
+pub(crate) fn resolve_limit_offset(
+    limit: Option<LimitVal>,
+    offset: Option<LimitVal>,
+    params: &[Value],
+) -> Result<(Option<u64>, u64)> {
+    let l = resolve_limit(limit, params)?;
+    if l == Some(0) {
+        return Ok((Some(0), 0));
+    }
+    Ok((l, resolve_offset(offset, params)?))
+}
+
+/// The OFFSET twin: absent and negative both mean "skip nothing" (sqlite),
+/// NULL is the same loud refusal as LIMIT.
+pub(crate) fn resolve_offset(v: Option<LimitVal>, params: &[Value]) -> Result<u64> {
+    match v {
+        None => Ok(0),
+        Some(LimitVal::Lit(n)) => Ok(n),
+        Some(LimitVal::Param(i)) => match params.get(i as usize) {
+            Some(Value::Int(n)) => Ok((*n).max(0) as u64),
+            Some(Value::Null) => Err(Error::Bind(
+                "datatype mismatch: LIMIT/OFFSET parameter is NULL".into(),
+            )),
+            _ => Err(internal("OFFSET parameter slot is not an integer")),
+        },
+    }
 }
 
 fn internal(msg: &str) -> Error {
@@ -1477,8 +1535,9 @@ fn exec_compound(
         gather::check_order_colls(&c.order_by, ctx.host_colls())?;
         sort_rows(&mut acc, &c.order_by, ctx.host_colls());
     }
-    let skip = c.offset.unwrap_or(0).min(usize::MAX as u64) as usize;
-    let take = c.limit.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
+    let (l, o) = resolve_limit_offset(c.limit, c.offset, params)?;
+    let skip = o.min(usize::MAX as u64) as usize;
+    let take = l.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
     if skip > 0 || take != usize::MAX {
         acc = acc.into_iter().skip(skip).take(take).collect();
     }
@@ -1571,6 +1630,7 @@ fn exec_select(
             // happen on the base row — otherwise LIMIT bounds a tuple further
             // down the pipeline and cutting the scan short would drop input
             // that later stages still need.
+            let (limit_val, offset_val) = resolve_limit_offset(*limit, *offset, params)?;
             let skip_take_bound = || {
                 // A join is gathered whole (the LIMIT bounds joined rows, not
                 // outer rows), and any sort below the base row moves the bound
@@ -1578,9 +1638,9 @@ fn exec_select(
                 if !joins.is_empty() || *order_over != OrderOver::BaseRow {
                     return None;
                 }
-                limit.map(|l| {
+                limit_val.map(|l| {
                     let l = l.min(usize::MAX as u64) as usize;
-                    let o = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
+                    let o = offset_val.min(usize::MAX as u64) as usize;
                     l.saturating_add(o)
                 })
             };
@@ -1629,8 +1689,7 @@ fn exec_select(
                 // rows instead would index the wrong tuple.
                 if *order_over == OrderOver::BaseRow && !order_by.is_empty() {
                     gather::check_order_colls(order_by, ctx.host_colls())?;
-                    gather::check_order_colls(order_by, ctx.host_colls())?;
-                sort_rows(&mut r, order_by, ctx.host_colls());
+                    sort_rows(&mut r, order_by, ctx.host_colls());
                 }
                 r
             } else if *order_over != OrderOver::BaseRow {
@@ -1652,8 +1711,8 @@ fn exec_select(
                 sort_rows(&mut r, order_by, ctx.host_colls());
                 r
             };
-            let skip = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
-            let take = limit.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
+            let skip = offset_val.min(usize::MAX as u64) as usize;
+            let take = limit_val.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
             // Without DISTINCT, skip/take applies to base rows and there is no
             // reason to project the ones being skipped. With it, the projection
             // is what gets deduplicated, so it must happen first and skip/take
@@ -1814,8 +1873,9 @@ fn try_exec_knn(
         .collect();
 
     let keep = {
-        let l = (*limit).min(usize::MAX as u64) as usize;
-        let o = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
+        let (l, o) = resolve_limit_offset(Some(*limit), *offset, params)?;
+        let l = l.unwrap_or(u64::MAX).min(usize::MAX as u64) as usize;
+        let o = o.min(usize::MAX as u64) as usize;
         l.saturating_add(o)
     };
 
@@ -1846,7 +1906,10 @@ fn try_exec_knn(
         }
     }
     let mut nulls: Vec<Vec<Value>> = Vec::new();
-    let mut heap: BinaryHeap<Cand> = BinaryHeap::with_capacity(keep + 1);
+    // Same discipline as `scan_rows_topk`: `keep` is runtime data (a negative
+    // `LIMIT $k` resolves to no-bound = usize::MAX here), so it bounds what
+    // the heap holds, never the preallocation — `keep + 1` alone overflows.
+    let mut heap: BinaryHeap<Cand> = BinaryHeap::with_capacity(keep.saturating_add(1).min(65_536));
     for (seq, row) in rows.into_iter().enumerate() {
         let emb = row.get(emb_col as usize);
         let eb = match emb {
@@ -1946,8 +2009,9 @@ fn try_exec_knn(
             row.truncate(width);
         }
     }
-    let skip = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
-    let take = (*limit).min(usize::MAX as u64) as usize;
+    let (l, o) = resolve_limit_offset(Some(*limit), *offset, params)?;
+    let skip = o.min(usize::MAX as u64) as usize;
+    let take = l.unwrap_or(u64::MAX).min(usize::MAX as u64) as usize;
     let out: Vec<Vec<Value>> = out.into_iter().skip(skip).take(take).collect();
 
     let columns = select_output_columns(schema, plan, sp)?;
@@ -2007,8 +2071,8 @@ pub(crate) fn try_build_pk_point_hot(
         || !sp.windows.is_empty()
         || !sp.order_by.is_empty()
         || sp.order_junk != 0
-        || sp.offset.unwrap_or(0) != 0
-        || matches!(sp.limit, Some(0))
+        || !matches!(sp.offset, None | Some(LimitVal::Lit(0)))
+        || matches!(sp.limit, Some(LimitVal::Lit(0)) | Some(LimitVal::Param(_)))
     {
         return Ok(None);
     }
@@ -2313,8 +2377,9 @@ fn exec_select_with(
     }
     // The post-filter changed the counts, so LIMIT/OFFSET bound the SURVIVING
     // rows — always applied here, whatever tuple the sort ran over.
-    let skip = offset.unwrap_or(0).min(usize::MAX as u64) as usize;
-    let take = limit.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
+    let (l, o) = resolve_limit_offset(*limit, *offset, params)?;
+    let skip = o.min(usize::MAX as u64) as usize;
+    let take = l.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
     if skip > 0 || take != usize::MAX {
         out = out.into_iter().skip(skip).take(take).collect();
     }

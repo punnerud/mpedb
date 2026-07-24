@@ -106,8 +106,9 @@ pub(super) fn exec_select_windowed(
             row.truncate(keep);
         }
     }
-    let skip = sp.offset.unwrap_or(0).min(usize::MAX as u64) as usize;
-    let take = sp.limit.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
+    let (l, o) = super::resolve_limit_offset(sp.limit, sp.offset, params)?;
+    let skip = o.min(usize::MAX as u64) as usize;
+    let take = l.map_or(usize::MAX, |l| l.min(usize::MAX as u64) as usize);
     if skip > 0 || take != usize::MAX {
         out = out.into_iter().skip(skip).take(take).collect();
     }

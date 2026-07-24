@@ -439,9 +439,17 @@ pub fn estimate_plan_risk(
         // infinite generator finite); without one it is reported as unbounded, so
         // a probable runaway is flagged at prepare and the #74 work counter is
         // the real runtime guard.
-        PlanStmt::RecursiveCte(rc) => match rc.outer.limit {
-            Some(lim) => {
-                let bound = lim.saturating_add(rc.outer.offset.unwrap_or(0));
+        // Only a LITERAL outer LIMIT bounds it statically — a parameterized
+        // one is unknown at prepare and falls to the unbounded arm (advisory).
+        PlanStmt::RecursiveCte(rc) => match (rc.outer.limit, rc.outer.offset) {
+            // Only fully-LITERAL bounds are static: the cap is offset+limit
+            // (rows produced before slicing), so a parameterized OFFSET is as
+            // unknowable as a parameterized LIMIT — both fall through.
+            (Some(mpedb_sql::LimitVal::Lit(lim)), None | Some(mpedb_sql::LimitVal::Lit(_))) => {
+                let bound = lim.saturating_add(match rc.outer.offset {
+                    Some(mpedb_sql::LimitVal::Lit(o)) => o,
+                    _ => 0,
+                });
                 Acc::new(bound, format!("recursive CTE \"{}\" bounded by outer LIMIT", rc.name))
             }
             // Stage C of design/DESIGN-MPEE-GENERAL.md: a provably monotone
@@ -449,7 +457,7 @@ pub fn estimate_plan_risk(
             // classic generator (`SELECT x+1 FROM c WHERE x < 20`) stops
             // reporting as a probable runaway. Anything the proof cannot
             // establish keeps today's honest u64::MAX.
-            None => match depth_guard_bound(rc, &plan.subplans, schema, row_count) {
+            _ => match depth_guard_bound(rc, &plan.subplans, schema, row_count) {
                 Some(acc) => acc,
                 None => Acc::new(
                     u64::MAX,

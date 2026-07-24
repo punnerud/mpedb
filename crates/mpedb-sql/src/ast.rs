@@ -2,7 +2,7 @@
 //! Carries no source text except literal values and identifiers, so plans
 //! built from it are automatically whitespace/keyword-case canonical.
 
-use crate::plan::{SetOp, SortDir};
+use crate::plan::{SetOp, SortDir, LimitVal};
 use mpedb_types::Value;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -106,8 +106,8 @@ pub(crate) struct SelectStmt {
     /// requires each item to REDUCE to a column of the output tuple — sorting
     /// by a computed expression is rejected, not silently mis-sorted.
     pub order_by: Vec<(Expr, SortDir)>,
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
+    pub limit: Option<LimitVal>,
+    pub offset: Option<LimitVal>,
     /// Trailing projection items that exist only so DISTINCT / ORDER BY still
     /// see them after a projection-passthrough collapse pushed hidden columns
     /// onto this select (`view::collapse_self_projection_passthrough`). Added
@@ -127,9 +127,11 @@ pub(crate) struct CompoundStmt {
     pub ops: Vec<SetOp>,
     /// Over the compound OUTPUT: an ordinal or a first-arm output name.
     pub order_by: Vec<(Expr, SortDir)>,
-    pub limit: Option<u64>,
-    pub offset: Option<u64>,
+    pub limit: Option<LimitVal>,
+    pub offset: Option<LimitVal>,
 }
+
+
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct InsertStmt {

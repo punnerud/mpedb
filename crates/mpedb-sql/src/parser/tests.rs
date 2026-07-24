@@ -5,7 +5,7 @@
 
 use super::{parse_expr_only, parse_statement, MAX_ORDER_BY_ITEMS, MAX_SELECT_ITEMS, MAX_SET_ITEMS};
 use crate::ast::{BinOp, DeleteStmt, Expr, InsertStmt, SelectStmt, Stmt, UnOp};
-use crate::plan::{SetOp, SortDir};
+use crate::plan::{LimitVal, SetOp, SortDir};
 use mpedb_types::{Error, Value};
 
 fn expr(src: &str) -> Expr {
@@ -149,7 +149,7 @@ fn compound_selects_parse() {
     assert_eq!(c.ops, vec![SetOp::UnionAll, SetOp::Union]);
     // hoisted off the last arm
     assert_eq!(c.order_by.len(), 1);
-    assert_eq!(c.limit, Some(3));
+    assert_eq!(c.limit, Some(LimitVal::Lit(3)));
     assert!(c.arms.iter().all(|a| a.order_by.is_empty() && a.limit.is_none()));
 
     let Stmt::Compound(c) = stmt("SELECT a FROM t EXCEPT SELECT a FROM u") else {
@@ -413,8 +413,8 @@ fn full_select() {
                     (Expr::Col("b".into()), SortDir::dir(true))
                 ]
             );
-            assert_eq!(sel.limit, Some(10));
-            assert_eq!(sel.offset, Some(2));
+            assert_eq!(sel.limit, Some(LimitVal::Lit(10)));
+            assert_eq!(sel.offset, Some(LimitVal::Lit(2)));
         }
         other => panic!("expected select, got {other:?}"),
     }
@@ -463,10 +463,16 @@ fn select_star_and_limits() {
         other => panic!("expected select, got {other:?}"),
     }
     match parse_statement("SELECT * FROM t LIMIT -1 OFFSET -2").unwrap().0 {
-        Stmt::Select(s) => assert_eq!((s.limit, s.offset), (None, Some(0))),
+        Stmt::Select(s) => assert_eq!((s.limit, s.offset), (None, Some(LimitVal::Lit(0)))),
         other => panic!("expected select, got {other:?}"),
     }
-    assert!(parse_statement("SELECT * FROM t LIMIT $1").is_err());
+    match parse_statement("SELECT * FROM t LIMIT $1").unwrap().0 {
+        Stmt::Select(s) => assert_eq!(s.limit, Some(LimitVal::Param(0))),
+        other => panic!("expected select, got {other:?}"),
+    }
+    // A sign prefix on a parameter is refused — the sign folds at execution.
+    assert!(parse_statement("SELECT * FROM t LIMIT -?").is_err());
+    assert!(parse_statement("SELECT * FROM t LIMIT -$1").is_err());
     assert!(parse_statement("SELECT *, a FROM t").is_err());
 }
 

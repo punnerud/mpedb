@@ -44,7 +44,7 @@ pub use trigger::{
 pub use plan::{
     AccessPath, AggCall, Aggregation, CompiledPlan, CompoundArm, CompoundPlan, ConflictProbe, Frame,
     FrameBound, FrameMode, FtsQuery, FtsTerm, GroupKey, InsertSource, Join, JoinKind, OrderOver,
-    parallel_fold_shape, PlanOnConflict, PlanStmt, PolicyStamp, Projection, DerivedPlan, dual_def,
+    parallel_fold_shape, LimitVal, PlanOnConflict, PlanStmt, PolicyStamp, Projection, DerivedPlan, dual_def,
     RecursiveCtePlan, SelectPlan, SetOp, SortDir, SubBody, SubPlan, SubPlanKind, WindowFunc,
     WindowSpec, CTE_TABLE, DUAL_TABLE,
 };
