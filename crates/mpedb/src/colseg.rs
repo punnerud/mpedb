@@ -63,11 +63,37 @@ pub struct Block<'a> {
     enc: u8,
     width: u32,
     zmin: u64,
+    zmax: u64,
     nulls: &'a [u8],
     payload: &'a [u8],
 }
 
 impl Block<'_> {
+    /// Does this block contain no NULLs at all? A "the whole block passes"
+    /// shortcut is only sound when it does: the zone map covers the NON-NULL
+    /// values, and a NULL satisfies no comparison, so a block with NULLs must
+    /// still be tested row by row.
+    pub fn null_free(&self) -> bool {
+        self.n_nonnull == self.n_rows
+    }
+
+    /// Is this an integer-class column (the only kind a zone map decides)?
+    pub fn is_int_column(&self) -> bool {
+        matches!(self.ty, ColumnType::Int64 | ColumnType::Timestamp)
+    }
+
+    /// The block's INTEGER value bounds, or `None` when the block holds no
+    /// non-null value (the bounds would be sentinels) or is not an integer
+    /// column. Floats are deliberately excluded: NaN compares false to
+    /// everything, and the encoder's min/max skip it, so a float zone map
+    /// cannot support an "everything passes" conclusion.
+    pub fn int_bounds(&self) -> Option<(i64, i64)> {
+        if self.n_nonnull == 0 || matches!(self.ty, ColumnType::Float64) {
+            return None;
+        }
+        Some((self.zmin as i64, self.zmax as i64))
+    }
+
     /// Stream every value, in PK order, nulls in place.
     pub fn for_each(&self, f: &mut dyn FnMut(&Value) -> Result<()>) -> Result<()> {
         let lo = self.zmin as i64;
@@ -363,7 +389,7 @@ pub fn decode_block(bytes: &[u8], want_gen: u64, ty: ColumnType) -> Result<Optio
         return Err(Error::Corrupt("column segment: bad bit width".into()));
     }
     let zmin = u64::from_le_bytes(take(&mut p, 8)?.try_into().unwrap());
-    let _zmax = u64::from_le_bytes(take(&mut p, 8)?.try_into().unwrap());
+    let zmax = u64::from_le_bytes(take(&mut p, 8)?.try_into().unwrap());
     let nulls_start = p;
     let nulls_len = n_rows.div_ceil(8);
     let nulls = take(&mut p, nulls_len)?;
@@ -391,9 +417,134 @@ pub fn decode_block(bytes: &[u8], want_gen: u64, ty: ColumnType) -> Result<Optio
         enc,
         width,
         zmin,
+        zmax,
         nulls,
         payload,
     }))
+}
+
+// ------------------------------------------------------- zone-map predicates
+
+/// The comparison a zone map can reason about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cmp {
+    Lt,
+    Le,
+    Gt,
+    Ge,
+    Eq,
+}
+
+/// A predicate a block's zone map can decide WITHOUT decoding: `col OP k`,
+/// over an integer column, where `k` is a folded constant or a query
+/// parameter.
+pub struct ZonePred {
+    pub col: u16,
+    pub op: Cmp,
+    pub k: i64,
+}
+
+/// Recognize the whole filter as one integer comparison against a constant or
+/// parameter — the shape a zone map can decide.
+///
+/// Deliberately narrow, and every restriction is a correctness one rather than
+/// laziness:
+/// - the program must be the ENTIRE filter, so nothing else can disqualify a
+///   row a block-level "all pass" conclusion would then wave through;
+/// - integers (and timestamps) only, because a float zone map is built with
+///   comparisons NaN loses, so "every value passes" would not follow from it;
+/// - the constant must be an integer of the same class, so no cross-type
+///   coercion happens here that the row path would have done differently.
+///
+/// Anything else returns `None` and the ordinary filtered fold runs.
+pub fn zone_predicate(prog: &mpedb_types::ExprProgram, params: &[Value]) -> Option<ZonePred> {
+    use mpedb_types::Instr;
+    let [a, b, c] = prog.instrs.as_slice() else {
+        return None;
+    };
+    let op = match c {
+        Instr::Lt => Cmp::Lt,
+        Instr::Le => Cmp::Le,
+        Instr::Gt => Cmp::Gt,
+        Instr::Ge => Cmp::Ge,
+        Instr::Eq => Cmp::Eq,
+        _ => return None,
+    };
+    let operand = |i: &Instr| -> Option<i64> {
+        match i {
+            Instr::PushConst(x) => match prog.consts.get(*x as usize)? {
+                Value::Int(v) | Value::Timestamp(v) => Some(*v),
+                _ => None,
+            },
+            Instr::PushParam(x) => match params.get(*x as usize)? {
+                Value::Int(v) | Value::Timestamp(v) => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    match (a, b) {
+        (Instr::PushCol(col), rhs) => Some(ZonePred { col: *col, op, k: operand(rhs)? }),
+        // `1000 <= day_id` — the same fact with the operands swapped, so the
+        // comparison must be mirrored, not merely reused.
+        (lhs, Instr::PushCol(col)) => {
+            let k = operand(lhs)?;
+            let op = match op {
+                Cmp::Lt => Cmp::Gt,
+                Cmp::Le => Cmp::Ge,
+                Cmp::Gt => Cmp::Lt,
+                Cmp::Ge => Cmp::Le,
+                Cmp::Eq => Cmp::Eq,
+            };
+            Some(ZonePred { col: *col, op, k })
+        }
+        _ => None,
+    }
+}
+
+/// What a block's zone map says about a predicate, before any value is read.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Verdict {
+    /// No row in the block can satisfy it — skip the block entirely.
+    None,
+    /// Every row satisfies it — take the block without testing.
+    All,
+    /// Some might; the block has to be read.
+    Some,
+}
+
+pub fn zone_verdict(b: &Block<'_>, p: &ZonePred) -> Verdict {
+    if b.n_rows == 0 {
+        return Verdict::None;
+    }
+    let Some((lo, hi)) = b.int_bounds() else {
+        // No integer bounds. Two reasons, and they differ: an INTEGER column
+        // whose every row is NULL satisfies nothing (NULL passes no
+        // comparison), while a non-integer column simply has to be read.
+        return if b.is_int_column() {
+            Verdict::None
+        } else {
+            Verdict::Some
+        };
+    };
+    let (all, none) = match p.op {
+        Cmp::Ge => (lo >= p.k, hi < p.k),
+        Cmp::Gt => (lo > p.k, hi <= p.k),
+        Cmp::Le => (hi <= p.k, lo > p.k),
+        Cmp::Lt => (hi < p.k, lo >= p.k),
+        Cmp::Eq => (lo == p.k && hi == p.k, p.k < lo || p.k > hi),
+    };
+    if none {
+        // Sound with NULLs present too: a NULL satisfies no comparison, so if
+        // no non-null value can pass, no row can.
+        Verdict::None
+    } else if all && b.null_free() {
+        // "All" needs null-freeness: the bounds describe the non-null values
+        // only, and a NULL would not have passed.
+        Verdict::All
+    } else {
+        Verdict::Some
+    }
 }
 
 // ---------------------------------------------------------------- the passes
@@ -562,6 +713,147 @@ pub(crate) fn feed_from_segments(
         let b = decode_block(&bytes, want_gen, ty)?
             .ok_or_else(|| Error::Corrupt("column segment changed mid-scan".into()))?;
         b.for_each(push)?;
+    }
+    Ok(true)
+}
+
+
+/// Load and validate every block of one column, returning the raw records so
+/// the caller can decode them a second time without another round of checks.
+/// `None` = not usable (missing, stale, unknown format, or the blocks do not
+/// cover the table).
+fn load_column(
+    snap: &mpedb_core::engine::ReadTxn<'_>,
+    table: u32,
+    col: u16,
+    ty: ColumnType,
+    want_gen: u64,
+    want_rows: u64,
+) -> Result<Option<Vec<Vec<u8>>>> {
+    if !segmentable(ty) {
+        return Ok(None);
+    }
+    let mut recs = Vec::new();
+    let mut covered = 0u64;
+    for bi in 0u32.. {
+        let key = crate::sys_record_subkey(NS, &record_key(table, col, bi))?;
+        let Some(bytes) = snap.sys_get(&key)? else { break };
+        match decode_block(&bytes, want_gen, ty)? {
+            Some(b) => covered += b.n_rows as u64,
+            None => return Ok(None),
+        }
+        recs.push(bytes);
+        if covered > want_rows {
+            return Ok(None);
+        }
+    }
+    if recs.is_empty() || covered != want_rows {
+        return Ok(None);
+    }
+    Ok(Some(recs))
+}
+
+/// Feed a FILTERED whole-table aggregate from column segments, skipping every
+/// block whose zone map proves the predicate cannot hold there
+/// (DESIGN-COLUMNAR stage 2).
+///
+/// This is the half a row store structurally cannot do: a row scan must visit
+/// every row to learn that none of them match, while a block whose `[min,max]`
+/// excludes the predicate is never read at all — not the predicate column, not
+/// the aggregate column.
+///
+/// Per block, exactly one of three things happens:
+/// - `None` — skip, nothing decoded;
+/// - `All` — stream the aggregate column, no per-row test (sound only when the
+///   predicate block has no NULLs, see [`zone_verdict`]);
+/// - `Some` — stream the predicate column into a pass mask, then stream the
+///   aggregate column and push where the mask says so.
+///
+/// Two streaming passes and an 8 KiB mask per block: no random access, no
+/// materialized values, and the aggregate sees the same values in the same PK
+/// order as the row scan, so the answer stays bit-identical.
+pub(crate) fn feed_filtered_from_segments(
+    snap: &mpedb_core::engine::ReadTxn<'_>,
+    table: u32,
+    agg_col: u16,
+    agg_ty: ColumnType,
+    pred: &ZonePred,
+    pred_ty: ColumnType,
+    push: &mut dyn FnMut(&Value) -> Result<()>,
+) -> Result<bool> {
+    if !segmentable(agg_ty) || !segmentable(pred_ty) {
+        return Ok(false);
+    }
+    let (Ok(want_gen), Ok(want_rows)) = (snap.mod_gen(table), snap.row_count(table)) else {
+        return Ok(false);
+    };
+    let Some(agg_recs) = load_column(snap, table, agg_col, agg_ty, want_gen, want_rows)? else {
+        return Ok(false);
+    };
+    // The same column twice is legal (`sum(day_id) WHERE day_id >= …`) and
+    // needs no second load.
+    let pred_recs = if pred.col == agg_col && pred_ty == agg_ty {
+        None
+    } else {
+        match load_column(snap, table, pred.col, pred_ty, want_gen, want_rows)? {
+            Some(r) => Some(r),
+            None => return Ok(false),
+        }
+    };
+    let pred_recs: &Vec<Vec<u8>> = pred_recs.as_ref().unwrap_or(&agg_recs);
+    if pred_recs.len() != agg_recs.len() {
+        return Ok(false); // the two columns are blocked differently: do not pair them
+    }
+
+    let mut mask: Vec<u64> = Vec::new();
+    for (abytes, pbytes) in agg_recs.iter().zip(pred_recs) {
+        let ablk = decode_block(abytes, want_gen, agg_ty)?
+            .ok_or_else(|| Error::Corrupt("column segment changed mid-scan".into()))?;
+        let pblk = decode_block(pbytes, want_gen, pred_ty)?
+            .ok_or_else(|| Error::Corrupt("column segment changed mid-scan".into()))?;
+        // Blocks are built in one pass at one block size, so a mismatch means
+        // the two columns do not describe the same rows — refuse to pair them.
+        if ablk.n_rows != pblk.n_rows {
+            return Ok(false);
+        }
+        match zone_verdict(&pblk, pred) {
+            Verdict::None => continue,
+            Verdict::All => ablk.for_each(push)?,
+            Verdict::Some => {
+                let n = ablk.n_rows as usize;
+                mask.clear();
+                mask.resize(n.div_ceil(64), 0);
+                let mut i = 0usize;
+                pblk.for_each(&mut |v: &Value| {
+                    let pass = match v {
+                        // A NULL satisfies no comparison — SQL's 3VL, and the
+                        // same answer the row path's `eval_filter` gives.
+                        Value::Null => false,
+                        Value::Int(x) | Value::Timestamp(x) => match pred.op {
+                            Cmp::Lt => *x < pred.k,
+                            Cmp::Le => *x <= pred.k,
+                            Cmp::Gt => *x > pred.k,
+                            Cmp::Ge => *x >= pred.k,
+                            Cmp::Eq => *x == pred.k,
+                        },
+                        _ => false,
+                    };
+                    if pass {
+                        mask[i / 64] |= 1u64 << (i % 64);
+                    }
+                    i += 1;
+                    Ok(())
+                })?;
+                let mut j = 0usize;
+                ablk.for_each(&mut |v: &Value| {
+                    if mask[j / 64] & (1u64 << (j % 64)) != 0 {
+                        push(v)?;
+                    }
+                    j += 1;
+                    Ok(())
+                })?;
+            }
+        }
     }
     Ok(true)
 }

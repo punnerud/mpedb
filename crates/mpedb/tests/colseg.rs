@@ -201,3 +201,70 @@ fn segments_survive_reopen_and_another_handle_reads_them() {
     };
     assert_eq!(after[0], want_sum, "the cross-process write is visible");
 }
+
+const FILTERED: &[&str] = &[
+    // Wholly-excluded, wholly-included and straddling blocks in one sweep.
+    "SELECT sum(amount) FROM fact WHERE id >= 60000",
+    "SELECT sum(amount) FROM fact WHERE id < 3",
+    "SELECT sum(amount) FROM fact WHERE id > 69999",
+    "SELECT count(qty) FROM fact WHERE id >= 1000",
+    "SELECT min(qty), max(qty) FROM fact WHERE id <= 500",
+    "SELECT sum(qty) FROM fact WHERE id = 4242",
+    // The predicate column IS the aggregate column.
+    "SELECT sum(qty) FROM fact WHERE qty >= 0",
+    "SELECT sum(id) FROM fact WHERE id >= 35000",
+    // A predicate on a NULLABLE column: NULLs satisfy nothing, and the
+    // "whole block passes" shortcut must not fire where they exist.
+    "SELECT sum(amount) FROM fact WHERE qty > 400",
+    "SELECT count(amount) FROM fact WHERE qty <= -400",
+    // Matches nothing at all — every block should be skipped.
+    "SELECT sum(qty) FROM fact WHERE id > 999999",
+    // Reversed operand order.
+    "SELECT sum(qty) FROM fact WHERE 1000 <= id",
+];
+
+#[test]
+fn zone_pruned_filtered_aggregates_are_bit_identical_to_the_row_scan() {
+    let (db, _g) = open("filtered");
+    seed(&db, 70_000);
+
+    let before: Vec<Vec<Value>> = FILTERED.iter().map(|q| one(&db, q)).collect();
+    db.compact_columns().unwrap();
+    for (q, want) in FILTERED.iter().zip(&before) {
+        assert_same(&one(&db, q), want, q);
+    }
+
+    // A write invalidates the segments; the filtered answers must still be
+    // right, now from the row scan.
+    db.query("INSERT INTO fact (id, qty, amount) VALUES (500000, 1, 1.0)", &[]).unwrap();
+    db.query("DELETE FROM fact WHERE id = 500000", &[]).unwrap();
+    for (q, want) in FILTERED.iter().zip(&before) {
+        assert_same(&one(&db, q), want, q);
+    }
+}
+
+/// A predicate a zone map cannot reason about must DECLINE to the row fold
+/// rather than answer from segments — checked by answer, on shapes chosen to
+/// break a careless extractor.
+#[test]
+fn predicates_the_zone_map_cannot_decide_still_answer_correctly() {
+    let (db, _g) = open("decline");
+    seed(&db, 5_000);
+    let qs = [
+        // Two conjuncts: the program is not one comparison.
+        "SELECT sum(qty) FROM fact WHERE id >= 100 AND id < 200",
+        // A float predicate column — NaN makes a float zone map unusable.
+        "SELECT sum(qty) FROM fact WHERE amount > 100.0",
+        // Not a comparison at all.
+        "SELECT sum(qty) FROM fact WHERE qty IS NOT NULL",
+        // A text column has no segment.
+        "SELECT sum(qty) FROM fact WHERE label = 'r7'",
+        // Comparison between two columns.
+        "SELECT sum(qty) FROM fact WHERE id > qty",
+    ];
+    let before: Vec<Vec<Value>> = qs.iter().map(|q| one(&db, q)).collect();
+    db.compact_columns().unwrap();
+    for (q, want) in qs.iter().zip(&before) {
+        assert_same(&one(&db, q), want, q);
+    }
+}
