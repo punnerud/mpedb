@@ -214,6 +214,31 @@ impl ReadTxn<'_> {
         catalog_entry(self, self.meta.catalog_root, table_id, 0).map(|(_, _, g)| g)
     }
 
+    /// The table's columnar WATERMARK on this snapshot (DESIGN-COLUMNAR §7):
+    /// `(build_gen, covered_rows, wm_pk)`, or `None` if there is no live
+    /// watermark — the table was never compacted with one, or a covered-row
+    /// mutation or a column-layout DDL invalidated it. When present, the segments
+    /// decode at `build_gen`, cover exactly the first `covered_rows` rows in PK
+    /// order, and everything with a PK strictly greater than `wm_pk` is an append
+    /// the row-tail fold must supply. The presence of the record is itself the
+    /// coherence proof (the write path deletes it the instant a covered row
+    /// changes), so a reader needs no second staleness test beyond decoding the
+    /// blocks at `build_gen`.
+    pub fn columnar_watermark(&self, table_id: u32) -> Result<Option<(u64, u64, Vec<u8>)>> {
+        match self.sys_get(&colwm_subkey(table_id))? {
+            Some(v) => Ok(decode_colwm(&v).map(|(g, w, pk)| (g, w, pk.to_vec()))),
+            None => Ok(None),
+        }
+    }
+
+    /// The largest PK key in the table — the natural columnar watermark — or
+    /// `None` for an empty table. O(log n): a rightmost descent of the PK tree,
+    /// no scan.
+    pub fn max_pk_key(&self, table_id: u32) -> Result<Option<Vec<u8>>> {
+        let root = self.tree_root(table_id, 0)?;
+        btree::max_key(self, root)
+    }
+
     /// Open one `text`/`blob` column of one row for CHUNKED reading — the
     /// eviction valve of DESIGN-BLOBEXTENT §5. `range` clamps to the value
     /// (`None` = the whole value); `Ok(None)` when the row is absent or the

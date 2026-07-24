@@ -2640,6 +2640,28 @@ impl WriteSession<'_> {
         self.txn.sys_delete(&subkey)
     }
 
+    /// Publish a columnar watermark for `table_id`, but only if the table's
+    /// mod_gen still equals `expect_gen` (see
+    /// [`mpedb_core::engine::WriteTxn::set_columnar_watermark_if_gen`]). Used by
+    /// the compaction pass to arm the segment/row-tail split scan atomically with
+    /// its own segment writes.
+    pub(crate) fn set_columnar_watermark_if_gen(
+        &mut self,
+        table_id: u32,
+        expect_gen: u64,
+        covered_rows: u64,
+        wm_pk: &[u8],
+    ) -> Result<bool> {
+        self.txn
+            .set_columnar_watermark_if_gen(table_id, expect_gen, covered_rows, wm_pk)
+    }
+
+    /// Drop a table's columnar watermark through this transaction (segments are
+    /// being dropped or rebuilt).
+    pub(crate) fn clear_columnar_watermark(&mut self, table_id: u32) -> Result<()> {
+        self.txn.clear_columnar_watermark(table_id)
+    }
+
     /// Scan namespaced system records whose key is in `[lo, hi)`, prefix-bounded
     /// (the mirror's dirty-set / park scans). Keys returned with the namespace
     /// prefix stripped.

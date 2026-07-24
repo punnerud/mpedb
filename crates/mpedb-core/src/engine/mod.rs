@@ -325,6 +325,48 @@ fn sys_key(subkey: &[u8]) -> Vec<u8> {
     k
 }
 
+/// Subkey of a table's columnar WATERMARK record (DESIGN-COLUMNAR §7), in the
+/// engine's own reserved sys-keyspace: `NUL 'w' <table BE4>`. The leading NUL
+/// keeps it disjoint from every facade sys-record namespace — `check_sys_ns`
+/// forces those to be non-empty and NUL-free — so the engine and the facade
+/// never collide in the one catalog tree they share.
+///
+/// The record's PRESENCE is the coherence signal for the segment/row-tail split
+/// scan: it is set only by a compaction whose build snapshot was clean (a
+/// mod_gen CAS), left untouched by appends ABOVE the watermark, and deleted the
+/// instant a write mutates a row AT OR BELOW it. Absent ⇒ the tail scan is inert
+/// and reads fall back to the whole-table (mod_gen) path — the fail-safe default.
+pub(super) fn colwm_subkey(table_id: u32) -> [u8; 6] {
+    let mut k = [0u8, b'w', 0, 0, 0, 0];
+    k[2..6].copy_from_slice(&table_id.to_be_bytes());
+    k
+}
+
+/// Value of a watermark record: the build generation and covered-row count the
+/// segments were stamped with, then the encoded PK key of the highest covered
+/// row (variable length — a composite PK is longer). The scan reads the gen to
+/// decode the blocks, the count to verify coverage, and the PK as the exclusive
+/// lower bound of the row-tail fold.
+pub(super) fn encode_colwm(build_gen: u64, covered_rows: u64, wm_pk: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(16 + wm_pk.len());
+    v.extend_from_slice(&build_gen.to_le_bytes());
+    v.extend_from_slice(&covered_rows.to_le_bytes());
+    v.extend_from_slice(wm_pk);
+    v
+}
+
+/// Decode a watermark value into `(build_gen, covered_rows, wm_pk)`. `None` when
+/// the record is too short to be well-formed — treated as no watermark, which is
+/// fail-safe (the read falls back to the row scan; the write invalidates).
+pub(super) fn decode_colwm(v: &[u8]) -> Option<(u64, u64, &[u8])> {
+    if v.len() < 16 {
+        return None;
+    }
+    let g = u64::from_le_bytes(v[0..8].try_into().unwrap());
+    let w = u64::from_le_bytes(v[8..16].try_into().unwrap());
+    Some((g, w, &v[16..]))
+}
+
 /// Best-effort wall-clock micros since the Unix epoch, for CDC dirty entries
 /// (used only by the off-by-default newest-wins conflict policy). A clock before
 /// the epoch yields 0 rather than a negative surprise.
@@ -1414,6 +1456,7 @@ impl Engine {
             finished: false,
             written_tables: 0,
             mutated_tables: std::collections::BTreeSet::new(),
+            colwm_cache: HashMap::new(),
             commit_point: None,
             capture_enabled: true,
             capture_cfg: None,

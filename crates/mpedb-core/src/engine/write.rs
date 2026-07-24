@@ -144,6 +144,15 @@ pub struct WriteTxn<'e> {
     /// would publish a stale segment as fresh. The asymmetry decides the
     /// design: this set only ever grows until the txn ends.
     pub(super) mutated_tables: std::collections::BTreeSet<u32>,
+    /// Per-table cache of the columnar WATERMARK PK, loaded lazily on the first
+    /// mutation of a table (DESIGN-COLUMNAR §7). `None` value = the table has no
+    /// watermark record (the overwhelmingly common case — one point `sys_get`
+    /// per mutated table per txn, then free). `Some(pk)` = a covered mutation
+    /// (key ≤ pk) must delete the record. NOT snapshotted by `savepoint`: the
+    /// boundary is stable within a txn, and the delete is re-issued idempotently
+    /// on every covered mutation, so a rollback that RESTORES a deleted record is
+    /// re-invalidated by the next covered write — never a stale segment read.
+    pub(super) colwm_cache: HashMap<u32, Option<Vec<u8>>>,
     /// Set by the optimistic blind-apply path to record a precise
     /// (table, key_hash) point footprint at commit instead of a table-level
     /// one. `None` for every other path.
@@ -195,6 +204,92 @@ impl<'e> WriteTxn<'e> {
         self.table_roots.insert((table_id, index_no), (root, count));
     }
 
+    // ---------- columnar watermark (DESIGN-COLUMNAR §7) ----------
+
+    /// Record that a row with encoded PK `key` was mutated in `table_id`, so the
+    /// columnar watermark can be invalidated if that row is COVERED by segments.
+    ///
+    /// Called from every row mutator (insert/update/delete, typed and blind) at
+    /// its success point — `set_tree_root` cannot host this because it does not
+    /// have the PK, and the whole discrimination here is PK ≤ watermark. A
+    /// mutation at or below the watermark changes one of the segments' first `W`
+    /// rows, so the segment/row-tail split scan can no longer trust them: the
+    /// watermark record is DELETED (the scan then declines to the row scan). A
+    /// mutation ABOVE the watermark is an append — the segments still describe
+    /// the first `W` rows exactly, and the row-tail fold re-reads everything past
+    /// the watermark fresh — so the record is left intact and the append is free.
+    ///
+    /// Cost for the common case (no watermark): one point `sys_get` on the first
+    /// mutation of the table, cached `None` for the rest of the txn.
+    pub(super) fn note_columnar_mutation(&mut self, table_id: u32, key: &[u8]) -> Result<()> {
+        if !self.colwm_cache.contains_key(&table_id) {
+            let wm = self
+                .sys_get(&colwm_subkey(table_id))?
+                .and_then(|v| decode_colwm(&v).map(|(_, _, pk)| pk.to_vec()));
+            self.colwm_cache.insert(table_id, wm);
+        }
+        // A malformed empty PK (never written by compaction) is treated as
+        // "covers everything" so it is deleted on the first mutation — the
+        // conservative direction is always to invalidate.
+        let covered = match self.colwm_cache.get(&table_id) {
+            Some(Some(wm)) => wm.is_empty() || key <= wm.as_slice(),
+            _ => false,
+        };
+        if covered {
+            // Idempotent (see the `colwm_cache` field doc): a savepoint may have
+            // restored a record this txn already deleted, so we do NOT drop the
+            // cache entry — the next covered mutation re-deletes it.
+            self.sys_delete(&colwm_subkey(table_id))?;
+        }
+        Ok(())
+    }
+
+    /// The table's data-modification generation, read on the writer's own view
+    /// (the committed catalog plus this txn's writes). Sys writes never bump it,
+    /// so during a compaction session it still equals the build snapshot's gen
+    /// unless a USER write committed in between — which is exactly the condition
+    /// [`set_columnar_watermark_if_gen`](Self::set_columnar_watermark_if_gen)
+    /// tests.
+    pub fn columnar_mod_gen(&mut self, table_id: u32) -> Result<u64> {
+        catalog_entry(self, self.catalog_root, table_id, 0).map(|(_, _, g)| g)
+    }
+
+    /// Publish a columnar watermark for `table_id` — but ONLY if the table's
+    /// current mod_gen still equals `expect_gen`, i.e. no user write has landed
+    /// since the compaction snapshot the segments were built from. Returns
+    /// whether it was set. Running under the writer lock makes the check and the
+    /// write atomic, which is what closes the build race: a covered mutation that
+    /// committed while the segments were being built has already bumped mod_gen
+    /// past `expect_gen`, so the CAS fails and no stale watermark is ever born.
+    pub fn set_columnar_watermark_if_gen(
+        &mut self,
+        table_id: u32,
+        expect_gen: u64,
+        covered_rows: u64,
+        wm_pk: &[u8],
+    ) -> Result<bool> {
+        if covered_rows == 0 || wm_pk.is_empty() {
+            return Ok(false);
+        }
+        if self.columnar_mod_gen(table_id)? != expect_gen {
+            return Ok(false);
+        }
+        let v = encode_colwm(expect_gen, covered_rows, wm_pk);
+        self.sys_put(&colwm_subkey(table_id), &v)?;
+        Ok(true)
+    }
+
+    /// Drop a table's columnar watermark. Called by column-layout DDL (ADD/DROP
+    /// COLUMN), which rewrites rows OUTSIDE the mutators above and shifts the
+    /// ordinals the segments are keyed by — so the tail path, which reads blocks
+    /// at their build gen rather than the current one, must be disarmed. The
+    /// segment records themselves stay guarded by the whole-table mod_gen check.
+    /// Idempotent.
+    pub fn clear_columnar_watermark(&mut self, table_id: u32) -> Result<()> {
+        self.sys_delete(&colwm_subkey(table_id))?;
+        Ok(())
+    }
+
     // ---------- optimistic concurrency (DESIGN-PHASE3) ----------
 
     /// First-committer-wins validation for an optimistic write of
@@ -242,6 +337,7 @@ impl<'e> WriteTxn<'e> {
         }
         self.set_tree_root(table_id, 0, out.new_root, count + 1);
         self.capture_dirty(table_id, key, DirtyOp::Upsert)?;
+        self.note_columnar_mutation(table_id, key)?;
         Ok(true)
     }
 
@@ -258,6 +354,7 @@ impl<'e> WriteTxn<'e> {
         let out = btree::insert(self, root, key, &mut btree::Payload::Flat(payload), InsertMode::Upsert)?;
         self.set_tree_root(table_id, 0, out.new_root, count);
         self.capture_dirty(table_id, key, DirtyOp::Upsert)?;
+        self.note_columnar_mutation(table_id, key)?;
         Ok(())
     }
 
@@ -270,6 +367,7 @@ impl<'e> WriteTxn<'e> {
         if out.existed {
             self.set_tree_root(table_id, 0, out.new_root, count - 1);
             self.capture_dirty(table_id, key, DirtyOp::Delete)?;
+            self.note_columnar_mutation(table_id, key)?;
         }
         Ok(out.existed)
     }
@@ -427,6 +525,7 @@ impl<'e> WriteTxn<'e> {
             return Err(Error::PrimaryKeyViolation { table: tname });
         }
         self.set_tree_root(table_id, 0, out.new_root, count + 1);
+        self.note_columnar_mutation(table_id, &key)?;
         Ok(())
     }
 
@@ -697,6 +796,7 @@ impl<'e> WriteTxn<'e> {
         // §1): a no-op unless `table_id` is an FTS table.
         self.fts_maybe_index(table_id, values, true)?;
         self.capture_dirty(table_id, &key, DirtyOp::Upsert)?;
+        self.note_columnar_mutation(table_id, &key)?;
         Ok(())
     }
 
@@ -850,6 +950,7 @@ impl<'e> WriteTxn<'e> {
         // Remove the deleted row's postings (FTS tables only).
         self.fts_maybe_index(table_id, &old, false)?;
         self.capture_dirty(table_id, &key, DirtyOp::Delete)?;
+        self.note_columnar_mutation(table_id, &key)?;
         Ok(true)
     }
 
@@ -981,6 +1082,7 @@ impl<'e> WriteTxn<'e> {
         self.fts_maybe_index(table_id, &old, false)?;
         self.fts_maybe_index(table_id, new_values, true)?;
         self.capture_dirty(table_id, &key, DirtyOp::Upsert)?;
+        self.note_columnar_mutation(table_id, &key)?;
         Ok(true)
     }
 
@@ -1375,6 +1477,11 @@ impl<'e> WriteTxn<'e> {
             self.capture_cfg = Some(cfg);
         }
 
+        // 7. Drop the table's columnar watermark record (the segment BLOCKS are
+        //    a facade-owned sys namespace this layer cannot reach, but they too
+        //    can never be matched again: table ids are never reused).
+        self.clear_columnar_watermark(table_id)?;
+
         self.schema_gen_bump = true;
         Ok(())
     }
@@ -1483,6 +1590,10 @@ impl<'e> WriteTxn<'e> {
             cur_root = out.new_root;
         }
         self.set_tree_root(table_id, 0, cur_root, count);
+        // The row rewrite went through `btree::insert` directly, not the
+        // mutators, so no `note_columnar_mutation` fired — disarm the tail scan
+        // explicitly (DESIGN-COLUMNAR §7).
+        self.clear_columnar_watermark(table_id)?;
         self.publish_schema(&new_schema)
     }
 
@@ -1539,6 +1650,11 @@ impl<'e> WriteTxn<'e> {
             cur_root = out.new_root;
         }
         self.set_tree_root(table_id, 0, cur_root, count);
+        // DROP COLUMN renumbers the surviving ordinals the segments are keyed by,
+        // and the tail scan reads blocks at their BUILD gen (not the current
+        // one), so the whole-table mod_gen guard would not catch it here —
+        // disarm the watermark explicitly (DESIGN-COLUMNAR §7).
+        self.clear_columnar_watermark(table_id)?;
         self.publish_schema(&new_schema)
     }
 
@@ -1978,6 +2094,9 @@ impl<'e> WriteTxn<'e> {
         self.bound_recomputed = false;
         self.written_tables = 0;
         self.mutated_tables.clear();
+        // Rewound to the committed catalog, which the watermark records live in;
+        // drop the cache so it reloads from that restored state.
+        self.colwm_cache.clear();
         self.commit_point = None;
         self.work = WorkMeter::new(self.eng.work_budget());
     }

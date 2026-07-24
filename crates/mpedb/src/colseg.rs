@@ -827,13 +827,23 @@ pub fn zone_verdict(b: &Block<'_>, p: &ZonePred) -> Verdict {
 
 // ---------------------------------------------------------------- the passes
 
+/// One column's freshly built blocks, held between the fold (which reads the
+/// snapshot) and the write session (which cannot borrow it).
+struct BuiltColumn {
+    ci: u16,
+    name: String,
+    blocks: Vec<Vec<u8>>,
+    rows: u64,
+    bytes: u64,
+}
+
 impl crate::Database {
     /// Build column segments for every segmentable column of every table —
     /// the explicit pass of DESIGN-COLUMNAR §5. Nothing here runs on the write
     /// path; a heavy write workload simply leaves segments stale (and so
     /// unused) until the next pass, which is correct.
     ///
-    /// The pass reads ONE snapshot and stamps every record with that
+    /// The pass reads ONE snapshot per table and stamps every record with that
     /// snapshot's `mod_gen`. If a writer commits while the pass runs, the
     /// records are stamped with a generation the table no longer reports and
     /// every one of them reads as stale — wasted work, never a wrong answer.
@@ -845,91 +855,131 @@ impl crate::Database {
             if !matches!(t.kind, mpedb_types::TableKind::Standard) {
                 continue;
             }
-            for (ci, col) in t.columns.iter().enumerate() {
-                if let Some(stat) = self.compact_one_column(t, ci as u16, col)? {
-                    out.push(stat);
-                }
-            }
+            self.compact_table(t, &mut out)?;
         }
         Ok(out)
     }
 
-    /// Build one column's segments in the current committed state, or `None`
-    /// when the column is not segmentable or the context cannot fold it. The
-    /// generation and the values come from ONE read snapshot, so the stamp
-    /// describes the exact state the values were read from.
-    fn compact_one_column(
+    /// Build every segmentable column of ONE table from a single read snapshot,
+    /// then arm the segment/row-tail split scan (DESIGN-COLUMNAR §7) with a
+    /// watermark — the highest PK the snapshot covered — set under a mod_gen CAS.
+    ///
+    /// All columns share the snapshot's generation `g0`, so the whole table's
+    /// segments are internally consistent: a reader either uses all of them (the
+    /// watermark is present and every block decodes at `g0`) or none. The
+    /// watermark is published only if the table is STILL at `g0` when the write
+    /// commits — no user write raced the build — which is what makes appending
+    /// above the watermark safe afterwards. Returns the number of columns built.
+    fn compact_table(
         &self,
         t: &mpedb_types::TableDef,
-        ci: u16,
-        col: &mpedb_types::ColumnDef,
-    ) -> Result<Option<ColSegStat>> {
-        if !segmentable(col.ty) {
-            return Ok(None);
-        }
+        out: &mut Vec<ColSegStat>,
+    ) -> Result<u32> {
         let r = self.engine.begin_read()?;
-        let gen = r.mod_gen(t.id)?;
-        let mut blocks: Vec<Vec<u8>> = Vec::new();
-        let mut buf: Vec<Value> = Vec::with_capacity(BLOCK_ROWS);
-        let mut rows = 0u64;
-        let fold = r.fold_range_column(
-            t.id,
-            None,
-            None,
-            ci,
-            mpedb_core::FoldOpts::SERIAL,
-            &mut |v: &Value| {
-                buf.push(v.clone());
-                rows += 1;
-                if buf.len() == BLOCK_ROWS {
-                    blocks.push(encode_block(gen, col.ty, &buf)?);
-                    buf.clear();
+        let g0 = r.mod_gen(t.id)?;
+        let covered_rows = r.row_count(t.id)?;
+        let wm_pk = r.max_pk_key(t.id)?;
+        // Fold each column from the ONE snapshot, holding only the encoded
+        // blocks (≈12× smaller than the rows) between here and the write below —
+        // the per-block Value buffer is the actual memory peak, one block wide.
+        let mut built: Vec<BuiltColumn> = Vec::new();
+        let mut hard_err: Option<Error> = None;
+        'cols: for (ci, col) in t.columns.iter().enumerate() {
+            if !segmentable(col.ty) {
+                continue;
+            }
+            let mut blocks: Vec<Vec<u8>> = Vec::new();
+            let mut buf: Vec<Value> = Vec::with_capacity(BLOCK_ROWS);
+            let mut rows = 0u64;
+            let fold = r.fold_range_column(
+                t.id,
+                None,
+                None,
+                ci as u16,
+                mpedb_core::FoldOpts::SERIAL,
+                &mut |v: &Value| {
+                    buf.push(v.clone());
+                    rows += 1;
+                    if buf.len() == BLOCK_ROWS {
+                        blocks.push(encode_block(g0, col.ty, &buf)?);
+                        buf.clear();
+                    }
+                    Ok(())
+                },
+            );
+            let fold = fold.and_then(|_| {
+                if !buf.is_empty() {
+                    blocks.push(encode_block(g0, col.ty, &buf)?);
                 }
                 Ok(())
-            },
-        );
-        let fold = fold.and_then(|_| {
-            if !buf.is_empty() {
-                blocks.push(encode_block(gen, col.ty, &buf)?);
+            });
+            match fold {
+                Ok(()) => {}
+                Err(Error::Unsupported(_)) => continue 'cols, // column not foldable
+                Err(e) => {
+                    hard_err = Some(e);
+                    break 'cols;
+                }
             }
-            Ok(())
-        });
+            let bytes = blocks.iter().map(|b| b.len() as u64).sum();
+            built.push(BuiltColumn { ci: ci as u16, name: col.name.clone(), blocks, rows, bytes });
+        }
         r.finish()?;
-        match fold {
-            Ok(()) => {}
-            Err(Error::Unsupported(_)) => return Ok(None),
-            Err(e) => return Err(e),
+        if let Some(e) = hard_err {
+            return Err(e);
         }
-        let bytes: u64 = blocks.iter().map(|b| b.len() as u64).sum();
-        let n_blocks = blocks.len() as u32;
-        // Replace this column's old blocks in the SAME session as the new
-        // writes, so a reader never sees a mix of two builds: delete the whole
-        // column range first, then write the fresh blocks.
+        if built.is_empty() {
+            return Ok(0);
+        }
+
+        // Write every column's blocks, then CAS the watermark — all in ONE
+        // commit, so a reader never sees a mix of two builds. Each column's old
+        // blocks are deleted first (a shortened table would otherwise leave a
+        // trailing stale block).
         let mut sess = self.begin()?;
-        let lo = record_key(t.id, ci, 0);
-        let mut hi = record_key(t.id, ci, u32::MAX);
-        // Exclusive upper bound one past the last block of THIS column.
-        for b in hi.iter_mut().skip(6) {
-            *b = 0xFF;
+        for b in &built {
+            let lo = record_key(t.id, b.ci, 0);
+            let mut hi = record_key(t.id, b.ci, u32::MAX);
+            for x in hi.iter_mut().skip(6) {
+                *x = 0xFF;
+            }
+            for (k, _) in sess.sys_record_scan_range(NS, &lo, &hi)? {
+                sess.sys_record_delete(NS, &k)?;
+            }
+            for (bi, blk) in b.blocks.iter().enumerate() {
+                sess.sys_record_put(NS, &record_key(t.id, b.ci, bi as u32), blk)?;
+            }
         }
-        for (k, _) in sess.sys_record_scan_range(NS, &lo, &hi)? {
-            sess.sys_record_delete(NS, &k)?;
-        }
-        for (bi, b) in blocks.into_iter().enumerate() {
-            sess.sys_record_put(NS, &record_key(t.id, ci, bi as u32), &b)?;
+        // A non-empty table gets a watermark iff nothing raced the build; an
+        // empty one clears any stale watermark by leaving none (the CAS with
+        // covered_rows 0 is a no-op, and the segments cover nothing anyway).
+        match &wm_pk {
+            Some(pk) => {
+                sess.set_columnar_watermark_if_gen(t.id, g0, covered_rows, pk)?;
+            }
+            None => {
+                sess.clear_columnar_watermark(t.id)?;
+            }
         }
         sess.commit()?;
-        Ok(Some(ColSegStat {
-            table: t.name.clone(),
-            column: col.name.clone(),
-            blocks: n_blocks,
-            rows,
-            bytes,
-        }))
+
+        let n = built.len() as u32;
+        for b in built {
+            out.push(ColSegStat {
+                table: t.name.clone(),
+                column: b.name,
+                blocks: b.blocks.len() as u32,
+                rows: b.rows,
+                bytes: b.bytes,
+            });
+        }
+        Ok(n)
     }
 
-    /// Delete every column segment of one table (by id). Returns how many
-    /// records went.
+    /// Delete every column segment of one table (by id) AND its watermark.
+    /// Returns how many segment records went. Clearing the watermark disarms the
+    /// tail scan; without segments it would decline anyway, but leaving a stale
+    /// watermark record is untidy.
     fn drop_table_segments(&self, table_id: u32) -> Result<usize> {
         let prefix = table_id.to_be_bytes();
         let keys: Vec<Vec<u8>> = self
@@ -939,13 +989,12 @@ impl crate::Database {
             .filter(|k| k.starts_with(&prefix))
             .collect();
         let n = keys.len();
-        if n > 0 {
-            let mut s = self.begin()?;
-            for k in keys {
-                s.sys_record_delete(NS, &k)?;
-            }
-            s.commit()?;
+        let mut s = self.begin()?;
+        for k in keys {
+            s.sys_record_delete(NS, &k)?;
         }
+        s.clear_columnar_watermark(table_id)?;
+        s.commit()?;
         Ok(n)
     }
 
@@ -990,12 +1039,8 @@ impl crate::Database {
                 }
                 continue;
             }
-            let mut built = 0u32;
-            for (ci, col) in t.columns.iter().enumerate() {
-                if self.compact_one_column(t, ci as u16, col)?.is_some() {
-                    built += 1;
-                }
-            }
+            let mut stats = Vec::new();
+            let built = self.compact_table(t, &mut stats)?;
             if built > 0 {
                 out.columnarized.push((t.name.clone(), built));
             }
@@ -1003,8 +1048,9 @@ impl crate::Database {
         Ok(out)
     }
 
-    /// Drop every stored column segment. Segments are regenerable, so this is
-    /// always safe — it only costs the next scan its speed.
+    /// Drop every stored column segment and every columnar watermark. Segments
+    /// are regenerable, so this is always safe — it only costs the next scan its
+    /// speed.
     pub fn drop_column_segments(&self) -> Result<usize> {
         let keys: Vec<Vec<u8>> = self
             .sys_record_scan(NS)?
@@ -1012,12 +1058,40 @@ impl crate::Database {
             .map(|(k, _)| k)
             .collect();
         let n = keys.len();
+        self.refresh_schema_if_stale()?;
+        let bundle = self.schema();
         let mut s = self.begin()?;
         for k in keys {
             s.sys_record_delete(NS, &k)?;
         }
+        for t in bundle.schema.tables.iter().filter(|x| !x.dead) {
+            s.clear_columnar_watermark(t.id)?;
+        }
         s.commit()?;
         Ok(n)
+    }
+
+    /// Test/diagnostic observability: the covered-row count of a table's live
+    /// columnar watermark, or `None` if it has none (never compacted, or a
+    /// covered-row write or column DDL invalidated it). Lets a test assert the
+    /// split scan is actually armed rather than only that the answer is right.
+    #[doc(hidden)]
+    pub fn columnar_watermark_covered(&self, table: &str) -> Result<Option<u64>> {
+        self.refresh_schema_if_stale()?;
+        let bundle = self.schema();
+        let Some(t) = bundle
+            .schema
+            .tables
+            .iter()
+            .find(|t| !t.dead && mpedb_types::ident_eq(&t.name, table))
+        else {
+            return Ok(None);
+        };
+        let id = t.id;
+        let r = self.engine.begin_read()?;
+        let wm = r.columnar_watermark(id)?;
+        r.finish()?;
+        Ok(wm.map(|(_, w, _)| w))
     }
 }
 
@@ -1046,6 +1120,9 @@ pub(crate) fn feed_from_segments(
     if !segmentable(ty) {
         return Ok(false);
     }
+    // The shipped whole-table path first: it succeeds exactly when nothing has
+    // written since the segments were built (mod_gen matches), and declines
+    // without pushing anything otherwise — so it is safe to fall through from.
     let want_gen = match snap.mod_gen(table) {
         Ok(g) => g,
         Err(_) => return Ok(false),
@@ -1066,7 +1143,11 @@ pub(crate) fn feed_from_segments(
         let Some(bytes) = snap.sys_get(&key)? else { break };
         match decode_block(&bytes, want_gen, ty)? {
             Some(b) => covered += b.n_rows as u64,
-            None => return Ok(false), // stale or unknown: the row scan runs
+            None => {
+                // Stale for the WHOLE-table path — but this may just be appends
+                // above a watermark, which the tail path serves.
+                return feed_from_segments_tail(snap, table, col, ty, push);
+            }
         }
         n_blocks += 1;
         if covered > want_rows {
@@ -1074,7 +1155,9 @@ pub(crate) fn feed_from_segments(
         }
     }
     if n_blocks == 0 || covered != want_rows {
-        return Ok(false); // no segments, or they do not cover the table
+        // No segments at this gen, or they do not cover the whole table: the
+        // segments might still cover a watermark prefix with a row tail.
+        return feed_from_segments_tail(snap, table, col, ty, push);
     }
     for bi in 0..n_blocks {
         let key = crate::sys_record_subkey(NS, &record_key(table, col, bi))?;
@@ -1086,6 +1169,58 @@ pub(crate) fn feed_from_segments(
         b.for_each(push)?;
     }
     Ok(true)
+}
+
+/// The split scan (DESIGN-COLUMNAR §7): segments for the first `W` rows (built
+/// at generation `g0`), then a row-tree fold of everything with a PK strictly
+/// above the watermark. Used when the whole-table path declines because rows
+/// were APPENDED since the segments were built — the appends are all above the
+/// watermark (a covered-row write would have deleted it), so this reads exactly
+/// the same values in exactly PK order and stays bit-identical to the row scan.
+///
+/// Declines (Ok(false), nothing pushed) unless a watermark record is present and
+/// the column's blocks decode at `g0` and cover exactly `W` rows.
+fn feed_from_segments_tail(
+    snap: &mpedb_core::engine::ReadTxn<'_>,
+    table: u32,
+    col: u16,
+    ty: ColumnType,
+    push: &mut dyn FnMut(&Value) -> Result<()>,
+) -> Result<bool> {
+    let Some((g0, covered, wm_pk)) = snap.columnar_watermark(table)? else {
+        return Ok(false);
+    };
+    let Some(recs) = load_column(snap, table, col, ty, g0, covered)? else {
+        return Ok(false);
+    };
+    for bytes in &recs {
+        let b = decode_block(bytes, g0, ty)?
+            .ok_or_else(|| Error::Corrupt("column segment changed mid-scan".into()))?;
+        b.for_each(push)?;
+    }
+    fold_tail_column(snap, table, &wm_pk, col, push)?;
+    Ok(true)
+}
+
+/// Fold one column of the row tail — rows with a PK strictly greater than the
+/// watermark — into `push`, in PK order (the fold's natural order), continuing
+/// straight on from the segments. `SERIAL` drains the whole range.
+fn fold_tail_column(
+    snap: &mpedb_core::engine::ReadTxn<'_>,
+    table: u32,
+    wm_pk: &[u8],
+    col: u16,
+    push: &mut dyn FnMut(&Value) -> Result<()>,
+) -> Result<()> {
+    snap.fold_range_column(
+        table,
+        Some((wm_pk, false)),
+        None,
+        col,
+        mpedb_core::FoldOpts::SERIAL,
+        push,
+    )?;
+    Ok(())
 }
 
 
@@ -1115,14 +1250,54 @@ pub(crate) fn feed_group_from_segments(
     if needed.is_empty() || needed.iter().any(|&(_, ty)| !segmentable(ty)) {
         return Ok(false);
     }
-    let (Ok(want_gen), Ok(want_rows)) = (snap.mod_gen(table), snap.row_count(table)) else {
+    // Whole-table path (mod_gen): fed only when nothing has written since the
+    // build. It validates every column before emitting any, so a decline pushes
+    // nothing and it is safe to fall through to the tail path.
+    if let (Ok(want_gen), Ok(want_rows)) = (snap.mod_gen(table), snap.row_count(table)) {
+        if emit_group_segments(snap, table, width, needed, want_gen, want_rows, push)? {
+            return Ok(true);
+        }
+    }
+    // Split path (DESIGN-COLUMNAR §7): segments for the first `W` rows plus a
+    // synthetic-row fold of the appended tail above the watermark.
+    let Some((g0, covered, wm_pk)) = snap.columnar_watermark(table)? else {
         return Ok(false);
     };
-    // Load and validate every column up front: a decline discovered on column
-    // 2 must not have fed the folder from column 1.
+    if !emit_group_segments(snap, table, width, needed, g0, covered, push)? {
+        return Ok(false);
+    }
+    // The tail's needed columns, folded as full-width synthetic rows in PK order
+    // — the same shape `emit_group_segments` produces, so the folder cannot tell
+    // the two halves apart.
+    let ords: Vec<u16> = needed.iter().map(|&(o, _)| o).collect();
+    snap.fold_range_columns(
+        table,
+        Some((&wm_pk, false)),
+        None,
+        &ords,
+        mpedb_core::FoldOpts::SERIAL,
+        push,
+    )?;
+    Ok(true)
+}
+
+/// Emit the group-by synthetic rows of the segments for `needed` columns, all
+/// decoded at generation `gen` and required to cover exactly `covered` rows.
+/// Returns `false` (having pushed nothing) if any column is missing, stale,
+/// blocked differently, or does not cover — the caller then declines or tries
+/// the tail. Every column is validated up front, before the first emit.
+fn emit_group_segments(
+    snap: &mpedb_core::engine::ReadTxn<'_>,
+    table: u32,
+    width: usize,
+    needed: &[(u16, ColumnType)],
+    gen: u64,
+    covered: u64,
+    push: &mut dyn FnMut(&[Value]) -> Result<()>,
+) -> Result<bool> {
     let mut recs: Vec<Vec<Vec<u8>>> = Vec::with_capacity(needed.len());
     for &(col, ty) in needed {
-        match load_column(snap, table, col, ty, want_gen, want_rows)? {
+        match load_column(snap, table, col, ty, gen, covered)? {
             Some(r) => recs.push(r),
             None => return Ok(false),
         }
@@ -1141,11 +1316,21 @@ pub(crate) fn feed_group_from_segments(
     for bi in 0..n_blocks {
         let mut n_rows: Option<usize> = None;
         for (k, ((_, ty), rec)) in needed.iter().zip(&recs).enumerate() {
-            let blk = decode_block(&rec[bi], want_gen, *ty)?
+            let blk = decode_block(&rec[bi], gen, *ty)?
                 .ok_or_else(|| Error::Corrupt("column segment changed mid-scan".into()))?;
             match n_rows {
                 None => n_rows = Some(blk.n_rows as usize),
-                Some(n) if n != blk.n_rows as usize => return Ok(false),
+                // Same-build columns share BLOCK_ROWS boundaries, so equal block
+                // counts (checked above) force equal per-block rows — a mismatch
+                // is inconsistent segments, i.e. corruption. It must be a hard
+                // error, NOT a mid-emit `Ok(false)`: the group caller does not
+                // rebuild its accumulators on decline, so declining after having
+                // pushed earlier blocks would double-count them.
+                Some(n) if n != blk.n_rows as usize => {
+                    return Err(Error::Corrupt(
+                        "group column segments disagree on block size".into(),
+                    ))
+                }
                 _ => {}
             }
             cols[k].clear();
@@ -1236,10 +1421,77 @@ pub(crate) fn feed_filtered_from_segments(
     if !segmentable(agg_ty) || !segmentable(pred_ty) {
         return Ok(false);
     }
-    let (Ok(want_gen), Ok(want_rows)) = (snap.mod_gen(table), snap.row_count(table)) else {
+    // Whole-table path (mod_gen). Its only in-loop non-emit exit is the
+    // corruption tripwire (now a hard `Corrupt`, not a decline), so a `false`
+    // here always means it emitted nothing — safe to fall through.
+    if let (Ok(want_gen), Ok(want_rows)) = (snap.mod_gen(table), snap.row_count(table)) {
+        if emit_filtered_segments(snap, table, agg_col, agg_ty, pred, pred_ty, want_gen, want_rows, push)?
+        {
+            return Ok(true);
+        }
+    }
+    // Split path (DESIGN-COLUMNAR §7): zone-pruned segments for the first `W`
+    // rows plus a filtered fold of the appended tail above the watermark.
+    let Some((g0, covered, wm_pk)) = snap.columnar_watermark(table)? else {
         return Ok(false);
     };
-    let Some(agg_recs) = load_column(snap, table, agg_col, agg_ty, want_gen, want_rows)? else {
+    if !emit_filtered_segments(snap, table, agg_col, agg_ty, pred, pred_ty, g0, covered, push)? {
+        return Ok(false);
+    }
+    // The tail: the aggregate column pushed only where the predicate holds,
+    // evaluated by the SAME `zone_pred_pass` the block mask uses — bit-identical.
+    let cols = [agg_col, pred.col];
+    snap.fold_range_columns(
+        table,
+        Some((&wm_pk, false)),
+        None,
+        &cols,
+        mpedb_core::FoldOpts::SERIAL,
+        &mut |row: &[Value]| {
+            if zone_pred_pass(&row[pred.col as usize], pred) {
+                push(&row[agg_col as usize])?;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(true)
+}
+
+/// Does `v` satisfy the zone predicate? SQL 3VL (a NULL satisfies no
+/// comparison), identical to the row path's `eval_filter`. Shared by the block
+/// mask and the row-tail fold so the two halves of a split scan agree exactly.
+fn zone_pred_pass(v: &Value, pred: &ZonePred) -> bool {
+    match v {
+        Value::Int(x) | Value::Timestamp(x) => match pred.op {
+            Cmp::Lt => *x < pred.k,
+            Cmp::Le => *x <= pred.k,
+            Cmp::Gt => *x > pred.k,
+            Cmp::Ge => *x >= pred.k,
+            Cmp::Eq => *x == pred.k,
+        },
+        _ => false,
+    }
+}
+
+/// Emit the zone-pruned aggregate values of the filtered segments, all decoded
+/// at generation `gen` and required to cover exactly `covered` rows. Returns
+/// `false` (nothing pushed) if either column is missing/stale/uncovered — the
+/// decline is decided by `load_column` up front, before the emit loop, so it is
+/// safe to fall through from. An inconsistent per-block pairing is `Corrupt`,
+/// never a mid-emit decline.
+#[allow(clippy::too_many_arguments)]
+fn emit_filtered_segments(
+    snap: &mpedb_core::engine::ReadTxn<'_>,
+    table: u32,
+    agg_col: u16,
+    agg_ty: ColumnType,
+    pred: &ZonePred,
+    pred_ty: ColumnType,
+    gen: u64,
+    covered: u64,
+    push: &mut dyn FnMut(&Value) -> Result<()>,
+) -> Result<bool> {
+    let Some(agg_recs) = load_column(snap, table, agg_col, agg_ty, gen, covered)? else {
         return Ok(false);
     };
     // The same column twice is legal (`sum(day_id) WHERE day_id >= …`) and
@@ -1247,7 +1499,7 @@ pub(crate) fn feed_filtered_from_segments(
     let pred_recs = if pred.col == agg_col && pred_ty == agg_ty {
         None
     } else {
-        match load_column(snap, table, pred.col, pred_ty, want_gen, want_rows)? {
+        match load_column(snap, table, pred.col, pred_ty, gen, covered)? {
             Some(r) => Some(r),
             None => return Ok(false),
         }
@@ -1259,14 +1511,16 @@ pub(crate) fn feed_filtered_from_segments(
 
     let mut mask: Vec<u64> = Vec::new();
     for (abytes, pbytes) in agg_recs.iter().zip(pred_recs) {
-        let ablk = decode_block(abytes, want_gen, agg_ty)?
+        let ablk = decode_block(abytes, gen, agg_ty)?
             .ok_or_else(|| Error::Corrupt("column segment changed mid-scan".into()))?;
-        let pblk = decode_block(pbytes, want_gen, pred_ty)?
+        let pblk = decode_block(pbytes, gen, pred_ty)?
             .ok_or_else(|| Error::Corrupt("column segment changed mid-scan".into()))?;
-        // Blocks are built in one pass at one block size, so a mismatch means
-        // the two columns do not describe the same rows — refuse to pair them.
+        // Both columns are blocked at one fixed size and cover the same row
+        // count (checked above), so equal block counts force equal per-block
+        // rows — a mismatch is inconsistent segments, i.e. corruption, NOT a
+        // reason to decline after having already emitted earlier blocks.
         if ablk.n_rows != pblk.n_rows {
-            return Ok(false);
+            return Err(Error::Corrupt("paired column segments disagree on block size".into()));
         }
         match zone_verdict(&pblk, pred) {
             Verdict::None => continue,
@@ -1277,20 +1531,9 @@ pub(crate) fn feed_filtered_from_segments(
                 mask.resize(n.div_ceil(64), 0);
                 let mut i = 0usize;
                 pblk.for_each(&mut |v: &Value| {
-                    let pass = match v {
-                        // A NULL satisfies no comparison — SQL's 3VL, and the
-                        // same answer the row path's `eval_filter` gives.
-                        Value::Null => false,
-                        Value::Int(x) | Value::Timestamp(x) => match pred.op {
-                            Cmp::Lt => *x < pred.k,
-                            Cmp::Le => *x <= pred.k,
-                            Cmp::Gt => *x > pred.k,
-                            Cmp::Ge => *x >= pred.k,
-                            Cmp::Eq => *x == pred.k,
-                        },
-                        _ => false,
-                    };
-                    if pass {
+                    // A NULL satisfies no comparison — SQL's 3VL, and the same
+                    // answer the row path's `eval_filter` gives.
+                    if zone_pred_pass(v, pred) {
                         mask[i / 64] |= 1u64 << (i % 64);
                     }
                     i += 1;
