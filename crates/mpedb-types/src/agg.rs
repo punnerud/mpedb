@@ -113,6 +113,24 @@ impl Accum {
         Accum::new_collated(func, crate::Collation::Binary)
     }
 
+    /// A FINISHED `Sum` over a `Float64` column, seeded from a total the caller
+    /// already accumulated in scan order — the vectorized segment `sum` path
+    /// (DESIGN-COLUMNAR §7.2). It stores the running value exactly as `push`
+    /// would have left it: `Some(Value::Float(total))` for `n > 0`, or `None`
+    /// (→ `finish` gives NULL) when every input was NULL. Bit-identical to the
+    /// per-value fold because the caller added the same floats in the same order
+    /// into a single running total; this only skips the `Value` boxing per row.
+    pub fn from_float_sum(total: f64, n: u64) -> Accum {
+        Accum {
+            func: AggFn::Sum,
+            n,
+            acc: (n > 0).then_some(Value::Float(total)),
+            fsum: total,
+            seen: None,
+            coll: crate::Collation::Binary,
+        }
+    }
+
     /// An accumulator whose argument carries a collating sequence — see the
     /// `coll` field. `new` is the `Binary` shorthand.
     pub fn new_collated(func: AggFn, coll: crate::Collation) -> Accum {

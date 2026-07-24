@@ -218,6 +218,31 @@ impl Block<'_> {
         Ok(())
     }
 
+    /// Add every value of a null-free `Float64` `Raw64` block to `acc`, IN THE
+    /// SAME ORDER `for_each` would, and return the count — the vectorized `sum`
+    /// path (DESIGN-COLUMNAR §7.2). It stays bit-identical to the row scan
+    /// because it accumulates into the caller's single running total per value
+    /// in sequence (float addition is not associative, so order is the
+    /// contract), and it is fast because it never materializes a `Value` or
+    /// crosses a `dyn` closure — an f64 read and add in a tight loop LLVM keeps
+    /// scalar (it may not reorder float adds) but strips of all the per-row tax.
+    ///
+    /// `None` = not specializable (has NULLs, or an encoding other than raw
+    /// f64) → the caller uses the generic per-value fold. Timestamps/integers
+    /// are out: their `sum` needs the i128 overflow-exact monoid, not an f64.
+    pub fn add_f64_into(&self, acc: &mut f64) -> Option<u64> {
+        if self.ty != ColumnType::Float64 || !self.null_free() {
+            return None;
+        }
+        let Codec::Raw64(p) = &self.codec else { return None };
+        let n = self.n_nonnull as usize;
+        let bytes = p.get(..n * 8)?;
+        for chunk in bytes.chunks_exact(8) {
+            *acc += f64::from_le_bytes(chunk.try_into().unwrap());
+        }
+        Some(n as u64)
+    }
+
     /// Materialize — tests and the reference path only.
     #[cfg(test)]
     pub fn values(&self) -> Result<Vec<Value>> {
@@ -1369,6 +1394,53 @@ fn fold_tail_column(
         push,
     )?;
     Ok(())
+}
+
+/// The VECTORIZED whole-table `sum(FLOAT column)` (DESIGN-COLUMNAR §7.2):
+/// `(total, non_null_count)` summed straight out of the packed segments, in PK
+/// order, with no `Value` boxed and no `dyn` closure crossed per row — the tight
+/// f64 loop of [`Block::add_f64_into`]. `Ok(None)` = not applicable (the whole-
+/// table `mod_gen` path declined — appends, stale, or a block that is not a
+/// null-free raw-f64 encoding), and the caller runs the ordinary per-value fold.
+///
+/// Bit-identical to that fold: it accumulates the SAME floats in the SAME order
+/// into one running total, only skipping the per-row tax. Restricted to the
+/// whole-table path on purpose — the row tail and predicate paths keep the
+/// general fold, so this stays a pure speed swap on the one hot shape.
+pub(crate) fn sum_f64_whole_table(
+    snap: &mpedb_core::engine::ReadTxn<'_>,
+    table: u32,
+    col: u16,
+) -> Result<Option<(f64, u64)>> {
+    let (Ok(want_gen), Ok(want_rows)) = (snap.mod_gen(table), snap.row_count(table)) else {
+        return Ok(None);
+    };
+    // One pass: the running total is LOCAL, so a mid-loop decline discards it
+    // with no side effect (unlike the feeding paths, which need two passes).
+    let mut total = 0.0f64;
+    let mut count = 0u64;
+    let mut covered = 0u64;
+    let mut n_blocks = 0u32;
+    for bi in 0u32.. {
+        let key = crate::sys_record_subkey(NS, &record_key(table, col, bi))?;
+        let Some(bytes) = snap.sys_get(&key)? else { break };
+        let Some(b) = decode_block(&bytes, want_gen, ColumnType::Float64)? else {
+            return Ok(None); // stale, or not a Float64 block
+        };
+        let Some(c) = b.add_f64_into(&mut total) else {
+            return Ok(None); // has NULLs, or an encoding the tight loop can't take
+        };
+        count += c;
+        covered += b.n_rows as u64;
+        n_blocks += 1;
+        if covered > want_rows {
+            return Ok(None);
+        }
+    }
+    if n_blocks == 0 || covered != want_rows {
+        return Ok(None);
+    }
+    Ok(Some((total, count)))
 }
 
 
