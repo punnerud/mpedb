@@ -35,6 +35,30 @@ impl JoinCells {
         self.budget == 0 || self.live.saturating_add(n) <= self.budget
     }
 
+    /// The largest build side the hash-strategy switch may hold, PRICED against
+    /// this join's cell budget instead of a universal constant. The line stays
+    /// a fixed cell count per deployment — a function of CONFIG, never of the
+    /// query's input — which is what the #125 memory contract actually requires
+    /// (`prune_width_mem`: held bytes must not scale with input); the old
+    /// universal 65,536 was that contract plus an accident of arithmetic
+    /// (`DEFAULT_MAX_JOIN_CELLS = 2^28`, and 2^28/4096 = 65,536 exactly).
+    ///
+    /// `budget/1024` at the default budget is 262,144 cells (~10 MiB at the
+    /// measured ~40 B/cell) — enough that a 20k-row dimension table hashes,
+    /// which the old constant refused (the measured star-join gap to
+    /// PostgreSQL). The floor keeps every configuration at least as capable as
+    /// before, and an UNLIMITED budget (0) deliberately keeps the old
+    /// constant: opting out of the cell budget must not silently license
+    /// unbounded builds.
+    pub(super) fn hash_build_cap(&self) -> u64 {
+        const FLOOR: u64 = 65_536;
+        if self.budget == 0 {
+            FLOOR
+        } else {
+            FLOOR.max(self.budget / 1024)
+        }
+    }
+
     /// Charge `n` newly held cells; [`Error::RuntimeBudget`] once the live
     /// total crosses the budget. `which` is evaluated only on the error path.
     #[inline]
@@ -1547,15 +1571,14 @@ fn hash_switch_wins(
     cells: &JoinCells,
 ) -> Result<bool> {
     const HASH_SWITCH_MIN_OUTER: usize = 256;
-    /// A hash join hashes the SMALL side, and "small" here is ABSOLUTE, not
-    /// relative to the outer: the switch holds the build side resident, while
-    /// the #125 memory contract (`prune_width_mem`) is that the pipeline's
-    /// held bytes do NOT scale with the input. A build side that grows with
-    /// the query's input breaks that contract however favourable its ratio to
-    /// the outer looks, so the line is a fixed cell count — a dimension table
-    /// passes it, a self-join on a growing table does not.
-    const HASH_SWITCH_MAX_CELLS: u64 = 65_536;
-    if outer_rows < HASH_SWITCH_MIN_OUTER || join.kind != JoinKind::Inner {
+    // One-binary A/B (the `MPEDB_NO_MPEE` doctrine): `=1` and nothing else,
+    // so a script spelling "off" as `=0` cannot select the arm it meant to
+    // exclude. Lets a paired bench run measure the switch's worth without a
+    // second build.
+    static OFF: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("MPEDB_NO_HASH_SWITCH").is_ok_and(|v| v == "1")
+    });
+    if *OFF || outer_rows < HASH_SWITCH_MIN_OUTER || join.kind != JoinKind::Inner {
         return Ok(false);
     }
     if join_hash_key(schema, join, on, acc_width).is_none() {
@@ -1568,8 +1591,12 @@ fn hash_switch_wins(
     if inner_rows > 2 * outer_rows as u64 {
         return Ok(false); // the build would cost more than the probes it saves
     }
+    // A hash join hashes the SMALL side, and "small" is a fixed cell count per
+    // DEPLOYMENT (`hash_build_cap`, priced off `max_join_cells`), never a
+    // function of the query's input — the #125 memory contract. `fits` then
+    // guards the live accumulator on top.
     let build_cells = inner_rows.saturating_mul(t.columns.len() as u64);
-    Ok(build_cells <= HASH_SWITCH_MAX_CELLS && cells.fits(build_cells))
+    Ok(build_cells <= cells.hash_build_cap() && cells.fits(build_cells))
 }
 
 /// A built hash probe: the OUTER column to key by, and key → held indices.
