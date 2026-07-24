@@ -1252,7 +1252,7 @@ mod tests {
             seen.borrow_mut().insert(tid);
             10
         };
-        let cs = crate::CostSource { row_count: &f, index_ndv_bucket: &|_, _| None };
+        let cs = crate::CostSource { row_count: &f, index_ndv_bucket: &|_, _| None, columnar: &|_| false };
         crate::prepare_with_row_counts(sql, schema, &cs).expect("compiles");
         let hit = seen.borrow().len();
         assert!(hit <= n, "cannot probe more tables than the scope has");
@@ -1351,7 +1351,7 @@ mod tests {
         let rows = |tid: u32| -> u64 { if tid == 0 { 2_000_000 } else { 5_000 } };
 
         // Unanalyzed: byte-identical to pre-stage-A behavior — fact drives.
-        let blind = crate::CostSource { row_count: &rows, index_ndv_bucket: &|_, _| None };
+        let blind = crate::CostSource { row_count: &rows, index_ndv_bucket: &|_, _| None, columnar: &|_| false };
         let plan = crate::prepare_with_row_counts(sql, &schema, &blind).unwrap();
         assert!(
             plan.explain(&schema).contains("join order: fact"),
@@ -1367,7 +1367,7 @@ mod tests {
                 _ => None,
             }
         };
-        let seen = crate::CostSource { row_count: &rows, index_ndv_bucket: &ndv };
+        let seen = crate::CostSource { row_count: &rows, index_ndv_bucket: &ndv, columnar: &|_| false };
         let plan = crate::prepare_with_row_counts(sql, &schema, &seen).unwrap();
         let explain = plan.explain(&schema);
         assert!(

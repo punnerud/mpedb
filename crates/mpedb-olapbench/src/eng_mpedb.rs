@@ -21,6 +21,30 @@ pub struct Mpedb {
     pub path: PathBuf,
 }
 
+/// The bench workload as a model: the fact is scanned (→ column segments), the
+/// dimensions are pointed at by key (→ row tree). This is the "automatic via
+/// MPEE" decision (stage 4) made explicit for the harness.
+const STAR_MODEL: &str = r#"
+[model]
+name = "star-olap"
+archetype = "star-olap"
+[[model.table]]
+name = "fact"
+role = "fact"
+[[model.table]]
+name = "customer"
+role = "dimension"
+[[model.table]]
+name = "product"
+role = "dimension"
+[[model.table]]
+name = "store"
+role = "dimension"
+[[model.table]]
+name = "day"
+role = "dimension"
+"#;
+
 /// The whole star, as the seed schema. Every generated column is populated on
 /// every row, and the schema SAYS so: NOT NULL is what admits `count(*)` onto
 /// an index tree at all (an index omits NULL-bearing rows, so its entry count
@@ -72,7 +96,6 @@ primary_key = ["id"]
   type = "float64"
   nullable = false
   indexed = true
-
 [[table]]
 name = "customer"
 primary_key = ["id"]
@@ -236,6 +259,25 @@ impl Mpedb {
             "  analyze: {} indexes in {:.2} s",
             stats.len(),
             t1.elapsed().as_secs_f64()
+        );
+
+        // Column segments: the adaptive-storage program (DESIGN-COLUMNAR). The
+        // MODEL says the fact is scanned and the dimensions are pointed at, so
+        // `sync_columnar` builds column segments for `fact` and leaves the
+        // dimensions on the row tree. This is what lets a scan-aggregate read
+        // one frame-of-reference-coded column instead of whole rows — the
+        // measurement this harness exists to make against a real column store.
+        // Timed separately, exactly like analyze: a real deployment builds
+        // segments after a bulk load (or `mpedb model maintain` does it
+        // adaptively), and folding the cost into the load number would be
+        // dishonest in the other direction.
+        let t2 = Instant::now();
+        db.set_model(STAR_MODEL)?;
+        let sync = db.sync_columnar()?;
+        eprintln!(
+            "  sync-columnar: {} tables in {:.2} s",
+            sync.columnarized.len(),
+            t2.elapsed().as_secs_f64()
         );
 
         Ok((Mpedb { db, path }, load_s))

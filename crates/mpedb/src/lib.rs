@@ -1068,6 +1068,40 @@ impl Database {
     /// DROP / re-CREATE (id reused in place) / ALTER since it was compiled makes
     /// it stale, and cache HITS never recompile. One `newest_meta` read in the
     /// common (unchanged) case; the cache is cleared only on a real gen change.
+    /// The set of table ids the workload MODEL marks columnar (scan-heavy) — the
+    /// stable cost signal `CostSource::columnar` reports (stage C / DESIGN-COLUMNAR
+    /// §7.1). A `fact` is columnar, a `dimension` is not, an unroled table follows
+    /// a `star-olap` archetype (the same rule as `sync_columnar`). Empty without a
+    /// model. This governs plan CHOICE, so it must be stable per prepare — the
+    /// model is read once from the compile's snapshot, and `set_model` bumps
+    /// `schema_gen` so a changed model re-prepares plans.
+    fn columnar_cost_tables(
+        &self,
+        model: Option<&mpedb_types::model::WorkloadModel>,
+    ) -> std::collections::HashSet<u32> {
+        let mut set = std::collections::HashSet::new();
+        let Some(model) = model else { return set };
+        let scan_archetype =
+            matches!(model.archetype, Some(mpedb_types::model::Archetype::StarOlap));
+        let bundle = self.schema();
+        for t in bundle.schema.tables.iter().filter(|t| !t.dead) {
+            let role = model
+                .tables
+                .iter()
+                .find(|m| mpedb_types::ident_eq(&m.name, &t.name))
+                .and_then(|m| m.role);
+            let eligible = match role {
+                Some(mpedb_types::model::TableRole::Fact) => true,
+                Some(mpedb_types::model::TableRole::Dimension) => false,
+                _ => scan_archetype,
+            };
+            if eligible {
+                set.insert(t.id);
+            }
+        }
+        set
+    }
+
     fn gate_cache_on_schema(&self) -> Result<()> {
         self.engine.refresh_schema_if_stale()?;
         let gen = self.engine.schema().schema_gen;
@@ -1109,14 +1143,17 @@ impl Database {
             // process runs the same spell on the same inputs.
             costlayer::apply_policy(p, "probe", "", 0, 1, 1, "")?;
         }
-        let archetype: String = self
-            .model()?
+        let model = self.model()?;
+        let archetype: String = model
+            .as_ref()
             .and_then(|m| m.archetype)
             .map(|a| a.name().to_string())
             .unwrap_or_default();
+        let columnar_tables = self.columnar_cost_tables(model.as_ref());
         let schema_for_cost = bundle.clone();
         let cost = mpedb_sql::CostSource {
             row_count: &|tid| r.row_count(tid).unwrap_or(0),
+            columnar: &|tid| columnar_tables.contains(&tid),
             // Stage A's per-index NDV bucket, now behind the M5 layer: the
             // `ndv_discount` tunable can switch the channel off, and the
             // policy spell — if one is stored — adjusts every bucket it sees.
@@ -1247,13 +1284,16 @@ impl Database {
         if let Some(p) = &policy {
             costlayer::apply_policy(p, "probe", "", 0, 1, 1, "")?;
         }
-        let archetype: String = self
-            .model()?
+        let model = self.model()?;
+        let archetype: String = model
+            .as_ref()
             .and_then(|m| m.archetype)
             .map(|a| a.name().to_string())
             .unwrap_or_default();
+        let columnar_tables = self.columnar_cost_tables(model.as_ref());
         let cost = mpedb_sql::CostSource {
             row_count: &|tid| r.row_count(tid).unwrap_or(0),
+            columnar: &|tid| columnar_tables.contains(&tid),
             index_ndv_bucket: &|tid, ixno| {
                 if !tune.ndv_discount {
                     return None;
