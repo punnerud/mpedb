@@ -1087,9 +1087,15 @@ fn try_fused_fold(
     // block-skipping path (stage 2), and a bounded range needs the block/PK
     // mapping the watermark work introduces (stage 5). Anything else declines
     // and the row fold runs, exactly as before.
-    if filter.is_none() && matches!(access, AccessPath::FullScan) {
+    if matches!(access, AccessPath::FullScan) {
         if let Some(snap) = ctx.snapshot_txn() {
             let ty = t.columns[col as usize].ty;
+            // With a predicate, the zone maps decide each block before it is
+            // read (stage 2): a block whose [min,max] excludes the predicate is
+            // skipped entirely — neither column decoded — which is the half a
+            // row scan structurally cannot do. Only a filter the zone map can
+            // reason about qualifies; anything else declines to the row fold.
+            let zpred = filter.and_then(|f| crate::colseg::zone_predicate(f, params));
             let mut probe = accs;
             let fed = {
                 let mut push = |v: &Value| {
@@ -1098,7 +1104,16 @@ fn try_fused_fold(
                     }
                     Ok(())
                 };
-                crate::colseg::feed_from_segments(snap, table, col, ty, &mut push)?
+                match (filter, zpred) {
+                    (None, _) => crate::colseg::feed_from_segments(snap, table, col, ty, &mut push)?,
+                    (Some(_), Some(p)) if (p.col as usize) < t.columns.len() => {
+                        let pty = t.columns[p.col as usize].ty;
+                        crate::colseg::feed_filtered_from_segments(
+                            snap, table, col, ty, &p, pty, &mut push,
+                        )?
+                    }
+                    _ => false,
+                }
             };
             if fed {
                 return Ok(Some(probe));
