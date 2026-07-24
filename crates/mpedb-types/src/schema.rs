@@ -512,9 +512,25 @@ impl TableDef {
     /// fallback), matching sqlite, and an explicit-PK table returns `None` so its
     /// name resolution is completely unchanged (#94 requirement 7).
     pub fn rowid_name_col(&self, name: &str) -> Option<u16> {
-        let hidden = self.hidden_rowid_col()?;
         let lc = name.to_ascii_lowercase();
-        (lc == "rowid" || lc == "_rowid_" || lc == "oid").then_some(hidden)
+        if !(lc == "rowid" || lc == "_rowid_" || lc == "oid") {
+            return None;
+        }
+        if let Some(hidden) = self.hidden_rowid_col() {
+            return Some(hidden);
+        }
+        // sqlite: a declared INTEGER PRIMARY KEY column IS the rowid, and the
+        // alias spellings resolve to it (diskcache's `DELETE … WHERE rowid IN`
+        // runs against exactly such a table). A single int64 PK is that
+        // table shape here; TEXT/composite PKs are the WITHOUT-ROWID analog,
+        // where sqlite refuses the name too — so absence stays a refusal.
+        if self.primary_key.len() == 1 {
+            let pk = self.primary_key[0];
+            if self.columns[pk as usize].ty == ColumnType::Int64 {
+                return Some(pk);
+            }
+        }
+        None
     }
 
     /// For an FTS table, the `(column_index, fts_colno)` of every content
@@ -2159,6 +2175,41 @@ mod tests {
         assert_eq!(t.rowid_name_col("a"), None);
         // The auto-assign machinery treats it as a rowid alias.
         assert_eq!(t.rowid_alias_col(), Some(2));
+
+        // A declared single int64 PK (no hidden column) is sqlite's INTEGER
+        // PRIMARY KEY shape: the alias spellings resolve to the PK itself.
+        // A TEXT PK is the WITHOUT-ROWID analog — the name stays unknown,
+        // exactly as sqlite refuses it there (oracle-checked).
+        let pkcol = |n: &str, ty| {
+            let mut c = col(n, ty);
+            c.nullable = false;
+            c
+        };
+        let ipk = Schema::new(vec![TableDef {
+            id: 0,
+            name: "n".into(),
+            columns: vec![pkcol("id", ColumnType::Int64), col("x", ColumnType::Text)],
+            primary_key: vec![0],
+            indexes: vec![],
+            dead: false,
+            kind: TableKind::Standard,
+            implicit_rowid: false,
+        }])
+        .unwrap();
+        assert_eq!(ipk.tables[0].rowid_name_col("rowid"), Some(0));
+        assert_eq!(ipk.tables[0].rowid_name_col("_ROWID_"), Some(0));
+        let wr = Schema::new(vec![TableDef {
+            id: 0,
+            name: "w".into(),
+            columns: vec![pkcol("k", ColumnType::Text), col("v", ColumnType::Int64)],
+            primary_key: vec![0],
+            indexes: vec![],
+            dead: false,
+            kind: TableKind::Standard,
+            implicit_rowid: false,
+        }])
+        .unwrap();
+        assert_eq!(wr.tables[0].rowid_name_col("rowid"), None);
 
         let r = Schema::from_canonical_bytes(&s.canonical_bytes()).unwrap();
         assert_eq!(s, r);

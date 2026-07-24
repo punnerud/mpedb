@@ -596,6 +596,14 @@ impl SqliteOverlay {
         params: &[Value],
         base_ok: bool,
     ) -> Result<ExecResult> {
+        // The SAME parameter staging every other execution path runs
+        // (session.rs): validate the USER-facing count, then pad the reserved
+        // subplan-result/context slots the executor fills. Raw user params
+        // straight into exec_stmt made every subquery-lifted statement fail
+        // with "wrong parameter count: expected N+slots" on this path —
+        // diskcache's `WHERE rowid IN (SELECT … LIMIT ?)` found it.
+        let params = crate::session::resolve_params_timed(plan, params, &crate::Session::empty())?;
+        let params: &[Value] = &params;
         let mut partial = false;
         if plan.footprint.read_only {
             let r = self.db.engine.begin_read()?;
