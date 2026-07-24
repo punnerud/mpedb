@@ -41,10 +41,50 @@ const FORMAT: u16 = 1;
 /// header is noise.
 pub const BLOCK_ROWS: usize = 65_536;
 
-/// Encodings. Both are directly addressable by arithmetic — no decode pass, no
-/// intermediate buffer, and (stage 2) no obstacle to skipping a block whole.
-const ENC_FOR_BITPACK: u8 = 1; // integers: value − min, packed to the needed width
-const ENC_RAW64: u8 = 2; // floats (and any block FOR cannot shrink): plain 8-byte values
+/// Encodings, all directly addressable — no entropy coder, no decode pass, no
+/// intermediate buffer (stage 3b adds dictionary and run-of-default; the byte
+/// values still come straight out of the payload). Every one is chosen per
+/// block from that block's own data at compact time.
+const ENC_FOR_BITPACK: u8 = 1; // integers: value − block_min, packed to the needed width
+const ENC_RAW64: u8 = 2; // 8-byte values (floats, and any block the others cannot shrink)
+const ENC_DICT: u8 = 3; // low-cardinality: a per-block dictionary + packed codes
+const ENC_RAW_TEXT: u8 = 4; // high-cardinality text/blob: length-prefixed bytes
+const ENC_RUN_DEFAULT: u8 = 5; // sparse: one default value + an exception list
+
+/// Read the `k`-th `width`-bit value from a packed array (`width == 0` → 0).
+fn packed_at(buf: &[u8], k: usize, width: u32) -> u64 {
+    if width == 0 {
+        return 0;
+    }
+    let mask = u64::MAX >> (64 - width);
+    let bit = k * width as usize;
+    let byte = bit / 8;
+    let off = (bit % 8) as u32;
+    let end = (byte + 9).min(buf.len());
+    let mut acc: u128 = 0;
+    for (j, b) in buf[byte..end].iter().enumerate() {
+        acc |= (*b as u128) << (8 * j);
+    }
+    ((acc >> off) as u64) & mask
+}
+
+/// The decoded, ready-to-stream form of a block's payload. Borrows the block's
+/// bytes (dictionaries and text are slices, not copies); numeric values are
+/// produced by arithmetic, text values by a dictionary/offset lookup.
+enum Codec<'a> {
+    /// 8-byte values.
+    Raw64(&'a [u8]),
+    /// Frame of reference: `block_min + packed_delta`.
+    For { lo: i64, width: u32, packed: &'a [u8] },
+    /// Sparse: `default` everywhere except the listed non-null indices.
+    RunDefault { default: u64, exc: Vec<(u32, u64)> },
+    /// Low-cardinality numeric: `dict[code(k)]`.
+    DictNum { dict: Vec<u64>, width: u32, codes: &'a [u8] },
+    /// Low-cardinality text/blob: `dict[code(k)]` as bytes.
+    DictText { dict: Vec<&'a [u8]>, width: u32, codes: &'a [u8] },
+    /// High-cardinality text/blob: the k-th length-prefixed slice.
+    RawText(Vec<&'a [u8]>),
+}
 
 /// One VALIDATED block, held as a view over its own bytes.
 ///
@@ -60,12 +100,13 @@ pub struct Block<'a> {
     pub n_rows: u32,
     n_nonnull: u32,
     ty: ColumnType,
-    enc: u8,
-    width: u32,
     zmin: u64,
     zmax: u64,
-    nulls: &'a [u8],
-    payload: &'a [u8],
+    /// The null bitmap, or `None` when the block has no NULLs — a NOT-NULL
+    /// fact column then pays nothing for a bitmap of zeros (n_rows/8 bytes, a
+    /// quarter-megabyte per 2M-row column).
+    nulls: Option<&'a [u8]>,
+    codec: Codec<'a>,
 }
 
 impl Block<'_> {
@@ -96,53 +137,82 @@ impl Block<'_> {
 
     /// Stream every value, in PK order, nulls in place.
     pub fn for_each(&self, f: &mut dyn FnMut(&Value) -> Result<()>) -> Result<()> {
-        let lo = self.zmin as i64;
-        let mask = if self.width == 0 {
-            0
-        } else {
-            u64::MAX >> (64 - self.width)
+        let n_rows = self.n_rows as usize;
+        let n_nonnull = self.n_nonnull as usize;
+        // A NULL bitmap that disagrees with `n_nonnull` is corruption; produce
+        // the numeric bit-pattern (or text slice) for the k-th non-null value.
+        let numeric = |bits: u64| match self.ty {
+            ColumnType::Float64 => Value::Float(f64::from_bits(bits)),
+            ColumnType::Timestamp => Value::Timestamp(bits as i64),
+            _ => Value::Int(bits as i64),
         };
-        let mut k = 0usize; // index among the NON-NULL values
-        for i in 0..self.n_rows as usize {
-            if self.nulls[i / 8] & (1 << (i % 8)) != 0 {
+        let text = |b: &[u8]| -> Result<Value> {
+            if self.ty == ColumnType::Text {
+                Ok(Value::Text(
+                    std::str::from_utf8(b)
+                        .map_err(|_| Error::Corrupt("column segment: invalid utf-8".into()))?
+                        .to_owned(),
+                ))
+            } else {
+                Ok(Value::Blob(b.to_vec()))
+            }
+        };
+        // RunDefault walks its exception list with a cursor as `k` advances.
+        let mut exc_i = 0usize;
+        let mut k = 0usize;
+        for i in 0..n_rows {
+            if self.nulls.is_some_and(|b| b[i / 8] & (1 << (i % 8)) != 0) {
                 f(&Value::Null)?;
                 continue;
             }
-            if k >= self.n_nonnull as usize {
+            if k >= n_nonnull {
                 return Err(Error::Corrupt("column segment: null bitmap disagrees".into()));
             }
-            let bits = match self.enc {
-                ENC_RAW64 => {
+            let v = match &self.codec {
+                Codec::Raw64(p) => {
                     let o = k * 8;
-                    u64::from_le_bytes(self.payload[o..o + 8].try_into().unwrap())
+                    numeric(u64::from_le_bytes(
+                        p.get(o..o + 8)
+                            .ok_or_else(|| Error::Corrupt("column segment: short raw64".into()))?
+                            .try_into()
+                            .unwrap(),
+                    ))
                 }
-                _ => {
-                    // Frame of reference: the value is base + a packed delta,
-                    // read in place. No intermediate buffer, no allocation.
-                    if self.width == 0 {
-                        lo as u64
+                Codec::For { lo, width, packed } => {
+                    numeric(lo.wrapping_add(packed_at(packed, k, *width) as i64) as u64)
+                }
+                Codec::RunDefault { default, exc } => {
+                    let bits = if exc_i < exc.len() && exc[exc_i].0 as usize == k {
+                        let v = exc[exc_i].1;
+                        exc_i += 1;
+                        v
                     } else {
-                        let bit = k * self.width as usize;
-                        let byte = bit / 8;
-                        let off = (bit % 8) as u32;
-                        let end = (byte + 9).min(self.payload.len());
-                        let mut acc: u128 = 0;
-                        for (j, b) in self.payload[byte..end].iter().enumerate() {
-                            acc |= (*b as u128) << (8 * j);
-                        }
-                        lo.wrapping_add((((acc >> off) as u64) & mask) as i64) as u64
-                    }
+                        *default
+                    };
+                    numeric(bits)
                 }
+                Codec::DictNum { dict, width, codes } => {
+                    let c = packed_at(codes, k, *width) as usize;
+                    numeric(
+                        *dict
+                            .get(c)
+                            .ok_or_else(|| Error::Corrupt("column segment: dict code".into()))?,
+                    )
+                }
+                Codec::DictText { dict, width, codes } => {
+                    let c = packed_at(codes, k, *width) as usize;
+                    text(dict
+                        .get(c)
+                        .ok_or_else(|| Error::Corrupt("column segment: dict code".into()))?)?
+                }
+                Codec::RawText(offs) => text(offs.get(k).ok_or_else(|| {
+                    Error::Corrupt("column segment: short raw-text".into())
+                })?)?,
             };
             k += 1;
-            let v = match self.ty {
-                ColumnType::Float64 => Value::Float(f64::from_bits(bits)),
-                ColumnType::Timestamp => Value::Timestamp(bits as i64),
-                _ => Value::Int(bits as i64),
-            };
             f(&v)?;
         }
-        if k != self.n_nonnull as usize {
+        if k != n_nonnull {
             return Err(Error::Corrupt("column segment: null bitmap disagrees".into()));
         }
         Ok(())
@@ -190,8 +260,17 @@ pub fn record_key(table_id: u32, col: u16, block: u32) -> [u8; 10] {
 pub fn segmentable(ty: ColumnType) -> bool {
     matches!(
         ty,
-        ColumnType::Int64 | ColumnType::Float64 | ColumnType::Timestamp
+        ColumnType::Int64 | ColumnType::Float64 | ColumnType::Timestamp | ColumnType::Text | ColumnType::Blob
     )
+}
+
+fn is_numeric(ty: ColumnType) -> bool {
+    matches!(ty, ColumnType::Int64 | ColumnType::Float64 | ColumnType::Timestamp)
+}
+
+fn put_lp(out: &mut Vec<u8>, b: &[u8]) {
+    out.extend_from_slice(&(b.len() as u32).to_le_bytes());
+    out.extend_from_slice(b);
 }
 
 fn bits_for(range: u64) -> u32 {
@@ -257,96 +336,205 @@ fn unpack_bits(buf: &[u8], n: usize, width: u32) -> Result<Vec<u64>> {
 pub fn encode_block(mod_gen: u64, ty: ColumnType, vals: &[Value]) -> Result<Vec<u8>> {
     let n = vals.len();
     let mut nulls = vec![0u8; n.div_ceil(8)];
-    let mut raw: Vec<u64> = Vec::with_capacity(n);
+
+    // The NON-NULL stream, in row order. Numeric columns carry bit patterns;
+    // text/blob carry the bytes.
+    let mut raw: Vec<u64> = Vec::new();
+    let mut txt: Vec<&[u8]> = Vec::new();
+    let numeric = is_numeric(ty);
     for (i, v) in vals.iter().enumerate() {
         match v {
             Value::Null => nulls[i / 8] |= 1 << (i % 8),
-            Value::Int(x) | Value::Timestamp(x) => raw.push(*x as u64),
-            Value::Float(f) => raw.push(f.to_bits()),
+            Value::Int(x) | Value::Timestamp(x) if numeric => raw.push(*x as u64),
+            Value::Float(f) if numeric => raw.push(f.to_bits()),
+            Value::Text(sx) if ty == ColumnType::Text => txt.push(sx.as_bytes()),
+            Value::Blob(bx) if ty == ColumnType::Blob => txt.push(bx.as_slice()),
             other => {
                 return Err(Error::Internal(format!(
-                    "column segment: unexpected value {}",
+                    "column segment: unexpected value {} for {ty:?}",
                     other.type_name()
                 )))
             }
         }
     }
+    let n_nonnull = if numeric { raw.len() } else { txt.len() };
 
-    // Zone map over the NON-NULL values. Stored for stage 2's block skipping;
-    // stage 1 does not read it back, which is why it cannot be wrong yet.
-    let (zmin, zmax) = match ty {
-        ColumnType::Float64 => {
-            let mut lo = f64::INFINITY;
-            let mut hi = f64::NEG_INFINITY;
-            for &b in &raw {
-                let f = f64::from_bits(b);
-                if f < lo {
-                    lo = f;
-                }
-                if f > hi {
-                    hi = f;
-                }
-            }
-            (lo.to_bits(), hi.to_bits())
+    // Zone map over the NON-NULL values (integers only; a float zone map is
+    // unusable for pruning, and text has none). Stored for stage 2.
+    let (zmin, zmax) = if numeric && ty != ColumnType::Float64 {
+        let mut lo = i64::MAX;
+        let mut hi = i64::MIN;
+        for &b in &raw {
+            let x = b as i64;
+            if x < lo { lo = x; }
+            if x > hi { hi = x; }
         }
-        _ => {
-            let mut lo = i64::MAX;
-            let mut hi = i64::MIN;
-            for &b in &raw {
-                let x = b as i64;
-                if x < lo {
-                    lo = x;
-                }
-                if x > hi {
-                    hi = x;
-                }
-            }
-            (lo as u64, hi as u64)
+        (lo as u64, hi as u64)
+    } else if ty == ColumnType::Float64 {
+        let mut lo = f64::INFINITY;
+        let mut hi = f64::NEG_INFINITY;
+        for &b in &raw {
+            let f = f64::from_bits(b);
+            if f < lo { lo = f; }
+            if f > hi { hi = f; }
         }
+        (lo.to_bits(), hi.to_bits())
+    } else {
+        (0, 0)
     };
 
-    // Encoding, chosen from THIS block's own data: integers frame-of-reference
-    // against the block minimum, floats raw (a FOR over bit patterns would be
-    // arithmetic nonsense).
-    let (enc, width, payload) = if ty == ColumnType::Float64 || raw.is_empty() {
-        let mut p = Vec::with_capacity(raw.len() * 8);
-        for &b in &raw {
-            p.extend_from_slice(&b.to_le_bytes());
-        }
-        (ENC_RAW64, 0u32, p)
+    // Best-of encoding, chosen from THIS block's own data. Each candidate is
+    // built, and the smallest payload wins — the compression is the layout, so
+    // "smaller" is measured, not guessed.
+    let (enc, width, payload) = if numeric {
+        best_numeric(ty, &raw, zmin)
     } else {
-        let lo = zmin as i64;
-        let hi = zmax as i64;
-        let range = (hi as i128 - lo as i128) as u128;
-        if range > u64::MAX as u128 {
-            let mut p = Vec::with_capacity(raw.len() * 8);
-            for &b in &raw {
-                p.extend_from_slice(&b.to_le_bytes());
-            }
-            (ENC_RAW64, 0u32, p)
-        } else {
-            let w = bits_for(range as u64);
-            let mut p = Vec::with_capacity((raw.len() * w as usize).div_ceil(8));
-            let deltas: Vec<u64> = raw.iter().map(|&b| (b as i64).wrapping_sub(lo) as u64).collect();
-            pack_bits(&mut p, &deltas, w);
-            (ENC_FOR_BITPACK, w, p)
-        }
+        best_text(&txt)
     };
 
     let mut out = Vec::with_capacity(40 + nulls.len() + payload.len());
+
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&FORMAT.to_le_bytes());
     out.extend_from_slice(&mod_gen.to_le_bytes());
     out.extend_from_slice(&(n as u32).to_le_bytes());
-    out.extend_from_slice(&(raw.len() as u32).to_le_bytes());
+    out.extend_from_slice(&(n_nonnull as u32).to_le_bytes());
     out.push(ty as u8);
     out.push(enc);
     out.push(width as u8);
+    out.push((n_nonnull != n) as u8);
     out.extend_from_slice(&zmin.to_le_bytes());
     out.extend_from_slice(&zmax.to_le_bytes());
-    out.extend_from_slice(&nulls);
+    if n_nonnull != n {
+        out.extend_from_slice(&nulls);
+    }
     out.extend_from_slice(&payload);
     Ok(out)
+}
+
+/// Choose the smallest of the numeric encodings for this block's non-null
+/// values (`raw`, bit patterns): frame-of-reference, run-of-default, a
+/// low-cardinality dictionary, or plain 8-byte. All lossless; the winner is
+/// whichever is fewest bytes.
+fn best_numeric(ty: ColumnType, raw: &[u64], zmin: u64) -> (u8, u32, Vec<u8>) {
+    let raw64 = || -> Vec<u8> {
+        let mut p = Vec::with_capacity(raw.len() * 8);
+        for &b in raw {
+            p.extend_from_slice(&b.to_le_bytes());
+        }
+        p
+    };
+    if raw.is_empty() {
+        return (ENC_RAW64, 0, Vec::new());
+    }
+    let mut best: (u8, u32, Vec<u8>) = (ENC_RAW64, 0, raw64());
+
+    // Frame of reference (non-float, in-range).
+    if ty != ColumnType::Float64 {
+        let lo = zmin as i64;
+        let hi = best_hi(raw);
+        let range = (hi as i128 - lo as i128) as u128;
+        if range <= u64::MAX as u128 {
+            let w = bits_for(range as u64);
+            let mut p = Vec::with_capacity((raw.len() * w as usize).div_ceil(8));
+            let deltas: Vec<u64> = raw.iter().map(|&b| (b as i64).wrapping_sub(lo) as u64).collect();
+            pack_bits(&mut p, &deltas, w);
+            if p.len() < best.2.len() {
+                best = (ENC_FOR_BITPACK, w, p);
+            }
+        }
+    }
+
+    // Frequency-derived candidates: run-of-default (from the mode) and
+    // dictionary (from the distinct set). One pass builds the counts.
+    let mut counts: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
+    for &b in raw {
+        *counts.entry(b).or_default() += 1;
+    }
+    // Run-of-default: the most frequent value as the default, the rest as
+    // (index, value) exceptions. Worth it only when one value dominates.
+    if let Some((&default, &cnt)) = counts.iter().max_by_key(|(_, c)| **c) {
+        let n_exc = raw.len() - cnt as usize;
+        // 8 (default) + 4 (count) + 12 per exception.
+        let size = 12 + n_exc * 12;
+        if size < best.2.len() {
+            let mut p = Vec::with_capacity(size);
+            p.extend_from_slice(&default.to_le_bytes());
+            p.extend_from_slice(&(n_exc as u32).to_le_bytes());
+            for (k, &b) in raw.iter().enumerate() {
+                if b != default {
+                    p.extend_from_slice(&(k as u32).to_le_bytes());
+                    p.extend_from_slice(&b.to_le_bytes());
+                }
+            }
+            best = (ENC_RUN_DEFAULT, 0, p);
+        }
+    }
+    // Dictionary: distinct values + packed codes.
+    let distinct = counts.len();
+    if distinct >= 1 {
+        let cw = bits_for((distinct as u64).saturating_sub(1));
+        let size = 4 + distinct * 8 + (raw.len() * cw as usize).div_ceil(8);
+        if size < best.2.len() {
+            let mut dict: Vec<u64> = counts.keys().copied().collect();
+            dict.sort_unstable();
+            let index: std::collections::HashMap<u64, u32> =
+                dict.iter().enumerate().map(|(i, &v)| (v, i as u32)).collect();
+            let mut p = Vec::with_capacity(size);
+            p.extend_from_slice(&(distinct as u32).to_le_bytes());
+            for &d in &dict {
+                p.extend_from_slice(&d.to_le_bytes());
+            }
+            let codes: Vec<u64> = raw.iter().map(|b| index[b] as u64).collect();
+            pack_bits(&mut p, &codes, cw);
+            best = (ENC_DICT, cw, p);
+        }
+    }
+    best
+}
+
+fn best_hi(raw: &[u64]) -> i64 {
+    raw.iter().map(|&b| b as i64).max().unwrap_or(i64::MIN)
+}
+
+/// Choose between a dictionary and raw length-prefixed bytes for a text/blob
+/// block's non-null values.
+fn best_text(txt: &[&[u8]]) -> (u8, u32, Vec<u8>) {
+    let raw_text = || -> Vec<u8> {
+        let mut p = Vec::new();
+        for b in txt {
+            put_lp(&mut p, b);
+        }
+        p
+    };
+    if txt.is_empty() {
+        return (ENC_RAW_TEXT, 0, Vec::new());
+    }
+    let mut best = (ENC_RAW_TEXT, 0u32, raw_text());
+
+    // Dictionary of distinct byte strings.
+    let mut index: std::collections::HashMap<&[u8], u32> = std::collections::HashMap::new();
+    let mut dict: Vec<&[u8]> = Vec::new();
+    for b in txt {
+        if !index.contains_key(b) {
+            index.insert(b, dict.len() as u32);
+            dict.push(b);
+        }
+    }
+    let cw = bits_for((dict.len() as u64).saturating_sub(1));
+    let dict_bytes: usize = 4 + dict.iter().map(|b| 4 + b.len()).sum::<usize>();
+    let size = dict_bytes + (txt.len() * cw as usize).div_ceil(8);
+    if size < best.2.len() {
+        let mut p = Vec::with_capacity(size);
+        p.extend_from_slice(&(dict.len() as u32).to_le_bytes());
+        for b in &dict {
+            put_lp(&mut p, b);
+        }
+        let codes: Vec<u64> = txt.iter().map(|b| index[b] as u64).collect();
+        pack_bits(&mut p, &codes, cw);
+        best = (ENC_DICT, cw, p);
+    }
+    best
 }
 
 /// Decode a block, but only if it was built at `want_gen` — the coherence test
@@ -388,39 +576,120 @@ pub fn decode_block(bytes: &[u8], want_gen: u64, ty: ColumnType) -> Result<Optio
     if width > 64 {
         return Err(Error::Corrupt("column segment: bad bit width".into()));
     }
+    let has_nulls = match take(&mut p, 1)?[0] {
+        0 => false,
+        1 => true,
+        _ => return Err(Error::Corrupt("column segment: bad has_nulls".into())),
+    };
     let zmin = u64::from_le_bytes(take(&mut p, 8)?.try_into().unwrap());
     let zmax = u64::from_le_bytes(take(&mut p, 8)?.try_into().unwrap());
-    let nulls_start = p;
-    let nulls_len = n_rows.div_ceil(8);
-    let nulls = take(&mut p, nulls_len)?;
-    let _ = nulls_start;
-
-    // Validate the payload's LENGTH here, so `Block::for_each` can index it by
-    // arithmetic without a bounds check per value.
-    let need = match enc {
-        ENC_RAW64 => n_nonnull
-            .checked_mul(8)
-            .ok_or_else(|| Error::Corrupt("column segment: payload length overflow".into()))?,
-        ENC_FOR_BITPACK => (n_nonnull * width as usize).div_ceil(8),
-        _ => return Ok(None), // an encoding this build does not know
+    let nulls = if has_nulls {
+        Some(take(&mut p, n_rows.div_ceil(8))?)
+    } else {
+        if n_nonnull != n_rows {
+            return Err(Error::Corrupt("column segment: null-free flag disagrees".into()));
+        }
+        None
     };
-    let payload = take(&mut p, need)?;
+
+    // Everything after the null bitmap is the encoding's payload; parse it into
+    // the streaming codec here, so `for_each` allocates nothing and the length
+    // checks happen once per block, not once per value. A length-prefix reader
+    // over the remaining bytes, bounds-checked, `Corrupt`-never-panic.
+    let lp = |p: &mut usize| -> Result<&[u8]> {
+        let len = u32::from_le_bytes(take_at(bytes, p, 4)?.try_into().unwrap()) as usize;
+        take_at(bytes, p, len)
+    };
+    let text_col = matches!(ty, ColumnType::Text | ColumnType::Blob);
+    let codec = match (enc, text_col) {
+        (ENC_RAW64, false) => {
+            let body = take(&mut p, n_nonnull.checked_mul(8).ok_or_else(|| {
+                Error::Corrupt("column segment: payload length overflow".into())
+            })?)?;
+            Codec::Raw64(body)
+        }
+        (ENC_FOR_BITPACK, false) => {
+            let body = take(&mut p, (n_nonnull * width as usize).div_ceil(8))?;
+            Codec::For { lo: zmin as i64, width, packed: body }
+        }
+        (ENC_RUN_DEFAULT, false) => {
+            let default = u64::from_le_bytes(take(&mut p, 8)?.try_into().unwrap());
+            let n_exc = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
+            if n_exc > n_nonnull {
+                return Err(Error::Corrupt("column segment: too many exceptions".into()));
+            }
+            let mut exc = Vec::with_capacity(n_exc);
+            let mut prev: Option<u32> = None;
+            for _ in 0..n_exc {
+                let idx = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap());
+                let val = u64::from_le_bytes(take(&mut p, 8)?.try_into().unwrap());
+                // Ascending, in range — the streaming cursor relies on it.
+                if idx as usize >= n_nonnull || prev.is_some_and(|q| idx <= q) {
+                    return Err(Error::Corrupt("column segment: bad exception index".into()));
+                }
+                prev = Some(idx);
+                exc.push((idx, val));
+            }
+            Codec::RunDefault { default, exc }
+        }
+        (ENC_DICT, false) => {
+            let dn = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
+            let mut dict = Vec::with_capacity(dn);
+            for _ in 0..dn {
+                dict.push(u64::from_le_bytes(take(&mut p, 8)?.try_into().unwrap()));
+            }
+            let codes = take(&mut p, (n_nonnull * width as usize).div_ceil(8))?;
+            if dn == 0 && n_nonnull > 0 {
+                return Err(Error::Corrupt("column segment: empty dict".into()));
+            }
+            Codec::DictNum { dict, width, codes }
+        }
+        (ENC_DICT, true) => {
+            let dn = u32::from_le_bytes(take(&mut p, 4)?.try_into().unwrap()) as usize;
+            let mut dict = Vec::with_capacity(dn);
+            for _ in 0..dn {
+                dict.push(lp(&mut p)?);
+            }
+            let codes = take(&mut p, (n_nonnull * width as usize).div_ceil(8))?;
+            if dn == 0 && n_nonnull > 0 {
+                return Err(Error::Corrupt("column segment: empty dict".into()));
+            }
+            Codec::DictText { dict, width, codes }
+        }
+        (ENC_RAW_TEXT, true) => {
+            let mut offs = Vec::with_capacity(n_nonnull);
+            for _ in 0..n_nonnull {
+                offs.push(lp(&mut p)?);
+            }
+            Codec::RawText(offs)
+        }
+        // An encoding/type this build does not pair: fall back to the row scan.
+        _ => return Ok(None),
+    };
     if p != bytes.len() {
         return Err(Error::Corrupt("column segment: trailing bytes".into()));
     }
-    // `for_each` reads up to 9 bytes at a time from the packed payload; the
-    // read is clamped to the slice, so a short tail cannot index out of bounds.
     Ok(Some(Block {
         n_rows: n_rows as u32,
         n_nonnull: n_nonnull as u32,
         ty,
-        enc,
-        width,
         zmin,
         zmax,
         nulls,
-        payload,
+        codec,
     }))
+}
+
+/// Bounds-checked read of `n` bytes at `*p`, advancing it — the module's
+/// standard `Corrupt`-never-panic slice reader.
+fn take_at<'a>(bytes: &'a [u8], p: &mut usize, n: usize) -> Result<&'a [u8]> {
+    let end = p
+        .checked_add(n)
+        .filter(|&e| e <= bytes.len())
+        .ok_or_else(|| Error::Corrupt("column segment: truncated".into()))?;
+    let s = &bytes[*p..end];
+    *p = end;
+    Ok(s)
 }
 
 // ------------------------------------------------------- zone-map predicates
@@ -971,6 +1240,76 @@ mod tests {
     }
 
     #[test]
+    fn text_and_sparse_round_trip() {
+        // Low-cardinality text → dictionary; the exact strings, NULLs in place.
+        roundtrip(
+            ColumnType::Text,
+            &(0..1000).map(|i| Value::Text(format!("cat{}", i % 5))).collect::<Vec<_>>(),
+        );
+        // High-cardinality text → raw length-prefixed (dict would not shrink).
+        roundtrip(
+            ColumnType::Text,
+            &(0..500).map(|i| Value::Text(format!("row-{i}-unique"))).collect::<Vec<_>>(),
+        );
+        // Text with NULLs and empty strings interleaved.
+        roundtrip(
+            ColumnType::Text,
+            &[
+                Value::Text("a".into()),
+                Value::Null,
+                Value::Text(String::new()),
+                Value::Text("a".into()),
+                Value::Null,
+            ],
+        );
+        roundtrip(ColumnType::Text, &[]);
+        // Blob.
+        roundtrip(
+            ColumnType::Blob,
+            &[Value::Blob(vec![0, 1, 2]), Value::Null, Value::Blob(vec![])],
+        );
+        // Sparse integer → run-of-default (mostly 0, a few exceptions).
+        let mut sparse = vec![Value::Int(0); 2000];
+        sparse[7] = Value::Int(99);
+        sparse[1500] = Value::Int(-42);
+        sparse[13] = Value::Null;
+        roundtrip(ColumnType::Int64, &sparse);
+        // Low-cardinality integer → dictionary (5 distinct in 2000).
+        roundtrip(
+            ColumnType::Int64,
+            &(0..2000).map(|i| Value::Int([10, 20, 30, 40, 50][i % 5])).collect::<Vec<_>>(),
+        );
+        // Low-cardinality FLOAT → dictionary over bit patterns; NaN and -0.0
+        // must survive as their exact bits, not merely compare equal.
+        roundtrip(
+            ColumnType::Float64,
+            &(0..2000)
+                .map(|i| Value::Float([1.5, -0.0, f64::NAN, 2.5][i % 4]))
+                .collect::<Vec<_>>(),
+        );
+    }
+
+    /// The compact pass must pick the SMALLEST candidate per block — checked by
+    /// asserting each shape lands on the encoding it should and beats raw.
+    #[test]
+    fn best_of_picks_the_smallest_encoding() {
+        let raw_bytes = |vals: &[Value]| {
+            // n_nonnull × 8 is the raw64 body size; the header+nulls are
+            // constant, so a smaller total means a smaller payload.
+            vals.iter().filter(|v| !matches!(v, Value::Null)).count() * 8
+        };
+        // A 5-value low-card int block: dictionary must beat 8 bytes/value.
+        let lc: Vec<Value> = (0..2000).map(|i| Value::Int([1, 2, 3, 4, 5][i % 5])).collect();
+        let enc = encode_block(1, ColumnType::Int64, &lc).unwrap();
+        assert!(enc.len() < raw_bytes(&lc), "low-card int compresses");
+        // A sparse block: run-of-default must be tiny.
+        let mut sp = vec![Value::Int(0); 5000];
+        sp[10] = Value::Int(1);
+        let enc = encode_block(1, ColumnType::Int64, &sp).unwrap();
+        assert!(enc.len() < 100, "sparse null-free int is a handful of bytes, got {}", enc.len());
+    }
+
+    #[test]
     fn blocks_round_trip_across_shapes() {
         // Narrow range → a few bits per value.
         roundtrip(
@@ -1025,6 +1364,7 @@ mod tests {
         let b = encode_block(1, ColumnType::Int64, &[Value::Int(5)]).unwrap();
         // Same bytes read as a different column type: decline, not garbage.
         assert!(decode_block(&b, 1, ColumnType::Float64).unwrap().is_none());
+        assert!(decode_block(&b, 1, ColumnType::Text).unwrap().is_none());
         // A bumped format byte declines too.
         let mut f = b.clone();
         f[4] = 0xFF;

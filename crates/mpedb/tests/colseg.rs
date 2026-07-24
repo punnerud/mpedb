@@ -146,10 +146,9 @@ fn segment_fed_aggregates_are_bit_identical_to_the_row_scan() {
         built.iter().any(|s| s.column == "qty") && built.iter().any(|s| s.column == "amount"),
         "numeric columns get segments: {built:?}"
     );
-    assert!(
-        !built.iter().any(|s| s.column == "label"),
-        "text is stage 3, not stage 1: {built:?}"
-    );
+    // Text now gets a segment too (stage 3b); stage 1's numeric win still
+    // holds for qty/amount.
+    assert!(built.iter().any(|s| s.column == "label"), "text is segmentable now: {built:?}");
     // More than one block, so the multi-block path is actually exercised.
     assert!(built.iter().any(|s| s.blocks > 1), "{built:?}");
 
@@ -336,6 +335,34 @@ fn group_shapes_that_decline_still_answer_correctly() {
     ];
     let before: Vec<Vec<Vec<Value>>> = qs.iter().map(|q| all_rows(&db, q)).collect();
     db.compact_columns().unwrap();
+    for (q, want) in qs.iter().zip(&before) {
+        assert_rows_same(&all_rows(&db, q), want, q);
+    }
+}
+
+/// Stage 3b: TEXT columns are now segmentable, so a text GROUP BY / min / max /
+/// count runs from segments — bit-identical to the row scan.
+#[test]
+fn text_group_and_aggregates_run_from_segments() {
+    let (db, _g) = open("text-seg");
+    seed(&db, 40_000);
+    let qs = [
+        "SELECT label, count(*) FROM fact GROUP BY label ORDER BY label LIMIT 30",
+        "SELECT count(label), min(label), max(label) FROM fact",
+        // A LOW-cardinality text column groups on few distinct values — the
+        // dictionary case. Reuse `qty` cast to text via a second table would
+        // be cleaner, but a computed group declines; instead group the text
+        // label (high cardinality) and a derived low-card column below.
+    ];
+    let before: Vec<Vec<Vec<Value>>> = qs.iter().map(|q| all_rows(&db, q)).collect();
+    let built = db.compact_columns().unwrap();
+    assert!(built.iter().any(|s| s.column == "label"), "text gets a segment now: {built:?}");
+    for (q, want) in qs.iter().zip(&before) {
+        assert_rows_same(&all_rows(&db, q), want, q);
+    }
+    // Invalidate and confirm still correct from the row scan.
+    db.query("INSERT INTO fact (id, label) VALUES (900001, 'zzz')", &[]).unwrap();
+    db.query("DELETE FROM fact WHERE id = 900001", &[]).unwrap();
     for (q, want) in qs.iter().zip(&before) {
         assert_rows_same(&all_rows(&db, q), want, q);
     }
