@@ -334,6 +334,32 @@ off segments) would extend the CostSource seam (DESIGN-MPEE-GENERAL §9.3), but
 it is a refinement, not a prerequisite: today's transparent execution already
 takes the cheaper source per query without it.
 
+### 7.1 The adaptive loop — analyze usage, adapt the model (stages A/B, SHIPPED)
+
+Stage 4 leaves one thing manual: a human still writes the model roles and runs
+`sync-columnar`. The adaptive loop closes it, and it is safe to close for
+columns precisely because the two prerequisites that block index auto-create
+(DESIGN-WORKLOAD-INDEXES §7: P2 a state bit, P3 a drop) are already met here —
+the stage-5 watermark IS the state bit, and segments are regenerable and free to
+drop. The only missing input was workload observation, which the plan registry
+already holds.
+
+- **Stage A — `recommend_columnar` (advisor.rs).** The SAME registry the index
+  advisor reads, asked a different question: does the workload SCAN a table
+  (segments pay) or POINT at it (row tree cheaper)? A scan-aggregate votes
+  column, a key probe votes row, an append counts neither (stage 5 keeps it in
+  the tail). Output is a report and a proposed MODEL (`to_model_toml` → roles an
+  LLM or `mpedb model set` applies) — recommend-only, the same discipline as the
+  index advisor. `mpedb advise --columnar [--emit-model]`.
+- **Stage B — `maintain_columnar` / `columnar_maintenance_plan` (colseg.rs).**
+  The cheap live check (O(model tables), one watermark + row-count read each)
+  says what is stale: a fact with no live watermark wants building, one whose
+  tail grew past a fraction of the covered rows wants rebuilding, a table the
+  model dropped wants its segments gone. `maintain_columnar` applies it, capped
+  at `max_rebuilds` per pass so one call has a bounded cost. No daemon: an
+  explicit `mpedb model maintain [--plan]`, or a query-path hook that consults
+  the plan and records the need without ever paying for a build inline.
+
 ## 8. Staged plan (each stage ships, measurable, fail-safe)
 
 **Stage 0 — the coherence primitive.** The per-table `mod_gen` counter (§6):
