@@ -1653,6 +1653,42 @@ impl Cursor {
         }
     }
 
+    /// [`next`](Cursor::next) yielding ONLY the key — the value is never
+    /// resolved, so an Overflow/Extent cell costs nothing to skip. For callers
+    /// that delete or re-key by prefix and never read the old value (columnar
+    /// segment drop, DESIGN-COLUMNAR §7.3): resolving a 512 KiB block extent
+    /// just to learn its key would materialize the whole segment set.
+    pub fn next_key<S: PageStore + ?Sized>(&mut self, store: &S) -> Result<Option<Vec<u8>>> {
+        loop {
+            if self.done {
+                return Ok(None);
+            }
+            if let Some((leaf_id, pos)) = self.leaf {
+                let p = store.page(leaf_id)?;
+                check_node(p)?;
+                if pos < nkeys(p) {
+                    let (key, _val) = leaf_cell(p, pos)?;
+                    if let Some((hk, inc)) = &self.hi {
+                        let over = match key.cmp(hk.as_slice()) {
+                            Ordering::Less => false,
+                            Ordering::Equal => !*inc,
+                            Ordering::Greater => true,
+                        };
+                        if over {
+                            self.done = true;
+                            return Ok(None);
+                        }
+                    }
+                    let k = key.to_vec();
+                    self.leaf = Some((leaf_id, pos + 1));
+                    return Ok(Some(k));
+                }
+                self.leaf = None;
+            }
+            self.climb(store)?;
+        }
+    }
+
     /// Climb until a branch has an unvisited child, then descend to that
     /// child's leftmost leaf (`self.leaf`); `self.done` when the stack
     /// empties. The between-leaves step both scan forms share.

@@ -234,11 +234,42 @@ impl Block<'_> {
         if self.ty != ColumnType::Float64 || !self.null_free() {
             return None;
         }
-        let Codec::Raw64(p) = &self.codec else { return None };
         let n = self.n_nonnull as usize;
-        let bytes = p.get(..n * 8)?;
-        for chunk in bytes.chunks_exact(8) {
-            *acc += f64::from_le_bytes(chunk.try_into().unwrap());
+        match &self.codec {
+            // Raw f64s: one contiguous scan.
+            Codec::Raw64(p) => {
+                let bytes = p.get(..n * 8)?;
+                for chunk in bytes.chunks_exact(8) {
+                    *acc += f64::from_le_bytes(chunk.try_into().unwrap());
+                }
+            }
+            // Low-cardinality (the common price/measure column): decode the
+            // dictionary to f64 ONCE, then add `dict[code_k]` in k-order — the
+            // same order `for_each` visits, so the sum is bit-identical, minus
+            // the per-row `Value` box and closure. `codes` is width-bit-packed.
+            Codec::DictNum { dict, width, codes } => {
+                let vals: Vec<f64> = dict.iter().map(|&b| f64::from_bits(b)).collect();
+                for k in 0..n {
+                    let c = packed_at(codes, k, *width) as usize;
+                    *acc += *vals.get(c)?;
+                }
+            }
+            // Sparse: one default plus an ascending exception list, added in
+            // k-order so the float rounding matches `for_each` exactly.
+            Codec::RunDefault { default, exc } => {
+                let d = f64::from_bits(*default);
+                let mut ei = 0usize;
+                for k in 0..n {
+                    if ei < exc.len() && exc[ei].0 as usize == k {
+                        *acc += f64::from_bits(exc[ei].1);
+                        ei += 1;
+                    } else {
+                        *acc += d;
+                    }
+                }
+            }
+            // FOR/bitpack is integer-only; text codecs never hold a float.
+            _ => return None,
         }
         Some(n as u64)
     }
@@ -332,6 +363,38 @@ pub fn record_key(table_id: u32, col: u16, block: u32) -> [u8; 10] {
     k[4..6].copy_from_slice(&col.to_be_bytes());
     k[6..10].copy_from_slice(&block.to_be_bytes());
     k
+}
+
+/// Read block `bi`'s bytes via its CONTIGUOUS extent record. The block's sys
+/// record IS an [`ExtentRef`](mpedb_core) catalog cell (DESIGN-COLUMNAR §7.3):
+/// its bytes live in the extent, read straight from the mapping, never as a
+/// 512 KiB overflow chain in the catalog tree. `Ok(None)` when the record is
+/// absent (the column ends there).
+///
+/// It copies the run out and then REVALIDATES the pin, exactly as
+/// [`ReadTxn::blob_read`] does per chunk: `extent_slice` borrows the mapping,
+/// and while this reader stays pinned the freed-extent MVCC rule keeps the run
+/// un-reused — but the moment live-pin eviction (max pin age) lands, a writer
+/// could reuse the pages mid-`memcpy`. A torn image that still passed the
+/// block's MAGIC+format+`mod_gen` would be a WRONG aggregate, not a decline, so
+/// the `still_pinned` recheck turns any such eviction into `SnapshotEvicted`
+/// instead. Today no live pin is ever evicted, so it never fires — it is the
+/// assertion that keeps that invariant honest.
+fn block_bytes(
+    snap: &mpedb_core::engine::ReadTxn<'_>,
+    table: u32,
+    col: u16,
+    bi: u32,
+) -> Result<Option<Vec<u8>>> {
+    let key = crate::sys_record_subkey(NS, &record_key(table, col, bi))?;
+    let Some((start_page, len)) = snap.sys_extent_ref(&key)? else {
+        return Ok(None);
+    };
+    let bytes = snap.extent_slice(start_page, len)?.to_vec();
+    if !snap.still_pinned() {
+        return Err(Error::SnapshotEvicted);
+    }
+    Ok(Some(bytes))
 }
 
 /// Is this a column type stage 1 can segment? Text/Blob need the dictionary
@@ -1013,11 +1076,17 @@ impl crate::Database {
             for x in hi.iter_mut().skip(6) {
                 *x = 0xFF;
             }
-            for (k, _) in sess.sys_record_scan_range(NS, &lo, &hi)? {
+            // Replace: delete every old block record first (a shortened table
+            // would otherwise leave a trailing stale block). Deleting the record
+            // frees its extent through the one btree free-old-val path — the
+            // old run stays readable for a reader still pinned on the pre-replace
+            // snapshot (the row-value extent MVCC discipline, inherited), no
+            // manual free bookkeeping. `_` is the resolved old block (unread).
+            for k in sess.sys_record_scan_range_keys(NS, &lo, &hi)? {
                 sess.sys_record_delete(NS, &k)?;
             }
             for (bi, blk) in b.blocks.iter().enumerate() {
-                sess.sys_record_put(NS, &record_key(t.id, b.ci, bi as u32), blk)?;
+                sess.sys_record_put_extent(NS, &record_key(t.id, b.ci, bi as u32), blk)?;
             }
         }
         // A non-empty table gets a watermark iff nothing raced the build; an
@@ -1052,10 +1121,12 @@ impl crate::Database {
     /// watermark record is untidy.
     fn drop_table_segments(&self, table_id: u32) -> Result<usize> {
         let prefix = table_id.to_be_bytes();
+        // Deleting each block record frees its extent through the btree's one
+        // free-old-val path — no manual run bookkeeping. Scan KEYS only, or a
+        // drop would resolve every 512 KiB block just to learn its key.
         let keys: Vec<Vec<u8>> = self
-            .sys_record_scan(NS)?
+            .sys_record_scan_keys(NS)?
             .into_iter()
-            .map(|(k, _)| k)
             .filter(|k| k.starts_with(&prefix))
             .collect();
         let n = keys.len();
@@ -1225,11 +1296,10 @@ impl crate::Database {
     /// are regenerable, so this is always safe — it only costs the next scan its
     /// speed.
     pub fn drop_column_segments(&self) -> Result<usize> {
-        let keys: Vec<Vec<u8>> = self
-            .sys_record_scan(NS)?
-            .into_iter()
-            .map(|(k, _)| k)
-            .collect();
+        // Only the KEYS: deleting each block record frees its extent through the
+        // btree's one free-old-val path (resolving values would materialize
+        // every block).
+        let keys: Vec<Vec<u8>> = self.sys_record_scan_keys(NS)?;
         let n = keys.len();
         self.refresh_schema_if_stale()?;
         let bundle = self.schema();
@@ -1312,8 +1382,7 @@ pub(crate) fn feed_from_segments(
     let mut n_blocks = 0u32;
     let mut covered: u64 = 0;
     for bi in 0u32.. {
-        let key = crate::sys_record_subkey(NS, &record_key(table, col, bi))?;
-        let Some(bytes) = snap.sys_get(&key)? else { break };
+        let Some(bytes) = block_bytes(snap, table, col, bi)? else { break };
         match decode_block(&bytes, want_gen, ty)? {
             Some(b) => covered += b.n_rows as u64,
             None => {
@@ -1333,9 +1402,7 @@ pub(crate) fn feed_from_segments(
         return feed_from_segments_tail(snap, table, col, ty, push);
     }
     for bi in 0..n_blocks {
-        let key = crate::sys_record_subkey(NS, &record_key(table, col, bi))?;
-        let bytes = snap
-            .sys_get(&key)?
+        let bytes = block_bytes(snap, table, col, bi)?
             .ok_or_else(|| Error::Corrupt("column segment vanished mid-scan".into()))?;
         let b = decode_block(&bytes, want_gen, ty)?
             .ok_or_else(|| Error::Corrupt("column segment changed mid-scan".into()))?;
@@ -1422,8 +1489,7 @@ pub(crate) fn sum_f64_whole_table(
     let mut covered = 0u64;
     let mut n_blocks = 0u32;
     for bi in 0u32.. {
-        let key = crate::sys_record_subkey(NS, &record_key(table, col, bi))?;
-        let Some(bytes) = snap.sys_get(&key)? else { break };
+        let Some(bytes) = block_bytes(snap, table, col, bi)? else { break };
         let Some(b) = decode_block(&bytes, want_gen, ColumnType::Float64)? else {
             return Ok(None); // stale, or not a Float64 block
         };
@@ -1593,8 +1659,7 @@ fn load_column(
     let mut recs = Vec::new();
     let mut covered = 0u64;
     for bi in 0u32.. {
-        let key = crate::sys_record_subkey(NS, &record_key(table, col, bi))?;
-        let Some(bytes) = snap.sys_get(&key)? else { break };
+        let Some(bytes) = block_bytes(snap, table, col, bi)? else { break };
         match decode_block(&bytes, want_gen, ty)? {
             Some(b) => covered += b.n_rows as u64,
             None => return Ok(None),
