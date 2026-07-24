@@ -2472,7 +2472,14 @@ impl Shm {
             )));
         }
         let file = memory_backing_file()?;
-        if unsafe { libc::ftruncate(file.as_raw_fd(), size as i64) } != 0 {
+        // `crate::os::ftruncate_len` routes through the LFS variant on 32-bit
+        // glibc (armv7's plain `ftruncate` takes a 32-bit off_t); the wasm
+        // shim's own `ftruncate` keeps its arm.
+        #[cfg(not(target_arch = "wasm32"))]
+        let rc = crate::os::ftruncate_len(file.as_raw_fd(), size);
+        #[cfg(target_arch = "wasm32")]
+        let rc = unsafe { libc::ftruncate(file.as_raw_fd(), size as i64) };
+        if rc != 0 {
             return Err(io_err("ftruncate (in-memory size)"));
         }
         // Synthetic path for macOS .wlock sidecar only; never used as a real
@@ -2553,9 +2560,7 @@ impl Shm {
                 }
             }
             // non-READY debris: safe to resize and re-format
-            if st_size > size
-                && unsafe { libc::ftruncate(file.as_raw_fd(), size as i64) } != 0
-            {
+            if st_size > size && crate::os::ftruncate_len(file.as_raw_fd(), size) != 0 {
                 return Err(io_err("ftruncate (shrinking debris file)"));
             }
             // real preallocation: ENOSPC surfaces here instead of as SIGBUS

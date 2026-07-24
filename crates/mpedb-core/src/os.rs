@@ -28,6 +28,38 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::os::unix::io::RawFd;
+
+// Large-file support on 32-bit glibc Linux (armv7): the plain libc wrappers
+// take a 32-bit `off_t` there, and the engine addresses files past 2 GiB —
+// the explicit `*64` variants are the LFS interface. Everywhere else the
+// plain names are already 64-bit, so the aliases are the plain names.
+#[cfg(all(target_os = "linux", target_env = "gnu", target_pointer_width = "32"))]
+use libc::{
+    fallocate64 as sys_fallocate, fstat64 as sys_fstat, ftruncate64 as sys_ftruncate,
+    pwrite64 as sys_pwrite, stat64 as sys_stat,
+};
+#[cfg(all(
+    target_os = "linux",
+    not(all(target_env = "gnu", target_pointer_width = "32"))
+))]
+use libc::{
+    fallocate as sys_fallocate, fstat as sys_fstat, ftruncate as sys_ftruncate,
+    pwrite as sys_pwrite, stat as sys_stat,
+};
+
+/// `ftruncate` with a 64-bit length on every platform (LFS on 32-bit glibc).
+/// The shm layer calls this instead of `libc::ftruncate` directly.
+#[cfg(all(unix, not(target_arch = "wasm32")))]
+pub fn ftruncate_len(fd: RawFd, len: u64) -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe { sys_ftruncate(fd, len as i64) }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        unsafe { libc::ftruncate(fd, len as libc::off_t) }
+    }
+}
 #[cfg(target_arch = "wasm32")]
 use crate::wasmcompat::{libc, RawFd};
 use std::sync::atomic::AtomicU32;
@@ -100,7 +132,7 @@ pub fn preallocate(fd: RawFd, offset: i64, len: i64) -> libc::c_int {
     }
     #[cfg(target_os = "linux")]
     {
-        let rc = unsafe { libc::fallocate(fd, 0, offset, len) };
+        let rc = unsafe { sys_fallocate(fd, 0, offset, len) };
         if rc == 0 {
             return 0;
         }
@@ -113,9 +145,9 @@ pub fn preallocate(fd: RawFd, offset: i64, len: i64) -> libc::c_int {
         let e = unsafe { *libc::__errno_location() };
         if e == libc::EOPNOTSUPP || e == libc::ENOSYS {
             let want = offset + len;
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            let cur = if unsafe { libc::fstat(fd, &mut st) } == 0 { st.st_size } else { 0 };
-            return if want > cur { unsafe { libc::ftruncate(fd, want) } } else { 0 };
+            let mut st: sys_stat = unsafe { std::mem::zeroed() };
+            let cur = if unsafe { sys_fstat(fd, &mut st) } == 0 { st.st_size } else { 0 };
+            return if want > cur { unsafe { sys_ftruncate(fd, want) } } else { 0 };
         }
         rc
     }
@@ -150,7 +182,7 @@ pub fn prewrite_zeros(fd: RawFd, len: u64) -> libc::c_int {
     let mut off: u64 = 0;
     while off < len {
         let n = CHUNK.min((len - off) as usize);
-        let w = unsafe { libc::pwrite(fd, zeros.as_ptr() as *const libc::c_void, n, off as i64) };
+        let w = unsafe { sys_pwrite(fd, zeros.as_ptr() as *const libc::c_void, n, off as i64) };
         if w < 0 || w as usize != n {
             return -1;
         }
@@ -171,7 +203,7 @@ pub fn prewrite_zeros(_fd: RawFd, _len: u64) -> libc::c_int {
 pub fn punch_hole(fd: RawFd, offset: i64, len: i64) {
     #[cfg(target_os = "linux")]
     unsafe {
-        libc::fallocate(
+        sys_fallocate(
             fd,
             libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
             offset,

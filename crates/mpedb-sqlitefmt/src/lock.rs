@@ -86,8 +86,12 @@ fn flock(ty: i16, start: i64, len: i64) -> libc::flock {
     // Zeroed base: l_whence = SEEK_SET (0), l_pid filled by the kernel.
     let mut f: libc::flock = unsafe { std::mem::zeroed() };
     f.l_type = ty as libc::c_short;
-    f.l_start = start;
-    f.l_len = len;
+    // `as _`: 32-bit glibc (armv7) has a 32-bit off_t here. Every byte this
+    // module locks is a sqlite LOCK BYTE at a fixed position below 2^31
+    // (PENDING_BYTE = 0x4000_0000, spans <= 512 bytes), never a
+    // file-size-dependent offset — the narrowing cannot truncate.
+    f.l_start = start as _;
+    f.l_len = len as _;
     f
 }
 
