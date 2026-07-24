@@ -230,6 +230,15 @@ impl Block<'_> {
     }
 }
 
+/// What one `sync_columnar` pass decided (DESIGN-COLUMNAR §2).
+#[derive(Debug, Clone, Default)]
+pub struct ColumnarSync {
+    /// `(table, columns built)` — the scan-heavy tables that got segments.
+    pub columnarized: Vec<(String, u32)>,
+    /// Tables the model marks point-oriented, whose segments were dropped.
+    pub dropped: Vec<String>,
+}
+
 /// What one `compact_columns` pass produced, for the CLI/report.
 #[derive(Debug, Clone)]
 pub struct ColSegStat {
@@ -832,70 +841,163 @@ impl crate::Database {
         self.refresh_schema_if_stale()?;
         let bundle = self.schema();
         let mut out = Vec::new();
-
         for t in bundle.schema.tables.iter().filter(|x| !x.dead) {
             if !matches!(t.kind, mpedb_types::TableKind::Standard) {
                 continue;
             }
             for (ci, col) in t.columns.iter().enumerate() {
-                if !segmentable(col.ty) {
-                    continue;
+                if let Some(stat) = self.compact_one_column(t, ci as u16, col)? {
+                    out.push(stat);
                 }
-                // One read snapshot per column: the generation and the values
-                // must come from the SAME view, or the stamp would describe a
-                // state the values were not read from.
-                let r = self.engine.begin_read()?;
-                let gen = r.mod_gen(t.id)?;
-                let mut blocks: Vec<Vec<u8>> = Vec::new();
-                let mut buf: Vec<Value> = Vec::with_capacity(BLOCK_ROWS);
-                let mut rows = 0u64;
-                let fold = r.fold_range_column(
-                    t.id,
-                    None,
-                    None,
-                    ci as u16,
-                    mpedb_core::FoldOpts::SERIAL,
-                    &mut |v: &Value| {
-                        buf.push(v.clone());
-                        rows += 1;
-                        if buf.len() == BLOCK_ROWS {
-                            blocks.push(encode_block(gen, col.ty, &buf)?);
-                            buf.clear();
-                        }
-                        Ok(())
-                    },
-                );
-                let fold = fold.and_then(|_| {
-                    if !buf.is_empty() {
-                        blocks.push(encode_block(gen, col.ty, &buf)?);
-                    }
-                    Ok(())
-                });
-                r.finish()?;
-                match fold {
-                    Ok(()) => {}
-                    // A column this context cannot fold is not an error — it
-                    // simply gets no segment.
-                    Err(Error::Unsupported(_)) => continue,
-                    Err(e) => return Err(e),
-                }
+            }
+        }
+        Ok(out)
+    }
 
-                let bytes: u64 = blocks.iter().map(|b| b.len() as u64).sum();
-                let n_blocks = blocks.len() as u32;
-                // One session for the whole column: the records land together
-                // or not at all, so a reader never sees half a column.
-                let mut s = self.begin()?;
-                for (bi, b) in blocks.into_iter().enumerate() {
-                    s.sys_record_put(NS, &record_key(t.id, ci as u16, bi as u32), &b)?;
+    /// Build one column's segments in the current committed state, or `None`
+    /// when the column is not segmentable or the context cannot fold it. The
+    /// generation and the values come from ONE read snapshot, so the stamp
+    /// describes the exact state the values were read from.
+    fn compact_one_column(
+        &self,
+        t: &mpedb_types::TableDef,
+        ci: u16,
+        col: &mpedb_types::ColumnDef,
+    ) -> Result<Option<ColSegStat>> {
+        if !segmentable(col.ty) {
+            return Ok(None);
+        }
+        let r = self.engine.begin_read()?;
+        let gen = r.mod_gen(t.id)?;
+        let mut blocks: Vec<Vec<u8>> = Vec::new();
+        let mut buf: Vec<Value> = Vec::with_capacity(BLOCK_ROWS);
+        let mut rows = 0u64;
+        let fold = r.fold_range_column(
+            t.id,
+            None,
+            None,
+            ci,
+            mpedb_core::FoldOpts::SERIAL,
+            &mut |v: &Value| {
+                buf.push(v.clone());
+                rows += 1;
+                if buf.len() == BLOCK_ROWS {
+                    blocks.push(encode_block(gen, col.ty, &buf)?);
+                    buf.clear();
                 }
-                s.commit()?;
-                out.push(ColSegStat {
-                    table: t.name.clone(),
-                    column: col.name.clone(),
-                    blocks: n_blocks,
-                    rows,
-                    bytes,
-                });
+                Ok(())
+            },
+        );
+        let fold = fold.and_then(|_| {
+            if !buf.is_empty() {
+                blocks.push(encode_block(gen, col.ty, &buf)?);
+            }
+            Ok(())
+        });
+        r.finish()?;
+        match fold {
+            Ok(()) => {}
+            Err(Error::Unsupported(_)) => return Ok(None),
+            Err(e) => return Err(e),
+        }
+        let bytes: u64 = blocks.iter().map(|b| b.len() as u64).sum();
+        let n_blocks = blocks.len() as u32;
+        // Replace this column's old blocks in the SAME session as the new
+        // writes, so a reader never sees a mix of two builds: delete the whole
+        // column range first, then write the fresh blocks.
+        let mut sess = self.begin()?;
+        let lo = record_key(t.id, ci, 0);
+        let mut hi = record_key(t.id, ci, u32::MAX);
+        // Exclusive upper bound one past the last block of THIS column.
+        for b in hi.iter_mut().skip(6) {
+            *b = 0xFF;
+        }
+        for (k, _) in sess.sys_record_scan_range(NS, &lo, &hi)? {
+            sess.sys_record_delete(NS, &k)?;
+        }
+        for (bi, b) in blocks.into_iter().enumerate() {
+            sess.sys_record_put(NS, &record_key(t.id, ci, bi as u32), &b)?;
+        }
+        sess.commit()?;
+        Ok(Some(ColSegStat {
+            table: t.name.clone(),
+            column: col.name.clone(),
+            blocks: n_blocks,
+            rows,
+            bytes,
+        }))
+    }
+
+    /// Delete every column segment of one table (by id). Returns how many
+    /// records went.
+    fn drop_table_segments(&self, table_id: u32) -> Result<usize> {
+        let prefix = table_id.to_be_bytes();
+        let keys: Vec<Vec<u8>> = self
+            .sys_record_scan(NS)?
+            .into_iter()
+            .map(|(k, _)| k)
+            .filter(|k| k.starts_with(&prefix))
+            .collect();
+        let n = keys.len();
+        if n > 0 {
+            let mut s = self.begin()?;
+            for k in keys {
+                s.sys_record_delete(NS, &k)?;
+            }
+            s.commit()?;
+        }
+        Ok(n)
+    }
+
+    /// Make the stored column segments match the workload MODEL (DESIGN-COLUMNAR
+    /// §2, stage 4) — the "automatic + sparse + dynamic via MPEE" half of the
+    /// ask. A table is columnar-eligible when the model marks it scan-heavy:
+    /// role `fact`, or a scan archetype (`star-olap`) unless the table is a
+    /// `dimension`. A point-oriented table gains nothing from a segment, so its
+    /// segments are DROPPED; an eligible table gets one per segmentable column.
+    /// Regenerable — safe to run whenever. `mpedb model sync-columnar`.
+    pub fn sync_columnar(&self) -> Result<ColumnarSync> {
+        let model = self.model()?.ok_or_else(|| {
+            Error::Unsupported(
+                "no model stored — `mpedb model set` first; the model's roles are \
+                 what say which tables are scanned (columnar) vs pointed at (row)"
+                    .into(),
+            )
+        })?;
+        self.refresh_schema_if_stale()?;
+        let bundle = self.schema();
+        let scan_archetype =
+            matches!(model.archetype, Some(mpedb_types::model::Archetype::StarOlap));
+
+        let mut out = ColumnarSync::default();
+        for t in bundle.schema.tables.iter().filter(|x| !x.dead) {
+            if !matches!(t.kind, mpedb_types::TableKind::Standard) {
+                continue;
+            }
+            let role = model
+                .tables
+                .iter()
+                .find(|m| mpedb_types::ident_eq(&m.name, &t.name))
+                .and_then(|m| m.role);
+            let eligible = match role {
+                Some(mpedb_types::model::TableRole::Fact) => true,
+                Some(mpedb_types::model::TableRole::Dimension) => false,
+                _ => scan_archetype,
+            };
+            if !eligible {
+                if self.drop_table_segments(t.id)? > 0 {
+                    out.dropped.push(t.name.clone());
+                }
+                continue;
+            }
+            let mut built = 0u32;
+            for (ci, col) in t.columns.iter().enumerate() {
+                if self.compact_one_column(t, ci as u16, col)?.is_some() {
+                    built += 1;
+                }
+            }
+            if built > 0 {
+                out.columnarized.push((t.name.clone(), built));
             }
         }
         Ok(out)
