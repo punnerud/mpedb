@@ -104,6 +104,17 @@ struct Cost {
     /// upper bound, categorically different risk — and purely structural, so
     /// this term reads no statistics whatsoever.
     cartesian: u32,
+    /// **Hash-rescue awareness (join-program stage 2).** Charged 1 for a
+    /// linked, non-KNOWN step NONE of whose linking equalities has the shape
+    /// the executor's hash strategies can stand in for (a bare column = bare
+    /// column equality, same type, `Binary` collation both sides — the
+    /// conservative AST-level face of `join_hash_key`/`equi_join_cols`). Such
+    /// a step is condemned to O(n·m) ON evaluations, where a hashable step is
+    /// O(n+m) at worst — categorically riskier, though less certain than a
+    /// cartesian step (which stays its own, stronger term; no double charge:
+    /// this one applies only to LINKED steps). Reads schema + ON shape, zero
+    /// statistics, so §9.5's lazy-purchase laziness proof is untouched.
+    unhashable: u32,
     /// `(n - i)` for a position `i` whose table has no constraint on it at all.
     /// An unconstrained table inflates its own stage and every stage after it,
     /// so it is charged once per remaining step — this is what pushes
@@ -126,6 +137,7 @@ impl Cost {
         Cost {
             worst_log: self.worst_log.saturating_add(o.worst_log),
             cartesian: self.cartesian.saturating_add(o.cartesian),
+            unhashable: self.unhashable.saturating_add(o.unhashable),
             late_unconstrained: self.late_unconstrained.saturating_add(o.late_unconstrained),
             residual_late: self.residual_late.saturating_add(o.residual_late),
         }
@@ -206,6 +218,10 @@ struct Node<'a> {
     self_filter: bool,
     /// Tables this one shares a conjunct with.
     adj: u32,
+    /// Need-masks (the OTHER side's tables) of linking equalities in the
+    /// hash-representable shape — see [`Cost::unhashable`]. A step is
+    /// hash-rescuable once any entry's mask is fully placed.
+    hash_link: Vec<u32>,
     /// **v2 barrier (#116).** This table is the NULL-extended inner side of a
     /// LEFT join: its position is FIXED, so the set of tables that precede it
     /// — and therefore exactly what it preserves and what it NULL-extends — is
@@ -343,6 +359,12 @@ impl<'a> Problem<'a> {
                 if d == 0 || b == 0 { b } else { b.saturating_sub(d).max(1) }
             },
             cartesian: u32::from(pos > 0 && !linked),
+            unhashable: u32::from(
+                pos > 0
+                    && linked
+                    && !known
+                    && !node.hash_link.iter().any(|&need| need & !placed == 0),
+            ),
             late_unconstrained: if constrained { 0 } else { (self.n - pos) as u32 },
             residual_late: resolved.saturating_mul(pos as u32),
         }
@@ -950,6 +972,7 @@ pub(super) fn reorder<'s>(
             conj: Vec::new(),
             self_filter: false,
             adj: 0,
+            hash_link: Vec::new(),
             barrier: barrier[i],
         })
         .collect();
@@ -1010,6 +1033,21 @@ pub(super) fn reorder<'s>(
             let ok = match b {
                 BExpr::Col(o) => {
                     let ot = table_of(*o).map(|ot| (ot, *o as usize - base[ot]));
+                    // The bare col = bare col shape is ALSO what the executor's
+                    // hash strategies reproduce — record it when both sides
+                    // compare `Binary` (a folded comparison would bucket rows
+                    // the operator calls equal apart; the hash key encodes
+                    // `Binary`). Same guard family as `join_hash_key`.
+                    if let Some((ot, oc)) = ot {
+                        if nodes[ot].def.columns[oc].ty == ty
+                            && nodes[t].def.columns[col].collation
+                                == mpedb_types::Collation::Binary
+                            && nodes[ot].def.columns[oc].collation
+                                == mpedb_types::Collation::Binary
+                        {
+                            nodes[t].hash_link.push(need);
+                        }
+                    }
                     ot.is_some_and(|(ot, oc)| nodes[ot].def.columns[oc].ty == ty)
                 }
                 BExpr::Const(v) => !v.is_null() && v.fits(ty),
@@ -1199,17 +1237,17 @@ mod tests {
 
     #[test]
     fn cost_orders_lexicographically() {
-        let a = Cost { worst_log: 10, cartesian: 0, late_unconstrained: 99, residual_late: 99 };
-        let b = Cost { worst_log: 11, cartesian: 0, late_unconstrained: 0, residual_late: 0 };
+        let a = Cost { worst_log: 10, cartesian: 0, unhashable: 0, late_unconstrained: 99, residual_late: 99 };
+        let b = Cost { worst_log: 11, cartesian: 0, unhashable: 0, late_unconstrained: 0, residual_late: 0 };
         assert!(a < b, "the worst-case product dominates");
-        let c = Cost { worst_log: 10, cartesian: 5, late_unconstrained: 0, residual_late: 0 };
+        let c = Cost { worst_log: 10, cartesian: 5, unhashable: 0, late_unconstrained: 0, residual_late: 0 };
         assert!(a < c, "with equal worst case, fewer cartesian steps win");
         // v2: residual placement is the LAST word — it may only break ties the
         // first three terms leave open, never overturn one of them.
-        let early = Cost { worst_log: 4, cartesian: 0, late_unconstrained: 0, residual_late: 3 };
-        let late = Cost { worst_log: 4, cartesian: 0, late_unconstrained: 0, residual_late: 9 };
+        let early = Cost { worst_log: 4, cartesian: 0, unhashable: 0, late_unconstrained: 0, residual_late: 3 };
+        let late = Cost { worst_log: 4, cartesian: 0, unhashable: 0, late_unconstrained: 0, residual_late: 9 };
         assert!(early < late, "an equally-safe order that filters earlier wins");
-        let riskier = Cost { worst_log: 5, cartesian: 0, late_unconstrained: 0, residual_late: 0 };
+        let riskier = Cost { worst_log: 5, cartesian: 0, unhashable: 0, late_unconstrained: 0, residual_late: 0 };
         assert!(late < riskier, "no amount of early filtering buys a worse worst case");
     }
 
