@@ -249,6 +249,51 @@ pub struct ColSegStat {
     pub bytes: u64,
 }
 
+/// What the stage-B live check found a table needs. `Fresh` tables are omitted
+/// from a plan, so this only ever names a table with work to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MaintainAction {
+    /// Eligible for segments but has none live — build.
+    Build,
+    /// Eligible and segments are live, but `tail` rows have accreted above the
+    /// stage-5 watermark (which covers `covered`) past the rebuild fraction —
+    /// rebuild to absorb them.
+    Rebuild { covered: u64, tail: u64 },
+    /// The model no longer wants segments here, but a watermark is still live —
+    /// drop them.
+    Drop,
+    /// Nothing to do (never stored in a plan; the default when nothing matches).
+    Fresh,
+}
+
+/// One table's maintenance verdict from the live check.
+#[derive(Debug, Clone)]
+pub struct ColumnarMaintenance {
+    pub table: String,
+    pub action: MaintainAction,
+}
+
+/// The model's columnar-eligibility rule, shared by `sync_columnar` and the
+/// maintenance pass: a `fact` is columnar, a `dimension` is not, and anything
+/// unroled follows the archetype (a `star-olap` database columnarizes by
+/// default). One place so the two passes can never disagree on what is eligible.
+fn columnar_eligible(
+    model: &mpedb_types::model::WorkloadModel,
+    scan_archetype: bool,
+    table_name: &str,
+) -> bool {
+    let role = model
+        .tables
+        .iter()
+        .find(|m| mpedb_types::ident_eq(&m.name, table_name))
+        .and_then(|m| m.role);
+    match role {
+        Some(mpedb_types::model::TableRole::Fact) => true,
+        Some(mpedb_types::model::TableRole::Dimension) => false,
+        _ => scan_archetype,
+    }
+}
+
 /// Key: `table BE4 ‖ column ORDINAL BE2 ‖ block BE4`.
 ///
 /// The column is keyed by ORDINAL, not by name, which is safe only because
@@ -1006,13 +1051,7 @@ impl crate::Database {
     /// segments are DROPPED; an eligible table gets one per segmentable column.
     /// Regenerable — safe to run whenever. `mpedb model sync-columnar`.
     pub fn sync_columnar(&self) -> Result<ColumnarSync> {
-        let model = self.model()?.ok_or_else(|| {
-            Error::Unsupported(
-                "no model stored — `mpedb model set` first; the model's roles are \
-                 what say which tables are scanned (columnar) vs pointed at (row)"
-                    .into(),
-            )
-        })?;
+        let model = self.require_model()?;
         self.refresh_schema_if_stale()?;
         let bundle = self.schema();
         let scan_archetype =
@@ -1023,17 +1062,7 @@ impl crate::Database {
             if !matches!(t.kind, mpedb_types::TableKind::Standard) {
                 continue;
             }
-            let role = model
-                .tables
-                .iter()
-                .find(|m| mpedb_types::ident_eq(&m.name, &t.name))
-                .and_then(|m| m.role);
-            let eligible = match role {
-                Some(mpedb_types::model::TableRole::Fact) => true,
-                Some(mpedb_types::model::TableRole::Dimension) => false,
-                _ => scan_archetype,
-            };
-            if !eligible {
+            if !columnar_eligible(&model, scan_archetype, &t.name) {
                 if self.drop_table_segments(t.id)? > 0 {
                     out.dropped.push(t.name.clone());
                 }
@@ -1043,6 +1072,125 @@ impl crate::Database {
             let built = self.compact_table(t, &mut stats)?;
             if built > 0 {
                 out.columnarized.push((t.name.clone(), built));
+            }
+        }
+        Ok(out)
+    }
+
+    fn require_model(&self) -> Result<mpedb_types::model::WorkloadModel> {
+        self.model()?.ok_or_else(|| {
+            Error::Unsupported(
+                "no model stored — `mpedb model set` first; the model's roles are \
+                 what say which tables are scanned (columnar) vs pointed at (row)"
+                    .into(),
+            )
+        })
+    }
+
+    /// The cheap, bounded LIVE CHECK (stage B): read-only, O(model tables), it
+    /// says what `maintain_columnar` WOULD do without doing any of it. Per
+    /// eligible table it reports whether the segments are absent (Build), or
+    /// present but the row tail above the stage-5 watermark has grown past
+    /// `tail_fraction` of the covered rows (Rebuild); an ineligible table that
+    /// still carries a watermark is a Drop. `Fresh` tables are omitted.
+    ///
+    /// One read snapshot, one watermark read and one row-count per table — safe
+    /// to call often (a query-path hook can consult it and record the need
+    /// without ever paying for a build).
+    pub fn columnar_maintenance_plan(
+        &self,
+        tail_fraction: f64,
+    ) -> Result<Vec<ColumnarMaintenance>> {
+        let model = self.require_model()?;
+        self.refresh_schema_if_stale()?;
+        let bundle = self.schema();
+        let scan_archetype =
+            matches!(model.archetype, Some(mpedb_types::model::Archetype::StarOlap));
+        let r = self.engine.begin_read()?;
+        let mut out = Vec::new();
+        for t in bundle.schema.tables.iter().filter(|x| !x.dead) {
+            if !matches!(t.kind, mpedb_types::TableKind::Standard) {
+                continue;
+            }
+            let eligible = columnar_eligible(&model, scan_archetype, &t.name);
+            // A live watermark == usable segments (compact_table publishes it
+            // under a CAS, and any covered write deletes it), so its covered-row
+            // count is the exact "are the segments there and how much do they
+            // cover" signal.
+            let covered = r.columnar_watermark(t.id)?.map(|(_, w, _)| w);
+            let action = if eligible {
+                match covered {
+                    None => MaintainAction::Build,
+                    Some(w) => {
+                        let n = r.row_count(t.id)?;
+                        let tail = n.saturating_sub(w);
+                        if w > 0 && tail as f64 > tail_fraction.max(0.0) * w as f64 {
+                            MaintainAction::Rebuild { covered: w, tail }
+                        } else {
+                            MaintainAction::Fresh
+                        }
+                    }
+                }
+            } else if covered.is_some() {
+                MaintainAction::Drop
+            } else {
+                MaintainAction::Fresh
+            };
+            if action != MaintainAction::Fresh {
+                out.push(ColumnarMaintenance { table: t.name.clone(), action });
+            }
+        }
+        r.finish()?;
+        Ok(out)
+    }
+
+    /// Apply the maintenance plan (stage B): build absent segments, rebuild the
+    /// ones whose tail grew past `tail_fraction`, drop the ones the model no
+    /// longer wants — but at most `max_rebuilds` builds/rebuilds this call
+    /// (0 = unbounded), so a single maintenance pass has a bounded cost even
+    /// when many tables went stale at once. Drops are cheap and never capped.
+    ///
+    /// The adaptive counterpart to `sync_columnar` (which rebuilds every
+    /// eligible table unconditionally): this touches only what the live check
+    /// found stale, so re-running it on a settled database does nothing.
+    pub fn maintain_columnar(
+        &self,
+        tail_fraction: f64,
+        max_rebuilds: usize,
+    ) -> Result<ColumnarSync> {
+        let plan = self.columnar_maintenance_plan(tail_fraction)?;
+        let bundle = self.schema();
+        let find = |name: &str| {
+            bundle
+                .schema
+                .tables
+                .iter()
+                .find(|t| !t.dead && mpedb_types::ident_eq(&t.name, name))
+        };
+        let mut out = ColumnarSync::default();
+        let mut rebuilds = 0usize;
+        for m in plan {
+            match m.action {
+                MaintainAction::Build | MaintainAction::Rebuild { .. } => {
+                    if max_rebuilds > 0 && rebuilds >= max_rebuilds {
+                        continue; // bounded — the rest wait for the next pass
+                    }
+                    let Some(t) = find(&m.table) else { continue };
+                    let mut stats = Vec::new();
+                    let built = self.compact_table(t, &mut stats)?;
+                    rebuilds += 1;
+                    if built > 0 {
+                        out.columnarized.push((m.table.clone(), built));
+                    }
+                }
+                MaintainAction::Drop => {
+                    if let Some(t) = find(&m.table) {
+                        if self.drop_table_segments(t.id)? > 0 {
+                            out.dropped.push(m.table.clone());
+                        }
+                    }
+                }
+                MaintainAction::Fresh => {}
             }
         }
         Ok(out)

@@ -71,6 +71,9 @@ usage: mpedb <command> [args]
                                            the model marks scan-heavy (fact /
                                            star-olap); drop them for row-oriented
                                            ones — automatic + sparse via MPEE
+  model maintain <target>                  adaptive columnar upkeep: build/rebuild
+         [--tail-fraction F] [--max N]     only what went stale (absent, or tail
+         [--plan]                          grown past F); --plan = dry-run
   fn define <target> <file.py|file.rs>     store a PySpell SQL function
   fn drop <target> <name>                  drop a stored function
   fn list <target>                         list stored functions
@@ -304,9 +307,71 @@ fn cmd_model(args: &[String]) -> CliResult {
             }
             Ok(())
         }
+        [sub, rest @ ..] if sub == "maintain" => {
+            // model maintain <target> [--tail-fraction F] [--max N] [--plan]
+            let plan_only = rest.iter().any(|a| a == "--plan");
+            let mut fraction = 0.25f64;
+            let mut max_rebuilds = 0usize;
+            let mut config: Option<&str> = None;
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i].as_str() {
+                    "--plan" => {}
+                    "--tail-fraction" => {
+                        i += 1;
+                        fraction = rest.get(i).and_then(|s| s.parse().ok()).ok_or_else(|| {
+                            Failure::Usage("--tail-fraction needs a number".into())
+                        })?;
+                    }
+                    "--max" => {
+                        i += 1;
+                        max_rebuilds = rest.get(i).and_then(|s| s.parse().ok()).ok_or_else(|| {
+                            Failure::Usage("--max needs an integer".into())
+                        })?;
+                    }
+                    other if config.is_none() => config = Some(other),
+                    _ => return usage("model maintain <target> [--tail-fraction F] [--max N] [--plan]"),
+                }
+                i += 1;
+            }
+            let Some(config) = config else {
+                return usage("model maintain <target> [--tail-fraction F] [--max N] [--plan]");
+            };
+            let db = crate::util::open_target(config)?;
+            if plan_only {
+                use mpedb::colseg::MaintainAction;
+                let plan = db.columnar_maintenance_plan(fraction)?;
+                if plan.is_empty() {
+                    println!("nothing to do — every model-eligible table is fresh");
+                }
+                for m in &plan {
+                    match &m.action {
+                        MaintainAction::Build => println!("build   {}", m.table),
+                        MaintainAction::Rebuild { covered, tail } => {
+                            println!("rebuild {} (tail {tail} over {covered} covered)", m.table)
+                        }
+                        MaintainAction::Drop => println!("drop    {}", m.table),
+                        MaintainAction::Fresh => {}
+                    }
+                }
+                return Ok(());
+            }
+            let r = db.maintain_columnar(fraction, max_rebuilds)?;
+            for (t, n) in &r.columnarized {
+                println!("built {t} ({n} columns)");
+            }
+            for t in &r.dropped {
+                println!("dropped segments for {t}");
+            }
+            if r.columnarized.is_empty() && r.dropped.is_empty() {
+                println!("nothing to do — every model-eligible table is fresh");
+            }
+            Ok(())
+        }
         _ => usage(
             "model needs: set <target> <model.toml> | show <target> | \
-             sync-derived <target> | sync-columnar <target>",
+             sync-derived <target> | sync-columnar <target> | \
+             maintain <target> [--tail-fraction F] [--max N] [--plan]",
         ),
     }
 }
