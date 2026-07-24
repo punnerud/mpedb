@@ -21,7 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use mpedb_sql::{AccessPath, CompiledPlan, OrderOver, PlanStmt, SelectPlan};
+use mpedb_sql::{AccessPath, CompiledPlan, GroupKey, OrderOver, PlanStmt, Projection, SelectPlan};
 use mpedb_types::{CmpKind, Collation, ExprProgram, Instr, Result, Schema};
 
 /// Where the statements come from.
@@ -332,6 +332,363 @@ fn fold_shape(
 
     let entry = cands.entry((table, key)).or_insert_with(|| (0, sql.to_string()));
     entry.0 += weight.max(1);
+}
+
+// ==========================================================================
+// Columnar advice — stage A of the MPEE-adaptive storage program.
+//
+// The SAME workload the index advisor reads (every registered plan) answers a
+// DIFFERENT question: does the application SCAN this table (segments pay) or
+// POINT at it (the row tree is cheaper)? A scan-aggregate — an aggregate over a
+// scan access path — is the exact shape column segments accelerate, and a
+// PkPoint/IndexPoint is the exact shape they do not. So the analysis is a per-
+// table vote: scan-aggregate / narrow scan weight vs point / key-probe / write
+// weight. Appends count NEITHER way: stage 5 keeps appended rows in a row tail
+// that leaves the segments valid, so an append-and-scan fact table wins columnar
+// on its reads without its inserts fighting the signal.
+//
+// Recommend-only, exactly like the index advisor: the output is a report and a
+// proposed MODEL (roles an LLM or `mpedb model set` applies), never a silent
+// storage change. The model then drives `sync_columnar` (stage 4).
+// ==========================================================================
+
+/// Which storage orientation the workload wants for a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Orient {
+    /// Scanned and aggregated — column segments pay.
+    Column,
+    /// Pointed at by key — the row tree is cheaper.
+    Row,
+}
+
+impl Orient {
+    /// The model role this orientation maps to (`sync_columnar`'s input):
+    /// a scanned table is a `fact` (columnarized), a pointed-at one a
+    /// `dimension` (kept on the row tree).
+    pub fn role(self) -> &'static str {
+        match self {
+            Orient::Column => "fact",
+            Orient::Row => "dimension",
+        }
+    }
+}
+
+/// One table's recommended storage orientation, derived from the workload.
+#[derive(Debug, Clone)]
+pub struct ColumnarAdvice {
+    pub table: String,
+    pub orient: Orient,
+    /// Weight of scan-aggregate / narrow-scan traffic (columnar-favouring).
+    pub scan_weight: u64,
+    /// Weight of point / key-probe / mutating traffic (row-favouring).
+    pub point_weight: u64,
+    /// log2 bucket of the table's row count — segments only pay on big scans,
+    /// shown so a consumer weighs the vote against size without a hard cutoff.
+    pub rows_bucket: u32,
+    /// Columns the scan-aggregates actually read — the segments that would be
+    /// built for this table.
+    pub scan_columns: Vec<String>,
+    /// One motivating SQL text, for the human (or LLM) reading the advice.
+    pub example: String,
+}
+
+/// The columnar advice plus the census of what the extraction could not use.
+#[derive(Debug, Default)]
+pub struct ColumnarReport {
+    pub advices: Vec<ColumnarAdvice>,
+    pub compiled: u64,
+    pub uncompilable: u64,
+    /// Shapes with no single-table storage signal (compounds, DDL, FTS…).
+    pub skipped_shape: u64,
+}
+
+impl ColumnarReport {
+    /// Render the advice as a proposed workload MODEL (`[model]` TOML) — the
+    /// LLM-inspectable "adapt the model" surface. Every scanned table becomes a
+    /// `fact`, every pointed-at one a `dimension`, and the archetype is
+    /// `star-olap` iff anything wants columns. Directly consumable by
+    /// `mpedb model set`; a comment records the evidence behind each role.
+    pub fn to_model_toml(&self) -> String {
+        let any_col = self.advices.iter().any(|a| a.orient == Orient::Column);
+        let mut s = String::new();
+        s.push_str("[model]\nname = \"workload-derived\"\n");
+        s.push_str(&format!(
+            "archetype = \"{}\"\n",
+            if any_col { "star-olap" } else { "oltp" }
+        ));
+        s.push_str("# Derived from the observed workload by `mpedb advise --columnar`.\n");
+        s.push_str("# Roles drive `mpedb model sync-columnar`: fact -> column segments,\n");
+        s.push_str("# dimension -> row tree. Review before applying.\n");
+        for a in &self.advices {
+            s.push_str(&format!(
+                "\n[[model.table]]\nname = {:?}\nrole = {:?}\n",
+                a.table,
+                a.orient.role()
+            ));
+            match a.orient {
+                Orient::Column => s.push_str(&format!(
+                    "# scanned by weight {} (vs {} point); columns: {}\n",
+                    a.scan_weight,
+                    a.point_weight,
+                    if a.scan_columns.is_empty() {
+                        "*".to_string()
+                    } else {
+                        a.scan_columns.join(", ")
+                    }
+                )),
+                Orient::Row => s.push_str(&format!(
+                    "# pointed at by weight {} (vs {} scan)\n",
+                    a.point_weight, a.scan_weight
+                )),
+            }
+        }
+        s
+    }
+}
+
+/// Per-table running tally while folding the workload.
+#[derive(Default)]
+struct TableVote {
+    scan: u64,
+    point: u64,
+    scan_cols: std::collections::BTreeSet<u16>,
+    example: String,
+}
+
+impl crate::Database {
+    /// Derive per-table storage orientation (column vs row) from the workload.
+    /// Read-only: creates nothing, writes nothing, changes no storage — the
+    /// output is advice and a proposed model (`ColumnarReport::to_model_toml`).
+    ///
+    /// The safe half of "automatic via MPEE": the analysis says WHICH tables the
+    /// workload scans, an operator (or an LLM, or `sync_columnar` once the model
+    /// carries the roles) decides whether to act. A wrong analysis never makes an
+    /// answer wrong — segments are regenerable and fail-safe — it only mis-sizes
+    /// what gets built.
+    pub fn recommend_columnar(&self, source: WorkloadSource) -> Result<ColumnarReport> {
+        self.refresh_schema_if_stale()?;
+        let bundle = self.schema();
+        let schema = &bundle.schema;
+
+        let mut rep = ColumnarReport::default();
+        let mut votes: BTreeMap<u32, TableVote> = BTreeMap::new();
+
+        let mut fold = |sql: &str, plan: &CompiledPlan, weight: u64, rep: &mut ColumnarReport| {
+            rep.compiled += 1;
+            match &plan.stmt {
+                PlanStmt::Select(sp) => fold_columnar(schema, sp, sql, weight, &mut votes, rep),
+                // A write POINTS at rows it changes, and a covered change
+                // invalidates segments (stage 5); count it row-favouring.
+                // (An INSERT is deliberately NOT here: an append leaves the
+                // segments valid, so it must not vote against columns.)
+                PlanStmt::Update { table, .. } | PlanStmt::Delete { table, .. } => {
+                    votes.entry(*table).or_default().point += weight.max(1);
+                }
+                _ => rep.skipped_shape += 1,
+            }
+        };
+
+        match source {
+            WorkloadSource::Registry => {
+                let r = self.engine.begin_read()?;
+                let records = r.sys_scan_range(
+                    crate::registry::PLAN_PREFIX,
+                    crate::registry::PLAN_PREFIX_END,
+                )?;
+                r.finish()?;
+                for (_k, bytes) in records {
+                    let Some(rec) = crate::registry::parse_record(&bytes) else {
+                        rep.uncompilable += 1;
+                        continue;
+                    };
+                    match CompiledPlan::decode(rec.blob, schema) {
+                        Ok(plan) => fold(rec.sql, &plan, 1, &mut rep),
+                        Err(_) => rep.uncompilable += 1,
+                    }
+                }
+            }
+            WorkloadSource::Statements(stmts) => {
+                for sql in &stmts {
+                    match mpedb_sql::prepare(sql, schema) {
+                        Ok(plan) => fold(sql, &plan, 1, &mut rep),
+                        Err(_) => rep.uncompilable += 1,
+                    }
+                }
+            }
+            WorkloadSource::Model(model) => {
+                for st in crate::model::synthesize_statements(&model, schema) {
+                    match mpedb_sql::prepare(&st.sql, schema) {
+                        Ok(plan) => fold(&st.sql, &plan, st.weight, &mut rep),
+                        Err(_) => rep.uncompilable += 1,
+                    }
+                }
+            }
+        }
+
+        let r = self.engine.begin_read()?;
+        let mut advices: Vec<ColumnarAdvice> = votes
+            .into_iter()
+            .filter_map(|(tid, v)| {
+                let t = schema.tables.get(tid as usize)?;
+                if t.dead {
+                    return None;
+                }
+                let scan_columns = v
+                    .scan_cols
+                    .iter()
+                    .filter_map(|&i| t.columns.get(i as usize).map(|c| c.name.clone()))
+                    .collect();
+                // Ties go to Row: the row tree is the safe default, and a table
+                // the workload does not clearly scan should not be columnarized.
+                let orient = if v.scan > v.point { Orient::Column } else { Orient::Row };
+                Some(ColumnarAdvice {
+                    table: t.name.clone(),
+                    orient,
+                    scan_weight: v.scan,
+                    point_weight: v.point,
+                    rows_bucket: crate::stats::bucket(r.row_count(tid).unwrap_or(0)),
+                    scan_columns,
+                    example: v.example,
+                })
+            })
+            .collect();
+        r.finish()?;
+        // Most-scanned first, then biggest, then name — the tables worth
+        // columnarizing float to the top.
+        advices.sort_by(|a, b| {
+            b.scan_weight
+                .cmp(&a.scan_weight)
+                .then(b.rows_bucket.cmp(&a.rows_bucket))
+                .then(a.table.cmp(&b.table))
+        });
+        rep.advices = advices;
+        Ok(rep)
+    }
+}
+
+/// Fold one SELECT into per-table storage votes. The base table's access +
+/// aggregate is the primary signal; each joined-in table is a key probe (the
+/// dimension side of a star), so it votes row.
+fn fold_columnar(
+    schema: &Schema,
+    sp: &SelectPlan,
+    sql: &str,
+    weight: u64,
+    votes: &mut BTreeMap<u32, TableVote>,
+    rep: &mut ColumnarReport,
+) {
+    let w = weight.max(1);
+    let base_scan = is_scan_access(&sp.access);
+    let base_point = is_point_access(&sp.access);
+    if matches!(sp.access, AccessPath::FtsScan { .. }) {
+        rep.skipped_shape += 1;
+        return;
+    }
+
+    // The base table's vote.
+    let base = votes.entry(sp.table).or_default();
+    if base.example.is_empty() {
+        base.example = sql.to_string();
+    }
+    if base_scan {
+        // A scan that AGGREGATES is the exact columnar win. A scan without an
+        // aggregate is one only when it reads FEW of the table's columns (a
+        // `SELECT *` needs every column and is cheaper off the row tree); the
+        // width test is applied by the caller-visible `scan_columns` and, here,
+        // by requiring a narrow read.
+        let width = schema
+            .tables
+            .get(sp.table as usize)
+            .map(|t| t.columns.len())
+            .unwrap_or(0);
+        let cols = base_scan_columns(sp);
+        let narrow = !cols.is_empty() && (width == 0 || cols.len() * 2 <= width);
+        if sp.aggregate.is_some() || narrow {
+            base.scan += w;
+            for c in cols {
+                base.scan_cols.insert(c);
+            }
+        }
+        // A wide, non-aggregate scan is neither a clear column nor point win —
+        // it does not vote, so it cannot drag a table either way.
+    } else if base_point {
+        base.point += w;
+    }
+
+    // Joined-in tables: a key probe is the dimension side; a scanned inner side
+    // (rare) is itself a scan.
+    for j in &sp.joins {
+        let e = votes.entry(j.table).or_default();
+        if e.example.is_empty() {
+            e.example = sql.to_string();
+        }
+        if is_point_access(&j.access) {
+            e.point += w;
+        } else if is_scan_access(&j.access) {
+            e.scan += w;
+        }
+    }
+}
+
+fn is_scan_access(a: &AccessPath) -> bool {
+    matches!(
+        a,
+        AccessPath::FullScan | AccessPath::PkRange { .. } | AccessPath::IndexRange { .. }
+    )
+}
+
+fn is_point_access(a: &AccessPath) -> bool {
+    matches!(a, AccessPath::PkPoint(_) | AccessPath::IndexPoint { .. })
+}
+
+/// The BASE-row columns a scan reads — the columns whose segments would serve
+/// it. The residual filter is always base-row. With an aggregate, the base-row
+/// reads are the group keys and the aggregate arguments (the projection and
+/// HAVING run over the GROUPED tuple, whose ordinals are NOT base columns, so
+/// they must not be counted); without one, the projection IS the base row.
+/// Best-effort and advisory — an incomplete set only under-reports which
+/// segments help.
+fn base_scan_columns(sp: &SelectPlan) -> std::collections::BTreeSet<u16> {
+    let mut cols = std::collections::BTreeSet::new();
+    if let Some(f) = &sp.filter {
+        cols.extend(cols_in_program(f));
+    }
+    if let Some(agg) = &sp.aggregate {
+        for g in &agg.group_by {
+            match g {
+                GroupKey::Col(c) => {
+                    cols.insert(*c);
+                }
+                GroupKey::Expr(p) => cols.extend(cols_in_program(p)),
+            }
+        }
+        for a in &agg.aggs {
+            if let Some(arg) = &a.arg {
+                cols.extend(cols_in_program(arg));
+            }
+        }
+    } else {
+        for p in &sp.projection {
+            match p {
+                Projection::Column(c) => {
+                    cols.insert(*c);
+                }
+                Projection::Expr { program, .. } => cols.extend(cols_in_program(program)),
+            }
+        }
+    }
+    cols
+}
+
+/// Every base-row column ordinal an expression program reads.
+fn cols_in_program(p: &ExprProgram) -> Vec<u16> {
+    p.instrs
+        .iter()
+        .filter_map(|i| match i {
+            Instr::PushCol(c) => Some(*c),
+            _ => None,
+        })
+        .collect()
 }
 
 /// The §2.2 identity: names + collation, never ordinals, never statistics.

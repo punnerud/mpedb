@@ -63,6 +63,8 @@ usage: mpedb <command> [args]
   advise <target> [statements.sql]         recommend indexes from the workload
          [--model <file|stored>]           (registry, a ;-separated file, or a
                                            workload model — DESIGN-MODEL-LANG.md)
+         [--columnar [--emit-model]]       …or column-vs-row storage advice;
+                                           --emit-model prints a proposed [model]
   model set <target> <model.toml>          store the workload model
   model show <target>                      print the stored model
   model sync-columnar <target>             build column segments for the tables
@@ -535,13 +537,22 @@ fn cmd_op(args: &[String]) -> CliResult {
 /// workload is the plan registry: everything this database has ever compiled.
 fn cmd_advise(args: &[String]) -> CliResult {
     use mpedb::advisor::WorkloadSource;
-    let (config, source) = match args {
-        [config] => (config, None),
-        [config, flag, spec] if flag == "--model" => (config, Some((true, spec.clone()))),
-        [config, file] => (config, Some((false, file.clone()))),
+    // Split boolean flags from positional args so `--columnar`/`--emit-model`
+    // may appear anywhere.
+    let columnar = args.iter().any(|a| a == "--columnar");
+    let emit_model = args.iter().any(|a| a == "--emit-model");
+    let pos: Vec<&String> = args
+        .iter()
+        .filter(|a| *a != "--columnar" && *a != "--emit-model")
+        .collect();
+    let (config, source) = match pos.as_slice() {
+        [config] => (*config, None),
+        [config, flag, spec] if *flag == "--model" => (*config, Some((true, (*spec).clone()))),
+        [config, file] => (*config, Some((false, (*file).clone()))),
         _ => {
             return usage(
-                "advise needs <config.toml|db.mpedb> [statements.sql | --model <file|stored>]",
+                "advise needs <config.toml|db.mpedb> [statements.sql | --model <file|stored>] \
+                 [--columnar [--emit-model]]",
             )
         }
     };
@@ -572,6 +583,41 @@ fn cmd_advise(args: &[String]) -> CliResult {
             WorkloadSource::Statements(stmts)
         }
     };
+    if columnar {
+        let rep = db.recommend_columnar(source)?;
+        if emit_model {
+            print!("{}", rep.to_model_toml());
+            return Ok(());
+        }
+        println!(
+            "workload: {} compiled, {} uncompilable, {} shapes without a single-table storage signal",
+            rep.compiled, rep.uncompilable, rep.skipped_shape
+        );
+        if rep.advices.is_empty() {
+            println!("no columnar recommendations.");
+            return Ok(());
+        }
+        println!();
+        println!("{:<24} {:>7} {:>6} {:>6}  columns", "table", "orient", "scan", "point");
+        for a in &rep.advices {
+            println!(
+                "{:<24} {:>7} {:>6} {:>6}  {}",
+                a.table,
+                match a.orient {
+                    mpedb::advisor::Orient::Column => "column",
+                    mpedb::advisor::Orient::Row => "row",
+                },
+                a.scan_weight,
+                a.point_weight,
+                if a.scan_columns.is_empty() { "*".into() } else { a.scan_columns.join(", ") },
+            );
+        }
+        println!();
+        println!(
+            "apply with `--emit-model` → `mpedb model set`, then `mpedb model sync-columnar`."
+        );
+        return Ok(());
+    }
     let rep = db.recommend_indexes(source)?;
     println!(
         "workload: {} compiled, {} uncompilable, {} shapes without a single-table          candidate, {} opaque filters, {} no-key, {} already served",
