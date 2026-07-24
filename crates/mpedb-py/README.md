@@ -1,39 +1,78 @@
-# mpedb-py — Python bindings for mpedb
+# mpedb — a drop-in `sqlite3` replacement
 
-CPython **3.12+** extension module (PyO3 0.29, `abi3-py312`: one wheel/.so for all
-3.12+ versions). Module name: `mpedb`. Free-threading friendly by design: no
-module-level mutable state, and the GIL is released around every engine call, so
-point reads from multiple Python threads run truly in parallel.
+A multi-process embedded database engine with PostgreSQL-grade concurrency
+(MVCC snapshots, lock-free readers) behind the `sqlite3` API you already use.
+Swap one import and existing code runs unchanged:
 
-## Building
+```python
+import mpedb as db          # was: import sqlite3 as db
 
-Manual (no extra tooling):
-
-```sh
-cargo build --release -p mpedb-py
-mkdir -p /path/to/pymod
-cp target/release/libmpedb_py.so /path/to/pymod/mpedb.so   # the rename is required
-PYTHONPATH=/path/to/pymod python3.12 -c "import mpedb; print(mpedb.Database)"
+conn = db.connect("app.db")
+conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)")
+conn.execute("INSERT INTO users (id, name) VALUES (?, ?)", (1, "Ada"))
+conn.commit()
+print(conn.execute("SELECT name FROM users").fetchall())
 ```
 
-The cdylib is built as `libmpedb_py.so` but must be importable as `mpedb.so`
-(the `#[pymodule]` is named `mpedb`, so its init symbol is `PyInit_mpedb`).
-
-With maturin (builds a proper wheel):
-
 ```sh
-pip install maturin && maturin build --release -m crates/mpedb-py/Cargo.toml
+pip install mpedb
 ```
 
-Tests (plain Python, no pytest; run it twice against the same directory to also
-exercise persistence across process restarts):
+CPython **3.12+** (`abi3`: one wheel per platform covers every 3.12+ version).
+Wheels for Linux x86-64 and macOS arm64, published automatically when the full
+engine test suite is green on CI.
 
-```sh
-PYTHONPATH=/path/to/pymod python3.12 crates/mpedb-py/pytest/test_mpedb.py /tmp/mpedb-pytest
-PYTHONPATH=/path/to/pymod python3.12 crates/mpedb-py/pytest/test_mpedb.py /tmp/mpedb-pytest
+## The path decides the engine
+
+| path | what happens |
+|---|---|
+| `*.db` | The file is read as a **real sqlite database**. Writes land in an mpedb delta next to it, and `commit()` checkpoints them back into the `.db` — sqlite tools and mpedb see one store, kept in sync. |
+| `*.mpedb` | Native mpedb: multi-process shared-memory engine; attaching processes may be SIGKILLed at any instant without corrupting the file. |
+| `:memory:` | Native mpedb, process-private memory. |
+| `*.toml` | An explicit mpedb config file (declared schema, durability modes, sizing). |
+
+```python
+import mpedb.sqlite3 as db   # the default routing, under its explicit name
+import mpedb.mpedb  as db    # force the NATIVE engine for any path
 ```
 
-## API
+## Why
+
+- **Multi-process for real.** sqlite's operational model (no server, attach by
+  path) with lock-free MVCC readers: readers never block the writer, the
+  writer never blocks readers, and a crash mid-write never corrupts the file.
+- **Compiled plans.** SQL compiles once to a content-hashed plan shared across
+  processes; repeated parameterised statements execute with zero parsing.
+- **Keep your `.db` files.** The sqlite-backed mode means adopting mpedb does
+  not mean leaving sqlite — your existing tools keep reading the same file.
+- **Never a wrong answer.** mpedb's SQL is a differentially tested subset of
+  sqlite's: a statement is either answered exactly as sqlite answers it, or
+  refused loudly with `ProgrammingError` — never silently misinterpreted.
+
+## Honest status (0.1)
+
+The DB-API core is implemented: `connect`, `Connection`
+(`execute`/`commit`/`rollback`/`close`, context manager), `Cursor`
+(`execute`/`executemany`/`fetchone`/`fetchmany`/`fetchall`/`description`/
+`rowcount`/iteration), `?` parameters, the PEP 249 exception hierarchy, and
+live DDL (`CREATE TABLE` / `DROP TABLE` / `ALTER TABLE`).
+
+Not yet implemented (the 0.2 roadmap, mapped against CPython's own
+`test_sqlite3` suite): `Row`/`row_factory`, `executescript`, `lastrowid`,
+adapters/converters (`detect_types`), `create_function`, `blobopen`,
+`isolation_level`/`autocommit` control. On the native engine, reads on a
+connection do not yet see its own uncommitted writes (they do on the `.db`
+overlay backend). Details and progress:
+[github.com/punnerud/mpedb](https://github.com/punnerud/mpedb).
+
+---
+
+# Reference
+
+## Advanced API (beyond sqlite3)
+
+The native module also exposes mpedb's own machinery — content-hashed prepared
+plans, explicit write sessions, `EXPLAIN`, streaming blob inserts:
 
 ```python
 import mpedb
@@ -55,6 +94,10 @@ db = mpedb.Database("app.toml")   # open/create from a TOML config file
 | `tx.insert_file(table, values, stream_col, path)` | `None` | INSERT one row, streaming column `stream_col` from the file at `path` a page at a time (never resident — files larger than RAM are fine). `values` is the full row; `values[stream_col]` is a placeholder (`b""`). Path-based on purpose: the engine pulls pages with the writer lock held, so there is no Python `read()`-callback variant. The streamed column must be the table's **last** varlen column; tables with a secondary UNIQUE index are refused. |
 | `tx.commit()` / `tx.rollback()` | `None` | Explicit finish. A dropped/GC'd transaction rolls back. |
 | `with db.begin() as tx:` | | Commits on clean exit, rolls back if an exception propagates (never suppresses it). |
+
+Free-threading friendly by design: no module-level mutable state, and the GIL
+is released around every engine call, so point reads from multiple Python
+threads run truly in parallel.
 
 ## Value mapping (both directions)
 
@@ -80,8 +123,11 @@ mpedb.Error (Exception)
                              session, engine internals
 ```
 
-Messages carry the engine's `Display` text. Binding-level misuse (bad params
-container, non-convertible value) raises the ordinary `TypeError`/`OverflowError`.
+The sqlite3 aliases (`DatabaseError`, `InterfaceError`, `DataError`,
+`InternalError`, `NotSupportedError`, `Warning`) exist and alias the closest
+parent, so `except sqlite3.DatabaseError` keeps catching. Messages carry the
+engine's `Display` text. Binding-level misuse (bad params container,
+non-convertible value) raises the ordinary `TypeError`/`OverflowError`.
 
 ## Locking rules (inherited from the Rust facade)
 
@@ -104,3 +150,13 @@ container, non-convertible value) raises the ordinary `TypeError`/`OverflowError
   (or errors for re-entry into) the single writer lock. Readers never block.
 - Use a `Transaction` from the thread that created it; the writer lock is a
   pthread mutex with thread affinity.
+
+## Building from source
+
+See [github.com/punnerud/mpedb](https://github.com/punnerud/mpedb):
+`maturin build --release` in `crates/mpedb-py/` produces the wheel; the test
+suite is `crates/mpedb-py/pytest/test_mpedb.py` (plain Python, no pytest —
+run it twice against the same directory to also exercise persistence across
+process restarts).
+
+License: MIT OR Apache-2.0
