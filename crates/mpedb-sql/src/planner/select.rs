@@ -506,6 +506,7 @@ pub(super) fn plan_select<'s>(
             mode,
             consts,
             subplans,
+            row_count,
         )?;
         // A correlated slot may be read ONLY by the WHERE (→ post_filter). One
         // in the projection, an aggregate argument, GROUP BY or HAVING has no

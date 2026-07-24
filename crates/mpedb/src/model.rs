@@ -8,11 +8,15 @@
 //! shape level — the reverse of the advisor's extraction, emitting exactly
 //! the statement shapes whose candidates the advisor knows how to derive.
 //!
-//! The model is advisory metadata: it never enters plan bytes, plan hashes,
-//! or the schema hash. Storing one cannot change any query's meaning — only
-//! what the advisor/analyze layer recommends. That is why `set_model` does
-//! not bump `schema_gen`: there is nothing cached to invalidate, and a second
-//! process sees the record on its next read snapshot like any other row.
+//! The model never changes a query's MEANING — it never enters plan bytes or
+//! the schema hash, and the answer is identical with or without it. But since
+//! stage C it IS a cost input: `CostSource::columnar` prices a columnar table's
+//! `sum`/`avg` off the segment rather than the index tree, so the model can
+//! change which PLAN (and thus which plan hash) a scan-aggregate gets — the same
+//! answer, a cheaper source. So `set_model` bumps `schema_gen`, exactly like a
+//! tunable or cost-policy change, so cached plans re-prepare and every attached
+//! process prices identically off the same stored record. (A stale plan would
+//! only be slower, never wrong — the index and the segment sum the same values.)
 
 use mpedb_types::model::{AccessKind, StatementModel, WorkloadModel};
 use mpedb_types::{Error, Result};
@@ -30,7 +34,25 @@ impl crate::Database {
         self.refresh_schema_if_stale()?;
         let bundle = self.schema();
         validate_against_schema(&model, &bundle.schema)?;
-        self.sys_record_put(NS, KEY, toml.as_bytes())
+        // Bump schema_gen so the model's cost effect (stage C) re-prepares cached
+        // plans everywhere — the same pattern as `set_cost_policy`.
+        let subkey = crate::sys_record_subkey(NS, KEY)?;
+        let mut w = self.engine.begin_write_deadline(self.busy_deadline())?;
+        let res = (|| {
+            w.sys_put(&subkey, toml.as_bytes())?;
+            w.bump_schema_gen();
+            Ok(())
+        })();
+        match res {
+            Ok(()) => w.commit()?,
+            Err(e) => {
+                w.abort();
+                return Err(e);
+            }
+        }
+        self.cache.write().expect(crate::POISON).clear();
+        let _ = self.engine.reload_schema_from_catalog();
+        Ok(())
     }
 
     /// The stored model's source, verbatim, if one was set.

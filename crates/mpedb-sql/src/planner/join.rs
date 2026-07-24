@@ -538,6 +538,7 @@ fn plan_join_select_inner<'s>(
             mode,
             consts,
             subplans,
+            row_count,
         )?;
         // A correlated slot may be read ONLY by the WHERE (→ post_filter); one
         // in the projection/aggregate-arg/GROUP BY/HAVING over the grouped

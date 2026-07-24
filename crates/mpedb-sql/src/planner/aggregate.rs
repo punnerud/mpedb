@@ -358,6 +358,9 @@ pub(super) fn plan_aggregate_select(
     mode: BareGroupBy,
     _consts: &mut Vec<Value>,
     subplans: Vec<SubPlan>,
+    // The cost seam (stage C): its `columnar` signal prices a full-column
+    // sum/avg off the packed segment rather than the index tree.
+    cost: RowCountFn<'_>,
 ) -> Result<PlannedStmt> {
     let items = s.items.as_ref().ok_or_else(|| {
         bind_err("SELECT * with GROUP BY has no meaning — list the group keys and aggregates")
@@ -718,7 +721,7 @@ pub(super) fn plan_aggregate_select(
         let over_index = joins.is_empty().then(|| {
             agg_index_choice(
                 base_scope.only(), &access, &filter, &joins, &post_filter, &subplans,
-                &aggs, &bare_cols, &group_by,
+                &aggs, &bare_cols, &group_by, cost,
             )
         }).flatten();
         let (order_by, _) = distinct_order_by(s, base_scope, None, binder.host_colls())?;
@@ -845,8 +848,8 @@ pub(super) fn plan_aggregate_select(
     // the shape guards (bare_cols included) is known.
     let over_index = joins.is_empty().then(|| {
         agg_index_choice(
-            base_scope.only(), &access, &filter, &joins, &post_filter, &subplans,
-            &aggs, &bare_cols, &group_by,
+                base_scope.only(), &access, &filter, &joins, &post_filter, &subplans,
+                &aggs, &bare_cols, &group_by, cost,
         )
     }).flatten();
 
@@ -881,6 +884,17 @@ pub(super) fn plan_aggregate_select(
         out_types,
         subplans,
     ))
+}
+
+/// The single base-row column an aggregate argument reads, iff the argument is
+/// exactly one bare column (`sum(amount)`, not `sum(amount * 2)`). The columnar
+/// segment fast path feeds a RAW column value, so only a bare-column argument
+/// can ride it — a computed argument keeps the index (stage C).
+fn single_pushcol(p: &ExprProgram) -> Option<u16> {
+    match p.instrs.as_slice() {
+        [Instr::PushCol(c)] => Some(*c),
+        _ => None,
+    }
 }
 
 /// The aggregate-over-index-tree access decision (format 59): the index whose
@@ -919,6 +933,7 @@ fn agg_index_choice(
     aggs: &[AggCall],
     bare_cols: &[u16],
     group_by: &[GroupKey],
+    cost: RowCountFn<'_>,
 ) -> Option<u32> {
     if !matches!(access, AccessPath::FullScan)
         || filter.is_some()
@@ -933,6 +948,39 @@ fn agg_index_choice(
         || subplans.iter().any(|s| !s.outer_args.is_empty())
     {
         return None;
+    }
+    // Stage C (DESIGN-COLUMNAR §7.1): on a table the MODEL marks columnar, a
+    // full-column `sum`/`avg`/`total` reads LESS off the packed segment (bits
+    // per value) than off the index tree (whole `value ‖ pk` entries), so
+    // DECLINE the index and let the FullScan segment path serve it — the same
+    // answer, the cheaper source. Scoped to the exact shape that path
+    // accelerates: a SINGLE such aggregate over ONE bare, segmentable column.
+    // Everything the index serves more cheaply is untouched — `count(*)` from
+    // entry counts, `min`/`max` from an O(log n) boundary probe, a computed
+    // argument the segment cannot feed, or any multi-aggregate shape.
+    if (cost.columnar)(t.id) && aggs.len() == 1 {
+        use mpedb_types::{AggFn, AggTarget};
+        let a = &aggs[0];
+        let full_accum = matches!(
+            a.func,
+            AggTarget::Native(AggFn::Sum | AggFn::Avg | AggFn::Total)
+        );
+        let bare_seg_col = !a.distinct
+            && a.filter.is_none()
+            && a
+                .arg
+                .as_ref()
+                .and_then(single_pushcol)
+                .and_then(|c| t.columns.get(c as usize))
+                .is_some_and(|col| {
+                    matches!(
+                        col.ty,
+                        ColumnType::Int64 | ColumnType::Float64 | ColumnType::Timestamp
+                    )
+                });
+        if full_accum && bare_seg_col {
+            return None;
+        }
     }
     let mut best: Option<(usize, usize)> = None; // (columns, position)
     for (pos, ix) in t.indexes.iter().enumerate() {

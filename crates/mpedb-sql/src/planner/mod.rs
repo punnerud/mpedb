@@ -25,6 +25,17 @@ pub struct CostSource<'a> {
     /// position + 1. Deterministic between analyze runs by construction: the
     /// value is a stored record, not a live estimate.
     pub index_ndv_bucket: &'a dyn Fn(u32, u32) -> Option<u32>,
+    /// Whether the workload MODEL marks `table_id` columnar (scan-heavy) — the
+    /// stable, gen-gated signal that column segments exist for its scans (stage
+    /// C, DESIGN-COLUMNAR §7.1). It prices a full-column `sum`/`avg` off the
+    /// packed segment rather than the index tree: the segment reads bits per
+    /// value where the tree reads whole `(value ‖ pk)` entries, so on a columnar
+    /// table the segment wins and `agg_index_choice` declines the index. NOT
+    /// live segment presence — that changes as segments are built/dropped and
+    /// would re-hash plans; the model signal is stable and bumps `schema_gen`
+    /// when it changes, keeping plan identity coherent. Defaults to "never
+    /// columnar" (`false`), which prices exactly as before this signal existed.
+    pub columnar: &'a dyn Fn(u32) -> bool,
 }
 
 /// How the cost source is threaded through the planner. The alias (rather than
@@ -36,7 +47,7 @@ pub type RowCountFn<'a> = &'a CostSource<'a>;
 /// The solver then still runs — its decisive term (cartesian-step count) is
 /// purely structural — but cannot rank tables by size.
 pub const NO_ROW_COUNTS: RowCountFn<'static> =
-    &CostSource { row_count: &|_| 0, index_ndv_bucket: &|_, _| None };
+    &CostSource { row_count: &|_| 0, index_ndv_bucket: &|_, _| None, columnar: &|_| false };
 
 /// What a `plan_*` helper hands back: the statement plan, the inferred parameter
 /// types, the session-context keys it referenced (in reserved-slot order), and
